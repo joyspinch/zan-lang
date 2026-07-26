@@ -775,18 +775,9 @@ partial class DataTable {
         }
 
         // ---------------- inline cell editor overlay ----------------
+        st.edPopHot = false;
         if (st.editing && edVis && edW > app.Scale(8)) {
-            int epad = t.paddingSmall;
-            int efs = t.fontSizeMedium;
-            int etY = edY + (edH - Canvas.FontHeight(efs)) / 2;
-            c.FillRect(edX, edY, edW, edH, t.bgPrimary);
-            c.DrawRect(edX, edY, edW, edH, t.borderFocus, 2);
-            c.PushClip(edX + epad, edY, edW - epad * 2, edH);
-            c.DrawText(edX + epad, etY, st.editBuf, t.textPrimary, efs);
-            int ecaretX = edX + epad + Canvas.MeasureText(Text.Left(st.editBuf, st.editCur), efs);
-            c.FillRect(ecaretX, etY, 1, Canvas.FontHeight(efs), t.primary);
-            c.PopClip();
-            app.SetImeCaret(ecaretX, etY + Canvas.FontHeight(efs));
+            DataTable.RenderEditor(app, cols, src, st, edX, edY, edW, edH);
         }
 
         // ---------------- body pointer interaction ----------------
@@ -888,6 +879,9 @@ partial class DataTable {
         // (RenderContextMenu reads the raw event to drive item hits / dismiss.)
         if (st.ctxOpen) { ek = 0; }
         if (st.hdrCtxOpen) { ek = 0; }
+        // Same for an open editor popup: its list/calendar handled the press
+        // itself, so the cell beneath must not treat it as a new selection.
+        if (st.edPopHot) { ek = 0; }
 
         // ---------------- inline editor key handling ----------------
         // While an editor is open it owns the keyboard: printable input, caret
@@ -896,6 +890,7 @@ partial class DataTable {
         // Only keyboard events are swallowed here; mouse presses fall through to
         // the press handler, which commits the edit before re-selecting.
         if (st.editing) {
+            DataColumn ecol = cols[st.editCol];
             if (ek == 6) {
                 int code = app.window.EventKeyCode();
                 if (code == 13) { DataTable.CommitEdit(st, cols, src); }
@@ -906,27 +901,68 @@ partial class DataTable {
                         int startp = Text.PrevCharStart(st.editBuf, st.editCur);
                         st.editBuf = Text.DeleteBefore(st.editBuf, st.editCur);
                         st.editCur = startp;
+                        // Typing invalidates the previous rejection: the value
+                        // under the message no longer exists.
+                        st.editError = "";
+                        if (ecol.editorKind == 1) { DataTable.RefreshChoices(st, ecol); }
                     }
                 } else {
                     string ch = Text.CharStr(code);
                     if (ch.Length > 0) {
                         st.editBuf = Text.InsertAt(st.editBuf, st.editCur, ch);
                         st.editCur = st.editCur + ch.Length;
+                        st.editError = "";
+                        if (ecol.editorKind == 1) {
+                            st.edPopOpen = true;
+                            DataTable.RefreshChoices(st, ecol);
+                        }
                     }
                 }
                 app.RequestRedraw();
                 ek = 0;
             } else if (ek == 4) {
                 int kc = app.window.EventKeyCode();
-                if (kc == 27) { DataTable.CancelEdit(st); }
-                else if (kc == 13) { DataTable.CommitEdit(st, cols, src); }
-                else if (kc == 37) { if (st.editCur > 0) { st.editCur = Text.PrevCharStart(st.editBuf, st.editCur); } }
-                else if (kc == 39) { if (st.editCur < st.editBuf.Length) { st.editCur = Text.NextCharEnd(st.editBuf, st.editCur); } }
+                // Up/Down drive whatever the editor's vertical affordance is:
+                // the dropdown highlight, the calendar week, or the spinner.
+                bool consumed = true;
+                if (kc == 38 || kc == 40) {
+                    int dir = 1;
+                    if (kc == 38) { dir = -1; }
+                    if (ecol.editorKind == 1) {
+                        st.edPopOpen = true;
+                        DataTable.MoveChoice(st, dir);
+                    } else if (ecol.editorKind == 2) {
+                        DataTable.CalendarStep(st, ecol, dir * 7);
+                    } else if (ecol.editorKind == 3) {
+                        st.editBuf = DataTable.StepValue(ecol, st.editBuf, 0 - dir);
+                        st.editCur = st.editBuf.Length;
+                        st.editError = "";
+                    } else { consumed = false; }
+                } else if (kc == 27) {
+                    // Escape closes the popup first, and only then the editor —
+                    // so dismissing a list doesn't throw away the typed text.
+                    if (st.edPopOpen) { st.edPopOpen = false; }
+                    else { DataTable.CancelEdit(st); }
+                } else if (kc == 13) { DataTable.CommitEdit(st, cols, src); }
+                else if (kc == 37) {
+                    if (ecol.editorKind == 2) { DataTable.CalendarStep(st, ecol, -1); }
+                    else if (st.editCur > 0) { st.editCur = Text.PrevCharStart(st.editBuf, st.editCur); }
+                } else if (kc == 39) {
+                    if (ecol.editorKind == 2) { DataTable.CalendarStep(st, ecol, 1); }
+                    else if (st.editCur < st.editBuf.Length) { st.editCur = Text.NextCharEnd(st.editBuf, st.editCur); }
+                } else if (kc == 33 && ecol.editorKind == 2) { st.edCalMonth = st.edCalMonth - 1; }
+                else if (kc == 34 && ecol.editorKind == 2) { st.edCalMonth = st.edCalMonth + 1; }
                 else if (kc == 36) { st.editCur = 0; }
                 else if (kc == 35) { st.editCur = st.editBuf.Length; }
-                else if (kc == 46) { if (st.editCur < st.editBuf.Length) { st.editBuf = Text.RemoveAt(st.editBuf, st.editCur); } }
+                else if (kc == 46) {
+                    if (st.editCur < st.editBuf.Length) {
+                        st.editBuf = Text.RemoveAt(st.editBuf, st.editCur);
+                        st.editError = "";
+                        if (ecol.editorKind == 1) { DataTable.RefreshChoices(st, ecol); }
+                    }
+                } else { consumed = false; }
                 app.RequestRedraw();
-                ek = 0;
+                if (consumed) { ek = 0; }
             }
         }
 
@@ -983,7 +1019,12 @@ partial class DataTable {
                 bool sameCell = (!st.editing) && st.hitOrder == ptrOi && st.hitCol == ptrCol
                     && st.rangeR0 == st.rangeR1 && st.rangeC0 == st.rangeC1;
                 if (st.editing) { DataTable.CommitEdit(st, cols, src); }
-                if (sameCell && cols[ptrCol].editable && !cols[ptrCol].isBool) {
+                // A refused commit keeps its editor open; moving the selection
+                // now would strand it over an unrelated cell, so the press is
+                // spent on surfacing the error instead.
+                if (st.editing) {
+                    app.RequestRedraw();
+                } else if (sameCell && cols[ptrCol].editable && !cols[ptrCol].isBool) {
                     DataTable.BeginEdit(st, cols, src, st.dispRows[ptrOi].row, ptrCol);
                     app.RequestRedraw();
                 } else {
@@ -1773,6 +1814,280 @@ partial class DataTable {
     }
 
     // ---------- tabbed filter popup (DevExpress-style) ----------
+
+    /// The open inline editor, drawn over its cell. Text and spinner editors are
+    /// a box with a caret; dropdown and calendar editors add a popup below (or
+    /// above, when the cell sits near the bottom of the window). A failed
+    /// validation shows its message in place of the popup.
+    static void RenderEditor(App app, List<DataColumn> cols, DataSource src,
+                             DataTableState st, int edX, int edY, int edW, int edH) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        DataColumn col = cols[st.editCol];
+        int epad = t.paddingSmall;
+        int efs = t.fontSizeMedium;
+        int etY = edY + (edH - Canvas.FontHeight(efs)) / 2;
+
+        // A rejected value gets a danger border, so the error is visible even
+        // when the message itself is clipped by the window edge.
+        int bord = t.borderFocus;
+        if (st.editError.Length > 0) { bord = t.error; }
+
+        // Reserve room for the affordance the editor owns: spinner steppers, or
+        // the dropdown / calendar toggle.
+        int btnW = 0;
+        if (col.editorKind == 3) { btnW = app.Scale(34); }
+        else if (col.editorKind == 1 || col.editorKind == 2) { btnW = app.Scale(20); }
+        int textW = edW - btnW;
+        if (textW < app.Scale(24)) { textW = app.Scale(24); }
+
+        c.FillRect(edX, edY, edW, edH, t.bgPrimary);
+        c.DrawRect(edX, edY, edW, edH, bord, 2);
+        c.PushClip(edX + epad, edY, textW - epad * 2, edH);
+        c.DrawText(edX + epad, etY, st.editBuf, t.textPrimary, efs);
+        int ecaretX = edX + epad + Canvas.MeasureText(Text.Left(st.editBuf, st.editCur), efs);
+        c.FillRect(ecaretX, etY, 1, Canvas.FontHeight(efs), t.primary);
+        c.PopClip();
+        app.SetImeCaret(ecaretX, etY + Canvas.FontHeight(efs));
+
+        if (col.editorKind == 3) {
+            // Two half-height steppers, matching a native spin box.
+            int sw = app.Scale(16);
+            int sx = edX + edW - sw - app.Scale(3);
+            int hh = (edH - app.Scale(6)) / 2;
+            int sy = edY + app.Scale(3);
+            if (DataTable.IconBtn(app, sx, sy, sw, hh, "chevron-up", false)) {
+                st.editBuf = DataTable.StepValue(col, st.editBuf, 1);
+                st.editCur = st.editBuf.Length;
+                st.editError = "";
+                app.RequestRedraw();
+            }
+            if (DataTable.IconBtn(app, sx, sy + hh, sw, hh, "chevron-down", false)) {
+                st.editBuf = DataTable.StepValue(col, st.editBuf, -1);
+                st.editCur = st.editBuf.Length;
+                st.editError = "";
+                app.RequestRedraw();
+            }
+        } else if (col.editorKind == 1 || col.editorKind == 2) {
+            int sw = app.Scale(18);
+            string ico = "chevron-down";
+            if (col.editorKind == 2) { ico = "calendar"; }
+            if (DataTable.IconBtn(app, edX + edW - sw - app.Scale(2),
+                                  edY + (edH - sw) / 2, sw, sw, ico, st.edPopOpen)) {
+                st.edPopOpen = !st.edPopOpen;
+                app.RequestRedraw();
+            }
+        }
+
+        // ---- popup / error, placed below the cell unless that would fall off
+        // the bottom of the window ----
+        int popW = edW;
+        int popH = 0;
+        if (st.editError.Length > 0) {
+            popH = app.Scale(24);
+            int mw = Canvas.MeasureText(st.editError, t.fontSizeSmall) + app.Scale(16);
+            if (mw > popW) { popW = mw; }
+        } else if (st.edPopOpen && col.editorKind == 1) {
+            int itemH = app.Scale(24);
+            int n = st.edPopItems.Count;
+            if (n > 8) { n = 8; }
+            if (n < 1) { n = 1; }
+            popH = n * itemH + app.Scale(8);
+            if (popW < app.Scale(120)) { popW = app.Scale(120); }
+        } else if (st.edPopOpen && col.editorKind == 2) {
+            popW = app.Scale(224);
+            popH = app.Scale(230);
+        }
+        if (popH == 0) { return; }
+
+        int popX = edX;
+        int popY = edY + edH;
+        if (popX + popW > c.Width()) { popX = c.Width() - popW - app.Scale(4); }
+        if (popX < app.Scale(2)) { popX = app.Scale(2); }
+        if (popY + popH > c.Height()) { popY = edY - popH; }
+        if (popY < app.titlebarH) { popY = app.titlebarH; }
+
+        c.FillRoundRect(popX + app.Scale(2), popY + app.Scale(3), popW, popH,
+                        t.borderRadiusSmall, t.overlay);
+        c.FillRoundRect(popX, popY, popW, popH, t.borderRadiusSmall, t.bgPrimary);
+
+        if (st.editError.Length > 0) {
+            c.DrawRect(popX, popY, popW, popH, t.error, 1);
+            c.DrawText(popX + app.Scale(8),
+                       popY + (popH - Canvas.FontHeight(t.fontSizeSmall)) / 2,
+                       st.editError, t.error, t.fontSizeSmall);
+            return;
+        }
+
+        c.DrawRect(popX, popY, popW, popH, t.borderPrimary, 1);
+        app.CaptureWheel(popX, popY, popW, popH);
+        app.BlockHitsRect(popX, popY, popW, popH);
+        // The popup draws before the body reads the pointer, so flag the overlap
+        // for the press handler: without this a click on a list item would also
+        // land on the cell underneath, committing and closing the editor before
+        // the item could be picked.
+        if (app.mouseX >= popX && app.mouseX < popX + popW
+            && app.mouseY >= popY && app.mouseY < popY + popH) {
+            st.edPopHot = true;
+        }
+        if (col.editorKind == 1) {
+            DataTable.RenderChoiceList(app, col, st, popX, popY, popW, popH);
+        } else {
+            DataTable.RenderCalendar(app, col, st, popX, popY, popW, popH);
+        }
+    }
+
+    /// The dropdown list: up to 8 visible rows out of the filtered choices.
+    static void RenderChoiceList(App app, DataColumn col, DataTableState st,
+                                 int px, int py, int pw, int ph) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int fs = t.fontSizeSmall;
+        int itemH = app.Scale(24);
+        int pad = app.Scale(4);
+        int vis = (ph - pad * 2) / itemH;
+        if (vis < 1) { vis = 1; }
+
+        if (st.edPopItems.Count == 0) {
+            c.DrawText(px + app.Scale(8), py + pad + (itemH - Canvas.FontHeight(fs)) / 2,
+                       "No match", t.textTertiary, fs);
+            return;
+        }
+
+        // Keep the highlight on screen after keyboard movement.
+        int selAt = -1;
+        int q = 0;
+        while (q < st.edPopItems.Count) {
+            if (st.edPopItems[q] == st.edPopSel) { selAt = q; q = st.edPopItems.Count; }
+            else { q = q + 1; }
+        }
+        if (selAt >= 0) {
+            if (selAt < st.edPopScroll) { st.edPopScroll = selAt; }
+            if (selAt >= st.edPopScroll + vis) { st.edPopScroll = selAt - vis + 1; }
+        }
+        int maxScroll = st.edPopItems.Count - vis;
+        if (maxScroll < 0) { maxScroll = 0; }
+        if (st.edPopScroll > maxScroll) { st.edPopScroll = maxScroll; }
+        if (st.edPopScroll < 0) { st.edPopScroll = 0; }
+
+        // Wheel over the list scrolls it (delta arrives as the key code on a
+        // kind-13 event, per the convention the table body already uses).
+        if (app.window.EventKind() == 13 && maxScroll > 0
+            && app.mouseX >= px && app.mouseX < px + pw
+            && app.mouseY >= py && app.mouseY < py + ph) {
+            int delta = app.window.EventKeyCode();
+            int step = delta / 120;
+            if (step == 0) { if (delta > 0) { step = 1; } else if (delta < 0) { step = 0 - 1; } }
+            st.edPopScroll = st.edPopScroll - step;
+            if (st.edPopScroll > maxScroll) { st.edPopScroll = maxScroll; }
+            if (st.edPopScroll < 0) { st.edPopScroll = 0; }
+            app.RequestRedraw();
+        }
+
+        int i = 0;
+        while (i < vis && st.edPopScroll + i < st.edPopItems.Count) {
+            int ci = st.edPopItems[st.edPopScroll + i];
+            int iy = py + pad + i * itemH;
+            int id = app.focus.AllocId();
+            bool hov = app.focus.IsHovered(id);
+            if (ci == st.edPopSel) { c.FillRect(px + pad, iy, pw - pad * 2, itemH, t.bgActive); }
+            else if (hov) { c.FillRect(px + pad, iy, pw - pad * 2, itemH, t.bgHover); }
+            c.DrawText(px + app.Scale(8), iy + (itemH - Canvas.FontHeight(fs)) / 2,
+                       DataTable.Truncate(col.choices[ci], fs, pw - app.Scale(16)),
+                       t.textPrimary, fs);
+            app.hitTester.Register(HitRegion.Create(id, px + pad, iy, pw - pad * 2, itemH, 0));
+            if (app.window.EventKind() == 3 && app.hitTester.HitTest(app.mouseX, app.mouseY) == id) {
+                st.editBuf = col.choices[ci];
+                st.editCur = st.editBuf.Length;
+                st.edPopSel = ci;
+                st.editError = "";
+                app.RequestRedraw();
+            }
+            i = i + 1;
+        }
+    }
+
+    /// A month grid. Clicking a day writes it back through the column's own date
+    /// format, so the stored text keeps whatever shape the column declares.
+    static void RenderCalendar(App app, DataColumn col, DataTableState st,
+                               int px, int py, int pw, int ph) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int fs = t.fontSizeSmall;
+        int pad = app.Scale(8);
+        int hdrH = app.Scale(26);
+        int cw = (pw - pad * 2) / 7;
+        int chh = app.Scale(24);
+
+        // header: month name with prev/next steppers
+        int y = DataTable.YmYear(st.edCalMonth);
+        int m = DataTable.YmMonth(st.edCalMonth);
+        if (DataTable.IconBtn(app, px + pad, py + app.Scale(3), app.Scale(22), hdrH,
+                              "chevron-left", false)) {
+            st.edCalMonth = st.edCalMonth - 1;
+            app.RequestRedraw();
+        }
+        if (DataTable.IconBtn(app, px + pw - pad - app.Scale(22), py + app.Scale(3),
+                              app.Scale(22), hdrH, "chevron-right", false)) {
+            st.edCalMonth = st.edCalMonth + 1;
+            app.RequestRedraw();
+        }
+        c.DrawTextCentered(px + pad + app.Scale(24), py + app.Scale(3),
+                           pw - pad * 2 - app.Scale(48), hdrH,
+                           DataTable.MonthAbbr(m) + " " + Convert.ToString(y),
+                           t.textPrimary, t.fontSizeMedium);
+
+        // weekday captions
+        List<string> dows = new List<string>();
+        dows.Add("Su"); dows.Add("Mo"); dows.Add("Tu"); dows.Add("We");
+        dows.Add("Th"); dows.Add("Fr"); dows.Add("Sa");
+        int dy = py + app.Scale(3) + hdrH;
+        int di = 0;
+        while (di < 7) {
+            c.DrawTextCentered(px + pad + di * cw, dy, cw, app.Scale(18),
+                               dows[di], t.textTertiary, t.fontSizeSmall);
+            di = di + 1;
+        }
+
+        int gridY = dy + app.Scale(18);
+        List<int> cells = DataTable.MonthCells(st.edCalMonth);
+        int today = DataTable.Today();
+        int i = 0;
+        while (i < 42) {
+            int day = cells[i];
+            if (day > 0) {
+                int gx = px + pad + (i % 7) * cw;
+                int gy = gridY + (i / 7) * chh;
+                int dnum = DateTime.DaysFromCivil(y, m, day);
+                int id = app.focus.AllocId();
+                bool hov = app.focus.IsHovered(id);
+                int fg = t.textPrimary;
+                if (dnum == st.edPopSel) {
+                    c.FillRoundRect(gx + app.Scale(2), gy + app.Scale(1),
+                                    cw - app.Scale(4), chh - app.Scale(2),
+                                    t.borderRadiusSmall, t.primary);
+                    fg = t.textInverse;
+                } else if (hov) {
+                    c.FillRoundRect(gx + app.Scale(2), gy + app.Scale(1),
+                                    cw - app.Scale(4), chh - app.Scale(2),
+                                    t.borderRadiusSmall, t.bgHover);
+                } else if (dnum == today) {
+                    c.DrawRect(gx + app.Scale(2), gy + app.Scale(1),
+                               cw - app.Scale(4), chh - app.Scale(2), t.primary, 1);
+                }
+                c.DrawTextCentered(gx, gy, cw, chh, Convert.ToString(day), fg, fs);
+                app.hitTester.Register(HitRegion.Create(id, gx, gy, cw, chh, 0));
+                if (app.window.EventKind() == 3 && app.hitTester.HitTest(app.mouseX, app.mouseY) == id) {
+                    st.edPopSel = dnum;
+                    st.editBuf = DataTable.FormatDate(dnum, DataTable.DateStoreFormat(col));
+                    st.editCur = st.editBuf.Length;
+                    st.editError = "";
+                    app.RequestRedraw();
+                }
+            }
+            i = i + 1;
+        }
+    }
 
     static bool TabBtn(App app, int bx, int by, int bw, int bh, string label, bool active) {
         Canvas c = app.canvas;

@@ -521,5 +521,223 @@ class Program {
         Console.WriteLine(DataTable.ClearRangeCells(pst, pcols, psrc));
         Console.WriteLine(psrc.CellText(firstData, 1) == "");
         Console.WriteLine(pst.EditRow() == firstData);
+
+        Program.EditorTests();
+    }
+
+    // Rejection counter for the CellValidating handler below. Static fields so
+    // the handler stays a plain parameterless Action, matching the event model.
+    static int rejects;
+    static DataTableState vst;
+
+    static void RejectOdd() {
+        // Refuse a value the demo considers reserved, proving a handler can veto
+        // a commit that already cleared the declarative rules.
+        if (vst.EditValue() == "reserved") {
+            rejects = rejects + 1;
+            vst.Reject("Name is reserved");
+        }
+    }
+
+    /// The editor system: declarative validation, the CellValidating veto,
+    /// dropdown filtering, the numeric spinner and the calendar grid.
+    static void EditorTests() {
+        Console.WriteLine("-- editors --");
+
+        // ---- ValidateCell against each declarative rule ----
+        DataColumn tc = DataColumn.Required(DataColumn.Editable(DataColumn.Text("Name", 80)));
+        DataColumn.MaxLength(tc, 5);
+        Console.WriteLine(DataTable.ValidateCell(tc, "abc") == "");
+        Console.WriteLine(DataTable.ValidateCell(tc, "") == "Value required");
+        Console.WriteLine(DataTable.ValidateCell(tc, "   ") == "Value required");  // blanks are empty
+        Console.WriteLine(DataTable.ValidateCell(tc, "abcdefg"));
+
+        // a numeric column checks shape before range
+        DataColumn nc = DataColumn.Range(DataColumn.Editable(DataColumn.Numeric("Qty", 60)), 1.0, 10.0);
+        Console.WriteLine(DataTable.ValidateCell(nc, "5") == "");
+        Console.WriteLine(DataTable.ValidateCell(nc, "abc"));
+        Console.WriteLine(DataTable.ValidateCell(nc, "0"));
+        Console.WriteLine(DataTable.ValidateCell(nc, "11"));
+        Console.WriteLine(DataTable.ValidateCell(nc, "1") == "");    // bounds are inclusive
+        Console.WriteLine(DataTable.ValidateCell(nc, "10") == "");
+        // an optional column lets a blank through without a format complaint
+        Console.WriteLine(DataTable.ValidateCell(nc, "") == "");
+
+        // a date column rejects unparseable text
+        DataColumn dc = DataColumn.DatePicker(DataColumn.Date("When", 100));
+        Console.WriteLine(DataTable.ValidateCell(dc, "2026-07-26") == "");
+        Console.WriteLine(DataTable.ValidateCell(dc, "2026-13-01"));   // month out of range
+        Console.WriteLine(DataTable.ValidateCell(dc, "not a date"));
+
+        // ---- dropdown choices ----
+        List<string> opts = new List<string>();
+        opts.Add("Shipping"); opts.Add("Sales"); opts.Add("Support"); opts.Add("Legal");
+        DataColumn sc = DataColumn.Dropdown(DataColumn.Text("Team", 90), opts, true);
+        Console.WriteLine(DataTable.ValidateCell(sc, "Sales") == "");
+        Console.WriteLine(DataTable.ValidateCell(sc, "sales") == "");     // case-insensitive
+        Console.WriteLine(DataTable.ValidateCell(sc, "Nope"));
+        // the same column in loose mode accepts free text
+        DataColumn lc = DataColumn.Dropdown(DataColumn.Text("Team", 90), opts, false);
+        Console.WriteLine(DataTable.ValidateCell(lc, "Nope") == "");
+
+        // filtering narrows the list by case-insensitive substring
+        Console.WriteLine(DataTable.FilterChoices(sc, "").Count);        // 4: empty shows all
+        Console.WriteLine(DataTable.FilterChoices(sc, "s").Count);       // 3: all but Legal
+        Console.WriteLine(DataTable.FilterChoices(sc, "SUP").Count);     // 1
+        Console.WriteLine(DataTable.FilterChoices(sc, "zz").Count);      // 0
+        Console.WriteLine(DataTable.IndexOfChoice(sc, "Support"));       // 2
+        Console.WriteLine(DataTable.IndexOfChoice(sc, "  legal  "));     // 3: trimmed + folded
+        Console.WriteLine(DataTable.IndexOfChoice(sc, "Nope"));          // -1
+
+        // ---- spinner stepping, clamped to the declared bounds ----
+        DataColumn pc = DataColumn.Range(DataColumn.Spinner(DataColumn.Numeric("N", 60), 0.5), 0.0, 2.0);
+        DataColumn.Decimals(pc, 1);
+        Console.WriteLine(DataTable.StepValue(pc, "1.0", 1));      // 1.5
+        Console.WriteLine(DataTable.StepValue(pc, "1.0", -1));     // 0.5
+        Console.WriteLine(DataTable.StepValue(pc, "2.0", 1));      // clamps at the max
+        Console.WriteLine(DataTable.StepValue(pc, "0.0", -1));     // clamps at the min
+        Console.WriteLine(DataTable.StepValue(pc, "junk", 1));     // unparseable starts at the min
+        Console.WriteLine(DataTable.StepValue(pc, "", 1));
+
+        // ---- calendar grid ----
+        // July 2026 starts on a Wednesday and has 31 days.
+        int ym = DataTable.YearMonth(2026, 7);
+        Console.WriteLine(DataTable.YmYear(ym));
+        Console.WriteLine(DataTable.YmMonth(ym));
+        Console.WriteLine(DataTable.MonthFirstDow(ym));            // 3 = Wednesday
+        List<int> cells = DataTable.MonthCells(ym);
+        Console.WriteLine(cells.Count);                            // always 42
+        Console.WriteLine(cells[0]);                               // 0: leading blank
+        Console.WriteLine(cells[3]);                               // 1: the 1st sits in slot 3
+        Console.WriteLine(cells[33]);                              // 31: the last day
+        Console.WriteLine(cells[34]);                              // 0: trailing blank
+        // stepping across a year boundary rolls the packed month correctly
+        Console.WriteLine(DataTable.YmMonth(DataTable.YearMonth(2026, 12) + 1));   // 1
+        Console.WriteLine(DataTable.YmYear(DataTable.YearMonth(2026, 12) + 1));    // 2027
+        Console.WriteLine(DataTable.YmMonth(DataTable.YearMonth(2026, 1) - 1));    // 12
+        Console.WriteLine(DataTable.YmYear(DataTable.YearMonth(2026, 1) - 1));     // 2025
+
+        // a date written back uses the column's *stored* order, not its display
+        // pattern, so it survives a re-parse
+        DataColumn ddc = DataColumn.DateFormat(DataColumn.AsDate(DataColumn.Text("D", 90), 1), 3);
+        Console.WriteLine(DataTable.DateStoreFormat(ddc));          // 1, matching dateOrder
+        int day = DateTime.DaysFromCivil(2026, 7, 26);
+        string stored = DataTable.FormatDate(day, DataTable.DateStoreFormat(ddc));
+        Console.WriteLine(stored);
+        Console.WriteLine(DataTable.ParseDate(stored, ddc.dateOrder) == day);
+
+        // ---- BeginEdit / CommitEdit through a real source ----
+        List<DataColumn> ecols = new List<DataColumn>();
+        ecols.Add(DataColumn.MaxLength(DataColumn.Required(DataColumn.Editable(DataColumn.Text("Name", 90))), 8));
+        ecols.Add(DataColumn.Dropdown(DataColumn.Text("Team", 90), opts, true));
+        ecols.Add(DataColumn.Range(DataColumn.Spinner(DataColumn.Numeric("Qty", 60), 1.0), 0.0, 5.0));
+        List<DataRow> erows = new List<DataRow>();
+        erows.Add(Program.Row("Ann", "Sales", "2"));
+        erows.Add(Program.Row("Bob", "Legal", "3"));
+        DataSource esrc = RowListSource.Create(erows);
+        vst = DataTableState.Create();
+        DataTable.EnsureInit(vst, ecols, esrc);
+        DataTable.Recompute(vst, ecols, esrc);
+        rejects = 0;
+        vst.CellValidating.Add(Program.RejectOdd);
+
+        // a good edit commits and closes the editor
+        DataTable.BeginEdit(vst, ecols, esrc, 0, 0);
+        Console.WriteLine(vst.editing);
+        Console.WriteLine(vst.editBuf);
+        vst.editBuf = "Anna";
+        DataTable.CommitEdit(vst, ecols, esrc);
+        Console.WriteLine(vst.editing);
+        Console.WriteLine(esrc.CellText(0, 0));
+
+        // a value failing a declarative rule keeps the editor open, reports why,
+        // and leaves the stored cell untouched
+        DataTable.BeginEdit(vst, ecols, esrc, 0, 0);
+        vst.editBuf = "";
+        DataTable.CommitEdit(vst, ecols, esrc);
+        Console.WriteLine(vst.editing);
+        Console.WriteLine(vst.EditError());
+        Console.WriteLine(esrc.CellText(0, 0));
+        // correcting it commits
+        vst.editBuf = "Bea";
+        DataTable.CommitEdit(vst, ecols, esrc);
+        Console.WriteLine(vst.editing);
+        Console.WriteLine(esrc.CellText(0, 0));
+
+        // a handler veto behaves the same way, and did run
+        DataTable.BeginEdit(vst, ecols, esrc, 1, 0);
+        vst.editBuf = "reserved";
+        DataTable.CommitEdit(vst, ecols, esrc);
+        Console.WriteLine(vst.editing);
+        Console.WriteLine(vst.EditError());
+        Console.WriteLine(rejects);
+        Console.WriteLine(esrc.CellText(1, 0));
+        DataTable.CancelEdit(vst);
+        Console.WriteLine(vst.editing);
+        Console.WriteLine(vst.EditError() == "");   // cancelling clears the message
+
+        // opening a dropdown editor pre-selects the current value and shows the
+        // whole list
+        DataTable.BeginEdit(vst, ecols, esrc, 0, 1);
+        Console.WriteLine(vst.edPopOpen);
+        Console.WriteLine(vst.edPopItems.Count);
+        Console.WriteLine(vst.edPopSel);              // 1 = Sales
+        // typing narrows it and moves the highlight to the first hit
+        vst.editBuf = "su";
+        DataTable.RefreshChoices(vst, ecols[1]);
+        Console.WriteLine(vst.edPopItems.Count);
+        Console.WriteLine(vst.edPopSel);              // 2 = Support
+        // committing a prefix stores the highlighted item, not what was typed
+        DataTable.CommitEdit(vst, ecols, esrc);
+        Console.WriteLine(esrc.CellText(0, 1));
+        Console.WriteLine(vst.editing);
+        // text matching nothing leaves no highlight, and the strict column
+        // refuses to store it
+        DataTable.BeginEdit(vst, ecols, esrc, 0, 1);
+        vst.editBuf = "zzz";
+        DataTable.RefreshChoices(vst, ecols[1]);
+        Console.WriteLine(vst.edPopItems.Count);
+        Console.WriteLine(vst.edPopSel);
+        DataTable.CommitEdit(vst, ecols, esrc);
+        Console.WriteLine(vst.editing);
+        Console.WriteLine(vst.EditError());
+        Console.WriteLine(esrc.CellText(0, 1));       // still Support
+        DataTable.CancelEdit(vst);
+
+        // MoveChoice walks the filtered list and stops at both ends
+        DataTable.BeginEdit(vst, ecols, esrc, 0, 1);
+        vst.edPopSel = 0;
+        DataTable.MoveChoice(vst, 1);
+        Console.WriteLine(vst.edPopSel);              // 1
+        DataTable.MoveChoice(vst, -5);
+        Console.WriteLine(vst.edPopSel);              // 0, clamped
+        DataTable.MoveChoice(vst, 99);
+        Console.WriteLine(vst.edPopSel);              // 3, clamped
+        DataTable.CancelEdit(vst);
+
+        // a spinner column rejects an out-of-range commit
+        DataTable.BeginEdit(vst, ecols, esrc, 0, 2);
+        vst.editBuf = "9";
+        DataTable.CommitEdit(vst, ecols, esrc);
+        Console.WriteLine(vst.editing);
+        Console.WriteLine(vst.EditError());
+        Console.WriteLine(esrc.CellText(0, 2));       // unchanged
+        DataTable.CancelEdit(vst);
+
+        // pasting is held to the same rules: the bad field is skipped, the good
+        // one lands
+        vst.hitOrder = 0;
+        vst.hitCol = 0;
+        DataTable.ClearRange(vst);
+        Console.WriteLine(DataTable.PasteText(vst, ecols, esrc, "waytoolongname\tLegal\n"));
+        Console.WriteLine(esrc.CellText(0, 0));       // still Bea: over MaxLength
+        Console.WriteLine(esrc.CellText(0, 1));       // Legal: accepted
+
+        // and a required column can't be blanked by Delete
+        vst.rangeR0 = 0; vst.rangeC0 = 0;
+        vst.rangeR1 = 0; vst.rangeC1 = 1;
+        Console.WriteLine(DataTable.ClearRangeCells(vst, ecols, esrc));
+        Console.WriteLine(esrc.CellText(0, 0));       // Bea survives
+        Console.WriteLine(esrc.CellText(0, 1) == ""); // the optional one cleared
     }
 }

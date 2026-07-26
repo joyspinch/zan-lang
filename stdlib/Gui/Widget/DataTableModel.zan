@@ -70,6 +70,23 @@ class DataColumn {
     // ---- editing ----
     bool editable; // cell values can be edited inline (opt-in)
 
+    // Which editor a cell opens. 0 = plain text box; 1 = dropdown, picking from
+    // `choices`; 2 = calendar, for date columns; 3 = numeric spinner stepping by
+    // `editStep`. Bool columns ignore this — they toggle in place.
+    int editorKind;
+    List<string> choices;   // dropdown items (editorKind 1)
+    bool choicesStrict;     // dropdown: reject anything not in `choices`
+    double editStep;        // spinner increment (editorKind 3)
+
+    // Declarative validation, checked on commit before the CellValidating event
+    // gets its say. A column may use any combination.
+    bool required;          // reject an empty value
+    int maxLength;          // reject longer input (0 = unlimited)
+    bool hasMin;            // enforce editMin as a lower bound
+    bool hasMax;            // enforce editMax as an upper bound
+    double editMin;
+    double editMax;
+
     // ---- pinning / freeze ----
     bool pinned;   // freeze this column to the left: hoisted ahead of the rest
                    // and kept at its natural width when others compress to fit
@@ -107,6 +124,16 @@ class DataColumn {
         col.boolTrue = "true";
         col.boolFalse = "false";
         col.editable = false;
+        col.editorKind = 0;
+        col.choices = new List<string>();
+        col.choicesStrict = true;
+        col.editStep = 1.0;
+        col.required = false;
+        col.maxLength = 0;
+        col.hasMin = false;
+        col.hasMax = false;
+        col.editMin = 0.0;
+        col.editMax = 0.0;
         col.pinned = false;
         return col;
     }
@@ -115,6 +142,69 @@ class DataColumn {
     /// F2/Enter). Numeric columns validate input on commit.
     static DataColumn Editable(DataColumn c) {
         c.editable = true; return c;
+    }
+
+    // ---- editor configurators (all imply Editable) ----
+    /// Edit this column through a dropdown list. Typing filters the list, and
+    /// by default only a listed value commits; pass `strict = false` to allow
+    /// free text alongside the suggestions.
+    static DataColumn Dropdown(DataColumn c, List<string> items, bool strict) {
+        c.editable = true;
+        c.editorKind = 1;
+        c.choices = items;
+        c.choicesStrict = strict;
+        return c;
+    }
+
+    /// Edit this column through a month calendar. Implies `AsDate` so the
+    /// picked day round-trips through the column's own parse/format pair.
+    static DataColumn DatePicker(DataColumn c) {
+        c.editable = true;
+        c.editorKind = 2;
+        c.isDate = true;
+        return c;
+    }
+
+    /// Edit this column through a numeric spinner: Up/Down and the +/- buttons
+    /// step by `step`, and the value stays a number.
+    static DataColumn Spinner(DataColumn c, double step) {
+        c.editable = true;
+        c.editorKind = 3;
+        c.numeric = true;
+        c.align = 2;
+        if (step <= 0.0) { step = 1.0; }
+        c.editStep = step;
+        return c;
+    }
+
+    // ---- declarative validation (checked on commit) ----
+    /// Reject an empty value.
+    static DataColumn Required(DataColumn c) {
+        c.required = true; return c;
+    }
+
+    /// Reject input longer than `n` characters (0 clears the limit).
+    static DataColumn MaxLength(DataColumn c, int n) {
+        if (n < 0) { n = 0; }
+        c.maxLength = n; return c;
+    }
+
+    /// Constrain a numeric column to [lo, hi] on commit.
+    static DataColumn Range(DataColumn c, double lo, double hi) {
+        c.numeric = true;
+        c.hasMin = true; c.hasMax = true;
+        c.editMin = lo; c.editMax = hi;
+        return c;
+    }
+
+    /// Constrain a numeric column to values >= lo.
+    static DataColumn MinValue(DataColumn c, double lo) {
+        c.numeric = true; c.hasMin = true; c.editMin = lo; return c;
+    }
+
+    /// Constrain a numeric column to values <= hi.
+    static DataColumn MaxValue(DataColumn c, double hi) {
+        c.numeric = true; c.hasMax = true; c.editMax = hi; return c;
     }
 
     /// Freeze a column to the left edge: it is hoisted ahead of the unpinned
@@ -622,6 +712,8 @@ class DataTableState {
     UiEvent RowDoubleClick;    // a row was double-clicked
     UiEvent CellClick;         // a data cell was clicked (read HitRow/HitCol)
     UiEvent CellEdit;          // an in-cell edit committed (read EditRow/EditCol/EditValue)
+    UiEvent CellValidating;    // a commit is being checked: read EditRow/EditCol/EditValue
+                               // and call Reject(msg) to refuse it (see editError)
     UiEvent SelectionChanged;  // the selected-row set changed
     UiEvent ColumnResize;      // a column width changed by dragging (read HitCol)
     UiEvent ScrollChanged;     // the virtual row window scrolled (read ScrollTop)
@@ -636,6 +728,22 @@ class DataTableState {
     bool editing;              // an inline editor is currently open
     string editBuf;            // working text inside the open editor
     int editCur;               // caret position (chars) in editBuf
+
+    // ---- validation ----
+    // A rejected commit keeps the editor open and shows editError beneath it, so
+    // the user can correct the value instead of silently losing it.
+    string editError;          // rejection message ("" = the value is fine)
+    bool editRejected;         // set by Reject() while CellValidating runs
+
+    // ---- editor popups (dropdown list / calendar) ----
+    bool edPopOpen;            // the open editor is showing its popup
+    int edPopSel;              // highlighted dropdown item, or calendar day
+    int edPopScroll;           // first visible dropdown item
+    List<int> edPopItems;      // dropdown: indices into the column's `choices`
+                               // that match the typed text, in list order
+    int edCalMonth;            // calendar: displayed month as y * 12 + (m - 1)
+    bool edPopHot;             // per-frame: the pointer is over the editor popup,
+                               // so the body must not also act on the press
 
     static DataTableState Create() {
         DataTableState s = new DataTableState();
@@ -726,6 +834,7 @@ class DataTableState {
         s.RowDoubleClick = UiEvent.Create();
         s.CellClick = UiEvent.Create();
         s.CellEdit = UiEvent.Create();
+        s.CellValidating = UiEvent.Create();
         s.SelectionChanged = UiEvent.Create();
         s.ColumnResize = UiEvent.Create();
         s.ScrollChanged = UiEvent.Create();
@@ -744,6 +853,14 @@ class DataTableState {
         s.editing = false;
         s.editBuf = "";
         s.editCur = 0;
+        s.editError = "";
+        s.editRejected = false;
+        s.edPopOpen = false;
+        s.edPopSel = -1;
+        s.edPopScroll = 0;
+        s.edPopItems = new List<int>();
+        s.edCalMonth = 0;
+        s.edPopHot = false;
         return s;
     }
 
@@ -757,6 +874,17 @@ class DataTableState {
     int EditRow() { return editRow; }
     int EditCol() { return editCol; }
     string EditValue() { return editVal; }
+
+    /// Refuse the value being validated. Call from a `CellValidating` handler:
+    /// the editor stays open with `msg` shown beneath it, and no write reaches
+    /// the data source.
+    void Reject(string msg) {
+        editRejected = true;
+        editError = msg;
+    }
+
+    /// The current rejection message ("" when the last commit was accepted).
+    string EditError() { return editError; }
 }
 
 /// Virtual data source for DataTable (DevExpress-style ValueNeeded).
