@@ -330,7 +330,7 @@ partial class DataTable {
                             st.batchLines = new List<string>();
                             st.batchLines.Add("");
                             st.batchExactFlag = 0;
-                            st.menuVals = DataTable.Distinct(src, i);
+                            st.menuVals = DataTable.DistinctFiltered(st, src, i);
                             st.menuMatched = st.menuVals;
                             st.menuSearchCache = "";
                         }
@@ -471,8 +471,12 @@ partial class DataTable {
         int pagerH = 0;
         if (st.paged) { pagerH = app.Scale(38); }
 
-        int bodyTop = y + headerH;
-        int bodyH = viewH - headerH - summaryH - pagerH;
+        int filterRowH = 0;
+        if (st.showFilterRow) { filterRowH = t.heightMedium; }
+        int statusBarH = 0;
+        if (st.showStatusBar) { statusBarH = app.Scale(28); }
+        int bodyTop = y + headerH + filterRowH;
+        int bodyH = viewH - headerH - filterRowH - summaryH - pagerH - statusBarH;
         if (bodyH < rowH) { bodyH = rowH; }
         int visRows = bodyH / rowH;
         if (visRows < 1) { visRows = 1; }
@@ -493,6 +497,77 @@ partial class DataTable {
             if (start > total - visRows) { start = total - visRows; }
             if (start < 0) { start = 0; }
             st.scrollRow = start;
+        }
+
+        // ---------------- filter row (DevExpress inline quick-filter) ----------------
+        // A row of per-column text inputs just below the header. Clicking any
+        // cell focuses it; typing applies a real-time Contains filter on that
+        // column orthogonally to the popup filter. Only drawn when showFilterRow.
+        if (st.showFilterRow && filterRowH > 0) {
+            int fry = y + headerH;
+            c.FillRect(x + 1, fry, viewW - 2, filterRowH, t.bgSecondary);
+            c.FillRect(x + 1, fry, numW + selW - 2, filterRowH, t.bgTertiary);
+
+            // small funnel icon in the gutter to signal the row's purpose
+            if (st.showRowNum && numW > 0) {
+                Icon.DrawCenteredIn(c, "filter", x, fry, numW, filterRowH, app.Scale(12), t.textTertiary);
+            }
+
+            c.PushClip(firstDataX, fry, dataViewW, filterRowH);
+            int froi = 0;
+            int frcl = firstDataX - st.scrollX;
+            while (froi < vorder.Count) {
+                int fri = vorder[froi];
+                int fcw = st.dispW[fri];
+                if (frcl + fcw > firstDataX && frcl < clipRight) {
+                    int pad2 = t.paddingSmall;
+                    bool frFoc = st.filterRowFocusCol == fri;
+                    string frTxt = st.filterRowText[fri];
+                    if (frFoc) { frTxt = st.filterRowBuf; }
+                    int frid2 = app.focus.AllocId();
+                    int frX = frcl;
+                    int frW = fcw;
+                    if (frX < firstDataX) { frW = frW - (firstDataX - frX); frX = firstDataX; }
+                    if (frX + frW > clipRight) { frW = clipRight - frX; }
+                    bool frAct = frTxt.Length > 0 || frFoc;
+                    int frBg = t.bgPrimary;
+                    if (frAct) { frBg = t.bgSecondary; }
+                    if (frFoc) { frBg = t.bgPrimary; }
+                    c.FillRect(frX + 2, fry + 3, frW - 4, filterRowH - 6, frBg);
+                    int frBorder = t.borderPrimary;
+                    if (frFoc) { frBorder = t.borderFocus; }
+                    c.DrawRoundRect(frX + 2, fry + 3, frW - 4, filterRowH - 6, t.borderRadiusSmall, frBorder, 1);
+                    int frInner = frW - 4 - pad2 * 2;
+                    if (frInner < 0) { frInner = 0; }
+                    int frfs = t.fontSizeSmall;
+                    int frtY = fry + (filterRowH - Canvas.FontHeight(frfs)) / 2;
+                    c.PushClip(frX + 2 + pad2, fry, frInner, filterRowH);
+                    if (frTxt.Length == 0 && !frFoc) {
+                        c.DrawText(frX + 2 + pad2, frtY, "搜索...", t.textTertiary, frfs);
+                    } else {
+                        c.DrawText(frX + 2 + pad2, frtY, frTxt, t.textPrimary, frfs);
+                        if (frFoc) {
+                            int fcaretW = Canvas.MeasureText(Text.Left(frTxt, st.filterRowCur), frfs);
+                            c.FillRect(frX + 2 + pad2 + fcaretW, frtY, 1, Canvas.FontHeight(frfs), t.primary);
+                        }
+                    }
+                    c.PopClip();
+                    app.hitTester.Register(HitRegion.Create(frid2, frX, fry, frW, filterRowH, 1));
+                    if (app.window.EventKind() == 3 && app.window.EventButton() == 0
+                        && app.hitTester.HitTest(app.mouseX, app.mouseY) == frid2) {
+                        if (st.filterRowFocusCol != fri) {
+                            st.filterRowFocusCol = fri;
+                            st.filterRowBuf = st.filterRowText[fri];
+                            st.filterRowCur = st.filterRowBuf.Length;
+                        }
+                        app.RequestRedraw();
+                    }
+                }
+                frcl = frcl + fcw;
+                froi = froi + 1;
+            }
+            c.PopClip();
+            c.FillRect(x + 1, fry + filterRowH - 1, viewW - 2, 1, gridColor);
         }
 
         // Normalised cell-range bounds (order-index rows + column indices) for
@@ -536,6 +611,17 @@ partial class DataTable {
                 int chSz = app.Scale(14);
                 Icon.Draw(c, chev, gcx, ry + (rowH - chSz) / 2, chSz, t.textSecondary);
                 string glbl = grp.label + "  (" + Convert.ToString(grp.count) + ")";
+                // Append group-level aggregate summaries for columns that have
+                // an aggMode set (DevExpress-style group subtotals).
+                // Format: "  |  Revenue: ¥1,234,567  |  Avg CTR: 3.2%"
+                int gagg = 0;
+                while (gagg < grp.aggTexts.Count && gagg < cols.Count) {
+                    string gat = grp.aggTexts[gagg];
+                    if (gat.Length > 0) {
+                        glbl = glbl + "    " + cols[gagg].title + ": " + gat;
+                    }
+                    gagg = gagg + 1;
+                }
                 c.DrawText(gcx + chSz + app.Scale(4),
                     ry + (rowH - t.fontSizeMedium) / 2, glbl, t.textPrimary, t.fontSizeMedium);
                 c.FillRect(x + 1, ry + rowH - 1, viewW - 2, 1, gridColor);
@@ -673,6 +759,78 @@ partial class DataTable {
         int ek = app.window.EventKind();
         int eb = app.window.EventButton();
         int emods = app.window.EventMods();
+
+        // ---------------- filter row keyboard handling ----------------
+        // When a filter-row cell is focused it consumes keyboard events
+        // (printable chars, Backspace, Delete, Left/Right, Escape, Enter/Tab)
+        // before the body interaction and inline editor see them.
+        if (st.filterRowFocusCol >= 0) {
+            int frc = st.filterRowFocusCol;
+            bool frKeyHandled = false;
+            if (ek == 6) {
+                int fkc = app.window.EventKeyCode();
+                if (fkc == 27) {
+                    // Escape: clear this column's filter and blur
+                    st.filterRowBuf = "";
+                    if (st.filterRowText[frc].Length > 0) {
+                        st.filterRowText[frc] = "";
+                        st.dirty = true;
+                        st.FilterChanged.Raise();
+                    }
+                    st.filterRowFocusCol = -1;
+                } else if (fkc == 8) {
+                    // Backspace
+                    if (st.filterRowCur > 0) {
+                        int prevStart = Text.PrevCharStart(st.filterRowBuf, st.filterRowCur);
+                        st.filterRowBuf = Text.DeleteBefore(st.filterRowBuf, st.filterRowCur);
+                        st.filterRowCur = prevStart;
+                        st.filterRowText[frc] = st.filterRowBuf;
+                        st.dirty = true;
+                        st.FilterChanged.Raise();
+                    }
+                } else if (fkc == 46) {
+                    // Delete
+                    if (st.filterRowCur < st.filterRowBuf.Length) {
+                        st.filterRowBuf = Text.RemoveAt(st.filterRowBuf, st.filterRowCur);
+                        st.filterRowText[frc] = st.filterRowBuf;
+                        st.dirty = true;
+                        st.FilterChanged.Raise();
+                    }
+                } else {
+                    string fch = Text.CharStr(fkc);
+                    if (fch.Length > 0) {
+                        st.filterRowBuf = Text.InsertAt(st.filterRowBuf, st.filterRowCur, fch);
+                        st.filterRowCur = st.filterRowCur + fch.Length;
+                        st.filterRowText[frc] = st.filterRowBuf;
+                        st.dirty = true;
+                        st.FilterChanged.Raise();
+                    }
+                }
+                frKeyHandled = true;
+            } else if (ek == 4) {
+                int fkc2 = app.window.EventKeyCode();
+                if (fkc2 == 13 || fkc2 == 9) {
+                    // Enter / Tab: commit and blur
+                    st.filterRowText[frc] = st.filterRowBuf;
+                    st.filterRowFocusCol = -1;
+                } else if (fkc2 == 37) {
+                    if (st.filterRowCur > 0) { st.filterRowCur = Text.PrevCharStart(st.filterRowBuf, st.filterRowCur); }
+                } else if (fkc2 == 39) {
+                    if (st.filterRowCur < st.filterRowBuf.Length) { st.filterRowCur = Text.NextCharEnd(st.filterRowBuf, st.filterRowCur); }
+                } else if (fkc2 == 36) {
+                    st.filterRowCur = 0;
+                } else if (fkc2 == 35) {
+                    st.filterRowCur = st.filterRowBuf.Length;
+                }
+                frKeyHandled = true;
+            }
+            // A click outside the filter row blurs the focused cell
+            if (ek == 2 && (app.mouseY < y + headerH || app.mouseY >= y + headerH + filterRowH)) {
+                st.filterRowText[frc] = st.filterRowBuf;
+                st.filterRowFocusCol = -1;
+            }
+            if (frKeyHandled) { ek = 0; app.RequestRedraw(); }
+        }
         // While the context menu is open it is modal: swallow body events so a
         // click on a menu item can't also start a range/selection behind it.
         // (RenderContextMenu reads the raw event to drive item hits / dismiss.)
@@ -916,6 +1074,61 @@ partial class DataTable {
             if (total == 0) { from = 0; }
             string info = Convert.ToString(from) + "-" + Convert.ToString(to) + " / " + Convert.ToString(total);
             c.DrawText(x + t.paddingMedium, pgY + (t.heightMedium - Canvas.FontHeight(t.fontSizeSmall)) / 2, info, t.textTertiary, t.fontSizeSmall);
+        }
+
+        // ---------------- status bar (DevExpress-style bottom strip) ----------------
+        // Left: filtered/total row count + selected-row count. Right: live
+        // sum/avg/cell-count for the current cell-range selection (numeric
+        // columns only) — lets the user eyeball a quick total without leaving
+        // the grid, same as Excel's/DevExpress's status strip.
+        if (st.showStatusBar) {
+            int sbY = bodyTop + bodyH + summaryH + pagerH;
+            c.FillRect(x + 1, sbY, viewW - 2, statusBarH, t.bgSecondary);
+            c.FillRect(x + 1, sbY, viewW - 2, 1, gridColor);
+            int sbFs = t.fontSizeSmall;
+            int sbTy = sbY + (statusBarH - Canvas.FontHeight(sbFs)) / 2;
+
+            int totalSrc = src.RowCount();
+            int shownRows = st.order.Count;
+            string rowInfo = "行数: " + Convert.ToString(shownRows);
+            if (shownRows != totalSrc) { rowInfo = rowInfo + " / " + Convert.ToString(totalSrc); }
+            int selCount = 0;
+            int sci = 0;
+            while (sci < st.selected.Count) { if (st.selected[sci]) { selCount = selCount + 1; } sci = sci + 1; }
+            if (selCount > 0) { rowInfo = rowInfo + "    已选: " + Convert.ToString(selCount); }
+            c.DrawText(x + t.paddingMedium, sbTy, rowInfo, t.textSecondary, sbFs);
+
+            if (DataTable.HasRange(st)) {
+                int rC0 = DataTable.MinI(st.rangeC0, st.rangeC1);
+                int rC1 = DataTable.MaxI(st.rangeC0, st.rangeC1);
+                int rR0 = DataTable.MinI(st.rangeR0, st.rangeR1);
+                int rR1 = DataTable.MaxI(st.rangeR0, st.rangeR1);
+                int rsum = 0;
+                int rcount = 0;
+                int rri = rR0;
+                while (rri <= rR1 && rri < st.dispRows.Count) {
+                    if (st.dispRows[rri].kind == 0) {
+                        int drow = st.dispRows[rri].row;
+                        int rci = rC0;
+                        while (rci <= rC1 && rci < cols.Count) {
+                            if (cols[rci].numeric) {
+                                rsum = rsum + src.CellNum(drow, rci);
+                                rcount = rcount + 1;
+                            }
+                            rci = rci + 1;
+                        }
+                    }
+                    rri = rri + 1;
+                }
+                if (rcount > 0) {
+                    int ravg = rsum / rcount;
+                    string rangeInfo = "选区求和: " + Convert.ToString(rsum)
+                        + "    平均: " + Convert.ToString(ravg)
+                        + "    单元格: " + Convert.ToString(rcount);
+                    int rw = Canvas.MeasureText(rangeInfo, sbFs);
+                    c.DrawText(x + viewW - t.paddingMedium - rw, sbTy, rangeInfo, t.textSecondary, sbFs);
+                }
+            }
         }
 
         // ---------------- vertical scrollbar ----------------
@@ -1451,7 +1664,7 @@ partial class DataTable {
                 st.batchLines = new List<string>();
                 st.batchLines.Add("");
                 st.batchExactFlag = 0;
-                st.menuVals = DataTable.Distinct(src, col);
+                st.menuVals = DataTable.DistinctFiltered(st, src, col);
                 st.menuMatched = st.menuVals;
                 st.menuSearchCache = "";
                 st.hdrCtxOpen = false; app.RequestRedraw();
@@ -1576,6 +1789,7 @@ partial class DataTable {
                 if (chv == 8) { f.textQuery = DataTable.Backspace(f.textQuery); }
                 else { string ad = DataTable.CharStr(chv); if (ad.Length > 0) { f.textQuery = f.textQuery + ad; } }
                 st.dirty = true;
+                st.FilterChanged.Raise();
             } else if (st.editFocus == 3) {
                 int last = st.batchLines.Count - 1;
                 if (last < 0) { st.batchLines.Add(""); last = 0; }
@@ -1639,7 +1853,7 @@ partial class DataTable {
             app.hitTester.Register(HitRegion.Create(allId, mx + pad, cy, menuW - pad * 2, itemH, 0));
             if (app.window.EventKind() == 3 && app.hitTester.HitTest(app.mouseX, app.mouseY) == allId) {
                 f.hidden.Clear();
-                st.dirty = true; app.RequestRedraw();
+                st.dirty = true; st.FilterChanged.Raise(); app.RequestRedraw();
             }
             cy = cy + itemH;
 
@@ -1683,7 +1897,7 @@ partial class DataTable {
                 c.DrawText(listX + app.Scale(22), cy + (itemH - Canvas.FontHeight(fs)) / 2, label, t.textPrimary, fs);
                 app.hitTester.Register(HitRegion.Create(vId, listX, cy, itemW, itemH, 0));
                 if (app.window.EventKind() == 3 && app.hitTester.HitTest(app.mouseX, app.mouseY) == vId) {
-                    f.Toggle(v); st.dirty = true; app.RequestRedraw();
+                    f.Toggle(v); st.dirty = true; st.FilterChanged.Raise(); app.RequestRedraw();
                 }
                 cy = cy + itemH;
                 r2 = r2 + 1;
@@ -1728,10 +1942,10 @@ partial class DataTable {
             int chipW = (menuW - pad * 2 - app.Scale(9)) / 4;
             int chipH = app.Scale(24);
             int gap = app.Scale(3);
-            if (DataTable.TabBtn(app, mx + pad, cy, chipW, chipH, "Contains", f.textMode == 1)) { f.textMode = 1; st.dirty = true; app.RequestRedraw(); }
-            if (DataTable.TabBtn(app, mx + pad + (chipW + gap), cy, chipW, chipH, "Equals", f.textMode == 2)) { f.textMode = 2; st.dirty = true; app.RequestRedraw(); }
-            if (DataTable.TabBtn(app, mx + pad + (chipW + gap) * 2, cy, chipW, chipH, "Starts", f.textMode == 3)) { f.textMode = 3; st.dirty = true; app.RequestRedraw(); }
-            if (DataTable.TabBtn(app, mx + pad + (chipW + gap) * 3, cy, chipW, chipH, "Ends", f.textMode == 4)) { f.textMode = 4; st.dirty = true; app.RequestRedraw(); }
+            if (DataTable.TabBtn(app, mx + pad, cy, chipW, chipH, "Contains", f.textMode == 1)) { f.textMode = 1; st.dirty = true; st.FilterChanged.Raise(); app.RequestRedraw(); }
+            if (DataTable.TabBtn(app, mx + pad + (chipW + gap), cy, chipW, chipH, "Equals", f.textMode == 2)) { f.textMode = 2; st.dirty = true; st.FilterChanged.Raise(); app.RequestRedraw(); }
+            if (DataTable.TabBtn(app, mx + pad + (chipW + gap) * 2, cy, chipW, chipH, "Starts", f.textMode == 3)) { f.textMode = 3; st.dirty = true; st.FilterChanged.Raise(); app.RequestRedraw(); }
+            if (DataTable.TabBtn(app, mx + pad + (chipW + gap) * 3, cy, chipW, chipH, "Ends", f.textMode == 4)) { f.textMode = 4; st.dirty = true; st.FilterChanged.Raise(); app.RequestRedraw(); }
             cy = cy + chipH + app.Scale(8);
 
             int boxH = app.Scale(26);
@@ -1796,6 +2010,7 @@ partial class DataTable {
                 f.batchExact = st.batchExactFlag == 1;
                 f.batchKeep = keepClick;
                 st.dirty = true;
+                st.FilterChanged.Raise();
                 app.RequestRedraw();
             }
         }
@@ -1815,6 +2030,7 @@ partial class DataTable {
             st.batchExactFlag = 0;
             st.editFocus = 0;
             st.dirty = true;
+            st.FilterChanged.Raise();
             app.RequestRedraw();
         }
         if (closeClick) { st.openMenu = -1; app.RequestRedraw(); }

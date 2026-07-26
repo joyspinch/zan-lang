@@ -328,6 +328,7 @@ partial class DataTable {
         while (st.selected.Count < src.RowCount()) { st.selected.Add(false); }
         while (st.colHidden.Count < cols.Count) { st.colHidden.Add(false); }
         while (st.colPinned.Count < cols.Count) { st.colPinned.Add(false); }
+        while (st.filterRowText.Count < cols.Count) { st.filterRowText.Add(""); }
         // colOrder tracks every column exactly once; append any not yet listed.
         int co = 0;
         while (co < cols.Count) {
@@ -498,6 +499,20 @@ partial class DataTable {
         }
     }
 
+    // Whether a row passes the filter-row quick-filter (case-insensitive Contains
+    // per column). Columns whose filterRowText is empty are always passed.
+    static bool RowPassesFilterRow(DataTableState st, DataSource src, int row) {
+        int c = 0;
+        while (c < st.filterRowText.Count) {
+            string q = st.filterRowText[c];
+            if (q.Length > 0) {
+                if (!DataTable.ContainsCI(src.CellText(row, c), q)) { return false; }
+            }
+            c = c + 1;
+        }
+        return true;
+    }
+
     static bool RowPasses(DataTableState st, List<DataColumn> cols, DataSource src, int row) {
         int i = 0;
         while (i < cols.Count) {
@@ -552,6 +567,25 @@ partial class DataTable {
             DataTable.SortOrder(st, cols, src);
         } else if (st.sortKeys.Count > 1) {
             DataTable.SortOrderMulti(st, cols, src);
+        }
+        // Apply filter-row quick-filter as a second pass over the ColFilter result.
+        // This keeps it orthogonal to the popup filter so both can coexist.
+        if (st.showFilterRow) {
+            bool frAny = false;
+            int fri = 0;
+            while (fri < st.filterRowText.Count) {
+                if (st.filterRowText[fri].Length > 0) { frAny = true; }
+                fri = fri + 1;
+            }
+            if (frAny) {
+                List<int> kept = new List<int>();
+                int fro = 0;
+                while (fro < st.order.Count) {
+                    if (DataTable.RowPassesFilterRow(st, src, st.order[fro])) { kept.Add(st.order[fro]); }
+                    fro = fro + 1;
+                }
+                st.order = kept;
+            }
         }
         if (st.showSummary) { DataTable.ComputeSummary(st, cols, src); }
         DataTable.ComputeColStats(st, cols, src);
@@ -687,6 +721,46 @@ partial class DataTable {
         }
     }
 
+    // Compute per-column aggregates for a contiguous slice of st.order[lo..hi)
+    // and store the results in grp.aggValues / grp.aggTexts (index-aligned with
+    // cols). Only columns whose aggMode > 0 and != 6 (derived) are scanned;
+    // derived columns are left at 0 (they reference footer-level agg values, not
+    // per-group ones). O(|hi-lo| * agg-column-count).
+    static void FillGroupAgg(DataTableState st, List<DataColumn> cols, DataSource src,
+                             GroupRow grp, int lo, int hi) {
+        int nc = cols.Count;
+        while (grp.aggValues.Count < nc) { grp.aggValues.Add(0); }
+        while (grp.aggTexts.Count < nc) { grp.aggTexts.Add(""); }
+        int col = 0;
+        while (col < nc) {
+            int m = 0;
+            if (col < st.aggMode.Count) { m = st.aggMode[col]; }
+            if (m == 0 || m == 6) { col = col + 1; continue; }
+            int s = 0;
+            int mn = 0;
+            int mx = 0;
+            int cnt2 = 0;
+            int k = lo;
+            while (k < hi && k < st.order.Count) {
+                int v = src.CellNum(st.order[k], col);
+                if (cnt2 == 0) { mn = v; mx = v; }
+                else { if (v < mn) { mn = v; } if (v > mx) { mx = v; } }
+                s = s + v;
+                cnt2 = cnt2 + 1;
+                k = k + 1;
+            }
+            int av = 0;
+            if (m == 1) { av = s; }
+            else if (m == 2) { if (cnt2 > 0) { av = s / cnt2; } }
+            else if (m == 3) { av = mn; }
+            else if (m == 4) { av = mx; }
+            else if (m == 5) { av = cnt2; }
+            grp.aggValues[col] = av;
+            grp.aggTexts[col] = DataTable.FormatCell(cols[col], Convert.ToString(av));
+            col = col + 1;
+        }
+    }
+
     // Build the flat display model (group headers interleaved with data rows)
     // from the already filtered+sorted st.order. When no grouping is active the
     // model mirrors st.order one-to-one, so every downstream render/hit path
@@ -730,10 +804,12 @@ partial class DataTable {
                         cnt = cnt + 1; q = q + 1;
                     }
                     int gi = st.groups.Count;
-                    st.groups.Add(new GroupRow(
+                    GroupRow newGrp = new GroupRow(
                         cols[st.groupCols[L]].title + ": "
                             + src.CellText(rowIdx, st.groupCols[L]),
-                        L, cnt, key, DataTable.IsCollapsed(st, key)));
+                        L, cnt, key, DataTable.IsCollapsed(st, key));
+                    DataTable.FillGroupAgg(st, cols, src, newGrp, p, p + cnt);
+                    st.groups.Add(newGrp);
                     if (!ancColl) {
                         st.dispRows.Add(new DispRow(1, gi, 0));
                     }
@@ -1157,15 +1233,32 @@ partial class DataTable {
         }
     }
 
-    // Sorted distinct values of a column, computed by sorting all cell values
-    // (O(n log n)) and collapsing adjacent duplicates (O(n)). The previous
-    // implementation rescanned the result list per row — O(n^2) — which hung
-    // on high-cardinality columns once the dataset grew large.
+    // Sorted distinct values of a column across ALL source rows (no filter).
+    // Kept for backward compatibility (PivotTable passes a DataRow list here).
     static List<string> Distinct(DataSource src, int col) {
         List<string> vals = new List<string>();
         int i = 0;
         int nrows = src.RowCount();
         while (i < nrows) { vals.Add(src.CellText(i, col)); i = i + 1; }
+        DataTable.SortStr(vals);
+        List<string> res = new List<string>();
+        int j = 0;
+        while (j < vals.Count) {
+            if (j == 0 || DataTable.CompareStr(vals[j], vals[j - 1]) != 0) { res.Add(vals[j]); }
+            j = j + 1;
+        }
+        return res;
+    }
+
+    // Sorted distinct values of a column scoped to the currently FILTERED view
+    // (st.order). This is what the Set-Filter popup should show: only values
+    // that are present after all OTHER column filters have been applied, so the
+    // popup reflects what the user can actually see. O(n log n) on the visible
+    // row count, which is usually much smaller than the full source row count.
+    static List<string> DistinctFiltered(DataTableState st, DataSource src, int col) {
+        List<string> vals = new List<string>();
+        int i = 0;
+        while (i < st.order.Count) { vals.Add(src.CellText(st.order[i], col)); i = i + 1; }
         DataTable.SortStr(vals);
         List<string> res = new List<string>();
         int j = 0;
