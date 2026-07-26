@@ -131,6 +131,93 @@ partial class CodeEditor {
 
     /// Recomputes the completion popup from the word immediately left of the
     /// cursor; closes the popup when there is no prefix or no candidate.
+    /// Relevance of `cand` for the typed `pfx`, or -1 when it does not match.
+    /// Higher is better. The order is the one VS-style completion implies:
+    /// an exact-case prefix beats a case-insensitive prefix, which beats a
+    /// camel-hump initialism (`rdal` -> `ReadAllLines`), which beats a plain
+    /// subsequence (`rdll` -> `ReadAllLines`); shorter candidates win ties, so
+    /// `Add` sorts above `AddRange` for the prefix `add`.
+    static int MatchScore(string cand, string pfx) {
+        if (pfx.Length == 0) { return 1; }
+        if (cand.Length < pfx.Length) { return 0 - 1; }
+        int bonus = 0 - cand.Length;
+        if (cand.StartsWith(pfx)) { return 4000 + bonus; }
+        if (CodeEditor.StartsWithI(cand, pfx)) { return 3000 + bonus; }
+        if (CodeEditor.HumpMatch(cand, pfx)) { return 2000 + bonus; }
+        if (CodeEditor.SubseqMatchI(cand, pfx)) { return 1000 + bonus; }
+        return 0 - 1;
+    }
+
+    /// True when `pfx` spells out the capitals (plus the leading character) of
+    /// `cand`: `rdal` and `RAL` both match `ReadAllLines`.
+    static bool HumpMatch(string cand, string pfx) {
+        string upper = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        List<string> humps = new List<string>();
+        int i = 0;
+        while (i < cand.Length) {
+            string ch = cand.Substring(i, 1);
+            if (i == 0 || CodeEditor.InSet(upper, ch) || ch == "_") {
+                if (ch != "_") { humps.Add(ch); }
+            }
+            i = i + 1;
+        }
+        if (humps.Count < pfx.Length) { return false; }
+        int h = 0;
+        while (h < pfx.Length) {
+            if (!CodeEditor.EqI(humps[h], pfx.Substring(h, 1))) { return false; }
+            h = h + 1;
+        }
+        return true;
+    }
+
+    /// True when every character of `pfx` occurs in `cand` in order,
+    /// ignoring case.
+    static bool SubseqMatchI(string cand, string pfx) {
+        int ci = 0;
+        int pi = 0;
+        while (pi < pfx.Length && ci < cand.Length) {
+            if (CodeEditor.EqI(cand.Substring(ci, 1), pfx.Substring(pi, 1))) { pi = pi + 1; }
+            ci = ci + 1;
+        }
+        return pi >= pfx.Length;
+    }
+
+    /// Case-insensitive comparison of two one-character strings.
+    static bool EqI(string a, string b) {
+        return CodeEditor.StartsWithI(a, b) && a.Length == b.Length;
+    }
+
+    /// Sorts the candidate/kind lists in place by descending relevance.
+    static void SortByScore(List<string> items, List<string> kinds, List<int> scores) {
+        int i = 1;
+        while (i < items.Count) {
+            string it = items[i];
+            string kd = kinds[i];
+            int sc = scores[i];
+            int j = i - 1;
+            while (j >= 0 && scores[j] < sc) {
+                items[j + 1] = items[j];
+                kinds[j + 1] = kinds[j];
+                scores[j + 1] = scores[j];
+                j = j - 1;
+            }
+            items[j + 1] = it;
+            kinds[j + 1] = kd;
+            scores[j + 1] = sc;
+            i = i + 1;
+        }
+    }
+
+    /// Opens completion explicitly (Ctrl+Space), listing everything in scope
+    /// even with no prefix typed yet.
+    void ForceCompletion() {
+        acDot = false;
+        acActive = true;
+        acForced = true;
+        UpdateCompletion();
+        acForced = false;
+    }
+
     void UpdateCompletion() {
         string idrest = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
         string ln = lines[curLine];
@@ -141,14 +228,18 @@ partial class CodeEditor {
             string prefix = ln.Substring(acStart, curCol - acStart);
             acAllItems = new List<string>();
             acAllKinds = new List<string>();
+            List<int> dscores = new List<int>();
             int fi = 0;
             while (fi < acFull.Count) {
-                if (prefix.Length == 0 || CodeEditor.StartsWithI(acFull[fi], prefix)) {
+                int sc = CodeEditor.MatchScore(acFull[fi], prefix);
+                if (sc >= 0) {
                     acAllItems.Add(acFull[fi]);
                     acAllKinds.Add(CodeEditor.MemberKind(acFull[fi]));
+                    dscores.Add(sc);
                 }
                 fi = fi + 1;
             }
+            CodeEditor.SortByScore(acAllItems, acAllKinds, dscores);
             if (acAllItems.Count == 0) { acActive = false; acDot = false; return; }
             acSel = 0;
             ApplyKindFilter();
@@ -164,7 +255,7 @@ partial class CodeEditor {
         }
         acStart = st;
         string pfx = ln.Substring(st, curCol - st);
-        if (pfx.Length < 1) { acActive = false; return; }
+        if (pfx.Length < 1 && !acForced) { acActive = false; return; }
 
         List<string> cand = new List<string>();
         List<string> candKinds = new List<string>();
@@ -181,18 +272,27 @@ partial class CodeEditor {
         }
         acAllItems = new List<string>();
         acAllKinds = new List<string>();
+        List<int> scores = new List<int>();
         int i = 0;
         while (i < cand.Count) {
             string w = cand[i];
-            if (w != pfx && CodeEditor.StartsWithI(w, pfx) && !CodeEditor.Has(acAllItems, w)) {
+            int sc = CodeEditor.MatchScore(w, pfx);
+            if (w != pfx && sc >= 0 && !CodeEditor.Has(acAllItems, w)) {
                 acAllItems.Add(w);
                 if (i < candKinds.Count) { acAllKinds.Add(candKinds[i]); }
                 else { acAllKinds.Add("W"); }
-                if (acAllItems.Count >= 40) { i = cand.Count; }
+                scores.Add(sc);
             }
             i = i + 1;
         }
         if (acAllItems.Count == 0) { acActive = false; return; }
+        // Rank first, then keep the best few: cutting at collection order used
+        // to drop the obvious candidate whenever it was scanned late.
+        CodeEditor.SortByScore(acAllItems, acAllKinds, scores);
+        while (acAllItems.Count > 60) {
+            acAllItems.RemoveAt(acAllItems.Count - 1);
+            acAllKinds.RemoveAt(acAllKinds.Count - 1);
+        }
         acSel = 0;
         ApplyKindFilter();
     }
