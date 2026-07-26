@@ -1087,7 +1087,26 @@ static zan_img_t *zan_img_load(const char *path) {
     if (!path || !path[0]) return NULL;
     e = zan_img_find(path);
     if (e) return e;
+#ifdef _WIN32
+    /* stbi_load goes through fopen, which on Windows interprets the bytes in
+     * the ANSI code page -- so a UTF-8 path with non-ASCII characters (a
+     * Chinese picture name, say) never opens. Widen it and hand stb the FILE*. */
+    {
+        int wn = MultiByteToWideChar(CP_UTF8, 0, path, -1, NULL, 0);
+        wchar_t *wp = wn > 0 ? (wchar_t *)malloc((size_t)wn * sizeof(wchar_t)) : NULL;
+        FILE *f = NULL;
+        if (wp) {
+            MultiByteToWideChar(CP_UTF8, 0, path, -1, wp, wn);
+            f = _wfopen(wp, L"rb");
+            free(wp);
+        }
+        if (!f) return NULL;
+        data = stbi_load_from_file(f, &w, &h, &n, 4);
+        fclose(f);
+    }
+#else
     data = stbi_load(path, &w, &h, &n, 4);
+#endif
     if (!data) return NULL;
     pix = (u32 *)malloc((size_t)w * h * sizeof(u32));
     if (!pix) { stbi_image_free(data); return NULL; }
