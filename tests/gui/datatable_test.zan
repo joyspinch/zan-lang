@@ -523,6 +523,7 @@ class Program {
         Console.WriteLine(pst.EditRow() == firstData);
 
         Program.EditorTests();
+        Program.StylerTests();
     }
 
     // Rejection counter for the CellValidating handler below. Static fields so
@@ -739,5 +740,90 @@ class Program {
         Console.WriteLine(DataTable.ClearRangeCells(vst, ecols, esrc));
         Console.WriteLine(esrc.CellText(0, 0));       // Bea survives
         Console.WriteLine(esrc.CellText(0, 1) == ""); // the optional one cleared
+    }
+
+    /// Row / cell appearance resolution: which colour wins, and how a styled
+    /// row blends with selection and hover instead of losing its meaning.
+    static void StylerTests() {
+        Console.WriteLine("-- styler --");
+
+        int red = DataTable.Rgb(255, 0, 0);
+        int white = DataTable.Rgb(255, 255, 255);
+        int grey = DataTable.Rgb(240, 240, 240);
+        int blue = DataTable.Rgb(0, 0, 255);
+        int hoverC = DataTable.Rgb(0, 255, 0);
+
+        List<DataColumn> scols = new List<DataColumn>();
+        scols.Add(DataColumn.Text("Name", 80));
+        scols.Add(DataColumn.Text("State", 80));
+        List<DataRow> srows = new List<DataRow>();
+        DataRow s0 = DataRow.Create(); s0.Push("Ann"); s0.Push("Overdue"); srows.Add(s0);
+        DataRow s1 = DataRow.Create(); s1.Push("Bob"); s1.Push("Paid"); srows.Add(s1);
+        RowListSource ssrc = RowListSource.Create(srows);
+        DataTableState sst = DataTableState.Create();
+        DataTable.EnsureInit(sst, scols, ssrc);
+
+        // ---- no styler: the stock striping / selection / hover order ----
+        Console.WriteLine(DataTable.RowBackground(sst, ssrc, 0, white, blue, hoverC, false, false) == white);
+        Console.WriteLine(DataTable.RowBackground(sst, ssrc, 0, grey, blue, hoverC, false, false) == grey);
+        Console.WriteLine(DataTable.RowBackground(sst, ssrc, 0, white, blue, hoverC, true, false) == blue);
+        // hover outranks selection, as in the stock renderer
+        Console.WriteLine(DataTable.RowBackground(sst, ssrc, 0, white, blue, hoverC, true, true) == hoverC);
+        Console.WriteLine(DataTable.CellBackground(sst, ssrc, 0, 0) == 0);
+        Console.WriteLine(DataTable.CellForeground(sst, ssrc, 0, 0) == 0);
+
+        // ---- with a styler ----
+        sst.styler = new TestStyler();
+
+        // row 0 is "Overdue": its colour replaces the striping outright
+        Console.WriteLine(DataTable.RowBackground(sst, ssrc, 0, white, blue, hoverC, false, false) == red);
+        // row 1 is not: it keeps whatever stripe it was given
+        Console.WriteLine(DataTable.RowBackground(sst, ssrc, 1, grey, blue, hoverC, false, false) == grey);
+
+        // selecting a styled row blends rather than erasing — half red, half
+        // blue — so the row still reads as overdue while it is active
+        int selBlend = DataTable.RowBackground(sst, ssrc, 0, white, blue, hoverC, true, false);
+        Console.WriteLine(selBlend == DataTable.LerpColor(red, blue, 1, 2));
+        Console.WriteLine(selBlend != red);
+        Console.WriteLine(selBlend != blue);
+        // hover blends the same way and still outranks selection
+        Console.WriteLine(DataTable.RowBackground(sst, ssrc, 0, white, blue, hoverC, true, true)
+                          == DataTable.LerpColor(red, hoverC, 1, 2));
+
+        // ---- cell background: only column 1 of row 0 is tinted ----
+        Console.WriteLine(DataTable.CellBackground(sst, ssrc, 0, 1) == blue);
+        Console.WriteLine(DataTable.CellBackground(sst, ssrc, 0, 0) == 0);
+        Console.WriteLine(DataTable.CellBackground(sst, ssrc, 1, 1) == 0);
+
+        // ---- foreground: a per-cell colour beats the row's, which covers the rest ----
+        Console.WriteLine(DataTable.CellForeground(sst, ssrc, 0, 0) == white);  // row colour
+        Console.WriteLine(DataTable.CellForeground(sst, ssrc, 0, 1) == red);    // cell wins
+        Console.WriteLine(DataTable.CellForeground(sst, ssrc, 1, 0) == 0);      // neither set
+
+        // ---- clearing the styler restores the stock appearance exactly ----
+        sst.styler = null;
+        Console.WriteLine(DataTable.RowBackground(sst, ssrc, 0, white, blue, hoverC, false, false) == white);
+        Console.WriteLine(DataTable.CellForeground(sst, ssrc, 0, 1) == 0);
+    }
+}
+
+/// A styler that colours "Overdue" rows and picks out the state cell, used to
+/// prove the row/cell precedence rules above.
+class TestStyler : CellStyler {
+    override int RowBg(DataSource src, int row) {
+        if (src.CellText(row, 1) == "Overdue") { return DataTable.Rgb(255, 0, 0); }
+        return 0;
+    }
+    override int RowFg(DataSource src, int row) {
+        if (src.CellText(row, 1) == "Overdue") { return DataTable.Rgb(255, 255, 255); }
+        return 0;
+    }
+    override int CellBg(DataSource src, int row, int col) {
+        if (col == 1 && src.CellText(row, 1) == "Overdue") { return DataTable.Rgb(0, 0, 255); }
+        return 0;
+    }
+    override int CellFg(DataSource src, int row, int col) {
+        if (col == 1 && src.CellText(row, 1) == "Overdue") { return DataTable.Rgb(255, 0, 0); }
+        return 0;
     }
 }

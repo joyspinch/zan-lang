@@ -9,7 +9,11 @@ namespace Gui.Widget;
 partial class DataTable {
     // ---------- cell rendering ----------
 
-    static void DrawCell(App app, DataColumn col, string val, int cx, int cy, int cw, int rowH, double cfLo, double cfHi) {
+    /// `fgOverride` is a packed colour from the state's CellStyler, or 0 for
+    /// none. It replaces the theme's text colour on plain and link cells, but a
+    /// conditional-format colour still wins — there, the colour *is* the
+    /// information the cell carries.
+    static void DrawCell(App app, DataColumn col, string val, int cx, int cy, int cw, int rowH, double cfLo, double cfHi, int fgOverride) {
         Canvas c = app.canvas;
         Theme t = app.theme;
         int fs = t.fontSizeMedium;
@@ -18,6 +22,7 @@ partial class DataTable {
 
         // ---- conditional formatting (plain text/numeric cells only) ----
         int cfText = t.textPrimary;
+        if (fgOverride != 0) { cfText = fgOverride; }
         if (col.cfMode != 0 && col.cellType == 0) {
             double v = DataTable.ParseReal(val);
             if (col.cfMode == 1) {
@@ -42,7 +47,7 @@ partial class DataTable {
                 string sb = DataTable.Truncate(DataTable.FormatCell(col, val), fs, innerW);
                 int twb = Canvas.MeasureText(sb, fs);
                 int tyb = cy + (rowH - Canvas.FontHeight(fs)) / 2;
-                c.DrawText(cx + cw - pad - twb, tyb, sb, t.textPrimary, fs);
+                c.DrawText(cx + cw - pad - twb, tyb, sb, cfText, fs);
                 return;
             } else if (col.cfMode == 2) {
                 // Scale the 0..1 position to a 0..1000 integer ramp so the lerp
@@ -73,7 +78,7 @@ partial class DataTable {
                 int btx = cx + (cw - btw) / 2;
                 if (col.align == 0) { btx = cx + pad; }
                 if (col.align == 2) { btx = cx + cw - pad - btw; }
-                c.DrawText(btx, cy + (rowH - Canvas.FontHeight(fs)) / 2, bt, t.textPrimary, fs);
+                c.DrawText(btx, cy + (rowH - Canvas.FontHeight(fs)) / 2, bt, cfText, fs);
                 return;
             }
             int box = app.Scale(16);
@@ -137,12 +142,12 @@ partial class DataTable {
             if (col.align == 1) { cxc = cx + cw / 2 - Canvas.MeasureText(val, fs) / 2 - dotR - app.Scale(4); }
             c.FillCircle(cxc, cy + rowH / 2, dotR, dotColor);
             int txtY = cy + (rowH - Canvas.FontHeight(fs)) / 2;
-            c.DrawText(cxc + dotR + app.Scale(4), txtY, val, t.textPrimary, fs);
+            c.DrawText(cxc + dotR + app.Scale(4), txtY, val, cfText, fs);
             return;
         }
 
         int color = cfText;
-        if (col.cellType == 1) { color = t.primary; }
+        if (col.cellType == 1 && fgOverride == 0) { color = t.primary; }
         string shown = DataTable.Truncate(DataTable.FormatCell(col, val), fs, innerW);
         int tw = Canvas.MeasureText(shown, fs);
         int tx = cx + pad;
@@ -678,10 +683,10 @@ partial class DataTable {
             bool rHover = app.focus.IsHovered(rowId);
             bool rSel = st.selected[rowIdx];
 
-            int rowBg = t.bgPrimary;
-            if (st.striped && (st.dispRows[oiRow].no % 2 == 0)) { rowBg = t.bgSecondary; }
-            if (rSel) { rowBg = t.bgActive; }
-            if (rHover) { rowBg = t.bgHover; }
+            int stripeBg = t.bgPrimary;
+            if (st.striped && (st.dispRows[oiRow].no % 2 == 0)) { stripeBg = t.bgSecondary; }
+            int rowBg = DataTable.RowBackground(st, src, rowIdx, stripeBg,
+                                                t.bgActive, t.bgHover, rSel, rHover);
             c.FillRect(x + 1, ry, viewW - 2, rowH, rowBg);
 
             int cx2 = x;
@@ -723,16 +728,32 @@ partial class DataTable {
                 int cc = vorder[coi];
                 int cw = st.dispW[cc];
                 if (ccl + cw > firstDataX) {
+                    // A per-cell style background paints under the range
+                    // highlight, so a selected cell still reads as selected.
+                    int cellBg = DataTable.CellBackground(st, src, rowIdx, cc);
+                    if (cellBg != 0) { c.FillRect(ccl, ry, cw, rowH, cellBg); }
                     if (rowInRange && cc >= rgC0 && cc <= rgC1) {
                         c.FillRect(ccl, ry, cw, rowH, t.bgActive);
                     }
                     if (st.editing && rowIdx == st.editRow && cc == st.editCol) {
                         edX = ccl; edY = ry; edW = cw; edH = rowH; edVis = true;
                     }
-                    double cfLo = 0.0;
-                    double cfHi = 0.0;
-                    if (cc < st.cfMinR.Count) { cfLo = st.cfMinR[cc]; cfHi = st.cfMaxR[cc]; }
-                    DataTable.DrawCell(app, cols[cc], src.CellText(rowIdx, cc), ccl, ry, cw, rowH, cfLo, cfHi);
+                    // A custom painter owns the cell outright. Clipping it to
+                    // its own rect means a misbehaving one can't bleed over its
+                    // neighbours or escape the table.
+                    bool painted = false;
+                    if (st.styler != null) {
+                        c.PushClip(ccl, ry, cw, rowH);
+                        painted = st.styler.PaintCell(app, src, rowIdx, cc, ccl, ry, cw, rowH);
+                        c.PopClip();
+                    }
+                    if (!painted) {
+                        double cfLo = 0.0;
+                        double cfHi = 0.0;
+                        if (cc < st.cfMinR.Count) { cfLo = st.cfMinR[cc]; cfHi = st.cfMaxR[cc]; }
+                        DataTable.DrawCell(app, cols[cc], src.CellText(rowIdx, cc), ccl, ry, cw, rowH,
+                                           cfLo, cfHi, DataTable.CellForeground(st, src, rowIdx, cc));
+                    }
                     // An editable bool cell toggles on a single click, rather
                     // than opening the text editor an inline edit would use.
                     if (cols[cc].isBool && cols[cc].editable) {
