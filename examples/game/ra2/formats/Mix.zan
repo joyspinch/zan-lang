@@ -1,0 +1,351 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+
+namespace Ra2.Formats;
+
+/// <summary>One file inside a MIX archive. Files are identified by a hash of
+/// their name; the name itself is not stored.</summary>
+class MixEntry {
+    int id;
+    int offset;
+    int size;
+
+    static MixEntry Create(int id, int offset, int size) {
+        MixEntry e = new MixEntry();
+        e.id = id;
+        e.offset = offset;
+        e.size = size;
+        return e;
+    }
+
+    int Id() { return this.id; }
+    int Offset() { return this.offset; }
+    int Size() { return this.size; }
+}
+
+/// <summary>Reads a MIX archive, the container every RA2 asset ships in.</summary>
+///
+/// Two layouts exist. The pre-Tiberian-Sun one starts straight at the entry
+/// count; the TS/RA2 one prefixes a flags word and may wrap the entry table
+/// with Blowfish, keyed by an RSA-wrapped key in the header. A RA2 install has
+/// both, so both are handled here.
+///
+/// An archive is backed either by a file or by a buffer. Disk archives keep
+/// only the header in memory and read payloads on demand -- ra2.mix is 270 MB.
+/// Buffer backing exists because ra2.mix nests further archives (cache.mix,
+/// conquer.mix, ...) that are read straight out of their parent's bytes.
+class MixArchive {
+    [DllImport("crt")] static extern string calloc(int count, int size);
+    [DllImport("crt")] static extern void free(string p);
+
+    static int FlagChecksum() { return 0x00010000; }
+    static int FlagEncrypted() { return 0x00020000; }
+
+    string path;          // "" when backed by a buffer
+    string data;          // header only when file-backed, whole archive otherwise
+    int dataLen;          // length of `data`
+    int totalLen;         // bytes readable behind this archive
+    string label;         // for diagnostics: file name or parent's description
+    int headerLen;        // cached HeaderLength(), 0 until computed
+    int dataStart;        // where payloads begin, relative to the archive start
+    List<MixEntry> entries;
+    Dictionary<int, int> index;   // entry id -> position in entries
+
+    /// <summary>The TS/RA2 filename hash.</summary>
+    ///
+    /// Westwood padded the uppercased name up to a multiple of four before
+    /// running CRC32 over it, and the padding is not zeros: it is the length
+    /// remainder followed by repeats of the byte at the last 4-byte boundary.
+    /// Getting that wrong yields hashes that miss every real file.
+    static int HashName(string name) {
+        string s = name.ToUpper();
+        int l = s.Length;
+        int a = l >> 2;
+        if ((l & 3) != 0) {
+            StringBuilder sb = new StringBuilder();
+            sb.Append(s);
+            sb.Append(MixArchive.CharOf(l - (a << 2)));
+            string padSrc = s.Substring(a << 2, 1);
+            int i = 3 - (l & 3);
+            while (i > 0) {
+                sb.Append(padSrc);
+                i = i - 1;
+            }
+            s = sb.ToString();
+        }
+        return MixArchive.Crc32(s, s.Length);
+    }
+
+    // A one-character string holding the given byte value. Appending a char
+    // directly would append its decimal digits instead.
+    static string CharOf(int v) {
+        string one = calloc(2, 1);
+        one[0] = (char)(v & 0xFF);
+        return one;
+    }
+
+    /// Standard reflected CRC32 (polynomial 0xEDB88320), masked to 32 bits
+    /// because Zan's int is 64-bit and would otherwise keep the high garbage.
+    static int Crc32(string buf, int len) {
+        int crc = 0xFFFFFFFF;
+        int i = 0;
+        while (i < len) {
+            int c = (crc ^ (buf[i] & 0xFF)) & 0xFF;
+            int k = 0;
+            while (k < 8) {
+                if ((c & 1) != 0) { c = 0xEDB88320 ^ (c >> 1); }
+                else { c = c >> 1; }
+                k = k + 1;
+            }
+            crc = ((crc >> 8) & 0x00FFFFFF) ^ c;
+            i = i + 1;
+        }
+        return (crc ^ 0xFFFFFFFF) & 0xFFFFFFFF;
+    }
+
+    /// <summary>Opens an archive on disk, reading only its header.</summary>
+    static MixArchive Open(string path) {
+        MixArchive m = new MixArchive();
+        m.path = path;
+        m.label = path;
+        m.totalLen = File.GetSize(path);
+        m.entries = new List<MixEntry>();
+        m.index = new Dictionary<int, int>();
+
+        // The header's length depends on the entry count, which is inside it,
+        // so read a small chunk first and grow once the count is known.
+        int probeLen = 4 + WsKey.WrappedSize() + 8;
+        if (probeLen > m.totalLen) { probeLen = m.totalLen; }
+        m.data = File.ReadBytes(path, 0, probeLen);
+        m.dataLen = probeLen;
+
+        int headerLen = m.HeaderLength();
+        if (headerLen > m.totalLen) { headerLen = m.totalLen; }
+        if (headerLen > m.dataLen) {
+            free(m.data);
+            m.data = File.ReadBytes(path, 0, headerLen);
+            m.dataLen = headerLen;
+        }
+        m.Parse();
+        return m;
+    }
+
+    /// <summary>Opens an archive held in memory. Takes ownership of the
+    /// buffer.</summary>
+    static MixArchive FromBuffer(string data, int length, string label) {
+        MixArchive m = new MixArchive();
+        m.path = "";
+        m.data = data;
+        m.dataLen = length;
+        m.totalLen = length;
+        m.label = label;
+        m.entries = new List<MixEntry>();
+        m.index = new Dictionary<int, int>();
+        m.Parse();
+        return m;
+    }
+
+    int U16At(int at) {
+        return (this.data[at] & 0xFF) | ((this.data[at + 1] & 0xFF) << 8);
+    }
+
+    int U32At(int at) {
+        return (this.data[at] & 0xFF)
+             | ((this.data[at + 1] & 0xFF) << 8)
+             | ((this.data[at + 2] & 0xFF) << 16)
+             | ((this.data[at + 3] & 0xFF) << 24);
+    }
+
+    // True for the TS/RA2 layout. The old format has no flags word, so its
+    // first four bytes are the entry count and the low half of the data size.
+    // Only the checksum and encryption bits are ever set in a real flags word,
+    // and its low half is always zero, so anything else means the old layout.
+    bool IsNewFormat() {
+        int flags = this.U32At(0);
+        int known = MixArchive.FlagChecksum() | MixArchive.FlagEncrypted();
+        int unknownHigh = flags & 0xFFFF0000 & (0xFFFF0000 ^ known);
+        return (flags & 0x0000FFFF) == 0
+            && (flags & 0xFFFF0000) != 0
+            && unknownHigh == 0;
+    }
+
+    // Bytes of header that must be in memory before the entry table can be
+    // read. Requires only the first block of an encrypted table to be present.
+    // Cached, because working it out costs an RSA unwrap.
+    int HeaderLength() {
+        if (this.headerLen == 0) { this.headerLen = this.ComputeHeaderLength(); }
+        return this.headerLen;
+    }
+
+    int ComputeHeaderLength() {
+        if (!this.IsNewFormat()) {
+            return 6 + this.U16At(0) * 12;
+        }
+        if ((this.U32At(0) & MixArchive.FlagEncrypted()) == 0) {
+            return 4 + 6 + this.U16At(4) * 12;
+        }
+        int cipherAt = 4 + WsKey.WrappedSize();
+        Blowfish bf = this.HeaderCipher();
+        string first = calloc(9, 1);
+        int i = 0;
+        while (i < 8) {
+            first[i] = this.data[cipherAt + i];
+            i = i + 1;
+        }
+        bf.DecryptBlock(first, 0);
+        int count = (first[0] & 0xFF) | ((first[1] & 0xFF) << 8);
+        free(first);
+        return cipherAt + ((6 + count * 12 + 7) / 8) * 8;
+    }
+
+    Blowfish HeaderCipher() {
+        string key = WsKey.Decrypt(this.data, 4);
+        Blowfish bf = Blowfish.Create(key, WsKey.KeySize());
+        free(key);
+        return bf;
+    }
+
+    void Parse() {
+        if (!this.IsNewFormat()) {
+            this.ParseTable(0);
+        } else if ((this.U32At(0) & MixArchive.FlagEncrypted()) != 0) {
+            this.ParseEncrypted();
+        } else {
+            this.ParseTable(4);
+        }
+    }
+
+    // Plaintext table: count, data size, then count 12-byte entries.
+    void ParseTable(int at) {
+        int count = this.U16At(at);
+        int tableAt = at + 6;
+        this.dataStart = tableAt + count * 12;
+        int i = 0;
+        while (i < count) {
+            int e = tableAt + i * 12;
+            this.AddEntry(this.U32At(e), this.U32At(e + 4), this.U32At(e + 8));
+            i = i + 1;
+        }
+    }
+
+    // Encrypted table: an 80-byte RSA-wrapped Blowfish key, then the table in
+    // Blowfish ECB. The header is padded to a block boundary, so payloads start
+    // after a whole number of blocks -- not after count*12 bytes.
+    void ParseEncrypted() {
+        int cipherAt = 4 + WsKey.WrappedSize();
+        Blowfish bf = this.HeaderCipher();
+
+        // Only the table is encrypted, so decrypt exactly as many blocks as it
+        // spans. Running to the end of the buffer would work for a file-backed
+        // archive, where only the header was read, but a nested archive holds
+        // its whole self in memory -- and then dataStart would land at the end.
+        int plainLen = this.HeaderLength() - cipherAt;
+        string plain = calloc(plainLen + 1, 1);
+        int i = 0;
+        while (i < plainLen) {
+            plain[i] = this.data[cipherAt + i];
+            i = i + 1;
+        }
+        bf.DecryptBuffer(plain, 0, plainLen);
+
+        int count = (plain[0] & 0xFF) | ((plain[1] & 0xFF) << 8);
+        this.dataStart = cipherAt + plainLen;
+        i = 0;
+        while (i < count) {
+            int e = 6 + i * 12;
+            this.AddEntry(MixArchive.BufU32(plain, e),
+                          MixArchive.BufU32(plain, e + 4),
+                          MixArchive.BufU32(plain, e + 8));
+            i = i + 1;
+        }
+        free(plain);
+    }
+
+    static int BufU32(string buf, int at) {
+        return (buf[at] & 0xFF)
+             | ((buf[at + 1] & 0xFF) << 8)
+             | ((buf[at + 2] & 0xFF) << 16)
+             | ((buf[at + 3] & 0xFF) << 24);
+    }
+
+    void AddEntry(int id, int offset, int size) {
+        // Indexing a dictionary through `this` drops the write, so bind it to a
+        // local first -- the same workaround System.Web.Router uses.
+        Dictionary<int, int> idx = this.index;
+        // Duplicate ids do occur; the first one wins, matching how the game
+        // resolves them.
+        if (!idx.ContainsKey(id)) {
+            idx[id] = this.entries.Count;
+        }
+        this.entries.Add(MixEntry.Create(id, offset, size));
+    }
+
+    int Count() { return this.entries.Count; }
+    string Label() { return this.label; }
+    int DataStart() { return this.dataStart; }
+    int TotalLength() { return this.totalLen; }
+
+    MixEntry EntryAt(int i) { return this.entries[i]; }
+
+    MixEntry Find(string name) {
+        int id = MixArchive.HashName(name);
+        Dictionary<int, int> idx = this.index;
+        if (!idx.ContainsKey(id)) { return null; }
+        return this.entries[idx[id]];
+    }
+
+    bool Contains(string name) { return this.Find(name) != null; }
+
+    /// <summary>Reads a file's bytes. Sets outLen[0] to the length and returns
+    /// an empty string when the name is not in this archive. Caller frees.</summary>
+    string ReadFile(string name, List<int> outLen) {
+        MixEntry e = this.Find(name);
+        if (e == null) {
+            outLen[0] = 0;
+            return "";
+        }
+        return this.ReadEntry(e, outLen);
+    }
+
+    string ReadEntry(MixEntry e, List<int> outLen) {
+        int at = this.dataStart + e.Offset();
+        int size = e.Size();
+        // A truncated or mis-parsed archive would otherwise read past the end.
+        if (at < 0 || size < 0 || at + size > this.totalLen) {
+            outLen[0] = 0;
+            return "";
+        }
+        outLen[0] = size;
+        if (this.path != "") {
+            return File.ReadBytes(this.path, at, size);
+        }
+        string buf = calloc(size + 1, 1);
+        int i = 0;
+        while (i < size) {
+            buf[i] = this.data[at + i];
+            i = i + 1;
+        }
+        return buf;
+    }
+
+    /// <summary>Opens an archive stored inside this one, e.g. cache.mix within
+    /// ra2.mix. Returns null when absent.</summary>
+    MixArchive OpenNested(string name) {
+        List<int> len = new List<int>();
+        len.Add(0);
+        string sub = this.ReadFile(name, len);
+        if (len[0] == 0) { return null; }
+        return MixArchive.FromBuffer(sub, len[0], this.label + "!" + name);
+    }
+
+    void Close() {
+        if (this.data != "") {
+            free(this.data);
+            this.data = "";
+        }
+        this.dataLen = 0;
+        this.entries = new List<MixEntry>();
+        this.index = new Dictionary<int, int>();
+    }
+}

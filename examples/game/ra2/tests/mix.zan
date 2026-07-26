@@ -1,0 +1,110 @@
+// MIX archive reading and TS/RA2 name hashing.
+//
+// Clean-room: the archive below is assembled here from scratch, so no game data
+// is embedded. The hash values are the published TS/RA2 ones -- notably
+// "LOCAL MIX DATABASE.DAT" = 0x366E051F, which every MIX tool agrees on.
+using System;
+using System.Collections.Generic;
+using Ra2.Formats;
+
+namespace T;
+
+class Program {
+    [DllImport("crt")] static extern string calloc(int count, int size);
+
+    static void PutU16(string buf, int at, int v) {
+        buf[at] = (char)(v & 0xFF);
+        buf[at + 1] = (char)((v >> 8) & 0xFF);
+    }
+
+    static void PutU32(string buf, int at, int v) {
+        buf[at] = (char)(v & 0xFF);
+        buf[at + 1] = (char)((v >> 8) & 0xFF);
+        buf[at + 2] = (char)((v >> 16) & 0xFF);
+        buf[at + 3] = (char)((v >> 24) & 0xFF);
+    }
+
+    static void PutText(string buf, int at, string text) {
+        int i = 0;
+        while (i < text.Length) {
+            buf[at + i] = (char)(text[i] & 0xFF);
+            i = i + 1;
+        }
+    }
+
+    // A plaintext (pre-TS format) archive: count, data size, id-ascending
+    // entry table, then the payloads.
+    static string BuildMix(List<int> outLen) {
+        string iniText = "[Test]\nKey=Value\n";
+        int iniLen = iniText.Length;
+        int binLen = 10;
+
+        // DATA.BIN hashes lower than TEST.INI, so it comes first in the table.
+        int binId = MixArchive.HashName("DATA.BIN");
+        int iniId = MixArchive.HashName("TEST.INI");
+
+        int tableAt = 6;
+        int dataAt = tableAt + 12 * 2;
+        int total = dataAt + binLen + iniLen;
+        string buf = calloc(total + 1, 1);
+
+        Program.PutU16(buf, 0, 2);
+        Program.PutU32(buf, 2, binLen + iniLen);
+
+        Program.PutU32(buf, tableAt, binId);
+        Program.PutU32(buf, tableAt + 4, 0);
+        Program.PutU32(buf, tableAt + 8, binLen);
+
+        Program.PutU32(buf, tableAt + 12, iniId);
+        Program.PutU32(buf, tableAt + 16, binLen);
+        Program.PutU32(buf, tableAt + 20, iniLen);
+
+        int i = 0;
+        while (i < binLen) {
+            buf[dataAt + i] = (char)(i + 1);
+            i = i + 1;
+        }
+        Program.PutText(buf, dataAt + binLen, iniText);
+
+        outLen[0] = total;
+        return buf;
+    }
+
+    static void Main() {
+        // Published hashes, so a regression in the padding rule is caught.
+        Console.WriteLine("h_lmd=" + Convert.ToString(
+            MixArchive.HashName("LOCAL MIX DATABASE.DAT")));
+        Console.WriteLine("h_cache=" + Convert.ToString(MixArchive.HashName("CACHE.MIX")));
+        Console.WriteLine("h_rules=" + Convert.ToString(MixArchive.HashName("RULES.INI")));
+        // Hashing uppercases first, so case must not matter.
+        Console.WriteLine("h_case=" + Convert.ToString(
+            MixArchive.HashName("rules.ini") == MixArchive.HashName("RULES.INI")));
+
+        List<int> mixLen = new List<int>();
+        mixLen.Add(0);
+        string raw = Program.BuildMix(mixLen);
+        MixArchive mix = MixArchive.FromBuffer(raw, mixLen[0], "synthetic");
+
+        Console.WriteLine("count=" + Convert.ToString(mix.Count()));
+        Console.WriteLine("has_ini=" + Convert.ToString(mix.Contains("TEST.INI")));
+        Console.WriteLine("has_bin=" + Convert.ToString(mix.Contains("DATA.BIN")));
+        Console.WriteLine("has_missing=" + Convert.ToString(mix.Contains("NOPE.DAT")));
+
+        List<int> outLen = new List<int>();
+        outLen.Add(0);
+        string ini = mix.ReadFile("TEST.INI", outLen);
+        Console.WriteLine("ini_len=" + Convert.ToString(outLen[0]));
+        Console.WriteLine("ini_text=" + ini.Substring(0, 6));
+
+        string bin = mix.ReadFile("DATA.BIN", outLen);
+        Console.WriteLine("bin_len=" + Convert.ToString(outLen[0]));
+        Console.WriteLine("bin_first=" + Convert.ToString(bin[0] & 0xFF));
+        Console.WriteLine("bin_last=" + Convert.ToString(bin[9] & 0xFF));
+
+        // A miss reads as empty rather than throwing, so callers can probe.
+        string none = mix.ReadFile("NOPE.DAT", outLen);
+        Console.WriteLine("missing_len=" + Convert.ToString(outLen[0]));
+
+        mix.Close();
+    }
+}
