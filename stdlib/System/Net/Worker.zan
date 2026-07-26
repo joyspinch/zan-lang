@@ -6,6 +6,7 @@ using System.Net.Sse;
 using System.Net.Mqtt;
 using System.Diagnostics;
 using System.Text;
+using System.Threading;
 
 namespace System.Net;
 
@@ -150,19 +151,40 @@ class Worker {
     static void BumpStat() {
         statRequests = statRequests + 1;
     }
+
+    // Messages/frames/datagrams written back to peers by this process.
+    static int statSent = 0;
+
+    static void BumpSent() {
+        statSent = statSent + 1;
+    }
+
+    // Live connections across every Worker in this process.
+    static int LiveConnections() {
+        int n = 0;
+        int i = 0;
+        while (i < workers.Count) {
+            n = n + workers[i].connectionCount;
+            i = i + 1;
+        }
+        return n;
+    }
     // Status print interval in seconds for the foreground master (or the
     // single-process server). 0 disables. Workers report to the master over
     // the control connection every 2s regardless.
     static int statusInterval = 10;
 
-    // Master-side latest report per worker (parallel lists indexed by slot).
-    static List<int> stWid = new List<int>();
-    static List<int> stPid = new List<int>();
-    static List<int> stReq = new List<int>();
+    // Cross-process counters live in shared memory, the same mechanism the
+    // router's per-route stats use: every process publishes its own row every
+    // two seconds and `status` reads the rows, so no worker has to be asked
+    // and a report cannot be lost with a control connection.
+    // Columns: pid, recv (requests/messages in), sent (messages out), conns,
+    // cpu (ms), rss (bytes). Key: "w<id>", or "self" in a single process.
+    static SharedTable statTable = null;
+
+    // Previous sample per worker id, for the periodic rate line.
     static List<int> stPrevReq = new List<int>();
-    static List<int> stCpuMs = new List<int>();
     static List<int> stPrevCpuMs = new List<int>();
-    static List<int> stRss = new List<int>();
 
     [DllImport("crt")]
     static extern string calloc(int count, int size);
@@ -459,6 +481,8 @@ class Worker {
 
         int procs = MaxCount();
         if (procs <= 1) {
+            StatsCreate(1);
+            Task.Spawn(StatsPublishLoop());
             PrintBanner(1);
             // stop/status/reload have to reach a single-process server too, so
             // it listens on the control port just like a master does. Only
@@ -503,6 +527,76 @@ class Worker {
         if (cliMode) { b.Commands(Worker.Usage()); }
         b.Footer("Press Ctrl+C to stop. Start success.");
         b.Print();
+    }
+
+    // ---- shared stats table ----
+
+    static string StatsName() {
+        return "zanworker_" + Convert.ToString(ControlPort());
+    }
+
+    static string StatsKey(int wid) {
+        if (wid <= 0) { return "self"; }
+        return "w" + Convert.ToString(wid);
+    }
+
+    /// Master (or single process): create the shared stats table, one row per
+    /// process. Workers open the same table by name.
+    static void StatsCreate(int procs) {
+        SharedTable t = new SharedTable(StatsName(), procs + 8);
+        t.KeySize(16);
+        t.ColumnInt("pid");
+        t.ColumnInt("recv");
+        t.ColumnInt("sent");
+        t.ColumnInt("conns");
+        t.ColumnInt("cpu");
+        t.ColumnInt("rss");
+        if (t.Create()) {
+            // Seed the rows so a worker's first publish writes into an
+            // existing row instead of racing to create one.
+            int wid = 0;
+            while (wid <= procs) {
+                t.SetInt(StatsKey(wid), "pid", 0);
+                wid = wid + 1;
+            }
+            statTable = t;
+            return;
+        }
+        SharedTable existing = SharedTable.Open(StatsName());
+        if (existing.IsOpen()) { statTable = existing; }
+    }
+
+    static void StatsOpen() {
+        SharedTable t = SharedTable.Open(StatsName());
+        if (t.IsOpen()) { statTable = t; }
+    }
+
+    /// Publishes this process's counters into its row.
+    static void StatsPublish() {
+        SharedTable t = statTable;
+        if (t == null) { return; }
+        if (!t.IsOpen()) { return; }
+        string key = StatsKey(ProcessHost.WorkerId());
+        t.SetInt(key, "pid", ProcessHost.Pid());
+        t.SetInt(key, "recv", statRequests);
+        t.SetInt(key, "sent", statSent);
+        t.SetInt(key, "conns", LiveConnections());
+        t.SetInt(key, "cpu", ServerMetrics.CpuMillis());
+        t.SetInt(key, "rss", ServerMetrics.MemoryRssBytes());
+    }
+
+    static async void StatsPublishLoop() {
+        while (true) {
+            await Task.Delay(2000);
+            StatsPublish();
+        }
+    }
+
+    static int StatsRead(int wid, string column) {
+        SharedTable t = statTable;
+        if (t == null) { return 0; }
+        if (!t.IsOpen()) { return 0; }
+        return t.GetInt(StatsKey(wid), column);
     }
 
     /// <summary>The command line a CLI-driven server answers.</summary>
@@ -628,6 +722,10 @@ class Worker {
             i = i + 1;
         }
         #endif
+
+        // The stats table must exist before the first worker starts, so a
+        // worker's Open always finds it.
+        StatsCreate(procs);
 
         int wid = 1;
         while (wid <= procs) {
@@ -766,19 +864,11 @@ class Worker {
         ctlWid.Add(childWid);
 
         // Supervise: the control connection stays open for the worker's whole
-        // life and carries its periodic "STAT wid pid req cpuMs rss" reports;
-        // it closing means the worker exited.
-        string acc = "";
+        // life (counters travel through the shared stats table, not this
+        // socket); it closing means the worker exited.
         while (true) {
             string beat = await conn.RecvAsync(256);
             if (beat.Length == 0) { break; }
-            acc = acc + beat;
-            while (true) {
-                int nl2 = IndexOfByte(acc, 10);
-                if (nl2 < 0) { break; }
-                RecordStat(acc.Substring(0, nl2));
-                acc = acc.Substring(nl2 + 1);
-            }
         }
         conn.Close();
         DropCtl(conn);
@@ -898,36 +988,44 @@ class Worker {
         }
         sb.Append(Rule(""));
         sb.Append("\n");
-        sb.Append(Pad("worker", 10) + Pad("pid", 10) + Pad("requests", 14)
-            + Pad("cpu ms", 12) + "memory\n");
-        if (stWid.Count == 0) {
-            int conns = 0;
-            int k = 0;
-            while (k < workers.Count) {
-                conns = conns + workers[k].connectionCount;
-                k = k + 1;
-            }
-            sb.Append(Pad("self", 10)
-                + Pad(Convert.ToString(ProcessHost.Pid()), 10)
-                + Pad(Convert.ToString(statRequests), 14)
-                + Pad(Convert.ToString(ServerMetrics.CpuMillis()), 12)
-                + Convert.ToString(ServerMetrics.MemoryRssBytes() / 1048576) + "MB\n");
-            sb.Append("connections: " + Convert.ToString(conns) + "\n");
+        sb.Append(Pad("worker", 8) + Pad("pid", 9) + Pad("received", 12)
+            + Pad("sent", 12) + Pad("clients", 10) + Pad("cpu ms", 10)
+            + "memory\n");
+        int procs = MaxCount();
+        if (procs <= 1) {
+            // Single process: publish first so the row is this second's truth.
+            StatsPublish();
+            sb.Append(StatusRow("self", 0));
             return sb.ToString();
         }
-        int total = 0;
-        int j = 0;
-        while (j < stWid.Count) {
-            total = total + stReq[j];
-            sb.Append(Pad("w" + Convert.ToString(stWid[j]), 10)
-                + Pad(Convert.ToString(stPid[j]), 10)
-                + Pad(Convert.ToString(stReq[j]), 14)
-                + Pad(Convert.ToString(stCpuMs[j]), 12)
-                + Convert.ToString(stRss[j] / 1048576) + "MB\n");
-            j = j + 1;
+        int totRecv = 0;
+        int totSent = 0;
+        int totConns = 0;
+        int wid = 1;
+        while (wid <= procs) {
+            if (StatsRead(wid, "pid") != 0) {
+                totRecv = totRecv + StatsRead(wid, "recv");
+                totSent = totSent + StatsRead(wid, "sent");
+                totConns = totConns + StatsRead(wid, "conns");
+                sb.Append(StatusRow("w" + Convert.ToString(wid), wid));
+            }
+            wid = wid + 1;
         }
-        sb.Append("total requests: " + Convert.ToString(total) + "\n");
+        sb.Append("total   received: " + Convert.ToString(totRecv)
+            + "   sent: " + Convert.ToString(totSent)
+            + "   clients: " + Convert.ToString(totConns) + "\n");
         return sb.ToString();
+    }
+
+    // One process row of the status table, read from the shared stats table.
+    static string StatusRow(string label, int wid) {
+        return Pad(label, 8)
+            + Pad(Convert.ToString(StatsRead(wid, "pid")), 9)
+            + Pad(Convert.ToString(StatsRead(wid, "recv")), 12)
+            + Pad(Convert.ToString(StatsRead(wid, "sent")), 12)
+            + Pad(Convert.ToString(StatsRead(wid, "conns")), 10)
+            + Pad(Convert.ToString(StatsRead(wid, "cpu")), 10)
+            + Convert.ToString(StatsRead(wid, "rss") / 1048576) + "MB\n";
     }
 
     // Control listener for a single-process server started through RunCommand:
@@ -1064,8 +1162,9 @@ class Worker {
         }
         #endif
 
-        // Report stats to the master every 2s over the control connection.
-        Task.Spawn(StatReportLoop(ctl));
+        // Publish this worker's counters into the shared stats table.
+        StatsOpen();
+        Task.Spawn(StatsPublishLoop());
 
         // Liveness watch: the master holds this connection open for our whole
         // life; when it closes (master exited), leave too. It also sends QUIT
@@ -1109,48 +1208,6 @@ class Worker {
     }
     #endif
 
-    static async void StatReportLoop(TcpClient ctl) {
-        while (true) {
-            await Task.Delay(2000);
-            int cpu = ServerMetrics.CpuMillis();
-            int rss = ServerMetrics.MemoryRssBytes();
-            int _n = await ctl.SendAsync("STAT " + Convert.ToString(ProcessHost.WorkerId())
-                + " " + Convert.ToString(ProcessHost.Pid())
-                + " " + Convert.ToString(statRequests)
-                + " " + Convert.ToString(cpu)
-                + " " + Convert.ToString(rss) + "\n");
-            if (_n <= 0) { return; }
-        }
-    }
-
-    // Parses one "STAT wid pid req cpuMs rss" line from a worker.
-    static void RecordStat(string line) {
-        List<string> f = SplitWords(line);
-        if (f.Count < 6) { return; }
-        if (f[0] != "STAT") { return; }
-        int wid = Convert.ToInt32(f[1]);
-        int slot = -1;
-        int i = 0;
-        while (i < stWid.Count) {
-            if (stWid[i] == wid) { slot = i; break; }
-            i = i + 1;
-        }
-        if (slot < 0) {
-            stWid.Add(wid);
-            stPid.Add(0);
-            stReq.Add(0);
-            stPrevReq.Add(0);
-            stCpuMs.Add(0);
-            stPrevCpuMs.Add(0);
-            stRss.Add(0);
-            slot = stWid.Count - 1;
-        }
-        stPid[slot] = Convert.ToInt32(f[2]);
-        stReq[slot] = Convert.ToInt32(f[3]);
-        stCpuMs[slot] = Convert.ToInt32(f[4]);
-        stRss[slot] = Convert.ToInt32(f[5]);
-    }
-
     static List<string> SplitWords(string s) {
         List<string> parts = new List<string>();
         StringBuilder sb = new StringBuilder();
@@ -1181,23 +1238,34 @@ class Worker {
             StringBuilder sb = new StringBuilder();
             sb.Append("[status]");
             int totQps = 0;
-            int i = 0;
-            while (i < stWid.Count) {
-                int dReq = stReq[i] - stPrevReq[i];
-                int dCpu = stCpuMs[i] - stPrevCpuMs[i];
-                stPrevReq[i] = stReq[i];
-                stPrevCpuMs[i] = stCpuMs[i];
+            int procs = MaxCount();
+            while (stPrevReq.Count <= procs) {
+                stPrevReq.Add(0);
+                stPrevCpuMs.Add(0);
+            }
+            int wid = 1;
+            while (wid <= procs) {
+                int pid = StatsRead(wid, "pid");
+                if (pid == 0) { wid = wid + 1; continue; }
+                int recv = StatsRead(wid, "recv");
+                int cpu = StatsRead(wid, "cpu");
+                int dReq = recv - stPrevReq[wid];
+                int dCpu = cpu - stPrevCpuMs[wid];
+                stPrevReq[wid] = recv;
+                stPrevCpuMs[wid] = cpu;
                 int qps = (dReq * 1000) / dWall;
                 totQps = totQps + qps;
                 int cpuPct = -1;
-                if (stCpuMs[i] >= 0 && dCpu >= 0) { cpuPct = (dCpu * 100) / dWall; }
-                sb.Append(" | w" + Convert.ToString(stWid[i])
-                    + " pid=" + Convert.ToString(stPid[i])
-                    + " reqs=" + Convert.ToString(stReq[i])
+                if (cpu >= 0 && dCpu >= 0) { cpuPct = (dCpu * 100) / dWall; }
+                sb.Append(" | w" + Convert.ToString(wid)
+                    + " pid=" + Convert.ToString(pid)
+                    + " reqs=" + Convert.ToString(recv)
                     + " qps=" + Convert.ToString(qps)
+                    + " sent=" + Convert.ToString(StatsRead(wid, "sent"))
+                    + " conns=" + Convert.ToString(StatsRead(wid, "conns"))
                     + " cpu=" + Convert.ToString(cpuPct) + "%"
-                    + " mem=" + Convert.ToString(stRss[i] / 1048576) + "MB");
-                i = i + 1;
+                    + " mem=" + Convert.ToString(StatsRead(wid, "rss") / 1048576) + "MB");
+                wid = wid + 1;
             }
             sb.Append(" | total qps=" + Convert.ToString(totQps));
             Console.WriteLine(sb.ToString());
@@ -1222,16 +1290,11 @@ class Worker {
             if (cpu >= 0) { cpuPct = ((cpu - prevCpu) * 100) / dWall; }
             prevReq = statRequests;
             prevCpu = cpu;
-            int conns = 0;
-            int i = 0;
-            while (i < workers.Count) {
-                conns = conns + workers[i].connectionCount;
-                i = i + 1;
-            }
             Console.WriteLine("[status] pid=" + Convert.ToString(ProcessHost.Pid())
                 + " reqs=" + Convert.ToString(statRequests)
                 + " qps=" + Convert.ToString(qps)
-                + " conns=" + Convert.ToString(conns)
+                + " sent=" + Convert.ToString(statSent)
+                + " conns=" + Convert.ToString(LiveConnections())
                 + " cpu=" + Convert.ToString(cpuPct) + "%"
                 + " mem=" + Convert.ToString(rss / 1048576) + "MB");
         }
@@ -1375,7 +1438,7 @@ class Worker {
     // proven indirect async-call path (spawning the delegate call directly does
     // not build a task frame).
     async void RunRaw(int clientSock) {
-        Worker.BumpStat();
+        // The delegate owns the protocol, so it counts its own messages.
         await this.onRawConnection(clientSock);
     }
 
@@ -1409,6 +1472,7 @@ class Worker {
                 }
                 if (response.Length > 0) {
                     int _n = await client.SendAsync(response);
+                    BumpSent();
                 }
             }
         }
@@ -1523,6 +1587,7 @@ class Worker {
                     if (response.Length > 65535) { hdrLen = 10; }
                     else if (response.Length > 125) { hdrLen = 4; }
                     writer.Append(encoded, hdrLen + response.Length);
+                    BumpSent();
                 }
             } else if (frame.opcode == WsOpcode.Ping) {
                 WsFrame pong = WsFrame.PongFrame();
@@ -1607,6 +1672,7 @@ class Worker {
                 }
                 if (response.Length > 0 && peerPort > 0) {
                     int _n = await Socket.SendToAsync(sock, response, response.Length, peerIp, peerPort);
+                    BumpSent();
                 }
             }
         }
@@ -1664,11 +1730,13 @@ class Connection {
     /// reply from onMessage so it is framed; Send writes raw bytes.</summary>
     void Send(string data) {
         Task.Spawn(Socket.SendStringAsync(this.sock, data));
+        Worker.BumpSent();
     }
 
     /// <summary>Sends data and suspends until it is written.</summary>
     async int SendAsync(string data) {
         int n = await Socket.SendStringAsync(this.sock, data);
+        Worker.BumpSent();
         return n;
     }
 
