@@ -136,6 +136,153 @@ partial class DataTable {
         return s;
     }
 
+    // ---- date support ----
+    // A date column stores text but sorts, groups and totals on a day number
+    // (days since 1970-01-01, negative before it), so "2026-01-05" orders after
+    // "2025-12-31" instead of tying on a string compare. The day number goes
+    // through the existing int key path, so sorting costs no extra machinery.
+
+    /// Parse a date, returning days since the epoch, or `DataTable.NoDate` when
+    /// the text holds no recognisable date. Accepts any single non-digit
+    /// separator ("2026-07-26", "2026/7/6", "2026.7.6"), an optional trailing
+    /// time (ignored), and the field order named by `dateOrder`:
+    /// 0 = y-m-d, 1 = d-m-y, 2 = m-d-y. Two-digit years map to 2000..2069 /
+    /// 1970..1999. A bare 8-digit run is read as YYYYMMDD.
+    static int ParseDate(string s, int dateOrder) {
+        int n = s.Length;
+        List<int> nums = new List<int>();
+        List<int> lens = new List<int>();
+        int i = 0;
+        // Take the first three digit runs; a trailing time contributes more runs
+        // that we simply drop.
+        while (i < n && nums.Count < 3) {
+            int c = (int)s[i];
+            if (c >= 48 && c <= 57) {
+                int v = 0;
+                int len = 0;
+                bool run = true;
+                while (i < n && run) {
+                    int d = (int)s[i];
+                    if (d < 48 || d > 57) { run = false; } else {
+                        v = v * 10 + (d - 48);
+                        len = len + 1;
+                        i = i + 1;
+                    }
+                }
+                nums.Add(v);
+                lens.Add(len);
+            } else {
+                i = i + 1;
+            }
+        }
+
+        // A single 8-digit run is a packed YYYYMMDD.
+        if (nums.Count == 1 && lens[0] == 8) {
+            int p = nums[0];
+            int py = p / 10000;
+            int pm = (p / 100) - py * 100;
+            int pd = p - py * 10000 - pm * 100;
+            return DataTable.DateFromYmd(py, pm, pd);
+        }
+        if (nums.Count < 3) { return DataTable.NoDate(); }
+
+        int y = nums[0];
+        int m = nums[1];
+        int d = nums[2];
+        if (dateOrder == 1) { d = nums[0]; m = nums[1]; y = nums[2]; }
+        else if (dateOrder == 2) { m = nums[0]; d = nums[1]; y = nums[2]; }
+        // A 4-digit run in the leading slot always wins over the declared
+        // order, so an ISO value parses correctly under any dateOrder.
+        if (lens[0] == 4) { y = nums[0]; m = nums[1]; d = nums[2]; }
+        if (y < 100) {
+            if (y < 70) { y = y + 2000; } else { y = y + 1900; }
+        }
+        return DataTable.DateFromYmd(y, m, d);
+    }
+
+    /// Sentinel day number for "not a date": sorts before every real date and
+    /// is rendered as an empty cell.
+    static int NoDate() { return 0 - 100000000; }
+
+    // Validate the fields, then convert to a day number.
+    static int DateFromYmd(int y, int m, int d) {
+        if (m < 1 || m > 12) { return DataTable.NoDate(); }
+        if (d < 1 || d > DateTime.DaysInMonth(y, m)) { return DataTable.NoDate(); }
+        return DateTime.DaysFromCivil(y, m, d);
+    }
+
+    /// Render a day number using the pattern named by `dateFmt`:
+    /// 0 = YYYY-MM-DD, 1 = DD/MM/YYYY, 2 = MM/DD/YYYY, 3 = YYYY年M月D日,
+    /// 4 = YYYY-MM (month), 5 = YYYY (year), 6 = "1 Jan 2026".
+    static string FormatDate(int days, int dateFmt) {
+        if (days == DataTable.NoDate()) { return ""; }
+        DateTime t = DateTime.FromUnixSeconds(days * 86400);
+        int y = t.Year();
+        int m = t.Month();
+        int d = t.Day();
+        if (dateFmt == 1) {
+            return DateTime.Pad2(d) + "/" + DateTime.Pad2(m) + "/" + Convert.ToString(y);
+        }
+        if (dateFmt == 2) {
+            return DateTime.Pad2(m) + "/" + DateTime.Pad2(d) + "/" + Convert.ToString(y);
+        }
+        if (dateFmt == 3) {
+            return Convert.ToString(y) + Text.CharStr(24180) + Convert.ToString(m)
+                 + Text.CharStr(26376) + Convert.ToString(d) + Text.CharStr(26085);
+        }
+        if (dateFmt == 4) { return Convert.ToString(y) + "-" + DateTime.Pad2(m); }
+        if (dateFmt == 5) { return Convert.ToString(y); }
+        if (dateFmt == 6) {
+            return Convert.ToString(d) + " " + DataTable.MonthAbbr(m) + " " + Convert.ToString(y);
+        }
+        return Convert.ToString(y) + "-" + DateTime.Pad2(m) + "-" + DateTime.Pad2(d);
+    }
+
+    static string MonthAbbr(int m) {
+        if (m == 1) { return "Jan"; }
+        if (m == 2) { return "Feb"; }
+        if (m == 3) { return "Mar"; }
+        if (m == 4) { return "Apr"; }
+        if (m == 5) { return "May"; }
+        if (m == 6) { return "Jun"; }
+        if (m == 7) { return "Jul"; }
+        if (m == 8) { return "Aug"; }
+        if (m == 9) { return "Sep"; }
+        if (m == 10) { return "Oct"; }
+        if (m == 11) { return "Nov"; }
+        if (m == 12) { return "Dec"; }
+        return "";
+    }
+
+    /// Bucket label for grouping a date cell, per `dateGroup`:
+    /// 0 = exact day, 1 = year, 2 = year+month, 3 = quarter, 4 = day of week.
+    /// Grouping by month collapses every day of a month into one header.
+    static string DateGroupKey(int days, int dateGroup) {
+        if (days == DataTable.NoDate()) { return ""; }
+        if (dateGroup == 0) { return DataTable.FormatDate(days, 0); }
+        DateTime t = DateTime.FromUnixSeconds(days * 86400);
+        int y = t.Year();
+        if (dateGroup == 1) { return Convert.ToString(y); }
+        if (dateGroup == 2) { return Convert.ToString(y) + "-" + DateTime.Pad2(t.Month()); }
+        if (dateGroup == 3) {
+            int q = (t.Month() - 1) / 3 + 1;
+            return Convert.ToString(y) + " Q" + Convert.ToString(q);
+        }
+        if (dateGroup == 4) { return DataTable.DayName(t.DayOfWeek()); }
+        return DataTable.FormatDate(days, 0);
+    }
+
+    static string DayName(int dow) {
+        if (dow == 0) { return "Sunday"; }
+        if (dow == 1) { return "Monday"; }
+        if (dow == 2) { return "Tuesday"; }
+        if (dow == 3) { return "Wednesday"; }
+        if (dow == 4) { return "Thursday"; }
+        if (dow == 5) { return "Friday"; }
+        if (dow == 6) { return "Saturday"; }
+        return "";
+    }
+
     // Insert thousands separators into a run of digits. Left untouched if the
     // string contains any non-digit (so it never mangles a non-numeric cell).
     static string GroupDigits(string ipart) {
@@ -163,6 +310,14 @@ partial class DataTable {
     // grouping of the integer part plus prefix/suffix. Sign and any fractional
     // part are preserved. Returns the raw value unchanged when fmt is off.
     static string FormatCell(DataColumn col, string raw) {
+        // Date columns re-render from the parsed day number, so mixed stored
+        // spellings ("2026/7/6", "20260706") all display identically. Text that
+        // does not parse as a date is shown as typed rather than blanked.
+        if (col.isDate) {
+            int dk = DataTable.ParseDate(raw, col.dateOrder);
+            if (dk == DataTable.NoDate()) { return raw; }
+            return DataTable.FormatDate(dk, col.dateFmt);
+        }
         if (col.fmt == 0) { return raw; }
         if (raw.Length == 0) { return raw; }
         // Fixed-decimal columns re-render from the parsed value so every cell
@@ -346,6 +501,13 @@ partial class DataTable {
     // 1.5 and 1.9 no longer tie, integer columns keep the exact int path, and
     // everything else compares as text.
     static int CompareCellCol(DataColumn col, string a, string b) {
+        if (col.isDate) {
+            int ka = DataTable.ParseDate(a, col.dateOrder);
+            int kb = DataTable.ParseDate(b, col.dateOrder);
+            if (ka < kb) { return -1; }
+            if (ka > kb) { return 1; }
+            return 0;
+        }
         if (col.numeric && col.decimals > 0) {
             double da = DataTable.ParseReal(a);
             double db = DataTable.ParseReal(b);
@@ -752,15 +914,29 @@ partial class DataTable {
     // Path key for the group that data row `rowIdx` belongs to at nesting
     // `level` — the concatenation of its group-column values down to that level,
     // joined by a control separator so distinct paths never collide.
-    static string PathKey(DataTableState st, DataSource src, int rowIdx, int level) {
+    static string PathKey(DataTableState st, List<DataColumn> cols, DataSource src,
+                          int rowIdx, int level) {
         string sep = Text.ByteChar(31);
         string k = "";
         int g = 0;
         while (g <= level && g < st.groupCols.Count) {
-            k = k + src.CellText(rowIdx, st.groupCols[g]) + sep;
+            k = k + DataTable.GroupValue(cols, src, rowIdx, st.groupCols[g]) + sep;
             g = g + 1;
         }
         return k;
+    }
+
+    // The value a row contributes to its group at column `gc`. Date columns
+    // collapse to their bucket label (year / month / quarter / weekday), so
+    // grouping by a date does not produce one group per distinct day.
+    static string GroupValue(List<DataColumn> cols, DataSource src, int rowIdx, int gc) {
+        if (gc >= 0 && gc < cols.Count) {
+            DataColumn c = cols[gc];
+            if (c.isDate) {
+                return DataTable.DateGroupKey(src.CellDay(rowIdx, gc, c.dateOrder), c.dateGroup);
+            }
+        }
+        return src.CellText(rowIdx, gc);
     }
 
     // Compare two data rows by the grouping columns (outer→inner), then by the
@@ -771,12 +947,46 @@ partial class DataTable {
             int gc = st.groupCols[g];
             int cmp = DataTable.CompareStr(src.CellText(ra, gc), src.CellText(rb, gc));
             if (gc >= 0 && gc < cols.Count) {
-                cmp = DataTable.CompareCellCol(cols[gc], src.CellText(ra, gc), src.CellText(rb, gc));
+                DataColumn gcol = cols[gc];
+                if (gcol.isDate) {
+                    // Order by the bucket, not the raw day: grouping by weekday
+                    // must put every Monday together, which a day-number sort
+                    // would scatter. Within one bucket the raw day still breaks
+                    // the tie so rows stay chronological.
+                    cmp = DataTable.CmpDateGroup(gcol,
+                                                 src.CellDay(ra, gc, gcol.dateOrder),
+                                                 src.CellDay(rb, gc, gcol.dateOrder));
+                } else {
+                    cmp = DataTable.CompareCellCol(gcol, src.CellText(ra, gc), src.CellText(rb, gc));
+                }
             }
             if (cmp != 0) { return cmp; }
             g = g + 1;
         }
         return DataTable.CmpMultiKey(st, cols, src, ra, rb);
+    }
+
+    // Order two date cells by their group bucket, falling back to the raw day
+    // so rows inside a bucket stay chronological. Weekday buckets (mode 4) are
+    // ordered Sunday..Saturday rather than by date.
+    static int CmpDateGroup(DataColumn col, int da, int db) {
+        int ka = da;
+        int kb = db;
+        if (col.dateGroup == 4) {
+            ka = DataTable.WeekdayOf(da);
+            kb = DataTable.WeekdayOf(db);
+        }
+        if (ka < kb) { return -1; }
+        if (ka > kb) { return 1; }
+        if (da < db) { return -1; }
+        if (da > db) { return 1; }
+        return 0;
+    }
+
+    // Day of week (0=Sunday) for a day number; blanks sort first.
+    static int WeekdayOf(int days) {
+        if (days == DataTable.NoDate()) { return -1; }
+        return DateTime.FloorMod(days + 4, 7);
     }
 
     static void MergeGrp(DataTableState st, List<DataColumn> cols, DataSource src,
@@ -892,27 +1102,27 @@ partial class DataTable {
             while (L < G) {
                 bool isNew = false;
                 if (p == 0) { isNew = true; }
-                else if (DataTable.PathKey(st, src, st.order[p], L)
-                      != DataTable.PathKey(st, src, st.order[p - 1], L)) { isNew = true; }
+                else if (DataTable.PathKey(st, cols, src, st.order[p], L)
+                      != DataTable.PathKey(st, cols, src, st.order[p - 1], L)) { isNew = true; }
                 if (isNew) {
-                    string key = DataTable.PathKey(st, src, rowIdx, L);
+                    string key = DataTable.PathKey(st, cols, src, rowIdx, L);
                     bool ancColl = false;
                     int a = 0;
                     while (a < L) {
-                        if (DataTable.IsCollapsed(st, DataTable.PathKey(st, src, rowIdx, a))) {
+                        if (DataTable.IsCollapsed(st, DataTable.PathKey(st, cols, src, rowIdx, a))) {
                             ancColl = true;
                         }
                         a = a + 1;
                     }
                     int cnt = 0;
                     int q = p;
-                    while (q < N && DataTable.PathKey(st, src, st.order[q], L) == key) {
+                    while (q < N && DataTable.PathKey(st, cols, src, st.order[q], L) == key) {
                         cnt = cnt + 1; q = q + 1;
                     }
                     int gi = st.groups.Count;
                     GroupRow newGrp = new GroupRow(
                         cols[st.groupCols[L]].title + ": "
-                            + src.CellText(rowIdx, st.groupCols[L]),
+                            + DataTable.GroupValue(cols, src, rowIdx, st.groupCols[L]),
                         L, cnt, key, DataTable.IsCollapsed(st, key));
                     DataTable.FillGroupAgg(st, cols, src, newGrp, p, p + cnt);
                     st.groups.Add(newGrp);
@@ -925,7 +1135,7 @@ partial class DataTable {
             bool anyColl = false;
             int a2 = 0;
             while (a2 < G) {
-                if (DataTable.IsCollapsed(st, DataTable.PathKey(st, src, rowIdx, a2))) {
+                if (DataTable.IsCollapsed(st, DataTable.PathKey(st, cols, src, rowIdx, a2))) {
                     anyColl = true;
                 }
                 a2 = a2 + 1;
@@ -1302,9 +1512,11 @@ partial class DataTable {
         if (n < 2) { return; }
         int dir = st.sortDir;
         int sc = st.sortCol;
-        // key kind: 0 string, 1 int, 2 real (fractional numeric column)
+        // key kind: 0 string, 1 int, 2 real (fractional numeric column). A date
+        // column keys on its day number, so it rides the int path.
         int kind = 0;
-        if (cols[sc].numeric) { if (cols[sc].decimals > 0) { kind = 2; } else { kind = 1; } }
+        if (cols[sc].isDate) { kind = 1; }
+        else if (cols[sc].numeric) { if (cols[sc].decimals > 0) { kind = 2; } else { kind = 1; } }
 
         // decorate: pull the sort key for each visible row once (O(n)), so a
         // comparison is a plain int/double/string compare rather than a
@@ -1314,7 +1526,8 @@ partial class DataTable {
         List<double> rkey = new List<double>();
         int q = 0;
         while (q < n) {
-            if (kind == 1) { nkey.Add(src.CellNum(st.order[q], sc)); }
+            if (cols[sc].isDate) { nkey.Add(src.CellDay(st.order[q], sc, cols[sc].dateOrder)); }
+            else if (kind == 1) { nkey.Add(src.CellNum(st.order[q], sc)); }
             else if (kind == 2) { rkey.Add(src.CellReal(st.order[q], sc)); }
             else { skey.Add(src.CellText(st.order[q], sc)); }
             q = q + 1;
