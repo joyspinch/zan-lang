@@ -1,0 +1,272 @@
+// Terrain compositing: map bounds and back-to-front draw order.
+//
+// Clean-room: a synthetic theater, a hand-built TMP template and a hand-built
+// IsoMapPack5 record array. No game data -- data/ is the user's own install.
+//
+// Draw order is checked through the rendered pixels rather than by walking the
+// cells again: re-implementing the ordering in the test would pass even if
+// MapRenderer sorted differently.
+using System;
+using System.Collections.Generic;
+using System.IO;
+using Ra2.Assets;
+using Ra2.Formats;
+using Ra2.Render;
+
+namespace T;
+
+class Program {
+    [DllImport("crt")] static extern string calloc(int count, int size);
+
+    // Tiles are deliberately the real 60x30 diamond: Bounds sizes the canvas
+    // from IsoProjection's constants, so a synthetic tile of another size
+    // would render correctly but leave the canvas padded and the golden file
+    // full of blank rows.
+    static int TileW() { return 60; }
+    static int TileH() { return 30; }
+
+    static void PutU32(string buf, int at, int v) {
+        buf[at] = (char)(v & 0xFF);
+        buf[at + 1] = (char)((v >> 8) & 0xFF);
+        buf[at + 2] = (char)((v >> 16) & 0xFF);
+        buf[at + 3] = (char)((v >> 24) & 0xFF);
+    }
+
+    // A one-tile TMP whose diamond is filled with a single palette index, so
+    // the index a pixel carries names the cell that painted it.
+    static string BuildTmp(int fill, List<int> outLen) {
+        int cx = Program.TileW();
+        int cy = Program.TileH();
+        // header(16) + directory(4) + tile header(52) + base pixels
+        int basePixels = 0;
+        int width = 4;
+        int j = 0;
+        while (j < cy) {
+            basePixels = basePixels + width;
+            if (j < cy / 2 - 1) { width = width + 4; } else { width = width - 4; }
+            j = j + 1;
+        }
+        int tileOff = 16 + 4;
+        int total = tileOff + 52 + basePixels;
+        string buf = Program.calloc(total + 1, 1);
+        Program.PutU32(buf, 0, 1);        // blocksX
+        Program.PutU32(buf, 4, 1);        // blocksY
+        Program.PutU32(buf, 8, cx);
+        Program.PutU32(buf, 12, cy);
+        Program.PutU32(buf, 16, tileOff); // directory entry 0
+        // The 52-byte tile header is left zero; only the pixels matter here.
+        int i = 0;
+        while (i < basePixels) {
+            buf[tileOff + 52 + i] = (char)fill;
+            i = i + 1;
+        }
+        outLen.Add(total);
+        return buf;
+    }
+
+    static string Hex8(int v) {
+        string digits = "0123456789abcdef";
+        StringBuilder sb = new StringBuilder();
+        int shift = 28;
+        while (shift >= 0) {
+            sb.Append(digits.Substring((v >> shift) & 0x0F, 1));
+            shift = shift - 4;
+        }
+        return sb.ToString();
+    }
+
+    // Samples the canvas at an offset from a cell's apex and reports which
+    // cell's fill index landed there. Bounds' origin has to come off the same
+    // way MapRenderer subtracts it when blitting.
+    static void Probe(string label, Texture canvas,
+                      int cellX, int cellY, List<int> bounds, int dx, int dy) {
+        int sx = IsoProjection.ScreenX(cellX, cellY) - bounds[0] + dx;
+        int sy = IsoProjection.ScreenY(cellX, cellY, 0) - bounds[1] + dy;
+        int px = canvas.PixelAt(sx, sy);
+        string who = "none";
+        if (((px >> 24) & 0xFF) != 0) {
+            if ((px & 0xFF) < 128) { who = "a"; } else { who = "b"; }
+        }
+        Console.WriteLine(label + "=" + who + " rgba=" + Program.Hex8(px));
+    }
+
+    // 768-byte palette; entry i is grey (i, i, i) in 6-bit channels.
+    static string BuildPal() {
+        string raw = Program.calloc(768 + 1, 1);
+        int i = 0;
+        while (i < 256) {
+            raw[i * 3] = (char)(i & 0x3F);
+            raw[i * 3 + 1] = (char)(i & 0x3F);
+            raw[i * 3 + 2] = (char)(i & 0x3F);
+            i = i + 1;
+        }
+        return raw;
+    }
+
+    // An IsoMapPack5 record is 11 bytes: x(u16) y(u16) tile(i32) sub(u8)
+    // level(u8) ice(u8).
+    static void PutCell(string buf, int at, int x, int y, int tile, int level) {
+        buf[at] = (char)(x & 0xFF);
+        buf[at + 1] = (char)((x >> 8) & 0xFF);
+        buf[at + 2] = (char)(y & 0xFF);
+        buf[at + 3] = (char)((y >> 8) & 0xFF);
+        buf[at + 4] = (char)(tile & 0xFF);
+        buf[at + 5] = (char)((tile >> 8) & 0xFF);
+        buf[at + 6] = (char)0;
+        buf[at + 7] = (char)0;
+        buf[at + 8] = (char)0;          // subTile
+        buf[at + 9] = (char)(level & 0xFF);
+        buf[at + 10] = (char)0;         // iceGrowth
+    }
+
+    // Byte-at-a-time so embedded NULs survive: a TMP header is mostly zero,
+    // and Substring would cut the buffer at the first one.
+    static void WriteBytes(string path, string data, int len) {
+        FileStream fs = FileStream.Create(path);
+        int i = 0;
+        while (i < len) {
+            fs.WriteByte(data[i] & 0xFF);
+            i = i + 1;
+        }
+        fs.Close();
+    }
+
+    static void Main() {
+        string dir = "build/ra2_test_maprender_data";
+        Directory.CreateDirectory(dir);
+
+        // Two sets so the two cells that overlap can carry different art and
+        // the winner is identifiable from its palette index.
+        StringBuilder ini = new StringBuilder();
+        ini.Append("[TileSet0000]\nSetName=A\nFileName=aa\nTilesInSet=1\n");
+        ini.Append("[TileSet0001]\nSetName=B\nFileName=bb\nTilesInSet=1\n");
+        File.WriteAllText(dir + "/TEMPERAT.INI", ini.ToString());
+
+        // Indices 1 and 63 rather than round numbers: the palette masks to
+        // 6 bits, so e.g. 100 and 200 invert (100 -> 36, 200 -> 8) and the
+        // brighter tile would be the one with the smaller index.
+        List<int> tlen = new List<int>();
+        string ta = Program.BuildTmp(1, tlen);
+        Program.WriteBytes(dir + "/AA01.TEM", ta, tlen[0]);
+        List<int> tlen2 = new List<int>();
+        string tb = Program.BuildTmp(63, tlen2);
+        Program.WriteBytes(dir + "/BB01.TEM", tb, tlen2[0]);
+        Program.WriteBytes(dir + "/ISOTEM.PAL", Program.BuildPal(), 768);
+
+        // Two adjacent cells. Their diamonds are half a tile apart on x, so
+        // they genuinely overlap; (2,1) has the larger x+y and must therefore
+        // be painted second and win the shared pixels.
+        int n = 2;
+        string buf = Program.calloc(n * 11 + 1, 1);
+        Program.PutCell(buf, 0, 1, 1, 0, 0);   // set A, key 2, drawn first
+        Program.PutCell(buf, 11, 2, 1, 1, 0);  // set B, key 3, drawn last
+
+        IsoMap iso = IsoMap.Parse(buf, n * 11, 8, 8);
+        Console.WriteLine("cells=" + Convert.ToString(iso.Count()));
+
+        Vfs vfs = Vfs.Create();
+        vfs.MountDirectory(dir);
+        AssetDb db = AssetDb.Load(vfs);
+        Theater th = Theater.Load(vfs, db, "temperate");
+        Console.WriteLine("f0=" + th.FileForTile(0) + " f1=" + th.FileForTile(1));
+
+        List<int> b = new List<int>();
+        MapRenderer.Bounds(iso, b);
+        Console.WriteLine("origin=" + Convert.ToString(b[0]) + ","
+            + Convert.ToString(b[1]));
+        Console.WriteLine("size=" + Convert.ToString(b[2]) + "x"
+            + Convert.ToString(b[3]));
+
+        MapRenderer mr = MapRenderer.Create(iso, th);
+        Console.WriteLine("world=" + Convert.ToString(mr.WorldWidth()) + "x"
+            + Convert.ToString(mr.WorldHeight())
+            + " ordered=" + Convert.ToString(mr.CellCount()));
+
+        // A view covering the whole map draws both cells.
+        Texture canvas = Texture.Create(mr.WorldWidth(), mr.WorldHeight());
+        int drawn = mr.RenderInto(canvas, 0, 0);
+        Console.WriteLine("drawn_all=" + Convert.ToString(drawn));
+
+        // Culling: a view scrolled far past the terrain draws nothing at all.
+        Texture far = Texture.Create(60, 30);
+        Console.WriteLine("drawn_far=" + Convert.ToString(mr.RenderInto(far, 5000, 5000)));
+        far.Close();
+
+        // Probe the cells' apex-relative pixels instead of dumping a 60x30
+        // canvas. Each diamond's widest row is its vertical centre, so a point
+        // there is inside the tile; 'a' and 'b' name which cell painted it.
+        // A tile's diamond is widest at row 14 and spans the full 60px there,
+        // so it sits at (+30, +14) from the apex the blit lands on. The two
+        // cells are half a tile apart on both axes, so (1,1) owns the upper
+        // left, (2,1) the lower right, and a band between them is shared.
+        Program.Probe("a_only", canvas, 1, 1, b, 10, 14);
+        Program.Probe("b_only", canvas, 2, 1, b, 50, 14);
+
+        // Rather than reason about which pixel is in both diamonds, find the
+        // shared band by scanning: any pixel a lone (1,1) would have painted
+        // but that now reads as 'b' proves (2,1) was drawn over it. Reporting
+        // the count keeps the test honest -- a zero here would mean the cells
+        // never overlapped and the ordering was never exercised.
+        int shared = 0;
+        int firstX = -1;
+        int firstY = -1;
+        int py = 0;
+        while (py < canvas.Height()) {
+            int px = 0;
+            while (px < canvas.Width()) {
+                int v = canvas.PixelAt(px, py);
+                if (((v >> 24) & 0xFF) != 0 && (v & 0xFF) > 128) {
+                    // 'b' pixels that fall inside (1,1)'s diamond footprint.
+                    int lx = px - (IsoProjection.ScreenX(1, 1) - b[0]);
+                    int ly = py - (IsoProjection.ScreenY(1, 1, 0) - b[1]);
+                    if (ly >= 0 && ly < IsoProjection.TileH()) {
+                        int half = 2 + ly * 2;
+                        if (ly >= IsoProjection.TileH() / 2) {
+                            half = 2 + (IsoProjection.TileH() - 1 - ly) * 2;
+                        }
+                        int cxm = IsoProjection.TileW() / 2;
+                        if (lx >= cxm - half && lx < cxm + half) {
+                            shared = shared + 1;
+                            if (firstX < 0) { firstX = lx; firstY = ly; }
+                        }
+                    }
+                }
+                px = px + 1;
+            }
+            py = py + 1;
+        }
+        Console.WriteLine("overdrawn=" + Convert.ToString(shared)
+            + " first=" + Convert.ToString(firstX) + "," + Convert.ToString(firstY));
+
+        // The whole-map thumbnail: one pixel per cell, squeezed into any
+        // canvas size. A blank preview would still "work" on screen, so the
+        // painted-pixel count is what the test pins.
+        Texture pv = Texture.Create(40, 20);
+        mr.RenderPreview(pv);
+        int painted = 0;
+        int py = 0;
+        while (py < pv.Height()) {
+            int px = 0;
+            while (px < pv.Width()) {
+                if (((pv.PixelAt(px, py) >> 24) & 0xFF) != 0) { painted = painted + 1; }
+                px = px + 1;
+            }
+            py = py + 1;
+        }
+        Console.WriteLine("preview_painted=" + Convert.ToString(painted));
+        // A degenerate canvas is refused rather than dividing by zero.
+        Texture zero = Texture.Create(0, 0);
+        mr.RenderPreview(zero);
+        Console.WriteLine("preview_zero_ok=1");
+        zero.Close();
+        pv.Close();
+
+        canvas.Close();
+        th.Close();
+        File.Delete(dir + "/AA01.TEM");
+        File.Delete(dir + "/BB01.TEM");
+        File.Delete(dir + "/ISOTEM.PAL");
+        File.Delete(dir + "/TEMPERAT.INI");
+        Directory.Delete(dir);
+    }
+}

@@ -1,0 +1,82 @@
+using System;
+using System.Collections.Generic;
+
+namespace Ra2.Render;
+
+/// <summary>Maps between IsoMapPack5 cell coordinates and screen pixels.</summary>
+///
+/// RA2's world is a square cell grid rotated 45 degrees. A tile's base graphic
+/// is a 60x30 diamond, so stepping one cell in x moves half a tile right and
+/// half a tile down, and one cell in y moves half a tile left and half down:
+///
+///   screenX = (x - y) * 30
+///   screenY = (x + y) * 15
+///
+/// That puts cell (0,0) at the top of the diamond and grows the map downward,
+/// with x running to the lower-right and y to the lower-left. Because x and y
+/// both push down, the drawn area is a diamond whose bounding box is twice the
+/// declared map size on the x axis.
+///
+/// Cell space is not bounded by the map's declared size: the pack covers a
+/// (w+h) square, of which only the middle diamond is playable.
+class IsoProjection {
+    /// Half of a tile's width -- one cell step along x.
+    static int HalfW() { return 30; }
+    /// Half of a tile's height.
+    static int HalfH() { return 15; }
+    /// The full diamond, matching the TMP tile graphics.
+    static int TileW() { return 60; }
+    static int TileH() { return 30; }
+
+    /// <summary>Each level of elevation lifts a cell by half a tile height, so
+    /// a cliff reads as a step rather than a seam.</summary>
+    static int LevelRise() { return 15; }
+
+    /// <summary>The pixel position of a cell's top-left corner, before the
+    /// camera is applied. Elevation raises the tile.</summary>
+    static int ScreenX(int cellX, int cellY) {
+        return (cellX - cellY) * IsoProjection.HalfW();
+    }
+
+    static int ScreenY(int cellX, int cellY, int level) {
+        return (cellX + cellY) * IsoProjection.HalfH()
+             - level * IsoProjection.LevelRise();
+    }
+
+    /// <summary>The cell under a screen point, inverting the projection.
+    /// Cell x and y are written to slots 0 and 1 of outXy.</summary>
+    ///
+    /// Elevation is not accounted for: this is the ground-level cell, which is
+    /// what mouse picking on flat terrain wants.
+    ///
+    /// Solving the forward transform gives
+    ///   x = (sy / halfH + sx / halfW) / 2,  y = (sy / halfH - sx / halfW) / 2
+    /// but every division here has to floor rather than truncate. C division
+    /// rounds toward zero, so a point anywhere left of the origin lands one
+    /// cell too far right, and the sum/difference halving repeats the error --
+    /// picking was off by one across the whole negative half of the map.
+    static void CellAt(int screenX, int screenY, List<int> outXy) {
+        int a = IsoProjection.FloorDiv(screenY * 2, IsoProjection.TileH());
+        int b = IsoProjection.FloorDiv(screenX * 2, IsoProjection.TileW());
+        int x = IsoProjection.FloorDiv(a + b, 2);
+        int y = IsoProjection.FloorDiv(a - b, 2);
+        IsoProjection.SetSlot(outXy, 0, x);
+        IsoProjection.SetSlot(outXy, 1, y);
+    }
+
+    /// <summary>Integer division that rounds toward negative infinity.</summary>
+    static int FloorDiv(int n, int d) {
+        int q = n / d;
+        // C truncates toward zero; when the signs differ and the division was
+        // not exact, that is one greater than the floor.
+        if ((n % d) != 0) {
+            if ((n < 0) != (d < 0)) { q = q - 1; }
+        }
+        return q;
+    }
+
+    static void SetSlot(List<int> list, int slot, int v) {
+        while (list.Count <= slot) { list.Add(0); }
+        list[slot] = v;
+    }
+}
