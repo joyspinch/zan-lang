@@ -142,7 +142,9 @@ static int64_t *g_pending_accept_out;
 
 /* On POSIX there is no overlapped recv, so zan_io_recv_co registers a readiness
  * watcher and performs the recv here once the fd is readable -- same net effect
- * (one recv per await, byte count delivered via out_n). No-op for plain probes. */
+ * (one recv per await, byte count delivered via out_n). No-op for plain probes.
+ * (The epoll backend has its own slot-based io_deliver_waiter.) */
+#if !defined(__linux__)
 static void io_deliver_recv(zan_io_entry_t *e) {
     if (e->out_accept) {
         *e->out_accept = (int64_t)accept(e->fd, NULL, NULL);
@@ -152,6 +154,7 @@ static void io_deliver_recv(zan_io_entry_t *e) {
     ssize_t rn = recv(e->fd, e->rbuf, (size_t)e->rlen, 0);
     *e->out_n = (rn < 0) ? 0 : (int64_t)rn;
 }
+#endif
 #endif
 
 #if defined(_WIN32)
@@ -273,9 +276,40 @@ int64_t zan_io_connect_status(int64_t fd) {
 /* ---- platform backend ---- */
 
 #if defined(__linux__)
-/* ==================== EPOLL ==================== */
+/* ==================== EPOLL ====================
+ *
+ * Watchers live in an fd-indexed slot table, not a linked list: registering
+ * and waking are O(1) with no per-await malloc, and a fd stays a member of
+ * the epoll set for its whole life. Readiness is armed with EPOLLONESHOT and
+ * re-armed with EPOLL_CTL_MOD, so an await costs one epoll_ctl instead of the
+ * ADD + DEL pair (and none of the list walking) the previous version needed.
+ */
 
 static int g_epoll_fd = -1;
+
+/* One waiter per direction is stored inline in the slot (the common case:
+ * one coroutine reading and/or writing a socket). The rare extra waiter on
+ * the same fd+direction chains through `next`. */
+typedef struct zan_io_waiter {
+    void *co;
+    zan_co_step_t step;
+    void *rbuf;
+    int   rlen;
+    int64_t *out_n;
+    int64_t *out_accept;
+    struct zan_io_waiter *next;   /* overflow chain (usually NULL) */
+} zan_io_waiter_t;
+
+typedef struct {
+    zan_io_waiter_t r;
+    zan_io_waiter_t w;
+    unsigned char has_r;
+    unsigned char has_w;
+    unsigned char in_epoll;   /* fd is a member of the epoll set */
+} zan_io_slot_t;
+
+static zan_io_slot_t *g_slots;
+static int g_slots_cap;
 
 void zan_io_init(void) {
     if (g_io_started) return;
@@ -286,13 +320,18 @@ void zan_io_init(void) {
 }
 
 void zan_io_shutdown(void) {
-    /* remove all entries */
-    zan_io_entry_t *e = g_io_entries;
-    while (e) {
-        zan_io_entry_t *n = e->next;
-        epoll_ctl(g_epoll_fd, EPOLL_CTL_DEL, e->fd, NULL);
-        free(e);
-        e = n;
+    if (g_slots) {
+        for (int fd = 0; fd < g_slots_cap; fd++) {
+            zan_io_slot_t *s = &g_slots[fd];
+            if (s->in_epoll) epoll_ctl(g_epoll_fd, EPOLL_CTL_DEL, fd, NULL);
+            zan_io_waiter_t *x = s->r.next;
+            while (x) { zan_io_waiter_t *n = x->next; free(x); x = n; }
+            x = s->w.next;
+            while (x) { zan_io_waiter_t *n = x->next; free(x); x = n; }
+        }
+        free(g_slots);
+        g_slots = NULL;
+        g_slots_cap = 0;
     }
     g_io_entries = NULL;
     g_io_count = 0;
@@ -306,53 +345,137 @@ int zan_io_set_nonblocking(int64_t fd) {
     return fcntl((int)fd, F_SETFL, flags | O_NONBLOCK);
 }
 
-static void io_register(int fd, int interest, void *co, zan_co_step_t step) {
-    zan_io_entry_t *e = (zan_io_entry_t *)calloc(1, sizeof(*e));
-    e->fd = fd;
-    e->interest = interest;
-    e->co = co;
-    e->step = step;
-    e->rbuf = g_pending_rbuf;
-    e->rlen = g_pending_rlen;
-    e->out_n = g_pending_out_n;
-    g_pending_rbuf = NULL;
-    g_pending_out_n = NULL;
-    e->next = g_io_entries;
-    g_io_entries = e;
-    g_io_count++;
+static zan_io_slot_t *io_slot(int fd) {
+    if (fd < 0) return NULL;
+    if (fd >= g_slots_cap) {
+        int cap = g_slots_cap ? g_slots_cap * 2 : 256;
+        while (cap <= fd) cap *= 2;
+        zan_io_slot_t *ns = (zan_io_slot_t *)realloc(g_slots, (size_t)cap * sizeof(*ns));
+        if (!ns) return NULL;
+        memset(ns + g_slots_cap, 0, (size_t)(cap - g_slots_cap) * sizeof(*ns));
+        g_slots = ns;
+        g_slots_cap = cap;
+    }
+    return &g_slots[fd];
+}
 
+/* (Re-)arm `fd` for the directions that still have waiters. EPOLLONESHOT keeps
+ * the fd registered but disabled after each wake, so re-arming is a MOD; the
+ * ADD/ENOENT fallbacks cover a first registration and a recycled fd number. */
+static void io_arm(int fd, zan_io_slot_t *s) {
     struct epoll_event ev;
     memset(&ev, 0, sizeof(ev));
     ev.data.fd = fd;
-    ev.events = (interest == ZAN_IO_READ) ? EPOLLIN : EPOLLOUT;
-    ev.events |= EPOLLONESHOT;
-    epoll_ctl(g_epoll_fd, EPOLL_CTL_ADD, fd, &ev);
+    ev.events = EPOLLONESHOT;
+    if (s->has_r) ev.events |= EPOLLIN;
+    if (s->has_w) ev.events |= EPOLLOUT;
+    if (!s->in_epoll) {
+        if (epoll_ctl(g_epoll_fd, EPOLL_CTL_ADD, fd, &ev) == 0) {
+            s->in_epoll = 1;
+        } else if (errno == EEXIST) {
+            epoll_ctl(g_epoll_fd, EPOLL_CTL_MOD, fd, &ev);
+            s->in_epoll = 1;
+        }
+        return;
+    }
+    if (epoll_ctl(g_epoll_fd, EPOLL_CTL_MOD, fd, &ev) != 0 && errno == ENOENT) {
+        /* fd was closed and its number reused: re-add it. */
+        if (epoll_ctl(g_epoll_fd, EPOLL_CTL_ADD, fd, &ev) != 0) s->in_epoll = 0;
+    }
+}
+
+static void io_register(int fd, int interest, void *co, zan_co_step_t step) {
+    zan_io_slot_t *s = io_slot(fd);
+    if (!s) return;
+    zan_io_waiter_t *w;
+    unsigned char *has = (interest == ZAN_IO_READ) ? &s->has_r : &s->has_w;
+    zan_io_waiter_t *inl = (interest == ZAN_IO_READ) ? &s->r : &s->w;
+    if (!*has) {
+        w = inl;
+        w->next = NULL;
+        *has = 1;
+    } else {
+        /* second waiter on the same fd+direction: chain it (rare) */
+        w = (zan_io_waiter_t *)calloc(1, sizeof(*w));
+        if (!w) return;
+        zan_io_waiter_t *tail = inl;
+        while (tail->next) tail = tail->next;
+        tail->next = w;
+    }
+    w->co = co;
+    w->step = step;
+    w->rbuf = g_pending_rbuf;
+    w->rlen = g_pending_rlen;
+    w->out_n = g_pending_out_n;
+    w->out_accept = g_pending_accept_out;
+    g_pending_rbuf = NULL;
+    g_pending_out_n = NULL;
+    g_pending_accept_out = NULL;
+    g_io_count++;
+
+    io_arm(fd, s);
+}
+
+/* Perform the pending recv/accept for a woken waiter (see io_deliver_recv). */
+static void io_deliver_waiter(int fd, zan_io_waiter_t *w) {
+    if (w->out_accept) {
+        *w->out_accept = (int64_t)accept(fd, NULL, NULL);
+        return;
+    }
+    if (!w->out_n) return;
+    ssize_t rn = recv(fd, w->rbuf, (size_t)w->rlen, 0);
+    *w->out_n = (rn < 0) ? 0 : (int64_t)rn;
+}
+
+/* Detach every waiter of one direction into `out` (an array of at most
+ * `max` entries), returning how many were taken. */
+static int io_take(zan_io_slot_t *s, int fd, int read_dir,
+                   zan_io_waiter_t *out, int max) {
+    unsigned char *has = read_dir ? &s->has_r : &s->has_w;
+    if (!*has) return 0;
+    zan_io_waiter_t *inl = read_dir ? &s->r : &s->w;
+    int n = 0;
+    if (n < max) out[n++] = *inl;
+    zan_io_waiter_t *x = inl->next;
+    while (x) {
+        zan_io_waiter_t *nx = x->next;
+        if (n < max) out[n++] = *x;
+        free(x);
+        x = nx;
+    }
+    inl->next = NULL;
+    *has = 0;
+    (void)fd;
+    return n;
 }
 
 int zan_io_poll(int64_t timeout_ms) {
     if (g_io_count == 0) return 0;
-    struct epoll_event events[64];
-    int n = epoll_wait(g_epoll_fd, events, 64,
+    struct epoll_event events[256];
+    int n = epoll_wait(g_epoll_fd, events, 256,
                        timeout_ms < 0 ? -1 : (int)timeout_ms);
     int woke = 0;
     for (int i = 0; i < n; i++) {
         int fd = events[i].data.fd;
-        zan_io_entry_t **pp = &g_io_entries;
-        while (*pp) {
-            if ((*pp)->fd == fd) {
-                zan_io_entry_t *e = *pp;
-                void *co = e->co;
-                zan_co_step_t step = e->step;
-                *pp = e->next;
-                epoll_ctl(g_epoll_fd, EPOLL_CTL_DEL, fd, NULL);
-                io_deliver_recv(e);
-                free(e);
-                g_io_count--;
-                io_wake(co, step);
-                woke++;
-                break;
-            }
-            pp = &(*pp)->next;
+        if (fd < 0 || fd >= g_slots_cap) continue;
+        zan_io_slot_t *s = &g_slots[fd];
+        uint32_t ev = events[i].events;
+        int err = (ev & (EPOLLERR | EPOLLHUP)) != 0;
+
+        zan_io_waiter_t ready[8];
+        int nr = 0;
+        if ((ev & EPOLLIN) || err)  nr += io_take(s, fd, 1, ready + nr, 8 - nr);
+        if ((ev & EPOLLOUT) || err) nr += io_take(s, fd, 0, ready + nr, 8 - nr);
+
+        /* Re-arm before waking: a woken coroutine may register again and the
+         * EPOLLONESHOT arm state must already reflect the remaining waiters. */
+        if (s->has_r || s->has_w) io_arm(fd, s);
+
+        for (int k = 0; k < nr; k++) {
+            io_deliver_waiter(fd, &ready[k]);
+            g_io_count--;
+            io_wake(ready[k].co, ready[k].step);
+            woke++;
         }
     }
     return woke;
