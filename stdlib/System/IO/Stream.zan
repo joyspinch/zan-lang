@@ -1,0 +1,150 @@
+using System;
+
+namespace System.IO;
+
+/// <summary>
+/// Byte-oriented stream: the shared base of <see cref="FileStream"/> and
+/// <see cref="MemoryStream"/>, and what <see cref="StreamReader"/> /
+/// <see cref="StreamWriter"/> read and write through.
+///
+/// A subclass overrides the four primitives (ReadInto / WriteFrom / Seek /
+/// Close) plus the capability and length queries; everything else here is
+/// built on them, so a new stream kind gets the whole helper surface for
+/// free:
+///   FileStream fs = FileStream.OpenRead("data.bin");
+///   string head = fs.Read(16);
+///   fs.Close();
+///
+/// Byte payloads travel as `string`: a zan string carries an explicit length,
+/// so embedded NUL bytes survive. Raw addresses (nint, from NativeMemory or
+/// ByteBuffer.Raw) are accepted too for zero-copy paths.
+/// </summary>
+class Stream {
+    /// <summary>True when the stream can be read.</summary>
+    virtual bool CanRead() { return false; }
+
+    /// <summary>True when the stream can be written.</summary>
+    virtual bool CanWrite() { return false; }
+
+    /// <summary>True when the stream supports Seek/Position.</summary>
+    virtual bool CanSeek() { return false; }
+
+    /// <summary>Total bytes in the stream, or -1 when unknown.</summary>
+    virtual long Length() { return -1; }
+
+    /// <summary>Current byte offset, or -1 when unknown.</summary>
+    virtual long Position() { return -1; }
+
+    /// <summary>Moves the cursor. `origin`: 0 = begin, 1 = current, 2 = end.
+    /// Returns the new absolute position, or -1 when not seekable.</summary>
+    virtual long Seek(long offset, int origin) { return -1; }
+
+    /// <summary>Reads up to `count` bytes into the raw address `buf`.
+    /// Returns the number of bytes read; 0 means end of stream.</summary>
+    virtual int ReadInto(nint buf, int count) { return 0; }
+
+    /// <summary>Writes `count` bytes from the raw address `buf`.
+    /// Returns the number of bytes written.</summary>
+    virtual int WriteFrom(nint buf, int count) { return 0; }
+
+    /// <summary>Pushes buffered writes to the underlying device.</summary>
+    virtual void Flush() { }
+
+    /// <summary>Releases the stream. Safe to call twice.</summary>
+    virtual void Close() { }
+
+    /// <summary>Reads up to `count` bytes; returns "" at end of stream.</summary>
+    string Read(int count) {
+        if (count <= 0) {
+            return "";
+        }
+        nint buf = NativeMemory.Alloc(count + 1);
+        int n = this.ReadInto(buf, count);
+        string s = "";
+        if (n > 0) {
+            s = NativeMemory.GetString(buf, 0, n);
+        }
+        NativeMemory.Free(buf);
+        return s;
+    }
+
+    /// <summary>Writes every byte of `data`. Returns the bytes written.</summary>
+    int Write(string data) {
+        int n = data.Length;
+        if (n <= 0) {
+            return 0;
+        }
+        nint buf = NativeMemory.Alloc(n + 1);
+        NativeMemory.PutString(buf, 0, data, n);
+        int w = this.WriteFrom(buf, n);
+        NativeMemory.Free(buf);
+        return w;
+    }
+
+    /// <summary>Reads one byte, or -1 at end of stream.</summary>
+    int ReadByte() {
+        nint buf = NativeMemory.Alloc(1);
+        int n = this.ReadInto(buf, 1);
+        int v = -1;
+        if (n == 1) {
+            v = NativeMemory.GetByte(buf, 0);
+        }
+        NativeMemory.Free(buf);
+        return v;
+    }
+
+    /// <summary>Writes one byte (low 8 bits of `b`).</summary>
+    void WriteByte(int b) {
+        nint buf = NativeMemory.Alloc(1);
+        NativeMemory.SetByte(buf, 0, b & 255);
+        this.WriteFrom(buf, 1);
+        NativeMemory.Free(buf);
+    }
+
+    /// <summary>Reads everything left in the stream (binary-safe).</summary>
+    string ReadToEnd() {
+        ByteBuffer acc = ByteBuffer.Alloc(4096);
+        int chunk = 65536;
+        nint buf = NativeMemory.Alloc(chunk);
+        int n = this.ReadInto(buf, chunk);
+        while (n > 0) {
+            acc.WriteBytes(buf, n);
+            n = this.ReadInto(buf, chunk);
+        }
+        NativeMemory.Free(buf);
+        string all = acc.ToStr();
+        acc.Free();
+        return all;
+    }
+
+    /// <summary>Copies everything left in this stream into `dest`.
+    /// Returns the number of bytes copied.</summary>
+    long CopyTo(Stream dest) {
+        int chunk = 65536;
+        nint buf = NativeMemory.Alloc(chunk);
+        long total = 0;
+        int n = this.ReadInto(buf, chunk);
+        while (n > 0) {
+            dest.WriteFrom(buf, n);
+            total = total + n;
+            n = this.ReadInto(buf, chunk);
+        }
+        NativeMemory.Free(buf);
+        return total;
+    }
+
+    /// <summary>Seeks to an absolute offset (shorthand for Seek(pos, 0)).</summary>
+    long SeekTo(long position) {
+        return this.Seek(position, 0);
+    }
+
+    /// <summary>Bytes between the cursor and the end, or -1 when unknown.</summary>
+    long Remaining() {
+        long len = this.Length();
+        long pos = this.Position();
+        if (len < 0 || pos < 0) {
+            return -1;
+        }
+        return len - pos;
+    }
+}

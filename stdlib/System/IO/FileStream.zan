@@ -1,0 +1,155 @@
+using System;
+
+namespace System.IO;
+
+/// <summary>
+/// A <see cref="Stream"/> over a file on disk. Offsets are 64-bit, so files
+/// larger than 2 GB seek correctly on every platform.
+///
+///   FileStream fs = FileStream.Create("out.bin");
+///   fs.Write("header");
+///   fs.Close();
+///
+/// Open with <see cref="OpenRead"/> (read), <see cref="Create"/> (truncate),
+/// <see cref="OpenWrite"/> (read/write, keeps contents), <see cref="Append"/>
+/// or <see cref="Open"/> for an explicit stdio mode string. A failed open
+/// throws, so a returned FileStream is always usable.
+/// </summary>
+class FileStream : Stream {
+    [DllImport("crt")]
+    static extern long zan_file_open(string path, string mode);
+    [DllImport("crt")]
+    static extern long zan_file_read(long handle, nint buf, long count);
+    [DllImport("crt")]
+    static extern long zan_file_write(long handle, nint buf, long count);
+    [DllImport("crt")]
+    static extern long zan_file_seek(long handle, long offset, int origin);
+    [DllImport("crt")]
+    static extern long zan_file_tell(long handle);
+    [DllImport("crt")]
+    static extern long zan_file_flush(long handle);
+    [DllImport("crt")]
+    static extern long zan_file_close(long handle);
+    [DllImport("crt")]
+    static extern long zan_file_eof(long handle);
+
+    long handle;
+    string path;
+    bool readable;
+    bool writable;
+
+    FileStream() {
+        this.handle = 0;
+        this.path = "";
+        this.readable = false;
+        this.writable = false;
+    }
+
+    /// <summary>Opens `path` with a stdio mode string ("rb", "wb", "r+b",
+    /// "ab"). Throws FileNotFoundException/IOException when the open
+    /// fails.</summary>
+    static FileStream Open(string path, string mode) {
+        long h = zan_file_open(path, mode);
+        if (h == 0) {
+            if (mode.Substring(0, 1) == "r") {
+                throw new FileNotFoundException("Could not open file: " + path);
+            }
+            throw new IOException("Could not open file for writing: " + path);
+        }
+        FileStream fs = new FileStream();
+        fs.handle = h;
+        fs.path = path;
+        fs.readable = mode.Substring(0, 1) == "r" || mode.Contains("+");
+        fs.writable = mode.Substring(0, 1) != "r" || mode.Contains("+");
+        return fs;
+    }
+
+    /// <summary>Opens an existing file for reading.</summary>
+    static FileStream OpenRead(string path) {
+        return FileStream.Open(path, "rb");
+    }
+
+    /// <summary>Creates or truncates a file for writing (also readable).</summary>
+    static FileStream Create(string path) {
+        return FileStream.Open(path, "w+b");
+    }
+
+    /// <summary>Opens a file for read/write without truncating it, creating
+    /// it when missing.</summary>
+    static FileStream OpenWrite(string path) {
+        long h = zan_file_open(path, "r+b");
+        if (h == 0) {
+            return FileStream.Open(path, "w+b");
+        }
+        FileStream fs = new FileStream();
+        fs.handle = h;
+        fs.path = path;
+        fs.readable = true;
+        fs.writable = true;
+        return fs;
+    }
+
+    /// <summary>Opens a file for appending, creating it when missing.</summary>
+    static FileStream Append(string path) {
+        return FileStream.Open(path, "ab");
+    }
+
+    /// <summary>The path this stream was opened with.</summary>
+    string Path() { return this.path; }
+
+    /// <summary>True once <see cref="Close"/> has run.</summary>
+    bool IsClosed() { return this.handle == 0; }
+
+    override bool CanRead() { return this.readable && this.handle != 0; }
+
+    override bool CanWrite() { return this.writable && this.handle != 0; }
+
+    override bool CanSeek() { return this.handle != 0; }
+
+    override long Length() {
+        if (this.handle == 0) { return -1; }
+        long here = zan_file_tell(this.handle);
+        long end = zan_file_seek(this.handle, 0, 2);
+        zan_file_seek(this.handle, here, 0);
+        return end;
+    }
+
+    override long Position() {
+        if (this.handle == 0) { return -1; }
+        return zan_file_tell(this.handle);
+    }
+
+    override long Seek(long offset, int origin) {
+        if (this.handle == 0) { return -1; }
+        return zan_file_seek(this.handle, offset, origin);
+    }
+
+    override int ReadInto(nint buf, int count) {
+        if (this.handle == 0 || count <= 0) { return 0; }
+        return (int)zan_file_read(this.handle, buf, count);
+    }
+
+    override int WriteFrom(nint buf, int count) {
+        if (this.handle == 0 || count <= 0) { return 0; }
+        return (int)zan_file_write(this.handle, buf, count);
+    }
+
+    /// <summary>True once a read has hit end of file.</summary>
+    bool EndOfFile() {
+        if (this.handle == 0) { return true; }
+        return zan_file_eof(this.handle) == 1;
+    }
+
+    override void Flush() {
+        if (this.handle != 0) {
+            zan_file_flush(this.handle);
+        }
+    }
+
+    override void Close() {
+        if (this.handle != 0) {
+            zan_file_close(this.handle);
+            this.handle = 0;
+        }
+    }
+}

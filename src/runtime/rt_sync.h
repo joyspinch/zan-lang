@@ -64,6 +64,14 @@ long long zan_file_time(const char *path, int which);
 long long zan_file_length(const char *path);
 long long zan_file_attributes(const char *path);
 long long zan_file_set_readonly(const char *path, int on);
+long long zan_file_open(const char *path, const char *mode);
+long long zan_file_read(long long handle, long long buf, long long count);
+long long zan_file_write(long long handle, long long buf, long long count);
+long long zan_file_seek(long long handle, long long offset, int origin);
+long long zan_file_tell(long long handle);
+long long zan_file_flush(long long handle);
+long long zan_file_close(long long handle);
+long long zan_file_eof(long long handle);
 
 #ifdef __cplusplus
 }

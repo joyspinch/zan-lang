@@ -1437,3 +1437,73 @@ long long zan_file_set_readonly(const char *path, int on) {
     return chmod(path, m) == 0 ? 1 : 0;
 #endif
 }
+
+/* ---- file handles (System.IO.FileStream) ---------------------------------
+ * FILE*-based stream IO with 64-bit offsets, exposed as an opaque handle so
+ * zan code never spells FILE* (its size and the width of fseek's offset both
+ * vary by platform). A handle is 0 when the open failed; every other call
+ * treats 0 as a no-op so a failed open cannot corrupt memory.
+ */
+
+/* `mode` is a stdio mode string ("rb", "wb", "r+b", "ab", ...). */
+long long zan_file_open(const char *path, const char *mode) {
+    if (!path || !path[0] || !mode || !mode[0]) return 0;
+    FILE *f = fopen(path, mode);
+    return (long long)(intptr_t)f;
+}
+
+long long zan_file_read(long long handle, long long buf, long long count) {
+    FILE *f = (FILE *)(intptr_t)handle;
+    if (!f || !buf || count <= 0) return 0;
+    return (long long)fread((void *)(intptr_t)buf, 1, (size_t)count, f);
+}
+
+long long zan_file_write(long long handle, long long buf, long long count) {
+    FILE *f = (FILE *)(intptr_t)handle;
+    if (!f || !buf || count <= 0) return 0;
+    return (long long)fwrite((const void *)(intptr_t)buf, 1, (size_t)count, f);
+}
+
+/* `origin`: 0 = begin, 1 = current, 2 = end. Returns the new absolute
+ * position, or -1 on failure. */
+long long zan_file_seek(long long handle, long long offset, int origin) {
+    FILE *f = (FILE *)(intptr_t)handle;
+    if (!f) return -1;
+    int whence = origin == 1 ? SEEK_CUR : (origin == 2 ? SEEK_END : SEEK_SET);
+#ifdef _WIN32
+    if (_fseeki64(f, (__int64)offset, whence) != 0) return -1;
+    return (long long)_ftelli64(f);
+#else
+    if (fseeko(f, (off_t)offset, whence) != 0) return -1;
+    return (long long)ftello(f);
+#endif
+}
+
+long long zan_file_tell(long long handle) {
+    FILE *f = (FILE *)(intptr_t)handle;
+    if (!f) return -1;
+#ifdef _WIN32
+    return (long long)_ftelli64(f);
+#else
+    return (long long)ftello(f);
+#endif
+}
+
+long long zan_file_flush(long long handle) {
+    FILE *f = (FILE *)(intptr_t)handle;
+    if (!f) return -1;
+    return fflush(f) == 0 ? 1 : 0;
+}
+
+long long zan_file_close(long long handle) {
+    FILE *f = (FILE *)(intptr_t)handle;
+    if (!f) return 0;
+    return fclose(f) == 0 ? 1 : 0;
+}
+
+/* 1 once a read hit end-of-file on this handle. */
+long long zan_file_eof(long long handle) {
+    FILE *f = (FILE *)(intptr_t)handle;
+    if (!f) return 1;
+    return feof(f) ? 1 : 0;
+}

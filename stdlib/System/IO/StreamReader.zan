@@ -1,0 +1,184 @@
+using System;
+
+namespace System.IO;
+
+/// <summary>
+/// Buffered text reading over a <see cref="Stream"/>: line-by-line input
+/// without pulling the whole file into memory, which is what File.ReadAllText
+/// forces today.
+///
+///   StreamReader r = StreamReader.Open("log.txt");
+///   string line = r.ReadLine();
+///   while (line != null) {
+///       Console.WriteLine(line);
+///       line = r.ReadLine();
+///   }
+///   r.Close();
+///
+/// <see cref="ReadLine"/> returns null at end of input and strips the line
+/// terminator (both "\n" and "\r\n"). Bytes are passed through as-is (UTF-8
+/// stays UTF-8). Close closes the underlying stream when this reader opened
+/// it; a reader wrapped around a caller's stream leaves it alone.
+/// </summary>
+class StreamReader {
+    Stream stream;
+    bool owns;
+    string buf;      // bytes read but not yet returned
+    int pos;         // consume cursor into buf
+    bool eof;        // the stream has no more bytes
+    int chunk;
+
+    StreamReader() {
+        this.stream = null;
+        this.owns = false;
+        this.buf = "";
+        this.pos = 0;
+        this.eof = false;
+        this.chunk = 8192;
+    }
+
+    /// <summary>Reads text from an existing stream (not closed by this
+    /// reader).</summary>
+    static StreamReader Wrap(Stream s) {
+        StreamReader r = new StreamReader();
+        r.stream = s;
+        return r;
+    }
+
+    /// <summary>Opens a file for reading. Throws FileNotFoundException when it
+    /// does not exist.</summary>
+    static StreamReader Open(string path) {
+        StreamReader r = new StreamReader();
+        r.stream = FileStream.OpenRead(path);
+        r.owns = true;
+        return r;
+    }
+
+    /// <summary>Reads text out of a string, for testing parsers.</summary>
+    static StreamReader FromStr(string text) {
+        StreamReader r = new StreamReader();
+        r.stream = MemoryStream.FromStr(text);
+        r.owns = true;
+        return r;
+    }
+
+    /// <summary>The stream being read.</summary>
+    Stream BaseStream() { return this.stream; }
+
+    /// <summary>True when the buffer is empty and the stream is exhausted.</summary>
+    bool EndOfStream() {
+        if (this.pos < this.buf.Length) {
+            return false;
+        }
+        this.Fill();
+        return this.pos >= this.buf.Length;
+    }
+
+    /// <summary>Pulls one more chunk into the buffer when it is drained.</summary>
+    void Fill() {
+        if (this.pos < this.buf.Length || this.eof) {
+            return;
+        }
+        string more = this.stream.Read(this.chunk);
+        if (more.Length == 0) {
+            this.eof = true;
+            return;
+        }
+        this.buf = more;
+        this.pos = 0;
+    }
+
+    /// <summary>Reads one byte as a 1-character string, or "" at end.</summary>
+    string ReadChar() {
+        this.Fill();
+        if (this.pos >= this.buf.Length) {
+            return "";
+        }
+        string c = this.buf.Substring(this.pos, 1);
+        this.pos = this.pos + 1;
+        return c;
+    }
+
+    /// <summary>Reads up to `count` bytes; "" at end of input.</summary>
+    string ReadBlock(int count) {
+        StringBuilder sb = new StringBuilder();
+        int need = count;
+        while (need > 0) {
+            this.Fill();
+            int avail = this.buf.Length - this.pos;
+            if (avail <= 0) {
+                need = 0;
+            } else {
+                int take = need;
+                if (take > avail) { take = avail; }
+                sb.Append(this.buf.Substring(this.pos, take));
+                this.pos = this.pos + take;
+                need = need - take;
+            }
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>Reads the next line without its terminator, or null at end of
+    /// input.</summary>
+    string ReadLine() {
+        this.Fill();
+        if (this.pos >= this.buf.Length) {
+            return null;
+        }
+        StringBuilder sb = new StringBuilder();
+        bool done = false;
+        while (!done) {
+            this.Fill();
+            if (this.pos >= this.buf.Length) {
+                done = true;
+            } else {
+                string c = this.buf.Substring(this.pos, 1);
+                this.pos = this.pos + 1;
+                if (c == "\n") {
+                    done = true;
+                } else if (c != "\r") {
+                    sb.Append(c);
+                }
+            }
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>Reads every remaining line.</summary>
+    List<string> ReadAllLines() {
+        List<string> lines = new List<string>();
+        string line = this.ReadLine();
+        while (line != null) {
+            lines.Add(line);
+            line = this.ReadLine();
+        }
+        return lines;
+    }
+
+    /// <summary>Reads everything left, buffer included.</summary>
+    string ReadToEnd() {
+        StringBuilder sb = new StringBuilder();
+        if (this.pos < this.buf.Length) {
+            sb.Append(this.buf.Substring(this.pos, this.buf.Length - this.pos));
+            this.pos = this.buf.Length;
+        }
+        if (!this.eof) {
+            sb.Append(this.stream.ReadToEnd());
+            this.eof = true;
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>Closes the reader, and the stream when this reader opened
+    /// it.</summary>
+    void Close() {
+        if (this.owns && this.stream != null) {
+            this.stream.Close();
+        }
+        this.stream = null;
+        this.buf = "";
+        this.pos = 0;
+        this.eof = true;
+    }
+}

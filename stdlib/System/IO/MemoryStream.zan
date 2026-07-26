@@ -1,0 +1,143 @@
+using System;
+
+namespace System.IO;
+
+/// <summary>
+/// A <see cref="Stream"/> over a growable off-heap buffer -- the in-memory
+/// stand-in for a FileStream in tests, and the way to build a byte payload
+/// with stream code before handing it to a socket or a file:
+///   MemoryStream ms = MemoryStream.Alloc(64);
+///   ms.Write("hello");
+///   string all = ms.ToStr();
+///   ms.Close();
+///
+/// Reads and writes share one cursor (as in System.IO.MemoryStream): writing
+/// past the end grows the buffer, and Length is the high-water mark.
+/// <see cref="Close"/> releases the buffer.
+/// </summary>
+class MemoryStream : Stream {
+    nint data;
+    int capacity;
+    int length;
+    int pos;
+
+    MemoryStream() {
+        this.data = 0;
+        this.capacity = 0;
+        this.length = 0;
+        this.pos = 0;
+    }
+
+    /// <summary>An empty, writable stream with the given initial capacity.</summary>
+    static MemoryStream Alloc(int initialCapacity) {
+        int cap = initialCapacity;
+        if (cap < 16) { cap = 16; }
+        MemoryStream ms = new MemoryStream();
+        ms.data = NativeMemory.Alloc(cap);
+        ms.capacity = cap;
+        return ms;
+    }
+
+    /// <summary>A stream over a copy of `s`'s bytes, positioned at 0
+    /// (binary-safe: embedded NUL bytes are preserved).</summary>
+    static MemoryStream FromStr(string s) {
+        int n = s.Length;
+        MemoryStream ms = MemoryStream.Alloc(n + 1);
+        NativeMemory.PutString(ms.data, 0, s, n);
+        ms.length = n;
+        return ms;
+    }
+
+    /// <summary>A stream over a copy of `count` bytes at a raw address.</summary>
+    static MemoryStream FromRaw(nint src, int count) {
+        MemoryStream ms = MemoryStream.Alloc(count + 1);
+        NativeMemory.Copy(ms.data, src, count);
+        ms.length = count;
+        return ms;
+    }
+
+    /// <summary>The bytes written so far, as a binary-safe string.</summary>
+    string ToStr() {
+        if (this.length <= 0) { return ""; }
+        return NativeMemory.GetString(this.data, 0, this.length);
+    }
+
+    /// <summary>The backing address, for zero-copy FFI. Invalid after a write
+    /// that grows the buffer, and after Close.</summary>
+    nint Raw() { return this.data; }
+
+    void Grow(int needed) {
+        if (needed <= this.capacity) { return; }
+        int cap = this.capacity;
+        if (cap < 16) { cap = 16; }
+        while (cap < needed) {
+            cap = cap * 2;
+        }
+        nint bigger = NativeMemory.Alloc(cap);
+        if (this.length > 0) {
+            NativeMemory.Copy(bigger, this.data, this.length);
+        }
+        if (this.capacity > 0) {
+            NativeMemory.Free(this.data);
+        }
+        this.data = bigger;
+        this.capacity = cap;
+    }
+
+    override bool CanRead() { return this.capacity > 0; }
+
+    override bool CanWrite() { return this.capacity > 0; }
+
+    override bool CanSeek() { return this.capacity > 0; }
+
+    override long Length() { return this.length; }
+
+    override long Position() { return this.pos; }
+
+    override long Seek(long offset, int origin) {
+        long target = offset;
+        if (origin == 1) { target = this.pos + offset; }
+        else if (origin == 2) { target = this.length + offset; }
+        if (target < 0) { target = 0; }
+        this.pos = (int)target;
+        return this.pos;
+    }
+
+    /// <summary>Drops the contents and rewinds; keeps the buffer.</summary>
+    void Clear() {
+        this.length = 0;
+        this.pos = 0;
+    }
+
+    override int ReadInto(nint buf, int count) {
+        if (this.capacity == 0 || count <= 0) { return 0; }
+        int avail = this.length - this.pos;
+        if (avail <= 0) { return 0; }
+        int n = count;
+        if (n > avail) { n = avail; }
+        NativeMemory.Copy(buf, this.data + this.pos, n);
+        this.pos = this.pos + n;
+        return n;
+    }
+
+    override int WriteFrom(nint buf, int count) {
+        if (count <= 0) { return 0; }
+        this.Grow(this.pos + count);
+        NativeMemory.Copy(this.data + this.pos, buf, count);
+        this.pos = this.pos + count;
+        if (this.pos > this.length) {
+            this.length = this.pos;
+        }
+        return count;
+    }
+
+    override void Close() {
+        if (this.capacity > 0) {
+            NativeMemory.Free(this.data);
+            this.data = 0;
+            this.capacity = 0;
+            this.length = 0;
+            this.pos = 0;
+        }
+    }
+}
