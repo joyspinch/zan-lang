@@ -763,25 +763,87 @@ partial class ZanIDE {
     // Git panel helpers (right panel "Git" tab)
     // ================================================================
 
-    /// Runs a git command inside `root`, capturing stdout+stderr.
-    static List<string> GitRun(string root, string args) {
-        return Process.RunCapture("git -C \"" + root + "\" " + args);
+    static string GitLogPath() { return ZanIDE.UserConfigDir() + "/git_job.log"; }
+    static string GitDonePath() { return ZanIDE.UserConfigDir() + "/git_job_done.txt"; }
+
+    /// Marker line separating the two commands of a refresh job's output.
+    static string GitRefreshMark() { return "--zan-git-branch--"; }
+
+    /// Starts `git -C root <args>` detached: its combined output lands in
+    /// GitLogPath and GitDonePath appears once it exits. On a large repository
+    /// even `status` takes seconds, so the caller polls GitJobDone() from the
+    /// frame loop instead of blocking the UI for the duration.
+    static void GitBegin(string root, string args) {
+        ZanIDE.GitBeginRaw("git -C \"" + root + "\" " + args);
     }
 
-    /// Refills `files` with `git status --porcelain` lines and returns the
-    /// current branch name ("" when not a repository).
-    static string GitRefresh(string root, List<string> files) {
+    /// Starts one detached shell command as the current git job.
+    static void GitBeginRaw(string cmd) {
+        Directory.CreateDirectoryRecursive(ZanIDE.UserConfigDir());
+        File.WriteAllText(ZanIDE.GitLogPath(), "");
+        if (File.Exists(ZanIDE.GitDonePath())) { File.Delete(ZanIDE.GitDonePath()); }
+        #if WINDOWS
+        string sep = " & ";
+        #else
+        string sep = " ; ";
+        #endif
+        Process.RunDetached("((" + cmd + ") >> \"" + ZanIDE.GitLogPath() + "\" 2>&1)"
+            + sep + "echo ok > \"" + ZanIDE.GitDonePath() + "\"");
+    }
+
+    /// Starts a status + branch scan as one job, the two outputs separated by
+    /// GitRefreshMark() so GitRefreshApply can tell them apart.
+    static void GitRefreshBegin(string root) {
+        #if WINDOWS
+        string sep = " & ";
+        #else
+        string sep = " ; ";
+        #endif
+        string g = "git -C \"" + root + "\" ";
+        ZanIDE.GitBeginRaw(g + "status --porcelain" + sep
+            + "echo " + ZanIDE.GitRefreshMark() + sep
+            + g + "rev-parse --abbrev-ref HEAD");
+    }
+
+    /// True when the running git job has finished.
+    static bool GitJobDone() { return File.Exists(ZanIDE.GitDonePath()); }
+
+    /// Consumes a finished job's output lines and clears its marker.
+    static List<string> GitJobTake() {
+        List<string> lines = new List<string>();
+        if (File.Exists(ZanIDE.GitLogPath())) {
+            lines = CodeEditor.SplitLines(File.ReadAllText(ZanIDE.GitLogPath()));
+        }
+        if (File.Exists(ZanIDE.GitDonePath())) { File.Delete(ZanIDE.GitDonePath()); }
+        return lines;
+    }
+
+    /// Refills `files` with the porcelain lines of a finished refresh job and
+    /// returns the branch name that followed the marker ("" when unknown).
+    static string GitRefreshApply(List<string> out2, List<string> files) {
         while (files.Count > 0) { files.RemoveAt(files.Count - 1); }
-        if (!Directory.Exists(root + "/.git")) { return ""; }
-        List<string> st = ZanIDE.GitRun(root, "status --porcelain");
+        string branch = "";
+        bool afterMark = false;
         int i = 0;
-        while (i < st.Count) {
-            if (st[i] != "") { files.Add(st[i]); }
+        while (i < out2.Count) {
+            string line = out2[i];
+            if (ZanIDE.TrimTail(line) == ZanIDE.GitRefreshMark()) {
+                afterMark = true;
+            } else if (afterMark) {
+                if (branch == "" && line != "") { branch = ZanIDE.TrimTail(line); }
+            } else if (line != "") {
+                files.Add(line);
+            }
             i = i + 1;
         }
-        List<string> br = ZanIDE.GitRun(root, "rev-parse --abbrev-ref HEAD");
-        if (br.Count > 0) { return br[0]; }
-        return "";
+        return branch;
+    }
+
+    /// Drops trailing spaces (echo on cmd.exe keeps the space before `&`).
+    static string TrimTail(string s) {
+        int end = s.Length;
+        while (end > 0 && s.Substring(end - 1, 1) == " ") { end = end - 1; }
+        return s.Substring(0, end);
     }
 
     /// The path part of a porcelain status line ("XY path" or "XY a -> b",
@@ -832,21 +894,23 @@ partial class ZanIDE {
     // Debug helpers
     // ================================================================
 
-    static bool DebugBuild(
+    /// Starts the debug build (`-g`, DWARF + O0) DETACHED and returns the
+    /// executable path it will produce ("" when there is nothing to build).
+    /// The frame loop polls BuildDone() and, on success, opens the debug
+    /// session -- so pressing F5 never freezes the window during compilation.
+    static string DebugBuildBegin(
         List<string> tabPaths,
         SignalInt activeTab,
         string root,
-        List<string> log,
-        CodeEditor editor
+        List<string> log
     ) {
         int a = activeTab.Get();
-        if (a < 0 || a >= tabPaths.Count) { return false; }
-        string activePath = tabPaths[a];
-        string p = activePath;
+        if (a < 0 || a >= tabPaths.Count) { return ""; }
+        string p = tabPaths[a];
         p = ZanIDE.RibbonRunTarget(p, root);
         if (p == "") {
             log.Add(ZanIDE.T("> [Debug] Open a source file first.", "> [调试] 请先打开源文件。"));
-            return false;
+            return "";
         }
         string bd = ZanIDE.EnsureBuildDir(root);
         string ll = bd + "/.zandbg.ll";
@@ -857,15 +921,8 @@ partial class ZanIDE {
         // source lines, frames and locals.
         string buildCmd = ZanIDE.CompileToExe(root, p, inputs, ll, exe, false) + " -g";
         log.Add("> [Debug] Building " + p + " ...");
-        List<string> buildOut = Process.RunCapture(buildCmd);
-        ZanIDE.AppendAll(log, buildOut);
-        ZanIDE.ApplyDiagnostics(editor, activePath, buildOut, log);
-        if (!File.Exists(exe)) {
-            log.Add("> [Debug] Build failed.");
-            return false;
-        }
-        log.Add("> [Debug] Build succeeded.");
-        return true;
+        ZanIDE.BuildDetach(buildCmd);
+        return exe;
     }
 
     static int FirstDebugLine(CodeEditor editor) {
@@ -882,40 +939,6 @@ partial class ZanIDE {
             i = i + 1;
         }
         return 0;
-    }
-
-    static List<string> DebugBuildRun(List<string> tabPaths, SignalInt activeTab,
-            string root, List<string> log) {
-        List<string> console = new List<string>();
-        int a = activeTab.Get();
-        if (a < 0 || a >= tabPaths.Count) { return console; }
-        string p = tabPaths[a];
-        if (p == "") {
-            log.Add("> [Debug] Save the file first.");
-            return console;
-        }
-        string bd = ZanIDE.EnsureBuildDir(root);
-        string ll = bd + "/.zandbg.ll";
-        string exe = bd + "/.zandbg" + ZanIDE.ExeSuffix();
-        string buildCmd = ZanIDE.CompileToExe(root, p, "\"" + p + "\"", ll, exe, false);
-        log.Add("> [Debug] Building ...");
-        List<string> buildOut = Process.RunCapture(buildCmd);
-        int bo = 0;
-        while (bo < buildOut.Count) {
-            log.Add("  " + buildOut[bo]);
-            bo = bo + 1;
-        }
-        log.Add("> [Debug] Running ...");
-        List<string> runOut = Process.RunCapture("\"" + exe + "\"");
-        int ri = 0;
-        while (ri < runOut.Count) {
-            console.Add(runOut[ri]);
-            ri = ri + 1;
-        }
-        if (console.Count == 0) {
-            console.Add("(no output)");
-        }
-        return console;
     }
 
     static int FindInEditor(CodeEditor editor, string query, int afterLine) {

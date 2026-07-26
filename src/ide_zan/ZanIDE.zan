@@ -1366,6 +1366,10 @@ partial class ZanIDE {
         List<string> gitFiles = new List<string>();
         string gitBranch = "";
         bool gitLoaded = false;
+        // Which detached git job is in flight (0 none, 1 status+branch scan,
+        // 2 a command whose output goes to Output); the frame loop polls it so
+        // git never blocks drawing.
+        int gitJob = 0;
         SignalInt gitSel = SignalInt.Create(0 - 1);
         SignalInt gitScroll = SignalInt.Create(0);
         Input gitMsgIn = new Input(
@@ -1452,6 +1456,9 @@ partial class ZanIDE {
         string buildExe = "";
         bool buildIsGui = false;
         bool buildThenRun = false;
+        // When the in-flight detached build is a debug (`-g`) build, the poll
+        // opens the debugger on success instead of running the program.
+        bool dbgBuildPending = false;
         string buildTargetPath = "";
         // Hot reload: when ON, saving rebuilds and restarts the running app.
         bool autoRun = ZanIDE.CfgInt(cfg, "autoRun", 0) == 1;
@@ -1717,27 +1724,23 @@ partial class ZanIDE {
             if (kind == 5) {
                 int kc = app.window.EventKeyCode();
                 if (kc == 116 && dbgState == 0) {
-                    // F5 = Start Debug (same as clicking Debug button)
-                    ZanIDE.SaveActive(
-                        editor, tabNames, tabBodies,
-                        tabPaths, activeTab, root, log);
-                    if (ZanIDE.DebugBuild(
-                            tabPaths, activeTab, root, log, editor)) {
-                        dbg = ZanIDE.DbgBegin(root,
-                            ZanIDE.PathOf(tabPaths, activeTab),
-                            editor.Breakpoints(),
-                            ZanIDE.FirstDebugLine(editor), bpCondLines, bpCondExprs, log);
-                        dbgState = ZanIDE.DbgSync(dbg, editor, log, dbgConsole);
-                        dbgExecLine = ZanIDE.DbgLine(dbg);
-                        dbgVarInfo = ZanIDE.DbgVars(dbg);
-                        dbgStack = ZanIDE.DbgStack(dbg);
-                        dbgWatchVals = ZanIDE.DbgEvalWatches(dbg, dbgWatches);
-                        dbgPanelTab.Set(1);
-                        if (dbgState == 2) {
-                            log.Add(">   F5=Continue  F10=StepOver  F11=StepInto  Ctrl+B=Condition  Esc=Stop");
-                            ZanIDE.LogVarsToConsole(log, dbgVarInfo, dbgExecLine);
-                        } else {
-                            dbg = null;
+                    // F5 = Start Debug (same as clicking Debug button). The
+                    // `-g` build runs DETACHED; the poll opens the debugger on
+                    // success so F5 never freezes the window during compilation.
+                    if (!buildBusy) {
+                        ZanIDE.SaveActive(
+                            editor, tabNames, tabBodies,
+                            tabPaths, activeTab, root, log);
+                        string dExe = ZanIDE.DebugBuildBegin(tabPaths, activeTab, root, log);
+                        if (dExe != "") {
+                            buildBusy = true;
+                            buildThenRun = false;
+                            dbgBuildPending = true;
+                            buildExe = dExe;
+                            buildTargetPath = ZanIDE.PathOf(tabPaths, activeTab);
+                            buildLogLen = 0;
+                            dock.Focus("output");
+                            app.RequestAnimationFrame(80);
                         }
                     }
                     app.RequestRedraw();
@@ -2032,26 +2035,20 @@ partial class ZanIDE {
                     // Debug (F5)
                     designerMode = false;
                     if (dbgState == 0) {
-                        ZanIDE.SaveActive(
-                            editor, tabNames, tabBodies,
-                            tabPaths, activeTab, root, log);
-                        if (ZanIDE.DebugBuild(
-                                tabPaths, activeTab, root, log, editor)) {
-                            dbg = ZanIDE.DbgBegin(root,
-                                ZanIDE.PathOf(tabPaths, activeTab),
-                                editor.Breakpoints(),
-                                ZanIDE.FirstDebugLine(editor), bpCondLines, bpCondExprs, log);
-                            dbgState = ZanIDE.DbgSync(dbg, editor, log, dbgConsole);
-                            dbgExecLine = ZanIDE.DbgLine(dbg);
-                            dbgVarInfo = ZanIDE.DbgVars(dbg);
-                            dbgStack = ZanIDE.DbgStack(dbg);
-                            dbgWatchVals = ZanIDE.DbgEvalWatches(dbg, dbgWatches);
-                            dbgPanelTab.Set(1);
-                            if (dbgState == 2) {
-                                log.Add(">   F5=Continue  F10=StepOver  F11=StepInto  Ctrl+B=Condition  Esc=Stop");
-                                ZanIDE.LogVarsToConsole(log, dbgVarInfo, dbgExecLine);
-                            } else {
-                                dbg = null;
+                        if (!buildBusy) {
+                            ZanIDE.SaveActive(
+                                editor, tabNames, tabBodies,
+                                tabPaths, activeTab, root, log);
+                            string dExe = ZanIDE.DebugBuildBegin(tabPaths, activeTab, root, log);
+                            if (dExe != "") {
+                                buildBusy = true;
+                                buildThenRun = false;
+                                dbgBuildPending = true;
+                                buildExe = dExe;
+                                buildTargetPath = ZanIDE.PathOf(tabPaths, activeTab);
+                                buildLogLen = 0;
+                                dock.Focus("output");
+                                app.RequestAnimationFrame(80);
                             }
                         }
                     } else if (dbgState == 2) {
@@ -3487,10 +3484,10 @@ partial class ZanIDE {
                     // ---- Git panel: repository status + stage / commit / sync ----
                     Rect gArea = dock.ContentParked("git");
                     int gPad = app.Scale(6);
-                    if (!gitLoaded) {
-                        gitBranch = ZanIDE.GitRefresh(root, gitFiles);
-                        gitLoaded = true;
-                        gitSel.Set(0 - 1);
+                    if (!gitLoaded && gitJob == 0 && Directory.Exists(root + "/.git")) {
+                        ZanIDE.GitRefreshBegin(root);
+                        gitJob = 1;
+                        app.RequestAnimationFrame(120);
                     }
                     bool gitRepo = Directory.Exists(root + "/.git");
                     int gy = gArea.y + gPad;
@@ -3501,9 +3498,11 @@ partial class ZanIDE {
                         int giId = Button.Primary(ZanIDE.T("Initialize repository", "初始化仓库"))
                             .SetSize(1).Render(app, gArea.x + gPad, gy + app.Scale(24), app.Scale(150));
                         if (Button.WasClicked(app, giId)) {
-                            ZanIDE.AppendAll(log, ZanIDE.GitRun(root, "init"));
-                            log.Add(ZanIDE.T("> git init done.", "> git 仓库初始化完成。"));
-                            gitLoaded = false;
+                            if (gitJob == 0) {
+                                ZanIDE.GitBegin(root, "init");
+                                gitJob = 2;
+                                log.Add(ZanIDE.T("> git init ...", "> 正在初始化 git 仓库 ..."));
+                            }
                             app.RequestRedraw();
                         }
                     } else {
@@ -3536,9 +3535,11 @@ partial class ZanIDE {
                             app.RequestRedraw();
                         }
                         if (Button.WasClicked(app, gStgId)) {
-                            ZanIDE.AppendAll(log, ZanIDE.GitRun(root, "add -A"));
-                            log.Add(ZanIDE.T("> Staged all changes.", "> 已暂存全部变更。"));
-                            gitLoaded = false;
+                            if (gitJob == 0) {
+                                ZanIDE.GitBegin(root, "add -A");
+                                gitJob = 2;
+                                log.Add(ZanIDE.T("> Staging all changes ...", "> 正在暂存全部变更 ..."));
+                            }
                             dock.Focus("output");
                             app.RequestRedraw();
                         }
@@ -3548,28 +3549,40 @@ partial class ZanIDE {
                             if (gsv >= 0 && gsv < gitFiles.Count) {
                                 gtgt = " -- \"" + ZanIDE.GitPathOf(gitFiles[gsv]) + "\"";
                             }
-                            ZanIDE.AppendAll(log, ZanIDE.GitRun(root, "diff HEAD" + gtgt));
+                            if (gitJob == 0) {
+                                ZanIDE.GitBegin(root, "diff HEAD" + gtgt);
+                                gitJob = 2;
+                                log.Add("> git diff HEAD" + gtgt + " ...");
+                            }
                             dock.Focus("output");
                             coScroll = 0;
                             app.RequestRedraw();
                         }
                         if (Button.WasClicked(app, gLogId)) {
-                            ZanIDE.AppendAll(log, ZanIDE.GitRun(root,
-                                "log --oneline --decorate -20"));
+                            if (gitJob == 0) {
+                                ZanIDE.GitBegin(root, "log --oneline --decorate -20");
+                                gitJob = 2;
+                                log.Add("> git log ...");
+                            }
                             dock.Focus("output");
                             coScroll = 0;
                             app.RequestRedraw();
                         }
                         if (Button.WasClicked(app, gPulId)) {
-                            log.Add("> git pull ...");
-                            ZanIDE.AppendAll(log, ZanIDE.GitRun(root, "pull"));
-                            gitLoaded = false;
+                            if (gitJob == 0) {
+                                log.Add("> git pull ...");
+                                ZanIDE.GitBegin(root, "pull");
+                                gitJob = 2;
+                            }
                             dock.Focus("output");
                             app.RequestRedraw();
                         }
                         if (Button.WasClicked(app, gPshId)) {
-                            log.Add("> git push ...");
-                            ZanIDE.AppendAll(log, ZanIDE.GitRun(root, "push"));
+                            if (gitJob == 0) {
+                                log.Add("> git push ...");
+                                ZanIDE.GitBegin(root, "push");
+                                gitJob = 2;
+                            }
                             dock.Focus("output");
                             app.RequestRedraw();
                         }
@@ -3645,13 +3658,15 @@ partial class ZanIDE {
                                     "> 请先输入提交信息。"));
                             } else {
                                 gMsg = ZanIDE.GitEscape(gMsg);
-                                List<string> gOut = ZanIDE.GitRun(root,
-                                    "diff --cached --quiet && git -C \"" + root
-                                    + "\" commit -a -m \"" + gMsg
-                                    + "\" || git -C \"" + root + "\" commit -m \"" + gMsg + "\"");
-                                ZanIDE.AppendAll(log, gOut);
-                                gitMsgIn.SetText("");
-                                gitLoaded = false;
+                                if (gitJob == 0) {
+                                    ZanIDE.GitBegin(root,
+                                        "diff --cached --quiet && git -C \"" + root
+                                        + "\" commit -a -m \"" + gMsg
+                                        + "\" || git -C \"" + root + "\" commit -m \"" + gMsg + "\"");
+                                    gitJob = 2;
+                                    log.Add("> git commit ...");
+                                    gitMsgIn.SetText("");
+                                }
                             }
                             dock.Focus("output");
                             app.RequestRedraw();
@@ -3805,6 +3820,28 @@ partial class ZanIDE {
                         }
                     }
                 }
+                // Poll the in-flight detached git job (status scan or a panel
+                // command): apply the result when its marker appears, so a slow
+                // repository never freezes the window.
+                if (gitJob != 0) {
+                    if (ZanIDE.GitJobDone()) {
+                        List<string> gJob = ZanIDE.GitJobTake();
+                        if (gitJob == 1) {
+                            gitBranch = ZanIDE.GitRefreshApply(gJob, gitFiles);
+                            gitLoaded = true;
+                            gitSel.Set(0 - 1);
+                        } else {
+                            ZanIDE.AppendAll(log, gJob);
+                            coScroll = 0;
+                            // a command may have changed the working tree
+                            gitLoaded = false;
+                        }
+                        gitJob = 0;
+                        app.RequestRedraw();
+                    } else {
+                        app.RequestAnimationFrame(120);
+                    }
+                }
                 // Poll the in-flight detached build (Run/Build ribbon): stream
                 // compiler output and, when the done-marker appears, apply
                 // diagnostics and (for Run) launch the program -- no UI freeze.
@@ -3821,7 +3858,29 @@ partial class ZanIDE {
                         buildBusy = false;
                         List<string> bout = CodeEditor.SplitLines(File.ReadAllText(ZanIDE.BuildLogPath()));
                         ZanIDE.ApplyDiagnostics(editor, buildTargetPath, bout, log);
-                        if (!File.Exists(buildExe)) {
+                        if (dbgBuildPending) {
+                            dbgBuildPending = false;
+                            if (!File.Exists(buildExe)) {
+                                log.Add("> [Debug] Build failed.");
+                            } else {
+                                log.Add("> [Debug] Build succeeded.");
+                                dbg = ZanIDE.DbgBegin(root, buildTargetPath,
+                                    editor.Breakpoints(),
+                                    ZanIDE.FirstDebugLine(editor), bpCondLines, bpCondExprs, log);
+                                dbgState = ZanIDE.DbgSync(dbg, editor, log, dbgConsole);
+                                dbgExecLine = ZanIDE.DbgLine(dbg);
+                                dbgVarInfo = ZanIDE.DbgVars(dbg);
+                                dbgStack = ZanIDE.DbgStack(dbg);
+                                dbgWatchVals = ZanIDE.DbgEvalWatches(dbg, dbgWatches);
+                                dbgPanelTab.Set(1);
+                                if (dbgState == 2) {
+                                    log.Add(">   F5=Continue  F10=StepOver  F11=StepInto  Ctrl+B=Condition  Esc=Stop");
+                                    ZanIDE.LogVarsToConsole(log, dbgVarInfo, dbgExecLine);
+                                } else {
+                                    dbg = null;
+                                }
+                            }
+                        } else if (!File.Exists(buildExe)) {
                             log.Add(ZanIDE.T("> Build failed; not run.", "> 构建失败，未运行。"));
                         } else if (buildThenRun) {
                             if (buildIsGui) {
