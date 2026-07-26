@@ -1,0 +1,140 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using Ra2.Formats;
+
+namespace Ra2.Assets;
+
+/// <summary>One place files can be looked up: a MIX archive or a directory.</summary>
+class VfsMount {
+    MixArchive mix;       // null for a directory mount
+    string dir;           // "" for an archive mount
+    string label;
+
+    static VfsMount OfArchive(MixArchive mix, string label) {
+        VfsMount m = new VfsMount();
+        m.mix = mix;
+        m.dir = "";
+        m.label = label;
+        return m;
+    }
+
+    static VfsMount OfDirectory(string dir) {
+        VfsMount m = new VfsMount();
+        m.mix = null;
+        m.dir = dir;
+        m.label = dir + "/";
+        return m;
+    }
+
+    string Label() { return this.label; }
+    MixArchive Archive() { return this.mix; }
+
+    bool Contains(string name) {
+        if (this.mix != null) { return this.mix.Contains(name); }
+        return File.Exists(this.dir + "/" + name);
+    }
+
+    string Read(string name, List<int> outLen) {
+        if (this.mix != null) { return this.mix.ReadFile(name, outLen); }
+        string path = this.dir + "/" + name;
+        if (!File.Exists(path)) {
+            outLen[0] = 0;
+            return "";
+        }
+        int size = File.GetSize(path);
+        outLen[0] = size;
+        return File.ReadBytes(path, 0, size);
+    }
+
+    void Close() {
+        if (this.mix != null) { this.mix.Close(); }
+    }
+}
+
+/// <summary>Resolves asset names across every archive an install provides.</summary>
+///
+/// The game looks a name up in a fixed order and takes the first hit, which is
+/// how expansion archives and loose files override the base game. Mounts are
+/// searched in the order they were added, so callers add the highest-priority
+/// source first.
+class Vfs {
+    List<VfsMount> mounts;
+
+    static Vfs Create() {
+        Vfs v = new Vfs();
+        v.mounts = new List<VfsMount>();
+        return v;
+    }
+
+    void MountArchive(MixArchive mix, string label) {
+        this.mounts.Add(VfsMount.OfArchive(mix, label));
+    }
+
+    void MountDirectory(string dir) {
+        this.mounts.Add(VfsMount.OfDirectory(dir));
+    }
+
+    /// <summary>Mounts a disk archive, and any of the named archives nested in
+    /// it. Missing archives are skipped, so a base-game install works the same
+    /// as one with expansions.</summary>
+    bool MountArchiveFile(string dir, string fileName, List<string> nested) {
+        string path = dir + "/" + fileName;
+        if (!File.Exists(path)) { return false; }
+        MixArchive mix = MixArchive.Open(path);
+        this.MountArchive(mix, fileName);
+        if (nested == null) { return true; }
+        int i = 0;
+        while (i < nested.Count) {
+            MixArchive sub = mix.OpenNested(nested[i]);
+            if (sub != null) { this.MountArchive(sub, fileName + "!" + nested[i]); }
+            i = i + 1;
+        }
+        return true;
+    }
+
+    int MountCount() { return this.mounts.Count; }
+    VfsMount MountAt(int i) { return this.mounts[i]; }
+
+    bool Contains(string name) {
+        int i = 0;
+        while (i < this.mounts.Count) {
+            if (this.mounts[i].Contains(name)) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    /// <summary>Which mount would serve this name, or "" if none would.</summary>
+    string SourceOf(string name) {
+        int i = 0;
+        while (i < this.mounts.Count) {
+            if (this.mounts[i].Contains(name)) { return this.mounts[i].Label(); }
+            i = i + 1;
+        }
+        return "";
+    }
+
+    /// <summary>Reads a file from the first mount that has it. Sets outLen[0]
+    /// and returns "" when nothing does. Caller frees.</summary>
+    string Read(string name, List<int> outLen) {
+        int i = 0;
+        while (i < this.mounts.Count) {
+            if (this.mounts[i].Contains(name)) {
+                return this.mounts[i].Read(name, outLen);
+            }
+            i = i + 1;
+        }
+        outLen[0] = 0;
+        return "";
+    }
+
+    void Close() {
+        int i = 0;
+        while (i < this.mounts.Count) {
+            this.mounts[i].Close();
+            i = i + 1;
+        }
+        this.mounts = new List<VfsMount>();
+    }
+}

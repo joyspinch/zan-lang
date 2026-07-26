@@ -34,7 +34,7 @@ for src in examples/game/ra2/tests/*.zan; do
   fi
 
   if ! out="$("$zanc" "$src" examples/game/ra2/formats/*.zan \
-      --auto-stdlib -o "$exe" 2>&1)"; then
+      examples/game/ra2/assets/*.zan --auto-stdlib -o "$exe" 2>&1)"; then
     echo "FAIL $name: compile error"
     echo "$out" | sed 's/^/    /'
     fail=$((fail + 1))

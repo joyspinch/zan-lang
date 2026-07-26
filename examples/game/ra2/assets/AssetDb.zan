@@ -1,0 +1,150 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using Ra2.Formats;
+
+namespace Ra2.Assets;
+
+/// <summary>Mounts an install's archives and serves the parsed assets on top.</summary>
+///
+/// Rules, art and the string table are read once at start-up; palettes and
+/// shapes are parsed on first use and kept, since the same few palettes back
+/// every tile and unit drawn in a frame.
+class AssetDb {
+    Vfs vfs;
+    IniDocument rules;
+    IniDocument art;
+    CsfTable strings;
+    List<string> palNames;
+    List<Palette> palCache;
+    List<string> shpNames;
+    List<ShpImage> shpCache;
+
+    /// The archives making up a Red Alert 2 install, highest priority first.
+    /// Expansion archives are listed too and skipped when absent, so this works
+    /// for a base-game install as well as one with Yuri's Revenge.
+    static List<string> ArchiveOrder() {
+        List<string> l = new List<string>();
+        l.Add("expandmd03.mix");
+        l.Add("expandmd02.mix");
+        l.Add("expandmd01.mix");
+        l.Add("ra2md.mix");
+        l.Add("ra2.mix");
+        l.Add("language.mix");
+        l.Add("multi.mix");
+        l.Add("maps01.mix");
+        l.Add("theme.mix");
+        return l;
+    }
+
+    /// Archives nested inside ra2.mix (and its expansion counterpart) that hold
+    /// the assets this demo draws: rules and art in local, unit and structure
+    /// shapes in conquer and generic, terrain in the iso* and theatre archives.
+    static List<string> NestedOrder() {
+        List<string> l = new List<string>();
+        l.Add("LOCAL.MIX");
+        l.Add("CONQUER.MIX");
+        l.Add("GENERIC.MIX");
+        l.Add("ISOTEMP.MIX");
+        l.Add("TEMPERAT.MIX");
+        l.Add("ISOSNOW.MIX");
+        l.Add("SNOW.MIX");
+        l.Add("ISOURB.MIX");
+        l.Add("URBAN.MIX");
+        l.Add("SIDEC01.MIX");
+        l.Add("SIDEC02.MIX");
+        l.Add("CACHE.MIX");
+        return l;
+    }
+
+    /// <summary>Mounts every archive found under <paramref name="dataDir"/>.
+    /// Loose files in that directory win over archived ones, matching how the
+    /// game lets you drop a replacement next to the executable.</summary>
+    static Vfs MountInstall(string dataDir) {
+        Vfs vfs = Vfs.Create();
+        vfs.MountDirectory(dataDir);
+        List<string> nested = AssetDb.NestedOrder();
+        List<string> order = AssetDb.ArchiveOrder();
+        int i = 0;
+        while (i < order.Count) {
+            vfs.MountArchiveFile(dataDir, order[i], nested);
+            i = i + 1;
+        }
+        return vfs;
+    }
+
+    static AssetDb Load(Vfs vfs) {
+        AssetDb db = new AssetDb();
+        db.vfs = vfs;
+        db.palNames = new List<string>();
+        db.palCache = new List<Palette>();
+        db.shpNames = new List<string>();
+        db.shpCache = new List<ShpImage>();
+        db.rules = db.LoadIni("RULES.INI");
+        db.art = db.LoadIni("ART.INI");
+        db.strings = db.LoadCsf("RA2.CSF");
+        return db;
+    }
+
+    Vfs Files() { return this.vfs; }
+    IniDocument Rules() { return this.rules; }
+    IniDocument Art() { return this.art; }
+    CsfTable Strings() { return this.strings; }
+
+    IniDocument LoadIni(string name) {
+        List<int> len = new List<int>();
+        len.Add(0);
+        string raw = this.vfs.Read(name, len);
+        if (len[0] == 0) { return IniDocument.Create(); }
+        return IniParser.Parse(raw);
+    }
+
+    CsfTable LoadCsf(string name) {
+        List<int> len = new List<int>();
+        len.Add(0);
+        string raw = this.vfs.Read(name, len);
+        if (len[0] == 0) { return null; }
+        return CsfTable.Parse(raw, len[0]);
+    }
+
+    /// <summary>A palette by file name, e.g. "isotem.pal". Null when absent.</summary>
+    Palette PaletteNamed(string name) {
+        int i = this.IndexOfName(this.palNames, name);
+        if (i >= 0) { return this.palCache[i]; }
+        List<int> len = new List<int>();
+        len.Add(0);
+        string raw = this.vfs.Read(name, len);
+        Palette p = null;
+        if (len[0] > 0) { p = Palette.Parse(raw, len[0]); }
+        this.palNames.Add(name);
+        this.palCache.Add(p);
+        return p;
+    }
+
+    /// <summary>A shape by file name, e.g. "gi.shp". Null when absent.</summary>
+    ShpImage ShapeNamed(string name) {
+        int i = this.IndexOfName(this.shpNames, name);
+        if (i >= 0) { return this.shpCache[i]; }
+        List<int> len = new List<int>();
+        len.Add(0);
+        string raw = this.vfs.Read(name, len);
+        ShpImage s = null;
+        if (len[0] > 0) { s = ShpImage.Parse(raw, len[0]); }
+        this.shpNames.Add(name);
+        this.shpCache.Add(s);
+        return s;
+    }
+
+    int IndexOfName(List<string> names, string name) {
+        int i = 0;
+        while (i < names.Count) {
+            if (names[i] == name) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    void Close() {
+        this.vfs.Close();
+    }
+}
