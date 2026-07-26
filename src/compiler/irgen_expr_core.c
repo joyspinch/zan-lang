@@ -47,11 +47,20 @@ enum {
                                    * can drive the sub-task without knowing its name
                                    * -- required for awaiting an indirect (delegate)
                                    * async call, whose callee has no static name. */
-    ASYNC_FRAME_FIRST_PARAM = 8
+    ASYNC_FRAME_EXC = 8,          /* i8*: exception this coroutine completed with */
+    ASYNC_FRAME_EXC_TID = 9,      /* i8*: its class type descriptor (or null) */
+    ASYNC_FRAME_EXC_OWNED = 10,   /* i32: the exception carries a +1 reference */
+    ASYNC_FRAME_HSTACK = 11,      /* [ASYNC_MAX_HANDLERS x i32]: ids of the try
+                                   * handlers this frame has armed, innermost
+                                   * last -- re-armed at each resume (see
+                                   * emit_async_eh_prologue) */
+    ASYNC_FRAME_FIRST_PARAM = 12
 };
 static LLVMValueRef coerce_to_i64(zan_irgen_t *g, LLVMValueRef v);
 static void emit_async_save_slots(zan_irgen_t *g);
 static void emit_async_reload_slots(zan_irgen_t *g);
+static void emit_async_eh_unarm(zan_irgen_t *g);
+static void emit_async_check_sub_exc(zan_irgen_t *g, LLVMValueRef sub);
 
 /* A "name path" is a chain of identifiers joined by member access, e.g.
  * `Foo.Bar.Widget` — the syntactic form of a namespace-qualified type

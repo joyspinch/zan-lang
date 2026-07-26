@@ -67,6 +67,7 @@ static void emit_async_complete(zan_irgen_t *g, local_scope_t *locals, LLVMValue
         LLVMBuildStructGEP2(g->builder, ft, frame, ASYNC_FRAME_HCOUNT, "fr.hc"));
 
     emit_release_owned_locals(g, locals);
+    emit_async_eh_unarm(g);
 
     /* if (awaiter != null) zan_co_ready(awaiter, awaiter_step); */
     LLVMValueRef aw_ptr = LLVMBuildStructGEP2(g->builder, ft, frame,
@@ -89,6 +90,22 @@ static void emit_async_complete(zan_irgen_t *g, local_scope_t *locals, LLVMValue
 
     LLVMPositionBuilderAtEnd(g->builder, ret_bb);
     LLVMBuildRetVoid(g->builder);
+}
+
+/* Pop every eh handler this $resume invocation armed (its own trampoline plus
+ * the user handlers re-armed from the frame). A jmp_buf records a stack frame,
+ * so a handler armed by an invocation is unusable once that invocation returns
+ * -- leaving it on the eh stack is what made a throw after a suspension jump
+ * into a dead frame. Handlers armed by a try that spans the suspension stay
+ * recorded in the frame (hcount/hstack) and are re-armed on the next resume. */
+static void emit_async_eh_unarm(zan_irgen_t *g) {
+    if (!g->current_async_eh_entry) return;
+    LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
+    LLVMValueRef top_g, bufs_g, exc_g;
+    get_eh_globals(g, &top_g, &bufs_g, &exc_g);
+    LLVMValueRef entry = LLVMBuildLoad2(g->builder, i32,
+        g->current_async_eh_entry, "eh.entry");
+    LLVMBuildStore(g->builder, entry, top_g);
 }
 
 /* Save all frame-resident slots (params + named scalar locals) from their
@@ -755,4 +772,229 @@ static int rc_array_local_escapes(zan_irgen_t *g, zan_istr_t nm) {
     if (g->current_fn_body) arr_escape_stmt(nm, g->current_fn_body, &esc);
     else esc = 1; /* unknown body: conservative */
     return esc;
+}
+
+
+static void emit_eh_hook_call(zan_irgen_t *g, const char *name);
+
+/* ---- async exception propagation -----------------------------------------
+ * A coroutine cannot longjmp into the frame that awaits it: that frame's
+ * invocation returned to the scheduler at the suspension. Instead each
+ * $resume invocation arms one trampoline handler around its whole body; an
+ * exception that escapes the body lands there, is parked in the frame's
+ * exception slots, and completes the coroutine. The awaiting frame finds it
+ * at its resume point and re-throws it in its own (live) invocation. */
+
+/* Arm the trampoline plus every handler recorded in the frame, then leave the
+ * builder in the block where the state dispatch belongs. Emitted at the top of
+ * each $resume invocation, after the frame slots have been set up. */
+static void emit_async_eh_prologue(zan_irgen_t *g) {
+    LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMValueRef fn = g->current_async_resume_fn;
+    LLVMValueRef frame = g->current_async_frame;
+    LLVMTypeRef ft = g->current_async_frame_type;
+    LLVMValueRef top_g, bufs_g, exc_g;
+    get_eh_globals(g, &top_g, &bufs_g, &exc_g);
+    LLVMTypeRef bufs_ty = LLVMGlobalGetValueType(bufs_g);
+    LLVMValueRef zero = LLVMConstInt(i32, 0, 0);
+
+    LLVMValueRef entry_slot = LLVMBuildAlloca(g->builder, i32, "eh.co.entry");
+    LLVMValueRef idx_slot = LLVMBuildAlloca(g->builder, i32, "eh.co.i");
+    LLVMValueRef id_slot = LLVMBuildAlloca(g->builder, i32, "eh.co.id");
+    g->current_async_eh_entry = entry_slot;
+    LLVMBuildStore(g->builder, LLVMBuildLoad2(g->builder, i32, top_g, "eh.top0"),
+        entry_slot);
+    LLVMBuildStore(g->builder, zero, idx_slot);
+
+    LLVMBasicBlockRef exc_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "co.exc");
+    LLVMBasicBlockRef head_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "eh.rearm");
+    LLVMBasicBlockRef arm_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "eh.arm");
+    LLVMBasicBlockRef init_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "eh.init");
+    LLVMBasicBlockRef next_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "eh.next");
+    LLVMBasicBlockRef land_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "eh.land");
+    LLVMBasicBlockRef disp_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "co.dispatch");
+    g->current_async_exc_bb = exc_bb;
+
+    /* trampoline: the outermost handler of this invocation */
+    {
+        LLVMValueRef t = LLVMBuildLoad2(g->builder, i32, top_g, "eh.t");
+        LLVMValueRef t1 = LLVMBuildAdd(g->builder, t, LLVMConstInt(i32, 1, 0), "eh.t1");
+        LLVMBuildStore(g->builder, t1, top_g);
+        LLVMValueRef gep_idx[2] = { zero, t1 };
+        LLVMValueRef buf = LLVMBuildGEP2(g->builder, bufs_ty, bufs_g, gep_idx, 2, "eh.buf");
+        LLVMValueRef bufp = LLVMBuildBitCast(g->builder, buf, i8ptr, "eh.bufp");
+        LLVMValueRef r = emit_eh_setjmp(g, bufp);
+        LLVMValueRef took = LLVMBuildICmp(g->builder, LLVMIntEQ, r, zero, "eh.took");
+        LLVMBuildCondBr(g->builder, took, head_bb, exc_bb);
+    }
+
+    /* re-arm the handlers of the tries this frame is currently inside */
+    LLVMPositionBuilderAtEnd(g->builder, head_bb);
+    {
+        LLVMValueRef i = LLVMBuildLoad2(g->builder, i32, idx_slot, "eh.i");
+        LLVMValueRef hc = LLVMBuildLoad2(g->builder, i32,
+            LLVMBuildStructGEP2(g->builder, ft, frame, ASYNC_FRAME_HCOUNT, "hc.p"), "hc");
+        /* only the first ASYNC_MAX_HANDLERS handlers have a recorded id */
+        LLVMValueRef cap = LLVMConstInt(i32, ASYNC_MAX_HANDLERS, 0);
+        hc = LLVMBuildSelect(g->builder,
+            LLVMBuildICmp(g->builder, LLVMIntSLT, hc, cap, "hc.fits"), hc, cap, "hc.cap");
+        LLVMValueRef more = LLVMBuildICmp(g->builder, LLVMIntSLT, i, hc, "eh.more");
+        LLVMBuildCondBr(g->builder, more, arm_bb, disp_bb);
+    }
+
+    LLVMPositionBuilderAtEnd(g->builder, arm_bb);
+    {
+        LLVMValueRef i = LLVMBuildLoad2(g->builder, i32, idx_slot, "eh.i2");
+        LLVMValueRef hs_idx[2] = { zero, i };
+        LLVMValueRef hs = LLVMBuildStructGEP2(g->builder, ft, frame,
+            ASYNC_FRAME_HSTACK, "hs");
+        LLVMValueRef slot = LLVMBuildGEP2(g->builder,
+            LLVMArrayType(i32, ASYNC_MAX_HANDLERS), hs, hs_idx, 2, "hs.slot");
+        LLVMBuildStore(g->builder,
+            LLVMBuildLoad2(g->builder, i32, slot, "hs.id"), id_slot);
+        LLVMValueRef t = LLVMBuildLoad2(g->builder, i32, top_g, "eh.t2");
+        LLVMValueRef t1 = LLVMBuildAdd(g->builder, t, LLVMConstInt(i32, 1, 0), "eh.t3");
+        LLVMBuildStore(g->builder, t1, top_g);
+        LLVMValueRef gep_idx[2] = { zero, t1 };
+        LLVMValueRef buf = LLVMBuildGEP2(g->builder, bufs_ty, bufs_g, gep_idx, 2, "eh.buf2");
+        LLVMValueRef bufp = LLVMBuildBitCast(g->builder, buf, i8ptr, "eh.bufp2");
+        LLVMValueRef r = emit_eh_setjmp(g, bufp);
+        LLVMValueRef took = LLVMBuildICmp(g->builder, LLVMIntEQ, r, zero, "eh.took2");
+        LLVMBuildCondBr(g->builder, took, init_bb, land_bb);
+    }
+
+    /* the try's own entry code ran in an earlier invocation, so its eh
+     * bookkeeping allocas are uninitialised here: let the try fill them in */
+    LLVMPositionBuilderAtEnd(g->builder, init_bb);
+    g->current_async_rearm_next_bb = next_bb;
+    g->current_async_rearm_init_switch = LLVMBuildSwitch(g->builder,
+        LLVMBuildLoad2(g->builder, i32, id_slot, "eh.id0"), next_bb,
+        ASYNC_MAX_HANDLERS);
+
+    LLVMPositionBuilderAtEnd(g->builder, next_bb);
+    {
+        LLVMValueRef i = LLVMBuildLoad2(g->builder, i32, idx_slot, "eh.i3");
+        LLVMBuildStore(g->builder,
+            LLVMBuildAdd(g->builder, i, LLVMConstInt(i32, 1, 0), "eh.i4"), idx_slot);
+        LLVMBuildBr(g->builder, head_bb);
+    }
+
+    /* a re-armed handler caught: hand control to that try's catch (the cases
+     * are added by the try lowering, which owns the catch blocks) */
+    LLVMPositionBuilderAtEnd(g->builder, land_bb);
+    emit_async_reload_slots(g);
+    g->current_async_rearm_switch = LLVMBuildSwitch(g->builder,
+        LLVMBuildLoad2(g->builder, i32, id_slot, "eh.id"), exc_bb,
+        ASYNC_MAX_HANDLERS);
+
+    LLVMPositionBuilderAtEnd(g->builder, disp_bb);
+}
+
+/* Fill the trampoline landing block: park the in-flight exception in the frame
+ * and complete the coroutine, so the awaiter can re-throw it. */
+static void emit_async_exc_epilogue(zan_irgen_t *g, local_scope_t *locals) {
+    if (!g->current_async_exc_bb) return;
+    LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMValueRef frame = g->current_async_frame;
+    LLVMTypeRef ft = g->current_async_frame_type;
+    LLVMValueRef top_g, bufs_g, exc_g;
+    get_eh_globals(g, &top_g, &bufs_g, &exc_g);
+
+    LLVMPositionBuilderAtEnd(g->builder, g->current_async_exc_bb);
+    emit_async_reload_slots(g);
+    LLVMBuildStore(g->builder, LLVMBuildLoad2(g->builder, i8ptr, exc_g, "exc.v"),
+        LLVMBuildStructGEP2(g->builder, ft, frame, ASYNC_FRAME_EXC, "fr.exc"));
+    LLVMBuildStore(g->builder,
+        LLVMBuildLoad2(g->builder, i8ptr, get_eh_exc_tid_global(g), "exc.tid"),
+        LLVMBuildStructGEP2(g->builder, ft, frame, ASYNC_FRAME_EXC_TID, "fr.exc.tid"));
+    LLVMBuildStore(g->builder,
+        LLVMBuildLoad2(g->builder, i32, get_eh_exc_owned_global(g), "exc.own"),
+        LLVMBuildStructGEP2(g->builder, ft, frame, ASYNC_FRAME_EXC_OWNED, "fr.exc.own"));
+    /* the exception now travels in the frame, not in the globals */
+    LLVMBuildStore(g->builder, LLVMConstNull(i8ptr), exc_g);
+    LLVMBuildStore(g->builder, LLVMConstInt(i32, 0, 0), get_eh_exc_owned_global(g));
+    emit_async_complete(g, locals, NULL);
+}
+
+/* Re-throw the exception the globals currently hold: jump to the innermost
+ * armed handler, or report it as unhandled when none is left. */
+static void emit_eh_rethrow_current(zan_irgen_t *g) {
+    LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMValueRef top_g, bufs_g, exc_g;
+    get_eh_globals(g, &top_g, &bufs_g, &exc_g);
+    LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder));
+    LLVMValueRef top = LLVMBuildLoad2(g->builder, i32, top_g, "reh.top");
+    LLVMValueRef has = LLVMBuildICmp(g->builder, LLVMIntSGE, top,
+        LLVMConstInt(i32, 0, 0), "reh.has");
+    LLVMBasicBlockRef jmp_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "aeh.jmp");
+    LLVMBasicBlockRef die_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "aeh.die");
+    LLVMBuildCondBr(g->builder, has, jmp_bb, die_bb);
+
+    LLVMPositionBuilderAtEnd(g->builder, jmp_bb);
+    {
+        LLVMValueRef gep_idx[2] = { LLVMConstInt(i32, 0, 0), top };
+        LLVMValueRef buf = LLVMBuildGEP2(g->builder,
+            LLVMGlobalGetValueType(bufs_g), bufs_g, gep_idx, 2, "aeh.buf");
+        emit_eh_longjmp(g, LLVMBuildBitCast(g->builder, buf, i8ptr, "aeh.bufp"));
+        LLVMBuildUnreachable(g->builder);
+    }
+
+    LLVMPositionBuilderAtEnd(g->builder, die_bb);
+    {
+        emit_eh_hook_call(g, "__zan_eh_unhandled");
+        LLVMValueRef printf_fn = LLVMGetNamedFunction(g->mod, "printf");
+        if (printf_fn) {
+            LLVMTypeRef printf_ty = LLVMFunctionType(i32, &i8ptr, 1, 1);
+            LLVMValueRef fmt = LLVMBuildGlobalStringPtr(g->builder,
+                "Unhandled exception\n", "aexfmt");
+            zan_call2(g->builder, printf_ty, printf_fn, &fmt, 1, "");
+        }
+        LLVMTypeRef exit_ty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), &i32, 1, 0);
+        LLVMValueRef exit_fn = get_libc_fn(g, "exit", exit_ty);
+        LLVMValueRef one = LLVMConstInt(i32, 1, 0);
+        zan_call2(g->builder, exit_ty, exit_fn, &one, 1, "");
+        LLVMBuildUnreachable(g->builder);
+    }
+
+    LLVMBasicBlockRef cont = LLVMAppendBasicBlockInContext(g->ctx, fn, "aeh.cont");
+    LLVMPositionBuilderAtEnd(g->builder, cont);
+}
+
+/* At an await resume point: if the awaited coroutine completed by throwing,
+ * move its exception back into the globals and re-throw it here, inside a live
+ * invocation of this frame. `sub` is the (still owned) sub-frame handle. */
+static void emit_async_check_sub_exc(zan_irgen_t *g, LLVMValueRef sub) {
+    LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMTypeRef hdr = g->co_header_type;
+    LLVMValueRef top_g, bufs_g, exc_g;
+    get_eh_globals(g, &top_g, &bufs_g, &exc_g);
+    LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder));
+
+    LLVMValueRef ep = LLVMBuildStructGEP2(g->builder, hdr, sub, ASYNC_FRAME_EXC, "sub.exc.p");
+    LLVMValueRef ev = LLVMBuildLoad2(g->builder, i8ptr, ep, "sub.exc");
+    LLVMValueRef tp = LLVMBuildStructGEP2(g->builder, hdr, sub, ASYNC_FRAME_EXC_TID, "sub.exc.tid.p");
+    LLVMValueRef tv = LLVMBuildLoad2(g->builder, i8ptr, tp, "sub.exc.tid");
+    LLVMValueRef op = LLVMBuildStructGEP2(g->builder, hdr, sub, ASYNC_FRAME_EXC_OWNED, "sub.exc.own.p");
+    LLVMValueRef ov = LLVMBuildLoad2(g->builder, i32, op, "sub.exc.own");
+    LLVMValueRef threw = LLVMBuildICmp(g->builder, LLVMIntNE, ev,
+        LLVMConstNull(i8ptr), "sub.threw");
+    LLVMBasicBlockRef thr_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "sub.rethrow");
+    LLVMBasicBlockRef ok_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "sub.ok");
+    LLVMBuildCondBr(g->builder, threw, thr_bb, ok_bb);
+
+    LLVMPositionBuilderAtEnd(g->builder, thr_bb);
+    LLVMBuildStore(g->builder, ev, exc_g);
+    LLVMBuildStore(g->builder, tv, get_eh_exc_tid_global(g));
+    LLVMBuildStore(g->builder, ov, get_eh_exc_owned_global(g));
+    /* the sub-frame is dead once its exception has been taken over */
+    zan_call2(g->builder, LLVMGlobalGetValueType(g->fn_free), g->fn_free, &sub, 1, "");
+    emit_eh_rethrow_current(g);
+    if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder)))
+        LLVMBuildUnreachable(g->builder);
+
+    LLVMPositionBuilderAtEnd(g->builder, ok_bb);
 }

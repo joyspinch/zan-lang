@@ -822,6 +822,43 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             LLVMValueRef hc = LLVMBuildLoad2(g->builder, i32t, hc_ptr, "eh.hcv");
             LLVMBuildStore(g->builder, LLVMBuildAdd(g->builder, hc,
                 LLVMConstInt(i32t, 1, 0), "eh.hc1"), hc_ptr);
+            /* Record this handler in the frame so a later resume can re-arm it:
+             * the jmp_buf armed below dies with this invocation, but the try
+             * itself stays open across every suspension in its body. The
+             * re-entry block restores the eh bookkeeping this invocation's
+             * try-entry would have written, then enters the catch. */
+            if (g->current_async_rearm_switch) {
+                int hid = g->current_async_handler_next++;
+                LLVMValueRef hs = LLVMBuildStructGEP2(g->builder,
+                    g->current_async_frame_type, g->current_async_frame,
+                    ASYNC_FRAME_HSTACK, "eh.hs");
+                LLVMValueRef hs_idx[2] = { LLVMConstInt(i32t, 0, 0), hc };
+                LLVMValueRef hs_slot = LLVMBuildGEP2(g->builder,
+                    LLVMArrayType(i32t, ASYNC_MAX_HANDLERS), hs, hs_idx, 2, "eh.hs.slot");
+                LLVMBuildStore(g->builder, LLVMConstInt(i32t, (unsigned)hid, 0), hs_slot);
+
+                LLVMBasicBlockRef here = LLVMGetInsertBlock(g->builder);
+                struct { const char *nm; LLVMValueRef sw; LLVMBasicBlockRef dst; } re[2] = {
+                    { "try.rearm.init", g->current_async_rearm_init_switch,
+                      g->current_async_rearm_next_bb },
+                    { "try.rearm", g->current_async_rearm_switch, catch_bb }
+                };
+                for (int ri = 0; ri < 2; ri++) {
+                    if (!re[ri].sw) continue;
+                    LLVMBasicBlockRef re_bb = LLVMAppendBasicBlockInContext(g->ctx, fn,
+                        re[ri].nm);
+                    LLVMPositionBuilderAtEnd(g->builder, re_bb);
+                    LLVMValueRef rtop = LLVMBuildLoad2(g->builder, i32t, top_g, "eh.rtop");
+                    LLVMBuildStore(g->builder, LLVMBuildSub(g->builder, rtop,
+                        LLVMConstInt(i32t, 1, 0), "eh.rtop0"), old_top_slot);
+                    LLVMBuildStore(g->builder,
+                        LLVMBuildLoad2(g->builder, i32t, eh_tmptop_g, "eh.rtmp"),
+                        tmp_mark_slot);
+                    LLVMBuildBr(g->builder, re[ri].dst);
+                    LLVMAddCase(re[ri].sw, LLVMConstInt(i32t, (unsigned)hid, 0), re_bb);
+                }
+                LLVMPositionBuilderAtEnd(g->builder, here);
+            }
             /* keep the heap frame authoritative across this try: a throw
              * that crosses a suspension longjmps into a stale invocation
              * whose stack allocas are garbage; the catch below re-loads the
@@ -989,17 +1026,11 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                     LLVMAppendBasicBlockInContext(g->ctx, fn, "reh.die");
                 LLVMBuildCondBr(g->builder, rhas, rjmp_bb, rdie_bb);
                 LLVMPositionBuilderAtEnd(g->builder, rjmp_bb);
-                /* rethrowing out of this coroutine: release the CPS frames
-                 * the longjmp is about to skip (see __zan_async_unwind) */
-                if (g->current_async_frame) {
+                /* an exception leaving this coroutine now travels through the
+                 * frame (see emit_async_exc_epilogue), so the longjmp stays
+                 * inside this invocation -- no cross-frame unwinding here */
+                if (g->current_async_frame)
                     emit_async_save_slots(g);
-                    LLVMValueRef self_i8 = LLVMBuildBitCast(g->builder,
-                        g->current_async_frame, i8ptr, "uw.self");
-                    LLVMTypeRef uw_ty = LLVMFunctionType(
-                        LLVMVoidTypeInContext(g->ctx), &i8ptr, 1, 0);
-                    zan_call2(g->builder, uw_ty, get_async_unwind_fn(g),
-                        &self_i8, 1, "");
-                }
                 LLVMValueRef rgep_idx[2] = { LLVMConstInt(i32t, 0, 0), rtop };
                 LLVMValueRef rbuf = LLVMBuildGEP2(g->builder,
                     LLVMGlobalGetValueType(bufs_g), bufs_g, rgep_idx, 2, "reh.buf");
@@ -1289,19 +1320,11 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             LLVMBasicBlockRef die_bb = LLVMAppendBasicBlockInContext(g->ctx, fn2, "throw.die");
             LLVMBuildCondBr(g->builder, has, jmp_bb, die_bb);
             LLVMPositionBuilderAtEnd(g->builder, jmp_bb);
-            /* a throw leaving an async body longjmps over every suspended
-             * CPS frame between here and the handler: save the live slots
-             * (so the frame is authoritative), then release the skipped
-             * frames and the rc values they own (see __zan_async_unwind) */
-            if (g->current_async_frame) {
+            /* the handler is either a try of this invocation or this
+             * invocation's trampoline, so keep the frame authoritative and
+             * longjmp without touching the frames that await us */
+            if (g->current_async_frame)
                 emit_async_save_slots(g);
-                LLVMValueRef self_i8 = LLVMBuildBitCast(g->builder,
-                    g->current_async_frame, i8ptr, "uw.self");
-                LLVMTypeRef uw_ty = LLVMFunctionType(
-                    LLVMVoidTypeInContext(g->ctx), &i8ptr, 1, 0);
-                zan_call2(g->builder, uw_ty, get_async_unwind_fn(g),
-                    &self_i8, 1, "");
-            }
             LLVMValueRef gep_idx[2] = { LLVMConstInt(i32t, 0, 0), top };
             LLVMValueRef buf = LLVMBuildGEP2(g->builder,
                 LLVMGlobalGetValueType(bufs_g), bufs_g, gep_idx, 2, "eh.buf");

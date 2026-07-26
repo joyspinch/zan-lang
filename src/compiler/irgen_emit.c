@@ -495,6 +495,10 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
                 fields[ASYNC_FRAME_CLEANUP] = g->co_step_ptr;
                 fields[ASYNC_FRAME_HCOUNT] = i32;
                 fields[ASYNC_FRAME_SELF_STEP] = g->co_step_ptr;
+                fields[ASYNC_FRAME_EXC] = i8ptr;
+                fields[ASYNC_FRAME_EXC_TID] = i8ptr;
+                fields[ASYNC_FRAME_EXC_OWNED] = i32;
+                fields[ASYNC_FRAME_HSTACK] = LLVMArrayType(i32, ASYNC_MAX_HANDLERS);
                 for (int k = 0; k < total_params; k++) {
                     fields[ASYNC_FRAME_FIRST_PARAM + k] = param_types[k];
                 }
@@ -759,15 +763,6 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
                 si++;
             }
 
-            LLVMValueRef state = LLVMBuildLoad2(g->builder, i32,
-                LLVMBuildStructGEP2(g->builder, frame_type, sframe, ASYNC_FRAME_STATE, "st.ptr"),
-                "state");
-            LLVMBasicBlockRef body_bb = LLVMAppendBasicBlockInContext(g->ctx, resume_fn, "co.start");
-            /* switch(state): case 0 (start) -> body; each await point appends a
-             * resume-k case (see the AST_AWAIT_EXPR lowering). */
-            LLVMValueRef sw = LLVMBuildSwitch(g->builder, state, body_bb, (unsigned)(work[w].await_count + 1));
-            LLVMAddCase(sw, LLVMConstInt(i32, 0, 0), body_bb);
-
             LLVMValueRef saved_fn = g->current_fn;
             LLVMTypeRef saved_fn_ret = g->current_fn_ret_type;
             LLVMValueRef saved_this = g->current_this;
@@ -781,6 +776,10 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
             int saved_sub_next = g->current_async_sub_next;
             void *saved_slots = (void *)g->current_async_slots;
             int saved_slot_count = g->current_async_slot_count;
+            LLVMValueRef saved_eh_entry = g->current_async_eh_entry;
+            LLVMBasicBlockRef saved_exc_bb = g->current_async_exc_bb;
+            LLVMValueRef saved_rearm = g->current_async_rearm_switch;
+            int saved_handler_next = g->current_async_handler_next;
 
             g->current_fn = resume_fn;
             g->current_fn_ret_type = LLVMVoidTypeInContext(g->ctx);
@@ -789,12 +788,31 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
             g->current_async_frame = sframe;
             g->current_async_frame_type = frame_type;
             g->current_async_resume_fn = resume_fn;
-            g->current_async_switch = sw;
             g->current_async_next_state = 1;
             g->current_async_sub_base = work[w].sub_base;
             g->current_async_sub_next = 0;
             g->current_async_slots = slots;
             g->current_async_slot_count = slot_total;
+            g->current_async_eh_entry = NULL;
+            g->current_async_exc_bb = NULL;
+            g->current_async_rearm_switch = NULL;
+            g->current_async_handler_next = 0;
+
+            /* arm this invocation's exception trampoline (and re-arm the
+             * handlers of the tries the frame is suspended inside) before the
+             * state dispatch, so a throw anywhere in the body lands on a live
+             * stack frame */
+            emit_async_eh_prologue(g);
+
+            LLVMValueRef state = LLVMBuildLoad2(g->builder, i32,
+                LLVMBuildStructGEP2(g->builder, frame_type, sframe, ASYNC_FRAME_STATE, "st.ptr"),
+                "state");
+            LLVMBasicBlockRef body_bb = LLVMAppendBasicBlockInContext(g->ctx, resume_fn, "co.start");
+            /* switch(state): case 0 (start) -> body; each await point appends a
+             * resume-k case (see the AST_AWAIT_EXPR lowering). */
+            LLVMValueRef sw = LLVMBuildSwitch(g->builder, state, body_bb, (unsigned)(work[w].await_count + 1));
+            LLVMAddCase(sw, LLVMConstInt(i32, 0, 0), body_bb);
+            g->current_async_switch = sw;
 
             LLVMPositionBuilderAtEnd(g->builder, body_bb);
             emit_async_reload_slots(g); /* load `this`/params from the frame */
@@ -814,6 +832,10 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
                 emit_async_complete(g, locals, NULL);
             }
 
+            /* an exception nothing in the body caught completes the coroutine
+             * with that exception, for the awaiter to re-throw */
+            emit_async_exc_epilogue(g, locals);
+
             g->current_fn = saved_fn;
             g->current_fn_ret_type = saved_fn_ret;
             g->current_this = saved_this;
@@ -827,6 +849,10 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
             g->current_async_sub_next = saved_sub_next;
             g->current_async_slots = saved_slots;
             g->current_async_slot_count = saved_slot_count;
+            g->current_async_eh_entry = saved_eh_entry;
+            g->current_async_exc_bb = saved_exc_bb;
+            g->current_async_rearm_switch = saved_rearm;
+            g->current_async_handler_next = saved_handler_next;
 
             /* ---- cleanup: release owned rc slots from the frame, free it.
              * Mirrors the arc_owned marking above: by-value rc params (the

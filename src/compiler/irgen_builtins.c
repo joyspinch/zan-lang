@@ -826,8 +826,24 @@ static void get_eh_globals(zan_irgen_t *g, LLVMValueRef *top,
     *top = t; *bufs = b; *exc = e;
 }
 
+/* Marks a function and a call to it with a simple enum attribute. */
+static void add_enum_attr(zan_irgen_t *g, LLVMValueRef fn, LLVMValueRef call,
+                          const char *name) {
+    unsigned kind = LLVMGetEnumAttributeKindForName(name, strlen(name));
+    if (kind == 0) return;
+    LLVMAttributeRef attr = LLVMCreateEnumAttribute(g->ctx, kind, 0);
+    LLVMAddAttributeAtIndex(fn, (LLVMAttributeIndex)LLVMAttributeFunctionIndex, attr);
+    if (call)
+        LLVMAddCallSiteAttribute(call, (LLVMAttributeIndex)LLVMAttributeFunctionIndex,
+                                 attr);
+}
+
 /* i32 setjmp on the current target: `_setjmp(buf, NULL)` on Windows (frame
- * NULL disables SEH unwinding), `_setjmp(buf)` elsewhere (no sigmask save). */
+ * NULL disables SEH unwinding), `_setjmp(buf)` elsewhere (no sigmask save).
+ * The call carries `returns_twice`: without it the backend is free to keep
+ * values in registers across the setjmp, and whatever the longjmp'd-to catch
+ * block reads afterwards is garbage (it showed up as corrupted exception
+ * messages and access violations in unoptimized builds). */
 static LLVMValueRef emit_eh_setjmp(zan_irgen_t *g, LLVMValueRef bufp) {
     LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
@@ -836,11 +852,14 @@ static LLVMValueRef emit_eh_setjmp(zan_irgen_t *g, LLVMValueRef bufp) {
         LLVMValueRef fn = get_libc_fn(g, "_setjmp", ty);
         LLVMValueRef call = zan_call2(g->builder, ty, fn,
             (LLVMValueRef[]){ bufp, LLVMConstNull(i8ptr) }, 2, "sj");
+        add_enum_attr(g, fn, call, "returns_twice");
         return call;
     }
     LLVMTypeRef ty = LLVMFunctionType(i32t, (LLVMTypeRef[]){ i8ptr }, 1, 0);
     LLVMValueRef fn = get_libc_fn(g, "_setjmp", ty);
-    return zan_call2(g->builder, ty, fn, &bufp, 1, "sj");
+    LLVMValueRef call = zan_call2(g->builder, ty, fn, &bufp, 1, "sj");
+    add_enum_attr(g, fn, call, "returns_twice");
+    return call;
 }
 
 static void emit_eh_longjmp(zan_irgen_t *g, LLVMValueRef bufp) {
@@ -849,8 +868,9 @@ static void emit_eh_longjmp(zan_irgen_t *g, LLVMValueRef bufp) {
     LLVMTypeRef ty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx),
         (LLVMTypeRef[]){ i8ptr, i32t }, 2, 0);
     LLVMValueRef fn = get_libc_fn(g, "longjmp", ty);
-    zan_call2(g->builder, ty, fn,
+    LLVMValueRef call = zan_call2(g->builder, ty, fn,
         (LLVMValueRef[]){ bufp, LLVMConstInt(i32t, 1, 0) }, 2, "");
+    add_enum_attr(g, fn, call, "noreturn");
 }
 
 /* ---- EH-owned temporaries -------------------------------------------------

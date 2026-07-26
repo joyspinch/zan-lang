@@ -691,6 +691,35 @@ static int type_is_binding(zan_type_t *t) {
            memcmp(t->name.str, "Binding", 7) == 0;
 }
 
+/* A delegate-typed field declared on a generic class can spell its signature
+ * in the class's type parameters (`RowPaint<T> painter` inside `List<T>`).
+ * Rebuild the signature against the receiver's instantiation so callers see
+ * concrete parameter/return types (`RowPaint<Person>`). Returns `t` unchanged
+ * when nothing needs substituting. */
+static zan_type_t *subst_delegate_sig(zan_irgen_t *g, zan_type_t *t,
+                                      zan_type_t *recv) {
+    if (!t || t->kind != TYPE_DELEGATE || !recv || recv->type_arg_count <= 0)
+        return t;
+    bool needs = t->delegate_ret_type &&
+                 t->delegate_ret_type->kind == TYPE_TYPE_PARAM;
+    for (int i = 0; !needs && i < t->delegate_param_count; i++)
+        needs = t->delegate_param_types[i] &&
+                t->delegate_param_types[i]->kind == TYPE_TYPE_PARAM;
+    if (!needs) return t;
+
+    zan_type_t *out = (zan_type_t *)zan_arena_alloc(g->arena, sizeof(zan_type_t));
+    *out = *t;
+    out->delegate_ret_type = subst_type_param(t->delegate_ret_type, recv);
+    if (t->delegate_param_count > 0) {
+        out->delegate_param_types = (zan_type_t **)zan_arena_alloc(g->arena,
+            sizeof(zan_type_t *) * (size_t)t->delegate_param_count);
+        for (int i = 0; i < t->delegate_param_count; i++)
+            out->delegate_param_types[i] =
+                subst_type_param(t->delegate_param_types[i], recv);
+    }
+    return out;
+}
+
 /* Static type of an assignment target (NULL when unknown). */
 static zan_type_t *assign_lhs_type(zan_irgen_t *g, zan_ast_node_t *lhs,
                                    local_scope_t *locals) {
@@ -700,12 +729,13 @@ static zan_type_t *assign_lhs_type(zan_irgen_t *g, zan_ast_node_t *lhs,
         if (lv) return lv->type;
         if (g->current_type_sym) {
             zan_symbol_t *fs = get_field_sym(g->current_type_sym, lhs->ident.name);
-            if (fs) return fs->type;
+            if (fs) return subst_delegate_sig(g, fs->type, g->cur_inst);
         }
         return NULL;
     }
     if (lhs->kind == AST_MEMBER_ACCESS)
-        return member_access_field_type(g, locals, lhs);
+        return subst_delegate_sig(g, member_access_field_type(g, locals, lhs),
+                                  infer_expr_type(g, lhs->member.object, locals));
     return NULL;
 }
 
@@ -993,7 +1023,12 @@ static LLVMValueRef emit_expr_assignment(zan_irgen_t *g, zan_ast_node_t *expr,
                     goto binding_lowered;
                 }
             }
-            right = emit_expr(g, expr->binary.right, locals);
+            /* `target = (a, b) => ...`: hand the delegate type down so the
+             * lambda's unannotated parameters borrow their types from it. */
+            right = (lt && lt->kind == TYPE_DELEGATE &&
+                     expr->binary.right->kind == AST_LAMBDA)
+                        ? emit_lambda_typed(g, expr->binary.right, lt, locals)
+                        : emit_expr(g, expr->binary.right, locals);
         }
 binding_lowered:
         if (expr->binary.left->kind == AST_IDENTIFIER) {
@@ -2505,6 +2540,7 @@ static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                     LLVMBuildStructGEP2(g->builder, self_ft, selfframe, ASYNC_FRAME_STATE, "self.state"));
                 zan_call2(g->builder, g->rt_co_delay_type, g->rt_co_delay,
                     (LLVMValueRef[]){ ms, self_i8, g->current_async_resume_fn }, 3, "");
+                emit_async_eh_unarm(g);
                 LLVMBuildRetVoid(g->builder);
 
                 LLVMBasicBlockRef rk = LLVMAppendBasicBlockInContext(g->ctx,
@@ -2573,6 +2609,7 @@ static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                 LLVMBuildStructGEP2(g->builder, self_ft, selfframe, ASYNC_FRAME_STATE, "self.state"));
             zan_call2(g->builder, gate_park_type, gate_park,
                 (LLVMValueRef[]){ handle, self_i8, g->current_async_resume_fn }, 3, "");
+            emit_async_eh_unarm(g);
             LLVMBuildRetVoid(g->builder);
 
             LLVMBasicBlockRef rk = LLVMAppendBasicBlockInContext(g->ctx,
@@ -2620,6 +2657,7 @@ static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                     LLVMBuildStructGEP2(g->builder, self_ft, selfframe, ASYNC_FRAME_STATE, "self.state"));
                 zan_call2(g->builder, g->rt_io_wait_co_type, g->rt_io_wait_co,
                     (LLVMValueRef[]){ fd, interest, self_i8, g->current_async_resume_fn }, 4, "");
+                emit_async_eh_unarm(g);
                 LLVMBuildRetVoid(g->builder);
 
                 LLVMBasicBlockRef rk = LLVMAppendBasicBlockInContext(g->ctx,
@@ -2673,6 +2711,7 @@ static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                 zan_call2(g->builder, g->rt_io_recv_co_type, g->rt_io_recv_co,
                     (LLVMValueRef[]){ fd, buf, len, self_i8,
                         g->current_async_resume_fn, out_n }, 6, "");
+                emit_async_eh_unarm(g);
                 LLVMBuildRetVoid(g->builder);
 
                 LLVMBasicBlockRef rk = LLVMAppendBasicBlockInContext(g->ctx,
@@ -2720,6 +2759,7 @@ static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                 zan_call2(g->builder, g->rt_io_accept_co_type,
                     g->rt_io_accept_co, (LLVMValueRef[]){ fd, self_i8,
                         g->current_async_resume_fn, out_fd }, 4, "");
+                emit_async_eh_unarm(g);
                 LLVMBuildRetVoid(g->builder);
 
                 LLVMBasicBlockRef rk = LLVMAppendBasicBlockInContext(g->ctx,
@@ -2820,6 +2860,7 @@ static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                     LLVMBuildStructGEP2(g->builder, self_ft, selfframe, ASYNC_FRAME_STATE, "self.state"));
                 LLVMValueRef sched_args[] = { sub_i8, sub_resume };
                 zan_call2(g->builder, g->rt_co_ready_type, g->rt_co_ready, sched_args, 2, "");
+                emit_async_eh_unarm(g);
                 LLVMBuildRetVoid(g->builder);
 
                 /* resume-k: re-entered by the driver once the sub completes */
@@ -2833,6 +2874,10 @@ static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                 LLVMValueRef sub_slot = LLVMBuildStructGEP2(g->builder, self_ft, selfframe,
                     (unsigned)(g->current_async_sub_base + j), "sub.slot2");
                 LLVMValueRef sub_rl = LLVMBuildLoad2(g->builder, i8ptr, sub_slot, "sub.rl");
+                /* the sub may have completed by throwing: re-throw it here,
+                 * where this frame has a live invocation and its handlers are
+                 * armed again */
+                emit_async_check_sub_exc(g, sub_rl);
                 LLVMValueRef rptr = LLVMBuildStructGEP2(g->builder, hdr, sub_rl,
                     ASYNC_FRAME_RESULT, "sub.result");
                 LLVMValueRef awres = LLVMBuildLoad2(g->builder, i64, rptr, "awres");
@@ -2854,6 +2899,7 @@ static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
             LLVMValueRef sched_args[] = { sub_i8, sub_resume };
             zan_call2(g->builder, g->rt_co_ready_type, g->rt_co_ready, sched_args, 2, "");
             zan_call2(g->builder, g->rt_co_sched_run_type, g->rt_co_sched_run, NULL, 0, "");
+            emit_async_check_sub_exc(g, sub_i8);
             LLVMValueRef rptr = LLVMBuildStructGEP2(g->builder, hdr, sub_i8,
                 ASYNC_FRAME_RESULT, "sub.result");
             LLVMValueRef awres = LLVMBuildLoad2(g->builder, i64, rptr, "awres");

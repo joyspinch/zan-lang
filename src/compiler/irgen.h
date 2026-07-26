@@ -20,6 +20,9 @@ typedef struct {
     int          frame_index;
 } zan_async_slot_t;
 
+/* Handler ids a single coroutine can keep armed across suspensions. */
+#define ASYNC_MAX_HANDLERS 8
+
 struct zan_irgen {
     zan_arena_t *arena;
     zan_diag_t *diag;
@@ -195,6 +198,7 @@ struct zan_irgen {
     const char  *src_file;        /* source path, for runtime diagnostics */
     bool         runtime_checks;  /* insert div-by-zero (etc.) guards; default true */
     bool         check_leaks;     /* emit a leak report at program exit */
+    bool         fast_codegen;    /* machine codegen at -O0 (fast turnaround) */
 
     /* Binding<T> lowering: synthesized per-(class,field) accessor functions
      * (see emit_binding_value in irgen_expr.c), cached so each field pair is
@@ -284,6 +288,18 @@ struct zan_irgen {
     int          current_async_sub_next;
     zan_async_slot_t *current_async_slots;
     int          current_async_slot_count;
+    /* async exception handling: the eh-stack depth on entry to the $resume
+     * invocation being emitted (an alloca), the block that completes the frame
+     * with a pending exception, the switch that re-enters the catch of a
+     * handler armed by an earlier invocation, and the next handler id. */
+    LLVMValueRef current_async_eh_entry;
+    LLVMBasicBlockRef current_async_exc_bb;
+    LLVMValueRef current_async_rearm_switch;
+    /* re-arm time: per-handler block that restores the eh bookkeeping the
+     * try's entry wrote in the invocation that armed it */
+    LLVMValueRef current_async_rearm_init_switch;
+    LLVMBasicBlockRef current_async_rearm_next_bb;
+    int          current_async_handler_next;
 
     /* DllImport: tracked extern libraries for linker */
     zan_istr_t extern_libs[64];
