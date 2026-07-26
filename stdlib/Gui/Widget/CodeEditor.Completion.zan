@@ -342,59 +342,106 @@ partial class CodeEditor {
         return name;
     }
 
-    /// Counts whole-word occurrences of `name` across all lines.
-    int CountWord(string name) {
+    /// `line` with comment and string/char literal text blanked out (same
+    /// length, so offsets still map back to the original), so a scan never
+    /// matches a name mentioned in prose or inside a literal.
+    static string StripCode(string line) {
+        string outp = "";
+        int i = 0;
+        bool inStr = false;
+        bool inChr = false;
+        while (i < line.Length) {
+            string ch = line.Substring(i, 1);
+            if (inStr || inChr) {
+                outp = outp + " ";
+                if (ch == "\\" && i + 1 < line.Length) {
+                    outp = outp + " ";
+                    i = i + 2;
+                    continue;
+                }
+                if (inStr && ch == "\"") { inStr = false; }
+                if (inChr && ch == "'") { inChr = false; }
+                i = i + 1;
+                continue;
+            }
+            if (ch == "/" && i + 1 < line.Length && line.Substring(i + 1, 1) == "/") {
+                while (i < line.Length) { outp = outp + " "; i = i + 1; }
+                return outp;
+            }
+            if (ch == "\"") { inStr = true; outp = outp + " "; i = i + 1; continue; }
+            if (ch == "'") { inChr = true; outp = outp + " "; i = i + 1; continue; }
+            outp = outp + ch;
+            i = i + 1;
+        }
+        return outp;
+    }
+
+    /// Offset of the first call site of `name` in `code` at or after `from`, or
+    /// -1. A call site is a whole-word occurrence followed by `(`, which is what
+    /// separates a real reference from a named argument (`Upload = true`), a
+    /// type name (`class Index`) or a declaration of a same-named member.
+    static int FindCallSite(string code, string name, int from) {
         string idset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
+        int at = from;
+        while (true) {
+            int p = CodeEditor.FindFrom(code, name, at);
+            if (p < 0) { return -1; }
+            at = p + name.Length;
+            bool word = true;
+            if (p > 0 && CodeEditor.InSet(idset, code.Substring(p - 1, 1))) { word = false; }
+            if (at < code.Length && CodeEditor.InSet(idset, code.Substring(at, 1))) { word = false; }
+            if (word) {
+                int q = at;
+                while (q < code.Length && code.Substring(q, 1) == " ") { q = q + 1; }
+                if (q < code.Length && code.Substring(q, 1) == "(") { return p; }
+            }
+        }
+    }
+
+    /// Counts the call sites of `name` outside its declaration on `declLine`
+    /// (and outside any other declaration of the same name), appending the line
+    /// of each one to `outLines` when that list is given.
+    int ScanRefs(string name, int declLine, List<int> outLines) {
         int total = 0;
         int li = 0;
         while (li < lines.Count) {
-            string s = lines[li];
-            int from = 0;
-            while (true) {
-                int p = CodeEditor.FindFrom(s, name, from);
-                if (p < 0) { break; }
-                bool lok = true;
-                bool rok = true;
-                if (p > 0 && CodeEditor.InSet(idset, s.Substring(p - 1, 1))) { lok = false; }
-                int rp = p + name.Length;
-                if (rp < s.Length && CodeEditor.InSet(idset, s.Substring(rp, 1))) { rok = false; }
-                if (lok && rok) { total = total + 1; }
-                from = p + name.Length;
+            if (li != declLine && CodeEditor.DeclNameAt(lines[li]) != name) {
+                string s = CodeEditor.StripCode(lines[li]);
+                int from = 0;
+                while (true) {
+                    int p = CodeEditor.FindCallSite(s, name, from);
+                    if (p < 0) { break; }
+                    from = p + name.Length;
+                    total = total + 1;
+                    if (outLines != null) { outLines.Add(li); }
+                }
             }
             li = li + 1;
         }
         return total;
     }
 
-    /// Moves the caret to the next whole-word reference of `name` after
-    /// `declLine` (wrapping around), skipping the declaration line itself, and
-    /// selects it. Does nothing when no other reference exists.
+    /// Number of call sites of `name` declared on `declLine` (the CodeLens count).
+    int CountRefs(string name, int declLine) {
+        return ScanRefs(name, declLine, null);
+    }
+
+    /// Moves the caret to the next call site of `name` after `declLine`
+    /// (wrapping around) and selects it. Does nothing when there is none.
     void JumpToNextRef(string name, int declLine) {
-        string idset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
         int total = lines.Count;
         int scanned = 0;
         int li = declLine + 1;
         while (scanned < total) {
             if (li >= lines.Count) { li = 0; }
-            if (li != declLine) {
-                string s = lines[li];
-                int from = 0;
-                while (true) {
-                    int p = CodeEditor.FindFrom(s, name, from);
-                    if (p < 0) { break; }
-                    bool lok = true;
-                    bool rok = true;
-                    if (p > 0 && CodeEditor.InSet(idset, s.Substring(p - 1, 1))) { lok = false; }
-                    int rp = p + name.Length;
-                    if (rp < s.Length && CodeEditor.InSet(idset, s.Substring(rp, 1))) { rok = false; }
-                    if (lok && rok) {
-                        ClearExtraCarets();
-                        selActive = true;
-                        selAnchorLine = li; selAnchorCol = p;
-                        curLine = li; curCol = p + name.Length;
-                        return;
-                    }
-                    from = p + name.Length;
+            if (li != declLine && CodeEditor.DeclNameAt(lines[li]) != name) {
+                int p = CodeEditor.FindCallSite(CodeEditor.StripCode(lines[li]), name, 0);
+                if (p >= 0) {
+                    ClearExtraCarets();
+                    selActive = true;
+                    selAnchorLine = li; selAnchorCol = p;
+                    curLine = li; curCol = p + name.Length;
+                    return;
                 }
             }
             li = li + 1;
@@ -402,59 +449,26 @@ partial class CodeEditor {
         }
     }
 
-    /// Collects every line index (excluding `declLine`) that contains a
-    /// whole-word reference of `name`, in file order, into `outLines`.
+    /// Collects the line of every call site of `name` (excluding its
+    /// declaration on `declLine`), in file order, into `outLines`.
     void CollectRefs(string name, int declLine, List<int> outLines) {
-        string idset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
-        int li = 0;
-        while (li < lines.Count) {
-            if (li != declLine) {
-                string s = lines[li];
-                int from = 0;
-                bool found = false;
-                while (!found) {
-                    int p = CodeEditor.FindFrom(s, name, from);
-                    if (p < 0) { break; }
-                    bool lok = true;
-                    bool rok = true;
-                    if (p > 0 && CodeEditor.InSet(idset, s.Substring(p - 1, 1))) { lok = false; }
-                    int rp = p + name.Length;
-                    if (rp < s.Length && CodeEditor.InSet(idset, s.Substring(rp, 1))) { rok = false; }
-                    if (lok && rok) { outLines.Add(li); found = true; }
-                    from = p + name.Length;
-                }
-            }
-            li = li + 1;
-        }
+        ScanRefs(name, declLine, outLines);
     }
 
-    /// Moves the caret to the first whole-word reference of `name` on `targetLine`
-    /// and selects it (used by the reference-list popup).
+    /// Moves the caret to the first call site of `name` on `targetLine` and
+    /// selects it (used by the reference-list popup).
     void JumpToRefLine(string name, int targetLine) {
         if (targetLine < 0 || targetLine >= lines.Count) { return; }
-        string idset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
-        string s = lines[targetLine];
-        int from = 0;
-        while (true) {
-            int p = CodeEditor.FindFrom(s, name, from);
-            if (p < 0) { break; }
-            bool lok = true;
-            bool rok = true;
-            if (p > 0 && CodeEditor.InSet(idset, s.Substring(p - 1, 1))) { lok = false; }
-            int rp = p + name.Length;
-            if (rp < s.Length && CodeEditor.InSet(idset, s.Substring(rp, 1))) { rok = false; }
-            if (lok && rok) {
-                ClearExtraCarets();
-                selActive = true;
-                selAnchorLine = targetLine; selAnchorCol = p;
-                curLine = targetLine; curCol = p + name.Length;
-                if (curLine < scrollLine || curLine >= scrollLine + 4) {
-                    scrollLine = curLine - 4;
-                    if (scrollLine < 0) { scrollLine = 0; }
-                }
-                return;
-            }
-            from = p + name.Length;
+        int p = CodeEditor.FindCallSite(
+            CodeEditor.StripCode(lines[targetLine]), name, 0);
+        if (p < 0) { return; }
+        ClearExtraCarets();
+        selActive = true;
+        selAnchorLine = targetLine; selAnchorCol = p;
+        curLine = targetLine; curCol = p + name.Length;
+        if (curLine < scrollLine || curLine >= scrollLine + 4) {
+            scrollLine = curLine - 4;
+            if (scrollLine < 0) { scrollLine = 0; }
         }
     }
 
