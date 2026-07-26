@@ -1,0 +1,367 @@
+using System;
+using System.Data;
+using System.Net.Sockets;
+
+namespace System.Data.SqlServer;
+
+/// <summary>
+/// Native, coroutine-ized SQL Server client speaking TDS 7.4 on the wire --
+/// no ODBC driver, no SNI, no native DLL. PRELOGIN, LOGIN7, SQL batches and
+/// sp_executesql RPCs are built by <see cref="TdsMessage"/> and every network
+/// step suspends on the IO reactor (<c>Socket.ConnectAsync</c> /
+/// <c>Socket.SendAsync</c> / <c>Socket.RecvOv</c>), so a query never blocks the
+/// worker thread and many connections progress on one thread.
+///
+/// The login packet is sent in the clear: TDS scrambles the password field but
+/// that is obfuscation, not encryption, so a server with "force encryption" on
+/// will reject the login (its PRELOGIN answers ENCRYPT_REQ, which shows up as a
+/// connection error rather than a silent downgrade).
+///
+/// Usage:
+///   SqlServerConnection db = await SqlServerConnection.OpenAsync(
+///       "127.0.0.1", 1433, "master", "sa", "secret");
+///   DbResult r = await db.QueryAsync("SELECT id, name FROM t WHERE id > ?",
+///                                    DbParams.Create().AddInt(3));
+///   db.Close();
+/// </summary>
+class SqlServerConnection {
+    int sock;
+    bool connected;
+    string lastError;
+    int lastAffected;
+    string serverVersion;
+    string database;
+    string appName;
+    int packetSize;
+    int packetId;
+
+    [DllImport("crt")]
+    static extern string calloc(int count, int size);
+
+    [DllImport("crt")]
+    static extern void free(string ptr);
+
+    SqlServerConnection() {
+        this.sock = -1;
+        this.connected = false;
+        this.lastError = "";
+        this.lastAffected = 0;
+        this.serverVersion = "";
+        this.database = "";
+        this.appName = "zan";
+        this.packetSize = TdsPacket.DEFAULT_SIZE;
+        this.packetId = 1;
+    }
+
+    // ============================================================
+    // Packet IO
+    // ============================================================
+
+    /// <summary>Reads exactly <paramref name="need"/> bytes, suspending between
+    /// partial reads. Returns what it managed to read.</summary>
+    async int recvExact(string dst, int off, int need) {
+        int got = 0;
+        string tmp = SqlServerConnection.calloc(need + 1, 1);
+        while (got < need) {
+            int n = await Socket.RecvOv(this.sock, tmp, need - got);
+            if (n <= 0) {
+                SqlServerConnection.free(tmp);
+                return got;
+            }
+            int j = 0;
+            while (j < n) {
+                dst[off + got + j] = tmp[j] & 255;
+                j = j + 1;
+            }
+            got = got + n;
+        }
+        SqlServerConnection.free(tmp);
+        return got;
+    }
+
+    /// <summary>Sends a message, splitting it over as many packets as the
+    /// negotiated packet size needs; only the last one carries the EOM bit.</summary>
+    async bool sendMessage(int type, TdsBytes payload) {
+        int max = this.packetSize - TdsPacket.HEADER_LEN;
+        int off = 0;
+        int total = payload.Len();
+        bool first = true;
+        while (first || off < total) {
+            first = false;
+            int chunk = total - off;
+            int status = TdsPacket.STATUS_EOM;
+            if (chunk > max) {
+                chunk = max;
+                status = TdsPacket.STATUS_NORMAL;
+            }
+            TdsBytes pkt = TdsPacket.Frame(type, status, this.packetId, payload,
+                                           off, chunk);
+            this.packetId = this.packetId + 1;
+            if (this.packetId > 255) { this.packetId = 1; }
+            int sent = await Socket.SendAsync(this.sock, pkt.Data(), pkt.Len());
+            pkt.Release();
+            if (sent < 0) {
+                this.lastError = "send failed";
+                return false;
+            }
+            off = off + chunk;
+        }
+        return true;
+    }
+
+    /// <summary>Reads one whole response message: packets are concatenated until
+    /// the server marks end of message, because a token can straddle the
+    /// boundary between two of them.</summary>
+    async TdsBytes recvMessage() {
+        TdsBuf body = TdsBuf.Create();
+        bool more = true;
+        while (more) {
+            string hdr = SqlServerConnection.calloc(TdsPacket.HEADER_LEN + 1, 1);
+            int got = await this.recvExact(hdr, 0, TdsPacket.HEADER_LEN);
+            if (got < TdsPacket.HEADER_LEN) {
+                SqlServerConnection.free(hdr);
+                this.lastError = "connection closed by the server";
+                return null;
+            }
+            int status = hdr[1] & 255;
+            int len = ((hdr[2] & 255) << 8) | (hdr[3] & 255);
+            SqlServerConnection.free(hdr);
+            int payLen = len - TdsPacket.HEADER_LEN;
+            if (payLen < 0) {
+                this.lastError = "malformed packet header";
+                return null;
+            }
+            if (payLen > 0) {
+                string pay = SqlServerConnection.calloc(payLen + 1, 1);
+                int g2 = await this.recvExact(pay, 0, payLen);
+                if (g2 < payLen) {
+                    SqlServerConnection.free(pay);
+                    this.lastError = "truncated packet";
+                    return null;
+                }
+                int i = 0;
+                while (i < payLen) {
+                    body.U8(pay[i] & 255);
+                    i = i + 1;
+                }
+                SqlServerConnection.free(pay);
+            }
+            if ((status & TdsPacket.STATUS_EOM) != 0) { more = false; }
+        }
+        return body.ToBytes();
+    }
+
+    // ============================================================
+    // Connect and login
+    // ============================================================
+
+    /// <summary>Opens a connection and logs in with SQL Server authentication.</summary>
+    static async SqlServerConnection OpenAsync(string host, int port,
+            string database, string user, string password) {
+        Socket.Initialize();
+        SqlServerConnection conn = new SqlServerConnection();
+        conn.database = database;
+        bool ok = await conn.handshake(host, port, database, user, password);
+        conn.connected = ok;
+        if (!ok && conn.sock >= 0) {
+            Socket.Close(conn.sock);
+            conn.sock = -1;
+        }
+        return conn;
+    }
+
+    async bool handshake(string host, int port, string db, string user, string pw) {
+        this.sock = Socket.CreateTcp();
+        if (this.sock < 0) {
+            this.lastError = "socket create failed";
+            return false;
+        }
+        Socket.SetNonBlocking(this.sock);
+        int rc = await Socket.ConnectAsync(this.sock, host, port);
+        if (rc != 0) {
+            this.lastError = "cannot reach " + host + ":" + Convert.ToString(port);
+            return false;
+        }
+
+        // PRELOGIN. Declaring ENCRYPT_NOT_SUP keeps the exchange in the clear;
+        // a server that requires TLS answers ENCRYPT_REQ and is refused here
+        // instead of failing later with an opaque login error.
+        TdsBytes preloginMsg = TdsMessage.Prelogin(2);
+        bool sent = await this.sendMessage(TdsPacket.PRELOGIN, preloginMsg);
+        preloginMsg.Release();
+        if (!sent) { return false; }
+        TdsBytes pre = await this.recvMessage();
+        if (pre == null) { return false; }
+        int enc = TdsMessage.PreloginEncryption(pre);
+        pre.Release();
+        if (enc == 1 || enc == 3) {
+            this.lastError = "the server requires TLS, which this driver does not speak yet";
+            return false;
+        }
+
+        this.packetId = 1;
+        TdsBytes login = TdsMessage.Login7(host, user, pw, this.appName, host, db,
+                                           this.packetSize);
+        sent = await this.sendMessage(TdsPacket.LOGIN7, login);
+        login.Release();
+        if (!sent) { return false; }
+        TdsBytes ack = await this.recvMessage();
+        if (ack == null) { return false; }
+        TdsResponse resp = TdsMessage.Decode(ack);
+        ack.Release();
+        if (resp.Failed()) {
+            this.lastError = "login failed: " + resp.Error();
+            return false;
+        }
+        this.serverVersion = resp.ServerVersion();
+        if (resp.Database().Length > 0) {
+            this.database = resp.Database();
+        }
+        return true;
+    }
+
+    // ============================================================
+    // Statements
+    // ============================================================
+
+    async TdsResponse roundTrip(int type, TdsBytes payload) {
+        this.lastError = "";
+        if (!this.connected) {
+            payload.Release();
+            this.lastError = "not connected";
+            return TdsResponse.Create();
+        }
+        this.packetId = 1;
+        bool sent = await this.sendMessage(type, payload);
+        payload.Release();
+        if (!sent) {
+            this.connected = false;
+            return TdsResponse.Create();
+        }
+        TdsBytes body = await this.recvMessage();
+        if (body == null) {
+            this.connected = false;
+            return TdsResponse.Create();
+        }
+        TdsResponse resp = TdsMessage.Decode(body);
+        body.Release();
+        this.lastAffected = resp.Affected();
+        if (resp.Failed()) {
+            this.lastError = resp.Error();
+        }
+        return resp;
+    }
+
+    /// <summary>Runs a statement batch and returns its result set.</summary>
+    async DbResult QueryAsync(string sql) {
+        TdsResponse resp = await this.roundTrip(TdsPacket.SQLBATCH,
+                                                TdsMessage.SqlBatch(sql));
+        return resp.Rows();
+    }
+
+    /// <summary>Runs a parameterized query through sp_executesql. Placeholders
+    /// are `?`, rewritten to the @P1.. names the server expects; values travel
+    /// out of band, so nothing is escaped into the statement text.</summary>
+    async DbResult QueryAsync(string sql, DbParams prms) {
+        string text = SqlServerConnection.Renumber(sql, prms.Count());
+        if (text.Length == 0 && sql.Length > 0) {
+            this.lastError = "parameter count does not match the placeholders";
+            return DbResult.Empty();
+        }
+        TdsResponse resp = await this.roundTrip(TdsPacket.RPC,
+                                                TdsMessage.RpcExecuteSql(text, prms));
+        return resp.Rows();
+    }
+
+    /// <summary>Runs a statement and returns the affected row count (-1 on
+    /// failure).</summary>
+    async int ExecuteAsync(string sql) {
+        TdsResponse resp = await this.roundTrip(TdsPacket.SQLBATCH,
+                                                TdsMessage.SqlBatch(sql));
+        if (resp.Failed()) { return 0 - 1; }
+        return resp.Affected();
+    }
+
+    /// <summary>Parameterized statement.</summary>
+    async int ExecuteAsync(string sql, DbParams prms) {
+        string text = SqlServerConnection.Renumber(sql, prms.Count());
+        if (text.Length == 0 && sql.Length > 0) {
+            this.lastError = "parameter count does not match the placeholders";
+            return 0 - 1;
+        }
+        TdsResponse resp = await this.roundTrip(TdsPacket.RPC,
+                                                TdsMessage.RpcExecuteSql(text, prms));
+        if (resp.Failed()) { return 0 - 1; }
+        return resp.Affected();
+    }
+
+    /// <summary>First column of the first row, or "".</summary>
+    async string ExecuteScalarAsync(string sql) {
+        DbResult r = await this.QueryAsync(sql);
+        if (r.RowCount() == 0) { return ""; }
+        return r.GetString(0, 0);
+    }
+
+    /// <summary>Rewrites `?` placeholders to @P1, @P2 ... leaving anything
+    /// inside string literals, quoted identifiers or brackets alone. Returns ""
+    /// when the count does not match.</summary>
+    static string Renumber(string sql, int count) {
+        StringBuilder outp = new StringBuilder();
+        int i = 0;
+        int n = 0;
+        int quote = 0;              // 0 none, 1 ', 2 ", 3 [
+        while (i < sql.Length) {
+            string ch = sql.Substring(i, 1);
+            if (quote == 0) {
+                if (ch == "'") { quote = 1; }
+                else if (ch == "\"") { quote = 2; }
+                else if (ch == "[") { quote = 3; }
+                else if (ch == "?") {
+                    n = n + 1;
+                    outp.Append("@P");
+                    outp.Append(Convert.ToString(n));
+                    i = i + 1;
+                    continue;
+                }
+            } else if (quote == 1 && ch == "'") {
+                quote = 0;
+            } else if (quote == 2 && ch == "\"") {
+                quote = 0;
+            } else if (quote == 3 && ch == "]") {
+                quote = 0;
+            }
+            outp.Append(ch);
+            i = i + 1;
+        }
+        if (n != count) { return ""; }
+        return outp.ToString();
+    }
+
+    // ============================================================
+    // State
+    // ============================================================
+
+    /// <summary>Rows affected by the last statement.</summary>
+    int AffectedRows() { return this.lastAffected; }
+
+    /// <summary>Description of the last failure, or "".</summary>
+    string GetError() { return this.lastError; }
+
+    /// <summary>Server version reported by LOGINACK, e.g. "16.0.1000".</summary>
+    string ServerVersion() { return this.serverVersion; }
+
+    /// <summary>Database the session is bound to.</summary>
+    string Database() { return this.database; }
+
+    bool IsConnected() { return this.connected; }
+
+    int GetProvider() { return DbProvider.SqlServer; }
+
+    void Close() {
+        if (this.sock >= 0) {
+            Socket.Close(this.sock);
+            this.sock = -1;
+        }
+        this.connected = false;
+    }
+}

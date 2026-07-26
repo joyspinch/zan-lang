@@ -1,0 +1,539 @@
+using System;
+using System.Data;
+using System.Data.SqlServer;
+using System.Net.Sockets;
+
+// The native TDS 7.4 driver, checked two ways: the wire format on its own
+// (PRELOGIN/LOGIN7/SQLBatch/RPC bytes and the token-stream decoder against
+// hand-built responses), then the whole client against a fake SQL Server
+// served by this same program -- login, batches, errors, and a pool of two
+// sessions shared by four coroutines.
+
+/// Builds the token streams a server would send.
+class Tok {
+    /// A token with a two-byte length prefix.
+    static void Wrap(TdsBuf outp, int token, TdsBytes body) {
+        outp.U8(token);
+        outp.U16LE(body.Len());
+        outp.Block(body);
+        body.Release();
+    }
+
+    static void BVarchar(TdsBuf b, string s) {
+        b.U8(s.Length);
+        b.Ucs2(s);
+    }
+
+    static void LoginAck(TdsBuf outp, string version, int major, int minor, int build) {
+        TdsBuf b = TdsBuf.Create();
+        b.U8(1);                        // interface: SQL
+        b.U32LE(1946157060);            // TDS 7.4
+        Tok.BVarchar(b, version);
+        b.U8(major);
+        b.U8(minor);
+        b.U16BE(build);
+        Tok.Wrap(outp, 173, b.ToBytes());
+    }
+
+    static void EnvChangeDb(TdsBuf outp, string newDb, string oldDb) {
+        TdsBuf b = TdsBuf.Create();
+        b.U8(1);                        // database change
+        Tok.BVarchar(b, newDb);
+        Tok.BVarchar(b, oldDb);
+        Tok.Wrap(outp, 227, b.ToBytes());
+    }
+
+    static void Error(TdsBuf outp, int number, string msg) {
+        TdsBuf b = TdsBuf.Create();
+        b.U32LE(number);
+        b.U8(16);                       // state
+        b.U8(16);                       // class
+        b.U16LE(msg.Length);
+        b.Ucs2(msg);
+        Tok.BVarchar(b, "fake");        // server name
+        Tok.BVarchar(b, "");            // procedure name
+        b.U32LE(1);                     // line number
+        Tok.Wrap(outp, 170, b.ToBytes());
+    }
+
+    /// DONE with the "count is valid" status bit set.
+    static void Done(TdsBuf outp, int rowCount) {
+        outp.U8(253);
+        outp.U16LE(16);
+        outp.U16LE(0);
+        outp.U64LE(rowCount);
+    }
+
+    /// COLMETADATA for (id int, name nvarchar(50)).
+    static void ColMeta2(TdsBuf b) {
+        b.U8(129);
+        b.U16LE(2);
+        b.U32LE(0); b.U16LE(0);
+        b.U8(56);                       // INT4
+        Tok.BVarchar(b, "id");
+        b.U32LE(0); b.U16LE(0);
+        b.U8(231);                      // NVARCHAR
+        b.U16LE(100);
+        b.U32LE(0); b.U8(0);            // collation
+        Tok.BVarchar(b, "name");
+    }
+
+    static void Row2(TdsBuf b, int id, string name) {
+        b.U8(209);
+        b.U32LE(id);
+        b.U16LE(name.Length * 2);
+        b.Ucs2(name);
+    }
+
+    /// NBCROW whose second column is NULL, so its value is left out entirely.
+    static void RowNullName(TdsBuf b, int id) {
+        b.U8(210);
+        b.U8(2);                        // null bitmap: column 1
+        b.U32LE(id);
+    }
+}
+
+class Fake {
+    static int PORT = 54343;
+    static int logins = 0;
+    static int batches = 0;
+    static int inFlight = 0;
+    static int peak = 0;
+
+    [DllImport("crt")]
+    static extern string calloc(int count, int size);
+
+    [DllImport("crt")]
+    static extern void free(string ptr);
+
+    /// Reads exactly `need` bytes, or fewer if the peer goes away.
+    static async int RecvExact(int sock, string dst, int off, int need) {
+        int got = 0;
+        string tmp = Fake.calloc(need + 1, 1);
+        while (got < need) {
+            int n = await Socket.RecvOv(sock, tmp, need - got);
+            if (n <= 0) { Fake.free(tmp); return got; }
+            int j = 0;
+            while (j < n) {
+                dst[off + got + j] = tmp[j] & 255;
+                j = j + 1;
+            }
+            got = got + n;
+        }
+        Fake.free(tmp);
+        return got;
+    }
+
+    /// The statement text of a SQLBatch payload: 22 bytes of ALL_HEADERS, then
+    /// UCS-2.
+    static string BatchSql(string pay, int len) {
+        if (len <= 22) { return ""; }
+        TdsReader r = TdsReader.Over(pay, len);
+        r.Skip(22);
+        return r.Ucs2((len - 22) / 2);
+    }
+
+    static TdsBytes Reply(int type, string pay, int len) {
+        TdsBuf b = TdsBuf.Create();
+        if (type == 18) {               // PRELOGIN: same option table both ways
+            return TdsMessage.Prelogin(2);
+        }
+        if (type == 16) {               // LOGIN7
+            Fake.logins = Fake.logins + 1;
+            Tok.LoginAck(b, "Microsoft SQL Server", 16, 0, 1000);
+            Tok.EnvChangeDb(b, "master", "");
+            Tok.Done(b, 0);
+            return b.ToBytes();
+        }
+        Fake.batches = Fake.batches + 1;
+        string sql = "";
+        if (type == 1) { sql = Fake.BatchSql(pay, len); }
+        if (sql.StartsWith("BOOM")) {
+            Tok.Error(b, 208, "Invalid object name 'nope'.");
+            Tok.Done(b, 0);
+            return b.ToBytes();
+        }
+        if (sql.StartsWith("INSERT")) {
+            Tok.Done(b, 3);
+            return b.ToBytes();
+        }
+        Tok.ColMeta2(b);
+        Tok.Row2(b, 1, "alpha");
+        Tok.RowNullName(b, 2);
+        Tok.Done(b, 2);
+        return b.ToBytes();
+    }
+
+    static async void Serve(int client) {
+        string hdr = Fake.calloc(9, 1);
+        string pay = Fake.calloc(65537, 1);
+        bool alive = true;
+        while (alive) {
+            int got = await Fake.RecvExact(client, hdr, 0, 8);
+            if (got < 8) {
+                alive = false;
+            } else {
+                int type = hdr[0] & 255;
+                int len = ((hdr[2] & 255) << 8) | (hdr[3] & 255);
+                int payLen = len - 8;
+                if (payLen > 0) {
+                    await Fake.RecvExact(client, pay, 0, payLen);
+                }
+                Fake.inFlight = Fake.inFlight + 1;
+                if (Fake.inFlight > Fake.peak) { Fake.peak = Fake.inFlight; }
+                if (type == 1 || type == 3) { await Task.Delay(15); }
+                TdsBytes body = Fake.Reply(type, pay, payLen);
+                TdsBytes pkt = TdsPacket.Frame(4, 1, 1, body, 0, body.Len());
+                int sent = await Socket.SendAsync(client, pkt.Data(), pkt.Len());
+                body.Release();
+                pkt.Release();
+                Fake.inFlight = Fake.inFlight - 1;
+            }
+        }
+        Fake.free(hdr);
+        Fake.free(pay);
+        Socket.Close(client);
+    }
+
+    /// Accepts exactly `count` sessions and then retires, so no accept is left
+    /// parked on the reactor once the run is over.
+    static async void Accept(int listener, int count) {
+        int n = 0;
+        while (n < count) {
+            int client = await AsyncSocket.Accept(listener);
+            Socket.SetNonBlocking(client);
+            Task.Spawn(Fake.Serve(client));
+            n = n + 1;
+        }
+        Socket.Close(listener);
+    }
+
+    static int Listen() {
+        int listener = Socket.CreateTcp();
+        Socket.SetReuseAddr(listener);
+        Socket.Bind(listener, "127.0.0.1", Fake.PORT);
+        Socket.Listen(listener, 16);
+        Socket.SetNonBlocking(listener);
+        return listener;
+    }
+}
+
+class Program {
+    static int passed = 0;
+    static int failed = 0;
+    static int done = 0;
+
+    static void Check(string name, bool ok) {
+        if (ok) {
+            Program.passed = Program.passed + 1;
+        } else {
+            Program.failed = Program.failed + 1;
+            Console.WriteLine("FAIL: " + name);
+        }
+    }
+
+    static void CheckEq(string name, string got, string want) {
+        Program.Check(name + " (got '" + got + "', want '" + want + "')", got == want);
+    }
+
+    static void CheckEqInt(string name, int got, int want) {
+        Program.CheckEq(name, Convert.ToString(got), Convert.ToString(want));
+    }
+
+    // ===== wire format =====
+
+    static void TestPrelogin() {
+        TdsBytes p = TdsMessage.Prelogin(2);
+        Program.CheckEqInt("prelogin length", p.Len(), 24);
+        Program.CheckEqInt("prelogin starts with VERSION", p.At(0), 0);
+        Program.CheckEqInt("prelogin table ends with the terminator", p.At(15), 255);
+        Program.CheckEqInt("version option points past the table", p.At(2), 16);
+        Program.CheckEqInt("encryption byte", p.At(22), 2);
+        Program.CheckEqInt("MARS off", p.At(23), 0);
+        Program.CheckEqInt("server encryption is read back", TdsMessage.PreloginEncryption(p), 2);
+        p.Release();
+
+        TdsBytes req = TdsMessage.Prelogin(3);
+        Program.CheckEqInt("a server demanding encryption is recognised",
+                           TdsMessage.PreloginEncryption(req), 3);
+        req.Release();
+    }
+
+    static void TestLogin7() {
+        TdsBytes l = TdsMessage.Login7("host", "sa", "pw", "zan", "srv", "master", 4096);
+        int total = l.At(0) | (l.At(1) << 8) | (l.At(2) << 16) | (l.At(3) << 24);
+        Program.CheckEqInt("login7 length field matches the payload", total, l.Len());
+        Program.CheckEqInt("TDS 7.4 major version", l.At(7), 116);
+        Program.CheckEqInt("packet size", l.At(8) | (l.At(9) << 8), 4096);
+        int hostOff = l.At(36) | (l.At(37) << 8);
+        int hostLen = l.At(38) | (l.At(39) << 8);
+        Program.CheckEqInt("variable data starts after the 94-byte header", hostOff, 94);
+        Program.CheckEqInt("host name length is in characters", hostLen, 4);
+        int passOff = l.At(44) | (l.At(45) << 8);
+        int passLen = l.At(46) | (l.At(47) << 8);
+        Program.CheckEqInt("password offset", passOff, 94 + (4 + 2) * 2);
+        Program.CheckEqInt("password length", passLen, 2);
+        // Scrambling is nibble swap then XOR 0xA5, so undoing it returns 'p'.
+        int raw = l.At(passOff) ^ 165;
+        int ch = ((raw & 15) << 4) | ((raw >> 4) & 15);
+        Program.CheckEqInt("password is unscrambled back to its first byte", ch, 112);
+        Program.CheckEqInt("password high byte is scrambled too", l.At(passOff + 1), 165);
+        l.Release();
+    }
+
+    static void TestBatchAndRpc() {
+        TdsBytes b = TdsMessage.SqlBatch("SELECT 1");
+        Program.CheckEqInt("ALL_HEADERS total length", b.At(0), 22);
+        Program.CheckEqInt("transaction descriptor header length", b.At(4), 18);
+        Program.CheckEqInt("header type is the transaction descriptor", b.At(8), 2);
+        Program.CheckEqInt("outstanding request count", b.At(18), 1);
+        Program.CheckEqInt("statement is UCS-2", b.At(22), 83);      // 'S'
+        Program.CheckEqInt("statement high byte", b.At(23), 0);
+        Program.CheckEqInt("batch length", b.Len(), 22 + 16);
+        b.Release();
+
+        TdsBytes r = TdsMessage.RpcExecuteSql("SELECT @P1",
+                                              DbParams.Create().AddInt(7));
+        Program.CheckEqInt("RPC sends a procedure id", r.At(22) | (r.At(23) << 8), 65535);
+        Program.CheckEqInt("procedure id is sp_executesql", r.At(24) | (r.At(25) << 8), 10);
+        r.Release();
+
+        DbParams p = DbParams.Create().AddInt(1).AddDouble(2.5).Add("x").AddNull();
+        Program.CheckEq("parameter declaration", TdsMessage.Declaration(p),
+                        "@P1 bigint, @P2 float, @P3 nvarchar(max), @P4 nvarchar(max)");
+        Program.CheckEqInt("double bit pattern", TdsMessage.DoubleBits(2.5),
+                           4612811918334230528);
+        Program.CheckEqInt("zero has no bits set", TdsMessage.DoubleBits(0.0), 0);
+    }
+
+    static void TestRenumber() {
+        Program.CheckEq("placeholders are renumbered",
+                        SqlServerConnection.Renumber("SELECT ?, ?", 2),
+                        "SELECT @P1, @P2");
+        Program.CheckEq("a literal question mark is left alone",
+                        SqlServerConnection.Renumber("SELECT '?', ?", 1),
+                        "SELECT '?', @P1");
+        Program.CheckEq("a bracketed identifier is left alone",
+                        SqlServerConnection.Renumber("SELECT [a?b] FROM t WHERE x = ?", 1),
+                        "SELECT [a?b] FROM t WHERE x = @P1");
+        Program.CheckEq("a count mismatch is rejected",
+                        SqlServerConnection.Renumber("SELECT ?, ?", 1), "");
+    }
+
+    // ===== token stream =====
+
+    static void TestDecodeRows() {
+        TdsBuf b = TdsBuf.Create();
+        Tok.ColMeta2(b);
+        Tok.Row2(b, 1, "alpha");
+        Tok.RowNullName(b, 2);
+        Tok.Done(b, 2);
+        TdsBytes bytes = b.ToBytes();
+        TdsResponse resp = TdsMessage.Decode(bytes);
+        bytes.Release();
+
+        DbResult r = resp.Rows();
+        Program.Check("no error on a plain result", !resp.Failed());
+        Program.CheckEqInt("column count", r.ColumnCount(), 2);
+        Program.CheckEq("first column name", r.GetColumnName(0), "id");
+        Program.CheckEq("second column name", r.GetColumnName(1), "name");
+        Program.CheckEqInt("row count", r.RowCount(), 2);
+        Program.CheckEqInt("INT4 value", r.GetInt(0, 0), 1);
+        Program.CheckEq("NVARCHAR value", r.GetString(0, 1), "alpha");
+        Program.CheckEqInt("NBCROW keeps the non-null column", r.GetInt(1, 0), 2);
+        Program.Check("NBCROW marks the omitted column null", r.IsNull(1, 1));
+        Program.Check("a present value is not null", !resp.Rows().IsNull(0, 1));
+        Program.CheckEqInt("rows are the affected count for a query", resp.Affected(), 2);
+    }
+
+    static void TestDecodeError() {
+        TdsBuf b = TdsBuf.Create();
+        Tok.Error(b, 208, "Invalid object name 'nope'.");
+        Tok.Done(b, 0);
+        TdsBytes bytes = b.ToBytes();
+        TdsResponse resp = TdsMessage.Decode(bytes);
+        bytes.Release();
+        Program.Check("error token fails the response", resp.Failed());
+        Program.CheckEq("error message", resp.Error(), "Invalid object name 'nope'.");
+        Program.CheckEqInt("error number", resp.ErrorNumber(), 208);
+    }
+
+    static void TestDecodeLogin() {
+        TdsBuf b = TdsBuf.Create();
+        Tok.LoginAck(b, "Microsoft SQL Server", 16, 0, 1000);
+        Tok.EnvChangeDb(b, "appdb", "master");
+        Tok.Done(b, 0);
+        TdsBytes bytes = b.ToBytes();
+        TdsResponse resp = TdsMessage.Decode(bytes);
+        bytes.Release();
+        Program.CheckEq("server version from LOGINACK", resp.ServerVersion(), "16.0.1000");
+        Program.CheckEq("database from ENVCHANGE", resp.Database(), "appdb");
+        Program.Check("login stream has no error", !resp.Failed());
+    }
+
+    /// One row holding the awkward types: the decoder has to turn fifteen-odd
+    /// binary encodings into text.
+    static void TestDecodeTypes() {
+        TdsBuf b = TdsBuf.Create();
+        b.U8(129);
+        b.U16LE(8);
+        // BITN
+        b.U32LE(0); b.U16LE(0); b.U8(104); b.U8(1); Tok.BVarchar(b, "flag");
+        // INTN(8)
+        b.U32LE(0); b.U16LE(0); b.U8(38); b.U8(8); Tok.BVarchar(b, "big");
+        // FLTN(8)
+        b.U32LE(0); b.U16LE(0); b.U8(109); b.U8(8); Tok.BVarchar(b, "dbl");
+        // MONEYN(8)
+        b.U32LE(0); b.U16LE(0); b.U8(110); b.U8(8); Tok.BVarchar(b, "cash");
+        // NUMERIC(18,4)
+        b.U32LE(0); b.U16LE(0); b.U8(108); b.U8(9); b.U8(18); b.U8(4);
+        Tok.BVarchar(b, "num");
+        // DATETIME
+        b.U32LE(0); b.U16LE(0); b.U8(111); b.U8(8); Tok.BVarchar(b, "when");
+        // GUID
+        b.U32LE(0); b.U16LE(0); b.U8(36); b.U8(16); Tok.BVarchar(b, "uid");
+        // VARBINARY(8)
+        b.U32LE(0); b.U16LE(0); b.U8(165); b.U16LE(8); Tok.BVarchar(b, "blob");
+
+        b.U8(209);
+        b.U8(1); b.U8(1);                       // BITN: true
+        b.U8(8); b.U64LE(0 - 5000000000);       // INTN: a bigint below -2^32
+        b.U8(8); b.U64LE(TdsMessage.DoubleBits(1.5));
+        // MONEY: 12.3456 in ten-thousandths, high word first
+        b.U8(8); b.U32LE(0); b.U32LE(123456);
+        // NUMERIC 1234.5678 -> sign byte then a little-endian magnitude
+        b.U8(9); b.U8(1); b.U32LE(12345678); b.U32LE(0);
+        // DATETIME: 2024-03-01 12:00:00, days since 1900 and 300ths of a second
+        b.U8(8); b.U32LE(45350); b.U32LE(12960000);
+        b.U8(16);
+        b.U32LE(305419896); b.U16LE(4660); b.U16LE(22136);
+        b.U8(1); b.U8(2); b.U8(3); b.U8(4); b.U8(5); b.U8(6); b.U8(7); b.U8(8);
+        b.U16LE(4); b.U8(222); b.U8(173); b.U8(190); b.U8(239);
+        Tok.Done(b, 1);
+
+        TdsBytes bytes = b.ToBytes();
+        TdsResponse resp = TdsMessage.Decode(bytes);
+        bytes.Release();
+        DbResult r = resp.Rows();
+        Program.CheckEqInt("typed row decoded", r.RowCount(), 1);
+        Program.CheckEq("BITN", r.GetString(0, 0), "1");
+        Program.CheckEq("INTN keeps 64-bit range", r.GetString(0, 1), "-5000000000");
+        Program.CheckEq("FLTN", r.GetString(0, 2), "1.5");
+        Program.CheckEq("MONEY is scaled by ten thousand", r.GetString(0, 3), "12.3456");
+        Program.CheckEq("NUMERIC honours its scale", r.GetString(0, 4), "1234.5678");
+        Program.CheckEq("DATETIME", r.GetString(0, 5), "2024-03-01 12:00:00.000");
+        Program.CheckEq("GUID groups are byte-swapped", r.GetString(0, 6),
+                        "12345678-1234-5678-0102-030405060708");
+        Program.CheckEq("VARBINARY becomes hex", r.GetString(0, 7), "0xdeadbeef");
+    }
+
+    static void TestDecodeDates() {
+        TdsBuf b = TdsBuf.Create();
+        b.U8(129);
+        b.U16LE(3);
+        b.U32LE(0); b.U16LE(0); b.U8(40); Tok.BVarchar(b, "d");          // DATE
+        b.U32LE(0); b.U16LE(0); b.U8(41); b.U8(0); Tok.BVarchar(b, "t");  // TIME(0)
+        b.U32LE(0); b.U16LE(0); b.U8(42); b.U8(3); Tok.BVarchar(b, "dt2");// DATETIME2(3)
+        b.U8(209);
+        b.U8(3); b.U8(129); b.U8(70); b.U8(11);        // 2024-03-01
+        b.U8(3); b.U8(128); b.U8(112); b.U8(0);        // 08:00:00
+        b.U8(7);
+        b.U8(128); b.U8(41); b.U8(179); b.U8(2);       // 12:34:56.000
+        b.U8(129); b.U8(70); b.U8(11);
+        Tok.Done(b, 1);
+        TdsBytes bytes = b.ToBytes();
+        TdsResponse resp = TdsMessage.Decode(bytes);
+        bytes.Release();
+        DbResult r = resp.Rows();
+        Program.CheckEq("DATE", r.GetString(0, 0), "2024-03-01");
+        Program.CheckEq("TIME", r.GetString(0, 1), "08:00:00");
+        Program.CheckEq("DATETIME2 keeps its fractional scale", r.GetString(0, 2),
+                        "2024-03-01 12:34:56.000");
+    }
+
+    // ===== against the fake server =====
+
+    static async void Worker(SqlServerPool pool) {
+        SqlServerConnection db = await pool.AcquireAsync();
+        if (db == null) {
+            Program.done = Program.done + 1;
+            return;
+        }
+        DbResult r = await db.QueryAsync("SELECT id, name FROM t");
+        if (r.RowCount() == 2) {
+            Program.done = Program.done + 1;
+        }
+        pool.Release(db);
+    }
+
+    static async void Live() {
+        // One session for the direct checks plus two for the pool.
+        int listener = Fake.Listen();
+        Task.Spawn(Fake.Accept(listener, 3));
+
+        SqlServerConnection db = await SqlServerConnection.OpenAsync(
+            "127.0.0.1", Fake.PORT, "master", "sa", "secret");
+        Program.Check("login succeeds", db.IsConnected());
+        Program.CheckEq("server version is remembered", db.ServerVersion(), "16.0.1000");
+        Program.CheckEq("database from the login response", db.Database(), "master");
+        Program.CheckEqInt("the server saw one login", Fake.logins, 1);
+
+        DbResult r = await db.QueryAsync("SELECT id, name FROM t");
+        Program.CheckEqInt("query returns its rows", r.RowCount(), 2);
+        Program.CheckEq("row values survive the round trip", r.GetString(0, 1), "alpha");
+        Program.Check("a NULL column stays null", r.IsNull(1, 1));
+
+        int n = await db.ExecuteAsync("INSERT INTO t VALUES (3, 'c')");
+        Program.CheckEqInt("execute reports affected rows", n, 3);
+
+        DbResult bad = await db.QueryAsync("BOOM");
+        Program.CheckEqInt("a failed statement returns no rows", bad.RowCount(), 0);
+        Program.CheckEq("the server error reaches the caller", db.GetError(),
+                        "Invalid object name 'nope'.");
+        Program.Check("an error does not drop the session", db.IsConnected());
+
+        int again = await db.ExecuteAsync("INSERT INTO t VALUES (4, 'd')");
+        Program.CheckEqInt("the session is reusable after an error", again, 3);
+        db.Close();
+        Program.Check("Close() marks the connection down", !db.IsConnected());
+
+        // Two sessions, four coroutines: all finish, the cap holds, and the
+        // fake server sees statements overlapping rather than taking turns.
+        SqlServerPool pool = SqlServerPool.Create("127.0.0.1", Fake.PORT, "master",
+                                                  "sa", "secret", 2);
+        Fake.peak = 0;
+        int i = 0;
+        while (i < 4) {
+            Task.Spawn(Program.Worker(pool));
+            i = i + 1;
+        }
+        while (Program.done < 4) {
+            await Task.Delay(5);
+        }
+        Program.CheckEqInt("every pooled worker finished", Program.done, 4);
+        Program.Check("the pool never exceeds its size", pool.LiveCount() <= 2);
+        Program.CheckEqInt("only two logins for four workers", Fake.logins, 3);
+        Program.Check("statements really overlap", Fake.peak >= 2);
+        Program.CheckEqInt("connections are pooled, not dropped", pool.IdleCount(), 2);
+        pool.Close();
+        Program.CheckEqInt("close drains the pool", pool.IdleCount(), 0);
+        SqlServerConnection dead = await pool.AcquireAsync();
+        Program.Check("acquire on a closed pool yields null", dead == null);
+    }
+
+    static void Main() {
+        Socket.Initialize();
+        Program.TestPrelogin();
+        Program.TestLogin7();
+        Program.TestBatchAndRpc();
+        Program.TestRenumber();
+        Program.TestDecodeRows();
+        Program.TestDecodeError();
+        Program.TestDecodeLogin();
+        Program.TestDecodeTypes();
+        Program.TestDecodeDates();
+        await Program.Live();
+        Console.WriteLine("pass: " + Convert.ToString(Program.passed));
+        Console.WriteLine("fail: " + Convert.ToString(Program.failed));
+    }
+}

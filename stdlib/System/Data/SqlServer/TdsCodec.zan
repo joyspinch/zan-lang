@@ -1,0 +1,348 @@
+using System;
+using System.Data;
+
+namespace System.Data.SqlServer;
+
+/// <summary>
+/// Byte buffer used to build TDS messages. Bytes are collected in a list and
+/// materialised once, which keeps the encoders free of pointer arithmetic; the
+/// resulting Zan string is a plain byte array and stays binary-safe (embedded
+/// NULs included).
+/// </summary>
+class TdsBuf {
+    List<int> b;
+
+    [DllImport("crt")]
+    static extern string calloc(int count, int size);
+
+    [DllImport("crt")]
+    static extern void free(string ptr);
+
+    /// <summary>Byte string of <paramref name="n"/> zero bytes' worth of room,
+    /// used by decoders that assemble text byte by byte.</summary>
+    static string Alloc(int n) { return TdsBuf.calloc(n + 1, 1); }
+
+    static void Release(string p) { TdsBuf.free(p); }
+
+    TdsBuf() {
+        this.b = new List<int>();
+    }
+
+    static TdsBuf Create() {
+        return new TdsBuf();
+    }
+
+    int Count() { return this.b.Count; }
+    int At(int i) { return this.b[i]; }
+    void SetAt(int i, int v) { this.b[i] = v & 255; }
+
+    TdsBuf U8(int v) {
+        this.b.Add(v & 255);
+        return this;
+    }
+
+    TdsBuf U16LE(int v) {
+        this.b.Add(v & 255);
+        this.b.Add((v >> 8) & 255);
+        return this;
+    }
+
+    TdsBuf U16BE(int v) {
+        this.b.Add((v >> 8) & 255);
+        this.b.Add(v & 255);
+        return this;
+    }
+
+    TdsBuf U32LE(int v) {
+        this.b.Add(v & 255);
+        this.b.Add((v >> 8) & 255);
+        this.b.Add((v >> 16) & 255);
+        this.b.Add((v >> 24) & 255);
+        return this;
+    }
+
+    TdsBuf U32BE(int v) {
+        this.b.Add((v >> 24) & 255);
+        this.b.Add((v >> 16) & 255);
+        this.b.Add((v >> 8) & 255);
+        this.b.Add(v & 255);
+        return this;
+    }
+
+    /// <summary>Eight-byte little-endian integer (row counts, transaction
+    /// descriptors, money).</summary>
+    TdsBuf U64LE(int v) {
+        int i = 0;
+        while (i < 8) {
+            this.b.Add((v >> (i * 8)) & 255);
+            i = i + 1;
+        }
+        return this;
+    }
+
+    /// <summary>Raw bytes of a Zan string, up to its NUL terminator.</summary>
+    TdsBuf Bytes(string s) {
+        int i = 0;
+        while (i < s.Length) {
+            this.b.Add(s[i] & 255);
+            i = i + 1;
+        }
+        return this;
+    }
+
+    /// <summary>Appends a counted byte block.</summary>
+    TdsBuf Block(TdsBytes src) {
+        int i = 0;
+        while (i < src.Len()) {
+            this.b.Add(src.At(i));
+            i = i + 1;
+        }
+        return this;
+    }
+
+    /// <summary>UCS-2LE text, the encoding every string in TDS uses.</summary>
+    TdsBuf Ucs2(string s) {
+        int i = 0;
+        while (i < s.Length) {
+            this.b.Add(s[i] & 255);
+            this.b.Add(0);
+            i = i + 1;
+        }
+        return this;
+    }
+
+    /// <summary>The password field is scrambled (nibble swap, then XOR 0xA5)
+    /// rather than encrypted -- it is only obfuscation, which is why a real
+    /// deployment should run the login over TLS.</summary>
+    TdsBuf Password(string s) {
+        int i = 0;
+        while (i < s.Length) {
+            int lo = s[i] & 15;
+            int hi = (s[i] >> 4) & 15;
+            this.b.Add(((lo << 4) | hi) ^ 165);
+            this.b.Add(165);   // high byte of the UCS-2 unit: 0x00 scrambled
+            i = i + 1;
+        }
+        return this;
+    }
+
+    /// <summary>Materialises the buffer. The result carries its length
+    /// explicitly: a Zan string ends at its first NUL and TDS messages are full
+    /// of zero bytes.</summary>
+    TdsBytes ToBytes() {
+        int n = this.b.Count;
+        string t = TdsBuf.calloc(n + 1, 1);
+        int i = 0;
+        while (i < n) {
+            t[i] = this.b[i] & 255;
+            i = i + 1;
+        }
+        return TdsBytes.Own(t, n);
+    }
+}
+
+/// <summary>
+/// A counted block of bytes. Zan strings are NUL-terminated, so anything binary
+/// has to travel with its length beside it; this pairs the two and owns the
+/// allocation.
+/// </summary>
+class TdsBytes {
+    string data;
+    int len;
+
+    [DllImport("crt")]
+    static extern string calloc(int count, int size);
+
+    [DllImport("crt")]
+    static extern void free(string ptr);
+
+    TdsBytes(string data, int len) {
+        this.data = data;
+        this.len = len;
+    }
+
+    /// <summary>Takes ownership of an allocated buffer.</summary>
+    static TdsBytes Own(string data, int len) {
+        return new TdsBytes(data, len);
+    }
+
+    /// <summary>Copies a Zan string's bytes into a counted block.</summary>
+    static TdsBytes Of(string s) {
+        int n = s.Length;
+        string t = TdsBytes.calloc(n + 1, 1);
+        int i = 0;
+        while (i < n) {
+            t[i] = s[i] & 255;
+            i = i + 1;
+        }
+        return new TdsBytes(t, n);
+    }
+
+    static TdsBytes Alloc(int n) {
+        return new TdsBytes(TdsBytes.calloc(n + 1, 1), n);
+    }
+
+    string Data() { return this.data; }
+    int Len() { return this.len; }
+    int At(int i) { return this.data[i] & 255; }
+    void SetAt(int i, int v) { this.data[i] = v & 255; }
+
+    /// <summary>Releases the buffer. Callers own what they build.</summary>
+    void Release() {
+        TdsBytes.free(this.data);
+        this.len = 0;
+    }
+}
+
+/// <summary>Cursor over a received byte buffer.</summary>
+class TdsReader {
+    string buf;
+    int pos;
+    int len;
+
+    TdsReader(string buf, int len) {
+        this.buf = buf;
+        this.pos = 0;
+        this.len = len;
+    }
+
+    static TdsReader Over(string buf) {
+        return new TdsReader(buf, buf.Length);
+    }
+
+    static TdsReader Over(string buf, int len) {
+        return new TdsReader(buf, len);
+    }
+
+    static TdsReader Over(TdsBytes b) {
+        return new TdsReader(b.Data(), b.Len());
+    }
+
+    int Pos() { return this.pos; }
+    int Left() { return this.len - this.pos; }
+    bool Eof() { return this.pos >= this.len; }
+    void Seek(int p) { this.pos = p; }
+
+    int U8() {
+        if (this.pos >= this.len) { return 0; }
+        int v = this.buf[this.pos] & 255;
+        this.pos = this.pos + 1;
+        return v;
+    }
+
+    int U16LE() {
+        int a = U8();
+        int b = U8();
+        return a | (b << 8);
+    }
+
+    int U16BE() {
+        int a = U8();
+        int b = U8();
+        return (a << 8) | b;
+    }
+
+    int U32LE() {
+        int a = U16LE();
+        int b = U16LE();
+        return a | (b << 16);
+    }
+
+    int U32BE() {
+        int a = U16BE();
+        int b = U16BE();
+        return (a << 16) | b;
+    }
+
+    /// <summary>Unsigned little-endian integer of 1..8 bytes.</summary>
+    int UIntLE(int n) {
+        int v = 0;
+        int i = 0;
+        while (i < n) {
+            v = v | (U8() << (i * 8));
+            i = i + 1;
+        }
+        return v;
+    }
+
+    /// <summary>Signed little-endian integer of 1..8 bytes.</summary>
+    int IntLE(int n) {
+        int v = UIntLE(n);
+        int bits = n * 8;
+        if (bits < 64) {
+            int sign = 1 << (bits - 1);
+            if ((v & sign) != 0) {
+                v = v - (sign << 1);
+            }
+        }
+        return v;
+    }
+
+    void Skip(int n) {
+        this.pos = this.pos + n;
+        if (this.pos > this.len) { this.pos = this.len; }
+    }
+
+    /// <summary>Single-byte text of <paramref name="n"/> bytes. Any NUL inside
+    /// ends the resulting Zan string, which matches how such text is used.</summary>
+    string Narrow(int n) {
+        if (n <= 0) { return ""; }
+        if (this.pos + n > this.len) { n = this.len - this.pos; }
+        string t = TdsBuf.Alloc(n);
+        int i = 0;
+        while (i < n) {
+            t[i] = this.buf[this.pos + i] & 255;
+            i = i + 1;
+        }
+        string s = t.Substring(0, n);
+        TdsBuf.Release(t);
+        this.pos = this.pos + n;
+        return s;
+    }
+
+    /// <summary>Copies <paramref name="n"/> raw bytes out as a counted block.</summary>
+    TdsBytes Raw(int n) {
+        if (n < 0) { n = 0; }
+        if (this.pos + n > this.len) { n = this.len - this.pos; }
+        TdsBytes b = TdsBytes.Alloc(n);
+        int i = 0;
+        while (i < n) {
+            b.SetAt(i, this.buf[this.pos + i] & 255);
+            i = i + 1;
+        }
+        this.pos = this.pos + n;
+        return b;
+    }
+
+    /// <summary>UCS-2LE text of <paramref name="chars"/> code units. Units
+    /// above U+00FF are rendered as '?', which keeps the decoder total without
+    /// pulling in a full transcoder; everything else keeps its byte value.</summary>
+    string Ucs2(int chars) {
+        if (chars <= 0) { return ""; }
+        string t = TdsBuf.calloc(chars + 1, 1);
+        int i = 0;
+        while (i < chars) {
+            int lo = U8();
+            int hi = U8();
+            if (hi != 0) {
+                t[i] = 63;      // '?'
+            } else {
+                t[i] = lo;
+            }
+            i = i + 1;
+        }
+        string s = t.Substring(0, chars);
+        TdsBuf.free(t);
+        return s;
+    }
+
+    /// <summary>B_VARCHAR: one length byte, then that many UCS-2 units.</summary>
+    string BVarchar() {
+        return Ucs2(U8());
+    }
+
+    /// <summary>US_VARCHAR: a two-byte length, then that many UCS-2 units.</summary>
+    string UsVarchar() {
+        return Ucs2(U16LE());
+    }
+}

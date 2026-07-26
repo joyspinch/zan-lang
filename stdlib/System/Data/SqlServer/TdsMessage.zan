@@ -1,0 +1,540 @@
+using System;
+using System.Data;
+
+namespace System.Data.SqlServer;
+
+/// <summary>TDS packet types and the status bits of a packet header.</summary>
+class TdsPacket {
+    static int SQLBATCH = 1;      // 0x01
+    static int RPC      = 3;      // 0x03
+    static int REPLY    = 4;      // 0x04
+    static int ATTENTION = 6;     // 0x06
+    static int LOGIN7   = 16;     // 0x10
+    static int PRELOGIN = 18;     // 0x12
+
+    static int STATUS_NORMAL = 0;
+    static int STATUS_EOM    = 1;
+
+    static int HEADER_LEN = 8;
+    static int DEFAULT_SIZE = 4096;
+
+    /// <summary>Wraps a payload slice in the eight-byte packet header. The
+    /// length field counts the header itself and is big-endian, unlike every
+    /// other integer in the protocol.</summary>
+    static TdsBytes Frame(int type, int status, int packetId, TdsBytes payload,
+            int off, int len) {
+        TdsBuf b = TdsBuf.Create();
+        b.U8(type);
+        b.U8(status);
+        b.U16BE(len + TdsPacket.HEADER_LEN);
+        b.U16BE(0);                 // SPID
+        b.U8(packetId & 255);
+        b.U8(0);                    // window
+        int i = 0;
+        while (i < len) {
+            b.U8(payload.At(off + i));
+            i = i + 1;
+        }
+        return b.ToBytes();
+    }
+}
+
+/// <summary>Result of decoding one TDS response message.</summary>
+class TdsResponse {
+    DbResult rows;
+    int affected;
+    string error;
+    int errorNumber;
+    string serverVersion;
+    string database;
+
+    TdsResponse() {
+        this.rows = DbResult.Create();
+        this.affected = 0;
+        this.error = "";
+        this.errorNumber = 0;
+        this.serverVersion = "";
+        this.database = "";
+    }
+
+    static TdsResponse Create() { return new TdsResponse(); }
+
+    DbResult Rows() { return this.rows; }
+    int Affected() { return this.affected; }
+    string Error() { return this.error; }
+    int ErrorNumber() { return this.errorNumber; }
+    string ServerVersion() { return this.serverVersion; }
+    string Database() { return this.database; }
+    bool Failed() { return this.error.Length > 0; }
+}
+
+/// <summary>
+/// Builders for the client messages of TDS 7.4 and the decoder for the token
+/// stream that comes back. Kept free of IO so the wire format can be exercised
+/// without a server.
+/// </summary>
+class TdsMessage {
+    static int TDS74 = 1946157060;      // 0x74000004
+
+    // ============================================================
+    // Client messages
+    // ============================================================
+
+    /// <summary>PRELOGIN: a table of (token, offset, length) entries followed by
+    /// their payloads. <paramref name="encrypt"/> is the ENCRYPTION byte -- 0x02
+    /// (NOT_SUP) says the client cannot do TLS, which a server configured with
+    /// "force encryption" will refuse.</summary>
+    static TdsBytes Prelogin(int encrypt) {
+        // Three options: VERSION(0, 6 bytes), ENCRYPTION(1, 1), MARS(4, 1).
+        int tableLen = 3 * 5 + 1;
+        TdsBuf b = TdsBuf.Create();
+        b.U8(0);                        // VERSION
+        b.U16BE(tableLen);
+        b.U16BE(6);
+        b.U8(1);                        // ENCRYPTION
+        b.U16BE(tableLen + 6);
+        b.U16BE(1);
+        b.U8(4);                        // MARS
+        b.U16BE(tableLen + 7);
+        b.U16BE(1);
+        b.U8(255);                      // terminator
+        b.U8(16);                       // version 16.0.0.0
+        b.U8(0);
+        b.U16BE(0);
+        b.U16BE(0);                     // sub-build
+        b.U8(encrypt);
+        b.U8(0);                        // MARS off
+        return b.ToBytes();
+    }
+
+    /// <summary>The server's answer to PRELOGIN, reduced to its ENCRYPTION byte
+    /// (0 off, 1 on, 2 not supported, 3 required).</summary>
+    static int PreloginEncryption(TdsBytes payload) {
+        TdsReader r = TdsReader.Over(payload);
+        while (!r.Eof()) {
+            int token = r.U8();
+            if (token == 255) { return 2; }
+            int off = r.U16BE();
+            int len = r.U16BE();
+            if (token == 1 && len >= 1 && off < payload.Len()) {
+                return payload.At(off);
+            }
+        }
+        return 2;
+    }
+
+    /// <summary>LOGIN7: a fixed 94-byte header of offset/length pairs, then the
+    /// UCS-2 strings they point at.</summary>
+    static TdsBytes Login7(string host, string user, string password,
+            string appName, string server, string database, int packetSize) {
+        string libName = "zan";
+        int dataStart = 94;
+        int hostLen = host.Length;
+        int userLen = user.Length;
+        int passLen = password.Length;
+        int appLen = appName.Length;
+        int srvLen = server.Length;
+        int libLen = libName.Length;
+        int dbLen = database.Length;
+
+        int off = dataStart;
+        int hostOff = off; off = off + hostLen * 2;
+        int userOff = off; off = off + userLen * 2;
+        int passOff = off; off = off + passLen * 2;
+        int appOff = off;  off = off + appLen * 2;
+        int srvOff = off;  off = off + srvLen * 2;
+        int libOff = off;  off = off + libLen * 2;
+        int dbOff = off;   off = off + dbLen * 2;
+        int total = off;
+
+        TdsBuf b = TdsBuf.Create();
+        b.U32LE(total);
+        b.U32LE(TdsMessage.TDS74);
+        b.U32LE(packetSize);
+        b.U32LE(0);                     // client program version
+        b.U32LE(0);                     // client PID
+        b.U32LE(0);                     // connection id
+        b.U8(0);                        // OptionFlags1: little-endian, ASCII, IEEE floats
+        b.U8(0);                        // OptionFlags2
+        b.U8(0);                        // TypeFlags
+        b.U8(0);                        // OptionFlags3
+        b.U32LE(0);                     // client time zone
+        b.U32LE(0);                     // client LCID
+
+        b.U16LE(hostOff); b.U16LE(hostLen);
+        b.U16LE(userOff); b.U16LE(userLen);
+        b.U16LE(passOff); b.U16LE(passLen);
+        b.U16LE(appOff);  b.U16LE(appLen);
+        b.U16LE(srvOff);  b.U16LE(srvLen);
+        b.U16LE(0);       b.U16LE(0);   // unused / extension
+        b.U16LE(libOff);  b.U16LE(libLen);
+        b.U16LE(0);       b.U16LE(0);   // language: server default
+        b.U16LE(dbOff);   b.U16LE(dbLen);
+        int i = 0;
+        while (i < 6) { b.U8(0); i = i + 1; }   // client MAC address
+        b.U16LE(0); b.U16LE(0);         // SSPI
+        b.U16LE(0); b.U16LE(0);         // attached database file
+        b.U16LE(0); b.U16LE(0);         // change password
+        b.U32LE(0);                     // long SSPI length
+
+        b.Ucs2(host);
+        b.Ucs2(user);
+        b.Password(password);
+        b.Ucs2(appName);
+        b.Ucs2(server);
+        b.Ucs2(libName);
+        b.Ucs2(database);
+        return b.ToBytes();
+    }
+
+    /// <summary>The ALL_HEADERS block that TDS 7.2 and later require in front of
+    /// a batch or an RPC: only the transaction descriptor is needed.</summary>
+    static TdsBuf AllHeaders(TdsBuf b) {
+        b.U32LE(22);                    // total length
+        b.U32LE(18);                    // this header's length
+        b.U16LE(2);                     // type: transaction descriptor
+        b.U64LE(0);                     // transaction descriptor
+        b.U32LE(1);                     // outstanding request count
+        return b;
+    }
+
+    /// <summary>SQLBatch payload: headers plus the statement as UCS-2.</summary>
+    static TdsBytes SqlBatch(string sql) {
+        TdsBuf b = TdsBuf.Create();
+        TdsMessage.AllHeaders(b);
+        b.Ucs2(sql);
+        return b.ToBytes();
+    }
+
+    /// <summary>
+    /// RPC payload calling sp_executesql, which is how parameters are sent out
+    /// of band: values never touch the statement text, so no escaping is
+    /// involved and the server can reuse the plan.
+    /// </summary>
+    static TdsBytes RpcExecuteSql(string sql, DbParams prms) {
+        TdsBuf b = TdsBuf.Create();
+        TdsMessage.AllHeaders(b);
+        b.U16LE(65535);                 // ID follows instead of a name
+        b.U16LE(10);                    // sp_executesql
+        b.U16LE(0);                     // option flags
+
+        TdsMessage.NVarcharParam(b, "", sql);
+        TdsMessage.NVarcharParam(b, "", TdsMessage.Declaration(prms));
+        int i = 0;
+        while (i < prms.Count()) {
+            string name = "@P" + Convert.ToString(i + 1);
+            int kind = prms.KindAt(i);
+            if (kind == DbParams.KindInt) {
+                TdsMessage.IntParam(b, name, prms.IntAt(i));
+            } else if (kind == DbParams.KindDouble) {
+                TdsMessage.FloatParam(b, name, prms.DoubleAt(i));
+            } else if (kind == DbParams.KindNull) {
+                TdsMessage.NullParam(b, name);
+            } else {
+                TdsMessage.NVarcharParam(b, name, prms.TextAt(i));
+            }
+            i = i + 1;
+        }
+        return b.ToBytes();
+    }
+
+    /// <summary>The "@P1 bigint, @P2 float" string sp_executesql expects.</summary>
+    static string Declaration(DbParams prms) {
+        StringBuilder sb = new StringBuilder();
+        int i = 0;
+        while (i < prms.Count()) {
+            if (i > 0) { sb.Append(", "); }
+            sb.Append("@P");
+            sb.Append(Convert.ToString(i + 1));
+            int kind = prms.KindAt(i);
+            if (kind == DbParams.KindInt) {
+                sb.Append(" bigint");
+            } else {
+                if (kind == DbParams.KindDouble) {
+                    sb.Append(" float");
+                } else {
+                    sb.Append(" nvarchar(max)");
+                }
+            }
+            i = i + 1;
+        }
+        return sb.ToString();
+    }
+
+    static void ParamHeader(TdsBuf b, string name) {
+        b.U8(name.Length);
+        b.Ucs2(name);
+        b.U8(0);                        // status: input parameter
+    }
+
+    /// <summary>NVARCHAR parameter. Text over 4000 characters no longer fits the
+    /// fixed form and goes out as NVARCHAR(MAX) in PLP chunks.</summary>
+    static void NVarcharParam(TdsBuf b, string name, string val) {
+        TdsMessage.ParamHeader(b, name);
+        b.U8(TdsType.NVARCHAR);
+        int bytes = val.Length * 2;
+        if (val.Length <= 4000) {
+            b.U16LE(8000);
+            b.U32LE(0); b.U8(0);        // collation: server default
+            b.U16LE(bytes);
+            b.Ucs2(val);
+            return;
+        }
+        b.U16LE(65535);                 // MAX
+        b.U32LE(0); b.U8(0);
+        b.U64LE(bytes);                 // PLP total length
+        b.U32LE(bytes);                 // single chunk
+        b.Ucs2(val);
+        b.U32LE(0);                     // terminator
+    }
+
+    static void IntParam(TdsBuf b, string name, int val) {
+        TdsMessage.ParamHeader(b, name);
+        b.U8(TdsType.INTN);
+        b.U8(8);                        // declared as bigint
+        b.U8(8);                        // present, eight bytes
+        b.U64LE(val);
+    }
+
+    static void FloatParam(TdsBuf b, string name, double val) {
+        TdsMessage.ParamHeader(b, name);
+        b.U8(TdsType.FLTN);
+        b.U8(8);
+        b.U8(8);
+        b.U64LE(TdsMessage.DoubleBits(val));
+    }
+
+    static void NullParam(TdsBuf b, string name) {
+        TdsMessage.ParamHeader(b, name);
+        b.U8(TdsType.NVARCHAR);
+        b.U16LE(8000);
+        b.U32LE(0); b.U8(0);
+        b.U16LE(65535);                 // NULL
+    }
+
+    /// <summary>IEEE-754 bit pattern of a double, built by normalising the value
+    /// -- the language has no reinterpret cast.</summary>
+    static int DoubleBits(double v) {
+        if (v == 0.0) { return 0; }
+        int sign = 0;
+        if (v < 0.0) {
+            sign = 1;
+            v = 0.0 - v;
+        }
+        int exp = 0;
+        while (v >= 2.0) { v = v / 2.0; exp = exp + 1; }
+        while (v < 1.0) { v = v * 2.0; exp = exp - 1; }
+        double frac = v - 1.0;
+        int mant = 0;
+        int i = 0;
+        while (i < 52) {
+            frac = frac * 2.0;
+            int bit = 0;
+            if (frac >= 1.0) {
+                bit = 1;
+                frac = frac - 1.0;
+            }
+            mant = (mant << 1) | bit;
+            i = i + 1;
+        }
+        return (sign << 63) | ((exp + 1023) << 52) | mant;
+    }
+
+    // ============================================================
+    // Token stream
+    // ============================================================
+
+    static int TOK_RETURNSTATUS = 121;  // 0x79
+    static int TOK_COLMETADATA  = 129;  // 0x81
+    static int TOK_TABNAME      = 164;  // 0xA4
+    static int TOK_COLINFO      = 165;  // 0xA5
+    static int TOK_ORDER        = 169;  // 0xA9
+    static int TOK_ERROR        = 170;  // 0xAA
+    static int TOK_INFO         = 171;  // 0xAB
+    static int TOK_RETURNVALUE  = 172;  // 0xAC
+    static int TOK_LOGINACK     = 173;  // 0xAD
+    static int TOK_FEATUREACK   = 174;  // 0xAE
+    static int TOK_ROW          = 209;  // 0xD1
+    static int TOK_NBCROW       = 210;  // 0xD2
+    static int TOK_SSPI         = 237;  // 0xED
+    static int TOK_ENVCHANGE    = 227;  // 0xE3
+    static int TOK_DONE         = 253;  // 0xFD
+    static int TOK_DONEPROC     = 254;  // 0xFE
+    static int TOK_DONEINPROC   = 255;  // 0xFF
+
+    /// <summary>Decodes a complete response message.</summary>
+    static TdsResponse Decode(TdsBytes buf) {
+        TdsResponse resp = TdsResponse.Create();
+        TdsReader r = TdsReader.Over(buf);
+        List<TdsColumn> cols = new List<TdsColumn>();
+        bool haveRows = false;
+
+        while (!r.Eof()) {
+            int token = r.U8();
+            if (token == TdsMessage.TOK_COLMETADATA) {
+                cols = TdsMessage.ReadColumns(r, resp);
+                haveRows = cols.Count > 0;
+            } else if (token == TdsMessage.TOK_ROW) {
+                TdsMessage.ReadRow(r, cols, resp, false);
+            } else if (token == TdsMessage.TOK_NBCROW) {
+                TdsMessage.ReadRow(r, cols, resp, true);
+            } else if (token == TdsMessage.TOK_ERROR) {
+                TdsMessage.ReadError(r, resp);
+            } else if (token == TdsMessage.TOK_INFO) {
+                r.Skip(r.U16LE());
+            } else if (token == TdsMessage.TOK_LOGINACK) {
+                TdsMessage.ReadLoginAck(r, resp);
+            } else if (token == TdsMessage.TOK_ENVCHANGE) {
+                TdsMessage.ReadEnvChange(r, resp);
+            } else if (token == TdsMessage.TOK_DONE
+                    || token == TdsMessage.TOK_DONEPROC
+                    || token == TdsMessage.TOK_DONEINPROC) {
+                int status = r.U16LE();
+                r.U16LE();                      // current command
+                int count = r.UIntLE(8);
+                if ((status & 16) != 0 && !haveRows) {
+                    resp.affected = count;
+                }
+            } else if (token == TdsMessage.TOK_RETURNSTATUS) {
+                r.Skip(4);
+            } else if (token == TdsMessage.TOK_ORDER
+                    || token == TdsMessage.TOK_TABNAME
+                    || token == TdsMessage.TOK_COLINFO
+                    || token == TdsMessage.TOK_SSPI) {
+                r.Skip(r.U16LE());
+            } else if (token == TdsMessage.TOK_FEATUREACK) {
+                TdsMessage.SkipFeatureAck(r);
+            } else if (token == TdsMessage.TOK_RETURNVALUE) {
+                TdsMessage.SkipReturnValue(r);
+            } else {
+                // An unknown token has no length prefix to skip by, so the rest
+                // of the stream can no longer be parsed.
+                return resp;
+            }
+        }
+        if (haveRows) {
+            resp.affected = resp.rows.RowCount();
+        }
+        return resp;
+    }
+
+    static List<TdsColumn> ReadColumns(TdsReader r, TdsResponse resp) {
+        List<TdsColumn> cols = new List<TdsColumn>();
+        int count = r.U16LE();
+        if (count == 65535) { return cols; }    // no metadata for this batch
+        int i = 0;
+        while (i < count) {
+            r.Skip(4);                          // user type
+            r.Skip(2);                          // flags
+            TdsColumn c = TdsColumn.Create();
+            TdsValue.ReadTypeInfo(r, c);
+            c.name = r.BVarchar();
+            cols.Add(c);
+            i = i + 1;
+        }
+        resp.rows.SetColumnCount(cols.Count);
+        int j = 0;
+        while (j < cols.Count) {
+            resp.rows.AddColumnName(cols[j].Name());
+            j = j + 1;
+        }
+        return cols;
+    }
+
+    /// <summary>ROW, or NBCROW where a leading bitmap marks the NULL columns and
+    /// their values are omitted entirely.</summary>
+    static void ReadRow(TdsReader r, List<TdsColumn> cols, TdsResponse resp,
+            bool nbc) {
+        List<int> bitmap = new List<int>();
+        if (nbc) {
+            int bytes = (cols.Count + 7) / 8;
+            int i = 0;
+            while (i < bytes) {
+                bitmap.Add(r.U8());
+                i = i + 1;
+            }
+        }
+        List<string> row = new List<string>();
+        List<bool> nulls = new List<bool>();
+        int c = 0;
+        while (c < cols.Count) {
+            bool isNull = false;
+            if (nbc && ((bitmap[c / 8] >> (c % 8)) & 1) == 1) {
+                isNull = true;
+            }
+            if (isNull) {
+                row.Add("");
+                nulls.Add(true);
+            } else {
+                TdsCell cell = TdsValue.ReadValue(r, cols[c]);
+                row.Add(cell.Text());
+                nulls.Add(cell.IsNull());
+            }
+            c = c + 1;
+        }
+        resp.rows.AddRowNulls(row, nulls);
+    }
+
+    static void ReadError(TdsReader r, TdsResponse resp) {
+        int len = r.U16LE();
+        int end = r.Pos() + len;
+        int number = r.U32LE();
+        r.U8();                             // state
+        r.U8();                             // class
+        string msg = r.UsVarchar();
+        r.Seek(end);
+        if (resp.error.Length == 0) {
+            resp.error = msg;
+            resp.errorNumber = number;
+        }
+    }
+
+    static void ReadLoginAck(TdsReader r, TdsResponse resp) {
+        int len = r.U16LE();
+        int end = r.Pos() + len;
+        r.U8();                             // interface
+        r.Skip(4);                          // TDS version
+        r.BVarchar();                       // program name
+        int major = r.U8();
+        int minor = r.U8();
+        int build = r.U16BE();
+        resp.serverVersion = Convert.ToString(major) + "." + Convert.ToString(minor)
+            + "." + Convert.ToString(build);
+        r.Seek(end);
+    }
+
+    /// <summary>ENVCHANGE reports the effects of logging in; the database name
+    /// is the one worth keeping, the rest only has to be stepped over.</summary>
+    static void ReadEnvChange(TdsReader r, TdsResponse resp) {
+        int len = r.U16LE();
+        int end = r.Pos() + len;
+        int kind = r.U8();
+        if (kind == 1) {                    // database
+            resp.database = r.BVarchar();
+        }
+        r.Seek(end);
+    }
+
+    static void SkipFeatureAck(TdsReader r) {
+        bool more = true;
+        while (more) {
+            int id = r.U8();
+            if (id == 255) {
+                more = false;
+            } else {
+                r.Skip(r.U32LE());
+            }
+        }
+    }
+
+    static void SkipReturnValue(TdsReader r) {
+        r.Skip(2);                          // parameter ordinal
+        r.BVarchar();                       // parameter name
+        r.U8();                             // status
+        r.Skip(4);                          // user type
+        r.Skip(2);                          // flags
+        TdsColumn c = TdsColumn.Create();
+        TdsValue.ReadTypeInfo(r, c);
+        TdsValue.ReadValue(r, c);
+    }
+}
