@@ -169,9 +169,9 @@ int zan_symbols_emit(zan_ast_node_t *unit, const char *path) {
     int bcount = 0;
     const zan_builtin_type_t *bts = zan_builtin_types(&bcount);
     for (int i = 0; i < bcount; i++) {
-        fprintf(f, "T\tclass\t*builtin*\t%s\t\n", bts[i].type);
+        fprintf(f, "T\tclass\t*builtin*\t%s\t\n", bts[i].name_public);
         for (int j = 0; j < bts[i].member_count; j++) {
-            fprintf(f, "M\t%s\t%s\t%c\t%d\t%s\n", bts[i].type,
+            fprintf(f, "M\t%s\t%s\t%c\t%d\t%s\n", bts[i].name_public,
                     bts[i].members[j].name, bts[i].members[j].kind,
                     bts[i].is_static ? 1 : 0, bts[i].members[j].sig);
         }

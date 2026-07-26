@@ -117,6 +117,30 @@ static const char *string_methods[] = {
     "Remove", "Equals", "CompareTo", NULL
 };
 
+/* Grows the symbol table to hold at least `need` entries. */
+static bool reserve_symbols(intellisense_t *is, int need) {
+    if (need <= is->symbol_cap) return true;
+    int cap = is->symbol_cap ? is->symbol_cap * 2 : INTEL_INIT_SYMBOLS;
+    while (cap < need) cap *= 2;
+    isym_t *p = (isym_t *)realloc(is->symbols, (size_t)cap * sizeof(isym_t));
+    if (!p) return false;
+    is->symbols = p;
+    is->symbol_cap = cap;
+    return true;
+}
+
+/* Grows the indexed-file list to hold at least `need` paths. */
+static bool reserve_files(intellisense_t *is, int need) {
+    if (need <= is->indexed_file_cap) return true;
+    int cap = is->indexed_file_cap ? is->indexed_file_cap * 2 : INTEL_INIT_FILES;
+    while (cap < need) cap *= 2;
+    char (*p)[512] = (char (*)[512])realloc(is->indexed_files, (size_t)cap * 512);
+    if (!p) return false;
+    is->indexed_files = p;
+    is->indexed_file_cap = cap;
+    return true;
+}
+
 void intel_init(intellisense_t *is) {
     memset(is, 0, sizeof(intellisense_t));
     is->completion_selected = -1;
@@ -128,11 +152,23 @@ void intel_clear(intellisense_t *is) {
     is->indexed_file_count = 0;
 }
 
+void intel_free(intellisense_t *is) {
+    if (!is) return;
+    free(is->symbols);
+    free(is->indexed_files);
+    is->symbols = NULL;
+    is->indexed_files = NULL;
+    is->symbol_count = 0;
+    is->symbol_cap = 0;
+    is->indexed_file_count = 0;
+    is->indexed_file_cap = 0;
+}
+
 static void add_symbol(intellisense_t *is, const char *name,
                        const char *type_name, const char *parent,
                        const char *signature, const char *file,
                        isym_kind_t kind, int line, int col) {
-    if (is->symbol_count >= INTEL_MAX_SYMBOLS) return;
+    if (!reserve_symbols(is, is->symbol_count + 1)) return;
     isym_t *sym = &is->symbols[is->symbol_count++];
     memset(sym, 0, sizeof(isym_t));
     strncpy(sym->name, name, sizeof(sym->name) - 1);
@@ -152,7 +188,7 @@ static void add_symbol_ex(intellisense_t *is, const char *name,
                           const char *doc,
                           isym_kind_t kind, int line, int col,
                           bool is_static, int param_count) {
-    if (is->symbol_count >= INTEL_MAX_SYMBOLS) return;
+    if (!reserve_symbols(is, is->symbol_count + 1)) return;
     isym_t *sym = &is->symbols[is->symbol_count++];
     memset(sym, 0, sizeof(isym_t));
     strncpy(sym->name, name, sizeof(sym->name) - 1);
@@ -222,7 +258,7 @@ void intel_parse_file(intellisense_t *is, const char *filepath,
     for (int i = 0; i < is->indexed_file_count; i++) {
         if (strcmp(is->indexed_files[i], filepath) == 0) { already_indexed = true; break; }
     }
-    if (!already_indexed && is->indexed_file_count < 64) {
+    if (!already_indexed && reserve_files(is, is->indexed_file_count + 1)) {
         strncpy(is->indexed_files[is->indexed_file_count++], filepath, 511);
     }
 

@@ -14,8 +14,13 @@
 extern "C" {
 #endif
 
-#define INTEL_MAX_SYMBOLS      4096
-#define INTEL_MAX_COMPLETIONS  128
+/* The symbol table and the indexed-file list grow on demand: a fixed 4096
+ * symbols and 64 files silently truncated the index of any real project (the
+ * standard library alone is several hundred files), so completion went quiet
+ * with no way to tell why. These are only the initial capacities. */
+#define INTEL_INIT_SYMBOLS     1024
+#define INTEL_INIT_FILES       64
+#define INTEL_MAX_COMPLETIONS  512
 #define INTEL_MAX_SNIPPETS     32
 #define INTEL_MAX_SIGNATURES   16
 #define INTEL_MAX_PARAMS       16
@@ -106,8 +111,9 @@ typedef struct {
 
 /* Intellisense engine state */
 typedef struct {
-    isym_t      symbols[INTEL_MAX_SYMBOLS];
+    isym_t      *symbols;           /* grown by intel_parse_file */
     int         symbol_count;
+    int         symbol_cap;
 
     completion_t completions[INTEL_MAX_COMPLETIONS];
     int          completion_count;
@@ -132,8 +138,9 @@ typedef struct {
     int          current_word_start;
 
     /* multi-file index: track which files have been indexed */
-    char         indexed_files[64][512];
+    char         (*indexed_files)[512];
     int          indexed_file_count;
+    int          indexed_file_cap;
 } intellisense_t;
 
 /* Initialize */
@@ -145,6 +152,10 @@ void intel_parse_file(intellisense_t *is, const char *filepath,
 
 /* Clear all symbols */
 void intel_clear(intellisense_t *is);
+
+/* Release the symbol table and file list. The struct itself is the caller's
+ * (it is usually malloc'd for one request). */
+void intel_free(intellisense_t *is);
 
 /* Request autocomplete at the given position.
  * `prefix` is the partial word typed so far.

@@ -27,7 +27,8 @@ typedef struct {
 
 typedef struct {
     const char *type;         /* receiver type name as irgen sees it */
-    const char *display;      /* name shown to the user */
+    const char *name_public;  /* name the language spells it with ("Dictionary") */
+    const char *display;      /* name shown in diagnostics ("Dictionary<K,V>") */
     int is_static;            /* 1 = static class (Console.X), 0 = instance */
     const zan_builtin_member_t *members;
     int member_count;

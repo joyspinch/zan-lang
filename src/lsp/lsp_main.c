@@ -810,6 +810,7 @@ static void handle_completion(lsp_server_t *s, json_value *id, json_value *param
 
         json_arr_add(items, item);
     }
+    intel_free(is);
     free(is);
     send_response(s, id, items);
 }
@@ -833,6 +834,7 @@ static void handle_hover(lsp_server_t *s, json_value *id, json_value *params) {
     intel_init(is);
     intel_parse_file(is, uri, doc->text, strlen(doc->text));
     hover_info_t h = intel_hover(is, word);
+    intel_free(is);
     free(is);
     if (!h.valid) { send_response(s, id, json_new_null()); return; }
 
@@ -869,6 +871,7 @@ static void handle_definition(lsp_server_t *s, json_value *id, json_value *param
     intel_init(is);
     intel_parse_file(is, uri, doc->text, strlen(doc->text));
     goto_def_t g = intel_goto_def(is, word);
+    intel_free(is);
     free(is);
     if (!g.found) { send_response(s, id, json_new_null()); return; }
 
@@ -1000,6 +1003,7 @@ static void handle_signature_help(lsp_server_t *s, json_value *id, json_value *p
 
     signature_info_t sig = intel_signature_help(is, method_name,
                                                  class_context[0] ? class_context : NULL);
+    intel_free(is);
     free(is);
 
     if (!sig.valid) { send_response(s, id, json_new_null()); return; }
@@ -1084,6 +1088,7 @@ static void handle_document_symbol(lsp_server_t *s, json_value *id, json_value *
         json_obj_set(sinfo, "location", loc);
         json_arr_add(arr, sinfo);
     }
+    intel_free(is);
     free(is);
     send_response(s, id, arr);
 }
@@ -1343,7 +1348,7 @@ static void handle_code_action(lsp_server_t *s, json_value *id, json_value *para
         json_arr_add(actions, action);
     }
 
-    if (is != g_project_intel) free(is);
+    if (is != g_project_intel) { intel_free(is); free(is); }
     send_response(s, id, actions);
 }
 

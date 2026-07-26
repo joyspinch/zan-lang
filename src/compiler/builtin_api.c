@@ -144,24 +144,24 @@ static const zan_builtin_member_t members_task[] = {
     { "Spawn", 'M', "void Spawn(Action work)" },
 };
 
-#define BT(name, disp, stat, arr) \
-    { name, disp, stat, arr, (int)(sizeof(arr) / sizeof((arr)[0])) }
+#define BT(name, pub, disp, stat, arr) \
+    { name, pub, disp, stat, arr, (int)(sizeof(arr) / sizeof((arr)[0])) }
 
 static const zan_builtin_type_t builtin_types[] = {
-    BT("string",        "string",        0, members_string),
-    BT("List",          "List<T>",       0, members_list),
-    BT("Dict",          "Dictionary<K,V>", 0, members_dict),
-    BT("StringBuilder", "StringBuilder", 0, members_sb),
-    BT("Console",       "Console",       1, members_console),
-    BT("Math",          "Math",          1, members_math),
-    BT("Convert",       "Convert",       1, members_convert),
-    BT("String",        "String",        1, members_stringcls),
-    BT("File",          "File",          1, members_file),
-    BT("Directory",     "Directory",     1, members_dir),
-    BT("Path",          "Path",          1, members_path),
-    BT("Environment",   "Environment",   1, members_env),
-    BT("NativeMemory",  "NativeMemory",  1, members_nativemem),
-    BT("Task",          "Task",          1, members_task),
+    BT("string", "string", "string", 0, members_string),
+    BT("List", "List", "List<T>", 0, members_list),
+    BT("Dict", "Dictionary", "Dictionary<K,V>", 0, members_dict),
+    BT("StringBuilder", "StringBuilder", "StringBuilder", 0, members_sb),
+    BT("Console", "Console", "Console", 1, members_console),
+    BT("Math", "Math", "Math", 1, members_math),
+    BT("Convert", "Convert", "Convert", 1, members_convert),
+    BT("String", "String", "String", 1, members_stringcls),
+    BT("File", "File", "File", 1, members_file),
+    BT("Directory", "Directory", "Directory", 1, members_dir),
+    BT("Path", "Path", "Path", 1, members_path),
+    BT("Environment", "Environment", "Environment", 1, members_env),
+    BT("NativeMemory", "NativeMemory", "NativeMemory", 1, members_nativemem),
+    BT("Task", "Task", "Task", 1, members_task),
 };
 
 const zan_builtin_type_t *zan_builtin_types(int *count) {
