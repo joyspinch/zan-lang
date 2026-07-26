@@ -1,0 +1,251 @@
+using System;
+using System.Data.ZanDb;
+using System.Diagnostics;
+using System.IO;
+using System.Json;
+using System.Threading;
+
+// ZanDB P6: cross-process write correctness. The program re-executes itself as
+// two child writers that insert documents into the same collection while one of
+// them also builds a secondary index in batches; the parent then verifies the
+// merged result. What has to hold when several processes write one file:
+//
+//   * every write survives -- the cross-process writer lock serialises the
+//     commits of the two children, so neither loses documents to the other;
+//   * documents decode with the field names they were written with: the
+//     collection's field-name dictionary lives in the file, and a writer must
+//     adopt a peer's additions before assigning ids of its own (otherwise the
+//     same id means "f_a" in one process and "f_b" in the other);
+//   * a batch-built index ends up complete even though a peer keeps inserting
+//     during the build: the peer maintains entries for the documents it writes
+//     as soon as the field appears in the index list, and the build covers
+//     everything committed before it finished.
+class Program {
+    static int pass = 0;
+    static int fail = 0;
+    static string path = "zandb_p6.tmp.db";
+    static int SEED = 100;
+    static int PER_CHILD = 150;
+
+    #if WINDOWS
+    [DllImport("kernel32", EntryPoint = "GetModuleFileNameA")]
+    static extern int WinGetModuleFileName(int hModule, string buf, int size);
+    #elif MACOS
+    [DllImport("crt", EntryPoint = "_NSGetExecutablePath")]
+    static extern int MacGetExecutablePath(string buf, string bufsize);
+    #else
+    [DllImport("crt", EntryPoint = "readlink")]
+    static extern int LinuxReadlink(string p, string buf, int bufsize);
+    #endif
+
+    [DllImport("crt")]
+    static extern string calloc(int count, int size);
+
+    static void Check(string name, bool ok) {
+        if (ok) { pass = pass + 1; }
+        else { fail = fail + 1; Console.WriteLine("FAIL " + name); }
+    }
+
+    // Full path of the running program: the children are copies of this same
+    // executable, told by argv which role to play.
+    static string ExePath() {
+        string buf = calloc(4096, 1);
+        #if WINDOWS
+        WinGetModuleFileName(0, buf, 4096);
+        #elif MACOS
+        string cap = calloc(4, 1);
+        cap[1] = 16;
+        MacGetExecutablePath(buf, cap);
+        #else
+        LinuxReadlink("/proc/self/exe", buf, 4096);
+        #endif
+        return buf;
+    }
+
+    static string MarkerOf(string role) {
+        return "zandb_p6." + role + ".done";
+    }
+
+    static string LogOf(string role) {
+        return "zandb_p6." + role + ".log";
+    }
+
+    static JsonValue MakeDoc(string owner, int seq) {
+        JsonValue d = JsonValue.NewObject();
+        d.Put("owner", JsonValue.NewStr(owner));
+        d.Put("city", JsonValue.NewStr("c" + Convert.ToString(seq % 3)));
+        d.Put("seq", JsonValue.NewNum(Convert.ToString(seq)));
+        // A field name only this writer uses: its dictionary id is assigned by
+        // this process and must not collide with a peer's.
+        d.Put("f_" + owner, JsonValue.NewStr(owner + "-" + Convert.ToString(seq)));
+        return d;
+    }
+
+    // ===== child =====
+
+    static void Child(string role, int count) {
+        ZanDatabase db = ZanDatabase.Open(path, 64);
+        if (!db.IsOpen()) {
+            Console.WriteLine("child " + role + " open failed: " + db.GetError());
+            return;
+        }
+        Collection docs = db.GetCollection("docs");
+        int i = 0;
+        while (i < count) {
+            docs.Insert(MakeDoc(role, i));
+            i = i + 1;
+        }
+        // One child also builds the index, in small batches, while the other is
+        // still inserting.
+        if (role == "a") { docs.EnsureIndex("city", 32); }
+        db.Close();
+        File.WriteAllText(MarkerOf(role), Convert.ToString(count));
+    }
+
+    // ===== parent =====
+
+    static void Spawn(string exe, string role, int count) {
+        // Redirect the child's own output: it must not land in the stdout this
+        // test is judged on. The redirection leads so that the command does not
+        // start with a quote -- `cmd /c "prog" ... > "file"` makes cmd.exe strip
+        // the first and the last quote of the whole line, mangling both.
+        string cmd = "> \"" + LogOf(role) + "\" 2>&1 \"" + exe + "\" child "
+            + role + " " + Convert.ToString(count);
+        Process.RunDetached(cmd);
+    }
+
+    static bool WaitForChildren() {
+        int waited = 0;
+        while (waited < 120000) {
+            if (File.Exists(MarkerOf("a")) && File.Exists(MarkerOf("b"))) { return true; }
+            Thread.Sleep(50);
+            waited = waited + 50;
+        }
+        return false;
+    }
+
+    static void Cleanup() {
+        File.Delete(path);
+        File.Delete(path + "-lock");
+        File.Delete(MarkerOf("a"));
+        File.Delete(MarkerOf("b"));
+        File.Delete(LogOf("a"));
+        File.Delete(LogOf("b"));
+    }
+
+    static void Parent() {
+        Cleanup();
+
+        // Seed documents from this process, so the children start on a file
+        // that already has a dictionary, a sequence and documents.
+        ZanDatabase seedDb = ZanDatabase.Open(path, 64);
+        Check("open", seedDb.IsOpen());
+        Collection seeded = seedDb.GetCollection("docs");
+        List<JsonValue> batch = new List<JsonValue>();
+        int i = 0;
+        while (i < SEED) {
+            batch.Add(MakeDoc("seed", i));
+            i = i + 1;
+        }
+        seeded.InsertBulk(batch);
+        Check("seeded", seeded.Count() == SEED);
+        seedDb.Close();
+
+        string exe = ExePath();
+        Spawn(exe, "a", PER_CHILD);
+        Spawn(exe, "b", PER_CHILD);
+        bool finished = WaitForChildren();
+        Check("children-finished", finished);
+        if (!finished) { return; }
+
+        ZanDatabase db = ZanDatabase.Open(path, 256);
+        Collection docs = db.GetCollection("docs");
+        int total = SEED + 2 * PER_CHILD;
+        Check("all-writes-survived", docs.Count() == total);
+
+        // Every document decodes with its own field names, and each writer's
+        // sequence appears exactly once (no lost and no duplicated write).
+        List<JsonValue> all = docs.FindAll();
+        Check("scan-count", all.Count == total);
+        int nSeed = 0;
+        int nA = 0;
+        int nB = 0;
+        int sumA = 0;
+        int sumB = 0;
+        int badField = 0;
+        int badId = 0;
+        int prevId = 0;
+        i = 0;
+        while (i < all.Count) {
+            JsonValue d = all[i];
+            string owner = d.Str("owner", "");
+            int seq = d.Int("seq", 0 - 1);
+            int id = d.Int("_id", 0);
+            if (id <= prevId) { badId = badId + 1; }
+            prevId = id;
+            if (d.Str("f_" + owner, "") != owner + "-" + Convert.ToString(seq)) {
+                badField = badField + 1;
+            }
+            if (owner == "seed") { nSeed = nSeed + 1; }
+            else if (owner == "a") {
+                nA = nA + 1;
+                sumA = sumA + seq;
+                if (d.Has("f_b") || d.Has("f_seed")) { badField = badField + 1; }
+            } else if (owner == "b") {
+                nB = nB + 1;
+                sumB = sumB + seq;
+                if (d.Has("f_a") || d.Has("f_seed")) { badField = badField + 1; }
+            } else {
+                badField = badField + 1;
+            }
+            i = i + 1;
+        }
+        int expectedSum = PER_CHILD * (PER_CHILD - 1) / 2;
+        Check("per-writer-counts", nSeed == SEED && nA == PER_CHILD && nB == PER_CHILD);
+        Check("no-lost-or-duplicated-seq", sumA == expectedSum && sumB == expectedSum);
+        Check("field-dictionary-shared", badField == 0);
+        Check("ids-unique-and-ordered", badId == 0);
+
+        // The index built in a batch loop by one child, while the other kept
+        // committing, covers every document.
+        Check("index-registered", docs.HasIndex("city"));
+        Check("index-build-finished", docs.IndexReady("city"));
+        int viaIndex = 0;
+        int mismatched = 0;
+        int c = 0;
+        while (c < 3) {
+            string city = "c" + Convert.ToString(c);
+            int hits = docs.FindByIndex("city", city).Count;
+            int scanned = 0;
+            i = 0;
+            while (i < all.Count) {
+                if (all[i].Str("city", "") == city) { scanned = scanned + 1; }
+                i = i + 1;
+            }
+            if (hits != scanned) { mismatched = mismatched + 1; }
+            viaIndex = viaIndex + hits;
+            c = c + 1;
+        }
+        Check("index-matches-scan", mismatched == 0);
+        Check("index-covers-everything", viaIndex == total);
+
+        // A partial index must never answer from a half-built state: while a
+        // build is pending the lookup falls back to a scan.
+        docs.EnsureIndex("owner", 32);
+        Check("second-index-ready", docs.IndexReady("owner"));
+        Check("second-index-lookup", docs.FindByIndex("owner", "b").Count == PER_CHILD);
+
+        db.Close();
+        Cleanup();
+    }
+
+    static void Main() {
+        if (Environment.ArgCount() >= 3 && Environment.ArgAt(0) == "child") {
+            Child(Environment.ArgAt(1), Convert.ToInt32(Environment.ArgAt(2)));
+            return;
+        }
+        Parent();
+        Console.WriteLine("pass: " + Convert.ToString(pass));
+        Console.WriteLine("fail: " + Convert.ToString(fail));
+    }
+}

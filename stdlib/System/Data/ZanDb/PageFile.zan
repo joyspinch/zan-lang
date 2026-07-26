@@ -1,13 +1,18 @@
 using System;
 using System.IO;
+using System.Threading;
 
 namespace System.Data.ZanDb;
 
 /// <summary>
 /// Random-access page-granular file used by the ZanDB storage engine.
-/// Unlike System.IO.File (whole-file text helpers), PageFile reads and writes
-/// arbitrary byte ranges at 64-bit offsets and can force data to stable
-/// storage (fsync) for durability.
+///
+/// All reads and writes are positional (pread/pwrite on POSIX, seek+read on
+/// the file descriptor on Windows): they do not depend on a shared file
+/// position, so several database handles -- and several processes -- can work
+/// on the same file without stepping on each other's offsets. The stdio
+/// FILE* is only used to create/open the file portably; no buffered stdio
+/// read/write is ever issued, so fd-level IO and fsync see everything.
 ///
 ///   PageFile f = PageFile.Open("data.zdb");
 ///   ByteBuffer page = ByteBuffer.Alloc(4096);
@@ -17,7 +22,12 @@ namespace System.Data.ZanDb;
 ///   f.Close();
 /// </summary>
 class PageFile {
+    /// <summary>How long <see cref="LockExclusive"/> waits for the current
+    /// holder before it reports failure.</summary>
+    static int LOCK_TIMEOUT_MS = 60000;
+
     int fp;
+    int fd;
     string path;
     string lastError;
 
@@ -27,43 +37,54 @@ class PageFile {
     [DllImport("crt")]
     static extern int fclose(int fp);
 
-    [DllImport("crt")]
-    static extern int fread(nint buf, int size, int count, int fp);
-
-    [DllImport("crt")]
-    static extern int fwrite(nint buf, int size, int count, int fp);
-
-    [DllImport("crt")]
-    static extern int fflush(int fp);
-
     #if WINDOWS
-    [DllImport("crt", EntryPoint = "_fseeki64")]
-    static extern int Seek64(int fp, int offset, int origin);
-
-    [DllImport("crt", EntryPoint = "_ftelli64")]
-    static extern int Tell64(int fp);
-
     [DllImport("crt", EntryPoint = "_fileno")]
     static extern int FileNo(int fp);
 
     [DllImport("crt", EntryPoint = "_commit")]
     static extern int SyncFd(int fd);
+
+    [DllImport("crt", EntryPoint = "_lseeki64")]
+    static extern int SeekFd(int fd, int offset, int origin);
+
+    [DllImport("crt", EntryPoint = "_read")]
+    static extern int ReadFd(int fd, nint buf, int count);
+
+    [DllImport("crt", EntryPoint = "_write")]
+    static extern int WriteFd(int fd, nint buf, int count);
+
+    // _locking() locks a byte range starting at the current file position;
+    // mode 1 (_LK_LOCK) blocks (retrying for ~10s), 2 (_LK_NBLCK) fails fast,
+    // 0 (_LK_UNLCK) releases.
+    [DllImport("crt", EntryPoint = "_locking")]
+    static extern int LockFd(int fd, int mode, int length);
     #else
-    [DllImport("crt", EntryPoint = "fseeko")]
-    static extern int Seek64(int fp, int offset, int origin);
-
-    [DllImport("crt", EntryPoint = "ftello")]
-    static extern int Tell64(int fp);
-
     [DllImport("crt", EntryPoint = "fileno")]
     static extern int FileNo(int fp);
 
     [DllImport("crt", EntryPoint = "fsync")]
     static extern int SyncFd(int fd);
+
+    [DllImport("crt", EntryPoint = "lseek")]
+    static extern int SeekFd(int fd, int offset, int origin);
+
+    [DllImport("crt", EntryPoint = "pread")]
+    static extern int PReadFd(int fd, nint buf, int count, int offset);
+
+    [DllImport("crt", EntryPoint = "pwrite")]
+    static extern int PWriteFd(int fd, nint buf, int count, int offset);
+
+    [DllImport("crt", EntryPoint = "ftruncate")]
+    static extern int TruncateFd(int fd, int length);
+
+    // flock(): 2 = LOCK_EX, 8 = LOCK_UN, 4 = LOCK_NB
+    [DllImport("crt", EntryPoint = "flock")]
+    static extern int FlockFd(int fd, int op);
     #endif
 
     PageFile() {
         this.fp = 0;
+        this.fd = -1;
         this.path = "";
         this.lastError = "";
     }
@@ -78,7 +99,9 @@ class PageFile {
         }
         if (f.fp == 0) {
             f.lastError = "cannot open " + path;
+            return f;
         }
+        f.fd = FileNo(f.fp);
         return f;
     }
 
@@ -92,62 +115,105 @@ class PageFile {
         if (this.fp == 0) { return -1; }
         buf.Clear();
         buf.EnsureCapacity(count);
-        if (Seek64(this.fp, offset, 0) != 0) {
+        int n = ReadRaw(offset, buf.Raw(), count);
+        if (n < 0) { n = 0; }
+        buf.SetLength(n);
+        return n;
+    }
+
+    /// <summary>Positional read into a raw block.</summary>
+    int ReadRaw(int offset, nint raw, int count) {
+        if (this.fp == 0) { return -1; }
+        #if WINDOWS
+        if (SeekFd(this.fd, offset, 0) < 0) {
             this.lastError = "seek failed";
             return -1;
         }
-        int n = fread(buf.Raw(), 1, count, this.fp);
-        buf.SetLength(n);
-        return n;
+        return ReadFd(this.fd, raw, count);
+        #else
+        return PReadFd(this.fd, raw, count, offset);
+        #endif
     }
 
     /// <summary>Writes count bytes from a raw block at offset.
     /// Returns bytes written.</summary>
     int WriteAt(int offset, nint raw, int count) {
         if (this.fp == 0) { return -1; }
-        if (Seek64(this.fp, offset, 0) != 0) {
+        #if WINDOWS
+        if (SeekFd(this.fd, offset, 0) < 0) {
             this.lastError = "seek failed";
             return -1;
         }
-        int n = fwrite(raw, 1, count, this.fp);
-        return n;
+        return WriteFd(this.fd, raw, count);
+        #else
+        return PWriteFd(this.fd, raw, count, offset);
+        #endif
     }
 
     /// <summary>Appends count bytes at end of file; returns the offset the
     /// data landed at, or -1 on error.</summary>
     int Append(nint raw, int count) {
         if (this.fp == 0) { return -1; }
-        if (Seek64(this.fp, 0, 2) != 0) { return -1; }
-        int off = Tell64(this.fp);
-        int n = fwrite(raw, 1, count, this.fp);
-        if (n != count) { return -1; }
-        return off;
+        int end = Size();
+        if (end < 0) { return -1; }
+        if (WriteAt(end, raw, count) != count) { return -1; }
+        return end;
     }
 
     /// <summary>Current file size in bytes.</summary>
     int Size() {
         if (this.fp == 0) { return -1; }
-        Seek64(this.fp, 0, 2);
-        return Tell64(this.fp);
+        return SeekFd(this.fd, 0, 2);
     }
 
-    /// <summary>Flushes stdio buffers to the OS.</summary>
-    void Flush() {
-        if (this.fp != 0) { fflush(this.fp); }
-    }
+    /// <summary>Buffered-write flush; positional IO is unbuffered, so this is
+    /// only kept for API compatibility.</summary>
+    void Flush() { }
 
-    /// <summary>Forces buffered data to stable storage (fflush + fsync).
-    /// Returns true on success.</summary>
+    /// <summary>Forces written data to stable storage. Returns true on
+    /// success.</summary>
     bool Sync() {
         if (this.fp == 0) { return false; }
-        fflush(this.fp);
-        return SyncFd(FileNo(this.fp)) == 0;
+        return SyncFd(this.fd) == 0;
+    }
+
+    /// <summary>Takes an exclusive whole-file lock, waiting for the current
+    /// holder. The lock is released by the operating system if the process
+    /// dies, so a crashed writer cannot wedge the database.</summary>
+    bool LockExclusive() {
+        if (this.fp == 0) { return false; }
+        #if WINDOWS
+        if (SeekFd(this.fd, 0, 0) < 0) { return false; }
+        // _LK_NBLCK in a spin loop rather than _LK_LOCK: _LK_LOCK sleeps a
+        // whole second between its own retries, so a writer that commits in
+        // milliseconds would hand the lock to a waiter only once per second.
+        int waited = 0;
+        while (waited < PageFile.LOCK_TIMEOUT_MS) {
+            if (LockFd(this.fd, 2, 1) == 0) { return true; }
+            Thread.Sleep(1);
+            waited = waited + 1;
+        }
+        return false;
+        #else
+        return FlockFd(this.fd, 2) == 0;
+        #endif
+    }
+
+    bool Unlock() {
+        if (this.fp == 0) { return false; }
+        #if WINDOWS
+        if (SeekFd(this.fd, 0, 0) < 0) { return false; }
+        return LockFd(this.fd, 0, 1) == 0;                     // _LK_UNLCK
+        #else
+        return FlockFd(this.fd, 8) == 0;
+        #endif
     }
 
     void Close() {
         if (this.fp != 0) {
             fclose(this.fp);
             this.fp = 0;
+            this.fd = -1;
         }
     }
 }

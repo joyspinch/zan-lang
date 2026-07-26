@@ -3,18 +3,82 @@ using System.IO;
 
 namespace System.Data.ZanDb;
 
+/// <summary>Small open-addressing set of page ids: "was this page allocated by
+/// the transaction that is currently running?" is asked for every node the
+/// writer touches, so it must not be a linear scan.</summary>
+class PageIdSet {
+    int slots;
+    int count;
+    List<int> keys;   // pageId + 1, 0 = empty
+
+    PageIdSet() {
+        this.slots = 256;
+        this.count = 0;
+        this.keys = new List<int>();
+        int i = 0;
+        while (i < this.slots) { this.keys.Add(0); i = i + 1; }
+    }
+
+    static PageIdSet Create() { return new PageIdSet(); }
+
+    int Count() { return this.count; }
+
+    int SlotOf(int pageId) {
+        int mask = this.slots - 1;
+        int h = (pageId * 2654435761) & mask;
+        if (h < 0) { h = -h & mask; }
+        while (true) {
+            int k = this.keys[h];
+            if (k == 0) { return -(h + 1); }
+            if (k == pageId + 1) { return h; }
+            h = (h + 1) & mask;
+        }
+        return 0;
+    }
+
+    bool Has(int pageId) { return SlotOf(pageId) >= 0; }
+
+    void Grow() {
+        List<int> old = this.keys;
+        int oldSlots = this.slots;
+        this.slots = oldSlots * 2;
+        this.keys = new List<int>();
+        int i = 0;
+        while (i < this.slots) { this.keys.Add(0); i = i + 1; }
+        this.count = 0;
+        i = 0;
+        while (i < oldSlots) {
+            if (old[i] != 0) { Add(old[i] - 1); }
+            i = i + 1;
+        }
+    }
+
+    void Add(int pageId) {
+        if (this.count * 2 >= this.slots) { Grow(); }
+        int s = SlotOf(pageId);
+        if (s >= 0) { return; }
+        this.keys[-s - 1] = pageId + 1;
+        this.count = this.count + 1;
+    }
+
+    void Clear() {
+        int i = 0;
+        while (i < this.slots) { this.keys[i] = 0; i = i + 1; }
+        this.count = 0;
+    }
+}
+
 /// <summary>
 /// Fixed-capacity LRU cache mapping page id -> ByteBuffer. Open-addressing
-/// hash table with an intrusive doubly-linked LRU list; no allocation after
-/// construction. Dirty pages are pinned (never evicted) until the pager
-/// commits them.
+/// hash table with an intrusive doubly-linked LRU list. Pages written by the
+/// running transaction are pinned (never evicted) until it commits.
 /// </summary>
 class PageCache {
     int capacity;      // max resident pages
     int slots;         // hash slots (power of two, > capacity)
     List<int> keys;    // pageId + 1; 0 = empty, -1 = tombstone
     List<ByteBuffer> vals;
-    List<bool> dirty;
+    List<bool> pinned;
     List<int> lruPrev; // slot index links, -1 = none
     List<int> lruNext;
     int lruHead;       // most recently used slot
@@ -28,14 +92,14 @@ class PageCache {
         this.slots = s;
         this.keys = new List<int>();
         this.vals = new List<ByteBuffer>();
-        this.dirty = new List<bool>();
+        this.pinned = new List<bool>();
         this.lruPrev = new List<int>();
         this.lruNext = new List<int>();
         int i = 0;
         while (i < s) {
             this.keys.Add(0);
             this.vals.Add(ByteBuffer.Alloc(16));
-            this.dirty.Add(false);
+            this.pinned.Add(false);
             this.lruPrev.Add(-1);
             this.lruNext.Add(-1);
             i = i + 1;
@@ -45,9 +109,7 @@ class PageCache {
         this.count = 0;
     }
 
-    static PageCache Create(int capacity) {
-        return new PageCache(capacity);
-    }
+    static PageCache Create(int capacity) { return new PageCache(capacity); }
 
     int Count() { return this.count; }
 
@@ -93,58 +155,86 @@ class PageCache {
         if (this.lruTail < 0) { this.lruTail = slot; }
     }
 
-    /// <summary>Returns the cached page or null-equivalent (check Found).</summary>
-    bool Has(int pageId) {
-        return FindSlot(pageId) >= 0;
-    }
+    bool Has(int pageId) { return FindSlot(pageId) >= 0; }
 
     ByteBuffer Get(int pageId) {
         int slot = FindSlot(pageId);
+        if (slot < 0) { return ByteBuffer.Alloc(16); }
         LruUnlink(slot);
         LruPushFront(slot);
         return this.vals[slot];
     }
 
-    bool IsDirty(int pageId) {
+    void SetPinned(int pageId, bool p) {
         int slot = FindSlot(pageId);
-        if (slot < 0) { return false; }
-        return this.dirty[slot];
+        if (slot >= 0) { this.pinned[slot] = p; }
     }
 
-    void SetDirty(int pageId, bool d) {
-        int slot = FindSlot(pageId);
-        if (slot >= 0) { this.dirty[slot] = d; }
+    /// <summary>Unpins everything (called when a transaction ends).</summary>
+    void UnpinAll() {
+        int i = 0;
+        while (i < this.slots) { this.pinned[i] = false; i = i + 1; }
     }
 
-    /// <summary>Slot of the least-recently-used clean page, or -1.</summary>
+    /// <summary>Drops one page (its id is about to be reused for different
+    /// content, so a stale copy must not survive).</summary>
+    void Remove(int pageId) {
+        int slot = FindSlot(pageId);
+        if (slot < 0) { return; }
+        this.vals[slot].Free();
+        this.vals[slot] = ByteBuffer.Alloc(16);
+        this.keys[slot] = -1;
+        this.pinned[slot] = false;
+        LruUnlink(slot);
+        this.count = this.count - 1;
+    }
+
+    /// <summary>Drops every page (another process committed, so cached page
+    /// contents may belong to a version that no longer exists).</summary>
+    void Clear() {
+        int i = 0;
+        while (i < this.slots) {
+            if (this.keys[i] > 0) {
+                this.vals[i].Free();
+                this.vals[i] = ByteBuffer.Alloc(16);
+            }
+            this.keys[i] = 0;
+            this.pinned[i] = false;
+            this.lruPrev[i] = -1;
+            this.lruNext[i] = -1;
+            i = i + 1;
+        }
+        this.lruHead = -1;
+        this.lruTail = -1;
+        this.count = 0;
+    }
+
     int EvictableSlot() {
         int s = this.lruTail;
         while (s >= 0) {
-            if (!this.dirty[s]) { return s; }
+            if (!this.pinned[s]) { return s; }
             s = this.lruPrev[s];
         }
         return -1;
     }
 
-    /// <summary>Doubles the slot table (dirty-page bursts can exceed the
-    /// nominal capacity, and tombstones consume slots).</summary>
     void Grow() {
         List<int> oldKeys = this.keys;
         List<ByteBuffer> oldVals = this.vals;
-        List<bool> oldDirty = this.dirty;
+        List<bool> oldPinned = this.pinned;
         int oldSlots = this.slots;
 
         this.slots = oldSlots * 2;
         this.keys = new List<int>();
         this.vals = new List<ByteBuffer>();
-        this.dirty = new List<bool>();
+        this.pinned = new List<bool>();
         this.lruPrev = new List<int>();
         this.lruNext = new List<int>();
         int i = 0;
         while (i < this.slots) {
             this.keys.Add(0);
             this.vals.Add(ByteBuffer.Alloc(16));
-            this.dirty.Add(false);
+            this.pinned.Add(false);
             this.lruPrev.Add(-1);
             this.lruNext.Add(-1);
             i = i + 1;
@@ -153,7 +243,6 @@ class PageCache {
         this.lruTail = -1;
         this.count = 0;
 
-        // Reinsert live entries (LRU recency ordering is rebuilt coarsely).
         i = 0;
         while (i < oldSlots) {
             if (oldKeys[i] > 0) {
@@ -161,7 +250,7 @@ class PageCache {
                 int slot = FindInsertSlot(id);
                 this.keys[slot] = id + 1;
                 this.vals[slot] = oldVals[i];
-                this.dirty[slot] = oldDirty[i];
+                this.pinned[slot] = oldPinned[i];
                 LruPushFront(slot);
                 this.count = this.count + 1;
             }
@@ -169,14 +258,14 @@ class PageCache {
         }
     }
 
-    /// <summary>Inserts a page taking ownership of buf; evicts the LRU clean
-    /// page when full (its buffer is freed). Dirty pages are never evicted,
-    /// so the cache may temporarily exceed capacity under write bursts.</summary>
-    void Put(int pageId, ByteBuffer buf) {
+    /// <summary>Inserts a page taking ownership of buf; evicts the LRU
+    /// unpinned page when full.</summary>
+    void Put(int pageId, ByteBuffer buf, bool pin) {
         if (this.count >= this.capacity) {
             int ev = EvictableSlot();
             if (ev >= 0) {
                 this.vals[ev].Free();
+                this.vals[ev] = ByteBuffer.Alloc(16);
                 this.keys[ev] = -1;
                 LruUnlink(ev);
                 this.count = this.count - 1;
@@ -186,59 +275,89 @@ class PageCache {
         int slot = FindInsertSlot(pageId);
         this.keys[slot] = pageId + 1;
         this.vals[slot] = buf;
-        this.dirty[slot] = false;
+        this.pinned[slot] = pin;
         LruPushFront(slot);
         this.count = this.count + 1;
-    }
-
-    /// <summary>Collects the ids of all dirty pages.</summary>
-    List<int> DirtyPageIds() {
-        List<int> ids = new List<int>();
-        int s = this.lruTail;
-        while (s >= 0) {
-            if (this.dirty[s]) { ids.Add(this.keys[s] - 1); }
-            s = this.lruPrev[s];
-        }
-        return ids;
     }
 }
 
 /// <summary>
-/// Page manager: fixed-size pages in a single file, LRU page cache with a
-/// hard memory cap, free-page reuse, and WAL-backed atomic commits.
+/// Page manager with single-writer / multi-reader MVCC (the LMDB model).
 ///
-/// Page 0 is the header: magic, page size, page count, freelist head and
-/// commit counter. Data pages start at id 1. Mutations go through:
-///   ByteBuffer page = pager.GetPage(id);
-///   ...mutate page...
-///   pager.MarkDirty(id);
-///   pager.Commit();      // atomic: all dirty pages or none
+/// Pages 0 and 1 are meta pages written alternately; each carries a
+/// transaction id, the B+Tree root, the free-list head, the page count and a
+/// CRC. Opening the database picks the valid meta page with the highest
+/// transaction id, which makes a commit atomic without a redo log: a crash
+/// either leaves the new meta page complete (new version) or not (previous
+/// version, untouched because pages are never modified in place).
+///
+/// A write transaction never overwrites a live page: <see cref="PageForWrite"/>
+/// copies it to a freshly allocated page and hands the old one to the
+/// free-list stamped with the committing transaction id. A page can be reused
+/// only once no reader still looks at a snapshot older than the transaction
+/// that freed it, which is what <see cref="DbRegistry"/> tracks.
+///
+///   pager.BeginWrite();
+///   int np = pager.PageForWrite(oldPage);   // copy-on-write
+///   ...mutate pager.GetPage(np)...
+///   pager.SetRoot(newRoot);
+///   pager.Commit();                          // fsync data, then meta
 /// </summary>
 class Pager {
     static int PAGE_SIZE = 4096;
-    static int MAGIC = 826425690;        // "ZDB1" little-endian
+    static int MAGIC = 843202906;        // "ZDB2" little-endian
+    static int META_FIELDS = 48;         // bytes covered by the meta CRC
+    static int FREE_PER_PAGE = 255;      // (id, txn) pairs in one free-list page
 
     PageFile file;
-    Wal wal;
     PageCache cache;
+    DbRegistry registry;
     string lastError;
-    int pageCount;      // includes header page
-    int freelistHead;   // 0 = none
-    int commitId;
-    int syncEvery;      // fsync main file every N commits (1 = always)
+
+    int txnid;          // snapshot this handle is looking at
+    int rootId;
+    int freeHead;
+    int pageCount;      // total pages in the file (>= 2)
+
+    PageIdSet fresh;    // pages allocated by the running write transaction
+    List<int> freshIds; // same, in allocation order (the commit write set)
+    List<int> freeIds;  // free-list: page ids...
+    List<int> freeTxns; // ...and the transaction that freed each of them
+    List<int> reusable; // free pages no reader can see any more
+    List<int> pendingFree;   // freed by the running transaction
+    List<int> freeChain;     // pages holding the persisted free list
+
+    int writeDepth;
+    int readDepth;
+    int pageWrites;     // pages written to disk since this handle opened
+    int syncEvery;
     int commitsSinceSync;
+    bool freeLoaded;
+    bool cacheDirty;    // caches were invalidated: BTree must reload its root
 
     Pager() {
         this.lastError = "";
-        this.pageCount = 1;
-        this.freelistHead = 0;
-        this.commitId = 0;
-        this.syncEvery = 16;
+        this.txnid = 0;
+        this.rootId = 0;
+        this.freeHead = 0;
+        this.pageCount = 2;
+        this.writeDepth = 0;
+        this.readDepth = 0;
+        this.pageWrites = 0;
+        this.syncEvery = 1;
         this.commitsSinceSync = 0;
+        this.freeLoaded = false;
+        this.cacheDirty = false;
+        this.fresh = PageIdSet.Create();
+        this.freshIds = new List<int>();
+        this.freeIds = new List<int>();
+        this.freeTxns = new List<int>();
+        this.reusable = new List<int>();
+        this.pendingFree = new List<int>();
+        this.freeChain = new List<int>();
     }
 
-    /// <summary>Opens (creating if missing) a database file, recovering any
-    /// committed-but-unapplied WAL data from a previous crash.</summary>
+    /// <summary>Opens (creating if missing) a database file.</summary>
     static Pager Open(string path, int cacheCapacity) {
         Pager p = new Pager();
         p.file = PageFile.Open(path);
@@ -247,43 +366,35 @@ class Pager {
             return p;
         }
         p.cache = PageCache.Create(cacheCapacity);
-        p.wal = Wal.Open(path + "-wal", Pager.PAGE_SIZE);
+        p.registry = DbRegistry.Attach(path);
 
-        // Crash recovery: re-apply committed WAL frames, then reset the WAL.
-        p.wal.Recover(p.file);
-
-        if (p.file.Size() < Pager.PAGE_SIZE) {
-            // Fresh database: write the header page.
-            ByteBuffer h = ByteBuffer.Alloc(Pager.PAGE_SIZE);
-            h.WriteU32(Pager.MAGIC);
-            h.WriteU32(Pager.PAGE_SIZE);
-            h.WriteU64(1);       // pageCount
-            h.WriteU64(0);       // freelistHead
-            h.WriteU64(0);       // commitId
-            p.file.WriteAt(0, h.Raw(), Pager.PAGE_SIZE);
-            p.file.Sync();
-            h.Free();
+        if (p.file.Size() < Pager.PAGE_SIZE * 2) {
+            if (!p.registry.LockWrite()) {
+                p.lastError = "cannot lock database for initialization";
+                return p;
+            }
+            if (p.file.Size() < Pager.PAGE_SIZE * 2) {
+                p.txnid = 1;
+                p.rootId = 0;
+                p.freeHead = 0;
+                p.pageCount = 2;
+                ByteBuffer zero = ByteBuffer.Alloc(Pager.PAGE_SIZE);
+                zero.Clear();
+                zero.SetLength(Pager.PAGE_SIZE);
+                p.file.WriteAt(0, zero.Raw(), Pager.PAGE_SIZE);
+                p.file.WriteAt(Pager.PAGE_SIZE, zero.Raw(), Pager.PAGE_SIZE);
+                zero.Free();
+                p.WriteMeta(1);
+                p.file.Sync();
+                p.registry.PublishTxn(1);
+            } else {
+                p.LoadMeta();
+            }
+            p.registry.UnlockWrite();
         } else {
-            ByteBuffer h = ByteBuffer.Alloc(Pager.PAGE_SIZE);
-            p.file.ReadAt(0, h, Pager.PAGE_SIZE);
-            h.SeekRead(0);
-            int magic = h.ReadU32();
-            if (magic != Pager.MAGIC) {
-                p.lastError = "not a ZanDB file";
-                h.Free();
-                return p;
-            }
-            int ps = h.ReadU32();
-            if (ps != Pager.PAGE_SIZE) {
-                p.lastError = "unsupported page size";
-                h.Free();
-                return p;
-            }
-            p.pageCount = h.ReadU64();
-            p.freelistHead = h.ReadU64();
-            p.commitId = h.ReadU64();
-            h.Free();
+            p.LoadMeta();
         }
+        p.registry.ClaimSlot();
         return p;
     }
 
@@ -293,19 +404,322 @@ class Pager {
 
     int PageCount() { return this.pageCount; }
 
-    int CommitId() { return this.commitId; }
+    int CommitId() { return this.txnid; }
 
-    /// <summary>fsync cadence for the main file: 1 = every commit (Full),
-    /// N = every N commits (default 16). Durability is identical either way:
-    /// the WAL is fsynced on every commit and recovery replays it, so the
-    /// cadence only bounds how much WAL is replayed after a crash. The WAL
-    /// is also checkpointed whenever it exceeds 4 MB.</summary>
+    int RootId() { return this.rootId; }
+
+    void SetRoot(int id) { this.rootId = id; }
+
+    /// <summary>Number of pages on the free-list plus those already reusable
+    /// (space that will be reused before the file grows).</summary>
+    int FreePages() { return this.freeIds.Count + this.reusable.Count; }
+
+    /// <summary>Pages written to disk since this handle was opened, meta pages
+    /// included: divide by the pages a workload actually changed to get its
+    /// write amplification.</summary>
+    int PageWrites() { return this.pageWrites; }
+
+    /// <summary>Oldest snapshot still being read by any process; freed pages
+    /// newer than this cannot be reused yet. 0 = nobody is reading.</summary>
+    int OldestReader() { return this.registry.OldestSnapshot(); }
+
+    /// <summary>fsync cadence for the data pages of a commit: 1 = full
+    /// durability (default), N = fsync data every N commits. The meta page is
+    /// always written last, so a lower cadence trades "the last N commits may
+    /// be lost" for throughput -- never a corrupt database.</summary>
     void SetSyncEvery(int n) {
         if (n >= 1) { this.syncEvery = n; }
     }
 
-    /// <summary>Returns the page buffer (cached; loaded from disk on miss).
-    /// The buffer stays owned by the pager.</summary>
+    // ===== meta pages =====
+
+    void WriteMeta(int newTxn) {
+        ByteBuffer h = ByteBuffer.Alloc(Pager.PAGE_SIZE);
+        h.Clear();
+        h.WriteU32(Pager.MAGIC);
+        h.WriteU32(Pager.PAGE_SIZE);
+        h.WriteU64(newTxn);
+        h.WriteU64(this.rootId);
+        h.WriteU64(this.freeHead);
+        h.WriteU64(this.pageCount);
+        h.WriteU64(0);
+        h.SetLength(Pager.META_FIELDS);
+        int crc = h.Crc32(Pager.META_FIELDS);
+        h.SetLength(Pager.META_FIELDS);
+        h.WriteU32(crc);
+        h.SetLength(Pager.PAGE_SIZE);
+        int slot = newTxn & 1;
+        this.file.WriteAt(slot * Pager.PAGE_SIZE, h.Raw(), Pager.PAGE_SIZE);
+        this.pageWrites = this.pageWrites + 1;
+        h.Free();
+    }
+
+    /// <summary>Reads one meta page; returns its transaction id, or 0 when the
+    /// page is absent, foreign or CRC-broken (a torn commit).</summary>
+    int ReadMetaSlot(int slot, ByteBuffer h) {
+        int n = this.file.ReadAt(slot * Pager.PAGE_SIZE, h, Pager.PAGE_SIZE);
+        if (n < Pager.PAGE_SIZE) { return 0; }
+        h.SeekRead(0);
+        if (h.ReadU32() != Pager.MAGIC) { return 0; }
+        if (h.ReadU32() != Pager.PAGE_SIZE) { return 0; }
+        int txn = h.ReadU64();
+        h.SeekRead(Pager.META_FIELDS);
+        int stored = h.ReadU32();
+        if (h.Crc32(Pager.META_FIELDS) != stored) { return 0; }
+        return txn;
+    }
+
+    /// <summary>Adopts the newest valid meta page as this handle's snapshot.</summary>
+    void LoadMeta() {
+        ByteBuffer a = ByteBuffer.Alloc(Pager.PAGE_SIZE);
+        ByteBuffer b = ByteBuffer.Alloc(Pager.PAGE_SIZE);
+        int ta = ReadMetaSlot(0, a);
+        int tb = ReadMetaSlot(1, b);
+        ByteBuffer pick = a;
+        int txn = ta;
+        if (tb > ta) { pick = b; txn = tb; }
+        if (txn == 0) {
+            this.lastError = "not a ZanDB file (no valid meta page)";
+            a.Free();
+            b.Free();
+            return;
+        }
+        pick.SeekRead(8);
+        this.txnid = pick.ReadU64();
+        this.rootId = pick.ReadU64();
+        this.freeHead = pick.ReadU64();
+        this.pageCount = pick.ReadU64();
+        a.Free();
+        b.Free();
+        this.freeLoaded = false;
+        this.freeIds = new List<int>();
+        this.freeTxns = new List<int>();
+        this.reusable = new List<int>();
+        this.freeChain = new List<int>();
+    }
+
+    /// <summary>Whether another process may have committed since this handle
+    /// last read the meta page. Transaction ids are handed out from the shared
+    /// registry, so they are unique across the database: a published id equal
+    /// to ours means our snapshot *is* the newest version. The number of live
+    /// processes says nothing here -- a process that committed and exited
+    /// leaves its version behind for this one to adopt.</summary>
+    bool MaybeStale() {
+        if (!this.registry.IsShared()) { return false; }
+        int published = this.registry.CommittedTxn();
+        if (published == 0) { return false; }
+        return published != this.txnid;
+    }
+
+    /// <summary>Re-reads the meta page when another process has committed, and
+    /// drops the cached pages of the version we were looking at. Returns true
+    /// when the snapshot moved.</summary>
+    bool Refresh() {
+        if (!MaybeStale()) { return false; }
+        int before = this.txnid;
+        LoadMeta();
+        if (this.txnid == before) { return false; }
+        this.cache.Clear();
+        this.cacheDirty = true;
+        return true;
+    }
+
+    /// <summary>Whether cached decoded state (B+Tree nodes) must be dropped
+    /// because the snapshot moved. Clears the flag.</summary>
+    bool TakeInvalidation() {
+        bool v = this.cacheDirty;
+        this.cacheDirty = false;
+        return v;
+    }
+
+    // ===== free list =====
+
+    void LoadFreeList() {
+        if (this.freeLoaded) { return; }
+        this.freeIds = new List<int>();
+        this.freeTxns = new List<int>();
+        this.freeChain = new List<int>();
+        int pid = this.freeHead;
+        ByteBuffer pg = ByteBuffer.Alloc(Pager.PAGE_SIZE);
+        while (pid != 0) {
+            this.file.ReadAt(pid * Pager.PAGE_SIZE, pg, Pager.PAGE_SIZE);
+            pg.SeekRead(0);
+            int next = pg.ReadU64();
+            int cnt = pg.ReadU64();
+            int i = 0;
+            while (i < cnt && i < Pager.FREE_PER_PAGE) {
+                this.freeIds.Add(pg.ReadU64());
+                this.freeTxns.Add(pg.ReadU64());
+                i = i + 1;
+            }
+            // The list pages themselves are rewritten on every commit.
+            this.freeChain.Add(pid);
+            pid = next;
+        }
+        pg.Free();
+        this.freeLoaded = true;
+    }
+
+    /// <summary>Moves free pages that no live reader can reach into the
+    /// reusable pool.</summary>
+    void ReclaimFree() {
+        LoadFreeList();
+        int oldest = this.registry.OldestSnapshot();
+        List<int> keepIds = new List<int>();
+        List<int> keepTxns = new List<int>();
+        int i = 0;
+        while (i < this.freeIds.Count) {
+            int freedBy = this.freeTxns[i];
+            if (oldest == 0 || freedBy <= oldest) {
+                this.reusable.Add(this.freeIds[i]);
+            } else {
+                keepIds.Add(this.freeIds[i]);
+                keepTxns.Add(this.freeTxns[i]);
+            }
+            i = i + 1;
+        }
+        this.freeIds = keepIds;
+        this.freeTxns = keepTxns;
+    }
+
+    /// <summary>Writes the free list as a fresh page chain and returns its
+    /// head (0 when empty). Called inside Commit, after the new transaction id
+    /// is known.</summary>
+    int PersistFreeList(int newTxn) {
+        int total = this.freeIds.Count;
+        this.freeChain = new List<int>();
+        if (total == 0) { return 0; }
+        int head = 0;
+        int written = 0;
+        while (written < total) {
+            int cnt = total - written;
+            if (cnt > Pager.FREE_PER_PAGE) { cnt = Pager.FREE_PER_PAGE; }
+            int pid = AllocPage();
+            ByteBuffer pg = GetPage(pid);
+            pg.Clear();
+            pg.WriteU64(head);
+            pg.WriteU64(cnt);
+            int i = 0;
+            while (i < cnt) {
+                pg.WriteU64(this.freeIds[written + i]);
+                pg.WriteU64(this.freeTxns[written + i]);
+                i = i + 1;
+            }
+            pg.SetLength(Pager.PAGE_SIZE);
+            this.freeChain.Add(pid);
+            head = pid;
+            written = written + cnt;
+        }
+        return head;
+    }
+
+    // ===== transactions =====
+
+    /// <summary>Registers the snapshot this handle reads, so a writer in
+    /// another process cannot recycle the pages under it. Cheap: one
+    /// shared-memory store, and nothing at all when the database is open in a
+    /// single process.</summary>
+    void BeginRead() {
+        this.readDepth = this.readDepth + 1;
+        if (this.readDepth > 1 || this.writeDepth > 0) { return; }
+        if (!this.registry.IsShared()) { return; }
+        Refresh();
+        this.registry.PublishSnapshot(this.txnid);
+    }
+
+    void EndRead() {
+        if (this.readDepth > 0) { this.readDepth = this.readDepth - 1; }
+        if (this.readDepth == 0 && this.writeDepth == 0) {
+            this.registry.PublishSnapshot(0);
+        }
+    }
+
+    /// <summary>Takes the single writer slot (blocking) and starts a write
+    /// transaction on the newest committed snapshot. Nestable.</summary>
+    bool BeginWrite() {
+        this.writeDepth = this.writeDepth + 1;
+        if (this.writeDepth > 1) { return true; }
+        if (!this.registry.LockWrite()) {
+            this.writeDepth = 0;
+            this.lastError = "cannot acquire the writer lock";
+            return false;
+        }
+        // Adopt another process's commit before building on it; when nothing
+        // moved, the cached pages and free list stay valid.
+        if (MaybeStale()) {
+            LoadMeta();
+            this.cache.Clear();
+            this.cacheDirty = true;
+        }
+        this.fresh.Clear();
+        this.freshIds = new List<int>();
+        this.pendingFree = new List<int>();
+        ReclaimFree();
+        // A writer is also a reader of the snapshot it builds on.
+        this.registry.PublishSnapshot(this.txnid);
+        return true;
+    }
+
+    bool InWrite() { return this.writeDepth > 0; }
+
+    /// <summary>True when the page belongs to the running write transaction
+    /// (so it may be modified in place).</summary>
+    bool IsFresh(int pageId) { return this.fresh.Has(pageId); }
+
+    /// <summary>Allocates a page: a reusable free page if there is one,
+    /// otherwise the file grows. The page is pinned until commit.</summary>
+    int AllocPage() {
+        int id = 0;
+        if (this.reusable.Count > 0) {
+            id = this.reusable[this.reusable.Count - 1];
+            this.reusable.RemoveAt(this.reusable.Count - 1);
+            this.cache.Remove(id);
+        } else {
+            id = this.pageCount;
+            this.pageCount = this.pageCount + 1;
+        }
+        ByteBuffer buf = ByteBuffer.Alloc(Pager.PAGE_SIZE);
+        buf.Clear();
+        buf.SetLength(Pager.PAGE_SIZE);
+        this.cache.Put(id, buf, true);
+        this.fresh.Add(id);
+        this.freshIds.Add(id);
+        return id;
+    }
+
+    /// <summary>Copy-on-write: returns a page id that may be modified. Pages
+    /// of the committed snapshot are copied to a new page and the old one is
+    /// queued for the free list; pages created by this transaction are
+    /// returned unchanged.</summary>
+    int PageForWrite(int pageId) {
+        if (pageId == 0) { return AllocPage(); }
+        if (this.fresh.Has(pageId)) { return pageId; }
+        int nid = AllocPage();
+        // The new page is pinned, so reading the old one cannot evict it.
+        ByteBuffer src = GetPage(pageId);
+        ByteBuffer dst = GetPage(nid);
+        dst.Clear();
+        dst.WriteBytes(src.Raw(), Pager.PAGE_SIZE);
+        dst.SetLength(Pager.PAGE_SIZE);
+        FreeLater(pageId);
+        return nid;
+    }
+
+    /// <summary>Queues a page for reuse once no reader can see it any more.
+    /// Pages created by the running transaction are recycled immediately --
+    /// nobody has ever seen them.</summary>
+    void FreeLater(int pageId) {
+        if (pageId == 0) { return; }
+        if (this.fresh.Has(pageId)) {
+            this.reusable.Add(pageId);
+            return;
+        }
+        this.pendingFree.Add(pageId);
+    }
+
+    /// <summary>Returns the page buffer (cached; read from the file on a
+    /// miss). The buffer stays owned by the pager and is only writable when
+    /// the page belongs to the running transaction.</summary>
     ByteBuffer GetPage(int pageId) {
         if (this.cache.Has(pageId)) {
             return this.cache.Get(pageId);
@@ -315,116 +729,118 @@ class Pager {
             this.file.ReadAt(pageId * Pager.PAGE_SIZE, buf, Pager.PAGE_SIZE);
         }
         buf.SetLength(Pager.PAGE_SIZE);
-        this.cache.Put(pageId, buf);
-        return this.cache.Get(pageId);
+        this.cache.Put(pageId, buf, this.fresh.Has(pageId));
+        return buf;
     }
 
-    /// <summary>Marks a page as modified; it will be persisted atomically by
-    /// the next Commit().</summary>
-    void MarkDirty(int pageId) {
-        this.cache.SetDirty(pageId, true);
-    }
+    /// <summary>Kept for API compatibility: with copy-on-write every modified
+    /// page is a freshly allocated one, so there is nothing to mark.</summary>
+    void MarkDirty(int pageId) { }
 
-    /// <summary>Allocates a page, reusing the freelist before growing the
-    /// file. Returns the new page id.</summary>
-    int AllocPage() {
-        if (this.freelistHead != 0) {
-            int id = this.freelistHead;
-            ByteBuffer pg = GetPage(id);
-            pg.SeekRead(0);
-            this.freelistHead = pg.ReadU64();
-            pg.Clear();
-            pg.SetLength(Pager.PAGE_SIZE);
-            MarkDirty(id);
-            return id;
-        }
-        int nid = this.pageCount;
-        this.pageCount = this.pageCount + 1;
-        ByteBuffer fresh = GetPage(nid);
-        fresh.Clear();
-        fresh.SetLength(Pager.PAGE_SIZE);
-        MarkDirty(nid);
-        return nid;
-    }
-
-    /// <summary>Returns a page to the freelist for reuse.</summary>
-    void FreePage(int pageId) {
-        ByteBuffer pg = GetPage(pageId);
-        pg.Clear();
-        pg.WriteU64(this.freelistHead);
-        pg.SetLength(Pager.PAGE_SIZE);
-        this.freelistHead = pageId;
-        MarkDirty(pageId);
-    }
-
-    void WriteHeaderInto(ByteBuffer h) {
-        h.Clear();
-        h.WriteU32(Pager.MAGIC);
-        h.WriteU32(Pager.PAGE_SIZE);
-        h.WriteU64(this.pageCount);
-        h.WriteU64(this.freelistHead);
-        h.WriteU64(this.commitId);
-        h.SetLength(Pager.PAGE_SIZE);
-    }
-
-    /// <summary>Atomically persists all dirty pages: frames + commit record
-    /// are appended to the WAL and fsynced (durability point), then pages are
-    /// checkpointed into the main file. Returns true on success.</summary>
+    /// <summary>Publishes the transaction: data pages first (fsync), then the
+    /// meta page (fsync). A crash before the meta write leaves the previous
+    /// version intact, so a commit is all-or-nothing without a redo log.</summary>
     bool Commit() {
-        List<int> ids = this.cache.DirtyPageIds();
-        this.commitId = this.commitId + 1;
+        if (this.writeDepth > 1) {
+            this.writeDepth = this.writeDepth - 1;
+            return true;
+        }
+        if (this.writeDepth == 0) { return true; }
 
-        // Header page carries the new commit id / page count / freelist.
-        ByteBuffer header = GetPage(0);
-        WriteHeaderInto(header);
-        this.cache.SetDirty(0, true);
-        ids = this.cache.DirtyPageIds();
+        // Transaction ids come from the whole database, not from this handle:
+        // two processes that start from the same snapshot must not both call
+        // their commit "n + 1", or neither would ever notice that the other
+        // moved the database on (and one lineage would silently overwrite the
+        // other's meta page). The writer lock is held here, so max + 1 is
+        // unique and monotonic across processes.
+        int newTxn = this.txnid + 1;
+        int published = this.registry.CommittedTxn();
+        if (published >= newTxn) { newTxn = published + 1; }
 
+        // The pages holding the previous free list are rewritten below.
+        int c = 0;
+        while (c < this.freeChain.Count) {
+            this.pendingFree.Add(this.freeChain[c]);
+            c = c + 1;
+        }
+
+        // Pages freed by this transaction become reusable for later ones.
         int i = 0;
-        while (i < ids.Count) {
-            ByteBuffer pg = this.cache.Get(ids[i]);
-            if (!this.wal.AppendFrame(ids[i], pg)) {
-                this.lastError = "wal append failed";
+        while (i < this.pendingFree.Count) {
+            this.freeIds.Add(this.pendingFree[i]);
+            this.freeTxns.Add(newTxn);
+            i = i + 1;
+        }
+        this.pendingFree = new List<int>();
+        this.freeHead = PersistFreeList(newTxn);
+
+        // Write every page this transaction created. They are all new pages,
+        // so no live data is overwritten and the order does not matter.
+        i = 0;
+        while (i < this.freshIds.Count) {
+            int pid = this.freshIds[i];
+            ByteBuffer pg = GetPage(pid);
+            if (this.file.WriteAt(pid * Pager.PAGE_SIZE, pg.Raw(), Pager.PAGE_SIZE)
+                    != Pager.PAGE_SIZE) {
+                this.lastError = "page write failed";
+                Rollback();
                 return false;
             }
+            this.pageWrites = this.pageWrites + 1;
             i = i + 1;
         }
-        if (!this.wal.AppendCommit(this.commitId)) {
-            this.lastError = "wal commit failed";
-            return false;
-        }
-        // Durability point: committed data now survives a crash.
-
-        // Checkpoint: write dirty pages into the main file.
-        i = 0;
-        while (i < ids.Count) {
-            ByteBuffer pg = this.cache.Get(ids[i]);
-            this.file.WriteAt(ids[i] * Pager.PAGE_SIZE, pg.Raw(), Pager.PAGE_SIZE);
-            this.cache.SetDirty(ids[i], false);
-            i = i + 1;
-        }
-        this.file.Flush();
 
         this.commitsSinceSync = this.commitsSinceSync + 1;
-        if (this.commitsSinceSync >= this.syncEvery || this.wal.Size() > 4194304) {
+        if (this.commitsSinceSync >= this.syncEvery) {
             this.file.Sync();
             this.commitsSinceSync = 0;
-            // Main file is durable; the WAL can start over.
-            this.wal.Reset();
         }
+
+        WriteMeta(newTxn);
+        this.file.Sync();
+        this.txnid = newTxn;
+        this.registry.PublishTxn(newTxn);
+
+        this.cache.UnpinAll();
+        this.fresh.Clear();
+        this.freshIds = new List<int>();
+        this.writeDepth = 0;
+        this.registry.PublishSnapshot(0);
+        this.registry.UnlockWrite();
         return true;
     }
 
-    /// <summary>Forces the main file to disk and truncates the WAL.</summary>
+    /// <summary>Discards everything the transaction wrote: nothing durable was
+    /// touched, so it is enough to drop the new pages and the meta page keeps
+    /// pointing at the previous version.</summary>
+    void Rollback() {
+        if (this.writeDepth == 0) { return; }
+        int i = 0;
+        while (i < this.freshIds.Count) {
+            this.cache.Remove(this.freshIds[i]);
+            i = i + 1;
+        }
+        this.fresh.Clear();
+        this.freshIds = new List<int>();
+        this.pendingFree = new List<int>();
+        this.writeDepth = 0;
+        LoadMeta();
+        this.cache.Clear();
+        this.cacheDirty = true;
+        this.registry.PublishSnapshot(0);
+        this.registry.UnlockWrite();
+    }
+
+    /// <summary>Forces everything written so far to stable storage.</summary>
     void Checkpoint() {
         this.file.Sync();
         this.commitsSinceSync = 0;
-        this.wal.Reset();
     }
 
     void Close() {
+        if (this.writeDepth > 0) { Rollback(); }
         Checkpoint();
-        this.wal.Close();
+        this.registry.Close();
         this.file.Close();
     }
 }

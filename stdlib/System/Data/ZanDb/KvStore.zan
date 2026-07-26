@@ -9,19 +9,26 @@ namespace System.Data.ZanDb;
 delegate string KvUpdater(string current);
 
 /// <summary>
-/// Embedded key/value store: single file + WAL, B+Tree index, LRU page cache
-/// with a hard memory cap, crash-safe atomic commits. Open-and-go facade:
+/// Embedded key/value store: one file, copy-on-write B+Tree index, LRU page
+/// cache with a hard memory cap, atomic commits through alternating meta
+/// pages. Open-and-go facade:
 ///
 ///   KvStore db = KvStore.Open("app.zdb");
 ///   db.Put("user:1", "alice");
 ///   string v = db.Get("user:1");
 ///   db.Close();
 ///
+/// Concurrency is the single-writer / many-reader model: readers never block
+/// and never take a lock, because the pages of the snapshot they are reading
+/// are never modified in place; writers serialise on a cross-process lock, so
+/// several processes (for instance the workers of a web server) may open the
+/// same file safely.
+///
 /// Writes auto-commit. Wrap several writes in Begin()/Commit() to make them
-/// one atomic (and much faster) transaction. Coroutine-safe async variants
-/// (GetAsync/PutAsync/UpdateAtomic) coordinate through a reader/writer lock;
-/// UpdateAtomic runs read-modify-write inside the write critical section so
-/// concurrent increments never lose updates.
+/// one atomic -- and much faster, and much easier on an SSD -- transaction:
+/// inside one transaction a page is copied once no matter how many keys in it
+/// change. Coroutine-safe async variants (GetAsync/PutAsync/UpdateAtomic)
+/// additionally serialise the coroutines of one process.
 /// </summary>
 class KvStore {
     Pager pager;
@@ -35,9 +42,8 @@ class KvStore {
         this.lastError = "";
     }
 
-    /// <summary>Opens (creating if needed) a store with default settings
-    /// (256-page / 1 MB cache; WAL fsynced every commit, main file every
-    /// 16 commits -- crash durability is per commit either way).</summary>
+    /// <summary>Opens (creating if needed) a store with a 256-page (1 MB)
+    /// cache, fsyncing every commit.</summary>
     static KvStore Open(string path) {
         return KvStore.Open(path, 256);
     }
@@ -59,38 +65,123 @@ class KvStore {
 
     string GetError() { return this.lastError; }
 
-    /// <summary>Main-file fsync cadence: 1 = every commit, N = every N
-    /// commits (default 16; the WAL still makes each commit crash-recoverable).</summary>
+    /// <summary>Data-page fsync cadence: 1 = every commit (default), N = every
+    /// N commits. The meta page is always written after the data pages, so a
+    /// larger N risks losing the last commits, never a broken database.</summary>
     void SetSyncEvery(int n) { this.pager.SetSyncEvery(n); }
+
+    /// <summary>Transaction id of the snapshot this handle last read.</summary>
+    int Version() { return this.pager.CommitId(); }
+
+    /// <summary>Pages in the file, and pages on the free list -- the two
+    /// numbers space growth is judged by.</summary>
+    int PageCount() { return this.pager.PageCount(); }
+
+    int FreePages() { return this.pager.FreePages(); }
+
+    /// <summary>Pages written to disk since this handle was opened: the input
+    /// for a write-amplification measurement (pages written vs. bytes of data
+    /// actually changed).</summary>
+    int PageWrites() { return this.pager.PageWrites(); }
 
     // ===== Synchronous core =====
 
+    /// <summary>Pins one snapshot for several reads: everything read until
+    /// EndSnapshot() sees the same version of the database, even while other
+    /// processes commit. Readers take no lock; the cost of a long snapshot is
+    /// that pages it can still see are not reused meanwhile.</summary>
+    void BeginSnapshot() { this.pager.BeginRead(); }
+
+    void EndSnapshot() { this.pager.EndRead(); }
+
     /// <summary>Returns the value, or "" when absent (see Contains).</summary>
     string Get(string key) {
+        this.pager.BeginRead();
         List<string> outv = new List<string>();
-        if (this.tree.Get(key, outv)) { return outv[0]; }
+        bool ok = this.tree.Get(key, outv);
+        this.pager.EndRead();
+        if (ok) { return outv[0]; }
         return "";
     }
 
-    bool Contains(string key) { return this.tree.Contains(key); }
+    bool Contains(string key) {
+        this.pager.BeginRead();
+        bool ok = this.tree.Contains(key);
+        this.pager.EndRead();
+        return ok;
+    }
 
     /// <summary>Inserts or replaces a key. Auto-commits unless inside
     /// Begin()/Commit().</summary>
     void Put(string key, string val) {
+        if (this.txDepth > 0) {
+            this.tree.Put(key, val);
+            return;
+        }
+        if (!this.pager.BeginWrite()) {
+            this.lastError = this.pager.GetError();
+            return;
+        }
         this.tree.Put(key, val);
-        if (this.txDepth == 0) { this.pager.Commit(); }
+        if (!this.pager.Commit()) { this.lastError = this.pager.GetError(); }
     }
 
     /// <summary>Removes a key; true when it existed.</summary>
     bool Delete(string key) {
+        if (this.txDepth > 0) {
+            return this.tree.Delete(key);
+        }
+        if (!this.pager.BeginWrite()) {
+            this.lastError = this.pager.GetError();
+            return false;
+        }
         bool existed = this.tree.Delete(key);
-        if (existed && this.txDepth == 0) { this.pager.Commit(); }
+        if (!this.pager.Commit()) { this.lastError = this.pager.GetError(); }
         return existed;
     }
 
-    /// <summary>Starts a batch: writes accumulate and commit atomically
-    /// together on Commit(). Nestable: only the outermost Commit persists.</summary>
-    void Begin() { this.txDepth = this.txDepth + 1; }
+    /// <summary>Deletes every key with startKey &lt;= key &lt;= endKey
+    /// (endKey "" = to the end) in one transaction; returns how many were
+    /// removed. Leaves that fall entirely inside the range are freed as whole
+    /// pages instead of being rewritten key by key, so dropping a batch costs
+    /// about one page write per tree level -- the path to use when a batch of
+    /// records (a plan, a tenant, a day) is replaced wholesale.</summary>
+    int DeleteRange(string startKey, string endKey) {
+        if (this.txDepth > 0) { return this.tree.DeleteRange(startKey, endKey); }
+        if (!this.pager.BeginWrite()) {
+            this.lastError = this.pager.GetError();
+            return 0;
+        }
+        int n = this.tree.DeleteRange(startKey, endKey);
+        if (!this.pager.Commit()) { this.lastError = this.pager.GetError(); }
+        return n;
+    }
+
+    /// <summary>Deletes every key starting with prefix (see DeleteRange).</summary>
+    int DeletePrefix(string prefix) {
+        if (this.txDepth > 0) { return this.tree.DeletePrefix(prefix); }
+        if (!this.pager.BeginWrite()) {
+            this.lastError = this.pager.GetError();
+            return 0;
+        }
+        int n = this.tree.DeletePrefix(prefix);
+        if (!this.pager.Commit()) { this.lastError = this.pager.GetError(); }
+        return n;
+    }
+
+    /// <summary>Starts a batch: takes the writer lock, accumulates writes and
+    /// commits them atomically on Commit(). Nestable: only the outermost
+    /// Commit persists. Holding a transaction open holds the writer lock, so
+    /// keep batches bounded.</summary>
+    void Begin() {
+        if (this.txDepth == 0) {
+            if (!this.pager.BeginWrite()) {
+                this.lastError = this.pager.GetError();
+                return;
+            }
+        }
+        this.txDepth = this.txDepth + 1;
+    }
 
     /// <summary>Atomically persists everything since the outermost Begin().</summary>
     bool Commit() {
@@ -99,11 +190,21 @@ class KvStore {
         return this.pager.Commit();
     }
 
-    /// <summary>Range scan: startKey <= key <= endKey (endKey "" = to end),
+    /// <summary>Throws away everything written since the outermost Begin();
+    /// the database stays on the previous version.</summary>
+    void Rollback() {
+        this.txDepth = 0;
+        this.pager.Rollback();
+    }
+
+    /// <summary>Range scan: startKey &lt;= key &lt;= endKey (endKey "" = to end),
     /// limit 0 = unlimited. Returns number of entries appended.</summary>
     int Scan(string startKey, string endKey, int limit,
             List<string> outKeys, List<string> outVals) {
-        return this.tree.Scan(startKey, endKey, limit, outKeys, outVals);
+        this.pager.BeginRead();
+        int n = this.tree.Scan(startKey, endKey, limit, outKeys, outVals);
+        this.pager.EndRead();
+        return n;
     }
 
     /// <summary>All keys with the given prefix (e.g. "user:").</summary>
@@ -111,7 +212,7 @@ class KvStore {
             List<string> outKeys, List<string> outVals) {
         List<string> ks = new List<string>();
         List<string> vs = new List<string>();
-        this.tree.Scan(prefix, "", 0, ks, vs);
+        Scan(prefix, "", 0, ks, vs);
         int added = 0;
         int i = 0;
         while (i < ks.Count) {
@@ -127,9 +228,14 @@ class KvStore {
         return added;
     }
 
-    int Count() { return this.tree.Count(); }
+    int Count() {
+        this.pager.BeginRead();
+        int n = this.tree.Count();
+        this.pager.EndRead();
+        return n;
+    }
 
-    /// <summary>Forces everything to stable storage and truncates the WAL.</summary>
+    /// <summary>Forces everything written so far to stable storage.</summary>
     void Checkpoint() { this.pager.Checkpoint(); }
 
     void Close() {
@@ -167,9 +273,11 @@ class KvStore {
     /// stored result.</summary>
     async string UpdateAtomic(string key, KvUpdater fn) {
         await this.rw.EnterWrite();
+        Begin();
         string cur = Get(key);
         string next = fn(cur);
         Put(key, next);
+        Commit();
         this.rw.ExitWrite();
         return next;
     }

@@ -1,0 +1,234 @@
+using System;
+using System.IO;
+using System.Threading;
+
+namespace System.Data.ZanDb;
+
+/// <summary>
+/// Cross-process coordination for one database file, in three parts:
+///
+///   * a writer mutex -- an exclusive lock on a side file ("<db>-lock").
+///     The operating system drops it when the holder dies, so a crashed
+///     writer never wedges the database (a shared-memory mutex would);
+///   * the last committed transaction id, published in shared memory, so a
+///     reader can tell in ~100 ns whether its cached pages are still current
+///     instead of re-reading the meta page from disk on every lookup;
+///   * a reader table: each process publishes the oldest snapshot it is
+///     currently reading, so the writer knows which freed pages are still
+///     visible to somebody and must not be reused yet (MVCC).
+///
+/// Everything is addressed by hash (SharedTable's ByHash API), so no keys are
+/// formatted and no strings are allocated on the hot path.
+/// </summary>
+class DbRegistry {
+    static int MAX_READERS = 512;
+
+    SharedTable table;
+    string dbName;
+    PageFile lockFile;
+    int slot;              // this process's reader slot, -1 = none
+    int slotHash;
+    int wtxnHash;
+    int slotsHash;
+    int procsHash;
+    int pid;
+    bool locked;
+
+    #if WINDOWS
+    [DllImport("crt", EntryPoint = "_getpid")]
+    static extern int GetPid();
+
+    [DllImport("kernel32", EntryPoint = "OpenProcess")]
+    static extern int OpenProcess(int access, int inherit, int pid);
+
+    [DllImport("kernel32", EntryPoint = "CloseHandle")]
+    static extern int CloseHandle(int handle);
+    #else
+    [DllImport("crt", EntryPoint = "getpid")]
+    static extern int GetPid();
+
+    [DllImport("crt", EntryPoint = "kill")]
+    static extern int KillSignal(int pid, int sig);
+    #endif
+
+    DbRegistry() {
+        this.dbName = "";
+        this.slot = -1;
+        this.locked = false;
+    }
+
+    /// <summary>Derives a shared-memory name from the database path (the file
+    /// name, so all processes opening the same database meet in the same
+    /// registry).</summary>
+    static string NameOf(string path) {
+        string s = path;
+        int i = s.Length - 1;
+        while (i >= 0) {
+            int c = s[i] & 255;
+            if (c == 47 || c == 92 || c == 58) { s = s.Substring(i + 1, s.Length - i - 1); break; }
+            i = i - 1;
+        }
+        return "zandb:" + s;
+    }
+
+    /// <summary>Attaches to (creating on first use) the registry of a
+    /// database file.</summary>
+    static DbRegistry Attach(string path) {
+        DbRegistry r = new DbRegistry();
+        r.dbName = DbRegistry.NameOf(path);
+        r.pid = GetPid();
+
+        SharedTable t = SharedTable.Open(r.dbName);
+        if (!t.IsOpen()) {
+            SharedTable fresh = new SharedTable(r.dbName, DbRegistry.MAX_READERS + 16);
+            fresh.KeySize(16);
+            fresh.ColumnInt("pid");
+            fresh.ColumnInt("txn");
+            if (fresh.Create()) {
+                t = fresh;
+            } else {
+                // Another process created it between Open and Create.
+                t = SharedTable.Open(r.dbName);
+            }
+        }
+        r.table = t;
+        r.wtxnHash = SharedTable.Hash(r.dbName + "#wtxn");
+        r.slotsHash = SharedTable.Hash(r.dbName + "#slots");
+        r.procsHash = SharedTable.Hash(r.dbName + "#procs");
+        r.lockFile = PageFile.Open(path + "-lock");
+        if (r.table.IsOpen()) {
+            r.table.IncrementAt(r.procsHash, "pid", 1);
+        }
+        return r;
+    }
+
+    bool IsShared() { return this.table.IsOpen(); }
+
+    /// <summary>Number of processes that currently have the database open.
+    /// A single-process database can skip snapshot publication entirely.</summary>
+    int Processes() {
+        if (!this.table.IsOpen()) { return 1; }
+        return this.table.GetIntAt(this.procsHash, "pid");
+    }
+
+    /// <summary>Last committed transaction id as published by the writer
+    /// (0 when nothing has been committed since the registry appeared).</summary>
+    int CommittedTxn() {
+        if (!this.table.IsOpen()) { return 0; }
+        return this.table.GetIntAt(this.wtxnHash, "txn");
+    }
+
+    void PublishTxn(int txnid) {
+        if (!this.table.IsOpen()) { return; }
+        this.table.SetIntAt(this.wtxnHash, "txn", txnid);
+    }
+
+    // ===== writer mutex =====
+
+    /// <summary>Blocks until this process owns the single writer slot.</summary>
+    bool LockWrite() {
+        if (this.locked) { return true; }
+        if (!this.lockFile.IsOpen()) { return true; }
+        if (!this.lockFile.LockExclusive()) { return false; }
+        this.locked = true;
+        return true;
+    }
+
+    void UnlockWrite() {
+        if (!this.locked) { return; }
+        this.lockFile.Unlock();
+        this.locked = false;
+    }
+
+    // ===== reader table =====
+
+    int HashOfSlot(int index) {
+        return SharedTable.Hash(this.dbName + "#r" + Convert.ToString(index));
+    }
+
+    bool Alive(int otherPid) {
+        if (otherPid == 0) { return false; }
+        if (otherPid == this.pid) { return true; }
+        #if WINDOWS
+        int h = OpenProcess(1024, 0, otherPid);   // PROCESS_QUERY_LIMITED_INFORMATION
+        if (h == 0) { return false; }
+        CloseHandle(h);
+        return true;
+        #else
+        return KillSignal(otherPid, 0) == 0;
+        #endif
+    }
+
+    /// <summary>Claims a reader slot for this process, reusing the slot of a
+    /// process that has since died. Called once per database handle.</summary>
+    void ClaimSlot() {
+        if (this.slot >= 0 || !this.table.IsOpen()) { return; }
+        int used = this.table.GetIntAt(this.slotsHash, "txn");
+        int i = 0;
+        while (i < used) {
+            int h = HashOfSlot(i);
+            int owner = this.table.GetIntAt(h, "pid");
+            if (!Alive(owner)) {
+                this.table.SetIntAt(h, "txn", 0);
+                this.table.SetIntAt(h, "pid", this.pid);
+                this.slot = i;
+                this.slotHash = h;
+                return;
+            }
+            i = i + 1;
+        }
+        if (used >= DbRegistry.MAX_READERS) { return; }
+        int idx = this.table.IncrementAt(this.slotsHash, "txn", 1) - 1;
+        if (idx >= DbRegistry.MAX_READERS) { return; }
+        this.slot = idx;
+        this.slotHash = HashOfSlot(idx);
+        this.table.SetIntAt(this.slotHash, "txn", 0);
+        this.table.SetIntAt(this.slotHash, "pid", this.pid);
+    }
+
+    /// <summary>Publishes the snapshot this process is reading (0 = idle).
+    /// One shared-memory store, no lock.</summary>
+    void PublishSnapshot(int txnid) {
+        if (this.slot < 0) { return; }
+        this.table.SetIntAt(this.slotHash, "txn", txnid);
+    }
+
+    /// <summary>Oldest snapshot any live process is reading, or 0 when nobody
+    /// is reading. Pages freed by a transaction newer than this must stay
+    /// untouched; everything older can be reused.</summary>
+    int OldestSnapshot() {
+        if (!this.table.IsOpen()) { return 0; }
+        int used = this.table.GetIntAt(this.slotsHash, "txn");
+        if (used > DbRegistry.MAX_READERS) { used = DbRegistry.MAX_READERS; }
+        int oldest = 0;
+        int i = 0;
+        while (i < used) {
+            int h = HashOfSlot(i);
+            int txn = this.table.GetIntAt(h, "txn");
+            if (txn > 0) {
+                int owner = this.table.GetIntAt(h, "pid");
+                if (Alive(owner)) {
+                    if (oldest == 0 || txn < oldest) { oldest = txn; }
+                } else {
+                    this.table.SetIntAt(h, "txn", 0);
+                }
+            }
+            i = i + 1;
+        }
+        return oldest;
+    }
+
+    void Close() {
+        UnlockWrite();
+        if (this.slot >= 0 && this.table.IsOpen()) {
+            this.table.SetIntAt(this.slotHash, "txn", 0);
+            this.table.SetIntAt(this.slotHash, "pid", 0);
+            this.slot = -1;
+        }
+        if (this.table.IsOpen()) {
+            this.table.IncrementAt(this.procsHash, "pid", -1);
+            this.table.Close();
+        }
+        this.lockFile.Close();
+    }
+}

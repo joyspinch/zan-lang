@@ -14,6 +14,7 @@ namespace System.Data.ZanDb;
 ///   m:{name}:keys                    field-name dictionary (JSON array)
 ///   m:{name}:seq                     last assigned id
 ///   m:{name}:idx                     comma list of indexed fields
+///   m:{name}:idxpos:{field}          batch index build cursor (absent = built)
 ///   i:{name}:{field}:{value}\t{id}   secondary index entry -> id
 /// Ids are zero-padded so B+Tree order == insertion order, making FindAll
 /// and range iteration sequential page reads.
@@ -25,12 +26,17 @@ class Collection {
     List<string> indexedFields;
     List<string> keyDict;
     bool keyDictDirty;
+    int metaVersion;
+
+    /// <summary>Documents indexed per transaction by the batch index build.</summary>
+    static int INDEX_BATCH = 500;
 
     Collection() {
         this.name = "";
         this.indexedFields = new List<string>();
         this.keyDict = new List<string>();
         this.keyDictDirty = false;
+        this.metaVersion = 0 - 1;
     }
 
     static Collection Attach(KvStore kv, AsyncRwLock rw, string name) {
@@ -40,7 +46,26 @@ class Collection {
         c.name = name;
         c.LoadIndexMeta();
         c.LoadKeyDict();
+        c.metaVersion = kv.Version();
         return c;
+    }
+
+    /// <summary>Re-reads the cached metadata (field-name dictionary, index
+    /// list) when the database moved to a newer version, i.e. when another
+    /// process committed. Both are needed before touching documents: the
+    /// dictionary decodes and encodes object keys, so a stale copy would
+    /// decode a peer's document with the wrong field names and reuse its ids
+    /// for different names. Cheap: one version compare, and two reads only
+    /// when something actually changed.</summary>
+    void SyncMeta() {
+        int v = this.kv.Version();
+        if (v == this.metaVersion) { return; }
+        // Never reload on top of dictionary entries that are not on disk yet
+        // (mid-encode inside a transaction) -- they would be lost.
+        if (this.keyDictDirty) { return; }
+        this.metaVersion = v;
+        LoadIndexMeta();
+        LoadKeyDict();
     }
 
     string Name() { return this.name; }
@@ -65,6 +90,10 @@ class Collection {
 
     string KeysMetaKey() {
         return "m:" + this.name + ":keys";
+    }
+
+    string IdxPosKey(string field) {
+        return "m:" + this.name + ":idxpos:" + field;
     }
 
     string IdxKey(string field, string val, int id) {
@@ -372,6 +401,7 @@ class Collection {
     /// (also written into the document).</summary>
     int Insert(JsonValue doc) {
         this.kv.Begin();
+        SyncMeta();
         int id = NextId();
         doc.Set("_id", JsonValue.NewNum(Convert.ToString(id)));
         this.kv.Put(DocKey(id), EncodeDoc(doc));
@@ -384,6 +414,7 @@ class Collection {
     /// batch). Returns the first assigned id.</summary>
     int InsertBulk(List<JsonValue> docs) {
         this.kv.Begin();
+        SyncMeta();
         int first = 0;
         int i = 0;
         while (i < docs.Count) {
@@ -400,10 +431,15 @@ class Collection {
 
     /// <summary>Returns the document, or null when absent.</summary>
     JsonValue FindById(int id) {
+        this.kv.BeginSnapshot();
+        SyncMeta();
         string body = this.kv.Get(DocKey(id));
-        if (body.Length == 0) { return null; }
-        JsonValue doc = DecodeDoc(body);
-        doc.Set("_id", JsonValue.NewNum(Convert.ToString(id)));
+        JsonValue doc = null;
+        if (body.Length > 0) {
+            doc = DecodeDoc(body);
+            doc.Set("_id", JsonValue.NewNum(Convert.ToString(id)));
+        }
+        this.kv.EndSnapshot();
         return doc;
     }
 
@@ -413,6 +449,7 @@ class Collection {
     bool Update(int id, JsonValue doc) {
         if (!this.kv.Contains(DocKey(id))) { return false; }
         this.kv.Begin();
+        SyncMeta();
         if (this.indexedFields.Count > 0) { RemoveIndexEntries(id, FindById(id)); }
         doc.Set("_id", JsonValue.NewNum(Convert.ToString(id)));
         this.kv.Put(DocKey(id), EncodeDoc(doc));
@@ -425,6 +462,7 @@ class Collection {
     /// sequence past id so later inserts cannot collide.</summary>
     void Upsert(int id, JsonValue doc) {
         this.kv.Begin();
+        SyncMeta();
         string cur = this.kv.Get(SeqKey());
         int seq = 0;
         if (cur.Length > 0) { seq = Convert.ToInt(cur); }
@@ -440,6 +478,7 @@ class Collection {
 
     bool DeleteById(int id) {
         this.kv.Begin();
+        SyncMeta();
         if (this.indexedFields.Count > 0) { RemoveIndexEntries(id, FindById(id)); }
         bool existed = this.kv.Delete(DocKey(id));
         this.kv.Commit();
@@ -448,39 +487,77 @@ class Collection {
 
     // ===== Secondary indexes =====
 
-    /// <summary>Creates (or rebuilds) a secondary index on a field, indexing
-    /// existing documents. Maintained automatically by later writes.</summary>
-    void EnsureIndex(string field) {
-        bool known = false;
+    void PersistIndexMeta() {
+        string meta = "";
         int i = 0;
         while (i < this.indexedFields.Count) {
-            if (this.indexedFields[i] == field) { known = true; }
+            if (i > 0) { meta = meta + ","; }
+            meta = meta + this.indexedFields[i];
             i = i + 1;
         }
+        this.kv.Put(IdxMetaKey(), meta);
+    }
+
+    /// <summary>Creates (or rebuilds) a secondary index on a field, indexing
+    /// existing documents in bounded batches. Maintained automatically by
+    /// later writes. Resumes an interrupted build instead of restarting
+    /// it.</summary>
+    void EnsureIndex(string field) {
+        EnsureIndex(field, Collection.INDEX_BATCH);
+    }
+
+    /// <summary>EnsureIndex with an explicit batch size (documents per
+    /// transaction).</summary>
+    void EnsureIndex(string field, int batchSize) {
+        bool done = false;
+        while (!done) { done = BuildIndexStep(field, batchSize); }
+    }
+
+    /// <summary>Indexes the next batch of documents, one transaction per call,
+    /// and returns true once the whole collection is covered.
+    ///
+    /// Building an index over a large collection in a single transaction pins
+    /// every touched page until the commit and holds the cross-process writer
+    /// lock for the whole build; batching bounds both. The cursor
+    /// (m:{name}:idxpos:{field}) is part of the same commit as the entries it
+    /// covers, so a crash or a kill mid-build loses nothing and the next call
+    /// picks up where the last commit left off.
+    ///
+    /// The field joins the index list in the first batch, so concurrent writers
+    /// (including other processes) already maintain entries for documents the
+    /// build has not reached; those writes and the build agree because both
+    /// derive the entry from the same document. Until the build finishes,
+    /// IndexReady is false and FindByIndex falls back to a scan, so a partial
+    /// index never yields partial results.</summary>
+    bool BuildIndexStep(string field, int batchSize) {
+        if (batchSize <= 0) { batchSize = Collection.INDEX_BATCH; }
         this.kv.Begin();
-        if (!known) {
+        SyncMeta();
+        if (!HasIndex(field)) {
             this.indexedFields.Add(field);
-            string meta = "";
-            i = 0;
-            while (i < this.indexedFields.Count) {
-                if (i > 0) { meta = meta + ","; }
-                meta = meta + this.indexedFields[i];
-                i = i + 1;
-            }
-            this.kv.Put(IdxMetaKey(), meta);
+            PersistIndexMeta();
         }
-        List<JsonValue> all = FindAll();
-        i = 0;
-        while (i < all.Count) {
-            JsonValue d = all[i];
+        int from = 0;
+        string cursor = this.kv.Get(IdxPosKey(field));
+        if (cursor.Length > 0) { from = Collection.ParseI64(cursor) + 1; }
+        List<JsonValue> batch = FindRange(from, 0, batchSize);
+        int last = from;
+        int i = 0;
+        while (i < batch.Count) {
+            JsonValue d = batch[i];
+            int id = d.Int("_id", 0);
             if (d.Has(field)) {
-                int id = d.Int("_id", 0);
                 this.kv.Put(IdxKey(field, d.Get(field).AsString(""), id),
                     Convert.ToString(id));
             }
+            if (id > last) { last = id; }
             i = i + 1;
         }
+        bool done = batch.Count < batchSize;
+        if (done) { this.kv.Delete(IdxPosKey(field)); }
+        else { this.kv.Put(IdxPosKey(field), Convert.ToString(last)); }
         this.kv.Commit();
+        return done;
     }
 
     bool HasIndex(string field) {
@@ -492,19 +569,43 @@ class Collection {
         return false;
     }
 
+    /// <summary>True when the field is indexed and its batch build has
+    /// finished, i.e. when the index covers every document.</summary>
+    bool IndexReady(string field) {
+        this.kv.BeginSnapshot();
+        SyncMeta();
+        bool ready = HasIndex(field) && !this.kv.Contains(IdxPosKey(field));
+        this.kv.EndSnapshot();
+        return ready;
+    }
+
     /// <summary>Index lookup: documents whose field equals val (string form),
-    /// via the secondary index -- no full scan.</summary>
+    /// via the secondary index -- no full scan. Falls back to a scan while an
+    /// index build is still running, so the answer is always complete.</summary>
     List<JsonValue> FindByIndex(string field, string val) {
-        List<string> ks = new List<string>();
-        List<string> vs = new List<string>();
-        this.kv.ScanPrefix("i:" + this.name + ":" + field + ":" + val + "\t", 0, ks, vs);
+        this.kv.BeginSnapshot();
+        SyncMeta();
         List<JsonValue> docs = new List<JsonValue>();
-        int i = 0;
-        while (i < vs.Count) {
-            JsonValue d = FindById(Convert.ToInt(vs[i]));
-            if (d != null) { docs.Add(d); }
-            i = i + 1;
+        if (HasIndex(field) && !this.kv.Contains(IdxPosKey(field))) {
+            List<string> ks = new List<string>();
+            List<string> vs = new List<string>();
+            this.kv.ScanPrefix("i:" + this.name + ":" + field + ":" + val + "\t", 0, ks, vs);
+            int i = 0;
+            while (i < vs.Count) {
+                JsonValue d = FindById(Collection.ParseI64(vs[i]));
+                if (d != null) { docs.Add(d); }
+                i = i + 1;
+            }
+        } else {
+            List<JsonValue> all = FindRange(0, 0, 0);
+            int i = 0;
+            while (i < all.Count) {
+                JsonValue d = all[i];
+                if (d.Has(field) && d.Get(field).AsString("") == val) { docs.Add(d); }
+                i = i + 1;
+            }
         }
+        this.kv.EndSnapshot();
         return docs;
     }
 
@@ -523,6 +624,8 @@ class Collection {
     /// <summary>Documents with fromId <= _id <= toId (0 = unbounded),
     /// limit 0 = unlimited, in id order.</summary>
     List<JsonValue> FindRange(int fromId, int toId, int limit) {
+        this.kv.BeginSnapshot();
+        SyncMeta();
         string lo = DocKey(fromId);
         string hi = "";
         if (toId > 0) { hi = DocKey(toId); }
@@ -540,6 +643,7 @@ class Collection {
             }
             i = i + 1;
         }
+        this.kv.EndSnapshot();
         return docs;
     }
 

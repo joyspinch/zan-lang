@@ -110,6 +110,41 @@ class Program {
         Check("combo", combo.Count == 3 && combo[0].Str("name", "") == "henry"
             && combo[2].Str("name", "") == "eve");
 
+        // 8. Batch index build: one transaction per batch, resumable, and the
+        // half-built index never answers a lookup.
+        Collection big = db2.GetCollection("big");
+        List<JsonValue> rows = new List<JsonValue>();
+        int r = 0;
+        while (r < 250) {
+            JsonValue d = JsonValue.NewObject();
+            d.Put("g", JsonValue.NewStr("g" + Convert.ToString(r % 5)));
+            d.Put("n", JsonValue.NewNum(Convert.ToString(r)));
+            rows.Add(d);
+            r = r + 1;
+        }
+        big.InsertBulk(rows);
+        Check("batch-step-partial", !big.BuildIndexStep("g", 100));
+        Check("batch-registered-early", big.HasIndex("g"));
+        Check("batch-not-ready", !big.IndexReady("g"));
+        // A document inserted while the build is in flight is indexed by the
+        // insert itself, and the pending build does not answer from the
+        // incomplete index -- both lookups see all 50 matching documents.
+        JsonValue extra = JsonValue.NewObject();
+        extra.Put("g", JsonValue.NewStr("g0"));
+        extra.Put("n", JsonValue.NewNum("250"));
+        big.Insert(extra);
+        Check("batch-partial-lookup-complete", big.FindByIndex("g", "g0").Count == 51);
+        Check("batch-step-resumes", !big.BuildIndexStep("g", 100));
+        Check("batch-step-finishes", big.BuildIndexStep("g", 100));
+        Check("batch-ready", big.IndexReady("g"));
+        Check("batch-index-complete", big.FindByIndex("g", "g0").Count == 51
+            && big.FindByIndex("g", "g4").Count == 50);
+        Check("batch-index-other-values", big.FindByIndex("g", "g1").Count == 50);
+        // Nothing to index: an empty collection settles in a single step.
+        Collection none = db2.GetCollection("none");
+        Check("batch-empty-collection", none.BuildIndexStep("z", 100)
+            && none.IndexReady("z"));
+
         db2.Close();
         File.Delete(path);
         File.Delete(path + "-wal");
