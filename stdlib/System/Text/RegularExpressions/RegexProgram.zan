@@ -1,0 +1,769 @@
+using System;
+
+namespace System.Text.RegularExpressions;
+
+/// <summary>
+/// The compiled form of a pattern, and the engine that runs it: a pattern is
+/// parsed into a small instruction program (Thompson-style: Char / Any /
+/// Class / Split / Jmp / Save / assertions) which a backtracking interpreter
+/// executes against the input.
+///
+/// Instructions live in three parallel int lists (op / x / y) so no per-node
+/// object is allocated per character of the pattern, and the interpreter reads
+/// the subject through a byte buffer rather than Substring, which keeps the
+/// inner loop to integer compares.
+///
+/// This is an implementation detail of <see cref="Regex"/>; use that instead.
+/// Supported syntax: literals, `.`, character classes with ranges and
+/// negation, `\d \D \w \W \s \S \b \B` and escaped metacharacters, groups
+/// `( )` and `(?: )`, alternation `|`, the quantifiers `* + ? {n} {n,} {n,m}`
+/// each with a lazy `?` form, the anchors `^ $`, and backreferences `\1`-`\9`.
+/// </summary>
+class RegexProgram {
+    // opcodes
+    static int OpChar() { return 1; }
+    static int OpAny() { return 2; }
+    static int OpClass() { return 3; }
+    static int OpMatch() { return 4; }
+    static int OpJmp() { return 5; }
+    static int OpSplit() { return 6; }
+    static int OpSave() { return 7; }
+    static int OpBol() { return 8; }
+    static int OpEol() { return 9; }
+    static int OpWordB() { return 10; }
+    static int OpBackref() { return 11; }
+
+    List<int> op;
+    List<int> ax;
+    List<int> ay;
+
+    // character classes: ranges of class c are clsLo/clsHi[clsStart[c] ..
+    // clsStart[c] + clsCount[c]), negated when clsNeg[c] == 1
+    List<int> clsLo;
+    List<int> clsHi;
+    List<int> clsStart;
+    List<int> clsCount;
+    List<int> clsNeg;
+
+    int groups;         // capturing groups, group 0 being the whole match
+    bool ignoreCase;
+    string pattern;
+    string error;
+
+    // parse cursor over the pattern's bytes
+    nint pbuf;
+    int plen;
+    int ppos;
+
+    RegexProgram() {
+        this.op = new List<int>();
+        this.ax = new List<int>();
+        this.ay = new List<int>();
+        this.clsLo = new List<int>();
+        this.clsHi = new List<int>();
+        this.clsStart = new List<int>();
+        this.clsCount = new List<int>();
+        this.clsNeg = new List<int>();
+        this.groups = 1;
+        this.ignoreCase = false;
+        this.pattern = "";
+        this.error = "";
+        this.pbuf = 0;
+        this.plen = 0;
+        this.ppos = 0;
+    }
+
+    /// <summary>Parses `pattern`. Check <see cref="Error"/> afterwards: it is
+    /// "" for a usable program and carries the reason otherwise.</summary>
+    static RegexProgram Compile(string pattern, bool ignoreCase) {
+        RegexProgram p = new RegexProgram();
+        p.pattern = pattern;
+        p.ignoreCase = ignoreCase;
+        p.plen = pattern.Length;
+        p.pbuf = NativeMemory.Alloc(p.plen + 1);
+        if (p.plen > 0) {
+            NativeMemory.PutString(p.pbuf, 0, pattern, p.plen);
+        }
+        // group 0 spans the whole match
+        p.Emit(RegexProgram.OpSave(), 0, 0);
+        p.ParseAlt();
+        if (p.error.Length == 0 && p.ppos < p.plen) {
+            p.error = "unexpected ')' at " + p.ppos;
+        }
+        p.Emit(RegexProgram.OpSave(), 1, 0);
+        p.Emit(RegexProgram.OpMatch(), 0, 0);
+        NativeMemory.Free(p.pbuf);
+        p.pbuf = 0;
+        return p;
+    }
+
+    /// <summary>"" when the pattern parsed, else why it did not.</summary>
+    string Error() { return this.error; }
+
+    /// <summary>Number of capturing groups, including group 0.</summary>
+    int GroupCount() { return this.groups; }
+
+    /// <summary>The pattern this program was compiled from.</summary>
+    string Pattern() { return this.pattern; }
+
+    // ---- emit helpers ----------------------------------------------------
+
+    int Emit(int o, int x, int y) {
+        this.op.Add(o);
+        this.ax.Add(x);
+        this.ay.Add(y);
+        return this.op.Count - 1;
+    }
+
+    int Here() { return this.op.Count; }
+
+    /// <summary>Appends a copy of the instructions in [from, to), relocating
+    /// the jump targets. Used to expand `{n,m}` into repeated copies.</summary>
+    int CopyRange(int from, int to) {
+        int delta = this.op.Count - from;
+        int i = from;
+        while (i < to) {
+            int o = this.op[i];
+            int x = this.ax[i];
+            int y = this.ay[i];
+            if (o == RegexProgram.OpJmp() || o == RegexProgram.OpSplit()) {
+                x = x + delta;
+                if (o == RegexProgram.OpSplit()) { y = y + delta; }
+            }
+            this.Emit(o, x, y);
+            i = i + 1;
+        }
+        return delta;
+    }
+
+    // ---- pattern cursor --------------------------------------------------
+
+    int PeekAt(int i) {
+        if (i < 0 || i >= this.plen) { return -1; }
+        return NativeMemory.GetByte(this.pbuf, i);
+    }
+
+    int Peek() { return this.PeekAt(this.ppos); }
+
+    int Next() {
+        int c = this.Peek();
+        this.ppos = this.ppos + 1;
+        return c;
+    }
+
+    // ---- parser ----------------------------------------------------------
+
+    /// <summary>alt := seq ('|' seq)*  ->  split left, right ; left ; jmp end ;
+    /// right ; end. Repeated alternatives nest to the left.</summary>
+    void ParseAlt() {
+        int start = this.Here();
+        this.ParseSeq();
+        while (this.Peek() == 124 && this.error.Length == 0) {      // '|'
+            this.ppos = this.ppos + 1;
+            int len = this.Here() - start;
+            this.Shift(start, len, 1);
+            int jmpOut = this.Emit(RegexProgram.OpJmp(), 0, 0);
+            this.op[start] = RegexProgram.OpSplit();
+            this.ax[start] = start + 1;
+            this.ay[start] = this.Here();
+            this.ParseSeq();
+            this.ax[jmpOut] = this.Here();
+        }
+    }
+
+    /// <summary>seq := term*</summary>
+    void ParseSeq() {
+        bool more = true;
+        while (more) {
+            int c = this.Peek();
+            if (c < 0 || c == 124 || c == 41) {   // end, '|' or ')'
+                more = false;
+            } else {
+                this.ParseTerm();
+                if (this.error.Length > 0) { more = false; }
+            }
+        }
+    }
+
+    /// <summary>term := atom quantifier?</summary>
+    void ParseTerm() {
+        int start = this.Here();
+        this.ParseAtom();
+        if (this.error.Length > 0) { return; }
+        this.ParseQuantifier(start);
+    }
+
+    void ParseQuantifier(int start) {
+        int c = this.Peek();
+        int min = -1;
+        int max = -1;
+        if (c == 42) {                        // '*'
+            this.ppos = this.ppos + 1;
+            min = 0;
+            max = -1;
+        } else if (c == 43) {                 // '+'
+            this.ppos = this.ppos + 1;
+            min = 1;
+            max = -1;
+        } else if (c == 63) {                 // '?'
+            this.ppos = this.ppos + 1;
+            min = 0;
+            max = 1;
+        } else if (c == 123) {                // '{'
+            int save = this.ppos;
+            this.ppos = this.ppos + 1;
+            int lo = this.ParseInt();
+            if (lo < 0) {
+                this.ppos = save;
+                return;
+            }
+            int hi = lo;
+            if (this.Peek() == 44) {          // ','
+                this.ppos = this.ppos + 1;
+                if (this.Peek() == 125) {     // '}' -> {n,}
+                    hi = -1;
+                } else {
+                    hi = this.ParseInt();
+                    if (hi < 0) {
+                        this.ppos = save;
+                        return;
+                    }
+                }
+            }
+            if (this.Peek() != 125) {
+                this.ppos = save;
+                return;
+            }
+            this.ppos = this.ppos + 1;
+            min = lo;
+            max = hi;
+        } else {
+            return;
+        }
+        bool lazy = false;
+        if (this.Peek() == 63) {              // '?' -> lazy
+            this.ppos = this.ppos + 1;
+            lazy = true;
+        }
+        this.ApplyQuantifier(start, min, max, lazy);
+    }
+
+    int ParseInt() {
+        int v = -1;
+        int c = this.Peek();
+        while (c >= 48 && c <= 57) {
+            if (v < 0) { v = 0; }
+            v = v * 10 + (c - 48);
+            this.ppos = this.ppos + 1;
+            c = this.Peek();
+        }
+        return v;
+    }
+
+    /// <summary>Rewrites the atom already emitted at [start, end) into its
+    /// repeated form.</summary>
+    void ApplyQuantifier(int start, int min, int max, bool lazy) {
+        int end = this.Here();
+        int len = end - start;
+        if (len <= 0) {
+            this.error = "quantifier with nothing to repeat at " + this.ppos;
+            return;
+        }
+        if (min == 0 && max == -1) {
+            this.StarAt(start, len, lazy);
+            return;
+        }
+        if (min == 1 && max == -1) {
+            // body ; split body, out
+            int sp = this.Emit(RegexProgram.OpSplit(), 0, 0);
+            if (lazy) {
+                this.ax[sp] = sp + 1;
+                this.ay[sp] = start;
+            } else {
+                this.ax[sp] = start;
+                this.ay[sp] = sp + 1;
+            }
+            return;
+        }
+        if (min == 0 && max == 1) {
+            this.OptionalAt(start, len, lazy);
+            return;
+        }
+        // {n,m}: keep the copy already emitted as the first repetition
+        if (min == 0) {
+            // drop the emitted body; re-add it as optional copies
+            List<int> bo = new List<int>();
+            List<int> bx = new List<int>();
+            List<int> by = new List<int>();
+            int i = 0;
+            while (i < len) {
+                bo.Add(this.op[start + i]);
+                bx.Add(this.ax[start + i]);
+                by.Add(this.ay[start + i]);
+                i = i + 1;
+            }
+            this.Truncate(start);
+            int reps = max;
+            if (reps < 0) { reps = 1; }
+            int r = 0;
+            while (r < reps) {
+                int s = this.Here();
+                this.AppendBody(bo, bx, by, s - start);
+                this.OptionalAt(s, len, lazy);
+                r = r + 1;
+            }
+            return;
+        }
+        int copies = min - 1;
+        int k = 0;
+        while (k < copies) {
+            this.CopyRange(start, start + len);
+            k = k + 1;
+        }
+        if (max == -1) {
+            int s = this.Here();
+            this.CopyRange(start, start + len);
+            this.StarAt(s, len, lazy);
+        } else {
+            int extra = max - min;
+            int e = 0;
+            while (e < extra) {
+                int s = this.Here();
+                this.CopyRange(start, start + len);
+                this.OptionalAt(s, len, lazy);
+                e = e + 1;
+            }
+        }
+    }
+
+    void AppendBody(List<int> bo, List<int> bx, List<int> by, int delta) {
+        int i = 0;
+        while (i < bo.Count) {
+            int o = bo[i];
+            int x = bx[i];
+            int y = by[i];
+            if (o == RegexProgram.OpJmp() || o == RegexProgram.OpSplit()) {
+                x = x + delta;
+                if (o == RegexProgram.OpSplit()) { y = y + delta; }
+            }
+            this.Emit(o, x, y);
+            i = i + 1;
+        }
+    }
+
+    void Truncate(int n) {
+        while (this.op.Count > n) {
+            this.op.RemoveAt(this.op.Count - 1);
+            this.ax.RemoveAt(this.ax.Count - 1);
+            this.ay.RemoveAt(this.ay.Count - 1);
+        }
+    }
+
+    /// <summary>Turns the body at [start, start+len) into `body*`:
+    /// split body,out ; body ; jmp split.</summary>
+    void StarAt(int start, int len, bool lazy) {
+        this.Shift(start, len, 1);
+        int jmp = this.Emit(RegexProgram.OpJmp(), start, 0);
+        int outPc = this.Here();
+        this.op[start] = RegexProgram.OpSplit();
+        if (lazy) {
+            this.ax[start] = outPc;
+            this.ay[start] = start + 1;
+        } else {
+            this.ax[start] = start + 1;
+            this.ay[start] = outPc;
+        }
+    }
+
+    /// <summary>Turns the body at [start, start+len) into `body?`.</summary>
+    void OptionalAt(int start, int len, bool lazy) {
+        this.Shift(start, len, 1);
+        int outPc = this.Here();
+        this.op[start] = RegexProgram.OpSplit();
+        if (lazy) {
+            this.ax[start] = outPc;
+            this.ay[start] = start + 1;
+        } else {
+            this.ax[start] = start + 1;
+            this.ay[start] = outPc;
+        }
+    }
+
+    /// <summary>Makes room for `n` instructions in front of the body at
+    /// [start, start+len), relocating jump targets at or after start.</summary>
+    void Shift(int start, int len, int n) {
+        int i = 0;
+        while (i < n) {
+            this.Emit(RegexProgram.OpJmp(), 0, 0);
+            i = i + 1;
+        }
+        // move the body up by n, from the end so nothing is overwritten
+        i = len - 1;
+        while (i >= 0) {
+            int o = this.op[start + i];
+            int x = this.ax[start + i];
+            int y = this.ay[start + i];
+            if (o == RegexProgram.OpJmp() || o == RegexProgram.OpSplit()) {
+                if (x >= start) { x = x + n; }
+                if (o == RegexProgram.OpSplit() && y >= start) { y = y + n; }
+            }
+            this.op[start + n + i] = o;
+            this.ax[start + n + i] = x;
+            this.ay[start + n + i] = y;
+            i = i - 1;
+        }
+    }
+
+    void ParseAtom() {
+        int c = this.Next();
+        if (c == 40) {                        // '('
+            bool capture = true;
+            if (this.Peek() == 63 && this.PeekAt(this.ppos + 1) == 58) {   // "(?:"
+                this.ppos = this.ppos + 2;
+                capture = false;
+            }
+            int gi = 0;
+            if (capture) {
+                gi = this.groups;
+                this.groups = this.groups + 1;
+                this.Emit(RegexProgram.OpSave(), gi * 2, 0);
+            }
+            this.ParseAlt();
+            if (this.error.Length > 0) { return; }
+            if (this.Peek() != 41) {
+                this.error = "missing ')' at " + this.ppos;
+                return;
+            }
+            this.ppos = this.ppos + 1;
+            if (capture) {
+                this.Emit(RegexProgram.OpSave(), gi * 2 + 1, 0);
+            }
+            return;
+        }
+        if (c == 46) {                        // '.'
+            this.Emit(RegexProgram.OpAny(), 0, 0);
+            return;
+        }
+        if (c == 94) {                        // '^'
+            this.Emit(RegexProgram.OpBol(), 0, 0);
+            return;
+        }
+        if (c == 36) {                        // '$'
+            this.Emit(RegexProgram.OpEol(), 0, 0);
+            return;
+        }
+        if (c == 91) {                        // '['
+            this.ParseClass();
+            return;
+        }
+        if (c == 92) {                        // '\'
+            this.ParseEscape();
+            return;
+        }
+        if (c < 0) {
+            this.error = "unexpected end of pattern";
+            return;
+        }
+        this.Emit(RegexProgram.OpChar(), c, 0);
+    }
+
+    /// <summary>Starts a class and returns its index.</summary>
+    int BeginClass(bool negate) {
+        int ci = this.clsStart.Count;
+        this.clsStart.Add(this.clsLo.Count);
+        this.clsCount.Add(0);
+        int n = 0;
+        if (negate) { n = 1; }
+        this.clsNeg.Add(n);
+        return ci;
+    }
+
+    void AddRange(int ci, int lo, int hi) {
+        this.clsLo.Add(lo);
+        this.clsHi.Add(hi);
+        this.clsCount[ci] = this.clsCount[ci] + 1;
+    }
+
+    /// <summary>Adds the ranges of a `\d \w \s` shorthand (upper case = the
+    /// complement, which only makes sense as a whole class).</summary>
+    void AddShorthand(int ci, int kind) {
+        if (kind == 100) {                    // 'd'
+            this.AddRange(ci, 48, 57);
+        } else if (kind == 119) {              // 'w'
+            this.AddRange(ci, 48, 57);
+            this.AddRange(ci, 65, 90);
+            this.AddRange(ci, 97, 122);
+            this.AddRange(ci, 95, 95);
+        } else if (kind == 115) {              // 's'
+            this.AddRange(ci, 32, 32);
+            this.AddRange(ci, 9, 13);
+        }
+    }
+
+    void ParseClass() {
+        bool negate = false;
+        if (this.Peek() == 94) {              // '^'
+            this.ppos = this.ppos + 1;
+            negate = true;
+        }
+        int ci = this.BeginClass(negate);
+        bool first = true;
+        bool done = false;
+        while (!done) {
+            int c = this.Peek();
+            if (c < 0) {
+                this.error = "missing ']' at " + this.ppos;
+                return;
+            }
+            if (c == 93 && !first) {          // ']'
+                this.ppos = this.ppos + 1;
+                done = true;
+            } else {
+                this.ppos = this.ppos + 1;
+                first = false;
+                if (c == 92) {                // '\'
+                    int e = this.Next();
+                    int lower = e;
+                    if (lower >= 65 && lower <= 90) { lower = lower + 32; }
+                    if (lower == 100 || lower == 119 || lower == 115) {
+                        // a shorthand inside a class: its ranges join this one
+                        // (the negated forms are not expressible this way)
+                        this.AddShorthand(ci, lower);
+                    } else {
+                        int lit = this.EscapeLiteral(e);
+                        this.AddRange(ci, lit, lit);
+                    }
+                } else if (this.Peek() == 45 && this.PeekAt(this.ppos + 1) != 93
+                           && this.PeekAt(this.ppos + 1) >= 0) {
+                    this.ppos = this.ppos + 1;
+                    int hi = this.Next();
+                    if (hi == 92) { hi = this.EscapeLiteral(this.Next()); }
+                    this.AddRange(ci, c, hi);
+                } else {
+                    this.AddRange(ci, c, c);
+                }
+            }
+        }
+        this.Emit(RegexProgram.OpClass(), ci, 0);
+    }
+
+    /// <summary>The byte an escape stands for ("\n" -> 10, "\." -> '.').</summary>
+    int EscapeLiteral(int e) {
+        if (e == 110) { return 10; }          // \n
+        if (e == 114) { return 13; }          // \r
+        if (e == 116) { return 9; }           // \t
+        if (e == 102) { return 12; }          // \f
+        if (e == 118) { return 11; }          // \v
+        if (e == 48) { return 0; }            // \0
+        if (e < 0) { return 92; }
+        return e;
+    }
+
+    void ParseEscape() {
+        int e = this.Next();
+        if (e < 0) {
+            this.error = "trailing backslash";
+            return;
+        }
+        if (e == 100 || e == 119 || e == 115) {          // \d \w \s
+            int ci = this.BeginClass(false);
+            this.AddShorthand(ci, e);
+            this.Emit(RegexProgram.OpClass(), ci, 0);
+            return;
+        }
+        if (e == 68 || e == 87 || e == 83) {             // \D \W \S
+            int ci = this.BeginClass(true);
+            this.AddShorthand(ci, e + 32);
+            this.Emit(RegexProgram.OpClass(), ci, 0);
+            return;
+        }
+        if (e == 98) {                                   // \b
+            this.Emit(RegexProgram.OpWordB(), 1, 0);
+            return;
+        }
+        if (e == 66) {                                   // \B
+            this.Emit(RegexProgram.OpWordB(), 0, 0);
+            return;
+        }
+        if (e >= 49 && e <= 57) {                        // \1 - \9
+            this.Emit(RegexProgram.OpBackref(), e - 48, 0);
+            return;
+        }
+        this.Emit(RegexProgram.OpChar(), this.EscapeLiteral(e), 0);
+    }
+
+    // ---- interpreter -----------------------------------------------------
+
+    static int Fold(int c) {
+        if (c >= 65 && c <= 90) { return c + 32; }
+        return c;
+    }
+
+    static bool IsWordByte(int c) {
+        if (c >= 48 && c <= 57) { return true; }
+        if (c >= 65 && c <= 90) { return true; }
+        if (c >= 97 && c <= 122) { return true; }
+        return c == 95;
+    }
+
+    bool ClassHas(int ci, int c) {
+        int from = this.clsStart[ci];
+        int to = from + this.clsCount[ci];
+        bool hit = false;
+        int i = from;
+        while (i < to) {
+            int lo = this.clsLo[i];
+            int hi = this.clsHi[i];
+            if (c >= lo && c <= hi) { hit = true; }
+            if (this.ignoreCase && !hit) {
+                int f = RegexProgram.Fold(c);
+                int u = f - 32;
+                if ((f >= lo && f <= hi) || (u >= lo && u <= hi)) { hit = true; }
+            }
+            i = i + 1;
+        }
+        if (this.clsNeg[ci] == 1) { return !hit; }
+        return hit;
+    }
+
+    /// <summary>Runs the program from `start`. On success `caps` holds
+    /// 2 * GroupCount() offsets (-1 when the group did not take part) and the
+    /// return value is the end of the match; -1 means no match here.</summary>
+    int RunAt(nint input, int len, int start, List<int> caps) {
+        int slots = this.groups * 2;
+        caps.Clear();
+        int i = 0;
+        while (i < slots) {
+            caps.Add(-1);
+            i = i + 1;
+        }
+        RegexRun run = new RegexRun();
+        run.input = input;
+        run.len = len;
+        run.caps = caps;
+        run.budget = 400000;
+        if (this.Step(run, 0, start)) {
+            return run.end;
+        }
+        return -1;
+    }
+
+    /// <summary>Backtracking interpreter: one recursive call per branch taken.
+    /// `budget` bounds the total steps so a pathological pattern reports "no
+    /// match" instead of running forever.</summary>
+    bool Step(RegexRun run, int pc, int sp) {
+        bool running = true;
+        while (running) {
+            run.budget = run.budget - 1;
+            if (run.budget <= 0) { return false; }
+            int o = this.op[pc];
+            if (o == RegexProgram.OpChar()) {
+                if (sp >= run.len) { return false; }
+                int c = NativeMemory.GetByte(run.input, sp);
+                int want = this.ax[pc];
+                if (c != want) {
+                    if (!this.ignoreCase) { return false; }
+                    if (RegexProgram.Fold(c) != RegexProgram.Fold(want)) { return false; }
+                }
+                pc = pc + 1;
+                sp = sp + 1;
+            } else if (o == RegexProgram.OpAny()) {
+                if (sp >= run.len) { return false; }
+                if (NativeMemory.GetByte(run.input, sp) == 10) { return false; }
+                pc = pc + 1;
+                sp = sp + 1;
+            } else if (o == RegexProgram.OpClass()) {
+                if (sp >= run.len) { return false; }
+                if (!this.ClassHas(this.ax[pc], NativeMemory.GetByte(run.input, sp))) {
+                    return false;
+                }
+                pc = pc + 1;
+                sp = sp + 1;
+            } else if (o == RegexProgram.OpJmp()) {
+                pc = this.ax[pc];
+            } else if (o == RegexProgram.OpSplit()) {
+                if (this.Step(run, this.ax[pc], sp)) { return true; }
+                pc = this.ay[pc];
+            } else if (o == RegexProgram.OpSave()) {
+                int slot = this.ax[pc];
+                int old = run.caps[slot];
+                run.caps[slot] = sp;
+                if (this.Step(run, pc + 1, sp)) { return true; }
+                run.caps[slot] = old;
+                return false;
+            } else if (o == RegexProgram.OpBol()) {
+                if (sp != 0) {
+                    if (NativeMemory.GetByte(run.input, sp - 1) != 10) { return false; }
+                }
+                pc = pc + 1;
+            } else if (o == RegexProgram.OpEol()) {
+                if (sp != run.len) {
+                    if (NativeMemory.GetByte(run.input, sp) != 10) { return false; }
+                }
+                pc = pc + 1;
+            } else if (o == RegexProgram.OpWordB()) {
+                bool before = false;
+                bool after = false;
+                if (sp > 0) {
+                    before = RegexProgram.IsWordByte(NativeMemory.GetByte(run.input, sp - 1));
+                }
+                if (sp < run.len) {
+                    after = RegexProgram.IsWordByte(NativeMemory.GetByte(run.input, sp));
+                }
+                bool boundary = before != after;
+                if (this.ax[pc] == 1) {
+                    if (!boundary) { return false; }
+                } else {
+                    if (boundary) { return false; }
+                }
+                pc = pc + 1;
+            } else if (o == RegexProgram.OpBackref()) {
+                int g = this.ax[pc];
+                int gs = run.caps[g * 2];
+                int ge = run.caps[g * 2 + 1];
+                if (gs < 0 || ge < gs) {
+                    pc = pc + 1;
+                } else {
+                    int n = ge - gs;
+                    if (sp + n > run.len) { return false; }
+                    int k = 0;
+                    while (k < n) {
+                        int a = NativeMemory.GetByte(run.input, gs + k);
+                        int b = NativeMemory.GetByte(run.input, sp + k);
+                        if (a != b) {
+                            if (!this.ignoreCase) { return false; }
+                            if (RegexProgram.Fold(a) != RegexProgram.Fold(b)) { return false; }
+                        }
+                        k = k + 1;
+                    }
+                    pc = pc + 1;
+                    sp = sp + n;
+                }
+            } else {
+                // OpMatch
+                run.end = sp;
+                return true;
+            }
+        }
+        return false;
+    }
+}
+
+/// <summary>One in-flight match: the subject, the capture slots being filled
+/// and the remaining step budget. Separate from RegexProgram so a compiled
+/// pattern stays immutable and can be matched against many inputs.</summary>
+class RegexRun {
+    nint input;
+    int len;
+    List<int> caps;
+    int budget;
+    int end;
+
+    RegexRun() {
+        this.input = 0;
+        this.len = 0;
+        this.caps = null;
+        this.budget = 0;
+        this.end = -1;
+    }
+}

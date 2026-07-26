@@ -1,0 +1,261 @@
+using System;
+
+namespace System.Text.RegularExpressions;
+
+/// <summary>
+/// Regular expressions: search, extract, replace and split.
+///
+///   Regex re = Regex.Compile("(\\w+)=(\\d+)");
+///   Match m = re.Find("port=8080");
+///   string key = m.Group(1);
+///   string text = re.Replace("port=8080", "$2:$1");
+///
+/// A pattern is compiled once (an instruction program, see RegexProgram) and
+/// can then be matched against many inputs. Matching is leftmost-first with
+/// backtracking, as in Perl/.NET: `a|ab` prefers `a`, greedy quantifiers take
+/// as much as they can and give it back as needed, and their lazy `?` forms do
+/// the opposite.
+///
+/// Supported syntax: literals, `.`, classes `[a-z]` / `[^a-z]` with `\d \w \s`
+/// shorthands inside, `\d \D \w \W \s \S \b \B`, escapes for the
+/// metacharacters, groups `( )` and non-capturing `(?: )`, alternation `|`,
+/// quantifiers `* + ? {n} {n,} {n,m}` each with a lazy form, the anchors
+/// `^ $` (which also match at line boundaries), and backreferences `\1`-`\9`.
+///
+/// A malformed pattern throws at compile time. To avoid a runaway on a
+/// pathological pattern the matcher has a step budget: when it is exhausted
+/// the attempt reports "no match" rather than hanging.
+/// </summary>
+class Regex {
+    RegexProgram prog;
+    string pattern;
+
+    Regex() {
+        this.prog = null;
+        this.pattern = "";
+    }
+
+    /// <summary>Compiles `pattern`. Throws ArgumentException when it is
+    /// malformed.</summary>
+    static Regex Compile(string pattern) {
+        return Regex.CompileOptions(pattern, false);
+    }
+
+    /// <summary>Compiles `pattern`, optionally matching ASCII letters
+    /// case-insensitively.</summary>
+    static Regex CompileOptions(string pattern, bool ignoreCase) {
+        RegexProgram p = RegexProgram.Compile(pattern, ignoreCase);
+        if (p.Error().Length > 0) {
+            // a throw does not unwind this frame's locals, so drop the failed
+            // program before leaving
+            string why = p.Error();
+            p = null;
+            throw new ArgumentException("Invalid regular expression '" + pattern
+                                        + "': " + why);
+        }
+        Regex re = new Regex();
+        re.prog = p;
+        re.pattern = pattern;
+        return re;
+    }
+
+    /// <summary>The reason `pattern` is malformed, or "" when it compiles.
+    /// Lets a caller check a pattern typed by a user without catching.</summary>
+    static string Validate(string pattern) {
+        RegexProgram p = RegexProgram.Compile(pattern, false);
+        return p.Error();
+    }
+
+    /// <summary>The pattern this instance was compiled from.</summary>
+    string Pattern() { return this.pattern; }
+
+    /// <summary>Number of capturing groups, group 0 included.</summary>
+    int GroupCount() { return this.prog.GroupCount(); }
+
+    /// <summary>True when the pattern matches anywhere in `input`.</summary>
+    bool IsMatch(string input) {
+        return this.FindFrom(input, 0).Success();
+    }
+
+    /// <summary>The leftmost match, or a failed Match.</summary>
+    Match Find(string input) {
+        return this.FindFrom(input, 0);
+    }
+
+    /// <summary>The leftmost match at or after `start`.</summary>
+    Match FindFrom(string input, int start) {
+        int len = input.Length;
+        if (start < 0) { start = 0; }
+        if (start > len) { return Match.Failure(); }
+        nint buf = NativeMemory.Alloc(len + 1);
+        if (len > 0) {
+            NativeMemory.PutString(buf, 0, input, len);
+        }
+        List<int> caps = new List<int>();
+        Match result = Match.Failure();
+        int at = start;
+        bool done = false;
+        while (!done) {
+            if (this.prog.RunAt(buf, len, at, caps) >= 0) {
+                result = Match.FromCaps(input, caps, this.prog.GroupCount());
+                done = true;
+            } else if (at >= len) {
+                done = true;
+            } else {
+                at = at + 1;
+            }
+        }
+        NativeMemory.Free(buf);
+        return result;
+    }
+
+    /// <summary>Every non-overlapping match, left to right. An empty match
+    /// advances one byte so the scan always terminates.</summary>
+    List<Match> Matches(string input) {
+        List<Match> all = new List<Match>();
+        int at = 0;
+        int len = input.Length;
+        bool done = false;
+        while (!done) {
+            Match m = this.FindFrom(input, at);
+            if (!m.Success()) {
+                done = true;
+            } else {
+                all.Add(m);
+                int next = m.Index() + m.Length();
+                if (m.Length() == 0) { next = next + 1; }
+                at = next;
+                if (at > len) { done = true; }
+            }
+        }
+        return all;
+    }
+
+    /// <summary>Number of non-overlapping matches.</summary>
+    int Count(string input) {
+        return this.Matches(input).Count;
+    }
+
+    /// <summary>Replaces every match. `$0`-`$9` in `replacement` stand for the
+    /// matched text and the groups, `$$` for a literal '$'.</summary>
+    string Replace(string input, string replacement) {
+        List<Match> all = this.Matches(input);
+        StringBuilder sb = new StringBuilder();
+        int at = 0;
+        int i = 0;
+        while (i < all.Count) {
+            Match m = all[i];
+            if (m.Index() > at) {
+                sb.Append(input.Substring(at, m.Index() - at));
+            }
+            sb.Append(Regex.Expand(replacement, m));
+            at = m.Index() + m.Length();
+            i = i + 1;
+        }
+        if (at < input.Length) {
+            sb.Append(input.Substring(at, input.Length - at));
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>Replaces the first match only.</summary>
+    string ReplaceFirst(string input, string replacement) {
+        Match m = this.Find(input);
+        if (!m.Success()) { return input; }
+        StringBuilder sb = new StringBuilder();
+        sb.Append(input.Substring(0, m.Index()));
+        sb.Append(Regex.Expand(replacement, m));
+        int at = m.Index() + m.Length();
+        if (at < input.Length) {
+            sb.Append(input.Substring(at, input.Length - at));
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>Substitutes `$0`-`$9` and `$$` in a replacement string.</summary>
+    static string Expand(string replacement, Match m) {
+        StringBuilder sb = new StringBuilder();
+        int i = 0;
+        while (i < replacement.Length) {
+            string c = replacement.Substring(i, 1);
+            if (c == "$" && i + 1 < replacement.Length) {
+                string d = replacement.Substring(i + 1, 1);
+                if (d == "$") {
+                    sb.Append("$");
+                    i = i + 2;
+                } else if (Regex.IsDigit(d)) {
+                    sb.Append(m.Group(Regex.DigitValue(d)));
+                    i = i + 2;
+                } else {
+                    sb.Append(c);
+                    i = i + 1;
+                }
+            } else {
+                sb.Append(c);
+                i = i + 1;
+            }
+        }
+        return sb.ToString();
+    }
+
+    static int DigitValue(string d) {
+        int i = 0;
+        string digits = "0123456789";
+        while (i < 10) {
+            if (digits.Substring(i, 1) == d) { return i; }
+            i = i + 1;
+        }
+        return 0;
+    }
+
+    static bool IsDigit(string d) {
+        return d == "0" || d == "1" || d == "2" || d == "3" || d == "4"
+            || d == "5" || d == "6" || d == "7" || d == "8" || d == "9";
+    }
+
+    /// <summary>Splits `input` around every match. Empty matches are skipped,
+    /// so a pattern that can match nothing cannot explode the result.</summary>
+    List<string> Split(string input) {
+        List<string> parts = new List<string>();
+        List<Match> all = this.Matches(input);
+        int at = 0;
+        int i = 0;
+        while (i < all.Count) {
+            Match m = all[i];
+            if (m.Length() > 0) {
+                parts.Add(input.Substring(at, m.Index() - at));
+                at = m.Index() + m.Length();
+            }
+            i = i + 1;
+        }
+        parts.Add(input.Substring(at, input.Length - at));
+        return parts;
+    }
+
+    /// <summary>One-shot match without keeping the compiled pattern.</summary>
+    static bool Matched(string input, string pattern) {
+        return Regex.Compile(pattern).IsMatch(input);
+    }
+
+    /// <summary>One-shot replace without keeping the compiled pattern.</summary>
+    static string Replaced(string input, string pattern, string replacement) {
+        return Regex.Compile(pattern).Replace(input, replacement);
+    }
+
+    /// <summary>Escapes the metacharacters in `text` so it matches
+    /// literally.</summary>
+    static string Escape(string text) {
+        string meta = "\\.^$|()[]{}*+?";
+        StringBuilder sb = new StringBuilder();
+        int i = 0;
+        while (i < text.Length) {
+            string c = text.Substring(i, 1);
+            if (meta.Contains(c)) {
+                sb.Append("\\");
+            }
+            sb.Append(c);
+            i = i + 1;
+        }
+        return sb.ToString();
+    }
+}
