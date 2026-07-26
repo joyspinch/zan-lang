@@ -304,6 +304,9 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         if (arc_own) LLVMBuildStore(g->builder, LLVMConstNull(llvm_type), alloca);
 
         if (stmt->var_decl.initializer) {
+            if (type && type->kind == TYPE_DELEGATE &&
+                stmt->var_decl.initializer->kind != AST_LAMBDA)
+                check_delegate_async_match(g, stmt->var_decl.initializer, type, locals);
             LLVMValueRef init_val =
                 (type && type->kind == TYPE_DELEGATE &&
                  stmt->var_decl.initializer->kind == AST_LAMBDA)

@@ -3387,10 +3387,44 @@ static zan_type_t *method_ret_type_at(zan_irgen_t *g, zan_symbol_t *msym,
     return subst_method_tp(g, rt, tps, bind);
 }
 
+/* An `async delegate` is invoked by awaiting the callee's coroutine frame,
+ * while a plain delegate call consumes the returned value directly, so the
+ * two conversions are not interchangeable: binding a method of the wrong
+ * kind makes the invocation await something that is not a frame (or return a
+ * frame as the result). Diagnose the conversion instead of crashing at
+ * runtime. */
+static void check_delegate_async_match(zan_irgen_t *g, zan_ast_node_t *e,
+                                       zan_type_t *dt, local_scope_t *locals) {
+    if (!e || !dt || dt->kind != TYPE_DELEGATE) return;
+    zan_symbol_t *m = NULL;
+    if (e->kind == AST_IDENTIFIER) {
+        if (local_find(locals, e->ident.name)) return;
+        if (g->current_type_sym)
+            m = get_method_sym(g->current_type_sym, e->ident.name);
+    } else if (e->kind == AST_MEMBER_ACCESS && e->member.object &&
+               e->member.object->kind == AST_IDENTIFIER &&
+               !local_find(locals, e->member.object->ident.name)) {
+        zan_symbol_t *cs =
+            zan_binder_lookup(g->binder, e->member.object->ident.name);
+        if (cs && (cs->kind == SYM_CLASS || cs->kind == SYM_STRUCT))
+            m = get_method_sym(cs, e->member.name);
+    }
+    if (!m || !m->decl || m->decl->kind != AST_METHOD_DECL) return;
+    int m_async = (m->decl->method_decl.modifiers & MOD_ASYNC) != 0;
+    if (m_async == (dt->delegate_is_async != 0)) return;
+    zan_diag_emit(g->diag, DIAG_ERROR, e->loc,
+        "cannot convert %s method '%.*s' to %s delegate '%.*s'",
+        m_async ? "async" : "non-async", m->name.len, m->name.str,
+        dt->delegate_is_async ? "async" : "non-async",
+        dt->name.len, dt->name.str);
+}
+
 static LLVMValueRef emit_arg_typed(zan_irgen_t *g, zan_ast_node_t *arg,
                                    zan_type_t *ptype, local_scope_t *locals) {
-    if (arg && arg->kind == AST_LAMBDA && ptype && ptype->kind == TYPE_DELEGATE) {
-        return emit_lambda_typed(g, arg, ptype, locals);
+    if (arg && ptype && ptype->kind == TYPE_DELEGATE) {
+        if (arg->kind == AST_LAMBDA)
+            return emit_lambda_typed(g, arg, ptype, locals);
+        check_delegate_async_match(g, arg, ptype, locals);
     }
     return emit_expr(g, arg, locals);
 }
