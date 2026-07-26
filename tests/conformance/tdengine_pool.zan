@@ -1,0 +1,164 @@
+using System;
+using System.Data;
+using System.Data.TDengine;
+using System.Net.Sockets;
+
+// The TDengine driver's coroutine path, against a fake taosAdapter served by
+// this same program: every statement is an HTTP round trip on the IO reactor,
+// so what is checked is that TDenginePool bounds concurrency, that queries in
+// flight overlap instead of serializing, and that the async decode agrees with
+// the blocking one.
+
+class Fake {
+    static int PORT = 54341;
+    static int served = 0;      // statements answered
+    static int inFlight = 0;    // requests being handled right now
+    static int peak = 0;        // high-water mark of inFlight
+
+    static string Body(string sql) {
+        if (sql.Contains("SERVER_VERSION")) {
+            return "{\"code\":0,\"column_meta\":[[\"server_version()\",\"VARCHAR\",7]],"
+                + "\"data\":[[\"3.2.1.0\"]],\"rows\":1}";
+        }
+        if (sql.StartsWith("INSERT")) {
+            return "{\"code\":0,\"column_meta\":[[\"affected_rows\",\"INT\",4]],"
+                + "\"data\":[[3]],\"rows\":1}";
+        }
+        return "{\"code\":0,\"column_meta\":[[\"ts\",\"TIMESTAMP\",8],[\"v\",\"INT\",4]],"
+            + "\"data\":[[\"2024-01-01 00:00:00.000\",7]],\"rows\":1}";
+    }
+
+    // Reads one request, holds it briefly so overlapping requests are visible,
+    // then answers. Connection: close, matching what the driver sends.
+    static async void Serve(int client) {
+        string req = await AsyncSocket.Receive(client, 65536);
+        Fake.inFlight = Fake.inFlight + 1;
+        if (Fake.inFlight > Fake.peak) {
+            Fake.peak = Fake.inFlight;
+        }
+        int cut = req.IndexOf("\r\n\r\n");
+        string sql = "";
+        if (cut >= 0) {
+            sql = req.Substring(cut + 4, req.Length - cut - 4);
+        }
+        await Task.Delay(15);
+        string body = Fake.Body(sql);
+        string resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+            + "Content-Length: " + Convert.ToString(body.Length)
+            + "\r\nConnection: close\r\n\r\n" + body;
+        int sent = await AsyncSocket.SendString(client, resp);
+        Fake.inFlight = Fake.inFlight - 1;
+        Fake.served = Fake.served + 1;
+        Socket.Close(client);
+    }
+
+    /// Serves exactly `count` requests and then retires: a still-parked accept
+    /// would keep the reactor waiting after the run is otherwise finished.
+    static async void Accept(int listener, int count) {
+        int n = 0;
+        while (n < count) {
+            int client = await AsyncSocket.Accept(listener);
+            Socket.SetNonBlocking(client);
+            Task.Spawn(Fake.Serve(client));
+            n = n + 1;
+        }
+        Socket.Close(listener);
+    }
+
+    static int Listen() {
+        int listener = Socket.CreateTcp();
+        Socket.SetReuseAddr(listener);
+        Socket.Bind(listener, "127.0.0.1", Fake.PORT);
+        Socket.Listen(listener, 16);
+        Socket.SetNonBlocking(listener);
+        return listener;
+    }
+}
+
+class Program {
+    static int passed = 0;
+    static int failed = 0;
+    static int done = 0;
+
+    static void Check(string name, bool ok) {
+        if (ok) {
+            Program.passed = Program.passed + 1;
+        } else {
+            Program.failed = Program.failed + 1;
+            Console.WriteLine("FAIL: " + name);
+        }
+    }
+
+    // One pooled user: check out, query on the reactor, hand back.
+    static async void Worker(TDenginePool pool) {
+        TDengineConnection db = await pool.AcquireAsync();
+        if (db == null) {
+            Program.done = Program.done + 1;
+            return;
+        }
+        DbResult r = await db.QueryAsync("SELECT ts, v FROM meters LIMIT 1");
+        if (r.RowCount() == 1 && r.GetInt(0, 1) == 7) {
+            Program.done = Program.done + 1;
+        }
+        pool.Release(db);
+    }
+
+    static async void Run() {
+        // The run makes exactly ten requests: four directly (open ping, query,
+        // insert, scalar), then two pool opens and four pooled queries.
+        int listener = Fake.Listen();
+        Task.Spawn(Fake.Accept(listener, 10));
+
+        TDengineConnection db = await TDengineConnection.OpenAsync(
+            "127.0.0.1", Fake.PORT, "root", "taosdata", "power");
+        Program.Check("async open validates against the server", db.IsConnected());
+
+        DbResult r = await db.QueryAsync("SELECT ts, v FROM meters LIMIT 1");
+        Program.Check("async query decodes column_meta", r.ColumnCount() == 2);
+        Program.Check("async query decodes rows", r.RowCount() == 1);
+        Program.Check("async query decodes values", r.GetInt(0, 1) == 7);
+
+        int n = await db.ExecuteAsync("INSERT INTO meters VALUES (NOW, ?)",
+                                      DbParams.Create().AddInt(1));
+        Program.Check("async execute reports affected rows", n == 3);
+
+        string v = await db.ExecuteScalarAsync("SELECT SERVER_VERSION()");
+        Program.Check("async scalar", v == "3.2.1.0");
+        db.Close();
+
+        // Pool: four coroutines, two connections. All four complete, at most
+        // two run at a time, and the two extra ones reuse a released handle
+        // rather than opening a third.
+        TDenginePool pool = TDenginePool.Create("127.0.0.1", Fake.PORT, "root",
+                                                "taosdata", "power", 2);
+        Program.Check("pool max size", pool.MaxSize() == 2);
+        Fake.peak = 0;
+        int i = 0;
+        while (i < 4) {
+            Task.Spawn(Program.Worker(pool));
+            i = i + 1;
+        }
+        while (Program.done < 4) {
+            await Task.Delay(5);
+        }
+        Program.Check("every pooled worker finished", Program.done == 4);
+        Program.Check("pool never exceeds its size", pool.LiveCount() <= 2);
+        Program.Check("statements really overlap", Fake.peak >= 2);
+        Program.Check("connections are reused", pool.IdleCount() == 2);
+        Program.Check("no waiters left", pool.WaitingCount() == 0);
+
+        pool.Close();
+        Program.Check("close drains the pool", pool.IdleCount() == 0);
+        Program.Check("close drops the live count", pool.LiveCount() == 0);
+        TDengineConnection dead = await pool.AcquireAsync();
+        Program.Check("acquire on a closed pool yields null", dead == null);
+
+    }
+
+    static void Main() {
+        Socket.Initialize();
+        await Program.Run();
+        Console.WriteLine("pass: " + Convert.ToString(Program.passed));
+        Console.WriteLine("fail: " + Convert.ToString(Program.failed));
+    }
+}

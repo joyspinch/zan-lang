@@ -87,10 +87,44 @@ class TDengineConnection : IDbConnection {
         return conn;
     }
 
+    /// <summary>Opens with HTTP Basic credentials without blocking the worker:
+    /// the validating round-trip runs on the IO reactor.</summary>
+    static async TDengineConnection OpenAsync(string host, int port, string user,
+                                              string password, string database) {
+        TDengineConnection conn = new TDengineConnection();
+        conn.host = host;
+        conn.port = port;
+        conn.database = database;
+        string cred = user + ":" + password;
+        conn.auth = "Basic " + Base64.Encode(cred, cred.Length);
+        conn.connected = await conn.PingAsync();
+        return conn;
+    }
+
+    /// <summary>Token counterpart of OpenAsync.</summary>
+    static async TDengineConnection OpenTokenAsync(string host, int port, string token,
+                                                   string database) {
+        TDengineConnection conn = new TDengineConnection();
+        conn.host = host;
+        conn.port = port;
+        conn.database = database;
+        conn.auth = "Taosd " + token;
+        conn.connected = await conn.PingAsync();
+        return conn;
+    }
+
     /// <summary>Runs a trivial statement to check that the adapter answers and
     /// the credentials are accepted.</summary>
     bool Ping() {
         string body = Post("SELECT SERVER_VERSION()");
+        if (body.Length == 0) { return false; }
+        JsonValue root = JsonValue.ParseLenient(body);
+        return !Failed(root);
+    }
+
+    /// <summary>Ping over the reactor, suspending instead of blocking.</summary>
+    async bool PingAsync() {
+        string body = await PostAsync("SELECT SERVER_VERSION()");
         if (body.Length == 0) { return false; }
         JsonValue root = JsonValue.ParseLenient(body);
         return !Failed(root);
@@ -241,22 +275,8 @@ class TDengineConnection : IDbConnection {
         return "/rest/sql/" + this.database;
     }
 
-    /// <summary>Sends one statement and returns the response body, or "" with
-    /// lastError set when the request could not be completed.</summary>
-    string Post(string sql) {
-        this.lastError = "";
-        int sock = Socket.CreateTcp();
-        if (sock <= 0) {
-            this.lastError = "socket creation failed";
-            return "";
-        }
-        if (Socket.Connect(sock, this.host, this.port) != 0) {
-            Socket.Close(sock);
-            this.lastError = "cannot reach taosAdapter at " + this.host + ":"
-                + Convert.ToString(this.port);
-            return "";
-        }
-
+    /// <summary>The HTTP/1.1 request carrying one statement.</summary>
+    string Request(string sql) {
         StringBuilder req = new StringBuilder();
         req.Append("POST ");
         req.Append(SqlPath());
@@ -270,8 +290,45 @@ class TDengineConnection : IDbConnection {
         req.Append(Convert.ToString(sql.Length));
         req.Append("\r\nConnection: close\r\n\r\n");
         req.Append(sql);
-        string wire = req.ToString();
-        if (Socket.SendString(sock, wire) < 0) {
+        return req.ToString();
+    }
+
+    /// <summary>Extracts the response body from the raw HTTP exchange,
+    /// undoing chunked framing and recording a non-200 status.</summary>
+    string BodyOf(string raw) {
+        HttpResponse resp = HttpResponse.Parse(raw);
+        string body = resp.body;
+        if (TDengineConnection.IsChunked(resp)) {
+            body = TDengineConnection.Dechunk(body);
+        }
+        if (resp.statusCode != 200 && body.Length == 0) {
+            this.lastError = "HTTP " + Convert.ToString(resp.statusCode) + " "
+                + resp.statusText;
+        }
+        return body;
+    }
+
+    string Unreachable() {
+        return "cannot reach taosAdapter at " + this.host + ":"
+            + Convert.ToString(this.port);
+    }
+
+    /// <summary>Sends one statement and returns the response body, or "" with
+    /// lastError set when the request could not be completed.</summary>
+    string Post(string sql) {
+        this.lastError = "";
+        int sock = Socket.CreateTcp();
+        if (sock <= 0) {
+            this.lastError = "socket creation failed";
+            return "";
+        }
+        if (Socket.Connect(sock, this.host, this.port) != 0) {
+            Socket.Close(sock);
+            this.lastError = Unreachable();
+            return "";
+        }
+
+        if (Socket.SendString(sock, Request(sql)) < 0) {
             Socket.Close(sock);
             this.lastError = "sending the statement failed";
             return "";
@@ -284,17 +341,42 @@ class TDengineConnection : IDbConnection {
             if (chunk.Length == 0) { reading = false; } else { raw.Append(chunk); }
         }
         Socket.Close(sock);
+        return BodyOf(raw.ToString());
+    }
 
-        HttpResponse resp = HttpResponse.Parse(raw.ToString());
-        string body = resp.body;
-        if (TDengineConnection.IsChunked(resp)) {
-            body = TDengineConnection.Dechunk(body);
+    /// <summary>Post over the IO reactor: connect, send and receive all suspend
+    /// the coroutine instead of blocking the worker thread, so a pool of these
+    /// connections can have many statements in flight at once.</summary>
+    async string PostAsync(string sql) {
+        this.lastError = "";
+        int sock = Socket.CreateTcp();
+        if (sock <= 0) {
+            this.lastError = "socket creation failed";
+            return "";
         }
-        if (resp.statusCode != 200 && body.Length == 0) {
-            this.lastError = "HTTP " + Convert.ToString(resp.statusCode) + " "
-                + resp.statusText;
+        Socket.SetNonBlocking(sock);
+        int rc = await AsyncSocket.Connect(sock, this.host, this.port);
+        if (rc != 0) {
+            Socket.Close(sock);
+            this.lastError = Unreachable();
+            return "";
         }
-        return body;
+
+        int sent = await AsyncSocket.SendString(sock, Request(sql));
+        if (sent < 0) {
+            Socket.Close(sock);
+            this.lastError = "sending the statement failed";
+            return "";
+        }
+
+        StringBuilder raw = new StringBuilder();
+        bool reading = true;
+        while (reading) {
+            string chunk = await AsyncSocket.Receive(sock, 65536);
+            if (chunk.Length == 0) { reading = false; } else { raw.Append(chunk); }
+        }
+        Socket.Close(sock);
+        return BodyOf(raw.ToString());
     }
 
     // ===== Response decoding =====
@@ -432,6 +514,49 @@ class TDengineConnection : IDbConnection {
     /// <summary>First column of the first row of a parameterized query.</summary>
     string ExecuteScalar(string sql, DbParams prms) {
         DbResult r = Query(sql, prms);
+        if (r.RowCount() == 0) { return ""; }
+        return r.GetString(0, 0);
+    }
+
+    // ===== Coroutine API =====
+
+    /// <summary>Query without blocking the worker thread.</summary>
+    async DbResult QueryAsync(string sql) {
+        string body = await PostAsync(sql);
+        return Decode(body);
+    }
+
+    /// <summary>Parameterized query without blocking the worker thread.</summary>
+    async DbResult QueryAsync(string sql, DbParams prms) {
+        string text = TDengineConnection.RenderSql(sql, prms);
+        if (text.Length == 0 && sql.Length > 0) {
+            this.lastError = "parameter count does not match the placeholders";
+            return DbResult.Empty();
+        }
+        return await QueryAsync(text);
+    }
+
+    /// <summary>Statement without blocking the worker thread.</summary>
+    async int ExecuteAsync(string sql) {
+        string body = await PostAsync(sql);
+        DbResult r = Decode(body);
+        if (this.lastError.Length > 0) { return 0 - 1; }
+        return this.affected;
+    }
+
+    /// <summary>Parameterized statement without blocking the worker thread.</summary>
+    async int ExecuteAsync(string sql, DbParams prms) {
+        string text = TDengineConnection.RenderSql(sql, prms);
+        if (text.Length == 0 && sql.Length > 0) {
+            this.lastError = "parameter count does not match the placeholders";
+            return 0 - 1;
+        }
+        return await ExecuteAsync(text);
+    }
+
+    /// <summary>First cell of the first row, without blocking.</summary>
+    async string ExecuteScalarAsync(string sql) {
+        DbResult r = await QueryAsync(sql);
         if (r.RowCount() == 0) { return ""; }
         return r.GetString(0, 0);
     }
