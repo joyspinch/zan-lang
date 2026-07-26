@@ -190,6 +190,22 @@ partial class ZanIDE {
         ZanIDE.AddRecentProject(root);
     }
 
+    // ---- Dock layout (panel arrangement of the main area) ----
+    /// Where DockHost.SaveLayout() is persisted, so the panels the user dragged,
+    /// resized or closed come back the same way next launch.
+    static string DockLayoutPath() { return ZanIDE.UserConfigDir() + "/dock.cfg"; }
+
+    static string ReadDockLayout() {
+        string f = ZanIDE.DockLayoutPath();
+        if (!File.Exists(f)) { return ""; }
+        return ZanIDE.TrimWs(File.ReadAllText(f));
+    }
+
+    static void WriteDockLayout(string layout) {
+        Directory.CreateDirectoryRecursive(ZanIDE.UserConfigDir());
+        File.WriteAllText(ZanIDE.DockLayoutPath(), layout);
+    }
+
     // ---- Recently opened projects (start page MRU, newest first) ----
     static string RecentProjectsPath() { return ZanIDE.UserConfigDir() + "/recent_projects.txt"; }
 
@@ -1296,24 +1312,47 @@ partial class ZanIDE {
         AssetManager assetMgr = AssetManager.Create();
 
         SignalInt treeW = SignalInt.Create(ZanIDE.CfgClamp(ZanIDE.CfgInt(cfg, "treeW", 240), 120, 900));
-        // The code editor is the primary area: it fills the space left over
-        // after the bottom output panel, so it grows with the window instead of
-        // being pinned to a fixed height that leaves a huge output pane. We
-        // persist the compact OUTPUT height; `editorAreaH` is recomputed from it
-        // each frame and only used to drive the resize handle.
+        // Seeds for the dock's side extents on a first run (afterwards dock.cfg
+        // carries the sizes the user dragged).
         SignalInt bottomPanelH = SignalInt.Create(ZanIDE.CfgClamp(ZanIDE.CfgInt(cfg, "bottomH", 190), 70, 2000));
-        SignalInt editorAreaH = SignalInt.Create(430);
         // Bottom panel active tab: 0 = Output, 1 = Error List, 2 = Terminal.
         SignalInt bottomTab = SignalInt.Create(ZanIDE.CfgClamp(ZanIDE.CfgInt(cfg, "bottomTab", 0), 0, 1));
 
         // ---- Right side panel (AI assistant / integrated terminal) ----
-        // Third column of the aardio-style 3-pane layout: sidebar | editor |
-        // side panel. rightW persists across launches; centerW is derived from
-        // it each frame so the Split drag handle moves the panel edge.
         SignalInt rightW = SignalInt.Create(ZanIDE.CfgClamp(ZanIDE.CfgInt(cfg, "rightW", 600), 120, 1600));
-        SignalInt centerW = SignalInt.Create(0);
         // 0 = AI chat, 1 = tools/ tree, 2 = examples/ tree, 3 = git panel.
         SignalInt rightTab = SignalInt.Create(ZanIDE.CfgClamp(ZanIDE.CfgInt(cfg, "rightTab", 0), 0, 3));
+
+        // ---- Dockable main area ----
+        // The shell around the document area is a DockHost: EXPLORER, the
+        // structure/components outline, STDLIB, OUTPUT and the assistant column
+        // are tab groups the user can drag to another side, tab together,
+        // resize and close (right-click a tab strip to bring a closed one
+        // back). The editor is the fixed center panel everything docks around.
+        // The arrangement is persisted in dock.cfg and restored on launch.
+        DockHost dock = DockHost.Create();
+        dock.emptyMenuLabel = ZanIDE.T("No closed panels", "没有已关闭的面板");
+        dock.Register("explorer", ZanIDE.T("EXPLORER", "资源管理器"),
+            DockSide.Left(), true, true);
+        dock.Register("structure", ZanIDE.T("STRUCTURE", "结构"),
+            DockSide.Left(), true, true);
+        dock.Register("stdlib", ZanIDE.T("STDLIB", "标准库"),
+            DockSide.Left(), true, true);
+        dock.RegisterFixed("editor", "Editor");
+        dock.Register("output", ZanIDE.T("OUTPUT", "输出"),
+            DockSide.Bottom(), true, true);
+        dock.Register("assistant", ZanIDE.T("Assistant", "助手"),
+            DockSide.Right(), true, true);
+        dock.SetWeight("explorer", 40);
+        dock.SetWeight("structure", 32);
+        dock.SetWeight("stdlib", 28);
+        dock.SetSideExtent(DockSide.Left(), treeW.Get());
+        dock.SetSideExtent(DockSide.Right(), rightW.Get());
+        dock.SetSideExtent(DockSide.Bottom(), bottomPanelH.Get());
+        dock.LoadLayout(ZanIDE.ReadDockLayout());
+        // The outline panel retitles itself between STRUCTURE and COMPONENTS as
+        // the designer opens and closes; this tracks the title in effect.
+        string dockOutlineTitle = "";
         // ---- Git panel state (right panel "Git" tab) ----
         // gitFiles holds `git status --porcelain` lines; gitLoaded gates the
         // first (and refresh-triggered) status scan so git only runs on demand.
@@ -2167,18 +2206,20 @@ partial class ZanIDE {
                 }
 
                 Rect area = Rect.Create(0, top + ribbonH + dbgBarH, W, H - top - ribbonH - dbgBarH - sbH);
-                Split cols = Split.Vertical(app, area, treeW, app.Scale(170), app.Scale(440));
-
-                Rect tr = cols.first;
-                ZanIDE.ShellSurface(app, tr.x, tr.y, tr.width, tr.height, 0, t.bgTertiary);
-                int sectionH = app.Scale(24);
-                int explorerH = (tr.height * 40) / 100;
-                int structH = (tr.height * 32) / 100;
-                int exampleH = tr.height - explorerH - structH;
+                // The dock resolves every panel's rect and owns the tab strips,
+                // split handles and drag/close input; the panels below just draw
+                // into the rect it hands back (off-screen while closed, so each
+                // panel body stays a plain unconditional render).
+                string outlineTitle = ZanIDE.T("STRUCTURE", "结构");
+                if (designerMode || sceneMode) { outlineTitle = ZanIDE.T("COMPONENTS", "组件"); }
+                if (outlineTitle != dockOutlineTitle) {
+                    dock.SetTitle("structure", outlineTitle);
+                    dockOutlineTitle = outlineTitle;
+                }
+                dock.Begin(app, area);
 
                 // Section 1: Explorer (inline filter bar owned by the tree)
-                c.DrawText(tr.x + t.paddingMedium, tr.y + t.paddingSmall, ZanIDE.T("EXPLORER", "资源管理器"), t.textTertiary, t.fontSizeSmall);
-                Rect treeArea = Rect.Create(tr.x, tr.y + sectionH, tr.width, explorerH - sectionH);
+                Rect treeArea = dock.ContentParked("explorer");
                 treeArea = TreeView.FilterBar(app, treeArea, treeFilter);
                 treeShow = ZanIDE.FilterNodes(tree, treeFilter.GetText());
                 // Wheel-scroll the tree when the pointer is over it. Scroll in
@@ -2214,11 +2255,6 @@ partial class ZanIDE {
 
                 // Section 2: Structure / Components. Shows a code outline for
                 // source tabs, and the form's component tree in the designer.
-                int stY = tr.y + explorerH;
-                c.FillRect(tr.x, stY, tr.width, 1, t.divider);
-                string stTitle = ZanIDE.T("STRUCTURE", "结构");
-                if (designerMode || sceneMode) { stTitle = ZanIDE.T("COMPONENTS", "组件"); }
-                c.DrawText(tr.x + t.paddingMedium, stY + t.paddingSmall, stTitle, t.textTertiary, t.fontSizeSmall);
                 // Rebuild the tree only when the active buffer/form changes so
                 // typing and clicking stay cheap. The signature prefix (C/F)
                 // also flips the panel between code outline and components.
@@ -2256,7 +2292,7 @@ partial class ZanIDE {
                     structSel.Set(0 - 1);
                     lastStructSel = 0 - 1;
                 }
-                Rect stArea = Rect.Create(tr.x, stY + sectionH, tr.width, structH - sectionH);
+                Rect stArea = dock.ContentParked("structure");
                 stArea = TreeView.FilterBar(app, stArea, structFilter);
                 structShow = ZanIDE.FilterNodes(structTree, structFilter.GetText());
                 int stRowH = TreeView.RowHeight(app);
@@ -2319,10 +2355,7 @@ partial class ZanIDE {
                 }
 
                 // Section 3: Examples (collapsible tree, click a leaf to open)
-                int exY = tr.y + explorerH + structH;
-                c.FillRect(tr.x, exY, tr.width, 1, t.divider);
-                c.DrawText(tr.x + t.paddingMedium, exY + t.paddingSmall, ZanIDE.T("STDLIB", "标准库"), t.textTertiary, t.fontSizeSmall);
-                Rect exArea = Rect.Create(tr.x, exY + sectionH, tr.width, exampleH - sectionH);
+                Rect exArea = dock.ContentParked("stdlib");
                 exArea = TreeView.FilterBar(app, exArea, exFilter);
                 exShow = ZanIDE.FilterNodes(exTree, exFilter.GetText());
                 int exRowH = TreeView.RowHeight(app);
@@ -2396,44 +2429,13 @@ partial class ZanIDE {
                     }
                 }
 
-                // Third column: split the remaining area into the editor stack
-                // and the right side panel (AI / terminal). The persisted value
-                // is the RIGHT panel width, so window resizes keep the editor
-                // as the dominant area; centerW only drives the drag handle.
-                int rightMin = app.Scale(140);
-                int centerMin = app.Scale(260);
-                int splitHandleW = app.Scale(5);
-                int wantCenter = cols.second.width - rightW.Get() - splitHandleW;
-                if (wantCenter < centerMin) { wantCenter = centerMin; }
-                centerW.Set(wantCenter);
-                Split mid = Split.Vertical(app, cols.second, centerW, centerMin, rightMin);
-                Rect centerArea = mid.first;
-                Rect rightArea = mid.second;
-                int newRightW = cols.second.width - centerW.Get() - splitHandleW;
-                if (newRightW < rightMin) { newRightW = rightMin; }
-                rightW.Set(newRightW);
-
-                // Center column = editor/designer stack on top + a docked output
-                // panel at the bottom, in every mode.
-                int bottomMin = app.Scale(90);
-                if (dbgState == 2) { bottomMin = app.Scale(160); }
-                int editorMin = app.Scale(140);
-                int splitHandleH = 5;
-                // The output/console panel stays docked at the bottom in EVERY
-                // mode -- code, form designer and scene designer -- so build
-                // output and logs are always visible. The editor/designer fills
-                // everything above the (compact) output panel.
-                int wantEditorH = centerArea.height - bottomPanelH.Get() - splitHandleH;
-                if (wantEditorH < editorMin) { wantEditorH = editorMin; }
-                editorAreaH.Set(wantEditorH);
-                Split rows = Split.Horizontal(app, centerArea, editorAreaH, editorMin, bottomMin);
-                Rect ea = rows.first;
-                Rect orr = rows.second;
-                // Persist the resulting output height (not the editor height) so
-                // resizing the window keeps the editor as the dominant area.
-                int newBottomH = centerArea.height - editorAreaH.Get() - splitHandleH;
-                if (newBottomH < bottomMin) { newBottomH = bottomMin; }
-                bottomPanelH.Set(newBottomH);
+                // Editor stack, output panel and the assistant column: all three
+                // rects come from the dock, which owns the handles between them.
+                // The editor is the fixed center panel, so it always has a rect;
+                // the other two are parked off-screen while the user closes them.
+                Rect ea = dock.Content("editor");
+                Rect orr = dock.ContentParked("output");
+                Rect rightArea = dock.ContentParked("assistant");
 
                 int tabH = TabView.Height(app);
                 TabHit hit = TabView.Render(app, ea.x, ea.y, ea.width, tabH, tabNames, activeTab, true);
@@ -3876,6 +3878,17 @@ partial class ZanIDE {
                     }
                     app.RequestRedraw();
                 }
+
+                // Close the dock frame: draws the drag ghost / drop highlight
+                // over the panels and applies a finished drag. The arrangement
+                // is written back only when it actually changed.
+                dock.End(app);
+                string dockClosed = dock.TakeClosed();
+                if (dockClosed != "") {
+                    Layer.Msg(ZanIDE.T("Panel closed - right-click a tab strip to restore",
+                        "面板已关闭 - 右键标签栏可恢复"), 3);
+                }
+                if (dock.TakeChanged()) { ZanIDE.WriteDockLayout(dock.SaveLayout()); }
 
                 // Status bar. Drawn on the same muted panel surface as the
                 // title bar / side panels (bgSecondary) so the shell reads as
