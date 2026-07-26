@@ -488,6 +488,11 @@ static zan_type_t *infer_expr_type(zan_irgen_t *g, zan_ast_node_t *e,
                                    local_scope_t *locals) {
     if (!e) return NULL;
     switch (e->kind) {
+    /* String literals have a static type like any other expression; without
+     * this an extension method on a literal receiver ("a,b".Split(...)) found
+     * no receiver type and silently lowered to a constant. */
+    case AST_STRING_LITERAL:
+        return g->binder ? g->binder->type_string : NULL;
     case AST_IDENTIFIER: {
         local_var_t *l = local_find(locals, e->ident.name);
         if (l) return l->type;

@@ -3287,6 +3287,33 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
             }
         }
 
+        /* Robustness: `recv.M(...)` where recv's static type is one of the
+         * compiler's built-in types (string, List<T>, Dictionary<K,V>,
+         * StringBuilder) and M is neither a member irgen lowers (builtin_api.c)
+         * nor an extension method (tried above). Falling through to the
+         * constant below made `s.PadLeft(4)` evaluate to 0 and `items.Sort()`
+         * a no-op, with no diagnostic anywhere. */
+        if (expr->call.callee && expr->call.callee->kind == AST_MEMBER_ACCESS) {
+            zan_ast_node_t *bcallee = expr->call.callee;
+            zan_istr_t bmn = bcallee->member.name;
+            zan_type_t *brt = infer_expr_type(g, bcallee->member.object, locals);
+            const char *brecv = NULL;
+            if (brt && brt->kind == TYPE_STRING) brecv = "string";
+            else if (brt && brt->name.len == 4 &&
+                     memcmp(brt->name.str, "List", 4) == 0) brecv = "List";
+            else if (brt && brt->name.len == 4 &&
+                     memcmp(brt->name.str, "Dict", 4) == 0) brecv = "Dict";
+            else if (brt && brt->name.len == 13 &&
+                     memcmp(brt->name.str, "StringBuilder", 13) == 0)
+                brecv = "StringBuilder";
+            if (brecv && !zan_builtin_has_member(brecv, bmn.str, (int)bmn.len)) {
+                const zan_builtin_type_t *bt = zan_builtin_find(brecv);
+                zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+                    "'%s' has no member '%.*s'",
+                    bt ? bt->display : brecv, (int)bmn.len, bmn.str);
+            }
+        }
+
         /* generic function call — fallback */
         return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
     return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);

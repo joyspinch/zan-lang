@@ -99,6 +99,8 @@ add_executable(zanc
     src/compiler/stdlib_ext.c
     src/compiler/crosscomp.c
     src/compiler/winres.c
+    src/compiler/builtin_api.c
+    src/compiler/symbols.c
 )
 target_include_directories(zanc PRIVATE src/compiler ${LLVM_INCLUDE_DIRS})
 if(MSVC)

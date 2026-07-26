@@ -10,6 +10,7 @@
  */
 
 #include "irgen.h"
+#include "builtin_api.h"
 #include "arena.h"
 #include "diag.h"
 #include <llvm-c/Analysis.h>
