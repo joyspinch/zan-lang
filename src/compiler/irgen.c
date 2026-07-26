@@ -297,6 +297,55 @@ static void *irgen_grow(void *base, int *cap, int need, size_t elem) {
     return p;
 }
 
+/* Bucket for `p` in a table of `cap` (a power of two) slots. */
+static size_t irgen_ptr_bucket(const void *p, int cap) {
+    uint64_t h = (uint64_t)(uintptr_t)p * 0x9E3779B97F4A7C15ull;
+    return (size_t)((h >> 32) & (uint64_t)(cap - 1));
+}
+
+/* ---- function registry index (see zan_irgen.fn_index) ---- */
+
+static size_t fn_index_hash(zan_symbol_t *sym, int cap) {
+    return irgen_ptr_bucket(sym, cap);
+}
+
+/* Record sym -> idx, keeping the entry already stored for a duplicate sym. */
+static void fn_index_put(zan_irgen_t *g, zan_symbol_t *sym, int idx) {
+    size_t i = fn_index_hash(sym, g->fn_index_cap);
+    while (g->fn_index[i].sym) {
+        if (g->fn_index[i].sym == sym) return;
+        i = (i + 1) & (size_t)(g->fn_index_cap - 1);
+    }
+    g->fn_index[i].sym = sym;
+    g->fn_index[i].idx = idx;
+}
+
+/* Grow the index to `ncap` slots and reinsert every registered function. */
+static void fn_index_rehash(zan_irgen_t *g, int ncap) {
+    struct zan_fn_index_slot *slots =
+        calloc((size_t)ncap, sizeof(*g->fn_index));
+    if (!slots) {
+        fprintf(stderr, "zanc: out of memory growing the function index\n");
+        exit(1);
+    }
+    free(g->fn_index);
+    g->fn_index = slots;
+    g->fn_index_cap = ncap;
+    for (int i = 0; i < g->function_count; i++)
+        if (g->functions[i].sym) fn_index_put(g, g->functions[i].sym, i);
+}
+
+/* Index of `sym` in g->functions, or -1 when it was never registered. */
+static int irgen_find_function(zan_irgen_t *g, zan_symbol_t *sym) {
+    if (!sym || !g->fn_index) return -1;
+    size_t i = fn_index_hash(sym, g->fn_index_cap);
+    while (g->fn_index[i].sym) {
+        if (g->fn_index[i].sym == sym) return g->fn_index[i].idx;
+        i = (i + 1) & (size_t)(g->fn_index_cap - 1);
+    }
+    return -1;
+}
+
 static void irgen_register_function(zan_irgen_t *g, zan_symbol_t *sym,
                                     LLVMValueRef fn, LLVMTypeRef fn_type) {
     if (g->function_count >= g->function_cap) {
@@ -308,7 +357,148 @@ static void irgen_register_function(zan_irgen_t *g, zan_symbol_t *sym,
     g->functions[g->function_count].sym = sym;
     g->functions[g->function_count].fn = fn;
     g->functions[g->function_count].fn_type = fn_type;
+    /* Keep the index under 50% load so probe chains stay short. */
+    if ((g->function_count + 1) * 2 >= g->fn_index_cap)
+        fn_index_rehash(g, g->fn_index_cap ? g->fn_index_cap * 2 : 2048);
+    if (sym) fn_index_put(g, sym, g->function_count);
     g->function_count++;
+}
+
+/* ---- per-class member index ------------------------------------------------
+ * Member lookup by name (get_method_sym, resolve_overload, get_field_sym) and
+ * by declaration node (method_sym_for_decl) used to scan a class's whole member
+ * list, so a class with N methods called from N sites cost O(N^2) comparisons
+ * and dominated irgen for large programs. Each class gets a lazily built hash
+ * index of its members instead. Buckets chain in declaration order, so the
+ * "first match wins" behaviour of the scans is preserved, and an index is
+ * rebuilt when its class gained members (specialization appends members while
+ * irgen runs). The table is file-static because the lookups are leaf helpers
+ * without access to the irgen state; zan_irgen_init/destroy reset it. */
+
+typedef struct {
+    zan_symbol_t *owner;
+    int built_count;    /* owner->member_count when the index was built */
+    int cap;            /* bucket count, a power of two */
+    int *name_buckets;  /* cap entries: first member index, or -1 */
+    int *name_next;     /* per member: next index in its bucket, or -1 */
+    int *decl_buckets;  /* cap entries: first member index, or -1 */
+    int *decl_next;     /* per member: next index in its bucket, or -1 */
+} zan_class_index_t;
+
+static zan_class_index_t *g_class_indexes;
+static int g_class_index_cap;   /* slots, a power of two */
+static int g_class_index_count;
+
+static uint64_t istr_hash(zan_istr_t s) {
+    uint64_t h = 1469598103934665603ull;
+    for (int i = 0; i < s.len; i++) {
+        h ^= (unsigned char)s.str[i];
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+
+static void *class_index_alloc(size_t n, size_t elem) {
+    void *p = malloc(n * elem);
+    if (!p) {
+        fprintf(stderr, "zanc: out of memory building a member index\n");
+        exit(1);
+    }
+    return p;
+}
+
+static void class_index_free(zan_class_index_t *ci) {
+    free(ci->name_buckets);
+    free(ci->name_next);
+    free(ci->decl_buckets);
+    free(ci->decl_next);
+    ci->name_buckets = ci->name_next = ci->decl_buckets = ci->decl_next = NULL;
+}
+
+static void class_index_build(zan_class_index_t *ci, zan_symbol_t *owner) {
+    class_index_free(ci);
+    int n = owner->member_count;
+    int cap = 16;
+    while (cap < n * 2) cap *= 2;
+    ci->owner = owner;
+    ci->built_count = n;
+    ci->cap = cap;
+    ci->name_buckets = class_index_alloc((size_t)cap, sizeof(int));
+    ci->decl_buckets = class_index_alloc((size_t)cap, sizeof(int));
+    ci->name_next = class_index_alloc((size_t)(n > 0 ? n : 1), sizeof(int));
+    ci->decl_next = class_index_alloc((size_t)(n > 0 ? n : 1), sizeof(int));
+    for (int i = 0; i < cap; i++) {
+        ci->name_buckets[i] = -1;
+        ci->decl_buckets[i] = -1;
+    }
+    /* Insert back to front so every chain runs in declaration order. */
+    for (int i = n - 1; i >= 0; i--) {
+        zan_symbol_t *m = owner->members[i];
+        size_t nb = (size_t)(istr_hash(m->name) & (uint64_t)(cap - 1));
+        ci->name_next[i] = ci->name_buckets[nb];
+        ci->name_buckets[nb] = i;
+        size_t db = irgen_ptr_bucket(m->decl, cap);
+        ci->decl_next[i] = ci->decl_buckets[db];
+        ci->decl_buckets[db] = i;
+    }
+}
+
+static void class_index_table_grow(void) {
+    int ncap = g_class_index_cap ? g_class_index_cap * 2 : 256;
+    zan_class_index_t *slots = calloc((size_t)ncap, sizeof(*slots));
+    if (!slots) {
+        fprintf(stderr, "zanc: out of memory growing the member index table\n");
+        exit(1);
+    }
+    for (int i = 0; i < g_class_index_cap; i++) {
+        if (!g_class_indexes[i].owner) continue;
+        size_t j = irgen_ptr_bucket(g_class_indexes[i].owner, ncap);
+        while (slots[j].owner) j = (j + 1) & (size_t)(ncap - 1);
+        slots[j] = g_class_indexes[i];
+    }
+    free(g_class_indexes);
+    g_class_indexes = slots;
+    g_class_index_cap = ncap;
+}
+
+static void class_index_reset(void) {
+    for (int i = 0; i < g_class_index_cap; i++)
+        if (g_class_indexes[i].owner) class_index_free(&g_class_indexes[i]);
+    free(g_class_indexes);
+    g_class_indexes = NULL;
+    g_class_index_cap = g_class_index_count = 0;
+}
+
+static zan_class_index_t *class_index_for(zan_symbol_t *owner) {
+    if ((g_class_index_count + 1) * 2 >= g_class_index_cap)
+        class_index_table_grow();
+    size_t i = irgen_ptr_bucket(owner, g_class_index_cap);
+    while (g_class_indexes[i].owner && g_class_indexes[i].owner != owner)
+        i = (i + 1) & (size_t)(g_class_index_cap - 1);
+    zan_class_index_t *ci = &g_class_indexes[i];
+    if (ci->owner != owner) {
+        class_index_build(ci, owner);
+        g_class_index_count++;
+    } else if (ci->built_count != owner->member_count) {
+        class_index_build(ci, owner);
+    }
+    return ci;
+}
+
+/* First member index in `owner`'s bucket for `name`; -1 when the bucket is
+ * empty. Walk on with member_next_named. Names still have to be compared: a
+ * bucket may hold members of other names. */
+static int member_first_named(zan_class_index_t *ci, zan_istr_t name) {
+    return ci->name_buckets[istr_hash(name) & (uint64_t)(ci->cap - 1)];
+}
+
+static int member_next_named(zan_class_index_t *ci, int i) {
+    return ci->name_next[i];
+}
+
+static bool member_name_is(zan_symbol_t *m, zan_istr_t name) {
+    return m->name.len == name.len &&
+           memcmp(m->name.str, name.str, (size_t)name.len) == 0;
 }
 
 /* Guard a malloc result inside runtime allocator `fn`: if it is null, print
@@ -368,6 +558,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
                             bool target_is_windows, bool mt_scheduler,
                             bool check_leaks) {
     memset(g, 0, sizeof(*g));
+    class_index_reset();
     g->arena = arena;
     g->diag = diag;
     g->binder = binder;
@@ -1360,6 +1551,10 @@ void zan_irgen_destroy(zan_irgen_t *g) {
     g->functions = NULL;
     g->function_count = 0;
     g->function_cap = 0;
+    free(g->fn_index);
+    g->fn_index = NULL;
+    g->fn_index_cap = 0;
+    class_index_reset();
     free(g->struct_types);
     g->struct_types = NULL;
     g->struct_type_count = g->struct_type_cap = 0;
@@ -1504,12 +1699,13 @@ static int get_field_index(zan_symbol_t *type_sym, zan_istr_t field_name) {
 }
 
 static zan_symbol_t *get_field_sym(zan_symbol_t *type_sym, zan_istr_t field_name) {
-    for (int i = 0; i < type_sym->member_count; i++) {
-        if ((type_sym->members[i]->kind == SYM_FIELD ||
-             type_sym->members[i]->kind == SYM_PROPERTY) &&
-            type_sym->members[i]->name.len == field_name.len &&
-            memcmp(type_sym->members[i]->name.str, field_name.str, field_name.len) == 0) {
-            return type_sym->members[i];
+    zan_class_index_t *ci = class_index_for(type_sym);
+    for (int i = member_first_named(ci, field_name); i >= 0;
+         i = member_next_named(ci, i)) {
+        zan_symbol_t *m = type_sym->members[i];
+        if ((m->kind == SYM_FIELD || m->kind == SYM_PROPERTY) &&
+            member_name_is(m, field_name)) {
+            return m;
         }
     }
     return NULL;
@@ -1517,12 +1713,12 @@ static zan_symbol_t *get_field_sym(zan_symbol_t *type_sym, zan_istr_t field_name
 
 static zan_symbol_t *get_method_sym(zan_symbol_t *type_sym, zan_istr_t method_name) {
     /* search in current type first */
-    for (int i = 0; i < type_sym->member_count; i++) {
-        if (type_sym->members[i]->kind == SYM_METHOD &&
-            type_sym->members[i]->name.len == method_name.len &&
-            memcmp(type_sym->members[i]->name.str, method_name.str, method_name.len) == 0) {
-            return type_sym->members[i];
-        }
+    zan_class_index_t *ci = class_index_for(type_sym);
+    for (int i = member_first_named(ci, method_name); i >= 0;
+         i = member_next_named(ci, i)) {
+        zan_symbol_t *m = type_sym->members[i];
+        if (m->kind == SYM_METHOD && member_name_is(m, method_name))
+            return m;
     }
     /* search in base type (inheritance) */
     if (type_sym->type && type_sym->type->base_type && type_sym->type->base_type->sym) {
@@ -1548,11 +1744,11 @@ static zan_symbol_t *get_method_sym(zan_symbol_t *type_sym, zan_istr_t method_na
  * type; each corresponds to exactly one AST_METHOD_DECL. Matching on the decl
  * back-pointer (not the name) is the only way to recover the right one. */
 static zan_symbol_t *method_sym_for_decl(zan_symbol_t *type_sym, zan_ast_node_t *decl) {
-    for (int i = 0; i < type_sym->member_count; i++) {
-        if (type_sym->members[i]->kind == SYM_METHOD &&
-            type_sym->members[i]->decl == decl) {
-            return type_sym->members[i];
-        }
+    zan_class_index_t *ci = class_index_for(type_sym);
+    for (int i = ci->decl_buckets[irgen_ptr_bucket(decl, ci->cap)]; i >= 0;
+         i = ci->decl_next[i]) {
+        zan_symbol_t *m = type_sym->members[i];
+        if (m->kind == SYM_METHOD && m->decl == decl) return m;
     }
     return NULL;
 }
@@ -1572,11 +1768,12 @@ static int method_is_params_variadic(zan_symbol_t *m) {
 static zan_symbol_t *resolve_overload(zan_symbol_t *type_sym, zan_istr_t name, int argc) {
     zan_symbol_t *first = NULL;
     zan_symbol_t *variadic = NULL;
-    for (int i = 0; i < type_sym->member_count; i++) {
+    zan_class_index_t *ci = class_index_for(type_sym);
+    for (int i = member_first_named(ci, name); i >= 0;
+         i = member_next_named(ci, i)) {
         zan_symbol_t *m = type_sym->members[i];
         if (m->kind != SYM_METHOD) continue;
-        if (m->name.len != name.len ||
-            memcmp(m->name.str, name.str, name.len) != 0) continue;
+        if (!member_name_is(m, name)) continue;
         if (!first) first = m;
         if (m->decl && m->decl->method_decl.params.count == argc) {
             return m;

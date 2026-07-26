@@ -2720,7 +2720,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                     zan_symbol_t *method_sym = resolve_overload(type_sym, callee->member.name, expr->call.args.count);
                     if (method_sym) pack_params_args(g, expr, method_sym, locals);
                     if (method_sym) {
-                        for (int fi = 0; fi < g->function_count; fi++) {
+                        for (int fi = irgen_find_function(g, method_sym); fi >= 0; fi = -1) {
                             if (g->functions[fi].sym == method_sym) {
                                 int argc = expr->call.args.count + 1;
                                 LLVMValueRef *call_args = (LLVMValueRef *)calloc((size_t)argc, sizeof(LLVMValueRef));
@@ -2764,7 +2764,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                         int spec = try_method_spec(g, method_sym, expr, NULL, locals);
                         if (spec >= 0)
                             return emit_method_spec_call(g, spec, expr, NULL, locals);
-                        for (int fi = 0; fi < g->function_count; fi++) {
+                        for (int fi = irgen_find_function(g, method_sym); fi >= 0; fi = -1) {
                             if (g->functions[fi].sym == method_sym) {
                                 int argc = expr->call.args.count;
                                 LLVMValueRef *call_args = (LLVMValueRef *)calloc((size_t)(argc > 0 ? argc : 1), sizeof(LLVMValueRef));
@@ -2822,7 +2822,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                 zan_symbol_t *method_sym = resolve_overload(recv_cls, callee->member.name, expr->call.args.count);
                     if (method_sym) pack_params_args(g, expr, method_sym, locals);
                 if (method_sym) {
-                    for (int fi = 0; fi < g->function_count; fi++) {
+                    for (int fi = irgen_find_function(g, method_sym); fi >= 0; fi = -1) {
                         if (g->functions[fi].sym == method_sym) {
                             int argc = expr->call.args.count + 1;
                             LLVMValueRef *call_args = (LLVMValueRef *)calloc((size_t)argc, sizeof(LLVMValueRef));
@@ -2927,7 +2927,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                         zan_symbol_t *impl_m = resolve_overload(cls, callee->member.name, uargc);
                         if (!impl_m) continue;
                         LLVMValueRef ifn = NULL; LLVMTypeRef ifnty = NULL;
-                        for (int fi = 0; fi < g->function_count; fi++)
+                        for (int fi = irgen_find_function(g, impl_m); fi >= 0; fi = -1)
                             if (g->functions[fi].sym == impl_m) {
                                 ifn = g->functions[fi].fn; ifnty = g->functions[fi].fn_type; break;
                             }
@@ -3006,7 +3006,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                     zan_symbol_t *method_sym = resolve_overload(type_sym, callee->member.name, expr->call.args.count);
                     if (method_sym) pack_params_args(g, expr, method_sym, locals);
                     if (method_sym) {
-                        for (int fi = 0; fi < g->function_count; fi++) {
+                        for (int fi = irgen_find_function(g, method_sym); fi >= 0; fi = -1) {
                             if (g->functions[fi].sym == method_sym) {
                                 int argc = expr->call.args.count;
                                 LLVMValueRef *call_args = (LLVMValueRef *)calloc((size_t)(argc > 0 ? argc : 1), sizeof(LLVMValueRef));
@@ -3069,7 +3069,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                 if (spec >= 0)
                     return emit_method_spec_call(g, spec, expr,
                                                  callee->member.object, locals);
-                for (int fi = 0; fi < g->function_count; fi++) {
+                for (int fi = irgen_find_function(g, method_sym); fi >= 0; fi = -1) {
                     if (g->functions[fi].sym == method_sym) {
                         int argc = expr->call.args.count + 1;
                         LLVMValueRef *call_args = (LLVMValueRef *)calloc((size_t)argc, sizeof(LLVMValueRef));
@@ -3118,7 +3118,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                 zan_symbol_t *method_sym = resolve_overload(g->current_type_sym, fn_name, expr->call.args.count);
                     if (method_sym) pack_params_args(g, expr, method_sym, locals);
                 if (method_sym) {
-                    for (int fi = 0; fi < g->function_count; fi++) {
+                    for (int fi = irgen_find_function(g, method_sym); fi >= 0; fi = -1) {
                         if (g->functions[fi].sym == method_sym) {
                             int argc = expr->call.args.count;
                             bool is_static = (method_sym->modifiers & MOD_STATIC) != 0;

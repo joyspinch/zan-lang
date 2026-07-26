@@ -85,6 +85,17 @@ struct zan_irgen {
     } *functions;
     int function_count;
     int function_cap;
+    /* symbol -> index into `functions`, so a call site resolves its callee in
+     * O(1). Scanning the registry made irgen quadratic in the number of
+     * functions (48k lines of code spent ~4.5 s of a 6 s build in irgen).
+     * Open addressing with a power-of-two capacity; sym == NULL marks a free
+     * slot, and a symbol registered twice keeps its first index (the scan it
+     * replaces stopped at the first match). */
+    struct zan_fn_index_slot {
+        zan_symbol_t *sym;
+        int idx;
+    } *fn_index;
+    int fn_index_cap;
 
     /* break/continue targets */
     LLVMBasicBlockRef break_target;

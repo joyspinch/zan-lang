@@ -314,7 +314,7 @@ static LLVMValueRef emit_expr_identifier(zan_irgen_t *g, zan_ast_node_t *expr,
         if (g->current_type_sym) {
             zan_symbol_t *method_sym = get_method_sym(g->current_type_sym, expr->ident.name);
             if (method_sym) {
-                for (int fi = 0; fi < g->function_count; fi++) {
+                for (int fi = irgen_find_function(g, method_sym); fi >= 0; fi = -1) {
                     if (g->functions[fi].sym == method_sym) {
                         return g->functions[fi].fn;
                     }
@@ -432,7 +432,7 @@ static LLVMValueRef emit_expr_binary(zan_irgen_t *g, zan_ast_node_t *expr,
                     zan_istr_t op_istr = { (char *)op_name, (int)strlen(op_name) };
                     zan_symbol_t *op_sym = get_method_sym(ltype->sym, op_istr);
                     if (op_sym) {
-                        for (int fi = 0; fi < g->function_count; fi++) {
+                        for (int fi = irgen_find_function(g, op_sym); fi >= 0; fi = -1) {
                             if (g->functions[fi].sym == op_sym) {
                                 LLVMValueRef args[] = { left, right };
                                 const char *cn = (LLVMGetTypeKind(LLVMGetReturnType(g->functions[fi].fn_type)) == LLVMVoidTypeKind) ? "" : "opcall";
@@ -1799,7 +1799,7 @@ static LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr
             if (cs && (cs->kind == SYM_CLASS || cs->kind == SYM_STRUCT)) {
                 zan_symbol_t *ms = get_method_sym(cs, expr->member.name);
                 if (ms) {
-                    for (int fi = 0; fi < g->function_count; fi++) {
+                    for (int fi = irgen_find_function(g, ms); fi >= 0; fi = -1) {
                         if (g->functions[fi].sym == ms) {
                             return g->functions[fi].fn;
                         }

@@ -448,9 +448,8 @@ static void emit_site_dtor_table(zan_irgen_t *g) {
 
 static LLVMValueRef find_fn_for_sym(zan_irgen_t *g, zan_symbol_t *msym) {
     if (!msym) return NULL;
-    for (int i = 0; i < g->function_count; i++)
-        if (g->functions[i].sym == msym) return g->functions[i].fn;
-    return NULL;
+    int i = irgen_find_function(g, msym);
+    return i >= 0 ? g->functions[i].fn : NULL;
 }
 
 /* Enumerate the virtual *slot-defining* methods (MOD_VIRTUAL and not an
