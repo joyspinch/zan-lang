@@ -1,0 +1,132 @@
+using System;
+using System.Collections.Generic;
+using System.Security.Cryptography;
+
+namespace Ra2.Formats;
+
+/// <summary>Recovers the Blowfish key from an encrypted MIX header.</summary>
+///
+/// Westwood wrapped the per-archive Blowfish key with a fixed RSA key and
+/// stored the 80-byte result at the head of the archive. Only the *public*
+/// half was ever shipped, and the wrap uses the public exponent, so unwrapping
+/// is a plain public-key operation -- the same one every open MIX tool does.
+/// The key string below is that public key; it is not a secret.
+///
+/// The layout is unusual: the 80 bytes are two independent 40-byte blocks, and
+/// each block's result is written back as 39 bytes rather than the 40 the
+/// 319-bit modulus would allow. Two blocks therefore give 78 bytes, of which
+/// the Blowfish key is the first 56.
+class WsKey {
+    [DllImport("crt")] static extern string calloc(int count, int size);
+    [DllImport("crt")] static extern void free(string p);
+
+    /// Base64 of a small ASN.1-ish blob: byte 0 is a tag, byte 1 the modulus
+    /// length (40), then the 40-byte big-endian modulus.
+    static string KeyString() {
+        return "AihRvNoIbTn85FZRYNZRcT+i6KpU+maCsEqr3Q5q+LDB5tH7Tz2qQ38V";
+    }
+
+    static int Exponent() { return 65537; }
+
+    /// Bytes consumed per input block, fixed by the format.
+    static int BlockSize() { return 40; }
+
+    /// Bytes produced per block. One less than the block size: Westwood sized
+    /// the output for the modulus' 312 usable bits, not its 320-bit buffer.
+    static int BlockOutSize() { return 39; }
+
+    /// Length of a wrapped key as stored in the header.
+    static int WrappedSize() { return 80; }
+
+    /// Length of the Blowfish key recovered from it.
+    static int KeySize() { return 56; }
+
+    /// The modulus as a big-endian byte buffer. Caller frees.
+    static string ModulusBytes(List<int> outLen) {
+        List<int> blobLen = new List<int>();
+        blobLen.Add(0);
+        string blob = Base64.Decode(WsKey.KeyString(), blobLen);
+        int declared = blob[1] & 0xFF;
+        int avail = blobLen[0] - 2;
+        if (declared > avail) { declared = avail; }
+
+        string mod = calloc(declared + 1, 1);
+        int i = 0;
+        while (i < declared) {
+            mod[i] = blob[2 + i];
+            i = i + 1;
+        }
+        free(blob);
+        outLen[0] = declared;
+        return mod;
+    }
+
+    static int ModulusByteLength() {
+        List<int> len = new List<int>();
+        len.Add(0);
+        string mod = WsKey.ModulusBytes(len);
+        free(mod);
+        return len[0];
+    }
+
+    static int ModulusBitLength() {
+        List<int> len = new List<int>();
+        len.Add(0);
+        string mod = WsKey.ModulusBytes(len);
+        BigInt n = BigInt.FromBytesBE(mod, len[0]);
+        free(mod);
+        return n.bitLength();
+    }
+
+    /// <summary>Unwraps the 80 bytes at <paramref name="offset"/> into a
+    /// 56-byte Blowfish key. Caller frees the result.</summary>
+    static string Decrypt(string src, int offset) {
+        List<int> modLen = new List<int>();
+        modLen.Add(0);
+        string modBytes = WsKey.ModulusBytes(modLen);
+        BigInt n = BigInt.FromBytesBE(modBytes, modLen[0]);
+        free(modBytes);
+
+        string expBytes = calloc(4, 1);
+        int e = WsKey.Exponent();
+        expBytes[0] = (char)((e >> 16) & 0xFF);
+        expBytes[1] = (char)((e >> 8) & 0xFF);
+        expBytes[2] = (char)(e & 0xFF);
+        BigInt exp = BigInt.FromBytesBE(expBytes, 3);
+        free(expBytes);
+
+        int blockIn = WsKey.BlockSize();
+        int blockOut = WsKey.BlockOutSize();
+        int blocks = WsKey.WrappedSize() / blockIn;
+
+        string keyBuf = calloc(WsKey.KeySize() + 1, 1);
+        string block = calloc(blockIn + 1, 1);
+        int keyLen = WsKey.KeySize();
+        int written = 0;
+        int b = 0;
+        while (b < blocks) {
+            int i = 0;
+            while (i < blockIn) {
+                block[i] = src[offset + b * blockIn + i];
+                i = i + 1;
+            }
+            BigInt c = BigInt.FromBytesBE(block, blockIn);
+            BigInt m = BigInt.ModPow(c, exp, n);
+            string plain = m.ToBytesBE(blockOut);
+
+            // The last block overruns the 56-byte key; keep only what fits.
+            int take = blockOut;
+            if (written + take > keyLen) { take = keyLen - written; }
+            int j = 0;
+            while (j < take) {
+                keyBuf[written + j] = plain[j];
+                j = j + 1;
+            }
+            free(plain);
+            written = written + take;
+            b = b + 1;
+        }
+        free(block);
+        return keyBuf;
+    }
+}
