@@ -59,6 +59,12 @@ void zan_shared_table_clear(int64_t handle);
 long long zan_exe_dir_into(char *out, long long cap);
 long long zan_dir_list_into(const char *pattern, char *out, long long cap);
 
+/* file metadata (System.IO.FileInfo) */
+long long zan_file_time(const char *path, int which);
+long long zan_file_length(const char *path);
+long long zan_file_attributes(const char *path);
+long long zan_file_set_readonly(const char *path, int on);
+
 #ifdef __cplusplus
 }
 #endif

@@ -1348,3 +1348,92 @@ long long zan_dir_list_into(const char *pattern, char *out, long long cap) {
 #endif
     return len;
 }
+
+/* --- File metadata -------------------------------------------------------
+ *
+ * The standard library had whole-file text IO and nothing else, so nothing
+ * could ask when a file last changed -- which is what incremental builds and
+ * hot reload are made of. These report Unix seconds (0 when the file does not
+ * exist) and the DOS/Unix attribute bits behind System.IO.FileInfo.
+ */
+
+/* 0 = last write, 1 = creation, 2 = last access. */
+long long zan_file_time(const char *path, int which) {
+    if (!path || !path[0]) return 0;
+#ifdef _WIN32
+    WIN32_FILE_ATTRIBUTE_DATA d;
+    if (!GetFileAttributesExA(path, GetFileExInfoStandard, &d)) return 0;
+    FILETIME ft = d.ftLastWriteTime;
+    if (which == 1) ft = d.ftCreationTime;
+    else if (which == 2) ft = d.ftLastAccessTime;
+    unsigned long long t = ((unsigned long long)ft.dwHighDateTime << 32)
+                         | (unsigned long long)ft.dwLowDateTime;
+    if (t == 0) return 0;
+    /* 100 ns ticks since 1601 -> seconds since 1970 */
+    return (long long)(t / 10000000ULL) - 11644473600LL;
+#else
+    struct stat st;
+    if (stat(path, &st) != 0) return 0;
+    if (which == 1) return (long long)st.st_ctime;
+    if (which == 2) return (long long)st.st_atime;
+    return (long long)st.st_mtime;
+#endif
+}
+
+/* Size in bytes, or -1 when the path does not exist. */
+long long zan_file_length(const char *path) {
+    if (!path || !path[0]) return -1;
+#ifdef _WIN32
+    WIN32_FILE_ATTRIBUTE_DATA d;
+    if (!GetFileAttributesExA(path, GetFileExInfoStandard, &d)) return -1;
+    return (long long)(((unsigned long long)d.nFileSizeHigh << 32)
+                       | (unsigned long long)d.nFileSizeLow);
+#else
+    struct stat st;
+    if (stat(path, &st) != 0) return -1;
+    return (long long)st.st_size;
+#endif
+}
+
+/* Bit 0 read-only, bit 1 hidden, bit 2 directory; -1 when missing. */
+long long zan_file_attributes(const char *path) {
+    if (!path || !path[0]) return -1;
+#ifdef _WIN32
+    DWORD a = GetFileAttributesA(path);
+    if (a == INVALID_FILE_ATTRIBUTES) return -1;
+    long long r = 0;
+    if (a & FILE_ATTRIBUTE_READONLY)  r |= 1;
+    if (a & FILE_ATTRIBUTE_HIDDEN)    r |= 2;
+    if (a & FILE_ATTRIBUTE_DIRECTORY) r |= 4;
+    return r;
+#else
+    struct stat st;
+    if (stat(path, &st) != 0) return -1;
+    long long r = 0;
+    if (access(path, W_OK) != 0) r |= 1;
+    { const char *base = strrchr(path, '/');
+      base = base ? base + 1 : path;
+      if (base[0] == '.') r |= 2; }
+    if (S_ISDIR(st.st_mode)) r |= 4;
+    return r;
+#endif
+}
+
+/* Marks the file read-only (`on`) or writable. Returns 1 on success. */
+long long zan_file_set_readonly(const char *path, int on) {
+    if (!path || !path[0]) return 0;
+#ifdef _WIN32
+    DWORD a = GetFileAttributesA(path);
+    if (a == INVALID_FILE_ATTRIBUTES) return 0;
+    if (on) a |= FILE_ATTRIBUTE_READONLY;
+    else    a &= ~(DWORD)FILE_ATTRIBUTE_READONLY;
+    return SetFileAttributesA(path, a) ? 1 : 0;
+#else
+    struct stat st;
+    if (stat(path, &st) != 0) return 0;
+    mode_t m = st.st_mode;
+    if (on) m &= ~(mode_t)(S_IWUSR | S_IWGRP | S_IWOTH);
+    else    m |= S_IWUSR;
+    return chmod(path, m) == 0 ? 1 : 0;
+#endif
+}

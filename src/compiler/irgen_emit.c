@@ -281,13 +281,17 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
             if (member->kind != AST_METHOD_DECL && !is_ctor) continue;
             /* extern/DllImport methods have no generic body: only the erased
              * variant declares them. */
-            if (cur_variant && member->kind == AST_METHOD_DECL &&
-                member->method_decl.extern_lib.str && !member->method_decl.body)
+            bool is_extern_decl =
+                member->kind == AST_METHOD_DECL && !member->method_decl.body &&
+                (member->method_decl.extern_lib.str ||
+                 (member->method_decl.modifiers & MOD_EXTERN) != 0);
+            if (cur_variant && is_extern_decl)
                 continue;
 
-            /* [DllImport] extern methods: generate extern declaration, skip body */
-            if (member->kind == AST_METHOD_DECL && member->method_decl.extern_lib.str &&
-                !member->method_decl.body) {
+            /* extern methods (with or without [DllImport]) become a plain
+             * external declaration resolved by the linker; without one a
+             * bodyless extern would silently return a default value. */
+            if (is_extern_decl) {
                 /* build extern function declaration */
                 int pc = member->method_decl.params.count;
                 LLVMTypeRef *pt = (LLVMTypeRef *)calloc((size_t)(pc > 0 ? pc : 1), sizeof(LLVMTypeRef));
@@ -312,7 +316,8 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
                              (int)member->method_decl.name.len,
                              member->method_decl.name.str);
                 }
-                if (strncmp(ext_name, "zan_atomic_int_", 15) == 0 ||
+                if (strncmp(ext_name, "zan_file_", 9) == 0 ||
+                    strncmp(ext_name, "zan_atomic_int_", 15) == 0 ||
                     strncmp(ext_name, "zan_shared_table_", 17) == 0 ||
                     strncmp(ext_name, "zan_thread_", 11) == 0 ||
                     strncmp(ext_name, "zan_dispatch_", 13) == 0) {
@@ -336,7 +341,7 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
                     irgen_register_function(g, method_sym, efn, ft);
                 }
                 /* store lib name for linker */
-                if (g->extern_lib_count < 64) {
+                if (member->method_decl.extern_lib.str && g->extern_lib_count < 64) {
                     bool already = false;
                     for (int li = 0; li < g->extern_lib_count; li++) {
                         if (g->extern_libs[li].len == member->method_decl.extern_lib.len &&
@@ -352,7 +357,8 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
                 }
                 /* record (lib, fn) so an unresolvable lib can be stubbed when
                  * cross-linking a static Linux binary */
-                if (g->extern_fn_count < (int)(sizeof(g->extern_fns) / sizeof(g->extern_fns[0]))) {
+                if (member->method_decl.extern_lib.str &&
+                    g->extern_fn_count < (int)(sizeof(g->extern_fns) / sizeof(g->extern_fns[0]))) {
                     zan_istr_t sym = member->method_decl.entry_point.str
                         ? member->method_decl.entry_point
                         : member->method_decl.name;
@@ -1632,9 +1638,14 @@ zan_status_t zan_irgen_write_obj(zan_irgen_t *g, const char *path) {
                           LLVMValueAsMetadata(LLVMMDStringInContext(
                               g->ctx, "lp64d", 5)));
     }
+    /* Machine codegen dominates compile time. Development builds (no
+     * --publish / -O) use the fast path (FastISel, no machine-level
+     * optimization); release builds keep the optimizing selector. */
+    LLVMCodeGenOptLevel cg = g->fast_codegen ? LLVMCodeGenLevelNone
+                                             : LLVMCodeGenLevelDefault;
     LLVMTargetMachineRef tm = LLVMCreateTargetMachine(
         target, triple, tm_cpu, tm_features,
-        LLVMCodeGenLevelDefault, LLVMRelocPIC, LLVMCodeModelDefault);
+        cg, LLVMRelocPIC, LLVMCodeModelDefault);
 
     LLVMSetTarget(g->mod, triple);
     LLVMTargetDataRef dl = LLVMCreateTargetDataLayout(tm);
