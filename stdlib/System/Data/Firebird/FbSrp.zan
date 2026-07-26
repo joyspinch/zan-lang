@@ -1,0 +1,261 @@
+using System;
+using System.Security.Cryptography;
+
+namespace System.Data.Firebird;
+
+/// <summary>The client proof of an SRP exchange and the session key it agreed
+/// on (the key doubles as the wire encryption key).</summary>
+class FbSrpProof {
+    FbBytes proof;
+    FbBytes key;
+
+    FbSrpProof(FbBytes proof, FbBytes key) {
+        this.proof = proof;
+        this.key = key;
+    }
+
+    static FbSrpProof Of(FbBytes proof, FbBytes key) {
+        return new FbSrpProof(proof, key);
+    }
+
+    FbBytes Proof() { return this.proof; }
+    FbBytes Key() { return this.key; }
+}
+
+/// <summary>
+/// The SRP-6a exchange Firebird 3+ authenticates with (plugins <c>Srp</c> and
+/// <c>Srp256</c>, which differ only in the hash the final proof uses).
+///
+///   client -> server:  A = g^a
+///   server -> client:  salt, B = k*v + g^b
+///   both:              u = H(A, B), x = H(salt, H(user ":" password))
+///   client:            S = (B - k*g^x)^(a + u*x),  K = SHA1(S)
+///   client -> server:  M = H(H(N)^H(g) mod N, H(user), salt, A, B, K)
+///
+/// Every integer is hashed as its shortest big-endian form, which is what the
+/// server does, so the two proofs only match when that detail matches too.
+/// The password never leaves the process: only A and M do.
+/// </summary>
+class FbSrp {
+    /// <summary>The 1024-bit prime the Firebird SRP plugins use.</summary>
+    static string PRIME_HEX = "e67d2e994b2f900c3f41f08f5bb2627ed0d49ee1fe767a52efcd565cd6e768812c3e1e9ce8f0a8bea6cb13cd29ddebf7a96d4a93b55d488df099a15c89dcb0640738eb2cbdd9a8f7bab561ab1b0dc1c6cdabf303264a08d1bca932d1f1ee428b619d970f342aba9a65793b8b2f041ae5364350c16f735f56ecbca87bd57b29e7";
+    /// <summary>The SRP-6a multiplier k = H(N, g), a constant of the plugin.
+    /// </summary>
+    static string MULT_HEX = "dfc212b4bd69674855cfceb30002b5c306ac60b5";
+    /// <summary>Bytes of secret exponent drawn per exchange.</summary>
+    static int PRIVATE_BYTES = 32;
+    /// <summary>Widest integer in play (the prime is 128 bytes).</summary>
+    static int WIDTH = 128;
+
+    BigInt priv;
+    FbBytes pub;
+
+    FbSrp(BigInt priv, FbBytes pub) {
+        this.priv = priv;
+        this.pub = pub;
+    }
+
+    /// <summary>Starts an exchange with a fresh secret exponent. Returns null
+    /// when the OS random source is unavailable -- a guessable exponent would
+    /// hand the session over, so there is no fallback.</summary>
+    static FbSrp Create() {
+        string r = RandomNumberGenerator.GetBytes(FbSrp.PRIVATE_BYTES);
+        if (r == null) { return null; }
+        BigInt a = BigInt.FromBytesBE(r, FbSrp.PRIVATE_BYTES);
+        FbBytes.Free(r);
+        return FbSrp.FromPrivate(a);
+    }
+
+    /// <summary>Exchange with a caller-chosen exponent. Only tests should use
+    /// this: it makes the handshake reproducible.</summary>
+    static FbSrp FromPrivateHex(string hex) {
+        FbBytes b = FbBytes.FromHex(hex);
+        BigInt a = BigInt.FromBytesBE(b.Data(), b.Len());
+        b.Release();
+        return FbSrp.FromPrivate(a);
+    }
+
+    static FbSrp FromPrivate(BigInt a) {
+        BigInt pub = BigInt.ModPow(FbSrp.Generator(), a, FbSrp.Prime());
+        return new FbSrp(a, FbSrp.Minimal(pub));
+    }
+
+    static BigInt Prime() {
+        FbBytes n = FbBytes.FromHex(FbSrp.PRIME_HEX);
+        BigInt v = BigInt.FromBytesBE(n.Data(), n.Len());
+        n.Release();
+        return v;
+    }
+
+    static BigInt Multiplier() {
+        FbBytes k = FbBytes.FromHex(FbSrp.MULT_HEX);
+        BigInt v = BigInt.FromBytesBE(k.Data(), k.Len());
+        k.Release();
+        return v;
+    }
+
+    static BigInt Generator() {
+        FbBytes g = FbBytes.Alloc(1);
+        g.SetAt(0, 2);
+        BigInt v = BigInt.FromBytesBE(g.Data(), g.Len());
+        g.Release();
+        return v;
+    }
+
+    /// <summary>The client public key A.</summary>
+    FbBytes Public() { return this.pub; }
+
+    /// <summary>A as the hex text the connect packet carries.</summary>
+    string PublicHex() { return this.pub.Hex(); }
+
+    /// <summary>Shortest big-endian encoding of an integer: how the protocol
+    /// hashes and transmits every one of them.</summary>
+    static FbBytes Minimal(BigInt v) {
+        string raw = v.ToBytesBE(FbSrp.WIDTH);
+        int off = 0;
+        while (off < FbSrp.WIDTH && (raw[off] & 255) == 0) {
+            off = off + 1;
+        }
+        FbBytes b = FbBytes.Alloc(FbSrp.WIDTH - off);
+        int i = off;
+        while (i < FbSrp.WIDTH) {
+            b.SetAt(i - off, raw[i] & 255);
+            i = i + 1;
+        }
+        FbBytes.Free(raw);
+        return b;
+    }
+
+    static BigInt ToInt(FbBytes b) {
+        return BigInt.FromBytesBE(b.Data(), b.Len());
+    }
+
+    static FbBytes Sha1Of(FbBytes b) {
+        return FbBytes.Own(Sha1.Hash(b.Data(), b.Len()), 20);
+    }
+
+    static FbBytes Sha256Of(FbBytes b) {
+        return FbBytes.Own(Sha256.Hash(b.Data(), b.Len()), 32);
+    }
+
+    /// <summary>The login name the proof is computed over: a quoted name keeps
+    /// its case (with doubled quotes collapsed), an unquoted one is upper-cased
+    /// the way the server stores it.</summary>
+    static string NormalizeUser(string user) {
+        if (user.Length > 2 && user.Substring(0, 1) == "\""
+                && user.Substring(user.Length - 1, 1) == "\"") {
+            return user.Substring(1, user.Length - 2).Replace("\"\"", "\"");
+        }
+        return user.ToUpper();
+    }
+
+    /// <summary>x = SHA1(salt, SHA1(user ":" password)).</summary>
+    static BigInt UserHash(string user, string password, FbBytes salt) {
+        FbBuf inner = FbBuf.Create();
+        inner.Raw(user);
+        inner.U8(58);                   // ':'
+        inner.Raw(password);
+        FbBytes im = inner.ToBytes();
+        FbBytes h1 = FbSrp.Sha1Of(im);
+        im.Release();
+
+        FbBuf outer = FbBuf.Create();
+        outer.RawBlock(salt);
+        outer.RawBlock(h1);
+        h1.Release();
+        FbBytes om = outer.ToBytes();
+        FbBytes h2 = FbSrp.Sha1Of(om);
+        om.Release();
+
+        BigInt x = FbSrp.ToInt(h2);
+        h2.Release();
+        return x;
+    }
+
+    /// <summary>u = SHA1(A, B), the scrambling parameter that binds the proof
+    /// to this pair of public keys.</summary>
+    static BigInt Scramble(FbBytes a, FbBytes b) {
+        FbBuf m = FbBuf.Create();
+        m.RawBlock(a);
+        m.RawBlock(b);
+        FbBytes msg = m.ToBytes();
+        FbBytes h = FbSrp.Sha1Of(msg);
+        msg.Release();
+        BigInt u = FbSrp.ToInt(h);
+        h.Release();
+        return u;
+    }
+
+    /// <summary>
+    /// Finishes the exchange: computes the session key from the server's salt
+    /// and public key, and the proof that shows the server the passwords match.
+    /// Returns null when the server's key is degenerate (B mod N == 0), which
+    /// SRP says to abort on.
+    /// </summary>
+    FbSrpProof Prove(string user, string password, FbBytes salt,
+            FbBytes serverPub, bool sha256) {
+        BigInt n = FbSrp.Prime();
+        BigInt g = FbSrp.Generator();
+        BigInt k = FbSrp.Multiplier();
+
+        BigInt bpub = BigInt.mod(FbSrp.ToInt(serverPub), n);
+        if (bpub.isZero()) { return null; }
+        FbBytes bmin = FbSrp.Minimal(bpub);
+
+        BigInt u = FbSrp.Scramble(this.pub, bmin);
+        if (u.isZero()) {
+            bmin.Release();
+            return null;
+        }
+        BigInt x = FbSrp.UserHash(user, password, salt);
+        BigInt gx = BigInt.ModPow(g, x, n);
+        BigInt kgx = BigInt.mod(BigInt.mul(k, gx), n);
+        BigInt diff = BigInt.mod(BigInt.sub(BigInt.add(bpub, n), kgx), n);
+        BigInt aux = BigInt.mod(BigInt.add(this.priv,
+                                           BigInt.mod(BigInt.mul(u, x), n)), n);
+        BigInt secret = BigInt.ModPow(diff, aux, n);
+
+        FbBytes smin = FbSrp.Minimal(secret);
+        FbBytes key = FbSrp.Sha1Of(smin);
+        smin.Release();
+
+        // M = H(H(N)^H(g) mod N, H(user), salt, A, B, K)
+        FbBytes nmin = FbSrp.Minimal(n);
+        FbBytes hn = FbSrp.Sha1Of(nmin);
+        nmin.Release();
+        FbBytes gmin = FbSrp.Minimal(g);
+        FbBytes hg = FbSrp.Sha1Of(gmin);
+        gmin.Release();
+        BigInt mixed = BigInt.ModPow(FbSrp.ToInt(hn), FbSrp.ToInt(hg), n);
+        hn.Release();
+        hg.Release();
+
+        FbBytes ub = FbBytes.Of(user);
+        FbBytes hu = FbSrp.Sha1Of(ub);
+        ub.Release();
+
+        FbBuf m = FbBuf.Create();
+        FbBytes mixedMin = FbSrp.Minimal(mixed);
+        m.RawBlock(mixedMin);
+        mixedMin.Release();
+        FbBytes huMin = FbSrp.Minimal(FbSrp.ToInt(hu));
+        hu.Release();
+        m.RawBlock(huMin);
+        huMin.Release();
+        m.RawBlock(salt);
+        m.RawBlock(this.pub);
+        m.RawBlock(bmin);
+        m.RawBlock(key);
+        FbBytes msg = m.ToBytes();
+        bmin.Release();
+
+        FbBytes proof;
+        if (sha256) {
+            proof = FbSrp.Sha256Of(msg);
+        } else {
+            proof = FbSrp.Sha1Of(msg);
+        }
+        msg.Release();
+        return FbSrpProof.Of(proof, key);
+    }
+}

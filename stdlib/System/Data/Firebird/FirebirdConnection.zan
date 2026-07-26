@@ -1,0 +1,1394 @@
+using System;
+using System.Data;
+using System.Net.Sockets;
+
+namespace System.Data.Firebird;
+
+/// <summary>A row under construction: cell text plus the SQL NULL flags.</summary>
+class FbRow {
+    List<string> values;
+    List<bool> nulls;
+
+    FbRow(int n) {
+        this.values = new List<string>();
+        this.nulls = new List<bool>();
+        int i = 0;
+        while (i < n) {
+            this.values.Add("");
+            this.nulls.Add(true);
+            i = i + 1;
+        }
+    }
+
+    static FbRow Create(int n) {
+        return new FbRow(n);
+    }
+
+    void Set(int i, string v) {
+        this.values[i] = v;
+        this.nulls[i] = false;
+    }
+
+    List<string> Values() { return this.values; }
+    List<bool> Nulls() { return this.nulls; }
+}
+
+/// <summary>A blob column whose payload still has to be fetched.</summary>
+class FbBlobRef {
+    FbRow row;
+    int col;
+    FbBytes id;
+    int subtype;
+
+    FbBlobRef(FbRow row, int col, FbBytes id, int subtype) {
+        this.row = row;
+        this.col = col;
+        this.id = id;
+        this.subtype = subtype;
+    }
+
+    static FbBlobRef Of(FbRow row, int col, FbBytes id, int subtype) {
+        return new FbBlobRef(row, col, id, subtype);
+    }
+}
+
+/// <summary>An <c>op_response</c>: the object handle, its id, the info buffer
+/// and the status vector that came with it.</summary>
+class FbResponse {
+    int handle;
+    FbBytes oid;
+    FbBytes buf;
+    FbError err;
+
+    FbResponse(int handle, FbBytes oid, FbBytes buf, FbError err) {
+        this.handle = handle;
+        this.oid = oid;
+        this.buf = buf;
+        this.err = err;
+    }
+
+    static FbResponse Of(int handle, FbBytes oid, FbBytes buf, FbError err) {
+        return new FbResponse(handle, oid, buf, err);
+    }
+
+    int Handle() { return this.handle; }
+    FbBytes Oid() { return this.oid; }
+    FbBytes Buf() { return this.buf; }
+    FbError Err() { return this.err; }
+    bool Failed() { return this.err.Failed(); }
+
+    void Release() {
+        this.oid.Release();
+        this.buf.Release();
+    }
+}
+
+/// <summary>
+/// Native Firebird client speaking the server's own wire protocol (version 13,
+/// i.e. Firebird 3 and newer) -- no fbclient, no ODBC. It logs in with SRP,
+/// optionally turns on the server's ARC4 wire encryption, and drives the
+/// statement lifecycle (allocate / prepare / execute / fetch / free) directly.
+///
+/// Every network step suspends on the IO reactor (<c>Socket.ConnectAsync</c>,
+/// <c>Socket.SendAsync</c>, <c>Socket.RecvOv</c>), so a statement never blocks
+/// the worker thread and many connections make progress on one thread. That is
+/// also why the class exposes only the coroutine API rather than the blocking
+/// <see cref="IDbExecutor"/> one: see <see cref="FirebirdPool"/> for pooling.
+///
+/// Usage:
+///   FirebirdConnection db = await FirebirdConnection.OpenAsync(
+///       "127.0.0.1", 3050, "/var/lib/firebird/data/test.fdb", "SYSDBA", "secret");
+///   DbResult r = await db.QueryAsync("SELECT id, name FROM t1 WHERE id > ?",
+///                                    DbParams.Create().AddInt(0));
+///   await db.CloseAsync();
+/// </summary>
+class FirebirdConnection {
+    int sock;
+    bool connected;
+    string lastError;
+    int lastAffected;
+    string database;
+    string user;
+    string plugin;          // authentication plugin the server picked
+    string cryptPlugin;     // wire encryption in use, "" when in the clear
+    int acceptVersion;
+    int dbHandle;
+    int transHandle;
+    FbBytes authData;
+    FbArc4 encIn;
+    FbArc4 encOut;
+    bool wantCrypt;
+    FbError lastStatus;
+
+    /// <summary>Rows the server is asked to send per fetch round trip.</summary>
+    static int FETCH_ROWS = 400;
+    /// <summary>Info-buffer size asked for when describing a statement.</summary>
+    static int INFO_BUFFER = 32768;
+    /// <summary>Largest single protocol block accepted, a guard against a
+    /// corrupt or hostile length prefix.</summary>
+    static int MAX_BLOCK = 33554432;
+
+    [DllImport("crt")]
+    static extern string calloc(int count, int size);
+
+    [DllImport("crt")]
+    static extern void free(string ptr);
+
+    FirebirdConnection() {
+        this.sock = 0 - 1;
+        this.connected = false;
+        this.lastError = "";
+        this.lastAffected = 0;
+        this.database = "";
+        this.user = "";
+        this.plugin = "";
+        this.cryptPlugin = "";
+        this.acceptVersion = 0;
+        this.dbHandle = 0 - 1;
+        this.transHandle = 0 - 1;
+        this.authData = null;
+        this.encIn = null;
+        this.encOut = null;
+        this.wantCrypt = true;
+        this.lastStatus = FbError.Create();
+    }
+
+    // ============================================================
+    // Transport
+    // ============================================================
+
+    /// <summary>Reads exactly <paramref name="need"/> bytes, decrypting them
+    /// when the session is encrypted. Returns what it managed to read.</summary>
+    async int recvExact(string dst, int off, int need) {
+        int got = 0;
+        string tmp = FirebirdConnection.calloc(need + 1, 1);
+        while (got < need) {
+            int n = await Socket.RecvOv(this.sock, tmp, need - got);
+            if (n <= 0) {
+                FirebirdConnection.free(tmp);
+                return got;
+            }
+            int j = 0;
+            while (j < n) {
+                dst[off + got + j] = tmp[j] & 255;
+                j = j + 1;
+            }
+            if (this.encIn != null) {
+                this.encIn.Translate(dst, off + got, n);
+            }
+            got = got + n;
+        }
+        FirebirdConnection.free(tmp);
+        return got;
+    }
+
+    /// <summary>Sends a whole packet and releases it. The bytes are copied
+    /// before encryption so the keystream never rewrites a caller's buffer.
+    /// </summary>
+    async bool sendPacket(FbBytes pkt) {
+        int n = pkt.Len();
+        string buf = FirebirdConnection.calloc(n + 1, 1);
+        int i = 0;
+        while (i < n) {
+            buf[i] = pkt.At(i);
+            i = i + 1;
+        }
+        pkt.Release();
+        if (this.encOut != null) {
+            this.encOut.Translate(buf, 0, n);
+        }
+        int sent = await Socket.SendAsync(this.sock, buf, n);
+        FirebirdConnection.free(buf);
+        if (sent < 0) {
+            this.lastError = "send failed";
+            this.connected = false;
+            return false;
+        }
+        return true;
+    }
+
+    async int recvInt() {
+        string b = FirebirdConnection.calloc(5, 1);
+        int got = await this.recvExact(b, 0, 4);
+        if (got < 4) {
+            FirebirdConnection.free(b);
+            this.lastError = "connection closed by the server";
+            this.connected = false;
+            return 0 - 1;
+        }
+        int v = ((b[0] & 255) << 24) | ((b[1] & 255) << 16)
+              | ((b[2] & 255) << 8) | (b[3] & 255);
+        FirebirdConnection.free(b);
+        return v;
+    }
+
+    /// <summary>Reads a 32-bit value that the protocol means as signed.</summary>
+    async int recvSigned() {
+        int v = await this.recvInt();
+        if (v >= 2147483648) { return v - 4294967296; }
+        return v;
+    }
+
+    /// <summary><paramref name="n"/> bytes plus the padding that rounds them up
+    /// to a four-byte boundary.</summary>
+    async FbBytes recvAligned(int n) {
+        if (n < 0 || n > FirebirdConnection.MAX_BLOCK) {
+            this.lastError = "malformed block length";
+            this.connected = false;
+            return null;
+        }
+        int pad = (4 - (n % 4)) % 4;
+        FbBytes b = FbBytes.Alloc(n + pad);
+        int got = await this.recvExact(b.Data(), 0, n + pad);
+        if (got < n + pad) {
+            b.Release();
+            this.lastError = "truncated response";
+            this.connected = false;
+            return null;
+        }
+        FbBytes v = b.Slice(0, n);
+        b.Release();
+        return v;
+    }
+
+    /// <summary>A length-prefixed, four-byte-aligned block.</summary>
+    async FbBytes recvBlock() {
+        int n = await this.recvInt();
+        if (n < 0) { return null; }
+        return await this.recvAligned(n);
+    }
+
+    // ============================================================
+    // Responses and errors
+    // ============================================================
+
+    /// <summary>Reads a status vector and turns it into a readable error.</summary>
+    async FbError recvStatus() {
+        FbError e = FbError.Create();
+        List<string> segs = new List<string>();
+        int argNum = 0;
+        bool more = true;
+        while (more) {
+            int kind = await this.recvInt();
+            if (kind < 0) {
+                e.SetMessage("connection closed while reading the status vector");
+                return e;
+            }
+            if (kind == FbOp.ARG_END) {
+                more = false;
+            } else if (kind == FbOp.ARG_GDS) {
+                int code = await this.recvInt();
+                // Every vector ends with a zero code, success or not; only a
+                // non-zero one carries a message.
+                if (code != 0) {
+                    e.AddCode(code);
+                    segs.Add(FbError.Text(code));
+                }
+                argNum = 0;
+            } else if (kind == FbOp.ARG_NUMBER) {
+                int v = await this.recvSigned();
+                argNum = argNum + 1;
+                if (e.CodeCount() > 0
+                        && e.CodeAt(e.CodeCount() - 1) == 335544436) {
+                    e.SetSqlCode(v);
+                }
+                FirebirdConnection.fill(segs, argNum, Convert.ToString(v));
+            } else if (kind == FbOp.ARG_STRING || kind == FbOp.ARG_CSTRING
+                    || kind == FbOp.ARG_SQL_STATE) {
+                FbBytes s = await this.recvBlock();
+                if (s == null) { return e; }
+                argNum = argNum + 1;
+                FirebirdConnection.fill(segs, argNum, s.Text());
+                s.Release();
+            } else if (kind == FbOp.ARG_INTERPRETED) {
+                FbBytes s = await this.recvBlock();
+                if (s == null) { return e; }
+                segs.Add(s.Text());
+                s.Release();
+                argNum = 0;
+            } else {
+                e.SetMessage("unsupported status argument "
+                             + Convert.ToString(kind));
+                return e;
+            }
+        }
+        if (segs.Count > 0) {
+            StringBuilder sb = new StringBuilder();
+            bool first = true;
+            int i = 0;
+            while (i < segs.Count) {
+                if (segs[i].Length > 0) {
+                    if (!first) { sb.Append("; "); }
+                    sb.Append(segs[i]);
+                    first = false;
+                }
+                i = i + 1;
+            }
+            e.SetMessage(sb.ToString());
+        }
+        return e;
+    }
+
+    /// <summary>Substitutes the n-th argument into the message segment that is
+    /// waiting for it.</summary>
+    static void fill(List<string> segs, int argNum, string text) {
+        if (segs.Count == 0) {
+            segs.Add(text);
+            return;
+        }
+        int last = segs.Count - 1;
+        string mark = "@" + Convert.ToString(argNum);
+        if (segs[last].Contains(mark)) {
+            segs[last] = segs[last].Replace(mark, text);
+        } else {
+            segs.Add(text);
+        }
+    }
+
+    /// <summary>Reads one <c>op_response</c>, skipping the keep-alive packets a
+    /// server may interleave.</summary>
+    async FbResponse recvResponse() {
+        int op = await this.recvInt();
+        while (op == FbOp.DUMMY) {
+            op = await this.recvInt();
+        }
+        if (op < 0) { return null; }
+        if (op != FbOp.RESPONSE) {
+            this.lastError = "unexpected operation " + Convert.ToString(op);
+            this.connected = false;
+            return null;
+        }
+        int handle = await this.recvInt();
+        FbBytes oid = await this.recvAligned(8);
+        if (oid == null) { return null; }
+        FbBytes buf = await this.recvBlock();
+        if (buf == null) {
+            oid.Release();
+            return null;
+        }
+        FbError err = await this.recvStatus();
+        return FbResponse.Of(handle, oid, buf, err);
+    }
+
+    /// <summary>Sends a packet and reads the response it answers with, recording
+    /// any server error.</summary>
+    async FbResponse roundTrip(FbBytes pkt) {
+        bool sent = await this.sendPacket(pkt);
+        if (!sent) { return null; }
+        FbResponse resp = await this.recvResponse();
+        if (resp == null) { return null; }
+        // The clean status of the round trips that follow a failure (freeing
+        // the statement, for one) must not erase what went wrong.
+        if (resp.Failed()) {
+            this.lastStatus = resp.Err();
+            this.lastError = resp.Err().Message();
+        }
+        return resp;
+    }
+
+    // ============================================================
+    // Connect, authenticate, attach
+    // ============================================================
+
+    /// <summary>Opens a connection, authenticates with SRP and attaches to the
+    /// database. Wire encryption is used when the server offers it.</summary>
+    static async FirebirdConnection OpenAsync(string host, int port,
+            string database, string user, string password) {
+        return await FirebirdConnection.OpenAsync(host, port, database, user,
+                                                  password, true);
+    }
+
+    /// <summary>Opening variant that can decline wire encryption (for a server
+    /// reached over a tunnel that already encrypts, or one configured with
+    /// <c>WireCrypt = Disabled</c>).</summary>
+    static async FirebirdConnection OpenAsync(string host, int port,
+            string database, string user, string password, bool wireCrypt) {
+        Socket.Initialize();
+        FirebirdConnection conn = new FirebirdConnection();
+        conn.database = database;
+        conn.user = user;
+        conn.wantCrypt = wireCrypt;
+        bool ok = await conn.handshake(host, port, database, user, password);
+        conn.connected = ok;
+        if (!ok) {
+            if (conn.sock >= 0) {
+                Socket.Close(conn.sock);
+                conn.sock = 0 - 1;
+            }
+        }
+        return conn;
+    }
+
+    async bool handshake(string host, int port, string db, string user, string pw) {
+        this.sock = Socket.CreateTcp();
+        if (this.sock < 0) {
+            this.lastError = "socket create failed";
+            return false;
+        }
+        Socket.SetNonBlocking(this.sock);
+        int rc = await Socket.ConnectAsync(this.sock, host, port);
+        if (rc != 0) {
+            this.lastError = "cannot reach " + host + ":" + Convert.ToString(port);
+            return false;
+        }
+        Socket.SetNoDelay(this.sock);
+
+        FbSrp srp = FbSrp.Create();
+        if (srp == null) {
+            this.lastError = "no secure random source for the SRP exchange";
+            return false;
+        }
+        bool sent = await this.sendPacket(
+            FirebirdConnection.ConnectPacket(db, user, srp.PublicHex(),
+                                             this.wantCrypt));
+        if (!sent) { return false; }
+        if (!await this.authenticate(srp, user, pw)) { return false; }
+
+        FbResponse att = await this.roundTrip(
+            FirebirdConnection.AttachPacket(db, user, this.authData));
+        if (att == null) { return false; }
+        if (att.Failed()) {
+            att.Release();
+            return false;
+        }
+        this.dbHandle = att.Handle();
+        att.Release();
+        return await this.beginTransaction();
+    }
+
+    /// <summary>Builds <c>op_connect</c>: the client offers protocol 13 with an
+    /// SRP public key, and the server answers with the salt and its own key.
+    /// </summary>
+    static FbBytes ConnectPacket(string database, string user, string pubHex,
+            bool wireCrypt) {
+        FbBuf uid = FbBuf.Create();
+        FirebirdConnection.cnct(uid, FbOp.CNCT_LOGIN, user);
+        FirebirdConnection.cnct(uid, FbOp.CNCT_PLUGIN_NAME, "Srp256");
+        FirebirdConnection.cnct(uid, FbOp.CNCT_PLUGIN_LIST, "Srp256,Srp");
+        FirebirdConnection.cnctChunked(uid, FbOp.CNCT_SPECIFIC_DATA, pubHex);
+        uid.U8(FbOp.CNCT_CLIENT_CRYPT);
+        uid.U8(4);
+        if (wireCrypt) { uid.U8(1); } else { uid.U8(0); }
+        uid.U8(0); uid.U8(0); uid.U8(0);
+        FirebirdConnection.cnct(uid, FbOp.CNCT_USER, user);
+        FirebirdConnection.cnct(uid, FbOp.CNCT_HOST, "zan");
+        FirebirdConnection.cnct(uid, FbOp.CNCT_USER_VERIFICATION, "");
+
+        FbBuf p = FbBuf.Create();
+        p.Int(FbOp.CONNECT);
+        p.Int(FbOp.ATTACH);
+        p.Int(FbOp.CONNECT_VERSION);
+        p.Int(FbOp.ARCH_GENERIC);
+        p.Str(database);
+        p.Int(1);                       // one protocol on offer
+        FbBytes uidBytes = uid.ToBytes();
+        p.Block(uidBytes);
+        uidBytes.Release();
+        // version, architecture, min type, max type (batch send), weight
+        p.Int(FbOp.PROTOCOL_V13);
+        p.Int(FbOp.ARCH_GENERIC);
+        p.Int(0);
+        p.Int(FbOp.PTYPE_BATCH_SEND);
+        p.Int(8);
+        return p.ToBytes();
+    }
+
+    static void cnct(FbBuf b, int tag, string v) {
+        b.U8(tag);
+        b.U8(v.Length);
+        b.Raw(v);
+    }
+
+    /// <summary>The specific-data clumplet carries a sequence byte and is split
+    /// into 254-byte pieces, which the SRP public key always needs.</summary>
+    static void cnctChunked(FbBuf b, int tag, string v) {
+        int off = 0;
+        int seq = 0;
+        while (v.Length - off > 254) {
+            b.U8(tag);
+            b.U8(255);
+            b.U8(seq);
+            b.Raw(v.Substring(off, 254));
+            off = off + 254;
+            seq = seq + 1;
+        }
+        b.U8(tag);
+        b.U8(v.Length - off + 1);
+        b.U8(seq);
+        b.Raw(v.Substring(off, v.Length - off));
+    }
+
+    /// <summary>Runs the SRP continuation and, when the server asks for it,
+    /// turns on wire encryption.</summary>
+    async bool authenticate(FbSrp srp, string user, string password) {
+        int op = await this.recvInt();
+        while (op == FbOp.DUMMY) {
+            op = await this.recvInt();
+        }
+        if (op < 0) { return false; }
+        if (op == FbOp.REJECT) {
+            this.lastError = "the server rejected the connection";
+            return false;
+        }
+        if (op == FbOp.RESPONSE) {
+            FbResponse r = await this.recvResponse4();
+            if (r != null) {
+                this.lastError = r.Err().Message();
+                if (this.lastError.Length == 0) {
+                    this.lastError = "the server refused the connection";
+                }
+                r.Release();
+            }
+            return false;
+        }
+        if (op != FbOp.ACCEPT && op != FbOp.ACCEPT_DATA
+                && op != FbOp.COND_ACCEPT) {
+            this.lastError = "unexpected connect response " + Convert.ToString(op);
+            return false;
+        }
+        int version = await this.recvInt();
+        this.acceptVersion = version & 255;
+        await this.recvInt();           // architecture
+        await this.recvInt();           // packet type
+        if (this.acceptVersion != 13) {
+            this.lastError = "the server speaks protocol "
+                + Convert.ToString(this.acceptVersion)
+                + "; this driver needs 13 (Firebird 3 or newer)";
+            return false;
+        }
+        if (op == FbOp.ACCEPT) {
+            // Protocol 13 always carries authentication data with the accept;
+            // a bare accept means the server wants a scheme we did not offer.
+            this.lastError = "the server accepted without authentication data";
+            return false;
+        }
+
+        FbBytes data = await this.recvBlock();
+        if (data == null) { return false; }
+        FbBytes pluginName = await this.recvBlock();
+        if (pluginName == null) { data.Release(); return false; }
+        this.plugin = pluginName.Text();
+        pluginName.Release();
+        int authenticated = await this.recvInt();
+        FbBytes keys = await this.recvBlock();
+        if (keys == null) { data.Release(); return false; }
+        keys.Release();
+
+        FbBytes sessionKey = null;
+        if (authenticated == 0) {
+            if (this.plugin != "Srp" && this.plugin != "Srp256") {
+                data.Release();
+                this.lastError = "the server asked for the " + this.plugin
+                    + " authentication plugin, which this driver does not implement";
+                return false;
+            }
+            if (data.Len() == 0) {
+                // The server wants the public key again before it will send the
+                // salt: continue the exchange.
+                data.Release();
+                bool sent = await this.sendPacket(FirebirdConnection.ContAuth(
+                    srp.Public(), this.plugin, "Srp256,Srp"));
+                if (!sent) { return false; }
+                int op2 = await this.recvInt();
+                if (op2 == FbOp.RESPONSE) {
+                    FbResponse r = await this.recvResponse4();
+                    if (r != null) {
+                        this.lastError = r.Err().Message();
+                        r.Release();
+                    }
+                    return false;
+                }
+                if (op2 != FbOp.CONT_AUTH) {
+                    this.lastError = "unexpected authentication response "
+                        + Convert.ToString(op2);
+                    return false;
+                }
+                data = await this.recvBlock();
+                if (data == null) { return false; }
+                FbBytes skip = await this.recvBlock();      // plugin name
+                if (skip != null) { skip.Release(); }
+                skip = await this.recvBlock();              // plugin list
+                if (skip != null) { skip.Release(); }
+                skip = await this.recvBlock();              // keys
+                if (skip != null) { skip.Release(); }
+            }
+            if (data.Len() < 4) {
+                data.Release();
+                this.lastError = "the server sent no SRP challenge (login refused)";
+                return false;
+            }
+            int saltLen = (data.At(0) & 255) | ((data.At(1) & 255) << 8);
+            if (saltLen < 0 || saltLen + 4 > data.Len()) {
+                data.Release();
+                this.lastError = "malformed SRP challenge";
+                return false;
+            }
+            FbBytes salt = data.Slice(2, saltLen);
+            FbBytes keyHex = data.Slice(4 + saltLen, data.Len() - 4 - saltLen);
+            FbBytes serverPub = FbBytes.FromHex(keyHex.Text());
+            keyHex.Release();
+            FbSrpProof proof = srp.Prove(FbSrp.NormalizeUser(user), password,
+                                         salt, serverPub,
+                                         this.plugin == "Srp256");
+            salt.Release();
+            serverPub.Release();
+            this.authData = proof.Proof();
+            sessionKey = proof.Key();
+        } else {
+            this.authData = FbBytes.Empty();
+        }
+        data.Release();
+
+        if (op == FbOp.COND_ACCEPT) {
+            bool sent = await this.sendPacket(FirebirdConnection.ContAuth(
+                this.authData, this.plugin, "Srp256,Srp"));
+            if (!sent) {
+                if (sessionKey != null) { sessionKey.Release(); }
+                return false;
+            }
+            FbResponse resp = await this.recvResponse();
+            if (resp == null) {
+                if (sessionKey != null) { sessionKey.Release(); }
+                return false;
+            }
+            if (resp.Failed()) {
+                this.lastError = resp.Err().Message();
+                resp.Release();
+                if (sessionKey != null) { sessionKey.Release(); }
+                return false;
+            }
+            string enc = FirebirdConnection.GuessWireCrypt(resp.Buf());
+            resp.Release();
+            if (enc.Length > 0 && this.wantCrypt && sessionKey != null) {
+                if (enc != "Arc4") {
+                    this.lastError = "the server offers only the " + enc
+                        + " wire encryption plugin, which this driver does not"
+                        + " implement; run the connection through a tunnel or"
+                        + " allow Arc4";
+                    sessionKey.Release();
+                    return false;
+                }
+                bool up = await this.startCrypt(sessionKey);
+                sessionKey.Release();
+                if (!up) { return false; }
+                // The exchange already authenticated the session, so the attach
+                // must not repeat the proof in its parameter block.
+                this.authData.Release();
+                this.authData = FbBytes.Empty();
+                return true;
+            }
+        }
+        if (sessionKey != null) { sessionKey.Release(); }
+        return true;
+    }
+
+    /// <summary>Reads the body of a response whose opcode was already taken off
+    /// the wire.</summary>
+    async FbResponse recvResponse4() {
+        int handle = await this.recvInt();
+        FbBytes oid = await this.recvAligned(8);
+        if (oid == null) { return null; }
+        FbBytes buf = await this.recvBlock();
+        if (buf == null) {
+            oid.Release();
+            return null;
+        }
+        FbError err = await this.recvStatus();
+        return FbResponse.Of(handle, oid, buf, err);
+    }
+
+    static FbBytes ContAuth(FbBytes authData, string plugin, string pluginList) {
+        FbBuf p = FbBuf.Create();
+        p.Int(FbOp.CONT_AUTH);
+        p.Str(authData.Hex());
+        p.Str(plugin);
+        p.Str(pluginList);
+        p.Str("");
+        return p.ToBytes();
+    }
+
+    /// <summary>Picks a wire encryption plugin out of the server's offer. The
+    /// buffer is a clumplet list: tag 1 holds the space-separated plugin names.
+    /// </summary>
+    static string GuessWireCrypt(FbBytes buf) {
+        FbReader r = FbReader.Over(buf);
+        string names = "";
+        while (r.Left() >= 2) {
+            int tag = r.U8();
+            int ln = r.U8();
+            string v = r.Text(ln);
+            if (tag == 1) { names = v; }
+        }
+        if (names.Length == 0) { return ""; }
+        if (names.Contains("Arc4")) { return "Arc4"; }
+        int sp = names.IndexOf(" ");
+        if (sp > 0) { return names.Substring(0, sp); }
+        return names;
+    }
+
+    async bool startCrypt(FbBytes sessionKey) {
+        FbBuf p = FbBuf.Create();
+        p.Int(FbOp.CRYPT);
+        p.Str("Arc4");
+        p.Str("Symmetric");
+        bool sent = await this.sendPacket(p.ToBytes());
+        if (!sent) { return false; }
+        // The keystream starts with the next byte in each direction, so the
+        // translators go in after the request is on the wire and before the
+        // answer is read.
+        this.encOut = FbArc4.Create(sessionKey);
+        this.encIn = FbArc4.Create(sessionKey);
+        this.cryptPlugin = "Arc4";
+        FbResponse resp = await this.recvResponse();
+        if (resp == null) { return false; }
+        if (resp.Failed()) {
+            this.lastError = resp.Err().Message();
+            resp.Release();
+            return false;
+        }
+        resp.Release();
+        return true;
+    }
+
+    /// <summary>Builds <c>op_attach</c> with the database parameter block.</summary>
+    static FbBytes AttachPacket(string database, string user, FbBytes authData) {
+        FbBuf dpb = FbBuf.Create();
+        dpb.U8(FbOp.DPB_VERSION1);
+        FirebirdConnection.dpbStr(dpb, FbOp.DPB_LC_CTYPE, "UTF8");
+        FirebirdConnection.dpbStr(dpb, FbOp.DPB_USER_NAME, user);
+        FirebirdConnection.dpbStr(dpb, FbOp.DPB_PROCESS_NAME, "zan");
+        dpb.U8(FbOp.DPB_SQL_DIALECT);
+        dpb.U8(4);
+        dpb.U8(3); dpb.U8(0); dpb.U8(0); dpb.U8(0);
+        if (authData != null && authData.Len() > 0) {
+            FirebirdConnection.dpbStr(dpb, FbOp.DPB_SPECIFIC_AUTH_DATA,
+                                      authData.Hex());
+        }
+        FbBuf p = FbBuf.Create();
+        p.Int(FbOp.ATTACH);
+        p.Int(0);
+        p.Str(database);
+        FbBytes d = dpb.ToBytes();
+        p.Block(d);
+        d.Release();
+        return p.ToBytes();
+    }
+
+    static void dpbStr(FbBuf b, int tag, string v) {
+        b.U8(tag);
+        b.U8(v.Length);
+        b.Raw(v);
+    }
+
+    // ============================================================
+    // Transactions
+    // ============================================================
+
+    async bool beginTransaction() {
+        FbBuf tpb = FbBuf.Create();
+        tpb.U8(FbOp.TPB_VERSION3);
+        tpb.U8(FbOp.TPB_WRITE);
+        tpb.U8(FbOp.TPB_WAIT);
+        tpb.U8(FbOp.TPB_READ_COMMITTED);
+        tpb.U8(FbOp.TPB_REC_VERSION);
+
+        FbBuf p = FbBuf.Create();
+        p.Int(FbOp.TRANSACTION);
+        p.Int(this.dbHandle);
+        FbBytes t = tpb.ToBytes();
+        p.Block(t);
+        t.Release();
+        FbResponse resp = await this.roundTrip(p.ToBytes());
+        if (resp == null) { return false; }
+        if (resp.Failed()) {
+            resp.Release();
+            return false;
+        }
+        this.transHandle = resp.Handle();
+        resp.Release();
+        return true;
+    }
+
+    /// <summary>Commits without giving up the transaction handle: statements run
+    /// outside an explicit transaction are committed this way, which is what
+    /// makes the connection behave like an autocommitting one.</summary>
+    async bool commitRetaining() {
+        FbBuf p = FbBuf.Create();
+        p.Int(FbOp.COMMIT_RETAINING);
+        p.Int(this.transHandle);
+        FbResponse resp = await this.roundTrip(p.ToBytes());
+        if (resp == null) { return false; }
+        bool ok = !resp.Failed();
+        resp.Release();
+        return ok;
+    }
+
+    /// <summary>Commits the current transaction and starts a fresh one.</summary>
+    async bool CommitAsync() {
+        if (!this.connected) { return false; }
+        FbBuf p = FbBuf.Create();
+        p.Int(FbOp.COMMIT);
+        p.Int(this.transHandle);
+        FbResponse resp = await this.roundTrip(p.ToBytes());
+        if (resp == null) { return false; }
+        bool ok = !resp.Failed();
+        resp.Release();
+        this.transHandle = 0 - 1;
+        if (!ok) { return false; }
+        return await this.beginTransaction();
+    }
+
+    /// <summary>Rolls the current transaction back and starts a fresh one.</summary>
+    async bool RollbackAsync() {
+        if (!this.connected) { return false; }
+        FbBuf p = FbBuf.Create();
+        p.Int(FbOp.ROLLBACK);
+        p.Int(this.transHandle);
+        FbResponse resp = await this.roundTrip(p.ToBytes());
+        if (resp == null) { return false; }
+        bool ok = !resp.Failed();
+        resp.Release();
+        this.transHandle = 0 - 1;
+        if (!ok) { return false; }
+        return await this.beginTransaction();
+    }
+
+    // ============================================================
+    // Statements
+    // ============================================================
+
+    async int allocStatement() {
+        FbBuf p = FbBuf.Create();
+        p.Int(FbOp.ALLOCATE_STATEMENT);
+        p.Int(this.dbHandle);
+        FbResponse resp = await this.roundTrip(p.ToBytes());
+        if (resp == null) { return 0 - 1; }
+        if (resp.Failed()) {
+            resp.Release();
+            return 0 - 1;
+        }
+        int h = resp.Handle();
+        resp.Release();
+        return h;
+    }
+
+    /// <summary>The describe items a prepare asks for: the statement kind, then
+    /// the layout of every output column.</summary>
+    static FbBytes describeItems() {
+        FbBuf b = FbBuf.Create();
+        b.U8(FbType.INFO_STMT_TYPE);
+        b.U8(FbType.INFO_SELECT);
+        b.U8(FbType.INFO_DESCRIBE_VARS);
+        b.U8(FbType.INFO_SQLDA_SEQ);
+        b.U8(FbType.INFO_TYPE);
+        b.U8(FbType.INFO_SUB_TYPE);
+        b.U8(FbType.INFO_SCALE);
+        b.U8(FbType.INFO_LENGTH);
+        b.U8(FbType.INFO_NULL_IND);
+        b.U8(FbType.INFO_FIELD);
+        b.U8(FbType.INFO_RELATION);
+        b.U8(FbType.INFO_OWNER);
+        b.U8(FbType.INFO_ALIAS);
+        b.U8(FbType.INFO_DESCRIBE_END);
+        return b.ToBytes();
+    }
+
+    async FbXsqlda prepare(int stmt, string sql) {
+        FbBuf p = FbBuf.Create();
+        p.Int(FbOp.PREPARE_STATEMENT);
+        p.Int(this.transHandle);
+        p.Int(stmt);
+        p.Int(3);                       // SQL dialect
+        p.Str(sql);
+        FbBytes items = FirebirdConnection.describeItems();
+        p.Block(items);
+        items.Release();
+        p.Int(FirebirdConnection.INFO_BUFFER);
+        FbResponse resp = await this.roundTrip(p.ToBytes());
+        if (resp == null) { return null; }
+        if (resp.Failed()) {
+            resp.Release();
+            return null;
+        }
+        FbXsqlda xs = FbXsqlda.Create();
+        int next = xs.Parse(resp.Buf());
+        resp.Release();
+        if (next == 0 - 2) {
+            this.lastError = "malformed statement description";
+            return null;
+        }
+        // A description too large for one buffer comes back truncated; ask for
+        // the rest starting at the column the server stopped on.
+        while (next > 0) {
+            FbBuf q = FbBuf.Create();
+            q.Int(FbOp.INFO_SQL);
+            q.Int(stmt);
+            q.Int(0);
+            FbBuf items2 = FbBuf.Create();
+            items2.U8(FbType.INFO_SQLDA_START);
+            items2.U8(2);
+            items2.U8(next & 255);
+            items2.U8((next >> 8) & 255);
+            items2.U8(FbType.INFO_SELECT);
+            items2.U8(FbType.INFO_DESCRIBE_VARS);
+            items2.U8(FbType.INFO_SQLDA_SEQ);
+            items2.U8(FbType.INFO_TYPE);
+            items2.U8(FbType.INFO_SUB_TYPE);
+            items2.U8(FbType.INFO_SCALE);
+            items2.U8(FbType.INFO_LENGTH);
+            items2.U8(FbType.INFO_NULL_IND);
+            items2.U8(FbType.INFO_FIELD);
+            items2.U8(FbType.INFO_RELATION);
+            items2.U8(FbType.INFO_OWNER);
+            items2.U8(FbType.INFO_ALIAS);
+            items2.U8(FbType.INFO_DESCRIBE_END);
+            FbBytes i2 = items2.ToBytes();
+            q.Block(i2);
+            i2.Release();
+            q.Int(FirebirdConnection.INFO_BUFFER);
+            FbResponse more = await this.roundTrip(q.ToBytes());
+            if (more == null) { return null; }
+            if (more.Failed()) {
+                more.Release();
+                return null;
+            }
+            int again = xs.Parse(more.Buf());
+            more.Release();
+            if (again == next) {
+                this.lastError = "the server keeps truncating the description";
+                return null;
+            }
+            next = again;
+        }
+        return xs;
+    }
+
+    async bool execute(int stmt, DbParams prms) {
+        FbParamBlock pb = FbValue.Params(prms);
+        FbBuf p = FbBuf.Create();
+        p.Int(FbOp.EXECUTE);
+        p.Int(stmt);
+        p.Int(this.transHandle);
+        int count = 0;
+        if (prms != null) { count = prms.Count(); }
+        if (count == 0) {
+            FbBytes none = FbBytes.Empty();
+            p.Block(none);
+            none.Release();
+            p.Int(0);
+            p.Int(0);
+        } else {
+            p.Block(pb.Blr());
+            p.Int(0);
+            p.Int(1);
+            p.RawBlock(pb.Values());
+        }
+        pb.Release();
+        FbResponse resp = await this.roundTrip(p.ToBytes());
+        if (resp == null) { return false; }
+        bool ok = !resp.Failed();
+        resp.Release();
+        return ok;
+    }
+
+    async bool freeStatement(int stmt) {
+        FbBuf p = FbBuf.Create();
+        p.Int(FbOp.FREE_STATEMENT);
+        p.Int(stmt);
+        p.Int(FbOp.DSQL_DROP);
+        FbResponse resp = await this.roundTrip(p.ToBytes());
+        if (resp == null) { return false; }
+        bool ok = !resp.Failed();
+        resp.Release();
+        return ok;
+    }
+
+    /// <summary>Reads the row counters the last statement produced.</summary>
+    async int affectedRows(int stmt, bool select) {
+        FbBuf p = FbBuf.Create();
+        p.Int(FbOp.INFO_SQL);
+        p.Int(stmt);
+        p.Int(0);
+        FbBytes items = FbBytes.Alloc(1);
+        items.SetAt(0, FbType.INFO_RECORDS);
+        p.Block(items);
+        items.Release();
+        p.Int(FirebirdConnection.INFO_BUFFER);
+        FbResponse resp = await this.roundTrip(p.ToBytes());
+        if (resp == null) { return 0; }
+        if (resp.Failed()) {
+            resp.Release();
+            return 0;
+        }
+        int total = 0;
+        FbReader r = FbReader.Over(resp.Buf());
+        if (r.U8() == FbType.INFO_RECORDS) {
+            r.U16LE();                  // length of the counter group
+            bool more = true;
+            while (more && r.Left() > 0) {
+                int item = r.U8();
+                if (item == FbType.INFO_END) {
+                    more = false;
+                } else {
+                    int ln = r.U16LE();
+                    int v = r.IntLE(ln);
+                    if (select) {
+                        if (item == FbType.REQ_SELECT_COUNT) { total = v; }
+                    } else if (item == FbType.REQ_INSERT_COUNT
+                            || item == FbType.REQ_UPDATE_COUNT
+                            || item == FbType.REQ_DELETE_COUNT) {
+                        total = total + v;
+                    }
+                }
+            }
+        }
+        resp.Release();
+        return total;
+    }
+
+    // ============================================================
+    // Fetching
+    // ============================================================
+
+    /// <summary>Reads one value off the wire, honouring the four-byte alignment
+    /// every field is padded to.</summary>
+    async FbBytes fetchValue(FbColumn col) {
+        int n = col.IoLength();
+        if (n < 0) {
+            n = await this.recvInt();
+            if (n < 0) { return null; }
+        }
+        return await this.recvAligned(n);
+    }
+
+    /// <summary>Pulls every row of an open cursor. Blob columns are collected
+    /// and resolved afterwards, because their payload needs its own round
+    /// trips and those cannot be interleaved with the fetch stream.</summary>
+    async DbResult fetchAll(int stmt, FbXsqlda xs) {
+        DbResult res = DbResult.Create();
+        int cols = xs.Count();
+        res.SetColumnCount(cols);
+        int c = 0;
+        while (c < cols) {
+            res.AddColumnName(xs.At(c).Name());
+            c = c + 1;
+        }
+        List<FbRow> rows = new List<FbRow>();
+        List<FbBlobRef> blobs = new List<FbBlobRef>();
+        FbBytes blr = xs.CalcBlr();
+        int nullBytes = cols / 8;
+        if ((cols % 8) != 0) { nullBytes = nullBytes + 1; }
+
+        bool more = true;
+        while (more) {
+            FbBuf p = FbBuf.Create();
+            p.Int(FbOp.FETCH);
+            p.Int(stmt);
+            p.Block(blr);
+            p.Int(0);
+            p.Int(FirebirdConnection.FETCH_ROWS);
+            bool sent = await this.sendPacket(p.ToBytes());
+            if (!sent) {
+                blr.Release();
+                return res;
+            }
+            int op = await this.recvInt();
+            while (op == FbOp.DUMMY) {
+                op = await this.recvInt();
+            }
+            if (op == FbOp.RESPONSE) {
+                FbResponse r = await this.recvResponse4();
+                if (r != null) {
+                    if (r.Failed()) { this.lastError = r.Err().Message(); }
+                    r.Release();
+                }
+                blr.Release();
+                return res;
+            }
+            if (op != FbOp.FETCH_RESPONSE) {
+                this.lastError = "unexpected fetch response "
+                    + Convert.ToString(op);
+                this.connected = false;
+                blr.Release();
+                return res;
+            }
+            int status = await this.recvInt();
+            int count = await this.recvInt();
+            while (count != 0) {
+                FbBytes flags = await this.recvAligned(nullBytes);
+                if (flags == null) {
+                    blr.Release();
+                    return res;
+                }
+                FbRow row = FbRow.Create(cols);
+                int i = 0;
+                while (i < cols) {
+                    bool isNull = ((flags.At(i / 8) >> (i % 8)) & 1) != 0;
+                    if (!isNull) {
+                        FbColumn col = xs.At(i);
+                        FbBytes raw = await this.fetchValue(col);
+                        if (raw == null) {
+                            flags.Release();
+                            blr.Release();
+                            return res;
+                        }
+                        if (col.SqlType() == FbType.BLOB) {
+                            blobs.Add(FbBlobRef.Of(row, i, raw, col.SubType()));
+                            row.Set(i, "");
+                        } else {
+                            row.Set(i, FbValue.Decode(col, raw));
+                            raw.Release();
+                        }
+                    }
+                    i = i + 1;
+                }
+                flags.Release();
+                rows.Add(row);
+                op = await this.recvInt();
+                status = await this.recvInt();
+                count = await this.recvInt();
+            }
+            if (status == 100) { more = false; }
+        }
+        blr.Release();
+
+        int b = 0;
+        while (b < blobs.Count) {
+            FbBlobRef br = blobs[b];
+            string text = await this.readBlob(br.id, br.subtype);
+            br.row.Set(br.col, text);
+            br.id.Release();
+            b = b + 1;
+        }
+
+        int k = 0;
+        while (k < rows.Count) {
+            res.AddRowNulls(rows[k].Values(), rows[k].Nulls());
+            k = k + 1;
+        }
+        return res;
+    }
+
+    /// <summary>Reads a blob whole. Subtype 1 is text and comes back as such;
+    /// anything else is binary and is rendered as hex rather than being cut
+    /// short at its first zero byte.</summary>
+    async string readBlob(FbBytes blobId, int subtype) {
+        FbBuf p = FbBuf.Create();
+        p.Int(FbOp.OPEN_BLOB2);
+        p.Int(0);
+        p.Int(this.transHandle);
+        p.RawBlock(blobId);
+        FbResponse open = await this.roundTrip(p.ToBytes());
+        if (open == null) { return ""; }
+        if (open.Failed()) {
+            open.Release();
+            return "";
+        }
+        int h = open.Handle();
+        open.Release();
+
+        FbBuf all = FbBuf.Create();
+        bool more = true;
+        while (more) {
+            FbBuf g = FbBuf.Create();
+            g.Int(FbOp.GET_SEGMENT);
+            g.Int(h);
+            g.Int(FirebirdConnection.INFO_BUFFER);
+            g.Int(0);
+            FbResponse seg = await this.roundTrip(g.ToBytes());
+            if (seg == null) { return ""; }
+            if (seg.Failed()) {
+                seg.Release();
+                more = false;
+            } else {
+                FbReader r = FbReader.Over(seg.Buf());
+                while (r.Left() >= 2) {
+                    int ln = r.U16LE();
+                    FbBytes part = r.Raw(ln);
+                    all.RawBlock(part);
+                    part.Release();
+                }
+                if (seg.Handle() == 2) { more = false; }
+                seg.Release();
+            }
+        }
+
+        FbBuf cl = FbBuf.Create();
+        cl.Int(FbOp.CLOSE_BLOB);
+        cl.Int(h);
+        FbResponse close = await this.roundTrip(cl.ToBytes());
+        if (close != null) { close.Release(); }
+
+        FbBytes data = all.ToBytes();
+        string outp;
+        if (subtype == 1) {
+            outp = FbReader.Over(data).Text(data.Len());
+        } else {
+            outp = "0x" + data.Hex();
+        }
+        data.Release();
+        return outp;
+    }
+
+    // ============================================================
+    // Coroutine query API
+    // ============================================================
+
+    /// <summary>Runs a statement and returns its rows (empty for a statement
+    /// that produces none). <see cref="GetError"/> tells the two cases apart.
+    /// </summary>
+    async DbResult QueryAsync(string sql) {
+        return await this.QueryAsync(sql, null);
+    }
+
+    /// <summary>Runs a parameterized statement. Placeholders are the protocol's
+    /// own positional ones, so the values are bound rather than pasted into the
+    /// SQL text.</summary>
+    async DbResult QueryAsync(string sql, DbParams prms) {
+        this.lastError = "";
+        this.lastStatus = FbError.Create();
+        if (!this.connected) {
+            this.lastError = "not connected";
+            return DbResult.Empty();
+        }
+        int stmt = await this.allocStatement();
+        if (stmt < 0) { return DbResult.Empty(); }
+        FbXsqlda xs = await this.prepare(stmt, sql);
+        if (xs == null) {
+            await this.freeStatement(stmt);
+            return DbResult.Empty();
+        }
+        if (xs.StmtType() == FbType.STMT_EXEC_PROCEDURE && xs.Count() > 0) {
+            // A procedure with output parameters answers with op_sql_response
+            // instead of a cursor; say so rather than mis-reading the stream.
+            await this.freeStatement(stmt);
+            this.lastError = "EXECUTE PROCEDURE with output parameters is not"
+                + " supported; select from the procedure instead";
+            return DbResult.Empty();
+        }
+        bool ok = await this.execute(stmt, prms);
+        if (!ok) {
+            await this.freeStatement(stmt);
+            return DbResult.Empty();
+        }
+        DbResult res = DbResult.Empty();
+        if (xs.IsSelect() && xs.Count() > 0) {
+            res = await this.fetchAll(stmt, xs);
+            this.lastAffected = res.RowCount();
+        } else {
+            this.lastAffected = await this.affectedRows(stmt, false);
+        }
+        await this.freeStatement(stmt);
+        if (!xs.IsSelect()) {
+            await this.commitRetaining();
+        }
+        return res;
+    }
+
+    /// <summary>Runs a statement and returns how many rows it changed, or -1 on
+    /// failure.</summary>
+    async int ExecuteAsync(string sql) {
+        return await this.ExecuteAsync(sql, null);
+    }
+
+    /// <summary>Parameterized counterpart of ExecuteAsync.</summary>
+    async int ExecuteAsync(string sql, DbParams prms) {
+        DbResult r = await this.QueryAsync(sql, prms);
+        if (this.lastError.Length > 0) { return 0 - 1; }
+        return this.lastAffected;
+    }
+
+    /// <summary>First column of the first row, or "".</summary>
+    async string ExecuteScalarAsync(string sql) {
+        DbResult r = await this.QueryAsync(sql, null);
+        if (r.RowCount() == 0) { return ""; }
+        return r.GetString(0, 0);
+    }
+
+    /// <summary>Parameterized counterpart of ExecuteScalarAsync.</summary>
+    async string ExecuteScalarAsync(string sql, DbParams prms) {
+        DbResult r = await this.QueryAsync(sql, prms);
+        if (r.RowCount() == 0) { return ""; }
+        return r.GetString(0, 0);
+    }
+
+    /// <summary>Round trip that proves the session is still usable.</summary>
+    async bool PingAsync() {
+        if (!this.connected) { return false; }
+        FbBuf p = FbBuf.Create();
+        p.Int(FbOp.PING);
+        FbResponse resp = await this.roundTrip(p.ToBytes());
+        if (resp == null) { return false; }
+        bool ok = !resp.Failed();
+        resp.Release();
+        return ok;
+    }
+
+    // ============================================================
+    // State
+    // ============================================================
+
+    /// <summary>Rows affected by the last statement.</summary>
+    int AffectedRows() { return this.lastAffected; }
+
+    /// <summary>Description of the last failure, or "".</summary>
+    string GetError() { return this.lastError; }
+
+    /// <summary>Firebird SQL code of the last failure (0 when there was none).
+    /// </summary>
+    int SqlCode() { return this.lastStatus.SqlCode(); }
+
+    /// <summary>Authentication plugin the server chose.</summary>
+    string AuthPlugin() { return this.plugin; }
+
+    /// <summary>Wire encryption in use, or "" when the session is in the clear.
+    /// </summary>
+    string WireCrypt() { return this.cryptPlugin; }
+
+    /// <summary>Protocol version the server accepted.</summary>
+    int ProtocolVersion() { return this.acceptVersion; }
+
+    /// <summary>Database this session is attached to.</summary>
+    string Database() { return this.database; }
+
+    bool IsConnected() { return this.connected; }
+
+    int GetProvider() { return DbProvider.Firebird; }
+
+    /// <summary>Detaches politely (rolling the open transaction back) and then
+    /// closes the socket.</summary>
+    async void CloseAsync() {
+        if (this.connected && this.transHandle >= 0) {
+            FbBuf p = FbBuf.Create();
+            p.Int(FbOp.ROLLBACK);
+            p.Int(this.transHandle);
+            FbResponse r = await this.roundTrip(p.ToBytes());
+            if (r != null) { r.Release(); }
+            this.transHandle = 0 - 1;
+        }
+        if (this.connected && this.dbHandle >= 0) {
+            FbBuf p = FbBuf.Create();
+            p.Int(FbOp.DETACH);
+            p.Int(this.dbHandle);
+            FbResponse r = await this.roundTrip(p.ToBytes());
+            if (r != null) { r.Release(); }
+            this.dbHandle = 0 - 1;
+        }
+        this.Close();
+    }
+
+    /// <summary>Drops the connection without the detach round trip.</summary>
+    void Close() {
+        if (this.sock >= 0) {
+            Socket.Close(this.sock);
+            this.sock = 0 - 1;
+        }
+        this.connected = false;
+        this.encIn = null;
+        this.encOut = null;
+        if (this.authData != null) {
+            this.authData.Release();
+            this.authData = null;
+        }
+    }
+}

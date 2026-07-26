@@ -1,0 +1,575 @@
+using System;
+using System.Data;
+
+namespace System.Data.Firebird;
+
+/// <summary>
+/// Operation codes of the Firebird wire protocol (the <c>op_</c> constants of
+/// the server's <c>remote/protocol.h</c>), plus the protocol version this
+/// driver speaks.
+/// </summary>
+class FbOp {
+    static int CONNECT            = 1;
+    static int EXIT               = 2;
+    static int ACCEPT             = 3;
+    static int REJECT             = 4;
+    static int DISCONNECT         = 6;
+    static int RESPONSE           = 9;
+    static int ATTACH             = 19;
+    static int CREATE             = 20;
+    static int DETACH             = 21;
+    static int TRANSACTION        = 29;
+    static int COMMIT             = 30;
+    static int ROLLBACK           = 31;
+    static int OPEN_BLOB2         = 56;
+    static int GET_SEGMENT        = 36;
+    static int CLOSE_BLOB         = 39;
+    static int ALLOCATE_STATEMENT = 62;
+    static int EXECUTE            = 63;
+    static int FETCH              = 65;
+    static int FETCH_RESPONSE     = 66;
+    static int FREE_STATEMENT     = 67;
+    static int PREPARE_STATEMENT  = 68;
+    static int INFO_SQL           = 70;
+    static int DUMMY              = 71;
+    static int SQL_RESPONSE       = 78;
+    static int COMMIT_RETAINING   = 50;
+    static int CONT_AUTH          = 92;
+    static int PING               = 93;
+    static int ACCEPT_DATA        = 94;
+    static int CRYPT              = 96;
+    static int COND_ACCEPT        = 98;
+
+    /// <summary>Connect handshake version (CONNECT_VERSION3).</summary>
+    static int CONNECT_VERSION = 3;
+    /// <summary>Generic architecture (arch_generic).</summary>
+    static int ARCH_GENERIC = 1;
+    /// <summary>PROTOCOL_VERSION13 as it travels on the wire: the version word
+    /// is tagged with the FB_PROTOCOL_FLAG (0xFFFF8000) bit pattern. Version 13
+    /// is the first one with SRP authentication, wire encryption and the
+    /// bitmap-based NULL encoding, and it is the only one this driver speaks.
+    /// </summary>
+    static int PROTOCOL_V13 = 4294934541;   // 0xFFFF800D
+
+    static int PTYPE_RPC = 2;
+    static int PTYPE_BATCH_SEND = 3;
+
+    // op_free_statement modes
+    static int DSQL_CLOSE = 1;
+    static int DSQL_DROP  = 2;
+
+    // status vector argument kinds
+    static int ARG_END         = 0;
+    static int ARG_GDS         = 1;
+    static int ARG_STRING      = 2;
+    static int ARG_CSTRING     = 3;
+    static int ARG_NUMBER      = 4;
+    static int ARG_INTERPRETED = 5;
+    static int ARG_SQL_STATE   = 19;
+
+    // CNCT clumplet tags of the connect packet
+    static int CNCT_USER              = 1;
+    static int CNCT_HOST              = 4;
+    static int CNCT_USER_VERIFICATION = 6;
+    static int CNCT_SPECIFIC_DATA     = 7;
+    static int CNCT_PLUGIN_NAME       = 8;
+    static int CNCT_LOGIN             = 9;
+    static int CNCT_PLUGIN_LIST       = 10;
+    static int CNCT_CLIENT_CRYPT      = 11;
+
+    // database parameter block
+    static int DPB_VERSION1           = 1;
+    static int DPB_USER_NAME          = 28;
+    static int DPB_SQL_ROLE_NAME      = 60;
+    static int DPB_LC_CTYPE           = 48;
+    static int DPB_SQL_DIALECT        = 63;
+    static int DPB_PROCESS_NAME       = 74;
+    static int DPB_PROCESS_ID         = 71;
+    static int DPB_SPECIFIC_AUTH_DATA = 84;
+    static int DPB_UTF8_FILENAME      = 77;
+
+    // transaction parameter block
+    static int TPB_VERSION3       = 3;
+    static int TPB_WAIT           = 6;
+    static int TPB_WRITE          = 9;
+    static int TPB_READ_COMMITTED = 15;
+    static int TPB_REC_VERSION    = 17;
+}
+
+/// <summary>
+/// A counted block of bytes. Zan strings stop at their first NUL and the wire
+/// protocol is full of zero bytes (every integer is four bytes big-endian), so
+/// binary data has to travel with an explicit length.
+/// </summary>
+class FbBytes {
+    string data;
+    int len;
+
+    [DllImport("crt")]
+    static extern string calloc(int count, int size);
+
+    [DllImport("crt")]
+    static extern void free(string ptr);
+
+    FbBytes(string data, int len) {
+        this.data = data;
+        this.len = len;
+    }
+
+    /// <summary>Takes ownership of an allocated buffer.</summary>
+    static FbBytes Own(string data, int len) {
+        return new FbBytes(data, len);
+    }
+
+    /// <summary>Copies a Zan string's bytes into a counted block.</summary>
+    static FbBytes Of(string s) {
+        int n = s.Length;
+        string t = FbBytes.calloc(n + 1, 1);
+        int i = 0;
+        while (i < n) {
+            t[i] = s[i] & 255;
+            i = i + 1;
+        }
+        return new FbBytes(t, n);
+    }
+
+    static FbBytes Alloc(int n) {
+        if (n < 0) { n = 0; }
+        return new FbBytes(FbBytes.calloc(n + 1, 1), n);
+    }
+
+    static FbBytes Empty() {
+        return FbBytes.Alloc(0);
+    }
+
+    string Data() { return this.data; }
+    int Len() { return this.len; }
+    int At(int i) { return this.data[i] & 255; }
+    void SetAt(int i, int v) { this.data[i] = v & 255; }
+
+    /// <summary>The bytes as text, stopping at the first NUL.</summary>
+    string Text() {
+        int n = 0;
+        while (n < this.len && (this.data[n] & 255) != 0) {
+            n = n + 1;
+        }
+        return this.data.Substring(0, n);
+    }
+
+    /// <summary>A copy of <paramref name="n"/> bytes starting at
+    /// <paramref name="off"/>.</summary>
+    FbBytes Slice(int off, int n) {
+        if (off < 0) { off = 0; }
+        if (off + n > this.len) { n = this.len - off; }
+        FbBytes b = FbBytes.Alloc(n);
+        int i = 0;
+        while (i < n) {
+            b.SetAt(i, this.data[off + i] & 255);
+            i = i + 1;
+        }
+        return b;
+    }
+
+    /// <summary>Lower-case hex of the whole block.</summary>
+    string Hex() {
+        string h = "0123456789abcdef";
+        StringBuilder sb = new StringBuilder();
+        int i = 0;
+        while (i < this.len) {
+            int v = this.data[i] & 255;
+            sb.Append(h.Substring(v >> 4, 1));
+            sb.Append(h.Substring(v & 15, 1));
+            i = i + 1;
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>Decodes a hex string into a counted block.</summary>
+    static FbBytes FromHex(string hex) {
+        int n = hex.Length / 2;
+        FbBytes b = FbBytes.Alloc(n);
+        int i = 0;
+        while (i < n) {
+            b.SetAt(i, (FbBytes.nibble(hex[2 * i] & 255) << 4)
+                       | FbBytes.nibble(hex[2 * i + 1] & 255));
+            i = i + 1;
+        }
+        return b;
+    }
+
+    static int nibble(int c) {
+        if (c >= 48 && c <= 57) { return c - 48; }
+        if (c >= 97 && c <= 102) { return c - 87; }
+        if (c >= 65 && c <= 70) { return c - 55; }
+        return 0;
+    }
+
+    /// <summary>Frees a raw buffer another API handed over (a digest, say).
+    /// </summary>
+    static void Free(string p) {
+        FbBytes.free(p);
+    }
+
+    /// <summary>Releases the buffer. Callers own what they build.</summary>
+    void Release() {
+        FbBytes.free(this.data);
+        this.len = 0;
+    }
+}
+
+/// <summary>
+/// Builder for the protocol's XDR-ish framing: every integer is four bytes
+/// big-endian and every variable block is a length followed by its bytes padded
+/// out to a four-byte boundary.
+/// </summary>
+class FbBuf {
+    List<int> b;
+
+    [DllImport("crt")]
+    static extern string calloc(int count, int size);
+
+    [DllImport("crt")]
+    static extern void free(string ptr);
+
+    static string Alloc(int n) { return FbBuf.calloc(n + 1, 1); }
+    static void Release(string p) { FbBuf.free(p); }
+
+    FbBuf() {
+        this.b = new List<int>();
+    }
+
+    static FbBuf Create() {
+        return new FbBuf();
+    }
+
+    int Count() { return this.b.Count; }
+    int At(int i) { return this.b[i]; }
+
+    FbBuf U8(int v) {
+        this.b.Add(v & 255);
+        return this;
+    }
+
+    /// <summary>Four-byte big-endian integer.</summary>
+    FbBuf Int(int v) {
+        this.b.Add((v >> 24) & 255);
+        this.b.Add((v >> 16) & 255);
+        this.b.Add((v >> 8) & 255);
+        this.b.Add(v & 255);
+        return this;
+    }
+
+    /// <summary>Raw bytes of a Zan string, up to its NUL terminator.</summary>
+    FbBuf Raw(string s) {
+        int i = 0;
+        while (i < s.Length) {
+            this.b.Add(s[i] & 255);
+            i = i + 1;
+        }
+        return this;
+    }
+
+    /// <summary>Raw bytes of a counted block.</summary>
+    FbBuf RawBlock(FbBytes src) {
+        int i = 0;
+        while (i < src.Len()) {
+            this.b.Add(src.At(i));
+            i = i + 1;
+        }
+        return this;
+    }
+
+    void pad() {
+        while ((this.b.Count % 4) != 0) {
+            this.b.Add(0);
+        }
+    }
+
+    /// <summary>Length-prefixed, four-byte-aligned block.</summary>
+    FbBuf Block(FbBytes src) {
+        Int(src.Len());
+        RawBlock(src);
+        pad();
+        return this;
+    }
+
+    /// <summary>Length-prefixed, four-byte-aligned text.</summary>
+    FbBuf Str(string s) {
+        Int(s.Length);
+        Raw(s);
+        pad();
+        return this;
+    }
+
+    /// <summary>Materialises the buffer as a counted block.</summary>
+    FbBytes ToBytes() {
+        int n = this.b.Count;
+        string t = FbBuf.calloc(n + 1, 1);
+        int i = 0;
+        while (i < n) {
+            t[i] = this.b[i] & 255;
+            i = i + 1;
+        }
+        return FbBytes.Own(t, n);
+    }
+}
+
+/// <summary>Cursor over a received block.</summary>
+class FbReader {
+    string buf;
+    int pos;
+    int len;
+
+    FbReader(string buf, int len) {
+        this.buf = buf;
+        this.pos = 0;
+        this.len = len;
+    }
+
+    static FbReader Over(FbBytes b) {
+        return new FbReader(b.Data(), b.Len());
+    }
+
+    static FbReader Over(string buf, int len) {
+        return new FbReader(buf, len);
+    }
+
+    int Pos() { return this.pos; }
+    int Left() { return this.len - this.pos; }
+    bool Eof() { return this.pos >= this.len; }
+    void Skip(int n) {
+        this.pos = this.pos + n;
+        if (this.pos > this.len) { this.pos = this.len; }
+    }
+
+    int U8() {
+        if (this.pos >= this.len) { return 0; }
+        int v = this.buf[this.pos] & 255;
+        this.pos = this.pos + 1;
+        return v;
+    }
+
+    /// <summary>Two-byte little-endian integer: the info buffers and clumplets
+    /// inside a response are little-endian even though the framing is not.
+    /// </summary>
+    int U16LE() {
+        int a = U8();
+        int b = U8();
+        return a | (b << 8);
+    }
+
+    /// <summary>Unsigned little-endian integer of <paramref name="n"/> bytes.</summary>
+    int UIntLE(int n) {
+        int v = 0;
+        int i = 0;
+        while (i < n) {
+            v = v | (U8() << (i * 8));
+            i = i + 1;
+        }
+        return v;
+    }
+
+    /// <summary>Signed little-endian integer of <paramref name="n"/> bytes.</summary>
+    int IntLE(int n) {
+        int v = UIntLE(n);
+        int bits = n * 8;
+        if (bits < 64) {
+            int sign = 1 << (bits - 1);
+            if ((v & sign) != 0) {
+                v = v - (sign << 1);
+            }
+        }
+        return v;
+    }
+
+    /// <summary>Four-byte big-endian integer.</summary>
+    int Int() {
+        int a = U8();
+        int b = U8();
+        int c = U8();
+        int d = U8();
+        return (a << 24) | (b << 16) | (c << 8) | d;
+    }
+
+    /// <summary>Signed big-endian integer of <paramref name="n"/> bytes.</summary>
+    int IntBE(int n) {
+        int v = 0;
+        int i = 0;
+        while (i < n) {
+            v = (v << 8) | U8();
+            i = i + 1;
+        }
+        int bits = n * 8;
+        if (bits < 64) {
+            int sign = 1 << (bits - 1);
+            if ((v & sign) != 0) {
+                v = v - (sign << 1);
+            }
+        }
+        return v;
+    }
+
+    /// <summary><paramref name="n"/> raw bytes.</summary>
+    FbBytes Raw(int n) {
+        if (n < 0) { n = 0; }
+        if (this.pos + n > this.len) { n = this.len - this.pos; }
+        FbBytes b = FbBytes.Alloc(n);
+        int i = 0;
+        while (i < n) {
+            b.SetAt(i, this.buf[this.pos + i] & 255);
+            i = i + 1;
+        }
+        this.pos = this.pos + n;
+        return b;
+    }
+
+    /// <summary>Text of <paramref name="n"/> bytes.</summary>
+    string Text(int n) {
+        if (n <= 0) { return ""; }
+        if (this.pos + n > this.len) { n = this.len - this.pos; }
+        string t = FbBuf.Alloc(n);
+        int i = 0;
+        while (i < n) {
+            t[i] = this.buf[this.pos + i] & 255;
+            i = i + 1;
+        }
+        string s = t.Substring(0, n);
+        FbBuf.Release(t);
+        this.pos = this.pos + n;
+        return s;
+    }
+}
+
+/// <summary>
+/// ARC4 keystream, the wire-encryption plugin every Firebird 3+ server carries.
+/// It is weak by modern standards but it is what the protocol offers without a
+/// TLS tunnel; a deployment that cares should put the connection inside one.
+/// Send and receive directions each need their own instance because the
+/// keystream is stateful.
+/// </summary>
+class FbArc4 {
+    List<int> s;
+    int x;
+    int y;
+
+    FbArc4(List<int> s) {
+        this.s = s;
+        this.x = 0;
+        this.y = 0;
+    }
+
+    static FbArc4 Create(FbBytes key) {
+        List<int> s = new List<int>();
+        int i = 0;
+        while (i < 256) {
+            s.Add(i);
+            i = i + 1;
+        }
+        int j = 0;
+        i = 0;
+        while (i < 256) {
+            j = (j + s[i] + key.At(i % key.Len())) % 256;
+            int t = s[i];
+            s[i] = s[j];
+            s[j] = t;
+            i = i + 1;
+        }
+        return new FbArc4(s);
+    }
+
+    /// <summary>XORs <paramref name="len"/> bytes of the buffer in place;
+    /// encryption and decryption are the same operation.</summary>
+    void Translate(string buf, int off, int len) {
+        int i = 0;
+        while (i < len) {
+            this.x = (this.x + 1) % 256;
+            this.y = (this.y + this.s[this.x]) % 256;
+            int t = this.s[this.x];
+            this.s[this.x] = this.s[this.y];
+            this.s[this.y] = t;
+            int k = this.s[(this.s[this.x] + this.s[this.y]) % 256];
+            buf[off + i] = (buf[off + i] & 255) ^ k;
+            i = i + 1;
+        }
+    }
+}
+
+/// <summary>
+/// A decoded status vector: the gds error codes, the SQL code and a readable
+/// message assembled from the server's argument list.
+/// </summary>
+class FbError {
+    List<int> codes;
+    int sqlCode;
+    string message;
+
+    FbError() {
+        this.codes = new List<int>();
+        this.sqlCode = 0;
+        this.message = "";
+    }
+
+    static FbError Create() {
+        return new FbError();
+    }
+
+    void AddCode(int c) { this.codes.Add(c); }
+    void SetSqlCode(int c) { this.sqlCode = c; }
+    void SetMessage(string m) { this.message = m; }
+
+    bool Failed() { return this.message.Length > 0; }
+    int SqlCode() { return this.sqlCode; }
+    string Message() { return this.message; }
+    int CodeCount() { return this.codes.Count; }
+    int CodeAt(int i) { return this.codes[i]; }
+
+    /// <summary>True when the vector carries the given gds code.</summary>
+    bool Has(int code) {
+        int i = 0;
+        while (i < this.codes.Count) {
+            if (this.codes[i] == code) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// Text of the common gds codes with their <c>@n</c> placeholders. The
+    /// server sends numbers, not text, and shipping the whole message table
+    /// (some two thousand entries) is not worth it; anything unlisted is
+    /// reported as its numeric code so it can still be looked up.
+    /// </summary>
+    static string Text(int code) {
+        if (code == 335544321) { return "arithmetic exception, numeric overflow, or string truncation"; }
+        if (code == 335544336) { return "deadlock"; }
+        if (code == 335544344) { return "I/O error during \"@1\" operation for file \"@2\""; }
+        if (code == 335544345) { return "lock conflict on no wait transaction"; }
+        if (code == 335544347) { return "validation error for column @1, value \"@2\""; }
+        if (code == 335544349) { return "attempt to store duplicate value in unique index \"@1\""; }
+        if (code == 335544351) { return "unsuccessful metadata update"; }
+        if (code == 335544352) { return "no permission for @1 access to @2 @3"; }
+        if (code == 335544359) { return "attempted update of read-only column @1"; }
+        if (code == 335544382) { return "@1"; }
+        if (code == 335544436) { return "SQL error code = @1"; }
+        if (code == 335544438) { return "function @1 is not defined"; }
+        if (code == 335544451) { return "update conflicts with concurrent update"; }
+        if (code == 335544466) { return "violation of FOREIGN KEY constraint \"@1\" on table \"@2\""; }
+        if (code == 335544472) { return "Your user name and password are not defined"; }
+        if (code == 335544528) { return "database @1 shutdown"; }
+        if (code == 335544557) { return "connection shutdown"; }
+        if (code == 335544569) { return "Dynamic SQL Error"; }
+        if (code == 335544580) { return "Table unknown"; }
+        if (code == 335544620) { return "Column unknown"; }
+        if (code == 335544634) { return "Token unknown"; }
+        if (code == 335544665) { return "violation of PRIMARY or UNIQUE KEY constraint \"@1\" on table \"@2\""; }
+        if (code == 335544721) { return "Unable to complete network request to host \"@1\""; }
+        if (code == 335544726) { return "Error reading data from the connection"; }
+        if (code == 335544741) { return "user name and password are required"; }
+        if (code == 335544772) { return "Cannot attach to services manager"; }
+        if (code == 335544842) { return "@1"; }
+        if (code == 335544878) { return "concurrent transaction number is @1"; }
+        if (code == 336397208) { return "At line @1, column @2"; }
+        if (code == 336003075) { return "Dynamic SQL Error"; }
+        return "firebird error " + Convert.ToString(code);
+    }
+}

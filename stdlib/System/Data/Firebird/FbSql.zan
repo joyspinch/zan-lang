@@ -1,0 +1,647 @@
+using System;
+using System.Data;
+
+namespace System.Data.Firebird;
+
+/// <summary>Firebird SQL type codes (the odd variants that mean "nullable" are
+/// folded onto the even base type when metadata is parsed).</summary>
+class FbType {
+    static int TEXT         = 452;
+    static int VARYING      = 448;
+    static int SHORT        = 500;
+    static int LONG         = 496;
+    static int FLOAT        = 482;
+    static int DOUBLE       = 480;
+    static int D_FLOAT      = 530;
+    static int TIMESTAMP    = 510;
+    static int BLOB         = 520;
+    static int ARRAY        = 540;
+    static int QUAD         = 550;
+    static int TIME         = 560;
+    static int DATE         = 570;
+    static int INT64        = 580;
+    static int INT128       = 32752;
+    static int TIMESTAMP_TZ = 32754;
+    static int TIME_TZ      = 32756;
+    static int DEC_FIXED    = 32758;
+    static int DEC64        = 32760;
+    static int DEC128       = 32762;
+    static int BOOLEAN      = 32764;
+    static int NULL         = 32766;
+
+    // isc_info_sql_* items of a describe request
+    static int INFO_END           = 1;
+    static int INFO_TRUNCATED     = 2;
+    static int INFO_SELECT        = 4;
+    static int INFO_BIND          = 5;
+    static int INFO_DESCRIBE_VARS = 7;
+    static int INFO_DESCRIBE_END  = 8;
+    static int INFO_SQLDA_SEQ     = 9;
+    static int INFO_TYPE          = 11;
+    static int INFO_SUB_TYPE      = 12;
+    static int INFO_SCALE         = 13;
+    static int INFO_LENGTH        = 14;
+    static int INFO_NULL_IND      = 15;
+    static int INFO_FIELD         = 16;
+    static int INFO_RELATION      = 17;
+    static int INFO_OWNER         = 18;
+    static int INFO_ALIAS         = 19;
+    static int INFO_SQLDA_START   = 20;
+    static int INFO_STMT_TYPE     = 21;
+    static int INFO_RECORDS       = 23;
+
+    // isc_info_req_* counters inside isc_info_sql_records
+    static int REQ_SELECT_COUNT = 13;
+    static int REQ_INSERT_COUNT = 14;
+    static int REQ_UPDATE_COUNT = 15;
+    static int REQ_DELETE_COUNT = 16;
+
+    // statement kinds
+    static int STMT_SELECT = 1;
+    static int STMT_INSERT = 2;
+    static int STMT_UPDATE = 3;
+    static int STMT_DELETE = 4;
+    static int STMT_DDL    = 5;
+    static int STMT_EXEC_PROCEDURE = 8;
+    static int STMT_SELECT_FOR_UPD = 12;
+}
+
+/// <summary>One column of a prepared statement's output row.</summary>
+class FbColumn {
+    int sqltype;
+    int subtype;
+    int scale;
+    int sqllen;
+    bool nullOk;
+    string field;
+    string relation;
+    string owner;
+    string alias;
+
+    FbColumn() {
+        this.sqltype = 0;
+        this.subtype = 0;
+        this.scale = 0;
+        this.sqllen = 0;
+        this.nullOk = false;
+        this.field = "";
+        this.relation = "";
+        this.owner = "";
+        this.alias = "";
+    }
+
+    static FbColumn Create() {
+        return new FbColumn();
+    }
+
+    /// <summary>A column of a known shape, for decoding a value without a
+    /// describe buffer to hand.</summary>
+    static FbColumn Of(int sqltype, int scale, int sqllen) {
+        FbColumn c = new FbColumn();
+        c.sqltype = sqltype;
+        c.scale = scale;
+        c.sqllen = sqllen;
+        return c;
+    }
+
+    int SqlType() { return this.sqltype; }
+    int SubType() { return this.subtype; }
+    int Scale() { return this.scale; }
+    int Length() { return this.sqllen; }
+    bool NullOk() { return this.nullOk; }
+    string Field() { return this.field; }
+    string Relation() { return this.relation; }
+
+    /// <summary>Column name as the result set should show it: the SELECT alias
+    /// when there is one, otherwise the underlying field name.</summary>
+    string Name() {
+        if (this.alias.Length > 0) { return this.alias; }
+        return this.field;
+    }
+
+    /// <summary>Bytes this column occupies in a fetched row, or -1 when it is
+    /// length-prefixed (VARCHAR).</summary>
+    int IoLength() {
+        int t = this.sqltype;
+        if (t == FbType.TEXT) { return this.sqllen; }
+        if (t == FbType.VARYING) { return 0 - 1; }
+        if (t == FbType.SHORT || t == FbType.LONG || t == FbType.FLOAT
+                || t == FbType.TIME || t == FbType.DATE) { return 4; }
+        if (t == FbType.DOUBLE || t == FbType.TIMESTAMP || t == FbType.BLOB
+                || t == FbType.ARRAY || t == FbType.QUAD || t == FbType.INT64
+                || t == FbType.DEC64 || t == FbType.TIME_TZ) { return 8; }
+        if (t == FbType.INT128 || t == FbType.DEC128
+                || t == FbType.DEC_FIXED) { return 16; }
+        if (t == FbType.TIMESTAMP_TZ) { return 12; }
+        if (t == FbType.BOOLEAN) { return 1; }
+        return this.sqllen;
+    }
+}
+
+/// <summary>Output row layout of a prepared statement, decoded from the
+/// server's describe buffer.</summary>
+class FbXsqlda {
+    List<FbColumn> cols;
+    int stmtType;
+
+    FbXsqlda() {
+        this.cols = new List<FbColumn>();
+        this.stmtType = 0;
+    }
+
+    static FbXsqlda Create() {
+        return new FbXsqlda();
+    }
+
+    int Count() { return this.cols.Count; }
+    FbColumn At(int i) { return this.cols[i]; }
+    int StmtType() { return this.stmtType; }
+    void SetStmtType(int t) { this.stmtType = t; }
+
+    /// <summary>True when fetching rows is the way to consume the statement.</summary>
+    bool IsSelect() {
+        return this.stmtType == FbType.STMT_SELECT
+            || this.stmtType == FbType.STMT_SELECT_FOR_UPD;
+    }
+
+    void Resize(int n) {
+        while (this.cols.Count < n) {
+            this.cols.Add(FbColumn.Create());
+        }
+    }
+
+    /// <summary>
+    /// Reads a describe buffer into this layout. Returns the 1-based index the
+    /// server truncated at (so the caller can ask for the rest with
+    /// <c>isc_info_sql_sqlda_start</c>), or -1 when the description is
+    /// complete, or -2 when the buffer is not a describe answer at all.
+    /// </summary>
+    int Parse(FbBytes buf) {
+        FbReader r = FbReader.Over(buf);
+        int next = 0 - 1;
+        while (!r.Eof()) {
+            int item = r.U8();
+            if (item == FbType.INFO_END) {
+                return next;
+            }
+            if (item == FbType.INFO_STMT_TYPE) {
+                int ln = r.U16LE();
+                this.stmtType = r.IntLE(ln);
+            } else if (item == FbType.INFO_SELECT) {
+                if (r.U8() != FbType.INFO_DESCRIBE_VARS) { return 0 - 2; }
+                int ln = r.U16LE();
+                int n = r.IntLE(ln);
+                Resize(n);
+                next = ParseItems(r);
+                if (next > 0) { return next; }
+            } else if (item == FbType.INFO_TRUNCATED) {
+                return next;
+            } else {
+                return 0 - 2;
+            }
+        }
+        return next;
+    }
+
+    /// <summary>Reads the per-column items; returns the index to resume from
+    /// when the server ran out of buffer, -1 when the list is complete.</summary>
+    int ParseItems(FbReader r) {
+        int index = 0;
+        while (!r.Eof()) {
+            int item = r.U8();
+            if (item == FbType.INFO_END) { return 0 - 1; }
+            if (item == FbType.INFO_TRUNCATED) { return index; }
+            if (item == FbType.INFO_DESCRIBE_END) { continue; }
+            int ln = r.U16LE();
+            if (item == FbType.INFO_SQLDA_SEQ) {
+                index = r.IntLE(ln);
+                Resize(index);
+                continue;
+            }
+            if (index < 1) {
+                r.Skip(ln);
+                continue;
+            }
+            FbColumn c = this.cols[index - 1];
+            if (item == FbType.INFO_TYPE) {
+                // The low bit of the type marks "may be NULL"; the type itself
+                // is the even value.
+                int tv = r.IntLE(ln);
+                c.sqltype = tv - (tv & 1);
+            } else if (item == FbType.INFO_SUB_TYPE) {
+                c.subtype = r.IntLE(ln);
+            } else if (item == FbType.INFO_SCALE) {
+                c.scale = r.IntLE(ln);
+            } else if (item == FbType.INFO_LENGTH) {
+                c.sqllen = r.IntLE(ln);
+            } else if (item == FbType.INFO_NULL_IND) {
+                c.nullOk = r.IntLE(ln) != 0;
+            } else if (item == FbType.INFO_FIELD) {
+                c.field = r.Text(ln);
+            } else if (item == FbType.INFO_RELATION) {
+                c.relation = r.Text(ln);
+            } else if (item == FbType.INFO_OWNER) {
+                c.owner = r.Text(ln);
+            } else if (item == FbType.INFO_ALIAS) {
+                c.alias = r.Text(ln);
+            } else {
+                r.Skip(ln);
+            }
+        }
+        return 0 - 1;
+    }
+
+    /// <summary>Row format the server should send fetched rows in.</summary>
+    FbBytes CalcBlr() {
+        FbBuf b = FbBuf.Create();
+        int ln = this.cols.Count * 2;
+        b.U8(5); b.U8(2); b.U8(4); b.U8(0);
+        b.U8(ln & 255); b.U8((ln >> 8) & 255);
+        int i = 0;
+        while (i < this.cols.Count) {
+            FbColumn c = this.cols[i];
+            int t = c.sqltype;
+            if (t == FbType.VARYING) {
+                b.U8(37); b.U8(c.sqllen & 255); b.U8((c.sqllen >> 8) & 255);
+            } else if (t == FbType.TEXT) {
+                b.U8(14); b.U8(c.sqllen & 255); b.U8((c.sqllen >> 8) & 255);
+            } else if (t == FbType.LONG) {
+                b.U8(8); b.U8(c.scale & 255);
+            } else if (t == FbType.SHORT) {
+                b.U8(7); b.U8(c.scale & 255);
+            } else if (t == FbType.INT64) {
+                b.U8(16); b.U8(c.scale & 255);
+            } else if (t == FbType.INT128 || t == FbType.DEC_FIXED) {
+                b.U8(26); b.U8(c.scale & 255);
+            } else if (t == FbType.QUAD) {
+                b.U8(9); b.U8(c.scale & 255);
+            } else if (t == FbType.DOUBLE) {
+                b.U8(27);
+            } else if (t == FbType.FLOAT) {
+                b.U8(10);
+            } else if (t == FbType.D_FLOAT) {
+                b.U8(11);
+            } else if (t == FbType.DATE) {
+                b.U8(12);
+            } else if (t == FbType.TIME) {
+                b.U8(13);
+            } else if (t == FbType.TIMESTAMP) {
+                b.U8(35);
+            } else if (t == FbType.BLOB || t == FbType.ARRAY) {
+                b.U8(9); b.U8(0);
+            } else if (t == FbType.BOOLEAN) {
+                b.U8(23);
+            } else if (t == FbType.DEC64) {
+                b.U8(24);
+            } else if (t == FbType.DEC128) {
+                b.U8(25);
+            } else if (t == FbType.TIME_TZ) {
+                b.U8(28);
+            } else if (t == FbType.TIMESTAMP_TZ) {
+                b.U8(29);
+            } else {
+                b.U8(14); b.U8(c.sqllen & 255); b.U8((c.sqllen >> 8) & 255);
+            }
+            b.U8(7); b.U8(0);           // blr_short: the NULL indicator
+            i = i + 1;
+        }
+        b.U8(255); b.U8(76);            // blr_end, blr_eoc
+        return b.ToBytes();
+    }
+}
+
+/// <summary>Input parameters encoded the way <c>op_execute</c> wants them: a
+/// BLR message describing the values, and the values themselves.</summary>
+class FbParamBlock {
+    FbBytes blr;
+    FbBytes values;
+
+    FbParamBlock(FbBytes blr, FbBytes values) {
+        this.blr = blr;
+        this.values = values;
+    }
+
+    static FbParamBlock Of(FbBytes blr, FbBytes values) {
+        return new FbParamBlock(blr, values);
+    }
+
+    FbBytes Blr() { return this.blr; }
+    FbBytes Values() { return this.values; }
+
+    void Release() {
+        this.blr.Release();
+        this.values.Release();
+    }
+}
+
+/// <summary>Encoders and decoders for statement values.</summary>
+class FbValue {
+    static string HEX = "0123456789abcdef";
+
+    /// <summary>IEEE-754 bit pattern of a double: the language has no
+    /// reinterpret cast, so the value is normalised by hand.</summary>
+    static int DoubleBits(double v) {
+        if (v == 0.0) { return 0; }
+        int sign = 0;
+        if (v < 0.0) {
+            sign = 1;
+            v = 0.0 - v;
+        }
+        int exp = 0;
+        while (v >= 2.0) { v = v / 2.0; exp = exp + 1; }
+        while (v < 1.0) { v = v * 2.0; exp = exp - 1; }
+        double frac = v - 1.0;
+        int mant = 0;
+        int i = 0;
+        while (i < 52) {
+            frac = frac * 2.0;
+            int bit = 0;
+            if (frac >= 1.0) {
+                bit = 1;
+                frac = frac - 1.0;
+            }
+            mant = (mant << 1) | bit;
+            i = i + 1;
+        }
+        return (sign << 63) | ((exp + 1023) << 52) | mant;
+    }
+
+    /// <summary>2^e as a double (e may be negative).</summary>
+    static double Pow2(int e) {
+        double v = 1.0;
+        int i = 0;
+        if (e >= 0) {
+            while (i < e) { v = v * 2.0; i = i + 1; }
+        } else {
+            while (i > e) { v = v / 2.0; i = i - 1; }
+        }
+        return v;
+    }
+
+    static string Ieee(int sign, int exp, int mant, int bias, int mantBits) {
+        if (exp == 0 && mant == 0) { return "0"; }
+        double m = 1.0;
+        int b = mantBits - 1;
+        while (b >= 0) {
+            if (((mant >> b) & 1) == 1) { m = m + FbValue.Pow2(b - mantBits); }
+            b = b - 1;
+        }
+        double v = m * FbValue.Pow2(exp - bias);
+        if (sign == 1) { v = 0.0 - v; }
+        return Convert.ToString(v);
+    }
+
+    static string Pad2(int v) {
+        if (v < 10) { return "0" + Convert.ToString(v); }
+        return Convert.ToString(v);
+    }
+
+    static string Pad4(int v) {
+        string s = Convert.ToString(v);
+        while (s.Length < 4) { s = "0" + s; }
+        return s;
+    }
+
+    /// <summary>Civil date from a day count relative to 1970-01-01.</summary>
+    static string CivilDate(int z) {
+        z = z + 719468;
+        int era = z / 146097;
+        if (z < 0) { era = (z - 146096) / 146097; }
+        int doe = z - era * 146097;
+        int yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+        int y = yoe + era * 400;
+        int doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        int mp = (5 * doy + 2) / 153;
+        int d = doy - (153 * mp + 2) / 5 + 1;
+        int m = mp + 3;
+        if (mp >= 10) { m = mp - 9; }
+        if (m <= 2) { y = y + 1; }
+        return FbValue.Pad4(y) + "-" + FbValue.Pad2(m) + "-" + FbValue.Pad2(d);
+    }
+
+    /// <summary>Firebird stores dates as days since 1858-11-17 (the modified
+    /// Julian epoch); 40587 of those days precede 1970-01-01.</summary>
+    static string Date(int nday) {
+        return FbValue.CivilDate(nday - 40587);
+    }
+
+    /// <summary>Time of day from ten-thousandths of a second.</summary>
+    static string Time(int n) {
+        int frac = n % 10000;
+        int secs = n / 10000;
+        string s = FbValue.Pad2(secs / 3600) + ":" + FbValue.Pad2((secs / 60) % 60)
+            + ":" + FbValue.Pad2(secs % 60);
+        if (frac == 0) { return s; }
+        string f = Convert.ToString(frac);
+        while (f.Length < 4) { f = "0" + f; }
+        return s + "." + f;
+    }
+
+    /// <summary>Renders an integer that carries <paramref name="scale"/> implied
+    /// decimals (scale is negative in Firebird metadata).</summary>
+    static string Scaled(int units, int scale) {
+        if (scale >= 0) { return Convert.ToString(units); }
+        int digitsAfter = 0 - scale;
+        bool neg = units < 0;
+        if (neg) { units = 0 - units; }
+        string digits = Convert.ToString(units);
+        while (digits.Length <= digitsAfter) { digits = "0" + digits; }
+        int cut = digits.Length - digitsAfter;
+        string outp = digits.Substring(0, cut) + "."
+            + digits.Substring(cut, digitsAfter);
+        if (neg) { outp = "-" + outp; }
+        return outp;
+    }
+
+    /// <summary>Decimal text of a two's-complement big-endian integer of any
+    /// width (INT128 does not fit in a machine word).</summary>
+    static string WideDecimal(FbBytes raw, int scale) {
+        int n = raw.Len();
+        List<int> mag = new List<int>();
+        bool neg = (raw.At(0) & 128) != 0;
+        int carry = 1;
+        int i = n - 1;
+        while (i >= 0) {
+            int v = raw.At(i);
+            if (neg) {
+                v = (v ^ 255) + carry;
+                carry = (v >> 8) & 1;
+                v = v & 255;
+            }
+            mag.Add(v);                 // little-endian magnitude
+            i = i - 1;
+        }
+        StringBuilder rev = new StringBuilder();
+        bool any = true;
+        while (any) {
+            int rem = 0;
+            int k = mag.Count - 1;
+            any = false;
+            while (k >= 0) {
+                int cur = (rem << 8) | mag[k];
+                int q = cur / 10;
+                rem = cur - q * 10;
+                mag[k] = q;
+                if (q != 0) { any = true; }
+                k = k - 1;
+            }
+            rev.Append(FbValue.HEX.Substring(rem, 1));
+        }
+        StringBuilder fwd = new StringBuilder();
+        string s = rev.ToString();
+        int j = s.Length - 1;
+        while (j >= 0) {
+            fwd.Append(s.Substring(j, 1));
+            j = j - 1;
+        }
+        string digits = fwd.ToString();
+        while (digits.Length > 1 && digits.Substring(0, 1) == "0") {
+            digits = digits.Substring(1, digits.Length - 1);
+        }
+        if (scale < 0) {
+            int after = 0 - scale;
+            while (digits.Length <= after) { digits = "0" + digits; }
+            int cut = digits.Length - after;
+            digits = digits.Substring(0, cut) + "." + digits.Substring(cut, after);
+        }
+        if (neg && digits != "0") { digits = "-" + digits; }
+        return digits;
+    }
+
+    static string Hex(FbBytes raw) {
+        return "0x" + raw.Hex();
+    }
+
+    /// <summary>
+    /// Renders one fetched value as text. BLOB columns are not decoded here --
+    /// their payload lives in another set of round trips, so the connection
+    /// resolves those before building the row.
+    /// </summary>
+    static string Decode(FbColumn col, FbBytes raw) {
+        int t = col.SqlType();
+        FbReader r = FbReader.Over(raw);
+        if (t == FbType.TEXT) {
+            string s = r.Text(raw.Len());
+            int end = s.Length;
+            while (end > 0 && s.Substring(end - 1, 1) == " ") { end = end - 1; }
+            return s.Substring(0, end);
+        }
+        if (t == FbType.VARYING) {
+            return r.Text(raw.Len());
+        }
+        if (t == FbType.SHORT || t == FbType.LONG || t == FbType.INT64) {
+            return FbValue.Scaled(r.IntBE(raw.Len()), col.Scale());
+        }
+        if (t == FbType.INT128 || t == FbType.DEC_FIXED) {
+            return FbValue.WideDecimal(raw, col.Scale());
+        }
+        if (t == FbType.BOOLEAN) {
+            if (r.U8() == 0) { return "0"; }
+            return "1";
+        }
+        if (t == FbType.FLOAT) {
+            int bits = r.Int() & 4294967295;
+            return FbValue.Ieee((bits >> 31) & 1, (bits >> 23) & 255,
+                                bits & 8388607, 127, 23);
+        }
+        if (t == FbType.DOUBLE || t == FbType.D_FLOAT) {
+            int hi = r.Int() & 4294967295;
+            int lo = r.Int() & 4294967295;
+            int bits = (hi << 32) | lo;
+            return FbValue.Ieee((bits >> 63) & 1, (bits >> 52) & 2047,
+                                bits & 4503599627370495, 1023, 52);
+        }
+        if (t == FbType.DATE) {
+            return FbValue.Date(r.IntBE(4));
+        }
+        if (t == FbType.TIME) {
+            return FbValue.Time(r.IntBE(4));
+        }
+        if (t == FbType.TIMESTAMP) {
+            string d = FbValue.Date(r.IntBE(4));
+            return d + " " + FbValue.Time(r.IntBE(4));
+        }
+        if (t == FbType.TIME_TZ) {
+            // The zone id is dropped: mapping ids to names needs the server's
+            // zone table. The time itself is the one the zone was recorded in.
+            return FbValue.Time(r.IntBE(4));
+        }
+        if (t == FbType.TIMESTAMP_TZ) {
+            string d = FbValue.Date(r.IntBE(4));
+            return d + " " + FbValue.Time(r.IntBE(4));
+        }
+        // DECFLOAT and anything unrecognised keep their bytes rather than being
+        // silently mangled into a wrong number.
+        return FbValue.Hex(raw);
+    }
+
+    /// <summary>
+    /// Encodes a parameter list as the BLR message plus values <c>op_execute</c>
+    /// carries. Protocol 13 puts a NULL bitmap in front of the values, so a NULL
+    /// parameter contributes nothing but its bit.
+    /// </summary>
+    static FbParamBlock Params(DbParams prms) {
+        int count = 0;
+        if (prms != null) { count = prms.Count(); }
+        FbBuf blr = FbBuf.Create();
+        int ln = count * 2;
+        blr.U8(5); blr.U8(2); blr.U8(4); blr.U8(0);
+        blr.U8(ln & 255); blr.U8((ln >> 8) & 255);
+
+        FbBuf vals = FbBuf.Create();
+        int nbytes = count / 8;
+        if ((count % 8) != 0) { nbytes = nbytes + 1; }
+        if ((nbytes % 4) != 0) { nbytes = nbytes + 4 - (nbytes % 4); }
+        int i = 0;
+        while (i < nbytes) {
+            int bits = 0;
+            int k = 0;
+            while (k < 8) {
+                int idx = i * 8 + k;
+                if (idx < count && prms.KindAt(idx) == DbParams.KindNull) {
+                    bits = bits | (1 << k);
+                }
+                k = k + 1;
+            }
+            vals.U8(bits);
+            i = i + 1;
+        }
+
+        i = 0;
+        while (i < count) {
+            int kind = prms.KindAt(i);
+            if (kind == DbParams.KindNull) {
+                blr.U8(14); blr.U8(0); blr.U8(0);       // blr_text, length 0
+            } else if (kind == DbParams.KindInt) {
+                blr.U8(16); blr.U8(0);                  // blr_int64
+                FbValue.appendBE(vals, prms.IntAt(i), 8);
+            } else if (kind == DbParams.KindDouble) {
+                blr.U8(27);                             // blr_double
+                FbValue.appendBE(vals, FbValue.DoubleBits(prms.DoubleAt(i)), 8);
+            } else {
+                string s = prms.TextAt(i);
+                int n = s.Length;
+                blr.U8(14); blr.U8(n & 255); blr.U8((n >> 8) & 255);
+                vals.Raw(s);
+                int pad = (4 - (n % 4)) % 4;
+                int p = 0;
+                while (p < pad) {
+                    vals.U8(0);
+                    p = p + 1;
+                }
+            }
+            blr.U8(7); blr.U8(0);                       // blr_short: NULL flag
+            i = i + 1;
+        }
+        blr.U8(255); blr.U8(76);                        // blr_end, blr_eoc
+        return FbParamBlock.Of(blr.ToBytes(), vals.ToBytes());
+    }
+
+    static void appendBE(FbBuf b, int v, int n) {
+        int i = n - 1;
+        while (i >= 0) {
+            b.U8((v >> (i * 8)) & 255);
+            i = i - 1;
+        }
+    }
+}

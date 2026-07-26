@@ -1,0 +1,945 @@
+using System;
+using System.Data;
+using System.Data.Firebird;
+using System.Net.Sockets;
+
+// The native Firebird driver, checked three ways: the codecs on their own
+// (counted blocks, describe buffers, BLR, value decoding, SRP), then against
+// byte fixtures captured from a real Firebird 4 server, then end to end
+// against a fake server served by this same program -- an SRP handshake whose
+// proof is verified with the server half of the exchange, statements, rows,
+// errors, and a pool of two sessions shared by four coroutines.
+
+/// Byte strings recorded from Firebird 4.0 answering a session over TCP.
+class Cap {
+    /// Describe buffer for "SELECT id,name,amt FROM t1 WHERE id > ?" against
+    /// t1(id integer not null, name varchar(50), amt numeric(9,2)).
+    static string DESCRIBE_SELECT =
+        "150400010000000407040003000000090400010000000b0400f00100000c0400"
+        + "000000000d0400000000000e0400040000000f04000000000010020049441102"
+        + "005431120600535953444241130200494408090400020000000b0400c1010000"
+        + "0c0400000000000d0400000000000e0400320000000f0400010000001004004e"
+        + "414d4511020054311206005359534442411304004e414d450809040003000000"
+        + "0b0400f10100000c0400010000000d0400feffffff0e0400040000000f040001"
+        + "000000100300414d541102005431120600535953444241130300414d540801";
+
+    /// Describe buffer for an INSERT: statement kind 2, no output columns.
+    static string DESCRIBE_INSERT = "1504000200000004070400000000000001";
+
+    /// Two op_fetch_response packets carrying (1, 'alpha', 12.34) and
+    /// (2, NULL, 0.50), then the empty one that ends the cursor.
+    static string FETCH_ROWS =
+        "000000420000000000000001000000000000000100000005616c706861000000"
+        + "000004d200000042000000000000000102000000000000020000003200000042"
+        + "0000006400000000";
+
+    /// Status vector of "SELECT * FROM nosuchtable": dynamic SQL error, SQL
+    /// code -204, table unknown NOSUCHTABLE, at line 1 column 15.
+    static string STATUS_NOSUCHTABLE =
+        "00000001140000f9000000011400007400000004ffffff340000000114000104"
+        + "000000011400003e000000020000000b4e4f535543485441424c450000000001"
+        + "140d03980000000400000001000000040000000f00000000";
+
+    /// The row format the reference client asked those three columns in.
+    static string SELECT_BLR = "05020400060008000700253200070008fe0700ff4c";
+}
+
+/// The server half of the SRP exchange, so the fake server can check the
+/// client's proof instead of taking it on trust.
+class Srv {
+    /// A fixed salt, in the 64-character form the server sends it.
+    static string SALT = "E5E4F178670AD4BE695DC50D95D170D1C4DCF3719832FCAE7B2BF0A355A045FA";
+    static string PRIV_HEX =
+        "1122334455667788990011223344556677889900112233445566778899001122";
+
+    static FbBytes Salt() {
+        return FbBytes.Of(Srv.SALT);
+    }
+
+    static BigInt Priv() {
+        FbBytes b = FbBytes.FromHex(Srv.PRIV_HEX);
+        BigInt v = BigInt.FromBytesBE(b.Data(), b.Len());
+        b.Release();
+        return v;
+    }
+
+    /// v = g^x mod N, the only thing a real server stores.
+    static BigInt Verifier(string user, string password) {
+        FbBytes salt = Srv.Salt();
+        BigInt x = FbSrp.UserHash(FbSrp.NormalizeUser(user), password, salt);
+        salt.Release();
+        return BigInt.ModPow(FbSrp.Generator(), x, FbSrp.Prime());
+    }
+
+    /// B = k*v + g^b mod N.
+    static BigInt Public(BigInt v) {
+        BigInt n = FbSrp.Prime();
+        BigInt gb = BigInt.ModPow(FbSrp.Generator(), Srv.Priv(), n);
+        BigInt kv = BigInt.mod(BigInt.mul(FbSrp.Multiplier(), v), n);
+        return BigInt.mod(BigInt.add(kv, gb), n);
+    }
+
+    /// The proof the client must produce, derived the server's way: from the
+    /// verifier and the server's secret, never from the password's x alone.
+    static FbBytes Proof(FbBytes apub, string user, string password, bool sha256) {
+        BigInt n = FbSrp.Prime();
+        BigInt v = Srv.Verifier(user, password);
+        BigInt bpub = Srv.Public(v);
+        FbBytes bmin = FbSrp.Minimal(bpub);
+        BigInt u = FbSrp.Scramble(apub, bmin);
+        BigInt av = BigInt.mod(BigInt.mul(FbSrp.ToInt(apub),
+                                          BigInt.ModPow(v, u, n)), n);
+        BigInt secret = BigInt.ModPow(av, Srv.Priv(), n);
+        FbBytes smin = FbSrp.Minimal(secret);
+        FbBytes key = FbSrp.Sha1Of(smin);
+        smin.Release();
+
+        FbBytes nmin = FbSrp.Minimal(n);
+        FbBytes hn = FbSrp.Sha1Of(nmin);
+        nmin.Release();
+        FbBytes gmin = FbSrp.Minimal(FbSrp.Generator());
+        FbBytes hg = FbSrp.Sha1Of(gmin);
+        gmin.Release();
+        BigInt mixed = BigInt.ModPow(FbSrp.ToInt(hn), FbSrp.ToInt(hg), n);
+        hn.Release();
+        hg.Release();
+
+        FbBytes ub = FbBytes.Of(FbSrp.NormalizeUser(user));
+        FbBytes hu = FbSrp.Sha1Of(ub);
+        ub.Release();
+
+        FbBytes salt = Srv.Salt();
+        FbBuf m = FbBuf.Create();
+        FbBytes mixedMin = FbSrp.Minimal(mixed);
+        m.RawBlock(mixedMin);
+        mixedMin.Release();
+        FbBytes huMin = FbSrp.Minimal(FbSrp.ToInt(hu));
+        hu.Release();
+        m.RawBlock(huMin);
+        huMin.Release();
+        m.RawBlock(salt);
+        m.RawBlock(apub);
+        m.RawBlock(bmin);
+        m.RawBlock(key);
+        salt.Release();
+        bmin.Release();
+        key.Release();
+        FbBytes msg = m.ToBytes();
+        FbBytes proof;
+        if (sha256) {
+            proof = FbSrp.Sha256Of(msg);
+        } else {
+            proof = FbSrp.Sha1Of(msg);
+        }
+        msg.Release();
+        return proof;
+    }
+
+    /// The challenge an op_accept_data carries: the salt and B as hex text,
+    /// each behind a little-endian length.
+    static FbBytes Challenge(string user, string password) {
+        BigInt v = Srv.Verifier(user, password);
+        FbBytes bmin = FbSrp.Minimal(Srv.Public(v));
+        string keyHex = bmin.Hex();
+        bmin.Release();
+        FbBuf b = FbBuf.Create();
+        b.U8(Srv.SALT.Length & 255);
+        b.U8((Srv.SALT.Length >> 8) & 255);
+        b.Raw(Srv.SALT);
+        b.U8(keyHex.Length & 255);
+        b.U8((keyHex.Length >> 8) & 255);
+        b.Raw(keyHex);
+        return b.ToBytes();
+    }
+}
+
+class Fake {
+    static int PORT = 54347;
+    static string USER = "SYSDBA";
+    static string PASSWORD = "masterkey";
+
+    static int attaches = 0;
+    static int badProofs = 0;
+    static int inFlight = 0;
+    static int peak = 0;
+    static string lastBlr = "";
+    static string lastValues = "";
+    static string lastSql = "";
+
+    [DllImport("crt")]
+    static extern string calloc(int count, int size);
+
+    [DllImport("crt")]
+    static extern void free(string ptr);
+
+    static async int RecvExact(int sock, string dst, int off, int need) {
+        int got = 0;
+        string tmp = Fake.calloc(need + 1, 1);
+        while (got < need) {
+            int n = await Socket.RecvOv(sock, tmp, need - got);
+            if (n <= 0) { Fake.free(tmp); return got; }
+            int j = 0;
+            while (j < n) {
+                dst[off + got + j] = tmp[j] & 255;
+                j = j + 1;
+            }
+            got = got + n;
+        }
+        Fake.free(tmp);
+        return got;
+    }
+
+    static async int RecvInt(int sock) {
+        string b = Fake.calloc(5, 1);
+        int got = await Fake.RecvExact(sock, b, 0, 4);
+        if (got < 4) { Fake.free(b); return 0 - 1; }
+        int v = ((b[0] & 255) << 24) | ((b[1] & 255) << 16)
+              | ((b[2] & 255) << 8) | (b[3] & 255);
+        Fake.free(b);
+        return v;
+    }
+
+    /// A counted, four-byte-aligned block.
+    static async FbBytes RecvBlock(int sock) {
+        int n = await Fake.RecvInt(sock);
+        if (n < 0) { return null; }
+        return await Fake.RecvRaw(sock, n);
+    }
+
+    static async FbBytes RecvRaw(int sock, int n) {
+        int pad = (4 - (n % 4)) % 4;
+        FbBytes b = FbBytes.Alloc(n + pad);
+        int got = await Fake.RecvExact(sock, b.Data(), 0, n + pad);
+        if (got < n + pad) { b.Release(); return null; }
+        FbBytes v = b.Slice(0, n);
+        b.Release();
+        return v;
+    }
+
+    static async bool Send(int sock, FbBytes pkt) {
+        int sent = await Socket.SendAsync(sock, pkt.Data(), pkt.Len());
+        pkt.Release();
+        return sent >= 0;
+    }
+
+    /// op_response with an all-clear status vector.
+    static FbBytes Ok(int handle) {
+        FbBuf p = FbBuf.Create();
+        p.Int(FbOp.RESPONSE);
+        p.Int(handle);
+        p.Int(0); p.Int(0);             // blob id
+        p.Int(0);                       // empty data block
+        p.Int(FbOp.ARG_GDS); p.Int(0); p.Int(FbOp.ARG_END);
+        return p.ToBytes();
+    }
+
+    /// op_response carrying an info buffer.
+    static FbBytes OkBuf(int handle, FbBytes buf) {
+        FbBuf p = FbBuf.Create();
+        p.Int(FbOp.RESPONSE);
+        p.Int(handle);
+        p.Int(0); p.Int(0);
+        p.Block(buf);
+        buf.Release();
+        p.Int(FbOp.ARG_GDS); p.Int(0); p.Int(FbOp.ARG_END);
+        return p.ToBytes();
+    }
+
+    /// op_response whose status vector is the recorded one.
+    static FbBytes Err(string statusHex) {
+        FbBuf p = FbBuf.Create();
+        p.Int(FbOp.RESPONSE);
+        p.Int(0 - 1);
+        p.Int(0); p.Int(0);
+        p.Int(0);
+        FbBytes st = FbBytes.FromHex(statusHex);
+        p.RawBlock(st);
+        st.Release();
+        return p.ToBytes();
+    }
+
+    /// The client's public key, reassembled from the CNCT_SPECIFIC_DATA
+    /// clumplets of an op_connect user block (each piece carries a sequence
+    /// byte the key text has to be stripped of).
+    static string PubHex(FbBytes uid) {
+        FbReader r = FbReader.Over(uid);
+        StringBuilder sb = new StringBuilder();
+        while (r.Left() >= 2) {
+            int tag = r.U8();
+            int ln = r.U8();
+            if (tag == FbOp.CNCT_SPECIFIC_DATA) {
+                r.U8();                 // sequence
+                sb.Append(r.Text(ln - 1));
+            } else {
+                r.Skip(ln);
+            }
+        }
+        return sb.ToString();
+    }
+
+    /// The proof a client put in its database parameter block.
+    static string AuthData(FbBytes dpb) {
+        FbReader r = FbReader.Over(dpb);
+        r.U8();                         // isc_dpb_version1
+        string found = "";
+        while (r.Left() >= 2) {
+            int tag = r.U8();
+            int ln = r.U8();
+            if (tag == FbOp.DPB_SPECIFIC_AUTH_DATA) {
+                found = r.Text(ln);
+            } else {
+                r.Skip(ln);
+            }
+        }
+        return found;
+    }
+
+    /// How many bytes of values a parameter message occupies, worked out from
+    /// its BLR the way a server has to.
+    static int ValuesLen(FbBytes blr) {
+        FbReader r = FbReader.Over(blr);
+        r.Skip(4);
+        int ln = r.U16LE();
+        int count = ln / 2;
+        int nbytes = count / 8;
+        if ((count % 8) != 0) { nbytes = nbytes + 1; }
+        if ((nbytes % 4) != 0) { nbytes = nbytes + 4 - (nbytes % 4); }
+        int total = nbytes;
+        int i = 0;
+        while (i < count) {
+            int t = r.U8();
+            if (t == 14) {              // blr_text
+                int n = r.U8() | (r.U8() << 8);
+                total = total + n + ((4 - (n % 4)) % 4);
+            } else if (t == 8) {        // blr_long
+                r.U8();
+                total = total + 4;
+            } else if (t == 7) {        // blr_short
+                r.U8();
+                total = total + 4;
+            } else if (t == 16) {       // blr_int64
+                r.U8();
+                total = total + 8;
+            } else if (t == 27) {       // blr_double
+                total = total + 8;
+            }
+            r.U8(); r.U8();             // the NULL indicator descriptor
+            i = i + 1;
+        }
+        return total;
+    }
+
+    static FbBytes RecordCounts(int inserted) {
+        FbBuf b = FbBuf.Create();
+        b.U8(FbType.INFO_RECORDS);
+        b.U8(29); b.U8(0);
+        b.U8(FbType.REQ_SELECT_COUNT); b.U8(4); b.U8(0);
+        b.U8(0); b.U8(0); b.U8(0); b.U8(0);
+        b.U8(FbType.REQ_INSERT_COUNT); b.U8(4); b.U8(0);
+        b.U8(inserted & 255); b.U8(0); b.U8(0); b.U8(0);
+        b.U8(FbType.REQ_UPDATE_COUNT); b.U8(4); b.U8(0);
+        b.U8(0); b.U8(0); b.U8(0); b.U8(0);
+        b.U8(FbType.REQ_DELETE_COUNT); b.U8(4); b.U8(0);
+        b.U8(0); b.U8(0); b.U8(0); b.U8(0);
+        b.U8(FbType.INFO_END);
+        b.U8(FbType.INFO_END);
+        return b.ToBytes();
+    }
+
+    static async void Serve(int client) {
+        bool alive = true;
+        string pubHex = "";
+        bool selecting = false;
+        while (alive) {
+            int op = await Fake.RecvInt(client);
+            if (op < 0) {
+                alive = false;
+            } else if (op == FbOp.CONNECT) {
+                await Fake.RecvInt(client);         // op_attach
+                await Fake.RecvInt(client);         // connect version
+                await Fake.RecvInt(client);         // architecture
+                FbBytes db = await Fake.RecvBlock(client);
+                if (db != null) { db.Release(); }
+                int protocols = await Fake.RecvInt(client);
+                FbBytes uid = await Fake.RecvBlock(client);
+                int i = 0;
+                while (i < protocols * 5) {
+                    await Fake.RecvInt(client);
+                    i = i + 1;
+                }
+                pubHex = Fake.PubHex(uid);
+                uid.Release();
+                FbBuf p = FbBuf.Create();
+                p.Int(FbOp.ACCEPT_DATA);
+                p.Int(FbOp.PROTOCOL_V13);
+                p.Int(FbOp.ARCH_GENERIC);
+                p.Int(FbOp.PTYPE_BATCH_SEND);
+                FbBytes ch = Srv.Challenge(Fake.USER, Fake.PASSWORD);
+                p.Block(ch);
+                ch.Release();
+                p.Str("Srp256");
+                p.Int(0);                           // not authenticated yet
+                p.Int(0);                           // no keys
+                await Fake.Send(client, p.ToBytes());
+            } else if (op == FbOp.ATTACH) {
+                await Fake.RecvInt(client);         // unused handle
+                FbBytes db = await Fake.RecvBlock(client);
+                if (db != null) { db.Release(); }
+                FbBytes dpb = await Fake.RecvBlock(client);
+                string got = Fake.AuthData(dpb);
+                dpb.Release();
+                FbBytes apub = FbBytes.FromHex(pubHex);
+                FbBytes want = Srv.Proof(apub, Fake.USER, Fake.PASSWORD, true);
+                apub.Release();
+                bool good = got == want.Hex();
+                want.Release();
+                if (good) {
+                    Fake.attaches = Fake.attaches + 1;
+                    await Fake.Send(client, Fake.Ok(1));
+                } else {
+                    Fake.badProofs = Fake.badProofs + 1;
+                    FbBuf p = FbBuf.Create();
+                    p.Int(FbOp.RESPONSE);
+                    p.Int(0 - 1);
+                    p.Int(0); p.Int(0);
+                    p.Int(0);
+                    p.Int(FbOp.ARG_GDS); p.Int(335544472);
+                    p.Int(FbOp.ARG_END);
+                    await Fake.Send(client, p.ToBytes());
+                }
+            } else if (op == FbOp.TRANSACTION) {
+                await Fake.RecvInt(client);
+                FbBytes tpb = await Fake.RecvBlock(client);
+                if (tpb != null) { tpb.Release(); }
+                await Fake.Send(client, Fake.Ok(2));
+            } else if (op == FbOp.ALLOCATE_STATEMENT) {
+                await Fake.RecvInt(client);
+                await Fake.Send(client, Fake.Ok(3));
+            } else if (op == FbOp.PREPARE_STATEMENT) {
+                await Fake.RecvInt(client);         // transaction
+                await Fake.RecvInt(client);         // statement
+                await Fake.RecvInt(client);         // dialect
+                FbBytes sql = await Fake.RecvBlock(client);
+                Fake.lastSql = sql.Text();
+                sql.Release();
+                FbBytes items = await Fake.RecvBlock(client);
+                if (items != null) { items.Release(); }
+                await Fake.RecvInt(client);         // buffer size
+                selecting = Fake.lastSql.StartsWith("SELECT");
+                if (Fake.lastSql.Contains("nosuchtable")) {
+                    await Fake.Send(client, Fake.Err(Cap.STATUS_NOSUCHTABLE));
+                } else if (selecting) {
+                    await Fake.Send(client,
+                        Fake.OkBuf(0, FbBytes.FromHex(Cap.DESCRIBE_SELECT)));
+                } else {
+                    await Fake.Send(client,
+                        Fake.OkBuf(0, FbBytes.FromHex(Cap.DESCRIBE_INSERT)));
+                }
+            } else if (op == FbOp.EXECUTE) {
+                await Fake.RecvInt(client);         // statement
+                await Fake.RecvInt(client);         // transaction
+                FbBytes blr = await Fake.RecvBlock(client);
+                Fake.lastBlr = blr.Hex();
+                await Fake.RecvInt(client);         // message number
+                int msgs = await Fake.RecvInt(client);
+                Fake.lastValues = "";
+                if (msgs > 0) {
+                    FbBytes vals = await Fake.RecvRaw(client, Fake.ValuesLen(blr));
+                    if (vals != null) {
+                        Fake.lastValues = vals.Hex();
+                        vals.Release();
+                    }
+                }
+                blr.Release();
+                Fake.inFlight = Fake.inFlight + 1;
+                if (Fake.inFlight > Fake.peak) { Fake.peak = Fake.inFlight; }
+                await Task.Delay(15);
+                await Fake.Send(client, Fake.Ok(0));
+                Fake.inFlight = Fake.inFlight - 1;
+            } else if (op == FbOp.FETCH) {
+                await Fake.RecvInt(client);
+                FbBytes blr = await Fake.RecvBlock(client);
+                Fake.lastBlr = blr.Hex();
+                blr.Release();
+                await Fake.RecvInt(client);
+                await Fake.RecvInt(client);
+                await Fake.Send(client, FbBytes.FromHex(Cap.FETCH_ROWS));
+            } else if (op == FbOp.INFO_SQL) {
+                await Fake.RecvInt(client);
+                await Fake.RecvInt(client);
+                FbBytes items = await Fake.RecvBlock(client);
+                if (items != null) { items.Release(); }
+                await Fake.RecvInt(client);
+                await Fake.Send(client, Fake.OkBuf(0, Fake.RecordCounts(1)));
+            } else if (op == FbOp.FREE_STATEMENT) {
+                await Fake.RecvInt(client);
+                await Fake.RecvInt(client);
+                await Fake.Send(client, Fake.Ok(0));
+            } else if (op == FbOp.COMMIT_RETAINING || op == FbOp.COMMIT
+                    || op == FbOp.ROLLBACK || op == FbOp.DETACH) {
+                await Fake.RecvInt(client);
+                await Fake.Send(client, Fake.Ok(0));
+            } else if (op == FbOp.PING) {
+                await Fake.Send(client, Fake.Ok(0));
+            } else {
+                alive = false;
+            }
+        }
+        Socket.Close(client);
+    }
+
+    static async void Accept(int listener, int count) {
+        int n = 0;
+        while (n < count) {
+            int client = await AsyncSocket.Accept(listener);
+            Socket.SetNonBlocking(client);
+            Task.Spawn(Fake.Serve(client));
+            n = n + 1;
+        }
+        Socket.Close(listener);
+    }
+
+    static int Listen() {
+        int listener = Socket.CreateTcp();
+        Socket.SetReuseAddr(listener);
+        Socket.Bind(listener, "127.0.0.1", Fake.PORT);
+        Socket.Listen(listener, 16);
+        Socket.SetNonBlocking(listener);
+        return listener;
+    }
+}
+
+class Program {
+    static int passed = 0;
+    static int failed = 0;
+    static int done = 0;
+
+    static void Check(string name, bool ok) {
+        if (ok) {
+            Program.passed = Program.passed + 1;
+        } else {
+            Program.failed = Program.failed + 1;
+            Console.WriteLine("FAIL: " + name);
+        }
+    }
+
+    static void CheckEq(string name, string got, string want) {
+        Program.Check(name + " (got '" + got + "', want '" + want + "')", got == want);
+    }
+
+    static void CheckEqInt(string name, int got, int want) {
+        Program.CheckEq(name, Convert.ToString(got), Convert.ToString(want));
+    }
+
+    // ===== counted buffers =====
+
+    static void TestBytes() {
+        FbBytes b = FbBytes.FromHex("00ff10");
+        Program.CheckEqInt("hex round trip length", b.Len(), 3);
+        Program.CheckEqInt("a leading NUL is kept", b.At(0), 0);
+        Program.CheckEqInt("high byte survives", b.At(1), 255);
+        Program.CheckEq("bytes render back as hex", b.Hex(), "00ff10");
+        FbBytes tail = b.Slice(1, 2);
+        Program.CheckEq("slice", tail.Hex(), "ff10");
+        tail.Release();
+        b.Release();
+
+        FbBytes t = FbBytes.Of("ab");
+        Program.CheckEqInt("text length", t.Len(), 2);
+        Program.CheckEq("text back", t.Text(), "ab");
+        t.Release();
+    }
+
+    static void TestBuf() {
+        FbBuf p = FbBuf.Create();
+        p.Int(19);
+        p.Str("abc");
+        FbBytes body = p.ToBytes();
+        Program.CheckEqInt("integers are four bytes big-endian", body.At(0), 0);
+        Program.CheckEqInt("low byte last", body.At(3), 19);
+        Program.CheckEqInt("string length prefix", body.At(7), 3);
+        Program.CheckEqInt("string bytes", body.At(8), 97);
+        Program.CheckEqInt("padded to a four-byte boundary", body.Len(), 12);
+        Program.CheckEqInt("padding is zero", body.At(11), 0);
+
+        FbReader r = FbReader.Over(body);
+        Program.CheckEqInt("reader reads the opcode", r.Int(), 19);
+        Program.CheckEqInt("reader reads the length", r.Int(), 3);
+        Program.CheckEq("reader reads the text", r.Text(3), "abc");
+        body.Release();
+
+        // A block with embedded zeros keeps them: this is why the driver does
+        // not carry packets in plain strings.
+        FbBuf q = FbBuf.Create();
+        FbBytes zeros = FbBytes.FromHex("00000102");
+        q.Block(zeros);
+        zeros.Release();
+        FbBytes qb = q.ToBytes();
+        Program.CheckEq("a block of zero bytes survives", qb.Hex(),
+                        "0000000400000102");
+        qb.Release();
+
+        FbReader r2 = FbReader.Over(FbBytes.FromHex("3412"));
+        Program.CheckEqInt("metadata lengths are little-endian", r2.U16LE(), 4660);
+        FbReader r3 = FbReader.Over(FbBytes.FromHex("feffffff"));
+        Program.CheckEqInt("a little-endian scale is signed", r3.IntLE(4), 0 - 2);
+        FbReader r4 = FbReader.Over(FbBytes.FromHex("fffffffe"));
+        Program.CheckEqInt("a big-endian value is signed too", r4.IntBE(4), 0 - 2);
+    }
+
+    // ===== SRP =====
+
+    /// Vectors computed independently (Python, against the reference SRP
+    /// implementation Firebird's plugin follows) for a fixed secret exponent.
+    static void TestSrp() {
+        FbSrp s = FbSrp.FromPrivateHex(
+            "60975527035cf2ad1989806f0407210bc81edc04e2762a56afd529ddda2d4393");
+        Program.CheckEq("public key A", s.PublicHex(),
+            "712c5f8a2db82464c4d640ae971025aa50ab64906d4f044f822e8af8a58adabb"
+            + "dbe1efaba00bccd4cdaa8a955bc43c3600beab9ebb9bd41acc56e37f1a48f172"
+            + "93f24e876b53eea6a60712d3f943769056b63202416827b400e162a8c0938d48"
+            + "2274307585e0bc1d9dd52efa7330b28e41b7cfcefd9e8523fd11440ee5de93a8");
+
+        FbBytes salt = FbBytes.FromHex(
+            "02e268803000000079a478a700000002d1a6979000000026e1601c000000054f");
+        FbBytes bpub = FbBytes.FromHex(
+            "22687f0e47e0ceff58370704df73247aab1b61a31f1ef22c28fa650a17220d6f"
+            + "42cf512837b1c206127f4d0b9c7daa09a174b38456512af1eb2a6afedb7e5bdd"
+            + "56af560c0081e6ed73853975398bb32f0e9415ebaa51e4b250eee16e24f447ac"
+            + "a4499f243b140ba8aaf67859d9fab90f485ae18852dd387eb289e3dc795f8b4b");
+
+        FbSrpProof p1 = s.Prove("SYSDBA", "masterkey", salt, bpub, false);
+        Program.CheckEq("session key", p1.Key().Hex(),
+                        "d4d101eaffc92b19d31fa0872ae794179522781d");
+        Program.CheckEq("Srp proof is SHA-1", p1.Proof().Hex(),
+                        "76fc4e6b69f188b1f0b3c5d2982f6e228319985d");
+        p1.Key().Release();
+        p1.Proof().Release();
+
+        FbSrpProof p2 = s.Prove("SYSDBA", "masterkey", salt, bpub, true);
+        Program.CheckEq("Srp256 proof is SHA-256", p2.Proof().Hex(),
+            "b8ff0eb0cc6033e29c2349c9335acb7c1d77e7bf41262cc6c83d549b1471dceb");
+        Program.CheckEq("the session key stays SHA-1 under Srp256",
+                        p2.Key().Hex(), "d4d101eaffc92b19d31fa0872ae794179522781d");
+        p2.Key().Release();
+        p2.Proof().Release();
+
+        // A degenerate server key means the exchange has to be abandoned.
+        FbBytes zero = FbBytes.FromHex("00");
+        Program.Check("B == 0 is refused",
+                      s.Prove("SYSDBA", "masterkey", salt, zero, true) == null);
+        zero.Release();
+        salt.Release();
+        bpub.Release();
+
+        Program.CheckEq("an unquoted name is upper-cased",
+                        FbSrp.NormalizeUser("sysdba"), "SYSDBA");
+        Program.CheckEq("a quoted name keeps its case",
+                        FbSrp.NormalizeUser("\"MixedCase\""), "MixedCase");
+        Program.CheckEq("doubled quotes collapse",
+                        FbSrp.NormalizeUser("\"od\"\"d\""), "od\"d");
+    }
+
+    // ===== describe buffers, BLR and values =====
+
+    static void TestDescribe() {
+        FbBytes buf = FbBytes.FromHex(Cap.DESCRIBE_SELECT);
+        FbXsqlda xs = FbXsqlda.Create();
+        int next = xs.Parse(buf);
+        buf.Release();
+        Program.CheckEqInt("a complete description is not truncated", next, 0 - 1);
+        Program.CheckEqInt("statement kind is SELECT", xs.StmtType(),
+                           FbType.STMT_SELECT);
+        Program.Check("a select has a cursor", xs.IsSelect());
+        Program.CheckEqInt("column count", xs.Count(), 3);
+        Program.CheckEq("first column name", xs.At(0).Name(), "ID");
+        Program.CheckEqInt("integer column type", xs.At(0).SqlType(), FbType.LONG);
+        Program.Check("a NOT NULL column says so", !xs.At(0).NullOk());
+        Program.CheckEq("relation name", xs.At(0).Relation(), "T1");
+        Program.CheckEq("second column name", xs.At(1).Name(), "NAME");
+        Program.CheckEqInt("varchar column type", xs.At(1).SqlType(),
+                           FbType.VARYING);
+        Program.CheckEqInt("declared length", xs.At(1).Length(), 50);
+        Program.Check("the nullable bit is stripped from the type",
+                      xs.At(1).NullOk());
+        Program.CheckEqInt("varchar is length-prefixed on the wire",
+                           xs.At(1).IoLength(), 0 - 1);
+        Program.CheckEq("third column name", xs.At(2).Name(), "AMT");
+        Program.CheckEqInt("numeric(9,2) is a scaled long",
+                           xs.At(2).SqlType(), FbType.LONG);
+        Program.CheckEqInt("scale is negative", xs.At(2).Scale(), 0 - 2);
+
+        // The row format asked for has to be the one the server was recorded
+        // answering: this is the byte string the reference client sent.
+        FbBytes blr = xs.CalcBlr();
+        Program.CheckEq("row BLR matches the recorded one", blr.Hex(),
+                        Cap.SELECT_BLR);
+        blr.Release();
+
+        FbBytes ibuf = FbBytes.FromHex(Cap.DESCRIBE_INSERT);
+        FbXsqlda ins = FbXsqlda.Create();
+        int inext = ins.Parse(ibuf);
+        ibuf.Release();
+        Program.CheckEqInt("insert description is complete", inext, 0 - 1);
+        Program.CheckEqInt("statement kind is INSERT", ins.StmtType(),
+                           FbType.STMT_INSERT);
+        Program.CheckEqInt("an insert has no columns", ins.Count(), 0);
+        Program.Check("an insert has no cursor", !ins.IsSelect());
+
+        FbXsqlda junk = FbXsqlda.Create();
+        FbBytes bad = FbBytes.FromHex("6300");
+        Program.CheckEqInt("a buffer that is not a description is rejected",
+                           junk.Parse(bad), 0 - 2);
+        bad.Release();
+    }
+
+    static void TestParams() {
+        FbParamBlock pb = FbValue.Params(
+            DbParams.Create().AddInt(7).Add("gamma").AddNull());
+        Program.CheckEq("parameter BLR", pb.Blr().Hex(),
+                        "050204000600100007000e050007000e00000700ff4c");
+        Program.CheckEq("parameter values", pb.Values().Hex(),
+                        "04000000" + "0000000000000007" + "67616d6d61000000");
+        pb.Release();
+
+        FbParamBlock none = FbValue.Params(null);
+        Program.CheckEq("an empty message is still a valid BLR",
+                        none.Blr().Hex(), "050204000000ff4c");
+        Program.CheckEqInt("and carries no values", none.Values().Len(), 0);
+        none.Release();
+
+        Program.CheckEqInt("doubles are IEEE bit patterns",
+                           FbValue.DoubleBits(2.5), 4612811918334230528);
+    }
+
+    static FbColumn Col(int type, int scale, int len) {
+        return FbColumn.Of(type, scale, len);
+    }
+
+    static string Dec(FbColumn c, string hex) {
+        FbBytes raw = FbBytes.FromHex(hex);
+        string s = FbValue.Decode(c, raw);
+        raw.Release();
+        return s;
+    }
+
+    static void TestDecode() {
+        Program.CheckEq("CHAR is right-trimmed",
+                        Program.Dec(Program.Col(FbType.TEXT, 0, 5), "6162202020"),
+                        "ab");
+        Program.CheckEq("VARCHAR",
+                        Program.Dec(Program.Col(FbType.VARYING, 0, 5), "616263"),
+                        "abc");
+        Program.CheckEq("SMALLINT",
+                        Program.Dec(Program.Col(FbType.SHORT, 0, 2), "fffe"),
+                        "-2");
+        Program.CheckEq("INTEGER",
+                        Program.Dec(Program.Col(FbType.LONG, 0, 4), "000004d2"),
+                        "1234");
+        Program.CheckEq("NUMERIC(9,2) is scaled",
+                        Program.Dec(Program.Col(FbType.LONG, 0 - 2, 4), "000004d2"),
+                        "12.34");
+        Program.CheckEq("a scaled value below one keeps its leading zero",
+                        Program.Dec(Program.Col(FbType.LONG, 0 - 2, 4), "00000032"),
+                        "0.50");
+        Program.CheckEq("a negative scaled value",
+                        Program.Dec(Program.Col(FbType.LONG, 0 - 2, 4), "fffffb2e"),
+                        "-12.34");
+        Program.CheckEq("BIGINT",
+                        Program.Dec(Program.Col(FbType.INT64, 0, 8),
+                                    "7fffffffffffffff"),
+                        "9223372036854775807");
+        Program.CheckEq("INT128 goes beyond a machine word",
+                        Program.Dec(Program.Col(FbType.INT128, 0, 16),
+                                    "0000000000000000ffffffffffffffff"),
+                        "18446744073709551615");
+        Program.CheckEq("a negative INT128",
+                        Program.Dec(Program.Col(FbType.INT128, 0 - 3, 16),
+                                    "ffffffffffffffffffffffffffffd8f1"),
+                        "-9.999");
+        Program.CheckEq("DOUBLE",
+                        Program.Dec(Program.Col(FbType.DOUBLE, 0, 8),
+                                    "4004000000000000"),
+                        "2.5");
+        Program.CheckEq("FLOAT",
+                        Program.Dec(Program.Col(FbType.FLOAT, 0, 4), "40200000"),
+                        "2.5");
+        Program.CheckEq("BOOLEAN true",
+                        Program.Dec(Program.Col(FbType.BOOLEAN, 0, 1), "01"), "1");
+        Program.CheckEq("BOOLEAN false",
+                        Program.Dec(Program.Col(FbType.BOOLEAN, 0, 1), "00"), "0");
+        // 2024-03-01 is modified Julian day 60370, 12:34:56 is that many
+        // ten-thousandths of a second.
+        Program.CheckEq("DATE",
+                        Program.Dec(Program.Col(FbType.DATE, 0, 4), "0000ebd2"),
+                        "2024-03-01");
+        Program.CheckEq("TIME",
+                        Program.Dec(Program.Col(FbType.TIME, 0, 4), "1aff9f00"),
+                        "12:34:56");
+        Program.CheckEq("TIMESTAMP",
+                        Program.Dec(Program.Col(FbType.TIMESTAMP, 0, 8),
+                                    "0000ebd21aff9f00"),
+                        "2024-03-01 12:34:56");
+        Program.CheckEq("a fractional second is kept",
+                        Program.Dec(Program.Col(FbType.TIME, 0, 4), "1affa2e8"),
+                        "12:34:56.1000");
+        Program.CheckEq("DECFLOAT is left as bytes rather than mangled",
+                        Program.Dec(Program.Col(FbType.DEC64, 0, 8),
+                                    "2238000000000001"),
+                        "0x2238000000000001");
+    }
+
+    // ===== against the fake server =====
+
+    static async void Worker(FirebirdPool pool) {
+        FirebirdConnection db = await pool.AcquireAsync();
+        if (db == null) {
+            Program.done = Program.done + 1;
+            return;
+        }
+        DbResult r = await db.QueryAsync("SELECT id,name,amt FROM t1");
+        if (r.RowCount() == 2) {
+            Program.done = Program.done + 1;
+        }
+        pool.Release(db);
+    }
+
+    static async void Live() {
+        int listener = Fake.Listen();
+        Task.Spawn(Fake.Accept(listener, 5));
+
+        FirebirdConnection db = await FirebirdConnection.OpenAsync(
+            "127.0.0.1", Fake.PORT, "test.fdb", "sysdba", "masterkey", false);
+        Program.Check("the handshake completes", db.IsConnected());
+        Program.CheckEqInt("the server verified the SRP proof", Fake.attaches, 1);
+        Program.CheckEqInt("no proof was rejected", Fake.badProofs, 0);
+        Program.CheckEq("the negotiated plugin", db.AuthPlugin(), "Srp256");
+        Program.CheckEqInt("protocol 13", db.ProtocolVersion(), 13);
+        Program.CheckEq("the session is in the clear", db.WireCrypt(), "");
+        Program.CheckEq("database name", db.Database(), "test.fdb");
+
+        DbResult r = await db.QueryAsync("SELECT id,name,amt FROM t1 WHERE id > ?",
+                                         DbParams.Create().AddInt(0));
+        Program.CheckEq("no error", db.GetError(), "");
+        Program.CheckEqInt("column count", r.ColumnCount(), 3);
+        Program.CheckEq("column names come from the description",
+                        r.GetColumnName(2), "AMT");
+        Program.CheckEqInt("row count", r.RowCount(), 2);
+        Program.CheckEqInt("integer column", r.GetInt(0, 0), 1);
+        Program.CheckEq("varchar column", r.GetString(0, 1), "alpha");
+        Program.CheckEq("scaled numeric column", r.GetString(0, 2), "12.34");
+        Program.CheckEqInt("second row", r.GetInt(1, 0), 2);
+        Program.Check("the NULL bitmap marks the missing value", r.IsNull(1, 1));
+        Program.CheckEq("the row after a NULL is still aligned",
+                        r.GetString(1, 2), "0.50");
+        Program.CheckEq("the fetch asked for the recorded row format",
+                        Fake.lastBlr, Cap.SELECT_BLR);
+        Program.CheckEq("the parameter was bound, not pasted into the SQL",
+                        Fake.lastSql, "SELECT id,name,amt FROM t1 WHERE id > ?");
+
+        int n = await db.ExecuteAsync("INSERT INTO t1 VALUES (?,?,?)",
+                                      DbParams.Create().AddInt(3).Add("gamma")
+                                              .AddNull());
+        Program.CheckEqInt("insert reports its affected rows", n, 1);
+        Program.CheckEq("the values message carries the NULL bitmap",
+                        Fake.lastValues.Substring(0, 8), "04000000");
+        Program.CheckEq("and the two non-null values",
+                        Fake.lastValues.Substring(8, Fake.lastValues.Length - 8),
+                        "000000000000000367616d6d61000000");
+
+        DbResult bad = await db.QueryAsync("SELECT * FROM nosuchtable");
+        Program.CheckEqInt("a failed statement returns no rows", bad.RowCount(), 0);
+        Program.CheckEq("the status vector is turned into a message",
+                        db.GetError(),
+                        "Dynamic SQL Error; SQL error code = -204; Table unknown;"
+                        + " NOSUCHTABLE; At line 1, column 15");
+        Program.CheckEqInt("the SQL code is picked out", db.SqlCode(), 0 - 204);
+        Program.Check("an error does not drop the session", db.IsConnected());
+
+        Program.Check("ping", await db.PingAsync());
+        string one = await db.ExecuteScalarAsync("SELECT id,name,amt FROM t1");
+        Program.CheckEq("scalar takes the first column of the first row", one, "1");
+        await db.CloseAsync();
+        Program.Check("close marks the session down", !db.IsConnected());
+
+        // A wrong password must fail the attach rather than half-open.
+        FirebirdConnection nope = await FirebirdConnection.OpenAsync(
+            "127.0.0.1", Fake.PORT, "test.fdb", "sysdba", "wrong", false);
+        Program.Check("a bad password does not connect", !nope.IsConnected());
+        Program.CheckEqInt("the server rejected the proof", Fake.badProofs, 1);
+        Program.CheckEq("and says why", nope.GetError(),
+                        "Your user name and password are not defined");
+        nope.Close();
+
+        // Two sessions, four coroutines.
+        FirebirdPool pool = FirebirdPool.Create("127.0.0.1", Fake.PORT, "test.fdb",
+                                                "sysdba", "masterkey", false, 2);
+        Program.CheckEqInt("the pool reports the Firebird provider",
+                           pool.GetProvider(), DbProvider.Firebird);
+        Fake.peak = 0;
+        int i = 0;
+        while (i < 4) {
+            Task.Spawn(Program.Worker(pool));
+            i = i + 1;
+        }
+        while (Program.done < 4) {
+            await Task.Delay(5);
+        }
+        Program.CheckEqInt("every pooled worker finished", Program.done, 4);
+        Program.Check("the pool never exceeds its size", pool.LiveCount() <= 2);
+        Program.CheckEqInt("only two more attaches for four workers",
+                           Fake.attaches, 3);
+        Program.Check("statements really overlap", Fake.peak >= 2);
+        Program.CheckEqInt("connections are pooled, not dropped",
+                           pool.IdleCount(), 2);
+        Program.CheckEqInt("nobody is left waiting", pool.WaitingCount(), 0);
+
+        // A session that died while it was checked out must not be handed to
+        // the next caller: the pool drops it and opens a replacement.
+        FirebirdConnection first = await pool.AcquireAsync();
+        FirebirdConnection second = await pool.AcquireAsync();
+        Program.CheckEqInt("both sessions are checked out", pool.IdleCount(), 0);
+        first.Close();
+        pool.Release(first);
+        pool.Release(second);
+        Program.CheckEqInt("a dead session is not put back", pool.IdleCount(), 1);
+        Program.CheckEqInt("and stops counting against the cap",
+                           pool.LiveCount(), 1);
+        FirebirdConnection kept = await pool.AcquireAsync();
+        Program.CheckEqInt("the live session is reused", Fake.attaches, 3);
+        FirebirdConnection fresh = await pool.AcquireAsync();
+        Program.Check("the replacement is usable", fresh.IsConnected());
+        Program.CheckEqInt("which cost one more attach", Fake.attaches, 4);
+        pool.Release(kept);
+        pool.Release(fresh);
+
+        pool.Close();
+        Program.Check("close marks the pool closed", pool.IsClosed());
+        Program.CheckEqInt("close drains the pool", pool.IdleCount(), 0);
+        FirebirdConnection dead = await pool.AcquireAsync();
+        Program.Check("acquire on a closed pool yields null", dead == null);
+
+        // A pool that cannot reach its server hands back null and keeps no
+        // phantom connection behind.
+        FirebirdPool broken = FirebirdPool.Create("127.0.0.1", 1, "test.fdb",
+                                                  "sysdba", "masterkey", false, 2);
+        FirebirdConnection never = await broken.AcquireAsync();
+        Program.Check("a failed open yields no connection",
+                      never == null || !never.IsConnected());
+        Program.CheckEqInt("a failed open is rolled back", broken.LiveCount(), 0);
+        broken.Close();
+    }
+
+    static void Main() {
+        Socket.Initialize();
+        Program.TestBytes();
+        Program.TestBuf();
+        Program.TestSrp();
+        Program.TestDescribe();
+        Program.TestParams();
+        Program.TestDecode();
+        await Program.Live();
+        Console.WriteLine("pass: " + Convert.ToString(Program.passed));
+        Console.WriteLine("fail: " + Convert.ToString(Program.failed));
+    }
+}
