@@ -1,4 +1,4 @@
-param([int]$Skin = 10, [string]$Wall = "", [int]$WallOp = 100, [int]$CX = -1, [int]$CY = -1, [string]$Out = "d:\project\zan-lang\build\v_skin.png", [switch]$NoRestart)
+param([int]$Skin = 10, [string]$Wall = "", [int]$WallOp = 100, [int]$CX = -1, [int]$CY = -1, [int]$WheelX = -1, [int]$WheelY = -1, [int]$WheelSteps = 0, [string]$Out = "d:\project\zan-lang\build\v_skin.png", [switch]$NoRestart)
 
 $cfgDir = "$env:APPDATA\ZanIDE"
 New-Item -ItemType Directory -Force -Path $cfgDir | Out-Null
@@ -35,6 +35,7 @@ public class WS{
    if(s.ToString().Contains("Zan IDE")){ Found=h; return false; }
    return true;
  }
+ public static void Wheel(int x,int y,int steps){ SetCursorPos(x,y); System.Threading.Thread.Sleep(120); int i=0; while(i<System.Math.Abs(steps)){ uint d=(uint)(steps>0?120:-120); mouse_event(0x0800,0,0,d,IntPtr.Zero); System.Threading.Thread.Sleep(60); i++; } }
  public static void Click(int x,int y){ SetCursorPos(x,y); System.Threading.Thread.Sleep(150); mouse_event(0x0002,0,0,0,IntPtr.Zero); System.Threading.Thread.Sleep(60); mouse_event(0x0004,0,0,0,IntPtr.Zero); }
 }
 "@
@@ -54,6 +55,10 @@ $r = New-Object WS+RECT
 if ($CX -ge 0) {
   [WS]::Click($r.L + $CX, $r.T + $CY)
   Start-Sleep -Milliseconds 900
+}
+if ($WheelSteps -ne 0) {
+  [WS]::Wheel($r.L + $WheelX, $r.T + $WheelY, $WheelSteps)
+  Start-Sleep -Milliseconds 700
 }
 [WS]::GetWindowRect($h,[ref]$r) | Out-Null
 $w = $r.R - $r.L; $ht = $r.B - $r.T
