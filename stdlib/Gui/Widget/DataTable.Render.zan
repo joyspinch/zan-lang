@@ -1806,6 +1806,168 @@ partial class DataTable {
         }
     }
 
+    /// A small pill that reads as selected when `on`. Used for the rule chips,
+    /// which are radio-like: clicking the active one turns the rule off.
+    static bool Chip(App app, int bx, int by, int bw, int bh, string label, bool on) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int id = app.focus.AllocId();
+        bool hov = app.focus.IsHovered(id);
+        int bg = t.bgSecondary;
+        int fg = t.textSecondary;
+        if (on) { bg = t.primary; fg = t.textInverse; }
+        else if (hov) { bg = t.bgHover; }
+        c.FillRoundRect(bx, by, bw, bh, bh / 2, bg);
+        if (!on) { c.DrawRect(bx, by, bw, bh, t.borderPrimary, 1); }
+        c.DrawTextCentered(bx, by, bw, bh, label, fg, t.fontSizeSmall);
+        app.hitTester.Register(HitRegion.Create(id, bx, by, bw, bh, 0));
+        return app.window.EventKind() == 3 && app.hitTester.HitTest(app.mouseX, app.mouseY) == id;
+    }
+
+    /// The "Rules" filter tab: value comparison, relative date presets (date
+    /// columns only) and top-N. Returns the y below the content it drew.
+    static int RenderRulesTab(App app, int mx, int cy, int menuW, int pad,
+                              ColFilter f, DataColumn col, DataTableState st) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int fs = t.fontSizeSmall;
+        int chipH = app.Scale(22);
+        int gap = app.Scale(4);
+        int innerW = menuW - pad * 2;
+
+        // ---- comparison ----
+        c.DrawText(mx + pad, cy, "Compare", t.textSecondary, fs);
+        cy = cy + Canvas.FontHeight(fs) + app.Scale(4);
+
+        // two rows of four operators; a chip toggles its own mode off again
+        int cw4 = (innerW - gap * 3) / 4;
+        List<string> ops = new List<string>();
+        ops.Add(">"); ops.Add(">="); ops.Add("<"); ops.Add("<=");
+        ops.Add("="); ops.Add("<>"); ops.Add("in"); ops.Add("not in");
+        int oi = 0;
+        while (oi < ops.Count) {
+            int mode = oi + 1;
+            int bx = mx + pad + (cw4 + gap) * (oi % 4);
+            int by = cy + (chipH + gap) * (oi / 4);
+            if (DataTable.Chip(app, bx, by, cw4, chipH, ops[oi], f.cmpMode == mode)) {
+                if (f.cmpMode == mode) { f.cmpMode = 0; } else { f.cmpMode = mode; }
+                st.editFocus = 4;
+                st.dirty = true;
+                st.FilterChanged.Raise();
+                app.RequestRedraw();
+            }
+            oi = oi + 1;
+        }
+        cy = cy + (chipH + gap) * 2;
+
+        // the two blank-ness rules take a wider chip since they need no operand
+        int cw2 = (innerW - gap) / 2;
+        if (DataTable.Chip(app, mx + pad, cy, cw2, chipH, "is empty", f.cmpMode == 9)) {
+            if (f.cmpMode == 9) { f.cmpMode = 0; } else { f.cmpMode = 9; st.editFocus = 0; }
+            st.dirty = true; st.FilterChanged.Raise(); app.RequestRedraw();
+        }
+        if (DataTable.Chip(app, mx + pad + cw2 + gap, cy, cw2, chipH, "not empty", f.cmpMode == 10)) {
+            if (f.cmpMode == 10) { f.cmpMode = 0; } else { f.cmpMode = 10; st.editFocus = 0; }
+            st.dirty = true; st.FilterChanged.Raise(); app.RequestRedraw();
+        }
+        cy = cy + chipH + app.Scale(6);
+
+        // operand boxes: one for the one-sided operators, two for in/not in.
+        // The blank-ness rules need none, so they get no boxes at all.
+        bool twoSided = f.cmpMode == 7 || f.cmpMode == 8;
+        bool needsA = f.cmpMode != 0 && f.cmpMode != 9 && f.cmpMode != 10;
+        int boxH = app.Scale(26);
+        if (needsA) {
+            int aw = innerW;
+            if (twoSided) { aw = (innerW - gap) / 2; }
+            DataTable.EditBox(app, mx + pad, cy, aw, boxH, f.cmpA, "value", st.editFocus == 4);
+            int aId = app.focus.AllocId();
+            app.hitTester.Register(HitRegion.Create(aId, mx + pad, cy, aw, boxH, 0));
+            if (app.window.EventKind() == 3 && app.hitTester.HitTest(app.mouseX, app.mouseY) == aId) {
+                st.editFocus = 4; app.RequestRedraw();
+            }
+            if (twoSided) {
+                int bx2 = mx + pad + aw + gap;
+                DataTable.EditBox(app, bx2, cy, aw, boxH, f.cmpB, "and", st.editFocus == 5);
+                int bId = app.focus.AllocId();
+                app.hitTester.Register(HitRegion.Create(bId, bx2, cy, aw, boxH, 0));
+                if (app.window.EventKind() == 3 && app.hitTester.HitTest(app.mouseX, app.mouseY) == bId) {
+                    st.editFocus = 5; app.RequestRedraw();
+                }
+            }
+            cy = cy + boxH + app.Scale(4);
+        }
+        cy = cy + app.Scale(6);
+
+        // ---- date presets (date columns only) ----
+        if (col.isDate) {
+            c.DrawText(mx + pad, cy, "Date range", t.textSecondary, fs);
+            cy = cy + Canvas.FontHeight(fs) + app.Scale(4);
+            List<string> ps = new List<string>();
+            ps.Add("Today"); ps.Add("Yesterday"); ps.Add("This week");
+            ps.Add("Last 7d"); ps.Add("This month"); ps.Add("Last 30d");
+            ps.Add("Quarter"); ps.Add("This year"); ps.Add("YTD");
+            ps.Add("Past"); ps.Add("Future");
+            int cw3 = (innerW - gap * 2) / 3;
+            int pi = 0;
+            while (pi < ps.Count) {
+                int preset = pi + 1;
+                int bx = mx + pad + (cw3 + gap) * (pi % 3);
+                int by = cy + (chipH + gap) * (pi / 3);
+                if (DataTable.Chip(app, bx, by, cw3, chipH, ps[pi], f.datePreset == preset)) {
+                    if (f.datePreset == preset) { f.datePreset = 0; } else { f.datePreset = preset; }
+                    st.dirty = true; st.FilterChanged.Raise(); app.RequestRedraw();
+                }
+                pi = pi + 1;
+            }
+            cy = cy + (chipH + gap) * 4 + app.Scale(6);
+        }
+
+        // ---- top-N ----
+        c.DrawText(mx + pad, cy, "Top / bottom", t.textSecondary, fs);
+        cy = cy + Canvas.FontHeight(fs) + app.Scale(4);
+        List<string> tops = new List<string>();
+        tops.Add("Top N"); tops.Add("Bottom N"); tops.Add("Top N%");
+        tops.Add("Bot N%"); tops.Add("Above avg"); tops.Add("Below avg");
+        int cw3b = (innerW - gap * 2) / 3;
+        int ti = 0;
+        while (ti < tops.Count) {
+            int mode = ti + 1;
+            int bx = mx + pad + (cw3b + gap) * (ti % 3);
+            int by = cy + (chipH + gap) * (ti / 3);
+            if (DataTable.Chip(app, bx, by, cw3b, chipH, tops[ti], f.topMode == mode)) {
+                if (f.topMode == mode) { f.topMode = 0; } else { f.topMode = mode; }
+                st.dirty = true; st.FilterChanged.Raise(); app.RequestRedraw();
+            }
+            ti = ti + 1;
+        }
+        cy = cy + (chipH + gap) * 2;
+
+        // N only matters for the four counted modes
+        if (f.topMode >= 1 && f.topMode <= 4) {
+            int lw = app.Scale(20);
+            c.DrawText(mx + pad, cy + (boxH - Canvas.FontHeight(fs)) / 2, "N", t.textSecondary, fs);
+            int nx = mx + pad + lw;
+            int nw = app.Scale(64);
+            DataTable.EditBox(app, nx, cy, nw, boxH, Convert.ToString(f.topN), "10", st.editFocus == 6);
+            int nId = app.focus.AllocId();
+            app.hitTester.Register(HitRegion.Create(nId, nx, cy, nw, boxH, 0));
+            if (app.window.EventKind() == 3 && app.hitTester.HitTest(app.mouseX, app.mouseY) == nId) {
+                st.editFocus = 6; app.RequestRedraw();
+            }
+            int spw = app.Scale(24);
+            if (DataTable.TextBtn(app, nx + nw + gap, cy, spw, boxH, "-", false)) {
+                if (f.topN > 1) { f.topN = f.topN - 1; st.dirty = true; st.FilterChanged.Raise(); }
+                app.RequestRedraw();
+            }
+            if (DataTable.TextBtn(app, nx + nw + gap + spw + gap, cy, spw, boxH, "+", false)) {
+                f.topN = f.topN + 1; st.dirty = true; st.FilterChanged.Raise(); app.RequestRedraw();
+            }
+            cy = cy + boxH;
+        }
+        return cy;
+    }
+
     static void RenderMenu(App app, int x, int y, int viewW, int headerH, int numW, int selW,
                            List<DataColumn> cols, DataSource src, DataTableState st) {
         Canvas c = app.canvas;
@@ -1819,6 +1981,12 @@ partial class DataTable {
         int rowH = app.Scale(28);
         int menuW = app.Scale(256);
         int menuH = app.Scale(348);
+        // The Rules tab stacks several sections, so it needs a taller panel;
+        // date columns add the preset section on top of that.
+        if (st.filterTab == 3) {
+            menuH = app.Scale(392);
+            if (cols[mi].isDate) { menuH = app.Scale(486); }
+        }
 
         // anchor under the column, clamp fully inside the window
         int mx = x + numW + selW - st.scrollX;
@@ -1859,6 +2027,24 @@ partial class DataTable {
                     string ad = Text.CharStr(chv);
                     if (ad.Length > 0) { st.batchLines[last] = st.batchLines[last] + ad; }
                 }
+            } else if (st.editFocus == 4 || st.editFocus == 5) {
+                // comparison operands: edited live, like the Text tab's query
+                string cur = f.cmpA;
+                if (st.editFocus == 5) { cur = f.cmpB; }
+                if (chv == 8) { cur = DataTable.Backspace(cur); }
+                else { string ad = Text.CharStr(chv); if (ad.Length > 0) { cur = cur + ad; } }
+                if (st.editFocus == 5) { f.cmpB = cur; } else { f.cmpA = cur; }
+                st.dirty = true;
+                st.FilterChanged.Raise();
+            } else if (st.editFocus == 6) {
+                // top-N count: digits only, so the spinner value stays a number
+                if (chv == 8) {
+                    f.topN = f.topN / 10;
+                } else if (chv >= 48 && chv <= 57 && f.topN < 100000) {
+                    f.topN = f.topN * 10 + (chv - 48);
+                }
+                st.dirty = true;
+                st.FilterChanged.Raise();
             }
             app.RequestRedraw();
         }
@@ -1883,10 +2069,11 @@ partial class DataTable {
         int cy = hy + rowH + app.Scale(6);
 
         // tabs
-        int tabW = (menuW - pad * 2) / 3;
+        int tabW = (menuW - pad * 2) / 4;
         if (DataTable.TabBtn(app, mx + pad, cy, tabW, rowH, "Values", st.filterTab == 0)) { st.filterTab = 0; st.editFocus = 0; app.RequestRedraw(); }
         if (DataTable.TabBtn(app, mx + pad + tabW, cy, tabW, rowH, "Text", st.filterTab == 1)) { st.filterTab = 1; st.editFocus = 0; app.RequestRedraw(); }
         if (DataTable.TabBtn(app, mx + pad + tabW * 2, cy, tabW, rowH, "Batch", st.filterTab == 2)) { st.filterTab = 2; st.editFocus = 0; app.RequestRedraw(); }
+        if (DataTable.TabBtn(app, mx + pad + tabW * 3, cy, tabW, rowH, "Rules", st.filterTab == 3)) { st.filterTab = 3; st.editFocus = 0; app.RequestRedraw(); }
         c.FillRect(mx + pad, cy + rowH, menuW - pad * 2, 1, t.divider);
         cy = cy + rowH + app.Scale(8);
 
@@ -2015,6 +2202,8 @@ partial class DataTable {
             c.DrawText(mx + pad, cy, "Live-filters as you type", t.textTertiary, fs);
             cy = cy + Canvas.FontHeight(fs) + app.Scale(2);
             c.DrawText(mx + pad, cy, "(case-insensitive).", t.textTertiary, fs);
+        } else if (st.filterTab == 3) {
+            cy = DataTable.RenderRulesTab(app, mx, cy, menuW, pad, f, cols[mi], st);
         } else {
             c.DrawText(mx + pad, cy, "One condition per line:", t.textSecondary, fs);
             cy = cy + Canvas.FontHeight(fs) + app.Scale(4);

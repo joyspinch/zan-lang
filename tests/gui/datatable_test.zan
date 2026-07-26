@@ -202,5 +202,136 @@ class Program {
         DataTable.Recompute(bst, bcols, bsrc);
         Console.WriteLine(bst.groups.Count);
         foreach (GroupRow g in bst.groups) { Console.WriteLine(g.label); }
+
+        // ---- comparison rules compare by the column's type, not lexically ----
+        ColFilter cf = ColFilter.Create();
+        cf.cmpMode = 1;                 // greater than
+        cf.cmpA = "9";
+        // "10.25" > "9" numerically, though it sorts before "9" as text
+        Console.WriteLine(DataTable.CellPassesCol(cf, rc, "10.25", 0));
+        Console.WriteLine(DataTable.CellPassesCol(cf, rc, "1.5", 0));
+        cf.cmpMode = 7;                 // between, inclusive
+        cf.cmpA = "1.5";
+        cf.cmpB = "2";
+        Console.WriteLine(DataTable.CellPassesCol(cf, rc, "1.5", 0));
+        Console.WriteLine(DataTable.CellPassesCol(cf, rc, "1.9", 0));
+        Console.WriteLine(DataTable.CellPassesCol(cf, rc, "2.01", 0));
+        // reversed bounds still describe the same range
+        cf.cmpA = "2";
+        cf.cmpB = "1.5";
+        Console.WriteLine(DataTable.CellPassesCol(cf, rc, "1.9", 0));
+        cf.cmpMode = 8;                 // not between inverts it exactly
+        Console.WriteLine(DataTable.CellPassesCol(cf, rc, "1.9", 0));
+        cf.cmpMode = 9;                 // is empty ignores the operands
+        Console.WriteLine(DataTable.CellPassesCol(cf, rc, "   ", 0));
+        Console.WriteLine(DataTable.CellPassesCol(cf, rc, "0", 0));
+        cf.cmpMode = 10;
+        Console.WriteLine(DataTable.CellPassesCol(cf, rc, "0", 0));
+
+        // ---- date presets resolve against a fixed "today" ----
+        // 2026-07-26 is a Sunday, so "this week" starts on that very day.
+        int today = DateTime.DaysFromCivil(2026, 7, 26);
+        ColFilter df = ColFilter.Create();
+        df.datePreset = 1;              // today
+        Console.WriteLine(DataTable.CellPassesCol(df, dcols[1], "2026-07-26", today));
+        Console.WriteLine(DataTable.CellPassesCol(df, dcols[1], "2026-07-25", today));
+        // a cell with no readable date never satisfies a preset
+        Console.WriteLine(DataTable.CellPassesCol(df, dcols[1], "n/a", today));
+        df.datePreset = 3;              // this week (Sunday-based)
+        Console.WriteLine(DataTable.CellPassesCol(df, dcols[1], "2026-08-01", today));
+        Console.WriteLine(DataTable.CellPassesCol(df, dcols[1], "2026-08-02", today));
+        Console.WriteLine(DataTable.CellPassesCol(df, dcols[1], "2026-07-25", today));
+        df.datePreset = 5;              // this month spans exactly July
+        Console.WriteLine(DataTable.CellPassesCol(df, dcols[1], "2026-07-01", today));
+        Console.WriteLine(DataTable.CellPassesCol(df, dcols[1], "2026-07-31", today));
+        Console.WriteLine(DataTable.CellPassesCol(df, dcols[1], "2026-08-01", today));
+        df.datePreset = 7;              // Q3 = Jul..Sep
+        Console.WriteLine(DataTable.CellPassesCol(df, dcols[1], "2026-09-30", today));
+        Console.WriteLine(DataTable.CellPassesCol(df, dcols[1], "2026-06-30", today));
+        df.datePreset = 9;              // YTD stops at today, unlike "this year"
+        Console.WriteLine(DataTable.CellPassesCol(df, dcols[1], "2026-01-01", today));
+        Console.WriteLine(DataTable.CellPassesCol(df, dcols[1], "2026-12-31", today));
+        df.datePreset = 8;
+        Console.WriteLine(DataTable.CellPassesCol(df, dcols[1], "2026-12-31", today));
+        df.datePreset = 10;             // past excludes today itself
+        Console.WriteLine(DataTable.CellPassesCol(df, dcols[1], "2026-07-26", today));
+        Console.WriteLine(DataTable.CellPassesCol(df, dcols[1], "2026-07-25", today));
+        df.datePreset = 11;             // and so does future
+        Console.WriteLine(DataTable.CellPassesCol(df, dcols[1], "2026-07-26", today));
+        Console.WriteLine(DataTable.CellPassesCol(df, dcols[1], "2026-07-27", today));
+
+        // ---- top-N runs over the surviving set, keeping the user's row order ----
+        List<DataColumn> tcols = new List<DataColumn>();
+        tcols.Add(DataColumn.Create("name", 80));
+        tcols.Add(DataColumn.Real("v", 60, 1));
+        tcols.Add(DataColumn.Create("pad", 40));
+
+        List<DataRow> trows = new List<DataRow>();
+        trows.Add(Row("a", "1", ""));
+        trows.Add(Row("b", "5", ""));
+        trows.Add(Row("c", "3", ""));
+        trows.Add(Row("d", "9", ""));
+        trows.Add(Row("e", "7", ""));
+
+        DataSource tsrc = RowListSource.Create(trows);
+        DataTableState tst = DataTableState.Create();
+        DataTable.EnsureInit(tst, tcols, tsrc);
+        tst.filters[1].topMode = 1;      // top 2 by value
+        tst.filters[1].topN = 2;
+        tst.dirty = true;
+        DataTable.Recompute(tst, tcols, tsrc);
+        // rows come back in source order (d before e), not ranked order
+        seq = "";
+        foreach (int oi in tst.order) { seq = seq + tsrc.CellText(oi, 0); }
+        Console.WriteLine(seq);
+
+        tst.filters[1].topMode = 2;      // bottom 2
+        tst.dirty = true;
+        DataTable.Recompute(tst, tcols, tsrc);
+        seq = "";
+        foreach (int oi in tst.order) { seq = seq + tsrc.CellText(oi, 0); }
+        Console.WriteLine(seq);
+
+        tst.filters[1].topMode = 5;      // above the mean of 5
+        tst.dirty = true;
+        DataTable.Recompute(tst, tcols, tsrc);
+        seq = "";
+        foreach (int oi in tst.order) { seq = seq + tsrc.CellText(oi, 0); }
+        Console.WriteLine(seq);
+
+        tst.filters[1].topMode = 3;      // top 40% of 5 rows = 2 rows
+        tst.filters[1].topN = 40;
+        tst.dirty = true;
+        DataTable.Recompute(tst, tcols, tsrc);
+        seq = "";
+        foreach (int oi in tst.order) { seq = seq + tsrc.CellText(oi, 0); }
+        Console.WriteLine(seq);
+
+        // a tie on the cut line keeps every tied row rather than truncating
+        tsrc.SetCell(4, 1, "9");
+        tst.filters[1].topMode = 1;
+        tst.filters[1].topN = 1;
+        tst.dirty = true;
+        DataTable.Recompute(tst, tcols, tsrc);
+        seq = "";
+        foreach (int oi in tst.order) { seq = seq + tsrc.CellText(oi, 0); }
+        Console.WriteLine(seq);
+
+        // cell rules and the set pass compose: >4 leaves b,d,e; top 2 of those
+        tst.filters[1].cmpMode = 1;
+        tst.filters[1].cmpA = "4";
+        tst.filters[1].topN = 2;
+        tst.dirty = true;
+        DataTable.Recompute(tst, tcols, tsrc);
+        seq = "";
+        foreach (int oi in tst.order) { seq = seq + tsrc.CellText(oi, 0); }
+        Console.WriteLine(seq);
+
+        // Reset() drops every stage at once
+        tst.filters[1].Reset();
+        Console.WriteLine(tst.filters[1].Active());
+        tst.dirty = true;
+        DataTable.Recompute(tst, tcols, tsrc);
+        Console.WriteLine(tst.order.Count);
     }
 }
