@@ -70,6 +70,23 @@ partial class ZanIDE {
     [DllImport("crt")]
     static extern string calloc(int count, int size);
 
+    // Raw (nint-buffer) binary file I/O, used only by WriteIconResFromIco
+    // below to read a .ico and write a .res without going through the
+    // string-based System.IO.File helpers (which are not NUL-safe for
+    // arbitrary binary data). Mirrors the nint-typed fread/fwrite pattern
+    // already used by System.Data.ZanDb.PageFile.
+    [DllImport("crt", EntryPoint = "fopen")]
+    static extern int BinFOpen(string path, string mode);
+
+    [DllImport("crt", EntryPoint = "fclose")]
+    static extern int BinFClose(int fp);
+
+    [DllImport("crt", EntryPoint = "fread")]
+    static extern int BinFRead(nint buf, int size, int count, int fp);
+
+    [DllImport("crt", EntryPoint = "fwrite")]
+    static extern int BinFWrite(nint buf, int size, int count, int fp);
+
     /// Full path of the running IDE executable. Platform-specific: Win32
     /// GetModuleFileNameA, macOS _NSGetExecutablePath, Linux /proc/self/exe.
     /// The buffer is calloc-zeroed so the returned path stays NUL-terminated.
@@ -767,8 +784,15 @@ partial class ZanIDE {
         string pub = "";
         if (publish) { pub = " --publish"; }
         string sub = "";
-        if (ZanIDE.IsGuiTarget(root, p)) { sub = " --subsystem windows"; }
-        return ZanIDE.ZancCmd() + pub + " " + inputs + " -o \"" + exe + "\"" + sub;
+        string icon = "";
+        if (ZanIDE.IsGuiTarget(root, p)) {
+            sub = " --subsystem windows";
+            if (ZanIDE.IsGuiProject(root)) {
+                string res = ZanIDE.EnsureProjectIconRes(root);
+                if (res != "") { icon = " --link-input \"" + res + "\""; }
+            }
+        }
+        return ZanIDE.ZancCmd() + pub + " " + inputs + " -o \"" + exe + "\"" + sub + icon;
     }
 
     /// Like CompileToExe but cross-compiles for an explicit `--target` (e.g.
@@ -867,20 +891,121 @@ partial class ZanIDE {
         return ZanIDE.ProjField(root, "singleFile") != "false";
     }
 
-    /// Compiles the project's custom .ico into a Windows resource so it can be
-    /// linked into (packaged inside) the produced exe. Returns the .res path, or
-    /// "" when no icon is configured / the .ico is missing / llvm-rc is absent.
+    /// Writes a 32-byte .res resource-entry header (numeric type and name).
+    /// dataSize  : size of the data that follows (not counting padding)
+    /// typeId    : RT_ICON = 3, RT_GROUP_ICON = 14, 0 for the null entry
+    /// nameId    : 1-based icon ID (0 for the null entry)
+    /// memFlags  : 0x1010 for RT_ICON, 0x1030 for RT_GROUP_ICON, 0 for null
+    static void WriteResHeader(ByteBuffer b, int dataSize, int typeId, int nameId, int memFlags) {
+        b.WriteU32(dataSize);        // DataSize
+        b.WriteU32(32);              // HeaderSize is always 32 for numeric type+name
+        b.WriteU16(0xFFFF);          // numeric type marker
+        b.WriteU16(typeId);          // resource type id
+        b.WriteU16(0xFFFF);          // numeric name marker
+        b.WriteU16(nameId);          // resource name id
+        b.WriteU32(0);               // DataVersion
+        b.WriteU16(memFlags);        // MemoryFlags
+        b.WriteU16(0);               // LanguageId = neutral
+        b.WriteU32(0);               // Version
+        b.WriteU32(0);               // Characteristics
+    }
+
+    /// Builds a Windows COFF .res binary directly from a .ico file and writes
+    /// it to resPath. No external tool (llvm-rc / windres) required.
+    ///
+    /// .res layout:
+    ///   [null resource header — 32 bytes]
+    ///   [RT_ICON entry × N]   one raw image blob per image in the .ico
+    ///   [RT_GROUP_ICON entry]  the icon-group directory the linker reads
+    ///
+    /// Returns true on success, false when the .ico is unreadable / malformed
+    /// or the output file cannot be written.
+    static bool WriteIconResFromIco(string icoPath, string resPath) {
+        // Read the whole .ico into an off-heap buffer (NUL-safe binary read).
+        int icoSize = File.GetSize(icoPath);
+        if (icoSize < 22) { return false; }   // header (6) + at least 1 entry (16)
+        nint ico = NativeMemory.Alloc(icoSize + 1);
+        int rfp = ZanIDE.BinFOpen(icoPath, "rb");
+        if (rfp == 0) { NativeMemory.Free(ico); return false; }
+        ZanIDE.BinFRead(ico, 1, icoSize, rfp);
+        ZanIDE.BinFClose(rfp);
+
+        // ICO header: reserved(2) type=1(2) count(2)
+        int count = NativeMemory.GetU16(ico, 4);
+        if (count <= 0 || count > 256 || icoSize < 6 + count * 16) {
+            NativeMemory.Free(ico); return false;
+        }
+
+        // Build the .res binary in a ByteBuffer.
+        ByteBuffer res = ByteBuffer.Alloc(icoSize + 256);
+
+        // ── null resource (32 zero bytes) ──────────────────────────────────
+        ZanIDE.WriteResHeader(res, 0, 0, 0, 0);
+
+        // ── RT_ICON resources (one per image in the .ico) ──────────────────
+        int i = 0;
+        while (i < count) {
+            int eBase = 6 + i * 16;
+            int imgSize = NativeMemory.GetU32(ico, eBase + 8);
+            int imgOff  = NativeMemory.GetU32(ico, eBase + 12);
+            if (imgOff + imgSize > icoSize) {
+                NativeMemory.Free(ico); res.Free(); return false;
+            }
+            ZanIDE.WriteResHeader(res, imgSize, 3, i + 1, 0x1010);
+            res.WriteBytes(ico + imgOff, imgSize);
+            // align data to DWORD boundary
+            int pad = (4 - (imgSize & 3)) & 3;
+            int p = 0;
+            while (p < pad) { res.WriteU8(0); p = p + 1; }
+            i = i + 1;
+        }
+
+        // ── RT_GROUP_ICON resource ─────────────────────────────────────────
+        int grpData = 6 + count * 14;          // GRPICONDIR size
+        ZanIDE.WriteResHeader(res, grpData, 14, 1, 0x1030);
+        res.WriteU16(0);                        // reserved
+        res.WriteU16(1);                        // type = icon
+        res.WriteU16(count);                    // count
+        i = 0;
+        while (i < count) {
+            int eBase = 6 + i * 16;
+            res.WriteU8(NativeMemory.GetByte(ico, eBase));          // width
+            res.WriteU8(NativeMemory.GetByte(ico, eBase + 1));      // height
+            res.WriteU8(NativeMemory.GetByte(ico, eBase + 2));      // colorCount
+            res.WriteU8(0);                                          // reserved
+            res.WriteU16(NativeMemory.GetU16(ico, eBase + 4));      // planes
+            res.WriteU16(NativeMemory.GetU16(ico, eBase + 6));      // bitCount
+            res.WriteU32(NativeMemory.GetU32(ico, eBase + 8));      // bytesInRes
+            res.WriteU16(i + 1);                                     // id (1-based)
+            i = i + 1;
+        }
+        // align group data to DWORD boundary
+        int grpPad = (4 - (grpData & 3)) & 3;
+        int q = 0;
+        while (q < grpPad) { res.WriteU8(0); q = q + 1; }
+
+        NativeMemory.Free(ico);
+
+        // Write the finished .res to disk.
+        int wfp = ZanIDE.BinFOpen(resPath, "wb");
+        if (wfp == 0) { res.Free(); return false; }
+        ZanIDE.BinFWrite(res.Raw(), 1, res.Length(), wfp);
+        ZanIDE.BinFClose(wfp);
+        res.Free();
+        return true;
+    }
+
+    /// Builds (or refreshes) the project's icon .res file in the build dir.
+    /// Returns the .res path for --link-input, or "" when no icon is configured,
+    /// the .ico is missing, or the .res could not be written.
     static string EnsureProjectIconRes(string root) {
         string rel = ZanIDE.ProjField(root, "icon");
         if (rel == "") { return ""; }
         string ico = root + "/" + rel;
         if (!File.Exists(ico)) { return ""; }
         string bd = ZanIDE.EnsureBuildDir(root);
-        string rc = bd + "/app.rc";
         string res = bd + "/app.res";
-        File.WriteAllText(rc, "1 ICON \"" + ico + "\"\n");
-        Process.RunCapture("llvm-rc /fo \"" + res + "\" \"" + rc + "\"");
-        if (!File.Exists(res)) { return ""; }
+        if (!ZanIDE.WriteIconResFromIco(ico, res)) { return ""; }
         return res;
     }
 
@@ -1208,6 +1333,7 @@ partial class ZanIDE {
         Input rtExFilter = new Input(ZanIDE.T("Filter...", "筛选..."));
         SignalInt rtToolScroll = SignalInt.Create(0);
         SignalInt rtExScroll = SignalInt.Create(0);
+        List<TreeNode> rtCtxShow = new List<TreeNode>();
         // Chat transcript: parallel role ("user"/"assistant"/"error") + text.
         List<string> aiRole = new List<string>();
         List<string> aiText = new List<string>();
@@ -1398,9 +1524,10 @@ partial class ZanIDE {
                     if (app.fxNextMs >= 0 && (deadline < 0 || app.fxNextMs < deadline)) {
                         deadline = app.fxNextMs;
                     }
-                    // Fold the wizard child window's animation deadlines in too, so
-                    // its button hover/press cross-fades and ripples keep ticking
-                    // after the mouse stops (otherwise a fade-out freezes mid-way
+                    // Fold every open child window's animation deadlines in too, so
+                    // button hover/press cross-fades, ripples, and skin backdrop
+                    // effects keep ticking smoothly after the mouse stops
+                    // (otherwise a fade-out or animated skin freezes mid-way
                     // until the next OS event).
                     if (dlg != null) {
                         if (dlg.animNextMs >= 0 && (deadline < 0 || dlg.animNextMs < deadline)) {
@@ -1408,6 +1535,30 @@ partial class ZanIDE {
                         }
                         if (dlg.fxNextMs >= 0 && (deadline < 0 || dlg.fxNextMs < deadline)) {
                             deadline = dlg.fxNextMs;
+                        }
+                    }
+                    if (pubWin != null) {
+                        if (pubWin.animNextMs >= 0 && (deadline < 0 || pubWin.animNextMs < deadline)) {
+                            deadline = pubWin.animNextMs;
+                        }
+                        if (pubWin.fxNextMs >= 0 && (deadline < 0 || pubWin.fxNextMs < deadline)) {
+                            deadline = pubWin.fxNextMs;
+                        }
+                    }
+                    if (cfgWin != null) {
+                        if (cfgWin.animNextMs >= 0 && (deadline < 0 || cfgWin.animNextMs < deadline)) {
+                            deadline = cfgWin.animNextMs;
+                        }
+                        if (cfgWin.fxNextMs >= 0 && (deadline < 0 || cfgWin.fxNextMs < deadline)) {
+                            deadline = cfgWin.fxNextMs;
+                        }
+                    }
+                    if (assetWin != null) {
+                        if (assetWin.animNextMs >= 0 && (deadline < 0 || assetWin.animNextMs < deadline)) {
+                            deadline = assetWin.animNextMs;
+                        }
+                        if (assetWin.fxNextMs >= 0 && (deadline < 0 || assetWin.fxNextMs < deadline)) {
+                            deadline = assetWin.fxNextMs;
                         }
                     }
                     if (deadline < 0) {
@@ -1421,12 +1572,24 @@ partial class ZanIDE {
                                 if (dlg.animNextMs >= 0 && idleNow >= dlg.animNextMs) { childDue = true; }
                                 if (dlg.fxNextMs >= 0 && idleNow >= dlg.fxNextMs) { childDue = true; }
                             }
+                            if (pubWin != null) {
+                                if (pubWin.animNextMs >= 0 && idleNow >= pubWin.animNextMs) { childDue = true; pubWin.RequestRedraw(); }
+                                if (pubWin.fxNextMs >= 0 && idleNow >= pubWin.fxNextMs) { childDue = true; pubWin.RequestRedraw(); }
+                            }
+                            if (cfgWin != null) {
+                                if (cfgWin.animNextMs >= 0 && idleNow >= cfgWin.animNextMs) { childDue = true; cfgWin.RequestRedraw(); }
+                                if (cfgWin.fxNextMs >= 0 && idleNow >= cfgWin.fxNextMs) { childDue = true; cfgWin.RequestRedraw(); }
+                            }
+                            if (assetWin != null) {
+                                if (assetWin.animNextMs >= 0 && idleNow >= assetWin.animNextMs) { childDue = true; assetWin.RequestRedraw(); }
+                                if (assetWin.fxNextMs >= 0 && idleNow >= assetWin.fxNextMs) { childDue = true; assetWin.RequestRedraw(); }
+                            }
                             bool fxOnly = app.animNextMs < 0 || idleNow < app.animNextMs;
                             if (!childDue && fxOnly && app.FxPresent()) {
                                 // Effect tick presented in place; keep idling.
                             } else {
                                 app.needsRedraw = true;
-                                if (childDue) { dlg.RequestRedraw(); }
+                                if (childDue && dlg != null) { dlg.RequestRedraw(); }
                                 r = app.window.PollEvent();
                                 idleWait = false;
                             }
@@ -2282,17 +2445,20 @@ partial class ZanIDE {
                         dlg = ZanIDE.OpenWizard(app, ZanIDE.T("New File", "新建文件"), fSel, fNameInput, "NewFile");
                         dlgMode = 2;
                     } else if (hit.action == 2) {
-                        if (tabNames.Count > 1) {
-                            tabNames.RemoveAt(hit.index);
-                            tabBodies.RemoveAt(hit.index);
-                            tabPaths.RemoveAt(hit.index);
-                            int a = activeTab.Get();
-                            if (a > hit.index) { a = a - 1; }
-                            if (a >= tabNames.Count) { a = tabNames.Count - 1; }
-                            if (a < 0) { a = 0; }
-                            activeTab.Set(a);
-                            lastActive = 0 - 1;
+                        tabNames.RemoveAt(hit.index);
+                        tabBodies.RemoveAt(hit.index);
+                        tabPaths.RemoveAt(hit.index);
+                        if (tabNames.Count == 0) {
+                            // Never leave the shell with zero tabs: fall back
+                            // to the Start page, same as a fresh launch.
+                            tabNames.Add("Start"); tabBodies.Add(""); tabPaths.Add("@start");
                         }
+                        int a = activeTab.Get();
+                        if (a > hit.index) { a = a - 1; }
+                        if (a >= tabNames.Count) { a = tabNames.Count - 1; }
+                        if (a < 0) { a = 0; }
+                        activeTab.Set(a);
+                        lastActive = 0 - 1;
                     } else if (hit.action == 1) {
                         activeTab.Set(hit.index);
                     }
@@ -3531,15 +3697,12 @@ partial class ZanIDE {
                             rtEmpty, t.textTertiary, t.fontSizeSmall);
                     } else {
                         int rtRight = TreeView.Render(app, rtArea, rtShow, rtSel, rtSc);
-                        // Right-click on a tool: open its source in the editor
-                        // (double-click runs it).
-                        if (rTab == 1 && rtRight >= 0 && rtRight < rtShow.Count) {
-                            TreeNode rtrn = rtShow[rtRight];
-                            if (!rtrn.isDir && rtrn.path != "" && !ZanIDE.StartsWith(rtrn.path, "@")) {
-                                ZanIDE.OpenPath(tabNames, tabBodies, tabPaths, activeTab, rtrn.path, rtrn.label);
-                                log.Add("> Opened " + rtrn.path + ".");
-                                app.RequestRedraw();
-                            }
+                        // Right-click on any row: open a context menu.
+                        if (rtRight >= 0 && rtRight < rtShow.Count) {
+                            rtCtxShow = rtShow;
+                            if (rTab == 1) { ctxKind = 4; } else { ctxKind = 5; }
+                            ctxX = app.mouseX; ctxY = app.mouseY;
+                            ctxTarget = rtRight; app.RequestRedraw();
                         }
                     }
                     // Double-click on a leaf: run the tool / open the example.
@@ -3762,7 +3925,9 @@ partial class ZanIDE {
                     }
                 }
                 // File-tree / tab right-click context menus, drawn above the
-                // editor overlay. ctxKind: 1 = project tree row, 3 = editor tab.
+                // editor overlay. ctxKind: 1 = project tree row, 2 = stdlib
+                // tree row, 3 = editor tab, 4 = Tools panel row, 5 = Examples
+                // panel row.
                 if (ctxKind != 0) {
                     List<string> cmLabels = new List<string>();
                     if (ctxKind == 1) {
@@ -3785,6 +3950,17 @@ partial class ZanIDE {
                         cmLabels.Add(ZanIDE.T("Close Others", "关闭其他"));
                         cmLabels.Add("-");
                         cmLabels.Add(ZanIDE.T("Copy Path", "复制路径"));
+                    } else if (ctxKind == 4) {
+                        cmLabels.Add(ZanIDE.T("Open in Editor", "在编辑器中打开"));
+                        cmLabels.Add(ZanIDE.T("Run", "运行"));
+                        cmLabels.Add("-");
+                        cmLabels.Add(ZanIDE.T("Copy Path", "复制路径"));
+                        cmLabels.Add(ZanIDE.T("Reveal in Explorer", "在资源管理器中显示"));
+                    } else if (ctxKind == 5) {
+                        cmLabels.Add(ZanIDE.T("Open", "打开"));
+                        cmLabels.Add("-");
+                        cmLabels.Add(ZanIDE.T("Copy Path", "复制路径"));
+                        cmLabels.Add(ZanIDE.T("Reveal in Explorer", "在资源管理器中显示"));
                     }
                     int chosen = ContextMenu.Render(app, ctxX, ctxY, cmLabels);
                     if (chosen == 0 - 2) {
@@ -3853,6 +4029,43 @@ partial class ZanIDE {
                                 if (ctxTarget >= 0 && ctxTarget < tabPaths.Count) {
                                     Clipboard.SetText(tabPaths[ctxTarget]);
                                     log.Add("> Copied path: " + tabPaths[ctxTarget]);
+                                }
+                            }
+                        } else if (ctxKind == 4) {
+                            if (ctxTarget >= 0 && ctxTarget < rtCtxShow.Count) {
+                                TreeNode rtrn = rtCtxShow[ctxTarget];
+                                bool rtReal = rtrn.path != "" && !ZanIDE.StartsWith(rtrn.path, "@");
+                                if (!rtrn.isDir && rtReal) {
+                                    if (chosen == 0) {
+                                        ZanIDE.OpenPath(tabNames, tabBodies, tabPaths, activeTab, rtrn.path, rtrn.label);
+                                        log.Add("> Opened " + rtrn.path + ".");
+                                    } else if (chosen == 1) {
+                                        log.Add(ZanIDE.T("> Running tool ", "> 运行工具 ") + rtrn.path + " ...");
+                                        ZanIDE.RunFile(rtrn.path, root, log, editor);
+                                    } else if (chosen == 3) {
+                                        Clipboard.SetText(rtrn.path);
+                                        log.Add("> Copied path: " + rtrn.path);
+                                    } else if (chosen == 4) {
+                                        ZanIDE.RevealInFileManager(rtrn.path);
+                                    }
+                                }
+                            }
+                        } else if (ctxKind == 5) {
+                            if (ctxTarget >= 0 && ctxTarget < rtCtxShow.Count) {
+                                TreeNode exrn = rtCtxShow[ctxTarget];
+                                bool exrReal = exrn.path != "" && !ZanIDE.StartsWith(exrn.path, "@");
+                                if (chosen == 0) {
+                                    if (!exrn.isDir && exrReal) {
+                                        ZanIDE.OpenPath(tabNames, tabBodies, tabPaths, activeTab, exrn.path, exrn.label);
+                                        log.Add("> Opened " + exrn.path + ".");
+                                    }
+                                } else if (chosen == 2) {
+                                    if (exrReal) {
+                                        Clipboard.SetText(exrn.path);
+                                        log.Add("> Copied path: " + exrn.path);
+                                    }
+                                } else if (chosen == 3) {
+                                    if (exrReal) { ZanIDE.RevealInFileManager(exrn.path); }
                                 }
                             }
                         }
@@ -4275,15 +4488,17 @@ partial class ZanIDE {
         return outp;
     }
 
-    /// Closes the tab at `idx`, keeping at least one tab open and clamping the
-    /// active index.
+    /// Closes the tab at `idx`, falling back to the Start tab if it was the
+    /// last one open, and clamping the active index.
     static void CloseTabAt(List<string> names, List<string> bodies,
             List<string> paths, SignalInt active, int idx) {
         if (idx < 0 || idx >= names.Count) { return; }
-        if (names.Count <= 1) { return; }
         names.RemoveAt(idx);
         bodies.RemoveAt(idx);
         paths.RemoveAt(idx);
+        if (names.Count == 0) {
+            names.Add("Start"); bodies.Add(""); paths.Add("@start");
+        }
         int a = active.Get();
         if (a > idx) { a = a - 1; }
         if (a >= names.Count) { a = names.Count - 1; }
