@@ -625,6 +625,7 @@ partial class DataTable {
         if (!c.isBool || !c.editable) { return; }
         string nv = c.boolTrue;
         if (src.CellBool(row, col)) { nv = c.boolFalse; }
+        DataTable.Journal(st, RowEdit.Cell(row, col, src.CellText(row, col), nv));
         src.SetCell(row, col, nv);
         st.editRow = row;
         st.editCol = col;
@@ -674,6 +675,7 @@ partial class DataTable {
             return;
         }
 
+        DataTable.Journal(st, RowEdit.Cell(rr, cc, src.CellText(rr, cc), st.editBuf));
         src.SetCell(rr, cc, st.editBuf);
         st.hitRow = rr;
         st.hitCol = cc;
@@ -974,6 +976,231 @@ partial class DataTable {
         while (co < cols.Count) {
             if (st.colOrder.IndexOf(co) < 0) { st.colOrder.Add(co); }
             co = co + 1;
+        }
+    }
+
+    // ---------- row add / delete + undo ----------
+
+    /// Push a reversible change onto the journal, dropping the oldest entry
+    /// once the cap is reached. Writes made *by* an undo are not journalled —
+    /// otherwise undo would immediately become its own redo.
+    static void Journal(DataTableState st, RowEdit e) {
+        if (st.undoing) { return; }
+        e.group = st.undoGroup;
+        st.undoLog.Add(e);
+        while (st.undoLog.Count > st.undoLimit && st.undoLog.Count > 0) {
+            st.undoLog.RemoveAt(0);
+        }
+    }
+
+    /// Start a compound change: everything journalled until EndUndoGroup comes
+    /// back in a single Undo. Used by paste, Delete-over-a-range and
+    /// delete-selected-rows, where one gesture touches many cells or rows.
+    static void BeginUndoGroup(DataTableState st) {
+        st.undoGroupSeq = st.undoGroupSeq + 1;
+        st.undoGroup = st.undoGroupSeq;
+    }
+
+    static void EndUndoGroup(DataTableState st) { st.undoGroup = 0; }
+
+    /// Number of Ctrl+Z presses the journal can still absorb. Grouped entries
+    /// count once, since they come back together.
+    static int UndoDepth(DataTableState st) {
+        int n = 0;
+        int i = 0;
+        int lastG = 0;
+        while (i < st.undoLog.Count) {
+            int g = st.undoLog[i].group;
+            if (g == 0 || g != lastG) { n = n + 1; }
+            lastG = g;
+            i = i + 1;
+        }
+        return n;
+    }
+
+    /// Drop the journal (e.g. after saving).
+    static void ClearUndo(DataTableState st) { st.undoLog.Clear(); }
+
+    /// Insert a blank row at data index `at` and select it. Returns the index
+    /// of the new row, or -1 when the source refused.
+    ///
+    /// `st.selected` is indexed by data row, so every flag at or after the
+    /// insertion point shifts up with it — otherwise the new row would inherit
+    /// the selection state of whatever used to sit at that index.
+    static int InsertRow(DataTableState st, List<DataColumn> cols, DataSource src, int at) {
+        if (!src.CanInsert()) { return -1; }
+        int n = src.RowCount();
+        if (at < 0) { at = 0; }
+        if (at > n) { at = n; }
+        if (!src.InsertRow(at)) { return -1; }
+
+        while (st.selected.Count < at) { st.selected.Add(false); }
+        st.selected.Insert(at, false);
+
+        // A new row starts blank, but a bool column has no blank: give it the
+        // column's own false text so it reads back as a valid value.
+        int c = 0;
+        while (c < cols.Count) {
+            if (cols[c].isBool) { src.SetCell(at, c, cols[c].boolFalse); }
+            c = c + 1;
+        }
+
+        DataTable.Journal(st, RowEdit.Insert(at));
+        st.lastAddedRow = at;
+        st.hitRow = at;
+        st.dirty = true;
+        st.RowInserted.Raise();
+        return at;
+    }
+
+    /// Append a blank row after the last one.
+    static int AppendRow(DataTableState st, List<DataColumn> cols, DataSource src) {
+        return DataTable.InsertRow(st, cols, src, src.RowCount());
+    }
+
+    /// Snapshot every cell of a row, so a delete can be undone after the source
+    /// has forgotten it.
+    static List<string> RowCells(DataSource src, List<DataColumn> cols, int row) {
+        List<string> out2 = new List<string>();
+        int c = 0;
+        while (c < cols.Count) {
+            out2.Add(src.CellText(row, c));
+            c = c + 1;
+        }
+        return out2;
+    }
+
+    /// Delete the row at data index `at`. Returns true when it was removed.
+    static bool DeleteRow(DataTableState st, List<DataColumn> cols, DataSource src, int at) {
+        if (!src.CanInsert()) { return false; }
+        if (at < 0 || at >= src.RowCount()) { return false; }
+
+        // Snapshot before the source drops it — after RemoveRow the cells are
+        // gone, so this is the only chance to make the delete reversible.
+        List<string> cells = DataTable.RowCells(src, cols, at);
+        if (!src.RemoveRow(at)) { return false; }
+
+        if (at < st.selected.Count) { st.selected.RemoveAt(at); }
+
+        // An open editor on the deleted row now points at a row that no longer
+        // exists (or, worse, at its successor); close it rather than let it
+        // commit into the wrong place.
+        if (st.editing && st.editRow == at) { DataTable.CancelEdit(st); }
+        else if (st.editing && st.editRow > at) { st.editRow = st.editRow - 1; }
+
+        if (st.lastAddedRow == at) { st.lastAddedRow = -1; }
+        else if (st.lastAddedRow > at) { st.lastAddedRow = st.lastAddedRow - 1; }
+
+        DataTable.Journal(st, RowEdit.Delete(at, cells));
+        st.hitRow = at;
+        st.dirty = true;
+        st.RowDeleted.Raise();
+        return true;
+    }
+
+    /// Delete every selected row. Returns how many went.
+    ///
+    /// Rows are removed back-to-front: deleting forwards would renumber the
+    /// rows still to be deleted, so each removal would take the wrong one.
+    static int DeleteSelectedRows(DataTableState st, List<DataColumn> cols, DataSource src) {
+        DataTable.BeginUndoGroup(st);
+        int gone = 0;
+        int i = st.selected.Count - 1;
+        while (i >= 0) {
+            if (i < src.RowCount() && st.selected[i]) {
+                if (DataTable.DeleteRow(st, cols, src, i)) { gone = gone + 1; }
+            }
+            i = i - 1;
+        }
+        DataTable.EndUndoGroup(st);
+        return gone;
+    }
+
+    /// Display slot showing data row `row`, or -1 when it has none — it is
+    /// filtered out, or sits inside a collapsed group. A data-row index is
+    /// never a slot index, so anything that scrolls or parks the cursor has to
+    /// come through here.
+    static int SlotOfRow(DataTableState st, int row) {
+        int i = 0;
+        while (i < st.dispRows.Count) {
+            if (st.dispRows[i].kind == 0 && st.dispRows[i].row == row) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    /// Park the cell cursor on `row` and open its first editable column, which
+    /// is what makes a freshly added row usable without a second click. Does
+    /// nothing when the row isn't currently displayed.
+    static void FocusRow(DataTableState st, List<DataColumn> cols, DataSource src, int row) {
+        int slot = DataTable.SlotOfRow(st, row);
+        if (slot < 0) { return; }
+        st.hitOrder = slot;
+        st.hitRow = row;
+        DataTable.ClearRange(st);
+        int c = 0;
+        while (c < cols.Count) {
+            // A hidden column can be edited by no one: skip past it rather than
+            // open an editor the user can't see.
+            if (cols[c].editable && !cols[c].isBool
+                && (c >= st.colHidden.Count || !st.colHidden[c])) {
+                st.hitCol = c;
+                DataTable.BeginEdit(st, cols, src, row, c);
+                return;
+            }
+            c = c + 1;
+        }
+    }
+
+    /// Reverse the most recent journalled change. Returns true when something
+    /// was undone.
+    static bool Undo(DataTableState st, List<DataColumn> cols, DataSource src) {
+        if (st.undoLog.Count == 0) { return false; }
+
+        // Everything below writes through the same public operations, which
+        // would journal themselves and make the undo undoable-forever; this
+        // flag suppresses that for the duration.
+        st.undoing = true;
+
+        // Pop the trailing entry and, if it belongs to a group, every entry of
+        // that group with it — newest first, so each reversal lands on the row
+        // indices the one before it left behind.
+        int grp = st.undoLog[st.undoLog.Count - 1].group;
+        bool more = true;
+        while (more && st.undoLog.Count > 0) {
+            RowEdit e = st.undoLog[st.undoLog.Count - 1];
+            st.undoLog.RemoveAt(st.undoLog.Count - 1);
+            DataTable.UndoOne(st, cols, src, e);
+            more = grp != 0 && st.undoLog.Count > 0
+                   && st.undoLog[st.undoLog.Count - 1].group == grp;
+        }
+
+        st.undoing = false;
+        st.dirty = true;
+        return true;
+    }
+
+    /// Reverse one journal entry. Assumes st.undoing is already set.
+    static void UndoOne(DataTableState st, List<DataColumn> cols, DataSource src, RowEdit e) {
+        if (e.kind == 0) {
+            if (e.row >= 0 && e.row < src.RowCount() && e.col >= 0 && e.col < cols.Count) {
+                src.SetCell(e.row, e.col, e.before);
+                st.hitRow = e.row;
+                st.hitCol = e.col;
+            }
+        } else if (e.kind == 1) {
+            // undo an insert = delete it again
+            DataTable.DeleteRow(st, cols, src, e.row);
+        } else if (e.kind == 2) {
+            // undo a delete = put the row back, cell for cell
+            int at = DataTable.InsertRow(st, cols, src, e.row);
+            if (at >= 0) {
+                int c = 0;
+                while (c < cols.Count && c < e.cells.Count) {
+                    src.SetCell(at, c, e.cells[c]);
+                    c = c + 1;
+                }
+            }
         }
     }
 
@@ -2748,6 +2975,8 @@ partial class DataTable {
         r0 = DataTable.NextDataSlot(st, r0, 1);
         if (r0 < 0) { return 0; }
 
+        // One paste is one undo, however many cells it lands on.
+        DataTable.BeginUndoGroup(st);
         List<string> lines = DataTable.SplitLines(text);
         int written = 0;
         int li = 0;
@@ -2778,6 +3007,7 @@ partial class DataTable {
                             string perr = DataTable.ValidateCell(cols[col], v);
                             if (perr.Length > 0) { st.editError = perr; }
                             else {
+                                DataTable.Journal(st, RowEdit.Cell(row, col, src.CellText(row, col), v));
                                 src.SetCell(row, col, v);
                                 written = written + 1;
                             }
@@ -2789,6 +3019,7 @@ partial class DataTable {
                 }
             }
         }
+        DataTable.EndUndoGroup(st);
         if (written > 0) {
             st.editRow = st.dispRows[r0].row;
             st.editCol = c0;
@@ -2816,6 +3047,8 @@ partial class DataTable {
         // range happens to start on.
         r0 = DataTable.NextDataSlot(st, r0, 1);
         if (r0 < 0 || r0 > r1) { return 0; }
+        // One Delete press is one undo, however wide the range.
+        DataTable.BeginUndoGroup(st);
         int cleared = 0;
         int rr = r0;
         while (rr <= r1) {
@@ -2828,6 +3061,7 @@ partial class DataTable {
                     if (cc < cols.Count && cols[cc].editable && !cols[cc].required) {
                         string blank = "";
                         if (cols[cc].isBool) { blank = cols[cc].boolFalse; }
+                        DataTable.Journal(st, RowEdit.Cell(row, cc, src.CellText(row, cc), blank));
                         src.SetCell(row, cc, blank);
                         cleared = cleared + 1;
                     }
@@ -2836,6 +3070,7 @@ partial class DataTable {
             }
             rr = rr + 1;
         }
+        DataTable.EndUndoGroup(st);
         if (cleared > 0) {
             st.editRow = st.dispRows[r0].row;
             st.editCol = c0;

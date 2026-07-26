@@ -737,6 +737,8 @@ class DataTableState {
     UiEvent ScrollChanged;     // the virtual row window scrolled (read ScrollTop)
     UiEvent GroupChanged;      // grouping columns changed (read GroupCount)
     UiEvent ColumnReorder;     // a column was drag-reordered (read HitCol)
+    UiEvent RowInserted;       // a row was added (read HitRow for its index)
+    UiEvent RowDeleted;        // a row was removed (read HitRow for its index)
     int hitRow;                // data-row index of the last row/cell interaction
     int hitOrder;              // order-position (post sort/filter) of that row
     int hitCol;                // column index of the last header/cell interaction
@@ -766,6 +768,17 @@ class DataTableState {
     // ---- appearance hooks ----
     CellStyler styler;         // optional row/cell colouring + custom cell paint
                                // (null = stock appearance; see CellStyler)
+
+    // ---- row add / delete + undo ----
+    // The journal is capped (undoLimit) so a long editing session can't grow it
+    // without bound; the oldest entry is dropped when it overflows.
+    List<RowEdit> undoLog;     // reversible changes, oldest first
+    int undoLimit;             // max journal entries (default 100)
+    bool allowAddRow;          // show the new-row placeholder under the last row
+    bool undoing;              // an undo is applying: don't journal its own writes
+    int lastAddedRow;          // data-row index of the most recent insert (-1 none)
+    int undoGroup;             // group id stamped on new entries (0 = ungrouped)
+    int undoGroupSeq;          // last group id handed out by BeginUndoGroup
 
     static DataTableState Create() {
         DataTableState s = new DataTableState();
@@ -862,6 +875,8 @@ class DataTableState {
         s.ScrollChanged = UiEvent.Create();
         s.GroupChanged = UiEvent.Create();
         s.ColumnReorder = UiEvent.Create();
+        s.RowInserted = UiEvent.Create();
+        s.RowDeleted = UiEvent.Create();
         s.groupCols = new List<int>();
         s.collapsedKeys = new List<string>();
         s.dispRows = new List<DispRow>();
@@ -884,6 +899,13 @@ class DataTableState {
         s.edCalMonth = 0;
         s.edPopHot = false;
         s.styler = null;
+        s.undoLog = new List<RowEdit>();
+        s.undoLimit = 100;
+        s.allowAddRow = false;
+        s.undoing = false;
+        s.lastAddedRow = -1;
+        s.undoGroup = 0;
+        s.undoGroupSeq = 0;
         return s;
     }
 
@@ -953,6 +975,18 @@ class DataSource {
     /// Write a cell value back into the underlying data (inline editing).
     /// Read-only sources ignore the write.
     virtual void SetCell(int row, int col, string v) { }
+
+    /// True when this source supports InsertRow / RemoveRow. The grid hides its
+    /// add/delete affordances (and the new-row placeholder) when it is false,
+    /// so a read-only or computed source needs no extra guarding.
+    virtual bool CanInsert() { return false; }
+
+    /// Insert a blank row so that it lands at index `at` (`at == RowCount()`
+    /// appends). Return true when the row was actually inserted.
+    virtual bool InsertRow(int at) { return false; }
+
+    /// Remove the row at `at`. Return true when it was actually removed.
+    virtual bool RemoveRow(int at) { return false; }
 }
 
 /// Backward-compatible adapter: serves an in-memory `List<DataRow>` of string
@@ -971,6 +1005,77 @@ class RowListSource : DataSource {
     override string CellText(int row, int col) { return this.rows[row].At(col); }
     override int CellNum(int row, int col) { return DataTable.ParseInt(this.rows[row].At(col)); }
     override void SetCell(int row, int col, string v) { this.rows[row].Set(col, v); }
+
+    /// An in-memory list can always grow or shrink.
+    override bool CanInsert() { return true; }
+
+    override bool InsertRow(int at) {
+        if (at < 0 || at > this.rows.Count) { return false; }
+        this.rows.Insert(at, DataRow.Create());
+        return true;
+    }
+
+    override bool RemoveRow(int at) {
+        if (at < 0 || at >= this.rows.Count) { return false; }
+        this.rows.RemoveAt(at);
+        return true;
+    }
+}
+
+/// One reversible change, recorded so Ctrl+Z can put it back.
+///
+/// `kind` is 0 cell-edit, 1 row-insert, 2 row-delete. A delete keeps the whole
+/// row's text in `cells`, because the source is free to drop the storage the
+/// moment RemoveRow returns — the journal, not the source, is what makes the
+/// row recoverable.
+class RowEdit {
+    int kind;
+    int row;          // data-row index the change applied to
+    int col;          // cell-edit: the column; otherwise -1
+    string before;    // cell-edit: the value that was there
+    string after;     // cell-edit: the value written
+    List<string> cells;  // row-delete: the removed row, cell by cell
+
+    /// Entries sharing a group are undone together. A paste that touched fifty
+    /// cells must come back in one Ctrl+Z, not fifty — so the group, not the
+    /// entry, is the unit of undo. 0 means "on its own".
+    int group;
+
+    static RowEdit Cell(int row, int col, string before, string after) {
+        RowEdit e = new RowEdit();
+        e.kind = 0;
+        e.row = row;
+        e.col = col;
+        e.before = before;
+        e.after = after;
+        e.cells = new List<string>();
+        e.group = 0;
+        return e;
+    }
+
+    static RowEdit Insert(int row) {
+        RowEdit e = new RowEdit();
+        e.kind = 1;
+        e.row = row;
+        e.col = -1;
+        e.before = "";
+        e.after = "";
+        e.cells = new List<string>();
+        e.group = 0;
+        return e;
+    }
+
+    static RowEdit Delete(int row, List<string> cells) {
+        RowEdit e = new RowEdit();
+        e.kind = 2;
+        e.row = row;
+        e.col = -1;
+        e.before = "";
+        e.after = "";
+        e.cells = cells;
+        e.group = 0;
+        return e;
+    }
 }
 
 /// Appearance + custom-paint hook for DataTable (DevExpress-style

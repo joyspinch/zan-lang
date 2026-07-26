@@ -775,6 +775,43 @@ partial class DataTable {
             r = r + 1;
         }
 
+        // ---------------- new-row placeholder ----------------
+        // The empty row under the last one, DevExpress's "click here to add".
+        // It is drawn only when the view is scrolled to the bottom (`r` stops
+        // short of visRows exactly then), so it always sits after the final
+        // row rather than floating in the middle of a scrolled page. It is not
+        // a display slot: it carries no data, so nothing selects or sorts it.
+        if (st.allowAddRow && src.CanInsert() && r < visRows) {
+            int ay = bodyTop + r * rowH;
+            int addId = app.focus.AllocId();
+            app.hitTester.Register(HitRegion.Create(addId, x, ay, viewW, rowH, 0));
+            bool aHover = app.focus.IsHovered(addId);
+            int aBg = t.bgPrimary;
+            if (aHover) { aBg = t.bgHover; }
+            c.FillRect(x + 1, ay, viewW - 2, rowH, aBg);
+            int aIco = app.Scale(12);
+            int aIx = x + app.Scale(8);
+            int aFg = t.textTertiary;
+            if (aHover) { aFg = t.primary; }
+            Icon.Draw(c, "plus", aIx, ay + (rowH - aIco) / 2, aIco, aFg);
+            c.DrawText(aIx + aIco + app.Scale(6),
+                       ay + (rowH - t.fontSizeSmall) / 2,
+                       "点击添加新行  Click to add row", aFg, t.fontSizeSmall);
+            c.FillRect(x + 1, ay + rowH - 1, viewW - 2, 1, gridColor);
+            if (app.window.EventKind() == 3 && app.window.EventButton() == 0
+                && app.hitTester.HitTest(app.mouseX, app.mouseY) == addId) {
+                int newRow = DataTable.AppendRow(st, cols, src);
+                if (newRow >= 0) {
+                    // Recompute first: the row has to exist in the display order
+                    // before the cursor can be parked on it, or BeginEdit would
+                    // open on a slot that isn't there yet.
+                    DataTable.Recompute(st, cols, src);
+                    DataTable.FocusRow(st, cols, src, newRow);
+                }
+                app.RequestRedraw();
+            }
+        }
+
         // ---------------- freeze boundary ----------------
         // A subtle accent divider marks where the frozen (pinned) columns end.
         if (pinnedW > 0) {
@@ -1450,9 +1487,15 @@ partial class DataTable {
 
         // menu items: label, accelerator, kind (0 item, 1 separator)
         // 0 copy, 1 copy-with-headers, 2 paste, 3 clear cells, 4 export csv,
-        // 5 chart-from-selection, sep, 6 select all, sep, 7 clear selection
+        // 5 chart-from-selection, [sep, insert row, delete rows, undo,]
+        // sep, select all, sep, clear selection
+        // The row-editing group only exists when the source can actually grow
+        // or shrink, so a read-only grid shows no command it would refuse.
+        bool canRows = src.CanInsert();
         int nItems = 8;
-        int mh = ih * nItems + sepH * 2 + app.Scale(8);
+        int nSeps = 2;
+        if (canRows) { nItems = nItems + 3; nSeps = nSeps + 1; }
+        int mh = ih * nItems + sepH * nSeps + app.Scale(8);
 
         int mx = st.ctxX;
         int my = st.ctxY;
@@ -1523,6 +1566,54 @@ partial class DataTable {
             app.RequestRedraw();
         }
         iy = iy + ih;
+        if (canRows) {
+            c.FillRect(mx + app.Scale(8), iy + sepH / 2, mw - app.Scale(16), 1, t.divider);
+            iy = iy + sepH;
+            DataTable.CtxItem(app, mx, iy, mw, ih, "插入行  Insert row", "Ctrl+Ins");
+            if (DataTable.CtxHit(app, mx, iy, mw, ih)) {
+                // Insert *below* the clicked row, which is where a reader
+                // expects a new entry to appear; the anchor row keeps its place.
+                int at = src.RowCount();
+                if (st.hitRow >= 0) { at = st.hitRow + 1; }
+                int nr = DataTable.InsertRow(st, cols, src, at);
+                if (nr >= 0) {
+                    DataTable.Recompute(st, cols, src);
+                    DataTable.FocusRow(st, cols, src, nr);
+                }
+                st.ctxOpen = false;
+                app.RequestRedraw();
+            }
+            iy = iy + ih;
+            DataTable.CtxItem(app, mx, iy, mw, ih, "删除行  Delete rows", "Ctrl+Del");
+            if (DataTable.CtxHit(app, mx, iy, mw, ih)) {
+                int killed = DataTable.DeleteSelectedRows(st, cols, src);
+                if (killed == 0 && st.hitRow >= 0) {
+                    if (DataTable.DeleteRow(st, cols, src, st.hitRow)) { killed = 1; }
+                }
+                if (killed > 0) {
+                    DataTable.Recompute(st, cols, src);
+                    DataTable.Flash(st, "已删除 " + Convert.ToString(killed) + " 行（Ctrl+Z 撤销）");
+                }
+                st.ctxOpen = false;
+                app.RequestRedraw();
+            }
+            iy = iy + ih;
+            int undoN = DataTable.UndoDepth(st);
+            string undoLbl = "撤销  Undo";
+            if (undoN > 0) { undoLbl = undoLbl + "  (" + Convert.ToString(undoN) + ")"; }
+            DataTable.CtxItem(app, mx, iy, mw, ih, undoLbl, "Ctrl+Z");
+            if (DataTable.CtxHit(app, mx, iy, mw, ih)) {
+                if (DataTable.Undo(st, cols, src)) {
+                    DataTable.Recompute(st, cols, src);
+                    DataTable.Flash(st, "已撤销");
+                } else {
+                    DataTable.Flash(st, "没有可撤销的操作");
+                }
+                st.ctxOpen = false;
+                app.RequestRedraw();
+            }
+            iy = iy + ih;
+        }
         c.FillRect(mx + app.Scale(8), iy + sepH / 2, mw - app.Scale(16), 1, t.divider);
         iy = iy + sepH;
         DataTable.CtxItem(app, mx, iy, mw, ih, "全选", "Ctrl+A");
@@ -2220,6 +2311,40 @@ partial class DataTable {
                 st.rangeC1 = vorder[vorder.Count - 1];
             }
             st.SelectionChanged.Raise();
+            return true;
+        }
+        if (ctrl && kc == 90) {                     // Ctrl+Z
+            if (DataTable.Undo(st, cols, src)) {
+                DataTable.Recompute(st, cols, src);
+                DataTable.Flash(st, "已撤销");
+            } else {
+                DataTable.Flash(st, "没有可撤销的操作");
+            }
+            return true;
+        }
+        // Ctrl+Delete removes whole rows; plain Delete only blanks cells. The
+        // destructive one is deliberately the harder chord to hit by accident.
+        if (ctrl && kc == 46) {
+            int killed = DataTable.DeleteSelectedRows(st, cols, src);
+            if (killed == 0 && st.hitRow >= 0) {
+                if (DataTable.DeleteRow(st, cols, src, st.hitRow)) { killed = 1; }
+            }
+            if (killed > 0) {
+                DataTable.Recompute(st, cols, src);
+                DataTable.Flash(st, "已删除 " + Convert.ToString(killed) + " 行（Ctrl+Z 撤销）");
+            } else {
+                DataTable.Flash(st, "该数据源不支持删除行");
+            }
+            return true;
+        }
+        if (ctrl && kc == 45) {                     // Ctrl+Insert appends a row
+            int nr = DataTable.AppendRow(st, cols, src);
+            if (nr >= 0) {
+                DataTable.Recompute(st, cols, src);
+                DataTable.FocusRow(st, cols, src, nr);
+            } else {
+                DataTable.Flash(st, "该数据源不支持添加行");
+            }
             return true;
         }
         if (kc == 46 && !ctrl) {                    // Delete blanks the range

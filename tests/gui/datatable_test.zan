@@ -18,6 +18,13 @@ class Program {
         return r;
     }
 
+    static DataRow Row2(string a, string b) {
+        DataRow r = DataRow.Create();
+        r.Push(a);
+        r.Push(b);
+        return r;
+    }
+
     static void Main() {
         // ---- ParseReal accepts separators / currency / sign; FormatReal is half-up ----
         Console.WriteLine(DataTable.FormatReal(DataTable.ParseReal("1234.5678"), 4));
@@ -525,6 +532,7 @@ class Program {
         Program.EditorTests();
         Program.StylerTests();
         Program.FieldTests();
+        Program.RowEditTests();
     }
 
     // Rejection counter for the CellValidating handler below. Static fields so
@@ -911,6 +919,204 @@ class Program {
         fst.editCol = 99;                     // out of range, not a crash
         Console.WriteLine(DataTable.EditField(fst, fc) == "");
     }
+
+    /// Row insert / delete and the undo journal. The interesting part is what
+    /// has to move when a row does: the per-row selection flags, an open
+    /// editor's row, and the indices of edits still sitting in the journal.
+    static void RowEditTests() {
+        Console.WriteLine("-- rows --");
+
+        List<DataColumn> rcols = new List<DataColumn>();
+        rcols.Add(DataColumn.Field(DataColumn.Editable(DataColumn.Text("Name", 100)), "name"));
+        rcols.Add(DataColumn.Field(DataColumn.Editable(DataColumn.Text("City", 100)), "city"));
+        List<DataRow> rrows = new List<DataRow>();
+        rrows.Add(Program.Row2("Ann", "Seattle"));
+        rrows.Add(Program.Row2("Bob", "Denver"));
+        rrows.Add(Program.Row2("Cid", "Austin"));
+        RowListSource rsrc = RowListSource.Create(rrows);
+        DataTableState rst = DataTableState.Create();
+        DataTable.EnsureInit(rst, rcols, rsrc);
+
+        Console.WriteLine(rsrc.CanInsert());
+        Console.WriteLine(rsrc.RowCount() == 3);
+
+        // ---- append ----
+        int added = DataTable.AppendRow(rst, rcols, rsrc);
+        Console.WriteLine(added == 3);
+        Console.WriteLine(rsrc.RowCount() == 4);
+        Console.WriteLine(rsrc.CellText(3, 0) == "");
+        Console.WriteLine(rst.HitRow() == 3);
+
+        // ---- insert in the middle shifts the rows after it ----
+        int mid = DataTable.InsertRow(rst, rcols, rsrc, 1);
+        Console.WriteLine(mid == 1);
+        Console.WriteLine(rsrc.CellText(0, 0));       // Ann, unmoved
+        Console.WriteLine(rsrc.CellText(1, 0) == ""); // the new blank
+        Console.WriteLine(rsrc.CellText(2, 0));       // Bob, pushed down
+
+        // ---- selection flags travel with their rows ----
+        // Cid is at index 3 now; select it and insert above, and the flag must
+        // follow Cid rather than stay on index 3.
+        rst.selected[3] = true;
+        DataTable.InsertRow(rst, rcols, rsrc, 0);
+        Console.WriteLine(rsrc.CellText(4, 0));            // Cid moved to 4
+        Console.WriteLine(rst.selected[4] == true);        // and so did its flag
+        Console.WriteLine(rst.selected[3] == false);
+        // deleting above it moves the flag back down
+        DataTable.DeleteRow(rst, rcols, rsrc, 0);
+        Console.WriteLine(rsrc.CellText(3, 0));
+        Console.WriteLine(rst.selected[3] == true);
+        rst.selected[3] = false;
+
+        // ---- an open editor is closed when its own row is deleted ----
+        DataTable.BeginEdit(rst, rcols, rsrc, 2, 0);
+        Console.WriteLine(rst.editing);
+        DataTable.DeleteRow(rst, rcols, rsrc, 2);
+        Console.WriteLine(rst.editing == false);          // not left dangling
+        // ...but only shifted when an earlier row goes
+        DataTable.BeginEdit(rst, rcols, rsrc, 2, 0);
+        Console.WriteLine(rst.EditRow() == 2);
+        DataTable.DeleteRow(rst, rcols, rsrc, 0);
+        Console.WriteLine(rst.editing);
+        Console.WriteLine(rst.EditRow() == 1);
+        DataTable.CancelEdit(rst);
+
+        // ---- undo a cell edit ----
+        List<DataRow> urows = new List<DataRow>();
+        urows.Add(Program.Row2("Ann", "Seattle"));
+        urows.Add(Program.Row2("Bob", "Denver"));
+        RowListSource usrc = RowListSource.Create(urows);
+        DataTableState ust = DataTableState.Create();
+        DataTable.EnsureInit(ust, rcols, usrc);
+        Console.WriteLine(DataTable.UndoDepth(ust) == 0);
+        Console.WriteLine(DataTable.Undo(ust, rcols, usrc) == false);  // nothing to undo
+
+        DataTable.BeginEdit(ust, rcols, usrc, 0, 1);
+        ust.editBuf = "Portland";
+        DataTable.CommitEdit(ust, rcols, usrc);
+        Console.WriteLine(usrc.CellText(0, 1));
+        Console.WriteLine(DataTable.UndoDepth(ust) == 1);
+        Console.WriteLine(DataTable.Undo(ust, rcols, usrc));
+        Console.WriteLine(usrc.CellText(0, 1));        // back to Seattle
+        Console.WriteLine(DataTable.UndoDepth(ust) == 0);
+
+        // ---- undo an insert removes it again ----
+        DataTable.AppendRow(ust, rcols, usrc);
+        Console.WriteLine(usrc.RowCount() == 3);
+        DataTable.Undo(ust, rcols, usrc);
+        Console.WriteLine(usrc.RowCount() == 2);
+        // and undoing did not itself become undoable
+        Console.WriteLine(DataTable.UndoDepth(ust) == 0);
+
+        // ---- undo a delete restores the row's contents, not just a blank ----
+        DataTable.DeleteRow(ust, rcols, usrc, 0);
+        Console.WriteLine(usrc.RowCount() == 1);
+        Console.WriteLine(usrc.CellText(0, 0));        // Bob is now first
+        DataTable.Undo(ust, rcols, usrc);
+        Console.WriteLine(usrc.RowCount() == 2);
+        Console.WriteLine(usrc.CellText(0, 0));        // Ann is back
+        Console.WriteLine(usrc.CellText(0, 1));        // with her city
+        Console.WriteLine(usrc.CellText(1, 0));        // and Bob after her
+
+        // ---- a multi-cell paste is ONE undo, not one per cell ----
+        // Paste anchors on the *display* order, so the view has to be built
+        // first; without it there is no row 0 to paste into.
+        DataTable.Recompute(ust, rcols, usrc);
+        ust.hitOrder = 0;
+        ust.hitCol = 0;
+        DataTable.ClearRange(ust);
+        int pasted = DataTable.PasteText(ust, rcols, usrc, "Xan\tOslo\nYin\tLima\n");
+        Console.WriteLine(pasted == 4);
+        Console.WriteLine(usrc.CellText(0, 0));
+        Console.WriteLine(usrc.CellText(1, 1));
+        Console.WriteLine(DataTable.UndoDepth(ust) == 1);   // grouped
+        Console.WriteLine(DataTable.Undo(ust, rcols, usrc));
+        Console.WriteLine(usrc.CellText(0, 0));            // all four restored
+        Console.WriteLine(usrc.CellText(0, 1));
+        Console.WriteLine(usrc.CellText(1, 0));
+        Console.WriteLine(usrc.CellText(1, 1));
+        Console.WriteLine(DataTable.UndoDepth(ust) == 0);
+
+        // ---- deleting several selected rows is also one undo ----
+        ust.selected[0] = true;
+        ust.selected[1] = true;
+        Console.WriteLine(DataTable.DeleteSelectedRows(ust, rcols, usrc) == 2);
+        Console.WriteLine(usrc.RowCount() == 0);
+        Console.WriteLine(DataTable.UndoDepth(ust) == 1);
+        DataTable.Undo(ust, rcols, usrc);
+        Console.WriteLine(usrc.RowCount() == 2);
+        // and they come back in their original order, not reversed
+        Console.WriteLine(usrc.CellText(0, 0));
+        Console.WriteLine(usrc.CellText(1, 0));
+
+        // ---- the journal is capped ----
+        DataTable.ClearUndo(ust);
+        ust.undoLimit = 3;
+        int k = 0;
+        while (k < 10) {
+            DataTable.BeginEdit(ust, rcols, usrc, 0, 0);
+            ust.editBuf = "v" + Convert.ToString(k);
+            DataTable.CommitEdit(ust, rcols, usrc);
+            k = k + 1;
+        }
+        Console.WriteLine(DataTable.UndoDepth(ust) == 3);
+        // the three surviving entries still undo in order, back to v6
+        DataTable.Undo(ust, rcols, usrc);
+        Console.WriteLine(usrc.CellText(0, 0));
+        DataTable.Undo(ust, rcols, usrc);
+        Console.WriteLine(usrc.CellText(0, 0));
+
+        // ---- a data row is not a display slot ----
+        // Restore known names first: the cap test above left "v7" in row 0, and
+        // the point here is the slot mapping, not whatever ordering that yields.
+        DataTable.ClearUndo(ust);
+        usrc.SetCell(0, 0, "Ann");
+        usrc.SetCell(1, 0, "Bob");
+        // Sorting descending puts Bob first, so row 0 is shown at slot 1; the
+        // add-row flow must go through SlotOfRow or it would park the cursor on
+        // the wrong line.
+        DataTable.SortBy(ust, 0, 2);
+        DataTable.Recompute(ust, rcols, usrc);
+        Console.WriteLine(usrc.CellText(0, 0));                   // Ann, still row 0
+        Console.WriteLine(DataTable.SlotOfRow(ust, 0) == 1);      // shown second
+        Console.WriteLine(DataTable.SlotOfRow(ust, 1) == 0);
+        Console.WriteLine(DataTable.SlotOfRow(ust, 99) == -1);    // no such row
+
+        // FocusRow parks the cursor and opens the first editable column
+        DataTable.FocusRow(ust, rcols, usrc, 0);
+        Console.WriteLine(ust.hitOrder == 1);
+        Console.WriteLine(ust.HitRow() == 0);
+        Console.WriteLine(ust.editing);
+        Console.WriteLine(ust.EditRow() == 0);
+        Console.WriteLine(ust.editCol == 0);
+        DataTable.CancelEdit(ust);
+        // a filtered-out row can't be focused, and asking is not a crash
+        DataTable.FocusRow(ust, rcols, usrc, 99);
+        Console.WriteLine(ust.editing == false);
+        // a hidden first column is skipped: the editor opens on the next one
+        ust.colHidden[0] = true;
+        DataTable.FocusRow(ust, rcols, usrc, 0);
+        Console.WriteLine(ust.editCol == 1);
+        DataTable.CancelEdit(ust);
+        ust.colHidden[0] = false;
+        DataTable.SortBy(ust, -1, 1);
+
+        // ---- a read-only source refuses, and says so ----
+        RoSource ro = new RoSource();
+        DataTableState rost = DataTableState.Create();
+        DataTable.EnsureInit(rost, rcols, ro);
+        Console.WriteLine(ro.CanInsert() == false);
+        Console.WriteLine(DataTable.AppendRow(rost, rcols, ro) == -1);
+        Console.WriteLine(DataTable.DeleteRow(rost, rcols, ro, 0) == false);
+        Console.WriteLine(DataTable.UndoDepth(rost) == 0);  // nothing journalled
+    }
+}
+
+/// A source that serves rows but refuses to grow or shrink — the default
+/// DataSource behaviour, which the grid must respect.
+class RoSource : DataSource {
+    override int RowCount() { return 2; }
+    override string CellText(int row, int col) { return "ro"; }
 }
 
 /// A styler that colours "Overdue" rows and picks out the state cell, used to
