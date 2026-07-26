@@ -1,16 +1,18 @@
-# examples/game/ra2 — 红色警戒 2 HD 演示
+# examples/game/ra2 — 红色警戒 2 演示
 
 用 Zan 重写的《红色警戒 2》等轴测 RTS 演示：直接读取玩家自己的原版
-MIX 资源包，用 SDL3 以 HD 分辨率渲染。
+MIX 资源包，用 SDL3 渲染。
 
-> 当前进度：项目骨架 + 资源自检。还没有窗口和渲染，运行后只校验资源是否就位。
+> 当前进度：主菜单（原版 TITLE.PCX 背景）→ 遭遇战设置（地图列表 +
+> 地图预览 + 阵营选择）→ 地形浏览（平移/缩放）。**还没有单位、建筑和
+> 战斗**，游戏内也还没有侧边栏和小地图。
 
 ## 准备资源（必需）
 
 本仓库**不附带任何原版素材**。你需要自备一份合法的《红色警戒 2》安装目录，
 整个拷到：
 
-```
+```text
 examples/game/ra2/data/
 ```
 
@@ -26,32 +28,50 @@ examples/game/ra2/data/
 
 在仓库根目录执行：
 
-```
+```bash
 bash examples/game/ra2/build.sh
 ./build/ra2.exe
 ```
 
-资源就位时输出：
+操作：
 
-```
-assets found in examples/game/ra2/data
+| 界面 | 按键 |
+| --- | --- |
+| 主菜单 | 鼠标点击；`Esc` 退出 |
+| 遭遇战设置 | `↑`/`↓` 选地图，`Enter` 开始，`Esc` 返回 |
+| 地形浏览 | 方向键平移，`+`/`-` 缩放，`Esc` 返回 |
+| 任何时候 | `F11` 全屏 |
+
+不想手动点，可以让它自己走一遍完整流程再退出：
+
+```bash
+RA2_SELFTEST=1 ./build/ra2.exe
 ```
 
-缺资源时输出（示例：`ra2.mix` 没找到）：
+## 已实现
 
-```
-missing asset archive: ra2.mix
-place your Red Alert 2 install in examples/game/ra2/data
-```
+- **归档**：MIX 读取（含 Blowfish 加密头、TS/RA2 名字哈希）、分层 VFS
+- **格式**：INI、CSF、PAL、SHP、TMP、PCX、Format80/LCW、LZO1X、IsoMapPack5
+- **地形**：主题贴图集、等轴测投影、按 `x+y` 的画家序合成、视区裁剪
+- **界面**：原版 PCX 背景、地图预览缩略图、场景状态机
 
-`data/` 的位置会相对可执行文件自动向上探测，所以从仓库根或 `build/`
-目录启动都能找到资源。
+## 已知缺口
+
+- **抬升地形下方有菱形空洞**。悬崖/高地的 TMP `extra` 数据块已能解析
+  （`flags` 位 0 标志其存在），但绘制位置仍不对：实测四张地图开启后空洞
+  总数只从 61673 降到 60406，且其中两张反而变差，所以默认关闭。用
+  `RA2_EXTRA=1` 可以打开继续调试。
+- **界面按钮是自绘的**。原版按钮/侧边栏是 SHP，但 MIX 用哈希存名字，
+  这些资源名还没找到。
+- **没有启动动画**。原版是 VQA 视频，解码器未实现。
+- **没有单位、建筑、战斗**。
 
 ## 测试
 
-`formats/` 下的解析器有一套回归测试，同样只用 zanc 编译，不经过 CMake：
+`formats/`、`assets/`、`render/`、`game/` 下的代码有一套回归测试，
+同样只用 zanc 编译，不经过 CMake：
 
-```
+```bash
 bash examples/game/ra2/tests/run.sh
 ```
 

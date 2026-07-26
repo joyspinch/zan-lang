@@ -1,15 +1,29 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using SDL3;
+using GameKit;
 using Ra2.Assets;
 using Ra2.Formats;
+using Ra2.Render;
+using Ra2.Game;
+using Ra2.Ui;
 
 namespace Ra2;
 
-// Entry point. Verifies the user's original RA2 install is present under data/
-// before anything else runs: assets are never redistributed, the player
-// supplies their own copy of the game.
+// The RA2 HD demo: main menu -> skirmish setup -> terrain view.
+//
+// Assets are never redistributed. The player supplies their own copy of the
+// game under data/, which is gitignored.
 class Ra2App {
+    // memset rather than a byte loop: the canvas is 3.7 MB and clearing it in
+    // Zan costs more than drawing the frame.
+    [DllImport("crt")]
+    static extern void memset(string p, int v, int n);
+
+    static int ViewW() { return 1280; }
+    static int ViewH() { return 720; }
+
     // Locates data/ regardless of the working directory the game was launched
     // from (repo root, build/, or a double-click on the exe). Falls back to the
     // repo-relative path so the "missing assets" hint still names the spot the
@@ -30,8 +44,40 @@ class Ra2App {
         return "";
     }
 
-    static void ReportIni(string label, IniDocument doc) {
-        Console.WriteLine(label + " sections=" + Convert.ToString(doc.Count()));
+    // zanc has no command-line argument accessor, so the self-test is armed
+    // through the environment: RA2_SELFTEST=1 walks menu -> setup -> a
+    // rendered frame and exits, which is what CI and a quick smoke run need.
+    [DllImport("crt")]
+    static extern string getenv(string name);
+
+    static bool SelfTestArmed() {
+        string v = Ra2App.getenv("RA2_SELFTEST");
+        return v != null && v.Length > 0 && v != "0";
+    }
+
+    static int PreviewW() { return 396; }
+    static int PreviewH() { return 212; }
+
+    /// <summary>A thumbnail of a map's terrain, or null when it will not open.
+    /// The theater is loaded and dropped here: a preview touches every tile
+    /// once, and keeping the art around for eighteen maps would dwarf the
+    /// memory the game itself uses.</summary>
+    static SdlTexture BuildPreview(SdlRenderer r, AssetDb db, Vfs vfs, string name) {
+        MapFile m = db.MapNamed(name);
+        if (m == null) { return null; }
+        Theater th = Theater.Load(vfs, db, m.Theater());
+        MapRenderer mr = MapRenderer.Create(m.Terrain(), th);
+
+        Texture canvas = Texture.Create(Ra2App.PreviewW(), Ra2App.PreviewH());
+        Ra2App.memset(canvas.Pixels(), 0, canvas.ByteLength());
+        mr.RenderPreview(canvas);
+
+        SdlTexture tex = SdlTexture.CreateRgba32(r, canvas.Width(), canvas.Height(), true);
+        tex.SetBlendMode(1);
+        tex.Update(canvas.Pixels(), canvas.Width() * 4);
+        canvas.Close();
+        th.Close();
+        return tex;
     }
 
     static void Main() {
@@ -42,38 +88,174 @@ class Ra2App {
             Console.WriteLine("place your Red Alert 2 install in " + dir);
             return;
         }
-        Console.WriteLine("assets found in " + dir);
 
         Vfs vfs = AssetDb.MountInstall(dir);
-        Console.WriteLine("mounts=" + Convert.ToString(vfs.MountCount()));
-
         AssetDb db = AssetDb.Load(vfs);
-        Ra2App.ReportIni("rules", db.Rules());
-        Ra2App.ReportIni("art", db.Art());
-        Console.WriteLine("rules from " + vfs.SourceOf("RULES.INI"));
-
-        CsfTable csf = db.Strings();
-        if (csf == null) { Console.WriteLine("strings missing"); }
-        else { Console.WriteLine("strings=" + Convert.ToString(csf.Count())); }
-
-        Palette iso = db.PaletteNamed("ISOTEM.PAL");
-        if (iso == null) { Console.WriteLine("isotem.pal missing"); }
-        else {
-            Console.WriteLine("isotem.pal entries=" + Convert.ToString(iso.Count())
-                + " colour1=" + Convert.ToString(iso.Rgb8(1)));
-        }
-
         List<string> maps = db.SkirmishMaps();
-        Console.WriteLine("skirmish maps=" + Convert.ToString(maps.Count));
-        if (maps.Count > 0) {
-            MapFile m = db.MapNamed(maps[0]);
-            Console.WriteLine(maps[0] + " theater=" + m.Theater()
-                + " size=" + Convert.ToString(m.Width())
-                + "x" + Convert.ToString(m.Height())
-                + " cells=" + Convert.ToString(m.Terrain().Count())
-                + " starts=" + Convert.ToString(m.StartCount()));
+        Console.WriteLine("maps=" + Convert.ToString(maps.Count));
+
+        Shell shell = Shell.Create(maps.Count);
+        Host host = Host.Create("Red Alert 2 -- Zan", Ra2App.ViewW(), Ra2App.ViewH());
+        // The shell's backdrop comes from the player's own install, so the menu
+        // shows the game's artwork rather than something drawn here.
+        ShellArt art = ShellArt.Load(host.Renderer(), vfs);
+        Console.WriteLine("shell art title=" + Convert.ToString(art.HasTitle()));
+
+        // Loaded lazily when a game starts, and torn down when it ends, so the
+        // menu does not hold a map's worth of textures.
+        MapFile map = null;
+        Theater theater = null;
+        MapRenderer terrain = null;
+        Camera cam = null;
+        Texture canvas = null;
+        SdlTexture screen = null;
+        int loadedIndex = -1;
+        bool dirty = false;
+        int drawn = 0;
+
+        // Thumbnail of whatever map the setup screen has selected. Rebuilt
+        // only when the selection changes -- it costs a full pass over the
+        // map's cells.
+        SdlTexture preview = null;
+        int previewIndex = -1;
+
+        int mouseX = 0;
+        int mouseY = 0;
+        int panStep = 64;
+        bool selfTest = Ra2App.SelfTestArmed();
+        int frames = 0;
+
+        while (host.Running()) {
+            bool clicked = false;
+            while (SdlEvent.Poll()) {
+                int ty = SdlEvent.Type();
+                host.OnWindowEvent(ty);
+                if (SdlEvent.IsQuit()) { host.Quit(); }
+                if (ty == SdlEventType.MouseMotion()) {
+                    mouseX = host.MouseX();
+                    mouseY = host.MouseY();
+                }
+                if (ty == SdlEventType.MouseButtonDown()) {
+                    if (SdlEvent.MouseButton() == SdlMouseButton.Left()) {
+                        mouseX = host.MouseX();
+                        mouseY = host.MouseY();
+                        clicked = true;
+                    }
+                }
+                if (ty == SdlEventType.KeyDown()) {
+                    int sc = SdlEvent.Scancode();
+                    if (sc == 68) { host.ToggleFullscreen(); }   // F11
+                    if (sc == 41) {                              // Esc
+                        if (shell.CurrentScene() == 0) { host.Quit(); }
+                        else { shell.Back(); }
+                    }
+                    if (shell.CurrentScene() == 1) {
+                        if (sc == 82) { shell.SelectMap(-1); }   // up
+                        if (sc == 81) { shell.SelectMap(1); }    // down
+                        if (sc == 40 || sc == 88) {              // Enter
+                            shell.StartGame();
+                        }
+                    }
+                    if (shell.CurrentScene() == 2 && cam != null) {
+                        if (sc == 80) { cam.MoveBy(0 - panStep, 0); dirty = true; }
+                        if (sc == 79) { cam.MoveBy(panStep, 0); dirty = true; }
+                        if (sc == 82) { cam.MoveBy(0, 0 - panStep); dirty = true; }
+                        if (sc == 81) { cam.MoveBy(0, panStep); dirty = true; }
+                        if (sc == 87 || sc == 46) { cam.ZoomBy(1); dirty = true; }
+                        if (sc == 86 || sc == 45) { cam.ZoomBy(-1); dirty = true; }
+                    }
+                }
+            }
+
+            host.Begin(16, 20, 16);
+
+            if (shell.CurrentScene() == 0) {
+                int act = Screens.DrawMainMenu(host.Renderer(), art,
+                    Ra2App.ViewW(), Ra2App.ViewH(), mouseX, mouseY, clicked);
+                if (act == 1) { shell.OpenSkirmish(); }
+                if (act == 2) { host.Quit(); }
+            } else if (shell.CurrentScene() == 1) {
+                if (previewIndex != shell.MapIndex()) {
+                    if (preview != null) { preview.Close(); }
+                    preview = Ra2App.BuildPreview(host.Renderer(), db, vfs,
+                                                  maps[shell.MapIndex()]);
+                    previewIndex = shell.MapIndex();
+                }
+                int act = Screens.DrawSkirmish(host.Renderer(), shell, maps,
+                    preview, Ra2App.ViewW(), Ra2App.ViewH(), mouseX, mouseY, clicked);
+                if (act == 1) { shell.StartGame(); }
+                if (act == 2) { shell.Back(); }
+            } else {
+                // Load on the first frame of a game, or when the player backed
+                // out and picked a different map.
+                if (loadedIndex != shell.MapIndex()) {
+                    if (terrain != null) {
+                        screen.Close();
+                        canvas.Close();
+                        theater.Close();
+                    }
+                    map = db.MapNamed(maps[shell.MapIndex()]);
+                    theater = Theater.Load(vfs, db, map.Theater());
+                    terrain = MapRenderer.Create(map.Terrain(), theater);
+                    cam = Camera.Create(Ra2App.ViewW(), Ra2App.ViewH(),
+                                        terrain.WorldWidth(), terrain.WorldHeight());
+                    canvas = Texture.Create(Ra2App.ViewW(), Ra2App.ViewH());
+                    screen = SdlTexture.CreateRgba32(host.Renderer(),
+                        Ra2App.ViewW(), Ra2App.ViewH(), true);
+                    screen.SetBlendMode(1);
+                    loadedIndex = shell.MapIndex();
+                    dirty = true;
+                    Console.WriteLine("loaded " + maps[loadedIndex]
+                        + " " + map.Theater()
+                        + " cells=" + Convert.ToString(terrain.CellCount())
+                        + " world=" + Convert.ToString(terrain.WorldWidth())
+                        + "x" + Convert.ToString(terrain.WorldHeight()));
+                }
+
+                // Terrain is static, so the canvas is only recomposited when
+                // the camera actually moved.
+                if (dirty) {
+                    Ra2App.memset(canvas.Pixels(), 0, canvas.ByteLength());
+                    drawn = terrain.RenderInto(canvas, cam.X(), cam.Y());
+                    screen.Update(canvas.Pixels(), canvas.Width() * 4);
+                    dirty = false;
+                }
+                host.Renderer().DrawTexture(screen, 0, 0,
+                    Ra2App.ViewW(), Ra2App.ViewH());
+                Screens.DrawHud(host.Renderer(), maps[loadedIndex],
+                    Side.NameOf(shell.SideIndex()), terrain.CellCount(), drawn,
+                    Ra2App.ViewW(), Ra2App.ViewH());
+            }
+
+            host.End();
+
+            // --selftest walks the whole flow without a human at the keyboard:
+            // menu, setup, then a rendered frame of the first map.
+            frames = frames + 1;
+            if (selfTest) {
+                if (frames == 2) { shell.OpenSkirmish(); }
+                // Linger on setup so a preview is actually built, then step
+                // the selection once so the rebuild path runs too.
+                if (frames == 4) { shell.SelectMap(1); }
+                if (frames == 6) { shell.StartGame(); }
+                if (frames == 10) {
+                    Console.WriteLine("selftest scene=" + Convert.ToString(shell.CurrentScene())
+                        + " drawn=" + Convert.ToString(drawn)
+                        + " previewBuilt=" + Convert.ToString(previewIndex >= 0)
+                        + " map=" + maps[shell.MapIndex()]);
+                    host.Quit();
+                }
+            }
         }
 
+        if (terrain != null) {
+            screen.Close();
+            canvas.Close();
+            theater.Close();
+        }
+        if (preview != null) { preview.Close(); }
+        art.Close();
+        host.Close();
         db.Close();
     }
 }

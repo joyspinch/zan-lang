@@ -33,8 +33,13 @@ for src in examples/game/ra2/tests/*.zan; do
     continue
   fi
 
+  # game/ holds both the window-free shell state and the screens that draw it,
+  # and the screens need GameKit, so every test links it. Tests themselves stay
+  # headless -- none of them opens a window.
   if ! out="$("$zanc" "$src" examples/game/ra2/formats/*.zan \
-      examples/game/ra2/assets/*.zan --auto-stdlib -o "$exe" 2>&1)"; then
+      examples/game/ra2/assets/*.zan examples/game/ra2/render/*.zan \
+      examples/game/ra2/game/*.zan examples/game/common/GameKit.zan \
+      --auto-stdlib -o "$exe" 2>&1)"; then
     echo "FAIL $name: compile error"
     echo "$out" | sed 's/^/    /'
     fail=$((fail + 1))

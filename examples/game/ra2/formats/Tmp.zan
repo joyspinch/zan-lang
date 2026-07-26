@@ -5,6 +5,11 @@ namespace Ra2.Formats;
 
 // Header of a single tile within a TMP(TS) template. The base graphic is an
 // isometric diamond; a few gameplay fields (height/terrain/ramp) are exposed.
+//
+// A tile may also carry an "extra" graphic: the overhanging art of a cliff or
+// a bridge, drawn as a plain rectangle at its own offset rather than as a
+// diamond. Without it, a raised cell leaves a transparent diamond where the
+// ground it rose above used to be.
 class TmpTile {
     int x;
     int y;
@@ -12,6 +17,15 @@ class TmpTile {
     int terrainType;
     int rampType;
     int offset;
+    // Extra graphic, present only when bit 0 of the block's flags is set.
+    // The other bytes of that field are uninitialised in the shipped art
+    // (0xCDCDCDCD shows through), so the flag is the only reliable test.
+    bool hasExtra;
+    int extraOffset;
+    int extraX;
+    int extraY;
+    int extraWidth;
+    int extraHeight;
 
     int X() { return this.x; }
     int Y() { return this.y; }
@@ -20,12 +34,21 @@ class TmpTile {
     int RampType() { return this.rampType; }
     int Offset() { return this.offset; }
     bool IsEmpty() { return this.offset == 0; }
+
+    bool HasExtra() { return this.hasExtra; }
+    int ExtraWidth() { return this.extraWidth; }
+    int ExtraHeight() { return this.extraHeight; }
+    /// <summary>Where the extra graphic sits relative to the tile's own
+    /// apex, in pixels.</summary>
+    int ExtraOffsetX() { return this.extraX - this.x; }
+    int ExtraOffsetY() { return this.extraY - this.y; }
 }
 
 // Parses a TMP(TS) terrain template as used by Tiberian Sun / Red Alert 2.
 // Pixels are 8-bit palette indices (0 = transparent); the base graphic of each
 // tile is a centered isometric diamond of tileWidth x tileHeight. Depth and
-// "extra" (cliff) data are skipped here. Clean-room: tests synthesize tiles.
+// "extra" (cliff) data is parsed but not drawn by default -- see
+// ExtraEnabled. Clean-room: tests synthesize tiles.
 //
 // Layout (little-endian):
 //   header    : blocksX(u32), blocksY(u32), tileWidth(u32), tileHeight(u32)
@@ -33,6 +56,12 @@ class TmpTile {
 //   tile      : 52-byte header, then base pixels (tileWidth*tileHeight/2),
 //               then depth pixels; base rows are runs 4,8,.. centered, growing
 //               by 4 while row < height/2-1 then shrinking by 4.
+//   tile hdr  : x(i32), y(i32), extraOfs(u32), zOfs(u32), extraZOfs(u32),
+//               extraX(i32), extraY(i32), extraW(u32), extraH(u32),
+//               flags(u32), height(u8), terrain(u8), ramp(u8), ...
+//               Bit 0 of flags says the extra fields are meaningful; when it
+//               is clear they hold uninitialised memory, so the flag -- not a
+//               range check on the rectangle -- is what decides.
 class TmpTemplate {
     [DllImport("crt")]
     static extern string calloc(int count, int size);
@@ -44,6 +73,19 @@ class TmpTemplate {
     int tileWidth;
     int tileHeight;
     List<TmpTile> tiles;
+
+    // The extra-graphic pass is parsed but OFF by default. Measured over four
+    // shipped maps it only moved the transparent-hole count from 61673 to
+    // 60406 (-2%), and it made MP01T4 and MP02T2 *worse* -- so the placement
+    // is still wrong somewhere and enabling it would trade one artefact for
+    // another. Set RA2_EXTRA=1 to opt in while working on it.
+    [DllImport("crt")]
+    static extern string getenv(string name);
+
+    static bool ExtraEnabled() {
+        string v = TmpTemplate.getenv("RA2_EXTRA");
+        return v != null && v.Length > 0 && v != "0";
+    }
 
     static TmpTemplate Parse(string data, int length) {
         TmpTemplate t = new TmpTemplate();
@@ -68,10 +110,34 @@ class TmpTemplate {
                 r.Seek(off);
                 tile.x = r.ReadI32();
                 tile.y = r.ReadI32();
-                r.Seek(off + 40);        // past extra offsets/coords/flags
+                tile.extraOffset = (int)r.ReadU32();
+                r.Seek(off + 20);
+                tile.extraX = r.ReadI32();
+                tile.extraY = r.ReadI32();
+                tile.extraWidth = (int)r.ReadU32();
+                tile.extraHeight = (int)r.ReadU32();
+                int flags = (int)r.ReadU32();
+                tile.hasExtra = (flags & 1) != 0;
+                if (!TmpTemplate.ExtraEnabled()) { tile.hasExtra = false; }
                 tile.height = r.ReadU8();
                 tile.terrainType = r.ReadU8();
                 tile.rampType = r.ReadU8();
+                // Guard the rectangle even though the flag vouches for it.
+                // Some shipped blocks set the flag but leave extraX/extraY as
+                // uninitialised memory, which reads back as a huge value and
+                // would size a texture into the gigabytes; a cliff overhang is
+                // never more than a couple of tiles from its own diamond, so
+                // anything past that is rejected outright.
+                int limit = 512;
+                int dx = tile.extraX - tile.x;
+                int dy = tile.extraY - tile.y;
+                if (tile.extraWidth <= 0 || tile.extraHeight <= 0
+                    || tile.extraWidth > limit || tile.extraHeight > limit
+                    || dx < 0 - limit || dx > limit
+                    || dy < 0 - limit || dy > limit
+                    || tile.extraOffset <= 0 || tile.extraOffset >= length) {
+                    tile.hasExtra = false;
+                }
                 r.Seek(save);
             }
             t.tiles.Add(tile);
@@ -118,6 +184,34 @@ class TmpTemplate {
                 width = width - 4;
             }
             j = j + 1;
+        }
+        return outBuf;
+    }
+
+    // Decode a tile's extra graphic -- the overhang of a cliff or bridge --
+    // into an extraWidth*extraHeight index buffer (0 = transparent).
+    //
+    // Unlike the base diamond this is a plain rectangle stored row by row with
+    // no run structure, and it is what fills the gap a raised cell leaves
+    // behind. Returns "" when the tile has no extra graphic.
+    string DecodeExtra(int index) {
+        TmpTile tile = this.TileAt(index);
+        if (tile == null || !tile.HasExtra()) { return ""; }
+        int w = tile.ExtraWidth();
+        int h = tile.ExtraHeight();
+        string outBuf = TmpTemplate.calloc(w * h + 1, 1);
+
+        BinaryReader r = BinaryReader.FromBuffer(this.data, this.length);
+        r.Seek(tile.extraOffset);
+        int n = w * h;
+        // The file can end mid-rectangle; the tail stays transparent rather
+        // than reading past the buffer.
+        int avail = this.length - tile.extraOffset;
+        if (avail < n) { n = avail; }
+        int i = 0;
+        while (i < n) {
+            outBuf[i] = (char)r.ReadU8();
+            i = i + 1;
         }
         return outBuf;
     }

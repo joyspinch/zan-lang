@@ -1,0 +1,229 @@
+using System;
+using System.Collections.Generic;
+using SDL3;
+using GameKit;
+using Ra2.Assets;
+using Ra2.Formats;
+using Ra2.Game;
+
+namespace Ra2.Ui;
+
+/// <summary>The game's own shell art, loaded from the player's install.</summary>
+///
+/// RA2 ships its menu backdrops as PCX, so the shell shows the real artwork
+/// rather than something drawn here. When a piece is missing -- installs vary,
+/// and only the base archives are required -- the screen falls back to a plain
+/// panel instead of failing to open.
+class ShellArt {
+    SdlTexture title;
+    bool loaded;
+
+    static ShellArt Load(SdlRenderer r, Vfs vfs) {
+        ShellArt a = new ShellArt();
+        a.loaded = false;
+        a.title = ShellArt.LoadPcx(r, vfs, "TITLE.PCX");
+        if (a.title != null) { a.loaded = true; }
+        return a;
+    }
+
+    /// <summary>Decodes a PCX from the archives into a GPU texture, or null
+    /// when the install does not carry it.</summary>
+    static SdlTexture LoadPcx(SdlRenderer r, Vfs vfs, string name) {
+        if (!vfs.Contains(name)) { return null; }
+        List<int> len = new List<int>();
+        len.Add(0);
+        string raw = vfs.Read(name, len);
+        if (len[0] == 0) { return null; }
+        PcxImage img = PcxImage.Parse(raw, len[0]);
+        ShellArt.free(raw);
+        if (!img.IsValid() || !img.HasPalette()) { return null; }
+
+        Texture rgba = Texture.FromPcx(img);
+        SdlTexture tex = SdlTexture.CreateRgba32(r, rgba.Width(), rgba.Height(), true);
+        tex.Update(rgba.Pixels(), rgba.Width() * 4);
+        rgba.Close();
+        img.Close();
+        return tex;
+    }
+
+    [DllImport("crt")]
+    static extern void free(string p);
+
+    SdlTexture Title() { return this.title; }
+    bool HasTitle() { return this.title != null; }
+
+    void Close() {
+        if (this.title != null) { this.title.Close(); }
+        this.title = null;
+    }
+}
+
+/// <summary>Draws the shell screens: main menu and skirmish setup.</summary>
+///
+/// The screens read a Shell and call its transitions; they hold no state of
+/// their own beyond hit-test rectangles, so the flow stays testable without a
+/// window.
+class Screens {
+    static int PanelW() { return 420; }
+
+    /// <summary>Main menu over the game's own title art. Returns the action
+    /// the click landed on: 0 none, 1 skirmish, 2 quit.</summary>
+    static int DrawMainMenu(SdlRenderer r, ShellArt art, int viewW, int viewH,
+                            int mouseX, int mouseY, bool clicked) {
+        if (art != null && art.HasTitle()) {
+            // The backdrop is 640x480; stretching it to the window keeps the
+            // whole composition visible rather than cropping it.
+            r.DrawTexture(art.Title(), 0, 0, viewW, viewH);
+            // A scrim under the buttons only, so the art stays readable.
+            Draw.RoundRectFill(r, viewW / 2 - Screens.PanelW() / 2 - 30, 270,
+                               Screens.PanelW() + 60, 340, 18, 8, 10, 16, 150);
+        } else {
+            Ui.Backdrop(r, null, viewW, viewH);
+            Text.DrawCenteredShadow(r, "红色警戒 2", viewW / 2, 120, 6,
+                                    236, 208, 120, 3);
+        }
+
+        int bw = Screens.PanelW();
+        int bh = 62;
+        int bx = viewW / 2 - bw / 2;
+        int by = 300;
+        int gap = 22;
+
+        int action = 0;
+        bool hovSkirmish = Ui.Button(r, mouseX, mouseY, bx, by, bw, bh,
+                                     "遭遇战", 3, 1);
+        if (hovSkirmish && clicked) { action = 1; }
+
+        // Campaign and multiplayer are not implemented; they are drawn
+        // disabled rather than hidden so the menu reads like the real one and
+        // the gap is honest.
+        Screens.DisabledButton(r, bx, by + bh + gap, bw, bh, "战役（未实现）");
+        Screens.DisabledButton(r, bx, by + (bh + gap) * 2, bw, bh, "多人游戏（未实现）");
+
+        bool hovQuit = Ui.Button(r, mouseX, mouseY, bx, by + (bh + gap) * 3,
+                                 bw, bh, "退出", 3, 0);
+        if (hovQuit && clicked) { action = 2; }
+
+        Text.Draw(r, "Esc 退出  F11 全屏", 20, viewH - 34, 2, 150, 158, 172, 255);
+        return action;
+    }
+
+    /// <summary>A button that reads as present but unavailable.</summary>
+    static void DisabledButton(SdlRenderer r, int x, int y, int w, int h,
+                               string label) {
+        Draw.RoundRectFill(r, x - 2, y - 2, w + 4, h + 4, 14, 8, 10, 16, 200);
+        Draw.RoundRectFill(r, x, y, w, h, 12, 40, 44, 54, 255);
+        Text.DrawCentered(r, label, x + w / 2, y + h / 2 - 12, 3,
+                          110, 116, 130, 255);
+    }
+
+    /// <summary>Skirmish setup: map list on the left, side pick and a preview
+    /// of the selected map on the right. Returns 0 none, 1 start, 2 back.</summary>
+    static int DrawSkirmish(SdlRenderer r, Shell shell, List<string> maps,
+                            SdlTexture preview, int viewW, int viewH,
+                            int mouseX, int mouseY, bool clicked) {
+        Ui.Backdrop(r, null, viewW, viewH);
+        Text.DrawShadow(r, "遭遇战", 40, 40, 4, 236, 208, 120, 3);
+
+        int listX = 40;
+        int listY = 120;
+        int listW = 560;
+        int rowH = 42;
+        // The list shows a window of rows around the selection so a long map
+        // list does not run off the bottom of the screen.
+        int rows = (viewH - listY - 130) / rowH;
+        Ui.Panel(r, listX - 12, listY - 14, listW + 24, rows * rowH + 28,
+                 22, 26, 36, 210);
+
+        int first = shell.MapIndex() - rows / 2;
+        if (first > shell.MapCount() - rows) { first = shell.MapCount() - rows; }
+        if (first < 0) { first = 0; }
+
+        int i = 0;
+        while (i < rows && first + i < maps.Count) {
+            int idx = first + i;
+            int ry = listY + i * rowH;
+            bool sel = idx == shell.MapIndex();
+            bool hov = Draw.PointIn(mouseX, mouseY, listX, ry, listW, rowH - 4);
+            if (sel) {
+                Draw.RoundRectFill(r, listX, ry, listW, rowH - 4, 8,
+                                   224, 176, 66, 235);
+            } else if (hov) {
+                Draw.RoundRectFill(r, listX, ry, listW, rowH - 4, 8,
+                                   62, 70, 88, 200);
+            }
+            int tc = 224;
+            if (sel) { tc = 32; }
+            Text.Draw(r, maps[idx], listX + 16, ry + 9, 2, tc, tc, tc, 255);
+            if (hov && clicked) { shell.SelectMapAt(idx); }
+            i = i + 1;
+        }
+
+        // Side picker.
+        int sideX = viewW - 460;
+        Ui.Panel(r, sideX - 12, listY - 14, 420, 200, 22, 26, 36, 210);
+        Text.Draw(r, "阵营", sideX + 8, listY, 3, 236, 208, 120, 255);
+        int sw = 180;
+        int sh = 62;
+        int sy = listY + 60;
+        int alliedKind = 0;
+        int sovietKind = 0;
+        if (shell.SideIndex() == Side.Allied()) { alliedKind = 2; }
+        else { sovietKind = 2; }
+        bool hovA = Ui.Button(r, mouseX, mouseY, sideX + 8, sy, sw, sh,
+                              "盟军", 3, alliedKind);
+        bool hovS = Ui.Button(r, mouseX, mouseY, sideX + 8 + sw + 20, sy, sw, sh,
+                              "苏联", 3, sovietKind);
+        if (clicked) {
+            if (hovA) { shell.SetSide(Side.Allied()); }
+            if (hovS) { shell.SetSide(Side.Soviet()); }
+        }
+
+        // Map preview, rendered from the selected map's own terrain by the
+        // caller and handed in as a texture; null while it is still loading or
+        // when the map failed to open.
+        int pvY = listY + 220;
+        int pvW = 396;
+        int pvH = 220;
+        Ui.Panel(r, sideX - 12, pvY, pvW + 24, pvH + 40, 22, 26, 36, 210);
+        Text.Draw(r, "预览", sideX + 8, pvY + 10, 2, 236, 208, 120, 255);
+        if (preview != null) {
+            r.DrawTexture(preview, sideX + 8, pvY + 38, pvW, pvH - 8);
+        } else {
+            Text.DrawCentered(r, "载入中…", sideX + 8 + pvW / 2, pvY + 120, 2,
+                              120, 128, 142, 255);
+        }
+
+        // Actions.
+        int bw = 200;
+        int bh = 62;
+        int by = viewH - 100;
+        int action = 0;
+        bool hovBack = Ui.Button(r, mouseX, mouseY, 40, by, bw, bh, "返回", 3, 0);
+        bool hovGo = Ui.Button(r, mouseX, mouseY, viewW - 40 - bw, by, bw, bh,
+                               "开始", 3, 1);
+        if (clicked) {
+            if (hovBack) { action = 2; }
+            if (hovGo) { action = 1; }
+        }
+
+        Text.Draw(r, "上下键选择地图  Enter 开始  Esc 返回",
+                  40, viewH - 148, 2, 150, 158, 172, 255);
+        return action;
+    }
+
+    /// <summary>The in-game overlay: which map is loaded and the controls.
+    /// The sidebar, minimap and build menu are not implemented yet, so this
+    /// deliberately shows only what exists.</summary>
+    static void DrawHud(SdlRenderer r, string mapName, string sideName,
+                        int cells, int drawn, int viewW, int viewH) {
+        Ui.Panel(r, 12, 12, 520, 76, 18, 22, 32, 190);
+        Text.Draw(r, mapName + "   " + sideName, 28, 24, 2, 236, 208, 120, 255);
+        Text.Draw(r, "单元 " + Convert.ToString(cells)
+                  + "   本帧绘制 " + Convert.ToString(drawn),
+                  28, 54, 2, 170, 178, 192, 255);
+
+        Text.Draw(r, "方向键平移  +/- 缩放  Esc 返回",
+                  12, viewH - 34, 2, 150, 158, 172, 255);
+    }
+}
