@@ -47,16 +47,29 @@ class BigDataSource : DataSource {
 /// about straight from the source. Here, under-performers are tinted, the Score
 /// column is coloured by band, and the City column is painted by hand.
 class ScoreStyler : CellStyler {
+    // Resolved from field names by Bind() rather than hard-coded, so the
+    // styler keeps working if the columns are reordered.
+    int scoreCol;
+    int cityCol;
+
+    /// Look the columns this styler cares about up by name. Called once per
+    /// frame before the table renders, since the demo rebuilds its columns.
+    void Bind(List<DataColumn> cols) {
+        scoreCol = DataTable.Col(cols, "score");
+        cityCol = DataTable.Col(cols, "city");
+    }
+
     override int RowBg(DataSource src, int row) {
         // A failing score tints the whole row, so it is visible even when the
         // Score column has been scrolled out of view.
-        if (DataTable.ParseInt(src.CellText(row, 2)) < 80) { return DataTable.Rgb(255, 240, 240); }
+        if (scoreCol < 0) { return 0; }
+        if (DataTable.ParseInt(src.CellText(row, scoreCol)) < 80) { return DataTable.Rgb(255, 240, 240); }
         return 0;
     }
 
     override int CellFg(DataSource src, int row, int col) {
-        if (col != 2) { return 0; }
-        int v = DataTable.ParseInt(src.CellText(row, 2));
+        if (col != scoreCol || scoreCol < 0) { return 0; }
+        int v = DataTable.ParseInt(src.CellText(row, scoreCol));
         if (v >= 90) { return DataTable.Rgb(21, 128, 61); }
         if (v < 80) { return DataTable.Rgb(185, 28, 28); }
         return 0;
@@ -64,13 +77,13 @@ class ScoreStyler : CellStyler {
 
     override bool PaintCell(App app, DataSource src, int row, int col,
                             int x, int y, int w, int h) {
-        // Column 5 (City) is drawn entirely by this hook: a dot keyed to the
+        // The City column is drawn entirely by this hook: a dot keyed to the
         // city plus the name. Returning true means the grid's own cell
         // renderer is skipped for this cell.
-        if (col != 5) { return false; }
+        if (col != cityCol || cityCol < 0) { return false; }
         Canvas c = app.canvas;
         Theme t = app.theme;
-        string city = src.CellText(row, 5);
+        string city = src.CellText(row, cityCol);
         int dot = t.textTertiary;
         if (city == "San Francisco") { dot = t.primary; }
         else if (city == "New York") { dot = t.warning; }
@@ -430,6 +443,7 @@ class Gallery {
     // Retained state for the deferred-overlay / interactive demos.
     static string copiedIcon;
     static DataTableState demoTableState;
+    static ScoreStyler demoStyler;      // kept typed so its columns can be rebound
     static DataTableState bigTableState;    // large-data demo
     static List<DataColumn> bigCols;
     static BigDataSource bigSource;         // virtual source (no per-row storage)
@@ -626,7 +640,8 @@ class Gallery {
         Gallery.pendingPicker = "";
         Gallery.copiedIcon = "";
         Gallery.demoTableState = DataTableState.Create();
-        Gallery.demoTableState.styler = new ScoreStyler();
+        Gallery.demoStyler = new ScoreStyler();
+        Gallery.demoTableState.styler = Gallery.demoStyler;
         Gallery.bigTableState = DataTableState.Create();
         Gallery.bigTableState.showSummary = true;
         Gallery.bigCols = null;
@@ -3210,18 +3225,24 @@ class Gallery {
                 Gallery.bigTableState);
         } else if (name == "DataTable") {
             List<DataColumn> cols = new List<DataColumn>();
-            cols.Add(DataColumn.Pin(DataColumn.Text("Team", app.Scale(110))));
+            // Every column is named, so the styler below and any handler can
+            // say "score" instead of 2 — and keep working if a column moves.
+            cols.Add(DataColumn.Field(DataColumn.Pin(DataColumn.Text("Team", app.Scale(110))), "team"));
             // Name must be filled in and fits a short label; Score is a spinner
             // bounded to a percentage; Dept picks from a fixed list.
-            cols.Add(DataColumn.Pin(DataColumn.MaxLength(
-                DataColumn.Required(DataColumn.Editable(DataColumn.Text("Name", app.Scale(130)))), 16)));
-            cols.Add(DataColumn.Avg(DataColumn.Range(
+            cols.Add(DataColumn.Field(DataColumn.Pin(DataColumn.MaxLength(
+                DataColumn.Required(DataColumn.Editable(DataColumn.Text("Name", app.Scale(130)))), 16)), "name"));
+            cols.Add(DataColumn.Field(DataColumn.Avg(DataColumn.Range(
                 DataColumn.Spinner(DataColumn.Percent(DataColumn.Numeric("Score", app.Scale(90))), 1.0),
-                0.0, 100.0)));
-            cols.Add(DataColumn.Sum(DataColumn.Editable(DataColumn.Money(DataColumn.Numeric("Salary", app.Scale(120)), "$"))));
-            cols.Add(DataColumn.Dropdown(DataColumn.Text("Dept", app.Scale(120)),
-                                         Gallery.DeptChoices(), true));
-            cols.Add(DataColumn.Text("City", app.Scale(110)));
+                0.0, 100.0)), "score"));
+            cols.Add(DataColumn.Field(DataColumn.Sum(DataColumn.Editable(
+                DataColumn.Money(DataColumn.Numeric("Salary", app.Scale(120)), "$"))), "salary"));
+            cols.Add(DataColumn.Field(DataColumn.Dropdown(DataColumn.Text("Dept", app.Scale(120)),
+                                         Gallery.DeptChoices(), true), "dept"));
+            cols.Add(DataColumn.Field(DataColumn.Text("City", app.Scale(110)), "city"));
+            // The demo rebuilds its columns every frame, so the styler
+            // re-resolves the ones it needs by name.
+            Gallery.demoStyler.Bind(cols);
             List<DataRow> rows = new List<DataRow>();
             rows.Add(Gallery.DtRow6("Alpha", "Zan", "98", "128000", "Engineering", "San Francisco"));
             rows.Add(Gallery.DtRow6("Beta", "Lang", "87", "94500", "Sales", "New York"));
@@ -3802,7 +3823,7 @@ class Gallery {
         Gallery.Add(list, "Data Display", "DataTable",
             Gallery.T("A stateful table with typed columns, multi-column sort, grouping, frozen (pinned-left) columns, per-column display formatting, inline editing, footer aggregation, drag-to-reorder, filtering, range charts, CSV export and a CellStyler hook for row/cell colours and hand-drawn cells.",
                 "带状态的表格：类型化列、多列排序、分组、冻结（左固定）列、按列显示格式、内联编辑、底部聚合、拖拽换列、筛选、区域出图、CSV 导出，以及用于行/单元格着色与自绘单元格的 CellStyler 钩子。"),
-            "// column builders compose: pin, editable, per-column format, footer aggregate\nList<DataColumn> cols = new List<DataColumn>{\n  DataColumn.Pin(DataColumn.Text(\"Name\", 140)),\n  DataColumn.Avg(DataColumn.Editable(DataColumn.Percent(DataColumn.Numeric(\"Score\", 90)))),\n  DataColumn.Sum(DataColumn.Money(DataColumn.Numeric(\"Salary\", 120), \"$\")) };\nDataTableState state = DataTableState.Create();\n\n// appearance hook: a subclass, since Zan delegates can't capture. Return 0\n// from a colour method for \"no override\"; return true from PaintCell to\n// take the cell over completely (the canvas is clipped to it).\nclass Overdue : CellStyler {\n    override int RowBg(DataSource src, int row) {\n        if (src.CellText(row, 4) == \"Overdue\") { return DataTable.Rgb(255, 236, 236); }\n        return 0;\n    }\n    override bool PaintCell(App app, DataSource src, int row, int col,\n                            int x, int y, int w, int h) { return false; }\n}\nstate.styler = new Overdue();\n\nDataTable.Render(app, 40, 60, 520, 260, cols, rows, state);")
+            "// column builders compose: pin, editable, per-column format, footer aggregate\nList<DataColumn> cols = new List<DataColumn>{\n  DataColumn.Pin(DataColumn.Text(\"Name\", 140)),\n  DataColumn.Avg(DataColumn.Editable(DataColumn.Percent(DataColumn.Numeric(\"Score\", 90)))),\n  DataColumn.Sum(DataColumn.Money(DataColumn.Numeric(\"Salary\", 120), \"$\")) };\nDataTableState state = DataTableState.Create();\n\n// appearance hook: a subclass, since Zan delegates can't capture. Return 0\n// from a colour method for \"no override\"; return true from PaintCell to\n// take the cell over completely (the canvas is clipped to it).\nclass Overdue : CellStyler {\n    override int RowBg(DataSource src, int row) {\n        if (src.CellText(row, 4) == \"Overdue\") { return DataTable.Rgb(255, 236, 236); }\n        return 0;\n    }\n    override bool PaintCell(App app, DataSource src, int row, int col,\n                            int x, int y, int w, int h) { return false; }\n}\nstate.styler = new Overdue();\n\n// name columns to stop hard-coding indices — a name survives\n// insertion, reordering and a retitled (or translated) header\ncols.Add(DataColumn.Field(DataColumn.Text(\"City\", 110), \"city\"));\nint ci = DataTable.Col(cols, \"city\");\nstring v = DataTable.Cell(source, cols, row, \"city\");\nDataTable.SortByField(state, cols, \"score\", 2);   // 2 = descending\n\nDataTable.Render(app, 40, 60, 520, 260, cols, rows, state);")
             .Json("{\n  \"type\": \"DataTable\",\n  \"name\": \"grid\",\n  \"selection\": \"model.selectedRow\",\n  \"page\": \"model.page\",\n  \"pageSize\": 20,\n  \"columns\": [\n    {\n      \"title\": \"Name\",\n      \"field\": \"name\"\n    },\n    {\n      \"title\": \"Age\",\n      \"field\": \"age\"\n    }\n  ]\n}")
             .AddProp("cols", "List<DataColumn>", "-", "Typed columns (Text/Numeric).")
             .AddProp("rows", "List<DataRow>", "-", "Row data (Push per cell).")
@@ -3811,6 +3832,7 @@ class Gallery {
             .AddProp("DataColumn.Percent / Money", "builder", "-", "Per-column display formatting.")
             .AddProp("DataColumn.Sum / Avg", "builder", "-", "Footer aggregation for a numeric column.")
             .AddProp("state.styler", "CellStyler", "null", "Row/cell colours + custom cell paint (subclass, see below).")
+            .AddProp("DataColumn.Field", "builder", "\"\"", "Name a column; DataTable.Col(cols, name) resolves it to an index.")
             .AddEvent("GroupChanged", "UiEvent (state)", "Group-by columns changed (right-click header → group / ungroup).")
             .AddEvent("HeaderClick / Sort", "UiEvent (state)", "Header title clicked; Sort fires on sort col/dir change.")
             .AddEvent("HeaderRightClick", "UiEvent (state)", "Right-click a header cell (read HitCol).")

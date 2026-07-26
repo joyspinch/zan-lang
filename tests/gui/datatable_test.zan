@@ -524,6 +524,7 @@ class Program {
 
         Program.EditorTests();
         Program.StylerTests();
+        Program.FieldTests();
     }
 
     // Rejection counter for the CellValidating handler below. Static fields so
@@ -804,6 +805,111 @@ class Program {
         sst.styler = null;
         Console.WriteLine(DataTable.RowBackground(sst, ssrc, 0, white, blue, hoverC, false, false) == white);
         Console.WriteLine(DataTable.CellForeground(sst, ssrc, 0, 1) == 0);
+    }
+
+    /// Field-name addressing: the point is that indices may move underneath
+    /// application code, and names must not.
+    static void FieldTests() {
+        Console.WriteLine("-- fields --");
+
+        List<DataColumn> fc = new List<DataColumn>();
+        fc.Add(DataColumn.Field(DataColumn.Text("Name", 100), "name"));
+        fc.Add(DataColumn.Field(DataColumn.Numeric("Score", 60), "score"));
+        fc.Add(DataColumn.Text("City", 80));            // deliberately unnamed
+        List<DataRow> frows = new List<DataRow>();
+        frows.Add(Program.Row("Ann", "91", "Seattle"));
+        frows.Add(Program.Row("Bob", "72", "Denver"));
+        RowListSource fsrc = RowListSource.Create(frows);
+
+        // ---- lookup ----
+        Console.WriteLine(DataTable.Col(fc, "name") == 0);
+        Console.WriteLine(DataTable.Col(fc, "score") == 1);
+        Console.WriteLine(DataTable.Col(fc, "nope") == -1);
+        // an empty argument must not select the unnamed column at index 2
+        Console.WriteLine(DataTable.Col(fc, "") == -1);
+        Console.WriteLine(DataTable.HasCol(fc, "score"));
+        Console.WriteLine(DataTable.HasCol(fc, "city") == false);
+
+        // ---- reads / writes go through the name ----
+        Console.WriteLine(DataTable.Cell(fsrc, fc, 0, "name"));
+        Console.WriteLine(DataTable.Cell(fsrc, fc, 1, "score"));
+        Console.WriteLine(DataTable.Cell(fsrc, fc, 0, "nope") == "");   // unknown reads blank
+        Console.WriteLine(DataTable.CellValue(fsrc, fc, 0, "score") == 91.0);
+        Console.WriteLine(DataTable.CellValue(fsrc, fc, 0, "nope") == 0.0);
+        DataTable.SetCellField(fsrc, fc, 0, "score", "95");
+        Console.WriteLine(fsrc.CellText(0, 1));
+        // an unknown field must not fall through onto some other column
+        DataTable.SetCellField(fsrc, fc, 0, "nope", "wrecked");
+        Console.WriteLine(fsrc.CellText(0, 0));
+        Console.WriteLine(fsrc.CellText(0, 1));
+        Console.WriteLine(fsrc.CellText(0, 2));
+
+        // ---- the same names still resolve after a column is inserted ----
+        // This is the whole point: index 0 stops meaning "name", but the name
+        // does not stop meaning the name.
+        List<DataColumn> fc2 = new List<DataColumn>();
+        fc2.Add(DataColumn.Field(DataColumn.Text("Team", 80), "team"));
+        fc2.Add(DataColumn.Field(DataColumn.Text("Name", 100), "name"));
+        fc2.Add(DataColumn.Field(DataColumn.Numeric("Score", 60), "score"));
+        Console.WriteLine(DataTable.Col(fc2, "name") == 1);
+        Console.WriteLine(DataTable.Col(fc2, "score") == 2);
+        // and a title change doesn't move the name either
+        DataColumn.Field(fc2[1], "name");
+        fc2[1].title = "Full name";
+        Console.WriteLine(DataTable.Col(fc2, "name") == 1);
+
+        // ---- state operations by name ----
+        DataTableState fst = DataTableState.Create();
+        DataTable.EnsureInit(fst, fc, fsrc);
+
+        DataTable.SortByField(fst, fc, "score", 2);
+        Console.WriteLine(fst.SortColIndex() == 1);
+        Console.WriteLine(fst.SortDirection() == 2);
+        DataTable.AddSortField(fst, fc, "name", 1);
+        Console.WriteLine(fst.sortKeys.Count == 2);
+        Console.WriteLine(fst.sortKeys[1].col == 0);
+        // an unknown field changes nothing at all
+        DataTable.AddSortField(fst, fc, "nope", 1);
+        Console.WriteLine(fst.sortKeys.Count == 2);
+        DataTable.SortByField(fst, fc, "nope", 1);
+        Console.WriteLine(fst.sortKeys.Count == 2);
+
+        DataTable.SetAggregateField(fst, fc, "score", 1);
+        Console.WriteLine(fst.aggMode[1] == 1);
+        DataTable.SetAggregateField(fst, fc, "nope", 1);
+        Console.WriteLine(fst.aggMode[0] == 0);
+
+        DataTable.PinField(fst, fc, "name", true);
+        Console.WriteLine(DataTable.IsPinned(fst, 0));
+        DataTable.PinField(fst, fc, "name", false);
+        Console.WriteLine(DataTable.IsPinned(fst, 0) == false);
+        DataTable.PinField(fst, fc, "nope", true);
+        Console.WriteLine(DataTable.IsPinned(fst, 0) == false);
+
+        DataTable.HideField(fst, fc, "score", true);
+        // Compared rather than printed bare: a List<bool> element currently
+        // materialises as -1 instead of 1 (irgen sign-extends the i1 on store),
+        // and the golden must not enshrine that.
+        Console.WriteLine(fst.colHidden[1] == true);
+        Console.WriteLine(DataTable.HiddenCount(fst) == 1);
+        DataTable.HideField(fst, fc, "score", false);
+        Console.WriteLine(DataTable.HiddenCount(fst) == 0);
+
+        DataTable.GroupByField(fst, fc, "name");
+        Console.WriteLine(fst.groupCols.Count == 1);
+        Console.WriteLine(fst.groupCols[0] == 0);
+
+        // ---- naming the column an event reports ----
+        fst.hitCol = 1;
+        Console.WriteLine(DataTable.HitField(fst, fc));
+        fst.hitCol = 2;                       // the unnamed column
+        Console.WriteLine(DataTable.HitField(fst, fc) == "");
+        fst.hitCol = -1;
+        Console.WriteLine(DataTable.HitField(fst, fc) == "");
+        fst.editCol = 0;
+        Console.WriteLine(DataTable.EditField(fst, fc));
+        fst.editCol = 99;                     // out of range, not a crash
+        Console.WriteLine(DataTable.EditField(fst, fc) == "");
     }
 }
 
