@@ -1502,6 +1502,18 @@ static zan_symbol_t *get_method_sym(zan_symbol_t *type_sym, zan_istr_t method_na
     if (type_sym->type && type_sym->type->base_type && type_sym->type->base_type->sym) {
         return get_method_sym(type_sym->type->base_type->sym, method_name);
     }
+    /* An interface re-exports the members of the interfaces it extends, and
+     * those sit in the extends list rather than in base_type. Without this the
+     * call's static type is unknown at the call site, so e.g. an owned string
+     * returned through the derived interface is never released. */
+    if (type_sym->kind == SYM_INTERFACE && type_sym->type) {
+        for (int i = 0; i < type_sym->type->interface_count; i++) {
+            zan_type_t *it = type_sym->type->interfaces[i];
+            if (!it || !it->sym || it->sym == type_sym) continue;
+            zan_symbol_t *m = get_method_sym(it->sym, method_name);
+            if (m) return m;
+        }
+    }
     return NULL;
 }
 
