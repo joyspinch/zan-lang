@@ -513,10 +513,18 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
     g->list_struct_type = LLVMStructCreateNamed(g->ctx, "List");
     LLVMStructSetBody(g->list_struct_type, list_fields, 3, 0);
 
-    /* Dict struct type: { i64 count, i64 capacity, i8** keys, i64* values } */
-    LLVMTypeRef dict_fields[] = { i64, i64, LLVMPointerType(i8ptr, 0), LLVMPointerType(i64, 0) };
+    /* Dict struct type:
+     *   { i64 count, i64 capacity, i8** keys, i64* values,
+     *     i64* index, i64 index_capacity, i64 indexed_count }
+     * Entries stay in insertion order in the parallel keys/values buffers (so
+     * enumeration order and the ARC release walk are unchanged); `index` is an
+     * open-addressed hash index over them holding `entry + 1` per slot (0 =
+     * empty), rebuilt lazily by __zan_dict_find whenever `indexed_count` no
+     * longer matches `count` or a removal invalidated it (index_capacity 0). */
+    LLVMTypeRef dict_fields[] = { i64, i64, LLVMPointerType(i8ptr, 0), LLVMPointerType(i64, 0),
+                                  LLVMPointerType(i64, 0), i64, i64 };
     g->dict_struct_type = LLVMStructCreateNamed(g->ctx, "Dict");
-    LLVMStructSetBody(g->dict_struct_type, dict_fields, 4, 0);
+    LLVMStructSetBody(g->dict_struct_type, dict_fields, 7, 0);
 
     /* Task struct: { completed: i64, result: i64, thread_handle: i64 } */
     g->task_struct_type = LLVMStructCreateNamed(g->ctx, "Task");

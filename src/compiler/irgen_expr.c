@@ -1911,50 +1911,27 @@ static LLVMValueRef emit_expr_index(zan_irgen_t *g, zan_ast_node_t *expr,
             }
             return raw;
         }
-        /* Dict indexer: dict[key] -> linear scan for key, return value */
+        /* Dict indexer: dict[key] -> hash probe for the entry, then its value
+         * (0 when the key is absent, as the linear scan this replaces did). */
         if (arr_ptr && arr_type && arr_type->name.len == 4 && memcmp(arr_type->name.str, "Dict", 4) == 0) {
             LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
-            LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
-            LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
             LLVMValueRef dp = LLVMBuildBitCast(g->builder, arr_ptr,
                 LLVMPointerType(g->dict_struct_type, 0), "dp");
-            LLVMValueRef cntp = LLVMBuildStructGEP2(g->builder, g->dict_struct_type, dp, 0, "cntp");
-            LLVMValueRef cnt = LLVMBuildLoad2(g->builder, i64, cntp, "cnt");
-            LLVMValueRef kp = LLVMBuildStructGEP2(g->builder, g->dict_struct_type, dp, 2, "kp");
-            LLVMValueRef ks = LLVMBuildLoad2(g->builder, LLVMPointerType(i8ptr, 0), kp, "ks");
             LLVMValueRef vp = LLVMBuildStructGEP2(g->builder, g->dict_struct_type, dp, 3, "vp");
             LLVMValueRef vs = LLVMBuildLoad2(g->builder, LLVMPointerType(i64, 0), vp, "vs");
             LLVMValueRef search = coerce_dict_key(g, emit_expr(g, expr->index.index, locals));
-            /* loop to find key */
             LLVMValueRef res = emit_entry_alloca(g, i64, "dres");
             LLVMBuildStore(g->builder, LLVMConstInt(i64, 0, 0), res);
-            LLVMValueRef idx_a = emit_entry_alloca(g, i64, "di");
-            LLVMBuildStore(g->builder, LLVMConstInt(i64, 0, 0), idx_a);
-            LLVMBasicBlockRef cond_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "di.cond");
-            LLVMBasicBlockRef body_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "di.body");
+            LLVMValueRef found = emit_dict_find(g, arr_type, arr_ptr, search);
+            LLVMValueRef hit = LLVMBuildICmp(g->builder, LLVMIntSGE, found,
+                LLVMConstInt(i64, 0, 0), "dihit");
+            LLVMBasicBlockRef hit_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "di.hit");
             LLVMBasicBlockRef done_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "di.done");
-            LLVMBuildBr(g->builder, cond_bb);
-            LLVMPositionBuilderAtEnd(g->builder, cond_bb);
-            LLVMValueRef ci = LLVMBuildLoad2(g->builder, i64, idx_a, "ci");
-            LLVMValueRef cdone = LLVMBuildICmp(g->builder, LLVMIntUGE, ci, cnt, "cdone");
-            LLVMBuildCondBr(g->builder, cdone, done_bb, body_bb);
-            LLVMPositionBuilderAtEnd(g->builder, body_bb);
-            LLVMValueRef ci2 = LLVMBuildLoad2(g->builder, i64, idx_a, "ci2");
-            LLVMValueRef kslot = LLVMBuildGEP2(g->builder, i8ptr, ks, &ci2, 1, "ksl");
-            LLVMValueRef kv = LLVMBuildLoad2(g->builder, i8ptr, kslot, "kv");
-            LLVMValueRef eq = emit_dict_key_eq(g, arr_type, kv, search);
-            LLVMBasicBlockRef found_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "di.found");
-            LLVMBasicBlockRef next_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "di.next");
-            LLVMBuildCondBr(g->builder, eq, found_bb, next_bb);
-            LLVMPositionBuilderAtEnd(g->builder, found_bb);
-            LLVMValueRef vslot = LLVMBuildGEP2(g->builder, i64, vs, &ci2, 1, "vsl");
-            LLVMValueRef val = LLVMBuildLoad2(g->builder, i64, vslot, "val");
-            LLVMBuildStore(g->builder, val, res);
+            LLVMBuildCondBr(g->builder, hit, hit_bb, done_bb);
+            LLVMPositionBuilderAtEnd(g->builder, hit_bb);
+            LLVMValueRef vslot = LLVMBuildGEP2(g->builder, i64, vs, &found, 1, "vsl");
+            LLVMBuildStore(g->builder, LLVMBuildLoad2(g->builder, i64, vslot, "val"), res);
             LLVMBuildBr(g->builder, done_bb);
-            LLVMPositionBuilderAtEnd(g->builder, next_bb);
-            LLVMValueRef ni = LLVMBuildAdd(g->builder, ci2, LLVMConstInt(i64, 1, 0), "ni");
-            LLVMBuildStore(g->builder, ni, idx_a);
-            LLVMBuildBr(g->builder, cond_bb);
             LLVMPositionBuilderAtEnd(g->builder, done_bb);
             LLVMValueRef dval = LLVMBuildLoad2(g->builder, i64, res, "dval");
             zan_type_t *dvt = dict_value_type(arr_type);
@@ -2205,8 +2182,9 @@ static LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                 (tname2.len == 10 && memcmp(tname2.str, "Dictionary", 10) == 0)) {
                 LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
                 LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
-                /* allocate Dict struct: { i64 count, i64 capacity, i8** keys, i64* values } = 32 bytes */
-                LLVMValueRef dict_size = LLVMConstInt(i64, 32, 0);
+                /* allocate the Dict struct (7 i64-sized fields); the hash
+                 * index fields start zeroed, i.e. "no index yet". */
+                LLVMValueRef dict_size = LLVMConstInt(i64, 56, 0);
                 LLVMValueRef dict_raw = zan_call2(g->builder,
                     LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i64, i64 }, 2, 0),
                     get_calloc_fn(g), (LLVMValueRef[]){ LLVMConstInt(i64, 1, 0), dict_size }, 2, "dict");

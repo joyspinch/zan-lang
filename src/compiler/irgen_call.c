@@ -2533,46 +2533,11 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                     }
 
                     if (mname.len == 11 && memcmp(mname.str, "ContainsKey", 11) == 0 && expr->call.args.count == 1) {
-                        LLVMValueRef cntp = LLVMBuildStructGEP2(g->builder, g->dict_struct_type, dp, 0, "cntp");
-                        LLVMValueRef cnt = LLVMBuildLoad2(g->builder, i64, cntp, "cnt");
-                        LLVMValueRef kp = LLVMBuildStructGEP2(g->builder, g->dict_struct_type, dp, 2, "kp");
-                        LLVMValueRef ks = LLVMBuildLoad2(g->builder, LLVMPointerType(i8ptr, 0), kp, "ks");
                         LLVMValueRef search = coerce_dict_key(g, emit_expr(g, expr->call.args.items[0], locals));
-                        /* result alloca */
-                        LLVMValueRef res = emit_entry_alloca(g, i32t, "ckr");
-                        LLVMBuildStore(g->builder, LLVMConstInt(i32t, 0, 0), res);
-                        LLVMValueRef idx_a = emit_entry_alloca(g, i64, "di");
-                        LLVMBuildStore(g->builder, LLVMConstInt(i64, 0, 0), idx_a);
-                        LLVMBasicBlockRef cond_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "ck.cond");
-                        LLVMBasicBlockRef body_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "ck.body");
-                        LLVMBasicBlockRef done_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "ck.done");
-                        LLVMBuildBr(g->builder, cond_bb);
-                        /* cond: i < count? */
-                        LLVMPositionBuilderAtEnd(g->builder, cond_bb);
-                        LLVMValueRef ci = LLVMBuildLoad2(g->builder, i64, idx_a, "ci");
-                        LLVMValueRef cmp_done = LLVMBuildICmp(g->builder, LLVMIntUGE, ci, cnt, "cdone");
-                        LLVMBuildCondBr(g->builder, cmp_done, done_bb, body_bb);
-                        /* body: compare keys[i] with search key */
-                        LLVMPositionBuilderAtEnd(g->builder, body_bb);
-                        LLVMValueRef ci2 = LLVMBuildLoad2(g->builder, i64, idx_a, "ci2");
-                        LLVMValueRef kslot = LLVMBuildGEP2(g->builder, i8ptr, ks, &ci2, 1, "ksl");
-                        LLVMValueRef kv = LLVMBuildLoad2(g->builder, i8ptr, kslot, "kv");
-                        LLVMValueRef eq = emit_dict_key_eq(g, dict_local->type, kv, search);
-                        LLVMBasicBlockRef found_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "ck.found");
-                        LLVMBasicBlockRef next_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "ck.next");
-                        LLVMBuildCondBr(g->builder, eq, found_bb, next_bb);
-                        /* found: set result = 1, jump to done */
-                        LLVMPositionBuilderAtEnd(g->builder, found_bb);
-                        LLVMBuildStore(g->builder, LLVMConstInt(i32t, 1, 0), res);
-                        LLVMBuildBr(g->builder, done_bb);
-                        /* next: i++, loop back */
-                        LLVMPositionBuilderAtEnd(g->builder, next_bb);
-                        LLVMValueRef ni = LLVMBuildAdd(g->builder, ci2, LLVMConstInt(i64, 1, 0), "ni");
-                        LLVMBuildStore(g->builder, ni, idx_a);
-                        LLVMBuildBr(g->builder, cond_bb);
-                        /* done: return result */
-                        LLVMPositionBuilderAtEnd(g->builder, done_bb);
-                        return LLVMBuildLoad2(g->builder, i32t, res, "ckres");
+                        LLVMValueRef found = emit_dict_find(g, dict_local->type, raw, search);
+                        LLVMValueRef hit = LLVMBuildICmp(g->builder, LLVMIntSGE, found,
+                            LLVMConstInt(i64, 0, 0), "ckhit");
+                        return LLVMBuildZExt(g->builder, hit, i32t, "ckres");
                     }
                     if (mname.len == 5 && memcmp(mname.str, "Clear", 5) == 0 && expr->call.args.count == 0) {
                         LLVMValueRef cntp = LLVMBuildStructGEP2(g->builder, g->dict_struct_type, dp, 0, "cntp");
@@ -2674,6 +2639,10 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                         LLVMBuildCondBr(g->builder, eq, found_bb, next_bb);
                         /* found: shift remaining entries left */
                         LLVMPositionBuilderAtEnd(g->builder, found_bb);
+                        /* the hash index maps keys to entry slots, and both the
+                         * slots and the count change here: drop it. */
+                        LLVMBuildStore(g->builder, LLVMConstInt(i64, 0, 0),
+                            LLVMBuildStructGEP2(g->builder, g->dict_struct_type, dp, 5, "icapp"));
                         LLVMValueRef fi = LLVMBuildLoad2(g->builder, i64, idx_a, "fi");
                         LLVMValueRef last = LLVMBuildSub(g->builder, cnt, LLVMConstInt(i64, 1, 0), "last");
                         LLVMValueRef rkey = LLVMBuildGEP2(g->builder, i8ptr, ks, &fi, 1, "rkey");
