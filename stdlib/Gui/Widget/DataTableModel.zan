@@ -99,6 +99,14 @@ class DataColumn {
     // keeps its screen position while the middle pans underneath it.
     int freeze;
 
+    // ---- band (multi-level header) ----
+    // Slash-separated path of the header groups this column sits under, outermost
+    // first: "" is ungrouped, "Contact" is one level, "Contact/Address" is two.
+    // The header grows one row per level and spans a group across the adjacent
+    // columns sharing its path — so the grouping is a property of the columns
+    // themselves and cannot fall out of sync with them.
+    string band;
+
     static DataColumn Create(string title, int width) {
         DataColumn col = new DataColumn();
         col.title = title;
@@ -144,6 +152,7 @@ class DataColumn {
         col.editMin = 0.0;
         col.editMax = 0.0;
         col.freeze = 0;
+        col.band = "";
         return col;
     }
 
@@ -238,6 +247,20 @@ class DataColumn {
     /// scrolled, which is the whole reason to put them there.
     static DataColumn PinRight(DataColumn c) {
         c.freeze = 2; return c;
+    }
+
+    /// Put this column under a header group, growing the header a row:
+    ///
+    /// ```zan
+    /// cols.Add(DataColumn.Band(DataColumn.Text("Street", 160), "Address"));
+    /// cols.Add(DataColumn.Band(DataColumn.Text("City", 120), "Address"));
+    /// ```
+    ///
+    /// Adjacent columns with the same path share one spanning cell. Nest with a
+    /// slash, outermost first — "Contact/Address" sits under a "Contact" cell
+    /// that also spans whatever else names Contact. Passing "" ungroups.
+    static DataColumn Band(DataColumn c, string path) {
+        c.band = path; return c;
     }
 
     // ---- display-format configurators (compose onto any column) ----
@@ -562,19 +585,53 @@ class ChartBar {
     }
 }
 
+/// One spanning cell in a multi-level header: the group's own label, the header
+/// row it occupies (0 = outermost), and the half-open slice [from, to) of the
+/// *visible order* it covers. `path` is the full slash-separated key, which is
+/// what collapse state is stored under — the label alone would collide between
+/// two groups that happen to share a leaf name under different parents.
+class BandSpan {
+    string label;
+    string path;
+    int level;
+    int from;
+    int to;
+
+    BandSpan(string l, string p, int lv, int f, int tt) {
+        label = l;
+        path = p;
+        level = lv;
+        from = f;
+        to = tt;
+    }
+}
+
 /// One entry in the flattened display model: `kind` 0 = data row, 1 = group
-/// header; `row` = data-row index (kind 0) or GroupRow index (kind 1); `no` =
-/// 1-based data ordinal for data rows, else 0. Replaces the old index-aligned
-/// dispKind/dispRow/dispNo parallel lists.
+/// header, 2 = detail band (a master-detail panel under an expanded data row);
+/// `row` = data-row index (kind 0 and kind 2) or GroupRow index (kind 1);
+/// `no` = 1-based data ordinal for data rows, else 0. Replaces the old
+/// index-aligned dispKind/dispRow/dispNo parallel lists.
+///
+/// A detail band occupies `DataTable.DetailSlots(st)` *consecutive* kind-2
+/// entries, all naming the same master row. Keeping the band an integer number
+/// of row slots is what lets the body keep addressing rows by
+/// `bodyTop + slot * rowH` — a genuinely variable row height would force every
+/// scroll, hit-test and drag calculation onto a cumulative-height table. `part`
+/// says which slot of the band this is (0 = first), so the renderer can draw the
+/// panel once, on its first slot, and skip the rest.
 class DispRow {
     int kind;
     int row;
     int no;
+    /// Index of this slot within a multi-slot detail band (0 for every other
+    /// kind). Only meaningful when kind == 2.
+    int part;
 
     DispRow(int k, int r, int n) {
         kind = k;
         row = r;
         no = n;
+        part = 0;
     }
 }
 
@@ -693,6 +750,13 @@ class DataTableState {
     List<bool> colHidden;      // per-column visibility (true = hidden from view)
     List<int> colFreeze;       // per-column freeze: 0 none, 1 left edge, 2 right edge
     List<int> colOrder;        // user column order (master sequence of column indices)
+    // Header-band paths the user has collapsed. A collapsed band shows only its
+    // first column, so a wide group can be folded down to a stub without
+    // hiding it outright — the columns keep their state and come back intact.
+    List<string> bandCollapsed;
+    // Columns hidden by the collapse above, so unfolding restores exactly those
+    // and leaves any column the user hid by hand alone.
+    List<int> bandAutoHidden;
     int dragCol;               // column index being header-drag-reordered (-1 none)
     int dragColStartX;         // pointer X where the header press began
     bool dragColMoved;         // pointer moved enough to become a reorder drag
@@ -730,6 +794,16 @@ class DataTableState {
     List<DispRow> dispRows;     // flattened display model (see DispRow)
     List<GroupRow> groups;     // group-header rows (see GroupRow)
 
+    // ---- group panel (DevExpress-style strip above the header) ----
+    // A drop target that turns "group by this column" into a drag: pull a column
+    // header up into the strip to group by it, drag its chip sideways to renest,
+    // click the chip's × to ungroup just that one. The strip sits above the
+    // header, so it shifts the header and body down when shown.
+    bool showGroupPanel;       // draw the strip (default false)
+    int dragChip;              // group column being dragged within the strip (-1 none)
+    int chipDropVis;           // insertion slot shown while dragging (-1 none)
+    bool hdrDragToPanel;       // a header drag has been pulled up over the strip
+
     // ---- semantic event surface (sender = this state; handlers pull context
     // via HitRow()/HitCol()/SortColIndex()/... per the parameterless model) ----
     UiEvent FilterChanged;     // any filter change (filter row, popup, batch)
@@ -748,6 +822,7 @@ class DataTableState {
     UiEvent ColumnReorder;     // a column was drag-reordered (read HitCol)
     UiEvent RowInserted;       // a row was added (read HitRow for its index)
     UiEvent RowDeleted;        // a row was removed (read HitRow for its index)
+    UiEvent BandToggled;       // a header band was folded or unfolded
     int hitRow;                // data-row index of the last row/cell interaction
     int hitOrder;              // order-position (post sort/filter) of that row
     int hitCol;                // column index of the last header/cell interaction
@@ -777,6 +852,13 @@ class DataTableState {
     // ---- appearance hooks ----
     CellStyler styler;         // optional row/cell colouring + custom cell paint
                                // (null = stock appearance; see CellStyler)
+
+    // ---- master-detail ----
+    // Rows the user has expanded, held as *source* row indices so an expansion
+    // follows its row through sorting and filtering instead of pinning to a
+    // display position. null provider = the feature is off and costs nothing.
+    DetailProvider detail;
+    List<int> expandedRows;
 
     // ---- row add / delete + undo ----
     // The journal is capped (undoLimit) so a long editing session can't grow it
@@ -850,6 +932,8 @@ class DataTableState {
         s.ctxY = 0;
         s.colHidden = new List<bool>();
         s.colFreeze = new List<int>();
+        s.bandCollapsed = new List<string>();
+        s.bandAutoHidden = new List<int>();
         s.colOrder = new List<int>();
         s.dragCol = -1;
         s.dragColStartX = 0;
@@ -886,8 +970,13 @@ class DataTableState {
         s.ColumnReorder = UiEvent.Create();
         s.RowInserted = UiEvent.Create();
         s.RowDeleted = UiEvent.Create();
+        s.BandToggled = UiEvent.Create();
         s.groupCols = new List<int>();
         s.collapsedKeys = new List<string>();
+        s.showGroupPanel = false;
+        s.dragChip = -1;
+        s.chipDropVis = -1;
+        s.hdrDragToPanel = false;
         s.dispRows = new List<DispRow>();
         s.groups = new List<GroupRow>();
         s.hitRow = -1;
@@ -908,6 +997,8 @@ class DataTableState {
         s.edCalMonth = 0;
         s.edPopHot = false;
         s.styler = null;
+        s.detail = null;
+        s.expandedRows = new List<int>();
         s.undoLog = new List<RowEdit>();
         s.undoLimit = 100;
         s.allowAddRow = false;
@@ -1128,4 +1219,29 @@ class CellStyler {
     /// custom painter cannot bleed into its neighbours.
     virtual bool PaintCell(App app, DataSource src, int row, int col,
                            int x, int y, int w, int h) { return false; }
+}
+
+/// Master-detail hook: supplies the panel drawn under an expanded row.
+///
+/// Subclass it, override `Paint` (and optionally `Slots` / `CanExpand`), and hand
+/// it to the grid with `DataTable.SetDetail(st, provider)`. A row then grows an
+/// expander chevron in the row-number gutter; clicking it opens a band beneath
+/// the row for the detail panel to draw into — a child table, a form, a chart.
+///
+/// The band is an integer number of ordinary row slots high (`Slots`), which is
+/// what keeps the body's scroll and hit-test arithmetic uniform; see `DispRow`.
+class DetailProvider {
+    /// Height of the detail band for `row`, counted in ordinary row heights.
+    /// Clamped to at least 1 by the grid. Override to size per row (e.g. by the
+    /// number of child records).
+    virtual int Slots(DataSource src, int row) { return 3; }
+
+    /// Whether `row` can be expanded at all. Return false for a row with nothing
+    /// to show and it keeps a blank gutter instead of a dead chevron.
+    virtual bool CanExpand(DataSource src, int row) { return true; }
+
+    /// Draw the detail panel for `row` into [x,y,w,h]. The canvas is clipped to
+    /// that rectangle, so the panel cannot bleed into neighbouring rows.
+    virtual void Paint(App app, DataSource src, int row,
+                       int x, int y, int w, int h) { }
 }

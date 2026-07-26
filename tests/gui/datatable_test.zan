@@ -1252,6 +1252,343 @@ class Program {
         // an out-of-range column is not a crash
         DataTable.FreezeColumn(zst, 99, 1);
         Console.WriteLine(DataTable.FreezeOf(zst, 99) == 0);
+
+        // ---- layout persistence: save / load round-trip ----
+        // The view state a user builds by hand survives a round-trip through
+        // JSON, keyed by field name rather than column position.
+        List<DataColumn> lc = new List<DataColumn>();
+        lc.Add(DataColumn.Field(DataColumn.Create("Name", 120), "name"));
+        lc.Add(DataColumn.Field(DataColumn.Create("City", 90), "city"));
+        lc.Add(DataColumn.Field(DataColumn.Sum(DataColumn.Numeric("Qty", 70)), "qty"));
+
+        DataTableState ls = DataTableState.Create();
+        DataTable.EnsureLayoutSlots(ls, lc);
+        ls.colWidths[0] = 240;          // widened by dragging
+        ls.colHidden[1] = true;         // hidden from the header menu
+        ls.colFreeze[0] = 1;            // pinned left
+        ls.colOrder = new List<int>();
+        ls.colOrder.Add(2);             // reordered: qty, name, city
+        ls.colOrder.Add(0);
+        ls.colOrder.Add(1);
+        ls.sortKeys.Add(new SortKey(2, 2));   // sorted desc on qty
+        ls.groupCols.Add(1);                  // grouped by city
+        ls.showFilterRow = true;
+        ls.striped = false;
+        ls.filters[2].cmpMode = 1;            // qty > 5
+        ls.filters[2].cmpA = "5";
+        ls.filters[1].hidden.Add("Berlin");   // set-filter unticks a value
+        ls.filterRowText[0] = "an";
+
+        string lj = DataTable.SaveLayout(ls, lc);
+
+        DataTableState rs = DataTableState.Create();
+        Console.WriteLine(DataTable.LoadLayout(rs, lc, lj));
+        Console.WriteLine(rs.colWidths[0] == 240);
+        Console.WriteLine(rs.colHidden[1] == true);
+        Console.WriteLine(rs.colFreeze[0] == 1);
+        Console.WriteLine(rs.colOrder[0] == 2 && rs.colOrder[1] == 0 && rs.colOrder[2] == 1);
+        Console.WriteLine(rs.sortKeys.Count == 1 && rs.sortKeys[0].col == 2);
+        Console.WriteLine(rs.sortKeys[0].dir == 2);
+        // sortCol/sortDir mirror the primary key, so the legacy readers agree
+        Console.WriteLine(rs.sortCol == 2 && rs.sortDir == 2);
+        Console.WriteLine(rs.groupCols.Count == 1 && rs.groupCols[0] == 1);
+        Console.WriteLine(rs.showFilterRow);
+        Console.WriteLine(rs.striped == false);
+        Console.WriteLine(rs.aggMode[2] == 1);              // Sum survives
+        Console.WriteLine(rs.filters[2].cmpMode == 1);
+        Console.WriteLine(rs.filters[2].cmpA == "5");
+        Console.WriteLine(rs.filters[1].IsHidden("Berlin"));
+        Console.WriteLine(rs.filterRowText[0] == "an");
+        // an untouched column keeps its declared width and carries no filter
+        Console.WriteLine(rs.colWidths[1] == 90);
+        Console.WriteLine(rs.filters[0].Active() == false);
+
+        // ---- a layout outlives its table being rearranged ----
+        // Same three fields, declared in a different order with a new column
+        // inserted at the front: every setting still lands on the column it was
+        // saved against, and the newcomer is appended rather than dropped.
+        List<DataColumn> mc = new List<DataColumn>();
+        mc.Add(DataColumn.Field(DataColumn.Create("Id", 50), "id"));
+        mc.Add(DataColumn.Field(DataColumn.Numeric("Qty", 70), "qty"));
+        mc.Add(DataColumn.Field(DataColumn.Create("Name", 120), "name"));
+        mc.Add(DataColumn.Field(DataColumn.Create("City", 90), "city"));
+
+        DataTableState ms = DataTableState.Create();
+        Console.WriteLine(DataTable.LoadLayout(ms, mc, lj));
+        // "name" moved from index 0 to 2 — its width follows the name
+        Console.WriteLine(ms.colWidths[2] == 240);
+        Console.WriteLine(ms.colFreeze[2] == 1);
+        // "city" moved from 1 to 3 — still hidden, still the grouped column
+        Console.WriteLine(ms.colHidden[3] == true);
+        Console.WriteLine(ms.groupCols.Count == 1 && ms.groupCols[0] == 3);
+        // "qty" moved from 2 to 1 — still the sort key, still filtered
+        Console.WriteLine(ms.sortKeys.Count == 1 && ms.sortKeys[0].col == 1);
+        Console.WriteLine(ms.filters[1].cmpMode == 1);
+        // saved order was qty,name,city; "id" is new, so it lands after them
+        Console.WriteLine(ms.colOrder.Count == 4);
+        Console.WriteLine(ms.colOrder[0] == 1 && ms.colOrder[1] == 2 && ms.colOrder[2] == 3);
+        Console.WriteLine(ms.colOrder[3] == 0);
+        // the new column is untouched by a layout that predates it
+        Console.WriteLine(ms.colWidths[0] == 50 && ms.colHidden[0] == false);
+
+        // ---- a layout naming columns this table no longer has ----
+        // Only "name" still exists; the rest are skipped instead of shifting
+        // onto whichever column happens to sit at the saved index.
+        List<DataColumn> sc = new List<DataColumn>();
+        sc.Add(DataColumn.Field(DataColumn.Create("Name", 120), "name"));
+        DataTableState ss = DataTableState.Create();
+        Console.WriteLine(DataTable.LoadLayout(ss, sc, lj));
+        Console.WriteLine(ss.colWidths[0] == 240);
+        Console.WriteLine(ss.sortKeys.Count == 0);   // "qty" is gone
+        Console.WriteLine(ss.groupCols.Count == 0);  // "city" is gone
+        Console.WriteLine(ss.colOrder.Count == 1);
+
+        // ---- unusable input is refused outright, leaving the state alone ----
+        DataTableState bs = DataTableState.Create();
+        DataTable.EnsureLayoutSlots(bs, lc);
+        bs.colWidths[0] = 333;
+        Console.WriteLine(DataTable.LoadLayout(bs, lc, ""));            // empty
+        Console.WriteLine(DataTable.LoadLayout(bs, lc, "not json"));    // garbage
+        Console.WriteLine(DataTable.LoadLayout(bs, lc, "[1,2,3]"));     // not an object
+        Console.WriteLine(DataTable.LoadLayout(bs, lc, "{\"ver\":99}")); // future version
+        Console.WriteLine(bs.colWidths[0] == 333);                      // untouched
+
+        // ---- an unnamed column can't be addressed, so it is left out ----
+        List<DataColumn> uc = new List<DataColumn>();
+        uc.Add(DataColumn.Create("Anon", 60));                     // no field
+        uc.Add(DataColumn.Field(DataColumn.Create("Named", 80), "named"));
+        DataTableState us = DataTableState.Create();
+        DataTable.EnsureLayoutSlots(us, uc);
+        us.colWidths[0] = 200;
+        us.colWidths[1] = 210;
+        DataTableState ur = DataTableState.Create();
+        Console.WriteLine(DataTable.LoadLayout(ur, uc, DataTable.SaveLayout(us, uc)));
+        Console.WriteLine(ur.colWidths[0] == 60);    // unnamed: declared default
+        Console.WriteLine(ur.colWidths[1] == 210);   // named: restored
+
+        // ---- a hand-edited file can't collapse a column or store a bad enum ----
+        DataTableState hs = DataTableState.Create();
+        Console.WriteLine(DataTable.LoadLayout(hs, lc,
+            "{\"ver\":1,\"cols\":[{\"field\":\"name\",\"w\":0,\"freeze\":9,\"agg\":42}]}"));
+        Console.WriteLine(hs.colWidths[0] == 120);   // zero width rejected
+        Console.WriteLine(hs.colFreeze[0] == 0);     // out-of-range side rejected
+        Console.WriteLine(hs.aggMode[0] == 0);       // out-of-range aggregate rejected
+
+        // ---- master-detail: a detail band occupies whole row slots ----
+        List<DataRow> drs = new List<DataRow>();
+        drs.Add(Program.Row2("a", "1"));
+        drs.Add(Program.Row2("b", "2"));
+        drs.Add(Program.Row2("c", "3"));
+        List<DataColumn> dc2 = new List<DataColumn>();
+        dc2.Add(DataColumn.Field(DataColumn.Create("k", 80), "k"));
+        dc2.Add(DataColumn.Field(DataColumn.Numeric("v", 60), "v"));
+        DataSource ds2 = RowListSource.Create(drs);
+        DataTableState dt2 = DataTableState.Create();
+        DataTable.EnsureInit(dt2, dc2, ds2);
+        DataTable.Recompute(dt2, dc2, ds2);
+        // no provider: the flattened model is exactly the data rows
+        Console.WriteLine(DataTable.HasDetail(dt2) == false);
+        Console.WriteLine(dt2.dispRows.Count == 3);
+        // expanding without a provider is refused, so it cannot desync the model
+        DataTable.ExpandRow(dt2, ds2, 0);
+        Console.WriteLine(DataTable.ExpandedCount(dt2) == 0);
+
+        DataTable.SetDetail(dt2, new FixedDetail());
+        DataTable.Recompute(dt2, dc2, ds2);
+        Console.WriteLine(DataTable.HasDetail(dt2));
+        Console.WriteLine(dt2.dispRows.Count == 3);      // nothing expanded yet
+        Console.WriteLine(DataTable.DetailSlots(dt2, ds2, 0) == 2);
+
+        // expand the middle row: 2 detail slots land directly after it
+        DataTable.ExpandRow(dt2, ds2, 1);
+        DataTable.Recompute(dt2, dc2, ds2);
+        Console.WriteLine(dt2.dispRows.Count == 5);
+        Console.WriteLine(dt2.dispRows[1].kind == 0 && dt2.dispRows[1].row == 1);
+        Console.WriteLine(dt2.dispRows[2].kind == 2 && dt2.dispRows[2].row == 1);
+        Console.WriteLine(dt2.dispRows[2].part == 0);
+        Console.WriteLine(dt2.dispRows[3].kind == 2 && dt2.dispRows[3].part == 1);
+        Console.WriteLine(dt2.dispRows[4].kind == 0 && dt2.dispRows[4].row == 2);
+        // the data ordinals stay 1,2,3 — a detail band is not a numbered row
+        Console.WriteLine(dt2.dispRows[0].no == 1 && dt2.dispRows[1].no == 2);
+        Console.WriteLine(dt2.dispRows[4].no == 3);
+        Console.WriteLine(dt2.dispRows[2].no == 0);
+
+        // keyboard navigation steps over the band instead of stalling in it
+        Console.WriteLine(DataTable.NextDataSlot(dt2, 2, 1) == 4);
+        Console.WriteLine(DataTable.NextDataSlot(dt2, 3, -1) == 1);
+
+        // collapse restores the flat model exactly
+        DataTable.CollapseRow(dt2, 1);
+        DataTable.Recompute(dt2, dc2, ds2);
+        Console.WriteLine(dt2.dispRows.Count == 3);
+
+        // toggle is expand/collapse in one call
+        DataTable.ToggleDetail(dt2, ds2, 0);
+        Console.WriteLine(DataTable.IsExpanded(dt2, 0));
+        DataTable.ToggleDetail(dt2, ds2, 0);
+        Console.WriteLine(DataTable.IsExpanded(dt2, 0) == false);
+
+        // ---- expansion is keyed by source row, so it survives a sort ----
+        DataTable.ExpandRow(dt2, ds2, 0);          // source row 0 == "a"
+        DataTable.SortBy(dt2, 0, 2);               // sort by k descending: c,b,a
+        DataTable.Recompute(dt2, dc2, ds2);
+        Console.WriteLine(dt2.dispRows.Count == 5);
+        // "a" is now last, and its band follows it there
+        Console.WriteLine(dt2.dispRows[2].kind == 0 && dt2.dispRows[2].row == 0);
+        Console.WriteLine(dt2.dispRows[3].kind == 2 && dt2.dispRows[3].row == 0);
+        Console.WriteLine(dt2.dispRows[4].kind == 2 && dt2.dispRows[4].row == 0);
+        DataTable.SortBy(dt2, 0, 1);
+        DataTable.CollapseAllDetail(dt2);
+        DataTable.Recompute(dt2, dc2, ds2);
+        Console.WriteLine(dt2.dispRows.Count == 3);
+
+        // ---- a provider can size per row and decline a row outright ----
+        DataTable.SetDetail(dt2, new PerRowDetail());
+        DataTable.Recompute(dt2, dc2, ds2);
+        // PerRowDetail: row 0 -> 1 slot, row 1 -> 3 slots, row 2 declined
+        Console.WriteLine(DataTable.CanExpand(dt2, ds2, 0));
+        Console.WriteLine(DataTable.CanExpand(dt2, ds2, 2) == false);
+        // a declined row cannot be expanded, so no chevron promises what it
+        // cannot deliver
+        DataTable.ExpandRow(dt2, ds2, 2);
+        Console.WriteLine(DataTable.ExpandedCount(dt2) == 0);
+        DataTable.ExpandRow(dt2, ds2, 0);
+        DataTable.ExpandRow(dt2, ds2, 1);
+        DataTable.Recompute(dt2, dc2, ds2);
+        // 3 data + 1 (row 0) + 3 (row 1) = 7
+        Console.WriteLine(dt2.dispRows.Count == 7);
+        Console.WriteLine(dt2.dispRows[1].kind == 2 && dt2.dispRows[1].row == 0);
+        Console.WriteLine(dt2.dispRows[2].kind == 0 && dt2.dispRows[2].row == 1);
+        Console.WriteLine(dt2.dispRows[5].kind == 2 && dt2.dispRows[5].part == 2);
+        Console.WriteLine(dt2.dispRows[6].kind == 0 && dt2.dispRows[6].row == 2);
+        // a slot count below 1 is clamped, so a band can never be zero-high
+        DataTableState zt = DataTableState.Create();
+        DataTable.SetDetail(zt, new ZeroDetail());
+        Console.WriteLine(DataTable.DetailSlots(zt, ds2, 0) == 1);
+
+        // detaching the provider closes everything and restores the flat model
+        DataTable.SetDetail(dt2, null);
+        DataTable.Recompute(dt2, dc2, ds2);
+        Console.WriteLine(DataTable.ExpandedCount(dt2) == 0);
+        Console.WriteLine(dt2.dispRows.Count == 3);
+
+        // ---- detail bands coexist with grouping ----
+        List<DataRow> grs = new List<DataRow>();
+        grs.Add(Program.Row2("x", "1"));
+        grs.Add(Program.Row2("x", "2"));
+        grs.Add(Program.Row2("y", "3"));
+        DataSource gs2 = RowListSource.Create(grs);
+        DataTableState gt2 = DataTableState.Create();
+        DataTable.EnsureInit(gt2, dc2, gs2);
+        DataTable.SetDetail(gt2, new FixedDetail());
+        DataTable.GroupBy(gt2, 0);                 // group by k: [x: 2] [y: 1]
+        DataTable.Recompute(gt2, dc2, gs2);
+        // 2 group headers + 3 data rows
+        Console.WriteLine(gt2.dispRows.Count == 5);
+        DataTable.ExpandRow(gt2, gs2, 0);
+        DataTable.Recompute(gt2, dc2, gs2);
+        Console.WriteLine(gt2.dispRows.Count == 7);   // + 2 detail slots
+        // the band sits inside its group, right after its master row
+        Console.WriteLine(gt2.dispRows[0].kind == 1);          // group header "x"
+        Console.WriteLine(gt2.dispRows[1].kind == 0 && gt2.dispRows[1].row == 0);
+        Console.WriteLine(gt2.dispRows[2].kind == 2 && gt2.dispRows[2].row == 0);
+        Console.WriteLine(gt2.dispRows[3].kind == 2);
+        Console.WriteLine(gt2.dispRows[4].kind == 0 && gt2.dispRows[4].row == 1);
+        // collapsing the group takes the band away with its master row
+        DataTable.ToggleCollapse(gt2, DataTable.PathKey(gt2, dc2, gs2, 0, 0));
+        DataTable.Recompute(gt2, dc2, gs2);
+        Console.WriteLine(gt2.dispRows.Count == 3);   // [x] header + [y] header + y row
+        Console.WriteLine(DataTable.IsExpanded(gt2, 0));  // still expanded, just hidden
+
+        // ---- a saved layout carries the open detail rows ----
+        DataTableState xs = DataTableState.Create();
+        DataTable.SetDetail(xs, new FixedDetail());
+        DataTable.EnsureLayoutSlots(xs, dc2);
+        DataTable.ExpandRow(xs, ds2, 0);
+        DataTable.ExpandRow(xs, ds2, 2);
+        string xj = DataTable.SaveLayout(xs, dc2);
+
+        DataTableState xr = DataTableState.Create();
+        DataTable.SetDetail(xr, new FixedDetail());
+        Console.WriteLine(DataTable.LoadLayout(xr, dc2, xj));
+        Console.WriteLine(DataTable.ExpandedCount(xr) == 2);
+        Console.WriteLine(DataTable.IsExpanded(xr, 0));
+        Console.WriteLine(DataTable.IsExpanded(xr, 2));
+        Console.WriteLine(DataTable.IsExpanded(xr, 1) == false);
+        // the restored expansions drive the flattening on the next recompute
+        DataTable.EnsureInit(xr, dc2, ds2);
+        DataTable.Recompute(xr, dc2, ds2);
+        Console.WriteLine(xr.dispRows.Count == 7);   // 3 data + 2 + 2
+        // a layout written before this feature existed simply opens nothing
+        DataTableState xo = DataTableState.Create();
+        DataTable.SetDetail(xo, new FixedDetail());
+        Console.WriteLine(DataTable.LoadLayout(xo, dc2, "{\"ver\":1}"));
+        Console.WriteLine(DataTable.ExpandedCount(xo) == 0);
+
+        // ---- group panel: reorder / remove really renest the model ----
+        List<DataColumn> gpcols = new List<DataColumn>();
+        gpcols.Add(DataColumn.Create("city", 80));
+        gpcols.Add(DataColumn.Create("dept", 80));
+        gpcols.Add(DataColumn.Create("name", 80));
+        List<DataRow> gprows = new List<DataRow>();
+        gprows.Add(Program.Row("Rome", "Ops", "a"));
+        gprows.Add(Program.Row("Rome", "Dev", "b"));
+        gprows.Add(Program.Row("Oslo", "Ops", "c"));
+        DataSource gpsrc = RowListSource.Create(gprows);
+        DataTableState gpst = DataTableState.Create();
+        DataTable.EnsureInit(gpst, gpcols, gpsrc);
+        gpst.showGroupPanel = true;
+        DataTable.GroupBy(gpst, 0);                    // city
+        DataTable.GroupBy(gpst, 1);                    // then dept
+        DataTable.Recompute(gpst, gpcols, gpsrc);
+        Console.WriteLine(gpst.groupCols.Count == 2);
+        Console.WriteLine(gpst.groupCols[0] == 0 && gpst.groupCols[1] == 1);
+        // outer captions come from the city column while city is outermost
+        Console.WriteLine(gpst.groups[0].label);        // Oslo
+        int panelSlots = gpst.dispRows.Count;
+
+        // dragging the dept chip to slot 0 swaps the nesting, and the display
+        // model must be rebuilt around it (dept captions now lead)
+        DataTable.MoveGroup(gpst, 1, 0);
+        DataTable.Recompute(gpst, gpcols, gpsrc);
+        Console.WriteLine(gpst.groupCols[0] == 1 && gpst.groupCols[1] == 0);
+        Console.WriteLine(gpst.groups[0].label);        // Dev
+        Console.WriteLine(gpst.dispRows[0].kind == 1 && gpst.dispRows[0].level == 0);
+
+        // out-of-range destinations clamp instead of doing nothing
+        DataTable.MoveGroup(gpst, 1, 9);
+        Console.WriteLine(gpst.groupCols[0] == 0 && gpst.groupCols[1] == 1);
+        DataTable.MoveGroup(gpst, 1, 0 - 3);
+        Console.WriteLine(gpst.groupCols[0] == 1 && gpst.groupCols[1] == 0);
+        // moving a column that is not grouped is a no-op
+        DataTable.MoveGroup(gpst, 2, 0);
+        Console.WriteLine(gpst.groupCols.Count == 2 && gpst.groupCols[0] == 1);
+
+        // a chip's × drops just that level; the other one survives
+        DataTable.UngroupOne(gpst, 1);
+        DataTable.Recompute(gpst, gpcols, gpsrc);
+        Console.WriteLine(gpst.groupCols.Count == 1 && gpst.groupCols[0] == 0);
+        Console.WriteLine(gpst.dispRows.Count < panelSlots);   // one nesting less
+        Console.WriteLine(gpst.groups[0].label);        // Oslo again
+        // removing an ungrouped column changes nothing
+        DataTable.UngroupOne(gpst, 2);
+        Console.WriteLine(gpst.groupCols.Count == 1);
+        // the last × leaves a flat table
+        DataTable.UngroupOne(gpst, 0);
+        DataTable.Recompute(gpst, gpcols, gpsrc);
+        Console.WriteLine(gpst.groupCols.Count == 0);
+        Console.WriteLine(gpst.dispRows.Count == 3);
+
+        // dropping a header onto a slot inserts at that depth, and a second drop
+        // of the same column moves it rather than duplicating it
+        DataTable.GroupByAt(gpst, 0, 0);
+        DataTable.GroupByAt(gpst, 1, 0);
+        Console.WriteLine(gpst.groupCols[0] == 1 && gpst.groupCols[1] == 0);
+        DataTable.GroupByAt(gpst, 1, 1);
+        Console.WriteLine(gpst.groupCols.Count == 2);
+        Console.WriteLine(gpst.groupCols[0] == 0 && gpst.groupCols[1] == 1);
+        Console.WriteLine(DataTable.GroupDepth(gpst, 1) == 1);
+        Console.WriteLine(DataTable.GroupDepth(gpst, 2) == 0 - 1);
     }
 }
 
@@ -1281,4 +1618,25 @@ class TestStyler : CellStyler {
         if (col == 1 && src.CellText(row, 1) == "Overdue") { return DataTable.Rgb(255, 0, 0); }
         return 0;
     }
+}
+
+/// A detail provider with a constant 2-slot band, used to check the flatten
+/// arithmetic without a per-row size getting in the way.
+class FixedDetail : DetailProvider {
+    override int Slots(DataSource src, int row) { return 2; }
+}
+
+/// A detail provider that sizes per row and refuses the last one, proving both
+/// `Slots` and `CanExpand` reach the flattening.
+class PerRowDetail : DetailProvider {
+    override int Slots(DataSource src, int row) {
+        if (row == 0) { return 1; }
+        return 3;
+    }
+    override bool CanExpand(DataSource src, int row) { return row != 2; }
+}
+
+/// A provider that asks for a zero-high band, to prove the grid clamps it.
+class ZeroDetail : DetailProvider {
+    override int Slots(DataSource src, int row) { return 0; }
 }
