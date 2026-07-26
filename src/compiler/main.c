@@ -1663,6 +1663,18 @@ int main(int argc, char **argv) {
                 size_t cur = strlen(cmd);
                 snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s/zanrt_sync.o\"", sys);
             }
+            /* Small-object allocator in front of musl's mallocng: ARC programs
+             * allocate one short-lived block per string/object/frame, which is
+             * mallocng's worst case. Wrapping malloc/free also catches libc's
+             * own allocations; foreign pointers are passed straight through. */
+            { char memobj[1300];
+              snprintf(memobj, sizeof(memobj), "%s/zanrt_mem.o", sys);
+              if (zan_file_exists(memobj)) {
+                  size_t cur = strlen(cmd);
+                  snprintf(cmd + cur, sizeof(cmd) - cur,
+                           " \"%s\" --wrap=malloc --wrap=free"
+                           " --wrap=calloc --wrap=realloc", memobj);
+              } }
             { size_t cur = strlen(cmd);
               snprintf(cmd + cur, sizeof(cmd) - cur, " --start-group \"%s/libc.a\"", sys); }
             /* soft-float / int128 builtins (aarch64 long double is fp128) */

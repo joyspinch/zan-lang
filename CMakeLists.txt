@@ -206,6 +206,13 @@ foreach(_linux_sub linux-musl linux-arm64 linux-riscv64)
                     $<TARGET_FILE_DIR:zanc>/${_linux_sub}/
             COMMENT "Copying ${_linux_sub} sysroot for cross-compilation"
             VERBATIM)
+        if(EXISTS "${_linux_sys}/zanrt_mem.o")
+            add_custom_command(TARGET zanc POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                        "${_linux_sys}/zanrt_mem.o"
+                        $<TARGET_FILE_DIR:zanc>/${_linux_sub}/
+                VERBATIM)
+        endif()
         if(EXISTS "${_linux_sys}/libgcc.a")
             add_custom_command(TARGET zanc POST_BUILD
                 COMMAND ${CMAKE_COMMAND} -E copy_if_different
