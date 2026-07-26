@@ -1,0 +1,288 @@
+using System;
+using System.Collections.Generic;
+using Ra2.Formats;
+
+namespace Ra2.Assets;
+
+/// <summary>One entry of a theater's tile set table.</summary>
+///
+/// A set groups the variants of one kind of ground -- "Cliff Set", "Shore
+/// Pieces". Tile ids in IsoMapPack5 are a single sequence running across all
+/// sets in declaration order, so a set owns the ids [firstId, firstId+count).
+class TileSet {
+    string name;
+    string fileName;
+    int count;
+    int firstId;
+
+    string Name() { return this.name; }
+    string FileName() { return this.fileName; }
+    int Count() { return this.count; }
+    int FirstId() { return this.firstId; }
+    bool Contains(int tileId) {
+        return tileId >= this.firstId && tileId < this.firstId + this.count;
+    }
+}
+
+/// <summary>A theater's terrain art: the tile set table from its .ini plus the
+/// TMP templates the sets name, decoded to RGBA on demand.</summary>
+///
+/// Templates are cached because a map draws the same few hundred tiles over
+/// and over, and each decode is a palette conversion over ~1800 pixels.
+class Theater {
+    Vfs vfs;
+    string name;
+    string extension;
+    Palette palette;
+    List<TileSet> sets;
+    int tileCount;
+
+    // Parallel caches keyed by tile id; a null texture means "looked up and
+    // not present", which is distinct from "not looked up yet".
+    List<int> cacheIds;
+    List<Texture> cacheTex;
+    // Where each cached texture sits relative to the cell apex; non-zero when
+    // a cliff's extra art reaches above or left of the diamond.
+    List<int> cacheOffX;
+    List<int> cacheOffY;
+
+    /// <summary>The theater matching a map's Theater= value. Falls back to
+    /// temperate, which every install has.</summary>
+    static Theater Load(Vfs vfs, AssetDb db, string theaterName) {
+        Theater t = new Theater();
+        t.vfs = vfs;
+        t.name = theaterName.ToUpper();
+        t.sets = new List<TileSet>();
+        t.cacheIds = new List<int>();
+        t.cacheTex = new List<Texture>();
+        t.cacheOffX = new List<int>();
+        t.cacheOffY = new List<int>();
+
+        string ini = Theater.IniNameFor(t.name);
+        t.extension = Theater.ExtensionFor(t.name);
+        t.palette = db.PaletteNamed(Theater.PaletteNameFor(t.name));
+
+        List<int> len = new List<int>();
+        len.Add(0);
+        string raw = vfs.Read(ini, len);
+        if (len[0] == 0) { return t; }
+        IniDocument doc = IniParser.Parse(raw);
+        Theater.free(raw);
+
+        int setIndex = 0;
+        int nextId = 0;
+        while (true) {
+            IniSection s = doc.Section("TileSet" + Theater.Pad4(setIndex));
+            if (s == null) { break; }
+            TileSet ts = new TileSet();
+            ts.name = s.GetOr("SetName", "");
+            ts.fileName = s.GetOr("FileName", "");
+            ts.count = s.GetIntOr("TilesInSet", 0);
+            ts.firstId = nextId;
+            t.sets.Add(ts);
+            nextId = nextId + ts.count;
+            setIndex = setIndex + 1;
+        }
+        t.tileCount = nextId;
+        return t;
+    }
+
+    [DllImport("crt")]
+    static extern void free(string p);
+
+    static string Pad4(int n) {
+        string s = Convert.ToString(n);
+        while (s.Length < 4) { s = "0" + s; }
+        return s;
+    }
+
+    // Theater art is keyed off three names that do not follow one rule, so
+    // they are spelled out rather than derived.
+    static string IniNameFor(string theater) {
+        if (theater == "SNOW") { return "SNOW.INI"; }
+        if (theater == "URBAN") { return "URBAN.INI"; }
+        if (theater == "NEWURBAN") { return "URBANN.INI"; }
+        if (theater == "LUNAR") { return "LUNAR.INI"; }
+        if (theater == "DESERT") { return "DESERT.INI"; }
+        return "TEMPERAT.INI";
+    }
+
+    /// The suffix of a theater's TMP files: CLEAR01.TEM for temperate,
+    /// CLEAR01.SNO for snow, and so on.
+    static string ExtensionFor(string theater) {
+        if (theater == "SNOW") { return ".SNO"; }
+        if (theater == "URBAN") { return ".URB"; }
+        if (theater == "NEWURBAN") { return ".UBN"; }
+        if (theater == "LUNAR") { return ".LUN"; }
+        if (theater == "DESERT") { return ".DES"; }
+        return ".TEM";
+    }
+
+    static string PaletteNameFor(string theater) {
+        if (theater == "SNOW") { return "ISOSNO.PAL"; }
+        if (theater == "URBAN") { return "ISOURB.PAL"; }
+        if (theater == "NEWURBAN") { return "ISOUBN.PAL"; }
+        if (theater == "LUNAR") { return "ISOLUN.PAL"; }
+        if (theater == "DESERT") { return "ISODES.PAL"; }
+        return "ISOTEM.PAL";
+    }
+
+    string Name() { return this.name; }
+    Palette TilePalette() { return this.palette; }
+    int SetCount() { return this.sets.Count; }
+    TileSet SetAt(int i) { return this.sets[i]; }
+    int TileCount() { return this.tileCount; }
+
+    /// Cell records use 0xFFFF to mean "no tile chosen", which the engine draws
+    /// as plain clear terrain rather than as a hole -- on MP02T2 that is 1551
+    /// cells, and treating it as missing art punches black diamonds through the
+    /// middle of the map.
+    static int ClearTile = 0xFFFF;
+
+    /// <summary>The set owning a tile id, or null when the id is out of range.
+    /// Sets are contiguous and in order, so this is a scan over ~80 entries.</summary>
+    static int NormalizeTile(int tileId) {
+        if (tileId == Theater.ClearTile) { return 0; }
+        return tileId;
+    }
+
+    TileSet SetForTile(int tileId) {
+        int id = Theater.NormalizeTile(tileId);
+        int i = 0;
+        while (i < this.sets.Count) {
+            if (this.sets[i].Contains(id)) { return this.sets[i]; }
+            i = i + 1;
+        }
+        return null;
+    }
+
+    /// <summary>The TMP file backing a tile id, e.g. tile 49 -> "CLIFF01.TEM".
+    /// The variant number is the tile's offset within its set, one-based.</summary>
+    string FileForTile(int tileId) {
+        TileSet ts = this.SetForTile(tileId);
+        if (ts == null) { return ""; }
+        if (ts.FileName().Length == 0) { return ""; }
+        int variant = Theater.NormalizeTile(tileId) - ts.FirstId() + 1;
+        string num = Convert.ToString(variant);
+        if (variant < 10) { num = "0" + num; }
+        return ts.FileName().ToUpper() + num + this.extension;
+    }
+
+    /// <summary>A tile's graphic as RGBA, or null when the theater has no art
+    /// for it. Cached; the caller must not free the result.</summary>
+    ///
+    /// The base diamond and the extra (cliff/bridge overhang) graphic are
+    /// composited into one texture, with the origin shifted so the extra art
+    /// fits: a cliff's overhang reaches above and left of the diamond, and
+    /// dropping it leaves a transparent hole wherever raised ground rose above
+    /// its neighbours. DrawOffsetX/Y report the shift so the renderer can
+    /// place the result against the cell's apex.
+    Texture TileTexture(int tileId, int subTile) {
+        int key = tileId * 256 + subTile;
+        int i = 0;
+        while (i < this.cacheIds.Count) {
+            if (this.cacheIds[i] == key) { return this.cacheTex[i]; }
+            i = i + 1;
+        }
+
+        Texture tex = null;
+        int offX = 0;
+        int offY = 0;
+        // The clear-terrain sentinel keeps whatever subtile the cell recorded,
+        // which need not exist in CLEAR01; fall back to the first.
+        int sub = subTile;
+        if (tileId == Theater.ClearTile) { sub = 0; }
+        string file = this.FileForTile(tileId);
+        if (file.Length > 0 && this.palette != null) {
+            List<int> len = new List<int>();
+            len.Add(0);
+            string raw = this.vfs.Read(file, len);
+            if (len[0] > 0) {
+                TmpTemplate tmp = TmpTemplate.Parse(raw, len[0]);
+                if (sub < tmp.TileCount()) {
+                    TmpTile t = tmp.TileAt(sub);
+                    int baseW = tmp.TileWidth();
+                    int baseH = tmp.TileHeight();
+
+                    // Union of the diamond (at 0,0) and the extra rectangle.
+                    int minX = 0;
+                    int minY = 0;
+                    int maxX = baseW;
+                    int maxY = baseH;
+                    if (t != null && t.HasExtra()) {
+                        int ex = t.ExtraOffsetX();
+                        int ey = t.ExtraOffsetY();
+                        if (ex < minX) { minX = ex; }
+                        if (ey < minY) { minY = ey; }
+                        if (ex + t.ExtraWidth() > maxX) { maxX = ex + t.ExtraWidth(); }
+                        if (ey + t.ExtraHeight() > maxY) { maxY = ey + t.ExtraHeight(); }
+                    }
+                    offX = minX;
+                    offY = minY;
+
+                    tex = Texture.Create(maxX - minX, maxY - minY);
+                    // The extra art goes down first: the diamond is the ground
+                    // surface and has to sit on top of the overhang behind it.
+                    if (t != null && t.HasExtra()) {
+                        string ei = tmp.DecodeExtra(sub);
+                        Texture etex = Texture.FromIndexed(ei, t.ExtraWidth(),
+                                                           t.ExtraHeight(), this.palette);
+                        tex.Blit(etex, t.ExtraOffsetX() - minX, t.ExtraOffsetY() - minY);
+                        etex.Close();
+                        Theater.free(ei);
+                    }
+                    string idx = tmp.DecodeTile(sub);
+                    Texture btex = Texture.FromIndexed(idx, baseW, baseH, this.palette);
+                    tex.Blit(btex, 0 - minX, 0 - minY);
+                    btex.Close();
+                    Theater.free(idx);
+                }
+                // TmpTemplate reads through the buffer, so it can only be
+                // released once the tile is decoded.
+                Theater.free(raw);
+            }
+        }
+
+        this.cacheIds.Add(key);
+        this.cacheTex.Add(tex);
+        this.cacheOffX.Add(offX);
+        this.cacheOffY.Add(offY);
+        return tex;
+    }
+
+    /// <summary>Where a cached tile's texture sits relative to the cell apex.
+    /// Non-zero when a cliff's overhang reaches above or left of the diamond.</summary>
+    int DrawOffsetX(int tileId, int subTile) {
+        int i = this.CacheSlot(tileId, subTile);
+        if (i < 0) { return 0; }
+        return this.cacheOffX[i];
+    }
+
+    int DrawOffsetY(int tileId, int subTile) {
+        int i = this.CacheSlot(tileId, subTile);
+        if (i < 0) { return 0; }
+        return this.cacheOffY[i];
+    }
+
+    int CacheSlot(int tileId, int subTile) {
+        int key = tileId * 256 + subTile;
+        int i = 0;
+        while (i < this.cacheIds.Count) {
+            if (this.cacheIds[i] == key) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    void Close() {
+        int i = 0;
+        while (i < this.cacheTex.Count) {
+            if (this.cacheTex[i] != null) { this.cacheTex[i].Close(); }
+            i = i + 1;
+        }
+        this.cacheIds = new List<int>();
+        this.cacheTex = new List<Texture>();
+        this.cacheOffX = new List<int>();
+        this.cacheOffY = new List<int>();
+    }
+}

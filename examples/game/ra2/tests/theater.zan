@@ -1,0 +1,102 @@
+// Theater tile-set bookkeeping: the id ranges a set owns, and the TMP file
+// name a tile id resolves to.
+//
+// Clean-room: the theater .ini below is written to a scratch directory and
+// mounted as a Vfs directory mount. No game data is read -- data/ is the
+// user's own install and tests never touch it.
+using System;
+using System.Collections.Generic;
+using System.IO;
+using Ra2.Assets;
+using Ra2.Formats;
+
+namespace T;
+
+class Program {
+    // Tile ids run as one sequence across sets in declaration order, so these
+    // three sets own 0..1, 2..5 and 6..6. A set with no FileName is legal and
+    // still consumes ids -- it just has no art.
+    static string TemperateIni() {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("[General]\n");
+        sb.Append("Name=Temperate\n");
+        sb.Append("\n[TileSet0000]\n");
+        sb.Append("SetName=Clear\n");
+        sb.Append("FileName=clear\n");
+        sb.Append("TilesInSet=2\n");
+        sb.Append("\n[TileSet0001]\n");
+        sb.Append("SetName=Cliffs\n");
+        sb.Append("FileName=cliff\n");
+        sb.Append("TilesInSet=4\n");
+        sb.Append("\n[TileSet0002]\n");
+        sb.Append("SetName=Nameless\n");
+        sb.Append("TilesInSet=1\n");
+        return sb.ToString();
+    }
+
+    static void ReportFile(Theater t, string label, int tileId) {
+        string f = t.FileForTile(tileId);
+        if (f.Length == 0) { f = "-"; }
+        Console.WriteLine(label + "=" + f);
+    }
+
+    static void Main() {
+        string dir = "build/ra2_test_theater_data";
+        Directory.CreateDirectory(dir);
+        File.WriteAllText(dir + "/TEMPERAT.INI", Program.TemperateIni());
+
+        Vfs vfs = Vfs.Create();
+        vfs.MountDirectory(dir);
+        AssetDb db = AssetDb.Load(vfs);
+
+        Theater t = Theater.Load(vfs, db, "temperate");
+        Console.WriteLine("name=" + t.Name());
+        Console.WriteLine("sets=" + Convert.ToString(t.SetCount()));
+        Console.WriteLine("tiles=" + Convert.ToString(t.TileCount()));
+
+        // Each set owns a contiguous half-open range starting where the
+        // previous one ended.
+        int i = 0;
+        while (i < t.SetCount()) {
+            TileSet s = t.SetAt(i);
+            Console.WriteLine("set" + Convert.ToString(i) + "=" + s.Name()
+                + " first=" + Convert.ToString(s.FirstId())
+                + " count=" + Convert.ToString(s.Count()));
+            i = i + 1;
+        }
+
+        // The variant number is the tile's one-based offset within its set, so
+        // the first id of each set is 01.
+        Program.ReportFile(t, "f0", 0);
+        Program.ReportFile(t, "f1", 1);
+        Program.ReportFile(t, "f2", 2);
+        Program.ReportFile(t, "f5", 5);
+        // A set declared without FileName has no art.
+        Program.ReportFile(t, "f6", 6);
+        // Past the last set entirely.
+        Program.ReportFile(t, "f99", 99);
+
+        // 0xFFFF means "clear ground", not "missing art": it normalizes to the
+        // first tile so the map draws terrain rather than a hole.
+        Program.ReportFile(t, "fclear", 0xFFFF);
+
+        // Set lookup mirrors the ranges above.
+        Console.WriteLine("owner4=" + t.SetForTile(4).Name());
+        if (t.SetForTile(99) == null) { Console.WriteLine("owner99=null"); }
+
+        // A theater whose .ini is absent loads empty rather than failing, so a
+        // map naming an uninstalled theater still opens.
+        Theater missing = Theater.Load(vfs, db, "lunar");
+        Console.WriteLine("missing_sets=" + Convert.ToString(missing.SetCount()));
+        Console.WriteLine("missing_tiles=" + Convert.ToString(missing.TileCount()));
+
+        // Unknown theater names fall back to temperate's ini and extension.
+        Theater fallback = Theater.Load(vfs, db, "nosuch");
+        Console.WriteLine("fallback_sets=" + Convert.ToString(fallback.SetCount()));
+        Program.ReportFile(fallback, "fallback_f2", 2);
+
+        t.Close();
+        File.Delete(dir + "/TEMPERAT.INI");
+        Directory.Delete(dir);
+    }
+}

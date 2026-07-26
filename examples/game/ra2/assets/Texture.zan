@@ -1,0 +1,114 @@
+using System;
+using System.Collections.Generic;
+using Ra2.Formats;
+
+namespace Ra2.Assets;
+
+/// <summary>An RGBA8888 image in memory, four bytes per pixel.</summary>
+///
+/// Palette index 0 is transparent everywhere in RA2's art, so it becomes a
+/// fully transparent pixel rather than whatever colour sits in slot 0.
+class Texture {
+    [DllImport("crt")]
+    static extern string calloc(int count, int size);
+    [DllImport("crt")]
+    static extern void free(string p);
+
+    string pixels;
+    int width;
+    int height;
+
+    static Texture Create(int width, int height) {
+        Texture t = new Texture();
+        t.width = width;
+        t.height = height;
+        t.pixels = Texture.calloc(width * height * 4 + 1, 1);
+        return t;
+    }
+
+    /// <summary>Converts an 8-bit palette-index buffer to RGBA.</summary>
+    static Texture FromIndexed(string indices, int width, int height, Palette pal) {
+        Texture t = Texture.Create(width, height);
+        int n = width * height;
+        int i = 0;
+        while (i < n) {
+            int idx = indices[i] & 0xFF;
+            if (idx != 0) {
+                t.SetPixel(i, pal.R8(idx), pal.G8(idx), pal.B8(idx), 255);
+            }
+            i = i + 1;
+        }
+        return t;
+    }
+
+    /// <summary>Converts a PCX image, which carries its own 8-bit palette.</summary>
+    ///
+    /// Unlike sprite art, a shell backdrop is fully opaque -- index 0 is a real
+    /// colour there, not transparency -- so every pixel is written.
+    static Texture FromPcx(PcxImage img) {
+        Texture t = Texture.Create(img.Width(), img.Height());
+        int n = img.Width() * img.Height();
+        string idx = img.Indices();
+        int i = 0;
+        while (i < n) {
+            int v = idx[i] & 0xFF;
+            t.SetPixel(i, img.R(v), img.G(v), img.B(v), 255);
+            i = i + 1;
+        }
+        return t;
+    }
+
+    int Width() { return this.width; }
+    int Height() { return this.height; }
+    string Pixels() { return this.pixels; }
+    int ByteLength() { return this.width * this.height * 4; }
+
+    void SetPixel(int at, int r, int g, int b, int a) {
+        int o = at * 4;
+        this.pixels[o] = (char)r;
+        this.pixels[o + 1] = (char)g;
+        this.pixels[o + 2] = (char)b;
+        this.pixels[o + 3] = (char)a;
+    }
+
+    /// <summary>The packed 0xAARRGGBB value of a pixel.</summary>
+    int PixelAt(int x, int y) {
+        if (x < 0 || y < 0 || x >= this.width || y >= this.height) { return 0; }
+        int o = (y * this.width + x) * 4;
+        return ((this.pixels[o + 3] & 0xFF) << 24) | ((this.pixels[o] & 0xFF) << 16)
+             | ((this.pixels[o + 1] & 0xFF) << 8) | (this.pixels[o + 2] & 0xFF);
+    }
+
+    /// <summary>Copies another texture in at (dx, dy), skipping transparent
+    /// pixels so overlapping sprites composite correctly.</summary>
+    void Blit(Texture src, int dx, int dy) {
+        int y = 0;
+        while (y < src.Height()) {
+            int x = 0;
+            while (x < src.Width()) {
+                int tx = dx + x;
+                int ty = dy + y;
+                if (tx >= 0 && ty >= 0 && tx < this.width && ty < this.height) {
+                    int so = (y * src.Width() + x) * 4;
+                    string sp = src.Pixels();
+                    if ((sp[so + 3] & 0xFF) != 0) {
+                        int to = (ty * this.width + tx) * 4;
+                        this.pixels[to] = (char)(sp[so] & 0xFF);
+                        this.pixels[to + 1] = (char)(sp[so + 1] & 0xFF);
+                        this.pixels[to + 2] = (char)(sp[so + 2] & 0xFF);
+                        this.pixels[to + 3] = (char)(sp[so + 3] & 0xFF);
+                    }
+                }
+                x = x + 1;
+            }
+            y = y + 1;
+        }
+    }
+
+    void Close() {
+        Texture.free(this.pixels);
+        this.pixels = "";
+        this.width = 0;
+        this.height = 0;
+    }
+}
