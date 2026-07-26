@@ -588,6 +588,14 @@ EXPORT i64 zan_gui_window_visible(i64 hwnd_val) {
     return 1;
 }
 
+/* 1 while the window has keyboard focus; ambient animations idle down to a
+ * slow heartbeat while this reports 0, so a background IDE costs almost
+ * nothing. */
+EXPORT i64 zan_gui_window_focused(i64 hwnd_val) {
+    SDL_Window *win = (SDL_Window *)(intptr_t)hwnd_val;
+    return (SDL_GetWindowFlags(win) & SDL_WINDOW_INPUT_FOCUS) ? 1 : 0;
+}
+
 EXPORT i64 zan_gui_titlebar_height(void) { return g_titlebar_h; }
 EXPORT i64 zan_gui_caption_button_width(void) { return g_btn_w; }
 
@@ -759,6 +767,46 @@ static void fprof_record(Uint64 t_enter, Uint64 t_upload, Uint64 t_present_end) 
     g_fp_last_end = t_present_end;
 }
 
+/* Dirty rects for the next present: an animation frame that only repainted a
+ * few hundred small particles has no reason to re-upload the whole surface
+ * (several MB on a large window, and the single most expensive thing an idle
+ * effect tick does). The caller announces the rects it touched; the present
+ * uploads only those and then blits the texture as usual. The list is emptied
+ * by every present, so a caller that announces nothing gets a full upload. */
+#define ZAN_DIRTY_MAX 512
+static SDL_Rect g_dirty[ZAN_DIRTY_MAX];
+static int g_dirty_count;
+static int g_dirty_overflow;
+
+EXPORT i64 zan_gui_present_dirty_add(i64 x, i64 y, i64 w, i64 h) {
+    if (w <= 0 || h <= 0) return 0;
+    if (g_dirty_count >= ZAN_DIRTY_MAX) { g_dirty_overflow = 1; return 0; }
+    g_dirty[g_dirty_count].x = (int)x;
+    g_dirty[g_dirty_count].y = (int)y;
+    g_dirty[g_dirty_count].w = (int)w;
+    g_dirty[g_dirty_count].h = (int)h;
+    g_dirty_count++;
+    return 0;
+}
+
+static void sdl_upload(zan_surface_t *s, SDL_Texture *tex) {
+    if (g_dirty_count == 0 || g_dirty_overflow) {
+        SDL_UpdateTexture(tex, NULL, s->pixels, s->width * 4);
+        return;
+    }
+    for (int i = 0; i < g_dirty_count; i++) {
+        SDL_Rect r = g_dirty[i];
+        if (r.x < 0) { r.w += r.x; r.x = 0; }
+        if (r.y < 0) { r.h += r.y; r.y = 0; }
+        if (r.x + r.w > s->width)  r.w = s->width - r.x;
+        if (r.y + r.h > s->height) r.h = s->height - r.y;
+        if (r.w <= 0 || r.h <= 0) continue;
+        const unsigned char *px = (const unsigned char *)s->pixels
+            + (size_t)r.y * (size_t)s->width * 4 + (size_t)r.x * 4;
+        SDL_UpdateTexture(tex, &r, px, s->width * 4);
+    }
+}
+
 EXPORT i64 zan_gui_present(i64 hwnd_val, i64 surface_id) {
     SDL_Window *win = (SDL_Window *)(intptr_t)hwnd_val;
     if (surface_id < 0 || surface_id >= g_surface_count ||
@@ -771,6 +819,9 @@ EXPORT i64 zan_gui_present(i64 hwnd_val, i64 surface_id) {
     Uint64 t_enter = SDL_GetPerformanceCounter();
 
     if (!rec->tex || rec->tw != s->width || rec->th != s->height) {
+        /* A fresh texture holds no previous frame to patch. */
+        g_dirty_count = 0;
+        g_dirty_overflow = 1;
         if (rec->tex) SDL_DestroyTexture(rec->tex);
         rec->tex = SDL_CreateTexture(rec->ren, SDL_PIXELFORMAT_ARGB8888,
                                      SDL_TEXTUREACCESS_STREAMING,
@@ -779,7 +830,9 @@ EXPORT i64 zan_gui_present(i64 hwnd_val, i64 surface_id) {
         SDL_SetTextureScaleMode(rec->tex, SDL_SCALEMODE_NEAREST);
         rec->tw = s->width; rec->th = s->height;
     }
-    SDL_UpdateTexture(rec->tex, NULL, s->pixels, s->width * 4);
+    sdl_upload(s, rec->tex);
+    g_dirty_count = 0;
+    g_dirty_overflow = 0;
     Uint64 t_upload = SDL_GetPerformanceCounter() - t_enter;
 
     /* Clear the (possibly larger) window to the canvas background so a live

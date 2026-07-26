@@ -634,6 +634,25 @@ EXPORT i64 zan_gui_client_height(i64 hwnd_val) {
     return w ? w->h : g_win_h;
 }
 
+/* Dirty rects for the next present -- see the SDL backend: an effect tick that
+ * only touched a few hundred particles blits just those instead of the whole
+ * surface. Emptied by every present, so announcing nothing means a full blit. */
+#define ZAN_DIRTY_MAX 512
+static int g_dirty[ZAN_DIRTY_MAX * 4];
+static int g_dirty_count;
+static int g_dirty_overflow;
+
+EXPORT i64 zan_gui_present_dirty_add(i64 x, i64 y, i64 w, i64 h) {
+    if (w <= 0 || h <= 0) return 0;
+    if (g_dirty_count >= ZAN_DIRTY_MAX) { g_dirty_overflow = 1; return 0; }
+    g_dirty[g_dirty_count * 4 + 0] = (int)x;
+    g_dirty[g_dirty_count * 4 + 1] = (int)y;
+    g_dirty[g_dirty_count * 4 + 2] = (int)w;
+    g_dirty[g_dirty_count * 4 + 3] = (int)h;
+    g_dirty_count++;
+    return 0;
+}
+
 EXPORT i64 zan_gui_present(i64 hwnd_val, i64 surface_id) {
     if (!g_display) return 1;
     zan_lwin_t *w = lwin_find((Window)(intptr_t)hwnd_val);
@@ -648,6 +667,9 @@ EXPORT i64 zan_gui_present(i64 hwnd_val, i64 surface_id) {
     /* Blit through the window's own off-screen Pixmap (double buffering) so
      * resizes and expose events never show a half-drawn or torn frame. */
     if (!w->backbuf || w->backbuf_w != s->width || w->backbuf_h != s->height) {
+        /* A fresh back buffer holds no previous frame to patch. */
+        g_dirty_count = 0;
+        g_dirty_overflow = 1;
         if (w->backbuf) XFreePixmap(g_display, w->backbuf);
         w->backbuf = XCreatePixmap(g_display, w->xid,
                                    (unsigned)s->width, (unsigned)s->height, depth);
@@ -659,13 +681,33 @@ EXPORT i64 zan_gui_present(i64 hwnd_val, i64 surface_id) {
         depth, ZPixmap, 0, (char *)s->pixels, (unsigned)s->width, (unsigned)s->height, 32, 0);
     if (img) {
         img->byte_order = LSBFirst;
-        XPutImage(g_display, w->backbuf, w->gc, img, 0, 0, 0, 0,
-                  (unsigned)s->width, (unsigned)s->height);
+        if (g_dirty_count > 0 && !g_dirty_overflow) {
+            for (int i = 0; i < g_dirty_count; i++) {
+                int rx = g_dirty[i * 4 + 0];
+                int ry = g_dirty[i * 4 + 1];
+                int rw = g_dirty[i * 4 + 2];
+                int rh = g_dirty[i * 4 + 3];
+                if (rx < 0) { rw += rx; rx = 0; }
+                if (ry < 0) { rh += ry; ry = 0; }
+                if (rx + rw > s->width)  rw = s->width - rx;
+                if (ry + rh > s->height) rh = s->height - ry;
+                if (rw <= 0 || rh <= 0) continue;
+                XPutImage(g_display, w->backbuf, w->gc, img, rx, ry, rx, ry,
+                          (unsigned)rw, (unsigned)rh);
+                XCopyArea(g_display, w->backbuf, w->xid, w->gc, rx, ry,
+                          (unsigned)rw, (unsigned)rh, rx, ry);
+            }
+        } else {
+            XPutImage(g_display, w->backbuf, w->gc, img, 0, 0, 0, 0,
+                      (unsigned)s->width, (unsigned)s->height);
+            XCopyArea(g_display, w->backbuf, w->xid, w->gc, 0, 0,
+                      (unsigned)s->width, (unsigned)s->height, 0, 0);
+        }
         img->data = NULL;
         XDestroyImage(img);
-        XCopyArea(g_display, w->backbuf, w->xid, w->gc, 0, 0,
-                  (unsigned)s->width, (unsigned)s->height, 0, 0);
     }
+    g_dirty_count = 0;
+    g_dirty_overflow = 0;
     XFlush(g_display);
     return 0;
 }

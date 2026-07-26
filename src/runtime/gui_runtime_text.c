@@ -521,9 +521,35 @@ EXPORT i64 zan_gui_disable_glass(i64 hwnd_val) {
     return 0;
 }
 
+/* Dirty rects for the next present: an animation frame that only repainted a
+ * few hundred small particles has no reason to push the whole surface through
+ * GDI (several MB on a large window). The caller announces the rects it
+ * touched and they are consumed -- and cleared -- by the next blit, so a
+ * caller that announces nothing (WM_PAINT, a full repaint) gets everything. */
+#define ZAN_DIRTY_MAX 512
+static RECT g_dirty[ZAN_DIRTY_MAX];
+static int g_dirty_count;
+static int g_dirty_overflow;
+
+EXPORT i64 zan_gui_present_dirty_add(i64 x, i64 y, i64 w, i64 h) {
+    if (w <= 0 || h <= 0) return 0;
+    if (g_dirty_count >= ZAN_DIRTY_MAX) { g_dirty_overflow = 1; return 0; }
+    g_dirty[g_dirty_count].left = (LONG)x;
+    g_dirty[g_dirty_count].top = (LONG)y;
+    g_dirty[g_dirty_count].right = (LONG)(x + w);
+    g_dirty[g_dirty_count].bottom = (LONG)(y + h);
+    g_dirty_count++;
+    return 0;
+}
+
 static void blit_surface_to_hwnd(HWND hwnd, zan_surface_t *s) {
     if (!s) return;
-    if (g_glass_on) { present_layered(hwnd, s); return; }
+    if (g_glass_on) {
+        g_dirty_count = 0;
+        g_dirty_overflow = 0;
+        present_layered(hwnd, s);
+        return;
+    }
     HDC hdc = GetDC(hwnd);
     BITMAPINFO bmi = {0};
     bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
@@ -536,8 +562,28 @@ static void blit_surface_to_hwnd(HWND hwnd, zan_surface_t *s) {
      * rubbery/blurry during a drag-resize). Any client area beyond the frame is
      * filled with the canvas background so a grow-resize shows solid bg in the
      * new region until the app thread repaints it crisply. */
-    SetDIBitsToDevice(hdc, 0, 0, (DWORD)s->width, (DWORD)s->height,
-        0, 0, 0, (UINT)s->height, s->pixels, &bmi, DIB_RGB_COLORS);
+    if (g_dirty_count > 0 && !g_dirty_overflow) {
+        for (int i = 0; i < g_dirty_count; i++) {
+            int rx = (int)g_dirty[i].left;
+            int ry = (int)g_dirty[i].top;
+            int rw = (int)(g_dirty[i].right - g_dirty[i].left);
+            int rh = (int)(g_dirty[i].bottom - g_dirty[i].top);
+            if (rx < 0) { rw += rx; rx = 0; }
+            if (ry < 0) { rh += ry; ry = 0; }
+            if (rx + rw > (int)s->width)  rw = (int)s->width - rx;
+            if (ry + rh > (int)s->height) rh = (int)s->height - ry;
+            if (rw <= 0 || rh <= 0) continue;
+            /* Source rows are counted from the bottom of the top-down DIB. */
+            SetDIBitsToDevice(hdc, rx, ry, (DWORD)rw, (DWORD)rh,
+                rx, (int)s->height - (ry + rh), 0, (UINT)s->height,
+                s->pixels, &bmi, DIB_RGB_COLORS);
+        }
+    } else {
+        SetDIBitsToDevice(hdc, 0, 0, (DWORD)s->width, (DWORD)s->height,
+            0, 0, 0, (UINT)s->height, s->pixels, &bmi, DIB_RGB_COLORS);
+    }
+    g_dirty_count = 0;
+    g_dirty_overflow = 0;
     if (g_window_width > (int)s->width || g_window_height > (int)s->height) {
         HBRUSH br = CreateSolidBrush(RGB((g_bg_color >> 16) & 0xFF,
                                          (g_bg_color >> 8) & 0xFF,
@@ -1002,6 +1048,12 @@ EXPORT i64 zan_gui_window_visible(i64 hwnd_val) {
     HWND hwnd = (HWND)(intptr_t)hwnd_val;
     if (IsIconic(hwnd) || !IsWindowVisible(hwnd)) return 0;
     return 1;
+}
+
+/* 1 while the window is the foreground window -- see the SDL backend. */
+EXPORT i64 zan_gui_window_focused(i64 hwnd_val) {
+    HWND hwnd = (HWND)(intptr_t)hwnd_val;
+    return (hwnd && GetForegroundWindow() == hwnd) ? 1 : 0;
 }
 
 EXPORT i64 zan_gui_titlebar_height(void) { return g_titlebar_h; }

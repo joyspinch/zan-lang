@@ -821,6 +821,18 @@ EXPORT i64 zan_gui_window_visible(i64 hwnd_val) {
     return 1;
 }
 
+/* 1 while the window holds the input focus; ambient animations idle down to a
+ * slow heartbeat while this reports 0, so a background window costs almost
+ * nothing. */
+EXPORT i64 zan_gui_window_focused(i64 hwnd_val) {
+    Window xid = hwnd_val ? (Window)(intptr_t)hwnd_val : g_x11_window;
+    if (!g_display || !xid) return 0;
+    Window focused = 0;
+    int revert = 0;
+    if (!XGetInputFocus(g_display, &focused, &revert)) return 1;
+    return focused == xid ? 1 : 0;
+}
+
 EXPORT i64 zan_gui_set_topmost(i64 hwnd_val, i64 on) {
     Window xid = hwnd_val ? (Window)(intptr_t)hwnd_val : g_x11_window;
     x11_wm_state(xid, x11_atom("_NET_WM_STATE_ABOVE"), 0, on ? 1 : 0);

@@ -548,6 +548,7 @@ class App {
             return true;
         }
         Canvas fc = canvas;
+        List<int> repaired = fxDamage;
         bool ok;
         if (fxDamage == null) {
             ok = fc.RestoreRect(0, 0, fc.Width(), fc.Height(), 7);
@@ -569,10 +570,37 @@ class App {
         BackdropFx.Render(fc, this.EffectiveFx(), 0, 0, fc.Width(), fc.Height(),
                           Window.GetTickMs(), theme, dpiScale);
         fxDamage = BackdropFx.TakeDamage();
+        // Nothing outside the repaired pixels and the ones this effect frame
+        // painted has changed, so the present uploads only those -- pushing the
+        // whole surface is what an idle effect tick used to spend all its time
+        // on. A full restore (no previous damage) still presents everything.
+        if (repaired != null) {
+            this.MarkPresentDirty(repaired);
+            this.MarkPresentDirty(fxDamage);
+        }
         window.Present(canvas);
         lastPresentMs = Window.GetTickMs();
-        fxNextMs = lastPresentMs + BackdropFx.IntervalMs(this.EffectiveFx());
+        fxNextMs = lastPresentMs + this.FxIntervalMs();
         return true;
+    }
+
+    /// How long until the next effect tick. A window nobody is looking at (no
+    /// input focus) drifts at a quarter of the rate: the skin still lives, but
+    /// an IDE left open behind another window stops costing a redraw a frame.
+    int FxIntervalMs() {
+        int ms = BackdropFx.IntervalMs(this.EffectiveFx());
+        if (!window.IsFocused()) { ms = ms * 4; }
+        return ms;
+    }
+
+    /// Announces a flat [x,y,w,h,...] damage list to the next Present.
+    void MarkPresentDirty(List<int> rects) {
+        if (rects == null) { return; }
+        int i = 0;
+        while (i + 3 < rects.Count) {
+            window.PresentDirty(rects[i], rects[i + 1], rects[i + 2], rects[i + 3]);
+            i = i + 4;
+        }
     }
 
     int ChromeButtonCount() {
@@ -1550,7 +1578,7 @@ class App {
             BackdropFx.Render(fc, this.EffectiveFx(), 0, 0, fc.Width(), fc.Height(),
                               Window.GetTickMs(), theme, dpiScale);
             fxDamage = BackdropFx.TakeDamage();
-            fxNextMs = Window.GetTickMs() + BackdropFx.IntervalMs(this.EffectiveFx());
+            fxNextMs = Window.GetTickMs() + this.FxIntervalMs();
             if (!window.IsVisible()) { fxNextMs = -1; }
         } else {
             fxNextMs = -1;

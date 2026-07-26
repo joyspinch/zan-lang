@@ -34,6 +34,9 @@ EXPORT i64 zan_gui_event_hwnd(void) { return 0; }
 EXPORT i64 zan_gui_client_width(i64 h) { (void)h; return 0; }
 EXPORT i64 zan_gui_client_height(i64 h) { (void)h; return 0; }
 EXPORT i64 zan_gui_present(i64 h, i64 s) { (void)h;(void)s; return 1; }
+EXPORT i64 zan_gui_present_dirty_add(i64 x, i64 y, i64 w, i64 h) {
+    (void)x;(void)y;(void)w;(void)h; return 0;
+}
 EXPORT i64 zan_gui_set_title(i64 h, const char *t) { (void)h;(void)t; return 0; }
 EXPORT i64 zan_gui_set_cursor(i64 c) { (void)c; return 0; }
 EXPORT i64 zan_gui_get_tick_ms(void) { return 0; }
@@ -90,6 +93,7 @@ EXPORT i64 zan_gui_minimize(i64 hwnd_val) { (void)hwnd_val; return 0; }
 EXPORT i64 zan_gui_toggle_maximize(i64 hwnd_val) { (void)hwnd_val; return 0; }
 EXPORT i64 zan_gui_is_maximized(i64 hwnd_val) { (void)hwnd_val; return 0; }
 EXPORT i64 zan_gui_window_visible(i64 hwnd_val) { (void)hwnd_val; return 1; }
+EXPORT i64 zan_gui_window_focused(i64 hwnd_val) { (void)hwnd_val; return 1; }
 EXPORT i64 zan_gui_set_topmost(i64 hwnd_val, i64 on) { (void)hwnd_val; (void)on; return 0; }
 EXPORT i64 zan_gui_set_clipboard(const char *utf8) { (void)utf8; return 0; }
 EXPORT const char *zan_gui_get_clipboard(void) { return ""; }

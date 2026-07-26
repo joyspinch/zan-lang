@@ -1033,6 +1033,16 @@ EXPORT i64 zan_gui_window_visible(i64 hwnd_val) {
     }
 }
 
+/* 1 while the window is the key window -- see the X11 backend. */
+EXPORT i64 zan_gui_window_focused(i64 hwnd_val) {
+    zan_mwin_t *mw = mwin_find(hwnd_val);
+    if (!mw && hwnd_val == 0 && g_mwin_count > 0) mw = &g_mwins[0];
+    if (!mw) return 0;
+    @autoreleasepool {
+        return [mw->window isKeyWindow] ? 1 : 0;
+    }
+}
+
 EXPORT i64 zan_gui_set_topmost(i64 hwnd_val, i64 on) {
     zan_mwin_t *mw = mwin_find(hwnd_val);
     if (!mw && hwnd_val == 0 && g_mwin_count > 0) mw = &g_mwins[0];
