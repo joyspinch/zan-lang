@@ -1,0 +1,457 @@
+using System;
+using System.Data;
+using System.Json;
+using System.Net.Http;
+using System.Net.Sockets;
+using System.Security.Cryptography;
+
+namespace System.Data.TDengine;
+
+/// <summary>
+/// Native, dependency-free TDengine connection speaking the REST API that
+/// taosAdapter serves on port 6041 (`POST /rest/sql`).
+///
+/// Unlike the ODBC path this needs nothing installed on the target: the whole
+/// protocol is HTTP plus JSON, so it works from any machine that can reach the
+/// adapter, including cross-compiled targets that have no taosc client library.
+///
+/// TDengine has no client-side statement protocol over REST, so `?`
+/// placeholders are rendered into the SQL text here -- text values are quoted
+/// and escaped, numbers are formatted, NULL is emitted as the keyword. The
+/// renderer only substitutes placeholders found outside string literals, so a
+/// literal question mark in the SQL is left alone.
+///
+/// The host must be given as a dotted IPv4 address (the socket layer does not
+/// resolve names). TDengine has no transactions, so no Begin/Commit is
+/// offered.
+///
+/// Usage:
+///   TDengineConnection db = TDengineConnection.Open("127.0.0.1", 6041,
+///                               "root", "taosdata", "demo");
+///   db.Execute("CREATE TABLE IF NOT EXISTS t (ts TIMESTAMP, v INT)");
+///   db.Execute("INSERT INTO t VALUES (NOW, ?)", DbParams.Create().AddInt(7));
+///   DbResult r = db.Query("SELECT * FROM t WHERE v > ?",
+///                         DbParams.Create().AddInt(3));
+///   db.Close();
+/// </summary>
+class TDengineConnection : IDbExecutor {
+    string host;
+    int port;
+    string auth;          // full Authorization header value
+    string database;      // "" = no default database
+    bool connected;
+    string lastError;
+    int affected;
+
+    TDengineConnection() {
+        this.host = "";
+        this.port = 6041;
+        this.auth = "";
+        this.database = "";
+        this.connected = false;
+        this.lastError = "";
+        this.affected = 0;
+    }
+
+    /// <summary>Opens a connection with HTTP Basic credentials, without
+    /// selecting a database.</summary>
+    static TDengineConnection Open(string host, int port, string user, string password) {
+        return TDengineConnection.Open(host, port, user, password, "");
+    }
+
+    /// <summary>Opens a connection with HTTP Basic credentials and a default
+    /// database (statements may then use unqualified table names). The server
+    /// is contacted once to validate the credentials; check IsConnected().</summary>
+    static TDengineConnection Open(string host, int port, string user, string password,
+                                   string database) {
+        TDengineConnection conn = new TDengineConnection();
+        conn.host = host;
+        conn.port = port;
+        conn.database = database;
+        string cred = user + ":" + password;
+        conn.auth = "Basic " + Base64.Encode(cred, cred.Length);
+        conn.connected = conn.Ping();
+        return conn;
+    }
+
+    /// <summary>Opens a connection with a taosAdapter login token
+    /// (`Authorization: Taosd &lt;token&gt;`), as returned by
+    /// `GET /rest/login/&lt;user&gt;/&lt;password&gt;`.</summary>
+    static TDengineConnection OpenToken(string host, int port, string token, string database) {
+        TDengineConnection conn = new TDengineConnection();
+        conn.host = host;
+        conn.port = port;
+        conn.database = database;
+        conn.auth = "Taosd " + token;
+        conn.connected = conn.Ping();
+        return conn;
+    }
+
+    /// <summary>Runs a trivial statement to check that the adapter answers and
+    /// the credentials are accepted.</summary>
+    bool Ping() {
+        string body = Post("SELECT SERVER_VERSION()");
+        if (body.Length == 0) { return false; }
+        JsonValue root = JsonValue.ParseLenient(body);
+        return !Failed(root);
+    }
+
+    /// <summary>Server version string, or "" when the query fails.</summary>
+    string ServerVersion() {
+        DbResult r = Query("SELECT SERVER_VERSION()");
+        if (r.RowCount() == 0) { return ""; }
+        return r.GetString(0, 0);
+    }
+
+    /// <summary>Selects the default database used by later statements.</summary>
+    void Use(string database) {
+        this.database = database;
+    }
+
+    // ===== SQL text rendering =====
+
+    /// <summary>Escapes a value for a single-quoted TDengine string literal:
+    /// backslash and quote are the only characters the parser treats
+    /// specially inside one.</summary>
+    static string EscapeText(string val) {
+        StringBuilder sb = new StringBuilder();
+        int i = 0;
+        while (i < val.Length) {
+            int c = val[i] & 255;
+            if (c == 92 || c == 39) { sb.Append("\\"); }   // '\' or '\''
+            sb.Append(val.Substring(i, 1));
+            i = i + 1;
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>Renders one parameter as a SQL literal.</summary>
+    static string Literal(DbParams prms, int i) {
+        int kind = prms.KindAt(i);
+        if (kind == DbParams.KindInt) { return Convert.ToString(prms.IntAt(i)); }
+        if (kind == DbParams.KindDouble) { return Convert.ToString(prms.DoubleAt(i)); }
+        if (kind == DbParams.KindText) {
+            return "'" + TDengineConnection.EscapeText(prms.TextAt(i)) + "'";
+        }
+        return "NULL";
+    }
+
+    /// <summary>
+    /// Substitutes `?` placeholders with the escaped parameter literals. Only
+    /// placeholders outside string literals count, so `WHERE note = 'a?b'`
+    /// keeps its question mark; a backslash inside a literal escapes the next
+    /// character, as the server's parser does.
+    ///
+    /// Returns "" when the SQL and the parameter list disagree on the number
+    /// of placeholders, so a mismatch never sends a half-bound statement.
+    /// </summary>
+    static string RenderSql(string sql, DbParams prms) {
+        StringBuilder sb = new StringBuilder();
+        int quote = 0;      // 0 = outside a literal, else the quote byte
+        int used = 0;
+        int i = 0;
+        while (i < sql.Length) {
+            int c = sql[i] & 255;
+            if (quote != 0) {
+                sb.Append(sql.Substring(i, 1));
+                if (c == 92 && i + 1 < sql.Length) {
+                    sb.Append(sql.Substring(i + 1, 1));
+                    i = i + 2;
+                    continue;
+                }
+                if (c == quote) { quote = 0; }
+            } else if (c == 39 || c == 34) {                 // '\'' or '"'
+                quote = c;
+                sb.Append(sql.Substring(i, 1));
+            } else if (c == 63) {                            // '?'
+                if (used >= prms.Count()) { return ""; }
+                sb.Append(TDengineConnection.Literal(prms, used));
+                used = used + 1;
+            } else {
+                sb.Append(sql.Substring(i, 1));
+            }
+            i = i + 1;
+        }
+        if (used != prms.Count()) { return ""; }
+        return sb.ToString();
+    }
+
+    // ===== HTTP transport =====
+
+    /// <summary>Undoes `Transfer-Encoding: chunked` framing. taosAdapter uses
+    /// it for result sets whose size it does not know up front, and the
+    /// response parser hands the body over still framed.</summary>
+    static string Dechunk(string body) {
+        StringBuilder sb = new StringBuilder();
+        int pos = 0;
+        while (pos < body.Length) {
+            int lineEnd = pos;
+            while (lineEnd < body.Length && (body[lineEnd] & 255) != 10) {
+                lineEnd = lineEnd + 1;
+            }
+            int size = TDengineConnection.HexOf(body.Substring(pos, lineEnd - pos));
+            if (size <= 0) { return sb.ToString(); }
+            int start = lineEnd + 1;
+            if (start + size > body.Length) { size = body.Length - start; }
+            if (size <= 0) { return sb.ToString(); }
+            sb.Append(body.Substring(start, size));
+            pos = start + size + 2;             // skip the chunk's trailing CRLF
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>Parses a chunk-size line (hex, optional ";extension", CR).</summary>
+    static int HexOf(string text) {
+        int v = 0;
+        int i = 0;
+        bool any = false;
+        while (i < text.Length) {
+            int c = text[i] & 255;
+            int d = 0 - 1;
+            if (c >= 48 && c <= 57) { d = c - 48; }
+            else if (c >= 97 && c <= 102) { d = c - 87; }
+            else if (c >= 65 && c <= 70) { d = c - 55; }
+            else { i = text.Length; }
+            if (d >= 0) {
+                v = v * 16 + d;
+                any = true;
+                i = i + 1;
+            }
+        }
+        if (!any) { return 0 - 1; }
+        return v;
+    }
+
+    /// <summary>True when the response announces chunked framing.</summary>
+    static bool IsChunked(HttpResponse resp) {
+        int i = 0;
+        while (i < resp.headers.Count) {
+            string h = resp.headers[i].ToLower();
+            if (h.StartsWith("transfer-encoding:") && h.Contains("chunked")) {
+                return true;
+            }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    /// <summary>The REST endpoint for the current default database.</summary>
+    string SqlPath() {
+        if (this.database.Length == 0) { return "/rest/sql"; }
+        return "/rest/sql/" + this.database;
+    }
+
+    /// <summary>Sends one statement and returns the response body, or "" with
+    /// lastError set when the request could not be completed.</summary>
+    string Post(string sql) {
+        this.lastError = "";
+        int sock = Socket.CreateTcp();
+        if (sock <= 0) {
+            this.lastError = "socket creation failed";
+            return "";
+        }
+        if (Socket.Connect(sock, this.host, this.port) != 0) {
+            Socket.Close(sock);
+            this.lastError = "cannot reach taosAdapter at " + this.host + ":"
+                + Convert.ToString(this.port);
+            return "";
+        }
+
+        StringBuilder req = new StringBuilder();
+        req.Append("POST ");
+        req.Append(SqlPath());
+        req.Append(" HTTP/1.1\r\nHost: ");
+        req.Append(this.host);
+        req.Append(":");
+        req.Append(Convert.ToString(this.port));
+        req.Append("\r\nAuthorization: ");
+        req.Append(this.auth);
+        req.Append("\r\nContent-Type: text/plain\r\nContent-Length: ");
+        req.Append(Convert.ToString(sql.Length));
+        req.Append("\r\nConnection: close\r\n\r\n");
+        req.Append(sql);
+        string wire = req.ToString();
+        if (Socket.SendString(sock, wire) < 0) {
+            Socket.Close(sock);
+            this.lastError = "sending the statement failed";
+            return "";
+        }
+
+        StringBuilder raw = new StringBuilder();
+        bool reading = true;
+        while (reading) {
+            string chunk = Socket.Receive(sock, 65536);
+            if (chunk.Length == 0) { reading = false; } else { raw.Append(chunk); }
+        }
+        Socket.Close(sock);
+
+        HttpResponse resp = HttpResponse.Parse(raw.ToString());
+        string body = resp.body;
+        if (TDengineConnection.IsChunked(resp)) {
+            body = TDengineConnection.Dechunk(body);
+        }
+        if (resp.statusCode != 200 && body.Length == 0) {
+            this.lastError = "HTTP " + Convert.ToString(resp.statusCode) + " "
+                + resp.statusText;
+        }
+        return body;
+    }
+
+    // ===== Response decoding =====
+
+    /// <summary>True when the response reports a server-side error; the
+    /// description is kept in lastError. Both the 3.x shape (`code` != 0) and
+    /// the 2.x one (`status` == "error") are recognised.</summary>
+    bool Failed(JsonValue root) {
+        if (!root.IsObject()) {
+            this.lastError = "malformed response from taosAdapter";
+            return true;
+        }
+        bool bad = root.Int("code", 0) != 0 || root.Str("status", "succ") == "error";
+        if (bad) {
+            this.lastError = root.Str("desc", root.Str("status", "unknown error"));
+        }
+        return bad;
+    }
+
+    /// <summary>Turns one `/rest/sql` response document into a result set,
+    /// taking the column names from `column_meta` (3.x) or `head` (2.x) and
+    /// keeping JSON nulls apart from empty strings.</summary>
+    DbResult Decode(string body) {
+        DbResult result = DbResult.Create();
+        this.affected = 0;
+        if (body.Length == 0) {
+            if (this.lastError.Length == 0) { this.lastError = "empty response"; }
+            return result;
+        }
+        JsonValue root = JsonValue.ParseLenient(body);
+        if (Failed(root)) { return result; }
+
+        List<string> names = new List<string>();
+        JsonValue meta = root.Get("column_meta");
+        if (meta != null && meta.IsArray()) {
+            int i = 0;
+            while (i < meta.Count()) {
+                JsonValue col = meta.At(i);
+                if (col.IsArray() && col.Count() > 0) {
+                    names.Add(col.At(0).AsString(""));
+                } else {
+                    names.Add(col.AsString(""));
+                }
+                i = i + 1;
+            }
+        } else {
+            JsonValue head = root.Get("head");
+            if (head != null && head.IsArray()) {
+                int i = 0;
+                while (i < head.Count()) {
+                    names.Add(head.At(i).AsString(""));
+                    i = i + 1;
+                }
+            }
+        }
+        result.SetColumnCount(names.Count);
+        int n = 0;
+        while (n < names.Count) {
+            result.AddColumnName(names[n]);
+            n = n + 1;
+        }
+
+        JsonValue data = root.Get("data");
+        if (data != null && data.IsArray()) {
+            int r = 0;
+            while (r < data.Count()) {
+                JsonValue jrow = data.At(r);
+                List<string> row = new List<string>();
+                List<bool> nulls = new List<bool>();
+                int c = 0;
+                while (c < jrow.Count()) {
+                    JsonValue cell = jrow.At(c);
+                    row.Add(cell.AsString(""));
+                    nulls.Add(cell.IsNull());
+                    c = c + 1;
+                }
+                result.AddRowNulls(row, nulls);
+                r = r + 1;
+            }
+        }
+
+        // A non-query answers with a single `affected_rows` cell; a query
+        // reports how many rows it produced.
+        if (names.Count == 1 && names[0] == "affected_rows" && result.RowCount() == 1) {
+            this.affected = result.GetInt(0, 0);
+        } else {
+            this.affected = root.Int("rows", result.RowCount());
+        }
+        return result;
+    }
+
+    // ===== IDbExecutor =====
+
+    /// <summary>Executes a query and returns its result set.</summary>
+    DbResult Query(string sql) {
+        return Decode(Post(sql));
+    }
+
+    /// <summary>Executes a query whose `?` placeholders are filled from
+    /// <paramref name="prms"/>.</summary>
+    DbResult Query(string sql, DbParams prms) {
+        string text = TDengineConnection.RenderSql(sql, prms);
+        if (text.Length == 0 && sql.Length > 0) {
+            this.lastError = "parameter count does not match the placeholders";
+            return DbResult.Empty();
+        }
+        return Query(text);
+    }
+
+    /// <summary>Executes a statement and returns the affected row count, or -1
+    /// on failure.</summary>
+    int Execute(string sql) {
+        DbResult r = Decode(Post(sql));
+        if (this.lastError.Length > 0) { return 0 - 1; }
+        return this.affected;
+    }
+
+    /// <summary>Executes a parameterized statement.</summary>
+    int Execute(string sql, DbParams prms) {
+        string text = TDengineConnection.RenderSql(sql, prms);
+        if (text.Length == 0 && sql.Length > 0) {
+            this.lastError = "parameter count does not match the placeholders";
+            return 0 - 1;
+        }
+        return Execute(text);
+    }
+
+    /// <summary>First column of the first row, or "".</summary>
+    string ExecuteScalar(string sql) {
+        DbResult r = Query(sql);
+        if (r.RowCount() == 0) { return ""; }
+        return r.GetString(0, 0);
+    }
+
+    /// <summary>First column of the first row of a parameterized query.</summary>
+    string ExecuteScalar(string sql, DbParams prms) {
+        DbResult r = Query(sql, prms);
+        if (r.RowCount() == 0) { return ""; }
+        return r.GetString(0, 0);
+    }
+
+    /// <summary>Rows affected by the last statement.</summary>
+    int AffectedRows() { return this.affected; }
+
+    /// <summary>Description of the last failure, or "".</summary>
+    string GetError() { return this.lastError; }
+
+    /// <summary>Whether the adapter answered when the connection was opened.</summary>
+    bool IsConnected() { return this.connected; }
+
+    /// <summary>Drops the connection state. The REST protocol is stateless, so
+    /// nothing is sent to the server.</summary>
+    void Close() {
+        this.connected = false;
+        this.auth = "";
+    }
+
+    /// <summary>Returns the provider id (DbProvider.TDengine).</summary>
+    int GetProvider() { return DbProvider.TDengine; }
+}

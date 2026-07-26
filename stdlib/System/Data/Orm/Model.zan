@@ -321,6 +321,29 @@ class Model {
         }
     }
 
+    static void FillFromTdengine(Model m, IDbExecutor db, string t) {
+        DbResult r = db.Query("DESCRIBE " + t);
+        if (r == null) { return; }
+        int ni = Model.ColIndex(r, "field");
+        int ti = Model.ColIndex(r, "type");
+        int li = Model.ColIndex(r, "length");
+        int row = 0;
+        while (row < r.RowCount()) {
+            string name = r.GetString(row, ni);
+            string type = r.GetString(row, ti);
+            // BINARY/NCHAR carry their width in a separate column.
+            if (li >= 0 && (Model.EqIgnoreCase(type, "BINARY")
+                    || Model.EqIgnoreCase(type, "VARCHAR")
+                    || Model.EqIgnoreCase(type, "NCHAR"))) {
+                type = type + "(" + r.GetString(row, li) + ")";
+            }
+            // DESCRIBE lists the timestamp column first; it is the key every
+            // TDengine table is ordered and queried by.
+            m.AddIntrospected(name, type, row == 0, row == 0);
+            row = row + 1;
+        }
+    }
+
     static string PrimaryKeyFromCatalog(IDbExecutor db, string t) {
         DbResult r = db.Query("SELECT kcu.column_name "
             + "FROM information_schema.table_constraints tc "
@@ -346,9 +369,10 @@ class Model {
 
     /// <summary>Builds a Model by reflecting an existing table's schema (the
     /// "database first" direction). Provider is auto-detected: SQLite uses
-    /// PRAGMA table_info, MySQL/MariaDB use SHOW COLUMNS, and everything else
-    /// falls back to the ANSI information_schema catalog. The raw DB column type
-    /// is preserved so a subsequent CreateTable() round-trips.</summary>
+    /// PRAGMA table_info, MySQL/MariaDB use SHOW COLUMNS, TDengine uses
+    /// DESCRIBE, and everything else falls back to the ANSI information_schema
+    /// catalog. The raw DB column type is preserved so a subsequent
+    /// CreateTable() round-trips.</summary>
     static Model FromTable(IDbExecutor db, string tableName) {
         Model m = new Model(tableName);
         if (db == null) { return m; }
@@ -357,6 +381,8 @@ class Model {
             Model.FillFromSqlite(m, db, tableName);
         } else if (p == DbProvider.MySQL || p == DbProvider.MariaDB) {
             Model.FillFromMysql(m, db, tableName);
+        } else if (p == DbProvider.TDengine) {
+            Model.FillFromTdengine(m, db, tableName);
         } else {
             Model.FillFromInformationSchema(m, db, tableName);
         }
