@@ -433,8 +433,34 @@ partial class ZanIDE {
         cmds.Add(RibbonCmd.Create("grid", ZanIDE.T("Config", "配置")));
         cmds.Add(RibbonCmd.Create("image", ZanIDE.T("Assets", "素材")));
         cmds.Add(RibbonCmd.Group("settings", ZanIDE.T("Settings", "设置")));
-        cmds.Add(RibbonCmd.Create("info", ZanIDE.T("Help", "帮助")));
+        cmds.Add(RibbonCmd.Group("info", ZanIDE.T("Help", "帮助")));
+        // The Panels section (one icon switch per dock panel) is appended by
+        // DockHost.AddSwitches, which also owns their state and clicks.
         return cmds;
+    }
+
+    /// The dock panels' titles and switch icons, applied after registration and
+    /// again whenever the UI language changes. The dock draws them on the tab
+    /// strips and on the ribbon's panel switches.
+    static void ApplyPanelLabels(DockHost dock) {
+        dock.SetTitle("explorer", ZanIDE.T("EXPLORER", "资源管理器"));
+        dock.SetIcon("explorer", "folder");
+        dock.SetTitle("structure", ZanIDE.T("STRUCTURE", "结构"));
+        dock.SetIcon("structure", "menu");
+        dock.SetTitle("stdlib", ZanIDE.T("STDLIB", "标准库"));
+        dock.SetIcon("stdlib", "code");
+        dock.SetTitle("ai", ZanIDE.T("AI", "AI 助手"));
+        dock.SetIcon("ai", "user");
+        dock.SetTitle("tools", ZanIDE.T("Tools", "工具"));
+        dock.SetIcon("tools", "settings");
+        dock.SetTitle("examples", ZanIDE.T("Examples", "示例"));
+        dock.SetIcon("examples", "star");
+        dock.SetTitle("git", ZanIDE.T("Git", "Git"));
+        dock.SetIcon("git", "globe");
+        dock.SetTitle("output", ZanIDE.T("Output", "输出"));
+        dock.SetIcon("output", "align-left");
+        dock.SetTitle("errors", ZanIDE.T("Errors", "错误"));
+        dock.SetIcon("errors", "warning");
     }
 
     /// Maps a ribbon position (from Ribbon.Render) to its stable action id.
@@ -1315,13 +1341,9 @@ partial class ZanIDE {
         // Seeds for the dock's side extents on a first run (afterwards dock.cfg
         // carries the sizes the user dragged).
         SignalInt bottomPanelH = SignalInt.Create(ZanIDE.CfgClamp(ZanIDE.CfgInt(cfg, "bottomH", 190), 70, 2000));
-        // Bottom panel active tab: 0 = Output, 1 = Error List, 2 = Terminal.
-        SignalInt bottomTab = SignalInt.Create(ZanIDE.CfgClamp(ZanIDE.CfgInt(cfg, "bottomTab", 0), 0, 1));
 
-        // ---- Right side panel (AI assistant / integrated terminal) ----
+        // ---- Right side panel (AI assistant, tools, examples, git) ----
         SignalInt rightW = SignalInt.Create(ZanIDE.CfgClamp(ZanIDE.CfgInt(cfg, "rightW", 600), 120, 1600));
-        // 0 = AI chat, 1 = tools/ tree, 2 = examples/ tree, 3 = git panel.
-        SignalInt rightTab = SignalInt.Create(ZanIDE.CfgClamp(ZanIDE.CfgInt(cfg, "rightTab", 0), 0, 3));
 
         // ---- Dockable main area ----
         // The shell around the document area is a DockHost: EXPLORER, the
@@ -1330,19 +1352,23 @@ partial class ZanIDE {
         // resize and close (right-click a tab strip to bring a closed one
         // back). The editor is the fixed center panel everything docks around.
         // The arrangement is persisted in dock.cfg and restored on launch.
+        // Every tool panel closes; the ribbon's Panels section is the switch
+        // that brings it back (its icon goes dark while the panel is hidden).
         DockHost dock = DockHost.Create();
         dock.emptyMenuLabel = ZanIDE.T("No closed panels", "没有已关闭的面板");
-        dock.Register("explorer", ZanIDE.T("EXPLORER", "资源管理器"),
-            DockSide.Left(), true, true);
-        dock.Register("structure", ZanIDE.T("STRUCTURE", "结构"),
-            DockSide.Left(), true, true);
-        dock.Register("stdlib", ZanIDE.T("STDLIB", "标准库"),
-            DockSide.Left(), true, true);
+        dock.Register("explorer", "", DockSide.Left(), true, true);
+        dock.Register("structure", "", DockSide.Left(), true, true);
+        dock.Register("stdlib", "", DockSide.Left(), true, true);
         dock.RegisterFixed("editor", "Editor");
-        dock.Register("output", ZanIDE.T("OUTPUT", "输出"),
-            DockSide.Bottom(), true, true);
-        dock.Register("assistant", ZanIDE.T("Assistant", "助手"),
-            DockSide.Right(), true, true);
+        // The assistant column and the bottom band each start as one tab group.
+        dock.Register("ai", "", DockSide.Right(), true, true);
+        dock.Register("tools", "", DockSide.Right(), true, false);
+        dock.Register("examples", "", DockSide.Right(), true, false);
+        dock.Register("git", "", DockSide.Right(), true, false);
+        dock.Register("output", "", DockSide.Bottom(), true, true);
+        dock.Register("errors", "", DockSide.Bottom(), true, false);
+        ZanIDE.ApplyPanelLabels(dock);
+        dock.AddSwitches(cmds);
         dock.SetWeight("explorer", 40);
         dock.SetWeight("structure", 32);
         dock.SetWeight("stdlib", 28);
@@ -1353,6 +1379,8 @@ partial class ZanIDE {
         // The outline panel retitles itself between STRUCTURE and COMPONENTS as
         // the designer opens and closes; this tracks the title in effect.
         string dockOutlineTitle = "";
+        // The errors panel tab carries the diagnostic count; this tracks it.
+        string dockErrorsTitle = "";
         // ---- Git panel state (right panel "Git" tab) ----
         // gitFiles holds `git status --porcelain` lines; gitLoaded gates the
         // first (and refresh-triggered) status scan so git only runs on demand.
@@ -1935,8 +1963,12 @@ partial class ZanIDE {
                     && (ZanIDE.IsFormPath(apE) || ZanIDE.IsScenePath(apE)));
                 cmds[12].SetEnabled(haveProj);
                 cmds[13].SetEnabled(haveProj);
-                int rc = ZanIDE.RibbonAction(
-                    Ribbon.Render(app, 0, top, W, ribbonH, cmds));
+                // The dock's panel switches light up with their panel and
+                // swallow their own clicks.
+                dock.SyncSwitches(cmds);
+                int rcPos = Ribbon.Render(app, 0, top, W, ribbonH, cmds);
+                if (dock.HandleRibbon(rcPos)) { rcPos = 0 - 1; }
+                int rc = ZanIDE.RibbonAction(rcPos);
                 if (rc == 0 && dlg == null) {
                     // Rebuild the catalog (built-ins + custom templates on disk).
                     tpls = ZanIDE.BuildCatalog(root);
@@ -2003,7 +2035,7 @@ partial class ZanIDE {
                             buildIsGui = ZanIDE.IsGuiTarget(root, rpB);
                             buildTargetPath = apB;
                             buildLogLen = 0;
-                            bottomTab.Set(0);
+                            dock.Focus("output");
                             log.Add("> Building " + rpB + " ...");
                             if (rc == 4) { Layer.Msg(ZanIDE.T("Building & running…", "正在构建并运行…"), 2); }
                             else { Layer.Msg(ZanIDE.T("Building…", "正在构建…"), 2); }
@@ -2429,13 +2461,10 @@ partial class ZanIDE {
                     }
                 }
 
-                // Editor stack, output panel and the assistant column: all three
-                // rects come from the dock, which owns the handles between them.
-                // The editor is the fixed center panel, so it always has a rect;
-                // the other two are parked off-screen while the user closes them.
+                // The editor is the dock's fixed center panel, so it always has
+                // a rect; every tool panel is parked off-screen while closed.
                 Rect ea = dock.Content("editor");
                 Rect orr = dock.ContentParked("output");
-                Rect rightArea = dock.ContentParked("assistant");
 
                 int tabH = TabView.Height(app);
                 TabHit hit = TabView.Render(app, ea.x, ea.y, ea.width, tabH, tabNames, activeTab, true);
@@ -2914,6 +2943,47 @@ partial class ZanIDE {
                     }
                 }
 
+                // ---- Errors panel: the diagnostics of the last build. Its own
+                // dock panel, so it stays readable next to (or instead of) the
+                // console, and its tab carries the error count.
+                Rect errRect = dock.ContentParked("errors");
+                List<string> ePath = new List<string>();
+                List<string> eLine = new List<string>();
+                List<string> eMsg = new List<string>();
+                ZanIDE.ParseErrorList(log, ePath, eLine, eMsg);
+                string errTitle = ZanIDE.T("Errors", "错误");
+                if (eLine.Count > 0) {
+                    errTitle = errTitle + " (" + Convert.ToString(eLine.Count) + ")";
+                }
+                if (errTitle != dockErrorsTitle) {
+                    dock.SetTitle("errors", errTitle);
+                    dockErrorsTitle = errTitle;
+                }
+                OutputPanel.RenderErrorsPanel(app, c, t, errRect, ePath, eLine, eMsg, errorList);
+                // Error rows are widgets: the ErrorList component records clicks
+                // during RenderAt; apply them here.
+                if (!coCtxOpen) {
+                    int efr = errorList.TakeFix();
+                    if (efr >= 0) {
+                        ZanIDE.AddUsing(editor, tabBodies, activeTab,
+                            errorList.FixNs(efr), log);
+                        app.RequestRedraw();
+                    }
+                    int ejr = errorList.TakeJump();
+                    if (ejr >= 0 && ejr < ePath.Count) {
+                        int ejt = ZanIDE.FindTabByBase(
+                            tabPaths, ZanIDE.BaseName(ePath[ejr]));
+                        int ejl = ZanIDE.ParseInt(eLine[ejr]);
+                        if (ejt >= 0) {
+                            activeTab.Set(ejt);
+                            lastActive = 0 - 1;
+                            pendingGotoLine = ejl - 1;
+                            pendingGotoCol = 0;
+                        }
+                        app.RequestRedraw();
+                    }
+                }
+
                 if (dbgState == 2) {
                     DebugPanel.RenderDebugBottom(app, c, t, orr, dbgPanelTab,
                         dbgConsole, dbgVarInfo, dbgWatchVals, watchText,
@@ -2957,11 +3027,10 @@ partial class ZanIDE {
                         }
                     }
                 } else {
-                    int botTab = bottomTab.Get();
-                    List<string> ePath = new List<string>();
-                    List<string> eLine = new List<string>();
-                    List<string> eMsg = new List<string>();
-                    ZanIDE.ParseErrorList(log, ePath, eLine, eMsg);
+                    // Which bottom panel the pointer is over -- 0 console,
+                    // 1 errors -- so copy/clear act on what was right-clicked.
+                    int botTab = 0;
+                    if (errRect.Contains(app.mouseX, app.mouseY)) { botTab = 1; }
                     // Build the (optionally) filtered view the console shows. The
                     // real `log` is untouched; selection/copy operate on the view.
                     string coFilterText = coFilter.GetText();
@@ -2999,8 +3068,8 @@ partial class ZanIDE {
                     }
                     if (coScroll < 0) { coScroll = 0; }
                     if (coScroll > coMaxScroll) { coScroll = coMaxScroll; }
-                    OutputPanel.RenderOutputBottom(app, c, t, orr, bottomTab, coView, ePath, eLine, eMsg,
-                        coScroll, coFilter, coSelA, coSelAc, coSelB, coSelBc, errorList, outClearBtn);
+                    OutputPanel.RenderConsolePanel(app, c, t, orr, coView, coScroll,
+                        coFilter, coSelA, coSelAc, coSelB, coSelBc, outClearBtn);
                     // Clear button empties the real log and resets the view state.
                     if (!coCtxOpen && Button.WasClicked(app, outClearBtn.wid)) {
                         log = new List<string>();
@@ -3072,34 +3141,12 @@ partial class ZanIDE {
                             app.RequestRedraw();
                         }
                     }
-                    // Error rows are widgets now: the ErrorList component
-                    // records clicks during RenderAt; apply them here.
-                    if (botTab == 1 && !coCtxOpen) {
-                        int efr = errorList.TakeFix();
-                        if (efr >= 0) {
-                            ZanIDE.AddUsing(editor, tabBodies, activeTab,
-                                errorList.FixNs(efr), log);
-                            app.RequestRedraw();
-                        }
-                        int ejr = errorList.TakeJump();
-                        if (ejr >= 0 && ejr < ePath.Count) {
-                            int j = ZanIDE.FindTabByBase(
-                                tabPaths, ZanIDE.BaseName(ePath[ejr]));
-                            int gl = ZanIDE.ParseInt(eLine[ejr]);
-                            if (j >= 0) {
-                                activeTab.Set(j);
-                                lastActive = 0 - 1;
-                                pendingGotoLine = gl - 1;
-                                pendingGotoCol = 0;
-                            }
-                            app.RequestRedraw();
-                        }
-                    }
                     // Right-click opens a context menu (copy selection / line /
                     // all, clear) instead of silently copying.
+                    Rect botRect = orr;
+                    if (botTab == 1) { botRect = errRect; }
                     if (app.window.EventKind() == 2 && app.window.EventButton() == 1
-                        && app.mouseX >= orr.x && app.mouseX < orr.x + orr.width
-                        && app.mouseY >= orr.y && app.mouseY < orr.y + orr.height) {
+                        && botRect.Contains(app.mouseX, app.mouseY)) {
                         coCtxOpen = true;
                         coCtxX = app.mouseX;
                         coCtxY = app.mouseY;
@@ -3107,7 +3154,7 @@ partial class ZanIDE {
                             coCtxRow = OutputPanel.ConsoleRowAt(app, coContentY, coRowH, coPad,
                                 coView.Count, coMaxRows, coScroll, app.mouseY);
                         } else {
-                            coCtxRow = (app.mouseY - (orr.y + obTabH + app.Scale(6))) / app.Scale(20);
+                            coCtxRow = (app.mouseY - (errRect.y + app.Scale(6))) / app.Scale(20);
                         }
                         app.RequestRedraw();
                     }
@@ -3210,45 +3257,23 @@ partial class ZanIDE {
                     }
                 }
 
-                // ---- Right side panel: AI assistant / integrated terminal ----
-                Rect rp = rightArea;
+                // ---- AI assistant panel ----
+                // The assistant, tools, examples and git are four dock panels of
+                // their own; each draws into the rect the dock hands it (parked
+                // off-screen while hidden), so any of them can be tabbed
+                // together, moved to another side or closed.
+                Rect rp = dock.ContentParked("ai");
                 ZanIDE.ShellSurface(app, rp.x, rp.y, rp.width, rp.height, 0, t.bgTertiary);
-                int rTabH = app.Scale(28);
-                int rTab = rightTab.Get();
-                int rTabW = rp.width / 4;
-                if (rTabW > app.Scale(90)) { rTabW = app.Scale(90); }
-                c.FillRect(rp.x, rp.y, rp.width, rTabH, t.bgSecondary);
-                c.FillRect(rp.x, rp.y + rTabH - 1, rp.width, 1, t.divider);
-                List<string> rTabNames = new List<string>();
-                rTabNames.Add(ZanIDE.T("AI", "AI 助手"));
-                rTabNames.Add(ZanIDE.T("Tools", "工具"));
-                rTabNames.Add(ZanIDE.T("Examples", "示例"));
-                rTabNames.Add(ZanIDE.T("Git", "Git"));
-                int rtI = 0;
-                while (rtI < rTabNames.Count) {
-                    int rBgN = t.bgTertiary;
-                    if (rTab == rtI) { rBgN = t.bgPrimary; }
-                    c.FillRect(rp.x + rTabW * rtI, rp.y, rTabW, rTabH, rBgN);
-                    c.DrawText(rp.x + rTabW * rtI + app.Scale(8), rp.y + app.Scale(6),
-                        rTabNames[rtI], t.textPrimary, t.fontSizeSmall);
-                    rtI = rtI + 1;
-                }
-                if (app.ClickAvailable()
-                    && app.mouseY >= rp.y && app.mouseY < rp.y + rTabH
-                    && app.mouseX >= rp.x && app.mouseX < rp.x + rTabW * rTabNames.Count) {
-                    rightTab.Set((app.mouseX - rp.x) / rTabW);
-                    app.RequestRedraw();
-                }
                 int rPad = app.Scale(6);
                 int rInH = app.Scale(30);
-                Rect rBody = Rect.Create(rp.x, rp.y + rTabH, rp.width,
-                    rp.height - rTabH - rInH - rPad * 2);
+                Rect rBody = Rect.Create(rp.x, rp.y, rp.width,
+                    rp.height - rInH - rPad * 2);
                 c.FillRect(rBody.x, rBody.y, rBody.width, rBody.height + rInH + rPad * 2, t.bgPrimary);
                 int rInY = rp.y + rp.height - rInH - rPad;
                 int rBtnW = app.Scale(56);
                 int rInW = rp.width - rPad * 3 - rBtnW;
                 if (rInW < app.Scale(40)) { rInW = app.Scale(40); }
-                if (rTab == 0) {
+                {
                     // ---- Header: chat model switcher + Continue + Config ----
                     // The dropdown lists the enabled profile's default model
                     // first, then the fetched model ids; picking one switches
@@ -3482,9 +3507,10 @@ partial class ZanIDE {
                             app.RequestRedraw();
                         }
                     }
-                } else if (rTab == 3) {
-                    // ---- Git: repository status + stage / commit / sync ----
-                    Rect gArea = Rect.Create(rp.x, rp.y + rTabH, rp.width, rp.height - rTabH);
+                }
+                {
+                    // ---- Git panel: repository status + stage / commit / sync ----
+                    Rect gArea = dock.ContentParked("git");
                     int gPad = app.Scale(6);
                     if (!gitLoaded) {
                         gitBranch = ZanIDE.GitRefresh(root, gitFiles);
@@ -3538,7 +3564,7 @@ partial class ZanIDE {
                             ZanIDE.AppendAll(log, ZanIDE.GitRun(root, "add -A"));
                             log.Add(ZanIDE.T("> Staged all changes.", "> 已暂存全部变更。"));
                             gitLoaded = false;
-                            bottomTab.Set(0);
+                            dock.Focus("output");
                             app.RequestRedraw();
                         }
                         if (Button.WasClicked(app, gDifId)) {
@@ -3548,14 +3574,14 @@ partial class ZanIDE {
                                 gtgt = " -- \"" + ZanIDE.GitPathOf(gitFiles[gsv]) + "\"";
                             }
                             ZanIDE.AppendAll(log, ZanIDE.GitRun(root, "diff HEAD" + gtgt));
-                            bottomTab.Set(0);
+                            dock.Focus("output");
                             coScroll = 0;
                             app.RequestRedraw();
                         }
                         if (Button.WasClicked(app, gLogId)) {
                             ZanIDE.AppendAll(log, ZanIDE.GitRun(root,
                                 "log --oneline --decorate -20"));
-                            bottomTab.Set(0);
+                            dock.Focus("output");
                             coScroll = 0;
                             app.RequestRedraw();
                         }
@@ -3563,13 +3589,13 @@ partial class ZanIDE {
                             log.Add("> git pull ...");
                             ZanIDE.AppendAll(log, ZanIDE.GitRun(root, "pull"));
                             gitLoaded = false;
-                            bottomTab.Set(0);
+                            dock.Focus("output");
                             app.RequestRedraw();
                         }
                         if (Button.WasClicked(app, gPshId)) {
                             log.Add("> git push ...");
                             ZanIDE.AppendAll(log, ZanIDE.GitRun(root, "push"));
-                            bottomTab.Set(0);
+                            dock.Focus("output");
                             app.RequestRedraw();
                         }
                         // Changed-file list (porcelain "XY path" rows): click
@@ -3652,21 +3678,32 @@ partial class ZanIDE {
                                 gitMsgIn.SetText("");
                                 gitLoaded = false;
                             }
-                            bottomTab.Set(0);
+                            dock.Focus("output");
                             app.RequestRedraw();
                         }
                     }
-                } else if (rTab >= 1) {
-                    // Tools / Examples: a filter bar + file tree. Single click
-                    // selects; double-click RUNS a tool (tools are Zan code)
-                    // or opens the source in the editor (examples); right-click
-                    // on a tool opens its source in the editor.
-                    Rect rtArea = Rect.Create(rp.x, rp.y + rTabH, rp.width, rp.height - rTabH);
+                }
+                // ---- Tools and Examples panels: a filter bar + file tree each.
+                // Single click selects; double-click RUNS a tool (tools are Zan
+                // code) or opens the source in the editor (examples);
+                // right-click on a tool opens its source in the editor. Both
+                // panels are the same view over a different tree, so one pass
+                // renders each (rTab 1 = tools, 2 = examples).
+                int rTab = 1;
+                while (rTab <= 2) {
+                    Rect rtArea = dock.ContentParked("tools");
                     List<TreeNode> rtNodes = rtToolTree;
                     SignalInt rtSel = rtToolSel;
                     SignalInt rtScroll = rtToolScroll;
                     Input rtFilter = rtToolFilter;
-                    if (rTab == 2) { rtNodes = rtExTree; rtSel = rtExSel; rtScroll = rtExScroll; rtFilter = rtExFilter; }
+                    if (rTab == 2) {
+                        rtArea = dock.ContentParked("examples");
+                        rtNodes = rtExTree;
+                        rtSel = rtExSel;
+                        rtScroll = rtExScroll;
+                        rtFilter = rtExFilter;
+                    }
+                    c.FillRect(rtArea.x, rtArea.y, rtArea.width, rtArea.height, t.bgPrimary);
                     rtArea = TreeView.FilterBar(app, rtArea, rtFilter);
                     List<TreeNode> rtShow = ZanIDE.FilterNodes(rtNodes, rtFilter.GetText());
                     int rtRowH = TreeView.RowHeight(app);
@@ -3727,6 +3764,7 @@ partial class ZanIDE {
                             }
                         }
                     }
+                    rTab = rTab + 1;
                 }
                 // Stream new shell output from a launched program into the
                 // Output tab. Poll on the throttled animation clock so a live
@@ -3775,7 +3813,7 @@ partial class ZanIDE {
                             buildIsGui = ZanIDE.IsGuiTarget(root, rpHr);
                             buildTargetPath = apHr;
                             buildLogLen = 0;
-                            bottomTab.Set(0);
+                            dock.Focus("output");
                             log.Add("> [Hot] Rebuilding " + rpHr + " ...");
                             app.RequestAnimationFrame(80);
                         }
@@ -4344,6 +4382,10 @@ partial class ZanIDE {
                     Wizard.lang = ZanIDE.uiLang;
                     Designer.lang = ZanIDE.uiLang;
                     cmds = ZanIDE.BuildRibbon();
+                    ZanIDE.ApplyPanelLabels(dock);
+                    dock.AddSwitches(cmds);
+                    dockOutlineTitle = "";
+                    dockErrorsTitle = "";
                     lastActive = 0 - 1;
                     app.RequestRedraw();
                 }
@@ -4460,7 +4502,7 @@ partial class ZanIDE {
         // Persist window + panel sizes so the next launch restores them.
         int arv = 0;
         if (autoRun) { arv = 1; }
-        ZanIDE.SaveSettings(treeW.Get(), bottomPanelH.Get(), savedW, savedH, bottomTab.Get(), arv, app.ThemeMenuIndex(), rightW.Get(), rightTab.Get(), winOpacity);
+        ZanIDE.SaveSettings(treeW.Get(), bottomPanelH.Get(), savedW, savedH, arv, app.ThemeMenuIndex(), rightW.Get(), winOpacity);
     }
 
     /// Spawns a fresh wizard child window (a real draggable top-level window),

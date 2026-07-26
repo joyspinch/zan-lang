@@ -20,6 +20,8 @@ class DockSide {
 class DockPanel {
     string id;
     string title;
+    /// Icon name for the host's panel switch (see DockHost.AddSwitches).
+    string icon;
     bool closable;
     bool headerless;
     bool hidden;
@@ -31,6 +33,7 @@ class DockPanel {
         DockPanel p = new DockPanel();
         p.id = id;
         p.title = title;
+        p.icon = "grid";
         p.closable = closable;
         p.headerless = false;
         p.hidden = false;
@@ -137,6 +140,11 @@ class DockHost {
     int menuY;
     string emptyMenuLabel;
 
+    /// Ribbon panel switches: the ids behind them and where they start in the
+    /// host's command list (see AddSwitches).
+    List<string> switchIds;
+    int switchBase;
+
     string lastClosed;
     bool changed;
     /// A resize drag in progress: promoted to `changed` on release so a host
@@ -165,6 +173,8 @@ class DockHost {
         h.menuX = 0;
         h.menuY = 0;
         h.emptyMenuLabel = "No closed panels";
+        h.switchIds = new List<string>();
+        h.switchBase = 0 - 1;
         h.lastClosed = "";
         h.changed = false;
         h.pendingResize = false;
@@ -291,6 +301,64 @@ class DockHost {
         if (p != null) { p.title = title; }
     }
 
+    /// Sets the icon a panel's ribbon switch shows.
+    void SetIcon(string id, string icon) {
+        DockPanel p = this.Find(id);
+        if (p != null) { p.icon = icon; }
+    }
+
+    // ------------------------------------------------------- panel switches
+
+    /// Appends one icon switch per closable panel to a ribbon command list --
+    /// the "Panels" section of a toolbar. The switches are the tail of the
+    /// list, so the host keeps addressing its own commands by index, and
+    /// HandleRibbon() consumes the clicks on them. Call it right after (re)
+    /// building the command list; returns the index the switches start at.
+    ///
+    ///   dock.AddSwitches(cmds);                    // after BuildRibbon()
+    ///   dock.SyncSwitches(cmds);                   // each frame
+    ///   int pos = Ribbon.Render(app, x, y, w, h, cmds);
+    ///   if (!dock.HandleRibbon(pos)) { ...own commands... }
+    int AddSwitches(List<RibbonCmd> cmds) {
+        switchBase = cmds.Count;
+        switchIds = new List<string>();
+        int i = 0;
+        while (i < panels.Count) {
+            DockPanel p = panels[i];
+            if (p.closable && !p.headerless) {
+                switchIds.Add(p.id);
+                cmds.Add(RibbonCmd.Switch(p.icon, p.title, !p.hidden));
+            }
+            i = i + 1;
+        }
+        return switchBase;
+    }
+
+    /// Refreshes the switches' lit state (and labels) from the live layout.
+    void SyncSwitches(List<RibbonCmd> cmds) {
+        int i = 0;
+        while (i < switchIds.Count) {
+            int at = switchBase + i;
+            if (at >= cmds.Count) { return; }
+            DockPanel p = this.Find(switchIds[i]);
+            if (p != null) {
+                cmds[at].SetOn(!p.hidden);
+                cmds[at].label = p.title;
+                cmds[at].icon = p.icon;
+            }
+            i = i + 1;
+        }
+    }
+
+    /// Toggles the panel a ribbon click landed on. Returns true when the click
+    /// was a panel switch (and the host should not dispatch it as a command).
+    bool HandleRibbon(int pos) {
+        int i = pos - switchBase;
+        if (i < 0 || i >= switchIds.Count) { return false; }
+        this.Toggle(switchIds[i]);
+        return true;
+    }
+
     /// Hides a panel and drops it out of its group (removing the group when it
     /// was the last tab). The panel stays registered and restorable.
     void Close(string id) {
@@ -340,6 +408,17 @@ class DockHost {
         int gi = this.GroupOf(id);
         if (gi >= 0) { groups[gi].active = this.IndexIn(groups[gi], id); }
         changed = true;
+    }
+
+    bool IsHidden(string id) {
+        DockPanel p = this.Find(id);
+        if (p == null) { return true; }
+        return p.hidden;
+    }
+
+    /// Show/hide switch for a panel -- what a "panels" toolbar button drives.
+    void Toggle(string id) {
+        if (this.IsHidden(id)) { this.Show(id); } else { this.Close(id); }
     }
 
     /// Re-docks a closed panel to the side it came from.
