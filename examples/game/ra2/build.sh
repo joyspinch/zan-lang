@@ -5,4 +5,5 @@ set -e
 root="$(cd "$(dirname "$0")/../../.." && pwd)"
 cd "$root"
 build/zanc examples/game/ra2/main.zan \
+  examples/game/ra2/formats/*.zan \
   --auto-stdlib -o build/ra2.exe
