@@ -136,6 +136,51 @@ partial class DataTable {
         return s;
     }
 
+    // ---- bool support ----
+    // A bool column stores text but keys on a truth value, so it sorts
+    // false-before-true and groups into exactly two buckets regardless of how
+    // each cell happens to be spelled.
+
+    /// Read a cell as a truth value. True for "1", "true", "yes", "y", "on",
+    /// "t" and a check mark; anything else (including "", "0" and "false") is
+    /// false. Case-insensitive and tolerant of surrounding spaces, so a column
+    /// mixing "Yes"/"TRUE"/"1" still reads consistently.
+    static bool ParseBool(string s) {
+        string v = DataTable.LowerAscii(DataTable.TrimSpace(s));
+        if (v == "1" || v == "true" || v == "yes" || v == "y" || v == "on" || v == "t") {
+            return true;
+        }
+        return v == Text.CharStr(10003);   // ✓
+    }
+
+    // Strip leading/trailing spaces and tabs.
+    static string TrimSpace(string s) {
+        int a = 0;
+        int b = s.Length;
+        while (a < b) {
+            int c = (int)s[a];
+            if (c == 32 || c == 9) { a = a + 1; } else { break; }
+        }
+        while (b > a) {
+            int c = (int)s[b - 1];
+            if (c == 32 || c == 9) { b = b - 1; } else { break; }
+        }
+        return s.Substring(a, b - a);
+    }
+
+    // ASCII-only lowercase; leaves any multi-byte sequence untouched.
+    static string LowerAscii(string s) {
+        string o = "";
+        int i = 0;
+        while (i < s.Length) {
+            int c = (int)s[i];
+            if (c >= 65 && c <= 90) { o = o + Text.ByteChar(c + 32); }
+            else { o = o + s.Substring(i, 1); }
+            i = i + 1;
+        }
+        return o;
+    }
+
     // ---- date support ----
     // A date column stores text but sorts, groups and totals on a day number
     // (days since 1970-01-01, negative before it), so "2026-01-05" orders after
@@ -310,6 +355,13 @@ partial class DataTable {
     // grouping of the integer part plus prefix/suffix. Sign and any fractional
     // part are preserved. Returns the raw value unchanged when fmt is off.
     static string FormatCell(DataColumn col, string raw) {
+        // Bool columns normalise every accepted spelling to the column's own
+        // pair, so a mix of "1"/"Yes"/"TRUE" reads as one vocabulary. The
+        // checkbox and glyph styles paint instead of using this text.
+        if (col.isBool) {
+            if (DataTable.ParseBool(raw)) { return col.boolTrue; }
+            return col.boolFalse;
+        }
         // Date columns re-render from the parsed day number, so mixed stored
         // spellings ("2026/7/6", "20260706") all display identically. Text that
         // does not parse as a date is shown as typed rather than blanked.
@@ -374,6 +426,27 @@ partial class DataTable {
         st.editing = false;
         st.editRow = -1;
         st.editCol = -1;
+    }
+
+    /// Flip a bool cell and report it as a committed edit. Bool columns have no
+    /// text to type into, so a click or F2/Enter toggles them in place instead
+    /// of opening the inline editor.
+    static void ToggleBoolCell(DataTableState st, List<DataColumn> cols, DataSource src,
+                               int row, int col) {
+        if (col < 0 || col >= cols.Count) { return; }
+        if (row < 0 || row >= src.RowCount()) { return; }
+        DataColumn c = cols[col];
+        if (!c.isBool || !c.editable) { return; }
+        string nv = c.boolTrue;
+        if (src.CellBool(row, col)) { nv = c.boolFalse; }
+        src.SetCell(row, col, nv);
+        st.editRow = row;
+        st.editCol = col;
+        st.editVal = nv;
+        st.hitRow = row;
+        st.hitCol = col;
+        st.dirty = true;
+        st.CellEdit.Raise();
     }
 
     /// Validate (numeric columns only) and write the buffer back into the row.
@@ -501,6 +574,15 @@ partial class DataTable {
     // 1.5 and 1.9 no longer tie, integer columns keep the exact int path, and
     // everything else compares as text.
     static int CompareCellCol(DataColumn col, string a, string b) {
+        if (col.isBool) {
+            int ba = 0;
+            int bb = 0;
+            if (DataTable.ParseBool(a)) { ba = 1; }
+            if (DataTable.ParseBool(b)) { bb = 1; }
+            if (ba < bb) { return -1; }
+            if (ba > bb) { return 1; }
+            return 0;
+        }
         if (col.isDate) {
             int ka = DataTable.ParseDate(a, col.dateOrder);
             int kb = DataTable.ParseDate(b, col.dateOrder);
@@ -934,6 +1016,11 @@ partial class DataTable {
             DataColumn c = cols[gc];
             if (c.isDate) {
                 return DataTable.DateGroupKey(src.CellDay(rowIdx, gc, c.dateOrder), c.dateGroup);
+            }
+            // Two buckets, whatever the cells are spelled like.
+            if (c.isBool) {
+                if (src.CellBool(rowIdx, gc)) { return c.boolTrue; }
+                return c.boolFalse;
             }
         }
         return src.CellText(rowIdx, gc);
@@ -1515,7 +1602,7 @@ partial class DataTable {
         // key kind: 0 string, 1 int, 2 real (fractional numeric column). A date
         // column keys on its day number, so it rides the int path.
         int kind = 0;
-        if (cols[sc].isDate) { kind = 1; }
+        if (cols[sc].isDate || cols[sc].isBool) { kind = 1; }
         else if (cols[sc].numeric) { if (cols[sc].decimals > 0) { kind = 2; } else { kind = 1; } }
 
         // decorate: pull the sort key for each visible row once (O(n)), so a
@@ -1527,6 +1614,11 @@ partial class DataTable {
         int q = 0;
         while (q < n) {
             if (cols[sc].isDate) { nkey.Add(src.CellDay(st.order[q], sc, cols[sc].dateOrder)); }
+            else if (cols[sc].isBool) {
+                int bv = 0;
+                if (src.CellBool(st.order[q], sc)) { bv = 1; }
+                nkey.Add(bv);
+            }
             else if (kind == 1) { nkey.Add(src.CellNum(st.order[q], sc)); }
             else if (kind == 2) { rkey.Add(src.CellReal(st.order[q], sc)); }
             else { skey.Add(src.CellText(st.order[q], sc)); }
