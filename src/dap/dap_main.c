@@ -67,6 +67,7 @@ typedef struct {
     char       source_file[1024];/* main source file (for stack frames) */
     bool       terminated;
     bool       launched;
+    int        attach_pid;       /* >0 when the client asked to attach */
     bool       use_sock;         /* true when framing over a TCP socket */
     dap_sock_t sock;             /* connected client socket (server mode) */
 } dap_t;
@@ -181,6 +182,7 @@ static const char *dap_stop_reason(const char *mi) {
     if (strncmp(mi, "breakpoint", 10) == 0) return "breakpoint";
     if (strstr(mi, "stepping-range") || strstr(mi, "finished")) return "step";
     if (strstr(mi, "watchpoint")) return "data breakpoint";
+    if (strstr(mi, "exception")) return "exception";
     if (strstr(mi, "signal")) return "exception";
     return "breakpoint";
 }
@@ -209,6 +211,22 @@ static void handle_initialize(dap_t *d, json_value *request) {
     json_obj_set(caps, "supportsTerminateRequest", json_new_bool(true));
     json_obj_set(caps, "supportsRunInTerminalRequest", json_new_bool(false));
     json_obj_set(caps, "supportsExceptionInfoRequest", json_new_bool(true));
+    json_obj_set(caps, "supportsExceptionFilterOptions", json_new_bool(true));
+    {
+        /* The filters a client shows in its Breakpoints pane. They map onto
+         * breakpoints in the compiler-emitted throw hooks. */
+        json_value *filters = json_new_arr();
+        const char *ids[2]   = { "throw", "unhandled" };
+        const char *labels[2] = { "Thrown exceptions", "Unhandled exceptions" };
+        for (int i = 0; i < 2; i++) {
+            json_value *f = json_new_obj();
+            json_obj_set(f, "filter", json_new_str(ids[i]));
+            json_obj_set(f, "label", json_new_str(labels[i]));
+            json_obj_set(f, "default", json_new_bool(i == 1));
+            json_arr_add(filters, f);
+        }
+        json_obj_set(caps, "exceptionBreakpointFilters", filters);
+    }
     dap_send_response(d, request, true, caps);
     /* signal readiness for configuration (breakpoints, etc.) */
     dap_send_event(d, "initialized", NULL);
@@ -296,17 +314,31 @@ static void handle_launch(dap_t *d, json_value *request) {
 
 static void handle_configuration_done(dap_t *d, json_value *request) {
     dap_send_response(d, request, true, NULL);
-    /* Breakpoints have now been delivered; launch the inferior under gdb. */
-    dbg_start(&d->dbg, d->program, d->prog_args[0] ? d->prog_args : NULL);
+    /* Breakpoints have now been delivered; start or attach under gdb. */
+    if (d->attach_pid > 0)
+        dbg_attach(&d->dbg, d->program, d->attach_pid);
+    else
+        dbg_start(&d->dbg, d->program, d->prog_args[0] ? d->prog_args : NULL);
     dap_report_stop(d);
 }
 
 static void handle_threads(dap_t *d, json_value *request) {
-    json_value *thread = json_new_obj();
-    json_obj_set(thread, "id", json_new_num(1));
-    json_obj_set(thread, "name", json_new_str("main"));
     json_value *threads = json_new_arr();
-    json_arr_add(threads, thread);
+    dbg_refresh_threads(&d->dbg);
+    for (int i = 0; i < d->dbg.thread_count; i++) {
+        json_value *thread = json_new_obj();
+        json_obj_set(thread, "id", json_new_num(d->dbg.threads[i].id));
+        json_obj_set(thread, "name", json_new_str(d->dbg.threads[i].name));
+        json_arr_add(threads, thread);
+    }
+    if (d->dbg.thread_count == 0) {
+        /* Not running yet (or gdb told us nothing): the client still needs a
+         * thread to hang its stack request on. */
+        json_value *thread = json_new_obj();
+        json_obj_set(thread, "id", json_new_num(1));
+        json_obj_set(thread, "name", json_new_str("main"));
+        json_arr_add(threads, thread);
+    }
     json_value *body = json_new_obj();
     json_obj_set(body, "threads", threads);
     dap_send_response(d, request, true, body);
@@ -499,6 +531,48 @@ static void handle_disconnect(dap_t *d, json_value *request) {
     dap_terminate_with_code(d, d->dbg.last_exit_code);
 }
 
+static void handle_set_exception_breakpoints(dap_t *d, json_value *request) {
+    json_value *args = json_obj_get(request, "arguments");
+    json_value *filters = json_obj_get(args, "filters");
+    bool on_throw = false, on_unhandled = false;
+    int n = json_arr_count(filters);
+    for (int i = 0; i < n; i++) {
+        const char *f = json_get_str(json_arr_at(filters, i));
+        if (!f) continue;
+        if (strcmp(f, "throw") == 0 || strcmp(f, "all") == 0) on_throw = true;
+        else if (strcmp(f, "unhandled") == 0 || strcmp(f, "uncaught") == 0)
+            on_unhandled = true;
+    }
+    /* Before the process exists this only records the request; dbg_start and
+     * dbg_attach place the breakpoints once gdb is up. */
+    dbg_set_exception_breakpoints(&d->dbg, on_throw, on_unhandled);
+    dap_send_response(d, request, true, NULL);
+}
+
+static void handle_attach(dap_t *d, json_value *request) {
+    json_value *args = json_obj_get(request, "arguments");
+    const char *program = json_get_str(json_obj_get(args, "program"));
+    const char *gdb_path = json_get_str(json_obj_get(args, "gdbPath"));
+    int pid = (int)json_get_num(json_obj_get(args, "processId"), 0);
+    if (program) strncpy(d->program, program, sizeof(d->program) - 1);
+    if (gdb_path && gdb_path[0]) dbg_set_gdb_path(&d->dbg, gdb_path);
+    if (pid <= 0) {
+        dap_send_response(d, request, false, NULL);
+        dap_output(d, "console", "attach needs a processId.\n");
+        return;
+    }
+    d->attach_pid = pid;
+    d->launched = true;
+    dap_send_response(d, request, true, NULL);
+}
+
+static void handle_select_thread(dap_t *d, json_value *request) {
+    json_value *args = json_obj_get(request, "arguments");
+    int tid = (int)json_get_num(json_obj_get(args, "threadId"), 0);
+    if (tid > 0) dbg_select_thread(&d->dbg, tid);
+    dap_send_response(d, request, true, NULL);
+}
+
 /* ============================== dispatch ============================= */
 
 static void dispatch(dap_t *d, json_value *request) {
@@ -507,11 +581,12 @@ static void dispatch(dap_t *d, json_value *request) {
 
     if (strcmp(cmd, "initialize") == 0)             handle_initialize(d, request);
     else if (strcmp(cmd, "setBreakpoints") == 0)    handle_set_breakpoints(d, request);
-    else if (strcmp(cmd, "setExceptionBreakpoints") == 0) dap_send_response(d, request, true, NULL);
+    else if (strcmp(cmd, "setExceptionBreakpoints") == 0) handle_set_exception_breakpoints(d, request);
     else if (strcmp(cmd, "launch") == 0)            handle_launch(d, request);
-    else if (strcmp(cmd, "attach") == 0)            handle_launch(d, request);
+    else if (strcmp(cmd, "attach") == 0)            handle_attach(d, request);
     else if (strcmp(cmd, "configurationDone") == 0) handle_configuration_done(d, request);
     else if (strcmp(cmd, "threads") == 0)           handle_threads(d, request);
+    else if (strcmp(cmd, "selectThread") == 0)      handle_select_thread(d, request);
     else if (strcmp(cmd, "stackTrace") == 0)        handle_stack_trace(d, request);
     else if (strcmp(cmd, "scopes") == 0)            handle_scopes(d, request);
     else if (strcmp(cmd, "variables") == 0)         handle_variables(d, request);

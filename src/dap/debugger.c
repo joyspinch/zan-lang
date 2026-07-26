@@ -244,8 +244,30 @@ static void mi_exec(debugger_t *dbg, const char *cmd) {
     }
     mi_wait_stopped(dbg);
     if (dbg->state == DBG_PAUSED) {
+        dbg_refresh_threads(dbg);
         dbg_refresh_callstack(dbg);
         dbg->active_frame = 0;
+        /* Stopping inside a compiler-emitted hook means the stop is an
+         * exception, not an ordinary breakpoint; report it as one and hide
+         * the hook frame from the reported stack. */
+        if (dbg->callstack_depth > 0 &&
+            strncmp(dbg->callstack[0].function_name, "__zan_eh_", 9) == 0) {
+            bool unhandled = strstr(dbg->callstack[0].function_name,
+                                    "unhandled") != NULL;
+            snprintf(dbg->stop_reason, sizeof(dbg->stop_reason), "%s",
+                     unhandled ? "unhandled exception" : "exception thrown");
+            for (int i = 1; i < dbg->callstack_depth; i++)
+                dbg->callstack[i - 1] = dbg->callstack[i];
+            dbg->callstack_depth--;
+            if (dbg->callstack_depth > 0) {
+                snprintf(dbg->current_file, sizeof(dbg->current_file), "%s",
+                         dbg->callstack[0].file);
+                dbg->current_line = dbg->callstack[0].line;
+            }
+            char sel[64], tmp[512];
+            snprintf(sel, sizeof(sel), "-stack-select-frame 1");
+            mi_command(dbg, sel, tmp, sizeof(tmp));
+        }
         dbg_refresh_locals(dbg);
         dbg_evaluate_watches(dbg);
     }
@@ -398,6 +420,9 @@ void dbg_init(debugger_t *dbg) {
     dbg->break_on_exception = true;
     dbg->skip_stdlib = true;
     dbg->active_frame = 0;
+    dbg->current_thread = 1;
+    dbg->exc_bp_throw = -1;
+    dbg->exc_bp_unhandled = -1;
 #ifndef _WIN32
     dbg->gdb_in_fd = -1;
     dbg->gdb_out_fd = -1;
@@ -704,8 +729,80 @@ bool dbg_start(debugger_t *dbg, const char *program, const char *args) {
     snprintf(msg, sizeof(msg), "[DBG] Launched under gdb: %s\n", program);
     dbg_append_output(dbg, msg);
 
+    /* Exception breakpoints requested before the session existed. */
+    dbg->exc_bp_throw = -1;
+    dbg->exc_bp_unhandled = -1;
+    if (dbg->break_on_throw || dbg->break_on_exception)
+        dbg_set_exception_breakpoints(dbg, dbg->break_on_throw,
+                                      dbg->break_on_exception);
+
     /* Start the inferior; --start stops at entry when requested. */
     mi_exec(dbg, dbg->break_on_entry ? "-exec-run --start" : "-exec-run");
+    return true;
+}
+
+bool dbg_attach(debugger_t *dbg, const char *program, int pid) {
+    if (pid <= 0) return false;
+    if (mi_active(dbg)) dbg_stop(dbg);
+    /* gdb is happy to start with no file and read symbols from the process,
+     * but naming the executable gives it the Zan DWARF right away. */
+    if (program && program[0])
+        snprintf(dbg->program_path, sizeof(dbg->program_path), "%s", program);
+    else
+        dbg->program_path[0] = '\0';
+    if (!mi_spawn(dbg, dbg->program_path)) {
+        dbg_append_output(dbg, "[DBG] Failed to launch gdb for attach\n");
+        dbg->state = DBG_TERMINATED;
+        return false;
+    }
+    char res[2048] = "";
+    mi_command(dbg, "-gdb-set mi-async off", res, sizeof(res));
+    mi_command(dbg, "-gdb-set confirm off", res, sizeof(res));
+    mi_command(dbg, "-gdb-set print pretty off", res, sizeof(res));
+
+    char cmd[64];
+    snprintf(cmd, sizeof(cmd), "-target-attach %d", pid);
+    if (!mi_command(dbg, cmd, res, sizeof(res)) || strstr(res, "^error")) {
+        char msg[256] = "";
+        char out[400];
+        mi_field(res, "msg", msg, sizeof(msg));
+        snprintf(out, sizeof(out), "[DBG] Attach to pid %d failed: %s\n",
+                 pid, msg[0] ? msg : "unknown error");
+        dbg_append_output(dbg, out);
+        mi_close(dbg);
+        dbg->state = DBG_TERMINATED;
+        return false;
+    }
+    dbg->attached = true;
+    dbg->state = DBG_PAUSED;   /* -target-attach stops the process */
+    dbg->last_exit_code = 0;
+
+    /* Breakpoints the client delivered before attaching. */
+    for (int i = 0; i < dbg->bp_count; i++) {
+        dbg_breakpoint_t *bp = &dbg->breakpoints[i];
+        if (!bp->enabled) continue;
+        char bcmd[900], r[1024] = "";
+        const char *base = mi_basename(bp->file);
+        if (bp->type == BP_CONDITIONAL && bp->condition[0])
+            snprintf(bcmd, sizeof(bcmd), "-break-insert -f -c \"%s\" \"%s:%d\"",
+                     bp->condition, base, bp->line);
+        else
+            snprintf(bcmd, sizeof(bcmd), "-break-insert -f \"%s:%d\"", base, bp->line);
+        bp->verified = mi_command(dbg, bcmd, r, sizeof(r)) && strstr(r, "^done") != NULL;
+    }
+    dbg->exc_bp_throw = -1;
+    dbg->exc_bp_unhandled = -1;
+    if (dbg->break_on_throw || dbg->break_on_exception)
+        dbg_set_exception_breakpoints(dbg, dbg->break_on_throw,
+                                      dbg->break_on_exception);
+
+    char msg[1200];
+    snprintf(msg, sizeof(msg), "[DBG] Attached to pid %d under gdb.\n", pid);
+    dbg_append_output(dbg, msg);
+    dbg_refresh_threads(dbg);
+    dbg_refresh_callstack(dbg);
+    dbg->active_frame = 0;
+    dbg_refresh_locals(dbg);
     return true;
 }
 
@@ -749,6 +846,102 @@ void dbg_run_to_cursor(debugger_t *dbg, const char *file, int line) {
 }
 
 /* --- Locals and Call Stack (gdb/MI) --- */
+
+/* --- Threads (gdb/MI) --- */
+
+void dbg_refresh_threads(debugger_t *dbg) {
+    dbg->thread_count = 0;
+    if (!mi_active(dbg) || dbg->state != DBG_PAUSED) return;
+    char res[8192] = "";
+    if (!mi_command(dbg, "-thread-info", res, sizeof(res))) return;
+    char cur[16] = "";
+    if (mi_field(res, "current-thread-id", cur, sizeof(cur)))
+        dbg->current_thread = atoi(cur);
+    const char *p = strstr(res, "threads=[");
+    if (!p) return;
+    while ((p = strstr(p, "{id=")) != NULL) {
+        p += 1;
+        const char *end = strchr(p, '}');
+        if (!end) break;
+        char block[1024];
+        int bl = (int)(end - p);
+        if (bl > (int)sizeof(block) - 1) bl = (int)sizeof(block) - 1;
+        memcpy(block, p, (size_t)bl);
+        block[bl] = '\0';
+
+        dbg_thread_t *t = &dbg->threads[dbg->thread_count];
+        memset(t, 0, sizeof(*t));
+        char id[16] = "", name[128] = "", target[128] = "", st[32] = "";
+        mi_field(block, "id", id, sizeof(id));
+        mi_field(block, "name", name, sizeof(name));
+        mi_field(block, "target-id", target, sizeof(target));
+        mi_field(block, "state", st, sizeof(st));
+        t->id = atoi(id);
+        if (name[0]) snprintf(t->name, sizeof(t->name), "%s", name);
+        else if (target[0]) snprintf(t->name, sizeof(t->name), "%s", target);
+        else snprintf(t->name, sizeof(t->name), "Thread %d", t->id);
+        t->running = strcmp(st, "running") == 0;
+        if (t->id > 0) dbg->thread_count++;
+        if (dbg->thread_count >= DBG_MAX_THREADS) break;
+        p = end;
+    }
+}
+
+bool dbg_select_thread(debugger_t *dbg, int thread_id) {
+    if (!mi_active(dbg) || thread_id <= 0) return false;
+    char cmd[64], res[1024] = "";
+    snprintf(cmd, sizeof(cmd), "-thread-select %d", thread_id);
+    if (!mi_command(dbg, cmd, res, sizeof(res)) || strstr(res, "^error"))
+        return false;
+    dbg->current_thread = thread_id;
+    dbg->active_frame = 0;
+    dbg_refresh_callstack(dbg);
+    dbg_refresh_locals(dbg);
+    return true;
+}
+
+/* --- Exception breakpoints --- */
+
+/* Inserts a pending breakpoint on `func`, returning its gdb number or -1. */
+static int mi_break_function(debugger_t *dbg, const char *func) {
+    char cmd[256], res[2048] = "";
+    snprintf(cmd, sizeof(cmd), "-break-insert -f %s", func);
+    if (!mi_command(dbg, cmd, res, sizeof(res)) || strstr(res, "^error"))
+        return -1;
+    char num[16] = "";
+    if (!mi_field(res, "number", num, sizeof(num))) return -1;
+    return atoi(num);
+}
+
+static void mi_delete_bp(debugger_t *dbg, int *num) {
+    if (*num < 0) return;
+    char cmd[64], res[512] = "";
+    snprintf(cmd, sizeof(cmd), "-break-delete %d", *num);
+    mi_command(dbg, cmd, res, sizeof(res));
+    *num = -1;
+}
+
+int dbg_set_exception_breakpoints(debugger_t *dbg, bool on_throw, bool on_unhandled) {
+    dbg->break_on_throw = on_throw;
+    dbg->break_on_exception = on_unhandled;
+    if (!mi_active(dbg)) return 0;   /* applied by dbg_start instead */
+    int placed = 0;
+    if (on_throw) {
+        if (dbg->exc_bp_throw < 0)
+            dbg->exc_bp_throw = mi_break_function(dbg, "__zan_eh_throw");
+        if (dbg->exc_bp_throw >= 0) placed++;
+    } else {
+        mi_delete_bp(dbg, &dbg->exc_bp_throw);
+    }
+    if (on_unhandled) {
+        if (dbg->exc_bp_unhandled < 0)
+            dbg->exc_bp_unhandled = mi_break_function(dbg, "__zan_eh_unhandled");
+        if (dbg->exc_bp_unhandled >= 0) placed++;
+    } else {
+        mi_delete_bp(dbg, &dbg->exc_bp_unhandled);
+    }
+    return placed;
+}
 
 void dbg_refresh_callstack(debugger_t *dbg) {
     dbg->callstack_depth = 0;
@@ -893,7 +1086,7 @@ bool dbg_set_variable(debugger_t *dbg, const char *name, const char *value) {
 
 bool dbg_get_exception_info(debugger_t *dbg, char *info, int info_size) {
     if (dbg->state != DBG_PAUSED) return false;
-    if (strcmp(dbg->stop_reason, "exception") != 0) return false;
+    if (strstr(dbg->stop_reason, "exception") == NULL) return false;
 
     snprintf(info, (size_t)info_size, "Exception at %s:%d",
             dbg->current_file, dbg->current_line + 1);

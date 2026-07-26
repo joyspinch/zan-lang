@@ -26,6 +26,34 @@ static LLVMBasicBlockRef irgen_goto_label(zan_irgen_t *g, zan_istr_t name) {
     return bb;
 }
 
+/* An empty function the debugger can put a breakpoint on, so a DAP client's
+ * "break when an exception is thrown / goes unhandled" actually stops. Only
+ * emitted for `zanc -g`; one local copy per module. */
+static LLVMValueRef get_eh_hook_fn(zan_irgen_t *g, const char *name) {
+    LLVMValueRef f = LLVMGetNamedFunction(g->mod, name);
+    if (f) return f;
+    LLVMTypeRef fty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), NULL, 0, 0);
+    f = LLVMAddFunction(g->mod, name, fty);
+    /* Internal: a weak external turns into a mangled COFF alias that gdb
+     * cannot break on by name, while a local symbol per module gives the
+     * breakpoint one location per compilation unit. */
+    LLVMSetLinkage(f, LLVMInternalLinkage);
+    LLVMBasicBlockRef saved = LLVMGetInsertBlock(g->builder);
+    LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, f, "entry");
+    LLVMPositionBuilderAtEnd(g->builder, entry);
+    LLVMBuildRetVoid(g->builder);
+    if (saved) LLVMPositionBuilderAtEnd(g->builder, saved);
+    return f;
+}
+
+/* Calls one of the debugger hooks above. */
+static void emit_eh_hook_call(zan_irgen_t *g, const char *name) {
+    if (!g->emit_debug) return;
+    LLVMValueRef f = get_eh_hook_fn(g, name);
+    LLVMTypeRef fty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), NULL, 0, 0);
+    zan_call2(g->builder, fty, f, NULL, 0, "");
+}
+
 static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *locals) {
     if (!stmt) return;
 
@@ -1213,6 +1241,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
     case AST_THROW_STMT: {
         /* throw expr; — store the exception and longjmp to the innermost
          * enclosing try (if any); otherwise print and exit(1). */
+        emit_eh_hook_call(g, "__zan_eh_throw");
         LLVMValueRef val = emit_expr(g, stmt->throw_stmt.value, locals);
         LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
         {
@@ -1280,6 +1309,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             emit_eh_longjmp(g, bufp);
             LLVMBuildUnreachable(g->builder);
             LLVMPositionBuilderAtEnd(g->builder, die_bb);
+            emit_eh_hook_call(g, "__zan_eh_unhandled");
         }
         LLVMValueRef printf_fn = LLVMGetNamedFunction(g->mod, "printf");
         if (printf_fn) {

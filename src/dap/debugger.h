@@ -22,6 +22,7 @@ extern "C" {
 #define DBG_MAX_WATCHES      32
 #define DBG_MAX_LOCALS       256
 #define DBG_MAX_CALLSTACK    64
+#define DBG_MAX_THREADS      64
 #define DBG_MAX_OUTPUT       8192
 
 /* Debugger state machine */
@@ -74,6 +75,13 @@ typedef struct {
     bool      has_children;
 } dbg_local_t;
 
+/* A thread of the debuggee, as reported by gdb's -thread-info */
+typedef struct {
+    int       id;               /* gdb thread number, used as the DAP id */
+    char      name[128];        /* thread name or gdb target-id */
+    bool      running;
+} dbg_thread_t;
+
 /* A call stack frame */
 typedef struct {
     char      function_name[128];
@@ -105,6 +113,11 @@ typedef struct {
     /* current locals */
     dbg_local_t     locals[DBG_MAX_LOCALS];
     int             local_count;
+
+    /* threads (refreshed on every stop) */
+    dbg_thread_t    threads[DBG_MAX_THREADS];
+    int             thread_count;
+    int             current_thread;
 
     /* call stack */
     dbg_frame_t     callstack[DBG_MAX_CALLSTACK];
@@ -152,6 +165,10 @@ typedef struct {
     /* settings */
     bool            break_on_entry;     /* pause at program start */
     bool            break_on_exception; /* pause on unhandled exceptions */
+    bool            break_on_throw;     /* pause on every throw */
+    int             exc_bp_throw;       /* gdb bp number, -1 when unset */
+    int             exc_bp_unhandled;
+    bool            attached;           /* attached to a running process */
     bool            skip_stdlib;        /* don't step into stdlib */
 } debugger_t;
 
@@ -164,6 +181,21 @@ void dbg_init(debugger_t *dbg);
 
 /* Start debugging a program */
 bool dbg_start(debugger_t *dbg, const char *program, const char *args);
+
+/* Attach to an already running process. `program` supplies the symbols and
+ * may be "" when gdb can read them from the process itself. */
+bool dbg_attach(debugger_t *dbg, const char *program, int pid);
+
+/* Break when an exception is thrown and/or when one goes unhandled. The
+ * compiler emits __zan_eh_throw / __zan_eh_unhandled hooks for `zanc -g`,
+ * and these are breakpoints on them. Returns the number that were placed. */
+int dbg_set_exception_breakpoints(debugger_t *dbg, bool on_throw, bool on_unhandled);
+
+/* Refresh the thread list from gdb. */
+void dbg_refresh_threads(debugger_t *dbg);
+
+/* Make `thread_id` the thread whose stack and locals are reported. */
+bool dbg_select_thread(debugger_t *dbg, int thread_id);
 
 /* Stop debugging (terminate the program) */
 void dbg_stop(debugger_t *dbg);
