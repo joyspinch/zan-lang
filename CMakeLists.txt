@@ -844,7 +844,20 @@ add_test(NAME tool_zanfmt
     -DWORKFILE=${CMAKE_BINARY_DIR}/zanfmt_work.zan
     -P ${CMAKE_SOURCE_DIR}/tests/run_zanfmt.cmake)
 
-# ---- zandoc (documentation generator) ----
-add_executable(zandoc
-    src/doc/zandoc.c
-)
+# ---- zandoc (documentation generator, written in Zan) ----
+set(_zandoc_exe ${CMAKE_BINARY_DIR}/zandoc${_exe_ext})
+add_custom_command(OUTPUT ${_zandoc_exe}
+    COMMAND $<TARGET_FILE:zanc> ${CMAKE_SOURCE_DIR}/src/doc/zandoc.zan
+            --auto-stdlib -o ${_zandoc_exe}
+    DEPENDS zanc ${CMAKE_SOURCE_DIR}/src/doc/zandoc.zan
+    COMMENT "Building zandoc from Zan source")
+add_custom_target(zandoc ALL DEPENDS ${_zandoc_exe})
+
+add_test(NAME tool_zandoc
+  COMMAND ${CMAKE_COMMAND}
+    -DZANDOC=${_zandoc_exe}
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/doc/sample.zan
+    -DEXPECTED_MD=${CMAKE_SOURCE_DIR}/tests/doc/sample.md
+    -DEXPECTED_HTML=${CMAKE_SOURCE_DIR}/tests/doc/sample.html
+    -DOUTFILE=${CMAKE_BINARY_DIR}/zandoc_out.md
+    -P ${CMAKE_SOURCE_DIR}/tests/run_zandoc.cmake)
