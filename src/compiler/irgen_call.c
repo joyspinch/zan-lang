@@ -3165,7 +3165,9 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                                 call_args[0] = this_val;
                             }
                             for (int k = 0; k < argc; k++) {
-                                call_args[k + extra] = emit_expr(g, expr->call.args.items[k], locals);
+                                call_args[k + extra] = emit_arg_typed(g,
+                                    expr->call.args.items[k],
+                                    method_param_type(g, method_sym, k), locals);
                             }
                             /* self-call inside a specialized variant stays in
                              * the same instantiation (receiver is `this`). */

@@ -147,6 +147,28 @@ static void warn_narrowing(zan_irgen_t *g, zan_type_t *dst, zan_type_t *src,
                   dst->name.str ? dst->name.str : "?", what);
 }
 
+/* A value struct and a primitive are unrelated types. Without this check the
+ * mismatch only surfaces as an LLVM verification failure with no source
+ * location ("Call parameter type does not match function signature"), which is
+ * useless while migrating an API onto a value type. */
+static void check_value_type_mismatch(zan_irgen_t *g, zan_type_t *dst, zan_type_t *src,
+                                      zan_ast_node_t *at, const char *what) {
+    if (!g || !g->diag || !at || !dst || !src) return;
+    if (dst->kind == src->kind) return;
+    bool dst_struct = dst->kind == TYPE_STRUCT, src_struct = src->kind == TYPE_STRUCT;
+    if (dst_struct == src_struct) return;
+    bool other_prim = (dst_struct ? conv_rank(src) : conv_rank(dst)) != 0 ||
+                      (dst_struct ? src->kind : dst->kind) == TYPE_FLOAT ||
+                      (dst_struct ? src->kind : dst->kind) == TYPE_DOUBLE ||
+                      (dst_struct ? src->kind : dst->kind) == TYPE_BOOL;
+    if (!other_prim) return;
+    zan_diag_emit(g->diag, DIAG_ERROR, at->loc,
+                  "cannot convert '%s' to '%s' in %s: a value struct and a "
+                  "primitive are unrelated types",
+                  src->name.str ? src->name.str : "?",
+                  dst->name.str ? dst->name.str : "?", what);
+}
+
 static zan_type_t *infer_expr_type(zan_irgen_t *g, zan_ast_node_t *e, local_scope_t *locals);
 
 static zan_type_t *member_access_field_type(zan_irgen_t *g, local_scope_t *locals, zan_ast_node_t *member) {

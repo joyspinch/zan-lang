@@ -1038,6 +1038,9 @@ static LLVMValueRef emit_expr_assignment(zan_irgen_t *g, zan_ast_node_t *expr,
             warn_narrowing(g, lt,
                 infer_expr_type(g, expr->binary.right, locals),
                 expr->binary.right, "assignment");
+            check_value_type_mismatch(g, lt,
+                infer_expr_type(g, expr->binary.right, locals),
+                expr->binary.right, "assignment");
             if (type_is_binding(lt) &&
                 !type_is_binding(infer_expr_type(g, expr->binary.right, locals))) {
                 LLVMValueRef bv = emit_binding_value(g, lt, expr->binary.right, locals);
@@ -3615,7 +3618,9 @@ static void check_delegate_async_match(zan_irgen_t *g, zan_ast_node_t *e,
 
 static LLVMValueRef emit_arg_typed(zan_irgen_t *g, zan_ast_node_t *arg,
                                    zan_type_t *ptype, local_scope_t *locals) {
-    warn_narrowing(g, ptype, infer_expr_type(g, arg, locals), arg, "argument");
+    zan_type_t *atype = infer_expr_type(g, arg, locals);
+    warn_narrowing(g, ptype, atype, arg, "argument");
+    check_value_type_mismatch(g, ptype, atype, arg, "argument");
     if (arg && ptype && ptype->kind == TYPE_DELEGATE) {
         if (arg->kind == AST_LAMBDA)
             return emit_lambda_typed(g, arg, ptype, locals);
