@@ -50,7 +50,14 @@ short, enforceable summary.
 7. **Every task ends clean.** Run `git status` before finishing; there should
    be no stray untracked files. Review `git diff --stat` and commit only what
    the task requires. Never `git add .` / `git add -A` blindly.
-8. **Never create branches.** Do NOT create local or remote branches; commit
+8. **Never run the full test suite for a compiler change.** Run only the subset
+   the change can affect (a generics/ARC change: `ctest --test-dir build -R
+   "generic|leakcheck_generic"`). The heavyweight cases (`gui_*`, `zgm_*`,
+   `selfhost_*`) are a release gate, not a per-change one: every test artifact
+   is keyed on the compiler binary, so relinking `zanc` invalidates all ~591 of
+   them and a cold full run costs ~25 minutes with nothing to show for it. Run
+   the whole suite before a release, not after each edit.
+9. **Never create branches.** Do NOT create local or remote branches; commit
    directly to `main` and push. Delete any stray branch you find after making
    sure its commits are merged into `main`.
 
