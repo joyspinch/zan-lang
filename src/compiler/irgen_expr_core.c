@@ -703,6 +703,34 @@ static zan_type_t *infer_expr_type(zan_irgen_t *g, zan_ast_node_t *e,
                     }
                 }
             }
+            /* static call on a built-in class (File.ReadAllText, Path.Combine,
+             * Directory.ListNames, ...): irgen lowers these directly, so there
+             * is no symbol to read a return type from. Without this a chained
+             * call -- File.ReadAllText(p).Split("\n") -- saw an untyped
+             * receiver and lowered to a constant. */
+            if (obj->kind == AST_IDENTIFIER && !local_find(locals, obj->ident.name)) {
+                char cls[64];
+                int cn = (int)obj->ident.name.len;
+                if (cn > 0 && cn < (int)sizeof(cls)) {
+                    memcpy(cls, obj->ident.name.str, (size_t)cn);
+                    cls[cn] = 0;
+                    const zan_builtin_type_t *bt = zan_builtin_find(cls);
+                    const char *res = bt && bt->is_static
+                        ? zan_builtin_member_result(cls, callee->member.name.str,
+                                                    (int)callee->member.name.len)
+                        : NULL;
+                    if (res) {
+                        if (strcmp(res, "string") == 0) return g->binder->type_string;
+                        if (strcmp(res, "int") == 0) return g->binder->type_int;
+                        if (strcmp(res, "long") == 0) return g->binder->type_long;
+                        if (strcmp(res, "double") == 0) return g->binder->type_double;
+                        if (strcmp(res, "bool") == 0) return g->binder->type_bool;
+                        if (strcmp(res, "List<string>") == 0)
+                            return zan_binder_make_list_type(g->binder,
+                                                             g->binder->type_string);
+                    }
+                }
+            }
             /* static: Namespace.Path.ClassName.Method() -- the object is a
              * name path, so its rightmost segment is the type name. */
             if (obj->kind == AST_MEMBER_ACCESS && is_name_path(obj)) {

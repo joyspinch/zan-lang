@@ -109,7 +109,7 @@ static const zan_builtin_member_t members_dir[] = {
     { "Exists",              'M', "bool Exists(string path)" },
     { "CreateDirectory",     'M', "void CreateDirectory(string path)" },
     { "Delete",              'M', "void Delete(string path)" },
-    { "ListNames",           'M', "List<string> ListNames(string path)" },
+    { "ListNames",           'M', "string ListNames(string globPattern)" },
     { "GetCurrentDirectory", 'M', "string GetCurrentDirectory()" },
     { "SetCurrentDirectory", 'M', "void SetCurrentDirectory(string path)" },
 };
@@ -173,6 +173,35 @@ const zan_builtin_type_t *zan_builtin_find(const char *type) {
     if (!type) return NULL;
     for (size_t i = 0; i < sizeof(builtin_types) / sizeof(builtin_types[0]); i++) {
         if (strcmp(builtin_types[i].type, type) == 0) return &builtin_types[i];
+    }
+    return NULL;
+}
+
+/* Signatures start with the result type, so it is the text before the first
+   space (a property's signature is "int Count", a method's "int IndexOf(...)").
+   The names are static, so a small table of the results actually used keeps
+   this allocation-free. */
+const char *zan_builtin_member_result(const char *type, const char *name,
+                                      int name_len) {
+    static const char *results[] = {
+        "string", "int", "long", "double", "bool", "void", "nint",
+        "List<string>", "List<K>", "List<V>", "ConsoleColor",
+    };
+    const zan_builtin_type_t *bt = zan_builtin_find(type);
+    if (!bt || !name || name_len <= 0) return NULL;
+    for (int i = 0; i < bt->member_count; i++) {
+        const char *m = bt->members[i].name;
+        if ((int)strlen(m) != name_len || memcmp(m, name, (size_t)name_len) != 0)
+            continue;
+        const char *sig = bt->members[i].sig;
+        const char *sp = strchr(sig, ' ');
+        if (!sp) return NULL;
+        size_t len = (size_t)(sp - sig);
+        for (size_t r = 0; r < sizeof(results) / sizeof(results[0]); r++) {
+            if (strlen(results[r]) == len && memcmp(results[r], sig, len) == 0)
+                return results[r];
+        }
+        return NULL;
     }
     return NULL;
 }

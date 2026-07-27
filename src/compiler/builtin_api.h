@@ -50,4 +50,10 @@ int zan_builtin_has_member(const char *type, const char *name, int name_len);
    receiver this table does not describe. */
 char zan_builtin_member_kind(const char *type, const char *name, int name_len);
 
+/* The declared result of `type`'s member `name` -- the leading word of its
+   signature, e.g. "string" for File.ReadAllText -- or NULL when the table does
+   not describe it. */
+const char *zan_builtin_member_result(const char *type, const char *name,
+                                      int name_len);
+
 #endif /* ZAN_BUILTIN_API_H */
