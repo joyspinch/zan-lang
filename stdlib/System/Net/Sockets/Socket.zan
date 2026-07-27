@@ -7,19 +7,23 @@ namespace System.Net.Sockets;
 /// Uses Winsock2 on Windows, BSD sockets (libc) on Linux/macOS.
 /// </summary>
 class Socket {
+    // A socket handle is `nint` throughout this API, as in C#
+    // (SafeSocketHandle / IntPtr): Windows SOCKET is a UINT_PTR, a POSIX fd is
+    // a 32-bit int. Only the Sys* wrappers below meet the real C signatures,
+    // truncating to `int` where POSIX expects an fd.
     [DllImport("crt", EntryPoint = "zan_io_socket_send")]
-    static extern int ReactorSend(int sock, string buf, int len, int flags);
+    static extern int ReactorSend(nint sock, string buf, int len, int flags);
 
     [DllImport("crt", EntryPoint = "zan_io_socket_recv")]
-    static extern int ReactorRecv(int sock, string buf, int len, int flags);
+    static extern int ReactorRecv(nint sock, string buf, int len, int flags);
 
     [DllImport("crt", EntryPoint = "zan_io_socket_ready")]
-    static extern int ReactorReady(int sock, int writeReady);
+    static extern int ReactorReady(nint sock, int writeReady);
 
     /// <summary>Probes the outcome of a non-blocking connect: 0 connected,
     /// positive SO_ERROR code (or -1) when failed, -2 while in progress.</summary>
     [DllImport("crt", EntryPoint = "zan_io_connect_status")]
-    static extern int ConnectStatus(int sock);
+    static extern int ConnectStatus(nint sock);
 
     // ---- Platform-specific DllImport ----
     #if WINDOWS
@@ -30,43 +34,46 @@ class Socket {
     static extern void ReactorCleanup();
 
     [DllImport("ws2_32")]
-    static extern int socket(int af, int type, int protocol);
+    static extern nint socket(int af, int type, int protocol);
 
     [DllImport("ws2_32")]
-    static extern int closesocket(int s);
+    static extern int closesocket(nint s);
 
     [DllImport("ws2_32", EntryPoint = "send")]
-    static extern int winsend(int s, string buf, int len, int flags);
+    static extern int winsend(nint s, string buf, int len, int flags);
 
     [DllImport("ws2_32", EntryPoint = "recv")]
-    static extern int winrecv(int s, string buf, int len, int flags);
+    static extern int winrecv(nint s, string buf, int len, int flags);
 
     [DllImport("ws2_32")]
-    static extern int bind(int s, string addr, int addrlen);
+    static extern int bind(nint s, string addr, int addrlen);
 
     [DllImport("ws2_32")]
-    static extern int listen(int s, int backlog);
+    static extern int listen(nint s, int backlog);
 
     [DllImport("ws2_32")]
-    static extern int accept(int s, string addr, string addrlen);
+    static extern nint accept(nint s, string addr, string addrlen);
 
     [DllImport("ws2_32")]
-    static extern int connect(int s, string addr, int addrlen);
+    static extern int connect(nint s, string addr, int addrlen);
 
     [DllImport("ws2_32")]
-    static extern int setsockopt(int s, int level, int optname, string optval, int optlen);
+    static extern int setsockopt(nint s, int level, int optname, string optval, int optlen);
 
     [DllImport("ws2_32")]
-    static extern int ioctlsocket(int s, int cmd, string argp);
+    static extern int ioctlsocket(nint s, int cmd, string argp);
 
     [DllImport("ws2_32")]
-    static extern int shutdown(int s, int how);
+    static extern int shutdown(nint s, int how);
+
+    [DllImport("kernel32", EntryPoint = "CancelIoEx")]
+    static extern int CancelIoEx(nint handle, nint overlapped);
 
     [DllImport("ws2_32")]
-    static extern int sendto(int s, string buf, int len, int flags, string to, int tolen);
+    static extern int sendto(nint s, string buf, int len, int flags, string to, int tolen);
 
     [DllImport("ws2_32")]
-    static extern int recvfrom(int s, string buf, int len, int flags, string from, string fromlen);
+    static extern int recvfrom(nint s, string buf, int len, int flags, string from, string fromlen);
 
     [DllImport("ws2_32")]
     static extern int htons(int hostshort);
@@ -81,7 +88,24 @@ class Socket {
     static extern int inet_addr(string cp);
 
     [DllImport("ws2_32")]
-    static extern int gethostbyname(string name);
+    static extern nint gethostbyname(string name);
+
+    // Winsock takes the whole SOCKET handle, so these just forward.
+    static int SysClose(nint s) { return closesocket(s); }
+    static int SysShutdown(nint s, int how) { return shutdown(s, how); }
+    static int SysBind(nint s, string addr, int addrlen) { return bind(s, addr, addrlen); }
+    static int SysListen(nint s, int backlog) { return listen(s, backlog); }
+    static nint SysAccept(nint s, string addr, string addrlen) { return accept(s, addr, addrlen); }
+    static int SysConnect(nint s, string addr, int addrlen) { return connect(s, addr, addrlen); }
+    static int SysSetSockOpt(nint s, int level, int optname, string optval, int optlen) {
+        return setsockopt(s, level, optname, optval, optlen);
+    }
+    static int SysSendTo(nint s, string buf, int len, int flags, string to, int tolen) {
+        return sendto(s, buf, len, flags, to, tolen);
+    }
+    static int SysRecvFrom(nint s, string buf, int len, int flags, string from, string fromlen) {
+        return recvfrom(s, buf, len, flags, from, fromlen);
+    }
     #elif LINUX || MACOS
     [DllImport("crt")]
     static extern int socket(int af, int type, int protocol);
@@ -139,6 +163,23 @@ class Socket {
 
     [DllImport("crt")]
     static extern int fcntl(int fd, int cmd, int arg);
+
+    // A POSIX fd is a 32-bit int: truncate the handle here, once.
+    static int SysClose(nint s) { return closesocket((int)s); }
+    static int SysShutdown(nint s, int how) { return shutdown((int)s, how); }
+    static int SysBind(nint s, string addr, int addrlen) { return bind((int)s, addr, addrlen); }
+    static int SysListen(nint s, int backlog) { return listen((int)s, backlog); }
+    static nint SysAccept(nint s, string addr, string addrlen) { return accept((int)s, addr, addrlen); }
+    static int SysConnect(nint s, string addr, int addrlen) { return connect((int)s, addr, addrlen); }
+    static int SysSetSockOpt(nint s, int level, int optname, string optval, int optlen) {
+        return setsockopt((int)s, level, optname, optval, optlen);
+    }
+    static int SysSendTo(nint s, string buf, int len, int flags, string to, int tolen) {
+        return sendto((int)s, buf, len, flags, to, tolen);
+    }
+    static int SysRecvFrom(nint s, string buf, int len, int flags, string from, string fromlen) {
+        return recvfrom((int)s, buf, len, flags, from, fromlen);
+    }
     #endif
 
     [DllImport("crt")]
@@ -152,6 +193,12 @@ class Socket {
 
     [DllImport("crt")]
     static extern string memcpy(string dest, string src, int n);
+
+    // Monotonic clock for deadline-bounded operations (same source as
+    // Stopwatch, declared here so the socket layer keeps no dependency on
+    // System.Threading).
+    [DllImport("crt", EntryPoint = "zan_monotonic_us")]
+    static extern int NativeMonotonicUs();
 
     /// <summary>Initializes the socket subsystem (WSAStartup on Windows, no-op on Linux).</summary>
     static void Initialize() {
@@ -170,18 +217,18 @@ class Socket {
     }
 
     /// <summary>Creates a TCP socket.</summary>
-    static int CreateTcp() {
+    static nint CreateTcp() {
         return socket(2, 1, 6);
     }
 
     /// <summary>Creates a UDP socket.</summary>
-    static int CreateUdp() {
+    static nint CreateUdp() {
         return socket(2, 2, 17);
     }
 
     /// <summary>Closes a socket.</summary>
-    static void Close(int sock) {
-        closesocket(sock);
+    static void Close(nint sock) {
+        SysClose(sock);
     }
 
     /// <summary>Shuts the connection down in both directions without releasing
@@ -190,12 +237,19 @@ class Socket {
     /// which closing the descriptor outright would not do: the fd would leave
     /// the reactor set with no completion and the coroutine would never
     /// resume. Used to hang up on connections that outstay a limit.</summary>
-    static void ShutdownBoth(int sock) {
-        shutdown(sock, 2);   // SD_BOTH / SHUT_RDWR
+    static void ShutdownBoth(nint sock) {
+        SysShutdown(sock, 2);   // SD_BOTH / SHUT_RDWR
+        #if WINDOWS
+        // A local shutdown does not complete an already-posted WSARecv, so on
+        // Windows the wake has to be asked for explicitly: CancelIoEx completes
+        // every pending overlapped operation on the handle, which the reactor
+        // reports as 0 bytes -- the same peer-close shape POSIX gives for free.
+        int _cancelled = CancelIoEx(sock, 0);
+        #endif
     }
 
     /// <summary>Sets the socket to non-blocking mode.</summary>
-    static int SetNonBlocking(int sock) {
+    static int SetNonBlocking(nint sock) {
         #if WINDOWS
         string argp = calloc(4, 1);
         argp[0] = 1;
@@ -203,24 +257,24 @@ class Socket {
         free(argp);
         return result;
         #elif LINUX
-        int flags = fcntl(sock, 3, 0);
-        return fcntl(sock, 4, flags | 2048);
+        int flags = fcntl((int)sock, 3, 0);
+        return fcntl((int)sock, 4, flags | 2048);
         #elif MACOS
-        int flags = fcntl(sock, 3, 0);
-        return fcntl(sock, 4, flags | 4);
+        int flags = fcntl((int)sock, 3, 0);
+        return fcntl((int)sock, 4, flags | 4);
         #endif
     }
 
     /// <summary>Sets SO_REUSEADDR on a socket.</summary>
-    static void SetReuseAddr(int sock) {
+    static void SetReuseAddr(nint sock) {
         string optval = calloc(4, 1);
         optval[0] = 1;
         #if WINDOWS
-        setsockopt(sock, 65535, 4, optval, 4);
+        SysSetSockOpt(sock, 65535, 4, optval, 4);
         #elif LINUX
-        setsockopt(sock, 1, 2, optval, 4);
+        SysSetSockOpt(sock, 1, 2, optval, 4);
         #elif MACOS
-        setsockopt(sock, 65535, 4, optval, 4);
+        SysSetSockOpt(sock, 65535, 4, optval, 4);
         #endif
         free(optval);
     }
@@ -230,15 +284,15 @@ class Socket {
     /// them -- the basis for multi-worker horizontal scaling (Linux/macOS). Must
     /// be set before bind(). Windows has no SO_REUSEPORT, so SO_REUSEADDR is set
     /// instead (a single process still owns the port there).</summary>
-    static void SetReusePort(int sock) {
+    static void SetReusePort(nint sock) {
         string optval = calloc(4, 1);
         optval[0] = 1;
         #if WINDOWS
-        setsockopt(sock, 65535, 4, optval, 4);
+        SysSetSockOpt(sock, 65535, 4, optval, 4);
         #elif LINUX
-        setsockopt(sock, 1, 15, optval, 4);
+        SysSetSockOpt(sock, 1, 15, optval, 4);
         #elif MACOS
-        setsockopt(sock, 65535, 512, optval, 4);
+        SysSetSockOpt(sock, 65535, 512, optval, 4);
         #endif
         free(optval);
     }
@@ -248,23 +302,23 @@ class Socket {
     /// a client that pipelines requests hits the ~40 ms delayed-ACK stall: the
     /// websocket echo path measured 18k messages/sec purely because of it.
     /// IPPROTO_TCP is 6 and TCP_NODELAY is 1 on all supported platforms.</summary>
-    static void SetNoDelay(int sock) {
+    static void SetNoDelay(nint sock) {
         string optval = calloc(4, 1);
         optval[0] = 1;
-        setsockopt(sock, 6, 1, optval, 4);
+        SysSetSockOpt(sock, 6, 1, optval, 4);
         free(optval);
     }
 
     /// <summary>Enables SO_BROADCAST on a socket (platform-correct constants).</summary>
-    static void SetBroadcast(int sock) {
+    static void SetBroadcast(nint sock) {
         string optval = calloc(4, 1);
         optval[0] = 1;
         #if WINDOWS
-        setsockopt(sock, 65535, 32, optval, 4);
+        SysSetSockOpt(sock, 65535, 32, optval, 4);
         #elif LINUX
-        setsockopt(sock, 1, 6, optval, 4);
+        SysSetSockOpt(sock, 1, 6, optval, 4);
         #elif MACOS
-        setsockopt(sock, 65535, 32, optval, 4);
+        SysSetSockOpt(sock, 65535, 32, optval, 4);
         #endif
         free(optval);
     }
@@ -296,24 +350,24 @@ class Socket {
     }
 
     /// <summary>Binds a socket to an address and port.</summary>
-    static int Bind(int sock, string ip, int port) {
+    static int Bind(nint sock, string ip, int port) {
         string addr = BuildSockAddr(ip, port);
-        int result = bind(sock, addr, 16);
+        int result = SysBind(sock, addr, 16);
         free(addr);
         return result;
     }
 
     /// <summary>Starts listening for connections.</summary>
-    static int Listen(int sock, int backlog) {
-        return listen(sock, backlog);
+    static int Listen(nint sock, int backlog) {
+        return SysListen(sock, backlog);
     }
 
     /// <summary>Accepts a connection synchronously.</summary>
-    static int Accept(int sock) {
+    static nint Accept(nint sock) {
         string clientAddr = calloc(16, 1);
         string addrLen = calloc(4, 1);
         addrLen[0] = 16;
-        int clientSock = accept(sock, clientAddr, addrLen);
+        nint clientSock = SysAccept(sock, clientAddr, addrLen);
         free(clientAddr);
         free(addrLen);
         return clientSock;
@@ -321,13 +375,13 @@ class Socket {
 
     /// <summary>Suspends on the IO reactor until an inbound connection is
     /// pending, then accepts it. Requires a non-blocking listener socket.</summary>
-    static async int AcceptAsync(int sock) {
+    static async nint AcceptAsync(nint sock) {
         #if WINDOWS
         return await Socket.AcceptOv(sock);
         #else
         while (true) {
             await Socket.ReadReady(sock);
-            int client = Accept(sock);
+            nint client = Accept(sock);
             if (client >= 0) {
                 return client;
             }
@@ -337,9 +391,9 @@ class Socket {
     }
 
     /// <summary>Connects to a remote address synchronously.</summary>
-    static int Connect(int sock, string ip, int port) {
+    static int Connect(nint sock, string ip, int port) {
         string addr = BuildSockAddr(ip, port);
-        int result = connect(sock, addr, 16);
+        int result = SysConnect(sock, addr, 16);
         free(addr);
         return result;
     }
@@ -354,7 +408,7 @@ class Socket {
     /// early and a failed connect is reported through the exception set), so
     /// after each wake the outcome is checked with ConnectStatus and re-polled
     /// with a short delay while still in progress.</summary>
-    static async int ConnectAsync(int sock, string ip, int port) {
+    static async int ConnectAsync(nint sock, string ip, int port) {
         Connect(sock, ip, port);
         await Socket.WriteReady(sock);
         while (true) {
@@ -367,8 +421,42 @@ class Socket {
         return 0;
     }
 
+    /// <summary>ConnectAsync bounded by <paramref name="timeoutMs"/>: returns
+    /// -3 when the connection has neither succeeded nor failed within the
+    /// window (a black-holed address never wakes the reactor, so the plain
+    /// overload would suspend forever). A non-positive timeout means "no
+    /// deadline" and defers to the reactor-driven overload.
+    ///
+    /// While the connect is pending the outcome is polled with ConnectStatus
+    /// and a growing delay instead of awaiting write-readiness: a reactor wake
+    /// cannot be cancelled, so a deadline can only be observed from a timer
+    /// this coroutine owns. The socket is left for the caller to close.</summary>
+    static async int ConnectAsync(nint sock, string ip, int port, int timeoutMs) {
+        if (timeoutMs <= 0) {
+            int plain = await ConnectAsync(sock, ip, port);
+            return plain;
+        }
+        Connect(sock, ip, port);
+        int deadlineUs = NativeMonotonicUs() + timeoutMs * 1000;
+        int stepMs = 1;
+        while (true) {
+            int st = ConnectStatus(sock);
+            if (st != -2) {
+                return st;
+            }
+            if (NativeMonotonicUs() >= deadlineUs) {
+                return -3;
+            }
+            await Task.Delay(stepMs);
+            if (stepMs < 16) {
+                stepMs = stepMs * 2;
+            }
+        }
+        return 0;
+    }
+
     /// <summary>Sends data synchronously.</summary>
-    static int Send(int sock, string data, int len) {
+    static int Send(nint sock, string data, int len) {
         return ReactorSend(sock, data, len, 0);
     }
 
@@ -385,7 +473,7 @@ class Socket {
     /// is only awaited when the socket would block (partial write / full send
     /// buffer). On an uncongested socket the whole payload leaves in one syscall
     /// with no suspension, avoiding a reactor round-trip per message.</summary>
-    static async int SendAsync(int sock, string data, int len) {
+    static async int SendAsync(nint sock, string data, int len) {
         int totalSent = 0;
         string cur = data;
         int curLen = len;
@@ -420,27 +508,27 @@ class Socket {
     }
 
     /// <summary>Sends a string (calculates length automatically).</summary>
-    static int SendString(int sock, string data) {
+    static int SendString(nint sock, string data) {
         int len = strlen(data);
         return Send(sock, data, len);
     }
 
     /// <summary>Sends a whole string asynchronously (length via strlen).</summary>
-    static async int SendStringAsync(int sock, string data) {
+    static async int SendStringAsync(nint sock, string data) {
         int len = strlen(data);
         int r = await SendAsync(sock, data, len);
         return r;
     }
 
     /// <summary>Receives data synchronously.</summary>
-    static int Recv(int sock, string buf, int bufSize) {
+    static int Recv(nint sock, string buf, int bufSize) {
         return ReactorRecv(sock, buf, bufSize, 0);
     }
 
     /// <summary>Suspends on the IO reactor until readable, then receives up to
     /// <paramref name="bufSize"/> bytes. Returns the data as a NUL-terminated
     /// string (empty on peer close / EOF). Requires a non-blocking socket.</summary>
-    static async string RecvAsync(int sock, int bufSize) {
+    static async string RecvAsync(nint sock, int bufSize) {
         string buf = calloc(bufSize + 1, 1);
         // Use the real overlapped receive (RecvOv) rather than a readiness probe
         // plus synchronous recv. A zero-byte readiness WSARecv can complete
@@ -460,7 +548,7 @@ class Socket {
     /// byte count. Returns the number of bytes read (0 on peer close). Lets a
     /// keep-alive connection reuse one buffer across requests instead of
     /// allocating and zeroing a fresh (up to 64KB) buffer per request.</summary>
-    static async int RecvIntoAsync(int sock, string buf, int bufSize) {
+    static async int RecvIntoAsync(nint sock, string buf, int bufSize) {
         int n = await Socket.RecvOv(sock, buf, bufSize);
         if (n > 0) {
             buf[n] = 0;
@@ -471,7 +559,7 @@ class Socket {
     }
 
     /// <summary>Receives into a buffer (returns string).</summary>
-    static string Receive(int sock, int bufSize) {
+    static string Receive(nint sock, int bufSize) {
         string buf = calloc(bufSize + 1, 1);
         int n = Recv(sock, buf, bufSize);
         if (n < 0) { n = 0; }
@@ -481,28 +569,28 @@ class Socket {
     }
 
     /// <summary>Sends a UDP datagram.</summary>
-    static int SendTo(int sock, string data, int len, string ip, int port) {
+    static int SendTo(nint sock, string data, int len, string ip, int port) {
         string addr = BuildSockAddr(ip, port);
-        int result = sendto(sock, data, len, 0, addr, 16);
+        int result = SysSendTo(sock, data, len, 0, addr, 16);
         free(addr);
         return result;
     }
 
     /// <summary>Suspends until writable, then sends a UDP datagram. Requires a
     /// non-blocking socket.</summary>
-    static async int SendToAsync(int sock, string data, int len, string ip, int port) {
+    static async int SendToAsync(nint sock, string data, int len, string ip, int port) {
         await Socket.WriteReady(sock);
         int result = SendTo(sock, data, len, ip, port);
         return result;
     }
 
     /// <summary>Receives a UDP datagram.</summary>
-    static string RecvFrom(int sock, int bufSize) {
+    static string RecvFrom(nint sock, int bufSize) {
         string buf = calloc(bufSize + 1, 1);
         string fromAddr = calloc(16, 1);
         string fromLen = calloc(4, 1);
         fromLen[0] = 16;
-        int n = recvfrom(sock, buf, bufSize, 0, fromAddr, fromLen);
+        int n = SysRecvFrom(sock, buf, bufSize, 0, fromAddr, fromLen);
         // recvfrom is a raw ws2_32 import returning C `int`; a -1 error arrives
         // zero-extended as 0xFFFFFFFF. Sign-normalize the low 32 bits so the
         // error check below sees a genuine negative rather than ~4G (which would
@@ -518,7 +606,7 @@ class Socket {
 
     /// <summary>Suspends on the IO reactor until a datagram is available, then
     /// receives it. Requires a non-blocking socket.</summary>
-    static async string RecvFromAsync(int sock, int bufSize) {
+    static async string RecvFromAsync(nint sock, int bufSize) {
         await Socket.ReadReady(sock);
         string result = RecvFrom(sock, bufSize);
         return result;
@@ -545,12 +633,12 @@ class Socket {
     /// <summary>Receives a UDP datagram and records the sender's address, so a
     /// server can reply (see PeerIp/PeerPort). Returns the payload ("" on
     /// error/close).</summary>
-    static string RecvFromPeer(int sock, int bufSize) {
+    static string RecvFromPeer(nint sock, int bufSize) {
         string buf = calloc(bufSize + 1, 1);
         string fromAddr = calloc(16, 1);
         string fromLen = calloc(4, 1);
         fromLen[0] = 16;
-        int n = recvfrom(sock, buf, bufSize, 0, fromAddr, fromLen);
+        int n = SysRecvFrom(sock, buf, bufSize, 0, fromAddr, fromLen);
         // Sign-normalize the low 32 bits (see RecvFrom).
         if (n > 2147483647) { n = n - 4294967296; }
         if (n < 0) { n = 0; }
@@ -573,7 +661,7 @@ class Socket {
 
     /// <summary>Suspends until a datagram arrives, receives it, and records the
     /// sender's address (see PeerIp/PeerPort). Requires a non-blocking socket.</summary>
-    static async string RecvFromPeerAsync(int sock, int bufSize) {
+    static async string RecvFromPeerAsync(nint sock, int bufSize) {
         await Socket.ReadReady(sock);
         string result = RecvFromPeer(sock, bufSize);
         return result;
@@ -581,18 +669,18 @@ class Socket {
 
     /// <summary>Resolves a hostname to an IP address.</summary>
     static string Resolve(string hostname) {
-        int he = gethostbyname(hostname);
+        nint he = gethostbyname(hostname);
         if (he == 0) { return ""; }
         return hostname;
     }
 
     /// <summary>Checks if a socket is readable using select() with zero timeout.</summary>
-    static bool IsReadable(int sock) {
+    static bool IsReadable(nint sock) {
         return ReactorReady(sock, 0) > 0;
     }
 
     /// <summary>Checks if a socket is writable using select() with zero timeout.</summary>
-    static bool IsWritable(int sock) {
+    static bool IsWritable(nint sock) {
         return ReactorReady(sock, 1) > 0;
     }
 }

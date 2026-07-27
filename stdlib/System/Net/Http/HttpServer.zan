@@ -159,7 +159,7 @@ class HttpServer {
         this.running = true;
 
         while (this.running) {
-            int clientSock = await this.listener.AcceptAsync();
+            nint clientSock = await this.listener.AcceptAsync();
             if (clientSock >= 0) {
                 Socket.SetNoDelay(clientSock);
                 if (this.activeConnections >= this.maxConnections) {
@@ -176,7 +176,7 @@ class HttpServer {
         }
     }
 
-    static async void RejectOverloaded(int clientSock) {
+    static async void RejectOverloaded(nint clientSock) {
         TcpClient client = TcpClient.FromSocket(clientSock);
         HttpResponse busy = HttpResponse.WithStatus(503, "Service Unavailable",
             "server busy");
@@ -186,7 +186,7 @@ class HttpServer {
     }
 
     /// <summary>Handles a single client connection.</summary>
-    async void HandleConnection(int clientSock) {
+    async void HandleConnection(nint clientSock) {
         await HttpServer.ServeConnection(clientSock, this.requestHandler,
             this.maxHeaderBytes, this.maxRequestBytes, this.requestTimeout);
         this.activeConnections = this.activeConnections - 1;
@@ -206,7 +206,7 @@ class HttpServer {
     ///   hang-up -- a request that is not complete within
     ///          <paramref name="timeoutMs"/> (slowloris: the deadline is set per
     ///          request and is NOT refreshed by trickled bytes).</summary>
-    static async void ServeConnection(int clientSock, HttpRequestHandler handler,
+    static async void ServeConnection(nint clientSock, HttpRequestHandler handler,
                                       int maxHeaderBytes, int maxRequestBytes,
                                       int timeoutMs) {
         await HttpServer.ServePrimed(clientSock, handler, "",
@@ -217,7 +217,7 @@ class HttpServer {
     /// read: `pending` is put back at the head of the stream. A port that serves
     /// both HTTP and WebSocket has to look at the request head before it knows
     /// which one it is, and hands the bytes it consumed to this.</summary>
-    static async void ServePrimed(int clientSock, HttpRequestHandler handler,
+    static async void ServePrimed(nint clientSock, HttpRequestHandler handler,
                                   string pending,
                                   int maxHeaderBytes, int maxRequestBytes,
                                   int timeoutMs) {
@@ -362,8 +362,9 @@ class HttpServer {
 /// that coroutine and leak the slot.
 /// </summary>
 class HttpDeadline {
-    static List<int> socks = new List<int>();
+    static List<nint> socks = new List<nint>();
     static List<int> deadlines = new List<int>();
+    static List<bool> fired = new List<bool>();
     static List<int> freeSlots = new List<int>();
     static bool sweeping = false;
     // Coarse clock kept by the sweeper: reading the real clock costs a syscall
@@ -373,7 +374,7 @@ class HttpDeadline {
 
     /// <summary>Registers a connection and returns its slot, or -1 when
     /// deadlines are disabled (timeoutMs &lt;= 0).</summary>
-    static int Arm(int sock, int timeoutMs) {
+    static int Arm(nint sock, int timeoutMs) {
         if (timeoutMs <= 0) { return -1; }
         if (!sweeping) {
             sweeping = true;
@@ -386,10 +387,12 @@ class HttpDeadline {
             freeSlots.RemoveAt(n - 1);
             socks[slot] = sock;
             deadlines[slot] = nowMs + timeoutMs;
+            fired[slot] = false;
             return slot;
         }
         socks.Add(sock);
         deadlines.Add(nowMs + timeoutMs);
+        fired.Add(false);
         return socks.Count - 1;
     }
 
@@ -397,6 +400,15 @@ class HttpDeadline {
     static void Touch(int slot, int timeoutMs) {
         if (slot < 0) { return; }
         deadlines[slot] = nowMs + timeoutMs;
+        fired[slot] = false;
+    }
+
+    /// <summary>True when the sweeper hung up on this slot, i.e. the wake that
+    /// ended the owner's read was the deadline and not the peer. Callers that
+    /// report timeouts (the HTTP client) must ask before Disarm.</summary>
+    static bool Expired(int slot) {
+        if (slot < 0) { return false; }
+        return fired[slot];
     }
 
     /// <summary>Releases a slot when the connection is done.</summary>
@@ -415,11 +427,12 @@ class HttpDeadline {
         int i = 0;
         int n = socks.Count;
         while (i < n) {
-            int s = socks[i];
+            nint s = socks[i];
             if (s >= 0 && nowMs > deadlines[i]) {
                 // Push the deadline out so a slot is only hung up once; the
                 // owning coroutine frees it via Disarm as it unwinds.
                 deadlines[i] = nowMs + 3600000;
+                fired[i] = true;
                 Socket.ShutdownBoth(s);
             }
             i = i + 1;

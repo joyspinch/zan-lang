@@ -1,0 +1,1253 @@
+using System;
+
+namespace Gui;
+
+#if WINDOWS
+
+/// Win32 window procedure, implemented in Zan and handed to RegisterClassExW.
+delegate nint ZanWndProc(nint hwnd, int msg, nint wp, nint lp);
+
+/// SetWindowCompositionAttribute (undocumented user32 entry, resolved lazily).
+delegate int SetWinCompAttrFn(nint hwnd, nint data);
+/// SetProcessDpiAwareness (Shcore) / SetProcessDPIAware (user32) fallbacks.
+delegate int SetProcessDpiAwarenessFn(int level);
+delegate int SetProcessDpiAwareFn();
+
+/// <summary>
+/// The Windows window shell -- class registration, the window procedure, the
+/// event queue, DIB presentation, acrylic glass, IME placement, the clipboard
+/// and the automation injection queue -- written in Zan against user32/gdi32
+/// instead of a C runtime file. Pixels still come from the rasterizer surface
+/// (Canvas), which hands over its buffer through zan_gui_get_pixels.
+///
+/// Everything the widget layer sees goes through Gui.Window, so this class is
+/// the Windows half of that abstraction and mirrors, one for one, the flat
+/// exports the other platforms' backends provide.
+/// </summary>
+class Win32Shell {
+    [DllImport("user32", EntryPoint = "RegisterClassExW")]
+    static extern int RegisterClassExW(nint wc);
+    [DllImport("user32", EntryPoint = "CreateWindowExW")]
+    static extern nint CreateWindowExW(int exStyle, nint cls, nint title,
+                                       int style, int x, int y, int w, int h,
+                                       nint parent, nint menu, nint inst,
+                                       nint param);
+    [DllImport("user32", EntryPoint = "DefWindowProcW")]
+    static extern nint DefWindowProcW(nint hwnd, int msg, nint wp, nint lp);
+    [DllImport("user32", EntryPoint = "ShowWindow")]
+    static extern int ShowWindow(nint hwnd, int cmd);
+    [DllImport("user32", EntryPoint = "UpdateWindow")]
+    static extern int UpdateWindow(nint hwnd);
+    [DllImport("user32", EntryPoint = "SetForegroundWindow")]
+    static extern int SetForegroundWindow(nint hwnd);
+    [DllImport("user32", EntryPoint = "SetFocus")]
+    static extern nint SetFocus(nint hwnd);
+    [DllImport("user32", EntryPoint = "DestroyWindow")]
+    static extern int DestroyWindow(nint hwnd);
+    [DllImport("user32", EntryPoint = "PostMessageW")]
+    static extern int PostMessageW(nint hwnd, int msg, nint wp, nint lp);
+    [DllImport("user32", EntryPoint = "PostQuitMessage")]
+    static extern void PostQuitMessage(int code);
+    [DllImport("user32", EntryPoint = "PeekMessageW")]
+    static extern int PeekMessageW(nint msg, nint hwnd, int min, int max, int remove);
+    [DllImport("user32", EntryPoint = "GetMessageW")]
+    static extern int GetMessageW(nint msg, nint hwnd, int min, int max);
+    [DllImport("user32", EntryPoint = "TranslateMessage")]
+    static extern int TranslateMessage(nint msg);
+    [DllImport("user32", EntryPoint = "DispatchMessageW")]
+    static extern nint DispatchMessageW(nint msg);
+    [DllImport("user32", EntryPoint = "MsgWaitForMultipleObjects")]
+    static extern int MsgWaitForMultipleObjects(int count, nint handles,
+                                                int waitAll, int ms, int mask);
+    [DllImport("user32", EntryPoint = "GetClientRect")]
+    static extern int GetClientRect(nint hwnd, nint rect);
+    [DllImport("user32", EntryPoint = "GetWindowRect")]
+    static extern int GetWindowRect(nint hwnd, nint rect);
+    [DllImport("user32", EntryPoint = "AdjustWindowRect")]
+    static extern int AdjustWindowRect(nint rect, int style, int menu);
+    [DllImport("user32", EntryPoint = "SetWindowPos")]
+    static extern int SetWindowPos(nint hwnd, nint after, int x, int y,
+                                   int w, int h, int flags);
+    [DllImport("user32", EntryPoint = "GetWindowPlacement")]
+    static extern int GetWindowPlacement(nint hwnd, nint placement);
+    [DllImport("user32", EntryPoint = "IsIconic")]
+    static extern int IsIconic(nint hwnd);
+    [DllImport("user32", EntryPoint = "IsWindowVisible")]
+    static extern int IsWindowVisible(nint hwnd);
+    [DllImport("user32", EntryPoint = "GetForegroundWindow")]
+    static extern nint GetForegroundWindow();
+    [DllImport("user32", EntryPoint = "SetWindowTextW")]
+    static extern int SetWindowTextW(nint hwnd, nint title);
+    [DllImport("user32", EntryPoint = "LoadCursorW")]
+    static extern nint LoadCursorW(nint inst, nint name);
+    [DllImport("user32", EntryPoint = "LoadIconW")]
+    static extern nint LoadIconW(nint inst, nint name);
+    [DllImport("user32", EntryPoint = "SetCursor")]
+    static extern nint SetCursor(nint cursor);
+    [DllImport("user32", EntryPoint = "SetCapture")]
+    static extern nint SetCapture(nint hwnd);
+    [DllImport("user32", EntryPoint = "ReleaseCapture")]
+    static extern int ReleaseCapture();
+    [DllImport("user32", EntryPoint = "GetKeyState")]
+    static extern int GetKeyState(int vk);
+    [DllImport("user32", EntryPoint = "ScreenToClient")]
+    static extern int ScreenToClient(nint hwnd, nint point);
+    [DllImport("user32", EntryPoint = "GetDC")]
+    static extern nint GetDC(nint hwnd);
+    [DllImport("user32", EntryPoint = "ReleaseDC")]
+    static extern int ReleaseDC(nint hwnd, nint dc);
+    [DllImport("user32", EntryPoint = "GetSystemMetrics")]
+    static extern int GetSystemMetrics(int index);
+    [DllImport("user32", EntryPoint = "MonitorFromWindow")]
+    static extern nint MonitorFromWindow(nint hwnd, int flags);
+    [DllImport("user32", EntryPoint = "GetMonitorInfoW")]
+    static extern int GetMonitorInfoW(nint monitor, nint info);
+    [DllImport("user32", EntryPoint = "GetWindowLongPtrW")]
+    static extern nint GetWindowLongPtrW(nint hwnd, int index);
+    [DllImport("user32", EntryPoint = "SetWindowLongPtrW")]
+    static extern nint SetWindowLongPtrW(nint hwnd, int index, nint newLong);
+    [DllImport("user32", EntryPoint = "SetLayeredWindowAttributes")]
+    static extern int SetLayeredWindowAttributes(nint hwnd, int key, int alpha,
+                                                 int flags);
+    [DllImport("user32", EntryPoint = "UpdateLayeredWindow")]
+    static extern int UpdateLayeredWindow(nint hwnd, nint dcDst, nint ptDst,
+                                          nint size, nint dcSrc, nint ptSrc,
+                                          int key, nint blend, int flags);
+    [DllImport("user32", EntryPoint = "BeginPaint")]
+    static extern nint BeginPaint(nint hwnd, nint ps);
+    [DllImport("user32", EntryPoint = "EndPaint")]
+    static extern int EndPaint(nint hwnd, nint ps);
+    [DllImport("user32", EntryPoint = "FillRect")]
+    static extern int FillRect(nint dc, nint rect, nint brush);
+    [DllImport("user32", EntryPoint = "OpenClipboard")]
+    static extern int OpenClipboard(nint hwnd);
+    [DllImport("user32", EntryPoint = "CloseClipboard")]
+    static extern int CloseClipboard();
+    [DllImport("user32", EntryPoint = "EmptyClipboard")]
+    static extern int EmptyClipboard();
+    [DllImport("user32", EntryPoint = "SetClipboardData")]
+    static extern nint SetClipboardData(int format, nint mem);
+    [DllImport("user32", EntryPoint = "GetClipboardData")]
+    static extern nint GetClipboardData(int format);
+    [DllImport("user32", EntryPoint = "IsClipboardFormatAvailable")]
+    static extern int IsClipboardFormatAvailable(int format);
+
+    [DllImport("gdi32", EntryPoint = "SetDIBitsToDevice")]
+    static extern int SetDIBitsToDevice(nint dc, int xd, int yd, int w, int h,
+                                        int xs, int ys, int startScan,
+                                        int scanLines, nint bits, nint info,
+                                        int usage);
+    [DllImport("gdi32", EntryPoint = "CreateSolidBrush")]
+    static extern nint CreateSolidBrush(int color);
+    [DllImport("gdi32", EntryPoint = "DeleteObject")]
+    static extern int DeleteObject(nint obj);
+    [DllImport("gdi32", EntryPoint = "CreateCompatibleDC")]
+    static extern nint CreateCompatibleDC(nint dc);
+    [DllImport("gdi32", EntryPoint = "CreateDIBSection")]
+    static extern nint CreateDIBSection(nint dc, nint info, int usage,
+                                        ref nint bits, nint section,
+                                        int offset);
+    [DllImport("gdi32", EntryPoint = "SelectObject")]
+    static extern nint SelectObject(nint dc, nint obj);
+    [DllImport("gdi32", EntryPoint = "DeleteDC")]
+    static extern int DeleteDC(nint dc);
+    [DllImport("gdi32", EntryPoint = "GetDeviceCaps")]
+    static extern int GetDeviceCaps(nint dc, int index);
+
+    [DllImport("kernel32", EntryPoint = "GetModuleHandleW")]
+    static extern nint GetModuleHandleW(nint name);
+    [DllImport("kernel32", EntryPoint = "Sleep")]
+    static extern void SleepW(int ms);
+    [DllImport("kernel32", EntryPoint = "GetTickCount")]
+    static extern int GetTickCount();
+    [DllImport("kernel32", EntryPoint = "QueryPerformanceCounter")]
+    static extern int QueryPerformanceCounter(nint slot);
+    [DllImport("kernel32", EntryPoint = "QueryPerformanceFrequency")]
+    static extern int QueryPerformanceFrequency(nint slot);
+    [DllImport("kernel32", EntryPoint = "GlobalAlloc")]
+    static extern nint GlobalAlloc(int flags, int bytes);
+    [DllImport("kernel32", EntryPoint = "GlobalLock")]
+    static extern nint GlobalLock(nint mem);
+    [DllImport("kernel32", EntryPoint = "GlobalUnlock")]
+    static extern int GlobalUnlock(nint mem);
+    [DllImport("kernel32", EntryPoint = "GlobalFree")]
+    static extern nint GlobalFree(nint mem);
+    [DllImport("kernel32", EntryPoint = "CreateFileW")]
+    static extern nint CreateFileW(nint path, int access, int share, nint sa,
+                                   int disposition, int flags, nint template);
+    [DllImport("kernel32", EntryPoint = "WriteFile")]
+    static extern int WriteFile(nint file, nint buf, int bytes, nint written,
+                                nint overlapped);
+    [DllImport("kernel32", EntryPoint = "CloseHandle")]
+    static extern int CloseHandle(nint h);
+    [DllImport("kernel32", EntryPoint = "InitializeCriticalSection")]
+    static extern void InitializeCriticalSection(nint cs);
+    [DllImport("kernel32", EntryPoint = "EnterCriticalSection")]
+    static extern void EnterCriticalSection(nint cs);
+    [DllImport("kernel32", EntryPoint = "LeaveCriticalSection")]
+    static extern void LeaveCriticalSection(nint cs);
+
+    [DllImport("imm32", EntryPoint = "ImmGetContext")]
+    static extern nint ImmGetContext(nint hwnd);
+    [DllImport("imm32", EntryPoint = "ImmSetCompositionWindow")]
+    static extern int ImmSetCompositionWindow(nint imc, nint form);
+    [DllImport("imm32", EntryPoint = "ImmSetCandidateWindow")]
+    static extern int ImmSetCandidateWindow(nint imc, nint form);
+    [DllImport("imm32", EntryPoint = "ImmReleaseContext")]
+    static extern int ImmReleaseContext(nint hwnd, nint imc);
+
+    [DllImport("dwmapi", EntryPoint = "DwmExtendFrameIntoClientArea")]
+    static extern int DwmExtendFrameIntoClientArea(nint hwnd, nint margins);
+
+    /// The rasterizer keeps the pixels; the shell only presents them.
+    [DllImport("zan_gui")]
+    static extern nint zan_gui_get_pixels(int surfaceId);
+    [DllImport("zan_gui")]
+    static extern int zan_gui_surface_width(int surfaceId);
+    [DllImport("zan_gui")]
+    static extern int zan_gui_surface_height(int surfaceId);
+
+    static bool ready;
+    static nint instance;
+    static nint className;
+    static nint mainHwnd;
+    static nint eventHwnd;
+
+    // Last reported event: kind, x, y, button, keycode, mods.
+    static int evKind;
+    static int evX;
+    static int evY;
+    static int evButton;
+    static int evKeyCode;
+    static int evMods;
+    static bool hasEvent;
+
+    static int windowWidth;
+    static int windowHeight;
+    static int dpi;
+    static int titlebarH;
+    static int buttonW;
+    static int captionButtons;
+    static int imeX;
+    static int imeY;
+
+    static bool glassOn;
+    static int glassTint;
+
+    // Per-window last presented surface, so WM_PAINT repaints the frame that
+    // belongs to *this* window rather than whichever one presented last.
+    static List<nint> surfHwnd;
+    static List<int> surfId;
+    static int lastSurface;
+
+    // Dirty rects announced for the next present (x, y, w, h groups of four).
+    static List<int> dirty;
+    static bool dirtyOverflow;
+
+    // Synthetic events queued by the automation driver, guarded by a critical
+    // section because a driver thread may enqueue while the UI thread drains.
+    static List<int> injectQ;
+    static List<nint> injectHwnd;
+    static nint injectCs;
+
+    // Cached layered-window present surface (glass), rebuilt on size change.
+    static nint lwDc;
+    static nint lwBitmap;
+    static nint lwOld;
+    static nint lwBits;
+    static int lwW;
+    static int lwH;
+
+    static nint scratchRect;
+    static nint scratchMsg;
+    static nint bitmapInfo;
+    static int bgColor;
+
+    /// Signed read of a 32-bit field (GetU32 zero-extends, and Win32 RECT /
+    /// POINT coordinates go negative on multi-monitor layouts).
+    static int S32(nint p, int off) {
+        int v = NativeMemory.GetU32(p, off);
+        if (v >= 2147483648) { return v - 4294967296; }
+        return v;
+    }
+
+    /// One-time class registration, DPI awareness and shared scratch buffers.
+    static void Init() {
+        if (Win32Shell.ready) { return; }
+        Win32Shell.ready = true;
+        Win32Shell.captionButtons = 5;
+        Win32Shell.dpi = 96;
+        Win32Shell.titlebarH = 32;
+        Win32Shell.buttonW = 46;
+        Win32Shell.surfHwnd = new List<nint>();
+        Win32Shell.surfId = new List<int>();
+        Win32Shell.dirty = new List<int>();
+        Win32Shell.injectQ = new List<int>();
+        Win32Shell.injectHwnd = new List<nint>();
+        Win32Shell.lastSurface = 0 - 1;
+        Win32Shell.bgColor = 0;
+
+        Win32Shell.injectCs = NativeMemory.Alloc(64);
+        Win32Shell.InitializeCriticalSection(Win32Shell.injectCs);
+        Win32Shell.scratchRect = NativeMemory.Alloc(16);
+        Win32Shell.scratchMsg = NativeMemory.Alloc(64);
+        Win32Shell.bitmapInfo = NativeMemory.Alloc(48);
+
+        Win32Shell.EnableDpiAwareness();
+
+        Win32Shell.instance = Win32Shell.GetModuleHandleW(0);
+        Win32Shell.className = Wide.Of("ZanGuiApp");
+        nint wc = NativeMemory.Alloc(80);
+        NativeMemory.Fill(wc, 0, 80);
+        NativeMemory.SetU32(wc, 0, 80);
+        NativeMemory.SetU32(wc, 4, 0x0020 | 0x0008);  // CS_OWNDC | CS_DBLCLKS
+        NativeMemory.SetI64(wc, 8, (nint)Win32Shell.OnMessage);
+        NativeMemory.SetI64(wc, 24, Win32Shell.instance);
+        NativeMemory.SetI64(wc, 32, Win32Shell.LoadIconW(Win32Shell.instance, 1));
+        NativeMemory.SetI64(wc, 40, Win32Shell.LoadCursorW(0, 32512));
+        NativeMemory.SetI64(wc, 64, Win32Shell.className);
+        NativeMemory.SetI64(wc, 72, NativeMemory.GetI64(wc, 32));
+        Win32Shell.RegisterClassExW(wc);
+        NativeMemory.Free(wc);
+    }
+
+    /// Per-monitor awareness when Shcore is present, system awareness otherwise,
+    /// so the binary still loads on Windows 7.
+    static void EnableDpiAwareness() {
+        nint fn = Interop.Entry("Shcore.dll", "SetProcessDpiAwareness");
+        if (fn != 0) {
+            SetProcessDpiAwarenessFn perMonitor = (SetProcessDpiAwarenessFn)fn;
+            perMonitor(2);
+            return;
+        }
+        fn = Interop.Entry("user32.dll", "SetProcessDPIAware");
+        if (fn == 0) { return; }
+        SetProcessDpiAwareFn system = (SetProcessDpiAwareFn)fn;
+        system();
+    }
+
+    // ---- window procedure ---------------------------------------------------
+
+    static int ModsNow() {
+        int mods = 0;
+        if ((Win32Shell.GetKeyState(17) & 0x8000) != 0) { mods = mods | 1; }
+        if ((Win32Shell.GetKeyState(16) & 0x8000) != 0) { mods = mods | 2; }
+        if ((Win32Shell.GetKeyState(18) & 0x8000) != 0) { mods = mods | 4; }
+        return mods;
+    }
+
+    /// Low/high signed 16-bit halves of an LPARAM coordinate pair.
+    static int LoWord(nint v) {
+        int raw = ((int)v) & 65535;
+        if (raw >= 32768) { return raw - 65536; }
+        return raw;
+    }
+
+    static int HiWord(nint v) {
+        int raw = (((int)v) >> 16) & 65535;
+        if (raw >= 32768) { return raw - 65536; }
+        return raw;
+    }
+
+    static void Post(int kind, int x, int y, int button, int keycode, int mods) {
+        Win32Shell.evKind = kind;
+        Win32Shell.evX = x;
+        Win32Shell.evY = y;
+        Win32Shell.evButton = button;
+        Win32Shell.evKeyCode = keycode;
+        Win32Shell.evMods = mods;
+        Win32Shell.hasEvent = true;
+    }
+
+    static nint OnMessage(nint hwnd, int msg, nint wp, nint lp) {
+        Win32Shell.eventHwnd = hwnd;
+        if (msg == 0x010D || msg == 0x010F || msg == 0x0281) {
+            // WM_IME_STARTCOMPOSITION / WM_IME_COMPOSITION / WM_IME_SETCONTEXT
+            Win32Shell.ImeReposition(hwnd);
+        } else if (msg == 2) {                     // WM_DESTROY
+            Win32Shell.Post(8, 0, 0, 0, 0, 0);
+            if (hwnd == Win32Shell.mainHwnd) { Win32Shell.PostQuitMessage(0); }
+            return 0;
+        } else if (msg == 0x0231) {                // WM_ENTERSIZEMOVE
+            if (Win32Shell.glassOn) {
+                Win32Shell.AcrylicApply(hwnd, 3, Win32Shell.glassTint);
+            }
+        } else if (msg == 0x0232) {                // WM_EXITSIZEMOVE
+            if (Win32Shell.glassOn) {
+                Win32Shell.AcrylicApply(hwnd, 4, Win32Shell.glassTint);
+                if (Win32Shell.lastSurface >= 0) {
+                    Win32Shell.PresentLayered(hwnd, Win32Shell.lastSurface);
+                }
+            }
+        } else if (msg == 5) {                     // WM_SIZE
+            Win32Shell.windowWidth = Win32Shell.LoWord(lp) & 65535;
+            Win32Shell.windowHeight = (((int)lp) >> 16) & 65535;
+            int own = Win32Shell.SurfaceOf(hwnd);
+            if (!Win32Shell.glassOn && own >= 0) {
+                Win32Shell.Blit(hwnd, own);
+            }
+            Win32Shell.Post(7, Win32Shell.windowWidth, Win32Shell.windowHeight,
+                0, 0, 0);
+            return 0;
+        } else if (msg == 512) {                   // WM_MOUSEMOVE
+            Win32Shell.Post(1, Win32Shell.LoWord(lp), Win32Shell.HiWord(lp),
+                0, 0, 0);
+            return 0;
+        } else if (msg == 513) {                   // WM_LBUTTONDOWN
+            Win32Shell.Post(2, Win32Shell.LoWord(lp), Win32Shell.HiWord(lp),
+                0, 0, Win32Shell.ModsNow());
+            Win32Shell.SetCapture(hwnd);
+            return 0;
+        } else if (msg == 514) {                   // WM_LBUTTONUP
+            Win32Shell.Post(3, Win32Shell.LoWord(lp), Win32Shell.HiWord(lp),
+                0, 0, Win32Shell.ModsNow());
+            Win32Shell.ReleaseCapture();
+            return 0;
+        } else if (msg == 516) {                   // WM_RBUTTONDOWN
+            Win32Shell.Post(2, Win32Shell.LoWord(lp), Win32Shell.HiWord(lp),
+                1, 0, Win32Shell.ModsNow());
+            return 0;
+        } else if (msg == 517) {                   // WM_RBUTTONUP
+            Win32Shell.Post(3, Win32Shell.LoWord(lp), Win32Shell.HiWord(lp),
+                1, 0, 0);
+            return 0;
+        } else if (msg == 256) {                   // WM_KEYDOWN
+            Win32Shell.Post(4, 0, 0, 0, (int)wp, Win32Shell.ModsNow());
+            return 0;
+        } else if (msg == 257) {                   // WM_KEYUP
+            Win32Shell.Post(5, 0, 0, 0, (int)wp, 0);
+            return 0;
+        } else if (msg == 258) {                   // WM_CHAR
+            Win32Shell.Post(6, 0, 0, 0, (int)wp, 0);
+            return 0;
+        } else if (msg == 522) {                   // WM_MOUSEWHEEL
+            nint pt = Win32Shell.scratchRect;
+            NativeMemory.SetU32(pt, 0, Win32Shell.LoWord(lp));
+            NativeMemory.SetU32(pt, 4, Win32Shell.HiWord(lp));
+            Win32Shell.ScreenToClient(hwnd, pt);
+            int delta = (((int)wp) >> 16) & 65535;
+            if (delta >= 32768) { delta = delta - 65536; }
+            Win32Shell.Post(13, Win32Shell.S32(pt, 0),
+                Win32Shell.S32(pt, 4), 0, delta, 0);
+            return 0;
+        } else if (msg == 0x0083) {                // WM_NCCALCSIZE
+            if (wp != 0) {
+                if (Win32Shell.IsMaximized(hwnd)) {
+                    int fx = Win32Shell.GetSystemMetrics(32)
+                        + Win32Shell.GetSystemMetrics(92);
+                    int fy = Win32Shell.GetSystemMetrics(33)
+                        + Win32Shell.GetSystemMetrics(92);
+                    NativeMemory.SetU32(lp, 0, Win32Shell.S32(lp, 0) + fx);
+                    NativeMemory.SetU32(lp, 4, Win32Shell.S32(lp, 4) + fy);
+                    NativeMemory.SetU32(lp, 8, Win32Shell.S32(lp, 8) - fx);
+                    NativeMemory.SetU32(lp, 12, Win32Shell.S32(lp, 12) - fy);
+                }
+                return 0;
+            }
+        } else if (msg == 0x0084) {                // WM_NCHITTEST
+            return Win32Shell.HitTest(hwnd, Win32Shell.LoWord(lp),
+                Win32Shell.HiWord(lp));
+        } else if (msg == 15) {                    // WM_PAINT
+            nint ps = NativeMemory.Alloc(72);
+            Win32Shell.BeginPaint(hwnd, ps);
+            int own = Win32Shell.SurfaceOf(hwnd);
+            if (!Win32Shell.glassOn && own >= 0) { Win32Shell.Blit(hwnd, own); }
+            Win32Shell.EndPaint(hwnd, ps);
+            NativeMemory.Free(ps);
+            return 0;
+        } else if (msg == 32) {                    // WM_SETCURSOR
+            if ((((int)lp) & 65535) == 1) { return 1; }
+        } else if (msg == 20) {                    // WM_ERASEBKGND
+            return 1;
+        }
+        return Win32Shell.DefWindowProcW(hwnd, msg, wp, lp);
+    }
+
+    /// Borderless chrome: frame-sized grips on the edges, the caption strip
+    /// draggable except where the app draws its caption buttons.
+    static nint HitTest(nint hwnd, int screenX, int screenY) {
+        nint rc = Win32Shell.scratchRect;
+        if (Win32Shell.GetWindowRect(hwnd, rc) == 0) { return 1; }
+        int left = Win32Shell.S32(rc, 0);
+        int top = Win32Shell.S32(rc, 4);
+        int w = Win32Shell.S32(rc, 8) - left;
+        int h = Win32Shell.S32(rc, 12) - top;
+        int x = screenX - left;
+        int y = screenY - top;
+        int b = 8 * Win32Shell.dpi / 96;
+        bool maxed = Win32Shell.IsMaximized(hwnd);
+        bool inButtons = y < Win32Shell.titlebarH
+            && x >= w - Win32Shell.captionButtons * Win32Shell.buttonW;
+        if (!maxed && !inButtons) {
+            bool onLeft = x < b;
+            bool onRight = x >= w - b;
+            bool onTop = y < b;
+            bool onBottom = y >= h - b;
+            if (onTop && onLeft) { return 13; }
+            if (onTop && onRight) { return 14; }
+            if (onBottom && onLeft) { return 16; }
+            if (onBottom && onRight) { return 17; }
+            if (onLeft) { return 10; }
+            if (onRight) { return 11; }
+            if (onTop) { return 12; }
+            if (onBottom) { return 15; }
+        }
+        if (inButtons) { return 1; }
+        if (y < Win32Shell.titlebarH) { return 2; }
+        return 1;
+    }
+
+    static bool IsMaximized(nint hwnd) {
+        nint wpl = NativeMemory.Alloc(48);
+        NativeMemory.Fill(wpl, 0, 48);
+        NativeMemory.SetU32(wpl, 0, 44);
+        int ok = Win32Shell.GetWindowPlacement(hwnd, wpl);
+        int show = Win32Shell.S32(wpl, 8);
+        NativeMemory.Free(wpl);
+        return ok != 0 && show == 3;
+    }
+
+    // ---- IME ----------------------------------------------------------------
+
+    static void ImeReposition(nint hwnd) {
+        nint imc = Win32Shell.ImmGetContext(hwnd);
+        if (imc == 0) { return; }
+        nint form = NativeMemory.Alloc(48);
+        NativeMemory.Fill(form, 0, 48);
+        NativeMemory.SetU32(form, 0, 2);           // CFS_POINT
+        NativeMemory.SetU32(form, 4, Win32Shell.imeX);
+        NativeMemory.SetU32(form, 8, Win32Shell.imeY);
+        Win32Shell.ImmSetCompositionWindow(imc, form);
+        NativeMemory.Fill(form, 0, 48);
+        NativeMemory.SetU32(form, 0, 0);           // dwIndex
+        NativeMemory.SetU32(form, 4, 64);          // CFS_CANDIDATEPOS
+        NativeMemory.SetU32(form, 8, Win32Shell.imeX);
+        NativeMemory.SetU32(form, 12, Win32Shell.imeY);
+        Win32Shell.ImmSetCandidateWindow(imc, form);
+        NativeMemory.Free(form);
+        Win32Shell.ImmReleaseContext(hwnd, imc);
+    }
+
+    static void SetImePos(int x, int y) {
+        Win32Shell.Init();
+        Win32Shell.imeX = x;
+        Win32Shell.imeY = y;
+        if (Win32Shell.eventHwnd != 0) {
+            Win32Shell.ImeReposition(Win32Shell.eventHwnd);
+        }
+    }
+
+    // ---- presentation -------------------------------------------------------
+
+    static int SurfaceOf(nint hwnd) {
+        int i = 0;
+        while (i < Win32Shell.surfHwnd.Count) {
+            if (Win32Shell.surfHwnd[i] == hwnd) { return Win32Shell.surfId[i]; }
+            i = i + 1;
+        }
+        return 0 - 1;
+    }
+
+    static void RememberSurface(nint hwnd, int surface) {
+        int i = 0;
+        while (i < Win32Shell.surfHwnd.Count) {
+            if (Win32Shell.surfHwnd[i] == hwnd) {
+                Win32Shell.surfId[i] = surface;
+                return;
+            }
+            i = i + 1;
+        }
+        Win32Shell.surfHwnd.Add(hwnd);
+        Win32Shell.surfId.Add(surface);
+    }
+
+    /// Top-down 32bpp BI_RGB header describing the surface being presented.
+    static void FillBitmapInfo(int w, int h) {
+        nint bi = Win32Shell.bitmapInfo;
+        NativeMemory.Fill(bi, 0, 48);
+        NativeMemory.SetU32(bi, 0, 40);
+        NativeMemory.SetU32(bi, 4, w);
+        NativeMemory.SetU32(bi, 8, 0 - h);
+        NativeMemory.SetU16(bi, 12, 1);
+        NativeMemory.SetU16(bi, 14, 32);
+    }
+
+    static void Blit(nint hwnd, int surface) {
+        nint pixels = Win32Shell.zan_gui_get_pixels(surface);
+        if (pixels == 0) { return; }
+        int sw = Win32Shell.zan_gui_surface_width(surface);
+        int sh = Win32Shell.zan_gui_surface_height(surface);
+        if (Win32Shell.glassOn) {
+            Win32Shell.dirty.Clear();
+            Win32Shell.dirtyOverflow = false;
+            Win32Shell.PresentLayered(hwnd, surface);
+            return;
+        }
+        nint dc = Win32Shell.GetDC(hwnd);
+        if (dc == 0) { return; }
+        Win32Shell.FillBitmapInfo(sw, sh);
+        if (Win32Shell.dirty.Count > 0 && !Win32Shell.dirtyOverflow) {
+            int i = 0;
+            while (i + 3 < Win32Shell.dirty.Count) {
+                int rx = Win32Shell.dirty[i];
+                int ry = Win32Shell.dirty[i + 1];
+                int rw = Win32Shell.dirty[i + 2];
+                int rh = Win32Shell.dirty[i + 3];
+                i = i + 4;
+                if (rx < 0) { rw = rw + rx; rx = 0; }
+                if (ry < 0) { rh = rh + ry; ry = 0; }
+                if (rx + rw > sw) { rw = sw - rx; }
+                if (ry + rh > sh) { rh = sh - ry; }
+                if (rw <= 0 || rh <= 0) { continue; }
+                // Source rows count from the bottom of a top-down DIB.
+                Win32Shell.SetDIBitsToDevice(dc, rx, ry, rw, rh, rx,
+                    sh - (ry + rh), 0, sh, pixels, Win32Shell.bitmapInfo, 0);
+            }
+        } else {
+            Win32Shell.SetDIBitsToDevice(dc, 0, 0, sw, sh, 0, 0, 0, sh,
+                pixels, Win32Shell.bitmapInfo, 0);
+        }
+        Win32Shell.dirty.Clear();
+        Win32Shell.dirtyOverflow = false;
+        if (Win32Shell.windowWidth > sw || Win32Shell.windowHeight > sh) {
+            int bgr = ((Win32Shell.bgColor & 255) << 16)
+                | (Win32Shell.bgColor & 65280)
+                | ((Win32Shell.bgColor >> 16) & 255);
+            nint brush = Win32Shell.CreateSolidBrush(bgr);
+            nint rc = Win32Shell.scratchRect;
+            if (Win32Shell.windowWidth > sw) {
+                NativeMemory.SetU32(rc, 0, sw);
+                NativeMemory.SetU32(rc, 4, 0);
+                NativeMemory.SetU32(rc, 8, Win32Shell.windowWidth);
+                NativeMemory.SetU32(rc, 12, Win32Shell.windowHeight);
+                Win32Shell.FillRect(dc, rc, brush);
+            }
+            if (Win32Shell.windowHeight > sh) {
+                NativeMemory.SetU32(rc, 0, 0);
+                NativeMemory.SetU32(rc, 4, sh);
+                NativeMemory.SetU32(rc, 8, sw);
+                NativeMemory.SetU32(rc, 12, Win32Shell.windowHeight);
+                Win32Shell.FillRect(dc, rc, brush);
+            }
+            Win32Shell.DeleteObject(brush);
+        }
+        Win32Shell.ReleaseDC(hwnd, dc);
+    }
+
+    /// Glass present: premultiply the straight-alpha surface into a cached DIB
+    /// section and hand it to the DWM, which composites the blurred backdrop
+    /// wherever the alpha is below 255.
+    static void PresentLayered(nint hwnd, int surface) {
+        nint pixels = Win32Shell.zan_gui_get_pixels(surface);
+        if (pixels == 0) { return; }
+        int sw = Win32Shell.zan_gui_surface_width(surface);
+        int sh = Win32Shell.zan_gui_surface_height(surface);
+        if (Win32Shell.lwDc == 0 || Win32Shell.lwW != sw
+                || Win32Shell.lwH != sh) {
+            if (Win32Shell.lwDc != 0) {
+                Win32Shell.SelectObject(Win32Shell.lwDc, Win32Shell.lwOld);
+                Win32Shell.DeleteObject(Win32Shell.lwBitmap);
+                Win32Shell.DeleteDC(Win32Shell.lwDc);
+                Win32Shell.lwDc = 0;
+            }
+            nint screen = Win32Shell.GetDC(0);
+            Win32Shell.lwDc = Win32Shell.CreateCompatibleDC(screen);
+            Win32Shell.ReleaseDC(0, screen);
+            Win32Shell.FillBitmapInfo(sw, sh);
+            nint bits = 0;
+            Win32Shell.lwBitmap = Win32Shell.CreateDIBSection(Win32Shell.lwDc,
+                Win32Shell.bitmapInfo, 0, ref bits, 0, 0);
+            if (Win32Shell.lwBitmap == 0) {
+                Win32Shell.DeleteDC(Win32Shell.lwDc);
+                Win32Shell.lwDc = 0;
+                return;
+            }
+            Win32Shell.lwOld = Win32Shell.SelectObject(Win32Shell.lwDc,
+                Win32Shell.lwBitmap);
+            Win32Shell.lwBits = bits;
+            Win32Shell.lwW = sw;
+            Win32Shell.lwH = sh;
+        }
+        int n = sw * sh;
+        int i = 0;
+        while (i < n) {
+            int p = Win32Shell.S32(pixels, i * 4);
+            int a = (p >> 24) & 255;
+            int r = ((p >> 16) & 255) * a / 255;
+            int g = ((p >> 8) & 255) * a / 255;
+            int b = (p & 255) * a / 255;
+            NativeMemory.SetU32(Win32Shell.lwBits, i * 4,
+                (a << 24) | (r << 16) | (g << 8) | b);
+            i = i + 1;
+        }
+        nint screenDc = Win32Shell.GetDC(0);
+        nint size = NativeMemory.Alloc(8);
+        NativeMemory.SetU32(size, 0, sw);
+        NativeMemory.SetU32(size, 4, sh);
+        nint src = NativeMemory.Alloc(8);
+        NativeMemory.SetU32(src, 0, 0);
+        NativeMemory.SetU32(src, 4, 0);
+        nint blend = NativeMemory.Alloc(4);
+        NativeMemory.SetByte(blend, 0, 0);         // AC_SRC_OVER
+        NativeMemory.SetByte(blend, 1, 0);
+        NativeMemory.SetByte(blend, 2, 255);
+        NativeMemory.SetByte(blend, 3, 1);         // AC_SRC_ALPHA
+        // pptDst = 0: update only the content, never the OS-owned position.
+        Win32Shell.UpdateLayeredWindow(hwnd, screenDc, 0, size,
+            Win32Shell.lwDc, src, 0, blend, 2);
+        NativeMemory.Free(blend);
+        NativeMemory.Free(src);
+        NativeMemory.Free(size);
+        Win32Shell.ReleaseDC(0, screenDc);
+    }
+
+    static void AcrylicApply(nint hwnd, int state, int tintArgb) {
+        nint fn = Interop.Entry("user32.dll", "SetWindowCompositionAttribute");
+        if (fn == 0) { return; }
+        int a = (tintArgb >> 24) & 255;
+        int r = (tintArgb >> 16) & 255;
+        int g = (tintArgb >> 8) & 255;
+        int b = tintArgb & 255;
+        nint accent = NativeMemory.Alloc(16);
+        NativeMemory.SetU32(accent, 0, state);
+        NativeMemory.SetU32(accent, 4, 0);
+        NativeMemory.SetU32(accent, 8, (a << 24) | (b << 16) | (g << 8) | r);
+        NativeMemory.SetU32(accent, 12, 0);
+        nint data = NativeMemory.Alloc(24);
+        NativeMemory.SetU32(data, 0, 19);          // WCA_ACCENT_POLICY
+        NativeMemory.SetI64(data, 8, accent);
+        NativeMemory.SetI64(data, 16, 16);
+        SetWinCompAttrFn call = (SetWinCompAttrFn)fn;
+        call(hwnd, data);
+        NativeMemory.Free(data);
+        NativeMemory.Free(accent);
+    }
+
+    // ---- public shell API ---------------------------------------------------
+
+    static nint CreateWindow(string title, int width, int height) {
+        Win32Shell.Init();
+        nint screenDc = Win32Shell.GetDC(0);
+        int deviceDpi = Win32Shell.GetDeviceCaps(screenDc, 88);
+        Win32Shell.ReleaseDC(0, screenDc);
+        if (deviceDpi <= 0) { deviceDpi = 96; }
+        Win32Shell.dpi = deviceDpi;
+        Win32Shell.titlebarH = 32 * deviceDpi / 96;
+        Win32Shell.buttonW = 46 * deviceDpi / 96;
+
+        int scaledW = width * deviceDpi / 96;
+        int scaledH = height * deviceDpi / 96;
+        Win32Shell.windowWidth = scaledW;
+        Win32Shell.windowHeight = scaledH;
+
+        nint rc = NativeMemory.Alloc(16);
+        NativeMemory.SetU32(rc, 0, 0);
+        NativeMemory.SetU32(rc, 4, 0);
+        NativeMemory.SetU32(rc, 8, scaledW);
+        NativeMemory.SetU32(rc, 12, scaledH);
+        Win32Shell.AdjustWindowRect(rc, 13565952, 0);   // WS_OVERLAPPEDWINDOW
+        int frameW = Win32Shell.S32(rc, 8) - Win32Shell.S32(rc, 0);
+        int frameH = Win32Shell.S32(rc, 12) - Win32Shell.S32(rc, 4);
+        NativeMemory.Free(rc);
+
+        nint wtitle = Wide.Of(title);
+        nint hwnd = Win32Shell.CreateWindowExW(0, Win32Shell.className, wtitle,
+            13565952, 0x80000000, 0x80000000, frameW, frameH, 0, 0,
+            Win32Shell.instance, 0);
+        Wide.Free(wtitle);
+        if (hwnd == 0) { return 0; }
+
+        if (Win32Shell.mainHwnd == 0) {
+            Win32Shell.mainHwnd = hwnd;
+            Win32Shell.CenterWindow(hwnd);
+        } else {
+            Win32Shell.CenterOnOwner(hwnd);
+        }
+
+        // A 1px extended frame restores the OS drop shadow and rounded corners
+        // on the borderless window.
+        nint margins = NativeMemory.Alloc(16);
+        NativeMemory.SetU32(margins, 0, 0);
+        NativeMemory.SetU32(margins, 4, 0);
+        NativeMemory.SetU32(margins, 8, 0);
+        NativeMemory.SetU32(margins, 12, 1);
+        Win32Shell.DwmExtendFrameIntoClientArea(hwnd, margins);
+        NativeMemory.Free(margins);
+        // SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | NOACTIVATE
+        Win32Shell.SetWindowPos(hwnd, 0, 0, 0, 0, 0, 0x0020 | 2 | 1 | 4 | 16);
+        return hwnd;
+    }
+
+    /// Work-area rectangle of the monitor a window sits on, into scratchRect.
+    static bool WorkArea(nint hwnd, int flags) {
+        nint monitor = Win32Shell.MonitorFromWindow(hwnd, flags);
+        nint mi = NativeMemory.Alloc(40);
+        NativeMemory.Fill(mi, 0, 40);
+        NativeMemory.SetU32(mi, 0, 40);
+        int ok = Win32Shell.GetMonitorInfoW(monitor, mi);
+        if (ok != 0) {
+            NativeMemory.SetU32(Win32Shell.scratchRect, 0,
+                Win32Shell.S32(mi, 20));
+            NativeMemory.SetU32(Win32Shell.scratchRect, 4,
+                Win32Shell.S32(mi, 24));
+            NativeMemory.SetU32(Win32Shell.scratchRect, 8,
+                Win32Shell.S32(mi, 28));
+            NativeMemory.SetU32(Win32Shell.scratchRect, 12,
+                Win32Shell.S32(mi, 32));
+        }
+        NativeMemory.Free(mi);
+        return ok != 0;
+    }
+
+    static bool CenterWindow(nint hwnd) {
+        nint wr = NativeMemory.Alloc(16);
+        if (Win32Shell.GetWindowRect(hwnd, wr) == 0) {
+            NativeMemory.Free(wr);
+            return false;
+        }
+        int winW = Win32Shell.S32(wr, 8) - Win32Shell.S32(wr, 0);
+        int winH = Win32Shell.S32(wr, 12) - Win32Shell.S32(wr, 4);
+        NativeMemory.Free(wr);
+        if (!Win32Shell.WorkArea(hwnd, 1)) { return false; }
+        int waL = Win32Shell.S32(Win32Shell.scratchRect, 0);
+        int waT = Win32Shell.S32(Win32Shell.scratchRect, 4);
+        int waR = Win32Shell.S32(Win32Shell.scratchRect, 8);
+        int waB = Win32Shell.S32(Win32Shell.scratchRect, 12);
+        int x = waL + (waR - waL - winW) / 2;
+        int y = waT + (waB - waT - winH) / 2;
+        if (x < waL) { x = waL; }
+        if (y < waT) { y = waT; }
+        Win32Shell.SetWindowPos(hwnd, 0, x, y, 0, 0, 1 | 4 | 16);
+        return true;
+    }
+
+    /// Secondary windows (dialogs) open centered over the main window, kept
+    /// inside the monitor work area.
+    static void CenterOnOwner(nint hwnd) {
+        nint pr = NativeMemory.Alloc(16);
+        nint cr = NativeMemory.Alloc(16);
+        int okP = Win32Shell.GetWindowRect(Win32Shell.mainHwnd, pr);
+        int okC = Win32Shell.GetWindowRect(hwnd, cr);
+        if (okP != 0 && okC != 0) {
+            int childW = Win32Shell.S32(cr, 8) - Win32Shell.S32(cr, 0);
+            int childH = Win32Shell.S32(cr, 12) - Win32Shell.S32(cr, 4);
+            int x = Win32Shell.S32(pr, 0)
+                + (Win32Shell.S32(pr, 8) - Win32Shell.S32(pr, 0)
+                    - childW) / 2;
+            int y = Win32Shell.S32(pr, 4)
+                + (Win32Shell.S32(pr, 12) - Win32Shell.S32(pr, 4)
+                    - childH) / 2;
+            if (Win32Shell.WorkArea(Win32Shell.mainHwnd, 2)) {
+                int waL = Win32Shell.S32(Win32Shell.scratchRect, 0);
+                int waT = Win32Shell.S32(Win32Shell.scratchRect, 4);
+                int waR = Win32Shell.S32(Win32Shell.scratchRect, 8);
+                int waB = Win32Shell.S32(Win32Shell.scratchRect, 12);
+                if (x < waL) { x = waL; }
+                if (y < waT) { y = waT; }
+                if (x + childW > waR) { x = waR - childW; }
+                if (y + childH > waB) { y = waB - childH; }
+            }
+            Win32Shell.SetWindowPos(hwnd, 0, x, y, 0, 0, 1 | 4 | 16);
+        }
+        NativeMemory.Free(cr);
+        NativeMemory.Free(pr);
+    }
+
+    static void ShowWindowNow(nint hwnd) {
+        Win32Shell.ShowWindow(hwnd, 5);
+        Win32Shell.UpdateWindow(hwnd);
+        Win32Shell.SetForegroundWindow(hwnd);
+        Win32Shell.SetFocus(hwnd);
+    }
+
+    static void SetWindowPosition(nint hwnd, int x, int y) {
+        if (hwnd == 0) { return; }
+        Win32Shell.SetWindowPos(hwnd, 0, x, y, 0, 0, 1 | 4 | 16);
+    }
+
+    static void Minimize(nint hwnd) { Win32Shell.ShowWindow(hwnd, 6); }
+
+    static void ToggleMaximize(nint hwnd) {
+        if (Win32Shell.IsMaximized(hwnd)) {
+            Win32Shell.ShowWindow(hwnd, 9);
+        } else {
+            Win32Shell.ShowWindow(hwnd, 3);
+        }
+    }
+
+    static void CloseWindow(nint hwnd) {
+        Win32Shell.PostMessageW(hwnd, 16, 0, 0);   // WM_CLOSE
+    }
+
+    static void Destroy(nint hwnd) { Win32Shell.DestroyWindow(hwnd); }
+
+    static bool Maximized(nint hwnd) { return Win32Shell.IsMaximized(hwnd); }
+
+    static bool Visible(nint hwnd) {
+        if (Win32Shell.IsIconic(hwnd) != 0) { return false; }
+        return Win32Shell.IsWindowVisible(hwnd) != 0;
+    }
+
+    static bool Focused(nint hwnd) {
+        if (hwnd == 0) { return false; }
+        return Win32Shell.GetForegroundWindow() == hwnd;
+    }
+
+    static void SetTopmost(nint hwnd, bool on) {
+        nint after = 0 - 2;                        // HWND_NOTOPMOST
+        if (on) { after = 0 - 1; }                 // HWND_TOPMOST
+        Win32Shell.SetWindowPos(hwnd, after, 0, 0, 0, 0, 2 | 1 | 16);
+    }
+
+    static void SetTitle(nint hwnd, string title) {
+        nint wtitle = Wide.Of(title);
+        Win32Shell.SetWindowTextW(hwnd, wtitle);
+        Wide.Free(wtitle);
+    }
+
+    static void SetCaptionButtons(int count) {
+        Win32Shell.Init();
+        if (count >= 0 && count <= 8) { Win32Shell.captionButtons = count; }
+    }
+
+    static int TitlebarHeight() {
+        Win32Shell.Init();
+        return Win32Shell.titlebarH;
+    }
+
+    static int CaptionButtonWidth() {
+        Win32Shell.Init();
+        return Win32Shell.buttonW;
+    }
+
+    static int ClientWidth(nint hwnd) {
+        if (hwnd == 0) { return 0; }
+        nint rc = Win32Shell.scratchRect;
+        if (Win32Shell.GetClientRect(hwnd, rc) == 0) { return 0; }
+        return Win32Shell.S32(rc, 8) - Win32Shell.S32(rc, 0);
+    }
+
+    static int ClientHeight(nint hwnd) {
+        if (hwnd == 0) { return 0; }
+        nint rc = Win32Shell.scratchRect;
+        if (Win32Shell.GetClientRect(hwnd, rc) == 0) { return 0; }
+        return Win32Shell.S32(rc, 12) - Win32Shell.S32(rc, 4);
+    }
+
+    static int WindowWidth() { return Win32Shell.windowWidth; }
+    static int WindowHeight() { return Win32Shell.windowHeight; }
+
+    static void SetCursorShape(int kind) {
+        int id = 32512;
+        if (kind == 1) { id = 32649; }             // hand
+        if (kind == 2) { id = 32513; }             // I-beam
+        if (kind == 3) { id = 32644; }             // size WE
+        if (kind == 4) { id = 32645; }             // size NS
+        if (kind == 5) { id = 32515; }             // cross
+        Win32Shell.SetCursor(Win32Shell.LoadCursorW(0, id));
+    }
+
+    static void EnableGlass(nint hwnd, int tintArgb) {
+        Win32Shell.Init();
+        if (hwnd == 0) { return; }
+        nint ex = Win32Shell.GetWindowLongPtrW(hwnd, 0 - 20);
+        if ((ex & 0x00080000) == 0) {              // WS_EX_LAYERED
+            Win32Shell.SetWindowLongPtrW(hwnd, 0 - 20, ex | 0x00080000);
+        }
+        Win32Shell.glassTint = tintArgb;
+        Win32Shell.AcrylicApply(hwnd, 4, tintArgb);
+        Win32Shell.glassOn = true;
+        int own = Win32Shell.SurfaceOf(hwnd);
+        if (own >= 0) { Win32Shell.PresentLayered(hwnd, own); }
+    }
+
+    static void DisableGlass(nint hwnd) {
+        Win32Shell.Init();
+        if (hwnd == 0) { return; }
+        Win32Shell.AcrylicApply(hwnd, 0, 0);
+        nint ex = Win32Shell.GetWindowLongPtrW(hwnd, 0 - 20);
+        Win32Shell.SetWindowLongPtrW(hwnd, 0 - 20, ex & ~0x00080000);
+        Win32Shell.glassOn = false;
+    }
+
+    static void SetOpacity(nint hwnd, int percent) {
+        Win32Shell.Init();
+        if (hwnd == 0) { return; }
+        if (percent < 10) { percent = 10; }
+        if (percent > 100) { percent = 100; }
+        nint ex = Win32Shell.GetWindowLongPtrW(hwnd, 0 - 20);
+        if (percent >= 100) {
+            if (!Win32Shell.glassOn && (ex & 0x00080000) != 0) {
+                Win32Shell.SetLayeredWindowAttributes(hwnd, 0, 255, 2);
+                Win32Shell.SetWindowLongPtrW(hwnd, 0 - 20, ex & ~0x00080000);
+            }
+            return;
+        }
+        if ((ex & 0x00080000) == 0) {
+            Win32Shell.SetWindowLongPtrW(hwnd, 0 - 20, ex | 0x00080000);
+        }
+        Win32Shell.SetLayeredWindowAttributes(hwnd, 0, percent * 255 / 100, 2);
+    }
+
+    static void Present(nint hwnd, int surface) {
+        Win32Shell.Init();
+        if (Win32Shell.zan_gui_get_pixels(surface) == 0) { return; }
+        Win32Shell.lastSurface = surface;
+        Win32Shell.RememberSurface(hwnd, surface);
+        Win32Shell.Blit(hwnd, surface);
+    }
+
+    static void PresentDirty(int x, int y, int w, int h) {
+        Win32Shell.Init();
+        if (w <= 0 || h <= 0) { return; }
+        if (Win32Shell.dirty.Count >= 2048) {
+            Win32Shell.dirtyOverflow = true;
+            return;
+        }
+        Win32Shell.dirty.Add(x);
+        Win32Shell.dirty.Add(y);
+        Win32Shell.dirty.Add(w);
+        Win32Shell.dirty.Add(h);
+    }
+
+    // ---- event loop ---------------------------------------------------------
+
+    static void ClearEvent() {
+        Win32Shell.hasEvent = false;
+        Win32Shell.evKind = 0;
+        Win32Shell.evX = 0;
+        Win32Shell.evY = 0;
+        Win32Shell.evButton = 0;
+        Win32Shell.evKeyCode = 0;
+        Win32Shell.evMods = 0;
+    }
+
+    /// Serve one queued synthetic event, if the automation driver left any.
+    static bool DrainInjected() {
+        bool got = false;
+        Win32Shell.EnterCriticalSection(Win32Shell.injectCs);
+        if (Win32Shell.injectQ.Count >= 6) {
+            Win32Shell.evKind = Win32Shell.injectQ[0];
+            Win32Shell.evX = Win32Shell.injectQ[1];
+            Win32Shell.evY = Win32Shell.injectQ[2];
+            Win32Shell.evButton = Win32Shell.injectQ[3];
+            Win32Shell.evKeyCode = Win32Shell.injectQ[4];
+            Win32Shell.evMods = Win32Shell.injectQ[5];
+            int i = 0;
+            while (i < 6) {
+                Win32Shell.injectQ.RemoveAt(0);
+                i = i + 1;
+            }
+            nint target = Win32Shell.injectHwnd[0];
+            Win32Shell.injectHwnd.RemoveAt(0);
+            if (target == 0) { target = Win32Shell.mainHwnd; }
+            Win32Shell.eventHwnd = target;
+            Win32Shell.hasEvent = true;
+            got = true;
+        }
+        Win32Shell.LeaveCriticalSection(Win32Shell.injectCs);
+        return got;
+    }
+
+    static int PollEvent() {
+        Win32Shell.Init();
+        Win32Shell.ClearEvent();
+        if (Win32Shell.DrainInjected()) { return 0; }
+        nint msg = Win32Shell.scratchMsg;
+        while (Win32Shell.PeekMessageW(msg, 0, 0, 0, 1) != 0) {
+            if (Win32Shell.S32(msg, 8) == 18) { return 0 - 1; }  // WM_QUIT
+            Win32Shell.TranslateMessage(msg);
+            Win32Shell.DispatchMessageW(msg);
+            if (Win32Shell.hasEvent) { return 0; }
+        }
+        return 1;
+    }
+
+    static int WaitEvent() {
+        Win32Shell.Init();
+        Win32Shell.ClearEvent();
+        if (Win32Shell.DrainInjected()) { return 0; }
+        nint msg = Win32Shell.scratchMsg;
+        if (Win32Shell.GetMessageW(msg, 0, 0, 0) <= 0) { return 0 - 1; }
+        Win32Shell.TranslateMessage(msg);
+        Win32Shell.DispatchMessageW(msg);
+        return 0;
+    }
+
+    static int WaitEventTimeout(int ms) {
+        Win32Shell.Init();
+        Win32Shell.ClearEvent();
+        if (Win32Shell.DrainInjected()) { return 0; }
+        if (ms < 0) { ms = 0; }
+        int start = Win32Shell.GetTickCount();
+        nint msg = Win32Shell.scratchMsg;
+        while (true) {
+            while (Win32Shell.PeekMessageW(msg, 0, 0, 0, 1) != 0) {
+                if (Win32Shell.S32(msg, 8) == 18) { return 0 - 1; }
+                Win32Shell.TranslateMessage(msg);
+                Win32Shell.DispatchMessageW(msg);
+                if (Win32Shell.hasEvent) { return 0; }
+            }
+            int elapsed = Win32Shell.GetTickCount() - start;
+            if (elapsed >= ms) { return 1; }
+            // QS_ALLINPUT = 0x04FF; WAIT_TIMEOUT = 258
+            int wr = Win32Shell.MsgWaitForMultipleObjects(0, 0, 0,
+                ms - elapsed, 0x04FF);
+            if (wr == 258) { return 1; }
+        }
+        return 1;
+    }
+
+    static void Wake() {
+        Win32Shell.Init();
+        if (Win32Shell.mainHwnd != 0) {
+            Win32Shell.PostMessageW(Win32Shell.mainHwnd, 0, 0, 0);
+        }
+    }
+
+    static void InjectEvent(nint hwnd, int kind, int x, int y, int button,
+                            int keycode, int mods) {
+        Win32Shell.Init();
+        Win32Shell.EnterCriticalSection(Win32Shell.injectCs);
+        Win32Shell.injectQ.Add(kind);
+        Win32Shell.injectQ.Add(x);
+        Win32Shell.injectQ.Add(y);
+        Win32Shell.injectQ.Add(button);
+        Win32Shell.injectQ.Add(keycode);
+        Win32Shell.injectQ.Add(mods);
+        Win32Shell.injectHwnd.Add(hwnd);
+        Win32Shell.LeaveCriticalSection(Win32Shell.injectCs);
+        Win32Shell.Wake();
+    }
+
+    static int InjectPending() {
+        Win32Shell.Init();
+        Win32Shell.EnterCriticalSection(Win32Shell.injectCs);
+        int n = Win32Shell.injectHwnd.Count;
+        Win32Shell.LeaveCriticalSection(Win32Shell.injectCs);
+        return n;
+    }
+
+    static int EventKindValue() { return Win32Shell.evKind; }
+    static int EventXValue() { return Win32Shell.evX; }
+    static int EventYValue() { return Win32Shell.evY; }
+    static int EventButtonValue() { return Win32Shell.evButton; }
+    static int EventKeyCodeValue() { return Win32Shell.evKeyCode; }
+    static int EventModsValue() { return Win32Shell.evMods; }
+    static nint EventWindow() { return Win32Shell.eventHwnd; }
+
+    /// Monotonic milliseconds from the performance counter: GetTickCount only
+    /// moves every ~15 ms, which makes per-frame animation steps jitter.
+    static int TickMs() {
+        Win32Shell.Init();
+        nint slot = NativeMemory.Alloc(16);
+        Win32Shell.QueryPerformanceFrequency(slot);
+        int freq = NativeMemory.GetI64(slot, 0);
+        Win32Shell.QueryPerformanceCounter(slot);
+        int now = NativeMemory.GetI64(slot, 0);
+        NativeMemory.Free(slot);
+        if (freq <= 0) { return Win32Shell.GetTickCount(); }
+        return now * 1000 / freq;
+    }
+
+    static void Sleep(int ms) {
+        if (ms > 0) { Win32Shell.SleepW(ms); }
+    }
+
+    // ---- clipboard ----------------------------------------------------------
+
+    static bool SetClipboard(string text) {
+        Win32Shell.Init();
+        nint wide = Wide.Of(text);
+        int units = Wide.Length(wide);
+        // GMEM_MOVEABLE; the clipboard takes ownership on success.
+        nint mem = Win32Shell.GlobalAlloc(2, (units + 1) * 2);
+        if (mem == 0) { Wide.Free(wide); return false; }
+        nint dst = Win32Shell.GlobalLock(mem);
+        if (dst == 0) {
+            Win32Shell.GlobalFree(mem);
+            Wide.Free(wide);
+            return false;
+        }
+        NativeMemory.Copy(dst, wide, (units + 1) * 2);
+        Win32Shell.GlobalUnlock(mem);
+        Wide.Free(wide);
+        if (Win32Shell.OpenClipboard(Win32Shell.mainHwnd) == 0) {
+            Win32Shell.GlobalFree(mem);
+            return false;
+        }
+        Win32Shell.EmptyClipboard();
+        nint ok = Win32Shell.SetClipboardData(13, mem);   // CF_UNICODETEXT
+        Win32Shell.CloseClipboard();
+        if (ok == 0) {
+            Win32Shell.GlobalFree(mem);
+            return false;
+        }
+        return true;
+    }
+
+    static string GetClipboard() {
+        Win32Shell.Init();
+        if (Win32Shell.IsClipboardFormatAvailable(13) == 0) { return ""; }
+        if (Win32Shell.OpenClipboard(Win32Shell.mainHwnd) == 0) { return ""; }
+        nint handle = Win32Shell.GetClipboardData(13);
+        if (handle == 0) {
+            Win32Shell.CloseClipboard();
+            return "";
+        }
+        nint text = Win32Shell.GlobalLock(handle);
+        string text2 = "";
+        if (text != 0) {
+            text2 = Wide.Read(text);
+            Win32Shell.GlobalUnlock(handle);
+        }
+        Win32Shell.CloseClipboard();
+        return text2;
+    }
+
+    /// Screen DPI as a percentage of 96 (150 on a 144 dpi display).
+    static int DpiScale() {
+        nint dc = Win32Shell.GetDC(0);
+        int deviceDpi = Win32Shell.GetDeviceCaps(dc, 88);
+        Win32Shell.ReleaseDC(0, dc);
+        if (deviceDpi <= 0) { return 100; }
+        return deviceDpi * 100 / 96;
+    }
+
+    /// Overwrite a file with UTF-8 text, prefixed with a BOM so spreadsheet
+    /// apps detect the encoding of an exported CJK CSV.
+    static bool WriteTextFile(string path, string content) {
+        nint wpath = Wide.Of(path);
+        // GENERIC_WRITE, no sharing, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL
+        nint file = Win32Shell.CreateFileW(wpath, 0x40000000, 0, 0, 2, 128, 0);
+        Wide.Free(wpath);
+        if (file == 0 - 1 || file == 0) { return false; }
+        nint written = NativeMemory.Alloc(8);
+        nint bom = NativeMemory.Alloc(4);
+        NativeMemory.SetByte(bom, 0, 239);
+        NativeMemory.SetByte(bom, 1, 187);
+        NativeMemory.SetByte(bom, 2, 191);
+        Win32Shell.WriteFile(file, bom, 3, written, 0);
+        NativeMemory.Free(bom);
+        int bytes = content.Length;
+        int ok = 1;
+        if (bytes > 0) {
+            nint buf = NativeMemory.Alloc(bytes + 1);
+            NativeMemory.PutString(buf, 0, content, bytes);
+            ok = Win32Shell.WriteFile(file, buf, bytes, written, 0);
+            NativeMemory.Free(buf);
+        }
+        NativeMemory.Free(written);
+        Win32Shell.CloseHandle(file);
+        return ok != 0;
+    }
+
+    /// Background colour used to fill the margin exposed by a live resize
+    /// before the app repaints, kept in sync by the canvas clear.
+    static void SetBackground(int color) {
+        Win32Shell.Init();
+        Win32Shell.bgColor = color;
+    }
+}
+
+#endif

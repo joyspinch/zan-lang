@@ -23,6 +23,9 @@
 #include <unistd.h>
 
 typedef int64_t i64;
+/* Native window handle (HWND / X11 Window / NSWindow*): pointer-width, so it
+ * must not ride in a type that narrows when Zan `int` becomes 32-bit. */
+typedef intptr_t iptr;
 typedef uint32_t u32;
 
 /* Implemented in gui_runtime.c; not part of the [DllImport] ABI. */
@@ -303,7 +306,7 @@ static ZanDelegate *g_delegate = nil;
 
 /* ---- window lifecycle ---- */
 
-EXPORT i64 zan_gui_create_window(const char *title, i64 width, i64 height) {
+EXPORT iptr zan_gui_create_window(const char *title, i64 width, i64 height) {
     if (g_mwin_count >= ZAN_MAX_WINDOWS) return 0;
     @autoreleasepool {
         [NSApplication sharedApplication];
@@ -371,11 +374,11 @@ EXPORT i64 zan_gui_create_window(const char *title, i64 width, i64 height) {
         mw->h = (int)height;
         mw->caption_btns = 5;
         mw->glassFx = nil;
-        return (i64)(intptr_t)window;
+        return (iptr)window;
     }
 }
 
-EXPORT i64 zan_gui_show_window(i64 hwnd_val) {
+EXPORT i64 zan_gui_show_window(iptr hwnd_val) {
     zan_mwin_t *mw = mwin_find(hwnd_val);
     if (!mw && hwnd_val == 0 && g_mwin_count > 0) mw = &g_mwins[0];
     if (!mw) return 1;
@@ -392,7 +395,7 @@ EXPORT i64 zan_gui_show_window(i64 hwnd_val) {
  * system vibrancy material shows through -- the macOS counterpart of Win11
  * acrylic, behind the same Gui.Native.Window.EnableGlass API. tint is unused:
  * macOS derives the material tint from the system appearance. */
-EXPORT i64 zan_gui_enable_glass(i64 hwnd_val, i64 tint_argb) {
+EXPORT i64 zan_gui_enable_glass(iptr hwnd_val, i64 tint_argb) {
     (void)tint_argb;
     zan_mwin_t *mw = mwin_find(hwnd_val);
     if (!mw && hwnd_val == 0 && g_mwin_count > 0) mw = &g_mwins[0];
@@ -424,7 +427,7 @@ EXPORT i64 zan_gui_enable_glass(i64 hwnd_val, i64 tint_argb) {
 
 /* Revert to an opaque window: pull the drawing view back out as the content
  * view and drop the vibrancy material. */
-EXPORT i64 zan_gui_disable_glass(i64 hwnd_val) {
+EXPORT i64 zan_gui_disable_glass(iptr hwnd_val) {
     zan_mwin_t *mw = mwin_find(hwnd_val);
     if (!mw && hwnd_val == 0 && g_mwin_count > 0) mw = &g_mwins[0];
     if (!mw) return 1;
@@ -443,7 +446,7 @@ EXPORT i64 zan_gui_disable_glass(i64 hwnd_val) {
     return 0;
 }
 
-EXPORT i64 zan_gui_close_window(i64 hwnd_val) {
+EXPORT i64 zan_gui_close_window(iptr hwnd_val) {
     zan_mwin_t *mw = mwin_find(hwnd_val);
     if (!mw && hwnd_val == 0 && g_mwin_count == 1) mw = &g_mwins[0];
     if (!mw) return 0;
@@ -461,7 +464,7 @@ EXPORT i64 zan_gui_close_window(i64 hwnd_val) {
 /* On macOS close_window already tears the NSWindow down synchronously, so the
  * owner-driven destroy is a no-op kept for FFI symbol parity across
  * backends. */
-EXPORT i64 zan_gui_destroy_window(i64 hwnd_val) { (void)hwnd_val; return 0; }
+EXPORT i64 zan_gui_destroy_window(iptr hwnd_val) { (void)hwnd_val; return 0; }
 
 /* ---- event pump ---- */
 
@@ -682,7 +685,7 @@ EXPORT i64 zan_gui_event_y(void)       { return g_evt[2]; }
 EXPORT i64 zan_gui_event_button(void)  { return g_evt[3]; }
 EXPORT i64 zan_gui_event_keycode(void) { return g_evt[4]; }
 EXPORT i64 zan_gui_event_mods(void)    { return g_evt[5]; }
-EXPORT i64 zan_gui_event_hwnd(void)    { return (i64)g_evt[6]; }
+EXPORT iptr zan_gui_event_hwnd(void)    { return (iptr)g_evt[6]; }
 
 /* ---- native text rendering ---- */
 
@@ -885,12 +888,12 @@ EXPORT i64 zan_gui_window_height(void) {
 /* A stale handle (window already closed) reports 0, never another window's
  * size: falling back to g_mwins[0] made a closing dialog resize its canvas to
  * the primary window's dimensions and present one parent-sized frame. */
-EXPORT i64 zan_gui_client_width(i64 hwnd_val) {
+EXPORT i64 zan_gui_client_width(iptr hwnd_val) {
     zan_mwin_t *mw = mwin_find(hwnd_val);
     if (!mw || !mw->view) return hwnd_val == 0 ? zan_gui_window_width() : 0;
     return (i64)[mw->view bounds].size.width;
 }
-EXPORT i64 zan_gui_client_height(i64 hwnd_val) {
+EXPORT i64 zan_gui_client_height(iptr hwnd_val) {
     zan_mwin_t *mw = mwin_find(hwnd_val);
     if (!mw || !mw->view) return hwnd_val == 0 ? zan_gui_window_height() : 0;
     return (i64)[mw->view bounds].size.height;
@@ -900,7 +903,7 @@ EXPORT i64 zan_gui_client_height(i64 hwnd_val) {
 
 EXPORT i64 zan_gui_titlebar_height(void) { return (i64)zan_titlebar_h(); }
 EXPORT i64 zan_gui_caption_button_width(void) { return (i64)zan_caption_btn_w(); }
-EXPORT i64 zan_gui_set_caption_buttons(i64 hwnd_val, i64 count) {
+EXPORT i64 zan_gui_set_caption_buttons(iptr hwnd_val, i64 count) {
     if (count < 0 || count > 8) return 0;
     zan_mwin_t *mw = mwin_find(hwnd_val);
     if (mw) mw->caption_btns = (int)count;
@@ -910,7 +913,7 @@ EXPORT i64 zan_gui_set_caption_buttons(i64 hwnd_val, i64 count) {
 
 /* ---- present: blit the software surface to the window ---- */
 
-EXPORT i64 zan_gui_present(i64 hwnd_val, i64 surface_id) {
+EXPORT i64 zan_gui_present(iptr hwnd_val, i64 surface_id) {
     zan_mwin_t *mw = mwin_find(hwnd_val);
     if (!mw && hwnd_val == 0 && g_mwin_count > 0) mw = &g_mwins[0];
     if (!mw || !mw->view) return 1;
@@ -965,7 +968,7 @@ EXPORT i64 zan_gui_present(i64 hwnd_val, i64 surface_id) {
 
 /* ---- misc ---- */
 
-EXPORT i64 zan_gui_set_title(i64 hwnd_val, const char *title) {
+EXPORT i64 zan_gui_set_title(iptr hwnd_val, const char *title) {
     zan_mwin_t *mw = mwin_find(hwnd_val);
     if (!mw && hwnd_val == 0 && g_mwin_count > 0) mw = &g_mwins[0];
     if (mw && title) {
@@ -999,21 +1002,21 @@ EXPORT void zan_gui_sleep_ms(i64 ms) {
 
 /* ---- window management ---- */
 
-EXPORT i64 zan_gui_minimize(i64 hwnd_val) {
+EXPORT i64 zan_gui_minimize(iptr hwnd_val) {
     zan_mwin_t *mw = mwin_find(hwnd_val);
     if (!mw && hwnd_val == 0 && g_mwin_count > 0) mw = &g_mwins[0];
     if (mw) { @autoreleasepool { [mw->window miniaturize:nil]; } }
     return 0;
 }
 
-EXPORT i64 zan_gui_toggle_maximize(i64 hwnd_val) {
+EXPORT i64 zan_gui_toggle_maximize(iptr hwnd_val) {
     zan_mwin_t *mw = mwin_find(hwnd_val);
     if (!mw && hwnd_val == 0 && g_mwin_count > 0) mw = &g_mwins[0];
     if (mw) { @autoreleasepool { [mw->window zoom:nil]; } }
     return 0;
 }
 
-EXPORT i64 zan_gui_is_maximized(i64 hwnd_val) {
+EXPORT i64 zan_gui_is_maximized(iptr hwnd_val) {
     zan_mwin_t *mw = mwin_find(hwnd_val);
     if (!mw && hwnd_val == 0 && g_mwin_count > 0) mw = &g_mwins[0];
     if (!mw) return 0;
@@ -1022,7 +1025,7 @@ EXPORT i64 zan_gui_is_maximized(i64 hwnd_val) {
 
 /* 1 while any part of the window can be seen (not miniaturized and not fully
  * occluded by other windows); ambient animations pause while this reports 0. */
-EXPORT i64 zan_gui_window_visible(i64 hwnd_val) {
+EXPORT i64 zan_gui_window_visible(iptr hwnd_val) {
     zan_mwin_t *mw = mwin_find(hwnd_val);
     if (!mw && hwnd_val == 0 && g_mwin_count > 0) mw = &g_mwins[0];
     if (!mw) return 0;
@@ -1034,7 +1037,7 @@ EXPORT i64 zan_gui_window_visible(i64 hwnd_val) {
 }
 
 /* 1 while the window is the key window -- see the X11 backend. */
-EXPORT i64 zan_gui_window_focused(i64 hwnd_val) {
+EXPORT i64 zan_gui_window_focused(iptr hwnd_val) {
     zan_mwin_t *mw = mwin_find(hwnd_val);
     if (!mw && hwnd_val == 0 && g_mwin_count > 0) mw = &g_mwins[0];
     if (!mw) return 0;
@@ -1043,7 +1046,7 @@ EXPORT i64 zan_gui_window_focused(i64 hwnd_val) {
     }
 }
 
-EXPORT i64 zan_gui_set_topmost(i64 hwnd_val, i64 on) {
+EXPORT i64 zan_gui_set_topmost(iptr hwnd_val, i64 on) {
     zan_mwin_t *mw = mwin_find(hwnd_val);
     if (!mw && hwnd_val == 0 && g_mwin_count > 0) mw = &g_mwins[0];
     if (mw) {
@@ -1053,7 +1056,7 @@ EXPORT i64 zan_gui_set_topmost(i64 hwnd_val, i64 on) {
 }
 
 /* Whole-window opacity, 10..100 percent. */
-EXPORT i64 zan_gui_set_opacity(i64 hwnd_val, i64 percent) {
+EXPORT i64 zan_gui_set_opacity(iptr hwnd_val, i64 percent) {
     zan_mwin_t *mw = mwin_find(hwnd_val);
     if (!mw && hwnd_val == 0 && g_mwin_count > 0) mw = &g_mwins[0];
     if (!mw) return 1;
@@ -1257,7 +1260,7 @@ static WKWebsiteDataStore *wv_store_for_profile(const char *profile_id) {
     return ds ? ds : [WKWebsiteDataStore defaultDataStore];
 }
 
-EXPORT i64 zan_gui_webview_create(i64 hwnd_val, const char *profile_id) {
+EXPORT i64 zan_gui_webview_create(iptr hwnd_val, const char *profile_id) {
     zan_mwin_t *mw = mwin_find(hwnd_val);
     if (!mw && hwnd_val == 0 && g_mwin_count > 0) mw = &g_mwins[0];
     if (!mw || !mw->view) return 0;

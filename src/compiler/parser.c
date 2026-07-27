@@ -83,6 +83,8 @@ static void parser_expect_gt(zan_parser_t *p) {
 static zan_ast_node_t *parse_expression(zan_parser_t *p);
 static zan_ast_node_t *parse_statement(zan_parser_t *p);
 static zan_ast_node_t *parse_block(zan_parser_t *p);
+static zan_ast_node_t *parse_embedded_stmt(zan_parser_t *p);
+static bool looks_like_var_decl(zan_parser_t *p);
 static zan_ast_node_t *parse_type_ref(zan_parser_t *p);
 static zan_ast_node_t *parse_type_decl(zan_parser_t *p, uint32_t modifiers);
 static void gen_record_class(zan_ast_node_t *unit, zan_istr_t rname,
@@ -748,6 +750,41 @@ static bool looks_like_call_type_args(zan_parser_t *p) {
     return ok;
 }
 
+/* Disambiguate `Name<...>.` (static access on a constructed generic type,
+ * e.g. `Box<int>.Create(7)`) from a `<` comparison, the same way
+ * looks_like_call_type_args does for `name<...>(` — here the matching `>`
+ * must be followed by `.`. */
+static bool looks_like_type_args_before_dot(zan_parser_t *p) {
+    zan_lexer_t saved_lex = *p->lex;
+    zan_token_t saved_cur = p->current;
+    zan_token_t saved_prev = p->previous;
+    bool ok = false;
+    int depth = 0;
+    while (p->current.kind != TK_EOF) {
+        zan_token_kind_t k = p->current.kind;
+        if (k == TK_LESS) {
+            depth++;
+        } else if (k == TK_GREATER || k == TK_GREATER_GREATER) {
+            depth -= (k == TK_GREATER_GREATER) ? 2 : 1;
+            if (depth <= 0) {
+                ok = (zan_lexer_peek(p->lex).kind == TK_DOT);
+                break;
+            }
+        } else if (k == TK_IDENT || k == TK_COMMA || k == TK_DOT ||
+                   k == TK_LBRACKET || k == TK_RBRACKET || k == TK_QUESTION ||
+                   is_type_kw(k)) {
+            /* still plausibly a type-argument list */
+        } else {
+            break;
+        }
+        parser_advance(p);
+    }
+    *p->lex = saved_lex;
+    p->current = saved_cur;
+    p->previous = saved_prev;
+    return ok;
+}
+
 /* postfix: call, member access, index, ++, --, object initializer */
 static zan_ast_node_t *parse_postfix(zan_parser_t *p) {
     zan_ast_node_t *expr = parse_primary(p);
@@ -834,6 +871,26 @@ static zan_ast_node_t *parse_postfix(zan_parser_t *p) {
             }
             parser_expect(p, TK_RPAREN);
             expr = n;
+        } else if (parser_check(p, TK_LESS) && expr->kind == AST_IDENTIFIER &&
+                   !expr->inst_type_ref &&
+                   looks_like_type_args_before_dot(p)) {
+            /* static access on a constructed generic type: Box<int>.Create(7).
+             * The identifier keeps its simple name and carries the
+             * instantiation, so the following `.` is an ordinary member
+             * access. */
+            zan_ast_node_t *tref = zan_ast_new(p->arena, AST_TYPE_REF, expr->loc);
+            tref->type_ref.name = expr->ident.name;
+            tref->type_ref.is_nullable = false;
+            tref->type_ref.is_array = false;
+            zan_ast_list_init(&tref->type_ref.type_args);
+            parser_advance(p); /* < */
+            while (!parser_check(p, TK_GREATER) && !parser_check(p, TK_EOF)) {
+                zan_ast_node_t *ta = parse_type_ref(p);
+                zan_ast_list_push(&tref->type_ref.type_args, ta, p->arena);
+                if (!parser_match(p, TK_COMMA)) break;
+            }
+            parser_expect_gt(p);
+            expr->inst_type_ref = tref;
         } else if (parser_match(p, TK_LBRACKET)) {
             /* indexing */
             zan_ast_node_t *idx = parse_expression(p);
@@ -1077,6 +1134,36 @@ static zan_ast_node_t *parse_block(zan_parser_t *p) {
     return block;
 }
 
+/* C# embedded statement: the body of if/else/while/for/foreach/do.
+ * Either a block or a single statement; a single statement is wrapped in a
+ * block so scoping and every consumer that assumes a block keep working.
+ * As in C#, a declaration is not an embedded statement (CS1023) — it would
+ * declare a variable nothing can reach. */
+static zan_ast_node_t *parse_embedded_stmt(zan_parser_t *p) {
+    if (parser_check(p, TK_LBRACE)) {
+        return parse_block(p);
+    }
+
+    zan_loc_t loc = p->current.loc;
+    if (looks_like_var_decl(p)) {
+        zan_diag_emit(p->diag, DIAG_ERROR, loc,
+                      "a declaration cannot be used as a single-statement body; "
+                      "enclose it in braces");
+    }
+
+    zan_ast_node_t *block = zan_ast_new(p->arena, AST_BLOCK, loc);
+    zan_ast_list_init(&block->block.stmts);
+    uint32_t before = p->current.loc.offset;
+    zan_ast_node_t *stmt = parse_statement(p);
+    if (stmt) {
+        zan_ast_list_push(&block->block.stmts, stmt, p->arena);
+    }
+    if (p->current.loc.offset == before && !parser_check(p, TK_EOF)) {
+        parser_advance(p);
+    }
+    return block;
+}
+
 /* check if current position looks like a variable declaration:
  * type ident [= ...]
  * var ident [= ...]
@@ -1211,14 +1298,14 @@ static zan_ast_node_t *parse_if_stmt(zan_parser_t *p) {
     parser_expect(p, TK_LPAREN);
     zan_ast_node_t *cond = parse_expression(p);
     parser_expect(p, TK_RPAREN);
-    zan_ast_node_t *then_body = parse_block(p);
+    zan_ast_node_t *then_body = parse_embedded_stmt(p);
 
     zan_ast_node_t *else_body = NULL;
     if (parser_match(p, TK_ELSE)) {
         if (parser_check(p, TK_IF)) {
             else_body = parse_if_stmt(p);
         } else {
-            else_body = parse_block(p);
+            else_body = parse_embedded_stmt(p);
         }
     }
 
@@ -1235,7 +1322,7 @@ static zan_ast_node_t *parse_while_stmt(zan_parser_t *p) {
     parser_expect(p, TK_LPAREN);
     zan_ast_node_t *cond = parse_expression(p);
     parser_expect(p, TK_RPAREN);
-    zan_ast_node_t *body = parse_block(p);
+    zan_ast_node_t *body = parse_embedded_stmt(p);
 
     zan_ast_node_t *n = zan_ast_new(p->arena, AST_WHILE_STMT, loc);
     n->while_stmt.cond = cond;
@@ -1276,7 +1363,7 @@ parse_cond:;
     }
     parser_expect(p, TK_RPAREN);
 
-    zan_ast_node_t *body = parse_block(p);
+    zan_ast_node_t *body = parse_embedded_stmt(p);
 
     zan_ast_node_t *n = zan_ast_new(p->arena, AST_FOR_STMT, loc);
     n->for_stmt.init = init;
@@ -1307,7 +1394,7 @@ static zan_ast_node_t *parse_foreach_stmt(zan_parser_t *p) {
     parser_expect(p, TK_IN);
     zan_ast_node_t *collection = parse_expression(p);
     parser_expect(p, TK_RPAREN);
-    zan_ast_node_t *body = parse_block(p);
+    zan_ast_node_t *body = parse_embedded_stmt(p);
 
     zan_ast_node_t *n = zan_ast_new(p->arena, AST_FOREACH_STMT, loc);
     n->foreach_stmt.var_name = var_name;
@@ -1548,7 +1635,7 @@ static zan_ast_node_t *parse_statement(zan_parser_t *p) {
     case TK_DO: {
         zan_loc_t loc = p->current.loc;
         parser_advance(p);
-        zan_ast_node_t *body = parse_block(p);
+        zan_ast_node_t *body = parse_embedded_stmt(p);
         parser_expect(p, TK_WHILE);
         parser_expect(p, TK_LPAREN);
         zan_ast_node_t *cond = parse_expression(p);

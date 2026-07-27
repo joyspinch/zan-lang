@@ -27,16 +27,20 @@
 void zan_io_init(void);
 void zan_io_shutdown(void);
 void zan_io_socket_cleanup(void);
-int64_t zan_io_socket_send(int64_t fd, const void *buf, int64_t len,
-                           int64_t flags);
-int64_t zan_io_socket_recv(int64_t fd, void *buf, int64_t len,
-                           int64_t flags);
-int64_t zan_io_socket_ready(int64_t fd, int64_t write_ready);
+/* `fd` is a socket handle, so it is pointer-width (`intptr_t`): a Windows
+ * SOCKET is a UINT_PTR and only a POSIX fd fits in 32 bits. Byte counts and
+ * status codes are `int64_t`, flags are `int32_t` -- none of these may be
+ * spelled `int`/`long`, whose width differs across our targets. */
+int64_t zan_io_socket_send(intptr_t fd, const void *buf, int64_t len,
+                           int32_t flags);
+int64_t zan_io_socket_recv(intptr_t fd, void *buf, int64_t len,
+                           int32_t flags);
+int64_t zan_io_socket_ready(intptr_t fd, int32_t write_ready);
 
 /* Probe the outcome of a non-blocking connect on `fd`.
  * Returns 0 once connected, a positive SO_ERROR code (or -1 when no code is
  * available) once the connect has failed, and -2 while still in progress. */
-int64_t zan_io_connect_status(int64_t fd);
+int64_t zan_io_connect_status(intptr_t fd);
 
 /* ---- stackless (CPS state-machine) ABI ----
  *
@@ -46,7 +50,7 @@ int64_t zan_io_connect_status(int64_t fd);
  * one-shot watcher that, when `fd` becomes ready for `interest`
  * (ZAN_IO_READ / ZAN_IO_WRITE), calls `zan_co_ready(frame, step)` to re-enter
  * the state machine. Returns immediately (does not block or suspend). */
-void zan_io_wait_co(int64_t fd, int interest, void *frame, zan_co_step_t step);
+void zan_io_wait_co(intptr_t fd, int32_t interest, void *frame, zan_co_step_t step);
 
 /* Overlapped receive: post a real recv of up to `len` bytes into `buf` and
  * suspend `frame` until it completes, then re-enter via `step`. The number of
@@ -58,55 +62,55 @@ void zan_io_wait_co(int64_t fd, int interest, void *frame, zan_co_step_t step);
  * single overlapped op, so there is no probe/recv window -- the pattern the
  * multi-worker IOCP driver needs to avoid lost completions under high load.
  * On POSIX backends the recv is performed at readiness (same effect). */
-void zan_io_recv_co(int64_t fd, void *buf, int len, void *frame,
+void zan_io_recv_co(intptr_t fd, void *buf, int32_t len, void *frame,
                     zan_co_step_t step, int64_t *out_n);
 
 /* Overlapped accept: post AcceptEx for listener `fd` and suspend `frame`
  * until a connection completes. The accepted socket is stored in `*out_fd`,
  * or -1 when the operation cannot be posted or completed. */
-void zan_io_accept_co(int64_t fd, void *frame, zan_co_step_t step,
-                      int64_t *out_fd);
+void zan_io_accept_co(intptr_t fd, void *frame, zan_co_step_t step,
+                      intptr_t *out_fd);
 
 /* Idle bridge for the stackless scheduler: if IO watchers are pending, block
  * until at least one fires (readying its frame via zan_co_ready) and return the
  * number woken; otherwise return 0. Wire into the co driver with
  * zan_co_set_idle(zan_io_pump). */
-int zan_io_pump(void);
+int32_t zan_io_pump(void);
 
 /* Timer-aware idle bridge used by generated schedulers. Blocks for IO for at
  * most timeout_ms, or sleeps for that duration when no IO is pending. A
  * negative timeout waits indefinitely when IO is pending. */
-int zan_io_pump_timeout(int64_t timeout_ms);
+int32_t zan_io_pump_timeout(int64_t timeout_ms);
 
 /* ---- coroutine-facing ABI (stackful rt_sched fibers) ---- */
 
 /* Suspend the current coroutine until `fd` is readable.
  * Returns 0 on success, -1 on error (fd closed, etc.). */
-int64_t zan_io_wait_readable(int64_t fd);
+int64_t zan_io_wait_readable(intptr_t fd);
 
 /* Suspend the current coroutine until `fd` is writable. */
-int64_t zan_io_wait_writable(int64_t fd);
+int64_t zan_io_wait_writable(intptr_t fd);
 
 /* Suspend until `fd` is readable OR a timeout (ms) expires.
  * Returns 1 if readable, 0 if timeout, -1 on error. */
-int64_t zan_io_wait_readable_timeout(int64_t fd, int64_t timeout_ms);
+int64_t zan_io_wait_readable_timeout(intptr_t fd, int64_t timeout_ms);
 
 /* Asynchronously connect socket `fd` to `ip`:`port` (IPv4 dotted-quad).
  * Suspends the current coroutine until the connection completes.
  * Returns 0 on success, -1 on error.  Backend: ConnectEx on Windows,
  * non-blocking connect + writable readiness on POSIX. */
-int64_t zan_io_connect(int64_t fd, const char *ip, int port);
+int64_t zan_io_connect(intptr_t fd, const char *ip, int32_t port);
 
 /* ---- scheduler-facing ---- */
 
 /* Poll for IO events with at most `timeout_ms` wait.
  * Returns the number of coroutines moved to the ready queue. */
-int zan_io_poll(int64_t timeout_ms);
+int32_t zan_io_poll(int64_t timeout_ms);
 
 /* Returns non-zero if there are pending IO watchers. */
-int zan_io_has_pending(void);
+int32_t zan_io_has_pending(void);
 
 /* Set a file descriptor to non-blocking mode. */
-int zan_io_set_nonblocking(int64_t fd);
+int32_t zan_io_set_nonblocking(intptr_t fd);
 
 #endif /* ZAN_RT_IO_H */

@@ -1940,6 +1940,10 @@ typedef struct {
     /* For any local initialized with `new T[n]`, the i64 alloca holding the
      * element count so `a.Length` can read it; NULL when unknown. */
     LLVMValueRef arr_len_slot;
+    /* 1 when this local's slot is registered on the unwind stack, so an
+     * exception thrown below this frame releases it (A8-12). Scope exit pops
+     * the entry along with the release it emits. */
+    int eh_slot;
 } local_var_t;
 
 /* A function's locals live in a single flat scope. The backing array grows
@@ -1990,6 +1994,7 @@ static void local_add(local_scope_t *scope, zan_istr_t name, LLVMValueRef alloca
     scope->vars[scope->count].alloca = alloca;
     scope->vars[scope->count].type = type;
     scope->vars[scope->count].arc_owned = 0;
+    scope->vars[scope->count].eh_slot = 0;
     scope->vars[scope->count].arr_len = NULL;
     scope->vars[scope->count].arr_len_slot = NULL;
     scope->count++;
@@ -2036,13 +2041,16 @@ static int is_builtin_collection_type(zan_type_t *t) {
            (n.len == 13 && memcmp(n.str, "StringBuilder", 13) == 0);
 }
 
-/* List and StringBuilder are refcounted collections: they carry the rc header
- * and are freed (backing buffer + struct) via a per-site collection destructor.
- * Dict is deliberately excluded (still header-less). */
+/* List, Dict and StringBuilder are refcounted collections: they carry the rc
+ * header and are freed (backing buffers + struct) via a per-site collection
+ * destructor. Dict used to be header-less, which left ownership of a dict
+ * undecidable -- returning one from a method either released its occupants
+ * while the caller still held them, or leaked them. */
 static int is_rc_collection_type(zan_type_t *t) {
     if (!t || t->kind != TYPE_CLASS) return 0;
     zan_istr_t n = t->name;
     return (n.len == 4 && memcmp(n.str, "List", 4) == 0) ||
+           (n.len == 4 && memcmp(n.str, "Dict", 4) == 0) ||
            (n.len == 13 && memcmp(n.str, "StringBuilder", 13) == 0);
 }
 
@@ -2166,11 +2174,12 @@ static LLVMValueRef get_calloc_fn(zan_irgen_t *g) {
     return f;
 }
 
-/* Allocate a refcounted built-in collection (List/StringBuilder) struct through
- * zan_rt_alloc so it carries the 16-byte rc header. Records the collection kind
- * (and, for List, the element type) at a fresh allocation site; the per-site
- * destructor emitted at finalize releases the elements and frees the backing
- * buffer before the struct itself. `coll_kind` is 1=List, 2=StringBuilder.
+/* Allocate a refcounted built-in collection struct through zan_rt_alloc so it
+ * carries the 16-byte rc header. Records the collection kind (and, for List and
+ * Dict, the element/dict type) at a fresh allocation site; the per-site
+ * destructor emitted at finalize releases the occupants and frees the backing
+ * buffers before the struct itself. `coll_kind` is 1=List, 2=StringBuilder,
+ * 3=Dict.
  * Returns the user pointer (i8*), i.e. the struct base past the header. */
 static LLVMValueRef emit_alloc_rc_collection(zan_irgen_t *g, zan_ast_node_t *expr,
                                              long size, int coll_kind,
@@ -2186,7 +2195,8 @@ static LLVMValueRef emit_alloc_rc_collection(zan_irgen_t *g, zan_ast_node_t *exp
     if (g->check_leaks) {
         char site_buf[600];
         const char *sfile = leak_site_file(g, expr->loc);
-        const char *knm = (coll_kind == 2) ? "StringBuilder" : "List";
+        const char *knm = (coll_kind == 2) ? "StringBuilder"
+                        : (coll_kind == 3) ? "Dictionary" : "List";
         int elen = (elem_type && elem_type->name.len) ? elem_type->name.len : 1;
         const char *estr = (elem_type && elem_type->name.len) ? elem_type->name.str : "?";
         snprintf(site_buf, sizeof(site_buf), "%s:%u:%u [%s<%.*s>]",

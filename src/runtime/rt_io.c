@@ -126,7 +126,7 @@ typedef struct zan_io_entry {
     void *rbuf;             /* recv sink (zan_io_recv_co); NULL => plain probe */
     int   rlen;
     int64_t *out_n;         /* recv byte-count sink (NULL => plain probe) */
-    int64_t *out_accept;    /* accepted fd sink (NULL => not an accept op) */
+    intptr_t *out_accept;   /* accepted fd sink (NULL => not an accept op) */
     struct zan_io_entry *next;
 } zan_io_entry_t;
 
@@ -136,9 +136,9 @@ static zan_io_entry_t *g_io_entries;    /* linked list of active watchers */
  * backends run only under the single-thread inline driver, so plain statics are
  * safe (the multi-worker driver is Windows/IOCP-only). */
 static void   *g_pending_rbuf;
-static int      g_pending_rlen;
+static int32_t  g_pending_rlen;
 static int64_t *g_pending_out_n;
-static int64_t *g_pending_accept_out;
+static intptr_t *g_pending_accept_out;
 
 /* On POSIX there is no overlapped recv, so zan_io_recv_co registers a readiness
  * watcher and performs the recv here once the fd is readable -- same net effect
@@ -147,7 +147,7 @@ static int64_t *g_pending_accept_out;
 #if !defined(__linux__)
 static void io_deliver_recv(zan_io_entry_t *e) {
     if (e->out_accept) {
-        *e->out_accept = (int64_t)accept(e->fd, NULL, NULL);
+        *e->out_accept = (intptr_t)accept(e->fd, NULL, NULL);
         return;
     }
     if (!e->out_n) return;
@@ -179,8 +179,8 @@ void zan_io_socket_cleanup(void) {}
  * Returning a single -1 for every error made the async SendAsync loop wait
  * forever for a writability that never comes when the peer had reset the
  * connection mid-send (e.g. a server that answers 413 and closes). */
-int64_t zan_io_socket_send(int64_t fd, const void *buf, int64_t len,
-                           int64_t flags) {
+int64_t zan_io_socket_send(intptr_t fd, const void *buf, int64_t len,
+                           int32_t flags) {
 #if defined(_WIN32)
     int _sr = send((SOCKET)fd, (const char *)buf, (int)len, (int)flags);
     if (_sr == SOCKET_ERROR) {
@@ -201,8 +201,8 @@ int64_t zan_io_socket_send(int64_t fd, const void *buf, int64_t len,
 #endif
 }
 
-int64_t zan_io_socket_recv(int64_t fd, void *buf, int64_t len,
-                           int64_t flags) {
+int64_t zan_io_socket_recv(intptr_t fd, void *buf, int64_t len,
+                           int32_t flags) {
 #if defined(_WIN32)
     return (int64_t)recv((SOCKET)fd, (char *)buf, (int)len, (int)flags);
 #else
@@ -210,7 +210,7 @@ int64_t zan_io_socket_recv(int64_t fd, void *buf, int64_t len,
 #endif
 }
 
-int64_t zan_io_socket_ready(int64_t fd, int64_t write_ready) {
+int64_t zan_io_socket_ready(intptr_t fd, int32_t write_ready) {
     fd_set fds;
     FD_ZERO(&fds);
     struct timeval timeout = {0, 0};
@@ -239,7 +239,7 @@ int64_t zan_io_socket_ready(int64_t fd, int64_t write_ready) {
  * populated until the exception set has actually been polled, so a bare
  * getsockopt(SO_ERROR) after the reactor wake reads 0 for a refused
  * connection. */
-int64_t zan_io_connect_status(int64_t fd) {
+int64_t zan_io_connect_status(intptr_t fd) {
     fd_set wfds, efds;
     FD_ZERO(&wfds);
     FD_ZERO(&efds);
@@ -296,7 +296,7 @@ typedef struct zan_io_waiter {
     void *rbuf;
     int   rlen;
     int64_t *out_n;
-    int64_t *out_accept;
+    intptr_t *out_accept;
     struct zan_io_waiter *next;   /* overflow chain (usually NULL) */
 } zan_io_waiter_t;
 
@@ -339,7 +339,7 @@ void zan_io_shutdown(void) {
     g_io_started = 0;
 }
 
-int zan_io_set_nonblocking(int64_t fd) {
+int32_t zan_io_set_nonblocking(intptr_t fd) {
     int flags = fcntl((int)fd, F_GETFL, 0);
     if (flags < 0) return -1;
     return fcntl((int)fd, F_SETFL, flags | O_NONBLOCK);
@@ -384,8 +384,8 @@ static void io_arm(int fd, zan_io_slot_t *s) {
     }
 }
 
-static void io_register(int fd, int interest, void *co, zan_co_step_t step) {
-    zan_io_slot_t *s = io_slot(fd);
+static void io_register(intptr_t fd, int32_t interest, void *co, zan_co_step_t step) {
+    zan_io_slot_t *s = io_slot((int)fd);
     if (!s) return;
     zan_io_waiter_t *w;
     unsigned char *has = (interest == ZAN_IO_READ) ? &s->has_r : &s->has_w;
@@ -419,7 +419,7 @@ static void io_register(int fd, int interest, void *co, zan_co_step_t step) {
 /* Perform the pending recv/accept for a woken waiter (see io_deliver_recv). */
 static void io_deliver_waiter(int fd, zan_io_waiter_t *w) {
     if (w->out_accept) {
-        *w->out_accept = (int64_t)accept(fd, NULL, NULL);
+        *w->out_accept = (intptr_t)accept(fd, NULL, NULL);
         return;
     }
     if (!w->out_n) return;
@@ -449,7 +449,7 @@ static int io_take(zan_io_slot_t *s, int fd, int read_dir,
     return n;
 }
 
-int zan_io_poll(int64_t timeout_ms) {
+int32_t zan_io_poll(int64_t timeout_ms) {
     if (g_io_count == 0) return 0;
     struct epoll_event events[256];
     int n = epoll_wait(g_epoll_fd, events, 256,
@@ -507,15 +507,15 @@ void zan_io_shutdown(void) {
     g_io_started = 0;
 }
 
-int zan_io_set_nonblocking(int64_t fd) {
+int32_t zan_io_set_nonblocking(intptr_t fd) {
     int flags = fcntl((int)fd, F_GETFL, 0);
     if (flags < 0) return -1;
     return fcntl((int)fd, F_SETFL, flags | O_NONBLOCK);
 }
 
-static void io_register(int fd, int interest, void *co, zan_co_step_t step) {
+static void io_register(intptr_t fd, int32_t interest, void *co, zan_co_step_t step) {
     zan_io_entry_t *e = (zan_io_entry_t *)calloc(1, sizeof(*e));
-    e->fd = fd;
+    e->fd = (int)fd;
     e->interest = interest;
     e->co = co;
     e->step = step;
@@ -534,7 +534,7 @@ static void io_register(int fd, int interest, void *co, zan_co_step_t step) {
     kevent(g_kq_fd, &kev, 1, NULL, 0, NULL);
 }
 
-int zan_io_poll(int64_t timeout_ms) {
+int32_t zan_io_poll(int64_t timeout_ms) {
     if (g_io_count == 0) return 0;
     struct kevent events[64];
     struct timespec ts = { timeout_ms / 1000, (timeout_ms % 1000) * 1000000L };
@@ -735,7 +735,7 @@ void zan_io_shutdown(void) {
     g_io_started = 0;
 }
 
-int zan_io_set_nonblocking(int64_t fd) {
+int32_t zan_io_set_nonblocking(intptr_t fd) {
     u_long mode = 1;
     return ioctlsocket((SOCKET)fd, FIONBIO, &mode);
 }
@@ -762,7 +762,7 @@ static int io_is_listening(SOCKET s) {
 #endif
 
 /* Post a zero-byte overlapped op to learn when `fd` is read/write ready. */
-static void io_register(int fd, int interest, void *co, zan_co_step_t step) {
+static void io_register(intptr_t fd, int32_t interest, void *co, zan_co_step_t step) {
     SOCKET s = (SOCKET)fd;
 
 #if defined(ZAN_CO_DRIVER)
@@ -840,7 +840,7 @@ static void io_register(int fd, int interest, void *co, zan_co_step_t step) {
  * probe/synchronous-recv window that leaked completions under the multi-worker
  * driver at high load. The byte count reaches the coroutine via `*out_n`, set
  * either inline (immediate completion) or when the completion is dequeued. */
-void zan_io_recv_co(int64_t fd, void *buf, int len, void *frame,
+void zan_io_recv_co(intptr_t fd, void *buf, int32_t len, void *frame,
                     zan_co_step_t step, int64_t *out_n) {
     zan_io_init();
     SOCKET s = (SOCKET)fd;
@@ -884,8 +884,8 @@ void zan_io_recv_co(int64_t fd, void *buf, int len, void *frame,
     PostQueuedCompletionStatus(g_iocp, 0, (ULONG_PTR)s, &op->ov);
 }
 
-void zan_io_accept_co(int64_t fd, void *frame, zan_co_step_t step,
-                      int64_t *out_fd) {
+void zan_io_accept_co(intptr_t fd, void *frame, zan_co_step_t step,
+                      intptr_t *out_fd) {
     zan_io_init();
     SOCKET listener = (SOCKET)fd;
     IOTRACE("accept_co ENTER listener=%lld", (long long)fd);
@@ -916,7 +916,7 @@ void zan_io_accept_co(int64_t fd, void *frame, zan_co_step_t step,
     op->kind = ZAN_IO_OP_ACCEPT;
     op->co = frame;
     op->step = step;
-    op->out_n = out_fd;
+    op->out_n = (int64_t *)out_fd;
     op->accepted = accepted;
     op->accept_buf = calloc(1, addr_len * 2);
     IO_CNT_INC();
@@ -965,7 +965,7 @@ static void io_complete_op(zan_io_op_t *op, DWORD transferred,
     if (op->out_n) *op->out_n = (int64_t)transferred;
 }
 
-int zan_io_poll(int64_t timeout_ms) {
+int32_t zan_io_poll(int64_t timeout_ms) {
     if (g_io_count == 0) return 0;
     OVERLAPPED_ENTRY entries[64];
     ULONG removed = 0;
@@ -1014,15 +1014,15 @@ void zan_io_shutdown(void) {
     g_io_started = 0;
 }
 
-int zan_io_set_nonblocking(int64_t fd) {
+int32_t zan_io_set_nonblocking(intptr_t fd) {
     int flags = fcntl((int)fd, F_GETFL, 0);
     if (flags < 0) return -1;
     return fcntl((int)fd, F_SETFL, flags | O_NONBLOCK);
 }
 
-static void io_register(int fd, int interest, void *co, zan_co_step_t step) {
+static void io_register(intptr_t fd, int32_t interest, void *co, zan_co_step_t step) {
     zan_io_entry_t *e = (zan_io_entry_t *)calloc(1, sizeof(*e));
-    e->fd = fd;
+    e->fd = (int)fd;
     e->interest = interest;
     e->co = co;
     e->step = step;
@@ -1038,7 +1038,7 @@ static void io_register(int fd, int interest, void *co, zan_co_step_t step) {
     g_io_count++;
 }
 
-int zan_io_poll(int64_t timeout_ms) {
+int32_t zan_io_poll(int64_t timeout_ms) {
     if (g_io_count == 0) return 0;
 
     fd_set read_fds, write_fds;
@@ -1093,33 +1093,33 @@ int zan_io_poll(int64_t timeout_ms) {
 
 /* ---- stackless (CPS) registration + idle bridge ---- */
 
-void zan_io_wait_co(int64_t fd, int interest, void *frame, zan_co_step_t step) {
+void zan_io_wait_co(intptr_t fd, int32_t interest, void *frame, zan_co_step_t step) {
     zan_io_init();      /* lazy: generated programs never call zan_io_init */
-    io_register((int)fd, interest, frame, step);
+    io_register(fd, interest, frame, step);
 }
 
 #if !defined(_WIN32)
 /* POSIX overlapped-recv shim: register a read-readiness watcher carrying the
  * recv sink, so the poll loop performs the recv and delivers the byte count
  * (see io_deliver_recv). Windows has a true overlapped implementation above. */
-void zan_io_recv_co(int64_t fd, void *buf, int len, void *frame,
+void zan_io_recv_co(intptr_t fd, void *buf, int32_t len, void *frame,
                     zan_co_step_t step, int64_t *out_n) {
     zan_io_init();
     g_pending_rbuf = buf;
     g_pending_rlen = len;
     g_pending_out_n = out_n;
-    io_register((int)fd, ZAN_IO_READ, frame, step);
+    io_register(fd, ZAN_IO_READ, frame, step);
 }
 
-void zan_io_accept_co(int64_t fd, void *frame, zan_co_step_t step,
-                      int64_t *out_fd) {
+void zan_io_accept_co(intptr_t fd, void *frame, zan_co_step_t step,
+                      intptr_t *out_fd) {
     zan_io_init();
     g_pending_accept_out = out_fd;
-    io_register((int)fd, ZAN_IO_READ, frame, step);
+    io_register(fd, ZAN_IO_READ, frame, step);
 }
 #endif
 
-int zan_io_pump_timeout(int64_t timeout_ms) {
+int32_t zan_io_pump_timeout(int64_t timeout_ms) {
     if (zan_io_has_pending())
         return zan_io_poll(timeout_ms);
     if (timeout_ms <= 0)
@@ -1136,11 +1136,11 @@ int zan_io_pump_timeout(int64_t timeout_ms) {
     return 0;
 }
 
-int zan_io_pump(void) {
+int32_t zan_io_pump(void) {
     return zan_io_pump_timeout(-1);
 }
 
-int zan_io_has_pending(void) {
+int32_t zan_io_has_pending(void) {
     return g_io_count > 0;
 }
 
@@ -1148,23 +1148,23 @@ int zan_io_has_pending(void) {
 /* ---- stackful (rt_sched fiber) ABI: excluded from the reactor object
  * shipped with zanc so it needs no rt_sched. ---- */
 
-int64_t zan_io_wait_readable(int64_t fd) {
+int64_t zan_io_wait_readable(intptr_t fd) {
     void *co = zan_io_get_current_co();
     if (!co) return -1;
-    io_register((int)fd, ZAN_IO_READ, co, NULL);
+    io_register(fd, ZAN_IO_READ, co, NULL);
     zan_io_suspend_current();
     return 0;
 }
 
-int64_t zan_io_wait_writable(int64_t fd) {
+int64_t zan_io_wait_writable(intptr_t fd) {
     void *co = zan_io_get_current_co();
     if (!co) return -1;
-    io_register((int)fd, ZAN_IO_WRITE, co, NULL);
+    io_register(fd, ZAN_IO_WRITE, co, NULL);
     zan_io_suspend_current();
     return 0;
 }
 
-int64_t zan_io_wait_readable_timeout(int64_t fd, int64_t timeout_ms) {
+int64_t zan_io_wait_readable_timeout(intptr_t fd, int64_t timeout_ms) {
     /* For simplicity, delegate to wait_readable; timeout is handled
      * by the scheduler's timer integration.  A proper implementation
      * would register both an IO watcher and a timer, and cancel whichever
@@ -1172,7 +1172,7 @@ int64_t zan_io_wait_readable_timeout(int64_t fd, int64_t timeout_ms) {
     (void)timeout_ms;
     void *co = zan_io_get_current_co();
     if (!co) return -1;
-    io_register((int)fd, ZAN_IO_READ, co, NULL);
+    io_register(fd, ZAN_IO_READ, co, NULL);
     zan_io_suspend_current();
     return 1;
 }
@@ -1182,7 +1182,7 @@ int64_t zan_io_wait_readable_timeout(int64_t fd, int64_t timeout_ms) {
 #if defined(_WIN32)
 /* Async connect via ConnectEx; suspends until the connection completes.
  * Returns 0 on success, -1 on error. */
-int64_t zan_io_connect(int64_t fd, const char *ip, int port) {
+int64_t zan_io_connect(intptr_t fd, const char *ip, int32_t port) {
     SOCKET s = (SOCKET)fd;
 
     /* ConnectEx requires a bound socket. */
@@ -1241,7 +1241,7 @@ int64_t zan_io_connect(int64_t fd, const char *ip, int port) {
 
 #else
 /* POSIX async connect: non-blocking connect + writable readiness. */
-int64_t zan_io_connect(int64_t fd, const char *ip, int port) {
+int64_t zan_io_connect(intptr_t fd, const char *ip, int32_t port) {
     int s = (int)fd;
     struct sockaddr_in target;
     memset(&target, 0, sizeof(target));

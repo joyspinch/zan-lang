@@ -18,14 +18,49 @@ if(NOT ZANC OR NOT SRC OR NOT EXPECTED OR NOT OUT_EXE)
   message(FATAL_ERROR "run_case.cmake: ZANC, SRC, EXPECTED and OUT_EXE are required")
 endif()
 
+
+# ---- up-to-date check ------------------------------------------------------
+# Re-running the suite must not recompile programs whose inputs did not change:
+# the artifact is a pure function of (source, compiler, stdlib), so a target
+# newer than all three is reused. STDLIB_STAMP is touched by the build whenever
+# any stdlib source changes.
+function(zan_artifact_is_current out_var artifact)
+  set(${out_var} FALSE PARENT_SCOPE)
+  if(NOT EXISTS ${artifact})
+    return()
+  endif()
+  if(${SRC} IS_NEWER_THAN ${artifact})
+    return()
+  endif()
+  if(${ZANC} IS_NEWER_THAN ${artifact})
+    return()
+  endif()
+  if(STDLIB_STAMP AND EXISTS ${STDLIB_STAMP} AND ${STDLIB_STAMP} IS_NEWER_THAN ${artifact})
+    return()
+  endif()
+  set(${out_var} TRUE PARENT_SCOPE)
+endfunction()
+
+
+# A reused artifact must never make a failure sticky: if the program crashed or
+# its output did not match, drop the executable so the next run recompiles it
+# from scratch (an image damaged by a transient build/AV race would otherwise be
+# considered "current" forever).
+function(zan_drop_artifact)
+  file(REMOVE ${OUT_EXE})
+endfunction()
+
 # ---- compile ----
-execute_process(
-  COMMAND ${ZANC} ${SRC} -o ${OUT_EXE} ${ZANC_ARGS}
-  RESULT_VARIABLE compile_rc
-  OUTPUT_VARIABLE compile_out
-  ERROR_VARIABLE  compile_err)
-if(NOT compile_rc EQUAL 0)
-  message(FATAL_ERROR "compile failed (rc=${compile_rc})\n${compile_out}${compile_err}")
+zan_artifact_is_current(_current ${OUT_EXE})
+if(NOT _current)
+  execute_process(
+    COMMAND ${ZANC} ${SRC} -o ${OUT_EXE} ${ZANC_ARGS}
+    RESULT_VARIABLE compile_rc
+    OUTPUT_VARIABLE compile_out
+    ERROR_VARIABLE  compile_err)
+  if(NOT compile_rc EQUAL 0)
+    message(FATAL_ERROR "compile failed (rc=${compile_rc})\n${compile_out}${compile_err}")
+  endif()
 endif()
 
 # ---- run ----
@@ -59,6 +94,7 @@ while(TRUE)
   break()
 endwhile()
 if(NOT run_rc EQUAL 0)
+  zan_drop_artifact()
   message(FATAL_ERROR "program exited with ${run_rc}\noutput:\n${actual}")
 endif()
 
@@ -70,6 +106,7 @@ string(REGEX REPLACE "[ \t\r\n]+$" "" expected "${expected}")
 string(REGEX REPLACE "[ \t\r\n]+$" "" actual   "${actual}")
 
 if(NOT actual STREQUAL expected)
+  zan_drop_artifact()
   message(FATAL_ERROR
     "output mismatch for ${SRC}\n--- expected ---\n${expected}\n--- actual ---\n${actual}")
 endif()

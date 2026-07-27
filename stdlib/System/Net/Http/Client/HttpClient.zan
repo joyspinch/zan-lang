@@ -8,6 +8,18 @@ namespace System.Net.Http.Client;
 /// <summary>
 /// HTTP client supporting GET, POST, PUT, DELETE, over plain TCP or TLS
 /// (https via CreateHttps / UseTls).
+///
+/// <c>SetTimeout</c> is enforced, not advisory: the connect phase is bounded by
+/// a deadline-polled non-blocking connect, and the send/receive phase by the
+/// shared <see cref="HttpDeadline"/> sweeper, which hangs up on a late socket so
+/// the parked coroutine wakes and reports the timeout. The sweeper ticks once a
+/// second, so the effective granularity is ~1s (a 30s timeout fires between 30
+/// and 31s); <c>SetTimeout(0)</c> disables deadlines entirely.
+///
+/// The status line is available through <see cref="SendAsync"/>, which returns
+/// the parsed <see cref="HttpResponse"/>; the verb helpers keep returning just
+/// the body. Nothing about the last response is cached on the client, so one
+/// client stays usable from several coroutines.
 /// </summary>
 class HttpClient {
     string host;
@@ -18,13 +30,13 @@ class HttpClient {
     List<string> defaultHeaders;
 
     [DllImport("crt")]
-    static extern int fopen(string path, string mode);
+    static extern nint fopen(string path, string mode);
 
     [DllImport("crt")]
-    static extern int fputs(string str, int fp);
+    static extern int fputs(string str, nint fp);
 
     [DllImport("crt")]
-    static extern int fclose(int fp);
+    static extern int fclose(nint fp);
 
     HttpClient() {
         this.host = "";
@@ -69,7 +81,10 @@ class HttpClient {
         return this;
     }
 
-    /// <summary>Sets the request timeout in milliseconds.</summary>
+    /// <summary>Sets the request timeout in milliseconds: the connect phase and
+    /// the request/response phase each get their own window. Zero or less
+    /// disables timeouts (the coroutine then waits for the peer
+    /// indefinitely).</summary>
     HttpClient SetTimeout(int ms) {
         this.timeout = ms;
         return this;
@@ -108,8 +123,31 @@ class HttpClient {
         return sb.ToString();
     }
 
+    // Reports a connect failure, telling a refused connection apart from an
+    // exhausted deadline. Kept out of RequestAsync so the message is built in a
+    // frame that owns no other allocation (`throw` does not release live locals,
+    // see docs/bugs/throw-leaks-live-locals.md).
+    void FailConnect() {
+        if (TcpClient.LastConnectTimedOut()) {
+            throw new HttpRequestException("Connect to " + this.host + ":"
+                + Convert.ToString(this.port) + " timed out after "
+                + Convert.ToString(this.timeout) + "ms");
+        }
+        throw new HttpRequestException("Could not connect to " + this.host
+            + ":" + Convert.ToString(this.port));
+    }
+
+    // Reports an exhausted request deadline (the sweeper already hung the
+    // socket up, which is what ended the caller's read loop).
+    void FailTimeout() {
+        throw new HttpRequestException("Request to " + this.host + ":"
+            + Convert.ToString(this.port) + " timed out after "
+            + Convert.ToString(this.timeout) + "ms");
+    }
+
     /// <summary>Sends an HTTP request and returns the raw response. Throws
-    /// HttpRequestException when the connection (or TLS handshake) fails.
+    /// HttpRequestException when the connection (or TLS handshake) fails, or
+    /// when the request does not complete within the timeout.
     /// The connection is established before the request text is built, so a
     /// connect failure throws with no allocations live in this frame.</summary>
     async string RequestAsync(string method, string path, string body) {
@@ -118,27 +156,51 @@ class HttpClient {
             return raw;
         }
 
-        TcpClient conn = await TcpClient.ConnectAsync(this.host, this.port);
+        TcpClient conn = await TcpClient.ConnectAsync(this.host, this.port,
+                                                     this.timeout);
         if (conn == null) {
-            throw new HttpRequestException("Could not connect to " + this.host
-                + ":" + Convert.ToString(this.port));
+            FailConnect();
         }
+        // From here on the deadline is the sweeper's: a peer that accepts the
+        // connection and then goes quiet would park this coroutine forever,
+        // since a reactor wake cannot be cancelled.
+        int watch = HttpDeadline.Arm(conn.Sock(), this.timeout);
         int _sent = await conn.SendAsync(BuildRequest(method, path, body));
 
-        // Read response
+        // Read response. The chunk is hoisted out of the loop and cleared
+        // afterwards because a timeout unwinds through `throw`, which does not
+        // release live locals -- including the loop-scoped ones
+        // (docs/bugs/throw-leaks-live-locals.md).
         StringBuilder respSb = new StringBuilder();
         bool reading = true;
+        string chunk = "";
         while (reading) {
-            string chunk = await conn.RecvAsync(65536);
+            chunk = await conn.RecvAsync(65536);
             if (chunk.Length == 0) {
                 reading = false;
             } else {
                 respSb.Append(chunk);
             }
         }
+        chunk = "";
 
+        string result = respSb.ToString();
+        respSb = null;
+        bool late = HttpDeadline.Expired(watch);
+        HttpDeadline.Disarm(watch);
         conn.Close();
-        return respSb.ToString();
+        conn = null;
+        if (late) {
+            // Drop the partial response and the connection before unwinding:
+            // locals still live at the throw are not released
+            // (docs/bugs/throw-leaks-live-locals.md).
+            result = "";
+            method = "";
+            path = "";
+            body = "";
+            FailTimeout();
+        }
+        return result;
     }
 
     // Establishes a fresh TLS connection (throwing HttpRequestException on
@@ -146,10 +208,10 @@ class HttpClient {
     // the request and reads the whole response (Connection: close framing).
     async string RequestTlsAsync(string method, string path, string body) {
         Socket.Initialize();
-        TcpClient conn = await TcpClient.ConnectAsync(this.host, this.port);
+        TcpClient conn = await TcpClient.ConnectAsync(this.host, this.port,
+                                                     this.timeout);
         if (conn == null) {
-            throw new HttpRequestException("Could not connect to " + this.host
-                + ":" + Convert.ToString(this.port));
+            FailConnect();
         }
         TlsContext ctx = TlsContext.CreateClient();
         if (ctx == null) {
@@ -167,24 +229,53 @@ class HttpClient {
                 + " failed");
         }
 
+        // The handshake is done; bound the exchange itself the same way the
+        // plain path does.
+        int watch = HttpDeadline.Arm(conn.Sock(), this.timeout);
         string requestData = BuildRequest(method, path, body);
         int _sent = await stream.SendAsync(requestData, requestData.Length);
 
         StringBuilder respSb = new StringBuilder();
         bool reading = true;
+        string chunk = "";
         while (reading) {
-            string chunk = await stream.RecvAsync(65536);
+            chunk = await stream.RecvAsync(65536);
             if (chunk.Length == 0) {
                 reading = false;
             } else {
                 respSb.Append(chunk);
             }
         }
+        chunk = "";
 
+        string result = respSb.ToString();
+        respSb = null;
+        bool late = HttpDeadline.Expired(watch);
+        HttpDeadline.Disarm(watch);
         stream.Close();
         conn.Close();
         ctx.Free();
-        return respSb.ToString();
+        stream = null;
+        conn = null;
+        ctx = null;
+        if (late) {
+            result = "";
+            requestData = "";
+            method = "";
+            path = "";
+            body = "";
+            FailTimeout();
+        }
+        return result;
+    }
+
+    /// <summary>Sends a request and returns the parsed response, so callers can
+    /// see the status line and headers instead of only the body: a 502 from a
+    /// gateway is otherwise indistinguishable from a 200 with an odd
+    /// payload.</summary>
+    async HttpResponse SendAsync(string method, string path, string body) {
+        string raw = await RequestAsync(method, path, body);
+        return HttpResponse.Parse(raw);
     }
 
     /// <summary>Sends a GET request and returns the response body.</summary>

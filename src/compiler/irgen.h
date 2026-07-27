@@ -23,6 +23,9 @@ typedef struct {
 /* Handler ids a single coroutine can keep armed across suspensions. */
 #define ASYNC_MAX_HANDLERS 8
 
+/* Nesting depth of catch bodies a single function body may be inside. */
+#define ZAN_MAX_CATCH_DEPTH 16
+
 struct zan_irgen {
     zan_arena_t *arena;
     zan_diag_t *diag;
@@ -103,6 +106,26 @@ struct zan_irgen {
     /* first body-scope local of the innermost loop: `break`/`continue`
      * release owned locals from this index before leaving the body */
     int loop_locals_base;
+    /* first local whose scope-exit release a `throw` would skip: the longjmp
+     * lands in the innermost enclosing try of *this* function (so its body's
+     * locals, from this index up, must be released at the throw site) or, with
+     * no enclosing try, leaves the function altogether (index 0). */
+    int throw_locals_base;
+    /* catch bodies currently being emitted, innermost last. A handler owns the
+     * caught exception (see the exc.push/exc.hrel pair in the try lowering) and
+     * releases it in the try's epilogue -- which `return`, `break`, `continue`
+     * and `throw` jump past, so those paths release it from here instead. */
+    struct {
+        LLVMValueRef exc_slot;   /* i8* slot holding the caught exception */
+        LLVMValueRef owned_slot; /* i32 slot: non-zero when the handler owns it */
+    } catch_cleanups[ZAN_MAX_CATCH_DEPTH];
+    int catch_cleanup_count;
+    /* catch_cleanups entries entered inside the innermost loop: `break` and
+     * `continue` leave only those */
+    int loop_catch_base;
+    /* catch_cleanups entries entered inside the innermost enclosing try body:
+     * a `throw` unwinds past exactly those handlers */
+    int throw_catch_base;
 
     /* constructors */
     struct zan_ctor_entry {
@@ -262,12 +285,15 @@ struct zan_irgen {
      * a one-shot fd watcher that re-readies (frame, step) when ready;
      * zan_io_pump_timeout blocks for IO up to the next timer deadline. A weak
      * inline fallback sleeps for timer-only programs; the reactor object's
-     * strong definition overrides it for socket-async programs. */
-    LLVMValueRef rt_io_wait_co;   /* void zan_io_wait_co(i64 fd,i32 interest,i8* frame,step) */
+     * strong definition overrides it for socket-async programs.
+     * The `fd` parameters are C `intptr_t` (a Windows SOCKET is a UINT_PTR),
+     * lowered as i64 because our targets are 64-bit; A0-2 makes that a real
+     * pointer-width lowering. */
+    LLVMValueRef rt_io_wait_co;   /* void zan_io_wait_co(iptr fd,i32 interest,i8* frame,step) */
     LLVMTypeRef  rt_io_wait_co_type;
-    LLVMValueRef rt_io_recv_co;   /* void zan_io_recv_co(i64 fd,i8* buf,i32 len,i8* frame,step,i64* out_n) */
+    LLVMValueRef rt_io_recv_co;   /* void zan_io_recv_co(iptr fd,i8* buf,i32 len,i8* frame,step,i64* out_n) */
     LLVMTypeRef  rt_io_recv_co_type;
-    LLVMValueRef rt_io_accept_co; /* void zan_io_accept_co(i64 fd,i8* frame,step,i64* out_fd) */
+    LLVMValueRef rt_io_accept_co; /* void zan_io_accept_co(iptr fd,i8* frame,step,iptr* out_fd) */
     LLVMTypeRef  rt_io_accept_co_type;
     LLVMValueRef rt_io_pump_timeout;      /* i32 zan_io_pump_timeout(i64 timeout_ms) */
     LLVMTypeRef  rt_io_pump_timeout_type;
@@ -311,6 +337,9 @@ struct zan_irgen {
     LLVMValueRef current_async_rearm_init_switch;
     LLVMBasicBlockRef current_async_rearm_next_bb;
     int          current_async_handler_next;
+    /* per-function id of the next `foreach` emitted inside an async body;
+     * indexes its frame-resident iteration state (see AST_FOREACH_STMT) */
+    int          current_async_foreach_next;
 
     /* DllImport: tracked extern libraries for linker */
     zan_istr_t extern_libs[64];

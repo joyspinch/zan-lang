@@ -492,7 +492,7 @@ static void present_layered(HWND hwnd, zan_surface_t *s) {
 
 /* Enable native glass on a window. tint_argb: ARGB tint (alpha ~0x40-0xA0
  * reads as frost strength). Idempotent; safe to call every theme change. */
-EXPORT i64 zan_gui_enable_glass(i64 hwnd_val, i64 tint_argb) {
+EXPORT i64 zan_gui_enable_glass(iptr hwnd_val, i64 tint_argb) {
     HWND hwnd = (HWND)(intptr_t)hwnd_val;
     if (!hwnd) return 1;
     LONG_PTR ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
@@ -511,7 +511,7 @@ EXPORT i64 zan_gui_enable_glass(i64 hwnd_val, i64 tint_argb) {
 }
 
 /* Disable native glass and drop the layered style, back to opaque GDI present. */
-EXPORT i64 zan_gui_disable_glass(i64 hwnd_val) {
+EXPORT i64 zan_gui_disable_glass(iptr hwnd_val) {
     HWND hwnd = (HWND)(intptr_t)hwnd_val;
     if (!hwnd) return 1;
     acrylic_apply(hwnd, ZAN_ACCENT_DISABLED, 0);
@@ -857,7 +857,7 @@ static void zan_enable_dpi_awareness(void) {
     }
 }
 
-EXPORT i64 zan_gui_create_window(const char *title, i64 width, i64 height) {
+EXPORT iptr zan_gui_create_window(const char *title, i64 width, i64 height) {
     static int registered = 0;
     static int dpi_set = 0;
     if (!dpi_set) {
@@ -965,12 +965,12 @@ EXPORT i64 zan_gui_create_window(const char *title, i64 width, i64 height) {
     /* Apply the frame removal (WM_NCCALCSIZE) right away. */
     SetWindowPos(hwnd, NULL, 0, 0, 0, 0,
         SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-    return (i64)(intptr_t)hwnd;
+    return (iptr)hwnd;
 }
 
 /* Move a window's top-left to (x, y) in screen (work-area) pixels. Used when a
  * designer configures a manual window position instead of the default center. */
-EXPORT i64 zan_gui_set_window_pos(i64 hwnd_val, i64 x, i64 y) {
+EXPORT i64 zan_gui_set_window_pos(iptr hwnd_val, i64 x, i64 y) {
     HWND hwnd = (HWND)(intptr_t)hwnd_val;
     if (!hwnd) return 0;
     SetWindowPos(hwnd, NULL, (int)x, (int)y, 0, 0,
@@ -979,7 +979,7 @@ EXPORT i64 zan_gui_set_window_pos(i64 hwnd_val, i64 x, i64 y) {
 }
 
 /* Re-center a window on its monitor work area (designer "center" position). */
-EXPORT i64 zan_gui_center_window(i64 hwnd_val) {
+EXPORT i64 zan_gui_center_window(iptr hwnd_val) {
     HWND hwnd = (HWND)(intptr_t)hwnd_val;
     if (!hwnd) return 0;
     RECT wr;
@@ -998,7 +998,7 @@ EXPORT i64 zan_gui_center_window(i64 hwnd_val) {
     return 1;
 }
 
-EXPORT i64 zan_gui_show_window(i64 hwnd_val) {
+EXPORT i64 zan_gui_show_window(iptr hwnd_val) {
     HWND hwnd = (HWND)(intptr_t)hwnd_val;
     ShowWindow(hwnd, SW_SHOW);
     UpdateWindow(hwnd);
@@ -1009,12 +1009,12 @@ EXPORT i64 zan_gui_show_window(i64 hwnd_val) {
 }
 
 /* ---- Custom title bar window controls ---- */
-EXPORT i64 zan_gui_minimize(i64 hwnd_val) {
+EXPORT i64 zan_gui_minimize(iptr hwnd_val) {
     ShowWindow((HWND)(intptr_t)hwnd_val, SW_MINIMIZE);
     return 0;
 }
 
-EXPORT i64 zan_gui_toggle_maximize(i64 hwnd_val) {
+EXPORT i64 zan_gui_toggle_maximize(iptr hwnd_val) {
     HWND hwnd = (HWND)(intptr_t)hwnd_val;
     WINDOWPLACEMENT wpl; wpl.length = sizeof(wpl);
     if (GetWindowPlacement(hwnd, &wpl) && wpl.showCmd == SW_SHOWMAXIMIZED) {
@@ -1025,17 +1025,17 @@ EXPORT i64 zan_gui_toggle_maximize(i64 hwnd_val) {
     return 0;
 }
 
-EXPORT i64 zan_gui_close_window(i64 hwnd_val) {
+EXPORT i64 zan_gui_close_window(iptr hwnd_val) {
     PostMessageW((HWND)(intptr_t)hwnd_val, WM_CLOSE, 0, 0);
     return 0;
 }
 
-EXPORT i64 zan_gui_destroy_window(i64 hwnd_val) {
+EXPORT i64 zan_gui_destroy_window(iptr hwnd_val) {
     DestroyWindow((HWND)(intptr_t)hwnd_val);
     return 0;
 }
 
-EXPORT i64 zan_gui_is_maximized(i64 hwnd_val) {
+EXPORT i64 zan_gui_is_maximized(iptr hwnd_val) {
     HWND hwnd = (HWND)(intptr_t)hwnd_val;
     WINDOWPLACEMENT wpl; wpl.length = sizeof(wpl);
     if (GetWindowPlacement(hwnd, &wpl) && wpl.showCmd == SW_SHOWMAXIMIZED) { return 1; }
@@ -1044,14 +1044,14 @@ EXPORT i64 zan_gui_is_maximized(i64 hwnd_val) {
 
 /* 1 while the window can be seen (not minimized/hidden); ambient animations
  * pause while this reports 0. */
-EXPORT i64 zan_gui_window_visible(i64 hwnd_val) {
+EXPORT i64 zan_gui_window_visible(iptr hwnd_val) {
     HWND hwnd = (HWND)(intptr_t)hwnd_val;
     if (IsIconic(hwnd) || !IsWindowVisible(hwnd)) return 0;
     return 1;
 }
 
 /* 1 while the window is the foreground window -- see the SDL backend. */
-EXPORT i64 zan_gui_window_focused(i64 hwnd_val) {
+EXPORT i64 zan_gui_window_focused(iptr hwnd_val) {
     HWND hwnd = (HWND)(intptr_t)hwnd_val;
     return (hwnd && GetForegroundWindow() == hwnd) ? 1 : 0;
 }
@@ -1061,14 +1061,14 @@ EXPORT i64 zan_gui_caption_button_width(void) { return g_btn_w; }
 
 /* Set the number of caption buttons so the draggable caption region excludes
  * exactly the button cluster on the right. */
-EXPORT i64 zan_gui_set_caption_buttons(i64 hwnd_val, i64 count) {
+EXPORT i64 zan_gui_set_caption_buttons(iptr hwnd_val, i64 count) {
     (void)hwnd_val;
     if (count >= 0 && count <= 8) { g_caption_btn_count = (int)count; }
     return 0;
 }
 
 /* Toggle always-on-top (topmost) state for the window. */
-EXPORT i64 zan_gui_set_topmost(i64 hwnd_val, i64 on) {
+EXPORT i64 zan_gui_set_topmost(iptr hwnd_val, i64 on) {
     HWND hwnd = (HWND)(intptr_t)hwnd_val;
     HWND after = on ? HWND_TOPMOST : HWND_NOTOPMOST;
     SetWindowPos(hwnd, after, 0, 0, 0, 0,
@@ -1137,7 +1137,7 @@ EXPORT i64 zan_gui_wake(void) {
 /* Queue a synthetic input event for the automation driver. hwnd_val=0 targets
  * the main window. kind/x/y/button/keycode/mods use the same encoding as real
  * events (see zan_gui_event_kind). Thread-safe. */
-EXPORT i64 zan_gui_inject_event(i64 hwnd_val, i64 kind, i64 x, i64 y,
+EXPORT i64 zan_gui_inject_event(iptr hwnd_val, i64 kind, i64 x, i64 y,
                                 i64 button, i64 keycode, i64 mods) {
     zan_inject_lock();
     int nt = (g_inject_tail + 1) % ZAN_INJECT_CAP;
@@ -1175,23 +1175,23 @@ EXPORT i64 zan_gui_event_mods(void)    { return g_pending_event[5]; }
 EXPORT i64 zan_gui_window_width(void)  { return g_window_width; }
 EXPORT i64 zan_gui_window_height(void) { return g_window_height; }
 
-EXPORT i64 zan_gui_event_hwnd(void)    { return (i64)(intptr_t)g_event_hwnd; }
+EXPORT iptr zan_gui_event_hwnd(void)    { return (iptr)g_event_hwnd; }
 
-EXPORT i64 zan_gui_client_width(i64 hwnd_val) {
+EXPORT i64 zan_gui_client_width(iptr hwnd_val) {
     HWND hwnd = (HWND)(intptr_t)hwnd_val;
     RECT rc;
     if (!hwnd || !GetClientRect(hwnd, &rc)) { return 0; }
     return rc.right - rc.left;
 }
 
-EXPORT i64 zan_gui_client_height(i64 hwnd_val) {
+EXPORT i64 zan_gui_client_height(iptr hwnd_val) {
     HWND hwnd = (HWND)(intptr_t)hwnd_val;
     RECT rc;
     if (!hwnd || !GetClientRect(hwnd, &rc)) { return 0; }
     return rc.bottom - rc.top;
 }
 
-EXPORT i64 zan_gui_present(i64 hwnd_val, i64 surface_id) {
+EXPORT i64 zan_gui_present(iptr hwnd_val, i64 surface_id) {
     HWND hwnd = (HWND)(intptr_t)hwnd_val;
     if (surface_id < 0 || surface_id >= g_surface_count || !g_surfaces[surface_id]) return 1;
     g_last_surface = surface_id;
@@ -1207,7 +1207,7 @@ EXPORT i64 zan_gui_present(i64 hwnd_val, i64 surface_id) {
 /* Whole-window opacity, 10..100 percent. Uses a constant-alpha layered window
  * (independent from the per-pixel-alpha glass present). 100 removes the
  * layered style so the normal opaque present path is restored. */
-EXPORT i64 zan_gui_set_opacity(i64 hwnd_val, i64 percent) {
+EXPORT i64 zan_gui_set_opacity(iptr hwnd_val, i64 percent) {
     HWND hwnd = (HWND)(intptr_t)hwnd_val;
     if (!hwnd) return 1;
     if (percent < 10) percent = 10;
@@ -1227,7 +1227,7 @@ EXPORT i64 zan_gui_set_opacity(i64 hwnd_val, i64 percent) {
     return 0;
 }
 
-EXPORT i64 zan_gui_set_title(i64 hwnd_val, const char *title) {
+EXPORT i64 zan_gui_set_title(iptr hwnd_val, const char *title) {
     HWND hwnd = (HWND)(intptr_t)hwnd_val;
     int len = MultiByteToWideChar(CP_UTF8, 0, title, -1, NULL, 0);
     wchar_t *wt = (wchar_t *)malloc((size_t)len * sizeof(wchar_t));

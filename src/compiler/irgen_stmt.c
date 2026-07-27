@@ -84,6 +84,14 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
     }
 
     case AST_VAR_DECL: {
+        /* `int fd = SomethingReturningNint()` is the same silent truncation as
+         * an assignment or an argument, and is how handle carriers typed `int`
+         * usually enter a function. */
+        if (stmt->var_decl.type && stmt->var_decl.initializer) {
+            warn_narrowing(g, resolve_type_ctx(g, stmt->var_decl.type),
+                           infer_expr_type(g, stmt->var_decl.initializer, locals),
+                           stmt->var_decl.initializer, "initializer");
+        }
         /* In an async $resume body, named scalar locals were pre-allocated in
          * the entry block and their storage lives in the heap frame (so they
          * survive suspensions). Reuse that slot instead of a fresh alloca:
@@ -183,7 +191,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                     /* List is refcounted: `new` yields an owned (+1) reference, so
                      * this local owns it and must release it at scope exit. */
                     if (list_type && is_rc_managed_type(list_type))
-                        locals->vars[locals->count - 1].arc_owned = 1;
+                        arc_own_local(g, locals);
                     return;
                 }
                 if (tname.len == 13 && memcmp(tname.str, "StringBuilder", 13) == 0) {
@@ -196,7 +204,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                     /* StringBuilder is refcounted: `new` yields an owned (+1)
                      * reference this local owns and releases at scope exit. */
                     if (sb_type && is_rc_managed_type(sb_type))
-                        locals->vars[locals->count - 1].arc_owned = 1;
+                        arc_own_local(g, locals);
                     return;
                 }
                 if ((tname.len == 4 && memcmp(tname.str, "Dict", 4) == 0) ||
@@ -209,7 +217,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                     local_add(locals, stmt->var_decl.name, alloca, dict_type);
                     /* This local owns the freshly-built dict: release its
                      * rc-managed keys/values at scope exit. */
-                    locals->vars[locals->count - 1].arc_owned = 1;
+                    arc_own_local(g, locals);
                     return;
                 }
             }
@@ -307,7 +315,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                 LLVMBuildStore(g->builder, LLVMConstNull(llvm_string), slot);
                 emit_rc_capture_local(g, type, slot, init_val, init, locals);
                 local_add(locals, stmt->var_decl.name, slot, type);
-                locals->vars[locals->count - 1].arc_owned = 1;
+                arc_own_local(g, locals);
                 return;
             }
             local_add(locals, stmt->var_decl.name, alloca, type);
@@ -332,6 +340,9 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         if (arc_own) LLVMBuildStore(g->builder, LLVMConstNull(llvm_type), alloca);
 
         if (stmt->var_decl.initializer) {
+            warn_narrowing(g, type,
+                infer_expr_type(g, stmt->var_decl.initializer, locals),
+                stmt->var_decl.initializer, "initializer");
             if (type && type->kind == TYPE_DELEGATE &&
                 stmt->var_decl.initializer->kind != AST_LAMBDA)
                 check_delegate_async_match(g, stmt->var_decl.initializer, type, locals);
@@ -349,7 +360,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         }
 
         local_add(locals, stmt->var_decl.name, alloca, type);
-        if (arc_own) locals->vars[locals->count - 1].arc_owned = 1;
+        if (arc_own) arc_own_local(g, locals);
         /* A local initialized with a freshly-built dict owns the dict's
          * rc-managed keys/values and releases them at scope exit. */
         if (type &&
@@ -357,7 +368,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
              (type->name.len == 10 && memcmp(type->name.str, "Dictionary", 10) == 0)) &&
             stmt->var_decl.initializer &&
             stmt->var_decl.initializer->kind == AST_NEW_EXPR)
-            locals->vars[locals->count - 1].arc_owned = 1;
+            arc_own_local(g, locals);
         /* rc-element array from `new T[n]`: remember the element count so its
          * elements can be released at scope exit (arrays have no length header). */
         if (type && type->kind == TYPE_ARRAY && type->element_type &&
@@ -450,6 +461,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                 }
                 ri = coerce_to_i64(g, rv);
             }
+            emit_release_active_catch_excs(g, 0);
             emit_async_complete(g, locals, ri);
             break;
         }
@@ -464,7 +476,16 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                 !expr_yields_owned_rc_value(g, stmt->ret.value, locals)) {
                 emit_rc_retain_for_type(g, ret_type, val);
             }
-            emit_release_owned_locals(g, locals);
+            /* `return a;` where a is a local `new T[n]` buffer hands the
+             * caller the array itself; the exit pass must leave its elements
+             * alone (a bare array carries no rc header, so no retain can keep
+             * them alive). */
+            local_var_t *ret_local =
+                stmt->ret.value->kind == AST_IDENTIFIER
+                    ? local_find(locals, stmt->ret.value->ident.name) : NULL;
+            if (ret_local && !ret_local->arr_len) ret_local = NULL;
+            emit_release_owned_locals_except(g, locals, ret_local);
+            emit_release_active_catch_excs(g, 0);
             /* convert return value to match function return type */
             LLVMTypeRef fn_ret = g->current_fn_ret_type;
             LLVMTypeRef val_t = LLVMTypeOf(val);
@@ -494,6 +515,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             LLVMBuildRet(g->builder, val);
         } else {
             emit_release_owned_locals(g, locals);
+            emit_release_active_catch_excs(g, 0);
             /* A bare `return;` normally maps to `ret void`. The program entry
              * `Main` is lowered to an LLVM `i32 main`, though, so a bare return
              * there must yield an exit code to match the function's return type
@@ -557,9 +579,11 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         LLVMBasicBlockRef saved_break = g->break_target;
         LLVMBasicBlockRef saved_cont = g->continue_target;
         int saved_loop_base = g->loop_locals_base;
+        int saved_loop_cbase = g->loop_catch_base;
         g->break_target = end_bb;
         g->continue_target = cond_bb;
         g->loop_locals_base = body_start;
+        g->loop_catch_base = g->catch_cleanup_count;
 
         LLVMBuildBr(g->builder, cond_bb);
         LLVMPositionBuilderAtEnd(g->builder, cond_bb);
@@ -583,6 +607,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         g->break_target = saved_break;
         g->continue_target = saved_cont;
         g->loop_locals_base = saved_loop_base;
+        g->loop_catch_base = saved_loop_cbase;
 
         LLVMPositionBuilderAtEnd(g->builder, end_bb);
         break;
@@ -609,9 +634,11 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         LLVMBasicBlockRef saved_break = g->break_target;
         LLVMBasicBlockRef saved_cont = g->continue_target;
         int saved_loop_base = g->loop_locals_base;
+        int saved_loop_cbase = g->loop_catch_base;
         g->break_target = end_bb;
         g->continue_target = step_bb;
         g->loop_locals_base = for_body_start;
+        g->loop_catch_base = g->catch_cleanup_count;
 
         LLVMBuildBr(g->builder, cond_bb);
         LLVMPositionBuilderAtEnd(g->builder, cond_bb);
@@ -643,6 +670,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         g->break_target = saved_break;
         g->continue_target = saved_cont;
         g->loop_locals_base = saved_loop_base;
+        g->loop_catch_base = saved_loop_cbase;
 
         LLVMPositionBuilderAtEnd(g->builder, end_bb);
         /* Drop the loop variables (and any owned init-clause locals) now that
@@ -654,6 +682,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
     case AST_BREAK_STMT:
         if (g->break_target) {
             emit_release_owned_locals_range(g, locals, g->loop_locals_base);
+            emit_release_active_catch_excs(g, g->loop_catch_base);
             LLVMBuildBr(g->builder, g->break_target);
         }
         break;
@@ -661,6 +690,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
     case AST_CONTINUE_STMT:
         if (g->continue_target) {
             emit_release_owned_locals_range(g, locals, g->loop_locals_base);
+            emit_release_active_catch_excs(g, g->loop_catch_base);
             LLVMBuildBr(g->builder, g->continue_target);
         }
         break;
@@ -799,6 +829,9 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         LLVMValueRef eh_tmps_g, eh_tmptop_g;
         get_eh_tmp_globals(g, &eh_tmps_g, &eh_tmptop_g);
         (void)eh_tmps_g;
+        /* compile-time id of this try within the enclosing async function;
+         * indexes its frame-resident catch slots (-1 = not async / no room) */
+        int async_hid = -1;
         LLVMValueRef tmp_mark = LLVMBuildLoad2(g->builder, i32t, eh_tmptop_g, "eh.tmpmark");
         LLVMValueRef old_top = LLVMBuildLoad2(g->builder, i32t, top_g, "eh.old");
         /* Spill try-entry EH state to allocas: an await inside the try body
@@ -811,6 +844,15 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         LLVMValueRef new_top = LLVMBuildAdd(g->builder, old_top,
             LLVMConstInt(i32t, 1, 0), "eh.new");
         LLVMBuildStore(g->builder, new_top, top_g);
+        /* record the depth this handler was armed at, so a throw below can
+         * release the skipped frames' locals while they are still alive */
+        {
+            LLVMValueRef marks = get_eh_tmpmarks_global(g);
+            LLVMValueRef mi[2] = { LLVMConstInt(i32t, 0, 0), new_top };
+            LLVMValueRef mp = LLVMBuildGEP2(g->builder,
+                LLVMGlobalGetValueType(marks), marks, mi, 2, "eh.markp");
+            LLVMBuildStore(g->builder, tmp_mark, mp);
+        }
         /* An async frame records how many try handlers it currently has
          * armed (frame.hcount): __zan_async_unwind stops releasing frames at
          * the first one with an armed handler, since the exception resumes
@@ -827,8 +869,9 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
              * itself stays open across every suspension in its body. The
              * re-entry block restores the eh bookkeeping this invocation's
              * try-entry would have written, then enters the catch. */
+            async_hid = g->current_async_handler_next++;
             if (g->current_async_rearm_switch) {
-                int hid = g->current_async_handler_next++;
+                int hid = async_hid;
                 LLVMValueRef hs = LLVMBuildStructGEP2(g->builder,
                     g->current_async_frame_type, g->current_async_frame,
                     ASYNC_FRAME_HSTACK, "eh.hs");
@@ -876,7 +919,15 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
 
         LLVMPositionBuilderAtEnd(g->builder, try_bb);
         int try_start = locals->count;
+        /* a throw inside this body unwinds to the catch below, skipping the
+         * body's scope-exit releases: they move to the throw site */
+        int saved_throw_base = g->throw_locals_base;
+        int saved_throw_cbase = g->throw_catch_base;
+        g->throw_locals_base = try_start;
+        g->throw_catch_base = g->catch_cleanup_count;
         emit_stmt(g, stmt->try_stmt.try_body, locals);
+        g->throw_locals_base = saved_throw_base;
+        g->throw_catch_base = saved_throw_cbase;
         locals->count = try_start;
         if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder))) {
             LLVMValueRef ot = LLVMBuildLoad2(g->builder, i32t, old_top_slot, "eh.old.re");
@@ -919,11 +970,45 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             zan_call2(g->builder, uwty, get_eh_tmp_unwind_fn(g), &tm, 1, "");
         }
         LLVMValueRef exc_val = LLVMBuildLoad2(g->builder, i8ptr, exc_g, "exc");
-        LLVMValueRef exc_slot = emit_entry_alloca(g, i8ptr, "eh.exc.slot");
+        /* The caught exception and its ownership flag are read again by the
+         * catch epilogue, which an `await` inside the catch body separates
+         * from here by a suspension: this $resume invocation returns and its
+         * stack allocas are garbage when the next one resumes into the
+         * epilogue. Keep them in the heap frame, indexed by this try's
+         * compile-time handler id, so they survive the suspension. */
+        LLVMValueRef exc_slot, exc_owned_slot;
+        if (g->current_async_frame && async_hid >= 0 &&
+            async_hid < ASYNC_MAX_HANDLERS) {
+            /* Address them in the entry block, like emit_entry_alloca: the
+             * catch epilogue lives in a block the CPS split leaves outside
+             * this one's dominance, so a GEP computed here would not
+             * dominate its uses. */
+            LLVMValueRef cidx[2] = { LLVMConstInt(i32t, 0, 0),
+                                     LLVMConstInt(i32t, (unsigned)async_hid, 0) };
+            LLVMBasicBlockRef cur_bb = LLVMGetInsertBlock(g->builder);
+            LLVMBasicBlockRef entry_bb = LLVMGetEntryBasicBlock(
+                LLVMGetBasicBlockParent(cur_bb));
+            LLVMValueRef entry_term = LLVMGetBasicBlockTerminator(entry_bb);
+            if (entry_term) LLVMPositionBuilderBefore(g->builder, entry_term);
+            else LLVMPositionBuilderAtEnd(g->builder, entry_bb);
+            exc_slot = LLVMBuildGEP2(g->builder,
+                LLVMArrayType(i8ptr, ASYNC_MAX_HANDLERS),
+                LLVMBuildStructGEP2(g->builder, g->current_async_frame_type,
+                    g->current_async_frame, ASYNC_FRAME_CEXC, "eh.cexc"),
+                cidx, 2, "eh.exc.slot");
+            exc_owned_slot = LLVMBuildGEP2(g->builder,
+                LLVMArrayType(i32t, ASYNC_MAX_HANDLERS),
+                LLVMBuildStructGEP2(g->builder, g->current_async_frame_type,
+                    g->current_async_frame, ASYNC_FRAME_CEXC_OWNED, "eh.cexcown"),
+                cidx, 2, "eh.excown.slot");
+            LLVMPositionBuilderAtEnd(g->builder, cur_bb);
+        } else {
+            exc_slot = emit_entry_alloca(g, i8ptr, "eh.exc.slot");
+            /* set when a matched handler takes over the in-flight +1 (see the
+             * ownership transfer at the top of each catch body) */
+            exc_owned_slot = emit_entry_alloca(g, i32t, "eh.excown.slot");
+        }
         LLVMBuildStore(g->builder, exc_val, exc_slot);
-        /* set when a matched handler takes over the in-flight +1 (see the
-         * ownership transfer at the top of each catch body) */
-        LLVMValueRef exc_owned_slot = emit_entry_alloca(g, i32t, "eh.excown.slot");
         LLVMBuildStore(g->builder, LLVMConstInt(i32t, 0, 0), exc_owned_slot);
         int catch_start = locals->count;
         int ncatch = stmt->try_stmt.catches.count;
@@ -971,7 +1056,19 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                 LLVMPositionBuilderAtEnd(g->builder, body_bb);
                 if (cc->catch_clause.var_name.len > 0) {
                     LLVMValueRef ev = LLVMBuildLoad2(g->builder, i8ptr, exc_slot, "exc.re");
-                    LLVMValueRef ea = emit_entry_alloca(g, i8ptr, "exc.var");
+                    /* an await in the handler returns from this $resume, so a
+                     * stack alloca would hold garbage when the handler resumes
+                     * and dereferences the binding: use its frame slot (a
+                     * storage-only local, ztype NULL, registered by the async
+                     * scan) whenever the method has one */
+                    LLVMValueRef ea = NULL;
+                    if (g->current_async_frame) {
+                        local_var_t *fv = local_find(locals, cc->catch_clause.var_name);
+                        if (fv && !fv->type &&
+                            LLVMGetTypeKind(local_slot_type(g, fv)) == LLVMPointerTypeKind)
+                            ea = fv->alloca;
+                    }
+                    if (!ea) ea = emit_entry_alloca(g, i8ptr, "exc.var");
                     LLVMBuildStore(g->builder, ev, ea);
                     local_add(locals, cc->catch_clause.var_name, ea, et);
                 }
@@ -998,7 +1095,15 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                     LLVMBuildBr(g->builder, pcont_bb);
                     LLVMPositionBuilderAtEnd(g->builder, pcont_bb);
                 }
+                if (g->catch_cleanup_count < ZAN_MAX_CATCH_DEPTH) {
+                    g->catch_cleanups[g->catch_cleanup_count].exc_slot = exc_slot;
+                    g->catch_cleanups[g->catch_cleanup_count].owned_slot =
+                        exc_owned_slot;
+                    g->catch_cleanup_count++;
+                }
+                int saved_cc = g->catch_cleanup_count;
                 emit_stmt(g, cc->catch_clause.body, locals);
+                g->catch_cleanup_count = saved_cc - 1;
                 locals->count = catch_start;
                 if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder)))
                     LLVMBuildBr(g->builder, done_bb);
@@ -1154,40 +1259,100 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         if (!elem_type) elem_type = g->binder->type_int;
         LLVMTypeRef elem_llvm = map_type(g, elem_type);
 
-        /* get count: field 0 of List struct */
-        LLVMValueRef cnt_ptr = LLVMBuildStructGEP2(g->builder, g->list_struct_type,
-            collection, 0, "cnt_ptr");
-        LLVMValueRef count = LLVMBuildLoad2(g->builder, i64, cnt_ptr, "cnt");
-
-        /* get data pointer: field 2 of List struct */
-        LLVMValueRef data_ptr = LLVMBuildStructGEP2(g->builder, g->list_struct_type,
-            collection, 2, "data_ptr");
-        LLVMValueRef data = LLVMBuildLoad2(g->builder, LLVMPointerType(i64, 0),
-            data_ptr, "data");
+        /* Iteration state (element, index, collection) of a `foreach` in an
+         * async body lives in the heap frame: an await in the loop body
+         * re-enters at a block the pre-header never runs, so values computed
+         * here neither dominate their uses nor survive the suspension. The
+         * collection is what gets stored -- count and data are re-derived per
+         * iteration, which is also what keeps the loop correct across a
+         * reallocation of the list. */
+        LLVMValueRef col_slot = NULL, idx_alloc = NULL, iter_alloc = NULL;
+        if (g->current_async_frame) {
+            int fe_id = g->current_async_foreach_next++;
+            char nm[32];
+            snprintf(nm, sizeof(nm), "$fe.c%d", fe_id);
+            zan_istr_t cn = { nm, (uint32_t)strlen(nm) };
+            local_var_t *cv = local_find(locals, cn);
+            if (cv) col_slot = cv->alloca;
+            snprintf(nm, sizeof(nm), "$fe.i%d", fe_id);
+            zan_istr_t in_ = { nm, (uint32_t)strlen(nm) };
+            local_var_t *iv = local_find(locals, in_);
+            if (iv) idx_alloc = iv->alloca;
+            /* the loop variable's frame slot is the storage-only one this
+             * foreach registered (ztype NULL); anything else with that name is
+             * a user local that merely shadows it, and must not be aliased */
+            local_var_t *ev = local_find(locals, stmt->foreach_stmt.var_name);
+            if (ev && !ev->type && LLVMGetTypeKind(elem_llvm) ==
+                    LLVMGetTypeKind(local_slot_type(g, ev)))
+                iter_alloc = ev->alloca;
+        }
+        if (col_slot)
+            LLVMBuildStore(g->builder,
+                LLVMBuildBitCast(g->builder, collection,
+                    LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0), "fe.colp"),
+                col_slot);
 
         /* index variable */
-        LLVMValueRef idx_alloc = emit_entry_alloca(g, i64, "fi");
+        if (!idx_alloc) idx_alloc = emit_entry_alloca(g, i64, "fi");
         LLVMBuildStore(g->builder, LLVMConstInt(i64, 0, 0), idx_alloc);
 
         /* iteration variable */
-        LLVMValueRef iter_alloc = emit_entry_alloca(g, elem_llvm, "fv");
+        if (!iter_alloc) iter_alloc = emit_entry_alloca(g, elem_llvm, "fv");
         local_add(locals, stmt->foreach_stmt.var_name, iter_alloc, elem_type);
 
+        LLVMTypeRef list_ptr_ty = LLVMTypeOf(collection);
         LLVMBasicBlockRef cond_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "fe.cond");
         LLVMBasicBlockRef body_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "fe.body");
+        /* the index advance is its own block so `continue` can reach it: a
+         * `continue` that branched straight to the condition would spin
+         * forever on the same element */
+        LLVMBasicBlockRef step_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "fe.step");
         LLVMBasicBlockRef end_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "fe.end");
+
+        LLVMBasicBlockRef fe_saved_break = g->break_target;
+        LLVMBasicBlockRef fe_saved_cont = g->continue_target;
+        int fe_saved_loop_base = g->loop_locals_base;
+        int fe_saved_loop_cbase = g->loop_catch_base;
+        g->break_target = end_bb;
+        g->continue_target = step_bb;
+        g->loop_locals_base = fe_start;
+        g->loop_catch_base = g->catch_cleanup_count;
 
         LLVMBuildBr(g->builder, cond_bb);
         LLVMPositionBuilderAtEnd(g->builder, cond_bb);
+        /* count: field 0 of the List struct, re-read each iteration */
+        LLVMValueRef col_cond = col_slot
+            ? LLVMBuildBitCast(g->builder,
+                  LLVMBuildLoad2(g->builder,
+                      LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0),
+                      col_slot, "fe.col"),
+                  list_ptr_ty, "fe.colc")
+            : collection;
+        LLVMValueRef cnt_ptr = LLVMBuildStructGEP2(g->builder, g->list_struct_type,
+            col_cond, 0, "cnt_ptr");
+        LLVMValueRef count = LLVMBuildLoad2(g->builder, i64, cnt_ptr, "cnt");
         LLVMValueRef idx_val = LLVMBuildLoad2(g->builder, i64, idx_alloc, "i");
         LLVMValueRef cmp = LLVMBuildICmp(g->builder, LLVMIntSLT, idx_val, count, "fcmp");
         LLVMBuildCondBr(g->builder, cmp, body_bb, end_bb);
 
         LLVMPositionBuilderAtEnd(g->builder, body_bb);
+        /* data pointer: field 2 of the List struct, likewise re-read here */
+        LLVMValueRef col_body = col_slot
+            ? LLVMBuildBitCast(g->builder,
+                  LLVMBuildLoad2(g->builder,
+                      LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0),
+                      col_slot, "fe.col"),
+                  list_ptr_ty, "fe.colb")
+            : collection;
+        LLVMValueRef data_ptr = LLVMBuildStructGEP2(g->builder, g->list_struct_type,
+            col_body, 2, "data_ptr");
+        LLVMValueRef data = LLVMBuildLoad2(g->builder, LLVMPointerType(i64, 0),
+            data_ptr, "data");
+        LLVMValueRef idx_body = LLVMBuildLoad2(g->builder, i64, idx_alloc, "ib");
         /* load current element; slots physically hold an i64, so pointer
          * (class/string) elements need inttoptr, doubles a bitcast, and
          * narrower integers a trunc back to the value type */
-        LLVMValueRef elem_ptr = LLVMBuildGEP2(g->builder, i64, data, &idx_val, 1, "ep");
+        LLVMValueRef elem_ptr = LLVMBuildGEP2(g->builder, i64, data, &idx_body, 1, "ep");
         LLVMValueRef elem = LLVMBuildLoad2(g->builder, i64, elem_ptr, "elem");
         LLVMTypeKind ek = LLVMGetTypeKind(elem_llvm);
         if (ek == LLVMPointerTypeKind)
@@ -1201,22 +1366,36 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         emit_stmt(g, stmt->foreach_stmt.body, locals);
 
         if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder))) {
-            /* increment index */
             emit_release_owned_locals_from(g, locals, fe_start);
-            LLVMValueRef next = LLVMBuildAdd(g->builder,
-                LLVMBuildLoad2(g->builder, i64, idx_alloc, "i2"),
-                LLVMConstInt(i64, 1, 0), "next");
-            LLVMBuildStore(g->builder, next, idx_alloc);
-            LLVMBuildBr(g->builder, cond_bb);
+            LLVMBuildBr(g->builder, step_bb);
         } else {
             emit_release_owned_locals_from(g, locals, fe_start);
         }
 
+        LLVMPositionBuilderAtEnd(g->builder, step_bb);
+        LLVMValueRef next = LLVMBuildAdd(g->builder,
+            LLVMBuildLoad2(g->builder, i64, idx_alloc, "i2"),
+            LLVMConstInt(i64, 1, 0), "next");
+        LLVMBuildStore(g->builder, next, idx_alloc);
+        LLVMBuildBr(g->builder, cond_bb);
+
+        g->break_target = fe_saved_break;
+        g->continue_target = fe_saved_cont;
+        g->loop_locals_base = fe_saved_loop_base;
+        g->loop_catch_base = fe_saved_loop_cbase;
+
         LLVMPositionBuilderAtEnd(g->builder, end_bb);
         /* an owned temporary collection (e.g. iterating a call result) is
          * consumed by the loop and released once iteration ends */
+        LLVMValueRef col_end = col_slot
+            ? LLVMBuildBitCast(g->builder,
+                  LLVMBuildLoad2(g->builder,
+                      LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0),
+                      col_slot, "fe.col"),
+                  list_ptr_ty, "fe.cole")
+            : collection;
         emit_release_owned_call_temp(g, stmt->foreach_stmt.collection,
-                                     collection, locals);
+                                     col_end, locals);
         break;
     }
 
@@ -1312,6 +1491,24 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                     LLVMBuildStore(g->builder, LLVMConstNull(i8ptr), tid_g);
                 }
             }
+            /* longjmp skips every scope-exit release between here and the
+             * handler. An async body's locals live in its heap frame, which
+             * the frame chain releases, so releasing this frame's abandoned
+             * ones here is enough (A8-3). A plain frame's locals -- and those
+             * of every frame between here and the handler -- are only
+             * reachable through the slots they registered on the unwind
+             * stack, released below while those frames are still alive
+             * (A8-12). `throw` is noreturn, so the releases the normal paths
+             * emit for the same locals stay correct: they are only reached
+             * when no exception was raised. */
+            if (g->current_async_frame) {
+                emit_release_owned_locals_range(g, locals, g->throw_locals_base);
+                emit_clear_owned_locals_range(g, locals, g->throw_locals_base);
+            }
+            /* a throw out of a catch body skips that handler's epilogue, so
+             * the exception it caught is released here (the new one is
+             * already stored in the globals and retained) */
+            emit_release_active_catch_excs(g, g->throw_catch_base);
             LLVMValueRef top = LLVMBuildLoad2(g->builder, i32t, top_g, "eh.top");
             LLVMValueRef has = LLVMBuildICmp(g->builder, LLVMIntSGE, top,
                 LLVMConstInt(i32t, 0, 0), "eh.has");
@@ -1325,6 +1522,8 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
              * longjmp without touching the frames that await us */
             if (g->current_async_frame)
                 emit_async_save_slots(g);
+            else
+                emit_eh_unwind_to_handler(g, top);
             LLVMValueRef gep_idx[2] = { LLVMConstInt(i32t, 0, 0), top };
             LLVMValueRef buf = LLVMBuildGEP2(g->builder,
                 LLVMGlobalGetValueType(bufs_g), bufs_g, gep_idx, 2, "eh.buf");

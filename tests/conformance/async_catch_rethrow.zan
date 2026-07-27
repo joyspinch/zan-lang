@@ -1,0 +1,76 @@
+// A8-2/A8-3: an exception raised inside a catch body of an async method must
+// reach the *enclosing* handler (not the one it just left), and every handler
+// that is abandoned by `return`, `break`, `continue` or `throw` must still
+// release the exception it caught (run under --check-leaks).
+using System;
+
+class Program {
+    static async int Boom(string tag) {
+        await Task.Delay(1);
+        throw new Exception(tag);
+    }
+
+    // catch, then throw a new exception out of the coroutine
+    static async int Rethrow() {
+        try {
+            return await Boom("inner");
+        } catch (Exception e) {
+            throw new Exception("outer:" + e.Message);
+        }
+    }
+
+    // nested try: the inner catch throws, the outer catch of the same frame
+    // must be the one that runs
+    static async int Nested() {
+        try {
+            try {
+                await Task.Delay(1);
+                throw new Exception("deep");
+            } catch (Exception e) {
+                throw new Exception("mid:" + e.Message);
+            }
+        } catch (Exception e2) {
+            Console.WriteLine("nested " + e2.Message);
+            return 5;
+        }
+    }
+
+    // a managed local held across the throw, and a `return` out of the handler
+    static async int HeldLocal() {
+        List<string> keep = new List<string>();
+        keep.Add("a");
+        try {
+            keep.Add("b");
+            return await Boom("held");
+        } catch (Exception e) {
+            Console.WriteLine("held " + e.Message + " " + Convert.ToString(keep.Count));
+            return 4;
+        }
+    }
+
+    // handlers left by `continue` and `break`
+    static async int Loop() {
+        int hits = 0;
+        for (int i = 0; i < 4; i = i + 1) {
+            try {
+                await Boom("i" + Convert.ToString(i));
+            } catch (Exception e) {
+                hits = hits + 1;
+                if (i == 2) break;
+                continue;
+            }
+        }
+        return hits;
+    }
+
+    static async void Main() {
+        try {
+            await Rethrow();
+        } catch (Exception e) {
+            Console.WriteLine("main " + e.Message);
+        }
+        Console.WriteLine(Convert.ToString(await Nested()));
+        Console.WriteLine(Convert.ToString(await HeldLocal()));
+        Console.WriteLine(Convert.ToString(await Loop()));
+    }
+}

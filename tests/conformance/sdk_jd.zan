@@ -1,0 +1,148 @@
+using System;
+using System.Json;
+using Sdk.Jd;
+
+namespace JdSdkTest;
+
+/// Offline conformance for the JD (JOS) SDK core: signing, request building,
+/// response envelope unwrapping and the error paths. No network involved.
+///
+/// A business model the caller defines; the compiler binds JSON to it.
+/// This is what replaces the 634 boilerplate classes of the C# SDK.
+class Province {
+    public long id;
+    public string name;
+    public bool cod;
+}
+
+class ProvinceResult {
+    public List<Province> province_areas;
+    public bool success;
+}
+
+class Program {
+    static void TestSign() {
+        // Signing is "secret + k1v1k2v2... (keys ascending) + secret", MD5 upper hex.
+        Dictionary<string, string> p = new Dictionary<string, string>();
+        p.Add("method", "jingdong.area.province.get");
+        p.Add("app_key", "abc");
+        p.Add("v", "2.0");
+        string sign = JdSign.Compute(p, "sec");
+        // Reference value: md5("sec" + "app_key" "abc" + "method" "jingdong..." + "v" "2.0" + "sec")
+        Console.WriteLine("sign=" + sign);
+        Console.WriteLine("signLen=" + Convert.ToString(sign.Length));
+
+        // Key order must not depend on insertion order.
+        Dictionary<string, string> q = new Dictionary<string, string>();
+        q.Add("v", "2.0");
+        q.Add("method", "jingdong.area.province.get");
+        q.Add("app_key", "abc");
+        Console.WriteLine("orderStable=" + Convert.ToString(JdSign.Compute(q, "sec") == sign));
+
+        // Empty values are excluded from the signature.
+        Dictionary<string, string> r = new Dictionary<string, string>();
+        r.Add("method", "jingdong.area.province.get");
+        r.Add("app_key", "abc");
+        r.Add("v", "2.0");
+        r.Add("access_token", "");
+        Console.WriteLine("emptySkipped=" + Convert.ToString(JdSign.Compute(r, "sec") == sign));
+    }
+
+    static void TestRequest() {
+        JdRequest req = new JdRequest("jingdong.ware.read.searchWare4Valid");
+        req.Set("field", "value").SetInt("pageNo", 1).SetBool("onlyValid", true);
+        Console.WriteLine("api=" + req.ApiName);
+        Console.WriteLine("version=" + req.ApiVersion);
+        Console.WriteLine("param=" + req.ParamJson());
+
+        // A value carrying quotes must not break the JSON (the C# version
+        // hand-built this string and would emit invalid JSON here).
+        JdRequest q = new JdRequest("jingdong.test");
+        q.Set("keyword", "say \"hi\"");
+        Console.WriteLine("escaped=" + q.ParamJson());
+
+        // Empty values are dropped, matching gateway expectations.
+        JdRequest e = new JdRequest("jingdong.test");
+        e.Set("a", "").Set("b", "x");
+        Console.WriteLine("dropEmpty=" + e.ParamJson());
+    }
+
+    static void TestEnvelope() {
+        string body = "{\"jingdong_area_province_get_responce\":{\"province_areas\":[{\"id\":1,\"name\":\"Beijing\",\"cod\":true},{\"id\":2,\"name\":\"Shanghai\",\"cod\":false}],\"success\":true}}";
+        JdResponse resp = JdResponse.Parse(body);
+        ProvinceResult r = Json.Deserialize<ProvinceResult>(resp.Data);
+        Console.WriteLine("count=" + Convert.ToString(r.province_areas.Count));
+        Console.WriteLine("first=" + r.province_areas[0].name);
+        Console.WriteLine("cod=" + Convert.ToString(r.province_areas[0].cod));
+        Console.WriteLine("success=" + Convert.ToString(r.success));
+        // Dynamic access without a model.
+        Console.WriteLine("dynamic=" + resp.Value.Get("province_areas").At(1).Get("name").AsString(""));
+    }
+
+    static void TestGatewayError() {
+        string body = "{\"error_response\":{\"code\":\"18\",\"zh_desc\":\"app is not exist\"}}";
+        try {
+            JdResponse resp = JdResponse.Parse(body);
+            Console.WriteLine("gatewayError=NOT THROWN");
+        } catch (JdException e) {
+            Console.WriteLine("gatewayError code=" + e.Code);
+            Console.WriteLine("gatewayError raw=" + Convert.ToString(e.Body.Length > 0));
+        }
+    }
+
+    static void TestBusinessError() {
+        string body = "{\"jingdong_x_responce\":{\"code\":\"1001\",\"zh_desc\":\"quota exceeded\"}}";
+        try {
+            JdResponse resp = JdResponse.Parse(body);
+            Console.WriteLine("bizError=NOT THROWN");
+        } catch (JdException e) {
+            Console.WriteLine("bizError code=" + e.Code);
+        }
+    }
+
+    static void TestSuccessCodeZero() {
+        // code "0" means success and must not be treated as an error.
+        string body = "{\"jingdong_x_responce\":{\"code\":\"0\",\"total\":42}}";
+        JdResponse resp = JdResponse.Parse(body);
+        Console.WriteLine("codeZeroOk=" + Convert.ToString(resp.Value.Get("total").AsInt(0)));
+    }
+
+    static void TestMalformed() {
+        try {
+            JdResponse resp = JdResponse.Parse("not json at all");
+            Console.WriteLine("malformed=NOT THROWN");
+        } catch (JdException e) {
+            Console.WriteLine("malformed code=" + e.Code);
+        }
+    }
+
+    static void TestTimestamp() {
+        // The gateway lives in +0800 and validates the timestamp against its own
+        // clock, so the wall-clock time and the suffix have to agree. DateTime
+        // has no local timezone (Now is an alias of UtcNow), which is why the
+        // offset is configuration rather than something read off the machine.
+        // 2024-05-06 07:08:09 UTC = 1714979289.
+        Console.WriteLine("tsBeijing=" + JdClient.FormatTimestamp(1714979289, 480));
+        Console.WriteLine("tsUtc=" + JdClient.FormatTimestamp(1714979289, 0));
+        Console.WriteLine("tsIndia=" + JdClient.FormatTimestamp(1714979289, 330));
+        Console.WriteLine("tsWest=" + JdClient.FormatTimestamp(1714979289, -300));
+    }
+
+    static void TestClientValidation() {
+        // appKey/appSecret and ApiName are validated before any socket work.
+        JdClient bad = new JdClient("", "");
+        Console.WriteLine("clientBuilt=ok");
+    }
+
+    static void Main() {
+        TestSign();
+        TestRequest();
+        TestEnvelope();
+        TestGatewayError();
+        TestBusinessError();
+        TestSuccessCodeZero();
+        TestMalformed();
+        TestTimestamp();
+        TestClientValidation();
+    }
+}

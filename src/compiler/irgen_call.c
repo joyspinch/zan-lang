@@ -2772,10 +2772,17 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                                     call_args[k] = emit_arg_typed(g, expr->call.args.items[k],
                                         method_param_type_at(g, method_sym, k, expr, NULL, locals), locals);
                                 }
-                                const char *cn = (LLVMGetTypeKind(LLVMGetReturnType(g->functions[fi].fn_type)) == LLVMVoidTypeKind) ? "" : "scall";
-                                coerce_args_to_params(g, g->functions[fi].fn_type, call_args, argc);
-                                LLVMValueRef result = zan_call2(g->builder, g->functions[fi].fn_type,
-                                    g->functions[fi].fn, call_args, (unsigned)argc, cn);
+                                /* `Box<int>.Create(x)` names the instantiation,
+                                 * so call its specialization rather than the
+                                 * erased body. */
+                                LLVMTypeRef sft = g->functions[fi].fn_type;
+                                LLVMValueRef sfn = route_generic_method(g,
+                                    ident_inst_type(g, callee->member.object),
+                                    method_sym, g->functions[fi].fn, sft, &sft);
+                                const char *cn = (LLVMGetTypeKind(LLVMGetReturnType(sft)) == LLVMVoidTypeKind) ? "" : "scall";
+                                coerce_args_to_params(g, sft, call_args, argc);
+                                LLVMValueRef result = zan_call2(g->builder, sft,
+                                    sfn, call_args, (unsigned)argc, cn);
                                 zan_type_t *gret = generic_method_ret(g, method_sym, expr, locals);
                                 if (!gret && method_ret_is_bare_tp(method_sym)) {
                                     zan_type_t *ir = method_ret_type_at(g, method_sym,
@@ -3118,6 +3125,11 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                 zan_symbol_t *method_sym = resolve_overload(g->current_type_sym, fn_name, expr->call.args.count);
                     if (method_sym) pack_params_args(g, expr, method_sym, locals);
                 if (method_sym) {
+                    /* an unqualified call to a generic method of this class
+                     * monomorphizes exactly like the qualified form */
+                    int spec = try_method_spec(g, method_sym, expr, NULL, locals);
+                    if (spec >= 0)
+                        return emit_method_spec_call(g, spec, expr, NULL, locals);
                     for (int fi = irgen_find_function(g, method_sym); fi >= 0; fi = -1) {
                         if (g->functions[fi].sym == method_sym) {
                             int argc = expr->call.args.count;
