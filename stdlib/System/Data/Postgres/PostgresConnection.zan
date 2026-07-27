@@ -459,20 +459,26 @@ class PgConnection : IDbConnection {
     /// last row-returning result set. Suspends on the reactor for IO readiness so
     /// the worker thread stays free for other coroutines.</summary>
     async DbResult QueryAsync(string sql) {
-        if (!this.connected) { return DbResult.Empty(); }
+        if (!this.connected) {
+            this.lastError = "not connected";
+            this.fail();
+        }
         DbResult result = DbResult.Create();
         if (PQsendQuery(this.handle, sql) == 0) {
             this.lastError = CopyText(PQerrorMessage(this.handle));
-            return result;
+            this.fail();
         }
         int f = await this.flushOutput();
         if (f < 0) {
-            return result;
+            this.lastError = "cannot send the query";
+            this.fail();
         }
+        bool failed = false;
         while (true) {
             bool ready = await this.waitReady();
             if (!ready) {
-                return result;
+                this.lastError = "the connection went away mid-statement";
+                this.fail();
             }
             nint res = PQgetResult(this.handle);
             if (res == 0) {
@@ -508,16 +514,22 @@ class PgConnection : IDbConnection {
                 }
             } else if (PQresultStatus(res) != 1) {   // not COMMAND_OK
                 this.lastError = CopyText(PQerrorMessage(this.handle));
+                failed = true;
             }
             PQclear(res);
         }
+        if (failed) { this.fail(); }
         return result;
     }
 
     /// <summary>Sends a parameterized query asynchronously (PQsendQueryParams)
-    /// and drains the results on the IO reactor.</summary>
+    /// and drains the results on the IO reactor. Throws
+    /// <see cref="DbException"/> when the statement fails.</summary>
     async DbResult QueryParamsAsync(string sql, DbParams prms) {
-        if (!this.connected) { return DbResult.Empty(); }
+        if (!this.connected) {
+            this.lastError = "not connected";
+            this.fail();
+        }
         DbResult result = DbResult.Create();
         List<string> keepAlive = new List<string>();
         string block = BuildParamBlock(prms, keepAlive);
@@ -526,16 +538,19 @@ class PgConnection : IDbConnection {
         FreeParamBlock(block, keepAlive);
         if (ok == 0) {
             this.lastError = CopyText(PQerrorMessage(this.handle));
-            return result;
+            this.fail();
         }
         int f = await this.flushOutput();
         if (f < 0) {
-            return result;
+            this.lastError = "cannot send the query";
+            this.fail();
         }
+        bool failedP = false;
         while (true) {
             bool ready = await this.waitReady();
             if (!ready) {
-                return result;
+                this.lastError = "the connection went away mid-statement";
+                this.fail();
             }
             nint res = PQgetResult(this.handle);
             if (res == 0) {
@@ -545,16 +560,22 @@ class PgConnection : IDbConnection {
                 result = ReadTuples(res);
             } else if (PQresultStatus(res) != 1) {   // not COMMAND_OK
                 this.lastError = CopyText(PQerrorMessage(this.handle));
+                failedP = true;
             }
             PQclear(res);
         }
+        if (failedP) { this.fail(); }
         return result;
     }
 
-    /// <summary>Sends a parameterized non-query statement asynchronously;
-    /// returns the affected row count, or -1 on error.</summary>
+    /// <summary>Sends a parameterized non-query statement asynchronously and
+    /// returns the affected row count. Throws <see cref="DbException"/> when the
+    /// statement fails.</summary>
     async int ExecuteParamsAsync(string sql, DbParams prms) {
-        if (!this.connected) { return -1; }
+        if (!this.connected) {
+            this.lastError = "not connected";
+            this.fail();
+        }
         List<string> keepAlive = new List<string>();
         string block = BuildParamBlock(prms, keepAlive);
         int ok = PQsendQueryParams(this.handle, ToDollarParams(sql), prms.Count(),
@@ -562,18 +583,20 @@ class PgConnection : IDbConnection {
         FreeParamBlock(block, keepAlive);
         if (ok == 0) {
             this.lastError = CopyText(PQerrorMessage(this.handle));
-            return -1;
+            this.fail();
         }
         int f2 = await this.flushOutput();
         if (f2 < 0) {
-            return -1;
+            this.lastError = "cannot send the statement";
+            this.fail();
         }
         int affected2 = 0;
         bool failed2 = false;
         while (true) {
             bool ready = await this.waitReady();
             if (!ready) {
-                return -1;
+                this.lastError = "the connection went away mid-statement";
+                this.fail();
             }
             nint res = PQgetResult(this.handle);
             if (res == 0) {
@@ -589,29 +612,35 @@ class PgConnection : IDbConnection {
             PQclear(res);
         }
         if (failed2) {
-            return -1;
+            this.fail();
         }
         return affected2;
     }
 
-    /// <summary>Sends a non-query statement asynchronously; returns the affected
-    /// row count, or -1 on error.</summary>
+    /// <summary>Sends a non-query statement asynchronously and returns the
+    /// affected row count. Throws <see cref="DbException"/> when the statement
+    /// fails.</summary>
     async int ExecuteAsync(string sql) {
-        if (!this.connected) { return -1; }
+        if (!this.connected) {
+            this.lastError = "not connected";
+            this.fail();
+        }
         if (PQsendQuery(this.handle, sql) == 0) {
             this.lastError = CopyText(PQerrorMessage(this.handle));
-            return -1;
+            this.fail();
         }
         int f = await this.flushOutput();
         if (f < 0) {
-            return -1;
+            this.lastError = "cannot send the statement";
+            this.fail();
         }
         int affected = 0;
         bool failed = false;
         while (true) {
             bool ready = await this.waitReady();
             if (!ready) {
-                return -1;
+                this.lastError = "the connection went away mid-statement";
+                this.fail();
             }
             nint res = PQgetResult(this.handle);
             if (res == 0) {
@@ -627,9 +656,20 @@ class PgConnection : IDbConnection {
             PQclear(res);
         }
         if (failed) {
-            return -1;
+            this.fail();
         }
         return affected;
+    }
+
+    /// <summary>Raises the recorded failure. libpq's message is the server's
+    /// own, so it reaches the caller verbatim instead of being swallowed by an
+    /// empty result or a -1.</summary>
+    void fail() {
+        string why = this.lastError;
+        if (why.Length == 0) {
+            why = "the statement failed";
+        }
+        throw new DbException(why, 0, DbProvider.PostgreSQL);
     }
 
     /// <summary>Gets the last error message.</summary>

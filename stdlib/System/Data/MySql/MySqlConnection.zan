@@ -48,6 +48,7 @@ class MySqlConnection {
     nint sock;
     bool connected;
     string lastError;
+    int lastNumber;             // the server's own error number, 0 when none
     int lastLen;        // payload length of the most recently read packet
     int lastSeq;        // sequence id of the most recently read packet
     int lastAffected;   // affected rows / row count of the last statement
@@ -521,7 +522,10 @@ class MySqlConnection {
     }
 
     /// <summary>Runs a query and returns the full result set. For non-SELECT
-    /// statements the result is empty and affected rows are recorded.</summary>
+    /// statements the result is empty and affected rows are recorded. Throws
+    /// <see cref="DbException"/> when the server answers with an error packet or
+    /// the session is gone, so an empty result always means "no rows";
+    /// <see cref="GetError"/> still carries the message.</summary>
     async DbResult QueryAsync(string sql) {
         DbResult result = DbResult.Create();
         this.hadError = false;
@@ -530,7 +534,7 @@ class MySqlConnection {
         if (!this.connected) {
             this.hadError = true;
             this.lastError = "not connected";
-            return result;
+            this.fail();
         }
         await this.comQuery(sql);
         string first = await this.readPacket();
@@ -538,7 +542,7 @@ class MySqlConnection {
             this.hadError = true;
             this.lastError = "connection closed";
             this.connected = false;
-            return result;
+            this.fail();
         }
         int b0 = first[0] & 255;
         if (b0 == 255) {
@@ -546,8 +550,9 @@ class MySqlConnection {
             this.lastError = "err " + Convert.ToString(code) + ": "
                 + bytesToStr(first, 9, this.lastLen - 9);
             this.hadError = true;
+            this.lastNumber = code;
             free(first);
-            return result;
+            this.fail();
         }
         if (b0 == 0 || b0 == 254) {
             // OK packet (no result set): affected rows is a lenenc int at offset 1.
@@ -603,20 +608,32 @@ class MySqlConnection {
         return result;
     }
 
-    /// <summary>Runs a non-query statement and returns affected rows (-1 on error).</summary>
+    /// <summary>Runs a non-query statement and returns affected rows. Throws
+    /// <see cref="DbException"/> when the statement fails.</summary>
     async int ExecuteAsync(string sql) {
         if (!this.connected) {
             this.lastError = "not connected";
-            return -1;
+            this.fail();
         }
         DbResult r = await this.QueryAsync(sql);
         if (this.hadError) {
-            return -1;
+            this.fail();
         }
         return this.lastAffected;
     }
 
-    /// <summary>First column of the first row as a string ("" if empty).</summary>
+    /// <summary>Raises the recorded failure, carrying the server's own error
+    /// number so a handler does not have to parse the message.</summary>
+    void fail() {
+        string why = this.lastError;
+        if (why.Length == 0) {
+            why = "the statement failed";
+        }
+        throw new DbException(why, this.lastNumber, DbProvider.MySQL);
+    }
+
+    /// <summary>First column of the first row as a string ("" when there are no
+    /// rows).</summary>
     async string ExecuteScalarAsync(string sql) {
         DbResult r = await this.QueryAsync(sql);
         if (r.RowCount() > 0) {

@@ -28,6 +28,7 @@ class SqlServerConnection {
     nint sock;
     bool connected;
     string lastError;
+    int lastNumber;             // the server's own error number, 0 when none
     int lastAffected;
     string serverVersion;
     string database;
@@ -248,14 +249,19 @@ class SqlServerConnection {
         this.lastAffected = resp.Affected();
         if (resp.Failed()) {
             this.lastError = resp.Error();
+            this.lastNumber = resp.ErrorNumber();
         }
         return resp;
     }
 
-    /// <summary>Runs a statement batch and returns its result set.</summary>
+    /// <summary>Runs a statement batch and returns its result set. Throws
+    /// <see cref="DbException"/> when the server rejects the batch, so an empty
+    /// result always means "no rows"; <see cref="GetError"/> still carries the
+    /// message for a caller that prefers to inspect it.</summary>
     async DbResult QueryAsync(string sql) {
         TdsResponse resp = await this.roundTrip(TdsPacket.SQLBATCH,
                                                 TdsMessage.SqlBatch(sql));
+        if (resp.Failed()) { this.fail(); }
         return resp.Rows();
     }
 
@@ -266,19 +272,20 @@ class SqlServerConnection {
         string text = SqlServerConnection.Renumber(sql, prms.Count());
         if (text.Length == 0 && sql.Length > 0) {
             this.lastError = "parameter count does not match the placeholders";
-            return DbResult.Empty();
+            this.fail();
         }
         TdsResponse resp = await this.roundTrip(TdsPacket.RPC,
                                                 TdsMessage.RpcExecuteSql(text, prms));
+        if (resp.Failed()) { this.fail(); }
         return resp.Rows();
     }
 
-    /// <summary>Runs a statement and returns the affected row count (-1 on
-    /// failure).</summary>
+    /// <summary>Runs a statement and returns the affected row count. Throws
+    /// <see cref="DbException"/> when the server rejects it.</summary>
     async int ExecuteAsync(string sql) {
         TdsResponse resp = await this.roundTrip(TdsPacket.SQLBATCH,
                                                 TdsMessage.SqlBatch(sql));
-        if (resp.Failed()) { return 0 - 1; }
+        if (resp.Failed()) { this.fail(); }
         return resp.Affected();
     }
 
@@ -287,15 +294,25 @@ class SqlServerConnection {
         string text = SqlServerConnection.Renumber(sql, prms.Count());
         if (text.Length == 0 && sql.Length > 0) {
             this.lastError = "parameter count does not match the placeholders";
-            return 0 - 1;
+            this.fail();
         }
         TdsResponse resp = await this.roundTrip(TdsPacket.RPC,
                                                 TdsMessage.RpcExecuteSql(text, prms));
-        if (resp.Failed()) { return 0 - 1; }
+        if (resp.Failed()) { this.fail(); }
         return resp.Affected();
     }
 
-    /// <summary>First column of the first row, or "".</summary>
+    /// <summary>Raises the recorded failure, so the server's own message
+    /// reaches the caller instead of an empty result.</summary>
+    void fail() {
+        string why = this.lastError;
+        if (why.Length == 0) {
+            why = "the statement failed";
+        }
+        throw new DbException(why, this.lastNumber, DbProvider.SqlServer);
+    }
+
+    /// <summary>First column of the first row, or "" when there are no rows.</summary>
     async string ExecuteScalarAsync(string sql) {
         DbResult r = await this.QueryAsync(sql);
         if (r.RowCount() == 0) { return ""; }

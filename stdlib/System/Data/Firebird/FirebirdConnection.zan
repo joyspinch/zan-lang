@@ -1235,8 +1235,10 @@ class FirebirdConnection {
     // ============================================================
 
     /// <summary>Runs a statement and returns its rows (empty for a statement
-    /// that produces none). <see cref="GetError"/> tells the two cases apart.
-    /// </summary>
+    /// that produces none). Throws <see cref="DbException"/> when the statement
+    /// fails, so an empty result always means "no rows" and never "it never
+    /// ran"; <see cref="GetError"/> and <see cref="SqlCode"/> still carry the
+    /// last failure for a caller that prefers to inspect it.</summary>
     async DbResult QueryAsync(string sql) {
         return await this.QueryAsync(sql, null);
     }
@@ -1249,14 +1251,14 @@ class FirebirdConnection {
         this.lastStatus = FbError.Create();
         if (!this.connected) {
             this.lastError = "not connected";
-            return DbResult.Empty();
+            this.fail();
         }
         int stmt = await this.allocStatement();
-        if (stmt < 0) { return DbResult.Empty(); }
+        if (stmt < 0) { this.fail(); }
         FbXsqlda xs = await this.prepare(stmt, sql);
         if (xs == null) {
             await this.freeStatement(stmt);
-            return DbResult.Empty();
+            this.fail();
         }
         if (xs.StmtType() == FbType.STMT_EXEC_PROCEDURE && xs.Count() > 0) {
             // A procedure with output parameters answers with op_sql_response
@@ -1264,12 +1266,12 @@ class FirebirdConnection {
             await this.freeStatement(stmt);
             this.lastError = "EXECUTE PROCEDURE with output parameters is not"
                 + " supported; select from the procedure instead";
-            return DbResult.Empty();
+            this.fail();
         }
         bool ok = await this.execute(stmt, prms);
         if (!ok) {
             await this.freeStatement(stmt);
-            return DbResult.Empty();
+            this.fail();
         }
         DbResult res = DbResult.Empty();
         if (xs.IsSelect() && xs.Count() > 0) {
@@ -1285,8 +1287,8 @@ class FirebirdConnection {
         return res;
     }
 
-    /// <summary>Runs a statement and returns how many rows it changed, or -1 on
-    /// failure.</summary>
+    /// <summary>Runs a statement and returns how many rows it changed. Throws
+    /// <see cref="DbException"/> when the statement fails.</summary>
     async int ExecuteAsync(string sql) {
         return await this.ExecuteAsync(sql, null);
     }
@@ -1294,11 +1296,22 @@ class FirebirdConnection {
     /// <summary>Parameterized counterpart of ExecuteAsync.</summary>
     async int ExecuteAsync(string sql, DbParams prms) {
         DbResult r = await this.QueryAsync(sql, prms);
-        if (this.lastError.Length > 0) { return 0 - 1; }
+        if (this.lastError.Length > 0) { this.fail(); }
         return this.lastAffected;
     }
 
-    /// <summary>First column of the first row, or "".</summary>
+    /// <summary>Raises the recorded failure, so the caller sees the server's own
+    /// wording and SQL code instead of an empty result.</summary>
+    void fail() {
+        string why = this.lastError;
+        if (why.Length == 0) {
+            why = "the statement failed";
+        }
+        throw new DbException(why, this.lastStatus.SqlCode(),
+                              DbProvider.Firebird);
+    }
+
+    /// <summary>First column of the first row, or "" when there are no rows.</summary>
     async string ExecuteScalarAsync(string sql) {
         DbResult r = await this.QueryAsync(sql, null);
         if (r.RowCount() == 0) { return ""; }
