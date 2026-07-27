@@ -263,11 +263,18 @@ static int expr_is_arc_object(zan_irgen_t *g, zan_ast_node_t *e, local_scope_t *
  * and the index expression owns its result like a call would. */
 static int expr_index_of_owned_temp(zan_irgen_t *g, zan_ast_node_t *e,
                                     local_scope_t *locals);
+/* Reading a field off a temporary object -- Make().name, Get().Inner -- has to
+ * release that object, so the field is handed out retained (see the general
+ * field-access path) and the member expression owns its result like a call. */
+static int expr_member_of_owned_temp(zan_irgen_t *g, zan_ast_node_t *e,
+                                     local_scope_t *locals);
 
 static int expr_yields_owned_rc_value(zan_irgen_t *g, zan_ast_node_t *e,
                                       local_scope_t *locals) {
     if (!e) return 0;
     if (e->kind == AST_INDEX && expr_index_of_owned_temp(g, e, locals)) return 1;
+    if (e->kind == AST_MEMBER_ACCESS && expr_member_of_owned_temp(g, e, locals))
+        return 1;
     if (e->kind == AST_NEW_EXPR || e->kind == AST_CALL ||
         e->kind == AST_QUERY_EXPR) return 1;
     /* An awaited async call yields a freshly owned (+1) reference: the callee's
@@ -334,6 +341,32 @@ static int expr_index_of_owned_temp(zan_irgen_t *g, zan_ast_node_t *e,
     if (!expr_yields_owned_rc_value(g, obj, locals)) return 0;
     return is_rc_managed_type(container_elem_type(ct)) ||
            is_rc_managed_type(dict_value_type(ct));
+}
+
+/* The field type a member access yields, with the receiver's type arguments
+ * substituted, or NULL when the receiver has no such field. */
+static zan_type_t *member_owned_field_type(zan_irgen_t *g, zan_ast_node_t *e,
+                                           local_scope_t *locals) {
+    zan_ast_node_t *obj = e->member.object;
+    zan_type_t *ot = infer_expr_type(g, obj, locals);
+    if (!ot || !ot->sym) return NULL;
+    zan_symbol_t *fs = get_field_sym(ot->sym, e->member.name);
+    if (!fs || !fs->type) return NULL;
+    zan_type_t *ft = subst_type_param_deep(g, fs->type, ot);
+    if (ft && ft->kind == TYPE_TYPE_PARAM) ft = concretize(g, ft);
+    return ft;
+}
+
+static int expr_member_of_owned_temp(zan_irgen_t *g, zan_ast_node_t *e,
+                                     local_scope_t *locals) {
+    if (!e || e->kind != AST_MEMBER_ACCESS || !locals) return 0;
+    zan_ast_node_t *obj = e->member.object;
+    if (!obj || expr_is_local_ident(obj, locals)) return 0;
+    zan_type_t *ot = infer_expr_type(g, obj, locals);
+    if (!ot || ot->kind != TYPE_CLASS || !is_rc_managed_type(ot)) return 0;
+    if (!expr_yields_owned_rc_value(g, obj, locals)) return 0;
+    zan_type_t *ft = member_owned_field_type(g, e, locals);
+    return ft && is_rc_managed_type(ft);
 }
 
 static void emit_release_owned_call_temp(zan_irgen_t *g, zan_ast_node_t *arg,

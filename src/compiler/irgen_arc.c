@@ -20,6 +20,11 @@
  * released, which keeps collections/stores that capture it use-after-free
  * safe. Strings, async frames and collection element release are follow-ups. */
 
+static bool types_equal(zan_type_t *a, zan_type_t *b);
+static bool type_is_concrete(zan_type_t *t);
+static zan_type_t *subst_type_param_deep(zan_irgen_t *g, zan_type_t *t,
+                                         zan_type_t *recv);
+
 static void emit_arc_retain(zan_irgen_t *g, LLVMValueRef v) {
     if (!v || LLVMGetTypeKind(LLVMTypeOf(v)) != LLVMPointerTypeKind) return;
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
@@ -87,10 +92,20 @@ static void emit_rc_release_for_type(zan_irgen_t *g, zan_type_t *type, LLVMValue
  * Peeking the refcount keeps field release aliasing-safe: fields are dropped
  * exactly once, on the release that brings the object to zero. */
 
-static LLVMValueRef get_class_release_decl(zan_irgen_t *g, zan_symbol_t *sym) {
+/* One destructor per (class, instantiation): a field declared `T` holds a
+ * different type in Acc<Node> than in Acc<int>, so one shared destructor keyed
+ * by the class symbol alone skipped every type-parameter field and leaked
+ * whatever it held. `inst` is NULL for non-generic classes. */
+static LLVMValueRef get_class_release_decl(zan_irgen_t *g, zan_symbol_t *sym,
+                                          zan_type_t *inst) {
     if (!sym) return NULL;
-    for (int i = 0; i < g->class_release_count; i++)
-        if (g->class_release[i].sym == sym) return g->class_release[i].fn;
+    if (inst && (!inst->type_arg_count || !type_is_concrete(inst))) inst = NULL;
+    for (int i = 0; i < g->class_release_count; i++) {
+        if (g->class_release[i].sym != sym) continue;
+        zan_type_t *ci = g->class_release[i].inst;
+        if (ci == inst) return g->class_release[i].fn;
+        if (ci && inst && types_equal(ci, inst)) return g->class_release[i].fn;
+    }
     /* only classes with a registered struct layout can be walked */
     if (!get_struct_llvm_type(g, sym)) return NULL;
     g->class_release = irgen_grow(g->class_release, &g->class_release_cap,
@@ -104,6 +119,7 @@ static LLVMValueRef get_class_release_decl(zan_irgen_t *g, zan_symbol_t *sym) {
     LLVMValueRef fn = LLVMAddFunction(g->mod, name, ft);
     LLVMSetLinkage(fn, LLVMInternalLinkage);
     g->class_release[g->class_release_count].sym = sym;
+    g->class_release[g->class_release_count].inst = inst;
     g->class_release[g->class_release_count].fn = fn;
     g->class_release_count++;
     return fn;
@@ -259,7 +275,8 @@ static void emit_array_release_elems(zan_irgen_t *g, zan_type_t *elem_type,
 /* Emit the body of __zan_release_<T>: null-guard, peek the refcount, release the
  * RC-managed fields when it is about to hit zero, then hand off to
  * zan_rt_release for the decrement + free. */
-static void build_class_release_body(zan_irgen_t *g, zan_symbol_t *sym, LLVMValueRef fn) {
+static void build_class_release_body(zan_irgen_t *g, zan_symbol_t *sym,
+                                    zan_type_t *inst, LLVMValueRef fn) {
     di_clear(g); /* synthetic fn: don't inherit a user fn's DISubprogram scope */
     LLVMContextRef c = g->ctx;
     LLVMBuilderRef b = g->builder;
@@ -292,6 +309,9 @@ static void build_class_release_body(zan_irgen_t *g, zan_symbol_t *sym, LLVMValu
         int idx = fi++;
         zan_type_t *ft = m->type;
         if (!ft) continue;
+        /* resolve `T` / `List<T>` fields against the instantiation being freed */
+        if (inst) ft = subst_type_param_deep(g, ft, inst);
+        if (!ft || ft->kind == TYPE_TYPE_PARAM) continue;
         /* weak fields are non-owning back-references: never released here. */
         if (m->modifiers & MOD_WEAK) continue;
         if (ft->kind == TYPE_STRING) {
@@ -425,8 +445,23 @@ static void emit_all_class_releases(zan_irgen_t *g) {
     for (int i = 0; i < g->struct_type_count; i++) {
         zan_symbol_t *sym = g->struct_types[i].sym;
         if (!sym || !sym->type || !is_arc_managed_type(sym->type)) continue;
-        LLVMValueRef fn = get_class_release_decl(g, sym);
-        if (fn) build_class_release_body(g, sym, fn);
+        LLVMValueRef fn = get_class_release_decl(g, sym, NULL);
+        if (fn) build_class_release_body(g, sym, NULL, fn);
+    }
+    /* plus one per generic instantiation that was actually allocated, so its
+     * type-parameter fields are released with their concrete types */
+    for (int i = 0; g->site_inst && i < g->leak_site_count; i++) {
+        zan_symbol_t *sym = g->site_syms ? g->site_syms[i] : NULL;
+        zan_type_t *inst = g->site_inst[i];
+        if (!sym || !inst || !inst->type_arg_count || !type_is_concrete(inst)) continue;
+        int seen = 0;
+        for (int j = 0; j < g->class_release_count && !seen; j++)
+            if (g->class_release[j].sym == sym && g->class_release[j].inst &&
+                types_equal(g->class_release[j].inst, inst))
+                seen = 1;
+        if (seen) continue;
+        LLVMValueRef fn = get_class_release_decl(g, sym, inst);
+        if (fn) build_class_release_body(g, sym, inst, fn);
     }
 }
 
@@ -444,7 +479,8 @@ static void emit_site_dtor_table(zan_irgen_t *g) {
             LLVMValueRef fn = get_collection_release_decl(g, i);
             if (fn) e = LLVMConstBitCast(fn, i8ptr);
         } else if (i < g->leak_site_count && g->site_syms[i]) {
-            LLVMValueRef fn = get_class_release_decl(g, g->site_syms[i]);
+            LLVMValueRef fn = get_class_release_decl(g, g->site_syms[i],
+                                  g->site_inst ? g->site_inst[i] : NULL);
             if (fn) e = LLVMConstBitCast(fn, i8ptr);
         }
         elems[i] = e;

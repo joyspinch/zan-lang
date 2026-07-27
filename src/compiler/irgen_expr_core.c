@@ -780,7 +780,15 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
             zan_type_t *rt = infer_expr_type(g, obj, locals);
             if (rt && rt->sym) {
                 zan_symbol_t *m = get_method_sym(rt->sym, callee->member.name);
-                if (m) return m->type;
+                if (m) {
+                    /* a method returning a type parameter returns the
+                     * receiver's type argument: Acc<Node>.Get() is a Node, so
+                     * `a.Get().tag` finds Node's fields instead of treating an
+                     * erased result as a number */
+                    zan_type_t *mt = subst_type_param_deep(g, m->type, rt);
+                    if (mt && mt->kind == TYPE_TYPE_PARAM) mt = concretize(g, mt);
+                    return mt;
+                }
             }
             /* extension method: recv.M(args) returns the static method's type
              * (with its generic type parameters substituted from this call

@@ -999,6 +999,37 @@ static void emit_console_title(zan_irgen_t *g, LLVMValueRef s) {
     zan_call2(g->builder, pty, pf, (LLVMValueRef[]){ fmt, s }, 2, "");
 }
 
+/* The type a field store must manage, as opposed to the type the field was
+ * declared with: a field declared `T` in `Acc<T>` holds a `Node` in `Acc<Node>`
+ * and has to be retained/released like one. Without this the store lowered to a
+ * bare pointer store, so the +1 the caller handed over was dropped and the
+ * object was freed while the field still pointed at it. */
+static zan_type_t *field_store_type(zan_irgen_t *g, zan_symbol_t *fsym,
+                                    zan_type_t *recv) {
+    if (!fsym || !fsym->type) return NULL;
+    return concretize(g, subst_type_param(fsym->type, recv));
+}
+
+/* A receiver that is itself a temporary -- Make().name, Get().Inner -- must be
+ * released once the field is out, and an rc-managed field retained first so it
+ * outlives the object it was read from. expr_member_of_owned_temp reports the
+ * member expression as owning its result, so the consumer releases it. */
+static LLVMValueRef finish_member_of_temp(zan_irgen_t *g, zan_ast_node_t *expr,
+                                          local_scope_t *locals,
+                                          zan_type_t *obj_type,
+                                          LLVMValueRef obj_val, LLVMValueRef fv) {
+    if (!obj_val || !obj_type || !is_rc_managed_type(obj_type) ||
+        expr_is_local_ident(expr->member.object, locals) ||
+        !expr_yields_owned_rc_value(g, expr->member.object, locals))
+        return fv;
+    zan_type_t *ft = member_owned_field_type(g, expr, locals);
+    if (ft && is_rc_managed_type(ft) &&
+        LLVMGetTypeKind(LLVMTypeOf(fv)) == LLVMPointerTypeKind)
+        emit_rc_retain_for_type(g, ft, fv);
+    emit_rc_release_for_type(g, obj_type, obj_val);
+    return fv;
+}
+
 static LLVMValueRef emit_expr_assignment(zan_irgen_t *g, zan_ast_node_t *expr,
         local_scope_t *locals) {
         LLVMValueRef right;
@@ -1407,8 +1438,9 @@ binding_lowered:
                             LLVMValueRef struct_ptr = struct_base_ptr(g, local, st);
                             LLVMValueRef fptr = LLVMBuildStructGEP2(g->builder, st, struct_ptr, (unsigned)fi, "fld");
                             zan_symbol_t *afsym = get_field_sym(local->type->sym, expr->binary.left->member.name);
-                            if (afsym && afsym->type && is_rc_managed_type(afsym->type)) {
-                                emit_rc_store_field(g, afsym->type, fptr, right, expr->binary.right, locals,
+                            zan_type_t *aft = afsym ? field_store_type(g, afsym, local->type) : NULL;
+                            if (aft && is_rc_managed_type(aft)) {
+                                emit_rc_store_field(g, aft, fptr, right, expr->binary.right, locals,
                                                     (afsym->modifiers & MOD_WEAK) ? 1 : 0);
                             } else {
                                 LLVMBuildStore(g->builder, right, fptr);
@@ -1431,8 +1463,12 @@ binding_lowered:
                             LLVMValueRef fptr = LLVMBuildStructGEP2(g->builder, st,
                                 obj_val, (unsigned)fi, "gfld");
                             zan_symbol_t *gfsym = get_field_sym(cls, expr->binary.left->member.name);
-                            if (gfsym && gfsym->type && is_rc_managed_type(gfsym->type)) {
-                                emit_rc_store_field(g, gfsym->type, fptr, right, expr->binary.right, locals,
+                            zan_type_t *gft = gfsym
+                                ? field_store_type(g, gfsym,
+                                      infer_expr_type(g, obj_expr, locals))
+                                : NULL;
+                            if (gft && is_rc_managed_type(gft)) {
+                                emit_rc_store_field(g, gft, fptr, right, expr->binary.right, locals,
                                                     (gfsym->modifiers & MOD_WEAK) ? 1 : 0);
                             } else {
                                 LLVMBuildStore(g->builder, right, fptr);
@@ -1854,12 +1890,13 @@ static LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr
                         LLVMTypeRef ft = fsym ? map_type(g, fsym->type)
                                               : LLVMInt64TypeInContext(g->ctx);
                         LLVMValueRef gfv = LLVMBuildLoad2(g->builder, ft, field_ptr, "gfval");
+                        zan_type_t *rct = infer_expr_type(g, expr->member.object, locals);
                         if (fsym) {
-                            zan_type_t *rct = infer_expr_type(g, expr->member.object, locals);
                             zan_type_t *ct = subst_type_param(fsym->type, rct);
                             if (ct != fsym->type) gfv = emit_boundary_coerce(g, gfv, map_type(g, ct));
                         }
-                        return gfv;
+                        return finish_member_of_temp(g, expr, locals, rct,
+                                                     obj_val, gfv);
                     }
                 }
             }
@@ -2386,6 +2423,9 @@ static LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                             if (site_idx >= ZAN_MAX_LEAK_SITES) site_idx = ZAN_MAX_LEAK_SITES - 1;
                             else g->leak_site_count++;
                             if (g->site_syms) g->site_syms[site_idx] = sym;
+                            if (g->site_inst)
+                                g->site_inst[site_idx] =
+                                    resolve_type_ctx(g, expr->new_expr.type);
                             site_val = LLVMConstInt(i64, (unsigned long long)site_idx, 0);
                             if (g->check_leaks) {
                                 char site_buf[600];

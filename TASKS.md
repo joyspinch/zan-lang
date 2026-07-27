@@ -335,14 +335,33 @@ operand type of return inst!
   block；和 C# 一样，声明不能当嵌入语句（CS1023），会给出"用花括号括起来"的报错。
   回归：`tests/conformance/stmt_braceless_bodies.zan`（含 `else` 悬挂、`for`/`foreach`
   单语句体、单语句体里的 `break`/`continue`、以及单语句体里的 `await`）。
-* **A7-5**〔新，2026-07-27 实测〕**泛型类的字段在 `T` 绑定引用类型时读不对**。
+* **A7-5 ✅ 已修（2026-07-27）泛型类的字段在 `T` 绑定引用类型时取值错误 / 堆损坏**。
   `_scratch/pd.zan`：`class Acc<T> { T cur; void Set(T v){this.cur=v;} T Get(){return this.cur;} }`
-  * `Acc<string>`：正确。
-  * `Acc<Node>`（`Node` 是 class）：`a.cur` 直接堆损坏退出（`0xC0000374`）；
-    只走 `a.Get().tag` 时不崩，但打印 `0`——引用被当成整数用了。
-  * `Acc<List<string>>`：`l.Get().Count` 打印 `0`。
-  这正是 A7-1 结尾列的"仍未覆盖的边界"（实例泛型方法的单态化）在**字段**上的表现，
-  而且不是"明确报错"而是静默错值/崩溃。**阻塞 B3-1**（`DbPool<TConn>` 的字段就是 `TConn`）。
+  修复前 `Acc<Node>`（`Node` 是 class）直接 `a.cur` 以 `0xC0000374` 退出，
+  `a.Get().tag` 打印 `0`；`Acc<List<string>>` 的 `.Count` 打印 `0`；`Acc<string>` 正常。
+  **四个独立缺陷**：
+  1. **字段写入用的是声明类型而不是实例化后的类型**（`irgen_expr.c` 的三条
+     `obj.Field = v` 路径）。字段声明成 `T`，`is_rc_managed_type(T)` 为假 ⇒ 降级成裸指针
+     store，调用方交过来的 +1 被丢掉，对象在字段还指着它的时候就被释放。
+     修法：新增 `field_store_type()`＝`concretize(subst_type_param(字段类型, 接收者类型))`。
+  2. **返回类型是类型参数的方法，其返回类型没有按接收者替换**（`irgen_expr_core.c`
+     的 `infer_expr_type` 实例调用分支）⇒ `a.Get().tag` 找不到 `Node` 的字段，
+     把擦除结果当数字用。修法：`subst_type_param_deep` + `concretize`。
+  3. **每个泛型类只有一份析构器**（`class_release` 只按类符号做键）⇒ 走到 `T` 字段时
+     类型仍是 `T`，一律跳过，字段持有的整个对象图泄漏。修法：析构器改为按
+     （类符号，实例化类型）成键，新增 `site_inst[]` 记录每个分配点的实例化类型，
+     `emit_all_class_releases` 为每个真实分配过的实例化各发射一份（`Acc<Node>` 与
+     `Acc<string>` 因此是两个 `__zan_release_Acc_*`）。
+  4. **从临时接收者上读字段不释放那个临时对象**（`Make().name` / `a.Get().tag`）。
+     这是 `finish_index_of_temp`（`Split(",")[0]`）的成员访问版，此前缺失。修法：
+     新增 `finish_member_of_temp()` + 分类器 `expr_member_of_owned_temp()`：
+     rc 字段先 retain、随后释放容器，并把该成员表达式报告为"持有结果"，由消费方释放。
+  回归：`tests/conformance/generic_ref_type_fields.zan`（`Acc<Node>` 的字段/方法/链式读、
+  循环内反复覆盖、`Acc<string>` / `Acc<List<string>>` / `Acc<int>`、`Pair<Node,int>`、
+  临时接收者的字段读），conformance / determinism / leakcheck 三份全绿；
+  全量 `ctest -j8` **588/588**。
+  **注意**：这一项解掉了 B3-1 的阻塞——`DbPool<TConn>` 的 `TConn` 字段现在按真实类型
+  管理所有权。仍未做的是**实例泛型方法的单态化**（A7-1 结尾那条），与本项无关。
 
 ## A8 ARC / 异常 / 协程交互 〔**已实测，三份 repro 全部仍成立**，2026-07-27〕
 
@@ -781,7 +800,7 @@ header-only 库 / C 回调 / 结构体字段偏移，全部对应 A2 / A3 / A4�
 | 批次 | 内容 | 为什么排这里 |
 |---|---|---|
 | **0** | ~~A8-1~~ ✅ / ~~A8-2~~ ✅ / ~~A8-3~~ ✅ / ~~A8-4~~ ✅ / ~~A8-12~~ ✅ / ~~A8-13~~ ✅ / ~~A8-14~~ ✅ / ~~A8-15~~ ✅（catch 内再抛跳错 handler、抛出点双重释放、被放弃 handler 泄漏异常、异常落地用帧覆盖栈槽、表达式里的 await 被当 `int`；+ 顺带修掉 A8-8 foreach break/continue、A8-9 `var`+await 类型、A8-10 测试重复编译） | **三份 repro 全部实测仍成立，两个比文档记的更严重**。ARC 与异常/协程交互不可靠 ⇒ 任何 Zan 上层代码都不可信，而"上层全用 Zan"是整个计划的地基 |
-| **0.5** | ~~**A7-1**~~ ✅（修约束接口方法调用的 codegen 崩溃）/ ~~A7-2~~ ✅（构造类型的静态成员访问）/ ~~A7-4~~ ✅（无花括号单语句体）；**A7-5** 待修（泛型字段在 `T` 为引用类型时取值错误/堆损坏） | 已实测复现且已定位；A7-5 阻塞 B3-1；不依赖其他任何项 |
+| **0.5** | ~~**A7-1**~~ ✅（修约束接口方法调用的 codegen 崩溃）/ ~~A7-2~~ ✅（构造类型的静态成员访问）/ ~~A7-4~~ ✅（无花括号单语句体）；~~**A7-5**~~ ✅（泛型字段在 `T` 为引用类型时取值错误/堆损坏，四个缺陷） | 已全部实测修复；A7-5 曾阻塞 B3-1，现已解除 |
 | **1** | ~~**A0-0**（句柄型 extern 改 `nint`）~~ ✅ 已完成（330 处 / 26 文件，553/553）；**A0-0c**（socket 句柄统一 `nint`）已完成（562/562，窄化警告 51 → 0）、**A0-0d** 句柄部分已完成（`rt_io` → `intptr_t`，`zan_gui_*` 句柄 → `iptr`；位宽部分并入 A0-1/A0-2）；余下 C4 / C5 / C7（删残桩、提交游离文档、游戏计划归到项目文档层） | A0-0 在 int 还是 64 位时零语义变化，是切 int=32 的安全前置。清理放这里而不是更早：`ABI.md` 这类失真文档在 A2 落地前仍是唯一的目标 ABI 参照，**先实现、后按实现重写文档**，不要先清场 |
 | **2** | **A0-1 / A0-2 / A0-3**（int=32 + FFI 位宽 + 结构体布局） | 一切 FFI 和编解码工作的前置 |
 | **3** | **A1** `Span<T>` + **B2**（用它清掉 49 处 calloc-as-string） | 能力与清理配对落地 |

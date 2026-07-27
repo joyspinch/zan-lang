@@ -75,6 +75,7 @@ struct zan_irgen {
      * via zan_rt_release. Built lazily and cached by class symbol. */
     struct zan_class_release_entry {
         zan_symbol_t *sym;
+        zan_type_t   *inst;  /* instantiation walked (Acc<Node>), NULL if none */
         LLVMValueRef  fn;
     } *class_release;
     int class_release_count;
@@ -225,6 +226,9 @@ struct zan_irgen {
     LLVMValueRef g_site_dtors;    /* [N x i8*] global: release fn per alloc site */
     LLVMTypeRef  site_dtors_type; /* [N x i8*] array type */
     zan_symbol_t **site_syms;    /* concrete class symbol per alloc site */
+    zan_type_t   **site_inst;    /* per site: the instantiated class type, so a
+                                  * generic class's destructor releases the
+                                  * fields its type arguments really hold */
     int          *site_coll;     /* per site: 0=class, 1=List, 2=StringBuilder */
     zan_type_t   **site_coll_elem; /* per site: List element type (for release) */
     int          leak_site_count; /* number of distinct `new` sites assigned */

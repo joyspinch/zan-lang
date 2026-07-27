@@ -614,6 +614,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         g->site_syms = (zan_symbol_t **)calloc(ZAN_MAX_LEAK_SITES, sizeof(zan_symbol_t *));
         g->site_coll = (int *)calloc(ZAN_MAX_LEAK_SITES, sizeof(int));
         g->site_coll_elem = (zan_type_t **)calloc(ZAN_MAX_LEAK_SITES, sizeof(zan_type_t *));
+        g->site_inst = (zan_type_t **)calloc(ZAN_MAX_LEAK_SITES, sizeof(zan_type_t *));
     }
 
     /* declare printf */
@@ -1558,6 +1559,8 @@ void zan_irgen_destroy(zan_irgen_t *g) {
     free(g->struct_types);
     g->struct_types = NULL;
     g->struct_type_count = g->struct_type_cap = 0;
+    free(g->site_inst);
+    g->site_inst = NULL;
     free(g->class_release);
     g->class_release = NULL;
     g->class_release_count = g->class_release_cap = 0;
@@ -2086,7 +2089,8 @@ static int expr_yields_owned_rc_value(zan_irgen_t *g, zan_ast_node_t *e,
                                       local_scope_t *locals);
 static void emit_rc_retain_for_type(zan_irgen_t *g, zan_type_t *type, LLVMValueRef v);
 static void emit_arc_release_typed(zan_irgen_t *g, zan_type_t *type, LLVMValueRef v);
-static LLVMValueRef get_class_release_decl(zan_irgen_t *g, zan_symbol_t *sym);
+static LLVMValueRef get_class_release_decl(zan_irgen_t *g, zan_symbol_t *sym,
+                                          zan_type_t *inst);
 static void emit_list_release_elems(zan_irgen_t *g, zan_type_t *elem_type, LLVMValueRef col);
 static void emit_dict_release_elems(zan_irgen_t *g, zan_type_t *dict_type, LLVMValueRef col);
 static void emit_array_release_elems(zan_irgen_t *g, zan_type_t *elem_type,
