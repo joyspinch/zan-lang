@@ -117,9 +117,28 @@
   否则每个 lowering 点都要手工扩展。`int` 仍是 i64，这批包装在当前位宽下是恒等变换。
   **实测**：把 `map_type` 的 `TYPE_INT` 临时改成 i32 后，编译器自身、全部 Zan 工具链
   （zanfmt / zandoc / zanpkg）都能编过，`int_width` / `numeric_cast` 输出正确。
-  **剩下的**：和 A0-2 同一批切——`zan_gui_*` / `rt_*` 的 C 侧坐标、颜色、尺寸参数还是
-  i64，Zan 侧 extern 写的是 `int`，单独切任何一边都是 ABI 不匹配；再加上
-  `ServerMetrics.LeInt()` 这类"用 `int` 装 64 位量"的语义定型。
+  **剩下的**：
+
+  **A0-1 / A0-2 实测（2026-07-27）**：已把 Zan 侧 `extern` 与 C 侧 `EXPORT`
+  签名逐个对照过一遍，规模是确定的：
+  * **23 处窗口句柄**：C 侧是 `iptr`，Zan 侧却写 `int`（`zan_gui_create_window`
+    的返回、`zan_gui_present` / `show_window` / `set_title` … 的 hwnd 参数）。
+    **已改成 `nint` 并提交**——`nint` 在两种宽度下都是指针宽，与 A0-1 无关，
+    先落地不会影响现状。
+  * **383 处坐标 / 尺寸 / 颜色**：C 侧 `i64`，Zan 侧 `int`，要一起改成 `int32_t`。
+    改法是机械的（按 Zan 声明逐参数替换），改完编译器和 GUI 全部编过，
+    `gui_icon` / `gui_stack` / `gui_webview_interop` 输出正确。
+  * **真正的阻塞不在 FFI，在标准库把 `int` 当 64 位量用**：`map_type` 一改 i32，
+    `ByteBuffer.ReadU64()` 返回 `int` 就把 `9000000000` 截断
+    （`conformance_native_memory` 的 `bb-u64` 失败），ZanDb 的页 id / 偏移
+    （`BTree.zan` 里 `int nxt = pg.ReadU64();` 等数十处）同理。这类截断
+    **是静默的**，只有恰好有断言的用例会红。
+  * 因此 A0-1 的实际工作量是：**先把标准库里承载 64 位量的 `int` 全部改成
+    `long`**（ByteBuffer 的 U64 系列、ZanDb 页 id/偏移、文件偏移、时间戳），
+    再同一批切 map_type + 383 处 C 签名 + 重新生成 `golden_structs_ir`
+    （IR 里 `int` 字段会从 i64 变 i32，golden 必须一起更新）。
+    `gui_css` / `gui_datatable` 在 i32 下也失败，尚未定位。
+
 * **A0-2** FFI 边界按声明类型的真实位宽 lower。现在 `map_type`（`irgen.c:1601`）对
   `int`/`uint`/`long`/`nint` 一律给 i64，于是：传参时把 64 位塞给期望 32 位的 C 函数；
   取返回值时按 64 位读，而 C 只保证低 32 位有效，**高位是未定义的**
