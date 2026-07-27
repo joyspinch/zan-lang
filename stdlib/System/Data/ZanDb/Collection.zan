@@ -31,6 +31,13 @@ class Collection {
     /// <summary>Documents indexed per transaction by the batch index build.</summary>
     static int INDEX_BATCH = 500;
 
+    // Records are escaped to keep 0x00 out of them (see EncodeDoc); the escape
+    // byte is 0xFF and almost never appears, so the read path asks memchr --
+    // one vectorized pass in C -- whether unescaping is needed at all instead
+    // of copying every record through a second buffer byte by byte.
+    [DllImport("crt", EntryPoint = "memchr")]
+    static extern nint MemChr(nint p, int c, int n);
+
     Collection() {
         this.name = "";
         this.indexedFields = new List<string>();
@@ -145,6 +152,18 @@ class Collection {
         this.keyDict.Add(k);
         this.keyDictDirty = true;
         return this.keyDict.Count;
+    }
+
+    /// <summary>Dictionary id of a field name, or 0 when this collection has
+    /// never stored that field. Unlike KeyId this never grows the dictionary,
+    /// so it is safe on the read path.</summary>
+    int KeyIdOf(string k) {
+        int i = 0;
+        while (i < this.keyDict.Count) {
+            if (this.keyDict[i] == k) { return i + 1; }
+            i = i + 1;
+        }
+        return 0;
     }
 
     string KeyName(int id) {
@@ -334,10 +353,17 @@ class Collection {
     /// <summary>Decodes a binary record body (see EncodeDoc) back into a
     /// JsonValue object. "_id" is not stored in the body; callers attach it
     /// from the row key.</summary>
-    JsonValue DecodeDoc(string body) {
-        // Reverse the NUL-free escaping applied by EncodeDoc.
+    /// <summary>Wraps a stored record for reading, undoing the escaping only
+    /// when the record actually contains an escape byte. Records written by
+    /// EncodeDoc rarely do (tags 9 and 10 keep 0x00 out of the common cells),
+    /// so the usual case is one buffer and no byte-by-byte copy.</summary>
+    ByteBuffer OpenRecord(string body) {
         ByteBuffer e = ByteBuffer.FromStr(body);
-        ByteBuffer b = ByteBuffer.Alloc(body.Length + 4);
+        if (Collection.MemChr(e.Raw(), 255, e.Length()) == 0) {
+            e.SeekRead(0);
+            return e;
+        }
+        ByteBuffer b = ByteBuffer.Alloc(e.Length() + 4);
         e.SeekRead(0);
         while (e.Remaining() > 0) {
             int by = e.ReadU8();
@@ -350,6 +376,62 @@ class Collection {
         }
         e.Free();
         b.SeekRead(0);
+        return b;
+    }
+
+    /// <summary>Steps over one encoded value without building anything from
+    /// it. Strings and numbers-as-text are skipped by length rather than
+    /// copied.</summary>
+    void SkipVal(ByteBuffer b) {
+        int tag = b.ReadU8();
+        if (tag == 3 || tag == 8) { b.ReadVarInt(); return; }
+        if (tag == 4 || tag == 5) {
+            int len = b.ReadVarInt();
+            b.SeekRead(b.ReadPos() + len);
+            return;
+        }
+        if (tag == 6) {
+            int c = b.ReadVarInt();
+            int i = 0;
+            while (i < c) { SkipVal(b); i = i + 1; }
+            return;
+        }
+        if (tag == 7) {
+            int c = b.ReadVarInt();
+            int i = 0;
+            while (i < c) { b.ReadVarInt(); SkipVal(b); i = i + 1; }
+            return;
+        }
+        // tags 0, 1, 2, 9, 10 carry no payload.
+    }
+
+    /// <summary>One field straight out of a stored record: the other fields are
+    /// stepped over instead of being decoded, so a filter over a large
+    /// collection does not build a JsonValue tree per document. Returns null
+    /// when the record has no such field.</summary>
+    JsonValue FieldOf(string body, int kid) {
+        if (kid == 0) { return null; }
+        ByteBuffer b = OpenRecord(body);
+        b.ReadU8();                     // 'B'
+        int n = b.ReadVarInt();
+        JsonValue found = null;
+        int i = 0;
+        while (i < n) {
+            int k = b.ReadVarInt();
+            if (k == kid) {
+                found = ReadVal(b);
+                i = n;
+            } else {
+                SkipVal(b);
+                i = i + 1;
+            }
+        }
+        b.Free();
+        return found;
+    }
+
+    JsonValue DecodeDoc(string body) {
+        ByteBuffer b = OpenRecord(body);
         int fmt = b.ReadU8();   // 'B' = 66
         JsonValue o = JsonValue.NewObject();
         int n = b.ReadVarInt();
@@ -596,17 +678,73 @@ class Collection {
                 if (d != null) { docs.Add(d); }
                 i = i + 1;
             }
-        } else {
-            List<JsonValue> all = FindRange(0, 0, 0);
-            int i = 0;
-            while (i < all.Count) {
-                JsonValue d = all[i];
-                if (d.Has(field) && d.Get(field).AsString("") == val) { docs.Add(d); }
-                i = i + 1;
+            this.kv.EndSnapshot();
+            return docs;
+        }
+        this.kv.EndSnapshot();
+        return FindByFieldScan(field, val);
+    }
+
+    /// <summary>Documents whose field equals val, found by scanning: every
+    /// record is asked for that one field, and only the matches are decoded in
+    /// full. Used when the field has no usable index.</summary>
+    List<JsonValue> FindByFieldScan(string field, string val) {
+        this.kv.BeginSnapshot();
+        SyncMeta();
+        List<JsonValue> docs = new List<JsonValue>();
+        int kid = KeyIdOf(field);
+        if (kid == 0) {
+            this.kv.EndSnapshot();
+            return docs;
+        }
+        List<string> ks = new List<string>();
+        List<string> vs = new List<string>();
+        this.kv.Scan(DocKey(0), "c:" + this.name + ";", 0, ks, vs);
+        int i = 0;
+        while (i < vs.Count) {
+            JsonValue f = FieldOf(vs[i], kid);
+            if (f != null && f.AsString("") == val) {
+                JsonValue doc = DecodeDoc(vs[i]);
+                doc.Set("_id", JsonValue.NewNum(Collection.IdFromKey(ks[i])));
+                docs.Add(doc);
             }
+            i = i + 1;
         }
         this.kv.EndSnapshot();
         return docs;
+    }
+
+    /// <summary>How many documents have field == val, without materializing
+    /// any of them.</summary>
+    int CountByField(string field, string val) {
+        this.kv.BeginSnapshot();
+        SyncMeta();
+        int n = 0;
+        if (HasIndex(field) && !this.kv.Contains(IdxPosKey(field))) {
+            // A ready index answers from its keys alone: no document is read.
+            List<string> ks = new List<string>();
+            List<string> vs = new List<string>();
+            n = this.kv.ScanPrefix("i:" + this.name + ":" + field + ":" + val
+                                   + "\t", 0, ks, vs);
+            this.kv.EndSnapshot();
+            return n;
+        }
+        int kid = KeyIdOf(field);
+        if (kid == 0) {
+            this.kv.EndSnapshot();
+            return 0;
+        }
+        List<string> ks2 = new List<string>();
+        List<string> vs2 = new List<string>();
+        this.kv.Scan(DocKey(0), "c:" + this.name + ";", 0, ks2, vs2);
+        int i = 0;
+        while (i < vs2.Count) {
+            JsonValue f = FieldOf(vs2[i], kid);
+            if (f != null && f.AsString("") == val) { n = n + 1; }
+            i = i + 1;
+        }
+        this.kv.EndSnapshot();
+        return n;
     }
 
     /// <summary>Number of documents (range scan over the namespace).</summary>

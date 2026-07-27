@@ -140,7 +140,34 @@ class DocQuery {
         if (this.hasIdxEq) {
             return this.col.FindByIndex(this.idxField, this.idxValue);
         }
+        if (this.eqFilters.Count > 0) {
+            // Narrow with the first equality while scanning: the collection
+            // reads just that field out of each record and only decodes the
+            // matches. The remaining filters still run over the survivors.
+            EqFilter f = this.eqFilters[0];
+            return this.col.FindByFieldScan(f.field, f.val);
+        }
         return this.col.FindAll();
+    }
+
+    bool MatchesRest(JsonValue d) {
+        int i = 1;
+        while (i < this.eqFilters.Count) {
+            EqFilter f = this.eqFilters[i];
+            if (!d.Has(f.field)) { return false; }
+            if (d.Get(f.field).AsString("") != f.val) { return false; }
+            i = i + 1;
+        }
+        foreach (DocPredicate p in this.preds) {
+            if (!p(d)) { return false; }
+        }
+        return true;
+    }
+
+    /// <summary>True when the candidate set already applied the first equality
+    /// filter, so re-checking it would be wasted work.</summary>
+    bool EqAppliedByScan() {
+        return !this.hasIdxEq && this.eqFilters.Count > 0;
     }
 
     bool Matches(JsonValue d) {
@@ -219,10 +246,14 @@ class DocQuery {
     /// <summary>Runs the query and materializes matching documents.</summary>
     List<JsonValue> ToList() {
         List<JsonValue> cand = Candidates();
+        bool scanned = EqAppliedByScan();
         List<JsonValue> matched = new List<JsonValue>();
         int i = 0;
         while (i < cand.Count) {
-            if (Matches(cand[i])) { matched.Add(cand[i]); }
+            bool keep = false;
+            if (scanned) { keep = MatchesRest(cand[i]); }
+            else { keep = Matches(cand[i]); }
+            if (keep) { matched.Add(cand[i]); }
             i = i + 1;
         }
         if (this.sortInt || this.sortStr) {
@@ -257,13 +288,29 @@ class DocQuery {
         return null;
     }
 
-    /// <summary>Number of matches (no sort/paging applied).</summary>
+    /// <summary>Number of matches (no sort/paging applied). A single equality
+    /// with nothing else is counted without materializing any document -- from
+    /// the index keys when the field is indexed, otherwise by reading one field
+    /// out of each record.</summary>
     int Count() {
+        if (this.preds.Count == 0) {
+            if (this.hasIdxEq && this.eqFilters.Count == 0) {
+                return this.col.CountByField(this.idxField, this.idxValue);
+            }
+            if (!this.hasIdxEq && this.eqFilters.Count == 1) {
+                EqFilter only = this.eqFilters[0];
+                return this.col.CountByField(only.field, only.val);
+            }
+        }
         List<JsonValue> cand = Candidates();
+        bool scanned = EqAppliedByScan();
         int n = 0;
         int i = 0;
         while (i < cand.Count) {
-            if (Matches(cand[i])) { n = n + 1; }
+            bool keep = false;
+            if (scanned) { keep = MatchesRest(cand[i]); }
+            else { keep = Matches(cand[i]); }
+            if (keep) { n = n + 1; }
             i = i + 1;
         }
         return n;
