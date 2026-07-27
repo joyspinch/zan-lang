@@ -535,7 +535,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         /* ensure cond is i1 */
         if (LLVMGetTypeKind(LLVMTypeOf(cond)) != LLVMIntegerTypeKind ||
             LLVMGetIntTypeWidth(LLVMTypeOf(cond)) != 1) {
-            cond = LLVMBuildICmp(g->builder, LLVMIntNE, cond,
+            cond = zan_icmp(g->builder, LLVMIntNE, cond,
                                  LLVMConstInt(LLVMTypeOf(cond), 0, 0), "tobool");
         }
 
@@ -590,7 +590,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         LLVMValueRef cond = emit_expr(g, stmt->while_stmt.cond, locals);
         if (LLVMGetTypeKind(LLVMTypeOf(cond)) != LLVMIntegerTypeKind ||
             LLVMGetIntTypeWidth(LLVMTypeOf(cond)) != 1) {
-            cond = LLVMBuildICmp(g->builder, LLVMIntNE, cond,
+            cond = zan_icmp(g->builder, LLVMIntNE, cond,
                                  LLVMConstInt(LLVMTypeOf(cond), 0, 0), "tobool");
         }
         LLVMBuildCondBr(g->builder, cond, body_bb, end_bb);
@@ -646,7 +646,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             LLVMValueRef cond = emit_expr(g, stmt->for_stmt.cond, locals);
             if (LLVMGetTypeKind(LLVMTypeOf(cond)) != LLVMIntegerTypeKind ||
                 LLVMGetIntTypeWidth(LLVMTypeOf(cond)) != 1) {
-                cond = LLVMBuildICmp(g->builder, LLVMIntNE, cond,
+                cond = zan_icmp(g->builder, LLVMIntNE, cond,
                                      LLVMConstInt(LLVMTypeOf(cond), 0, 0), "tobool");
             }
             LLVMBuildCondBr(g->builder, cond, body_bb, end_bb);
@@ -735,7 +735,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                 LLVMBasicBlockRef next_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "sw.next");
                 LLVMValueRef cmp = zan_call2(g->builder, strcmp_ty, strcmp_fn,
                     (LLVMValueRef[]){ switch_val, case_val }, 2, "swcmp");
-                LLVMValueRef eq = LLVMBuildICmp(g->builder, LLVMIntEQ, cmp,
+                LLVMValueRef eq = zan_icmp(g->builder, LLVMIntEQ, cmp,
                     LLVMConstInt(i32, 0, 0), "sweq");
                 LLVMBuildCondBr(g->builder, eq, case_bb, next_bb);
                 LLVMPositionBuilderAtEnd(g->builder, next_bb);
@@ -841,7 +841,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         LLVMBuildStore(g->builder, tmp_mark, tmp_mark_slot);
         LLVMValueRef old_top_slot = emit_entry_alloca(g, i32t, "eh.old.slot");
         LLVMBuildStore(g->builder, old_top, old_top_slot);
-        LLVMValueRef new_top = LLVMBuildAdd(g->builder, old_top,
+        LLVMValueRef new_top = zan_add(g->builder, old_top,
             LLVMConstInt(i32t, 1, 0), "eh.new");
         LLVMBuildStore(g->builder, new_top, top_g);
         /* record the depth this handler was armed at, so a throw below can
@@ -862,7 +862,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                 g->current_async_frame_type, g->current_async_frame,
                 ASYNC_FRAME_HCOUNT, "eh.hc");
             LLVMValueRef hc = LLVMBuildLoad2(g->builder, i32t, hc_ptr, "eh.hcv");
-            LLVMBuildStore(g->builder, LLVMBuildAdd(g->builder, hc,
+            LLVMBuildStore(g->builder, zan_add(g->builder, hc,
                 LLVMConstInt(i32t, 1, 0), "eh.hc1"), hc_ptr);
             /* Record this handler in the frame so a later resume can re-arm it:
              * the jmp_buf armed below dies with this invocation, but the try
@@ -892,7 +892,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                         re[ri].nm);
                     LLVMPositionBuilderAtEnd(g->builder, re_bb);
                     LLVMValueRef rtop = LLVMBuildLoad2(g->builder, i32t, top_g, "eh.rtop");
-                    LLVMBuildStore(g->builder, LLVMBuildSub(g->builder, rtop,
+                    LLVMBuildStore(g->builder, zan_sub(g->builder, rtop,
                         LLVMConstInt(i32t, 1, 0), "eh.rtop0"), old_top_slot);
                     LLVMBuildStore(g->builder,
                         LLVMBuildLoad2(g->builder, i32t, eh_tmptop_g, "eh.rtmp"),
@@ -914,7 +914,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         LLVMValueRef buf = LLVMBuildGEP2(g->builder, bufs_ty, bufs_g, gep_idx, 2, "eh.buf");
         LLVMValueRef bufp = LLVMBuildBitCast(g->builder, buf, i8ptr, "eh.bufp");
         LLVMValueRef r = emit_eh_setjmp(g, bufp);
-        LLVMValueRef took = LLVMBuildICmp(g->builder, LLVMIntEQ, r, zero, "eh.took");
+        LLVMValueRef took = zan_icmp(g->builder, LLVMIntEQ, r, zero, "eh.took");
         LLVMBuildCondBr(g->builder, took, try_bb, catch_bb);
 
         LLVMPositionBuilderAtEnd(g->builder, try_bb);
@@ -937,7 +937,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                     g->current_async_frame_type, g->current_async_frame,
                     ASYNC_FRAME_HCOUNT, "eh.hc");
                 LLVMValueRef hc = LLVMBuildLoad2(g->builder, i32t, hc_ptr, "eh.hcv");
-                LLVMBuildStore(g->builder, LLVMBuildSub(g->builder, hc,
+                LLVMBuildStore(g->builder, zan_sub(g->builder, hc,
                     LLVMConstInt(i32t, 1, 0), "eh.hc0"), hc_ptr);
             }
             LLVMBuildBr(g->builder, end_bb);
@@ -952,7 +952,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                     g->current_async_frame_type, g->current_async_frame,
                     ASYNC_FRAME_HCOUNT, "eh.hc");
                 LLVMValueRef hc = LLVMBuildLoad2(g->builder, i32t, hc_ptr, "eh.hcv");
-                LLVMBuildStore(g->builder, LLVMBuildSub(g->builder, hc,
+                LLVMBuildStore(g->builder, zan_sub(g->builder, hc,
                     LLVMConstInt(i32t, 1, 0), "eh.hc0"), hc_ptr);
                 /* No reload from the frame: the handler this catch belongs to
                  * is re-armed by the invocation that raises the throw, whose
@@ -1082,7 +1082,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                     LLVMValueRef ofl = LLVMBuildLoad2(g->builder, i32t, owned_g2, "exc.ofl");
                     LLVMBuildStore(g->builder, ofl, exc_owned_slot);
                     LLVMBuildStore(g->builder, LLVMConstInt(i32t, 0, 0), owned_g2);
-                    LLVMValueRef isown = LLVMBuildICmp(g->builder, LLVMIntNE, ofl,
+                    LLVMValueRef isown = zan_icmp(g->builder, LLVMIntNE, ofl,
                         LLVMConstInt(i32t, 0, 0), "exc.isown");
                     LLVMBasicBlockRef push_bb =
                         LLVMAppendBasicBlockInContext(g->ctx, fn, "exc.push");
@@ -1123,7 +1123,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             LLVMPositionBuilderAtEnd(g->builder, rethrow_bb);
             {
                 LLVMValueRef rtop = LLVMBuildLoad2(g->builder, i32t, top_g, "reh.top");
-                LLVMValueRef rhas = LLVMBuildICmp(g->builder, LLVMIntSGE, rtop,
+                LLVMValueRef rhas = zan_icmp(g->builder, LLVMIntSGE, rtop,
                     LLVMConstInt(i32t, 0, 0), "reh.has");
                 LLVMBasicBlockRef rjmp_bb =
                     LLVMAppendBasicBlockInContext(g->ctx, fn, "reh.jmp");
@@ -1166,7 +1166,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
              * throws set __zan_eh_exc_owned; string throws leave it 0) */
             LLVMValueRef owned_g = get_eh_exc_owned_global(g);
             LLVMValueRef ofl = LLVMBuildLoad2(g->builder, i32t, owned_g, "exc.owned");
-            LLVMValueRef is_owned = LLVMBuildICmp(g->builder, LLVMIntNE, ofl,
+            LLVMValueRef is_owned = zan_icmp(g->builder, LLVMIntNE, ofl,
                 LLVMConstInt(i32t, 0, 0), "exc.isown");
             LLVMValueRef cfn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder));
             LLVMBasicBlockRef rel_bb = LLVMAppendBasicBlockInContext(g->ctx, cfn, "exc.rel");
@@ -1186,7 +1186,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
              * stacked as an EH temp) -- pop the temp and release it now */
             LLVMValueRef hofl = LLVMBuildLoad2(g->builder, i32t, exc_owned_slot,
                 "exc.hown");
-            LLVMValueRef h_owned = LLVMBuildICmp(g->builder, LLVMIntNE, hofl,
+            LLVMValueRef h_owned = zan_icmp(g->builder, LLVMIntNE, hofl,
                 LLVMConstInt(i32t, 0, 0), "exc.hisown");
             LLVMBasicBlockRef hrel_bb = LLVMAppendBasicBlockInContext(g->ctx, cfn, "exc.hrel");
             LLVMBasicBlockRef hcont_bb = LLVMAppendBasicBlockInContext(g->ctx, cfn, "exc.hcont");
@@ -1231,7 +1231,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         LLVMPositionBuilderAtEnd(g->builder, cond_bb);
         LLVMValueRef cond = emit_expr(g, stmt->while_stmt.cond, locals);
         if (LLVMTypeOf(cond) != LLVMInt1TypeInContext(g->ctx)) {
-            cond = LLVMBuildICmp(g->builder, LLVMIntNE, cond,
+            cond = zan_icmp(g->builder, LLVMIntNE, cond,
                                  LLVMConstInt(LLVMTypeOf(cond), 0, 0), "dcond");
         }
         LLVMBuildCondBr(g->builder, cond, body_bb, end_bb);
@@ -1332,7 +1332,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             col_cond, 0, "cnt_ptr");
         LLVMValueRef count = LLVMBuildLoad2(g->builder, i64, cnt_ptr, "cnt");
         LLVMValueRef idx_val = LLVMBuildLoad2(g->builder, i64, idx_alloc, "i");
-        LLVMValueRef cmp = LLVMBuildICmp(g->builder, LLVMIntSLT, idx_val, count, "fcmp");
+        LLVMValueRef cmp = zan_icmp(g->builder, LLVMIntSLT, idx_val, count, "fcmp");
         LLVMBuildCondBr(g->builder, cmp, body_bb, end_bb);
 
         LLVMPositionBuilderAtEnd(g->builder, body_bb);
@@ -1373,7 +1373,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         }
 
         LLVMPositionBuilderAtEnd(g->builder, step_bb);
-        LLVMValueRef next = LLVMBuildAdd(g->builder,
+        LLVMValueRef next = zan_add(g->builder,
             LLVMBuildLoad2(g->builder, i64, idx_alloc, "i2"),
             LLVMConstInt(i64, 1, 0), "next");
         LLVMBuildStore(g->builder, next, idx_alloc);
@@ -1510,7 +1510,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
              * already stored in the globals and retained) */
             emit_release_active_catch_excs(g, g->throw_catch_base);
             LLVMValueRef top = LLVMBuildLoad2(g->builder, i32t, top_g, "eh.top");
-            LLVMValueRef has = LLVMBuildICmp(g->builder, LLVMIntSGE, top,
+            LLVMValueRef has = zan_icmp(g->builder, LLVMIntSGE, top,
                 LLVMConstInt(i32t, 0, 0), "eh.has");
             LLVMValueRef fn2 = LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder));
             LLVMBasicBlockRef jmp_bb = LLVMAppendBasicBlockInContext(g->ctx, fn2, "throw.jmp");

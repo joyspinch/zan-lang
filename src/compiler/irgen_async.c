@@ -73,7 +73,7 @@ static void emit_async_complete(zan_irgen_t *g, local_scope_t *locals, LLVMValue
     LLVMValueRef aw_ptr = LLVMBuildStructGEP2(g->builder, ft, frame,
         ASYNC_FRAME_AWAITER, "fr.awaiter");
     LLVMValueRef awaiter = LLVMBuildLoad2(g->builder, i8ptr, aw_ptr, "awaiter");
-    LLVMValueRef has_awaiter = LLVMBuildICmp(g->builder, LLVMIntNE, awaiter,
+    LLVMValueRef has_awaiter = zan_icmp(g->builder, LLVMIntNE, awaiter,
         LLVMConstNull(i8ptr), "has.awaiter");
     LLVMValueRef fn = g->current_fn;
     LLVMBasicBlockRef wake_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "co.wake");
@@ -906,13 +906,13 @@ static void emit_async_eh_prologue(zan_irgen_t *g) {
     /* trampoline: the outermost handler of this invocation */
     {
         LLVMValueRef t = LLVMBuildLoad2(g->builder, i32, top_g, "eh.t");
-        LLVMValueRef t1 = LLVMBuildAdd(g->builder, t, LLVMConstInt(i32, 1, 0), "eh.t1");
+        LLVMValueRef t1 = zan_add(g->builder, t, LLVMConstInt(i32, 1, 0), "eh.t1");
         LLVMBuildStore(g->builder, t1, top_g);
         LLVMValueRef gep_idx[2] = { zero, t1 };
         LLVMValueRef buf = LLVMBuildGEP2(g->builder, bufs_ty, bufs_g, gep_idx, 2, "eh.buf");
         LLVMValueRef bufp = LLVMBuildBitCast(g->builder, buf, i8ptr, "eh.bufp");
         LLVMValueRef r = emit_eh_setjmp(g, bufp);
-        LLVMValueRef took = LLVMBuildICmp(g->builder, LLVMIntEQ, r, zero, "eh.took");
+        LLVMValueRef took = zan_icmp(g->builder, LLVMIntEQ, r, zero, "eh.took");
         LLVMBuildCondBr(g->builder, took, head_bb, exc_bb);
     }
 
@@ -925,8 +925,8 @@ static void emit_async_eh_prologue(zan_irgen_t *g) {
         /* only the first ASYNC_MAX_HANDLERS handlers have a recorded id */
         LLVMValueRef cap = LLVMConstInt(i32, ASYNC_MAX_HANDLERS, 0);
         hc = LLVMBuildSelect(g->builder,
-            LLVMBuildICmp(g->builder, LLVMIntSLT, hc, cap, "hc.fits"), hc, cap, "hc.cap");
-        LLVMValueRef more = LLVMBuildICmp(g->builder, LLVMIntSLT, i, hc, "eh.more");
+            zan_icmp(g->builder, LLVMIntSLT, hc, cap, "hc.fits"), hc, cap, "hc.cap");
+        LLVMValueRef more = zan_icmp(g->builder, LLVMIntSLT, i, hc, "eh.more");
         LLVMBuildCondBr(g->builder, more, arm_bb, disp_bb);
     }
 
@@ -941,13 +941,13 @@ static void emit_async_eh_prologue(zan_irgen_t *g) {
         LLVMBuildStore(g->builder,
             LLVMBuildLoad2(g->builder, i32, slot, "hs.id"), id_slot);
         LLVMValueRef t = LLVMBuildLoad2(g->builder, i32, top_g, "eh.t2");
-        LLVMValueRef t1 = LLVMBuildAdd(g->builder, t, LLVMConstInt(i32, 1, 0), "eh.t3");
+        LLVMValueRef t1 = zan_add(g->builder, t, LLVMConstInt(i32, 1, 0), "eh.t3");
         LLVMBuildStore(g->builder, t1, top_g);
         LLVMValueRef gep_idx[2] = { zero, t1 };
         LLVMValueRef buf = LLVMBuildGEP2(g->builder, bufs_ty, bufs_g, gep_idx, 2, "eh.buf2");
         LLVMValueRef bufp = LLVMBuildBitCast(g->builder, buf, i8ptr, "eh.bufp2");
         LLVMValueRef r = emit_eh_setjmp(g, bufp);
-        LLVMValueRef took = LLVMBuildICmp(g->builder, LLVMIntEQ, r, zero, "eh.took2");
+        LLVMValueRef took = zan_icmp(g->builder, LLVMIntEQ, r, zero, "eh.took2");
         LLVMBuildCondBr(g->builder, took, init_bb, land_bb);
     }
 
@@ -963,7 +963,7 @@ static void emit_async_eh_prologue(zan_irgen_t *g) {
     {
         LLVMValueRef i = LLVMBuildLoad2(g->builder, i32, idx_slot, "eh.i3");
         LLVMBuildStore(g->builder,
-            LLVMBuildAdd(g->builder, i, LLVMConstInt(i32, 1, 0), "eh.i4"), idx_slot);
+            zan_add(g->builder, i, LLVMConstInt(i32, 1, 0), "eh.i4"), idx_slot);
         LLVMBuildBr(g->builder, head_bb);
     }
 
@@ -981,12 +981,12 @@ static void emit_async_eh_prologue(zan_irgen_t *g) {
          * dropped (the catch entry pops the catching handler itself). */
         LLVMValueRef t = LLVMBuildLoad2(g->builder, i32, top_g, "eh.land.top");
         LLVMValueRef e = LLVMBuildLoad2(g->builder, i32, entry_slot, "eh.land.entry");
-        LLVMValueRef k = LLVMBuildSub(g->builder,
-            LLVMBuildSub(g->builder, t, e, "eh.land.d"),
+        LLVMValueRef k = zan_sub(g->builder,
+            zan_sub(g->builder, t, e, "eh.land.d"),
             LLVMConstInt(i32, 2, 0), "eh.land.k");
-        LLVMValueRef ok = LLVMBuildAnd(g->builder,
-            LLVMBuildICmp(g->builder, LLVMIntSGE, k, zero, "eh.land.lo"),
-            LLVMBuildICmp(g->builder, LLVMIntSLT, k,
+        LLVMValueRef ok = zan_and(g->builder,
+            zan_icmp(g->builder, LLVMIntSGE, k, zero, "eh.land.lo"),
+            zan_icmp(g->builder, LLVMIntSLT, k,
                 LLVMConstInt(i32, ASYNC_MAX_HANDLERS, 0), "eh.land.hi"),
             "eh.land.ok");
         LLVMValueRef ksafe = LLVMBuildSelect(g->builder, ok, k, zero, "eh.land.ks");
@@ -1001,7 +1001,7 @@ static void emit_async_eh_prologue(zan_irgen_t *g) {
             LLVMConstInt(i32, -1, 1), "eh.land.id");
         LLVMBuildStore(g->builder, id, id_slot);
         LLVMBuildStore(g->builder,
-            LLVMBuildAdd(g->builder, ksafe, LLVMConstInt(i32, 1, 0), "eh.land.hc"),
+            zan_add(g->builder, ksafe, LLVMConstInt(i32, 1, 0), "eh.land.hc"),
             LLVMBuildStructGEP2(g->builder, ft, frame, ASYNC_FRAME_HCOUNT, "hc.l"));
     }
     /* No reload here: a longjmp only ever reaches a handler armed by the
@@ -1055,7 +1055,7 @@ static void emit_eh_rethrow_current(zan_irgen_t *g) {
     get_eh_globals(g, &top_g, &bufs_g, &exc_g);
     LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder));
     LLVMValueRef top = LLVMBuildLoad2(g->builder, i32, top_g, "reh.top");
-    LLVMValueRef has = LLVMBuildICmp(g->builder, LLVMIntSGE, top,
+    LLVMValueRef has = zan_icmp(g->builder, LLVMIntSGE, top,
         LLVMConstInt(i32, 0, 0), "reh.has");
     LLVMBasicBlockRef jmp_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "aeh.jmp");
     LLVMBasicBlockRef die_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "aeh.die");
@@ -1108,7 +1108,7 @@ static void emit_async_check_sub_exc(zan_irgen_t *g, LLVMValueRef sub) {
     LLVMValueRef tv = LLVMBuildLoad2(g->builder, i8ptr, tp, "sub.exc.tid");
     LLVMValueRef op = LLVMBuildStructGEP2(g->builder, hdr, sub, ASYNC_FRAME_EXC_OWNED, "sub.exc.own.p");
     LLVMValueRef ov = LLVMBuildLoad2(g->builder, i32, op, "sub.exc.own");
-    LLVMValueRef threw = LLVMBuildICmp(g->builder, LLVMIntNE, ev,
+    LLVMValueRef threw = zan_icmp(g->builder, LLVMIntNE, ev,
         LLVMConstNull(i8ptr), "sub.threw");
     LLVMBasicBlockRef thr_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "sub.rethrow");
     LLVMBasicBlockRef ok_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "sub.ok");

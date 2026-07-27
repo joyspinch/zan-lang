@@ -13,6 +13,51 @@
 #include "builtin_api.h"
 #include "arena.h"
 #include "diag.h"
+
+/* ---- width-tolerant integer builders -------------------------------------
+ * Zan's `int` lowers to i32 while lengths, counts, handles and every runtime
+ * helper are i64, so mixed-width operands reach these builders constantly (an
+ * i32 loop variable against an i64 `List.Count`, an i32 index plus an i64
+ * offset). LLVM rejects that, and dozens of lowering sites would each have to
+ * extend by hand. These wrappers sign-extend the narrower operand to the wider
+ * one first and are otherwise the LLVM builders; irgen calls them instead. */
+static void zan_ipair(LLVMBuilderRef b, LLVMValueRef *l, LLVMValueRef *r) {
+    LLVMTypeRef tl = LLVMTypeOf(*l), tr = LLVMTypeOf(*r);
+    if (LLVMGetTypeKind(tl) != LLVMIntegerTypeKind ||
+        LLVMGetTypeKind(tr) != LLVMIntegerTypeKind) return;
+    unsigned wl = LLVMGetIntTypeWidth(tl), wr = LLVMGetIntTypeWidth(tr);
+    if (wl == wr) return;
+    if (wl < wr) *l = LLVMBuildSExt(b, *l, tr, "wx");
+    else         *r = LLVMBuildSExt(b, *r, tl, "wx");
+}
+
+#define ZAN_IBIN(name, builder)                                              \
+static LLVMValueRef name(LLVMBuilderRef b, LLVMValueRef l, LLVMValueRef r,    \
+                         const char *n) {                                    \
+    zan_ipair(b, &l, &r);                                                    \
+    return builder(b, l, r, n);                                              \
+}
+ZAN_IBIN(zan_add,  LLVMBuildAdd)
+ZAN_IBIN(zan_sub,  LLVMBuildSub)
+ZAN_IBIN(zan_mul,  LLVMBuildMul)
+ZAN_IBIN(zan_sdiv, LLVMBuildSDiv)
+ZAN_IBIN(zan_udiv, LLVMBuildUDiv)
+ZAN_IBIN(zan_srem, LLVMBuildSRem)
+ZAN_IBIN(zan_urem, LLVMBuildURem)
+ZAN_IBIN(zan_and,  LLVMBuildAnd)
+ZAN_IBIN(zan_or,   LLVMBuildOr)
+ZAN_IBIN(zan_xor,  LLVMBuildXor)
+ZAN_IBIN(zan_shl,  LLVMBuildShl)
+ZAN_IBIN(zan_lshr, LLVMBuildLShr)
+ZAN_IBIN(zan_ashr, LLVMBuildAShr)
+#undef ZAN_IBIN
+
+static LLVMValueRef zan_icmp(LLVMBuilderRef b, LLVMIntPredicate p,
+                             LLVMValueRef l, LLVMValueRef r, const char *n) {
+    zan_ipair(b, &l, &r);
+    return LLVMBuildICmp(b, p, l, r, n);
+}
+
 #include <llvm-c/Analysis.h>
 #include <llvm-c/BitWriter.h>
 #include <llvm-c/DebugInfo.h>
@@ -506,7 +551,7 @@ static bool member_name_is(zan_symbol_t *m, zan_istr_t name) {
  * into a null allocation (which would later be dereferenced). */
 static void emit_oom_check(zan_irgen_t *g, LLVMValueRef fn, LLVMValueRef raw) {
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
-    LLVMValueRef isnull = LLVMBuildICmp(g->builder, LLVMIntEQ, raw,
+    LLVMValueRef isnull = zan_icmp(g->builder, LLVMIntEQ, raw,
         LLVMConstPointerNull(i8ptr), "oom");
     LLVMBasicBlockRef oom_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "oom");
     LLVMBasicBlockRef ok_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "oom.ok");
@@ -543,7 +588,7 @@ static void emit_header_read_guard(zan_irgen_t *g, LLVMValueRef fn,
     if (!isbad) isbad = LLVMAddFunction(g->mod, "IsBadReadPtr", fnty);
     LLVMValueRef cargs[] = { ptr8, LLVMConstInt(i64t, 8, 0) };
     LLVMValueRef bad = zan_call2(g->builder, fnty, isbad, cargs, 2, "badread");
-    LLVMValueRef isbadnz = LLVMBuildICmp(g->builder, LLVMIntNE, bad,
+    LLVMValueRef isbadnz = zan_icmp(g->builder, LLVMIntNE, bad,
         LLVMConstInt(i32t, 0, 0), "isbadnz");
     LLVMBasicBlockRef readable_bb =
         LLVMAppendBasicBlockInContext(g->ctx, fn, "readable");
@@ -893,11 +938,11 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
                     LLVMBuildStructGEP2(g->builder, ts_type, ts, 0, "ts.sec.p"), "ts.sec");
                 LLVMValueRef nsec = LLVMBuildLoad2(g->builder, i64t,
                     LLVMBuildStructGEP2(g->builder, ts_type, ts, 1, "ts.nsec.p"), "ts.nsec");
-                LLVMValueRef sec_ms = LLVMBuildMul(g->builder, sec,
+                LLVMValueRef sec_ms = zan_mul(g->builder, sec,
                     LLVMConstInt(i64t, 1000, 0), "sec.ms");
-                LLVMValueRef nsec_ms = LLVMBuildSDiv(g->builder, nsec,
+                LLVMValueRef nsec_ms = zan_sdiv(g->builder, nsec,
                     LLVMConstInt(i64t, 1000000, 0), "nsec.ms");
-                LLVMBuildRet(g->builder, LLVMBuildAdd(g->builder, sec_ms, nsec_ms, "now"));
+                LLVMBuildRet(g->builder, zan_add(g->builder, sec_ms, nsec_ms, "now"));
             }
         }
 
@@ -911,7 +956,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
                 g->rt_io_pump_timeout, "ret");
             LLVMPositionBuilderAtEnd(g->builder, entry);
             LLVMValueRef timeout = LLVMGetParam(g->rt_io_pump_timeout, 0);
-            LLVMValueRef positive = LLVMBuildICmp(g->builder, LLVMIntSGT, timeout,
+            LLVMValueRef positive = zan_icmp(g->builder, LLVMIntSGT, timeout,
                 LLVMConstInt(i64t, 0, 0), "positive");
             LLVMBuildCondBr(g->builder, positive, sleep, ret);
 
@@ -953,11 +998,11 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
             LLVMValueRef old = LLVMBuildLoad2(g->builder, i8ptr, g_timers, "t.head");
             LLVMBuildStore(g->builder, old, LLVMBuildStructGEP2(g->builder, tnode_ty, tn, 0, "tn.next"));
             LLVMValueRef now = zan_call2(g->builder, now_type, fn_now, NULL, 0, "now");
-            LLVMValueRef positive = LLVMBuildICmp(g->builder, LLVMIntSGT, ms,
+            LLVMValueRef positive = zan_icmp(g->builder, LLVMIntSGT, ms,
                 LLVMConstInt(i64t, 0, 0), "positive");
             LLVMValueRef delay = LLVMBuildSelect(g->builder, positive, ms,
                 LLVMConstInt(i64t, 0, 0), "delay");
-            LLVMValueRef deadline = LLVMBuildAdd(g->builder, now, delay, "deadline");
+            LLVMValueRef deadline = zan_add(g->builder, now, delay, "deadline");
             LLVMBuildStore(g->builder, deadline,
                 LLVMBuildStructGEP2(g->builder, tnode_ty, tn, 1, "tn.deadline"));
             LLVMBuildStore(g->builder, frame, LLVMBuildStructGEP2(g->builder, tnode_ty, tn, 2, "tn.frame"));
@@ -977,7 +1022,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
             LLVMPositionBuilderAtEnd(g->builder, entry);
             LLVMValueRef frame = LLVMGetParam(g->rt_co_ready, 0);
             LLVMValueRef step  = LLVMGetParam(g->rt_co_ready, 1);
-            LLVMValueRef step_null = LLVMBuildICmp(g->builder, LLVMIntEQ, step,
+            LLVMValueRef step_null = zan_icmp(g->builder, LLVMIntEQ, step,
                 LLVMConstNull(g->co_step_ptr), "step.null");
             LLVMBuildCondBr(g->builder, step_null, ret, cont);
 
@@ -991,7 +1036,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
             LLVMValueRef nstep = LLVMBuildStructGEP2(g->builder, node_ty, node, 2, "n.step");
             LLVMBuildStore(g->builder, step, nstep);
             LLVMValueRef tail = LLVMBuildLoad2(g->builder, i8ptr, g_tail, "tail");
-            LLVMValueRef is_empty = LLVMBuildICmp(g->builder, LLVMIntEQ, tail,
+            LLVMValueRef is_empty = zan_icmp(g->builder, LLVMIntEQ, tail,
                 LLVMConstNull(i8ptr), "q.empty");
             LLVMBuildCondBr(g->builder, is_empty, empty, nonempty);
 
@@ -1046,7 +1091,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
 
             LLVMPositionBuilderAtEnd(g->builder, head_bb);
             LLVMValueRef head = LLVMBuildLoad2(g->builder, i8ptr, g_head, "head");
-            LLVMValueRef empty = LLVMBuildICmp(g->builder, LLVMIntEQ, head,
+            LLVMValueRef empty = zan_icmp(g->builder, LLVMIntEQ, head,
                 LLVMConstNull(i8ptr), "q.empty");
             LLVMBuildCondBr(g->builder, empty, timers_bb, body_bb);
 
@@ -1058,7 +1103,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
             LLVMValueRef nx_ptr = LLVMBuildStructGEP2(g->builder, node_ty, head, 0, "n.next");
             LLVMValueRef nx = LLVMBuildLoad2(g->builder, i8ptr, nx_ptr, "next");
             LLVMBuildStore(g->builder, nx, g_head);
-            LLVMValueRef is_last = LLVMBuildICmp(g->builder, LLVMIntEQ, nx,
+            LLVMValueRef is_last = zan_icmp(g->builder, LLVMIntEQ, nx,
                 LLVMConstNull(i8ptr), "is.last");
             LLVMBuildCondBr(g->builder, is_last, last_bb, after_bb);
 
@@ -1077,7 +1122,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
              * the reactor waits, so an IO wake cannot lose the timer. */
             LLVMPositionBuilderAtEnd(g->builder, timers_bb);
             LLVMValueRef t0 = LLVMBuildLoad2(g->builder, i8ptr, g_timers, "t.head");
-            LLVMValueRef tnull = LLVMBuildICmp(g->builder, LLVMIntEQ, t0,
+            LLVMValueRef tnull = zan_icmp(g->builder, LLVMIntEQ, t0,
                 LLVMConstNull(i8ptr), "t.empty");
             LLVMBuildCondBr(g->builder, tnull, io_bb, scan_setup);
 
@@ -1092,7 +1137,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
 
             LLVMPositionBuilderAtEnd(g->builder, scan_cond);
             LLVMValueRef cur_c = LLVMBuildLoad2(g->builder, i8ptr, a_cur, "cur");
-            LLVMValueRef cur_null = LLVMBuildICmp(g->builder, LLVMIntEQ, cur_c,
+            LLVMValueRef cur_null = zan_icmp(g->builder, LLVMIntEQ, cur_c,
                 LLVMConstNull(i8ptr), "cur.null");
             LLVMBuildCondBr(g->builder, cur_null, scan_done, scan_body);
 
@@ -1103,7 +1148,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
                 LLVMBuildStructGEP2(g->builder, tnode_ty, cur_b, 1, "cur.due"), "curdue");
             LLVMValueRef bestdue = LLVMBuildLoad2(g->builder, i64t,
                 LLVMBuildStructGEP2(g->builder, tnode_ty, best_b, 1, "best.due"), "bestdue");
-            LLVMValueRef lt = LLVMBuildICmp(g->builder, LLVMIntULT, curdue, bestdue, "due.lt");
+            LLVMValueRef lt = zan_icmp(g->builder, LLVMIntULT, curdue, bestdue, "due.lt");
             LLVMBuildCondBr(g->builder, lt, scan_take, scan_next);
 
             LLVMPositionBuilderAtEnd(g->builder, scan_take);
@@ -1127,12 +1172,12 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
             LLVMValueRef bestdue_done = LLVMBuildLoad2(g->builder, i64t,
                 LLVMBuildStructGEP2(g->builder, tnode_ty, best, 1, "best.duep"), "best.due");
             LLVMValueRef now_done = zan_call2(g->builder, now_type, fn_now, NULL, 0, "now");
-            LLVMValueRef due_now = LLVMBuildICmp(g->builder, LLVMIntSLE,
+            LLVMValueRef due_now = zan_icmp(g->builder, LLVMIntSLE,
                 bestdue_done, now_done, "due.now");
             LLVMBuildCondBr(g->builder, due_now, timer_due, wait_timer);
 
             LLVMPositionBuilderAtEnd(g->builder, wait_timer);
-            LLVMValueRef remaining = LLVMBuildSub(g->builder, bestdue_done, now_done, "remaining");
+            LLVMValueRef remaining = zan_sub(g->builder, bestdue_done, now_done, "remaining");
             zan_call2(g->builder, g->rt_io_pump_timeout_type,
                 g->rt_io_pump_timeout, (LLVMValueRef[]){ remaining }, 1, "");
             LLVMBuildBr(g->builder, head_bb);
@@ -1140,7 +1185,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
             LLVMPositionBuilderAtEnd(g->builder, timer_due);
             LLVMValueRef bestnext = LLVMBuildLoad2(g->builder, i8ptr,
                 LLVMBuildStructGEP2(g->builder, tnode_ty, best, 0, "best.nextp"), "best.nextv");
-            LLVMValueRef bp_null = LLVMBuildICmp(g->builder, LLVMIntEQ, bestprev,
+            LLVMValueRef bp_null = zan_icmp(g->builder, LLVMIntEQ, bestprev,
                 LLVMConstNull(i8ptr), "bp.null");
             LLVMBuildCondBr(g->builder, bp_null, unlink_head, unlink_mid);
 
@@ -1172,7 +1217,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
             LLVMValueRef legacy_pump = LLVMGetNamedFunction(g->mod, "zan_io_pump");
             LLVMValueRef woke = zan_call2(g->builder, legacy_pump_type,
                 legacy_pump, NULL, 0, "woke");
-            LLVMValueRef more = LLVMBuildICmp(g->builder, LLVMIntSGT, woke,
+            LLVMValueRef more = zan_icmp(g->builder, LLVMIntSGT, woke,
                 LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0), "io.more");
             LLVMBuildCondBr(g->builder, more, head_bb, exit_bb);
 
@@ -1240,7 +1285,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMPositionBuilderAtEnd(g->builder, bb);
         LLVMValueRef obj = LLVMGetParam(g->rt_retain, 0);
         /* null check */
-        LLVMValueRef is_null = LLVMBuildICmp(g->builder, LLVMIntEQ, obj,
+        LLVMValueRef is_null = zan_icmp(g->builder, LLVMIntEQ, obj,
             LLVMConstNull(i8ptr), "isnull");
         LLVMBasicBlockRef do_retain = LLVMAppendBasicBlockInContext(g->ctx, g->rt_retain, "retain");
         LLVMBasicBlockRef ret_bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_retain, "ret");
@@ -1268,7 +1313,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMBasicBlockRef bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_release, "entry");
         LLVMPositionBuilderAtEnd(g->builder, bb);
         LLVMValueRef obj = LLVMGetParam(g->rt_release, 0);
-        LLVMValueRef is_null = LLVMBuildICmp(g->builder, LLVMIntEQ, obj,
+        LLVMValueRef is_null = zan_icmp(g->builder, LLVMIntEQ, obj,
             LLVMConstNull(i8ptr), "isnull");
         LLVMBasicBlockRef do_release = LLVMAppendBasicBlockInContext(g->ctx, g->rt_release, "release");
         LLVMBasicBlockRef ret_bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_release, "ret");
@@ -1282,9 +1327,9 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         /* atomically decrement; LLVMBuildAtomicRMW returns the pre-op value */
         LLVMValueRef rc_old = LLVMBuildAtomicRMW(g->builder, LLVMAtomicRMWBinOpSub, rc_iptr,
             LLVMConstInt(i64, 1, 0), LLVMAtomicOrderingAcquireRelease, 0);
-        LLVMValueRef rc1 = LLVMBuildSub(g->builder, rc_old, LLVMConstInt(i64, 1, 0), "rc1");
+        LLVMValueRef rc1 = zan_sub(g->builder, rc_old, LLVMConstInt(i64, 1, 0), "rc1");
         /* if rc1 == 0, free the object (16-byte header precedes obj) */
-        LLVMValueRef is_zero = LLVMBuildICmp(g->builder, LLVMIntEQ, rc1,
+        LLVMValueRef is_zero = zan_icmp(g->builder, LLVMIntEQ, rc1,
             LLVMConstInt(i64, 0, 0), "iszero");
         LLVMBasicBlockRef free_bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_release, "dofree");
         LLVMBuildCondBr(g->builder, is_zero, free_bb, ret_bb);
@@ -1304,12 +1349,12 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         if (g->check_leaks) {
             /* leak tracking: one fewer live object, and one fewer at this site */
             LLVMValueRef lv = LLVMBuildLoad2(g->builder, i64, g->g_live, "live");
-            LLVMValueRef lv1 = LLVMBuildSub(g->builder, lv, LLVMConstInt(i64, 1, 0), "live_dec");
+            LLVMValueRef lv1 = zan_sub(g->builder, lv, LLVMConstInt(i64, 1, 0), "live_dec");
             LLVMBuildStore(g->builder, lv1, g->g_live);
             LLVMValueRef gidx[2] = { LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0), site };
             LLVMValueRef sc_ptr = LLVMBuildGEP2(g->builder, g->site_live_type, g->g_site_live, gidx, 2, "scptr");
             LLVMValueRef sc = LLVMBuildLoad2(g->builder, i64, sc_ptr, "sc");
-            LLVMValueRef sc1 = LLVMBuildSub(g->builder, sc, LLVMConstInt(i64, 1, 0), "sc_dec");
+            LLVMValueRef sc1 = zan_sub(g->builder, sc, LLVMConstInt(i64, 1, 0), "sc_dec");
             LLVMBuildStore(g->builder, sc1, sc_ptr);
         }
         LLVMBuildBr(g->builder, ret_bb);
@@ -1330,7 +1375,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMBasicBlockRef bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_release_dyn, "entry");
         LLVMPositionBuilderAtEnd(g->builder, bb);
         LLVMValueRef obj = LLVMGetParam(g->rt_release_dyn, 0);
-        LLVMValueRef is_null = LLVMBuildICmp(g->builder, LLVMIntEQ, obj, LLVMConstNull(i8ptr), "isnull");
+        LLVMValueRef is_null = zan_icmp(g->builder, LLVMIntEQ, obj, LLVMConstNull(i8ptr), "isnull");
         LLVMBasicBlockRef cont = LLVMAppendBasicBlockInContext(g->ctx, g->rt_release_dyn, "cont");
         LLVMBasicBlockRef lookup = LLVMAppendBasicBlockInContext(g->ctx, g->rt_release_dyn, "lookup");
         LLVMBasicBlockRef calld = LLVMAppendBasicBlockInContext(g->ctx, g->rt_release_dyn, "calld");
@@ -1342,7 +1387,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMValueRef sptr = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx), obj, &neg8, 1, "sptr");
         LLVMValueRef siptr = LLVMBuildBitCast(g->builder, sptr, LLVMPointerType(i64, 0), "siptr");
         LLVMValueRef site = LLVMBuildLoad2(g->builder, i64, siptr, "site");
-        LLVMValueRef inrange = LLVMBuildICmp(g->builder, LLVMIntULT, site,
+        LLVMValueRef inrange = zan_icmp(g->builder, LLVMIntULT, site,
             LLVMConstInt(i64, ZAN_MAX_LEAK_SITES, 0), "inrange");
         LLVMBuildCondBr(g->builder, inrange, lookup, fb);
         LLVMPositionBuilderAtEnd(g->builder, lookup);
@@ -1350,7 +1395,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMValueRef gidx[2] = { z32, site };
         LLVMValueRef dpp = LLVMBuildGEP2(g->builder, g->site_dtors_type, g->g_site_dtors, gidx, 2, "dpp");
         LLVMValueRef dtor = LLVMBuildLoad2(g->builder, i8ptr, dpp, "dtor");
-        LLVMValueRef hasd = LLVMBuildICmp(g->builder, LLVMIntNE, dtor, LLVMConstNull(i8ptr), "hasd");
+        LLVMValueRef hasd = zan_icmp(g->builder, LLVMIntNE, dtor, LLVMConstNull(i8ptr), "hasd");
         LLVMBuildCondBr(g->builder, hasd, calld, fb);
         LLVMPositionBuilderAtEnd(g->builder, calld);
         LLVMTypeRef dfnty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), &i8ptr, 1, 0);
@@ -1382,7 +1427,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMValueRef site = LLVMGetParam(g->rt_alloc, 1);
         LLVMValueRef name = LLVMGetParam(g->rt_alloc, 2);
         /* total = size + 16 (for the 16-byte header) */
-        LLVMValueRef total = LLVMBuildAdd(g->builder, size, LLVMConstInt(i64, 16, 0), "total");
+        LLVMValueRef total = zan_add(g->builder, size, LLVMConstInt(i64, 16, 0), "total");
         LLVMTypeRef malloc_fn_type = LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i64 }, 1, 0);
         LLVMValueRef raw = zan_call2(g->builder, malloc_fn_type, g->fn_malloc, &total, 1, "raw");
         emit_oom_check(g, g->rt_alloc, raw);
@@ -1401,12 +1446,12 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
             /* leak tracking: total + per-site count, and record the site name */
             LLVMValueRef z32 = LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
             LLVMValueRef lv = LLVMBuildLoad2(g->builder, i64, g->g_live, "live");
-            LLVMValueRef lv1 = LLVMBuildAdd(g->builder, lv, LLVMConstInt(i64, 1, 0), "live_inc");
+            LLVMValueRef lv1 = zan_add(g->builder, lv, LLVMConstInt(i64, 1, 0), "live_inc");
             LLVMBuildStore(g->builder, lv1, g->g_live);
             LLVMValueRef gidx[2] = { z32, site };
             LLVMValueRef sc_ptr = LLVMBuildGEP2(g->builder, g->site_live_type, g->g_site_live, gidx, 2, "scptr");
             LLVMValueRef sc = LLVMBuildLoad2(g->builder, i64, sc_ptr, "sc");
-            LLVMValueRef sc1 = LLVMBuildAdd(g->builder, sc, LLVMConstInt(i64, 1, 0), "sc_inc");
+            LLVMValueRef sc1 = zan_add(g->builder, sc, LLVMConstInt(i64, 1, 0), "sc_inc");
             LLVMBuildStore(g->builder, sc1, sc_ptr);
             LLVMValueRef nm_ptr = LLVMBuildGEP2(g->builder, g->site_names_type, g->g_site_names, gidx, 2, "nmptr");
             LLVMBuildStore(g->builder, name, nm_ptr);
@@ -1427,7 +1472,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMBasicBlockRef bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_str_alloc, "entry");
         LLVMPositionBuilderAtEnd(g->builder, bb);
         LLVMValueRef size = LLVMGetParam(g->rt_str_alloc, 0);
-        LLVMValueRef total = LLVMBuildAdd(g->builder, size, LLVMConstInt(i64, 16, 0), "total");
+        LLVMValueRef total = zan_add(g->builder, size, LLVMConstInt(i64, 16, 0), "total");
         LLVMTypeRef malloc_fn_type = LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i64 }, 1, 0);
         LLVMValueRef raw = zan_call2(g->builder, malloc_fn_type, g->fn_malloc, &total, 1, "raw");
         emit_oom_check(g, g->rt_str_alloc, raw);
@@ -1441,7 +1486,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMValueRef user_ptr = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx), raw, &sixteen, 1, "usr");
         if (g->check_leaks) {
             LLVMValueRef lv = LLVMBuildLoad2(g->builder, i64, g->g_live, "live");
-            LLVMValueRef lv1 = LLVMBuildAdd(g->builder, lv, LLVMConstInt(i64, 1, 0), "live_inc");
+            LLVMValueRef lv1 = zan_add(g->builder, lv, LLVMConstInt(i64, 1, 0), "live_inc");
             LLVMBuildStore(g->builder, lv1, g->g_live);
         }
         LLVMBuildRet(g->builder, user_ptr);
@@ -1457,7 +1502,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMBasicBlockRef bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_str_retain, "entry");
         LLVMPositionBuilderAtEnd(g->builder, bb);
         LLVMValueRef obj = LLVMGetParam(g->rt_str_retain, 0);
-        LLVMValueRef is_null = LLVMBuildICmp(g->builder, LLVMIntEQ, obj, LLVMConstNull(i8p), "isnull");
+        LLVMValueRef is_null = zan_icmp(g->builder, LLVMIntEQ, obj, LLVMConstNull(i8p), "isnull");
         LLVMBasicBlockRef ret_bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_str_retain, "ret");
         LLVMBasicBlockRef cont_bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_str_retain, "cont");
         LLVMBuildCondBr(g->builder, is_null, ret_bb, cont_bb);
@@ -1467,7 +1512,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         emit_header_read_guard(g, g->rt_str_retain, magic_ptr, ret_bb);
         LLVMValueRef magic_iptr = LLVMBuildBitCast(g->builder, magic_ptr, LLVMPointerType(i64t, 0), "magicip");
         LLVMValueRef magic = LLVMBuildLoad2(g->builder, i64t, magic_iptr, "magic");
-        LLVMValueRef has_magic = LLVMBuildICmp(g->builder, LLVMIntEQ, magic,
+        LLVMValueRef has_magic = zan_icmp(g->builder, LLVMIntEQ, magic,
             LLVMConstInt(i64t, ZAN_STRING_MAGIC, 0), "hasmagic");
         LLVMBasicBlockRef retain_bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_str_retain, "retain");
         LLVMBuildCondBr(g->builder, has_magic, retain_bb, ret_bb);
@@ -1476,7 +1521,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMValueRef rc_ptr = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx), obj, &neg16, 1, "rcptr");
         LLVMValueRef rc_iptr = LLVMBuildBitCast(g->builder, rc_ptr, LLVMPointerType(i64t, 0), "rciptr");
         LLVMValueRef rc = LLVMBuildLoad2(g->builder, i64t, rc_iptr, "rc");
-        LLVMValueRef is_sent = LLVMBuildICmp(g->builder, LLVMIntEQ, rc,
+        LLVMValueRef is_sent = zan_icmp(g->builder, LLVMIntEQ, rc,
             LLVMConstInt(i64t, ZAN_STRING_SENTINEL_RC, 0), "issent");
         LLVMBasicBlockRef add_bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_str_retain, "add");
         LLVMBuildCondBr(g->builder, is_sent, ret_bb, add_bb);
@@ -1496,7 +1541,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMBasicBlockRef bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_str_release, "entry");
         LLVMPositionBuilderAtEnd(g->builder, bb);
         LLVMValueRef obj = LLVMGetParam(g->rt_str_release, 0);
-        LLVMValueRef is_null = LLVMBuildICmp(g->builder, LLVMIntEQ, obj, LLVMConstNull(i8p), "isnull");
+        LLVMValueRef is_null = zan_icmp(g->builder, LLVMIntEQ, obj, LLVMConstNull(i8p), "isnull");
         LLVMBasicBlockRef ret_bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_str_release, "ret");
         LLVMBasicBlockRef cont_bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_str_release, "cont");
         LLVMBuildCondBr(g->builder, is_null, ret_bb, cont_bb);
@@ -1506,7 +1551,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         emit_header_read_guard(g, g->rt_str_release, magic_ptr, ret_bb);
         LLVMValueRef magic_iptr = LLVMBuildBitCast(g->builder, magic_ptr, LLVMPointerType(i64t, 0), "magicip");
         LLVMValueRef magic = LLVMBuildLoad2(g->builder, i64t, magic_iptr, "magic");
-        LLVMValueRef has_magic = LLVMBuildICmp(g->builder, LLVMIntEQ, magic,
+        LLVMValueRef has_magic = zan_icmp(g->builder, LLVMIntEQ, magic,
             LLVMConstInt(i64t, ZAN_STRING_MAGIC, 0), "hasmagic");
         LLVMBasicBlockRef rel_bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_str_release, "release");
         LLVMBuildCondBr(g->builder, has_magic, rel_bb, ret_bb);
@@ -1515,15 +1560,15 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMValueRef rc_ptr = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx), obj, &neg16, 1, "rcptr");
         LLVMValueRef rc_iptr = LLVMBuildBitCast(g->builder, rc_ptr, LLVMPointerType(i64t, 0), "rciptr");
         LLVMValueRef rc = LLVMBuildLoad2(g->builder, i64t, rc_iptr, "rc");
-        LLVMValueRef is_sent = LLVMBuildICmp(g->builder, LLVMIntEQ, rc,
+        LLVMValueRef is_sent = zan_icmp(g->builder, LLVMIntEQ, rc,
             LLVMConstInt(i64t, ZAN_STRING_SENTINEL_RC, 0), "issent");
         LLVMBasicBlockRef dec_bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_str_release, "dec");
         LLVMBuildCondBr(g->builder, is_sent, ret_bb, dec_bb);
         LLVMPositionBuilderAtEnd(g->builder, dec_bb);
         LLVMValueRef rc_old = LLVMBuildAtomicRMW(g->builder, LLVMAtomicRMWBinOpSub, rc_iptr,
             LLVMConstInt(i64t, 1, 0), LLVMAtomicOrderingAcquireRelease, 0);
-        LLVMValueRef rc1 = LLVMBuildSub(g->builder, rc_old, LLVMConstInt(i64t, 1, 0), "rc1");
-        LLVMValueRef is_zero = LLVMBuildICmp(g->builder, LLVMIntEQ, rc1, LLVMConstInt(i64t, 0, 0), "iszero");
+        LLVMValueRef rc1 = zan_sub(g->builder, rc_old, LLVMConstInt(i64t, 1, 0), "rc1");
+        LLVMValueRef is_zero = zan_icmp(g->builder, LLVMIntEQ, rc1, LLVMConstInt(i64t, 0, 0), "iszero");
         LLVMBasicBlockRef free_bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_str_release, "dofree");
         LLVMBuildCondBr(g->builder, is_zero, free_bb, ret_bb);
         LLVMPositionBuilderAtEnd(g->builder, free_bb);
@@ -1533,7 +1578,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         zan_call2(g->builder, free_fn_type, g->fn_free, &header_ptr, 1, "");
         {
             LLVMValueRef lv = LLVMBuildLoad2(g->builder, i64t, g->g_live, "live");
-            LLVMValueRef lv1 = LLVMBuildSub(g->builder, lv, LLVMConstInt(i64t, 1, 0), "live_dec");
+            LLVMValueRef lv1 = zan_sub(g->builder, lv, LLVMConstInt(i64t, 1, 0), "live_dec");
             LLVMBuildStore(g->builder, lv1, g->g_live);
         }
         LLVMBuildBr(g->builder, ret_bb);

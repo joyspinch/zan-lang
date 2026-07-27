@@ -143,7 +143,7 @@ static void emit_list_release_elems(zan_irgen_t *g, zan_type_t *elem_type, LLVMV
     LLVMBasicBlockRef done = LLVMAppendBasicBlockInContext(c, fn, "lc.done");
     LLVMValueRef c8 = (LLVMTypeOf(col) == i8ptr) ? col
                       : LLVMBuildBitCast(b, col, i8ptr, "lc.c8");
-    LLVMValueRef isn = LLVMBuildICmp(b, LLVMIntEQ, c8, LLVMConstNull(i8ptr), "lc.isn");
+    LLVMValueRef isn = zan_icmp(b, LLVMIntEQ, c8, LLVMConstNull(i8ptr), "lc.isn");
     LLVMBuildCondBr(b, isn, done, chk);
     LLVMPositionBuilderAtEnd(b, chk);
     LLVMValueRef lp = LLVMBuildBitCast(b, c8, LLVMPointerType(g->list_struct_type, 0), "lp");
@@ -154,13 +154,13 @@ static void emit_list_release_elems(zan_irgen_t *g, zan_type_t *elem_type, LLVMV
     LLVMBuildBr(b, head);
     LLVMPositionBuilderAtEnd(b, head);
     LLVMValueRef iphi = LLVMBuildPhi(b, i64, "i");
-    LLVMValueRef lt = LLVMBuildICmp(b, LLVMIntSLT, iphi, cnt, "lt");
+    LLVMValueRef lt = zan_icmp(b, LLVMIntSLT, iphi, cnt, "lt");
     LLVMBuildCondBr(b, lt, body, done);
     LLVMPositionBuilderAtEnd(b, body);
     LLVMValueRef slot = LLVMBuildGEP2(b, i64, data, &iphi, 1, "slot");
     LLVMValueRef raw = LLVMBuildLoad2(b, i64, slot, "raw");
     emit_collection_release_raw_slot(g, elem_type, raw, i64);
-    LLVMValueRef inext = LLVMBuildAdd(b, iphi, LLVMConstInt(i64, 1, 0), "inext");
+    LLVMValueRef inext = zan_add(b, iphi, LLVMConstInt(i64, 1, 0), "inext");
     LLVMBasicBlockRef body_end = LLVMGetInsertBlock(b);
     LLVMBuildBr(b, head);
     LLVMValueRef vals[2] = { LLVMConstInt(i64, 0, 0), inext };
@@ -191,7 +191,7 @@ static void emit_dict_release_elems(zan_irgen_t *g, zan_type_t *dict_type, LLVMV
     LLVMBasicBlockRef done = LLVMAppendBasicBlockInContext(c, fn, "dc.done");
     LLVMValueRef c8 = (LLVMTypeOf(col) == i8ptr) ? col
                       : LLVMBuildBitCast(b, col, i8ptr, "dc.c8");
-    LLVMValueRef isn = LLVMBuildICmp(b, LLVMIntEQ, c8, LLVMConstNull(i8ptr), "dc.isn");
+    LLVMValueRef isn = zan_icmp(b, LLVMIntEQ, c8, LLVMConstNull(i8ptr), "dc.isn");
     LLVMBuildCondBr(b, isn, done, chk);
     LLVMPositionBuilderAtEnd(b, chk);
     LLVMValueRef dp = LLVMBuildBitCast(b, c8, LLVMPointerType(g->dict_struct_type, 0), "dp");
@@ -204,7 +204,7 @@ static void emit_dict_release_elems(zan_irgen_t *g, zan_type_t *dict_type, LLVMV
     LLVMBuildBr(b, head);
     LLVMPositionBuilderAtEnd(b, head);
     LLVMValueRef iphi = LLVMBuildPhi(b, i64, "i");
-    LLVMValueRef lt = LLVMBuildICmp(b, LLVMIntSLT, iphi, cnt, "lt");
+    LLVMValueRef lt = zan_icmp(b, LLVMIntSLT, iphi, cnt, "lt");
     LLVMBuildCondBr(b, lt, body, done);
     LLVMPositionBuilderAtEnd(b, body);
     if (krc) {
@@ -217,7 +217,7 @@ static void emit_dict_release_elems(zan_irgen_t *g, zan_type_t *dict_type, LLVMV
         LLVMValueRef vv = LLVMBuildLoad2(b, i64, vslot, "vv");
         emit_collection_release_raw_slot(g, vt, vv, i64);
     }
-    LLVMValueRef inext = LLVMBuildAdd(b, iphi, LLVMConstInt(i64, 1, 0), "inext");
+    LLVMValueRef inext = zan_add(b, iphi, LLVMConstInt(i64, 1, 0), "inext");
     LLVMBasicBlockRef body_end = LLVMGetInsertBlock(b);
     LLVMBuildBr(b, head);
     LLVMValueRef vals[2] = { LLVMConstInt(i64, 0, 0), inext };
@@ -246,7 +246,7 @@ static void emit_array_release_elems(zan_irgen_t *g, zan_type_t *elem_type,
     LLVMBasicBlockRef done = LLVMAppendBasicBlockInContext(c, fn, "ac.done");
     LLVMValueRef a8 = (LLVMTypeOf(arr) == i8ptr) ? arr
                       : LLVMBuildBitCast(b, arr, i8ptr, "ac.a8");
-    LLVMValueRef isn = LLVMBuildICmp(b, LLVMIntEQ, a8, LLVMConstNull(i8ptr), "ac.isn");
+    LLVMValueRef isn = zan_icmp(b, LLVMIntEQ, a8, LLVMConstNull(i8ptr), "ac.isn");
     LLVMBuildCondBr(b, isn, done, chk);
     LLVMPositionBuilderAtEnd(b, chk);
     LLVMValueRef typed = LLVMBuildBitCast(b, a8, LLVMPointerType(elem_llvm, 0), "ac.tp");
@@ -257,13 +257,13 @@ static void emit_array_release_elems(zan_irgen_t *g, zan_type_t *elem_type,
     LLVMBuildBr(b, head);
     LLVMPositionBuilderAtEnd(b, head);
     LLVMValueRef iphi = LLVMBuildPhi(b, i64, "i");
-    LLVMValueRef lt = LLVMBuildICmp(b, LLVMIntSLT, iphi, n, "ac.lt");
+    LLVMValueRef lt = zan_icmp(b, LLVMIntSLT, iphi, n, "ac.lt");
     LLVMBuildCondBr(b, lt, body, done);
     LLVMPositionBuilderAtEnd(b, body);
     LLVMValueRef slot = LLVMBuildGEP2(b, elem_llvm, typed, &iphi, 1, "ac.slot");
     LLVMValueRef elem = LLVMBuildLoad2(b, elem_llvm, slot, "ac.elem");
     emit_rc_release_for_type(g, elem_type, elem);
-    LLVMValueRef inext = LLVMBuildAdd(b, iphi, LLVMConstInt(i64, 1, 0), "ac.inext");
+    LLVMValueRef inext = zan_add(b, iphi, LLVMConstInt(i64, 1, 0), "ac.inext");
     LLVMBasicBlockRef body_end = LLVMGetInsertBlock(b);
     LLVMBuildBr(b, head);
     LLVMValueRef vals[2] = { LLVMConstInt(i64, 0, 0), inext };
@@ -290,14 +290,14 @@ static void build_class_release_body(zan_irgen_t *g, zan_symbol_t *sym,
     LLVMBasicBlockRef dorel = LLVMAppendBasicBlockInContext(c, fn, "dorel");
     LLVMBasicBlockRef ret   = LLVMAppendBasicBlockInContext(c, fn, "ret");
     LLVMPositionBuilderAtEnd(b, entry);
-    LLVMValueRef isnull = LLVMBuildICmp(b, LLVMIntEQ, obj, LLVMConstNull(i8ptr), "isnull");
+    LLVMValueRef isnull = zan_icmp(b, LLVMIntEQ, obj, LLVMConstNull(i8ptr), "isnull");
     LLVMBuildCondBr(b, isnull, ret, cont);
     LLVMPositionBuilderAtEnd(b, cont);
     LLVMValueRef neg16 = LLVMConstInt(i64, (unsigned long long)-16, 1);
     LLVMValueRef rcp = LLVMBuildGEP2(b, LLVMInt8TypeInContext(c), obj, &neg16, 1, "rcp");
     LLVMValueRef rcip = LLVMBuildBitCast(b, rcp, LLVMPointerType(i64, 0), "rcip");
     LLVMValueRef rc = LLVMBuildLoad2(b, i64, rcip, "rc");
-    LLVMValueRef is1 = LLVMBuildICmp(b, LLVMIntEQ, rc, LLVMConstInt(i64, 1, 0), "is1");
+    LLVMValueRef is1 = zan_icmp(b, LLVMIntEQ, rc, LLVMConstInt(i64, 1, 0), "is1");
     LLVMBuildCondBr(b, is1, relf, dorel);
     LLVMPositionBuilderAtEnd(b, relf);
     LLVMValueRef self = LLVMBuildBitCast(b, obj, LLVMPointerType(structT, 0), "self");
@@ -355,14 +355,14 @@ static void build_collection_release_body(zan_irgen_t *g, int coll_kind,
     LLVMBasicBlockRef dorel = LLVMAppendBasicBlockInContext(c, fn, "dorel");
     LLVMBasicBlockRef ret   = LLVMAppendBasicBlockInContext(c, fn, "ret");
     LLVMPositionBuilderAtEnd(b, entry);
-    LLVMValueRef isnull = LLVMBuildICmp(b, LLVMIntEQ, obj, LLVMConstNull(i8ptr), "isnull");
+    LLVMValueRef isnull = zan_icmp(b, LLVMIntEQ, obj, LLVMConstNull(i8ptr), "isnull");
     LLVMBuildCondBr(b, isnull, ret, cont);
     LLVMPositionBuilderAtEnd(b, cont);
     LLVMValueRef neg16 = LLVMConstInt(i64, (unsigned long long)-16, 1);
     LLVMValueRef rcp = LLVMBuildGEP2(b, LLVMInt8TypeInContext(c), obj, &neg16, 1, "rcp");
     LLVMValueRef rcip = LLVMBuildBitCast(b, rcp, LLVMPointerType(i64, 0), "rcip");
     LLVMValueRef rc = LLVMBuildLoad2(b, i64, rcip, "rc");
-    LLVMValueRef is1 = LLVMBuildICmp(b, LLVMIntEQ, rc, LLVMConstInt(i64, 1, 0), "is1");
+    LLVMValueRef is1 = zan_icmp(b, LLVMIntEQ, rc, LLVMConstInt(i64, 1, 0), "is1");
     LLVMBuildCondBr(b, is1, relf, dorel);
     LLVMPositionBuilderAtEnd(b, relf);
     LLVMTypeRef free_ty = LLVMFunctionType(LLVMVoidTypeInContext(c), &i8ptr, 1, 0);
