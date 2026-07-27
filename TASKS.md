@@ -680,6 +680,14 @@ catch 块内的挂起、foreach 的降级与状态切分冲突。所以是**定�
 
 ## B3 提炼：消除结构性重复
 
+* **B3-0 ✅ 已完成（2026-07-27）驱动的失败语句改为抛 `DbException`**。
+  此前服务端拒绝的语句返回一个空 `DbResult`、把原因留在 `GetError()` 里，
+  调用方忘了检查就会拿着"从来不存在的行"继续跑。现在 Firebird / MySQL /
+  Postgres / SQL Server / ZanDb 一律抛 `DbException`，带驱动自己的错误号和
+  `DbProvider` id（handler 不必解析消息就能判断是哪个驱动），`GetError()`
+  仍然报告最后一次失败。`DbProvider.Unknown` 表示"根本没到服务端"的失败。
+  回归：`firebird_wire` / `sqlserver_tds` 已改为断言抛出。
+
 * **B3-1** **7 个连接池**（`DbPool` / `FirebirdPool` / `MySqlPool` / `PgPool` /
   `SqlitePool` / `SqlServerPool` / `TDenginePool`，合计 39KB）逻辑完全一致：
   懒增长到 maxSize、`Gate` 事件驱动等待、死连接剔除。字段一模一样
