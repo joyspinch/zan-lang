@@ -321,14 +321,28 @@ operand type of return inst!
   **仍未覆盖的边界**（不要当已完成）：实例方法和 async 泛型方法的单态化尚未实现，
   这类体现在是明确报错而不是编译成垃圾；B3-1 的 `DbPool<TConn>` 若需要
   **实例**泛型方法，得先把 spec 扩展到带 `this` 的形态。
-* **A7-2** C# 语法缺口：泛型类型上的静态成员访问无法解析。
-  `Box<int>.Create(7)` 报 `unexpected token 'int' in expression`。C# 里这是合法的。
-* **A7-3** 原文档第 7 条（泛型累加器重新赋值泄漏）尚未单独验证。
-* **A7-4**〔新，2026-07-27 实测〕C# 语法缺口：**`if`/`else`/`while` 不支持不带花括号的
-  单语句体**。`if (v == 1) P(2);`、`if (v == 1) v = 3; else v = 4;`、`while (v < 5) v = v + 1;`
-  一律报 `expected '{', got 'IDENT'`。C# 里全部合法，而且是极常见写法；
-  现在全库被迫写花括号，等于语法没对齐。修 parser 的 `if`/`else`/`while`/`for`/`foreach`
-  语句体解析：接受任意单语句，不只是 block。
+* **A7-2 ✅ 已修**（构造类型上的静态成员访问）。`Box<int>.Create(7)` /
+  `Pair<int, string>.Of(3, "three")` / `Counter<double>.Twice(21)` 现在都解析并
+  绑定到对应实例化。回归：`tests/conformance/generic_static_member_access.zan`
+  （conformance / determinism / leakcheck 三份全绿）。
+* **A7-3 ⚠️ 已验证，但结论变了**（2026-07-27 复验，`_scratch/pc.zan`）。
+  泛型累加器**本身**不漏：`Acc<string>` 在循环里反复 `Set()` 输出正确、
+  `--check-leaks` 干净；`string acc = acc + x` 的自累加也干净。
+  但复验时撞到一个更严重的问题，见 **A7-5**：`T` 绑定到**引用类型**时，
+  泛型字段的读取根本不对（不是泄漏，是取值错误 / 堆损坏）。
+* **A7-4 ✅ 已修**（不带花括号的单语句体）。`if`/`else`/`while`/`for`/`foreach`/`do`
+  的语句体现在走 `parse_embedded_stmt()`：接受任意单语句，并按 C# 的作用域语义包一层
+  block；和 C# 一样，声明不能当嵌入语句（CS1023），会给出"用花括号括起来"的报错。
+  回归：`tests/conformance/stmt_braceless_bodies.zan`（含 `else` 悬挂、`for`/`foreach`
+  单语句体、单语句体里的 `break`/`continue`、以及单语句体里的 `await`）。
+* **A7-5**〔新，2026-07-27 实测〕**泛型类的字段在 `T` 绑定引用类型时读不对**。
+  `_scratch/pd.zan`：`class Acc<T> { T cur; void Set(T v){this.cur=v;} T Get(){return this.cur;} }`
+  * `Acc<string>`：正确。
+  * `Acc<Node>`（`Node` 是 class）：`a.cur` 直接堆损坏退出（`0xC0000374`）；
+    只走 `a.Get().tag` 时不崩，但打印 `0`——引用被当成整数用了。
+  * `Acc<List<string>>`：`l.Get().Count` 打印 `0`。
+  这正是 A7-1 结尾列的"仍未覆盖的边界"（实例泛型方法的单态化）在**字段**上的表现，
+  而且不是"明确报错"而是静默错值/崩溃。**阻塞 B3-1**（`DbPool<TConn>` 的字段就是 `TConn`）。
 
 ## A8 ARC / 异常 / 协程交互 〔**已实测，三份 repro 全部仍成立**，2026-07-27〕
 
@@ -767,7 +781,7 @@ header-only 库 / C 回调 / 结构体字段偏移，全部对应 A2 / A3 / A4�
 | 批次 | 内容 | 为什么排这里 |
 |---|---|---|
 | **0** | ~~A8-1~~ ✅ / ~~A8-2~~ ✅ / ~~A8-3~~ ✅ / ~~A8-4~~ ✅ / ~~A8-12~~ ✅ / ~~A8-13~~ ✅ / ~~A8-14~~ ✅ / ~~A8-15~~ ✅（catch 内再抛跳错 handler、抛出点双重释放、被放弃 handler 泄漏异常、异常落地用帧覆盖栈槽、表达式里的 await 被当 `int`；+ 顺带修掉 A8-8 foreach break/continue、A8-9 `var`+await 类型、A8-10 测试重复编译） | **三份 repro 全部实测仍成立，两个比文档记的更严重**。ARC 与异常/协程交互不可靠 ⇒ 任何 Zan 上层代码都不可信，而"上层全用 Zan"是整个计划的地基 |
-| **0.5** | **A7-1**（修约束接口方法调用的 codegen 崩溃）+ A7-2 | 已实测复现且已定位；阻塞 B3-1；不依赖其他任何项 |
+| **0.5** | ~~**A7-1**~~ ✅（修约束接口方法调用的 codegen 崩溃）/ ~~A7-2~~ ✅（构造类型的静态成员访问）/ ~~A7-4~~ ✅（无花括号单语句体）；**A7-5** 待修（泛型字段在 `T` 为引用类型时取值错误/堆损坏） | 已实测复现且已定位；A7-5 阻塞 B3-1；不依赖其他任何项 |
 | **1** | ~~**A0-0**（句柄型 extern 改 `nint`）~~ ✅ 已完成（330 处 / 26 文件，553/553）；**A0-0c**（socket 句柄统一 `nint`）已完成（562/562，窄化警告 51 → 0）、**A0-0d** 句柄部分已完成（`rt_io` → `intptr_t`，`zan_gui_*` 句柄 → `iptr`；位宽部分并入 A0-1/A0-2）；余下 C4 / C5 / C7（删残桩、提交游离文档、游戏计划归到项目文档层） | A0-0 在 int 还是 64 位时零语义变化，是切 int=32 的安全前置。清理放这里而不是更早：`ABI.md` 这类失真文档在 A2 落地前仍是唯一的目标 ABI 参照，**先实现、后按实现重写文档**，不要先清场 |
 | **2** | **A0-1 / A0-2 / A0-3**（int=32 + FFI 位宽 + 结构体布局） | 一切 FFI 和编解码工作的前置 |
 | **3** | **A1** `Span<T>` + **B2**（用它清掉 49 处 calloc-as-string） | 能力与清理配对落地 |
