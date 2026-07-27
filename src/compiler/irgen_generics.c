@@ -826,8 +826,8 @@ static void coerce_int_pair(zan_irgen_t *g, LLVMValueRef *a, LLVMValueRef *b) {
         LLVMGetTypeKind(tb) != LLVMIntegerTypeKind) return;
     unsigned wa = LLVMGetIntTypeWidth(ta), wb = LLVMGetIntTypeWidth(tb);
     if (wa == wb) return;
-    if (wa < wb) *a = LLVMBuildSExt(g->builder, *a, tb, "iext");
-    else         *b = LLVMBuildSExt(g->builder, *b, ta, "iext");
+    if (wa < wb) *a = zan_iwiden(g->builder, *a, tb);
+    else         *b = zan_iwiden(g->builder, *b, ta);
 }
 
 /* Normalize an integer value to a target integer type before storing it into a
@@ -840,7 +840,7 @@ static LLVMValueRef coerce_int_to(zan_irgen_t *g, LLVMValueRef v, LLVMTypeRef ta
         LLVMGetTypeKind(target) != LLVMIntegerTypeKind) return v;
     unsigned wv = LLVMGetIntTypeWidth(vt), wt = LLVMGetIntTypeWidth(target);
     if (wv == wt) return v;
-    if (wv < wt) return LLVMBuildSExt(g->builder, v, target, "sext");
+    if (wv < wt) return zan_iwiden(g->builder, v, target);
     return LLVMBuildTrunc(g->builder, v, target, "trunc");
 }
 
@@ -870,17 +870,16 @@ static LLVMValueRef zan_store_fit(zan_irgen_t *g, LLVMValueRef val, LLVMValueRef
     return LLVMBuildStore(g->builder, val, ptr);
 }
 
-/* Widen a narrow integer to i64 for numeric formatting/printing. Signed
- * integers are sign-extended, but i1 (bool) is zero-extended so that `true`
- * formats as 1 rather than -1 (sext of an i1 set to 1 yields all-ones). */
+/* Widen a narrow integer to i64 for numeric formatting/printing: the narrow
+ * widths are the unsigned ones, so `true` formats as 1 and a byte of 255 as
+ * 255 rather than as -1. */
 static LLVMValueRef emit_widen_i64_for_print(zan_irgen_t *g, LLVMValueRef v) {
     LLVMTypeRef vt = LLVMTypeOf(v);
     if (LLVMGetTypeKind(vt) != LLVMIntegerTypeKind) return v;
     unsigned w = LLVMGetIntTypeWidth(vt);
     if (w >= 64) return v;
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
-    if (w == 1) return LLVMBuildZExt(g->builder, v, i64, "bext");
-    return LLVMBuildSExt(g->builder, v, i64, "ext");
+    return zan_iwiden(g->builder, v, i64);
 }
 
 static LLVMValueRef emit_string_alloc_rc(zan_irgen_t *g, LLVMValueRef payload_size) {

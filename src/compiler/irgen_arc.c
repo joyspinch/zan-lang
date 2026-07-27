@@ -588,7 +588,7 @@ static LLVMValueRef emit_boundary_coerce(zan_irgen_t *g, LLVMValueRef v,
             return LLVMBuildBitCast(g->builder, v, target, "bc.pp");
         if (vk == LLVMIntegerTypeKind) {
             if (LLVMGetIntTypeWidth(vt) < 64)
-                v = LLVMBuildSExt(g->builder, v, i64, "bc.ext");
+                v = zan_iwiden(g->builder, v, i64);
             return LLVMBuildIntToPtr(g->builder, v, target, "bc.ip");
         }
         if (vk == LLVMFloatTypeKind) {

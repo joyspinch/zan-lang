@@ -21,14 +21,35 @@
  * offset). LLVM rejects that, and dozens of lowering sites would each have to
  * extend by hand. These wrappers sign-extend the narrower operand to the wider
  * one first and are otherwise the LLVM builders; irgen calls them instead. */
+/* Widen an integer, choosing the extension its Zan type calls for. Of the
+ * narrow LLVM widths only i1 (`bool`) and i8 (`byte`) occur, and both are
+ * unsigned -- `sbyte` and `short` are wider in this lowering -- so anything
+ * up to a byte zero-extends. Sign-extending a byte is what made `byte b =
+ * 255` read back as -1. */
+static LLVMValueRef zan_iwiden(LLVMBuilderRef b, LLVMValueRef v, LLVMTypeRef to) {
+    LLVMTypeRef vt = LLVMTypeOf(v);
+    if (LLVMGetTypeKind(vt) != LLVMIntegerTypeKind) return v;
+    return LLVMGetIntTypeWidth(vt) <= 8 ? LLVMBuildZExt(b, v, to, "zx")
+                                        : LLVMBuildSExt(b, v, to, "wx");
+}
+
 static void zan_ipair(LLVMBuilderRef b, LLVMValueRef *l, LLVMValueRef *r) {
     LLVMTypeRef tl = LLVMTypeOf(*l), tr = LLVMTypeOf(*r);
     if (LLVMGetTypeKind(tl) != LLVMIntegerTypeKind ||
         LLVMGetTypeKind(tr) != LLVMIntegerTypeKind) return;
     unsigned wl = LLVMGetIntTypeWidth(tl), wr = LLVMGetIntTypeWidth(tr);
-    if (wl == wr) return;
-    if (wl < wr) *l = LLVMBuildSExt(b, *l, tr, "wx");
-    else         *r = LLVMBuildSExt(b, *r, tl, "wx");
+    if (wl == wr) {
+        /* C# promotes byte operands to int before arithmetic, so `b + 1`
+         * with b = 255 is 256 and not a wrapped 0. */
+        if (wl == 8) {
+            LLVMTypeRef i64 = LLVMInt64TypeInContext(LLVMGetTypeContext(tl));
+            *l = LLVMBuildZExt(b, *l, i64, "zx");
+            *r = LLVMBuildZExt(b, *r, i64, "zx");
+        }
+        return;
+    }
+    if (wl < wr) *l = zan_iwiden(b, *l, tr);
+    else         *r = zan_iwiden(b, *r, tl);
 }
 
 #define ZAN_IBIN(name, builder)                                              \

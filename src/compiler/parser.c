@@ -229,6 +229,11 @@ static uint32_t parse_modifiers(zan_parser_t *p) {
         case TK_ABSTRACT:  parser_advance(p); mods |= MOD_ABSTRACT;  break;
         case TK_SEALED:    parser_advance(p); mods |= MOD_SEALED;    break;
         case TK_READONLY:  parser_advance(p); mods |= MOD_READONLY;  break;
+        /* C# `const` on a member is an implicitly static, never-assigned
+         * field; the compiler has no separate constant storage class, so it
+         * lowers to `static readonly`. */
+        case TK_CONST:     parser_advance(p);
+                           mods |= MOD_STATIC | MOD_READONLY; break;
         case TK_EXTERN:    parser_advance(p); mods |= MOD_EXTERN;    break;
         case TK_ASYNC:     parser_advance(p); mods |= MOD_ASYNC;     break;
         case TK_UNSAFE:    parser_advance(p); mods |= MOD_UNSAFE;    break;
@@ -597,6 +602,7 @@ static zan_ast_node_t *parse_primary(zan_parser_t *p) {
         n->new_expr.type = type;
         zan_ast_list_init(&n->new_expr.args);
         n->new_expr.is_array = false;
+        n->new_expr.array_init = false;
 
         /* array creation: new Type[size] */
         if (parser_check(p, TK_LBRACKET) && !type->type_ref.is_array) {
@@ -618,6 +624,13 @@ static zan_ast_node_t *parse_primary(zan_parser_t *p) {
          * A braced element `{ k, v }` is a dictionary initializer entry; its
          * inner expressions are flattened into args as consecutive key/value
          * pairs and consumed pairwise by the Dict lowering. */
+        if (parser_check(p, TK_LBRACE) && type->kind == AST_TYPE_REF &&
+            type->type_ref.is_array && !n->new_expr.is_array) {
+            /* new T[] { a, b, c }: the braces hold the elements and the
+             * length is how many there are. */
+            n->new_expr.is_array = true;
+            n->new_expr.array_init = true;
+        }
         if (parser_match(p, TK_LBRACE)) {
             while (!parser_check(p, TK_RBRACE) && !parser_check(p, TK_EOF)) {
                 if (parser_match(p, TK_LBRACE)) {

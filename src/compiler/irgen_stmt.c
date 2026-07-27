@@ -402,6 +402,16 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             stmt->var_decl.initializer->kind == AST_NEW_EXPR &&
             stmt->var_decl.initializer->new_expr.is_array &&
             stmt->var_decl.initializer->new_expr.args.count > 0) {
+            if (stmt->var_decl.initializer->new_expr.array_init) {
+                /* new T[] { ... }: the length is the element count. */
+                LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
+                LLVMValueRef lslot = emit_entry_alloca(g, i64t, "arr.lenslot3");
+                zan_store_fit(g, LLVMConstInt(i64t,
+                    (unsigned long long)stmt->var_decl.initializer->new_expr.args.count, 0),
+                    lslot);
+                locals->vars[locals->count - 1].arr_len_slot = lslot;
+                break;
+            }
             zan_ast_node_t *sz = stmt->var_decl.initializer->new_expr.args.items[0];
             if (sz->kind == AST_INT_LITERAL || sz->kind == AST_IDENTIFIER) {
                 LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
@@ -1262,6 +1272,37 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         if (!elem_type) elem_type = g->binder->type_int;
         LLVMTypeRef elem_llvm = map_type(g, elem_type);
 
+        /* How the collection is laid out. A List has a count and a data
+         * pointer; an array is a bare buffer whose length was captured where
+         * it was declared; a string is NUL-terminated bytes. foreach used to
+         * read every one of them as a List, so iterating an array or a string
+         * loaded a count and a data pointer out of unrelated memory and the
+         * program died on the first element. */
+        zan_type_t *col_type = infer_expr_type(g, stmt->foreach_stmt.collection, locals);
+        bool fe_array = col_type && col_type->kind == TYPE_ARRAY;
+        bool fe_string = col_type && col_type->kind == TYPE_STRING;
+        LLVMValueRef fe_len = NULL;
+        if (fe_array) {
+            if (stmt->foreach_stmt.collection->kind == AST_IDENTIFIER) {
+                local_var_t *al = local_find(locals,
+                    stmt->foreach_stmt.collection->ident.name);
+                if (al && al->arr_len_slot)
+                    fe_len = LLVMBuildLoad2(g->builder, i64, al->arr_len_slot, "fe.alen");
+            }
+            if (!fe_len) {
+                zan_diag_emit(g->diag, DIAG_ERROR, stmt->loc,
+                    "cannot foreach over this array: its length is only known "
+                    "where it was declared (iterate with an index, or use "
+                    "List<T>)");
+                fe_len = LLVMConstInt(i64, 0, 0);
+            }
+        } else if (fe_string) {
+            LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+            LLVMTypeRef slt = LLVMFunctionType(i64, (LLVMTypeRef[]){ i8ptr }, 1, 0);
+            LLVMValueRef sp = LLVMBuildBitCast(g->builder, collection, i8ptr, "fe.sp");
+            fe_len = zan_call2(g->builder, slt, g->fn_strlen, &sp, 1, "fe.slen");
+        }
+
         /* Iteration state (element, index, collection) of a `foreach` in an
          * async body lives in the heap frame: an await in the loop body
          * re-enters at a block the pre-header never runs, so values computed
@@ -1331,9 +1372,14 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                       col_slot, "fe.col"),
                   list_ptr_ty, "fe.colc")
             : collection;
-        LLVMValueRef cnt_ptr = LLVMBuildStructGEP2(g->builder, g->list_struct_type,
-            col_cond, 0, "cnt_ptr");
-        LLVMValueRef count = LLVMBuildLoad2(g->builder, i64, cnt_ptr, "cnt");
+        LLVMValueRef count;
+        if (fe_array || fe_string) {
+            count = fe_len;
+        } else {
+            LLVMValueRef cnt_ptr = LLVMBuildStructGEP2(g->builder, g->list_struct_type,
+                col_cond, 0, "cnt_ptr");
+            count = LLVMBuildLoad2(g->builder, i64, cnt_ptr, "cnt");
+        }
         LLVMValueRef idx_val = LLVMBuildLoad2(g->builder, i64, idx_alloc, "i");
         LLVMValueRef cmp = zan_icmp(g->builder, LLVMIntSLT, idx_val, count, "fcmp");
         LLVMBuildCondBr(g->builder, cmp, body_bb, end_bb);
@@ -1347,6 +1393,36 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                       col_slot, "fe.col"),
                   list_ptr_ty, "fe.colb")
             : collection;
+        if (fe_array || fe_string) {
+            LLVMValueRef ai = LLVMBuildLoad2(g->builder, i64, idx_alloc, "ib");
+            LLVMTypeRef slot_ty = fe_string
+                ? LLVMInt8TypeInContext(g->ctx) : elem_llvm;
+            LLVMValueRef ep = LLVMBuildGEP2(g->builder, slot_ty, col_body, &ai, 1, "aep");
+            LLVMValueRef av = LLVMBuildLoad2(g->builder, slot_ty, ep, "aelem");
+            if (fe_string && slot_ty != elem_llvm)
+                av = zan_iwiden(g->builder, av, elem_llvm);
+            zan_store_fit(g, av, iter_alloc);
+
+            emit_stmt(g, stmt->foreach_stmt.body, locals);
+            emit_release_owned_locals_from(g, locals, fe_start);
+            if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder)))
+                LLVMBuildBr(g->builder, step_bb);
+
+            LLVMPositionBuilderAtEnd(g->builder, step_bb);
+            zan_store_fit(g, zan_add(g->builder,
+                LLVMBuildLoad2(g->builder, i64, idx_alloc, "i2"),
+                LLVMConstInt(i64, 1, 0), "next"), idx_alloc);
+            LLVMBuildBr(g->builder, cond_bb);
+
+            g->break_target = fe_saved_break;
+            g->continue_target = fe_saved_cont;
+            g->loop_locals_base = fe_saved_loop_base;
+            g->loop_catch_base = fe_saved_loop_cbase;
+            LLVMPositionBuilderAtEnd(g->builder, end_bb);
+            emit_release_owned_call_temp(g, stmt->foreach_stmt.collection,
+                                         collection, locals);
+            break;
+        }
         LLVMValueRef data_ptr = LLVMBuildStructGEP2(g->builder, g->list_struct_type,
             col_body, 2, "data_ptr");
         LLVMValueRef data = LLVMBuildLoad2(g->builder, LLVMPointerType(i64, 0),

@@ -411,7 +411,8 @@ static LLVMValueRef emit_expr_binary(zan_irgen_t *g, zan_ast_node_t *expr,
              * so an op_eq body can null-check without recursing into itself */
             int null_cmp = expr->binary.left->kind == AST_NULL_LITERAL ||
                            expr->binary.right->kind == AST_NULL_LITERAL;
-            if (!null_cmp && ltype && ltype->kind == TYPE_CLASS && ltype->sym) {
+            if (!null_cmp && ltype && ltype->sym &&
+                (ltype->kind == TYPE_CLASS || ltype->kind == TYPE_STRUCT)) {
                 const char *op_name = NULL;
                 switch (expr->binary.op) {
                 case TK_PLUS:       op_name = "op_add"; break;
@@ -443,6 +444,36 @@ static LLVMValueRef emit_expr_binary(zan_irgen_t *g, zan_ast_node_t *expr,
                     }
                 }
             }
+        }
+
+        /* Two structs compare memberwise, like a C# value type without a
+         * user-defined operator: LLVM has no icmp for aggregates, so the
+         * fields are compared one by one and the results and-ed. */
+        if ((expr->binary.op == TK_EQ_EQ || expr->binary.op == TK_BANG_EQ) &&
+            LLVMGetTypeKind(LLVMTypeOf(left)) == LLVMStructTypeKind &&
+            LLVMTypeOf(left) == LLVMTypeOf(right)) {
+            LLVMTypeRef st = LLVMTypeOf(left);
+            unsigned nf = LLVMCountStructElementTypes(st);
+            LLVMValueRef acc = LLVMConstInt(LLVMInt1TypeInContext(g->ctx), 1, 0);
+            for (unsigned fi = 0; fi < nf; fi++) {
+                LLVMValueRef lf = LLVMBuildExtractValue(g->builder, left, fi, "sq.l");
+                LLVMValueRef rf = LLVMBuildExtractValue(g->builder, right, fi, "sq.r");
+                LLVMTypeKind fk = LLVMGetTypeKind(LLVMTypeOf(lf));
+                LLVMValueRef eq;
+                if (fk == LLVMDoubleTypeKind || fk == LLVMFloatTypeKind)
+                    eq = LLVMBuildFCmp(g->builder, LLVMRealOEQ, lf, rf, "sq.f");
+                else if (fk == LLVMPointerTypeKind)
+                    eq = LLVMBuildICmp(g->builder, LLVMIntEQ,
+                        LLVMBuildPtrToInt(g->builder, lf, LLVMInt64TypeInContext(g->ctx), "sq.lp"),
+                        LLVMBuildPtrToInt(g->builder, rf, LLVMInt64TypeInContext(g->ctx), "sq.rp"),
+                        "sq.p");
+                else
+                    eq = zan_icmp(g->builder, LLVMIntEQ, lf, rf, "sq.i");
+                acc = LLVMBuildAnd(g->builder, acc, eq, "sq.and");
+            }
+            if (expr->binary.op == TK_BANG_EQ)
+                acc = LLVMBuildNot(g->builder, acc, "sq.not");
+            return acc;
         }
 
         bool both_ptr =
@@ -1237,9 +1268,11 @@ binding_lowered:
                             } else if (slot_k == LLVMIntegerTypeKind) {
                                 if (val_k == LLVMPointerTypeKind) {
                                     stored = LLVMBuildPtrToInt(g->builder, stored, elem_llvm, "slot.pi");
-                                } else if (val_k == LLVMIntegerTypeKind &&
-                                           LLVMGetIntTypeWidth(LLVMTypeOf(stored)) < 64) {
-                                    stored = LLVMBuildSExt(g->builder, stored, elem_llvm, "slot.sx");
+                                } else if (val_k == LLVMIntegerTypeKind) {
+                                    /* fit the value to the element width in
+                                     * both directions: an i64 into a byte
+                                     * slot used to write over its neighbours */
+                                    stored = coerce_int_to(g, stored, elem_llvm);
                                 }
                             }
                             zan_store_fit(g, stored, elem_ptr);
@@ -1305,9 +1338,11 @@ binding_lowered:
                             } else if (slot_k == LLVMIntegerTypeKind) {
                                 if (val_k == LLVMPointerTypeKind) {
                                     stored = LLVMBuildPtrToInt(g->builder, stored, elem_llvm, "slot.pi");
-                                } else if (val_k == LLVMIntegerTypeKind &&
-                                           LLVMGetIntTypeWidth(LLVMTypeOf(stored)) < 64) {
-                                    stored = LLVMBuildSExt(g->builder, stored, elem_llvm, "slot.sx");
+                                } else if (val_k == LLVMIntegerTypeKind) {
+                                    /* fit the value to the element width in
+                                     * both directions: an i64 into a byte
+                                     * slot used to write over its neighbours */
+                                    stored = coerce_int_to(g, stored, elem_llvm);
                                 }
                             }
                             zan_store_fit(g, stored, elem_ptr);
@@ -1375,9 +1410,11 @@ binding_lowered:
                             } else if (slot_k == LLVMIntegerTypeKind) {
                                 if (val_k == LLVMPointerTypeKind) {
                                     stored = LLVMBuildPtrToInt(g->builder, stored, elem_llvm, "slot.pi");
-                                } else if (val_k == LLVMIntegerTypeKind &&
-                                           LLVMGetIntTypeWidth(LLVMTypeOf(stored)) < 64) {
-                                    stored = LLVMBuildSExt(g->builder, stored, elem_llvm, "slot.sx");
+                                } else if (val_k == LLVMIntegerTypeKind) {
+                                    /* fit the value to the element width in
+                                     * both directions: an i64 into a byte
+                                     * slot used to write over its neighbours */
+                                    stored = coerce_int_to(g, stored, elem_llvm);
                                 }
                             }
                             zan_store_fit(g, stored, elem_ptr);
@@ -2377,6 +2414,42 @@ static LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
             }
         }
 
+        /* new Type[] { a, b, c } — the braces hold the elements, so the
+         * buffer is as long as the element list and each one is stored into
+         * it. Without this the node fell through to the class path below and
+         * produced a pointer to nothing. */
+        if (expr->new_expr.is_array && expr->new_expr.array_init) {
+            /* the type node is written `T[]` here, so it resolves to the
+             * array type; the elements are of its element type */
+            zan_type_t *elem_type = resolve_type_ctx(g, expr->new_expr.type);
+            if (elem_type && elem_type->kind == TYPE_ARRAY && elem_type->element_type)
+                elem_type = elem_type->element_type;
+            if (!elem_type) elem_type = g->binder->type_int;
+            LLVMTypeRef elem_llvm = map_type(g, elem_type);
+            LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
+            LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+            int n = expr->new_expr.args.count;
+            LLVMValueRef total = zan_mul(g->builder,
+                LLVMConstInt(i64t, (unsigned long long)n, 0),
+                LLVMSizeOf(elem_llvm), "total");
+            LLVMValueRef arr = zan_call2(g->builder,
+                LLVMFunctionType(i8ptr,
+                    (LLVMTypeRef[]){ i64t, i64t }, 2, 0),
+                get_calloc_fn(g),
+                (LLVMValueRef[]){ total, LLVMConstInt(i64t, 1, 0) }, 2, "arr");
+            for (int k = 0; k < n; k++) {
+                LLVMValueRef v = emit_arg_typed(g, expr->new_expr.args.items[k],
+                                                elem_type, locals);
+                LLVMValueRef idx = LLVMConstInt(i64t, (unsigned long long)k, 0);
+                LLVMValueRef slot = LLVMBuildGEP2(g->builder, elem_llvm, arr,
+                                                  &idx, 1, "aep");
+                /* fit the value to the element width: storing an i64 into a
+                 * byte slot would write over the elements after it */
+                LLVMBuildStore(g->builder, emit_boundary_coerce(g, v, elem_llvm), slot);
+            }
+            return arr;
+        }
+
         /* new Type[size] — array creation */
         if (expr->new_expr.is_array && expr->new_expr.args.count > 0) {
             zan_type_t *elem_type = resolve_type_ctx(g, expr->new_expr.type);
@@ -3084,7 +3157,7 @@ static LLVMValueRef emit_expr_cast_expr(zan_irgen_t *g, zan_ast_node_t *expr,
             unsigned sw = LLVMGetIntTypeWidth(src);
             unsigned tw = LLVMGetIntTypeWidth(target);
             if (tw < sw) return LLVMBuildTrunc(g->builder, val, target, "cast");
-            if (tw > sw) return LLVMBuildSExt(g->builder, val, target, "cast");
+            if (tw > sw) return zan_iwiden(g->builder, val, target);
             return val;
         }
         if (src_fp && tk == LLVMIntegerTypeKind)

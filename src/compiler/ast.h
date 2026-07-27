@@ -185,6 +185,7 @@ struct zan_ast_node {
             zan_ast_node_t *type;
             zan_ast_list_t args;
             bool is_array;       /* new Type[size] */
+            bool array_init;     /* new Type[] { a, b } -- args are elements */
         } new_expr;
 
         /* cast: (Type)expr */
