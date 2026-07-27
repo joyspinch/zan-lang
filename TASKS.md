@@ -137,7 +137,25 @@
     `long`**（ByteBuffer 的 U64 系列、ZanDb 页 id/偏移、文件偏移、时间戳），
     再同一批切 map_type + 383 处 C 签名 + 重新生成 `golden_structs_ir`
     （IR 里 `int` 字段会从 i64 变 i32，golden 必须一起更新）。
-    `gui_css` / `gui_datatable` 在 i32 下也失败，尚未定位。
+    `gui_css` / `gui_datatable` 在 i32 下也失败，已定位（见下）。
+
+  **第二轮实测（2026-07-27，i32 临时切换）**：
+  * 标准库非 ZanDb 的 64 位量已改 `long` 并提交（`818cac5`）：ByteBuffer 的
+    U64/VarInt、NativeMemory 的 GetI64/SetI64、DateTime.epoch（顺带 Y2038）、
+    TimeSpan.total、WebView2 事件 token、Win32Shell 的性能计数器。
+    切 i32 后 `conformance_native_memory` 已通过。
+  * **不定宽存储是 i32 下的堆破坏源**：不透明指针让宽度不匹配的 store 逃过
+    verifier，`obj.field = 2` 会对 4 字节字段发 `store i64 2`，多写 4 字节。
+    两个 int 字段的类一释放就破坏堆（`DataTableState.Create()` 直接崩）。
+    已修：irgen 的 store 统一走 `zan_store_fit`（`9189e7b`），i64 下是恒等。
+  * **`gui_css` 剩余失败是语义问题，不是 bug**：ARGB 颜色存在 `int` 里，
+    i32 下 `0xFF282830` 变成负数（golden 写的是 4280296496）。
+    两条路：颜色改 `uint`（Gui 下 287 处声明，混色代码的移位语义要一起过），
+    或按 .NET `Color.ToArgb()` 的做法保留 `int`（负值）并更新 golden。
+    **待定，需要决定。**
+  * `gui_datatable` 在 store 修复后从第 10 行推进到第 333 行，剩余崩溃点
+    （`UndoDepth` / `Undo` 附近）尚未复现出最小用例。
+  * 当前仓库状态：`map_type` 仍是 i64，383 处 C 签名改动未提交。
 
 * **A0-2** FFI 边界按声明类型的真实位宽 lower。现在 `map_type`（`irgen.c:1601`）对
   `int`/`uint`/`long`/`nint` 一律给 i64，于是：传参时把 64 位塞给期望 32 位的 C 函数；
