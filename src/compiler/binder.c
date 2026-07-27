@@ -140,8 +140,8 @@ zan_type_t *zan_binder_make_list_type(zan_binder_t *b, zan_type_t *elem) {
 
 /* Substitute type parameters (matched by declared name in `tps`) with `args`
  * throughout `t`, cloning composite types as needed. */
-static zan_type_t *subst_named_tp(zan_binder_t *b, zan_type_t *t,
-                                  zan_ast_list_t *tps, zan_type_t **args) {
+zan_type_t *zan_binder_subst_named(zan_binder_t *b, zan_type_t *t,
+                                   zan_ast_list_t *tps, zan_type_t **args) {
     if (!t) return t;
     if (t->kind == TYPE_TYPE_PARAM) {
         for (int i = 0; i < tps->count; i++) {
@@ -161,24 +161,24 @@ static zan_type_t *subst_named_tp(zan_binder_t *b, zan_type_t *t,
     zan_type_t *nt = (zan_type_t *)zan_arena_alloc(b->arena, sizeof(zan_type_t));
     *nt = *t;
     if (t->kind == TYPE_ARRAY || t->kind == TYPE_NULLABLE) {
-        nt->element_type = subst_named_tp(b, t->element_type, tps, args);
+        nt->element_type = zan_binder_subst_named(b, t->element_type, tps, args);
         return nt;
     }
     if (t->kind == TYPE_DELEGATE) {
-        nt->delegate_ret_type = subst_named_tp(b, t->delegate_ret_type, tps, args);
+        nt->delegate_ret_type = zan_binder_subst_named(b, t->delegate_ret_type, tps, args);
         if (t->delegate_param_count > 0) {
             nt->delegate_param_types = (zan_type_t **)zan_arena_alloc(
                 b->arena, sizeof(zan_type_t *) * (size_t)t->delegate_param_count);
             for (int i = 0; i < t->delegate_param_count; i++)
                 nt->delegate_param_types[i] =
-                    subst_named_tp(b, t->delegate_param_types[i], tps, args);
+                    zan_binder_subst_named(b, t->delegate_param_types[i], tps, args);
         }
     }
     if (t->type_arg_count > 0) {
         nt->type_args = (zan_type_t **)zan_arena_alloc(
             b->arena, sizeof(zan_type_t *) * (size_t)t->type_arg_count);
         for (int i = 0; i < t->type_arg_count; i++)
-            nt->type_args[i] = subst_named_tp(b, t->type_args[i], tps, args);
+            nt->type_args[i] = zan_binder_subst_named(b, t->type_args[i], tps, args);
     }
     return nt;
 }
@@ -260,13 +260,13 @@ zan_type_t *zan_binder_resolve_type(zan_binder_t *b, zan_ast_node_t *type_ref) {
         inst->type_arg_count = nargs;
         zan_ast_list_t *dtps = &base->sym->decl->method_decl.type_params;
         inst->delegate_ret_type =
-            subst_named_tp(b, base->delegate_ret_type, dtps, args);
+            zan_binder_subst_named(b, base->delegate_ret_type, dtps, args);
         if (base->delegate_param_count > 0) {
             inst->delegate_param_types = (zan_type_t **)zan_arena_alloc(
                 b->arena, sizeof(zan_type_t *) * (size_t)base->delegate_param_count);
             for (int i = 0; i < base->delegate_param_count; i++)
                 inst->delegate_param_types[i] =
-                    subst_named_tp(b, base->delegate_param_types[i], dtps, args);
+                    zan_binder_subst_named(b, base->delegate_param_types[i], dtps, args);
         }
         base = inst;
     } else

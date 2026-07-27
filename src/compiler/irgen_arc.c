@@ -603,6 +603,17 @@ static void coerce_args_to_params(zan_irgen_t *g, LLVMTypeRef fn_type,
 /* If `t` is a generic type parameter of `recv`'s instantiated class, resolve it
  * to the corresponding concrete type argument (e.g. T -> int for Box<int>);
  * otherwise return `t` unchanged. */
+/* Like subst_type_param, but reaches inside type arguments as well, so a field
+ * declared List<T> in Box<Square> reads back as List<Square> rather than
+ * leaving T unresolved for whatever indexes it. */
+static zan_type_t *subst_type_param_deep(zan_irgen_t *g, zan_type_t *t,
+                                         zan_type_t *recv) {
+    if (!t || !recv || !recv->sym || !recv->sym->decl) return t;
+    zan_ast_list_t *tps = &recv->sym->decl->type_decl.type_params;
+    if (tps->count == 0 || recv->type_arg_count < tps->count) return t;
+    return zan_binder_subst_named(g->binder, t, tps, recv->type_args);
+}
+
 static zan_type_t *subst_type_param(zan_type_t *t, zan_type_t *recv) {
     if (!t || t->kind != TYPE_TYPE_PARAM || !recv || !recv->sym) return t;
     zan_ast_node_t *decl = recv->sym->decl;

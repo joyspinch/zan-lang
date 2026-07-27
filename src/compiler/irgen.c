@@ -2181,10 +2181,17 @@ static LLVMValueRef get_calloc_fn(zan_irgen_t *g) {
  * buffers before the struct itself. `coll_kind` is 1=List, 2=StringBuilder,
  * 3=Dict.
  * Returns the user pointer (i8*), i.e. the struct base past the header. */
+static zan_type_t *subst_type_param_deep(zan_irgen_t *g, zan_type_t *t,
+                                         zan_type_t *recv);
+
 static LLVMValueRef emit_alloc_rc_collection(zan_irgen_t *g, zan_ast_node_t *expr,
                                              long size, int coll_kind,
                                              zan_type_t *elem_type) {
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    /* `new List<T>()` in a specialized body allocates a list of the concrete
+     * argument: the site destructor has to release real elements, matching the
+     * retain their stores emit. */
+    if (g->cur_inst) elem_type = subst_type_param_deep(g, elem_type, g->cur_inst);
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
     int site_idx = g->leak_site_count;
     if (site_idx >= ZAN_MAX_LEAK_SITES) site_idx = ZAN_MAX_LEAK_SITES - 1;

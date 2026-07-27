@@ -132,6 +132,11 @@ zan_type_t *zan_binder_resolve_type(zan_binder_t *b, zan_ast_node_t *type_ref);
 /* Construct a List<elem> instantiation type (used by query-expression
  * lowering, which has no syntactic type reference to resolve). */
 zan_type_t *zan_binder_make_list_type(zan_binder_t *b, zan_type_t *elem);
+
+/* Substitute the type parameters named by `tps` with `args` throughout `t`,
+ * cloning composite types on the way (List<T> -> List<Square>). */
+zan_type_t *zan_binder_subst_named(zan_binder_t *b, zan_type_t *t,
+                                   zan_ast_list_t *tps, zan_type_t **args);
 zan_symbol_t *zan_binder_lookup(zan_binder_t *b, zan_istr_t name);
 
 #endif /* ZAN_BINDER_H */

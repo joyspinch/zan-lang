@@ -61,6 +61,10 @@ static void check_generic_constraints(zan_checker_t *c, zan_type_t *t,
         }
         if (idx < 0 || idx >= t->type_arg_count) continue;
         zan_type_t *arg = t->type_args[idx];
+        /* Box<T> written inside a generic that owns T: nothing is known about
+         * T here, and the constraint is checked where that outer generic is
+         * instantiated with a real type. */
+        if (arg && arg->kind == TYPE_TYPE_PARAM) continue;
         for (int k = 0; k < wc->where_clause.constraints.count; k++) {
             zan_type_t *cons = zan_binder_resolve_type(
                 c->binder, wc->where_clause.constraints.items[k]);

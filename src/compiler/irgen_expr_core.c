@@ -11,6 +11,9 @@
 /* defined in later-included parts of this translation unit */
 static zan_type_t *subst_type_param(zan_type_t *t, zan_type_t *recv);
 static zan_type_t *concretize(zan_irgen_t *g, zan_type_t *t);
+static zan_type_t *subst_type_param_deep(zan_irgen_t *g, zan_type_t *t,
+                                         zan_type_t *recv);
+static bool type_is_concrete(zan_type_t *t);
 
 static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_t *locals);
 static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *locals);
@@ -553,11 +556,36 @@ static zan_symbol_t *resolve_overload_typed(zan_irgen_t *g,
     return resolve_overload(type_sym, name, argc);
 }
 
+static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
+                                       local_scope_t *locals);
+
 /* Best-effort static inference of an expression's Zan type, composed over
  * identifiers, `this`, field access and element indexing so that patterns like
- * `list[i].field` or `a.b[i].c` resolve their class/struct symbol. */
+ * `list[i].field` or `a.b[i].c` resolve their class/struct symbol.
+ *
+ * While a generic class is being specialized, anything still phrased in its
+ * type parameters is resolved against that instantiation -- a local declared
+ * `T` in Box<Square> is a Square here. Method lookup and element ownership
+ * both go through this, so leaving T unresolved silently lowered
+ * `item.Area()` to a 0 and dropped the stored element's retain. */
 static zan_type_t *infer_expr_type(zan_irgen_t *g, zan_ast_node_t *e,
                                    local_scope_t *locals) {
+    zan_type_t *t = infer_expr_type_raw(g, e, locals);
+    if (!t || !g->cur_inst || type_is_concrete(t)) return t;
+    /* Delegates keep their type parameters: a T-returning delegate is invoked
+     * through an erased signature, so resolving T would disagree with it. */
+    if (t->kind == TYPE_DELEGATE) return t;
+    /* A bare `T` stays erased: parameters and returns of a specialized body
+     * keep the erased ABI, and resolving T here would change how callers own
+     * the value they pass. Only composites are resolved, so that a field
+     * declared List<T> reads back as List<Square> and its elements are stored
+     * and loaded with the ownership rules of the real element type. */
+    if (t->kind == TYPE_TYPE_PARAM) return t;
+    return subst_type_param_deep(g, t, g->cur_inst);
+}
+
+static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
+                                       local_scope_t *locals) {
     if (!e) return NULL;
     switch (e->kind) {
     /* String literals have a static type like any other expression; without
@@ -631,7 +659,7 @@ static zan_type_t *infer_expr_type(zan_irgen_t *g, zan_ast_node_t *e,
             if (fs) {
                 /* a field declared as a type parameter has the receiver's
                  * concrete type argument here: Pool<Conn>.item is a Conn */
-                zan_type_t *ft = subst_type_param(fs->type, ot);
+                zan_type_t *ft = subst_type_param_deep(g, fs->type, ot);
                 if (ft && ft->kind == TYPE_TYPE_PARAM) ft = concretize(g, ft);
                 return ft;
             }
@@ -817,6 +845,11 @@ static bool expr_is_ulong(zan_irgen_t *g, zan_ast_node_t *e, local_scope_t *loca
 static zan_symbol_t *expr_class_sym(zan_irgen_t *g, zan_ast_node_t *e,
                                     local_scope_t *locals) {
     zan_type_t *t = infer_expr_type(g, e, locals);
+    /* Inside a specialization a receiver typed `T` -- a local declared `T` in
+     * Box<Square> -- must be resolved for the method to be found at all;
+     * unresolved, the call silently lowered to a 0. Only the lookup resolves
+     * it: the emitted signature stays erased. */
+    if (t && t->kind == TYPE_TYPE_PARAM) t = concretize(g, t);
     if (t && (t->kind == TYPE_CLASS || t->kind == TYPE_STRUCT)) return t->sym;
     return NULL;
 }
