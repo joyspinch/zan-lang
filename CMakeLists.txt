@@ -827,10 +827,22 @@ else()
     target_link_libraries(zanpkg PRIVATE m)
 endif()
 
-# ---- zanfmt (code formatter) ----
-add_executable(zanfmt
-    src/fmt/zanfmt.c
-)
+# ---- zanfmt (code formatter, written in Zan) ----
+set(_zanfmt_exe ${CMAKE_BINARY_DIR}/zanfmt${_exe_ext})
+add_custom_command(OUTPUT ${_zanfmt_exe}
+    COMMAND $<TARGET_FILE:zanc> ${CMAKE_SOURCE_DIR}/src/fmt/zanfmt.zan
+            --auto-stdlib -o ${_zanfmt_exe}
+    DEPENDS zanc ${CMAKE_SOURCE_DIR}/src/fmt/zanfmt.zan
+    COMMENT "Building zanfmt from Zan source")
+add_custom_target(zanfmt ALL DEPENDS ${_zanfmt_exe})
+
+add_test(NAME tool_zanfmt
+  COMMAND ${CMAKE_COMMAND}
+    -DZANFMT=${_zanfmt_exe}
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/fmt/messy.zan
+    -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/fmt/messy.expected
+    -DWORKFILE=${CMAKE_BINARY_DIR}/zanfmt_work.zan
+    -P ${CMAKE_SOURCE_DIR}/tests/run_zanfmt.cmake)
 
 # ---- zandoc (documentation generator) ----
 add_executable(zandoc
