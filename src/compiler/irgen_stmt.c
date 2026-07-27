@@ -142,7 +142,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                                     LLVMTypeOf(iv) != slot_ty) {
                                     iv = LLVMBuildBitCast(g->builder, iv, slot_ty, "fl.bc");
                                 }
-                                LLVMBuildStore(g->builder, iv, pre->alloca);
+                                zan_store_fit(g, iv, pre->alloca);
                             }
                         }
                         if (arc_own) pre->arc_owned = 1;
@@ -162,7 +162,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                 LLVMValueRef arr_val = emit_expr(g, init, locals);
                 LLVMTypeRef ptr_type = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
                 LLVMValueRef alloca = emit_entry_alloca(g, ptr_type, "arr");
-                LLVMBuildStore(g->builder, arr_val, alloca);
+                zan_store_fit(g, arr_val, alloca);
 
                 zan_type_t *elem_type = resolve_type_ctx(g, init->new_expr.type);
                 if (!elem_type) elem_type = g->binder->type_int;
@@ -185,7 +185,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                     LLVMValueRef list_val = emit_expr(g, init, locals);
                     LLVMTypeRef ptr_type = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
                     LLVMValueRef alloca = emit_entry_alloca(g, ptr_type, "list");
-                    LLVMBuildStore(g->builder, list_val, alloca);
+                    zan_store_fit(g, list_val, alloca);
                     zan_type_t *list_type = resolve_type_ctx(g, init->new_expr.type);
                     local_add(locals, stmt->var_decl.name, alloca, list_type);
                     /* List is refcounted: `new` yields an owned (+1) reference, so
@@ -198,7 +198,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                     LLVMValueRef sb_val = emit_expr(g, init, locals);
                     LLVMTypeRef ptr_type = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
                     LLVMValueRef alloca = emit_entry_alloca(g, ptr_type, "sb");
-                    LLVMBuildStore(g->builder, sb_val, alloca);
+                    zan_store_fit(g, sb_val, alloca);
                     zan_type_t *sb_type = resolve_type_ctx(g, init->new_expr.type);
                     local_add(locals, stmt->var_decl.name, alloca, sb_type);
                     /* StringBuilder is refcounted: `new` yields an owned (+1)
@@ -212,7 +212,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                     LLVMValueRef dict_val = emit_expr(g, init, locals);
                     LLVMTypeRef ptr_type = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
                     LLVMValueRef alloca = emit_entry_alloca(g, ptr_type, "dict");
-                    LLVMBuildStore(g->builder, dict_val, alloca);
+                    zan_store_fit(g, dict_val, alloca);
                     zan_type_t *dict_type = resolve_type_ctx(g, init->new_expr.type);
                     local_add(locals, stmt->var_decl.name, alloca, dict_type);
                     /* This local owns the freshly-built dict: release its
@@ -237,7 +237,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                         LLVMTypeRef st = get_struct_llvm_type(g, sym);
                         if (st) {
                             LLVMValueRef alloca = emit_entry_alloca(g, st, "var");
-                            LLVMBuildStore(g->builder, LLVMConstNull(st), alloca);
+                            zan_store_fit(g, LLVMConstNull(st), alloca);
 
                             /* try calling constructor */
                             bool ctor_called = false;
@@ -279,7 +279,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                                                     fval = LLVMBuildFPExt(g->builder, fval, target_t, "ext");
                                                 }
                                             }
-                                            LLVMBuildStore(g->builder, fval, fptr);
+                                            zan_store_fit(g, fval, fptr);
                                         }
                                     }
                                 }
@@ -295,7 +295,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             LLVMValueRef init_val = emit_expr(g, init, locals);
             LLVMTypeRef init_type = LLVMTypeOf(init_val);
             LLVMValueRef alloca = emit_entry_alloca(g, init_type, "var");
-            LLVMBuildStore(g->builder, init_val, alloca);
+            zan_store_fit(g, init_val, alloca);
             if (LLVMGetTypeKind(init_type) == LLVMDoubleTypeKind) {
                 type = g->binder->type_double;
             } else if (LLVMGetTypeKind(init_type) == LLVMFloatTypeKind) {
@@ -312,7 +312,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             if (type && type->kind == TYPE_STRING) {
                 LLVMTypeRef llvm_string = map_type(g, type);
                 LLVMValueRef slot = emit_entry_alloca(g, llvm_string, "var");
-                LLVMBuildStore(g->builder, LLVMConstNull(llvm_string), slot);
+                zan_store_fit(g, LLVMConstNull(llvm_string), slot);
                 emit_rc_capture_local(g, type, slot, init_val, init, locals);
                 local_add(locals, stmt->var_decl.name, slot, type);
                 arc_own_local(g, locals);
@@ -337,7 +337,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
          * at exit is safe even before the initializer has stored anything. */
         int arc_own = (type && is_rc_managed_type(type) &&
                        LLVMGetTypeKind(llvm_type) == LLVMPointerTypeKind);
-        if (arc_own) LLVMBuildStore(g->builder, LLVMConstNull(llvm_type), alloca);
+        if (arc_own) zan_store_fit(g, LLVMConstNull(llvm_type), alloca);
 
         if (stmt->var_decl.initializer) {
             warn_narrowing(g, type,
@@ -355,7 +355,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                 emit_rc_capture_local(g, type, alloca, init_val, stmt->var_decl.initializer, locals);
             } else {
                 init_val = coerce_int_to(g, init_val, llvm_type);
-                LLVMBuildStore(g->builder, init_val, alloca);
+                zan_store_fit(g, init_val, alloca);
             }
         }
 
@@ -387,7 +387,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                     LLVMGetIntTypeWidth(LLVMTypeOf(szv)) < 64)
                     szv = LLVMBuildSExt(g->builder, szv, i64t, "arr.len");
                 LLVMValueRef lenslot = emit_entry_alloca(g, i64t, "arr.lenslot");
-                LLVMBuildStore(g->builder, szv, lenslot);
+                zan_store_fit(g, szv, lenslot);
                 locals->vars[locals->count - 1].arr_len = lenslot;
             }
         }
@@ -407,7 +407,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                     LLVMGetIntTypeWidth(LLVMTypeOf(szv)) < 64)
                     szv = LLVMBuildSExt(g->builder, szv, i64t, "arr.len");
                 LLVMValueRef lslot = emit_entry_alloca(g, i64t, "arr.lenslot2");
-                LLVMBuildStore(g->builder, szv, lslot);
+                zan_store_fit(g, szv, lslot);
                 locals->vars[locals->count - 1].arr_len_slot = lslot;
             }
         }
@@ -838,12 +838,12 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
          * splits the function during CPS lowering, so SSA values defined here
          * would not dominate their uses in the catch/end blocks. */
         LLVMValueRef tmp_mark_slot = emit_entry_alloca(g, i32t, "eh.tmpmark.slot");
-        LLVMBuildStore(g->builder, tmp_mark, tmp_mark_slot);
+        zan_store_fit(g, tmp_mark, tmp_mark_slot);
         LLVMValueRef old_top_slot = emit_entry_alloca(g, i32t, "eh.old.slot");
-        LLVMBuildStore(g->builder, old_top, old_top_slot);
+        zan_store_fit(g, old_top, old_top_slot);
         LLVMValueRef new_top = zan_add(g->builder, old_top,
             LLVMConstInt(i32t, 1, 0), "eh.new");
-        LLVMBuildStore(g->builder, new_top, top_g);
+        zan_store_fit(g, new_top, top_g);
         /* record the depth this handler was armed at, so a throw below can
          * release the skipped frames' locals while they are still alive */
         {
@@ -851,7 +851,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             LLVMValueRef mi[2] = { LLVMConstInt(i32t, 0, 0), new_top };
             LLVMValueRef mp = LLVMBuildGEP2(g->builder,
                 LLVMGlobalGetValueType(marks), marks, mi, 2, "eh.markp");
-            LLVMBuildStore(g->builder, tmp_mark, mp);
+            zan_store_fit(g, tmp_mark, mp);
         }
         /* An async frame records how many try handlers it currently has
          * armed (frame.hcount): __zan_async_unwind stops releasing frames at
@@ -862,7 +862,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                 g->current_async_frame_type, g->current_async_frame,
                 ASYNC_FRAME_HCOUNT, "eh.hc");
             LLVMValueRef hc = LLVMBuildLoad2(g->builder, i32t, hc_ptr, "eh.hcv");
-            LLVMBuildStore(g->builder, zan_add(g->builder, hc,
+            zan_store_fit(g, zan_add(g->builder, hc,
                 LLVMConstInt(i32t, 1, 0), "eh.hc1"), hc_ptr);
             /* Record this handler in the frame so a later resume can re-arm it:
              * the jmp_buf armed below dies with this invocation, but the try
@@ -878,7 +878,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                 LLVMValueRef hs_idx[2] = { LLVMConstInt(i32t, 0, 0), hc };
                 LLVMValueRef hs_slot = LLVMBuildGEP2(g->builder,
                     LLVMArrayType(i32t, ASYNC_MAX_HANDLERS), hs, hs_idx, 2, "eh.hs.slot");
-                LLVMBuildStore(g->builder, LLVMConstInt(i32t, (unsigned)hid, 0), hs_slot);
+                zan_store_fit(g, LLVMConstInt(i32t, (unsigned)hid, 0), hs_slot);
 
                 LLVMBasicBlockRef here = LLVMGetInsertBlock(g->builder);
                 struct { const char *nm; LLVMValueRef sw; LLVMBasicBlockRef dst; } re[2] = {
@@ -892,9 +892,9 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                         re[ri].nm);
                     LLVMPositionBuilderAtEnd(g->builder, re_bb);
                     LLVMValueRef rtop = LLVMBuildLoad2(g->builder, i32t, top_g, "eh.rtop");
-                    LLVMBuildStore(g->builder, zan_sub(g->builder, rtop,
+                    zan_store_fit(g, zan_sub(g->builder, rtop,
                         LLVMConstInt(i32t, 1, 0), "eh.rtop0"), old_top_slot);
-                    LLVMBuildStore(g->builder,
+                    zan_store_fit(g,
                         LLVMBuildLoad2(g->builder, i32t, eh_tmptop_g, "eh.rtmp"),
                         tmp_mark_slot);
                     LLVMBuildBr(g->builder, re[ri].dst);
@@ -931,13 +931,13 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         locals->count = try_start;
         if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder))) {
             LLVMValueRef ot = LLVMBuildLoad2(g->builder, i32t, old_top_slot, "eh.old.re");
-            LLVMBuildStore(g->builder, ot, top_g);
+            zan_store_fit(g, ot, top_g);
             if (g->current_async_frame) {
                 LLVMValueRef hc_ptr = LLVMBuildStructGEP2(g->builder,
                     g->current_async_frame_type, g->current_async_frame,
                     ASYNC_FRAME_HCOUNT, "eh.hc");
                 LLVMValueRef hc = LLVMBuildLoad2(g->builder, i32t, hc_ptr, "eh.hcv");
-                LLVMBuildStore(g->builder, zan_sub(g->builder, hc,
+                zan_store_fit(g, zan_sub(g->builder, hc,
                     LLVMConstInt(i32t, 1, 0), "eh.hc0"), hc_ptr);
             }
             LLVMBuildBr(g->builder, end_bb);
@@ -946,13 +946,13 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         LLVMPositionBuilderAtEnd(g->builder, catch_bb);
         {
             LLVMValueRef ot = LLVMBuildLoad2(g->builder, i32t, old_top_slot, "eh.old.re");
-            LLVMBuildStore(g->builder, ot, top_g);
+            zan_store_fit(g, ot, top_g);
             if (g->current_async_frame) {
                 LLVMValueRef hc_ptr = LLVMBuildStructGEP2(g->builder,
                     g->current_async_frame_type, g->current_async_frame,
                     ASYNC_FRAME_HCOUNT, "eh.hc");
                 LLVMValueRef hc = LLVMBuildLoad2(g->builder, i32t, hc_ptr, "eh.hcv");
-                LLVMBuildStore(g->builder, zan_sub(g->builder, hc,
+                zan_store_fit(g, zan_sub(g->builder, hc,
                     LLVMConstInt(i32t, 1, 0), "eh.hc0"), hc_ptr);
                 /* No reload from the frame: the handler this catch belongs to
                  * is re-armed by the invocation that raises the throw, whose
@@ -1008,8 +1008,8 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
              * ownership transfer at the top of each catch body) */
             exc_owned_slot = emit_entry_alloca(g, i32t, "eh.excown.slot");
         }
-        LLVMBuildStore(g->builder, exc_val, exc_slot);
-        LLVMBuildStore(g->builder, LLVMConstInt(i32t, 0, 0), exc_owned_slot);
+        zan_store_fit(g, exc_val, exc_slot);
+        zan_store_fit(g, LLVMConstInt(i32t, 0, 0), exc_owned_slot);
         int catch_start = locals->count;
         int ncatch = stmt->try_stmt.catches.count;
         if (ncatch > 0) {
@@ -1069,7 +1069,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                             ea = fv->alloca;
                     }
                     if (!ea) ea = emit_entry_alloca(g, i8ptr, "exc.var");
-                    LLVMBuildStore(g->builder, ev, ea);
+                    zan_store_fit(g, ev, ea);
                     local_add(locals, cc->catch_clause.var_name, ea, et);
                 }
                 /* transfer the in-flight +1 into this handler: clear the
@@ -1080,8 +1080,8 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                 {
                     LLVMValueRef owned_g2 = get_eh_exc_owned_global(g);
                     LLVMValueRef ofl = LLVMBuildLoad2(g->builder, i32t, owned_g2, "exc.ofl");
-                    LLVMBuildStore(g->builder, ofl, exc_owned_slot);
-                    LLVMBuildStore(g->builder, LLVMConstInt(i32t, 0, 0), owned_g2);
+                    zan_store_fit(g, ofl, exc_owned_slot);
+                    zan_store_fit(g, LLVMConstInt(i32t, 0, 0), owned_g2);
                     LLVMValueRef isown = zan_icmp(g->builder, LLVMIntNE, ofl,
                         LLVMConstInt(i32t, 0, 0), "exc.isown");
                     LLVMBasicBlockRef push_bb =
@@ -1177,8 +1177,8 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             zan_call2(g->builder,
                 LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), &i8ptr, 1, 0),
                 g->rt_release_dyn, &ev, 1, "");
-            LLVMBuildStore(g->builder, LLVMConstInt(i32t, 0, 0), owned_g);
-            LLVMBuildStore(g->builder, LLVMConstNull(i8ptr), exc_g);
+            zan_store_fit(g, LLVMConstInt(i32t, 0, 0), owned_g);
+            zan_store_fit(g, LLVMConstNull(i8ptr), exc_g);
             LLVMBuildBr(g->builder, cont_bb);
             LLVMPositionBuilderAtEnd(g->builder, cont_bb);
             /* handler-owned release: a matched catch body transferred the
@@ -1197,7 +1197,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             zan_call2(g->builder,
                 LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), &i8ptr, 1, 0),
                 g->rt_release_dyn, &hev, 1, "");
-            LLVMBuildStore(g->builder, LLVMConstNull(i8ptr), exc_g);
+            zan_store_fit(g, LLVMConstNull(i8ptr), exc_g);
             LLVMBuildBr(g->builder, hcont_bb);
             LLVMPositionBuilderAtEnd(g->builder, hcont_bb);
             LLVMBuildBr(g->builder, end_bb);
@@ -1287,14 +1287,14 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                 iter_alloc = ev->alloca;
         }
         if (col_slot)
-            LLVMBuildStore(g->builder,
+            zan_store_fit(g,
                 LLVMBuildBitCast(g->builder, collection,
                     LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0), "fe.colp"),
                 col_slot);
 
         /* index variable */
         if (!idx_alloc) idx_alloc = emit_entry_alloca(g, i64, "fi");
-        LLVMBuildStore(g->builder, LLVMConstInt(i64, 0, 0), idx_alloc);
+        zan_store_fit(g, LLVMConstInt(i64, 0, 0), idx_alloc);
 
         /* iteration variable */
         if (!iter_alloc) iter_alloc = emit_entry_alloca(g, elem_llvm, "fv");
@@ -1361,7 +1361,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             elem = LLVMBuildBitCast(g->builder, elem, elem_llvm, "elf");
         else if (ek == LLVMIntegerTypeKind && LLVMGetIntTypeWidth(elem_llvm) < 64)
             elem = LLVMBuildTrunc(g->builder, elem, elem_llvm, "elt");
-        LLVMBuildStore(g->builder, elem, iter_alloc);
+        zan_store_fit(g, elem, iter_alloc);
 
         emit_stmt(g, stmt->foreach_stmt.body, locals);
 
@@ -1376,7 +1376,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         LLVMValueRef next = zan_add(g->builder,
             LLVMBuildLoad2(g->builder, i64, idx_alloc, "i2"),
             LLVMConstInt(i64, 1, 0), "next");
-        LLVMBuildStore(g->builder, next, idx_alloc);
+        zan_store_fit(g, next, idx_alloc);
         LLVMBuildBr(g->builder, cond_bb);
 
         g->break_target = fe_saved_break;
@@ -1463,7 +1463,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                 vail = LLVMConstNull(i8ptr);
             else if (LLVMTypeOf(vail) != i8ptr)
                 vail = LLVMBuildBitCast(g->builder, vail, i8ptr, "exc.bc");
-            LLVMBuildStore(g->builder, vail, exc_g);
+            zan_store_fit(g, vail, exc_g);
             /* rc convention: for class-typed throws __zan_eh_exc carries a +1
              * reference (retain borrowed values here); the catch releases it
              * once the handler completes */
@@ -1475,20 +1475,20 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                     LLVMGetTypeKind(LLVMTypeOf(val)) == LLVMPointerTypeKind) {
                     if (!expr_yields_owned_rc_value(g, stmt->throw_stmt.value, locals))
                         emit_arc_retain(g, vail);
-                    LLVMBuildStore(g->builder, LLVMConstInt(i32t, 1, 0), owned_g);
+                    zan_store_fit(g, LLVMConstInt(i32t, 1, 0), owned_g);
                     /* record the thrown class's type descriptor so catch
                      * clauses can dispatch by type */
                     if (tt->sym) {
                         LLVMValueRef tid = get_class_tid_global(g, tt->sym);
-                        LLVMBuildStore(g->builder,
+                        zan_store_fit(g,
                             LLVMBuildBitCast(g->builder, tid, i8ptr, "tid.bc"),
                             tid_g);
                     } else {
-                        LLVMBuildStore(g->builder, LLVMConstNull(i8ptr), tid_g);
+                        zan_store_fit(g, LLVMConstNull(i8ptr), tid_g);
                     }
                 } else {
-                    LLVMBuildStore(g->builder, LLVMConstInt(i32t, 0, 0), owned_g);
-                    LLVMBuildStore(g->builder, LLVMConstNull(i8ptr), tid_g);
+                    zan_store_fit(g, LLVMConstInt(i32t, 0, 0), owned_g);
+                    zan_store_fit(g, LLVMConstNull(i8ptr), tid_g);
                 }
             }
             /* longjmp skips every scope-exit release between here and the
@@ -1596,7 +1596,7 @@ static void emit_release_static_rc_fields(zan_irgen_t *g, zan_ast_node_t *unit) 
             LLVMTypeRef ft = map_type(g, fs->type);
             LLVMValueRef old = LLVMBuildLoad2(g->builder, ft, gv, "sf.rel");
             emit_rc_release_for_type(g, fs->type, old);
-            LLVMBuildStore(g->builder, LLVMConstNull(ft), gv);
+            zan_store_fit(g, LLVMConstNull(ft), gv);
         }
     }
     g->current_type_sym = saved_type;

@@ -844,6 +844,32 @@ static LLVMValueRef coerce_int_to(zan_irgen_t *g, LLVMValueRef v, LLVMTypeRef ta
     return LLVMBuildTrunc(g->builder, v, target, "trunc");
 }
 
+/* Store an integer into a slot whose type is statically known (an alloca, a
+ * global, or a struct field GEP), fitting the value's width to the slot's
+ * first. Opaque pointers make a width mismatch invisible to the verifier, so
+ * an i64 stored into an i32 field silently writes four bytes past it; this
+ * keeps every such store in range. Non-integer values and slots whose type
+ * cannot be recovered (byte-offset GEPs, casts) pass through untouched. */
+static LLVMValueRef zan_store_fit(zan_irgen_t *g, LLVMValueRef val, LLVMValueRef ptr) {
+    LLVMTypeRef target = NULL;
+    if (LLVMIsAAllocaInst(ptr)) {
+        target = LLVMGetAllocatedType(ptr);
+    } else if (LLVMIsAGlobalVariable(ptr)) {
+        target = LLVMGlobalGetValueType(ptr);
+    } else if (LLVMIsAGetElementPtrInst(ptr)) {
+        LLVMTypeRef src = LLVMGetGEPSourceElementType(ptr);
+        if (src && LLVMGetTypeKind(src) == LLVMStructTypeKind &&
+            LLVMGetNumOperands(ptr) == 3) {
+            LLVMValueRef idx = LLVMGetOperand(ptr, 2);
+            if (LLVMIsAConstantInt(idx))
+                target = LLVMStructGetTypeAtIndex(
+                    src, (unsigned)LLVMConstIntGetZExtValue(idx));
+        }
+    }
+    if (target) val = coerce_int_to(g, val, target);
+    return LLVMBuildStore(g->builder, val, ptr);
+}
+
 /* Widen a narrow integer to i64 for numeric formatting/printing. Signed
  * integers are sign-extended, but i1 (bool) is zero-extended so that `true`
  * formats as 1 rather than -1 (sext of an i1 set to 1 yields all-ones). */
