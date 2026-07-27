@@ -1485,8 +1485,11 @@ int main(int argc, char **argv) {
     } else {
         /* Unoptimized build: also skip machine-level optimization, which is
          * the single most expensive phase (edit-compile-run turnaround in the
-         * IDE, tests, and every plain `zanc foo.zan`). */
+         * IDE, tests, and every plain `zanc foo.zan`). Unreachable definitions
+         * are still dropped: emitting a whole globbed-in stdlib directory costs
+         * far more time and size than the sweep itself. */
         irgen.fast_codegen = true;
+        if (!do_emit_ir) zan_opt_strip_unused(&irgen);
     }
 
     if (do_emit_ir) {

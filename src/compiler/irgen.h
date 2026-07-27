@@ -381,6 +381,18 @@ struct zan_irgen {
     int arc_stmt_depth;
 };
 
+/* Zan compiles a whole program (every reachable stdlib and user file) into one
+ * LLVM module and links an executable, so nothing outside the module can call a
+ * Zan function: `main` is the only symbol the C runtime needs by name. Giving
+ * every other definition internal linkage is what lets LLVM's GlobalDCE delete
+ * the ones no live code, vtable or delegate refers to -- with external linkage
+ * the linker has to keep them all (a layout-only demo still carried the whole
+ * code editor and data grid). Address-taken functions stay alive through the
+ * reference itself, so delegates, WndProcs and vtable slots are unaffected. */
+static inline void zan_set_module_local(LLVMValueRef fn) {
+    if (fn) LLVMSetLinkage(fn, LLVMInternalLinkage);
+}
+
 zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
                             zan_diag_t *diag, zan_binder_t *binder,
                             const char *module_name,

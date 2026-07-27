@@ -363,6 +363,28 @@ void zan_opt_configure_llvm_passes(zan_irgen_t *g, zan_opt_level_t level) {
     LLVMDisposePassBuilderOptions(opts);
 }
 
+/* Delete every function and global no live code refers to, without running any
+ * other transform. A whole program is one module here, so a `using` that globs
+ * in a directory of stdlib widgets leaves hundreds of complete-but-uncalled
+ * definitions behind; at -O0 no pass pipeline runs at all, so they used to be
+ * emitted and linked in full. GlobalDCE is a pure reachability sweep over the
+ * module's reference graph (cheap, no codegen changes to surviving functions),
+ * which keeps unoptimized builds debuggable and fast to produce while dropping
+ * the dead weight. Only internal-linkage definitions can be removed, which is
+ * why irgen marks everything but `main` internal. */
+void zan_opt_strip_unused(zan_irgen_t *g) {
+    LLVMPassBuilderOptionsRef opts = LLVMCreatePassBuilderOptions();
+    LLVMPassBuilderOptionsSetVerifyEach(opts, 0);
+    LLVMPassBuilderOptionsSetDebugLogging(opts, 0);
+    LLVMErrorRef err = LLVMRunPasses(g->mod, "globaldce", NULL, opts);
+    if (err) {
+        char *msg = LLVMGetErrorMessage(err);
+        fprintf(stderr, "warning: LLVM globaldce error: %s\n", msg);
+        LLVMDisposeErrorMessage(msg);
+    }
+    LLVMDisposePassBuilderOptions(opts);
+}
+
 /* ---- Combined pipeline ---- */
 
 zan_opt_report_t zan_optimize(zan_irgen_t *g, zan_binder_t *binder, zan_opt_level_t level) {

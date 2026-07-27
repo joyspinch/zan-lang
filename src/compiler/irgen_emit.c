@@ -566,13 +566,16 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
                  * handle (i8*); the body runs later in resume(frame). */
                 fn_type = LLVMFunctionType(i8ptr, param_types, (unsigned)total_params, 0);
                 fn = LLVMAddFunction(g->mod, fn_name, fn_type);
+                zan_set_module_local(fn);
 
                 char resume_name[560];
                 snprintf(resume_name, sizeof(resume_name), "%s$resume", fn_name);
                 resume_fn = LLVMAddFunction(g->mod, resume_name, g->co_step_type);
+                zan_set_module_local(resume_fn);
             } else {
                 fn_type = LLVMFunctionType(llvm_ret, param_types, (unsigned)total_params, 0);
                 fn = LLVMAddFunction(g->mod, fn_name, fn_type);
+                zan_set_module_local(fn);
             }
 
             /* register in function/ctor table. For async methods the ramp is
@@ -1408,6 +1411,7 @@ static int get_or_create_method_spec(zan_irgen_t *g, zan_symbol_t *msym,
     LLVMTypeRef fn_type = LLVMFunctionType(map_type(g, ret_type), param_types,
                                            (unsigned)param_count, 0);
     LLVMValueRef fn = LLVMAddFunction(g->mod, fn_name, fn_type);
+    zan_set_module_local(fn);
     free(param_types);
 
     if (g->method_spec_count >= g->method_spec_cap) {

@@ -83,4 +83,7 @@ zan_opt_report_t zan_optimize(zan_irgen_t *g, zan_binder_t *binder, zan_opt_leve
 void zan_opt_report_print(const zan_opt_report_t *report);
 void zan_opt_configure_llvm_passes(zan_irgen_t *g, zan_opt_level_t level);
 
+/* Reachability-only sweep (LLVM globaldce), for builds that run no pipeline. */
+void zan_opt_strip_unused(zan_irgen_t *g);
+
 #endif /* ZAN_OPTIMIZER_H */
