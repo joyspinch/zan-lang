@@ -889,6 +889,104 @@ header-only 库 / C 回调 / 结构体字段偏移，全部对应 A2 / A3 / A4�
 
 ---
 
+# A15 语言缺口审计（2026-07-27，实测，全部有探针）
+
+标准库里那些"看着绕"的封装，多数不是风格问题，是被下面这些缺口逼出来的。
+每条都用最小程序实测过，不是读代码推断的。
+
+## A15-1 `byte` 是有符号的（**根因级**）
+
+```zan
+byte b = 255;   Console.WriteLine(b);    // -1，C# 是 255
+byte[] a = new byte[2]; a[0] = 200;
+Console.WriteLine((int)a[0]);            // -56，C# 是 200
+```
+
+`byte` 按 i8 存、按有符号读，取值范围实际是 −128..127。`ushort`/`uint` 正常，
+只有 8 位的坏了。后果直接可量：**整个 stdlib 里 `byte[]` 出现 0 次**，
+而 53 个文件自己拿 `string` / `NativeMemory` 手搓字节缓冲（B2 记的 49 处
+calloc-as-string 就是这个）。修好 `byte` 的零扩展语义，B2 才有意义——否则
+`Span<byte>` 做出来也没人敢用。
+
+## A15-2 数组初始化器产出的数组是坏的
+
+```zan
+int[] b = new int[] { 1, 2, 3 };
+Console.WriteLine(b.Length);   // 访问违例退出（0xC0000005）
+```
+
+`new int[3]` + 逐个赋值正常，只有带初始化器的形式坏。`List<T>` 的集合
+初始化器（`new List<string> { "a", "b" }`）是好的。
+
+## A15-3 值类型缺三样：`==`、运算符重载、`const`
+
+```zan
+p == q                          // LLVM: Invalid operand types for ICmp（无行号）
+static V operator +(V l, V r)   // struct 上：Integer arithmetic operators only
+                                // work with integral types；同样的代码在 class 上正常
+const int K = 7;                // 解析错误 "expected type"；static readonly 可用
+```
+
+`Color` 这类值类型直接受影响：现在只能 `IsNone()`，写不了
+`if (bg == Color.None())`。运算符重载在 class 上可用、在 struct 上产出非法
+IR，是 irgen 的分支缺失。
+
+## A15-4 集合元素槽固定 8 字节
+
+`List<T>` / `Dictionary` 的元素槽是裸 `i64`，所以 struct 元素要打包/解包
+（`33a66df`），超过 8 字节的只能报错。真正的修法是按元素大小/stride 存，
+和 A1 `Span<T>` 一起做。
+
+## A15-5 `switch` 全库 0 处使用
+
+`switch (string)` 实测可用，但 stdlib 里 `switch` 出现 **0 次**，单是 Gui
+就有 871 处 `if (x == "...")` 链（`StyleSheet.DeclX` 的属性分派最典型）。
+这是历史惯性不是能力缺口，属于可读性/性能债，随颜色迁移一起清。
+
+## A15-6 其它已确认的小差异
+
+* `char` 打印成数字（`'A'` → `65`），C# 打印字符。
+* `ulong` 字面量超过 i64 上限会被夹到 `9223372036854775807`。
+* struct 与整数不兼容此前只有无行号的 LLVM 校验失败——已修（`94cf827`）。
+
+## 建议顺序
+
+1. A15-1 `byte` 零扩展 + A15-2 数组初始化器（两个都是静默错误结果，最危险）；
+2. A15-3 struct `==` / 运算符重载 / `const`（颜色迁移要用）；
+3. A15-4 元素槽（与 A1 合并）；
+4. A15-5 用 `switch` 重写属性分派（与颜色迁移同批）。
+
+---
+
+# A16 CSS 支持面（现状实测）
+
+**选择器**：类型名、`.class`、`#id`，各自可带 `:state` 后缀
+（hover / active / focus / disabled），逗号选择器列表。
+**没有**后代/子/兄弟组合器、属性选择器、`*`、伪元素，也没有真正的层叠优先级
+——`Apply` 按 类型 → `.class` → `#id` → 带状态 的固定顺序依次覆盖。
+
+**at-rule**：只有 `:root` 自定义属性 + `var(--x)`。没有 `@media`、`@import`、
+`@font-face`；`@keyframes` 不解析，`animation: <name> ...` 只能引用内置的
+8 条曲线（spin / pulse / breath / shimmer / float / glow / aurora / motes）。
+
+**属性**（约 90 个）：盒模型（margin/padding/border 及四边分解/radius/width/
+height/min/max）、背景（color/image/linear-gradient 2~3 停靠点）、
+文本（color/font/font-size/font-weight/text-align/text-transform/
+text-overflow/letter-spacing/line-height/white-space）、
+flex 子集（display/flex-direction/justify-content/align-items/flex-wrap/
+flex-grow/gap/order）、定位（position/dock/top/left/bottom/right/z-index）、
+效果（box-shadow 含 inset/opacity/filter/backdrop-filter/transform:
+translate|translateX|translateY|scale|rotate/transition 三件套）、
+overflow/visibility/cursor/accent-color。
+
+**取值**：颜色齐全（`#rgb`/`#rgba`/`#rrggbb`/`#aarrggbb`/`rgb()`/`rgba()`/
+`hsl()`/`hsla()`/`0x`/十进制/约 60 个具名色/`transparent`）。长度**只有像素**：
+`Num()` 遇到第一个非数字就停，所以 `12px` = 12、`1.5rem` = 1、`50%` 在多数属性
+上被当成 50；比例值走 `Perm()`（千分数），因此小数只在 opacity/scale/alpha
+这些地方有效。没有 `calc()`、没有 em/rem/vh/vw。
+
+---
+
 # 已撤回的结论（早期草稿中的错误，勿再引用）
 
 1. ~~"无符号/窄类型只是语法别名，IR 层全塌成 i64，语义是假的"~~ ——
