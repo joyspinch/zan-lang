@@ -189,6 +189,130 @@ partial class DataTable {
         c.PushClip(l, y, w, h);
     }
 
+    // ---------- group panel ----------
+
+    /// Chip x positions and widths for the group panel, outer-to-inner. Shared
+    /// by the strip's painting, its hit tests and the header drop, so all three
+    /// agree on the geometry by construction.
+    static void GroupChipLayout(App app, List<DataColumn> cols, DataTableState st,
+                                int x, List<int> outX, List<int> outW) {
+        Theme t = app.theme;
+        int fs = t.fontSizeSmall;
+        int cx = x + app.Scale(10);
+        int i = 0;
+        while (i < st.groupCols.Count) {
+            int w = Canvas.MeasureText(cols[st.groupCols[i]].title, fs) + app.Scale(38);
+            outX.Add(cx);
+            outW.Add(w);
+            cx = cx + w + app.Scale(8);
+            i = i + 1;
+        }
+    }
+
+    /// Insertion slot (0..count) the pointer addresses: the number of chips whose
+    /// midpoint sits left of it.
+    static int GroupDropSlot(App app, List<int> cxs, List<int> cws) {
+        int slot = 0;
+        int i = 0;
+        while (i < cxs.Count) {
+            if (app.mouseX > cxs[i] + cws[i] / 2) { slot = i + 1; }
+            i = i + 1;
+        }
+        return slot;
+    }
+
+    /// The grouping strip above the header: one chip per grouped column
+    /// (outer-to-inner) with a remove button, an insertion indicator while
+    /// something is dragged over it, and a hint while the table is flat.
+    /// `headerDrag` is true while a column header is being dragged, so the strip
+    /// can advertise itself as a drop target.
+    static void RenderGroupPanel(App app, int x, int y, int viewW, int h,
+                                 List<DataColumn> cols, DataTableState st,
+                                 bool headerDrag) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int fs = t.fontSizeSmall;
+        bool over = app.mouseX >= x && app.mouseX < x + viewW
+                    && app.mouseY >= y && app.mouseY < y + h;
+        int bg = t.bgTertiary;
+        if (headerDrag && over) { bg = t.bgActive; }
+        c.FillRect(x, y, viewW, h, bg);
+        c.FillRect(x, y + h - 1, viewW, 1, t.divider);
+        c.PushClip(x, y, viewW, h);
+
+        List<int> cxs = new List<int>();
+        List<int> cws = new List<int>();
+        DataTable.GroupChipLayout(app, cols, st, x, cxs, cws);
+        int chipH = h - app.Scale(10);
+        int chipY = y + app.Scale(5);
+
+        if (st.groupCols.Count == 0) {
+            c.DrawText(x + app.Scale(10), y + (h - Canvas.FontHeight(fs)) / 2,
+                       "Drag a column header here to group by it",
+                       t.textTertiary, fs);
+        }
+
+        int i = 0;
+        while (i < st.groupCols.Count) {
+            int col = st.groupCols[i];
+            int cxp = cxs[i];
+            int cwp = cws[i];
+            bool dragged = st.dragChip == col;
+            int fill = t.bgSecondary;
+            if (dragged) { fill = t.primary; }
+            c.FillRoundRect(cxp, chipY, cwp, chipH, chipH / 2, fill);
+            int lc = t.textPrimary;
+            if (dragged) { lc = t.textInverse; }
+            int rsz = app.Scale(14);
+            int rx = cxp + cwp - rsz - app.Scale(6);
+            int ry = chipY + (chipH - rsz) / 2;
+            string lbl = DataTable.Truncate(cols[col].title, fs,
+                                            rx - cxp - app.Scale(14));
+            c.DrawText(cxp + app.Scale(10),
+                       chipY + (chipH - Canvas.FontHeight(fs)) / 2, lbl, lc, fs);
+            int rmId = app.focus.AllocId();
+            Icon.DrawCenteredIn(c, "close", rx, ry, rsz, rsz, app.Scale(10), lc);
+            app.hitTester.Register(HitRegion.Create(rmId, rx, ry, rsz, rsz, 0));
+            int chipId = app.focus.AllocId();
+            app.hitTester.Register(HitRegion.Create(chipId, cxp, chipY,
+                                                    rx - cxp, chipH, 0));
+            if (app.window.EventKind() == 3 && app.window.EventButton() == 0
+                && app.hitTester.HitTest(app.mouseX, app.mouseY) == rmId) {
+                DataTable.UngroupOne(st, col);
+                st.GroupChanged.Raise();
+                app.RequestRedraw();
+            }
+            if (app.window.EventKind() == 2 && app.window.EventButton() == 0
+                && app.hitTester.HitTest(app.mouseX, app.mouseY) == chipId) {
+                st.dragChip = col;
+                app.RequestRedraw();
+            }
+            i = i + 1;
+        }
+
+        if (st.dragChip >= 0 || (headerDrag && over)) {
+            int slot = DataTable.GroupDropSlot(app, cxs, cws);
+            int lineX = x + app.Scale(6);
+            if (slot > 0) { lineX = cxs[slot - 1] + cws[slot - 1] + app.Scale(2); }
+            c.FillRect(lineX, chipY, app.Scale(2), chipH, t.primary);
+        }
+        c.PopClip();
+
+        // Finalize a chip drag on release (the App clears the press before this
+        // render runs, exactly as for the header drag).
+        if (st.dragChip >= 0 && app.focus.pressedId < 0) {
+            int from = DataTable.GroupDepth(st, st.dragChip);
+            int dst = DataTable.GroupDropSlot(app, cxs, cws);
+            if (dst > from) { dst = dst - 1; }
+            if (from >= 0 && dst != from) {
+                DataTable.MoveGroup(st, st.dragChip, dst);
+                st.GroupChanged.Raise();
+            }
+            st.dragChip = -1;
+            app.RequestRedraw();
+        }
+    }
+
     // ---------- main render ----------
 
     /// Convenience overload: render an in-memory List<DataRow> (wraps it in a
@@ -208,9 +332,31 @@ partial class DataTable {
         DataTable.SyncBindings(st);
         DataTable.Recompute(st, cols, src);
 
-        int headerH = t.heightMedium;
+        int titleRowH = t.heightMedium;
         int rowH = t.heightMedium;
         int fs = t.fontSizeMedium;
+        // Band rows sit above the column titles and are a little shorter — they
+        // carry a group name, not a sort arrow or a filter icon. `headerH` stays
+        // the full header height, so every later measurement (body top, menu
+        // anchors, the outside-click test) keeps working unchanged.
+        int bandRowH = t.heightSmall;
+        int bandLevels = 0;
+        int headerH = titleRowH;
+
+        // The group panel is a strip above the header, so it moves the header's
+        // top edge down while `y` stays the widget's own top. Every vertical
+        // measurement below is taken from `hdrY`, which equals `y` when the strip
+        // is hidden — so a table without the panel lays out exactly as before.
+        int groupPanelH = 0;
+        if (st.showGroupPanel) { groupPanelH = app.Scale(34); }
+        int hdrY = y + groupPanelH;
+        int panelY = y;
+        if (st.showGroupPanel) {
+            DataTable.RenderGroupPanel(app, x, panelY, viewW, groupPanelH, cols, st,
+                                       st.dragCol >= 0 && st.dragColMoved);
+        }
+        y = hdrY;
+        viewH = viewH - groupPanelH;
 
         int numW = 0;
         if (st.showRowNum) {
@@ -295,6 +441,13 @@ partial class DataTable {
         if (st.scrollX < 0) { st.scrollX = 0; }
         int rightX = firstDataX + dataViewW - pinnedRW;    // left edge of the right band
 
+        // Header height is known only now: a banded table grows one row per
+        // nesting level above the titles. The column titles keep their own row
+        // at the bottom, so `y + headerH` still means "below the whole header".
+        bandLevels = DataTable.BandLevels(cols, vorder);
+        headerH = titleRowH + bandLevels * bandRowH;
+        int titleTop = y + bandLevels * bandRowH;
+
         // Screen x and owning band for every entry of `vorder`, computed once.
         // Each band is clipped to its own strip, so a scrolled middle column can
         // never paint (or register a hit region) over a frozen one — which makes
@@ -359,6 +512,82 @@ partial class DataTable {
             c.FillRect(hx, y, 1, headerH, gridColor);
         }
 
+        // ---------------- band rows (multi-level header) ----------------
+        // One row per nesting level above the titles. A span covers a run of
+        // adjacent slots in the visible order, so it is clipped to its own
+        // frozen strip exactly like the columns underneath it — a group split
+        // by a freeze boundary simply draws as two spans, one per band, which
+        // is also what it means: those columns are no longer adjacent.
+        int blv = 0;
+        while (blv < bandLevels) {
+            int by0 = y + blv * bandRowH;
+            List<BandSpan> spans = DataTable.BandRow(st, cols, vorder, blv);
+            int si = 0;
+            while (si < spans.Count) {
+                BandSpan sp = spans[si];
+                // A span is only ever drawn inside one strip; a run crossing a
+                // band boundary is emitted once per strip it touches.
+                int seg = sp.from;
+                while (seg < sp.to) {
+                    int segBand = colBand[seg];
+                    int segEnd = seg;
+                    while (segEnd < sp.to && colBand[segEnd] == segBand) { segEnd = segEnd + 1; }
+                    int sx0 = colX[seg];
+                    int sx1 = colX[segEnd - 1] + st.dispW[vorder[segEnd - 1]];
+                    int sbL = DataTable.BandLeft(segBand, firstDataX, bandX, rightX);
+                    int sbR = DataTable.BandRight(segBand, firstDataX, bandX, bandW,
+                                                  rightX, pinnedW, pinnedRW, clipRight);
+                    if (sx1 > sbL && sx0 < sbR) {
+                        DataTable.PushBandClip(c, segBand, firstDataX, bandX, bandW, rightX,
+                                               pinnedW, pinnedRW, by0, bandRowH, clipRight);
+                        int vx0 = sx0;
+                        if (vx0 < sbL) { vx0 = sbL; }
+                        int vx1 = sx1;
+                        if (vx1 > sbR) { vx1 = sbR; }
+                        c.FillRect(sx0, by0, sx1 - sx0, bandRowH - 1, t.bgTertiary);
+                        c.FillRect(sx1 - 1, by0, 1, bandRowH, gridColor);
+
+                        // The chevron reads as "there is more here", so it is
+                        // only offered on the segment that owns the band's first
+                        // column — collapsing from a fragment on the far side of
+                        // a freeze would fold columns the user isn't looking at.
+                        int capX = sx0;
+                        int capW = sx1 - sx0;
+                        bool owner = seg == sp.from;
+                        if (owner) {
+                            int chev = app.Scale(14);
+                            int chId = app.focus.AllocId();
+                            string chIcon = "chevron-down";
+                            if (DataTable.BandIsCollapsed(st, sp.path)) { chIcon = "chevron-right"; }
+                            int chX = sx0 + app.Scale(4);
+                            Icon.DrawCenteredIn(c, chIcon, chX, by0, chev, bandRowH,
+                                                app.Scale(11), t.textTertiary);
+                            app.hitTester.Register(HitRegion.Create(chId, chX, by0, chev, bandRowH, 0));
+                            if (app.window.EventKind() == 3 && app.window.EventButton() == 0
+                                && app.hitTester.HitTest(app.mouseX, app.mouseY) == chId) {
+                                DataTable.ToggleBand(st, cols, sp.path);
+                                st.BandToggled.Raise();
+                                app.RequestRedraw();
+                            }
+                            capX = chX + chev;
+                            capW = sx1 - capX;
+                        }
+                        int capPad = app.Scale(4);
+                        capW = capW - capPad * 2;
+                        if (capW < 0) { capW = 0; }
+                        string capT = DataTable.Truncate(sp.label, t.fontSizeSmall, capW);
+                        c.DrawTextCentered(capX + capPad, by0, capW, bandRowH, capT,
+                                           t.textSecondary, t.fontSizeSmall);
+                        c.PopClip();
+                    }
+                    seg = segEnd;
+                }
+                si = si + 1;
+            }
+            c.FillRect(x, by0 + bandRowH - 1, viewW, 1, gridColor);
+            blv = blv + 1;
+        }
+
         // Column drag-reorder in progress this frame (a header title is held and
         // the pointer has moved past the start threshold). dropVisLocal is the
         // visual slot the dragged column would land before; dropX is its screen x.
@@ -380,7 +609,7 @@ partial class DataTable {
                 if (hBand >= 0) { c.PopClip(); }
                 hBand = colBand[hoi];
                 DataTable.PushBandClip(c, hBand, firstDataX, bandX, bandW, rightX,
-                                       pinnedW, pinnedRW, y, headerH, clipRight);
+                                       pinnedW, pinnedRW, titleTop, titleRowH, clipRight);
             }
             hcl = colX[hoi];
             // Ids are allocated for every column — visible or not — so the id
@@ -414,12 +643,12 @@ partial class DataTable {
                 dropX = visX;
             }
             bool hHover = app.focus.IsHovered(titleId);
-            if (hHover) { c.FillRect(visX, y, visW, headerH, t.bgHover); }
+            if (hHover) { c.FillRect(visX, titleTop, visW, titleRowH, t.bgHover); }
 
             int pad = t.paddingSmall;
             int availTitle = cw - pad * 2 - menuIconW;
             string ht = DataTable.Truncate(col.title, fs, availTitle);
-            int ty = y + (headerH - Canvas.FontHeight(fs)) / 2;
+            int ty = titleTop + (titleRowH - Canvas.FontHeight(fs)) / 2;
             c.DrawText(hx + pad, ty, ht, t.textSecondary, fs);
 
             // sort indicator — arrow per key, plus a 1-based priority badge when
@@ -430,7 +659,7 @@ partial class DataTable {
                 if (st.sortKeys[spos].dir == 2) { arrow = "arrow-down"; }
                 int aw = app.Scale(12);
                 int ax = hx + pad + Canvas.MeasureText(ht, fs) + app.Scale(4);
-                Icon.Draw(c, arrow, ax, y + (headerH - aw) / 2, aw, t.primary);
+                Icon.Draw(c, arrow, ax, titleTop + (titleRowH - aw) / 2, aw, t.primary);
                 if (st.sortKeys.Count > 1) {
                     c.DrawText(ax + aw + app.Scale(1), ty,
                                Convert.ToString(spos + 1), t.primary, t.fontSizeSmall);
@@ -445,14 +674,14 @@ partial class DataTable {
                 int mIx = hx + cw - menuIconW - app.Scale(2);
                 bool active = st.filters[i].Active();
                 bool cellHover = app.mouseX >= visX && app.mouseX < visR
-                                 && app.mouseY >= y && app.mouseY < y + headerH;
+                                 && app.mouseY >= titleTop && app.mouseY < titleTop + titleRowH;
                 bool showIcon = active || cellHover || st.openMenu == i;
                 if (showIcon) {
                     int mColor = t.textTertiary;
                     if (active) { mColor = t.primary; }
                     if (app.focus.IsHovered(menuId)) { mColor = t.textPrimary; }
-                    Icon.DrawCenteredIn(c, "filter", mIx, y, menuIconW, headerH, app.Scale(13), mColor);
-                    app.hitTester.Register(HitRegion.Create(menuId, mIx, y, menuIconW, headerH, 0));
+                    Icon.DrawCenteredIn(c, "filter", mIx, titleTop, menuIconW, titleRowH, app.Scale(13), mColor);
+                    app.hitTester.Register(HitRegion.Create(menuId, mIx, titleTop, menuIconW, titleRowH, 0));
                     if (!st.dragColMoved && app.window.EventKind() == 3 && app.window.EventButton() == 0 && app.hitTester.HitTest(app.mouseX, app.mouseY) == menuId) {
                         if (st.openMenu == i) { st.openMenu = -1; } else {
                             st.openMenu = i;
@@ -476,7 +705,7 @@ partial class DataTable {
             // drag) cycles the sort. The dragged column is dimmed while moving.
             int titleW = visW - menuIconW;
             if (titleW < 0) { titleW = 0; }
-            app.hitTester.Register(HitRegion.Create(titleId, visX, y, titleW, headerH, 0));
+            app.hitTester.Register(HitRegion.Create(titleId, visX, titleTop, titleW, titleRowH, 0));
             if (app.window.EventKind() == 2 && app.window.EventButton() == 0 && app.hitTester.HitTest(app.mouseX, app.mouseY) == titleId) {
                 st.dragCol = i;
                 st.dragColStartX = app.mouseX;
@@ -491,7 +720,7 @@ partial class DataTable {
                 if (st.dragColMoved) { app.RequestRedraw(); }
             }
             if (colDragging && st.dragCol == i) {
-                c.FillRect(visX, y, visW, headerH, t.bgHover);
+                c.FillRect(visX, titleTop, visW, titleRowH, t.bgHover);
             }
             if (col.sortable && !st.dragColMoved && app.window.EventKind() == 3 && app.window.EventButton() == 0 && app.ClickTarget() == titleId) {
                 st.hitCol = i;
@@ -509,7 +738,7 @@ partial class DataTable {
             if (app.window.EventKind() == 2 && app.window.EventButton() == 1
                 && st.openMenu < 0
                 && app.mouseX >= hx && app.mouseX < hx + cw
-                && app.mouseY >= y && app.mouseY < y + headerH) {
+                && app.mouseY >= titleTop && app.mouseY < titleTop + titleRowH) {
                 st.hdrCtxOpen = true;
                 st.hdrCtxCol = i;
                 st.hdrCtxX = app.mouseX;
@@ -525,7 +754,7 @@ partial class DataTable {
             int rzX = hx + cw - rzW / 2;
             int rzCursor = 4;
             if (!col.resizable) { rzCursor = 6; }
-            app.hitTester.Register(HitRegion.Create(rzId, rzX, y, rzW, headerH, rzCursor));
+            app.hitTester.Register(HitRegion.Create(rzId, rzX, titleTop, rzW, titleRowH, rzCursor));
             if (col.resizable && app.window.EventKind() == 2 && app.window.EventButton() == 0 && app.PressTarget() == rzId) {
                 st.resizeCol = i;
                 st.resizeStartX = app.mouseX;
@@ -548,7 +777,7 @@ partial class DataTable {
                 st.ColumnResizeEnd.Raise();
             }
 
-            c.FillRect(hx + cw, y, 1, headerH, gridColor);
+            c.FillRect(hx + cw, titleTop, 1, titleRowH, gridColor);
             hoi = hoi + 1;
             }
         }
@@ -560,16 +789,19 @@ partial class DataTable {
         // column is moved before the target slot (or to the end).
         if (colDragging) {
             if (dropVisLocal < 0) { dropX = hx; }
+            // The insertion line spans the whole header — including the band
+            // rows, since dropping between two columns can also move one out of
+            // a group — but the chip rides the title row it came from.
             c.FillRect(dropX - 1, y, app.Scale(2), headerH, t.primary);
             string dl = cols[st.dragCol].title;
             int chW = Canvas.MeasureText(dl, fs) + app.Scale(16);
             int chX = app.mouseX - chW / 2;
             if (chX < x) { chX = x; }
             if (chX + chW > x + viewW) { chX = x + viewW - chW; }
-            c.FillRoundRect(chX, y + app.Scale(3), chW, headerH - app.Scale(6),
+            c.FillRoundRect(chX, titleTop + app.Scale(3), chW, titleRowH - app.Scale(6),
                             t.borderRadiusSmall, t.primary);
             c.DrawText(chX + app.Scale(8),
-                       y + (headerH - Canvas.FontHeight(fs)) / 2, dl, t.textInverse, fs);
+                       titleTop + (titleRowH - Canvas.FontHeight(fs)) / 2, dl, t.textInverse, fs);
         }
         // Remember the drop slot while the button is held, so the finalize below
         // uses the last live drag position rather than wherever the pointer sits
@@ -579,7 +811,19 @@ partial class DataTable {
         // mouse-up before this render runs, so `pressedId < 0` reliably marks the
         // release frame even when the synthetic event's kind is coalesced away.
         if (st.dragCol >= 0 && app.focus.pressedId < 0) {
-            if (st.dragColMoved) {
+            // Released over the group strip: that is a "group by this column"
+            // gesture at the slot the pointer addresses, not a reorder.
+            bool toPanel = st.showGroupPanel && st.dragColMoved
+                && app.mouseX >= x && app.mouseX < x + viewW
+                && app.mouseY >= panelY && app.mouseY < panelY + groupPanelH;
+            if (toPanel) {
+                List<int> gcx = new List<int>();
+                List<int> gcw = new List<int>();
+                DataTable.GroupChipLayout(app, cols, st, x, gcx, gcw);
+                DataTable.GroupByAt(st, st.dragCol,
+                                    DataTable.GroupDropSlot(app, gcx, gcw));
+                st.GroupChanged.Raise();
+            } else if (st.dragColMoved) {
                 int beforeCol = -1;
                 if (st.dropVis >= 0 && st.dropVis < vorder.Count) {
                     beforeCol = vorder[st.dropVis];
@@ -769,6 +1013,40 @@ partial class DataTable {
                 continue;
             }
 
+            // Detail band: a master-detail panel under an expanded row. The band
+            // spans DetailSlots consecutive slots; it is drawn once, on its first
+            // slot, over the full height so the panel sees one rectangle rather
+            // than a series of row-high strips. Later parts of the same band draw
+            // nothing — the first part already covered their pixels.
+            if (st.dispRows[oiRow].kind == 2) {
+                if (st.dispRows[oiRow].part != 0) { r = r + 1; continue; }
+                int dRow = st.dispRows[oiRow].row;
+                // Count this band's remaining slots so the panel gets its whole
+                // height even when the band starts on-screen and runs past the
+                // bottom edge (the clip keeps the overspill invisible).
+                int span = 1;
+                int ns = oiRow + 1;
+                while (ns < total && st.dispRows[ns].kind == 2
+                       && st.dispRows[ns].part != 0 && st.dispRows[ns].row == dRow) {
+                    span = span + 1;
+                    ns = ns + 1;
+                }
+                int dh = span * rowH;
+                c.FillRect(x + 1, ry, viewW - 2, dh, t.bgSecondary);
+                // A left accent ties the panel to the master row above it.
+                c.FillRect(x + 1, ry, app.Scale(3), dh, t.primary);
+                if (st.detail != null) {
+                    int dx = x + app.Scale(4);
+                    int dw = viewW - app.Scale(6);
+                    c.PushClip(dx, ry, dw, dh);
+                    st.detail.Paint(app, src, dRow, dx, ry, dw, dh);
+                    c.PopClip();
+                }
+                c.FillRect(x + 1, ry + dh - 1, viewW - 2, 1, gridColor);
+                r = r + 1;
+                continue;
+            }
+
             int rowIdx = st.dispRows[oiRow].row;
             bool rowInRange = hasRange && oiRow >= rgR0 && oiRow <= rgR1;
 
@@ -790,6 +1068,28 @@ partial class DataTable {
                 // column stays ordered instead of jumping around when the user
                 // sorts or filters.
                 c.DrawTextCentered(cx2, ry, numW, rowH, Convert.ToString(st.dispRows[oiRow].no), t.textTertiary, t.fontSizeSmall);
+                // Master-detail expander, tucked into the left of the gutter so
+                // the row number stays legible beside it. Only rows the provider
+                // accepts get one, so a childless row shows a blank margin
+                // instead of a chevron that does nothing.
+                if (DataTable.CanExpand(st, src, rowIdx)) {
+                    int exSz = app.Scale(12);
+                    int exX = cx2 + app.Scale(2);
+                    int exY = ry + (rowH - exSz) / 2;
+                    bool isExp = DataTable.IsExpanded(st, rowIdx);
+                    string exCh = "chevron-right";
+                    if (isExp) { exCh = "chevron-down"; }
+                    int exId = app.focus.AllocId();
+                    app.hitTester.Register(HitRegion.Create(exId, cx2, ry, app.Scale(16), rowH, 0));
+                    int exCol = t.textTertiary;
+                    if (app.focus.IsHovered(exId)) { exCol = t.primary; }
+                    Icon.Draw(c, exCh, exX, exY, exSz, exCol);
+                    if (app.window.EventKind() == 3 && app.window.EventButton() == 0
+                        && app.hitTester.HitTest(app.mouseX, app.mouseY) == exId) {
+                        DataTable.ToggleDetail(st, src, rowIdx);
+                        app.RequestRedraw();
+                    }
+                }
                 cx2 = cx2 + numW;
             }
             if (st.showSelect) {
@@ -949,6 +1249,11 @@ partial class DataTable {
         if (app.mouseY >= bodyTop && app.mouseY < bodyTop + bodyH && app.mouseX >= x && app.mouseX < clipRight) {
             int rr2 = (app.mouseY - bodyTop) / rowH;
             if (rr2 >= 0 && rr2 < visRows && (start + rr2) < total) { ptrOi = start + rr2; }
+            // A detail band is the provider's own surface, not a row: presses
+            // there must not start a range selection, a reorder drag or an
+            // editor. Dropping it here keeps every ptrOi consumer below honest
+            // without each having to re-test the kind.
+            if (ptrOi >= 0 && st.dispRows[ptrOi].kind == 2) { ptrOi = -1; }
         }
         int ptrCol = -1;
         if (ptrOi >= 0 && app.mouseX >= firstDataX) {

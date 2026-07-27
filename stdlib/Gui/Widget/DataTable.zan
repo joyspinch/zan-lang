@@ -1390,6 +1390,166 @@ partial class DataTable {
         if (c >= 0) { DataTable.FreezeColumn(st, c, side); }
     }
 
+    // ---------- header bands (multi-level header) ----------
+    // A column's `band` is a slash-separated path of the groups above it, so the
+    // header structure is carried by the columns and cannot drift out of sync
+    // with them. Everything below derives the spanning cells from the *visible
+    // order*, which means freezing, reordering and hiding all fall out for free:
+    // a group spans whatever adjacent slots happen to share its path, and a
+    // group split across two bands simply becomes two spans.
+
+    /// The band path of a column, or "" when it belongs to no group.
+    static string BandOf(List<DataColumn> cols, int col) {
+        if (col < 0 || col >= cols.Count) { return ""; }
+        return cols[col].band;
+    }
+
+    /// The first `depth` segments of a band path, e.g. Prefix("a/b/c", 2) is
+    /// "a/b". Fewer segments than `depth` yields the whole path.
+    static string BandPrefix(string path, int depth) {
+        if (path == "" || depth <= 0) { return ""; }
+        List<string> parts = path.Split("/");
+        string outp = "";
+        int i = 0;
+        while (i < parts.Count && i < depth) {
+            if (i > 0) { outp = outp + "/"; }
+            outp = outp + parts[i];
+            i = i + 1;
+        }
+        return outp;
+    }
+
+    /// How many groups sit above a column.
+    static int BandDepth(string path) {
+        if (path == "") { return 0; }
+        return path.Split("/").Count;
+    }
+
+    /// Deepest band nesting among the visible columns — the number of extra
+    /// header rows to draw above the column titles. 0 means a plain header.
+    static int BandLevels(List<DataColumn> cols, List<int> vorder) {
+        int m = 0;
+        int i = 0;
+        while (i < vorder.Count) {
+            int d = DataTable.BandDepth(DataTable.BandOf(cols, vorder[i]));
+            if (d > m) { m = d; }
+            i = i + 1;
+        }
+        return m;
+    }
+
+    /// The spanning header cells for one level, left to right. A run of adjacent
+    /// slots sharing a prefix becomes one span; slots with no group at this
+    /// depth produce no span at all, leaving the column title to reach up into
+    /// the empty rows above it.
+    static List<BandSpan> BandRow(DataTableState st, List<DataColumn> cols,
+                                  List<int> vorder, int level) {
+        List<BandSpan> spans = new List<BandSpan>();
+        int i = 0;
+        while (i < vorder.Count) {
+            string p = DataTable.BandPrefix(DataTable.BandOf(cols, vorder[i]), level + 1);
+            if (DataTable.BandDepth(p) <= level) {
+                // No group at this depth: the title cell below owns the space.
+                i = i + 1;
+            } else {
+                int j = i + 1;
+                while (j < vorder.Count
+                       && DataTable.BandPrefix(DataTable.BandOf(cols, vorder[j]), level + 1) == p) {
+                    j = j + 1;
+                }
+                List<string> segs = p.Split("/");
+                spans.Add(new BandSpan(segs[segs.Count - 1], p, level, i, j));
+                i = j;
+            }
+        }
+        return spans;
+    }
+
+    /// All spanning cells, outermost level first.
+    static List<BandSpan> BandSpans(DataTableState st, List<DataColumn> cols,
+                                    List<int> vorder) {
+        List<BandSpan> all = new List<BandSpan>();
+        int levels = DataTable.BandLevels(cols, vorder);
+        int lv = 0;
+        while (lv < levels) {
+            List<BandSpan> row = DataTable.BandRow(st, cols, vorder, lv);
+            int i = 0;
+            while (i < row.Count) { all.Add(row[i]); i = i + 1; }
+            lv = lv + 1;
+        }
+        return all;
+    }
+
+    static bool BandIsCollapsed(DataTableState st, string path) {
+        if (path == "") { return false; }
+        return st.bandCollapsed.IndexOf(path) >= 0;
+    }
+
+    /// Fold a band down to its first column, or unfold it. Collapsing hides the
+    /// group's other columns rather than deleting anything, so their widths,
+    /// filters and sort keys survive the round trip.
+    static void SetBandCollapsed(DataTableState st, List<DataColumn> cols,
+                                 string path, bool collapsed) {
+        if (path == "") { return; }
+        int at = st.bandCollapsed.IndexOf(path);
+        if (collapsed && at < 0) { st.bandCollapsed.Add(path); }
+        if (!collapsed && at >= 0) { st.bandCollapsed.RemoveAt(at); }
+        DataTable.ApplyBandCollapse(st, cols);
+        st.dirty = true;
+    }
+
+    static void ToggleBand(DataTableState st, List<DataColumn> cols, string path) {
+        DataTable.SetBandCollapsed(st, cols, path, !DataTable.BandIsCollapsed(st, path));
+    }
+
+    /// Re-derive `colHidden` from the collapsed set: within a collapsed band
+    /// every column but the first is hidden.
+    ///
+    /// `bandAutoHidden` records exactly which columns *this* mechanism hid, so
+    /// unfolding restores those and only those. Without it a column the user hid
+    /// by hand would be silently brought back the next time an unrelated band
+    /// was collapsed — hiding is the user's decision and collapsing must not
+    /// quietly overwrite it.
+    static void ApplyBandCollapse(DataTableState st, List<DataColumn> cols) {
+        List<int> nowHidden = new List<int>();
+        int i = 0;
+        while (i < cols.Count && i < st.colHidden.Count) {
+            string p = cols[i].band;
+            if (p != "") {
+                // Outermost collapsed ancestor wins: folding an outer group
+                // folds everything under it whatever the inner state says.
+                string keep = "";
+                int d = 1;
+                while (d <= DataTable.BandDepth(p) && keep == "") {
+                    string pref = DataTable.BandPrefix(p, d);
+                    if (DataTable.BandIsCollapsed(st, pref)) { keep = pref; }
+                    d = d + 1;
+                }
+                if (keep != "") {
+                    // The band's first column stays behind as the visible stub.
+                    int first = -1;
+                    int k = 0;
+                    while (k < cols.Count && first < 0) {
+                        if (DataTable.BandPrefix(cols[k].band, DataTable.BandDepth(keep)) == keep) {
+                            first = k;
+                        }
+                        k = k + 1;
+                    }
+                    if (i != first) {
+                        st.colHidden[i] = true;
+                        nowHidden.Add(i);
+                    } else if (st.bandAutoHidden.IndexOf(i) >= 0) {
+                        st.colHidden[i] = false;
+                    }
+                } else if (st.bandAutoHidden.IndexOf(i) >= 0) {
+                    st.colHidden[i] = false;
+                }
+            }
+            i = i + 1;
+        }
+        st.bandAutoHidden = nowHidden;
+    }
+
     // Column indices in on-screen order: left-frozen first, then active group
     // columns, then the scrolling columns, and finally the right-frozen ones.
     // Hidden columns are excluded. Every layout pass (header / filter row /
@@ -1848,6 +2008,56 @@ partial class DataTable {
         st.dirty = true;
     }
 
+    /// Drop one column out of the grouping, keeping the rest in order. Used by the
+    /// group panel's per-chip remove button, where `Ungroup`'s clear-everything
+    /// would be too blunt.
+    static void UngroupOne(DataTableState st, int col) {
+        int i = st.groupCols.IndexOf(col);
+        if (i < 0) { return; }
+        st.groupCols.RemoveAt(i);
+        // Group keys are built from the whole path, so any collapse state recorded
+        // against the old nesting no longer addresses anything: drop it rather
+        // than leave keys that can never match again.
+        st.collapsedKeys.Clear();
+        st.dirty = true;
+    }
+
+    /// Move a grouped column to a new nesting depth. `to` is the destination
+    /// index in the outer-to-inner list; out-of-range values clamp to the ends,
+    /// so a drag past either edge does the sensible thing instead of nothing.
+    static void MoveGroup(DataTableState st, int col, int to) {
+        int fi = st.groupCols.IndexOf(col);
+        if (fi < 0) { return; }
+        int dst = to;
+        if (dst < 0) { dst = 0; }
+        if (dst > st.groupCols.Count - 1) { dst = st.groupCols.Count - 1; }
+        if (dst == fi) { return; }
+        st.groupCols.RemoveAt(fi);
+        st.groupCols.Insert(dst, col);
+        st.collapsedKeys.Clear();
+        st.dirty = true;
+    }
+
+    /// Nesting depth of a grouped column (0 = outermost), or -1 when the column
+    /// isn't grouped.
+    static int GroupDepth(DataTableState st, int col) {
+        return st.groupCols.IndexOf(col);
+    }
+
+    /// Insert a column into the grouping at a given depth, rather than appending
+    /// it innermost the way `GroupBy` does. Feeds the panel's drop-at-position
+    /// gesture; a column that is already grouped is moved instead of duplicated.
+    static void GroupByAt(DataTableState st, int col, int at) {
+        if (col < 0) { return; }
+        if (st.groupCols.IndexOf(col) >= 0) { DataTable.MoveGroup(st, col, at); return; }
+        int dst = at;
+        if (dst < 0) { dst = 0; }
+        if (dst > st.groupCols.Count) { dst = st.groupCols.Count; }
+        st.groupCols.Insert(dst, col);
+        st.collapsedKeys.Clear();
+        st.dirty = true;
+    }
+
     static bool IsCollapsed(DataTableState st, string key) {
         return st.collapsedKeys.IndexOf(key) >= 0;
     }
@@ -1858,6 +2068,77 @@ partial class DataTable {
         else { st.collapsedKeys.Add(key); }
         st.dirty = true;
     }
+
+    // ---------- master-detail ----------
+    // A row can open a panel beneath itself: a child table, a form, a chart.
+    // Expansion is tracked by *source* row index, so it follows a row through
+    // sorting and filtering rather than pinning to a display position.
+
+    /// Attach the hook that draws detail panels, switching the feature on. Pass
+    /// null to turn it back off (every row collapses; nothing else is disturbed).
+    static void SetDetail(DataTableState st, DetailProvider p) {
+        st.detail = p;
+        if (p == null) { st.expandedRows.Clear(); }
+        st.dirty = true;
+    }
+
+    /// Whether master-detail is active at all.
+    static bool HasDetail(DataTableState st) { return st.detail != null; }
+
+    /// Height of a detail band in whole row heights, at least 1. Asking the
+    /// provider keeps a per-row size (say, one slot per child record) possible.
+    static int DetailSlots(DataTableState st, DataSource src, int row) {
+        if (st.detail == null) { return 0; }
+        int n = st.detail.Slots(src, row);
+        if (n < 1) { n = 1; }
+        return n;
+    }
+
+    /// Whether `row` (a source index) is currently expanded.
+    static bool IsExpanded(DataTableState st, int row) {
+        return st.expandedRows.IndexOf(row) >= 0;
+    }
+
+    /// Whether `row` offers a detail panel — false when the feature is off or the
+    /// provider declines this row, in which case no chevron is drawn.
+    static bool CanExpand(DataTableState st, DataSource src, int row) {
+        if (st.detail == null) { return false; }
+        if (row < 0 || row >= src.RowCount()) { return false; }
+        return st.detail.CanExpand(src, row);
+    }
+
+    /// Open `row`'s detail panel. A row the provider declines, or one already
+    /// open, is left as it is.
+    static void ExpandRow(DataTableState st, DataSource src, int row) {
+        if (!DataTable.CanExpand(st, src, row)) { return; }
+        if (st.expandedRows.IndexOf(row) >= 0) { return; }
+        st.expandedRows.Add(row);
+        st.dirty = true;
+    }
+
+    /// Close `row`'s detail panel. A row that isn't open is left as it is.
+    static void CollapseRow(DataTableState st, int row) {
+        int i = st.expandedRows.IndexOf(row);
+        if (i < 0) { return; }
+        st.expandedRows.RemoveAt(i);
+        st.dirty = true;
+    }
+
+    /// Flip `row`'s detail panel open or shut.
+    static void ToggleDetail(DataTableState st, DataSource src, int row) {
+        if (DataTable.IsExpanded(st, row)) { DataTable.CollapseRow(st, row); }
+        else { DataTable.ExpandRow(st, src, row); }
+    }
+
+    /// Close every open detail panel.
+    static void CollapseAllDetail(DataTableState st) {
+        if (st.expandedRows.Count == 0) { return; }
+        st.expandedRows.Clear();
+        st.dirty = true;
+    }
+
+    /// How many rows currently have their detail panel open.
+    static int ExpandedCount(DataTableState st) { return st.expandedRows.Count; }
 
     // Path key for the group that data row `rowIdx` belongs to at nesting
     // `level` — the concatenation of its group-column values down to that level,
@@ -2042,6 +2323,7 @@ partial class DataTable {
             int i = 0;
             while (i < st.order.Count) {
                 st.dispRows.Add(new DispRow(0, st.order[i], i + 1));
+                DataTable.EmitDetail(st, src, st.order[i]);
                 i = i + 1;
             }
             return;
@@ -2096,8 +2378,34 @@ partial class DataTable {
             dataNo = dataNo + 1;
             if (!anyColl) {
                 st.dispRows.Add(new DispRow(0, rowIdx, dataNo));
+                DataTable.EmitDetail(st, src, rowIdx);
             }
             p = p + 1;
+        }
+    }
+
+    /// Append a detail band for `row` when it is expanded: `DetailSlots` blank
+    /// kind-2 entries, each naming the master row and numbered by `part`. A
+    /// collapsed row, or one in a table with no provider, contributes nothing —
+    /// so an unexpanded grid flattens exactly as it did before the feature.
+    ///
+    /// The band takes whole row slots rather than a free-form pixel height so the
+    /// body can keep converting between a slot and its Y with a multiply; see
+    /// `DispRow`.
+    static void EmitDetail(DataTableState st, DataSource src, int row) {
+        if (st.detail == null) { return; }
+        if (st.expandedRows.IndexOf(row) < 0) { return; }
+        // A row the provider has since declined (its children were deleted, say)
+        // stays in expandedRows but contributes no band, so the list needs no
+        // pruning when the underlying data changes.
+        if (!st.detail.CanExpand(src, row)) { return; }
+        int n = DataTable.DetailSlots(st, src, row);
+        int k = 0;
+        while (k < n) {
+            DispRow d = new DispRow(2, row, 0);
+            d.part = k;
+            st.dispRows.Add(d);
+            k = k + 1;
         }
     }
 

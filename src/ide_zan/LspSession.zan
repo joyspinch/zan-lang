@@ -22,6 +22,12 @@ class LspSession {
     static extern int ws_send(int s, string buf, int len, int flags);
     [DllImport("ws2_32", EntryPoint = "recv")]
     static extern int ws_recv(int s, string buf, int len, int flags);
+    [DllImport("ws2_32", EntryPoint = "setsockopt")]
+    static extern int ws_setsockopt(int s, int level, int opt, string val, int len);
+    [DllImport("ws2_32", EntryPoint = "ioctlsocket")]
+    static extern int ws_ioctl(int s, int cmd, string argp);
+    [DllImport("ws2_32", EntryPoint = "WSAGetLastError")]
+    static extern int ws_lasterr();
     [DllImport("ws2_32", EntryPoint = "htons")]
     static extern int ws_htons(int v);
     [DllImport("ws2_32", EntryPoint = "inet_addr")]
@@ -39,6 +45,8 @@ class LspSession {
     static extern int ws_send(int s, string buf, int len, int flags);
     [DllImport("crt", EntryPoint = "recv")]
     static extern int ws_recv(int s, string buf, int len, int flags);
+    [DllImport("crt", EntryPoint = "setsockopt")]
+    static extern int ws_setsockopt(int s, int level, int opt, string val, int len);
     [DllImport("crt", EntryPoint = "htons")]
     static extern int ws_htons(int v);
     [DllImport("crt", EntryPoint = "inet_addr")]
@@ -57,6 +65,17 @@ class LspSession {
     int seq;
     bool alive;
     string rbuf;
+    /// -1 when the last recv timed out, 0 when the peer closed, else the byte
+    /// count. A timeout must not be mistaken for a dead server: the language
+    /// server can simply be busy indexing.
+    int lastRecv;
+    /// Remaining recv timeouts the current request may absorb before it gives
+    /// up. Bounded so a hung or slow server can never freeze the event loop:
+    /// go-to-definition falls back to the text scan instead.
+    int waitsLeft;
+    /// Recv timeouts a request may absorb. Raised for the initialize handshake,
+    /// which indexes the whole workspace before it answers.
+    int waitBudget;
 
     /// Spawns `zan-lsp --port N`, connects and runs the LSP initialize
     /// handshake with `root` as the workspace root (enables project-wide
@@ -66,7 +85,7 @@ class LspSession {
         if (!File.Exists(exe)) { exe = ZanIDE.ExeDir() + "/zan-lsp" + ZanIDE.ExeSuffix(); }
         if (!File.Exists(exe)) { return null; }
         int attempt = 0;
-        while (attempt < 4) {
+        while (attempt < 2) {
             int port = 47411 + attempt;
             Process.RunDetached("\"" + exe + "\" --port " + Convert.ToString(port));
             LspSession s = LspSession.Open(port, root);
@@ -82,6 +101,9 @@ class LspSession {
         d.seq = 1;
         d.alive = false;
         d.rbuf = "";
+        d.lastRecv = 0;
+        d.waitsLeft = LspSession.RequestWaits();
+        d.waitBudget = LspSession.RequestWaits();
 
         #if WINDOWS
         string wsa = calloc(512, 1);
@@ -94,6 +116,33 @@ class LspSession {
         d.sock = s;
 
         bool connected = false;
+        #if WINDOWS
+        // A blocking connect() cannot be bounded and hangs the whole UI when
+        // the SYN is dropped (a filter driver or a wedged server leaves the
+        // socket in SYN_SENT for minutes). Drive it non-blocking instead:
+        // repeated connect() calls report WSAEISCONN once the handshake lands,
+        // so the wait stays inside our own bounded loop.
+        {
+            string one = calloc(4, 1);
+            one[0] = 1;
+            ws_ioctl(s, 0 - 2147195266, one);
+            free(one);
+        }
+        int tries = 0;
+        while (tries < 25 && !connected) {
+            string addr = d.BuildAddr(port);
+            int r = ws_connect(s, addr, 16);
+            free(addr);
+            // 0 = connected, WSAEISCONN = already connected.
+            if (r == 0 || ws_lasterr() == 10056) { connected = true; }
+            else { d.SnoozeMs(20); tries = tries + 1; }
+        }
+        if (connected) {
+            string zero = calloc(4, 1);
+            ws_ioctl(s, 0 - 2147195266, zero);
+            free(zero);
+        }
+        #else
         int tries = 0;
         while (tries < 100 && !connected) {
             string addr = d.BuildAddr(port);
@@ -102,13 +151,19 @@ class LspSession {
             if (r == 0) { connected = true; }
             else { d.SnoozeMs(20); tries = tries + 1; }
         }
+        #endif
         if (!connected) { ws_close(s); return null; }
+        d.SetRecvTimeout(LspSession.RecvTimeoutMs());
         d.alive = true;
 
+        // The handshake indexes the workspace, so allow it a minute before
+        // deciding the server is unusable; ordinary requests stay snappy.
+        d.waitBudget = 40;
         string m = d.RequestWait("initialize",
             "{\"processId\":null,\"rootUri\":\"" + LspSession.PathToUri(root)
             + "\",\"capabilities\":{}}");
         if (m.Length == 0) { d.Shutdown(); return null; }
+        d.waitBudget = LspSession.RequestWaits();
         d.Notify("initialized", "{}");
         return d;
     }
@@ -347,6 +402,7 @@ class LspSession {
         if (paramsJson.Length > 0) { body = body + ",\"params\":" + paramsJson; }
         body = body + "}";
         this.SendMsg(body);
+        this.waitsLeft = this.waitBudget;
         int guard = 0;
         while (guard < 100000) {
             guard = guard + 1;
@@ -360,10 +416,44 @@ class LspSession {
         return "";
     }
 
+    /// One blocking recv's worth of milliseconds. Short enough that the IDE
+    /// notices a wedged server quickly, long enough that a busy one still wins.
+    static int RecvTimeoutMs() { return 250; }
+
+    /// Recv timeouts one request may absorb (250ms each) before falling back.
+    static int RequestWaits() { return 24; }
+
+    /// Bounds every blocking recv so the UI thread cannot park in the kernel
+    /// forever when the server stops answering.
+    void SetRecvTimeout(int ms) {
+        #if WINDOWS
+        // Winsock takes a DWORD of milliseconds.
+        string v = calloc(4, 1);
+        v[0] = ms & 255;
+        v[1] = (ms >> 8) & 255;
+        v[2] = (ms >> 16) & 255;
+        v[3] = (ms >> 24) & 255;
+        ws_setsockopt(this.sock, 65535, 4102, v, 4);
+        free(v);
+        #else
+        // POSIX takes a struct timeval { time_t sec; suseconds_t usec; }.
+        string v = calloc(16, 1);
+        int us = (ms % 1000) * 1000;
+        v[0] = (ms / 1000) & 255;
+        v[8] = us & 255;
+        v[9] = (us >> 8) & 255;
+        v[10] = (us >> 16) & 255;
+        v[11] = (us >> 24) & 255;
+        ws_setsockopt(this.sock, 1, 20, v, 16);
+        free(v);
+        #endif
+    }
+
     string RecvChunk() {
         int cap = 65536;
         string buf = calloc(cap + 1, 1);
         int n = ws_recv(this.sock, buf, cap, 0);
+        this.lastRecv = n;
         if (n <= 0) { free(buf); return ""; }
         string res = buf.Substring(0, n);
         free(buf);
@@ -387,7 +477,13 @@ class LspSession {
                 }
             }
             string chunk = this.RecvChunk();
-            if (chunk.Length == 0) { this.alive = false; return ""; }
+            if (chunk.Length == 0) {
+                if (this.lastRecv == 0) { this.alive = false; return ""; }
+                // Timed out: the server is alive but has not answered yet.
+                this.waitsLeft = this.waitsLeft - 1;
+                if (this.waitsLeft <= 0) { return ""; }
+                continue;
+            }
             this.rbuf = this.rbuf + chunk;
         }
         return "";

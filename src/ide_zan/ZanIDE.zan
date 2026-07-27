@@ -1042,6 +1042,12 @@ partial class ZanIDE {
         // Whole-window opacity (percent), persisted like the skin.
         int winOpacity = ZanIDE.CfgClamp(ZanIDE.CfgInt(cfg, "opacity", 100), 30, 100);
         app.SetWindowOpacity(winOpacity);
+        // Custom window wallpaper (image + blend strength), set in the
+        // appearance drawer and persisted like the skin.
+        string wallPath = ZanIDE.CfgStr(cfg, "wallpaper", "");
+        int wallOpacity = ZanIDE.CfgClamp(ZanIDE.CfgInt(cfg, "wallOpacity", 100), 10, 100);
+        if (wallPath != "" && !File.Exists(wallPath)) { wallPath = ""; }
+        app.SetWallpaper(wallPath, wallOpacity);
         int savedW = cfgW;
         int savedH = cfgH;
 
@@ -1057,7 +1063,14 @@ partial class ZanIDE {
         // Completion answers from the compiler's own symbol index; load
         // whatever the last build left behind and refresh it in the
         // background so it follows the code.
-        if (haveProject) { ZanIDE.LoadSymbolIndexFor(root); }
+        if (haveProject) {
+            if (!ZanIDE.LoadSymbolIndexFor(root)) {
+                // Never built here: generate the index in the background so
+                // hover and completion show real signatures (including stdlib
+                // ones) instead of falling back to guesses.
+                ZanIDE.EmitSymbolsDetach(root, root + "/src/main.zan");
+            }
+        }
         List<TreeNode> tree = new List<TreeNode>();
         if (haveProject) { tree = ZanIDE.ScanTree(root); }
         bool rescan = false;
@@ -1550,6 +1563,30 @@ partial class ZanIDE {
                 }
                 if (aiWindow != null && aiWindow.IsOpen()) {
                     aiWindow.FollowOpacity(winOpacity);
+                }
+            }
+            // Wallpaper: the appearance drawer asks the host to pick a file
+            // (App has no file dialog), and any change follows to the children.
+            if (app.ConsumeWallpaperPick() && !pathPicker.IsOpen()) {
+                pathPicker.BeginOpenFile(
+                    ZanIDE.ReadLastPickerDirectory(root), ".png;.jpg;.jpeg;.bmp",
+                    ZanIDE.T("Choose a window background image", "选择窗口背景图片"));
+                pathPickerOwner = 9;
+                app.RequestRedraw();
+            }
+            if (app.WallpaperPath() != wallPath
+                    || app.WallpaperOpacity() != wallOpacity) {
+                wallPath = app.WallpaperPath();
+                wallOpacity = app.WallpaperOpacity();
+                if (dlg != null) { dlg.SetWallpaper(wallPath, wallOpacity); }
+                if (pubWin != null) { pubWin.SetWallpaper(wallPath, wallOpacity); }
+                if (cfgWin != null) { cfgWin.SetWallpaper(wallPath, wallOpacity); }
+                if (assetWin != null) { assetWin.SetWallpaper(wallPath, wallOpacity); }
+                if (settingsWindow != null && settingsWindow.IsOpen()) {
+                    settingsWindow.FollowWallpaper(wallPath, wallOpacity);
+                }
+                if (aiWindow != null && aiWindow.IsOpen()) {
+                    aiWindow.FollowWallpaper(wallPath, wallOpacity);
                 }
             }
             // One shared event pump drives BOTH the main window and any open
@@ -2072,6 +2109,7 @@ partial class ZanIDE {
                         pubWin.SetChromeButtons(false, false, false, false);
                         pubWin.Show();
                         pubWin.SetWindowOpacity(app.WindowOpacity());
+                        pubWin.SetWallpaper(app.WallpaperPath(), app.WallpaperOpacity());
                     }
                     app.RequestRedraw();
                 } else if (rc == 7) {
@@ -2164,6 +2202,7 @@ partial class ZanIDE {
                             cfgWin.SetChromeButtons(false, false, false, false);
                             cfgWin.Show();
                             cfgWin.SetWindowOpacity(app.WindowOpacity());
+                            cfgWin.SetWallpaper(app.WallpaperPath(), app.WallpaperOpacity());
                         }
                     } else {
                         log.Add("> Open or create a project first to configure it.");
@@ -2185,6 +2224,7 @@ partial class ZanIDE {
                             assetWin.SetChromeButtons(false, false, true, true);
                             assetWin.Show();
                             assetWin.SetWindowOpacity(app.WindowOpacity());
+                            assetWin.SetWallpaper(app.WallpaperPath(), app.WallpaperOpacity());
                         }
                     } else {
                         log.Add("> Open or create a project first to manage its assets.");
@@ -3400,15 +3440,31 @@ partial class ZanIDE {
                         aiModelSelProf = aiProfActive;
                     }
                     int aiRow2H = app.Scale(30);
-                    int aiHdrH = app.Scale(34) + aiRow2H;
+                    // The model row is a medium-height control (34dp) placed 4dp
+                    // down, so the session row must start below 4+34 -- the old
+                    // 34+2 clipped the select's bottom edge.
+                    int aiRow1Y = rBody.y + app.Scale(4);
+                    int aiRow1H = app.Scale(34);
+                    int aiRow2Y = aiRow1Y + aiRow1H + app.Scale(6);
+                    int aiHdrH = aiRow2Y - rBody.y + aiRow2H + app.Scale(4);
                     int aiSmBtnW = app.Scale(52);
                     int aiSelW = rBody.width - rPad * 4 - aiSmBtnW * 2;
-                    if (aiSelW < app.Scale(60)) { aiSelW = app.Scale(60); }
-                    aiModelSel.Render(app, rBody.x + rPad, rBody.y + app.Scale(4), aiSelW);
+                    if (aiSelW < app.Scale(60)) {
+                        // A narrow panel cannot hold the natural sizes: share
+                        // the strip instead of letting the buttons run past the
+                        // right edge (and over each other).
+                        int aiStrip = rBody.width - rPad * 4;
+                        if (aiStrip < app.Scale(48)) { aiStrip = app.Scale(48); }
+                        aiSmBtnW = aiStrip * 22 / 100;
+                        if (aiSmBtnW < app.Scale(24)) { aiSmBtnW = app.Scale(24); }
+                        aiSelW = aiStrip - aiSmBtnW * 2;
+                        if (aiSelW < app.Scale(24)) { aiSelW = app.Scale(24); }
+                    }
+                    aiModelSel.Render(app, rBody.x + rPad, aiRow1Y, aiSelW);
                     int aiPredId = aiPredictBtn.Render(app,
-                        rBody.x + rPad * 2 + aiSelW, rBody.y + app.Scale(4), aiSmBtnW);
+                        rBody.x + rPad * 2 + aiSelW, aiRow1Y, aiSmBtnW);
                     int aiCfgId = aiCfgBtn.Render(app,
-                        rBody.x + rPad * 3 + aiSelW + aiSmBtnW, rBody.y + app.Scale(4), aiSmBtnW);
+                        rBody.x + rPad * 3 + aiSelW + aiSmBtnW, aiRow1Y, aiSmBtnW);
                     if (Button.WasClicked(app, aiCfgId)) {
                         if (aiWindow == null || !aiWindow.IsOpen()) {
                             aiWindow = AiSettingsWindow.Open(app, ZanIDE.uiLang);
@@ -3418,13 +3474,26 @@ partial class ZanIDE {
                     // ---- Session row: switch / new / clear chat contexts ----
                     int sNavW = app.Scale(24);
                     int sBtnW = app.Scale(62);
-                    int sy = rBody.y + app.Scale(34) + app.Scale(2);
+                    // Keep New/Clear inside the panel: they shrink before they
+                    // reach the session label on their left.
+                    int sRoom = rBody.width - rPad * 3 - sNavW * 2 - app.Scale(20);
+                    if (sBtnW * 2 > sRoom) {
+                        sBtnW = sRoom / 2;
+                        if (sBtnW < app.Scale(26)) { sBtnW = app.Scale(26); }
+                    }
+                    int sy = aiRow2Y;
                     int sPrevId = aiSessPrevBtn.Render(app, rBody.x + rPad, sy, sNavW);
                     int sNextId = aiSessNextBtn.Render(app,
                         rBody.x + rPad + sNavW + app.Scale(4), sy, sNavW);
-                    c.DrawText(rBody.x + rPad + sNavW * 2 + app.Scale(12), sy + app.Scale(6),
+                    int sLabX = rBody.x + rPad + sNavW * 2 + app.Scale(12);
+                    int sLabW = rBody.x + rBody.width - rPad * 2 - sBtnW * 2
+                                - app.Scale(6) - sLabX;
+                    if (sLabW < 0) { sLabW = 0; }
+                    c.PushClip(sLabX, sy, sLabW, aiRow2H);
+                    c.DrawText(sLabX, sy + app.Scale(6),
                         ZanIDE.T("Chat ", "会话 ") + Convert.ToString(aiSessCur + 1) + "/"
                         + Convert.ToString(aiSessions.Count), t.textSecondary, t.fontSizeSmall);
+                    c.PopClip();
                     int sNewId = aiSessNewBtn.Render(app,
                         rBody.x + rBody.width - rPad * 2 - sBtnW * 2, sy, sBtnW);
                     int sClrId = aiSessClearBtn.Render(app,
@@ -4522,6 +4591,7 @@ partial class ZanIDE {
                         assetWin.SetChromeButtons(false, false, true, true);
                         assetWin.Show();
                         assetWin.SetWindowOpacity(app.WindowOpacity());
+                        assetWin.SetWallpaper(app.WallpaperPath(), app.WallpaperOpacity());
                     }
                     app.RequestRedraw();
                 }
@@ -4658,6 +4728,8 @@ partial class ZanIDE {
                     ZanIDE.AddProjLink(root, picked);
                     log.Add("> Linked resource: " + picked);
                     Layer.Msg(ZanIDE.T("Resource linked: ", "已链接资源：") + Path.GetFileName(picked), 3);
+                } else if (pathPickerOwner == 9) {
+                    app.SetWallpaper(picked, app.WallpaperOpacity());
                 } else if (pathPickerOwner == 4) {
                     string projectRoot = ZanIDE.FindProjectRoot(picked);
                     haveProject = projectRoot != "";
@@ -4697,7 +4769,7 @@ partial class ZanIDE {
         // Persist window + panel sizes so the next launch restores them.
         int arv = 0;
         if (autoRun) { arv = 1; }
-        ZanIDE.SaveSettings(treeW.Get(), bottomPanelH.Get(), savedW, savedH, arv, app.ThemeMenuIndex(), rightW.Get(), winOpacity);
+        ZanIDE.SaveSettings(treeW.Get(), bottomPanelH.Get(), savedW, savedH, arv, app.ThemeMenuIndex(), rightW.Get(), winOpacity, app.WallpaperPath(), app.WallpaperOpacity());
     }
 
     /// Spawns a fresh wizard child window (a real draggable top-level window),
@@ -4709,6 +4781,7 @@ partial class ZanIDE {
         w.ApplySkin(parent.ThemeMenuIndex());
         w.Show();
         w.SetWindowOpacity(parent.WindowOpacity());
+        w.SetWallpaper(parent.WallpaperPath(), parent.WallpaperOpacity());
         sel.Set(0);
         nameInput.SetText(defName);
         return w;
