@@ -920,6 +920,37 @@ static bool zan_type_defines(zan_irgen_t *g, const char *type_name,
     return get_method_sym(sym, mn) != NULL;
 }
 
+/* Arrays carry their element count in a 16-byte header that sits in front of
+ * the buffer; the value a program holds points at the first element, so the
+ * pointer can still be handed to C unchanged. */
+#define ZAN_ARRAY_HEADER 16
+
+static LLVMValueRef zan_array_alloc(zan_irgen_t *g, LLVMValueRef total,
+                                    LLVMValueRef count) {
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+    LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
+    LLVMTypeRef i8ptr = LLVMPointerType(i8, 0);
+    LLVMValueRef bytes = LLVMBuildAdd(g->builder, total,
+        LLVMConstInt(i64, ZAN_ARRAY_HEADER, 0), "arr.bytes");
+    LLVMValueRef raw = zan_call2(g->builder,
+        LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i64, i64 }, 2, 0),
+        get_calloc_fn(g), (LLVMValueRef[]){ bytes, LLVMConstInt(i64, 1, 0) }, 2, "arr.raw");
+    LLVMBuildStore(g->builder, count,
+        LLVMBuildBitCast(g->builder, raw, LLVMPointerType(i64, 0), "arr.hdr"));
+    LLVMValueRef off = LLVMConstInt(i64, ZAN_ARRAY_HEADER, 0);
+    return LLVMBuildGEP2(g->builder, i8, raw, &off, 1, "arr");
+}
+
+static LLVMValueRef zan_array_len(zan_irgen_t *g, LLVMValueRef arr) {
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+    LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
+    LLVMValueRef off = LLVMConstInt(i64, (unsigned long long)-ZAN_ARRAY_HEADER, 1);
+    LLVMValueRef hdr = LLVMBuildGEP2(g->builder, i8, arr, &off, 1, "arr.hdrp");
+    return LLVMBuildLoad2(g->builder, i64,
+        LLVMBuildBitCast(g->builder, hdr, LLVMPointerType(i64, 0), "arr.hdrc"),
+        "arr.len");
+}
+
 static bool is_call_to(zan_ast_node_t *expr, const char *obj, const char *method) {
     if (expr->kind != AST_CALL) return false;
     zan_ast_node_t *callee = expr->call.callee;

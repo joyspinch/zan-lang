@@ -1759,14 +1759,12 @@ static LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr
             }
         }
 
-        /* array.Length: read the element count captured at declaration. */
-        if (expr->member.name.len == 6 && memcmp(expr->member.name.str, "Length", 6) == 0 &&
-            expr->member.object->kind == AST_IDENTIFIER) {
-            local_var_t *arr_local = local_find(locals, expr->member.object->ident.name);
-            if (arr_local && arr_local->type && arr_local->type->kind == TYPE_ARRAY &&
-                arr_local->arr_len_slot) {
-                return LLVMBuildLoad2(g->builder, LLVMInt64TypeInContext(g->ctx),
-                                      arr_local->arr_len_slot, "arr.len");
+        /* array.Length: read the element count from the array header. */
+        if (expr->member.name.len == 6 && memcmp(expr->member.name.str, "Length", 6) == 0) {
+            zan_type_t *at = infer_expr_type(g, expr->member.object, locals);
+            if (at && at->kind == TYPE_ARRAY) {
+                LLVMValueRef arr = emit_expr(g, expr->member.object, locals);
+                return zan_array_len(g, arr);
             }
         }
 
@@ -2432,11 +2430,8 @@ static LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
             LLVMValueRef total = zan_mul(g->builder,
                 LLVMConstInt(i64t, (unsigned long long)n, 0),
                 LLVMSizeOf(elem_llvm), "total");
-            LLVMValueRef arr = zan_call2(g->builder,
-                LLVMFunctionType(i8ptr,
-                    (LLVMTypeRef[]){ i64t, i64t }, 2, 0),
-                get_calloc_fn(g),
-                (LLVMValueRef[]){ total, LLVMConstInt(i64t, 1, 0) }, 2, "arr");
+            LLVMValueRef arr = zan_array_alloc(g, total,
+                LLVMConstInt(i64t, (unsigned long long)n, 0));
             for (int k = 0; k < n; k++) {
                 LLVMValueRef v = emit_arg_typed(g, expr->new_expr.args.items[k],
                                                 elem_type, locals);
@@ -2462,11 +2457,9 @@ static LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
             LLVMValueRef total = zan_mul(g->builder,
                 LLVMBuildZExt(g->builder, size_val, LLVMInt64TypeInContext(g->ctx), "zext"),
                 elem_size, "total");
-            LLVMValueRef arr = zan_call2(g->builder,
-                LLVMFunctionType(LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0),
-                    (LLVMTypeRef[]){LLVMInt64TypeInContext(g->ctx), LLVMInt64TypeInContext(g->ctx)}, 2, 0),
-                get_calloc_fn(g), (LLVMValueRef[]){ total, LLVMConstInt(LLVMInt64TypeInContext(g->ctx), 1, 0) }, 2, "arr");
-            return arr;
+            return zan_array_alloc(g, total,
+                LLVMBuildZExt(g->builder, size_val,
+                    LLVMInt64TypeInContext(g->ctx), "arr.count"));
         }
 
         /* new ClassName(args) — allocate struct + call constructor */

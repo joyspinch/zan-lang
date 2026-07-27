@@ -1283,19 +1283,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         bool fe_string = col_type && col_type->kind == TYPE_STRING;
         LLVMValueRef fe_len = NULL;
         if (fe_array) {
-            if (stmt->foreach_stmt.collection->kind == AST_IDENTIFIER) {
-                local_var_t *al = local_find(locals,
-                    stmt->foreach_stmt.collection->ident.name);
-                if (al && al->arr_len_slot)
-                    fe_len = LLVMBuildLoad2(g->builder, i64, al->arr_len_slot, "fe.alen");
-            }
-            if (!fe_len) {
-                zan_diag_emit(g->diag, DIAG_ERROR, stmt->loc,
-                    "cannot foreach over this array: its length is only known "
-                    "where it was declared (iterate with an index, or use "
-                    "List<T>)");
-                fe_len = LLVMConstInt(i64, 0, 0);
-            }
+            fe_len = zan_array_len(g, collection);
         } else if (fe_string) {
             LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
             LLVMTypeRef slt = LLVMFunctionType(i64, (LLVMTypeRef[]){ i8ptr }, 1, 0);
