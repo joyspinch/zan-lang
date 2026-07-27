@@ -1,104 +1,10 @@
-/* gui_runtime_shims.c -- macOS/other windowing dispatch, portable shims for Win32-only
- * functions and the embedded WebView control.
+/* gui_runtime_shims.c -- the embedded WebView control's macOS-without-Cocoa
+ * fallback.
  *
  * Part of the gui_runtime translation unit: #include'd by gui_runtime.c in
  * a fixed order; not compiled standalone (preprocessor state and static
  * linkage are shared across the parts).
  */
-
-/* ========================================================================
- * macOS (and other non-Windows, non-Linux) windowing.
- *
- * When ZAN_GUI_COCOA is defined the real Cocoa backend in gui_runtime_mac.m
- * provides these; otherwise they are no-op stubs so the library still links.
- * Text rendering is the shared software path above, so it is omitted here.
- * The unified SDL backend (ZAN_GUI_SDL) supplies real implementations, so the
- * stubs are compiled out there too. */
-#if !defined(_WIN32) && !defined(__linux__) && !defined(ZAN_GUI_COCOA) && !defined(ZAN_GUI_SDL)
-
-EXPORT iptr zan_gui_create_window(const char *t, i64 w, i64 h) { (void)t;(void)w;(void)h; return 0; }
-EXPORT i64 zan_gui_show_window(i64 h) { (void)h; return 0; }
-EXPORT i64 zan_gui_wait_event(void) { return -1; }
-EXPORT i64 zan_gui_wait_event_timeout(i64 ms) { (void)ms; return -1; }
-EXPORT i64 zan_gui_poll_event(void) { return -1; }
-EXPORT i64 zan_gui_wake(void) { return 0; }
-EXPORT i64 zan_gui_event_kind(void) { return 0; }
-EXPORT i64 zan_gui_event_x(void) { return 0; }
-EXPORT i64 zan_gui_event_y(void) { return 0; }
-EXPORT i64 zan_gui_event_button(void) { return 0; }
-EXPORT i64 zan_gui_event_keycode(void) { return 0; }
-EXPORT i64 zan_gui_event_mods(void) { return 0; }
-EXPORT i64 zan_gui_window_width(void) { return 0; }
-EXPORT i64 zan_gui_window_height(void) { return 0; }
-EXPORT iptr zan_gui_event_hwnd(void) { return 0; }
-EXPORT i64 zan_gui_client_width(i64 h) { (void)h; return 0; }
-EXPORT i64 zan_gui_client_height(i64 h) { (void)h; return 0; }
-EXPORT i64 zan_gui_present(i64 h, i64 s) { (void)h;(void)s; return 1; }
-EXPORT i64 zan_gui_present_dirty_add(i64 x, i64 y, i64 w, i64 h) {
-    (void)x;(void)y;(void)w;(void)h; return 0;
-}
-EXPORT i64 zan_gui_set_title(i64 h, const char *t) { (void)h;(void)t; return 0; }
-EXPORT i64 zan_gui_set_cursor(i64 c) { (void)c; return 0; }
-EXPORT i64 zan_gui_get_tick_ms(void) { return 0; }
-EXPORT void zan_gui_sleep_ms(i64 ms) { (void)ms; }
-
-#endif
-
-/* ========================================================================
- * Portable / fallback shims for functions native only to Win32.
- * ========================================================================
- * The Win32, X11 and Cocoa backends all draw their own client-side title bar
- * and supply these; only the headless/no-op fallback reports 0. */
-#if !defined(_WIN32) && !defined(__linux__) && !defined(ZAN_GUI_COCOA) && !defined(ZAN_GUI_SDL)
-EXPORT i64 zan_gui_caption_button_width(void) { return 0; }
-EXPORT i64 zan_gui_titlebar_height(void) { return 0; }
-EXPORT i64 zan_gui_set_caption_buttons(iptr hwnd_val, i64 count) { (void)hwnd_val; (void)count; return 0; }
-#endif
-
-/* write_file is portable across every non-Win32 backend (X11, Cocoa and the
- * no-op fallback all need it), so it lives outside the CSD-metrics guard. The
- * SDL backend supplies its own (SDL_IOStream) write_file. */
-#if !defined(_WIN32) && !defined(ZAN_GUI_SDL)
-EXPORT i64 zan_gui_write_file(const char *path, const char *utf8) {
-    FILE *f = fopen(path, "wb");
-    if (!f) return 1;
-    if (utf8) fwrite(utf8, 1, strlen(utf8), f);
-    fclose(f);
-    return 0;
-}
-#endif
-
-/* Native translucent glass. Windows has the DWM-acrylic implementation above.
- * macOS (NSVisualEffectView) and Linux (compositor blur) get real backends in
- * their own sections; any other target links a no-op so the cross-platform
- * Gui.Native.Window.EnableGlass entry points resolve everywhere. */
-#if !defined(_WIN32) && !defined(__linux__) && !defined(ZAN_GUI_COCOA) && !defined(ZAN_GUI_SDL)
-EXPORT i64 zan_gui_enable_glass(iptr hwnd_val, i64 tint_argb) {
-    (void)hwnd_val; (void)tint_argb; return 1;
-}
-EXPORT i64 zan_gui_disable_glass(iptr hwnd_val) { (void)hwnd_val; return 1; }
-EXPORT i64 zan_gui_set_opacity(iptr hwnd_val, i64 percent) {
-    (void)hwnd_val; (void)percent; return 1;
-}
-#endif
-
-/* Window management: X11 has real implementations in the __linux__ branch
- * above; the Cocoa backend (ZAN_GUI_COCOA) provides them on macOS. Any other
- * non-Windows target falls back to no-ops. */
-#if !defined(_WIN32) && !defined(__linux__) && !defined(ZAN_GUI_COCOA) && !defined(ZAN_GUI_SDL)
-EXPORT i64 zan_gui_get_dpi_scale(void) { return 100; }
-EXPORT i64 zan_gui_close_window(iptr hwnd_val) { (void)hwnd_val; return 0; }
-EXPORT i64 zan_gui_destroy_window(iptr hwnd_val) { (void)hwnd_val; return 0; }
-EXPORT i64 zan_gui_minimize(iptr hwnd_val) { (void)hwnd_val; return 0; }
-EXPORT i64 zan_gui_toggle_maximize(iptr hwnd_val) { (void)hwnd_val; return 0; }
-EXPORT i64 zan_gui_is_maximized(iptr hwnd_val) { (void)hwnd_val; return 0; }
-EXPORT i64 zan_gui_window_visible(iptr hwnd_val) { (void)hwnd_val; return 1; }
-EXPORT i64 zan_gui_window_focused(iptr hwnd_val) { (void)hwnd_val; return 1; }
-EXPORT i64 zan_gui_set_topmost(iptr hwnd_val, i64 on) { (void)hwnd_val; (void)on; return 0; }
-EXPORT i64 zan_gui_set_clipboard(const char *utf8) { (void)utf8; return 0; }
-EXPORT const char *zan_gui_get_clipboard(void) { return ""; }
-EXPORT void zan_gui_set_ime_pos(i64 x, i64 y) { (void)x; (void)y; }
-#endif
 
 /* ========================================================================
  * Embedded WebView (native browser control).
@@ -107,17 +13,19 @@ EXPORT void zan_gui_set_ime_pos(i64 x, i64 y) { (void)x; (void)y; }
  * (WKWebView on macOS, WebView2 on Windows, WebKitGTK on Linux). Only macOS
  * needs a backend here (gui_runtime_mac.m, ZAN_GUI_COCOA): a WKWebView subview
  * of the window's content view. Windows drives Edge WebView2 from Zan itself
- * (stdlib/Gui/WebView2.zan, straight against its COM interfaces) and never
- * calls these exports. Everywhere else they are no-op stubs:
- * zan_gui_webview_create returns 0 so the Zan WebView widget can detect the
- * lack of native support and paint an in-canvas placeholder instead of
- * embedding a live browser.
+ * (stdlib/Gui/WebView2.zan, straight against its COM interfaces) and every
+ * other platform takes WebViewBackend's own fallback, so neither references
+ * these exports. Only a macOS build that opts out of the Cocoa backend (the
+ * SDL windowing shell) still binds them, and gets no-op stubs:
+ * zan_gui_webview_create returns 0 so the Zan WebView widget detects the lack
+ * of native support and paints an in-canvas placeholder instead of embedding
+ * a live browser.
  * ======================================================================== */
-#if !defined(ZAN_GUI_COCOA)
+#if defined(__APPLE__) && !defined(ZAN_GUI_COCOA)
 /* profile_id selects a per-account isolation profile (see WebView.zan). When a
  * real backend is added here it should map profile_id to that engine's data
- * partitioning -- on Linux a WebKitGTK WebKitWebsiteDataManager with a
- * per-profile base data/cache directory. Until then it is a no-op stub. */
+ * partitioning -- a WKWebsiteDataStore with a per-profile identifier. Until
+ * then it is a no-op stub. */
 EXPORT i64 zan_gui_webview_create(iptr hwnd, const char *profile_id) {
     (void)hwnd; (void)profile_id; return 0;
 }
