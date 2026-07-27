@@ -45,4 +45,9 @@ const zan_builtin_type_t *zan_builtin_find(const char *type);
  * a receiver this table says nothing about. */
 int zan_builtin_has_member(const char *type, const char *name, int name_len);
 
+/* The kind ('M', 'P', 'F') of `type`'s member `name`, or 'M' when the table
+   says nothing about the type or the member, so callers never reject a
+   receiver this table does not describe. */
+char zan_builtin_member_kind(const char *type, const char *name, int name_len);
+
 #endif /* ZAN_BUILTIN_API_H */

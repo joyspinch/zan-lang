@@ -756,6 +756,14 @@ add_test(NAME diag_no_runaway
 set_tests_properties(diag_no_runaway PROPERTIES
   WILL_FAIL TRUE TIMEOUT 20)
 
+# A property called as a method (`list.Count()`) must be a compile error, not a
+# silent constant 0.
+add_test(NAME diag_property_call
+  COMMAND zanc ${CMAKE_SOURCE_DIR}/tests/diag/property_call.zan
+    -o ${CMAKE_BINARY_DIR}/diag_property_call${_exe_ext})
+set_tests_properties(diag_property_call PROPERTIES
+  WILL_FAIL TRUE TIMEOUT 60)
+
 # ---- Golden compiler regression tests ----
 # Freeze the lexer token stream and parse tree for a set of hermetic (stdlib-free)
 # .zan inputs so any lexer/parser/AST regression is caught in CI on every

@@ -177,6 +177,17 @@ const zan_builtin_type_t *zan_builtin_find(const char *type) {
     return NULL;
 }
 
+char zan_builtin_member_kind(const char *type, const char *name, int name_len) {
+    const zan_builtin_type_t *bt = zan_builtin_find(type);
+    if (!bt || !name || name_len <= 0) return 'M';
+    for (int i = 0; i < bt->member_count; i++) {
+        const char *m = bt->members[i].name;
+        if ((int)strlen(m) == name_len && memcmp(m, name, (size_t)name_len) == 0)
+            return bt->members[i].kind;
+    }
+    return 'M';
+}
+
 int zan_builtin_has_member(const char *type, const char *name, int name_len) {
     const zan_builtin_type_t *bt = zan_builtin_find(type);
     if (!bt) return 1;

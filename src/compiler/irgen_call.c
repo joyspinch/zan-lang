@@ -3324,6 +3324,17 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                     "'%s' has no member '%.*s'",
                     bt ? bt->display : brecv, (int)bmn.len, bmn.str);
             }
+            /* A property spelled with parentheses (`items.Count()`) parses and
+             * type-checks, but no lowering claims it, so it used to fall
+             * through to the constant 0 below -- a loop bounded by
+             * `l.Count()` then silently did nothing. */
+            else if (brecv &&
+                     zan_builtin_member_kind(brecv, bmn.str, (int)bmn.len) == 'P') {
+                const zan_builtin_type_t *bt = zan_builtin_find(brecv);
+                zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+                    "'%s.%.*s' is a property, not a method: drop the '()'",
+                    bt ? bt->display : brecv, (int)bmn.len, bmn.str);
+            }
         }
 
         /* generic function call — fallback */
