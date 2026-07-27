@@ -902,10 +902,10 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                 }
                 LLVMPositionBuilderAtEnd(g->builder, here);
             }
-            /* keep the heap frame authoritative across this try: a throw
-             * that crosses a suspension longjmps into a stale invocation
-             * whose stack allocas are garbage; the catch below re-loads the
-             * frame-resident slots from the frame instead. */
+            /* keep the heap frame in step with the allocas across this try:
+             * a later invocation re-arms this handler and loads the frame at
+             * its state block, so the frame must already carry what the try
+             * entry saw. */
             emit_async_save_slots(g);
         }
         LLVMValueRef zero = LLVMConstInt(i32t, 0, 0);
@@ -954,11 +954,11 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                 LLVMValueRef hc = LLVMBuildLoad2(g->builder, i32t, hc_ptr, "eh.hcv");
                 LLVMBuildStore(g->builder, LLVMBuildSub(g->builder, hc,
                     LLVMConstInt(i32t, 1, 0), "eh.hc0"), hc_ptr);
-                /* if the throw crossed a suspension, this invocation's stack
-                 * allocas are stale/garbage -- the frame (saved at try entry,
-                 * every suspension, and every async throw site) is the
-                 * authoritative copy of the frame-resident locals */
-                emit_async_reload_slots(g);
+                /* No reload from the frame: the handler this catch belongs to
+                 * is re-armed by the invocation that raises the throw, whose
+                 * state block already loaded the frame-resident slots, so the
+                 * stack allocas are the live copy -- and the only one holding
+                 * the locals assigned after the last suspension. */
             }
         }
         /* longjmp skipped the normal releases of temps pushed after this try

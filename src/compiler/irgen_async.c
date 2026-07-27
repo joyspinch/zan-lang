@@ -244,7 +244,11 @@ static void anf_check_order(anf_ctx_t *c, zan_ast_node_t *before, zan_ast_node_t
     }
 }
 
-/* Hoist `await E` into `int $awN = await E;` and return a reference to $awN. */
+/* Hoist `await E` into `var $awN = await E;` and return a reference to $awN.
+ *
+ * The temp is inferred, not `int`: an awaited call can yield a string, a list
+ * or a class instance, and typing the temp `int` made the residual expression
+ * see the reference as a number (`"n=" + await F()` printed a pointer). */
 static zan_ast_node_t *anf_hoist_await(anf_ctx_t *c, zan_ast_node_t *aw) {
     /* normalize any nested awaits inside the awaited expression first */
     aw->await_expr.expr = anf_expr(c, aw->await_expr.expr);
@@ -255,13 +259,9 @@ static zan_ast_node_t *anf_hoist_await(anf_ctx_t *c, zan_ast_node_t *aw) {
     memcpy(nm, buf, (size_t)len + 1);
     zan_istr_t name = { nm, (uint32_t)len };
 
-    zan_ast_node_t *tref = zan_ast_new(c->g->arena, AST_TYPE_REF, aw->loc);
-    static const char intname[] = "int";
-    tref->type_ref.name = (zan_istr_t){ intname, 3 };
-
     zan_ast_node_t *vd = zan_ast_new(c->g->arena, AST_VAR_DECL, aw->loc);
     vd->var_decl.name = name;
-    vd->var_decl.type = tref;
+    vd->var_decl.type = NULL; /* inferred from the awaited expression */
     vd->var_decl.initializer = aw;
     zan_ast_list_push(c->out, vd, c->g->arena);
 
@@ -1004,7 +1004,13 @@ static void emit_async_eh_prologue(zan_irgen_t *g) {
             LLVMBuildAdd(g->builder, ksafe, LLVMConstInt(i32, 1, 0), "eh.land.hc"),
             LLVMBuildStructGEP2(g->builder, ft, frame, ASYNC_FRAME_HCOUNT, "hc.l"));
     }
-    emit_async_reload_slots(g);
+    /* No reload here: a longjmp only ever reaches a handler armed by the
+     * invocation it is raised in (handlers of finished invocations are unarmed
+     * at every suspension), and this invocation's state block already loaded
+     * the frame-resident slots. Their stack allocas therefore hold the live
+     * values, including the ones written after the last suspension -- copying
+     * the frame over them would undo those writes and lose the references
+     * they hold. */
     g->current_async_rearm_switch = LLVMBuildSwitch(g->builder,
         LLVMBuildLoad2(g->builder, i32, id_slot, "eh.id"), exc_bb,
         ASYNC_MAX_HANDLERS);
@@ -1024,7 +1030,8 @@ static void emit_async_exc_epilogue(zan_irgen_t *g, local_scope_t *locals) {
     get_eh_globals(g, &top_g, &bufs_g, &exc_g);
 
     LLVMPositionBuilderAtEnd(g->builder, g->current_async_exc_bb);
-    emit_async_reload_slots(g);
+    /* the allocas are the live copy here too (see eh.land above): the cleanup
+     * emit_async_complete runs must see the locals this invocation assigned */
     LLVMBuildStore(g->builder, LLVMBuildLoad2(g->builder, i8ptr, exc_g, "exc.v"),
         LLVMBuildStructGEP2(g->builder, ft, frame, ASYNC_FRAME_EXC, "fr.exc"));
     LLVMBuildStore(g->builder,

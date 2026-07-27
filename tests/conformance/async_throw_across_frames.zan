@@ -1,0 +1,120 @@
+// Conformance: an exception raised in a synchronous callee, unwinding through
+// async frames.
+//
+// A $resume invocation keeps its frame-resident locals in stack allocas and
+// only copies them into the heap frame at a suspension. A longjmp always lands
+// in the invocation that raised it, so those allocas -- not the frame -- hold
+// the live values: everything assigned after the last await lives only there.
+// Reloading the frame at the landing pad used to undo those assignments, which
+// both reverted values a catch block could see and dropped the references the
+// coroutine's cleanup had to release (a leak).
+using System;
+
+class Boom : Exception {
+    Boom(string m) { Message = m; }
+}
+
+class Bag {
+    string tag;
+    List<string> rows;
+
+    static Bag Of(string tag) {
+        Bag b = new Bag();
+        b.tag = tag;
+        b.rows = new List<string>();
+        b.rows.Add(tag);
+        return b;
+    }
+}
+
+class Driver {
+    // The failure is raised here, one plain frame below the async body: the
+    // async frame is an intermediate frame of the unwind.
+    void fail(string why) {
+        throw new Boom(why);
+    }
+
+    static async Bag Fetch(string tag) {
+        await Task.Delay(1);
+        return Bag.Of(tag);
+    }
+
+    // The owned local is the result of an await, so it never reaches the heap
+    // frame; the throw leaves through the trampoline of this invocation.
+    async int Query(bool bad) {
+        Bag resp = await Driver.Fetch("q");
+        if (bad) { this.fail("query failed"); }
+        return resp.rows.Count;
+    }
+
+    // Same shape, but the handler is in this frame and its try spans the
+    // suspension, so the catch is reached by re-arming the recorded handler.
+    async string Guarded(bool bad) {
+        string note = "start";
+        try {
+            Bag resp = await Driver.Fetch("g");
+            note = "after-await";
+            if (bad) { this.fail("guarded failed"); }
+            note = "no-throw";
+        } catch (Boom e) {
+            // `note` was assigned after the last suspension: the catch must
+            // still see that value, not the one the frame was saved with.
+            return note + "/" + e.Message;
+        }
+        return note;
+    }
+
+    // Two async frames between the throw and the handler.
+    async int Middle(bool bad) {
+        Bag mid = await Driver.Fetch("m");
+        int n = await this.Query(bad);
+        return n + mid.rows.Count;
+    }
+}
+
+class Program {
+    static async int Run() {
+        Driver d = new Driver();
+        int ok = await d.Query(false);
+        Console.WriteLine("query ok=" + Convert.ToString(ok));
+
+        string caught = "";
+        try {
+            int bad = await d.Query(true);
+        } catch (Boom e) {
+            caught = e.Message;
+        }
+        Console.WriteLine("query threw=" + caught);
+
+        Console.WriteLine("guarded ok=" + await d.Guarded(false));
+        Console.WriteLine("guarded bad=" + await d.Guarded(true));
+
+        int mid = await d.Middle(false);
+        Console.WriteLine("middle ok=" + Convert.ToString(mid));
+
+        string caught2 = "";
+        try {
+            int bad2 = await d.Middle(true);
+        } catch (Boom e) {
+            caught2 = e.Message;
+        }
+        Console.WriteLine("middle threw=" + caught2);
+
+        // Repeated failures must not accumulate anything.
+        int rounds = 0;
+        int i = 0;
+        while (i < 3) {
+            try {
+                int bad3 = await d.Query(true);
+            } catch (Boom e) {
+                rounds = rounds + 1;
+            }
+            i = i + 1;
+        }
+        return rounds;
+    }
+
+    static async void Main() {
+        Console.WriteLine("rounds=" + Convert.ToString(await Run()));
+    }
+}

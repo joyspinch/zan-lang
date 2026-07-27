@@ -504,6 +504,38 @@ operand type of return inst!
   **仍缺**：C# 的裸 `throw;`（不带表达式的重抛）解析器仍不接受，需要给每个 handler
   额外保存 tid 才能正确重抛，未做。
 
+* **A8-14 ✅ 已修（2026-07-27）异常落地时用帧覆盖栈槽，丢掉最后一次挂起之后写的局部**。
+  `_scratch/p2.zan` 复现：async 体里 `Bag resp = await Trip();` 之后由**同步 callee**
+  抛出，`resp` 指向的对象图（Bag + 两个 List）全部泄漏；输出仍然正确，所以只有
+  `--check-leaks` 能看见。根因：`emit_async_eh_prologue` 的 `eh.land`、
+  `emit_async_exc_epilogue` 的 `co.exc`、以及 `irgen_stmt.c` try 降级的 `catch_bb`
+  三处都在落地时 `emit_async_reload_slots()`，把**堆帧**拷回栈 alloca。可是帧只在挂起点
+  更新，`resp` 是最后一次 await **之后**赋的值，只存在 alloca 里 ⇒ 落地时被帧里的旧值
+  （通常是 null）覆盖，之后 `emit_async_complete` 的释放遍历读到的就是被覆盖的槽。
+  longjmp 只会落到**发起抛出的那次 invocation** 自己武装的 handler（挂起时
+  `emit_async_eh_unarm` 会把已结束 invocation 的 handler 弹掉），而该 invocation 的
+  state block 进入时已经 reload 过一次，所以 alloca 才是活的那份拷贝：**三处 reload 全部删掉**。
+  这不只是泄漏——`catch` 里读最后一次挂起之后赋的值也会读回旧值（见新用例的
+  `guarded bad=after-await/...`，修复前拿到的是 `start`）。
+  证据：`tests/conformance/async_throw_across_frames.zan`（await 结果 + 同步 callee 抛出、
+  try 跨挂起后在本帧 catch、两层 async 帧之间抛出、连抛三次不累积），
+  conformance / determinism / leakcheck 三份全绿。
+
+* **A8-15 ✅ 已修（2026-07-27）表达式里的 `await` 被当成 `int`，字符串/集合/对象结果被按整数使用**。
+  `Console.WriteLine("b=" + await F())`（`F` 返回 `string`）打印的是指针值。根因：
+  `anf_hoist_await` 把表达式中的 await 提升成临时局部时**硬编码 `int $awN`**
+  （A8-9 只修了 `var x = await F()` 这一种直接形态）。修法：临时局部改为推导
+  （`var_decl.type = NULL`，走 A8-9 已经打通的推导路径）。
+  连带修正所有权：`expr_yields_owned_rc_value` 原本把 `$awN` 标识符当"单次使用的移动"
+  （因为它以前是 `int`，不持有所有权）；现在临时局部有了正确类型、会在作用域退出时释放，
+  再当移动就会**提前释放**（`return await this.MakeAsync();` 崩溃，0xC0000005 / 0xC0000374）。
+  改成按普通局部处理：读它是借用、赋值方自己 retain。
+  副作用：这条同时修掉了 SQL Server 驱动 leakcheck 里 4 个对象的泄漏（`DbResult` 的
+  `List<DbRow>` / `List<string>`、`TdsMessage`）——那不是驱动的问题，是这个 `int` 临时局部。
+  证据：`tests/conformance/async_await_expr_types.zan`（string / int / `List<string>` /
+  class 的 await 参与拼接、成员访问、算术、索引；`return await f() + await g()`），
+  全量 **588/588** 通过。
+
 ### A8-5 async 覆盖面探针矩阵〔已实测，`_scratch/async_probe/`〕
 
 | 形态 | 结果 |
@@ -734,7 +766,7 @@ header-only 库 / C 回调 / 结构体字段偏移，全部对应 A2 / A3 / A4�
 
 | 批次 | 内容 | 为什么排这里 |
 |---|---|---|
-| **0** | ~~A8-1~~ ✅ / ~~A8-2~~ ✅ / ~~A8-3~~ ✅ / ~~A8-4~~ ✅ / ~~A8-12~~ ✅ / ~~A8-13~~ ✅（catch 内再抛跳错 handler、抛出点双重释放、被放弃 handler 泄漏异常；+ 顺带修掉 A8-8 foreach break/continue、A8-9 `var`+await 类型、A8-10 测试重复编译） | **三份 repro 全部实测仍成立，两个比文档记的更严重**。ARC 与异常/协程交互不可靠 ⇒ 任何 Zan 上层代码都不可信，而"上层全用 Zan"是整个计划的地基 |
+| **0** | ~~A8-1~~ ✅ / ~~A8-2~~ ✅ / ~~A8-3~~ ✅ / ~~A8-4~~ ✅ / ~~A8-12~~ ✅ / ~~A8-13~~ ✅ / ~~A8-14~~ ✅ / ~~A8-15~~ ✅（catch 内再抛跳错 handler、抛出点双重释放、被放弃 handler 泄漏异常、异常落地用帧覆盖栈槽、表达式里的 await 被当 `int`；+ 顺带修掉 A8-8 foreach break/continue、A8-9 `var`+await 类型、A8-10 测试重复编译） | **三份 repro 全部实测仍成立，两个比文档记的更严重**。ARC 与异常/协程交互不可靠 ⇒ 任何 Zan 上层代码都不可信，而"上层全用 Zan"是整个计划的地基 |
 | **0.5** | **A7-1**（修约束接口方法调用的 codegen 崩溃）+ A7-2 | 已实测复现且已定位；阻塞 B3-1；不依赖其他任何项 |
 | **1** | ~~**A0-0**（句柄型 extern 改 `nint`）~~ ✅ 已完成（330 处 / 26 文件，553/553）；**A0-0c**（socket 句柄统一 `nint`）已完成（562/562，窄化警告 51 → 0）、**A0-0d** 句柄部分已完成（`rt_io` → `intptr_t`，`zan_gui_*` 句柄 → `iptr`；位宽部分并入 A0-1/A0-2）；余下 C4 / C5 / C7（删残桩、提交游离文档、游戏计划归到项目文档层） | A0-0 在 int 还是 64 位时零语义变化，是切 int=32 的安全前置。清理放这里而不是更早：`ABI.md` 这类失真文档在 A2 落地前仍是唯一的目标 ABI 参照，**先实现、后按实现重写文档**，不要先清场 |
 | **2** | **A0-1 / A0-2 / A0-3**（int=32 + FFI 位宽 + 结构体布局） | 一切 FFI 和编解码工作的前置 |
