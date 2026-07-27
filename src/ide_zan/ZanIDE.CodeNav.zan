@@ -35,6 +35,7 @@ partial class ZanIDE {
         string s = CodeEditor.LTrim(line);
         List<string> kws = new List<string>();
         kws.Add("class "); kws.Add("struct "); kws.Add("enum "); kws.Add("interface ");
+        kws.Add("namespace ");
         int i = 0;
         while (i < kws.Count) {
             string kw = kws[i];
@@ -434,6 +435,26 @@ partial class ZanIDE {
         return outp;
     }
 
+    /// First source file of the directory named `name` under `dir` (recursive),
+    /// or "". Namespaces map onto directories, so this is how a namespace name
+    /// -- which has no declaration line to jump to -- resolves to a file.
+    static string FindNamespaceDirFile(string dir, string name) {
+        if (!Directory.Exists(dir)) { return ""; }
+        List<string> subs = Directory.GetDirectories(dir);
+        int i = 0;
+        while (i < subs.Count) {
+            string sub = dir + "/" + subs[i];
+            if (subs[i] == name) {
+                List<string> inner = ZanIDE.ListZanFiles(sub);
+                if (inner.Count > 0) { return inner[0]; }
+            }
+            string deep = ZanIDE.FindNamespaceDirFile(sub, name);
+            if (deep != "") { return deep; }
+            i = i + 1;
+        }
+        return "";
+    }
+
     static void CollectZan(string dir, List<string> outp) {
         if (!Directory.Exists(dir)) { return; }
         List<string> files = Directory.GetFiles(dir);
@@ -485,6 +506,15 @@ partial class ZanIDE {
             i = i + 1;
         }
         List<string> files = ZanIDE.ListZanFiles(root + "/src");
+        // Most symbols a project uses are declared in the stdlib, and stdlib
+        // sources are browsable/openable here, so search them after the project
+        // instead of reporting "not found in project".
+        List<string> stdFiles = ZanIDE.ListZanFiles(ZanIDE.StdlibDir());
+        int si = 0;
+        while (si < stdFiles.Count) {
+            files.Add(stdFiles[si]);
+            si = si + 1;
+        }
         int fi = 0;
         while (fi < files.Count) {
             string fp = files[fi];
@@ -499,6 +529,20 @@ partial class ZanIDE {
                 }
             }
             fi = fi + 1;
+        }
+        // Namespaces (`using System.Web;`) declare nothing, so fall back to the
+        // directory that backs them and open its first source file.
+        string nsFile = ZanIDE.FindNamespaceDirFile(ZanIDE.StdlibDir(), word);
+        if (nsFile == "") { nsFile = ZanIDE.FindNamespaceDirFile(root + "/src", word); }
+        if (nsFile != "") {
+            if (tabPaths.IndexOf(nsFile) < 0) {
+                ZanIDE.OpenPath(tabNames, tabBodies, tabPaths, active, nsFile,
+                    Path.GetFileName(nsFile));
+            } else {
+                active.Set(tabPaths.IndexOf(nsFile));
+            }
+            log.Add("> Namespace '" + word + "' -> " + Path.GetFileName(nsFile) + ".");
+            return 0;
         }
         log.Add("> Go to Definition: '" + word + "' not found in project.");
         return 0 - 1;
@@ -527,7 +571,12 @@ partial class ZanIDE {
                                    List<string> tabBodies, List<string> tabPaths,
                                    SignalInt active, string root, List<string> log) {
         int a = active.Get();
-        if (lsp != null && lsp.Alive() && a >= 0 && a < tabPaths.Count && tabPaths[a].Length > 0) {
+        // The server indexes the project root only; querying it about a file
+        // outside that root (a stdlib source, say) costs a round trip that can
+        // never answer, so go straight to the text scan there.
+        bool inRoot = a >= 0 && a < tabPaths.Count
+            && ZanIDE.NormPath(tabPaths[a]).StartsWith(ZanIDE.NormPath(root));
+        if (lsp != null && lsp.Alive() && inRoot && tabPaths[a].Length > 0) {
             tabBodies[a] = editor.GetText();
             lsp.SyncDoc(tabPaths[a], tabBodies[a]);
             string hit = lsp.Definition(tabPaths[a], editor.CurLine(), editor.CurCol());
@@ -564,7 +613,12 @@ partial class ZanIDE {
                                     List<string> tabBodies, List<string> tabPaths,
                                     SignalInt active, string root, List<string> log) {
         int a = active.Get();
-        if (lsp != null && lsp.Alive() && a >= 0 && a < tabPaths.Count && tabPaths[a].Length > 0) {
+        // The server indexes the project root only; querying it about a file
+        // outside that root (a stdlib source, say) costs a round trip that can
+        // never answer, so go straight to the text scan there.
+        bool inRoot = a >= 0 && a < tabPaths.Count
+            && ZanIDE.NormPath(tabPaths[a]).StartsWith(ZanIDE.NormPath(root));
+        if (lsp != null && lsp.Alive() && inRoot && tabPaths[a].Length > 0) {
             tabBodies[a] = editor.GetText();
             lsp.SyncDoc(tabPaths[a], tabBodies[a]);
             List<string> rows = lsp.References(tabPaths[a], editor.CurLine(), editor.CurCol());
@@ -1473,7 +1527,7 @@ partial class ZanIDE {
         if (ft == 1 || ft == 14) { return "TextArea"; }
         if (ft == 4) { return "Radio"; }
         if (ft == 5) { return "Checkbox"; }
-        if (ft == 6 || ft == 48) { return "Select"; }
+        if (ft == 6 || ft == 48) { return "SelectBox"; }
         if (ft == 7) { return "Switch"; }
         if (ft == 8) { return "Rate"; }
         if (ft == 9) { return "Slider"; }
@@ -1524,7 +1578,7 @@ partial class ZanIDE {
         if (wt == "Switch") { return "Switch.Create()"; }
         if (wt == "Radio") { return "new Radio(SignalInt.Create(0), 0, \"" + ZanIDE.EscZ(ZanIDE.FieldCaption(f)) + "\")"; }
         if (wt == "Slider") { return "new Slider(0, 100, SignalInt.Create(0))"; }
-        if (wt == "Select") { return "new Select(new List<string>(), \"\")"; }
+        if (wt == "SelectBox") { return "SelectBox.FromOptions(new List<string>(), \"\")"; }
         if (wt == "Progress") { return "new Progress(50, 1)"; }
         if (wt == "Rate") { return "new Rate(SignalInt.Create(0), 5)"; }
         if (wt == "Panel") { return "new Panel(\"" + ZanIDE.EscZ(f.fname) + "\")"; }
@@ -1535,7 +1589,7 @@ partial class ZanIDE {
     static void EmitFieldSetup(FormField f, string wt, string vn, List<string> body) {
         if (wt == "Checkbox" && f.defOn) { body.Add("        " + vn + ".SetChecked(true);"); }
         if (wt == "Switch" && f.defOn) { body.Add("        " + vn + ".SetOn(true);"); }
-        if (wt == "Select") {
+        if (wt == "SelectBox") {
             string opts = ZanIDE.JoinOpts(f.options);
             if (opts.Length > 0) {
                 body.Add("        " + vn + ".SetOptionsText(\"" + ZanIDE.EscZ(opts) + "\");");

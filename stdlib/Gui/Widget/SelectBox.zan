@@ -34,10 +34,23 @@ class SelectOption {
 /// Multi-select: SelectBox.Multi(hint) + IsChosen(i). Fluent config:
 ///   SelectBox.Create(hint).Clearable(true).Size(SelectBox.Large())
 ///                         .Status(SelectBox.Error())
+///
+/// Binding: `sel.data = form.color;` two-way binds the selected index to a
+/// plain field, `SelectBox.Bind(options, signal, hint)` shares a SignalInt with
+/// other widgets, and `sel.Change += h;` fires on every selection change.
 /// </summary>
 class SelectBox : Control {
     List<SelectOption> opts;
     int selected;
+    /// Optional shared selection signal (SelectBox.Bind).
+    SignalInt model;
+    /// Two-way bound selected index: `sel.data = form.color;` (compiler-lowered
+    /// Binding). The newer side wins, so the popup and the field stay in sync.
+    Binding<int> data;
+    int lastModel;
+    int lastData;
+    /// Fires when the selection changes (`sel.Change += h;`).
+    UiEvent Change;
     string hint;
     bool multi;
     bool clearable;
@@ -51,6 +64,9 @@ class SelectBox : Control {
     int trigX;
     int trigY;
     int trigW;
+    /// Stable widget id: the trigger registers it so hover/press/focus (and the
+    /// eased style transitions that read them) work like any other control.
+    int wid;
 
     static int Small() { return 0; }
     static int Medium() { return 1; }
@@ -74,7 +90,102 @@ class SelectBox : Control {
         s.size = 1;
         s.status = 0;
         s.maxVisible = 6;
+        s.wid = WidgetId.Next();
+        s.lastModel = 0 - 1;
+        s.lastData = 0 - 1;
+        s.Change = UiEvent.Create();
         return s;
+    }
+
+    /// Builds a box from a plain label list (JSON / designer / one-liner use).
+    static SelectBox FromOptions(List<string> options, string hint) {
+        SelectBox s = SelectBox.Make(hint, false);
+        int i = 0;
+        while (i < options.Count) {
+            s.AddOption(options[i]);
+            i = i + 1;
+        }
+        return s;
+    }
+
+    /// Shares an external SignalInt as the selected index: every widget reading
+    /// the same signal stays in sync.
+    static SelectBox Bind(List<string> options, SignalInt model, string hint) {
+        SelectBox s = SelectBox.FromOptions(options, hint);
+        s.model = model;
+        s.selected = model.Get();
+        s.lastModel = s.selected;
+        return s;
+    }
+
+    /// Options as a `a|b|c` string (designer / .zform property round-trip).
+    string OptionsText() {
+        string outp = "";
+        int i = 0;
+        while (i < opts.Count) {
+            if (i > 0) { outp = outp + "|"; }
+            outp = outp + opts[i].label;
+            i = i + 1;
+        }
+        return outp;
+    }
+
+    void SetOptionsText(string text) {
+        opts = new List<SelectOption>();
+        string current = "";
+        int i = 0;
+        while (i <= text.Length) {
+            string ch = "";
+            if (i < text.Length) { ch = text.Substring(i, 1); }
+            if (ch == "|" || i == text.Length) {
+                opts.Add(new SelectOption(current, false));
+                current = "";
+            } else {
+                current = current + ch;
+            }
+            i = i + 1;
+        }
+        scrollY = 0;
+    }
+
+    int Value() { return selected; }
+    bool IsOpen() { return open; }
+
+    /// Reconciles the shared signal and the two-way binding with `selected`.
+    /// The popup writes `selected` directly, so each side is compared against
+    /// its last synced value and the one that moved wins.
+    void SyncBinding() {
+        if (model != null) {
+            int m = model.Get();
+            if (m != selected) {
+                if (selected != lastModel) { model.Set(selected); }
+                else { selected = m; }
+            }
+            lastModel = selected;
+        }
+        if (data != null) {
+            int b = data.Get();
+            if (b != selected) {
+                if (selected != lastData) { data.Set(selected); }
+                else { selected = b; }
+            }
+            lastData = selected;
+        }
+    }
+
+    /// Applies a selection made by the popup: keeps bindings and the Change
+    /// event in one place so every entry point behaves the same.
+    void Choose(int idx) {
+        if (idx < 0 || idx >= opts.Count) { return; }
+        if (multi) {
+            opts[idx].chosen = !opts[idx].chosen;
+        } else {
+            if (selected == idx) { return; }
+            selected = idx;
+            if (model != null) { model.Set(idx); lastModel = idx; }
+            if (data != null) { data.Set(idx); lastData = idx; }
+        }
+        Change.Raise();
     }
 
     static SelectBox Create(string hintText) {
@@ -171,12 +282,64 @@ class SelectBox : Control {
         return t.borderPrimary;
     }
 
+    override string Kind() { return "Select"; }
+
+    override List<PropSpec> Props() {
+        List<PropSpec> ps = new List<PropSpec>();
+        ps.Add(PropSpec.Text("hint", "Placeholder"));
+        ps.Add(PropSpec.Text("options", "Options"));
+        ps.Add(PropSpec.Int("value", "Selected"));
+        ps.Add(PropSpec.Bool("clearable", "Clearable"));
+        return ps;
+    }
+
+    override string GetProp(string key) {
+        if (key == "value" || key == "selected") { return Convert.ToString(selected); }
+        if (key == "hint" || key == "placeholder") { return hint; }
+        if (key == "options") { return this.OptionsText(); }
+        if (key == "clearable") { return Convert.ToString(clearable); }
+        return "";
+    }
+
+    override void SetProp(string key, string val) {
+        if (key == "value" || key == "selected") { selected = Convert.ToInt32(val); }
+        else if (key == "hint" || key == "placeholder") { hint = val; }
+        else if (key == "options") { this.SetOptionsText(val); }
+        else if (key == "clearable") { clearable = val == "true"; }
+    }
+
+    override List<string> Events() {
+        List<string> e = Control.CommonEvents();
+        e.Add("Change");
+        e.Add("SelectionChanged");
+        e.Add("Open");
+        e.Add("Close");
+        return e;
+    }
+
+    override void BindEvent(string evt, Action a) {
+        if (evt == "Change" || evt == "SelectionChanged") { Change.Add(a); return; }
+        On.AddByName(evt, a);
+    }
+
+    override void OnMeasure(App app) {
+        prefH = this.HeadHeight(app.theme);
+        prefW = app.Scale(200);
+    }
+
+    override void OnPaint(App app) {
+        this.Render(app, bx, by, bw);
+    }
+
     void Render(App app, int x, int y, int w) {
         Canvas c = app.canvas;
         Theme t = app.theme;
+        this.SyncBinding();
 
         int h = this.HeadHeight(t);
         int fs = this.FontSize(t);
+        app.focus.RegisterFocusable(wid);
+        app.hitTester.Register(HitRegion.Create(wid, x, y, w, h, 1));
 
         int ek = app.window.EventKind();
         int eb = app.window.EventButton();
@@ -193,20 +356,26 @@ class SelectBox : Control {
             && app.mouseX < clearX + t.iconSizeSmall;
 
         // ---- trigger ----
-        int border = this.StatusBorder(t, overHead || open);
-        c.FillRoundRect(x, y, w, h, t.borderRadiusMedium, t.bgPrimary);
-        c.DrawRoundRect(x, y, w, h, t.borderRadiusMedium, border, 1);
+        // Resolved from the style layer as a `select` control, so a skin styles
+        // it exactly like an input (`select:hover`, `select:focus`, ...); the
+        // validation status still overrides the border colour.
+        StyleBox s = Style.EasedId(app, wid, "select", styleClass, name, false, open);
+        Style.Inline(s, this);
+        if (status != 0) { s.borderColor = this.StatusBorder(t, overHead || open); }
+        fs = s.FontOr(fs);
+        int pad = s.PadLOr(t.paddingSmall);
+        s.Paint(app, x, y, w, h);
 
         int textY = y + (h - Canvas.FontHeight(fs)) / 2;
-        int headMaxW = w - t.paddingSmall - arrowSlot - t.paddingSmall;
+        int headMaxW = w - pad - arrowSlot - t.paddingSmall;
         if (showClear) { headMaxW = headMaxW - t.iconSizeSmall - t.paddingSmall; }
         string shown = this.Text();
         if (shown == "") {
-            c.DrawText(x + t.paddingSmall, textY,
+            c.DrawText(x + pad, textY,
                 Ellipsis.Fit(hint, headMaxW, fs), t.textTertiary, fs);
         } else {
-            c.DrawText(x + t.paddingSmall, textY,
-                Ellipsis.Fit(shown, headMaxW, fs), t.textPrimary, fs);
+            c.DrawText(x + pad, textY,
+                Ellipsis.Fit(shown, headMaxW, fs), s.FgOr(t.textPrimary), fs);
         }
 
         if (showClear) {
@@ -289,9 +458,8 @@ class SelectBox : Control {
         if (scrollY < 0) { scrollY = 0; }
 
         app.BlockHitsBelow();
-        c.FillRoundRect(popX + 1, popY + 2, w, viewH, t.borderRadiusMedium, t.shadowColor);
-        c.FillRoundRect(popX, popY, w, viewH, t.borderRadiusMedium, t.bgPrimary);
-        c.DrawRoundRect(popX, popY, w, viewH, t.borderRadiusMedium, t.borderPrimary, 1);
+        StyleBox pop = Style.Of(app, "popup", styleClass, Style.SNormal());
+        pop.Paint(app, popX, popY, w, viewH);
         app.BlockHitsRect(popX, popY, w, viewH);
 
         c.PushClip(popX, popY, w, viewH);
@@ -305,18 +473,24 @@ class SelectBox : Control {
                 if (multi) { isSel = opts[i].chosen; }
                 else { isSel = i == selected; }
 
-                if (States.HasBg(overRow, false, isSel, false)) {
-                    c.FillRect(popX + 1, oy, w - 2, optH,
-                        States.Bg(t, overRow, false, isSel, false));
-                }
-                int tc = States.Text(t, isSel, false);
-                int oMaxW = w - t.paddingSmall - arrowSlot - t.paddingSmall;
-                c.DrawText(popX + t.paddingSmall,
-                    oy + (optH - Canvas.FontHeight(fs)) / 2,
-                    Ellipsis.Fit(opts[i].label, oMaxW, fs), tc, fs);
+                // Rows resolve as `option` (`option:hover`, `option:selected`),
+                // so a skin restyles the list without a branch here.
+                int st = Style.SNormal();
+                if (overRow) { st = st + Style.SHover(); }
+                if (isSel) { st = st + Style.SSelected(); }
+                StyleBox row = Style.Of(app, "option", styleClass, st);
+                row.Paint(app, popX + 1, oy, w - 2, optH);
+                int rowFs = row.FontOr(fs);
+                int rowPad = row.PadLOr(t.paddingSmall);
+                int oMaxW = w - rowPad - arrowSlot - t.paddingSmall;
+                c.DrawText(popX + rowPad,
+                    oy + (optH - Canvas.FontHeight(rowFs)) / 2,
+                    Ellipsis.Fit(opts[i].label, oMaxW, rowFs),
+                    row.FgOr(States.Text(t, isSel, false)), rowFs);
                 if (isSel) {
                     Icon.DrawCenteredIn(c, "check", popX + w - arrowSlot, oy,
-                        t.iconSizeSmall, optH, t.iconSizeSmall, t.primary);
+                        t.iconSizeSmall, optH, t.iconSizeSmall,
+                        row.AccentOr(t.primary));
                 }
             }
             i = i + 1;
@@ -351,12 +525,8 @@ class SelectBox : Control {
                 int rel = app.mouseY - popY + scrollY;
                 int idx = rel / optH;
                 if (idx >= 0 && idx < opts.Count) {
-                    if (multi) {
-                        opts[idx].chosen = !opts[idx].chosen;
-                    } else {
-                        selected = idx;
-                        open = false;
-                    }
+                    this.Choose(idx);
+                    if (!multi) { open = false; }
                     app.ClaimClick();
                     app.RequestRedraw();
                 }

@@ -364,7 +364,20 @@ set(ZAN_GUI_AVAILABLE FALSE)
 if(ZAN_BUILD_GUI)
     if(WIN32)
         add_library(zan_gui SHARED src/runtime/gui_runtime.c)
-        target_link_libraries(zan_gui PRIVATE user32 gdi32 dwmapi shcore imm32)
+        target_link_libraries(zan_gui PRIVATE user32 gdi32 dwmapi shcore imm32 ole32)
+        # Embedded WebView: the Edge WebView2 backend needs the SDK header, which
+        # is vendored under stdlib/Gui/native/webview2. Its loader
+        # (WebView2Loader.dll, shipped in the zan_gui driver bundle) is resolved
+        # at run time, so a machine without the WebView2 runtime still runs GUI
+        # apps -- the widget falls back to its placeholder.
+        if(EXISTS "${CMAKE_SOURCE_DIR}/stdlib/Gui/native/webview2/WebView2.h")
+            target_compile_definitions(zan_gui PRIVATE ZAN_GUI_WEBVIEW2)
+            target_include_directories(zan_gui
+                PRIVATE "${CMAKE_SOURCE_DIR}/stdlib/Gui/native/webview2")
+        else()
+            message(STATUS "WebView2 SDK header not vendored; zan_gui WebView "
+                           "falls back to the placeholder backend")
+        endif()
         set(ZAN_GUI_AVAILABLE TRUE)
     elseif(ZAN_GUI_SDL)
         # SDL owns the window/event pump/present; the shared software rasterizer
@@ -691,7 +704,18 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_datatable${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
-  set_tests_properties(runtime_gui conformance_gui_stack conformance_gui_text conformance_gui_codeeditor conformance_gui_datatable PROPERTIES
+  # The CSS skin pipeline (Css parser -> StyleSheet -> StyleBox) is pure
+  # computation, so it is verified headlessly against a golden dump.
+  add_test(NAME conformance_gui_css
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/css_test.zan
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/stdlib/Gui/Css.zan;${CMAKE_SOURCE_DIR}/stdlib/Gui/StyleSheet.zan;${CMAKE_SOURCE_DIR}/stdlib/Gui/StyleBox.zan;--auto-stdlib;--driver-dir;$<TARGET_FILE_DIR:zan_gui>"
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_css.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_css${_exe_ext}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+
+  set_tests_properties(runtime_gui conformance_gui_stack conformance_gui_text conformance_gui_codeeditor conformance_gui_datatable conformance_gui_css PROPERTIES
     ENVIRONMENT "ZAN_LIB_PATH=$<TARGET_FILE_DIR:zan_gui>;LD_LIBRARY_PATH=$<TARGET_FILE_DIR:zan_gui>;DYLD_LIBRARY_PATH=$<TARGET_FILE_DIR:zan_gui>")
 endif()
 

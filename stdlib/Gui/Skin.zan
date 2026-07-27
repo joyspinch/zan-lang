@@ -1,0 +1,292 @@
+using System;
+using System.IO;
+using System.Json;
+
+namespace Gui;
+
+/// <summary>
+/// A skin pack: a directory holding `skin.css` (semantic tokens in `:root` plus
+/// per-control rules) and its artwork. A skin is data, not code — a user can
+/// drop a folder next to the app and pick it at runtime:
+///
+///     stdlib/Gui/skins/fortune/skin.css
+///     stdlib/Gui/skins/fortune/banner.png
+///
+///     Skin s = Skin.Load("fortune");
+///     s.Apply(app);            // theme tokens + stylesheet + backdrop art
+///
+/// `:root` custom properties feed the semantic Theme (so anything not styled by
+/// CSS still gets the skin's palette), and every other rule feeds the style
+/// resolver (Style/StyleBox) that widgets paint with. Both halves are optional:
+/// a `:root`-only skin is a palette swap, a rules-only skin restyles controls on
+/// top of the current theme.
+/// </summary>
+class Skin {
+    string name;
+    string dir;
+    StyleSheet sheet;
+    Theme theme;
+    bool dark;
+    /// Backdrop illustration (absolute or app-relative path, "" when the skin
+    /// ships none) and how strongly it is laid over the wallpaper (percent).
+    string art;
+    int artOpacity;
+
+    static List<string> cacheNames;
+    static List<Skin> cacheSkins;
+
+    static Skin Create(string skinName) {
+        Skin s = new Skin();
+        s.name = skinName;
+        s.dir = "";
+        s.sheet = StyleSheet.Create();
+        s.theme = null;
+        s.dark = true;
+        s.art = "";
+        s.artOpacity = 100;
+        return s;
+    }
+
+    /// Loads (and memoizes) the skin named `name`, searching the skin roots.
+    /// Returns a skin with an empty sheet when nothing is found, so a missing
+    /// skin degrades to the current theme instead of failing.
+    static Skin Load(string name) {
+        if (Skin.cacheNames == null) {
+            Skin.cacheNames = new List<string>();
+            Skin.cacheSkins = new List<Skin>();
+        }
+        int i = 0;
+        while (i < Skin.cacheNames.Count) {
+            if (Skin.cacheNames[i] == name) { return Skin.cacheSkins[i]; }
+            i = i + 1;
+        }
+        Skin s = Skin.Create(name);
+        s.dir = Skin.FindDir(name);
+        if (s.dir != "") {
+            string css = Skin.ReadIfExists(s.dir + "/skin.css");
+            if (css != "") { s.sheet = StyleSheet.FromCss(css); }
+            s.art = Skin.FindArt(s.dir);
+            s.theme = Skin.ThemeOf(s.sheet);
+            s.dark = Skin.DarkOf(s.sheet);
+            string op = s.sheet.Var("--art-opacity");
+            if (op != "") { s.artOpacity = StyleSheet.Num(op); }
+        }
+        Skin.cacheNames.Add(name);
+        Skin.cacheSkins.Add(s);
+        return s;
+    }
+
+    /// Re-reads the skin from disk (used by the live skin reload path so a CSS
+    /// edit shows up without restarting the app).
+    static Skin Reload(string name) {
+        if (Skin.cacheNames != null) {
+            int i = 0;
+            while (i < Skin.cacheNames.Count) {
+                if (Skin.cacheNames[i] == name) {
+                    Skin.cacheNames.RemoveAt(i);
+                    Skin.cacheSkins.RemoveAt(i);
+                    i = Skin.cacheNames.Count;
+                }
+                i = i + 1;
+            }
+        }
+        return Skin.Load(name);
+    }
+
+    /// True when the pack was found on disk.
+    bool IsLoaded() { return dir != ""; }
+
+    /// Installs the skin on `app`: the theme from `:root` (falling back to the
+    /// current theme), the stylesheet every widget resolves against, and the
+    /// backdrop artwork.
+    void Apply(App app) {
+        app.sheet = sheet;
+        app.skinName = name;
+        if (theme != null) { app.ApplyTheme(theme, dark); }
+        if (art != "") { app.SetWallpaper(art, artOpacity); }
+        app.bgThemeGen = app.bgThemeGen + 1;
+        app.needsRedraw = true;
+    }
+
+    // ---- discovery ----------------------------------------------------------
+
+    /// Roots searched for skin packs, most specific first: `$ZAN_GUI_SKINS`, the
+    /// app's own `skins/`, then the stdlib copies (running from a build tree).
+    static List<string> Roots() {
+        List<string> r = new List<string>();
+        string env = Skin.Env("ZAN_GUI_SKINS");
+        if (env != "") { r.Add(env); }
+        r.Add("skins");
+        r.Add("assets/skins");
+        r.Add("stdlib/Gui/skins");
+        r.Add("../stdlib/Gui/skins");
+        r.Add("../../stdlib/Gui/skins");
+        return r;
+    }
+
+    /// The directory of skin `name`, or "" when no root holds it.
+    static string FindDir(string name) {
+        List<string> roots = Skin.Roots();
+        int i = 0;
+        while (i < roots.Count) {
+            string cand = roots[i] + "/" + name;
+            i = i + 1;
+            if (File.Exists(cand + "/skin.css")) { return cand; }
+        }
+        return "";
+    }
+
+    /// Every skin pack discoverable on disk (a directory holding a skin.css).
+    static List<string> Available() {
+        List<string> names = new List<string>();
+        List<string> roots = Skin.Roots();
+        int i = 0;
+        while (i < roots.Count) {
+            string root = roots[i];
+            i = i + 1;
+            if (!Directory.Exists(root)) { continue; }
+            List<string> dirs = Directory.GetDirectories(root);
+            int k = 0;
+            while (k < dirs.Count) {
+                string d = dirs[k];
+                k = k + 1;
+                string nm = Skin.Leaf(d);
+                if (!File.Exists(d + "/skin.css")) { continue; }
+                if (Skin.Contains(names, nm)) { continue; }
+                names.Add(nm);
+            }
+        }
+        return names;
+    }
+
+    /// The skin's illustration: whatever `--art` names, else a conventional
+    /// banner file in the pack.
+    static string FindArt(string dir) {
+        List<string> cands = new List<string>();
+        cands.Add(dir + "/banner.png");
+        cands.Add(dir + "/banner.jpg");
+        cands.Add(dir + "/backdrop.png");
+        cands.Add(dir + "/backdrop.jpg");
+        int i = 0;
+        while (i < cands.Count) {
+            if (File.Exists(cands[i])) { return cands[i]; }
+            i = i + 1;
+        }
+        return "";
+    }
+
+    // ---- :root tokens -> Theme ---------------------------------------------
+
+    /// Builds the skin's Theme from its `:root` custom properties. `--base`
+    /// picks the starting preset ("dark", "light" or a preset name/index) and
+    /// every other `--token` overrides one Theme field; CSS spelling is
+    /// accepted, so `--bg-primary` sets `bgPrimary`. Returns null when the skin
+    /// declares no tokens (keep the app's current theme).
+    static Theme ThemeOf(StyleSheet sheet) {
+        if (sheet == null || sheet.vars == null || sheet.vars.Count() == 0) {
+            return null;
+        }
+        Theme t = Skin.BaseOf(sheet);
+        int i = 0;
+        while (i < sheet.vars.Count()) {
+            string key = sheet.vars.KeyAt(i);
+            JsonValue v = sheet.vars.ValAt(i);
+            i = i + 1;
+            string tok = Skin.TokenName(key);
+            if (tok == "base" || tok == "dark" || tok == "art"
+                || tok == "artOpacity") { continue; }
+            Theme.SetToken(t, tok, v);
+        }
+        return t;
+    }
+
+    /// The preset a skin starts from (`--base: light | dark | <preset name> |
+    /// <index>`), defaulting to the dark theme.
+    static Theme BaseOf(StyleSheet sheet) {
+        string b = sheet.Var("--base");
+        if (b == "") { return Theme.Dark(); }
+        string lo = b.ToLower();
+        if (lo == "light") { return Theme.Light(); }
+        if (lo == "dark") { return Theme.Dark(); }
+        List<string> names = Theme.PresetNames();
+        int i = 0;
+        while (i < names.Count) {
+            if (names[i].ToLower() == lo) { return Theme.PresetAt(i); }
+            i = i + 1;
+        }
+        if (StyleSheet.IsNumeric(b)) { return Theme.PresetAt(StyleSheet.Num(b)); }
+        return Theme.Dark();
+    }
+
+    /// Whether the skin wants dark window chrome (`--dark: 1`, else inferred
+    /// from `--base`).
+    static bool DarkOf(StyleSheet sheet) {
+        string d = sheet.Var("--dark");
+        if (d != "") { return StyleSheet.Num(d) != 0; }
+        string b = sheet.Var("--base").ToLower();
+        if (b == "light") { return false; }
+        if (b == "" || b == "dark") { return true; }
+        List<string> names = Theme.PresetNames();
+        int i = 0;
+        while (i < names.Count) {
+            if (names[i].ToLower() == b) { return Theme.PresetDark(i); }
+            i = i + 1;
+        }
+        return true;
+    }
+
+    /// `--bg-primary` / `--bgPrimary` / `bg-primary` -> `bgPrimary`.
+    static string TokenName(string key) {
+        string k = key;
+        if (k.Length >= 2 && k.Substring(0, 2) == "--") {
+            k = k.Substring(2, k.Length - 2);
+        }
+        string outp = "";
+        bool up = false;
+        int i = 0;
+        while (i < k.Length) {
+            string ch = k.Substring(i, 1);
+            i = i + 1;
+            if (ch == "-" || ch == "_") { up = true; continue; }
+            if (up) { outp = outp + ch.ToUpper(); up = false; }
+            else { outp = outp + ch; }
+        }
+        return outp;
+    }
+
+    // ---- small helpers ------------------------------------------------------
+
+    static string ReadIfExists(string path) {
+        if (!File.Exists(path)) { return ""; }
+        return File.ReadAllText(path);
+    }
+
+    static string Leaf(string path) {
+        int cut = -1;
+        int i = 0;
+        while (i < path.Length) {
+            string ch = path.Substring(i, 1);
+            if (ch == "/" || ch == "\\") { cut = i; }
+            i = i + 1;
+        }
+        if (cut < 0) { return path; }
+        return path.Substring(cut + 1, path.Length - cut - 1);
+    }
+
+    static bool Contains(List<string> list, string v) {
+        int i = 0;
+        while (i < list.Count) {
+            if (list[i] == v) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    static extern string getenv(string name);
+
+    static string Env(string name) {
+        string v = getenv(name);
+        if (v == null) { return ""; }
+        return v;
+    }
+}

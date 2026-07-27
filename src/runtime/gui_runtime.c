@@ -1061,6 +1061,12 @@ EXPORT void *zan_gui_get_pixels(i64 surface_id) {
 /* ========================================================================
  * Sprite-sheet image blitter (stb_image, path-keyed FIFO cache)
  * ======================================================================== */
+/* stb's thread-local globals (STBI_THREAD_LOCAL) fault on the IDE's statically
+ * linked mingw build: reading stbi__vertically_flip_on_load segfaults before a
+ * single pixel is decoded, so every wallpaper crashed the process. The image
+ * cache below is only ever touched from the UI thread, so plain globals are
+ * what we want anyway. */
+#define STBI_NO_THREAD_LOCALS
 #define STB_IMAGE_IMPLEMENTATION
 #include "../../stdlib/SDL3/native/stb_image.h"
 
@@ -1079,6 +1085,28 @@ static zan_img_t *zan_img_find(const char *path) {
         if (strncmp(g_imgs[i].path, path, 511) == 0) return &g_imgs[i];
     return NULL;
 }
+/* Paths that failed to decode. Without this a broken or unsupported image is
+ * re-decoded on every frame that paints the wallpaper. */
+#define ZAN_IMG_BAD_CAP 16
+static char g_img_bad[ZAN_IMG_BAD_CAP][512];
+static int  g_img_bad_n = 0;
+static int zan_img_is_bad(const char *path) {
+    int i;
+    for (i = 0; i < g_img_bad_n; i++)
+        if (strncmp(g_img_bad[i], path, 511) == 0) return 1;
+    return 0;
+}
+static void zan_img_mark_bad(const char *path) {
+    if (zan_img_is_bad(path)) return;
+    if (g_img_bad_n >= ZAN_IMG_BAD_CAP) {
+        memmove(&g_img_bad[0], &g_img_bad[1], sizeof(g_img_bad[0]) * (ZAN_IMG_BAD_CAP - 1));
+        g_img_bad_n = ZAN_IMG_BAD_CAP - 1;
+    }
+    strncpy(g_img_bad[g_img_bad_n], path, 511);
+    g_img_bad[g_img_bad_n][511] = '\0';
+    g_img_bad_n++;
+}
+
 static zan_img_t *zan_img_load(const char *path) {
     zan_img_t *e;
     int i, w, h, n;
@@ -1087,9 +1115,52 @@ static zan_img_t *zan_img_load(const char *path) {
     if (!path || !path[0]) return NULL;
     e = zan_img_find(path);
     if (e) return e;
+    if (zan_img_is_bad(path)) return NULL;
+#ifdef _WIN32
+    /* stbi_load goes through fopen, which on Windows interprets the bytes in
+     * the ANSI code page -- so a UTF-8 path with non-ASCII characters (a
+     * Chinese picture name, say) never opens. Read the bytes through the Win32
+     * wide API and decode from memory: passing a FILE* across CRTs is not safe
+     * here, and stb's file reader would fault on a foreign stream. */
+    {
+        int wn = MultiByteToWideChar(CP_UTF8, 0, path, -1, NULL, 0);
+        wchar_t *wp = wn > 0 ? (wchar_t *)malloc((size_t)wn * sizeof(wchar_t)) : NULL;
+        HANDLE fh = INVALID_HANDLE_VALUE;
+        LARGE_INTEGER fsz;
+        unsigned char *bytes = NULL;
+        DWORD got = 0;
+        if (!wp) return NULL;
+        MultiByteToWideChar(CP_UTF8, 0, path, -1, wp, wn);
+        fh = CreateFileW(wp, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
+                         FILE_ATTRIBUTE_NORMAL, NULL);
+        free(wp);
+        if (fh == INVALID_HANDLE_VALUE) { zan_img_mark_bad(path); return NULL; }
+        if (!GetFileSizeEx(fh, &fsz) || fsz.QuadPart <= 0
+            || fsz.QuadPart > 268435456) {
+            CloseHandle(fh); zan_img_mark_bad(path); return NULL;
+        }
+        bytes = (unsigned char *)malloc((size_t)fsz.QuadPart);
+        if (!bytes) { CloseHandle(fh); return NULL; }
+        if (!ReadFile(fh, bytes, (DWORD)fsz.QuadPart, &got, NULL)
+            || got != (DWORD)fsz.QuadPart) {
+            free(bytes); CloseHandle(fh); return NULL;
+        }
+        CloseHandle(fh);
+        data = stbi_load_from_memory(bytes, (int)got, &w, &h, &n, 4);
+        free(bytes);
+    }
+#else
     data = stbi_load(path, &w, &h, &n, 4);
-    if (!data) return NULL;
-    pix = (u32 *)malloc((size_t)w * h * sizeof(u32));
+#endif
+    if (!data) { zan_img_mark_bad(path); return NULL; }
+    /* Reject implausible dimensions before sizing the buffer: w*h*4 must not
+     * overflow the allocation size. */
+    if (w <= 0 || h <= 0 || w > 32768 || h > 32768) {
+        stbi_image_free(data);
+        zan_img_mark_bad(path);
+        return NULL;
+    }
+    pix = (u32 *)malloc((size_t)w * (size_t)h * sizeof(u32));
     if (!pix) { stbi_image_free(data); return NULL; }
     for (i = 0; i < w * h; i++) {
         unsigned char r = data[i*4], g = data[i*4+1],
@@ -1121,6 +1192,14 @@ EXPORT i64 zan_gui_image_height(const char *path) {
 EXPORT void zan_gui_image_evict(const char *path) {
     int i;
     if (!path) return;
+    for (i = 0; i < g_img_bad_n; i++) {
+        if (strncmp(g_img_bad[i], path, 511) == 0) {
+            memmove(&g_img_bad[i], &g_img_bad[i+1],
+                    sizeof(g_img_bad[0]) * (g_img_bad_n - i - 1));
+            g_img_bad_n--;
+            break;
+        }
+    }
     for (i = 0; i < g_img_n; i++) {
         if (strncmp(g_imgs[i].path, path, 511) == 0) {
             free(g_imgs[i].pix);
@@ -1177,3 +1256,6 @@ EXPORT void zan_gui_blit_image(i64 surf_id, const char *path,
 #include "gui_runtime_x11.c"
 #include "gui_runtime_font.c"
 #include "gui_runtime_shims.c"
+#if defined(_WIN32) && defined(ZAN_GUI_WEBVIEW2)
+#include "gui_runtime_webview2.c"
+#endif

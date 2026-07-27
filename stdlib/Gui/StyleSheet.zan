@@ -3,27 +3,43 @@ using System.Json;
 
 namespace Gui;
 
-/// A CSS-like cascade of declarations applied to controls while a UiDoc builds.
+/// A CSS cascade of declarations, applied either to a resolved StyleBox (the
+/// skin path, used by every widget through Style) or to a retained-mode Control
+/// while a UiDoc builds.
 ///
-/// The sheet is a JSON object whose keys are selectors and whose values are
-/// declaration blocks (property maps applied through the control's SetProp):
+/// The sheet is a selector -> declaration-block map. Selectors keep their CSS
+/// spelling (`button`, `.primary`, `button.primary`, `#save`) and may carry a
+/// `:state` suffix (`:hover`, `:active`, `:focus`, `:disabled`, `:selected`,
+/// `:checked`). Specificity ascends type -> class -> type.class -> id, and state
+/// rules layer on top of the base look, so `button:hover` only names what
+/// changes.
 ///
-///   {
-///     "Button":   { "text": "OK" },        // by type      (Kind())
-///     ".primary": { "text": "Save" },       // by class     (JSON "class")
-///     "#save":    { "text": "Save now" }     // by id/name   (JSON "name")
-///   }
-///
-/// Specificity ascends type -> class -> id, and inline node properties win over
-/// all of them (UiDoc applies the sheet before a node's own props). Layout keys
-/// `pad`/`gap` are understood in addition to whatever keys a widget publishes.
+/// Values are real CSS: colors as `#rgb / #rrggbb / #aarrggbb / rgb() / rgba() /
+/// hsl() / hsla()` or a named color, lengths with or without `px`, durations as
+/// `120ms / 0.2s`, `linear-gradient(...)`, `box-shadow: x y blur color`,
+/// `backdrop-filter: blur(20px)`, `transform: translate/scale/rotate`, flex
+/// layout, typography and `animation: <name> <dur> <easing>`.
 class StyleSheet {
     JsonValue rules;
+    /// `:root` custom properties (`--name` -> value) kept after parsing so a
+    /// skin can also feed the semantic Theme tokens, not just control rules.
+    JsonValue vars;
+    /// Pseudo-state the next Apply resolves in addition to the plain selectors
+    /// ("hover", "active", "focus", "disabled"; "" = base look only).
+    string state;
 
     static StyleSheet Create() {
         StyleSheet s = new StyleSheet();
         s.rules = JsonValue.NewObject();
+        s.vars = JsonValue.NewObject();
+        s.state = "";
         return s;
+    }
+
+    /// Parses a stylesheet written as CSS text (see Css). Skins ship as `.css`
+    /// so they can be authored and swapped without rebuilding the app.
+    static StyleSheet FromCss(string src) {
+        return Css.Parse(src);
     }
 
     /// Parses a stylesheet from a JSON source string. A malformed / non-object
@@ -35,98 +51,622 @@ class StyleSheet {
         return s;
     }
 
+    /// True when the sheet holds no rule at all (an app with no skin loaded).
+    bool IsEmpty() {
+        return rules == null || rules.Count() == 0;
+    }
+
+    /// Value of a `:root` custom property (`Var("--accent")`), "" when absent.
+    string Var(string name) {
+        if (vars == null) { return ""; }
+        JsonValue v = vars.Get(name);
+        if (v == null) { return ""; }
+        return v.AsString("");
+    }
+
+    /// The declaration block of one selector (null when the selector is absent).
+    JsonValue Block(string selector) {
+        if (rules == null) { return null; }
+        JsonValue block = rules.Get(selector);
+        if (block == null || !block.IsObject()) { return null; }
+        return block;
+    }
+
+    // ---- StyleBox application (the skin path) -------------------------------
+
+    /// Layers one selector's declarations onto a resolved style box. Unknown
+    /// properties are ignored here (they are control props, handled by
+    /// ApplySelector).
+    void ApplyBox(StyleBox b, string selector) {
+        JsonValue block = this.Block(selector);
+        if (block == null) { return; }
+        int i = 0;
+        while (i < block.Count()) {
+            string k = block.KeyAt(i);
+            JsonValue v = block.ValAt(i);
+            StyleSheet.Decl(b, k, StyleSheet.ValStr(v));
+            i = i + 1;
+        }
+    }
+
+    /// A declaration value as text (numbers stringify so `radius: 8` in a JSON
+    /// sheet behaves like `radius: 8px` in CSS).
+    static string ValStr(JsonValue v) {
+        if (v == null) { return ""; }
+        if (v.IsNumber()) { return Convert.ToString(v.AsInt(0)); }
+        return v.AsString("");
+    }
+
+    /// Applies one CSS declaration to a style box. Returns false when the
+    /// property is not a visual/layout property this engine understands.
+    static bool Decl(StyleBox b, string key, string val) {
+        string k = StyleSheet.Lower(StyleSheet.Trim(key));
+        string v = StyleSheet.Trim(val);
+        if (k == "" || v == "") { return false; }
+
+        // ---- fill ----------------------------------------------------------
+        if (k == "background" || k == "background-color" || k == "bg") {
+            StyleSheet.DeclBackground(b, v);
+            return true;
+        }
+        if (k == "background-image") {
+            StyleSheet.DeclBackground(b, v);
+            return true;
+        }
+        if (k == "opacity") { b.opacity = StyleSheet.Perm(v); return true; }
+        if (k == "backdrop-filter" || k == "filter") {
+            b.blur = StyleSheet.BlurArg(v);
+            return true;
+        }
+
+        // ---- text ----------------------------------------------------------
+        if (k == "color") { b.fg = StyleSheet.ParseColor(v); return true; }
+        if (k == "accent-color") { b.accent = StyleSheet.ParseColor(v); return true; }
+        if (k == "font-size" || k == "font") { b.fontPx = StyleSheet.Num(v); return true; }
+        if (k == "font-weight") { b.fontWeight = StyleSheet.Weight(v); return true; }
+        if (k == "line-height") { b.lineHeight = StyleSheet.Num(v); return true; }
+        if (k == "letter-spacing") { b.letterSpacing = StyleSheet.Num(v); return true; }
+        if (k == "text-align") {
+            b.align = 0;
+            if (v == "center") { b.align = 1; }
+            if (v == "right" || v == "end") { b.align = 2; }
+            return true;
+        }
+        if (k == "vertical-align") {
+            b.valign = 0;
+            if (v == "middle" || v == "center") { b.valign = 1; }
+            if (v == "bottom") { b.valign = 2; }
+            return true;
+        }
+        if (k == "text-transform") {
+            b.textCase = 0;
+            if (v == "uppercase") { b.textCase = 1; }
+            if (v == "lowercase") { b.textCase = 2; }
+            return true;
+        }
+        if (k == "text-overflow") {
+            b.ellipsis = 0;
+            if (v == "ellipsis") { b.ellipsis = 1; }
+            return true;
+        }
+        if (k == "white-space") {
+            b.nowrap = 0;
+            if (v == "nowrap" || v == "pre") { b.nowrap = 1; }
+            return true;
+        }
+
+        // ---- border / corners ----------------------------------------------
+        if (k == "border") { StyleSheet.DeclBorder(b, v, 0); return true; }
+        if (k == "border-top") { StyleSheet.DeclBorder(b, v, 1); return true; }
+        if (k == "border-right") { StyleSheet.DeclBorder(b, v, 2); return true; }
+        if (k == "border-bottom") { StyleSheet.DeclBorder(b, v, 3); return true; }
+        if (k == "border-left") { StyleSheet.DeclBorder(b, v, 4); return true; }
+        if (k == "border-width") { b.borderW = StyleSheet.Num(v); return true; }
+        if (k == "border-color") { b.borderColor = StyleSheet.ParseColor(v); return true; }
+        if (k == "border-top-width") { b.borderTopW = StyleSheet.Num(v); return true; }
+        if (k == "border-right-width") { b.borderRightW = StyleSheet.Num(v); return true; }
+        if (k == "border-bottom-width") { b.borderBottomW = StyleSheet.Num(v); return true; }
+        if (k == "border-left-width") { b.borderLeftW = StyleSheet.Num(v); return true; }
+        if (k == "border-top-color") { b.borderTopColor = StyleSheet.ParseColor(v); return true; }
+        if (k == "border-right-color") { b.borderRightColor = StyleSheet.ParseColor(v); return true; }
+        if (k == "border-bottom-color") { b.borderBottomColor = StyleSheet.ParseColor(v); return true; }
+        if (k == "border-left-color") { b.borderLeftColor = StyleSheet.ParseColor(v); return true; }
+        if (k == "border-radius" || k == "radius") {
+            StyleSheet.DeclRadius(b, v);
+            return true;
+        }
+
+        // ---- shadow --------------------------------------------------------
+        if (k == "box-shadow" || k == "shadow") { StyleSheet.DeclShadow(b, v); return true; }
+
+        // ---- box metrics ---------------------------------------------------
+        if (k == "padding" || k == "pad") { StyleSheet.DeclSides(b, v, 0); return true; }
+        if (k == "padding-left") { b.padL = StyleSheet.Num(v); return true; }
+        if (k == "padding-top") { b.padT = StyleSheet.Num(v); return true; }
+        if (k == "padding-right") { b.padR = StyleSheet.Num(v); return true; }
+        if (k == "padding-bottom") { b.padB = StyleSheet.Num(v); return true; }
+        if (k == "margin") { StyleSheet.DeclSides(b, v, 1); return true; }
+        if (k == "margin-left") { b.marL = StyleSheet.Num(v); return true; }
+        if (k == "margin-top") { b.marT = StyleSheet.Num(v); return true; }
+        if (k == "margin-right") { b.marR = StyleSheet.Num(v); return true; }
+        if (k == "margin-bottom") { b.marB = StyleSheet.Num(v); return true; }
+        if (k == "width") { b.width = StyleSheet.Num(v); return true; }
+        if (k == "height") { b.height = StyleSheet.Num(v); return true; }
+        if (k == "min-width") { b.minW = StyleSheet.Num(v); return true; }
+        if (k == "min-height") { b.minH = StyleSheet.Num(v); return true; }
+        if (k == "max-width") { b.maxW = StyleSheet.Num(v); return true; }
+        if (k == "max-height") { b.maxH = StyleSheet.Num(v); return true; }
+        if (k == "gap") { b.gap = StyleSheet.Num(v); return true; }
+
+        // ---- layout --------------------------------------------------------
+        if (k == "display") {
+            b.display = 0;
+            if (v == "flex" || v == "inline-flex") { b.display = 1; }
+            if (v == "none") { b.display = 2; }
+            return true;
+        }
+        if (k == "flex-direction") {
+            b.flexDir = 0;
+            if (v == "column" || v == "column-reverse") { b.flexDir = 1; }
+            return true;
+        }
+        if (k == "justify-content") {
+            b.justify = 0;
+            if (v == "center") { b.justify = 1; }
+            if (v == "flex-end" || v == "end" || v == "right") { b.justify = 2; }
+            if (v == "space-between") { b.justify = 3; }
+            if (v == "space-around" || v == "space-evenly") { b.justify = 4; }
+            return true;
+        }
+        if (k == "align-items") {
+            b.alignItems = 0;
+            if (v == "flex-start" || v == "start" || v == "top") { b.alignItems = 1; }
+            if (v == "center") { b.alignItems = 2; }
+            if (v == "flex-end" || v == "end" || v == "bottom") { b.alignItems = 3; }
+            return true;
+        }
+        if (k == "flex-wrap") {
+            b.wrap = 0;
+            if (v == "wrap" || v == "wrap-reverse") { b.wrap = 1; }
+            return true;
+        }
+        if (k == "flex" || k == "flex-grow") { b.grow = StyleSheet.Num(v); return true; }
+        if (k == "order") { b.order = StyleSheet.Num(v); return true; }
+        if (k == "position") {
+            b.position = 0;
+            if (v == "relative") { b.position = 1; }
+            if (v == "absolute" || v == "fixed") { b.position = 2; }
+            return true;
+        }
+        if (k == "top") { b.posT = StyleSheet.Num(v); return true; }
+        if (k == "right") { b.posR = StyleSheet.Num(v); return true; }
+        if (k == "bottom") { b.posB = StyleSheet.Num(v); return true; }
+        if (k == "left") { b.posL = StyleSheet.Num(v); return true; }
+        if (k == "overflow" || k == "overflow-y" || k == "overflow-x") {
+            b.overflow = 0;
+            if (v == "hidden" || v == "clip" || v == "auto" || v == "scroll") {
+                b.overflow = 1;
+            }
+            return true;
+        }
+        if (k == "z-index") { b.zIndex = StyleSheet.Num(v); return true; }
+        if (k == "visibility") {
+            b.visible = 1;
+            if (v == "hidden" || v == "collapse") { b.visible = 0; }
+            return true;
+        }
+        if (k == "cursor") { b.cursor = StyleSheet.CursorCode(v); return true; }
+
+        // ---- motion --------------------------------------------------------
+        if (k == "transition" || k == "transition-duration") {
+            StyleSheet.DeclTransition(b, v);
+            return true;
+        }
+        if (k == "transition-timing-function") {
+            b.easing = StyleSheet.Easing(v);
+            return true;
+        }
+        if (k == "transform") { StyleSheet.DeclTransform(b, v); return true; }
+        if (k == "animation" || k == "animation-name") {
+            StyleSheet.DeclAnimation(b, v);
+            return true;
+        }
+        if (k == "animation-duration") { b.animMs = StyleSheet.Ms(v); return true; }
+        return false;
+    }
+
+    /// `background: <color> | linear-gradient([<dir>,] a, b[, c])`.
+    static void DeclBackground(StyleBox b, string val) {
+        string s = val;
+        if (StyleSheet.StartsWith(s, "linear-gradient(")) {
+            int close = StyleSheet.LastIndexOf(s, ")");
+            if (close < 0) { close = s.Length; }
+            string inner = s.Substring(16, close - 16);
+            List<string> parts = Css.SplitTrim(inner, ",");
+            List<string> stops = new List<string>();
+            int i = 0;
+            while (i < parts.Count) {
+                string p = parts[i];
+                i = i + 1;
+                if (p == "") { continue; }
+                int dir = StyleSheet.GradientDir(p);
+                if (dir >= 0) { b.bgDir = dir; continue; }
+                stops.Add(p);
+            }
+            if (stops.Count >= 2) {
+                b.bg = StyleSheet.ParseColor(StyleSheet.StopColor(stops[0]));
+                if (stops.Count >= 3) {
+                    b.bgVia = StyleSheet.ParseColor(StyleSheet.StopColor(stops[1]));
+                    b.bgTo = StyleSheet.ParseColor(StyleSheet.StopColor(stops[2]));
+                } else {
+                    b.bgVia = 0;
+                    b.bgTo = StyleSheet.ParseColor(StyleSheet.StopColor(stops[1]));
+                }
+                return;
+            }
+        }
+        if (s == "none" || s == "transparent") {
+            b.bg = 0;
+            b.bgTo = 0;
+            b.bgVia = 0;
+            return;
+        }
+        b.bg = StyleSheet.ParseColor(s);
+        b.bgTo = 0;
+        b.bgVia = 0;
+    }
+
+    /// A gradient direction keyword/angle as a StyleBox.bgDir, or -1 when the
+    /// token is a color stop instead.
+    static int GradientDir(string tok) {
+        string s = StyleSheet.Lower(tok);
+        if (s == "to bottom" || s == "180deg") { return 0; }
+        if (s == "to right" || s == "90deg") { return 1; }
+        if (s == "to bottom right" || s == "135deg" || s == "to right bottom") { return 2; }
+        if (s == "to top" || s == "0deg" || s == "360deg") { return 3; }
+        return 0 - 1;
+    }
+
+    /// Drops a stop's position (`#fff 40%` -> `#fff`).
+    static string StopColor(string stop) {
+        string s = StyleSheet.Trim(stop);
+        if (StyleSheet.StartsWith(s, "rgb") || StyleSheet.StartsWith(s, "hsl")) {
+            int close = StyleSheet.IndexOf(s, ")");
+            if (close > 0) { return s.Substring(0, close + 1); }
+            return s;
+        }
+        int sp = StyleSheet.IndexOf(s, " ");
+        if (sp > 0) { return s.Substring(0, sp); }
+        return s;
+    }
+
+    /// `border[-side]: <width> [style] <color>` (any order, width optional).
+    static void DeclBorder(StyleBox b, string val, int side) {
+        List<string> toks = StyleSheet.Tokens(val);
+        int w = 1;
+        int col = 0;
+        bool haveW = false;
+        int i = 0;
+        while (i < toks.Count) {
+            string tk = toks[i];
+            i = i + 1;
+            string lo = StyleSheet.Lower(tk);
+            if (lo == "solid" || lo == "dashed" || lo == "dotted" || lo == "none") {
+                if (lo == "none") { w = 0; haveW = true; }
+                continue;
+            }
+            if (StyleSheet.IsNumeric(tk)) {
+                w = StyleSheet.Num(tk);
+                haveW = true;
+                continue;
+            }
+            col = StyleSheet.ParseColor(tk);
+        }
+        if (!haveW) { w = 1; }
+        if (side == 0) {
+            b.borderW = w;
+            if (col != 0) { b.borderColor = col; }
+            b.borderTopW = 0 - 1; b.borderRightW = 0 - 1;
+            b.borderBottomW = 0 - 1; b.borderLeftW = 0 - 1;
+        } else if (side == 1) {
+            b.borderTopW = w; b.borderTopColor = col;
+        } else if (side == 2) {
+            b.borderRightW = w; b.borderRightColor = col;
+        } else if (side == 3) {
+            b.borderBottomW = w; b.borderBottomColor = col;
+        } else {
+            b.borderLeftW = w; b.borderLeftColor = col;
+        }
+    }
+
+    /// `border-radius: all | tl tr br bl` (`999`/`50%` round the shape fully).
+    static void DeclRadius(StyleBox b, string val) {
+        List<string> toks = StyleSheet.Tokens(val);
+        if (toks.Count == 0) { return; }
+        if (toks.Count == 1) {
+            b.SetRadius(StyleSheet.Num(toks[0]));
+            return;
+        }
+        int tl = StyleSheet.Num(toks[0]);
+        int tr = tl;
+        int br = tl;
+        int bl = tl;
+        if (toks.Count == 2) {
+            tr = StyleSheet.Num(toks[1]);
+            br = tl;
+            bl = tr;
+        } else if (toks.Count == 3) {
+            tr = StyleSheet.Num(toks[1]);
+            br = StyleSheet.Num(toks[2]);
+            bl = tr;
+        } else {
+            tr = StyleSheet.Num(toks[1]);
+            br = StyleSheet.Num(toks[2]);
+            bl = StyleSheet.Num(toks[3]);
+        }
+        b.radiusTL = tl; b.radiusTR = tr; b.radiusBR = br; b.radiusBL = bl;
+        int max = tl;
+        if (tr > max) { max = tr; }
+        if (br > max) { max = br; }
+        if (bl > max) { max = bl; }
+        b.radius = max;
+    }
+
+    /// `box-shadow: [inset] <dx> <dy> [blur] <color>` (or just a color).
+    static void DeclShadow(StyleBox b, string val) {
+        if (StyleSheet.Lower(val) == "none") {
+            b.shadow = 0;
+            return;
+        }
+        List<string> toks = StyleSheet.Tokens(val);
+        List<int> nums = new List<int>();
+        int col = 0;
+        int i = 0;
+        while (i < toks.Count) {
+            string tk = toks[i];
+            i = i + 1;
+            if (StyleSheet.Lower(tk) == "inset") { b.shadowInset = 1; continue; }
+            if (StyleSheet.IsNumeric(tk)) { nums.Add(StyleSheet.Num(tk)); continue; }
+            col = StyleSheet.ParseColor(tk);
+        }
+        if (col != 0) { b.shadow = col; }
+        if (nums.Count >= 2) {
+            b.shadowDx = nums[0];
+            b.shadowDy = nums[1];
+            if (nums.Count >= 3) { b.shadowBlur = nums[2]; }
+        } else if (nums.Count == 1) {
+            b.shadowDy = nums[0];
+        } else if (b.shadowDy == 0) {
+            b.shadowDy = 2;
+        }
+    }
+
+    /// `padding/margin: all | v h | t h b | t r b l`.
+    static void DeclSides(StyleBox b, string val, int which) {
+        List<string> toks = StyleSheet.Tokens(val);
+        if (toks.Count == 0) { return; }
+        int t = StyleSheet.Num(toks[0]);
+        int r = t;
+        int bo = t;
+        int l = t;
+        if (toks.Count == 2) {
+            r = StyleSheet.Num(toks[1]);
+            l = r;
+        } else if (toks.Count == 3) {
+            r = StyleSheet.Num(toks[1]);
+            l = r;
+            bo = StyleSheet.Num(toks[2]);
+        } else if (toks.Count >= 4) {
+            r = StyleSheet.Num(toks[1]);
+            bo = StyleSheet.Num(toks[2]);
+            l = StyleSheet.Num(toks[3]);
+        }
+        if (which == 0) {
+            b.padT = t; b.padR = r; b.padB = bo; b.padL = l;
+        } else {
+            b.marT = t; b.marR = r; b.marB = bo; b.marL = l;
+        }
+    }
+
+    /// `transition: [prop] <duration> [timing]` — only the duration and timing
+    /// matter here (every animatable property eases together).
+    static void DeclTransition(StyleBox b, string val) {
+        List<string> toks = StyleSheet.Tokens(val);
+        int i = 0;
+        while (i < toks.Count) {
+            string tk = toks[i];
+            i = i + 1;
+            if (StyleSheet.IsNumeric(tk)) { b.transitionMs = StyleSheet.Ms(tk); continue; }
+            int e = StyleSheet.Easing(tk);
+            if (e >= 0) { b.easing = e; }
+        }
+    }
+
+    /// `transform: translate(x,y) translateX(x) translateY(y) scale(n) rotate(deg)`.
+    static void DeclTransform(StyleBox b, string val) {
+        string s = val;
+        if (StyleSheet.Lower(s) == "none") {
+            b.tx = 0; b.ty = 0; b.scale = 1000; b.rotate = 0;
+            return;
+        }
+        int i = 0;
+        while (i < s.Length) {
+            int open = Css.IndexFrom(s, "(", i);
+            if (open < 0) { return; }
+            int close = Css.IndexFrom(s, ")", open + 1);
+            if (close < 0) { return; }
+            string name = StyleSheet.Lower(StyleSheet.Trim(s.Substring(i, open - i)));
+            string args = s.Substring(open + 1, close - open - 1);
+            i = close + 1;
+            List<string> a = Css.SplitTrim(args, ",");
+            if (name == "translate") {
+                if (a.Count >= 1) { b.tx = StyleSheet.Num(a[0]); }
+                if (a.Count >= 2) { b.ty = StyleSheet.Num(a[1]); }
+            } else if (name == "translatex") {
+                if (a.Count >= 1) { b.tx = StyleSheet.Num(a[0]); }
+            } else if (name == "translatey") {
+                if (a.Count >= 1) { b.ty = StyleSheet.Num(a[0]); }
+            } else if (name == "scale") {
+                if (a.Count >= 1) { b.scale = StyleSheet.Perm(a[0]); }
+            } else if (name == "rotate") {
+                if (a.Count >= 1) { b.rotate = StyleSheet.Num(a[0]); }
+            }
+        }
+    }
+
+    /// `animation: <name> <duration> [timing] [infinite]`. Names map onto the
+    /// built-in keyframes (spin, pulse, breath, shimmer, float, glow, aurora,
+    /// motes) drawn by Fx.
+    static void DeclAnimation(StyleBox b, string val) {
+        List<string> toks = StyleSheet.Tokens(val);
+        int i = 0;
+        while (i < toks.Count) {
+            string tk = toks[i];
+            i = i + 1;
+            string lo = StyleSheet.Lower(tk);
+            if (lo == "none") { b.anim = 0; continue; }
+            if (lo == "infinite" || lo == "linear" || lo == "ease"
+                || lo == "ease-in" || lo == "ease-out" || lo == "ease-in-out"
+                || lo == "alternate" || lo == "forwards") {
+                int e = StyleSheet.Easing(lo);
+                if (e >= 0) { b.easing = e; }
+                continue;
+            }
+            if (StyleSheet.IsNumeric(tk)) { b.animMs = StyleSheet.Ms(tk); continue; }
+            int kind = Style.AnimKind(lo);
+            if (kind != 0) { b.anim = kind; }
+        }
+    }
+
+    /// `blur(20px)` inside a filter value -> 20 (0 when absent).
+    static int BlurArg(string val) {
+        int at = Css.IndexFrom(StyleSheet.Lower(val), "blur(", 0);
+        if (at < 0) { return 0; }
+        int close = Css.IndexFrom(val, ")", at);
+        if (close < 0) { return 0; }
+        return StyleSheet.Num(val.Substring(at + 5, close - at - 5));
+    }
+
+    static int Easing(string val) {
+        string s = StyleSheet.Lower(val);
+        if (s == "ease") { return 0; }
+        if (s == "linear") { return 1; }
+        if (s == "ease-in") { return 2; }
+        if (s == "ease-out") { return 3; }
+        if (s == "ease-in-out") { return 4; }
+        return 0 - 1;
+    }
+
+    static int Weight(string val) {
+        string s = StyleSheet.Lower(val);
+        if (s == "bold" || s == "bolder") { return 700; }
+        if (s == "normal") { return 400; }
+        if (s == "light" || s == "lighter") { return 300; }
+        return StyleSheet.Num(s);
+    }
+
+    static int CursorCode(string val) {
+        string s = StyleSheet.Lower(val);
+        if (s == "pointer" || s == "hand" || s == "grab") { return Cursor.Hand(); }
+        if (s == "text") { return Cursor.IBeam(); }
+        if (s == "ew-resize" || s == "col-resize") { return Cursor.ResizeH(); }
+        if (s == "ns-resize" || s == "row-resize") { return Cursor.ResizeV(); }
+        return Cursor.Arrow();
+    }
+
+    // ---- Control application (retained mode / UiDoc) -----------------------
+
     /// Applies the matching rules to `c`, ascending specificity (type, then
     /// class, then id) so the most specific selector wins.
     void Apply(Control c, string type, string cls, string id) {
         ApplySelector(c, type);
         if (cls != "") { ApplySelector(c, "." + cls); }
         if (id != "") { ApplySelector(c, "#" + id); }
+        // State rules layer on top of the base look, so `button:hover` only has
+        // to name what changes.
+        if (state != "") {
+            ApplySelector(c, type + ":" + state);
+            if (cls != "") { ApplySelector(c, "." + cls + ":" + state); }
+            if (id != "") { ApplySelector(c, "#" + id + ":" + state); }
+        }
     }
 
-    /// Applies the declaration block registered for one selector (no-op when the
-    /// selector is absent or its value is not an object).
+    /// Applies one selector's declarations to a control: layout keys land on the
+    /// control's own fields, visual keys go through the shared StyleBox parser
+    /// (so CSS behaves identically in retained and immediate mode), and anything
+    /// else is published to the widget through SetProp.
     void ApplySelector(Control c, string selector) {
-        JsonValue block = rules.Get(selector);
-        if (block == null || !block.IsObject()) { return; }
+        JsonValue block = this.Block(selector);
+        if (block == null) { return; }
+        StyleBox box = StyleBox.Create();
+        bool visual = false;
         int i = 0;
         while (i < block.Count()) {
             string k = block.KeyAt(i);
             JsonValue v = block.ValAt(i);
+            i = i + 1;
             if (k == "pad" || k == "padding") {
-                c.Pad(v.AsInt(0));
-            } else if (k == "gap") {
-                c.gap = v.AsInt(0);
-            } else if (k == "dock") {
+                c.Pad(StyleSheet.Num(StyleSheet.ValStr(v)));
+                continue;
+            }
+            if (k == "gap") { c.gap = v.AsInt(0); continue; }
+            if (k == "dock") {
                 if (v.IsNumber()) { c.dock = v.AsInt(0); }
                 else { c.dock = UiDoc.DockValue(v.AsString("")); }
-            } else if (k == "x") {
-                c.mx = v.AsInt(0);
-            } else if (k == "y") {
-                c.my = v.AsInt(0);
-            } else if (k == "width") {
-                c.prefW = v.AsInt(c.prefW);
-            } else if (k == "height") {
-                c.prefH = v.AsInt(c.prefH);
-            } else if (k == "background" || k == "bg" || k == "background-color") {
-                StyleSheet.ApplyBackground(c, v.AsString(""));
-            } else if (k == "color") {
-                c.styleColor = StyleSheet.ParseColor(v.AsString(""));
-            } else if (k == "radius" || k == "border-radius") {
-                c.styleRadius = v.AsInt(0);
-            } else if (k == "border-color") {
-                c.styleBorderColor = StyleSheet.ParseColor(v.AsString(""));
-            } else if (k == "border-width") {
-                c.styleBorderWidth = v.AsInt(0);
-            } else if (k == "border") {
-                StyleSheet.ApplyBorder(c, v.AsString(""));
-            } else if (k == "shadow" || k == "box-shadow") {
-                c.styleShadow = StyleSheet.ParseColor(v.AsString(""));
-                if (c.styleShadowDy == 0) { c.styleShadowDy = 2; }
-            } else if (k == "font-size" || k == "font") {
-                c.styleFontPx = v.AsInt(0);
-            } else if (k == "transition") {
-                c.styleTransitionMs = v.AsInt(0);
-            } else {
-                c.SetProp(k, UiDoc.Scalar(v));
+                continue;
             }
-            i = i + 1;
+            if (k == "x") { c.mx = v.AsInt(0); continue; }
+            if (k == "y") { c.my = v.AsInt(0); continue; }
+            if (k == "width") { c.prefW = StyleSheet.Num(StyleSheet.ValStr(v)); continue; }
+            if (k == "height") { c.prefH = StyleSheet.Num(StyleSheet.ValStr(v)); continue; }
+            if (StyleSheet.Decl(box, k, StyleSheet.ValStr(v))) {
+                visual = true;
+                continue;
+            }
+            c.SetProp(k, UiDoc.Scalar(v));
         }
+        if (visual) { StyleSheet.CopyToControl(box, c); }
+    }
+
+    /// Copies the visual properties a control carries inline (Control keeps a
+    /// small subset; the rest lives on the resolved StyleBox at paint time).
+    static void CopyToControl(StyleBox b, Control c) {
+        if (b.bg != 0) { c.styleBg = b.bg; }
+        if (b.bgTo != 0) { c.styleBgTo = b.bgTo; }
+        if (b.radius >= 0) { c.styleRadius = b.radius; }
+        if (b.borderColor != 0) { c.styleBorderColor = b.borderColor; }
+        if (b.borderW >= 0) { c.styleBorderWidth = b.borderW; }
+        if (b.shadow != 0) {
+            c.styleShadow = b.shadow;
+            c.styleShadowDy = b.shadowDy;
+            if (c.styleShadowDy == 0) { c.styleShadowDy = 2; }
+        }
+        if (b.fg != 0) { c.styleColor = b.fg; }
+        if (b.fontPx > 0) { c.styleFontPx = b.fontPx; }
+        if (b.transitionMs >= 0) { c.styleTransitionMs = b.transitionMs; }
     }
 
     /// Sets a solid fill or a `linear-gradient(a,b)` on the control.
     static void ApplyBackground(Control c, string val) {
-        string s = StyleSheet.Trim(val);
-        if (s.Length >= 16 && s.Substring(0, 16) == "linear-gradient(") {
-            int close = StyleSheet.IndexOf(s, ")");
-            string inner = s.Substring(16, close - 16);
-            int comma = StyleSheet.IndexOf(inner, ",");
-            if (comma > 0) {
-                string a = StyleSheet.Trim(inner.Substring(0, comma));
-                string b = StyleSheet.Trim(inner.Substring(comma + 1, inner.Length - comma - 1));
-                c.styleBg = StyleSheet.ParseColor(a);
-                c.styleBgTo = StyleSheet.ParseColor(b);
-                return;
-            }
-        }
-        c.styleBg = StyleSheet.ParseColor(s);
-        c.styleBgTo = 0;
+        StyleBox b = StyleBox.Create();
+        StyleSheet.DeclBackground(b, StyleSheet.Trim(val));
+        c.styleBg = b.bg;
+        c.styleBgTo = b.bgTo;
     }
 
     /// Parses `border: <width> <color>` (width optional, defaults to 1).
     static void ApplyBorder(Control c, string val) {
-        string s = StyleSheet.Trim(val);
-        int sp = StyleSheet.IndexOf(s, " ");
-        if (sp > 0) {
-            c.styleBorderWidth = StyleSheet.ParseInt(StyleSheet.Trim(s.Substring(0, sp)));
-            c.styleBorderColor = StyleSheet.ParseColor(StyleSheet.Trim(s.Substring(sp + 1, s.Length - sp - 1)));
-        } else {
-            c.styleBorderWidth = 1;
-            c.styleBorderColor = StyleSheet.ParseColor(s);
-        }
+        StyleBox b = StyleBox.Create();
+        StyleSheet.DeclBorder(b, StyleSheet.Trim(val), 0);
+        c.styleBorderWidth = b.borderW;
+        c.styleBorderColor = b.borderColor;
     }
 
+    // ---- value parsing ------------------------------------------------------
+
     /// Parses a CSS colour into a packed 0xAARRGGBB int. Accepts `#RGB`,
-    /// `#RRGGBB`, `#AARRGGBB`, `0x...` and plain decimal. Returns 0 (= unset)
+    /// `#RRGGBB`, `#RRGGBBAA`, `#AARRGGBB`, `rgb()/rgba()`, `hsl()/hsla()`,
+    /// `0x...`, a plain decimal and the CSS named colors. Returns 0 (= unset)
     /// for an empty/unparseable value, so a bad rule simply does nothing.
     static int ParseColor(string val) {
         string s = StyleSheet.Trim(val);
@@ -138,15 +678,149 @@ class StyleSheet {
                 string g = h.Substring(1, 1);
                 string b = h.Substring(2, 1);
                 h = r + r + g + g + b + b;
+            } else if (h.Length == 4) {
+                // #rgba
+                string r = h.Substring(0, 1);
+                string g = h.Substring(1, 1);
+                string b = h.Substring(2, 1);
+                string a = h.Substring(3, 1);
+                h = a + a + r + r + g + g + b + b;
             }
             if (h.Length == 6) { h = "FF" + h; }
+            if (h.Length == 8 && StyleSheet.HexDigit(h.Substring(0, 1)) < 0) { return 0; }
             if (h.Length != 8) { return 0; }
             return StyleSheet.HexToInt(h);
         }
+        string lo = StyleSheet.Lower(s);
+        if (StyleSheet.StartsWith(lo, "rgb")) { return StyleSheet.ParseRgb(s); }
+        if (StyleSheet.StartsWith(lo, "hsl")) { return StyleSheet.ParseHsl(s); }
+        if (lo == "transparent" || lo == "none" || lo == "currentcolor") { return 0; }
         if (s.Length > 2 && s.Substring(0, 2) == "0x") {
             return StyleSheet.HexToInt(s.Substring(2, s.Length - 2));
         }
+        int named = StyleSheet.NamedColor(lo);
+        if (named != 0) { return named; }
         return StyleSheet.ParseInt(s);
+    }
+
+    /// `rgb(r,g,b)` / `rgba(r,g,b,a)` with `a` as 0..1 or a percentage.
+    static int ParseRgb(string val) {
+        int open = StyleSheet.IndexOf(val, "(");
+        int close = StyleSheet.LastIndexOf(val, ")");
+        if (open < 0 || close < open) { return 0; }
+        List<string> a = Css.SplitTrim(val.Substring(open + 1, close - open - 1), ",");
+        if (a.Count < 3) { return 0; }
+        int r = StyleSheet.Chan(a[0]);
+        int g = StyleSheet.Chan(a[1]);
+        int b = StyleSheet.Chan(a[2]);
+        int al = 255;
+        if (a.Count >= 4) { al = StyleSheet.Perm(a[3]) * 255 / 1000; }
+        return StyleSheet.Pack(al, r, g, b);
+    }
+
+    /// `hsl(h,s%,l%)` / `hsla(...)` converted to RGB (integer math).
+    static int ParseHsl(string val) {
+        int open = StyleSheet.IndexOf(val, "(");
+        int close = StyleSheet.LastIndexOf(val, ")");
+        if (open < 0 || close < open) { return 0; }
+        List<string> a = Css.SplitTrim(val.Substring(open + 1, close - open - 1), ",");
+        if (a.Count < 3) { return 0; }
+        int h = StyleSheet.Num(a[0]) % 360;
+        if (h < 0) { h = h + 360; }
+        int sat = StyleSheet.Perm(a[1]);
+        int lit = StyleSheet.Perm(a[2]);
+        int al = 255;
+        if (a.Count >= 4) { al = StyleSheet.Perm(a[3]) * 255 / 1000; }
+        // c = (1 - |2l - 1|) * s ; all values in permille
+        int d2l = 2 * lit - 1000;
+        if (d2l < 0) { d2l = 0 - d2l; }
+        int chroma = (1000 - d2l) * sat / 1000;
+        int hp = h * 1000 / 60;
+        int mod2 = hp % 2000;
+        int xm = mod2 - 1000;
+        if (xm < 0) { xm = 0 - xm; }
+        int x = chroma * (1000 - xm) / 1000;
+        int m = lit - chroma / 2;
+        int r = 0; int g = 0; int b = 0;
+        if (h < 60) { r = chroma; g = x; b = 0; }
+        else if (h < 120) { r = x; g = chroma; b = 0; }
+        else if (h < 180) { r = 0; g = chroma; b = x; }
+        else if (h < 240) { r = 0; g = x; b = chroma; }
+        else if (h < 300) { r = x; g = 0; b = chroma; }
+        else { r = chroma; g = 0; b = x; }
+        r = (r + m) * 255 / 1000;
+        g = (g + m) * 255 / 1000;
+        b = (b + m) * 255 / 1000;
+        return StyleSheet.Pack(al, r, g, b);
+    }
+
+    /// A single rgb() channel: `0..255` or a percentage.
+    static int Chan(string tok) {
+        string s = StyleSheet.Trim(tok);
+        if (StyleSheet.IndexOf(s, "%") >= 0) { return StyleSheet.Perm(s) * 255 / 1000; }
+        return StyleSheet.Clamp255(StyleSheet.Num(s));
+    }
+
+    static int Clamp255(int v) {
+        if (v < 0) { return 0; }
+        if (v > 255) { return 255; }
+        return v;
+    }
+
+    /// Packs a,r,g,b (0..255) into the GUI's signed 0xAARRGGBB int.
+    static int Pack(int a, int r, int g, int b) {
+        int av = StyleSheet.Clamp255(a);
+        int rv = StyleSheet.Clamp255(r);
+        int gv = StyleSheet.Clamp255(g);
+        int bv = StyleSheet.Clamp255(b);
+        return av * 16777216 + rv * 65536 + gv * 256 + bv;
+    }
+
+    /// The CSS named colors a skin realistically reaches for (0 when unknown).
+    static int NamedColor(string name) {
+        if (name == "white") { return StyleSheet.Pack(255, 255, 255, 255); }
+        if (name == "black") { return StyleSheet.Pack(255, 0, 0, 0); }
+        if (name == "red") { return StyleSheet.Pack(255, 255, 0, 0); }
+        if (name == "green") { return StyleSheet.Pack(255, 0, 128, 0); }
+        if (name == "lime") { return StyleSheet.Pack(255, 0, 255, 0); }
+        if (name == "blue") { return StyleSheet.Pack(255, 0, 0, 255); }
+        if (name == "yellow") { return StyleSheet.Pack(255, 255, 255, 0); }
+        if (name == "orange") { return StyleSheet.Pack(255, 255, 165, 0); }
+        if (name == "gold") { return StyleSheet.Pack(255, 255, 215, 0); }
+        if (name == "purple") { return StyleSheet.Pack(255, 128, 0, 128); }
+        if (name == "magenta" || name == "fuchsia") { return StyleSheet.Pack(255, 255, 0, 255); }
+        if (name == "cyan" || name == "aqua") { return StyleSheet.Pack(255, 0, 255, 255); }
+        if (name == "gray" || name == "grey") { return StyleSheet.Pack(255, 128, 128, 128); }
+        if (name == "silver") { return StyleSheet.Pack(255, 192, 192, 192); }
+        if (name == "maroon") { return StyleSheet.Pack(255, 128, 0, 0); }
+        if (name == "navy") { return StyleSheet.Pack(255, 0, 0, 128); }
+        if (name == "teal") { return StyleSheet.Pack(255, 0, 128, 128); }
+        if (name == "olive") { return StyleSheet.Pack(255, 128, 128, 0); }
+        if (name == "pink") { return StyleSheet.Pack(255, 255, 192, 203); }
+        if (name == "brown") { return StyleSheet.Pack(255, 165, 42, 42); }
+        if (name == "crimson") { return StyleSheet.Pack(255, 220, 20, 60); }
+        if (name == "coral") { return StyleSheet.Pack(255, 255, 127, 80); }
+        if (name == "salmon") { return StyleSheet.Pack(255, 250, 128, 114); }
+        if (name == "khaki") { return StyleSheet.Pack(255, 240, 230, 140); }
+        if (name == "ivory") { return StyleSheet.Pack(255, 255, 255, 240); }
+        if (name == "beige") { return StyleSheet.Pack(255, 245, 245, 220); }
+        if (name == "wheat") { return StyleSheet.Pack(255, 245, 222, 179); }
+        if (name == "tan") { return StyleSheet.Pack(255, 210, 180, 140); }
+        if (name == "indigo") { return StyleSheet.Pack(255, 75, 0, 130); }
+        if (name == "violet") { return StyleSheet.Pack(255, 238, 130, 238); }
+        if (name == "turquoise") { return StyleSheet.Pack(255, 64, 224, 208); }
+        if (name == "skyblue") { return StyleSheet.Pack(255, 135, 206, 235); }
+        if (name == "steelblue") { return StyleSheet.Pack(255, 70, 130, 180); }
+        if (name == "slategray" || name == "slategrey") { return StyleSheet.Pack(255, 112, 128, 144); }
+        if (name == "seagreen") { return StyleSheet.Pack(255, 46, 139, 87); }
+        if (name == "forestgreen") { return StyleSheet.Pack(255, 34, 139, 34); }
+        if (name == "darkgreen") { return StyleSheet.Pack(255, 0, 100, 0); }
+        if (name == "darkred") { return StyleSheet.Pack(255, 139, 0, 0); }
+        if (name == "darkblue") { return StyleSheet.Pack(255, 0, 0, 139); }
+        if (name == "darkgray" || name == "darkgrey") { return StyleSheet.Pack(255, 169, 169, 169); }
+        if (name == "lightgray" || name == "lightgrey") { return StyleSheet.Pack(255, 211, 211, 211); }
+        if (name == "whitesmoke") { return StyleSheet.Pack(255, 245, 245, 245); }
+        return 0;
     }
 
     /// Converts a hex string (up to 8 digits) into a packed int. High bit set
@@ -183,32 +857,144 @@ class StyleSheet {
         return -1;
     }
 
-    static int ParseInt(string s) {
-        int acc = 0;
-        int i = 0;
-        while (i < s.Length) {
-            int d = StyleSheet.HexDigit(s.Substring(i, 1));
-            if (d < 0 || d > 9) { return acc; }
-            acc = (acc * 10) + d;
-            i = i + 1;
+    static bool Digit(string ch) {
+        int d = StyleSheet.HexDigit(ch);
+        return d >= 0 && d <= 9;
+    }
+
+    /// True when the token reads as a number (optionally signed, decimal, with
+    /// a unit suffix like px/ms/s/%/deg) rather than a keyword or color.
+    static bool IsNumeric(string tok) {
+        string s = StyleSheet.Trim(tok);
+        if (s.Length == 0) { return false; }
+        string first = s.Substring(0, 1);
+        if (first == "-" || first == "+" || first == ".") {
+            if (s.Length < 2) { return false; }
+            return StyleSheet.Digit(s.Substring(1, 1));
         }
-        return acc;
+        return StyleSheet.Digit(first);
+    }
+
+    /// A CSS length/number as an int: sign-aware, unit-tolerant (`12px`, `-4`,
+    /// `1.5rem` -> 1, `200ms`), and 0 for a non-numeric token.
+    static int Num(string val) {
+        string s = StyleSheet.Trim(val);
+        if (s.Length == 0) { return 0; }
+        int sign = 1;
+        int i = 0;
+        if (s.Substring(0, 1) == "-") { sign = -1; i = 1; }
+        else if (s.Substring(0, 1) == "+") { i = 1; }
+        int acc = 0;
+        bool any = false;
+        while (i < s.Length) {
+            string ch = s.Substring(i, 1);
+            if (!StyleSheet.Digit(ch)) { i = s.Length; }
+            else {
+                acc = acc * 10 + StyleSheet.HexDigit(ch);
+                any = true;
+                i = i + 1;
+            }
+        }
+        if (!any) { return 0; }
+        return sign * acc;
+    }
+
+    /// A ratio as permille: `1` / `1.0` -> 1000, `0.5` -> 500, `60%` -> 600,
+    /// `255` (an alpha channel) stays 255-scaled by the caller.
+    static int Perm(string val) {
+        string s = StyleSheet.Trim(val);
+        if (s.Length == 0) { return 1000; }
+        if (StyleSheet.IndexOf(s, "%") >= 0) {
+            return StyleSheet.Num(s) * 10;
+        }
+        int dot = StyleSheet.IndexOf(s, ".");
+        if (dot < 0) {
+            int n = StyleSheet.Num(s);
+            if (n <= 1) { return n * 1000; }
+            return n;
+        }
+        int whole = StyleSheet.Num(s.Substring(0, dot));
+        string fracStr = s.Substring(dot + 1, s.Length - dot - 1);
+        int frac = 0;
+        int scale = 100;
+        int i = 0;
+        while (i < fracStr.Length && i < 3) {
+            string ch = fracStr.Substring(i, 1);
+            if (!StyleSheet.Digit(ch)) { i = fracStr.Length; }
+            else {
+                frac = frac + StyleSheet.HexDigit(ch) * scale;
+                scale = scale / 10;
+                i = i + 1;
+            }
+        }
+        int sign = 1;
+        if (whole < 0) { sign = -1; whole = -whole; }
+        return sign * (whole * 1000 + frac);
+    }
+
+    /// A CSS duration in ms: `200`, `200ms`, `0.25s`.
+    static int Ms(string val) {
+        string s = StyleSheet.Trim(val);
+        if (StyleSheet.IndexOf(StyleSheet.Lower(s), "ms") >= 0) {
+            return StyleSheet.Num(s);
+        }
+        if (StyleSheet.IndexOf(StyleSheet.Lower(s), "s") >= 0) {
+            return StyleSheet.Perm(s);
+        }
+        return StyleSheet.Num(s);
+    }
+
+    static int ParseInt(string s) {
+        return StyleSheet.Num(s);
+    }
+
+    /// Splits a value into whitespace-separated tokens, keeping `fn(a, b)`
+    /// groups intact so `rgba(0,0,0,.4)` survives as one token.
+    static List<string> Tokens(string val) {
+        List<string> outp = new List<string>();
+        string cur = "";
+        int depth = 0;
+        int i = 0;
+        while (i < val.Length) {
+            string ch = val.Substring(i, 1);
+            i = i + 1;
+            if (ch == "(") { depth = depth + 1; cur = cur + ch; continue; }
+            if (ch == ")") { depth = depth - 1; cur = cur + ch; continue; }
+            if (depth == 0 && Css.Space(ch)) {
+                if (cur != "") { outp.Add(cur); }
+                cur = "";
+                continue;
+            }
+            cur = cur + ch;
+        }
+        if (cur != "") { outp.Add(cur); }
+        return outp;
+    }
+
+    static bool StartsWith(string s, string prefix) {
+        if (s.Length < prefix.Length) { return false; }
+        return s.Substring(0, prefix.Length) == prefix;
     }
 
     static int IndexOf(string s, string ch) {
+        return Css.IndexFrom(s, ch, 0);
+    }
+
+    static int LastIndexOf(string s, string ch) {
+        int found = -1;
         int i = 0;
         while (i < s.Length) {
-            if (s.Substring(i, 1) == ch) { return i; }
+            if (s.Substring(i, 1) == ch) { found = i; }
             i = i + 1;
         }
-        return -1;
+        return found;
+    }
+
+    static string Lower(string s) {
+        return s.ToLower();
     }
 
     static string Trim(string s) {
-        int a = 0;
-        int b = s.Length;
-        while (a < b && (s.Substring(a, 1) == " " || s.Substring(a, 1) == "\t")) { a = a + 1; }
-        while (b > a && (s.Substring(b - 1, 1) == " " || s.Substring(b - 1, 1) == "\t")) { b = b - 1; }
-        return s.Substring(a, b - a);
+        return Css.Trim(s);
     }
 }

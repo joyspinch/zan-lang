@@ -73,6 +73,15 @@ class BackdropFx {
     static int KindInk()       { return 4; }
     static int KindPetals()    { return 5; }
     static int KindRain()      { return 6; }
+    static int KindBokeh()     { return 7; }
+    static int KindMesh()      { return 8; }
+    // Skin-pack decorations: signature motion belonging to one skin, drawn as
+    // an ambient layer (drifting clouds and spinning coins for Fortune, rising
+    // embers and gold filigree for Dark Gold, sparkles and butterflies for
+    // Dreamy) so a pack is recognisable at a glance and not just a palette.
+    static int KindFortune()   { return 9; }
+    static int KindDarkGold()  { return 10; }
+    static int KindDreamy()    { return 11; }
 
     /// Repaint cadence for a kind (ms between animation frames). Slow ambient
     /// effects tick lazily; fast ones (lightfall, rain) tick a bit quicker.
@@ -82,6 +91,11 @@ class BackdropFx {
         if (kind == BackdropFx.KindPetals())    { return 100; }
         if (kind == BackdropFx.KindAurora())    { return 150; }
         if (kind == BackdropFx.KindInk())       { return 200; }
+        if (kind == BackdropFx.KindBokeh())     { return 160; }
+        if (kind == BackdropFx.KindFortune())   { return 110; }
+        if (kind == BackdropFx.KindDarkGold())  { return 110; }
+        if (kind == BackdropFx.KindDreamy())    { return 100; }
+        if (kind == BackdropFx.KindMesh())      { return 160; }
         return 140;
     }
 
@@ -133,7 +147,12 @@ class BackdropFx {
         if (kind == BackdropFx.KindLightfall()) { BackdropFx.Lightfall(c, x, y, w, h, now, t, dpi); }
         if (kind == BackdropFx.KindInk())       { BackdropFx.Ink(c, x, y, w, h, now, dpi); }
         if (kind == BackdropFx.KindPetals())    { BackdropFx.Petals(c, x, y, w, h, now, t, dpi); }
+        if (kind == BackdropFx.KindFortune())   { BackdropFx.Fortune(c, x, y, w, h, now, dpi); }
+        if (kind == BackdropFx.KindDarkGold())  { BackdropFx.DarkGold(c, x, y, w, h, now, dpi); }
+        if (kind == BackdropFx.KindDreamy())    { BackdropFx.Dreamy(c, x, y, w, h, now, dpi); }
         if (kind == BackdropFx.KindRain())      { BackdropFx.Rain(c, x, y, w, h, now, t, dpi); }
+        if (kind == BackdropFx.KindBokeh())     { BackdropFx.Bokeh(c, x, y, w, h, now, t, dpi); }
+        if (kind == BackdropFx.KindMesh())      { BackdropFx.Mesh(c, x, y, w, h, now, t, dpi); }
         c.PopClip();
     }
 
@@ -284,6 +303,96 @@ class BackdropFx {
         }
     }
 
+    // ---- Bokeh (Sunset): out-of-focus light orbs floating up -----------------
+    /// One out-of-focus orb: concentric faint disks, brightest at the rim so it
+    /// reads as a defocused highlight rather than a solid ball.
+    static void BokehOrb(Canvas c, int cx, int cy, int r, int color, int alpha) {
+        BackdropFx.Mark(cx - r - 1, cy - r - 1, r * 2 + 2, r * 2 + 2);
+        int rgb = color % 16777216;
+        if (rgb < 0) { rgb = rgb + 16777216; }
+        int steps = 6;
+        int i = 0;
+        while (i < steps) {
+            int rr = r - r * i / (steps * 2);
+            c.FillCircle(cx, cy, rr, alpha * 16777216 + rgb);
+            i = i + 1;
+        }
+    }
+
+    static void Bokeh(Canvas c, int x, int y, int w, int h, int now,
+                      Theme t, int dpi) {
+        int n = 16;
+        int i = 0;
+        while (i < n) {
+            int hx = BackdropFx.Hash(i, 151);
+            int hy = BackdropFx.Hash(i, 167);
+            int r = BackdropFx.Px(10, dpi) + hy % BackdropFx.Px(34, dpi);
+            int spd = 6 + hx % 12;                      // px/s rising
+            int span = h + r * 2;
+            // Rise: subtract from the span so orbs drift upward, and sway on a
+            // per-orb phase so no two share a path.
+            int py = y + h + r - (hy + now * spd / 1000) % span;
+            int sway = BackdropFx.Sin1000(now / 22 + hx % 360)
+                     * BackdropFx.Px(20, dpi) / 1000;
+            int px = x + hx % w + sway;
+            int color = t.primary;
+            if (i % 3 == 1) { color = t.warning; }
+            if (i % 3 == 2) { color = t.error; }
+            BackdropFx.BokehOrb(c, px, py, r, color, 7);
+            i = i + 1;
+        }
+    }
+
+    // ---- Mesh (Nebula): drifting wireframe grid with lit nodes ---------------
+    static void Mesh(Canvas c, int x, int y, int w, int h, int now,
+                     Theme t, int dpi) {
+        int cell = BackdropFx.Px(72, dpi);
+        int lw = 1;
+        // The whole lattice slides diagonally by one cell and wraps, so the
+        // motion never accumulates state or drifts out of the area.
+        int offx = (now / 90) % cell;
+        int offy = (now / 140) % cell;
+        int rgbP = t.primary % 16777216;
+        if (rgbP < 0) { rgbP = rgbP + 16777216; }
+        int rgbI = t.info % 16777216;
+        if (rgbI < 0) { rgbI = rgbI + 16777216; }
+        int cols = w / cell + 2;
+        int rows = h / cell + 2;
+        int ci = 0;
+        while (ci < cols) {
+            int gx = x + ci * cell - cell + offx;
+            if (gx >= x && gx < x + w) {
+                BackdropFx.FR(c, gx, y, lw, h, 12 * 16777216 + rgbP);
+            }
+            ci = ci + 1;
+        }
+        int ri = 0;
+        while (ri < rows) {
+            int gy = y + ri * cell - cell + offy;
+            if (gy >= y && gy < y + h) {
+                BackdropFx.FR(c, x, gy, w, lw, 12 * 16777216 + rgbP);
+            }
+            ri = ri + 1;
+        }
+        // A handful of nodes pulse at the lattice intersections.
+        int i = 0;
+        while (i < 18) {
+            int hc = BackdropFx.Hash(i, 181);
+            int nx = x + (hc % cols) * cell - cell + offx;
+            int ny = y + ((hc / 7) % rows) * cell - cell + offy;
+            if (nx >= x && nx < x + w && ny >= y && ny < y + h) {
+                int pulse = BackdropFx.Sin1000(now / 9 + hc % 360);
+                int alpha = 40 + pulse * 35 / 1000;
+                if (alpha < 6) { alpha = 6; }
+                int rgb = rgbP;
+                if (i % 2 == 1) { rgb = rgbI; }
+                BackdropFx.FC(c, nx, ny, BackdropFx.Px(2, dpi) + 1,
+                              alpha * 16777216 + rgb);
+            }
+            i = i + 1;
+        }
+    }
+
     // ---- Rain (Matrix): digital glyph rain -----------------------------------
     static void Rain(Canvas c, int x, int y, int w, int h, int now,
                      Theme t, int dpi) {
@@ -321,6 +430,131 @@ class BackdropFx {
                 }
             }
             col = col + 1;
+        }
+    }
+
+    // ---- Skin-pack decorations ---------------------------------------------
+    // Each pack owns one signature ambient layer. They are procedural (no
+    // sprite sheets) so they scale with dpi and cost only a handful of shapes
+    // per frame, and they animate on the same throttled cadence as the other
+    // effects.
+
+    /// Fortune (Chinese new-year pack): auspicious clouds drifting sideways,
+    /// gold coins tumbling down and a slow shimmer of ingot sparkles.
+    static void Fortune(Canvas c, int x, int y, int w, int h, int now, int dpi) {
+        // Clouds: three stacked disks per puff, sliding right and wrapping.
+        int n = 7;
+        int i = 0;
+        while (i < n) {
+            int hx = BackdropFx.Hash(i, 211);
+            int hy = BackdropFx.Hash(i, 233);
+            int r = BackdropFx.Px(16, dpi) + hy % BackdropFx.Px(14, dpi);
+            int span = w + r * 8;
+            int spd = 8 + hx % 10;
+            int px = x - r * 4 + (hx + now * spd / 1000) % span;
+            int py = y + BackdropFx.Px(30, dpi) + hy % (h * 2 / 3);
+            int tint = Theme.Rgba(255, 226, 168, 34);
+            BackdropFx.FC(c, px, py, r, tint);
+            BackdropFx.FC(c, px + r, py + r / 3, r * 3 / 4, tint);
+            BackdropFx.FC(c, px - r, py + r / 3, r * 2 / 3, tint);
+            i = i + 1;
+        }
+        // Coins: gold rings falling with a squash cycle so they read as spinning.
+        int m = 14;
+        int j = 0;
+        while (j < m) {
+            int hx = BackdropFx.Hash(j, 307);
+            int hy = BackdropFx.Hash(j, 331);
+            int r = BackdropFx.Px(4, dpi) + hy % 4;
+            int spd = 34 + hx % 40;
+            int margin = BackdropFx.Px(20, dpi);
+            int span = h + margin * 2;
+            int py = y + (hy + now * spd / 1000) % span - margin;
+            int px = x + hx % w
+                   + BackdropFx.Sin1000(now / 10 + hx % 360) * BackdropFx.Px(10, dpi) / 1000;
+            int squash = BackdropFx.Sin1000(now / 4 + hy % 360);
+            int rr = r * (400 + squash * 6 / 10) / 1000;
+            if (rr < 1) { rr = 1; }
+            BackdropFx.FC(c, px, py, r, Theme.Rgba(224, 164, 32, 120));
+            BackdropFx.FC(c, px, py, rr, Theme.Rgba(255, 226, 130, 170));
+            j = j + 1;
+        }
+    }
+
+    /// Dark Gold (mythology pack): embers rising through smoke with a molten
+    /// glow pooling along the bottom edge.
+    static void DarkGold(Canvas c, int x, int y, int w, int h, int now, int dpi) {
+        int glowH = BackdropFx.Px(70, dpi);
+        int band = 0;
+        while (band < 6) {
+            int bh = glowH / 6;
+            int by = y + h - bh * (band + 1);
+            BackdropFx.FR(c, x, by, w, bh, Theme.Rgba(190, 120, 20, 8 + band * 2));
+            band = band + 1;
+        }
+        int n = 30;
+        int i = 0;
+        while (i < n) {
+            int hx = BackdropFx.Hash(i, 419);
+            int hy = BackdropFx.Hash(i, 431);
+            int spd = 26 + hx % 46;
+            int margin = BackdropFx.Px(16, dpi);
+            int span = h + margin * 2;
+            int py = y + h + margin - (hy + now * spd / 1000) % span;
+            int drift = BackdropFx.Sin1000(now / 13 + hx % 360)
+                      * BackdropFx.Px(14, dpi) / 1000;
+            int px = x + hx % w + drift;
+            int r = BackdropFx.Px(2, dpi) + hy % 3;
+            // Fade out as the ember climbs: alpha tracks the remaining height.
+            int life = (py - y) * 100 / h;
+            int alpha = 40 + life * 130 / 100;
+            BackdropFx.FC(c, px, py, r + 1, Theme.Rgba(150, 70, 10, alpha / 3));
+            BackdropFx.FC(c, px, py, r, Theme.Rgba(255, 190, 90, alpha));
+            i = i + 1;
+        }
+    }
+
+    /// Dreamy (starlight pack): twinkling sparkles plus a few butterflies
+    /// tracing slow sine paths.
+    static void Dreamy(Canvas c, int x, int y, int w, int h, int now, int dpi) {
+        int n = 40;
+        int i = 0;
+        while (i < n) {
+            int hx = BackdropFx.Hash(i, 521);
+            int hy = BackdropFx.Hash(i, 541);
+            int px = x + hx % w;
+            int py = y + hy % h;
+            // Twinkle: per-sparkle phase drives both size and alpha.
+            int ph = BackdropFx.Sin1000(now / 5 + (hx + hy) % 360);
+            if (ph < 0) { ph = 0; }
+            int r = BackdropFx.Px(1, dpi) + ph * BackdropFx.Px(3, dpi) / 1000;
+            int alpha = 40 + ph * 150 / 1000;
+            BackdropFx.FC(c, px, py, r, Theme.Rgba(255, 255, 255, alpha));
+            if (i % 7 == 0) {
+                int arm = r * 3;
+                BackdropFx.FR(c, px - arm, py, arm * 2, 1, Theme.Rgba(220, 210, 255, alpha / 2));
+                BackdropFx.FR(c, px, py - arm, 1, arm * 2, Theme.Rgba(220, 210, 255, alpha / 2));
+            }
+            i = i + 1;
+        }
+        int b = 0;
+        while (b < 5) {
+            int hx = BackdropFx.Hash(b, 601);
+            int hy = BackdropFx.Hash(b, 613);
+            int spd = 18 + hx % 16;
+            int span = w + BackdropFx.Px(60, dpi);
+            int px = x - BackdropFx.Px(30, dpi) + (hx + now * spd / 1000) % span;
+            int py = y + hy % (h - BackdropFx.Px(40, dpi))
+                   + BackdropFx.Sin1000(now / 7 + hy % 360) * BackdropFx.Px(22, dpi) / 1000;
+            // Wings: two disks whose spread flaps with the same clock.
+            int wr = BackdropFx.Px(4, dpi) + hy % 3;
+            int flap = BackdropFx.Sin1000(now / 2 + hx % 360);
+            int off = wr * (300 + flap * 7 / 10) / 1000;
+            if (off < 1) { off = 1; }
+            BackdropFx.FC(c, px - off, py, wr, Theme.Rgba(198, 170, 255, 120));
+            BackdropFx.FC(c, px + off, py, wr, Theme.Rgba(168, 214, 255, 120));
+            BackdropFx.FR(c, px, py - wr / 2, 1, wr, Theme.Rgba(240, 236, 255, 150));
+            b = b + 1;
         }
     }
 }

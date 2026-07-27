@@ -1,0 +1,629 @@
+using System;
+
+namespace Gui;
+
+/// <summary>
+/// A resolved visual style: the flattened result of the theme defaults plus the
+/// skin stylesheet's matching declarations for one control in one state.
+///
+/// This is the single place the GUI knows how to *paint* a styled box, so a
+/// widget no longer carries per-skin drawing branches. It resolves once and
+/// paints:
+///
+///     StyleBox s = Style.Eased(app, id, "button", "primary", disabled);
+///     s.Paint(app, x, y, w, h);
+///     s.DrawLabel(app, x, y, w, h, "Save");
+///
+/// Every field is an int (the GUI stack is float-free). `0` means "unset" for
+/// colors, `-1` for metrics, so a declaration can leave anything to the theme
+/// default; read them through the `*Or` accessors which take the fallback.
+/// </summary>
+class StyleBox {
+    // ---- fill ---------------------------------------------------------------
+    int bg;          // background color (0 = none)
+    int bgTo;        // gradient end color (0 = solid)
+    int bgVia;       // optional middle gradient stop (0 = none)
+    int bgDir;       // 0 to-bottom, 1 to-right, 2 to-bottom-right, 3 to-top
+    int opacity;     // 0..1000 permille, multiplies every painted alpha
+    int blur;        // backdrop-filter blur radius in px (0 = off)
+
+    // ---- text ---------------------------------------------------------------
+    int fg;          // text/icon color
+    int accent;      // accent color for indicators (underline, caret, marks)
+    int fontPx;
+    int fontWeight;  // 0 unset, 400 normal, 700 bold (simulated double-draw)
+    int lineHeight;
+    int letterSpacing;
+    int align;       // -1 unset, 0 left, 1 center, 2 right
+    int valign;      // -1 unset, 0 top, 1 middle, 2 bottom
+    int textCase;    // 0 none, 1 uppercase, 2 lowercase
+    int ellipsis;    // 1 = text-overflow: ellipsis
+    int nowrap;      // 1 = white-space: nowrap
+
+    // ---- border / corners ---------------------------------------------------
+    int borderColor;
+    int borderW;
+    int borderTopW;    int borderTopColor;
+    int borderRightW;  int borderRightColor;
+    int borderBottomW; int borderBottomColor;
+    int borderLeftW;   int borderLeftColor;
+    int radius;
+    int radiusTL; int radiusTR; int radiusBR; int radiusBL;
+
+    // ---- shadow -------------------------------------------------------------
+    int shadow;      // color (0 = none)
+    int shadowDx;
+    int shadowDy;
+    int shadowBlur;
+    int shadowInset; // 1 = inner shadow
+
+    // ---- box metrics --------------------------------------------------------
+    int padL; int padT; int padR; int padB;
+    int marL; int marT; int marR; int marB;
+    int width; int height;
+    int minW; int minH; int maxW; int maxH;
+    int gap;
+
+    // ---- layout -------------------------------------------------------------
+    int display;     // 0 block, 1 flex, 2 none
+    int flexDir;     // 0 row, 1 column
+    int justify;     // 0 start, 1 center, 2 end, 3 space-between, 4 space-around
+    int alignItems;  // 0 stretch, 1 start, 2 center, 3 end
+    int wrap;        // 1 = flex-wrap: wrap
+    int grow;
+    int order;
+    int position;    // 0 static, 1 relative, 2 absolute
+    int posT; int posR; int posB; int posL;
+    int overflow;    // 1 = hidden (clip children)
+    int zIndex;
+    int cursor;      // Cursor.* code, 0 = default
+    int visible;     // 0 = visibility: hidden
+
+    // ---- motion -------------------------------------------------------------
+    int transitionMs;
+    int easing;      // 0 ease, 1 linear, 2 ease-in, 3 ease-out, 4 ease-in-out
+    int anim;        // Style.Anim* kind (0 none)
+    int animMs;
+    int tx; int ty;  // transform: translate()
+    int scale;       // transform: scale(), permille (1000 = 1x)
+    int rotate;      // transform: rotate(), degrees
+
+    static int Unset() { return 0 - 1; }
+
+    /// An empty box: nothing set, so every accessor yields its fallback.
+    static StyleBox Create() {
+        StyleBox s = new StyleBox();
+        s.bg = 0; s.bgTo = 0; s.bgVia = 0; s.bgDir = 0;
+        s.opacity = 1000; s.blur = 0;
+        s.fg = 0; s.accent = 0;
+        s.fontPx = 0; s.fontWeight = 0; s.lineHeight = 0; s.letterSpacing = 0;
+        s.align = 0 - 1; s.valign = 0 - 1; s.textCase = 0;
+        s.ellipsis = 0; s.nowrap = 0;
+        s.borderColor = 0; s.borderW = 0 - 1;
+        s.borderTopW = 0 - 1;    s.borderTopColor = 0;
+        s.borderRightW = 0 - 1;  s.borderRightColor = 0;
+        s.borderBottomW = 0 - 1; s.borderBottomColor = 0;
+        s.borderLeftW = 0 - 1;   s.borderLeftColor = 0;
+        s.radius = 0 - 1;
+        s.radiusTL = 0 - 1; s.radiusTR = 0 - 1; s.radiusBR = 0 - 1; s.radiusBL = 0 - 1;
+        s.shadow = 0; s.shadowDx = 0; s.shadowDy = 0; s.shadowBlur = 0; s.shadowInset = 0;
+        s.padL = 0 - 1; s.padT = 0 - 1; s.padR = 0 - 1; s.padB = 0 - 1;
+        s.marL = 0; s.marT = 0; s.marR = 0; s.marB = 0;
+        s.width = 0 - 1; s.height = 0 - 1;
+        s.minW = 0 - 1; s.minH = 0 - 1; s.maxW = 0 - 1; s.maxH = 0 - 1;
+        s.gap = 0 - 1;
+        s.display = 0; s.flexDir = 0; s.justify = 0; s.alignItems = 0;
+        s.wrap = 0; s.grow = 0; s.order = 0;
+        s.position = 0;
+        s.posT = StyleBox.Unset(); s.posR = StyleBox.Unset();
+        s.posB = StyleBox.Unset(); s.posL = StyleBox.Unset();
+        s.overflow = 0; s.zIndex = 0; s.cursor = 0; s.visible = 1;
+        s.transitionMs = 0 - 1; s.easing = 0;
+        s.anim = 0; s.animMs = 0;
+        s.tx = 0; s.ty = 0; s.scale = 1000; s.rotate = 0;
+        return s;
+    }
+
+    /// A field-by-field copy (resolution caches hand out copies so a widget can
+    /// tweak its box without poisoning the cache).
+    StyleBox Clone() {
+        StyleBox d = StyleBox.Create();
+        d.bg = bg; d.bgTo = bgTo; d.bgVia = bgVia; d.bgDir = bgDir;
+        d.opacity = opacity; d.blur = blur;
+        d.fg = fg; d.accent = accent;
+        d.fontPx = fontPx; d.fontWeight = fontWeight;
+        d.lineHeight = lineHeight; d.letterSpacing = letterSpacing;
+        d.align = align; d.valign = valign; d.textCase = textCase;
+        d.ellipsis = ellipsis; d.nowrap = nowrap;
+        d.borderColor = borderColor; d.borderW = borderW;
+        d.borderTopW = borderTopW;       d.borderTopColor = borderTopColor;
+        d.borderRightW = borderRightW;   d.borderRightColor = borderRightColor;
+        d.borderBottomW = borderBottomW; d.borderBottomColor = borderBottomColor;
+        d.borderLeftW = borderLeftW;     d.borderLeftColor = borderLeftColor;
+        d.radius = radius;
+        d.radiusTL = radiusTL; d.radiusTR = radiusTR;
+        d.radiusBR = radiusBR; d.radiusBL = radiusBL;
+        d.shadow = shadow; d.shadowDx = shadowDx; d.shadowDy = shadowDy;
+        d.shadowBlur = shadowBlur; d.shadowInset = shadowInset;
+        d.padL = padL; d.padT = padT; d.padR = padR; d.padB = padB;
+        d.marL = marL; d.marT = marT; d.marR = marR; d.marB = marB;
+        d.width = width; d.height = height;
+        d.minW = minW; d.minH = minH; d.maxW = maxW; d.maxH = maxH;
+        d.gap = gap;
+        d.display = display; d.flexDir = flexDir; d.justify = justify;
+        d.alignItems = alignItems; d.wrap = wrap; d.grow = grow; d.order = order;
+        d.position = position;
+        d.posT = posT; d.posR = posR; d.posB = posB; d.posL = posL;
+        d.overflow = overflow; d.zIndex = zIndex; d.cursor = cursor;
+        d.visible = visible;
+        d.transitionMs = transitionMs; d.easing = easing;
+        d.anim = anim; d.animMs = animMs;
+        d.tx = tx; d.ty = ty; d.scale = scale; d.rotate = rotate;
+        return d;
+    }
+
+    // ---- fallback accessors -------------------------------------------------
+
+    int BgOr(int fb)      { if (bg != 0) { return bg; } return fb; }
+    int FgOr(int fb)      { if (fg != 0) { return fg; } return fb; }
+    int AccentOr(int fb)  { if (accent != 0) { return accent; } return fb; }
+    int FontOr(int fb)    { if (fontPx > 0) { return fontPx; } return fb; }
+    int RadiusOr(int fb)  { if (radius >= 0) { return radius; } return fb; }
+    int BorderWOr(int fb) { if (borderW >= 0) { return borderW; } return fb; }
+    int BorderOr(int fb)  { if (borderColor != 0) { return borderColor; } return fb; }
+    int GapOr(int fb)     { if (gap >= 0) { return gap; } return fb; }
+    int HeightOr(int fb)  { if (height >= 0) { return height; } return fb; }
+    int WidthOr(int fb)   { if (width >= 0) { return width; } return fb; }
+    int TransitionOr(int fb) { if (transitionMs >= 0) { return transitionMs; } return fb; }
+
+    int PadLOr(int fb) { if (padL >= 0) { return padL; } return fb; }
+    int PadTOr(int fb) { if (padT >= 0) { return padT; } return fb; }
+    int PadROr(int fb) { if (padR >= 0) { return padR; } return fb; }
+    int PadBOr(int fb) { if (padB >= 0) { return padB; } return fb; }
+
+    /// Clamps `w` into the box's min/max-width (unset bounds are ignored).
+    int ClampW(int w) {
+        int v = w;
+        if (minW >= 0 && v < minW) { v = minW; }
+        if (maxW >= 0 && v > maxW) { v = maxW; }
+        return v;
+    }
+
+    int ClampH(int h) {
+        int v = h;
+        if (minH >= 0 && v < minH) { v = minH; }
+        if (maxH >= 0 && v > maxH) { v = maxH; }
+        return v;
+    }
+
+    /// Sets every padding side at once (used by the `padding: n` shorthand).
+    void SetPad(int v) { padL = v; padT = v; padR = v; padB = v; }
+
+    void SetMargin(int v) { marL = v; marT = v; marR = v; marB = v; }
+
+    /// Sets the four corner radii at once.
+    void SetRadius(int v) {
+        radius = v;
+        radiusTL = v; radiusTR = v; radiusBR = v; radiusBL = v;
+    }
+
+    void SetBorder(int w, int color) {
+        borderW = w;
+        borderColor = color;
+    }
+
+    // ---- interpolation ------------------------------------------------------
+
+    /// Linear blend of two resolved boxes by permille `p` — how a `transition`
+    /// cross-fades a control between its base look and a state look. Colors
+    /// blend through App.LerpColor (alpha-preserving via ScaleAlpha when one
+    /// side is unset), metrics interpolate, and flags/enums switch at the
+    /// halfway point.
+    static StyleBox Blend(StyleBox a, StyleBox b, int p) {
+        if (p <= 0) { return a; }
+        if (p >= 1000) { return b; }
+        StyleBox d = b.Clone();
+        d.bg = StyleBox.MixColor(a.bg, b.bg, p);
+        d.bgTo = StyleBox.MixColor(a.bgTo, b.bgTo, p);
+        d.bgVia = StyleBox.MixColor(a.bgVia, b.bgVia, p);
+        d.fg = StyleBox.MixColor(a.fg, b.fg, p);
+        d.accent = StyleBox.MixColor(a.accent, b.accent, p);
+        d.borderColor = StyleBox.MixColor(a.borderColor, b.borderColor, p);
+        d.borderTopColor = StyleBox.MixColor(a.borderTopColor, b.borderTopColor, p);
+        d.borderRightColor = StyleBox.MixColor(a.borderRightColor, b.borderRightColor, p);
+        d.borderBottomColor = StyleBox.MixColor(a.borderBottomColor, b.borderBottomColor, p);
+        d.borderLeftColor = StyleBox.MixColor(a.borderLeftColor, b.borderLeftColor, p);
+        d.shadow = StyleBox.MixColor(a.shadow, b.shadow, p);
+        d.opacity = App.Lerp(a.opacity, b.opacity, p);
+        d.blur = App.Lerp(a.blur, b.blur, p);
+        d.borderW = StyleBox.MixMetric(a.borderW, b.borderW, p);
+        d.borderTopW = StyleBox.MixMetric(a.borderTopW, b.borderTopW, p);
+        d.borderRightW = StyleBox.MixMetric(a.borderRightW, b.borderRightW, p);
+        d.borderBottomW = StyleBox.MixMetric(a.borderBottomW, b.borderBottomW, p);
+        d.borderLeftW = StyleBox.MixMetric(a.borderLeftW, b.borderLeftW, p);
+        d.radius = StyleBox.MixMetric(a.radius, b.radius, p);
+        d.radiusTL = StyleBox.MixMetric(a.radiusTL, b.radiusTL, p);
+        d.radiusTR = StyleBox.MixMetric(a.radiusTR, b.radiusTR, p);
+        d.radiusBR = StyleBox.MixMetric(a.radiusBR, b.radiusBR, p);
+        d.radiusBL = StyleBox.MixMetric(a.radiusBL, b.radiusBL, p);
+        d.shadowDx = App.Lerp(a.shadowDx, b.shadowDx, p);
+        d.shadowDy = App.Lerp(a.shadowDy, b.shadowDy, p);
+        d.shadowBlur = App.Lerp(a.shadowBlur, b.shadowBlur, p);
+        d.fontPx = StyleBox.MixMetric(a.fontPx, b.fontPx, p);
+        d.letterSpacing = App.Lerp(a.letterSpacing, b.letterSpacing, p);
+        d.tx = App.Lerp(a.tx, b.tx, p);
+        d.ty = App.Lerp(a.ty, b.ty, p);
+        d.scale = App.Lerp(a.scale, b.scale, p);
+        d.rotate = App.Lerp(a.rotate, b.rotate, p);
+        d.height = StyleBox.MixMetric(a.height, b.height, p);
+        d.width = StyleBox.MixMetric(a.width, b.width, p);
+        return d;
+    }
+
+    /// Blends two colors, treating 0 (unset) as "fade the other one out" so a
+    /// state that only *adds* a fill still eases in instead of popping.
+    static int MixColor(int c0, int c1, int p) {
+        if (c0 == c1) { return c0; }
+        if (c0 == 0) { return App.ScaleAlpha(c1, p); }
+        if (c1 == 0) { return App.ScaleAlpha(c0, 1000 - p); }
+        int rgb = App.LerpColor(c0, c1, p);
+        int a0 = StyleBox.AlphaOf(c0);
+        int a1 = StyleBox.AlphaOf(c1);
+        int a = a0 + (a1 - a0) * p / 1000;
+        return App.ScaleAlpha(rgb, a * 1000 / 255);
+    }
+
+    /// Interpolates a metric where -1 means "unset" (an unset side keeps the
+    /// other side's value instead of easing from a bogus -1).
+    static int MixMetric(int v0, int v1, int p) {
+        if (v0 < 0) { return v1; }
+        if (v1 < 0) { return v0; }
+        return v0 + (v1 - v0) * p / 1000;
+    }
+
+    static int AlphaOf(int color) {
+        int rgb = color % 16777216;
+        if (rgb < 0) { rgb = rgb + 16777216; }
+        int a = (color - rgb) / 16777216;
+        if (a < 0) { a = a + 256; }
+        return a;
+    }
+
+    /// Applies `opacity` to a color (and nothing when fully opaque).
+    int Fade(int color) {
+        if (color == 0) { return 0; }
+        if (opacity >= 1000) { return color; }
+        return App.ScaleAlpha(color, opacity);
+    }
+
+    // ---- painting -----------------------------------------------------------
+
+    /// Paints the box: backdrop blur, drop shadow, fill (solid or gradient),
+    /// per-side borders, then any `animation` overlay. Honors `transform`
+    /// (translate/scale) and `opacity`; a `display: none` / `visibility: hidden`
+    /// box paints nothing.
+    void Paint(App app, int x, int y, int w, int h) {
+        if (display == 2 || visible == 0) { return; }
+        if (w <= 0 || h <= 0) { return; }
+        Canvas c = app.canvas;
+
+        int rx = x + tx;
+        int ry = y + ty;
+        int rw = w;
+        int rh = h;
+        if (scale != 1000 && scale > 0) {
+            int nw = w * scale / 1000;
+            int nh = h * scale / 1000;
+            rx = rx + (w - nw) / 2;
+            ry = ry + (h - nh) / 2;
+            rw = nw;
+            rh = nh;
+        }
+        int r = this.RadiusOr(0);
+
+        if (blur > 0) {
+            c.BlurRectCached(rx, ry, rw, rh, app.Scale(blur),
+                             app.NextBlurSlot(), app.BackdropDirty());
+        }
+
+        if (shadow != 0 && shadowInset == 0) {
+            this.PaintShadow(app, rx, ry, rw, rh, r);
+        }
+
+        int fill = this.Fade(bg);
+        if (bgTo != 0) {
+            this.PaintGradient(app, rx, ry, rw, rh, r);
+        } else if (fill != 0) {
+            if (r > 0) { c.FillRoundRect(rx, ry, rw, rh, r, fill); }
+            else { c.FillRect(rx, ry, rw, rh, fill); }
+        }
+
+        if (shadow != 0 && shadowInset == 1) {
+            int ia = 1;
+            while (ia <= 3) {
+                c.DrawRoundRect(rx + ia - 1, ry + ia - 1, rw - (ia - 1) * 2,
+                                rh - (ia - 1) * 2, r,
+                                App.ScaleAlpha(this.Fade(shadow), 1000 - ia * 250), 1);
+                ia = ia + 1;
+            }
+        }
+
+        this.PaintBorders(app, rx, ry, rw, rh, r);
+        this.PaintAnim(app, rx, ry, rw, rh, r);
+    }
+
+    /// Drop shadow: an offset shape, plus a few expanding translucent rings
+    /// when `shadowBlur` asks for a soft edge (the software renderer has no
+    /// gaussian shadow, so the falloff is layered).
+    void PaintShadow(App app, int x, int y, int w, int h, int r) {
+        Canvas c = app.canvas;
+        int col = this.Fade(shadow);
+        int dx = x + app.Scale(shadowDx);
+        int dy = y + app.Scale(shadowDy);
+        if (shadowBlur <= 0) {
+            if (r > 0) { c.FillRoundRect(dx, dy, w, h, r, col); }
+            else { c.FillRect(dx, dy, w, h, col); }
+            return;
+        }
+        int steps = shadowBlur / 2;
+        if (steps < 1) { steps = 1; }
+        if (steps > 6) { steps = 6; }
+        int i = steps;
+        while (i >= 1) {
+            int spread = app.Scale(shadowBlur) * i / steps;
+            int a = 1000 / (steps + 1) * (steps - i + 1);
+            c.FillRoundRect(dx - spread, dy - spread, w + spread * 2, h + spread * 2,
+                            r + spread, App.ScaleAlpha(col, a * 600 / 1000));
+            i = i - 1;
+        }
+    }
+
+    /// Gradient fill honoring the corner radius: a plain FillVGrad when the box
+    /// is square, otherwise banded fills inset to the rounded silhouette (the
+    /// renderer has no rounded-gradient primitive).
+    void PaintGradient(App app, int x, int y, int w, int h, int r) {
+        Canvas c = app.canvas;
+        int from = this.Fade(bg);
+        int to = this.Fade(bgTo);
+        if (bgDir == 3) {
+            int sw = from; from = to; to = sw;
+        }
+        if (r <= 0 && bgDir != 1) {
+            c.FillVGrad(x, y, w, h, from, to);
+            return;
+        }
+        if (bgDir == 1) {
+            // Horizontal: vertical bands (no native primitive).
+            int bands = w / 4;
+            if (bands < 8) { bands = 8; }
+            if (bands > 96) { bands = 96; }
+            int bw = (w + bands - 1) / bands;
+            int i = 0;
+            while (i < bands) {
+                int bx = x + i * bw;
+                if (bx >= x + w) { i = bands; }
+                else {
+                    int seg = bw;
+                    if (bx + seg > x + w) { seg = x + w - bx; }
+                    int p = i * 1000 / bands;
+                    int col = StyleBox.MixColor(from, to, p);
+                    if (bgVia != 0) { col = StyleBox.ViaColor(from, bgVia, to, p); }
+                    c.FillRect(bx, y, seg, h, col);
+                    i = i + 1;
+                }
+            }
+            if (r > 0) { this.PaintCornerMask(app, x, y, w, h, r); }
+            return;
+        }
+        // Vertical (or diagonal, approximated vertically) with rounded corners:
+        // fill the silhouette, then lay bands inset by the corner arc.
+        int bands = h / 3;
+        if (bands < 8) { bands = 8; }
+        if (bands > 96) { bands = 96; }
+        int bh = (h + bands - 1) / bands;
+        int k = 0;
+        while (k < bands) {
+            int by = y + k * bh;
+            if (by >= y + h) { k = bands; }
+            else {
+                int seg = bh;
+                if (by + seg > y + h) { seg = y + h - by; }
+                int p = k * 1000 / bands;
+                int col = StyleBox.MixColor(from, to, p);
+                if (bgVia != 0) { col = StyleBox.ViaColor(from, bgVia, to, p); }
+                int inset = StyleBox.CornerInset(r, by - y, seg, h);
+                if (inset > 0) {
+                    c.FillRoundRect(x + inset, by, w - inset * 2, seg, 0, col);
+                } else {
+                    c.FillRect(x, by, w, seg, col);
+                }
+                k = k + 1;
+            }
+        }
+        this.PaintCornerMask(app, x, y, w, h, r);
+    }
+
+    /// Re-draws the rounded outline in the gradient's own end colors so the
+    /// banded fill keeps clean anti-aliased corners.
+    void PaintCornerMask(App app, int x, int y, int w, int h, int r) {
+        Canvas c = app.canvas;
+        c.DrawRoundRect(x, y, w, h, r, this.Fade(bg), 1);
+    }
+
+    /// Horizontal inset of a rounded rect at row offset `dy` (0 outside the
+    /// corner arcs), so a band can hug the silhouette.
+    static int CornerInset(int r, int dy, int seg, int h) {
+        if (r <= 0) { return 0; }
+        int d = dy;
+        if (dy > h - r) { d = h - dy - seg; }
+        else { d = dy; }
+        if (d >= r) { return 0; }
+        if (d < 0) { d = 0; }
+        int arm = r - d;
+        int inner = r * r - arm * arm;
+        if (inner < 0) { inner = 0; }
+        return r - Fx.Isqrt(inner);
+    }
+
+    /// A three-stop gradient sample (`from` -> `via` at 50% -> `to`).
+    static int ViaColor(int from, int via, int to, int p) {
+        if (p < 500) { return StyleBox.MixColor(from, via, p * 2); }
+        return StyleBox.MixColor(via, to, (p - 500) * 2);
+    }
+
+    /// Per-side borders when any side is set, otherwise the uniform border.
+    void PaintBorders(App app, int x, int y, int w, int h, int r) {
+        Canvas c = app.canvas;
+        bool anySide = borderTopW > 0 || borderRightW > 0
+            || borderBottomW > 0 || borderLeftW > 0;
+        if (!anySide) {
+            int bw = this.BorderWOr(0);
+            int bc = this.Fade(borderColor);
+            if (bw > 0 && bc != 0) {
+                if (r > 0) { c.DrawRoundRect(x, y, w, h, r, bc, bw); }
+                else { c.DrawRect(x, y, w, h, bc, bw); }
+            }
+            return;
+        }
+        if (borderTopW > 0) {
+            c.FillRect(x, y, w, borderTopW, this.SideColor(borderTopColor));
+        }
+        if (borderBottomW > 0) {
+            c.FillRect(x, y + h - borderBottomW, w, borderBottomW,
+                       this.SideColor(borderBottomColor));
+        }
+        if (borderLeftW > 0) {
+            c.FillRect(x, y, borderLeftW, h, this.SideColor(borderLeftColor));
+        }
+        if (borderRightW > 0) {
+            c.FillRect(x + w - borderRightW, y, borderRightW, h,
+                       this.SideColor(borderRightColor));
+        }
+    }
+
+    int SideColor(int col) {
+        if (col != 0) { return this.Fade(col); }
+        return this.Fade(borderColor);
+    }
+
+    /// The `animation` layer: keyframe-style motion drawn inside the box, and
+    /// self-arming (it keeps requesting frames while it runs).
+    void PaintAnim(App app, int x, int y, int w, int h, int r) {
+        if (anim == 0) { return; }
+        int ms = animMs;
+        if (ms <= 0) { ms = 2400; }
+        int tint = this.AccentOr(this.FgOr(0));
+        if (anim == Style.AnimShimmer()) {
+            Fx.CardSheen(app, x, y, w, h, tint, ms);
+        } else if (anim == Style.AnimGlow()) {
+            Fx.BorderGlow(app, x, y, w, h, r, tint, ms, 220);
+        } else if (anim == Style.AnimBreath()) {
+            Fx.CardBreath(app, x, y, w, h, tint, ms);
+        } else if (anim == Style.AnimAurora()) {
+            Fx.CardAurora(app, x, y, w, h, tint);
+        } else if (anim == Style.AnimMotes()) {
+            Fx.CardMotes(app, x, y, w, h, tint);
+        } else if (anim == Style.AnimPulse()) {
+            int a = Fx.Pulse(app, ms) * 140 / 1000;
+            Canvas c = app.canvas;
+            c.FillRoundRect(x, y, w, h, r, App.ScaleAlpha(tint, a * 1000 / 255));
+            app.RequestAnimationFrame(32);
+        }
+    }
+
+    /// Extra offset a `float` animation contributes this frame (widgets add it
+    /// to their content origin so the whole control bobs).
+    int FloatOffset(App app) {
+        if (anim != Style.AnimFloat()) { return 0; }
+        int ms = animMs;
+        if (ms <= 0) { ms = 2600; }
+        app.RequestAnimationFrame(32);
+        int p = Fx.Pulse(app, ms);
+        return app.Scale(3) * (p - 500) / 500;
+    }
+
+    /// Rotation (degrees) a `spin` animation contributes this frame.
+    int SpinDeg(App app) {
+        if (anim != Style.AnimSpin()) { return rotate; }
+        int ms = animMs;
+        if (ms <= 0) { ms = 900; }
+        app.RequestAnimationFrame(16);
+        return rotate + Fx.Saw(app, ms) * 360 / 1000;
+    }
+
+    // ---- text ---------------------------------------------------------------
+
+    /// Draws a label inside [x,y,w,h] honoring color, font size/weight,
+    /// text-align, vertical-align, letter-spacing, text-transform and
+    /// text-overflow: ellipsis. Returns the width actually drawn.
+    int DrawLabel(App app, int x, int y, int w, int h, string label) {
+        if (label == "" || visible == 0 || display == 2) { return 0; }
+        Canvas c = app.canvas;
+        int fs = this.FontOr(app.theme.fontSizeMedium);
+        int col = this.Fade(this.FgOr(app.theme.textPrimary));
+        string s = label;
+        if (textCase == 1) { s = s.ToUpper(); }
+        else if (textCase == 2) { s = s.ToLower(); }
+
+        int avail = w - this.PadLOr(0) - this.PadROr(0);
+        int tw = StyleBox.MeasureSpaced(s, fs, letterSpacing);
+        if (ellipsis == 1 && avail > 0 && tw > avail) {
+            s = StyleBox.Truncate(s, fs, letterSpacing, avail);
+            tw = StyleBox.MeasureSpaced(s, fs, letterSpacing);
+        }
+
+        int tx0 = x + this.PadLOr(0);
+        if (align == 1) { tx0 = x + (w - tw) / 2; }
+        else if (align == 2) { tx0 = x + w - this.PadROr(0) - tw; }
+
+        int fh = Canvas.FontHeight(fs);
+        int ty0 = y + this.PadTOr(0);
+        if (align >= 0 && valign < 0) { ty0 = y + (h - fh) / 2; }
+        if (valign == 1) { ty0 = y + (h - fh) / 2; }
+        else if (valign == 2) { ty0 = y + h - this.PadBOr(0) - fh; }
+        if (lineHeight > 0) { ty0 = y + (lineHeight - fh) / 2; }
+
+        this.DrawRun(c, tx0, ty0, s, col, fs);
+        return tw;
+    }
+
+    /// Draws one text run at an exact origin (no box alignment), applying
+    /// letter-spacing and the simulated bold of `font-weight >= 600`.
+    void DrawRun(Canvas c, int x, int y, string s, int color, int fs) {
+        if (letterSpacing == 0) {
+            c.DrawText(x, y, s, color, fs);
+            if (fontWeight >= 600) { c.DrawText(x + 1, y, s, color, fs); }
+            return;
+        }
+        int cx = x;
+        int i = 0;
+        while (i < s.Length) {
+            string ch = s.Substring(i, 1);
+            c.DrawText(cx, y, ch, color, fs);
+            if (fontWeight >= 600) { c.DrawText(cx + 1, y, ch, color, fs); }
+            cx = cx + Canvas.MeasureText(ch, fs) + letterSpacing;
+            i = i + 1;
+        }
+    }
+
+    static int MeasureSpaced(string s, int fs, int spacing) {
+        int w = Canvas.MeasureText(s, fs);
+        if (spacing != 0) { w = w + spacing * s.Length; }
+        return w;
+    }
+
+    /// Longest prefix of `s` plus "..." that fits `avail` px.
+    static string Truncate(string s, int fs, int spacing, int avail) {
+        int ell = StyleBox.MeasureSpaced("...", fs, spacing);
+        if (avail <= ell) { return "..."; }
+        int keep = s.Length;
+        while (keep > 0) {
+            string head = s.Substring(0, keep);
+            if (StyleBox.MeasureSpaced(head, fs, spacing) + ell <= avail) {
+                return head + "...";
+            }
+            keep = keep - 1;
+        }
+        return "...";
+    }
+}

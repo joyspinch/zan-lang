@@ -1,0 +1,225 @@
+using System;
+using System.Json;
+
+namespace Gui;
+
+/// A small CSS parser: turns skin stylesheets written as real CSS text into the
+/// selector -> declaration map StyleSheet already applies.
+///
+/// Skins used to be Zan code (a Theme preset per skin), so anything beyond a
+/// palette swap - control shape, gradients, shadows, per-state looks - meant
+/// editing widgets. A skin is now a `.css` file next to its artwork, which the
+/// GUI loads at runtime, so a user can restyle the app (or ship their own skin)
+/// without touching or rebuilding any code:
+///
+///   :root { --accent: #d92b2b; --radius: 999; }
+///   button.primary        { background: linear-gradient(#ffd76a, #e0a020);
+///                           radius: var(--radius); border: 1 #8a5b12; }
+///   button.primary:hover  { background: #ffe08a; }
+///   tab.item:active       { border-bottom: 2 var(--accent); }
+///
+/// Supported on purpose (no cascade beyond this): declaration blocks, selector
+/// lists (`a, b { }`), `:state` suffixes, `/* comments */`, and `:root`
+/// custom properties referenced as `var(--name)`. Everything else parses as a
+/// plain property so StyleSheet / the widgets decide what it means.
+class Css {
+    /// Parses `src` into a sheet whose selectors keep their `:state` suffix.
+    /// A malformed document yields whatever parsed cleanly, so one bad rule
+    /// never costs the whole skin.
+    static StyleSheet Parse(string src) {
+        StyleSheet sheet = StyleSheet.Create();
+        string s = Css.StripComments(src);
+        // Pass 1: :root custom properties, so values can reference them.
+        List<string> varNames = new List<string>();
+        List<string> varVals = new List<string>();
+        Css.CollectVars(s, varNames, varVals);
+        int vi = 0;
+        while (vi < varNames.Count) {
+            sheet.vars.Set(varNames[vi], JsonValue.NewStr(varVals[vi]));
+            vi = vi + 1;
+        }
+        // Pass 2: every rule block.
+        int i = 0;
+        while (i < s.Length) {
+            int open = Css.IndexFrom(s, "{", i);
+            if (open < 0) { break; }
+            int close = Css.IndexFrom(s, "}", open + 1);
+            if (close < 0) { break; }
+            string selectors = Css.Trim(s.Substring(i, open - i));
+            string body = s.Substring(open + 1, close - open - 1);
+            i = close + 1;
+            if (selectors.Length == 0) { continue; }
+            List<string> sels = Css.SplitTrim(selectors, ",");
+            JsonValue block = Css.ParseBlock(body, varNames, varVals);
+            if (block.Count() == 0) { continue; }
+            int k = 0;
+            while (k < sels.Count) {
+                string sel = sels[k];
+                k = k + 1;
+                if (sel.Length == 0) { continue; }
+                if (sel == ":root") { continue; }
+                Css.MergeInto(sheet, sel, block);
+            }
+        }
+        return sheet;
+    }
+
+    /// Declarations of one block, with `var(--x)` resolved and custom
+    /// properties dropped (they only exist to be referenced).
+    static JsonValue ParseBlock(string body, List<string> varNames,
+                                List<string> varVals) {
+        JsonValue block = JsonValue.NewObject();
+        List<string> decls = Css.SplitTrim(body, ";");
+        int i = 0;
+        while (i < decls.Count) {
+            string d = decls[i];
+            i = i + 1;
+            if (d.Length == 0) { continue; }
+            int colon = Css.IndexFrom(d, ":", 0);
+            if (colon <= 0) { continue; }
+            string key = Css.Trim(d.Substring(0, colon));
+            string val = Css.Trim(d.Substring(colon + 1, d.Length - colon - 1));
+            if (key.Length == 0 || val.Length == 0) { continue; }
+            if (key.Length > 2 && key.Substring(0, 2) == "--") { continue; }
+            block.Set(Css.Lower(key),
+                      JsonValue.NewStr(Css.StripImportant(
+                          Css.ExpandVars(val, varNames, varVals))));
+        }
+        return block;
+    }
+
+    /// Drops a trailing `!important` (the cascade here is already "last rule
+    /// wins", so the flag carries no extra meaning).
+    static string StripImportant(string val) {
+        int at = Css.IndexFrom(Css.Lower(val), "!important", 0);
+        if (at < 0) { return val; }
+        return Css.Trim(val.Substring(0, at));
+    }
+
+    /// Lowercases a property name/keyword (selectors keep their case so `#Save`
+    /// still matches a control named `Save`).
+    static string Lower(string s) {
+        return s.ToLower();
+    }
+
+    /// Adds `block`'s declarations to `sel`, keeping declarations an earlier
+    /// rule already set for the same selector (later rules win, as in CSS).
+    static void MergeInto(StyleSheet sheet, string sel, JsonValue block) {
+        JsonValue existing = sheet.rules.Get(sel);
+        if (existing == null || !existing.IsObject()) {
+            JsonValue copy = JsonValue.NewObject();
+            int i = 0;
+            while (i < block.Count()) {
+                copy.Set(block.KeyAt(i), block.ValAt(i));
+                i = i + 1;
+            }
+            sheet.rules.Set(sel, copy);
+            return;
+        }
+        int j = 0;
+        while (j < block.Count()) {
+            existing.Set(block.KeyAt(j), block.ValAt(j));
+            j = j + 1;
+        }
+    }
+
+    /// Reads `--name: value` pairs out of every `:root` block.
+    static void CollectVars(string s, List<string> names, List<string> vals) {
+        int i = 0;
+        while (i < s.Length) {
+            int open = Css.IndexFrom(s, "{", i);
+            if (open < 0) { return; }
+            int close = Css.IndexFrom(s, "}", open + 1);
+            if (close < 0) { return; }
+            string sel = Css.Trim(s.Substring(i, open - i));
+            string body = s.Substring(open + 1, close - open - 1);
+            i = close + 1;
+            if (sel != ":root") { continue; }
+            List<string> decls = Css.SplitTrim(body, ";");
+            int k = 0;
+            while (k < decls.Count) {
+                string d = decls[k];
+                k = k + 1;
+                int colon = Css.IndexFrom(d, ":", 0);
+                if (colon <= 0) { continue; }
+                string key = Css.Trim(d.Substring(0, colon));
+                if (key.Length <= 2 || key.Substring(0, 2) != "--") { continue; }
+                names.Add(key);
+                vals.Add(Css.Trim(d.Substring(colon + 1, d.Length - colon - 1)));
+            }
+        }
+    }
+
+    /// Replaces every `var(--name)` in `val`; an unknown name expands to "".
+    static string ExpandVars(string val, List<string> names, List<string> vals) {
+        string s = val;
+        int guard = 0;
+        while (guard < 8) {
+            int at = Css.IndexFrom(s, "var(", 0);
+            if (at < 0) { return s; }
+            int close = Css.IndexFrom(s, ")", at);
+            if (close < 0) { return s; }
+            string name = Css.Trim(s.Substring(at + 4, close - at - 4));
+            string rep = "";
+            int i = 0;
+            while (i < names.Count) {
+                if (names[i] == name) { rep = vals[i]; }
+                i = i + 1;
+            }
+            s = s.Substring(0, at) + rep + s.Substring(close + 1, s.Length - close - 1);
+            guard = guard + 1;
+        }
+        return s;
+    }
+
+    /// Blanks out `/* ... */` comments, preserving length-independent content.
+    static string StripComments(string src) {
+        string outp = "";
+        int i = 0;
+        while (i < src.Length) {
+            if (i + 1 < src.Length && src.Substring(i, 2) == "/*") {
+                int end = Css.IndexFrom(src, "*/", i + 2);
+                if (end < 0) { return outp; }
+                i = end + 2;
+                continue;
+            }
+            outp = outp + src.Substring(i, 1);
+            i = i + 1;
+        }
+        return outp;
+    }
+
+    /// Splits on `sep` and trims each part (whitespace and newlines).
+    static List<string> SplitTrim(string s, string sep) {
+        List<string> outp = new List<string>();
+        List<string> parts = s.Split(sep);
+        int i = 0;
+        while (i < parts.Count) {
+            outp.Add(Css.Trim(parts[i]));
+            i = i + 1;
+        }
+        return outp;
+    }
+
+    static int IndexFrom(string s, string needle, int start) {
+        int n = needle.Length;
+        int i = start;
+        while (i + n <= s.Length) {
+            if (s.Substring(i, n) == needle) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    static bool Space(string ch) {
+        return ch == " " || ch == "\t" || ch == "\r" || ch == "\n";
+    }
+
+    static string Trim(string s) {
+        int a = 0;
+        int b = s.Length;
+        while (a < b && Css.Space(s.Substring(a, 1))) { a = a + 1; }
+        while (b > a && Css.Space(s.Substring(b - 1, 1))) { b = b - 1; }
+        return s.Substring(a, b - a);
+    }
+}

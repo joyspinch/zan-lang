@@ -630,6 +630,26 @@ EXPORT i64 zan_gui_set_caption_buttons(i64 hwnd_val, i64 count) {
     return 0;
 }
 
+/* Move a window's top-left to (x, y) in screen pixels (designer "manual"
+ * window position). */
+EXPORT i64 zan_gui_set_window_pos(i64 hwnd_val, i64 x, i64 y) {
+    SDL_Window *win = (SDL_Window *)(intptr_t)hwnd_val;
+    if (!win) return 0;
+    SDL_SetWindowPosition(win, (int)x, (int)y);
+    return 1;
+}
+
+/* Re-center a window on the display it currently sits on. */
+EXPORT i64 zan_gui_center_window(i64 hwnd_val) {
+    SDL_Window *win = (SDL_Window *)(intptr_t)hwnd_val;
+    if (!win) return 0;
+    SDL_DisplayID disp = SDL_GetDisplayForWindow(win);
+    if (disp == 0) disp = SDL_GetPrimaryDisplay();
+    SDL_SetWindowPosition(win, SDL_WINDOWPOS_CENTERED_DISPLAY(disp),
+                          SDL_WINDOWPOS_CENTERED_DISPLAY(disp));
+    return 1;
+}
+
 EXPORT i64 zan_gui_set_topmost(i64 hwnd_val, i64 on) {
     SDL_SetWindowAlwaysOnTop((SDL_Window *)(intptr_t)hwnd_val, on ? true : false);
     return 0;
