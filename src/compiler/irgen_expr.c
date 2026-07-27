@@ -1004,6 +1004,9 @@ static LLVMValueRef emit_expr_assignment(zan_irgen_t *g, zan_ast_node_t *expr,
         LLVMValueRef right;
         {
             zan_type_t *lt = assign_lhs_type(g, expr->binary.left, locals);
+            warn_narrowing(g, lt,
+                infer_expr_type(g, expr->binary.right, locals),
+                expr->binary.right, "assignment");
             if (type_is_binding(lt) &&
                 !type_is_binding(infer_expr_type(g, expr->binary.right, locals))) {
                 LLVMValueRef bv = emit_binding_value(g, lt, expr->binary.right, locals);
@@ -2217,14 +2220,21 @@ static LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                 (tname2.len == 10 && memcmp(tname2.str, "Dictionary", 10) == 0)) {
                 LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
                 LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
-                /* allocate the Dict struct (7 i64-sized fields); the hash
-                 * index fields start zeroed, i.e. "no index yet". */
-                LLVMValueRef dict_size = LLVMConstInt(i64, 56, 0);
-                LLVMValueRef dict_raw = zan_call2(g->builder,
-                    LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i64, i64 }, 2, 0),
-                    get_calloc_fn(g), (LLVMValueRef[]){ LLVMConstInt(i64, 1, 0), dict_size }, 2, "dict");
+                /* allocate the Dict struct (7 i64-sized fields) with an rc
+                 * header, so a dict is owned like any other collection. */
+                LLVMValueRef dict_raw = emit_alloc_rc_collection(g, expr, 56, 3,
+                    resolve_type_ctx(g, expr->new_expr.type));
                 LLVMValueRef typed_ptr = LLVMBuildBitCast(g->builder, dict_raw,
                     LLVMPointerType(g->dict_struct_type, 0), "dptr");
+                /* zan_rt_alloc does not zero: the hash index fields must start
+                 * at "no index yet" explicitly. */
+                for (unsigned zf = 4; zf < 7; zf++) {
+                    LLVMValueRef zp = LLVMBuildStructGEP2(g->builder,
+                        g->dict_struct_type, typed_ptr, zf, "dz");
+                    LLVMBuildStore(g->builder,
+                        (zf == 4) ? (LLVMValueRef)LLVMConstNull(LLVMPointerType(i64, 0))
+                                  : (LLVMValueRef)LLVMConstInt(i64, 0, 0), zp);
+                }
                 /* count = 0 */
                 LLVMValueRef cnt_p = LLVMBuildStructGEP2(g->builder, g->dict_struct_type, typed_ptr, 0, "cnt");
                 LLVMBuildStore(g->builder, LLVMConstInt(i64, 0, 0), cnt_p);
@@ -2513,6 +2523,26 @@ static bool is_async_iface_call(zan_irgen_t *g, zan_ast_node_t *e,
                                              e->call.args.count);
     return m && m->decl && m->decl->kind == AST_METHOD_DECL &&
            (m->decl->method_decl.modifiers & MOD_ASYNC) != 0;
+}
+
+/* An async frame's result slot is a raw i64, so `await f()` loads i64 bits no
+ * matter what `f` returns. Give the expression the callee's declared type
+ * back: without it an inferred declaration (`var s = await Echo()`) keeps a
+ * string as an integer, and only an explicitly typed target got converted. */
+static LLVMValueRef coerce_await_result(zan_irgen_t *g, zan_ast_node_t *expr,
+        LLVMValueRef res, local_scope_t *locals) {
+    zan_type_t *rt = infer_expr_type(g, expr->await_expr.expr, locals);
+    if (!rt || LLVMGetTypeKind(LLVMTypeOf(res)) != LLVMIntegerTypeKind) return res;
+    LLVMTypeRef want = map_type(g, rt);
+    if (LLVMTypeOf(res) == want) return res;
+    switch (LLVMGetTypeKind(want)) {
+    case LLVMPointerTypeKind:
+        return LLVMBuildIntToPtr(g->builder, res, want, "aw.ptr");
+    case LLVMDoubleTypeKind:
+        return LLVMBuildBitCast(g->builder, res, want, "aw.dbl");
+    default:
+        return res;
+    }
 }
 
 static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
@@ -2888,7 +2918,7 @@ static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                  * long-running socket server's memory without bound. */
                 zan_call2(g->builder, LLVMGlobalGetValueType(g->fn_free),
                     g->fn_free, &sub_rl, 1, "");
-                return awres;
+                return coerce_await_result(g, expr, awres, locals);
             }
 
             /* root drive (non-async caller). The scheduler is initialized once
@@ -2907,7 +2937,7 @@ static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
              * free its heap frame (no awaiter will). */
             zan_call2(g->builder, LLVMGlobalGetValueType(g->fn_free),
                 g->fn_free, &sub_i8, 1, "");
-            return awres;
+            return coerce_await_result(g, expr, awres, locals);
         }
 
         /* Fallback: awaiting a legacy Task struct (busy-wait) or a plain value. */
@@ -2924,7 +2954,8 @@ static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
             LLVMBuildCondBr(g->builder, is_done, done_bb, poll_bb);
             LLVMPositionBuilderAtEnd(g->builder, done_bb);
             LLVMValueRef res_ptr = LLVMBuildStructGEP2(g->builder, g->task_struct_type, task_ptr, 1, "resp");
-            return LLVMBuildLoad2(g->builder, i64, res_ptr, "awres");
+            return coerce_await_result(g, expr,
+                LLVMBuildLoad2(g->builder, i64, res_ptr, "awres"), locals);
         }
         return sub;
     return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
@@ -3200,6 +3231,12 @@ static LLVMValueRef emit_lambda_typed(zan_irgen_t *g, zan_ast_node_t *expr,
     LLVMValueRef saved_async_frame = g->current_async_frame;
     g->current_fn = lambda_fn;
     g->current_fn_ret_type = ret_type;
+    int saved_throw_base = g->throw_locals_base;
+    int saved_catch_cc = g->catch_cleanup_count;
+    int saved_throw_cb = g->throw_catch_base;
+    g->throw_locals_base = 0;
+    g->catch_cleanup_count = 0;
+    g->throw_catch_base = 0;
     g->current_this = NULL;
     g->current_async_frame = NULL;
 
@@ -3238,6 +3275,9 @@ static LLVMValueRef emit_lambda_typed(zan_irgen_t *g, zan_ast_node_t *expr,
 
     g->current_fn = saved_fn;
     g->current_fn_ret_type = saved_fn_ret;
+    g->throw_locals_base = saved_throw_base;
+    g->catch_cleanup_count = saved_catch_cc;
+    g->throw_catch_base = saved_throw_cb;
     g->current_this = saved_this;
     g->current_async_frame = saved_async_frame;
     LLVMPositionBuilderAtEnd(g->builder, saved_bb);
@@ -3504,6 +3544,7 @@ static void check_delegate_async_match(zan_irgen_t *g, zan_ast_node_t *e,
 
 static LLVMValueRef emit_arg_typed(zan_irgen_t *g, zan_ast_node_t *arg,
                                    zan_type_t *ptype, local_scope_t *locals) {
+    warn_narrowing(g, ptype, infer_expr_type(g, arg, locals), arg, "argument");
     if (arg && ptype && ptype->kind == TYPE_DELEGATE) {
         if (arg->kind == AST_LAMBDA)
             return emit_lambda_typed(g, arg, ptype, locals);

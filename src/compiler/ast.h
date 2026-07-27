@@ -121,6 +121,13 @@ struct zan_ast_node {
     zan_istr_t orig_name;       /* pre-mangling simple name, if renamed */
     zan_ast_list_t *ns_usings;  /* the file's `using` decls; NULL if none */
 
+    /* On an AST_IDENTIFIER naming a generic type in expression position
+     * (`Box<int>.Create(x)`): the `Box<int>` type reference. The identifier
+     * keeps the simple name, so every consumer that only reads the name is
+     * unaffected, while a static call can route to the instantiation's
+     * specialization. NULL on every other node. */
+    zan_ast_node_t *inst_type_ref;
+
     union {
         /* literals */
         int64_t int_val;

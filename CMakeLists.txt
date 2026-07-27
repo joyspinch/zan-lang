@@ -485,6 +485,20 @@ else()
 endif()
 
 file(GLOB _conf_srcs ${CMAKE_SOURCE_DIR}/tests/conformance/*.zan)
+
+# Every test program is a pure function of (its source, zanc, the stdlib), so
+# the suite reuses the binary it built last time unless one of those changed.
+# This stamp carries the stdlib's mtime into that comparison; the test scripts
+# do the rest. Without it a plain re-run recompiled and relinked all ~165
+# programs three times over -- minutes of work with nothing to show for it.
+set(_stdlib_stamp ${CMAKE_BINARY_DIR}/stdlib.stamp)
+file(GLOB_RECURSE _stdlib_srcs ${CMAKE_SOURCE_DIR}/stdlib/*.zan)
+add_custom_command(OUTPUT ${_stdlib_stamp}
+  COMMAND ${CMAKE_COMMAND} -E touch ${_stdlib_stamp}
+  DEPENDS ${_stdlib_srcs}
+  COMMENT "Stamping stdlib sources for the test suite")
+add_custom_target(stdlib_stamp ALL DEPENDS ${_stdlib_stamp})
+
 foreach(_src ${_conf_srcs})
   get_filename_component(_name ${_src} NAME_WE)
   add_test(NAME conformance_${_name}
@@ -493,6 +507,7 @@ foreach(_src ${_conf_srcs})
       -DSRC=${_src}
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/${_name}.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_${_name}${_exe_ext}
+      -DSTDLIB_STAMP=${_stdlib_stamp}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
   # A program and its leakcheck twin are built from the same source, so any
   # hardcoded listen port (e.g. the async networking conformance tests) is
@@ -510,6 +525,8 @@ foreach(_src ${_conf_srcs})
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${_src}
+      -DSTDLIB_STAMP=${_stdlib_stamp}
+      -DSTAMP=${CMAKE_BINARY_DIR}/det_${_name}.stamp
       -P ${CMAKE_SOURCE_DIR}/tests/run_determinism.cmake)
 endforeach()
 
@@ -529,6 +546,7 @@ foreach(_src ${_conf_srcs})
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${_src}
       -DOUT_EXE=${CMAKE_BINARY_DIR}/leak_${_name}${_exe_ext}
+      -DSTDLIB_STAMP=${_stdlib_stamp}
       -P ${CMAKE_SOURCE_DIR}/tests/run_leakcheck.cmake)
   set_tests_properties(leakcheck_${_name} PROPERTIES RESOURCE_LOCK src_${_name})
   if(_name IN_LIST _known_leaky)

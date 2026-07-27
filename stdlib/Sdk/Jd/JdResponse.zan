@@ -1,0 +1,125 @@
+using System;
+using System.Json;
+
+namespace Sdk.Jd;
+
+/// <summary>
+/// 一次成功调用的返回结果。
+///
+/// 京东网关的响应是一层信封：
+/// <code>{"jingdong_area_province_get_responce": { ...业务数据... }}</code>
+/// 本类已把信封剥掉：<c>Data</c> 是业务数据本身，<c>Raw</c> 保留原始报文。
+///
+/// 与 C# 原版每个接口一个 Response 类（211 个纯样板）不同，这里不预置任何
+/// 业务模型——用编译期绑定把 <c>Data</c> 转成你自己的类即可：
+/// <code>
+/// JdResponse resp = await client.ExecuteAsync(req);
+/// MyResult r = Json.Deserialize&lt;MyResult&gt;(resp.Data);
+/// </code>
+///
+/// 失败不会走到这里：网关返回错误码时 JdClient 直接抛 <see cref="JdException"/>。
+/// </summary>
+class JdResponse {
+    /// <summary>剥掉信封后的业务数据 JSON 文本，可直接喂 Json.Deserialize。</summary>
+    public string Data;
+
+    /// <summary>网关返回的完整原始报文。</summary>
+    public string Raw;
+
+    /// <summary>已解析的业务数据树，需要动态取值时用。</summary>
+    public JsonValue Value;
+
+    // Inspect 判定出的失败原因；Parse 读走后抛成 JdException。
+    // 用 static 承载而不是实例字段，是为了让 throw 发生时本帧没有活跃对象
+    // （见 docs/bugs/throw-leaks-live-locals.md）。非并发安全，仅在 Parse
+    // 内部同步使用。
+    static string lastErrCode = "";
+    static string lastErrMsg = "";
+
+    JdResponse(string data, string raw, JsonValue v) {
+        this.Data = data;
+        this.Raw = raw;
+        this.Value = v;
+    }
+
+    /// <summary>
+    /// 解析网关响应：剥信封、识别错误。
+    ///
+    /// 错误有两种形态，都抛 JdException：
+    ///  1. <c>{"error_response":{"code":"...","zh_desc":"..."}}</c> 网关级错误；
+    ///  2. 信封内业务数据带非 "0" 的 code 字段。
+    ///
+    /// 实现上分两步：先在 Inspect 里把结论（错误码 + 消息，或成功结果）取出来，
+    /// 返回后才抛异常。原因是 <c>throw</c> 不会释放当前帧里活着的对象
+    /// （见 docs/bugs/throw-leaks-live-locals.md），若在持有 JsonValue 树或
+    /// 结果对象时直接抛，它们都会泄漏。所以失败原因走 static 字段传出，
+    /// 抛异常那一刻本帧没有任何活跃分配。
+    /// </summary>
+    static JdResponse Parse(string body) {
+        JdResponse.lastErrCode = "";
+        JdResponse.lastErrMsg = "";
+        JdResponse ok = JdResponse.Inspect(body);
+        if (ok != null) { return ok; }
+        throw new JdException(JdResponse.lastErrCode, JdResponse.lastErrMsg, body);
+    }
+
+    /// 解析并判定结果，不抛异常：成功返回填好 Data/Raw/Value 的实例，
+    /// 失败返回 null 并把原因写入 lastErrCode / lastErrMsg。JsonValue 树在本
+    /// 方法返回时按正常路径释放。
+    static JdResponse Inspect(string body) {
+        JsonValue root = null;
+        string parseErr = "";
+        try {
+            root = JsonValue.Parse(body);
+        } catch (Exception e) {
+            // 报文不是合法 JSON（网关 5xx 的 HTML 错误页、被中间设备篡改等）。
+            parseErr = e.Message;
+        }
+        if (parseErr.Length > 0) {
+            return JdResponse.Failure("client.badResponse", parseErr);
+        }
+        if (root == null || !root.IsObject()) {
+            return JdResponse.Failure("client.badResponse", "响应不是合法的 JSON 对象");
+        }
+
+        JsonValue err = root.Get("error_response");
+        if (err != null && err.IsObject()) {
+            string code = JdResponse.Field(err, "code", "unknown");
+            string msg = JdResponse.Field(err, "zh_desc", "");
+            if (msg.Length == 0) { msg = JdResponse.Field(err, "en_desc", "网关返回错误"); }
+            return JdResponse.Failure(code, msg);
+        }
+
+        if (root.Count() == 0) {
+            return JdResponse.Failure("client.badResponse", "响应信封为空");
+        }
+
+        // 信封只有一个键，键名形如 jingdong_xxx_responce。
+        JsonValue data = root.ValAt(0);
+        if (data == null || !data.IsObject()) {
+            return JdResponse.Failure("client.badResponse", "响应信封内不是对象");
+        }
+
+        // 业务层错误码：京东各接口不统一，"0" / "" 视为成功。
+        string bizCode = JdResponse.Field(data, "code", "");
+        if (bizCode.Length > 0 && bizCode != "0") {
+            string bizMsg = JdResponse.Field(data, "zh_desc", "");
+            if (bizMsg.Length == 0) { bizMsg = JdResponse.Field(data, "msg", "业务返回错误"); }
+            return JdResponse.Failure(bizCode, bizMsg);
+        }
+
+        return new JdResponse(data.ToJson(), body, data);
+    }
+
+    static JdResponse Failure(string code, string msg) {
+        JdResponse.lastErrCode = code;
+        JdResponse.lastErrMsg = msg;
+        return null;
+    }
+
+    static string Field(JsonValue obj, string key, string dflt) {
+        JsonValue v = obj.Get(key);
+        if (v == null) { return dflt; }
+        return v.AsString(dflt);
+    }
+}

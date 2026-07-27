@@ -826,6 +826,20 @@ static void get_eh_globals(zan_irgen_t *g, LLVMValueRef *top,
     *top = t; *bufs = b; *exc = e;
 }
 
+/* i32[16] parallel to __zan_eh_bufs: the unwind-stack depth each armed handler
+ * was entered at. A `throw` reads its target handler's entry and releases
+ * everything stacked above it *before* longjmp, while the frames that own
+ * those objects are still alive (see emit_eh_unwind_to_handler). */
+static LLVMValueRef get_eh_tmpmarks_global(zan_irgen_t *g) {
+    LLVMValueRef v = LLVMGetNamedGlobal(g->mod, "__zan_eh_tmpmarks");
+    if (v) return v;
+    LLVMTypeRef at = LLVMArrayType(LLVMInt32TypeInContext(g->ctx), 16);
+    v = LLVMAddGlobal(g->mod, at, "__zan_eh_tmpmarks");
+    LLVMSetLinkage(v, LLVMInternalLinkage);
+    LLVMSetInitializer(v, LLVMConstNull(at));
+    return v;
+}
+
 /* Marks a function and a call to it with a simple enum attribute. */
 static void add_enum_attr(zan_irgen_t *g, LLVMValueRef fn, LLVMValueRef call,
                           const char *name) {
@@ -880,7 +894,11 @@ static void emit_eh_longjmp(zan_irgen_t *g, LLVMValueRef bufp) {
  * throwing callee would leak them. Each such temp is pushed onto a small
  * global stack for the duration of the call and popped on normal return;
  * entering a catch releases every entry pushed after its try was entered. */
-#define ZAN_EH_TMP_CAP 256
+/* Depth of the unwind stack: call temps plus every live owning local of every
+ * frame between an active handler and the throw site. Recursion deeper than
+ * this silently drops entries (push checks the bound), which would leak on
+ * unwind -- growing it dynamically is the real fix, tracked in TASKS.md. */
+#define ZAN_EH_TMP_CAP 4096
 
 static void get_eh_tmp_globals(zan_irgen_t *g, LLVMValueRef *arr, LLVMValueRef *top) {
     LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
@@ -1084,6 +1102,9 @@ static LLVMValueRef get_eh_tmp_unwind_fn(zan_irgen_t *g) {
     LLVMBasicBlockRef head = LLVMAppendBasicBlockInContext(g->ctx, fn, "head");
     LLVMBasicBlockRef body = LLVMAppendBasicBlockInContext(g->ctx, fn, "body");
     LLVMBasicBlockRef rel = LLVMAppendBasicBlockInContext(g->ctx, fn, "rel");
+    LLVMBasicBlockRef rel_slot = LLVMAppendBasicBlockInContext(g->ctx, fn, "rel.slot");
+    LLVMBasicBlockRef rel_obj = LLVMAppendBasicBlockInContext(g->ctx, fn, "rel.obj");
+    LLVMBasicBlockRef rel_do = LLVMAppendBasicBlockInContext(g->ctx, fn, "rel.do");
     LLVMBasicBlockRef done = LLVMAppendBasicBlockInContext(g->ctx, fn, "done");
     LLVMPositionBuilderAtEnd(g->builder, entry);
     LLVMBuildBr(g->builder, head);
@@ -1104,8 +1125,37 @@ static LLVMValueRef get_eh_tmp_unwind_fn(zan_irgen_t *g) {
         arr_g, gi, 2, "slot");
     LLVMValueRef obj = LLVMBuildLoad2(g->builder, i8ptr, slot, "obj");
     LLVMBuildStore(g->builder, LLVMConstNull(i8ptr), slot);
+    /* Two entry flavours share the stack (the low bit tags them, every rc
+     * object and alloca being at least 2-byte aligned): a plain object
+     * pointer (a call temp), or a *variable slot* whose current value is the
+     * object to release. The slot flavour keeps up with reassignment and
+     * lets the release null the variable out, so the frame's own scope-exit
+     * release -- reached only when no exception was raised -- stays correct. */
+    LLVMValueRef obj_i = LLVMBuildPtrToInt(g->builder, obj,
+        LLVMInt64TypeInContext(g->ctx), "obji");
+    LLVMValueRef tagged = LLVMBuildTrunc(g->builder,
+        obj_i, LLVMInt1TypeInContext(g->ctx), "tagged");
+    LLVMBuildCondBr(g->builder, tagged, rel_slot, rel_obj);
+
+    LLVMPositionBuilderAtEnd(g->builder, rel_slot);
+    LLVMValueRef untag = LLVMBuildIntToPtr(g->builder,
+        LLVMBuildAnd(g->builder, obj_i,
+            LLVMConstInt(LLVMInt64TypeInContext(g->ctx), ~(uint64_t)1, 0), "untag"),
+        i8ptr, "vslot");
+    LLVMValueRef vobj = LLVMBuildLoad2(g->builder, i8ptr, untag, "vobj");
+    LLVMBuildStore(g->builder, LLVMConstNull(i8ptr), untag);
+    LLVMBuildBr(g->builder, rel_do);
+
+    LLVMPositionBuilderAtEnd(g->builder, rel_obj);
+    LLVMBuildBr(g->builder, rel_do);
+
+    LLVMPositionBuilderAtEnd(g->builder, rel_do);
+    LLVMValueRef vic = LLVMBuildPhi(g->builder, i8ptr, "vic");
+    LLVMValueRef vic_v[2] = { vobj, obj };
+    LLVMBasicBlockRef vic_b[2] = { rel_slot, rel_obj };
+    LLVMAddIncoming(vic, vic_v, vic_b, 2);
     zan_call2(g->builder, LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), &i8ptr, 1, 0),
-        g->rt_release_dyn, &obj, 1, "");
+        g->rt_release_dyn, &vic, 1, "");
     LLVMBuildBr(g->builder, head);
     LLVMPositionBuilderAtEnd(g->builder, done);
     LLVMBuildRetVoid(g->builder);
@@ -1122,9 +1172,121 @@ static void emit_eh_tmp_push(zan_irgen_t *g, LLVMValueRef obj) {
     zan_call2(g->builder, fnty, get_eh_tmp_push_fn(g), &obj, 1, "");
 }
 
+/* Register a *variable slot* with the unwinder: an exception raised anywhere
+ * below this frame releases whatever the variable holds at that moment, which
+ * is the only way a longjmp-based unwind can free the locals of the frames it
+ * skips over (A8-12). */
+static void emit_eh_tmp_push_slot(zan_irgen_t *g, LLVMValueRef slot) {
+    if (!slot || LLVMGetTypeKind(LLVMTypeOf(slot)) != LLVMPointerTypeKind) return;
+    LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMValueRef tagged = LLVMBuildIntToPtr(g->builder,
+        LLVMBuildOr(g->builder, LLVMBuildPtrToInt(g->builder, slot, i64t, "slot.i"),
+            LLVMConstInt(i64t, 1, 0), "slot.t"),
+        i8ptr, "eh.slot");
+    LLVMTypeRef fnty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), &i8ptr, 1, 0);
+    zan_call2(g->builder, fnty, get_eh_tmp_push_fn(g), &tagged, 1, "");
+}
+
+/* Release everything the unwind stack holds above the depth handler `top` was
+ * armed at. Emitted at the throw site, before the longjmp: the frames between
+ * here and the handler are still alive at this point, and their locals are
+ * only reachable through the slots they registered. */
+static void emit_eh_unwind_to_handler(zan_irgen_t *g, LLVMValueRef top) {
+    LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
+    LLVMValueRef marks = get_eh_tmpmarks_global(g);
+    LLVMValueRef idx[2] = { LLVMConstInt(i32t, 0, 0), top };
+    LLVMValueRef mp = LLVMBuildGEP2(g->builder, LLVMGlobalGetValueType(marks),
+        marks, idx, 2, "eh.markp");
+    LLVMValueRef mark = LLVMBuildLoad2(g->builder, i32t, mp, "eh.mark");
+    LLVMTypeRef uwty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), &i32t, 1, 0);
+    zan_call2(g->builder, uwty, get_eh_tmp_unwind_fn(g), &mark, 1, "");
+}
+
 static void emit_eh_tmp_pop(zan_irgen_t *g) {
     LLVMTypeRef fnty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), NULL, 0, 0);
     zan_call2(g->builder, fnty, get_eh_tmp_pop_fn(g), NULL, 0, "");
+}
+
+/* void __zan_eh_tmp_drop(i8* obj): unregister one stacked temp by identity.
+ * A catch body that is abandoned by `return`/`break`/`continue`/`throw` has to
+ * take back the exception it stacked at handler entry, but locals declared in
+ * the handler sit above it, so popping the top would unregister the wrong
+ * entry. Nulls the topmost entry equal to `obj` (and shrinks the stack when
+ * that entry is the top). */
+static LLVMValueRef get_eh_tmp_drop_fn(zan_irgen_t *g) {
+    LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "__zan_eh_tmp_drop");
+    if (fn) return fn;
+    LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMTypeRef fnty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), &i8ptr, 1, 0);
+    fn = LLVMAddFunction(g->mod, "__zan_eh_tmp_drop", fnty);
+    LLVMSetLinkage(fn, LLVMInternalLinkage);
+    LLVMBasicBlockRef saved = LLVMGetInsertBlock(g->builder);
+    LLVMValueRef arr_g, top_g;
+    get_eh_tmp_globals(g, &arr_g, &top_g);
+    LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, fn, "entry");
+    LLVMBasicBlockRef head = LLVMAppendBasicBlockInContext(g->ctx, fn, "head");
+    LLVMBasicBlockRef body = LLVMAppendBasicBlockInContext(g->ctx, fn, "body");
+    LLVMBasicBlockRef hit = LLVMAppendBasicBlockInContext(g->ctx, fn, "hit");
+    LLVMBasicBlockRef shrink = LLVMAppendBasicBlockInContext(g->ctx, fn, "shrink");
+    LLVMBasicBlockRef next = LLVMAppendBasicBlockInContext(g->ctx, fn, "next");
+    LLVMBasicBlockRef done = LLVMAppendBasicBlockInContext(g->ctx, fn, "done");
+    LLVMPositionBuilderAtEnd(g->builder, entry);
+    LLVMValueRef i_slot = LLVMBuildAlloca(g->builder, i32t, "i");
+    LLVMValueRef top0 = LLVMBuildLoad2(g->builder, i32t, top_g, "top0");
+    LLVMValueRef cap = LLVMConstInt(i32t, ZAN_EH_TMP_CAP, 0);
+    LLVMValueRef start = LLVMBuildSelect(g->builder,
+        LLVMBuildICmp(g->builder, LLVMIntSLT, top0, cap, "fits"), top0, cap, "start");
+    LLVMBuildStore(g->builder, start, i_slot);
+    LLVMBuildBr(g->builder, head);
+
+    LLVMPositionBuilderAtEnd(g->builder, head);
+    LLVMValueRef i = LLVMBuildLoad2(g->builder, i32t, i_slot, "i.v");
+    LLVMBuildCondBr(g->builder,
+        LLVMBuildICmp(g->builder, LLVMIntSGT, i, LLVMConstInt(i32t, 0, 0), "more"),
+        body, done);
+
+    LLVMPositionBuilderAtEnd(g->builder, body);
+    LLVMValueRef idx = LLVMBuildSub(g->builder,
+        LLVMBuildLoad2(g->builder, i32t, i_slot, "i.v2"),
+        LLVMConstInt(i32t, 1, 0), "idx");
+    LLVMBuildStore(g->builder, idx, i_slot);
+    LLVMValueRef gi[2] = { LLVMConstInt(i32t, 0, 0), idx };
+    LLVMValueRef slot = LLVMBuildGEP2(g->builder, LLVMGlobalGetValueType(arr_g),
+        arr_g, gi, 2, "slot");
+    LLVMValueRef obj = LLVMBuildLoad2(g->builder, i8ptr, slot, "obj");
+    LLVMBuildCondBr(g->builder,
+        LLVMBuildICmp(g->builder, LLVMIntEQ, obj, LLVMGetParam(fn, 0), "same"),
+        hit, next);
+
+    LLVMPositionBuilderAtEnd(g->builder, hit);
+    LLVMBuildStore(g->builder, LLVMConstNull(i8ptr), slot);
+    LLVMValueRef top = LLVMBuildLoad2(g->builder, i32t, top_g, "top");
+    LLVMBuildCondBr(g->builder,
+        LLVMBuildICmp(g->builder, LLVMIntEQ, top,
+            LLVMBuildAdd(g->builder, idx, LLVMConstInt(i32t, 1, 0), "idx1"), "is.top"),
+        shrink, done);
+    LLVMPositionBuilderAtEnd(g->builder, shrink);
+    LLVMBuildStore(g->builder, idx, top_g);
+    LLVMBuildBr(g->builder, done);
+
+    LLVMPositionBuilderAtEnd(g->builder, next);
+    LLVMBuildBr(g->builder, head);
+
+    LLVMPositionBuilderAtEnd(g->builder, done);
+    LLVMBuildRetVoid(g->builder);
+    if (saved) LLVMPositionBuilderAtEnd(g->builder, saved);
+    return fn;
+}
+
+static void emit_eh_tmp_drop(zan_irgen_t *g, LLVMValueRef obj) {
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    if (!obj || LLVMGetTypeKind(LLVMTypeOf(obj)) != LLVMPointerTypeKind) return;
+    if (LLVMTypeOf(obj) != i8ptr)
+        obj = LLVMBuildBitCast(g->builder, obj, i8ptr, "eh.drop");
+    LLVMTypeRef fnty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), &i8ptr, 1, 0);
+    zan_call2(g->builder, fnty, get_eh_tmp_drop_fn(g), &obj, 1, "");
 }
 
 /* i8* __zan_str_join(i8* sep, i8* lst): join a List<string>'s elements with

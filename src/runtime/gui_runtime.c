@@ -75,6 +75,9 @@
 #include "../common/host_oom.h"
 #include "rt_crash.h"
 typedef int64_t i64;
+/* Native window handle (HWND / X11 Window / NSWindow*): pointer-width, so it
+ * must not ride in a type that narrows when Zan `int` becomes 32-bit. */
+typedef intptr_t iptr;
 typedef uint32_t u32;
 typedef uint8_t  u8;
 

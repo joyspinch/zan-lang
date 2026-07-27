@@ -400,7 +400,7 @@ static void zan_sdl_ensure_init(void) {
     g_sdl_ready = 1;
 }
 
-EXPORT i64 zan_gui_create_window(const char *title, i64 width, i64 height) {
+EXPORT iptr zan_gui_create_window(const char *title, i64 width, i64 height) {
     zan_sdl_ensure_init();
     sdl_reclaim_closed(); /* free windows a previous Close() hid, reclaim slots */
     if (!g_sdl_ready || g_win_count >= ZAN_SDL_MAX_WIN) return 0;
@@ -494,10 +494,10 @@ EXPORT i64 zan_gui_create_window(const char *title, i64 width, i64 height) {
         }
         SDL_SetWindowPosition(win, x, y);
     }
-    return (i64)(intptr_t)win;
+    return (iptr)win;
 }
 
-EXPORT i64 zan_gui_show_window(i64 hwnd_val) {
+EXPORT i64 zan_gui_show_window(iptr hwnd_val) {
     SDL_Window *win = (SDL_Window *)(intptr_t)hwnd_val;
     if (!win) return 1;
     SDL_ShowWindow(win);
@@ -536,19 +536,19 @@ EXPORT i64 zan_gui_show_window(i64 hwnd_val) {
     return 0;
 }
 
-EXPORT i64 zan_gui_minimize(i64 hwnd_val) {
+EXPORT i64 zan_gui_minimize(iptr hwnd_val) {
     SDL_MinimizeWindow((SDL_Window *)(intptr_t)hwnd_val);
     return 0;
 }
 
-EXPORT i64 zan_gui_toggle_maximize(i64 hwnd_val) {
+EXPORT i64 zan_gui_toggle_maximize(iptr hwnd_val) {
     SDL_Window *win = (SDL_Window *)(intptr_t)hwnd_val;
     if (SDL_GetWindowFlags(win) & SDL_WINDOW_MAXIMIZED) SDL_RestoreWindow(win);
     else SDL_MaximizeWindow(win);
     return 0;
 }
 
-EXPORT i64 zan_gui_close_window(i64 hwnd_val) {
+EXPORT i64 zan_gui_close_window(iptr hwnd_val) {
     SDL_Window *win = (SDL_Window *)(intptr_t)hwnd_val;
     /* Deliver the close (kind 8) so the owning App drops the window, mirroring
      * the async Win32 WM_CLOSE. Closing the main window quits the app; a
@@ -571,7 +571,7 @@ EXPORT i64 zan_gui_close_window(i64 hwnd_val) {
 /* Actually tear down a (non-main) window: SDL_close_window only enqueues a
  * kind-8 event so the app can react; the owner calls this once it has fully
  * unwound its state, so a dialog does not linger on screen as an orphan. */
-EXPORT i64 zan_gui_destroy_window(i64 hwnd_val) {
+EXPORT i64 zan_gui_destroy_window(iptr hwnd_val) {
     SDL_Window *win = (SDL_Window *)(intptr_t)hwnd_val;
     if (!win || win == g_main_win) return 1;
     /* Drop any still-queued events aimed at this window so a later pop
@@ -593,14 +593,14 @@ EXPORT i64 zan_gui_destroy_window(i64 hwnd_val) {
     return 0;
 }
 
-EXPORT i64 zan_gui_is_maximized(i64 hwnd_val) {
+EXPORT i64 zan_gui_is_maximized(iptr hwnd_val) {
     SDL_Window *win = (SDL_Window *)(intptr_t)hwnd_val;
     return (SDL_GetWindowFlags(win) & SDL_WINDOW_MAXIMIZED) ? 1 : 0;
 }
 
 /* 1 while the window can be seen (not minimized/hidden/occluded); ambient
  * animations pause while this reports 0. */
-EXPORT i64 zan_gui_window_visible(i64 hwnd_val) {
+EXPORT i64 zan_gui_window_visible(iptr hwnd_val) {
     SDL_Window *win = (SDL_Window *)(intptr_t)hwnd_val;
     SDL_WindowFlags f = SDL_GetWindowFlags(win);
     if (f & (SDL_WINDOW_MINIMIZED | SDL_WINDOW_HIDDEN | SDL_WINDOW_OCCLUDED))
@@ -611,7 +611,7 @@ EXPORT i64 zan_gui_window_visible(i64 hwnd_val) {
 /* 1 while the window has keyboard focus; ambient animations idle down to a
  * slow heartbeat while this reports 0, so a background IDE costs almost
  * nothing. */
-EXPORT i64 zan_gui_window_focused(i64 hwnd_val) {
+EXPORT i64 zan_gui_window_focused(iptr hwnd_val) {
     SDL_Window *win = (SDL_Window *)(intptr_t)hwnd_val;
     return (SDL_GetWindowFlags(win) & SDL_WINDOW_INPUT_FOCUS) ? 1 : 0;
 }
@@ -619,7 +619,7 @@ EXPORT i64 zan_gui_window_focused(i64 hwnd_val) {
 EXPORT i64 zan_gui_titlebar_height(void) { return g_titlebar_h; }
 EXPORT i64 zan_gui_caption_button_width(void) { return g_btn_w; }
 
-EXPORT i64 zan_gui_set_caption_buttons(i64 hwnd_val, i64 count) {
+EXPORT i64 zan_gui_set_caption_buttons(iptr hwnd_val, i64 count) {
     if (count < 0 || count > 8) return 0;
     /* Record per-window so each window's hit-test excludes exactly its own
      * caption cluster; a dialog with fewer buttons no longer leaves the main
@@ -632,7 +632,7 @@ EXPORT i64 zan_gui_set_caption_buttons(i64 hwnd_val, i64 count) {
 
 /* Move a window's top-left to (x, y) in screen pixels (designer "manual"
  * window position). */
-EXPORT i64 zan_gui_set_window_pos(i64 hwnd_val, i64 x, i64 y) {
+EXPORT i64 zan_gui_set_window_pos(iptr hwnd_val, i64 x, i64 y) {
     SDL_Window *win = (SDL_Window *)(intptr_t)hwnd_val;
     if (!win) return 0;
     SDL_SetWindowPosition(win, (int)x, (int)y);
@@ -640,7 +640,7 @@ EXPORT i64 zan_gui_set_window_pos(i64 hwnd_val, i64 x, i64 y) {
 }
 
 /* Re-center a window on the display it currently sits on. */
-EXPORT i64 zan_gui_center_window(i64 hwnd_val) {
+EXPORT i64 zan_gui_center_window(iptr hwnd_val) {
     SDL_Window *win = (SDL_Window *)(intptr_t)hwnd_val;
     if (!win) return 0;
     SDL_DisplayID disp = SDL_GetDisplayForWindow(win);
@@ -650,7 +650,7 @@ EXPORT i64 zan_gui_center_window(i64 hwnd_val) {
     return 1;
 }
 
-EXPORT i64 zan_gui_set_topmost(i64 hwnd_val, i64 on) {
+EXPORT i64 zan_gui_set_topmost(iptr hwnd_val, i64 on) {
     SDL_SetWindowAlwaysOnTop((SDL_Window *)(intptr_t)hwnd_val, on ? true : false);
     return 0;
 }
@@ -718,7 +718,7 @@ EXPORT i64 zan_gui_wake(void) {
  * poll/wait_event report it exactly like OS input and the whole App + widget
  * dispatch path is exercised unchanged. Must be called on the UI thread (the
  * only thread that touches SDL events), which the driver is. */
-EXPORT i64 zan_gui_inject_event(i64 hwnd_val, i64 kind, i64 x, i64 y,
+EXPORT i64 zan_gui_inject_event(iptr hwnd_val, i64 kind, i64 x, i64 y,
                                 i64 button, i64 keycode, i64 mods) {
     SDL_Window *w = hwnd_val ? (SDL_Window *)(intptr_t)hwnd_val : g_main_win;
     zq_push((int)kind, (int)x, (int)y, (int)button, (int)keycode, (int)mods, w);
@@ -748,16 +748,16 @@ EXPORT i64 zan_gui_event_mods(void)    { return g_pending_event[5]; }
 EXPORT i64 zan_gui_window_width(void)  { return g_window_width; }
 EXPORT i64 zan_gui_window_height(void) { return g_window_height; }
 
-EXPORT i64 zan_gui_event_hwnd(void) { return (i64)(intptr_t)g_event_win; }
+EXPORT iptr zan_gui_event_hwnd(void) { return (iptr)g_event_win; }
 
-EXPORT i64 zan_gui_client_width(i64 hwnd_val) {
+EXPORT i64 zan_gui_client_width(iptr hwnd_val) {
     SDL_Window *win = (SDL_Window *)(intptr_t)hwnd_val;
     int w = 0, h = 0;
     if (!win || !SDL_GetWindowSizeInPixels(win, &w, &h)) return 0;
     return w;
 }
 
-EXPORT i64 zan_gui_client_height(i64 hwnd_val) {
+EXPORT i64 zan_gui_client_height(iptr hwnd_val) {
     SDL_Window *win = (SDL_Window *)(intptr_t)hwnd_val;
     int w = 0, h = 0;
     if (!win || !SDL_GetWindowSizeInPixels(win, &w, &h)) return 0;
@@ -847,7 +847,7 @@ static void sdl_upload(zan_surface_t *s, SDL_Texture *tex) {
     }
 }
 
-EXPORT i64 zan_gui_present(i64 hwnd_val, i64 surface_id) {
+EXPORT i64 zan_gui_present(iptr hwnd_val, i64 surface_id) {
     SDL_Window *win = (SDL_Window *)(intptr_t)hwnd_val;
     if (surface_id < 0 || surface_id >= g_surface_count ||
         !g_surfaces[surface_id]) return 1;
@@ -888,7 +888,7 @@ EXPORT i64 zan_gui_present(i64 hwnd_val, i64 surface_id) {
     return 0;
 }
 
-EXPORT i64 zan_gui_set_title(i64 hwnd_val, const char *title) {
+EXPORT i64 zan_gui_set_title(iptr hwnd_val, const char *title) {
     SDL_SetWindowTitle((SDL_Window *)(intptr_t)hwnd_val, title ? title : "");
     return 0;
 }
@@ -953,14 +953,14 @@ EXPORT void zan_gui_set_ime_pos(i64 x, i64 y) {
 /* Native OS glass has no portable SDL equivalent; the software frosted-glass
  * baked into the surface still renders. These stay as safe no-ops so themes
  * that toggle glass keep working under the unified backend. */
-EXPORT i64 zan_gui_enable_glass(i64 hwnd_val, i64 tint_argb) {
+EXPORT i64 zan_gui_enable_glass(iptr hwnd_val, i64 tint_argb) {
     (void)hwnd_val; (void)tint_argb; return 0;
 }
-EXPORT i64 zan_gui_disable_glass(i64 hwnd_val) { (void)hwnd_val; return 0; }
+EXPORT i64 zan_gui_disable_glass(iptr hwnd_val) { (void)hwnd_val; return 0; }
 
 /* Whole-window opacity, 10..100 percent. SDL composites this natively on
  * every platform (DWM / X11 compositor / Cocoa). */
-EXPORT i64 zan_gui_set_opacity(i64 hwnd_val, i64 percent) {
+EXPORT i64 zan_gui_set_opacity(iptr hwnd_val, i64 percent) {
     SDL_Window *win = (SDL_Window *)(intptr_t)hwnd_val;
     if (!win) return 1;
     if (percent < 10) percent = 10;

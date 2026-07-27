@@ -1,0 +1,170 @@
+// Conformance: the JD (JOS) client's full ExecuteAsync path against a local
+// mock gateway -- request assembly (protocol params + signature), envelope
+// unwrapping, the rate-limit (code 66) async backoff retry, and the error
+// paths. The mock gateway re-derives the signature from the received body to
+// prove the client signs exactly what the real gateway would verify.
+//
+// The form parsing here deliberately keeps decoded keys in parallel Lists
+// rather than a Dictionary: see docs/bugs/dict-urldecode-key-corruption.md.
+using System;
+using System.Json;
+using System.Net.Sockets;
+using System.Net.Http;
+using System.Text;
+using Sdk.Jd;
+
+class Ware {
+    public long skuId;
+    public string title;
+}
+
+class WareResult {
+    public List<Ware> wares;
+    public int total;
+}
+
+class Program {
+    static int PORT = 54388;
+    static string SECRET = "test-secret";
+    static string APPKEY = "test-appkey";
+
+    // How many times the rate-limit endpoint was hit (first two answer 66).
+    static int rateHits = 0;
+    static string lastSignOk = "unchecked";
+    static string lastParamJson = "";
+    static string lastToken = "";
+    static string lastMethod = "";
+
+    static List<string> formKeys;
+    static List<string> formVals;
+
+    static void ParseForm(string body) {
+        formKeys = new List<string>();
+        formVals = new List<string>();
+        List<string> pairs = body.Split("&");
+        int i = 0;
+        while (i < pairs.Count) {
+            string p = pairs[i];
+            int eq = p.IndexOf("=");
+            if (eq > 0) {
+                formKeys.Add(Encoding.UrlDecode(p.Substring(0, eq)));
+                formVals.Add(Encoding.UrlDecode(p.Substring(eq + 1)));
+            }
+            i = i + 1;
+        }
+    }
+
+    static string FormGet(string key) {
+        int i = 0;
+        while (i < formKeys.Count) {
+            if (formKeys[i] == key) { return formVals[i]; }
+            i = i + 1;
+        }
+        return "";
+    }
+
+    // Re-derives the signature the way the real gateway does: every received
+    // parameter except `sign`, sorted by key, wrapped in the app secret.
+    static bool VerifySign() {
+        string got = FormGet("sign");
+        if (got.Length == 0) { return false; }
+        Dictionary<string, string> rest = new Dictionary<string, string>();
+        int i = 0;
+        while (i < formKeys.Count) {
+            if (formKeys[i] != "sign") { rest.Add(formKeys[i], formVals[i]); }
+            i = i + 1;
+        }
+        return JdSign.Compute(rest, SECRET) == got;
+    }
+
+    static async HttpResponse Handle(HttpRequest req) {
+        ParseForm(req.body);
+        if (VerifySign()) { lastSignOk = "yes"; } else { lastSignOk = "NO"; }
+        lastParamJson = FormGet("360buy_param_json");
+        lastToken = FormGet("access_token");
+        lastMethod = FormGet("method");
+
+        if (lastMethod == "jingdong.mock.ratelimit") {
+            rateHits = rateHits + 1;
+            if (rateHits <= 2) {
+                return HttpResponse.Json("{\"error_response\":{\"code\":\"66\",\"zh_desc\":\"rate limited\"}}");
+            }
+            return HttpResponse.Json("{\"jingdong_mock_ratelimit_responce\":{\"ok\":\"recovered\"}}");
+        }
+        if (lastMethod == "jingdong.mock.fail") {
+            return HttpResponse.Json("{\"error_response\":{\"code\":\"18\",\"zh_desc\":\"app is not exist\"}}");
+        }
+        return HttpResponse.Json("{\"jingdong_mock_ware_responce\":{\"wares\":[{\"skuId\":100,\"title\":\"pen\"},{\"skuId\":200,\"title\":\"cup\"}],\"total\":2}}");
+    }
+
+    static JdClient NewClient() {
+        JdClient c = new JdClient(APPKEY, SECRET);
+        c.Server("127.0.0.1", PORT, "/routerjson", false);
+        return c;
+    }
+
+    static async int Run() {
+        Socket.Initialize();
+        HttpServer server = HttpServer.Create("127.0.0.1", PORT);
+        server.OnRequest(Handle);
+        Task.Spawn(server.Start());
+        await Task.Delay(50);
+
+        // --- happy path: protocol params, signature, envelope, JSON binding ---
+        JdClient client = NewClient();
+        client.SetAccessToken("tok-123");
+        JdRequest req = new JdRequest("jingdong.mock.ware.get");
+        req.Set("keyword", "say \"hi\"").SetInt("pageNo", 2);
+
+        JdResponse resp = await client.ExecuteAsync(req);
+        WareResult r = Json.Deserialize<WareResult>(resp.Data);
+        Console.WriteLine("signVerified=" + lastSignOk);
+        Console.WriteLine("method=" + lastMethod);
+        Console.WriteLine("paramJson=" + lastParamJson);
+        Console.WriteLine("token=" + lastToken);
+        Console.WriteLine("total=" + Convert.ToString(r.total));
+        Console.WriteLine("ware0=" + r.wares[0].title + "/" + Convert.ToString(r.wares[0].skuId));
+        Console.WriteLine("ware1=" + r.wares[1].title);
+
+        // --- rate limit (code 66): retried with async backoff, then succeeds ---
+        JdResponse rlResp = await client.ExecuteAsync(new JdRequest("jingdong.mock.ratelimit"));
+        Console.WriteLine("rateHits=" + Convert.ToString(rateHits));
+        Console.WriteLine("rateRecovered=" + rlResp.Value.Get("ok").AsString(""));
+
+        // --- gateway error surfaces as JdException, never a fake response ---
+        try {
+            JdResponse _x = await client.ExecuteAsync(new JdRequest("jingdong.mock.fail"));
+            Console.WriteLine("gatewayError=NOT THROWN");
+        } catch (JdException e) {
+            Console.WriteLine("gatewayError=" + e.Code);
+        }
+
+        // --- retries disabled: the 66 propagates after a single attempt ---
+        rateHits = 0;
+        JdClient noRetry = NewClient();
+        noRetry.MaxRetries(0);
+        try {
+            JdResponse _y = await noRetry.ExecuteAsync(new JdRequest("jingdong.mock.ratelimit"));
+            Console.WriteLine("noRetry=NOT THROWN");
+        } catch (JdException e) {
+            Console.WriteLine("noRetry=" + e.Code + " hits=" + Convert.ToString(rateHits));
+        }
+
+        // --- local validation happens before any socket work ---
+        JdClient blank = new JdClient("", "");
+        blank.Server("127.0.0.1", PORT, "/routerjson", false);
+        try {
+            JdResponse _z = await blank.ExecuteAsync(new JdRequest("jingdong.mock.ware.get"));
+            Console.WriteLine("validation=NOT THROWN");
+        } catch (JdException e) {
+            Console.WriteLine("validation=" + e.Code);
+        }
+
+        server.Stop();
+        return 0;
+    }
+
+    static async void Main() {
+        int _rc = await Run();
+    }
+}

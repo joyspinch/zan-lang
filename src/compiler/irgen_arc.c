@@ -356,6 +356,21 @@ static void build_collection_release_body(zan_irgen_t *g, int coll_kind,
         emit_list_release_elems(g, elem_type, obj);
         LLVMValueRef d8 = LLVMBuildBitCast(b, data, i8ptr, "d8");
         zan_call2(b, free_ty, g->fn_free, &d8, 1, "");
+    } else if (coll_kind == 3) {
+        /* Dict: release rc-managed keys/values, then free the keys, values and
+         * hash-index buffers. `elem_type` carries the dict type itself so the
+         * key/value types stay recoverable here. */
+        LLVMValueRef dp = LLVMBuildBitCast(b, obj, LLVMPointerType(g->dict_struct_type, 0), "dp");
+        LLVMValueRef ks = LLVMBuildLoad2(b, i8ptr,
+            LLVMBuildStructGEP2(b, g->dict_struct_type, dp, 2, "kp"), "ks8");
+        LLVMValueRef vs = LLVMBuildLoad2(b, i8ptr,
+            LLVMBuildStructGEP2(b, g->dict_struct_type, dp, 3, "vp"), "vs8");
+        LLVMValueRef ix = LLVMBuildLoad2(b, i8ptr,
+            LLVMBuildStructGEP2(b, g->dict_struct_type, dp, 4, "ip"), "ix8");
+        emit_dict_release_elems(g, elem_type, obj);
+        zan_call2(b, free_ty, g->fn_free, &ks, 1, "");
+        zan_call2(b, free_ty, g->fn_free, &vs, 1, "");
+        zan_call2(b, free_ty, g->fn_free, &ix, 1, "");
     } else if (coll_kind == 2) {
         /* StringBuilder: free the i8* data buffer (free tolerates null). */
         LLVMValueRef sp = LLVMBuildBitCast(b, obj, LLVMPointerType(g->sb_struct_type, 0), "sp");

@@ -49,6 +49,10 @@ static void collect_inst_expr(zan_irgen_t *g, zan_ast_node_t *e) {
     case AST_MEMBER_ACCESS:
         collect_inst_expr(g, e->member.object);
         break;
+    case AST_IDENTIFIER:
+        /* `Box<int>` naming a constructed type in expression position */
+        collect_inst_typeref(g, e->inst_type_ref);
+        break;
     case AST_INDEX:
         collect_inst_expr(g, e->index.object);
         collect_inst_expr(g, e->index.index);
@@ -167,6 +171,13 @@ static void discover_generic_insts(zan_irgen_t *g, zan_ast_node_t *unit) {
             }
         }
     }
+}
+
+/* The instantiation an identifier names when it is a constructed generic type
+ * in expression position (`Box<int>.Create(x)`); NULL for a plain identifier. */
+static zan_type_t *ident_inst_type(zan_irgen_t *g, zan_ast_node_t *e) {
+    if (!e || e->kind != AST_IDENTIFIER || !e->inst_type_ref) return NULL;
+    return zan_binder_resolve_type(g->binder, e->inst_type_ref);
 }
 
 /* Coerce a call result from the erased opaque pointer back to the concrete
@@ -452,6 +463,11 @@ static void emit_leak_report_support(zan_irgen_t *g) {
     }
 }
 
+/* defined in later-included parts of this translation unit */
+static void emit_eh_tmp_push_slot(zan_irgen_t *g, LLVMValueRef slot);
+static void emit_eh_tmp_pop(zan_irgen_t *g);
+static void emit_eh_tmp_drop(zan_irgen_t *g, LLVMValueRef obj);
+
 /* True when a local owns a class heap reference held as a pointer (excludes
  * borrowed params, stack-struct classes and non-class types). */
 static int local_owns_arc(local_var_t *v) {
@@ -459,29 +475,51 @@ static int local_owns_arc(local_var_t *v) {
     return LLVMGetTypeKind(LLVMGetAllocatedType(v->alloca)) == LLVMPointerTypeKind;
 }
 
-static int local_is_dict(local_var_t *v) {
-    return v && v->arc_owned == 1 && v->type &&
-           ((v->type->name.len == 4 && memcmp(v->type->name.str, "Dict", 4) == 0) ||
-            (v->type->name.len == 10 && memcmp(v->type->name.str, "Dictionary", 10) == 0)) &&
-           LLVMGetTypeKind(LLVMGetAllocatedType(v->alloca)) == LLVMPointerTypeKind;
+/* Register the most recently declared local's slot with the unwinder and mark
+ * it owning. A longjmp skips the scope-exit release of every frame it unwinds
+ * through, so the slot is what lets the throw site release them (A8-12).
+ *
+ * Async bodies are excluded: their locals live in the heap frame, which
+ * __zan_async_unwind releases per suspended frame, and the throw site releases
+ * the current one (A8-3). */
+static void arc_own_local(zan_irgen_t *g, local_scope_t *locals) {
+    if (!locals || locals->count == 0) return;
+    local_var_t *v = &locals->vars[locals->count - 1];
+    v->arc_owned = 1;
+    if (v->eh_slot || g->current_async_frame || !local_owns_arc(v)) return;
+    emit_eh_tmp_push_slot(g, v->alloca);
+    v->eh_slot = 1;
 }
 
-static void emit_release_dict_local(zan_irgen_t *g, local_var_t *v) {
-    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
-    LLVMValueRef cur = LLVMBuildLoad2(g->builder, i8ptr, v->alloca, "dict.rel");
-    emit_dict_release_elems(g, v->type, cur);
+/* Drop a released local's unwind-stack entry. Entries are pushed in
+ * declaration order and every release pass walks a suffix of the scope, so
+ * popping once per released registered local restores the depth the scope was
+ * entered at. */
+static void pop_eh_slot(zan_irgen_t *g, local_var_t *v) {
+    if (v && v->eh_slot) emit_eh_tmp_pop(g);
 }
 
-static void emit_release_owned_locals(zan_irgen_t *g, local_scope_t *locals) {
+/* Release owned locals in [start, count) without dropping them from the
+ * scope: used on `break`/`continue` edges, where the same locals remain in
+ * scope on the fall-through path and are released there separately. */
+/* Release every owning local at function exit, except `keep` (when non-null).
+ *
+ * A bare `new T[n]` array has no rc header, so a function that returns one
+ * hands over the only reference: its elements must not be released on the way
+ * out, or the caller receives an array full of dangling pointers. Rc-managed
+ * returns (including Dict, see A8-2) don't need the exclusion -- `return`
+ * retains them before the release pass. */
+static void emit_release_owned_locals_except(zan_irgen_t *g, local_scope_t *locals,
+                                             local_var_t *keep) {
     if (!locals) return;
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     for (int i = 0; i < locals->count; i++) {
+        pop_eh_slot(g, &locals->vars[i]);
+        if (keep && &locals->vars[i] == keep) continue;
         if (local_owns_arc(&locals->vars[i])) {
             LLVMValueRef cur = LLVMBuildLoad2(g->builder, i8ptr,
                                               locals->vars[i].alloca, "arc.rel");
             emit_rc_release_for_type(g, locals->vars[i].type, cur);
-        } else if (local_is_dict(&locals->vars[i])) {
-            emit_release_dict_local(g, &locals->vars[i]);
         } else if (locals->vars[i].arr_len && locals->vars[i].type) {
             LLVMValueRef a = LLVMBuildLoad2(g->builder, i8ptr,
                                             locals->vars[i].alloca, "arr.rel");
@@ -492,25 +530,77 @@ static void emit_release_owned_locals(zan_irgen_t *g, local_scope_t *locals) {
     }
 }
 
-/* Release owned locals in [start, count) without dropping them from the
- * scope: used on `break`/`continue` edges, where the same locals remain in
- * scope on the fall-through path and are released there separately. */
+static void emit_release_owned_locals(zan_irgen_t *g, local_scope_t *locals) {
+    emit_release_owned_locals_except(g, locals, NULL);
+}
+
 static void emit_release_owned_locals_range(zan_irgen_t *g, local_scope_t *locals, int start) {
     if (!locals) return;
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     for (int i = locals->count - 1; i >= start; i--) {
+        pop_eh_slot(g, &locals->vars[i]);
         if (local_owns_arc(&locals->vars[i])) {
             LLVMValueRef cur = LLVMBuildLoad2(g->builder, i8ptr,
                                               locals->vars[i].alloca, "arc.rel");
             emit_rc_release_for_type(g, locals->vars[i].type, cur);
-        } else if (local_is_dict(&locals->vars[i])) {
-            emit_release_dict_local(g, &locals->vars[i]);
         } else if (locals->vars[i].arr_len && locals->vars[i].type) {
             LLVMValueRef a = LLVMBuildLoad2(g->builder, i8ptr,
                                             locals->vars[i].alloca, "arr.rel");
             LLVMValueRef nn = LLVMBuildLoad2(g->builder,
                 LLVMInt64TypeInContext(g->ctx), locals->vars[i].arr_len, "arr.n");
             emit_array_release_elems(g, locals->vars[i].type->element_type, a, nn);
+        }
+    }
+}
+
+/* Release the exceptions owned by the catch bodies in [base, count): the
+ * handler entry stacked each one as an EH temp and the try epilogue would pop
+ * and release it, but `return`/`break`/`continue`/`throw` leave the handler
+ * without reaching that epilogue. Innermost first, mirroring the epilogue. */
+static void emit_release_active_catch_excs(zan_irgen_t *g, int base) {
+    LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    for (int i = g->catch_cleanup_count - 1; i >= base; i--) {
+        LLVMValueRef owned_slot = g->catch_cleanups[i].owned_slot;
+        LLVMValueRef exc_slot = g->catch_cleanups[i].exc_slot;
+        if (!owned_slot || !exc_slot) continue;
+        LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder));
+        LLVMValueRef ofl = LLVMBuildLoad2(g->builder, i32, owned_slot, "cex.own");
+        LLVMValueRef is_own = LLVMBuildICmp(g->builder, LLVMIntNE, ofl,
+            LLVMConstInt(i32, 0, 0), "cex.isown");
+        LLVMBasicBlockRef rel_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "cex.rel");
+        LLVMBasicBlockRef cont_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "cex.cont");
+        LLVMBuildCondBr(g->builder, is_own, rel_bb, cont_bb);
+        LLVMPositionBuilderAtEnd(g->builder, rel_bb);
+        LLVMValueRef ev = LLVMBuildLoad2(g->builder, i8ptr, exc_slot, "cex.re");
+        emit_eh_tmp_drop(g, ev);
+        zan_call2(g->builder,
+            LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), &i8ptr, 1, 0),
+            g->rt_release_dyn, &ev, 1, "");
+        /* leave __zan_eh_exc alone: on a `throw` out of the handler it already
+         * carries the new in-flight exception */
+        LLVMBuildStore(g->builder, LLVMConstInt(i32, 0, 0), owned_slot);
+        LLVMBuildBr(g->builder, cont_bb);
+        LLVMPositionBuilderAtEnd(g->builder, cont_bb);
+    }
+}
+
+/* Null the slots of the owning locals in [start, count) after they have been
+ * released. An async body's locals are frame-resident and every path that
+ * abandons the frame -- the coroutine's exception landing pad, the frame
+ * cleanup -- releases them again from those slots, so a throw that releases
+ * them itself (A8-3) must leave null behind instead of dangling pointers. */
+static void emit_clear_owned_locals_range(zan_irgen_t *g, local_scope_t *locals, int start) {
+    if (!locals) return;
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    for (int i = locals->count - 1; i >= start; i--) {
+        if (local_owns_arc(&locals->vars[i])) {
+            LLVMBuildStore(g->builder, LLVMConstNull(i8ptr),
+                           locals->vars[i].alloca);
+        } else if (locals->vars[i].arr_len && locals->vars[i].type) {
+            LLVMBuildStore(g->builder,
+                           LLVMConstInt(LLVMInt64TypeInContext(g->ctx), 0, 0),
+                           locals->vars[i].arr_len);
         }
     }
 }
@@ -526,13 +616,12 @@ static void emit_release_owned_locals_from(zan_irgen_t *g, local_scope_t *locals
     bool terminated =
         LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder)) != NULL;
     for (int i = locals->count - 1; i >= start; i--) {
+        if (!terminated) pop_eh_slot(g, &locals->vars[i]);
         if (!terminated && local_owns_arc(&locals->vars[i])) {
             LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
             LLVMValueRef cur = LLVMBuildLoad2(g->builder, i8ptr,
                                               locals->vars[i].alloca, "arc.rel");
             emit_rc_release_for_type(g, locals->vars[i].type, cur);
-        } else if (!terminated && local_is_dict(&locals->vars[i])) {
-            emit_release_dict_local(g, &locals->vars[i]);
         } else if (!terminated && locals->vars[i].arr_len && locals->vars[i].type) {
             LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
             LLVMValueRef a = LLVMBuildLoad2(g->builder, i8ptr,

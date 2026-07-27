@@ -1,0 +1,107 @@
+// Conformance: the generated JD API surface (tools/jdsdk/generate.py output).
+// Exercises a request with typed setters end-to-end against a mock gateway --
+// API name, parameter marshalling (including 64-bit ids that must not be
+// truncated), and binding the envelope into the generated response class via
+// the shared Domain models.
+using System;
+using System.Json;
+using System.Net.Sockets;
+using System.Net.Http;
+using System.Text;
+using Sdk.Jd;
+using Sdk.Jd.Api.Ware;
+using Sdk.Jd.Api.Area;
+
+class Program {
+    static int PORT = 54389;
+    static string SECRET = "gen-secret";
+    static string lastParamJson = "";
+    static string lastMethod = "";
+
+    static List<string> formKeys;
+    static List<string> formVals;
+
+    static void ParseForm(string body) {
+        formKeys = new List<string>();
+        formVals = new List<string>();
+        List<string> pairs = body.Split("&");
+        int i = 0;
+        while (i < pairs.Count) {
+            string p = pairs[i];
+            int eq = p.IndexOf("=");
+            if (eq > 0) {
+                formKeys.Add(Encoding.UrlDecode(p.Substring(0, eq)));
+                formVals.Add(Encoding.UrlDecode(p.Substring(eq + 1)));
+            }
+            i = i + 1;
+        }
+    }
+
+    static string FormGet(string key) {
+        int i = 0;
+        while (i < formKeys.Count) {
+            if (formKeys[i] == key) { return formVals[i]; }
+            i = i + 1;
+        }
+        return "";
+    }
+
+    static async HttpResponse Handle(HttpRequest req) {
+        ParseForm(req.body);
+        lastMethod = FormGet("method");
+        lastParamJson = FormGet("360buy_param_json");
+
+        if (lastMethod == "jingdong.area.province.get") {
+            return HttpResponse.Json("{\"jingdong_area_province_get_responce\":{\"province_areas\":[{\"id\":1,\"name\":\"Beijing\",\"cod\":true},{\"id\":2,\"name\":\"Shanghai\",\"cod\":false}],\"success\":true}}");
+        }
+        return HttpResponse.Json("{\"jingdong_ware_read_searchWare4Valid_responce\":{\"page\":{\"data\":[\"w1\",\"w2\"],\"pageNo\":2,\"pageSize\":50,\"totalItem\":4294967296}}}");
+    }
+
+    static async int Run() {
+        Socket.Initialize();
+        HttpServer server = HttpServer.Create("127.0.0.1", PORT);
+        server.OnRequest(Handle);
+        Task.Spawn(server.Start());
+        await Task.Delay(50);
+
+        JdClient client = new JdClient("gen-key", SECRET);
+        client.Server("127.0.0.1", PORT, "/routerjson", false);
+
+        // --- typed request: setters marshal into the protocol parameters ---
+        // categoryId is beyond 32 bits on purpose: SetLong must not truncate.
+        WareReadSearchWare4ValidRequest ware = new WareReadSearchWare4ValidRequest();
+        ware.SearchKey("pen").PageNo(2).PageSize(50).CategoryId(4294967296);
+
+        JdResponse resp = await client.ExecuteAsync(ware.Raw());
+        Console.WriteLine("method=" + lastMethod);
+        Console.WriteLine("params=" + lastParamJson);
+
+        WareReadSearchWare4ValidResponse w =
+            Json.Deserialize<WareReadSearchWare4ValidResponse>(resp.Data);
+        Console.WriteLine("pageNo=" + Convert.ToString(w.page.pageNo));
+        Console.WriteLine("pageSize=" + Convert.ToString(w.page.pageSize));
+        Console.WriteLine("totalItem=" + Convert.ToString(w.page.totalItem));
+        Console.WriteLine("data=" + Convert.ToString(w.page.data.Count) + ":" + w.page.data[0]);
+
+        // --- a request with no parameters, binding a List<Domain> ---
+        AreaProvinceGetRequest area = new AreaProvinceGetRequest();
+        JdResponse aresp = await client.ExecuteAsync(area.Raw());
+        Console.WriteLine("areaMethod=" + lastMethod);
+        Console.WriteLine("areaParams=" + lastParamJson);
+
+        AreaProvinceGetResponse a =
+            Json.Deserialize<AreaProvinceGetResponse>(aresp.Data);
+        Console.WriteLine("provinces=" + Convert.ToString(a.province_areas.Count));
+        Console.WriteLine("first=" + a.province_areas[0].name
+            + " id=" + Convert.ToString(a.province_areas[0].id)
+            + " cod=" + Convert.ToString(a.province_areas[0].cod));
+        Console.WriteLine("success=" + Convert.ToString(a.success));
+
+        server.Stop();
+        return 0;
+    }
+
+    static async void Main() {
+        int _rc = await Run();
+    }
+}

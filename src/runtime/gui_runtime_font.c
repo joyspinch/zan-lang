@@ -769,7 +769,7 @@ EXPORT void zan_gui_draw_icon(i64 surface_id, i64 x, i64 y, i64 box,
 #if defined(__linux__) && !defined(ZAN_GUI_SDL)
 /* ---- window management (EWMH / Xlib) ---- */
 
-EXPORT i64 zan_gui_minimize(i64 hwnd_val) {
+EXPORT i64 zan_gui_minimize(iptr hwnd_val) {
     Window xid = hwnd_val ? (Window)(intptr_t)hwnd_val : g_x11_window;
     if (g_display && xid) {
         XIconifyWindow(g_display, xid, DefaultScreen(g_display));
@@ -778,14 +778,14 @@ EXPORT i64 zan_gui_minimize(i64 hwnd_val) {
     return 0;
 }
 
-EXPORT i64 zan_gui_toggle_maximize(i64 hwnd_val) {
+EXPORT i64 zan_gui_toggle_maximize(iptr hwnd_val) {
     Window xid = hwnd_val ? (Window)(intptr_t)hwnd_val : g_x11_window;
     x11_wm_state(xid, x11_atom("_NET_WM_STATE_MAXIMIZED_VERT"),
                  x11_atom("_NET_WM_STATE_MAXIMIZED_HORZ"), 2 /* toggle */);
     return 0;
 }
 
-EXPORT i64 zan_gui_is_maximized(i64 hwnd_val) {
+EXPORT i64 zan_gui_is_maximized(iptr hwnd_val) {
     Window xid = hwnd_val ? (Window)(intptr_t)hwnd_val : g_x11_window;
     if (!g_display || !xid) return 0;
     Atom vert = x11_atom("_NET_WM_STATE_MAXIMIZED_VERT");
@@ -810,7 +810,7 @@ EXPORT i64 zan_gui_is_maximized(i64 hwnd_val) {
 
 /* 1 while the window can be seen (not iconified/unmapped); ambient
  * animations pause while this reports 0. */
-EXPORT i64 zan_gui_window_visible(i64 hwnd_val) {
+EXPORT i64 zan_gui_window_visible(iptr hwnd_val) {
     Window xid = hwnd_val ? (Window)(intptr_t)hwnd_val : g_x11_window;
     if (!g_display || !xid) return 0;
     XWindowAttributes attrs;
@@ -824,7 +824,7 @@ EXPORT i64 zan_gui_window_visible(i64 hwnd_val) {
 /* 1 while the window holds the input focus; ambient animations idle down to a
  * slow heartbeat while this reports 0, so a background window costs almost
  * nothing. */
-EXPORT i64 zan_gui_window_focused(i64 hwnd_val) {
+EXPORT i64 zan_gui_window_focused(iptr hwnd_val) {
     Window xid = hwnd_val ? (Window)(intptr_t)hwnd_val : g_x11_window;
     if (!g_display || !xid) return 0;
     Window focused = 0;
@@ -833,7 +833,7 @@ EXPORT i64 zan_gui_window_focused(i64 hwnd_val) {
     return focused == xid ? 1 : 0;
 }
 
-EXPORT i64 zan_gui_set_topmost(i64 hwnd_val, i64 on) {
+EXPORT i64 zan_gui_set_topmost(iptr hwnd_val, i64 on) {
     Window xid = hwnd_val ? (Window)(intptr_t)hwnd_val : g_x11_window;
     x11_wm_state(xid, x11_atom("_NET_WM_STATE_ABOVE"), 0, on ? 1 : 0);
     return 0;
@@ -842,13 +842,13 @@ EXPORT i64 zan_gui_set_topmost(i64 hwnd_val, i64 on) {
 /* ---- client-side title-bar metrics (borderless window) ---- */
 EXPORT i64 zan_gui_titlebar_height(void) { return g_titlebar_h_l; }
 EXPORT i64 zan_gui_caption_button_width(void) { return g_btn_w_l; }
-EXPORT i64 zan_gui_set_caption_buttons(i64 hwnd_val, i64 count) {
+EXPORT i64 zan_gui_set_caption_buttons(iptr hwnd_val, i64 count) {
     (void)hwnd_val;
     if (count >= 0 && count <= 8) { g_caption_btn_count_l = (int)count; }
     return 0;
 }
 
-EXPORT i64 zan_gui_close_window(i64 hwnd_val) {
+EXPORT i64 zan_gui_close_window(iptr hwnd_val) {
     if (!g_display) return 0;
     Window xid = hwnd_val ? (Window)(intptr_t)hwnd_val : g_primary_win;
     zan_lwin_t *w = lwin_find(xid);
@@ -893,7 +893,7 @@ EXPORT i64 zan_gui_close_window(i64 hwnd_val) {
 /* On Linux close_window already destroys the X window synchronously, so the
  * owner-driven destroy is a no-op kept for FFI symbol parity across
  * backends. */
-EXPORT i64 zan_gui_destroy_window(i64 hwnd_val) { (void)hwnd_val; return 0; }
+EXPORT i64 zan_gui_destroy_window(iptr hwnd_val) { (void)hwnd_val; return 0; }
 
 /* Native glass on Linux: ask a compositing WM (KWin, or picom via rules) to
  * blur whatever is behind the window by setting the de-facto standard
@@ -902,7 +902,7 @@ EXPORT i64 zan_gui_destroy_window(i64 hwnd_val) { (void)hwnd_val; return 0; }
  * which requires a 32-bit ARGB visual plus a running compositor; without those
  * the hint is a harmless no-op. tint is unused (the compositor owns the tint).
  * This is the Linux side of the same Gui.Native.Window.EnableGlass API. */
-EXPORT i64 zan_gui_enable_glass(i64 hwnd_val, i64 tint_argb) {
+EXPORT i64 zan_gui_enable_glass(iptr hwnd_val, i64 tint_argb) {
     (void)tint_argb;
     if (!g_display) return 1;
     Window xid = hwnd_val ? (Window)(intptr_t)hwnd_val : g_primary_win;
@@ -915,7 +915,7 @@ EXPORT i64 zan_gui_enable_glass(i64 hwnd_val, i64 tint_argb) {
     return 0;
 }
 
-EXPORT i64 zan_gui_disable_glass(i64 hwnd_val) {
+EXPORT i64 zan_gui_disable_glass(iptr hwnd_val) {
     if (!g_display) return 1;
     Window xid = hwnd_val ? (Window)(intptr_t)hwnd_val : g_primary_win;
     if (!xid) return 1;
@@ -927,7 +927,7 @@ EXPORT i64 zan_gui_disable_glass(i64 hwnd_val) {
 
 /* Whole-window opacity via the EWMH _NET_WM_WINDOW_OPACITY hint (honoured by
  * any compositing WM). percent is 10..100. */
-EXPORT i64 zan_gui_set_opacity(i64 hwnd_val, i64 percent) {
+EXPORT i64 zan_gui_set_opacity(iptr hwnd_val, i64 percent) {
     if (!g_display) return 1;
     Window xid = hwnd_val ? (Window)(intptr_t)hwnd_val : g_primary_win;
     if (!xid) return 1;

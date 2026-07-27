@@ -368,6 +368,19 @@ returning empty responses:
   connect fails, the TLS context cannot be created, or the TLS handshake
   fails. `HttpRequestException` derives from `Exception`.
 
+**Timeouts.** `SetTimeout(ms)` is enforced, not advisory: the connect phase is
+bounded by a deadline-polled non-blocking connect and the request/response
+phase by the `HttpDeadline` sweeper, which hangs the socket up so a peer that
+accepts and then goes quiet cannot park the coroutine forever. Either phase
+running out throws `HttpRequestException` with a "timed out after Nms" message.
+The sweeper ticks once a second, so the effective granularity is ~1s;
+`SetTimeout(0)` disables deadlines.
+
+**Status codes.** The verb helpers (`GetAsync` / `PostAsync` / ...) return the
+body only, which makes a 502 error page look like a payload. `SendAsync(method,
+path, body)` returns the parsed `HttpResponse` instead, so callers can see
+`statusCode` / `statusText` / headers.
+
 **JSON error model (System.Json).** `JsonValue.Parse` throws `JsonException`
 ("Malformed JSON at position N") on malformed input; the document is
 validated with an allocation-free scan before the value tree is built.

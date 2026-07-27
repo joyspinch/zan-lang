@@ -107,6 +107,9 @@ static void emit_main_method(zan_irgen_t *g, zan_ast_node_t *method, zan_symbol_
 
     g->current_fn = main_fn;
     g->current_fn_ret_type = LLVMInt32TypeInContext(g->ctx);
+    g->throw_locals_base = 0;
+    g->catch_cleanup_count = 0;
+    g->throw_catch_base = 0;
     g->current_type_sym = type_sym;
     g->current_this = NULL;
     g->current_fn_body = method->method_decl.body;
@@ -222,6 +225,27 @@ static int generic_variant_count(zan_irgen_t *g, zan_symbol_t *type_sym) {
     return n;
 }
 
+static bool method_is_tp_template(zan_ast_node_t *member);
+static bool class_member_uses_tp(zan_ast_node_t *decl, zan_ast_node_t *member);
+
+/* Body for the erased variant of a generic-class member that reaches into one
+ * of the class's type parameters: there is no erased lowering for `t.Member`
+ * when T is unknown, and every call site whose receiver instantiation is known
+ * routes to a specialized variant instead. Keeping the symbol (rather than
+ * dropping it) keeps every existing reference linkable. */
+static void emit_tp_erased_stub(zan_irgen_t *g, LLVMValueRef fn) {
+    LLVMBasicBlockRef saved = LLVMGetInsertBlock(g->builder);
+    LLVMBasicBlockRef bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "entry");
+    LLVMPositionBuilderAtEnd(g->builder, bb);
+    LLVMValueRef ab = LLVMGetNamedFunction(g->mod, "abort");
+    LLVMTypeRef vfn = ab ? LLVMGlobalGetValueType(ab)
+                         : LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), NULL, 0, 0);
+    if (!ab) ab = LLVMAddFunction(g->mod, "abort", vfn);
+    zan_call2(g->builder, vfn, ab, NULL, 0, "");
+    LLVMBuildUnreachable(g->builder);
+    if (saved) LLVMPositionBuilderAtEnd(g->builder, saved);
+}
+
 static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
     /* Discover every concrete instantiation of a user generic class up front so
      * Pass A can emit one specialized variant per instantiation (in addition to
@@ -279,6 +303,22 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
             zan_ast_node_t *member = decl->type_decl.members.items[j];
             bool is_ctor = (member->kind == AST_CONSTRUCTOR_DECL);
             if (member->kind != AST_METHOD_DECL && !is_ctor) continue;
+            /* A generic method that reaches into its own type parameters is a
+             * template: it exists only as monomorphized copies, emitted from
+             * the call sites (emit_method_spec_body). Emitting an erased
+             * instance here produced broken IR, since `c.Name()` on a T has
+             * nothing to resolve against. */
+            if (method_is_tp_template(member)) {
+                if ((member->method_decl.modifiers & MOD_STATIC) &&
+                    !(member->method_decl.modifiers & MOD_ASYNC)) continue;
+                zan_diag_emit(g->diag, DIAG_ERROR, member->loc,
+                    "generic method '%.*s' accesses a member of its type "
+                    "parameter; only static non-async generic methods can be "
+                    "monomorphized today",
+                    (int)member->method_decl.name.len,
+                    member->method_decl.name.str);
+                continue;
+            }
             /* extern/DllImport methods have no generic body: only the erased
              * variant declares them. */
             bool is_extern_decl =
@@ -320,7 +360,8 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
                     strncmp(ext_name, "zan_atomic_int_", 15) == 0 ||
                     strncmp(ext_name, "zan_shared_table_", 17) == 0 ||
                     strncmp(ext_name, "zan_thread_", 11) == 0 ||
-                    strncmp(ext_name, "zan_dispatch_", 13) == 0) {
+                    strncmp(ext_name, "zan_dispatch_", 13) == 0 ||
+                    strncmp(ext_name, "zan_monotonic_", 14) == 0) {
                     g->uses_sync_runtime = true;
                 }
                 if (strncmp(ext_name, "zan_io_socket_", 14) == 0) {
@@ -475,8 +516,12 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
                 /* Scan the body: count await points (→ states / sub-task slots)
                  * and collect named scalar locals that must live in the frame
                  * so they survive across suspensions. */
-                async_scan_t scan = { g, 0, NULL, 0, 0 };
+                async_scan_t scan = { g, 0, NULL, 0, 0,
+                                      local_scope_new(g->arena), 0 };
+                zan_symbol_t *scan_saved_type = g->current_type_sym;
+                g->current_type_sym = type_sym;
                 async_scan_stmt(&scan, member->method_decl.body);
+                g->current_type_sym = scan_saved_type;
                 a_await_count = scan.await_count;
                 a_locals = scan.locals;
                 a_local_count = scan.local_count;
@@ -499,6 +544,8 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
                 fields[ASYNC_FRAME_EXC_TID] = i8ptr;
                 fields[ASYNC_FRAME_EXC_OWNED] = i32;
                 fields[ASYNC_FRAME_HSTACK] = LLVMArrayType(i32, ASYNC_MAX_HANDLERS);
+                fields[ASYNC_FRAME_CEXC] = LLVMArrayType(i8ptr, ASYNC_MAX_HANDLERS);
+                fields[ASYNC_FRAME_CEXC_OWNED] = LLVMArrayType(i32, ASYNC_MAX_HANDLERS);
                 for (int k = 0; k < total_params; k++) {
                     fields[ASYNC_FRAME_FIRST_PARAM + k] = param_types[k];
                 }
@@ -556,6 +603,15 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
                 } else {
                     irgen_register_function(g, method_sym, fn, fn_type);
                 }
+            }
+
+            /* The erased variant of a member reaching into the class's own
+             * type parameters has no valid lowering; only the specialized
+             * variants below carry a real body. */
+            if (!cur_variant && class_member_uses_tp(decl, member)) {
+                emit_tp_erased_stub(g, fn);
+                free(param_types);
+                continue;
             }
 
             /* defer body emission to Pass B so calls may forward-reference
@@ -751,7 +807,8 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
                  * an await) must still release the value a prior iteration
                  * stored, or it leaks. The null-init makes the release a no-op
                  * on paths where the local was never assigned. */
-                if (is_rc_managed_type(work[w].alocals[k].ztype) &&
+                if (!work[w].alocals[k].no_arc &&
+                    is_rc_managed_type(work[w].alocals[k].ztype) &&
                     LLVMGetTypeKind(work[w].alocals[k].llvm) == LLVMPointerTypeKind) {
                     LLVMBuildStore(g->builder,
                         LLVMConstNull(work[w].alocals[k].llvm), la);
@@ -780,9 +837,17 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
             LLVMBasicBlockRef saved_exc_bb = g->current_async_exc_bb;
             LLVMValueRef saved_rearm = g->current_async_rearm_switch;
             int saved_handler_next = g->current_async_handler_next;
+            int saved_foreach_next = g->current_async_foreach_next;
 
             g->current_fn = resume_fn;
             g->current_fn_ret_type = LLVMVoidTypeInContext(g->ctx);
+            /* a nested body starts with no enclosing try of its own */
+            int saved_throw_base = g->throw_locals_base;
+            int saved_catch_cc = g->catch_cleanup_count;
+            int saved_throw_cb = g->throw_catch_base;
+            g->throw_locals_base = 0;
+            g->catch_cleanup_count = 0;
+            g->throw_catch_base = 0;
             g->current_this = is_static ? NULL : res_this;
             g->current_type_sym = type_sym;
             g->current_async_frame = sframe;
@@ -797,6 +862,7 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
             g->current_async_exc_bb = NULL;
             g->current_async_rearm_switch = NULL;
             g->current_async_handler_next = 0;
+            g->current_async_foreach_next = 0;
 
             /* arm this invocation's exception trampoline (and re-arm the
              * handlers of the tries the frame is suspended inside) before the
@@ -838,6 +904,9 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
 
             g->current_fn = saved_fn;
             g->current_fn_ret_type = saved_fn_ret;
+            g->throw_locals_base = saved_throw_base;
+            g->catch_cleanup_count = saved_catch_cc;
+            g->throw_catch_base = saved_throw_cb;
             g->current_this = saved_this;
             g->current_type_sym = saved_type_sym;
             g->current_async_frame = saved_async_frame;
@@ -853,6 +922,7 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
             g->current_async_exc_bb = saved_exc_bb;
             g->current_async_rearm_switch = saved_rearm;
             g->current_async_handler_next = saved_handler_next;
+            g->current_async_foreach_next = saved_foreach_next;
 
             /* ---- cleanup: release owned rc slots from the frame, free it.
              * Mirrors the arc_owned marking above: by-value rc params (the
@@ -882,7 +952,8 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
                     emit_rc_release_for_type(g, pt, v);
                 }
                 for (int k = 0; k < work[w].alocal_count; k++) {
-                    if (!is_rc_managed_type(work[w].alocals[k].ztype) ||
+                    if (work[w].alocals[k].no_arc ||
+                        !is_rc_managed_type(work[w].alocals[k].ztype) ||
                         LLVMGetTypeKind(work[w].alocals[k].llvm) != LLVMPointerTypeKind)
                         continue;
                     LLVMValueRef sp = LLVMBuildStructGEP2(g->builder, frame_type, cframe,
@@ -935,6 +1006,12 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
         zan_ast_node_t *saved_fn_body = g->current_fn_body;
         g->current_fn = fn;
         g->current_fn_ret_type = llvm_ret;
+        int saved_throw_base = g->throw_locals_base;
+        int saved_catch_cc = g->catch_cleanup_count;
+        int saved_throw_cb = g->throw_catch_base;
+        g->throw_locals_base = 0;
+        g->catch_cleanup_count = 0;
+        g->throw_catch_base = 0;
         g->current_this = is_static ? NULL : this_alloca;
         g->current_type_sym = type_sym;
         g->current_fn_body = member->method_decl.body;
@@ -1014,6 +1091,9 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
 
         g->current_fn = saved_fn;
         g->current_fn_ret_type = saved_fn_ret;
+        g->throw_locals_base = saved_throw_base;
+        g->catch_cleanup_count = saved_catch_cc;
+        g->throw_catch_base = saved_throw_cb;
         g->current_this = saved_this;
         g->current_type_sym = saved_type_sym;
         g->current_fn_body = saved_fn_body;
@@ -1052,6 +1132,218 @@ static bool mspec_bind_worthwhile(zan_type_t **bind, int bindc) {
     return false;
 }
 
+/* ---- generic methods that reach into their own type parameters -----------
+ * `c.Name()` or `c.id` where `c` is declared with one of the method's own type
+ * parameters has no erased form: without a binding for T the member cannot be
+ * resolved, and the erased body silently fell through to a default value --
+ * miscompiled IR (`ret i32 0` out of a pointer-returning function), rejected
+ * by the LLVM verifier. Such a method is a pure template: no erased instance
+ * is emitted for it and every call site must monomorphize (A7-1). */
+
+typedef struct {
+    zan_ast_list_t *tps;
+    zan_istr_t      names[32];  /* locals/params whose declared type is a tp */
+    int             count;
+    zan_istr_t      fields[32]; /* fields of the enclosing type, declared as a tp */
+    int             field_count;
+    bool            found;
+} tp_use_scan_t;
+
+static bool tp_istr_eq(zan_istr_t a, zan_istr_t b) {
+    return a.len == b.len && a.str && b.str &&
+           memcmp(a.str, b.str, (size_t)a.len) == 0;
+}
+
+/* `T` / `T[]` / `List<T>`: a type reference that names a type parameter. */
+static bool tp_typeref_is_tp(tp_use_scan_t *s, zan_ast_node_t *tref) {
+    if (!tref || tref->kind != AST_TYPE_REF) return false;
+    for (int i = 0; i < s->tps->count; i++)
+        if (tp_istr_eq(s->tps->items[i]->ident.name, tref->type_ref.name))
+            return true;
+    return false;
+}
+
+static void tp_scan_bind(tp_use_scan_t *s, zan_istr_t name) {
+    if (s->count < (int)(sizeof(s->names) / sizeof(s->names[0])))
+        s->names[s->count++] = name;
+}
+
+static bool tp_scan_is_tp_field(tp_use_scan_t *s, zan_istr_t name) {
+    for (int i = 0; i < s->field_count; i++)
+        if (tp_istr_eq(s->fields[i], name)) return true;
+    return false;
+}
+
+/* `c` (a local/parameter of type T), `item` / `this.item` (a field of type T). */
+static bool tp_scan_is_tp_value(tp_use_scan_t *s, zan_ast_node_t *e) {
+    if (!e) return false;
+    if (e->kind == AST_IDENTIFIER) {
+        for (int i = 0; i < s->count; i++)
+            if (tp_istr_eq(s->names[i], e->ident.name)) return true;
+        return tp_scan_is_tp_field(s, e->ident.name);
+    }
+    if (e->kind == AST_MEMBER_ACCESS && e->member.object &&
+        e->member.object->kind == AST_THIS_EXPR)
+        return tp_scan_is_tp_field(s, e->member.name);
+    return false;
+}
+
+static void tp_scan_stmt(tp_use_scan_t *s, zan_ast_node_t *st);
+
+static void tp_scan_expr(tp_use_scan_t *s, zan_ast_node_t *e) {
+    if (!e || s->found) return;
+    switch (e->kind) {
+    case AST_MEMBER_ACCESS:
+        if (tp_scan_is_tp_value(s, e->member.object)) { s->found = true; return; }
+        tp_scan_expr(s, e->member.object);
+        return;
+    case AST_INDEX:
+        if (tp_scan_is_tp_value(s, e->index.object)) { s->found = true; return; }
+        tp_scan_expr(s, e->index.object);
+        tp_scan_expr(s, e->index.index);
+        return;
+    case AST_CALL:
+        tp_scan_expr(s, e->call.callee);
+        for (int i = 0; i < e->call.args.count; i++)
+            tp_scan_expr(s, e->call.args.items[i]);
+        return;
+    case AST_BINARY:
+    case AST_ASSIGNMENT:
+        tp_scan_expr(s, e->binary.left);
+        tp_scan_expr(s, e->binary.right);
+        return;
+    case AST_UNARY:
+    case AST_POSTFIX_UNARY: tp_scan_expr(s, e->unary.operand); return;
+    case AST_CONDITIONAL:
+        tp_scan_expr(s, e->conditional.cond);
+        tp_scan_expr(s, e->conditional.then_expr);
+        tp_scan_expr(s, e->conditional.else_expr);
+        return;
+    case AST_NEW_EXPR:
+        for (int i = 0; i < e->new_expr.args.count; i++)
+            tp_scan_expr(s, e->new_expr.args.items[i]);
+        return;
+    case AST_CAST_EXPR:  tp_scan_expr(s, e->cast.expr); return;
+    case AST_IS_EXPR:
+    case AST_AS_EXPR:    tp_scan_expr(s, e->type_test.expr); return;
+    case AST_AWAIT_EXPR: tp_scan_expr(s, e->await_expr.expr); return;
+    case AST_LAMBDA:     tp_scan_stmt(s, e->lambda.body); return;
+    case AST_STRING_INTERP:
+        for (int i = 0; i < e->string_interp.parts.count; i++)
+            tp_scan_expr(s, e->string_interp.parts.items[i]);
+        return;
+    default: return;
+    }
+}
+
+static void tp_scan_stmt(tp_use_scan_t *s, zan_ast_node_t *st) {
+    if (!st || s->found) return;
+    switch (st->kind) {
+    case AST_BLOCK:
+        for (int i = 0; i < st->block.stmts.count; i++)
+            tp_scan_stmt(s, st->block.stmts.items[i]);
+        return;
+    case AST_VAR_DECL:
+        if (tp_typeref_is_tp(s, st->var_decl.type)) tp_scan_bind(s, st->var_decl.name);
+        tp_scan_expr(s, st->var_decl.initializer);
+        return;
+    case AST_EXPR_STMT:   tp_scan_expr(s, st->expr_stmt.expr); return;
+    case AST_RETURN_STMT: tp_scan_expr(s, st->ret.value); return;
+    case AST_THROW_STMT:  tp_scan_expr(s, st->throw_stmt.value); return;
+    case AST_IF_STMT:
+        tp_scan_expr(s, st->if_stmt.cond);
+        tp_scan_stmt(s, st->if_stmt.then_body);
+        tp_scan_stmt(s, st->if_stmt.else_body);
+        return;
+    case AST_WHILE_STMT:
+    case AST_DO_WHILE_STMT:
+        tp_scan_expr(s, st->while_stmt.cond);
+        tp_scan_stmt(s, st->while_stmt.body);
+        return;
+    case AST_FOR_STMT:
+        tp_scan_stmt(s, st->for_stmt.init);
+        tp_scan_expr(s, st->for_stmt.cond);
+        tp_scan_stmt(s, st->for_stmt.step);
+        tp_scan_stmt(s, st->for_stmt.body);
+        return;
+    case AST_FOREACH_STMT:
+        if (tp_typeref_is_tp(s, st->foreach_stmt.var_type))
+            tp_scan_bind(s, st->foreach_stmt.var_name);
+        tp_scan_expr(s, st->foreach_stmt.collection);
+        tp_scan_stmt(s, st->foreach_stmt.body);
+        return;
+    case AST_TRY_STMT:
+        tp_scan_stmt(s, st->try_stmt.try_body);
+        for (int i = 0; i < st->try_stmt.catches.count; i++)
+            tp_scan_stmt(s, st->try_stmt.catches.items[i]->catch_clause.body);
+        tp_scan_stmt(s, st->try_stmt.finally_body);
+        return;
+    case AST_SWITCH_STMT:
+        tp_scan_expr(s, st->switch_stmt.expr);
+        for (int i = 0; i < st->switch_stmt.cases.count; i++)
+            tp_scan_stmt(s, st->switch_stmt.cases.items[i]->switch_case.body);
+        return;
+    case AST_LOCK_STMT:
+        tp_scan_expr(s, st->while_stmt.cond);
+        tp_scan_stmt(s, st->while_stmt.body);
+        return;
+    default:
+        tp_scan_expr(s, st);
+        return;
+    }
+}
+
+/* True when this generic method's body reaches through a value of one of its
+ * own type parameters, i.e. it only makes sense monomorphized. */
+static bool method_is_tp_template(zan_ast_node_t *member) {
+    if (!member || member->kind != AST_METHOD_DECL) return false;
+    zan_ast_list_t *tps = &member->method_decl.type_params;
+    if (tps->count == 0 || !member->method_decl.body) return false;
+    tp_use_scan_t s;
+    memset(&s, 0, sizeof(s));
+    s.tps = tps;
+    for (int i = 0; i < member->method_decl.params.count; i++) {
+        zan_ast_node_t *p = member->method_decl.params.items[i];
+        if (p && tp_typeref_is_tp(&s, p->param.type)) tp_scan_bind(&s, p->param.name);
+    }
+    if (s.count == 0) return false;
+    tp_scan_stmt(&s, member->method_decl.body);
+    return s.found;
+}
+
+/* Same question for a member of a generic *class*: does its body reach through
+ * a value of one of the class's type parameters (a T field, a T parameter, a T
+ * local)? The erased variant of such a body has nothing to resolve the member
+ * against, so only the per-instantiation variants are emittable. */
+static bool class_member_uses_tp(zan_ast_node_t *decl, zan_ast_node_t *member) {
+    if (!decl || !member) return false;
+    zan_ast_list_t *tps = &decl->type_decl.type_params;
+    if (tps->count == 0) return false;
+    zan_ast_node_t *body = NULL;
+    zan_ast_list_t *params = NULL;
+    if (member->kind == AST_METHOD_DECL || member->kind == AST_CONSTRUCTOR_DECL) {
+        body = member->method_decl.body;
+        params = &member->method_decl.params;
+    }
+    if (!body) return false;
+    tp_use_scan_t s;
+    memset(&s, 0, sizeof(s));
+    s.tps = tps;
+    for (int i = 0; i < decl->type_decl.members.count; i++) {
+        zan_ast_node_t *f = decl->type_decl.members.items[i];
+        if (f && f->kind == AST_FIELD_DECL && tp_typeref_is_tp(&s, f->field_decl.type) &&
+            s.field_count < (int)(sizeof(s.fields) / sizeof(s.fields[0])))
+            s.fields[s.field_count++] = f->field_decl.name;
+    }
+    for (int i = 0; params && i < params->count; i++) {
+        zan_ast_node_t *p = params->items[i];
+        if (p && tp_typeref_is_tp(&s, p->param.type)) tp_scan_bind(&s, p->param.name);
+    }
+    if (s.count == 0 && s.field_count == 0) return false;
+    tp_scan_stmt(&s, body);
+    return s.found;
+}
+
 static int get_or_create_method_spec(zan_irgen_t *g, zan_symbol_t *msym,
                                      zan_type_t **bind, int bindc) {
     if (!msym || !msym->decl || msym->decl->kind != AST_METHOD_DECL) return -1;
@@ -1064,7 +1356,9 @@ static int get_or_create_method_spec(zan_irgen_t *g, zan_symbol_t *msym,
     if (tps->count != bindc || bindc <= 0 || bindc > 8) return -1;
     for (int i = 0; i < bindc; i++)
         if (!bind[i] || !type_is_concrete(bind[i])) return -1;
-    if (!mspec_bind_worthwhile(bind, bindc)) return -1;
+    /* a body that reaches into T has no erased fallback to defer to */
+    if (!method_is_tp_template(member) && !mspec_bind_worthwhile(bind, bindc))
+        return -1;
     zan_symbol_t *type_sym = msym->parent;
     if (!type_sym ||
         (type_sym->kind != SYM_CLASS && type_sym->kind != SYM_STRUCT))
@@ -1188,6 +1482,12 @@ static void emit_method_spec_body(zan_irgen_t *g, int idx) {
     zan_ast_node_t *saved_fn_body = g->current_fn_body;
     g->current_fn = sp.fn;
     g->current_fn_ret_type = llvm_ret;
+    int saved_throw_base = g->throw_locals_base;
+    int saved_catch_cc = g->catch_cleanup_count;
+    int saved_throw_cb = g->throw_catch_base;
+    g->throw_locals_base = 0;
+    g->catch_cleanup_count = 0;
+    g->throw_catch_base = 0;
     g->current_this = NULL;
     g->current_type_sym = sp.type_sym;
     g->current_fn_body = member->method_decl.body;
@@ -1228,6 +1528,9 @@ static void emit_method_spec_body(zan_irgen_t *g, int idx) {
 
     g->current_fn = saved_fn;
     g->current_fn_ret_type = saved_fn_ret;
+    g->throw_locals_base = saved_throw_base;
+    g->catch_cleanup_count = saved_catch_cc;
+    g->throw_catch_base = saved_throw_cb;
     g->current_this = saved_this;
     g->current_type_sym = saved_type_sym;
     g->current_fn_body = saved_fn_body;

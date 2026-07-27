@@ -396,7 +396,17 @@ static void anf_normalize_stmt(zan_irgen_t *g, zan_ast_node_t *st,
     anf_ctx_t c = { g, dst, counter };
     switch (st->kind) {
     case AST_VAR_DECL:
-        st->var_decl.initializer = anf_expr(&c, st->var_decl.initializer);
+        /* `T x = await E;` is already at statement position: keep the await
+         * as the initializer instead of hoisting it into an `int $awN` temp,
+         * which would erase its result type -- an inferred declaration
+         * (`var s = await Echo()`) would then hold a string as an integer. */
+        if (st->var_decl.initializer &&
+            st->var_decl.initializer->kind == AST_AWAIT_EXPR) {
+            st->var_decl.initializer->await_expr.expr =
+                anf_expr(&c, st->var_decl.initializer->await_expr.expr);
+        } else {
+            st->var_decl.initializer = anf_expr(&c, st->var_decl.initializer);
+        }
         break;
     case AST_EXPR_STMT:
         /* A bare `await E;` is already at statement position, so keep the await
@@ -476,6 +486,10 @@ typedef struct {
     LLVMTypeRef  llvm;        /* slot element type */
     zan_type_t  *ztype;      /* zan type (for identifier load typing) */
     int          frame_index;
+    /* storage-only slot: the frame preserves the bits across suspensions but
+     * does not own the value. A `foreach` loop variable borrows its element
+     * from the collection, so the coroutine's cleanup must not release it. */
+    bool         no_arc;
 } async_local_t;
 
 typedef struct {
@@ -484,6 +498,12 @@ typedef struct {
     async_local_t *locals;
     int            local_count;
     int            local_cap;
+    /* Types of the locals seen so far, so a `var` declaration's type can be
+     * inferred here exactly as it will be at emit time. Alloca-less: only the
+     * `type` field is read (by infer_expr_type). */
+    local_scope_t *scope;
+    /* id of the next `foreach`, in the same AST order the emitter walks */
+    int            foreach_next;
 } async_scan_t;
 
 static bool async_type_is_scalar(LLVMTypeRef t) {
@@ -530,7 +550,30 @@ static void async_scan_add_local(async_scan_t *s, zan_istr_t name, LLVMTypeRef l
     s->locals[s->local_count].llvm = llvm;
     s->locals[s->local_count].ztype = zt;
     s->locals[s->local_count].frame_index = -1;
+    s->locals[s->local_count].no_arc = false;
     s->local_count++;
+}
+
+/* A compiler-generated frame local. The `$` keeps it out of the identifier
+ * namespace, so it can never collide with (or shadow) a user local. */
+static zan_istr_t async_synth_name(zan_irgen_t *g, const char *prefix, int n) {
+    char buf[32];
+    int len = snprintf(buf, sizeof(buf), "$%s%d", prefix, n);
+    char *p = (char *)zan_arena_alloc(g->arena, (size_t)len + 1);
+    memcpy(p, buf, (size_t)len + 1);
+    zan_istr_t s = { p, (uint32_t)len };
+    return s;
+}
+
+static void async_scan_add_storage_local(async_scan_t *s, zan_istr_t name,
+                                         LLVMTypeRef llvm) {
+    async_scan_add_local(s, name, llvm, NULL);
+    if (s->local_count > 0) s->locals[s->local_count - 1].no_arc = true;
+}
+
+/* Record a local's type for the scan's own inference (no storage yet). */
+static void async_scan_note_type(async_scan_t *s, zan_istr_t name, zan_type_t *t) {
+    if (s->scope && t) local_add(s->scope, name, NULL, t);
 }
 
 /* Walk expressions to count await points (state-machine transitions). */
@@ -592,17 +635,25 @@ static void async_scan_stmt(async_scan_t *s, zan_ast_node_t *st) {
         for (int i = 0; i < st->block.stmts.count; i++)
             async_scan_stmt(s, st->block.stmts.items[i]);
         break;
-    case AST_VAR_DECL:
-        if (st->var_decl.type) {
-            zan_type_t *t = zan_binder_resolve_type(s->g->binder, st->var_decl.type);
-            if (t) {
-                LLVMTypeRef lt = map_type(s->g, t);
-                if (async_type_is_frame_resident(lt))
-                    async_scan_add_local(s, st->var_decl.name, lt, t);
-            }
+    case AST_VAR_DECL: {
+        /* `var x = e` must reach the frame just like `T x = e`: infer its type
+         * here with the same inference the emitter uses. Skipping inferred
+         * declarations left them stack-only, so their value was garbage after
+         * any suspension. */
+        zan_type_t *t = st->var_decl.type
+            ? zan_binder_resolve_type(s->g->binder, st->var_decl.type)
+            : NULL;
+        if ((!t || t->kind == TYPE_ERROR) && st->var_decl.initializer)
+            t = infer_expr_type(s->g, st->var_decl.initializer, s->scope);
+        if (t && t->kind != TYPE_ERROR) {
+            LLVMTypeRef lt = map_type(s->g, t);
+            if (async_type_is_frame_resident(lt))
+                async_scan_add_local(s, st->var_decl.name, lt, t);
+            async_scan_note_type(s, st->var_decl.name, t);
         }
         async_scan_expr(s, st->var_decl.initializer);
         break;
+    }
     case AST_EXPR_STMT:
         async_scan_expr(s, st->expr_stmt.expr);
         break;
@@ -625,17 +676,53 @@ static void async_scan_stmt(async_scan_t *s, zan_ast_node_t *st) {
         async_scan_expr(s, st->for_stmt.step);
         async_scan_stmt(s, st->for_stmt.body);
         break;
-    case AST_FOREACH_STMT:
+    case AST_FOREACH_STMT: {
         async_scan_expr(s, st->foreach_stmt.collection);
+        /* A `foreach` resumed inside its body re-enters at a block the loop
+         * pre-header never reaches, so the whole iteration state -- element,
+         * index and collection -- lives in the frame. The collection itself is
+         * kept (rather than the data/count pair derived from it) so every
+         * iteration reloads them from the live list. */
+        int fe_id = s->foreach_next++;
+        zan_type_t *et = st->foreach_stmt.var_type
+            ? zan_binder_resolve_type(s->g->binder, st->foreach_stmt.var_type)
+            : NULL;
+        if (!et || et->kind == TYPE_ERROR)
+            et = container_elem_type(
+                infer_expr_type(s->g, st->foreach_stmt.collection, s->scope));
+        if (et && et->kind != TYPE_ERROR) {
+            LLVMTypeRef lt = map_type(s->g, et);
+            /* the element is borrowed from the collection: storage only */
+            if (async_type_is_frame_resident(lt))
+                async_scan_add_storage_local(s, st->foreach_stmt.var_name, lt);
+            async_scan_note_type(s, st->foreach_stmt.var_name, et);
+        }
+        async_scan_add_storage_local(s, async_synth_name(s->g, "fe.i", fe_id),
+            LLVMInt64TypeInContext(s->g->ctx));
+        async_scan_add_storage_local(s, async_synth_name(s->g, "fe.c", fe_id),
+            LLVMPointerType(LLVMInt8TypeInContext(s->g->ctx), 0));
         async_scan_stmt(s, st->foreach_stmt.body);
         break;
+    }
     case AST_THROW_STMT:
         async_scan_expr(s, st->throw_stmt.value);
         break;
     case AST_TRY_STMT:
         async_scan_stmt(s, st->try_stmt.try_body);
-        for (int i = 0; i < st->try_stmt.catches.count; i++)
-            async_scan_stmt(s, st->try_stmt.catches.items[i]->catch_clause.body);
+        for (int i = 0; i < st->try_stmt.catches.count; i++) {
+            zan_ast_node_t *cc = st->try_stmt.catches.items[i];
+            /* the caught exception binding outlives an await in the handler,
+             * so it is frame-resident too; the frame's per-handler exception
+             * slot owns the object, this binding only borrows it */
+            if (cc->catch_clause.var_name.len > 0) {
+                async_scan_add_storage_local(s, cc->catch_clause.var_name,
+                    LLVMPointerType(LLVMInt8TypeInContext(s->g->ctx), 0));
+                if (cc->catch_clause.type)
+                    async_scan_note_type(s, cc->catch_clause.var_name,
+                        zan_binder_resolve_type(s->g->binder, cc->catch_clause.type));
+            }
+            async_scan_stmt(s, cc->catch_clause.body);
+        }
         async_scan_stmt(s, st->try_stmt.finally_body);
         break;
     case AST_SWITCH_STMT:
@@ -883,6 +970,40 @@ static void emit_async_eh_prologue(zan_irgen_t *g) {
     /* a re-armed handler caught: hand control to that try's catch (the cases
      * are added by the try lowering, which owns the catch blocks) */
     LLVMPositionBuilderAtEnd(g->builder, land_bb);
+    {
+        /* Which of the re-armed handlers was jumped to: a thrower longjmps to
+         * bufs[__zan_eh_top], and handler k of this invocation was armed at
+         * entry + 2 + k (entry + 1 is the trampoline). id_slot still holds the
+         * id armed *last*, which is the innermost handler -- dispatching on it
+         * would send an exception raised inside a catch body back into the try
+         * it just left. Recover k from the top instead, and truncate the
+         * handler count so the handlers armed inside the one that caught are
+         * dropped (the catch entry pops the catching handler itself). */
+        LLVMValueRef t = LLVMBuildLoad2(g->builder, i32, top_g, "eh.land.top");
+        LLVMValueRef e = LLVMBuildLoad2(g->builder, i32, entry_slot, "eh.land.entry");
+        LLVMValueRef k = LLVMBuildSub(g->builder,
+            LLVMBuildSub(g->builder, t, e, "eh.land.d"),
+            LLVMConstInt(i32, 2, 0), "eh.land.k");
+        LLVMValueRef ok = LLVMBuildAnd(g->builder,
+            LLVMBuildICmp(g->builder, LLVMIntSGE, k, zero, "eh.land.lo"),
+            LLVMBuildICmp(g->builder, LLVMIntSLT, k,
+                LLVMConstInt(i32, ASYNC_MAX_HANDLERS, 0), "eh.land.hi"),
+            "eh.land.ok");
+        LLVMValueRef ksafe = LLVMBuildSelect(g->builder, ok, k, zero, "eh.land.ks");
+        LLVMBuildStore(g->builder, ksafe, idx_slot);
+        LLVMValueRef hs = LLVMBuildStructGEP2(g->builder, ft, frame,
+            ASYNC_FRAME_HSTACK, "hs.l");
+        LLVMValueRef hs_idx[2] = { zero, ksafe };
+        LLVMValueRef slot = LLVMBuildGEP2(g->builder,
+            LLVMArrayType(i32, ASYNC_MAX_HANDLERS), hs, hs_idx, 2, "hs.lslot");
+        LLVMValueRef id = LLVMBuildSelect(g->builder, ok,
+            LLVMBuildLoad2(g->builder, i32, slot, "hs.lid"),
+            LLVMConstInt(i32, -1, 1), "eh.land.id");
+        LLVMBuildStore(g->builder, id, id_slot);
+        LLVMBuildStore(g->builder,
+            LLVMBuildAdd(g->builder, ksafe, LLVMConstInt(i32, 1, 0), "eh.land.hc"),
+            LLVMBuildStructGEP2(g->builder, ft, frame, ASYNC_FRAME_HCOUNT, "hc.l"));
+    }
     emit_async_reload_slots(g);
     g->current_async_rearm_switch = LLVMBuildSwitch(g->builder,
         LLVMBuildLoad2(g->builder, i32, id_slot, "eh.id"), exc_bb,

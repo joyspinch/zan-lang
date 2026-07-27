@@ -8,6 +8,10 @@
 
 /* ---- expression codegen ---- */
 
+/* defined in later-included parts of this translation unit */
+static zan_type_t *subst_type_param(zan_type_t *t, zan_type_t *recv);
+static zan_type_t *concretize(zan_irgen_t *g, zan_type_t *t);
+
 static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_t *locals);
 static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *locals);
 /* Emit a lambda literal, typing its parameters/return from `expected` (the
@@ -54,7 +58,16 @@ enum {
                                    * handlers this frame has armed, innermost
                                    * last -- re-armed at each resume (see
                                    * emit_async_eh_prologue) */
-    ASYNC_FRAME_FIRST_PARAM = 12
+    ASYNC_FRAME_CEXC = 12,        /* [ASYNC_MAX_HANDLERS x i8*]: the exception each
+                                   * open catch is currently handling, indexed by
+                                   * the try's compile-time handler id. Frame- (not
+                                   * stack-) resident because an await inside a
+                                   * catch body returns from this $resume
+                                   * invocation: its allocas are garbage when the
+                                   * catch epilogue resumes and releases. */
+    ASYNC_FRAME_CEXC_OWNED = 13,  /* [ASYNC_MAX_HANDLERS x i32]: whether that
+                                   * exception carries the in-flight +1 */
+    ASYNC_FRAME_FIRST_PARAM = 14
 };
 static LLVMValueRef coerce_to_i64(zan_irgen_t *g, LLVMValueRef v);
 static void emit_async_save_slots(zan_irgen_t *g);
@@ -81,6 +94,56 @@ static zan_ast_node_t *name_path_head(zan_ast_node_t *node) {
 /* Resolve the declared type of an `obj.field` member access so that element
  * indexing on struct/class array fields (e.g. `b.data[i]`) can determine the
  * element LLVM type. Returns NULL when the field/type cannot be resolved. */
+/* ---- C# conversion rules: report silent narrowing (A0) ----
+ *
+ * C# only converts implicitly when the destination can hold every value of
+ * the source: `int -> long` / `int -> nint` are implicit, `long -> int` and
+ * `nint -> int` need an explicit cast. Zan truncates silently instead, which
+ * is invisible today (every integer is stored as i64) but starts dropping the
+ * high half of every handle the moment `int` becomes 32 bits. Reporting it
+ * now is what turns "carrier variables typed `int`" from an invisible hazard
+ * into a compile-time list.
+ *
+ * Opt-in (`ZAN_WARN_NARROW=1`) while the stdlib is migrated; it becomes an
+ * error by default in the same change that makes `int` 32-bit. */
+static int conv_rank(zan_type_t *t) {
+    if (!t) return 0;
+    switch (t->kind) {
+    case TYPE_SBYTE: case TYPE_BYTE: case TYPE_CHAR: return 1;
+    case TYPE_SHORT: case TYPE_USHORT: return 2;
+    case TYPE_INT: case TYPE_UINT: return 4;
+    case TYPE_LONG: case TYPE_ULONG: return 8;
+    case TYPE_NINT: return 8;
+    default: return 0;
+    }
+}
+
+static bool narrow_warn_enabled(void) {
+    static int state = -1;
+    if (state < 0) state = getenv("ZAN_WARN_NARROW") ? 1 : 0;
+    return state == 1;
+}
+
+static void warn_narrowing(zan_irgen_t *g, zan_type_t *dst, zan_type_t *src,
+                           zan_ast_node_t *at, const char *what) {
+    if (!narrow_warn_enabled() || !g || !g->diag || !at) return;
+    if (!dst || !src) return;
+    int rd = conv_rank(dst), rs = conv_rank(src);
+    bool src_float = src->kind == TYPE_FLOAT || src->kind == TYPE_DOUBLE;
+    if (!rd) return;
+    if (!rs && !src_float) return;
+    /* nint keeps its own identity: it is pointer-width, so narrowing it to a
+     * fixed 32-bit `int` is a loss even while both are stored as i64. */
+    bool loses = src_float || rs > rd ||
+                 (src->kind == TYPE_NINT && dst->kind != TYPE_NINT && rd < 8);
+    if (!loses) return;
+    zan_diag_emit(g->diag, DIAG_WARNING, at->loc,
+                  "narrowing conversion from '%s' to '%s' in %s needs an "
+                  "explicit cast (C# rules)",
+                  src->name.str ? src->name.str : "?",
+                  dst->name.str ? dst->name.str : "?", what);
+}
+
 static zan_type_t *infer_expr_type(zan_irgen_t *g, zan_ast_node_t *e, local_scope_t *locals);
 
 static zan_type_t *member_access_field_type(zan_irgen_t *g, local_scope_t *locals, zan_ast_node_t *member) {
@@ -502,6 +565,16 @@ static zan_type_t *infer_expr_type(zan_irgen_t *g, zan_ast_node_t *e,
      * no receiver type and silently lowered to a constant. */
     case AST_STRING_LITERAL:
         return g->binder ? g->binder->type_string : NULL;
+    /* Other literals are just as typed: an inferred declaration (`var n = 5`)
+     * needs them to reach a type at all. */
+    case AST_INT_LITERAL:
+        return g->binder ? g->binder->type_int : NULL;
+    case AST_FLOAT_LITERAL:
+        return g->binder ? g->binder->type_double : NULL;
+    case AST_CHAR_LITERAL:
+        return g->binder ? g->binder->type_char : NULL;
+    case AST_BOOL_LITERAL:
+        return g->binder ? g->binder->type_bool : NULL;
     case AST_IDENTIFIER: {
         local_var_t *l = local_find(locals, e->ident.name);
         if (l) return l->type;
@@ -555,7 +628,13 @@ static zan_type_t *infer_expr_type(zan_irgen_t *g, zan_ast_node_t *e,
         }
         if (ot && ot->sym) {
             zan_symbol_t *fs = get_field_sym(ot->sym, e->member.name);
-            if (fs) return fs->type;
+            if (fs) {
+                /* a field declared as a type parameter has the receiver's
+                 * concrete type argument here: Pool<Conn>.item is a Conn */
+                zan_type_t *ft = subst_type_param(fs->type, ot);
+                if (ft && ft->kind == TYPE_TYPE_PARAM) ft = concretize(g, ft);
+                return ft;
+            }
         }
         return NULL;
     }
@@ -675,8 +754,17 @@ static zan_type_t *infer_expr_type(zan_irgen_t *g, zan_ast_node_t *e,
             zan_type_t *rt = infer_expr_type(g, e->binary.right, locals);
             if ((lt && lt->kind == TYPE_ULONG) || (rt && rt->kind == TYPE_ULONG))
                 return g->binder->type_ulong;
+            /* otherwise the result keeps the operand type when both agree
+             * (or only one is known) -- enough to type `var d = a * b` */
+            if (lt && rt && lt->kind == rt->kind) return lt;
+            if (lt && !rt) return lt;
+            if (rt && !lt) return rt;
             return NULL;
         }
+        case TK_EQ_EQ: case TK_BANG_EQ: case TK_LESS:
+        case TK_LESS_EQ: case TK_GREATER: case TK_GREATER_EQ:
+        case TK_AMP_AMP: case TK_PIPE_PIPE:
+            return g->binder ? g->binder->type_bool : NULL;
         default:
             return NULL;
         }

@@ -33,12 +33,6 @@ if ($LASTEXITCODE -ne 0) { Write-Output "RUNTIME_COMPILE_FAILED"; exit 1 }
 llvm-ar rcs build\libzan_gui_ide_gnu.a build\zan_gui_ide_gnu.o
 if ($LASTEXITCODE -ne 0) { Write-Output "RUNTIME_LIB_FAILED"; exit 1 }
 
-# ---- application icon resource --------------------------------------------
-# Compiled to a COFF object with windres so the bundled GNU ld can link it
-# (GNU ld cannot consume a .res directly).
-Write-Output "Compiling application icon (assets\zan.rc -> build\zan_icon.o) ..."
-windres assets\zan.rc -O coff -o build\zan_icon.o "--include-dir=assets"
-if ($LASTEXITCODE -ne 0) { Write-Output "ICON_RC_FAILED"; exit 1 }
 
 $registryPath = Join-Path $root "stdlib\Gui\CustomComponents.zan"
 $registryOriginal = [System.IO.File]::ReadAllText($registryPath)
@@ -80,7 +74,7 @@ try {
     $zanArgs += @("--link-lib", "ws2_32", "--link-lib", "mswsock")
     $zanArgs += @("--link-lib", "psapi", "--link-lib", "advapi32")
     $zanArgs += @("--link-lib", "dwmapi", "--link-lib", "gdi32", "--link-lib", "imm32")
-    $zanArgs += @("--link-input", (Join-Path (Get-Location) "build\zan_icon.o"))
+    $zanArgs += @("--icon", (Join-Path (Get-Location) "assets\zan.ico"))
     $out = & build\zanc.exe @zanArgs 2>&1
     $code = $LASTEXITCODE
     if ($code -ne 0) {

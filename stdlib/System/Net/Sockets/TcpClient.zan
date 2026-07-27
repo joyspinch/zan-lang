@@ -7,7 +7,7 @@ namespace System.Net.Sockets;
 /// TCP client with send/receive operations built on Socket layer.
 /// </summary>
 class TcpClient {
-    int sock;
+    nint sock;
     string host;
     int port;
     bool connected;
@@ -34,12 +34,12 @@ class TcpClient {
 
     /// <summary>Returns the underlying socket handle (e.g. to wrap the
     /// connection in a TlsStream).</summary>
-    int Sock() {
+    nint Sock() {
         return this.sock;
     }
 
     /// <summary>Creates a TcpClient from an already-connected socket.</summary>
-    static TcpClient FromSocket(int sock) {
+    static TcpClient FromSocket(nint sock) {
         TcpClient client = new TcpClient();
         client.sock = sock;
         client.connected = true;
@@ -64,6 +64,45 @@ class TcpClient {
         }
         client.connected = true;
         return client;
+    }
+
+    /// <summary>ConnectAsync bounded by <paramref name="timeoutMs"/>: returns
+    /// null when the connection fails or is still pending when the deadline
+    /// passes (LastConnectTimedOut tells the two apart). A non-positive timeout
+    /// means "no deadline".</summary>
+    static async TcpClient ConnectAsync(string host, int port, int timeoutMs) {
+        Socket.Initialize();
+        TcpClient client = new TcpClient();
+        client.host = host;
+        client.port = port;
+        client.sock = Socket.CreateTcp();
+        Socket.SetNonBlocking(client.sock);
+        TcpClient.MarkConnectTimeout(false);
+        int err = await Socket.ConnectAsync(client.sock, host, port, timeoutMs);
+        if (err != 0) {
+            // The socket is still mid-connect on timeout; closing it aborts the
+            // pending handshake so no descriptor (or SYN retry) is left behind.
+            Socket.Close(client.sock);
+            client.sock = -1;
+            TcpClient.MarkConnectTimeout(err == -3);
+            return null;
+        }
+        client.connected = true;
+        return client;
+    }
+
+    /// <summary>True when the last ConnectAsync on this thread gave up on its
+    /// deadline rather than being refused. Written through a synchronous helper
+    /// because a static assigned inside an async method is captured by value
+    /// there and the update would never reach the caller.</summary>
+    static bool LastConnectTimedOut() {
+        return TcpClient.connectTimedOut;
+    }
+
+    static bool connectTimedOut = false;
+
+    static void MarkConnectTimeout(bool timedOut) {
+        TcpClient.connectTimedOut = timedOut;
     }
 
     /// <summary>Connects to a remote host synchronously.</summary>
@@ -158,7 +197,7 @@ class TcpClient {
     }
 
     /// <summary>Gets the underlying socket handle.</summary>
-    int GetSocket() {
+    nint GetSocket() {
         return this.sock;
     }
 

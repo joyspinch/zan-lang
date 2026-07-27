@@ -1,0 +1,87 @@
+// Conformance: HttpClient's request deadline and status-line reporting.
+//
+// A peer that accepts the connection and then goes quiet used to park the
+// calling coroutine forever -- SetTimeout only stored a number. The deadline is
+// now enforced by the HttpDeadline sweeper, which hangs the socket up so the
+// read loop wakes and the client reports the timeout. The sweeper ticks once a
+// second, so a 1s timeout is expected to fire within a few seconds, not never.
+using System;
+using System.Net.Sockets;
+using System.Net.Http;
+using System.Net.Http.Client;
+using System.Threading;
+
+class Program {
+    static int PORT = 54391;
+
+    static async HttpResponse Handle(HttpRequest req) {
+        if (req.path == "/slow") {
+            // Outlives the client's 1s deadline, but not the test: the handler
+            // has to finish for the scheduler to drain and the process to exit,
+            // and its answer then goes to a socket the sweeper already hung up.
+            await Task.Delay(3000);
+            return HttpResponse.Text("too late");
+        }
+        if (req.path == "/bad-gateway") {
+            HttpResponse resp = HttpResponse.Text("upstream is down");
+            resp.statusCode = 502;
+            resp.statusText = "Bad Gateway";
+            return resp;
+        }
+        return HttpResponse.Text("ok");
+    }
+
+    static async int Run() {
+        Socket.Initialize();
+        HttpServer server = HttpServer.Create("127.0.0.1", PORT);
+        server.OnRequest(Handle);
+        Task.Spawn(server.Start());
+        await Task.Delay(50);
+
+        // --- the status line is visible, not swallowed with the body ---
+        HttpClient client = HttpClient.Create("127.0.0.1", PORT);
+        HttpResponse ok = await client.SendAsync("GET", "/", "");
+        Console.WriteLine("okStatus=" + Convert.ToString(ok.statusCode) + " body=" + ok.body);
+
+        HttpResponse bad = await client.SendAsync("GET", "/bad-gateway", "");
+        Console.WriteLine("badStatus=" + Convert.ToString(bad.statusCode)
+            + " text=" + bad.statusText + " body=" + bad.body);
+
+        // The verb helpers still hand back only the body, so a 502 page reads
+        // like a payload -- which is exactly why SendAsync exists.
+        string bodyOnly = await client.GetAsync("/bad-gateway");
+        Console.WriteLine("bodyOnly=" + bodyOnly);
+
+        // --- a silent peer is abandoned at the deadline instead of hanging ---
+        HttpClient slow = HttpClient.Create("127.0.0.1", PORT);
+        slow.SetTimeout(1000);
+        int t0 = Stopwatch.GetMilliseconds();
+        try {
+            string _never = await slow.GetAsync("/slow");
+            Console.WriteLine("slow=NOT THROWN");
+        } catch (HttpRequestException e) {
+            if (e.Message.IndexOf("timed out") >= 0) {
+                Console.WriteLine("slowTimedOut=yes");
+            } else {
+                Console.WriteLine("slowTimedOut=no msg=" + e.Message);
+            }
+        }
+        int elapsed = Stopwatch.GetMilliseconds() - t0;
+        if (elapsed < 15000) {
+            Console.WriteLine("slowBounded=yes");
+        } else {
+            Console.WriteLine("slowBounded=no ms=" + Convert.ToString(elapsed));
+        }
+
+        // --- the client survives its own timeout: next call still works ---
+        string after = await client.GetAsync("/");
+        Console.WriteLine("after=" + after);
+
+        server.Stop();
+        return 0;
+    }
+
+    static async void Main() {
+        int _rc = await Run();
+    }
+}

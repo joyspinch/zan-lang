@@ -16,7 +16,7 @@
  * stubs are compiled out there too. */
 #if !defined(_WIN32) && !defined(__linux__) && !defined(ZAN_GUI_COCOA) && !defined(ZAN_GUI_SDL)
 
-EXPORT i64 zan_gui_create_window(const char *t, i64 w, i64 h) { (void)t;(void)w;(void)h; return 0; }
+EXPORT iptr zan_gui_create_window(const char *t, i64 w, i64 h) { (void)t;(void)w;(void)h; return 0; }
 EXPORT i64 zan_gui_show_window(i64 h) { (void)h; return 0; }
 EXPORT i64 zan_gui_wait_event(void) { return -1; }
 EXPORT i64 zan_gui_wait_event_timeout(i64 ms) { (void)ms; return -1; }
@@ -30,7 +30,7 @@ EXPORT i64 zan_gui_event_keycode(void) { return 0; }
 EXPORT i64 zan_gui_event_mods(void) { return 0; }
 EXPORT i64 zan_gui_window_width(void) { return 0; }
 EXPORT i64 zan_gui_window_height(void) { return 0; }
-EXPORT i64 zan_gui_event_hwnd(void) { return 0; }
+EXPORT iptr zan_gui_event_hwnd(void) { return 0; }
 EXPORT i64 zan_gui_client_width(i64 h) { (void)h; return 0; }
 EXPORT i64 zan_gui_client_height(i64 h) { (void)h; return 0; }
 EXPORT i64 zan_gui_present(i64 h, i64 s) { (void)h;(void)s; return 1; }
@@ -52,7 +52,7 @@ EXPORT void zan_gui_sleep_ms(i64 ms) { (void)ms; }
 #if !defined(_WIN32) && !defined(__linux__) && !defined(ZAN_GUI_COCOA) && !defined(ZAN_GUI_SDL)
 EXPORT i64 zan_gui_caption_button_width(void) { return 0; }
 EXPORT i64 zan_gui_titlebar_height(void) { return 0; }
-EXPORT i64 zan_gui_set_caption_buttons(i64 hwnd_val, i64 count) { (void)hwnd_val; (void)count; return 0; }
+EXPORT i64 zan_gui_set_caption_buttons(iptr hwnd_val, i64 count) { (void)hwnd_val; (void)count; return 0; }
 #endif
 
 /* write_file is portable across every non-Win32 backend (X11, Cocoa and the
@@ -73,11 +73,11 @@ EXPORT i64 zan_gui_write_file(const char *path, const char *utf8) {
  * their own sections; any other target links a no-op so the cross-platform
  * Gui.Native.Window.EnableGlass entry points resolve everywhere. */
 #if !defined(_WIN32) && !defined(__linux__) && !defined(ZAN_GUI_COCOA) && !defined(ZAN_GUI_SDL)
-EXPORT i64 zan_gui_enable_glass(i64 hwnd_val, i64 tint_argb) {
+EXPORT i64 zan_gui_enable_glass(iptr hwnd_val, i64 tint_argb) {
     (void)hwnd_val; (void)tint_argb; return 1;
 }
-EXPORT i64 zan_gui_disable_glass(i64 hwnd_val) { (void)hwnd_val; return 1; }
-EXPORT i64 zan_gui_set_opacity(i64 hwnd_val, i64 percent) {
+EXPORT i64 zan_gui_disable_glass(iptr hwnd_val) { (void)hwnd_val; return 1; }
+EXPORT i64 zan_gui_set_opacity(iptr hwnd_val, i64 percent) {
     (void)hwnd_val; (void)percent; return 1;
 }
 #endif
@@ -87,14 +87,14 @@ EXPORT i64 zan_gui_set_opacity(i64 hwnd_val, i64 percent) {
  * non-Windows target falls back to no-ops. */
 #if !defined(_WIN32) && !defined(__linux__) && !defined(ZAN_GUI_COCOA) && !defined(ZAN_GUI_SDL)
 EXPORT i64 zan_gui_get_dpi_scale(void) { return 100; }
-EXPORT i64 zan_gui_close_window(i64 hwnd_val) { (void)hwnd_val; return 0; }
-EXPORT i64 zan_gui_destroy_window(i64 hwnd_val) { (void)hwnd_val; return 0; }
-EXPORT i64 zan_gui_minimize(i64 hwnd_val) { (void)hwnd_val; return 0; }
-EXPORT i64 zan_gui_toggle_maximize(i64 hwnd_val) { (void)hwnd_val; return 0; }
-EXPORT i64 zan_gui_is_maximized(i64 hwnd_val) { (void)hwnd_val; return 0; }
-EXPORT i64 zan_gui_window_visible(i64 hwnd_val) { (void)hwnd_val; return 1; }
-EXPORT i64 zan_gui_window_focused(i64 hwnd_val) { (void)hwnd_val; return 1; }
-EXPORT i64 zan_gui_set_topmost(i64 hwnd_val, i64 on) { (void)hwnd_val; (void)on; return 0; }
+EXPORT i64 zan_gui_close_window(iptr hwnd_val) { (void)hwnd_val; return 0; }
+EXPORT i64 zan_gui_destroy_window(iptr hwnd_val) { (void)hwnd_val; return 0; }
+EXPORT i64 zan_gui_minimize(iptr hwnd_val) { (void)hwnd_val; return 0; }
+EXPORT i64 zan_gui_toggle_maximize(iptr hwnd_val) { (void)hwnd_val; return 0; }
+EXPORT i64 zan_gui_is_maximized(iptr hwnd_val) { (void)hwnd_val; return 0; }
+EXPORT i64 zan_gui_window_visible(iptr hwnd_val) { (void)hwnd_val; return 1; }
+EXPORT i64 zan_gui_window_focused(iptr hwnd_val) { (void)hwnd_val; return 1; }
+EXPORT i64 zan_gui_set_topmost(iptr hwnd_val, i64 on) { (void)hwnd_val; (void)on; return 0; }
 EXPORT i64 zan_gui_set_clipboard(const char *utf8) { (void)utf8; return 0; }
 EXPORT const char *zan_gui_get_clipboard(void) { return ""; }
 EXPORT void zan_gui_set_ime_pos(i64 x, i64 y) { (void)x; (void)y; }
@@ -118,7 +118,7 @@ EXPORT void zan_gui_set_ime_pos(i64 x, i64 y) { (void)x; (void)y; }
  * real backend is added here it should map profile_id to that engine's data
  * partitioning -- on Linux a WebKitGTK WebKitWebsiteDataManager with a
  * per-profile base data/cache directory. Until then it is a no-op stub. */
-EXPORT i64 zan_gui_webview_create(i64 hwnd, const char *profile_id) {
+EXPORT i64 zan_gui_webview_create(iptr hwnd, const char *profile_id) {
     (void)hwnd; (void)profile_id; return 0;
 }
 EXPORT void zan_gui_webview_destroy(i64 h) { (void)h; }
