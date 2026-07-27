@@ -900,6 +900,26 @@ static bool class_implements_iface(zan_symbol_t *cls, zan_symbol_t *iface) {
     return false;
 }
 
+/* True when the program (or the stdlib it was compiled with) declares a type
+ * with this name that itself defines the method. irgen lowers a handful of
+ * static library calls itself, which silently shadows the Zan implementation
+ * of the same API -- the Zan one then cannot be fixed or even reached. Where
+ * a real definition exists it wins, and the built-in lowering stays as the
+ * fallback for programs compiled without the stdlib. */
+static zan_symbol_t *get_method_sym(zan_symbol_t *cls, zan_istr_t name);
+
+static bool zan_type_defines(zan_irgen_t *g, const char *type_name,
+                             const char *method) {
+    if (!g || !g->binder) return false;
+    zan_istr_t tn = { (char *)type_name, (uint32_t)strlen(type_name) };
+    zan_symbol_t *sym = zan_binder_lookup(g->binder, tn);
+    if (!sym || !sym->type) return false;
+    if (sym->type->kind != TYPE_CLASS && sym->type->kind != TYPE_STRUCT)
+        return false;
+    zan_istr_t mn = { (char *)method, (uint32_t)strlen(method) };
+    return get_method_sym(sym, mn) != NULL;
+}
+
 static bool is_call_to(zan_ast_node_t *expr, const char *obj, const char *method) {
     if (expr->kind != AST_CALL) return false;
     zan_ast_node_t *callee = expr->call.callee;

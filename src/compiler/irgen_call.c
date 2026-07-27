@@ -1331,7 +1331,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
         }
 
         /* Path.GetFileName(path), Path.GetExtension(path), Path.Combine(a,b) */
-        if (is_call_to(expr, "Path", "GetFileName") && expr->call.args.count == 1) {
+        if (!zan_type_defines(g, "Path", "GetFileName") &&
+            is_call_to(expr, "Path", "GetFileName") && expr->call.args.count == 1) {
             LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
             LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
             zan_ast_node_t *path_ast = expr->call.args.items[0];
@@ -1358,7 +1359,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
             return LLVMBuildSelect(g->builder, both_null, path_val, plus1, "fname");
         }
 
-        if (is_call_to(expr, "Path", "GetExtension") && expr->call.args.count == 1) {
+        if (!zan_type_defines(g, "Path", "GetExtension") &&
+            is_call_to(expr, "Path", "GetExtension") && expr->call.args.count == 1) {
             LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
             LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
             zan_ast_node_t *path_ast = expr->call.args.items[0];
@@ -1374,7 +1376,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
             return LLVMBuildSelect(g->builder, is_null, empty, dot, "ext");
         }
 
-        if (is_call_to(expr, "Path", "Combine") && expr->call.args.count == 2) {
+        if (!zan_type_defines(g, "Path", "Combine") &&
+            is_call_to(expr, "Path", "Combine") && expr->call.args.count == 2) {
             LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
             LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
             LLVMValueRef a = emit_expr(g, expr->call.args.items[0], locals);
@@ -1808,7 +1811,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
         }
 
         /* Path.GetDirectoryName(path) -> string */
-        if (is_call_to(expr, "Path", "GetDirectoryName") && expr->call.args.count == 1) {
+        if (!zan_type_defines(g, "Path", "GetDirectoryName") &&
+            is_call_to(expr, "Path", "GetDirectoryName") && expr->call.args.count == 1) {
             LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
             LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
             LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
@@ -1855,7 +1859,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
         }
 
         /* Path.HasExtension(path) -> bool */
-        if (is_call_to(expr, "Path", "HasExtension") && expr->call.args.count == 1) {
+        if (!zan_type_defines(g, "Path", "HasExtension") &&
+            is_call_to(expr, "Path", "HasExtension") && expr->call.args.count == 1) {
             LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
             LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
             LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
@@ -1871,7 +1876,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
         }
 
         /* Path.GetTempPath() -> string */
-        if (is_call_to(expr, "Path", "GetTempPath") && expr->call.args.count == 0) {
+        if (!zan_type_defines(g, "Path", "GetTempPath") &&
+            is_call_to(expr, "Path", "GetTempPath") && expr->call.args.count == 0) {
             LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
             LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
             LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
@@ -1906,7 +1912,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
         }
 
         /* Path.GetFileNameWithoutExtension(path) -> string */
-        if (is_call_to(expr, "Path", "GetFileNameWithoutExtension") && expr->call.args.count == 1) {
+        if (!zan_type_defines(g, "Path", "GetFileNameWithoutExtension") &&
+            is_call_to(expr, "Path", "GetFileNameWithoutExtension") && expr->call.args.count == 1) {
             LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
             LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
             LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
