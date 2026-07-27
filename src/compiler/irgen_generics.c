@@ -258,9 +258,16 @@ static int expr_is_arc_object(zan_irgen_t *g, zan_ast_node_t *e, local_scope_t *
     return is_rc_managed_type(t);
 }
 
+/* Indexing a temporary container -- Split(",")[0], Keys[i] -- has to release
+ * that container, so the element is handed out retained (see emit_expr_index)
+ * and the index expression owns its result like a call would. */
+static int expr_index_of_owned_temp(zan_irgen_t *g, zan_ast_node_t *e,
+                                    local_scope_t *locals);
+
 static int expr_yields_owned_rc_value(zan_irgen_t *g, zan_ast_node_t *e,
                                       local_scope_t *locals) {
     if (!e) return 0;
+    if (e->kind == AST_INDEX && expr_index_of_owned_temp(g, e, locals)) return 1;
     if (e->kind == AST_NEW_EXPR || e->kind == AST_CALL ||
         e->kind == AST_QUERY_EXPR) return 1;
     /* An awaited async call yields a freshly owned (+1) reference: the callee's
@@ -319,6 +326,18 @@ static int expr_yields_owned_rc_value(zan_irgen_t *g, zan_ast_node_t *e,
 
 static int expr_is_local_ident(zan_ast_node_t *e, local_scope_t *locals) {
     return e && e->kind == AST_IDENTIFIER && locals && local_find(locals, e->ident.name);
+}
+
+static int expr_index_of_owned_temp(zan_irgen_t *g, zan_ast_node_t *e,
+                                    local_scope_t *locals) {
+    if (!e || e->kind != AST_INDEX || !locals) return 0;
+    zan_ast_node_t *obj = e->index.object;
+    if (!obj || expr_is_local_ident(obj, locals)) return 0;
+    zan_type_t *ct = infer_expr_type(g, obj, locals);
+    if (!ct || !is_rc_managed_type(ct)) return 0;
+    if (!expr_yields_owned_rc_value(g, obj, locals)) return 0;
+    return is_rc_managed_type(container_elem_type(ct)) ||
+           is_rc_managed_type(dict_value_type(ct));
 }
 
 static void emit_release_owned_call_temp(zan_irgen_t *g, zan_ast_node_t *arg,

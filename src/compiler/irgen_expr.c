@@ -1868,6 +1868,28 @@ static LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr
     return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
 }
 
+/* A container that is itself a temporary -- Split(",")[0], Keys[i] -- has to be
+ * released once the element is out, and the element retained first so it
+ * outlives its container. The index expression then owns its result, which
+ * expr_yields_owned_rc_value reports so the receiver does not retain twice. */
+static LLVMValueRef finish_index_of_temp(zan_irgen_t *g, zan_ast_node_t *expr,
+                                         local_scope_t *locals,
+                                         zan_type_t *container_type,
+                                         zan_type_t *elem_type,
+                                         LLVMValueRef container,
+                                         LLVMValueRef elem) {
+    if (!container || !container_type ||
+        !expr_yields_owned_rc_value(g, expr->index.object, locals) ||
+        expr_is_local_ident(expr->index.object, locals) ||
+        !is_rc_managed_type(container_type))
+        return elem;
+    if (elem_type && is_rc_managed_type(elem_type) &&
+        LLVMGetTypeKind(LLVMTypeOf(elem)) == LLVMPointerTypeKind)
+        emit_rc_retain_for_type(g, elem_type, elem);
+    emit_rc_release_for_type(g, container_type, container);
+    return elem;
+}
+
 static LLVMValueRef emit_expr_index(zan_irgen_t *g, zan_ast_node_t *expr,
         local_scope_t *locals) {
         /* arr[i] — array/list element access */
@@ -1939,15 +1961,17 @@ static LLVMValueRef emit_expr_index(zan_irgen_t *g, zan_ast_node_t *expr,
              * so pointer (class/string) elements need inttoptr and floating
              * (double) elements need a bitcast back to the value type. */
             zan_type_t *et = container_elem_type(arr_type);
+            LLVMValueRef out = raw;
             if (et) {
                 LLVMTypeRef m = map_type(g, et);
                 LLVMTypeKind mk = LLVMGetTypeKind(m);
                 if (mk == LLVMPointerTypeKind)
-                    return LLVMBuildIntToPtr(g->builder, raw, m, "elp");
-                if (mk == LLVMDoubleTypeKind)
-                    return LLVMBuildBitCast(g->builder, raw, m, "elf");
+                    out = LLVMBuildIntToPtr(g->builder, raw, m, "elp");
+                else if (mk == LLVMDoubleTypeKind)
+                    out = LLVMBuildBitCast(g->builder, raw, m, "elf");
             }
-            return raw;
+            return finish_index_of_temp(g, expr, locals, arr_type, et,
+                                        arr_ptr, out);
         }
         /* Dict indexer: dict[key] -> hash probe for the entry, then its value
          * (0 when the key is absent, as the linear scan this replaces did). */
@@ -1973,15 +1997,17 @@ static LLVMValueRef emit_expr_index(zan_irgen_t *g, zan_ast_node_t *expr,
             LLVMPositionBuilderAtEnd(g->builder, done_bb);
             LLVMValueRef dval = LLVMBuildLoad2(g->builder, i64, res, "dval");
             zan_type_t *dvt = dict_value_type(arr_type);
+            LLVMValueRef dout = dval;
             if (dvt) {
                 LLVMTypeRef m = map_type(g, dvt);
                 LLVMTypeKind mk = LLVMGetTypeKind(m);
                 if (mk == LLVMPointerTypeKind)
-                    return LLVMBuildIntToPtr(g->builder, dval, m, "dvalp");
-                if (mk == LLVMDoubleTypeKind)
-                    return LLVMBuildBitCast(g->builder, dval, m, "dvalf");
+                    dout = LLVMBuildIntToPtr(g->builder, dval, m, "dvalp");
+                else if (mk == LLVMDoubleTypeKind)
+                    dout = LLVMBuildBitCast(g->builder, dval, m, "dvalf");
             }
-            return dval;
+            return finish_index_of_temp(g, expr, locals, arr_type, dvt,
+                                        arr_ptr, dout);
         }
         /* string[i] — load a single byte (i8) and zero-extend to i32 so that
          * indexing a string yields the character code, enabling char-level
@@ -1996,7 +2022,10 @@ static LLVMValueRef emit_expr_index(zan_irgen_t *g, zan_ast_node_t *expr,
             LLVMTypeRef i8t = LLVMInt8TypeInContext(g->ctx);
             LLVMValueRef ch_ptr = LLVMBuildGEP2(g->builder, i8t, arr_ptr, &idx, 1, "chp");
             LLVMValueRef ch = LLVMBuildLoad2(g->builder, i8t, ch_ptr, "ch");
-            return LLVMBuildZExt(g->builder, ch, LLVMInt64TypeInContext(g->ctx), "chz");
+            LLVMValueRef chz = LLVMBuildZExt(g->builder, ch,
+                LLVMInt64TypeInContext(g->ctx), "chz");
+            return finish_index_of_temp(g, expr, locals, arr_type, NULL,
+                                        arr_ptr, chz);
         }
         if (arr_ptr && arr_type) {
             LLVMValueRef idx = emit_expr(g, expr->index.index, locals);
