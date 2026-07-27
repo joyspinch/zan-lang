@@ -1,0 +1,362 @@
+using System;
+
+namespace Gui;
+
+/// Icon glyphs drawn as scalable vector primitives rather than glyphs of an
+/// icon font: "Segoe MDL2 Assets" only exists on Windows 10+, so a font path
+/// would look different on macOS/Linux and break on Win7. Every shape is built
+/// from Canvas lines, rects, circles and sectors, so an icon rasterizes
+/// identically on every backend.
+///
+/// Canvas.DrawIcon is the entry point; call that rather than these helpers.
+class IconVector {
+    static double Pi() { return 3.14159265358979323846; }
+
+    static int Iabs(int v) {
+        if (v < 0) { return -v; }
+        return v;
+    }
+
+    /// Regular polygon approximation of a circle outline: more segments once
+    /// the radius is large enough for the facets to show.
+    static void Circle(Canvas s, int cx, int cy, int radius,
+                       int color, int thickness) {
+        int segments = 16;
+        if (radius > 12) { segments = 24; }
+        int px = cx + radius;
+        int py = cy;
+        for (int i = 1; i <= segments; i = i + 1) {
+            double a = 2.0 * IconVector.Pi() * (double)i / (double)segments;
+            int nx = cx + (int)(Math.Cos(a) * (double)radius);
+            int ny = cy + (int)(Math.Sin(a) * (double)radius);
+            s.DrawLine(px, py, nx, ny, color, thickness);
+            px = nx;
+            py = ny;
+        }
+    }
+
+    /// Line from (x0,y0) to (x1,y1) with two wings at the far end; the wings
+    /// straddle whichever axis the line runs along.
+    static void Arrow(Canvas s, int x0, int y0, int x1, int y1,
+                      int color, int thickness) {
+        s.DrawLine(x0, y0, x1, y1, color, thickness);
+        int dx = x1 - x0;
+        int dy = y1 - y0;
+        int wing = (IconVector.Iabs(dx) + IconVector.Iabs(dy)) / 4;
+        if (wing < 3) { wing = 3; }
+        if (IconVector.Iabs(dx) >= IconVector.Iabs(dy)) {
+            int sign = -1;
+            if (dx >= 0) { sign = 1; }
+            s.DrawLine(x1, y1, x1 - sign * wing, y1 - wing, color, thickness);
+            s.DrawLine(x1, y1, x1 - sign * wing, y1 + wing, color, thickness);
+        } else {
+            int sign = -1;
+            if (dy >= 0) { sign = 1; }
+            s.DrawLine(x1, y1, x1 - wing, y1 - sign * wing, color, thickness);
+            s.DrawLine(x1, y1, x1 + wing, y1 - sign * wing, color, thickness);
+        }
+    }
+
+    /// The ten alternating outer/inner vertices of a five-point star, starting
+    /// at 12 o'clock. Returned interleaved as x0,y0,x1,y1,...
+    static List<int> StarPoints(int cx, int cy, int radius) {
+        List<int> pts = new List<int>();
+        for (int i = 0; i < 10; i = i + 1) {
+            double a = -IconVector.Pi() / 2.0
+                     + (double)i * IconVector.Pi() / 5.0;
+            int rr = radius;
+            if (i % 2 == 1) { rr = radius * 2 / 5; }
+            pts.Add(cx + (int)(Math.Cos(a) * (double)rr));
+            pts.Add(cy + (int)(Math.Sin(a) * (double)rr));
+        }
+        return pts;
+    }
+
+    static void Star(Canvas s, int cx, int cy, int radius,
+                     int color, int thickness) {
+        List<int> pts = IconVector.StarPoints(cx, cy, radius);
+        for (int i = 0; i < 10; i = i + 1) {
+            int j = (i + 1) % 10;
+            s.DrawLine(pts[i * 2], pts[i * 2 + 1],
+                       pts[j * 2], pts[j * 2 + 1], color, thickness);
+        }
+    }
+
+    /// Even-odd point-in-polygon test (ray cast) over interleaved points.
+    static bool PtInPoly(List<int> pts, int n, int x, int y) {
+        bool inside = false;
+        int j = n - 1;
+        for (int i = 0; i < n; i = i + 1) {
+            int xi = pts[i * 2];
+            int yi = pts[i * 2 + 1];
+            int xj = pts[j * 2];
+            int yj = pts[j * 2 + 1];
+            if ((yi > y) != (yj > y)) {
+                if (x < (xj - xi) * (y - yi) / (yj - yi) + xi) {
+                    inside = !inside;
+                }
+            }
+            j = i;
+        }
+        return inside;
+    }
+
+    /// Solid five-point star: scanline fill, each run of inside pixels emitted
+    /// as one 1px-tall rect.
+    static void FillStar(Canvas s, int cx, int cy, int radius, int color) {
+        List<int> pts = IconVector.StarPoints(cx, cy, radius);
+        for (int yy = cy - radius; yy <= cy + radius; yy = yy + 1) {
+            bool run = false;
+            int startx = 0;
+            for (int xx = cx - radius; xx <= cx + radius; xx = xx + 1) {
+                if (IconVector.PtInPoly(pts, 10, xx, yy)) {
+                    if (!run) {
+                        run = true;
+                        startx = xx;
+                    }
+                } else if (run) {
+                    s.FillRect(startx, yy, xx - startx, 1, color);
+                    run = false;
+                }
+            }
+            if (run) {
+                s.FillRect(startx, yy, cx + radius - startx + 1, 1, color);
+            }
+        }
+    }
+
+    /// Draws the glyph for `codepoint` inside the `box`-sized square at (x,y).
+    /// Unknown codepoints draw nothing.
+    static void Draw(Canvas s, int x, int y, int box, int color, int codepoint) {
+        int size = box;
+        if (size < 8) { size = 8; }
+        int pad = size / 6;
+        int x0 = x + pad;
+        int y0 = y + pad;
+        int x1 = x + size - pad;
+        int y1 = y + size - pad;
+        int cx = (x0 + x1) / 2;
+        int cy = (y0 + y1) / 2;
+        int w = x1 - x0;
+        int h = y1 - y0;
+        int thick = size / 10;
+        if (thick < 1) { thick = 1; }
+        int c = color;
+
+        if (codepoint == 0xE8BB || codepoint == 0xEA39) {
+            /* close / error: cross */
+            s.DrawLine(x0, y0, x1, y1, c, thick);
+            s.DrawLine(x1, y0, x0, y1, c, thick);
+        } else if (codepoint == 0xE921 || codepoint == 0xE738) {
+            s.DrawLine(x0, cy, x1, cy, c, thick);
+        } else if (codepoint == 0xE922) {
+            s.DrawRect(x0, y0, w, h, c, thick);
+        } else if (codepoint == 0xE923 || codepoint == 0xE8C8) {
+            s.DrawRect(x0 + pad / 2, y0, w - pad / 2, h - pad / 2, c, thick);
+            s.DrawRect(x0, y0 + pad / 2, w - pad / 2, h - pad / 2, c, thick);
+        } else if (codepoint == 0xE73E || codepoint == 0xE930) {
+            s.DrawLine(x0, cy, cx - pad / 3, y1, c, thick);
+            s.DrawLine(cx - pad / 3, y1, x1, y0, c, thick);
+        } else if (codepoint == 0xE710) {
+            s.DrawLine(x0, cy, x1, cy, c, thick);
+            s.DrawLine(cx, y0, cx, y1, c, thick);
+        } else if (codepoint == 0xE76B) {
+            IconVector.Arrow(s, x1, cy, x0, cy, c, thick);
+        } else if (codepoint == 0xE76C) {
+            IconVector.Arrow(s, x0, cy, x1, cy, c, thick);
+        } else if (codepoint == 0xE70E || codepoint == 0xE898) {
+            IconVector.Arrow(s, cx, y1, cx, y0, c, thick);
+        } else if (codepoint == 0xE70D || codepoint == 0xE896) {
+            IconVector.Arrow(s, cx, y0, cx, y1, c, thick);
+        } else if (codepoint == 0xE721) {
+            IconVector.Circle(s, cx - pad / 2, cy - pad / 2, w / 3, c, thick);
+            s.DrawLine(cx + pad / 2, cy + pad / 2, x1, y1, c, thick);
+        } else if (codepoint == 0xE713 || codepoint == 0xE706) {
+            /* settings / tools: hub plus eight radial teeth */
+            IconVector.Circle(s, cx, cy, w / 4, c, thick);
+            for (int i = 0; i < 8; i = i + 1) {
+                double a = IconVector.Pi() * (double)i / 4.0;
+                int ax = cx + (int)(Math.Cos(a) * (double)w / 3.0);
+                int ay = cy + (int)(Math.Sin(a) * (double)h / 3.0);
+                int bx = cx + (int)(Math.Cos(a) * (double)w / 2.0);
+                int by = cy + (int)(Math.Sin(a) * (double)h / 2.0);
+                s.DrawLine(ax, ay, bx, by, c, thick);
+            }
+        } else if (codepoint == 0xE77B) {
+            s.FillCircle(cx, y0 + h / 4, w / 6, c);
+            s.FillSector(cx, y1, 0, w / 2, 270, 450, c);
+        } else if (codepoint == 0xEA8F) {
+            IconVector.Circle(s, cx, cy, w / 3, c, thick);
+            s.FillRect(x0, cy, w, h / 3, c);
+            s.FillCircle(cx, y1, thick, c);
+        } else if (codepoint == 0xE7C3) {
+            s.DrawRect(x0, y0, w, h, c, thick);
+            s.DrawLine(x1 - w / 3, y0, x1, y0 + h / 3, c, thick);
+        } else if (codepoint == 0xE8B7) {
+            s.DrawRect(x0, y0 + h / 4, w, h * 3 / 4, c, thick);
+            s.DrawLine(x0, y0 + h / 4, cx, y0 + h / 4, c, thick);
+            s.DrawLine(x0, y0 + h / 4, x0 + w / 4, y0, c, thick);
+            s.DrawLine(x0 + w / 4, y0, cx, y0, c, thick);
+        } else if (codepoint == 0xE80F) {
+            s.DrawLine(x0, cy, cx, y0, c, thick);
+            s.DrawLine(cx, y0, x1, cy, c, thick);
+            s.DrawLine(x0 + pad / 2, cy - pad / 2, x0 + pad / 2, y1, c, thick);
+            s.DrawLine(x1 - pad / 2, cy - pad / 2, x1 - pad / 2, y1, c, thick);
+            s.DrawLine(x0 + pad / 2, y1, x1 - pad / 2, y1, c, thick);
+        } else if (codepoint == 0xE74D) {
+            s.DrawRect(x0 + pad / 2, y0 + pad, w - pad, h - pad, c, thick);
+            s.DrawLine(x0, y0 + pad / 2, x1, y0 + pad / 2, c, thick);
+            s.DrawLine(cx - pad, y0, cx + pad, y0, c, thick);
+        } else if (codepoint == 0xE70F) {
+            s.DrawLine(x0, y1, x1, y0, c, thick + 1);
+            s.DrawLine(x0, y1, x0 + pad, y1, c, thick);
+        } else if (codepoint == 0xE946) {
+            IconVector.Circle(s, cx, cy, w / 2, c, thick);
+            s.FillCircle(cx, y0 + h / 4, thick, c);
+            s.DrawLine(cx, cy - pad / 3, cx, y1 - pad / 3, c, thick);
+        } else if (codepoint == 0xE7BA) {
+            s.DrawLine(cx, y0, x0, y1, c, thick);
+            s.DrawLine(x0, y1, x1, y1, c, thick);
+            s.DrawLine(x1, y1, cx, y0, c, thick);
+            s.DrawLine(cx, cy - pad / 2, cx, cy + pad / 2, c, thick);
+            s.FillCircle(cx, y1 - pad / 2, thick, c);
+        } else if (codepoint == 0xE735) {
+            IconVector.FillStar(s, cx, cy, w / 2, c);
+        } else if (codepoint == 0xE734) {
+            IconVector.Star(s, cx, cy, w / 2, c, thick);
+        } else if (codepoint == 0xEB51) {
+            s.DrawLine(x0, cy - pad, cx, y1, c, thick);
+            s.DrawLine(cx, y1, x1, cy - pad, c, thick);
+            IconVector.Circle(s, x0 + w / 4, cy - pad, w / 4, c, thick);
+            IconVector.Circle(s, x1 - w / 4, cy - pad, w / 4, c, thick);
+        } else if (codepoint == 0xE8E1) {
+            s.DrawRect(x0 + w / 4, cy - pad, w * 3 / 4, h / 2 + pad, c, thick);
+            s.DrawLine(x0 + w / 4, cy, x0, cy, c, thick + 1);
+            s.DrawLine(x0, cy, x0, y1, c, thick + 1);
+        } else if (codepoint == 0xE787) {
+            s.DrawRect(x0, y0 + pad / 2, w, h - pad / 2, c, thick);
+            s.DrawLine(x0, y0 + h / 3, x1, y0 + h / 3, c, thick);
+            s.DrawLine(x0 + pad, y0, x0 + pad, y0 + pad, c, thick);
+            s.DrawLine(x1 - pad, y0, x1 - pad, y0 + pad, c, thick);
+        } else if (codepoint == 0xE823) {
+            IconVector.Circle(s, cx, cy, w / 2, c, thick);
+            s.DrawLine(cx, cy, cx, y0 + pad, c, thick);
+            s.DrawLine(cx, cy, x1 - pad, cy, c, thick);
+        } else if (codepoint == 0xEB9F) {
+            s.DrawRect(x0, y0, w, h, c, thick);
+            s.FillCircle(x1 - pad, y0 + pad, thick + 1, c);
+            s.DrawLine(x0 + pad, y1 - pad, cx, cy, c, thick);
+            s.DrawLine(cx, cy, x1 - pad, y1 - pad, c, thick);
+        } else if (codepoint == 0xE72C || codepoint == 0xE7A7
+                   || codepoint == 0xE7A6) {
+            IconVector.Circle(s, cx, cy, w / 2, c, thick);
+            IconVector.Arrow(s, x1, cy, x1 - pad, y0, c, thick);
+        } else if (codepoint == 0xE712) {
+            s.FillCircle(x0 + pad, cy, thick + 1, c);
+            s.FillCircle(cx, cy, thick + 1, c);
+            s.FillCircle(x1 - pad, cy, thick + 1, c);
+        } else if (codepoint == 0xE700) {
+            s.DrawLine(x0, y0 + pad, x1, y0 + pad, c, thick);
+            s.DrawLine(x0, cy, x1, cy, c, thick);
+            s.DrawLine(x0, y1 - pad, x1, y1 - pad, c, thick);
+        } else if (codepoint == 0xE7B3) {
+            s.DrawLine(x0, cy, cx, y0 + pad, c, thick);
+            s.DrawLine(cx, y0 + pad, x1, cy, c, thick);
+            s.DrawLine(x1, cy, cx, y1 - pad, c, thick);
+            s.DrawLine(cx, y1 - pad, x0, cy, c, thick);
+            s.FillCircle(cx, cy, w / 8, c);
+        } else if (codepoint == 0xE72E) {
+            s.DrawRect(x0, cy - pad / 2, w, h / 2 + pad / 2, c, thick);
+            IconVector.Circle(s, cx, cy - pad / 2, w / 4, c, thick);
+        } else if (codepoint == 0xE715) {
+            s.DrawRect(x0, y0, w, h, c, thick);
+            s.DrawLine(x0, y0, cx, cy, c, thick);
+            s.DrawLine(cx, cy, x1, y0, c, thick);
+        } else if (codepoint == 0xE708) {
+            IconVector.Circle(s, cx, cy, w / 2, c, thick);
+            IconVector.Circle(s, cx + pad, cy - pad, w / 2, c, thick);
+        } else if (codepoint == 0xE718 || codepoint == 0xE77A) {
+            s.FillCircle(cx, y0 + h / 3, w / 4, c);
+            s.DrawLine(cx, cy, cx, y1, c, thick);
+        } else if (codepoint == 0xE71C) {
+            s.DrawLine(x0, y0, x1, y0, c, thick);
+            s.DrawLine(x1, y0, cx + pad / 2, cy, c, thick);
+            s.DrawLine(cx + pad / 2, cy, cx + pad / 2, y1, c, thick);
+        } else if (codepoint == 0xE8CB) {
+            IconVector.Arrow(s, x0 + pad, y1, x0 + pad, y0, c, thick);
+            IconVector.Arrow(s, x1 - pad, y0, x1 - pad, y1, c, thick);
+        } else if (codepoint == 0xE80A || codepoint == 0xF0E2
+                   || codepoint == 0xE8A1) {
+            s.DrawRect(x0, y0, w, h, c, thick);
+            s.DrawLine(cx, y0, cx, y1, c, thick);
+            s.DrawLine(x0, cy, x1, cy, c, thick);
+        } else if (codepoint == 0xE768) {
+            s.DrawLine(x0 + pad, y0, x0 + pad, y1, c, thick);
+            s.DrawLine(x0 + pad, y0, x1, cy, c, thick);
+            s.DrawLine(x1, cy, x0 + pad, y1, c, thick);
+        } else if (codepoint == 0xE769) {
+            s.FillRect(x0 + pad, y0, thick * 2, h, c);
+            s.FillRect(x1 - pad - thick * 2, y0, thick * 2, h, c);
+        } else if (codepoint == 0xE71A) {
+            s.FillRect(x0, y0, w, h, c);
+        } else if (codepoint == 0xEBE8) {
+            IconVector.Circle(s, cx, cy, w / 3, c, thick);
+            s.DrawLine(x0, y0, x0 + pad, cy, c, thick);
+            s.DrawLine(x1, y0, x1 - pad, cy, c, thick);
+            s.DrawLine(x0, y1, x0 + pad, cy, c, thick);
+            s.DrawLine(x1, y1, x1 - pad, cy, c, thick);
+        } else if (codepoint == 0xE943) {
+            s.DrawLine(cx - pad, y0, x0, cy, c, thick);
+            s.DrawLine(x0, cy, cx - pad, y1, c, thick);
+            s.DrawLine(cx + pad, y0, x1, cy, c, thick);
+            s.DrawLine(x1, cy, cx + pad, y1, c, thick);
+        } else if (codepoint == 0xE74E) {
+            s.DrawRect(x0, y0, w, h, c, thick);
+            s.DrawRect(x0 + pad, y0, w - 2 * pad, h / 3, c, thick);
+            s.DrawRect(x0 + pad, cy, w - 2 * pad, h / 3, c, thick);
+        } else if (codepoint == 0xE8C6) {
+            s.DrawLine(x0, y0, x1, y1, c, thick);
+            s.DrawLine(x1, y0, x0, y1, c, thick);
+            IconVector.Circle(s, x0 + pad, y1 - pad, pad, c, thick);
+            IconVector.Circle(s, x1 - pad, y1 - pad, pad, c, thick);
+        } else if (codepoint == 0xE77F) {
+            s.DrawRect(x0, y0 + pad, w, h - pad, c, thick);
+            s.DrawRect(cx - pad, y0, pad * 2, pad * 2, c, thick);
+        } else if (codepoint == 0xE8B3) {
+            s.DrawRect(x0, y0, w, h, c, thick);
+            s.DrawRect(x0 + pad, y0 + pad, w - 2 * pad, h - 2 * pad, c, thick);
+        } else if (codepoint == 0xE8D2) {
+            s.DrawLine(x0, y1, cx, y0, c, thick);
+            s.DrawLine(cx, y0, x1, y1, c, thick);
+            s.DrawLine(x0 + pad, cy + pad, x1 - pad, cy + pad, c, thick);
+        } else if (codepoint == 0xE790) {
+            IconVector.Circle(s, cx, cy, w / 2, c, thick);
+            s.FillCircle(cx - pad, cy - pad, thick + 1, c);
+            s.FillCircle(cx + pad, cy - pad, thick + 1, c);
+            s.FillCircle(cx, cy + pad, thick + 1, c);
+        } else if (codepoint == 0xF101) {
+            /* chevron-down */
+            s.DrawLine(x0, cy - h / 6, cx, cy + h / 6, c, thick);
+            s.DrawLine(cx, cy + h / 6, x1, cy - h / 6, c, thick);
+        } else if (codepoint == 0xF103) {
+            /* chevron-up */
+            s.DrawLine(x0, cy + h / 6, cx, cy - h / 6, c, thick);
+            s.DrawLine(cx, cy - h / 6, x1, cy + h / 6, c, thick);
+        } else if (codepoint == 0xF102) {
+            /* chevron-right */
+            s.DrawLine(cx - w / 6, y0, cx + w / 6, cy, c, thick);
+            s.DrawLine(cx + w / 6, cy, cx - w / 6, y1, c, thick);
+        } else if (codepoint == 0xF104) {
+            /* chevron-left */
+            s.DrawLine(cx + w / 6, y0, cx - w / 6, cy, c, thick);
+            s.DrawLine(cx - w / 6, cy, cx + w / 6, y1, c, thick);
+        } else if (codepoint == 0xE774) {
+            /* globe: circle + equator + meridian + two latitude lines */
+            IconVector.Circle(s, cx, cy, w / 2, c, thick);
+            s.DrawLine(x0, cy, x1, cy, c, thick);
+            s.DrawLine(cx, y0, cx, y1, c, thick);
+            s.DrawLine(cx - w / 3, cy - h / 4, cx + w / 3, cy - h / 4, c, thick);
+            s.DrawLine(cx - w / 3, cy + h / 4, cx + w / 3, cy + h / 4, c, thick);
+        }
+    }
+}

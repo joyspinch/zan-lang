@@ -11,8 +11,8 @@ extern void zan_gui_clear(i64 surface_id, i64 color);
 extern void zan_gui_draw_text(i64 surface_id, i64 x, i64 y,
                               const char *text, i64 color, i64 font_size);
 extern i64 zan_gui_measure_text(const char *text, i64 font_size);
-extern void zan_gui_draw_icon(i64 surface_id, i64 x, i64 y, i64 box,
-                              i64 color, i64 codepoint);
+extern void zan_gui_draw_line(i64 surface_id, i64 x0, i64 y0, i64 x1, i64 y1,
+                              i64 color, i64 thickness);
 extern void *zan_gui_get_pixels(i64 surface_id);
 
 static int changed(const u32 *pixels, int count, u32 background) {
@@ -29,7 +29,7 @@ int main(void) {
     assert(pixels);
 
     zan_gui_clear(surface, background);
-    zan_gui_draw_icon(surface, 8, 8, 32, 0xFF112233u, 0xE8BB);
+    zan_gui_draw_line(surface, 8, 8, 40, 40, 0xFF112233u, 2);
     assert(changed(pixels, 64 * 64, background));
 
     i64 one = zan_gui_measure_text("\xC3\xA9", 14);
