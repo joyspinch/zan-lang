@@ -2153,6 +2153,61 @@ static void release_all_arc_locals(zan_irgen_t *g, local_scope_t *locals) {
     }
 }
 
+/* Byte size of a scalar-or-scalar-aggregate LLVM type, or 0 when it cannot be
+ * computed here (no target data is available during irgen). Used only to decide
+ * whether a value struct fits a collection's 8-byte slot. */
+static unsigned llvm_scalar_size(LLVMTypeRef t) {
+    switch (LLVMGetTypeKind(t)) {
+    case LLVMIntegerTypeKind: return (LLVMGetIntTypeWidth(t) + 7) / 8;
+    case LLVMPointerTypeKind: return 8;
+    case LLVMFloatTypeKind:   return 4;
+    case LLVMDoubleTypeKind:  return 8;
+    case LLVMStructTypeKind: {
+        unsigned total = 0;
+        unsigned n = LLVMCountStructElementTypes(t);
+        for (unsigned i = 0; i < n; i++) {
+            unsigned fs = llvm_scalar_size(LLVMStructGetTypeAtIndex(t, i));
+            if (!fs) return 0;
+            if (fs > 1 && total % fs) total += fs - (total % fs);  /* natural align */
+            total += fs;
+        }
+        return total;
+    }
+    default: return 0;
+    }
+}
+
+/* A collection slot is uniformly 8 bytes, so a value struct element travels
+ * through it as raw bits: stored into a temporary and read back as an i64,
+ * and reversed on the way out. Storing the struct directly would spill past
+ * the slot for anything wider than the struct's first field. */
+static void check_struct_fits_slot(zan_irgen_t *g, LLVMTypeRef st, zan_ast_node_t *at) {
+    unsigned sz = llvm_scalar_size(st);
+    if (sz && sz <= 8) return;
+    zan_loc_t loc; memset(&loc, 0, sizeof(loc));
+    if (at) loc = at->loc;
+    zan_diag_emit(g->diag, DIAG_ERROR, loc,
+        "a value struct wider than 8 bytes cannot be a collection element yet "
+        "(the slot is 8 bytes); use a class or split the fields");
+}
+
+static LLVMValueRef pack_struct_into_slot(zan_irgen_t *g, LLVMValueRef v, zan_ast_node_t *at) {
+    LLVMTypeRef st = LLVMTypeOf(v);
+    check_struct_fits_slot(g, st, at);
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+    LLVMValueRef tmp = emit_entry_alloca(g, i64, "slot.pack");
+    LLVMBuildStore(g->builder, LLVMConstInt(i64, 0, 0), tmp);
+    LLVMBuildStore(g->builder, v, tmp);
+    return LLVMBuildLoad2(g->builder, i64, tmp, "slot.packed");
+}
+
+static LLVMValueRef unpack_struct_from_slot(zan_irgen_t *g, LLVMValueRef raw, LLVMTypeRef st) {
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+    LLVMValueRef tmp = emit_entry_alloca(g, i64, "slot.unpack");
+    LLVMBuildStore(g->builder, raw, tmp);
+    return LLVMBuildLoad2(g->builder, st, tmp, "slot.struct");
+}
+
 /* Store `value` into a collection slot, retaining the new occupant when needed
  * and releasing the old occupant when overwrite_old is true.
  *
@@ -2181,7 +2236,9 @@ static void emit_collection_slot_store(zan_irgen_t *g, zan_type_t *elem_type,
             stored = LLVMBuildBitCast(g->builder, stored, slot_ty, "slot.bc");
         }
     } else if (slot_k == LLVMIntegerTypeKind) {
-        if (val_k == LLVMPointerTypeKind) {
+        if (val_k == LLVMStructTypeKind) {
+            stored = pack_struct_into_slot(g, stored, rhs);
+        } else if (val_k == LLVMPointerTypeKind) {
             stored = LLVMBuildPtrToInt(g->builder, stored, slot_ty, "slot.pi");
         } else if (val_k == LLVMIntegerTypeKind &&
                    LLVMGetIntTypeWidth(LLVMTypeOf(stored)) < 64) {

@@ -2837,6 +2837,14 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                             /* receiver: the object pointer produced by the
                              * expression (field load, index, call, ...). */
                             call_args[0] = recv_val;
+                            /* A struct receiver that arrives by value (a call
+                             * result, a field read, an element) has no address,
+                             * but `this` is passed by pointer: spill it. */
+                            if (LLVMGetTypeKind(LLVMTypeOf(recv_val)) == LLVMStructTypeKind) {
+                                LLVMValueRef rslot = emit_entry_alloca(g, LLVMTypeOf(recv_val), "recv.tmp");
+                                LLVMBuildStore(g->builder, recv_val, rslot);
+                                call_args[0] = rslot;
+                            }
                             /* an owned receiver temp must survive a throwing
                              * callee: keep it on the EH temp stack so a catch
                              * can release it (longjmp skips the release below) */

@@ -2006,6 +2006,8 @@ static LLVMValueRef emit_expr_index(zan_irgen_t *g, zan_ast_node_t *expr,
                     out = LLVMBuildIntToPtr(g->builder, raw, m, "elp");
                 else if (mk == LLVMDoubleTypeKind)
                     out = LLVMBuildBitCast(g->builder, raw, m, "elf");
+                else if (mk == LLVMStructTypeKind)
+                    out = unpack_struct_from_slot(g, raw, m);
             }
             return finish_index_of_temp(g, expr, locals, arr_type, et,
                                         arr_ptr, out);
