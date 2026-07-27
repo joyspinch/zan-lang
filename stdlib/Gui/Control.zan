@@ -67,10 +67,17 @@ class Control {
     /// (see Events()) to a handler identifier. Empty when unbound.
     List<EventBinding> events;
     /// Common per-widget event bundle (pointer/focus/keyboard/touch/drag),
-    /// inherited by every control. A widget wires it by calling On.Fire(app, id)
-    /// once per frame after it registered its hit region (widgets keep their own
-    /// stable id, so Control does not allocate one here).
+    /// inherited by every control. Interactive widgets that own a stable id
+    /// wire it themselves (On.Fire(app, id) after registering their hit
+    /// region); everything else is wired by RenderTree via FireCommon.
     WidgetEvents On;
+    /// Stable id backing `On` for widgets that do not own one (containers and
+    /// display-only widgets). Allocated on first use; 0 = never needed.
+    int commonId;
+    /// Set by a widget that registers its own hit region and calls On.Fire
+    /// itself (Button, Input, ...), so RenderTree does not fire the bundle a
+    /// second time on a second id.
+    bool wiresOwnEvents;
     /// Lifecycle events fired by RenderTree: Paint every frame this node paints,
     /// Resize when its resolved size changed, Show/Hide on a visibility flip.
     UiEvent Paint;
@@ -129,6 +136,8 @@ class Control {
         children = new List<Control>();
         events = new List<EventBinding>();
         On = WidgetEvents.Create();
+        commonId = 0;
+        wiresOwnEvents = false;
         Paint = UiEvent.Create();
         Resize = UiEvent.Create();
         Show = UiEvent.Create();
@@ -172,9 +181,44 @@ class Control {
     // a handler and returns THIS so setup stays fluent. ---
     Control OnClick(Action a) { BindEvent("Click", a); return this; }
     Control OnDoubleClick(Action a) { BindEvent("DoubleClick", a); return this; }
+    Control OnRightClick(Action a) { BindEvent("RightClick", a); return this; }
     Control OnChange(Action a) { BindEvent("Change", a); return this; }
     Control OnEnter(Action a) { BindEvent("Enter", a); return this; }
+    Control OnLeave(Action a) { BindEvent("Leave", a); return this; }
+    Control OnMouseDown(Action a) { BindEvent("MouseDown", a); return this; }
+    Control OnMouseUp(Action a) { BindEvent("MouseUp", a); return this; }
+    Control OnWheel(Action a) { BindEvent("Wheel", a); return this; }
+    Control OnFocus(Action a) { BindEvent("Focus", a); return this; }
+    Control OnBlur(Action a) { BindEvent("Blur", a); return this; }
     Control OnKeyDown(Action a) { BindEvent("KeyDown", a); return this; }
+    Control OnKeyUp(Action a) { BindEvent("KeyUp", a); return this; }
+    Control OnLongPress(Action a) { BindEvent("LongPress", a); return this; }
+    Control OnSwipe(Action a) { BindEvent("Swipe", a); return this; }
+    Control OnDrag(Action a) { BindEvent("Drag", a); return this; }
+    Control OnDrop(Action a) { BindEvent("Drop", a); return this; }
+    Control OnResize(Action a) { Resize.Add(a); return this; }
+    Control OnShow(Action a) { Show.Add(a); return this; }
+    Control OnHide(Action a) { Hide.Add(a); return this; }
+
+    /// Stable id for this control's common event bundle (see FireCommon).
+    int CommonId() {
+        if (commonId == 0) { commonId = WidgetId.Next(); }
+        return commonId;
+    }
+
+    /// Registers the resolved box as a hit region and raises the common event
+    /// bundle, so pointer/focus/keyboard events work on EVERY control, not just
+    /// the handful that wire `On` themselves. Skipped when the widget wires its
+    /// own events, and when nobody is listening -- an unused container must not
+    /// take the pointer away from what is painted under it.
+    void FireCommon(App app) {
+        if (wiresOwnEvents) { return; }
+        if (!On.Any()) { return; }
+        if (bw <= 0 || bh <= 0) { return; }
+        int id = this.CommonId();
+        app.hitTester.Register(HitRegion.Create(id, bx, by, bw, bh, 0));
+        On.Fire(app, id);
+    }
 
     /// Effective text color: the CSS `styleColor` if set, else the fallback the
     /// widget resolves from its variant/theme. Text widgets call this.
@@ -593,6 +637,7 @@ class Control {
         lastVisible = true;
         PaintStyleBox(app);
         OnPaint(app);
+        this.FireCommon(app);
         if (Paint.Count() > 0) { Paint.Raise(); }
         if (everLaidOut && (bw != lastBw || bh != lastBh) && Resize.Count() > 0) {
             Resize.Raise();

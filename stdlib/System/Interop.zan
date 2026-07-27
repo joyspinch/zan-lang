@@ -1,0 +1,539 @@
+using System;
+
+namespace System;
+
+/// <summary>
+/// Dynamic native linking: resolve a library and its entry points at runtime
+/// and call them through a delegate, instead of declaring a `[DllImport]`
+/// that has to exist at load time.
+///
+///   nint user32 = Interop.Load("user32.dll");
+///   nint addr   = Interop.Symbol(user32, "MessageBoxW");
+///   MessageBoxW box = (MessageBoxW)addr;      // address -> callable
+///   box(0, Wide.Of("hi"), Wide.Of("zan"), 0);
+///
+/// The `(Delegate)address` cast and its inverse `(nint)handler` are compiler
+/// primitives, so an optional dependency (a runtime that may not be
+/// installed) needs no C shim: probe for it, and fall back when absent.
+/// </summary>
+class Interop {
+    [DllImport("kernel32", EntryPoint = "LoadLibraryA")]
+    static extern nint WinLoad(string name);
+
+    [DllImport("kernel32", EntryPoint = "GetProcAddress")]
+    static extern nint WinSymbol(nint mod, string name);
+
+    [DllImport("kernel32", EntryPoint = "FreeLibrary")]
+    static extern int WinUnload(nint mod);
+
+    /// Loads a shared library by name or path; 0 when it is not present.
+    static nint Load(string name) {
+        return Interop.WinLoad(name);
+    }
+
+    /// Address of an exported entry point; 0 when the library does not have
+    /// it (an ABI-compatible way to feature-detect a newer runtime).
+    static nint Symbol(nint mod, string name) {
+        if (mod == 0) { return 0; }
+        return Interop.WinSymbol(mod, name);
+    }
+
+    static void Unload(nint mod) {
+        if (mod != 0) { Interop.WinUnload(mod); }
+    }
+
+    /// Loads `name` and resolves `entry` in one step; 0 when either fails.
+    static nint Entry(string name, string entry) {
+        return Interop.Symbol(Interop.Load(name), entry);
+    }
+
+    /// Reads an environment variable from the live process block, "" when
+    /// unset.
+    static string EnvVar(string name) {
+        nint fn = Interop.Entry("kernel32.dll", "GetEnvironmentVariableW");
+        if (fn == 0) { return ""; }
+        GetEnvironmentVariableWFn call = (GetEnvironmentVariableWFn)fn;
+        nint wname = Wide.Of(name);
+        nint buf = NativeMemory.Alloc(2048);
+        NativeMemory.SetU16(buf, 0, 0);
+        int units = call(wname, buf, 1023);
+        string text = "";
+        if (units > 0 && units < 1023) { text = Wide.Read(buf); }
+        NativeMemory.Free(buf);
+        Wide.Free(wname);
+        return text;
+    }
+}
+
+delegate int GetEnvironmentVariableWFn(nint name, nint buf, int size);
+
+/// <summary>
+/// UTF-16 marshalling for the wide (`W`) half of the Win32/COM surface.
+/// A Zan string is UTF-8, so a wide argument is an explicitly owned buffer:
+///
+///   nint w = Wide.Of("https://example.com");
+///   nav(webview, w);
+///   Wide.Free(w);
+/// </summary>
+class Wide {
+    [DllImport("kernel32", EntryPoint = "MultiByteToWideChar")]
+    static extern int ToWide(int page, int flags, nint mb, int mbLen,
+                             nint wide, int wideLen);
+
+    [DllImport("kernel32", EntryPoint = "WideCharToMultiByte")]
+    static extern int ToMulti(int page, int flags, nint wide, int wideLen,
+                              nint mb, int mbLen, nint defChar, nint usedDef);
+
+    static int Utf8() { return 65001; }
+
+    /// Allocates a NUL-terminated UTF-16 copy of `s`. Free it with Free().
+    static nint Of(string s) {
+        int bytes = s.Length;
+        nint src = NativeMemory.Alloc(bytes + 1);
+        NativeMemory.PutString(src, 0, s, bytes);
+        NativeMemory.SetByte(src, bytes, 0);
+        int units = Wide.ToWide(Wide.Utf8(), 0, src, bytes + 1, 0, 0);
+        if (units <= 0) { units = 1; }
+        nint dst = NativeMemory.Alloc(units * 2 + 2);
+        Wide.ToWide(Wide.Utf8(), 0, src, bytes + 1, dst, units);
+        NativeMemory.Free(src);
+        return dst;
+    }
+
+    /// Copies a NUL-terminated UTF-16 buffer back into a Zan string.
+    static string Read(nint p) {
+        if (p == 0) { return ""; }
+        int bytes = Wide.ToMulti(Wide.Utf8(), 0, p, -1, 0, 0, 0, 0);
+        if (bytes <= 1) { return ""; }
+        nint buf = NativeMemory.Alloc(bytes + 1);
+        Wide.ToMulti(Wide.Utf8(), 0, p, -1, buf, bytes, 0, 0);
+        string s = NativeMemory.GetString(buf, 0, bytes - 1);
+        NativeMemory.Free(buf);
+        return s;
+    }
+
+    static void Free(nint p) {
+        NativeMemory.Free(p);
+    }
+}
+
+delegate int PeekMessageFn(nint msg, nint hwnd, int min, int max, int remove);
+delegate int TranslateMessageFn(nint msg);
+delegate nint DispatchMessageFn(nint msg);
+delegate int SleepFn(int ms);
+
+/// <summary>
+/// A nested Win32 message loop. Asynchronous COM completions arrive as posted
+/// messages on the calling (apartment) thread, so waiting for one means
+/// pumping: `Pump.Until(flag, 5000)` is how a synchronous wrapper waits for a
+/// callback without deadlocking the UI thread.
+/// </summary>
+class Pump {
+    static nint user32;
+    static nint peek;
+    static nint translate;
+    static nint dispatch;
+    static nint sleep;
+
+    static void Resolve() {
+        if (Pump.user32 != 0) { return; }
+        Pump.user32 = Interop.Load("user32.dll");
+        Pump.peek = Interop.Symbol(Pump.user32, "PeekMessageW");
+        Pump.translate = Interop.Symbol(Pump.user32, "TranslateMessage");
+        Pump.dispatch = Interop.Symbol(Pump.user32, "DispatchMessageW");
+        Pump.sleep = Interop.Entry("kernel32.dll", "Sleep");
+    }
+
+    /// Drains every message currently queued on this thread.
+    static void Drain() {
+        Pump.Resolve();
+        if (Pump.peek == 0) { return; }
+        PeekMessageFn peekMsg = (PeekMessageFn)Pump.peek;
+        TranslateMessageFn xlate = (TranslateMessageFn)Pump.translate;
+        DispatchMessageFn dispatchMsg = (DispatchMessageFn)Pump.dispatch;
+        nint msg = NativeMemory.Alloc(64);
+        while (peekMsg(msg, 0, 0, 0, 1) != 0) {
+            xlate(msg);
+            dispatchMsg(msg);
+        }
+        NativeMemory.Free(msg);
+    }
+
+    /// Pumps until `gate` reports completion or `timeoutMs` elapses; true when
+    /// the gate opened.
+    static bool Until(PumpGate gate, int timeoutMs) {
+        Pump.Resolve();
+        SleepFn nap = (SleepFn)Pump.sleep;
+        int waited = 0;
+        while (waited < timeoutMs) {
+            Pump.Drain();
+            if (gate.IsDone()) { return true; }
+            if (Pump.sleep != 0) { nap(5); }
+            waited = waited + 5;
+        }
+        return gate.IsDone();
+    }
+}
+
+/// Completion flag a callback sets and Pump.Until() waits on.
+class PumpGate {
+    bool done;
+
+    static PumpGate Create() {
+        PumpGate g = new PumpGate();
+        g.done = false;
+        return g;
+    }
+
+    void Signal() { done = true; }
+    bool IsDone() { return done; }
+    void Reset() { done = false; }
+}
+
+/// Call shapes for vtable methods: every COM method takes the interface
+/// pointer as its first argument and returns an HRESULT, and arguments wider
+/// than a register (a RECT, a struct out-parameter) are passed as addresses.
+delegate int ComCall0Fn(nint self);
+delegate int ComCall1Fn(nint self, nint a);
+delegate int ComCall2Fn(nint self, nint a, nint b);
+delegate int ComCall3Fn(nint self, nint a, nint b, nint c);
+delegate int ComCall4Fn(nint self, nint a, nint b, nint c, nint d);
+delegate int ComCall5Fn(nint self, nint a, nint b, nint c, nint d, nint e);
+
+delegate int CoInitializeExFn(nint reserved, int flags);
+delegate void CoUninitializeFn();
+delegate int CoCreateInstanceFn(nint clsid, nint outer, int ctx, nint iid,
+                                nint result);
+delegate void CoTaskMemFreeFn(nint p);
+
+/// <summary>
+/// COM without a C shim: interface pointers are addresses, methods live in
+/// the object's vtable, and a slot is turned into something callable with a
+/// delegate cast.
+///
+///   nint shell = Com.Create("00021401-0000-0000-C000-000000000046",
+///                           "00000000-0000-0000-C000-000000000046");
+///   Com.Call1(shell, 5, argument);   // vtable slot 5, `shell` as `this`
+///   Com.Release(shell);
+///
+/// A Zan-implemented COM object (what every async COM API needs for its
+/// completion handler) is built with ComVtbl: it writes callback addresses
+/// obtained from `(nint)handler` into a vtable and hands the object back.
+/// </summary>
+class Com {
+    /// ole32 is resolved at run time rather than linked: a program that never
+    /// touches COM neither loads nor depends on it.
+    static nint Ole() {
+        if (Com.ole == 0) { Com.ole = Interop.Load("ole32.dll"); }
+        return Com.ole;
+    }
+
+    static nint ole;
+
+    static int CoInit(nint reserved, int flags) {
+        nint fn = Interop.Symbol(Com.Ole(), "CoInitializeEx");
+        if (fn == 0) { return 0 - 1; }
+        CoInitializeExFn call = (CoInitializeExFn)fn;
+        return call(reserved, flags);
+    }
+
+    static void CoUninit() {
+        nint fn = Interop.Symbol(Com.Ole(), "CoUninitialize");
+        if (fn == 0) { return; }
+        CoUninitializeFn call = (CoUninitializeFn)fn;
+        call();
+    }
+
+    static int CoCreate(nint clsid, nint outer, int ctx, nint iid,
+                        nint result) {
+        nint fn = Interop.Symbol(Com.Ole(), "CoCreateInstance");
+        if (fn == 0) { return 0 - 1; }
+        CoCreateInstanceFn call = (CoCreateInstanceFn)fn;
+        return call(clsid, outer, ctx, iid, result);
+    }
+
+    static void TaskFree(nint p) {
+        nint fn = Interop.Symbol(Com.Ole(), "CoTaskMemFree");
+        if (fn == 0) { return; }
+        CoTaskMemFreeFn call = (CoTaskMemFreeFn)fn;
+        call(p);
+    }
+
+    /// IUnknown vtable layout, shared by every COM interface.
+    static int SlotQueryInterface() { return 0; }
+    static int SlotAddRef() { return 1; }
+    static int SlotRelease() { return 2; }
+
+    /// COINIT_APARTMENTTHREADED — the mode UI/WebView2 objects require.
+    static int Apartment() { return 2; }
+    /// CLSCTX_INPROC_SERVER.
+    static int InProc() { return 1; }
+
+    static bool Ok(int hr) { return hr >= 0; }
+
+    static int Initialize() {
+        return Com.CoInit(0, Com.Apartment());
+    }
+
+    static void Shutdown() {
+        Com.CoUninit();
+    }
+
+    /// Parses `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` into a freshly allocated
+    /// 16-byte GUID (little-endian first three fields, as COM expects).
+    static nint Guid(string text) {
+        nint g = NativeMemory.Alloc(16);
+        NativeMemory.SetU32(g, 0, Com.Hex(text, 0, 8));
+        NativeMemory.SetU16(g, 4, Com.Hex(text, 9, 4));
+        NativeMemory.SetU16(g, 6, Com.Hex(text, 14, 4));
+        NativeMemory.SetByte(g, 8, Com.Hex(text, 19, 2));
+        NativeMemory.SetByte(g, 9, Com.Hex(text, 21, 2));
+        int i = 0;
+        while (i < 6) {
+            NativeMemory.SetByte(g, 10 + i, Com.Hex(text, 24 + i * 2, 2));
+            i = i + 1;
+        }
+        return g;
+    }
+
+    static int Hex(string s, int off, int len) {
+        int v = 0;
+        int i = 0;
+        while (i < len) {
+            int d = Com.Digit(s.Substring(off + i, 1));
+            v = v * 16 + d;
+            i = i + 1;
+        }
+        return v;
+    }
+
+    static int Digit(string ch) {
+        if (ch == "0") { return 0; }
+        if (ch == "1") { return 1; }
+        if (ch == "2") { return 2; }
+        if (ch == "3") { return 3; }
+        if (ch == "4") { return 4; }
+        if (ch == "5") { return 5; }
+        if (ch == "6") { return 6; }
+        if (ch == "7") { return 7; }
+        if (ch == "8") { return 8; }
+        if (ch == "9") { return 9; }
+        if (ch == "a" || ch == "A") { return 10; }
+        if (ch == "b" || ch == "B") { return 11; }
+        if (ch == "c" || ch == "C") { return 12; }
+        if (ch == "d" || ch == "D") { return 13; }
+        if (ch == "e" || ch == "E") { return 14; }
+        if (ch == "f" || ch == "F") { return 15; }
+        return 0;
+    }
+
+    static void FreeGuid(nint g) {
+        NativeMemory.Free(g);
+    }
+
+    /// CoCreateInstance with textual GUIDs; 0 when the class is unavailable.
+    static nint Create(string clsid, string iid) {
+        nint c = Com.Guid(clsid);
+        nint i = Com.Guid(iid);
+        nint slot = NativeMemory.Alloc(8);
+        NativeMemory.SetI64(slot, 0, 0);
+        int hr = Com.CoCreate(c, 0, Com.InProc(), i, slot);
+        nint obj = NativeMemory.GetI64(slot, 0);
+        NativeMemory.Free(slot);
+        NativeMemory.Free(c);
+        NativeMemory.Free(i);
+        if (!Com.Ok(hr)) { return 0; }
+        return obj;
+    }
+
+    /// Address of the method in vtable slot `index` of an interface pointer.
+    static nint Slot(nint iface, int index) {
+        if (iface == 0) { return 0; }
+        nint vtbl = NativeMemory.GetI64(iface, 0);
+        if (vtbl == 0) { return 0; }
+        return NativeMemory.GetI64(vtbl, index * 8);
+    }
+
+    /// Invokes vtable slot `index`, passing the interface pointer as `this`.
+    /// E_FAIL when the slot is empty, so a missing method degrades like a
+    /// failed call rather than jumping to address zero.
+    static int Call0(nint iface, int index) {
+        nint f = Com.Slot(iface, index);
+        if (f == 0) { return Com.Fail(); }
+        ComCall0Fn call = (ComCall0Fn)f;
+        return call(iface);
+    }
+
+    static int Call1(nint iface, int index, nint a) {
+        nint f = Com.Slot(iface, index);
+        if (f == 0) { return Com.Fail(); }
+        ComCall1Fn call = (ComCall1Fn)f;
+        return call(iface, a);
+    }
+
+    static int Call2(nint iface, int index, nint a, nint b) {
+        nint f = Com.Slot(iface, index);
+        if (f == 0) { return Com.Fail(); }
+        ComCall2Fn call = (ComCall2Fn)f;
+        return call(iface, a, b);
+    }
+
+    static int Call3(nint iface, int index, nint a, nint b, nint c) {
+        nint f = Com.Slot(iface, index);
+        if (f == 0) { return Com.Fail(); }
+        ComCall3Fn call = (ComCall3Fn)f;
+        return call(iface, a, b, c);
+    }
+
+    static int Call4(nint iface, int index, nint a, nint b, nint c, nint d) {
+        nint f = Com.Slot(iface, index);
+        if (f == 0) { return Com.Fail(); }
+        ComCall4Fn call = (ComCall4Fn)f;
+        return call(iface, a, b, c, d);
+    }
+
+    static int Call5(nint iface, int index, nint a, nint b, nint c, nint d,
+                     nint e) {
+        nint f = Com.Slot(iface, index);
+        if (f == 0) { return Com.Fail(); }
+        ComCall5Fn call = (ComCall5Fn)f;
+        return call(iface, a, b, c, d, e);
+    }
+
+    /// E_FAIL.
+    static int Fail() { return 0 - 2147467259; }
+
+    /// Calls a slot whose single argument is an out-pointer and returns what
+    /// the callee stored there (0 on failure) — the shape of every COM getter.
+    static nint Get(nint iface, int index) {
+        nint cell = NativeMemory.Alloc(8);
+        NativeMemory.SetI64(cell, 0, 0);
+        int hr = Com.Call1(iface, index, cell);
+        nint v = NativeMemory.GetI64(cell, 0);
+        NativeMemory.Free(cell);
+        if (!Com.Ok(hr)) { return 0; }
+        return v;
+    }
+
+    /// Getter returning a CoTaskMemAlloc'd wide string, marshalled and freed.
+    static string GetString(nint iface, int index) {
+        return Com.TakeString(Com.Get(iface, index));
+    }
+
+    /// Getter returning a 32-bit value (BOOL, enum, count) by out-pointer.
+    static int GetInt(nint iface, int index) {
+        nint cell = NativeMemory.Alloc(8);
+        NativeMemory.SetI64(cell, 0, 0);
+        int hr = Com.Call1(iface, index, cell);
+        int v = NativeMemory.GetU32(cell, 0);
+        NativeMemory.Free(cell);
+        if (!Com.Ok(hr)) { return 0; }
+        return v;
+    }
+
+    /// QueryInterface for a textual IID; 0 when unsupported.
+    static nint Query(nint iface, string iid) {
+        if (iface == 0) { return 0; }
+        nint g = Com.Guid(iid);
+        nint cell = NativeMemory.Alloc(8);
+        NativeMemory.SetI64(cell, 0, 0);
+        int hr = Com.Call2(iface, Com.SlotQueryInterface(), g, cell);
+        nint v = NativeMemory.GetI64(cell, 0);
+        NativeMemory.Free(cell);
+        NativeMemory.Free(g);
+        if (!Com.Ok(hr)) { return 0; }
+        return v;
+    }
+
+    /// Takes a reference on a borrowed interface pointer (what a callback is
+    /// handed) so it stays alive past the call.
+    static nint Keep(nint iface) {
+        if (iface == 0) { return 0; }
+        Com.Call0(iface, Com.SlotAddRef());
+        return iface;
+    }
+
+    static void Release(nint iface) {
+        if (iface != 0) { Com.Call0(iface, Com.SlotRelease()); }
+    }
+
+    /// Frees a buffer the callee allocated with CoTaskMemAlloc (the usual
+    /// out-parameter convention for strings).
+    static void Free(nint p) {
+        if (p != 0) { Com.TaskFree(p); }
+    }
+
+    /// Reads a CoTaskMemAlloc'd wide string out-parameter and frees it.
+    static string TakeString(nint p) {
+        string s = Wide.Read(p);
+        Com.Free(p);
+        return s;
+    }
+}
+
+/// <summary>
+/// A COM object implemented in Zan: `Add` appends method addresses in vtable
+/// order (starting with the three IUnknown slots) and `Build` returns an
+/// interface pointer native code can call back into.
+///
+///   ComVtbl v = ComVtbl.Create(4);
+///   v.Add((nint)Handler.QueryInterface);
+///   v.Add((nint)Handler.AddRef);
+///   v.Add((nint)Handler.Release);
+///   v.Add((nint)Handler.Invoke);
+///   nint handler = v.Build();
+///
+/// The object is `{ vtable, state }`: `State()` gives the caller a slot to
+/// carry its own correlation id, which a static handler reads back from the
+/// `self` pointer it is invoked with.
+/// </summary>
+class ComVtbl {
+    nint vtbl;
+    nint obj;
+    int slots;
+    int count;
+
+    static ComVtbl Create(int slots) {
+        ComVtbl v = new ComVtbl();
+        v.slots = slots;
+        v.count = 0;
+        v.vtbl = NativeMemory.Alloc(slots * 8);
+        v.obj = 0;
+        return v;
+    }
+
+    /// Appends the next vtable entry; extra entries past `slots` are ignored.
+    ComVtbl Add(nint method) {
+        if (count < slots) {
+            NativeMemory.SetI64(vtbl, count * 8, method);
+            count = count + 1;
+        }
+        return this;
+    }
+
+    /// Allocates the object (vtable pointer + one state word) and returns the
+    /// interface pointer.
+    nint Build() {
+        if (obj == 0) {
+            obj = NativeMemory.Alloc(16);
+            NativeMemory.SetI64(obj, 0, vtbl);
+            NativeMemory.SetI64(obj, 8, 0);
+        }
+        return obj;
+    }
+
+    /// Caller-owned state word carried by the object.
+    void SetState(int v) {
+        if (obj != 0) { NativeMemory.SetI64(obj, 8, v); }
+    }
+
+    static int State(nint self) {
+        if (self == 0) { return 0; }
+        return NativeMemory.GetI64(self, 8);
+    }
+
+    void Destroy() {
+        if (obj != 0) { NativeMemory.Free(obj); obj = 0; }
+        if (vtbl != 0) { NativeMemory.Free(vtbl); vtbl = 0; }
+    }
+}

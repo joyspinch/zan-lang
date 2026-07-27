@@ -267,6 +267,38 @@ static bool paren_is_lambda(zan_parser_t *p) {
     return result;
 }
 
+/* `(Name)operand` — a cast to a user-declared type (delegate, class, struct)
+ * rather than a parenthesized expression. Only the unambiguous shape is
+ * accepted: a single identifier inside the parentheses followed by a token
+ * that can only start an operand (identifier, literal, `this`, `new` or a
+ * nested parenthesis), so `(x) + y` and `(x)` keep parsing as grouping.
+ * This is what makes `(WndProc)addr` — an address obtained at runtime turned
+ * into a callable function pointer — expressible in the language. */
+static bool paren_is_named_cast(zan_parser_t *p) {
+    if (zan_lexer_peek(p->lex).kind != TK_IDENT) return false;
+    zan_lexer_t saved_lex = *p->lex;
+    zan_token_t saved_cur = p->current;
+    zan_token_t saved_prev = p->previous;
+    bool result = false;
+    parser_advance(p); /* ( */
+    parser_advance(p); /* Name */
+    if (p->current.kind == TK_RPAREN) {
+        switch (zan_lexer_peek(p->lex).kind) {
+        case TK_IDENT: case TK_INT_LIT: case TK_FLOAT_LIT:
+        case TK_STRING_LIT: case TK_CHAR_LIT:
+        case TK_THIS: case TK_NEW:
+            result = true;
+            break;
+        default:
+            break;
+        }
+    }
+    *p->lex = saved_lex;
+    p->current = saved_cur;
+    p->previous = saved_prev;
+    return result;
+}
+
 /* A single lambda parameter: either an untyped bare identifier (when the
  * identifier is directly followed by ',' or ')') or a typed `Type name`. */
 static zan_ast_node_t *parse_lambda_param(zan_parser_t *p) {
@@ -509,7 +541,7 @@ static zan_ast_node_t *parse_primary(zan_parser_t *p) {
         case TK_INT: case TK_LONG: case TK_SHORT: case TK_BYTE:
         case TK_UINT: case TK_ULONG: case TK_USHORT: case TK_SBYTE:
         case TK_DOUBLE: case TK_FLOAT: case TK_DECIMAL:
-        case TK_BOOL: case TK_CHAR: {
+        case TK_BOOL: case TK_CHAR: case TK_NINT: {
             parser_advance(p); /* ( */
             zan_ast_node_t *ctype = parse_type_ref(p);
             parser_expect(p, TK_RPAREN);
@@ -520,6 +552,17 @@ static zan_ast_node_t *parse_primary(zan_parser_t *p) {
             return cn;
         }
         default: break;
+        }
+        /* Cast to a named type: (Delegate)addr, (Handle)value. */
+        if (paren_is_named_cast(p)) {
+            parser_advance(p); /* ( */
+            zan_ast_node_t *ctype = parse_type_ref(p);
+            parser_expect(p, TK_RPAREN);
+            zan_ast_node_t *coperand = parse_unary(p);
+            zan_ast_node_t *cn = zan_ast_new(p->arena, AST_CAST_EXPR, loc);
+            cn->cast.type = ctype;
+            cn->cast.expr = coperand;
+            return cn;
         }
         /* could be grouped expression or lambda: (params) => expr */
         /* save lexer state to try lambda parse */

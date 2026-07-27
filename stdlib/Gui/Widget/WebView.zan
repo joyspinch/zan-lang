@@ -5,11 +5,11 @@ namespace Gui.Widget;
 
 /// Embedded native web view (browser control).
 ///
-/// Backed by a platform browser engine through the zan_gui runtime: an Edge
-/// WebView2 controller on Windows, a WKWebView on macOS, a placeholder
-/// elsewhere (a backend without a native engine returns no handle, so
-/// IsSupported() is false and Render paints an in-canvas notice instead of
-/// embedding a live browser).
+/// Backed by a platform browser engine (WebViewBackend): an Edge WebView2
+/// controller on Windows, driven from Zan straight against its COM interfaces,
+/// a WKWebView on macOS, a placeholder elsewhere (a backend without a native
+/// engine returns no handle, so IsSupported() is false and Render paints an
+/// in-canvas notice instead of embedding a live browser).
 ///
 /// The native view is a sibling layer that floats above the software-rendered
 /// surface, so drive it every frame from the owning region:
@@ -27,51 +27,6 @@ namespace Gui.Widget;
 /// general escape hatch for reading request params / response bodies) and
 /// cookie access (GetCookies/SetCookie/ClearCookies).
 class WebView {
-    [DllImport("zan_gui")]
-    static extern int zan_gui_webview_create(int hwnd, string profileId);
-    [DllImport("zan_gui")]
-    static extern void zan_gui_webview_destroy(int h);
-    [DllImport("zan_gui")]
-    static extern void zan_gui_webview_set_frame(int h, int x, int y, int w, int hh);
-    [DllImport("zan_gui")]
-    static extern void zan_gui_webview_set_visible(int h, int visible);
-    [DllImport("zan_gui")]
-    static extern void zan_gui_webview_navigate(int h, string url);
-    [DllImport("zan_gui")]
-    static extern void zan_gui_webview_load_html(int h, string html, string baseUrl);
-    [DllImport("zan_gui")]
-    static extern void zan_gui_webview_back(int h);
-    [DllImport("zan_gui")]
-    static extern void zan_gui_webview_forward(int h);
-    [DllImport("zan_gui")]
-    static extern void zan_gui_webview_reload(int h);
-    [DllImport("zan_gui")]
-    static extern void zan_gui_webview_stop(int h);
-    [DllImport("zan_gui")]
-    static extern int zan_gui_webview_can_go_back(int h);
-    [DllImport("zan_gui")]
-    static extern int zan_gui_webview_can_go_forward(int h);
-    [DllImport("zan_gui")]
-    static extern int zan_gui_webview_is_loading(int h);
-    [DllImport("zan_gui")]
-    static extern int zan_gui_webview_nav_seq(int h);
-    [DllImport("zan_gui")]
-    static extern int zan_gui_webview_last_status(int h);
-    [DllImport("zan_gui")]
-    static extern string zan_gui_webview_get_url(int h);
-    [DllImport("zan_gui")]
-    static extern string zan_gui_webview_get_title(int h);
-    [DllImport("zan_gui")]
-    static extern string zan_gui_webview_last_request(int h);
-    [DllImport("zan_gui")]
-    static extern string zan_gui_webview_eval(int h, string js);
-    [DllImport("zan_gui")]
-    static extern string zan_gui_webview_get_cookies(int h, string url);
-    [DllImport("zan_gui")]
-    static extern void zan_gui_webview_set_cookie(int h, string url, string cookieName, string cookieValue);
-    [DllImport("zan_gui")]
-    static extern void zan_gui_webview_clear_cookies(int h);
-
     int handle;        // native webview handle (0 = not yet created / unsupported)
     string profileId;  // isolation profile: "" = shared default store, else per-account
     bool created;      // native create attempted
@@ -81,12 +36,22 @@ class WebView {
     string pendingHtml;
     string pendingBase;
 
+    string lastSeenRequest;
+    string lastSeenTitle;
+    bool lastSeenLoading;
+
     SignalString url;
     SignalString title;
 
     /// Fires when a navigation finishes (or fails), i.e. the current URL/title
     /// may have changed. Reactive Url()/Title() are updated just before it.
     UiEvent NavComplete;
+    /// Fires when a new navigation is requested (LastRequest() is its URL).
+    UiEvent NavStart;
+    /// Fires when the document title changes, including in-page updates.
+    UiEvent TitleChanged;
+    /// Fires when loading starts or stops (IsLoading() tells which).
+    UiEvent LoadingChanged;
 
     static WebView Create() {
         return WebView.CreateWithProfile("");
@@ -109,9 +74,15 @@ class WebView {
         w.pendingUrl = "";
         w.pendingHtml = "";
         w.pendingBase = "";
+        w.lastSeenRequest = "";
+        w.lastSeenTitle = "";
+        w.lastSeenLoading = false;
         w.url = SignalString.Create("");
         w.title = SignalString.Create("");
         w.NavComplete = UiEvent.Create();
+        w.NavStart = UiEvent.Create();
+        w.TitleChanged = UiEvent.Create();
+        w.LoadingChanged = UiEvent.Create();
         return w;
     }
 
@@ -121,17 +92,17 @@ class WebView {
     void EnsureCreated(App app) {
         if (created) { return; }
         created = true;
-        handle = WebView.zan_gui_webview_create(app.window.GetHandle(), profileId);
+        handle = WebViewBackend.Create(app.window.GetHandle(), profileId);
         if (handle == 0) {
             supported = false;
             return;
         }
         supported = true;
         if (pendingUrl != "") {
-            WebView.zan_gui_webview_navigate(handle, pendingUrl);
+            WebViewBackend.Navigate(handle, pendingUrl);
             pendingUrl = "";
         } else if (pendingHtml != "") {
-            WebView.zan_gui_webview_load_html(handle, pendingHtml, pendingBase);
+            WebViewBackend.LoadHtml(handle, pendingHtml, pendingBase);
             pendingHtml = "";
             pendingBase = "";
         }
@@ -154,7 +125,7 @@ class WebView {
             pendingHtml = "";
             return;
         }
-        WebView.zan_gui_webview_navigate(handle, u);
+        WebViewBackend.Navigate(handle, u);
     }
 
     /// Loads an in-memory HTML string (baseUrl resolves relative links; "" ok).
@@ -165,36 +136,36 @@ class WebView {
             pendingUrl = "";
             return;
         }
-        WebView.zan_gui_webview_load_html(handle, html, baseUrl);
+        WebViewBackend.LoadHtml(handle, html, baseUrl);
     }
 
-    void Back() { if (supported && handle != 0) { WebView.zan_gui_webview_back(handle); } }
-    void Forward() { if (supported && handle != 0) { WebView.zan_gui_webview_forward(handle); } }
-    void Reload() { if (supported && handle != 0) { WebView.zan_gui_webview_reload(handle); } }
-    void Stop() { if (supported && handle != 0) { WebView.zan_gui_webview_stop(handle); } }
+    void Back() { if (supported && handle != 0) { WebViewBackend.Back(handle); } }
+    void Forward() { if (supported && handle != 0) { WebViewBackend.Forward(handle); } }
+    void Reload() { if (supported && handle != 0) { WebViewBackend.Reload(handle); } }
+    void Stop() { if (supported && handle != 0) { WebViewBackend.Stop(handle); } }
 
     bool CanGoBack() {
         if (!supported || handle == 0) { return false; }
-        return WebView.zan_gui_webview_can_go_back(handle) != 0;
+        return WebViewBackend.CanGoBack(handle);
     }
     bool CanGoForward() {
         if (!supported || handle == 0) { return false; }
-        return WebView.zan_gui_webview_can_go_forward(handle) != 0;
+        return WebViewBackend.CanGoForward(handle);
     }
     bool IsLoading() {
         if (!supported || handle == 0) { return false; }
-        return WebView.zan_gui_webview_is_loading(handle) != 0;
+        return WebViewBackend.IsLoading(handle);
     }
 
     /// HTTP status code of the last response (0 if none / non-HTTP).
     int LastStatus() {
         if (!supported || handle == 0) { return 0; }
-        return WebView.zan_gui_webview_last_status(handle);
+        return WebViewBackend.LastStatus(handle);
     }
     /// URL of the most recent navigation request seen by the view.
     string LastRequest() {
         if (!supported || handle == 0) { return ""; }
-        return WebView.zan_gui_webview_last_request(handle);
+        return WebViewBackend.LastRequest(handle);
     }
 
     /// Runs JavaScript in the page and returns its result stringified ("" on
@@ -202,63 +173,86 @@ class WebView {
     /// response body fetched from the page.
     string Eval(string js) {
         if (!supported || handle == 0) { return ""; }
-        return WebView.zan_gui_webview_eval(handle, js);
+        return WebViewBackend.Eval(handle, js);
     }
 
     /// Cookies for `url` serialized as "name=value; name2=value2" ("" if none).
     /// Pass "" to get every cookie in the store.
     string GetCookies(string forUrl) {
         if (!supported || handle == 0) { return ""; }
-        return WebView.zan_gui_webview_get_cookies(handle, forUrl);
+        return WebViewBackend.GetCookies(handle, forUrl);
     }
     /// Sets a cookie on the store for `url`'s host (path defaults to "/").
     void SetCookie(string forUrl, string cookieName, string cookieValue) {
         if (supported && handle != 0) {
-            WebView.zan_gui_webview_set_cookie(handle, forUrl, cookieName, cookieValue);
+            WebViewBackend.SetCookie(handle, forUrl, cookieName, cookieValue);
         }
     }
     /// Clears all cookies from the shared store.
     void ClearCookies() {
-        if (supported && handle != 0) { WebView.zan_gui_webview_clear_cookies(handle); }
+        if (supported && handle != 0) { WebViewBackend.ClearCookies(handle); }
     }
 
     /// Hides the native view (call for tabs/panes that are not on screen).
     void Hide() {
         if (created && supported && handle != 0) {
-            WebView.zan_gui_webview_set_visible(handle, 0);
+            WebViewBackend.SetVisible(handle, false);
         }
     }
 
     /// Destroys the native view and releases its resources.
     void Destroy() {
         if (created && supported && handle != 0) {
-            WebView.zan_gui_webview_destroy(handle);
+            WebViewBackend.Destroy(handle);
         }
         handle = 0;
         created = false;
     }
 
     /// Places the native view at the given client-area rect and shows it, then
-    /// polls for navigation changes (updating Url()/Title() and raising
-    /// NavComplete). On platforms without a native web view it paints an
-    /// in-canvas placeholder covering the same rect.
+    /// polls the engine for changes, updating Url()/Title() and raising
+    /// NavStart / LoadingChanged / TitleChanged / NavComplete. The browser runs
+    /// on its own thread, so its events reach the UI as this per-frame diff.
+    /// On platforms without a native web view it paints an in-canvas
+    /// placeholder covering the same rect.
     int Render(App app, int x, int y, int w, int h) {
         EnsureCreated(app);
         if (!supported) {
             WebView.PaintPlaceholder(app, x, y, w, h);
             return handle;
         }
-        WebView.zan_gui_webview_set_frame(handle, x, y, w, h);
-        WebView.zan_gui_webview_set_visible(handle, 1);
+        WebViewBackend.SetFrame(handle, x, y, w, h);
+        WebViewBackend.SetVisible(handle, true);
 
-        int seq = WebView.zan_gui_webview_nav_seq(handle);
+        bool dirty = false;
+        string request = WebViewBackend.LastRequest(handle);
+        if (request != lastSeenRequest) {
+            lastSeenRequest = request;
+            if (request != "") { NavStart.Raise(); }
+            dirty = true;
+        }
+        bool busy = WebViewBackend.IsLoading(handle);
+        if (busy != lastSeenLoading) {
+            lastSeenLoading = busy;
+            LoadingChanged.Raise();
+            dirty = true;
+        }
+
+        int seq = WebViewBackend.NavSeq(handle);
         if (seq != lastNavSeq) {
             lastNavSeq = seq;
-            url.Set(WebView.zan_gui_webview_get_url(handle));
-            title.Set(WebView.zan_gui_webview_get_title(handle));
+            url.Set(WebViewBackend.GetUrl(handle));
+            title.Set(WebViewBackend.GetTitle(handle));
             NavComplete.Raise();
-            app.RequestRedraw();
+            dirty = true;
         }
+        string docTitle = title.Get();
+        if (docTitle != lastSeenTitle) {
+            lastSeenTitle = docTitle;
+            TitleChanged.Raise();
+            dirty = true;
+        }
+        if (dirty) { app.RequestRedraw(); }
         return handle;
     }
 

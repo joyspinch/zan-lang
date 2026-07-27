@@ -1,0 +1,58 @@
+using System;
+using Gui;
+
+/// Headless checks for the pieces of the Zan-side COM interop the WebView2
+/// backend is built from: GUID marshalling, vtable object layout, slot
+/// dispatch and the widget's URL/profile helpers. Creating a browser needs a
+/// window and the WebView2 runtime, so that part is covered by the smoke test.
+delegate int TwoArgFn(nint self, nint a);
+
+class Program {
+    static string Bytes(nint p, int n) {
+        string digits = "0123456789abcdef";
+        string outp = "";
+        int i = 0;
+        while (i < n) {
+            int b = NativeMemory.GetByte(p, i);
+            outp = outp + digits.Substring((b >> 4) & 15, 1);
+            outp = outp + digits.Substring(b & 15, 1);
+            i = i + 1;
+        }
+        return outp;
+    }
+
+    /// Stands in for a COM method: returns the sum so the caller can prove the
+    /// `this` pointer and the argument both arrived.
+    static int Method(nint self, nint a) {
+        return NativeMemory.GetI64(self, 8) + a;
+    }
+
+    static void Main() {
+        // GUID text -> the little-endian layout COM expects.
+        nint g = Com.Guid("9E8F0CF8-E670-4B5E-B2BC-73E061E3184C");
+        Console.WriteLine($"guid={Program.Bytes(g, 16)}");
+        NativeMemory.Free(g);
+
+        // A Zan-implemented COM object: vtable pointer first, then the state
+        // word, and slot dispatch through Com.Call1.
+        ComVtbl v = ComVtbl.Create(5);
+        v.Add(0);
+        v.Add(0);
+        v.Add(0);
+        v.Add(0);
+        v.Add((nint)Program.Method);
+        nint obj = v.Build();
+        v.SetState(40);
+        Console.WriteLine($"state={ComVtbl.State(obj)}");
+        Console.WriteLine($"slot4={Com.Call1(obj, 4, 2)}");
+        // An empty slot fails instead of jumping to address zero.
+        Console.WriteLine($"empty={Com.Call1(obj, 1, 0) < 0}");
+
+        string host = WebView2.HostOf("https://user.example.com:8443/a/b?q=1");
+        string bare = WebView2.HostOf("example.org");
+        Console.WriteLine($"host={host}");
+        Console.WriteLine($"bare={bare}");
+        Console.WriteLine($"safe={WebView2.IsSafeChar('a')}{WebView2.IsSafeChar('/')}");
+        Console.WriteLine($"missing={WebView2.Get(99) == null}");
+    }
+}

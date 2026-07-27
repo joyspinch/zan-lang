@@ -2964,6 +2964,15 @@ static LLVMValueRef emit_expr_cast_expr(zan_irgen_t *g, zan_ast_node_t *expr,
         if (src == target) return val;
         LLVMTypeKind sk = LLVMGetTypeKind(src);
         LLVMTypeKind tk = LLVMGetTypeKind(target);
+        /* Address <-> pointer: `(WndProc)addr` turns a runtime-resolved
+         * address into a callable function pointer, and `(nint)handler` hands
+         * a Zan function to native code as a callback address. Both are the
+         * building blocks for calling vtable-based APIs (COM) and for any
+         * entry point resolved with GetProcAddress/dlsym. */
+        if (sk == LLVMIntegerTypeKind && tk == LLVMPointerTypeKind)
+            return LLVMBuildIntToPtr(g->builder, val, target, "cast.p");
+        if (sk == LLVMPointerTypeKind && tk == LLVMIntegerTypeKind)
+            return LLVMBuildPtrToInt(g->builder, val, target, "cast.a");
         bool src_fp = (sk == LLVMDoubleTypeKind || sk == LLVMFloatTypeKind);
         bool tgt_fp = (tk == LLVMDoubleTypeKind || tk == LLVMFloatTypeKind);
         if (sk == LLVMIntegerTypeKind && tk == LLVMIntegerTypeKind) {

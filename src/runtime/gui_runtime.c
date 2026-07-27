@@ -1256,6 +1256,3 @@ EXPORT void zan_gui_blit_image(i64 surf_id, const char *path,
 #include "gui_runtime_x11.c"
 #include "gui_runtime_font.c"
 #include "gui_runtime_shims.c"
-#if defined(_WIN32) && defined(ZAN_GUI_WEBVIEW2)
-#include "gui_runtime_webview2.c"
-#endif

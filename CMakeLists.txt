@@ -57,8 +57,8 @@ message(STATUS "Found LLVM ${LLVM_PACKAGE_VERSION}")
 message(STATUS "Using LLVMConfig.cmake in: ${LLVM_DIR}")
 
 # Cross-compile backends beyond x86/aarch64 are optional: not every LLVM
-# distribution builds them (e.g. mozbuild clang omits RISCV). Link ¡ª and
-# initialize, via HAVE_LLVM_* defines ¡ª only the ones this LLVM provides.
+# distribution builds them (e.g. mozbuild clang omits RISCV). Link ï¿½ï¿½ and
+# initialize, via HAVE_LLVM_* defines ï¿½ï¿½ only the ones this LLVM provides.
 set(ZAN_LLVM_COMPONENTS
     core support analysis bitwriter target
     x86codegen x86asmparser x86desc x86info
@@ -365,19 +365,11 @@ if(ZAN_BUILD_GUI)
     if(WIN32)
         add_library(zan_gui SHARED src/runtime/gui_runtime.c)
         target_link_libraries(zan_gui PRIVATE user32 gdi32 dwmapi shcore imm32 ole32)
-        # Embedded WebView: the Edge WebView2 backend needs the SDK header, which
-        # is vendored under stdlib/Gui/native/webview2. Its loader
-        # (WebView2Loader.dll, shipped in the zan_gui driver bundle) is resolved
-        # at run time, so a machine without the WebView2 runtime still runs GUI
-        # apps -- the widget falls back to its placeholder.
-        if(EXISTS "${CMAKE_SOURCE_DIR}/stdlib/Gui/native/webview2/WebView2.h")
-            target_compile_definitions(zan_gui PRIVATE ZAN_GUI_WEBVIEW2)
-            target_include_directories(zan_gui
-                PRIVATE "${CMAKE_SOURCE_DIR}/stdlib/Gui/native/webview2")
-        else()
-            message(STATUS "WebView2 SDK header not vendored; zan_gui WebView "
-                           "falls back to the placeholder backend")
-        endif()
+        # Embedded WebView needs nothing here: the Edge WebView2 backend is
+        # written in Zan (stdlib/Gui/WebView2.zan) against its COM interfaces,
+        # and resolves WebView2Loader.dll (shipped in the zan_gui driver
+        # bundle) at run time, so a machine without the WebView2 runtime still
+        # runs GUI apps -- the widget falls back to its placeholder.
         set(ZAN_GUI_AVAILABLE TRUE)
     elseif(ZAN_GUI_SDL)
         # SDL owns the window/event pump/present; the shared software rasterizer
@@ -715,7 +707,19 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_css${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
-  set_tests_properties(runtime_gui conformance_gui_stack conformance_gui_text conformance_gui_codeeditor conformance_gui_datatable conformance_gui_css PROPERTIES
+  # The Zan-side COM interop the WebView2 backend is built from (GUID
+  # marshalling, vtable objects, slot dispatch, URL/profile helpers) is pure
+  # computation; embedding a live browser is covered by the smoke test.
+  add_test(NAME conformance_gui_webview_interop
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/webview_interop_test.zan
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/stdlib/Gui/WebView2.zan;--auto-stdlib;--driver-dir;$<TARGET_FILE_DIR:zan_gui>"
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_webview_interop.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_webview_interop${_exe_ext}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+
+  set_tests_properties(runtime_gui conformance_gui_stack conformance_gui_text conformance_gui_codeeditor conformance_gui_datatable conformance_gui_css conformance_gui_webview_interop PROPERTIES
     ENVIRONMENT "ZAN_LIB_PATH=$<TARGET_FILE_DIR:zan_gui>;LD_LIBRARY_PATH=$<TARGET_FILE_DIR:zan_gui>;DYLD_LIBRARY_PATH=$<TARGET_FILE_DIR:zan_gui>")
 endif()
 

@@ -104,21 +104,19 @@ EXPORT void zan_gui_set_ime_pos(i64 x, i64 y) { (void)x; (void)y; }
  * Embedded WebView (native browser control).
  *
  * A real, navigable web view is a heavyweight, per-platform native control
- * (WKWebView on macOS, WebView2 on Windows, WebKitGTK on Linux). Two backends
- * implement it: macOS (gui_runtime_mac.m, ZAN_GUI_COCOA) as a WKWebView subview
- * of the window's content view, and Windows (gui_runtime_webview2.c,
- * ZAN_GUI_WEBVIEW2) as an Edge WebView2 controller over the window -- both with
- * cookie access, navigation monitoring (URL/title/status) and JavaScript eval.
- * Everywhere else these are no-op stubs: zan_gui_webview_create returns 0 so
- * the Zan WebView widget can detect the lack of native support and paint an
- * in-canvas placeholder instead of embedding a live browser.
+ * (WKWebView on macOS, WebView2 on Windows, WebKitGTK on Linux). Only macOS
+ * needs a backend here (gui_runtime_mac.m, ZAN_GUI_COCOA): a WKWebView subview
+ * of the window's content view. Windows drives Edge WebView2 from Zan itself
+ * (stdlib/Gui/WebView2.zan, straight against its COM interfaces) and never
+ * calls these exports. Everywhere else they are no-op stubs:
+ * zan_gui_webview_create returns 0 so the Zan WebView widget can detect the
+ * lack of native support and paint an in-canvas placeholder instead of
+ * embedding a live browser.
  * ======================================================================== */
-#if !defined(ZAN_GUI_COCOA) && !defined(ZAN_GUI_WEBVIEW2)
+#if !defined(ZAN_GUI_COCOA)
 /* profile_id selects a per-account isolation profile (see WebView.zan). When a
  * real backend is added here it should map profile_id to that engine's data
- * partitioning: on Windows a WebView2 per-profile user-data folder (distinct
- * CreateCoreWebView2EnvironmentWithOptions userDataFolder, or ICoreWebView2Profile
- * on newer runtimes); on Linux a WebKitGTK WebKitWebsiteDataManager with a
+ * partitioning -- on Linux a WebKitGTK WebKitWebsiteDataManager with a
  * per-profile base data/cache directory. Until then it is a no-op stub. */
 EXPORT i64 zan_gui_webview_create(i64 hwnd, const char *profile_id) {
     (void)hwnd; (void)profile_id; return 0;
