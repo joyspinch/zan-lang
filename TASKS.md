@@ -157,6 +157,22 @@
     （`UndoDepth` / `Undo` 附近）尚未复现出最小用例。
   * 当前仓库状态：`map_type` 仍是 i64，383 处 C 签名改动未提交。
 
+  **颜色的最终形态（2026-07-27 决定）**：不把颜色改成 `uint`，改成 CSS 化的
+  值类型 `Gui.Color`（`f632a44`）——内部一个 packed `uint argb`，
+  `Color.Parse("#d92b2b" / "rgba() " / "transparent")`、`ToCss()`、
+  `ToArgb()` 只在渲染 / 平台边界出现、`Color.None()`/`IsNone()` 取代 alpha=0
+  哨兵。这样 A0-1 切 i32 后 `gui_css` 的有符号问题不复存在。
+  前置已完成：
+  * 值类型此前不可用，两个缺陷已修（`33a66df`）：返回的 struct 当接收者要落
+    临时槽；集合槽是 8 字节，struct 元素要打包/解包，超宽的给出诊断。
+    新增 `tests/conformance/value_structs`。
+  * struct 与整数不兼容此前只有 LLVM 校验失败（无行号），已改成带位置的
+    类型错误（`94cf827`），迁移时靠它扫残留点。
+  尚未做的迁移（一整批，必须一次做完）：`Canvas` 的绘制参数（1223 处调用，
+  连 tests/examples 是 1634 处）、`Theme` 的颜色 token、`StyleBox` 的 11 个
+  颜色字段（175 处引用），以及 `App.LerpColor` / `Fx` / `Effects` /
+  `ChartView` 里的颜色算术改成 `Color` 上的方法。
+
 * **A0-2** FFI 边界按声明类型的真实位宽 lower。现在 `map_type`（`irgen.c:1601`）对
   `int`/`uint`/`long`/`nint` 一律给 i64，于是：传参时把 64 位塞给期望 32 位的 C 函数；
   取返回值时按 64 位读，而 C 只保证低 32 位有效，**高位是未定义的**
