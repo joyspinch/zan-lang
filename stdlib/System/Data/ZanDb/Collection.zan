@@ -77,10 +77,36 @@ class Collection {
 
     string Name() { return this.name; }
 
+    // Ids appear in every document key and every index entry, so their text
+    // form is a large part of the file. They are written as six base-64 digits
+    // over the printable alphabet '?'..'~' (0x3F..0x7E): byte order still
+    // equals numeric order, so B+Tree order remains insertion order, the
+    // alphabet contains neither 0x00 nor the ':' and tab that delimit keys, and
+    // six digits still cover 64^6 = 68 billion ids -- half the width of the
+    // twelve decimal digits used before.
+    static int ID_DIGITS = 6;
+
     static string PadId(int id) {
-        string s = Convert.ToString(id);
-        while (s.Length < 12) { s = "0" + s; }
+        ByteBuffer b = ByteBuffer.Alloc(Collection.ID_DIGITS);
+        int shift = (Collection.ID_DIGITS - 1) * 6;
+        while (shift >= 0) {
+            b.WriteU8(63 + ((id >> shift) & 63));
+            shift = shift - 6;
+        }
+        string s = b.ToStr();
+        b.Free();
         return s;
+    }
+
+    /// <summary>Inverse of PadId.</summary>
+    static int UnpadId(string s) {
+        int v = 0;
+        int i = 0;
+        while (i < s.Length) {
+            v = (v << 6) | ((s[i] & 255) - 63);
+            i = i + 1;
+        }
+        return v;
     }
 
     string DocKey(int id) {
@@ -103,8 +129,16 @@ class Collection {
         return "m:" + this.name + ":idxpos:" + field;
     }
 
+    /// <summary>Prefix shared by every entry of one indexed field. The field
+    /// is named by its dictionary id rather than spelled out, so a long field
+    /// name costs nothing per entry.</summary>
+    string IdxPrefix(string field, string val) {
+        return "i:" + this.name + ":" + Collection.PadId(KeyIdOf(field)) + ":"
+               + val + "\t";
+    }
+
     string IdxKey(string field, string val, int id) {
-        return "i:" + this.name + ":" + field + ":" + val + "\t" + Collection.PadId(id);
+        return IdxPrefix(field, val) + Collection.PadId(id);
     }
 
     void LoadIndexMeta() {
@@ -339,15 +373,17 @@ class Collection {
         return o;
     }
 
+    /// <summary>Id encoded in the trailing digits of a key. Both row keys and
+    /// index entries end with a fixed-width id, so no delimiter is searched
+    /// for -- an id digit may legitimately look like one.</summary>
+    static int IdOfKey(string key) {
+        int off = key.Length - Collection.ID_DIGITS;
+        if (off < 0) { return 0; }
+        return Collection.UnpadId(key.Substring(off, Collection.ID_DIGITS));
+    }
+
     static string IdFromKey(string key) {
-        int p = -1;
-        int i = key.Length - 1;
-        while (i >= 0) {
-            if ((key[i] & 255) == 58) { p = i; break; }   // ':'
-            i = i - 1;
-        }
-        string suf = key.Substring(p + 1, key.Length - p - 1);
-        return Convert.ToString(Convert.ToInt(suf));
+        return Convert.ToString(Collection.IdOfKey(key));
     }
 
     /// <summary>Decodes a binary record body (see EncodeDoc) back into a
@@ -451,7 +487,7 @@ class Collection {
         while (i < this.indexedFields.Count) {
             string f = this.indexedFields[i];
             if (doc.Has(f)) {
-                this.kv.Put(IdxKey(f, doc.Get(f).AsString(""), id), Convert.ToString(id));
+                this.kv.Put(IdxKey(f, doc.Get(f).AsString(""), id), "");
             }
             i = i + 1;
         }
@@ -629,8 +665,7 @@ class Collection {
             JsonValue d = batch[i];
             int id = d.Int("_id", 0);
             if (d.Has(field)) {
-                this.kv.Put(IdxKey(field, d.Get(field).AsString(""), id),
-                    Convert.ToString(id));
+                this.kv.Put(IdxKey(field, d.Get(field).AsString(""), id), "");
             }
             if (id > last) { last = id; }
             i = i + 1;
@@ -671,10 +706,10 @@ class Collection {
         if (HasIndex(field) && !this.kv.Contains(IdxPosKey(field))) {
             List<string> ks = new List<string>();
             List<string> vs = new List<string>();
-            this.kv.ScanPrefix("i:" + this.name + ":" + field + ":" + val + "\t", 0, ks, vs);
+            this.kv.ScanPrefix(IdxPrefix(field, val), 0, ks, vs);
             int i = 0;
-            while (i < vs.Count) {
-                JsonValue d = FindById(Collection.ParseI64(vs[i]));
+            while (i < ks.Count) {
+                JsonValue d = FindById(Collection.IdOfKey(ks[i]));
                 if (d != null) { docs.Add(d); }
                 i = i + 1;
             }
@@ -724,8 +759,7 @@ class Collection {
             // A ready index answers from its keys alone: no document is read.
             List<string> ks = new List<string>();
             List<string> vs = new List<string>();
-            n = this.kv.ScanPrefix("i:" + this.name + ":" + field + ":" + val
-                                   + "\t", 0, ks, vs);
+            n = this.kv.ScanPrefix(IdxPrefix(field, val), 0, ks, vs);
             this.kv.EndSnapshot();
             return n;
         }

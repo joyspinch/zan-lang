@@ -145,6 +145,39 @@ class Program {
         Check("batch-empty-collection", none.BuildIndexStep("z", 100)
             && none.IndexReady("z"));
 
+        // Ids are encoded in the key, and every id digit must survive that
+        // round trip: a digit that happens to look like the ':' or tab that
+        // separate key parts used to be read back as a different id, so the
+        // index and a plain scan disagreed. 600 documents cover the whole
+        // low digit range.
+        Collection wide = db2.GetCollection("wide");
+        int w = 0;
+        while (w < 600) {
+            JsonValue d = JsonValue.NewObject();
+            d.Put("k", JsonValue.NewStr("k" + Convert.ToString(w % 4)));
+            d.Put("n", JsonValue.NewNum(Convert.ToString(w)));
+            wide.Insert(d);
+            w = w + 1;
+        }
+        bool idsRoundTrip = true;
+        List<JsonValue> all = wide.FindAll();
+        int a = 0;
+        while (a < all.Count) {
+            int id = all[a].Int("_id", 0);
+            JsonValue back = wide.FindById(id);
+            if (back == null || back.Int("n", -1) != all[a].Int("n", -2)) {
+                idsRoundTrip = false;
+            }
+            a = a + 1;
+        }
+        Check("wide-id-roundtrip", all.Count == 600 && idsRoundTrip);
+        Check("wide-scan-count", wide.Query().WhereEq("k", "k2").Count() == 150);
+        wide.EnsureIndex("k");
+        Check("wide-index-agrees-with-scan",
+            wide.FindByIndex("k", "k2").Count == 150
+            && wide.Query().WhereEq("k", "k2").Count() == 150
+            && wide.Query().WhereEq("k", "k0").ToList().Count == 150);
+
         db2.Close();
         File.Delete(path);
         File.Delete(path + "-wal");
