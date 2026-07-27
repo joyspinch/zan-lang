@@ -1207,7 +1207,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
         }
 
         /* File.ReadAllText(path) -> string */
-        if (is_call_to(expr, "File", "ReadAllText") && expr->call.args.count == 1 &&
+        if (!zan_type_defines(g, "File", "ReadAllText") &&
+            is_call_to(expr, "File", "ReadAllText") && expr->call.args.count == 1 &&
             !src_method_takes_over(g, expr, locals)) {
             zan_ast_node_t *path_ast = expr->call.args.items[0];
             LLVMValueRef path_arg = emit_expr(g, path_ast, locals);
@@ -1286,7 +1287,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
         }
 
         /* File.WriteAllText(path, content) */
-        if (is_call_to(expr, "File", "WriteAllText") && expr->call.args.count == 2 &&
+        if (!zan_type_defines(g, "File", "WriteAllText") &&
+            is_call_to(expr, "File", "WriteAllText") && expr->call.args.count == 2 &&
             !src_method_takes_over(g, expr, locals)) {
             zan_ast_node_t *path_ast = expr->call.args.items[0];
             zan_ast_node_t *content_ast = expr->call.args.items[1];
@@ -1411,7 +1413,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
         }
 
         /* File.AppendAllText(path, content) */
-        if (is_call_to(expr, "File", "AppendAllText") && expr->call.args.count == 2 &&
+        if (!zan_type_defines(g, "File", "AppendAllText") &&
+            is_call_to(expr, "File", "AppendAllText") && expr->call.args.count == 2 &&
             !src_method_takes_over(g, expr, locals)) {
             LLVMValueRef path_arg = emit_expr(g, expr->call.args.items[0], locals);
             LLVMValueRef content_arg = emit_expr(g, expr->call.args.items[1], locals);
@@ -1449,7 +1452,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
         }
 
         /* File.Exists(path) -> bool */
-        if (is_call_to(expr, "File", "Exists") && expr->call.args.count == 1 &&
+        if (!zan_type_defines(g, "File", "Exists") &&
+            is_call_to(expr, "File", "Exists") && expr->call.args.count == 1 &&
             !src_method_takes_over(g, expr, locals)) {
             LLVMValueRef path_arg = emit_expr(g, expr->call.args.items[0], locals);
             LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
@@ -1485,7 +1489,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
         }
 
         /* File.Delete(path) */
-        if (is_call_to(expr, "File", "Delete") && expr->call.args.count == 1 &&
+        if (!zan_type_defines(g, "File", "Delete") &&
+            is_call_to(expr, "File", "Delete") && expr->call.args.count == 1 &&
             !src_method_takes_over(g, expr, locals)) {
             LLVMValueRef path_arg = emit_expr(g, expr->call.args.items[0], locals);
             LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
@@ -1502,7 +1507,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
         }
 
         /* File.Move(source, dest) — rename */
-        if (is_call_to(expr, "File", "Move") && expr->call.args.count == 2 &&
+        if (!zan_type_defines(g, "File", "Move") &&
+            is_call_to(expr, "File", "Move") && expr->call.args.count == 2 &&
             !src_method_takes_over(g, expr, locals)) {
             LLVMValueRef src = emit_expr(g, expr->call.args.items[0], locals);
             LLVMValueRef dst = emit_expr(g, expr->call.args.items[1], locals);
@@ -1522,7 +1528,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
         }
 
         /* File.Copy(source, dest) — read source, write dest */
-        if (is_call_to(expr, "File", "Copy") && expr->call.args.count == 2 &&
+        if (!zan_type_defines(g, "File", "Copy") &&
+            is_call_to(expr, "File", "Copy") && expr->call.args.count == 2 &&
             !src_method_takes_over(g, expr, locals)) {
             LLVMValueRef src = emit_expr(g, expr->call.args.items[0], locals);
             LLVMValueRef dst = emit_expr(g, expr->call.args.items[1], locals);
@@ -1604,7 +1611,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
         }
 
         /* File.GetSize(path) -> int */
-        if (is_call_to(expr, "File", "GetSize") && expr->call.args.count == 1 &&
+        if (!zan_type_defines(g, "File", "GetSize") &&
+            is_call_to(expr, "File", "GetSize") && expr->call.args.count == 1 &&
             !src_method_takes_over(g, expr, locals)) {
             LLVMValueRef path_arg = emit_expr(g, expr->call.args.items[0], locals);
             LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
@@ -1647,7 +1655,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
         }
 
         /* Directory.Exists(path) -> bool */
-        if (is_call_to(expr, "Directory", "Exists") && expr->call.args.count == 1) {
+        if (!zan_type_defines(g, "Directory", "Exists") &&
+            is_call_to(expr, "Directory", "Exists") && expr->call.args.count == 1) {
             LLVMValueRef path_arg = emit_expr(g, expr->call.args.items[0], locals);
             LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
             LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
@@ -1715,7 +1724,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
 
         /* Directory.ListNames(pattern) — '\n'-joined file names matching a
          * glob (runtime helper zan_dir_list_into fills an rc string buffer). */
-        if (is_call_to(expr, "Directory", "ListNames") && expr->call.args.count == 1) {
+        if (!zan_type_defines(g, "Directory", "ListNames") &&
+            is_call_to(expr, "Directory", "ListNames") && expr->call.args.count == 1) {
             g->uses_sync_runtime = true;
             LLVMValueRef pat = emit_expr(g, expr->call.args.items[0], locals);
             LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
@@ -1732,7 +1742,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
         }
 
         /* Directory.CreateDirectory(path) */
-        if (is_call_to(expr, "Directory", "CreateDirectory") && expr->call.args.count == 1) {
+        if (!zan_type_defines(g, "Directory", "CreateDirectory") &&
+            is_call_to(expr, "Directory", "CreateDirectory") && expr->call.args.count == 1) {
             LLVMValueRef path_arg = emit_expr(g, expr->call.args.items[0], locals);
             LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
             LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
@@ -1759,7 +1770,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
         }
 
         /* Directory.Delete(path) */
-        if (is_call_to(expr, "Directory", "Delete") && expr->call.args.count == 1) {
+        if (!zan_type_defines(g, "Directory", "Delete") &&
+            is_call_to(expr, "Directory", "Delete") && expr->call.args.count == 1) {
             LLVMValueRef path_arg = emit_expr(g, expr->call.args.items[0], locals);
             LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
             LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
@@ -1776,7 +1788,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
         }
 
         /* Directory.GetCurrentDirectory() -> string */
-        if (is_call_to(expr, "Directory", "GetCurrentDirectory") && expr->call.args.count == 0) {
+        if (!zan_type_defines(g, "Directory", "GetCurrentDirectory") &&
+            is_call_to(expr, "Directory", "GetCurrentDirectory") && expr->call.args.count == 0) {
             LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
             LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
             LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
@@ -1794,7 +1807,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
         }
 
         /* Directory.SetCurrentDirectory(path) */
-        if (is_call_to(expr, "Directory", "SetCurrentDirectory") && expr->call.args.count == 1) {
+        if (!zan_type_defines(g, "Directory", "SetCurrentDirectory") &&
+            is_call_to(expr, "Directory", "SetCurrentDirectory") && expr->call.args.count == 1) {
             LLVMValueRef path_arg = emit_expr(g, expr->call.args.items[0], locals);
             LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
             LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
