@@ -1592,9 +1592,18 @@ static void emit_pending_method_specs(zan_irgen_t *g);
 /* Resolve a type reference appearing in the body currently being emitted,
  * substituting the active method specialization's type parameters (T -> the
  * concrete type bound at the call site that created the specialization). */
+static zan_type_t *subst_type_param_deep(zan_irgen_t *g, zan_type_t *t,
+                                         zan_type_t *recv);
+
 static zan_type_t *resolve_type_ctx(zan_irgen_t *g, zan_ast_node_t *tref) {
     zan_type_t *t = zan_binder_resolve_type(g->binder, tref);
     if (g->cur_mtps && t) t = subst_method_tp(g, t, g->cur_mtps, g->cur_mbind);
+    /* A type written in the source of a specialized body means the concrete
+     * type: a local declared `T` in Box<Square> holds a Square and owns it like
+     * one, and `new List<T>()` builds a list of Squares. Left as a type
+     * parameter, such a local was not rc-managed, so it borrowed a value that
+     * was released underneath it. */
+    if (t && g->cur_inst) t = subst_type_param_deep(g, t, g->cur_inst);
     return t;
 }
 
@@ -2181,9 +2190,6 @@ static LLVMValueRef get_calloc_fn(zan_irgen_t *g) {
  * buffers before the struct itself. `coll_kind` is 1=List, 2=StringBuilder,
  * 3=Dict.
  * Returns the user pointer (i8*), i.e. the struct base past the header. */
-static zan_type_t *subst_type_param_deep(zan_irgen_t *g, zan_type_t *t,
-                                         zan_type_t *recv);
-
 static LLVMValueRef emit_alloc_rc_collection(zan_irgen_t *g, zan_ast_node_t *expr,
                                              long size, int coll_kind,
                                              zan_type_t *elem_type) {

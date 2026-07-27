@@ -1,0 +1,156 @@
+using System;
+using System.Threading;
+
+namespace System.Data;
+
+/// <summary>
+/// The bookkeeping every driver connection pool shares: the free list, the
+/// live/waiting counters, the wakeup gate and the closed flag. A driver pool
+/// keeps only its endpoint parameters and its own way of opening a connection
+/// (usually a coroutine), and delegates the rest here.
+///
+/// The core never touches a connection itself -- it neither probes liveness nor
+/// closes anything -- so it works for any connection type, including the
+/// interface-typed <see cref="DbPool"/>. The driver pool decides whether a
+/// connection coming off the free list is still usable and reports the verdict
+/// back with <see cref="Pool"/> or <see cref="Drop"/>.
+///
+/// Pools rely on the cooperative single-thread-per-scheduler model: the free
+/// list is only touched between await points, so no lock is required. Parking
+/// stays in the driver pool -- <c>EnterWait</c>,
+/// <c>await core.Waiter().Wait()</c>, <c>LeaveWait</c> -- so the coroutine that
+/// suspends is the one the caller awaited.
+/// </summary>
+class PoolCore<T> {
+    int maxSize;
+    List<T> idle;
+    int liveCount;      // total opened connections (idle + checked out)
+    int waiting;        // coroutines currently parked waiting for a connection
+    Gate gate;          // event-driven wakeup for waiters (replaces poll)
+    bool closed;
+
+    /// <summary>Creates a core capped at <paramref name="maxSize"/> live
+    /// connections (at least one).</summary>
+    static PoolCore<T> Create(int maxSize) {
+        if (maxSize < 1) {
+            maxSize = 1;
+        }
+        PoolCore<T> p = new PoolCore<T>();
+        p.maxSize = maxSize;
+        p.idle = new List<T>();
+        p.liveCount = 0;
+        p.waiting = 0;
+        p.gate = Gate.Create();
+        p.closed = false;
+        return p;
+    }
+
+    /// <summary>Takes the most recently returned connection off the free list,
+    /// or null when it is empty. The caller checks whether it is still usable
+    /// and calls <see cref="Drop"/> for the ones that have died while parked
+    /// (server restart, idle timeout).</summary>
+    T TakeIdle() {
+        if (this.idle.Count == 0) {
+            return null;
+        }
+        int last = this.idle.Count - 1;
+        T c = this.idle[last];
+        this.idle.RemoveAt(last);
+        return c;
+    }
+
+    /// <summary>Parks a usable connection on the free list and wakes a waiter.</summary>
+    void Pool(T c) {
+        this.idle.Add(c);
+        if (this.waiting > 0) {
+            this.gate.Signal();
+        }
+    }
+
+    /// <summary>Accounts for a connection that left the pool for good (closed,
+    /// broken, or evicted): its slot is freed and a waiter may open a fresh
+    /// connection in its place.</summary>
+    void Drop() {
+        if (this.liveCount > 0) {
+            this.liveCount = this.liveCount - 1;
+        }
+        if (this.waiting > 0) {
+            this.gate.Signal();
+        }
+    }
+
+    /// <summary>Reserves a slot for a connection about to be opened. Reserving
+    /// before the open completes stops concurrent acquirers from both deciding
+    /// there is room and overshooting the cap.</summary>
+    bool TryReserve() {
+        if (this.liveCount < this.maxSize) {
+            this.liveCount = this.liveCount + 1;
+            return true;
+        }
+        return false;
+    }
+
+    /// <summary>Gives back a slot whose open failed, and lets a waiter retry.</summary>
+    void UndoReserve() {
+        this.Drop();
+    }
+
+    /// <summary>The gate a saturated pool parks its acquirers on. Its counting
+    /// semantics plus the caller's recheck loop guarantee no lost wakeup.</summary>
+    Gate Waiter() {
+        return this.gate;
+    }
+
+    /// <summary>Registers the calling coroutine as parked, before it awaits the
+    /// gate, so a releaser knows it has to signal.</summary>
+    void EnterWait() {
+        this.waiting = this.waiting + 1;
+    }
+
+    /// <summary>Unregisters a coroutine woken from the gate.</summary>
+    void LeaveWait() {
+        this.waiting = this.waiting - 1;
+    }
+
+    /// <summary>Number of idle (pooled, ready-to-use) connections.</summary>
+    int IdleCount() {
+        return this.idle.Count;
+    }
+
+    /// <summary>Total live connections (idle + checked out).</summary>
+    int LiveCount() {
+        return this.liveCount;
+    }
+
+    /// <summary>Coroutines currently parked waiting for a connection.</summary>
+    int WaitingCount() {
+        return this.waiting;
+    }
+
+    /// <summary>Maximum number of concurrently live connections.</summary>
+    int MaxSize() {
+        return this.maxSize;
+    }
+
+    /// <summary>True once the pool has been closed.</summary>
+    bool IsClosed() {
+        return this.closed;
+    }
+
+    /// <summary>Marks the pool closed: acquirers return null and released
+    /// connections are dropped instead of pooled.</summary>
+    void MarkClosed() {
+        this.closed = true;
+    }
+
+    /// <summary>Wakes every parked waiter; each rechecks the closed pool and
+    /// returns null.</summary>
+    void WakeAll() {
+        int n = this.waiting;
+        int k = 0;
+        while (k < n) {
+            this.gate.Signal();
+            k = k + 1;
+        }
+    }
+}

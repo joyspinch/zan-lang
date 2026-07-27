@@ -32,12 +32,7 @@ class MySqlPool {
     string database;
     string user;
     string password;
-    int maxSize;
-    List<MySqlConnection> idle;
-    int liveCount;      // total opened connections (idle + checked out)
-    int waiting;        // coroutines currently parked in AcquireAsync
-    Gate gate;          // event-driven wakeup for waiters (replaces poll)
-    bool closed;
+    PoolCore<MySqlConnection> core;
 
     MySqlPool(string host, int port, string database, string user,
             string password, int maxSize) {
@@ -46,12 +41,7 @@ class MySqlPool {
         this.database = database;
         this.user = user;
         this.password = password;
-        this.maxSize = maxSize;
-        this.idle = new List<MySqlConnection>();
-        this.liveCount = 0;
-        this.waiting = 0;
-        this.gate = Gate.Create();
-        this.closed = false;
+        this.core = PoolCore<MySqlConnection>.Create(maxSize);
     }
 
     /// <summary>Creates a pool bound to a MySQL/MariaDB endpoint.</summary>
@@ -60,91 +50,81 @@ class MySqlPool {
         return new MySqlPool(host, port, database, user, password, maxSize);
     }
 
-    /// <summary>Checks out a connection: reuses an idle one, opens a new one if
-    /// under the cap, otherwise suspends the coroutine until one is released.</summary>
-    async MySqlConnection AcquireAsync() {
-        while (true) {
-            if (this.closed) {
-                return null;
-            }
-            if (this.idle.Count > 0) {
-                int last = this.idle.Count - 1;
-                MySqlConnection c = this.idle[last];
-                this.idle.RemoveAt(last);
-                return c;
-            }
-            if (this.liveCount < this.maxSize) {
-                this.liveCount = this.liveCount + 1;
-                MySqlConnection c = await MySqlConnection.OpenParamsAsync(
-                    this.host, this.port, this.database, this.user, this.password);
-                if (!c.IsConnected()) {
-                    this.liveCount = this.liveCount - 1;
-                }
-                return c;
-            }
-            // Pool saturated: park until a connection is released. The gate's
-            // counting semantics + this recheck loop guarantee no lost wakeup.
-            this.waiting = this.waiting + 1;
-            await this.gate.Wait();
-            this.waiting = this.waiting - 1;
-        }
-        return null;
+    async MySqlConnection OpenOne() {
+        return await MySqlConnection.OpenParamsAsync(this.host, this.port,
+                                                     this.database, this.user,
+                                                     this.password);
     }
+
+    /// <summary>Checks out a connection: reuses an idle one, opens a new one if
+    /// under the cap, otherwise suspends the coroutine until one is released.
+    /// Returns null once the pool has been closed.</summary>
+    async MySqlConnection AcquireAsync() {{
+        while (true) {{
+            if (this.core.IsClosed()) {{
+                return null;
+            }}
+            MySqlConnection pooled = this.core.TakeIdle();
+            while (pooled != null) {{
+                // A connection can rot while parked (server restart, idle
+                // timeout): evict it and free its slot for a waiter.
+                if (pooled.IsConnected()) {{
+                    return pooled;
+                }}
+                this.core.Drop();
+                pooled = this.core.TakeIdle();
+            }}
+            if (this.core.TryReserve()) {{
+                MySqlConnection opened = await this.OpenOne();
+                if (opened == null || !opened.IsConnected()) {{
+                    this.core.UndoReserve();
+                }}
+                return opened;
+            }}
+            // Pool saturated: park until a connection is released.
+            this.core.EnterWait();
+            await this.core.Waiter().Wait();
+            this.core.LeaveWait();
+        }}
+        return null;
+    }}
 
     /// <summary>Returns a connection to the pool. A broken or post-Close()
     /// connection is closed and dropped instead of being pooled.</summary>
-    void Release(MySqlConnection c) {
-        if (c == null) {
+    void Release(MySqlConnection c) {{
+        if (c == null) {{
             return;
-        }
-        if (this.closed || !c.IsConnected()) {
-            if (c.IsConnected()) {
+        }}
+        if (this.core.IsClosed() || !c.IsConnected()) {{
+            if (c.IsConnected()) {{
                 c.Close();
-            }
-            if (this.liveCount > 0) {
-                this.liveCount = this.liveCount - 1;
-            }
-            // A live slot freed up: let a waiter open a fresh connection.
-            if (this.waiting > 0) {
-                this.gate.Signal();
-            }
+            }}
+            this.core.Drop();
             return;
-        }
-        this.idle.Add(c);
-        if (this.waiting > 0) {
-            this.gate.Signal();
-        }
-    }
+        }}
+        this.core.Pool(c);
+    }}
 
     /// <summary>Number of idle (pooled, ready-to-use) connections.</summary>
-    int IdleCount() {
-        return this.idle.Count;
-    }
+    int IdleCount() {{
+        return this.core.IdleCount();
+    }}
 
     /// <summary>Total live connections (idle + checked out).</summary>
-    int LiveCount() {
-        return this.liveCount;
-    }
+    int LiveCount() {{
+        return this.core.LiveCount();
+    }}
 
     /// <summary>Closes all idle connections and marks the pool closed. Connections
     /// still checked out are closed when they are released.</summary>
-    void Close() {
-        this.closed = true;
-        while (this.idle.Count > 0) {
-            int last = this.idle.Count - 1;
-            MySqlConnection c = this.idle[last];
-            this.idle.RemoveAt(last);
+    void Close() {{
+        this.core.MarkClosed();
+        MySqlConnection c = this.core.TakeIdle();
+        while (c != null) {{
             c.Close();
-            if (this.liveCount > 0) {
-                this.liveCount = this.liveCount - 1;
-            }
-        }
-        // Wake every parked waiter; each rechecks `closed` and returns null.
-        int n = this.waiting;
-        int k = 0;
-        while (k < n) {
-            this.gate.Signal();
-            k = k + 1;
-        }
-    }
-}
+            this.core.Drop();
+            c = this.core.TakeIdle();
+        }}
+        this.core.WakeAll();
+    }}
+}}
