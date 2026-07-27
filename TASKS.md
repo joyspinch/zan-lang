@@ -894,6 +894,9 @@ header-only 库 / C 回调 / 结构体字段偏移，全部对应 A2 / A3 / A4�
 **状态：A15-1 / A15-2 / A15-3 已修并推送（`1dd023d`），新增
 `byte_unsigned`、`array_init_foreach`、`struct_operators` 三个 conformance。
 A15-7（foreach 只能迭代 List）是修 A15-2 时实测发现的，一并修掉。
+A15-8（数组没有长度，字段/参数上 `.Length` 和 foreach 都不可用）已修
+（`a44a807`），A15-9（irgen 用 C 硬编码 43 个静态库调用，屏蔽 Zan 实现）
+已按 Path/File/Directory 处理（`b0f74ac`、`1cd90dd`）。
 A15-4 / A15-5 / A15-6 未做。**
 
 标准库里那些"看着绕"的封装，多数不是风格问题，是被下面这些缺口逼出来的。
@@ -966,13 +969,35 @@ foreach 把任何集合都按 List 布局读（count 取字段 0、data 取字�
 数组（字段、参数）给出诊断而不是崩溃——真正的修法是给数组加长度头，
 与 A1 `Span<T>` 一起做。
 
+## A15-8 数组不带长度 — 已修 `a44a807`
+
+数组曾是裸 calloc 缓冲，长度存在声明处旁边的一个 alloca 里，于是 `.Length`
+只在局部变量上可用：数组**字段和参数**根本没有长度，foreach 它们是编译错误。
+**这就是 stdlib 到处 `while (i < n)` 并额外传一个 count 参数的原因。**
+现在数组在缓冲区前面多分配 16 字节存元素个数，程序拿到的指针仍指向第一个
+元素，所以传给 C 的行为不变；`.Length` 对任意数组表达式读这个头，foreach
+用它做上界。
+
+## A15-9 irgen 用 C 硬编码库调用，屏蔽 Zan 实现 — Path/File/Directory 已修
+
+irgen 按"类名 + 方法名"直接 lower 了 **43 个**静态库调用
+（`Path` 7、`File` 8、`Directory` 6、`Math` 8、`Console` 8、`Environment` 3、
+`Convert`/`String`/`Task` 各 1），于是同名的 Zan 实现根本不可达——
+`stdlib/System/IO/Path.zan` 整个是死代码，改它没有任何效果，而 C 版的 bug
+（`GetDirectoryName("c.txt")` 返回整个路径、`ChangeExtension` 无扩展名时崩溃）
+在 Zan 里修不掉。这是"用 Zan 替代 C"这条主线上最直接的一处倒挂。
+
+现在这些位置在程序确实定义了该方法时让位给真实定义，没有 stdlib 时仍走内建
+兜底。`Path`（已用纯 Zan 重写，去掉 6 个 crt import）、`File`、`Directory`
+共 21 处已处理；`Math` / `Console` / `Environment` / `Convert` 在 stdlib 里
+没有对应的 Zan 类，要先写出来才能同样处理。
+
 ## A15-6 其它已确认的小差异
 
 * `char` 打印成数字（`'A'` → `65`），C# 打印字符。
 * `ulong` 字面量超过 i64 上限会被夹到 `9223372036854775807`。
 * struct 与整数不兼容此前只有无行号的 LLVM 校验失败——已修（`94cf827`）。
-* 数组是裸缓冲区，长度只在声明处记住：数组字段/参数没有 `.Length`，也不能
-  foreach。属于 A1 的范围。
+* ~~数组是裸缓冲区，长度只在声明处记住~~ 已修，见 A15-8。
 
 ## 建议顺序
 
