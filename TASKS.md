@@ -1417,6 +1417,28 @@ string base 实参、`List<string>` 字段 + string base 实参、三层继承�
 `LLVM verification failed: Incorrect number of arguments`，另一个会话正在改的
 `stdlib/Sdk/Wechat/*`，与本条无关）。
 
+## A25 — `--check-leaks` 的计数器不是线程安全的（已修，A22 的遗留项）
+
+现象：多线程程序即使一个对象都没漏，`--check-leaks` 也会随机报数。探针
+`_scratch/thr_alloc.zan`（5 个线程 × 5000 个 `List<string>`，全程不抛异常）同一个
+二进制每跑一次报的数字都不一样：27 / 60 / 320 / ……
+
+根因：`__zan_live` 和 `__zan_site_live[site]` 的加减是普通的
+load → add → store 三件套（`src/compiler/irgen.c` 里 `zan_rt_alloc` /
+`zan_rt_release` / `zan_rt_str_alloc` / `zan_rt_str_release` 四处）。对象的引用计数
+本身早就是 `atomicrmw`，唯独这两个统计量不是，于是两个线程同时分配就丢一次更新，
+最终净值偏正——报成"泄漏"。偏负的情况同样存在，那会**漏报**真实泄漏。
+
+改法：新增 `emit_leak_counter_add()`，四处都改成 `atomicrmw add/sub`
+（monotonic：只关心计数值本身，报告在 atexit 里读）。
+
+实测：`thr_alloc` 8 跑 8 次都只有 `25000` 一行、无泄漏行；
+`tests/conformance/exception_threads.zan --check-leaks` 5 跑 5 次
+`ok 1500 / bad 0` 且无泄漏行。于是把 A22 里临时摘掉的 leakcheck 变体放回去
+（删掉 `CMakeLists.txt` 的 `_no_leakcheck`），`leakcheck_exception_threads` 现在是
+正常门禁。子集 `ctest -R 'exception|thread|leakcheck|arc|generic'` = 239 个里 237 过，
+2 个失败仍是既有的 WeChat SDK codegen 错误（见 A24）。
+
 ---
 
 # 已撤回的结论（早期草稿中的错误，勿再引用）

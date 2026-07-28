@@ -588,6 +588,21 @@ static void emit_oom_check(zan_irgen_t *g, LLVMValueRef fn, LLVMValueRef raw) {
     LLVMPositionBuilderAtEnd(g->builder, ok_bb);
 }
 
+/* Add `delta` to a leak-tracking counter (`__zan_live` or a `__zan_site_live`
+ * bucket). Allocation and release happen on every thread the scheduler runs --
+ * `Thread.Start` bodies and coroutine workers alike -- so a load/add/store
+ * trio loses updates whenever two threads allocate at once, which reported a
+ * random handful of "still reachable" objects for programs that leaked
+ * nothing. Relaxed ordering is enough: only the counter value matters, and the
+ * report runs from atexit. */
+static void emit_leak_counter_add(zan_irgen_t *g, LLVMValueRef ptr, long long delta) {
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+    LLVMBuildAtomicRMW(g->builder,
+        delta < 0 ? LLVMAtomicRMWBinOpSub : LLVMAtomicRMWBinOpAdd, ptr,
+        LLVMConstInt(i64, (unsigned long long)(delta < 0 ? -delta : delta), 0),
+        LLVMAtomicOrderingMonotonic, 0);
+}
+
 /* On Windows, guard an about-to-be-dereferenced string header pointer (obj-8,
  * the STRING_MAGIC slot) against freed/unmapped pages. The tolerant retain and
  * release probe [obj-8] to decide whether a pointer is a managed string; for a
@@ -1371,14 +1386,10 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         zan_call2(g->builder, free_fn_type, g->fn_free, &header_ptr, 1, "");
         if (g->check_leaks) {
             /* leak tracking: one fewer live object, and one fewer at this site */
-            LLVMValueRef lv = LLVMBuildLoad2(g->builder, i64, g->g_live, "live");
-            LLVMValueRef lv1 = zan_sub(g->builder, lv, LLVMConstInt(i64, 1, 0), "live_dec");
-            LLVMBuildStore(g->builder, lv1, g->g_live);
+            emit_leak_counter_add(g, g->g_live, -1);
             LLVMValueRef gidx[2] = { LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0), site };
             LLVMValueRef sc_ptr = LLVMBuildGEP2(g->builder, g->site_live_type, g->g_site_live, gidx, 2, "scptr");
-            LLVMValueRef sc = LLVMBuildLoad2(g->builder, i64, sc_ptr, "sc");
-            LLVMValueRef sc1 = zan_sub(g->builder, sc, LLVMConstInt(i64, 1, 0), "sc_dec");
-            LLVMBuildStore(g->builder, sc1, sc_ptr);
+            emit_leak_counter_add(g, sc_ptr, -1);
         }
         LLVMBuildBr(g->builder, ret_bb);
         LLVMPositionBuilderAtEnd(g->builder, ret_bb);
@@ -1468,14 +1479,10 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         if (g->check_leaks) {
             /* leak tracking: total + per-site count, and record the site name */
             LLVMValueRef z32 = LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
-            LLVMValueRef lv = LLVMBuildLoad2(g->builder, i64, g->g_live, "live");
-            LLVMValueRef lv1 = zan_add(g->builder, lv, LLVMConstInt(i64, 1, 0), "live_inc");
-            LLVMBuildStore(g->builder, lv1, g->g_live);
+            emit_leak_counter_add(g, g->g_live, 1);
             LLVMValueRef gidx[2] = { z32, site };
             LLVMValueRef sc_ptr = LLVMBuildGEP2(g->builder, g->site_live_type, g->g_site_live, gidx, 2, "scptr");
-            LLVMValueRef sc = LLVMBuildLoad2(g->builder, i64, sc_ptr, "sc");
-            LLVMValueRef sc1 = zan_add(g->builder, sc, LLVMConstInt(i64, 1, 0), "sc_inc");
-            LLVMBuildStore(g->builder, sc1, sc_ptr);
+            emit_leak_counter_add(g, sc_ptr, 1);
             LLVMValueRef nm_ptr = LLVMBuildGEP2(g->builder, g->site_names_type, g->g_site_names, gidx, 2, "nmptr");
             LLVMBuildStore(g->builder, name, nm_ptr);
         }
@@ -1508,9 +1515,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMValueRef sixteen = LLVMConstInt(i64, 16, 0);
         LLVMValueRef user_ptr = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx), raw, &sixteen, 1, "usr");
         if (g->check_leaks) {
-            LLVMValueRef lv = LLVMBuildLoad2(g->builder, i64, g->g_live, "live");
-            LLVMValueRef lv1 = zan_add(g->builder, lv, LLVMConstInt(i64, 1, 0), "live_inc");
-            LLVMBuildStore(g->builder, lv1, g->g_live);
+            emit_leak_counter_add(g, g->g_live, 1);
         }
         LLVMBuildRet(g->builder, user_ptr);
     }
@@ -1600,9 +1605,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
             (LLVMTypeRef[]){ i8p }, 1, 0);
         zan_call2(g->builder, free_fn_type, g->fn_free, &header_ptr, 1, "");
         {
-            LLVMValueRef lv = LLVMBuildLoad2(g->builder, i64t, g->g_live, "live");
-            LLVMValueRef lv1 = zan_sub(g->builder, lv, LLVMConstInt(i64t, 1, 0), "live_dec");
-            LLVMBuildStore(g->builder, lv1, g->g_live);
+            emit_leak_counter_add(g, g->g_live, -1);
         }
         LLVMBuildBr(g->builder, ret_bb);
         LLVMPositionBuilderAtEnd(g->builder, ret_bb);
