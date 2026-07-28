@@ -512,7 +512,7 @@ static void emit_leak_report_support(zan_irgen_t *g) {
 }
 
 /* defined in later-included parts of this translation unit */
-static void emit_eh_tmp_push_slot(zan_irgen_t *g, LLVMValueRef slot);
+static void emit_eh_tmp_push_slot(zan_irgen_t *g, LLVMValueRef slot, bool is_string);
 static void emit_eh_tmp_pop(zan_irgen_t *g);
 static void emit_eh_tmp_drop(zan_irgen_t *g, LLVMValueRef obj);
 
@@ -535,7 +535,7 @@ static void arc_own_local(zan_irgen_t *g, local_scope_t *locals) {
     local_var_t *v = &locals->vars[locals->count - 1];
     v->arc_owned = 1;
     if (v->eh_slot || g->current_async_frame || !local_owns_arc(v)) return;
-    emit_eh_tmp_push_slot(g, v->alloca);
+    emit_eh_tmp_push_slot(g, v->alloca, v->type->kind == TYPE_STRING);
     v->eh_slot = 1;
 }
 

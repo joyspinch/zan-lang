@@ -1085,8 +1085,10 @@ static LLVMValueRef get_eh_tmp_pop_fn(zan_irgen_t *g) {
     return fn;
 }
 
-/* void __zan_eh_tmp_unwind(i32 mark): release (via zan_rt_release_dyn) every
- * stacked temp above `mark`, restoring the stack to the try-entry depth. */
+/* void __zan_eh_tmp_unwind(i32 mark): release every stacked temp above
+ * `mark`, restoring the stack to the try-entry depth. Object/class entries use
+ * zan_rt_release_dyn; string slots use zan_rt_str_release because strings have
+ * a different header and are not valid inputs to the dynamic object releaser. */
 static LLVMValueRef get_eh_tmp_unwind_fn(zan_irgen_t *g) {
     LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "__zan_eh_tmp_unwind");
     if (fn) return fn;
@@ -1104,7 +1106,8 @@ static LLVMValueRef get_eh_tmp_unwind_fn(zan_irgen_t *g) {
     LLVMBasicBlockRef rel = LLVMAppendBasicBlockInContext(g->ctx, fn, "rel");
     LLVMBasicBlockRef rel_slot = LLVMAppendBasicBlockInContext(g->ctx, fn, "rel.slot");
     LLVMBasicBlockRef rel_obj = LLVMAppendBasicBlockInContext(g->ctx, fn, "rel.obj");
-    LLVMBasicBlockRef rel_do = LLVMAppendBasicBlockInContext(g->ctx, fn, "rel.do");
+    LLVMBasicBlockRef rel_dyn = LLVMAppendBasicBlockInContext(g->ctx, fn, "rel.dyn");
+    LLVMBasicBlockRef rel_str = LLVMAppendBasicBlockInContext(g->ctx, fn, "rel.str");
     LLVMBasicBlockRef done = LLVMAppendBasicBlockInContext(g->ctx, fn, "done");
     LLVMPositionBuilderAtEnd(g->builder, entry);
     LLVMBuildBr(g->builder, head);
@@ -1125,12 +1128,12 @@ static LLVMValueRef get_eh_tmp_unwind_fn(zan_irgen_t *g) {
         arr_g, gi, 2, "slot");
     LLVMValueRef obj = LLVMBuildLoad2(g->builder, i8ptr, slot, "obj");
     LLVMBuildStore(g->builder, LLVMConstNull(i8ptr), slot);
-    /* Two entry flavours share the stack (the low bit tags them, every rc
-     * object and alloca being at least 2-byte aligned): a plain object
-     * pointer (a call temp), or a *variable slot* whose current value is the
-     * object to release. The slot flavour keeps up with reassignment and
-     * lets the release null the variable out, so the frame's own scope-exit
-     * release -- reached only when no exception was raised -- stays correct. */
+    /* Three entry flavours share the stack. Plain object pointers have both
+     * low bits clear (RC allocations are naturally aligned). Variable slots
+     * set bit 0; string slots additionally set bit 1. The slot flavour keeps
+     * up with reassignment and lets unwind null the variable. The string bit
+     * is required because zan_rt_release_dyn expects an object allocation
+     * header, while Zan strings use zan_rt_str_release. */
     LLVMValueRef obj_i = LLVMBuildPtrToInt(g->builder, obj,
         LLVMInt64TypeInContext(g->ctx), "obji");
     LLVMValueRef tagged = LLVMBuildTrunc(g->builder,
@@ -1138,24 +1141,33 @@ static LLVMValueRef get_eh_tmp_unwind_fn(zan_irgen_t *g) {
     LLVMBuildCondBr(g->builder, tagged, rel_slot, rel_obj);
 
     LLVMPositionBuilderAtEnd(g->builder, rel_slot);
+    LLVMValueRef is_string_slot = zan_icmp(g->builder, LLVMIntNE,
+        zan_and(g->builder, obj_i,
+            LLVMConstInt(LLVMInt64TypeInContext(g->ctx), 2, 0), "strbit"),
+        LLVMConstInt(LLVMInt64TypeInContext(g->ctx), 0, 0), "isstr");
     LLVMValueRef untag = LLVMBuildIntToPtr(g->builder,
         zan_and(g->builder, obj_i,
-            LLVMConstInt(LLVMInt64TypeInContext(g->ctx), ~(uint64_t)1, 0), "untag"),
+            LLVMConstInt(LLVMInt64TypeInContext(g->ctx), ~(uint64_t)3, 0), "untag"),
         i8ptr, "vslot");
     LLVMValueRef vobj = LLVMBuildLoad2(g->builder, i8ptr, untag, "vobj");
     LLVMBuildStore(g->builder, LLVMConstNull(i8ptr), untag);
-    LLVMBuildBr(g->builder, rel_do);
+    LLVMBuildCondBr(g->builder, is_string_slot, rel_str, rel_dyn);
 
     LLVMPositionBuilderAtEnd(g->builder, rel_obj);
-    LLVMBuildBr(g->builder, rel_do);
+    LLVMBuildBr(g->builder, rel_dyn);
 
-    LLVMPositionBuilderAtEnd(g->builder, rel_do);
-    LLVMValueRef vic = LLVMBuildPhi(g->builder, i8ptr, "vic");
-    LLVMValueRef vic_v[2] = { vobj, obj };
-    LLVMBasicBlockRef vic_b[2] = { rel_slot, rel_obj };
-    LLVMAddIncoming(vic, vic_v, vic_b, 2);
+    LLVMPositionBuilderAtEnd(g->builder, rel_dyn);
+    LLVMValueRef dyn_obj = LLVMBuildPhi(g->builder, i8ptr, "dyn.obj");
+    LLVMValueRef dyn_v[2] = { vobj, obj };
+    LLVMBasicBlockRef dyn_b[2] = { rel_slot, rel_obj };
+    LLVMAddIncoming(dyn_obj, dyn_v, dyn_b, 2);
     zan_call2(g->builder, LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), &i8ptr, 1, 0),
-        g->rt_release_dyn, &vic, 1, "");
+        g->rt_release_dyn, &dyn_obj, 1, "");
+    LLVMBuildBr(g->builder, head);
+
+    LLVMPositionBuilderAtEnd(g->builder, rel_str);
+    zan_call2(g->builder, LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), &i8ptr, 1, 0),
+        g->rt_str_release, &vobj, 1, "");
     LLVMBuildBr(g->builder, head);
     LLVMPositionBuilderAtEnd(g->builder, done);
     LLVMBuildRetVoid(g->builder);
@@ -1176,13 +1188,14 @@ static void emit_eh_tmp_push(zan_irgen_t *g, LLVMValueRef obj) {
  * below this frame releases whatever the variable holds at that moment, which
  * is the only way a longjmp-based unwind can free the locals of the frames it
  * skips over (A8-12). */
-static void emit_eh_tmp_push_slot(zan_irgen_t *g, LLVMValueRef slot) {
+static void emit_eh_tmp_push_slot(zan_irgen_t *g, LLVMValueRef slot, bool is_string) {
     if (!slot || LLVMGetTypeKind(LLVMTypeOf(slot)) != LLVMPointerTypeKind) return;
     LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    uint64_t tag = is_string ? 3 : 1;
     LLVMValueRef tagged = LLVMBuildIntToPtr(g->builder,
         zan_or(g->builder, LLVMBuildPtrToInt(g->builder, slot, i64t, "slot.i"),
-            LLVMConstInt(i64t, 1, 0), "slot.t"),
+            LLVMConstInt(i64t, tag, 0), "slot.t"),
         i8ptr, "eh.slot");
     LLVMTypeRef fnty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), &i8ptr, 1, 0);
     zan_call2(g->builder, fnty, get_eh_tmp_push_fn(g), &tagged, 1, "");
