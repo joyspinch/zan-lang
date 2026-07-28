@@ -93,6 +93,7 @@ typedef enum {
     FK_CLASS,
     FK_JSONVALUE,
     FK_LIST,
+    FK_LIST2,      /* List<List<T>> */
     FK_SKIP,
 } jg_fk_t;
 
@@ -125,9 +126,21 @@ static jg_fk_t jg_classify(zan_ast_node_t *unit, zan_ast_node_t *tref,
     zan_istr_t name = tref->type_ref.name;
     if (istr_is(name, "List") && tref->type_ref.type_args.count == 1) {
         zan_ast_node_t *ea = tref->type_ref.type_args.items[0];
-        if (!ea || ea->kind != AST_TYPE_REF || ea->type_ref.is_array ||
-            ea->type_ref.type_args.count > 0)
+        if (!ea || ea->kind != AST_TYPE_REF || ea->type_ref.is_array)
             return FK_SKIP;
+        if (istr_is(ea->type_ref.name, "List") &&
+            ea->type_ref.type_args.count == 1) {
+            zan_ast_node_t *inner = ea->type_ref.type_args.items[0];
+            if (!inner || inner->kind != AST_TYPE_REF || inner->type_ref.is_array ||
+                inner->type_ref.type_args.count > 0)
+                return FK_SKIP;
+            jg_fk_t ik = jg_classify_base(unit, inner->type_ref.name);
+            if (ik == FK_SKIP) return FK_SKIP;
+            *elem_name = inner->type_ref.name;
+            *elem_kind = ik;
+            return FK_LIST2;
+        }
+        if (ea->type_ref.type_args.count > 0) return FK_SKIP;
         jg_fk_t ek = jg_classify_base(unit, ea->type_ref.name);
         if (ek == FK_SKIP) return FK_SKIP;
         *elem_name = ea->type_ref.name;
@@ -410,7 +423,8 @@ static void jg_gen_fields(jg_ctx_t *c, jg_buf_t *out, zan_istr_t cls_name,
             continue;
         }
         if (fk == FK_CLASS) jg_need_add(&c->need, tname);
-        if (fk == FK_LIST && ek == FK_CLASS) jg_need_add(&c->need, elem_name);
+        if ((fk == FK_LIST || fk == FK_LIST2) && ek == FK_CLASS)
+            jg_need_add(&c->need, elem_name);
 
         if (mode == 2) {
             jg_putf(out, "        sb.Append(\"%s\\\"%.*s\\\":\");\n",
@@ -500,6 +514,59 @@ static void jg_gen_fields(jg_ctx_t *c, jg_buf_t *out, zan_istr_t cls_name,
                     "        }\n"
                     "        sb.Append(\"]\");\n",
                     FL, FS, FL, FS, FL, FS, FL, FS, FL, FS, wr, FL, FS, FL, FS);
+                break;
+            }
+            case FK_LIST2: {
+                int EL = (int)elem_name.len;
+                const char *ES = elem_name.str;
+                char item[192];
+                snprintf(item, sizeof(item), "o.%.*s[i_%.*s][k_%.*s]",
+                         FL, FS, FL, FS, FL, FS);
+                char wr[512];
+                switch (ek) {
+                case FK_INT:
+                case FK_FLOAT:
+                    snprintf(wr, sizeof(wr), "sb.Append(Convert.ToString(%s));", item);
+                    break;
+                case FK_ENUM:
+                    snprintf(wr, sizeof(wr), "sb.Append(Convert.ToString((int)%s));", item);
+                    break;
+                case FK_BOOL:
+                    snprintf(wr, sizeof(wr), "if (%s) { sb.Append(\"true\"); } else { sb.Append(\"false\"); }", item);
+                    break;
+                case FK_STRING:
+                    snprintf(wr, sizeof(wr), "if (%s == null) { sb.Append(\"null\"); } else { sb.Append(\"\\\"\"); sb.Append(Encoding.JsonEscape(%s)); sb.Append(\"\\\"\"); }", item, item);
+                    break;
+                case FK_JSONVALUE:
+                    snprintf(wr, sizeof(wr), "if (%s == null) { sb.Append(\"null\"); } else { sb.Append(%s.ToJson()); }", item, item);
+                    break;
+                default:
+                    snprintf(wr, sizeof(wr), "__JsonBind.W_%.*s(sb, %s);", EL, ES, item);
+                    break;
+                }
+                jg_putf(out,
+                    "        sb.Append(\"[\");\n"
+                    "        if (o.%.*s != null) {\n"
+                    "            int i_%.*s = 0;\n"
+                    "            while (i_%.*s < o.%.*s.Count) {\n"
+                    "                if (i_%.*s > 0) { sb.Append(\",\"); }\n"
+                    "                sb.Append(\"[\");\n"
+                    "                if (o.%.*s[i_%.*s] != null) {\n"
+                    "                    int k_%.*s = 0;\n"
+                    "                    while (k_%.*s < o.%.*s[i_%.*s].Count) {\n"
+                    "                        if (k_%.*s > 0) { sb.Append(\",\"); }\n"
+                    "                        %s\n"
+                    "                        k_%.*s = k_%.*s + 1;\n"
+                    "                    }\n"
+                    "                }\n"
+                    "                sb.Append(\"]\");\n"
+                    "                i_%.*s = i_%.*s + 1;\n"
+                    "            }\n"
+                    "        }\n"
+                    "        sb.Append(\"]\");\n",
+                    FL, FS, FL, FS, FL, FS, FL, FS, FL, FS,
+                    FL, FS, FL, FS, FL, FS, FL, FS, FL, FS, FL, FS,
+                    FL, FS, wr, FL, FS, FL, FS, FL, FS, FL, FS);
                 break;
             }
             default: break;
@@ -598,6 +665,49 @@ static void jg_gen_fields(jg_ctx_t *c, jg_buf_t *out, zan_istr_t cls_name,
                     FL, FS, FL, FS, FL, FS, FL, FS, FL, FS, conv_one);
                 break;
             }
+            case FK_LIST2: {
+                int EL = (int)elem_name.len;
+                const char *ES = elem_name.str;
+                char elem_from[256];
+                switch (ek) {
+                case FK_INT: snprintf(elem_from, sizeof(elem_from), "(%.*s)%%s.AsInt(0)", EL, ES); break;
+                case FK_ENUM: snprintf(elem_from, sizeof(elem_from), "%%s.AsInt(0)"); break;
+                case FK_FLOAT: snprintf(elem_from, sizeof(elem_from), "(%.*s)%%s.AsDouble(0.0)", EL, ES); break;
+                case FK_BOOL: snprintf(elem_from, sizeof(elem_from), "%%s.AsBool(false)"); break;
+                case FK_STRING: snprintf(elem_from, sizeof(elem_from), "%%s.AsString(\"\")"); break;
+                case FK_JSONVALUE: snprintf(elem_from, sizeof(elem_from), "%%s"); break;
+                default: snprintf(elem_from, sizeof(elem_from), "__JsonBind.B_%.*s(%%s)", EL, ES); break;
+                }
+                char src[160], conv[512];
+                snprintf(src, sizeof(src), "row_%.*s.At(k_%.*s)", FL, FS, FL, FS);
+                snprintf(conv, sizeof(conv), elem_from, src);
+                jg_putf(out,
+                    "        JsonValue j_%.*s = v.Get(\"%.*s\");\n"
+                    "        o.%.*s = new List<List<%.*s>>();\n"
+                    "        if (j_%.*s != null && j_%.*s.IsArray()) {\n"
+                    "            int i_%.*s = 0;\n"
+                    "            while (i_%.*s < j_%.*s.Count()) {\n"
+                    "                JsonValue row_%.*s = j_%.*s.At(i_%.*s);\n"
+                    "                List<%.*s> values_%.*s = new List<%.*s>();\n"
+                    "                if (row_%.*s != null && row_%.*s.IsArray()) {\n"
+                    "                    int k_%.*s = 0;\n"
+                    "                    while (k_%.*s < row_%.*s.Count()) {\n"
+                    "                        values_%.*s.Add(%s);\n"
+                    "                        k_%.*s = k_%.*s + 1;\n"
+                    "                    }\n"
+                    "                }\n"
+                    "                o.%.*s.Add(values_%.*s);\n"
+                    "                i_%.*s = i_%.*s + 1;\n"
+                    "            }\n"
+                    "        }\n",
+                    FL, FS, FL, FS, FL, FS, EL, ES,
+                    FL, FS, FL, FS, FL, FS, FL, FS, FL, FS,
+                    FL, FS, FL, FS, FL, FS, EL, ES, FL, FS, EL, ES,
+                    FL, FS, FL, FS, FL, FS, FL, FS, FL, FS,
+                    FL, FS, conv, FL, FS, FL, FS, FL, FS, FL, FS,
+                    FL, FS, FL, FS, FL, FS);
+                break;
+            }
             default: break;
             }
         } else {
@@ -684,6 +794,46 @@ static void jg_gen_fields(jg_ctx_t *c, jg_buf_t *out, zan_istr_t cls_name,
                     "        }\n"
                     "        v.Put(\"%.*s\", a_%.*s);\n",
                     FL, FS, FL, FS, FL, FS, FL, FS, FL, FS, FL, FS, conv,
+                    FL, FS, FL, FS, FL, FS, FL, FS);
+                break;
+            }
+            case FK_LIST2: {
+                int EL = (int)elem_name.len;
+                const char *ES = elem_name.str;
+                char elem_to[256];
+                switch (ek) {
+                case FK_INT:
+                case FK_FLOAT: snprintf(elem_to, sizeof(elem_to), "JsonValue.NewNum(Convert.ToString(%%s))"); break;
+                case FK_ENUM: snprintf(elem_to, sizeof(elem_to), "JsonValue.NewNum(Convert.ToString((int)%%s))"); break;
+                case FK_BOOL: snprintf(elem_to, sizeof(elem_to), "JsonValue.NewBool(%%s)"); break;
+                case FK_STRING: snprintf(elem_to, sizeof(elem_to), "__JsonBind.T_Str(%%s)"); break;
+                case FK_JSONVALUE: snprintf(elem_to, sizeof(elem_to), "__JsonBind.T_Jv(%%s)"); break;
+                default: snprintf(elem_to, sizeof(elem_to), "__JsonBind.T_%.*s(%%s)", EL, ES); break;
+                }
+                char item[192], conv[512];
+                snprintf(item, sizeof(item), "o.%.*s[i_%.*s][k_%.*s]", FL, FS, FL, FS, FL, FS);
+                snprintf(conv, sizeof(conv), elem_to, item);
+                jg_putf(out,
+                    "        JsonValue a_%.*s = JsonValue.NewArray();\n"
+                    "        if (o.%.*s != null) {\n"
+                    "            int i_%.*s = 0;\n"
+                    "            while (i_%.*s < o.%.*s.Count) {\n"
+                    "                JsonValue row_%.*s = JsonValue.NewArray();\n"
+                    "                if (o.%.*s[i_%.*s] != null) {\n"
+                    "                    int k_%.*s = 0;\n"
+                    "                    while (k_%.*s < o.%.*s[i_%.*s].Count) {\n"
+                    "                        row_%.*s.Append(%s);\n"
+                    "                        k_%.*s = k_%.*s + 1;\n"
+                    "                    }\n"
+                    "                }\n"
+                    "                a_%.*s.Append(row_%.*s);\n"
+                    "                i_%.*s = i_%.*s + 1;\n"
+                    "            }\n"
+                    "        }\n"
+                    "        v.Put(\"%.*s\", a_%.*s);\n",
+                    FL, FS, FL, FS, FL, FS, FL, FS, FL, FS, FL, FS,
+                    FL, FS, FL, FS, FL, FS, FL, FS, FL, FS, FL, FS,
+                    FL, FS, conv, FL, FS, FL, FS, FL, FS, FL, FS,
                     FL, FS, FL, FS, FL, FS, FL, FS);
                 break;
             }

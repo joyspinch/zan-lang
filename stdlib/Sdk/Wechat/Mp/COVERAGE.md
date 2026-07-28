@@ -2,7 +2,7 @@
 
 本目录迁移自 `WeiXinMPSDK-master/src/Senparc.Weixin.MP/.../AdvancedAPIs`。
 映射代码由 `scripts/generate_wechat_mp.py` 从仓库内固定的 C# 源码快照生成。
-这里的目标不是复制 C# 的 DI、MVC、反射序列化和数百个 JSON POCO，而是保留公开 API 名称与微信 HTTP 端点，统一复用 Zan 标准库 HTTP / JSON / 加密能力。
+这里保留公开 API 名称、方法专属请求/响应契约和微信 HTTP 端点；484 个可复用业务实体按原 C# 类型身份集中到 `../Models/Mp/WechatMpModels.zan`，统一复用 Zan 标准库 HTTP / JSON / 加密能力，不复制 C# 的 DI、MVC 和反射基础设施。
 
 ## 当前覆盖
 
@@ -21,15 +21,18 @@ using Sdk.Wechat;
 using Sdk.Wechat.Mp;
 
 WechatClient client = new WechatClient("app-id", "app-secret");
-WechatMpDraftApi draft = new WechatMpDraftApi(client);
-WechatResponse result = await draft.AddDraftAsync("", draftJson);
+WechatMpUserApi users = new WechatMpUserApi(client);
+WechatMpUserApiInfoResponse result = await users.InfoAsync(
+    new WechatMpUserApiInfoRequest().OpenId("openid"));
+Console.WriteLine(result.nickname);
 ```
 
-- GET：`MethodAsync(query)`；
-- JSON POST：`MethodAsync(query, jsonBody)`；
-- `query` 不含开头 `?`，没有 query 时传空串（传入 `?` 也会被兼容）；
-- 返回值统一为 `WechatResponse`，继续使用 `System.Json.JsonValue` 读取业务字段；
-- Token 缓存、HTTPS、超时、JSON 错误码处理都由 `WechatClient` 负责。
+- 每个方法生成独立 Request/Response 契约，IDE 可补全请求 setter 和响应字段；
+- Request 自动区分 path/query/body，调用方不再拼 query 或 JSON；
+- 业务 DTO 按 C# 命名空间、外层类型链和类型名去重，集中在 `Sdk.Wechat.Models.Mp`；
+- Response 继承共享实体，嵌套对象、列表和嵌套列表也引用共享类型，动态字典才保留 `JsonValue`；
+- token 缓存、HTTPS、超时、JSON 错误码处理都由 `WechatClient` 负责；
+- `*RawAsync(...)` 是明确的高级兼容入口，不是普通调用方式。
 
 ## 已迁移模块
 
@@ -98,16 +101,8 @@ WechatResponse result = await draft.AddDraftAsync("", draftJson);
 | `QrCode/QrCodeApi.cs` | `ShowQrCodeAsync` | multipart / 文件流 / 二进制 |
 | `ShakeAround/ShakeAroundApi.cs` | `UploadImageAsync` | multipart / 文件流 / 二进制 |
 
-这些方法需要先在 `System.Net.Http.Client.HttpClient` 增加可复用的 multipart、字节响应和流式下载能力；在此之前不能用 JSON POST 冒充。
+这些方法属于文件路径/流对象或二进制/CSV 返回形态，不能伪装成普通 JSON 方法；对应能力由共享 `WechatMultipart`、`WechatRawResponse` 和专用接口承载。
 
-## 尚未迁移的产品线
+## 其他产品线
 
-| 产品线 | C# 文件数 |
-|---|---:|
-| 企业微信 `Senparc.Weixin.Work` | 608 |
-| 微信支付 `Senparc.Weixin.TenPay` | 432 |
-| 小程序 `Senparc.Weixin.WxOpen` | 343 |
-| 开放平台 `Senparc.Weixin.Open` | 194 |
-| 通用层 `Senparc.Weixin` | 81 |
-
-因此当前准确状态是：**公众号 MP 的普通 JSON Advanced API 已大面积迁移；整个 Senparc 微信 SDK 尚未全部迁完。**
+企业微信 Work、小程序 WxOpen、开放平台 Open 和微信支付 TenPay 已迁移，详见上级目录的 `PRODUCT_COVERAGE.md`。

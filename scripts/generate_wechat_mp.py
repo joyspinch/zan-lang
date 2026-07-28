@@ -12,6 +12,8 @@ remain explicitly skipped until the shared HTTP standard library supports them.
 from pathlib import Path
 import re, json
 
+from wechat_typed_codegen import ModelIndex, SharedModelRegistry, emit_typed_classes
+
 ROOT = Path.cwd()
 src = (ROOT / 'stdlib/Sdk/WeiXinMPSDK-master/src/Senparc.Weixin.MP/Senparc.Weixin.MP/AdvancedAPIs').resolve()
 out = ROOT / 'stdlib/Sdk/Wechat/Mp'
@@ -214,6 +216,8 @@ def class_name(rel):
     return 'WechatMp' + ''.join(names) + 'Api'
 
 files = sorted({p.resolve() for p in src.rglob('*.cs') if p.name.lower().endswith('api.cs')})
+model_index = ModelIndex(src.parent, strip_comments)
+models = SharedModelRegistry(model_index, 'WechatMp')
 manifest = []
 skipped = []
 total = 0
@@ -225,6 +229,7 @@ for p in files:
     if rel_text == 'OAuth/OAuthApi.cs':
         continue
     methods = parse_methods(text)
+    for method in methods: method['source'] = p.as_posix()
     by_name = {}
     for method in methods:
         by_name.setdefault(method['name'], []).append(method)
@@ -259,7 +264,8 @@ for p in files:
         if not urls:
             skipped.append((rel_text, method['name'], 'endpoint unresolved'))
             continue
-        path = base_path(urls[0])
+        endpoint = urls[0]
+        path = base_path(endpoint)
         if not path.startswith('/'):
             skipped.append((rel_text, method['name'], 'invalid endpoint'))
             continue
@@ -274,22 +280,37 @@ for p in files:
         emitted.append({
             'name': method['name'],
             'path': path,
+            'endpoint': endpoint,
             'verb': 'GET' if is_get else 'POST',
             'resolution': resolution,
+            'method': method,
         })
 
     if not emitted:
         continue
     cls = class_name(rel)
+    typed = []
+    meta = []
+    for entry in emitted:
+        req, resp, declarations = emit_typed_classes(
+            cls, entry['method'], entry['endpoint'], entry['verb'],
+            'access_token', model_index, entry['method']['source'], models)
+        typed.extend(declarations)
+        meta.append((entry, req, resp))
     lines = [
         'using System;',
+        'using System.Json;',
         'using Sdk.Wechat;',
+        'using Sdk.Wechat.Models.Mp;',
         '',
         'namespace Sdk.Wechat.Mp;',
         '',
+        '/// <summary>Method request/response contracts; reusable DTO entities live in Sdk.Wechat.Models.Mp.</summary>',
+    ]
+    lines.extend(typed)
+    lines += [
         '/// <summary>',
-        f'/// {rel_text} 的 Zan JSON 接口。',
-        '/// 参数保持为 query / JSON，避免复制 C# SDK 的 ASP.NET、DI 和序列化实体层。',
+        f'/// {rel_text} 的 Zan 强类型 JSON 接口。',
         f'/// {MARKER}; do not hand-copy HTTP logic here.',
         '/// </summary>',
         f'class {cls} {{',
@@ -300,22 +321,31 @@ for p in files:
         '    }',
         '',
     ]
-    for entry in emitted:
+    for entry, req, resp in meta:
         lines.append(f'    /// <summary>{entry["verb"]} {entry["path"]}</summary>')
-        if entry['verb'] == 'GET':
-            lines += [
-                f'    async WechatResponse {entry["name"]}(string query) {{',
-                f'        return await WechatMpRequest.GetAsync(this.client, "{entry["path"]}", query);',
-                '    }',
-                '',
-            ]
+        arg = f'{req} request' if req else ''
+        lines.append(f'    async {resp} {entry["name"]}({arg}) {{')
+        if req:
+            lines.append(f'        if (request == null) {{ request = new {req}(); }}')
+            query = 'request.QueryText()'
+            body = 'request.JsonBody()' if entry['verb'] != 'GET' else '""'
         else:
-            lines += [
-                f'    async WechatResponse {entry["name"]}(string query, string jsonBody) {{',
-                f'        return await WechatMpRequest.PostAsync(this.client, "{entry["path"]}", query, jsonBody);',
-                '    }',
-                '',
-            ]
+            query = '""'; body = '""'
+        if entry['verb'] == 'GET':
+            lines.append(f'        WechatResponse raw = await WechatMpRequest.GetAsync(this.client, "{entry["path"]}", {query});')
+        else:
+            lines.append(f'        WechatResponse raw = await WechatMpRequest.PostAsync(this.client, "{entry["path"]}", {query}, {body});')
+        lines += [f'        {resp} result = Json.Deserialize<{resp}>(raw.Data);',
+                  '        result.Raw = raw.Raw;', '        return result;', '    }', '']
+        raw_name = re.sub(r'Async$', 'RawAsync', entry['name'])
+        if entry['verb'] == 'GET':
+            lines += [f'    async WechatResponse {raw_name}(string query) {{',
+                      f'        return await WechatMpRequest.GetAsync(this.client, "{entry["path"]}", query);',
+                      '    }', '']
+        else:
+            lines += [f'    async WechatResponse {raw_name}(string query, string jsonBody) {{',
+                      f'        return await WechatMpRequest.PostAsync(this.client, "{entry["path"]}", query, jsonBody);',
+                      '    }', '']
     lines.append('}')
     filename = cls + '.zan'
     (out / filename).write_text('\n'.join(lines) + '\n', encoding='utf-8', newline='\n')
@@ -323,12 +353,22 @@ for p in files:
         'source': rel_text,
         'file': 'Mp/' + filename,
         'class': cls,
-        'methods': emitted,
+        'methods': [{k:v for k,v in entry.items() if k != 'method'} for entry in emitted],
     })
     total += len(emitted)
 
+models_dir = ROOT / 'stdlib/Sdk/Wechat/Models/Mp'
+models_dir.mkdir(parents=True, exist_ok=True)
+for old in models_dir.glob('*.zan'):
+    if MARKER in old.read_text(encoding='utf-8', errors='ignore'):
+        old.unlink()
+(models_dir / 'WechatMpModels.zan').write_text(
+    models.render('Sdk.Wechat.Models.Mp', MARKER, 'scripts/generate_wechat_mp.py'),
+    encoding='utf-8', newline='\n')
+
 (ROOT / '_scratch/wechat_mp_generated_manifest.json').write_text(
-    json.dumps({'modules': manifest, 'skipped': skipped}, ensure_ascii=False, indent=2),
+    json.dumps({'modules': manifest, 'skipped': skipped,
+                'shared_models': len(models.models)}, ensure_ascii=False, indent=2),
     encoding='utf-8',
 )
 print(f'modules={len(manifest)} methods={total} skipped={len(skipped)}')

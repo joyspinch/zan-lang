@@ -15,6 +15,8 @@ from urllib.parse import urlsplit
 import json
 import re
 
+from wechat_typed_codegen import ModelIndex, SharedModelRegistry, credential_enum, emit_typed_classes
+
 ROOT = Path.cwd()
 MARKER = 'Generated from Senparc WeChat product APIs'
 
@@ -331,6 +333,8 @@ def generate_product(product, config):
     source = config['source'].resolve()
     output = config['output']
     output.mkdir(parents=True, exist_ok=True)
+    model_index = ModelIndex(source, strip_comments)
+    models = SharedModelRegistry(model_index, 'Wechat' + product)
     for old in output.glob('*.zan'):
         if MARKER in old.read_text(encoding='utf-8', errors='ignore'):
             old.unlink()
@@ -405,20 +409,37 @@ def generate_product(product, config):
                 'path': path_only,
                 'verb': verb,
                 'credential': credential,
+                'endpoint': endpoint,
+                'method': method,
+                'source_path': str(path.resolve()),
             })
 
         if not emitted:
             continue
         cls = class_name(config['prefix'], rel)
+        typed = []
+        typed_meta = []
+        for entry in emitted:
+            req, resp, declarations = emit_typed_classes(
+                cls, entry['method'], entry['endpoint'], entry['verb'],
+                entry['credential'], model_index, entry['source_path'], models)
+            typed.extend(declarations)
+            typed_meta.append((entry, req, resp))
         lines = [
             'using System;',
+            'using System.Json;',
             'using Sdk.Wechat;',
+            f'using Sdk.Wechat.Models.{product};',
             '',
             f'namespace {config["namespace"]};',
             '',
+            f'/// <summary>Method request/response contracts; reusable DTO entities live in Sdk.Wechat.Models.{product}.</summary>',
+        ]
+        lines.extend(typed)
+        lines += [
             '/// <summary>',
-            f'/// {rel_text} 的 Zan JSON 接口。',
-            '/// query / JSON 参数由调用方提供；token 和网络传输由产品客户端统一处理。',
+            f'/// {rel_text} 的 Zan 强类型接口。',
+            '/// 业务参数由请求对象自动序列化，凭证由客户端配置和缓存自动补充。',
             f'/// {MARKER}; regenerate with scripts/generate_wechat_product_apis.py.',
             '/// </summary>',
             f'class {cls} {{',
@@ -429,21 +450,36 @@ def generate_product(product, config):
             '    }',
             '',
         ]
-        for entry in emitted:
+        for entry, req, resp in typed_meta:
+            cred = credential_enum(entry['credential'], product)
             lines.append(f'    /// <summary>{entry["verb"]} {entry["path"]}</summary>')
+            arg = f'{req} request' if req else ''
+            lines.append(f'    async {resp} {entry["name"]}({arg}) {{')
+            if req:
+                lines.append(f'        if (request == null) {{ request = new {req}(); }}')
+                query = 'request.QueryText()'
+                body = 'request.JsonBody()' if entry['verb'] not in ('GET', 'DELETE') else '""'
+            else:
+                query = '""'
+                body = '""'
+            lines.append(f'        WechatResponse raw = await this.client.RequestAsync("{entry["verb"]}", "{entry["path"]}", {query}, {body}, {cred});')
+            lines.append(f'        {resp} result = Json.Deserialize<{resp}>(raw.Data);')
+            lines.append('        result.Raw = raw.Raw;')
+            lines.append('        return result;')
+            lines.append('    }')
+            lines.append('')
+            raw_name = re.sub(r'Async$', 'RawAsync', entry['name'])
             if entry['verb'] in ('GET', 'DELETE'):
                 lines += [
-                    f'    async WechatResponse {entry["name"]}(string query) {{',
-                    f'        return await this.client.RequestAsync("{entry["verb"]}", "{entry["path"]}", query, "", "{entry["credential"]}");',
-                    '    }',
-                    '',
+                    f'    async WechatResponse {raw_name}(string query) {{',
+                    f'        return await this.client.RequestAsync("{entry["verb"]}", "{entry["path"]}", query, "", {cred});',
+                    '    }', '',
                 ]
             else:
                 lines += [
-                    f'    async WechatResponse {entry["name"]}(string query, string jsonBody) {{',
-                    f'        return await this.client.RequestAsync("{entry["verb"]}", "{entry["path"]}", query, jsonBody, "{entry["credential"]}");',
-                    '    }',
-                    '',
+                    f'    async WechatResponse {raw_name}(string query, string jsonBody) {{',
+                    f'        return await this.client.RequestAsync("{entry["verb"]}", "{entry["path"]}", query, jsonBody, {cred});',
+                    '    }', '',
                 ]
         lines.append('}')
         filename = cls + '.zan'
@@ -452,11 +488,22 @@ def generate_product(product, config):
             'source': rel_text,
             'file': filename,
             'class': cls,
-            'methods': emitted,
+            'methods': [{k: v for k, v in entry.items() if k not in ('method', 'source_path')} for entry in emitted],
         })
         total += len(emitted)
 
-    return {'modules': manifest, 'skipped': skipped, 'method_count': total}
+    models_dir = ROOT / 'stdlib/Sdk/Wechat/Models' / product
+    models_dir.mkdir(parents=True, exist_ok=True)
+    for old in models_dir.glob('*.zan'):
+        if MARKER in old.read_text(encoding='utf-8', errors='ignore'):
+            old.unlink()
+    (models_dir / ('Wechat' + product + 'Models.zan')).write_text(
+        models.render('Sdk.Wechat.Models.' + product, MARKER,
+                      'scripts/generate_wechat_product_apis.py'),
+        encoding='utf-8', newline='\n')
+
+    return {'modules': manifest, 'skipped': skipped, 'method_count': total,
+            'shared_model_count': len(models.models)}
 
 
 def main():

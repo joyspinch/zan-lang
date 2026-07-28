@@ -905,10 +905,7 @@ static LLVMValueRef emit_binding_value(zan_irgen_t *g, zan_type_t *bind_t,
     LLVMValueRef site_name = LLVMConstNull(i8ptr);
     LLVMValueRef site_val = LLVMConstInt(i64, 0, 0);
     {
-        int site_idx = g->leak_site_count;
-        if (site_idx >= ZAN_MAX_LEAK_SITES) site_idx = ZAN_MAX_LEAK_SITES - 1;
-        else g->leak_site_count++;
-        if (g->site_syms) g->site_syms[site_idx] = bsym;
+        int site_idx = reserve_arc_site(g, bsym, bind_t, 0, NULL);
         site_val = LLVMConstInt(i64, (unsigned long long)site_idx, 0);
         if (g->check_leaks) {
             char site_buf[600];
@@ -2529,13 +2526,10 @@ static LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                              * also keys dynamic release dispatch to this site's
                              * concrete class). The "file:line:col" descriptor is
                              * only needed for --check-leaks reporting. */
-                            int site_idx = g->leak_site_count;
-                            if (site_idx >= ZAN_MAX_LEAK_SITES) site_idx = ZAN_MAX_LEAK_SITES - 1;
-                            else g->leak_site_count++;
-                            if (g->site_syms) g->site_syms[site_idx] = sym;
-                            if (g->site_inst)
-                                g->site_inst[site_idx] =
-                                    resolve_type_ctx(g, expr->new_expr.type);
+                            zan_type_t *site_inst =
+                                resolve_type_ctx(g, expr->new_expr.type);
+                            int site_idx = reserve_arc_site(
+                                g, sym, site_inst, 0, NULL);
                             site_val = LLVMConstInt(i64, (unsigned long long)site_idx, 0);
                             if (g->check_leaks) {
                                 char site_buf[600];

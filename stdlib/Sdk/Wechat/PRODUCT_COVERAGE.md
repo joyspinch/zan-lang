@@ -16,21 +16,23 @@
 | 微信支付 TenPay | 45 / 344 | 14 个同步旧接口的异步封装 + 支付核心 | 已迁移 |
 
 TenPay 的 344 个生成方法对应 C# 源码中 384 个公开异步声明；同一源文件内的
-重载被折叠成一个 Zan 原始 JSON/XML/multipart 调用入口。另补齐原 SDK 只有同步
-版本的红包和旧版分账网络接口。商户号、密钥、私钥、证书、通知地址、服务商子商户
-信息均进入配置对象，不要求每个 API 重复传入。
+重载折叠为一个 Zan 方法。另补齐原 SDK 只有同步版本的红包和旧版分账网络接口。
+商户号、密钥、私钥、证书、通知地址、服务商子商户信息进入配置对象；订单、退款、
+营销等逐笔业务数据进入方法专属 Request。
 
-统一签名：
+普通接口统一为强类型签名：
 
 ```zan
-// GET / DELETE
-WechatResponse result = await api.MethodAsync(query);
-
-// POST / PUT / PATCH
-WechatResponse result = await api.MethodAsync(query, jsonBody);
+WechatWorkAppApiGetAppInfoResponse result = await api.GetAppInfoAsync(
+    new WechatWorkAppApiGetAppInfoRequest().AgentId(1000002));
 ```
 
-`query` 负责原 C# 强类型参数对应的 query 字段；产品客户端自动补充自身管理的 token。返回业务字段继续通过 `WechatResponse` / `System.Json` 读取。
+Request setter 自动映射 path/query/body，Response 包含强类型字段、嵌套对象和列表。
+可复用 DTO 不跟随方法重复生成，而是按 C# 命名空间、外层类型链和类型名去重，分别位于
+`Models/Work`（516）、`Models/WxOpen`（525）、`Models/Open`（190）和
+`Models/TenPay`（631），命名空间为 `Sdk.Wechat.Models.*`。客户端依据
+`WechatCredentialKind` 自动补充自身管理的 token，调用方不传 token 名称或拼接 token query。
+每个生成方法保留显式 `*RawAsync(...)` 逃生口，用于协议新增字段尚未进入 vendored C# 快照的场景。
 
 ## Work 模块
 
@@ -223,8 +225,9 @@ WechatResponse result = await api.MethodAsync(query, jsonBody);
 - `WechatPayLegacyTenPayV3Api` / `WechatPayLegacyTenpayV3PayBankApi`：旧版 XML 支付；
 - `WechatPayLegacyTenPayApi` / `WechatPayLegacyTenPayRightsApi`：早期公众号支付和维权；
 - 共 45 个生成模块、344 个按源文件去重的方法，覆盖 384 个公开异步声明；
+- 631 个支付实体按原 C# 类型身份集中到 `Models/TenPay/WechatPayModels.zan`，多个支付接口共享同一实体；
 - 20 个 multipart、7 个下载/二进制接口、GET/POST/PATCH/PUT/DELETE 均保留；
-- 动态或带模板变量的端点由方法的 `path` 参数接收完整 API path，避免猜测商户/服务商模式。
+- 固定端点和模板变量从 Request 字段自动生成，普通调用不传 path；仅两个由微信账单响应返回的签名下载 URL 使用 `RequestPath(downloadUrl)`。
 
 ### 只有同步版本的旧接口
 
@@ -255,5 +258,5 @@ python scripts/generate_wechat_tenpay_apis.py
 ```
 
 生成清单写入 `_scratch/wechat_tenpay_generated_manifest.json`，当前结果为
-`modules=45 methods=344 dynamic=150 multipart=20`。生成器只重写带生成标记的文件，
+`modules=45 methods=344 dynamic=163 multipart=20`。生成器只重写带生成标记的文件，
 支付核心、配置、通知和手写特殊接口不会被覆盖。
