@@ -248,35 +248,6 @@ partial class Irgen {
         return a;
     }
 
-    // little-endian, align-1 load of <ity> at base+off, zero-extended to i64.
-    string NmLoad(string adr, string off, string ity, bool zext) {
-        string a = NmAddr(adr, off);
-        string lp = NT();
-        L("  " + lp + " = bitcast i8* " + a + " to " + ity + "*");
-        string v = NT();
-        L("  " + v + " = load " + ity + ", " + ity + "* " + lp + ", align 1");
-        if (zext) {
-            string z = NT();
-            L("  " + z + " = zext " + ity + " " + v + " to i64");
-            return z;
-        }
-        return v;
-    }
-
-    // align-1 store of an i64 value (truncated to <ity>) at base+off.
-    void NmStore(string adr, string off, string ity, string val, bool trunc) {
-        string a = NmAddr(adr, off);
-        string sp = NT();
-        L("  " + sp + " = bitcast i8* " + a + " to " + ity + "*");
-        string sv = val;
-        if (trunc) {
-            string t = NT();
-            L("  " + t + " = trunc i64 " + val + " to " + ity);
-            sv = t;
-        }
-        L("  store " + ity + " " + sv + ", " + ity + "* " + sp + ", align 1");
-    }
-
     // Emit the self-contained CRC32 (IEEE 802.3, reflected poly 0xEDB88320)
     // helper and its compile-time-computed 256-entry table, once per module.
     void EmitCrc32Helper() {
@@ -285,7 +256,9 @@ partial class Irgen {
         string tab = "";
         int i = 0;
         while (i < 256) {
-            int c = i;
+            // the reflected polynomial and every intermediate word are unsigned
+            // 32-bit quantities, so the lane is a long (int is signed 32-bit).
+            long c = i;
             int k = 0;
             while (k < 8) {
                 if ((c & 1) != 0) { c = 3988292384 ^ (c >> 1); }
@@ -376,14 +349,6 @@ partial class Irgen {
             L("  " + r64 + " = sext i32 " + r + " to i64");
             return new ExprVal(r64, MkType("int"));
         }
-        if (m == "GetByte" && argc == 2) { return NmGet(e, "i8"); }
-        if (m == "GetU16" && argc == 2) { return NmGet(e, "i16"); }
-        if (m == "GetU32" && argc == 2) { return NmGet(e, "i32"); }
-        if (m == "GetI64" && argc == 2) { return NmGet(e, "i64"); }
-        if (m == "SetByte" && argc == 3) { return NmSet(e, "i8"); }
-        if (m == "SetU16" && argc == 3) { return NmSet(e, "i16"); }
-        if (m == "SetU32" && argc == 3) { return NmSet(e, "i32"); }
-        if (m == "SetI64" && argc == 3) { return NmSet(e, "i64"); }
         if (m == "GetString" && argc == 3) {
             ExprVal p = GenExpr(e.kids[0]);
             ExprVal off = GenExpr(e.kids[1]);
@@ -420,23 +385,6 @@ partial class Irgen {
         return null;
     }
 
-    ExprVal NmGet(Node e, string ity) {
-        ExprVal p = GenExpr(e.kids[0]);
-        ExprVal off = GenExpr(e.kids[1]);
-        bool zext = ity != "i64";
-        string v = NmLoad(p.op, off.op, ity, zext);
-        return new ExprVal(v, MkType("int"));
-    }
-
-    ExprVal NmSet(Node e, string ity) {
-        ExprVal p = GenExpr(e.kids[0]);
-        ExprVal off = GenExpr(e.kids[1]);
-        ExprVal v = GenExpr(e.kids[2]);
-        bool trunc = ity != "i64";
-        NmStore(p.op, off.op, ity, v.op, trunc);
-        return new ExprVal("0", MkType("void"));
-    }
-
     string MapType(Node t) {
         if (t == null) { return "void"; }
         string n = t.sval;
@@ -450,6 +398,10 @@ partial class Irgen {
         if (n == "object" || n == "var") { return "i8*"; }
         if (n == "List" || n == "Dictionary" || n == "Dict") { return "i8*"; }
         if (n == "StringBuilder") { return "i8*"; }
+        // Span<T> is a non-owning view; the host carries { base, len } but the
+        // selfhost backend has no aggregate values, so a span travels as its
+        // base address (spans are never bounds-checked).
+        if (n == "Span") { return "i64"; }
         Node d = binder.FindType(n);
         if (d != null) {
             if (d.kind == AK.EnumDecl()) { return "i64"; }
@@ -476,6 +428,47 @@ partial class Irgen {
         if (t == null) { return false; }
         if (t.sval == "StringBuilder") { return true; }
         return false;
+    }
+
+    bool IsSpanType(Node t) {
+        if (t == null) { return false; }
+        if (t.ival >= 1) { return false; }
+        if (t.sval == "Span") { return true; }
+        return false;
+    }
+
+    Node SpanElem(Node t) {
+        if (t != null && t.kids.Count > 0) { return t.kids[0]; }
+        return MkType("int");
+    }
+
+    // LLVM integer type of one span element (its storage width, not the i64
+    // every scalar travels in).
+    string SpanIty(Node el) {
+        string n = "int";
+        if (el != null) { n = el.sval; }
+        if (n == "byte" || n == "sbyte" || n == "bool") { return "i8"; }
+        if (n == "short" || n == "ushort") { return "i16"; }
+        if (n == "int" || n == "uint") { return "i32"; }
+        return "i64";
+    }
+
+    // Whether loading a span element widens without sign extension.
+    bool SpanZext(Node el) {
+        string n = "int";
+        if (el != null) { n = el.sval; }
+        if (n == "byte" || n == "bool" || n == "char") { return true; }
+        if (n == "ushort" || n == "uint" || n == "ulong") { return true; }
+        return false;
+    }
+
+    // i8*/i16*/i32*/i64* to the span's element at `idx`.
+    string SpanElemPtr(string baseOp, string idxOp, string ity) {
+        string bp = NT();
+        L("  " + bp + " = inttoptr i64 " + baseOp + " to " + ity + "*");
+        string ep = NT();
+        L("  " + ep + " = getelementptr " + ity + ", " + ity + "* " + bp + ", i64 " + idxOp);
+        return ep;
     }
 
     bool IsDictType(Node t) {

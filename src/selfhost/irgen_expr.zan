@@ -769,6 +769,18 @@ partial class Irgen {
                 L("  call void @zdict_set(i8* " + obj.op + ", i8* " + DictKeyOp(idx) + ", i64 " + sv + ")");
                 return;
             }
+            if (IsSpanType(obj.ty)) {
+                string ity = SpanIty(SpanElem(obj.ty));
+                string ep = SpanElemPtr(obj.op, idx.op, ity);
+                string sv = v.op;
+                if (ity != "i64") {
+                    string t = NT();
+                    L("  " + t + " = trunc i64 " + v.op + " to " + ity);
+                    sv = t;
+                }
+                L("  store " + ity + " " + sv + ", " + ity + "* " + ep + ", align 1");
+                return;
+            }
             if (IsStr(obj.ty)) {
                 string sp = NT();
                 L("  " + sp + " = getelementptr i8, i8* " + obj.op + ", i64 " + idx.op);
@@ -1162,6 +1174,21 @@ partial class Irgen {
             L("  " + slot + " = call i64 @zlist_get(i8* " + obj.op + ", i64 " + idx.op + ")");
             return FromSlot(slot, ListElem(obj.ty));
         }
+        if (IsSpanType(obj.ty)) {
+            Node el = SpanElem(obj.ty);
+            string ity = SpanIty(el);
+            string ep = SpanElemPtr(obj.op, idx.op, ity);
+            string v0 = NT();
+            // align 1: a span may view a raw address (protocol framing, FFI
+            // structs) whose elements are not naturally aligned.
+            L("  " + v0 + " = load " + ity + ", " + ity + "* " + ep + ", align 1");
+            if (ity == "i64") { return new ExprVal(v0, el); }
+            string w = NT();
+            string ext = "sext";
+            if (SpanZext(el)) { ext = "zext"; }
+            L("  " + w + " = " + ext + " " + ity + " " + v0 + " to i64");
+            return new ExprVal(w, el);
+        }
         if (IsDictType(obj.ty)) {
             string slot = NT();
             L("  " + slot + " = call i64 @zdict_get(i8* " + obj.op + ", i8* " + DictKeyOp(idx) + ")");
@@ -1179,6 +1206,14 @@ partial class Irgen {
     // ---- new ----
     ExprVal GenNew(Node e) {
         Node ty = e.type;
+        if (e.ival != 1 && IsSpanType(ty)) {
+            // new Span<T>(base, len): a view value is just its base address;
+            // the length is evaluated for its side effects only.
+            string baseOp = "0";
+            if (e.kids.Count > 0) { baseOp = GenExpr(e.kids[0]).op; }
+            if (e.kids.Count > 1) { GenExpr(e.kids[1]); }
+            return new ExprVal(baseOp, ty);
+        }
         if (e.ival == 1) {
             // array new: T[n] as i64* (n zeroed slots after an i64 length header)
             ExprVal nsz = new ExprVal("0", MkType("int"));

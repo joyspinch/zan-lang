@@ -8,17 +8,16 @@
 
 /* ===== NativeMemory intrinsics =====================================
  * Raw off-heap memory for binary IO. An address is a plain nint (i64) that
- * never enters ARC. Every accessor lowers to direct (align-1) loads/stores or
- * a single libc call, so byte-level hot loops in Zan code (page encoding,
- * checksums, network framing) cost what the equivalent C would.
+ * never enters ARC. Each operation lowers to a single libc call, so bulk work
+ * in Zan code (page encoding, checksums, network framing) costs what the
+ * equivalent C would. Scalar access is Span<T>'s job: `new Span<int>(p, n)`
+ * views a raw address and indexes it with align-1 typed loads/stores.
  *
  *   nint  Alloc(int size)                     zeroed malloc
  *   void  Free(nint p)
  *   void  Copy(nint dst, nint src, int n)     memmove (overlap-safe)
  *   void  Fill(nint p, int byte, int n)       memset
  *   int   Compare(nint a, nint b, int n)      memcmp
- *   int   GetByte/GetU16/GetU32/GetI64(nint p, int off)   little-endian
- *   void  SetByte/SetU16/SetU32/SetI64(nint p, int off, int v)
  *   string GetString(nint p, int off, int len)  copies into a real ARC string
  *   void  PutString(nint p, int off, string s, int len)
  *   int   Crc32(nint p, int len)              hardware-independent CRC32 (IEEE)
@@ -46,29 +45,6 @@ static LLVMValueRef nm_to_i64(zan_irgen_t *g, LLVMValueRef v) {
 static LLVMValueRef nm_arg(zan_irgen_t *g, zan_ast_node_t *expr, int i,
                            local_scope_t *locals) {
     return nm_to_i64(g, emit_expr(g, expr->call.args.items[i], locals));
-}
-
-/* Little-endian load of `bits` at (p+off), zero-extended to i64 (i64 loads
- * are returned as-is). align 1: page/wire offsets are arbitrary. */
-static LLVMValueRef nm_load(zan_irgen_t *g, LLVMValueRef base, LLVMValueRef off, int bits) {
-    LLVMTypeRef it = LLVMIntTypeInContext(g->ctx, (unsigned)bits);
-    LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
-    LLVMValueRef ptr = LLVMBuildBitCast(g->builder, nm_addr(g, base, off),
-        LLVMPointerType(it, 0), "nm.lp");
-    LLVMValueRef v = LLVMBuildLoad2(g->builder, it, ptr, "nm.ld");
-    LLVMSetAlignment(v, 1);
-    if (bits < 64) v = LLVMBuildZExt(g->builder, v, i64t, "nm.zx");
-    return v;
-}
-
-static void nm_store(zan_irgen_t *g, LLVMValueRef base, LLVMValueRef off,
-                     LLVMValueRef val, int bits) {
-    LLVMTypeRef it = LLVMIntTypeInContext(g->ctx, (unsigned)bits);
-    LLVMValueRef ptr = LLVMBuildBitCast(g->builder, nm_addr(g, base, off),
-        LLVMPointerType(it, 0), "nm.sp");
-    if (bits < 64) val = LLVMBuildTrunc(g->builder, val, it, "nm.tr");
-    LLVMValueRef st = zan_store_fit(g, val, ptr);
-    LLVMSetAlignment(st, 1);
 }
 
 /* __zan_nm_crc32(i8*, i64) -> i64: CRC32 (IEEE 802.3, reflected polynomial
@@ -264,29 +240,6 @@ static bool emit_native_memory_call(zan_irgen_t *g, zan_ast_node_t *expr,
             nm_addr(g, a, zero64), nm_addr(g, b, zero64), n }, 3, "nm.cmp");
         *out = LLVMBuildSExt(g->builder, r, i64t, "nm.cmp64");
         return true;
-    }
-
-    static const struct { const char *get, *set; int bits; } nm_acc[] = {
-        { "GetByte", "SetByte", 8 },
-        { "GetU16",  "SetU16", 16 },
-        { "GetU32",  "SetU32", 32 },
-        { "GetI64",  "SetI64", 64 },
-    };
-    for (size_t i = 0; i < sizeof(nm_acc) / sizeof(nm_acc[0]); i++) {
-        if (is_call_to(expr, "NativeMemory", nm_acc[i].get) && expr->call.args.count == 2) {
-            LLVMValueRef p = nm_arg(g, expr, 0, locals);
-            LLVMValueRef off = nm_arg(g, expr, 1, locals);
-            *out = nm_load(g, p, off, nm_acc[i].bits);
-            return true;
-        }
-        if (is_call_to(expr, "NativeMemory", nm_acc[i].set) && expr->call.args.count == 3) {
-            LLVMValueRef p = nm_arg(g, expr, 0, locals);
-            LLVMValueRef off = nm_arg(g, expr, 1, locals);
-            LLVMValueRef v = nm_arg(g, expr, 2, locals);
-            nm_store(g, p, off, v, nm_acc[i].bits);
-            *out = zero64;
-            return true;
-        }
     }
 
     if (is_call_to(expr, "NativeMemory", "GetString") && expr->call.args.count == 3) {
@@ -1243,7 +1196,9 @@ binding_lowered:
                         LLVMGetTypeKind(elem_llvm) == LLVMIntegerTypeKind &&
                         LLVMTypeOf(sv) != elem_llvm)
                         sv = coerce_int_to(g, sv, elem_llvm);
-                    LLVMBuildStore(g->builder, sv, ep);
+                    /* align 1: a span may view a raw address (protocol framing,
+                     * FFI structs) whose elements are not naturally aligned. */
+                    LLVMSetAlignment(LLVMBuildStore(g->builder, sv, ep), 1);
                     return right;
                 }
             }
@@ -2145,7 +2100,9 @@ static LLVMValueRef emit_expr_index(zan_irgen_t *g, zan_ast_node_t *expr,
                     idx = LLVMBuildSExt(g->builder, idx,
                         LLVMInt64TypeInContext(g->ctx), "spx.ix");
                 LLVMValueRef ep = LLVMBuildGEP2(g->builder, elem_llvm, typed, &idx, 1, "spx.ep");
-                return LLVMBuildLoad2(g->builder, elem_llvm, ep, "spx.elem");
+                LLVMValueRef ld = LLVMBuildLoad2(g->builder, elem_llvm, ep, "spx.elem");
+                LLVMSetAlignment(ld, 1);
+                return ld;
             }
         }
         LLVMValueRef arr_ptr = NULL;

@@ -184,6 +184,10 @@
   （今天在 x86-64 上大多碰巧能跑，属于潜伏问题）。
   这正是 `SDL3/Native.zan` 类注释写明的垫片存在理由：
   "Zan integers are 64-bit while many SDL C parameters are 32-bit"。
+  **A1-2 期间实测（2026-07-28）**：A0-1 只把 `int` 收窄到 i32，`sbyte/ushort/uint/
+  ulong` 在 `map_type` 里仍一律 i64，所以这些类型的**存储宽度**也是错的——
+  `Span<ushort>` 按 8 字节步长读写（`h[1] = 258` 落到偏移 8），`ushort` 字段同理。
+  A1-2 的 u16 场景先用 `Span<short> + & 65535` 绕过，本条一并在 A0-2 修。
 * **A0-3** 结构体字段布局：`register_struct_type`（`irgen.c:1843`）对每个字段直接
   `map_type`，所以 `int` 字段占 **8 字节**，`[repr(C)]` 下与 C 不符。
   A0-1 之后自动修复大半，剩余交给 A2-2。
@@ -327,8 +331,21 @@ static extern int zan_gui_present(int hwnd, int surfaceId);
 * **A1-1 ✅ 已完成（2026-07-28，commit `6ebffc1`）** `Span<T>` 为值类型 `{ i8* base, i64 len }`（`TYPE_STRUCT`，不入 ARC）；`arr.AsSpan([start[,len]])` 对紧凑数组零拷贝建视图，`s[i]` lower 成 `getelementptr T` + typed load/store（不经 `NativeMemory`），支持 `.Length` / `.Slice(start[,len])`，byte/int/long 宽度均验证。新增 conformance/determinism/leakcheck 用例 `span_intrinsic`（均绿）。
   【待进】noalias 元数据未加（LLVM C API 不直接暴露，待后续）；传参/返回 Span 的 ABI 路径待 A2。
   **必须是编译器内建**，做成库类型 LLVM 看不穿，别名分析依然失败。
-* **A1-2** **删除** `NativeMemory` 的 `GetByte/GetU16/GetU32/GetI64/SetByte/…`
-  整排 intrinsic，不留兼容层。
+* **A1-2 ✅ 已完成（2026-07-28）** `NativeMemory` 的 `GetByte/GetU16/GetU32/GetI64/
+  SetByte/SetU16/SetU32/SetI64` 整排 intrinsic 已删（stdlib 声明、`irgen_expr.c`
+  的 `nm_load/nm_store`、selfhost 的 `NmLoad/NmStore/NmGet/NmSet`），不留兼容层。
+  132 处调用点（Win32Shell 70 / Interop 24 / WebView2 12 / native_memory 用例 12 /
+  RegexProgram 10 / Stream 4）改成 `new Span<T>(addr, len)[i]`；`Span` 元素读写补上
+  `align 1`，保住原 intrinsic 的非对齐裸内存契约。
+  顺带给 selfhost 编译器补齐 `Span<T>`（binder/checker 识别 + irgen 按元素宽度
+  align-1 load/store，span 值只带基址、不做边界检查），否则 gen1 编译不了改过的
+  stdlib；`EmitCrc32Helper` 的 32 位车道改 `long`（`int` 已是 i32，`3988292384`
+  会截断，导致 g2/g3 的 CRC 表不一致、fixed point 失败）。
+  `regex|native_memory|span|gui|interop|webview|stream|zandb|respack|http` +
+  `selfhost` 共 53+2 个用例全绿。
+  **遗留（A0-2）**：`map_type()` 把 `sbyte/ushort/uint/ulong` 一律映射成 i64，
+  所以 `Span<ushort>` 实际按 8 字节步长读写。这批 u16 场景先用
+  `Span<short> + & 65535` 绕过，无符号原生宽度待 A0-2 修。
 * **A1-3** 提供 `byte[]` / `Span<byte>` 作为全库统一的字节缓冲类型（配合 B2）。
 * **判定**：Zan 版 `blur_rect` / `fill_radial` / `blit_image` 对 C 版基准 ≥0.9x。
   达不到先修优化管线，不要往下推进。

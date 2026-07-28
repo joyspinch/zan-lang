@@ -440,9 +440,9 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
         /* ==== NativeMemory intrinsics ====
          * Raw off-heap memory access for binary IO (ByteBuffer, ZanDB pages,
          * network framing). Addresses travel as nint (i64); every operation
-         * lowers to direct loads/stores or libc calls, so none of these values
-         * ever enter the ARC string/object machinery. Multi-byte accessors are
-         * little-endian and unaligned-safe (align 1). */
+         * lowers to a libc call, so none of these values ever enter the ARC
+         * string/object machinery. Scalar access goes through Span<T> views
+         * over the address (little-endian, align 1). */
         {
             LLVMValueRef nm_out = NULL;
             if (emit_native_memory_call(g, expr, locals, &nm_out))

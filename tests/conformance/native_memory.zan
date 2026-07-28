@@ -2,9 +2,10 @@ using System;
 using System.IO;
 
 // NativeMemory intrinsics + ByteBuffer over raw off-heap memory: scalar
-// accessors (LE, unaligned), bulk copy/fill/compare, string round-trips into
-// real ARC strings, CRC32, and buffer growth. Guards against raw pointers
-// ever re-entering the ARC string machinery (heap corruption regression).
+// access through Span<T> views (LE, unaligned), bulk copy/fill/compare, string
+// round-trips into real ARC strings, CRC32, and buffer growth. Guards against
+// raw pointers ever re-entering the ARC string machinery (heap corruption
+// regression).
 class Program {
     static int pass = 0;
     static int fail = 0;
@@ -18,16 +19,17 @@ class Program {
         // ---- scalar accessors, little-endian, unaligned offsets ----
         nint p = NativeMemory.Alloc(64);
         Check("alloc-nonzero", p != 0);
-        Check("alloc-zeroed", NativeMemory.GetI64(p, 0) == 0);
-        NativeMemory.SetByte(p, 0, 200);
-        NativeMemory.SetU16(p, 1, 65535);
-        NativeMemory.SetU32(p, 3, 305419896);          // 0x12345678
-        NativeMemory.SetI64(p, 7, 1234567890123);
-        Check("get-byte", NativeMemory.GetByte(p, 0) == 200);
-        Check("get-u16", NativeMemory.GetU16(p, 1) == 65535);
-        Check("get-u32", NativeMemory.GetU32(p, 3) == 305419896);
-        Check("get-i64", NativeMemory.GetI64(p, 7) == 1234567890123);
-        Check("le-order", NativeMemory.GetByte(p, 3) == 120);   // 0x78 first
+        Span<byte> pb = new Span<byte>(p, 64);
+        Check("alloc-zeroed", new Span<long>(p, 8)[0] == 0);
+        pb[0] = 200;
+        new Span<short>(p + 1, 1)[0] = 65535;
+        new Span<int>(p + 3, 1)[0] = 305419896;        // 0x12345678, unaligned
+        new Span<long>(p + 7, 1)[0] = 1234567890123;   // unaligned
+        Check("get-byte", pb[0] == 200);
+        Check("get-u16", (new Span<short>(p + 1, 1)[0] & 65535) == 65535);
+        Check("get-u32", new Span<int>(p + 3, 1)[0] == 305419896);
+        Check("get-i64", new Span<long>(p + 7, 1)[0] == 1234567890123);
+        Check("le-order", pb[3] == 120);               // 0x78 first
 
         // ---- string round-trip through raw memory ----
         NativeMemory.PutString(p, 20, "hello world", 11);
@@ -40,10 +42,11 @@ class Program {
         nint q = NativeMemory.Alloc(64);
         NativeMemory.Copy(q, p, 64);
         Check("copy-compare", NativeMemory.Compare(p, q, 64) == 0);
-        NativeMemory.SetByte(q, 63, 1);
+        Span<byte> qb = new Span<byte>(q, 64);
+        qb[63] = 1;
         Check("compare-diff", NativeMemory.Compare(p, q, 64) != 0);
         NativeMemory.Fill(q, 170, 64);                 // 0xAA
-        Check("fill", NativeMemory.GetByte(q, 0) == 170 && NativeMemory.GetByte(q, 63) == 170);
+        Check("fill", qb[0] == 170 && qb[63] == 170);
         NativeMemory.Free(q);
 
         // ---- CRC32 (IEEE): crc32("123456789") = 0xCBF43926 ----
