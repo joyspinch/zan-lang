@@ -31,9 +31,24 @@ static int try_method_spec(zan_irgen_t *g, zan_symbol_t *msym,
     if (!msym || !msym->decl || msym->decl->kind != AST_METHOD_DECL) return -1;
     zan_ast_list_t *tps = &msym->decl->method_decl.type_params;
     if (tps->count == 0 || tps->count > 8) return -1;
+    /* An instance method's receiver is not a declared parameter: it becomes
+     * the implicit `this` argument (an extension method's `this T` receiver,
+     * by contrast, IS declared parameter 0 of a static method). */
+    bool m_static = (msym->decl->method_decl.modifiers & MOD_STATIC) != 0;
+    int recv_params = (recv_expr && m_static) ? 1 : 0;
     /* exact arity only: `params` packing / defaults keep the erased path */
     if (msym->decl->method_decl.params.count !=
-        call->call.args.count + (recv_expr ? 1 : 0)) return -1;
+        call->call.args.count + recv_params) return -1;
+    if (!m_static) {
+        /* the receiver has to be a reference the call site can hand over as a
+         * plain pointer; struct receivers need their storage address, which
+         * this path does not model */
+        zan_type_t *rt = recv_expr ? infer_expr_type(g, recv_expr, locals)
+                                   : (g->current_type_sym ? g->current_type_sym->type
+                                                          : NULL);
+        if (!rt || rt->kind != TYPE_CLASS) return -1;
+        if (!recv_expr && !g->current_this) return -1;
+    }
     for (int j = 0; j < msym->decl->method_decl.params.count; j++)
         if (msym->decl->method_decl.params.items[j]->param.by_ref) return -1;
     zan_type_t *bind[8] = { NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL };
@@ -51,25 +66,44 @@ static LLVMValueRef emit_method_spec_call(zan_irgen_t *g, int idx,
     struct zan_method_spec *sp = &g->method_specs[idx];
     zan_ast_list_t *tps = &sp->msym->decl->method_decl.type_params;
     int pcount = sp->msym->decl->method_decl.params.count;
-    int arg_base = recv_expr ? 1 : 0;
+    bool m_static = (sp->msym->decl->method_decl.modifiers & MOD_STATIC) != 0;
+    int this_off = m_static ? 0 : 1;
+    int arg_base = (recv_expr && m_static) ? 1 : 0;
+    int total = pcount + this_off;
     LLVMValueRef *call_args = (LLVMValueRef *)calloc(
-        (size_t)(pcount > 0 ? pcount : 1), sizeof(LLVMValueRef));
+        (size_t)(total > 0 ? total : 1), sizeof(LLVMValueRef));
     zan_ast_node_t **aexprs = (zan_ast_node_t **)calloc(
-        (size_t)(pcount > 0 ? pcount : 1), sizeof(zan_ast_node_t *));
+        (size_t)(total > 0 ? total : 1), sizeof(zan_ast_node_t *));
+    if (this_off) {
+        LLVMTypeRef this_ty = LLVMTypeOf(LLVMGetParam(sp->fn, 0));
+        LLVMValueRef self;
+        if (recv_expr) {
+            self = emit_expr(g, recv_expr, locals);
+        } else {
+            self = LLVMBuildLoad2(g->builder,
+                LLVMGetAllocatedType(g->current_this), g->current_this, "self");
+        }
+        if (LLVMTypeOf(self) != this_ty)
+            self = LLVMBuildBitCast(g->builder, self, this_ty, "self.c");
+        call_args[0] = self;
+        aexprs[0] = recv_expr;
+    }
     for (int j = 0; j < pcount; j++) {
-        aexprs[j] = (arg_base == 1 && j == 0)
+        aexprs[j + this_off] = (arg_base == 1 && j == 0)
             ? recv_expr : call->call.args.items[j - arg_base];
         zan_type_t *pt = subst_method_tp(g,
             method_param_type(g, sp->msym, j), tps, sp->bind);
-        call_args[j] = emit_arg_typed(g, aexprs[j], pt, locals);
+        call_args[j + this_off] =
+            emit_arg_typed(g, aexprs[j + this_off], pt, locals);
     }
-    coerce_args_to_params(g, sp->fn_type, call_args, pcount);
+    coerce_args_to_params(g, sp->fn_type, call_args, total);
     const char *cn = (LLVMGetTypeKind(LLVMGetReturnType(sp->fn_type)) ==
                       LLVMVoidTypeKind) ? "" : "gspec";
     LLVMValueRef result = zan_call2(g->builder, sp->fn_type, sp->fn,
-                                    call_args, (unsigned)pcount, cn);
-    for (int j = 0; j < pcount; j++)
-        emit_release_owned_call_temp(g, aexprs[j], call_args[j], locals);
+                                    call_args, (unsigned)total, cn);
+    for (int j = 0; j < total; j++)
+        if (aexprs[j])
+            emit_release_owned_call_temp(g, aexprs[j], call_args[j], locals);
     free(aexprs);
     free(call_args);
     return result;
@@ -2785,6 +2819,13 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                     zan_symbol_t *method_sym = resolve_overload(type_sym, callee->member.name, expr->call.args.count);
                     if (method_sym) pack_params_args(g, expr, method_sym, locals);
                     if (method_sym) {
+                        /* a generic instance method monomorphizes with the
+                         * receiver handed over as the implicit `this` */
+                        int spec = try_method_spec(g, method_sym, expr,
+                                                   callee->member.object, locals);
+                        if (spec >= 0)
+                            return emit_method_spec_call(g, spec, expr,
+                                                         callee->member.object, locals);
                         for (int fi = irgen_find_function(g, method_sym); fi >= 0; fi = -1) {
                             if (g->functions[fi].sym == method_sym) {
                                 int argc = expr->call.args.count + 1;
@@ -2894,6 +2935,11 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                 zan_symbol_t *method_sym = resolve_overload(recv_cls, callee->member.name, expr->call.args.count);
                     if (method_sym) pack_params_args(g, expr, method_sym, locals);
                 if (method_sym) {
+                    int spec = try_method_spec(g, method_sym, expr,
+                                               callee->member.object, locals);
+                    if (spec >= 0)
+                        return emit_method_spec_call(g, spec, expr,
+                                                     callee->member.object, locals);
                     for (int fi = irgen_find_function(g, method_sym); fi >= 0; fi = -1) {
                         if (g->functions[fi].sym == method_sym) {
                             int argc = expr->call.args.count + 1;

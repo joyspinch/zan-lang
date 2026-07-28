@@ -312,12 +312,17 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
              * instance here produced broken IR, since `c.Name()` on a T has
              * nothing to resolve against. */
             if (method_is_tp_template(member)) {
-                if ((member->method_decl.modifiers & MOD_STATIC) &&
-                    !(member->method_decl.modifiers & MOD_ASYNC)) continue;
+                bool tpl_async = (member->method_decl.modifiers & MOD_ASYNC) != 0;
+                bool tpl_static = (member->method_decl.modifiers & MOD_STATIC) != 0;
+                /* an instance template monomorphizes too (`this` is prepended
+                 * to the specialized signature), as long as the declaring type
+                 * is not itself generic */
+                if (!tpl_async && (tpl_static || !is_user_generic_sym(type_sym)))
+                    continue;
                 zan_diag_emit(g->diag, DIAG_ERROR, member->loc,
                     "generic method '%.*s' accesses a member of its type "
-                    "parameter; only static non-async generic methods can be "
-                    "monomorphized today",
+                    "parameter; async generic methods, and instance generic "
+                    "methods of a generic type, cannot be monomorphized today",
                     (int)member->method_decl.name.len,
                     member->method_decl.name.str);
                 continue;
@@ -1273,6 +1278,14 @@ static void tp_scan_expr(tp_use_scan_t *s, zan_ast_node_t *e) {
         tp_scan_expr(s, e->index.index);
         return;
     case AST_CALL:
+        /* `Other<T>(x)`: forwarding one of our own type parameters to another
+         * generic call has no erased form either -- the callee is itself a
+         * template, so this body only exists monomorphized */
+        for (int i = 0; i < e->call.type_args.count; i++)
+            if (tp_typeref_is_tp(s, e->call.type_args.items[i])) {
+                s->found = true;
+                return;
+            }
         tp_scan_expr(s, e->call.callee);
         for (int i = 0; i < e->call.args.count; i++)
             tp_scan_expr(s, e->call.args.items[i]);
@@ -1421,7 +1434,7 @@ static int get_or_create_method_spec(zan_irgen_t *g, zan_symbol_t *msym,
     if (!member->method_decl.body) return -1;
     /* async bodies lower through the CPS frame machinery; keep them erased */
     if (member->method_decl.modifiers & MOD_ASYNC) return -1;
-    if (!(member->method_decl.modifiers & MOD_STATIC)) return -1;
+    bool spec_static = (member->method_decl.modifiers & MOD_STATIC) != 0;
     zan_ast_list_t *tps = &member->method_decl.type_params;
     if (tps->count != bindc || bindc <= 0 || bindc > 8) return -1;
     for (int i = 0; i < bindc; i++)
@@ -1433,6 +1446,13 @@ static int get_or_create_method_spec(zan_irgen_t *g, zan_symbol_t *msym,
     if (!type_sym ||
         (type_sym->kind != SYM_CLASS && type_sym->kind != SYM_STRUCT))
         return -1;
+    /* An instance generic method specializes the same way a static one does,
+     * with `this` prepended to the signature. A generic *declaring type* would
+     * additionally need the class instantiation folded into the mangled name
+     * and into `this`'s layout, which the erased class variant cannot supply,
+     * so those stay rejected (see the diagnostic in emit_user_methods). */
+    if (!spec_static && is_user_generic_sym(type_sym)) return -1;
+    int this_off = spec_static ? 0 : 1;
 
     for (int i = 0; i < g->method_spec_count; i++)
         if (g->method_specs[i].msym == msym &&
@@ -1461,13 +1481,19 @@ static int get_or_create_method_spec(zan_irgen_t *g, zan_symbol_t *msym,
     }
 
     int param_count = member->method_decl.params.count;
+    int total_params = param_count + this_off;
     LLVMTypeRef *param_types = (LLVMTypeRef *)calloc(
-        (size_t)(param_count > 0 ? param_count : 1), sizeof(LLVMTypeRef));
+        (size_t)(total_params > 0 ? total_params : 1), sizeof(LLVMTypeRef));
+    if (this_off) {
+        LLVMTypeRef st = get_struct_llvm_type(g, type_sym);
+        param_types[0] = st ? LLVMPointerType(st, 0)
+                            : LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    }
     for (int k = 0; k < param_count; k++) {
         zan_ast_node_t *param = member->method_decl.params.items[k];
         zan_type_t *pt = subst_method_tp(g,
             zan_binder_resolve_type(g->binder, param->param.type), tps, bind);
-        param_types[k] = param->param.by_ref
+        param_types[k + this_off] = param->param.by_ref
             ? LLVMPointerType(map_type(g, pt), 0)
             : map_type(g, pt);
     }
@@ -1476,7 +1502,7 @@ static int get_or_create_method_spec(zan_irgen_t *g, zan_symbol_t *msym,
               member->method_decl.return_type), tps, bind)
         : g->binder->type_void;
     LLVMTypeRef fn_type = LLVMFunctionType(map_type(g, ret_type), param_types,
-                                           (unsigned)param_count, 0);
+                                           (unsigned)total_params, 0);
     LLVMValueRef fn = LLVMAddFunction(g->mod, fn_name, fn_type);
     zan_set_module_local(fn);
     free(param_types);
@@ -1524,19 +1550,25 @@ static void emit_method_spec_body(zan_irgen_t *g, int idx) {
     local_scope_t *locals = local_scope_new(g->arena);
     int param_count = member->method_decl.params.count;
     unsigned npt = LLVMCountParamTypes(sp.fn_type);
+    int this_off = (member->method_decl.modifiers & MOD_STATIC) ? 0 : 1;
     LLVMTypeRef *param_types = (LLVMTypeRef *)calloc(
         (size_t)(npt > 0 ? npt : 1), sizeof(LLVMTypeRef));
     LLVMGetParamTypes(sp.fn_type, param_types);
+    LLVMValueRef spec_this = NULL;
+    if (this_off) {
+        spec_this = LLVMBuildAlloca(g->builder, param_types[0], "this");
+        LLVMBuildStore(g->builder, LLVMGetParam(sp.fn, 0), spec_this);
+    }
     for (int k = 0; k < param_count; k++) {
         zan_ast_node_t *param = member->method_decl.params.items[k];
         zan_type_t *pt = resolve_type_ctx(g, param->param.type);
+        unsigned pi = (unsigned)(k + this_off);
         if (param->param.by_ref) {
-            local_add(locals, param->param.name,
-                      LLVMGetParam(sp.fn, (unsigned)k), pt);
+            local_add(locals, param->param.name, LLVMGetParam(sp.fn, pi), pt);
             continue;
         }
-        LLVMValueRef param_alloca = LLVMBuildAlloca(g->builder, param_types[k], "p");
-        LLVMBuildStore(g->builder, LLVMGetParam(sp.fn, (unsigned)k), param_alloca);
+        LLVMValueRef param_alloca = LLVMBuildAlloca(g->builder, param_types[pi], "p");
+        LLVMBuildStore(g->builder, LLVMGetParam(sp.fn, pi), param_alloca);
         local_add(locals, param->param.name, param_alloca, pt);
     }
     free(param_types);
@@ -1563,7 +1595,7 @@ static void emit_method_spec_body(zan_irgen_t *g, int idx) {
     g->throw_catch_base = 0;
     g->finally_count = 0;
     g->finally_loop_base = 0;
-    g->current_this = NULL;
+    g->current_this = spec_this;
     g->current_type_sym = sp.type_sym;
     g->current_fn_body = member->method_decl.body;
 

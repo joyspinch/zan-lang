@@ -1525,6 +1525,32 @@ load → add → store 三件套（`src/compiler/irgen.c` 里 `zan_rt_alloc` /
 
 ---
 
+## A29 — 实例泛型方法单态化（A7-1 收尾，2026-07-28）
+
+* **A29-1 ✅ 实例（非 static）泛型方法现在能单态化**。此前 `get_or_create_method_spec`
+  只接受 static 方法，实例的"模板"方法（体内穿过 `T` 取成员）直接报编译错误。
+  现在特化副本把 `this` 作为第 0 个参数插到签名前面，`emit_method_spec_body`
+  绑定 `this`（`g->current_this`），调用点三条路径都接了单态化：
+  局部变量接收者 `p.M<T>(x)`、任意表达式接收者 `p.Self().M<T>(x)`、
+  以及同类内不带接收者的 `M<T>(x)`（用隐式 `this`）。
+  接收者限定为**类**（struct 接收者要按地址传，这条路径没建模），
+  **声明类型本身是泛型**（`Pool<TConn>.M<T>()`）仍然报错——擦除的类变体拿不出
+  `this` 的布局，需要把类实例化也折进 mangling，留作后续。
+
+* **A29-2 ✅ 顺带修：泛型方法把自己的类型参数转发给另一个泛型调用**
+  （`Both<T>(T c) { return this.Describe<T>(c); }`）。这种体同样**没有擦除形态**，
+  但模板扫描只看"是否穿过 T 取成员"，于是照样发射了一份擦除实例，里面那个
+  `Describe<T>` 无从解析，落到 `emit_expr` 兜底 `ret i32 0` → LLVM 校验失败。
+  现在 `tp_scan_expr` 把"调用的显式类型实参里出现自己的类型参数"也算作模板标记。
+
+  证据：`tests/conformance/generic_instance_method.zan`（conformance / determinism /
+  leakcheck 三份）。全量 ctest 678 项，仍只有 `conformance_gui_datatable` 一项既有失败。
+
+> 仍未做：**async 泛型方法**的单态化（CPS 帧机制按符号建帧，特化副本要连帧类型、
+> ramp/$resume 一起复制），以及**泛型类的实例泛型方法**（见上）。
+
+---
+
 # 已撤回的结论（早期草稿中的错误，勿再引用）
 
 1. ~~"无符号/窄类型只是语法别名，IR 层全塌成 i64，语义是假的"~~ ——
