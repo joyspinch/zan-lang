@@ -2240,35 +2240,68 @@ static unsigned llvm_scalar_size(LLVMTypeRef t) {
     }
 }
 
-/* A collection slot is uniformly 8 bytes, so a value struct element travels
- * through it as raw bits: stored into a temporary and read back as an i64,
- * and reversed on the way out. Storing the struct directly would spill past
- * the slot for anything wider than the struct's first field. */
-static void check_struct_fits_slot(zan_irgen_t *g, LLVMTypeRef st, zan_ast_node_t *at) {
+/* A List element occupies a whole number of 8-byte words in the data buffer.
+ * Everything the language can put in a collection is one word wide except a
+ * value struct, which lives inline across ceil(size/8) words; capacity math
+ * and every slot address scale by that stride (A15-4). */
+static unsigned elem_slot_words(zan_irgen_t *g, zan_type_t *elem) {
+    if (!elem || elem->kind != TYPE_STRUCT) return 1;
+    LLVMTypeRef st = map_type(g, elem);
+    if (!st || LLVMGetTypeKind(st) != LLVMStructTypeKind) return 1;
     unsigned sz = llvm_scalar_size(st);
-    if (sz && sz <= 8) return;
+    if (!sz) return 1;
+    return (sz + 7) / 8;
+}
+
+/* Scale an element index to the word index of that element's first slot. */
+static LLVMValueRef slot_word_index(zan_irgen_t *g, LLVMValueRef idx,
+                                    unsigned words) {
+    if (words <= 1) return idx;
+    return zan_mul(g->builder, idx,
+                   LLVMConstInt(LLVMTypeOf(idx), words, 0), "slot.wi");
+}
+
+/* A struct with a layout this pass cannot compute has no inline form. */
+static void check_struct_fits_slot(zan_irgen_t *g, LLVMTypeRef st, zan_ast_node_t *at) {
+    if (llvm_scalar_size(st)) return;
     zan_loc_t loc; memset(&loc, 0, sizeof(loc));
     if (at) loc = at->loc;
     zan_diag_emit(g->diag, DIAG_ERROR, loc,
-        "a value struct wider than 8 bytes cannot be a collection element yet "
-        "(the slot is 8 bytes); use a class or split the fields");
+        "this value struct cannot be a collection element: the slot allocator "
+        "cannot compute its layout; use a class instead");
 }
 
-static LLVMValueRef pack_struct_into_slot(zan_irgen_t *g, LLVMValueRef v, zan_ast_node_t *at) {
+/* Operations that treat a slot as one raw word (equality search, swap, the
+ * element-by-element copies) have no multi-word form yet: report that instead
+ * of quietly reading half an element. */
+static int wide_elem_unsupported(zan_irgen_t *g, zan_type_t *elem,
+                                 zan_ast_node_t *at, const char *op) {
+    if (elem_slot_words(g, elem) <= 1) return 0;
+    zan_loc_t loc; memset(&loc, 0, sizeof(loc));
+    if (at) loc = at->loc;
+    zan_diag_emit(g->diag, DIAG_ERROR, loc,
+        "'%s' is not supported yet for a list whose element is a value struct "
+        "wider than 8 bytes; Add / [i] / foreach / RemoveAt / Clear are",
+        op);
+    return 1;
+}
+
+/* Store a struct element inline: the slot pointer addresses enough words for
+ * the whole value, so it is written through a pointer of the struct's type. */
+static void store_struct_in_slot(zan_irgen_t *g, LLVMValueRef v,
+                                 LLVMValueRef slot_ptr, zan_ast_node_t *at) {
     LLVMTypeRef st = LLVMTypeOf(v);
     check_struct_fits_slot(g, st, at);
-    LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
-    LLVMValueRef tmp = emit_entry_alloca(g, i64, "slot.pack");
-    LLVMBuildStore(g->builder, LLVMConstInt(i64, 0, 0), tmp);
-    LLVMBuildStore(g->builder, v, tmp);
-    return LLVMBuildLoad2(g->builder, i64, tmp, "slot.packed");
+    LLVMValueRef sp = LLVMBuildBitCast(g->builder, slot_ptr,
+        LLVMPointerType(st, 0), "slot.sp");
+    LLVMBuildStore(g->builder, v, sp);
 }
 
-static LLVMValueRef unpack_struct_from_slot(zan_irgen_t *g, LLVMValueRef raw, LLVMTypeRef st) {
-    LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
-    LLVMValueRef tmp = emit_entry_alloca(g, i64, "slot.unpack");
-    LLVMBuildStore(g->builder, raw, tmp);
-    return LLVMBuildLoad2(g->builder, st, tmp, "slot.struct");
+static LLVMValueRef load_struct_from_slot(zan_irgen_t *g, LLVMValueRef slot_ptr,
+                                          LLVMTypeRef st) {
+    LLVMValueRef sp = LLVMBuildBitCast(g->builder, slot_ptr,
+        LLVMPointerType(st, 0), "slot.lp");
+    return LLVMBuildLoad2(g->builder, st, sp, "slot.struct");
 }
 
 /* Store `value` into a collection slot, retaining the new occupant when needed
@@ -2300,7 +2333,9 @@ static void emit_collection_slot_store(zan_irgen_t *g, zan_type_t *elem_type,
         }
     } else if (slot_k == LLVMIntegerTypeKind) {
         if (val_k == LLVMStructTypeKind) {
-            stored = pack_struct_into_slot(g, stored, rhs);
+            /* value struct: written inline across the element's own words */
+            store_struct_in_slot(g, stored, slot_ptr, rhs);
+            return;
         } else if (val_k == LLVMPointerTypeKind) {
             stored = LLVMBuildPtrToInt(g->builder, stored, slot_ty, "slot.pi");
         } else if (val_k == LLVMIntegerTypeKind &&

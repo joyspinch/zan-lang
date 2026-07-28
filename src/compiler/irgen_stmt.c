@@ -1641,9 +1641,13 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         /* load current element; slots physically hold an i64, so pointer
          * (class/string) elements need inttoptr, doubles a bitcast, and
          * narrower integers a trunc back to the value type */
-        LLVMValueRef elem_ptr = LLVMBuildGEP2(g->builder, i64, data, &idx_body, 1, "ep");
-        LLVMValueRef elem = LLVMBuildLoad2(g->builder, i64, elem_ptr, "elem");
+        LLVMValueRef fe_widx = slot_word_index(g, idx_body,
+            elem_slot_words(g, elem_type));
+        LLVMValueRef elem_ptr = LLVMBuildGEP2(g->builder, i64, data, &fe_widx, 1, "ep");
         LLVMTypeKind ek = LLVMGetTypeKind(elem_llvm);
+        LLVMValueRef elem = (ek == LLVMStructTypeKind)
+            ? load_struct_from_slot(g, elem_ptr, elem_llvm)
+            : LLVMBuildLoad2(g->builder, i64, elem_ptr, "elem");
         if (ek == LLVMPointerTypeKind)
             elem = LLVMBuildIntToPtr(g->builder, elem, elem_llvm, "elp");
         else if (ek == LLVMDoubleTypeKind)

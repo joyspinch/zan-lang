@@ -1551,6 +1551,30 @@ load → add → store 三件套（`src/compiler/irgen.c` 里 `zan_rt_alloc` /
 
 ---
 
+# A30 · 集合元素槽不再固定 8 字节（A15-4，已完成）
+
+`List<T>` 的数据缓冲区仍是 `i64*`，但一个元素占**整数个 8 字节字**：标量/引用元素
+1 个字，值 struct 占 `ceil(sizeof/8)` 个字并**内联**存放（原来是打包进单个 i64，
+超过 8 字节直接报编译错误）。容量、`realloc` 字节数、以及每一处槽地址计算都按
+`elem_slot_words()` 的 stride 缩放（`slot_word_index()`）。
+
+* 覆盖到的路径：`new List<T>()` 与带初始化列表的 `new List<T>{...}` 的首次分配与
+  逐项写入、`Add`（含扩容 `cap*stride*8`）、`list[i]` 读、`list[i] = v` 三条写路径
+  （局部 / 隐式 `this.field` / `obj.field`）、`foreach`、LINQ 查询取元素、
+  `RemoveAt`（按字整体左移 + 尾部清零 stride 个字）、`Clear`。
+* **顺带修**：`list[i].field` 这类"在 struct 右值上取字段"一直落到
+  `emit_expr_member_access` 的兜底 `return 0`——`a[0].x` 静默返回 0（与元素宽度无关，
+  1 个 int 的 struct 也中招）。现在对寄存器里的 struct 右值走 `extractvalue`。
+* 仍受限（给明确编译错误，不产生错 IR）：宽 struct 元素的 `IndexOf` / `Contains` /
+  `Insert` / `Reverse` / `AddRange`（这些按单字做相等比较或整字搬运），
+  以及 `Dictionary` 的值槽仍是 8 字节。
+
+证据：`tests/conformance/list_wide_struct_elements.zan`（12 字节 P3 与 32 字节 Big：
+10 个元素的下标/字段访问、foreach 求和、扩容、整元素覆盖写、`RemoveAt` 左移、
+`Clear`）。全量 ctest 687 项，仍只有 `conformance_gui_datatable` 一项既有失败。
+
+---
+
 # 已撤回的结论（早期草稿中的错误，勿再引用）
 
 1. ~~"无符号/窄类型只是语法别名，IR 层全塌成 i64，语义是假的"~~ ——
