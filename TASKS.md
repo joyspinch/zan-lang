@@ -112,7 +112,7 @@
   - 顺带修：`irgen_emit.c` 的 sync-runtime 触发前缀表补上 `zan_monotonic_`，
     否则只 import `zan_monotonic_us` 的程序不会链接 `zanrt_sync`，
     链接期报 `undefined reference to 'zan_monotonic_us'`。
-* **A0-1** `int` → i32、`long` → i64。C 的 `int` 也是 32 位，**对齐后 FFI 自然正确**。
+* **A0-1 ✅ 已完成（2026-07-28，commit `3a2bc6d`）** `int` → i32、`long` → i64。C 的 `int` 也是 32 位，**对齐后 FFI 自然正确**。
   **前置已落地（2026-07-27）**：`map_type` 一改，i32 的 `int` 就会和 i64 的长度/计数/
   句柄/运行时 helper 混在同一个二元运算里，LLVM 直接拒绝
   （`%argi = add i32 %load5, i64 1`）。irgen 里 391 处整数 builder 已统一换成
@@ -176,6 +176,8 @@
   颜色字段（175 处引用），以及 `App.LerpColor` / `Fx` / `Effects` /
   `ChartView` 里的颜色算术改成 `Color` 上的方法。
 
+  **✅ 落地纪要（2026-07-28）**：`map_type` 的 `TYPE_INT` 正式改为 i32（`long` 保持 i64、ARGB 保留负值对齐 C#）。i32 收窄暴露并已修复的回归：集合槽按源类型做符号/零扩展、`List.RemoveAt` 索引先符号扩展再入 i64 槽、`Gate`/`AsyncGate` 句柄（64 位堆指针）改 `long`（修 Firebird 并发池崩溃）、switch 内含 await 的 case 标签改用常量位宽转换（修 async 漏终结符崩溃）、crypto(Bits/Sha512/AesGcm/BigInt) 与 Firebird(FbWire/FbSql) 的 64 位量迁 `long`、JSON 新增 `FK_LONG` + `AsLong/Long/LongOf`。golden IR 与 gui_css/json_entity_mapping golden 已重刷。焦点子集 203/203 通过。
+  **A0-2 / A0-3 仍未做**（FFI 按声明位宽 lower、结构体布局），并入 A2 一起推进。
 * **A0-2** FFI 边界按声明类型的真实位宽 lower。现在 `map_type`（`irgen.c:1601`）对
   `int`/`uint`/`long`/`nint` 一律给 i64，于是：传参时把 64 位塞给期望 32 位的 C 函数；
   取返回值时按 64 位读，而 C 只保证低 32 位有效，**高位是未定义的**
