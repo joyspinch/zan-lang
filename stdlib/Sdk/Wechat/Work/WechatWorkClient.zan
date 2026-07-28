@@ -1,0 +1,99 @@
+using System;
+using System.Text;
+using Sdk.Wechat;
+
+namespace Sdk.Wechat.Work;
+
+/// <summary>企业微信 JSON API 客户端，自动缓存 corp access_token。</summary>
+class WechatWorkClient {
+    WechatApiTransport transport;
+    string corpId;
+    string corpSecret;
+    string accessToken;
+    long accessTokenExpireUnix;
+    string providerAccessToken;
+    string suiteAccessToken;
+
+    public WechatWorkClient(string corpId, string corpSecret) {
+        this.transport = new WechatApiTransport("qyapi.weixin.qq.com");
+        this.corpId = corpId;
+        this.corpSecret = corpSecret;
+        this.accessToken = "";
+        this.accessTokenExpireUnix = 0;
+        this.providerAccessToken = "";
+        this.suiteAccessToken = "";
+    }
+
+    WechatWorkClient Server(string host, int port) {
+        this.transport.Server(host, port);
+        return this;
+    }
+
+    WechatWorkClient Timeout(int ms) {
+        this.transport.Timeout(ms);
+        return this;
+    }
+
+    WechatWorkClient SetAccessToken(string token, int expiresIn) {
+        this.accessToken = token;
+        int life = expiresIn - 300;
+        if (life < 0) { life = 0; }
+        this.accessTokenExpireUnix = DateTime.UtcNow().ToUnixSeconds() + life;
+        return this;
+    }
+
+    WechatWorkClient SetProviderAccessToken(string token) {
+        this.providerAccessToken = token;
+        return this;
+    }
+
+    WechatWorkClient SetSuiteAccessToken(string token) {
+        this.suiteAccessToken = token;
+        return this;
+    }
+
+    async string GetAccessTokenAsync() {
+        if (this.accessToken.Length > 0
+            && DateTime.UtcNow().ToUnixSeconds() < this.accessTokenExpireUnix) {
+            return this.accessToken;
+        }
+        if (this.corpId.Length == 0 || this.corpSecret.Length == 0) {
+            throw new WechatException("work.paramError", "corpId / corpSecret 不能为空", "");
+        }
+        string path = "/cgi-bin/gettoken?corpid=" + Encoding.UrlEncode(this.corpId)
+            + "&corpsecret=" + Encoding.UrlEncode(this.corpSecret);
+        WechatResponse response = await this.transport.RequestJsonAsync("GET", path, "");
+        string token = response.Str("access_token", "");
+        if (token.Length == 0) {
+            throw new WechatException("work.badResponse", "响应缺少 access_token", response.Data);
+        }
+        this.SetAccessToken(token, response.Int("expires_in", 7200));
+        return this.accessToken;
+    }
+
+    async string CredentialAsync(string name) {
+        if (name.Length == 0) { return ""; }
+        if (name == "access_token") { return await this.GetAccessTokenAsync(); }
+        if (name == "provider_access_token") {
+            if (this.providerAccessToken.Length == 0) {
+                throw new WechatException("work.tokenMissing", "请先设置 provider_access_token", "");
+            }
+            return this.providerAccessToken;
+        }
+        if (name == "suite_access_token") {
+            if (this.suiteAccessToken.Length == 0) {
+                throw new WechatException("work.tokenMissing", "请先设置 suite_access_token", "");
+            }
+            return this.suiteAccessToken;
+        }
+        throw new WechatException("work.tokenUnsupported", "不支持的凭证参数：" + name, "");
+    }
+
+    async WechatResponse RequestAsync(string method, string path, string query,
+                                      string jsonBody, string credentialName) {
+        string target = WechatApiTransport.BuildPath(path, query);
+        string token = await this.CredentialAsync(credentialName);
+        target = WechatApiTransport.AppendQuery(target, credentialName, token);
+        return await this.transport.RequestJsonAsync(method, target, jsonBody);
+    }
+}

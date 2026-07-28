@@ -1,7 +1,7 @@
-# Sdk.Wechat —— 微信公众号（MP）客户端
+# Sdk.Wechat —— 微信 SDK
 
-`stdlib/Sdk/Wechat` 是 [Senparc.Weixin.MP](https://github.com/JeffreySu/WeiXinMPSDK)
-的 Zan 原生移植。当前覆盖公众号接入、消息加密、常用强类型方法，以及大部分 MP Advanced JSON API：
+`stdlib/Sdk/Wechat` 是 [Senparc 微信 SDK](https://github.com/JeffreySu/WeiXinMPSDK)
+的 Zan 原生移植。当前覆盖公众号 MP、企业微信 Work、小程序 WxOpen 和开放平台 Open：
 
 | 能力 | 对应文件 | 微信接口 |
 |------|----------|----------|
@@ -17,8 +17,11 @@
 | 安全模式消息加解密 | `WXBizMsgCrypt.zan` | SHA-1 + AES-256-CBC + PKCS#7 |
 | 响应解析 / 错误抛出 | `WechatResponse.zan` / `WechatException.zan` | 通用 errcode/errmsg |
 | MP Advanced JSON API | `Mp/WechatMp*Api.zan` | 37 个模块、383 个方法映射 |
+| 企业微信 Work | `Work/WechatWork*Api.zan` | 34 个模块、249 个 JSON 方法 |
+| 小程序 WxOpen | `WxOpen/WechatWxOpen*Api.zan` | 58 个模块、421 个 JSON 方法 |
+| 开放平台 Open | `Open/WechatOpen*Api.zan` | 24 个模块、147 个 JSON 方法 |
 
-MP 模块的精确覆盖和特殊传输缺口见 `Mp/COVERAGE.md`。企业微信、支付、WxOpen 和开放平台仍需后续分批迁移。
+MP 模块见 `Mp/COVERAGE.md`；其他产品线和 TenPay 暂缓原因见 `PRODUCT_COVERAGE.md`。当前已迁移 Work、WxOpen、Open 的普通 JSON API；TenPay 签名/证书接口按计划后置。
 **不**再复制一份 HTTP / 摘要 / JSON——一律用 `System.Net.Http.Client.HttpClient`、
 `System.Security.Cryptography.*`、`System.Json.*`。
 
@@ -55,6 +58,27 @@ WechatResponse result = await draft.AddDraftAsync("", draftJson);
 
 生成模块采用原始 query / JSON 请求体，避免把 C# SDK 的 ASP.NET、DI 和纯数据 POCO 整套复制到 Zan；返回字段通过 `WechatResponse` / `System.Json` 读取。
 
+其他产品线使用各自客户端：
+
+```zan
+using Sdk.Wechat.Work;
+using Sdk.Wechat.WxOpen;
+using Sdk.Wechat.Open;
+
+WechatWorkClient work = new WechatWorkClient("corp-id", "corp-secret");
+WechatWorkAppApi workApp = new WechatWorkAppApi(work);
+WechatResponse appInfo = await workApp.GetAppInfoAsync("agentid=1000002");
+
+WechatWxOpenClient mini = new WechatWxOpenClient("app-id", "app-secret");
+WechatWxOpenDataCubeApi cube = new WechatWxOpenDataCubeApi(mini);
+WechatResponse trend = await cube.GetWeAnalysisAppidDailySummaryTrendAsync("", dateJson);
+
+WechatOpenClient open = new WechatOpenClient();
+open.SetComponentAccessToken(componentToken);
+WechatOpenComponentApi component = new WechatOpenComponentApi(open);
+WechatResponse auth = await component.GetPreAuthCodeAsync("", componentJson);
+```
+
 失败一律抛 `WechatException`：
 
 ```zan
@@ -89,6 +113,7 @@ if (CheckSignature.Check(signature, timestamp, nonce, "your-token")) {
 
 - `tests/conformance/sdk_wechat.zan`：签名、JSON 响应、错误路径和请求体；
 - `tests/conformance/sdk_wechat_crypt.zan`：官方密文向量、加解密往返、消息 XML、OAuth URL；
-- `tests/conformance/sdk_wechat_mp_modules.zan`：37 个 MP 模块自动发现、构造及代表性 GET/POST 接口编译。
+- `tests/conformance/sdk_wechat_mp_modules.zan`：37 个 MP 模块自动发现、构造及代表性 GET/POST 接口编译；
+- `tests/conformance/sdk_wechat_product_modules.zan`：Work/WxOpen/Open 共 116 个模块和 817 个方法的自动发现、构造与代表性调用编译。
 
 测试不访问微信网关，可在 conformance / determinism / leakcheck 三种模式运行。

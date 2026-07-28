@@ -1,0 +1,71 @@
+using System;
+using System.Text;
+using System.Net.Http;
+using System.Net.Http.Client;
+
+namespace Sdk.Wechat;
+
+/// <summary>
+/// 微信各产品线共用的 HTTPS / JSON 传输层。
+/// 产品客户端只负责取得对应 token；这里统一处理 query、HTTP verb、超时、
+/// JSON 响应和网络异常，不为 Work/WxOpen/Open 各复制一套 HttpClient。
+/// </summary>
+class WechatApiTransport {
+    string host;
+    int port;
+    int timeoutMs;
+
+    public WechatApiTransport(string host) {
+        this.host = host;
+        this.port = 443;
+        this.timeoutMs = 30000;
+    }
+
+    WechatApiTransport Server(string host, int port) {
+        this.host = host;
+        this.port = port;
+        return this;
+    }
+
+    WechatApiTransport Timeout(int ms) {
+        this.timeoutMs = ms;
+        return this;
+    }
+
+    static string BuildPath(string path, string query) {
+        if (query.Length == 0) { return path; }
+        if (query.StartsWith("?")) { return path + query; }
+        return path + "?" + query;
+    }
+
+    static string AppendQuery(string path, string name, string tokenValue) {
+        if (name.Length == 0 || tokenValue.Length == 0) { return path; }
+        string sep = "?";
+        int i = 0;
+        while (i < path.Length) {
+            if ((path[i] & 255) == 63) { sep = "&"; break; }
+            i = i + 1;
+        }
+        return path + sep + name + "=" + Encoding.UrlEncode(tokenValue);
+    }
+
+    async WechatResponse RequestJsonAsync(string method, string path, string body) {
+        string raw = "";
+        try {
+            HttpClient http = HttpClient.CreateHttps(this.host, this.port);
+            http.SetTimeout(this.timeoutMs);
+            string payload = body;
+            if (method != "GET" && method != "DELETE" && payload.Length == 0) {
+                payload = "{}";
+            }
+            if (payload.Length > 0) {
+                http.SetHeader("Content-Type", "application/json");
+            }
+            HttpResponse response = await http.SendAsync(method, path, payload);
+            raw = response.body;
+        } catch (Exception e) {
+            throw new WechatException("client.networkError", e.Message, "");
+        }
+        return WechatResponse.Parse(raw);
+    }
+}
