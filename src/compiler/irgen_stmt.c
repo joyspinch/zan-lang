@@ -855,9 +855,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         LLVMBasicBlockRef catch_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "try.catch");
         LLVMBasicBlockRef end_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "try.end");
 
-        LLVMValueRef eh_tmps_g, eh_tmptop_g, eh_tmpcap_g;
-        get_eh_tmp_globals(g, &eh_tmps_g, &eh_tmptop_g, &eh_tmpcap_g);
-        (void)eh_tmps_g; (void)eh_tmpcap_g;
+        LLVMValueRef eh_tmptop_g = get_eh_tmp_top_global(g);
         /* compile-time id of this try within the enclosing async function;
          * indexes its frame-resident catch slots (-1 = not async / no room) */
         int async_hid = -1;
@@ -875,13 +873,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         zan_store_fit(g, new_top, top_g);
         /* record the depth this handler was armed at, so a throw below can
          * release the skipped frames' locals while they are still alive */
-        {
-            LLVMValueRef marks = get_eh_tmpmarks_global(g);
-            LLVMValueRef mi[2] = { LLVMConstInt(i32t, 0, 0), new_top };
-            LLVMValueRef mp = LLVMBuildGEP2(g->builder,
-                LLVMGlobalGetValueType(marks), marks, mi, 2, "eh.markp");
-            zan_store_fit(g, tmp_mark, mp);
-        }
+        zan_store_fit(g, tmp_mark, emit_eh_mark_ptr(g, new_top));
         /* An async frame records how many try handlers it currently has
          * armed (frame.hcount): __zan_async_unwind stops releasing frames at
          * the first one with an armed handler, since the exception resumes
@@ -938,10 +930,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             emit_async_save_slots(g);
         }
         LLVMValueRef zero = LLVMConstInt(i32t, 0, 0);
-        LLVMValueRef gep_idx[2] = { zero, new_top };
-        LLVMTypeRef bufs_ty = LLVMGlobalGetValueType(bufs_g);
-        LLVMValueRef buf = LLVMBuildGEP2(g->builder, bufs_ty, bufs_g, gep_idx, 2, "eh.buf");
-        LLVMValueRef bufp = LLVMBuildBitCast(g->builder, buf, i8ptr, "eh.bufp");
+        LLVMValueRef bufp = emit_eh_buf_ptr(g, new_top);
         LLVMValueRef r = emit_eh_setjmp(g, bufp);
         LLVMValueRef took = zan_icmp(g->builder, LLVMIntEQ, r, zero, "eh.took");
         LLVMBuildCondBr(g->builder, took, try_bb, catch_bb);
@@ -1177,11 +1166,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                  * inside this invocation -- no cross-frame unwinding here */
                 if (g->current_async_frame)
                     emit_async_save_slots(g);
-                LLVMValueRef rgep_idx[2] = { LLVMConstInt(i32t, 0, 0), rtop };
-                LLVMValueRef rbuf = LLVMBuildGEP2(g->builder,
-                    LLVMGlobalGetValueType(bufs_g), bufs_g, rgep_idx, 2, "reh.buf");
-                LLVMValueRef rbufp = LLVMBuildBitCast(g->builder, rbuf, i8ptr, "reh.bufp");
-                emit_eh_longjmp(g, rbufp);
+                emit_eh_longjmp(g, emit_eh_buf_ptr(g, rtop));
                 LLVMBuildUnreachable(g->builder);
                 LLVMPositionBuilderAtEnd(g->builder, rdie_bb);
                 LLVMValueRef printf_fn = LLVMGetNamedFunction(g->mod, "printf");
@@ -1671,11 +1656,7 @@ throw_unwind:
                 emit_async_save_slots(g);
             else
                 emit_eh_unwind_to_handler(g, top);
-            LLVMValueRef gep_idx[2] = { LLVMConstInt(i32t, 0, 0), top };
-            LLVMValueRef buf = LLVMBuildGEP2(g->builder,
-                LLVMGlobalGetValueType(bufs_g), bufs_g, gep_idx, 2, "eh.buf");
-            LLVMValueRef bufp = LLVMBuildBitCast(g->builder, buf, i8ptr, "eh.bufp");
-            emit_eh_longjmp(g, bufp);
+            emit_eh_longjmp(g, emit_eh_buf_ptr(g, top));
             LLVMBuildUnreachable(g->builder);
             LLVMPositionBuilderAtEnd(g->builder, die_bb);
             emit_eh_hook_call(g, "__zan_eh_unhandled");

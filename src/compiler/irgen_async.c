@@ -883,7 +883,6 @@ static void emit_async_eh_prologue(zan_irgen_t *g) {
     LLVMTypeRef ft = g->current_async_frame_type;
     LLVMValueRef top_g, bufs_g, exc_g;
     get_eh_globals(g, &top_g, &bufs_g, &exc_g);
-    LLVMTypeRef bufs_ty = LLVMGlobalGetValueType(bufs_g);
     LLVMValueRef zero = LLVMConstInt(i32, 0, 0);
 
     LLVMValueRef entry_slot = LLVMBuildAlloca(g->builder, i32, "eh.co.entry");
@@ -908,10 +907,7 @@ static void emit_async_eh_prologue(zan_irgen_t *g) {
         LLVMValueRef t = LLVMBuildLoad2(g->builder, i32, top_g, "eh.t");
         LLVMValueRef t1 = zan_add(g->builder, t, LLVMConstInt(i32, 1, 0), "eh.t1");
         LLVMBuildStore(g->builder, t1, top_g);
-        LLVMValueRef gep_idx[2] = { zero, t1 };
-        LLVMValueRef buf = LLVMBuildGEP2(g->builder, bufs_ty, bufs_g, gep_idx, 2, "eh.buf");
-        LLVMValueRef bufp = LLVMBuildBitCast(g->builder, buf, i8ptr, "eh.bufp");
-        LLVMValueRef r = emit_eh_setjmp(g, bufp);
+        LLVMValueRef r = emit_eh_setjmp(g, emit_eh_buf_ptr(g, t1));
         LLVMValueRef took = zan_icmp(g->builder, LLVMIntEQ, r, zero, "eh.took");
         LLVMBuildCondBr(g->builder, took, head_bb, exc_bb);
     }
@@ -943,10 +939,7 @@ static void emit_async_eh_prologue(zan_irgen_t *g) {
         LLVMValueRef t = LLVMBuildLoad2(g->builder, i32, top_g, "eh.t2");
         LLVMValueRef t1 = zan_add(g->builder, t, LLVMConstInt(i32, 1, 0), "eh.t3");
         LLVMBuildStore(g->builder, t1, top_g);
-        LLVMValueRef gep_idx[2] = { zero, t1 };
-        LLVMValueRef buf = LLVMBuildGEP2(g->builder, bufs_ty, bufs_g, gep_idx, 2, "eh.buf2");
-        LLVMValueRef bufp = LLVMBuildBitCast(g->builder, buf, i8ptr, "eh.bufp2");
-        LLVMValueRef r = emit_eh_setjmp(g, bufp);
+        LLVMValueRef r = emit_eh_setjmp(g, emit_eh_buf_ptr(g, t1));
         LLVMValueRef took = zan_icmp(g->builder, LLVMIntEQ, r, zero, "eh.took2");
         LLVMBuildCondBr(g->builder, took, init_bb, land_bb);
     }
@@ -1063,10 +1056,7 @@ static void emit_eh_rethrow_current(zan_irgen_t *g) {
 
     LLVMPositionBuilderAtEnd(g->builder, jmp_bb);
     {
-        LLVMValueRef gep_idx[2] = { LLVMConstInt(i32, 0, 0), top };
-        LLVMValueRef buf = LLVMBuildGEP2(g->builder,
-            LLVMGlobalGetValueType(bufs_g), bufs_g, gep_idx, 2, "aeh.buf");
-        emit_eh_longjmp(g, LLVMBuildBitCast(g->builder, buf, i8ptr, "aeh.bufp"));
+        emit_eh_longjmp(g, emit_eh_buf_ptr(g, top));
         LLVMBuildUnreachable(g->builder);
     }
 

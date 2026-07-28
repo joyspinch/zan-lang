@@ -1185,6 +1185,62 @@ longjmp 跳过那些帧时它们的对象**全部泄漏**。
 仍未完成（同 A8-12 尾部）：async 体局部仍未登记到展开栈；终局仍应换成
 LLVM 真 EH（invoke/landingpad + personality），届时这套 push/pop 补偿整体删除。
 
+> 后续修正（A20）：这里的 `realloc` 增长形态在多线程调度器下是 use-after-free，
+> 已整体换成「固定 chunk 表 + 按需 malloc chunk」，`__zan_eh_tmps_cap` /
+> `__zan_eh_tmp_grow` 已删除。上面的泄漏复现与用例仍然有效。
+
+---
+
+# A20 handler 栈去掉固定 16 层上限，两个 EH 栈都改成不搬移的 chunk 存储（2026-07-28，已实测已修）
+
+`__zan_eh_bufs` 此前是 `[16 x [1024 x i8]]` 的静态全局，且 **没有任何边界检查**。
+handler 深度是**运行时**嵌套数（当前已进入的 try 数），不是源码嵌套层数——
+一个带 try/catch 的递归函数递归到第 17 层就写到数组之外。后果不是泄漏而是
+内存破坏 / 语义错：`throw` 会 longjmp 到某个更外层的 handler，本该接住它的
+catch 被跳过。
+
+为什么不能照 A19 那样 `realloc` 增长：**EH 状态是进程级全局，而调度器是多线程的**
+（`zan_co_sched_run` 起 N 个 worker 线程各自 step 协程）。实测证据：先按
+「两条并行数组各自 realloc」改完，`leakcheck_sqlserver_tds` 用新编译器跑 8 次崩 3 次，
+gdb 栈顶正是 `__zan_eh_tmp_grow` 里的 `realloc` → `RtlFreeHeap`（另一个线程仍持有旧缓冲），
+旧编译器 8/8 通过。另外 armed 的 `jmp_buf` 本身**永远不能被搬走**。
+顺带排除了 `thread_local`：把这些全局标成 TLS 后**每个**生成程序在第一次 TLS 访问
+（`_tls_index` + `gs:0x58`）就崩，说明 zanc 自带的 ld.lld + mingw runtime 这条链上
+生成代码的原生 TLS 目前不可用，需单独修（见下）。
+
+修法（`irgen_builtins.c`，两个栈共用）：`get_eh_chunk_fn` 生成
+`i8* __zan_eh_slot(i32)` / `i8* __zan_eh_tmp_slot(i32)`——固定的
+`[1024 x i8*]` chunk 表 + 首次使用时 `calloc` 一个 chunk，用
+**cmpxchg 发布**（抢输的线程 free 掉自己那块从未公开的内存，改用赢家的）。
+已发布的 chunk 永不 free / 永不搬移，所以发出去的地址（含 armed 的 jmp_buf）
+终生有效，别的 worker 线程并发读也安全。handler 槽 1040 字节 = 1024 的 jmp_buf +
+展开栈 mark（16 字节对齐），每 chunk 64 槽；展开栈每 chunk 4096 条。
+上限从 16 变成 65536 个活 handler / 4M 条展开项，超过或 chunk 分配失败是
+**明确 abort**，不再静默丢弃。删掉了 `__zan_eh_marks` / `__zan_eh_cap` /
+`__zan_eh_tmps_cap` / `__zan_eh_tmp_grow` / `__zan_eh_slots_ensure`。
+
+实测（Windows）：新增 `tests/conformance/exception_handler_depth.zan`——
+`Relay(40)` 递归 40 层、每层各有自己的 try/catch（第 20 层换抛新异常，其余用裸 `throw;`
+逐层重抛）+ 20 层静态嵌套 try 的 `Nested()` + 浅层抛出验证栈已复原 + 再跑一次深层
+验证 chunk 复用。
+* 旧的固定 16 层实现：同用例 access violation（第 17 个 handler 写越界）。
+* chunk 版：输出 `caught relayed at 20` / `nested 20` / `caught shallow` /
+  `caught relayed at 20` / `done` 全对，`--check-leaks` 干净。
+* 子集 `ctest -R 'exception|throw|catch|async|try|await|leakcheck|generic' -j8`
+  = **283/284，30.24 秒**；唯一失败 `leakcheck_sdk_wechat_product_modules` 是
+  另一个会话正在改的 Wechat stdlib（`WechatApiTransport_RequestRawAsync` 实参个数不匹配），
+  与 EH 无关。改之前失败的 `leakcheck_sqlserver_tds` /
+  `leakcheck_http_client_timeout` 现在连跑 6 轮 100% 通过。
+
+仍未完成（**不要当已解决**）：
+* **多线程共享 EH 状态的语义问题**：`__zan_eh_top` / `__zan_eh_exc` /
+  `__zan_eh_tmps_top` 仍是进程级全局，A 线程 throw 理论上能 longjmp 到 B 线程的
+  handler。chunk 存储只消除了内存安全回归，没有解决「每个协程应有独立 handler 栈」。
+  出路：协程/帧持有 EH 状态，或修好生成代码的 TLS。
+* async 帧的 catch 槽仍是固定 `ASYNC_MAX_HANDLERS`（8）。
+* `try { throw ... } finally { ... }`（无 catch）**吞异常**：finally 只跑最内层一层，
+  函数直接返回 0，异常没有继续往外传（C# 语义是 finally 跑完继续传播）。独立 bug，单独修。
+
 ---
 
 # 已撤回的结论（早期草稿中的错误，勿再引用）
