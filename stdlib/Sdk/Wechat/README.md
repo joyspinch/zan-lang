@@ -1,7 +1,7 @@
 # Sdk.Wechat —— 微信公众号（MP）客户端
 
 `stdlib/Sdk/Wechat` 是 [Senparc.Weixin.MP](https://github.com/JeffreySu/WeiXinMPSDK)
-的 Zan 原生精简移植。当前覆盖公众号接入、消息加密和常用管理 API：
+的 Zan 原生移植。当前覆盖公众号接入、消息加密、常用强类型方法，以及大部分 MP Advanced JSON API：
 
 | 能力 | 对应文件 | 微信接口 |
 |------|----------|----------|
@@ -16,8 +16,9 @@
 | 明文消息与被动回复 XML | `Message.zan` / `XmlUtil.zan` | 文本、图片、事件、图文回复 |
 | 安全模式消息加解密 | `WXBizMsgCrypt.zan` | SHA-1 + AES-256-CBC + PKCS#7 |
 | 响应解析 / 错误抛出 | `WechatResponse.zan` / `WechatException.zan` | 通用 errcode/errmsg |
+| MP Advanced JSON API | `Mp/WechatMp*Api.zan` | 37 个模块、383 个方法映射 |
 
-后续模块（素材、草稿/发布、卡券、小程序、企业微信、支付）按同样模式追加，
+MP 模块的精确覆盖和特殊传输缺口见 `Mp/COVERAGE.md`。企业微信、支付、WxOpen 和开放平台仍需后续分批迁移。
 **不**再复制一份 HTTP / 摘要 / JSON——一律用 `System.Net.Http.Client.HttpClient`、
 `System.Security.Cryptography.*`、`System.Json.*`。
 
@@ -40,6 +41,19 @@ class Program {
     }
 }
 ```
+
+更多 MP Advanced API 使用 `Sdk.Wechat.Mp`：
+
+```zan
+using Sdk.Wechat;
+using Sdk.Wechat.Mp;
+
+WechatClient client = new WechatClient("your-app-id", "your-app-secret");
+WechatMpDraftApi draft = new WechatMpDraftApi(client);
+WechatResponse result = await draft.AddDraftAsync("", draftJson);
+```
+
+生成模块采用原始 query / JSON 请求体，避免把 C# SDK 的 ASP.NET、DI 和纯数据 POCO 整套复制到 Zan；返回字段通过 `WechatResponse` / `System.Json` 读取。
 
 失败一律抛 `WechatException`：
 
@@ -74,6 +88,7 @@ if (CheckSignature.Check(signature, timestamp, nonce, "your-token")) {
 离线一致性用例：
 
 - `tests/conformance/sdk_wechat.zan`：签名、JSON 响应、错误路径和请求体；
-- `tests/conformance/sdk_wechat_crypt.zan`：官方密文向量、加解密往返、消息 XML、OAuth URL。
+- `tests/conformance/sdk_wechat_crypt.zan`：官方密文向量、加解密往返、消息 XML、OAuth URL；
+- `tests/conformance/sdk_wechat_mp_modules.zan`：37 个 MP 模块自动发现、构造及代表性 GET/POST 接口编译。
 
 测试不访问微信网关，可在 conformance / determinism / leakcheck 三种模式运行。
