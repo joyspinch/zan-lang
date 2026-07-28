@@ -178,6 +178,165 @@ class WechatClient {
         return WechatResponse.Parse(raw);
     }
 
+    /// <summary>自动附带 access_token 的 GET（path 不含 token，以 ? 或 &amp; 开头皆可）。</summary>
+    async WechatResponse GetWithTokenAsync(string path) {
+        string token = await this.GetAccessTokenAsync();
+        return await this.GetAsync(this.WithToken(path, token));
+    }
+
+    /// <summary>自动附带 access_token 的 JSON POST。</summary>
+    async WechatResponse PostJsonWithTokenAsync(string path, string jsonBody) {
+        string token = await this.GetAccessTokenAsync();
+        return await this.PostJsonAsync(this.WithToken(path, token), jsonBody);
+    }
+
+    string WithToken(string path, string token) {
+        string sep = "?";
+        int i = 0;
+        while (i < path.Length) {
+            if ((path[i] & 255) == 63) { sep = "&"; break; }
+            i = i + 1;
+        }
+        return path + sep + "access_token=" + Encoding.UrlEncode(token);
+    }
+
+    // ---- 菜单 ----------------------------------------------------------------
+
+    /// <summary>创建自定义菜单。body 为完整 JSON，如 <c>{"button":[...]}</c>。</summary>
+    async WechatResponse CreateMenuAsync(string menuJson) {
+        return await this.PostJsonWithTokenAsync("/cgi-bin/menu/create", menuJson);
+    }
+
+    /// <summary>查询当前自定义菜单。</summary>
+    async WechatResponse GetMenuAsync() {
+        return await this.GetWithTokenAsync("/cgi-bin/menu/get");
+    }
+
+    /// <summary>删除全部自定义菜单。</summary>
+    async WechatResponse DeleteMenuAsync() {
+        return await this.GetWithTokenAsync("/cgi-bin/menu/delete");
+    }
+
+    // ---- 用户 ----------------------------------------------------------------
+
+    /// <summary>获取用户基本信息（UnionID 机制）。</summary>
+    async WechatResponse GetUserInfoAsync(string openId, string lang) {
+        if (openId.Length == 0) {
+            throw new WechatException("client.paramError", "openId 不能为空", "");
+        }
+        string l = lang;
+        if (l.Length == 0) { l = "zh_CN"; }
+        string path = "/cgi-bin/user/info?openid=" + Encoding.UrlEncode(openId)
+            + "&lang=" + Encoding.UrlEncode(l);
+        return await this.GetWithTokenAsync(path);
+    }
+
+    /// <summary>获取帐号的关注者列表。nextOpenId 空串表示从头拉取。</summary>
+    async WechatResponse GetUserListAsync(string nextOpenId) {
+        string path = "/cgi-bin/user/get";
+        if (nextOpenId.Length > 0) {
+            path = path + "?next_openid=" + Encoding.UrlEncode(nextOpenId);
+        }
+        return await this.GetWithTokenAsync(path);
+    }
+
+    // ---- 二维码 / 票据 --------------------------------------------------------
+
+    /// <summary>
+    /// 创建二维码票据。actionName 如 <c>QR_SCENE</c> / <c>QR_LIMIT_STR_SCENE</c>；
+    /// sceneJson 是 action_info.scene 对象，例如 <c>{"scene_str":"test"}</c>。
+    /// </summary>
+    async WechatResponse CreateQrCodeAsync(string actionName, int expireSeconds, string sceneJson) {
+        JsonValue body = JsonValue.NewObject();
+        if (expireSeconds > 0) {
+            body.Put("expire_seconds", JsonValue.NewNum(Convert.ToString(expireSeconds)));
+        }
+        body.Put("action_name", JsonValue.NewStr(actionName));
+        JsonValue actionInfo = JsonValue.NewObject();
+        actionInfo.Put("scene", JsonValue.Parse(sceneJson));
+        body.Put("action_info", actionInfo);
+        return await this.PostJsonWithTokenAsync("/cgi-bin/qrcode/create", body.ToJson());
+    }
+
+    /// <summary>获取 jsapi_ticket（type=jsapi）或 wx_card ticket。</summary>
+    async WechatResponse GetTicketAsync(string type) {
+        string t = type;
+        if (t.Length == 0) { t = "jsapi"; }
+        return await this.GetWithTokenAsync(
+            "/cgi-bin/ticket/getticket?type=" + Encoding.UrlEncode(t));
+    }
+
+    // ---- 模板消息 ------------------------------------------------------------
+
+    /// <summary>
+    /// 发送模板消息。dataJson 是 data 对象，例如
+    /// <c>{"first":{"value":"hi","color":"#173177"}}</c>。
+    /// </summary>
+    async WechatResponse SendTemplateAsync(string openId, string templateId,
+                                           string url, string dataJson) {
+        if (openId.Length == 0 || templateId.Length == 0) {
+            throw new WechatException("client.paramError",
+                "openId / templateId 不能为空", "");
+        }
+        JsonValue body = JsonValue.NewObject();
+        body.Put("touser", JsonValue.NewStr(openId));
+        body.Put("template_id", JsonValue.NewStr(templateId));
+        if (url.Length > 0) { body.Put("url", JsonValue.NewStr(url)); }
+        body.Put("data", JsonValue.Parse(dataJson));
+        return await this.PostJsonWithTokenAsync(
+            "/cgi-bin/message/template/send", body.ToJson());
+    }
+
+    // ---- 网页 OAuth ----------------------------------------------------------
+
+    /// <summary>
+    /// 用 code 换网页授权 access_token（sns/oauth2）。
+    /// 不走公众号 access_token 缓存——这是用户授权 token。
+    /// </summary>
+    async WechatResponse OAuthAccessTokenAsync(string code) {
+        if (code.Length == 0) {
+            throw new WechatException("client.paramError", "code 不能为空", "");
+        }
+        string path = "/sns/oauth2/access_token?appid=" + Encoding.UrlEncode(this.appId)
+            + "&secret=" + Encoding.UrlEncode(this.appSecret)
+            + "&code=" + Encoding.UrlEncode(code)
+            + "&grant_type=authorization_code";
+        return await this.GetAsync(path);
+    }
+
+    /// <summary>刷新网页授权 access_token。</summary>
+    async WechatResponse OAuthRefreshTokenAsync(string refreshToken) {
+        string path = "/sns/oauth2/refresh_token?appid=" + Encoding.UrlEncode(this.appId)
+            + "&grant_type=refresh_token"
+            + "&refresh_token=" + Encoding.UrlEncode(refreshToken);
+        return await this.GetAsync(path);
+    }
+
+    /// <summary>拉取用户信息（需 snsapi_userinfo 授权）。</summary>
+    async WechatResponse OAuthUserInfoAsync(string oauthAccessToken, string openId, string lang) {
+        string l = lang;
+        if (l.Length == 0) { l = "zh_CN"; }
+        string path = "/sns/userinfo?access_token=" + Encoding.UrlEncode(oauthAccessToken)
+            + "&openid=" + Encoding.UrlEncode(openId)
+            + "&lang=" + Encoding.UrlEncode(l);
+        return await this.GetAsync(path);
+    }
+
+    /// <summary>
+    /// 拼网页授权跳转 URL（开在浏览器里让用户点）。
+    /// scope 通常 <c>snsapi_base</c> 或 <c>snsapi_userinfo</c>。
+    /// </summary>
+    string BuildOAuthUrl(string redirectUri, string scope, string state) {
+        string s = scope;
+        if (s.Length == 0) { s = "snsapi_base"; }
+        return "https://open.weixin.qq.com/connect/oauth2/authorize?appid="
+            + Encoding.UrlEncode(this.appId)
+            + "&redirect_uri=" + Encoding.UrlEncode(redirectUri)
+            + "&response_type=code&scope=" + Encoding.UrlEncode(s)
+            + "&state=" + Encoding.UrlEncode(state)
+            + "#wechat_redirect";
+    }
+
     HttpClient NewHttp() {
         HttpClient http = HttpClient.Create(this.host, this.port);
         http.UseTls();

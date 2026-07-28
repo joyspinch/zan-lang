@@ -1,0 +1,287 @@
+using System;
+using System.Text;
+using System.Security.Cryptography;
+
+namespace Sdk.Wechat;
+
+/// <summary>AES 解密后的明文消息 + 尾部 appId。</summary>
+class WXBizPlain {
+    public string Msg;
+    public string AppId;
+
+    public WXBizPlain() {
+        this.Msg = "";
+        this.AppId = "";
+    }
+}
+
+/// <summary>
+/// 微信消息加解密（公众号 / 企业微信兼容的 Tencent 方案）。
+///
+/// 算法要点（官方文档 + Senparc.Weixin.Tencent.Cryptography）：
+///  1. EncodingAESKey 是 43 字符的 Base64（缺一个 '='），解码得 32 字节 AES-256 密钥；
+///  2. IV = Key 的前 16 字节；
+///  3. 明文结构：16 字节随机 + 4 字节网络序 msg 长度 + msg + appId；
+///  4. 填充是 <b>32 字节块</b> 的 PKCS#7（不是标准 AES 的 16）——因此这里用
+///     <see cref="Aes.EncryptBlockEcb"/> 自拼 CBC，不走会自动 16 字节补位的 EncryptCbc；
+///  5. 密文签名：token/timestamp/nonce/encrypt 四串字典序拼接后 SHA-1。
+///
+/// 加解密原语全部来自 <c>System.Security.Cryptography</c>，本类只编排微信协议。
+/// </summary>
+class WXBizMsgCrypt {
+    [DllImport("crt")] static extern string calloc(int count, int size);
+    [DllImport("crt")] static extern void free(string p);
+
+    string token;
+    string appId;
+    string aesKey;   // 32 raw bytes
+    string aesIv;    // 16 raw bytes (= key[0..15])
+
+    /// <summary>
+    /// <paramref name="encodingAesKey"/> 必须是公众平台上配置的 43 字符 EncodingAESKey。
+    /// </summary>
+    public WXBizMsgCrypt(string token, string encodingAesKey, string appId) {
+        this.token = token;
+        this.appId = appId;
+        if (encodingAesKey.Length != 43) {
+            throw new WechatException("client.paramError",
+                "EncodingAESKey 长度必须为 43", "");
+        }
+        List<int> keyLen = new List<int>();
+        keyLen.Add(0);
+        string key = Base64.Decode(encodingAesKey + "=", keyLen);
+        if (keyLen[0] != 32) {
+            throw new WechatException("client.paramError",
+                "EncodingAESKey 解码后不是 32 字节", "");
+        }
+        this.aesKey = key;
+        string iv = calloc(17, 1);
+        int i = 0;
+        while (i < 16) { iv[i] = key[i] & 255; i = i + 1; }
+        this.aesIv = iv;
+    }
+
+    /// <summary>
+    /// 校验并解密微信推送的加密 XML，返回明文 XML。
+    /// 签名错误 / AES 失败 / appId 不匹配一律抛 <see cref="WechatException"/>。
+    /// </summary>
+    string DecryptMsg(string msgSignature, string timestamp, string nonce, string postData) {
+        string encrypt = XmlUtil.GetTag(postData, "Encrypt");
+        if (encrypt.Length == 0) {
+            throw new WechatException("client.badResponse", "推送 XML 缺少 Encrypt", postData);
+        }
+        string expect = WXBizMsgCrypt.MsgSignature(this.token, timestamp, nonce, encrypt);
+        if (expect != msgSignature) {
+            throw new WechatException("-40001", "签名校验失败", postData);
+        }
+        WXBizPlain plain = this.AesDecrypt(encrypt);
+        if (plain.AppId != this.appId) {
+            throw new WechatException("-40005", "appId 校验失败", postData);
+        }
+        return plain.Msg;
+    }
+
+    /// <summary>
+    /// 加密回复 XML，返回可直接写给微信的加密 XML
+    /// （含 Encrypt / MsgSignature / TimeStamp / Nonce）。
+    /// </summary>
+    string EncryptMsg(string replyMsg, string timestamp, string nonce) {
+        string encrypt = this.AesEncrypt(replyMsg);
+        string sig = WXBizMsgCrypt.MsgSignature(this.token, timestamp, nonce, encrypt);
+        StringBuilder sb = new StringBuilder();
+        sb.Append("<xml>");
+        sb.Append(XmlUtil.CdataTag("Encrypt", encrypt));
+        sb.Append(XmlUtil.CdataTag("MsgSignature", sig));
+        sb.Append(XmlUtil.TextTag("TimeStamp", timestamp));
+        sb.Append(XmlUtil.CdataTag("Nonce", nonce));
+        sb.Append("</xml>");
+        return sb.ToString();
+    }
+
+    /// <summary>
+    /// 四参数消息签名：token、timestamp、nonce、encrypt 字典序拼接后 SHA-1 小写 hex。
+    /// </summary>
+    static string MsgSignature(string token, string timestamp, string nonce, string encrypt) {
+        string joined = WXBizMsgCrypt.JoinSorted4(token, timestamp, nonce, encrypt);
+        string digest = Sha1.Hash(joined, joined.Length);
+        return Hex.Encode(digest, 20);
+    }
+
+    /// <summary>四个字符串字典序排序后拼接。</summary>
+    static string JoinSorted4(string a, string b, string c, string d) {
+        List<string> xs = new List<string>();
+        xs.Add(a); xs.Add(b); xs.Add(c); xs.Add(d);
+        // 插入排序（n=4）
+        int i = 1;
+        while (i < 4) {
+            string cur = xs[i];
+            int j = i;
+            while (j > 0) {
+                if (String.CompareOrdinal(xs[j - 1], cur) <= 0) { break; }
+                xs[j] = xs[j - 1];
+                j = j - 1;
+            }
+            xs[j] = cur;
+            i = i + 1;
+        }
+        return xs[0] + xs[1] + xs[2] + xs[3];
+    }
+
+    /// <summary>AES-256-CBC 解密 Base64 密文，按 32 字节 PKCS#7 去垫，拆出 msg 与 appId。</summary>
+    WXBizPlain AesDecrypt(string cipherB64) {
+        List<int> clen = new List<int>();
+        clen.Add(0);
+        string cipher = Base64.Decode(cipherB64, clen);
+        int n = clen[0];
+        if (n == 0 || (n % 16) != 0) {
+            throw new WechatException("-40007", "AES 密文长度非法", "");
+        }
+        string raw = WXBizMsgCrypt.CbcDecryptNoPad(this.aesKey, 32, this.aesIv, cipher, n);
+        // 32 字节 PKCS#7 去垫
+        int pad = raw[n - 1] & 255;
+        if (pad < 1 || pad > 32) { pad = 0; }
+        int plen = n - pad;
+        if (plen < 20) {
+            free(raw);
+            throw new WechatException("-40007", "AES 明文过短", "");
+        }
+        // 网络序 4 字节长度 @ offset 16
+        int msgLen = ((raw[16] & 255) << 24)
+                   | ((raw[17] & 255) << 16)
+                   | ((raw[18] & 255) << 8)
+                   | (raw[19] & 255);
+        if (msgLen < 0 || 20 + msgLen > plen) {
+            free(raw);
+            throw new WechatException("-40007", "AES 明文长度字段非法", "");
+        }
+        WXBizPlain result = new WXBizPlain();
+        result.Msg = WXBizMsgCrypt.BytesToString(raw, 20, msgLen);
+        result.AppId = WXBizMsgCrypt.BytesToString(raw, 20 + msgLen, plen - 20 - msgLen);
+        free(raw);
+        return result;
+    }
+
+    /// <summary>构造 16 随机 + 4 长度 + msg + appId，32 字节 PKCS#7 补位后 AES-CBC 加密并 Base64。</summary>
+    string AesEncrypt(string plain) {
+        string rand = WXBizMsgCrypt.RandAscii(16);
+        int msgLen = plain.Length;
+        int appLen = this.appId.Length;
+        int content = 16 + 4 + msgLen + appLen;
+        int amount = 32 - (content % 32);
+        if (amount == 0) { amount = 32; }
+        int total = content + amount;
+        string buf = calloc(total + 1, 1);
+        int i = 0;
+        while (i < 16) { buf[i] = rand[i] & 255; i = i + 1; }
+        // 网络序长度
+        buf[16] = (msgLen >> 24) & 255;
+        buf[17] = (msgLen >> 16) & 255;
+        buf[18] = (msgLen >> 8) & 255;
+        buf[19] = msgLen & 255;
+        i = 0;
+        while (i < msgLen) { buf[20 + i] = plain[i] & 255; i = i + 1; }
+        i = 0;
+        while (i < appLen) { buf[20 + msgLen + i] = this.appId[i] & 255; i = i + 1; }
+        i = 0;
+        while (i < amount) { buf[content + i] = amount & 255; i = i + 1; }
+
+        string cipher = WXBizMsgCrypt.CbcEncryptNoPad(this.aesKey, 32, this.aesIv, buf, total);
+        free(buf);
+        string b64 = Base64.Encode(cipher, total);
+        free(cipher);
+        return b64;
+    }
+
+    /// <summary>AES-CBC 加密，不做额外填充（调用方保证 len % 16 == 0）。</summary>
+    static string CbcEncryptNoPad(string key, int keyLen, string iv, string data, int len) {
+        string outb = calloc(len + 1, 1);
+        string prev = calloc(17, 1);
+        int i = 0;
+        while (i < 16) { prev[i] = iv[i] & 255; i = i + 1; }
+        int off = 0;
+        while (off < len) {
+            string block = calloc(17, 1);
+            int j = 0;
+            while (j < 16) {
+                block[j] = ((data[off + j] & 255) ^ (prev[j] & 255)) & 255;
+                j = j + 1;
+            }
+            string enc = Aes.EncryptBlockEcb(key, keyLen, block);
+            free(block);
+            j = 0;
+            while (j < 16) {
+                outb[off + j] = enc[j] & 255;
+                prev[j] = enc[j] & 255;
+                j = j + 1;
+            }
+            free(enc);
+            off = off + 16;
+        }
+        free(prev);
+        return outb;
+    }
+
+    /// <summary>AES-CBC 解密，不去垫（调用方处理 32 字节 PKCS#7）。</summary>
+    static string CbcDecryptNoPad(string key, int keyLen, string iv, string data, int len) {
+        string outb = calloc(len + 1, 1);
+        string prev = calloc(17, 1);
+        int i = 0;
+        while (i < 16) { prev[i] = iv[i] & 255; i = i + 1; }
+        int off = 0;
+        while (off < len) {
+            string block = calloc(17, 1);
+            int j = 0;
+            while (j < 16) { block[j] = data[off + j] & 255; j = j + 1; }
+            string dec = Aes.DecryptBlockEcb(key, keyLen, block);
+            j = 0;
+            while (j < 16) {
+                outb[off + j] = ((dec[j] & 255) ^ (prev[j] & 255)) & 255;
+                prev[j] = block[j] & 255;
+                j = j + 1;
+            }
+            free(block);
+            free(dec);
+            off = off + 16;
+        }
+        free(prev);
+        return outb;
+    }
+
+    /// <summary>把 raw 字节缓冲的一段解释为 Latin-1/UTF-8 字节透传字符串（微信 XML 按字节）。</summary>
+    static string BytesToString(string raw, int off, int len) {
+        // Zan 字符串即字节缓冲；用 StringBuilder 按字节 thrash 一份可释放的副本。
+        StringBuilder sb = new StringBuilder();
+        int i = 0;
+        while (i < len) {
+            sb.Append(raw.Substring(off + i, 1));
+            i = i + 1;
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>
+    /// 生成 n 字节可打印随机前缀（与官方 CreateRandCode 字符集一致）。
+    /// 失败时退回固定可重复填充（仍满足长度），加密结果可解密。
+    /// </summary>
+    static string RandAscii(int n) {
+        string alphabet = "234567acdefhijkmnprstACDEFGHJKMNPQRSUVWXYZ";
+        int alen = alphabet.Length;
+        string rnd = RandomNumberGenerator.GetBytes(n);
+        StringBuilder sb = new StringBuilder();
+        int i = 0;
+        if (rnd != null) {
+            while (i < n) {
+                int idx = (rnd[i] & 255) % alen;
+                sb.Append(alphabet.Substring(idx, 1));
+                i = i + 1;
+            }
+            free(rnd);
+        } else {
+            while (i < n) {
+                sb.Append(alphabet.Substring(i % alen, 1));
+                i = i + 1;
+            }
+        }
+        return sb.ToString();
+    }
+}
