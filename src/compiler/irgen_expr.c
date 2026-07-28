@@ -1421,6 +1421,45 @@ binding_lowered:
                         }
                     }
                 }
+            } else {
+                /* any other array expression: `obj.Buffer()[i] = v`, and the
+                 * like. Without this the store was dropped silently. */
+                zan_type_t *at = infer_expr_type(g, arr_expr, locals);
+                if (at && at->kind == TYPE_ARRAY) {
+                    LLVMTypeRef elem_llvm = at->element_type
+                        ? map_type(g, at->element_type)
+                        : LLVMInt64TypeInContext(g->ctx);
+                    LLVMValueRef arr_ptr = emit_expr(g, arr_expr, locals);
+                    LLVMValueRef idx = emit_expr(g, expr->binary.left->index.index, locals);
+                    LLVMValueRef typed_arr = LLVMBuildBitCast(g->builder, arr_ptr,
+                        LLVMPointerType(elem_llvm, 0), "arrp");
+                    LLVMValueRef elem_ptr = LLVMBuildGEP2(g->builder, elem_llvm,
+                        typed_arr, &idx, 1, "eidx");
+                    LLVMValueRef stored = right;
+                    LLVMTypeKind slot_k = LLVMGetTypeKind(elem_llvm);
+                    LLVMTypeKind val_k = LLVMGetTypeKind(LLVMTypeOf(stored));
+                    if (at->element_type && is_rc_managed_type(at->element_type)) {
+                        if (!expr_yields_owned_rc_value(g, expr->binary.right, locals))
+                            emit_rc_retain_for_type(g, at->element_type, stored);
+                        if (val_k == LLVMPointerTypeKind && LLVMTypeOf(stored) != elem_llvm)
+                            stored = LLVMBuildBitCast(g->builder, stored, elem_llvm, "slot.bc");
+                        LLVMValueRef old = LLVMBuildLoad2(g->builder, elem_llvm, elem_ptr, "old");
+                        zan_store_fit(g, stored, elem_ptr);
+                        emit_rc_release_for_type(g, at->element_type, old);
+                    } else {
+                        if (slot_k == LLVMPointerTypeKind && val_k == LLVMIntegerTypeKind)
+                            stored = LLVMBuildIntToPtr(g->builder, stored, elem_llvm, "slot.ip");
+                        else if (slot_k == LLVMIntegerTypeKind && val_k == LLVMPointerTypeKind)
+                            stored = LLVMBuildPtrToInt(g->builder, stored, elem_llvm, "slot.pi");
+                        else if (slot_k == LLVMIntegerTypeKind && val_k == LLVMIntegerTypeKind)
+                            stored = coerce_int_to(g, stored, elem_llvm);
+                        zan_store_fit(g, stored, elem_ptr);
+                    }
+                    emit_release_owned_call_temp(g, arr_expr, arr_ptr, locals);
+                } else {
+                    zan_diag_emit(g->diag, DIAG_ERROR, expr->binary.left->loc,
+                        "cannot assign through this indexed expression");
+                }
             }
         } else if (expr->binary.left->kind == AST_MEMBER_ACCESS) {
             /* obj.Field = value */
