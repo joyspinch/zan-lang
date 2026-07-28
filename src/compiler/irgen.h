@@ -281,6 +281,7 @@ struct zan_irgen {
     /* built-in List<T> runtime support */
     LLVMValueRef fn_realloc;     /* realloc(void*, size_t) -> void* */
     LLVMTypeRef list_struct_type; /* { i64 count, i64 capacity, i64* data } */
+    LLVMTypeRef span_struct_type; /* Span<T> value: { i8* base, i64 len } */
     LLVMTypeRef dict_struct_type; /* { i64 count, i64 capacity, i8** keys, i64* values } */
     LLVMTypeRef sb_struct_type;   /* StringBuilder { i64 count, i64 capacity, i8* data } */
     LLVMTypeRef task_struct_type; /* Task { i64 completed, i64 result, i64 thread_handle } */

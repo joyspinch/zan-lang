@@ -834,6 +834,13 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
     g->list_struct_type = LLVMStructCreateNamed(g->ctx, "List");
     LLVMStructSetBody(g->list_struct_type, list_fields, 3, 0);
 
+    /* Span<T> value type: { i8* base, i64 length }. A non-owning view over a
+     * contiguous run of T (a compact array or raw memory); it is a value
+     * struct, copied by value and never ARC-released. */
+    LLVMTypeRef span_fields[] = { i8ptr, i64 };
+    g->span_struct_type = LLVMStructCreateNamed(g->ctx, "Span");
+    LLVMStructSetBody(g->span_struct_type, span_fields, 2, 0);
+
     /* Dict struct type:
      *   { i64 count, i64 capacity, i8** keys, i64* values,
      *     i64* index, i64 index_capacity, i64 indexed_count }
@@ -1761,6 +1768,8 @@ static LLVMTypeRef map_type(zan_irgen_t *g, zan_type_t *type) {
     }
     case TYPE_STRUCT:
     case TYPE_CLASS: {
+        if (type->name.len == 4 && memcmp(type->name.str, "Span", 4) == 0)
+            return g->span_struct_type;
         /* look up registered struct type */
         for (int i = 0; i < g->struct_type_count; i++) {
             if (g->struct_types[i].sym == type->sym) {

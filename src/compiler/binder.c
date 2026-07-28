@@ -138,6 +138,17 @@ zan_type_t *zan_binder_make_list_type(zan_binder_t *b, zan_type_t *elem) {
     return t;
 }
 
+/* Span<T> is a non-owning value view; it is a value struct (TYPE_STRUCT), so
+ * ARC never retains or releases it. */
+zan_type_t *zan_binder_make_span_type(zan_binder_t *b, zan_type_t *elem) {
+    zan_type_t *t = make_type(b->arena, TYPE_STRUCT, "Span", 4);
+    t->type_args =
+        (zan_type_t **)zan_arena_alloc(b->arena, sizeof(zan_type_t *));
+    t->type_args[0] = elem;
+    t->type_arg_count = 1;
+    return t;
+}
+
 /* Substitute type parameters (matched by declared name in `tps`) with `args`
  * throughout `t`, cloning composite types as needed. */
 zan_type_t *zan_binder_subst_named(zan_binder_t *b, zan_type_t *t,
@@ -220,6 +231,8 @@ zan_type_t *zan_binder_resolve_type(zan_binder_t *b, zan_ast_node_t *type_ref) {
         base = make_type(b->arena, TYPE_CLASS, "Dict", 4);
     else if (istr_eq(name, "StringBuilder", 13))
         base = make_type(b->arena, TYPE_CLASS, "StringBuilder", 13);
+    else if (istr_eq(name, "Span", 4))
+        base = make_type(b->arena, TYPE_STRUCT, "Span", 4);
     else {
         /* user-defined type: look up in scope */
         zan_symbol_t *sym = scope_find(b->current_scope, name);
@@ -272,7 +285,7 @@ zan_type_t *zan_binder_resolve_type(zan_binder_t *b, zan_ast_node_t *type_ref) {
     } else
     if (type_ref->type_ref.type_args.count > 0) {
         bool builtin_generic = istr_eq(name, "List", 4) || istr_eq(name, "Dict", 4) ||
-                               istr_eq(name, "Dictionary", 10);
+                               istr_eq(name, "Dictionary", 10) || istr_eq(name, "Span", 4);
         bool user_generic = !builtin_generic &&
             (base->kind == TYPE_CLASS || base->kind == TYPE_STRUCT ||
              base->kind == TYPE_INTERFACE);

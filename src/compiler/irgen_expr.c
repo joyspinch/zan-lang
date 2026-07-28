@@ -144,6 +144,66 @@ static LLVMValueRef nm_crc32_fn(zan_irgen_t *g) {
     return fn;
 }
 
+/* Span<T> intrinsics lowering a member call to a { i8* base, i64 len } value:
+ * arr.AsSpan([start[,len]]) is a non-owning view over a compact array's
+ * elements; span.Slice(start[,len]) narrows an existing view. */
+static bool emit_span_call(zan_irgen_t *g, zan_ast_node_t *expr,
+                           local_scope_t *locals, LLVMValueRef *out) {
+    zan_ast_node_t *callee = expr->call.callee;
+    if (!callee || callee->kind != AST_MEMBER_ACCESS) return false;
+    zan_istr_t mm = callee->member.name;
+    LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
+    LLVMTypeRef i8ptr = LLVMPointerType(i8, 0);
+    LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
+    if (mm.len == 6 && memcmp(mm.str, "AsSpan", 6) == 0) {
+        zan_type_t *ot = infer_expr_type(g, callee->member.object, locals);
+        if (!ot || ot->kind != TYPE_ARRAY || !ot->element_type) return false;
+        LLVMValueRef arr = emit_expr(g, callee->member.object, locals);
+        LLVMValueRef base = LLVMBuildBitCast(g->builder, arr, i8ptr, "span.base");
+        LLVMValueRef len = zan_array_len(g, arr);
+        LLVMTypeRef elem_llvm = map_type(g, ot->element_type);
+        if (expr->call.args.count >= 1) {
+            LLVMValueRef start = coerce_int_to(g,
+                emit_expr(g, expr->call.args.items[0], locals), i64t);
+            LLVMValueRef off = LLVMBuildMul(g->builder, start,
+                LLVMSizeOf(elem_llvm), "span.boff");
+            base = LLVMBuildGEP2(g->builder, i8, base, &off, 1, "span.base2");
+            len = (expr->call.args.count >= 2)
+                ? coerce_int_to(g, emit_expr(g, expr->call.args.items[1], locals), i64t)
+                : LLVMBuildSub(g->builder, len, start, "span.len");
+        }
+        LLVMValueRef v = LLVMGetUndef(g->span_struct_type);
+        v = LLVMBuildInsertValue(g->builder, v, base, 0, "span.iv0");
+        v = LLVMBuildInsertValue(g->builder, v, len, 1, "span.iv1");
+        *out = v;
+        return true;
+    }
+    if (mm.len == 5 && memcmp(mm.str, "Slice", 5) == 0) {
+        zan_type_t *ot = infer_expr_type(g, callee->member.object, locals);
+        if (!is_span_type(ot) || expr->call.args.count < 1) return false;
+        zan_type_t *elem = container_elem_type(ot);
+        LLVMTypeRef elem_llvm = elem ? map_type(g, elem)
+                                     : LLVMInt32TypeInContext(g->ctx);
+        LLVMValueRef span_val = emit_expr(g, callee->member.object, locals);
+        LLVMValueRef base = LLVMBuildExtractValue(g->builder, span_val, 0, "sl.base");
+        LLVMValueRef len = LLVMBuildExtractValue(g->builder, span_val, 1, "sl.len");
+        LLVMValueRef start = coerce_int_to(g,
+            emit_expr(g, expr->call.args.items[0], locals), i64t);
+        LLVMValueRef off = LLVMBuildMul(g->builder, start,
+            LLVMSizeOf(elem_llvm), "sl.boff");
+        LLVMValueRef nbase = LLVMBuildGEP2(g->builder, i8, base, &off, 1, "sl.base2");
+        LLVMValueRef nlen = (expr->call.args.count >= 2)
+            ? coerce_int_to(g, emit_expr(g, expr->call.args.items[1], locals), i64t)
+            : LLVMBuildSub(g->builder, len, start, "sl.len2");
+        LLVMValueRef v = LLVMGetUndef(g->span_struct_type);
+        v = LLVMBuildInsertValue(g->builder, v, nbase, 0, "sl.iv0");
+        v = LLVMBuildInsertValue(g->builder, v, nlen, 1, "sl.iv1");
+        *out = v;
+        return true;
+    }
+    return false;
+}
+
 static bool emit_native_memory_call(zan_irgen_t *g, zan_ast_node_t *expr,
                                     local_scope_t *locals, LLVMValueRef *out) {
     LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
@@ -1162,6 +1222,31 @@ binding_lowered:
         } else if (expr->binary.left->kind == AST_INDEX) {
             /* arr[i] = value */
             zan_ast_node_t *arr_expr = expr->binary.left->index.object;
+            {
+                zan_type_t *sot = infer_expr_type(g, arr_expr, locals);
+                if (is_span_type(sot)) {
+                    zan_type_t *et = container_elem_type(sot);
+                    LLVMTypeRef elem_llvm = et ? map_type(g, et)
+                        : LLVMInt32TypeInContext(g->ctx);
+                    LLVMValueRef span_val = emit_expr(g, arr_expr, locals);
+                    LLVMValueRef base = LLVMBuildExtractValue(g->builder, span_val, 0, "sps.base");
+                    LLVMValueRef typed = LLVMBuildBitCast(g->builder, base,
+                        LLVMPointerType(elem_llvm, 0), "sps.p");
+                    LLVMValueRef idx = emit_expr(g, expr->binary.left->index.index, locals);
+                    if (LLVMGetTypeKind(LLVMTypeOf(idx)) == LLVMIntegerTypeKind &&
+                        LLVMGetIntTypeWidth(LLVMTypeOf(idx)) < 64)
+                        idx = LLVMBuildSExt(g->builder, idx,
+                            LLVMInt64TypeInContext(g->ctx), "sps.ix");
+                    LLVMValueRef ep = LLVMBuildGEP2(g->builder, elem_llvm, typed, &idx, 1, "sps.ep");
+                    LLVMValueRef sv = right;
+                    if (LLVMGetTypeKind(LLVMTypeOf(sv)) == LLVMIntegerTypeKind &&
+                        LLVMGetTypeKind(elem_llvm) == LLVMIntegerTypeKind &&
+                        LLVMTypeOf(sv) != elem_llvm)
+                        sv = coerce_int_to(g, sv, elem_llvm);
+                    LLVMBuildStore(g->builder, sv, ep);
+                    return right;
+                }
+            }
             if (arr_expr->kind == AST_IDENTIFIER) {
                 local_var_t *local = local_find(locals, arr_expr->ident.name);
                 if (local && local->type && local->type->name.len == 4 &&
@@ -1692,6 +1777,18 @@ static LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr
             }
         }
 
+        /* .Length property on Span -- read the length field from the value */
+        if (expr->member.name.len == 6 &&
+            memcmp(expr->member.name.str, "Length", 6) == 0) {
+            zan_type_t *st = infer_expr_type(g, expr->member.object, locals);
+            if (is_span_type(st)) {
+                LLVMValueRef span_val = emit_expr(g, expr->member.object, locals);
+                LLVMValueRef len = LLVMBuildExtractValue(g->builder, span_val, 1, "sp.len");
+                return LLVMBuildTrunc(g->builder, len,
+                    LLVMInt32TypeInContext(g->ctx), "sp.len32");
+            }
+        }
+
         /* .Count property on List — read count field from list struct
          * (works for local vars and fields). */
         if (expr->member.name.len == 5 && memcmp(expr->member.name.str, "Count", 5) == 0) {
@@ -2024,6 +2121,25 @@ static LLVMValueRef finish_index_of_temp(zan_irgen_t *g, zan_ast_node_t *expr,
 static LLVMValueRef emit_expr_index(zan_irgen_t *g, zan_ast_node_t *expr,
         local_scope_t *locals) {
         /* arr[i] — array/list element access */
+        {
+            zan_type_t *sot = infer_expr_type(g, expr->index.object, locals);
+            if (is_span_type(sot)) {
+                zan_type_t *et = container_elem_type(sot);
+                LLVMTypeRef elem_llvm = et ? map_type(g, et)
+                    : LLVMInt32TypeInContext(g->ctx);
+                LLVMValueRef span_val = emit_expr(g, expr->index.object, locals);
+                LLVMValueRef base = LLVMBuildExtractValue(g->builder, span_val, 0, "spx.base");
+                LLVMValueRef typed = LLVMBuildBitCast(g->builder, base,
+                    LLVMPointerType(elem_llvm, 0), "spx.p");
+                LLVMValueRef idx = emit_expr(g, expr->index.index, locals);
+                if (LLVMGetTypeKind(LLVMTypeOf(idx)) == LLVMIntegerTypeKind &&
+                    LLVMGetIntTypeWidth(LLVMTypeOf(idx)) < 64)
+                    idx = LLVMBuildSExt(g->builder, idx,
+                        LLVMInt64TypeInContext(g->ctx), "spx.ix");
+                LLVMValueRef ep = LLVMBuildGEP2(g->builder, elem_llvm, typed, &idx, 1, "spx.ep");
+                return LLVMBuildLoad2(g->builder, elem_llvm, ep, "spx.elem");
+            }
+        }
         LLVMValueRef arr_ptr = NULL;
         zan_type_t *arr_type = NULL;
         int is_list = 0;

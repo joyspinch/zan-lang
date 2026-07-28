@@ -449,6 +449,13 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                 return nm_out;
         }
 
+        /* Span<T> views: arr.AsSpan(), span.Slice() -> value struct. */
+        {
+            LLVMValueRef sp_out = NULL;
+            if (emit_span_call(g, expr, locals, &sp_out))
+                return sp_out;
+        }
+
         /* String.CompareOrdinal(a, b) → strcmp: byte-wise ordinal compare of
          * two NUL-terminated strings in one libc call. */
         if (is_call_to(expr, "String", "CompareOrdinal") && expr->call.args.count == 2) {

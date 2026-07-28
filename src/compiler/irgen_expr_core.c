@@ -435,6 +435,11 @@ static zan_type_t *container_elem_type(zan_type_t *t) {
     return NULL;
 }
 
+static int is_span_type(zan_type_t *t) {
+    return t && t->kind == TYPE_STRUCT && t->name.len == 4 &&
+           memcmp(t->name.str, "Span", 4) == 0;
+}
+
 static zan_type_t *dict_key_type(zan_irgen_t *g, zan_type_t *t) {
     if (!t || !t->type_args || t->type_arg_count < 1) return g ? g->binder->type_string : NULL;
     return t->type_args[0];
@@ -784,6 +789,9 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
                 if (vt) return zan_binder_make_list_type(g->binder, vt);
             }
         }
+        if (is_span_type(ot) && e->member.name.len == 6 &&
+            memcmp(e->member.name.str, "Length", 6) == 0)
+            return g->binder->type_int;
         if (ot && ot->sym) {
             zan_symbol_t *fs = get_field_sym(ot->sym, e->member.name);
             if (fs) {
@@ -814,6 +822,16 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
          * their owned result be released when passed straight into a call. */
         if (callee->kind == AST_MEMBER_ACCESS) {
             zan_istr_t mm = callee->member.name;
+            if (mm.len == 6 && memcmp(mm.str, "AsSpan", 6) == 0) {
+                zan_type_t *aot = infer_expr_type(g, callee->member.object, locals);
+                if (aot && aot->kind == TYPE_ARRAY && aot->element_type)
+                    return zan_binder_make_span_type(g->binder, aot->element_type);
+                if (is_span_type(aot)) return aot;
+            }
+            if (mm.len == 5 && memcmp(mm.str, "Slice", 5) == 0) {
+                zan_type_t *sot = infer_expr_type(g, callee->member.object, locals);
+                if (is_span_type(sot)) return sot;
+            }
             if ((mm.len == 9 && memcmp(mm.str, "Substring", 9) == 0) ||
                 (mm.len == 8 && memcmp(mm.str, "ToString", 8) == 0) ||
                 (mm.len == 4 && memcmp(mm.str, "Trim", 4) == 0) ||
