@@ -731,7 +731,12 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
     /* Other literals are just as typed: an inferred declaration (`var n = 5`)
      * needs them to reach a type at all. */
     case AST_INT_LITERAL:
-        return g->binder ? g->binder->type_int : NULL;
+        /* Value-based type: literals outside i32 are `long`, so assigning one
+         * to an `int` target is a real narrowing (ZAN_WARN_NARROW). */
+        if (!g->binder) return NULL;
+        if (e->int_val < -2147483648LL || e->int_val > 2147483647LL)
+            return g->binder->type_long;
+        return g->binder->type_int;
     case AST_FLOAT_LITERAL:
         return g->binder ? g->binder->type_double : NULL;
     case AST_CHAR_LITERAL:

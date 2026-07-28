@@ -1259,6 +1259,10 @@ binding_lowered:
                     zan_type_t *vt = dict_value_type(local->type);
                     LLVMValueRef key = emit_expr(g, expr->binary.left->index.index, locals);
                     if (LLVMGetTypeKind(LLVMTypeOf(key)) == LLVMIntegerTypeKind) {
+                        LLVMTypeRef kem = kt ? map_type(g, kt) : NULL;
+                        if (kem && LLVMGetTypeKind(kem) == LLVMIntegerTypeKind &&
+                            LLVMGetIntTypeWidth(kem) < LLVMGetIntTypeWidth(LLVMTypeOf(key)))
+                            key = LLVMBuildTrunc(g->builder, key, kem, "k.nw");
                         if (LLVMGetIntTypeWidth(LLVMTypeOf(key)) < 64)
                             key = LLVMBuildSExt(g->builder, key, i64, "k.sx");
                         key = LLVMBuildIntToPtr(g->builder, key, i8ptr, "k.ip");
@@ -1277,9 +1281,13 @@ binding_lowered:
                         val = LLVMBuildPtrToInt(g->builder, val, i64, "v.pi");
                     } else if (vk == LLVMDoubleTypeKind) {
                         val = LLVMBuildBitCast(g->builder, val, i64, "v.bc");
-                    } else if (vk == LLVMIntegerTypeKind &&
-                               LLVMGetIntTypeWidth(LLVMTypeOf(val)) < 64) {
-                        val = LLVMBuildSExt(g->builder, val, i64, "v.sx");
+                    } else if (vk == LLVMIntegerTypeKind) {
+                        LLVMTypeRef vem = vt ? map_type(g, vt) : NULL;
+                        if (vem && LLVMGetTypeKind(vem) == LLVMIntegerTypeKind &&
+                            LLVMGetIntTypeWidth(vem) < LLVMGetIntTypeWidth(LLVMTypeOf(val)))
+                            val = LLVMBuildTrunc(g->builder, val, vem, "v.nw");
+                        if (LLVMGetIntTypeWidth(LLVMTypeOf(val)) < 64)
+                            val = LLVMBuildSExt(g->builder, val, i64, "v.sx");
                     }
                     LLVMValueRef is_str = LLVMConstInt(i64,
                         (kt && kt->kind == TYPE_STRING) ? 1 : 0, 0);
@@ -2232,7 +2240,7 @@ static LLVMValueRef emit_expr_index(zan_irgen_t *g, zan_ast_node_t *expr,
                 LLVMPointerType(g->dict_struct_type, 0), "dp");
             LLVMValueRef vp = LLVMBuildStructGEP2(g->builder, g->dict_struct_type, dp, 3, "vp");
             LLVMValueRef vs = LLVMBuildLoad2(g->builder, LLVMPointerType(i64, 0), vp, "vs");
-            LLVMValueRef search = coerce_dict_key(g, emit_expr(g, expr->index.index, locals));
+            LLVMValueRef search = coerce_dict_key(g, emit_expr(g, expr->index.index, locals), dict_key_type(g, arr_type));
             LLVMValueRef res = emit_entry_alloca(g, i64, "dres");
             zan_store_fit(g, LLVMConstInt(i64, 0, 0), res);
             LLVMValueRef found = emit_dict_find(g, arr_type, arr_ptr, search);
@@ -2426,6 +2434,27 @@ static LLVMValueRef emit_expr_query_expr(zan_irgen_t *g, zan_ast_node_t *expr,
 
 static LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
         local_scope_t *locals) {
+        /* new Span<T>(nint base, int length) -- non-owning raw-memory view */
+        if (expr->new_expr.type && expr->new_expr.type->kind == AST_TYPE_REF &&
+            !expr->new_expr.is_array) {
+            zan_istr_t spn = expr->new_expr.type->type_ref.name;
+            if (spn.len == 4 && memcmp(spn.str, "Span", 4) == 0 &&
+                expr->new_expr.args.count == 2) {
+                LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+                LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
+                LLVMValueRef base = emit_expr(g, expr->new_expr.args.items[0], locals);
+                if (LLVMGetTypeKind(LLVMTypeOf(base)) == LLVMIntegerTypeKind)
+                    base = LLVMBuildIntToPtr(g->builder, base, i8ptr, "span.b2p");
+                else
+                    base = LLVMBuildBitCast(g->builder, base, i8ptr, "span.bbc");
+                LLVMValueRef len = coerce_int_to(g,
+                    emit_expr(g, expr->new_expr.args.items[1], locals), i64t);
+                LLVMValueRef v = LLVMGetUndef(g->span_struct_type);
+                v = LLVMBuildInsertValue(g->builder, v, base, 0, "span.n0");
+                v = LLVMBuildInsertValue(g->builder, v, len, 1, "span.n1");
+                return v;
+            }
+        }
         /* new List<T>() — built-in dynamic list */
         if (expr->new_expr.type && expr->new_expr.type->kind == AST_TYPE_REF) {
             zan_istr_t tname = expr->new_expr.type->type_ref.name;

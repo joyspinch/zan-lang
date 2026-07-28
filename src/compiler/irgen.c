@@ -2356,6 +2356,16 @@ static void emit_collection_slot_store(zan_irgen_t *g, zan_type_t *elem_type,
     LLVMTypeKind val_k = LLVMGetTypeKind(LLVMTypeOf(stored));
     if (slot_k == LLVMPointerTypeKind) {
         if (val_k == LLVMIntegerTypeKind) {
+            /* A scalar Dict key stored inttoptr'd: normalize to the declared
+             * key width (Dict<int,...> keys are i32) so a literal and a
+             * same-valued variable produce one raw key. */
+            LLVMTypeRef kem = elem_type ? map_type(g, elem_type) : NULL;
+            LLVMTypeRef i64k = LLVMInt64TypeInContext(g->ctx);
+            if (kem && LLVMGetTypeKind(kem) == LLVMIntegerTypeKind &&
+                LLVMGetIntTypeWidth(kem) < LLVMGetIntTypeWidth(LLVMTypeOf(stored)))
+                stored = LLVMBuildTrunc(g->builder, stored, kem, "slot.knw");
+            if (LLVMGetIntTypeWidth(LLVMTypeOf(stored)) < 64)
+                stored = extend_int_for_slot(g, stored, elem_type, i64k);
             stored = LLVMBuildIntToPtr(g->builder, stored, slot_ty, "slot.ip");
         } else if (val_k == LLVMPointerTypeKind && LLVMTypeOf(stored) != slot_ty) {
             stored = LLVMBuildBitCast(g->builder, stored, slot_ty, "slot.bc");
@@ -2367,9 +2377,18 @@ static void emit_collection_slot_store(zan_irgen_t *g, zan_type_t *elem_type,
             return;
         } else if (val_k == LLVMPointerTypeKind) {
             stored = LLVMBuildPtrToInt(g->builder, stored, slot_ty, "slot.pi");
-        } else if (val_k == LLVMIntegerTypeKind &&
-                   LLVMGetIntTypeWidth(LLVMTypeOf(stored)) < 64) {
-            stored = extend_int_for_slot(g, stored, elem_type, slot_ty);
+        } else if (val_k == LLVMIntegerTypeKind) {
+            /* Normalize to the declared element width first so a generic
+             * List<int>/Dict<...,int> enforces i32 like every other int
+             * context: a wider (e.g. i64 literal) value is truncated to the
+             * element width, then re-extended into the i64 slot per the
+             * element's signedness. */
+            LLVMTypeRef eem = elem_type ? map_type(g, elem_type) : NULL;
+            if (eem && LLVMGetTypeKind(eem) == LLVMIntegerTypeKind &&
+                LLVMGetIntTypeWidth(eem) < LLVMGetIntTypeWidth(LLVMTypeOf(stored)))
+                stored = LLVMBuildTrunc(g->builder, stored, eem, "slot.elw");
+            if (LLVMGetIntTypeWidth(LLVMTypeOf(stored)) < LLVMGetIntTypeWidth(slot_ty))
+                stored = extend_int_for_slot(g, stored, elem_type, slot_ty);
         } else if (val_k == LLVMDoubleTypeKind) {
             /* double element packed into an i64 slot: bitcast, not fptoint. */
             stored = LLVMBuildBitCast(g->builder, stored, slot_ty, "slot.fb");

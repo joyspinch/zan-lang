@@ -2676,7 +2676,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                     }
 
                     if (mname.len == 11 && memcmp(mname.str, "ContainsKey", 11) == 0 && expr->call.args.count == 1) {
-                        LLVMValueRef search = coerce_dict_key(g, emit_expr(g, expr->call.args.items[0], locals));
+                        LLVMValueRef search = coerce_dict_key(g, emit_expr(g, expr->call.args.items[0], locals), dict_key_type(g, dict_local->type));
                         LLVMValueRef found = emit_dict_find(g, dict_local->type, raw, search);
                         LLVMValueRef hit = zan_icmp(g->builder, LLVMIntSGE, found,
                             LLVMConstInt(i64, 0, 0), "ckhit");
@@ -2761,7 +2761,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                         LLVMValueRef ks = LLVMBuildLoad2(g->builder, LLVMPointerType(i8ptr, 0), kp, "ks");
                         LLVMValueRef vp = LLVMBuildStructGEP2(g->builder, g->dict_struct_type, dp, 3, "vp");
                         LLVMValueRef vs = LLVMBuildLoad2(g->builder, LLVMPointerType(i64, 0), vp, "vs");
-                        LLVMValueRef search = coerce_dict_key(g, emit_expr(g, expr->call.args.items[0], locals));
+                        LLVMValueRef search = coerce_dict_key(g, emit_expr(g, expr->call.args.items[0], locals), dict_key_type(g, dict_local->type));
                         /* linear search for key */
                         LLVMValueRef idx_a = emit_entry_alloca(g, i64, "di");
                         LLVMBuildStore(g->builder, LLVMConstInt(i64, 0, 0), idx_a);

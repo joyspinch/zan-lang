@@ -126,6 +126,11 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
 
     switch (expr->kind) {
     case AST_INT_LITERAL:
+        /* Type an integer literal by its value so it agrees with IRGen and so
+         * a narrowing target (`int x = 0xFFFFFFFF`) is diagnosable: a value
+         * outside i32 is `long`. */
+        if (expr->int_val < -2147483648LL || expr->int_val > 2147483647LL)
+            return c->binder->type_long;
         return c->binder->type_int;
     case AST_FLOAT_LITERAL:
         return c->binder->type_double;

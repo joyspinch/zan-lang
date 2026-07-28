@@ -1719,10 +1719,18 @@ static LLVMValueRef get_str_join_fn(zan_irgen_t *g) {
 
 /* Coerce a Dict key value to the i8* slot representation (scalar keys are
  * stored inttoptr'd; string keys are already pointers). */
-static LLVMValueRef coerce_dict_key(zan_irgen_t *g, LLVMValueRef key) {
+static LLVMValueRef coerce_dict_key(zan_irgen_t *g, LLVMValueRef key,
+                                    zan_type_t *kt) {
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
     if (LLVMGetTypeKind(LLVMTypeOf(key)) == LLVMIntegerTypeKind) {
+        /* Normalize to the declared key width (Dict<int,...> keys are i32)
+         * before sign-extending, so a literal and a same-valued variable map
+         * to one raw key. */
+        LLVMTypeRef kem = kt ? map_type(g, kt) : NULL;
+        if (kem && LLVMGetTypeKind(kem) == LLVMIntegerTypeKind &&
+            LLVMGetIntTypeWidth(kem) < LLVMGetIntTypeWidth(LLVMTypeOf(key)))
+            key = LLVMBuildTrunc(g->builder, key, kem, "k.nw");
         if (LLVMGetIntTypeWidth(LLVMTypeOf(key)) < 64)
             key = LLVMBuildSExt(g->builder, key, i64, "k.sx");
         return LLVMBuildIntToPtr(g->builder, key, i8ptr, "k.ip");
