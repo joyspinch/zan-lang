@@ -1494,6 +1494,37 @@ load → add → store 三件套（`src/compiler/irgen.c` 里 `zan_rt_alloc` /
 
 ---
 
+## A28 — A8-6 补漏，外加由此暴露的两个既有 bug（2026-07-28，已做完）
+
+* **A28-1 ✅ A8-6 `anf_stmt_contains_await` 补 `AST_TRY_STMT`/`AST_SWITCH_STMT`**
+  （连带 `AST_CATCH_CLAUSE`/`AST_SWITCH_CASE`）。只影响**不带花括号**的单语句体
+  （`if (c) try { ... await ... } catch ...`）：判定为"不含 await"就不会包块，
+  ANF 提升出来的临时声明会落到体外。
+  证据：`tests/conformance/async_await_in_braceless_body.zan`
+  （try/switch 分别作为 if / while / foreach 的无花括号体）。
+
+* **A28-2 ✅〔顺带发现，既有严重 bug〕`switch` 里的 `break` 会跳出外层循环**。
+  `AST_SWITCH_STMT` 的降级从来没有设置自己的 `g->break_target`，所以 case 里的
+  `break` 直接跳到外层 while/for/foreach 的出口块——**任何"循环里套 switch"的代码
+  都只跑了一轮**，而且是静默错误结果，不报错。与 async 无关，同步代码一样中招。
+  修法：switch 进入时保存并改写 `break_target`（`continue` 保持指向循环，不动），
+  string switch 与整数 switch 两条路径都改。
+  证据：`tests/conformance/switch_break_in_loop.zan`
+  （while / foreach / string switch / switch 内 `continue`）。修复前
+  `while=1(i=0)`、`foreach=1`，修复后 `213 / 71 / 8 / 102`。
+
+* **A28-3 ✅〔顺带发现〕`foreach` 遍历数组/字符串 + 体内 await ⇒ LLVM 校验失败**
+  （`Instruction does not dominate all uses: %arr.len`）。List 的 count 是每轮
+  从对象里重读的，数组长度和 `strlen` 却是在循环前置块算一次存寄存器；await 把循环
+  切到另一次 `$resume` 调用里，那个寄存器既不支配条件块也活不过挂起。
+  修法：async 体内（已有 `col_slot` 的情况）在条件块里从重新载入的集合指针重算长度。
+  证据：`tests/conformance/async_await_in_foreach_array.zan`（数组 / 字符串 / 嵌套 +
+  `continue`）。既有的 `async_await_in_foreach` 只覆盖了 `List<T>`，所以一直没暴露。
+
+> 全量 ctest 678 项，仅 `conformance_gui_datatable` 一项失败（A26 既有，B5 GUI）。
+
+---
+
 # 已撤回的结论（早期草稿中的错误，勿再引用）
 
 1. ~~"无符号/窄类型只是语法别名，IR 层全塌成 i64，语义是假的"~~ ——

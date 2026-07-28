@@ -714,6 +714,24 @@ static bool anf_stmt_contains_await(zan_ast_node_t *st) {
     case AST_FOREACH_STMT:
         return anf_expr_contains_await(st->foreach_stmt.collection) ||
                anf_stmt_contains_await(st->foreach_stmt.body);
+    case AST_TRY_STMT: {
+        if (anf_stmt_contains_await(st->try_stmt.try_body)) return true;
+        for (int i = 0; i < st->try_stmt.catches.count; i++)
+            if (anf_stmt_contains_await(st->try_stmt.catches.items[i]))
+                return true;
+        return anf_stmt_contains_await(st->try_stmt.finally_body);
+    }
+    case AST_CATCH_CLAUSE:
+        return anf_stmt_contains_await(st->catch_clause.body);
+    case AST_SWITCH_STMT: {
+        if (anf_expr_contains_await(st->switch_stmt.expr)) return true;
+        for (int i = 0; i < st->switch_stmt.cases.count; i++)
+            if (anf_stmt_contains_await(st->switch_stmt.cases.items[i]))
+                return true;
+        return false;
+    }
+    case AST_SWITCH_CASE:
+        return anf_stmt_contains_await(st->switch_case.body);
     case AST_BLOCK: {
         for (int i = 0; i < st->block.stmts.count; i++)
             if (anf_stmt_contains_await(st->block.stmts.items[i])) return true;

@@ -933,6 +933,11 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             ? LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "sw.default")
             : end_bb;
 
+        /* `break` in a case leaves the switch, not an enclosing loop
+         * (`continue` keeps targeting the loop, so it is left alone) */
+        LLVMBasicBlockRef sw_saved_break = g->break_target;
+        g->break_target = end_bb;
+
         if (is_string_expr(g, stmt->switch_stmt.expr, locals)) {
             /* string switch: strcmp chain (LLVMBuildSwitch requires integers) */
             LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
@@ -986,6 +991,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                 }
             }
 
+            g->break_target = sw_saved_break;
             LLVMPositionBuilderAtEnd(g->builder, end_bb);
             break;
         }
@@ -1025,6 +1031,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             }
         }
 
+        g->break_target = sw_saved_break;
         LLVMPositionBuilderAtEnd(g->builder, end_bb);
         break;
     }
@@ -1563,7 +1570,20 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             : collection;
         LLVMValueRef count;
         if (fe_array || fe_string) {
-            count = fe_len;
+            /* the pre-header length is a register, so in an async body it
+             * neither dominates the condition (re-entered from a later resume)
+             * nor survives the suspension: re-derive it from the reloaded
+             * collection, exactly as the List path re-reads its count */
+            if (col_slot && fe_array) {
+                count = zan_array_len(g, col_cond);
+            } else if (col_slot) {
+                LLVMTypeRef i8p = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+                LLVMTypeRef slt2 = LLVMFunctionType(i64, (LLVMTypeRef[]){ i8p }, 1, 0);
+                LLVMValueRef sp2 = LLVMBuildBitCast(g->builder, col_cond, i8p, "fe.sp2");
+                count = zan_call2(g->builder, slt2, g->fn_strlen, &sp2, 1, "fe.slen2");
+            } else {
+                count = fe_len;
+            }
         } else {
             LLVMValueRef cnt_ptr = LLVMBuildStructGEP2(g->builder, g->list_struct_type,
                 col_cond, 0, "cnt_ptr");
