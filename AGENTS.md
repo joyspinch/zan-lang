@@ -60,6 +60,20 @@ short, enforceable summary.
 9. **Never create branches.** Do NOT create local or remote branches; commit
    directly to `main` and push. Delete any stray branch you find after making
    sure its commits are merged into `main`.
+10. **Fix the compiler, don't route around it.** When Zan code fails because the
+    compiler/runtime has a bug or a missing capability, the default is to fix
+    the compiler or runtime. Do NOT rewrite the Zan code into a shape that
+    dodges the defect (hand-rolled `while` instead of a broken `foreach`,
+    `string`/`NativeMemory` instead of a broken `byte[]`, a C shim instead of
+    the Zan implementation, an extra `count` parameter because arrays lack a
+    length). Those workarounds are how the debt in A15 accumulated: each one
+    hides the root cause and spreads through the standard library.
+    Procedure: reduce it to a minimal probe in `_scratch/`, find the root cause
+    in `src/compiler/` or `src/runtime/`, fix it, add a `tests/conformance/`
+    case, and only then write the natural Zan code. If the fix is genuinely out
+    of scope for the current task, do not silently work around it: record it in
+    `TASKS.md` with the probe and the root cause, say so explicitly, and get
+    agreement before shipping any temporary shape.
 
 ## Build / dev quickstart
 
