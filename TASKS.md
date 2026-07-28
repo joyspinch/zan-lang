@@ -302,6 +302,25 @@ static extern int zan_gui_present(int hwnd, int surfaceId);
   `const_fits()`：常量折叠字面量与 `+ - * / << & | ~` 的常量表达式，能容纳就不报。
   回归用例 `tests/conformance/const_narrowing.zan`（`byte`/`sbyte`/`short`/`ushort`/
   `uint` 常量初始化、常量表达式 `1 << 7`、静态字段、`new byte[] { 0, 128, 255 }`）。
+* **A0-1b ✅ 已修（2026-07-28）** 三个协议编解码器里"用 `int` 装 64 位量"的残余，
+  由 `conformance_sqlserver_tds` / `conformance_mysql_stmt_binary` /
+  `conformance_ws_accept` 三个红灯暴露：
+  - **TDS**：`TdsReader.UIntLE/IntLE` → `long`（8 字节 bigint、MONEY、PLP 长度都超
+    i32），`TdsBuf.U64LE(long)`、`TdsMessage.DoubleBits` → `long`、`IntParam(long)`；
+    `TdsValue.Ieee` 的尾数、`Money`/`Scaled` 的单位、`TimeOfDay` 的 tick（scale 7 时
+    一天是 8.64e11）、`LimbsToDecimal` 的 `(rem << 32) | limb` 全部改 `long`，
+    日期/分钟/偏移这类真 32 位量在调用点显式 `(int)` 收窄。
+  - **MySQL**：`readBinValue` 的 LONG/LONGLONG/DOUBLE 累加与 `ieeeToText` 尾数改
+    `long`（`bits | (b << 56)` 在 i32 下移位越界，DOUBLE 一律解出 0）；
+    `readLenenc` 的 8 字节形式同理 → `long`，三个调用点显式 `(int)`。
+  - **SHA-1**（`System.Text.Encoding`）：`Rotl32` 与 h0..h4 / w[] / a..e 改 `long` 车道。
+    `int` 车道下 `m >> (32 - n)` 是算术右移，会把符号位灌进旋转结果，摘要全错。
+  〔已实测〕`ctest -R 'mysql|sqlserver|tds|ws_accept|websocket|encoding|base64|sha|http'`
+  27/27 通过；三个用例的 `ZAN_WARN_NARROW=1` 扫描 0 警告。
+  **遗留**：`System.Security.Cryptography` 的 Md5/Sha1/Sha256/Sm3 仍把 32 位车道放在
+  `int` 里（`int h1 = 4023233417;`）。结果是对的——`& 4294967295` 现在是 `long`
+  字面量，整条表达式在 64 位里算完再截回——但每个单元会带 26 处窄化警告。
+  要么显式 `(int)`，要么整体改 `long` 车道，未做。
 
 ## A1 `Span<T>` 编译器内建 〔依赖 A0〕
 
