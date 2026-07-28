@@ -1,0 +1,187 @@
+using System;
+using System.Text;
+using System.Json;
+using System.Net.Http.Client;
+
+namespace Sdk.Wechat;
+
+/// <summary>
+/// 微信公众号（MP）客户端。
+///
+/// 用法：
+/// <code>
+/// WechatClient client = new WechatClient("appId", "appSecret");
+/// string token = await client.GetAccessTokenAsync();
+/// WechatResponse r = await client.SendTextAsync("openid", "hello");
+/// </code>
+///
+/// AccessToken 在实例内缓存：未过期直接返回，过期才重新请求
+/// <c>/cgi-bin/token</c>。客服消息走 <c>/cgi-bin/message/custom/send</c>。
+///
+/// 依赖标准库：
+///  - <see cref="HttpClient"/> 发 HTTPS；
+///  - <see cref="JsonValue"/> 组请求 / 解析响应；
+///  - <see cref="Encoding.UrlEncode"/> 拼 query；
+/// 不重复封装 HTTP / 摘要 / JSON。
+///
+/// 相对 Senparc 原版的改动：
+///  - 去掉 AccessTokenContainer / DI / 中间件，一个实例管一个公众号；
+///  - 失败一律抛 <see cref="WechatException"/>，不返回带 errcode 的空结果；
+///  - Token 过期提前 5 分钟刷新（微信官方有效期 7200 秒）。
+/// </summary>
+class WechatClient {
+    static string DEFAULT_HOST = "api.weixin.qq.com";
+    static int DEFAULT_PORT = 443;
+    // 官方 access_token 7200 秒；提前 300 秒刷新，避免边界失效。
+    static int TOKEN_SKEW_SECONDS = 300;
+
+    string appId;
+    string appSecret;
+    string host;
+    int port;
+    int timeoutMs;
+
+    string accessToken;
+    long accessTokenExpireUnix;
+
+    /// <summary>用 appId / appSecret 创建客户端，默认指向正式网关。</summary>
+    public WechatClient(string appId, string appSecret) {
+        this.appId = appId;
+        this.appSecret = appSecret;
+        this.host = DEFAULT_HOST;
+        this.port = DEFAULT_PORT;
+        this.timeoutMs = 30000;
+        this.accessToken = "";
+        this.accessTokenExpireUnix = 0;
+    }
+
+    /// <summary>指向另一个网关（沙箱 / 自建代理）。</summary>
+    WechatClient Server(string host, int port) {
+        this.host = host;
+        this.port = port;
+        return this;
+    }
+
+    /// <summary>请求超时（毫秒），默认 30000。</summary>
+    WechatClient Timeout(int ms) {
+        this.timeoutMs = ms;
+        return this;
+    }
+
+    /// <summary>
+    /// 手动注入已有 access_token（例如从外部缓存读入），并设置剩余有效秒数。
+    /// expiresIn 按微信返回的 expires_in 理解；内部会扣掉 TOKEN_SKEW_SECONDS。
+    /// </summary>
+    WechatClient SetAccessToken(string token, int expiresIn) {
+        this.accessToken = token;
+        int life = expiresIn - TOKEN_SKEW_SECONDS;
+        if (life < 0) { life = 0; }
+        this.accessTokenExpireUnix = DateTime.UtcNow().ToUnixSeconds() + life;
+        return this;
+    }
+
+    /// <summary>
+    /// 获取可用的 access_token。缓存未过期则直接返回；否则请求
+    /// <c>GET /cgi-bin/token?grant_type=client_credential&amp;appid=...&amp;secret=...</c>。
+    /// </summary>
+    async string GetAccessTokenAsync() {
+        if (this.appId.Length == 0 || this.appSecret.Length == 0) {
+            throw new WechatException("client.paramError", "appId / appSecret 不能为空", "");
+        }
+        long now = DateTime.UtcNow().ToUnixSeconds();
+        if (this.accessToken.Length > 0 && now < this.accessTokenExpireUnix) {
+            return this.accessToken;
+        }
+
+        string path = "/cgi-bin/token?grant_type=client_credential"
+            + "&appid=" + Encoding.UrlEncode(this.appId)
+            + "&secret=" + Encoding.UrlEncode(this.appSecret);
+
+        string raw = "";
+        try {
+            HttpClient http = this.NewHttp();
+            raw = await http.GetAsync(path);
+        } catch (Exception e) {
+            throw new WechatException("client.networkError", e.Message, "");
+        }
+
+        WechatResponse resp = WechatResponse.Parse(raw);
+        string token = resp.Str("access_token", "");
+        int expiresIn = resp.Int("expires_in", 0);
+        if (token.Length == 0) {
+            throw new WechatException("client.badResponse", "响应缺少 access_token", raw);
+        }
+        this.SetAccessToken(token, expiresIn);
+        return this.accessToken;
+    }
+
+    /// <summary>
+    /// 发送客服文本消息：
+    /// <c>POST /cgi-bin/message/custom/send?access_token=...</c>，
+    /// body 为 <c>{"touser":"...","msgtype":"text","text":{"content":"..."}}</c>。
+    /// </summary>
+    async WechatResponse SendTextAsync(string openId, string content) {
+        if (openId.Length == 0) {
+            throw new WechatException("client.paramError", "openId 不能为空", "");
+        }
+        string token = await this.GetAccessTokenAsync();
+
+        JsonValue text = JsonValue.NewObject();
+        text.Put("content", JsonValue.NewStr(content));
+        JsonValue body = JsonValue.NewObject();
+        body.Put("touser", JsonValue.NewStr(openId));
+        body.Put("msgtype", JsonValue.NewStr("text"));
+        body.Put("text", text);
+        string json = body.ToJson();
+
+        string path = "/cgi-bin/message/custom/send?access_token="
+            + Encoding.UrlEncode(token);
+
+        string raw = "";
+        try {
+            HttpClient http = this.NewHttp();
+            http.SetHeader("Content-Type", "application/json");
+            raw = await http.PostAsync(path, json);
+        } catch (Exception e) {
+            throw new WechatException("client.networkError", e.Message, "");
+        }
+        return WechatResponse.Parse(raw);
+    }
+
+    /// <summary>
+    /// 通用 GET：path 已含 query（可含或不含 access_token）。
+    /// 需要 token 时先调 <see cref="GetAccessTokenAsync"/> 自行拼进 path。
+    /// </summary>
+    async WechatResponse GetAsync(string path) {
+        string raw = "";
+        try {
+            HttpClient http = this.NewHttp();
+            raw = await http.GetAsync(path);
+        } catch (Exception e) {
+            throw new WechatException("client.networkError", e.Message, "");
+        }
+        return WechatResponse.Parse(raw);
+    }
+
+    /// <summary>
+    /// 通用 JSON POST。自动带 <c>Content-Type: application/json</c>。
+    /// </summary>
+    async WechatResponse PostJsonAsync(string path, string jsonBody) {
+        string raw = "";
+        try {
+            HttpClient http = this.NewHttp();
+            http.SetHeader("Content-Type", "application/json");
+            raw = await http.PostAsync(path, jsonBody);
+        } catch (Exception e) {
+            throw new WechatException("client.networkError", e.Message, "");
+        }
+        return WechatResponse.Parse(raw);
+    }
+
+    HttpClient NewHttp() {
+        HttpClient http = HttpClient.Create(this.host, this.port);
+        http.UseTls();
+        http.SetTimeout(this.timeoutMs);
+        return http;
+    }
+}

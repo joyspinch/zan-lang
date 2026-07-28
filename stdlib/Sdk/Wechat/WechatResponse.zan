@@ -1,0 +1,95 @@
+using System;
+using System.Json;
+
+namespace Sdk.Wechat;
+
+/// <summary>
+/// 一次成功调用的返回结果。
+///
+/// 微信多数接口返回扁平 JSON（token 接口是 access_token/expires_in；
+/// 业务接口是 errcode/errmsg + 业务字段）。本类不预置业务模型——
+/// 成功时 <c>Data</c> 是完整 JSON 文本，用 <c>Json.Deserialize&lt;T&gt;</c> 绑定即可。
+///
+/// 失败不会走到这里：errcode 非 0 时直接抛 <see cref="WechatException"/>。
+/// </summary>
+class WechatResponse {
+    /// <summary>完整响应 JSON 文本，可直接喂 Json.Deserialize。</summary>
+    public string Data;
+
+    /// <summary>网关返回的完整原始报文（与 Data 相同，保留字段名以对齐 JdResponse）。</summary>
+    public string Raw;
+
+    /// <summary>已解析的响应树，需要动态取值时用。</summary>
+    public JsonValue Value;
+
+    // Inspect 判定出的失败原因；Parse 读走后抛成 WechatException。
+    // 用 static 承载而不是实例字段，是为了让 throw 发生时本帧没有活跃对象
+    // （见 docs/bugs/throw-leaks-live-locals.md）。
+    static string lastErrCode = "";
+    static string lastErrMsg = "";
+
+    WechatResponse(string data, string raw, JsonValue v) {
+        this.Data = data;
+        this.Raw = raw;
+        this.Value = v;
+    }
+
+    /// <summary>
+    /// 解析微信响应。errcode 缺失或为 0 视为成功；其它一律抛 WechatException。
+    ///
+    /// 实现上分两步：Inspect 先判定并释放 Json 树，失败原因走 static，
+    /// 返回后再 throw，避免 throw 泄漏活着的对象。
+    /// </summary>
+    static WechatResponse Parse(string body) {
+        WechatResponse.lastErrCode = "";
+        WechatResponse.lastErrMsg = "";
+        WechatResponse ok = WechatResponse.Inspect(body);
+        if (ok != null) { return ok; }
+        throw new WechatException(WechatResponse.lastErrCode, WechatResponse.lastErrMsg, body);
+    }
+
+    static WechatResponse Inspect(string body) {
+        JsonValue root = null;
+        string parseErr = "";
+        try {
+            root = JsonValue.Parse(body);
+        } catch (Exception e) {
+            parseErr = e.Message;
+        }
+        if (parseErr.Length > 0) {
+            return WechatResponse.Failure("client.badResponse", parseErr);
+        }
+        if (root == null || !root.IsObject()) {
+            return WechatResponse.Failure("client.badResponse", "响应不是合法的 JSON 对象");
+        }
+
+        // 微信约定：成功时 errcode 为 0 或字段缺失；非 0 是错误。
+        if (root.Has("errcode")) {
+            int code = root.Int("errcode", 0);
+            if (code != 0) {
+                string msg = root.Str("errmsg", "微信返回错误");
+                return WechatResponse.Failure(Convert.ToString(code), msg);
+            }
+        }
+
+        return new WechatResponse(root.ToJson(), body, root);
+    }
+
+    static WechatResponse Failure(string code, string msg) {
+        WechatResponse.lastErrCode = code;
+        WechatResponse.lastErrMsg = msg;
+        return null;
+    }
+
+    /// <summary>从已解析结果中读字符串字段。</summary>
+    string Str(string key, string dflt) {
+        if (this.Value == null) { return dflt; }
+        return this.Value.Str(key, dflt);
+    }
+
+    /// <summary>从已解析结果中读整型字段。</summary>
+    int Int(string key, int dflt) {
+        if (this.Value == null) { return dflt; }
+        return this.Value.Int(key, dflt);
+    }
+}
