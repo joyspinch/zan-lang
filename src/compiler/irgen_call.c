@@ -119,9 +119,53 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                     LLVMBuildStructGEP2(g->builder, hdr, sub_i8, ASYNC_FRAME_AWAITER_STEP, "spawn.aws"));
                 LLVMValueRef sched_args[] = { sub_i8, sub_resume };
                 zan_call2(g->builder, g->rt_co_ready_type, g->rt_co_ready, sched_args, 2, "");
+                /* the handle Spawn hands back outlives the coroutine, so the
+                 * driver has to be able to tell a live frame from a reaped one
+                 * before Task.Cancel writes through it */
+                LLVMValueRef track = get_co_track_fn(g);
+                zan_call2(g->builder, LLVMGlobalGetValueType(track), track,
+                          &sub_i8, 1, "");
+                emit_release_owned_call_temp(g, sub_arg, sub, locals);
+                /* Task.Spawn yields the task handle, so the program can later
+                 * cancel the detached coroutine (Task.Cancel). Discarding it
+                 * stays fire-and-forget. */
+                return LLVMBuildPtrToInt(g->builder, sub_i8, sp_i64, "spawn.h");
             }
             emit_release_owned_call_temp(g, sub_arg, sub, locals);
             return LLVMConstInt(sp_i64, 0, 0);
+        }
+
+        /* Task.Cancel(handle) — request cooperative cancellation of a spawned
+         * coroutine and of whatever it is transitively awaiting. The target
+         * observes it at its next statement boundary after an await and
+         * completes early; see get_co_cancel_fn. */
+        if (is_call_to(expr, "Task", "Cancel") && expr->call.args.count == 1) {
+            LLVMTypeRef ci8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+            LLVMTypeRef ci64 = LLVMInt64TypeInContext(g->ctx);
+            LLVMValueRef h = emit_expr(g, expr->call.args.items[0], locals);
+            if (LLVMGetTypeKind(LLVMTypeOf(h)) == LLVMIntegerTypeKind) {
+                if (LLVMGetIntTypeWidth(LLVMTypeOf(h)) < 64)
+                    h = zan_iwiden(g->builder, h, ci64);
+                h = LLVMBuildIntToPtr(g->builder, h, ci8ptr, "cancel.h");
+            } else {
+                h = LLVMBuildBitCast(g->builder, h, ci8ptr, "cancel.h");
+            }
+            LLVMValueRef cf = get_co_cancel_fn(g);
+            zan_call2(g->builder, LLVMGlobalGetValueType(cf), cf, &h, 1, "");
+            return LLVMConstInt(ci64, 0, 0);
+        }
+
+        /* Task.IsCancellationRequested() — inside an async body, whether this
+         * coroutine has been cancelled, so a long-running body can bail out at
+         * a point of its own choosing. Always 0 outside one. */
+        if (is_call_to(expr, "Task", "IsCancellationRequested") &&
+            expr->call.args.count == 0) {
+            LLVMTypeRef ci32 = LLVMInt32TypeInContext(g->ctx);
+            if (!g->current_async_frame) return LLVMConstInt(ci32, 0, 0);
+            return LLVMBuildLoad2(g->builder, ci32,
+                LLVMBuildStructGEP2(g->builder, g->current_async_frame_type,
+                    g->current_async_frame, ASYNC_FRAME_CANCEL, "fr.cancel.p"),
+                "cancel.req");
         }
 
         /* StringBuilder.Append(s) / StringBuilder.ToString() — growable byte

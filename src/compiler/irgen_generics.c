@@ -1182,6 +1182,10 @@ static LLVMValueRef get_co_reap_fn(zan_irgen_t *g) {
     LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, reap, "entry");
     LLVMPositionBuilderAtEnd(g->builder, entry);
     LLVMValueRef arg = LLVMGetParam(reap, 0);
+    /* drop the frame from the live-handle registry first: a Task.Spawn handle
+     * the program kept must stop naming this frame before it is freed */
+    LLVMValueRef untrack = get_co_untrack_fn(g);
+    zan_call2(g->builder, LLVMGlobalGetValueType(untrack), untrack, &arg, 1, "");
     zan_call2(g->builder, LLVMGlobalGetValueType(g->fn_free), g->fn_free, &arg, 1, "");
     LLVMBuildRetVoid(g->builder);
     if (saved) LLVMPositionBuilderAtEnd(g->builder, saved);

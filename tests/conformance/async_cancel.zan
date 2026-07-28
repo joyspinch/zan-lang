@@ -1,0 +1,95 @@
+// Conformance: cooperative async cancellation.
+//
+// Task.Spawn hands back a task handle; Task.Cancel(handle) marks that
+// coroutine -- and, down the await chain, whatever it is suspended on --
+// cancelled. A cancelled coroutine skips the rest of its body at its next
+// statement boundary after an await (and never starts at all if it has not run
+// yet), completing normally so its awaiter is woken and its frame is freed.
+using System;
+
+class Res {
+    int v;
+}
+
+class Program {
+    static int hit;
+    static int marks;
+    static long outerH;
+    static long probeH;
+    static long holdH;
+
+    // cancelled before the scheduler ever steps it: the body must not run
+    static async int Never() {
+        Program.hit = 1;
+        await Task.Delay(1);
+        Program.hit = 2;
+        return 0;
+    }
+
+    // cancellation of the parent has to reach the child it is awaiting
+    static async int Worker() {
+        await Task.Delay(1);
+        Task.Cancel(Program.outerH);
+        await Task.Delay(1);
+        Program.marks = Program.marks + 1;
+        return 7;
+    }
+
+    static async int Outer() {
+        int v = await Program.Worker();
+        Program.marks = Program.marks + 10;
+        return v;
+    }
+
+    // the flag is observable, so a body can bail out where it chooses
+    static async int Probe() {
+        await Task.Delay(1);
+        int before = Task.IsCancellationRequested();
+        Console.WriteLine("before=" + Convert.ToString(before));
+        Task.Cancel(Program.probeH);
+        int after = Task.IsCancellationRequested();
+        Console.WriteLine("after=" + Convert.ToString(after));
+        await Task.Delay(1);
+        Console.WriteLine("unreachable");
+        return 0;
+    }
+
+    // an owning local held across the await is released by the early
+    // completion, exactly as an early `return` would release it
+    static async int Holder() {
+        Res r = new Res();
+        r.v = 5;
+        await Task.Delay(1);
+        Task.Cancel(Program.holdH);
+        await Task.Delay(1);
+        Program.marks = Program.marks + 1000;
+        return r.v;
+    }
+
+    static async int Run() {
+        long h1 = Task.Spawn(Program.Never());
+        Task.Cancel(h1);
+        await Task.Delay(30);
+        Console.WriteLine("never_hit=" + Convert.ToString(Program.hit));
+
+        Program.outerH = Task.Spawn(Program.Outer());
+        await Task.Delay(40);
+        Console.WriteLine("marks=" + Convert.ToString(Program.marks));
+
+        Program.probeH = Task.Spawn(Program.Probe());
+        await Task.Delay(40);
+
+        Program.holdH = Task.Spawn(Program.Holder());
+        await Task.Delay(40);
+        Console.WriteLine("marks2=" + Convert.ToString(Program.marks));
+
+        // cancelling a handle whose coroutine has already been reaped is a no-op
+        Task.Cancel(h1);
+        return 0;
+    }
+
+    static async void Main() {
+        await Program.Run();
+        Console.WriteLine("done");
+    }
+}

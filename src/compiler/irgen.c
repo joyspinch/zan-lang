@@ -321,9 +321,42 @@ static void di_declare_var(zan_irgen_t *g, zan_istr_t name, LLVMValueRef storage
 static zan_irgen_t *g_di_emit_ctx = NULL;
 
 #include "../common/host_oom.h"
-/* Maximum number of distinct `new` allocation sites tracked for per-site
- * leak reporting. Sites beyond this share the last bucket. */
+/* Maximum number of distinct ARC destructor shapes tracked by the runtime.
+ * Allocation sites with the same concrete class/generic/collection shape share
+ * one slot; aliasing different shapes would dispatch the wrong destructor. */
 #define ZAN_MAX_LEAK_SITES 4096
+
+static bool types_equal(zan_type_t *a, zan_type_t *b);
+
+static int reserve_arc_site(zan_irgen_t *g, zan_symbol_t *sym,
+                            zan_type_t *inst, int coll_kind,
+                            zan_type_t *coll_elem) {
+    for (int i = 0; i < g->leak_site_count; i++) {
+        int existing_kind = g->site_coll ? g->site_coll[i] : 0;
+        if (existing_kind != coll_kind) continue;
+        if (coll_kind != 0) {
+            zan_type_t *existing_elem = g->site_coll_elem
+                ? g->site_coll_elem[i] : NULL;
+            if (types_equal(existing_elem, coll_elem)) return i;
+        } else {
+            zan_symbol_t *existing_sym = g->site_syms ? g->site_syms[i] : NULL;
+            zan_type_t *existing_inst = g->site_inst ? g->site_inst[i] : NULL;
+            if (existing_sym == sym && types_equal(existing_inst, inst)) return i;
+        }
+    }
+    if (g->leak_site_count >= ZAN_MAX_LEAK_SITES) {
+        fprintf(stderr,
+            "zanc: too many distinct ARC destructor shapes (maximum %d)\n",
+            ZAN_MAX_LEAK_SITES);
+        exit(1);
+    }
+    int site_idx = g->leak_site_count++;
+    if (g->site_syms) g->site_syms[site_idx] = sym;
+    if (g->site_inst) g->site_inst[site_idx] = inst;
+    if (g->site_coll) g->site_coll[site_idx] = coll_kind;
+    if (g->site_coll_elem) g->site_coll_elem[site_idx] = coll_elem;
+    return site_idx;
+}
 
 /* String RC header magic and sentinel refcount.
  * The second header word doubles as a guard for tolerant retain/release. */
@@ -1270,13 +1303,16 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         i8ptr, g->co_step_ptr, i64,
         g->co_step_ptr, LLVMInt32TypeInContext(g->ctx),
         g->co_step_ptr, /* SELF_STEP: frame's own resume fn */
-        i8ptr, i8ptr, LLVMInt32TypeInContext(g->ctx) /* pending exception */
+        i8ptr, i8ptr, LLVMInt32TypeInContext(g->ctx), /* pending exception */
+        LLVMInt32TypeInContext(g->ctx), /* CANCEL: cancellation requested */
+        i8ptr, /* CHILD: sub-frame currently awaited */
+        i8ptr  /* LNEXT: live detached-frame list link */
     };
     /* Stops before ASYNC_FRAME_HSTACK: the per-handler arrays are sized per
      * function (one slot per try in that body), so they are not part of the
      * shared prefix. Only the fields above are reached through this type. */
     g->co_header_type = LLVMStructCreateNamed(g->ctx, "zan.co.header");
-    LLVMStructSetBody(g->co_header_type, co_hdr_fields, 11, 0);
+    LLVMStructSetBody(g->co_header_type, co_hdr_fields, 14, 0);
     g->current_async_frame = NULL;
     g->current_async_frame_type = NULL;
     g->current_async_resume_fn = NULL;
@@ -2332,11 +2368,7 @@ static LLVMValueRef emit_alloc_rc_collection(zan_irgen_t *g, zan_ast_node_t *exp
      * retain their stores emit. */
     if (g->cur_inst) elem_type = subst_type_param_deep(g, elem_type, g->cur_inst);
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
-    int site_idx = g->leak_site_count;
-    if (site_idx >= ZAN_MAX_LEAK_SITES) site_idx = ZAN_MAX_LEAK_SITES - 1;
-    else g->leak_site_count++;
-    if (g->site_coll) g->site_coll[site_idx] = coll_kind;
-    if (g->site_coll_elem) g->site_coll_elem[site_idx] = elem_type;
+    int site_idx = reserve_arc_site(g, NULL, NULL, coll_kind, elem_type);
     LLVMValueRef site_name = LLVMConstNull(i8ptr);
     if (g->check_leaks) {
         char site_buf[600];

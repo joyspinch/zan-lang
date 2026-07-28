@@ -548,8 +548,8 @@ operand type of return inst!
   2. await 站点本身也不还原类型：帧的 result 槽是裸 `i64`，`await` 直接返回这份 i64。
      修法：新增 `coerce_await_result()`，按被 await 调用的声明返回类型把 i64 还原为
      指针 / double（`irgen_expr.c`，三个返回点统一）。
-  这只是把类型在 await 站点补回来，**帧 result 槽仍是硬编码 `i64`**——typed frame result
-  仍是 A0 落地时必须做的事（见 A8-7）。
+  这只是把类型在 await 站点补回来，帧 result 槽当时仍是硬编码 `i64`；
+  typed frame result 已在 **A27-1** 做完（存取两端都按声明类型编解码）。
   证据：`tests/conformance/async_var_locals_across_await.zan`
   （`var` 的 string/int/double/bool、跨两次 await）全部正确。
 
@@ -682,9 +682,9 @@ operand type of return inst!
 > 探针脚本 `a1`–`a17` 全部通过（2026-07-27 重跑）。已固化为三个 conformance 用例：
 > `async_await_in_catch` / `async_await_in_foreach` / `async_var_locals_across_await`，
 > 三类测试（conformance / determinism / leakcheck）各一份，**538/538 全绿**。
-> 仍未做完、不要因为这些用例通过就认为已完成的：typed frame result（仍是 `i64`）、
-> 取消（cancellation）路径、await 与 ARC 在异常退出时的所有权、`anf_stmt_contains_await`
-> 的 try/switch 补漏（A8-6）。
+> 仍未做完、不要因为这些用例通过就认为已完成的：await 与 ARC 在异常退出时的所有权、
+> `anf_stmt_contains_await` 的 try/switch 补漏（A8-6）。
+> （typed frame result 与取消路径已分别在 A27-1 / A27-2 完成。）
 
 **由此得出的判断**：async lowering **不是整体不成熟**——try/finally/switch/循环/跨协程
 异常传播这些主干形态都是通的，说明状态机变换的骨架是对的。坏的是两个具体形态：
@@ -708,7 +708,9 @@ catch 块内的挂起、foreach 的降级与状态切分冲突。所以是**定�
 **try/catch 从头到尾没有出现**——即 await 与异常处理的交互从设计阶段就不在覆盖范围内。
 实现后来补了协程 EH（trampoline + 帧内 hstack 重新 arm），但设计文档没同步。
 另外 frame 布局写死 `i64 result` / "all scalars are i64 in this backend"，
-**与 A0（int=32）直接冲突**，A0 落地时必须一并改。
+**与 A0（int=32）直接冲突**。**已修（A27）**：`ASYNC_CPS_DESIGN.md` 增补了
+"Result slot"（按声明类型编解码）与 "Cancellation" 两节，帧布局说明也补了 header
+后半段（cancel / child / lnext）。EH 与 await 交互的落差仍未在文档里补齐。
 
 ---
 
@@ -1450,6 +1452,45 @@ load → add → store 三件套（`src/compiler/irgen.c` 里 `zan_rt_alloc` /
    function`（如 `WechatWorkChatApi_CreateChatAsync`）。`stdlib/Sdk/Wechat/*` 和
    `scripts/generate_wechat_*_apis.py` 正在被另一个会话改动（工作树里是未提交状态），
    生成出来的调用点和声明的参数个数不一致。等那边收尾，不在本轮范围内。
+
+---
+
+## A27 — async 帧 result 类型化 + 取消路径（2026-07-28，已做完）
+
+* **A27-1 ✅ typed frame result**（原 A8-7 遗留，A0 前置）。帧 result 槽物理上仍是 64 位
+  （它在共享 header 的固定偏移上，宽度不能按函数变），但不再当成 `i64` **值**用：
+  完成侧按被调用方**声明返回类型**编码，await 侧按同一类型解码——有符号/bool 符号扩展、
+  无符号零扩展、指针 `ptrtoint`/`inttoptr`、`double` `bitcast`、`float` 先 `bitcast` 到
+  i32 再零扩展。return 表达式先转成声明类型再入槽，所以 `async double F() { return 3; }`
+  存的是 double 而不是整数位型。原来的一律符号扩展会吃掉无符号值的最高位、按错误宽度读
+  `float`，并且在 `int` 变成 32 位后会静默截断。
+  证据：`tests/conformance/async_result_types.zan`（负 int / 大 long / `uint` 最大值 /
+  byte / short / bool / double / `double` 返回整数字面量 / string / 对象 / `var` 推断）。
+
+* **A27-2 ✅ 取消路径**（原 A8 结尾记的空缺）。协作式，全部在生成代码里（驱动本身就是
+  编译器生成的，运行时没有可以持有这些状态的地方）：
+  - 帧头新增 `cancel`(i32) / `child`(i8*) / `lnext`(i8*)；`child` 在 await 站点写入、
+    在每次 resume 开头清掉。
+  - `__zan_co_cancel(handle)` 置位后沿 `child` 链向下传播——取消一个协程也会取消它正在
+    等的那个。
+  - `Task.Spawn` 的句柄比协程活得久，所以 detached 帧挂进内部 `__zan_co_live` 链
+    （`lnext`），`Task.Cancel` 先在链上查；已被 `__zan_co_reap` 回收的句柄是安全 no-op
+    （reap 先摘链再 free）。活帧下面的 `child` 链天然还活着：挂起的 awaiter 持有子帧。
+  - 被取消的协程不是被异步杀死：body 在**进入时**（还没被 step 过就被取消 ⇒ 整个 body
+    不执行）和**每个含 await 的语句边界之后**检查标志，命中就跳到正常完成路径——持有型
+    局部照常释放、awaiter 照常唤醒、帧只释放一次。`finally`/`catch` 清理区内不插检查，
+    取消不会绕过清理。代价：挂在 timer / socket 上的协程要等那次等待结束才看得见取消。
+  - 语言面：`Task.Spawn(asyncCall)` 返回句柄（丢弃即原来的 fire-and-forget）、
+    `Task.Cancel(handle)`、`Task.IsCancellationRequested()`（协程外返回 0）。
+    **不引入** `OperationCanceledException`——被取消的协程是"完成"，不是"抛出"。
+  证据：`tests/conformance/async_cancel.zan`（step 前取消 / 经 await 链传播到子协程 /
+  标志可观测 / 跨 await 的持有型局部在取消时被释放 / 对已回收句柄重复取消）。
+  对照组（同一程序去掉 `Task.Cancel` 调用）输出 `never_hit=2 marks=11 unreachable`，
+  说明用例不是空过。
+
+* **未做**：挂在 timer/IO 上的即时取消（需要 timer/reactor 侧可撤销的注册）、
+  取消时的非 void 返回值语义（目前返回槽保持零值/默认）、`CancellationToken` 那套
+  结构化传播。
 
 ---
 

@@ -210,6 +210,241 @@ static void emit_async_complete(zan_irgen_t *g, local_scope_t *locals, LLVMValue
     LLVMBuildRetVoid(g->builder);
 }
 
+/* Head of the module's list of live detached (Task.Spawn) frames, linked
+ * through ASYNC_FRAME_LNEXT. Created on first use. */
+static LLVMValueRef get_co_live_head(zan_irgen_t *g) {
+    LLVMValueRef gv = LLVMGetNamedGlobal(g->mod, "__zan_co_live");
+    if (gv) return gv;
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    gv = LLVMAddGlobal(g->mod, i8ptr, "__zan_co_live");
+    LLVMSetInitializer(gv, LLVMConstNull(i8ptr));
+    LLVMSetLinkage(gv, LLVMInternalLinkage);
+    return gv;
+}
+
+/* Open an internal `void f(i8*)` helper: creates it, positions the builder in a
+ * fresh entry block and returns it through *fn. Returns false if it existed. */
+static bool open_co_helper(zan_irgen_t *g, const char *name, LLVMValueRef *fn,
+                           LLVMBasicBlockRef *saved, LLVMValueRef *saved_fn) {
+    LLVMValueRef existing = LLVMGetNamedFunction(g->mod, name);
+    if (existing) { *fn = existing; return false; }
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    *fn = LLVMAddFunction(g->mod, name,
+        LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), &i8ptr, 1, 0));
+    LLVMSetLinkage(*fn, LLVMInternalLinkage);
+    *saved = LLVMGetInsertBlock(g->builder);
+    *saved_fn = g->current_fn;
+    g->current_fn = *fn;
+    LLVMPositionBuilderAtEnd(g->builder,
+        LLVMAppendBasicBlockInContext(g->ctx, *fn, "entry"));
+    di_clear(g);
+    return true;
+}
+
+static void close_co_helper(zan_irgen_t *g, LLVMBasicBlockRef saved,
+                            LLVMValueRef saved_fn) {
+    g->current_fn = saved_fn;
+    if (saved) LLVMPositionBuilderAtEnd(g->builder, saved);
+}
+
+/* __zan_co_track(f): push a detached frame onto the live list. */
+static LLVMValueRef get_co_track_fn(zan_irgen_t *g) {
+    LLVMValueRef fn; LLVMBasicBlockRef saved; LLVMValueRef saved_fn;
+    if (!open_co_helper(g, "__zan_co_track", &fn, &saved, &saved_fn)) return fn;
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMValueRef head = get_co_live_head(g);
+    LLVMValueRef f = LLVMGetParam(fn, 0);
+    LLVMValueRef old = LLVMBuildLoad2(g->builder, i8ptr, head, "live.head");
+    LLVMBuildStore(g->builder, old,
+        LLVMBuildStructGEP2(g->builder, g->co_header_type, f,
+                            ASYNC_FRAME_LNEXT, "tr.next"));
+    LLVMBuildStore(g->builder, f, head);
+    LLVMBuildRetVoid(g->builder);
+    close_co_helper(g, saved, saved_fn);
+    return fn;
+}
+
+/* __zan_co_untrack(f): unlink a frame from the live list (before it is freed). */
+static LLVMValueRef get_co_untrack_fn(zan_irgen_t *g) {
+    LLVMValueRef fn; LLVMBasicBlockRef saved; LLVMValueRef saved_fn;
+    if (!open_co_helper(g, "__zan_co_untrack", &fn, &saved, &saved_fn)) return fn;
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMTypeRef hdr = g->co_header_type;
+    LLVMValueRef head = get_co_live_head(g);
+    LLVMValueRef f = LLVMGetParam(fn, 0);
+    LLVMValueRef prev = LLVMBuildAlloca(g->builder, i8ptr, "ut.prev");
+    LLVMValueRef cur = LLVMBuildAlloca(g->builder, i8ptr, "ut.cur");
+    LLVMBuildStore(g->builder, LLVMConstNull(i8ptr), prev);
+    LLVMBuildStore(g->builder, LLVMBuildLoad2(g->builder, i8ptr, head, "h"), cur);
+    LLVMBasicBlockRef loop = LLVMAppendBasicBlockInContext(g->ctx, fn, "ut.loop");
+    LLVMBasicBlockRef test = LLVMAppendBasicBlockInContext(g->ctx, fn, "ut.test");
+    LLVMBasicBlockRef hit = LLVMAppendBasicBlockInContext(g->ctx, fn, "ut.hit");
+    LLVMBasicBlockRef first = LLVMAppendBasicBlockInContext(g->ctx, fn, "ut.first");
+    LLVMBasicBlockRef mid = LLVMAppendBasicBlockInContext(g->ctx, fn, "ut.mid");
+    LLVMBasicBlockRef step = LLVMAppendBasicBlockInContext(g->ctx, fn, "ut.step");
+    LLVMBasicBlockRef out = LLVMAppendBasicBlockInContext(g->ctx, fn, "ut.out");
+    LLVMBuildBr(g->builder, loop);
+
+    LLVMPositionBuilderAtEnd(g->builder, loop);
+    LLVMValueRef c = LLVMBuildLoad2(g->builder, i8ptr, cur, "ut.c");
+    LLVMBuildCondBr(g->builder,
+        zan_icmp(g->builder, LLVMIntNE, c, LLVMConstNull(i8ptr), "ut.nn"), test, out);
+
+    LLVMPositionBuilderAtEnd(g->builder, test);
+    LLVMValueRef c2 = LLVMBuildLoad2(g->builder, i8ptr, cur, "ut.c2");
+    LLVMBuildCondBr(g->builder,
+        zan_icmp(g->builder, LLVMIntEQ, c2, f, "ut.eq"), hit, step);
+
+    LLVMPositionBuilderAtEnd(g->builder, hit);
+    LLVMValueRef next = LLVMBuildLoad2(g->builder, i8ptr,
+        LLVMBuildStructGEP2(g->builder, hdr, f, ASYNC_FRAME_LNEXT, "ut.np"), "ut.n");
+    LLVMValueRef p = LLVMBuildLoad2(g->builder, i8ptr, prev, "ut.p");
+    LLVMBuildCondBr(g->builder,
+        zan_icmp(g->builder, LLVMIntEQ, p, LLVMConstNull(i8ptr), "ut.isfirst"),
+        first, mid);
+
+    LLVMPositionBuilderAtEnd(g->builder, first);
+    LLVMBuildStore(g->builder, next, head);
+    LLVMBuildBr(g->builder, out);
+
+    LLVMPositionBuilderAtEnd(g->builder, mid);
+    LLVMValueRef p2 = LLVMBuildLoad2(g->builder, i8ptr, prev, "ut.p2");
+    LLVMBuildStore(g->builder, next,
+        LLVMBuildStructGEP2(g->builder, hdr, p2, ASYNC_FRAME_LNEXT, "ut.pn"));
+    LLVMBuildBr(g->builder, out);
+
+    LLVMPositionBuilderAtEnd(g->builder, step);
+    LLVMValueRef c3 = LLVMBuildLoad2(g->builder, i8ptr, cur, "ut.c3");
+    LLVMBuildStore(g->builder, c3, prev);
+    LLVMBuildStore(g->builder, LLVMBuildLoad2(g->builder, i8ptr,
+        LLVMBuildStructGEP2(g->builder, hdr, c3, ASYNC_FRAME_LNEXT, "ut.cn"),
+        "ut.cnv"), cur);
+    LLVMBuildBr(g->builder, loop);
+
+    LLVMPositionBuilderAtEnd(g->builder, out);
+    LLVMBuildRetVoid(g->builder);
+    close_co_helper(g, saved, saved_fn);
+    return fn;
+}
+
+/* Return the module's `__zan_co_cancel(i8*)`, creating it once.
+ *
+ * Cancellation is cooperative and never touches the scheduler: it only sets the
+ * CANCEL flag on the target frame and, following the CHILD links, on the
+ * coroutines it is transitively suspended on. Each of those frames observes the
+ * flag at its next state block and completes early (see
+ * emit_async_cancel_check), so every frame still finishes through the normal
+ * completion protocol -- its awaiter is woken, its sub-frame is consumed and
+ * freed, and nothing is resumed twice. The cost is that a coroutine parked on a
+ * timer or socket wait is only cancelled once that wait completes.
+ *
+ * The handle comes from Task.Spawn and may name a frame the reaper has already
+ * freed, so the root handle is looked up in the live detached-frame list
+ * first; the CHILD chain below it is alive by construction (a suspended
+ * awaiter owns its sub-frame until it resumes). */
+static LLVMValueRef get_co_cancel_fn(zan_irgen_t *g) {
+    LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "__zan_co_cancel");
+    if (fn) return fn;
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
+    LLVMTypeRef hdr = g->co_header_type;
+    fn = LLVMAddFunction(g->mod, "__zan_co_cancel",
+        LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), &i8ptr, 1, 0));
+    LLVMSetLinkage(fn, LLVMInternalLinkage);
+
+    LLVMBasicBlockRef saved = LLVMGetInsertBlock(g->builder);
+    LLVMValueRef saved_fn = g->current_fn;
+    g->current_fn = fn;
+    LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, fn, "entry");
+    LLVMBasicBlockRef scan_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "cc.scan");
+    LLVMBasicBlockRef scmp_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "cc.scmp");
+    LLVMBasicBlockRef snext_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "cc.snext");
+    LLVMBasicBlockRef head_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "cc.head");
+    LLVMBasicBlockRef mark_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "cc.mark");
+    LLVMBasicBlockRef ret_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "cc.ret");
+    LLVMPositionBuilderAtEnd(g->builder, entry);
+    di_clear(g);
+    LLVMValueRef arg = LLVMGetParam(fn, 0);
+    LLVMValueRef cur = LLVMBuildAlloca(g->builder, i8ptr, "cc.cur");
+    LLVMValueRef scan = LLVMBuildAlloca(g->builder, i8ptr, "cc.scan.p");
+    LLVMBuildStore(g->builder, arg, cur);
+    LLVMBuildStore(g->builder, LLVMBuildLoad2(g->builder, i8ptr,
+        get_co_live_head(g), "cc.live"), scan);
+    LLVMBuildBr(g->builder, scan_bb);
+
+    /* is `arg` still a live detached frame? */
+    LLVMPositionBuilderAtEnd(g->builder, scan_bb);
+    LLVMValueRef s = LLVMBuildLoad2(g->builder, i8ptr, scan, "cc.s");
+    LLVMBuildCondBr(g->builder,
+        zan_icmp(g->builder, LLVMIntNE, s, LLVMConstNull(i8ptr), "cc.snn"),
+        scmp_bb, ret_bb);
+
+    LLVMPositionBuilderAtEnd(g->builder, scmp_bb);
+    LLVMValueRef s2 = LLVMBuildLoad2(g->builder, i8ptr, scan, "cc.s2");
+    LLVMBuildCondBr(g->builder,
+        zan_icmp(g->builder, LLVMIntEQ, s2, arg, "cc.seq"), head_bb, snext_bb);
+
+    LLVMPositionBuilderAtEnd(g->builder, snext_bb);
+    LLVMValueRef s3 = LLVMBuildLoad2(g->builder, i8ptr, scan, "cc.s3");
+    LLVMBuildStore(g->builder, LLVMBuildLoad2(g->builder, i8ptr,
+        LLVMBuildStructGEP2(g->builder, hdr, s3, ASYNC_FRAME_LNEXT, "cc.sn"),
+        "cc.snv"), scan);
+    LLVMBuildBr(g->builder, scan_bb);
+
+    /* while (cur != null) { cur->cancel = 1; cur = cur->child; } */
+    LLVMPositionBuilderAtEnd(g->builder, head_bb);
+    LLVMValueRef f = LLVMBuildLoad2(g->builder, i8ptr, cur, "cc.f");
+    LLVMValueRef nn = zan_icmp(g->builder, LLVMIntNE, f, LLVMConstNull(i8ptr), "cc.nn");
+    LLVMBuildCondBr(g->builder, nn, mark_bb, ret_bb);
+
+    LLVMPositionBuilderAtEnd(g->builder, mark_bb);
+    LLVMBuildStore(g->builder, LLVMConstInt(i32, 1, 0),
+        LLVMBuildStructGEP2(g->builder, hdr, f, ASYNC_FRAME_CANCEL, "cc.flag"));
+    LLVMValueRef child = LLVMBuildLoad2(g->builder, i8ptr,
+        LLVMBuildStructGEP2(g->builder, hdr, f, ASYNC_FRAME_CHILD, "cc.child.p"),
+        "cc.child");
+    LLVMBuildStore(g->builder, child, cur);
+    LLVMBuildBr(g->builder, head_bb);
+
+    LLVMPositionBuilderAtEnd(g->builder, ret_bb);
+    LLVMBuildRetVoid(g->builder);
+
+    g->current_fn = saved_fn;
+    if (saved) LLVMPositionBuilderAtEnd(g->builder, saved);
+    return fn;
+}
+
+/* Emit `if (frame->cancel) <complete with no result>` at a point where the
+ * body could just as well have executed `return;`: the locals in scope are
+ * released by the completion, the awaiter is woken, and the rest of the body
+ * never runs. Emitted at the start of the body and after every statement that
+ * awaited, i.e. at each point where cancellation can newly have been
+ * requested. */
+static void emit_async_cancel_check(zan_irgen_t *g, local_scope_t *locals) {
+    if (!g->current_async_frame) return;
+    /* Inside a try with a finally, an early completion would skip the finally
+     * body. Cancellation is cooperative, so it simply waits for the next
+     * statement boundary outside the protected region -- correctness of the
+     * unwind machinery beats reacting one statement sooner. */
+    if (g->finally_count > 0 || g->catch_cleanup_count > 0) return;
+    if (LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder))) return;
+    LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
+    LLVMValueRef frame = g->current_async_frame;
+    LLVMTypeRef ft = g->current_async_frame_type;
+    LLVMValueRef fn = g->current_fn;
+    LLVMValueRef flag = LLVMBuildLoad2(g->builder, i32,
+        LLVMBuildStructGEP2(g->builder, ft, frame, ASYNC_FRAME_CANCEL, "fr.cancel"),
+        "cancelled");
+    LLVMBasicBlockRef can_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "co.cancelled");
+    LLVMBasicBlockRef go_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "co.notcancelled");
+    LLVMBuildCondBr(g->builder,
+        zan_icmp(g->builder, LLVMIntNE, flag, LLVMConstInt(i32, 0, 0), "is.cancelled"),
+        can_bb, go_bb);
+    LLVMPositionBuilderAtEnd(g->builder, can_bb);
+    emit_async_complete(g, locals, NULL);
+    LLVMPositionBuilderAtEnd(g->builder, go_bb);
+}
+
 /* Pop every eh handler this $resume invocation armed (its own trampoline plus
  * the user handlers re-armed from the frame). A jmp_buf records a stack frame,
  * so a handler armed by an invocation is unusable once that invocation returns

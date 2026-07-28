@@ -3055,6 +3055,12 @@ static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                     LLVMBuildStructGEP2(g->builder, hdr, sub_i8, ASYNC_FRAME_AWAITER, "sub.aw"));
                 zan_store_fit(g, g->current_async_resume_fn,
                     LLVMBuildStructGEP2(g->builder, hdr, sub_i8, ASYNC_FRAME_AWAITER_STEP, "sub.aws"));
+                /* self.child = sub: cancelling this coroutine has to reach the
+                 * one it is actually waiting on (cleared again at the top of
+                 * the next resume) */
+                zan_store_fit(g, sub_i8,
+                    LLVMBuildStructGEP2(g->builder, self_ft, selfframe,
+                        ASYNC_FRAME_CHILD, "self.child"));
 
                 emit_async_save_slots(g);
                 zan_store_fit(g, LLVMConstInt(i32, (unsigned)k, 0),

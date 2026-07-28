@@ -551,6 +551,9 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
                 fields[ASYNC_FRAME_EXC] = i8ptr;
                 fields[ASYNC_FRAME_EXC_TID] = i8ptr;
                 fields[ASYNC_FRAME_EXC_OWNED] = i32;
+                fields[ASYNC_FRAME_CANCEL] = i32;
+                fields[ASYNC_FRAME_CHILD] = i8ptr;
+                fields[ASYNC_FRAME_LNEXT] = i8ptr;
                 fields[ASYNC_FRAME_HSTACK] = LLVMArrayType(i32, (unsigned)a_handler_cap);
                 fields[ASYNC_FRAME_CEXC] = LLVMArrayType(i8ptr, (unsigned)a_handler_cap);
                 fields[ASYNC_FRAME_CEXC_OWNED] = LLVMArrayType(i32, (unsigned)a_handler_cap);
@@ -900,6 +903,15 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
              * stack frame */
             emit_async_eh_prologue(g);
 
+            /* This invocation is running, so it is not suspended on a
+             * sub-frame: drop the CHILD link the last suspension left behind
+             * (it is about to be consumed and freed). Cancellation walks that
+             * chain, and a stale entry would point at freed memory. */
+            LLVMBuildStore(g->builder,
+                LLVMConstNull(LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0)),
+                LLVMBuildStructGEP2(g->builder, frame_type, sframe,
+                    ASYNC_FRAME_CHILD, "fr.child"));
+
             LLVMValueRef state = LLVMBuildLoad2(g->builder, i32,
                 LLVMBuildStructGEP2(g->builder, frame_type, sframe, ASYNC_FRAME_STATE, "st.ptr"),
                 "state");
@@ -912,10 +924,19 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
 
             LLVMPositionBuilderAtEnd(g->builder, body_bb);
             emit_async_reload_slots(g); /* load `this`/params from the frame */
+            /* cancelling a coroutine that is still queued for its first step
+             * must skip the body entirely */
+            emit_async_cancel_check(g, locals);
 
             if (member->method_decl.body->kind == AST_BLOCK) {
                 for (int k = 0; k < member->method_decl.body->block.stmts.count; k++) {
-                    emit_stmt(g, member->method_decl.body->block.stmts.items[k], locals);
+                    zan_ast_node_t *bs = member->method_decl.body->block.stmts.items[k];
+                    emit_stmt(g, bs, locals);
+                    /* a statement that awaited gave the scheduler a chance to
+                     * run Task.Cancel; observe it at this statement boundary,
+                     * where completing behaves exactly like an early `return` */
+                    if (anf_stmt_contains_await(bs))
+                        emit_async_cancel_check(g, locals);
                 }
             } else {
                 /* expression body (=> expr): treat as `return expr`. */

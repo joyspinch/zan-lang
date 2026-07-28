@@ -65,36 +65,54 @@ enum {
     ASYNC_FRAME_EXC = 8,          /* i8*: exception this coroutine completed with */
     ASYNC_FRAME_EXC_TID = 9,      /* i8*: its class type descriptor (or null) */
     ASYNC_FRAME_EXC_OWNED = 10,   /* i32: the exception carries a +1 reference */
-    ASYNC_FRAME_HSTACK = 11,      /* [ntries x i32]: ids of the try
+    ASYNC_FRAME_CANCEL = 11,      /* i32: 1 once cancellation was requested for
+                                   * this coroutine (Task.Cancel). Cooperative:
+                                   * the frame observes it at its next state
+                                   * block and completes early instead of
+                                   * running the rest of the body. Part of the
+                                   * shared header so __zan_co_cancel can set it
+                                   * through an i8* handle. */
+    ASYNC_FRAME_CHILD = 12,       /* i8*: the sub-frame this coroutine is
+                                   * currently suspended on (null while it runs
+                                   * and when it suspends on a timer/IO), so
+                                   * cancellation propagates down the await
+                                   * chain to the coroutine actually waiting. */
+    ASYNC_FRAME_LNEXT = 13,       /* i8*: intrusive link of the live detached
+                                   * (Task.Spawn) frame list rooted at the
+                                   * module's __zan_co_live. A spawn handle can
+                                   * outlive the coroutine (the reaper frees the
+                                   * frame), so Task.Cancel first checks the
+                                   * handle against this list. */
+    ASYNC_FRAME_HSTACK = 14,      /* [ntries x i32]: ids of the try
                                    * handlers this frame has armed, innermost
                                    * last -- re-armed at each resume (see
                                    * emit_async_eh_prologue). ntries is this
                                    * body's try count (current_async_handler_cap),
                                    * an exact bound: ids are handed out one per
                                    * lowered try. */
-    ASYNC_FRAME_CEXC = 12,        /* [ntries x i8*]: the exception each
+    ASYNC_FRAME_CEXC = 15,        /* [ntries x i8*]: the exception each
                                    * open catch is currently handling, indexed by
                                    * the try's compile-time handler id. Frame- (not
                                    * stack-) resident because an await inside a
                                    * catch body returns from this $resume
                                    * invocation: its allocas are garbage when the
                                    * catch epilogue resumes and releases. */
-    ASYNC_FRAME_CEXC_OWNED = 13,  /* [ntries x i32]: whether that
+    ASYNC_FRAME_CEXC_OWNED = 16,  /* [ntries x i32]: whether that
                                    * exception carries the in-flight +1 */
-    ASYNC_FRAME_CEXC_TID = 14,    /* [ntries x i8*]: that exception's
+    ASYNC_FRAME_CEXC_TID = 17,    /* [ntries x i8*]: that exception's
                                    * class type descriptor, so a bare `throw;`
                                    * rethrows with the original dynamic type
                                    * even after an await (or a nested throw)
                                    * has overwritten the in-flight global */
-    ASYNC_FRAME_FINEXC = 15,      /* [ZAN_MAX_FINALLY_DEPTH x i8*]: the exception
+    ASYNC_FRAME_FINEXC = 18,      /* [ZAN_MAX_FINALLY_DEPTH x i8*]: the exception
                                    * in flight across a `finally` body, indexed
                                    * by the try's finally-region depth. A finally
                                    * that awaits returns from this $resume, so
                                    * the exception it has to re-raise afterwards
                                    * cannot sit in an alloca. */
-    ASYNC_FRAME_FINEXC_OWNED = 16,/* [ZAN_MAX_FINALLY_DEPTH x i32] */
-    ASYNC_FRAME_FINEXC_TID = 17,  /* [ZAN_MAX_FINALLY_DEPTH x i8*] */
-    ASYNC_FRAME_FIRST_PARAM = 18
+    ASYNC_FRAME_FINEXC_OWNED = 19,/* [ZAN_MAX_FINALLY_DEPTH x i32] */
+    ASYNC_FRAME_FINEXC_TID = 20,  /* [ZAN_MAX_FINALLY_DEPTH x i8*] */
+    ASYNC_FRAME_FIRST_PARAM = 21
 };
 static LLVMValueRef coerce_to_i64(zan_irgen_t *g, LLVMValueRef v);
 static LLVMValueRef coerce_to_frame_result(zan_irgen_t *g, LLVMValueRef v,
@@ -102,6 +120,11 @@ static LLVMValueRef coerce_to_frame_result(zan_irgen_t *g, LLVMValueRef v,
 static LLVMValueRef coerce_from_frame_result(zan_irgen_t *g, LLVMValueRef res,
                                              zan_type_t *ty);
 static LLVMValueRef coerce_async_ret(zan_irgen_t *g, LLVMValueRef val);
+static void emit_async_cancel_check(zan_irgen_t *g, local_scope_t *locals);
+static LLVMValueRef get_co_cancel_fn(zan_irgen_t *g);
+static LLVMValueRef get_co_track_fn(zan_irgen_t *g);
+static LLVMValueRef get_co_untrack_fn(zan_irgen_t *g);
+static bool anf_stmt_contains_await(zan_ast_node_t *s);
 static void emit_async_save_slots(zan_irgen_t *g);
 static void emit_async_reload_slots(zan_irgen_t *g);
 static void emit_async_eh_unarm(zan_irgen_t *g);

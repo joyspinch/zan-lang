@@ -36,7 +36,7 @@ just materialised by us rather than by `CoroSplit`.
     i32   done           ; 1 once the result slot is valid
     i8*   awaiter         ; frame waiting on this one (or null)
     void(i8*)* awaiter_step ; awaiter's resume fn (or null)
-    i64   result         ; return value (all scalars are i64 in this backend)
+    i64   result         ; return value, encoded (see "Result slot" below)
     ; --- captured params ---
     <param0>, <param1>, ...
     ; --- captured named locals (live across any await) ---
@@ -45,8 +45,64 @@ just materialised by us rather than by `CoroSplit`.
     i8*   sub0, i8* sub1, ...
 }
 ```
-The first 5 fields are a fixed **header** at known offsets so runtime helpers
-and the await protocol can touch them.
+The header continues past the first 5 fields (cleanup fn, handler count, own
+resume fn, pending-exception triple, `cancel`, `child`, `lnext`); that prefix is
+a fixed **header** at known offsets (`%zan.co.header`) so runtime helpers, the
+await protocol and the cancellation helpers can touch any frame without knowing
+which function it belongs to.
+
+## Result slot
+The slot is physically 64 bits for every async function -- it sits at a fixed
+header offset, so its width cannot vary per function -- but it does not hold an
+`i64` *value*. The completing frame encodes its return value according to the
+function's **declared** return type, and the await site decodes it with the same
+type:
+
+| declared type | store | load |
+|---|---|---|
+| signed integer / bool | sign-extend to i64 | truncate |
+| unsigned integer | zero-extend to i64 | truncate |
+| pointer (class, string, array) | `ptrtoint` | `inttoptr` |
+| `double` | `bitcast` to i64 | `bitcast` back |
+| `float` | `bitcast` to i32, zero-extend | truncate, `bitcast` back |
+
+A plain sign-extend (what this used to do) loses an unsigned value's high bit
+and reads a `float` at the wrong width, and it silently truncates `int` once
+`int` is 32 bits wide. The return expression is converted to the declared return
+type *before* it is encoded, so `async double F() { return 3; }` puts a double in
+the slot rather than the integer bits.
+
+## Cancellation
+Cancellation is cooperative and lives entirely in the generated program (the
+driver is compiler-emitted, so there is nothing for the runtime to own):
+
+- `frame.cancel` (i32) is set to 1 by `__zan_co_cancel`.
+- `frame.child` (i8*) is the sub-frame the coroutine is currently suspended on;
+  it is written at the await site and cleared at the top of every resume.
+- `__zan_co_cancel(handle)` marks the target and then walks the `child` chain, so
+  cancelling a coroutine also cancels whatever it is waiting on.
+- `frame.lnext` links every *detached* frame (`Task.Spawn`) into the internal
+  `__zan_co_live` list. A spawn handle outlives its coroutine, so `Task.Cancel`
+  looks the handle up in that list first and does nothing if the reaper has
+  already freed the frame; the `child` chain below a live frame is alive by
+  construction, since a suspended awaiter owns its sub-frame. `__zan_co_reap`
+  unlinks a frame before freeing it.
+
+A cancelled coroutine is not killed asynchronously. The body tests the flag at
+body start (so a coroutine cancelled before it is ever stepped never runs) and at
+each statement boundary after an await; if set, it jumps to the normal completion
+path, so owning locals are released, the awaiter is woken and the frame is freed
+exactly once. The check is skipped inside `finally`/`catch` cleanup regions, so
+cancellation can never bypass cleanup. Being cooperative costs one thing: a
+coroutine parked on a timer or a socket observes cancellation only once that wait
+completes.
+
+Surface API: `Task.Spawn(asyncCall)` returns the task handle (discarding it stays
+fire-and-forget), `Task.Cancel(handle)` requests cancellation, and
+`Task.IsCancellationRequested()` reads the enclosing coroutine's flag (0 outside
+one) for a body that wants to bail out at a point of its own choosing. There is
+no `OperationCanceledException`: a cancelled coroutine completes, it does not
+throw.
 
 ## Two emitted functions per async `C.M`
 1. **Ramp** `C_M(params) -> i8*` (unchanged external signature except the return

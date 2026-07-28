@@ -209,7 +209,13 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
     case AST_BLOCK: {
         int block_start = locals->count;
         for (int i = 0; i < stmt->block.stmts.count; i++) {
-            emit_stmt(g, stmt->block.stmts.items[i], locals);
+            zan_ast_node_t *bs = stmt->block.stmts.items[i];
+            emit_stmt(g, bs, locals);
+            /* an await handed control back to the scheduler, which may have
+             * run Task.Cancel on this coroutine; observe it here, at a
+             * statement boundary where completing is an early `return` */
+            if (g->current_async_frame && anf_stmt_contains_await(bs))
+                emit_async_cancel_check(g, locals);
         }
         if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder))) {
             emit_release_owned_locals_from(g, locals, block_start);
