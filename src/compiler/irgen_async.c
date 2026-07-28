@@ -504,6 +504,10 @@ typedef struct {
     local_scope_t *scope;
     /* id of the next `foreach`, in the same AST order the emitter walks */
     int            foreach_next;
+    /* how many try statements the emitter will lower, counting a try inside a
+     * finally body once per copy of that body -- the frame's per-handler slot
+     * arrays are sized from this */
+    int            try_count;
 } async_scan_t;
 
 static bool async_type_is_scalar(LLVMTypeRef t) {
@@ -753,6 +757,7 @@ static void async_scan_stmt(async_scan_t *s, zan_ast_node_t *st) {
         async_scan_expr(s, st->throw_stmt.value);
         break;
     case AST_TRY_STMT:
+        s->try_count++;
         async_scan_stmt(s, st->try_stmt.try_body);
         for (int i = 0; i < st->try_stmt.catches.count; i++) {
             zan_ast_node_t *cc = st->try_stmt.catches.items[i];
@@ -976,8 +981,9 @@ static void emit_async_eh_prologue(zan_irgen_t *g) {
         LLVMValueRef i = LLVMBuildLoad2(g->builder, i32, idx_slot, "eh.i");
         LLVMValueRef hc = LLVMBuildLoad2(g->builder, i32,
             LLVMBuildStructGEP2(g->builder, ft, frame, ASYNC_FRAME_HCOUNT, "hc.p"), "hc");
-        /* only the first ASYNC_MAX_HANDLERS handlers have a recorded id */
-        LLVMValueRef cap = LLVMConstInt(i32, ASYNC_MAX_HANDLERS, 0);
+        /* the frame has one slot per try in this body, so hc can only exceed it
+         * if the bookkeeping is broken; clamp rather than read past the frame */
+        LLVMValueRef cap = LLVMConstInt(i32, g->current_async_handler_cap, 0);
         hc = LLVMBuildSelect(g->builder,
             zan_icmp(g->builder, LLVMIntSLT, hc, cap, "hc.fits"), hc, cap, "hc.cap");
         LLVMValueRef more = zan_icmp(g->builder, LLVMIntSLT, i, hc, "eh.more");
@@ -991,7 +997,8 @@ static void emit_async_eh_prologue(zan_irgen_t *g) {
         LLVMValueRef hs = LLVMBuildStructGEP2(g->builder, ft, frame,
             ASYNC_FRAME_HSTACK, "hs");
         LLVMValueRef slot = LLVMBuildGEP2(g->builder,
-            LLVMArrayType(i32, ASYNC_MAX_HANDLERS), hs, hs_idx, 2, "hs.slot");
+            LLVMArrayType(i32, (unsigned)g->current_async_handler_cap),
+            hs, hs_idx, 2, "hs.slot");
         LLVMBuildStore(g->builder,
             LLVMBuildLoad2(g->builder, i32, slot, "hs.id"), id_slot);
         LLVMValueRef t = LLVMBuildLoad2(g->builder, i32, top_g, "eh.t2");
@@ -1008,7 +1015,7 @@ static void emit_async_eh_prologue(zan_irgen_t *g) {
     g->current_async_rearm_next_bb = next_bb;
     g->current_async_rearm_init_switch = LLVMBuildSwitch(g->builder,
         LLVMBuildLoad2(g->builder, i32, id_slot, "eh.id0"), next_bb,
-        ASYNC_MAX_HANDLERS);
+        (unsigned)g->current_async_handler_cap);
 
     LLVMPositionBuilderAtEnd(g->builder, next_bb);
     {
@@ -1038,7 +1045,7 @@ static void emit_async_eh_prologue(zan_irgen_t *g) {
         LLVMValueRef ok = zan_and(g->builder,
             zan_icmp(g->builder, LLVMIntSGE, k, zero, "eh.land.lo"),
             zan_icmp(g->builder, LLVMIntSLT, k,
-                LLVMConstInt(i32, ASYNC_MAX_HANDLERS, 0), "eh.land.hi"),
+                LLVMConstInt(i32, g->current_async_handler_cap, 0), "eh.land.hi"),
             "eh.land.ok");
         LLVMValueRef ksafe = LLVMBuildSelect(g->builder, ok, k, zero, "eh.land.ks");
         LLVMBuildStore(g->builder, ksafe, idx_slot);
@@ -1046,7 +1053,8 @@ static void emit_async_eh_prologue(zan_irgen_t *g) {
             ASYNC_FRAME_HSTACK, "hs.l");
         LLVMValueRef hs_idx[2] = { zero, ksafe };
         LLVMValueRef slot = LLVMBuildGEP2(g->builder,
-            LLVMArrayType(i32, ASYNC_MAX_HANDLERS), hs, hs_idx, 2, "hs.lslot");
+            LLVMArrayType(i32, (unsigned)g->current_async_handler_cap),
+            hs, hs_idx, 2, "hs.lslot");
         LLVMValueRef id = LLVMBuildSelect(g->builder, ok,
             LLVMBuildLoad2(g->builder, i32, slot, "hs.lid"),
             LLVMConstInt(i32, -1, 1), "eh.land.id");
@@ -1064,7 +1072,7 @@ static void emit_async_eh_prologue(zan_irgen_t *g) {
      * they hold. */
     g->current_async_rearm_switch = LLVMBuildSwitch(g->builder,
         LLVMBuildLoad2(g->builder, i32, id_slot, "eh.id"), exc_bb,
-        ASYNC_MAX_HANDLERS);
+        (unsigned)g->current_async_handler_cap);
 
     LLVMPositionBuilderAtEnd(g->builder, disp_bb);
 }

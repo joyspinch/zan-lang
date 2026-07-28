@@ -1255,11 +1255,13 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         i8ptr, g->co_step_ptr, i64,
         g->co_step_ptr, LLVMInt32TypeInContext(g->ctx),
         g->co_step_ptr, /* SELF_STEP: frame's own resume fn */
-        i8ptr, i8ptr, LLVMInt32TypeInContext(g->ctx), /* pending exception */
-        LLVMArrayType(LLVMInt32TypeInContext(g->ctx), ASYNC_MAX_HANDLERS)
+        i8ptr, i8ptr, LLVMInt32TypeInContext(g->ctx) /* pending exception */
     };
+    /* Stops before ASYNC_FRAME_HSTACK: the per-handler arrays are sized per
+     * function (one slot per try in that body), so they are not part of the
+     * shared prefix. Only the fields above are reached through this type. */
     g->co_header_type = LLVMStructCreateNamed(g->ctx, "zan.co.header");
-    LLVMStructSetBody(g->co_header_type, co_hdr_fields, 12, 0);
+    LLVMStructSetBody(g->co_header_type, co_hdr_fields, 11, 0);
     g->current_async_frame = NULL;
     g->current_async_frame_type = NULL;
     g->current_async_resume_fn = NULL;

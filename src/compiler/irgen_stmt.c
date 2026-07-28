@@ -1073,7 +1073,8 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                     ASYNC_FRAME_HSTACK, "eh.hs");
                 LLVMValueRef hs_idx[2] = { LLVMConstInt(i32t, 0, 0), hc };
                 LLVMValueRef hs_slot = LLVMBuildGEP2(g->builder,
-                    LLVMArrayType(i32t, ASYNC_MAX_HANDLERS), hs, hs_idx, 2, "eh.hs.slot");
+                    LLVMArrayType(i32t, (unsigned)g->current_async_handler_cap),
+                    hs, hs_idx, 2, "eh.hs.slot");
                 zan_store_fit(g, LLVMConstInt(i32t, (unsigned)hid, 0), hs_slot);
 
                 LLVMBasicBlockRef here = LLVMGetInsertBlock(g->builder);
@@ -1185,7 +1186,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
          * compile-time handler id, so they survive the suspension. */
         LLVMValueRef exc_slot, exc_owned_slot, exc_tid_slot;
         if (g->current_async_frame && async_hid >= 0 &&
-            async_hid < ASYNC_MAX_HANDLERS) {
+            async_hid < g->current_async_handler_cap) {
             /* Address them in the entry block, like emit_entry_alloca: the
              * catch epilogue lives in a block the CPS split leaves outside
              * this one's dominance, so a GEP computed here would not
@@ -1199,17 +1200,17 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             if (entry_term) LLVMPositionBuilderBefore(g->builder, entry_term);
             else LLVMPositionBuilderAtEnd(g->builder, entry_bb);
             exc_slot = LLVMBuildGEP2(g->builder,
-                LLVMArrayType(i8ptr, ASYNC_MAX_HANDLERS),
+                LLVMArrayType(i8ptr, (unsigned)g->current_async_handler_cap),
                 LLVMBuildStructGEP2(g->builder, g->current_async_frame_type,
                     g->current_async_frame, ASYNC_FRAME_CEXC, "eh.cexc"),
                 cidx, 2, "eh.exc.slot");
             exc_owned_slot = LLVMBuildGEP2(g->builder,
-                LLVMArrayType(i32t, ASYNC_MAX_HANDLERS),
+                LLVMArrayType(i32t, (unsigned)g->current_async_handler_cap),
                 LLVMBuildStructGEP2(g->builder, g->current_async_frame_type,
                     g->current_async_frame, ASYNC_FRAME_CEXC_OWNED, "eh.cexcown"),
                 cidx, 2, "eh.excown.slot");
             exc_tid_slot = LLVMBuildGEP2(g->builder,
-                LLVMArrayType(i8ptr, ASYNC_MAX_HANDLERS),
+                LLVMArrayType(i8ptr, (unsigned)g->current_async_handler_cap),
                 LLVMBuildStructGEP2(g->builder, g->current_async_frame_type,
                     g->current_async_frame, ASYNC_FRAME_CEXC_TID, "eh.cexctid"),
                 cidx, 2, "eh.exctid.slot");

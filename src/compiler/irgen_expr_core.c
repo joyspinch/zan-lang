@@ -57,20 +57,23 @@ enum {
     ASYNC_FRAME_EXC = 8,          /* i8*: exception this coroutine completed with */
     ASYNC_FRAME_EXC_TID = 9,      /* i8*: its class type descriptor (or null) */
     ASYNC_FRAME_EXC_OWNED = 10,   /* i32: the exception carries a +1 reference */
-    ASYNC_FRAME_HSTACK = 11,      /* [ASYNC_MAX_HANDLERS x i32]: ids of the try
+    ASYNC_FRAME_HSTACK = 11,      /* [ntries x i32]: ids of the try
                                    * handlers this frame has armed, innermost
                                    * last -- re-armed at each resume (see
-                                   * emit_async_eh_prologue) */
-    ASYNC_FRAME_CEXC = 12,        /* [ASYNC_MAX_HANDLERS x i8*]: the exception each
+                                   * emit_async_eh_prologue). ntries is this
+                                   * body's try count (current_async_handler_cap),
+                                   * an exact bound: ids are handed out one per
+                                   * lowered try. */
+    ASYNC_FRAME_CEXC = 12,        /* [ntries x i8*]: the exception each
                                    * open catch is currently handling, indexed by
                                    * the try's compile-time handler id. Frame- (not
                                    * stack-) resident because an await inside a
                                    * catch body returns from this $resume
                                    * invocation: its allocas are garbage when the
                                    * catch epilogue resumes and releases. */
-    ASYNC_FRAME_CEXC_OWNED = 13,  /* [ASYNC_MAX_HANDLERS x i32]: whether that
+    ASYNC_FRAME_CEXC_OWNED = 13,  /* [ntries x i32]: whether that
                                    * exception carries the in-flight +1 */
-    ASYNC_FRAME_CEXC_TID = 14,    /* [ASYNC_MAX_HANDLERS x i8*]: that exception's
+    ASYNC_FRAME_CEXC_TID = 14,    /* [ntries x i8*]: that exception's
                                    * class type descriptor, so a bare `throw;`
                                    * rethrows with the original dynamic type
                                    * even after an await (or a nested throw)

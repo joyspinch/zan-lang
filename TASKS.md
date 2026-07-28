@@ -1355,6 +1355,68 @@ async 的 CPS 切分会把这些块挪出定义点的支配范围——和 `emit
 `exception_threads` 暂不注册 leakcheck 变体（`CMakeLists.txt` 的 `_no_leakcheck`），
 否则这个门禁就是抛硬币。追踪表要改成线程安全后再把它放回去。
 
+## A23 — async 帧的 catch 槽不再是固定 8 个（已修）
+
+现象：一个 async 函数体里同时活着的 try 超过 8 个就崩。新增
+`tests/conformance/async_handler_slots.zan`（12 个顺序 try/catch，每个 handler 内
+先 `await` 再读回自己的异常；外加 11 层嵌套 try，最内层抛出后每层 `await` 完再裸
+`throw;` 逐层重抛）。把容量重新卡回 8（`_scratch` 里临时改 `a_handler_cap`）复现旧
+行为：
+
+```
+12 boom1..boom12
+exit=-1073741819   (0xC0000005，Nested() 的第 9 层起写出帧外)
+```
+
+根因：`ASYNC_MAX_HANDLERS 8` 同时被用作三处：帧里 `HSTACK / CEXC / CEXC_OWNED /
+CEXC_TID` 四个数组的**长度**、catch 槽选择的**上界**、以及 resume 时重新武装
+handler 的**钳位**。async body 的 try 数量是编译期已知的，没有理由取一个猜的常数：
+超过 8 之后要么索引出帧（内存破坏），要么静默退回 alloca——而 alloca 在 `await`
+之后就是垃圾，catch 会读到已经失效的异常指针。
+
+改法：`async_scan_t` 增加 `try_count`（async 扫描已经会把 finally 体按发射份数重复
+遍历，所以计数和发射出的 try 数一致），`irgen_emit.c` 用它构造四个数组的长度
+（LLVM 不接受长度 0 的成员，所以无 try 的函数体仍留 1 个不用的槽），并把容量随
+`method_body_work_t.handler_cap` 传进 resume body 的发射，`g->current_async_handler_cap`
+在每个 async 发射路径上保存/恢复。所有 GEP 的数组类型、switch case 数、边界检查和
+重新武装的钳位都改读这个 per-frame 容量；`ASYNC_MAX_HANDLERS` 已从编译器里删除。
+`zan.co.header`（跨帧共享的前缀类型）随之截到 `HSTACK` 之前——per-handler 数组不再
+是共享前缀，而 header 本来也只用来访问它前面的字段。
+
+实测（Windows）：`async_handler_slots` 输出全对、`--check-leaks` 干净、
+`--async-workers 1/2/4` 都是同一结果；
+`ctest -R 'exception|throw|catch|try|await|async|thread|ctor|inherit|arc|leakcheck_generic'`
+= **132/132，8.7 秒**。
+
+## A24 — `: base(args)` 的实参临时被泄漏（已修）
+
+现象：**每一个**用计算出来的 rc 参数构造的派生类实例都会漏掉那个参数。最小复现
+`_scratch/four.zan`：`class D1 : B1 { D1(int c) : base("tag" + Convert.ToString(c)) }`
+—— `new B1("plain" + ...)` 干净，`new D1(1)` 报 1 个 still reachable；派生类**自己**
+声明的 string 字段正常释放，只有经 base 初始化器传下去的那个漏。
+
+根因（`src/compiler/irgen_emit.c` 的 base construction 段）：`: base(args)` 的实参
+只是 `emit_expr` 出来直接塞进 `cargs`，从来没有走普通调用点的
+`emit_release_owned_call_temp`。base ctor 会 `zan_rt_str_retain` 它存下来的值，于是
+实参表达式产生的那个 +1 没人放手，对象死后引用计数仍是 1。IR 里看得很清楚：
+`D1_ctor` 里 `%str.raw1 = call ptr @zan_rt_str_alloc(...)` 之后只有
+`call void @B1_ctor(ptr %this.base, ptr %str.raw1)`，没有对应的 release。
+
+这不是异常/async 的问题，是构造链的 ARC 漏洞，之所以在 A23 这轮暴露：新用例用了
+`class Boom : Exception { Boom(int c) : base("boom" + ...) }`，leakcheck 立刻报数。
+
+改法：base ctor 调用后按实参逐个 `emit_release_owned_call_temp`，和普通调用点完全
+一致（局部变量实参、借用返回值等由该函数自己判定，不会误放手）。
+
+实测：新增 `tests/conformance/base_ctor_arg_release.zan`（200 轮 × 三种形状：
+string base 实参、`List<string>` 字段 + string base 实参、三层继承链各自转发自己的
+临时）输出正确、`--check-leaks` 干净；修改前同一用例每轮每个实例漏 1 个。
+子集 `ctest -R 'leakcheck|oop|class|inherit|virtual|poly|struct|generic|sqlserver|http|socket'`
+= 250 个里 248 过，2 个失败是既有的 WeChat SDK codegen 错误
+（`leakcheck_sdk_wechat_product_modules` / `leakcheck_sdk_wechat_tenpay`：
+`LLVM verification failed: Incorrect number of arguments`，另一个会话正在改的
+`stdlib/Sdk/Wechat/*`，与本条无关）。
+
 ---
 
 # 已撤回的结论（早期草稿中的错误，勿再引用）

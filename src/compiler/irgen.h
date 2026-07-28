@@ -20,9 +20,6 @@ typedef struct {
     int          frame_index;
 } zan_async_slot_t;
 
-/* Handler ids a single coroutine can keep armed across suspensions. */
-#define ASYNC_MAX_HANDLERS 8
-
 /* Nesting depth of catch bodies a single function body may be inside. */
 #define ZAN_MAX_CATCH_DEPTH 16
 
@@ -365,6 +362,10 @@ struct zan_irgen {
     LLVMValueRef current_async_rearm_init_switch;
     LLVMBasicBlockRef current_async_rearm_next_bb;
     int          current_async_handler_next;
+    /* how many per-handler slots this frame has: the number of try statements
+     * the body lowers (counted by the async scan, which sees the finally-body
+     * copies too), so `current_async_handler_next` can never run past it */
+    int          current_async_handler_cap;
     /* per-function id of the next `foreach` emitted inside an async body;
      * indexes its frame-resident iteration state (see AST_FOREACH_STMT) */
     int          current_async_foreach_next;

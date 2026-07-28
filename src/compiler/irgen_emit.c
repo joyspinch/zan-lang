@@ -216,6 +216,7 @@ typedef struct {
     async_local_t  *alocals;       /* named scalar locals held in the frame */
     int             alocal_count;
     int             sub_base;       /* frame index of the first sub-task slot */
+    int             handler_cap;    /* per-handler slots in the frame */
     zan_type_t     *cur_inst;       /* instantiation being specialized, or NULL */
 } method_body_work_t;
 
@@ -500,6 +501,7 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
             async_local_t *a_locals = NULL;
             int a_local_count = 0;
             int a_sub_base = 0;
+            int a_handler_cap = 1;
 
             if (is_async) {
                 LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
@@ -519,7 +521,7 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
                  * and collect named scalar locals that must live in the frame
                  * so they survive across suspensions. */
                 async_scan_t scan = { g, 0, NULL, 0, 0,
-                                      local_scope_new(g->arena), 0 };
+                                      local_scope_new(g->arena), 0, 0 };
                 zan_symbol_t *scan_saved_type = g->current_type_sym;
                 g->current_type_sym = type_sym;
                 async_scan_stmt(&scan, member->method_decl.body);
@@ -527,6 +529,10 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
                 a_await_count = scan.await_count;
                 a_locals = scan.locals;
                 a_local_count = scan.local_count;
+                /* One per-handler slot group per try the body lowers. LLVM
+                 * rejects a zero-length array member, so a body with no try at
+                 * all still gets one unused slot. */
+                a_handler_cap = scan.try_count > 0 ? scan.try_count : 1;
 
                 /* frame = fixed header + params + frame locals +
                  * one i8* sub-task handle per await point. */
@@ -545,10 +551,10 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
                 fields[ASYNC_FRAME_EXC] = i8ptr;
                 fields[ASYNC_FRAME_EXC_TID] = i8ptr;
                 fields[ASYNC_FRAME_EXC_OWNED] = i32;
-                fields[ASYNC_FRAME_HSTACK] = LLVMArrayType(i32, ASYNC_MAX_HANDLERS);
-                fields[ASYNC_FRAME_CEXC] = LLVMArrayType(i8ptr, ASYNC_MAX_HANDLERS);
-                fields[ASYNC_FRAME_CEXC_OWNED] = LLVMArrayType(i32, ASYNC_MAX_HANDLERS);
-                fields[ASYNC_FRAME_CEXC_TID] = LLVMArrayType(i8ptr, ASYNC_MAX_HANDLERS);
+                fields[ASYNC_FRAME_HSTACK] = LLVMArrayType(i32, (unsigned)a_handler_cap);
+                fields[ASYNC_FRAME_CEXC] = LLVMArrayType(i8ptr, (unsigned)a_handler_cap);
+                fields[ASYNC_FRAME_CEXC_OWNED] = LLVMArrayType(i32, (unsigned)a_handler_cap);
+                fields[ASYNC_FRAME_CEXC_TID] = LLVMArrayType(i8ptr, (unsigned)a_handler_cap);
                 fields[ASYNC_FRAME_FINEXC] =
                     LLVMArrayType(i8ptr, ZAN_MAX_FINALLY_DEPTH);
                 fields[ASYNC_FRAME_FINEXC_OWNED] =
@@ -645,6 +651,7 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
                 work[work_count].alocals = a_locals;
                 work[work_count].alocal_count = a_local_count;
                 work[work_count].sub_base = a_sub_base;
+                work[work_count].handler_cap = a_handler_cap;
                 work[work_count].cur_inst = cur_variant;
                 work_count++;
             } else {
@@ -849,6 +856,7 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
             LLVMBasicBlockRef saved_exc_bb = g->current_async_exc_bb;
             LLVMValueRef saved_rearm = g->current_async_rearm_switch;
             int saved_handler_next = g->current_async_handler_next;
+            int saved_handler_cap = g->current_async_handler_cap;
             int saved_foreach_next = g->current_async_foreach_next;
 
             g->current_fn = resume_fn;
@@ -878,6 +886,7 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
             g->current_async_exc_bb = NULL;
             g->current_async_rearm_switch = NULL;
             g->current_async_handler_next = 0;
+            g->current_async_handler_cap = work[w].handler_cap;
             g->current_async_foreach_next = 0;
 
             /* arm this invocation's exception trampoline (and re-arm the
@@ -940,6 +949,7 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
             g->current_async_exc_bb = saved_exc_bb;
             g->current_async_rearm_switch = saved_rearm;
             g->current_async_handler_next = saved_handler_next;
+            g->current_async_handler_cap = saved_handler_cap;
             g->current_async_foreach_next = saved_foreach_next;
 
             /* ---- cleanup: release owned rc slots from the frame, free it.
@@ -1066,6 +1076,13 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
                         }
                         zan_call2(g->builder, g->ctors[ci].fn_type, g->ctors[ci].fn,
                                   cargs, (unsigned)(want_args + 1), "");
+                        /* the base constructor retains what it stores, so the
+                         * +1 an argument expression produced here is ours to
+                         * drop, exactly as at a plain call site */
+                        for (int ai = 0; ai < want_args; ai++)
+                            emit_release_owned_call_temp(g,
+                                member->method_decl.base_args.items[ai],
+                                cargs[ai + 1], locals);
                         free(cargs);
                     }
                     break;
