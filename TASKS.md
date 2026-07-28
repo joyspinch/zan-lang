@@ -1439,6 +1439,18 @@ load → add → store 三件套（`src/compiler/irgen.c` 里 `zan_rt_alloc` /
 正常门禁。子集 `ctest -R 'exception|thread|leakcheck|arc|generic'` = 239 个里 237 过，
 2 个失败仍是既有的 WeChat SDK codegen 错误（见 A24）。
 
+## A26 — 既有失败，与 A21-A25 无关（未修，记账）
+
+1. `conformance_gui_datatable`：554 行输出里 5 个断言输出 0 应为 1（行 306 / 328 /
+   331 / 438 / 457）。用改动前的编译器（`d1f804a^`）重编同一程序，失败完全一样，
+   所以是既有的 GUI DataTable 行为问题，不是 EH / async / ARC 这几轮引入的。属于 B5
+   GUI 迁移的范围。
+2. `leakcheck_sdk_wechat_product_modules` / `leakcheck_sdk_wechat_tenpay`：编译期就
+   失败，`LLVM verification failed: Incorrect number of arguments passed to called
+   function`（如 `WechatWorkChatApi_CreateChatAsync`）。`stdlib/Sdk/Wechat/*` 和
+   `scripts/generate_wechat_*_apis.py` 正在被另一个会话改动（工作树里是未提交状态），
+   生成出来的调用点和声明的参数个数不一致。等那边收尾，不在本轮范围内。
+
 ---
 
 # 已撤回的结论（早期草稿中的错误，勿再引用）
