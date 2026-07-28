@@ -127,10 +127,66 @@ static bool narrow_warn_enabled(void) {
     return state == 1;
 }
 
+/* C# implicit constant expression conversion: `byte b = 255;` is legal without
+ * a cast because the value is known at compile time and fits. Only a constant
+ * integer expression qualifies, so this folds literals and the operators a
+ * constant can be spelled with, and reports "not constant" for anything else. */
+static bool const_int_expr(zan_ast_node_t *e, int64_t *out) {
+    if (!e) return false;
+    switch (e->kind) {
+    case AST_INT_LITERAL:
+        *out = e->int_val;
+        return true;
+    case AST_UNARY: {
+        int64_t v;
+        if (!const_int_expr(e->unary.operand, &v)) return false;
+        switch (e->unary.op) {
+        case TK_MINUS: *out = -v; return true;
+        case TK_PLUS:  *out = v;  return true;
+        case TK_TILDE: *out = ~v; return true;
+        default: return false;
+        }
+    }
+    case AST_BINARY: {
+        int64_t l, r;
+        if (!const_int_expr(e->binary.left, &l)) return false;
+        if (!const_int_expr(e->binary.right, &r)) return false;
+        switch (e->binary.op) {
+        case TK_PLUS:  *out = l + r; return true;
+        case TK_MINUS: *out = l - r; return true;
+        case TK_STAR:  *out = l * r; return true;
+        case TK_SLASH: if (!r) return false; *out = l / r; return true;
+        case TK_LESS_LESS: *out = l << (r & 63); return true;
+        case TK_AMP:   *out = l & r; return true;
+        case TK_PIPE:  *out = l | r; return true;
+        default: return false;
+        }
+    }
+    default:
+        return false;
+    }
+}
+
+static bool const_fits(zan_type_t *dst, int64_t v) {
+    switch (dst->kind) {
+    case TYPE_SBYTE:  return v >= -128 && v <= 127;
+    case TYPE_BYTE:   return v >= 0 && v <= 255;
+    case TYPE_SHORT:  return v >= -32768 && v <= 32767;
+    case TYPE_USHORT: case TYPE_CHAR: return v >= 0 && v <= 65535;
+    case TYPE_INT:    return v >= INT32_MIN && v <= INT32_MAX;
+    case TYPE_UINT:   return v >= 0 && v <= 4294967295LL;
+    case TYPE_LONG: case TYPE_NINT: return true;
+    case TYPE_ULONG:  return v >= 0;
+    default: return false;
+    }
+}
+
 static void warn_narrowing(zan_irgen_t *g, zan_type_t *dst, zan_type_t *src,
                            zan_ast_node_t *at, const char *what) {
     if (!narrow_warn_enabled() || !g || !g->diag || !at) return;
     if (!dst || !src) return;
+    int64_t cv;
+    if (const_int_expr(at, &cv) && const_fits(dst, cv)) return;
     int rd = conv_rank(dst), rs = conv_rank(src);
     bool src_float = src->kind == TYPE_FLOAT || src->kind == TYPE_DOUBLE;
     if (!rd) return;

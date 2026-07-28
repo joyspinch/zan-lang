@@ -42,7 +42,7 @@ class Wal {
     bool IsOpen() { return this.file.IsOpen(); }
 
     /// <summary>Current WAL file size in bytes.</summary>
-    int Size() { return this.file.Size(); }
+    long Size() { return this.file.Size(); }
 
     /// <summary>Appends one page image; not yet durable (see AppendCommit).</summary>
     bool AppendFrame(int pageId, ByteBuffer page) {
@@ -51,20 +51,20 @@ class Wal {
         h.WriteU64(pageId);
         h.WriteU32(this.pageSize);
         h.WriteU32(page.Crc32(this.pageSize));
-        int ok1 = this.file.Append(h.Raw(), Wal.HEADER_LEN);
+        long ok1 = this.file.Append(h.Raw(), Wal.HEADER_LEN);
         h.Free();
         if (ok1 < 0) { return false; }
         return this.file.Append(page.Raw(), this.pageSize) >= 0;
     }
 
     /// <summary>Appends a commit record and fsyncs: the durability point.</summary>
-    bool AppendCommit(int commitId) {
+    bool AppendCommit(long commitId) {
         ByteBuffer h = ByteBuffer.Alloc(Wal.HEADER_LEN);
         h.WriteU32(Wal.FRAME_COMMIT);
         h.WriteU64(commitId);
         h.WriteU32(0);
         h.WriteU32(0);
-        int ok = this.file.Append(h.Raw(), Wal.HEADER_LEN);
+        long ok = this.file.Append(h.Raw(), Wal.HEADER_LEN);
         h.Free();
         if (ok < 0) { return false; }
         return this.file.Sync();
@@ -75,11 +75,11 @@ class Wal {
     /// discarded. Idempotent: replaying already-checkpointed frames simply
     /// rewrites identical page images. Resets the WAL afterwards.</summary>
     int Recover(PageFile db) {
-        int size = this.file.Size();
+        long size = this.file.Size();
         if (size <= 0) { return 0; }
 
         int applied = 0;
-        int off = 0;
+        long off = 0;
         // Pending frames of the transaction currently being scanned.
         List<int> pendIds = new List<int>();
         List<ByteBuffer> pendPages = new List<ByteBuffer>();
@@ -90,7 +90,7 @@ class Wal {
             this.file.ReadAt(off, h, Wal.HEADER_LEN);
             h.SeekRead(0);
             int type = h.ReadU32();
-            int id = h.ReadU64();
+            int id = Pager.PageIdOf(h.ReadU64());
             int plen = h.ReadU32();
             int crc = h.ReadU32();
             off = off + Wal.HEADER_LEN;
@@ -107,7 +107,7 @@ class Wal {
                 // Whole transaction present: apply it.
                 int i = 0;
                 while (i < pendIds.Count) {
-                    db.WriteAt(pendIds[i] * this.pageSize, pendPages[i].Raw(), this.pageSize);
+                    db.WriteAt((long)pendIds[i] * this.pageSize, pendPages[i].Raw(), this.pageSize);
                     pendPages[i].Free();
                     i = i + 1;
                 }

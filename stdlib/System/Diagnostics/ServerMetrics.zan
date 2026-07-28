@@ -31,9 +31,9 @@ namespace System.Diagnostics;
 /// entity so the text and its duration cannot drift apart in the ring buffer.</summary>
 class SlowEntry {
     string text;
-    int ms;
+    long ms;
 
-    SlowEntry(string text, int ms) {
+    SlowEntry(string text, long ms) {
         this.text = text;
         this.ms = ms;
     }
@@ -60,21 +60,21 @@ class ServerMetrics {
     // Aggregated request metrics.
     int reqCount;
     int reqErrors;
-    int reqTotalMs;
-    int reqMaxMs;
+    long reqTotalMs;
+    long reqMaxMs;
     int slowReqMs;                 // slow-request threshold (ms)
     List<SlowEntry> slowReqs;      // "METHOD path -> status" + elapsed ms
 
     // Aggregated query metrics.
     int queryCount;
-    int queryTotalMs;
-    int queryMaxMs;
+    long queryTotalMs;
+    long queryMaxMs;
     int slowQueryMs;               // slow-query threshold (ms)
     List<SlowEntry> slowQueries;   // truncated SQL + elapsed ms
 
-    int startMillis;
-    int lastWallMs;                // for CPU% delta sampling
-    int lastCpuMs;
+    long startMillis;
+    long lastWallMs;               // for CPU% delta sampling
+    long lastCpuMs;
     int ringCap;
 
     ServerMetrics() {
@@ -112,9 +112,9 @@ class ServerMetrics {
 
     // ---- OS probes ----
 
-    static int LeInt(string buf, int off, int n) {
-        int v = 0;
-        int mul = 1;
+    static long LeInt(string buf, int off, int n) {
+        long v = 0;
+        long mul = 1;
         int k = 0;
         while (k < n) {
             v = v + (buf[off + k] & 255) * mul;
@@ -126,22 +126,22 @@ class ServerMetrics {
 
     /// <summary>Monotonic wall-clock milliseconds (not affected by clock resets
     /// the way a seconds epoch is); use deltas, not the absolute value.</summary>
-    static int MonoMillis() {
+    static long MonoMillis() {
         #if WINDOWS
         return GetTickCount64();
         #else
         if (monoBuf == null) { monoBuf = calloc(16, 1); }
         string tv = monoBuf;
         int r = gettimeofday(tv, 0);
-        int sec = ServerMetrics.LeInt(tv, 0, 8);
-        int usec = ServerMetrics.LeInt(tv, 8, 8);
+        long sec = ServerMetrics.LeInt(tv, 0, 8);
+        long usec = ServerMetrics.LeInt(tv, 8, 8);
         return sec * 1000 + usec / 1000;
         #endif
     }
 
     /// <summary>Cumulative process CPU time in ms (user+kernel), or -1 if the
     /// current platform cannot report it.</summary>
-    static int CpuMillis() {
+    static long CpuMillis() {
         #if WINDOWS
         nint h = GetCurrentProcess();
         string cre = calloc(8, 1);
@@ -149,8 +149,8 @@ class ServerMetrics {
         string kern = calloc(8, 1);
         string usr = calloc(8, 1);
         int ok = GetProcessTimes(h, cre, ex, kern, usr);
-        int k = ServerMetrics.LeInt(kern, 0, 8);
-        int u = ServerMetrics.LeInt(usr, 0, 8);
+        long k = ServerMetrics.LeInt(kern, 0, 8);
+        long u = ServerMetrics.LeInt(usr, 0, 8);
         free(cre); free(ex); free(kern); free(usr);
         if (ok == 0) { return 0 - 1; }
         return (k + u) / 10000;   // 100ns units -> ms
@@ -163,8 +163,8 @@ class ServerMetrics {
         List<string> f = ServerMetrics.SplitWs(rest);
         // rest[0] = field 3 (state); utime = field 14 -> index 11, stime -> 12.
         if (f.Count < 13) { return 0 - 1; }
-        int utime = Convert.ToInt32(f[11]);
-        int stime = Convert.ToInt32(f[12]);
+        long utime = Convert.ToInt64(f[11]);
+        long stime = Convert.ToInt64(f[12]);
         return (utime + stime) * 10;   // assumes 100 Hz USER_HZ -> *1000/100
         #else
         return 0 - 1;
@@ -173,12 +173,12 @@ class ServerMetrics {
 
     /// <summary>Resident memory of this process in bytes, or -1 if unavailable
     /// on the current platform.</summary>
-    static int MemoryRssBytes() {
+    static long MemoryRssBytes() {
         #if WINDOWS
         nint h = GetCurrentProcess();
         string c = calloc(72, 1);
         int ok = GetProcessMemoryInfo(h, c, 72);
-        int rss = ServerMetrics.LeInt(c, 16, 8);   // WorkingSetSize
+        long rss = ServerMetrics.LeInt(c, 16, 8);   // WorkingSetSize
         free(c);
         if (ok == 0) { return 0 - 1; }
         return rss;
@@ -187,7 +187,7 @@ class ServerMetrics {
         string s = File.ReadAllText("/proc/self/statm");
         List<string> f = ServerMetrics.SplitWs(s);
         if (f.Count < 2) { return 0 - 1; }
-        int residentPages = Convert.ToInt32(f[1]);
+        long residentPages = Convert.ToInt64(f[1]);
         return residentPages * 4096;
         #else
         return 0 - 1;
@@ -224,7 +224,7 @@ class ServerMetrics {
     // ---- recording ----
 
     /// <summary>Records one completed HTTP request.</summary>
-    void RecordRequest(string method, string path, int status, int ms) {
+    void RecordRequest(string method, string path, int status, long ms) {
         this.reqCount = this.reqCount + 1;
         this.reqTotalMs = this.reqTotalMs + ms;
         if (ms > this.reqMaxMs) { this.reqMaxMs = ms; }
@@ -238,7 +238,7 @@ class ServerMetrics {
     }
 
     /// <summary>Records one completed database query.</summary>
-    void RecordQuery(string sql, int ms) {
+    void RecordQuery(string sql, long ms) {
         this.queryCount = this.queryCount + 1;
         this.queryTotalMs = this.queryTotalMs + ms;
         if (ms > this.queryMaxMs) { this.queryMaxMs = ms; }
@@ -306,22 +306,22 @@ class ServerMetrics {
     /// since the previous snapshot, so poll it on a fixed interval for a
     /// meaningful "cpu_percent".</summary>
     string SnapshotJson() {
-        int nowWall = ServerMetrics.MonoMillis();
-        int cpuMs = ServerMetrics.CpuMillis();
-        int uptime = nowWall - this.startMillis;
+        long nowWall = ServerMetrics.MonoMillis();
+        long cpuMs = ServerMetrics.CpuMillis();
+        long uptime = nowWall - this.startMillis;
 
-        int cpuPct = 0 - 1;
+        long cpuPct = 0 - 1;
         if (cpuMs >= 0) {
-            int dWall = nowWall - this.lastWallMs;
-            int dCpu = cpuMs - this.lastCpuMs;
+            long dWall = nowWall - this.lastWallMs;
+            long dCpu = cpuMs - this.lastCpuMs;
             if (dWall > 0) { cpuPct = (dCpu * 100) / dWall; }
             this.lastWallMs = nowWall;
             this.lastCpuMs = cpuMs;
         }
 
-        int reqAvg = 0;
+        long reqAvg = 0;
         if (this.reqCount > 0) { reqAvg = this.reqTotalMs / this.reqCount; }
-        int qAvg = 0;
+        long qAvg = 0;
         if (this.queryCount > 0) { qAvg = this.queryTotalMs / this.queryCount; }
 
         StringBuilder sb = new StringBuilder();

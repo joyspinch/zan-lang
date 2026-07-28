@@ -310,12 +310,22 @@ class Pager {
     static int META_FIELDS = 48;         // bytes covered by the meta CRC
     static int FREE_PER_PAGE = 255;      // (id, txn) pairs in one free-list page
 
+    // Page numbers are 32-bit (the file format spells them as u64, so the
+    // format itself allows more): 2^31 pages x 4 KiB is an 8 TiB database, and
+    // keeping them `int` keeps every index, list and cache key one word. A file
+    // that claims a larger id is corrupt or written by a future format, so it
+    // is rejected here rather than silently truncated.
+    static int PageIdOf(long stored) {
+        if (stored < 0 || stored > 2147483647) { return 0; }
+        return (int)stored;
+    }
+
     PageFile file;
     PageCache cache;
     DbRegistry registry;
     string lastError;
 
-    int txnid;          // snapshot this handle is looking at
+    long txnid;         // snapshot this handle is looking at
     int rootId;
     int freeHead;
     int pageCount;      // total pages in the file (>= 2)
@@ -323,7 +333,7 @@ class Pager {
     PageIdSet fresh;    // pages allocated by the running write transaction
     List<int> freshIds; // same, in allocation order (the commit write set)
     List<int> freeIds;  // free-list: page ids...
-    List<int> freeTxns; // ...and the transaction that freed each of them
+    List<long> freeTxns; // ...and the transaction that freed each of them
     List<int> reusable; // free pages no reader can see any more
     List<int> pendingFree;   // freed by the running transaction
     List<int> freeChain;     // pages holding the persisted free list
@@ -352,7 +362,7 @@ class Pager {
         this.fresh = PageIdSet.Create();
         this.freshIds = new List<int>();
         this.freeIds = new List<int>();
-        this.freeTxns = new List<int>();
+        this.freeTxns = new List<long>();
         this.reusable = new List<int>();
         this.pendingFree = new List<int>();
         this.freeChain = new List<int>();
@@ -405,7 +415,7 @@ class Pager {
 
     int PageCount() { return this.pageCount; }
 
-    int CommitId() { return this.txnid; }
+    long CommitId() { return this.txnid; }
 
     int RootId() { return this.rootId; }
 
@@ -422,7 +432,7 @@ class Pager {
 
     /// <summary>Oldest snapshot still being read by any process; freed pages
     /// newer than this cannot be reused yet. 0 = nobody is reading.</summary>
-    int OldestReader() { return this.registry.OldestSnapshot(); }
+    long OldestReader() { return this.registry.OldestSnapshot(); }
 
     /// <summary>fsync cadence for the data pages of a commit: 1 = full
     /// durability (default), N = fsync data every N commits. The meta page is
@@ -434,7 +444,7 @@ class Pager {
 
     // ===== meta pages =====
 
-    void WriteMeta(int newTxn) {
+    void WriteMeta(long newTxn) {
         ByteBuffer h = ByteBuffer.Alloc(Pager.PAGE_SIZE);
         h.Clear();
         h.WriteU32(Pager.MAGIC);
@@ -449,7 +459,7 @@ class Pager {
         h.SetLength(Pager.META_FIELDS);
         h.WriteU32(crc);
         h.SetLength(Pager.PAGE_SIZE);
-        int slot = newTxn & 1;
+        long slot = newTxn & 1;
         this.file.WriteAt(slot * Pager.PAGE_SIZE, h.Raw(), Pager.PAGE_SIZE);
         this.pageWrites = this.pageWrites + 1;
         h.Free();
@@ -457,13 +467,13 @@ class Pager {
 
     /// <summary>Reads one meta page; returns its transaction id, or 0 when the
     /// page is absent, foreign or CRC-broken (a torn commit).</summary>
-    int ReadMetaSlot(int slot, ByteBuffer h) {
-        int n = this.file.ReadAt(slot * Pager.PAGE_SIZE, h, Pager.PAGE_SIZE);
+    long ReadMetaSlot(int slot, ByteBuffer h) {
+        int n = this.file.ReadAt((long)slot * Pager.PAGE_SIZE, h, Pager.PAGE_SIZE);
         if (n < Pager.PAGE_SIZE) { return 0; }
         h.SeekRead(0);
         if (h.ReadU32() != Pager.MAGIC) { return 0; }
         if (h.ReadU32() != Pager.PAGE_SIZE) { return 0; }
-        int txn = h.ReadU64();
+        long txn = h.ReadU64();
         h.SeekRead(Pager.META_FIELDS);
         int stored = h.ReadU32();
         if (h.Crc32(Pager.META_FIELDS) != stored) { return 0; }
@@ -474,10 +484,10 @@ class Pager {
     void LoadMeta() {
         ByteBuffer a = ByteBuffer.Alloc(Pager.PAGE_SIZE);
         ByteBuffer b = ByteBuffer.Alloc(Pager.PAGE_SIZE);
-        int ta = ReadMetaSlot(0, a);
-        int tb = ReadMetaSlot(1, b);
+        long ta = ReadMetaSlot(0, a);
+        long tb = ReadMetaSlot(1, b);
         ByteBuffer pick = a;
-        int txn = ta;
+        long txn = ta;
         if (tb > ta) { pick = b; txn = tb; }
         if (txn == 0) {
             this.lastError = "not a ZanDB file (no valid meta page)";
@@ -487,14 +497,14 @@ class Pager {
         }
         pick.SeekRead(8);
         this.txnid = pick.ReadU64();
-        this.rootId = pick.ReadU64();
-        this.freeHead = pick.ReadU64();
-        this.pageCount = pick.ReadU64();
+        this.rootId = Pager.PageIdOf(pick.ReadU64());
+        this.freeHead = Pager.PageIdOf(pick.ReadU64());
+        this.pageCount = Pager.PageIdOf(pick.ReadU64());
         a.Free();
         b.Free();
         this.freeLoaded = false;
         this.freeIds = new List<int>();
-        this.freeTxns = new List<int>();
+        this.freeTxns = new List<long>();
         this.reusable = new List<int>();
         this.freeChain = new List<int>();
     }
@@ -507,7 +517,7 @@ class Pager {
     /// leaves its version behind for this one to adopt.</summary>
     bool MaybeStale() {
         if (!this.registry.IsShared()) { return false; }
-        int published = this.registry.CommittedTxn();
+        long published = this.registry.CommittedTxn();
         if (published == 0) { return false; }
         return published != this.txnid;
     }
@@ -517,7 +527,7 @@ class Pager {
     /// when the snapshot moved.</summary>
     bool Refresh() {
         if (!MaybeStale()) { return false; }
-        int before = this.txnid;
+        long before = this.txnid;
         LoadMeta();
         if (this.txnid == before) { return false; }
         this.cache.Clear();
@@ -538,18 +548,18 @@ class Pager {
     void LoadFreeList() {
         if (this.freeLoaded) { return; }
         this.freeIds = new List<int>();
-        this.freeTxns = new List<int>();
+        this.freeTxns = new List<long>();
         this.freeChain = new List<int>();
         int pid = this.freeHead;
         ByteBuffer pg = ByteBuffer.Alloc(Pager.PAGE_SIZE);
         while (pid != 0) {
-            this.file.ReadAt(pid * Pager.PAGE_SIZE, pg, Pager.PAGE_SIZE);
+            this.file.ReadAt((long)pid * Pager.PAGE_SIZE, pg, Pager.PAGE_SIZE);
             pg.SeekRead(0);
-            int next = pg.ReadU64();
-            int cnt = pg.ReadU64();
+            int next = Pager.PageIdOf(pg.ReadU64());
+            long cnt = pg.ReadU64();
             int i = 0;
             while (i < cnt && i < Pager.FREE_PER_PAGE) {
-                this.freeIds.Add(pg.ReadU64());
+                this.freeIds.Add(Pager.PageIdOf(pg.ReadU64()));
                 this.freeTxns.Add(pg.ReadU64());
                 i = i + 1;
             }
@@ -565,12 +575,12 @@ class Pager {
     /// reusable pool.</summary>
     void ReclaimFree() {
         LoadFreeList();
-        int oldest = this.registry.OldestSnapshot();
+        long oldest = this.registry.OldestSnapshot();
         List<int> keepIds = new List<int>();
-        List<int> keepTxns = new List<int>();
+        List<long> keepTxns = new List<long>();
         int i = 0;
         while (i < this.freeIds.Count) {
-            int freedBy = this.freeTxns[i];
+            long freedBy = this.freeTxns[i];
             if (oldest == 0 || freedBy <= oldest) {
                 this.reusable.Add(this.freeIds[i]);
             } else {
@@ -586,7 +596,7 @@ class Pager {
     /// <summary>Writes the free list as a fresh page chain and returns its
     /// head (0 when empty). Called inside Commit, after the new transaction id
     /// is known.</summary>
-    int PersistFreeList(int newTxn) {
+    int PersistFreeList(long newTxn) {
         int total = this.freeIds.Count;
         this.freeChain = new List<int>();
         if (total == 0) { return 0; }
@@ -727,7 +737,7 @@ class Pager {
         }
         ByteBuffer buf = ByteBuffer.Alloc(Pager.PAGE_SIZE);
         if (pageId < this.pageCount) {
-            this.file.ReadAt(pageId * Pager.PAGE_SIZE, buf, Pager.PAGE_SIZE);
+            this.file.ReadAt((long)pageId * Pager.PAGE_SIZE, buf, Pager.PAGE_SIZE);
         }
         buf.SetLength(Pager.PAGE_SIZE);
         this.cache.Put(pageId, buf, this.fresh.Has(pageId));
@@ -754,8 +764,8 @@ class Pager {
         // moved the database on (and one lineage would silently overwrite the
         // other's meta page). The writer lock is held here, so max + 1 is
         // unique and monotonic across processes.
-        int newTxn = this.txnid + 1;
-        int published = this.registry.CommittedTxn();
+        long newTxn = this.txnid + 1;
+        long published = this.registry.CommittedTxn();
         if (published >= newTxn) { newTxn = published + 1; }
 
         // The pages holding the previous free list are rewritten below.
@@ -781,7 +791,7 @@ class Pager {
         while (i < this.freshIds.Count) {
             int pid = this.freshIds[i];
             ByteBuffer pg = GetPage(pid);
-            if (this.file.WriteAt(pid * Pager.PAGE_SIZE, pg.Raw(), Pager.PAGE_SIZE)
+            if (this.file.WriteAt((long)pid * Pager.PAGE_SIZE, pg.Raw(), Pager.PAGE_SIZE)
                     != Pager.PAGE_SIZE) {
                 this.lastError = "page write failed";
                 Rollback();

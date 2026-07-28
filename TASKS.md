@@ -269,6 +269,38 @@ static extern int zan_gui_present(int hwnd, int surfaceId);
 `Guard` 的 QPC 计算（已修）、各处 `Le64` 风格的手写小端解码。
 这些不是 FFI 声明问题，是**语义类型选错**，要在 A0-1 里逐个定型。
 
+* **A0-1a** ✅ 已修（2026-07-28）把标准库里真正的 64 位量从 `int` 定型成 `long`，
+  并按数据模型（不是按"消警告"）决定每一处到底几位：
+  - **文件位置/大小是 64 位**：`PageFile` 的 `SeekFd`/`PReadFd`/`PWriteFd`/`TruncateFd`
+    改成真实 ABI（`_lseeki64`/`lseek`/`pread`/`pwrite`/`ftruncate` 的 `off_t`/`__int64`），
+    `ReadAt`/`ReadRaw`/`WriteAt` 的 offset、`Append`/`Size` 的返回值 → `long`；
+    字节数仍是 `int`（缓冲区长度本来就是 `int` 上界）。
+  - **共享内存/原子量是 64 位**：`rt_sync.c` 一直是 `int64_t` 值 + 64 位句柄，
+    `AtomicInt` / `SharedTable` 的 Zan 声明改成 `nint handle` + `long` 值，
+    上层 `RouteStats` / `RouteTable` / `PermTable` / `Router` / `Worker` 跟着走 `long`
+    （路由哈希是 64 位；`auth`/`perm`/`menu`/`mask` 这类应用级标志仍是 `int`，
+    读出时显式 `(int)` 收窄）。
+  - **事务号是 64 位、页号是 32 位**：ZanDB 元页把 txn/root/free/pageCount 都写成 u64，
+    但页号 2^31 × 4 KiB 已是 8 TiB，且它同时是 `List`/缓存的下标。因此
+    `Pager.txnid` / `CommitId` / `OldestSnapshot` / `freeTxns` → `long`，
+    页号保持 `int`，所有从盘上读回的页号统一过 `Pager.PageIdOf(long)`——
+    越界即判定为损坏（返回 0），不做静默截断。偏移一律 `(long)pid * PAGE_SIZE`。
+  - **`ByteBuffer.ReadVarInt` 的移位是真 bug**：`(b & 127) << shift` 在 i32 下
+    shift ≥ 32 会丢高位，改成 `(long)(b & 127) << shift`。
+  - 其余：`DateTime.Pad2(long)`、`HttpClient` 的 `fopen` 结果 → `nint`、
+    `ServerMetrics` 的累计/峰值毫秒 → `long`、`Collection` 的 varint 计数显式 `(int)`。
+  〔已实测〕`ZAN_WARN_NARROW=1` 全量扫描（`tests/conformance` + `examples` +
+  `templates` 297 个单元，另加 `tests` 其余 + `src/ide_zan` + `src/selfhost` 66 个）：
+  改前 24 处唯一窄化警告，改后 **0 处**。
+  `ctest -R 'const_narrowing|byte_unsigned|array_init_foreach|zandb|web_route|web_perm|http_client|datetime|timespan|metrics'`
+  42/42 通过。
+* **A0-1a 编译器修复**：窄化诊断原先对 `byte b = 255;` 也报警，这与 C# 不符——
+  C# 有**隐式常量表达式转换**（编译期已知且能容纳就不需要 cast）。
+  按"先修编译器、不要绕过"的规则，在 `irgen_expr_core.c` 里补 `const_int_expr()` /
+  `const_fits()`：常量折叠字面量与 `+ - * / << & | ~` 的常量表达式，能容纳就不报。
+  回归用例 `tests/conformance/const_narrowing.zan`（`byte`/`sbyte`/`short`/`ushort`/
+  `uint` 常量初始化、常量表达式 `1 << 7`、静态字段、`new byte[] { 0, 128, 255 }`）。
+
 ## A1 `Span<T>` 编译器内建 〔依赖 A0〕
 
 * **A1-1** `Span<T>` = `(nint base, int length)`，编译期知道 `T` 宽度；
