@@ -8,7 +8,125 @@
 
 /* ---- async/await CPS lowering helpers ---- */
 
-/* Coerce an arbitrary scalar value to the i64 used by the frame result slot. */
+/* Does `t` fill the frame result slot with zeros rather than a sign bit? The
+ * slot is 64 bits wide, so a narrower value is extended into it and truncated
+ * back out; extending an unsigned type with its sign bit would turn `uint`
+ * 0xFFFFFFFF into -1 for anything that reads the slot as 64 bits. */
+static bool type_is_unsigned_scalar(zan_type_t *t) {
+    if (!t) return false;
+    switch (t->kind) {
+    case TYPE_BOOL:
+    case TYPE_BYTE:
+    case TYPE_USHORT:
+    case TYPE_UINT:
+    case TYPE_ULONG:
+    case TYPE_CHAR:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/* Encode a completed coroutine's return value into the 64-bit frame result
+ * slot, using the callee's declared return type `ty` (may be NULL when it is
+ * not known). `coerce_from_frame_result` is the exact inverse: the pair is what
+ * makes `await` give back the value the coroutine returned rather than the
+ * bits that happened to fit an i64, for a narrow (`short`), unsigned (`uint`)
+ * or 32-bit floating (`float`) type -- and for `int` once it is 32 bits (A0). */
+static LLVMValueRef coerce_to_frame_result(zan_irgen_t *g, LLVMValueRef v,
+                                           zan_type_t *ty) {
+    if (!v) return NULL;
+    LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+    LLVMTypeRef t = LLVMTypeOf(v);
+    switch (LLVMGetTypeKind(t)) {
+    case LLVMIntegerTypeKind: {
+        unsigned bits = LLVMGetIntTypeWidth(t);
+        if (bits == 64) return v;
+        if (bits > 64) return LLVMBuildTrunc(g->builder, v, i64, "res.slot");
+        return type_is_unsigned_scalar(ty)
+            ? LLVMBuildZExt(g->builder, v, i64, "res.slot")
+            : LLVMBuildSExt(g->builder, v, i64, "res.slot");
+    }
+    case LLVMPointerTypeKind:
+        return LLVMBuildPtrToInt(g->builder, v, i64, "res.slot");
+    case LLVMDoubleTypeKind:
+        return LLVMBuildBitCast(g->builder, v, i64, "res.slot");
+    case LLVMFloatTypeKind: {
+        /* keep the 32 float bits as they are: widening to double here would
+         * make the awaiter's `float` read (a 32-bit bitcast) see the low half
+         * of a double instead of the value */
+        LLVMValueRef fb = LLVMBuildBitCast(g->builder, v, i32, "res.f32");
+        return LLVMBuildZExt(g->builder, fb, i64, "res.slot");
+    }
+    default:
+        return LLVMConstInt(i64, 0, 0);
+    }
+}
+
+/* Convert a returned value to the async method's declared return type, the way
+ * a synchronous `return` converts to the function's LLVM return type. The
+ * frame result encoding is type-directed, so the value has to reach it in the
+ * declared type -- otherwise `return 0;` from an async `double` method encodes
+ * an integer that the awaiter then reads as a double. */
+static LLVMValueRef coerce_async_ret(zan_irgen_t *g, LLVMValueRef val) {
+    zan_type_t *rt = g->current_async_ret_type;
+    if (!val || !rt || rt->kind == TYPE_VOID) return val;
+    LLVMTypeRef want = map_type(g, rt);
+    LLVMTypeRef have = LLVMTypeOf(val);
+    if (!want || have == want) return val;
+    LLVMTypeKind wk = LLVMGetTypeKind(want), hk = LLVMGetTypeKind(have);
+    if (wk == LLVMDoubleTypeKind || wk == LLVMFloatTypeKind) {
+        if (hk == LLVMIntegerTypeKind)
+            return type_is_unsigned_scalar(rt)
+                ? LLVMBuildUIToFP(g->builder, val, want, "ret.fp")
+                : LLVMBuildSIToFP(g->builder, val, want, "ret.fp");
+        if (hk == LLVMDoubleTypeKind)
+            return LLVMBuildFPTrunc(g->builder, val, want, "ret.fptrunc");
+        if (hk == LLVMFloatTypeKind)
+            return LLVMBuildFPExt(g->builder, val, want, "ret.fpext");
+        return val;
+    }
+    if (wk == LLVMIntegerTypeKind && hk == LLVMIntegerTypeKind) {
+        unsigned wb = LLVMGetIntTypeWidth(want), hb = LLVMGetIntTypeWidth(have);
+        if (wb > hb) return LLVMBuildSExt(g->builder, val, want, "ret.ext");
+        if (wb < hb) return LLVMBuildTrunc(g->builder, val, want, "ret.trunc");
+        return val;
+    }
+    if (wk == LLVMPointerTypeKind && hk == LLVMPointerTypeKind)
+        return LLVMBuildBitCast(g->builder, val, want, "ret.cast");
+    return val;
+}
+
+/* Decode a frame result slot back into the callee's declared type `ty`. */
+static LLVMValueRef coerce_from_frame_result(zan_irgen_t *g, LLVMValueRef res,
+                                             zan_type_t *ty) {
+    if (!res || !ty) return res;
+    if (LLVMGetTypeKind(LLVMTypeOf(res)) != LLVMIntegerTypeKind) return res;
+    LLVMTypeRef want = map_type(g, ty);
+    if (!want || LLVMTypeOf(res) == want) return res;
+    LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
+    switch (LLVMGetTypeKind(want)) {
+    case LLVMIntegerTypeKind:
+        return LLVMGetIntTypeWidth(want) < LLVMGetIntTypeWidth(LLVMTypeOf(res))
+            ? LLVMBuildTrunc(g->builder, res, want, "aw.int")
+            : res;
+    case LLVMPointerTypeKind:
+        return LLVMBuildIntToPtr(g->builder, res, want, "aw.ptr");
+    case LLVMDoubleTypeKind:
+        return LLVMBuildBitCast(g->builder, res, want, "aw.dbl");
+    case LLVMFloatTypeKind: {
+        LLVMValueRef fb = LLVMBuildTrunc(g->builder, res, i32, "aw.f32");
+        return LLVMBuildBitCast(g->builder, fb, want, "aw.flt");
+    }
+    default:
+        return res;
+    }
+}
+
+/* Coerce an arbitrary scalar value to the i64 used by the frame result slot,
+ * without a declared type to go by (untyped lambda bodies). Prefer
+ * coerce_to_frame_result wherever the declared type is available. */
 static LLVMValueRef coerce_to_i64(zan_irgen_t *g, LLVMValueRef v) {
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
     LLVMTypeRef t = LLVMTypeOf(v);

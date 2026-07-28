@@ -2704,24 +2704,16 @@ static bool is_async_iface_call(zan_irgen_t *g, zan_ast_node_t *e,
            (m->decl->method_decl.modifiers & MOD_ASYNC) != 0;
 }
 
-/* An async frame's result slot is a raw i64, so `await f()` loads i64 bits no
- * matter what `f` returns. Give the expression the callee's declared type
- * back: without it an inferred declaration (`var s = await Echo()`) keeps a
- * string as an integer, and only an explicitly typed target got converted. */
+/* An async frame's result slot is 64 bits wide, so `await f()` loads 64 bits no
+ * matter what `f` returns. Decode them back into the callee's declared type --
+ * the exact inverse of the encoding the completing coroutine applied (see
+ * coerce_to_frame_result). Without it an inferred declaration
+ * (`var s = await Echo()`) keeps a string as an integer, and a narrow or
+ * 32-bit floating result is read at the wrong width. */
 static LLVMValueRef coerce_await_result(zan_irgen_t *g, zan_ast_node_t *expr,
         LLVMValueRef res, local_scope_t *locals) {
-    zan_type_t *rt = infer_expr_type(g, expr->await_expr.expr, locals);
-    if (!rt || LLVMGetTypeKind(LLVMTypeOf(res)) != LLVMIntegerTypeKind) return res;
-    LLVMTypeRef want = map_type(g, rt);
-    if (LLVMTypeOf(res) == want) return res;
-    switch (LLVMGetTypeKind(want)) {
-    case LLVMPointerTypeKind:
-        return LLVMBuildIntToPtr(g->builder, res, want, "aw.ptr");
-    case LLVMDoubleTypeKind:
-        return LLVMBuildBitCast(g->builder, res, want, "aw.dbl");
-    default:
-        return res;
-    }
+    zan_type_t *rt = concretize(g, infer_expr_type(g, expr->await_expr.expr, locals));
+    return coerce_from_frame_result(g, res, rt);
 }
 
 static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,

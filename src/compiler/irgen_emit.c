@@ -846,6 +846,7 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
             LLVMValueRef saved_async_frame = g->current_async_frame;
             LLVMTypeRef saved_async_frame_type = g->current_async_frame_type;
             LLVMValueRef saved_async_resume_fn = g->current_async_resume_fn;
+            zan_type_t *saved_async_ret_type = g->current_async_ret_type;
             LLVMValueRef saved_async_switch = g->current_async_switch;
             int saved_next_state = g->current_async_next_state;
             int saved_sub_base = g->current_async_sub_base;
@@ -877,6 +878,10 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
             g->current_async_frame = sframe;
             g->current_async_frame_type = frame_type;
             g->current_async_resume_fn = resume_fn;
+            g->current_async_ret_type = concretize(g,
+                member->method_decl.return_type
+                    ? zan_binder_resolve_type(g->binder, member->method_decl.return_type)
+                    : g->binder->type_void);
             g->current_async_next_state = 1;
             g->current_async_sub_base = work[w].sub_base;
             g->current_async_sub_next = 0;
@@ -915,7 +920,9 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
             } else {
                 /* expression body (=> expr): treat as `return expr`. */
                 LLVMValueRef val = emit_expr(g, member->method_decl.body, locals);
-                emit_async_complete(g, locals, coerce_to_i64(g, val));
+                emit_async_complete(g, locals,
+                    coerce_to_frame_result(g, coerce_async_ret(g, val),
+                                           g->current_async_ret_type));
             }
 
             /* fall off the end: implicit completion (void / default result). */
@@ -939,6 +946,7 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
             g->current_async_frame = saved_async_frame;
             g->current_async_frame_type = saved_async_frame_type;
             g->current_async_resume_fn = saved_async_resume_fn;
+            g->current_async_ret_type = saved_async_ret_type;
             g->current_async_switch = saved_async_switch;
             g->current_async_next_state = saved_next_state;
             g->current_async_sub_base = saved_sub_base;

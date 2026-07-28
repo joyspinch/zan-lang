@@ -339,6 +339,9 @@ struct zan_irgen {
     LLVMValueRef current_async_frame;
     LLVMTypeRef  current_async_frame_type;
     LLVMValueRef current_async_resume_fn; /* the $resume fn being emitted */
+    /* declared return type of the async method being emitted: the frame result
+     * slot is encoded/decoded against it (see coerce_to_frame_result) */
+    zan_type_t  *current_async_ret_type;
     /* await state-machine context, valid only when current_async_frame is set
      * and the body contains awaits: the entry switch (new resume-k cases are
      * added here), the next state number to hand out, and the frame slots that

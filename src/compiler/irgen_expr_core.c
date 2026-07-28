@@ -46,7 +46,15 @@ enum {
     ASYNC_FRAME_DONE = 1,         /* i32: 1 once result slot is valid */
     ASYNC_FRAME_AWAITER = 2,      /* i8*: frame waiting on this one (or null) */
     ASYNC_FRAME_AWAITER_STEP = 3, /* void(i8*)*: awaiter's resume fn (or null) */
-    ASYNC_FRAME_RESULT = 4,       /* i64: return value (scalars are i64 here) */
+    ASYNC_FRAME_RESULT = 4,       /* i64: the return value, encoded to the slot
+                                   * width by coerce_to_frame_result and decoded
+                                   * back to the callee's declared type by
+                                   * coerce_from_frame_result. The slot stays 64
+                                   * bits (every frame shares this header
+                                   * prefix, so its offsets cannot depend on one
+                                   * body's return type); the *encoding* is
+                                   * type-directed, so a narrower or unsigned
+                                   * type survives it once `int` is 32 bits. */
     ASYNC_FRAME_CLEANUP = 5,      /* void(i8*)*: releases owned slots + frees the frame */
     ASYNC_FRAME_HCOUNT = 6,       /* i32: try handlers currently armed by this frame */
     ASYNC_FRAME_SELF_STEP = 7,    /* void(i8*)*: this frame's own resume/step fn.
@@ -89,6 +97,11 @@ enum {
     ASYNC_FRAME_FIRST_PARAM = 18
 };
 static LLVMValueRef coerce_to_i64(zan_irgen_t *g, LLVMValueRef v);
+static LLVMValueRef coerce_to_frame_result(zan_irgen_t *g, LLVMValueRef v,
+                                           zan_type_t *ty);
+static LLVMValueRef coerce_from_frame_result(zan_irgen_t *g, LLVMValueRef res,
+                                             zan_type_t *ty);
+static LLVMValueRef coerce_async_ret(zan_irgen_t *g, LLVMValueRef val);
 static void emit_async_save_slots(zan_irgen_t *g);
 static void emit_async_reload_slots(zan_irgen_t *g);
 static void emit_async_eh_unarm(zan_irgen_t *g);

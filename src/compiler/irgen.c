@@ -1280,6 +1280,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
     g->current_async_frame = NULL;
     g->current_async_frame_type = NULL;
     g->current_async_resume_fn = NULL;
+    g->current_async_ret_type = NULL;
     g->current_async_switch = NULL;
     g->current_async_next_state = 1;
     g->current_async_sub_base = 0;

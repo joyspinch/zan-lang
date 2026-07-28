@@ -622,7 +622,14 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                     !expr_yields_owned_rc_value(g, stmt->ret.value, locals)) {
                     emit_rc_retain_for_type(g, ret_type, rv);
                 }
-                ri = coerce_to_i64(g, rv);
+                /* encode against the *declared* return type, not the type of
+                 * this particular expression: the awaiter decodes with the
+                 * declared one, so `return 0;` from an async `double` method
+                 * has to reach the slot as a double */
+                ri = coerce_to_frame_result(g, coerce_async_ret(g, rv),
+                                            g->current_async_ret_type
+                                                ? g->current_async_ret_type
+                                                : ret_type);
             }
             /* C#: the return value is evaluated first, then every enclosing
              * finally runs, then the function returns. Spill the value across
