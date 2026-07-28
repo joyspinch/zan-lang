@@ -85,7 +85,8 @@ static zan_ast_node_t *jg_find_decl(zan_ast_node_t *unit, zan_istr_t name,
 /* ---- field kind classification ---- */
 
 typedef enum {
-    FK_INT,       /* int / long / short / byte / sbyte / uint / ushort / ulong / char */
+    FK_INT,       /* int / short / byte / sbyte / uint / ushort / char */
+    FK_LONG,      /* long / ulong (64-bit: needs a 64-bit accessor) */
     FK_FLOAT,     /* double / float / decimal */
     FK_BOOL,
     FK_STRING,
@@ -97,10 +98,14 @@ typedef enum {
     FK_SKIP,
 } jg_fk_t;
 
+static bool jg_is_long_name(zan_istr_t n) {
+    return istr_is(n, "long") || istr_is(n, "ulong");
+}
+
 static bool jg_is_int_name(zan_istr_t n) {
-    return istr_is(n, "int") || istr_is(n, "long") || istr_is(n, "short") ||
+    return istr_is(n, "int") || istr_is(n, "short") ||
            istr_is(n, "byte") || istr_is(n, "sbyte") || istr_is(n, "uint") ||
-           istr_is(n, "ushort") || istr_is(n, "ulong") || istr_is(n, "char");
+           istr_is(n, "ushort") || istr_is(n, "char");
 }
 
 static bool jg_is_float_name(zan_istr_t n) {
@@ -109,6 +114,7 @@ static bool jg_is_float_name(zan_istr_t n) {
 
 /* Classify a scalar/class element type (no List nesting). */
 static jg_fk_t jg_classify_base(zan_ast_node_t *unit, zan_istr_t name) {
+    if (jg_is_long_name(name)) return FK_LONG;
     if (jg_is_int_name(name)) return FK_INT;
     if (jg_is_float_name(name)) return FK_FLOAT;
     if (istr_is(name, "bool")) return FK_BOOL;
@@ -431,6 +437,7 @@ static void jg_gen_fields(jg_ctx_t *c, jg_buf_t *out, zan_istr_t cls_name,
                     (*emitted)++ ? "," : "", FL, FS);
             switch (fk) {
             case FK_INT:
+            case FK_LONG:
             case FK_FLOAT:
                 jg_putf(out,
                     "        sb.Append(Convert.ToString(o.%.*s));\n", FL, FS);
@@ -471,6 +478,7 @@ static void jg_gen_fields(jg_ctx_t *c, jg_buf_t *out, zan_istr_t cls_name,
                 char wr[512];
                 switch (ek) {
                 case FK_INT:
+                case FK_LONG:
                 case FK_FLOAT:
                     snprintf(wr, sizeof(wr),
                              "sb.Append(Convert.ToString(%s));", item);
@@ -525,6 +533,7 @@ static void jg_gen_fields(jg_ctx_t *c, jg_buf_t *out, zan_istr_t cls_name,
                 char wr[512];
                 switch (ek) {
                 case FK_INT:
+                case FK_LONG:
                 case FK_FLOAT:
                     snprintf(wr, sizeof(wr), "sb.Append(Convert.ToString(%s));", item);
                     break;
@@ -577,6 +586,10 @@ static void jg_gen_fields(jg_ctx_t *c, jg_buf_t *out, zan_istr_t cls_name,
                 jg_putf(out, "        o.%.*s = (%.*s)v.Int(\"%.*s\", 0);\n",
                         FL, FS, (int)tname.len, tname.str, FL, FS);
                 break;
+            case FK_LONG:
+                jg_putf(out, "        o.%.*s = (%.*s)v.Long(\"%.*s\", 0);\n",
+                        FL, FS, (int)tname.len, tname.str, FL, FS);
+                break;
             case FK_ENUM:
                 /* enum casts are not parseable; int -> enum assignment is
                  * implicit */
@@ -621,6 +634,10 @@ static void jg_gen_fields(jg_ctx_t *c, jg_buf_t *out, zan_istr_t cls_name,
                 case FK_INT:
                     snprintf(elem_from, sizeof(elem_from),
                              "(%.*s)%%s.AsInt(0)", EL, ES);
+                    break;
+                case FK_LONG:
+                    snprintf(elem_from, sizeof(elem_from),
+                             "(%.*s)%%s.AsLong(0)", EL, ES);
                     break;
                 case FK_ENUM:
                     /* enum casts are not parseable; int -> enum is implicit */
@@ -671,6 +688,7 @@ static void jg_gen_fields(jg_ctx_t *c, jg_buf_t *out, zan_istr_t cls_name,
                 char elem_from[256];
                 switch (ek) {
                 case FK_INT: snprintf(elem_from, sizeof(elem_from), "(%.*s)%%s.AsInt(0)", EL, ES); break;
+                case FK_LONG: snprintf(elem_from, sizeof(elem_from), "(%.*s)%%s.AsLong(0)", EL, ES); break;
                 case FK_ENUM: snprintf(elem_from, sizeof(elem_from), "%%s.AsInt(0)"); break;
                 case FK_FLOAT: snprintf(elem_from, sizeof(elem_from), "(%.*s)%%s.AsDouble(0.0)", EL, ES); break;
                 case FK_BOOL: snprintf(elem_from, sizeof(elem_from), "%%s.AsBool(false)"); break;
@@ -714,6 +732,7 @@ static void jg_gen_fields(jg_ctx_t *c, jg_buf_t *out, zan_istr_t cls_name,
             /* tree (serialize) direction */
             switch (fk) {
             case FK_INT:
+            case FK_LONG:
                 jg_putf(out,
                     "        v.Put(\"%.*s\", JsonValue.NewNum("
                     "Convert.ToString(o.%.*s)));\n",
@@ -757,6 +776,7 @@ static void jg_gen_fields(jg_ctx_t *c, jg_buf_t *out, zan_istr_t cls_name,
                 char elem_to[256];
                 switch (ek) {
                 case FK_INT:
+                case FK_LONG:
                 case FK_FLOAT:
                     snprintf(elem_to, sizeof(elem_to),
                              "JsonValue.NewNum(Convert.ToString(%%s))");
@@ -803,6 +823,7 @@ static void jg_gen_fields(jg_ctx_t *c, jg_buf_t *out, zan_istr_t cls_name,
                 char elem_to[256];
                 switch (ek) {
                 case FK_INT:
+                case FK_LONG:
                 case FK_FLOAT: snprintf(elem_to, sizeof(elem_to), "JsonValue.NewNum(Convert.ToString(%%s))"); break;
                 case FK_ENUM: snprintf(elem_to, sizeof(elem_to), "JsonValue.NewNum(Convert.ToString((int)%%s))"); break;
                 case FK_BOOL: snprintf(elem_to, sizeof(elem_to), "JsonValue.NewBool(%%s)"); break;

@@ -2,7 +2,7 @@
  *
  * For M1 this generates code for:
  *   - Static Main() method as program entry point
- *   - Console.WriteLine() calls â†’ zan_rt_println / printf
+ *   - Console.WriteLine() calls â†?zan_rt_println / printf
  *   - Integer and floating-point arithmetic
  *   - Local variable declarations and assignments
  *   - Control flow (if, while, for)
@@ -739,7 +739,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
     g->fn_printf = printf_fn;
     g->printf_type = printf_type;
 
-    /* declare zan_rt_println(const char*) â†’ calls printf("%s\n", str) */
+    /* declare zan_rt_println(const char*) â†?calls printf("%s\n", str) */
     LLVMTypeRef println_args[] = { LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0) };
     LLVMTypeRef println_type = LLVMFunctionType(
         LLVMVoidTypeInContext(g->ctx), println_args, 1, 0);
@@ -767,7 +767,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
     zan_call2(g->builder, printf_type, printf_fn, iargs, 2, "");
     LLVMBuildRetVoid(g->builder);
 
-    /* declare zan_rt_print_uint(uint64) â€” unsigned (%llu) println for ulong */
+    /* declare zan_rt_print_uint(uint64) â€?unsigned (%llu) println for ulong */
     g->rt_print_uint = LLVMAddFunction(g->mod, "zan_rt_print_uint", pint_type);
 
     LLVMBasicBlockRef puint_entry = LLVMAppendBasicBlockInContext(g->ctx, g->rt_print_uint, "entry");
@@ -810,13 +810,13 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
     LLVMTypeRef free_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), free_args, 1, 0);
     g->fn_free = LLVMAddFunction(g->mod, "free", free_type);
 
-    /* void exit(int) â€” used by runtime-check panics */
+    /* void exit(int) â€?used by runtime-check panics */
     LLVMTypeRef exit_args[] = { i32 };
     g->exit_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), exit_args, 1, 0);
     g->fn_exit = LLVMAddFunction(g->mod, "exit", g->exit_type);
 
     if (g->check_leaks) {
-        /* int atexit(void(*)(void)) â€” used to schedule the leak report */
+        /* int atexit(void(*)(void)) â€?used to schedule the leak report */
         LLVMTypeRef void_fn_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), NULL, 0, 0);
         LLVMTypeRef void_fn_ptr = LLVMPointerType(void_fn_type, 0);
         LLVMTypeRef atexit_args[] = { void_fn_ptr };
@@ -920,7 +920,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
     g->uses_socket_async = false;
 
     /* Emit the cooperative coroutine driver inline (the whole Zan runtime is
-     * emitted into the module, so produced programs are self-contained â€” see
+     * emitted into the module, so produced programs are self-contained â€?see
      * the ARC/List helpers below). The ready queue is a singly-linked FIFO of
      * malloc'd nodes {next, frame, step}; zan_co_ready appends, zan_co_sched_run
      * drains, popping+freeing a node before invoking its step (which may itself
@@ -1725,7 +1725,7 @@ static LLVMTypeRef map_type(zan_irgen_t *g, zan_type_t *type) {
     case TYPE_BOOL:   return LLVMInt1TypeInContext(g->ctx);
     case TYPE_BYTE:   return LLVMInt8TypeInContext(g->ctx);
     case TYPE_SHORT:  return LLVMInt16TypeInContext(g->ctx);
-    case TYPE_INT:    return LLVMInt64TypeInContext(g->ctx);
+    case TYPE_INT:    return LLVMInt32TypeInContext(g->ctx);
     case TYPE_LONG:   return LLVMInt64TypeInContext(g->ctx);
     case TYPE_SBYTE:  return LLVMInt64TypeInContext(g->ctx);
     case TYPE_USHORT: return LLVMInt64TypeInContext(g->ctx);
@@ -1940,7 +1940,7 @@ static void register_struct_type(zan_irgen_t *g, zan_symbol_t *sym) {
     /* Create and register the named struct *before* resolving field types,
      * so that a self- or mutually-referential class field (a pointer to this
      * type) resolves to `%struct.X*` via map_type instead of falling back to
-     * i8* â€” which produced type-mismatched IR (rejected under typed pointers). */
+     * i8* â€?which produced type-mismatched IR (rejected under typed pointers). */
     char name_buf[256];
     snprintf(name_buf, sizeof(name_buf), "struct.%.*s", (int)sym->name.len, sym->name.str);
     LLVMTypeRef st = LLVMStructCreateNamed(g->ctx, name_buf);
@@ -2150,7 +2150,7 @@ static local_var_t *local_find(local_scope_t *scope, zan_istr_t name) {
  * classes with a member layout. List and StringBuilder now carry the same
  * 16-byte rc header (allocated via zan_rt_alloc) and participate in ARC like
  * classes; Dict remains header-less (its backing buffers are still not
- * reclaimed) so ARC must continue to exclude it by name â€” retaining/releasing a
+ * reclaimed) so ARC must continue to exclude it by name â€?retaining/releasing a
  * header-less struct reads a refcount at obj-16 that lands in unrelated heap
  * memory and corrupts it. */
 static int is_builtin_collection_type(zan_type_t *t) {
@@ -2304,6 +2304,26 @@ static LLVMValueRef load_struct_from_slot(zan_irgen_t *g, LLVMValueRef slot_ptr,
     return LLVMBuildLoad2(g->builder, st, sp, "slot.struct");
 }
 
+/* Widen a narrow integer element into an i64 collection slot: zero-extend
+ * unsigned element types and sign-extend signed ones, so a stored value
+ * round-trips with its numeric meaning (a bool stays 1, not the -1 that a bare
+ * i1 sign-extension would yield). */
+static LLVMValueRef extend_int_for_slot(zan_irgen_t *g, LLVMValueRef v,
+                                        zan_type_t *elem_type,
+                                        LLVMTypeRef slot_ty) {
+    int uns = 0;
+    if (elem_type) {
+        switch (elem_type->kind) {
+        case TYPE_BOOL: case TYPE_BYTE: case TYPE_USHORT:
+        case TYPE_UINT: case TYPE_ULONG: case TYPE_CHAR:
+            uns = 1; break;
+        default: break;
+        }
+    }
+    return uns ? LLVMBuildZExt(g->builder, v, slot_ty, "slot.zx")
+               : LLVMBuildSExt(g->builder, v, slot_ty, "slot.sx");
+}
+
 /* Store `value` into a collection slot, retaining the new occupant when needed
  * and releasing the old occupant when overwrite_old is true.
  *
@@ -2340,7 +2360,7 @@ static void emit_collection_slot_store(zan_irgen_t *g, zan_type_t *elem_type,
             stored = LLVMBuildPtrToInt(g->builder, stored, slot_ty, "slot.pi");
         } else if (val_k == LLVMIntegerTypeKind &&
                    LLVMGetIntTypeWidth(LLVMTypeOf(stored)) < 64) {
-            stored = LLVMBuildSExt(g->builder, stored, slot_ty, "slot.sx");
+            stored = extend_int_for_slot(g, stored, elem_type, slot_ty);
         } else if (val_k == LLVMDoubleTypeKind) {
             /* double element packed into an i64 slot: bitcast, not fptoint. */
             stored = LLVMBuildBitCast(g->builder, stored, slot_ty, "slot.fb");

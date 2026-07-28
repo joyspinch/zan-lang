@@ -1005,8 +1005,19 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
 
             LLVMBasicBlockRef case_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "sw.case");
             LLVMValueRef case_val = emit_expr(g, sc->switch_case.pattern, locals);
-            /* case label must match the switch operand's integer width */
-            coerce_int_pair(g, &switch_val, &case_val);
+            /* A case label is an integer constant; fit it to the switch
+             * operand's width with a *constant* cast. Widening the operand
+             * instead (coerce_int_pair) would build a sext into this block,
+             * which LLVMBuildSwitch has already terminated, leaving the
+             * terminator no longer last -- invalid IR whenever the literal's
+             * width (i64) differs from the operand's (e.g. i32 `int`). */
+            LLVMTypeRef swty = LLVMTypeOf(switch_val);
+            if (LLVMGetTypeKind(LLVMTypeOf(case_val)) == LLVMIntegerTypeKind &&
+                LLVMGetTypeKind(swty) == LLVMIntegerTypeKind &&
+                LLVMTypeOf(case_val) != swty) {
+                long long cv = LLVMConstIntGetSExtValue(case_val);
+                case_val = LLVMConstInt(swty, (unsigned long long)cv, 1);
+            }
             LLVMAddCase(sw, case_val, case_bb);
 
             LLVMPositionBuilderAtEnd(g->builder, case_bb);

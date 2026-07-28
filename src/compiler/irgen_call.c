@@ -2287,6 +2287,13 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                     LLVMValueRef data_field = LLVMBuildStructGEP2(g->builder, g->list_struct_type, list_ptr, 2, "df");
                     LLVMValueRef data = LLVMBuildLoad2(g->builder, LLVMPointerType(i64, 0), data_field, "data");
                     LLVMValueRef idx = emit_expr(g, expr->call.args.items[0], locals);
+                    /* the index is `int` (i32); all buffer/word math below is
+                     * i64, and the loop counter is stored into an i64 slot, so
+                     * widen it here rather than store a half word. */
+                    if (LLVMGetTypeKind(LLVMTypeOf(idx)) == LLVMIntegerTypeKind &&
+                        LLVMGetIntTypeWidth(LLVMTypeOf(idx)) < 64) {
+                        idx = LLVMBuildSExt(g->builder, idx, i64, "idx.sx");
+                    }
                     unsigned rwords = elem_slot_words(g, container_elem_type(ltype));
                     LLVMValueRef widx = slot_word_index(g, idx, rwords);
                     LLVMValueRef removed_ptr = LLVMBuildGEP2(g->builder, i64, data, &widx, 1, "rmp");
