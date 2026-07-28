@@ -110,6 +110,8 @@ static void emit_main_method(zan_irgen_t *g, zan_ast_node_t *method, zan_symbol_
     g->throw_locals_base = 0;
     g->catch_cleanup_count = 0;
     g->throw_catch_base = 0;
+    g->finally_count = 0;
+    g->finally_loop_base = 0;
     g->current_type_sym = type_sym;
     g->current_this = NULL;
     g->current_fn_body = method->method_decl.body;
@@ -547,6 +549,12 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
                 fields[ASYNC_FRAME_CEXC] = LLVMArrayType(i8ptr, ASYNC_MAX_HANDLERS);
                 fields[ASYNC_FRAME_CEXC_OWNED] = LLVMArrayType(i32, ASYNC_MAX_HANDLERS);
                 fields[ASYNC_FRAME_CEXC_TID] = LLVMArrayType(i8ptr, ASYNC_MAX_HANDLERS);
+                fields[ASYNC_FRAME_FINEXC] =
+                    LLVMArrayType(i8ptr, ZAN_MAX_FINALLY_DEPTH);
+                fields[ASYNC_FRAME_FINEXC_OWNED] =
+                    LLVMArrayType(i32, ZAN_MAX_FINALLY_DEPTH);
+                fields[ASYNC_FRAME_FINEXC_TID] =
+                    LLVMArrayType(i8ptr, ZAN_MAX_FINALLY_DEPTH);
                 for (int k = 0; k < total_params; k++) {
                     fields[ASYNC_FRAME_FIRST_PARAM + k] = param_types[k];
                 }
@@ -849,9 +857,13 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
             int saved_throw_base = g->throw_locals_base;
             int saved_catch_cc = g->catch_cleanup_count;
             int saved_throw_cb = g->throw_catch_base;
+            int saved_fin_c = g->finally_count;
+            int saved_fin_lb = g->finally_loop_base;
             g->throw_locals_base = 0;
             g->catch_cleanup_count = 0;
             g->throw_catch_base = 0;
+            g->finally_count = 0;
+            g->finally_loop_base = 0;
             g->current_this = is_static ? NULL : res_this;
             g->current_type_sym = type_sym;
             g->current_async_frame = sframe;
@@ -911,6 +923,8 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
             g->throw_locals_base = saved_throw_base;
             g->catch_cleanup_count = saved_catch_cc;
             g->throw_catch_base = saved_throw_cb;
+            g->finally_count = saved_fin_c;
+            g->finally_loop_base = saved_fin_lb;
             g->current_this = saved_this;
             g->current_type_sym = saved_type_sym;
             g->current_async_frame = saved_async_frame;
@@ -1013,9 +1027,13 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
         int saved_throw_base = g->throw_locals_base;
         int saved_catch_cc = g->catch_cleanup_count;
         int saved_throw_cb = g->throw_catch_base;
+        int saved_fin_c = g->finally_count;
+        int saved_fin_lb = g->finally_loop_base;
         g->throw_locals_base = 0;
         g->catch_cleanup_count = 0;
         g->throw_catch_base = 0;
+        g->finally_count = 0;
+        g->finally_loop_base = 0;
         g->current_this = is_static ? NULL : this_alloca;
         g->current_type_sym = type_sym;
         g->current_fn_body = member->method_decl.body;
@@ -1098,6 +1116,8 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
         g->throw_locals_base = saved_throw_base;
         g->catch_cleanup_count = saved_catch_cc;
         g->throw_catch_base = saved_throw_cb;
+        g->finally_count = saved_fin_c;
+        g->finally_loop_base = saved_fin_lb;
         g->current_this = saved_this;
         g->current_type_sym = saved_type_sym;
         g->current_fn_body = saved_fn_body;
@@ -1490,9 +1510,13 @@ static void emit_method_spec_body(zan_irgen_t *g, int idx) {
     int saved_throw_base = g->throw_locals_base;
     int saved_catch_cc = g->catch_cleanup_count;
     int saved_throw_cb = g->throw_catch_base;
+    int saved_fin_c = g->finally_count;
+    int saved_fin_lb = g->finally_loop_base;
     g->throw_locals_base = 0;
     g->catch_cleanup_count = 0;
     g->throw_catch_base = 0;
+    g->finally_count = 0;
+    g->finally_loop_base = 0;
     g->current_this = NULL;
     g->current_type_sym = sp.type_sym;
     g->current_fn_body = member->method_decl.body;
@@ -1536,6 +1560,8 @@ static void emit_method_spec_body(zan_irgen_t *g, int idx) {
     g->throw_locals_base = saved_throw_base;
     g->catch_cleanup_count = saved_catch_cc;
     g->throw_catch_base = saved_throw_cb;
+    g->finally_count = saved_fin_c;
+    g->finally_loop_base = saved_fin_lb;
     g->current_this = saved_this;
     g->current_type_sym = saved_type_sym;
     g->current_fn_body = saved_fn_body;

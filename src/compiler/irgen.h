@@ -26,6 +26,9 @@ typedef struct {
 /* Nesting depth of catch bodies a single function body may be inside. */
 #define ZAN_MAX_CATCH_DEPTH 16
 
+/* Nesting depth of try/finally regions a single function body may be inside. */
+#define ZAN_MAX_FINALLY_DEPTH 16
+
 struct zan_irgen {
     zan_arena_t *arena;
     zan_diag_t *diag;
@@ -130,6 +133,24 @@ struct zan_irgen {
     /* catch_cleanups entries entered inside the innermost enclosing try body:
      * a `throw` unwinds past exactly those handlers */
     int throw_catch_base;
+
+    /* `finally` bodies of the try statements currently being emitted, innermost
+     * last. C# runs a finally on EVERY way out of its try, but this lowering
+     * has no landing pads to hang cleanups off, so each exit path emits the
+     * body inline: `return` runs all of them, `break`/`continue` the ones
+     * entered inside the loop (from finally_loop_base up), and an exception
+     * with no matching clause runs this try's own before rethrowing. */
+    struct {
+        zan_ast_node_t *body;   /* the finally block's AST */
+        bool in_try_body;       /* emitting the guarded body: a throw here is
+                                 * taken by this try's own handler, which runs
+                                 * the finally itself. False while emitting a
+                                 * catch (or the finally), where a throw leaves
+                                 * the region and must run it at the throw site. */
+    } finallys[ZAN_MAX_FINALLY_DEPTH];
+    int finally_count;
+    /* finallys entered inside the innermost loop: break/continue run only those */
+    int finally_loop_base;
 
     /* constructors */
     struct zan_ctor_entry {

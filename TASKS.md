@@ -1238,8 +1238,67 @@ gdb 栈顶正是 `__zan_eh_tmp_grow` 里的 `realloc` → `RtlFreeHeap`（另一
   handler。chunk 存储只消除了内存安全回归，没有解决「每个协程应有独立 handler 栈」。
   出路：协程/帧持有 EH 状态，或修好生成代码的 TLS。
 * async 帧的 catch 槽仍是固定 `ASYNC_MAX_HANDLERS`（8）。
-* `try { throw ... } finally { ... }`（无 catch）**吞异常**：finally 只跑最内层一层，
-  函数直接返回 0，异常没有继续往外传（C# 语义是 finally 跑完继续传播）。独立 bug，单独修。
+* ~~`try { throw ... } finally { ... }`（无 catch）**吞异常**~~ —— 见 A21，已修。
+
+---
+
+## A21 — `finally` 只在正常退出时跑：异常被吞、return/break/continue 跳过它（已修）
+
+现象（`_scratch/fin1.zan`，修前）：
+```
+inner try
+inner finally        <- 只有这一层跑了
+outer caught u       <- Boom 被吞掉，外层根本没收到
+ret 7                <- return 直接走，finally 没跑
+loop 0
+loop finally 0       <- break/continue 那两轮的 finally 全没跑
+done
+```
+
+根因（`src/compiler/irgen_stmt.c`，`AST_TRY_STMT` 降级）：`finally_body` 只在
+`try.end` 这一个基本块前发射，而 `try.end` 只有**正常落出**才会到。其它三条出路
+都绕开它：
+* 没有匹配 clause 的异常走 `rethrow_bb` → 直接 longjmp 到外层 handler；
+  无 catch clause 的 `try/finally` 更糟——`catch_bb` 释放掉异常后 br 到 `try.end`，
+  等于把异常吞了当没抛过，函数照常返回。
+* `return` 直接发 `ret`；
+* `break`/`continue` 直接 br 到循环出口/步进块。
+
+这套降级是 setjmp/longjmp，没有 landingpad 可以挂 cleanup，所以 C# 的「每条出路
+都跑 finally」只能**在每条出路上内联一份 finally 体**：
+* `g->finallys[]`（`irgen.h`，深度上限 `ZAN_MAX_FINALLY_DEPTH`，超出报编译错误而不是
+  静默不跑）记录当前正在发射的 try 的 finally 体，`in_try_body` 标记当前发的是被保护体
+  还是 catch/finally 体——前者的 throw 由本 try 自己的 handler 接住（finally 由
+  handler 路径跑），后者的 throw 已经离开本区域，必须在 throw 点先跑本层 finally。
+* `emit_pending_finallys()`：`return` 跑全部；`break`/`continue` 跑
+  `finally_loop_base` 以上的（即在本循环内进入的那些）。发射第 i 份时把栈截断到 i，
+  所以 finally 里的 return 只跑更外层的 finally，不会自我递归。
+* `emit_finally_on_exception_path()` + `emit_eh_propagate_tail()`：rethrow 路径和
+  「无 catch clause」路径先跑本层 finally，再把在飞异常交给下一个外层 handler
+  （没有则报 unhandled 退出），不再落到会释放异常的 catch 收尾。
+  finally 体自己可能 try/catch，会覆盖 `__zan_eh_exc/_owned/_tid`，所以进 finally 前
+  存一份、出来再恢复。
+* async 体里这份存档不能放 alloca：finally 里 `await` 会从 `$resume` 返回，
+  alloca 内容作废。新增帧字段 `ASYNC_FRAME_FINEXC/_OWNED/_TID`
+  （`[ZAN_MAX_FINALLY_DEPTH]`，按 finally 区域深度索引）。
+* async 帧的 await 子槽是按扫描到的 await 数量分配的，finally 体被内联多份后
+  子槽会不够（症状是 `Invalid indices for GEP pointer type!`）。
+  `async_scan_stmt` 现在按份数扫 finally 体：份数 = 正常出口 + 异常出口 +
+  被保护体/handler 体里的 return/break/continue/throw 条数（`async_count_transfers`，
+  取上界，多算只多占帧字节）。
+
+实测（Windows）：
+* 新增 `tests/conformance/exception_finally_paths.zan`（无 catch 的穿透、不匹配
+  clause、两层嵌套 finally 顺序、catch 里 throw 触发本层 finally、return 值在
+  finally 前求值、catch 里 return、循环里 break/continue、finally 内分配对象）
+  23 行输出全对，`--check-leaks` 干净。
+* 新增 `tests/conformance/async_finally_paths.zan`（finally 体内 `await` 的异常
+  穿透、`return await` + finally、循环 continue + finally）输出全对，
+  `--check-leaks` 干净。
+* 子集 `ctest -R 'exception|throw|catch|async|try|await|leakcheck|generic|finally' -j8`
+  = **289/290，131.8 秒**；唯一失败 `conformance_async_concurrent_echo` 是 -j8 高负载
+  下的端口/调度抖动（单独连跑 5 轮 9/9 全过）。A20 时失败的
+  `leakcheck_sdk_wechat_product_modules` 现在也过了（另一个会话已修）。
 
 ---
 

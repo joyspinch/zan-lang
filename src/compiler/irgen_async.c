@@ -626,6 +626,51 @@ static void async_scan_expr(async_scan_t *s, zan_ast_node_t *e) {
     }
 }
 
+/* Count the statements that leave a try region early (each emits its own inline
+ * copy of the enclosing finally body, see emit_pending_finallys). Nested
+ * function bodies are not walked -- they carry their own finallys. */
+static int async_count_transfers(zan_ast_node_t *st) {
+    if (!st) return 0;
+    switch (st->kind) {
+    case AST_RETURN_STMT:
+    case AST_BREAK_STMT:
+    case AST_CONTINUE_STMT:
+    case AST_THROW_STMT:
+        return 1;
+    case AST_BLOCK: {
+        int n = 0;
+        for (int i = 0; i < st->block.stmts.count; i++)
+            n += async_count_transfers(st->block.stmts.items[i]);
+        return n;
+    }
+    case AST_IF_STMT:
+        return async_count_transfers(st->if_stmt.then_body) +
+               async_count_transfers(st->if_stmt.else_body);
+    case AST_WHILE_STMT:
+    case AST_DO_WHILE_STMT:
+        return async_count_transfers(st->while_stmt.body);
+    case AST_FOR_STMT:
+        return async_count_transfers(st->for_stmt.body);
+    case AST_FOREACH_STMT:
+        return async_count_transfers(st->foreach_stmt.body);
+    case AST_SWITCH_STMT: {
+        int n = 0;
+        for (int i = 0; i < st->switch_stmt.cases.count; i++)
+            n += async_count_transfers(st->switch_stmt.cases.items[i]->switch_case.body);
+        return n;
+    }
+    case AST_TRY_STMT: {
+        int n = async_count_transfers(st->try_stmt.try_body) +
+                async_count_transfers(st->try_stmt.finally_body);
+        for (int i = 0; i < st->try_stmt.catches.count; i++)
+            n += async_count_transfers(st->try_stmt.catches.items[i]->catch_clause.body);
+        return n;
+    }
+    default:
+        return 0;
+    }
+}
+
 /* Walk statements to collect named scalar locals (which must live in the frame)
  * and count await points anywhere in the body. */
 static void async_scan_stmt(async_scan_t *s, zan_ast_node_t *st) {
@@ -723,7 +768,20 @@ static void async_scan_stmt(async_scan_t *s, zan_ast_node_t *st) {
             }
             async_scan_stmt(s, cc->catch_clause.body);
         }
-        async_scan_stmt(s, st->try_stmt.finally_body);
+        /* The finally body is emitted once per exit path out of this try, and
+         * every copy of an `await` inside it needs its own frame sub-slot, so
+         * scan it once per copy: the normal exit, the exception path, and one
+         * for each early transfer in the guarded/handler bodies. Over-counting
+         * only costs frame bytes; under-counting hands out sub-slot indices past
+         * the end of the frame type. */
+        if (st->try_stmt.finally_body) {
+            int copies = 2 + async_count_transfers(st->try_stmt.try_body);
+            for (int i = 0; i < st->try_stmt.catches.count; i++)
+                copies += async_count_transfers(
+                    st->try_stmt.catches.items[i]->catch_clause.body);
+            for (int c = 0; c < copies; c++)
+                async_scan_stmt(s, st->try_stmt.finally_body);
+        }
         break;
     case AST_SWITCH_STMT:
         async_scan_expr(s, st->switch_stmt.expr);

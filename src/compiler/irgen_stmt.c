@@ -54,6 +54,140 @@ static void emit_eh_hook_call(zan_irgen_t *g, const char *name) {
     zan_call2(g->builder, fty, f, NULL, 0, "");
 }
 
+static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *locals);
+
+/* Run the `finally` bodies of the try statements this exit path leaves, from
+ * the innermost open one down to (and including) `base`. C# runs them on every
+ * way out of a try, and this lowering has nothing to hang a cleanup off, so the
+ * bodies are emitted inline once per exit path. While emitting body i the stack
+ * is truncated to i, so a `return` inside a finally runs only the finallys
+ * outside it -- never itself. */
+static void emit_pending_finallys(zan_irgen_t *g, local_scope_t *locals, int base) {
+    if (base < 0) base = 0;
+    int saved = g->finally_count;
+    for (int i = saved - 1; i >= base; i--) {
+        if (!g->finallys[i].body) continue;
+        int saved_locals = locals->count;
+        g->finally_count = i;
+        emit_stmt(g, g->finallys[i].body, locals);
+        locals->count = saved_locals;
+        if (LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder))) break;
+    }
+    g->finally_count = saved;
+}
+
+/* Run one try's finally body while an exception is in flight, then put the
+ * in-flight exception back: the body may run try/catch of its own, and that
+ * overwrites the exception globals. */
+static void emit_finally_on_exception_path(zan_irgen_t *g, local_scope_t *locals,
+                                           int fin_idx) {
+    if (fin_idx < 0 || !g->finallys[fin_idx].body) return;
+    LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMValueRef top_g, bufs_g, exc_g;
+    get_eh_globals(g, &top_g, &bufs_g, &exc_g);
+    LLVMValueRef own_g = get_eh_exc_owned_global(g);
+    LLVMValueRef tid_g = get_eh_exc_tid_global(g);
+    LLVMValueRef s_exc, s_own, s_tid;
+    if (g->current_async_frame && fin_idx < ZAN_MAX_FINALLY_DEPTH) {
+        /* the body may await, which returns from this $resume and leaves its
+         * allocas behind: keep the exception in the heap frame. Addressed from
+         * the entry block, like emit_entry_alloca, so the GEPs dominate the
+         * blocks the CPS split puts the reload in. */
+        LLVMValueRef idx[2] = { LLVMConstInt(i32t, 0, 0),
+                                LLVMConstInt(i32t, (unsigned)fin_idx, 0) };
+        LLVMBasicBlockRef cur_bb = LLVMGetInsertBlock(g->builder);
+        LLVMBasicBlockRef entry_bb =
+            LLVMGetEntryBasicBlock(LLVMGetBasicBlockParent(cur_bb));
+        LLVMValueRef entry_term = LLVMGetBasicBlockTerminator(entry_bb);
+        if (entry_term) LLVMPositionBuilderBefore(g->builder, entry_term);
+        else LLVMPositionBuilderAtEnd(g->builder, entry_bb);
+        s_exc = LLVMBuildGEP2(g->builder,
+            LLVMArrayType(i8ptr, ZAN_MAX_FINALLY_DEPTH),
+            LLVMBuildStructGEP2(g->builder, g->current_async_frame_type,
+                g->current_async_frame, ASYNC_FRAME_FINEXC, "fin.f"),
+            idx, 2, "fin.exc.slot");
+        s_own = LLVMBuildGEP2(g->builder,
+            LLVMArrayType(i32t, ZAN_MAX_FINALLY_DEPTH),
+            LLVMBuildStructGEP2(g->builder, g->current_async_frame_type,
+                g->current_async_frame, ASYNC_FRAME_FINEXC_OWNED, "fin.fo"),
+            idx, 2, "fin.own.slot");
+        s_tid = LLVMBuildGEP2(g->builder,
+            LLVMArrayType(i8ptr, ZAN_MAX_FINALLY_DEPTH),
+            LLVMBuildStructGEP2(g->builder, g->current_async_frame_type,
+                g->current_async_frame, ASYNC_FRAME_FINEXC_TID, "fin.ft"),
+            idx, 2, "fin.tid.slot");
+        LLVMPositionBuilderAtEnd(g->builder, cur_bb);
+    } else {
+        s_exc = emit_entry_alloca(g, i8ptr, "fin.exc");
+        s_own = emit_entry_alloca(g, i32t, "fin.own");
+        s_tid = emit_entry_alloca(g, i8ptr, "fin.tid");
+    }
+    zan_store_fit(g, LLVMBuildLoad2(g->builder, i8ptr, exc_g, "fin.exc.v"), s_exc);
+    zan_store_fit(g, LLVMBuildLoad2(g->builder, i32t, own_g, "fin.own.v"), s_own);
+    zan_store_fit(g, LLVMBuildLoad2(g->builder, i8ptr, tid_g, "fin.tid.v"), s_tid);
+    int saved_count = g->finally_count;
+    int saved_locals = locals->count;
+    g->finally_count = fin_idx;   /* the body must not re-run itself */
+    emit_stmt(g, g->finallys[fin_idx].body, locals);
+    locals->count = saved_locals;
+    g->finally_count = saved_count;
+    if (LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder))) return;
+    zan_store_fit(g, LLVMBuildLoad2(g->builder, i8ptr, s_exc, "fin.exc.r"), exc_g);
+    zan_store_fit(g, LLVMBuildLoad2(g->builder, i32t, s_own, "fin.own.r"), own_g);
+    zan_store_fit(g, LLVMBuildLoad2(g->builder, i8ptr, s_tid, "fin.tid.r"), tid_g);
+}
+
+/* A throw leaves every enclosing try whose handler is no longer armed for it
+ * (its catch or finally body is what is running); those finallys run at the
+ * throw site. The try whose handler will take the longjmp keeps its own: the
+ * catch path runs it. */
+static void emit_finallys_left_by_throw(zan_irgen_t *g, local_scope_t *locals) {
+    int base = g->finally_count;
+    while (base > 0 && !g->finallys[base - 1].in_try_body) base--;
+    for (int i = g->finally_count - 1; i >= base; i--) {
+        emit_finally_on_exception_path(g, locals, i);
+        if (LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder))) return;
+    }
+}
+
+/* Hand the in-flight exception (still in the globals) to the next outer
+ * handler, or report it unhandled and exit. */
+static void emit_eh_propagate_tail(zan_irgen_t *g) {
+    LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMValueRef top_g, bufs_g, exc_g;
+    get_eh_globals(g, &top_g, &bufs_g, &exc_g);
+    LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder));
+    LLVMValueRef rtop = LLVMBuildLoad2(g->builder, i32t, top_g, "reh.top");
+    LLVMValueRef rhas = zan_icmp(g->builder, LLVMIntSGE, rtop,
+        LLVMConstInt(i32t, 0, 0), "reh.has");
+    LLVMBasicBlockRef rjmp_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "reh.jmp");
+    LLVMBasicBlockRef rdie_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "reh.die");
+    LLVMBuildCondBr(g->builder, rhas, rjmp_bb, rdie_bb);
+    LLVMPositionBuilderAtEnd(g->builder, rjmp_bb);
+    /* an exception leaving this coroutine now travels through the frame (see
+     * emit_async_exc_epilogue), so the longjmp stays inside this invocation --
+     * no cross-frame unwinding here */
+    if (g->current_async_frame) emit_async_save_slots(g);
+    emit_eh_longjmp(g, emit_eh_buf_ptr(g, rtop));
+    LLVMBuildUnreachable(g->builder);
+    LLVMPositionBuilderAtEnd(g->builder, rdie_bb);
+    emit_eh_hook_call(g, "__zan_eh_unhandled");
+    LLVMValueRef printf_fn = LLVMGetNamedFunction(g->mod, "printf");
+    if (printf_fn) {
+        LLVMTypeRef printf_ty = LLVMFunctionType(i32t, &i8ptr, 1, 1);
+        LLVMValueRef fmt = LLVMBuildGlobalStringPtr(g->builder,
+            "Unhandled exception\n", "rexfmt");
+        zan_call2(g->builder, printf_ty, printf_fn, &fmt, 1, "");
+    }
+    LLVMTypeRef exit_ty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), &i32t, 1, 0);
+    LLVMValueRef exit_fn = get_libc_fn(g, "exit", exit_ty);
+    LLVMValueRef one = LLVMConstInt(i32t, 1, 0);
+    zan_call2(g->builder, exit_ty, exit_fn, &one, 1, "");
+    LLVMBuildUnreachable(g->builder);
+}
+
 static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *locals) {
     if (!stmt) return;
 
@@ -490,6 +624,21 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                 }
                 ri = coerce_to_i64(g, rv);
             }
+            /* C#: the return value is evaluated first, then every enclosing
+             * finally runs, then the function returns. Spill the value across
+             * them -- a finally body may `await`, which ends this invocation
+             * and leaves the SSA value behind. */
+            if (g->finally_count > 0) {
+                LLVMValueRef ri_slot = ri
+                    ? emit_entry_alloca(g, LLVMTypeOf(ri), "ret.fin.slot") : NULL;
+                if (ri_slot) zan_store_fit(g, ri, ri_slot);
+                emit_pending_finallys(g, locals, 0);
+                if (LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder)))
+                    break;   /* a finally left the function itself */
+                if (ri_slot)
+                    ri = LLVMBuildLoad2(g->builder, LLVMTypeOf(ri), ri_slot,
+                                        "ret.fin");
+            }
             emit_release_active_catch_excs(g, 0);
             emit_async_complete(g, locals, ri);
             break;
@@ -504,6 +653,16 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             if (is_rc_managed_type(ret_type) &&
                 !expr_yields_owned_rc_value(g, stmt->ret.value, locals)) {
                 emit_rc_retain_for_type(g, ret_type, val);
+            }
+            if (g->finally_count > 0) {
+                LLVMValueRef v_slot =
+                    emit_entry_alloca(g, LLVMTypeOf(val), "ret.fin.slot");
+                zan_store_fit(g, val, v_slot);
+                emit_pending_finallys(g, locals, 0);
+                if (LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder)))
+                    break;
+                val = LLVMBuildLoad2(g->builder, LLVMTypeOf(val), v_slot,
+                                     "ret.fin");
             }
             /* `return a;` where a is a local `new T[n]` buffer hands the
              * caller the array itself; the exit pass must leave its elements
@@ -543,6 +702,9 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             }
             LLVMBuildRet(g->builder, val);
         } else {
+            emit_pending_finallys(g, locals, 0);
+            if (LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder)))
+                break;
             emit_release_owned_locals(g, locals);
             emit_release_active_catch_excs(g, 0);
             /* A bare `return;` normally maps to `ret void`. The program entry
@@ -609,10 +771,12 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         LLVMBasicBlockRef saved_cont = g->continue_target;
         int saved_loop_base = g->loop_locals_base;
         int saved_loop_cbase = g->loop_catch_base;
+        int saved_loop_fbase = g->finally_loop_base;
         g->break_target = end_bb;
         g->continue_target = cond_bb;
         g->loop_locals_base = body_start;
         g->loop_catch_base = g->catch_cleanup_count;
+        g->finally_loop_base = g->finally_count;
 
         LLVMBuildBr(g->builder, cond_bb);
         LLVMPositionBuilderAtEnd(g->builder, cond_bb);
@@ -637,6 +801,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         g->continue_target = saved_cont;
         g->loop_locals_base = saved_loop_base;
         g->loop_catch_base = saved_loop_cbase;
+        g->finally_loop_base = saved_loop_fbase;
 
         LLVMPositionBuilderAtEnd(g->builder, end_bb);
         break;
@@ -664,10 +829,12 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         LLVMBasicBlockRef saved_cont = g->continue_target;
         int saved_loop_base = g->loop_locals_base;
         int saved_loop_cbase = g->loop_catch_base;
+        int saved_loop_fbase = g->finally_loop_base;
         g->break_target = end_bb;
         g->continue_target = step_bb;
         g->loop_locals_base = for_body_start;
         g->loop_catch_base = g->catch_cleanup_count;
+        g->finally_loop_base = g->finally_count;
 
         LLVMBuildBr(g->builder, cond_bb);
         LLVMPositionBuilderAtEnd(g->builder, cond_bb);
@@ -700,6 +867,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         g->continue_target = saved_cont;
         g->loop_locals_base = saved_loop_base;
         g->loop_catch_base = saved_loop_cbase;
+        g->finally_loop_base = saved_loop_fbase;
 
         LLVMPositionBuilderAtEnd(g->builder, end_bb);
         /* Drop the loop variables (and any owned init-clause locals) now that
@@ -710,6 +878,10 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
 
     case AST_BREAK_STMT:
         if (g->break_target) {
+            /* leaving every try entered inside this loop runs their finallys */
+            emit_pending_finallys(g, locals, g->finally_loop_base);
+            if (LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder)))
+                break;
             emit_release_owned_locals_range(g, locals, g->loop_locals_base);
             emit_release_active_catch_excs(g, g->loop_catch_base);
             LLVMBuildBr(g->builder, g->break_target);
@@ -718,6 +890,9 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
 
     case AST_CONTINUE_STMT:
         if (g->continue_target) {
+            emit_pending_finallys(g, locals, g->finally_loop_base);
+            if (LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder)))
+                break;
             emit_release_owned_locals_range(g, locals, g->loop_locals_base);
             emit_release_active_catch_excs(g, g->loop_catch_base);
             LLVMBuildBr(g->builder, g->continue_target);
@@ -943,7 +1118,21 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         int saved_throw_cbase = g->throw_catch_base;
         g->throw_locals_base = try_start;
         g->throw_catch_base = g->catch_cleanup_count;
+        /* open this try's finally region: every exit path out of the body and
+         * the catches below runs the finally before leaving (see
+         * emit_pending_finallys) */
+        int fin_idx = -1;
+        if (stmt->try_stmt.finally_body &&
+            g->finally_count < ZAN_MAX_FINALLY_DEPTH) {
+            fin_idx = g->finally_count++;
+            g->finallys[fin_idx].body = stmt->try_stmt.finally_body;
+            g->finallys[fin_idx].in_try_body = true;
+        } else if (stmt->try_stmt.finally_body) {
+            zan_diag_emit(g->diag, DIAG_ERROR, stmt->loc,
+                "too many nested try/finally blocks in one function body");
+        }
         emit_stmt(g, stmt->try_stmt.try_body, locals);
+        if (fin_idx >= 0) g->finallys[fin_idx].in_try_body = false;
         g->throw_locals_base = saved_throw_base;
         g->throw_catch_base = saved_throw_cbase;
         locals->count = try_start;
@@ -1148,43 +1337,23 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                 LLVMBuildBr(g->builder, rethrow_bb);
 
             /* rethrow: the exception object/owned/tid globals still hold the
-             * in-flight exception; jump to the next outer handler (this try's
-             * frame was already popped above) or die if none remains */
+             * in-flight exception; run this try's finally (C# runs it while
+             * unwinding), then jump to the next outer handler (this try's frame
+             * was already popped above) or die if none remains */
             LLVMPositionBuilderAtEnd(g->builder, rethrow_bb);
-            {
-                LLVMValueRef rtop = LLVMBuildLoad2(g->builder, i32t, top_g, "reh.top");
-                LLVMValueRef rhas = zan_icmp(g->builder, LLVMIntSGE, rtop,
-                    LLVMConstInt(i32t, 0, 0), "reh.has");
-                LLVMBasicBlockRef rjmp_bb =
-                    LLVMAppendBasicBlockInContext(g->ctx, fn, "reh.jmp");
-                LLVMBasicBlockRef rdie_bb =
-                    LLVMAppendBasicBlockInContext(g->ctx, fn, "reh.die");
-                LLVMBuildCondBr(g->builder, rhas, rjmp_bb, rdie_bb);
-                LLVMPositionBuilderAtEnd(g->builder, rjmp_bb);
-                /* an exception leaving this coroutine now travels through the
-                 * frame (see emit_async_exc_epilogue), so the longjmp stays
-                 * inside this invocation -- no cross-frame unwinding here */
-                if (g->current_async_frame)
-                    emit_async_save_slots(g);
-                emit_eh_longjmp(g, emit_eh_buf_ptr(g, rtop));
-                LLVMBuildUnreachable(g->builder);
-                LLVMPositionBuilderAtEnd(g->builder, rdie_bb);
-                LLVMValueRef printf_fn = LLVMGetNamedFunction(g->mod, "printf");
-                if (printf_fn) {
-                    LLVMTypeRef printf_ty = LLVMFunctionType(i32t, &i8ptr, 1, 1);
-                    LLVMValueRef fmt = LLVMBuildGlobalStringPtr(g->builder,
-                        "Unhandled exception\n", "rexfmt");
-                    zan_call2(g->builder, printf_ty, printf_fn, &fmt, 1, "");
-                }
-                LLVMTypeRef exit_ty = LLVMFunctionType(
-                    LLVMVoidTypeInContext(g->ctx), &i32t, 1, 0);
-                LLVMValueRef exit_fn = get_libc_fn(g, "exit", exit_ty);
-                LLVMValueRef one = LLVMConstInt(i32t, 1, 0);
-                zan_call2(g->builder, exit_ty, exit_fn, &one, 1, "");
-                LLVMBuildUnreachable(g->builder);
-            }
+            emit_finally_on_exception_path(g, locals, fin_idx);
+            if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder)))
+                emit_eh_propagate_tail(g);
 
             LLVMPositionBuilderAtEnd(g->builder, done_bb);
+        } else {
+            /* try/finally with no catch clause catches nothing: run the finally
+             * and hand the exception to the next outer handler. (Falling
+             * through to the epilogue below would release it and continue as if
+             * nothing had been thrown.) */
+            emit_finally_on_exception_path(g, locals, fin_idx);
+            if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder)))
+                emit_eh_propagate_tail(g);
         }
         locals->count = catch_start;
         if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder))) {
@@ -1229,6 +1398,9 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             LLVMBuildBr(g->builder, end_bb);
         }
 
+        /* the region is closed: the normal-exit copy of the finally below is
+         * the last one this try emits */
+        if (fin_idx >= 0) g->finally_count = fin_idx;
         LLVMPositionBuilderAtEnd(g->builder, end_bb);
         if (stmt->try_stmt.finally_body) {
             emit_stmt(g, stmt->try_stmt.finally_body, locals);
@@ -1358,10 +1530,12 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         LLVMBasicBlockRef fe_saved_cont = g->continue_target;
         int fe_saved_loop_base = g->loop_locals_base;
         int fe_saved_loop_cbase = g->loop_catch_base;
+        int fe_saved_loop_fbase = g->finally_loop_base;
         g->break_target = end_bb;
         g->continue_target = step_bb;
         g->loop_locals_base = fe_start;
         g->loop_catch_base = g->catch_cleanup_count;
+        g->finally_loop_base = g->finally_count;
 
         LLVMBuildBr(g->builder, cond_bb);
         LLVMPositionBuilderAtEnd(g->builder, cond_bb);
@@ -1419,6 +1593,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             g->continue_target = fe_saved_cont;
             g->loop_locals_base = fe_saved_loop_base;
             g->loop_catch_base = fe_saved_loop_cbase;
+            g->finally_loop_base = fe_saved_loop_fbase;
             LLVMPositionBuilderAtEnd(g->builder, end_bb);
             emit_release_owned_call_temp(g, stmt->foreach_stmt.collection,
                                          collection, locals);
@@ -1463,6 +1638,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         g->continue_target = fe_saved_cont;
         g->loop_locals_base = fe_saved_loop_base;
         g->loop_catch_base = fe_saved_loop_cbase;
+        g->finally_loop_base = fe_saved_loop_fbase;
 
         LLVMPositionBuilderAtEnd(g->builder, end_bb);
         /* an owned temporary collection (e.g. iterating a call result) is
@@ -1623,6 +1799,10 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                 }
             }
 throw_unwind:
+            /* a throw out of a catch (or finally) body leaves that try, so its
+             * finally runs here -- the longjmp below goes straight to an outer
+             * handler and would skip it */
+            emit_finallys_left_by_throw(g, locals);
             /* longjmp skips every scope-exit release between here and the
              * handler. An async body's locals live in its heap frame, which
              * the frame chain releases, so releasing this frame's abandoned

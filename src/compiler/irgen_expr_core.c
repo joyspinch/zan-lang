@@ -75,7 +75,15 @@ enum {
                                    * rethrows with the original dynamic type
                                    * even after an await (or a nested throw)
                                    * has overwritten the in-flight global */
-    ASYNC_FRAME_FIRST_PARAM = 15
+    ASYNC_FRAME_FINEXC = 15,      /* [ZAN_MAX_FINALLY_DEPTH x i8*]: the exception
+                                   * in flight across a `finally` body, indexed
+                                   * by the try's finally-region depth. A finally
+                                   * that awaits returns from this $resume, so
+                                   * the exception it has to re-raise afterwards
+                                   * cannot sit in an alloca. */
+    ASYNC_FRAME_FINEXC_OWNED = 16,/* [ZAN_MAX_FINALLY_DEPTH x i32] */
+    ASYNC_FRAME_FINEXC_TID = 17,  /* [ZAN_MAX_FINALLY_DEPTH x i8*] */
+    ASYNC_FRAME_FIRST_PARAM = 18
 };
 static LLVMValueRef coerce_to_i64(zan_irgen_t *g, LLVMValueRef v);
 static void emit_async_save_slots(zan_irgen_t *g);
