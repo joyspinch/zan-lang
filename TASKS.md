@@ -305,8 +305,8 @@ static extern int zan_gui_present(int hwnd, int surfaceId);
 
 ## A1 `Span<T>` 编译器内建 〔依赖 A0〕
 
-* **A1-1** `Span<T>` = `(nint base, int length)`，编译期知道 `T` 宽度；
-  `s[i]` 直接 lower 成 `getelementptr T` + load/store，不经过 `NativeMemory`；带 noalias。
+* **A1-1 ✅ 已完成（2026-07-28，commit `6ebffc1`）** `Span<T>` 为值类型 `{ i8* base, i64 len }`（`TYPE_STRUCT`，不入 ARC）；`arr.AsSpan([start[,len]])` 对紧凑数组零拷贝建视图，`s[i]` lower 成 `getelementptr T` + typed load/store（不经 `NativeMemory`），支持 `.Length` / `.Slice(start[,len])`，byte/int/long 宽度均验证。新增 conformance/determinism/leakcheck 用例 `span_intrinsic`（均绿）。
+  【待进】noalias 元数据未加（LLVM C API 不直接暴露，待后续）；传参/返回 Span 的 ABI 路径待 A2。
   **必须是编译器内建**，做成库类型 LLVM 看不穿，别名分析依然失败。
 * **A1-2** **删除** `NativeMemory` 的 `GetByte/GetU16/GetU32/GetI64/SetByte/…`
   整排 intrinsic，不留兼容层。
