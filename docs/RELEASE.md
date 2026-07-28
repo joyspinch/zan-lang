@@ -31,12 +31,11 @@ Today the version is duplicated and inconsistent:
 |------------------------------|---------------|
 | `src/compiler/main.c`        | `v0.1.0`      |
 | `src/lsp/lsp_main.c`         | `0.3.0`       |
-| `src/pkg/zanpkg_main.c`      | `0.1.0`       |
 
 **Target:** a single `VERSION` file at the repo root (e.g. `0.2.0`) is the only
 place the number is edited. The build injects it (via a generated
 `src/common/zan_version.h` `#define ZAN_VERSION "…"`) into every binary, so
-`zanc --version`, the LSP `initialize` result, `zanpkg`, and the IDE About box
+`zanc --version`, the LSP `initialize` result, and the IDE About box
 all report the same string. Tag releases as `v<VERSION>`.
 
 ---
@@ -52,7 +51,7 @@ all report the same string. Tag releases as `v<VERSION>`.
 | macOS x64     | `x86_64-apple-darwin`    | `ZanIDE`     | `libSDL3.dylib`  | Planned |
 
 Notes:
-- The **CLIs** (`zanc`, `zan-lsp`, `zan-dap`, `zanpkg`, `zanfmt`, `zandoc`) build
+- The **CLIs** (`zanc`, `zan-lsp`, `zan-dap`, `zanfmt`, `zandoc`) build
   natively on all three OSes today — `CMakeLists.txt` already has the non-Windows
   link path (`stdc++ m pthread`). Only the **IDE build recipe** (SDL3 GUI runtime
   + linking `ZanIDE.zan`) is currently Windows-only and must be ported.
@@ -79,7 +78,7 @@ zan-ide-<version>-<os>-<arch>/
     zanc[.exe]              #   the compiler (the IDE resolves it here)
     zan-lsp[.exe]           #   language server (completion/diagnostics)
     zan-dap[.exe]           #   debug adapter (breakpoints/stepping)
-    zanpkg[.exe] zanfmt[.exe] zandoc[.exe]
+    zanfmt[.exe] zandoc[.exe]
     <linker bundle>         #   win: ld.exe + mingw\ ; posix: system cc is used
     linux-musl/             #   cross sysroot for --target linux-* (all hosts)
     zanrt_io*, zanrt_sync*  #   runtime objects linked into user programs
@@ -136,7 +135,7 @@ TDM-GCC (bundled ld), and a staged SDL3 mingw-devel package (see
 ### 5.2 Linux / macOS (planned — recipe to implement)
 
 1. `cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release` with system clang +
-   LLVM → builds `zanc`, `zan-lsp`, `zan-dap`, `zanpkg`, `zanfmt`, `zandoc`.
+   LLVM → builds `zanc`, `zan-lsp`, `zan-dap`, `zanfmt`, `zandoc`.
 2. Build the native GUI runtime against the platform SDL3 (`libSDL3.so` /
    `libSDL3.dylib`) → `zan_gui.a`.
 3. `zanc src/ide_zan/ZanIDE.zan -o build/ZanIDE` linking `zan_gui.a` + SDL3.

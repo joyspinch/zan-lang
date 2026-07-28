@@ -499,7 +499,8 @@ Decisions: distribution stays as a relocatable folder (**no installer**).
   - Crash handler in the IDE (minidump / stack capture) + opt-in upload;
     surface compiler/runtime `zan_crash` reports the same way.
 - [ ] **P.4 — Stdlib / package store**
-  - A package registry ("store") browsable from the IDE, backed by `zanpkg`;
+  - A package registry ("store") browsable from the IDE (distribution
+    mechanism TBD — the standalone `zanpkg` CLI has been dropped);
     publish/install versioned stdlib extensions and third-party libraries.
 - [ ] **P.5 — Remaining gaps tracked elsewhere**
   - Linux/macOS self-contained linking + publish path (`SELF_CONTAINED_TOOLCHAIN.md` §4)

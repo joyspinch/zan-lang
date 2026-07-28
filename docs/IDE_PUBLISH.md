@@ -31,7 +31,7 @@ The script (`scripts/publish_ide.ps1`):
 | --------------- | -------------------------------------------------------------------- |
 | `ZanIDE.exe`    | The IDE.                                                             |
 | `SDL3.dll`      | SDL3 runtime the IDE window uses; must sit next to `ZanIDE.exe`.     |
-| `toolchain\`    | The compiler and everything it links with, as siblings: `zanc.exe`, `zan-lsp.exe`, `zan-dap.exe`, `zanpkg`/`zanfmt`/`zandoc`, the bundled linker (`ld.exe` + `mingw\` MinGW-w64 runtime), cross sysroots (`linux-musl\` …), runtime objects (`zanrt_io*`, `zanrt_sync*`), `zan_gui.lib`, and `debugger\bin\gdb.exe`. |
+| `toolchain\`    | The compiler and everything it links with, as siblings: `zanc.exe`, `zan-lsp.exe`, `zan-dap.exe`, `zanfmt`/`zandoc`, the bundled linker (`ld.exe` + `mingw\` MinGW-w64 runtime), cross sysroots (`linux-musl\` …), runtime objects (`zanrt_io*`, `zanrt_sync*`), `zan_gui.lib`, and `debugger\bin\gdb.exe`. |
 | `stdlib\`       | Standard library sources. `zanc` auto-includes what it needs.        |
 | `examples\`     | Sample programs for the IDE's Examples pane (optional).              |
 | `templates\`    | Built-in New Project templates (data-driven, `template.manifest`).   |

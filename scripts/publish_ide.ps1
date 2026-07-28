@@ -99,13 +99,13 @@ if (Test-Path $assetsIco) {
 # zanc finds its linker / sysroot / runtime objects as its own siblings (no
 # nested toolchain\toolchain). Companion CLIs (zan-lsp, zan-dap) live here too.
 #   compiler + CLIs : zanc.exe, zan-lsp.exe, zan-dap.exe,
-#                     zanpkg.exe, zanfmt.exe, zandoc.exe
+#                     zanfmt.exe, zandoc.exe
 #   linker bundle   : ld.exe, mingw\            (Windows self-contained linking)
 #   cross sysroot   : linux-musl\               (--target linux-* static ELF)
 #   runtime objects : zanrt_io*, zanrt_sync*    (socket-async / sync runtimes)
 Copy-Item $zancExe (Join-Path $distTc 'zanc.exe')
 foreach ($cli in @('zan-lsp.exe', 'zan-dap.exe',
-                   'zanpkg.exe', 'zanfmt.exe', 'zandoc.exe')) {
+                   'zanfmt.exe', 'zandoc.exe')) {
     $p = Join-Path $b $cli
     if (Test-Path $p) { Copy-Item $p (Join-Path $distTc $cli) }
     else { Write-Output "PUBLISH_WARN: missing build\$cli (skipped)" }
@@ -208,7 +208,7 @@ Contents
                    zanc.exe                the compiler
                    zan-lsp.exe             language server (for external editors)
                    zan-dap.exe             debug adapter (for external editors)
-                   zanpkg/zanfmt/zandoc    package / format / doc CLIs
+                   zanfmt/zandoc           format / doc CLIs
                    ld.exe, mingw\          bundled linker + MinGW-w64 runtime
                    linux-musl\             sysroot for --target linux-* builds
                    debugger\bin\gdb.exe    bundled native debugger (used by

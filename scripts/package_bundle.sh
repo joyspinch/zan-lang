@@ -22,7 +22,7 @@ rm -rf "$stage"
 mkdir -p "$stage/toolchain"
 
 # compiler + companion CLIs
-for exe in zanc zan-lsp zan-dap zanpkg zanfmt zandoc; do
+for exe in zanc zan-lsp zan-dap zanfmt zandoc; do
     [ -f "build/$exe" ] && cp "build/$exe" "$stage/toolchain/"
 done
 
@@ -48,7 +48,6 @@ This bundle ships the Zan compiler and CLIs as an SDK:
   toolchain/zanc         the compiler        (toolchain/zanc --version)
   toolchain/zan-lsp      language server
   toolchain/zan-dap      debug adapter
-  toolchain/zanpkg       package tool
   toolchain/zanfmt       formatter
   toolchain/zandoc       doc generator
   stdlib/ templates/ examples/

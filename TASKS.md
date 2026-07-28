@@ -119,7 +119,7 @@
   `zan_add` / `zan_icmp` 等包装（`irgen.c` 顶部），先把较窄的一侧符号扩展到较宽的一侧，
   否则每个 lowering 点都要手工扩展。`int` 仍是 i64，这批包装在当前位宽下是恒等变换。
   **实测**：把 `map_type` 的 `TYPE_INT` 临时改成 i32 后，编译器自身、全部 Zan 工具链
-  （zanfmt / zandoc / zanpkg）都能编过，`int_width` / `numeric_cast` 输出正确。
+  （zanfmt / zandoc）都能编过，`int_width` / `numeric_cast` 输出正确。
   **剩下的**：
 
   **A0-1 / A0-2 实测（2026-07-27）**：已把 Zan 侧 `extern` 与 C 侧 `EXPORT`
@@ -775,16 +775,15 @@ catch 块内的挂起、foreach 的降级与状态切分冲突。所以是**定�
   仍然报告最后一次失败。`DbProvider.Unknown` 表示"根本没到服务端"的失败。
   回归：`firebird_wire` / `sqlserver_tds` 已改为断言抛出。
 
-* **B3-1** **7 个连接池**（`DbPool` / `FirebirdPool` / `MySqlPool` / `PgPool` /
-  `SqlitePool` / `SqlServerPool` / `TDenginePool`，合计 39KB）逻辑完全一致：
-  懒增长到 maxSize、`Gate` 事件驱动等待、死连接剔除。字段一模一样
-  （`idle` / `liveCount` / `waiting` / `gate` / `closed`），连注释都复制了 7 遍
-  （`// coroutines currently parked in AcquireAsync`）。
-  `PgPool` 自己的文档注释写明了原因："Same contract as DbPool … **but typed**,
-  so the coroutine query API stays reachable"——即 `IDbExecutor` 只声明同步
-  `Query` / `Execute`，异步方法穿不过接口。
-  **合并成 `DbPool<TConn>` + `IAsyncDbConnection`。前置是 A7-1**，
-  因为它正需要"通过类型参数调用约束接口方法"这个当前会崩的能力。
+* **B3-1** ✅ 已完成（新增泛型 `PoolCore<T>`，`stdlib/System/Data/PoolCore.zan`）。
+  7 个驱动池（`DbPool` / `FirebirdPool` / `MySqlPool` / `PgPool` / `SqlitePool` /
+  `SqlServerPool` / `TDenginePool`）曾逻辑完全一致（懒增长到 maxSize、`Gate` 事件
+  驱动等待、死连接剔除，字段与注释复制 7 遍）。现在共享簿记（free list、
+  live/waiting 计数、唤醒 gate、closed 标志）收敛到 `PoolCore<T>`，各驱动池只保留
+  自己的 endpoint 参数和开连接方式并 delegate 给 core，各缩到 120~154 行。
+  `PoolCore` 从不碰连接本身（既不探活也不关闭），因而对任意连接类型（含接口
+  类型的 `DbPool`）都适用；驻留仍留在驱动池里（协作式单线程调度，free list 只在
+  await 点之间访问，无需锁）。前置 A7-1（实例泛型方法单态化）已解除。
 * **B3-2** 23 个超过 150 行的方法，最长 **1536 行**
   （`Widget/DataTable.Render.zan:327`），其次 829 行（`CodeEditor.Render.zan:229`）、
   561 行（`FilePicker.zan:492`）、467 行（`Gui/Event.zan:991`）。
@@ -845,6 +844,20 @@ header-only 库 / C 回调 / 结构体字段偏移，全部对应 A2 / A3 / A4�
 `pkg/zanpkg_main.c` 12KB、`fmt/zanfmt.c` 7KB、`common/rpc.c` 3KB。
 按规则这些既不是 compiler 也不是 runtime，全都该是 Zan。
 
+进度：
+* `zandoc` / `zanfmt` 已是 Zan（`src/doc` / `src/fmt` 由 `zanc` 从 `.zan` 源构建）。
+* **包管理器 `src/pkg` 已整体移除**（2026-07-28，`ae75d50`）：`src/pkg/zanpkg.zan`、
+  CMake 的 `zanpkg` 目标、`tool_zanpkg` 测试与 `tests/run_zanpkg.cmake` 一并删除。
+  `release.yml`、`docs/{RELEASE,ROADMAP,PRODUCTION_PLAN,IDE_PUBLISH}.md`、
+  `scripts/{package_bundle,publish_ide}` 里对 zanpkg CLI 的引用也已全部清除；包管理
+  不再走独立 CLI 这套模式（IDE 内包商店的分发机制另定）。注意 `scripts/pkg_stub.c`、
+  `scripts/pack_single.ps1`、`scripts/package_games.ps1` 里的 `ZANPKG1` 是**自包含
+  单 exe 的封包尾部魔数**，与包管理器无关，保留。
+* 仍在 C：`lsp/intellisense.c`、`lsp/lsp_main.c`、`dap/debugger.c`、`dap/dap_main.c`、
+  `common/json.c`、`common/rpc.c`（依赖 A6 编译器对外 API）。
+* 另有 `src/selfhost/`（lexer/parser/binder/checker/irgen*/main 等一整套 `.zan`）是
+  **自举编译器**分支，属 A6 的"终局自举"路线，独立于上面这批工具链迁移在推进。
+
 ## B7 runtime 边界复核
 
 `rt_io.c` 67KB、`rt_sync.c` 49KB、`rt_sched.c` / `rt_mem.c` / `rt_co.c` /
@@ -875,9 +888,11 @@ header-only 库 / C 回调 / 结构体字段偏移，全部对应 A2 / A3 / A4�
   不要用横幅代替维护。
 * **C4** ✅ 已删（2026-07-27）`STDLIB_DB_AARDIO_REF.md` 那 2 行只是一句
   "已被 `STDLIB_ZAN_DESIGN.md` 取代"，接替者本身已在开头写明这段历史，残桩删掉。
-* **C5** 3 份 bug 文档未纳入 git（`await-in-catch-loop.md`、
-  `dict-urldecode-key-corruption.md`、`throw-leaks-live-locals.md`），
-  连同各自的 `repro_*.zan` 一起提交（配合 A8）。
+* **C5** ✅ 已完成。3 份 bug 文档（`await-in-catch-loop.md`、
+  `dict-urldecode-key-corruption.md`、`throw-leaks-live-locals.md`）及各自的
+  `repro_*.zan` 均已纳入 git 跟踪（配合 A8）。另外 `docs/bugs/` 又新增了
+  `catch-no-type-matching.md`、`cross-module-base-class-field-binding.md`、
+  `O0-list-index-write-stack-leak.md` 三份（含 repro），一并已入 git。
 * **C6** `docs/bugs/*.md` 需要统一的状态字段。`generics-uniform-repr.md` 标了
   `Status: FIXED`，其余几份没有——读者无法判断哪些还有效。
   且这份 FIXED 需要按 A7 的实测结果更新：5/6 条确实已修，
