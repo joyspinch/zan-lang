@@ -362,6 +362,22 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             }
         }
 
+        /* An array variable initialized from a List (`string[] p = s.Split(",")`)
+         * reads a length header that is not there and indexes a List struct as
+         * if it were a buffer. Reject it rather than corrupting memory. */
+        if (type && type->kind == TYPE_ARRAY && stmt->var_decl.initializer) {
+            zan_type_t *it = infer_expr_type(g, stmt->var_decl.initializer, locals);
+            if (it && it->name.str &&
+                ((it->name.len == 4 && memcmp(it->name.str, "List", 4) == 0) ||
+                 (it->name.len == 10 && memcmp(it->name.str, "Dictionary", 10) == 0) ||
+                 (it->name.len == 4 && memcmp(it->name.str, "Dict", 4) == 0)))
+                zan_diag_emit(g->diag, DIAG_ERROR, stmt->loc,
+                    "cannot initialize an array from '%.*s': declare the "
+                    "variable as '%.*s' instead",
+                    (int)it->name.len, it->name.str,
+                    (int)it->name.len, it->name.str);
+        }
+
         local_add(locals, stmt->var_decl.name, alloca, type);
         if (arc_own) arc_own_local(g, locals);
         /* A local initialized with a freshly-built dict owns the dict's
