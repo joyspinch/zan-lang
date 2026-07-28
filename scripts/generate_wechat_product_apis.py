@@ -459,14 +459,19 @@ def generate_product(product, config):
     return {'modules': manifest, 'skipped': skipped, 'method_count': total}
 
 
-result = {}
-for product, config in PRODUCTS.items():
-    generated = generate_product(product, config)
-    result[product] = generated
-    print(product, 'modules=' + str(len(generated['modules'])),
-          'methods=' + str(generated['method_count']),
-          'skipped=' + str(len(generated['skipped'])))
+def main():
+    result = {}
+    for product, config in PRODUCTS.items():
+        generated = generate_product(product, config)
+        result[product] = generated
+        print(product, 'modules=' + str(len(generated['modules'])),
+              'methods=' + str(generated['method_count']),
+              'skipped=' + str(len(generated['skipped'])))
 
-manifest_path = ROOT / '_scratch/wechat_product_generated_manifest.json'
-manifest_path.parent.mkdir(parents=True, exist_ok=True)
-manifest_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding='utf-8')
+    manifest_path = ROOT / '_scratch/wechat_product_generated_manifest.json'
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding='utf-8')
+
+
+if __name__ == '__main__':
+    main()

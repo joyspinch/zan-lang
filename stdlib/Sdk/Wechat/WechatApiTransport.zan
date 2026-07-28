@@ -6,19 +6,22 @@ using System.Net.Http.Client;
 namespace Sdk.Wechat;
 
 /// <summary>
-/// 微信各产品线共用的 HTTPS / JSON 传输层。
-/// 产品客户端只负责取得对应 token；这里统一处理 query、HTTP verb、超时、
-/// JSON 响应和网络异常，不为 Work/WxOpen/Open 各复制一套 HttpClient。
+/// 微信各产品线共用的 HTTPS 传输层。支持 JSON、XML、multipart、二进制响应、
+/// 任意请求头以及需要 PEM 客户端证书的双向 TLS。
 /// </summary>
 class WechatApiTransport {
     string host;
     int port;
     int timeoutMs;
+    string clientCertificateFile;
+    string clientPrivateKeyFile;
 
     public WechatApiTransport(string host) {
         this.host = host;
         this.port = 443;
         this.timeoutMs = 30000;
+        this.clientCertificateFile = "";
+        this.clientPrivateKeyFile = "";
     }
 
     WechatApiTransport Server(string host, int port) {
@@ -29,6 +32,12 @@ class WechatApiTransport {
 
     WechatApiTransport Timeout(int ms) {
         this.timeoutMs = ms;
+        return this;
+    }
+
+    WechatApiTransport SetClientCertificate(string certFile, string keyFile) {
+        this.clientCertificateFile = certFile;
+        this.clientPrivateKeyFile = keyFile;
         return this;
     }
 
@@ -49,23 +58,58 @@ class WechatApiTransport {
         return path + sep + name + "=" + Encoding.UrlEncode(tokenValue);
     }
 
-    async WechatResponse RequestJsonAsync(string method, string path, string body) {
-        string raw = "";
+    async WechatRawResponse RequestRawAsync(string method, string path,
+                                             string body, string contentType,
+                                             List<string> headers) {
         try {
             HttpClient http = HttpClient.CreateHttps(this.host, this.port);
             http.SetTimeout(this.timeoutMs);
-            string payload = body;
-            if (method != "GET" && method != "DELETE" && payload.Length == 0) {
-                payload = "{}";
+            if (this.clientCertificateFile.Length > 0
+                && this.clientPrivateKeyFile.Length > 0) {
+                http.SetClientCertificate(this.clientCertificateFile,
+                                          this.clientPrivateKeyFile);
             }
-            if (payload.Length > 0) {
-                http.SetHeader("Content-Type", "application/json");
+            if (contentType.Length > 0) { http.SetHeader("Content-Type", contentType); }
+            int i = 0;
+            while (i < headers.Count) {
+                string line = headers[i];
+                int colon = WechatRawResponse.IndexOf(line, ":", 0);
+                if (colon > 0) {
+                    string name = line.Substring(0, colon);
+                    int start = colon + 1;
+                    while (start < line.Length && (line[start] & 255) == 32) {
+                        start = start + 1;
+                    }
+                    http.SetHeader(name, line.Substring(start));
+                }
+                i = i + 1;
             }
-            HttpResponse response = await http.SendAsync(method, path, payload);
-            raw = response.body;
+            HttpResponse response = await http.SendAsync(method, path, body);
+            return WechatRawResponse.FromHttp(response);
         } catch (Exception e) {
             throw new WechatException("client.networkError", e.Message, "");
         }
-        return WechatResponse.Parse(raw);
+    }
+
+    async WechatRawResponse RequestSimpleRawAsync(string method, string path,
+                                                   string body, string contentType) {
+        return await this.RequestRawAsync(method, path, body, contentType,
+                                          new List<string>());
+    }
+
+    async WechatResponse RequestJsonAsync(string method, string path, string body) {
+        string payload = body;
+        if (method != "GET" && method != "DELETE" && payload.Length == 0) {
+            payload = "{}";
+        }
+        WechatRawResponse raw = await this.RequestSimpleRawAsync(method, path, payload,
+                                                                  "application/json");
+        return WechatResponse.Parse(raw.Body);
+    }
+
+    async WechatRawResponse RequestMultipartAsync(string method, string path,
+                                                   WechatMultipart multipart) {
+        return await this.RequestSimpleRawAsync(method, path, multipart.Body(),
+                                                multipart.ContentType());
     }
 }

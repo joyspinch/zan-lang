@@ -1,0 +1,265 @@
+using System;
+using System.Json;
+using System.Security.Cryptography;
+using Sdk.Wechat;
+
+namespace Sdk.Wechat.TenPay;
+
+/// <summary>
+/// 微信支付 API v3 的 WECHATPAY2 签名、验签、平台证书轮换、敏感字段和通知解密客户端。
+/// </summary>
+class WechatPayV3Client {
+    WechatPayV3Config config;
+    WechatApiTransport transport;
+    RsaKey merchantKey;
+    WechatPayPlatformKeyStore platformKeys;
+
+    public WechatPayV3Client(WechatPayV3Config config) {
+        this.config = config;
+        this.transport = new WechatApiTransport("api.mch.weixin.qq.com");
+        this.merchantKey = RsaKey.FromPrivatePem(config.MerchantPrivateKeyPem);
+        if (this.merchantKey == null || !this.merchantKey.HasPrivateKey()) {
+            throw new ArgumentException("MerchantPrivateKeyPem 不是有效的 RSA 私钥");
+        }
+        this.platformKeys = new WechatPayPlatformKeyStore();
+        if (config.PlatformSerialNumber.Length > 0
+            && config.PlatformPublicKeyPem.Length > 0) {
+            this.platformKeys.Add(config.PlatformSerialNumber,
+                                  config.PlatformPublicKeyPem);
+        }
+    }
+
+    WechatPayV3Client Server(string host, int port) {
+        this.transport.Server(host, port); return this;
+    }
+    WechatPayV3Client Timeout(int ms) { this.transport.Timeout(ms); return this; }
+
+    WechatPayV3Client SetPlatformPublicKey(string serial,
+                                           string publicKeyOrCertificatePem) {
+        this.platformKeys.Add(serial, publicKeyOrCertificatePem);
+        this.config.PlatformSerialNumber = serial;
+        this.config.PlatformPublicKeyPem = publicKeyOrCertificatePem;
+        this.config.RequireResponseSignature = true;
+        return this;
+    }
+
+    bool HasPlatformPublicKey(string serial) {
+        return this.platformKeys.Contains(serial);
+    }
+
+    string GetPlatformPublicKeyPem(string serial) {
+        return this.platformKeys.Pem(serial);
+    }
+
+    string BuildAuthorization(string method, string target, string body,
+                              long timestamp, string nonce) {
+        string message = method + "\n" + target + "\n"
+            + Convert.ToString(timestamp) + "\n" + nonce + "\n" + body + "\n";
+        string signature = this.merchantKey.SignSha256(message);
+        return "WECHATPAY2-SHA256-RSA2048 mchid=\"" + this.config.MerchantId
+            + "\",nonce_str=\"" + nonce + "\",timestamp=\""
+            + Convert.ToString(timestamp) + "\",serial_no=\""
+            + this.config.MerchantSerialNumber + "\",signature=\""
+            + signature + "\"";
+    }
+
+    async WechatRawResponse RequestAsync(string method, string path,
+                                          string query, string body,
+                                          string contentType) {
+        string target = WechatApiTransport.BuildPath(path, query);
+        long timestamp = DateTime.UtcNow().ToUnixSeconds();
+        string nonceBytes = RandomNumberGenerator.GetBytes(16);
+        string nonce = Hex.Encode(nonceBytes, 16);
+        string authorization = this.BuildAuthorization(method, target, body,
+                                                        timestamp, nonce);
+        List<string> headers = new List<string>();
+        headers.Add("Authorization: " + authorization);
+        headers.Add("Accept: application/json");
+        headers.Add("User-Agent: zan-wechat-sdk/1.0");
+        WechatRawResponse response = await this.transport.RequestRawAsync(
+            method, target, body, contentType, headers);
+        if (!this.VerifyResponse(response)) {
+            throw new WechatException("tenpay.signatureInvalid",
+                "微信支付响应签名验证失败", response.Body);
+        }
+        return response;
+    }
+
+    async WechatRawResponse RequestJsonAsync(string method, string path,
+                                              string query, string jsonBody) {
+        return await this.RequestAsync(method, path, query, jsonBody,
+                                       "application/json");
+    }
+
+    async WechatRawResponse RequestMultipartAsync(string method, string path,
+                                                   string query,
+                                                   WechatMultipart multipart) {
+        string body = multipart.Body();
+        return await this.RequestAsync(method, path, query, body,
+                                       multipart.ContentType());
+    }
+
+    bool VerifyResponse(WechatRawResponse response) {
+        string timestamp = response.Header("Wechatpay-Timestamp");
+        string nonce = response.Header("Wechatpay-Nonce");
+        string signature = response.Header("Wechatpay-Signature");
+        string serial = response.Header("Wechatpay-Serial");
+        if (timestamp.Length == 0 || nonce.Length == 0 || signature.Length == 0) {
+            return !this.config.RequireResponseSignature;
+        }
+        RsaKey key = this.PlatformKey(serial);
+        if (key == null) { return !this.config.RequireResponseSignature; }
+        string message = timestamp + "\n" + nonce + "\n" + response.Body + "\n";
+        return key.VerifySha256(message, signature);
+    }
+
+    bool VerifyNotification(string timestamp, string nonce, string body,
+                            string signature, string serial) {
+        RsaKey key = this.PlatformKey(serial);
+        if (key == null) { return false; }
+        string message = timestamp + "\n" + nonce + "\n" + body + "\n";
+        return key.VerifySha256(message, signature);
+    }
+
+    static bool VerifyNotificationWithPublicKey(string timestamp, string nonce,
+                                                string body, string signature,
+                                                string serial,
+                                                string expectedSerial,
+                                                string publicKeyPem) {
+        if (expectedSerial.Length > 0 && serial != expectedSerial) { return false; }
+        RsaKey key = RsaKey.FromPublicPem(publicKeyPem);
+        if (key == null) { return false; }
+        string message = timestamp + "\n" + nonce + "\n" + body + "\n";
+        return key.VerifySha256(message, signature);
+    }
+
+    RsaKey PlatformKey(string serial) {
+        if (serial.Length > 0) { return this.platformKeys.Get(serial); }
+        if (this.config.PlatformSerialNumber.Length > 0) {
+            RsaKey configured = this.platformKeys.Get(
+                this.config.PlatformSerialNumber);
+            if (configured != null) { return configured; }
+        }
+        return this.platformKeys.First();
+    }
+
+    string DecryptResource(string ciphertextBase64, string nonce,
+                           string associatedData) {
+        return WechatPayV3Client.DecryptResourceWithKey(this.config.ApiV3Key,
+            ciphertextBase64, nonce, associatedData);
+    }
+
+    static string DecryptResourceWithKey(string apiKey, string ciphertextBase64,
+                                         string nonce, string associatedData) {
+        if (apiKey.Length != 32) {
+            throw new ArgumentException("API 密钥必须是 32 字节");
+        }
+        List<int> totalLen = new List<int>(); totalLen.Add(0);
+        string encrypted = Base64.Decode(ciphertextBase64, totalLen);
+        if (totalLen[0] < 16 || nonce.Length != 12) {
+            throw new ArgumentException("微信支付 AES-GCM 密文或 nonce 无效");
+        }
+        int cipherLen = totalLen[0] - 16;
+        string tag = encrypted.Substring(cipherLen, 16);
+        List<int> ok = new List<int>(); ok.Add(0);
+        string plain = AesGcm.Decrypt(apiKey, 32, nonce,
+            associatedData, associatedData.Length, encrypted, cipherLen, tag, ok);
+        if (ok[0] == 0) {
+            throw new WechatException("tenpay.decryptFailed",
+                                      "微信支付 AES-GCM 标签验证失败", "");
+        }
+        return plain.Substring(0, cipherLen);
+    }
+
+    string EncryptSensitive(string plaintext) {
+        return this.EncryptSensitiveWithSerial(plaintext,
+                                                this.config.PlatformSerialNumber);
+    }
+
+    string EncryptSensitiveWithSerial(string plaintext, string serial) {
+        RsaKey key = this.PlatformKey(serial);
+        if (key == null) {
+            throw new InvalidOperationException("请先配置微信支付平台公钥");
+        }
+        return key.EncryptOaepSha1(plaintext);
+    }
+
+    string SignAppMessage(string appId, string packageValue,
+                          long timestamp, string nonce) {
+        string message = appId + "\n" + Convert.ToString(timestamp) + "\n"
+            + nonce + "\n" + packageValue + "\n";
+        return this.merchantKey.SignSha256(message);
+    }
+
+    /// <summary>下载微信支付平台证书；algorithmType 为 RSA、SM2 或 ALL。</summary>
+    async WechatRawResponse DownloadCertificatesAsync(string algorithmType) {
+        string query = "";
+        if (algorithmType.Length > 0) {
+            query = "algorithm_type=" + algorithmType;
+        }
+        return await this.RequestJsonAsync("GET", "/v3/certificates", query, "");
+    }
+
+    /// <summary>下载并解密 RSA 平台证书，加入按序列号缓存。</summary>
+    async int RefreshPlatformCertificatesAsync(string algorithmType) {
+        WechatRawResponse response = await this.DownloadCertificatesAsync(algorithmType);
+        return this.LoadCertificatesResponse(response.Body);
+    }
+
+    /// <summary>装载 /v3/certificates 的 JSON 响应并返回新增/更新数量。</summary>
+    int LoadCertificatesResponse(string json) {
+        JsonValue root = JsonValue.Parse(json);
+        JsonValue data = root.Get("data");
+        if (data == null || !data.IsArray()) { return 0; }
+        int loaded = 0;
+        int i = 0;
+        while (i < data.Count()) {
+            JsonValue item = data.At(i);
+            if (item != null && item.IsObject()) {
+                string serial = item.Str("serial_no", "");
+                JsonValue encrypted = item.Get("encrypt_certificate");
+                if (serial.Length > 0 && encrypted != null
+                    && encrypted.IsObject()) {
+                    string algorithm = encrypted.Str("algorithm", "");
+                    if (algorithm.Length == 0 || algorithm == "AEAD_AES_256_GCM") {
+                        string pem = this.DecryptResource(
+                            encrypted.Str("ciphertext", ""),
+                            encrypted.Str("nonce", ""),
+                            encrypted.Str("associated_data", ""));
+                        this.SetPlatformPublicKey(serial, pem);
+                        loaded = loaded + 1;
+                    }
+                }
+            }
+            i = i + 1;
+        }
+        return loaded;
+    }
+
+    /// <summary>装载直接返回 public_key/public_key_id 的平台公钥 JSON。</summary>
+    int LoadPublicKeysResponse(string json) {
+        JsonValue root = JsonValue.Parse(json);
+        JsonValue data = root.Get("data");
+        if (data == null) { return 0; }
+        int loaded = 0;
+        if (data.IsArray()) {
+            int i = 0;
+            while (i < data.Count()) {
+                loaded = loaded + this.LoadPublicKeyItem(data.At(i));
+                i = i + 1;
+            }
+        } else {
+            loaded = this.LoadPublicKeyItem(data);
+        }
+        return loaded;
+    }
+
+    int LoadPublicKeyItem(JsonValue item) {
+        if (item == null || !item.IsObject()) { return 0; }
+        string serial = item.Str("public_key_id", item.Str("serial_no", ""));
+        string pem = item.Str("public_key", item.Str("pem", ""));
+        if (serial.Length == 0 || pem.Length == 0) { return 0; }
+        this.SetPlatformPublicKey(serial, pem);
+        return 1;
+    }
+}

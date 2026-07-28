@@ -1,0 +1,251 @@
+using System;
+using System.Net.Sockets;
+using System.Net.Tls;
+using System.Net.WebSocket;
+using System.Security.Cryptography;
+
+namespace System.Net.WebSocket.Secure;
+
+/// <summary>RFC 6455 WebSocket client over TLS with masked client frames.</summary>
+class WssClient {
+    [DllImport("crt")] static extern string calloc(int count, int size);
+    [DllImport("crt")] static extern void free(string ptr);
+
+    TcpClient conn;
+    TlsContext context;
+    TlsStream stream;
+    string host;
+    string path;
+    string pending;
+    bool connected;
+
+    WssClient() {
+        this.host = "";
+        this.path = "/";
+        this.pending = "";
+        this.connected = false;
+    }
+
+    static async WssClient ConnectAsync(string host, int port, string path) {
+        WssClient client = new WssClient();
+        client.host = host;
+        client.path = path;
+        client.conn = await TcpClient.ConnectAsync(host, port);
+        if (client.conn == null) { return client; }
+        client.context = TlsContext.CreateClient();
+        if (client.context == null) { client.conn.Close(); return client; }
+        client.stream = await TlsStream.ConnectAsync(client.context,
+                                                      client.conn.Sock(), host);
+        if (client.stream == null) {
+            client.conn.Close(); client.context.Free(); return client;
+        }
+
+        string keyBytes = RandomNumberGenerator.GetBytes(16);
+        string key = Base64.Encode(keyBytes, 16);
+        string request = "GET " + path + " HTTP/1.1\r\n"
+            + "Host: " + host + "\r\n"
+            + "Upgrade: websocket\r\n"
+            + "Connection: Upgrade\r\n"
+            + "Sec-WebSocket-Key: " + key + "\r\n"
+            + "Sec-WebSocket-Version: 13\r\n\r\n";
+        int sent = await client.stream.SendAsync(request, request.Length);
+        if (sent <= 0) { client.CloseNow(); return client; }
+
+        string response = "";
+        int headerEnd = -1;
+        while (headerEnd < 0) {
+            string chunk = await client.stream.RecvAsync(8192);
+            if (chunk.Length == 0) { client.CloseNow(); return client; }
+            response = response + chunk;
+            headerEnd = WssClient.IndexOf(response, "\r\n\r\n", 0);
+        }
+        if (response.Length < 12 || response.Substring(9, 3) != "101") {
+            client.CloseNow();
+            return client;
+        }
+        string acceptSource = key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+        string expectedAccept = Base64.Encode(
+            Sha1.Hash(acceptSource, acceptSource.Length), 20);
+        string actualAccept = WssClient.Header(response.Substring(0, headerEnd),
+                                               "Sec-WebSocket-Accept");
+        if (actualAccept != expectedAccept) {
+            client.CloseNow();
+            return client;
+        }
+        int bodyStart = headerEnd + 4;
+        if (bodyStart < response.Length) {
+            client.pending = response.Substring(bodyStart);
+        }
+        client.connected = true;
+        return client;
+    }
+
+    bool IsConnected() { return this.connected; }
+
+    async void SendText(string text) {
+        await this.SendFrame(WsOpcode.Text, text, text.Length);
+    }
+
+    async void SendBinary(string bytes, int len) {
+        await this.SendFrame(WsOpcode.Binary, bytes, len);
+    }
+
+    async void Ping() { await this.SendFrame(WsOpcode.Ping, "", 0); }
+
+    async string RecvText() {
+        while (this.connected) {
+            int total = this.FrameLength();
+            while (total < 0) {
+                string chunk = await this.stream.RecvAsync(65536);
+                if (chunk.Length == 0) { this.CloseNow(); return ""; }
+                this.pending = this.pending + chunk;
+                total = this.FrameLength();
+            }
+            WsFrame frame = WsFrame.Decode(this.pending, total);
+            if (total < this.pending.Length) {
+                this.pending = this.pending.Substring(total);
+            } else {
+                this.pending = "";
+            }
+            if (frame.opcode == WsOpcode.Close) {
+                this.CloseNow();
+                return "";
+            }
+            if (frame.opcode == WsOpcode.Ping) {
+                await this.SendFrame(WsOpcode.Pong, frame.payload, frame.payloadLen);
+            } else if (frame.opcode == WsOpcode.Text
+                       || frame.opcode == WsOpcode.Binary) {
+                return frame.payload;
+            }
+        }
+        return "";
+    }
+
+    async void Close() {
+        if (this.connected) {
+            await this.SendFrame(WsOpcode.Close, "", 0);
+        }
+        this.CloseNow();
+    }
+
+    async void SendFrame(int opcode, string payload, int payloadLen) {
+        if (!this.connected) { return; }
+        int ext = 0;
+        if (payloadLen > 65535) { ext = 8; }
+        else if (payloadLen > 125) { ext = 2; }
+        int headerLen = 2 + ext + 4;
+        string frame = calloc(headerLen + payloadLen + 1, 1);
+        frame[0] = 128 | opcode;
+        int pos = 2;
+        if (ext == 0) {
+            frame[1] = 128 | payloadLen;
+        } else if (ext == 2) {
+            frame[1] = 128 | 126;
+            frame[2] = (payloadLen >> 8) & 255;
+            frame[3] = payloadLen & 255;
+            pos = 4;
+        } else {
+            frame[1] = 128 | 127;
+            frame[2] = 0; frame[3] = 0; frame[4] = 0; frame[5] = 0;
+            frame[6] = (payloadLen >> 24) & 255;
+            frame[7] = (payloadLen >> 16) & 255;
+            frame[8] = (payloadLen >> 8) & 255;
+            frame[9] = payloadLen & 255;
+            pos = 10;
+        }
+        string mask = RandomNumberGenerator.GetBytes(4);
+        int i = 0;
+        while (i < 4) { frame[pos + i] = mask[i] & 255; i = i + 1; }
+        pos = pos + 4;
+        i = 0;
+        while (i < payloadLen) {
+            frame[pos + i] = (payload[i] & 255) ^ (mask[i % 4] & 255);
+            i = i + 1;
+        }
+        int sent = await this.stream.SendAsync(frame, headerLen + payloadLen);
+        free(frame);
+        if (sent <= 0) { this.CloseNow(); }
+    }
+
+    int FrameLength() {
+        if (this.pending.Length < 2) { return -1; }
+        int b1 = this.pending[1] & 255;
+        int payloadLen = b1 & 127;
+        int pos = 2;
+        if (payloadLen == 126) {
+            if (this.pending.Length < 4) { return -1; }
+            payloadLen = ((this.pending[2] & 255) << 8)
+                | (this.pending[3] & 255);
+            pos = 4;
+        } else if (payloadLen == 127) {
+            if (this.pending.Length < 10) { return -1; }
+            payloadLen = ((this.pending[6] & 255) << 24)
+                | ((this.pending[7] & 255) << 16)
+                | ((this.pending[8] & 255) << 8)
+                | (this.pending[9] & 255);
+            pos = 10;
+        }
+        if ((b1 & 128) != 0) { pos = pos + 4; }
+        int total = pos + payloadLen;
+        if (this.pending.Length < total) { return -1; }
+        return total;
+    }
+
+    void CloseNow() {
+        this.connected = false;
+        if (this.stream != null) { this.stream.Close(); this.stream = null; }
+        if (this.conn != null) { this.conn.Close(); this.conn = null; }
+        if (this.context != null) { this.context.Free(); this.context = null; }
+        this.pending = "";
+    }
+
+    static string Header(string headers, string name) {
+        int pos = WssClient.IndexOf(headers, "\r\n", 0);
+        if (pos < 0) { return ""; }
+        pos = pos + 2;
+        while (pos < headers.Length) {
+            int end = WssClient.IndexOf(headers, "\r\n", pos);
+            if (end < 0) { end = headers.Length; }
+            int colon = WssClient.IndexOf(headers, ":", pos);
+            if (colon > pos && colon < end) {
+                string current = headers.Substring(pos, colon - pos);
+                if (WssClient.AsciiEquals(current, name)) {
+                    int start = colon + 1;
+                    while (start < end && (headers[start] & 255) == 32) {
+                        start = start + 1;
+                    }
+                    return headers.Substring(start, end - start);
+                }
+            }
+            if (end >= headers.Length) { break; }
+            pos = end + 2;
+        }
+        return "";
+    }
+
+    static bool AsciiEquals(string a, string b) {
+        if (a.Length != b.Length) { return false; }
+        int i = 0;
+        while (i < a.Length) {
+            int x = a[i] & 255; int y = b[i] & 255;
+            if (x >= 65 && x <= 90) { x = x + 32; }
+            if (y >= 65 && y <= 90) { y = y + 32; }
+            if (x != y) { return false; }
+            i = i + 1;
+        }
+        return true;
+    }
+
+    static int IndexOf(string hay, string needle, int from) {
+        int last = hay.Length - needle.Length;
+        int i = from;
+        while (i <= last) {
+            int j = 0;
+            while (j < needle.Length
+                && (hay[i + j] & 255) == (needle[j] & 255)) { j = j + 1; }
+            if (j == needle.Length) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+}

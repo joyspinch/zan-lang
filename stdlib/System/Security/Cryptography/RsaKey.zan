@@ -1,0 +1,230 @@
+using System;
+
+namespace System.Security.Cryptography;
+
+/// <summary>
+/// RSA key material loaded from PEM (PKCS#1, PKCS#8 or SubjectPublicKeyInfo).
+/// The existing <see cref="Rsa"/> primitive works with modulus/exponent byte
+/// buffers; this class supplies the reusable PEM/DER decoding layer needed by
+/// signed HTTP protocols and database clients.
+/// </summary>
+class RsaKey {
+    [DllImport("crt")] static extern string calloc(int count, int size);
+
+    string modulus;
+    string publicExponent;
+    string privateExponent;
+    int modulusLength;
+    int publicExponentLength;
+    int privateExponentLength;
+
+    RsaKey() {
+        this.modulus = "";
+        this.publicExponent = "";
+        this.privateExponent = "";
+        this.modulusLength = 0;
+        this.publicExponentLength = 0;
+        this.privateExponentLength = 0;
+    }
+
+    int ModulusLength() { return this.modulusLength; }
+    bool HasPrivateKey() { return this.privateExponentLength > 0; }
+
+    static int Find(string hay, string needle, int from) {
+        int last = hay.Length - needle.Length;
+        int i = from;
+        while (i <= last) {
+            int j = 0;
+            while (j < needle.Length
+                && (hay[i + j] & 255) == (needle[j] & 255)) {
+                j = j + 1;
+            }
+            if (j == needle.Length) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    static string PemToDer(string pem, List<int> outLen) {
+        int begin = RsaKey.Find(pem, "-----BEGIN", 0);
+        if (begin < 0) { outLen[0] = 0; return null; }
+        int body = RsaKey.Find(pem, "\n", begin);
+        if (body < 0) { outLen[0] = 0; return null; }
+        body = body + 1;
+        int end = RsaKey.Find(pem, "-----END", body);
+        if (end < 0) { outLen[0] = 0; return null; }
+        string base64 = pem.Substring(body, end - body);
+        return Base64.Decode(base64, outLen);
+    }
+
+    static int ReadLength(string der, List<int> cursor) {
+        int b = der[cursor[0]] & 255;
+        cursor[0] = cursor[0] + 1;
+        if (b < 128) { return b; }
+        int bytes = b - 128;
+        int result = 0;
+        int i = 0;
+        while (i < bytes) {
+            result = (result << 8) | (der[cursor[0]] & 255);
+            cursor[0] = cursor[0] + 1;
+            i = i + 1;
+        }
+        return result;
+    }
+
+    static int Enter(string der, List<int> cursor, int tag) {
+        if ((der[cursor[0]] & 255) != tag) { return -1; }
+        cursor[0] = cursor[0] + 1;
+        int len = RsaKey.ReadLength(der, cursor);
+        return cursor[0] + len;
+    }
+
+    static string ReadIntegerSafe(string der, List<int> cursor, List<int> outLen) {
+        if ((der[cursor[0]] & 255) != 2) { outLen[0] = 0; return null; }
+        cursor[0] = cursor[0] + 1;
+        int rawLen = RsaKey.ReadLength(der, cursor);
+        int rawStart = cursor[0];
+        int start = rawStart;
+        int len = rawLen;
+        if (len > 1 && (der[start] & 255) == 0) {
+            start = start + 1;
+            len = len - 1;
+        }
+        string bytes = calloc(len + 1, 1);
+        int i = 0;
+        while (i < len) { bytes[i] = der[start + i] & 255; i = i + 1; }
+        cursor[0] = rawStart + rawLen;
+        outLen[0] = len;
+        return bytes;
+    }
+
+    static RsaKey ParsePkcs1Private(string der, int offset) {
+        List<int> c = new List<int>(); c.Add(offset);
+        if (RsaKey.Enter(der, c, 48) < 0) { return null; }
+        List<int> len = new List<int>(); len.Add(0);
+        string version = RsaKey.ReadIntegerSafe(der, c, len);
+        if (version == null) { return null; }
+        RsaKey key = new RsaKey();
+        key.modulus = RsaKey.ReadIntegerSafe(der, c, len);
+        key.modulusLength = len[0];
+        key.publicExponent = RsaKey.ReadIntegerSafe(der, c, len);
+        key.publicExponentLength = len[0];
+        key.privateExponent = RsaKey.ReadIntegerSafe(der, c, len);
+        key.privateExponentLength = len[0];
+        if (key.modulus == null || key.publicExponent == null
+            || key.privateExponent == null) { return null; }
+        return key;
+    }
+
+    static int SkipElement(string der, List<int> cursor) {
+        cursor[0] = cursor[0] + 1; // tag
+        int len = RsaKey.ReadLength(der, cursor);
+        int end = cursor[0] + len;
+        cursor[0] = end;
+        return end;
+    }
+
+    static RsaKey ParseSpkiPublic(string der, int offset) {
+        List<int> c = new List<int>(); c.Add(offset);
+        if (RsaKey.Enter(der, c, 48) < 0) { return null; }
+        if ((der[c[0]] & 255) != 48) { return null; }
+        int algorithmEnd = RsaKey.Enter(der, c, 48);
+        if (algorithmEnd < 0) { return null; }
+        c[0] = algorithmEnd;
+        if ((der[c[0]] & 255) != 3) { return null; }
+        c[0] = c[0] + 1;
+        int bitLen = RsaKey.ReadLength(der, c);
+        if (bitLen < 2) { return null; }
+        c[0] = c[0] + 1; // unused-bits byte
+        return RsaKey.ParsePkcs1Public(der, c[0]);
+    }
+
+    static RsaKey ParseCertificatePublic(string der) {
+        List<int> c = new List<int>(); c.Add(0);
+        if (RsaKey.Enter(der, c, 48) < 0) { return null; }
+        if (RsaKey.Enter(der, c, 48) < 0) { return null; } // tbsCertificate
+        if ((der[c[0]] & 255) == 160) { RsaKey.SkipElement(der, c); } // version [0]
+        RsaKey.SkipElement(der, c); // serialNumber
+        RsaKey.SkipElement(der, c); // signature
+        RsaKey.SkipElement(der, c); // issuer
+        RsaKey.SkipElement(der, c); // validity
+        RsaKey.SkipElement(der, c); // subject
+        return RsaKey.ParseSpkiPublic(der, c[0]);
+    }
+
+    static RsaKey ParsePkcs1Public(string der, int offset) {
+        List<int> c = new List<int>(); c.Add(offset);
+        if (RsaKey.Enter(der, c, 48) < 0) { return null; }
+        List<int> len = new List<int>(); len.Add(0);
+        RsaKey key = new RsaKey();
+        key.modulus = RsaKey.ReadIntegerSafe(der, c, len);
+        key.modulusLength = len[0];
+        key.publicExponent = RsaKey.ReadIntegerSafe(der, c, len);
+        key.publicExponentLength = len[0];
+        if (key.modulus == null || key.publicExponent == null) { return null; }
+        return key;
+    }
+
+    static RsaKey FromPrivatePem(string pem) {
+        List<int> derLen = new List<int>(); derLen.Add(0);
+        string der = RsaKey.PemToDer(pem, derLen);
+        if (der == null || derLen[0] < 8) { return null; }
+        List<int> c = new List<int>(); c.Add(0);
+        if (RsaKey.Enter(der, c, 48) < 0) { return null; }
+        List<int> tmp = new List<int>(); tmp.Add(0);
+        string version = RsaKey.ReadIntegerSafe(der, c, tmp);
+        if (version == null) { return null; }
+        if ((der[c[0]] & 255) == 2) {
+            return RsaKey.ParsePkcs1Private(der, 0);
+        }
+        if ((der[c[0]] & 255) != 48) { return null; }
+        int algorithmEnd = RsaKey.Enter(der, c, 48);
+        if (algorithmEnd < 0) { return null; }
+        c[0] = algorithmEnd;
+        if ((der[c[0]] & 255) != 4) { return null; }
+        c[0] = c[0] + 1;
+        int innerLen = RsaKey.ReadLength(der, c);
+        if (innerLen < 8) { return null; }
+        return RsaKey.ParsePkcs1Private(der, c[0]);
+    }
+
+    static RsaKey FromPublicPem(string pem) {
+        List<int> derLen = new List<int>(); derLen.Add(0);
+        string der = RsaKey.PemToDer(pem, derLen);
+        if (der == null || derLen[0] < 8) { return null; }
+        if (RsaKey.Find(pem, "BEGIN CERTIFICATE", 0) >= 0) {
+            return RsaKey.ParseCertificatePublic(der);
+        }
+        List<int> c = new List<int>(); c.Add(0);
+        if (RsaKey.Enter(der, c, 48) < 0) { return null; }
+        if ((der[c[0]] & 255) == 2) {
+            return RsaKey.ParsePkcs1Public(der, 0);
+        }
+        return RsaKey.ParseSpkiPublic(der, 0);
+    }
+
+    string SignSha256(string message) {
+        if (!this.HasPrivateKey()) { return ""; }
+        string sig = Rsa.SignPkcs1Sha256(message, message.Length,
+            this.modulus, this.modulusLength,
+            this.privateExponent, this.privateExponentLength);
+        return Base64.Encode(sig, this.modulusLength);
+    }
+
+    bool VerifySha256(string message, string signatureBase64) {
+        List<int> sigLen = new List<int>(); sigLen.Add(0);
+        string sig = Base64.Decode(signatureBase64, sigLen);
+        if (sigLen[0] != this.modulusLength) { return false; }
+        return Rsa.VerifyPkcs1Sha256(message, message.Length, sig,
+            this.modulus, this.modulusLength,
+            this.publicExponent, this.publicExponentLength);
+    }
+
+    string EncryptOaepSha1(string plaintext) {
+        string seed = RandomNumberGenerator.GetBytes(20);
+        string encrypted = Rsa.EncryptOaep(plaintext, plaintext.Length,
+            this.modulus, this.modulusLength,
+            this.publicExponent, this.publicExponentLength, 1, seed);
+        return Base64.Encode(encrypted, this.modulusLength);
+    }
+}

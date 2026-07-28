@@ -1,16 +1,24 @@
 # 微信其他产品线迁移覆盖
 
 本页记录企业微信 Work、小程序 WxOpen、开放平台 Open 和微信支付 TenPay 的迁移状态。
-普通 JSON API 由 `scripts/generate_wechat_product_apis.py` 从仓库内固定的 C# SDK 快照生成，统一复用 `WechatApiTransport`、`HttpClient`、`WechatResponse` 和 `System.Json`。
+普通 JSON API 由 `scripts/generate_wechat_product_apis.py` 生成；微信支付由
+`scripts/generate_wechat_tenpay_apis.py` 生成。特殊传输统一复用
+`WechatApiTransport`、`WechatMultipart`、`WechatRawResponse`、标准库 HTTP/TLS/WebSocket
+以及 `System.Security.Cryptography`，没有复制 C# 的 HTTP、JSON 或密码学实现。
 
 ## 汇总
 
-| 产品线 | Zan 模块 | 已映射普通 JSON 方法 | 明确跳过 | 状态 |
-|---|---:|---:|---:|---|
-| 企业微信 Work | 34 | 249 | 7 | 普通 JSON 已迁移；WebSocket 机器人另有 5 个特殊方法 |
-| 小程序 WxOpen | 58 | 421 | 18 | 普通 JSON 已迁移 |
-| 开放平台 Open | 24 | 147 | 12 | 普通 JSON 已迁移 |
-| 微信支付 TenPay | 0 | 0 | 357 个唯一异步方法 | 全部依赖商户签名、证书、APIv3 密钥、XML 或加解密，按“特殊接口稍后迁移”暂缓 |
+| 产品线 | 普通生成模块 / 方法 | 特殊接口 | 状态 |
+|---|---:|---:|---|
+| 企业微信 Work | 34 / 249 | 7 个 HTTP 特殊接口 + 智能机器人 WSS | 已迁移 |
+| 小程序 WxOpen | 58 / 421 | 18 | 已迁移 |
+| 开放平台 Open | 24 / 147 | 12 | 已迁移（含 5 个 obsolete 兼容入口） |
+| 微信支付 TenPay | 45 / 344 | 14 个同步旧接口的异步封装 + 支付核心 | 已迁移 |
+
+TenPay 的 344 个生成方法对应 C# 源码中 384 个公开异步声明；同一源文件内的
+重载被折叠成一个 Zan 原始 JSON/XML/multipart 调用入口。另补齐原 SDK 只有同步
+版本的红包和旧版分账网络接口。商户号、密钥、私钥、证书、通知地址、服务商子商户
+信息均进入配置对象，不要求每个 API 重复传入。
 
 统一签名：
 
@@ -63,17 +71,17 @@ WechatResponse result = await api.MethodAsync(query, jsonBody);
 | `WechatWorkWebhookApi` | `Webhook/WebhookApi.cs` | 7 |
 | `WechatWorkWorkBenchApi` | `WorkBench/WorkBenchApi.cs` | 3 |
 
-### Work 暂缓方法
+### Work 特殊方法（已迁移）
 
-| C# 来源 | 方法 | 原因 |
+| C# 来源 | 方法 | 迁移方式 |
 |---|---|---|
-| `Media/MediaApi.cs` | `UploadAsync` | multipart / 专用传输 |
-| `Media/MediaApi.cs` | `GetAsync` | 流或二进制响应 |
-| `Media/MediaApi.cs` | `AddMaterialAsync` | multipart / 专用传输 |
-| `Media/MediaApi.cs` | `GetForeverMaterialAsync` | 流或二进制响应 |
-| `Media/MediaApi.cs` | `UploadimgMediaAsync` | multipart / 专用传输 |
-| `Media/MediaAttachmentApi.cs` | `UploadAttachmentAsync` | multipart / 专用传输 |
-| `Webhook/WebhookApi.cs` | `UploadMediaAsync` | multipart / 专用传输 |
+| `Media/MediaApi.cs` | `UploadAsync` | `WechatMultipart` 二进制安全上传 |
+| `Media/MediaApi.cs` | `GetAsync` | `WechatRawResponse` 二进制响应 |
+| `Media/MediaApi.cs` | `AddMaterialAsync` | `WechatMultipart` 二进制安全上传 |
+| `Media/MediaApi.cs` | `GetForeverMaterialAsync` | `WechatRawResponse` 二进制响应 |
+| `Media/MediaApi.cs` | `UploadimgMediaAsync` | `WechatMultipart` 二进制安全上传 |
+| `Media/MediaAttachmentApi.cs` | `UploadAttachmentAsync` | `WechatMultipart` 二进制安全上传 |
+| `Webhook/WebhookApi.cs` | `UploadMediaAsync` | `WechatMultipart` 二进制安全上传 |
 
 ## WxOpen 模块
 
@@ -138,28 +146,28 @@ WechatResponse result = await api.MethodAsync(query, jsonBody);
 | `WechatWxOpenXPayApi` | `XPay/XPayApi.cs` | 35 |
 | `WechatWxOpenXPayIncrementApi` | `XPay/XPayIncrementApi.cs` | 3 |
 
-### WxOpen 暂缓方法
+### WxOpen 特殊方法（已迁移）
 
-| C# 来源 | 方法 | 原因 |
+| C# 来源 | 方法 | 迁移方式 |
 |---|---|---|
-| `Custom/CustomApi.cs` | `SendTextAsync` | 一个方法按参数切换多个端点 |
-| `Custom/CustomApi.cs` | `GetTypingStatusAsync` | 一个方法按参数切换多个端点 |
-| `CV/VisualProcessingApi.cs` | `AiCropAsync` | multipart / 专用传输 |
-| `CV/VisualProcessingApi.cs` | `AiCropByFileAsync` | multipart / 专用传输 |
-| `CV/VisualProcessingApi.cs` | `QrCodeAsync` | multipart / 专用传输 |
-| `CV/VisualProcessingApi.cs` | `QrCodeByFileAsync` | multipart / 专用传输 |
-| `CV/VisualProcessingApi.cs` | `SuperResolutionAsync` | multipart / 专用传输 |
-| `CV/VisualProcessingApi.cs` | `SuperResolutionByFileAsync` | multipart / 专用传输 |
-| `CV/VisualProcessingApi.cs` | `DrivingLicenseAsync` | multipart / 专用传输 |
-| `CV/VisualProcessingApi.cs` | `DrivingLicenseByFileAsync` | multipart / 专用传输 |
-| `Delivery/DeliveryProviderApi.cs` | `GetBillAsync` | 流或二进制响应 |
-| `MiniDrama/MiniDramaApi.cs` | `SingleFileUploadAsync` | multipart / 专用传输 |
-| `MiniDrama/MiniDramaApi.cs` | `UploadPartAsync` | multipart / 专用传输 |
-| `Operation/OperationApi.cs` | `GetFeedbackMediaAsync` | 流或二进制响应 |
-| `WxApp/WxAppApi.cs` | `GetWxaCodeAsync` | 流或二进制响应 |
-| `WxApp/WxAppApi.cs` | `GetWxaCodeUnlimitAsync` | 流或二进制响应 |
-| `WxApp/WxAppApi.cs` | `CreateWxQrCodeAsync` | 流或二进制响应 |
-| `WxApp/WxAppApi.cs` | `ImgSecCheckAsync` | multipart / 专用传输 |
+| `Custom/CustomApi.cs` | `SendTextAsync` | 动态路径由特殊 API 选择 |
+| `Custom/CustomApi.cs` | `GetTypingStatusAsync` | 动态路径由特殊 API 选择 |
+| `CV/VisualProcessingApi.cs` | `AiCropAsync` | `WechatMultipart` 二进制安全上传 |
+| `CV/VisualProcessingApi.cs` | `AiCropByFileAsync` | `WechatMultipart` 二进制安全上传 |
+| `CV/VisualProcessingApi.cs` | `QrCodeAsync` | `WechatMultipart` 二进制安全上传 |
+| `CV/VisualProcessingApi.cs` | `QrCodeByFileAsync` | `WechatMultipart` 二进制安全上传 |
+| `CV/VisualProcessingApi.cs` | `SuperResolutionAsync` | `WechatMultipart` 二进制安全上传 |
+| `CV/VisualProcessingApi.cs` | `SuperResolutionByFileAsync` | `WechatMultipart` 二进制安全上传 |
+| `CV/VisualProcessingApi.cs` | `DrivingLicenseAsync` | `WechatMultipart` 二进制安全上传 |
+| `CV/VisualProcessingApi.cs` | `DrivingLicenseByFileAsync` | `WechatMultipart` 二进制安全上传 |
+| `Delivery/DeliveryProviderApi.cs` | `GetBillAsync` | `WechatRawResponse` 二进制响应 |
+| `MiniDrama/MiniDramaApi.cs` | `SingleFileUploadAsync` | `WechatMultipart` 二进制安全上传 |
+| `MiniDrama/MiniDramaApi.cs` | `UploadPartAsync` | `WechatMultipart` 二进制安全上传 |
+| `Operation/OperationApi.cs` | `GetFeedbackMediaAsync` | `WechatRawResponse` 二进制响应 |
+| `WxApp/WxAppApi.cs` | `GetWxaCodeAsync` | `WechatRawResponse` 二进制响应 |
+| `WxApp/WxAppApi.cs` | `GetWxaCodeUnlimitAsync` | `WechatRawResponse` 二进制响应 |
+| `WxApp/WxAppApi.cs` | `CreateWxQrCodeAsync` | `WechatRawResponse` 二进制响应 |
+| `WxApp/WxAppApi.cs` | `ImgSecCheckAsync` | `WechatMultipart` 二进制安全上传 |
 
 ## Open 模块
 
@@ -190,31 +198,62 @@ WechatResponse result = await api.MethodAsync(query, jsonBody);
 | `WechatOpenWxOpenManagedOfficialAccountApi` | `WxOpenAPIs/ManagedOfficialAccountApi.cs` | 5 |
 | `WechatOpenWxOpenApi` | `WxOpenAPIs/WxOpenApi.cs` | 6 |
 
-### Open 暂缓方法
+### Open 特殊方法（已迁移）
 
-| C# 来源 | 方法 | 原因 |
+| C# 来源 | 方法 | 迁移方式 |
 |---|---|---|
-| `ComponentAPIs/ComponentApi.cs` | `UploadPrivacyExtFileAsync` | multipart / 专用传输 |
-| `WxaAPIs/Code/CodeApi.cs` | `GetQRCodeAsync` | 流或二进制响应 |
-| `WxaAPIs/Code/CodeApi.cs` | `UploadMediaAsync` | multipart / 专用传输 |
-| `WxaAPIs/Icp/IcpApi.cs` | `UploadIcpMediaAsync` | multipart / 专用传输 |
-| `WxaAPIs/P1/P1Api.cs` | `GetIcpMediaAsync` | 流或二进制响应 |
-| `WxaAPIs/Sec/SecApi.cs` | `UploadAuthMaterialAsync` | multipart / 专用传输 |
-| `WxaAPIs/Template/TemplateApi.cs` | `LibraryListAsync` | C# 已废弃，实际接口位于 WxOpen 模块 |
-| `WxaAPIs/Template/TemplateApi.cs` | `LibraryGetAsync` | C# 已废弃，实际接口位于 WxOpen 模块 |
-| `WxaAPIs/Template/TemplateApi.cs` | `AddAsync` | C# 已废弃，实际接口位于 WxOpen 模块 |
-| `WxaAPIs/Template/TemplateApi.cs` | `ListAsync` | C# 已废弃，实际接口位于 WxOpen 模块 |
-| `WxaAPIs/Template/TemplateApi.cs` | `DelAsync` | C# 已废弃，实际接口位于 WxOpen 模块 |
-| `WxaAPIs/WxaApi.cs` | `UploadMediaAsync` | multipart / 专用传输 |
+| `ComponentAPIs/ComponentApi.cs` | `UploadPrivacyExtFileAsync` | `WechatMultipart` 二进制安全上传 |
+| `WxaAPIs/Code/CodeApi.cs` | `GetQRCodeAsync` | `WechatRawResponse` 二进制响应 |
+| `WxaAPIs/Code/CodeApi.cs` | `UploadMediaAsync` | `WechatMultipart` 二进制安全上传 |
+| `WxaAPIs/Icp/IcpApi.cs` | `UploadIcpMediaAsync` | `WechatMultipart` 二进制安全上传 |
+| `WxaAPIs/P1/P1Api.cs` | `GetIcpMediaAsync` | `WechatRawResponse` 二进制响应 |
+| `WxaAPIs/Sec/SecApi.cs` | `UploadAuthMaterialAsync` | `WechatMultipart` 二进制安全上传 |
+| `WxaAPIs/Template/TemplateApi.cs` | `LibraryListAsync` | 兼容入口直接调用实际模板端点 |
+| `WxaAPIs/Template/TemplateApi.cs` | `LibraryGetAsync` | 兼容入口直接调用实际模板端点 |
+| `WxaAPIs/Template/TemplateApi.cs` | `AddAsync` | 兼容入口直接调用实际模板端点 |
+| `WxaAPIs/Template/TemplateApi.cs` | `ListAsync` | 兼容入口直接调用实际模板端点 |
+| `WxaAPIs/Template/TemplateApi.cs` | `DelAsync` | 兼容入口直接调用实际模板端点 |
+| `WxaAPIs/WxaApi.cs` | `UploadMediaAsync` | `WechatMultipart` 二进制安全上传 |
 
-## TenPay 为什么本轮不生成
+## TenPay 完整迁移
 
-TenPay 源码中扫描到 405 个公开异步声明、357 个按文件去重的方法名。它们的 HTTP body 虽然部分是 JSON，但请求不能只靠普通 HTTP 客户端调用，普遍要求：
+### API 表面
 
-- 商户私钥签名和 `Authorization: WECHATPAY2-SHA256-RSA2048`；
-- 平台证书、公钥轮换和响应验签；
-- APIv3 Key / AES-GCM 敏感字段加解密；
-- V2 XML 签名、退款证书和双向 TLS；
-- 图片、视频、资质文件 multipart 上传。
+- `WechatPayV3*Api.zan`：41 个现代 API v3 模块；
+- `WechatPayLegacyTenPayV3Api` / `WechatPayLegacyTenpayV3PayBankApi`：旧版 XML 支付；
+- `WechatPayLegacyTenPayApi` / `WechatPayLegacyTenPayRightsApi`：早期公众号支付和维权；
+- 共 45 个生成模块、344 个按源文件去重的方法，覆盖 384 个公开异步声明；
+- 20 个 multipart、7 个下载/二进制接口、GET/POST/PATCH/PUT/DELETE 均保留；
+- 动态或带模板变量的端点由方法的 `path` 参数接收完整 API path，避免猜测商户/服务商模式。
 
-因此这一批不能复用普通 token JSON 包装。后续应先建设共享的支付签名、证书和 multipart 基础层，再迁移 TenPay，避免生成“能编译但无法安全支付”的假接口。
+### 只有同步版本的旧接口
+
+`WechatPayLegacyRedPackApi` 补齐普通红包、裂变红包、小程序红包、服务商红包、摇一摇红包、
+企业微信红包及查询；`WechatPayLegacyProfitSharingApi` 补齐单次/多次分账、完结、接收方增删和查询，
+共 14 个网络入口，统一提供异步 Zan 方法。
+
+### 商户配置与安全能力
+
+| Zan 类型 | 能力 |
+|---|---|
+| `WechatPayV3Config` | AppId/AppSecret、商户号、API Key、商户私钥/序列号、通知地址、服务商子商户、平台公钥 |
+| `WechatPayV2Config` | AppId/AppSecret、商户号、V2 Key、通知地址、签名算法、PEM 客户端证书和私钥 |
+| `WechatPayLegacyMpConfig` | 早期公众号支付 AppId/AppSecret 与短期 access_token |
+| `WechatPayConfigRegistry` | 按名称保存多商户 V2/V3 配置 |
+| `WechatPayV3Client` | WECHATPAY2 RSA-SHA256、响应/通知验签、平台证书轮换、AES-GCM、RSA-OAEP、JSAPI/App 签名 |
+| `WechatPayV2Client` | XML 字典序签名、MD5/HMAC-SHA256、mTLS、退款通知 AES-ECB 解密 |
+| `WechatPayNotification` | 原始通知、通知 ID、平台/品牌验签和资源解密 |
+| `WechatPayPlatformKeyStore` | 按序列号缓存多个平台证书/公钥，支持轮换 |
+
+`RsaKey` 复用标准库 RSA，支持 PKCS#1、PKCS#8、SubjectPublicKeyInfo 和 X.509
+证书 PEM；mTLS 复用 `HttpClient` / `TlsContext`，不会在 SDK 中另写 native shim。
+
+### 生成与审计
+
+```powershell
+python scripts/generate_wechat_tenpay_apis.py
+```
+
+生成清单写入 `_scratch/wechat_tenpay_generated_manifest.json`，当前结果为
+`modules=45 methods=344 dynamic=150 multipart=20`。生成器只重写带生成标记的文件，
+支付核心、配置、通知和手写特殊接口不会被覆盖。

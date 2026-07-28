@@ -1,0 +1,275 @@
+using System;
+using System.Security.Cryptography;
+using Sdk.Wechat;
+
+namespace Sdk.Wechat.TenPay;
+
+/// <summary>微信支付 V2/XML 参数集合、排序签名与 XML 编解码。</summary>
+class WechatPayV2Request {
+    List<string> names;
+    List<string> values;
+
+    public WechatPayV2Request() {
+        this.names = new List<string>();
+        this.values = new List<string>();
+    }
+
+    WechatPayV2Request Set(string name, string fieldValue) {
+        int i = this.Index(name);
+        if (i >= 0) { this.values[i] = fieldValue; }
+        else { this.names.Add(name); this.values.Add(fieldValue); }
+        return this;
+    }
+
+    bool Has(string name) { return this.Index(name) >= 0; }
+
+    string Get(string name, string dflt) {
+        int i = this.Index(name);
+        if (i < 0) { return dflt; }
+        return this.values[i];
+    }
+
+    int Count() { return this.names.Count; }
+
+    string Canonical(string merchantKey) {
+        List<string> sortedNames = new List<string>();
+        List<string> sortedValues = new List<string>();
+        int i = 0;
+        while (i < this.names.Count) {
+            string name = this.names[i];
+            string fieldValue = this.values[i];
+            if (name != "sign" && fieldValue.Length > 0) {
+                int at = sortedNames.Count;
+                int j = 0;
+                while (j < sortedNames.Count) {
+                    if (WechatPayV2Request.Compare(name, sortedNames[j]) < 0) {
+                        at = j; break;
+                    }
+                    j = j + 1;
+                }
+                sortedNames.Add(name); sortedValues.Add(fieldValue);
+                j = sortedNames.Count - 1;
+                while (j > at) {
+                    sortedNames[j] = sortedNames[j - 1];
+                    sortedValues[j] = sortedValues[j - 1];
+                    j = j - 1;
+                }
+                sortedNames[at] = name;
+                sortedValues[at] = fieldValue;
+            }
+            i = i + 1;
+        }
+        StringBuilder sb = new StringBuilder();
+        i = 0;
+        while (i < sortedNames.Count) {
+            if (i > 0) { sb.Append("&"); }
+            sb.Append(sortedNames[i]); sb.Append("="); sb.Append(sortedValues[i]);
+            i = i + 1;
+        }
+        if (sb.Length > 0) { sb.Append("&"); }
+        sb.Append("key="); sb.Append(merchantKey);
+        return sb.ToString();
+    }
+
+    string Sign(string merchantKey, string signType) {
+        string source = this.Canonical(merchantKey);
+        string digest;
+        if (signType == "HMAC-SHA256") {
+            digest = Hmac.Sha256Mac(merchantKey, merchantKey.Length,
+                                    source, source.Length);
+            return WechatPayV2Request.Upper(Hex.Encode(digest, 32));
+        }
+        digest = Md5.Hash(source, source.Length);
+        return WechatPayV2Request.Upper(Hex.Encode(digest, 16));
+    }
+
+    bool Verify(string merchantKey) {
+        string actual = this.Get("sign", "");
+        if (actual.Length == 0) { return false; }
+        string signType = this.Get("sign_type", "MD5");
+        return actual == this.Sign(merchantKey, signType);
+    }
+
+    string ToSignedXml(WechatPayV2Config config) {
+        if (!this.Has("appid") && config.AppId.Length > 0) {
+            this.Set("appid", config.AppId);
+        }
+        if (!this.Has("mch_id") && config.MerchantId.Length > 0) {
+            this.Set("mch_id", config.MerchantId);
+        }
+        if (!this.Has("nonce_str")) {
+            string random = RandomNumberGenerator.GetBytes(16);
+            this.Set("nonce_str", Hex.Encode(random, 16));
+        }
+        if (!this.Has("notify_url") && config.NotifyUrl.Length > 0) {
+            this.Set("notify_url", config.NotifyUrl);
+        }
+        if (config.SignType == "HMAC-SHA256" && !this.Has("sign_type")) {
+            this.Set("sign_type", config.SignType);
+        }
+        this.Set("sign", this.Sign(config.MerchantKey, config.SignType));
+        return this.ToXml();
+    }
+
+    string ToXml() {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("<xml>");
+        int i = 0;
+        while (i < this.names.Count) {
+            sb.Append("<"); sb.Append(this.names[i]); sb.Append("><![CDATA[");
+            sb.Append(this.values[i]);
+            sb.Append("]]></"); sb.Append(this.names[i]); sb.Append(">");
+            i = i + 1;
+        }
+        sb.Append("</xml>");
+        return sb.ToString();
+    }
+
+    static WechatPayV2Request ParseXml(string xml) {
+        WechatPayV2Request result = new WechatPayV2Request();
+        int pos = XmlUtil.IndexOf(xml, "<xml", 0);
+        if (pos < 0) { return result; }
+        pos = XmlUtil.IndexOf(xml, ">", pos);
+        if (pos < 0) { return result; }
+        pos = pos + 1;
+        int xmlEnd = XmlUtil.IndexOf(xml, "</xml>", pos);
+        if (xmlEnd < 0) { xmlEnd = xml.Length; }
+        while (pos < xmlEnd) {
+            int open = XmlUtil.IndexOf(xml, "<", pos);
+            if (open < 0 || open >= xmlEnd) { break; }
+            if (open + 1 < xml.Length && (xml[open + 1] & 255) == 47) { break; }
+            int gt = XmlUtil.IndexOf(xml, ">", open + 1);
+            if (gt < 0) { break; }
+            int nameEnd = gt;
+            int scan = open + 1;
+            while (scan < gt) {
+                int c = xml[scan] & 255;
+                if (c == 32 || c == 9 || c == 13 || c == 10) {
+                    nameEnd = scan; break;
+                }
+                scan = scan + 1;
+            }
+            string name = xml.Substring(open + 1, nameEnd - open - 1);
+            string close = "</" + name + ">";
+            int end = XmlUtil.IndexOf(xml, close, gt + 1);
+            if (end < 0 || end > xmlEnd) { break; }
+            string fieldValue = XmlUtil.StripCdata(xml.Substring(gt + 1,
+                                                   end - gt - 1));
+            result.Set(name, fieldValue);
+            pos = end + close.Length;
+        }
+        return result;
+    }
+
+    int Index(string name) {
+        int i = 0;
+        while (i < this.names.Count) {
+            if (this.names[i] == name) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    static int Compare(string a, string b) {
+        int n = a.Length;
+        if (b.Length < n) { n = b.Length; }
+        int i = 0;
+        while (i < n) {
+            int x = a[i] & 255; int y = b[i] & 255;
+            if (x < y) { return -1; }
+            if (x > y) { return 1; }
+            i = i + 1;
+        }
+        if (a.Length < b.Length) { return -1; }
+        if (a.Length > b.Length) { return 1; }
+        return 0;
+    }
+
+    static string Upper(string text) {
+        StringBuilder sb = new StringBuilder();
+        int i = 0;
+        while (i < text.Length) {
+            int c = text[i] & 255;
+            if (c >= 97 && c <= 122) { c = c - 32; }
+            sb.Append(Encoding.CharFromCode(c));
+            i = i + 1;
+        }
+        return sb.ToString();
+    }
+}
+
+/// <summary>微信支付 V2 XML 客户端，支持普通 HTTPS 与退款/红包所需 mTLS。</summary>
+class WechatPayV2Client {
+    [DllImport("crt")] static extern string calloc(int count, int size);
+
+    WechatPayV2Config config;
+    WechatApiTransport transport;
+    WechatApiTransport mutualTransport;
+
+    public WechatPayV2Client(WechatPayV2Config config) {
+        this.config = config;
+        this.transport = new WechatApiTransport("api.mch.weixin.qq.com");
+        this.mutualTransport = new WechatApiTransport("api.mch.weixin.qq.com");
+        if (config.ClientCertificateFile.Length > 0
+            && config.ClientPrivateKeyFile.Length > 0) {
+            this.mutualTransport.SetClientCertificate(config.ClientCertificateFile,
+                                                      config.ClientPrivateKeyFile);
+        }
+    }
+
+    WechatPayV2Client Server(string host, int port) {
+        this.transport.Server(host, port); this.mutualTransport.Server(host, port);
+        return this;
+    }
+    WechatPayV2Client Timeout(int ms) {
+        this.transport.Timeout(ms); this.mutualTransport.Timeout(ms); return this;
+    }
+
+    async WechatRawResponse RequestAsync(string path, WechatPayV2Request request,
+                                         bool requireClientCertificate) {
+        string xml = request.ToSignedXml(this.config);
+        return await this.RequestXmlAsync(path, xml, requireClientCertificate);
+    }
+
+    async WechatRawResponse RequestXmlAsync(string path, string signedXml,
+                                            bool requireClientCertificate) {
+        if (requireClientCertificate) {
+            if (this.config.ClientCertificateFile.Length == 0
+                || this.config.ClientPrivateKeyFile.Length == 0) {
+                throw new InvalidOperationException("此微信支付 V2 接口需要配置 PEM 客户端证书和私钥");
+            }
+            return await this.mutualTransport.RequestSimpleRawAsync("POST", path,
+                signedXml, "text/xml; charset=utf-8");
+        }
+        return await this.transport.RequestSimpleRawAsync("POST", path, signedXml,
+                                                     "text/xml; charset=utf-8");
+    }
+
+    bool VerifyResponse(string xml) {
+        return WechatPayV2Request.ParseXml(xml).Verify(this.config.MerchantKey);
+    }
+
+    string DecodeRefundReqInfo(string encryptedBase64) {
+        string md5 = Md5.Hash(this.config.MerchantKey,
+                              this.config.MerchantKey.Length);
+        string key = Hex.Encode(md5, 16);
+        List<int> cipherLen = new List<int>(); cipherLen.Add(0);
+        string encrypted = Base64.Decode(encryptedBase64, cipherLen);
+        if (cipherLen[0] == 0 || (cipherLen[0] % 16) != 0) {
+            throw new ArgumentException("退款通知密文长度无效");
+        }
+        string plain = calloc(cipherLen[0] + 1, 1);
+        int off = 0;
+        while (off < cipherLen[0]) {
+            string block = encrypted.Substring(off, 16);
+            string decoded = Aes.DecryptBlockEcb(key, 32, block);
+            int j = 0;
+            while (j < 16) { plain[off + j] = decoded[j] & 255; j = j + 1; }
+            off = off + 16;
+        }
+        int resultLen = cipherLen[0];
+        int padding = plain[resultLen - 1] & 255;
+        if (padding >= 1 && padding <= 16) { resultLen = resultLen - padding; }
+        return plain.Substring(0, resultLen);
+    }
+}
