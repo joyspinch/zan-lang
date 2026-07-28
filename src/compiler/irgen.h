@@ -119,6 +119,9 @@ struct zan_irgen {
     struct {
         LLVMValueRef exc_slot;   /* i8* slot holding the caught exception */
         LLVMValueRef owned_slot; /* i32 slot: non-zero when the handler owns it */
+        LLVMValueRef tid_slot;   /* i8* slot: its class type descriptor, used by
+                                  * a bare `throw;` to rethrow with the original
+                                  * dynamic type */
     } catch_cleanups[ZAN_MAX_CATCH_DEPTH];
     int catch_cleanup_count;
     /* catch_cleanups entries entered inside the innermost loop: `break` and

@@ -546,6 +546,7 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
                 fields[ASYNC_FRAME_HSTACK] = LLVMArrayType(i32, ASYNC_MAX_HANDLERS);
                 fields[ASYNC_FRAME_CEXC] = LLVMArrayType(i8ptr, ASYNC_MAX_HANDLERS);
                 fields[ASYNC_FRAME_CEXC_OWNED] = LLVMArrayType(i32, ASYNC_MAX_HANDLERS);
+                fields[ASYNC_FRAME_CEXC_TID] = LLVMArrayType(i8ptr, ASYNC_MAX_HANDLERS);
                 for (int k = 0; k < total_params; k++) {
                     fields[ASYNC_FRAME_FIRST_PARAM + k] = param_types[k];
                 }

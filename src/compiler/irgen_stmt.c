@@ -1005,7 +1005,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
          * stack allocas are garbage when the next one resumes into the
          * epilogue. Keep them in the heap frame, indexed by this try's
          * compile-time handler id, so they survive the suspension. */
-        LLVMValueRef exc_slot, exc_owned_slot;
+        LLVMValueRef exc_slot, exc_owned_slot, exc_tid_slot;
         if (g->current_async_frame && async_hid >= 0 &&
             async_hid < ASYNC_MAX_HANDLERS) {
             /* Address them in the entry block, like emit_entry_alloca: the
@@ -1030,15 +1030,24 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                 LLVMBuildStructGEP2(g->builder, g->current_async_frame_type,
                     g->current_async_frame, ASYNC_FRAME_CEXC_OWNED, "eh.cexcown"),
                 cidx, 2, "eh.excown.slot");
+            exc_tid_slot = LLVMBuildGEP2(g->builder,
+                LLVMArrayType(i8ptr, ASYNC_MAX_HANDLERS),
+                LLVMBuildStructGEP2(g->builder, g->current_async_frame_type,
+                    g->current_async_frame, ASYNC_FRAME_CEXC_TID, "eh.cexctid"),
+                cidx, 2, "eh.exctid.slot");
             LLVMPositionBuilderAtEnd(g->builder, cur_bb);
         } else {
             exc_slot = emit_entry_alloca(g, i8ptr, "eh.exc.slot");
             /* set when a matched handler takes over the in-flight +1 (see the
              * ownership transfer at the top of each catch body) */
             exc_owned_slot = emit_entry_alloca(g, i32t, "eh.excown.slot");
+            /* the thrown type, kept per handler so a bare `throw;` can rethrow
+             * it after the global has moved on */
+            exc_tid_slot = emit_entry_alloca(g, i8ptr, "eh.exctid.slot");
         }
         zan_store_fit(g, exc_val, exc_slot);
         zan_store_fit(g, LLVMConstInt(i32t, 0, 0), exc_owned_slot);
+        zan_store_fit(g, LLVMConstNull(i8ptr), exc_tid_slot);
         int catch_start = locals->count;
         int ncatch = stmt->try_stmt.catches.count;
         if (ncatch > 0) {
@@ -1047,6 +1056,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
              * no clause matches, rethrow to the next outer handler */
             LLVMValueRef tid_g = get_eh_exc_tid_global(g);
             LLVMValueRef thrown_tid = LLVMBuildLoad2(g->builder, i8ptr, tid_g, "exc.tid");
+            zan_store_fit(g, thrown_tid, exc_tid_slot);
             LLVMValueRef match_fn = get_eh_tid_match_fn(g);
             LLVMTypeRef match_ty = LLVMFunctionType(LLVMInt1TypeInContext(g->ctx),
                 (LLVMTypeRef[]){ i8ptr, i8ptr }, 2, 0);
@@ -1128,6 +1138,8 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                     g->catch_cleanups[g->catch_cleanup_count].exc_slot = exc_slot;
                     g->catch_cleanups[g->catch_cleanup_count].owned_slot =
                         exc_owned_slot;
+                    g->catch_cleanups[g->catch_cleanup_count].tid_slot =
+                        exc_tid_slot;
                     g->catch_cleanup_count++;
                 }
                 int saved_cc = g->catch_cleanup_count;
@@ -1533,14 +1545,65 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
 
     case AST_THROW_STMT: {
         /* throw expr; — store the exception and longjmp to the innermost
-         * enclosing try (if any); otherwise print and exit(1). */
+         * enclosing try (if any); otherwise print and exit(1).
+         * throw;      — rethrow what the enclosing catch is handling. */
+        bool rethrow = stmt->throw_stmt.value == NULL;
+        if (rethrow) {
+            /* the handler's slots live in the function that opened it: a
+             * `throw;` in a lambda body nested inside a catch is not a
+             * rethrow site (C# rejects it too) */
+            LLVMValueRef hslot = g->catch_cleanup_count > 0
+                ? g->catch_cleanups[g->catch_cleanup_count - 1].exc_slot : NULL;
+            LLVMBasicBlockRef hbb = hslot ? LLVMGetInstructionParent(hslot) : NULL;
+            if (!hbb || LLVMGetBasicBlockParent(hbb) !=
+                    LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder))) {
+                zan_diag_emit(g->diag, DIAG_ERROR, stmt->loc,
+                    "a rethrow (`throw;`) is only valid inside a catch block");
+                break;
+            }
+        }
         emit_eh_hook_call(g, "__zan_eh_throw");
-        LLVMValueRef val = emit_expr(g, stmt->throw_stmt.value, locals);
+        LLVMValueRef val = rethrow
+            ? NULL : emit_expr(g, stmt->throw_stmt.value, locals);
         LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
         {
             LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
             LLVMValueRef top_g, bufs_g, exc_g;
             get_eh_globals(g, &top_g, &bufs_g, &exc_g);
+            if (rethrow) {
+                /* Put the handler's exception back in flight unchanged -- same
+                 * object, same type descriptor, so outer clauses dispatch on
+                 * its original dynamic type -- and hand its +1 back to the
+                 * globals: the handler stops owning it, so drop the EH temp
+                 * entry it stacked at entry and clear its owned flag (both the
+                 * temp unwind and emit_release_active_catch_excs below would
+                 * otherwise release it under the outer handler). */
+                int ci = g->catch_cleanup_count - 1;
+                LLVMValueRef exc_slot = g->catch_cleanups[ci].exc_slot;
+                LLVMValueRef own_slot = g->catch_cleanups[ci].owned_slot;
+                LLVMValueRef tid_slot = g->catch_cleanups[ci].tid_slot;
+                LLVMValueRef ev = LLVMBuildLoad2(g->builder, i8ptr, exc_slot, "reth.exc");
+                LLVMValueRef ofl = LLVMBuildLoad2(g->builder, i32t, own_slot, "reth.own");
+                zan_store_fit(g, ev, exc_g);
+                zan_store_fit(g, ofl, get_eh_exc_owned_global(g));
+                zan_store_fit(g,
+                    LLVMBuildLoad2(g->builder, i8ptr, tid_slot, "reth.tid"),
+                    get_eh_exc_tid_global(g));
+                LLVMValueRef rfn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder));
+                LLVMValueRef isown = zan_icmp(g->builder, LLVMIntNE, ofl,
+                    LLVMConstInt(i32t, 0, 0), "reth.isown");
+                LLVMBasicBlockRef drop_bb =
+                    LLVMAppendBasicBlockInContext(g->ctx, rfn, "reth.drop");
+                LLVMBasicBlockRef dcont_bb =
+                    LLVMAppendBasicBlockInContext(g->ctx, rfn, "reth.dcont");
+                LLVMBuildCondBr(g->builder, isown, drop_bb, dcont_bb);
+                LLVMPositionBuilderAtEnd(g->builder, drop_bb);
+                emit_eh_tmp_drop(g, ev);
+                LLVMBuildBr(g->builder, dcont_bb);
+                LLVMPositionBuilderAtEnd(g->builder, dcont_bb);
+                zan_store_fit(g, LLVMConstInt(i32t, 0, 0), own_slot);
+                goto throw_unwind;
+            }
             LLVMValueRef vail = val;
             if (LLVMGetTypeKind(LLVMTypeOf(vail)) != LLVMPointerTypeKind)
                 vail = LLVMConstNull(i8ptr);
@@ -1574,6 +1637,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                     zan_store_fit(g, LLVMConstNull(i8ptr), tid_g);
                 }
             }
+throw_unwind:
             /* longjmp skips every scope-exit release between here and the
              * handler. An async body's locals live in its heap frame, which
              * the frame chain releases, so releasing this frame's abandoned
@@ -1620,7 +1684,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         if (printf_fn) {
             LLVMTypeRef printf_ty = LLVMFunctionType(LLVMInt32TypeInContext(g->ctx),
                 &i8ptr, 1, 1);
-            if (LLVMTypeOf(val) == i8ptr) {
+            if (val && LLVMTypeOf(val) == i8ptr) {
                 LLVMValueRef fmt = LLVMBuildGlobalStringPtr(g->builder,
                     "Unhandled exception: %s\n", "exfmt");
                 LLVMValueRef args[] = { fmt, val };

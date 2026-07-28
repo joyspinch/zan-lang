@@ -632,8 +632,7 @@ operand type of return inst!
   证据：`tests/conformance/async_catch_rethrow.zan`（跨协程 catch 后再抛、同帧嵌套
   try 再抛、try 前持有托管局部 + 从 catch 里 return、循环内 catch 的 break/continue）
   输出逐行正确、`--check-leaks` 干净；全量 **568/568** 通过。
-  **仍缺**：C# 的裸 `throw;`（不带表达式的重抛）解析器仍不接受，需要给每个 handler
-  额外保存 tid 才能正确重抛，未做。
+  ~~**仍缺**：C# 的裸 `throw;`（不带表达式的重抛）解析器仍不接受~~ → **已修，见 A18**。
 
 * **A8-14 ✅ 已修（2026-07-27）异常落地时用帧覆盖栈槽，丢掉最后一次挂起之后写的局部**。
   `_scratch/p2.zan` 复现：async 体里 `Bag resp = await Trip();` 之后由**同步 callee**
@@ -1115,6 +1114,49 @@ tests\conformance\http_server_stress.zan --auto-stdlib` = 0.41 秒）。两条�
   Windows 全量子集 `ctest -R 'accept_after_close|http|async|socket|tcp|udp|websocket|sse|net'`
   = **102/102 通过，8.5 秒**（含 `conformance_http_server_stress` 1.16 秒）。
   POSIX 侧由 CI 的 `build-unix` 全量 ctest 覆盖。
+
+---
+
+# A18 C# 裸 `throw;`（重抛）（2026-07-28，已实测已修）
+
+A8-13 结尾遗留的最后一条：`throw;` 此前解析器直接拒绝，只能写 `throw e;`——
+而那**不是**重抛：它会把 tid 换成静态类型、并把异常当成一次新的抛出，
+外层按派生类型写的 `catch` 就会漏掉。
+
+实现（只动了 5 个文件）：
+
+1. `parser.c`：`throw` 后紧跟 `;` 时 `throw_stmt.value = NULL`（其余各遍历器
+   对表达式本来就是 null-safe，逐个核对过）。
+2. **每个 handler 多存一个 tid 槽**（`irgen.h` 的 `catch_cleanups.tid_slot`）。
+   同步体是 entry alloca；async 体新增帧字段 `ASYNC_FRAME_CEXC_TID`
+   （`[ASYNC_MAX_HANDLERS x i8*]`，`irgen_expr_core.c` 枚举 + `irgen_emit.c` 布局），
+   与 A8-1 的 `CEXC` / `CEXC_OWNED` 同样按 try 的编译期 handler id 索引。
+   **必须帧驻留**：catch 里 `await` 之后、或 catch 里嵌套 try 抛过一次之后，
+   全局 `__zan_eh_exc_tid` 已被覆盖，只有 handler 自己存的那份还是原始动态类型。
+3. `irgen_stmt.c` 的 `AST_THROW_STMT`：`value == NULL` 时把 handler 的
+   异常指针 / owned 标志 / tid 原样写回在飞全局，然后走与普通 throw 完全相同的
+   展开 + longjmp 尾段（`goto throw_unwind`）。所有权：handler 不再持有那个 +1，
+   所以 `__zan_eh_tmp_drop` 注销它在异常临时栈上的那条、并把 `owned_slot` 清零，
+   否则 `emit_release_active_catch_excs` 和临时栈展开会在外层 handler 手里把它释放掉。
+4. `throw;` 不在 catch 内（包括 catch 里嵌套的 lambda 体——按 handler 槽所属函数判定）
+   给出明确编译错误 `a rethrow (\`throw;\`) is only valid inside a catch block`，
+   对应 C# CS0156，而不是生成垃圾 IR。
+
+实测（Windows，`build/zanc.exe`）：
+
+* 新增 `tests/conformance/exception_rethrow.zan`：基类 clause 重抛后**外层派生类
+  clause 命中**（不是基类 clause）、重抛时持有托管局部、同帧嵌套 try 内层重抛、
+  循环内连续重抛 3 次、async 体 catch 重抛、**catch 里先 `await` 再嵌套抛一次
+  scratch 异常然后 `throw;`**（专门盯 tid 被覆盖那条）。9 行输出逐行正确，
+  `--check-leaks` 干净。
+* `throw;` 写在 try 体里 → 上述编译错误，exit=1。
+* 子集 `ctest -R 'exception|throw|catch|async|try|await|generic|leakcheck' -j8`
+  = **276/276 通过，45.62 秒**（含 conformance / determinism / leakcheck 三份
+  `exception_rethrow`）。按 AGENTS 规则 8 没跑全量。
+
+仍缺（不要当已完成）：`finally` 里的隐式重抛路径没有单独构造用例；
+`throw;` 与 `finally` 组合、以及跨协程边界重抛（子任务 catch 后 `throw;`
+再由 awaiter 捕获）只被上面的 async 用例部分覆盖。
 
 ---
 

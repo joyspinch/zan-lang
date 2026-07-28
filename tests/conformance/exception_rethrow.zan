@@ -1,0 +1,124 @@
+// A8-13 tail: C# bare `throw;` (rethrow). The exception travels on unchanged --
+// same object, same dynamic type, so an outer clause typed on the *derived*
+// class still matches after a base-typed clause rethrew it -- and its +1 goes
+// back to the in-flight exception instead of being released by the handler it
+// left (run under --check-leaks).
+using System;
+
+class IoBoom : Exception {
+    public IoBoom(string m) : base(m) {}
+}
+
+class Program {
+    // a base-typed clause rethrows: the derived type must survive
+    static void Inner() {
+        try {
+            throw new IoBoom("io");
+        } catch (Exception e) {
+            Console.WriteLine("inner saw " + e.Message);
+            throw;
+        }
+    }
+
+    // a managed local held across the rethrow (unwind-stack path)
+    static void HeldLocal() {
+        List<string> keep = new List<string>();
+        keep.Add("a");
+        try {
+            keep.Add("b");
+            throw new Exception("held");
+        } catch (Exception e) {
+            Console.WriteLine("held " + Convert.ToString(keep.Count));
+            throw;
+        }
+    }
+
+    // rethrow from the inner of two handlers in the same frame
+    static void NestedSame() {
+        try {
+            try {
+                throw new IoBoom("deep");
+            } catch (IoBoom e) {
+                throw;
+            }
+        } catch (Exception e2) {
+            Console.WriteLine("nested " + e2.Message);
+        }
+    }
+
+    static async int Boom(string tag) {
+        await Task.Delay(1);
+        throw new IoBoom(tag);
+    }
+
+    // rethrow out of an async body's catch
+    static async int AsyncRethrow() {
+        try {
+            return await Boom("async");
+        } catch (Exception e) {
+            throw;
+        }
+    }
+
+    // the catch suspends before rethrowing: the type descriptor must come from
+    // the frame, not from the global another throw may have overwritten
+    static async int AwaitThenRethrow() {
+        try {
+            return await Boom("late");
+        } catch (Exception e) {
+            await Task.Delay(1);
+            try {
+                throw new Exception("scratch");
+            } catch (Exception ignored) {
+                Console.WriteLine("scratch " + ignored.Message);
+            }
+            throw;
+        }
+    }
+
+    static async void Main() {
+        // rethrown IoBoom reaches the derived clause, not the base one
+        try {
+            Inner();
+        } catch (IoBoom io) {
+            Console.WriteLine("outer io " + io.Message);
+        } catch (Exception e) {
+            Console.WriteLine("WRONG base clause");
+        }
+
+        try {
+            HeldLocal();
+        } catch (Exception e) {
+            Console.WriteLine("outer held " + e.Message);
+        }
+
+        NestedSame();
+
+        // rethrows through a loop, repeatedly
+        int hits = 0;
+        for (int i = 0; i < 3; i = i + 1) {
+            try {
+                try {
+                    throw new IoBoom("loop" + Convert.ToString(i));
+                } catch (Exception e) {
+                    throw;
+                }
+            } catch (IoBoom io) {
+                hits = hits + 1;
+            }
+        }
+        Console.WriteLine("loop " + Convert.ToString(hits));
+
+        try {
+            int r = await AsyncRethrow();
+        } catch (IoBoom io) {
+            Console.WriteLine("async io " + io.Message);
+        }
+
+        try {
+            int r2 = await AwaitThenRethrow();
+        } catch (IoBoom io) {
+            Console.WriteLine("late io " + io.Message);
+        }
+    }
+}

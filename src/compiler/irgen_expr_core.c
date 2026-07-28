@@ -70,7 +70,12 @@ enum {
                                    * catch epilogue resumes and releases. */
     ASYNC_FRAME_CEXC_OWNED = 13,  /* [ASYNC_MAX_HANDLERS x i32]: whether that
                                    * exception carries the in-flight +1 */
-    ASYNC_FRAME_FIRST_PARAM = 14
+    ASYNC_FRAME_CEXC_TID = 14,    /* [ASYNC_MAX_HANDLERS x i8*]: that exception's
+                                   * class type descriptor, so a bare `throw;`
+                                   * rethrows with the original dynamic type
+                                   * even after an await (or a nested throw)
+                                   * has overwritten the in-flight global */
+    ASYNC_FRAME_FIRST_PARAM = 15
 };
 static LLVMValueRef coerce_to_i64(zan_irgen_t *g, LLVMValueRef v);
 static void emit_async_save_slots(zan_irgen_t *g);
