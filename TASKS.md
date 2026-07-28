@@ -1302,6 +1302,61 @@ done
 
 ---
 
+## A22 — EH 状态改为每线程私有（已修）
+
+现象：多线程程序里的 try/catch 会崩。新增 `tests/conformance/exception_threads.zan`
+（4 个 `Thread.Start` 线程 + 主线程，各自 150 轮：6 层递归 try/catch + 逐层裸
+`throw;` 重抛 + 异常穿过 finally，每次校验接住的就是自己抛的那个 `Boom.code`）在
+改动前的编译器上 5 跑 4 崩：
+
+```
+run 0 exit=-1073740940   (0xC0000374 堆损坏)
+run 1 exit=-1073741819   (0xC0000005 访问违例)
+run 2 exit=0
+run 3 exit=-1073741819
+run 4 exit=-1073741811
+```
+
+根因：A20 把 handler 栈和展开栈换成了不搬移的 chunk 存储，解决了内存搬移，但
+`__zan_eh_top / __zan_eh_exc / __zan_eh_exc_owned / __zan_eh_exc_tid /
+__zan_eh_tmps_top` 以及两张 chunk 表仍是**进程级全局**。多线程同时抛：
+* A 线程的 `throw` 读到 B 线程的 `top`，longjmp 进 B 的 `jmp_buf`——跳进一个不属于
+  本线程的栈帧；
+* catch 绑到别的线程的异常对象，`owned` / `tid` 也串线；
+* 一个线程的展开栈项被另一个线程 pop / unwind，释放别人还在用的对象。
+
+改法（`src/compiler/irgen_builtins.c`）：全部 EH 状态收进一个每线程的状态块
+`zan.eh.state`（top / tmps_top / exc_owned / exc / exc_tid + 两张 chunk 表），
+由新的 `__zan_eh_state()` 按 OS 线程 id 在开放寻址表里找：
+* 线程 id 取 `GetCurrentThreadId`（Windows）/ `pthread_self`（POSIX），key 为
+  `id + 1`，0 表示空槽；
+* 空槽用一次 `cmpxchg` 抢占，抢到的线程 `calloc` 状态块并把 `top` 初始化成 -1，
+  此后该槽只有属主线程读写，状态块指针本身不需要同步；
+* 状态块永不释放（线程 id 被 OS 回收后复用同一块），槽用尽或分配失败**显式 abort**，
+  不会静默让两个线程共用一个 handler 栈——那正是本条要消灭的破坏。
+* 之前试过的编译器生成的原生 TLS 在自带 ld.lld + mingw 这条链上首次访问就崩（A20
+  记录），所以走这张表而不是 `thread_local`。
+
+配套：状态块指针和字段地址在**每个函数的 entry block** 里只求值一次（`irgen.h` 的
+`eh_state_owner/_cached/_fields` 缓存）。EH 降级会把这些指针交给 catch/end 块，而
+async 的 CPS 切分会把这些块挪出定义点的支配范围——和 `emit_entry_alloca` 是同一个
+理由。chunk 访问函数改成 `(i8* state, i32 idx)` 两参形式。
+
+`ZAN_EH_CHUNKS` 1024 → 64：容量是**每线程**的，仍有 4096 个活 handler /
+256K 条展开项，同时把每个状态块的固定部分压到 1 KB 出头。
+
+实测（Windows）：
+* `exception_threads` 新编译器 5 跑 5 过，`ok 1500 / bad 0`（5 个参与者 × 150 轮 × 2 项）。
+* 单线程变体（去掉 4 个 `Thread.Start`）`--check-leaks` 干净。
+
+顺带发现（**未修**，另记）：`--check-leaks` 的分配追踪本身不是线程安全的。纯分配、
+完全不抛异常的探针 `_scratch/thr_alloc.zan`（5 线程 × 5000 个 `List<string>`）就会
+随机报 27 / 60 / 320 个"still reachable"，同一个二进制每次数字都不一样。所以
+`exception_threads` 暂不注册 leakcheck 变体（`CMakeLists.txt` 的 `_no_leakcheck`），
+否则这个门禁就是抛硬币。追踪表要改成线程安全后再把它放回去。
+
+---
+
 # 已撤回的结论（早期草稿中的错误，勿再引用）
 
 1. ~~"无符号/窄类型只是语法别名，IR 层全塌成 i64，语义是假的"~~ ——

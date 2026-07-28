@@ -795,29 +795,52 @@ static LLVMValueRef get_dict_set_fn(zan_irgen_t *g) {
     return fn;
 }
 
-/* Handler-stack and unwind-stack storage.
+/* Handler-stack and unwind-stack storage: one independent state block per
+ * thread.
  *
  * Handler depth is *runtime* nesting -- one slot per try currently entered, so
  * a recursive function with a try/catch has no static bound. The previous
  * fixed 16-slot global array did no bound check at all: arming the 17th
- * handler wrote a jmp_buf past the end (access violation, see A20). Growing a
- * single buffer with realloc is not an option either: the Windows scheduler
- * steps coroutines on several worker threads (zan_co_sched_run), so two
- * threads can be inside the same growth, and an armed jmp_buf may never move.
+ * handler wrote a jmp_buf past the end (access violation, see A20), and
+ * growing a single buffer with realloc moves armed jmp_bufs out from under
+ * whoever is inside a try.
  *
- * So both stacks use a chunk table: a fixed array of chunk pointers, each
- * chunk malloc'd on first use and *never* freed, moved or reallocated. A chunk
- * is published with a compare-exchange, so a thread that loses the race frees
- * its own unpublished chunk and uses the winner's -- no reader can ever hold a
- * pointer into freed memory. Handler slots carry their jmp_buf (1024 bytes,
- * covering every supported target's) plus the unwind-stack depth the handler
- * was armed at, which a throw uses to release the skipped frames' locals while
- * they are still alive (see emit_eh_unwind_to_handler). */
-#define ZAN_EH_CHUNKS      1024   /* chunk-table entries, both stacks */
+ * Sharing one stack process-wide is wrong on its own: `System.Threading`
+ * programs run Zan code on real OS threads (zan_thread_start), each with its
+ * own call stack, so a throw on thread B would longjmp into thread A's frames
+ * (A21). The state therefore lives in a per-thread block reached through
+ * __zan_eh_state(): a thread-id keyed open-addressed table, since native TLS
+ * is unusable in emitted code on the bundled MinGW/lld toolchain (the first
+ * access to a thread_local global faults on _tls_index) and adding a runtime
+ * object would have to be cross-built for every supported target.
+ *
+ * Inside a block both stacks use a chunk table: a fixed array of chunk
+ * pointers, each chunk calloc'd on first use and never freed, moved or
+ * reallocated, so an armed jmp_buf's address is stable for the life of the
+ * thread. A block is only ever touched by its owning thread, so no atomics
+ * are needed past claiming its table slot. Handler slots carry their jmp_buf
+ * (1024 bytes, covering every supported target's) plus the unwind-stack depth
+ * the handler was armed at, which a throw uses to release the skipped frames'
+ * locals while they are still alive (see emit_eh_unwind_to_handler). */
+#define ZAN_EH_CHUNKS      64     /* chunk-table entries, both stacks */
 #define ZAN_EH_SLOT_SHIFT  6      /* 64 handler slots per chunk */
 #define ZAN_EH_SLOT_BYTES  1040   /* jmp_buf (1024) + mark, 16-byte aligned */
 #define ZAN_EH_MARK_OFF    1024
 #define ZAN_EH_TMP_SHIFT   12     /* 4096 unwind-stack entries per chunk */
+#define ZAN_EH_THREADS     1024   /* live threads that can raise exceptions */
+
+/* Fields of the per-thread state block. */
+enum {
+    EH_F_TOP = 0,      /* i32: handler stack top, -1 = no handler armed */
+    EH_F_TMPS_TOP,     /* i32: unwind stack depth */
+    EH_F_EXC_OWNED,    /* i32: in-flight exception holds a +1 reference */
+    EH_F_PAD,          /* i32: keeps the pointer fields naturally aligned */
+    EH_F_EXC,          /* i8*: in-flight exception object */
+    EH_F_EXC_TID,      /* i8*: its class type descriptor (null = string) */
+    EH_F_BUFS,         /* [ZAN_EH_CHUNKS x i8*]: handler slot chunks */
+    EH_F_TMPS,         /* [ZAN_EH_CHUNKS x i8*]: unwind stack chunks */
+    EH_F_COUNT
+};
 
 static LLVMValueRef eh_add_global(zan_irgen_t *g, LLVMTypeRef ty,
                                  const char *name, LLVMValueRef init) {
@@ -827,28 +850,108 @@ static LLVMValueRef eh_add_global(zan_irgen_t *g, LLVMTypeRef ty,
     return v;
 }
 
-/* [ZAN_EH_CHUNKS x i8*] of chunk pointers, all null until first use. */
-static LLVMValueRef get_eh_chunk_table(zan_irgen_t *g, const char *name) {
-    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
-    LLVMTypeRef arr = LLVMArrayType(i8ptr, ZAN_EH_CHUNKS);
-    LLVMValueRef v = LLVMGetNamedGlobal(g->mod, name);
-    if (v) return v;
-    return eh_add_global(g, arr, name, LLVMConstNull(arr));
-}
-
-/* Exception-handling globals: the handler stack's top index (-1 = empty), the
- * handler chunk table and the in-flight exception object. Index handler slots
- * with emit_eh_buf_ptr / emit_eh_mark_ptr, never with a direct GEP. */
-static void get_eh_globals(zan_irgen_t *g, LLVMValueRef *top,
-                           LLVMValueRef *bufs, LLVMValueRef *exc) {
+/* The layout of a thread's EH state. Private to emitted code (nothing outside
+ * this module allocates or reads a block), so it needs no fixed ABI. */
+static LLVMTypeRef get_eh_state_ty(zan_irgen_t *g) {
+    if (g->eh_state_ty) return g->eh_state_ty;
     LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
-    LLVMValueRef t = LLVMGetNamedGlobal(g->mod, "__zan_eh_top");
-    if (!t) t = eh_add_global(g, i32t, "__zan_eh_top",
-        LLVMConstInt(i32t, (unsigned long long)-1, 1));
-    LLVMValueRef e = LLVMGetNamedGlobal(g->mod, "__zan_eh_exc");
-    if (!e) e = eh_add_global(g, i8ptr, "__zan_eh_exc", LLVMConstNull(i8ptr));
-    *top = t; *bufs = get_eh_chunk_table(g, "__zan_eh_bufs"); *exc = e;
+    LLVMTypeRef fields[EH_F_COUNT];
+    fields[EH_F_TOP] = i32t;
+    fields[EH_F_TMPS_TOP] = i32t;
+    fields[EH_F_EXC_OWNED] = i32t;
+    fields[EH_F_PAD] = i32t;
+    fields[EH_F_EXC] = i8ptr;
+    fields[EH_F_EXC_TID] = i8ptr;
+    fields[EH_F_BUFS] = LLVMArrayType(i8ptr, ZAN_EH_CHUNKS);
+    fields[EH_F_TMPS] = LLVMArrayType(i8ptr, ZAN_EH_CHUNKS);
+    LLVMTypeRef ty = LLVMStructCreateNamed(g->ctx, "zan.eh.state");
+    LLVMStructSetBody(ty, fields, EH_F_COUNT, 0);
+    g->eh_state_ty = ty;
+    return ty;
+}
+
+/* i64 id of the calling thread, non-zero on every supported target.
+ * GetCurrentThreadId (kernel32) on Windows, pthread_self elsewhere -- both are
+ * already in every produced program's link line. wasm32 has no threads. */
+static LLVMValueRef emit_eh_thread_id(zan_irgen_t *g) {
+    LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
+    LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    if (strstr(g->target_triple, "wasm"))
+        return LLVMConstInt(i64t, 1, 0);
+    if (g->target_is_windows) {
+        LLVMTypeRef ty = LLVMFunctionType(i32t, NULL, 0, 0);
+        LLVMValueRef id = zan_call2(g->builder, ty,
+            get_libc_fn(g, "GetCurrentThreadId", ty), NULL, 0, "tid32");
+        return LLVMBuildZExt(g->builder, id, i64t, "tid");
+    }
+    /* pthread_t is a pointer on macOS and an unsigned long on Linux; both are
+     * returned in a register, so a pointer-typed declaration is ABI-correct on
+     * 32- and 64-bit alike. */
+    LLVMTypeRef ty = LLVMFunctionType(i8ptr, NULL, 0, 0);
+    LLVMValueRef self = zan_call2(g->builder, ty,
+        get_libc_fn(g, "pthread_self", ty), NULL, 0, "self");
+    return LLVMBuildPtrToInt(g->builder, self, i64t, "tid");
+}
+
+static LLVMValueRef get_eh_state_fn(zan_irgen_t *g);
+
+/* Position the builder in the current function's entry block, where the EH
+ * state pointer and its field addresses are materialized (see irgen.h). */
+static LLVMBasicBlockRef eh_enter_entry_block(zan_irgen_t *g) {
+    LLVMBasicBlockRef cur = LLVMGetInsertBlock(g->builder);
+    LLVMBasicBlockRef entry =
+        LLVMGetEntryBasicBlock(LLVMGetBasicBlockParent(cur));
+    LLVMValueRef term = LLVMGetBasicBlockTerminator(entry);
+    if (term && entry != cur) LLVMPositionBuilderBefore(g->builder, term);
+    else LLVMPositionBuilderAtEnd(g->builder, entry);
+    return cur;
+}
+
+/* The calling thread's state block, typed. Emitted once per function; the
+ * pointer is stable for the thread's lifetime, so every try, throw and catch
+ * in the function shares it. */
+static LLVMValueRef emit_eh_state(zan_irgen_t *g) {
+    LLVMBasicBlockRef cur = LLVMGetInsertBlock(g->builder);
+    LLVMValueRef fn = cur ? LLVMGetBasicBlockParent(cur) : NULL;
+    if (fn && fn == g->eh_state_owner && g->eh_state_cached)
+        return g->eh_state_cached;
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMValueRef state_fn = get_eh_state_fn(g);
+    eh_enter_entry_block(g);
+    LLVMValueRef p = zan_call2(g->builder, LLVMFunctionType(i8ptr, NULL, 0, 0),
+        state_fn, NULL, 0, "eh.st");
+    LLVMValueRef typed = LLVMBuildBitCast(g->builder, p,
+        LLVMPointerType(get_eh_state_ty(g), 0), "eh.stp");
+    LLVMPositionBuilderAtEnd(g->builder, cur);
+    g->eh_state_owner = fn;
+    g->eh_state_cached = typed;
+    for (int i = 0; i < EH_F_COUNT; i++) g->eh_state_fields[i] = NULL;
+    return typed;
+}
+
+static LLVMValueRef emit_eh_field_ptr(zan_irgen_t *g, unsigned field,
+                                      const char *name) {
+    LLVMValueRef st = emit_eh_state(g);
+    if (g->eh_state_fields[field]) return g->eh_state_fields[field];
+    LLVMBasicBlockRef cur = eh_enter_entry_block(g);
+    LLVMValueRef p = LLVMBuildStructGEP2(g->builder, get_eh_state_ty(g), st,
+        field, name);
+    LLVMPositionBuilderAtEnd(g->builder, cur);
+    g->eh_state_fields[field] = p;
+    return p;
+}
+
+/* Exception-handling state pointers for the calling thread: the handler
+ * stack's top index (-1 = empty), the handler chunk table and the in-flight
+ * exception object. Index handler slots with emit_eh_buf_ptr /
+ * emit_eh_mark_ptr, never with a direct GEP. */
+static void get_eh_globals(zan_irgen_t *g, LLVMValueRef *top,
+                           LLVMValueRef *bufs, LLVMValueRef *exc) {
+    *top = emit_eh_field_ptr(g, EH_F_TOP, "eh.topp");
+    *exc = emit_eh_field_ptr(g, EH_F_EXC, "eh.excp");
+    if (bufs) *bufs = emit_eh_field_ptr(g, EH_F_BUFS, "eh.bufsp");
 }
 
 /* Aborts with a message: reached only when a stack cannot be extended. */
@@ -864,17 +967,145 @@ static void emit_eh_oom_abort(zan_irgen_t *g, const char *msg) {
     LLVMBuildUnreachable(g->builder);
 }
 
-/* i8* <name>(i32 idx): the address of entry `idx` in a chunked stack, bringing
- * its chunk into existence on first use. `shift` entries of `elem` bytes per
- * chunk; a chunk is installed with a compare-exchange and never freed after
- * that, so an address handed out here stays valid and stays put for the rest of
- * the process -- required both for armed jmp_bufs and for concurrent readers on
- * the scheduler's other worker threads. Running past the chunk table (65536
- * live handlers / 4M stacked temporaries) or failing to allocate a chunk is
- * fatal: there is no correct way to continue a try whose handler cannot be
- * armed, and silently dropping the entry is what A19/A20 were about. */
+/* i8* __zan_eh_state(): the calling thread's EH state block, created on that
+ * thread's first use of it.
+ *
+ * Threads are found in an open-addressed table keyed on the OS thread id. A
+ * slot is claimed with one compare-exchange; after that only its owner touches
+ * it, so the state pointer itself needs no synchronization. Blocks are never
+ * freed: a thread id recycled by the OS reuses the block of the thread that
+ * had it, which is correct because a thread that exits with an exception in
+ * flight terminates the program. Running out of slots is fatal -- silently
+ * sharing one thread's handler stack with another is exactly the corruption
+ * this table exists to prevent. */
+static LLVMValueRef get_eh_state_fn(zan_irgen_t *g) {
+    LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "__zan_eh_state");
+    if (fn) return fn;
+    LLVMTypeRef i8t = LLVMInt8TypeInContext(g->ctx);
+    LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
+    LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
+    LLVMTypeRef i8ptr = LLVMPointerType(i8t, 0);
+    LLVMTypeRef state_ty = get_eh_state_ty(g);
+    LLVMTypeRef keys_ty = LLVMArrayType(i64t, ZAN_EH_THREADS);
+    LLVMTypeRef states_ty = LLVMArrayType(i8ptr, ZAN_EH_THREADS);
+    LLVMValueRef keys = LLVMGetNamedGlobal(g->mod, "__zan_eh_tids");
+    if (!keys)
+        keys = eh_add_global(g, keys_ty, "__zan_eh_tids", LLVMConstNull(keys_ty));
+    LLVMValueRef states = LLVMGetNamedGlobal(g->mod, "__zan_eh_states");
+    if (!states)
+        states = eh_add_global(g, states_ty, "__zan_eh_states",
+            LLVMConstNull(states_ty));
+    fn = LLVMAddFunction(g->mod, "__zan_eh_state",
+        LLVMFunctionType(i8ptr, NULL, 0, 0));
+    LLVMSetLinkage(fn, LLVMInternalLinkage);
+    LLVMBasicBlockRef saved = LLVMGetInsertBlock(g->builder);
+    LLVMTypeRef caty = LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i64t, i64t }, 2, 0);
+    LLVMValueRef calloc_fn = get_libc_fn(g, "calloc", caty);
+    LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, fn, "entry");
+    LLVMBasicBlockRef probe = LLVMAppendBasicBlockInContext(g->ctx, fn, "probe");
+    LLVMBasicBlockRef mine  = LLVMAppendBasicBlockInContext(g->ctx, fn, "mine");
+    LLVMBasicBlockRef claim = LLVMAppendBasicBlockInContext(g->ctx, fn, "claim");
+    LLVMBasicBlockRef make  = LLVMAppendBasicBlockInContext(g->ctx, fn, "make");
+    LLVMBasicBlockRef init  = LLVMAppendBasicBlockInContext(g->ctx, fn, "init");
+    LLVMBasicBlockRef oom   = LLVMAppendBasicBlockInContext(g->ctx, fn, "oom");
+    LLVMBasicBlockRef ready = LLVMAppendBasicBlockInContext(g->ctx, fn, "ready");
+    LLVMBasicBlockRef next  = LLVMAppendBasicBlockInContext(g->ctx, fn, "next");
+    LLVMBasicBlockRef full  = LLVMAppendBasicBlockInContext(g->ctx, fn, "full");
+
+    LLVMPositionBuilderAtEnd(g->builder, entry);
+    /* Key 0 marks a free slot, so shift the id out of that value. */
+    LLVMValueRef key = zan_add(g->builder, emit_eh_thread_id(g),
+        LLVMConstInt(i64t, 1, 0), "key");
+    LLVMValueRef h = zan_and(g->builder,
+        LLVMBuildXor(g->builder, key,
+            LLVMBuildLShr(g->builder, key, LLVMConstInt(i64t, 32, 0), "key.hi"),
+            "key.mix"),
+        LLVMConstInt(i64t, ZAN_EH_THREADS - 1, 0), "h");
+    LLVMValueRef i_slot = LLVMBuildAlloca(g->builder, i64t, "i");
+    LLVMBuildStore(g->builder, LLVMConstInt(i64t, 0, 0), i_slot);
+    LLVMBuildBr(g->builder, probe);
+
+    LLVMPositionBuilderAtEnd(g->builder, probe);
+    LLVMValueRef i = LLVMBuildLoad2(g->builder, i64t, i_slot, "i.v");
+    LLVMValueRef pos = zan_and(g->builder, zan_add(g->builder, h, i, "pos.raw"),
+        LLVMConstInt(i64t, ZAN_EH_THREADS - 1, 0), "pos");
+    LLVMValueRef zero64 = LLVMConstInt(i64t, 0, 0);
+    LLVMValueRef kp = LLVMBuildGEP2(g->builder, keys_ty, keys,
+        (LLVMValueRef[]){ zero64, pos }, 2, "kp");
+    LLVMValueRef sp = LLVMBuildGEP2(g->builder, states_ty, states,
+        (LLVMValueRef[]){ zero64, pos }, 2, "sp");
+    LLVMValueRef k = LLVMBuildLoad2(g->builder, i64t, kp, "k");
+    LLVMSetAlignment(k, 8);
+    LLVMSetOrdering(k, LLVMAtomicOrderingMonotonic);
+    LLVMBuildCondBr(g->builder,
+        zan_icmp(g->builder, LLVMIntEQ, k, key, "is.mine"), mine, claim);
+
+    LLVMPositionBuilderAtEnd(g->builder, mine);
+    LLVMBuildRet(g->builder, LLVMBuildLoad2(g->builder, i8ptr, sp, "st"));
+
+    LLVMPositionBuilderAtEnd(g->builder, claim);
+    LLVMBuildCondBr(g->builder,
+        zan_icmp(g->builder, LLVMIntEQ, k, LLVMConstInt(i64t, 0, 0), "is.free"),
+        make, next);
+
+    /* Claim it. Losing the race means another thread took this slot between the
+     * load and here, so move on to the next one. */
+    LLVMPositionBuilderAtEnd(g->builder, make);
+    LLVMValueRef xchg = LLVMBuildAtomicCmpXchg(g->builder, kp,
+        LLVMConstInt(i64t, 0, 0), key,
+        LLVMAtomicOrderingSequentiallyConsistent,
+        LLVMAtomicOrderingSequentiallyConsistent, 0);
+    LLVMBuildCondBr(g->builder,
+        LLVMBuildExtractValue(g->builder, xchg, 1, "won"), init, next);
+
+    LLVMPositionBuilderAtEnd(g->builder, init);
+    LLVMValueRef st = zan_call2(g->builder, caty, calloc_fn,
+        (LLVMValueRef[]){ LLVMConstInt(i64t, 1, 0), LLVMSizeOf(state_ty) }, 2,
+        "st.new");
+    LLVMBuildCondBr(g->builder,
+        zan_icmp(g->builder, LLVMIntEQ, st, LLVMConstNull(i8ptr), "nomem"),
+        oom, ready);
+
+    LLVMPositionBuilderAtEnd(g->builder, oom);
+    emit_eh_oom_abort(g,
+        "zan: out of memory creating this thread's exception state\n");
+
+    LLVMPositionBuilderAtEnd(g->builder, ready);
+    /* An empty handler stack is -1, the one field a zeroed block gets wrong. */
+    LLVMBuildStore(g->builder, LLVMConstInt(i32t, (unsigned long long)-1, 1),
+        LLVMBuildStructGEP2(g->builder, state_ty,
+            LLVMBuildBitCast(g->builder, st, LLVMPointerType(state_ty, 0),
+                "st.typed"), EH_F_TOP, "st.top"));
+    LLVMBuildStore(g->builder, st, sp);
+    LLVMBuildRet(g->builder, st);
+
+    LLVMPositionBuilderAtEnd(g->builder, next);
+    LLVMValueRef ni = zan_add(g->builder,
+        LLVMBuildLoad2(g->builder, i64t, i_slot, "i.v2"),
+        LLVMConstInt(i64t, 1, 0), "i.next");
+    LLVMBuildStore(g->builder, ni, i_slot);
+    LLVMBuildCondBr(g->builder,
+        zan_icmp(g->builder, LLVMIntUGE, ni,
+            LLVMConstInt(i64t, ZAN_EH_THREADS, 0), "exhausted"), full, probe);
+
+    LLVMPositionBuilderAtEnd(g->builder, full);
+    emit_eh_oom_abort(g,
+        "zan: too many live threads for the exception-handling table\n");
+    if (saved) LLVMPositionBuilderAtEnd(g->builder, saved);
+    return fn;
+}
+
+/* i8* <name>(i8* state, i32 idx): the address of entry `idx` in one of the
+ * calling thread's chunked stacks, bringing its chunk into existence on first
+ * use. `shift` entries of `elem` bytes per chunk; a chunk is never freed, so an
+ * address handed out here stays valid and stays put for the life of the thread
+ * -- required for armed jmp_bufs. Running past the chunk table (4096 live
+ * handlers / 256K stacked temporaries per thread) or failing to allocate a
+ * chunk is fatal: there is no correct way to continue a try whose handler
+ * cannot be armed, and silently dropping the entry is what A19/A20 were
+ * about. */
 static LLVMValueRef get_eh_chunk_fn(zan_irgen_t *g, const char *name,
-                                    const char *table, unsigned shift,
+                                    unsigned field, unsigned shift,
                                     unsigned elem, const char *deep_msg) {
     LLVMValueRef fn = LLVMGetNamedFunction(g->mod, name);
     if (fn) return fn;
@@ -882,24 +1113,24 @@ static LLVMValueRef get_eh_chunk_fn(zan_irgen_t *g, const char *name,
     LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     LLVMTypeRef tab_ty = LLVMArrayType(i8ptr, ZAN_EH_CHUNKS);
-    LLVMValueRef tab = get_eh_chunk_table(g, table);
-    fn = LLVMAddFunction(g->mod, name, LLVMFunctionType(i8ptr, &i32t, 1, 0));
+    LLVMTypeRef state_ty = get_eh_state_ty(g);
+    fn = LLVMAddFunction(g->mod, name,
+        LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i8ptr, i32t }, 2, 0));
     LLVMSetLinkage(fn, LLVMInternalLinkage);
     LLVMBasicBlockRef saved = LLVMGetInsertBlock(g->builder);
     LLVMTypeRef caty = LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i64t, i64t }, 2, 0);
     LLVMValueRef calloc_fn = get_libc_fn(g, "calloc", caty);
-    LLVMTypeRef frty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), &i8ptr, 1, 0);
-    LLVMValueRef free_fn = get_libc_fn(g, "free", frty);
     LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, fn, "entry");
     LLVMBasicBlockRef deep = LLVMAppendBasicBlockInContext(g->ctx, fn, "deep");
     LLVMBasicBlockRef look = LLVMAppendBasicBlockInContext(g->ctx, fn, "look");
     LLVMBasicBlockRef make = LLVMAppendBasicBlockInContext(g->ctx, fn, "make");
     LLVMBasicBlockRef oom = LLVMAppendBasicBlockInContext(g->ctx, fn, "oom");
-    LLVMBasicBlockRef pub = LLVMAppendBasicBlockInContext(g->ctx, fn, "publish");
-    LLVMBasicBlockRef lost = LLVMAppendBasicBlockInContext(g->ctx, fn, "lost");
     LLVMBasicBlockRef have = LLVMAppendBasicBlockInContext(g->ctx, fn, "have");
-    LLVMValueRef idx = LLVMGetParam(fn, 0);
+    LLVMValueRef idx = LLVMGetParam(fn, 1);
     LLVMPositionBuilderAtEnd(g->builder, entry);
+    LLVMValueRef tab = LLVMBuildStructGEP2(g->builder, state_ty,
+        LLVMBuildBitCast(g->builder, LLVMGetParam(fn, 0),
+            LLVMPointerType(state_ty, 0), "st"), field, "tab");
     LLVMValueRef ci = LLVMBuildLShr(g->builder, idx,
         LLVMConstInt(i32t, shift, 0), "chunk");
     LLVMBuildCondBr(g->builder, zan_icmp(g->builder, LLVMIntUGE, ci,
@@ -919,25 +1150,14 @@ static LLVMValueRef get_eh_chunk_fn(zan_irgen_t *g, const char *name,
         LLVMConstInt(i64t, elem, 0) }, 2, "nchunk");
     LLVMBuildCondBr(g->builder,
         zan_icmp(g->builder, LLVMIntEQ, np, LLVMConstNull(i8ptr), "nomem"),
-        oom, pub);
+        oom, have);
     LLVMPositionBuilderAtEnd(g->builder, oom);
     emit_eh_oom_abort(g, "zan: out of memory extending the exception stack\n");
-    /* Install it, or take the chunk a concurrent worker installed first and
-     * free ours -- which is safe because ours was never visible to anyone. */
-    LLVMPositionBuilderAtEnd(g->builder, pub);
-    LLVMValueRef xchg = LLVMBuildAtomicCmpXchg(g->builder, cslot,
-        LLVMConstNull(i8ptr), np, LLVMAtomicOrderingSequentiallyConsistent,
-        LLVMAtomicOrderingSequentiallyConsistent, 0);
-    LLVMValueRef prev = LLVMBuildExtractValue(g->builder, xchg, 0, "prev");
-    LLVMValueRef won = LLVMBuildExtractValue(g->builder, xchg, 1, "won");
-    LLVMBuildCondBr(g->builder, won, have, lost);
-    LLVMPositionBuilderAtEnd(g->builder, lost);
-    zan_call2(g->builder, frty, free_fn, &np, 1, "");
-    LLVMBuildBr(g->builder, have);
     LLVMPositionBuilderAtEnd(g->builder, have);
     LLVMValueRef base = LLVMBuildPhi(g->builder, i8ptr, "base");
-    LLVMAddIncoming(base, (LLVMValueRef[]){ p, np, prev },
-        (LLVMBasicBlockRef[]){ look, pub, lost }, 3);
+    LLVMAddIncoming(base, (LLVMValueRef[]){ p, np },
+        (LLVMBasicBlockRef[]){ look, make }, 2);
+    LLVMBuildStore(g->builder, base, cslot);
     LLVMValueRef off = LLVMBuildMul(g->builder,
         LLVMBuildZExt(g->builder, zan_and(g->builder, idx,
             LLVMConstInt(i32t, (1u << shift) - 1, 0), "inchunk"), i64t, "off32"),
@@ -948,18 +1168,27 @@ static LLVMValueRef get_eh_chunk_fn(zan_irgen_t *g, const char *name,
     return fn;
 }
 
+/* Call one of the chunked-stack accessors for the calling thread. */
+static LLVMValueRef emit_eh_chunk_call(zan_irgen_t *g, LLVMValueRef fn,
+                                      LLVMValueRef idx, const char *name) {
+    LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMValueRef args[2] = {
+        LLVMBuildBitCast(g->builder, emit_eh_state(g), i8ptr, "eh.stb"), idx };
+    return zan_call2(g->builder,
+        LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i8ptr, i32t }, 2, 0),
+        fn, args, 2, name);
+}
+
 static LLVMValueRef get_eh_slot_fn(zan_irgen_t *g) {
-    return get_eh_chunk_fn(g, "__zan_eh_slot", "__zan_eh_bufs",
+    return get_eh_chunk_fn(g, "__zan_eh_slot", EH_F_BUFS,
         ZAN_EH_SLOT_SHIFT, ZAN_EH_SLOT_BYTES,
         "zan: exception handler stack exhausted (too many nested try blocks)\n");
 }
 
 /* i8* to handler slot `idx`'s jmp_buf. */
 static LLVMValueRef emit_eh_buf_ptr(zan_irgen_t *g, LLVMValueRef idx) {
-    LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
-    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
-    return zan_call2(g->builder, LLVMFunctionType(i8ptr, &i32t, 1, 0),
-        get_eh_slot_fn(g), &idx, 1, "eh.bufp");
+    return emit_eh_chunk_call(g, get_eh_slot_fn(g), idx, "eh.bufp");
 }
 
 /* i32* to handler slot `idx`'s unwind-stack mark, which trails its jmp_buf. */
@@ -1032,44 +1261,30 @@ static void emit_eh_longjmp(zan_irgen_t *g, LLVMValueRef bufp) {
  * array it replaced silently dropped entries past its end and leaked whatever
  * they pointed at when an exception unwound past them (A19). */
 static LLVMValueRef get_eh_tmp_top_global(zan_irgen_t *g) {
-    LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
-    LLVMValueRef t = LLVMGetNamedGlobal(g->mod, "__zan_eh_tmps_top");
-    if (!t) t = eh_add_global(g, i32t, "__zan_eh_tmps_top",
-        LLVMConstInt(i32t, 0, 0));
-    return t;
+    return emit_eh_field_ptr(g, EH_F_TMPS_TOP, "eh.tmptopp");
 }
 
 /* i8** to unwind-stack entry `idx`. */
 static LLVMValueRef emit_eh_tmp_slot_ptr(zan_irgen_t *g, LLVMValueRef idx) {
-    LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
-    LLVMValueRef fn = get_eh_chunk_fn(g, "__zan_eh_tmp_slot", "__zan_eh_tmps",
-        ZAN_EH_TMP_SHIFT, 8,
-        "zan: exception unwind stack exhausted\n");
+    LLVMValueRef fn = get_eh_chunk_fn(g, "__zan_eh_tmp_slot", EH_F_TMPS,
+        ZAN_EH_TMP_SHIFT, 8, "zan: exception unwind stack exhausted\n");
     return LLVMBuildBitCast(g->builder,
-        zan_call2(g->builder, LLVMFunctionType(i8ptr, &i32t, 1, 0), fn, &idx, 1,
-            "eh.tslot"), LLVMPointerType(i8ptr, 0), "eh.tslotp");
+        emit_eh_chunk_call(g, fn, idx, "eh.tslot"),
+        LLVMPointerType(i8ptr, 0), "eh.tslotp");
 }
 
 /* i32 flag: the in-flight __zan_eh_exc holds a +1 reference (class-typed
  * throw) that the catch must release after the handler runs. */
 static LLVMValueRef get_eh_exc_owned_global(zan_irgen_t *g) {
-    LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
-    LLVMValueRef v = LLVMGetNamedGlobal(g->mod, "__zan_eh_exc_owned");
-    if (!v) v = eh_add_global(g, i32t, "__zan_eh_exc_owned",
-        LLVMConstInt(i32t, 0, 0));
-    return v;
+    return emit_eh_field_ptr(g, EH_F_EXC_OWNED, "eh.ownp");
 }
 
 /* i8* pointing at the thrown object's class type-descriptor (see
  * get_class_tid_global); null for string/non-class throws. Catch clauses use
  * it for type-based dispatch. */
 static LLVMValueRef get_eh_exc_tid_global(zan_irgen_t *g) {
-    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
-    LLVMValueRef v = LLVMGetNamedGlobal(g->mod, "__zan_eh_exc_tid");
-    if (!v) v = eh_add_global(g, i8ptr, "__zan_eh_exc_tid",
-        LLVMConstNull(i8ptr));
-    return v;
+    return emit_eh_field_ptr(g, EH_F_EXC_TID, "eh.tidp");
 }
 
 /* Per-class type descriptor for exception dispatch: an i8* global named
@@ -1149,9 +1364,11 @@ static LLVMValueRef get_eh_tmp_push_fn(zan_irgen_t *g) {
     fn = LLVMAddFunction(g->mod, "__zan_eh_tmp_push", fnty);
     LLVMSetLinkage(fn, LLVMInternalLinkage);
     LLVMBasicBlockRef saved = LLVMGetInsertBlock(g->builder);
-    LLVMValueRef top_g = get_eh_tmp_top_global(g);
     LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, fn, "entry");
     LLVMPositionBuilderAtEnd(g->builder, entry);
+    /* after positioning: the state pointer is materialized in the entry block
+     * of whatever function is being emitted, and must be this one */
+    LLVMValueRef top_g = get_eh_tmp_top_global(g);
     LLVMValueRef top = LLVMBuildLoad2(g->builder, i32t, top_g, "top");
     LLVMBuildStore(g->builder, LLVMGetParam(fn, 0), emit_eh_tmp_slot_ptr(g, top));
     LLVMBuildStore(g->builder,
@@ -1170,11 +1387,11 @@ static LLVMValueRef get_eh_tmp_pop_fn(zan_irgen_t *g) {
     fn = LLVMAddFunction(g->mod, "__zan_eh_tmp_pop", fnty);
     LLVMSetLinkage(fn, LLVMInternalLinkage);
     LLVMBasicBlockRef saved = LLVMGetInsertBlock(g->builder);
-    LLVMValueRef top_g = get_eh_tmp_top_global(g);
     LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, fn, "entry");
     LLVMBasicBlockRef dec = LLVMAppendBasicBlockInContext(g->ctx, fn, "dec");
     LLVMBasicBlockRef done = LLVMAppendBasicBlockInContext(g->ctx, fn, "done");
     LLVMPositionBuilderAtEnd(g->builder, entry);
+    LLVMValueRef top_g = get_eh_tmp_top_global(g);
     LLVMValueRef top = LLVMBuildLoad2(g->builder, i32t, top_g, "top");
     LLVMValueRef pos = zan_icmp(g->builder, LLVMIntSGT, top,
         LLVMConstInt(i32t, 0, 0), "pos");
@@ -1204,7 +1421,6 @@ static LLVMValueRef get_eh_tmp_unwind_fn(zan_irgen_t *g) {
     fn = LLVMAddFunction(g->mod, "__zan_eh_tmp_unwind", fnty);
     LLVMSetLinkage(fn, LLVMInternalLinkage);
     LLVMBasicBlockRef saved = LLVMGetInsertBlock(g->builder);
-    LLVMValueRef top_g = get_eh_tmp_top_global(g);
     LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, fn, "entry");
     LLVMBasicBlockRef head = LLVMAppendBasicBlockInContext(g->ctx, fn, "head");
     LLVMBasicBlockRef body = LLVMAppendBasicBlockInContext(g->ctx, fn, "body");
@@ -1215,6 +1431,7 @@ static LLVMValueRef get_eh_tmp_unwind_fn(zan_irgen_t *g) {
     LLVMBasicBlockRef rel_str = LLVMAppendBasicBlockInContext(g->ctx, fn, "rel.str");
     LLVMBasicBlockRef done = LLVMAppendBasicBlockInContext(g->ctx, fn, "done");
     LLVMPositionBuilderAtEnd(g->builder, entry);
+    LLVMValueRef top_g = get_eh_tmp_top_global(g);
     LLVMBuildBr(g->builder, head);
     LLVMPositionBuilderAtEnd(g->builder, head);
     LLVMValueRef top = LLVMBuildLoad2(g->builder, i32t, top_g, "top");
@@ -1334,7 +1551,6 @@ static LLVMValueRef get_eh_tmp_drop_fn(zan_irgen_t *g) {
     fn = LLVMAddFunction(g->mod, "__zan_eh_tmp_drop", fnty);
     LLVMSetLinkage(fn, LLVMInternalLinkage);
     LLVMBasicBlockRef saved = LLVMGetInsertBlock(g->builder);
-    LLVMValueRef top_g = get_eh_tmp_top_global(g);
     LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, fn, "entry");
     LLVMBasicBlockRef head = LLVMAppendBasicBlockInContext(g->ctx, fn, "head");
     LLVMBasicBlockRef body = LLVMAppendBasicBlockInContext(g->ctx, fn, "body");
@@ -1343,6 +1559,7 @@ static LLVMValueRef get_eh_tmp_drop_fn(zan_irgen_t *g) {
     LLVMBasicBlockRef next = LLVMAppendBasicBlockInContext(g->ctx, fn, "next");
     LLVMBasicBlockRef done = LLVMAppendBasicBlockInContext(g->ctx, fn, "done");
     LLVMPositionBuilderAtEnd(g->builder, entry);
+    LLVMValueRef top_g = get_eh_tmp_top_global(g);
     LLVMValueRef i_slot = LLVMBuildAlloca(g->builder, i32t, "i");
     LLVMBuildStore(g->builder,
         LLVMBuildLoad2(g->builder, i32t, top_g, "top0"), i_slot);

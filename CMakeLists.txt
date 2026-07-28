@@ -545,8 +545,19 @@ endforeach()
 # reminder to drop it from the allow-list below.
 set(_known_leaky
 )
+# Cases with no leakcheck twin: the tracker itself is not thread-safe, so a
+# program that allocates from several OS threads reports a random handful of
+# live objects that were in fact released (reproduced with plain allocation and
+# no exceptions at all -- see A22). Registering them here would be a coin flip,
+# not a gate. Drop the entry once the tracker is fixed.
+set(_no_leakcheck
+  exception_threads
+)
 foreach(_src ${_conf_srcs})
   get_filename_component(_name ${_src} NAME_WE)
+  if(_name IN_LIST _no_leakcheck)
+    continue()
+  endif()
   add_test(NAME leakcheck_${_name}
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>

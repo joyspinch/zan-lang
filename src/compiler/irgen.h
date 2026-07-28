@@ -382,6 +382,16 @@ struct zan_irgen {
     } extern_fns[512];
     int extern_fn_count;
 
+    /* Per-thread exception-handling state (see irgen_builtins.c). The block
+     * pointer and the field addresses derived from it are materialized once
+     * per function, in its entry block: EH lowering hands these pointers to
+     * blocks the async CPS split moves out of the defining block's dominance,
+     * exactly like emit_entry_alloca's slots. */
+    LLVMTypeRef  eh_state_ty;
+    LLVMValueRef eh_state_owner;   /* function the cache below belongs to */
+    LLVMValueRef eh_state_cached;
+    LLVMValueRef eh_state_fields[8];
+
     /* cross-compilation target. When target_triple[0] is set, write_obj emits
      * an object for that LLVM triple verbatim (e.g. x86_64-unknown-linux-musl)
      * instead of applying the host's default/windows-gnu triple. Empty means

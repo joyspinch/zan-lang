@@ -1,0 +1,84 @@
+// EH state is per-thread. `Thread.Start` runs real OS threads, so the handler
+// stack, the in-flight exception (object, ownership flag and dynamic type) and
+// the unwind stack of owning temporaries must be private to each thread: while
+// they were process-global, one thread's throw could longjmp into a jmp_buf
+// armed by another thread's frame, and a catch could bind the other thread's
+// exception object -- a crash or a silently wrong `code` here.
+// Five participants (four threads plus main) each keep a deep, busy handler
+// stack and check that every exception they catch is the one they threw.
+using System;
+using System.Threading;
+
+class Boom : Exception {
+    public int code;
+    public Boom(int c) : base("boom") { this.code = c; }
+}
+
+class Prog {
+    static AtomicInt ok;
+    static AtomicInt bad;
+    static AtomicInt done;
+
+    // Every level arms a handler, holds an owning local and rethrows, so both
+    // the handler stack and the unwind stack are deep while the other threads
+    // are pushing and popping their own.
+    static int Relay(int code, int depth) {
+        List<string> hold = new List<string>();
+        hold.Add("h");
+        if (depth == 0) {
+            throw new Boom(code);
+        }
+        try {
+            return Relay(code, depth - 1);
+        } catch (Boom b) {
+            if (depth == 5) {
+                return b.code;
+            }
+            throw;
+        }
+    }
+
+    static void Run(int code) {
+        int i = 0;
+        while (i < 150) {
+            int got = Relay(code, 6);
+            if (got == code) { Prog.ok.Add(1); } else { Prog.bad.Add(1); }
+            // an exception crossing a finally, which allocates its own owning
+            // local while the exception is in flight
+            try {
+                try {
+                    throw new Boom(code);
+                } finally {
+                    List<string> f = new List<string>();
+                    f.Add("f");
+                }
+            } catch (Boom b) {
+                if (b.code == code) { Prog.ok.Add(1); } else { Prog.bad.Add(1); }
+            }
+            i = i + 1;
+        }
+        Prog.done.Add(1);
+    }
+
+    // ThreadStart is parameterless and must not capture, so one entry per code
+    static void W1() { Prog.Run(1); }
+    static void W2() { Prog.Run(2); }
+    static void W3() { Prog.Run(3); }
+    static void W4() { Prog.Run(4); }
+
+    static void Main() {
+        Prog.ok = new AtomicInt(0);
+        Prog.bad = new AtomicInt(0);
+        Prog.done = new AtomicInt(0);
+        Thread.Start(Prog.W1);
+        Thread.Start(Prog.W2);
+        Thread.Start(Prog.W3);
+        Thread.Start(Prog.W4);
+        Prog.Run(9);
+        while (Prog.done.Load() < 5) {
+            Thread.Sleep(1);
+        }
+        Console.WriteLine("ok " + Convert.ToString(Prog.ok.Load()));
+        Console.WriteLine("bad " + Convert.ToString(Prog.bad.Load()));
+    }
+}
