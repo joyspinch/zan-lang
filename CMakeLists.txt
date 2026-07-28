@@ -824,23 +824,6 @@ add_test(NAME dap_integration
     -DZANC_ARGS=--auto-stdlib
     -P ${CMAKE_SOURCE_DIR}/tests/run_dap.cmake)
 
-# ---- zanpkg (package manager CLI, written in Zan) ----
-set(_zanpkg_exe ${CMAKE_BINARY_DIR}/zanpkg${_exe_ext})
-add_custom_command(OUTPUT ${_zanpkg_exe}
-    COMMAND $<TARGET_FILE:zanc> ${CMAKE_SOURCE_DIR}/src/pkg/zanpkg.zan
-            --auto-stdlib -o ${_zanpkg_exe}
-    DEPENDS zanc ${CMAKE_SOURCE_DIR}/src/pkg/zanpkg.zan
-    COMMENT "Building zanpkg from Zan source")
-add_custom_target(zanpkg ALL DEPENDS ${_zanpkg_exe})
-
-add_test(NAME tool_zanpkg
-  COMMAND ${CMAKE_COMMAND}
-    -DZANPKG=${_zanpkg_exe}
-    -DZANC_DIR=${CMAKE_BINARY_DIR}
-    -DWORKDIR=${CMAKE_BINARY_DIR}/zanpkg_work
-    -P ${CMAKE_SOURCE_DIR}/tests/run_zanpkg.cmake)
-set_tests_properties(tool_zanpkg PROPERTIES TIMEOUT 300)
-
 # ---- zanfmt (code formatter, written in Zan) ----
 set(_zanfmt_exe ${CMAKE_BINARY_DIR}/zanfmt${_exe_ext})
 add_custom_command(OUTPUT ${_zanfmt_exe}

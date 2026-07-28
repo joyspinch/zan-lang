@@ -15,7 +15,7 @@ short, enforceable summary.
 | `src/lsp/`      | Language server (`zan-lsp`) + `intellisense.{c,h}` engine       |
 | `src/dap/`      | Debug adapter (`zan-dap`) + `debugger.{c,h}` engine             |
 | `src/ide_zan/`  | The IDE — self-hosted, written in Zan (`ZanIDE.zan` + components) |
-| `src/fmt/`, `src/doc/`, `src/pkg/` | Formatter, doc generator, package manager    |
+| `src/fmt/`, `src/doc/` | Formatter, doc generator   |
 | `src/selfhost/` | Self-hosted compiler sources (`.zan`)                           |
 | `stdlib/`       | Standard library (`.zan` source + native driver bundles)        |
 | `examples/`     | Curated, runnable example programs (each with its own README)   |
