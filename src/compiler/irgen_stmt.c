@@ -855,9 +855,9 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         LLVMBasicBlockRef catch_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "try.catch");
         LLVMBasicBlockRef end_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "try.end");
 
-        LLVMValueRef eh_tmps_g, eh_tmptop_g;
-        get_eh_tmp_globals(g, &eh_tmps_g, &eh_tmptop_g);
-        (void)eh_tmps_g;
+        LLVMValueRef eh_tmps_g, eh_tmptop_g, eh_tmpcap_g;
+        get_eh_tmp_globals(g, &eh_tmps_g, &eh_tmptop_g, &eh_tmpcap_g);
+        (void)eh_tmps_g; (void)eh_tmpcap_g;
         /* compile-time id of this try within the enclosing async function;
          * indexes its frame-resident catch slots (-1 = not async / no room) */
         int async_hid = -1;

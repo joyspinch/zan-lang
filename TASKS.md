@@ -602,9 +602,7 @@ operand type of return inst!
   全量 `ctest -j8`：**550/550 通过，71.42 s**。
 
   **仍未完成的边界**（不要当已完成）：
-  * 展开栈仍是固定 4096 条的静态数组（原来 256，本次调大）。递归深度 × 每帧持有型
-    局部数超过它时 `push` 会丢弃条目 → 展开时泄漏（不会内存损坏）。**正确修法是动态
-    增长或改成每帧链表**，未做。
+  * ~~展开栈仍是固定 4096 条的静态数组~~ → **已修（2026-07-28），见 A19**。
   * async 体的局部仍走 A8-3 的抛出点释放 + 帧链释放，没有登记到展开栈；
     "async 帧夹在同步中间帧之间"的混合形态尚未单独构造用例验证。
   * 这仍然是 setjmp/longjmp EH 之上的补偿机制，happy path 上每个持有型局部多一次
@@ -1157,6 +1155,35 @@ A8-13 结尾遗留的最后一条：`throw;` 此前解析器直接拒绝，只�
 仍缺（不要当已完成）：`finally` 里的隐式重抛路径没有单独构造用例；
 `throw;` 与 `finally` 组合、以及跨协程边界重抛（子任务 catch 后 `throw;`
 再由 awaiter 捕获）只被上面的 async 用例部分覆盖。
+
+---
+
+# A19 展开栈改成动态增长（2026-07-28，已实测已修）
+
+A8-12 遗留的边界：`__zan_eh_tmps` 是**固定长度全局数组**（256 → 4096），
+`__zan_eh_tmp_push` 越界就静默丢弃条目。栈深度是「递归深度 × 每帧持有型局部数」，
+编译期根本不知道上界，所以固定容量必然能被真实程序压爆，压爆的后果是
+longjmp 跳过那些帧时它们的对象**全部泄漏**。
+
+修法（`irgen_builtins.c`）：改成堆缓冲 + 按需翻倍——
+`i8** __zan_eh_tmps` / `i32 __zan_eh_tmps_top` / `i32 __zan_eh_tmps_cap`，
+新增 `__zan_eh_tmp_grow()`（首次 256，之后 ×2，走 `realloc`）。
+`push` 在 `top >= cap` 时先 grow 再存；`pop` / `unwind` / `drop` 的边界检查
+从编译期常量改成读 `cap`。只有 **realloc 失败**才退回「丢条目」，即 OOM 下泄漏而不是崩。
+
+实测（Windows）：新增 `tests/conformance/exception_unwind_stack_growth.zan`
+（1500 层递归 × 每帧 3 个 `List<string>` = 4500 条，底层抛出、顶层捕获，
+之后再做一次浅层抛出验证栈已回到 handler 深度）。
+* 把 grow 临时改成「cap 到 4096 就不再增长」以复现旧行为：
+  `zan: memory leak detected: 542 object(s) still reachable at exit`
+  （三处 `List<string>` 各 135/136 条）。
+* 动态增长后同一用例 `--check-leaks` **干净**，输出 `caught bottom` /
+  `caught again bottom` / `done`。
+* 子集 `ctest -R 'exception|throw|catch|async|try|await|leakcheck|generic' -j8`
+  = **280/280 通过，46.44 秒**。
+
+仍未完成（同 A8-12 尾部）：async 体局部仍未登记到展开栈；终局仍应换成
+LLVM 真 EH（invoke/landingpad + personality），届时这套 push/pop 补偿整体删除。
 
 ---
 

@@ -894,21 +894,25 @@ static void emit_eh_longjmp(zan_irgen_t *g, LLVMValueRef bufp) {
  * throwing callee would leak them. Each such temp is pushed onto a small
  * global stack for the duration of the call and popped on normal return;
  * entering a catch releases every entry pushed after its try was entered. */
-/* Depth of the unwind stack: call temps plus every live owning local of every
- * frame between an active handler and the throw site. Recursion deeper than
- * this silently drops entries (push checks the bound), which would leak on
- * unwind -- growing it dynamically is the real fix, tracked in TASKS.md. */
-#define ZAN_EH_TMP_CAP 4096
+/* Storage for the unwind stack: a heap buffer grown on demand -- `i8** data`,
+ * `i32 top`, `i32 cap`. Its depth is bounded by recursion depth times the
+ * number of live owning locals per frame, not by anything the compiler knows,
+ * so it cannot be a fixed array: overflowing one silently dropped entries and
+ * leaked whatever they pointed at when an exception unwound past them.
+ * Growth failure is the one case that still degrades to dropping the entry --
+ * a leak, not a crash. */
+#define ZAN_EH_TMP_INIT_CAP 256
 
-static void get_eh_tmp_globals(zan_irgen_t *g, LLVMValueRef *arr, LLVMValueRef *top) {
+static void get_eh_tmp_globals(zan_irgen_t *g, LLVMValueRef *data,
+                               LLVMValueRef *top, LLVMValueRef *cap) {
     LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
-    LLVMValueRef a = LLVMGetNamedGlobal(g->mod, "__zan_eh_tmps");
-    if (!a) {
-        LLVMTypeRef at = LLVMArrayType(i8ptr, ZAN_EH_TMP_CAP);
-        a = LLVMAddGlobal(g->mod, at, "__zan_eh_tmps");
-        LLVMSetLinkage(a, LLVMInternalLinkage);
-        LLVMSetInitializer(a, LLVMConstNull(at));
+    LLVMTypeRef i8pp = LLVMPointerType(i8ptr, 0);
+    LLVMValueRef d = LLVMGetNamedGlobal(g->mod, "__zan_eh_tmps");
+    if (!d) {
+        d = LLVMAddGlobal(g->mod, i8pp, "__zan_eh_tmps");
+        LLVMSetLinkage(d, LLVMInternalLinkage);
+        LLVMSetInitializer(d, LLVMConstNull(i8pp));
     }
     LLVMValueRef t = LLVMGetNamedGlobal(g->mod, "__zan_eh_tmps_top");
     if (!t) {
@@ -916,7 +920,13 @@ static void get_eh_tmp_globals(zan_irgen_t *g, LLVMValueRef *arr, LLVMValueRef *
         LLVMSetLinkage(t, LLVMInternalLinkage);
         LLVMSetInitializer(t, LLVMConstInt(i32t, 0, 0));
     }
-    *arr = a; *top = t;
+    LLVMValueRef c = LLVMGetNamedGlobal(g->mod, "__zan_eh_tmps_cap");
+    if (!c) {
+        c = LLVMAddGlobal(g->mod, i32t, "__zan_eh_tmps_cap");
+        LLVMSetLinkage(c, LLVMInternalLinkage);
+        LLVMSetInitializer(c, LLVMConstInt(i32t, 0, 0));
+    }
+    *data = d; *top = t; *cap = c;
 }
 
 /* i32 flag: the in-flight __zan_eh_exc holds a +1 reference (class-typed
@@ -1014,29 +1024,88 @@ static LLVMValueRef get_eh_tid_match_fn(zan_irgen_t *g) {
     return fn;
 }
 
+/* void __zan_eh_tmp_grow(void): double the unwind stack (256 entries on the
+ * first call). A failed realloc leaves cap alone, and push then drops the
+ * entry -- the pre-existing fixed-array behaviour, now only under OOM. */
+static LLVMValueRef get_eh_tmp_grow_fn(zan_irgen_t *g) {
+    LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "__zan_eh_tmp_grow");
+    if (fn) return fn;
+    LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
+    LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMTypeRef i8pp = LLVMPointerType(i8ptr, 0);
+    LLVMTypeRef fnty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), NULL, 0, 0);
+    fn = LLVMAddFunction(g->mod, "__zan_eh_tmp_grow", fnty);
+    LLVMSetLinkage(fn, LLVMInternalLinkage);
+    LLVMBasicBlockRef saved = LLVMGetInsertBlock(g->builder);
+    LLVMValueRef data_g, top_g, cap_g;
+    get_eh_tmp_globals(g, &data_g, &top_g, &cap_g);
+    LLVMTypeRef rlty = LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i8ptr, i64t }, 2, 0);
+    LLVMValueRef realloc_fn = get_libc_fn(g, "realloc", rlty);
+    LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, fn, "entry");
+    LLVMBasicBlockRef ok = LLVMAppendBasicBlockInContext(g->ctx, fn, "ok");
+    LLVMBasicBlockRef done = LLVMAppendBasicBlockInContext(g->ctx, fn, "done");
+    LLVMPositionBuilderAtEnd(g->builder, entry);
+    LLVMValueRef cap = LLVMBuildLoad2(g->builder, i32t, cap_g, "cap");
+    LLVMValueRef ncap = LLVMBuildSelect(g->builder,
+        zan_icmp(g->builder, LLVMIntEQ, cap, LLVMConstInt(i32t, 0, 0), "empty"),
+        LLVMConstInt(i32t, ZAN_EH_TMP_INIT_CAP, 0),
+        LLVMBuildShl(g->builder, cap, LLVMConstInt(i32t, 1, 0), "dbl"), "ncap");
+    LLVMValueRef bytes = LLVMBuildMul(g->builder,
+        LLVMBuildZExt(g->builder, ncap, i64t, "ncap64"),
+        LLVMSizeOf(i8ptr), "bytes");
+    LLVMValueRef old = LLVMBuildBitCast(g->builder,
+        LLVMBuildLoad2(g->builder, i8pp, data_g, "old"), i8ptr, "oldp");
+    LLVMValueRef np = zan_call2(g->builder, rlty, realloc_fn,
+        (LLVMValueRef[]){ old, bytes }, 2, "np");
+    LLVMBuildCondBr(g->builder,
+        zan_icmp(g->builder, LLVMIntNE, np, LLVMConstNull(i8ptr), "grew"),
+        ok, done);
+    LLVMPositionBuilderAtEnd(g->builder, ok);
+    LLVMBuildStore(g->builder,
+        LLVMBuildBitCast(g->builder, np, i8pp, "newp"), data_g);
+    LLVMBuildStore(g->builder, ncap, cap_g);
+    LLVMBuildBr(g->builder, done);
+    LLVMPositionBuilderAtEnd(g->builder, done);
+    LLVMBuildRetVoid(g->builder);
+    if (saved) LLVMPositionBuilderAtEnd(g->builder, saved);
+    return fn;
+}
+
 static LLVMValueRef get_eh_tmp_push_fn(zan_irgen_t *g) {
     LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "__zan_eh_tmp_push");
     if (fn) return fn;
     LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMTypeRef i8pp = LLVMPointerType(i8ptr, 0);
     LLVMTypeRef fnty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), &i8ptr, 1, 0);
     fn = LLVMAddFunction(g->mod, "__zan_eh_tmp_push", fnty);
     LLVMSetLinkage(fn, LLVMInternalLinkage);
     LLVMBasicBlockRef saved = LLVMGetInsertBlock(g->builder);
-    LLVMValueRef arr_g, top_g;
-    get_eh_tmp_globals(g, &arr_g, &top_g);
+    LLVMValueRef data_g, top_g, cap_g;
+    get_eh_tmp_globals(g, &data_g, &top_g, &cap_g);
+    LLVMValueRef grow_fn = get_eh_tmp_grow_fn(g);
     LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, fn, "entry");
+    LLVMBasicBlockRef grow_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "grow");
+    LLVMBasicBlockRef check_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "check");
     LLVMBasicBlockRef store_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "store");
     LLVMBasicBlockRef done = LLVMAppendBasicBlockInContext(g->ctx, fn, "done");
     LLVMPositionBuilderAtEnd(g->builder, entry);
     LLVMValueRef top = LLVMBuildLoad2(g->builder, i32t, top_g, "top");
-    LLVMValueRef fits = zan_icmp(g->builder, LLVMIntULT, top,
-        LLVMConstInt(i32t, ZAN_EH_TMP_CAP, 0), "fits");
-    LLVMBuildCondBr(g->builder, fits, store_bb, done);
+    LLVMValueRef cap = LLVMBuildLoad2(g->builder, i32t, cap_g, "cap");
+    LLVMBuildCondBr(g->builder,
+        zan_icmp(g->builder, LLVMIntULT, top, cap, "fits"), store_bb, grow_bb);
+    LLVMPositionBuilderAtEnd(g->builder, grow_bb);
+    zan_call2(g->builder, LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), NULL, 0, 0),
+        grow_fn, NULL, 0, "");
+    LLVMBuildBr(g->builder, check_bb);
+    LLVMPositionBuilderAtEnd(g->builder, check_bb);
+    LLVMValueRef cap2 = LLVMBuildLoad2(g->builder, i32t, cap_g, "cap2");
+    LLVMBuildCondBr(g->builder,
+        zan_icmp(g->builder, LLVMIntULT, top, cap2, "fits2"), store_bb, done);
     LLVMPositionBuilderAtEnd(g->builder, store_bb);
-    LLVMValueRef gi[2] = { LLVMConstInt(i32t, 0, 0), top };
-    LLVMValueRef slot = LLVMBuildGEP2(g->builder, LLVMGlobalGetValueType(arr_g),
-        arr_g, gi, 2, "slot");
+    LLVMValueRef data = LLVMBuildLoad2(g->builder, i8pp, data_g, "data");
+    LLVMValueRef slot = LLVMBuildGEP2(g->builder, i8ptr, data, &top, 1, "slot");
     LLVMBuildStore(g->builder, LLVMGetParam(fn, 0), slot);
     LLVMBuildBr(g->builder, done);
     LLVMPositionBuilderAtEnd(g->builder, done);
@@ -1052,12 +1121,13 @@ static LLVMValueRef get_eh_tmp_pop_fn(zan_irgen_t *g) {
     if (fn) return fn;
     LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMTypeRef i8pp = LLVMPointerType(i8ptr, 0);
     LLVMTypeRef fnty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), NULL, 0, 0);
     fn = LLVMAddFunction(g->mod, "__zan_eh_tmp_pop", fnty);
     LLVMSetLinkage(fn, LLVMInternalLinkage);
     LLVMBasicBlockRef saved = LLVMGetInsertBlock(g->builder);
-    LLVMValueRef arr_g, top_g;
-    get_eh_tmp_globals(g, &arr_g, &top_g);
+    LLVMValueRef data_g, top_g, cap_g;
+    get_eh_tmp_globals(g, &data_g, &top_g, &cap_g);
     LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, fn, "entry");
     LLVMBasicBlockRef dec = LLVMAppendBasicBlockInContext(g->ctx, fn, "dec");
     LLVMBasicBlockRef clr = LLVMAppendBasicBlockInContext(g->ctx, fn, "clr");
@@ -1071,12 +1141,11 @@ static LLVMValueRef get_eh_tmp_pop_fn(zan_irgen_t *g) {
     LLVMValueRef ntop = zan_sub(g->builder, top, LLVMConstInt(i32t, 1, 0), "ntop");
     LLVMBuildStore(g->builder, ntop, top_g);
     LLVMValueRef fits = zan_icmp(g->builder, LLVMIntULT, ntop,
-        LLVMConstInt(i32t, ZAN_EH_TMP_CAP, 0), "fits");
+        LLVMBuildLoad2(g->builder, i32t, cap_g, "cap"), "fits");
     LLVMBuildCondBr(g->builder, fits, clr, done);
     LLVMPositionBuilderAtEnd(g->builder, clr);
-    LLVMValueRef gi[2] = { LLVMConstInt(i32t, 0, 0), ntop };
-    LLVMValueRef slot = LLVMBuildGEP2(g->builder, LLVMGlobalGetValueType(arr_g),
-        arr_g, gi, 2, "slot");
+    LLVMValueRef slot = LLVMBuildGEP2(g->builder, i8ptr,
+        LLVMBuildLoad2(g->builder, i8pp, data_g, "data"), &ntop, 1, "slot");
     LLVMBuildStore(g->builder, LLVMConstNull(i8ptr), slot);
     LLVMBuildBr(g->builder, done);
     LLVMPositionBuilderAtEnd(g->builder, done);
@@ -1095,11 +1164,12 @@ static LLVMValueRef get_eh_tmp_unwind_fn(zan_irgen_t *g) {
     LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     LLVMTypeRef fnty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), &i32t, 1, 0);
+    LLVMTypeRef i8pp = LLVMPointerType(i8ptr, 0);
     fn = LLVMAddFunction(g->mod, "__zan_eh_tmp_unwind", fnty);
     LLVMSetLinkage(fn, LLVMInternalLinkage);
     LLVMBasicBlockRef saved = LLVMGetInsertBlock(g->builder);
-    LLVMValueRef arr_g, top_g;
-    get_eh_tmp_globals(g, &arr_g, &top_g);
+    LLVMValueRef data_g, top_g, cap_g;
+    get_eh_tmp_globals(g, &data_g, &top_g, &cap_g);
     LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, fn, "entry");
     LLVMBasicBlockRef head = LLVMAppendBasicBlockInContext(g->ctx, fn, "head");
     LLVMBasicBlockRef body = LLVMAppendBasicBlockInContext(g->ctx, fn, "body");
@@ -1120,12 +1190,11 @@ static LLVMValueRef get_eh_tmp_unwind_fn(zan_irgen_t *g) {
     LLVMValueRef ntop = zan_sub(g->builder, top, LLVMConstInt(i32t, 1, 0), "ntop");
     LLVMBuildStore(g->builder, ntop, top_g);
     LLVMValueRef fits = zan_icmp(g->builder, LLVMIntULT, ntop,
-        LLVMConstInt(i32t, ZAN_EH_TMP_CAP, 0), "fits");
+        LLVMBuildLoad2(g->builder, i32t, cap_g, "cap"), "fits");
     LLVMBuildCondBr(g->builder, fits, rel, head);
     LLVMPositionBuilderAtEnd(g->builder, rel);
-    LLVMValueRef gi[2] = { LLVMConstInt(i32t, 0, 0), ntop };
-    LLVMValueRef slot = LLVMBuildGEP2(g->builder, LLVMGlobalGetValueType(arr_g),
-        arr_g, gi, 2, "slot");
+    LLVMValueRef slot = LLVMBuildGEP2(g->builder, i8ptr,
+        LLVMBuildLoad2(g->builder, i8pp, data_g, "data"), &ntop, 1, "slot");
     LLVMValueRef obj = LLVMBuildLoad2(g->builder, i8ptr, slot, "obj");
     LLVMBuildStore(g->builder, LLVMConstNull(i8ptr), slot);
     /* Three entry flavours share the stack. Plain object pointers have both
@@ -1233,11 +1302,12 @@ static LLVMValueRef get_eh_tmp_drop_fn(zan_irgen_t *g) {
     LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     LLVMTypeRef fnty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), &i8ptr, 1, 0);
+    LLVMTypeRef i8pp = LLVMPointerType(i8ptr, 0);
     fn = LLVMAddFunction(g->mod, "__zan_eh_tmp_drop", fnty);
     LLVMSetLinkage(fn, LLVMInternalLinkage);
     LLVMBasicBlockRef saved = LLVMGetInsertBlock(g->builder);
-    LLVMValueRef arr_g, top_g;
-    get_eh_tmp_globals(g, &arr_g, &top_g);
+    LLVMValueRef data_g, top_g, cap_g;
+    get_eh_tmp_globals(g, &data_g, &top_g, &cap_g);
     LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, fn, "entry");
     LLVMBasicBlockRef head = LLVMAppendBasicBlockInContext(g->ctx, fn, "head");
     LLVMBasicBlockRef body = LLVMAppendBasicBlockInContext(g->ctx, fn, "body");
@@ -1248,7 +1318,7 @@ static LLVMValueRef get_eh_tmp_drop_fn(zan_irgen_t *g) {
     LLVMPositionBuilderAtEnd(g->builder, entry);
     LLVMValueRef i_slot = LLVMBuildAlloca(g->builder, i32t, "i");
     LLVMValueRef top0 = LLVMBuildLoad2(g->builder, i32t, top_g, "top0");
-    LLVMValueRef cap = LLVMConstInt(i32t, ZAN_EH_TMP_CAP, 0);
+    LLVMValueRef cap = LLVMBuildLoad2(g->builder, i32t, cap_g, "cap");
     LLVMValueRef start = LLVMBuildSelect(g->builder,
         zan_icmp(g->builder, LLVMIntSLT, top0, cap, "fits"), top0, cap, "start");
     LLVMBuildStore(g->builder, start, i_slot);
@@ -1265,9 +1335,8 @@ static LLVMValueRef get_eh_tmp_drop_fn(zan_irgen_t *g) {
         LLVMBuildLoad2(g->builder, i32t, i_slot, "i.v2"),
         LLVMConstInt(i32t, 1, 0), "idx");
     LLVMBuildStore(g->builder, idx, i_slot);
-    LLVMValueRef gi[2] = { LLVMConstInt(i32t, 0, 0), idx };
-    LLVMValueRef slot = LLVMBuildGEP2(g->builder, LLVMGlobalGetValueType(arr_g),
-        arr_g, gi, 2, "slot");
+    LLVMValueRef slot = LLVMBuildGEP2(g->builder, i8ptr,
+        LLVMBuildLoad2(g->builder, i8pp, data_g, "data"), &idx, 1, "slot");
     LLVMValueRef obj = LLVMBuildLoad2(g->builder, i8ptr, slot, "obj");
     LLVMBuildCondBr(g->builder,
         zan_icmp(g->builder, LLVMIntEQ, obj, LLVMGetParam(fn, 0), "same"),
