@@ -5,14 +5,17 @@ Run from the repository root:
     python scripts/generate_wechat_mp.py
 
 The generated audit manifest is written to _scratch/ and is intentionally not
-version-controlled. Multipart, binary, stream, and non-JSON response methods
-remain explicitly skipped until the shared HTTP standard library supports them.
+version-controlled. Multipart, binary, stream, and non-JSON methods are kept
+out of the ordinary JSON wrappers and implemented by WechatMpSpecialApi.
 """
 
 from pathlib import Path
 import re, json
 
-from wechat_typed_codegen import ModelIndex, SharedModelRegistry, emit_typed_classes
+from wechat_typed_codegen import (
+    ModelIndex, SharedModelRegistry, emit_typed_classes,
+    parse_params, unwrap_task,
+)
 
 ROOT = Path.cwd()
 src = (ROOT / 'stdlib/Sdk/WeiXinMPSDK-master/src/Senparc.Weixin.MP/Senparc.Weixin.MP/AdvancedAPIs').resolve()
@@ -218,6 +221,14 @@ def class_name(rel):
 files = sorted({p.resolve() for p in src.rglob('*.cs') if p.name.lower().endswith('api.cs')})
 model_index = ModelIndex(src.parent, strip_comments)
 models = SharedModelRegistry(model_index, 'WechatMp')
+
+def collect_special_models(method):
+    """Keep special-transport DTOs in the same shared model registry."""
+    source_path = method['source']
+    models.model_type(unwrap_task(method['ret']), source_path)
+    for cs_type, _ in parse_params(method['params']):
+        models.type(cs_type, source_path)
+
 manifest = []
 skipped = []
 total = 0
@@ -245,13 +256,15 @@ for p in files:
         if re.search(r'\b(Stream|FileStream|byte\[\])\b', method['params'] + ' ' + method['ret']) \
                 or 'Post.PostFile' in method['body'] \
                 or 'UploadCustomHeadimg' in method['name']:
-            skipped.append((rel_text, method['name'], 'multipart/binary'))
+            collect_special_models(method)
+            skipped.append((rel_text, method['name'], 'special API: multipart/binary'))
             continue
 
         expanded = expanded_body(method, by_name)
         if 'FileHelper.GetFileStream' in expanded or (
                 'RequestUtility.HttpPost' in expanded and 'CommonJsonSend' not in expanded):
-            skipped.append((rel_text, method['name'], 'special transport/response'))
+            collect_special_models(method)
+            skipped.append((rel_text, method['name'], 'special API: transport/response'))
             continue
         urls = path_literals(expanded)
         resolution = 'method/helper'

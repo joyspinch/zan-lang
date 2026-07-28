@@ -124,8 +124,6 @@ class WechatClient {
         if (openId.Length == 0) {
             throw new WechatException("client.paramError", "openId 不能为空", "");
         }
-        string token = await this.GetAccessTokenAsync();
-
         JsonValue text = JsonValue.NewObject();
         text.Put("content", JsonValue.NewStr(content));
         JsonValue body = JsonValue.NewObject();
@@ -134,8 +132,8 @@ class WechatClient {
         body.Put("text", text);
         string json = body.ToJson();
 
-        string path = "/cgi-bin/message/custom/send?access_token="
-            + Encoding.UrlEncode(token);
+        string token = await this.GetAccessTokenAsync();
+        string path = this.WithToken("/cgi-bin/message/custom/send", token);
 
         string raw = "";
         try {
@@ -191,13 +189,41 @@ class WechatClient {
     }
 
     string WithToken(string path, string token) {
-        string sep = "?";
-        int i = 0;
-        while (i < path.Length) {
-            if ((path[i] & 255) == 63) { sep = "&"; break; }
-            i = i + 1;
+        return WechatApiTransport.AppendQuery(path,
+            WechatCredential.QueryName(WechatCredentialKind.AccessToken), token);
+    }
+
+    async string CredentialAsync(WechatCredentialKind kind) {
+        if (kind == WechatCredentialKind.None) { return ""; }
+        if (kind == WechatCredentialKind.AccessToken) {
+            return await this.GetAccessTokenAsync();
         }
-        return path + sep + "access_token=" + Encoding.UrlEncode(token);
+        throw new WechatException("client.tokenUnsupported",
+            "公众号客户端只支持 access token", "");
+    }
+
+    async WechatRawResponse RequestRawAsync(string method, string path,
+                                             string query, string body,
+                                             string contentType,
+                                             WechatCredentialKind credential) {
+        string target = WechatApiTransport.BuildPath(path, query);
+        string token = await this.CredentialAsync(credential);
+        target = WechatApiTransport.AppendQuery(target,
+            WechatCredential.QueryName(credential), token);
+        return await this.NewTransport().RequestSimpleRawAsync(method, target,
+            body, contentType);
+    }
+
+    async WechatRawResponse RequestMultipartAsync(string method, string path,
+                                                   string query,
+                                                   WechatMultipart multipart,
+                                                   WechatCredentialKind credential) {
+        string target = WechatApiTransport.BuildPath(path, query);
+        string token = await this.CredentialAsync(credential);
+        target = WechatApiTransport.AppendQuery(target,
+            WechatCredential.QueryName(credential), token);
+        return await this.NewTransport().RequestMultipartAsync(method, target,
+            multipart);
     }
 
     // ---- 菜单 ----------------------------------------------------------------
@@ -316,9 +342,11 @@ class WechatClient {
     async WechatResponse OAuthUserInfoAsync(string oauthAccessToken, string openId, string lang) {
         string l = lang;
         if (l.Length == 0) { l = "zh_CN"; }
-        string path = "/sns/userinfo?access_token=" + Encoding.UrlEncode(oauthAccessToken)
-            + "&openid=" + Encoding.UrlEncode(openId)
+        string path = "/sns/userinfo?openid=" + Encoding.UrlEncode(openId)
             + "&lang=" + Encoding.UrlEncode(l);
+        path = WechatApiTransport.AppendQuery(path,
+            WechatCredential.QueryName(WechatCredentialKind.AccessToken),
+            oauthAccessToken);
         return await this.GetAsync(path);
     }
 
@@ -335,6 +363,13 @@ class WechatClient {
             + "&response_type=code&scope=" + Encoding.UrlEncode(s)
             + "&state=" + Encoding.UrlEncode(state)
             + "#wechat_redirect";
+    }
+
+    WechatApiTransport NewTransport() {
+        WechatApiTransport transport = new WechatApiTransport(this.host);
+        transport.Server(this.host, this.port);
+        transport.Timeout(this.timeoutMs);
+        return transport;
     }
 
     HttpClient NewHttp() {

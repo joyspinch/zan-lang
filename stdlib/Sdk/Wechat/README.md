@@ -9,7 +9,7 @@
 | 产品线 | 覆盖 |
 |---|---|
 | 通用公众号能力 | URL 签名、token 缓存、客服消息、菜单、用户、二维码、模板消息、OAuth、消息 XML、安全模式加解密 |
-| MP Advanced API | 37 个模块、383 个强类型普通接口 |
+| MP Advanced API | 37 个普通模块、383 个强类型普通接口、20 个特殊传输接口 |
 | 企业微信 Work | 34 个模块、249 个强类型普通接口、7 个特殊 HTTP 接口、智能机器人 WSS |
 | 小程序 WxOpen | 58 个模块、421 个强类型普通接口、18 个特殊接口 |
 | 开放平台 Open | 24 个模块、147 个强类型普通接口、12 个特殊接口 |
@@ -38,7 +38,7 @@ path/query/body，Response 负责保留原始响应并继承实际返回实体�
 
 | 产品线 | 共享实体命名空间 | 目录 | 实体数 |
 |---|---|---|---:|
-| MP | `Sdk.Wechat.Models.Mp` | `Models/Mp/` | 484 |
+| MP | `Sdk.Wechat.Models.Mp` | `Models/Mp/` | 495 |
 | Work | `Sdk.Wechat.Models.Work` | `Models/Work/` | 516 |
 | WxOpen | `Sdk.Wechat.Models.WxOpen` | `Models/WxOpen/` | 525 |
 | Open | `Sdk.Wechat.Models.Open` | `Models/Open/` | 190 |
@@ -109,6 +109,13 @@ Console.WriteLine(auth.pre_auth_code);
 强类型请求；二进制响应保留 `WechatRawResponse`，避免把图片、PDF、CSV 当 JSON 解码。
 
 ```zan
+WechatMpMediaSpecialApi mpMedia = new WechatMpMediaSpecialApi(client);
+WechatMpSpecialUploadTemporaryMediaResponse mpUploaded =
+    await mpMedia.UploadTemporaryMediaAsync(
+        WechatMpMediaType.Image, "logo.png", "image/png", fileBytes);
+WechatRawResponse original = await mpMedia.GetAsync(mpUploaded.media_id);
+original.SaveBody("downloaded.png");
+
 WechatWorkMediaSpecialApi media = new WechatWorkMediaSpecialApi(work);
 WechatResponse uploaded = await media.UploadAsync(
     "image", "logo.png", "image/png", fileBytes);
@@ -210,7 +217,7 @@ try {
 - `tests/conformance/sdk_wechat_crypt.zan`：官方密文向量、加解密往返、消息 XML、OAuth URL；
 - `tests/conformance/sdk_wechat_mp_modules.zan`：37 个 MP 模块、383 个强类型方法编译面；
 - `tests/conformance/sdk_wechat_product_modules.zan`：Work/WxOpen/Open 共 116 个模块、817 个强类型方法编译面；
-- `tests/conformance/sdk_wechat_special_modules.zan`：特殊 HTTP 接口与企业微信智能机器人 WSS 编译面；
+- `tests/conformance/sdk_wechat_special_modules.zan`：57 个特殊 HTTP 接口（含 MP 20 个）与企业微信智能机器人 WSS 编译面；
 - `tests/conformance/sdk_wechat_tenpay.zan`：45 个 TenPay 模块、344 个强类型方法及支付密码学/配置/通知；
 - `tests/conformance/json_entity_mapping.zan`：生成 DTO 所需的对象、列表和嵌套列表 JSON 映射。
 

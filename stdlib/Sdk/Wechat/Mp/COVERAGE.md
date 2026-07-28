@@ -2,16 +2,16 @@
 
 本目录迁移自 `WeiXinMPSDK-master/src/Senparc.Weixin.MP/.../AdvancedAPIs`。
 映射代码由 `scripts/generate_wechat_mp.py` 从仓库内固定的 C# 源码快照生成。
-这里保留公开 API 名称、方法专属请求/响应契约和微信 HTTP 端点；484 个可复用业务实体按原 C# 类型身份集中到 `../Models/Mp/WechatMpModels.zan`，统一复用 Zan 标准库 HTTP / JSON / 加密能力，不复制 C# 的 DI、MVC 和反射基础设施。
+这里保留公开 API 名称、方法专属请求/响应契约和微信 HTTP 端点；495 个可复用业务实体按原 C# 类型身份集中到 `../Models/Mp/WechatMpModels.zan`，统一复用 Zan 标准库 HTTP / JSON / 加密能力，不复制 C# 的 DI、MVC 和反射基础设施。
 
 ## 当前覆盖
 
 - C# MP 项目：463 个 `.cs` 文件；
 - Advanced API 入口：39 个 `*Api.cs`；
 - 扫描到 415 个公开异步声明；去除 OAuth 的 4 个声明后有 411 个，其中 8 个是同名重载；
-- 非 OAuth 的 403 个唯一异步方法名中，383 个普通 JSON API 已映射为 Zan 方法；
-- 383 个方法分布在 37 个 `Sdk.Wechat.Mp` 模块类；
-- 其余 20 个方法因 multipart、文件流、二进制或 CSV 特殊响应暂不伪装成 JSON 接口；
+- 非 OAuth 的 403 个唯一异步方法名已全部迁移：383 个普通 JSON API 由生成模块承载，20 个特殊传输 API 由专用类承载；
+- 383 个普通方法分布在 37 个 `Sdk.Wechat.Mp` 模块类；20 个特殊方法分布在 9 个 `*SpecialApi` 类；
+- multipart、原始文件流、图片/PDF/账单响应保留为 `WechatMultipart` / `WechatRawResponse`，不会伪装成 JSON；
 - OAuth 授权 URL、token、刷新和用户信息由上层 `WechatClient.zan` 的便捷方法提供，不重复生成。
 
 统一调用形式：
@@ -76,32 +76,32 @@ Console.WriteLine(result.nickname);
 | `WechatMpWiFiApi` | `WiFi/WiFiApi.cs` | 18 |
 | `WechatMpWxaApi` | `Wxa/WxaApi.cs` | 11 |
 
-## 暂未映射的特殊方法
+## 特殊传输方法（已迁移）
 
-| C# 来源 | 方法 | 原因 |
+| C# 来源 | 方法 | Zan 接口 |
 |---|---|---|
-| `CustomService/CustomServiceApi.cs` | `UploadCustomHeadimgAsync` | multipart / 文件流 / 二进制 |
-| `CV/Image/ImageApi.cs` | `AiCropAsync` | multipart / 文件流 / 二进制 |
-| `CV/Image/ImageApi.cs` | `AiCropByFileAsync` | multipart / 文件流 / 二进制 |
-| `CV/Image/ImageApi.cs` | `QrCodeByFileAsync` | multipart / 文件流 / 二进制 |
-| `CV/OCR/OCRApi.cs` | `DrivingLicenseByFileAsync` | multipart / 文件流 / 二进制 |
-| `Invoice/InvoiceApi.cs` | `SetPdfAsync` | multipart / 文件流 / 二进制 |
-| `Media/MediaApi.cs` | `UploadTemporaryMediaAsync` | multipart / 文件流 / 二进制 |
-| `Media/MediaApi.cs` | `GetAsync` | multipart / 文件流 / 二进制 |
-| `Media/MediaApi.cs` | `GetJssdkAsync` | multipart / 文件流 / 二进制 |
-| `Media/MediaApi.cs` | `UploadForeverMediaAsync` | multipart / 文件流 / 二进制 |
-| `Media/MediaApi.cs` | `UploadForeverVideoAsync` | multipart / 文件流 / 二进制 |
-| `Media/MediaApi.cs` | `GetForeverMediaAsync` | multipart / 文件流 / 二进制 |
-| `Media/MediaApi.cs` | `GetForeverMediaWithContentTypeAsync` | multipart / 文件流 / 二进制 |
-| `Media/MediaApi.cs` | `UploadImgAsync` | multipart / 文件流 / 二进制 |
-| `Media/MediaApi.cs` | `AddVoiceAsync` | multipart / 文件流 / 二进制 |
-| `MerChant/Picture/PictureApi.cs` | `UploadImgAsync` | 专用上传或非 JSON 响应 |
-| `NonTaxPay/NonTaxPayApi.cs` | `DownloadBillAsync` | 专用上传或非 JSON 响应 |
-| `Poi/PoiApi.cs` | `UploadImageAsync` | multipart / 文件流 / 二进制 |
-| `QrCode/QrCodeApi.cs` | `ShowQrCodeAsync` | multipart / 文件流 / 二进制 |
-| `ShakeAround/ShakeAroundApi.cs` | `UploadImageAsync` | multipart / 文件流 / 二进制 |
+| `CustomService/CustomServiceApi.cs` | `UploadCustomHeadimgAsync` | `WechatMpCustomServiceSpecialApi` |
+| `CV/Image/ImageApi.cs` | `AiCropAsync` | `WechatMpCvSpecialApi` |
+| `CV/Image/ImageApi.cs` | `AiCropByFileAsync` | `WechatMpCvSpecialApi` |
+| `CV/Image/ImageApi.cs` | `QrCodeByFileAsync` | `WechatMpCvSpecialApi` |
+| `CV/OCR/OCRApi.cs` | `DrivingLicenseByFileAsync` | `WechatMpCvSpecialApi` |
+| `Invoice/InvoiceApi.cs` | `SetPdfAsync` | `WechatMpInvoiceSpecialApi` |
+| `Media/MediaApi.cs` | `UploadTemporaryMediaAsync` | `WechatMpMediaSpecialApi` |
+| `Media/MediaApi.cs` | `GetAsync` | `WechatMpMediaSpecialApi` |
+| `Media/MediaApi.cs` | `GetJssdkAsync` | `WechatMpMediaSpecialApi` |
+| `Media/MediaApi.cs` | `UploadForeverMediaAsync` | `WechatMpMediaSpecialApi` |
+| `Media/MediaApi.cs` | `UploadForeverVideoAsync` | `WechatMpMediaSpecialApi` |
+| `Media/MediaApi.cs` | `GetForeverMediaAsync` | `WechatMpMediaSpecialApi` |
+| `Media/MediaApi.cs` | `GetForeverMediaWithContentTypeAsync` | `WechatMpMediaSpecialApi` |
+| `Media/MediaApi.cs` | `UploadImgAsync` | `WechatMpMediaSpecialApi` |
+| `Media/MediaApi.cs` | `AddVoiceAsync` | `WechatMpMediaSpecialApi` |
+| `MerChant/Picture/PictureApi.cs` | `UploadImgAsync` | `WechatMpMerchantSpecialApi` |
+| `NonTaxPay/NonTaxPayApi.cs` | `DownloadBillAsync` | `WechatMpNonTaxSpecialApi` |
+| `Poi/PoiApi.cs` | `UploadImageAsync` | `WechatMpPoiSpecialApi` |
+| `QrCode/QrCodeApi.cs` | `ShowQrCodeAsync` | `WechatMpQrCodeSpecialApi` |
+| `ShakeAround/ShakeAroundApi.cs` | `UploadImageAsync` | `WechatMpShakeAroundSpecialApi` |
 
-这些方法属于文件路径/流对象或二进制/CSV 返回形态，不能伪装成普通 JSON 方法；对应能力由共享 `WechatMultipart`、`WechatRawResponse` 和专用接口承载。
+这些方法复用标准库 HTTP/TLS、`WechatMultipart` 和 `WechatRawResponse`。JSON 结果仍反序列化为共享实体；真正的图片、PDF、媒体和账单文本保持原始响应。
 
 ## 其他产品线
 
