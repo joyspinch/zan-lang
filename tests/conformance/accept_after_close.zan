@@ -1,0 +1,51 @@
+// Conformance: an accept parked on the IO reactor must fail -- not strand its
+// coroutine -- when its listener is closed under it (TcpListener.Stop() /
+// HttpServer.Stop()). The reactor wakes watchers whose fd has died and the
+// accept retry loop reports the error, so the program can still finish.
+using System;
+using System.Net.Sockets;
+
+class Program {
+    static int PORT = 54353;
+    static nint accepted = 0;
+    static int finished = 0;
+
+    static async void Waiter(TcpListener listener) {
+        accepted = await listener.AcceptAsync();
+        finished = 1;
+    }
+
+    static async int Run() {
+        Socket.Initialize();
+        TcpListener listener = TcpListener.Create("127.0.0.1", PORT);
+        listener.Start();
+
+        Task.Spawn(Waiter(listener));
+        await Task.Delay(30);        // let the accept park on the reactor
+        listener.Stop();             // close it under the parked accept
+
+        int spins = 0;
+        while (finished == 0 && spins < 400) {
+            await Task.Delay(5);
+            spins = spins + 1;
+        }
+
+        if (finished == 1) {
+            Console.WriteLine("woke");
+        } else {
+            Console.WriteLine("stranded");
+        }
+        if (accepted < 0) {
+            Console.WriteLine("failed");
+        } else {
+            Console.WriteLine("accepted");
+        }
+
+        Socket.Cleanup();
+        return 0;
+    }
+
+    static void Main() {
+        int r = await Run();
+    }
+}

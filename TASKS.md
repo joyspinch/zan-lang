@@ -1075,6 +1075,49 @@ overflow/visibility/cursor/accent-color。
 
 ---
 
+# A17 测试套件"要跑半小时"的真正原因（2026-07-28，已实测已修）
+
+不是缓存也不是编译慢：单个用例编译 0.03–0.4 秒（`build\zanc.exe
+tests\conformance\http_server_stress.zan --auto-stdlib` = 0.41 秒）。两条原因：
+
+* **A17-1** ✅ 已修。`conformance` / `determinism` / `leakcheck` 这三批（每批约 200 个，
+  由 `tests/conformance/*.zan` glob 生成）**都没设 TIMEOUT**，ctest 的默认值是 1500 秒，
+  所以任何一个挂死的用例独占 25 分钟。现在三批都是 `TIMEOUT 120`
+  （`CMakeLists.txt` 的三个 `foreach`），`selfhost_*`（600 / 1200）和
+  `runtime_gui_*`（15 / 20）保持各自原值。
+  〔已实测〕`build/CTestTestfile.cmake` 里每条都带 `TIMEOUT "120"`。
+* **A17-2** ✅ 已修。挂死是 runtime 的真 bug，**只发生在 POSIX 后端**
+  （epoll / kqueue / select；Windows 的 IOCP 会把被取消的 AcceptEx 以错误完成，
+  所以在 Windows 上看不到）。`server.Stop()` 关掉监听 socket 后，仍挂在 accept 上的
+  watcher 留在 io 表里：
+  - epoll：关 fd 会**静默地**把它移出 epoll 集，`epoll_wait` 永远不再报告它，
+    协程永久停摆；
+  - select 回退：把已成 `-1` 的 fd 塞进 `FD_SET` 是未定义行为（`-1` 会写到
+    `fd_set` 存储之外），实测表现为 select 去等 fd 0（stdin），永不返回。
+
+  修法（`src/runtime/rt_io.c`）：新增"死 fd watcher"队列。注册时和轮询前
+  用 `zan_io_socket_alive`（POSIX 一次 `fcntl(F_GETFD)`，Windows `getsockopt(SO_TYPE)`）
+  校验 fd；无效的 watcher 不进 `fd_set`/epoll，而是立刻以**失败**唤醒
+  （accept 出参 `-1`、recv 字节数 `0`）。三个后端都覆盖：epoll 在无事件返回和
+  阻塞前扫 slot 表，kqueue / select 同样扫 entry 链。
+  配套 stdlib：`Socket.AcceptAsync` / `AsyncSocket.Accept` 的 POSIX 重试循环
+  原先是 `while(true) { await ReadReady; if (accept >= 0) return; }`，
+  只修 runtime 会把"永久挂死"变成"忙等"，所以循环里补一条
+  `if (!Socket.IsOpen(sock)) return -1;`（`Socket.IsOpen` = 新的
+  `zan_io_socket_alive` 导入）。`HttpServer.Start` 的 `while (this.running)`
+  于是能正常退出。
+  〔已实测〕探针 `_scratch/io_dead_fd_probe.c`（直接驱动 rt_io，Linux）：
+  HEAD 基线上 epoll 与 select 两个后端都 `timeout 15` 超时（退出码 124）；
+  修后两个后端都是 `closed-listener: woke=1 accepted=-1` /
+  `invalid-fd recv: woke=1 n=0` /  `live accept: woke=1 accepted=ok`。
+  新增用例 `tests/conformance/accept_after_close.zan`（监听 socket 在 accept
+  挂起期间被 `Stop()` 关掉，期望输出 `woke` / `failed`）。
+  Windows 全量子集 `ctest -R 'accept_after_close|http|async|socket|tcp|udp|websocket|sse|net'`
+  = **102/102 通过，8.5 秒**（含 `conformance_http_server_stress` 1.16 秒）。
+  POSIX 侧由 CI 的 `build-unix` 全量 ctest 覆盖。
+
+---
+
 # 已撤回的结论（早期草稿中的错误，勿再引用）
 
 1. ~~"无符号/窄类型只是语法别名，IR 层全塌成 i64，语义是假的"~~ ——

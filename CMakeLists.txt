@@ -513,7 +513,12 @@ foreach(_src ${_conf_srcs})
   # hardcoded listen port (e.g. the async networking conformance tests) is
   # shared between them. Serialize the runnable variants of one source via a
   # per-source resource lock so parallel ctest can't collide on that port.
-  set_tests_properties(conformance_${_name} PROPERTIES RESOURCE_LOCK src_${_name})
+  # TIMEOUT: a single case compiles in well under a second and runs in
+  # milliseconds, so anything past two minutes is a hang (a coroutine parked on
+  # a dead socket, a server that never stops). Without it ctest waits out its
+  # 1500s default and one hung case alone costs 25 minutes.
+  set_tests_properties(conformance_${_name} PROPERTIES
+    RESOURCE_LOCK src_${_name} TIMEOUT 120)
 endforeach()
 
 # ---- Determinism: codegen must be a pure function of the source ----
@@ -528,6 +533,7 @@ foreach(_src ${_conf_srcs})
       -DSTDLIB_STAMP=${_stdlib_stamp}
       -DSTAMP=${CMAKE_BINARY_DIR}/det_${_name}.stamp
       -P ${CMAKE_SOURCE_DIR}/tests/run_determinism.cmake)
+  set_tests_properties(determinism_${_name} PROPERTIES TIMEOUT 120)
 endforeach()
 
 # ---- Leak detection: run each program under --check-leaks, fail on leaks ----
@@ -548,7 +554,8 @@ foreach(_src ${_conf_srcs})
       -DOUT_EXE=${CMAKE_BINARY_DIR}/leak_${_name}${_exe_ext}
       -DSTDLIB_STAMP=${_stdlib_stamp}
       -P ${CMAKE_SOURCE_DIR}/tests/run_leakcheck.cmake)
-  set_tests_properties(leakcheck_${_name} PROPERTIES RESOURCE_LOCK src_${_name})
+  set_tests_properties(leakcheck_${_name} PROPERTIES
+    RESOURCE_LOCK src_${_name} TIMEOUT 120)
   if(_name IN_LIST _known_leaky)
     set_tests_properties(leakcheck_${_name} PROPERTIES WILL_FAIL TRUE)
   endif()

@@ -51,6 +51,7 @@ static int zan_io_trace(void){static int t=-1;if(t<0){const char*e=getenv("ZAN_I
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <errno.h>
+#include <limits.h>
 #include <time.h>
 #endif
 #if defined(__linux__)
@@ -140,6 +141,82 @@ static int32_t  g_pending_rlen;
 static int64_t *g_pending_out_n;
 static intptr_t *g_pending_accept_out;
 
+/* ---- watchers stranded on a dead fd ----
+ * A watcher whose fd is already closed (or was never valid: -1 out of a failed
+ * accept, a listener taken down by Socket.Stop while a coroutine is parked in
+ * accept) can never be reported ready: the kernel refuses to register it, and a
+ * closed fd silently leaves the epoll set. Parking such a coroutine forever
+ * hangs the whole program, so they are queued here and woken by the next poll
+ * with their operation failed -- accept/recv then return an error the Zan side
+ * already handles. Never FD_SET such an fd either: an out-of-range fd is
+ * undefined behaviour and a negative one clobbers the fd_set's own storage. */
+typedef struct zan_io_dead {
+    void *co;
+    zan_co_step_t step;
+    int64_t *out_n;
+    intptr_t *out_accept;
+    struct zan_io_dead *next;
+} zan_io_dead_t;
+
+static zan_io_dead_t *g_io_dead;
+static int g_io_dead_count;
+
+/* An fd the kernel still knows (zan_io_socket_alive: a single fcntl here). */
+static int io_fd_usable(intptr_t fd) {
+    return zan_io_socket_alive(fd) != 0;
+}
+
+static void io_mark_dead(void *co, zan_co_step_t step, int64_t *out_n,
+                         intptr_t *out_accept) {
+    zan_io_dead_t *d = (zan_io_dead_t *)calloc(1, sizeof(*d));
+    if (!d) return;
+    d->co = co;
+    d->step = step;
+    d->out_n = out_n;
+    d->out_accept = out_accept;
+    d->next = g_io_dead;
+    g_io_dead = d;
+    g_io_dead_count++;
+}
+
+/* Fail and wake every stranded watcher. recv reports 0 bytes (the end-of-stream
+ * shape its callers already expect) and accept reports -1. */
+static int io_flush_dead(void) {
+    int woke = 0;
+    while (g_io_dead) {
+        zan_io_dead_t *d = g_io_dead;
+        g_io_dead = d->next;
+        g_io_dead_count--;
+        if (d->out_accept) *d->out_accept = -1;
+        else if (d->out_n)  *d->out_n = 0;
+        io_wake(d->co, d->step);
+        free(d);
+        woke++;
+    }
+    return woke;
+}
+
+/* Drop the queue without waking anyone (shutdown: the coroutines are gone). */
+static void io_dead_clear(void) {
+    while (g_io_dead) {
+        zan_io_dead_t *d = g_io_dead;
+        g_io_dead = d->next;
+        free(d);
+    }
+    g_io_dead_count = 0;
+}
+
+/* Registration-time guard shared by the POSIX backends: returns 1 when the
+ * watcher was stranded (and thus must not be registered). */
+static int io_reject_dead_fd(intptr_t fd, void *co, zan_co_step_t step) {
+    if (io_fd_usable(fd)) return 0;
+    io_mark_dead(co, step, g_pending_out_n, g_pending_accept_out);
+    g_pending_rbuf = NULL;
+    g_pending_out_n = NULL;
+    g_pending_accept_out = NULL;
+    return 1;
+}
+
 /* On POSIX there is no overlapped recv, so zan_io_recv_co registers a readiness
  * watcher and performs the recv here once the fd is readable -- same net effect
  * (one recv per await, byte count delivered via out_n). No-op for plain probes.
@@ -153,6 +230,27 @@ static void io_deliver_recv(zan_io_entry_t *e) {
     if (!e->out_n) return;
     ssize_t rn = recv(e->fd, e->rbuf, (size_t)e->rlen, 0);
     *e->out_n = (rn < 0) ? 0 : (int64_t)rn;
+}
+
+/* Detach every watcher whose fd died under it (or is unusable with this
+ * backend: select cannot represent fd >= FD_SETSIZE) and fail them.
+ * `fd_limit` is the first fd number the backend cannot watch. */
+static int io_sweep_entries(int fd_limit) {
+    int found = 0;
+    zan_io_entry_t **pp = &g_io_entries;
+    while (*pp) {
+        zan_io_entry_t *cur = *pp;
+        if (cur->fd < fd_limit && io_fd_usable(cur->fd)) {
+            pp = &cur->next;
+            continue;
+        }
+        *pp = cur->next;
+        io_mark_dead(cur->co, cur->step, cur->out_n, cur->out_accept);
+        free(cur);
+        g_io_count--;
+        found = 1;
+    }
+    return found ? io_flush_dead() : 0;
 }
 #endif
 #endif
@@ -226,6 +324,20 @@ int64_t zan_io_socket_ready(intptr_t fd, int32_t write_ready) {
     FD_SET(sock, &fds);
     return (int64_t)select(sock + 1, write_ready ? NULL : &fds,
                           write_ready ? &fds : NULL, NULL, &timeout);
+#endif
+}
+
+/* See rt_io.h: whether `fd` is still an open socket. */
+int64_t zan_io_socket_alive(intptr_t fd) {
+#if defined(_WIN32)
+    if ((SOCKET)fd == INVALID_SOCKET) return 0;
+    int type = 0;
+    int tlen = (int)sizeof(type);
+    /* SO_TYPE on a closed handle fails with WSAENOTSOCK. */
+    return getsockopt((SOCKET)fd, SOL_SOCKET, SO_TYPE, (char *)&type, &tlen) == 0;
+#else
+    if (fd < 0) return 0;
+    return fcntl((int)fd, F_GETFD) != -1;
 #endif
 }
 
@@ -335,6 +447,7 @@ void zan_io_shutdown(void) {
     }
     g_io_entries = NULL;
     g_io_count = 0;
+    io_dead_clear();
     if (g_epoll_fd >= 0) { close(g_epoll_fd); g_epoll_fd = -1; }
     g_io_started = 0;
 }
@@ -385,8 +498,15 @@ static void io_arm(int fd, zan_io_slot_t *s) {
 }
 
 static void io_register(intptr_t fd, int32_t interest, void *co, zan_co_step_t step) {
+    if (io_reject_dead_fd(fd, co, step)) return;
     zan_io_slot_t *s = io_slot((int)fd);
-    if (!s) return;
+    if (!s) {   /* slot table could not grow: fail rather than drop the waiter */
+        io_mark_dead(co, step, g_pending_out_n, g_pending_accept_out);
+        g_pending_rbuf = NULL;
+        g_pending_out_n = NULL;
+        g_pending_accept_out = NULL;
+        return;
+    }
     zan_io_waiter_t *w;
     unsigned char *has = (interest == ZAN_IO_READ) ? &s->has_r : &s->has_w;
     zan_io_waiter_t *inl = (interest == ZAN_IO_READ) ? &s->r : &s->w;
@@ -449,11 +569,44 @@ static int io_take(zan_io_slot_t *s, int fd, int read_dir,
     return n;
 }
 
+/* Fail every waiter parked on an fd that has since been closed. Closing an fd
+ * removes it from the epoll set without any event, so such waiters are
+ * invisible to epoll_wait and would otherwise never be resumed. */
+static int io_sweep_slots(void) {
+    int woke = 0;
+    for (int fd = 0; fd < g_slots_cap; fd++) {
+        zan_io_slot_t *s = &g_slots[fd];
+        if (!s->has_r && !s->has_w) continue;
+        if (io_fd_usable(fd)) continue;
+        zan_io_waiter_t ready[8];
+        int nr = io_take(s, fd, 1, ready, 8);
+        nr += io_take(s, fd, 0, ready + nr, 8 - nr);
+        s->in_epoll = 0;
+        for (int k = 0; k < nr; k++) {
+            if (ready[k].out_accept)   *ready[k].out_accept = -1;
+            else if (ready[k].out_n)   *ready[k].out_n = 0;
+            g_io_count--;
+            io_wake(ready[k].co, ready[k].step);
+            woke++;
+        }
+    }
+    return woke;
+}
+
 int32_t zan_io_poll(int64_t timeout_ms) {
+    if (g_io_dead) return io_flush_dead();
     if (g_io_count == 0) return 0;
+    /* An unbounded wait is the one that turns a stranded waiter into a hang,
+     * so check for dead fds before committing to it. */
+    if (timeout_ms < 0) {
+        int woke = io_sweep_slots();
+        if (woke) return woke;
+        if (g_io_count == 0) return 0;
+    }
     struct epoll_event events[256];
     int n = epoll_wait(g_epoll_fd, events, 256,
                        timeout_ms < 0 ? -1 : (int)timeout_ms);
+    if (n == 0) return io_sweep_slots();
     int woke = 0;
     for (int i = 0; i < n; i++) {
         int fd = events[i].data.fd;
@@ -503,6 +656,7 @@ void zan_io_shutdown(void) {
     }
     g_io_entries = NULL;
     g_io_count = 0;
+    io_dead_clear();
     if (g_kq_fd >= 0) { close(g_kq_fd); g_kq_fd = -1; }
     g_io_started = 0;
 }
@@ -514,6 +668,7 @@ int32_t zan_io_set_nonblocking(intptr_t fd) {
 }
 
 static void io_register(intptr_t fd, int32_t interest, void *co, zan_co_step_t step) {
+    if (io_reject_dead_fd(fd, co, step)) return;
     zan_io_entry_t *e = (zan_io_entry_t *)calloc(1, sizeof(*e));
     e->fd = (int)fd;
     e->interest = interest;
@@ -522,8 +677,10 @@ static void io_register(intptr_t fd, int32_t interest, void *co, zan_co_step_t s
     e->rbuf = g_pending_rbuf;
     e->rlen = g_pending_rlen;
     e->out_n = g_pending_out_n;
+    e->out_accept = g_pending_accept_out;
     g_pending_rbuf = NULL;
     g_pending_out_n = NULL;
+    g_pending_accept_out = NULL;
     e->next = g_io_entries;
     g_io_entries = e;
     g_io_count++;
@@ -535,11 +692,18 @@ static void io_register(intptr_t fd, int32_t interest, void *co, zan_co_step_t s
 }
 
 int32_t zan_io_poll(int64_t timeout_ms) {
+    if (g_io_dead) return io_flush_dead();
     if (g_io_count == 0) return 0;
+    if (timeout_ms < 0) {
+        int woke = io_sweep_entries(INT_MAX);
+        if (woke) return woke;
+        if (g_io_count == 0) return 0;
+    }
     struct kevent events[64];
     struct timespec ts = { timeout_ms / 1000, (timeout_ms % 1000) * 1000000L };
     int n = kevent(g_kq_fd, NULL, 0, events, 64,
                    timeout_ms < 0 ? NULL : &ts);
+    if (n == 0) return io_sweep_entries(INT_MAX);
     int woke = 0;
     for (int i = 0; i < n; i++) {
         int fd = (int)events[i].ident;
@@ -1011,6 +1175,7 @@ void zan_io_shutdown(void) {
     }
     g_io_entries = NULL;
     g_io_count = 0;
+    io_dead_clear();
     g_io_started = 0;
 }
 
@@ -1021,6 +1186,10 @@ int32_t zan_io_set_nonblocking(intptr_t fd) {
 }
 
 static void io_register(intptr_t fd, int32_t interest, void *co, zan_co_step_t step) {
+    /* select can only represent fd numbers below FD_SETSIZE; fail anything it
+     * (or the kernel) cannot watch instead of parking the coroutine. */
+    if (fd >= FD_SETSIZE) { io_reject_dead_fd(-1, co, step); return; }
+    if (io_reject_dead_fd(fd, co, step)) return;
     zan_io_entry_t *e = (zan_io_entry_t *)calloc(1, sizeof(*e));
     e->fd = (int)fd;
     e->interest = interest;
@@ -1039,7 +1208,19 @@ static void io_register(intptr_t fd, int32_t interest, void *co, zan_co_step_t s
 }
 
 int32_t zan_io_poll(int64_t timeout_ms) {
+    if (g_io_dead) return io_flush_dead();
     if (g_io_count == 0) return 0;
+
+    /* Every fd goes into an fd_set below, so a watcher whose socket has been
+     * closed under it must leave the list first: FD_SET of a negative or
+     * out-of-range fd is undefined behaviour (with -1 it writes outside the
+     * fd_set, and select then waits on whatever bit that landed on -- fd 0 in
+     * practice, which never becomes ready). */
+    {
+        int woke = io_sweep_entries(FD_SETSIZE);
+        if (woke) return woke;
+        if (g_io_count == 0) return 0;
+    }
 
     fd_set read_fds, write_fds;
     FD_ZERO(&read_fds);
@@ -1141,6 +1322,9 @@ int32_t zan_io_pump(void) {
 }
 
 int32_t zan_io_has_pending(void) {
+#if !defined(_WIN32)
+    if (g_io_dead_count > 0) return 1;   /* stranded watchers still owe a wake */
+#endif
     return g_io_count > 0;
 }
 

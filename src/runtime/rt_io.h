@@ -42,6 +42,13 @@ int64_t zan_io_socket_ready(intptr_t fd, int32_t write_ready);
  * available) once the connect has failed, and -2 while still in progress. */
 int64_t zan_io_connect_status(intptr_t fd);
 
+/* Whether `fd` still refers to an open socket. Non-zero when it does.
+ * A readiness-retry loop (accept, in particular) needs this: once its socket
+ * has been closed under it -- a listener taken down by Stop() while a coroutine
+ * was parked in accept -- the fd can never become ready again, and the loop
+ * must report the failure instead of re-arming the watcher forever. */
+int64_t zan_io_socket_alive(intptr_t fd);
+
 /* ---- stackless (CPS state-machine) ABI ----
  *
  * The compiler's async lowering (see docs/ASYNC_CPS_DESIGN.md) has no fiber to
