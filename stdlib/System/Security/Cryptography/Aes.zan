@@ -6,9 +6,6 @@ namespace System.Security.Cryptography;
 /// 128/192/256-bit keys. Pure Zan, byte-oriented (no T-tables). The S-box is
 /// stored as hex and decoded once; the inverse S-box is derived from it.</summary>
 class Aes {
-    [DllImport("crt")] static extern string calloc(long count, long size);
-    [DllImport("crt")] static extern void free(string ptr);
-
     static string SBOX_HEX() {
         return "637c777bf26b6fc53001672bfed7ab76"
              + "ca82c97dfa5947f0add4a2af9ca472c0"
@@ -29,13 +26,13 @@ class Aes {
     }
 
     static string sbox;
-    static string inv;
+    static byte[] inv;
     static bool ready = false;
 
     static void init() {
         if (ready) { return; }
         sbox = Hex.Decode(SBOX_HEX());
-        inv = calloc(257, 1);
+        inv = new byte[256];
         int i = 0;
         while (i < 256) { inv[sbox[i] & 255] = i; i = i + 1; }
         ready = true;
@@ -62,13 +59,13 @@ class Aes {
 
     /// <summary>Expands a key into (Nr+1)*16 round-key bytes. Returns the buffer;
     /// <paramref name="nrOut"/>[0] receives the round count.</summary>
-    static string expandKey(string key, int keyLen, List<int> nrOut) {
+    static byte[] expandKey(string key, int keyLen, List<int> nrOut) {
         init();
         int nk = keyLen / 4;
         int nr = nk + 6;
         nrOut[0] = nr;
         int total = 16 * (nr + 1);
-        string rk = calloc(total + 1, 1);
+        byte[] rk = new byte[total];
         int i = 0;
         while (i < keyLen) { rk[i] = key[i] & 255; i = i + 1; }
         int rcon = 1;
@@ -94,12 +91,12 @@ class Aes {
         return rk;
     }
 
-    static void addRoundKey(string st, string rk, int round) {
+    static void addRoundKey(byte[] st, byte[] rk, int round) {
         int i = 0;
         while (i < 16) { st[i] = (st[i]&255) ^ (rk[round*16+i]&255); i = i + 1; }
     }
 
-    static void encryptBlock(string st, string rk, int nr) {
+    static void encryptBlock(byte[] st, byte[] rk, int nr) {
         addRoundKey(st, rk, 0);
         int r = 1;
         while (r < nr) {
@@ -114,7 +111,7 @@ class Aes {
         addRoundKey(st, rk, nr);
     }
 
-    static void decryptBlock(string st, string rk, int nr) {
+    static void decryptBlock(byte[] st, byte[] rk, int nr) {
         addRoundKey(st, rk, nr);
         int r = nr - 1;
         while (r >= 1) {
@@ -129,8 +126,8 @@ class Aes {
         addRoundKey(st, rk, 0);
     }
 
-    static void shiftRows(string st) {
-        string t = calloc(17, 1);
+    static void shiftRows(byte[] st) {
+        byte[] t = new byte[16];
         int c = 0;
         while (c < 4) {
             int r = 0;
@@ -138,11 +135,10 @@ class Aes {
             c = c + 1;
         }
         int i = 0; while (i < 16) { st[i] = t[i]&255; i = i + 1; }
-        free(t);
     }
 
-    static void invShiftRows(string st) {
-        string t = calloc(17, 1);
+    static void invShiftRows(byte[] st) {
+        byte[] t = new byte[16];
         int c = 0;
         while (c < 4) {
             int r = 0;
@@ -150,10 +146,9 @@ class Aes {
             c = c + 1;
         }
         int i = 0; while (i < 16) { st[i] = t[i]&255; i = i + 1; }
-        free(t);
     }
 
-    static void mixColumns(string st) {
+    static void mixColumns(byte[] st) {
         int c = 0;
         while (c < 4) {
             int a0=st[c*4]&255; int a1=st[c*4+1]&255; int a2=st[c*4+2]&255; int a3=st[c*4+3]&255;
@@ -165,7 +160,7 @@ class Aes {
         }
     }
 
-    static void invMixColumns(string st) {
+    static void invMixColumns(byte[] st) {
         int c = 0;
         while (c < 4) {
             int a0=st[c*4]&255; int a1=st[c*4+1]&255; int a2=st[c*4+2]&255; int a3=st[c*4+3]&255;
@@ -179,39 +174,37 @@ class Aes {
 
     /// <summary>Encrypts a single 16-byte block (ECB). For testing / building
     /// other modes. Returns a fresh 16-byte buffer.</summary>
-    static string EncryptBlockEcb(string key, int keyLen, string in16) {
+    static byte[] EncryptBlockEcb(string key, int keyLen, string in16) {
         List<int> nr = new List<int>(); nr.Add(0);
-        string rk = expandKey(key, keyLen, nr);
-        string st = calloc(17, 1);
+        byte[] rk = expandKey(key, keyLen, nr);
+        byte[] st = new byte[16];
         int i = 0; while (i < 16) { st[i] = in16[i]&255; i = i + 1; }
         encryptBlock(st, rk, nr[0]);
-        free(rk);
         return st;
     }
 
-    static string DecryptBlockEcb(string key, int keyLen, string in16) {
+    static byte[] DecryptBlockEcb(string key, int keyLen, string in16) {
         List<int> nr = new List<int>(); nr.Add(0);
-        string rk = expandKey(key, keyLen, nr);
-        string st = calloc(17, 1);
+        byte[] rk = expandKey(key, keyLen, nr);
+        byte[] st = new byte[16];
         int i = 0; while (i < 16) { st[i] = in16[i]&255; i = i + 1; }
         decryptBlock(st, rk, nr[0]);
-        free(rk);
         return st;
     }
 
     /// <summary>AES-CBC encrypt with PKCS#7 padding. Returns ciphertext;
     /// <paramref name="outLen"/>[0] receives its length.</summary>
-    static string EncryptCbc(string key, int keyLen, string iv, string data, int len, List<int> outLen) {
+    static byte[] EncryptCbc(string key, int keyLen, string iv, string data, int len, List<int> outLen) {
         List<int> nr = new List<int>(); nr.Add(0);
-        string rk = expandKey(key, keyLen, nr);
+        byte[] rk = expandKey(key, keyLen, nr);
         int padVal = 16 - (len % 16);
         int total = len + padVal;
-        string outb = calloc(total + 1, 1);
-        string prev = calloc(17, 1);
+        byte[] outb = new byte[total];
+        byte[] prev = new byte[16];
         int i = 0; while (i < 16) { prev[i] = iv[i]&255; i = i + 1; }
         int off = 0;
         while (off < total) {
-            string st = calloc(17, 1);
+            byte[] st = new byte[16];
             int j = 0;
             while (j < 16) {
                 int b;
@@ -221,36 +214,32 @@ class Aes {
             }
             encryptBlock(st, rk, nr[0]);
             j = 0; while (j < 16) { outb[off+j] = st[j]&255; prev[j] = st[j]&255; j = j + 1; }
-            free(st);
             off = off + 16;
         }
-        free(prev); free(rk);
         outLen[0] = total;
         return outb;
     }
 
     /// <summary>AES-CBC decrypt, stripping PKCS#7 padding. Returns plaintext;
     /// <paramref name="outLen"/>[0] receives its length.</summary>
-    static string DecryptCbc(string key, int keyLen, string iv, string data, int len, List<int> outLen) {
+    static byte[] DecryptCbc(string key, int keyLen, string iv, string data, int len, List<int> outLen) {
         List<int> nr = new List<int>(); nr.Add(0);
-        string rk = expandKey(key, keyLen, nr);
-        string outb = calloc(len + 1, 1);
-        string prev = calloc(17, 1);
+        byte[] rk = expandKey(key, keyLen, nr);
+        byte[] outb = new byte[len];
+        byte[] prev = new byte[16];
         int i = 0; while (i < 16) { prev[i] = iv[i]&255; i = i + 1; }
         int off = 0;
         while (off < len) {
-            string st = calloc(17, 1);
+            byte[] st = new byte[16];
             int j = 0; while (j < 16) { st[j] = data[off+j]&255; j = j + 1; }
-            string cipher = calloc(17, 1);
+            byte[] cipher = new byte[16];
             j = 0; while (j < 16) { cipher[j] = st[j]&255; j = j + 1; }
             decryptBlock(st, rk, nr[0]);
             j = 0;
             while (j < 16) { outb[off+j] = (st[j]&255) ^ (prev[j]&255); j = j + 1; }
             j = 0; while (j < 16) { prev[j] = cipher[j]&255; j = j + 1; }
-            free(st); free(cipher);
             off = off + 16;
         }
-        free(prev); free(rk);
         int plen = len;
         if (len > 0) {
             int padVal = outb[len-1]&255;
@@ -263,20 +252,19 @@ class Aes {
     /// <summary>AES-CTR (encrypt == decrypt). <paramref name="iv"/> is the 16-byte
     /// initial counter block. Returns a buffer of exactly <paramref name="len"/>
     /// bytes.</summary>
-    static string Ctr(string key, int keyLen, string iv, string data, int len) {
+    static byte[] Ctr(string key, int keyLen, string iv, string data, int len) {
         List<int> nr = new List<int>(); nr.Add(0);
-        string rk = expandKey(key, keyLen, nr);
-        string outb = calloc(len + 1, 1);
-        string ctr = calloc(17, 1);
+        byte[] rk = expandKey(key, keyLen, nr);
+        byte[] outb = new byte[len];
+        byte[] ctr = new byte[16];
         int i = 0; while (i < 16) { ctr[i] = iv[i]&255; i = i + 1; }
         int off = 0;
         while (off < len) {
-            string ks = calloc(17, 1);
+            byte[] ks = new byte[16];
             int j = 0; while (j < 16) { ks[j] = ctr[j]&255; j = j + 1; }
             encryptBlock(ks, rk, nr[0]);
             j = 0;
             while (j < 16 && off + j < len) { outb[off+j] = (data[off+j]&255) ^ (ks[j]&255); j = j + 1; }
-            free(ks);
             int c = 15;
             while (c >= 0) {
                 int v = (ctr[c]&255) + 1;
@@ -286,7 +274,6 @@ class Aes {
             }
             off = off + 16;
         }
-        free(ctr); free(rk);
         return outb;
     }
 }

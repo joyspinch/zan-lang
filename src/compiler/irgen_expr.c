@@ -180,6 +180,64 @@ static bool emit_span_call(zan_irgen_t *g, zan_ast_node_t *expr,
     return false;
 }
 
+/* Byte-buffer bridge: `byte[]` is the owned buffer the library allocates and
+ * hands to C (an array value already points at its first element, so it is a
+ * `char*` as far as an extern is concerned), and these two convert between it
+ * and `string` without going through the "calloc returns a string" idiom.
+ *   s.ToBytes()          -> byte[] holding the bytes of s (no NUL)
+ *   b.ToStr([off, len])  -> owned rc string copied out of the buffer */
+static bool emit_bytes_call(zan_irgen_t *g, zan_ast_node_t *expr,
+                            local_scope_t *locals, LLVMValueRef *out) {
+    zan_ast_node_t *callee = expr->call.callee;
+    if (!callee || callee->kind != AST_MEMBER_ACCESS) return false;
+    zan_istr_t mm = callee->member.name;
+    bool to_bytes = mm.len == 7 && memcmp(mm.str, "ToBytes", 7) == 0;
+    bool to_str = mm.len == 5 && memcmp(mm.str, "ToStr", 5) == 0;
+    if (!to_bytes && !to_str) return false;
+
+    zan_type_t *ot = infer_expr_type(g, callee->member.object, locals);
+    if (!ot) return false;
+    LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
+    LLVMTypeRef i8ptr = LLVMPointerType(i8, 0);
+    LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
+    LLVMTypeRef memcpy_ty =
+        LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i8ptr, i8ptr, i64t }, 3, 0);
+    LLVMValueRef memcpy_fn = get_libc_fn(g, "memcpy", memcpy_ty);
+
+    if (to_bytes) {
+        if (ot->kind != TYPE_STRING || expr->call.args.count != 0) return false;
+        LLVMValueRef s = emit_expr(g, callee->member.object, locals);
+        LLVMTypeRef strlen_ty = LLVMFunctionType(i64t, (LLVMTypeRef[]){ i8ptr }, 1, 0);
+        LLVMValueRef len = zan_call2(g->builder, strlen_ty, g->fn_strlen, &s, 1, "tb.len");
+        LLVMValueRef arr = zan_array_alloc(g, len, len);
+        zan_call2(g->builder, memcpy_ty, memcpy_fn,
+                  (LLVMValueRef[]){ arr, s, len }, 3, "");
+        *out = arr;
+        return true;
+    }
+
+    if (ot->kind != TYPE_ARRAY) return false;
+    if (expr->call.args.count != 0 && expr->call.args.count != 2) return false;
+    LLVMValueRef arr = emit_expr(g, callee->member.object, locals);
+    LLVMValueRef src = arr, len = zan_array_len(g, arr);
+    if (expr->call.args.count == 2) {
+        LLVMValueRef off = coerce_int_to(g,
+            emit_expr(g, expr->call.args.items[0], locals), i64t);
+        len = coerce_int_to(g,
+            emit_expr(g, expr->call.args.items[1], locals), i64t);
+        src = LLVMBuildGEP2(g->builder, i8, arr, &off, 1, "ts.src");
+    }
+    LLVMTypeRef alloc_ty = LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i64t }, 1, 0);
+    LLVMValueRef total = LLVMBuildAdd(g->builder, len, LLVMConstInt(i64t, 1, 0), "ts.n");
+    LLVMValueRef s = zan_call2(g->builder, alloc_ty, g->rt_str_alloc, &total, 1, "ts.str");
+    zan_call2(g->builder, memcpy_ty, memcpy_fn,
+              (LLVMValueRef[]){ s, src, len }, 3, "");
+    LLVMValueRef endp = LLVMBuildGEP2(g->builder, i8, s, &len, 1, "ts.end");
+    LLVMBuildStore(g->builder, LLVMConstInt(i8, 0, 0), endp);
+    *out = s;
+    return true;
+}
+
 static bool emit_native_memory_call(zan_irgen_t *g, zan_ast_node_t *expr,
                                     local_scope_t *locals, LLVMValueRef *out) {
     LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);

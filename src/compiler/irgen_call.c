@@ -459,6 +459,13 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                 return sp_out;
         }
 
+        /* byte[] <-> string: s.ToBytes(), b.ToStr([off, len]). */
+        {
+            LLVMValueRef by_out = NULL;
+            if (emit_bytes_call(g, expr, locals, &by_out))
+                return by_out;
+        }
+
         /* String.CompareOrdinal(a, b) → strcmp: byte-wise ordinal compare of
          * two NUL-terminated strings in one libc call. */
         if (is_call_to(expr, "String", "CompareOrdinal") && expr->call.args.count == 2) {

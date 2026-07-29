@@ -133,6 +133,7 @@ zan_type_t *zan_binder_resolve_type(zan_binder_t *b, zan_ast_node_t *type_ref);
  * lowering, which has no syntactic type reference to resolve). */
 zan_type_t *zan_binder_make_list_type(zan_binder_t *b, zan_type_t *elem);
 zan_type_t *zan_binder_make_span_type(zan_binder_t *b, zan_type_t *elem);
+zan_type_t *zan_binder_make_array_type(zan_binder_t *b, zan_type_t *elem);
 
 /* Substitute the type parameters named by `tps` with `args` throughout `t`,
  * cloning composite types on the way (List<T> -> List<Square>). */

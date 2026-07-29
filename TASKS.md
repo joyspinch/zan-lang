@@ -859,6 +859,35 @@ catch 块内的挂起、foreach 的降级与状态切分冲突。所以是**定�
 
 ## B2 字节缓冲：收敛 "calloc 返回 string" 的用法 〔依赖 A1〕
 
+**A1-3 ✅ 已完成（2026-07-28）：字节缓冲类型与 string 桥接就位。**
+`byte[]` 现在是"自有字节缓冲"的正式类型：`new byte[n]` 归零、带长度、
+元素就是 i8、指针指向首元素（16 字节头在前），所以可以原样传给声明为
+`string`（`char*`）的 extern 和 Zan 函数。新增两个编译器内建完成与文本的互转：
+
+* `s.ToBytes()` → `byte[]`，复制 `s` 的字节（不含结尾 NUL）；
+* `b.ToStr()` / `b.ToStr(off, len)` → 由 `zan_rt_str_alloc` 分配的**受 ARC 管理**的
+  string（尾部补 NUL），因此**不能**再对它调 `free`；`free` 仍然只用于
+  `calloc` 出来的裸缓冲区（`ffi_free_consumes_string` 的语义不变）。
+
+用例 `tests/conformance/byte_buffer.zan`（含 conformance / determinism / leakcheck 三档）。
+
+**B2-1 部分完成：Aes / AesGcm / ResourcePack 这一条链已改为 `byte[]`。**
+`Aes` 的 `inv` / 轮密钥 / state / 输出缓冲、`AesGcm` 的 blk / lb / j0 / ctr / 密文明文，
+以及 `ResourcePack` 的密文列表与 `Read()` 返回值全部换成 `byte[]`，
+两个类里的 `extern string calloc` / `extern void free` 声明连同 **23 处 `free()`**
+一起删除（其中 `WechatPayV2` 对 `Aes.DecryptBlockEcb` 结果本来就漏了 free，
+换成 `byte[]` 后由 ARC 负责）。`ResourcePack.Read()` 返回 `byte[]`，
+调用方用 `.ToStr(0, len)` 取文本。
+输入参数仍声明为 `string`（`char*` 边界），`byte[]` 可直接传入，
+所以这次改造不需要动 key / iv / data 这些只读入参。
+
+* **B2-1（剩余）** `extern string calloc(...)` 仍在 **54 个文件**里，覆盖
+  `Cryptography`（Sha1 / Sha256 / Sha512 / Md5 / Hmac / Rsa / Sm2 / Sm3 / Sm4 /
+  Base64 / Hex / BigInt / Hkdf）、`Net`（TcpClient / Socket / UdpClient / WebSocket /
+  TlsStream / Mqtt）、`Data`（几乎每个驱动）、`IO`（File / Directory / Path）。
+  按"一条调用链一批"继续：改一个类的内部缓冲很容易，难的是它的返回值
+  被谁 `free`——所以每批都要连调用方一起改（Aes 这批即是范例）。
+
 〔已实测〕**这个惯用法是有意设计、有 conformance 覆盖的，不是内存安全 bug。**
 `tests/conformance/ffi_free_consumes_string.zan` 专门测它：`calloc` 返回的 buffer
 可以 `buf[0] = 65` 直接写，`free(buf)` 会消费它并把变量（含字段别名）置 null。
@@ -866,12 +895,6 @@ catch 块内的挂起、foreach 的降级与状态切分冲突。所以是**定�
 `Substring` / `IndexOf` / 拼接 / 当 Dictionary key / 200 次循环 `--check-leaks`，
 全部正确、`Length` 正确、无泄漏报告。**所以这是提炼问题不是安全问题。**
 
-* **B2-1** `extern string calloc(...)` 出现在 **49 个文件**里，覆盖
-  `Cryptography`（Aes / Sha1 / Sha256 / Sha512 / Md5 / Hmac / Rsa / Sm2 / Sm3 / Sm4 /
-  Base64 / Hex / BigInt / Hkdf）、`Net`（TcpClient / Socket / UdpClient / WebSocket /
-  TlsStream / Mqtt）、`Data`（几乎每个驱动）、`IO`（File / Directory / Path）。
-  它能跑，但**全库把 `string` 当可变字节缓冲区用**是没有字节缓冲类型逼出来的；
-  A1 的 `Span<byte>` / `byte[]` 到位后换掉。
 * **B2-2** `stdlib/System/IO/Path.zan` 是纯字符串处理，却整个建在
   `strrchr` / `strcpy` / `strcat` / `calloc` 上（`GetFileName` 用
   `strlen(lastBslash) < strlen(lastSlash)` 比长度判断哪个分隔符靠后）。

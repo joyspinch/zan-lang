@@ -837,6 +837,15 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
                 zan_type_t *sot = infer_expr_type(g, callee->member.object, locals);
                 if (is_span_type(sot)) return sot;
             }
+            if (mm.len == 7 && memcmp(mm.str, "ToBytes", 7) == 0) {
+                zan_type_t *bot = infer_expr_type(g, callee->member.object, locals);
+                if (bot && bot->kind == TYPE_STRING)
+                    return zan_binder_make_array_type(g->binder, g->binder->type_byte);
+            }
+            if (mm.len == 5 && memcmp(mm.str, "ToStr", 5) == 0) {
+                zan_type_t *bot = infer_expr_type(g, callee->member.object, locals);
+                if (bot && bot->kind == TYPE_ARRAY) return g->binder->type_string;
+            }
             if ((mm.len == 9 && memcmp(mm.str, "Substring", 9) == 0) ||
                 (mm.len == 8 && memcmp(mm.str, "ToString", 8) == 0) ||
                 (mm.len == 4 && memcmp(mm.str, "Trim", 4) == 0) ||

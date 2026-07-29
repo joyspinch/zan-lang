@@ -149,6 +149,12 @@ zan_type_t *zan_binder_make_span_type(zan_binder_t *b, zan_type_t *elem) {
     return t;
 }
 
+zan_type_t *zan_binder_make_array_type(zan_binder_t *b, zan_type_t *elem) {
+    zan_type_t *t = make_type(b->arena, TYPE_ARRAY, elem->name.str, elem->name.len);
+    t->element_type = elem;
+    return t;
+}
+
 /* Substitute type parameters (matched by declared name in `tps`) with `args`
  * throughout `t`, cloning composite types as needed. */
 zan_type_t *zan_binder_subst_named(zan_binder_t *b, zan_type_t *t,
