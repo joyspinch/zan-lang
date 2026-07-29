@@ -1517,6 +1517,21 @@ header-only 库 / C 回调 / 结构体字段偏移，全部对应 A2 / A3 / A4�
   `internal_surface_data/clip` 两个内部口子随之删除，其余全是跟随项。
   动手前先给 `blur_rect` / `fill_radial` / `blit_image` 做基准，
   它们是玻璃主题下单帧最贵的循环。
+  - **✅ 阶段 0 基准已做（2026-07-29）**：`_scratch/b51_bench.zan`（`zanc` 编译，
+    1600×900 surface，QueryPerformanceCounter 计时）。**C 版基线**：
+    `blur_rect` 800×500 r=24 = **3916 µs/op**（20 次）、
+    `fill_radial` r=300 = **1469 µs/op**（200 次）、
+    `blit_image` 256×256→512×512 = **623 µs/op**（200 次，解码已缓存）、
+    参考项 `fill_rect` 300×200 = **5 µs/op**（20000 次）。
+    Zan 版验收线（≥0.9x）：blur ≤ 4351、radial ≤ 1632、blit ≤ 692 µs/op。
+  - **移植的真实边界**（读代码后确认，排期要按这个来）：`gui_runtime.c` 的
+    surface 表还被 **C 文字/字形渲染**（`gui_runtime_text.c:167`、
+    `gui_runtime_font.c:150/269` 直接取 `g_surfaces[id]` 并用 `set_pixel`/clip）
+    和 **SDL / X11 / Cocoa present** 共用，`zan_gui_internal_surface_data/clip`
+    就是给 Cocoa 那条路开的口子。所以「surface 所有权归 Zan」必须同一批改掉
+    文字导出的签名（`surface_id` → `ptr,w,h,stride,clip*`）与三条 present 路径；
+    `blit_image` 还挂着 C 里的 stb_image 解码缓存（解码留 C，只搬采样循环）。
+    Windows present 已经只要 `pixels/w/h`（`Win32Shell.Blit`），不构成阻塞。
 * **B5-2 🟡 大部分完成**（`067ec4e` 删掉 C Win32 shell 与 link-only shims）。
   〔2026-07-29 核实〕`gui_runtime_shims.c` 从 160 行降到 3.5KB，里面**只剩
   macOS 非-Cocoa（SDL windowing）构建的 22 个 WebView no-op 桩**（`#if defined(__APPLE__)

@@ -1,0 +1,101 @@
+using System;
+using Gui;
+
+/// B5-1 阶段 0：光栅器基准。
+/// 在把 gui_runtime.c 的图元搬到 Zan 之前先量一遍 C 版的单帧成本，
+/// 之后 Zan 版必须 >= 0.9x（TASKS.md B5-1 的判定）。
+/// 用法: zanc tests/gui/raster_bench.zan -o build/b51_bench.exe && build\b51_bench.exe
+class B51Bench {
+    [DllImport("kernel32")]
+    static extern int QueryPerformanceCounter(nint p);
+
+    [DllImport("kernel32")]
+    static extern int QueryPerformanceFrequency(nint p);
+
+    static long freq;
+
+    static long Now() {
+        nint slot = NativeMemory.Alloc(16);
+        QueryPerformanceCounter(slot);
+        long t = new Span<long>(slot, 1)[0];
+        NativeMemory.Free(slot);
+        return t;
+    }
+
+    static void Report(string name, int iters, long t0, long t1) {
+        long us = (t1 - t0) * 1000000 / B51Bench.freq;
+        long per = us / iters;
+        Console.WriteLine(name + ": " + iters + " iters, " + us + " us total, "
+                          + per + " us/op");
+    }
+
+    static void Main() {
+        nint slot = NativeMemory.Alloc(16);
+        QueryPerformanceFrequency(slot);
+        B51Bench.freq = new Span<long>(slot, 1)[0];
+        NativeMemory.Free(slot);
+
+        int W = 1600;
+        int H = 900;
+        Canvas c = Canvas.Create(W, H);
+
+        // 一个有内容的背景，blur 才有真实的取样成本
+        c.Clear(0xFF202430);
+        int i = 0;
+        while (i < 200) {
+            c.FillRect(i * 7 % W, i * 13 % H, 120, 80, 0xFF3A6EA5 + i);
+            i = i + 1;
+        }
+
+        // --- blur_rect: 玻璃主题下单帧最贵的循环
+        int n = 20;
+        long t0 = B51Bench.Now();
+        i = 0;
+        while (i < n) {
+            c.BlurRect(100, 100, 800, 500, 24);
+            i = i + 1;
+        }
+        long t1 = B51Bench.Now();
+        Report("blur_rect 800x500 r=24", n, t0, t1);
+
+        // --- fill_radial
+        n = 200;
+        t0 = B51Bench.Now();
+        i = 0;
+        while (i < n) {
+            c.FillRadial(800, 450, 300, 0x80FFFFFF, 200);
+            i = i + 1;
+        }
+        t1 = B51Bench.Now();
+        Report("fill_radial r=300", n, t0, t1);
+
+        // --- blit_image（首次含解码，之后走缓存）
+        string img = "examples/game/ddz/assets/avatar_me.png";
+        int iw = Canvas.ImageWidth(img);
+        int ih = Canvas.ImageHeight(img);
+        Console.WriteLine("image " + img + " = " + iw + "x" + ih);
+        c.BlitImage(img, 40, 40, 512, 512, 0, 0, iw, ih);
+        n = 200;
+        t0 = B51Bench.Now();
+        i = 0;
+        while (i < n) {
+            c.BlitImage(img, 40, 40, 512, 512, 0, 0, iw, ih);
+            i = i + 1;
+        }
+        t1 = B51Bench.Now();
+        Report("blit_image ->512x512", n, t0, t1);
+
+        // --- 参考项：最常见的实心矩形
+        n = 20000;
+        t0 = B51Bench.Now();
+        i = 0;
+        while (i < n) {
+            c.FillRect(10, 10, 300, 200, 0xFF4488CC);
+            i = i + 1;
+        }
+        t1 = B51Bench.Now();
+        Report("fill_rect 300x200", n, t0, t1);
+
+        c.Destroy();
+    }
+}
