@@ -1,0 +1,66 @@
+using System;
+using System.IO;
+using System.Threading;
+
+/// Every extern is declared at the width its C signature really uses, so the
+/// FFI boundary neither truncates nor reads garbage:
+///   - pointer handles cross as `nint` (malloc'd memory, OS handles)
+///   - `size_t` arguments and results (calloc/memcpy/strlen/fread/fwrite)
+///   - byte counts and the monotonic clock stay 64-bit, status codes stay 32-bit
+class Program {
+    static string Repeat(string unit, int times) {
+        string s = "";
+        int i = 0;
+        while (i < times) { s = s + unit; i = i + 1; }
+        return s;
+    }
+
+    static void Main() {
+        Console.WriteLine("=== pointer handles ===");
+        // calloc/free take size_t and hand back a pointer: the full pointer has
+        // to survive the round trip, including arithmetic on it.
+        nint p = NativeMemory.Alloc(4096);
+        Console.WriteLine(p != 0);
+        Span<byte> bytes = new Span<byte>(p, 4096);
+        bytes[0] = 1;
+        bytes[4095] = 255;
+        Span<int> words = new Span<int>(p + 2048, 2);
+        words[0] = 2147483647;
+        words[1] = -2147483648;
+        Console.WriteLine(bytes[0]);
+        Console.WriteLine(bytes[4095]);
+        Console.WriteLine(words[0]);
+        Console.WriteLine(words[1]);
+        Console.WriteLine(bytes[2048]);
+        NativeMemory.Free(p);
+
+        Console.WriteLine("=== size_t lanes ===");
+        // A payload far beyond any 16-bit count, pushed through strlen (size_t
+        // result) and fwrite/fread (size_t size/count/result).
+        string unit = "0123456789abcdef";
+        string payload = Repeat(unit, 4096);
+        Console.WriteLine(payload.Length);
+        string path = "zan_ffi_widths.bin";
+        File.WriteAllText(path, payload);
+        string back = File.ReadAllText(path);
+        Console.WriteLine(back.Length);
+        Console.WriteLine(back == payload);
+        Console.WriteLine(File.GetSize(path));
+        File.Delete(path);
+        Console.WriteLine(File.Exists(path));
+
+        Console.WriteLine("=== 64-bit clock ===");
+        // zan_monotonic_us is int64_t: microseconds overflow int32 after ~35min.
+        long us0 = Stopwatch.GetMicroseconds();
+        long ms0 = Stopwatch.GetMilliseconds();
+        int spin = 0;
+        int i = 0;
+        while (i < 200000) { spin = spin + i; i = i + 1; }
+        long us1 = Stopwatch.GetMicroseconds();
+        if (us0 > 0 && us1 >= us0 && ms0 > 0) {
+            Console.WriteLine("clock ok");
+        } else {
+            Console.WriteLine("clock bad");
+        }
+    }
+}

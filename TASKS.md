@@ -375,6 +375,36 @@ static extern int zan_gui_present(int hwnd, int surfaceId);
 现在 extern 声明的全部逻辑是 `irgen_emit.c:294-307`：
 逐个 `map_type` 后 `LLVMFunctionType(rt, pt, pc, 0)`，`IsVarArg` 恒为 0，无任何 ABI 处理。
 
+* **A2-0 ✅ 已完成（2026-07-28）声明位宽逐符号核对**。工具 `_scratch/a2/`：
+  `extern_audit.py` 按 `DllImport` 的 `EntryPoint` 抽出 stdlib 全部 **864 个 extern**
+  （带 `#if WINDOWS / LINUX || MACOS` 分支归属），与两个来源比对——
+  仓库自己定义的 C 符号（`src/`、`stdlib/**/native/`，245 个），以及
+  Windows SDK + CRT 头的 clang AST（`sys_audit.py`，480 个，typedef 递归展开到
+  基础类型）。两边现在都是 **0 处不一致**。分三批修：
+  - **A2-0a**（`0267829`）运行时 shim：状态/布尔类返回在 C 侧回到 `int32_t`
+    （io ready/alive/connect_status、dispatch_post、thread_start、SharedTable
+    set/delete/exists/match/destroy），真 64 位量在 Zan 侧改 `long`
+    （send/recv 字节数、`zan_monotonic_us`）。顺带 `Stopwatch.GetMicroseconds()`
+    在 i32 下 35 分钟溢出、`GetMilliseconds()` 截断 `GetTickCount64`，都改 `long`。
+  - **A2-0b**（`e577ce2`）GUI/SDL 原生层 176 处：C 侧标量降到 `i32`，
+    SDL_Window/Renderer/Texture 与 GPU device/texture 这些**指针句柄**改
+    `intptr_t`，Zan 侧对应字段/返回值改 `nint`（`SdlWindow`/`SdlRenderer`/
+    `SdlTexture`/`SdlGpu`/`SdlGpuTexture`），tick/timestamp 两侧保持 64 位。
+    另修 `zan_gui_poll_event` 多声明 6 个参数、`zan_gui_sleep_ms` 应为 `void`、
+    `zan_gui_destroy_surface` 应返回 `int`。
+  - **A2-0c** 系统库 96 处：`size_t` 车道（`calloc`/`malloc`/`memcpy`/`memset`/
+    `memchr`/`strncpy` 的长度、`strlen` 的返回、`fread`/`fwrite` 的
+    size/count/返回）在 Zan 侧改 `long`，30 个吃这些返回值的调用点补 `(int)`；
+    `gethostbyname`/`memset` 返回指针改 `nint`；Win32 窄返回按真实宽度声明
+    （`RegisterClassEx*`→`ushort`(ATOM)、`GetKeyState`→`short`、
+    `htons`/`ntohs`→`ushort`、`SetLayeredWindowAttributes` 的 alpha→`byte`、
+    `WSAStartup` 的 version→`ushort`、`GlobalAlloc` 的 SIZE_T→`long`）。
+  - 用例：`tests/conformance/ffi_widths.zan`（指针句柄往返、size_t 车道、
+    64 位单调钟）。`ctest -j8` 695+3 全绿。
+  - **未覆盖**：libpq(24)、OpenSSL(25)、sqlite3(17)、ODBC(24)、POSIX-only 的
+    crt(46) 与直连 SDL3 的声明没有对应头可比对，只做了人工抽查；
+    这些库的头装上后重跑 `sys_audit.py` 即可闭环。
+
 * **A2-1** 结构体按值传参/返回：SysV AMD64 / Win64 / AAPCS64 的 eightbyte 分类，
   `byval` / `sret` attribute。（四项里唯一的大工程，先做 Win64 + SysV）
 * **A2-2** `[repr(C)]` 布局 + `[StructLayout(Explicit)]` + `[FieldOffset(n)]`。
