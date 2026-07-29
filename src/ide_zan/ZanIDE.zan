@@ -1028,501 +1028,34 @@ partial class ZanIDE {
     }
 
     static void Main() {
+        ZanIDE ide = new ZanIDE();
+        ide.Run();
+    }
+
+    /// The IDE itself: builds the window and state, then pumps the main
+    /// window, the child windows and the file picker until the app exits.
+    void Run() {
         // Restore the last-used window / panel sizes (see SaveSettings).
         string cfg = "";
         if (File.Exists(ZanIDE.CfgPath())) { cfg = File.ReadAllText(ZanIDE.CfgPath()); }
-        // Default is a standard 1080 (logical, 96-dpi) width; App.Show scales it
-        // up by the display DPI, so it stays a sensible size on HiDPI screens.
-        int cfgW = ZanIDE.CfgClamp(ZanIDE.CfgInt(cfg, "winW", 1080), 640, 4000);
-        int cfgH = ZanIDE.CfgClamp(ZanIDE.CfgInt(cfg, "winH", 720), 480, 3000);
-        App app = App.CreateDark("Zan IDE", cfgW, cfgH);
-        // Restore the last-used title-bar skin (index into Theme.PresetNames);
-        // the skin picker itself is a built-in window feature (EnableSkins).
-        app.ApplySkin(ZanIDE.CfgInt(cfg, "skin", 0));
-        app.Show();
-        // Whole-window opacity (percent), persisted like the skin.
-        int winOpacity = ZanIDE.CfgClamp(ZanIDE.CfgInt(cfg, "opacity", 100), 30, 100);
-        app.SetWindowOpacity(winOpacity);
-        // Custom window wallpaper (image + blend strength), set in the
-        // appearance drawer and persisted like the skin.
-        string wallPath = ZanIDE.CfgStr(cfg, "wallpaper", "");
-        int wallOpacity = ZanIDE.CfgClamp(ZanIDE.CfgInt(cfg, "wallOpacity", 100), 10, 100);
-        if (wallPath != "" && !File.Exists(wallPath)) { wallPath = ""; }
-        app.SetWallpaper(wallPath, wallOpacity);
-        int savedW = cfgW;
-        int savedH = cfgH;
+        InitWindowAndProject(cfg);
+        InitWizardCatalogs();
+        InitDialogState();
+        InitFindReplaceState();
+        InitPublishState();
+        InitEditorAppearance();
+        InitHelpBrowser();
+        InitOutputSelection();
+        InitDebugState();
+        InitDesignerState();
+        InitPanelsAndDock(cfg);
+        InitGitPanel();
+        InitAiState();
+        InitRunState(cfg);
+        InitSidebarState();
 
-        // Reopen the last project the user worked on; when there is none yet,
-        // start with just the Start page (no sample project is scaffolded).
-        Directory.CreateDirectoryRecursive(ZanIDE.ProjectsHome());
-        string lastProj = ZanIDE.ReadLastProject();
-        bool haveProject = lastProj != "" && File.Exists(lastProj + "/zan.proj");
-        string root = ZanIDE.ProjectsHome();
-        if (haveProject) { root = lastProj; }
-        if (haveProject) { ZanIDE.AddRecentProject(root); }
-
-        // Completion answers from the compiler's own symbol index; load
-        // whatever the last build left behind and refresh it in the
-        // background so it follows the code.
-        if (haveProject) {
-            if (!ZanIDE.LoadSymbolIndexFor(root)) {
-                // Never built here: generate the index in the background so
-                // hover and completion show real signatures (including stdlib
-                // ones) instead of falling back to guesses.
-                ZanIDE.EmitSymbolsDetach(root, root + "/src/main.zan");
-            }
-        }
-        List<TreeNode> tree = new List<TreeNode>();
-        if (haveProject) { tree = ZanIDE.ScanTree(root); }
-        bool rescan = false;
-
-        List<string> tabNames = new List<string>();
-        List<string> tabBodies = new List<string>();
-        List<string> tabPaths = new List<string>();
-
-        SignalInt activeTab = SignalInt.Create(0);
-        CodeEditor editor = CodeEditor.Create();
-        StatusBar statusBar = new StatusBar();
-        ErrorList errorList = new ErrorList();
-        Button outClearBtn = Button.Typed("Clear", 0);
-        outClearBtn.size = 0;
-        int lastActive = 0 - 1;
-        // Which .zform tab the designer is currently bound to, and the last
-        // serialized layout (to detect changes and persist them back to disk).
-        string loadedFormPath = "";
-        string formCache = "";
-        // Same for the .zscene tab bound to the scene designer.
-        string loadedScenePath = "";
-        string sceneCache = "";
-
-        if (haveProject) {
-            ZanIDE.OpenFirst(tabNames, tabBodies, tabPaths, activeTab, root);
-        }
-        // Start page is a real tab (path sentinel "@start"), shown first like
-        // VS's Start Page. Rendered specially instead of the code editor.
-        tabNames.Insert(0, "Start");
-        tabBodies.Insert(0, "");
-        tabPaths.Insert(0, "@start");
-        activeTab.Set(0);
-
-        List<string> log = new List<string>();
-        if (haveProject) {
-            log.Add("> Zan IDE ready. Workspace: " + root);
-        } else {
-            log.Add("> Zan IDE ready. No project is open.");
-        }
-
-        ZanIDE.uiLang = ZanIDE.ReadUiLang();
-        Wizard.lang = ZanIDE.uiLang;
-        Designer.lang = ZanIDE.uiLang;
-        SceneDesigner.lang = ZanIDE.uiLang;
-        List<string> ribbonTabs = ZanIDE.RibbonTabs();
-        SignalInt ribbonTab = SignalInt.Create(0);
-
-        // ---- New Project categories (built-in + user "Custom") ----
-        List<string> catNames = new List<string>{
-            "Console", "Library", "Window App", "WebView", "Server", "Custom" };
-
-        // The template catalog and the wizard's entity view of it; both rebuilt
-        // whenever the New Project wizard opens so freshly-saved custom
-        // templates show up.
-        List<Tpl> tpls = new List<Tpl>();
-        List<WizardTemplate> wizTpls = new List<WizardTemplate>();
-
-        // ---- New File template catalog ----
-        List<WizardItem> fileItems = new List<WizardItem>{
-            new WizardItem(ZanIDE.T("Program (Main)", "程序 (Main)"), "arrow-right", ZanIDE.T("Code file: class with a static Main() entry point.", "代码文件：带静态 Main() 入口的类。")),
-            new WizardItem(ZanIDE.T("Class", "类"), "grid", ZanIDE.T("Code file: an empty class with fields and methods.", "代码文件：带字段和方法的空类。")),
-            new WizardItem(ZanIDE.T("GUI Window", "GUI 窗口"), "maximize", ZanIDE.T("Code file: a Gui window with an event loop.", "代码文件：带事件循环的 Gui 窗口。")),
-            new WizardItem(ZanIDE.T("Interface", "接口"), "copy", ZanIDE.T("Code file: a base class defining a contract.", "代码文件：定义契约的基类。")),
-            new WizardItem(ZanIDE.T("Empty File", "空文件"), "file", ZanIDE.T("Code file: a blank .zan file.", "代码文件：空白的 .zan 文件。")),
-            new WizardItem(ZanIDE.T("Form (Designer)", "表单 (设计器)"), "layout", ZanIDE.T("Form: creates Name.zform (visual layout) + Name.zan (code-behind).", "表单：创建 Name.zform（可视化布局）+ Name.zan（代码后置）。")),
-            new WizardItem(ZanIDE.T("Game Scene (Designer)", "游戏场景 (设计器)"), "maximize", ZanIDE.T("Scene: creates Name.zscene, a free-canvas game window layout.", "场景：创建 Name.zscene，自由画布式游戏窗口布局。")),
-            new WizardItem(ZanIDE.T("Folder", "文件夹"), "folder", ZanIDE.T("Creates a new folder under src/.", "在 src/ 下创建一个新文件夹。")) };
-
-        // ---- Dialog state ----
-        // The New Project / New File wizards are REAL secondary top-level windows
-        // (draggable anywhere on the desktop), driven from this same event pump.
-        // dlg is null when no wizard is open.
-        // dlgMode: 1=new-project, 2=new-file, 3=save-as-template.
-        App dlg = null;
-        int dlgMode = 0;
-        FilePicker pathPicker = FilePicker.Create();
-        int pathPickerOwner = 0;
-        SignalInt catSel = SignalInt.Create(0);
-        SignalInt pSel = SignalInt.Create(0);
-        SignalInt fSel = SignalInt.Create(0);
-
-        // Target platforms for New Project (multi-select OS + architecture).
-        // One column per OS; two architecture chips stacked per column. Chip
-        // labels are arch-only (the OS is the column header). Order is
-        // column-major: [Win x64, Win ARM64, Linux x64, Linux ARM64, ...].
-        List<string> platformGroups = new List<string>{ "Windows", "Linux", "macOS" };
-        // One entry per (OS column, architecture), column-major, all selected by
-        // default. The order matches PlatformCsv's id list.
-        List<WizardTarget> platforms = new List<WizardTarget>{
-            new WizardTarget("x64", 1), new WizardTarget("ARM64", 1),
-            new WizardTarget("x64", 1), new WizardTarget("ARM64", 1),
-            new WizardTarget("x64", 1), new WizardTarget("ARM64", 1) };
-        Input pNameInput = new Input(ZanIDE.T("project name", "项目名称"));
-        pNameInput.SetText("NewProject");
-        Input pLocInput = new Input(ZanIDE.T("location", "位置"));
-        pLocInput.SetText(ZanIDE.ReadLastPickerDirectory(ZanIDE.ProjectsHome()));
-        Input fNameInput = new Input(ZanIDE.T("file name", "文件名称"));
-        fNameInput.SetText("NewFile");
-
-        // Right-click context menu (file tree + tab bar) state.
-        // ctxKind: 0 = none, 1 = project tree row, 3 = editor tab.
-        int ctxKind = 0;
-        int ctxX = 0;
-        int ctxY = 0;
-        int ctxTarget = 0 - 1;
-
-        // Save-current-project-as-custom-template state.
-        SignalInt tmplCatSel = SignalInt.Create(0);
-        Input tmplNameInput = new Input(ZanIDE.T("template name", "模板名称"));
-        tmplNameInput.SetText("MyTemplate");
-        List<WizardItem> saveItems = new List<WizardItem>{
-            new WizardItem("Console", "menu", ZanIDE.T("Save under the Console category.", "保存到 Console 分类下。")),
-            new WizardItem("Library", "grid", ZanIDE.T("Save under the Library category.", "保存到 Library 分类下。")),
-            new WizardItem("Window App", "maximize", ZanIDE.T("Save under the Window App category.", "保存到 Window App 分类下。")),
-            new WizardItem("WebView", "folder", ZanIDE.T("Save under the WebView category.", "保存到 WebView 分类下。")),
-            new WizardItem("Server", "arrow-right", ZanIDE.T("Save under the Server category.", "保存到 Server 分类下。")),
-            new WizardItem("Custom", "file", ZanIDE.T("Save under the Custom category.", "保存到 Custom 分类下。")) };
-
-        // ---- Find/Replace & GoToLine state ----
-        int findMode = 0;    // 0=hidden, 1=find, 2=replace, 3=gotoLine, 4=bpCondition, 5=rename,
-                             // 6=find in files, 7=replace in files
-        string findText = "";
-        string replText = "";
-        // Find in Files results (project-wide, F8/Shift+F8 walk them).
-        List<string> fifPath = new List<string>();
-        List<string> fifLine = new List<string>();
-        List<string> fifText = new List<string>();
-        string fifQuery = "";
-        string fifRepl = "";
-        bool fifReplFocus = false;   // Tab switches the Replace in Files field
-        int fifSel = 0 - 1;
-        string gotoText = "";
-        string renameText = "";
-        string renameWord = "";
-        int findMatch = -1;   // line of current match
-        // Persistent framework Button instances for the find/replace/goto bar so
-        // it renders through the themed, glass-aware component (not hand-drawn
-        // hex) and matches every skin. Text is set per frame by mode.
-        Button findBtn = Button.Primary(ZanIDE.T("Find", "查找")).SetSize(1);
-        Button findNextBtn = Button.Create(ZanIDE.T("Next", "下一个")).SetSize(1);
-        Button replBtn = Button.Primary(ZanIDE.T("Replace", "替换")).SetSize(1);
-        Button replAllBtn = Button.Create(ZanIDE.T("Repl All", "全部替换")).SetSize(1);
-        Button gotoBtn = Button.Primary(ZanIDE.T("Go", "跳转")).SetSize(1);
-        // Start-page quick-action buttons (framework Button components).
-        Button startNewProjBtn = Button.WithIcon(ZanIDE.T("New Project", "新建项目"), "plus");
-        Button startNewFileBtn = Button.WithIcon(ZanIDE.T("New File", "新建文件"), "file");
-        Button startOpenBtn = Button.WithIcon(ZanIDE.T("Open", "打开"), "folder");
-        SignalInt startNewsScroll = SignalInt.Create(0);
-        StartPage startPage = new StartPage();
-        Button debugContinueBtn = Button.IconTextTyped(
-            ZanIDE.T("Continue", "继续"), "play", 3);
-        debugContinueBtn.SetSize(1);
-        Button debugStepOverBtn = Button.IconTextTyped(
-            ZanIDE.T("Step Over", "单步跳过"), "arrow-right", 2);
-        debugStepOverBtn.SetSize(1);
-        Button debugStepIntoBtn = Button.IconTextTyped(
-            ZanIDE.T("Step Into", "单步进入"), "arrow-down", 2);
-        debugStepIntoBtn.SetSize(1);
-        Button debugStopBtn = Button.IconTextTyped(
-            ZanIDE.T("Stop", "停止"), "stop", 5);
-        debugStopBtn.SetSize(1);
-
-        // ---- Publish dialog state ----
-        // pubSel holds a 0/1 flag per platform, parallel to the host-aware id
-        // list in ZanIDE.PublishTargetIds (this OS's native x64/ARM64 plus
-        // Linux x64/ARM64). Populated from zan.proj via ReadProjectPlatforms.
-        App pubWin = null;
-        bool pubPending = false;
-        List<int> pubSel = new List<int>();
-        // In-flight detached publish: exe paths to verify on completion plus
-        // the consumed length of its streamed log (see the poll below).
-        bool pubBusy = false;
-        List<string> pubExes = new List<string>();
-        int pubLogLen = 0;
-
-        // ---- Editor appearance (color theme + font size) ----
-        // edThemeIdx selects a syntax-color preset (see EditorThemeName); edFontPx
-        // is the code font size (0 = follow the UI theme). Persisted to editor.cfg.
-        App cfgWin = null;
-        // Asset Manager child window (browse/import/organize assets/ recursively).
-        App assetWin = null;
-        int edThemeIdx = ZanIDE.ReadEditorTheme();
-        int edFontPx = ZanIDE.ReadEditorFont();
-        int defFontPx = app.theme.fontSizeMedium;
-        EditorSettingsWindow settingsWindow = null;
-
-        // ---- Help / Docs browser state ----
-        // The docs page is a real tab (path sentinel "@docs"). docsSearch filters
-        // the entry list; docsSel is the selected entry; docsScroll scrolls the
-        // sidebar list.
-        Input docsSearch = new Input(ZanIDE.T("Search syntax & components...", "搜索语法与组件..."));
-        SignalInt docsSel = SignalInt.Create(0);
-        SignalInt docsSection = SignalInt.Create(0);
-        SignalInt docsScroll = SignalInt.Create(0);
-        SignalInt docsCodeScroll = SignalInt.Create(0);
-        SignalBool docsDemoBool = SignalBool.Create(true);
-        SignalInt docsDemoInt = SignalInt.Create(2);
-        Input docsDemoInput = new Input(ZanIDE.T("Type here", "在此输入"));
-        docsDemoInput.SetText("Zan");
-
-        // Pending "go to definition" jump, applied after the target tab loads.
-        int pendingGotoLine = 0 - 1;
-        int pendingGotoCol = 0;
-
-        // ---- Output console text selection (drag to select, right-click copy) ----
-        // Anchor/head positions are absolute (row = index into `log`, col = char).
-        int coSelDrag = 0;
-        int coSelA = 0 - 1;
-        int coSelAc = 0;
-        int coSelB = 0 - 1;
-        int coSelBc = 0;
-        // Output console scroll (lines up from the bottom; 0 = follow the tail),
-        // a scrollbar-drag flag, and a substring filter box. The console owns its
-        // own scrolling/filtering rather than the caller wiring it up each time.
-        int coScroll = 0;
-        int coSbDrag = 0;
-        // Output/Errors right-click context menu (copy line / copy all / clear).
-        bool coCtxOpen = false;
-        int coCtxX = 0;
-        int coCtxY = 0;
-        int coCtxRow = 0 - 1;
-        Input coFilter = new Input(
-            ZanIDE.T("Filter output...", "筛选输出..."));
-
-        // ---- Debug state ----
-        int dbgState = 0;
-        int dbgExecLine = -1;
-        DebugSession dbg = null;
-        List<string> dbgConsole = new List<string>();
-        List<string> dbgVarInfo = new List<string>();
-        List<string> dbgStack = new List<string>();
-        SignalInt dbgPanelTab = SignalInt.Create(0);
-        // Conditional breakpoints: expression per 0-based line (edited via
-        // Ctrl+B, passed through DAP setBreakpoints as `condition`).
-        List<int> bpCondLines = new List<int>();
-        List<string> bpCondExprs = new List<string>();
-        string bpCondText = "";
-        // Watch expressions, re-evaluated via DAP `evaluate` on every stop.
-        List<string> dbgWatches = new List<string>();
-        List<string> dbgWatchVals = new List<string>();
-        string watchText = "";
-        // Semantic language server (zan-lsp), started lazily on first
-        // navigation request; falls back to text scanning when unavailable.
-        LspSession lspSess = null;
-        bool lspTried = false;
-
-        // ---- Designer state ----
-        // The single unified designer: .zform tabs host the component-based
-        // form designer (stdlib Gui.Designer) with palette, containers,
-        // inspector and event bindings. Its design document round-trips
-        // through the .zform file.
-        bool designerMode = false;
-        Designer formDesigner = Designer.Create();
-        // Design/Code toggle: codeViewForm holds the path of the .zform currently
-        // shown as code ("" = design view). The code view reuses a dedicated,
-        // in-place editor over the paired code-behind -- it never opens a new tab
-        // or creates a file just from switching modes. Only .zform tabs toggle.
-        string codeViewForm = "";
-        CodeEditor formCodeEd = CodeEditor.Create();
-        string formCodeLoaded = "";
-        // .zscene tabs host the free-canvas game scene designer (stdlib
-        // Game.Scene.SceneDesigner): background reference, absolute placement,
-        // nine-grid anchors, grid snapping, slot grid groups, z-order. The
-        // Design/Code toggle shows the .zscene JSON in place.
-        bool sceneMode = false;
-        SceneDesigner sceneDesigner = SceneDesigner.Create();
-        AssetManager assetMgr = AssetManager.Create();
-
-        SignalInt treeW = SignalInt.Create(ZanIDE.CfgClamp(ZanIDE.CfgInt(cfg, "treeW", 240), 120, 900));
-        // Seeds for the dock's side extents on a first run (afterwards dock.cfg
-        // carries the sizes the user dragged).
-        SignalInt bottomPanelH = SignalInt.Create(ZanIDE.CfgClamp(ZanIDE.CfgInt(cfg, "bottomH", 190), 70, 2000));
-
-        // ---- Right side panel (AI assistant, tools, examples, git) ----
-        SignalInt rightW = SignalInt.Create(ZanIDE.CfgClamp(ZanIDE.CfgInt(cfg, "rightW", 600), 120, 1600));
-
-        // ---- Dockable main area ----
-        // The shell around the document area is a DockHost: EXPLORER, the
-        // structure/components outline, STDLIB, OUTPUT and the assistant column
-        // are tab groups the user can drag to another side, tab together,
-        // resize and close (right-click a tab strip to bring a closed one
-        // back). The editor is the fixed center panel everything docks around.
-        // The arrangement is persisted in dock.cfg and restored on launch.
-        // Every tool panel closes; the ribbon's Panels section is the switch
-        // that brings it back (its icon goes dark while the panel is hidden).
-        DockHost dock = DockHost.Create();
-        dock.emptyMenuLabel = ZanIDE.T("No closed panels", "没有已关闭的面板");
-        dock.Register("explorer", "", DockSide.Left(), true, true);
-        dock.Register("structure", "", DockSide.Left(), true, true);
-        dock.Register("stdlib", "", DockSide.Left(), true, true);
-        dock.RegisterFixed("editor", "Editor");
-        // The assistant column and the bottom band each start as one tab group.
-        dock.Register("ai", "", DockSide.Right(), true, true);
-        dock.Register("tools", "", DockSide.Right(), true, false);
-        dock.Register("examples", "", DockSide.Right(), true, false);
-        dock.Register("git", "", DockSide.Right(), true, false);
-        dock.Register("output", "", DockSide.Bottom(), true, true);
-        dock.Register("errors", "", DockSide.Bottom(), true, false);
-        ZanIDE.ApplyPanelLabels(dock);
-        dock.SetWeight("explorer", 40);
-        dock.SetWeight("structure", 32);
-        dock.SetWeight("stdlib", 28);
-        dock.SetSideExtent(DockSide.Left(), treeW.Get());
-        dock.SetSideExtent(DockSide.Right(), rightW.Get());
-        dock.SetSideExtent(DockSide.Bottom(), bottomPanelH.Get());
-        dock.LoadLayout(ZanIDE.ReadDockLayout());
-        // The outline panel retitles itself between STRUCTURE and COMPONENTS as
-        // the designer opens and closes; this tracks the title in effect.
-        string dockOutlineTitle = "";
-        // The errors panel tab carries the diagnostic count; this tracks it.
-        string dockErrorsTitle = "";
-        // ---- Git panel state (right panel "Git" tab) ----
-        // gitFiles holds `git status --porcelain` lines; gitLoaded gates the
-        // first (and refresh-triggered) status scan so git only runs on demand.
-        List<string> gitFiles = new List<string>();
-        string gitBranch = "";
-        bool gitLoaded = false;
-        // Which detached git job is in flight (0 none, 1 status+branch scan,
-        // 2 a command whose output goes to Output); the frame loop polls it so
-        // git never blocks drawing.
-        int gitJob = 0;
-        SignalInt gitSel = SignalInt.Create(0 - 1);
-        SignalInt gitScroll = SignalInt.Create(0);
-        Input gitMsgIn = new Input(
-            ZanIDE.T("Commit message...", "提交信息..."));
-        // Tools / Examples trees for the right panel tabs.
-        List<TreeNode> rtToolTree = ZanIDE.BuildDirTree(ZanIDE.ToolsDir());
-        List<TreeNode> rtExTree = ZanIDE.BuildExampleTree();
-        SignalInt rtToolSel = SignalInt.Create(-1);
-        SignalInt rtExSel = SignalInt.Create(-1);
-        Input rtToolFilter = new Input(ZanIDE.T("Filter...", "筛选..."));
-        Input rtExFilter = new Input(ZanIDE.T("Filter...", "筛选..."));
-        SignalInt rtToolScroll = SignalInt.Create(0);
-        SignalInt rtExScroll = SignalInt.Create(0);
-        List<TreeNode> rtCtxShow = new List<TreeNode>();
-        // Chat transcript: parallel role ("user"/"assistant"/"error") + text.
-        List<string> aiRole = new List<string>();
-        List<string> aiText = new List<string>();
-        SignalInt aiScroll = SignalInt.Create(0);
-        // 1 while a completion request is in flight (curl runs detached and the
-        // event loop polls for its done-marker file, so the UI never blocks).
-        SignalInt aiBusy = SignalInt.Create(0);
-        Input aiInput = new Input(
-            ZanIDE.T("Ask AI about your code...", "向 AI 提问，辅助开发..."));
-        Button aiSendBtn = Button.Primary(ZanIDE.T("Send", "发送")).SetSize(1);
-        // "Insert code" applies the code block of the last AI answer at the
-        // editor cursor, making the assistant a real pair-programming tool.
-        Button aiApplyBtn = Button.WithIcon(ZanIDE.T("Insert code", "插入代码"), "code").SetSize(1);
-        // "Replace file" swaps the whole active file for the last AI code block.
-        Button aiReplaceBtn = Button.Create(ZanIDE.T("Replace file", "替换整文件")).SetSize(1);
-        // ---- AI provider profiles (ai_profiles.json) ----
-        // Parallel lists: profile name / base URL / API key / default model /
-        // `;`-joined fetched model ids. `aiProfActive` is the enabled profile.
-        List<string> aiProfNames = new List<string>();
-        List<string> aiProfBases = new List<string>();
-        List<string> aiProfKeys = new List<string>();
-        List<string> aiProfModels = new List<string>();
-        List<string> aiProfLists = new List<string>();
-        int aiProfActive = ZanIDE.AiProfilesLoad(aiProfNames, aiProfBases,
-            aiProfKeys, aiProfModels, aiProfLists);
-        // The unified AI configuration lives in its own child window
-        // (AiSettingsWindow, UiDoc-based like the editor settings).
-        AiSettingsWindow aiWindow = null;
-        // Chat model switcher: the dropdown lists the active profile's models
-        // (default model first); no selection = the profile's default model.
-        SelectBox aiModelSel = SelectBox.Create(ZanIDE.T("Model (default)", "模型（默认）"));
-        List<string> aiModelOpts = new List<string>();
-        int aiModelSelProf = 0 - 1;
-        Button aiCfgBtn = Button.Create(ZanIDE.T("Config", "配置")).SetSize(1);
-        Button aiPredictBtn = Button.Create(ZanIDE.T("Continue", "续写")).SetSize(1);
-        // Chat sessions: switch / new / clear the transcript context. Inactive
-        // sessions are kept serialized in `aiSessions` (\u0002-joined records).
-        List<string> aiSessions = new List<string>();
-        int aiSessCur = 0;
-        aiSessions.Add("");
-        Button aiSessPrevBtn = Button.Create("<").SetSize(1);
-        Button aiSessNextBtn = Button.Create(">").SetSize(1);
-        Button aiSessNewBtn = Button.Create(ZanIDE.T("New chat", "新会话")).SetSize(1);
-        Button aiSessClearBtn = Button.Create(ZanIDE.T("Clear", "清空")).SetSize(1);
-        // Chat transcript wrapped-line cache (rebuilt only when the transcript,
-        // width or theme changes — rewrapping every frame is too slow).
-        List<string> aiCacheLines = new List<string>();
-        List<int> aiCacheColors = new List<int>();
-        List<int> aiCacheKinds = new List<int>();
-        string aiCacheKey = "";
-        // In-flight "AI continue at caret" request (tab it was started from).
-        SignalInt aiPredBusy = SignalInt.Create(0);
-        int aiPredTab = 0 - 1;
-        // Run shell: a persistent interactive shell session used to stream a
-        // launched program's output into the Output tab without blocking the
-        // UI. Its stdin is a pipe (Process.ShellSend) and its stdout/stderr
-        // stream to a session log file polled each frame.
-        int termFp = 0;
-        int termLogLen = 0;
-        // Console-program output mirror: a launched console program prints into
-        // its own console window and, teed, into RunLogPath, which is polled
-        // into the Output tab so output shows in both places.
-        int runLogLen = 0;
-        bool runStreaming = false;
-        // Detached (non-blocking) build behind the Run/Build ribbon actions:
-        // the compile runs in a separate shell so the UI never freezes; the
-        // main loop polls a done-marker, then applies diagnostics and launches.
-        bool buildBusy = false;
-        int buildLogLen = 0;
-        string buildExe = "";
-        bool buildIsGui = false;
-        bool buildThenRun = false;
-        // When the in-flight detached build is a debug (`-g`) build, the poll
-        // opens the debugger on success instead of running the program.
-        bool dbgBuildPending = false;
-        string buildTargetPath = "";
-        // Hot reload: when ON, saving rebuilds and restarts the running app.
-        bool autoRun = ZanIDE.CfgInt(cfg, "autoRun", 0) == 1;
-        // Set by a save when autoRun is ON; consumed once per loop to kick off a
-        // DETACHED rebuild (never a synchronous compile on the UI thread).
-        bool hotReloadReq = false;
-        SignalInt treeSel = SignalInt.Create(-1);
-        int lastTreeSel = -1;
-
-        // Vertical scroll offsets for the sidebar sections, so long lists stay
-        // inside their region (EXPLORER in pixels, COMPONENTS/EXAMPLES in rows).
-        SignalInt treeScrollY = SignalInt.Create(0);
-
-        // Third sidebar section: the standard library as a collapsible tree
-        // (browse/open stdlib sources directly, like aardio's 库 pane).
-        List<TreeNode> exTree = ZanIDE.BuildStdlibTree();
-        SignalInt exSel = SignalInt.Create(-1);
-
-        // Per-section filter boxes: each sidebar tree can be narrowed by a
-        // case-insensitive substring; the displayed (possibly filtered) lists
-        // are recomputed every frame so click handlers index into them.
-        Input treeFilter = new Input(ZanIDE.T("Filter...", "筛选..."));
-        Input structFilter = new Input(ZanIDE.T("Filter...", "筛选..."));
-        Input exFilter = new Input(ZanIDE.T("Filter...", "筛选..."));
-        List<TreeNode> treeShow = new List<TreeNode>();
-        List<TreeNode> structShow = new List<TreeNode>();
-        List<TreeNode> exShow = new List<TreeNode>();
-        int lastExSel = -1;
-        SignalInt exTreeScrollY = SignalInt.Create(0);
-
-        // STRUCTURE (code outline): types + their members for the active code
-        // file, rebuilt only when the buffer signature changes so navigation
-        // stays cheap. Clicking a member jumps the editor to its line.
-        List<TreeNode> structTree = new List<TreeNode>();
-        SignalInt structSel = SignalInt.Create(-1);
-        int lastStructSel = -1;
-        SignalInt structScrollY = SignalInt.Create(0);
-        string structSig = "@none";
-
-        int lastPresent = 0;
-        int lastSkinIdx = app.ThemeMenuIndex();
+        lastPresent = 0;
+        lastSkinIdx = app.ThemeMenuIndex();
         while (app.isRunning) {
             // Advance any active AI automation script (ZAN_UI_SCRIPT). This
             // pump bypasses App.ProcessEvent, so drive the driver here too;
@@ -4413,351 +3946,14 @@ partial class ZanIDE {
                 lastPresent = Window.GetTickMs();
             }
 
-            // ---------------- wizard child window ----------------
-            if (dlg != null) {
-                if (dlg.needsRedraw && !pathPicker.IsOpen()) {
-                    dlg.BeginFrame();
-                    // The wizard is immediate-mode but shares the process-wide
-                    // WidgetId counter with the main window (which the IDE never
-                    // rewinds). Pin a fixed high baseline for the dialog's own
-                    // frame so its buttons (Create/Cancel/Browse) get identical
-                    // ids every frame -- otherwise hover/press/click never match
-                    // the pointer target resolved on the previous frame and the
-                    // Cancel/Create buttons appear dead. Restore afterwards.
-                    int savedSeq = WidgetId.SeqValue();
-                    WidgetId.SetSeq(850000);
-                    int action = 0;
-                    if (dlgMode == 1) {
-                        action = Wizard.RenderCategorized(dlg, ZanIDE.T("New Project", "新建项目"), catNames, catSel,
-                                                          wizTpls, pSel,
-                                                          pNameInput, pLocInput,
-                                                          platforms, platformGroups);
-                    } else if (dlgMode == 3) {
-                        action = Wizard.Render(dlg, ZanIDE.T("Save as Template", "另存为模板"), saveItems,
-                                               tmplCatSel, tmplNameInput, tmplNameInput, false);
-                    } else {
-                        action = Wizard.Render(dlg, ZanIDE.T("New File", "新建文件"), fileItems, fSel,
-                                               fNameInput, fNameInput, false);
-                    }
-                    WidgetId.SetSeq(savedSeq);
-                    dlg.PresentFrame();
-                    lastPresent = Window.GetTickMs();
-
-                    if (action == 1) {
-                        bool dlgDone = true;
-                        if (dlgMode == 1) {
-                            string parent = pLocInput.GetText();
-                            string name = pNameInput.GetText();
-                            int gi = pSel.Get();
-                            if (gi >= 0 && gi < tpls.Count && tpls[gi].ptype == "gui" && ZanIDE.IsGuiReservedName(name)) {
-                                Wizard.notice = ZanIDE.T(
-                                    "That name conflicts with a built-in Gui/System type. Choose another.",
-                                    "该名称与内置的 Gui/System 类型冲突，请换一个名称。");
-                                dlgDone = false;
-                            } else if (gi >= 0 && gi < tpls.Count) {
-                                string plats = ZanIDE.PlatformCsv(platforms);
-                                ZanIDE.WriteLastPickerDirectory(parent);
-                                string newDir = ZanIDE.CreateProjectT(tpls[gi], parent, name, plats, log);
-                                if (newDir == "") {
-                                    // Target folder exists and is not empty: keep the
-                                    // wizard open (with an inline notice) so the user
-                                    // can pick another name/location.
-                                    Wizard.notice = ZanIDE.T(
-                                        "Target folder exists and is not empty.",
-                                        "目标文件夹已存在且非空。");
-                                    dlgDone = false;
-                                } else {
-                                    root = newDir;
-                                    haveProject = true;
-                                    Layer.Notify(ZanIDE.T("Project created: ", "项目已创建：") + name, 3);
-                                    ZanIDE.WriteLastProject(root);
-                                    tabNames = new List<string>();
-                                    tabBodies = new List<string>();
-                                    tabPaths = new List<string>();
-                                    activeTab.Set(0);
-                                    lastActive = 0 - 1;
-                                    ZanIDE.OpenFirst(tabNames, tabBodies, tabPaths, activeTab, root);
-                                }
-                            }
-                        } else if (dlgMode == 3) {
-                            string cat = saveItems[tmplCatSel.Get()].name;
-                            string tname = tmplNameInput.GetText();
-                            ZanIDE.SaveAsTemplate(root, cat, tname, log);
-                            Layer.Notify(ZanIDE.T("Template saved: ", "模板已保存：") + tname, 3);
-                        } else {
-                            string name = fNameInput.GetText();
-                            if (fSel.Get() == 5 && ZanIDE.IsGuiReservedName(name)) {
-                                Wizard.notice = ZanIDE.T(
-                                    "That name conflicts with a built-in Gui/System type. Choose another.",
-                                    "该名称与内置的 Gui/System 类型冲突，请换一个名称。");
-                                dlgDone = false;
-                            } else {
-                                string p = ZanIDE.CreateFile(fSel.Get(), root, name, log);
-                                if (!Directory.Exists(p)) {
-                                    ZanIDE.OpenPath(tabNames, tabBodies, tabPaths, activeTab, p, Path.GetFileName(p));
-                                }
-                                Layer.Notify(ZanIDE.T("Created: ", "已创建：") + Path.GetFileName(p), 3);
-                            }
-                        }
-                        if (dlgDone) {
-                            rescan = true;
-                            Wizard.notice = "";
-                            dlg.window.Close();
-                            dlg = null;
-                            dlgMode = 0;
-                        } else {
-                            dlg.RequestRedraw();
-                        }
-                        app.RequestRedraw();
-                    } else if (action == 2) {
-                        Wizard.notice = "";
-                        dlg.window.Close();
-                        dlg = null;
-                        dlgMode = 0;
-                        app.RequestRedraw();
-                    } else if (action == 3) {
-                        if (dlgMode == 1 && !pathPicker.IsOpen()) {
-                            pathPicker.BeginFolder(ZanIDE.ReadLastPickerDirectory(pLocInput.GetText()),
-                                ZanIDE.T("Select project location", "选择项目位置"));
-                            pathPickerOwner = 1;
-                            dlg.RequestRedraw();
-                        }
-                    }
-                }
-            }
-
-            // ---------------- publish child window ----------------
-            if (pubWin != null && pubWin.needsRedraw && !pathPicker.IsOpen()) {
-                string pubName = Path.GetFileName(root);
-                if (pubName == "") { pubName = "project"; }
-                pubWin.BeginFrame();
-                int savedSeqP = WidgetId.SeqValue();
-                WidgetId.SetSeq(860000);
-                int pAct = Dialogs.RenderPublishDialog(pubWin, root, pubName, pubSel);
-                WidgetId.SetSeq(savedSeqP);
-                pubWin.PresentFrame();
-                lastPresent = Window.GetTickMs();
-                if (pAct == 1) {
-                    // Close first, then publish next frame so the (blocking)
-                    // cross-compile never leaves a frozen window.
-                    pubWin.window.Close();
-                    pubWin = null;
-                    pubPending = true;
-                    app.RequestRedraw();
-                } else if (pAct == 2) {
-                    pubWin.window.Close();
-                    pubWin = null;
-                    app.RequestRedraw();
-                }
-            }
-
-            // ---------------- project configuration child window ----------------
-            if (cfgWin != null && cfgWin.needsRedraw && !pathPicker.IsOpen()) {
-                cfgWin.BeginFrame();
-                int savedSeqC = WidgetId.SeqValue();
-                WidgetId.SetSeq(870000);
-                int cAct = Dialogs.RenderProjectConfigDialog(cfgWin, root, log);
-                WidgetId.SetSeq(savedSeqC);
-                cfgWin.PresentFrame();
-                lastPresent = Window.GetTickMs();
-                if (cAct == 1) {
-                    cfgWin.window.Close();
-                    cfgWin = null;
-                    lastActive = 0 - 1;
-                    app.RequestRedraw();
-                } else if (cAct == 2) {
-                    pathPicker.BeginOpenFile(
-                        ZanIDE.ReadLastPickerDirectory(root), ".ico",
-                        ZanIDE.T("Select application icon (.ico)", "选择应用图标 (.ico)"));
-                    pathPickerOwner = 2;
-                    app.RequestRedraw();
-                } else if (cAct == 3) {
-                    pathPicker.BeginOpenFile(
-                        ZanIDE.ReadLastPickerDirectory(root), "",
-                        ZanIDE.T("Add a static resource (copy)", "导入静态资源（复制）"));
-                    pathPickerOwner = 3;
-                    app.RequestRedraw();
-                } else if (cAct == 4) {
-                    pathPicker.BeginOpenFile(
-                        ZanIDE.ReadLastPickerDirectory(root), "",
-                        ZanIDE.T("Add a linked resource (referenced in place)", "导入链接资源（引用原位置）"));
-                    pathPickerOwner = 5;
-                    app.RequestRedraw();
-                } else if (cAct == 5) {
-                    cfgWin.window.Close();
-                    cfgWin = null;
-                    if (assetWin == null) {
-                        assetWin = App.CreateDark(ZanIDE.T("Asset Manager", "资源管理器"), 900, 660);
-                        assetWin.ApplySkin(app.ThemeMenuIndex());
-                        assetWin.SetChromeButtons(false, false, true, true);
-                        assetWin.Show();
-                        assetWin.SetWindowOpacity(app.WindowOpacity());
-                        assetWin.SetWallpaper(app.WallpaperPath(), app.WallpaperOpacity());
-                    }
-                    app.RequestRedraw();
-                }
-            }
-
-            // ---------------- asset manager child window ----------------
-            if (assetWin != null && assetWin.needsRedraw && !pathPicker.IsOpen()) {
-                AssetManager.lang = ZanIDE.uiLang;
-                assetWin.BeginFrame();
-                int savedSeqA2 = WidgetId.SeqValue();
-                WidgetId.SetSeq(890000);
-                int aAct = assetMgr.Render(assetWin, root, log);
-                WidgetId.SetSeq(savedSeqA2);
-                assetWin.PresentFrame();
-                lastPresent = Window.GetTickMs();
-                if (aAct == 1) {
-                    assetWin.window.Close();
-                    assetWin = null;
-                    lastActive = 0 - 1;
-                    app.RequestRedraw();
-                } else if (aAct == 2) {
-                    pathPicker.BeginOpenFile(
-                        ZanIDE.ReadLastPickerDirectory(root), "",
-                        ZanIDE.T("Import an asset file", "导入素材文件"));
-                    pathPickerOwner = 6;
-                    app.RequestRedraw();
-                } else if (aAct == 3) {
-                    pathPicker.BeginFolder(
-                        ZanIDE.ReadLastPickerDirectory(root),
-                        ZanIDE.T("Import an asset folder (recursive)", "导入素材文件夹（递归）"));
-                    pathPickerOwner = 7;
-                    app.RequestRedraw();
-                } else if (aAct == 4) {
-                    pathPicker.BeginOpenFile(
-                        ZanIDE.ReadLastPickerDirectory(root), "",
-                        ZanIDE.T("Link a resource (referenced in place)", "链接资源（引用原位置）"));
-                    pathPickerOwner = 8;
-                    app.RequestRedraw();
-                }
-            }
-
-            if (settingsWindow != null) {
-                // Pin the child window's widget ids to a fixed baseline (the
-                // main window's per-frame widget count varies, and drifting
-                // ids would leave the settings controls unresponsive).
-                int savedSeqS = WidgetId.SeqValue();
-                WidgetId.SetSeq(880000);
-                settingsWindow.Render();
-                WidgetId.SetSeq(savedSeqS);
-                edThemeIdx = settingsWindow.ThemeIndex();
-                edFontPx = settingsWindow.FontSize();
-                if (settingsWindow.TakeLanguageChanged()) {
-                    ZanIDE.uiLang = settingsWindow.Language();
-                    Wizard.lang = ZanIDE.uiLang;
-                    Designer.lang = ZanIDE.uiLang;
-                    ribbonTabs = ZanIDE.RibbonTabs();
-                    ZanIDE.ApplyPanelLabels(dock);
-                    dockOutlineTitle = "";
-                    dockErrorsTitle = "";
-                    lastActive = 0 - 1;
-                    app.RequestRedraw();
-                }
-                if (settingsWindow.TakeSaved()) {
-                    ZanIDE.WriteEditorPrefs(edThemeIdx, edFontPx);
-                    log.Add("> Editor theme: "
-                        + ZanIDE.EditorThemeName(edThemeIdx)
-                        + "; font " + Convert.ToString(
-                            ZanIDE.EditorFontOr(edFontPx, defFontPx))
-                        + "px.");
-                    app.RequestRedraw();
-                }
-                if (!settingsWindow.IsOpen()) {
-                    settingsWindow = null;
-                }
-            }
-
-            if (aiWindow != null) {
-                // Same fixed id baseline trick as the settings window above.
-                int savedSeqA = WidgetId.SeqValue();
-                WidgetId.SetSeq(885000);
-                aiWindow.Render();
-                WidgetId.SetSeq(savedSeqA);
-                if (aiWindow.TakeSaved()) {
-                    // Reload the chat's profile lists from disk so the enabled
-                    // profile / model dropdown follow the dialog immediately.
-                    aiProfNames = new List<string>();
-                    aiProfBases = new List<string>();
-                    aiProfKeys = new List<string>();
-                    aiProfModels = new List<string>();
-                    aiProfLists = new List<string>();
-                    aiProfActive = ZanIDE.AiProfilesLoad(aiProfNames, aiProfBases,
-                        aiProfKeys, aiProfModels, aiProfLists);
-                    aiModelSelProf = 0 - 1;
-                    app.RequestRedraw();
-                }
-                if (!aiWindow.IsOpen()) {
-                    aiWindow = null;
-                }
-            }
-
-            if (pathPicker.NeedsRedraw()) {
-                pathPicker.RenderWindow();
-                lastPresent = Window.GetTickMs();
-            }
-            int pickerResult = pathPicker.TakeResult();
-            if (pickerResult == 1) {
-                string picked = pathPicker.SelectedPath();
-                ZanIDE.WriteLastPickerDirectory(
-                    pathPicker.CurrentDirectory());
-                if (pathPickerOwner == 1) {
-                    pLocInput.SetText(picked);
-                    if (dlg != null) { dlg.RequestRedraw(); }
-                } else if (pathPickerOwner == 2) {
-                    string ad = ZanIDE.AssetsDir(root);
-                    Directory.CreateDirectoryRecursive(ad);
-                    File.Copy(picked, ad + "/app.ico");
-                    ZanIDE.SetProjectIcon(root, "assets/app.ico");
-                    log.Add(
-                        "> App icon set: assets/app.ico (embedded into the exe on the next Build/Run/Publish).");
-                } else if (pathPickerOwner == 3) {
-                    string ad = ZanIDE.AssetsDir(root);
-                    Directory.CreateDirectoryRecursive(ad);
-                    string nm = Path.GetFileName(picked);
-                    File.Copy(picked, ad + "/" + nm);
-                    log.Add("> Added resource: assets/" + nm);
-                    Layer.Msg(ZanIDE.T("Resource copied: ", "已复制资源：") + nm, 3);
-                } else if (pathPickerOwner == 6) {
-                    assetMgr.ImportFile(picked, root, log);
-                    Layer.Msg(ZanIDE.T("Asset imported", "素材已导入"), 3);
-                } else if (pathPickerOwner == 7) {
-                    assetMgr.ImportFolder(picked, root, log);
-                    Layer.Msg(ZanIDE.T("Folder imported", "文件夹已导入"), 3);
-                } else if (pathPickerOwner == 5 || pathPickerOwner == 8) {
-                    ZanIDE.AddProjLink(root, picked);
-                    log.Add("> Linked resource: " + picked);
-                    Layer.Msg(ZanIDE.T("Resource linked: ", "已链接资源：") + Path.GetFileName(picked), 3);
-                } else if (pathPickerOwner == 9) {
-                    app.SetWallpaper(picked, app.WallpaperOpacity());
-                } else if (pathPickerOwner == 4) {
-                    string projectRoot = ZanIDE.FindProjectRoot(picked);
-                    haveProject = projectRoot != "";
-                    if (haveProject) {
-                        root = projectRoot;
-                        ZanIDE.WriteLastProject(root);
-                    } else {
-                        root = ZanIDE.DirOf(picked);
-                    }
-                    ZanIDE.OpenPath(
-                        tabNames, tabBodies, tabPaths, activeTab,
-                        picked, Path.GetFileName(picked));
-                    lastActive = 0 - 1;
-                    rescan = true;
-                    log.Add("> Opened " + picked + ".");
-                }
-                pathPickerOwner = 0;
-                if (cfgWin != null) { cfgWin.RequestRedraw(); }
-                if (assetWin != null) { assetWin.RequestRedraw(); }
-                app.RequestRedraw();
-            } else if (pickerResult == 2) {
-                pathPickerOwner = 0;
-                if (dlg != null) { dlg.RequestRedraw(); }
-                if (cfgWin != null) { cfgWin.RequestRedraw(); }
-                if (assetWin != null) { assetWin.RequestRedraw(); }
-                app.RequestRedraw();
-            }
+            // Secondary top-level windows and the shared file picker, each
+            // pumped for at most one frame here (see ZanIDE.Shell.zan).
+            this.PumpWizardWindow();
+            this.PumpPublishWindow();
+            this.PumpConfigWindow();
+            this.PumpAssetWindow();
+            this.PumpSettingsWindows();
+            this.PumpFilePicker();
 
             if (rescan) {
                 rescan = false;
@@ -4772,6 +3968,551 @@ partial class ZanIDE {
         if (autoRun) { arv = 1; }
         ZanIDE.SaveSettings(treeW.Get(), bottomPanelH.Get(), savedW, savedH, arv, app.ThemeMenuIndex(), rightW.Get(), winOpacity, app.WallpaperPath(), app.WallpaperOpacity());
     }
+
+    /// Creates the main window from the persisted geometry/skin/wallpaper and
+    /// reopens the last project (tree, tabs, editor, symbol index, log).
+    void InitWindowAndProject(string cfg) {
+        // Default is a standard 1080 (logical, 96-dpi) width; App.Show scales it
+        // up by the display DPI, so it stays a sensible size on HiDPI screens.
+        int cfgW = ZanIDE.CfgClamp(ZanIDE.CfgInt(cfg, "winW", 1080), 640, 4000);
+        int cfgH = ZanIDE.CfgClamp(ZanIDE.CfgInt(cfg, "winH", 720), 480, 3000);
+        app = App.CreateDark("Zan IDE", cfgW, cfgH);
+        // Restore the last-used title-bar skin (index into Theme.PresetNames);
+        // the skin picker itself is a built-in window feature (EnableSkins).
+        app.ApplySkin(ZanIDE.CfgInt(cfg, "skin", 0));
+        app.Show();
+        // Whole-window opacity (percent), persisted like the skin.
+        winOpacity = ZanIDE.CfgClamp(ZanIDE.CfgInt(cfg, "opacity", 100), 30, 100);
+        app.SetWindowOpacity(winOpacity);
+        // Custom window wallpaper (image + blend strength), set in the
+        // appearance drawer and persisted like the skin.
+        wallPath = ZanIDE.CfgStr(cfg, "wallpaper", "");
+        wallOpacity = ZanIDE.CfgClamp(ZanIDE.CfgInt(cfg, "wallOpacity", 100), 10, 100);
+        if (wallPath != "" && !File.Exists(wallPath)) { wallPath = ""; }
+        app.SetWallpaper(wallPath, wallOpacity);
+        savedW = cfgW;
+        savedH = cfgH;
+
+        // Reopen the last project the user worked on; when there is none yet,
+        // start with just the Start page (no sample project is scaffolded).
+        Directory.CreateDirectoryRecursive(ZanIDE.ProjectsHome());
+        string lastProj = ZanIDE.ReadLastProject();
+        haveProject = lastProj != "" && File.Exists(lastProj + "/zan.proj");
+        root = ZanIDE.ProjectsHome();
+        if (haveProject) { root = lastProj; }
+        if (haveProject) { ZanIDE.AddRecentProject(root); }
+
+        // Completion answers from the compiler's own symbol index; load
+        // whatever the last build left behind and refresh it in the
+        // background so it follows the code.
+        if (haveProject) {
+            if (!ZanIDE.LoadSymbolIndexFor(root)) {
+                // Never built here: generate the index in the background so
+                // hover and completion show real signatures (including stdlib
+                // ones) instead of falling back to guesses.
+                ZanIDE.EmitSymbolsDetach(root, root + "/src/main.zan");
+            }
+        }
+        tree = new List<TreeNode>();
+        if (haveProject) { tree = ZanIDE.ScanTree(root); }
+        rescan = false;
+
+        tabNames = new List<string>();
+        tabBodies = new List<string>();
+        tabPaths = new List<string>();
+
+        activeTab = SignalInt.Create(0);
+        editor = CodeEditor.Create();
+        statusBar = new StatusBar();
+        errorList = new ErrorList();
+        outClearBtn = Button.Typed("Clear", 0);
+        outClearBtn.size = 0;
+        lastActive = 0 - 1;
+        // Which .zform tab the designer is currently bound to, and the last
+        // serialized layout (to detect changes and persist them back to disk).
+        loadedFormPath = "";
+        formCache = "";
+        // Same for the .zscene tab bound to the scene designer.
+        loadedScenePath = "";
+        sceneCache = "";
+
+        if (haveProject) {
+            ZanIDE.OpenFirst(tabNames, tabBodies, tabPaths, activeTab, root);
+        }
+        // Start page is a real tab (path sentinel "@start"), shown first like
+        // VS's Start Page. Rendered specially instead of the code editor.
+        tabNames.Insert(0, "Start");
+        tabBodies.Insert(0, "");
+        tabPaths.Insert(0, "@start");
+        activeTab.Set(0);
+
+        log = new List<string>();
+        if (haveProject) {
+            log.Add("> Zan IDE ready. Workspace: " + root);
+        } else {
+            log.Add("> Zan IDE ready. No project is open.");
+        }
+
+        ZanIDE.uiLang = ZanIDE.ReadUiLang();
+        Wizard.lang = ZanIDE.uiLang;
+        Designer.lang = ZanIDE.uiLang;
+        SceneDesigner.lang = ZanIDE.uiLang;
+        ribbonTabs = ZanIDE.RibbonTabs();
+        ribbonTab = SignalInt.Create(0);
+    }
+
+    /// New Project categories and the New File template catalog.
+    void InitWizardCatalogs() {
+        // ---- New Project categories (built-in + user "Custom") ----
+        catNames = new List<string>{
+            "Console", "Library", "Window App", "WebView", "Server", "Custom" };
+
+        // The template catalog and the wizard's entity view of it; both rebuilt
+        // whenever the New Project wizard opens so freshly-saved custom
+        // templates show up.
+        tpls = new List<Tpl>();
+        wizTpls = new List<WizardTemplate>();
+
+        // ---- New File template catalog ----
+        fileItems = new List<WizardItem>{
+            new WizardItem(ZanIDE.T("Program (Main)", "程序 (Main)"), "arrow-right", ZanIDE.T("Code file: class with a static Main() entry point.", "代码文件：带静态 Main() 入口的类。")),
+            new WizardItem(ZanIDE.T("Class", "类"), "grid", ZanIDE.T("Code file: an empty class with fields and methods.", "代码文件：带字段和方法的空类。")),
+            new WizardItem(ZanIDE.T("GUI Window", "GUI 窗口"), "maximize", ZanIDE.T("Code file: a Gui window with an event loop.", "代码文件：带事件循环的 Gui 窗口。")),
+            new WizardItem(ZanIDE.T("Interface", "接口"), "copy", ZanIDE.T("Code file: a base class defining a contract.", "代码文件：定义契约的基类。")),
+            new WizardItem(ZanIDE.T("Empty File", "空文件"), "file", ZanIDE.T("Code file: a blank .zan file.", "代码文件：空白的 .zan 文件。")),
+            new WizardItem(ZanIDE.T("Form (Designer)", "表单 (设计器)"), "layout", ZanIDE.T("Form: creates Name.zform (visual layout) + Name.zan (code-behind).", "表单：创建 Name.zform（可视化布局）+ Name.zan（代码后置）。")),
+            new WizardItem(ZanIDE.T("Game Scene (Designer)", "游戏场景 (设计器)"), "maximize", ZanIDE.T("Scene: creates Name.zscene, a free-canvas game window layout.", "场景：创建 Name.zscene，自由画布式游戏窗口布局。")),
+            new WizardItem(ZanIDE.T("Folder", "文件夹"), "folder", ZanIDE.T("Creates a new folder under src/.", "在 src/ 下创建一个新文件夹。")) };
+    }
+
+    /// Wizard windows (New Project / New File / Save as template) and the
+    /// inputs, pickers and target-platform chips they drive.
+    void InitDialogState() {
+        // ---- Dialog state ----
+        // The New Project / New File wizards are REAL secondary top-level windows
+        // (draggable anywhere on the desktop), driven from this same event pump.
+        // dlg is null when no wizard is open.
+        // dlgMode: 1=new-project, 2=new-file, 3=save-as-template.
+        dlg = null;
+        dlgMode = 0;
+        pathPicker = FilePicker.Create();
+        pathPickerOwner = 0;
+        catSel = SignalInt.Create(0);
+        pSel = SignalInt.Create(0);
+        fSel = SignalInt.Create(0);
+
+        // Target platforms for New Project (multi-select OS + architecture).
+        // One column per OS; two architecture chips stacked per column. Chip
+        // labels are arch-only (the OS is the column header). Order is
+        // column-major: [Win x64, Win ARM64, Linux x64, Linux ARM64, ...].
+        platformGroups = new List<string>{ "Windows", "Linux", "macOS" };
+        // One entry per (OS column, architecture), column-major, all selected by
+        // default. The order matches PlatformCsv's id list.
+        platforms = new List<WizardTarget>{
+            new WizardTarget("x64", 1), new WizardTarget("ARM64", 1),
+            new WizardTarget("x64", 1), new WizardTarget("ARM64", 1),
+            new WizardTarget("x64", 1), new WizardTarget("ARM64", 1) };
+        pNameInput = new Input(ZanIDE.T("project name", "项目名称"));
+        pNameInput.SetText("NewProject");
+        pLocInput = new Input(ZanIDE.T("location", "位置"));
+        pLocInput.SetText(ZanIDE.ReadLastPickerDirectory(ZanIDE.ProjectsHome()));
+        fNameInput = new Input(ZanIDE.T("file name", "文件名称"));
+        fNameInput.SetText("NewFile");
+
+        // Right-click context menu (file tree + tab bar) state.
+        // ctxKind: 0 = none, 1 = project tree row, 3 = editor tab.
+        ctxKind = 0;
+        ctxX = 0;
+        ctxY = 0;
+        ctxTarget = 0 - 1;
+
+        // Save-current-project-as-custom-template state.
+        tmplCatSel = SignalInt.Create(0);
+        tmplNameInput = new Input(ZanIDE.T("template name", "模板名称"));
+        tmplNameInput.SetText("MyTemplate");
+        saveItems = new List<WizardItem>{
+            new WizardItem("Console", "menu", ZanIDE.T("Save under the Console category.", "保存到 Console 分类下。")),
+            new WizardItem("Library", "grid", ZanIDE.T("Save under the Library category.", "保存到 Library 分类下。")),
+            new WizardItem("Window App", "maximize", ZanIDE.T("Save under the Window App category.", "保存到 Window App 分类下。")),
+            new WizardItem("WebView", "folder", ZanIDE.T("Save under the WebView category.", "保存到 WebView 分类下。")),
+            new WizardItem("Server", "arrow-right", ZanIDE.T("Save under the Server category.", "保存到 Server 分类下。")),
+            new WizardItem("Custom", "file", ZanIDE.T("Save under the Custom category.", "保存到 Custom 分类下。")) };
+    }
+
+    /// Find / Replace, Go To Line and the project-wide search state.
+    void InitFindReplaceState() {
+        // ---- Find/Replace & GoToLine state ----
+        findMode = 0;    // 0=hidden, 1=find, 2=replace, 3=gotoLine, 4=bpCondition, 5=rename,
+                             // 6=find in files, 7=replace in files
+        findText = "";
+        replText = "";
+        // Find in Files results (project-wide, F8/Shift+F8 walk them).
+        fifPath = new List<string>();
+        fifLine = new List<string>();
+        fifText = new List<string>();
+        fifQuery = "";
+        fifRepl = "";
+        fifReplFocus = false;   // Tab switches the Replace in Files field
+        fifSel = 0 - 1;
+        gotoText = "";
+        renameText = "";
+        renameWord = "";
+        findMatch = -1;   // line of current match
+        // Persistent framework Button instances for the find/replace/goto bar so
+        // it renders through the themed, glass-aware component (not hand-drawn
+        // hex) and matches every skin. Text is set per frame by mode.
+        findBtn = Button.Primary(ZanIDE.T("Find", "查找")).SetSize(1);
+        findNextBtn = Button.Create(ZanIDE.T("Next", "下一个")).SetSize(1);
+        replBtn = Button.Primary(ZanIDE.T("Replace", "替换")).SetSize(1);
+        replAllBtn = Button.Create(ZanIDE.T("Repl All", "全部替换")).SetSize(1);
+        gotoBtn = Button.Primary(ZanIDE.T("Go", "跳转")).SetSize(1);
+        // Start-page quick-action buttons (framework Button components).
+        startNewProjBtn = Button.WithIcon(ZanIDE.T("New Project", "新建项目"), "plus");
+        startNewFileBtn = Button.WithIcon(ZanIDE.T("New File", "新建文件"), "file");
+        startOpenBtn = Button.WithIcon(ZanIDE.T("Open", "打开"), "folder");
+        startNewsScroll = SignalInt.Create(0);
+        startPage = new StartPage();
+        debugContinueBtn = Button.IconTextTyped(
+            ZanIDE.T("Continue", "继续"), "play", 3);
+        debugContinueBtn.SetSize(1);
+        debugStepOverBtn = Button.IconTextTyped(
+            ZanIDE.T("Step Over", "单步跳过"), "arrow-right", 2);
+        debugStepOverBtn.SetSize(1);
+        debugStepIntoBtn = Button.IconTextTyped(
+            ZanIDE.T("Step Into", "单步进入"), "arrow-down", 2);
+        debugStepIntoBtn.SetSize(1);
+        debugStopBtn = Button.IconTextTyped(
+            ZanIDE.T("Stop", "停止"), "stop", 5);
+        debugStopBtn.SetSize(1);
+    }
+
+    /// Publish dialog state.
+    void InitPublishState() {
+        // ---- Publish dialog state ----
+        // pubSel holds a 0/1 flag per platform, parallel to the host-aware id
+        // list in ZanIDE.PublishTargetIds (this OS's native x64/ARM64 plus
+        // Linux x64/ARM64). Populated from zan.proj via ReadProjectPlatforms.
+        pubWin = null;
+        pubPending = false;
+        pubSel = new List<int>();
+        // In-flight detached publish: exe paths to verify on completion plus
+        // the consumed length of its streamed log (see the poll below).
+        pubBusy = false;
+        pubExes = new List<string>();
+        pubLogLen = 0;
+    }
+
+    /// Editor colour theme and code font size (persisted in editor.cfg).
+    void InitEditorAppearance() {
+        // ---- Editor appearance (color theme + font size) ----
+        // edThemeIdx selects a syntax-color preset (see EditorThemeName); edFontPx
+        // is the code font size (0 = follow the UI theme). Persisted to editor.cfg.
+        cfgWin = null;
+        // Asset Manager child window (browse/import/organize assets/ recursively).
+        assetWin = null;
+        edThemeIdx = ZanIDE.ReadEditorTheme();
+        edFontPx = ZanIDE.ReadEditorFont();
+        defFontPx = app.theme.fontSizeMedium;
+        settingsWindow = null;
+    }
+
+    /// Help / Docs browser state.
+    void InitHelpBrowser() {
+        // ---- Help / Docs browser state ----
+        // The docs page is a real tab (path sentinel "@docs"). docsSearch filters
+        // the entry list; docsSel is the selected entry; docsScroll scrolls the
+        // sidebar list.
+        docsSearch = new Input(ZanIDE.T("Search syntax & components...", "搜索语法与组件..."));
+        docsSel = SignalInt.Create(0);
+        docsSection = SignalInt.Create(0);
+        docsScroll = SignalInt.Create(0);
+        docsCodeScroll = SignalInt.Create(0);
+        docsDemoBool = SignalBool.Create(true);
+        docsDemoInt = SignalInt.Create(2);
+        docsDemoInput = new Input(ZanIDE.T("Type here", "在此输入"));
+        docsDemoInput.SetText("Zan");
+
+        // Pending "go to definition" jump, applied after the target tab loads.
+        pendingGotoLine = 0 - 1;
+        pendingGotoCol = 0;
+    }
+
+    /// Output console text selection (drag to select, right-click copy).
+    void InitOutputSelection() {
+        // ---- Output console text selection (drag to select, right-click copy) ----
+        // Anchor/head positions are absolute (row = index into `log`, col = char).
+        coSelDrag = 0;
+        coSelA = 0 - 1;
+        coSelAc = 0;
+        coSelB = 0 - 1;
+        coSelBc = 0;
+        // Output console scroll (lines up from the bottom; 0 = follow the tail),
+        // a scrollbar-drag flag, and a substring filter box. The console owns its
+        // own scrolling/filtering rather than the caller wiring it up each time.
+        coScroll = 0;
+        coSbDrag = 0;
+        // Output/Errors right-click context menu (copy line / copy all / clear).
+        coCtxOpen = false;
+        coCtxX = 0;
+        coCtxY = 0;
+        coCtxRow = 0 - 1;
+        coFilter = new Input(
+            ZanIDE.T("Filter output...", "筛选输出..."));
+    }
+
+    /// Debugger state: breakpoints, stepping and the variable/stack views.
+    void InitDebugState() {
+        // ---- Debug state ----
+        dbgState = 0;
+        dbgExecLine = -1;
+        dbg = null;
+        dbgConsole = new List<string>();
+        dbgVarInfo = new List<string>();
+        dbgStack = new List<string>();
+        dbgPanelTab = SignalInt.Create(0);
+        // Conditional breakpoints: expression per 0-based line (edited via
+        // Ctrl+B, passed through DAP setBreakpoints as `condition`).
+        bpCondLines = new List<int>();
+        bpCondExprs = new List<string>();
+        bpCondText = "";
+        // Watch expressions, re-evaluated via DAP `evaluate` on every stop.
+        dbgWatches = new List<string>();
+        dbgWatchVals = new List<string>();
+        watchText = "";
+        // Semantic language server (zan-lsp), started lazily on first
+        // navigation request; falls back to text scanning when unavailable.
+        lspSess = null;
+        lspTried = false;
+    }
+
+    /// Form and scene designer state.
+    void InitDesignerState() {
+        // ---- Designer state ----
+        // The single unified designer: .zform tabs host the component-based
+        // form designer (stdlib Gui.Designer) with palette, containers,
+        // inspector and event bindings. Its design document round-trips
+        // through the .zform file.
+        designerMode = false;
+        formDesigner = Designer.Create();
+        // Design/Code toggle: codeViewForm holds the path of the .zform currently
+        // shown as code ("" = design view). The code view reuses a dedicated,
+        // in-place editor over the paired code-behind -- it never opens a new tab
+        // or creates a file just from switching modes. Only .zform tabs toggle.
+        codeViewForm = "";
+        formCodeEd = CodeEditor.Create();
+        formCodeLoaded = "";
+        // .zscene tabs host the free-canvas game scene designer (stdlib
+        // Game.Scene.SceneDesigner): background reference, absolute placement,
+        // nine-grid anchors, grid snapping, slot grid groups, z-order. The
+        // Design/Code toggle shows the .zscene JSON in place.
+        sceneMode = false;
+        sceneDesigner = SceneDesigner.Create();
+        assetMgr = AssetManager.Create();
+    }
+
+    /// Right side panel (AI / tools / examples / git) and the dockable main
+    /// area, seeded from the persisted extents.
+    void InitPanelsAndDock(string cfg) {
+        treeW = SignalInt.Create(ZanIDE.CfgClamp(ZanIDE.CfgInt(cfg, "treeW", 240), 120, 900));
+        // Seeds for the dock's side extents on a first run (afterwards dock.cfg
+        // carries the sizes the user dragged).
+        bottomPanelH = SignalInt.Create(ZanIDE.CfgClamp(ZanIDE.CfgInt(cfg, "bottomH", 190), 70, 2000));
+
+        // ---- Right side panel (AI assistant, tools, examples, git) ----
+        rightW = SignalInt.Create(ZanIDE.CfgClamp(ZanIDE.CfgInt(cfg, "rightW", 600), 120, 1600));
+
+        // ---- Dockable main area ----
+        // The shell around the document area is a DockHost: EXPLORER, the
+        // structure/components outline, STDLIB, OUTPUT and the assistant column
+        // are tab groups the user can drag to another side, tab together,
+        // resize and close (right-click a tab strip to bring a closed one
+        // back). The editor is the fixed center panel everything docks around.
+        // The arrangement is persisted in dock.cfg and restored on launch.
+        // Every tool panel closes; the ribbon's Panels section is the switch
+        // that brings it back (its icon goes dark while the panel is hidden).
+        dock = DockHost.Create();
+        dock.emptyMenuLabel = ZanIDE.T("No closed panels", "没有已关闭的面板");
+        dock.Register("explorer", "", DockSide.Left(), true, true);
+        dock.Register("structure", "", DockSide.Left(), true, true);
+        dock.Register("stdlib", "", DockSide.Left(), true, true);
+        dock.RegisterFixed("editor", "Editor");
+        // The assistant column and the bottom band each start as one tab group.
+        dock.Register("ai", "", DockSide.Right(), true, true);
+        dock.Register("tools", "", DockSide.Right(), true, false);
+        dock.Register("examples", "", DockSide.Right(), true, false);
+        dock.Register("git", "", DockSide.Right(), true, false);
+        dock.Register("output", "", DockSide.Bottom(), true, true);
+        dock.Register("errors", "", DockSide.Bottom(), true, false);
+        ZanIDE.ApplyPanelLabels(dock);
+        dock.SetWeight("explorer", 40);
+        dock.SetWeight("structure", 32);
+        dock.SetWeight("stdlib", 28);
+        dock.SetSideExtent(DockSide.Left(), treeW.Get());
+        dock.SetSideExtent(DockSide.Right(), rightW.Get());
+        dock.SetSideExtent(DockSide.Bottom(), bottomPanelH.Get());
+        dock.LoadLayout(ZanIDE.ReadDockLayout());
+        // The outline panel retitles itself between STRUCTURE and COMPONENTS as
+        // the designer opens and closes; this tracks the title in effect.
+        dockOutlineTitle = "";
+        // The errors panel tab carries the diagnostic count; this tracks it.
+        dockErrorsTitle = "";
+    }
+
+    /// Git panel state (the right panel's "Git" tab).
+    void InitGitPanel() {
+        // ---- Git panel state (right panel "Git" tab) ----
+        // gitFiles holds `git status --porcelain` lines; gitLoaded gates the
+        // first (and refresh-triggered) status scan so git only runs on demand.
+        gitFiles = new List<string>();
+        gitBranch = "";
+        gitLoaded = false;
+        // Which detached git job is in flight (0 none, 1 status+branch scan,
+        // 2 a command whose output goes to Output); the frame loop polls it so
+        // git never blocks drawing.
+        gitJob = 0;
+        gitSel = SignalInt.Create(0 - 1);
+        gitScroll = SignalInt.Create(0);
+        gitMsgIn = new Input(
+            ZanIDE.T("Commit message...", "提交信息..."));
+        // Tools / Examples trees for the right panel tabs.
+        rtToolTree = ZanIDE.BuildDirTree(ZanIDE.ToolsDir());
+        rtExTree = ZanIDE.BuildExampleTree();
+        rtToolSel = SignalInt.Create(-1);
+        rtExSel = SignalInt.Create(-1);
+        rtToolFilter = new Input(ZanIDE.T("Filter...", "筛选..."));
+        rtExFilter = new Input(ZanIDE.T("Filter...", "筛选..."));
+        rtToolScroll = SignalInt.Create(0);
+        rtExScroll = SignalInt.Create(0);
+        rtCtxShow = new List<TreeNode>();
+        // Chat transcript: parallel role ("user"/"assistant"/"error") + text.
+        aiRole = new List<string>();
+        aiText = new List<string>();
+        aiScroll = SignalInt.Create(0);
+        // 1 while a completion request is in flight (curl runs detached and the
+        // event loop polls for its done-marker file, so the UI never blocks).
+        aiBusy = SignalInt.Create(0);
+        aiInput = new Input(
+            ZanIDE.T("Ask AI about your code...", "向 AI 提问，辅助开发..."));
+        aiSendBtn = Button.Primary(ZanIDE.T("Send", "发送")).SetSize(1);
+        // "Insert code" applies the code block of the last AI answer at the
+        // editor cursor, making the assistant a real pair-programming tool.
+        aiApplyBtn = Button.WithIcon(ZanIDE.T("Insert code", "插入代码"), "code").SetSize(1);
+        // "Replace file" swaps the whole active file for the last AI code block.
+        aiReplaceBtn = Button.Create(ZanIDE.T("Replace file", "替换整文件")).SetSize(1);
+    }
+
+    /// AI assistant: provider profiles, chat sessions, transcript cache and the
+    /// in-flight request flags.
+    void InitAiState() {
+        // ---- AI provider profiles (ai_profiles.json) ----
+        // Parallel lists: profile name / base URL / API key / default model /
+        // `;`-joined fetched model ids. `aiProfActive` is the enabled profile.
+        aiProfNames = new List<string>();
+        aiProfBases = new List<string>();
+        aiProfKeys = new List<string>();
+        aiProfModels = new List<string>();
+        aiProfLists = new List<string>();
+        aiProfActive = ZanIDE.AiProfilesLoad(aiProfNames, aiProfBases,
+            aiProfKeys, aiProfModels, aiProfLists);
+        // The unified AI configuration lives in its own child window
+        // (AiSettingsWindow, UiDoc-based like the editor settings).
+        aiWindow = null;
+        // Chat model switcher: the dropdown lists the active profile's models
+        // (default model first); no selection = the profile's default model.
+        aiModelSel = SelectBox.Create(ZanIDE.T("Model (default)", "模型（默认）"));
+        aiModelOpts = new List<string>();
+        aiModelSelProf = 0 - 1;
+        aiCfgBtn = Button.Create(ZanIDE.T("Config", "配置")).SetSize(1);
+        aiPredictBtn = Button.Create(ZanIDE.T("Continue", "续写")).SetSize(1);
+        // Chat sessions: switch / new / clear the transcript context. Inactive
+        // sessions are kept serialized in `aiSessions` (\u0002-joined records).
+        aiSessions = new List<string>();
+        aiSessCur = 0;
+        aiSessions.Add("");
+        aiSessPrevBtn = Button.Create("<").SetSize(1);
+        aiSessNextBtn = Button.Create(">").SetSize(1);
+        aiSessNewBtn = Button.Create(ZanIDE.T("New chat", "新会话")).SetSize(1);
+        aiSessClearBtn = Button.Create(ZanIDE.T("Clear", "清空")).SetSize(1);
+        // Chat transcript wrapped-line cache (rebuilt only when the transcript,
+        // width or theme changes — rewrapping every frame is too slow).
+        aiCacheLines = new List<string>();
+        aiCacheColors = new List<int>();
+        aiCacheKinds = new List<int>();
+        aiCacheKey = "";
+        // In-flight "AI continue at caret" request (tab it was started from).
+        aiPredBusy = SignalInt.Create(0);
+        aiPredTab = 0 - 1;
+    }
+
+    /// Run/build state: the streaming run shell, the detached build's poll
+    /// bookkeeping and hot reload.
+    void InitRunState(string cfg) {
+        // Run shell: a persistent interactive shell session used to stream a
+        // launched program's output into the Output tab without blocking the
+        // UI. Its stdin is a pipe (Process.ShellSend) and its stdout/stderr
+        // stream to a session log file polled each frame.
+        termFp = 0;
+        termLogLen = 0;
+        // Console-program output mirror: a launched console program prints into
+        // its own console window and, teed, into RunLogPath, which is polled
+        // into the Output tab so output shows in both places.
+        runLogLen = 0;
+        runStreaming = false;
+        // Detached (non-blocking) build behind the Run/Build ribbon actions:
+        // the compile runs in a separate shell so the UI never freezes; the
+        // main loop polls a done-marker, then applies diagnostics and launches.
+        buildBusy = false;
+        buildLogLen = 0;
+        buildExe = "";
+        buildIsGui = false;
+        buildThenRun = false;
+        // When the in-flight detached build is a debug (`-g`) build, the poll
+        // opens the debugger on success instead of running the program.
+        dbgBuildPending = false;
+        buildTargetPath = "";
+        // Hot reload: when ON, saving rebuilds and restarts the running app.
+        autoRun = ZanIDE.CfgInt(cfg, "autoRun", 0) == 1;
+        // Set by a save when autoRun is ON; consumed once per loop to kick off a
+        // DETACHED rebuild (never a synchronous compile on the UI thread).
+        hotReloadReq = false;
+        treeSel = SignalInt.Create(-1);
+        lastTreeSel = -1;
+    }
+
+    /// Sidebar sections: explorer / structure / stdlib trees, their filters and
+    /// scroll offsets.
+    void InitSidebarState() {
+        // Vertical scroll offsets for the sidebar sections, so long lists stay
+        // inside their region (EXPLORER in pixels, COMPONENTS/EXAMPLES in rows).
+        treeScrollY = SignalInt.Create(0);
+
+        // Third sidebar section: the standard library as a collapsible tree
+        // (browse/open stdlib sources directly, like aardio's 库 pane).
+        exTree = ZanIDE.BuildStdlibTree();
+        exSel = SignalInt.Create(-1);
+
+        // Per-section filter boxes: each sidebar tree can be narrowed by a
+        // case-insensitive substring; the displayed (possibly filtered) lists
+        // are recomputed every frame so click handlers index into them.
+        treeFilter = new Input(ZanIDE.T("Filter...", "筛选..."));
+        structFilter = new Input(ZanIDE.T("Filter...", "筛选..."));
+        exFilter = new Input(ZanIDE.T("Filter...", "筛选..."));
+        treeShow = new List<TreeNode>();
+        structShow = new List<TreeNode>();
+        exShow = new List<TreeNode>();
+        lastExSel = -1;
+        exTreeScrollY = SignalInt.Create(0);
+
+        // STRUCTURE (code outline): types + their members for the active code
+        // file, rebuilt only when the buffer signature changes so navigation
+        // stays cheap. Clicking a member jumps the editor to its line.
+        structTree = new List<TreeNode>();
+        structSel = SignalInt.Create(-1);
+        lastStructSel = -1;
+        structScrollY = SignalInt.Create(0);
+        structSig = "@none";
+    }
+
 
     /// Spawns a fresh wizard child window (a real draggable top-level window),
     /// resetting the selection and name field, and returns its App.
