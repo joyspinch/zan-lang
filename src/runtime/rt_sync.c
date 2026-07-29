@@ -521,12 +521,14 @@ static void zan_shared_table_free(zan_shared_table *table) {
 typedef void (*zan_thread_body_fn)(void);
 
 /* Emitted code defines this when the program can throw; it drops the calling
- * thread's exception-handling state. Weak so a program without exceptions --
- * or one linked against a runtime older than the emitter -- still links. */
+ * thread's exception-handling state. The fallback here is a weak *definition*
+ * rather than a weak reference: a weak undefined symbol resolves to null on
+ * ELF but is a link error on Mach-O, and this object is linked into static
+ * macOS binaries too. The emitted strong definition wins wherever it exists. */
 #if defined(__GNUC__) || defined(__clang__)
-__attribute__((weak)) extern void __zan_eh_release(void);
+__attribute__((weak)) void __zan_eh_release(void) { }
 #else
-extern void __zan_eh_release(void);
+void __zan_eh_release(void) { }
 #endif
 
 /* Release whatever per-thread runtime state the calling thread accumulated.
@@ -534,9 +536,6 @@ extern void __zan_eh_release(void);
  * callback thread that ran Zan code -- can hand its slot back instead of
  * holding one for the life of the process. */
 void zan_thread_detach(void) {
-#if defined(__GNUC__) || defined(__clang__)
-    if (!__zan_eh_release) return;
-#endif
     __zan_eh_release();
 }
 

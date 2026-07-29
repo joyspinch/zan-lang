@@ -1709,10 +1709,28 @@ header-only 库 / C 回调 / 结构体字段偏移，全部对应 A2 / A3 / A4�
 不跟 `cmake --build` 走，只能在对应平台重编。已经栽过两次（pre-A2-0b 的
 `zan_gui.dll` 让一个用例跑 331 秒；rt_sync/rt_io 的修改到不了任何非 Windows 构建）。
 新增 `python scripts/check_toolchain_stale.py`：按 **git 提交时间**（不是 mtime）
-比对每个成品与其源文件，陈旧即非零退出。当前实测 **10 个成品待重编**
-（linux-musl / linux-arm64 / linux-riscv64 的 `zanrt_io.o`+`zanrt_sync.o`、
-macOS 两个 arch 的 `zanrt_sync.o`、linux 两个 arch 的 `libzan_gui.a`），
-Windows 这台机器造不出来，必须在各自平台上重编后提交。
+比对每个成品与其源文件，陈旧即非零退出。
+
+**✅ 已解决（2026-07-29）：12 个 runtime 目标文件不再需要"对应平台"。**
+根本不用 Mac、也不用 Linux 机器：`zig cc` 自带 musl 与 Darwin 头文件，
+一台机器就能出全部五个目标。已有 `scripts/build_macos_rt.sh` 就是这么做的，
+现在补上对称的 `scripts/build_linux_rt.sh`（`-g0`，否则 DWARF 让静态链接用的
+`.o` 白白涨 4 倍），并加 `.github/workflows/toolchain.yml`：runtime 源码一变
+就重编 12 个 `.o`、跑 `check_macos_rt.py` 验证只导入 libSystem、提交回分支，
+最后 `check_toolchain_stale.py --group=runtime` 卡住任何漏网。
+本轮已用同样的命令重编并提交这 12 个，A4-2 / rt_sync / rt_io 的修复现在对
+linux-x64/musl/arm64/riscv64 与 macOS 两个 arch 同时生效。
+**顺带发现一个只在 macOS 上炸的链接错误**：A4-2 里 `rt_sync.c` 对
+`__zan_eh_release` 用的是**弱引用**（ELF 上未定义弱符号解析为 0，Mach-O 上是
+链接失败），`check_macos_rt.py` 直接报 `MISSING ___zan_eh_release`。
+改成**弱定义**（空函数），emit 出来的强定义照常覆盖它 —— Windows 上实测仍是
+3.9 MB 而非 102 MB，说明覆盖生效。
+
+**仍未解决：2 个 `libzan_gui.a`（linux-x64 / linux-arm64）。**
+签入的是**胖归档**：我们的 `gui_runtime*.o` 加上平台 libX11/libxcb/libXau 的
+全部成员，而树里没有任何地方记录它是怎么产生的。凭猜测重建会把一个能用的
+归档换成一个瘸的，所以保持手工，`check_toolchain_stale.py --group=gui` 继续报，
+等有人把配方写下来。
 
 ---
 

@@ -27,24 +27,28 @@ RT_SYNC = ["src/runtime/rt_sync.c"]
 GUI = ["src/runtime/gui_runtime.c", "src/runtime/gui_runtime_text.c",
        "src/runtime/gui_runtime_font.c", "src/runtime/gui_runtime_x11.c"]
 
+# (path, sources, group). The groups exist so CI can hold the part it can
+# rebuild -- `--group runtime`, which zig cc produces for every target from one
+# Linux runner -- to a hard failure, while the GUI drivers, whose archives
+# bundle the platform's X11/freetype and are still built by hand, only report.
 ARTIFACTS = [
-    ("toolchain/linux-musl/zanrt_io.o", RT_IO),
-    ("toolchain/linux-musl/zanrt_sync.o", RT_SYNC),
-    ("toolchain/linux-arm64/zanrt_io.o", RT_IO),
-    ("toolchain/linux-arm64/zanrt_sync.o", RT_SYNC),
-    ("toolchain/linux-riscv64/zanrt_io.o", RT_IO),
-    ("toolchain/linux-riscv64/zanrt_sync.o", RT_SYNC),
-    ("toolchain/macos/arm64/zanrt_io.o", RT_IO),
-    ("toolchain/macos/arm64/zanrt_io_mt.o", RT_IO),
-    ("toolchain/macos/arm64/zanrt_sync.o", RT_SYNC),
-    ("toolchain/macos/x64/zanrt_io.o", RT_IO),
-    ("toolchain/macos/x64/zanrt_io_mt.o", RT_IO),
-    ("toolchain/macos/x64/zanrt_sync.o", RT_SYNC),
-    ("stdlib/Gui/drivers/win-x64/zan_gui.dll", GUI),
-    ("stdlib/Gui/drivers/linux-x64/static/libzan_gui.a", GUI),
-    ("stdlib/Gui/drivers/linux-arm64/static/libzan_gui.a", GUI),
-    ("stdlib/Gui/drivers/macos-arm64/libzan_gui.dylib", GUI),
-    ("stdlib/Gui/drivers/macos-x64/libzan_gui.dylib", GUI),
+    ("toolchain/linux-musl/zanrt_io.o", RT_IO, "runtime"),
+    ("toolchain/linux-musl/zanrt_sync.o", RT_SYNC, "runtime"),
+    ("toolchain/linux-arm64/zanrt_io.o", RT_IO, "runtime"),
+    ("toolchain/linux-arm64/zanrt_sync.o", RT_SYNC, "runtime"),
+    ("toolchain/linux-riscv64/zanrt_io.o", RT_IO, "runtime"),
+    ("toolchain/linux-riscv64/zanrt_sync.o", RT_SYNC, "runtime"),
+    ("toolchain/macos/arm64/zanrt_io.o", RT_IO, "runtime"),
+    ("toolchain/macos/arm64/zanrt_io_mt.o", RT_IO, "runtime"),
+    ("toolchain/macos/arm64/zanrt_sync.o", RT_SYNC, "runtime"),
+    ("toolchain/macos/x64/zanrt_io.o", RT_IO, "runtime"),
+    ("toolchain/macos/x64/zanrt_io_mt.o", RT_IO, "runtime"),
+    ("toolchain/macos/x64/zanrt_sync.o", RT_SYNC, "runtime"),
+    ("stdlib/Gui/drivers/win-x64/zan_gui.dll", GUI, "gui"),
+    ("stdlib/Gui/drivers/linux-x64/static/libzan_gui.a", GUI, "gui"),
+    ("stdlib/Gui/drivers/linux-arm64/static/libzan_gui.a", GUI, "gui"),
+    ("stdlib/Gui/drivers/macos-arm64/libzan_gui.dylib", GUI, "gui"),
+    ("stdlib/Gui/drivers/macos-x64/libzan_gui.dylib", GUI, "gui"),
 ]
 
 
@@ -56,8 +60,17 @@ def last_commit(path):
 
 
 def main():
+    group = "all"
+    for arg in sys.argv[1:]:
+        if arg.startswith("--group="):
+            group = arg.split("=", 1)[1]
+        else:
+            print(f"usage: {sys.argv[0]} [--group=runtime|gui|all]")
+            return 2
     stale = 0
-    for artifact, sources in ARTIFACTS:
+    for artifact, sources, kind in ARTIFACTS:
+        if group != "all" and kind != group:
+            continue
         built = last_commit(artifact)
         if built is None:
             print(f"skip  {artifact} (not in the repo)")

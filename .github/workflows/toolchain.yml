@@ -1,0 +1,91 @@
+name: toolchain
+
+# The checked-in cross-compilation artifacts do not follow a local build, so a
+# runtime edit used to reach only the platform the author happened to be on --
+# twice that cost days (see scripts/check_toolchain_stale.py). This rebuilds
+# them whenever their sources change and commits the result.
+#
+# The runtime objects need no native runner at all: zig cc carries the musl and
+# Darwin headers, so one Linux job produces all five targets.
+#
+# The GUI drivers are deliberately not here. The committed linux-x64 archive is
+# a fat one -- our gui_runtime objects plus every member of the platform's
+# libX11/libxcb/libXau -- and nothing in the tree records how it was produced.
+# Rebuilding it from a guess would replace a working archive with a thin one,
+# so it stays manual until the recipe is written down, and --group=gui below
+# keeps reporting it.
+
+on:
+  push:
+    branches: ['**']
+    paths:
+      - 'src/runtime/rt_io.c'
+      - 'src/runtime/rt_io.h'
+      - 'src/runtime/rt_sched.c'
+      - 'src/runtime/rt_sync.c'
+      - 'src/runtime/rt_sync.h'
+      - 'scripts/build_linux_rt.sh'
+      - 'scripts/build_macos_rt.sh'
+      - '.github/workflows/toolchain.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  runtime-objects:
+    name: zanrt_*.o (linux x64/arm64/riscv64 + macOS arm64/x64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v1
+        with:
+          version: 0.13.0
+
+      - name: Build
+        run: |
+          sh scripts/build_linux_rt.sh zig
+          sh scripts/build_macos_rt.sh zig
+
+      # The Mach-O objects are linked against a libSystem stub, so anything
+      # they import that libSystem does not export is a link failure for every
+      # user, not for us.
+      - name: Check macOS imports
+        run: python3 scripts/check_macos_rt.py
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: runtime-objects
+          path: |
+            toolchain/linux-musl/zanrt_*.o
+            toolchain/linux-arm64/zanrt_*.o
+            toolchain/linux-riscv64/zanrt_*.o
+            toolchain/macos/arm64/zanrt_*.o
+            toolchain/macos/x64/zanrt_*.o
+
+      - name: Commit if changed
+        run: |
+          git config user.name  'zan-toolchain-bot'
+          git config user.email 'zan-toolchain-bot@users.noreply.github.com'
+          git add -f toolchain/linux-musl/zanrt_*.o \
+                     toolchain/linux-arm64/zanrt_*.o \
+                     toolchain/linux-riscv64/zanrt_*.o \
+                     toolchain/macos/arm64/zanrt_*.o \
+                     toolchain/macos/x64/zanrt_*.o
+          git diff --cached --quiet && { echo 'up to date'; exit 0; }
+          git commit -m 'toolchain: rebuild the cross runtime objects'
+          git pull --rebase --autostash origin "${GITHUB_REF_NAME}"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
+
+  stale-check:
+    name: nothing left stale
+    needs: [runtime-objects]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - run: python3 scripts/check_toolchain_stale.py --group=runtime
+      - name: GUI drivers (report only)
+        run: python3 scripts/check_toolchain_stale.py --group=gui || true
