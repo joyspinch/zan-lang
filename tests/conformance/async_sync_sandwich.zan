@@ -1,0 +1,103 @@
+// A8 probe: an async frame sandwiched between *synchronous* middle frames,
+// the one unwind shape TASKS.md records as never having been constructed.
+//
+// Shape (top -> bottom):
+//   Top (async, try/catch, owned local)
+//     -> await Mid (async, owned local, no try)
+//        -> SyncOuter (sync, owned local, no try)
+//           -> SyncInner (sync, owned local, no try)
+//              -> throw
+// Sync middle frames register their owned locals on the unwind stack (A8-12);
+// the async frame in the middle releases through the frame chain instead
+// (A8-3). This checks the two mechanisms compose: every Bag must be released
+// exactly once and the catch must see the value assigned after the last await.
+using System;
+
+class Boom : Exception {
+    Boom(string m) { Message = m; }
+}
+
+class Bag {
+    string tag;
+    List<string> rows;
+
+    static Bag Of(string tag) {
+        Bag b = new Bag();
+        b.tag = tag;
+        b.rows = new List<string>();
+        b.rows.Add(tag);
+        return b;
+    }
+}
+
+class Mixed {
+    // Deepest sync frame: owns a local, then raises.
+    static void SyncInner(bool bad) {
+        Bag inner = Bag.Of("inner");
+        if (bad) { throw new Boom("inner failed"); }
+        Console.WriteLine("inner ok " + inner.tag);
+    }
+
+    // Sync middle frame: owns a local across the throwing call.
+    static void SyncOuter(bool bad) {
+        Bag outer = Bag.Of("outer");
+        Mixed.SyncInner(bad);
+        Console.WriteLine("outer ok " + outer.tag);
+    }
+
+    static async Bag Fetch(string tag) {
+        await Task.Delay(1);
+        return Bag.Of(tag);
+    }
+
+    // Async middle frame: holds an awaited result (alloca-resident) across the
+    // sync frames that raise.
+    static async int Mid(bool bad) {
+        Bag mid = await Mixed.Fetch("mid");
+        Mixed.SyncOuter(bad);
+        return mid.rows.Count;
+    }
+
+    // Handler frame: its try spans a suspension, so it is reached by re-arming
+    // the recorded handler after the sync frames have been unwound.
+    static async string Top(bool bad) {
+        string note = "start";
+        Bag held = await Mixed.Fetch("held");
+        try {
+            note = "before";
+            int n = await Mixed.Mid(bad);
+            note = "n=" + n;
+        } catch (Boom e) {
+            return held.tag + "/" + note + "/" + e.Message;
+        }
+        return held.tag + "/" + note;
+    }
+
+    // Same sandwich, but the handler is a *synchronous* frame below which the
+    // async work is driven to completion, so the unwind crosses sync -> async
+    // -> sync in both directions.
+    static async string Driven(bool bad) {
+        Bag drv = Bag.Of("drv");
+        try {
+            int n = await Mixed.Mid(bad);
+            return drv.tag + "/n=" + n;
+        } catch (Boom e) {
+            return drv.tag + "/" + e.Message;
+        }
+    }
+
+    static async int Main() {
+        Console.WriteLine(await Mixed.Top(false));
+        Console.WriteLine(await Mixed.Top(true));
+        Console.WriteLine(await Mixed.Driven(false));
+        Console.WriteLine(await Mixed.Driven(true));
+        // Repeat the failing path: a per-throw leak shows up as growth, and a
+        // double release shows up as a crash.
+        int i = 0;
+        while (i < 3) {
+            Console.WriteLine(await Mixed.Top(true));
+            i = i + 1;
+        }
+        return 0;
+    }
+}

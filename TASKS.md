@@ -735,8 +735,15 @@ operand type of return inst!
 
   **仍未完成的边界**（不要当已完成）：
   * ~~展开栈仍是固定 4096 条的静态数组~~ → **已修（2026-07-28），见 A19**。
-  * async 体的局部仍走 A8-3 的抛出点释放 + 帧链释放，没有登记到展开栈；
-    "async 帧夹在同步中间帧之间"的混合形态尚未单独构造用例验证。
+  * async 体的局部仍走 A8-3 的抛出点释放 + 帧链释放，没有登记到展开栈。
+    ~~"async 帧夹在同步中间帧之间"的混合形态尚未单独构造用例验证~~ →
+    **✅ 已验证（2026-07-29）**：新增 `tests/conformance/async_sync_sandwich.zan`，
+    形态为 `Top(async, try 跨挂起, 持有 await 结果) → Mid(async, 持有 await 结果)
+    → SyncOuter(同步中间帧, 持有局部) → SyncInner(同步, 持有局部) → throw`，
+    另加一份 handler 在 async 帧本身、抛出路径同样穿两层同步中间帧的变体，
+    以及连抛三次看是否累积。**两套机制（同步帧的展开栈登记 + async 帧的帧链释放）
+    可以叠加，没有发现缺陷**：输出逐行正确（catch 读到的是最后一次 await 之后写的值），
+    `conformance` / `determinism` / `leakcheck` 三档 3/3 Passed，无泄漏、无重复释放。
   * 这仍然是 setjmp/longjmp EH 之上的补偿机制，happy path 上每个持有型局部多一次
     push、一次 pop。**终局仍应换成 LLVM 真 EH（invoke/landingpad + personality）**：
     零开销 happy path，中间帧 cleanup 交给 unwinder，同时能解决 A8-7 记录的其他 EH
@@ -2045,11 +2052,12 @@ gdb 栈顶正是 `__zan_eh_tmp_grow` 里的 `realloc` → `RtlFreeHeap`（另一
   `leakcheck_http_client_timeout` 现在连跑 6 轮 100% 通过。
 
 仍未完成（**不要当已解决**）：
-* **多线程共享 EH 状态的语义问题**：`__zan_eh_top` / `__zan_eh_exc` /
-  `__zan_eh_tmps_top` 仍是进程级全局，A 线程 throw 理论上能 longjmp 到 B 线程的
-  handler。chunk 存储只消除了内存安全回归，没有解决「每个协程应有独立 handler 栈」。
-  出路：协程/帧持有 EH 状态，或修好生成代码的 TLS。
-* async 帧的 catch 槽仍是固定 `ASYNC_MAX_HANDLERS`（8）。
+* ~~**多线程共享 EH 状态的语义问题**：EH 状态仍是进程级全局，A 线程 throw 能 longjmp
+  到 B 线程的 handler~~ → **已修，见 A22**（EH 状态收进 `__zan_eh_state()` 的每线程
+  状态块，OS 线程 id 开放寻址表 + 一次 cmpxchg 抢槽；2026-07-29 复核 `irgen_builtins.c`
+  确认全部字段都在状态块里，`src/runtime/*.c` 里已无 `__zan_eh_top` 之类的全局）。
+* ~~async 帧的 catch 槽仍是固定 `ASYNC_MAX_HANDLERS`（8）~~ → **已修，见 A23**
+  （改为 per-frame 容量，`ASYNC_MAX_HANDLERS` 已从编译器里删除）。
 * ~~`try { throw ... } finally { ... }`（无 catch）**吞异常**~~ —— 见 A21，已修。
 
 ---
