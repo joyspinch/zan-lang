@@ -1133,10 +1133,50 @@ firebird|rsa|crypt|hkdf|aes|sha|hex|encoding|resource|asset|ide'` 48 项在修�
 编译失败 `undefined type 'HttpClient'`——`HttpClient` 在 `System.Net.Http.Client`
 命名空间，示例只 `using System.Net.Http;`。）
 
-* **B2-1（剩余）** `extern string calloc(...)`：stdlib **18 个文件**
-  （`Game/Rts/Formats` 的 Csf/Shp/Tmp、`Game/Zgm/NetRuntime`、`Gui/Text`、
-  Wechat 2 个、`System/Data` 9 个、`Security/Guard`、`Threading`、
-  `Windows/Forms*`；另 tests / examples / src 若干）
+**B2-1 第十批 ✅ 已完成（2026-07-29）：`System.Data` 全驱动 + Wechat / RsaKey /
+Gui.Text / Game.Rts / Zgm / Windows.Forms —— stdlib 里最后一批 `calloc`-as-string。
+至此 `stdlib/**/*.zan` 中 `extern string calloc` 归零。**
+
+* `System/Data`：`SqliteConnection`（`ppDb`/`errmsg`/`ppStmt`/`pzTail` 句柄槽位，
+  native handle 仍由 `HandleFromBuf` 读出）、`DbConnection`（ODBC 的 `pEnv`/`pDbc`/
+  `pStmt`/`pRows`/`pOutLen`/`pInd`/`pcc`/`nameBuf` 等出参缓冲）、`Redis/RedisClient`
+  （`inbuf`/`tmp` 字段与扩容，取值 `inbuf.ToStr(start, len)`）、
+  `Postgres/PostgresConnection`（`BuildParamBlock` 的 `char**` 块与各参数缓冲改由
+  `List<byte[]> keepAlive` 持有，libpq 调用期间保持引用，删掉 `FreeParamBlock`）、
+  `SqlServer/TdsCodec`（`TdsBuf.Alloc → byte[]`、`TdsBytes.data → byte[]`、
+  `Release()` 只置 null；`Narrow`/`Ucs2` 走 `ToStr`）、`SqlServer/SqlServerConnection`
+  （`recvExact(byte[] dst)`、TDS 包头/包体）、`MySql/MySqlConnection`
+  （`readPacket() → byte[]`、`recvExact`、握手/认证/`COM_STMT_*` 全部报文缓冲、
+  `scramble41`/`scrambleNative`/`authToken → byte[]`、`pemToDer`/`fullAuthCipher`
+  的 DER/模数/指数缓冲）、`Firebird/FbWire`（`FbBytes.data → byte[]`、`FbBuf.Alloc`、
+  `FbReader.Text` 用 `ToStr`）、`Firebird/FirebirdConnection`（`recvExact`/`sendPacket`/
+  `recvInt`）。**协议数据一律带显式长度**，不靠 NUL；OpenSSL/libpq/sqlite3/ODBC 的
+  opaque handle 仍是 native 指针，没有动。
+* `Sdk/Wechat`：`WXBizMsgCrypt` 的 `aesIv` 字段、CBC 加解密缓冲与
+  `CbcEncryptNoPad`/`CbcDecryptNoPad → byte[]`，`BytesToString` 直接 `ToStr`；
+  `TenPay/WechatPayV2.DecodeRefundReqInfo` 的明文缓冲。
+* `Security/Cryptography/RsaKey`：`modulus`/`publicExponent`/`privateExponent`
+  字段与 `ReadIntegerSafe → byte[]`（`Rsa.*` 早就收 `byte[]`）。
+* `Gui/Text.ByteChar`：`calloc`+`memset` → `new byte[2]` + `ToStr(0, 1)`
+  （连 `memset` 这个 extern 一起删）。
+* `Game/Rts/Formats`：`Csf.ReadAscii`/`ReadValue`（UTF-8 转码缓冲 → `ToStr`）、
+  `Shp.DecodeFrame → byte[]`、`Tmp.DecodeTile → byte[]`；`Game/Zgm/NetRuntime` 的
+  `ZgmMessage.Encode() → byte[]`、`Decode` 的 body 缓冲、两个 runtime 的 `recvBuf`。
+  调用方同步：`examples/game/ra2` 的 `Shp`/`Tmp`(含 `DecodeExtra`)/`Theater`
+  （删掉 `Theater.free`）、`tests/conformance/rts_{shp,tmp}_parse`、`zgm_net_runtime`。
+* `System/Windows/Forms.zan` 与 `Windows/Forms/Forms.zan`（两份同源）：
+  `GetWindowTextA` 出参缓冲按返回长度 `ToStr`，消息循环的 `MSG` 缓冲 → `byte[]`。
+
+〔实测〕全量 `ctest -j4` **711/711 Passed**（159 s）；分组
+`sqlserver|tds|postgres|pg_` 9/9、`firebird` 3/3、`mysql` 6/6、
+`wechat|rsa|gui_text` 19/19、`rts_` 15/15、`zgm` 84/84 全绿；
+`examples/db/mysql_crud.zan`(52 files)、`examples/db/odbc_multidb.zan`(29)、
+RA2 demo(76 files) 编译通过。
+
+* **B2-1（剩余）** `extern string calloc(...)`：**stdlib 已清零**，只剩
+  tests / examples / src 若干（`examples/game/ra2` 的 Texture/Csf/Format80/Lzo/
+  MapPack/Pcx/WsKey 与其 tests、`src/ide_zan` 的 ZanIDE/LspSession/DebugSession、
+  `tests/conformance` 若干测试自建缓冲）
   （第二批消掉 Sha1 / Sha256 / Sha512 / Md5 / Sm3 / Hmac / Hex / Base64 八个，
   第三批 `Hkdf`，第四批 `Rsa`，第五批 `Sm2`，第六批 `Sm4`，第七批 `BigInt`）。
   **`Cryptography` 目录整条 `calloc` 链清完**（`Rsa` 也无 `free` 了）。剩下的都在

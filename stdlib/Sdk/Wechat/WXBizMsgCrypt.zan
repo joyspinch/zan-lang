@@ -29,13 +29,10 @@ class WXBizPlain {
 /// 加解密原语全部来自 <c>System.Security.Cryptography</c>，本类只编排微信协议。
 /// </summary>
 class WXBizMsgCrypt {
-    [DllImport("crt")] static extern string calloc(long count, long size);
-    [DllImport("crt")] static extern void free(string p);
-
     string token;
     string appId;
     byte[] aesKey;   // 32 raw bytes
-    string aesIv;    // 16 raw bytes (= key[0..15])
+    byte[] aesIv;    // 16 raw bytes (= key[0..15])
 
     /// <summary>
     /// <paramref name="encodingAesKey"/> 必须是公众平台上配置的 43 字符 EncodingAESKey。
@@ -55,9 +52,9 @@ class WXBizMsgCrypt {
                 "EncodingAESKey 解码后不是 32 字节", "");
         }
         this.aesKey = key;
-        string iv = calloc(17, 1);
+        byte[] iv = new byte[17];
         int i = 0;
-        while (i < 16) { iv[i] = key[i] & 255; i = i + 1; }
+        while (i < 16) { iv[i] = key[i]; i = i + 1; }
         this.aesIv = iv;
     }
 
@@ -136,13 +133,12 @@ class WXBizMsgCrypt {
         if (n == 0 || (n % 16) != 0) {
             throw new WechatException("-40007", "AES 密文长度非法", "");
         }
-        string raw = WXBizMsgCrypt.CbcDecryptNoPad(this.aesKey, 32, this.aesIv, cipher, n);
+        byte[] raw = WXBizMsgCrypt.CbcDecryptNoPad(this.aesKey, 32, this.aesIv, cipher, n);
         // 32 字节 PKCS#7 去垫
         int pad = raw[n - 1] & 255;
         if (pad < 1 || pad > 32) { pad = 0; }
         int plen = n - pad;
         if (plen < 20) {
-            free(raw);
             throw new WechatException("-40007", "AES 明文过短", "");
         }
         // 网络序 4 字节长度 @ offset 16
@@ -151,13 +147,11 @@ class WXBizMsgCrypt {
                    | ((raw[18] & 255) << 8)
                    | (raw[19] & 255);
         if (msgLen < 0 || 20 + msgLen > plen) {
-            free(raw);
             throw new WechatException("-40007", "AES 明文长度字段非法", "");
         }
         WXBizPlain result = new WXBizPlain();
         result.Msg = WXBizMsgCrypt.BytesToString(raw, 20, msgLen);
         result.AppId = WXBizMsgCrypt.BytesToString(raw, 20 + msgLen, plen - 20 - msgLen);
-        free(raw);
         return result;
     }
 
@@ -170,91 +164,77 @@ class WXBizMsgCrypt {
         int amount = 32 - (content % 32);
         if (amount == 0) { amount = 32; }
         int total = content + amount;
-        string buf = calloc(total + 1, 1);
+        byte[] buf = new byte[total + 1];
         int i = 0;
-        while (i < 16) { buf[i] = rand[i] & 255; i = i + 1; }
+        while (i < 16) { buf[i] = (byte)(rand[i] & 255); i = i + 1; }
         // 网络序长度
-        buf[16] = (msgLen >> 24) & 255;
-        buf[17] = (msgLen >> 16) & 255;
-        buf[18] = (msgLen >> 8) & 255;
-        buf[19] = msgLen & 255;
+        buf[16] = (byte)((msgLen >> 24) & 255);
+        buf[17] = (byte)((msgLen >> 16) & 255);
+        buf[18] = (byte)((msgLen >> 8) & 255);
+        buf[19] = (byte)(msgLen & 255);
         i = 0;
-        while (i < msgLen) { buf[20 + i] = plain[i] & 255; i = i + 1; }
+        while (i < msgLen) { buf[20 + i] = (byte)(plain[i] & 255); i = i + 1; }
         i = 0;
-        while (i < appLen) { buf[20 + msgLen + i] = this.appId[i] & 255; i = i + 1; }
+        while (i < appLen) { buf[20 + msgLen + i] = (byte)(this.appId[i] & 255); i = i + 1; }
         i = 0;
-        while (i < amount) { buf[content + i] = amount & 255; i = i + 1; }
+        while (i < amount) { buf[content + i] = (byte)(amount & 255); i = i + 1; }
 
-        string cipher = WXBizMsgCrypt.CbcEncryptNoPad(this.aesKey, 32, this.aesIv, buf, total);
-        free(buf);
-        string b64 = Base64.Encode(cipher, total);
-        free(cipher);
-        return b64;
+        byte[] cipher = WXBizMsgCrypt.CbcEncryptNoPad(this.aesKey, 32, this.aesIv, buf, total);
+        return Base64.Encode(cipher, total);
     }
 
     /// <summary>AES-CBC 加密，不做额外填充（调用方保证 len % 16 == 0）。</summary>
-    static string CbcEncryptNoPad(string key, int keyLen, string iv, string data, int len) {
-        string outb = calloc(len + 1, 1);
-        string prev = calloc(17, 1);
+    static byte[] CbcEncryptNoPad(string key, int keyLen, byte[] iv, byte[] data, int len) {
+        byte[] outb = new byte[len + 1];
+        byte[] prev = new byte[17];
         int i = 0;
-        while (i < 16) { prev[i] = iv[i] & 255; i = i + 1; }
+        while (i < 16) { prev[i] = iv[i]; i = i + 1; }
         int off = 0;
         while (off < len) {
-            string block = calloc(17, 1);
+            byte[] block = new byte[17];
             int j = 0;
             while (j < 16) {
-                block[j] = ((data[off + j] & 255) ^ (prev[j] & 255)) & 255;
+                block[j] = (byte)((data[off + j] & 255) ^ (prev[j] & 255));
                 j = j + 1;
             }
             byte[] enc = Aes.EncryptBlockEcb(key, keyLen, block);
-            free(block);
             j = 0;
             while (j < 16) {
-                outb[off + j] = enc[j] & 255;
-                prev[j] = enc[j] & 255;
+                outb[off + j] = enc[j];
+                prev[j] = enc[j];
                 j = j + 1;
             }
             off = off + 16;
         }
-        free(prev);
         return outb;
     }
 
     /// <summary>AES-CBC 解密，不去垫（调用方处理 32 字节 PKCS#7）。</summary>
-    static string CbcDecryptNoPad(string key, int keyLen, string iv, string data, int len) {
-        string outb = calloc(len + 1, 1);
-        string prev = calloc(17, 1);
+    static byte[] CbcDecryptNoPad(string key, int keyLen, byte[] iv, byte[] data, int len) {
+        byte[] outb = new byte[len + 1];
+        byte[] prev = new byte[17];
         int i = 0;
-        while (i < 16) { prev[i] = iv[i] & 255; i = i + 1; }
+        while (i < 16) { prev[i] = iv[i]; i = i + 1; }
         int off = 0;
         while (off < len) {
-            string block = calloc(17, 1);
+            byte[] block = new byte[17];
             int j = 0;
-            while (j < 16) { block[j] = data[off + j] & 255; j = j + 1; }
+            while (j < 16) { block[j] = (byte)(data[off + j] & 255); j = j + 1; }
             byte[] dec = Aes.DecryptBlockEcb(key, keyLen, block);
             j = 0;
             while (j < 16) {
-                outb[off + j] = ((dec[j] & 255) ^ (prev[j] & 255)) & 255;
-                prev[j] = block[j] & 255;
+                outb[off + j] = (byte)((dec[j] & 255) ^ (prev[j] & 255));
+                prev[j] = block[j];
                 j = j + 1;
             }
-            free(block);
             off = off + 16;
         }
-        free(prev);
         return outb;
     }
 
     /// <summary>把 raw 字节缓冲的一段解释为 Latin-1/UTF-8 字节透传字符串（微信 XML 按字节）。</summary>
-    static string BytesToString(string raw, int off, int len) {
-        // Zan 字符串即字节缓冲；用 StringBuilder 按字节 thrash 一份可释放的副本。
-        StringBuilder sb = new StringBuilder();
-        int i = 0;
-        while (i < len) {
-            sb.Append(raw.Substring(off + i, 1));
-            i = i + 1;
-        }
-        return sb.ToString();
+    static string BytesToString(byte[] raw, int off, int len) {
+        return raw.ToStr(off, len);
     }
 
     /// <summary>

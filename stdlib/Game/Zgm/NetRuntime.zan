@@ -85,9 +85,6 @@ class WsUrl {
 // message boundaries over a stream. This is a clean-room framing (u32 payload
 // length + u32 cid + body).
 class ZgmMessage {
-    [DllImport("crt")]
-    static extern string calloc(long count, long size);
-
     int cid;
     string body;
     int bodyLen;
@@ -111,21 +108,21 @@ class ZgmMessage {
     // Total encoded size: 4 (length) + 4 (cid) + body.
     int FrameLength() { return 8 + this.bodyLen; }
 
-    string Encode() {
+    byte[] Encode() {
         int total = 8 + this.bodyLen;
-        string buf = ZgmMessage.calloc(total + 1, 1);
+        byte[] buf = new byte[total + 1];
         int payload = 4 + this.bodyLen;   // bytes following the length field
-        buf[0] = (char)((payload >> 24) & 0xFF);
-        buf[1] = (char)((payload >> 16) & 0xFF);
-        buf[2] = (char)((payload >> 8) & 0xFF);
-        buf[3] = (char)(payload & 0xFF);
-        buf[4] = (char)((this.cid >> 24) & 0xFF);
-        buf[5] = (char)((this.cid >> 16) & 0xFF);
-        buf[6] = (char)((this.cid >> 8) & 0xFF);
-        buf[7] = (char)(this.cid & 0xFF);
+        buf[0] = (byte)((payload >> 24) & 0xFF);
+        buf[1] = (byte)((payload >> 16) & 0xFF);
+        buf[2] = (byte)((payload >> 8) & 0xFF);
+        buf[3] = (byte)(payload & 0xFF);
+        buf[4] = (byte)((this.cid >> 24) & 0xFF);
+        buf[5] = (byte)((this.cid >> 16) & 0xFF);
+        buf[6] = (byte)((this.cid >> 8) & 0xFF);
+        buf[7] = (byte)(this.cid & 0xFF);
         int i = 0;
         while (i < this.bodyLen) {
-            buf[8 + i] = this.body[i];
+            buf[8 + i] = (byte)(this.body[i] & 0xFF);
             i = i + 1;
         }
         return buf;
@@ -142,13 +139,13 @@ class ZgmMessage {
         int cid = ((buf[4] & 0xFF) << 24) | ((buf[5] & 0xFF) << 16) |
                   ((buf[6] & 0xFF) << 8) | (buf[7] & 0xFF);
         int bodyLen = payload - 4;
-        string body = ZgmMessage.calloc(bodyLen + 1, 1);
+        byte[] body = new byte[bodyLen + 1];
         int i = 0;
         while (i < bodyLen) {
-            body[i] = buf[8 + i];
+            body[i] = (byte)(buf[8 + i] & 0xFF);
             i = i + 1;
         }
-        return ZgmMessage.Of(cid, body, bodyLen);
+        return ZgmMessage.Of(cid, body.ToStr(0, bodyLen), bodyLen);
     }
 }
 
@@ -156,15 +153,10 @@ class ZgmMessage {
 // TcpClientConfig to a real reactor-driven socket and exchanges length-framed
 // ZgmMessages.
 class ZgmTcpClientRuntime {
-    [DllImport("crt")]
-    static extern string calloc(long count, long size);
-    [DllImport("crt")]
-    static extern void free(string ptr);
-
     TcpClientConfig config;
     nint sock;
     bool connected;
-    string recvBuf;
+    byte[] recvBuf;
 
     static ZgmTcpClientRuntime FromConfig(TcpClientConfig config) {
         ZgmTcpClientRuntime c = new ZgmTcpClientRuntime();
@@ -203,10 +195,8 @@ class ZgmTcpClientRuntime {
     }
 
     async int SendMessageAsync(ZgmMessage message) {
-        string buf = message.Encode();
-        int n = await AsyncSocket.Send(this.sock, buf, message.FrameLength());
-        free(buf);
-        return n;
+        byte[] buf = message.Encode();
+        return await AsyncSocket.Send(this.sock, buf, message.FrameLength());
     }
 
     // Receives one framed message (assumes a single small message arrives in one
@@ -214,7 +204,7 @@ class ZgmTcpClientRuntime {
     async ZgmMessage ReceiveMessageAsync() {
         int cap = this.config.MessageLength();
         if (this.recvBuf == null) {
-            this.recvBuf = calloc(cap + 1, 1);
+            this.recvBuf = new byte[cap + 1];
         }
         int n = await AsyncSocket.ReceiveInto(this.sock, this.recvBuf, cap);
         if (n <= 0) {
@@ -230,26 +220,18 @@ class ZgmTcpClientRuntime {
             this.connected = false;
             this.sock = -1;
         }
-        if (this.recvBuf != null) {
-            free(this.recvBuf);
-            this.recvBuf = null;
-        }
+        this.recvBuf = null;
     }
 }
 
 // A connected server-side client. It uses the same framed ZgmMessage protocol
 // as ZgmTcpClientRuntime, but takes its message limit from ServerConfig.
 class ZgmServerClient {
-    [DllImport("crt")]
-    static extern string calloc(long count, long size);
-    [DllImport("crt")]
-    static extern void free(string ptr);
-
     ServerConfig config;
     int id;
     nint sock;
     bool connected;
-    string recvBuf;
+    byte[] recvBuf;
     ZgmServerEvents events;
 
     static ZgmServerClient FromSocket(
@@ -273,17 +255,15 @@ class ZgmServerClient {
     bool IsConnected() { return this.connected; }
 
     async int SendMessageAsync(ZgmMessage message) {
-        string buf = message.Encode();
-        int n = await AsyncSocket.Send(
+        byte[] buf = message.Encode();
+        return await AsyncSocket.Send(
             this.sock, buf, message.FrameLength());
-        free(buf);
-        return n;
     }
 
     async ZgmMessage ReceiveMessageAsync() {
         int cap = this.config.MessageLength();
         if (this.recvBuf == null) {
-            this.recvBuf = calloc(cap + 1, 1);
+            this.recvBuf = new byte[cap + 1];
         }
         int n = await AsyncSocket.ReceiveInto(
             this.sock, this.recvBuf, cap);
@@ -310,10 +290,7 @@ class ZgmServerClient {
                 this.events.RaiseClientDisconnected(this);
             }
         }
-        if (this.recvBuf != null) {
-            free(this.recvBuf);
-            this.recvBuf = null;
-        }
+        this.recvBuf = null;
     }
 }
 

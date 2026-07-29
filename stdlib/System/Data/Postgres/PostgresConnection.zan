@@ -82,12 +82,6 @@ class PgConnection : IDbConnection {
 
 
     [DllImport("crt")]
-    static extern string calloc(long num, long size);
-
-    [DllImport("crt")]
-    static extern void free(string ptr);
-
-    [DllImport("crt")]
     static extern nint memcpy(string dest, string src, long n); // returns dest pointer
 
     // ---- Non-blocking (async) libpq entry points ----
@@ -157,41 +151,32 @@ class PgConnection : IDbConnection {
 
     /// <summary>Builds the char** paramValues block for PQexecParams: an array
     /// of pointers to NUL-terminated copies of each value (0 for SQL NULL).
-    /// The value buffers are appended to keepAlive and must be freed with
-    /// FreeParamBlock after the libpq call returns.</summary>
-    static string BuildParamBlock(DbParams prms, List<string> keepAlive) {
+    /// The value buffers are appended to keepAlive, which the caller must keep
+    /// referenced until the libpq call returns.</summary>
+    static byte[] BuildParamBlock(DbParams prms, List<byte[]> keepAlive) {
         int n = prms.Count();
-        string block = calloc(n * 8 + 8, 1);
+        byte[] block = new byte[n * 8 + 8];
         int i = 0;
         while (i < n) {
             nint p = 0;
             if (!prms.IsNull(i)) {
                 string t = prms.AsText(i);
-                string buf = calloc(t.Length + 1, 1);
+                byte[] buf = new byte[t.Length + 1];
                 p = memcpy(buf, t, t.Length);
                 keepAlive.Add(buf);
             }
             int off = i * 8;
-            block[off] = p & 255;
-            block[off + 1] = (p >> 8) & 255;
-            block[off + 2] = (p >> 16) & 255;
-            block[off + 3] = (p >> 24) & 255;
-            block[off + 4] = (p >> 32) & 255;
-            block[off + 5] = (p >> 40) & 255;
-            block[off + 6] = (p >> 48) & 255;
-            block[off + 7] = (p >> 56) & 255;
+            block[off] = (byte)(p & 255);
+            block[off + 1] = (byte)((p >> 8) & 255);
+            block[off + 2] = (byte)((p >> 16) & 255);
+            block[off + 3] = (byte)((p >> 24) & 255);
+            block[off + 4] = (byte)((p >> 32) & 255);
+            block[off + 5] = (byte)((p >> 40) & 255);
+            block[off + 6] = (byte)((p >> 48) & 255);
+            block[off + 7] = (byte)((p >> 56) & 255);
             i = i + 1;
         }
         return block;
-    }
-
-    static void FreeParamBlock(string block, List<string> keepAlive) {
-        int i = 0;
-        while (i < keepAlive.Count) {
-            free(keepAlive[i]);
-            i = i + 1;
-        }
-        free(block);
     }
 
     /// <summary>Copies a TUPLES_OK PGresult into a DbResult (NULL cells become "").</summary>
@@ -318,11 +303,10 @@ class PgConnection : IDbConnection {
     /// values are sent out-of-band, never spliced into the SQL text.</summary>
     int Execute(string sql, DbParams prms) {
         if (!this.connected) { return -1; }
-        List<string> keepAlive = new List<string>();
-        string block = BuildParamBlock(prms, keepAlive);
+        List<byte[]> keepAlive = new List<byte[]>();
+        byte[] block = BuildParamBlock(prms, keepAlive);
         nint res = PQexecParams(this.handle, ToDollarParams(sql), prms.Count(),
             0, block, 0, 0, 0);
-        FreeParamBlock(block, keepAlive);
         if (res == 0) { this.lastError = CopyText(PQerrorMessage(this.handle)); return -1; }
         int st = PQresultStatus(res);
         if (st != 1 && st != 2) {
@@ -338,11 +322,10 @@ class PgConnection : IDbConnection {
     /// <summary>Executes a parameterized query via PQexecParams.</summary>
     DbResult Query(string sql, DbParams prms) {
         if (!this.connected) { return DbResult.Empty(); }
-        List<string> keepAlive = new List<string>();
-        string block = BuildParamBlock(prms, keepAlive);
+        List<byte[]> keepAlive = new List<byte[]>();
+        byte[] block = BuildParamBlock(prms, keepAlive);
         nint res = PQexecParams(this.handle, ToDollarParams(sql), prms.Count(),
             0, block, 0, 0, 0);
-        FreeParamBlock(block, keepAlive);
         if (res == 0) { this.lastError = CopyText(PQerrorMessage(this.handle)); return DbResult.Create(); }
         if (PQresultStatus(res) != 2) {
             this.lastError = CopyText(PQerrorMessage(this.handle));
@@ -530,11 +513,10 @@ class PgConnection : IDbConnection {
             this.fail();
         }
         DbResult result = DbResult.Create();
-        List<string> keepAlive = new List<string>();
-        string block = BuildParamBlock(prms, keepAlive);
+        List<byte[]> keepAlive = new List<byte[]>();
+        byte[] block = BuildParamBlock(prms, keepAlive);
         int ok = PQsendQueryParams(this.handle, ToDollarParams(sql), prms.Count(),
             0, block, 0, 0, 0);
-        FreeParamBlock(block, keepAlive);
         if (ok == 0) {
             this.lastError = CopyText(PQerrorMessage(this.handle));
             this.fail();
@@ -575,11 +557,10 @@ class PgConnection : IDbConnection {
             this.lastError = "not connected";
             this.fail();
         }
-        List<string> keepAlive = new List<string>();
-        string block = BuildParamBlock(prms, keepAlive);
+        List<byte[]> keepAlive = new List<byte[]>();
+        byte[] block = BuildParamBlock(prms, keepAlive);
         int ok = PQsendQueryParams(this.handle, ToDollarParams(sql), prms.Count(),
             0, block, 0, 0, 0);
-        FreeParamBlock(block, keepAlive);
         if (ok == 0) {
             this.lastError = CopyText(PQerrorMessage(this.handle));
             this.fail();

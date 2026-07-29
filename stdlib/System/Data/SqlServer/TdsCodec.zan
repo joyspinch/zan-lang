@@ -12,17 +12,9 @@ namespace System.Data.SqlServer;
 class TdsBuf {
     List<int> b;
 
-    [DllImport("crt")]
-    static extern string calloc(long count, long size);
-
-    [DllImport("crt")]
-    static extern void free(string ptr);
-
-    /// <summary>Byte string of <paramref name="n"/> zero bytes' worth of room,
+    /// <summary>Byte block of <paramref name="n"/> zero bytes' worth of room,
     /// used by decoders that assemble text byte by byte.</summary>
-    static string Alloc(int n) { return TdsBuf.calloc(n + 1, 1); }
-
-    static void Release(string p) { TdsBuf.free(p); }
+    static byte[] Alloc(int n) { return new byte[n + 1]; }
 
     TdsBuf() {
         this.b = new List<int>();
@@ -131,10 +123,10 @@ class TdsBuf {
     /// of zero bytes.</summary>
     TdsBytes ToBytes() {
         int n = this.b.Count;
-        string t = TdsBuf.calloc(n + 1, 1);
+        byte[] t = new byte[n + 1];
         int i = 0;
         while (i < n) {
-            t[i] = this.b[i] & 255;
+            t[i] = (byte)(this.b[i] & 255);
             i = i + 1;
         }
         return TdsBytes.Own(t, n);
@@ -147,49 +139,43 @@ class TdsBuf {
 /// allocation.
 /// </summary>
 class TdsBytes {
-    string data;
+    byte[] data;
     int len;
 
-    [DllImport("crt")]
-    static extern string calloc(long count, long size);
-
-    [DllImport("crt")]
-    static extern void free(string ptr);
-
-    TdsBytes(string data, int len) {
+    TdsBytes(byte[] data, int len) {
         this.data = data;
         this.len = len;
     }
 
-    /// <summary>Takes ownership of an allocated buffer.</summary>
-    static TdsBytes Own(string data, int len) {
+    /// <summary>Wraps an existing buffer together with its length.</summary>
+    static TdsBytes Own(byte[] data, int len) {
         return new TdsBytes(data, len);
     }
 
     /// <summary>Copies a Zan string's bytes into a counted block.</summary>
     static TdsBytes Of(string s) {
         int n = s.Length;
-        string t = TdsBytes.calloc(n + 1, 1);
+        byte[] t = new byte[n + 1];
         int i = 0;
         while (i < n) {
-            t[i] = s[i] & 255;
+            t[i] = (byte)(s[i] & 255);
             i = i + 1;
         }
         return new TdsBytes(t, n);
     }
 
     static TdsBytes Alloc(int n) {
-        return new TdsBytes(TdsBytes.calloc(n + 1, 1), n);
+        return new TdsBytes(new byte[n + 1], n);
     }
 
-    string Data() { return this.data; }
+    byte[] Data() { return this.data; }
     int Len() { return this.len; }
     int At(int i) { return this.data[i] & 255; }
-    void SetAt(int i, int v) { this.data[i] = v & 255; }
+    void SetAt(int i, int v) { this.data[i] = (byte)(v & 255); }
 
-    /// <summary>Releases the buffer. Callers own what they build.</summary>
+    /// <summary>Drops the buffer so it can be collected right away.</summary>
     void Release() {
-        TdsBytes.free(this.data);
+        this.data = null;
         this.len = 0;
     }
 }
@@ -290,16 +276,14 @@ class TdsReader {
     string Narrow(int n) {
         if (n <= 0) { return ""; }
         if (this.pos + n > this.len) { n = this.len - this.pos; }
-        string t = TdsBuf.Alloc(n);
+        byte[] t = TdsBuf.Alloc(n);
         int i = 0;
         while (i < n) {
-            t[i] = this.buf[this.pos + i] & 255;
+            t[i] = (byte)(this.buf[this.pos + i] & 255);
             i = i + 1;
         }
-        string s = t.Substring(0, n);
-        TdsBuf.Release(t);
         this.pos = this.pos + n;
-        return s;
+        return t.ToStr(0, n);
     }
 
     /// <summary>Copies <paramref name="n"/> raw bytes out as a counted block.</summary>
@@ -321,7 +305,7 @@ class TdsReader {
     /// pulling in a full transcoder; everything else keeps its byte value.</summary>
     string Ucs2(int chars) {
         if (chars <= 0) { return ""; }
-        string t = TdsBuf.calloc(chars + 1, 1);
+        byte[] t = new byte[chars + 1];
         int i = 0;
         while (i < chars) {
             int lo = U8();
@@ -329,13 +313,11 @@ class TdsReader {
             if (hi != 0) {
                 t[i] = 63;      // '?'
             } else {
-                t[i] = lo;
+                t[i] = (byte)lo;
             }
             i = i + 1;
         }
-        string s = t.Substring(0, chars);
-        TdsBuf.free(t);
-        return s;
+        return t.ToStr(0, chars);
     }
 
     /// <summary>B_VARCHAR: one length byte, then that many UCS-2 units.</summary>

@@ -55,12 +55,6 @@ class MySqlConnection {
     bool hadError;      // whether the last statement returned an ERR packet
     List<PreparedStmt> stmtCache;  // prepared-statement cache (SQL -> server id)
 
-    [DllImport("crt")]
-    static extern string calloc(long count, long size);
-
-    [DllImport("crt")]
-    static extern void free(string ptr);
-
 
     MySqlConnection() {
         this.sock = -1;
@@ -81,35 +75,33 @@ class MySqlConnection {
     /// <paramref name="dst"/> at <paramref name="off"/>, suspending on the IO
     /// reactor between partial reads. Returns bytes actually read (&lt; need on
     /// peer close).</summary>
-    async int recvExact(string dst, int off, int need) {
+    async int recvExact(byte[] dst, int off, int need) {
         int got = 0;
-        string tmp = calloc(need + 1, 1);
+        byte[] tmp = new byte[need + 1];
         while (got < need) {
             int n = await Socket.RecvOv(this.sock, tmp, need - got);
-            if (n <= 0) { free(tmp); return got; }
+            if (n <= 0) { return got; }
             int j = 0;
-            while (j < n) { dst[off + got + j] = tmp[j] & 255; j = j + 1; }
+            while (j < n) { dst[off + got + j] = tmp[j]; j = j + 1; }
             got = got + n;
         }
-        free(tmp);
         return got;
     }
 
-    /// <summary>Reads one protocol packet, returning its payload as a freshly
-    /// allocated buffer (NUL-terminated at the payload length). Sets
-    /// <c>lastLen</c> / <c>lastSeq</c>. Returns null on connection close.</summary>
-    async string readPacket() {
-        string hdr = calloc(5, 1);
+    /// <summary>Reads one protocol packet, returning its payload with the
+    /// length in <c>lastLen</c> (the payload is binary, so it is never read as
+    /// a NUL-terminated string). Sets <c>lastSeq</c> too. Null on close.</summary>
+    async byte[] readPacket() {
+        byte[] hdr = new byte[5];
         int got = await this.recvExact(hdr, 0, 4);
-        if (got < 4) { this.lastLen = -1; free(hdr); return null; }
+        if (got < 4) { this.lastLen = -1; return null; }
         int len = (hdr[0]&255) | ((hdr[1]&255)<<8) | ((hdr[2]&255)<<16);
         this.lastSeq = hdr[3] & 255;
-        free(hdr);
         this.lastLen = len;
-        string pay = calloc(len + 1, 1);
+        byte[] pay = new byte[len + 1];
         if (len > 0) {
             int g2 = await this.recvExact(pay, 0, len);
-            if (g2 < len) { this.lastLen = -1; free(pay); return null; }
+            if (g2 < len) { this.lastLen = -1; return null; }
         }
         return pay;
     }
@@ -117,12 +109,11 @@ class MySqlConnection {
     /// <summary>Writes one protocol packet (4-byte header + payload) with the
     /// given sequence id. Binary-safe (length-carried send).</summary>
     async int writePacket(string payload, int len, int seq) {
-        string buf = calloc(len + 5, 1);
-        buf[0]=len&255; buf[1]=(len>>8)&255; buf[2]=(len>>16)&255; buf[3]=seq&255;
+        byte[] buf = new byte[len + 5];
+        buf[0]=(byte)(len&255); buf[1]=(byte)((len>>8)&255); buf[2]=(byte)((len>>16)&255); buf[3]=(byte)(seq&255);
         int i = 0;
-        while (i < len) { buf[i+4] = payload[i] & 255; i = i + 1; }
+        while (i < len) { buf[i+4] = (byte)(payload[i] & 255); i = i + 1; }
         int r = await Socket.SendAsync(this.sock, buf, len + 4);
-        free(buf);
         return r;
     }
 
@@ -130,12 +121,10 @@ class MySqlConnection {
     /// Zan string.</summary>
     static string bytesToStr(string buf, int off, int len) {
         if (len <= 0) { return ""; }
-        string t = calloc(len + 1, 1);
+        byte[] t = new byte[len + 1];
         int i = 0;
-        while (i < len) { t[i] = buf[off+i] & 255; i = i + 1; }
-        string s = t.Substring(0, len);
-        free(t);
-        return s;
+        while (i < len) { t[i] = (byte)(buf[off+i] & 255); i = i + 1; }
+        return t.ToStr(0, len);
     }
 
     /// <summary>Decodes a length-encoded integer at cursor <c>cur[0]</c>,
@@ -166,7 +155,7 @@ class MySqlConnection {
         return bytesToStr(buf, p, len);
     }
 
-    bool isEof(string pkt) {
+    bool isEof(byte[] pkt) {
         return (pkt[0] & 255) == 254 && this.lastLen < 9;
     }
 
@@ -176,46 +165,44 @@ class MySqlConnection {
 
     /// <summary>caching_sha2_password fast-auth scramble:
     /// SHA256(pw) XOR SHA256( SHA256(SHA256(pw)) . nonce ). Returns a 32-byte
-    /// buffer (caller frees).</summary>
-    static string scramble41(string pw, string nonce20) {
+    /// buffer.</summary>
+    static byte[] scramble41(string pw, string nonce20) {
         byte[] a = Sha256.Hash(pw, pw.Length);
         byte[] b = Sha256.Hash(a, 32);
-        string cat = calloc(53, 1);
+        byte[] cat = new byte[53];
         int i = 0;
-        while (i < 32) { cat[i] = b[i] & 255; i = i + 1; }
+        while (i < 32) { cat[i] = b[i]; i = i + 1; }
         i = 0;
-        while (i < 20) { cat[32 + i] = nonce20[i] & 255; i = i + 1; }
+        while (i < 20) { cat[32 + i] = (byte)(nonce20[i] & 255); i = i + 1; }
         byte[] c = Sha256.Hash(cat, 52);
-        free(cat);
-        string tok = calloc(33, 1);
+        byte[] tok = new byte[33];
         i = 0;
-        while (i < 32) { tok[i] = (a[i] ^ c[i]) & 255; i = i + 1; }
+        while (i < 32) { tok[i] = (byte)((a[i] ^ c[i]) & 255); i = i + 1; }
         return tok;
     }
 
     /// <summary>mysql_native_password scramble:
     /// SHA1(pw) XOR SHA1( nonce . SHA1(SHA1(pw)) ). Returns a 20-byte
-    /// buffer (caller frees).</summary>
-    static string scrambleNative(string pw, string nonce20) {
+    /// buffer.</summary>
+    static byte[] scrambleNative(string pw, string nonce20) {
         byte[] a = Sha1.Hash(pw, pw.Length);
         byte[] b = Sha1.Hash(a, 20);
-        string cat = calloc(41, 1);
+        byte[] cat = new byte[41];
         int i = 0;
-        while (i < 20) { cat[i] = nonce20[i] & 255; i = i + 1; }
+        while (i < 20) { cat[i] = (byte)(nonce20[i] & 255); i = i + 1; }
         i = 0;
-        while (i < 20) { cat[20 + i] = b[i] & 255; i = i + 1; }
+        while (i < 20) { cat[20 + i] = b[i]; i = i + 1; }
         byte[] c = Sha1.Hash(cat, 40);
-        free(cat);
-        string tok = calloc(21, 1);
+        byte[] tok = new byte[21];
         i = 0;
-        while (i < 20) { tok[i] = (a[i] ^ c[i]) & 255; i = i + 1; }
+        while (i < 20) { tok[i] = (byte)((a[i] ^ c[i]) & 255); i = i + 1; }
         return tok;
     }
 
-    static string authToken(string plugin, string pw, string nonce20, List<int> outLen) {
+    static byte[] authToken(string plugin, string pw, string nonce20, List<int> outLen) {
         if (pw.Length == 0) {
             outLen[0] = 0;
-            return calloc(1, 1);
+            return new byte[1];
         }
         if (plugin == "caching_sha2_password") {
             outLen[0] = 32;
@@ -262,11 +249,10 @@ class MySqlConnection {
         int end = findSub(pem, pemLen, "-----END", 8, hb);
         if (end < 0) { end = pemLen; }
         int blen = end - hb;
-        string b64 = calloc(blen + 1, 1);
-        int i = 0; while (i < blen) { b64[i] = pem[hb + i] & 255; i = i + 1; }
+        byte[] b64 = new byte[blen + 1];
+        int i = 0; while (i < blen) { b64[i] = (byte)(pem[hb + i] & 255); i = i + 1; }
         List<int> dl = new List<int>(); dl.Add(0);
-        byte[] der = Base64.Decode(b64, dl);
-        free(b64);
+        byte[] der = Base64.Decode(b64.ToStr(0, blen), dl);
         outLen[0] = dl[0];
         return der;
     }
@@ -298,12 +284,11 @@ class MySqlConnection {
         c[0] = origStart + origLen;
         c[0] = c[0] + 1; int eLen = readDerLen(der, c);            // INTEGER exponent
         int eStart = c[0];
-        string nBuf = calloc(useLen + 1, 1);
-        int i = 0; while (i < useLen) { nBuf[i] = der[nStart + i] & 255; i = i + 1; }
-        string eBuf = calloc(eLen + 1, 1);
-        i = 0; while (i < eLen) { eBuf[i] = der[eStart + i] & 255; i = i + 1; }
+        byte[] nBuf = new byte[useLen + 1];
+        int i = 0; while (i < useLen) { nBuf[i] = (byte)(der[nStart + i] & 255); i = i + 1; }
+        byte[] eBuf = new byte[eLen + 1];
+        i = 0; while (i < eLen) { eBuf[i] = (byte)(der[eStart + i] & 255); i = i + 1; }
         byte[] cph = Rsa.EncryptOaep(obf, obfLen, nBuf, useLen, eBuf, eLen, 1, seed);
-        free(nBuf); free(eBuf);
         kOut[0] = useLen;
         return cph;
     }
@@ -330,22 +315,22 @@ class MySqlConnection {
         await Socket.ConnectAsync(this.sock, host, port);
 
         // --- read + parse handshake (packet seq 0) ---
-        string hs = await this.readPacket();
+        byte[] hs = await this.readPacket();
         if (hs == null) { this.lastError = "no handshake from server"; return false; }
         int proto = hs[0] & 255;
         if (proto == 255) {
             int code = (hs[1]&255)|((hs[2]&255)<<8);
             this.lastError = "handshake err " + Convert.ToString(code) + ": "
                 + bytesToStr(hs, 3, this.lastLen - 3);
-            free(hs); return false;
+            return false;
         }
         int p = 1;
         while ((hs[p] & 255) != 0) { p = p + 1; }   // server version (NUL-terminated)
         p = p + 1;
         p = p + 4;                                    // thread id
-        string nonce = calloc(21, 1);
+        byte[] nonce = new byte[21];
         int i = 0;
-        while (i < 8) { nonce[i] = hs[p+i] & 255; i = i + 1; }
+        while (i < 8) { nonce[i] = (byte)(hs[p+i] & 255); i = i + 1; }
         p = p + 8;
         p = p + 1;                                    // filler
         int capLow = (hs[p]&255)|((hs[p+1]&255)<<8);
@@ -362,7 +347,7 @@ class MySqlConnection {
         int copy2 = part2;
         if (copy2 > 12) { copy2 = 12; }
         i = 0;
-        while (i < copy2) { nonce[8+i] = hs[p+i] & 255; i = i + 1; }
+        while (i < copy2) { nonce[8+i] = (byte)(hs[p+i] & 255); i = i + 1; }
         p = p + part2;
         string plugin = "mysql_native_password";
         if ((serverCaps & 524288) != 0 && p < this.lastLen) {
@@ -372,8 +357,6 @@ class MySqlConnection {
             }
             if (pluginEnd > p) { plugin = bytesToStr(hs, p, pluginEnd - p); }
         }
-        free(hs);
-
         // --- build + send handshake response (seq 1) ---
         // Capabilities: LONG_PASSWORD | LONG_FLAG | PROTOCOL_41 | TRANSACTIONS
         //             | SECURE_CONNECTION | PLUGIN_AUTH
@@ -381,86 +364,77 @@ class MySqlConnection {
         bool hasDb = db.Length > 0;
         if (hasDb) { caps = caps | 8; }              // CLIENT_CONNECT_WITH_DB
         List<int> tokenLenOut = new List<int>(); tokenLenOut.Add(0);
-        string token = authToken(plugin, pw, nonce, tokenLenOut);
+        byte[] token = authToken(plugin, pw, nonce, tokenLenOut);
         int tokenLen = tokenLenOut[0];
         if (token == null || tokenLen < 0) {
             this.lastError = "unsupported auth plugin: " + plugin;
-            free(nonce);
             return false;
         }
         int userLen = user.Length;
         int respLen = 4 + 4 + 1 + 23 + userLen + 1 + 1 + tokenLen;
         if (hasDb) { respLen = respLen + db.Length + 1; }
         respLen = respLen + plugin.Length + 1;
-        string resp = calloc(respLen + 1, 1);
+        byte[] resp = new byte[respLen + 1];
         int q = 0;
-        resp[q]=caps&255; resp[q+1]=(caps>>8)&255; resp[q+2]=(caps>>16)&255; resp[q+3]=(caps>>24)&255; q=q+4;
-        resp[q]=0; resp[q+1]=0; resp[q+2]=0; resp[q+3]=1; q=q+4;   // max packet 16M
-        resp[q]=45; q=q+1;                                          // charset utf8mb4_general_ci
+        resp[q] = (byte)(caps&255); resp[q+1] = (byte)((caps>>8)&255); resp[q+2] = (byte)((caps>>16)&255); resp[q+3] = (byte)((caps>>24)&255); q=q+4;
+        resp[q] = (byte)(0); resp[q+1] = (byte)(0); resp[q+2] = (byte)(0); resp[q+3] = (byte)(1); q=q+4;   // max packet 16M
+        resp[q] = (byte)(45); q=q+1;                                          // charset utf8mb4_general_ci
         q = q + 23;                                                 // 23-byte filler (zeros)
-        i = 0; while (i < userLen) { resp[q+i] = user[i] & 255; i = i + 1; } q = q + userLen;
-        resp[q]=0; q=q+1;
-        resp[q]=tokenLen; q=q+1;                                    // auth response length
-        i = 0; while (i < tokenLen) { resp[q+i] = token[i] & 255; i = i + 1; } q = q + tokenLen;
-        free(token);
+        i = 0; while (i < userLen) { resp[q+i] = (byte)(user[i] & 255); i = i + 1; } q = q + userLen;
+        resp[q] = (byte)(0); q=q+1;
+        resp[q] = (byte)(tokenLen); q=q+1;                                    // auth response length
+        i = 0; while (i < tokenLen) { resp[q+i] = (byte)(token[i] & 255); i = i + 1; } q = q + tokenLen;
         if (hasDb) {
-            i = 0; while (i < db.Length) { resp[q+i] = db[i] & 255; i = i + 1; } q = q + db.Length;
-            resp[q]=0; q=q+1;
+            i = 0; while (i < db.Length) { resp[q+i] = (byte)(db[i] & 255); i = i + 1; } q = q + db.Length;
+            resp[q] = (byte)(0); q=q+1;
         }
-        i = 0; while (i < plugin.Length) { resp[q+i] = plugin[i] & 255; i = i + 1; } q = q + plugin.Length;
-        resp[q]=0; q=q+1;
+        i = 0; while (i < plugin.Length) { resp[q+i] = (byte)(plugin[i] & 255); i = i + 1; } q = q + plugin.Length;
+        resp[q] = (byte)(0); q=q+1;
         await this.writePacket(resp, respLen, 1);
-        free(resp);
-
         // --- auth result ---
         while (true) {
-            string r = await this.readPacket();
-            if (r == null) { this.lastError = "connection closed during auth"; free(nonce); return false; }
+            byte[] r = await this.readPacket();
+            if (r == null) { this.lastError = "connection closed during auth"; return false; }
             int b0 = r[0] & 255;
-            if (b0 == 0) { free(r); free(nonce); return true; }         // OK -> authenticated
+            if (b0 == 0) { return true; }         // OK -> authenticated
             if (b0 == 255) {
                 int code = (r[1]&255)|((r[2]&255)<<8);
                 this.lastError = "auth err " + Convert.ToString(code) + ": "
                     + bytesToStr(r, 9, this.lastLen - 9);
-                free(r); free(nonce); return false;
+                return false;
             }
             if (b0 == 1) {
                 int more = r[1] & 255;
-                free(r);
                 if (more == 3) { continue; }                             // fast_auth_success -> OK follows
                 if (more == 4) {
                     // perform_full_authentication: request the server's RSA public
                     // key, then send (password XOR nonce) encrypted with OAEP-SHA1.
-                    string req = calloc(2, 1); req[0] = 2;               // request_public_key
+                    byte[] req = new byte[2]; req[0] = 2;               // request_public_key
                     await this.writePacket(req, 1, this.lastSeq + 1);
-                    free(req);
-                    string pk = await this.readPacket();
-                    if (pk == null) { this.lastError = "no RSA public key from server"; free(nonce); return false; }
+                    byte[] pk = await this.readPacket();
+                    if (pk == null) { this.lastError = "no RSA public key from server"; return false; }
                     int pemLen = this.lastLen - 1;                        // skip leading 0x01
-                    string pem = calloc(pemLen + 1, 1);
-                    i = 0; while (i < pemLen) { pem[i] = pk[1 + i] & 255; i = i + 1; }
-                    free(pk);
+                    byte[] pem = new byte[pemLen + 1];
+                    i = 0; while (i < pemLen) { pem[i] = (byte)(pk[1 + i] & 255); i = i + 1; }
                     List<int> derLen = new List<int>(); derLen.Add(0);
                     byte[] der = pemToDer(pem, pemLen, derLen);
-                    if (der == null) { this.lastError = "bad RSA public key PEM"; free(pem); free(nonce); return false; }
-                    free(pem);
+                    if (der == null) { this.lastError = "bad RSA public key PEM"; return false; }
                     int pwLen = pw.Length;
                     int obfLen = pwLen + 1;                               // include trailing NUL
-                    string obf = calloc(obfLen + 1, 1);
-                    i = 0; while (i < obfLen) { obf[i] = (pw[i] & 255) ^ (nonce[i % 20] & 255); i = i + 1; }
+                    byte[] obf = new byte[obfLen + 1];
+                    i = 0; while (i < obfLen) { obf[i] = (byte)((pw[i] & 255) ^ (nonce[i % 20] & 255)); i = i + 1; }
                     byte[] seed = genSeed(20);
                     if (seed == null) {
                         this.lastError = "secure RNG unavailable for full-auth";
-                        free(obf); free(nonce); return false;
+                        return false;
                     }
                     List<int> kOut = new List<int>(); kOut.Add(0);
                     byte[] cipher = fullAuthCipher(der, derLen[0], obf, obfLen, seed, kOut);
-                    free(obf);
                     await this.writePacket(cipher, kOut[0], this.lastSeq + 1);
                     continue;                                            // OK / ERR follows
                 }
                 this.lastError = "unexpected auth-more-data " + Convert.ToString(more);
-                free(nonce); return false;
+                return false;
             }
             if (b0 == 254) {
                 int pluginEnd = 1;
@@ -471,31 +445,25 @@ class MySqlConnection {
                 int nonceStart = pluginEnd + 1;
                 int switchNonceLen = this.lastLen - nonceStart;
                 if (switchNonceLen > 20) { switchNonceLen = 20; }
-                string switchNonce = calloc(21, 1);
+                byte[] switchNonce = new byte[21];
                 i = 0;
                 while (i < switchNonceLen) {
-                    switchNonce[i] = r[nonceStart + i] & 255;
+                    switchNonce[i] = (byte)(r[nonceStart + i] & 255);
                     i = i + 1;
                 }
-                free(r);
                 List<int> switchLenOut = new List<int>(); switchLenOut.Add(0);
-                string switchToken = authToken(switchPlugin, pw, switchNonce, switchLenOut);
+                byte[] switchToken = authToken(switchPlugin, pw, switchNonce, switchLenOut);
                 int switchLen = switchLenOut[0];
                 if (switchToken == null || switchLen < 0) {
                     this.lastError = "unsupported auth-switch plugin: " + switchPlugin;
-                    free(switchNonce);
-                    free(nonce);
                     return false;
                 }
-                free(nonce);
                 nonce = switchNonce;
                 await this.writePacket(switchToken, switchLen, this.lastSeq + 1);
-                free(switchToken);
                 continue;
             }
-            free(r);
             this.lastError = "unexpected auth packet " + Convert.ToString(b0);
-            free(nonce); return false;
+            return false;
         }
         return false;
     }
@@ -506,12 +474,11 @@ class MySqlConnection {
 
     async int comQuery(string sql) {
         int len = sql.Length + 1;
-        string pay = calloc(len + 1, 1);
-        pay[0] = 3;    // COM_QUERY
+        byte[] pay = new byte[len + 1];
+        pay[0] = (byte)(3);    // COM_QUERY
         int i = 0;
-        while (i < sql.Length) { pay[i+1] = sql[i] & 255; i = i + 1; }
+        while (i < sql.Length) { pay[i+1] = (byte)(sql[i] & 255); i = i + 1; }
         int r = await this.writePacket(pay, len, 0);
-        free(pay);
         return r;
     }
 
@@ -531,7 +498,7 @@ class MySqlConnection {
             this.fail();
         }
         await this.comQuery(sql);
-        string first = await this.readPacket();
+        byte[] first = await this.readPacket();
         if (first == null) {
             this.hadError = true;
             this.lastError = "connection closed";
@@ -545,40 +512,35 @@ class MySqlConnection {
                 + bytesToStr(first, 9, this.lastLen - 9);
             this.hadError = true;
             this.lastNumber = code;
-            free(first);
             this.fail();
         }
         if (b0 == 0 || b0 == 254) {
             // OK packet (no result set): affected rows is a lenenc int at offset 1.
             List<int> cur = new List<int>(); cur.Add(1);
             this.lastAffected = (int)readLenenc(first, cur);
-            free(first);
             return result;
         }
         // Result set: first packet is the column count (lenenc).
         List<int> cc = new List<int>(); cc.Add(0);
         int ncols = (int)readLenenc(first, cc);
-        free(first);
         result.SetColumnCount(ncols);
         int c = 0;
         while (c < ncols) {
-            string cd = await this.readPacket();
+            byte[] cd = await this.readPacket();
             List<int> cur = new List<int>(); cur.Add(0);
             readLenencStr(cd, cur);   // catalog
             readLenencStr(cd, cur);   // schema
             readLenencStr(cd, cur);   // table
             readLenencStr(cd, cur);   // org_table
             result.AddColumnName(readLenencStr(cd, cur));  // name
-            free(cd);
             c = c + 1;
         }
-        string colEof = await this.readPacket();   // EOF terminating column defs
-        if (colEof != null) { free(colEof); }
+        byte[] colEof = await this.readPacket();   // EOF terminating column defs
         int rowCount = 0;
         while (true) {
-            string row = await this.readPacket();
+            byte[] row = await this.readPacket();
             if (row == null) { break; }
-            if (this.isEof(row)) { free(row); break; }
+            if (this.isEof(row)) { break; }
             List<int> cur = new List<int>(); cur.Add(0);
             List<string> outRow = new List<string>();
             List<bool> nullFlags = new List<bool>();
@@ -595,7 +557,6 @@ class MySqlConnection {
                 c = c + 1;
             }
             result.AddRowNulls(outRow, nullFlags);
-            free(row);
             rowCount = rowCount + 1;
         }
         this.lastAffected = rowCount;
@@ -764,35 +725,31 @@ class MySqlConnection {
     /// packets of the prepare response.</summary>
     async bool stmtPrepare(string sql, List<int> outIds) {
         int len = sql.Length + 1;
-        string pay = calloc(len + 1, 1);
-        pay[0] = 22;   // COM_STMT_PREPARE
+        byte[] pay = new byte[len + 1];
+        pay[0] = (byte)(22);   // COM_STMT_PREPARE
         int i = 0;
-        while (i < sql.Length) { pay[i+1] = sql[i] & 255; i = i + 1; }
+        while (i < sql.Length) { pay[i+1] = (byte)(sql[i] & 255); i = i + 1; }
         await this.writePacket(pay, len, 0);
-        free(pay);
-        string r = await this.readPacket();
+        byte[] r = await this.readPacket();
         if (r == null) { this.lastError = "connection closed"; this.connected = false; return false; }
         int b0 = r[0] & 255;
         if (b0 == 255) {
             int code = (r[1]&255)|((r[2]&255)<<8);
             this.lastError = "prepare err " + Convert.ToString(code) + ": "
                 + bytesToStr(r, 9, this.lastLen - 9);
-            free(r);
             return false;
         }
         int stmtId = (r[1]&255) | ((r[2]&255)<<8) | ((r[3]&255)<<16) | ((r[4]&255)<<24);
         int numCols = (r[5]&255) | ((r[6]&255)<<8);
         int numParams = (r[7]&255) | ((r[8]&255)<<8);
-        free(r);
         outIds.Add(stmtId); outIds.Add(numCols); outIds.Add(numParams);
         int skip = 0;
         if (numParams > 0) { skip = numParams + 1; }   // param defs + EOF
         if (numCols > 0) { skip = skip + numCols + 1; } // column defs + EOF
         int k = 0;
         while (k < skip) {
-            string d = await this.readPacket();
+            byte[] d = await this.readPacket();
             if (d == null) { this.connected = false; return false; }
-            free(d);
             k = k + 1;
         }
         return true;
@@ -814,29 +771,29 @@ class MySqlConnection {
                 i = i + 1;
             }
         }
-        string pay = calloc(total + 1, 1);
-        pay[0] = 23;   // COM_STMT_EXECUTE
-        pay[1]=stmtId&255; pay[2]=(stmtId>>8)&255; pay[3]=(stmtId>>16)&255; pay[4]=(stmtId>>24)&255;
-        pay[5] = 0;    // CURSOR_TYPE_NO_CURSOR
-        pay[6] = 1; pay[7] = 0; pay[8] = 0; pay[9] = 0;   // iteration count = 1
+        byte[] pay = new byte[total + 1];
+        pay[0] = (byte)(23);   // COM_STMT_EXECUTE
+        pay[1] = (byte)(stmtId&255); pay[2] = (byte)((stmtId>>8)&255); pay[3] = (byte)((stmtId>>16)&255); pay[4] = (byte)((stmtId>>24)&255);
+        pay[5] = (byte)(0);    // CURSOR_TYPE_NO_CURSOR
+        pay[6] = (byte)(1); pay[7] = (byte)(0); pay[8] = (byte)(0); pay[9] = (byte)(0);   // iteration count = 1
         int q = 10;
         if (n > 0) {
             int i = 0;
             while (i < n) {
                 if (prms.IsNull(i)) {
                     int off = q + i / 8;
-                    pay[off] = (pay[off] & 255) | (1 << (i % 8));
+                    pay[off] = (byte)((pay[off] & 255) | (1 << (i % 8)));
                 }
                 i = i + 1;
             }
             q = q + bitmapLen;
-            pay[q] = 1; q = q + 1;   // new-params-bound flag
+            pay[q] = (byte)(1); q = q + 1;   // new-params-bound flag
             i = 0;
             while (i < n) {
-                if (prms.IsNull(i)) { pay[q] = 6; }                        // MYSQL_TYPE_NULL
-                else if (prms.KindAt(i) == DbParams.KindInt) { pay[q] = 8; } // MYSQL_TYPE_LONGLONG
-                else { pay[q] = 253; }                                      // MYSQL_TYPE_VAR_STRING
-                pay[q+1] = 0;
+                if (prms.IsNull(i)) { pay[q] = (byte)(6); }                        // MYSQL_TYPE_NULL
+                else if (prms.KindAt(i) == DbParams.KindInt) { pay[q] = (byte)(8); } // MYSQL_TYPE_LONGLONG
+                else { pay[q] = (byte)(253); }                                      // MYSQL_TYPE_VAR_STRING
+                pay[q+1] = (byte)(0);
                 q = q + 2;
                 i = i + 1;
             }
@@ -847,7 +804,7 @@ class MySqlConnection {
                     int v = prms.IntAt(i);
                     int j = 0;
                     while (j < 8) {
-                        pay[q+j] = (v >> (j * 8)) & 255;
+                        pay[q+j] = (byte)((v >> (j * 8)) & 255);
                         j = j + 1;
                     }
                     q = q + 8;
@@ -855,24 +812,22 @@ class MySqlConnection {
                     string t = prms.AsText(i);
                     q = writeLenenc(pay, q, t.Length);
                     int j = 0;
-                    while (j < t.Length) { pay[q+j] = t[j] & 255; j = j + 1; }
+                    while (j < t.Length) { pay[q+j] = (byte)(t[j] & 255); j = j + 1; }
                     q = q + t.Length;
                 }
                 i = i + 1;
             }
         }
         int rc = await this.writePacket(pay, q, 0);
-        free(pay);
         return rc;
     }
 
     /// <summary>Closes a server-side prepared statement (fire-and-forget).</summary>
     async int stmtClose(int stmtId) {
-        string pay = calloc(6, 1);
-        pay[0] = 25;   // COM_STMT_CLOSE
-        pay[1]=stmtId&255; pay[2]=(stmtId>>8)&255; pay[3]=(stmtId>>16)&255; pay[4]=(stmtId>>24)&255;
+        byte[] pay = new byte[6];
+        pay[0] = (byte)(25);   // COM_STMT_CLOSE
+        pay[1] = (byte)(stmtId&255); pay[2] = (byte)((stmtId>>8)&255); pay[3] = (byte)((stmtId>>16)&255); pay[4] = (byte)((stmtId>>24)&255);
         int rc = await this.writePacket(pay, 5, 0);
-        free(pay);
         return rc;
     }
 
@@ -935,7 +890,7 @@ class MySqlConnection {
             await this.stmtCacheAdd(sql, stmtId);
         }
         await this.stmtExecute(stmtId, prms);
-        string first = await this.readPacket();
+        byte[] first = await this.readPacket();
         if (first == null) {
             this.hadError = true;
             this.lastError = "connection closed";
@@ -948,7 +903,6 @@ class MySqlConnection {
             this.lastError = "err " + Convert.ToString(code) + ": "
                 + bytesToStr(first, 9, this.lastLen - 9);
             this.hadError = true;
-            free(first);
             this.stmtCacheRemove(stmtId);
             await this.stmtClose(stmtId);
             return result;
@@ -956,18 +910,16 @@ class MySqlConnection {
         if (b0 == 0 || b0 == 254) {
             List<int> cur = new List<int>(); cur.Add(1);
             this.lastAffected = (int)readLenenc(first, cur);
-            free(first);
             return result;
         }
         List<int> cc = new List<int>(); cc.Add(0);
         int ncols = (int)readLenenc(first, cc);
-        free(first);
         result.SetColumnCount(ncols);
         List<int> colTypes = new List<int>();
         List<int> colFlags = new List<int>();
         int c = 0;
         while (c < ncols) {
-            string cd = await this.readPacket();
+            byte[] cd = await this.readPacket();
             List<int> cur = new List<int>(); cur.Add(0);
             readLenencStr(cd, cur);   // catalog
             readLenencStr(cd, cur);   // schema
@@ -981,16 +933,14 @@ class MySqlConnection {
             int cflags = (cd[p+7]&255) | ((cd[p+8]&255) << 8);
             colTypes.Add(ctype);
             colFlags.Add(cflags);
-            free(cd);
             c = c + 1;
         }
-        string colEof = await this.readPacket();
-        if (colEof != null) { free(colEof); }
+        byte[] colEof = await this.readPacket();
         int rowCount = 0;
         while (true) {
-            string row = await this.readPacket();
+            byte[] row = await this.readPacket();
             if (row == null) { break; }
-            if (this.isEof(row)) { free(row); break; }
+            if (this.isEof(row)) { break; }
             // Binary row: 0x00 header, then a null bitmap with a 2-bit offset.
             int bmLen = (ncols + 9) / 8;
             List<int> cur = new List<int>(); cur.Add(1 + bmLen);
@@ -1010,7 +960,6 @@ class MySqlConnection {
                 c = c + 1;
             }
             result.AddRowNulls(outRow, nullFlags);
-            free(row);
             rowCount = rowCount + 1;
         }
         this.lastAffected = rowCount;
