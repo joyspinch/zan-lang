@@ -2,7 +2,7 @@
 
 ## 1. Overview
 
-The Zan compiler (`zanc`) is a single-pass, ahead-of-time compiler written in C11. It transforms `.zan` source files into native executables via LLVM.
+The Zan compiler (`zanc`) is a multi-pass, ahead-of-time compiler written in C11 (the lexer is single-pass/streaming; the binder runs three passes — see §4). It transforms `.zan` source files into native executables via LLVM.
 
 ```
  .zan source files

@@ -9,6 +9,10 @@
 > - 调试是 gdb 驱动的真调试（含随包 gdb）；
 > - LSP 已有 references / signatureHelp / codeAction；DAP 已有 evaluate / 异常断点 / logpoints / setVariable；
 > - IDE 已有 Git 面板和中英双语（`ZanIDE.T`）。
+>
+> **路线文档关系**：本文件是 `docs/EXECUTION_PLAN.md`（顶层索引）Workstream A 的详情来源
+> （ZanIDE 生产可用逐项）；工具链部分见 `docs/SELF_CONTAINED_TOOLCHAIN.md`。
+> 历史里程碑 `ROADMAP.md` 已归档到 `docs/archive/`。
 
 ---
 

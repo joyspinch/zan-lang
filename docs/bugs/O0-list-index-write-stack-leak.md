@@ -1,5 +1,7 @@
 # -O0 codegen: index-writing a `List<T>` at a varying index inside a loop leaks stack
 
+**Status:** Fixed (2026-07) — see Resolution below.
+
 ## Summary
 
 At the default optimization level (`-O0`), an indexed **write** to a `List<T>`

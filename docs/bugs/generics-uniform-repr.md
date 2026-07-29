@@ -1,12 +1,14 @@
 # Generic instantiation bugs (uniform-representation lowering)
 
-Status: FIXED — found 2026-07-23 while extending System.Linq; fixed via
+**Status:** Fixed (2026-07-23) — found while extending System.Linq; fixed via
 method-level monomorphization (static/extension generic methods are now
 specialized per concrete type-argument binding, so string/double comparisons,
 string equality, delegate-return overload ranking, Dictionary generic values
 and generic-accumulator ARC all lower with concrete types). Regression
 coverage: `tests/conformance/generics_uniform_repr.zan` plus the same-name
 C#-style overloads in `tests/conformance/linq_csharp_overloads.zan`.
+
+Follow-up (2026-07-27): the related codegen crash “calling a constraint interface method through a type parameter” — surfaced while re-checking this area — was fixed in A7-1 (see TASKS.md); constrained interface-method dispatch through `T` now lowers correctly.
 
 Each item below was reproduced with a minimal program against `build/zanc`
 (Windows, O0 default flags, `--auto-stdlib`).

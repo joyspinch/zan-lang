@@ -1,5 +1,7 @@
 # `throw` does not release live locals in the throwing frame
 
+**Status:** Fixed (2026-07-27) — A8-3 + A8-12 (throwing frame + intermediate frames). See TASKS.md A8-3 / A8-12.
+
 ## Summary
 
 Throwing an exception while a reference-counted object is live in the current

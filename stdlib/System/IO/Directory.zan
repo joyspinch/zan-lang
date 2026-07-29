@@ -87,40 +87,31 @@ class Directory {
     [DllImport("crt")]
     static extern void free(string ptr);
 
-    [DllImport("crt")]
-    static extern string strcpy(string dest, string src);
-
-    [DllImport("crt")]
-    static extern string strcat(string dest, string src);
-
-    [DllImport("crt")]
-    static extern long strlen(string str);
-
     #if WINDOWS
-    static string winWide(string text) {
+    static byte[] winWide(string text) {
         int count = WinToWide(65001, 0, text, -1, null, 0);
         if (count <= 0) { return null; }
-        string wide = calloc(count, 2);
+        byte[] wide = new byte[count * 2];
         WinToWide(65001, 0, text, -1, wide, count);
         return wide;
     }
 
+    // `count` from WideCharToMultiByte includes the NUL terminator, so the
+    // managed string keeps count-1 bytes.
     static string winUtf8(string wide) {
         int count = WinToUtf8(
             65001, 0, wide, -1, null, 0, null, null);
         if (count <= 0) { return ""; }
-        string text = calloc(count, 1);
+        byte[] text = new byte[count];
         WinToUtf8(
             65001, 0, wide, -1, text, count, null, null);
-        return text;
+        return text.ToStr(0, count - 1);
     }
 
     static int winAttributesUtf8(string path) {
-        string wide = winWide(path);
+        byte[] wide = winWide(path);
         if (wide == null) { return -1; }
-        int attrs = WinGetFileAttributes(wide);
-        free(wide);
-        return attrs;
+        return WinGetFileAttributes(wide);
     }
     #endif
 
@@ -149,10 +140,9 @@ class Directory {
     /// <summary>Creates a directory whose path is encoded as UTF-8.</summary>
     static void CreateDirectoryUtf8(string path) {
         #if WINDOWS
-        string wide = winWide(path);
+        byte[] wide = winWide(path);
         if (wide != null) {
             WinCreateDirectory(wide, 0);
-            free(wide);
         }
         #else
         CreateDirectory(path);
@@ -198,10 +188,9 @@ class Directory {
     /// <summary>Creates a directory at the specified path.</summary>
     static void CreateDirectory(string path) {
         #if WINDOWS
-        string wide = winWide(path);
+        byte[] wide = winWide(path);
         if (wide != null) {
             WinCreateDirectory(wide, 0);
-            free(wide);
         }
         #else
         mkdir(path, 511);   // 0o777, subject to umask
@@ -211,10 +200,9 @@ class Directory {
     /// <summary>Deletes an empty directory.</summary>
     static void Delete(string path) {
         #if WINDOWS
-        string wide = winWide(path);
+        byte[] wide = winWide(path);
         if (wide != null) {
             WinRemoveDirectory(wide);
-            free(wide);
         }
         #else
         rmdir(path);
@@ -224,13 +212,15 @@ class Directory {
     /// <summary>Gets the current working directory.</summary>
     static string GetCurrentDirectory() {
         #if WINDOWS
-        string wide = calloc(4096, 2);
+        byte[] wide = new byte[8192];
         WinGetCurrentDirectory(4096, wide);
         string buf = winUtf8(wide);
-        free(wide);
         #else
-        string buf = calloc(4096, 1);
-        getcwd(buf, 4096);
+        byte[] b = new byte[4096];
+        getcwd(b, 4096);
+        int n = 0;
+        while (n < 4096 && (b[n] & 255) != 0) { n = n + 1; }
+        string buf = b.ToStr(0, n);
         #endif
         return buf;
     }
@@ -238,10 +228,9 @@ class Directory {
     /// <summary>Sets the current working directory.</summary>
     static void SetCurrentDirectory(string path) {
         #if WINDOWS
-        string wide = winWide(path);
+        byte[] wide = winWide(path);
         if (wide != null) {
             WinSetCurrentDirectory(wide);
-            free(wide);
         }
         #else
         chdir(path);
@@ -261,11 +250,8 @@ class Directory {
         bool includeHidden
     ) {
         List<string> result = new List<string>();
-        int plen = (int)strlen(path);
-        string pattern = calloc(plen + 3, 1);
-        strcpy(pattern, path);
-        strcat(pattern, "\\*");
-        string widePattern = winWide(pattern);
+        string pattern = path + "\\*";
+        byte[] widePattern = winWide(pattern);
         string findData = calloc(592, 1);
         nint handle = -1;
         if (widePattern != null) {
@@ -287,8 +273,6 @@ class Directory {
             }
             WinFindClose(handle);
         }
-        if (widePattern != null) { free(widePattern); }
-        free(pattern);
         free(findData);
         return result;
     }
@@ -337,13 +321,9 @@ class Directory {
                 if (dtype == 4) {            // DT_DIR
                     isDir = true;
                 } else if (dtype == 0) {     // DT_UNKNOWN: probe the entry
-                    string full = calloc((int)strlen(path) + name.Length + 2, 1);
-                    strcpy(full, path);
-                    strcat(full, "/");
-                    strcat(full, name);
+                    string full = path + "/" + name;
                     int sub = opendir(full);
                     if (sub != 0) { isDir = true; closedir(sub); }
-                    free(full);
                 }
                 if (isDir == wantDirs
                     && (includeHidden || !hidden)) {

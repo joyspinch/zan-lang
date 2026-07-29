@@ -1,5 +1,7 @@
 # `await` inside a `catch` block crashes on the second loop iteration
 
+**Status:** Fixed (2026-07-27) — A8-1 (`await` in a `catch` block; the loop was incidental). See TASKS.md A8-1.
+
 ## Summary
 
 An `await` executed inside a `catch` block that sits in a loop crashes

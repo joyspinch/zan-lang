@@ -1,0 +1,389 @@
+using System;
+using Gui;
+
+namespace Gui.Widget;
+
+/// DataTable part: sorting & appearance — conditional-format colour
+/// helpers, appearance hooks, merge sorts and multi-column sort ordering.
+partial class DataTable {
+    // ---- color helpers for conditional formatting ----
+    // Opaque 0xFFRRGGBB packed as a positive int.
+    static int Rgb(int r, int g, int b) {
+        return 4278190080 + r * 65536 + g * 256 + b;
+    }
+    // Same RGB with a custom alpha (for translucent cell tints / data bars).
+    static int ColorAlpha(int packed, int a) {
+        int rgb = packed % 16777216;
+        if (rgb < 0) { rgb = rgb + 16777216; }
+        return rgb + a * 16777216;
+    }
+    // Linear blend of two opaque packed colors: (1-num/den)*c0 + (num/den)*c1.
+    static int LerpColor(int c0, int c1, int num, int den) {
+        if (den <= 0) { return c0; }
+        if (num < 0) { num = 0; }
+        if (num > den) { num = den; }
+        int r0 = (c0 / 65536) % 256;
+        int g0 = (c0 / 256) % 256;
+        int b0 = c0 % 256;
+        int r1 = (c1 / 65536) % 256;
+        int g1 = (c1 / 256) % 256;
+        int b1 = c1 % 256;
+        int r = r0 + (r1 - r0) * num / den;
+        int g = g0 + (g1 - g0) * num / den;
+        int b = b0 + (b1 - b0) * num / den;
+        return DataTable.Rgb(r, g, b);
+    }
+
+    // ---- appearance hooks (see CellStyler) ----
+    // A styler returns 0 for "no override": packed 0 is fully transparent
+    // black, so it can never collide with a colour someone meant to paint.
+
+    /// Background of a data row. The styler's colour wins over the striping
+    /// default, but selection and hover *tint* it rather than replacing it —
+    /// a half-and-half blend keeps a styled row's meaning legible while it is
+    /// active, instead of the row silently losing its colour under the cursor.
+    static int RowBackground(DataTableState st, DataSource src, int row,
+                             int stripeBg, int activeBg, int hoverBg,
+                             bool sel, bool hover) {
+        int custom = 0;
+        if (st.styler != null) { custom = st.styler.RowBg(src, row); }
+        if (custom == 0) {
+            if (hover) { return hoverBg; }
+            if (sel) { return activeBg; }
+            return stripeBg;
+        }
+        if (hover) { return DataTable.LerpColor(custom, hoverBg, 1, 2); }
+        if (sel) { return DataTable.LerpColor(custom, activeBg, 1, 2); }
+        return custom;
+    }
+
+    /// Background of one cell, or 0 to let the row background show through.
+    static int CellBackground(DataTableState st, DataSource src, int row, int col) {
+        if (st.styler == null) { return 0; }
+        return st.styler.CellBg(src, row, col);
+    }
+
+    /// Text colour for one cell, or 0 for the theme default. A per-cell colour
+    /// overrides the row's; the row's applies to every cell that has none.
+    static int CellForeground(DataTableState st, DataSource src, int row, int col) {
+        if (st.styler == null) { return 0; }
+        int fg = st.styler.CellFg(src, row, col);
+        if (fg == 0) { fg = st.styler.RowFg(src, row); }
+        return fg;
+    }
+
+    // ---- O(n log n) merge sort of row indices by the active sort column ----
+    // The previous selection sort was O(n^2) and locked up on large datasets;
+    // this bottom-up merge sort keeps sorting 100k+ rows responsive.
+    //
+    // Sort keys are extracted ONCE up front (decorate-sort-undecorate) into
+    // parallel arrays and moved in lockstep with the row indices during merges,
+    // so a comparison is a plain int/string compare instead of re-fetching the
+    // cell and re-parsing it on every one of the ~n*log2(n) comparisons.
+
+    // `kind` selects the decorated key array: 0 string, 1 int, 2 real.
+    static void MergeKeyed(int kind, int dir,
+                           List<int> order, List<int> nkey, List<string> skey, List<double> rkey,
+                           int lo, int mid, int hi,
+                           List<int> otmp, List<int> ntmp, List<string> stmp, List<double> rtmp) {
+        int i = lo;
+        int j = mid;
+        int k = lo;
+        while (i < mid && j < hi) {
+            int cmp = 0;
+            if (kind == 1) {
+                if (nkey[i] < nkey[j]) { cmp = -1; }
+                else if (nkey[i] > nkey[j]) { cmp = 1; }
+            } else if (kind == 2) {
+                if (rkey[i] < rkey[j]) { cmp = -1; }
+                else if (rkey[i] > rkey[j]) { cmp = 1; }
+            } else {
+                cmp = DataTable.CompareStr(skey[i], skey[j]);
+            }
+            if (dir == 2) { cmp = 0 - cmp; }
+            if (cmp <= 0) {
+                otmp[k] = order[i];
+                if (kind == 1) { ntmp[k] = nkey[i]; }
+                else if (kind == 2) { rtmp[k] = rkey[i]; }
+                else { stmp[k] = skey[i]; }
+                i = i + 1;
+            } else {
+                otmp[k] = order[j];
+                if (kind == 1) { ntmp[k] = nkey[j]; }
+                else if (kind == 2) { rtmp[k] = rkey[j]; }
+                else { stmp[k] = skey[j]; }
+                j = j + 1;
+            }
+            k = k + 1;
+        }
+        while (i < mid) {
+            otmp[k] = order[i];
+            if (kind == 1) { ntmp[k] = nkey[i]; }
+            else if (kind == 2) { rtmp[k] = rkey[i]; }
+            else { stmp[k] = skey[i]; }
+            i = i + 1; k = k + 1;
+        }
+        while (j < hi) {
+            otmp[k] = order[j];
+            if (kind == 1) { ntmp[k] = nkey[j]; }
+            else if (kind == 2) { rtmp[k] = rkey[j]; }
+            else { stmp[k] = skey[j]; }
+            j = j + 1; k = k + 1;
+        }
+        k = lo;
+        while (k < hi) {
+            order[k] = otmp[k];
+            if (kind == 1) { nkey[k] = ntmp[k]; }
+            else if (kind == 2) { rkey[k] = rtmp[k]; }
+            else { skey[k] = stmp[k]; }
+            k = k + 1;
+        }
+    }
+
+    // ---------- multi-column sort ----------
+    // sortKeys holds the active keys (outer→inner). sortCol/sortDir are kept in
+    // sync with the primary key so existing readers keep working.
+    static void SyncPrimary(DataTableState st) {
+        if (st.sortKeys.Count > 0) { st.sortCol = st.sortKeys[0].col; st.sortDir = st.sortKeys[0].dir; }
+        else { st.sortCol = -1; st.sortDir = 1; }
+    }
+
+    // Index of the sort key for `col`, or -1. Replaces List.IndexOf now that
+    // the keys are entities rather than a bare column-index list.
+    static int SortIndexOf(DataTableState st, int col) {
+        for (int i = 0; i < st.sortKeys.Count; i = i + 1) {
+            if (st.sortKeys[i].col == col) { return i; }
+        }
+        return -1;
+    }
+
+    /// Replace the sort with a single key (dir: 1 asc, 2 desc). col<0 clears it.
+    static void SortBy(DataTableState st, int col, int dir) {
+        st.sortKeys.Clear();
+        if (col >= 0) { st.sortKeys.Add(new SortKey(col, dir)); }
+        DataTable.SyncPrimary(st); st.dirty = true;
+    }
+
+    /// Append (or re-point) a secondary sort key without disturbing the others.
+    static void AddSort(DataTableState st, int col, int dir) {
+        if (col < 0) { return; }
+        int idx = DataTable.SortIndexOf(st, col);
+        if (idx < 0) { st.sortKeys.Add(new SortKey(col, dir)); }
+        else { st.sortKeys[idx].dir = dir; }
+        DataTable.SyncPrimary(st); st.dirty = true;
+    }
+
+    static void ClearSort(DataTableState st) {
+        st.sortKeys.Clear();
+        DataTable.SyncPrimary(st); st.dirty = true;
+    }
+
+    // Header-click state machine. `additive` (Shift) toggles this column as an
+    // extra key (asc → desc → removed); otherwise it becomes the sole key,
+    // cycling asc → desc → cleared when clicked repeatedly.
+    static void CycleSort(DataTableState st, int col, bool additive) {
+        int idx = DataTable.SortIndexOf(st, col);
+        if (additive) {
+            if (idx < 0) { st.sortKeys.Add(new SortKey(col, 1)); }
+            else if (st.sortKeys[idx].dir == 1) { st.sortKeys[idx].dir = 2; }
+            else { st.sortKeys.RemoveAt(idx); }
+        } else {
+            bool only = st.sortKeys.Count == 1 && idx == 0;
+            if (only) {
+                if (st.sortKeys[0].dir == 1) { st.sortKeys[0].dir = 2; }
+                else { st.sortKeys.Clear(); }
+            } else {
+                st.sortKeys.Clear();
+                st.sortKeys.Add(new SortKey(col, 1));
+            }
+        }
+        DataTable.SyncPrimary(st);
+    }
+
+    // Compare two data rows across every active sort key (stable tiebreak order).
+    static int CmpMultiKey(DataTableState st, List<DataColumn> cols, DataSource src, int ra, int rb) {
+        foreach (SortKey sk in st.sortKeys) {
+            int sc = sk.col;
+            if (sc >= 0 && sc < cols.Count) {
+                int cmp = DataTable.CompareCellCol(cols[sc], src.CellText(ra, sc), src.CellText(rb, sc));
+                if (sk.dir == 2) { cmp = 0 - cmp; }
+                if (cmp != 0) { return cmp; }
+            }
+        }
+        return 0;
+    }
+
+    static void MergeMulti(DataTableState st, List<DataColumn> cols, DataSource src,
+                           int lo, int mid, int hi, List<int> tmp) {
+        int i = lo;
+        int j = mid;
+        int k = lo;
+        while (i < mid && j < hi) {
+            if (DataTable.CmpMultiKey(st, cols, src, st.order[i], st.order[j]) <= 0) {
+                tmp[k] = st.order[i]; i = i + 1;
+            } else {
+                tmp[k] = st.order[j]; j = j + 1;
+            }
+            k = k + 1;
+        }
+        while (i < mid) { tmp[k] = st.order[i]; i = i + 1; k = k + 1; }
+        while (j < hi) { tmp[k] = st.order[j]; j = j + 1; k = k + 1; }
+        int p = lo;
+        while (p < hi) { st.order[p] = tmp[p]; p = p + 1; }
+    }
+
+    static void SortOrderMulti(DataTableState st, List<DataColumn> cols, DataSource src) {
+        int n = st.order.Count;
+        if (n < 2) { return; }
+        List<int> tmp = new List<int>();
+        int z = 0;
+        while (z < n) { tmp.Add(0); z = z + 1; }
+        int width = 1;
+        while (width < n) {
+            int lo = 0;
+            while (lo < n) {
+                int mid = lo + width;
+                if (mid > n) { mid = n; }
+                int hi = lo + width * 2;
+                if (hi > n) { hi = n; }
+                if (mid < hi) { DataTable.MergeMulti(st, cols, src, lo, mid, hi, tmp); }
+                lo = lo + width * 2;
+            }
+            width = width * 2;
+        }
+    }
+
+    static void SortOrder(DataTableState st, List<DataColumn> cols, DataSource src) {
+        int n = st.order.Count;
+        if (n < 2) { return; }
+        int dir = st.sortDir;
+        int sc = st.sortCol;
+        // key kind: 0 string, 1 int, 2 real (fractional numeric column). A date
+        // column keys on its day number, so it rides the int path.
+        int kind = 0;
+        if (cols[sc].isDate || cols[sc].isBool) { kind = 1; }
+        else if (cols[sc].numeric) { if (cols[sc].decimals > 0) { kind = 2; } else { kind = 1; } }
+
+        // decorate: pull the sort key for each visible row once (O(n)), so a
+        // comparison is a plain int/double/string compare rather than a
+        // per-compare CellNum/CellReal/CellText call.
+        List<int> nkey = new List<int>();
+        List<string> skey = new List<string>();
+        List<double> rkey = new List<double>();
+        int q = 0;
+        while (q < n) {
+            if (cols[sc].isDate) { nkey.Add(src.CellDay(st.order[q], sc, cols[sc].dateOrder)); }
+            else if (cols[sc].isBool) {
+                int bv = 0;
+                if (src.CellBool(st.order[q], sc)) { bv = 1; }
+                nkey.Add(bv);
+            }
+            else if (kind == 1) { nkey.Add(src.CellNum(st.order[q], sc)); }
+            else if (kind == 2) { rkey.Add(src.CellReal(st.order[q], sc)); }
+            else { skey.Add(src.CellText(st.order[q], sc)); }
+            q = q + 1;
+        }
+
+        List<int> otmp = new List<int>();
+        List<int> ntmp = new List<int>();
+        List<string> stmp = new List<string>();
+        List<double> rtmp = new List<double>();
+        int p = 0;
+        while (p < n) {
+            otmp.Add(0);
+            if (kind == 1) { ntmp.Add(0); }
+            else if (kind == 2) { rtmp.Add(0.0); }
+            else { stmp.Add(""); }
+            p = p + 1;
+        }
+
+        int width = 1;
+        while (width < n) {
+            int lo = 0;
+            while (lo < n) {
+                int mid = lo + width;
+                if (mid > n) { mid = n; }
+                int hi = lo + width * 2;
+                if (hi > n) { hi = n; }
+                if (mid < hi) { DataTable.MergeKeyed(kind, dir, st.order, nkey, skey, rkey, lo, mid, hi, otmp, ntmp, stmp, rtmp); }
+                lo = lo + width * 2;
+            }
+            width = width * 2;
+        }
+    }
+
+    // ---- O(n log n) merge sort of a string list (used for Distinct) ----
+
+    static void MergeStr(List<string> src, int lo, int mid, int hi, List<string> tmp) {
+        int i = lo;
+        int j = mid;
+        int k = lo;
+        while (i < mid && j < hi) {
+            if (DataTable.CompareStr(src[i], src[j]) <= 0) { tmp[k] = src[i]; i = i + 1; }
+            else { tmp[k] = src[j]; j = j + 1; }
+            k = k + 1;
+        }
+        while (i < mid) { tmp[k] = src[i]; i = i + 1; k = k + 1; }
+        while (j < hi) { tmp[k] = src[j]; j = j + 1; k = k + 1; }
+        k = lo;
+        while (k < hi) { src[k] = tmp[k]; k = k + 1; }
+    }
+
+    static void SortStr(List<string> a) {
+        int n = a.Count;
+        if (n < 2) { return; }
+        List<string> tmp = new List<string>();
+        int p = 0;
+        while (p < n) { tmp.Add(""); p = p + 1; }
+        int width = 1;
+        while (width < n) {
+            int lo = 0;
+            while (lo < n) {
+                int mid = lo + width;
+                if (mid > n) { mid = n; }
+                int hi = lo + width * 2;
+                if (hi > n) { hi = n; }
+                if (mid < hi) { DataTable.MergeStr(a, lo, mid, hi, tmp); }
+                lo = lo + width * 2;
+            }
+            width = width * 2;
+        }
+    }
+
+    // Sorted distinct values of a column across ALL source rows (no filter).
+    // Kept for backward compatibility (PivotTable passes a DataRow list here).
+    static List<string> Distinct(DataSource src, int col) {
+        List<string> vals = new List<string>();
+        int i = 0;
+        int nrows = src.RowCount();
+        while (i < nrows) { vals.Add(src.CellText(i, col)); i = i + 1; }
+        DataTable.SortStr(vals);
+        List<string> res = new List<string>();
+        int j = 0;
+        while (j < vals.Count) {
+            if (j == 0 || DataTable.CompareStr(vals[j], vals[j - 1]) != 0) { res.Add(vals[j]); }
+            j = j + 1;
+        }
+        return res;
+    }
+
+    // Sorted distinct values of a column scoped to the currently FILTERED view
+    // (st.order). This is what the Set-Filter popup should show: only values
+    // that are present after all OTHER column filters have been applied, so the
+    // popup reflects what the user can actually see. O(n log n) on the visible
+    // row count, which is usually much smaller than the full source row count.
+    static List<string> DistinctFiltered(DataTableState st, DataSource src, int col) {
+        List<string> vals = new List<string>();
+        int i = 0;
+        while (i < st.order.Count) { vals.Add(src.CellText(st.order[i], col)); i = i + 1; }
+        DataTable.SortStr(vals);
+        List<string> res = new List<string>();
+        int j = 0;
+        while (j < vals.Count) {
+            if (j == 0 || DataTable.CompareStr(vals[j], vals[j - 1]) != 0) { res.Add(vals[j]); }
+            j = j + 1;
+        }
+        return res;
+    }
+
+}

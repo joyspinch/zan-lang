@@ -1,3 +1,14 @@
+> **已归档（历史里程碑计划，不再维护）。** 本文件是项目最初的里程碑路线
+> （M1 最小可用编译器 → M9 调试器）。其复选框从未随实现更新——如 M1“Hello World
+> 编译器”早已远超、编译器已自举，M8/M9 标 ✅，而正文 §M9 仍指向 `src/ide/debugger.c`
+> （旧 C 版 IDE 已删除，现为 `src/ide_zan/` + `src/lsp/` + `src/dap/`）。因此不再据此立项。
+>
+> - 当前**能力现状**以 `docs/SPEC.md` / `docs/STDLIB.md` / `docs/ARCHITECTURE.md` 为准；
+> - 当前**执行计划**见 `docs/EXECUTION_PLAN.md`（顶层执行索引）、
+>   `docs/PRODUCTION_PLAN.md`（ZanIDE 生产可用详情）、
+>   `docs/SELF_CONTAINED_TOOLCHAIN.md`（自包含工具链技术设计与状态）；
+> - 下方正文保留为历史参考。
+
 ﻿# Zan Development Roadmap
 
 ## Milestone 1: Minimal Viable Compiler (M1)

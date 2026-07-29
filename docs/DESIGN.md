@@ -21,8 +21,8 @@ A modern systems programming language with C# syntax, compiling directly to nati
 
 ```csharp
 // Value types (stack allocated, zero overhead)
-int x = 42;              // 64-bit integer
-float y = 3.14;          // 64-bit float
+int x = 42;              // 32-bit integer (C# semantics; use long for 64-bit)
+float y = 3.14;          // 32-bit float (use double for 64-bit)
 bool ok = true;
 char ch = 'A';           // Unicode char
 string name = "hello";   // Immutable string (interned)

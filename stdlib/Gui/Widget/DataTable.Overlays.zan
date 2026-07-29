@@ -1,0 +1,516 @@
+using System;
+using Gui;
+
+namespace Gui.Widget;
+
+/// DataTable part: floating overlays — the right-click row context menu,
+/// the chart-from-selection overlay and the column-header context menu.
+partial class DataTable {
+    // ---------- right-click context menu ----------
+
+    static void CtxItem(App app, int mx, int my, int mw, int ih, string label, string accel) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int id = app.focus.AllocId();
+        bool hov = app.focus.IsHovered(id);
+        if (hov) { c.FillRect(mx, my, mw, ih, t.bgHover); }
+        c.DrawText(mx + app.Scale(12), my + (ih - Canvas.FontHeight(t.fontSizeSmall)) / 2, label, t.textPrimary, t.fontSizeSmall);
+        if (accel.Length > 0) {
+            int aw = Canvas.MeasureText(accel, t.fontSizeSmall);
+            c.DrawText(mx + mw - aw - app.Scale(12), my + (ih - Canvas.FontHeight(t.fontSizeSmall)) / 2, accel, t.textTertiary, t.fontSizeSmall);
+        }
+        app.hitTester.Register(HitRegion.Create(id, mx, my, mw, ih, 0));
+    }
+
+    // A header-menu aggregate row: shows a check on the active mode, and on
+    // click applies it and closes the menu. Returns the next item's y.
+    static int AggItem(App app, int mx, int iy, int mw, int ih,
+                       DataTableState st, int col, int mode, string label, int curAgg) {
+        string mark = "";
+        if (mode == curAgg) { mark = "✓"; }
+        DataTable.CtxItem(app, mx, iy, mw, ih, label, mark);
+        if (DataTable.CtxHit(app, mx, iy, mw, ih)) {
+            DataTable.SetAggregate(st, col, mode);
+            st.hitCol = col; st.ColumnResize.Raise();
+            st.hdrCtxOpen = false; app.RequestRedraw();
+        }
+        return iy + ih;
+    }
+
+    static bool CtxHit(App app, int mx, int my, int mw, int ih) {
+        // Was the row spanning (mx,my,mw,ih) just clicked? Uses geometry so the
+        // ids stay simple; the menu is modal-ish (drawn last, wins hit-testing).
+        return app.window.EventKind() == 3 && app.window.EventButton() == 0
+               && app.mouseX >= mx && app.mouseX < mx + mw
+               && app.mouseY >= my && app.mouseY < my + ih;
+    }
+
+    static void Flash(DataTableState st, string msg) {
+        st.toast = msg;
+        st.toastFrames = 90;
+    }
+
+    static void RenderContextMenu(App app, int x, int y, int viewW, int viewH,
+                                  List<DataColumn> cols, DataSource src, DataTableState st) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int mw = app.Scale(230);
+        int ih = t.heightMedium;
+        int sepH = app.Scale(9);
+
+        // menu items: label, accelerator, kind (0 item, 1 separator)
+        // 0 copy, 1 copy-with-headers, 2 paste, 3 clear cells, 4 export csv,
+        // 5 chart-from-selection, [sep, insert row, delete rows, undo,]
+        // sep, select all, sep, clear selection
+        // The row-editing group only exists when the source can actually grow
+        // or shrink, so a read-only grid shows no command it would refuse.
+        bool canRows = src.CanInsert();
+        int nItems = 8;
+        int nSeps = 2;
+        if (canRows) { nItems = nItems + 3; nSeps = nSeps + 1; }
+        int mh = ih * nItems + sepH * nSeps + app.Scale(8);
+
+        int mx = st.ctxX;
+        int my = st.ctxY;
+        if (mx + mw > x + viewW) { mx = x + viewW - mw - app.Scale(2); }
+        if (my + mh > y + viewH) { my = y + viewH - mh - app.Scale(2); }
+        if (mx < x) { mx = x; }
+        if (my < y) { my = y; }
+
+        // claim wheel + swallow clicks over the whole menu so gaps and the page
+        // beneath it don't get scrolled or fall through (items register later)
+        app.CaptureWheel(mx, my, mw, mh);
+        app.BlockHitsRect(mx, my, mw, mh);
+        c.FillRoundRect(mx, my, mw, mh, t.borderRadiusMedium, t.bgPrimary);
+        c.DrawRect(mx, my, mw, mh, t.borderPrimary, 1);
+
+        int iy = my + app.Scale(4);
+        DataTable.CtxItem(app, mx, iy, mw, ih, "复制  Copy", "Ctrl+C");
+        if (DataTable.CtxHit(app, mx, iy, mw, ih)) {
+            Clipboard.SetText(DataTable.BuildText(st, cols, src, false, false));
+            DataTable.Flash(st, "已复制到剪贴板");
+            st.ctxOpen = false;
+            app.RequestRedraw();
+        }
+        iy = iy + ih;
+        DataTable.CtxItem(app, mx, iy, mw, ih, "复制（含表头）", "");
+        if (DataTable.CtxHit(app, mx, iy, mw, ih)) {
+            Clipboard.SetText(DataTable.BuildText(st, cols, src, false, true));
+            DataTable.Flash(st, "已复制（含表头）");
+            st.ctxOpen = false;
+            app.RequestRedraw();
+        }
+        iy = iy + ih;
+        DataTable.CtxItem(app, mx, iy, mw, ih, "粘贴  Paste", "Ctrl+V");
+        if (DataTable.CtxHit(app, mx, iy, mw, ih)) {
+            int pn = DataTable.PasteText(st, cols, src, Clipboard.GetText());
+            if (pn > 0) { DataTable.Flash(st, "已粘贴 " + Convert.ToString(pn) + " 个单元格"); }
+            else { DataTable.Flash(st, "无可粘贴的可编辑单元格"); }
+            st.ctxOpen = false;
+            app.RequestRedraw();
+        }
+        iy = iy + ih;
+        DataTable.CtxItem(app, mx, iy, mw, ih, "清空所选单元格", "Delete");
+        if (DataTable.CtxHit(app, mx, iy, mw, ih)) {
+            int dn = DataTable.ClearRangeCells(st, cols, src);
+            if (dn > 0) { DataTable.Flash(st, "已清空 " + Convert.ToString(dn) + " 个单元格"); }
+            else { DataTable.Flash(st, "所选区域没有可编辑单元格"); }
+            st.ctxOpen = false;
+            app.RequestRedraw();
+        }
+        iy = iy + ih;
+        DataTable.CtxItem(app, mx, iy, mw, ih, "导出 CSV", "");
+        if (DataTable.CtxHit(app, mx, iy, mw, ih)) {
+            bool ok = SysFile.Write("datatable_export.csv", DataTable.BuildText(st, cols, src, true, true));
+            if (ok) { DataTable.Flash(st, "已导出 datatable_export.csv"); }
+            else { DataTable.Flash(st, "导出失败"); }
+            st.ctxOpen = false;
+            app.RequestRedraw();
+        }
+        iy = iy + ih;
+        DataTable.CtxItem(app, mx, iy, mw, ih, "从选区生成图表  Chart", "");
+        if (DataTable.CtxHit(app, mx, iy, mw, ih)) {
+            if (DataTable.BuildChartFromRange(st, cols, src)) {
+                st.chartOpen = true;
+            } else {
+                DataTable.Flash(st, "请先框选含数值列的区域");
+            }
+            st.ctxOpen = false;
+            app.RequestRedraw();
+        }
+        iy = iy + ih;
+        if (canRows) {
+            c.FillRect(mx + app.Scale(8), iy + sepH / 2, mw - app.Scale(16), 1, t.divider);
+            iy = iy + sepH;
+            DataTable.CtxItem(app, mx, iy, mw, ih, "插入行  Insert row", "Ctrl+Ins");
+            if (DataTable.CtxHit(app, mx, iy, mw, ih)) {
+                // Insert *below* the clicked row, which is where a reader
+                // expects a new entry to appear; the anchor row keeps its place.
+                int at = src.RowCount();
+                if (st.hitRow >= 0) { at = st.hitRow + 1; }
+                int nr = DataTable.InsertRow(st, cols, src, at);
+                if (nr >= 0) {
+                    DataTable.Recompute(st, cols, src);
+                    DataTable.FocusRow(st, cols, src, nr);
+                }
+                st.ctxOpen = false;
+                app.RequestRedraw();
+            }
+            iy = iy + ih;
+            DataTable.CtxItem(app, mx, iy, mw, ih, "删除行  Delete rows", "Ctrl+Del");
+            if (DataTable.CtxHit(app, mx, iy, mw, ih)) {
+                int killed = DataTable.DeleteSelectedRows(st, cols, src);
+                if (killed == 0 && st.hitRow >= 0) {
+                    if (DataTable.DeleteRow(st, cols, src, st.hitRow)) { killed = 1; }
+                }
+                if (killed > 0) {
+                    DataTable.Recompute(st, cols, src);
+                    DataTable.Flash(st, "已删除 " + Convert.ToString(killed) + " 行（Ctrl+Z 撤销）");
+                }
+                st.ctxOpen = false;
+                app.RequestRedraw();
+            }
+            iy = iy + ih;
+            int undoN = DataTable.UndoDepth(st);
+            string undoLbl = "撤销  Undo";
+            if (undoN > 0) { undoLbl = undoLbl + "  (" + Convert.ToString(undoN) + ")"; }
+            DataTable.CtxItem(app, mx, iy, mw, ih, undoLbl, "Ctrl+Z");
+            if (DataTable.CtxHit(app, mx, iy, mw, ih)) {
+                if (DataTable.Undo(st, cols, src)) {
+                    DataTable.Recompute(st, cols, src);
+                    DataTable.Flash(st, "已撤销");
+                } else {
+                    DataTable.Flash(st, "没有可撤销的操作");
+                }
+                st.ctxOpen = false;
+                app.RequestRedraw();
+            }
+            iy = iy + ih;
+        }
+        c.FillRect(mx + app.Scale(8), iy + sepH / 2, mw - app.Scale(16), 1, t.divider);
+        iy = iy + sepH;
+        DataTable.CtxItem(app, mx, iy, mw, ih, "全选", "Ctrl+A");
+        if (DataTable.CtxHit(app, mx, iy, mw, ih)) {
+            DataTable.SelectAllRows(st, true);
+            DataTable.ClearRange(st);
+            st.ctxOpen = false;
+            app.RequestRedraw();
+        }
+        iy = iy + ih;
+        c.FillRect(mx + app.Scale(8), iy + sepH / 2, mw - app.Scale(16), 1, t.divider);
+        iy = iy + sepH;
+        DataTable.CtxItem(app, mx, iy, mw, ih, "清除选择", "");
+        if (DataTable.CtxHit(app, mx, iy, mw, ih)) {
+            DataTable.SelectAllRows(st, false);
+            DataTable.ClearRange(st);
+            st.ctxOpen = false;
+            app.RequestRedraw();
+        }
+
+        // click outside closes the menu
+        if (app.window.EventKind() == 3
+            && !(app.mouseX >= mx && app.mouseX < mx + mw && app.mouseY >= my && app.mouseY < my + mh)) {
+            st.ctxOpen = false;
+            app.RequestRedraw();
+        }
+    }
+
+    // ---------- chart-from-selection overlay ----------
+    // A modal bar chart built from the selected range (see BuildChartFromRange).
+    // Closes on the [x] button, a click outside the panel, or Escape.
+    static void RenderChart(App app, int x, int y, int viewW, int viewH,
+                            DataTableState st) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+
+        int m = app.Scale(20);
+        int px = x + m;
+        int py = y + m;
+        int pw = viewW - m * 2;
+        int ph = viewH - m * 2;
+        if (pw < app.Scale(120) || ph < app.Scale(100)) { st.chartOpen = false; return; }
+
+        // scrim + panel
+        c.FillRect(x, y, viewW, viewH, t.overlay);
+        // modal: claim wheel + block all hits beneath the chart overlay
+        app.CaptureWheel(x, y, viewW, viewH);
+        app.BlockHitsRect(x, y, viewW, viewH);
+        c.FillRoundRect(px, py, pw, ph, t.borderRadiusMedium, t.bgPrimary);
+        c.DrawRect(px, py, pw, ph, t.borderPrimary, 1);
+
+        // title bar
+        int th = t.heightLarge;
+        c.FillRect(px + 1, py + 1, pw - 2, th, t.bgSecondary);
+        c.FillRect(px + 1, py + th, pw - 2, 1, t.divider);
+        c.DrawText(px + app.Scale(14), py + (th - Canvas.FontHeight(t.fontSizeMedium)) / 2,
+                   "图表 Chart · " + st.chartTitle, t.textPrimary, t.fontSizeMedium);
+
+        // close button
+        int cbs = app.Scale(22);
+        int cbx = px + pw - cbs - app.Scale(8);
+        int cby = py + (th - cbs) / 2;
+        bool cbHot = app.mouseX >= cbx && app.mouseX < cbx + cbs
+                     && app.mouseY >= cby && app.mouseY < cby + cbs;
+        if (cbHot) { c.FillRoundRect(cbx, cby, cbs, cbs, app.Scale(4), t.bgHover); }
+        c.DrawTextCentered(cbx, cby, cbs, cbs, "×", t.textPrimary, t.fontSizeLarge);
+
+        // plot area
+        int axisW = app.Scale(44);
+        int plotX = px + axisW;
+        int plotTop = py + th + app.Scale(14);
+        int plotBottom = py + ph - app.Scale(30);
+        int plotRight = px + pw - app.Scale(16);
+        int plotW = plotRight - plotX;
+        int plotH = plotBottom - plotTop;
+        int n = st.chartBars.Count;
+        if (plotH < app.Scale(20) || plotW < app.Scale(20) || n <= 0) {
+            // still allow closing even if too small to plot
+        } else {
+            int mx = st.chartMax;
+            if (mx < 1) { mx = 1; }
+
+            // baseline + max/zero axis labels + a faint midline
+            c.FillRect(plotX, plotBottom, plotW, 1, t.borderPrimary);
+            c.DrawText(px + app.Scale(8), plotTop - Canvas.FontHeight(t.fontSizeSmall) / 2,
+                       Convert.ToString(mx), t.textTertiary, t.fontSizeSmall);
+            c.DrawText(px + app.Scale(8), plotBottom - Canvas.FontHeight(t.fontSizeSmall) / 2,
+                       "0", t.textTertiary, t.fontSizeSmall);
+            int midY = plotTop + plotH / 2;
+            c.FillRect(plotX, midY, plotW, 1, t.divider);
+
+            int slotW = plotW / n;
+            int barW = slotW * 3 / 5;
+            if (barW < app.Scale(4)) { barW = app.Scale(4); }
+            int i = 0;
+            while (i < n) {
+                ChartBar bar = st.chartBars[i];
+                int av = bar.val;
+                if (av < 0) { av = 0 - av; }
+                int bh = av * plotH / mx;
+                if (bh < 1 && av > 0) { bh = 1; }
+                int slotL = plotX + slotW * i;
+                int bx = slotL + (slotW - barW) / 2;
+                int byy = plotBottom - bh;
+                c.FillRect(bx, byy, barW, bh, t.primary);
+
+                // value label above the bar
+                string vlab = Convert.ToString(bar.val);
+                int vlw = Canvas.MeasureText(vlab, t.fontSizeSmall);
+                int vlx = slotL + (slotW - vlw) / 2;
+                int vly = byy - Canvas.FontHeight(t.fontSizeSmall) - app.Scale(2);
+                if (vly < plotTop) { vly = plotTop; }
+                c.DrawText(vlx, vly, vlab, t.textSecondary, t.fontSizeSmall);
+
+                // category label below the baseline (clipped to the slot)
+                c.PushClip(slotL, plotBottom + app.Scale(4), slotW, app.Scale(20));
+                c.DrawTextCentered(slotL, plotBottom + app.Scale(4), slotW,
+                                   Canvas.FontHeight(t.fontSizeSmall),
+                                   bar.label, t.textTertiary, t.fontSizeSmall);
+                c.PopClip();
+                i = i + 1;
+            }
+        }
+
+        // close interactions: [x], click outside the panel, or Escape
+        bool clicked = app.window.EventKind() == 3 && app.window.EventButton() == 0;
+        bool inside = app.mouseX >= px && app.mouseX < px + pw
+                      && app.mouseY >= py && app.mouseY < py + ph;
+        if ((clicked && (cbHot || !inside))
+            || (app.window.EventKind() == 4 && app.window.EventKeyCode() == 27)) {
+            st.chartOpen = false;
+            app.RequestRedraw();
+        }
+    }
+
+    // ---------- header (column) context menu ----------
+    // Right-clicking a column header opens this DevExpress/ag-Grid-style menu:
+    // sort, auto-fit width, hide the column, restore all columns, and jump to
+    // the set-filter popup. Layout mirrors RenderContextMenu (running iy).
+    static void RenderHeaderMenu(App app, int x, int y, int viewW, int viewH,
+                                 List<DataColumn> cols, DataSource src, DataTableState st) {
+        int col = st.hdrCtxCol;
+        if (col < 0 || col >= cols.Count) { st.hdrCtxOpen = false; return; }
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int mw = app.Scale(230);
+        int ih = t.heightMedium;
+        int sepH = app.Scale(9);
+
+        bool canClear = DataTable.SortIndexOf(st, col) >= 0;
+        bool anyHidden = DataTable.HiddenCount(st) > 0;
+        bool canFilter = cols[col].filterable;
+        bool canAgg = cols[col].numeric;
+
+        int nItems = 4;                       // asc, desc, auto-fit, auto-fit-all
+        if (canClear) { nItems = nItems + 1; }
+        nItems = nItems + 1;                  // group by this column
+        if (st.groupCols.Count > 0) { nItems = nItems + 1; }  // ungroup all
+        nItems = nItems + 2;                  // freeze left / freeze right
+        nItems = nItems + 1;                  // hide column
+        if (anyHidden) { nItems = nItems + 1; }
+        if (canAgg) { nItems = nItems + 6; }  // sum/avg/min/max/count/none total
+        if (canFilter) { nItems = nItems + 1; }
+        int nSep = 3;                         // after sort, after auto-fit, after group
+        if (canAgg) { nSep = nSep + 1; }      // before aggregate items
+        if (canFilter) { nSep = nSep + 1; }   // before filter item
+        int mh = ih * nItems + sepH * nSep + app.Scale(8);
+
+        int mx = st.hdrCtxX;
+        int my = st.hdrCtxY;
+        if (mx + mw > x + viewW) { mx = x + viewW - mw - app.Scale(2); }
+        if (my + mh > y + viewH) { my = y + viewH - mh - app.Scale(2); }
+        if (mx < x) { mx = x; }
+        if (my < y) { my = y; }
+
+        // claim wheel + swallow clicks over the whole menu so gaps and the page
+        // beneath it don't get scrolled or fall through (items register later)
+        app.CaptureWheel(mx, my, mw, mh);
+        app.BlockHitsRect(mx, my, mw, mh);
+        c.FillRoundRect(mx, my, mw, mh, t.borderRadiusMedium, t.bgPrimary);
+        c.DrawRect(mx, my, mw, mh, t.borderPrimary, 1);
+
+        int iy = my + app.Scale(4);
+        DataTable.CtxItem(app, mx, iy, mw, ih, "升序排序  Sort Ascending", "");
+        if (DataTable.CtxHit(app, mx, iy, mw, ih)) {
+            DataTable.SortBy(st, col, 1);
+            st.hitCol = col; st.Sort.Raise();
+            st.hdrCtxOpen = false; app.RequestRedraw();
+        }
+        iy = iy + ih;
+        DataTable.CtxItem(app, mx, iy, mw, ih, "降序排序  Sort Descending", "");
+        if (DataTable.CtxHit(app, mx, iy, mw, ih)) {
+            DataTable.SortBy(st, col, 2);
+            st.hitCol = col; st.Sort.Raise();
+            st.hdrCtxOpen = false; app.RequestRedraw();
+        }
+        iy = iy + ih;
+        if (canClear) {
+            DataTable.CtxItem(app, mx, iy, mw, ih, "清除排序  Clear Sort", "");
+            if (DataTable.CtxHit(app, mx, iy, mw, ih)) {
+                DataTable.ClearSort(st);
+                st.Sort.Raise();
+                st.hdrCtxOpen = false; app.RequestRedraw();
+            }
+            iy = iy + ih;
+        }
+
+        c.FillRect(mx + app.Scale(8), iy + sepH / 2, mw - app.Scale(16), 1, t.divider);
+        iy = iy + sepH;
+        DataTable.CtxItem(app, mx, iy, mw, ih, "自动列宽  Auto-fit Column", "");
+        if (DataTable.CtxHit(app, mx, iy, mw, ih)) {
+            DataTable.AutoFitColumn(app, cols, src, st, col);
+            st.hitCol = col; st.ColumnResize.Raise();
+            st.hdrCtxOpen = false; app.RequestRedraw();
+        }
+        iy = iy + ih;
+        DataTable.CtxItem(app, mx, iy, mw, ih, "自动全部列宽  Auto-fit All", "");
+        if (DataTable.CtxHit(app, mx, iy, mw, ih)) {
+            DataTable.AutoFitAll(app, cols, src, st);
+            st.ColumnResize.Raise();
+            st.hdrCtxOpen = false; app.RequestRedraw();
+        }
+        iy = iy + ih;
+
+        c.FillRect(mx + app.Scale(8), iy + sepH / 2, mw - app.Scale(16), 1, t.divider);
+        iy = iy + sepH;
+        DataTable.CtxItem(app, mx, iy, mw, ih, "按此列分组  Group by This", "");
+        if (DataTable.CtxHit(app, mx, iy, mw, ih)) {
+            DataTable.GroupBy(st, col);
+            st.hitCol = col; st.GroupChanged.Raise();
+            st.hdrCtxOpen = false; app.RequestRedraw();
+        }
+        iy = iy + ih;
+        if (st.groupCols.Count > 0) {
+            DataTable.CtxItem(app, mx, iy, mw, ih, "取消分组  Ungroup All", "");
+            if (DataTable.CtxHit(app, mx, iy, mw, ih)) {
+                DataTable.Ungroup(st);
+                st.GroupChanged.Raise();
+                st.hdrCtxOpen = false; app.RequestRedraw();
+            }
+            iy = iy + ih;
+        }
+
+        c.FillRect(mx + app.Scale(8), iy + sepH / 2, mw - app.Scale(16), 1, t.divider);
+        iy = iy + sepH;
+        // Two explicit entries rather than one cycling toggle: which edge a
+        // column is frozen to is a choice, and a menu that makes the user click
+        // twice to guess their way to the right one is worse than showing both.
+        int frz = DataTable.FreezeOf(st, col);
+        string pinLbl = "冻结到左侧  Freeze Left";
+        if (frz == 1) { pinLbl = "取消冻结  Unfreeze"; }
+        DataTable.CtxItem(app, mx, iy, mw, ih, pinLbl, "");
+        if (DataTable.CtxHit(app, mx, iy, mw, ih)) {
+            if (frz == 1) { DataTable.UnpinColumn(st, col); }
+            else { DataTable.PinColumn(st, col); }
+            st.hitCol = col; st.ColumnResize.Raise();
+            st.hdrCtxOpen = false; app.RequestRedraw();
+        }
+        iy = iy + ih;
+        string pinRLbl = "冻结到右侧  Freeze Right";
+        if (frz == 2) { pinRLbl = "取消冻结  Unfreeze"; }
+        DataTable.CtxItem(app, mx, iy, mw, ih, pinRLbl, "");
+        if (DataTable.CtxHit(app, mx, iy, mw, ih)) {
+            if (frz == 2) { DataTable.UnpinColumn(st, col); }
+            else { DataTable.PinColumnRight(st, col); }
+            st.hitCol = col; st.ColumnResize.Raise();
+            st.hdrCtxOpen = false; app.RequestRedraw();
+        }
+        iy = iy + ih;
+        DataTable.CtxItem(app, mx, iy, mw, ih, "隐藏此列  Hide Column", "");
+        if (DataTable.CtxHit(app, mx, iy, mw, ih)) {
+            st.colHidden[col] = true;
+            st.hdrCtxOpen = false; app.RequestRedraw();
+        }
+        iy = iy + ih;
+        if (anyHidden) {
+            DataTable.CtxItem(app, mx, iy, mw, ih, "显示所有列  Show All Columns", "");
+            if (DataTable.CtxHit(app, mx, iy, mw, ih)) {
+                DataTable.ShowAllColumns(st);
+                st.hdrCtxOpen = false; app.RequestRedraw();
+            }
+            iy = iy + ih;
+        }
+
+        if (canAgg) {
+            c.FillRect(mx + app.Scale(8), iy + sepH / 2, mw - app.Scale(16), 1, t.divider);
+            iy = iy + sepH;
+            int curAgg = 0;
+            if (col < st.aggMode.Count) { curAgg = st.aggMode[col]; }
+            iy = DataTable.AggItem(app, mx, iy, mw, ih, st, col, 1, "合计  Sum", curAgg);
+            iy = DataTable.AggItem(app, mx, iy, mw, ih, st, col, 2, "平均  Average", curAgg);
+            iy = DataTable.AggItem(app, mx, iy, mw, ih, st, col, 3, "最小  Min", curAgg);
+            iy = DataTable.AggItem(app, mx, iy, mw, ih, st, col, 4, "最大  Max", curAgg);
+            iy = DataTable.AggItem(app, mx, iy, mw, ih, st, col, 5, "计数  Count", curAgg);
+            iy = DataTable.AggItem(app, mx, iy, mw, ih, st, col, 0, "无汇总  No Total", curAgg);
+        }
+
+        if (canFilter) {
+            c.FillRect(mx + app.Scale(8), iy + sepH / 2, mw - app.Scale(16), 1, t.divider);
+            iy = iy + sepH;
+            DataTable.CtxItem(app, mx, iy, mw, ih, "筛选…  Filter", "");
+            if (DataTable.CtxHit(app, mx, iy, mw, ih)) {
+                st.openMenu = col;
+                st.filterTab = 0;
+                st.searchText = "";
+                st.valScroll = 0;
+                st.editFocus = 0;
+                st.batchLines = new List<string>();
+                st.batchLines.Add("");
+                st.batchExactFlag = 0;
+                st.menuVals = DataTable.DistinctFiltered(st, src, col);
+                st.menuMatched = st.menuVals;
+                st.menuSearchCache = "";
+                st.hdrCtxOpen = false; app.RequestRedraw();
+            }
+            iy = iy + ih;
+        }
+
+        // click outside closes the menu
+        if (app.window.EventKind() == 3
+            && !(app.mouseX >= mx && app.mouseX < mx + mw && app.mouseY >= my && app.mouseY < my + mh)) {
+            st.hdrCtxOpen = false;
+            app.RequestRedraw();
+        }
+    }
+
+}

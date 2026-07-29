@@ -1,0 +1,514 @@
+using System;
+using Gui;
+
+namespace Gui.Widget;
+
+/// DataTable part: value parsing, number/real/bool/date formatting and
+/// calendar math — pure static conversions between raw cell strings and
+/// their typed or display forms. No table state is touched here.
+partial class DataTable {
+    // ---------- small helpers ----------
+
+    static int CompareStr(string a, string b) {
+        int la = a.Length;
+        int lb = b.Length;
+        int n = la;
+        if (lb < n) { n = lb; }
+        int i = 0;
+        while (i < n) {
+            char cha = a[i];
+            char chb = b[i];
+            int ca = (int)cha;
+            int cb = (int)chb;
+            if (ca < cb) { return -1; }
+            if (ca > cb) { return 1; }
+            i = i + 1;
+        }
+        if (la < lb) { return -1; }
+        if (la > lb) { return 1; }
+        return 0;
+    }
+
+    static bool IsIntStr(string s) {
+        int n = s.Length;
+        if (n == 0) { return false; }
+        int i = 0;
+        while (i < n) {
+            char ch = s[i];
+            int c = (int)ch;
+            bool neg = (i == 0 && c == 45);
+            if (!neg) {
+                if (c < 48 || c > 57) { return false; }
+            }
+            i = i + 1;
+        }
+        return true;
+    }
+
+    static int ParseInt(string s) {
+        int n = s.Length;
+        if (n == 0) { return 0; }
+        int i = 0;
+        bool neg = false;
+        char c0 = s[0];
+        if ((int)c0 == 45) { neg = true; i = 1; }
+        int v = 0;
+        while (i < n) {
+            char ch = s[i];
+            int c = (int)ch;
+            if (c < 48 || c > 57) { i = n; } else {
+                v = v * 10 + (c - 48);
+                i = i + 1;
+            }
+        }
+        if (neg) { return 0 - v; }
+        return v;
+    }
+
+    // ---- real (fixed-decimal) numeric support ----
+    // Cells stay strings on the wire, but numeric columns with `decimals > 0`
+    // are parsed to double for sorting / aggregating / conditional formatting
+    // and re-rendered at a fixed scale, so 1.5 and 1.9 no longer compare equal
+    // and totals keep their fractional part.
+
+    static double Pow10(int n) {
+        double p = 1.0;
+        int i = 0;
+        while (i < n) { p = p * 10.0; i = i + 1; }
+        return p;
+    }
+
+    /// Loose real parse: optional leading '-', decimal digits and at most one
+    /// '.'; thousands separators, currency symbols and unit suffixes are
+    /// skipped, so "¥1,234.56" and "-98%" both read correctly. "" reads as 0.
+    static double ParseReal(string s) {
+        int n = s.Length;
+        int i = 0;
+        bool neg = false;
+        if (i < n && (int)s[i] == 45) { neg = true; i = i + 1; }
+        double v = 0.0;
+        bool seenDot = false;
+        double scale = 1.0;
+        while (i < n) {
+            int c = (int)s[i];
+            if (c >= 48 && c <= 57) {
+                if (seenDot) { scale = scale * 10.0; v = v + (double)(c - 48) / scale; }
+                else { v = v * 10.0 + (double)(c - 48); }
+            } else if (c == 46 && !seenDot) {
+                seenDot = true;
+            }
+            i = i + 1;
+        }
+        if (neg) { return 0.0 - v; }
+        return v;
+    }
+
+    // Left-pad a fractional part to `decimals` digits ("5" at 2 -> "05").
+    static string PadFrac(int fp, int decimals) {
+        string fs = Convert.ToString(fp);
+        while (fs.Length < decimals) { fs = "0" + fs; }
+        return fs;
+    }
+
+    /// Render a double with exactly `decimals` fractional digits (half-up).
+    /// `Convert.ToString(double)` only carries ~6 significant digits, so the
+    /// grid never routes cell values through it.
+    static string FormatReal(double v, int decimals) {
+        bool neg = v < 0.0;
+        double a = v;
+        if (neg) { a = 0.0 - a; }
+        if (decimals <= 0) {
+            int r = (int)(a + 0.5);
+            string s0 = Convert.ToString(r);
+            if (neg && r != 0) { s0 = "-" + s0; }
+            return s0;
+        }
+        int iscale = (int)DataTable.Pow10(decimals);
+        int total = (int)(a * (double)iscale + 0.5);
+        int ip = total / iscale;
+        int fp = total - ip * iscale;
+        string s = Convert.ToString(ip) + "." + DataTable.PadFrac(fp, decimals);
+        if (neg && total != 0) { s = "-" + s; }
+        return s;
+    }
+
+    // ---- bool support ----
+    // A bool column stores text but keys on a truth value, so it sorts
+    // false-before-true and groups into exactly two buckets regardless of how
+    // each cell happens to be spelled.
+
+    /// Read a cell as a truth value. True for "1", "true", "yes", "y", "on",
+    /// "t" and a check mark; anything else (including "", "0" and "false") is
+    /// false. Case-insensitive and tolerant of surrounding spaces, so a column
+    /// mixing "Yes"/"TRUE"/"1" still reads consistently.
+    static bool ParseBool(string s) {
+        string v = DataTable.LowerAscii(DataTable.TrimSpace(s));
+        if (v == "1" || v == "true" || v == "yes" || v == "y" || v == "on" || v == "t") {
+            return true;
+        }
+        return v == Text.CharStr(10003);   // ✓
+    }
+
+    // Strip leading/trailing spaces and tabs.
+    static string TrimSpace(string s) {
+        int a = 0;
+        int b = s.Length;
+        while (a < b) {
+            int c = (int)s[a];
+            if (c == 32 || c == 9) { a = a + 1; } else { break; }
+        }
+        while (b > a) {
+            int c = (int)s[b - 1];
+            if (c == 32 || c == 9) { b = b - 1; } else { break; }
+        }
+        return s.Substring(a, b - a);
+    }
+
+    // ASCII-only lowercase; leaves any multi-byte sequence untouched.
+    static string LowerAscii(string s) {
+        string o = "";
+        int i = 0;
+        while (i < s.Length) {
+            int c = (int)s[i];
+            if (c >= 65 && c <= 90) { o = o + Text.ByteChar(c + 32); }
+            else { o = o + s.Substring(i, 1); }
+            i = i + 1;
+        }
+        return o;
+    }
+
+    // ---- date support ----
+    // A date column stores text but sorts, groups and totals on a day number
+    // (days since 1970-01-01, negative before it), so "2026-01-05" orders after
+    // "2025-12-31" instead of tying on a string compare. The day number goes
+    // through the existing int key path, so sorting costs no extra machinery.
+
+    /// Parse a date, returning days since the epoch, or `DataTable.NoDate` when
+    /// the text holds no recognisable date. Accepts any single non-digit
+    /// separator ("2026-07-26", "2026/7/6", "2026.7.6"), an optional trailing
+    /// time (ignored), and the field order named by `dateOrder`:
+    /// 0 = y-m-d, 1 = d-m-y, 2 = m-d-y. Two-digit years map to 2000..2069 /
+    /// 1970..1999. A bare 8-digit run is read as YYYYMMDD.
+    static int ParseDate(string s, int dateOrder) {
+        int n = s.Length;
+        List<int> nums = new List<int>();
+        List<int> lens = new List<int>();
+        int i = 0;
+        // Take the first three digit runs; a trailing time contributes more runs
+        // that we simply drop.
+        while (i < n && nums.Count < 3) {
+            int c = (int)s[i];
+            if (c >= 48 && c <= 57) {
+                int v = 0;
+                int len = 0;
+                bool run = true;
+                while (i < n && run) {
+                    int d = (int)s[i];
+                    if (d < 48 || d > 57) { run = false; } else {
+                        v = v * 10 + (d - 48);
+                        len = len + 1;
+                        i = i + 1;
+                    }
+                }
+                nums.Add(v);
+                lens.Add(len);
+            } else {
+                i = i + 1;
+            }
+        }
+
+        // A single 8-digit run is a packed YYYYMMDD.
+        if (nums.Count == 1 && lens[0] == 8) {
+            int p = nums[0];
+            int py = p / 10000;
+            int pm = (p / 100) - py * 100;
+            int pd = p - py * 10000 - pm * 100;
+            return DataTable.DateFromYmd(py, pm, pd);
+        }
+        if (nums.Count < 3) { return DataTable.NoDate(); }
+
+        int y = nums[0];
+        int m = nums[1];
+        int d = nums[2];
+        if (dateOrder == 1) { d = nums[0]; m = nums[1]; y = nums[2]; }
+        else if (dateOrder == 2) { m = nums[0]; d = nums[1]; y = nums[2]; }
+        // A 4-digit run in the leading slot always wins over the declared
+        // order, so an ISO value parses correctly under any dateOrder.
+        if (lens[0] == 4) { y = nums[0]; m = nums[1]; d = nums[2]; }
+        if (y < 100) {
+            if (y < 70) { y = y + 2000; } else { y = y + 1900; }
+        }
+        return DataTable.DateFromYmd(y, m, d);
+    }
+
+    /// Sentinel day number for "not a date": sorts before every real date and
+    /// is rendered as an empty cell.
+    static int NoDate() { return 0 - 100000000; }
+
+    // Validate the fields, then convert to a day number.
+    static int DateFromYmd(int y, int m, int d) {
+        if (m < 1 || m > 12) { return DataTable.NoDate(); }
+        if (d < 1 || d > DateTime.DaysInMonth(y, m)) { return DataTable.NoDate(); }
+        return DateTime.DaysFromCivil(y, m, d);
+    }
+
+    /// Render a day number using the pattern named by `dateFmt`:
+    /// 0 = YYYY-MM-DD, 1 = DD/MM/YYYY, 2 = MM/DD/YYYY, 3 = YYYY年M月D日,
+    /// 4 = YYYY-MM (month), 5 = YYYY (year), 6 = "1 Jan 2026".
+    static string FormatDate(int days, int dateFmt) {
+        if (days == DataTable.NoDate()) { return ""; }
+        DateTime t = DateTime.FromUnixSeconds(days * 86400);
+        int y = t.Year();
+        int m = t.Month();
+        int d = t.Day();
+        if (dateFmt == 1) {
+            return DateTime.Pad2(d) + "/" + DateTime.Pad2(m) + "/" + Convert.ToString(y);
+        }
+        if (dateFmt == 2) {
+            return DateTime.Pad2(m) + "/" + DateTime.Pad2(d) + "/" + Convert.ToString(y);
+        }
+        if (dateFmt == 3) {
+            return Convert.ToString(y) + Text.CharStr(24180) + Convert.ToString(m)
+                 + Text.CharStr(26376) + Convert.ToString(d) + Text.CharStr(26085);
+        }
+        if (dateFmt == 4) { return Convert.ToString(y) + "-" + DateTime.Pad2(m); }
+        if (dateFmt == 5) { return Convert.ToString(y); }
+        if (dateFmt == 6) {
+            return Convert.ToString(d) + " " + DataTable.MonthAbbr(m) + " " + Convert.ToString(y);
+        }
+        return Convert.ToString(y) + "-" + DateTime.Pad2(m) + "-" + DateTime.Pad2(d);
+    }
+
+    /// The FormatDate pattern that ParseDate will read back under this column's
+    /// dateOrder. The rendered pattern (dateFmt) is free to be anything — it may
+    /// drop the day entirely — so a value written into a *cell* has to use the
+    /// stored field order instead, or it would not survive a re-parse.
+    static int DateStoreFormat(DataColumn c) {
+        if (c.dateOrder == 1) { return 1; }
+        if (c.dateOrder == 2) { return 2; }
+        return 0;
+    }
+
+    static string MonthAbbr(int m) {
+        if (m == 1) { return "Jan"; }
+        if (m == 2) { return "Feb"; }
+        if (m == 3) { return "Mar"; }
+        if (m == 4) { return "Apr"; }
+        if (m == 5) { return "May"; }
+        if (m == 6) { return "Jun"; }
+        if (m == 7) { return "Jul"; }
+        if (m == 8) { return "Aug"; }
+        if (m == 9) { return "Sep"; }
+        if (m == 10) { return "Oct"; }
+        if (m == 11) { return "Nov"; }
+        if (m == 12) { return "Dec"; }
+        return "";
+    }
+
+    /// Bucket label for grouping a date cell, per `dateGroup`:
+    /// 0 = exact day, 1 = year, 2 = year+month, 3 = quarter, 4 = day of week.
+    /// Grouping by month collapses every day of a month into one header.
+    static string DateGroupKey(int days, int dateGroup) {
+        if (days == DataTable.NoDate()) { return ""; }
+        if (dateGroup == 0) { return DataTable.FormatDate(days, 0); }
+        DateTime t = DateTime.FromUnixSeconds(days * 86400);
+        int y = t.Year();
+        if (dateGroup == 1) { return Convert.ToString(y); }
+        if (dateGroup == 2) { return Convert.ToString(y) + "-" + DateTime.Pad2(t.Month()); }
+        if (dateGroup == 3) {
+            int q = (t.Month() - 1) / 3 + 1;
+            return Convert.ToString(y) + " Q" + Convert.ToString(q);
+        }
+        if (dateGroup == 4) { return DataTable.DayName(t.DayOfWeek()); }
+        return DataTable.FormatDate(days, 0);
+    }
+
+    static string DayName(int dow) {
+        if (dow == 0) { return "Sunday"; }
+        if (dow == 1) { return "Monday"; }
+        if (dow == 2) { return "Tuesday"; }
+        if (dow == 3) { return "Wednesday"; }
+        if (dow == 4) { return "Thursday"; }
+        if (dow == 5) { return "Friday"; }
+        if (dow == 6) { return "Saturday"; }
+        return "";
+    }
+
+    // Insert thousands separators into a run of digits. Left untouched if the
+    // string contains any non-digit (so it never mangles a non-numeric cell).
+    static string GroupDigits(string ipart) {
+        int n = ipart.Length;
+        int k = 0;
+        while (k < n) {
+            int cc = (int)ipart[k];
+            if (cc < 48 || cc > 57) { return ipart; }
+            k = k + 1;
+        }
+        if (n <= 3) { return ipart; }
+        string outp = "";
+        int cnt = 0;
+        int i = n - 1;
+        while (i >= 0) {
+            outp = ipart.Substring(i, 1) + outp;
+            cnt = cnt + 1;
+            if (cnt % 3 == 0 && i > 0) { outp = "," + outp; }
+            i = i - 1;
+        }
+        return outp;
+    }
+
+    // Apply a column's display format to a raw cell value: optional thousands
+    // grouping of the integer part plus prefix/suffix. Sign and any fractional
+    // part are preserved. Returns the raw value unchanged when fmt is off.
+    static string FormatCell(DataColumn col, string raw) {
+        // Bool columns normalise every accepted spelling to the column's own
+        // pair, so a mix of "1"/"Yes"/"TRUE" reads as one vocabulary. The
+        // checkbox and glyph styles paint instead of using this text.
+        if (col.isBool) {
+            if (DataTable.ParseBool(raw)) { return col.boolTrue; }
+            return col.boolFalse;
+        }
+        // Date columns re-render from the parsed day number, so mixed stored
+        // spellings ("2026/7/6", "20260706") all display identically. Text that
+        // does not parse as a date is shown as typed rather than blanked.
+        if (col.isDate) {
+            int dk = DataTable.ParseDate(raw, col.dateOrder);
+            if (dk == DataTable.NoDate()) { return raw; }
+            return DataTable.FormatDate(dk, col.dateFmt);
+        }
+        if (col.fmt == 0) { return raw; }
+        if (raw.Length == 0) { return raw; }
+        // Fixed-decimal columns re-render from the parsed value so every cell
+        // shows the same scale ("5" -> "5.00") regardless of how it was typed.
+        if (col.decimals > 0) {
+            raw = DataTable.FormatReal(DataTable.ParseReal(raw), col.decimals);
+        }
+        string sign = "";
+        string body = raw;
+        if ((int)raw[0] == 45) { sign = "-"; body = raw.Substring(1); }
+        int dot = -1;
+        int i = 0;
+        while (i < body.Length) {
+            if ((int)body[i] == 46) { dot = i; i = body.Length; } else { i = i + 1; }
+        }
+        string ipart = body;
+        string fpart = "";
+        if (dot >= 0) { ipart = body.Substring(0, dot); fpart = body.Substring(dot); }
+        if (col.grouped) { ipart = DataTable.GroupDigits(ipart); }
+        return sign + col.prefix + ipart + fpart + col.suffix;
+    }
+
+    // ---- inline cell editing ----
+
+    // Accepts an optional leading '-', decimal digits and at most one '.'.
+    static bool IsNumericStr(string s) {
+        if (s.Length == 0) { return false; }
+        int i = 0;
+        if ((int)s[0] == 45) { i = 1; }
+        if (i >= s.Length) { return false; }
+        int dots = 0;
+        while (i < s.Length) {
+            int cc = (int)s[i];
+            if (cc == 46) { dots = dots + 1; if (dots > 1) { return false; } }
+            else if (cc < 48 || cc > 57) { return false; }
+            i = i + 1;
+        }
+        return true;
+    }
+
+    /// Check a value against the column's declarative rules, returning the
+    /// rejection message or "" when it passes. Order matters: emptiness is
+    /// reported before format, and format before range, so the user always sees
+    /// the most fundamental problem first.
+    static string ValidateCell(DataColumn c, string v) {
+        string trimmed = DataTable.TrimSpace(v);
+        if (c.required && trimmed.Length == 0) { return "Value required"; }
+        if (c.maxLength > 0 && v.Length > c.maxLength) {
+            return "At most " + Convert.ToString(c.maxLength) + " characters";
+        }
+        // An empty optional value skips the value-shaped rules: "no entry" is
+        // not the same as "a badly formed entry".
+        if (trimmed.Length == 0) { return ""; }
+        if (c.isDate) {
+            if (DataTable.ParseDate(trimmed, c.dateOrder) == DataTable.NoDate()) {
+                return "Not a valid date";
+            }
+            return "";
+        }
+        if (c.numeric) {
+            if (!DataTable.IsNumericStr(trimmed)) { return "Must be a number"; }
+            double n = DataTable.ParseReal(trimmed);
+            if (c.hasMin && n < c.editMin) {
+                return "Must be >= " + DataTable.FormatReal(c.editMin, c.decimals);
+            }
+            if (c.hasMax && n > c.editMax) {
+                return "Must be <= " + DataTable.FormatReal(c.editMax, c.decimals);
+            }
+        }
+        if (c.editorKind == 1 && c.choicesStrict) {
+            int i = 0;
+            while (i < c.choices.Count) {
+                if (DataTable.EqCI(c.choices[i], trimmed)) { return ""; }
+                i = i + 1;
+            }
+            return "Not a listed value";
+        }
+        return "";
+    }
+
+    /// Indices of the dropdown choices matching `typed` (case-insensitive
+    /// substring). Empty text matches everything, so opening the editor shows
+    /// the whole list.
+    static List<int> FilterChoices(DataColumn c, string typed) {
+        List<int> hits = new List<int>();
+        string q = DataTable.TrimSpace(typed);
+        int i = 0;
+        while (i < c.choices.Count) {
+            if (q.Length == 0 || DataTable.ContainsCI(c.choices[i], q)) { hits.Add(i); }
+            i = i + 1;
+        }
+        return hits;
+    }
+
+    /// Step a numeric editor buffer by `dir` increments, clamped to the column's
+    /// declared bounds. A non-numeric buffer starts from the lower bound (or 0),
+    /// so the spinner always produces something valid.
+    static string StepValue(DataColumn c, string cur, int dir) {
+        string t = DataTable.TrimSpace(cur);
+        double v = 0.0;
+        if (t.Length > 0 && DataTable.IsNumericStr(t)) { v = DataTable.ParseReal(t); }
+        else if (c.hasMin) { v = c.editMin; dir = 0; }
+        v = v + c.editStep * (double)dir;
+        if (c.hasMin && v < c.editMin) { v = c.editMin; }
+        if (c.hasMax && v > c.editMax) { v = c.editMax; }
+        return DataTable.FormatReal(v, c.decimals);
+    }
+
+    // ---- calendar helpers (editorKind 2) ----
+    /// Pack a year and month into the single int the calendar tracks.
+    static int YearMonth(int y, int m) { return y * 12 + (m - 1); }
+    static int YmYear(int ym) { return DateTime.FloorDiv(ym, 12); }
+    static int YmMonth(int ym) { return DateTime.FloorMod(ym, 12) + 1; }
+
+    /// Weekday of the 1st of a month, 0 = Sunday. Day 0 of the epoch was a
+    /// Thursday, hence the +4.
+    static int MonthFirstDow(int ym) {
+        int d = DateTime.DaysFromCivil(DataTable.YmYear(ym), DataTable.YmMonth(ym), 1);
+        return DateTime.FloorMod(d + 4, 7);
+    }
+
+    /// The 42 cells of a month grid as day-of-month numbers, 0 where the cell
+    /// belongs to the neighbouring month. Six rows so the grid never reflows.
+    static List<int> MonthCells(int ym) {
+        List<int> cells = new List<int>();
+        int lead = DataTable.MonthFirstDow(ym);
+        int dim = DateTime.DaysInMonth(DataTable.YmYear(ym), DataTable.YmMonth(ym));
+        int i = 0;
+        while (i < 42) {
+            int day = i - lead + 1;
+            if (day < 1 || day > dim) { cells.Add(0); } else { cells.Add(day); }
+            i = i + 1;
+        }
+        return cells;
+    }
+}

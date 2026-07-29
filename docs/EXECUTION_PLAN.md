@@ -3,6 +3,11 @@
 > 本计划整合三类问题：(A) ZanIDE 生产可用差距（承接 `docs/PRODUCTION_PLAN.md`，
 > 此处不重复其表格，只排序引用）；(B) C# 语法/LINQ 友好度差距；(C) 仓库
 > 工作流问题（分支管理）。按优先级 P0 → P2 执行，每项含验收标准。
+>
+> **路线文档关系（本文件是顶层索引）**：细节分两份下钻——
+> `docs/PRODUCTION_PLAN.md`（ZanIDE 生产可用逐项，即 Workstream A 的表格来源）、
+> `docs/SELF_CONTAINED_TOOLCHAIN.md`（自包含工具链技术设计与落地状态，被生产计划阶段 5 引用）。
+> 项目最初的里程碑路线 `ROADMAP.md` 已归档到 `docs/archive/`（历史参考，不再维护）。
 
 ---
 

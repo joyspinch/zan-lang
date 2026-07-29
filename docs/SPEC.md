@@ -65,8 +65,8 @@ weak       when       where      while
 1_000_000   // digit separator
 ```
 
-Integer literals are `int` (64-bit signed) by default. Suffixes:
-- `L` or `l` — `long` (same as int, 64-bit)
+Integer literals are `int` (32-bit signed) by default. Suffixes:
+- `L` or `l` — `long` (64-bit; `int` is 32-bit)
 - `u` — unsigned
 
 #### Floating-Point Literals

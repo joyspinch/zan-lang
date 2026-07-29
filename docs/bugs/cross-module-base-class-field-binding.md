@@ -1,5 +1,7 @@
 # Subclassing a cross-module class silently mis-binds inherited fields
 
+**Status:** Fixed (2026-07) — re-verified against `build/zanc`. See Resolution below.
+
 ## Summary
 
 A class that inherits from a class defined in another stdlib module (observed

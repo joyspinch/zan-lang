@@ -36,14 +36,13 @@ class MixEntry {
 /// Buffer backing exists because ra2.mix nests further archives (cache.mix,
 /// conquer.mix, ...) that are read straight out of their parent's bytes.
 class MixArchive {
-    [DllImport("crt")] static extern string calloc(int count, int size);
     [DllImport("crt")] static extern void free(string p);
 
     static int FlagChecksum() { return 0x00010000; }
     static int FlagEncrypted() { return 0x00020000; }
 
     string path;          // "" when backed by a buffer
-    string data;          // header only when file-backed, whole archive otherwise
+    byte[] data;          // header only when file-backed, whole archive otherwise
     int dataLen;          // length of `data`
     int totalLen;         // bytes readable behind this archive
     string label;         // for diagnostics: file name or parent's description
@@ -80,9 +79,9 @@ class MixArchive {
     // A one-character string holding the given byte value. Appending a char
     // directly would append its decimal digits instead.
     static string CharOf(int v) {
-        string one = calloc(2, 1);
-        one[0] = (char)(v & 0xFF);
-        return one;
+        byte[] one = new byte[1];
+        one[0] = (byte)(v & 0xFF);
+        return one.ToStr(0, 1);
     }
 
     /// Standard reflected CRC32 (polynomial 0xEDB88320), masked to 32 bits
@@ -123,7 +122,6 @@ class MixArchive {
         int headerLen = m.HeaderLength();
         if (headerLen > m.totalLen) { headerLen = m.totalLen; }
         if (headerLen > m.dataLen) {
-            free(m.data);
             m.data = File.ReadBytes(path, 0, headerLen);
             m.dataLen = headerLen;
         }
@@ -131,9 +129,9 @@ class MixArchive {
         return m;
     }
 
-    /// <summary>Opens an archive held in memory. Takes ownership of the
-    /// buffer.</summary>
-    static MixArchive FromBuffer(string data, int length, string label) {
+    /// <summary>Opens an archive held in memory. The buffer is ARC-managed, so
+    /// the archive and the caller can both keep referring to it.</summary>
+    static MixArchive FromBuffer(byte[] data, int length, string label) {
         MixArchive m = new MixArchive();
         m.path = "";
         m.data = data;
@@ -187,7 +185,7 @@ class MixArchive {
         }
         int cipherAt = 4 + WsKey.WrappedSize();
         Blowfish bf = this.HeaderCipher();
-        string first = calloc(9, 1);
+        byte[] first = new byte[8];
         int i = 0;
         while (i < 8) {
             first[i] = this.data[cipherAt + i];
@@ -195,7 +193,6 @@ class MixArchive {
         }
         bf.DecryptBlock(first, 0);
         int count = (first[0] & 0xFF) | ((first[1] & 0xFF) << 8);
-        free(first);
         return cipherAt + ((6 + count * 12 + 7) / 8) * 8;
     }
 
@@ -241,7 +238,7 @@ class MixArchive {
         // archive, where only the header was read, but a nested archive holds
         // its whole self in memory -- and then dataStart would land at the end.
         int plainLen = this.HeaderLength() - cipherAt;
-        string plain = calloc(plainLen + 1, 1);
+        byte[] plain = new byte[plainLen];
         int i = 0;
         while (i < plainLen) {
             plain[i] = this.data[cipherAt + i];
@@ -259,7 +256,6 @@ class MixArchive {
                           MixArchive.BufU32(plain, e + 8));
             i = i + 1;
         }
-        free(plain);
     }
 
     static int BufU32(string buf, int at) {
@@ -298,29 +294,30 @@ class MixArchive {
     bool Contains(string name) { return this.Find(name) != null; }
 
     /// <summary>Reads a file's bytes. Sets outLen[0] to the length and returns
-    /// an empty string when the name is not in this archive. Caller frees.</summary>
-    string ReadFile(string name, List<int> outLen) {
+    /// an empty buffer when the name is not in this archive. The buffer is
+    /// ARC-managed, so the caller does not release it.</summary>
+    byte[] ReadFile(string name, List<int> outLen) {
         MixEntry e = this.Find(name);
         if (e == null) {
             outLen[0] = 0;
-            return "";
+            return new byte[0];
         }
         return this.ReadEntry(e, outLen);
     }
 
-    string ReadEntry(MixEntry e, List<int> outLen) {
+    byte[] ReadEntry(MixEntry e, List<int> outLen) {
         int at = this.dataStart + e.Offset();
         int size = e.Size();
         // A truncated or mis-parsed archive would otherwise read past the end.
         if (at < 0 || size < 0 || at + size > this.totalLen) {
             outLen[0] = 0;
-            return "";
+            return new byte[0];
         }
         outLen[0] = size;
         if (this.path != "") {
             return File.ReadBytes(this.path, at, size);
         }
-        string buf = calloc(size + 1, 1);
+        byte[] buf = new byte[size];
         int i = 0;
         while (i < size) {
             buf[i] = this.data[at + i];
@@ -334,16 +331,13 @@ class MixArchive {
     MixArchive OpenNested(string name) {
         List<int> len = new List<int>();
         len.Add(0);
-        string sub = this.ReadFile(name, len);
+        byte[] sub = this.ReadFile(name, len);
         if (len[0] == 0) { return null; }
         return MixArchive.FromBuffer(sub, len[0], this.label + "!" + name);
     }
 
     void Close() {
-        if (this.data != "") {
-            free(this.data);
-            this.data = "";
-        }
+        this.data = null;
         this.dataLen = 0;
         this.entries = new List<MixEntry>();
         this.index = new Dictionary<int, int>();

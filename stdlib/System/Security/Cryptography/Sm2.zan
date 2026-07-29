@@ -8,8 +8,6 @@ namespace System.Security.Cryptography;
 /// SM2 public-key encryption in C1C3C2 form. Points are held in Jacobian
 /// coordinates so only one modular inverse is needed per scalar multiply.</summary>
 class Sm2 {
-    [DllImport("crt")] static extern string calloc(long count, long size);
-    [DllImport("crt")] static extern void free(string ptr);
 
     static string PHEX  = "FFFFFFFEFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF00000000FFFFFFFFFFFFFFFF";
     static string AHEX  = "FFFFFFFEFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF00000000FFFFFFFFFFFFFFFC";
@@ -36,11 +34,9 @@ class Sm2 {
     }
 
     static BigInt fromInt(int v) {
-        string b = calloc(5, 1);
+        byte[] b = new byte[4];
         b[0] = (v >> 24) & 255; b[1] = (v >> 16) & 255; b[2] = (v >> 8) & 255; b[3] = v & 255;
-        BigInt r = BigInt.FromBytesBE(b, 4);
-        free(b);
-        return r;
+        return BigInt.FromBytesBE(b, 4);
     }
 
     // field arithmetic mod P
@@ -135,23 +131,19 @@ class Sm2 {
         init();
         int entBits = idLen * 8;
         int zLen = 2 + idLen + 32 * 6;
-        string zin = calloc(zLen + 1, 1);
+        byte[] zin = new byte[zLen];
         zin[0] = (entBits >> 8) & 255; zin[1] = entBits & 255;
         int i = 0; while (i < idLen) { zin[2 + i] = id[i] & 255; i = i + 1; }
         int off = 2 + idLen;
         writeBE32(zin, off, A); writeBE32(zin, off + 32, B);
         writeBE32(zin, off + 64, GX); writeBE32(zin, off + 96, GY);
         writeBE32(zin, off + 128, px); writeBE32(zin, off + 160, py);
-        string za = Sm3.Hash(zin, zLen);
-        free(zin);
-        string ein = calloc(32 + msgLen + 1, 1);
+        byte[] za = Sm3.Hash(zin, zLen);
+        byte[] ein = new byte[32 + msgLen];
         i = 0; while (i < 32) { ein[i] = za[i] & 255; i = i + 1; }
         i = 0; while (i < msgLen) { ein[32 + i] = msg[i] & 255; i = i + 1; }
-        string eh = Sm3.Hash(ein, 32 + msgLen);
-        free(ein); free(za);
-        BigInt e = BigInt.FromBytesBE(eh, 32);
-        free(eh);
-        return e;
+        byte[] eh = Sm3.Hash(ein, 32 + msgLen);
+        return BigInt.FromBytesBE(eh, 32);
     }
 
     /// <summary>SM2 signature. e is the ZA||M digest; k is a per-signature secret
@@ -183,18 +175,17 @@ class Sm2 {
     }
 
     // KDF from GB/T 32918.4
-    static string kdf(string z, int zLen, int klen) {
-        string outb = calloc(klen + 1, 1);
+    static byte[] kdf(string z, int zLen, int klen) {
+        byte[] outb = new byte[klen];
         int ct = 1; int pos = 0;
         while (pos < klen) {
-            string buf = calloc(zLen + 4 + 1, 1);
+            byte[] buf = new byte[zLen + 4];
             int i = 0; while (i < zLen) { buf[i] = z[i] & 255; i = i + 1; }
             buf[zLen] = (ct >> 24) & 255; buf[zLen+1] = (ct >> 16) & 255;
             buf[zLen+2] = (ct >> 8) & 255; buf[zLen+3] = ct & 255;
-            string h = Sm3.Hash(buf, zLen + 4);
+            byte[] h = Sm3.Hash(buf, zLen + 4);
             int j = 0;
             while (j < 32 && pos < klen) { outb[pos] = h[j] & 255; pos = pos + 1; j = j + 1; }
-            free(buf); free(h);
             ct = ct + 1;
         }
         return outb;
@@ -202,62 +193,60 @@ class Sm2 {
 
     /// <summary>SM2 public-key encrypt (C1C3C2, with a 0x04 prefix on C1).
     /// k is a per-message secret. outLen[0] receives the ciphertext length.</summary>
-    static string Encrypt(string msg, int msgLen, BigInt px, BigInt py, BigInt k, List<int> outLen) {
+    static byte[] Encrypt(string msg, int msgLen, BigInt px, BigInt py, BigInt k, List<int> outLen) {
         init();
         List<BigInt> C1 = toAffine(scalarMul(k, gPoint()));
         List<BigInt> pub = pt(px, py, BigInt.one());
         List<BigInt> kP = toAffine(scalarMul(k, pub));
-        string z = calloc(65, 1);
+        byte[] z = new byte[64];
         writeBE32(z, 0, kP[0]); writeBE32(z, 32, kP[1]);
-        string t = kdf(z, 64, msgLen);
+        byte[] t = kdf(z, 64, msgLen);
 
         int total = 1 + 64 + 32 + msgLen;
-        string outb = calloc(total + 1, 1);
+        byte[] outb = new byte[total];
         outb[0] = 4;
         writeBE32(outb, 1, C1[0]); writeBE32(outb, 33, C1[1]);
         // C3 = SM3(x2 || M || y2)
-        string c3in = calloc(64 + msgLen + 1, 1);
+        byte[] c3in = new byte[64 + msgLen];
         writeBE32(c3in, 0, kP[0]);
         int i = 0; while (i < msgLen) { c3in[32 + i] = msg[i] & 255; i = i + 1; }
         writeBE32(c3in, 32 + msgLen, kP[1]);
-        string c3 = Sm3.Hash(c3in, 64 + msgLen);
+        byte[] c3 = Sm3.Hash(c3in, 64 + msgLen);
         i = 0; while (i < 32) { outb[65 + i] = c3[i] & 255; i = i + 1; }
         // C2 = M xor t
         i = 0; while (i < msgLen) { outb[97 + i] = (msg[i] & 255) ^ (t[i] & 255); i = i + 1; }
-        free(z); free(t); free(c3in); free(c3);
         outLen[0] = total;
         return outb;
     }
 
     /// <summary>SM2 decrypt of a C1C3C2 ciphertext (0x04-prefixed C1). Returns the
     /// plaintext; outLen[0] receives its length (-1 if the C3 check fails).</summary>
-    static string Decrypt(string cph, int cphLen, BigInt d, List<int> outLen) {
+    static byte[] Decrypt(string cph, int cphLen, BigInt d, List<int> outLen) {
         init();
         int msgLen = cphLen - 97;
         BigInt x1 = BigInt.FromBytesBE(sliceBE(cph, 1), 32);
         BigInt y1 = BigInt.FromBytesBE(sliceBE(cph, 33), 32);
         List<BigInt> C1 = pt(x1, y1, BigInt.one());
         List<BigInt> kP = toAffine(scalarMul(d, C1));
-        string z = calloc(65, 1);
+        byte[] z = new byte[64];
         writeBE32(z, 0, kP[0]); writeBE32(z, 32, kP[1]);
-        string t = kdf(z, 64, msgLen);
-        string m = calloc(msgLen + 1, 1);
+        byte[] t = kdf(z, 64, msgLen);
+        byte[] m = new byte[msgLen];
         int i = 0; while (i < msgLen) { m[i] = (cph[97 + i] & 255) ^ (t[i] & 255); i = i + 1; }
         // verify C3
-        string c3in = calloc(64 + msgLen + 1, 1);
+        byte[] c3in = new byte[64 + msgLen];
         writeBE32(c3in, 0, kP[0]);
         i = 0; while (i < msgLen) { c3in[32 + i] = m[i] & 255; i = i + 1; }
         writeBE32(c3in, 32 + msgLen, kP[1]);
-        string c3 = Sm3.Hash(c3in, 64 + msgLen);
+        byte[] c3 = Sm3.Hash(c3in, 64 + msgLen);
         int diff = 0;
         i = 0; while (i < 32) { diff = diff | ((c3[i] & 255) ^ (cph[65 + i] & 255)); i = i + 1; }
-        free(z); free(t); free(c3in); free(c3);
         if (diff == 0) { outLen[0] = msgLen; } else { outLen[0] = -1; }
         return m;
     }
 
-    static string sliceBE(string src, int off) {
-        string b = calloc(33, 1);
+    static byte[] sliceBE(string src, int off) {
+        byte[] b = new byte[32];
         int i = 0; while (i < 32) { b[i] = src[off + i] & 255; i = i + 1; }
         return b;
     }

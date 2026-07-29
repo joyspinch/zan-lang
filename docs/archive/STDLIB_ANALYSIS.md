@@ -1,17 +1,17 @@
-# Zan 标准库能力分析 (Stdlib Capability Analysis)
+# Zan 标准库能力分析 (Stdlib Capability Analysis) — 历史归档
 
-> **状态更新（2026-07）：本文档的大部分"缺失"结论已过时，仅作历史参考。**
-> 现状核实（以 `stdlib/` 代码为准）：
-> - LINQ：`System/Linq/Enumerable.zan` 已存在（方法链），另有 conformance 测试（`linq_chained`、`generics_linq`）。
-> - 集合：`System/Collections/` 已有 `HashSet` / `Queue` / `Stack` / `LinkedList`。
-> - `DateTime.zan` / `TimeSpan.zan` / `Random.zan` 已存在。
-> - IO/Process：已通过 `DllImport("crt")` 抽象跨平台（msvcrt / libc 双端），不再仅 Windows。
-> - 网络：`System/Net/` 已有 Http / WebSocket / Mqtt / Tls / Sockets / Sse / Rpc 子模块。
-> - 数据库：`System/Data/` 已有 DbConnection + MySql / Postgres / Sqlite / Redis / Orm / ZanDb。
-> - 线程：可真正启动线程（见 `tests/conformance/thread_start.zan`），并有 AsyncGate / AsyncRwLock 等原语。
-> - 文本：`Encoding.zan` 已扩充（约 14 KB）；Regex 仍缺。
+> **已归档（2026-07-29），不再维护。** 本文是一次早期能力盘点，其大部分"缺失"结论已过时，仅作历史参考。
+> 当前标准库覆盖面以 `stdlib/` 源码与 `docs/STDLIB.md` 为准。
 >
-> **仍然成立的系统性短板**：失败静默返回空串/0、缺乏贯穿的异常（try/throw）或 Result 约定；Regex 缺失；部分模块仍偏薄。
+> 已过时/已被推翻的主要结论（以 `stdlib/` 代码为准核实）：
+> - LINQ 已存在（`System/Linq/Enumerable.zan`）；集合已有 `HashSet`/`Queue`/`Stack`/`LinkedList`；
+>   `DateTime`/`TimeSpan`/`Random` 已存在；IO/Process 已用 `DllImport("crt")` 抽象跨平台（非仅 Windows）；
+>   网络已有 Http/WebSocket/Mqtt/Tls/Sockets/Sse/Rpc；数据库已有 MySql/Postgres/Sqlite/Redis/Orm/ZanDb；
+>   线程可真正启动并有 AsyncGate/AsyncRwLock 等原语。
+> - **Regex 已存在**（`stdlib/System/Text/RegularExpressions/`，见 TASKS.md B4-3），非本文所称"仍缺"。
+>
+> 本文遗留的**唯一仍成立的系统性短板**——失败静默返回空串/0、缺乏贯穿的异常/Result 约定——
+> 在 `TASKS.md` 的 **B4-2** 跟踪。以下原正文原样保留，未作改动。
 
 
 > 目标：盘点 zan-lang 当前"常用标准库"的真实覆盖面，找出与 C#/.NET 级别常用库的差距（含 ORM、LINQ 等），并给出分优先级的补全建议。

@@ -3,6 +3,10 @@
 目标：**发布出去的程序只依赖 zan 本身**——开发者拿到 zan 就能 `zanc app.zan -o app.exe`，
 **无需安装 clang / gcc / MSVC / Windows SDK**；编译出来的可执行文件也**只依赖操作系统自带的系统库**。
 
+> **路线文档关系**：本文件是自包含工具链的技术设计与落地状态，被 `docs/PRODUCTION_PLAN.md`
+> 阶段 5（跨平台）与 `docs/EXECUTION_PLAN.md` 引用作为技术依据。顶层执行索引见
+> `docs/EXECUTION_PLAN.md`；历史里程碑 `ROADMAP.md` 已归档到 `docs/archive/`。
+
 ---
 
 ## 1. 结论（Windows，已落地并验证）

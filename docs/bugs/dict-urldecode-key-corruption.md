@@ -1,5 +1,7 @@
 # Dictionary keys corrupted when built from Split + Substring + UrlDecode
 
+**Status:** Fixed (2026-07-27) — A8-2 (use-after-free / heap corruption). See TASKS.md A8-2.
+
 ## Summary
 
 Building a `Dictionary<string, string>` whose keys come from

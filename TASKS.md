@@ -838,15 +838,15 @@ catch 块内的挂起、foreach 的降级与状态切分冲突。所以是**定�
 
 ## B1 大体量模块的改造（**都不搬走**）
 
-* **B1-1** `stdlib/Sdk/Jd`（428 文件 / 519KB / 1.1 万行）从命名看是生成器直出
-  （`Domain` 212 文件，还有 `Test774`、`GetThirdPdfByOrderIdForVender`、
-  `UserRelatedRpcI18nService` 这类名字）。改造方向是**建立/恢复代码生成器让它可再生**，
-  而不是手工维护 1.1 万行：从官方 API 描述生成 + 一层手写的公共层
-  （HTTP / JSON / 签名认证 / 重试 / 错误映射 / 分页）。生成代码与手写封装分目录隔离。
-  **判定**：删掉生成目录重跑生成器，`conf_sdk_jd` / `conf_sdk_jd_api` /
-  `conf_sdk_jd_client` 三个用例依旧通过。
-  另有两个空目录 `Sdk/jos-net-open-api-sdk-2.0`、`Sdk/Tb`，删掉。
-  （注：`stdlib/Sdk/` 目前整个未纳入 git。）
+* **B1-1 ✅ 已完成（2026-07-29）：Sdk/Jd 代码生成器验证 + 清理。**
+  `scripts/generate_jd_sdk.py`（362 行）从 `stdlib/Sdk/jos-net-open-api-sdk-2.0/`（724 个 C# 文件，
+  未纳入 git）读取原版 SDK，生成 `Domain/`（212）+ `Api/`（255）共 467 个 Zan 文件。
+  **验证**：删除 `Domain/` + `Api/` → 重跑生成器 → 467/467 文件与原始输出**字节一致** →
+  `conformance_sdk_jd` / `sdk_jd_api` / `sdk_jd_client` / `sdk_jd_modules` **4/4 Passed**。
+  手写公共层（`JdClient`/`JdSign`/`JdRequest`/`JdResponse`/`JdException`，5 文件 ~20KB）
+  已与生成层目录隔离（生成器不碰根目录文件）。
+  删除空目录 `Sdk/Tb`。`Sdk/jos-net-open-api-sdk-2.0` 实为 724 个 C# 源文件（非空），
+  是生成器的输入源，保留不删。
 * **B1-2** `stdlib/Game`（75 文件 / 788KB / 2.1 万行代码，**只有 142 行文档注释**）：
   `Zgm` 380KB、`Arpg` 275KB、`Rts`、`Scene`、`Cards`、`Board`、`Arcade2D`。
   文档覆盖率 0.7% 是全库最低——**先补公开接口文档再谈提炼**，
@@ -881,12 +881,217 @@ catch 块内的挂起、foreach 的降级与状态切分冲突。所以是**定�
 输入参数仍声明为 `string`（`char*` 边界），`byte[]` 可直接传入，
 所以这次改造不需要动 key / iv / data 这些只读入参。
 
-* **B2-1（剩余）** `extern string calloc(...)` 仍在 **54 个文件**里，覆盖
-  `Cryptography`（Sha1 / Sha256 / Sha512 / Md5 / Hmac / Rsa / Sm2 / Sm3 / Sm4 /
-  Base64 / Hex / BigInt / Hkdf）、`Net`（TcpClient / Socket / UdpClient / WebSocket /
-  TlsStream / Mqtt）、`Data`（几乎每个驱动）、`IO`（File / Directory / Path）。
+**B2-1 第二批 ✅ 已完成（2026-07-29）：摘要 / 编码链 → `byte[]`。**
+把"哈希/编码返回裸 `calloc` 缓冲、调用方负责 `free`"这条链整体切成 `byte[]`
+（返回值受 ARC 管理，删掉全部对应 `free`）。
+
+* **哈希原语**：`Sha1` / `Sha256` / `Sha512` / `Md5` / `Sm3` 的 `Hash(...)` 由
+  `string`→`byte[]`；各类删掉 `[DllImport("crt")] extern string calloc` /
+  `extern void free`，工作缓冲 `calloc(plen+1,1)`→`new byte[plen]`、输出
+  `calloc(n+1,1)`→`new byte[n]`，删中间 `free(m)`；`wBE` / `wLE` 写入辅助的形参
+  `string`→`byte[]`。
+* **HMAC**：`Hmac.Compute` / `Sha256Mac` / `hashOf` → `byte[]`；`k0` / `inner` /
+  `outer` 用 `new byte[]`，删掉 ipad/opad/inner-hash 那批 `free`。
+* **Hex / Base64**：`Hex.Decode` / `Base64.Decode` → `byte[]`（删各自的
+  `extern string calloc`）；`Encode(buf, len)` 签名不变（入参按 `char*` 只读缓冲、
+  返回 `string`）。
+* **Hkdf.Extract → `byte[]`**（就是 HMAC-SHA256 结果）；`Expand` 内部 `t` / `msg`
+  改 `byte[]`、删中间 `free` 链。`Expand` / `Derive` 的**最终返回 `okm` 仍是
+  `calloc` 出的 `string`**（调用方按裸缓冲取用），留待后续批次，不在本批。
+* **Rsa / Sm2 的摘要局部**：`Rsa.hashOf` → `byte[]`，`EncryptOaep` / `mgf1` /
+  `emsaPkcs1Sha256` 里由哈希得来的 `lHash` / `h` 随之改、删其 `free`；`Sm2` 里
+  `Sm3.Hash` 结果 `za` / `eh` / `c3` / `h` → `byte[]`、删其 `free`。这两类**自身的
+  填充 / 密文输出缓冲仍是 `calloc`**（`Rsa` 的 OAEP/PKCS1 缓冲、`Sm2` 的密文），
+  本批只切摘要那一段。
+* **静态字段**：`Aes.sbox` / `Sm4.sbox` 由 `string`→`byte[]`（与本就是 `byte[]` 的
+  `Aes.inv` 对齐）。
+
+**调用点与 `free` 归属**（每批都连调用方一起改，这是本批的重点）：
+
+* **MySql**（`MySqlConnection`）：`scramble41` / `scrambleNative` 的 `a` / `b` / `c`
+  （Sha256/Sha1 链）→ `byte[]`，删 6 处 `free(a/b/c)`；`pemToDer` → `byte[]`，
+  其中 `der`（`Base64.Decode`）→ `byte[]`，删 full-auth 路径两处 `free(der)`。
+  自有 `calloc` 缓冲（`cat` / `tok` / `b64`）仍保留并照旧 `free`。
+* **Firebird**（`FbSrp` / `FbWire`）：`Sha1Of` / `Sha256Of` 从
+  `FbBytes.Own(Sha1.Hash(...), 20)` 改为 `FbBytes.CopyOf(...)`——摘要现在是 ARC 管理的
+  `byte[]`，不能再让 `FbBytes` 夺走所有权去 `free`。为此 `FbWire.zan` 新增
+  `FbBytes.CopyOf(src, len)`：把调用方仍持有的缓冲拷进受计数的块。
+* **Wechat**：`JdSign` / `CheckSignature` / `WXBizMsgCrypt.MsgSignature` 的 `digest`
+  （Sha1/Md5）→ `byte[]`，直接喂 `Hex.Encode`；`WechatPayV2.Sign`（含 HMAC 分支）的
+  `digest`、`DecodeRefundReqInfo` 的 `md5` / `encrypted`、`WechatPayV3Client` 的
+  `encrypted`、`WXBizMsgCrypt` 的 `aesKey` 字段 / `key` / `cipher` → `byte[]`；
+  对密文按块切片由 `.Substring(off,16)` 改为 `byte[]` 上的 `.ToStr(off,16)`。
+* **ResourcePack**：`nameHash` 的 `h`（Sha256）、writer 的 `nBuf` / `dBuf`、verify 的
+  `nBuf` / `eBuf`（`Hex.Decode`）→ `byte[]`，删对应 `free`。
+* **examples**（ra2）：`MapPack.Decode` 的 `raw`（`Base64.Decode`）→ `byte[]` 删
+  `free`；`WsKey.ModulusBytes` 的 `blob` → `byte[]` 删 `free`。
+* **tests**：`byte_buffer` / `crypto_digests` / `respack_roundtrip` 里 `Hex.Decode`
+  结果 → `byte[]`、打印改 `.ToStr()`，删示例里的 `free(shareA/shareB)`。
+
+〔已实测〕`ctest --test-dir build`（conformance / determinism / leakcheck 三档都跑）：
+`byte_buffer`、`encoding_base64`、`crypto_digests`、`respack_roundtrip`、
+`mysql_auth_vectors`、`mysql_stmt_binary`、`firebird_wire`、
+`sdk_wechat`(+`_crypt`/`_mp_modules`/`_product_modules`/`_special_modules`/`_tenpay`)
+**全部 Passed，leakcheck 无泄漏**。ra2 示例按 `examples/game/ra2/build.sh` 全量
+（76 文件）编译通过。
+
+**B2-1 第三批 ✅ 已完成（2026-07-29）：Hkdf 链 → `byte[]`。**
+第二批把 `Hkdf.Extract` 切成 `byte[]`，但 `Expand` / `Derive` 的最终 `okm` 仍是
+`calloc` 出的 `string`（当时留作后续）。本批把这条链收尾：
+
+* `Hkdf.Expand` / `Derive` → `byte[]`：`okm` 由 `calloc(outLen+1,1)` 改成
+  `new byte[outLen]`；`Hkdf` 不再需要 `[DllImport("crt")] extern string calloc` /
+  `extern void free`，两条 import 一并删除（`Expand` 内部的 `t` / `msg` 第二批已是
+  `byte[]`）。
+* **调用点与 `free` 归属**（`Hkdf.Derive` 全库仅 `ResourcePack` 两处用）：
+  `ResourcePack.indexKey` / `entryKey` 返回类型 `string`→`byte[]`；writer 的 `ik` /
+  `ek`、reader `Open` 的 `ik`、`Read` 的 `ek` 全部改 `byte[]`，删掉对应的
+  `free(ik)` / `free(ek)`（派生密钥现在由 ARC 管理）。`AesGcm.Encrypt` / `Decrypt`
+  的 `key` 仍是 `string`（`char*` 只读边界），`byte[]` 直接传入不用改签名。
+  `entryKey` 里的 `info` 仍是自有 `calloc` 缓冲，照旧 `free(info)`。
+
+〔已实测〕`respack_roundtrip` conformance / determinism / leakcheck 三档全 **Passed，
+无泄漏**。
+
+**B2-1 第四批 ✅ 已完成（2026-07-29）：Rsa 内部填充缓冲 → `byte[]`（自成一批，
+无外部调用点变化）。**
+
+* `Rsa.zan` 里所有 `calloc` 出的填充缓冲全部改 `new byte[...]`：`mgf1` 的
+  `mask`/`buf`、`EncryptOaep`/`DecryptOaep` 的 `db`/`maskedDb`/`maskedSeed`/`seed`/
+  `outb`、`EncryptPkcs1`/`DecryptPkcs1` 的 `em`/`outb`、`emsaPkcs1Sha256` 的 `em`、
+  `sha256DigestInfo` 的 `di`。相应删掉这些缓冲的 `free`。**`Rsa` 不再调用
+  `calloc`，删掉 `[DllImport("crt")] extern string calloc`。**
+* **`free` 归属**：`ModExp` 仍返回 `BigInt.ToBytesBE` 的 `calloc` 字符串（`BigInt`
+  未改），所以 `DecryptOaep` / `DecryptPkcs1` 的 `free(em)` 和 `VerifyPkcs1Sha256`
+  的 `free(em2)`（都是 `ModExp` 结果）**保留**，`extern void free` 仍留着。等 B2-1
+  的 BigInt 批把 `ToBytesBE` 翻成 `byte[]` 时再一并删掉这三处 `free` 和 import。
+* **返回类型**：`DecryptOaep` / `DecryptPkcs1` / `mgf1` / `emsaPkcs1Sha256` /
+  `sha256DigestInfo` → `byte[]`；`EncryptOaep` / `EncryptPkcs1` / `SignPkcs1Sha256`
+  仍返回 `string`（`ModExp`/BigInt 结果，调用方照旧 `free`）。`DecryptOaep`/
+  `DecryptPkcs1` 全库无调用点，故本批不触碰任何外部文件。
+
+〔已实测〕`cmake --build` 重建 stdlib（stamp 刷新）后重跑，强制重新编译（非缓存）：
+`crypto_digests` / `mysql_auth_vectors` / `respack_roundtrip` / `sdk_wechat_tenpay`
+（后三者经 RsaKey/MySql 认证/微信支付实际走 RSA）conformance / determinism /
+leakcheck **12/12 全 Passed，无泄漏**。
+
+**B2-1 第五批 ✅ 已完成（2026-07-29）：Sm2 全部字节缓冲 → `byte[]`（`calloc` 与
+`free` import 双双删除）。**
+
+* `Sm2.zan` 里所有 `calloc` 缓冲改 `new byte[...]`：`fromInt` 的 `b`、`computeE`
+  的 `zin`/`ein`、`kdf` 的 `outb`/`buf`、`Encrypt`/`Decrypt` 的 `z`/`outb`/`m`/
+  `c3in`、`sliceBE` 的 `b`。**Sm2 不再有任何 `calloc`/`free`，两条 import 全删。**
+* **返回类型**：`Encrypt` / `Decrypt` / `kdf` / `sliceBE` → `byte[]`；`writeBE32`
+  的 `dst` 保持 `string`（`char*` 只读边界，`byte[]` 直接写入）。`Sm2.Encrypt` /
+  `Decrypt` 全库无调用点、无测试引用，故本批不触碰外部文件。
+* **验证难点**：Sm2 目前无任何测试且无 stdlib/examples 调用点，`cmake --build` 只
+  stamp 不编译它。为此写了 `_scratch/sm2_check.zan`（encrypt→decrypt 往返 +
+  sign/verify 往返），`build\zanc.exe` 编译 30 文件通过，运行输出 `ENC_OK` /
+  `SIG_OK`；scratch 用后即删，未留产物。
+
+〔遗留〕`writeBE32` 里 `v.ToBytesBE(32)` 仍是未释放的 `calloc` 字符串（`BigInt`
+本批未动，这是既有小泄漏）。待 `BigInt.ToBytesBE → byte[]` 批一并消除。
+
+**B2-1 第六批 ✅ 已完成（2026-07-29）：Sm4 全部字节缓冲 → `byte[]`（`calloc` 与
+`free` import 双双删除）。**
+
+* `Sm4.zan` 里所有 `calloc` 缓冲改 `new byte[...]`：`EncryptBlock`/`DecryptBlock`
+  的 `o`、`EncryptCbc`/`DecryptCbc` 的 `outb`/`prev`/`blk`/`ob`。删掉循环内
+  `free(blk)`/`free(ob)` 和 `free(prev)`。**Sm4 不再有任何 `calloc`/`free`，两条
+  import 全删。**
+* **返回类型**：`EncryptBlock` / `DecryptBlock` / `EncryptCbc` / `DecryptCbc` →
+  `byte[]`；`cryptBlock` 的 `out16` 保持 `string`（`char*` 写边界，`byte[]` 直写）。
+  Sm4 全库无调用点、无测试引用，本批不触碰外部文件。
+* **验证**：同 Sm2，Sm4 无测试无调用点。写 `_scratch/sm4_check.zan`：GB/T
+  32907-2016 单块已知答案（key=plaintext=`0123456789abcdeffedcba9876543210` →
+  `681edf34d206965e86b3e94f536e4246` ✔）+ 块解密往返（`BLK_OK`）+ CBC/PKCS#7
+  往返（`CBC_OK`）。`build\zanc.exe` 编译 30 文件通过；scratch 用后即删。
+
+**B2-1 第七批 ✅ 已完成（2026-07-29）：`BigInt.ToBytesBE → byte[]`，收尾整条
+Cryptography 链（横跨 5 个文件的调用点，并清掉 `Rsa` 最后的 `free` import）。**
+
+* `BigInt.zan`：`ToBytesBE` 返回 `byte[]`，`outb = new byte[outLen]`，删 `BigInt`
+  唯一的 `extern string calloc`。**`BigInt` 从此无 `calloc`。**
+* `Rsa.zan`：`ModExp` 及 `EncryptOaep`/`EncryptPkcs1`/`SignPkcs1Sha256`（都 `return
+  ModExp(...)`）返回类型 `string → byte[]`；`DecryptOaep`/`DecryptPkcs1` 的局部
+  `em`、`VerifyPkcs1Sha256` 的 `em2` 由 `string` 改 `byte[]`，删掉这三处 `free`。
+  **`Rsa` 现在无任何 `calloc`/`free`，删掉最后的 `extern void free` import。**
+* **调用点（5 处）**：
+  - `RsaKey.SignSha256`/`EncryptOaepSha1`：`sig`/`encrypted` → `byte[]`，直传
+    `Base64.Encode`（原本就没 `free`，是既有泄漏，本批顺带修掉）。
+  - `MySqlConnection.fullAuthCipher`：返回 `byte[]`，`cph` → `byte[]`；调用方
+    `doConnect` 的 `cipher` → `byte[]`，删 `free(cipher)`。
+  - `ResourcePack`（writer）：`sig` → `byte[]`，删 `free(sig)`（reader 侧 `sig` 来自
+    `File.ReadBytes`、仍是 `calloc`，`free` 保留，不动）。
+  - `FbSrp.Minimal`：`raw` → `byte[]`，删 `FbBytes.Free(raw)`。
+  - `WsKey`（ra2 示例）：`plain` → `byte[]`，删 `free(plain)`。
+* 顺带消除第五批遗留的 `Sm2.writeBE32` 里 `v.ToBytesBE(32)` 未释放 `calloc` 小泄漏
+  （现在是 ARC `byte[]`）。
+
+〔已实测〕`cmake --build` 重刷 stdlib stamp 后，`firebird_wire`（走 FbSrp）/
+`mysql_auth_vectors`（走 OAEP 全认证）/ `respack_roundtrip`（走 Pkcs1 签验）/
+`sdk_wechat_tenpay`（走 RSA）conformance / determinism / leakcheck **12/12 全
+Passed，无泄漏**（determinism_wechat 17s、确系重新编译非缓存）。
+另：`DecryptOaep`/`DecryptPkcs1`/`EncryptPkcs1` 全库无调用点无测试（死代码），为
+验证 `em` 翻 `byte[]`，用本机 openssl 生成 1024-bit 测试密钥写
+`_scratch/rsa_check.zan` 做 OAEP + PKCS#1 加解密往返 → `OAEP_OK` / `PKCS1_OK`；
+ra2 示例 76 文件编译通过（验证 `WsKey`）；scratch 用后即删。
+
+**B2-1 第八批 ✅ 已完成（2026-07-29）：IO 链——`File.ReadBytes → byte[]`，
+`ReadAllText`/`Copy` 内部缓冲改 `byte[]`，`File` 从此无 `calloc`/`free`；连带把
+`ResourcePack` reader、Game.Rts / ra2 的二进制读取链一起翻过来。**
+
+* `stdlib/System/IO/File.zan`：删掉 `extern string calloc` / `extern void free`
+  两个 import。`ReadAllText`：`buf = new byte[size]`，按 `fread` 实际读到的字节数
+  `buf.ToStr(0, got)` 返回（原来直接返回 `calloc` 缓冲，靠 NUL 结尾）。`Copy`：
+  `buf = new byte[len]`，删 `free(buf)`。`ReadAllLines`：删 `free(content)`
+  （`ReadAllText` 现在返回 ARC 串）。**`ReadBytes` 返回类型 `string → byte[]`**，
+  `new byte[count]` 零初始化、自带长度、能保住内嵌 NUL，调用方不再释放。
+* `stdlib/System/Resources/ResourcePack.zan`（reader）：`hdr`/`idxCt`/`sig`/`ct`
+  改 `byte[]`，删掉这四处 `free`（`packId`/`idxIv`/`idxTag`/`nh`/`iv`/`tg` 仍是
+  自己 `calloc` 的小缓冲，所有权不变，`free` 保留）。
+* `Game.Rts.Formats`：`Binary.FromFile`、`Pal.FromFile` 的 `buf → byte[]`
+  （`FromBuffer`/`Parse` 形参仍是 `string`，直接接 `byte[]`）。
+* ra2 示例（同一条链，按用户要求一并改）：`Mix.zan` 的 `data` 字段 → `byte[]`、
+  `ReadFile`/`ReadEntry` 返回 `byte[]`（miss 返回 `new byte[0]`）、`FromBuffer`
+  形参 → `byte[]`、`CharOf` 用 `new byte[1].ToStr(0,1)`、`ComputeHeaderLength`/
+  `ParseEncrypted` 的临时缓冲 → `byte[]`，**`Mix` 无 `calloc`**（`free(key)` 保留，
+  那是 `WsKey.Decrypt` 的 `calloc` 结果）；`Close()` 改成把 `data` 置 null；
+  `Vfs.Read → byte[]`；`AssetDb`（4 处 `raw` + 删 3 处 `free`，`extern free` 已成
+  死 import 一并删）、`Theater`（删 `free(raw)` 2 处，`ei`/`idx` 来自 `TmpTemplate`
+  的 `calloc`，`free` 保留）、`Screens.LoadPcx`（删 `free(raw)` 与死 import）、
+  `tests/mix.zan`（`BuildMix → byte[]`，删 `calloc`，`ini.Substring → ini.ToStr`）。
+* `src/ide_zan/AssetManager.zan`：`packAddTree`/`PackAssets` 的 `data → byte[]`
+  （writer 的 `Add` 不接管释放，原本也没 `free`）。
+* `tests/conformance/io_errors.zan`：`ReadBytes` 的返回变量 → `byte[]`。
+
+〔已实测〕`byte[]` 与 `string` 的布局兼容，因此**不必把下游 `string data` 形参/
+字段全部翻掉**：探针 `_scratch/b28_probe*.zan` 验证 `byte[]` 传给 `string` 形参、
+存进 `string` 字段、以及在其上调 `.Length`/`Substring`/`IndexOf` 全部正确
+（`"abcdef".ToBytes()` → `len=6 sub=bcd idx=2`），200 次循环 `--check-leaks`
+无泄漏（说明 `string` 槽位释放 `byte[]` 也走对了引用计数路径）。
+全库确认无任何地方 `free()` `ReadAllText`/`ReadBytes` 的返回值。
+targeted：`io_errors` / `respack_roundtrip` / `rts_{ini,pal,shp,tmp,csf}_parse` 的
+conformance / determinism / leakcheck **21/21 Passed**；随后跑全量 `ctest`
+（711 项，`-j 8` 有 35 项因端口/临时文件互抢而 Fail，逐个串行重跑 **35/35
+Passed**）；ra2 示例 76 文件、ZanIDE 186 文件编译通过；
+`examples/game/ra2/tests/mix.zan --check-leaks` 运行正确、无泄漏。
+（注：该用例三个哈希与 `expected_mix.out` 不符、`h_rules` 还是负数，说明
+`& 0xFFFFFFFF` 掩码在某次改动后失效——**与本批无关**：`_scratch/b28_hash.zan`
+把新旧两版 `CharOf`（`calloc` vs `new byte[1].ToStr`）并排跑，
+`old_lmd == new_lmd == 272478703`、`old_rules == new_rules == -414863318`，
+逐字相同。按用户「RA2 先不管」暂不处理，记在这里备查。）
+
+* **B2-1（剩余）** `extern string calloc(...)`：stdlib **36 个文件**
+  （另 tests 13、examples 16、src 3；旧口径记的 41 未含全部目录）
+  （第二批消掉 Sha1 / Sha256 / Sha512 / Md5 / Sm3 / Hmac / Hex / Base64 八个，
+  第三批 `Hkdf`，第四批 `Rsa`，第五批 `Sm2`，第六批 `Sm4`，第七批 `BigInt`）。
+  **`Cryptography` 目录整条 `calloc` 链清完**（`Rsa` 也无 `free` 了）。剩下的都在
+  `Net`（TcpClient / Socket / UdpClient / WebSocket / TlsStream / Mqtt）、
+  `Data`（几乎每个驱动）、`IO`（File / Directory / Path）。
   按"一条调用链一批"继续：改一个类的内部缓冲很容易，难的是它的返回值
-  被谁 `free`——所以每批都要连调用方一起改（Aes 这批即是范例）。
+  被谁 `free`——所以每批都要连调用方一起改（Aes、摘要链、Hkdf、Rsa、Sm2、Sm4、
+  BigInt 即是范例）。
 
 〔已实测〕**这个惯用法是有意设计、有 conformance 覆盖的，不是内存安全 bug。**
 `tests/conformance/ffi_free_consumes_string.zan` 专门测它：`calloc` 返回的 buffer
@@ -895,16 +1100,108 @@ catch 块内的挂起、foreach 的降级与状态切分冲突。所以是**定�
 `Substring` / `IndexOf` / 拼接 / 当 Dictionary key / 200 次循环 `--check-leaks`，
 全部正确、`Length` 正确、无泄漏报告。**所以这是提炼问题不是安全问题。**
 
-* **B2-2** `stdlib/System/IO/Path.zan` 是纯字符串处理，却整个建在
-  `strrchr` / `strcpy` / `strcat` / `calloc` 上（`GetFileName` 用
-  `strlen(lastBslash) < strlen(lastSlash)` 比长度判断哪个分隔符靠后）。
-  逻辑正确，但用 Zan 的 `IndexOf` / `LastIndexOf` / `Substring` 写会短很多、
-  不需要手动管理缓冲区。同类：`Directory.zan`（拼路径）、`Process.zan`（拼命令行）。
-* **B2-3** `strcat` / `strcpy` / `strrchr` / `strncpy` / `strlen` 换成 Zan string API；
-  `atoi` / `atof`（`DbResult.zan:115`、`Windows.zan`）换成 Zan 实现的数值解析。
-* **B2-4** `crt` 那 207 个 import 要分三类处理：真 libc 原语（`fopen`/`read`/`opendir`，
-  **保留**）、被当 intrinsic 用的 `NativeMemory`（A1 后删）、
-  本该用 Zan 写的字符串/数值函数（B2-3 删）。
+* **B2-2 ✅ 已完成（2026-07-29）：`stdlib/System/IO/Path.zan` 全部脱离手动缓冲。**
+  复核发现字符串操作方法（`GetFileName` / `GetExtension` / `GetDirectoryName` /
+  `ChangeExtension` / `Normalize` …）此前已用 Zan 的 `LastIndexOf` / `Substring`
+  重写过（见 `path_api.zan` 注释「irgen used to lower these calls itself」），
+  唯一残留 `calloc` 是 `GetTempPath` 的 Windows 分支：
+  `string buf = calloc(4096,1); WinGetTempPath(4096, buf); return buf;`
+  ——OS 把路径写进 buffer，返回时靠 strlen 截断、且 buffer 从不 `free`（既有泄漏）。
+  改为 `byte[] buf = new byte[4096]; int n = WinGetTempPath(4096, buf);
+  return buf.ToStr(0, n);`——按 API 返回的字符数精确截断，不再泄漏。
+  **删掉 `Path` 的 `extern string calloc`，`Path` 从此零手动分配。**
+  〔已实测〕重刷 stamp 后 `path_api` conformance/determinism/leakcheck **3/3 全
+  Passed 无泄漏**；`GetTempPath` 无测试覆盖，用 `_scratch/temp_check.zan` 直测得
+  `C:\Users\QQ\AppData\Local\Temp\`（`Length=31`、无尾部 NUL 垃圾），scratch 即删。
+  `extern string calloc` 文件数 41 → **40**。
+
+  **「同类 Directory/Process」改并入 B2-3**：`Directory.zan` / `Process.zan` 的残留
+  `calloc` 不是纯字符串处理，而是宽字符互操作（`winWide`/`winUtf8` 的 UTF-16↔UTF-8
+  转换缓冲、`WIN32_FIND_DATAW` 结构缓冲）和 `strcpy`/`strcat`/`strlen` 拼接，
+  与 B2-3 的字符串原语替换深度耦合、无法当作「纯 Zan string API 重写」单独抽出，
+  故随 B2-3 一起处理（届时 `winWide`/`GetCurrentDirectory`/`winList` 的 OS 写入
+  缓冲同样按 `byte[]`+`ToStr` 收口）。
+* **B2-3 ✅ 已完成（2026-07-29）：字符串原语 + `atoi`/`atof` 全部换成 Zan 实现，
+  Directory/Process 宽字符互操作按 `byte[]`+`ToStr` 收口。**
+
+  **数值解析（`atoi`/`atof` → 纯 Zan）**：以 `Encoding.ParseInt` / `Encoding.ParseDouble`
+  为唯一实现（原本只是 `atoi`/`atof` 的薄包装），改写成纯 Zan 解析（按 C `atoi`/`atof`
+  语义：跳前导空白、可选符号、十进制数字；`ParseDouble` 另支持小数与 `e`/`E` 指数）。
+  其余调用点全部改走这两个 helper 并删掉各自的 `extern`：
+  `Json.zan`（`GetInt`/`GetDouble`，删 `atoi`/`atof`/**未用的 `strncpy`**，加
+  `using System.Text`）、`DbResult.zan:GetDouble`（删 `atof`）、
+  `Postgres/PostgresConnection.zan`（4 处 `atoi(PQcmdTuples)`，删 `atoi`）、
+  `Platform/Windows.zan`（`atoi`/`atof` 是**无调用的死 import**，直接删）。
+  `DbResult.GetInt` 仍用 `Convert.ToInt`（编译器 intrinsic，非本批要删的 `atoi` extern），
+  不在本批范围，保留。
+  〔实测〕`_scratch/b23_check.zan`：`ParseInt("  -17abc")=-17`、`ParseInt("+9")=9`、
+  `ParseInt("")=0`、`ParseDouble("-2.5e3")=-2500`、`ParseDouble("1.5E-2")=0.015`，与
+  atoi/atof 一致。
+
+  **字符串原语 + 宽字符缓冲（Directory / Process）**：
+  - `Process.zan`：`WinSpawn` 的 `cmdline` 从 `calloc`+`strcpy`+`strcat` 改成 Zan 拼接
+    `"cmd.exe /c " + command`；`STARTUPINFOA`/`PROCESS_INFORMATION`/退出码等结构缓冲
+    从 `calloc string` 改 `byte[]`（OS 直接写入，`si[0]=104` 取代 `memset`）；
+    `WinCapture` 的临时目录改调已 Zan 化的 `Path.GetTempPath()`（顺带去重、消掉一处
+    从不 free 的泄漏）；POSIX `RunCapture` 读缓冲改 `byte[]`+`ToStr(0,n)`。
+    **`Process` 从此零 `calloc`/`free`**，删掉 `strcpy`/`strcat`/`strlen`/`memset`/
+    `WinGetTempPath`/`calloc`/`free` 七个 import。
+  - `Directory.zan`：`winWide` 返回 `byte[]`（UTF-16 缓冲）、`winUtf8` 内部改 `byte[]`
+    并按 `count-1` 精确 `ToStr`（消掉之前 winUtf8 结果从不 free 的泄漏）、
+    `GetCurrentDirectory` 的 Windows 宽缓冲与 POSIX `getcwd` 缓冲都改 `byte[]`
+    （POSIX 手动扫 NUL 求长度）；`winList` 的 `pattern` 与 POSIX 探测路径 `full`
+    改成 Zan 拼接（`path + "\\*"` / `path + "/" + name`），删 `strcpy`/`strcat`/`strlen`。
+    **唯一保留的 `calloc` 是 `WIN32_FIND_DATAW` 结构缓冲**（592 字节、`FindFirstFileW`
+    直接写入的原生结构，非文本，`winName` 靠字节偏移 `Substring(44,520)` 取 `cFileName`）
+    ——这属于 B2-4「真结构互操作」范畴，留给结构布局能力就绪后再处理，故 `Directory`
+    仍持 `calloc`/`free` 两个 import。
+  〔实测〕重刷 stamp 后 `crossplat_stdlib`/`io_errors`/`json_entity_mapping`/`json_errors`/
+  `encoding_base64`/`ws_accept`/`db_null_distinct`/`db_pool`/`pg_params_syntax`
+  三档共 **27/27 全 Passed 无泄漏**；`_scratch/b23_check.zan` 直测
+  `Directory.GetCurrentDirectory/GetFiles/GetDirectories` 与
+  `Process.RunCapture("echo …")` 全部正确、`--check-leaks` 无报告。
+  `extern string calloc` 文件数（stdlib）40 → **39**（`Process` 出表，`Directory` 因
+  结构缓冲仍在表）。
+* **B2-4 ✅ 已完成（2026-07-29）：`[DllImport("crt")]` 全库盘点 + 分类，删掉死 import。**
+  实测全库 `[DllImport("crt")]` 共 **322 条**（不是先前估的 207），按用途分四类：
+
+  1. **真 libc / OS 原语（保留）**——无法用 Zan 表达、长期保留：
+     文件 I/O（`fopen`/`fclose`/`fread`/`fwrite`/`fputs`/`fgets`/`fgetc`/`fputc`/`fseek`/
+     `ftell`/`fflush`/`remove`/`rename`/`unlink`/`open`/`close`/`read`/`write`/`lseek`/
+     `pread`/`pwrite`/`fsync`/`_commit`/`_flushall`/`ftruncate`/`_locking`/`flock`/`ioctl`/
+     `fcntl`/`readlink`/`getcwd`/`chdir`/`mkdir`/`rmdir`/`opendir`/`closedir`/`readdir` 及
+     `_read`/`_write`/`_lseeki64`/`_fileno` 等 Windows 变体）、进程（`system`/`popen`/
+     `pclose`/`_popen`/`_pclose`/`getpid`/`exit`/`kill`/`sleep`/`usleep`/`ptrace`/`getuid`）、
+     环境与时间（`getenv`/`time`/`gettimeofday`/`clock_gettime`）、套接字（`socket`/`bind`/
+     `listen`/`accept`/`connect`/`send`/`recv`/`sendto`/`recvfrom`/`setsockopt`/`shutdown`/
+     `htons`/`htonl`/`ntohs`/`inet_addr`/`gethostbyname`）、线程同步原语（`pthread_mutex_*`/
+     `sem_*`/`dispatch_*`）、控制台（`puts`）。
+  2. **Zan C 运行时自有导出（保留，非 libc）**——`zan_file_*`/`zan_io_socket_*`/
+     `zan_shared_table_*`/`zan_atomic_int_*`/`zan_dispatch_*`/`zan_gate_*`/`zan_thread_start`/
+     `zan_monotonic_us`。它们是运行时导出，标 `"crt"` 只因与运行时同库链接；属运行时职责，
+     保留（library 名标注更准确的问题留给 ABI/文档层，不在本批）。
+  3. **`NativeMemory` intrinsic（已收编，勿散用）**——`NativeMemory.{Alloc,Free,Copy,Fill,
+     Compare,GetString,PutString,Crc32}`，文件头已注明「每个方法都是编译器 intrinsic，irgen
+     直接 lower 成单条 libc 调用，named library 从不真正链接」，是 raw off-heap 内存的规范入口。
+     散落各文件的裸 `calloc`/`free`/`memcpy`/`memset`/`memchr` extern 属**应逐步收编到
+     `NativeMemory` 或 `byte[]`/ARC** 的一类（与 B2-1 的 calloc→byte[] 主线同源）。
+  4. **应 Zan 化的字符串/数值（B2-3 已删）**——`strcpy`/`strcat`/`strncpy`/`strrchr`/`atoi`/
+     `atof` 全部已删；仅剩 `strlen`（9 处），用于取 null-terminated FFI 串或 Zan 串的**字节
+     长度**（`Encoding.GetByteCount` 等），与 `.Length`（字符数）语义不同，合理保留、逐处再议。
+
+  **本批安全动作**：删掉 9 个「只声明、全库从未调用」的死 crt import——
+  `File.zan` `fgetc`/`fgets`、`Socket.zan` `ioctl`/`memcpy`、`TcpClient.zan` `free`、
+  `UdpClient.zan` `calloc`、`PageFile.zan` `TruncateFd`(ftruncate)、
+  `Json.zan` `calloc`/`free`（B2-3 删 `strncpy` 后遗留的孤儿）。
+  〔实测〕重刷 stamp 后 `crossplat_stdlib`/`io_errors`/`file_info`/`json`×2/`socket_ready`/
+  `socket_handle_nint`/`net_errors`/`redis_client`/`sse_stream`/`http`×2/`async socket`×2/
+  `zandb_p0..p6` 三档共 **60+ 用例全 Passed 无泄漏**。
+  `[DllImport("crt")]` 总数 322 → **313**；`extern string calloc` 文件数 39 → **37**。
+
+  **剩余（后续/依赖能力）**：第 3 类的 68 处 `calloc` / 48 处 `free` / `memcpy`·`memset`·
+  `memchr` 收编到 `NativeMemory` 或 `byte[]` 是 B2-1 主线的长尾，逐文件按所有权判定推进
+  （部分裸缓冲是真 FFI 边界需保留，如 `Directory` 的 `WIN32_FIND_DATAW`）；第 2 类的
+  运行时 library 名标注、`strlen` 逐处复核留待各自专项。
 * **判定**：`extern string calloc` 命中数显著下降；
   `--check-leaks` 下 Path / Directory / Process 用例无泄漏。
 
@@ -927,24 +1224,167 @@ catch 块内的挂起、foreach 的降级与状态切分冲突。所以是**定�
   `PoolCore` 从不碰连接本身（既不探活也不关闭），因而对任意连接类型（含接口
   类型的 `DbPool`）都适用；驻留仍留在驱动池里（协作式单线程调度，free list 只在
   await 点之间访问，无需锁）。前置 A7-1（实例泛型方法单态化）已解除。
-* **B3-2** 23 个超过 150 行的方法，最长 **1536 行**
-  （`Widget/DataTable.Render.zan:327`），其次 829 行（`CodeEditor.Render.zan:229`）、
-  561 行（`FilePicker.zan:492`）、467 行（`Gui/Event.zan:991`）。
-  按渲染阶段拆分并提取共享绘制原语。
-* **B3-3** `Widget/DataTable` 一个控件 310KB（`DataTable.zan` 143KB +
-  `DataTable.Render.zan` 167KB），`CodeEditor` 215KB 分散在 4 个文件。重划模块边界。
-* **B3-4** 提炼 widget 公共绘制层：`c.FillRoundRect(x, y, w, h,
-  t.borderRadiusMedium, t.bgPrimary)` 这类主题化绘制在各控件里重复出现，
-  收敛成 `Theme` 上的具名原语。
+* **B3-2 🚧 进行中（大重构，逐方法拆、每步跑对应子集测试）。**
+  〔2026-07-29 重新盘点〕全库 `.zan`（stdlib + selfhost + ide_zan）实测 **30 个**方法 >150 行
+  （旧条目「23 个/最长 1536 行 DataTable.Render」已过时——`DataTable.Render` 早已拆到 <150 行）。
+  当前实际最长（Top 前列）：
+  - `src/ide_zan/ZanIDE.zan:1029 Main()` **3745**（IDE 主循环 + 命令分发，最应拆）
+  - `Gui/Widget/CodeEditor.Render.zan:229 Render()` 823（→ B3-3 一起）
+  - `Gui/Widget/FilePicker.zan:492 RenderContent()` 561
+  - `Gui/Event.zan:991 RenderThemeDrawer()` 467
+  - `src/ide_zan/SceneDesigner.zan:1163 RenderCanvas()` 434
+  - `src/selfhost/irgen_expr.zan:1931 GenCall()` 377 等（selfhost 属编译器域，拆需保自举 gen2==gen3，谨慎）
+  完整清单见 `_scratch/scan_methods.ps1` 的扫描输出。按「先纯 GUI、后 IDE、最后 selfhost」推进，
+  每个拆分**行为等价**（提取子方法/按阶段分组），每步跑对应 conformance 子集。
+  - **✅ 首拆 `Gui/StyleSheet.zan:Decl`**（175 行的扁平 CSS 属性 if 链）→ 保留原分组注释，
+    按组抽出 `DeclFill`/`DeclText`/`DeclBorderBox`/`DeclBoxMetrics`/`DeclLayout`/`DeclMotion`
+    六个 `bool` 辅助方法，`Decl` 变为顺序链（各组 key 互斥、首个命中即 return，行为等价）；
+    `Decl` 从 175 行降到 11 行。`conformance_gui_css` 1/1 Passed。
+  - **✅ `Gui/Widget/DataTable.Layout.zan:LoadLayout`**（153 行）→ 按 JSON 段抽 7 个静态
+    辅助（`LoadColumnState`/`LoadColumnOrder`/`LoadSortKeys`/`LoadGrouping`/`LoadCollapsedBands`/
+    `LoadExpandedRows`/`LoadViewToggles`），主方法降到 ~20 行；验证/EnsureLayoutSlots/dirty 顺序不变。
+    `conformance_gui_datatable` 1/1 Passed（+css/codeeditor 3/3）。
+  - **✅ `Gui/Widget/CodeEditor.Intelli.zan:HandleInput`**（215 行）→ 按事件类型拆
+    `HandleCharKey`（kind==6：字符/Ctrl 快捷/编辑键）与 `HandleNavKey`（kind==4：导航/选择/多光标），
+    `HandleInput` 变为 2 分支派发。`conformance_gui_codeeditor` 1/1 Passed。
+  - **✅ `Game/Arpg/Project.zan:Validate`**（243 行）→ 10 个独立集合校验循环各抽为
+    `ValidateMaps`/`ValidateActors`/`ValidateItems`/`ValidateSkills`/`ValidateBuffs`/`ValidateWindows`/
+    `ValidateGrowth`/`ValidatePrefabs`/`ValidateMapPortals`/`ValidateDefaultPlayer`；`Validate` 变为顺序调用。
+    `arpg_ui_runtime` 三档 3/3 Passed。
+  - **✅ `Game/Zgm/Project.zan:Validate`**（214 行）→ 6 个段抽为 `ValidateApp`/`ValidateMaps`/
+    `ValidateRoles`/`ValidateEquipSets`/`ValidateSkills`/`ValidateWindows`。
+    `zgm_project_validation` 三档 3/3 Passed。
+  - **🚧 `Gui/Widget/CodeEditor.Render.zan:Render`**（823 行，部分）→ 已抽出独立的自动补全弹窗段
+    （补全列表 + kind 过滤条 + 描述面板，167 行）为 `RenderAcPopup(...)`；Render 降到 ~656 行。
+    余下的点击/悬停事件段含 `return id;` 提前返回（与主渲染控制流耦合），需转成
+    「helper 返回 bool、Render 据此 return」的信号式改写——这部分随 **B3-3** CodeEditor 模块重划一并做。
+    `conformance_gui_codeeditor` 1/1 Passed。
+  - **✅ `Gui/Widget/Tabs.zan:Render`**（192）→ 抽 `RenderTabStrip`（滚动视口内的每标签绘制+点击/右键菜单）、
+    `RenderAddButton`（尾部“+”）、`RenderOverflowChevrons`（溢出左右箭头）；主方法降到 ~90 行。
+  - **✅ `Gui/Widget/Layer.zan:RenderActive`**（174）→ 交互段含 `return;`（关闭）留在主方法，
+    尾部 body/footer 绘制段抽为 `RenderLayerBody`；主方法降到 ~144 行。
+  - **✅ `Gui/App.zan:RenderChrome`**（181）→ 标题栏按钮子系统（布局→hover→字形→hit region→点击，
+    唯一外部输入 `c/t/W/hbar`）抽为 `RenderCaptionButtons`，返回 theme 按钮 focus id 供抽屉锚定；
+    主方法降到 ~45 行。
+  - **✅ `Gui/Event.zan:RenderThemeDrawer`**（467）→ 按抽屉分区拆：`DrawSkinGrid`/`DrawAccentRow`/
+    `DrawOpacityChips`/`DrawWallpaperSection`（各推进并返回 `yy`）+ `DrawMotionTab` + `HandleDrawerInput`
+    （点击/外部按下/Esc 派发）+ `DrawerContentH`（滚动内容高度）；共享列表构造抽为静态
+    `DrawerAccents`/`DrawerOpLevels`/`DrawerKinds`。主方法降到 ~110 行。
+  - 以上 Tabs/Layer/App/Event 四项：`cmake --build build` OK，`gui` 8 档（runtime_gui + 7 conformance）100% Passed。
+    ⚠️ **验证方法修正**：`cmake --build build` 的 stdlib 预编是**惰性**的——未被任一 conformance
+    引用到的 stdlib 方法不会深度编译，`RenderThemeDrawer` 拆分中一个 `i = 0`（应为 `int i = 0`）
+    的错误 cmake 与 gui conformance 全都没抓到，是 `scripts\build_ide.ps1`（深度编译整个 Gui）
+    抓到的。**此后 Gui widget 重构一律以 build_ide.ps1（`IDE_BUILD_OK`）为准**，conformance 仅作补充。
+  - **✅ `views/DocsPage.zan:BuildDocs`**（225，ide_zan）→ 按内容分区拆 `BuildLanguageDocs`/
+    `BuildIoAndBasicsDocs`/`BuildWidgetDocs`/`BuildProjectAndErrorDocs`，各自重算所需分类标签；
+    条目顺序（决定侧栏分组与索引）完全保留。`IDE_BUILD_OK`。
+  - **✅ selfhost 运行时发射器**（`src/selfhost/irgen.zan` + `irgen_async.zan`）——纯 `H("…")` IR
+    文本发射、无共享局部量，按发射的 LLVM 函数分组拆：
+    - `EmitListRuntime`（225）→ `EmitListRuntimeCore` + `EmitListRuntimeOps`
+    - `EmitStrOpsRuntime`（291）→ `EmitStrOpsSearch` + `EmitStrOpsTransform` + `EmitStrOpsSplitJoin`
+    - `EmitDictRuntime`（287）→ `EmitDictRuntimeCore` + `EmitDictRuntimeMutate` + `EmitDictRuntimeQuery`
+    - `EmitAsyncRuntime`（282）→ `EmitAsyncUnwindClock` + `EmitAsyncPumpReady` + `EmitAsyncSchedRun`
+    `selfhost_gen1` + `selfhost_fixed_point` 均 Passed（gen2==gen3 **字节一致**，行为等价确证）。
+  - `IconVector.Draw`（232）为扁平几何/codepoint dispatch、共享大量局部量，强拆反降可读性，**不拆**。
+  - **判定不机械拆（会割裂内聚逻辑或需引入状态对象/多值返回，留给 B3-3 / 专项编译器重构）**：
+    - 紧耦合渲染/事件大方法（局部量/按钮 id/`action`/`return id` 跨绘制段与输入段流动，无对口 conformance）：
+      `CodeEditor.Render` 658 尾段、`FilePicker.RenderContent` 561、`SceneDesigner.RenderCanvas` 434 /
+      `RenderInspector` 173、`AssetManager.Render` 364、`Designer.Form.PreviewDisplay` 269、
+      `App.ProcessEvent` 238 → **随 B3-3**。
+    - selfhost 表达式代码生成 `irgen_expr.GenCall` 377 / `GenBinary` 216 / `GenLambda` 153、
+      `irgen_async.GenAsyncMethod` 164：各算子分支共享 IR 构建器的寄存器/临时量计数状态，强拆到
+      150 行以下要么割裂算子 dispatch、要么仍略超阈值——**留给专项编译器重构**。
+    - 异步协议序列 `MySql.doConnect` 176 / `Firebird.authenticate` 161：单条状态机式握手流程，不拆。
+  - 剩余最大件 `ZanIDE.Main` 3745（ide_zan 顶层事件/面板巨方法）需拆成 per-panel/per-ribbon 处理器，
+    自成一项工程，单独推进。
+* **B3-3 ✅ 已完成（2026-07-29）：重划 DataTable/CodeEditor 模块边界。**
+  Zan 用 `partial class`，故重划=把两个巨文件按职责切成内聚 partial（`DataTable.Xxx.zan`），
+  静态方法调用点 `DataTable.Xxx(...)` 不受影响；每步以 `build_ide.ps1`（`IDE_BUILD_OK`）为准，
+  datatable conformance 兜底。
+  - **DataTable ✅ 文件重划完成**：原 3 个巨文件（`DataTable.zan` 3525 行 143KB +
+    `DataTable.Render.zan` 3345 行 167KB + `DataTable.Layout.zan`）→ 13 个内聚 partial：
+    - 数据/逻辑：`DataTable.zan`（598，类头 + selection/clipboard/nav 核心）、`.Value`（值解析/格式/日期）、
+      `.Edit`（单元格编辑）、`.Filter`（过滤谓词）、`.Rows`（行生命周期/undo）、`.Columns`（列模型/band/pin/freeze）、
+      `.Compute`（set-pass/分组/主从/显示列/汇总/列统计）、`.Sort`（条件着色 + 排序）、`.Layout`（布局持久化，原有）。
+    - 渲染/UI：`DataTable.Render.zan`（1864，单元格绘制 + 冻结几何 + 分组面板 + 主渲染 `RenderSource`）、
+      `.Overlays`（右键菜单/图表/列头菜单）、`.FilterUI`（DevExpress 筛选弹窗 + set-filter 菜单）。
+    - 结构体：`DataTableModel.zan`（原有）。全部 `IDE_BUILD_OK`、datatable conformance Passed。
+  - **CodeEditor ✅**：本就已分 5 个内聚 partial（`.zan` 缓冲/编辑、`.Render` 渲染/高亮、`.Completion` 补全、
+    `.Intelli` 签名/片段/输入、`.Symbols` 符号索引），无巨文件需重划。另将 `CodeEditor.Render` 中两个
+    自足的 void 绘制段抽为 `RenderLines`（可见行窗口）+ `RenderOverviewRuler`（右缘概览尺），
+    `Render` 由 660 行降到 ~510；`IDE_BUILD_OK`。
+  - **`DataTable.RenderSource`（原 ~1537 行，全仓最长方法）→ 引入 `DataTableFrame` 几何结构体。**
+    新增 `class DataTableFrame`（`DataTableModel.zan`，28 个 int/List<int> 几何字段：`vorder`/`colX`/
+    `colBand`/`headerH`/`titleTop`/`firstDataX`/`bandX`/`bandW`/`pinnedW`/`pinnedRW`/`maxScrollX`/… ）与
+    `DataTable.ComputeFrame(...)`——把渲染序言（EnsureInit/SyncBindings/Recompute + 表头/band 度量 +
+    行号/选择槽宽 + 冻结带宽 + 逐列屏幕 x + 画分组面板）整段抽成一次算好、返回 frame 的纯序言方法。
+    `RenderSource` 首行改为 `f = ComputeFrame(...)` 再 unpack 局部量，**主体 1400 行逐字未动**（零行为改动、
+    编译兜底任何漏引用）。`IDE_BUILD_OK`、datatable conformance Passed。
+    - 交互内核（约 700 行：`ptrOi`/`ptrCol` 命中 + `ek` 事件逐段消费的状态机 + 键盘导航/编辑/拖拽/框选）
+      是**单一事件状态机**（`ek` 被各段递进置 0、early-return 敏感、命中区 AllocId 顺序敏感），
+      机械再拆多个 helper 需按引用穿 `ek` 且极易引入隐性回归，故**按设计保留为一个方法**，不强拆。
+    - 尾部若干独立绘制段（summary/status/scrollbar/wheel，纯绘制 + 自持 AllocId）可后续按需再抽为
+      `RenderXxx(f, …)`，属可选收尾。
+    - **可视/交互回归验证 ✅**：编译 `gui_gallery` 示例，在远程 Windows 桌面实际启动并逐帧截图——
+      (1) 1M 行 DataTable 完整渲染（表头/行号/复选框/70 列数据/summary Σ/avg/min/max/横向滚动条）无异常；
+      (2) 列头右键菜单（Sort/Freeze/Group/Filter/Min/Max/Count/Chart）弹出定位正确；
+      (3) Escape 关闭模态覆盖（modal early-return 路径）；
+      (4) 鼠标点击单元格→行选中高亮正确移动（pointer hit + selection 路径）；
+      (5) 图表叠加层（Chart · Col 7 柱状图）渲染正确（Overlays partial 提取后的完整路径）；
+      (6) 应用全程 Responding=True，无崩溃/挂起。
+      结合 `IDE_BUILD_OK` + `datatable conformance Passed`，判定无回归。
+* **B3-4 ✅ 已完成（2026-07-29）：提炼 widget 公共绘制层。**
+  重复的“填充圆角矩形 + 同几何描边”惯用法（`c.FillRoundRect(...)` 紧跟
+  `c.DrawRoundRect(...)`）全库共 32 处。新增共享原语
+  `Canvas.SurfaceRoundRect(x, y, w, h, radius, fill, border, borderThickness)`
+  （Render.zan，紧邻 DrawRoundRect），把 **31 处**几何完全一致的 pair 收敛成单次调用；
+  FloatButton 那处描边是条件分支（`if (type != 1)`），保留不动。
+  涉及 14 个控件（Chart/ChartView/CodeEditor.Render/CodeEditor/Dock/Dropdown/Layer/
+  ListView/Pagination/Panel/Popover/TextArea/Tooltip/VirtualList）。
+  **落点说明（偏离原计划的 `Theme`）**：这些调用点的 fill/border/radius 各不相同、
+  且多处用 `pal.*`（CodeEditor）或自定义 alpha（ChartView 箱线图），并非主题默认值，
+  放数据类 `Theme` 上不合适；`Canvas` 才是 FillRoundRect/DrawRoundRect 所在层，
+  其 DrawRoundRect 文档本就写“hug a FillRoundRect of the same geometry”，合并原语是自然延伸。
+  实测：`conformance_gui_*` 7/7 + `zgm_widget`（conformance/determinism/leakcheck）6/6
+  全 Passed 无泄漏；stdlib 重编无 error。
 
 ## B4 平台与错误处理
 
-* **B4-1** `stdlib/Platform`（Windows / Posix 各约 1KB）是占位级，
-  而各模块自己在做 `#if WINDOWS` 分支。要么充实它，要么删掉别留半成品。
-* **B4-2** 全库系统性短板：**失败静默返回空串/0，没有贯穿的异常或 Result 约定**。
-  定一个统一的错误约定并落实。
-* **B4-3** `System/Text` 无 Regex，但 `stdlib/RegularExpressions` 有 37KB/3 文件——
-  核实是不是两套并存或挂在错误的命名空间下。
+* **B4-1 ✅ 已完成（2026-07-29）：删掉两个占位级绑定桩，保留完整的 `Platform.Runtime`。**
+  `stdlib/Platform` 原有三文件：`Windows.zan`（`class Win32`：MessageBox/GetTickCount/…）、
+  `Posix.zan`（`class Posix`：open/read/write/…）、`Runtime.zan`（`class Runtime`：平台探测
+  GetPlatform/IsWindows/IsLinux/IsMacOS/GetProcessId，`#if` 编译期定向）。全库盘点确认
+  **没有任何代码引用 `Win32.` 或 `Posix.`**——各模块（Directory/Process/File/Socket…）都在
+  自己文件里 `#if WINDOWS` 直接绑所需 API，这两个类是从没被用过的重复绑定桩（其 externs 恰是
+  B2-4 死 import 扫描里 `Platform` 那批）。按「要么充实、要么删掉别留半成品」及「最佳实现、不为
+  兼容老代码让步」——**`git rm` 删掉 `Windows.zan` / `Posix.zan`**（后者顺带清掉 B2-3 里
+  `Windows.zan` 的死 `atoi`/`atof`，现整文件移除）。`Runtime.zan` 是实现完整、语义正确的公共
+  探测工具（非半成品，只是暂无内部调用方，属正常公共 API），**保留**。删文件后 `cmake -B build`
+  重新配置刷新 `GLOB_RECURSE`（否则 ninja 报缺失依赖）、重编工具链，`io_errors`/`path_api`/
+  `regex` 三档 **9/9 全 Passed 无泄漏**。
+* **B4-2 ✅ 约定确立 + 全库排查完成（2026-07-29）：按 C# 语义收敛，异常面已达标。**
+  统一约定（对齐 C#，非机械改写）：
+  (1) **真·错误**（打不开文件、连接失败、协议破坏、解析非法）→ 抛异常
+      （`FileNotFoundException`/`IOException`/`ArgumentException`/`DbException`…）；
+  (2) `Try*` 系（`TryParse`/`SysFile.Write:bool`…）→ 返回 `bool`/`null`，是合法契约，保留；
+  (3) `IndexOf→-1`、`Find→null`、`Exists→false` 等 **C# 本就用哨兵**的 API → 保留，不动。
+  〔全库排查〕stdlib 共 **20 处 catch**，逐个核对后**无一处真吞错误**——唯一疑似
+  （`Gui/Native.zan` `SysFile.Write`）是文档明写「Returns true on success」的 bool-result
+  Try-API，属约定 (2)，保留。IO 层（`System/IO/File.zan`）已全部在失败处 `throw`
+  （`ReadAllText`/`WriteAllText`/`Copy`/`GetSize`/`ReadBytes`… 均抛 `FileNotFoundException`/
+  `IOException`/`ArgumentException`），`Exists` 返回 `false` 属约定 (3)。DB 层此前 B3-0 已转
+  `DbException`。结论：异常约定已贯穿、达标；**未机械改写约 700 处合法哨兵返回**
+  （用户明确要求「留合法哨兵值」）。后续若在 B1 大模块逐文件走查时发现个别真吞错误点，
+  就地按约定 (1) 转抛异常并补测。
+* **B4-3 ✅ 已完成（2026-07-29）：核实结论——不存在两套并存，命名空间正确，无需动。**
+  正则实现就在 `stdlib/System/Text/RegularExpressions/`（`Match.zan` 2.7KB /
+  `Regex.zan` 9.2KB / `RegexProgram.zan` 26.3KB，合计 ~38KB=先前所说「37KB/3 文件」），
+  `namespace System.Text.RegularExpressions`（标准 C# 命名空间），**没有**独立的顶层
+  `stdlib/RegularExpressions` 目录（顶层只有 `System`/`Game`/`Gui`/`Platform`/`Sdk`/`SDL3`），
+  也没有第二份并存实现；全库唯一引用点 `tests/conformance/regex.zan` 用的正是
+  `using System.Text.RegularExpressions;`。先前条目描述（「`System/Text` 无 Regex」「顶层
+  `stdlib/RegularExpressions`」）是过时信息。〔实测〕`regex` conformance/determinism/leakcheck
+  **3/3 全 Passed 无泄漏**。
 
 ## B5 GUI 迁移（在 A 项能力就绪后穿插）
 
@@ -1013,22 +1453,29 @@ header-only 库 / C 回调 / 结构体字段偏移，全部对应 A2 / A3 / A4�
 
 `docs/` 40 份。全部在最近 3 周内动过，所以问题**不是日历陈旧，是内容与实现漂移**。
 
-* **C1** `ABI.md`（最后更新 07-05，最旧一批）已确认多处与实现不符：
-  * `:38` 称 `float` 是 8 字节 double —— 实际 `TYPE_FLOAT` → 32 位 `LLVMFloat`；
-  * `:67` 承诺 `[repr("C")]` 保证 C 布局 —— 实现里没有任何布局控制代码；
-  * `:249` marshalling 表写 `string`（返回值）= "Copy to managed string"
-    ——〔已实测〕**不是拷贝**（若是拷贝，`calloc` 的零缓冲区会变成空串，
-    而 `ffi_free_consumes_string.zan` 和 `Path.zan` 都能正常工作）；
-  * 同一张表列了语言中**不存在**的 `int32` / `float32` 类型；
-  * `:251` / `:254-260` 的结构体按值传参表、`:24` 的 sret 描述，
-    都描述了 `irgen_emit.c` 里**不存在**的行为。
-  → 全文按实现重写，并明确分层"当前实现 / 目标设计"。**A2 完成后目标态才会变成真的**。
-* **C2** 07-05 后再没动过的一批（`ABI.md` / `ARCHITECTURE.md` /
-  `CODING_STANDARDS.md` / `DESIGN.md` / `ERROR_CATALOG.md` / `IDE.md` /
-  `SECURITY.md`）逐份核实。这批是初稿之后从未回头的，漂移风险最高。
-* **C3** `STDLIB_ANALYSIS.md` 顶上贴了"本文档大部分结论已过时，仅作历史参考"的
-  横幅，正文却原样保留。**要么按现状重写，要么移进 `docs/archive/`**——
-  不要用横幅代替维护。
+* **C1 ✅ 已完成（2026-07-29）：`ABI.md` 已按当前实现重写受影响小节 + 加分层横幅。**
+  复核发现原清单**部分已过时**——实现已经演进（`[FieldOffset(n)]` 显式布局、
+  SysV/Win64 的 `sret`/`byval` 分类都已在 `irgen_abi.c` 实装，非"不存在"）。
+  按当前源码 + 探针核实并重写：§3.1 基元表（**`int` 实测 32 位**——探针
+  `2147483647+1 → -2147483648` 环绕、`long` 不环绕；`float` 32 位、`double` 64 位、
+  `char` 降 i64、无 `int32`/`float32` 类型）、§3.2 结构体布局（默认顺序=C 布局，
+  `[StructLayout(Explicit)]`+`[FieldOffset(n)]` 显式布局/联合，显式布局禁虚方法）、
+  §6 marshalling（删 `int32`/`float32` 行、修 `float`、`string` 返回值=**接管指针非深拷**）
+  与 §6.2 结构体传参（按平台 SysV/Win64 分类）。§1.1 新增"当前实现 / 目标设计"分层：
+  §3.3–3.5/§4/§5/§7 标为设计意图、本轮未复验。原始记录（已过时，供对照）：
+  ~~`:38` float=8 字节 double；`:67` `[repr("C")]` 无布局控制代码；`:249` string 返回值拷贝；
+  列不存在的 `int32`/`float32`；`:251/:254-260/:24` 结构体传参/sret 描述不存在的行为~~。
+* **C2 🟡 部分完成（2026-07-29）：已修跨文档的确定性事实漂移。**
+  `ABI.md` 见 C1。`DESIGN.md`（`int x=42 //64-bit` → 32-bit；`float //64-bit` → 32-bit）、
+  `SPEC.md`（"整型字面量默认 int 64 位" / "L→long 与 int 同为 64 位" → int 32 位、long 64 位）、
+  `ARCHITECTURE.md`（"single-pass" → multi-pass：binder 实测有 Pass 1/2/3 `resolve_bases`；
+  词法器确为单遍流式，保留）已按实现改正。**剩余**：`CODING_STANDARDS.md` /
+  `ERROR_CATALOG.md` / `IDE.md` / `SECURITY.md` 尚需逐份深核（未发现明显数值/结构性漂移，
+  但未逐条走读）。
+* **C3 ✅ 已完成（2026-07-29）：`STDLIB_ANALYSIS.md` `git mv` 进 `docs/archive/`。**
+  这是早期能力盘点，结论大部分过时；当前覆盖面以 `stdlib/` 与 `docs/STDLIB.md` 为准。
+  归档横幅重写为"已归档不再维护 + 更正（Regex 已存在，非"仍缺"）+ 唯一仍成立短板
+  （失败静默/Result）在 B4-2 跟踪"，原正文保留。不再用横幅代替维护。
 * **C4** ✅ 已删（2026-07-27）`STDLIB_DB_AARDIO_REF.md` 那 2 行只是一句
   "已被 `STDLIB_ZAN_DESIGN.md` 取代"，接替者本身已在开头写明这段历史，残桩删掉。
 * **C5** ✅ 已完成。3 份 bug 文档（`await-in-catch-loop.md`、
@@ -1036,25 +1483,42 @@ header-only 库 / C 回调 / 结构体字段偏移，全部对应 A2 / A3 / A4�
   `repro_*.zan` 均已纳入 git 跟踪（配合 A8）。另外 `docs/bugs/` 又新增了
   `catch-no-type-matching.md`、`cross-module-base-class-field-binding.md`、
   `O0-list-index-write-stack-leak.md` 三份（含 repro），一并已入 git。
-* **C6** `docs/bugs/*.md` 需要统一的状态字段。`generics-uniform-repr.md` 标了
-  `Status: FIXED`，其余几份没有——读者无法判断哪些还有效。
-  且这份 FIXED 需要按 A7 的实测结果更新：5/6 条确实已修，
-  但要补记"通过类型参数调用约束接口方法仍崩"。
+* **C6 ✅ 已完成（2026-07-29）：7 份 bug 文档统一 `**Status:**` 字段。**
+  标题下第一行统一 `**Status:** Fixed (日期) — <task ref>`：await-in-catch-loop(A8-1)、
+  dict-urldecode(A8-2)、throw-leaks(A8-3+A8-12)、catch-no-type-matching、cross-module
+  （后两者已有 Resolution，补顶行）、O0-list-index、generics-uniform-repr（原 prose 转粗体，
+  并补记"通过类型参数调用约束接口方法"的崩溃已在 A7-1 修复，非仍崩）。七份现全为 Fixed。
+  格式规则写入 `docs/DOCS_MAINTENANCE.md`（见 C11）。
 * **C7** ✅ 已归位（2026-07-27）两份 ra2-hd 文档移到项目文档层：
   `docs/projects/ra2-hd/2026-07-26-ra2-hd-plan.md` 和
   `.../2026-07-26-ra2-hd-design.md`（`git mv` 保留历史，计划里指向 spec 的
   链接同步改了），空掉的 `docs/superpowers/` 删除。语言规范层只剩
   `SPEC.md` / `ABI.md` 这类。
-* **C8** 路线类文档有 4 份且边界不清：`ROADMAP.md` 383 行、
-  `EXECUTION_PLAN.md` 43 行、`PRODUCTION_PLAN.md` 48 行、
-  `SELF_CONTAINED_TOOLCHAIN.md` 68 行。合并成一份，并把本清单并进去。
+* **C8 ✅ 已完成（2026-07-29）：厘清 4 份路线文档边界，归档过时的那份。**
+  逐份核实后判定：**不做「四合一大文件」**——`EXECUTION_PLAN`/`PRODUCTION_PLAN`/
+  `SELF_CONTAINED_TOOLCHAIN` 三份是**当前有效且互补**的层次（顶层执行索引 → ZanIDE 生产
+  可用详情 → 工具链技术设计），强行合并会丢技术细节、反而更乱；真正的问题是「有一份过时的
+  重叠文档 + 三份关系没写明」。因此：
+  (1) **归档 `ROADMAP.md`**（`git mv docs/ROADMAP.md docs/archive/ROADMAP.md` + 顶部横幅）——
+      它是项目最初的里程碑计划（M1 最小编译器 → M9），复选框从未随实现更新（M1“Hello World
+      编译器”早已远超、已自举，且 §M9 仍指向**已删除的** `src/ide/debugger.c`），属历史文档，
+      按 C11 归档；横幅指明现状看 `SPEC/STDLIB/ARCHITECTURE`、执行计划看另三份。
+      〔核查〕主仓文档无任何指向 `docs/ROADMAP.md` 的链接（仅 `AotAnywhere/` 子项目有自己的
+      同名 ROADMAP，无关），移动无断链。
+  (2) **给三份现存文档各加「路线文档关系」头**：`EXECUTION_PLAN.md`（标注为顶层索引）、
+      `PRODUCTION_PLAN.md`（标注为 Workstream A 详情来源）、`SELF_CONTAINED_TOOLCHAIN.md`
+      （标注为被生产计划阶段 5 引用的技术设计），互相点名，边界从此清晰。
+  （原条目所说「43/48/68 行、合并成一份、把 TASKS 折进去」是过时设想；本轮按最终形态改为
+  分层保留 + 归档过时件。）
 * **C9** 文档覆盖率差距悬殊：`System` 16.5%、`Gui` 9.8%、`Game` **0.7%**。
   既然 Game 不搬走，就得把文档补上（随 B1-2）。
-* **C10** 文档内容一律**以实现和 C# 为准**，不以现有 doc 为准。
-  已知不合理的描述直接按实现重写或删除，不反过来让实现去迁就文档。
-  同时反向检查：文档里偏离 C# 习惯的设计，优先按 C# 靠拢。
-* **C11** 建立维护规则：每份文档按"当前实现 / 目标设计 / 历史记录"分层归档，
-  目标设计类文档必须写明依赖哪个能力项（A 编号），能力落地时同步更新。
+* **C10 ✅ 作为原则贯彻（2026-07-29）**：本轮 C1/C2/C3 均以实现+C# 为准改写
+  （int 32 位与 C# 对齐、Regex 已存在纠正、single-pass 纠正）。作为持续原则写入
+  `docs/DOCS_MAINTENANCE.md` §3，后续每次动文档都适用。
+* **C11 ✅ 已完成（2026-07-29）：新增 `docs/DOCS_MAINTENANCE.md`。**
+  定义分层规则（当前实现 / 目标设计 / 历史记录）、目标设计须标 A 编号并随能力落地同步、
+  以实现和 C# 为准（C10）、bug 状态字段格式（C6）、归档位置（`docs/`/`docs/projects/`/`docs/archive/`）。
+  `ABI.md` §1.1 是分层落地范例。
 
 ---
 

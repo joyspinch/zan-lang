@@ -178,21 +178,18 @@ class MySqlConnection {
     /// SHA256(pw) XOR SHA256( SHA256(SHA256(pw)) . nonce ). Returns a 32-byte
     /// buffer (caller frees).</summary>
     static string scramble41(string pw, string nonce20) {
-        string a = Sha256.Hash(pw, pw.Length);
-        string b = Sha256.Hash(a, 32);
+        byte[] a = Sha256.Hash(pw, pw.Length);
+        byte[] b = Sha256.Hash(a, 32);
         string cat = calloc(53, 1);
         int i = 0;
         while (i < 32) { cat[i] = b[i] & 255; i = i + 1; }
         i = 0;
         while (i < 20) { cat[32 + i] = nonce20[i] & 255; i = i + 1; }
-        string c = Sha256.Hash(cat, 52);
+        byte[] c = Sha256.Hash(cat, 52);
         free(cat);
         string tok = calloc(33, 1);
         i = 0;
         while (i < 32) { tok[i] = (a[i] ^ c[i]) & 255; i = i + 1; }
-        free(a);
-        free(b);
-        free(c);
         return tok;
     }
 
@@ -200,21 +197,18 @@ class MySqlConnection {
     /// SHA1(pw) XOR SHA1( nonce . SHA1(SHA1(pw)) ). Returns a 20-byte
     /// buffer (caller frees).</summary>
     static string scrambleNative(string pw, string nonce20) {
-        string a = Sha1.Hash(pw, pw.Length);
-        string b = Sha1.Hash(a, 20);
+        byte[] a = Sha1.Hash(pw, pw.Length);
+        byte[] b = Sha1.Hash(a, 20);
         string cat = calloc(41, 1);
         int i = 0;
         while (i < 20) { cat[i] = nonce20[i] & 255; i = i + 1; }
         i = 0;
         while (i < 20) { cat[20 + i] = b[i] & 255; i = i + 1; }
-        string c = Sha1.Hash(cat, 40);
+        byte[] c = Sha1.Hash(cat, 40);
         free(cat);
         string tok = calloc(21, 1);
         i = 0;
         while (i < 20) { tok[i] = (a[i] ^ c[i]) & 255; i = i + 1; }
-        free(a);
-        free(b);
-        free(c);
         return tok;
     }
 
@@ -259,7 +253,7 @@ class MySqlConnection {
 
     /// <summary>Extracts the DER SubjectPublicKeyInfo from a PEM public key.
     /// outLen[0] receives the DER length; returns null if no PEM body found.</summary>
-    static string pemToDer(string pem, int pemLen, List<int> outLen) {
+    static byte[] pemToDer(string pem, int pemLen, List<int> outLen) {
         int begin = findSub(pem, pemLen, "-----BEGIN", 10, 0);
         if (begin < 0) { return null; }
         int hb = begin;
@@ -271,7 +265,7 @@ class MySqlConnection {
         string b64 = calloc(blen + 1, 1);
         int i = 0; while (i < blen) { b64[i] = pem[hb + i] & 255; i = i + 1; }
         List<int> dl = new List<int>(); dl.Add(0);
-        string der = Base64.Decode(b64, dl);
+        byte[] der = Base64.Decode(b64, dl);
         free(b64);
         outLen[0] = dl[0];
         return der;
@@ -290,7 +284,7 @@ class MySqlConnection {
     /// <summary>Parses an RSA SubjectPublicKeyInfo and encrypts <paramref name="obf"/>
     /// with RSA OAEP-SHA1 (MySQL full-auth padding). kOut[0] receives the modulus
     /// byte length (== ciphertext length).</summary>
-    static string fullAuthCipher(string der, int derLen, string obf, int obfLen, string seed, List<int> kOut) {
+    static byte[] fullAuthCipher(string der, int derLen, string obf, int obfLen, string seed, List<int> kOut) {
         List<int> c = new List<int>(); c.Add(0);
         c[0] = c[0] + 1; readDerLen(der, c);                       // outer SEQUENCE
         c[0] = c[0] + 1; int algLen = readDerLen(der, c); c[0] = c[0] + algLen;  // skip AlgorithmIdentifier
@@ -308,7 +302,7 @@ class MySqlConnection {
         int i = 0; while (i < useLen) { nBuf[i] = der[nStart + i] & 255; i = i + 1; }
         string eBuf = calloc(eLen + 1, 1);
         i = 0; while (i < eLen) { eBuf[i] = der[eStart + i] & 255; i = i + 1; }
-        string cph = Rsa.EncryptOaep(obf, obfLen, nBuf, useLen, eBuf, eLen, 1, seed);
+        byte[] cph = Rsa.EncryptOaep(obf, obfLen, nBuf, useLen, eBuf, eLen, 1, seed);
         free(nBuf); free(eBuf);
         kOut[0] = useLen;
         return cph;
@@ -447,7 +441,7 @@ class MySqlConnection {
                     i = 0; while (i < pemLen) { pem[i] = pk[1 + i] & 255; i = i + 1; }
                     free(pk);
                     List<int> derLen = new List<int>(); derLen.Add(0);
-                    string der = pemToDer(pem, pemLen, derLen);
+                    byte[] der = pemToDer(pem, pemLen, derLen);
                     if (der == null) { this.lastError = "bad RSA public key PEM"; free(pem); free(nonce); return false; }
                     free(pem);
                     int pwLen = pw.Length;
@@ -457,13 +451,12 @@ class MySqlConnection {
                     string seed = genSeed(20);
                     if (seed == null) {
                         this.lastError = "secure RNG unavailable for full-auth";
-                        free(der); free(obf); free(nonce); return false;
+                        free(obf); free(nonce); return false;
                     }
                     List<int> kOut = new List<int>(); kOut.Add(0);
-                    string cipher = fullAuthCipher(der, derLen[0], obf, obfLen, seed, kOut);
-                    free(der); free(obf); free(seed);
+                    byte[] cipher = fullAuthCipher(der, derLen[0], obf, obfLen, seed, kOut);
+                    free(obf); free(seed);
                     await this.writePacket(cipher, kOut[0], this.lastSeq + 1);
-                    free(cipher);
                     continue;                                            // OK / ERR follows
                 }
                 this.lastError = "unexpected auth-more-data " + Convert.ToString(more);

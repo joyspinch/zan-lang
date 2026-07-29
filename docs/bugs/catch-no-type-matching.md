@@ -1,5 +1,7 @@
 # catch clauses: no type-based matching; only the first clause is emitted
 
+**Status:** Fixed (2026-07) — re-verified against `build/zanc`. See Resolution below.
+
 ## Summary
 
 The C-host irgen lowers `try/catch` by unconditionally binding the thrown
