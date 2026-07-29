@@ -1823,6 +1823,26 @@ irgen 按"类名 + 方法名"直接 lower 了 **43 个**静态库调用
 共 21 处已处理；`Math` / `Console` / `Environment` / `Convert` 在 stdlib 里
 没有对应的 Zan 类，要先写出来才能同样处理。
 
+**顺带清出的两个真实缺陷**（2026-07-29，`tests/conformance/math_minmax.zan`）——
+硬编码这条路径本身就是它们长期没被发现的原因：
+
+* **`Math.Max` / `Math.Min` 对 `double` 直接把编译器搞崩**。两处一律
+  `zan_icmp(SGT/SLT)`，对 double 操作数就是在浮点值上发 `icmp`：
+  `double m = Math.Max(1.5, 2.5);` → `zanc` 自身 `0xC0000409` / `0xC0000005`
+  （连 IR 都出不来）。同理 `Math.Max(anInt, aLong)` 是在两个不同位宽上 `icmp`。
+  修法：任一操作数是浮点就整体升到 double 走 `fcmp OGT/OLT`（C# 的 double
+  重载语义），纯整数路径把窄的一侧 `sext` 到宽的一侧再比。
+* **`Math.Abs` 的整数路径按固定 31 位取符号掩码**（`(x ^ (x>>31)) - (x>>31)`），
+  对 `long` 那不是符号位。改成按操作数自身位宽 `w-1` 移位。
+* 证据：`tests/conformance/math_minmax.zan`（double/负 double/字面量/int 与 double
+  混合/同宽整数/int 与 long 混宽/`Abs` 的 int 与超 32 位 long 与 double），
+  conformance / determinism / leakcheck 3/3 Passed；全量 `ctest -j8` **719/720**，
+  唯一失败 `determinism_sdk_wechat_product_modules` 是 -j8 下与耗时 331 秒的
+  `conformance_gui_icon` 争抢导致的超时，单独重跑 3/3 Passed。
+* 〔实测，决定 Zan 版怎么写〕把 `Math.Sqrt` 换成 Zan 静态方法包一层 libm 的代价：
+  500 万次紧循环 52.7 ms → 59.4 ms（默认 O0，10.5 → 11.9 ns/次，+13%），
+  也就是**多一次未内联的调用**。可以接受，不构成不写 Zan 版的理由。
+
 ## A15-6 其它已确认的小差异 — ✅ 已修（2026-07-29）
 
 * ~~`char` 打印成数字（`'A'` → `65`），C# 打印字符。~~ 已修：新增

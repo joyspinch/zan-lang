@@ -560,28 +560,52 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                 return zan_call2(g->builder, LLVMFunctionType(dbl, (LLVMTypeRef[]){ dbl }, 1, 0),
                     fabs_fn, &arg, 1, "fabs");
             } else {
-                /* integer abs: (x ^ (x >> 31)) - (x >> 31) */
+                /* integer abs: (x ^ (x >> w-1)) - (x >> w-1), where the shift
+                 * must span the operand's own width -- a hardcoded 31 leaves
+                 * a long's sign bits in the mask. */
+                unsigned abs_bits = LLVMGetIntTypeWidth(arg_type);
                 LLVMValueRef shift = zan_ashr(g->builder, arg,
-                    LLVMConstInt(LLVMTypeOf(arg), 31, 0), "sh");
+                    LLVMConstInt(arg_type, abs_bits - 1, 0), "sh");
                 LLVMValueRef xor = zan_xor(g->builder, arg, shift, "xor");
                 return zan_sub(g->builder, xor, shift, "abs");
             }
         }
 
-        /* Math.Max(a, b) */
-        if (is_call_to(expr, "Math", "Max") && expr->call.args.count == 2) {
+        /* Math.Max(a, b) / Math.Min(a, b), on integers or on doubles: mixing
+         * the two widens to double, the way C# picks the double overload. */
+        if ((is_call_to(expr, "Math", "Max") || is_call_to(expr, "Math", "Min")) &&
+            expr->call.args.count == 2) {
+            int want_max = is_call_to(expr, "Math", "Max");
             LLVMValueRef a = emit_expr(g, expr->call.args.items[0], locals);
             LLVMValueRef b = emit_expr(g, expr->call.args.items[1], locals);
-            LLVMValueRef cmp = zan_icmp(g->builder, LLVMIntSGT, a, b, "cmp");
-            return LLVMBuildSelect(g->builder, cmp, a, b, "max");
-        }
-
-        /* Math.Min(a, b) */
-        if (is_call_to(expr, "Math", "Min") && expr->call.args.count == 2) {
-            LLVMValueRef a = emit_expr(g, expr->call.args.items[0], locals);
-            LLVMValueRef b = emit_expr(g, expr->call.args.items[1], locals);
-            LLVMValueRef cmp = zan_icmp(g->builder, LLVMIntSLT, a, b, "cmp");
-            return LLVMBuildSelect(g->builder, cmp, a, b, "min");
+            LLVMTypeKind ka = LLVMGetTypeKind(LLVMTypeOf(a));
+            LLVMTypeKind kb = LLVMGetTypeKind(LLVMTypeOf(b));
+            int fa = (ka == LLVMDoubleTypeKind || ka == LLVMFloatTypeKind);
+            int fb = (kb == LLVMDoubleTypeKind || kb == LLVMFloatTypeKind);
+            if (fa || fb) {
+                LLVMTypeRef dbl = LLVMDoubleTypeInContext(g->ctx);
+                a = fa ? (ka == LLVMFloatTypeKind
+                            ? LLVMBuildFPExt(g->builder, a, dbl, "ext")
+                            : a)
+                       : LLVMBuildSIToFP(g->builder, a, dbl, "tofp");
+                b = fb ? (kb == LLVMFloatTypeKind
+                            ? LLVMBuildFPExt(g->builder, b, dbl, "ext")
+                            : b)
+                       : LLVMBuildSIToFP(g->builder, b, dbl, "tofp");
+                LLVMValueRef cmp = LLVMBuildFCmp(g->builder,
+                    want_max ? LLVMRealOGT : LLVMRealOLT, a, b, "cmp");
+                return LLVMBuildSelect(g->builder, cmp, a, b,
+                    want_max ? "max" : "min");
+            }
+            /* Integers of different widths (Math.Max(anInt, aLong)) can be
+             * neither compared nor selected between as they are. */
+            unsigned wa = LLVMGetIntTypeWidth(LLVMTypeOf(a));
+            unsigned wb = LLVMGetIntTypeWidth(LLVMTypeOf(b));
+            if (wa < wb) a = LLVMBuildSExt(g->builder, a, LLVMTypeOf(b), "sx");
+            else if (wb < wa) b = LLVMBuildSExt(g->builder, b, LLVMTypeOf(a), "sx");
+            LLVMValueRef cmp = zan_icmp(g->builder,
+                want_max ? LLVMIntSGT : LLVMIntSLT, a, b, "cmp");
+            return LLVMBuildSelect(g->builder, cmp, a, b, want_max ? "max" : "min");
         }
 
         /* Math.Pow(base, exp) */
