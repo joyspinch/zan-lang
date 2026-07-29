@@ -377,9 +377,27 @@ static int reserve_arc_site(zan_irgen_t *g, zan_symbol_t *sym,
  * route it through a bitcast of the function pointer instead. */
 static LLVMValueRef zan_call2(LLVMBuilderRef b, LLVMTypeRef ty, LLVMValueRef fn,
                               LLVMValueRef *args, unsigned n, const char *nm) {
+    LLVMValueRef callee = fn;
     if (fn && LLVMIsAFunction(fn) && LLVMGlobalGetValueType(fn) != ty)
         fn = LLVMConstBitCast(fn, LLVMPointerType(ty, 0));
-    return LLVMBuildCall2(b, ty, fn, args, n, nm);
+    LLVMValueRef call = LLVMBuildCall2(b, ty, fn, args, n, nm);
+    /* Carry the callee's sub-`int` promotions onto the call site: once the
+     * callee is bitcast the backend sees an opaque pointer and has nothing
+     * left to read the extension off. */
+    if (callee && LLVMIsAFunction(callee)) {
+        static const char *ext[2] = { "signext", "zeroext" };
+        for (int e = 0; e < 2; e++) {
+            unsigned kind = LLVMGetEnumAttributeKindForName(ext[e], strlen(ext[e]));
+            if (!kind) continue;
+            for (unsigned idx = 0; idx <= n; idx++) {
+                unsigned at = idx == 0 ? (unsigned)LLVMAttributeReturnIndex : idx;
+                if (!LLVMGetEnumAttributeAtIndex(callee, at, kind)) continue;
+                LLVMAddCallSiteAttribute(call, at,
+                    LLVMCreateEnumAttribute(LLVMGetTypeContext(ty), kind, 0));
+            }
+        }
+    }
+    return call;
 }
 
 /* Grow one of the IR registries to hold `need` entries. */

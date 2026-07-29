@@ -335,6 +335,36 @@ static void abi_add_int_attr(zan_irgen_t *g, LLVMValueRef fn, LLVMValueRef call,
                                  LLVMCreateEnumAttribute(g->ctx, kind, val));
 }
 
+/* The C ABI promotes anything narrower than `int` at the boundary, and every
+ * supported target makes that the *caller's* job: AAPCS64 and the RISC-V ABI
+ * let the callee read the whole register, so an unextended i1/i8/i16 argument
+ * arrives with garbage above its own width. `char`/enum are 64-bit here and
+ * need no promotion. */
+static const char *abi_int_ext_attr(zan_type_t *t) {
+    if (!t) return NULL;
+    switch (t->kind) {
+    case TYPE_BOOL:
+    case TYPE_BYTE:
+    case TYPE_USHORT: return "zeroext";
+    case TYPE_SBYTE:
+    case TYPE_SHORT:  return "signext";
+    default:          return NULL;
+    }
+}
+
+/* Attach the promotion attributes for one extern declaration. `ptypes` holds
+ * the resolved parameter types in declaration order. */
+static void abi_add_int_ext_attrs(zan_irgen_t *g, LLVMValueRef fn,
+                                  zan_type_t *ret, zan_type_t **ptypes,
+                                  int pc) {
+    const char *r = abi_int_ext_attr(ret);
+    if (r) abi_add_int_attr(g, fn, NULL, (unsigned)LLVMAttributeReturnIndex, r, 0);
+    for (int i = 0; i < pc; i++) {
+        const char *a = abi_int_ext_attr(ptypes[i]);
+        if (a) abi_add_int_attr(g, fn, NULL, (unsigned)(i + 1), a, 0);
+    }
+}
+
 static LLVMValueRef abi_byte_ptr(zan_irgen_t *g, LLVMValueRef base,
                                  unsigned long off) {
     if (off == 0) return base;

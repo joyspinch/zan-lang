@@ -817,6 +817,20 @@ foreach(_abi_target win-x64 linux-x64 linux-arm64 macos-arm64)
   set_tests_properties(abi_signatures_${_abi_target} PROPERTIES TIMEOUT 120)
 endforeach()
 
+# ---- Sub-`int` FFI promotion: signext / zeroext per target ----
+# C promotes anything narrower than `int` at the boundary and leaves the work
+# to the caller, so the shapes are pinned per target like the struct cases.
+foreach(_abi_target win-x64 linux-x64 linux-arm64 macos-arm64)
+  add_test(NAME abi_int_ext_${_abi_target} COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/abi/int_ext.zan
+    -DTARGET=${_abi_target}
+    -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/abi/expected/int-ext.decls
+    -DWORKDIR=${CMAKE_BINARY_DIR}
+    -P ${CMAKE_SOURCE_DIR}/tests/run_abi_case.cmake)
+  set_tests_properties(abi_int_ext_${_abi_target} PROPERTIES TIMEOUT 120)
+endforeach()
+
 # ---- DAP integration test (real gdb-backed debug session) ----
 add_executable(dap_integration_test
     tests/dap/dap_integration_test.c

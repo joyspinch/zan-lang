@@ -344,9 +344,11 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
                 /* build extern function declaration */
                 int pc = member->method_decl.params.count;
                 LLVMTypeRef *pt = (LLVMTypeRef *)calloc((size_t)(pc > 0 ? pc : 1), sizeof(LLVMTypeRef));
+                zan_type_t **pzt = (zan_type_t **)calloc((size_t)(pc > 0 ? pc : 1), sizeof(zan_type_t *));
                 for (int k = 0; k < pc; k++) {
                     zan_ast_node_t *param = member->method_decl.params.items[k];
                     zan_type_t *ptype = zan_binder_resolve_type(g->binder, param->param.type);
+                    pzt[k] = ptype;
                     pt[k] = map_type(g, ptype);
                 }
                 zan_type_t *rt = member->method_decl.return_type
@@ -388,7 +390,9 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
                 if (!efn) efn = LLVMGetNamedFunction(g->mod, ext_name);
                 if (!efn) {
                     efn = LLVMAddFunction(g->mod, ext_name, ft);
+                    abi_add_int_ext_attrs(g, efn, rt, pzt, pc);
                 }
+                free(pzt);
                 /* register as a static method so it can be called */
                 zan_symbol_t *method_sym = method_sym_for_decl(type_sym, member);
                 if (method_sym) {
