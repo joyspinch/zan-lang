@@ -1173,10 +1173,29 @@ Gui.Text / Game.Rts / Zgm / Windows.Forms —— stdlib 里最后一批 `calloc`
 `examples/db/mysql_crud.zan`(52 files)、`examples/db/odbc_multidb.zan`(29)、
 RA2 demo(76 files) 编译通过。
 
-* **B2-1（剩余）** `extern string calloc(...)`：**stdlib 已清零**，只剩
-  tests / examples / src 若干（`examples/game/ra2` 的 Texture/Csf/Format80/Lzo/
-  MapPack/Pcx/WsKey 与其 tests、`src/ide_zan` 的 ZanIDE/LspSession/DebugSession、
-  `tests/conformance` 若干测试自建缓冲）
+**B2-1 第十一批 ✅ 已完成（2026-07-29）：`src/ide_zan` + RA2 示例 —— 生产代码里
+最后一批 `calloc`-as-string。**
+
+* `src/ide_zan/LspSession` / `DebugSession`：`WSAStartup` 的 WSADATA、`sockaddr_in`
+  （`BuildAddr → byte[]`）、`FIONBIO` 的 flag、`SO_RCVTIMEO` 的 DWORD/`timeval`、
+  `recv` 缓冲全部 `byte[]`；收到的字节按 `recv` 返回值 `ToStr(0, n)`。
+  `ZanIDE.ExePath`：路径缓冲 `byte[]`，按 `GetModuleFileNameA`/`readlink` 的返回
+  长度截断（macOS 的 `_NSGetExecutablePath` 不报长度，改为定位 NUL）。
+  〔实测〕`scripts/build_ide.ps1` → `IDE_BUILD_OK`；`ctest -j4` 711/711 Passed。
+* `examples/game/ra2`：`Format80.Decompress`/`Lzo.Decompress`/`MapPack.Decode`/
+  `DecodeChunks` → `byte[]`（`DecompressInto` 的 `dest` 形参同改）、`MapFile` 不再
+  `free` 解压结果、`Pcx` 的 `indices`/`palette` 字段、`Texture.pixels`/`Pixels()`、
+  `WsKey.ModulusBytes`/`Decrypt → byte[]`（`Mix` 侧删掉 `free(key)`）、`Csf` 的
+  ASCII/UTF-16→UTF-8 缓冲；7 个 tests 的合成缓冲同步。
+  〔实测〕RA2 demo 76 files 编译通过；`examples/game/ra2/tests/run.sh`
+  **11 passed, 1 failed** —— 失败的只有既有的 `mix` 哈希差异（见上文 B2-1 第八批
+  的记录：新旧两版 `CharOf` 逐字相同，`expected_mix.out` 本就对不上，用户已明确
+  「RA2 先不管」）。
+
+* **B2-1（剩余）** `extern string calloc(...)`：**stdlib / src / examples 均已清零**，
+  只剩 `tests/` 里少数刻意保留的 native-ABI 用例（`ffi_free_consumes_string` 专测
+  `free` 消费 string 的语义，`firebird_wire`/`mysql_stmt_binary`/`odbc_buffers`/
+  `sqlserver_tds`/`rts_*`/`zandb_p6`/`selfhost/prog1` 等自建 C 缓冲的测试）
   （第二批消掉 Sha1 / Sha256 / Sha512 / Md5 / Sm3 / Hmac / Hex / Base64 八个，
   第三批 `Hkdf`，第四批 `Rsa`，第五批 `Sm2`，第六批 `Sm4`，第七批 `BigInt`）。
   **`Cryptography` 目录整条 `calloc` 链清完**（`Rsa` 也无 `free` 了）。剩下的都在
