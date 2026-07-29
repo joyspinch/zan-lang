@@ -1108,6 +1108,8 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
                             cargs[ai + 1] = emit_expr(g,
                                 member->method_decl.base_args.items[ai], locals);
                         }
+                        coerce_args_to_params(g, g->ctors[ci].fn_type, cargs,
+                                              want_args + 1);
                         zan_call2(g->builder, g->ctors[ci].fn_type, g->ctors[ci].fn,
                                   cargs, (unsigned)(want_args + 1), "");
                         /* the base constructor retains what it stores, so the

@@ -178,16 +178,36 @@
 
   **✅ 落地纪要（2026-07-28）**：`map_type` 的 `TYPE_INT` 正式改为 i32（`long` 保持 i64、ARGB 保留负值对齐 C#）。i32 收窄暴露并已修复的回归：集合槽按源类型做符号/零扩展、`List.RemoveAt` 索引先符号扩展再入 i64 槽、`Gate`/`AsyncGate` 句柄（64 位堆指针）改 `long`（修 Firebird 并发池崩溃）、switch 内含 await 的 case 标签改用常量位宽转换（修 async 漏终结符崩溃）、crypto(Bits/Sha512/AesGcm/BigInt) 与 Firebird(FbWire/FbSql) 的 64 位量迁 `long`、JSON 新增 `FK_LONG` + `AsLong/Long/LongOf`。golden IR 与 gui_css/json_entity_mapping golden 已重刷。焦点子集 203/203 通过。
   **A0-2 / A0-3 仍未做**（FFI 按声明位宽 lower、结构体布局），并入 A2 一起推进。
-* **A0-2** FFI 边界按声明类型的真实位宽 lower。现在 `map_type`（`irgen.c:1601`）对
-  `int`/`uint`/`long`/`nint` 一律给 i64，于是：传参时把 64 位塞给期望 32 位的 C 函数；
-  取返回值时按 64 位读，而 C 只保证低 32 位有效，**高位是未定义的**
-  （今天在 x86-64 上大多碰巧能跑，属于潜伏问题）。
-  这正是 `SDL3/Native.zan` 类注释写明的垫片存在理由：
-  "Zan integers are 64-bit while many SDL C parameters are 32-bit"。
-  **A1-2 期间实测（2026-07-28）**：A0-1 只把 `int` 收窄到 i32，`sbyte/ushort/uint/
-  ulong` 在 `map_type` 里仍一律 i64，所以这些类型的**存储宽度**也是错的——
-  `Span<ushort>` 按 8 字节步长读写（`h[1] = 258` 落到偏移 8），`ushort` 字段同理。
-  A1-2 的 u16 场景先用 `Span<short> + & 65535` 绕过，本条一并在 A0-2 修。
+* **A0-2** ✅ 已修（2026-07-28）**按声明类型的真实位宽 lower**。
+  `map_type`（`irgen.c`）现在给出 `sbyte/byte`=i8、`short/ushort`=i16、
+  `int/uint`=i32、`long/ulong`=i64、`nint/nuint`=指针宽；
+  从内存里取回窄值时新增 `promote_loaded()`，**按 Zan 声明类型**而不是 LLVM 位宽
+  决定 sext/zext（局部变量、隐式字段、静态字段、对象字段、Span 下标、数组元素、
+  调用返回值七条 load 路径）。显式 cast 也按目标声明类型截断/掩码。
+  - `Span<T>` 现在按元素真实宽度做 GEP/load/store（`Span<ushort>` 步长 2 字节），
+    并保持 `align 1` 的非对齐裸内存契约；A1-2 期间 `Span<short> + & 65535` 的
+    临时绕行（`Interop.zan`、`native_memory.zan`）已删除，直接用 `Span<ushort>`。
+  - 顺带修的**真实缺陷**（都是 A0-1 把 `int` 收窄成 32 位后暴露出来的）：
+    * 值结构体构造 `S s = new S();` 会把 8 字节指针存进结构体槽，单 i32 字段的
+      结构体被踩坏（`zan_store_fit()` 现在先按目标结构体类型 load 再 store）。
+    * 构造函数实参没有按形参位宽归一化，`base(c * 2)` 传 i64 给 i32 形参导致
+      LLVM verify 失败（`irgen_emit.c` / `irgen_stmt.c` 现在走 `coerce_args_to_params`）。
+    * `DeterministicRandom.state`（`Game/Foundation/Timing.zan`）是 64 位 LCG 却声明
+      `int`，i32 之后生成器失效 → `long`。
+    * `SharedTable.NativeExtremeAt` 的 `keepLarger` 声明成 `int`，运行时是
+      `int64_t` → `long`（ABI 位宽不符）。
+    * ODBC / SQLite 句柄载体仍是 `int`：`DbConnection.handle/env/stmt`、
+      `SqliteConnection.handle/stmt`、两处 `HandleFromBuf()` 在 `int` 里拼 64 位
+      （`<< 32` 以上全被截断）→ 句柄截断成 32 位后传给 C，必然访问违例。
+      现在句柄一律 `nint`、`HandleFromBuf()` 用 `long` 拼装返回 `nint`，
+      `calloc(long, long)`（`size_t`）、`sqlite3_last_insert_rowid` 返回 `long`。
+  - 新增用例 `tests/conformance/unsigned_widths.zan`：`Span<ushort>/Span<uint>` 步长与
+    字节序、`sbyte/byte/ushort/uint` 静态字段、含窄字段的值结构体按值返回、
+    `uint[]` / `List<uint>` 元素、`(uint)/(ushort)/(byte)/(sbyte)/(short)` 显式 cast。
+  - **验证**：`ctest -j8` **695/695 通过**（含 selfhost gen1 / fixed point）。
+  - 遗留：`zan_iwiden()` 仍只看 LLVM 位宽（i8 分不出 `byte`/`sbyte`、i32 分不出
+    `int`/`uint`），泛型 erased 槽与部分聚合边界还是靠 64 位寄存器形态兜底；
+    真正按声明类型贯通泛型/集合边界归 A2/A3。
 * **A0-3** 结构体字段布局：`register_struct_type`（`irgen.c:1843`）对每个字段直接
   `map_type`，所以 `int` 字段占 **8 字节**，`[repr(C)]` 下与 C 不符。
   A0-1 之后自动修复大半，剩余交给 A2-2。

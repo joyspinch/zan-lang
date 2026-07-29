@@ -767,7 +767,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
     zan_call2(g->builder, printf_type, printf_fn, iargs, 2, "");
     LLVMBuildRetVoid(g->builder);
 
-    /* declare zan_rt_print_uint(uint64) â€?unsigned (%llu) println for ulong */
+    /* declare zan_rt_print_uint(uint64) â†?unsigned (%llu) println for ulong */
     g->rt_print_uint = LLVMAddFunction(g->mod, "zan_rt_print_uint", pint_type);
 
     LLVMBasicBlockRef puint_entry = LLVMAppendBasicBlockInContext(g->ctx, g->rt_print_uint, "entry");
@@ -810,13 +810,13 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
     LLVMTypeRef free_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), free_args, 1, 0);
     g->fn_free = LLVMAddFunction(g->mod, "free", free_type);
 
-    /* void exit(int) â€?used by runtime-check panics */
+    /* void exit(int) â†?used by runtime-check panics */
     LLVMTypeRef exit_args[] = { i32 };
     g->exit_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), exit_args, 1, 0);
     g->fn_exit = LLVMAddFunction(g->mod, "exit", g->exit_type);
 
     if (g->check_leaks) {
-        /* int atexit(void(*)(void)) â€?used to schedule the leak report */
+        /* int atexit(void(*)(void)) â†?used to schedule the leak report */
         LLVMTypeRef void_fn_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), NULL, 0, 0);
         LLVMTypeRef void_fn_ptr = LLVMPointerType(void_fn_type, 0);
         LLVMTypeRef atexit_args[] = { void_fn_ptr };
@@ -927,7 +927,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
     g->uses_socket_async = false;
 
     /* Emit the cooperative coroutine driver inline (the whole Zan runtime is
-     * emitted into the module, so produced programs are self-contained â€?see
+     * emitted into the module, so produced programs are self-contained â†?see
      * the ARC/List helpers below). The ready queue is a singly-linked FIFO of
      * malloc'd nodes {next, frame, step}; zan_co_ready appends, zan_co_sched_run
      * drains, popping+freeing a node before invoking its step (which may itself
@@ -1734,9 +1734,9 @@ static LLVMTypeRef map_type(zan_irgen_t *g, zan_type_t *type) {
     case TYPE_SHORT:  return LLVMInt16TypeInContext(g->ctx);
     case TYPE_INT:    return LLVMInt32TypeInContext(g->ctx);
     case TYPE_LONG:   return LLVMInt64TypeInContext(g->ctx);
-    case TYPE_SBYTE:  return LLVMInt64TypeInContext(g->ctx);
-    case TYPE_USHORT: return LLVMInt64TypeInContext(g->ctx);
-    case TYPE_UINT:   return LLVMInt64TypeInContext(g->ctx);
+    case TYPE_SBYTE:  return LLVMInt8TypeInContext(g->ctx);
+    case TYPE_USHORT: return LLVMInt16TypeInContext(g->ctx);
+    case TYPE_UINT:   return LLVMInt32TypeInContext(g->ctx);
     case TYPE_ULONG:  return LLVMInt64TypeInContext(g->ctx);
     case TYPE_NINT:   return LLVMInt64TypeInContext(g->ctx);
     case TYPE_FLOAT:  return LLVMFloatTypeInContext(g->ctx);
@@ -1782,6 +1782,32 @@ static LLVMTypeRef map_type(zan_irgen_t *g, zan_type_t *type) {
         return LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     }
     default:          return LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    }
+}
+
+/* Widen a value just loaded from a slot of `type` back to the register form
+ * the rest of irgen expects. Memory keeps every integer at its declared width,
+ * but the extension a load needs is a property of the Zan type, not of the
+ * LLVM width: i8 is `byte` (zero) or `sbyte` (sign), i16 is `short` (sign) or
+ * `ushort` (zero), i32 is `int` (sign) or `uint` (zero). The width-driven
+ * default handles the signed side and `byte`; the unsigned wide types and
+ * `sbyte` are the cases it gets backwards, so they extend explicitly and land
+ * in the 64-bit masked form that casts and arithmetic already assume. */
+static LLVMValueRef promote_loaded(zan_irgen_t *g, LLVMValueRef v,
+                                   zan_type_t *type) {
+    if (!v || !type) return v;
+    if (LLVMGetTypeKind(LLVMTypeOf(v)) != LLVMIntegerTypeKind) return v;
+    if (LLVMGetIntTypeWidth(LLVMTypeOf(v)) >= 64) return v;
+    LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
+    switch (type->kind) {
+    case TYPE_SBYTE:
+        return LLVMBuildSExt(g->builder, v, i64t, "sx.i8");
+    case TYPE_USHORT:
+        return LLVMBuildZExt(g->builder, v, i64t, "zx.u16");
+    case TYPE_UINT:
+        return LLVMBuildZExt(g->builder, v, i64t, "zx.u32");
+    default:
+        return v;
     }
 }
 
@@ -1949,7 +1975,7 @@ static void register_struct_type(zan_irgen_t *g, zan_symbol_t *sym) {
     /* Create and register the named struct *before* resolving field types,
      * so that a self- or mutually-referential class field (a pointer to this
      * type) resolves to `%struct.X*` via map_type instead of falling back to
-     * i8* â€?which produced type-mismatched IR (rejected under typed pointers). */
+     * i8* â†?which produced type-mismatched IR (rejected under typed pointers). */
     char name_buf[256];
     snprintf(name_buf, sizeof(name_buf), "struct.%.*s", (int)sym->name.len, sym->name.str);
     LLVMTypeRef st = LLVMStructCreateNamed(g->ctx, name_buf);
@@ -2159,7 +2185,7 @@ static local_var_t *local_find(local_scope_t *scope, zan_istr_t name) {
  * classes with a member layout. List and StringBuilder now carry the same
  * 16-byte rc header (allocated via zan_rt_alloc) and participate in ARC like
  * classes; Dict remains header-less (its backing buffers are still not
- * reclaimed) so ARC must continue to exclude it by name â€?retaining/releasing a
+ * reclaimed) so ARC must continue to exclude it by name â†?retaining/releasing a
  * header-less struct reads a refcount at obj-16 that lands in unrelated heap
  * memory and corrupts it. */
 static int is_builtin_collection_type(zan_type_t *t) {

@@ -293,8 +293,9 @@ static LLVMValueRef emit_expr_identifier(zan_irgen_t *g, zan_ast_node_t *expr,
         local_scope_t *locals) {
         local_var_t *local = local_find(locals, expr->ident.name);
         if (local) {
-            return LLVMBuildLoad2(g->builder, map_type(g, local->type),
-                                 local->alloca, "load");
+            return promote_loaded(g, LLVMBuildLoad2(g->builder,
+                map_type(g, local->type), local->alloca, "load"),
+                local->type);
         }
         /* implicit this.Field access in method bodies */
         if (g->current_this && g->current_type_sym) {
@@ -307,7 +308,9 @@ static LLVMValueRef emit_expr_identifier(zan_irgen_t *g, zan_ast_node_t *expr,
                     LLVMValueRef fptr = LLVMBuildStructGEP2(g->builder, st, this_ptr, (unsigned)fi, "fld");
                     zan_symbol_t *fsym = get_field_sym(g->current_type_sym, expr->ident.name);
                     LLVMTypeRef ft = fsym ? map_type(g, fsym->type) : LLVMInt64TypeInContext(g->ctx);
-                    return LLVMBuildLoad2(g->builder, ft, fptr, "fval");
+                    return promote_loaded(g,
+                        LLVMBuildLoad2(g->builder, ft, fptr, "fval"),
+                        fsym ? fsym->type : NULL);
                 }
             }
         }
@@ -319,7 +322,8 @@ static LLVMValueRef emit_expr_identifier(zan_irgen_t *g, zan_ast_node_t *expr,
             if (gv) {
                 LLVMTypeRef ft = fsym->type ? map_type(g, fsym->type)
                                             : LLVMInt64TypeInContext(g->ctx);
-                return LLVMBuildLoad2(g->builder, ft, gv, "sfld");
+                return promote_loaded(g,
+                    LLVMBuildLoad2(g->builder, ft, gv, "sfld"), fsym->type);
             }
         }
         /* method reference as delegate value: MethodName used as a value
@@ -1964,7 +1968,8 @@ static LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr
                 if (gv) {
                     LLVMTypeRef ft = fs->type ? map_type(g, fs->type)
                                               : LLVMInt64TypeInContext(g->ctx);
-                    return LLVMBuildLoad2(g->builder, ft, gv, "sfld");
+                    return promote_loaded(g,
+                        LLVMBuildLoad2(g->builder, ft, gv, "sfld"), fs->type);
                 }
             }
         }
@@ -2002,7 +2007,9 @@ static LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr
                             LLVMValueRef field_ptr = LLVMBuildStructGEP2(g->builder, st, struct_ptr, (unsigned)fi, "fld");
                             zan_symbol_t *fsym = get_field_sym(type_sym, expr->member.name);
                             LLVMTypeRef field_type = fsym ? map_type(g, fsym->type) : LLVMInt64TypeInContext(g->ctx);
-                            LLVMValueRef fv = LLVMBuildLoad2(g->builder, field_type, field_ptr, "fval");
+                            LLVMValueRef fv = promote_loaded(g,
+                                LLVMBuildLoad2(g->builder, field_type, field_ptr, "fval"),
+                                fsym ? fsym->type : NULL);
                             if (fsym) {
                                 zan_type_t *ct = subst_type_param(fsym->type, local->type);
                                 if (ct != fsym->type) fv = emit_boundary_coerce(g, fv, map_type(g, ct));
@@ -2043,7 +2050,9 @@ static LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr
                         zan_symbol_t *fsym = get_field_sym(cls, expr->member.name);
                         LLVMTypeRef ft = fsym ? map_type(g, fsym->type)
                                               : LLVMInt64TypeInContext(g->ctx);
-                        LLVMValueRef gfv = LLVMBuildLoad2(g->builder, ft, field_ptr, "gfval");
+                        LLVMValueRef gfv = promote_loaded(g,
+                            LLVMBuildLoad2(g->builder, ft, field_ptr, "gfval"),
+                            fsym ? fsym->type : NULL);
                         zan_type_t *rct = infer_expr_type(g, expr->member.object, locals);
                         if (fsym) {
                             zan_type_t *ct = subst_type_param(fsym->type, rct);
@@ -2102,7 +2111,7 @@ static LLVMValueRef emit_expr_index(zan_irgen_t *g, zan_ast_node_t *expr,
                 LLVMValueRef ep = LLVMBuildGEP2(g->builder, elem_llvm, typed, &idx, 1, "spx.ep");
                 LLVMValueRef ld = LLVMBuildLoad2(g->builder, elem_llvm, ep, "spx.elem");
                 LLVMSetAlignment(ld, 1);
-                return ld;
+                return promote_loaded(g, ld, et);
             }
         }
         LLVMValueRef arr_ptr = NULL;
@@ -2252,7 +2261,9 @@ static LLVMValueRef emit_expr_index(zan_irgen_t *g, zan_ast_node_t *expr,
             LLVMValueRef typed_arr = LLVMBuildBitCast(g->builder, arr_ptr,
                 LLVMPointerType(elem_llvm, 0), "arrp");
             LLVMValueRef elem_ptr = LLVMBuildGEP2(g->builder, elem_llvm, typed_arr, &idx, 1, "eidx");
-            return LLVMBuildLoad2(g->builder, elem_llvm, elem_ptr, "elem");
+            return promote_loaded(g,
+                LLVMBuildLoad2(g->builder, elem_llvm, elem_ptr, "elem"),
+                arr_type->element_type);
         }
         return LLVMConstInt(LLVMInt64TypeInContext(g->ctx), 0, 0);
     return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
@@ -3269,9 +3280,17 @@ static LLVMValueRef emit_expr_cast_expr(zan_irgen_t *g, zan_ast_node_t *expr,
         zan_type_t *tt = resolve_type_ctx(g, expr->cast.type);
         LLVMTypeRef target = tt ? map_type(g, tt) : LLVMInt64TypeInContext(g->ctx);
         LLVMTypeRef src = LLVMTypeOf(val);
-        /* Unsigned/small targets share the i64 representation, so their cast
-         * semantics are wrap-to-width masks (zero-extend for uint/ushort,
-         * sign-extend from 8 bits for sbyte) applied on the i64 value. */
+        /* Unsigned targets keep the 64-bit register form even though they are
+         * stored narrow, so their cast semantics are wrap-to-width masks
+         * (zero-extend for uint/ushort, sign-extend from 8 bits for sbyte)
+         * applied on the value widened to 64 bits. */
+        if (tt && LLVMGetTypeKind(src) == LLVMIntegerTypeKind &&
+            LLVMGetIntTypeWidth(src) < 64 &&
+            (tt->kind == TYPE_UINT || tt->kind == TYPE_USHORT ||
+             tt->kind == TYPE_SBYTE || tt->kind == TYPE_ULONG)) {
+            val = zan_iwiden(g->builder, val, LLVMInt64TypeInContext(g->ctx));
+            src = LLVMTypeOf(val);
+        }
         if (tt && LLVMGetTypeKind(src) == LLVMIntegerTypeKind &&
             LLVMGetIntTypeWidth(src) == 64) {
             LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
@@ -3375,7 +3394,8 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
         return emit_expr_assignment(g, expr, locals);
 
     case AST_CALL:
-        return emit_expr_call(g, expr, locals);
+        return promote_loaded(g, emit_expr_call(g, expr, locals),
+                              infer_expr_type(g, expr, locals));
 
     case AST_STRING_INTERP:
         return emit_expr_string_interp(g, expr, locals);

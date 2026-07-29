@@ -390,6 +390,8 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                                     for (int k = 0; k < init->new_expr.args.count; k++) {
                                         call_args[k + 1] = emit_expr(g, init->new_expr.args.items[k], locals);
                                     }
+                                    coerce_args_to_params(g, g->ctors[ci].fn_type,
+                                                          call_args, argc);
                                     zan_call2(g->builder, g->ctors[ci].fn_type,
                                         g->ctors[ci].fn, call_args, (unsigned)argc, "");
                                     free(call_args);

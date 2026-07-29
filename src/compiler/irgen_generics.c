@@ -866,6 +866,14 @@ static LLVMValueRef zan_store_fit(zan_irgen_t *g, LLVMValueRef val, LLVMValueRef
                     src, (unsigned)LLVMConstIntGetZExtValue(idx));
         }
     }
+    /* A value struct that arrives behind a pointer (`S s = new S();`, a byref
+     * receiver) is copied into the slot. Storing the pointer itself writes
+     * eight bytes into a slot that is only as wide as the struct, which
+     * overruns anything smaller than a pointer -- a struct holding a single
+     * i32 field had its stack neighbour clobbered. */
+    if (target && LLVMGetTypeKind(target) == LLVMStructTypeKind &&
+        LLVMGetTypeKind(LLVMTypeOf(val)) == LLVMPointerTypeKind)
+        val = LLVMBuildLoad2(g->builder, target, val, "sv.copy");
     if (target) val = coerce_int_to(g, val, target);
     return LLVMBuildStore(g->builder, val, ptr);
 }
