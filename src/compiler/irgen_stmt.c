@@ -62,10 +62,27 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
  * bodies are emitted inline once per exit path. While emitting body i the stack
  * is truncated to i, so a `return` inside a finally runs only the finallys
  * outside it -- never itself. */
+/* Release the monitor a `lock (obj)` took. The object is reloaded from its
+ * alloca so the call works from any exit path, including ones the entry block
+ * does not dominate. */
+static void emit_monitor_exit(zan_irgen_t *g, LLVMValueRef obj_slot) {
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMTypeRef mon_ty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx),
+                                          &i8ptr, 1, 0);
+    LLVMValueRef exit_fn = LLVMGetNamedFunction(g->mod, "zan_monitor_exit");
+    if (!exit_fn) exit_fn = LLVMAddFunction(g->mod, "zan_monitor_exit", mon_ty);
+    LLVMValueRef obj = LLVMBuildLoad2(g->builder, i8ptr, obj_slot, "lock.obj");
+    zan_call2(g->builder, mon_ty, exit_fn, &obj, 1, "");
+}
+
 static void emit_pending_finallys(zan_irgen_t *g, local_scope_t *locals, int base) {
     if (base < 0) base = 0;
     int saved = g->finally_count;
     for (int i = saved - 1; i >= base; i--) {
+        if (g->finallys[i].monitor_obj) {
+            emit_monitor_exit(g, g->finallys[i].monitor_obj);
+            continue;
+        }
         if (!g->finallys[i].body) continue;
         int saved_locals = locals->count;
         g->finally_count = i;
@@ -81,7 +98,13 @@ static void emit_pending_finallys(zan_irgen_t *g, local_scope_t *locals, int bas
  * overwrites the exception globals. */
 static void emit_finally_on_exception_path(zan_irgen_t *g, local_scope_t *locals,
                                            int fin_idx) {
-    if (fin_idx < 0 || !g->finallys[fin_idx].body) return;
+    if (fin_idx < 0) return;
+    if (g->finallys[fin_idx].monitor_obj) {
+        /* no exception state to preserve: the exit call runs no Zan code */
+        emit_monitor_exit(g, g->finallys[fin_idx].monitor_obj);
+        return;
+    }
+    if (!g->finallys[fin_idx].body) return;
     LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     LLVMValueRef top_g, bufs_g, exc_g;
@@ -1160,6 +1183,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             g->finally_count < ZAN_MAX_FINALLY_DEPTH) {
             fin_idx = g->finally_count++;
             g->finallys[fin_idx].body = stmt->try_stmt.finally_body;
+            g->finallys[fin_idx].monitor_obj = NULL;
             g->finallys[fin_idx].in_try_body = true;
         } else if (stmt->try_stmt.finally_body) {
             zan_diag_emit(g->diag, DIAG_ERROR, stmt->loc,
@@ -1725,10 +1749,31 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             obj = LLVMBuildIntToPtr(g->builder, obj, i8ptr, "lockp");
         else if (LLVMGetTypeKind(ot) == LLVMPointerTypeKind && ot != i8ptr)
             obj = LLVMBuildBitCast(g->builder, obj, i8ptr, "lockp");
+        /* C# lowers `lock` to try/finally, and so does this: a `return`,
+         * `break` or throw out of the body used to walk off with the monitor
+         * still held, which wedges every other thread for good. The object
+         * goes in an alloca so those exit paths can reload it. */
+        LLVMValueRef obj_slot = emit_entry_alloca(g, i8ptr, "lock.slot");
+        zan_store_fit(g, obj, obj_slot);
         zan_call2(g->builder, mon_ty, enter_fn, &obj, 1, "");
+        int lock_fin = -1;
+        if (g->finally_count < ZAN_MAX_FINALLY_DEPTH) {
+            lock_fin = g->finally_count++;
+            g->finallys[lock_fin].body = NULL;
+            g->finallys[lock_fin].monitor_obj = obj_slot;
+            /* a throw in the body has no handler here, so it releases the
+             * monitor at the throw site */
+            g->finallys[lock_fin].in_try_body = false;
+        } else {
+            zan_diag_emit(g->diag, DIAG_ERROR, stmt->loc,
+                "too many nested lock/try-finally blocks in one function body");
+        }
         emit_stmt(g, stmt->lock_stmt.body, locals);
-        if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder)))
-            zan_call2(g->builder, mon_ty, exit_fn, &obj, 1, "");
+        if (lock_fin >= 0) g->finally_count = lock_fin;
+        if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder))) {
+            (void)exit_fn;
+            emit_monitor_exit(g, obj_slot);
+        }
         break;
     }
 

@@ -147,6 +147,9 @@ struct zan_irgen {
      * with no matching clause runs this try's own before rethrowing. */
     struct {
         zan_ast_node_t *body;   /* the finally block's AST */
+        LLVMValueRef monitor_obj; /* set instead of `body` by `lock (obj)`: the
+                                   * alloca holding the locked object, whose
+                                   * monitor every exit path must release */
         bool in_try_body;       /* emitting the guarded body: a throw here is
                                  * taken by this try's own handler, which runs
                                  * the finally itself. False while emitting a
