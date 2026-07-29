@@ -1559,13 +1559,19 @@ header-only 库 / C 回调 / 结构体字段偏移，全部对应 A2 / A3 / A4�
     文字导出的签名（`surface_id` → `ptr,w,h,stride,clip*`）与三条 present 路径；
     `blit_image` 还挂着 C 里的 stb_image 解码缓存（解码留 C，只搬采样循环）。
     Windows present 已经只要 `pixels/w/h`（`Win32Shell.Blit`），不构成阻塞。
-  - 〔查过一次，不是缺陷，记下来省得下次再查〕`conformance_gui_icon` 一度要跑
-    **331 秒**（全套 `ctest -j8` 的最大热点，还会把并发跑的 wechat determinism
-    挤超时）：`Icon.Draw` 在 box ≤ 15 时每次 7～15 秒，box 16 起 0 毫秒。
-    起因是 `build/` 里的 `zan_gui.dll` 是旧源码编出来的存货——`cmake --build
-    build --target zan_gui` 重编一次之后同一个用例 **0.07 秒**。当前
-    `src/runtime/gui_runtime.c` 的 `zan_gui_draw_line` 没有这个问题。
-    `ctest` 不负责重编 driver DLL，量 GUI 性能前先重编它。
+  - 〔已定位并修掉，`d9dcf1c`〕`conformance_gui_icon` 一度要跑 **331 秒**（全套
+    `ctest -j8` 的最大热点，还会把并发跑的 wechat determinism 挤超时）：
+    `Icon.Draw` 在 box ≤ 15 时每次 7～15 秒，box 16 起 0 毫秒。真正的原因是
+    **仓库里签入的 `stdlib/Gui/drivers/win-x64/zan_gui.dll` 是 7-27 的存货**，
+    停在 `e577ce2`（A2-0b 给 GUI 原生 ABI 定宽）之前——Zan 侧现在按声明位宽传参，
+    旧 DLL 按老宽度取，`zan_gui_draw_line` 收到的坐标/线宽带上了寄存器残留，
+    于是在 bbox 循环里空转几秒。同一个可执行文件，只换 DLL：签入的旧驱动 12 秒，
+    `scripts\build_gui_driver.ps1` 重新生成的驱动 0 毫秒。
+    〔教训〕签入的 driver 二进制不会跟着 `cmake --build` 走，凡是改了
+    `src/runtime/gui_runtime.c` 的导出或参数宽度，必须跑一次
+    `scripts\build_gui_driver.ps1` 把 `stdlib/Gui/drivers/win-x64/` 一起更新；
+    只有 win-x64 能在本机重生成，linux/macOS 的驱动仍是 `c168ffc` 的存货，
+    同样的 A2-0b 位宽问题还在，等对应平台上重编。
 * **B5-2 🟡 大部分完成**（`067ec4e` 删掉 C Win32 shell 与 link-only shims）。
   〔2026-07-29 核实〕`gui_runtime_shims.c` 从 160 行降到 3.5KB，里面**只剩
   macOS 非-Cocoa（SDL windowing）构建的 22 个 WebView no-op 桩**（`#if defined(__APPLE__)
