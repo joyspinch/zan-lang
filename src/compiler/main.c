@@ -1565,6 +1565,57 @@ int main(int argc, char **argv) {
             }
         }
 
+        /* Cross-linking to macOS is dynamic: a [DllImport] lib resolves from
+         * the per-target driver dylib shipped inside the owning stdlib module
+         * (<module>/drivers/<target-sub>/lib<name>.dylib), which the link
+         * records as @rpath/... and --publish copies next to the executable.
+         * The dylib's own framework dependencies (Cocoa, WebKit, ...) are bound
+         * on the target Mac, which is what lets a Windows/Linux host cross-link
+         * a GUI program without an Apple SDK. A lib with no bundled dylib has
+         * its externs stubbed, exactly as on the Linux cross path. */
+        char cross_dylibs[16][1200];
+        int cross_dylib_count = 0;
+        if (cross_compiling && target.os == ZAN_OS_MACOS) {
+            zan_driver_registry_t mac_reg;
+            zan_discover_drivers(resolved_stdlib_root, &mac_reg);
+            const char *dsub = zan_driver_subdir(&target);
+            for (int li = 0; li < irgen.extern_lib_count; li++) {
+                int nlen;
+                const char *nm = zan_dllimport_lname(
+                    irgen.extern_libs[li].str,
+                    (int)irgen.extern_libs[li].len, &nlen);
+                if (!nm) continue; /* CRT/libc/libm: resolved by libSystem */
+                char dylib[1200];
+                dylib[0] = '\0';
+                int didx = zan_driver_find(&mac_reg, nm, nlen);
+                if (didx >= 0 && resolved_stdlib_root[0]) {
+                    snprintf(dylib, sizeof(dylib),
+                             "%s/%s/drivers/%s/lib%.*s.dylib",
+                             resolved_stdlib_root,
+                             mac_reg.entries[didx].module, dsub, nlen, nm);
+                }
+                if (dylib[0] && zan_file_exists(dylib)) {
+                    if (cross_dylib_count < 16) {
+                        snprintf(cross_dylibs[cross_dylib_count],
+                                 sizeof(cross_dylibs[0]), "%s", dylib);
+                        cross_dylib_count++;
+                    }
+                } else {
+                    int n = zan_irgen_stub_extern_lib(
+                        &irgen, irgen.extern_libs[li].str,
+                        (int)irgen.extern_libs[li].len);
+                    if (n > 0) {
+                        fprintf(stderr,
+                                "warning: no %s driver dylib for "
+                                "[DllImport(\"%.*s\")]; its %d function(s) "
+                                "are stubbed and will fail at runtime\n",
+                                dsub, (int)irgen.extern_libs[li].len,
+                                irgen.extern_libs[li].str, n);
+                    }
+                }
+            }
+        }
+
         /* emit object file */
         char obj_tmp[1024];
         snprintf(obj_tmp, sizeof(obj_tmp), "%s.o", obj_path);
@@ -2093,6 +2144,16 @@ int main(int argc, char **argv) {
                 snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"",
                          extra_link_inputs[ei]);
             }
+            for (int di = 0; di < cross_dylib_count; di++) {
+                size_t cur = strlen(cmd);
+                snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"",
+                         cross_dylibs[di]);
+            }
+            if (cross_dylib_count > 0) {
+                size_t cur = strlen(cmd);
+                snprintf(cmd + cur, sizeof(cmd) - cur,
+                         " -rpath @loader_path");
+            }
             { size_t cur = strlen(cmd);
               snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"", tbd); }
             link_ret = system(cmd);
@@ -2403,6 +2464,8 @@ int main(int argc, char **argv) {
                 } else if (win_target) {
                     snprintf(cands[ncand++], sizeof(cands[0]), "%s.dll", drv);
                     snprintf(cands[ncand++], sizeof(cands[0]), "lib%s.dll", drv);
+                } else if (target.os == ZAN_OS_MACOS) {
+                    snprintf(cands[ncand++], sizeof(cands[0]), "lib%s.dylib", drv);
                 } else {
                     snprintf(cands[ncand++], sizeof(cands[0]), "lib%s.so", drv);
                 }
