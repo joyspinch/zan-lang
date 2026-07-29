@@ -177,7 +177,7 @@
   `ChartView` 里的颜色算术改成 `Color` 上的方法。
 
   **✅ 落地纪要（2026-07-28）**：`map_type` 的 `TYPE_INT` 正式改为 i32（`long` 保持 i64、ARGB 保留负值对齐 C#）。i32 收窄暴露并已修复的回归：集合槽按源类型做符号/零扩展、`List.RemoveAt` 索引先符号扩展再入 i64 槽、`Gate`/`AsyncGate` 句柄（64 位堆指针）改 `long`（修 Firebird 并发池崩溃）、switch 内含 await 的 case 标签改用常量位宽转换（修 async 漏终结符崩溃）、crypto(Bits/Sha512/AesGcm/BigInt) 与 Firebird(FbWire/FbSql) 的 64 位量迁 `long`、JSON 新增 `FK_LONG` + `AsLong/Long/LongOf`。golden IR 与 gui_css/json_entity_mapping golden 已重刷。焦点子集 203/203 通过。
-  **A0-2 / A0-3 仍未做**（FFI 按声明位宽 lower、结构体布局），并入 A2 一起推进。
+  **A0-2 / A0-3 已完成**（FFI 按声明位宽 lower 见下条；结构体布局随 A0-2 + A2-2 落地，见 A0-3）。
 * **A0-2** ✅ 已修（2026-07-28）**按声明类型的真实位宽 lower**。
   `map_type`（`irgen.c`）现在给出 `sbyte/byte`=i8、`short/ushort`=i16、
   `int/uint`=i32、`long/ulong`=i64、`nint/nuint`=指针宽；
@@ -208,9 +208,14 @@
   - 遗留：`zan_iwiden()` 仍只看 LLVM 位宽（i8 分不出 `byte`/`sbyte`、i32 分不出
     `int`/`uint`），泛型 erased 槽与部分聚合边界还是靠 64 位寄存器形态兜底；
     真正按声明类型贯通泛型/集合边界归 A2/A3。
-* **A0-3** 结构体字段布局：`register_struct_type`（`irgen.c:1843`）对每个字段直接
-  `map_type`，所以 `int` 字段占 **8 字节**，`[repr(C)]` 下与 C 不符。
-  A0-1 之后自动修复大半，剩余交给 A2-2。
+* **A0-3** ✅ 已完成（2026-07-28，随 A0-1 / A0-2 / A2-2 落地）结构体字段布局。
+  `register_struct_type`（现在在 `irgen.c:2017` 一带）仍然对每个字段走 `map_type`，
+  但 `map_type` 自 A0-2 起按声明类型给真实位宽（`int`→i32、`short`→i16…），
+  所以顺序布局的字段宽度与 C 一致；LLVM 对非 packed 结构体的填充/对齐本来就同 C，
+  A2-1 的「27 种形状 × 4 target 与 clang 声明零差异」即是这条的验证。
+  显式布局（`[StructLayout(Explicit)]` + `[FieldOffset(n)]`，含 union）见 A2-2。
+  **仍未做**（归 A2-2 尾部）：`Pack = n` packed 布局、`[FieldOffset]` 用在顺序布局
+  类型上的校验。
 * **判定**：`unsigned_types` / `int_width` / `numeric_cast` 三个 conformance 保持通过
   （`int_width.zan` 里 `int n = s.Length`、`i < xs.Count` 这类 i64→i32 隐式窄化
   要一并处理）；新增 extern 位宽用例：调 C 侧 `int32_t` 收发函数，值域两端不失真。
@@ -366,7 +371,8 @@ static extern int zan_gui_present(int hwnd, int surfaceId);
   **遗留（A0-2）**：`map_type()` 把 `sbyte/ushort/uint/ulong` 一律映射成 i64，
   所以 `Span<ushort>` 实际按 8 字节步长读写。这批 u16 场景先用
   `Span<short> + & 65535` 绕过，无符号原生宽度待 A0-2 修。
-* **A1-3** 提供 `byte[]` / `Span<byte>` 作为全库统一的字节缓冲类型（配合 B2）。
+* **A1-3** ✅ 已完成（2026-07-28，`dd498ff`）`byte[]` 作为全库统一的字节缓冲类型
+  + `s.ToBytes()` / `b.ToStr()` 桥接，详见 B2 章开头。
 * **判定**：Zan 版 `blur_rect` / `fill_radial` / `blit_image` 对 C 版基准 ≥0.9x。
   达不到先修优化管线，不要往下推进。
 
@@ -871,7 +877,7 @@ catch 块内的挂起、foreach 的降级与状态切分冲突。所以是**定�
 
 用例 `tests/conformance/byte_buffer.zan`（含 conformance / determinism / leakcheck 三档）。
 
-**B2-1 部分完成：Aes / AesGcm / ResourcePack 这一条链已改为 `byte[]`。**
+**B2-1 第一批 ✅ 已完成：Aes / AesGcm / ResourcePack 这一条链已改为 `byte[]`。**
 `Aes` 的 `inv` / 轮密钥 / state / 输出缓冲、`AesGcm` 的 blk / lb / j0 / ctr / 密文明文，
 以及 `ResourcePack` 的密文列表与 `Read()` 返回值全部换成 `byte[]`，
 两个类里的 `extern string calloc` / `extern void free` 声明连同 **23 处 `free()`**
@@ -1192,7 +1198,7 @@ RA2 demo(76 files) 编译通过。
   的记录：新旧两版 `CharOf` 逐字相同，`expected_mix.out` 本就对不上，用户已明确
   「RA2 先不管」）。
 
-* **B2-1（剩余）** `extern string calloc(...)`：**stdlib / src / examples 均已清零**，
+* **B2-1 ✅ 已完成（2026-07-29，第十一批收尾）** `extern string calloc(...)`：**stdlib / src / examples 均已清零**，
   只剩 `tests/` 里少数刻意保留的 native-ABI 用例（`ffi_free_consumes_string` 专测
   `free` 消费 string 的语义，`firebird_wire`/`mysql_stmt_binary`/`odbc_buffers`/
   `sqlserver_tds`/`rts_*`/`zandb_p6`/`selfhost/prog1` 等自建 C 缓冲的测试）
@@ -1504,39 +1510,47 @@ RA2 demo(76 files) 编译通过。
 能在 Zan 里重写（连 WndProc 都是 delegate）。真正的阻塞是 union / 宏 API /
 header-only 库 / C 回调 / 结构体字段偏移，全部对应 A2 / A3 / A4。
 
-* **B5-1** 〔A0+A1 后〕光栅器搬 Zan：`gui_runtime.c` 的 19 个导出
+* **B5-1**（未开始，〔A0+A1 已就绪，可以动手〕；2026-07-29 核实 `gui_runtime.c`
+  仍有 **28 个导出** / 54KB）光栅器搬 Zan：`gui_runtime.c` 的 19 个导出
   （surface / clip / 全部图元 / blur / snapshot）。**关键一刀是 surface 所有权**——
   改由 Zan 持有后，present 签名从 `(hwnd, surface_id)` 改为 `(ptr, w, h, stride)`，
   `internal_surface_data/clip` 两个内部口子随之删除，其余全是跟随项。
   动手前先给 `blur_rect` / `fill_radial` / `blit_image` 做基准，
   它们是玻璃主题下单帧最贵的循环。
-* **B5-2** 删 `gui_runtime_shims.c` 全部桩（160 行，**零真运行时**，
-  存在理由只是"让链接过得去"；24 个 WebView 桩在 Windows 上已无调用方）。
-  Zan 侧 `#if` 兜底。其中 `write_file` 实际调 `fopen`/`fwrite`/`fclose`，
-  归入系统 IO，不要留在 GUI shim 里。
-* **B5-3** 搬 `gui_runtime_font.c` 的 `draw_icon`（约 300 行纯矢量）+ 位图字体。
-* **B5-4** 删 `gui_runtime_text.c:325-1360` 的 Win32 窗口壳——
-  未提交的 `Native.zan` 已把 `#if WINDOWS` 全线切到 `Win32Shell.zan`，
-  **这段在 Windows 上已是死代码**。Windows 只剩 `set_clipboard` / `get_clipboard` /
-  `set_ime_pos` / `write_file` 4 个走 C，补进 `Win32Shell.zan` 即清零。
-* **B5-5** 〔A2 后〕`X11Shell.zan`：先搬**错放在 `gui_runtime_font.c:769-1058`**
-  的那 15 个 X11 窗口管理导出（最容易，顺手修掉"窗口管理住在字体文件里"的结构债）。
+* **B5-2 🟡 大部分完成**（`067ec4e` 删掉 C Win32 shell 与 link-only shims）。
+  〔2026-07-29 核实〕`gui_runtime_shims.c` 从 160 行降到 3.5KB，里面**只剩
+  macOS 非-Cocoa（SDL windowing）构建的 22 个 WebView no-op 桩**（`#if defined(__APPLE__)
+  && !defined(ZAN_GUI_COCOA)`）。Windows 已改由 Zan 直驱 WebView2 COM（`c168ffc`，
+  `stdlib/Gui/WebView2.zan`），其余平台走 `WebViewBackend` 自带兜底；`write_file`
+  已不在 shim 里。**剩余**：macOS 那条分支要么接真 WKWebView、要么让 Zan 侧 `#if` 兜底后整文件删掉。
+* **B5-3 ✅ 已完成**（`406c451` gui: draw icons in Zan as vector primitives）。
+  〔核实〕`draw_icon` 在 `src/runtime/*.c` 里已**零匹配**。
+* **B5-4 ✅ 已完成**（`067ec4e`）删 `gui_runtime_text.c` 的 Win32 窗口壳。
+  〔核实〕`gui_runtime_text.c` 现在 11.9KB、**只剩 3 个文字导出**（`draw_text` /
+  `measure_text` / `font_height`），文件头已注明「窗口类/WndProc/事件队列/present/
+  剪贴板/IME/组合玻璃住在 `stdlib/Gui/Win32Shell.zan`」；`Win32Shell.zan` 里
+  clipboard / ime_pos / write_file 共 26 处实现。
+* **B5-5** 〔A2 后〕`X11Shell.zan`：X11 窗口管理导出 **已从 `gui_runtime_font.c` 离开**
+  （该文件现在 `XOpenDisplay`/`XCreateWindow` 零匹配，结构债已修），但落在新的
+  `src/runtime/gui_runtime_x11.c`（30KB / **25 个导出**），**仍是 C，本条未完成**。
   注意 `DefaultScreen` / `DefaultVisual` / `DefaultDepth` / `RootWindow` 是宏，
   用函数版 `XDefaultScreen` / `XDefaultVisual` / `XDefaultDepth` / `XRootWindow` 代替，
   这一条不构成阻塞。
 * **B5-6** 〔A2+A3 后〕SDL 后端（window registry / event queue / dirty rect /
   texture 上传）改由 Zan 组织，C facade 退回纯绑定；Cocoa 后端
   （`objc_allocateClassPair` + `class_addMethod` 造类）。
-* **B5-7** 终态：删除 `zan_gui`(103 处 import) 和 `zan_sdl3`(78 处) 两个自建垫片。
-  `user32`(81) / `kernel32`(73) / `gdi32`(38) / `odbc`(24) / `ws2_32` / `imm32` /
-  `dwmapi` / `psapi` 这些直接绑 OS 的**是正确形态，不动**。
+* **B5-7** 终态：删除 `zan_gui` 和 `zan_sdl3` 两个自建垫片。
+  〔2026-07-29 重新计数（stdlib+src+examples 的 `[DllImport("x")]`）〕`zan_gui` **108**、
+  `zan_sdl3` **78**——未减少，本条未开始（依赖 B5-1 / B5-5 / B5-6）。
+  `user32`(现 56) / `kernel32`(现 9) / `gdi32`(现 30) / `crt`(现 90) / `odbc` / `ws2_32` /
+  `imm32` / `dwmapi` / `psapi` 这些直接绑 OS 的**是正确形态，不动**。
 
 ## B6 工具链 Zan 化 〔依赖 A3 + A6〕
 
-`src/` 下非 compiler 的 C，**工具链一共 265KB，比 GUI runtime 还多**：
-`lsp/intellisense.c` 82KB、`lsp/lsp_main.c` 65KB、`dap/debugger.c` 40KB、
-`dap/dap_main.c` 27KB、`common/json.c` 15KB、`doc/zandoc.c` 14KB、
-`pkg/zanpkg_main.c` 12KB、`fmt/zanfmt.c` 7KB、`common/rpc.c` 3KB。
+`src/` 下非 compiler 的 C。〔2026-07-29 重新度量〕仍是 C 的共 **约 230KB**：
+`lsp/intellisense.c` 84KB、`lsp/lsp_main.c` 67KB、`dap/debugger.c` 41KB、
+`dap/dap_main.c` 28KB、`common/json.c` 15KB、`common/rpc.c` 3KB。
+（`doc/zandoc.c` / `fmt/zanfmt.c` 已是 Zan；`pkg/zanpkg_main.c` 随包管理器整体删除。）
 按规则这些既不是 compiler 也不是 runtime，全都该是 Zan。
 
 进度：
@@ -1555,8 +1569,8 @@ header-only 库 / C 回调 / 结构体字段偏移，全部对应 A2 / A3 / A4�
 
 ## B7 runtime 边界复核
 
-`rt_io.c` 67KB、`rt_sync.c` 49KB、`rt_sched.c` / `rt_mem.c` / `rt_co.c` /
-`rt_crash.h` / `rt_wasm.c` 26KB。真 reactor / 调度 / 同步原语 / 内存分配留 C 没问题，
+〔2026-07-29 实测大小〕`rt_io.c` **77KB**、`rt_sync.c` 49KB、`rt_sched.c` 10KB /
+`rt_mem.c` 7.6KB / `rt_co.c` 2.3KB / `rt_crash.h` 5KB / `rt_wasm.c` 0.8KB。真 reactor / 调度 / 同步原语 / 内存分配留 C 没问题，
 但要逐个过一遍：如果混了 HTTP 解析、编码转换、路径处理这类纯逻辑，上移到 Zan。
 
 ---
@@ -1641,12 +1655,12 @@ header-only 库 / C 回调 / 结构体字段偏移，全部对应 A2 / A3 / A4�
 | **0** | ~~A8-1~~ ✅ / ~~A8-2~~ ✅ / ~~A8-3~~ ✅ / ~~A8-4~~ ✅ / ~~A8-12~~ ✅ / ~~A8-13~~ ✅ / ~~A8-14~~ ✅ / ~~A8-15~~ ✅（catch 内再抛跳错 handler、抛出点双重释放、被放弃 handler 泄漏异常、异常落地用帧覆盖栈槽、表达式里的 await 被当 `int`；+ 顺带修掉 A8-8 foreach break/continue、A8-9 `var`+await 类型、A8-10 测试重复编译） | **三份 repro 全部实测仍成立，两个比文档记的更严重**。ARC 与异常/协程交互不可靠 ⇒ 任何 Zan 上层代码都不可信，而"上层全用 Zan"是整个计划的地基 |
 | **0.5** | ~~**A7-1**~~ ✅（修约束接口方法调用的 codegen 崩溃）/ ~~A7-2~~ ✅（构造类型的静态成员访问）/ ~~A7-4~~ ✅（无花括号单语句体）；~~**A7-5**~~ ✅（泛型字段在 `T` 为引用类型时取值错误/堆损坏，四个缺陷） | 已全部实测修复；A7-5 曾阻塞 B3-1，现已解除 |
 | **1** | ~~**A0-0**（句柄型 extern 改 `nint`）~~ ✅ 已完成（330 处 / 26 文件，553/553）；**A0-0c**（socket 句柄统一 `nint`）已完成（562/562，窄化警告 51 → 0）、**A0-0d** 句柄部分已完成（`rt_io` → `intptr_t`，`zan_gui_*` 句柄 → `iptr`；位宽部分并入 A0-1/A0-2）；余下 C4 / C5 / C7（删残桩、提交游离文档、游戏计划归到项目文档层） | A0-0 在 int 还是 64 位时零语义变化，是切 int=32 的安全前置。清理放这里而不是更早：`ABI.md` 这类失真文档在 A2 落地前仍是唯一的目标 ABI 参照，**先实现、后按实现重写文档**，不要先清场 |
-| **2** | **A0-1 / A0-2 / A0-3**（int=32 + FFI 位宽 + 结构体布局） | 一切 FFI 和编解码工作的前置 |
-| **3** | **A1** `Span<T>` + **B2**（用它清掉 49 处 calloc-as-string） | 能力与清理配对落地 |
-| **4** | B5-1 ~ B5-4（光栅器、shims、draw_icon、Win32 死代码） | A0+A1 就绪即可做，GUI 侧收益最大 |
-| **5** | **A2** FFI ABI → B5-5 / B5-6（X11 / SDL / Cocoa） | 大工程，前面跑通再上 |
-| **6** | **A3** bindgen + **A6** 编译器 API → **B6** 工具链 Zan 化 | 265KB C 的出口 |
-| **7** | A4 / A5、B1-1 Sdk 生成器、B1-2 Game 文档与提炼、B3 提炼、B4 错误约定、B7 runtime 复核、C1/C2/C3/C6/C8/C9/C10/C11 文档重写 | 收尾 |
+| **2** | ~~**A0-1 / A0-2 / A0-3**（int=32 + FFI 位宽 + 结构体布局）~~ ✅ 全部完成（2026-07-28） | 一切 FFI 和编解码工作的前置 |
+| **3** | ~~**A1** `Span<T>`（A1-1/A1-2/A1-3 ✅）~~ + **B2** ✅ 生产代码 calloc-as-string 已清零（十一批，只剩 tests 里刻意保留的 native-ABI 用例） | 能力与清理配对落地 |
+| **4** | B5-1 ~ B5-4：~~B5-3 draw_icon~~ ✅ / ~~B5-4 Win32 死代码~~ ✅ / B5-2 🟡 只剩 macOS WebView 桩；**B5-1 光栅器仍未开始**（`gui_runtime.c` 28 个导出） | A0+A1 就绪即可做，GUI 侧收益最大 |
+| **5** | **A2**（A2-0/A2-1/A2-2 ✅；仅剩 **A2-3** 变参 / **A2-4** signext+callconv）→ B5-5 / B5-6（X11 / SDL / Cocoa） | 大工程，前面跑通再上 |
+| **6** | **A3** bindgen + **A6** 编译器 API → **B6** 工具链 Zan 化 | 仍在 C 的约 230KB（LSP/DAP/json/rpc）的出口 |
+| **7** | A4 / A5、~~B1-1 Sdk 生成器~~ ✅、B1-2 Game 文档与提炼、B3 提炼（B3-0/B3-1 ✅、B3-2 🚧）、~~B4 错误约定~~ ✅（B4-1/2/3）、B7 runtime 复核、C 组文档（C1/C3/C4/C5/C6/C7/C8/C10/C11 ✅，剩 **C2 四份** 与 **C9**） | 收尾 |
 
 **节奏**：每补完一项能力，立刻用它改掉对应的那批 stdlib，拿真实场景验收，
 再进下一阶段。不要攒——否则能力做完了才发现设计不趁手。
@@ -1666,7 +1680,8 @@ A15-8（数组没有长度，字段/参数上 `.Length` 和 foreach 都不可用
 （`a44a807`），A15-9（irgen 用 C 硬编码 43 个静态库调用，屏蔽 Zan 实现）
 已按 Path/File/Directory 处理（`b0f74ac`、`1cd90dd`）。
 A15-6（`char` 按字符打印、`ulong` 十进制字面量不再夹断）已修，
-新增 `char_and_ulong_text` conformance。A15-4 / A15-5 未做。**
+新增 `char_and_ulong_text` conformance。A15-4 已完成（元素槽按 stride，见 A30）；
+**A15-5（全库 0 处 `switch`）仍未做**。**
 
 标准库里那些"看着绕"的封装，多数不是风格问题，是被下面这些缺口逼出来的。
 每条都用最小程序实测过，不是读代码推断的。
@@ -1708,11 +1723,12 @@ const int K = 7;                // 解析错误 "expected type"；static readonl
 `if (bg == Color.None())`。运算符重载在 class 上可用、在 struct 上产出非法
 IR，是 irgen 的分支缺失。
 
-## A15-4 集合元素槽固定 8 字节
+## A15-4 集合元素槽固定 8 字节 — ✅ 已完成（见 A30）
 
-`List<T>` / `Dictionary` 的元素槽是裸 `i64`，所以 struct 元素要打包/解包
-（`33a66df`），超过 8 字节的只能报错。真正的修法是按元素大小/stride 存，
-和 A1 `Span<T>` 一起做。
+原状：`List<T>` / `Dictionary` 的元素槽是裸 `i64`，struct 元素要打包/解包
+（`33a66df`），超过 8 字节的只能报错。现已按 stride 存放（`0fc30b4`），
+证据与遗留限制（`Dictionary` 值槽仍 8 字节、宽 struct 的 `IndexOf`/`Insert` 等
+给明确编译错误）见 **A30**。
 
 ## A15-5 `switch` 全库 0 处使用
 
@@ -1795,7 +1811,7 @@ irgen 按"类名 + 方法名"直接 lower 了 **43 个**静态库调用
 2. ~~A15-3 struct `==` / 运算符重载 / `const`~~ 已完成（`1dd023d`）；
 3. 用修好的语言能力改正封装：`byte[]` 取代 string/NativeMemory 字节缓冲
    （B2 的 49 处）、`foreach` 取代下标 while 循环；
-4. A15-4 元素槽 + 数组长度头（与 A1 `Span<T>` 合并）；
+4. ~~A15-4 元素槽 + 数组长度头（与 A1 `Span<T>` 合并）~~ 已完成（A30 / A15-8）；
 5. A15-5 用 `switch` 重写属性分派（与颜色迁移同批）。
 
 ---
