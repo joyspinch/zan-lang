@@ -1655,7 +1655,8 @@ int main(int argc, char **argv) {
             rt_sync_obj = rt_sync_buf;
         }
 #endif
-        if (cross_compiling && rt_sync_obj && target.os != ZAN_OS_LINUX) {
+        if (cross_compiling && rt_sync_obj && target.os != ZAN_OS_LINUX
+            && target.os != ZAN_OS_MACOS) {
             fprintf(stderr,
                     "error: AtomicInt and SharedTable are not available for "
                     "this cross-compilation target yet\n");
@@ -2025,7 +2026,12 @@ int main(int argc, char **argv) {
              * bundled libSystem text stub (macos/libSystem.tbd, an
              * MIT-licensed symbol list -- no Apple SDK is redistributed).
              * All macOS system libraries live behind /usr/lib/libSystem.B
-             * on the target, so a console executable only needs -lSystem. */
+             * on the target, so a console executable only needs -lSystem.
+             *
+             * Socket-async and AtomicInt/SharedTable programs additionally
+             * link the Mach-O builds of the reactor and the sync runtime from
+             * macos/<arch>/ (kqueue and pthread/shm code paths of the same
+             * sources; every symbol they import is in libSystem). */
             char exe_dir2[1024];
             zan_exe_dir(exe_dir2, sizeof(exe_dir2));
             char tbd[1200];
@@ -2041,24 +2047,47 @@ int main(int argc, char **argv) {
                 free(source);
                 return 1;
             }
-            if (rt_io_obj || irgen.uses_sync_runtime) {
+            const char *march = (target.arch == ZAN_ARCH_AARCH64)
+                                ? "arm64" : "x86_64";
+            char macrt[1200];
+            snprintf(macrt, sizeof(macrt), "%s/macos/%s", exe_dir2,
+                     (target.arch == ZAN_ARCH_AARCH64) ? "arm64" : "x64");
+            char macrt_io[1400] = {0};
+            char macrt_sync[1400] = {0};
+            if (rt_io_obj) {
+                snprintf(macrt_io, sizeof(macrt_io), "%s/%s", macrt,
+                         mt_scheduler ? "zanrt_io_mt.o" : "zanrt_io.o");
+            }
+            if (rt_sync_obj) {
+                snprintf(macrt_sync, sizeof(macrt_sync), "%s/zanrt_sync.o",
+                         macrt);
+            }
+            if ((macrt_io[0] && !zan_file_exists(macrt_io))
+                || (macrt_sync[0] && !zan_file_exists(macrt_sync))) {
                 fprintf(stderr,
-                        "error: socket-async/sync-runtime programs are not "
-                        "available for macOS cross-compilation yet\n");
+                        "error: bundled macOS runtime objects not found in "
+                        "'%s'; reinstall zan or rebuild with toolchain/macos "
+                        "present (see scripts/build_macos_rt.sh)\n", macrt);
                 remove(obj_tmp);
                 zan_irgen_destroy(&irgen);
                 zan_arena_free(arena);
                 free(source);
                 return 1;
             }
-            const char *march = (target.arch == ZAN_ARCH_AARCH64)
-                                ? "arm64" : "x86_64";
             char cmd[8192];
             snprintf(cmd, sizeof(cmd),
                      "ld64.lld -arch %s -platform_version macos 11.0 11.0"
                      "%s -o \"%s\" \"%s\"",
                      march, publish_mode ? " -dead_strip" : "",
                      obj_path, obj_tmp);
+            if (macrt_io[0]) {
+                size_t cur = strlen(cmd);
+                snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"", macrt_io);
+            }
+            if (macrt_sync[0]) {
+                size_t cur = strlen(cmd);
+                snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"", macrt_sync);
+            }
             for (int ei = 0; ei < extra_link_input_count; ei++) {
                 size_t cur = strlen(cmd);
                 snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"",

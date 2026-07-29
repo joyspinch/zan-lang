@@ -2222,3 +2222,55 @@ load → add → store 三件套（`src/compiler/irgen.c` 里 `zan_rt_alloc` /
 > `unsigned_types` 的全部数值语义；`Path.zan` 的 calloc-as-string 惯用法；
 > 泛型第 5 条（Dictionary 装泛型类值）与第 6 条（`foreach Dictionary.Keys`）；
 > async 的 try 体 / finally / switch / while / 嵌套 try / 跨协程异常传播。
+
+# A31 · macOS 交叉编译解锁 async + 原子（2026-07-29，已实测）
+
+**动机**：`docs/platform-targets.md` 原写「macOS 交叉 = console/compute only」，
+`main.c` 对 `rt_io_obj || irgen.uses_sync_runtime` 直接 `error:` 退出，原因是
+`zanrt_io.o`/`zanrt_sync.o` 只为 linux-musl 预编译过，没有 Mach-O ABI 版本。
+
+**做法**（对齐 AotAnywhere 的思路：宿主机不需要 Apple SDK / 不需要 Mac）：
+
+* `scripts/build_macos_rt.sh` —— 用 `zig cc -target {aarch64,x86_64}-macos.11.0`
+  编 `src/runtime/rt_io.c`（走文件里已有的 kqueue 分支）与 `rt_sync.c`，产出
+  `toolchain/macos/<arch>/zanrt_io.o` / `zanrt_io_mt.o`（`-DZAN_CO_DRIVER`，
+  `--async-workers` 用）/ `zanrt_sync.o`。zig 自带 Darwin libc 头，所以这一步在
+  Linux/Windows 上都能跑。`.11.0` 后缀让 `LC_BUILD_VERSION minos` 与 zanc 传给
+  ld64.lld 的 `-platform_version macos 11.0` 一致，否则每次链接都告警。
+* `scripts/check_macos_rt.py` —— 解析这 6 个对象的 undefined 符号，断言全部落在
+  `toolchain/macos/libSystem.tbd` 的导出表内（唯一例外 `_zan_co_ready`，由被编译
+  程序自身的内联协程驱动提供）。这样「stub 少一个符号」在我们这里就暴露，而不是
+  等用户链接时才炸。〔实测〕6/6 ok。
+* `main.c`：macOS 交叉分支不再硬报错，按目标架构挑
+  `<zanc>/macos/{arm64,x64}/zanrt_io{,_mt}.o`、`zanrt_sync.o` 加入 ld64.lld 命令行，
+  对象缺失时报明确错误并指向 `scripts/build_macos_rt.sh`；`rt_sync_obj` 的
+  「仅 Linux 可交叉」判断放行 macOS。CMake 的 `copy_directory toolchain/macos`
+  已经递归，子目录自动随 zanc 分发。
+
+**顺带修掉一个更基础的 bug**：macOS 交叉连 `Console.WriteLine` 的 hello world 都
+链不上 —— irgen 为非 Windows 目标发 `stdout`/`stdin` 全局，但 Darwin libSystem 只导出
+`__stdoutp`/`__stdinp`（`_stdout` 在 libSystem.tbd 里确实不存在，已核对）。加
+`irgen_t.target_is_macos`（由 target triple 含 `apple`/`darwin` 判定，本机 macOS
+编译走 `#ifdef __APPLE__`），`irgen_emit.c` 的 setvbuf 与 `irgen_call.c` 的
+`Console.ReadLine` 按平台选名。**所以此前文档说的「console 可交叉」其实也是不成立的**，
+现在才真正成立。
+
+**验证**：
+* `macos-arm64` / `macos-x64` 各链成功：hello world（12 文件）与 async socket +
+  `AtomicInt` 探针（21 文件）全部 `Compiled ... ->`，无告警。
+* 产物 Mach-O 复核（`_scratch/mac_probe_arm64`）：`magic feedfacf`、
+  `cputype 0x100000c`(arm64)、`filetype 2`(MH_EXECUTE)、`LC_BUILD_VERSION plat=1
+  minos=0xb0000`、`LC_MAIN`、`LC_LOAD_DYLIB /usr/lib/libSystem.B.dylib`、
+  **`LC_CODE_SIGNATURE` 存在且 CodeDirectory flags=0x20002 =
+  `CS_ADHOC|CS_LINKER_SIGNED`** —— 即 ld64.lld 已自动打 ad-hoc 签名，这正是
+  Apple Silicon 执行未签名 Mach-O 会被内核拒绝所要求的，不需要任何证书。
+* 回归：本机 Windows 与 `--target linux-musl` 的 hello/async 探针照旧（linux 产物在
+  Linux 上实跑输出 `hi from mac`）；`conformance_(console|io_|hello|string|threading|async_)`
+  **31/31 Passed**。
+
+**仍未做**（不算在本项内）：① 没有 Mac 机器，未在真实 macOS x64/arm64 上执行产物，
+只做到「链接 + Mach-O/签名结构」级别验证；② GUI 交叉仍不可用（只有 libSystem stub，
+Cocoa/CoreText/QuartzCore/IOSurface/WebKit 都没有 `.tbd`，且 `gui_runtime_mac.m` 是
+Objective-C，需要 Mac runner 编出对象），见 `docs/platform-targets.md` §4；
+③ 分发用 Developer ID 签名 + 公证（需要证书 + App Store Connect API key，
+可用 rcodesign 在非 Mac 上做）未接。

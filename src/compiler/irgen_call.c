@@ -378,8 +378,9 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                     LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ LLVMInt32TypeInContext(g->ctx) }, 1, 0),
                     stdin_fn, &zero, 1, "stdin");
             } else {
-                LLVMValueRef stdin_g = LLVMGetNamedGlobal(g->mod, "stdin");
-                if (!stdin_g) { stdin_g = LLVMAddGlobal(g->mod, i8ptr, "stdin"); }
+                const char *siname = g->target_is_macos ? "__stdinp" : "stdin";
+                LLVMValueRef stdin_g = LLVMGetNamedGlobal(g->mod, siname);
+                if (!stdin_g) { stdin_g = LLVMAddGlobal(g->mod, i8ptr, siname); }
                 stdin_ptr = LLVMBuildLoad2(g->builder, i8ptr, stdin_g, "stdin");
             }
             LLVMValueRef sz = LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 1024, 0);

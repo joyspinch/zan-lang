@@ -411,6 +411,9 @@ struct zan_irgen {
      * "use the host default" (unchanged legacy behaviour). */
     char target_triple[128];
     bool target_is_windows;   /* true when emitting for Windows (Sleep vs poll) */
+    bool target_is_macos;     /* true when emitting for Darwin: libSystem exports
+                               * the stdio streams as __std{in,out,err}p, not as
+                               * the ELF libc `stdin`/`stdout`/`stderr` globals */
     bool mt_scheduler;        /* --async-workers: skip the inline single-thread
                                * coroutine driver and link the multi-worker one
                                * from the zanrt_io_mt reactor object instead. */

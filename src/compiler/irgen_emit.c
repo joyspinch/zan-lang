@@ -73,8 +73,9 @@ static void emit_main_method(zan_irgen_t *g, zan_ast_node_t *method, zan_symbol_
             LLVMValueRef one = LLVMConstInt(svi32, 1, 0);
             stdout_ptr = zan_call2(g->builder, iob_type, iobfn, &one, 1, "stdout");
         } else {
-            LLVMValueRef sg = LLVMGetNamedGlobal(g->mod, "stdout");
-            if (!sg) sg = LLVMAddGlobal(g->mod, i8p, "stdout");
+            const char *soname = g->target_is_macos ? "__stdoutp" : "stdout";
+            LLVMValueRef sg = LLVMGetNamedGlobal(g->mod, soname);
+            if (!sg) sg = LLVMAddGlobal(g->mod, i8p, soname);
             stdout_ptr = LLVMBuildLoad2(g->builder, i8p, sg, "stdout");
         }
         LLVMTypeRef sv_type = LLVMFunctionType(svi32,

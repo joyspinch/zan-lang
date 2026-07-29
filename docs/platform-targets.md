@@ -64,25 +64,25 @@ because it is the same code path a normal `zanc` invocation on that OS takes.
 |------------------------------------|--------------------------------------------------------------------|-----------------------------------|
 | `linux-x64` / `linux-musl` / `linux-arm64` / `riscv64` | `ld.lld -static` + bundled musl sysroot `<zanc>/{linux-musl,linux-arm64,linux-riscv64}` → a dependency-free static ELF. | **None** — async-socket (`zanrt_io.o`) *and* the sync runtime (`zanrt_sync.o`: `AtomicInt`/`SharedTable`) are both linked in. "Build on Windows/macOS → upload → run on Linux" just works. |
 | `win-x64` / `win-arm64`            | `ld.lld` MinGW driver + bundled `win-<arch>/mingw/lib`; PE output. | **No async-socket**, and **no `AtomicInt`/`SharedTable`** (sync runtime is Linux-only when cross-compiling). Ordinary console/GUI programs link fine. |
-| `macos-x64` / `macos-arm64`        | `ld64.lld -arch <arch>` + bundled `macos/libSystem.tbd` (MIT symbol stub; no Apple SDK redistributed); Mach-O output linking only `-lSystem`. | **Console/compute only**: no async-socket, no `AtomicInt`/`SharedTable`, and only `libSystem` (no Cocoa/other frameworks, so no GUI). |
+| `macos-x64` / `macos-arm64`        | `ld64.lld -arch <arch> -platform_version macos 11.0` + bundled `macos/libSystem.tbd` (MIT symbol stub; no Apple SDK redistributed) + the Mach-O runtime objects in `macos/<arch>/` for async/atomics; Mach-O output linking only `-lSystem`. arm64 output is ad-hoc code-signed by the linker (`LC_CODE_SIGNATURE`, `CS_ADHOC|CS_LINKER_SIGNED`), which is what Apple Silicon requires to execute it at all. | **No GUI**: only `libSystem` is stubbed, so Cocoa/other frameworks cannot be linked. Async-socket and `AtomicInt`/`SharedTable` **do** work (see below). Developer ID signing/notarization is a separate, not-yet-implemented step needed only for distribution. |
 | `wasm32` (WASI)                    | `wasm-ld` + bundled wasm32 sysroot (`crt1.o`); WASI command module. | **No async-socket**; single-threaded WASI model. |
 
 Key properties:
 - **Linux is the universal cross target** — full-featured and self-contained from
   any host.
-- **Windows and macOS cross targets exist** but are restricted (no async-socket for
-  either; no atomics/shared-table for either; macOS additionally has no GUI/frameworks).
-  For a full-feature Windows or macOS program (GUI, networking, threads) build
-  **natively on that OS**.
+- **Windows and macOS cross targets exist** but are restricted: no async-socket and
+  no atomics/shared-table for Windows, no GUI/frameworks for macOS. For a
+  full-feature Windows program, or any GUI program, build **natively on that OS**.
 - The sync runtime (`AtomicInt`/`SharedTable`) is available natively everywhere and,
-  when cross-compiling, **only for Linux targets** (`main.c` errors early otherwise).
+  when cross-compiling, for **Linux and macOS** targets (`main.c` errors early on the
+  remaining ones).
 
 ### macOS: covering both architectures
 
 Cross-compiling from one Mac architecture to the other (`macos-arm64` host →
-`macos-x64`, or vice-versa) goes through the **restricted** `ld64.lld` path above
-(console-only). To ship a **full** (GUI/threads/async) binary for both Mac
-architectures you must build each **natively on its own arch** (an Apple Silicon
+`macos-x64`, or vice-versa) goes through the `ld64.lld` path above, so it carries the
+same single restriction as any other host: **no GUI**. To ship a GUI binary for both
+Mac architectures you must build each **natively on its own arch** (an Apple Silicon
 Mac for `arm64`, an Intel Mac — or Rosetta — for `x64`), optionally combining the
 two slices into a Universal 2 binary with `lipo -create`.
 
@@ -94,8 +94,8 @@ A target is only "complete" when these back ends exist for it. Current coverage:
 
 | Subsystem            | Windows | Linux | macOS | Notes / mechanism                         |
 |----------------------|:-------:|:-----:|:-----:|-------------------------------------------|
-| I/O reactor          | IOCP    | epoll | kqueue| `src/runtime` async socket/file reactor; **cross builds to Win/macOS/WASI cannot link it yet** |
-| Threads / sync       | Win32   | pthread| pthread| mutex, semaphore (macOS uses GCD dispatch), atomics; **`AtomicInt`/`SharedTable` cross only to Linux** |
+| I/O reactor          | IOCP    | epoll | kqueue| `src/runtime` async socket/file reactor; **cross builds to Win/WASI cannot link it yet** (macOS cross links `macos/<arch>/zanrt_io{,_mt}.o`) |
+| Threads / sync       | Win32   | pthread| pthread| mutex, semaphore (macOS uses GCD dispatch), atomics; **`AtomicInt`/`SharedTable` cross to Linux and macOS** |
 | C FFI (`DllImport`)  | crt/msvcrt → CRT | libc | libc | resolved by the linker; names unified as `crt` |
 | Filesystem / dirent  | ✅      | glibc layout | Darwin layout | `Directory.zan` branches on dirent offsets |
 | Monotonic clock      | ✅      | `CLOCK_MONOTONIC`=1 | =6 | `Stopwatch` |
@@ -111,11 +111,26 @@ yet.
 
 Difficulty is for **CLI/compute** first; GUI is a separate, larger effort on each.
 
-### Async-socket / sync runtime for Windows & macOS cross — small–medium
-- The reactor object (`zanrt_io.o`) and sync object (`zanrt_sync.o`) are only staged
-  for the Linux musl sysroots today. Producing Win/macOS-ABI builds of these objects
-  (and dropping them beside the respective bundled runtimes) would lift the cross
-  restrictions in §2.
+### Async-socket / sync runtime for Windows cross — small–medium
+- Done for macOS: `scripts/build_macos_rt.sh` compiles `rt_io.c` (kqueue) and
+  `rt_sync.c` for `{aarch64,x86_64}-macos.11.0` with `zig cc` (it carries the Darwin
+  libc headers, so no Apple SDK and no Mac are needed) into
+  `toolchain/macos/<arch>/zanrt_{io,io_mt,sync}.o`, which ship next to `zanc` and are
+  linked on demand. Every symbol they import is in the bundled `libSystem.tbd` —
+  `scripts/check_macos_rt.py` asserts that, so a missing stub is caught here instead
+  of in a user's link.
+- Still open for Windows: the same objects in the mingw ABI, staged beside
+  `toolchain/win-<arch>/`.
+
+### macOS GUI cross (Cocoa) — medium
+- `src/runtime/gui_runtime_mac.m` is Objective-C against Cocoa/CoreText/QuartzCore/
+  IOSurface/WebKit headers, which only the Apple SDK provides, so the object itself
+  must be built on a Mac (the `macos-13`/`macos-14` runners already used by
+  `.github/workflows/drivers.yml` are enough) and committed like the objects above.
+- The link then also needs `.tbd` stubs for those frameworks. They can be generated
+  on any host from the undefined symbols of that object (including the
+  `_OBJC_CLASS_$_*` references) into fresh tbd-v4 documents — the approach
+  AotAnywhere uses for .NET's Apple dependencies.
 
 ### Android (`aarch64/x86_64-linux-android`) — medium
 - Linux-like: epoll reactor and pthread work; needs the **NDK sysroot** and

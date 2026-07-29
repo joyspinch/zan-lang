@@ -680,6 +680,14 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
     if (target_triple && target_triple[0])
         snprintf(g->target_triple, sizeof(g->target_triple), "%s", target_triple);
     g->target_is_windows = target_is_windows;
+    if (g->target_triple[0]) {
+        g->target_is_macos = strstr(g->target_triple, "apple") != NULL
+                             || strstr(g->target_triple, "darwin") != NULL;
+    } else {
+#ifdef __APPLE__
+        g->target_is_macos = true;
+#endif
+    }
     /* Must be set before the inline coroutine driver is (conditionally)
      * emitted below, so the multi-worker mode can skip it. */
     g->mt_scheduler = mt_scheduler;
