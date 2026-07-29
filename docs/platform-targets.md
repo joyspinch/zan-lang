@@ -64,27 +64,29 @@ because it is the same code path a normal `zanc` invocation on that OS takes.
 |------------------------------------|--------------------------------------------------------------------|-----------------------------------|
 | `linux-x64` / `linux-musl` / `linux-arm64` / `riscv64` | `ld.lld -static` + bundled musl sysroot `<zanc>/{linux-musl,linux-arm64,linux-riscv64}` → a dependency-free static ELF. | **None** — async-socket (`zanrt_io.o`) *and* the sync runtime (`zanrt_sync.o`: `AtomicInt`/`SharedTable`) are both linked in. "Build on Windows/macOS → upload → run on Linux" just works. |
 | `win-x64` / `win-arm64`            | `ld.lld` MinGW driver + bundled `win-<arch>/mingw/lib`; PE output. | **No async-socket**, and **no `AtomicInt`/`SharedTable`** (sync runtime is Linux-only when cross-compiling). Ordinary console/GUI programs link fine. |
-| `macos-x64` / `macos-arm64`        | `ld64.lld -arch <arch> -platform_version macos 11.0` + bundled `macos/libSystem.tbd` (MIT symbol stub; no Apple SDK redistributed) + the Mach-O runtime objects in `macos/<arch>/` for async/atomics; Mach-O output linking only `-lSystem`. arm64 output is ad-hoc code-signed by the linker (`LC_CODE_SIGNATURE`, `CS_ADHOC|CS_LINKER_SIGNED`), which is what Apple Silicon requires to execute it at all. | **No GUI**: only `libSystem` is stubbed, so Cocoa/other frameworks cannot be linked. Async-socket and `AtomicInt`/`SharedTable` **do** work (see below). Developer ID signing/notarization is a separate, not-yet-implemented step needed only for distribution. |
+| `macos-x64` / `macos-arm64`        | `ld64.lld -arch <arch> -platform_version macos 11.0` + bundled `macos/libSystem.tbd` (MIT symbol stub; no Apple SDK redistributed) + the Mach-O runtime objects in `macos/<arch>/` for async/atomics; Mach-O output linking `-lSystem` plus, for GUI programs, the prebuilt `stdlib/Gui/drivers/macos-<arch>/libzan_gui.dylib` (`@rpath` install name; its own Cocoa/WebKit dependencies bind on the target Mac, so no framework stubs are needed here). arm64 output is ad-hoc code-signed by the linker (`LC_CODE_SIGNATURE`, `CS_ADHOC|CS_LINKER_SIGNED`), which is what Apple Silicon requires to execute it at all. | Async-socket, `AtomicInt`/`SharedTable` and Cocoa GUI all link. **`macos-x64` has no GUI driver yet** (only `macos-arm64`'s dylib is committed). Nothing here has been run on a real Mac — verification stops at "links + correct Mach-O/signature structure". Developer ID signing/notarization is a separate, not-yet-implemented step needed only for distribution. |
 | `wasm32` (WASI)                    | `wasm-ld` + bundled wasm32 sysroot (`crt1.o`); WASI command module. | **No async-socket**; single-threaded WASI model. |
 
 Key properties:
 - **Linux is the universal cross target** — full-featured and self-contained from
   any host.
-- **Windows and macOS cross targets exist** but are restricted: no async-socket and
-  no atomics/shared-table for Windows, no GUI/frameworks for macOS. For a
-  full-feature Windows program, or any GUI program, build **natively on that OS**.
+- **Windows cross is the restricted one**: no async-socket and no atomics/shared-
+  table. For a full-feature Windows program, build **natively on Windows**.
+- **macOS cross is feature-complete for `arm64`** (console, async, atomics, Cocoa
+  GUI), but only link-verified — no real-Mac run has happened yet.
 - The sync runtime (`AtomicInt`/`SharedTable`) is available natively everywhere and,
   when cross-compiling, for **Linux and macOS** targets (`main.c` errors early on the
   remaining ones).
 
 ### macOS: covering both architectures
 
-Cross-compiling from one Mac architecture to the other (`macos-arm64` host →
-`macos-x64`, or vice-versa) goes through the `ld64.lld` path above, so it carries the
-same single restriction as any other host: **no GUI**. To ship a GUI binary for both
-Mac architectures you must build each **natively on its own arch** (an Apple Silicon
-Mac for `arm64`, an Intel Mac — or Rosetta — for `x64`), optionally combining the
-two slices into a Universal 2 binary with `lipo -create`.
+Both Mac architectures go through the same `ld64.lld` path from any host; the only
+asymmetry is the GUI driver, which is a per-arch binary. `macos-arm64` has one
+committed (built by `.github/workflows/drivers.yml` on `macos-14`, `-mmacosx-version-
+min=11.0`, ad-hoc signed); `macos-x64` does not yet, because the `macos-13` runner job
+has not produced an artifact. Until it does, a `macos-x64` GUI link fails on the
+missing dylib while console/compute links fine. A Universal 2 binary is still made
+the usual way, by combining the two slices with `lipo -create`.
 
 ---
 
@@ -122,15 +124,18 @@ Difficulty is for **CLI/compute** first; GUI is a separate, larger effort on eac
 - Still open for Windows: the same objects in the mingw ABI, staged beside
   `toolchain/win-<arch>/`.
 
-### macOS GUI cross (Cocoa) — medium
+### macOS GUI cross (Cocoa) — done for arm64
 - `src/runtime/gui_runtime_mac.m` is Objective-C against Cocoa/CoreText/QuartzCore/
-  IOSurface/WebKit headers, which only the Apple SDK provides, so the object itself
-  must be built on a Mac (the `macos-13`/`macos-14` runners already used by
-  `.github/workflows/drivers.yml` are enough) and committed like the objects above.
-- The link then also needs `.tbd` stubs for those frameworks. They can be generated
-  on any host from the undefined symbols of that object (including the
-  `_OBJC_CLASS_$_*` references) into fresh tbd-v4 documents — the approach
-  AotAnywhere uses for .NET's Apple dependencies.
+  IOSurface/WebKit headers, which only the Apple SDK provides, so it is built on a
+  Mac by `.github/workflows/drivers.yml` and the resulting `libzan_gui.dylib` is
+  committed under `stdlib/Gui/drivers/macos-<arch>/`.
+- **No framework `.tbd` stubs are needed.** Because that dylib is a *dynamic*
+  library with an `@rpath` install name, the cross link only resolves
+  `_zan_gui_*` against it; its Cocoa/WebKit imports are bound by dyld on the target
+  Mac. `--publish` copies the dylib next to the executable, which the emitted
+  `LC_RPATH @loader_path` then finds.
+- Remaining: the `macos-x64` dylib (the `macos-13` job in that workflow), and an
+  actual run on Mac hardware — everything so far is link/structure verification only.
 
 ### Android (`aarch64/x86_64-linux-android`) — medium
 - Linux-like: epoll reactor and pthread work; needs the **NDK sysroot** and
