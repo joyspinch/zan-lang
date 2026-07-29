@@ -517,7 +517,14 @@ static void io_register(intptr_t fd, int32_t interest, void *co, zan_co_step_t s
     } else {
         /* second waiter on the same fd+direction: chain it (rare) */
         w = (zan_io_waiter_t *)calloc(1, sizeof(*w));
-        if (!w) return;
+        if (!w) {   /* same as a slot table that cannot grow: fail the waiter
+                     * rather than park a coroutine nothing will ever resume */
+            io_mark_dead(co, step, g_pending_out_n, g_pending_accept_out);
+            g_pending_rbuf = NULL;
+            g_pending_out_n = NULL;
+            g_pending_accept_out = NULL;
+            return;
+        }
         zan_io_waiter_t *tail = inl;
         while (tail->next) tail = tail->next;
         tail->next = w;
@@ -547,24 +554,31 @@ static void io_deliver_waiter(int fd, zan_io_waiter_t *w) {
     *w->out_n = (rn < 0) ? 0 : (int64_t)rn;
 }
 
-/* Detach every waiter of one direction into `out` (an array of at most
- * `max` entries), returning how many were taken. */
+/* Detach up to `max` waiters of one direction into `out`, returning how many
+ * were taken. Anything past `max` stays parked -- dropping it would strand the
+ * coroutine -- so the direction keeps its waiters and the next event or sweep
+ * picks the rest up. */
 static int io_take(zan_io_slot_t *s, int fd, int read_dir,
                    zan_io_waiter_t *out, int max) {
     unsigned char *has = read_dir ? &s->has_r : &s->has_w;
-    if (!*has) return 0;
+    if (!*has || max <= 0) return 0;
     zan_io_waiter_t *inl = read_dir ? &s->r : &s->w;
     int n = 0;
-    if (n < max) out[n++] = *inl;
+    out[n++] = *inl;
     zan_io_waiter_t *x = inl->next;
-    while (x) {
+    while (x && n < max) {
         zan_io_waiter_t *nx = x->next;
-        if (n < max) out[n++] = *x;
+        out[n++] = *x;
         free(x);
         x = nx;
     }
-    inl->next = NULL;
-    *has = 0;
+    if (x) {
+        *inl = *x;   /* the overflow head moves into the inline slot */
+        free(x);
+    } else {
+        inl->next = NULL;
+        *has = 0;
+    }
     (void)fd;
     return n;
 }

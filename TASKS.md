@@ -1632,6 +1632,47 @@ header-only 库 / C 回调 / 结构体字段偏移，全部对应 A2 / A3 / A4�
 `rt_mem.c` 7.6KB / `rt_co.c` 2.3KB / `rt_crash.h` 5KB / `rt_wasm.c` 0.8KB。真 reactor / 调度 / 同步原语 / 内存分配留 C 没问题，
 但要逐个过一遍：如果混了 HTTP 解析、编码转换、路径处理这类纯逻辑，上移到 Zan。
 
+### B7-1 ✅ `rt_sync.c` 复核（2026-07-29，`1f12a88`）
+
+挖出两个真缺陷，都已修 + 有回归用例：
+
+* **`lock` 离开 body 不还锁**（严重）。irgen 只在"顺着走到末尾"这条路上发
+  `zan_monitor_exit`；`return` / `break` / 抛异常出去的，锁永远拿着不放，
+  之后任何线程 `lock` 同一对象即永久阻塞。实测：`lock (a) { return 7; }`
+  之后起线程 `lock (a)` → 永远进不去。现按 C# 的做法把 `lock` 展开成
+  finally 区，复用已有退出路径机制；对象存 alloca 供各出口重载。
+* **所有 `lock(obj)` 共用一把全局互斥量**：锁两个无关对象也互相等。
+  改为按对象地址分 64 条 stripe 的递归锁（撞条只多串行，不丢互斥，
+  同对象重入照旧）。
+* 用例：`tests/conformance/lock_release_paths.zan`（return/break/throw 三条路
+  各走一遍，第二个线程验证锁确实放开）、`monitor_striped.zan`（4 线程 8 万次
+  加锁自增，计数精确 + 重入）。全量 733/733。
+
+〔待续〕`zan_dispatch_*` 的 Windows 首次初始化用的是普通 `int g_dispatch_ready`
+守卫 `InitializeCriticalSection`，多线程首次 `zan_dispatch_post` 理论上可竞争；
+目前所有调用方都在 UI 线程，未构造出复现，暂记不改。
+
+### B7-2 🚧 `rt_io.c` 复核（进行中）
+
+已修（epoll 路径，本机 Windows 无法实测，仅静态修正）：
+
+* 第二个 waiter 的 `calloc` 失败时直接 `return`，协程被丢弃且
+  `g_pending_*` 全局残留污染下一次注册 —— 改为与"槽表扩容失败"同一处理
+  （`io_mark_dead` + 清空 pending）。
+* `io_take` 一次最多取 8 个 waiter，**超出的直接 `free` 掉**，那些协程再也不会
+  被唤醒 —— 改为把溢出的留在原地（下一次事件或 sweep 再取）。
+
+### B7-3 签入的跨平台二进制会悄悄陈旧（`scripts/check_toolchain_stale.py`）
+
+`toolchain/<target>/zanrt_*.o` 与 `stdlib/Gui/drivers/**` 都是签入的成品，
+不跟 `cmake --build` 走，只能在对应平台重编。已经栽过两次（pre-A2-0b 的
+`zan_gui.dll` 让一个用例跑 331 秒；rt_sync/rt_io 的修改到不了任何非 Windows 构建）。
+新增 `python scripts/check_toolchain_stale.py`：按 **git 提交时间**（不是 mtime）
+比对每个成品与其源文件，陈旧即非零退出。当前实测 **10 个成品待重编**
+（linux-musl / linux-arm64 / linux-riscv64 的 `zanrt_io.o`+`zanrt_sync.o`、
+macOS 两个 arch 的 `zanrt_sync.o`、linux 两个 arch 的 `libzan_gui.a`），
+Windows 这台机器造不出来，必须在各自平台上重编后提交。
+
 ---
 
 # C. 文档
