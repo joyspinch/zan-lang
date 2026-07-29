@@ -963,6 +963,10 @@ static void io_register(intptr_t fd, int32_t interest, void *co, zan_co_step_t s
     IOTRACE("io_register(READY) fd=%lld interest=%d cnt=%d", (long long)s, interest, g_io_count);
 
     zan_io_op_t *op = op_alloc();
+    if (!op) {   /* out of memory: resume the waiter rather than park it forever */
+        if (step) zan_co_ready(co, step);
+        return;
+    }
     op->sock = s;
     op->interest = interest;
     op->kind = ZAN_IO_OP_READY;
@@ -1025,6 +1029,11 @@ void zan_io_recv_co(intptr_t fd, void *buf, int32_t len, void *frame,
     ensure_assoc(s);
 
     zan_io_op_t *op = op_alloc();
+    if (!op) {
+        if (out_n) *out_n = 0;   /* peer-close semantics, as for a hard error */
+        if (step) zan_co_ready(frame, step);
+        return;
+    }
     op->sock = s;
     op->interest = ZAN_IO_READ;
     op->kind = ZAN_IO_OP_RECV;
@@ -1090,6 +1099,12 @@ void zan_io_accept_co(intptr_t fd, void *frame, zan_co_step_t step,
 
     const DWORD addr_len = (DWORD)sizeof(struct sockaddr_in) + 16;
     zan_io_op_t *op = op_alloc();
+    if (!op) {
+        closesocket(accepted);
+        if (out_fd) *out_fd = -1;
+        if (step) zan_co_ready(frame, step);
+        return;
+    }
     op->sock = listener;
     op->kind = ZAN_IO_OP_ACCEPT;
     op->co = frame;
