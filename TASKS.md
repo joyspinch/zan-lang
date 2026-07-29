@@ -1820,8 +1820,22 @@ irgen 按"类名 + 方法名"直接 lower 了 **43 个**静态库调用
 
 现在这些位置在程序确实定义了该方法时让位给真实定义，没有 stdlib 时仍走内建
 兜底。`Path`（已用纯 Zan 重写，去掉 6 个 crt import）、`File`、`Directory`
-共 21 处已处理；`Math` / `Console` / `Environment` / `Convert` 在 stdlib 里
-没有对应的 Zan 类，要先写出来才能同样处理。
+共 21 处已处理；**2026-07-29 起 `Math`（Sqrt/Sin/Cos/Tan/Log/Exp/Abs/Max/Min/
+Pow/Floor/Ceiling/Round）、`Console`（WriteLine/PrintLine/Write/ReadLine/Read/
+ReadKey/Clear/ResetColor）、`Environment`（ArgCount/ArgAt/ExeDir）、
+`Convert`（ToDouble/ToInt/ToInt32/ToInt64）也全部加上了同样的
+`zan_type_defines` 让位判断**——43 处硬编码不再屏蔽任何 Zan 实现，写一个
+Zan `Math` 就能立刻接管。证据：`tests/conformance/builtin_shadowing.zan`
+（程序自带 `Math`/`Convert`/`Environment` 类，14 个方法全部拿到自定义实现的
+返回值），conformance / determinism / leakcheck 3/3；全量 `ctest -j8` 723 个
+用例中只有两个 wechat determinism 因并发争抢超时，单独重跑 6/6 Passed。
+
+**保留内建 lowering 作为兜底是有意的**：默认构建是 `-O0`，Zan 版包一层 libm
+的代价实测 +13%（Sqrt 紧循环 10.5 → 11.9 ns/次），而 `Math.Min/Max/Abs` 现在
+是单条 `select`/`icmp`，改成真调用在 GUI 逐像素循环里代价更大。定位与 C# 的
+JIT intrinsic 一致：**编译器可以认识它们，但不许屏蔽真实定义**。
+`Math` / `Console` / `Environment` / `Convert` 的 Zan 实现本身仍未写
+（`Console` 需要按静态类型分派的格式化，最重）。
 
 **顺带清出的两个真实缺陷**（2026-07-29，`tests/conformance/math_minmax.zan`）——
 硬编码这条路径本身就是它们长期没被发现的原因：

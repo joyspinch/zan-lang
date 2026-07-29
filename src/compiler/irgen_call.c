@@ -263,8 +263,9 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
         }
 
         /* special-case Console.WriteLine */
-        if (is_call_to(expr, "Console", "WriteLine") ||
-            is_call_to(expr, "Console", "PrintLine")) {
+        if (!zan_type_defines(g, "Console", "WriteLine") &&
+            (is_call_to(expr, "Console", "WriteLine") ||
+             is_call_to(expr, "Console", "PrintLine"))) {
             if (expr->call.args.count > 0) {
                 zan_ast_node_t *arg_ast = expr->call.args.items[0];
                 LLVMValueRef arg = emit_expr(g, arg_ast, locals);
@@ -319,7 +320,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
         }
 
         /* Console.Write (no newline) */
-        if (is_call_to(expr, "Console", "Write")) {
+        if (!zan_type_defines(g, "Console", "Write") &&
+            is_call_to(expr, "Console", "Write")) {
             if (expr->call.args.count > 0) {
                 zan_ast_node_t *arg_ast = expr->call.args.items[0];
                 LLVMValueRef arg = emit_expr(g, arg_ast, locals);
@@ -362,7 +364,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
         }
 
         /* Console.ReadLine() -> reads a line from stdin, returns i8* */
-        if (is_call_to(expr, "Console", "ReadLine")) {
+        if (!zan_type_defines(g, "Console", "ReadLine") &&
+            is_call_to(expr, "Console", "ReadLine")) {
             LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
             LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
             /* allocate 1024 byte buffer */
@@ -408,7 +411,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
 
         /* Console.Read() -> one char from stdin as int (i64); getchar() returns
          * the byte or EOF (-1). Portable across targets. */
-        if (is_call_to(expr, "Console", "Read")) {
+        if (!zan_type_defines(g, "Console", "Read") &&
+            is_call_to(expr, "Console", "Read")) {
             LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
             LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
             LLVMTypeRef getchar_ty = LLVMFunctionType(i32t, NULL, 0, 0);
@@ -421,7 +425,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
          * Windows uses _getch (no Enter, no echo -- matches C#); other targets
          * fall back to getchar(). The optional intercept bool is accepted for
          * source compatibility but not otherwise acted on. */
-        if (is_call_to(expr, "Console", "ReadKey")) {
+        if (!zan_type_defines(g, "Console", "ReadKey") &&
+            is_call_to(expr, "Console", "ReadKey")) {
             LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
             LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
             const char *fname = g->target_is_windows ? "_getch" : "getchar";
@@ -433,7 +438,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
 
         /* Console.Clear() -> clear screen + home cursor via an ANSI escape
          * (portable; Windows 10+ consoles interpret VT sequences). */
-        if (is_call_to(expr, "Console", "Clear")) {
+        if (!zan_type_defines(g, "Console", "Clear") &&
+            is_call_to(expr, "Console", "Clear")) {
             LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
             LLVMTypeRef printf_type = LLVMFunctionType(
                 LLVMInt32TypeInContext(g->ctx), (LLVMTypeRef[]){ i8ptr }, 1, 1);
@@ -445,7 +451,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
         }
 
         /* Console.ResetColor() -> reset all SGR attributes to default. */
-        if (is_call_to(expr, "Console", "ResetColor")) {
+        if (!zan_type_defines(g, "Console", "ResetColor") &&
+            is_call_to(expr, "Console", "ResetColor")) {
             LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
             LLVMTypeRef printf_type = LLVMFunctionType(
                 LLVMInt32TypeInContext(g->ctx), (LLVMTypeRef[]){ i8ptr }, 1, 1);
@@ -502,7 +509,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
         }
 
         /* Math.Sqrt(expr) → llvm.sqrt */
-        if (is_call_to(expr, "Math", "Sqrt") && expr->call.args.count == 1) {
+        if (!zan_type_defines(g, "Math", "Sqrt") &&
+            is_call_to(expr, "Math", "Sqrt") && expr->call.args.count == 1) {
             LLVMValueRef arg = emit_expr(g, expr->call.args.items[0], locals);
             LLVMTypeRef dbl = LLVMDoubleTypeInContext(g->ctx);
             /* ensure arg is double */
@@ -527,7 +535,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
             static const char *math1[] = { "Sin", "sin", "Cos", "cos", "Tan", "tan",
                                            "Log", "log", "Exp", "exp", NULL };
             for (int mi = 0; math1[mi]; mi += 2) {
-                if (is_call_to(expr, "Math", math1[mi]) && expr->call.args.count == 1) {
+                if (!zan_type_defines(g, "Math", math1[mi]) &&
+                    is_call_to(expr, "Math", math1[mi]) && expr->call.args.count == 1) {
                     LLVMValueRef arg = emit_expr(g, expr->call.args.items[0], locals);
                     LLVMTypeRef dbl = LLVMDoubleTypeInContext(g->ctx);
                     if (LLVMGetTypeKind(LLVMTypeOf(arg)) == LLVMFloatTypeKind) {
@@ -544,7 +553,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
         }
 
         /* Math.Abs(expr) */
-        if (is_call_to(expr, "Math", "Abs") && expr->call.args.count == 1) {
+        if (!zan_type_defines(g, "Math", "Abs") &&
+            is_call_to(expr, "Math", "Abs") && expr->call.args.count == 1) {
             LLVMValueRef arg = emit_expr(g, expr->call.args.items[0], locals);
             LLVMTypeRef arg_type = LLVMTypeOf(arg);
             if (LLVMGetTypeKind(arg_type) == LLVMDoubleTypeKind ||
@@ -573,7 +583,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
 
         /* Math.Max(a, b) / Math.Min(a, b), on integers or on doubles: mixing
          * the two widens to double, the way C# picks the double overload. */
-        if ((is_call_to(expr, "Math", "Max") || is_call_to(expr, "Math", "Min")) &&
+        if (!zan_type_defines(g, "Math", "Max") && !zan_type_defines(g, "Math", "Min") &&
+            (is_call_to(expr, "Math", "Max") || is_call_to(expr, "Math", "Min")) &&
             expr->call.args.count == 2) {
             int want_max = is_call_to(expr, "Math", "Max");
             LLVMValueRef a = emit_expr(g, expr->call.args.items[0], locals);
@@ -609,7 +620,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
         }
 
         /* Math.Pow(base, exp) */
-        if (is_call_to(expr, "Math", "Pow") && expr->call.args.count == 2) {
+        if (!zan_type_defines(g, "Math", "Pow") &&
+            is_call_to(expr, "Math", "Pow") && expr->call.args.count == 2) {
             LLVMTypeRef dbl = LLVMDoubleTypeInContext(g->ctx);
             LLVMValueRef base_v = emit_expr(g, expr->call.args.items[0], locals);
             LLVMValueRef exp_v = emit_expr(g, expr->call.args.items[1], locals);
@@ -629,7 +641,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
         }
 
         /* Math.Floor(x) */
-        if (is_call_to(expr, "Math", "Floor") && expr->call.args.count == 1) {
+        if (!zan_type_defines(g, "Math", "Floor") &&
+            is_call_to(expr, "Math", "Floor") && expr->call.args.count == 1) {
             LLVMTypeRef dbl = LLVMDoubleTypeInContext(g->ctx);
             LLVMValueRef arg = emit_expr(g, expr->call.args.items[0], locals);
             if (LLVMGetTypeKind(LLVMTypeOf(arg)) == LLVMIntegerTypeKind)
@@ -644,7 +657,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
         }
 
         /* Math.Ceiling(x) */
-        if (is_call_to(expr, "Math", "Ceiling") && expr->call.args.count == 1) {
+        if (!zan_type_defines(g, "Math", "Ceiling") &&
+            is_call_to(expr, "Math", "Ceiling") && expr->call.args.count == 1) {
             LLVMTypeRef dbl = LLVMDoubleTypeInContext(g->ctx);
             LLVMValueRef arg = emit_expr(g, expr->call.args.items[0], locals);
             if (LLVMGetTypeKind(LLVMTypeOf(arg)) == LLVMIntegerTypeKind)
@@ -659,7 +673,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
         }
 
         /* Math.Round(x[, digits]) */
-        if (is_call_to(expr, "Math", "Round") &&
+        if (!zan_type_defines(g, "Math", "Round") &&
+            is_call_to(expr, "Math", "Round") &&
             (expr->call.args.count == 1 || expr->call.args.count == 2)) {
             LLVMTypeRef dbl = LLVMDoubleTypeInContext(g->ctx);
             LLVMTypeRef d1_ty = LLVMFunctionType(dbl, (LLVMTypeRef[]){ dbl }, 1, 0);
@@ -685,7 +700,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
         }
 
         /* Convert.ToDouble(x) */
-        if (is_call_to(expr, "Convert", "ToDouble") && expr->call.args.count == 1) {
+        if (!zan_type_defines(g, "Convert", "ToDouble") &&
+            is_call_to(expr, "Convert", "ToDouble") && expr->call.args.count == 1) {
             LLVMTypeRef dbl = LLVMDoubleTypeInContext(g->ctx);
             LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
             LLVMValueRef arg = emit_expr(g, expr->call.args.items[0], locals);
@@ -925,7 +941,10 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
             /* Convert.ToInt / Convert.ToInt32 / Convert.ToInt64(x) */
             if (callee->member.object->kind == AST_IDENTIFIER) {
                 zan_istr_t obj_name = callee->member.object->ident.name;
-                if (obj_name.len == 7 && memcmp(obj_name.str, "Convert", 7) == 0) {
+                if (obj_name.len == 7 && memcmp(obj_name.str, "Convert", 7) == 0 &&
+                    !zan_type_defines(g, "Convert", "ToInt32") &&
+                    !zan_type_defines(g, "Convert", "ToInt64") &&
+                    !zan_type_defines(g, "Convert", "ToInt")) {
                     if (((method_name.len == 7 && memcmp(method_name.str, "ToInt32", 7) == 0) ||
                          (method_name.len == 7 && memcmp(method_name.str, "ToInt64", 7) == 0) ||
                          (method_name.len == 5 && memcmp(method_name.str, "ToInt", 5) == 0)) &&
@@ -1308,7 +1327,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
 
         /* Environment.ArgCount() -> number of command-line args (excludes the
          * program name), i.e. argc - 1. */
-        if (is_call_to(expr, "Environment", "ArgCount") && expr->call.args.count == 0) {
+        if (!zan_type_defines(g, "Environment", "ArgCount") &&
+            is_call_to(expr, "Environment", "ArgCount") && expr->call.args.count == 0) {
             LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
             LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
             LLVMValueRef g_argc = LLVMGetNamedGlobal(g->mod, "__zan_argc");
@@ -1323,7 +1343,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
 
         /* Environment.ArgAt(i) -> string : the (i+1)-th argv entry, so index 0
          * is the first user argument. */
-        if (is_call_to(expr, "Environment", "ArgAt") && expr->call.args.count == 1) {
+        if (!zan_type_defines(g, "Environment", "ArgAt") &&
+            is_call_to(expr, "Environment", "ArgAt") && expr->call.args.count == 1) {
             LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
             LLVMTypeRef i8ptrptr = LLVMPointerType(i8ptr, 0);
             LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
@@ -1844,7 +1865,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
 
         /* Environment.ExeDir() — directory containing the running executable
          * (runtime helper zan_exe_dir_into fills an rc string buffer). */
-        if (is_call_to(expr, "Environment", "ExeDir") && expr->call.args.count == 0) {
+        if (!zan_type_defines(g, "Environment", "ExeDir") &&
+            is_call_to(expr, "Environment", "ExeDir") && expr->call.args.count == 0) {
             g->uses_sync_runtime = true;
             LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
             LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
