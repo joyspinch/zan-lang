@@ -10,6 +10,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <ctype.h>
+#include <errno.h>
 #include <limits.h>
 
 /* ---- keyword table ---- */
@@ -698,7 +699,17 @@ static zan_token_t lexer_number(zan_lexer_t *lex) {
         return tok;
     } else {
         zan_token_t tok = lexer_make(lex, TK_INT_LIT, loc);
-        tok.int_val = (int64_t)strtoll(buf, NULL, 10);
+        /* Decimal literals above long.MaxValue are ulong in C#; strtoll would
+         * clamp them to LLONG_MAX, so keep the unsigned bit pattern instead
+         * (the hex/binary/octal paths already do). */
+        errno = 0;
+        long long sv = strtoll(buf, NULL, 10);
+        if (errno == ERANGE) {
+            errno = 0;
+            tok.int_val = (int64_t)strtoull(buf, NULL, 10);
+        } else {
+            tok.int_val = (int64_t)sv;
+        }
         return tok;
     }
 }

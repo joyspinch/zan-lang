@@ -1723,8 +1723,21 @@ done:
     /* verify module */
     char *error = NULL;
     if (LLVMVerifyModule(g->mod, LLVMReturnStatusAction, &error)) {
+        /* The module-level message quotes the offending instruction but not
+         * the function it sits in, which is what one actually needs to find
+         * the source. Re-verify per function to name it. */
+        const char *culprit = NULL;
+        for (LLVMValueRef fn = LLVMGetFirstFunction(g->mod); fn;
+             fn = LLVMGetNextFunction(fn)) {
+            if (LLVMIsDeclaration(fn)) continue;
+            if (LLVMVerifyFunction(fn, LLVMReturnStatusAction)) {
+                culprit = LLVMGetValueName(fn);
+                break;
+            }
+        }
         zan_diag_emit(g->diag, DIAG_ERROR, zan_loc(0, 0, 0, 0),
-                      "LLVM verification failed: %s", error);
+                      "LLVM verification failed%s%s: %s",
+                      culprit ? " in " : "", culprit ? culprit : "", error);
         LLVMDisposeMessage(error);
         return ZAN_ERROR;
     }

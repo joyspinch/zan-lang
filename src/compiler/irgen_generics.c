@@ -1106,6 +1106,84 @@ static LLVMValueRef emit_to_cstr(zan_irgen_t *g, LLVMValueRef val) {
     return buf;
 }
 
+/* Format a `char` as text the way C# does: the character itself, UTF-8 encoded,
+ * not its numeric code. The encoded bytes are built as a little-endian packed
+ * i64 (unused high bytes stay zero), so one store plus a length-sized memcpy
+ * covers all four UTF-8 lengths without branching. */
+static LLVMValueRef emit_char_to_cstr(zan_irgen_t *g, LLVMValueRef val) {
+    LLVMTypeRef i8t = LLVMInt8TypeInContext(g->ctx);
+    LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
+    LLVMTypeRef i8ptr = LLVMPointerType(i8t, 0);
+    LLVMBuilderRef bd = g->builder;
+
+    LLVMValueRef cp = emit_widen_i64_for_print(g, val);
+    cp = LLVMBuildAnd(bd, cp, LLVMConstInt(i64t, 0x1FFFFF, 0), "ch.cp");
+
+    LLVMValueRef low6 = LLVMBuildAnd(bd, cp, LLVMConstInt(i64t, 0x3F, 0), "ch.l6");
+    LLVMValueRef sh6 = LLVMBuildLShr(bd, cp, LLVMConstInt(i64t, 6, 0), "ch.s6");
+    LLVMValueRef sh12 = LLVMBuildLShr(bd, cp, LLVMConstInt(i64t, 12, 0), "ch.s12");
+    LLVMValueRef sh18 = LLVMBuildLShr(bd, cp, LLVMConstInt(i64t, 18, 0), "ch.s18");
+    LLVMValueRef c6 = LLVMBuildAnd(bd, sh6, LLVMConstInt(i64t, 0x3F, 0), "ch.c6");
+    LLVMValueRef c12 = LLVMBuildAnd(bd, sh12, LLVMConstInt(i64t, 0x3F, 0), "ch.c12");
+
+    /* byte(n) = payload | tag, packed at 8*n bits. */
+    LLVMValueRef b2 = LLVMBuildOr(bd,
+        LLVMBuildOr(bd, LLVMConstInt(i64t, 0xC0, 0), sh6, "ch.b2a"),
+        LLVMBuildShl(bd, LLVMBuildOr(bd, LLVMConstInt(i64t, 0x80, 0), low6, "ch.b2b"),
+                     LLVMConstInt(i64t, 8, 0), "ch.b2c"), "ch.b2");
+    LLVMValueRef b3 = LLVMBuildOr(bd,
+        LLVMBuildOr(bd, LLVMConstInt(i64t, 0xE0, 0), sh12, "ch.b3a"),
+        LLVMBuildOr(bd,
+            LLVMBuildShl(bd, LLVMBuildOr(bd, LLVMConstInt(i64t, 0x80, 0), c6, "ch.b3b"),
+                         LLVMConstInt(i64t, 8, 0), "ch.b3c"),
+            LLVMBuildShl(bd, LLVMBuildOr(bd, LLVMConstInt(i64t, 0x80, 0), low6, "ch.b3d"),
+                         LLVMConstInt(i64t, 16, 0), "ch.b3e"), "ch.b3f"), "ch.b3");
+    LLVMValueRef b4 = LLVMBuildOr(bd,
+        LLVMBuildOr(bd, LLVMConstInt(i64t, 0xF0, 0), sh18, "ch.b4a"),
+        LLVMBuildOr(bd,
+            LLVMBuildShl(bd, LLVMBuildOr(bd, LLVMConstInt(i64t, 0x80, 0), c12, "ch.b4b"),
+                         LLVMConstInt(i64t, 8, 0), "ch.b4c"),
+            LLVMBuildOr(bd,
+                LLVMBuildShl(bd, LLVMBuildOr(bd, LLVMConstInt(i64t, 0x80, 0), c6, "ch.b4d"),
+                             LLVMConstInt(i64t, 16, 0), "ch.b4e"),
+                LLVMBuildShl(bd, LLVMBuildOr(bd, LLVMConstInt(i64t, 0x80, 0), low6, "ch.b4f"),
+                             LLVMConstInt(i64t, 24, 0), "ch.b4g"), "ch.b4h"), "ch.b4i"), "ch.b4");
+
+    LLVMValueRef lt80 = LLVMBuildICmp(bd, LLVMIntULT, cp, LLVMConstInt(i64t, 0x80, 0), "ch.lt80");
+    LLVMValueRef lt800 = LLVMBuildICmp(bd, LLVMIntULT, cp, LLVMConstInt(i64t, 0x800, 0), "ch.lt800");
+    LLVMValueRef lt10000 = LLVMBuildICmp(bd, LLVMIntULT, cp, LLVMConstInt(i64t, 0x10000, 0), "ch.lt1k");
+    LLVMValueRef packed = LLVMBuildSelect(bd, lt80, cp,
+        LLVMBuildSelect(bd, lt800, b2,
+            LLVMBuildSelect(bd, lt10000, b3, b4, "ch.p3"), "ch.p2"), "ch.packed");
+    LLVMValueRef len = LLVMBuildSelect(bd, lt80, LLVMConstInt(i64t, 1, 0),
+        LLVMBuildSelect(bd, lt800, LLVMConstInt(i64t, 2, 0),
+            LLVMBuildSelect(bd, lt10000, LLVMConstInt(i64t, 3, 0),
+                            LLVMConstInt(i64t, 4, 0), "ch.n3"), "ch.n2"), "ch.len");
+    /* char 0 still yields the empty string, matching a NUL-terminated C string. */
+
+    LLVMValueRef tmp = LLVMBuildAlloca(g->builder, i64t, "ch.tmp");
+    LLVMBuildStore(bd, packed, tmp);
+    LLVMValueRef buf = emit_string_alloc_rc(g, zan_add(bd, len, LLVMConstInt(i64t, 1, 0), "ch.sz"));
+    LLVMTypeRef memcpy_type = LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i8ptr, i8ptr, i64t }, 3, 0);
+    LLVMValueRef memcpy_fn = LLVMGetNamedFunction(g->mod, "memcpy");
+    if (!memcpy_fn) memcpy_fn = LLVMAddFunction(g->mod, "memcpy", memcpy_type);
+    zan_call2(bd, memcpy_type, memcpy_fn, (LLVMValueRef[]){ buf, tmp, len }, 3, "");
+    LLVMValueRef endp = LLVMBuildGEP2(bd, i8t, buf, &len, 1, "ch.end");
+    LLVMBuildStore(bd, LLVMConstInt(i8t, 0, 0), endp);
+    return buf;
+}
+
+/* emit_to_cstr for an operand whose AST is known: `char` formats as the
+ * character, every other type keeps the numeric/string formatting. */
+static LLVMValueRef emit_to_cstr_of(zan_irgen_t *g, LLVMValueRef val,
+                                    zan_ast_node_t *ast, local_scope_t *locals) {
+    if (ast && LLVMGetTypeKind(LLVMTypeOf(val)) == LLVMIntegerTypeKind &&
+        expr_is_char(g, ast, locals)) {
+        return emit_char_to_cstr(g, val);
+    }
+    return emit_to_cstr(g, val);
+}
+
 /* Emit `a + b` for two string (i8*) operands as a heap-allocated concatenation:
  * malloc(strlen(a)+strlen(b)+1); memcpy left, memcpy right, NUL terminate. */
 static LLVMValueRef emit_str_concat(zan_irgen_t *g, LLVMValueRef a, LLVMValueRef b) {
@@ -1176,7 +1254,7 @@ static LLVMValueRef emit_str_concat_n(zan_irgen_t *g, zan_ast_node_t *expr,
     LLVMValueRef total = LLVMConstInt(i64t, 1, 0); /* NUL */
     for (int i = 0; i < n; i++) {
         LLVMValueRef v = emit_expr(g, ops[i], locals);
-        LLVMValueRef s = emit_to_cstr(g, v);
+        LLVMValueRef s = emit_to_cstr_of(g, v, ops[i], locals);
         vals[i] = s;
         owned[i] = !is_string_expr(g, ops[i], locals) ||
                    expr_yields_owned_rc_value(g, ops[i], locals);

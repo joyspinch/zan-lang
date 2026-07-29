@@ -286,6 +286,15 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                         (LLVMTypeRef[]){ dbl },
                         1, 0);
                     zan_call2(g->builder, fn_type, g->rt_print_double, &arg, 1, "");
+                } else if (expr_is_char(g, arg_ast, locals)) {
+                    /* char prints as the character (C#), UTF-8 encoded. */
+                    LLVMValueRef cs = emit_char_to_cstr(g, arg);
+                    LLVMTypeRef i8p = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+                    zan_call2(g->builder,
+                        LLVMFunctionType(LLVMVoidTypeInContext(g->ctx),
+                                         (LLVMTypeRef[]){ i8p }, 1, 0),
+                        g->rt_println, &cs, 1, "");
+                    emit_string_release(g, cs);
                 } else {
                     /* ensure integer arg is i64 for print_int */
                     arg = emit_widen_i64_for_print(g, arg);
@@ -333,6 +342,12 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                         dbl_arg = LLVMBuildFPExt(g->builder, arg, LLVMDoubleTypeInContext(g->ctx), "ext");
                     LLVMValueRef args[] = { fmt, dbl_arg };
                     zan_call2(g->builder, printf_type, printf_fn, args, 2, "");
+                } else if (expr_is_char(g, arg_ast, locals)) {
+                    LLVMValueRef cs = emit_char_to_cstr(g, arg);
+                    LLVMValueRef cfmt = LLVMBuildGlobalStringPtr(g->builder, "%s", "wfmt_c");
+                    LLVMValueRef cargs[] = { cfmt, cs };
+                    zan_call2(g->builder, printf_type, printf_fn, cargs, 2, "");
+                    emit_string_release(g, cs);
                 } else {
                     LLVMValueRef fmt = expr_is_ulong(g, arg_ast, locals)
                         ? LLVMBuildGlobalStringPtr(g->builder, "%llu", "wfmt_u")
@@ -831,7 +846,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                             }
                             zan_ast_node_t *arg_ast = expr->call.args.items[idx + 1];
                             LLVMValueRef av = emit_expr(g, arg_ast, locals);
-                            LLVMValueRef as = emit_to_cstr(g, av);
+                            LLVMValueRef as = emit_to_cstr_of(g, av, arg_ast, locals);
                             int as_owned =
                                 LLVMGetTypeKind(LLVMTypeOf(av)) != LLVMPointerTypeKind ||
                                 expr_yields_owned_rc_value(g, arg_ast, locals);

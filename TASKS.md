@@ -1665,7 +1665,8 @@ A15-7（foreach 只能迭代 List）是修 A15-2 时实测发现的，一并修�
 A15-8（数组没有长度，字段/参数上 `.Length` 和 foreach 都不可用）已修
 （`a44a807`），A15-9（irgen 用 C 硬编码 43 个静态库调用，屏蔽 Zan 实现）
 已按 Path/File/Directory 处理（`b0f74ac`、`1cd90dd`）。
-A15-4 / A15-5 / A15-6 未做。**
+A15-6（`char` 按字符打印、`ulong` 十进制字面量不再夹断）已修，
+新增 `char_and_ulong_text` conformance。A15-4 / A15-5 未做。**
 
 标准库里那些"看着绕"的封装，多数不是风格问题，是被下面这些缺口逼出来的。
 每条都用最小程序实测过，不是读代码推断的。
@@ -1760,10 +1761,30 @@ irgen 按"类名 + 方法名"直接 lower 了 **43 个**静态库调用
 共 21 处已处理；`Math` / `Console` / `Environment` / `Convert` 在 stdlib 里
 没有对应的 Zan 类，要先写出来才能同样处理。
 
-## A15-6 其它已确认的小差异
+## A15-6 其它已确认的小差异 — ✅ 已修（2026-07-29）
 
-* `char` 打印成数字（`'A'` → `65`），C# 打印字符。
-* `ulong` 字面量超过 i64 上限会被夹到 `9223372036854775807`。
+* ~~`char` 打印成数字（`'A'` → `65`），C# 打印字符。~~ 已修：新增
+  `emit_char_to_cstr()`（`irgen_generics.c`，把码点按 UTF-8 编成 ARC 串），
+  凡是静态类型为 `char` 的表达式都走它——`Console.WriteLine` / `Console.Write`
+  （`irgen_call.c`）、`+` 拼接与多段拼接 `emit_str_concat_n()`、字符串插值
+  （`irgen_expr.c`）、`String.Format` 的字面量展开。`(int)c` 与
+  `int n = c;` 仍然是码点，整数/`ulong` 的既有格式化路径没有变动。
+  注意 `s[i]` 目前的静态类型不是 `char`（仍是整数），所以按数字打印，
+  这属于「索引器返回 `char`」的另一处 C# 差异，不在本条范围内。
+* ~~`ulong` 字面量超过 i64 上限会被夹到 `9223372036854775807`。~~ 已修：
+  `lexer.c` 的十进制路径原先只用 `strtoll`，溢出时被 `LLONG_MAX` 夹断；
+  现在检查 `errno == ERANGE` 后改用 `strtoull` 保留位模式（十六/八/二进制
+  路径本来就是这么做的）。
+* 〔测试〕`tests/conformance/char_and_ulong_text.zan`：ASCII / 非 ASCII
+  （`€`、`ñ`）字符的打印、写、拼接、插值、`String.Format`，`(int)` 仍是码点，
+  以及 `ulong.MaxValue`、`10^19`、两者相减与 `long.MaxValue` 的十进制字面量。
+  conformance / determinism / leakcheck 3/3 Passed。
+* 〔顺带〕`irgen_emit.c` 的模块校验失败现在会先逐函数 `LLVMVerifyFunction`，
+  把出错函数名写进诊断（原来只有一条 `ret i32 0` 却不知道在哪个函数）；
+  靠它定位到 B2-1 第十批漏改的 `FbBytes.Text()`（`byte[]` 上调
+  `Substring` → 走了 fallback），以及 `tests/conformance/mysql_auth_vectors.zan`
+  还在对已经是 ARC `byte[]` 的返回值调 `free()`（堆损坏 0xc0000374）。
+  两处都已修，`firebird_wire` / `mysql_auth_vectors` 的 6 个测试恢复 Passed。
 * struct 与整数不兼容此前只有无行号的 LLVM 校验失败——已修（`94cf827`）。
 * ~~数组是裸缓冲区，长度只在声明处记住~~ 已修，见 A15-8。
 
@@ -2175,7 +2196,14 @@ load → add → store 三件套（`src/compiler/irgen.c` 里 `zan_rt_alloc` /
 正常门禁。子集 `ctest -R 'exception|thread|leakcheck|arc|generic'` = 239 个里 237 过，
 2 个失败仍是既有的 WeChat SDK codegen 错误（见 A24）。
 
-## A26 — 既有失败，与 A21-A25 无关（未修，记账）
+## A26 — 既有失败，与 A21-A25 无关（✅ 两项均已消失，2026-07-29 复核）
+
+〔复核〕`ctest -R 'conformance_gui_datatable|leakcheck_sdk_wechat_product_modules|
+leakcheck_sdk_wechat_tenpay'` **3/3 Passed**，全量 `ctest -j4` 也是 711/711。
+两项都不是靠改测试消掉的：`tests/conformance/gui_datatable.out` 与
+`tests/gui/datatable_test.zan` 的最后一次改动都还是 `00035b4`（早于本轮），
+说明 5 个断言是被后续的 DataTable 重划（B3-3）/编译器修复真正修好的；
+Wechat 那两个 leakcheck 则随生成脚本那边收尾后参数个数对上了。下面是原始记录：
 
 1. `conformance_gui_datatable`：554 行输出里 5 个断言输出 0 应为 1（行 306 / 328 /
    331 / 438 / 457）。用改动前的编译器（`d1f804a^`）重编同一程序，失败完全一样，

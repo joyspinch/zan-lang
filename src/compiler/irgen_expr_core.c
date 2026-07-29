@@ -1011,6 +1011,13 @@ static bool expr_is_ulong(zan_irgen_t *g, zan_ast_node_t *e, local_scope_t *loca
     return t && t->kind == TYPE_ULONG;
 }
 
+/* True when an expression's static type is `char`, which prints and
+ * concatenates as the character itself (C#) rather than its numeric code. */
+static bool expr_is_char(zan_irgen_t *g, zan_ast_node_t *e, local_scope_t *locals) {
+    zan_type_t *t = infer_expr_type(g, e, locals);
+    return t && t->kind == TYPE_CHAR;
+}
+
 /* Class/struct symbol of an expression's static type, or NULL. */
 static zan_symbol_t *expr_class_sym(zan_irgen_t *g, zan_ast_node_t *e,
                                     local_scope_t *locals) {

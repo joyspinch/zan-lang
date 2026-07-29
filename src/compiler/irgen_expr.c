@@ -562,8 +562,8 @@ static LLVMValueRef emit_expr_binary(zan_irgen_t *g, zan_ast_node_t *expr,
          * "%t" + counter), so concat is not limited to two pointers. The
          * numeric temporaries are released after the concat copies them. */
         if (expr->binary.op == TK_PLUS && str_operand) {
-            LLVMValueRef ls = emit_to_cstr(g, left);
-            LLVMValueRef rs = emit_to_cstr(g, right);
+            LLVMValueRef ls = emit_to_cstr_of(g, left, expr->binary.left, locals);
+            LLVMValueRef rs = emit_to_cstr_of(g, right, expr->binary.right, locals);
             LLVMValueRef out = emit_str_concat(g, ls, rs);
             if (!is_string_expr(g, expr->binary.left, locals) ||
                 expr_yields_owned_rc_value(g, expr->binary.left, locals)) {
@@ -1727,6 +1727,12 @@ static LLVMValueRef emit_expr_string_interp(zan_irgen_t *g, zan_ast_node_t *expr
                     zan_call2(g->builder, snprintf_type, g->fn_snprintf, snp_args2, 4, "");
                     strs[i] = buf;
                     lens[i] = needed64;
+                    owns[i] = 1;
+                } else if (expr_is_char(g, part, locals)) {
+                    /* char interpolates as the character (C#), not its code. */
+                    LLVMValueRef buf = emit_char_to_cstr(g, val);
+                    strs[i] = buf;
+                    lens[i] = zan_call2(g->builder, strlen_type, g->fn_strlen, &buf, 1, "clen");
                     owns[i] = 1;
                 } else {
                     /* integer types — format with %lld (%llu for ulong) */
