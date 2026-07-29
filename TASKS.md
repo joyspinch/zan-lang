@@ -17,6 +17,12 @@
 * 每项完成时补上实测证据（命令、输出、测试名），不写"应该可以"；
 * 新发现的问题追加到对应章节末尾，编号顺延；
 * 结论被推翻时，改正文并在文末"已撤回的结论"里留一条，不要静默修改。
+* **迁不彻底就不迁**（2026-07-29 定调）：把一段 C 搬成 Zan，如果**它的调用方仍是 C**、
+  或者只能搬走一半（另一半留 C 兼容层），那就不做——半迁移只是多一道跨语言边界，
+  结构不变、性能不变、风险还多。据此已冻结 **B5-1**（光栅器）与 **B6**（LSP/DAP：
+  `json.c`/`rpc.c` 单独搬没有意义，消费者仍是 C），等各自的前置（A2 / A6）就绪后一次做完。
+* **优先级（2026-07-29 定调）**：重心是 **compiler / runtime 自身的封装质量、性能与除 bug**
+  （A 系列），不是把代码从 C 搬到 Zan。B 组里不影响编译器/运行时质量的迁移项一律让路。
 * **遇到编译器/运行时缺陷先修根因，不要绕过**（`AGENTS.md` 硬规则 10、
   `docs/WORKSPACE_CONVENTIONS.md` §8）。绕过写法只允许在写清探针与根因、
   登记到本清单并取得一致之后存在。
@@ -1343,7 +1349,16 @@ RA2 demo(76 files) 编译通过。
   类型的 `DbPool`）都适用；驻留仍留在驱动池里（协作式单线程调度，free list 只在
   await 点之间访问，无需锁）。前置 A7-1（实例泛型方法单态化）已解除。
 * **B3-2 🚧 进行中（大重构，逐方法拆、每步跑对应子集测试）。**
-  〔2026-07-29 重新盘点〕全库 `.zan`（stdlib + selfhost + ide_zan）实测 **30 个**方法 >150 行
+  〔2026-07-29 二次盘点，扫描器 `_scratch/scan_long.py`（花括号配对，注释/字符串安全）〕
+  >150 行的方法已从 30 个降到 **22 个**，最长的 `ZanIDE.Run()` 已从 3408 行降到 **2934 行**：
+  - **✅ `src/ide_zan/ZanIDE.zan:Run`**（3408，`b4f7550`）→ 开头约 490 行一次性字段初始化按语义
+    拆成 15 个方法（`InitWindowAndProject` / `InitWizardCatalogs` / `InitDialogState` /
+    `InitFindReplaceState` / `InitPublishState` / `InitEditorAppearance` / `InitHelpBrowser` /
+    `InitOutputSelection` / `InitDebugState` / `InitDesignerState` / `InitPanelsAndDock` /
+    `InitGitPanel` / `InitAiState` / `InitRunState` / `InitSidebarState`），`Run()` 变成
+    「建状态 → 泵事件」。纯代码搬运，语句零重排/零增删，读配置的三个方法把 `cfg` 收为参数。
+    `scripts\build_ide.ps1` → `IDE_BUILD_OK`。**剩余**：2934 行的事件循环本体（命令分发）待拆。
+  〔旧盘点〕全库 `.zan`（stdlib + selfhost + ide_zan）实测 **30 个**方法 >150 行
   （旧条目「23 个/最长 1536 行 DataTable.Render」已过时——`DataTable.Render` 早已拆到 <150 行）。
   当前实际最长（Top 前列）：
   - `src/ide_zan/ZanIDE.zan:1029 Main()` **3745**（IDE 主循环 + 命令分发，最应拆）
@@ -1510,7 +1525,12 @@ RA2 demo(76 files) 编译通过。
 能在 Zan 里重写（连 WndProc 都是 delegate）。真正的阻塞是 union / 宏 API /
 header-only 库 / C 回调 / 结构体字段偏移，全部对应 A2 / A3 / A4。
 
-* **B5-1**（未开始，〔A0+A1 已就绪，可以动手〕；2026-07-29 核实 `gui_runtime.c`
+* **B5-1 ❄️ 冻结**（2026-07-29 定调）——阶段 0 基准做完后评估：这些都是纯整数逐像素
+  循环，Zan 版最好也只是**持平**，性能零收益；而代价是一次性破坏 ABI（surface 所有权 +
+  文字导出签名 + 三条 present 路径同批改），且 X11/SDL/macOS 三个后端无法在开发机实测。
+  **原则：迁不彻底就不迁**——半成品只会多一层胶水。等 A2（ABI 分类完备）与
+  B5-5/B5-6 后端就绪后一次性做。基准与边界调查（下面两条）已落盘，重启时直接用。
+  〔A0+A1 已就绪；2026-07-29 核实 `gui_runtime.c`
   仍有 **28 个导出** / 54KB）光栅器搬 Zan：`gui_runtime.c` 的 19 个导出
   （surface / clip / 全部图元 / blur / snapshot）。**关键一刀是 surface 所有权**——
   改由 Zan 持有后，present 签名从 `(hwnd, surface_id)` 改为 `(ptr, w, h, stride)`，
@@ -1567,6 +1587,10 @@ header-only 库 / C 回调 / 结构体字段偏移，全部对应 A2 / A3 / A4�
 `dap/dap_main.c` 28KB、`common/json.c` 15KB、`common/rpc.c` 3KB。
 （`doc/zandoc.c` / `fmt/zanfmt.c` 已是 Zan；`pkg/zanpkg_main.c` 随包管理器整体删除。）
 按规则这些既不是 compiler 也不是 runtime，全都该是 Zan。
+
+**❄️ 整块冻结到 A6 就绪**（2026-07-29 定调）：先搚 `common/json.c` + `common/rpc.c`（18KB）
+技术上可行且不依赖 A6，但它们的唯一消费者 LSP/DAP 仍是 C，搚了也只是多一道
+跨语言边界——**迁不彻底就不迁**。等 A6（编译器对外 API）一次性把 LSP/DAP 整体搬过去。
 
 进度：
 * `zandoc` / `zanfmt` 已是 Zan（`src/doc` / `src/fmt` 由 `zanc` 从 `.zan` 源构建）。
