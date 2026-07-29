@@ -149,18 +149,16 @@ static zan_ast_node_t *name_path_head(zan_ast_node_t *node) {
 /* Resolve the declared type of an `obj.field` member access so that element
  * indexing on struct/class array fields (e.g. `b.data[i]`) can determine the
  * element LLVM type. Returns NULL when the field/type cannot be resolved. */
-/* ---- C# conversion rules: report silent narrowing (A0) ----
+/* ---- C# conversion rules: reject unsafe native-integer narrowing (A0) ----
  *
  * C# only converts implicitly when the destination can hold every value of
- * the source: `int -> long` / `int -> nint` are implicit, `long -> int` and
- * `nint -> int` need an explicit cast. Zan truncates silently instead, which
- * is invisible today (every integer is stored as i64) but starts dropping the
- * high half of every handle the moment `int` becomes 32 bits. Reporting it
- * now is what turns "carrier variables typed `int`" from an invisible hazard
- * into a compile-time list.
+ * the source: `int -> long` / `int -> nint` are implicit, while `nint -> int`
+ * needs an explicit cast. Since Zan's `int` is now 32-bit, silently accepting
+ * a pointer-width handle in an `int` carrier truncates live pointers on 64-bit
+ * targets. That conversion is therefore an unconditional compile error.
  *
- * Opt-in (`ZAN_WARN_NARROW=1`) while the stdlib is migrated; it becomes an
- * error by default in the same change that makes `int` 32-bit. */
+ * Other historical numeric narrowing remains available as the opt-in
+ * `ZAN_WARN_NARROW=1` migration diagnostic until those call sites are audited. */
 static int conv_rank(zan_type_t *t) {
     if (!t) return 0;
     switch (t->kind) {
@@ -233,22 +231,27 @@ static bool const_fits(zan_type_t *dst, int64_t v) {
     }
 }
 
-static void warn_narrowing(zan_irgen_t *g, zan_type_t *dst, zan_type_t *src,
-                           zan_ast_node_t *at, const char *what) {
-    if (!narrow_warn_enabled() || !g || !g->diag || !at) return;
-    if (!dst || !src) return;
+static void check_implicit_narrowing(zan_irgen_t *g, zan_type_t *dst,
+                                      zan_type_t *src, zan_ast_node_t *at,
+                                      const char *what) {
+    if (!g || !g->diag || !at || !dst || !src) return;
     int64_t cv;
     if (const_int_expr(at, &cv) && const_fits(dst, cv)) return;
     int rd = conv_rank(dst), rs = conv_rank(src);
     bool src_float = src->kind == TYPE_FLOAT || src->kind == TYPE_DOUBLE;
-    if (!rd) return;
-    if (!rs && !src_float) return;
-    /* nint keeps its own identity: it is pointer-width, so narrowing it to a
-     * fixed 32-bit `int` is a loss even while both are stored as i64. */
-    bool loses = src_float || rs > rd ||
-                 (src->kind == TYPE_NINT && dst->kind != TYPE_NINT && rd < 8);
+    if (!rd || (!rs && !src_float)) return;
+
+    /* A native handle must not silently enter a fixed-width sub-64-bit
+     * carrier. This is a correctness boundary, not a style warning: the upper
+     * pointer bits are lost before the value reaches the runtime/FFI call. */
+    bool native_handle_loss =
+        src->kind == TYPE_NINT && dst->kind != TYPE_NINT && rd < 8;
+    bool loses = src_float || rs > rd || native_handle_loss;
     if (!loses) return;
-    zan_diag_emit(g->diag, DIAG_WARNING, at->loc,
+    if (!native_handle_loss && !narrow_warn_enabled()) return;
+
+    zan_diag_emit(g->diag, native_handle_loss ? DIAG_ERROR : DIAG_WARNING,
+                  at->loc,
                   "narrowing conversion from '%s' to '%s' in %s needs an "
                   "explicit cast (C# rules)",
                   src->name.str ? src->name.str : "?",

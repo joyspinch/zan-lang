@@ -787,6 +787,25 @@ add_test(NAME diag_no_runtime_arc COMMAND ${CMAKE_COMMAND}
   -P ${CMAKE_SOURCE_DIR}/tests/run_no_runtime_ir.cmake)
 set_tests_properties(diag_no_runtime_arc PROPERTIES TIMEOUT 60)
 
+# A pointer-width native handle must never be implicitly truncated into a
+# fixed 32-bit int. Exercise every conversion boundary independently so a new
+# lowering path cannot bypass the source-language diagnostic.
+foreach(_nint_boundary initializer assignment argument return expr_return async_return lambda_return generic_return)
+  if(_nint_boundary MATCHES "return$")
+    set(_nint_what return)
+  else()
+    set(_nint_what ${_nint_boundary})
+  endif()
+  add_test(NAME diag_nint_to_int_${_nint_boundary}
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/nint_to_int_${_nint_boundary}.zan
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_nint_to_int_${_nint_boundary}${_exe_ext}
+      "-DEXPECT_REGEX=narrowing conversion from 'nint' to 'int' in ${_nint_what}"
+      -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+  set_tests_properties(diag_nint_to_int_${_nint_boundary} PROPERTIES TIMEOUT 60)
+endforeach()
+
 # ---- Golden compiler regression tests ----
 # Freeze the lexer token stream and parse tree for a set of hermetic (stdlib-free)
 # .zan inputs so any lexer/parser/AST regression is caught in CI on every

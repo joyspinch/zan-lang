@@ -38,6 +38,7 @@ struct zan_irgen {
     /* current function being compiled */
     LLVMValueRef current_fn;
     LLVMTypeRef current_fn_ret_type;
+    zan_type_t *current_fn_zan_ret_type; /* declared source-language return type */
 
     /* unique-name counter for null-conditional (`?.`) receiver temps */
     int qdot_counter;

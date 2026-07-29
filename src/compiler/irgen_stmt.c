@@ -251,7 +251,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
          * an assignment or an argument, and is how handle carriers typed `int`
          * usually enter a function. */
         if (stmt->var_decl.type && stmt->var_decl.initializer) {
-            warn_narrowing(g, resolve_type_ctx(g, stmt->var_decl.type),
+            check_implicit_narrowing(g, resolve_type_ctx(g, stmt->var_decl.type),
                            infer_expr_type(g, stmt->var_decl.initializer, locals),
                            stmt->var_decl.initializer, "initializer");
         }
@@ -505,9 +505,6 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         if (arc_own) zan_store_fit(g, LLVMConstNull(llvm_type), alloca);
 
         if (stmt->var_decl.initializer) {
-            warn_narrowing(g, type,
-                infer_expr_type(g, stmt->var_decl.initializer, locals),
-                stmt->var_decl.initializer, "initializer");
             check_value_type_mismatch(g, type,
                 infer_expr_type(g, stmt->var_decl.initializer, locals),
                 stmt->var_decl.initializer, "initializer");
@@ -639,6 +636,11 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
     }
 
     case AST_RETURN_STMT:
+        if (stmt->ret.value) {
+            check_implicit_narrowing(g, g->current_fn_zan_ret_type,
+                infer_expr_type(g, stmt->ret.value, locals),
+                stmt->ret.value, "return");
+        }
         /* Inside an async $resume body, `return e` completes the state machine:
          * store the result into the frame, mark it done, and `ret void` — the
          * frame pointer (Task) was already handed out by the ramp. (The awaiter

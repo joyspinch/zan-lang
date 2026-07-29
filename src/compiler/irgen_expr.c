@@ -1138,7 +1138,7 @@ static LLVMValueRef emit_expr_assignment(zan_irgen_t *g, zan_ast_node_t *expr,
         LLVMValueRef right;
         {
             zan_type_t *lt = assign_lhs_type(g, expr->binary.left, locals);
-            warn_narrowing(g, lt,
+            check_implicit_narrowing(g, lt,
                 infer_expr_type(g, expr->binary.right, locals),
                 expr->binary.right, "assignment");
             check_value_type_mismatch(g, lt,
@@ -3610,10 +3610,12 @@ static LLVMValueRef emit_lambda_typed(zan_irgen_t *g, zan_ast_node_t *expr,
      * context while keeping the enclosing type for static member access. */
     LLVMValueRef saved_fn = g->current_fn;
     LLVMTypeRef saved_fn_ret = g->current_fn_ret_type;
+    zan_type_t *saved_fn_zan_ret = g->current_fn_zan_ret_type;
     LLVMValueRef saved_this = g->current_this;
     LLVMValueRef saved_async_frame = g->current_async_frame;
     g->current_fn = lambda_fn;
     g->current_fn_ret_type = ret_type;
+    g->current_fn_zan_ret_type = rett;
     int saved_throw_base = g->throw_locals_base;
     int saved_catch_cc = g->catch_cleanup_count;
     int saved_throw_cb = g->throw_catch_base;
@@ -3641,6 +3643,9 @@ static LLVMValueRef emit_lambda_typed(zan_irgen_t *g, zan_ast_node_t *expr,
             else LLVMBuildRet(g->builder, LLVMConstNull(ret_type));
         }
     } else if (expr->lambda.body) {
+        check_implicit_narrowing(g, rett,
+            infer_expr_type(g, expr->lambda.body, &lambda_locals),
+            expr->lambda.body, "return");
         LLVMValueRef result = emit_expr(g, expr->lambda.body, &lambda_locals);
         if (ret_void) {
             LLVMBuildRetVoid(g->builder);
@@ -3658,6 +3663,7 @@ static LLVMValueRef emit_lambda_typed(zan_irgen_t *g, zan_ast_node_t *expr,
 
     g->current_fn = saved_fn;
     g->current_fn_ret_type = saved_fn_ret;
+    g->current_fn_zan_ret_type = saved_fn_zan_ret;
     g->throw_locals_base = saved_throw_base;
     g->catch_cleanup_count = saved_catch_cc;
     g->throw_catch_base = saved_throw_cb;
@@ -3928,7 +3934,7 @@ static void check_delegate_async_match(zan_irgen_t *g, zan_ast_node_t *e,
 static LLVMValueRef emit_arg_typed(zan_irgen_t *g, zan_ast_node_t *arg,
                                    zan_type_t *ptype, local_scope_t *locals) {
     zan_type_t *atype = infer_expr_type(g, arg, locals);
-    warn_narrowing(g, ptype, atype, arg, "argument");
+    check_implicit_narrowing(g, ptype, atype, arg, "argument");
     check_value_type_mismatch(g, ptype, atype, arg, "argument");
     if (arg && ptype && ptype->kind == TYPE_DELEGATE) {
         if (arg->kind == AST_LAMBDA)

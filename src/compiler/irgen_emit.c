@@ -858,6 +858,7 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
 
             LLVMValueRef saved_fn = g->current_fn;
             LLVMTypeRef saved_fn_ret = g->current_fn_ret_type;
+            zan_type_t *saved_fn_zan_ret = g->current_fn_zan_ret_type;
             LLVMValueRef saved_this = g->current_this;
             zan_symbol_t *saved_type_sym = g->current_type_sym;
             LLVMValueRef saved_async_frame = g->current_async_frame;
@@ -899,6 +900,7 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
                 member->method_decl.return_type
                     ? zan_binder_resolve_type(g->binder, member->method_decl.return_type)
                     : g->binder->type_void);
+            g->current_fn_zan_ret_type = g->current_async_ret_type;
             g->current_async_next_state = 1;
             g->current_async_sub_base = work[w].sub_base;
             g->current_async_sub_next = 0;
@@ -954,6 +956,9 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
                 }
             } else {
                 /* expression body (=> expr): treat as `return expr`. */
+                check_implicit_narrowing(g, g->current_fn_zan_ret_type,
+                    infer_expr_type(g, member->method_decl.body, locals),
+                    member->method_decl.body, "return");
                 LLVMValueRef val = emit_expr(g, member->method_decl.body, locals);
                 emit_async_complete(g, locals,
                     coerce_to_frame_result(g, coerce_async_ret(g, val),
@@ -971,6 +976,7 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
 
             g->current_fn = saved_fn;
             g->current_fn_ret_type = saved_fn_ret;
+            g->current_fn_zan_ret_type = saved_fn_zan_ret;
             g->throw_locals_base = saved_throw_base;
             g->catch_cleanup_count = saved_catch_cc;
             g->throw_catch_base = saved_throw_cb;
@@ -1072,11 +1078,13 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
 
         LLVMValueRef saved_fn = g->current_fn;
         LLVMTypeRef saved_fn_ret = g->current_fn_ret_type;
+        zan_type_t *saved_fn_zan_ret = g->current_fn_zan_ret_type;
         LLVMValueRef saved_this = g->current_this;
         zan_symbol_t *saved_type_sym = g->current_type_sym;
         zan_ast_node_t *saved_fn_body = g->current_fn_body;
         g->current_fn = fn;
         g->current_fn_ret_type = llvm_ret;
+        g->current_fn_zan_ret_type = ret_type;
         int saved_throw_base = g->throw_locals_base;
         int saved_catch_cc = g->catch_cleanup_count;
         int saved_throw_cb = g->throw_catch_base;
@@ -1143,6 +1151,9 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
             }
         } else {
             /* expression body (=> expr) */
+            check_implicit_narrowing(g, g->current_fn_zan_ret_type,
+                infer_expr_type(g, member->method_decl.body, locals),
+                member->method_decl.body, "return");
             LLVMValueRef val = emit_expr(g, member->method_decl.body, locals);
             /* convert return type if needed */
             LLVMTypeRef val_t = LLVMTypeOf(val);
@@ -1176,6 +1187,7 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
 
         g->current_fn = saved_fn;
         g->current_fn_ret_type = saved_fn_ret;
+        g->current_fn_zan_ret_type = saved_fn_zan_ret;
         g->throw_locals_base = saved_throw_base;
         g->catch_cleanup_count = saved_catch_cc;
         g->throw_catch_base = saved_throw_cb;
@@ -1593,11 +1605,13 @@ static void emit_method_spec_body(zan_irgen_t *g, int idx) {
 
     LLVMValueRef saved_fn = g->current_fn;
     LLVMTypeRef saved_fn_ret = g->current_fn_ret_type;
+    zan_type_t *saved_fn_zan_ret = g->current_fn_zan_ret_type;
     LLVMValueRef saved_this = g->current_this;
     zan_symbol_t *saved_type_sym = g->current_type_sym;
     zan_ast_node_t *saved_fn_body = g->current_fn_body;
     g->current_fn = sp.fn;
     g->current_fn_ret_type = llvm_ret;
+    g->current_fn_zan_ret_type = ret_type;
     int saved_throw_base = g->throw_locals_base;
     int saved_catch_cc = g->catch_cleanup_count;
     int saved_throw_cb = g->throw_catch_base;
@@ -1617,6 +1631,9 @@ static void emit_method_spec_body(zan_irgen_t *g, int idx) {
             emit_stmt(g, member->method_decl.body->block.stmts.items[k], locals);
         }
     } else {
+        check_implicit_narrowing(g, g->current_fn_zan_ret_type,
+            infer_expr_type(g, member->method_decl.body, locals),
+            member->method_decl.body, "return");
         LLVMValueRef val = emit_expr(g, member->method_decl.body, locals);
         LLVMTypeRef val_t = LLVMTypeOf(val);
         if (val_t != llvm_ret) {
@@ -1648,6 +1665,7 @@ static void emit_method_spec_body(zan_irgen_t *g, int idx) {
 
     g->current_fn = saved_fn;
     g->current_fn_ret_type = saved_fn_ret;
+    g->current_fn_zan_ret_type = saved_fn_zan_ret;
     g->throw_locals_base = saved_throw_base;
     g->catch_cleanup_count = saved_catch_cc;
     g->throw_catch_base = saved_throw_cb;
