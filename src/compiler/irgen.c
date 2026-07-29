@@ -1828,6 +1828,38 @@ static LLVMTypeRef get_struct_llvm_type(zan_irgen_t *g, zan_symbol_t *sym) {
     return NULL;
 }
 
+static struct zan_struct_type_entry *get_struct_entry(zan_irgen_t *g,
+                                                      zan_symbol_t *sym) {
+    for (int i = 0; i < g->struct_type_count; i++) {
+        if (g->struct_types[i].sym == sym) return &g->struct_types[i];
+    }
+    return NULL;
+}
+
+/* Address a field of an instance. A sequential struct is laid out by LLVM
+ * exactly like the C compiler would, so its fields are reached by index; an
+ * explicit-layout struct is one opaque block, so the field's own offset is
+ * applied and then re-typed (a GEP of the field type, so that a store to it
+ * still sees what it is storing into). */
+static LLVMValueRef emit_field_ptr(zan_irgen_t *g, zan_symbol_t *type_sym,
+                                   LLVMTypeRef st, LLVMValueRef base,
+                                   int fi, const char *name) {
+    struct zan_struct_type_entry *e = type_sym ? get_struct_entry(g, type_sym) : NULL;
+    if (e && e->explicit_layout && fi >= 0 && fi < e->field_count) {
+        LLVMValueRef off = LLVMConstInt(LLVMInt64TypeInContext(g->ctx),
+                                        e->field_offsets[fi], 0);
+        LLVMValueRef raw = LLVMBuildInBoundsGEP2(g->builder,
+            LLVMInt8TypeInContext(g->ctx), base, &off, 1, "fld.off");
+        /* Re-typed as a one-field struct rather than as the bare field type:
+         * a store to it then recovers what it is storing into the same way it
+         * does for a sequential field, instead of writing the value's own
+         * width over the neighbouring fields. */
+        LLVMTypeRef wrap = LLVMStructTypeInContext(g->ctx, &e->field_llvm[fi], 1, 0);
+        return LLVMBuildStructGEP2(g->builder, wrap, raw, 0, name);
+    }
+    return LLVMBuildStructGEP2(g->builder, st, base, (unsigned)fi, name);
+}
+
 /* Static fields live in module globals, not in the instance struct: they are
  * excluded from instance layout and field indexing. */
 static bool field_member_is_static(zan_symbol_t *m) {
@@ -1966,6 +1998,34 @@ static zan_symbol_t *resolve_iface_overload(zan_symbol_t *iface, zan_istr_t name
     return NULL;
 }
 
+/* Defined in irgen_abi.c, which is part of this translation unit. */
+static unsigned long abi_size_of(LLVMTypeRef t);
+static unsigned long abi_align_of(LLVMTypeRef t);
+
+static bool decl_is_explicit_layout(zan_symbol_t *sym) {
+    return sym->decl &&
+           (sym->decl->kind == AST_STRUCT_DECL || sym->decl->kind == AST_CLASS_DECL) &&
+           sym->decl->type_decl.is_explicit_layout;
+}
+
+/* [FieldOffset(n)] -- the byte offset a field of an explicit-layout type sits
+ * at. Two fields may name the same offset, which is how a union is written. */
+static bool field_offset_attr(zan_symbol_t *field, unsigned long *out) {
+    if (!field->decl) return false;
+    for (int i = 0; i < field->decl->attributes.count; i++) {
+        zan_ast_node_t *a = field->decl->attributes.items[i];
+        if (a->kind != AST_ATTRIBUTE || !a->attribute.name) continue;
+        zan_istr_t n = a->attribute.name->ident.name;
+        if (!n.str || n.len != 11 || memcmp(n.str, "FieldOffset", 11) != 0) continue;
+        if (a->attribute.args.count < 1) continue;
+        zan_ast_node_t *v = a->attribute.args.items[0];
+        if (v->kind != AST_INT_LITERAL || v->int_val < 0) continue;
+        *out = (unsigned long)v->int_val;
+        return true;
+    }
+    return false;
+}
+
 static void register_struct_type(zan_irgen_t *g, zan_symbol_t *sym) {
     if (get_struct_llvm_type(g, sym)) return;
     g->struct_types = irgen_grow(g->struct_types, &g->struct_type_cap,
@@ -2009,8 +2069,63 @@ static void register_struct_type(zan_irgen_t *g, zan_symbol_t *sym) {
         }
     }
 
-    LLVMStructSetBody(st, field_types, (unsigned)(field_count + vptr), 0);
-    free(field_types);
+    struct zan_struct_type_entry *entry = &g->struct_types[g->struct_type_count - 1];
+    entry->field_count = field_count + vptr;
+    entry->field_llvm = field_types;
+    entry->explicit_layout = decl_is_explicit_layout(sym);
+
+    if (!entry->explicit_layout) {
+        /* Sequential (the default, and what [StructLayout] asks for): LLVM
+         * already pads and aligns a non-packed struct the way C does. */
+        LLVMStructSetBody(st, field_types, (unsigned)(field_count + vptr), 0);
+        return;
+    }
+
+    entry->field_offsets = (unsigned long *)calloc((size_t)(field_count + vptr),
+                                                   sizeof(unsigned long));
+    unsigned long size = 0, align = 1;
+    int slot = vptr;
+    if (vptr) {
+        /* A vtable pointer has no [FieldOffset] to place it at, and a type
+         * whose layout C code depends on has no business dispatching. */
+        zan_diag_emit(g->diag, DIAG_ERROR, sym->decl ? sym->decl->loc : zan_loc(0, 0, 0, 0),
+                      "explicit-layout type '%.*s' cannot have virtual methods",
+                      (int)sym->name.len, sym->name.str);
+    }
+    for (int i = 0; i < sym->member_count; i++) {
+        zan_symbol_t *m = sym->members[i];
+        if ((m->kind != SYM_FIELD && m->kind != SYM_PROPERTY) ||
+            field_member_is_static(m)) continue;
+        unsigned long off = 0;
+        if (!field_offset_attr(m, &off)) {
+            zan_diag_emit(g->diag, DIAG_ERROR, m->decl ? m->decl->loc : sym->decl->loc,
+                          "field '%.*s' of explicit-layout type '%.*s' needs [FieldOffset(n)]",
+                          (int)m->name.len, m->name.str,
+                          (int)sym->name.len, sym->name.str);
+        }
+        entry->field_offsets[slot] = off;
+        unsigned long fa = abi_align_of(field_types[slot]);
+        if (off % fa != 0) {
+            zan_diag_emit(g->diag, DIAG_ERROR, m->decl ? m->decl->loc : sym->decl->loc,
+                          "[FieldOffset(%lu)] on '%.*s' is not %lu-byte aligned",
+                          off, (int)m->name.len, m->name.str, fa);
+        }
+        if (fa > align) align = fa;
+        unsigned long end = off + abi_size_of(field_types[slot]);
+        if (end > size) size = end;
+        slot++;
+    }
+    if (size % align) size += align - size % align;
+
+    /* One block, with a leading integer of the widest field's alignment so
+     * that the block itself is aligned the way the C type is. */
+    LLVMTypeRef body[2];
+    unsigned nbody = 0;
+    body[nbody++] = LLVMIntTypeInContext(g->ctx, (unsigned)(align * 8));
+    if (size > align)
+        body[nbody++] = LLVMArrayType(LLVMInt8TypeInContext(g->ctx),
+                                      (unsigned)(size - align));
+    LLVMStructSetBody(st, body, nbody, 0);
 }
 
 /* ---- virtual dispatch helpers ---- */

@@ -2456,13 +2456,26 @@ zan_ast_node_t *zan_parser_parse(zan_parser_t *p) {
     while (!parser_check(p, TK_EOF) && !parser_check(p, TK_RBRACE)) {
         /* parse attributes: retained on the type; [StructLayout] also toggles C layout */
         bool has_c_layout = false;
+        bool has_explicit_layout = false;
         zan_ast_list_t type_attrs;
         zan_ast_list_init(&type_attrs);
         parse_attr_usages(p, &type_attrs, NULL, NULL);
         for (int _ai = 0; _ai < type_attrs.count; _ai++) {
             zan_istr_t _n = type_attrs.items[_ai]->attribute.name->ident.name;
-            if (_n.str && _n.len == 12 && memcmp(_n.str, "StructLayout", 12) == 0)
+            if (_n.str && _n.len == 12 && memcmp(_n.str, "StructLayout", 12) == 0) {
                 has_c_layout = true;
+                /* `LayoutKind.Explicit` parses as a member access whose last
+                 * segment names the kind; anything else stays sequential. */
+                zan_ast_list_t *_args = &type_attrs.items[_ai]->attribute.args;
+                for (int _aj = 0; _aj < _args->count; _aj++) {
+                    zan_ast_node_t *_a = _args->items[_aj];
+                    zan_istr_t _k = {NULL, 0};
+                    if (_a->kind == AST_MEMBER_ACCESS) _k = _a->member.name;
+                    else if (_a->kind == AST_IDENTIFIER) _k = _a->ident.name;
+                    if (_k.str && _k.len == 8 && memcmp(_k.str, "Explicit", 8) == 0)
+                        has_explicit_layout = true;
+                }
+            }
         }
 
         uint32_t mods = parse_modifiers(p);
@@ -2494,6 +2507,7 @@ zan_ast_node_t *zan_parser_parse(zan_parser_t *p) {
             parser_check(p, TK_INTERFACE) || parser_check(p, TK_ENUM)) {
             zan_ast_node_t *decl = parse_type_decl(p, mods);
             decl->type_decl.is_c_layout = has_c_layout;
+            decl->type_decl.is_explicit_layout = has_explicit_layout;
             decl->attributes = type_attrs;
             zan_ast_list_push(&unit->comp_unit.decls, decl, p->arena);
         } else if (parser_check(p, TK_DELEGATE)) {

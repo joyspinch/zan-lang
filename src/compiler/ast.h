@@ -312,6 +312,8 @@ struct zan_ast_node {
             zan_ast_list_t members;
             uint32_t modifiers;
             bool is_c_layout;  /* [StructLayout(LayoutKind.Sequential)] for C ABI */
+            bool is_explicit_layout; /* [StructLayout(LayoutKind.Explicit)]:
+                                      * every field carries [FieldOffset(n)] */
             zan_ast_list_t where_clauses; /* AST_WHERE_CLAUSE generic constraints */
         } type_decl;
 

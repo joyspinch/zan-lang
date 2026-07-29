@@ -407,7 +407,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                                     if (arg->kind == AST_ASSIGNMENT && arg->binary.left->kind == AST_IDENTIFIER) {
                                         int fi = get_field_index(sym, arg->binary.left->ident.name);
                                         if (fi >= 0) {
-                                            LLVMValueRef fptr = LLVMBuildStructGEP2(g->builder, st, alloca, (unsigned)fi, "finit");
+                                            LLVMValueRef fptr = emit_field_ptr(g, sym, st, alloca, fi, "finit");
                                             LLVMValueRef fval = emit_expr(g, arg->binary.right, locals);
                                             zan_symbol_t *fsym = get_field_sym(sym, arg->binary.left->ident.name);
                                             if (fsym && fsym->type) {

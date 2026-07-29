@@ -1826,8 +1826,8 @@ static void emit_invalidate_freed_string(zan_irgen_t *g, zan_ast_node_t *arg,
                 if (fi >= 0 && st) {
                     LLVMValueRef this_ptr = LLVMBuildLoad2(g->builder,
                         LLVMPointerType(st, 0), g->current_this, "this");
-                    LLVMValueRef field_ptr = LLVMBuildStructGEP2(g->builder, st,
-                        this_ptr, (unsigned)fi, "freed.fld");
+                    LLVMValueRef field_ptr = emit_field_ptr(g, g->current_type_sym, st,
+                        this_ptr, fi, "freed.fld");
                     LLVMBuildStore(g->builder, LLVMConstNull(field_type), field_ptr);
                 }
             }
@@ -1877,8 +1877,7 @@ static void emit_invalidate_freed_string(zan_irgen_t *g, zan_ast_node_t *arg,
     int fi = get_field_index(class_sym, arg->member.name);
     LLVMTypeRef st = get_struct_llvm_type(g, class_sym);
     if (fi < 0 || !st) return;
-    LLVMValueRef field_ptr = LLVMBuildStructGEP2(g->builder, st, object_ptr,
-                                                 (unsigned)fi, "freed.fld");
+    LLVMValueRef field_ptr = emit_field_ptr(g, class_sym, st, object_ptr, fi, "freed.fld");
     LLVMBuildStore(g->builder, LLVMConstNull(map_type(g, field_type)), field_ptr);
 }
 

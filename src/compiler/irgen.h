@@ -66,6 +66,14 @@ struct zan_irgen {
     struct zan_struct_type_entry {
         zan_symbol_t *sym;
         LLVMTypeRef llvm_type;
+        /* [StructLayout(LayoutKind.Explicit)]: the body is one opaque block
+         * and every field is addressed by its own [FieldOffset(n)], so two
+         * fields may overlap -- that is how a C union is written. Indexed
+         * like get_field_index (a vptr slot, if any, is index 0). */
+        bool explicit_layout;
+        unsigned long *field_offsets;
+        LLVMTypeRef *field_llvm;
+        int field_count;
     } *struct_types;
     int struct_type_count;
     int struct_type_cap;

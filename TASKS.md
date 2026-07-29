@@ -428,10 +428,21 @@ static extern int zan_gui_present(int hwnd, int surfaceId);
     但存进 float 槽时没有 `fptrunc`（写进去的是 f64 位型，打印出来是 0）、
     打印时没有 `fpext`（LLVM verify 直接失败）、`float op double` 两边类型不一致。
     见 `tests/conformance/float_widths.zan`。
-* **A2-2** `[repr(C)]` 布局 + `[StructLayout(Explicit)]` + `[FieldOffset(n)]`。
-  **union 不新增类型 kind**——所有字段 `FieldOffset(0)` 的 explicit struct 即 union，
-  用来表达 `SDL_Event`(128B) / `XEvent`(192B) / `DEBUG_EVENT`。
-  偏移本该由编译器从 repr(C) 算出，而不是在 Zan 里硬编码常量。
+* **A2-2 ✅ 已完成（2026-07-28）`[StructLayout(Explicit)]` + `[FieldOffset(n)]`**。
+  - **顺序布局**（默认，即 `[StructLayout]` / `[StructLayout(LayoutKind.Sequential)]`）：
+    LLVM 对非 packed 结构体的填充/对齐本来就和 C 一致，所以不需要额外代码；
+    A2-1 的 27 种形状 × 4 target 与 clang 声明零差异即是这条的验证。
+  - **显式布局**：`[StructLayout(LayoutKind.Explicit)]` 的类型整体降成一个
+    「对齐载体 + 字节块」（`%struct.Event = { i64, [8 x i8] }`），每个字段按自己的
+    `[FieldOffset(n)]` 用字节 GEP 定址，再按字段类型重新 typed（否则存的时候会按
+    值自身的宽度盖掉邻居）。**union 没有新增类型 kind**——两个字段写同一个偏移就是
+    union，可以表达 `SDL_Event` / `XEvent` / `DEBUG_EVENT`。
+  - 缺 `[FieldOffset]`、偏移未按字段对齐、以及 explicit 类型带虚方法（vptr 没有
+    偏移可放）都会报错，不再静默生成错位的访问。
+  - 用例：`tests/conformance/explicit_layout.zan`（int/byte 重叠、带洞的 tag +
+    payload、long/int 对/float 三者共用同一偏移）。`ctest -j8` 708/708。
+  - **未做**：`Pack = n`（packed 布局）、`[FieldOffset]` 用于顺序布局类型的校验、
+    以及把 stdlib 里硬编码的 `SDL_Event`/`MSG` 偏移改成声明式（属于 B5）。
 * **A2-3** 变参：加 `[DllImport(..., Variadic = true)]`。
 * **A2-4** `signext` / `zeroext` + 调用约定属性
   （全 compiler 里 `stdcall` / `CallConv` 出现 0 次）。

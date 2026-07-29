@@ -305,7 +305,7 @@ static LLVMValueRef emit_expr_identifier(zan_irgen_t *g, zan_ast_node_t *expr,
                 if (st) {
                     LLVMValueRef this_ptr = LLVMBuildLoad2(g->builder,
                         LLVMPointerType(st, 0), g->current_this, "this");
-                    LLVMValueRef fptr = LLVMBuildStructGEP2(g->builder, st, this_ptr, (unsigned)fi, "fld");
+                    LLVMValueRef fptr = emit_field_ptr(g, g->current_type_sym, st, this_ptr, fi, "fld");
                     zan_symbol_t *fsym = get_field_sym(g->current_type_sym, expr->ident.name);
                     LLVMTypeRef ft = fsym ? map_type(g, fsym->type) : LLVMInt64TypeInContext(g->ctx);
                     return promote_loaded(g,
@@ -823,7 +823,7 @@ static void get_binding_accessors(zan_irgen_t *g, zan_symbol_t *cls,
         g->current_fn = get_fn;
         LLVMValueRef obj = LLVMBuildBitCast(g->builder, LLVMGetParam(get_fn, 0),
             LLVMPointerType(st, 0), "obj");
-        LLVMValueRef fptr = LLVMBuildStructGEP2(g->builder, st, obj, (unsigned)fi, "fld");
+        LLVMValueRef fptr = emit_field_ptr(g, cls, st, obj, fi, "fld");
         LLVMValueRef val = LLVMBuildLoad2(g->builder, vt, fptr, "val");
         if (is_rc_managed_type(fs->type))
             emit_rc_retain_for_type(g, fs->type, val);
@@ -843,7 +843,7 @@ static void get_binding_accessors(zan_irgen_t *g, zan_symbol_t *cls,
         LLVMValueRef obj = LLVMBuildBitCast(g->builder, LLVMGetParam(set_fn, 0),
             LLVMPointerType(st, 0), "obj");
         LLVMValueRef v = LLVMGetParam(set_fn, 1);
-        LLVMValueRef fptr = LLVMBuildStructGEP2(g->builder, st, obj, (unsigned)fi, "fld");
+        LLVMValueRef fptr = emit_field_ptr(g, cls, st, obj, fi, "fld");
         if (is_rc_managed_type(fs->type)) {
             /* borrowed param: retain incoming, release the previous occupant */
             LLVMValueRef old = LLVMBuildLoad2(g->builder, vt, fptr, "old");
@@ -1145,7 +1145,7 @@ binding_lowered:
                     if (st) {
                         LLVMValueRef this_ptr = LLVMBuildLoad2(g->builder,
                             LLVMPointerType(st, 0), g->current_this, "this");
-                        LLVMValueRef fptr = LLVMBuildStructGEP2(g->builder, st, this_ptr, (unsigned)fi, "fld");
+                        LLVMValueRef fptr = emit_field_ptr(g, g->current_type_sym, st, this_ptr, fi, "fld");
                         /* type conversion if needed */
                         zan_symbol_t *fsym = get_field_sym(g->current_type_sym, expr->binary.left->ident.name);
                         if (fsym && fsym->type) {
@@ -1570,7 +1570,7 @@ binding_lowered:
                         LLVMTypeRef st = get_struct_llvm_type(g, local->type->sym);
                         if (st) {
                             LLVMValueRef struct_ptr = struct_base_ptr(g, local, st);
-                            LLVMValueRef fptr = LLVMBuildStructGEP2(g->builder, st, struct_ptr, (unsigned)fi, "fld");
+                            LLVMValueRef fptr = emit_field_ptr(g, local->type->sym, st, struct_ptr, fi, "fld");
                             zan_symbol_t *afsym = get_field_sym(local->type->sym, expr->binary.left->member.name);
                             zan_type_t *aft = afsym ? field_store_type(g, afsym, local->type) : NULL;
                             if (aft && is_rc_managed_type(aft)) {
@@ -1594,8 +1594,7 @@ binding_lowered:
                         LLVMTypeRef st = get_struct_llvm_type(g, cls);
                         LLVMValueRef obj_val = emit_expr(g, obj_expr, locals);
                         if (st && LLVMGetTypeKind(LLVMTypeOf(obj_val)) == LLVMPointerTypeKind) {
-                            LLVMValueRef fptr = LLVMBuildStructGEP2(g->builder, st,
-                                obj_val, (unsigned)fi, "gfld");
+                            LLVMValueRef fptr = emit_field_ptr(g, cls, st, obj_val, fi, "gfld");
                             zan_symbol_t *gfsym = get_field_sym(cls, expr->binary.left->member.name);
                             zan_type_t *gft = gfsym
                                 ? field_store_type(g, gfsym,
@@ -2004,7 +2003,7 @@ static LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr
                         if (st) {
                             /* load struct pointer or value, then GEP to field */
                             LLVMValueRef struct_ptr = struct_base_ptr(g, local, st);
-                            LLVMValueRef field_ptr = LLVMBuildStructGEP2(g->builder, st, struct_ptr, (unsigned)fi, "fld");
+                            LLVMValueRef field_ptr = emit_field_ptr(g, type_sym, st, struct_ptr, fi, "fld");
                             zan_symbol_t *fsym = get_field_sym(type_sym, expr->member.name);
                             LLVMTypeRef field_type = fsym ? map_type(g, fsym->type) : LLVMInt64TypeInContext(g->ctx);
                             LLVMValueRef fv = promote_loaded(g,
@@ -2045,8 +2044,7 @@ static LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr
                         return sfv;
                     }
                     if (st && LLVMGetTypeKind(LLVMTypeOf(obj_val)) == LLVMPointerTypeKind) {
-                        LLVMValueRef field_ptr = LLVMBuildStructGEP2(g->builder, st,
-                            obj_val, (unsigned)fi, "gfld");
+                        LLVMValueRef field_ptr = emit_field_ptr(g, cls, st, obj_val, fi, "gfld");
                         zan_symbol_t *fsym = get_field_sym(cls, expr->member.name);
                         LLVMTypeRef ft = fsym ? map_type(g, fsym->type)
                                               : LLVMInt64TypeInContext(g->ctx);
@@ -2753,7 +2751,7 @@ static LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                             if (arg->kind == AST_ASSIGNMENT && arg->binary.left->kind == AST_IDENTIFIER) {
                                 int fi = get_field_index(sym, arg->binary.left->ident.name);
                                 if (fi >= 0) {
-                                    LLVMValueRef fptr = LLVMBuildStructGEP2(g->builder, st, alloca, (unsigned)fi, "finit");
+                                    LLVMValueRef fptr = emit_field_ptr(g, sym, st, alloca, fi, "finit");
                                     zan_symbol_t *fsym = get_field_sym(sym, arg->binary.left->ident.name);
                                     LLVMValueRef fval =
                                         (fsym && fsym->type && fsym->type->kind == TYPE_DELEGATE &&
