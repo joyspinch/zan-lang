@@ -36,7 +36,7 @@ extern void zan_gui_internal_surface_clip(i64 id, int *x0, int *y0,
 
 /* Defined below; used by the client-side title-bar metrics helpers. */
 i32 zan_gui_get_dpi_scale(void);
-i64 zan_gui_wake(void);
+i32 zan_gui_wake(void);
 
 #define EXPORT __attribute__((visibility("default")))
 

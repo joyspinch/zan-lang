@@ -49,12 +49,6 @@ class MqttClient {
     int keepAlive;
 
     [DllImport("crt")]
-    static extern string calloc(long count, long size);
-
-    [DllImport("crt")]
-    static extern void free(string ptr);
-
-    [DllImport("crt")]
     static extern long strlen(string str);
 
     MqttClient() {
@@ -82,30 +76,26 @@ class MqttClient {
     /// <summary>Reads exactly one byte, or -1 if the peer closed.</summary>
     async int ReadByteAsync() {
         nint sock = this.conn.GetSocket();
-        string b = calloc(2, 1);
+        byte[] b = new byte[2];
         while (true) {
             await Socket.ReadReady(sock);
             int n = Socket.Recv(sock, b, 1);
             if (n == 0) {
                 this.connected = false;
-                free(b);
                 return -1;
             }
             if (n > 0) {
-                int v = b[0] & 255;
-                free(b);
-                return v;
+                return b[0] & 255;
             }
         }
-        free(b);
         return -1;
     }
 
     /// <summary>Reads exactly <paramref name="need"/> bytes, suspending on the IO
     /// reactor across as many recvs as it takes.</summary>
-    async string ReadBytesAsync(int need) {
-        string buf = calloc(need + 1, 1);
-        string tmp = calloc(need + 1, 1);
+    async byte[] ReadBytesAsync(int need) {
+        byte[] buf = new byte[need + 1];
+        byte[] tmp = new byte[need + 1];
         nint sock = this.conn.GetSocket();
         int got = 0;
         while (got < need) {
@@ -113,19 +103,17 @@ class MqttClient {
             int n = Socket.Recv(sock, tmp, need - got);
             if (n == 0) {
                 this.connected = false;
-                free(tmp);
                 return buf;
             }
             if (n > 0) {
                 int i = 0;
                 while (i < n) {
-                    buf[got] = tmp[i];
+                    buf[got] = (byte)(tmp[i]);
                     got = got + 1;
                     i = i + 1;
                 }
             }
         }
-        free(tmp);
         return buf;
     }
 
@@ -154,8 +142,7 @@ class MqttClient {
         }
         int remainLen = await ReadRemainingLenAsync();
         if (remainLen > 0) {
-            string body = await ReadBytesAsync(remainLen);
-            free(body);
+            byte[] _body = await ReadBytesAsync(remainLen);
         }
         return (b0 >> 4) & 15;
     }
@@ -170,15 +157,14 @@ class MqttClient {
 
         mqtt.conn = await TcpClient.ConnectAsync(host, port);
 
-        string packet = mqtt.BuildConnectPacket();
+        byte[] packet = mqtt.BuildConnectPacket();
         int sent = await mqtt.conn.SendBytesAsync(packet, mqtt.CalcConnectLen());
-        free(packet);
 
         // CONNACK: fixed header (2 bytes) + variable header (2 bytes); byte 2 of
         // the body is the connect return code (0 = accepted).
         int b0 = await mqtt.ReadByteAsync();
         int remainLen = await mqtt.ReadRemainingLenAsync();
-        string body = await mqtt.ReadBytesAsync(remainLen);
+        byte[] body = await mqtt.ReadBytesAsync(remainLen);
         int packetType = (b0 >> 4) & 15;
         if (packetType == MqttPacketType.CONNACK && remainLen >= 2) {
             int returnCode = body[1] & 255;
@@ -186,8 +172,6 @@ class MqttClient {
                 mqtt.connected = true;
             }
         }
-        free(body);
-
         return mqtt;
     }
 
@@ -207,21 +191,21 @@ class MqttClient {
             remainLen = remainLen + 2;
         }
 
-        string packet = calloc(remainLen + 2, 1);
+        byte[] packet = new byte[remainLen + 2];
         int offset = 0;
-        packet[offset] = byte0;
+        packet[offset] = (byte)(byte0);
         offset = offset + 1;
-        packet[offset] = remainLen;
+        packet[offset] = (byte)(remainLen);
         offset = offset + 1;
 
-        packet[offset] = (topicLen >> 8) & 255;
+        packet[offset] = (byte)((topicLen >> 8) & 255);
         offset = offset + 1;
-        packet[offset] = topicLen & 255;
+        packet[offset] = (byte)(topicLen & 255);
         offset = offset + 1;
 
         int i = 0;
         while (i < topicLen) {
-            packet[offset] = topic[i];
+            packet[offset] = (byte)(topic[i]);
             offset = offset + 1;
             i = i + 1;
         }
@@ -229,21 +213,20 @@ class MqttClient {
         if (qos > 0) {
             int pid = this.nextPacketId;
             this.nextPacketId = this.nextPacketId + 1;
-            packet[offset] = (pid >> 8) & 255;
+            packet[offset] = (byte)((pid >> 8) & 255);
             offset = offset + 1;
-            packet[offset] = pid & 255;
+            packet[offset] = (byte)(pid & 255);
             offset = offset + 1;
         }
 
         i = 0;
         while (i < msgLen) {
-            packet[offset] = message[i];
+            packet[offset] = (byte)(message[i]);
             offset = offset + 1;
             i = i + 1;
         }
 
         int sent = await this.conn.SendBytesAsync(packet, offset);
-        free(packet);
 
         if (qos == MqttQos.AtLeastOnce) {
             int acked = await DrainPacketAsync();
@@ -260,36 +243,35 @@ class MqttClient {
         this.nextPacketId = this.nextPacketId + 1;
 
         int remainLen = 2 + 2 + topicLen + 1;
-        string packet = calloc(remainLen + 2, 1);
+        byte[] packet = new byte[remainLen + 2];
         int offset = 0;
 
-        packet[offset] = (MqttPacketType.SUBSCRIBE << 4) + 2;
+        packet[offset] = (byte)((MqttPacketType.SUBSCRIBE << 4) + 2);
         offset = offset + 1;
-        packet[offset] = remainLen;
-        offset = offset + 1;
-
-        packet[offset] = (pid >> 8) & 255;
-        offset = offset + 1;
-        packet[offset] = pid & 255;
+        packet[offset] = (byte)(remainLen);
         offset = offset + 1;
 
-        packet[offset] = (topicLen >> 8) & 255;
+        packet[offset] = (byte)((pid >> 8) & 255);
         offset = offset + 1;
-        packet[offset] = topicLen & 255;
+        packet[offset] = (byte)(pid & 255);
+        offset = offset + 1;
+
+        packet[offset] = (byte)((topicLen >> 8) & 255);
+        offset = offset + 1;
+        packet[offset] = (byte)(topicLen & 255);
         offset = offset + 1;
 
         int i = 0;
         while (i < topicLen) {
-            packet[offset] = topic[i];
+            packet[offset] = (byte)(topic[i]);
             offset = offset + 1;
             i = i + 1;
         }
 
-        packet[offset] = qos;
+        packet[offset] = (byte)(qos);
         offset = offset + 1;
 
         int sent = await this.conn.SendBytesAsync(packet, offset);
-        free(packet);
         int acked = await DrainPacketAsync();
         return sent;
     }
@@ -302,33 +284,32 @@ class MqttClient {
         this.nextPacketId = this.nextPacketId + 1;
 
         int remainLen = 2 + 2 + topicLen;
-        string packet = calloc(remainLen + 2, 1);
+        byte[] packet = new byte[remainLen + 2];
         int offset = 0;
 
-        packet[offset] = (MqttPacketType.UNSUBSCRIBE << 4) + 2;
+        packet[offset] = (byte)((MqttPacketType.UNSUBSCRIBE << 4) + 2);
         offset = offset + 1;
-        packet[offset] = remainLen;
-        offset = offset + 1;
-
-        packet[offset] = (pid >> 8) & 255;
-        offset = offset + 1;
-        packet[offset] = pid & 255;
+        packet[offset] = (byte)(remainLen);
         offset = offset + 1;
 
-        packet[offset] = (topicLen >> 8) & 255;
+        packet[offset] = (byte)((pid >> 8) & 255);
         offset = offset + 1;
-        packet[offset] = topicLen & 255;
+        packet[offset] = (byte)(pid & 255);
+        offset = offset + 1;
+
+        packet[offset] = (byte)((topicLen >> 8) & 255);
+        offset = offset + 1;
+        packet[offset] = (byte)(topicLen & 255);
         offset = offset + 1;
 
         int i = 0;
         while (i < topicLen) {
-            packet[offset] = topic[i];
+            packet[offset] = (byte)(topic[i]);
             offset = offset + 1;
             i = i + 1;
         }
 
         int sent = await this.conn.SendBytesAsync(packet, offset);
-        free(packet);
         int acked = await DrainPacketAsync();
         return sent;
     }
@@ -343,7 +324,7 @@ class MqttClient {
             return "";
         }
         int remainLen = await ReadRemainingLenAsync();
-        string body = await ReadBytesAsync(remainLen);
+        byte[] body = await ReadBytesAsync(remainLen);
 
         int packetType = (byte0 >> 4) & 15;
 
@@ -358,43 +339,35 @@ class MqttClient {
             }
 
             int payloadLen = remainLen - offset;
-            string payload = body.Substring(offset, payloadLen);
-            free(body);
-            return payload;
+            return body.ToStr(offset, payloadLen);
         } else if (packetType == MqttPacketType.PINGREQ) {
-            free(body);
-            string pong = calloc(2, 1);
-            pong[0] = MqttPacketType.PINGRESP << 4;
+            byte[] pong = new byte[2];
+            pong[0] = (byte)(MqttPacketType.PINGRESP << 4);
             pong[1] = 0;
             int sent = await this.conn.SendBytesAsync(pong, 2);
-            free(pong);
             return await ReceiveAsync();
         }
 
-        string other = body.Substring(0, remainLen);
-        free(body);
-        return other;
+        return body.ToStr(0, remainLen);
     }
 
     /// <summary>Sends a PINGREQ keep-alive, suspending on the IO reactor.
     /// Returns the number of bytes sent.</summary>
     async int PingAsync() {
-        string packet = calloc(2, 1);
-        packet[0] = MqttPacketType.PINGREQ << 4;
+        byte[] packet = new byte[2];
+        packet[0] = (byte)(MqttPacketType.PINGREQ << 4);
         packet[1] = 0;
         int sent = await this.conn.SendBytesAsync(packet, 2);
-        free(packet);
         return sent;
     }
 
     /// <summary>Sends DISCONNECT and closes the connection, suspending on the IO
     /// reactor for the send. Returns the number of bytes sent.</summary>
     async int DisconnectAsync() {
-        string packet = calloc(2, 1);
-        packet[0] = MqttPacketType.DISCONNECT << 4;
+        byte[] packet = new byte[2];
+        packet[0] = (byte)(MqttPacketType.DISCONNECT << 4);
         packet[1] = 0;
         int sent = await this.conn.SendBytesAsync(packet, 2);
-        free(packet);
         this.conn.Close();
         this.connected = false;
         return sent;
@@ -404,16 +377,16 @@ class MqttClient {
         return this.connected;
     }
 
-    string BuildConnectPacket() {
+    byte[] BuildConnectPacket() {
         int clientIdLen = (int)strlen(this.clientId);
         int remainLen = 10 + 2 + clientIdLen;
 
-        string packet = calloc(remainLen + 2, 1);
+        byte[] packet = new byte[remainLen + 2];
         int offset = 0;
 
-        packet[offset] = MqttPacketType.CONNECT << 4;
+        packet[offset] = (byte)(MqttPacketType.CONNECT << 4);
         offset = offset + 1;
-        packet[offset] = remainLen;
+        packet[offset] = (byte)(remainLen);
         offset = offset + 1;
 
         packet[offset] = 0;
@@ -435,19 +408,19 @@ class MqttClient {
         packet[offset] = 2;
         offset = offset + 1;
 
-        packet[offset] = (this.keepAlive >> 8) & 255;
+        packet[offset] = (byte)((this.keepAlive >> 8) & 255);
         offset = offset + 1;
-        packet[offset] = this.keepAlive & 255;
+        packet[offset] = (byte)(this.keepAlive & 255);
         offset = offset + 1;
 
-        packet[offset] = (clientIdLen >> 8) & 255;
+        packet[offset] = (byte)((clientIdLen >> 8) & 255);
         offset = offset + 1;
-        packet[offset] = clientIdLen & 255;
+        packet[offset] = (byte)(clientIdLen & 255);
         offset = offset + 1;
 
         int i = 0;
         while (i < clientIdLen) {
-            packet[offset] = this.clientId[i];
+            packet[offset] = (byte)(this.clientId[i]);
             offset = offset + 1;
             i = i + 1;
         }

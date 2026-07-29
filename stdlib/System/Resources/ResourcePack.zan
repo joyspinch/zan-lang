@@ -38,8 +38,6 @@ class ResourceEntry {
 /// encrypted with its own HKDF-derived key, so one broken entry key reveals
 /// nothing about the others or the master key.</summary>
 class ResourcePackWriter {
-    [DllImport("crt")] static extern string calloc(long count, long size);
-    [DllImport("crt")] static extern void free(string ptr);
     [DllImport("crt")] static extern nint fopen(string path, string mode);
     [DllImport("crt")] static extern long fwrite(string buf, long size, long count, nint fp);
     [DllImport("crt")] static extern int fclose(nint fp);
@@ -73,34 +71,33 @@ class ResourcePackWriter {
             sigLen = nHex.Length / 2;
         }
 
-        string packId = RandomNumberGenerator.GetBytes(16);
-        string idxIv = RandomNumberGenerator.GetBytes(12);
+        byte[] packId = RandomNumberGenerator.GetBytes(16);
+        byte[] idxIv = RandomNumberGenerator.GetBytes(12);
         if (packId == null || idxIv == null) { return false; }
 
         int idxLen = 4 + 61 * count;
         int dataStart = 57 + idxLen + sigLen;
 
         // Build the plaintext index while laying out payload offsets.
-        string idx = calloc(idxLen + 1, 1);
+        byte[] idx = new byte[idxLen + 1];
         ResourcePack.storeBE32(idx, 0, count);
-        List<string> ivs = new List<string>();
+        List<byte[]> ivs = new List<byte[]>();
         int off = dataStart;
         int i = 0;
         while (i < count) {
-            string nh = ResourcePack.nameHash(this.entries[i].name);
-            string iv = RandomNumberGenerator.GetBytes(12);
-            if (iv == null) { free(idx); return false; }
+            byte[] nh = ResourcePack.nameHash(this.entries[i].name);
+            byte[] iv = RandomNumberGenerator.GetBytes(12);
+            if (iv == null) { return false; }
             ivs.Add(iv);
             int rec = 4 + 61 * i;
             int j = 0;
-            while (j < 16) { idx[rec + j] = nh[j] & 255; j = j + 1; }
+            while (j < 16) { idx[rec + j] = nh[j]; j = j + 1; }
             ResourcePack.storeBE64(idx, rec + 16, off);
             ResourcePack.storeBE64(idx, rec + 24, this.entries[i].len);
             idx[rec + 32] = 0;  // flags (bit0 reserved for compression)
             j = 0;
-            while (j < 12) { idx[rec + 33 + j] = iv[j] & 255; j = j + 1; }
+            while (j < 12) { idx[rec + 33 + j] = iv[j]; j = j + 1; }
             // tag written after encryption below
-            free(nh);
             off = off + this.entries[i].len;
             i = i + 1;
         }
@@ -109,15 +106,14 @@ class ResourcePackWriter {
         List<byte[]> cts = new List<byte[]>();
         i = 0;
         while (i < count) {
-            string nh = ResourcePack.nameHash(this.entries[i].name);
+            byte[] nh = ResourcePack.nameHash(this.entries[i].name);
             byte[] ek = ResourcePack.entryKey(masterKey, packId, nh);
-            string tag = calloc(17, 1);
+            byte[] tag = new byte[17];
             byte[] ct = AesGcm.Encrypt(ek, 32, ivs[i], nh, 16, this.entries[i].data, this.entries[i].len, tag);
             cts.Add(ct);
             int rec = 4 + 61 * i;
             int j = 0;
-            while (j < 16) { idx[rec + 45 + j] = tag[j] & 255; j = j + 1; }
-            free(nh); free(tag);
+            while (j < 16) { idx[rec + 45 + j] = tag[j]; j = j + 1; }
             i = i + 1;
         }
 
@@ -127,21 +123,20 @@ class ResourcePackWriter {
             sig = Rsa.SignPkcs1Sha256(idx, idxLen, nBuf, sigLen, dBuf, sigLen);
         }
 
-        string hdr = calloc(58, 1);
+        byte[] hdr = new byte[58];
         ResourcePack.writeMagic(hdr);
         i = 0;
-        while (i < 16) { hdr[5 + i] = packId[i] & 255; i = i + 1; }
+        while (i < 16) { hdr[5 + i] = packId[i]; i = i + 1; }
         i = 0;
-        while (i < 12) { hdr[21 + i] = idxIv[i] & 255; i = i + 1; }
+        while (i < 12) { hdr[21 + i] = idxIv[i]; i = i + 1; }
         ResourcePack.storeBE32(hdr, 49, idxLen);
         ResourcePack.storeBE32(hdr, 53, sigLen);
 
         byte[] ik = ResourcePack.indexKey(masterKey, packId);
-        string idxTag = calloc(17, 1);
+        byte[] idxTag = new byte[17];
         byte[] idxCt = AesGcm.Encrypt(ik, 32, idxIv, hdr, 21, idx, idxLen, idxTag);
         i = 0;
-        while (i < 16) { hdr[33 + i] = idxTag[i] & 255; i = i + 1; }
-        free(idxTag); free(idx);
+        while (i < 16) { hdr[33 + i] = idxTag[i]; i = i + 1; }
 
         nint fp = fopen(path, "wb");
         if (fp == 0) { return false; }
@@ -151,11 +146,6 @@ class ResourcePackWriter {
         i = 0;
         while (i < count) { fwrite(cts[i], 1, this.entries[i].len, fp); i = i + 1; }
         fclose(fp);
-
-        free(hdr);
-        i = 0;
-        while (i < count) { free(ivs[i]); i = i + 1; }
-        free(packId); free(idxIv);
         return true;
     }
 }
@@ -164,13 +154,13 @@ class ResourcePackWriter {
 /// and size, and its per-entry IV and GCM tag. One entity instead of five
 /// index-aligned parallel lists.</summary>
 class PackIndexEntry {
-    string hash;   // 16-byte truncated SHA-256 of the name
+    byte[] hash;   // 16-byte truncated SHA-256 of the name
     int off;       // payload offset within the file
     int size;      // payload byte length
-    string iv;     // per-entry AES-GCM IV
-    string tag;    // per-entry AES-GCM tag
+    byte[] iv;     // per-entry AES-GCM IV
+    byte[] tag;    // per-entry AES-GCM tag
 
-    PackIndexEntry(string hash, int off, int size, string iv, string tag) {
+    PackIndexEntry(byte[] hash, int off, int size, byte[] iv, byte[] tag) {
         this.hash = hash;
         this.off = off;
         this.size = size;
@@ -184,21 +174,18 @@ class PackIndexEntry {
 /// entry is served; Read() re-derives the per-entry key and rejects tampered
 /// payloads via the GCM tag.</summary>
 class ResourcePack {
-    [DllImport("crt")] static extern string calloc(long count, long size);
-    [DllImport("crt")] static extern void free(string ptr);
-
     string path;
     string masterKey;
-    string packId;
+    byte[] packId;
     int count;
     List<PackIndexEntry> index;
 
     // ---- shared helpers (also used by the writer) ----
 
-    static void writeMagic(string hdr) {
+    static void writeMagic(byte[] hdr) {
         // opaque non-ASCII magic + obfuscated version byte
         hdr[0] = 199; hdr[1] = 17; hdr[2] = 158; hdr[3] = 66;
-        hdr[4] = 1 ^ 165;
+        hdr[4] = (byte)(1 ^ 165);
     }
 
     static bool checkMagic(string hdr) {
@@ -209,11 +196,11 @@ class ResourcePack {
         return ((hdr[4] & 255) ^ 165) == 1;
     }
 
-    static void storeBE32(string buf, int off, int v) {
-        buf[off] = (v >> 24) & 255;
-        buf[off + 1] = (v >> 16) & 255;
-        buf[off + 2] = (v >> 8) & 255;
-        buf[off + 3] = v & 255;
+    static void storeBE32(byte[] buf, int off, int v) {
+        buf[off] = (byte)((v >> 24) & 255);
+        buf[off + 1] = (byte)((v >> 16) & 255);
+        buf[off + 2] = (byte)((v >> 8) & 255);
+        buf[off + 3] = (byte)(v & 255);
     }
 
     static int loadBE32(string buf, int off) {
@@ -221,9 +208,9 @@ class ResourcePack {
              | ((buf[off + 2] & 255) << 8) | (buf[off + 3] & 255);
     }
 
-    static void storeBE64(string buf, int off, int v) {
+    static void storeBE64(byte[] buf, int off, int v) {
         int i = 0;
-        while (i < 8) { buf[off + i] = Bits.Shr64(v, 8 * (7 - i)) & 255; i = i + 1; }
+        while (i < 8) { buf[off + i] = (byte)(Bits.Shr64(v, 8 * (7 - i)) & 255); i = i + 1; }
     }
 
     static int loadBE64(string buf, int off) {
@@ -235,34 +222,32 @@ class ResourcePack {
 
     /// <summary>Truncated SHA-256 of an entry name (16 bytes). Only this hash
     /// is stored in the pack, so entry names cannot be listed from the file.</summary>
-    static string nameHash(string name) {
+    static byte[] nameHash(string name) {
         byte[] h = Sha256.Hash(name, name.Length);
-        string t = calloc(17, 1);
+        byte[] t = new byte[17];
         int i = 0;
-        while (i < 16) { t[i] = h[i] & 255; i = i + 1; }
+        while (i < 16) { t[i] = h[i]; i = i + 1; }
         return t;
     }
 
-    static byte[] indexKey(string masterKey, string packId) {
+    static byte[] indexKey(string masterKey, byte[] packId) {
         return Hkdf.Derive(packId, 16, masterKey, 32, "ZRIX", 4, 32);
     }
 
-    static byte[] entryKey(string masterKey, string packId, string nh) {
-        string info = calloc(21, 1);
+    static byte[] entryKey(string masterKey, byte[] packId, byte[] nh) {
+        byte[] info = new byte[21];
         info[0] = 90; info[1] = 82; info[2] = 69; info[3] = 78;  // "ZREN"
         int i = 0;
-        while (i < 16) { info[4 + i] = nh[i] & 255; i = i + 1; }
-        byte[] k = Hkdf.Derive(packId, 16, masterKey, 32, info, 20, 32);
-        free(info);
-        return k;
+        while (i < 16) { info[4 + i] = nh[i]; i = i + 1; }
+        return Hkdf.Derive(packId, 16, masterKey, 32, info, 20, 32);
     }
 
     /// <summary>Reassembles a key from two XOR shares so the real key never
-    /// appears as one literal in the binary. Caller frees the result.</summary>
-    static string MixKey(string a, string b, int len) {
-        string k = calloc(len + 1, 1);
+    /// appears as one literal in the binary.</summary>
+    static byte[] MixKey(string a, string b, int len) {
+        byte[] k = new byte[len + 1];
         int i = 0;
-        while (i < len) { k[i] = ((a[i] & 255) ^ (b[i] & 255)) & 255; i = i + 1; }
+        while (i < len) { k[i] = (byte)((a[i] & 255) ^ (b[i] & 255)); i = i + 1; }
         return k;
     }
 
@@ -280,24 +265,22 @@ class ResourcePack {
         int sigLen = loadBE32(hdr, 53);
         if (idxLen < 4 || 57 + idxLen + sigLen > fsz) { return null; }
 
-        string packId = calloc(17, 1);
-        string idxIv = calloc(13, 1);
-        string idxTag = calloc(17, 1);
+        byte[] packId = new byte[17];
+        byte[] idxIv = new byte[13];
+        byte[] idxTag = new byte[17];
         int i = 0;
-        while (i < 16) { packId[i] = hdr[5 + i] & 255; i = i + 1; }
+        while (i < 16) { packId[i] = hdr[5 + i]; i = i + 1; }
         i = 0;
-        while (i < 12) { idxIv[i] = hdr[21 + i] & 255; i = i + 1; }
+        while (i < 12) { idxIv[i] = hdr[21 + i]; i = i + 1; }
         i = 0;
-        while (i < 16) { idxTag[i] = hdr[33 + i] & 255; i = i + 1; }
+        while (i < 16) { idxTag[i] = hdr[33 + i]; i = i + 1; }
 
         byte[] idxCt = File.ReadBytes(path, 57, idxLen);
         byte[] ik = indexKey(masterKey, packId);
         List<int> ok = new List<int>(); ok.Add(0);
         byte[] idx = AesGcm.Decrypt(ik, 32, idxIv, hdr, 21, idxCt, idxLen, idxTag, ok);
-        free(idxIv); free(idxTag);
         if (ok[0] == 0) {
             err[0] = 2;
-            free(packId);
             return null;
         }
 
@@ -311,7 +294,6 @@ class ResourcePack {
             }
             if (!sigOk) {
                 err[0] = 3;
-                free(packId);
                 return null;
             }
         }
@@ -325,15 +307,15 @@ class ResourcePack {
         i = 0;
         while (i < p.count) {
             int rec = 4 + 61 * i;
-            string nh = calloc(17, 1);
-            string iv = calloc(13, 1);
-            string tg = calloc(17, 1);
+            byte[] nh = new byte[17];
+            byte[] iv = new byte[13];
+            byte[] tg = new byte[17];
             int j = 0;
-            while (j < 16) { nh[j] = idx[rec + j] & 255; j = j + 1; }
+            while (j < 16) { nh[j] = idx[rec + j]; j = j + 1; }
             j = 0;
-            while (j < 12) { iv[j] = idx[rec + 33 + j] & 255; j = j + 1; }
+            while (j < 12) { iv[j] = idx[rec + 33 + j]; j = j + 1; }
             j = 0;
-            while (j < 16) { tg[j] = idx[rec + 45 + j] & 255; j = j + 1; }
+            while (j < 16) { tg[j] = idx[rec + 45 + j]; j = j + 1; }
             p.index.Add(new PackIndexEntry(nh, loadBE64(idx, rec + 16), loadBE64(idx, rec + 24), iv, tg));
             i = i + 1;
         }
@@ -344,17 +326,16 @@ class ResourcePack {
     int Count() { return this.count; }
 
     int find(string name) {
-        string nh = nameHash(name);
+        byte[] nh = nameHash(name);
         int i = 0;
         while (i < this.count) {
-            string h = this.index[i].hash;
+            byte[] h = this.index[i].hash;
             int diff = 0;
             int j = 0;
             while (j < 16) { diff = diff | ((h[j] & 255) ^ (nh[j] & 255)); j = j + 1; }
-            if (diff == 0) { free(nh); return i; }
+            if (diff == 0) { return i; }
             i = i + 1;
         }
-        free(nh);
         return -1;
     }
 

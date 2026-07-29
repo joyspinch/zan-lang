@@ -116,10 +116,6 @@ class MqttBroker {
     int bytesOut;
 
     [DllImport("crt")]
-    static extern string calloc(long count, long size);
-    [DllImport("crt")]
-    static extern void free(string ptr);
-    [DllImport("crt")]
     static extern long strlen(string str);
     [DllImport("crt")]
     static extern long time(nint ptr);
@@ -189,29 +185,26 @@ class MqttBroker {
     // ---- framing (binary-safe reads; see MqttClient for rationale) ----
 
     async int ReadByteAsync(nint sock) {
-        string b = calloc(2, 1);
+        byte[] b = new byte[2];
         while (true) {
             await Socket.ReadReady(sock);
             int n = Socket.Recv(sock, b, 1);
-            if (n == 0) { free(b); return -1; }
+            if (n == 0) { return -1; }
             if (n > 0) {
-                int v = b[0] & 255;
-                free(b);
-                return v;
+                return b[0] & 255;
             }
         }
-        free(b);
         return -1;
     }
 
-    async string ReadBytesAsync(nint sock, int need) {
-        string buf = calloc(need + 1, 1);
-        string tmp = calloc(need + 1, 1);
+    async byte[] ReadBytesAsync(nint sock, int need) {
+        byte[] buf = new byte[need + 1];
+        byte[] tmp = new byte[need + 1];
         int got = 0;
         while (got < need) {
             await Socket.ReadReady(sock);
             int n = Socket.Recv(sock, tmp, need - got);
-            if (n == 0) { free(tmp); return buf; }
+            if (n == 0) { return buf; }
             if (n > 0) {
                 int i = 0;
                 while (i < n) {
@@ -221,7 +214,6 @@ class MqttBroker {
                 }
             }
         }
-        free(tmp);
         return buf;
     }
 
@@ -272,40 +264,40 @@ class MqttBroker {
 
     // ---- packet builders ----
 
-    static string BuildPublish(string topic, string payload, int payloadLen) {
+    static byte[] BuildPublish(string topic, string payload, int payloadLen) {
         int topicLen = (int)strlen(topic);
         int remainLen = 2 + topicLen + payloadLen;
         // Varint remaining length (up to 2 bytes covers 16383; enough for the
         // 64 KB reads we do, encode up to 3 bytes to be safe).
-        string packet = calloc(remainLen + 5, 1);
+        byte[] packet = new byte[remainLen + 5];
         int offset = 0;
-        packet[offset] = MqttPacketType.PUBLISH << 4;
+        packet[offset] = (byte)(MqttPacketType.PUBLISH << 4);
         offset = offset + 1;
         int rl = remainLen;
         while (true) {
             int digit = rl & 127;
             rl = rl >> 7;
             if (rl > 0) {
-                packet[offset] = digit | 128;
+                packet[offset] = (byte)(digit | 128);
             } else {
-                packet[offset] = digit;
+                packet[offset] = (byte)digit;
             }
             offset = offset + 1;
             if (rl == 0) { break; }
         }
-        packet[offset] = (topicLen >> 8) & 255;
+        packet[offset] = (byte)((topicLen >> 8) & 255);
         offset = offset + 1;
-        packet[offset] = topicLen & 255;
+        packet[offset] = (byte)(topicLen & 255);
         offset = offset + 1;
         int i = 0;
         while (i < topicLen) {
-            packet[offset] = topic[i];
+            packet[offset] = (byte)topic[i];
             offset = offset + 1;
             i = i + 1;
         }
         i = 0;
         while (i < payloadLen) {
-            packet[offset] = payload[i];
+            packet[offset] = (byte)payload[i];
             offset = offset + 1;
             i = i + 1;
         }
@@ -326,7 +318,7 @@ class MqttBroker {
     /// <summary>Delivers a message to every live session whose filters match
     /// <paramref name="topic"/>. Returns the number of receivers.</summary>
     async int PublishToSubscribers(string topic, string payload, int payloadLen) {
-        string packet = BuildPublish(topic, payload, payloadLen);
+        byte[] packet = BuildPublish(topic, payload, payloadLen);
         int packetLen = this.PublishPacketLen(topic, payloadLen);
         int receivers = 0;
         int i = 0;
@@ -353,7 +345,6 @@ class MqttBroker {
             }
             i = i + 1;
         }
-        free(packet);
         return receivers;
     }
 
@@ -386,7 +377,7 @@ class MqttBroker {
         this.msgsIn = this.msgsIn + 1;
         this.bytesIn = this.bytesIn + payloadLen;
         this.Touch(topic, payload);
-        string packet = BuildPublish(topic, payload, payloadLen);
+        byte[] packet = BuildPublish(topic, payload, payloadLen);
         int packetLen = this.PublishPacketLen(topic, payloadLen);
         int sent = 0;
         int i = 0;
@@ -403,7 +394,6 @@ class MqttBroker {
                 this.bytesOut = this.bytesOut + packetLen;
             }
         }
-        free(packet);
         return sent;
     }
 
@@ -601,7 +591,7 @@ class MqttBroker {
             if (b0 < 0) { break; }
             int remainLen = await ReadRemainingLenAsync(sock);
             if (remainLen < 0) { break; }
-            string body = "";
+            byte[] body = new byte[1];
             if (remainLen > 0) {
                 body = await ReadBytesAsync(sock, remainLen);
             }
@@ -614,7 +604,7 @@ class MqttBroker {
                     sess.keepAlive = ((body[8] & 255) << 8) + (body[9] & 255);
                     int idLen = ((body[10] & 255) << 8) + (body[11] & 255);
                     if (12 + idLen <= remainLen) {
-                        sess.clientId = body.Substring(12, idLen);
+                        sess.clientId = body.ToStr(12, idLen);
                     }
                 }
                 if (sess.clientId.Length == 0) {
@@ -622,17 +612,16 @@ class MqttBroker {
                 }
                 this.totalConnections = this.totalConnections + 1;
                 this.sessions.Add(sess);
-                string connack = calloc(4, 1);
-                connack[0] = MqttPacketType.CONNACK << 4;
+                byte[] connack = new byte[4];
+                connack[0] = (byte)(MqttPacketType.CONNACK << 4);
                 connack[1] = 2;
                 connack[2] = 0;
                 connack[3] = 0;   // accepted
                 int _c = await Socket.SendAsync(sock, connack, 4);
-                free(connack);
             } else if (packetType == MqttPacketType.PUBLISH) {
                 int qos = (b0 >> 1) & 3;
                 int topicLen = ((body[0] & 255) << 8) + (body[1] & 255);
-                string topic = body.Substring(2, topicLen);
+                string topic = body.ToStr(2, topicLen);
                 int offset = 2 + topicLen;
                 int pid = 0;
                 if (qos > 0) {
@@ -640,20 +629,19 @@ class MqttBroker {
                     offset = offset + 2;
                 }
                 int payloadLen = remainLen - offset;
-                string payload = body.Substring(offset, payloadLen);
+                string payload = body.ToStr(offset, payloadLen);
                 sess.msgsIn = sess.msgsIn + 1;
                 this.msgsIn = this.msgsIn + 1;
                 this.bytesIn = this.bytesIn + payloadLen;
                 this.Touch(topic, payload);
                 int _r = await this.PublishToSubscribers(topic, payload, payloadLen);
                 if (qos > 0) {
-                    string puback = calloc(5, 1);
-                    puback[0] = MqttPacketType.PUBACK << 4;
+                    byte[] puback = new byte[5];
+                    puback[0] = (byte)(MqttPacketType.PUBACK << 4);
                     puback[1] = 2;
-                    puback[2] = (pid >> 8) & 255;
-                    puback[3] = pid & 255;
+                    puback[2] = (byte)((pid >> 8) & 255);
+                    puback[3] = (byte)(pid & 255);
                     int _a = await Socket.SendAsync(sock, puback, 4);
-                    free(puback);
                 }
             } else if (packetType == MqttPacketType.SUBSCRIBE) {
                 int pid = ((body[0] & 255) << 8) + (body[1] & 255);
@@ -663,7 +651,7 @@ class MqttBroker {
                 while (offset + 2 < remainLen) {
                     int fLen = ((body[offset] & 255) << 8) + (body[offset + 1] & 255);
                     offset = offset + 2;
-                    string filter = body.Substring(offset, fLen);
+                    string filter = body.ToStr(offset, fLen);
                     offset = offset + fLen;
                     int reqQos = body[offset] & 255;
                     offset = offset + 1;
@@ -673,25 +661,24 @@ class MqttBroker {
                     grantedQos.Add(reqQos);
                 }
                 int ackLen = 4 + grantedQos.Count;
-                string suback = calloc(ackLen + 1, 1);
-                suback[0] = MqttPacketType.SUBACK << 4;
-                suback[1] = 2 + grantedQos.Count;
-                suback[2] = (pid >> 8) & 255;
-                suback[3] = pid & 255;
+                byte[] suback = new byte[ackLen + 1];
+                suback[0] = (byte)(MqttPacketType.SUBACK << 4);
+                suback[1] = (byte)(2 + grantedQos.Count);
+                suback[2] = (byte)((pid >> 8) & 255);
+                suback[3] = (byte)(pid & 255);
                 int g = 0;
                 while (g < grantedQos.Count) {
-                    suback[4 + g] = grantedQos[g];
+                    suback[4 + g] = (byte)grantedQos[g];
                     g = g + 1;
                 }
                 int _s = await Socket.SendAsync(sock, suback, ackLen);
-                free(suback);
             } else if (packetType == MqttPacketType.UNSUBSCRIBE) {
                 int pid = ((body[0] & 255) << 8) + (body[1] & 255);
                 int offset = 2;
                 while (offset + 2 <= remainLen) {
                     int fLen = ((body[offset] & 255) << 8) + (body[offset + 1] & 255);
                     offset = offset + 2;
-                    string filter = body.Substring(offset, fLen);
+                    string filter = body.ToStr(offset, fLen);
                     offset = offset + fLen;
                     int k = 0;
                     while (k < sess.filters.Count) {
@@ -703,23 +690,20 @@ class MqttBroker {
                         }
                     }
                 }
-                string unsuback = calloc(5, 1);
-                unsuback[0] = MqttPacketType.UNSUBACK << 4;
+                byte[] unsuback = new byte[5];
+                unsuback[0] = (byte)(MqttPacketType.UNSUBACK << 4);
                 unsuback[1] = 2;
-                unsuback[2] = (pid >> 8) & 255;
-                unsuback[3] = pid & 255;
+                unsuback[2] = (byte)((pid >> 8) & 255);
+                unsuback[3] = (byte)(pid & 255);
                 int _u = await Socket.SendAsync(sock, unsuback, 4);
-                free(unsuback);
             } else if (packetType == MqttPacketType.PINGREQ) {
-                string pong = calloc(3, 1);
-                pong[0] = MqttPacketType.PINGRESP << 4;
+                byte[] pong = new byte[3];
+                pong[0] = (byte)(MqttPacketType.PINGRESP << 4);
                 pong[1] = 0;
                 int _p = await Socket.SendAsync(sock, pong, 2);
-                free(pong);
             } else if (packetType == MqttPacketType.DISCONNECT) {
                 active = false;
             }
-            if (remainLen > 0) { free(body); }
         }
 
         sess.alive = false;

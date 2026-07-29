@@ -1082,8 +1082,61 @@ Passed**）；ra2 示例 76 文件、ZanIDE 186 文件编译通过；
 `old_lmd == new_lmd == 272478703`、`old_rules == new_rules == -414863318`，
 逐字相同。按用户「RA2 先不管」暂不处理，记在这里备查。）
 
-* **B2-1（剩余）** `extern string calloc(...)`：stdlib **36 个文件**
-  （另 tests 13、examples 16、src 3；旧口径记的 41 未含全部目录）
+**B2-1 第九批 ✅ 已完成（2026-07-29）：Net 全链 + Diagnostics / IO.Directory /
+Text.Encoding / CSPRNG / ResourcePack writer —— raw `calloc` 缓冲 → `byte[]`。**
+
+* `Net/Sockets`：`Socket`（`WSAStartup`/`ioctlsocket`/`setsockopt` 的 `optval`、
+  `BuildSockAddr → byte[]`、`Accept`/`RecvFrom`/`Send*` 的收发缓冲）、
+  `AsyncSocket.Receive`、`TcpClient`（死 import）——三个文件都无 `calloc`/`free`。
+  接收路径统一 `buf.ToStr(0, n)`，长度由 `recv` 返回值决定，不靠 NUL。
+* `Net/Mqtt`：`MqttBroker` / `MqttClient` 的读缓冲与 CONNECT/PUBLISH/SUBSCRIBE/
+  UNSUBSCRIBE/PING/DISCONNECT 报文缓冲全部 `byte[]`，发送仍带显式 `offset` 长度；
+  取 topic/payload 用 `body.ToStr(off, len)`。
+* `Net/WebSocket`：`WsFrame.Encode() → byte[]`（原来 `calloc` 出去从没人释放，
+  是真泄漏）、掩码解码缓冲 → `byte[]` + `ToStr`；`WsReader`/`WsWriter` 的
+  `buf`/`tmp` 字段 → `byte[]`（`Ensure` 扩容不再 `free`）；`WssServer` 的 `plain`、
+  `WssClient.SendFrame` 的整帧缓冲同改。
+* `Net/Worker`：`WSAPROTOCOL_INFOA` 句柄传递缓冲（372 字节）、`RecvExact(dest)`
+  形参 → `byte[]`。`Net/Tls/TlsStream`：`scratch` 字段 → `byte[]`，`RecvAsync`
+  用 `ToStr(0, n)`。`Web/WebApp.MakeBuffer → byte[]`（注释早说是 ARC，实际不是）。
+* `Diagnostics`：`ProcessHost.Env`/`SelfExe`（`SelfExe` 现在按 `GetModuleFileNameA`/
+  `readlink` 的返回长度截断，失败返回 `""`）、`ServerMetrics` 的 timeval /
+  `GetProcessTimes` / `PROCESS_MEMORY_COUNTERS` 缓冲与 `LeInt(byte[] ...)`。
+* `IO/Directory`：`WIN32_FIND_DATAW` 缓冲 → `byte[]`，`winName(byte[])`。
+* `Text/Encoding`：`IntToString` / `CharFromCode` / `Sha1(msg)` 的临时缓冲，
+  `Sha1(..., byte[] digest)`，`WebSocketAccept` 不再 `calloc`/`free`。
+* `Security/Cryptography/RandomNumberGenerator.GetBytes → byte[]`：连带 17 个
+  调用点（Wechat 5 个、`WssClient`、`ResourcePack`、`RsaKey`、`FbSrp`、
+  `MySqlConnection.genSeed`、`AssetManager`）。**注意**：`FbSrp.Create` 的
+  `FbBytes.Free(r)` 与 `WXBizMsgCrypt.RandAscii` 的 `free(rnd)` 必须一并删掉，
+  否则 ARC 缓冲被 C `free` 掉 → 堆损坏（实测 `conformance_firebird_wire` /
+  `conformance_sdk_wechat_crypt` 退出码 `0xC0000374`，删掉后 6/6 Passed）。
+* `Resources/ResourcePack`（writer 侧收尾）：`idx`/`hdr`/`tag`/`idxTag` 缓冲、
+  `nameHash → byte[]`、`MixKey → byte[]`、`entryKey`/`indexKey` 形参、
+  `PackIndexEntry` 的 `hash`/`iv`/`tag` 字段、`storeBE32/64(byte[] ...)`、
+  `writeMagic(byte[])`——两个类都无 `calloc`/`free`。`AssetManager` 生成的
+  `AssetPack.zan` 模板同步改成 `byte[] a/b/k`（`Hex.Decode` 早已返回 `byte[]`）。
+* 测试同步：`tests/conformance/ws_accept.zan`、`respack_roundtrip.zan` 的
+  `calloc` 缓冲改 `new byte[]`（`digest`/`blob`/`bad`/翻位缓冲）。
+* 顺带修 `src/runtime/gui_runtime_mac.m`：`zan_gui_wake` 前向声明写成 `i64`、
+  定义是 `i32`，Xcode clang 直接报 `conflicting types` —— macOS GUI driver 的
+  CI job（`drivers.yml`）就是卡在这一步失败的。
+
+〔实测〕`examples/net` 的 `mqtt_pubsub` / `websocket_chat` / `tcp_echo` /
+`udp_messaging` / `sse_events` 编译并运行正确；`ctest -R
+'socket|udp|tcp|http|websocket|mqtt|net|web|zgm'` **115/115 Passed**、
+`-R 'ws_accept|encoding|directory|io_|metric|process|http|web|worker|mqtt|tls|
+wss|dir_|file|path|text'` **39/39 Passed**、`-R 'respack|ws_accept|wechat|mysql|
+firebird|rsa|crypt|hkdf|aes|sha|hex|encoding|resource|asset|ide'` 48 项在修掉上面
+那两处 double-free 后全绿。
+（既有问题，与本批无关：`examples/net/{http_server,http_client,worker_server}.zan`
+编译失败 `undefined type 'HttpClient'`——`HttpClient` 在 `System.Net.Http.Client`
+命名空间，示例只 `using System.Net.Http;`。）
+
+* **B2-1（剩余）** `extern string calloc(...)`：stdlib **18 个文件**
+  （`Game/Rts/Formats` 的 Csf/Shp/Tmp、`Game/Zgm/NetRuntime`、`Gui/Text`、
+  Wechat 2 个、`System/Data` 9 个、`Security/Guard`、`Threading`、
+  `Windows/Forms*`；另 tests / examples / src 若干）
   （第二批消掉 Sha1 / Sha256 / Sha512 / Md5 / Sm3 / Hmac / Hex / Base64 八个，
   第三批 `Hkdf`，第四批 `Rsa`，第五批 `Sm2`，第六批 `Sm4`，第七批 `BigInt`）。
   **`Cryptography` 目录整条 `calloc` 链清完**（`Rsa` 也无 `free` 了）。剩下的都在
