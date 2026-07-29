@@ -26,6 +26,7 @@ static zan_type_t *subst_type_param_deep(zan_irgen_t *g, zan_type_t *t,
                                          zan_type_t *recv);
 
 static void emit_arc_retain(zan_irgen_t *g, LLVMValueRef v) {
+    if (g->current_fn_no_runtime) return;   /* [NoRuntime]: no ARC helpers */
     if (!v || LLVMGetTypeKind(LLVMTypeOf(v)) != LLVMPointerTypeKind) return;
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     if (LLVMTypeOf(v) != i8ptr) v = LLVMBuildBitCast(g->builder, v, i8ptr, "arc.rt");
@@ -35,6 +36,7 @@ static void emit_arc_retain(zan_irgen_t *g, LLVMValueRef v) {
 }
 
 static void emit_arc_release(zan_irgen_t *g, LLVMValueRef v) {
+    if (g->current_fn_no_runtime) return;   /* [NoRuntime]: no ARC helpers */
     if (!v || LLVMGetTypeKind(LLVMTypeOf(v)) != LLVMPointerTypeKind) return;
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     if (LLVMTypeOf(v) != i8ptr) v = LLVMBuildBitCast(g->builder, v, i8ptr, "arc.rl");
@@ -44,6 +46,7 @@ static void emit_arc_release(zan_irgen_t *g, LLVMValueRef v) {
 }
 
 static void emit_string_retain(zan_irgen_t *g, LLVMValueRef v) {
+    if (g->current_fn_no_runtime) return;   /* [NoRuntime]: no ARC helpers */
     if (!v || LLVMGetTypeKind(LLVMTypeOf(v)) != LLVMPointerTypeKind) return;
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     if (LLVMTypeOf(v) != i8ptr) v = LLVMBuildBitCast(g->builder, v, i8ptr, "str.rt");
@@ -53,6 +56,7 @@ static void emit_string_retain(zan_irgen_t *g, LLVMValueRef v) {
 }
 
 static void emit_string_release(zan_irgen_t *g, LLVMValueRef v) {
+    if (g->current_fn_no_runtime) return;   /* [NoRuntime]: no ARC helpers */
     if (!v || LLVMGetTypeKind(LLVMTypeOf(v)) != LLVMPointerTypeKind) return;
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     if (LLVMTypeOf(v) != i8ptr) v = LLVMBuildBitCast(g->builder, v, i8ptr, "str.rl");

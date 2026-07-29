@@ -20,6 +20,18 @@ void zan_checker_init(zan_checker_t *c, zan_binder_t *binder,
     c->current_return_type = NULL;
 }
 
+/* ---- [NoRuntime] ---------------------------------------------------------
+ * A [NoRuntime] method must run with no managed runtime underneath it: crash
+ * handlers, thread trampolines and startup code execute where the allocator,
+ * the ARC helpers and the exception globals may be unusable or absent. The
+ * checker rejects the constructs that would emit calls into that runtime;
+ * irgen additionally emits no retain/release inside such a body. */
+static void no_runtime_reject(zan_checker_t *c, zan_loc_t loc, const char *what) {
+    if (!c->in_no_runtime) return;
+    zan_diag_emit(c->diag, DIAG_ERROR, loc,
+                  "%s is not allowed in a [NoRuntime] method", what);
+}
+
 /* ---- generic constraint checking ---- */
 
 /* True when `arg` is, implements, or derives from `cons`. */
@@ -160,6 +172,7 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
         case TK_PLUS:
             /* string concatenation */
             if (left->kind == TYPE_STRING || right->kind == TYPE_STRING) {
+                no_runtime_reject(c, expr->loc, "string concatenation");
                 return c->binder->type_string;
             }
             /* fall through */
@@ -259,6 +272,7 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
     }
 
     case AST_STRING_INTERP: {
+        no_runtime_reject(c, expr->loc, "string interpolation");
         for (int i = 0; i < expr->string_interp.parts.count; i++) {
             zan_checker_check_expr(c, expr->string_interp.parts.items[i]);
         }
@@ -296,6 +310,7 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
     }
 
     case AST_NEW_EXPR: {
+        no_runtime_reject(c, expr->loc, "allocation (`new`)");
         zan_type_t *type = zan_binder_resolve_type(c->binder, expr->new_expr.type);
         check_generic_constraints(c, type, expr->loc);
         for (int i = 0; i < expr->new_expr.args.count; i++) {
@@ -312,6 +327,7 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
     }
 
     case AST_LAMBDA:
+        no_runtime_reject(c, expr->loc, "a lambda");
         for (int i = 0; i < expr->lambda.params.count; i++) {
             /* params type-checked later */
         }
@@ -386,11 +402,14 @@ void zan_checker_check_stmt(zan_checker_t *c, zan_ast_node_t *stmt) {
         break;
 
     case AST_FOREACH_STMT:
+        /* iterating a managed collection walks rc-managed elements */
+        no_runtime_reject(c, stmt->loc, "`foreach`");
         zan_checker_check_expr(c, stmt->foreach_stmt.collection);
         zan_checker_check_stmt(c, stmt->foreach_stmt.body);
         break;
 
     case AST_THROW_STMT:
+        no_runtime_reject(c, stmt->loc, "`throw`");
         zan_checker_check_expr(c, stmt->throw_stmt.value);
         break;
 
@@ -401,6 +420,7 @@ void zan_checker_check_stmt(zan_checker_t *c, zan_ast_node_t *stmt) {
         break;
 
     case AST_LOCK_STMT:
+        no_runtime_reject(c, stmt->loc, "`lock`");
         zan_checker_check_expr(c, stmt->lock_stmt.expr);
         zan_checker_check_stmt(c, stmt->lock_stmt.body);
         break;
@@ -423,6 +443,7 @@ void zan_checker_check_stmt(zan_checker_t *c, zan_ast_node_t *stmt) {
     }
 
     case AST_TRY_STMT:
+        no_runtime_reject(c, stmt->loc, "`try`");
         zan_checker_check_stmt(c, stmt->try_stmt.try_body);
         for (int i = 0; i < stmt->try_stmt.catches.count; i++) {
             zan_ast_node_t *cc = stmt->try_stmt.catches.items[i];
@@ -443,11 +464,14 @@ void zan_checker_check_stmt(zan_checker_t *c, zan_ast_node_t *stmt) {
 static void check_method_body(zan_checker_t *c, zan_ast_node_t *method) {
     if (!method->method_decl.body) return;
 
+    bool saved_nrt = c->in_no_runtime;
+    c->in_no_runtime = zan_ast_has_attr(method, "NoRuntime");
     zan_type_t *saved = c->current_return_type;
     c->current_return_type = zan_binder_resolve_type(c->binder,
                                                       method->method_decl.return_type);
     zan_checker_check_stmt(c, method->method_decl.body);
     c->current_return_type = saved;
+    c->in_no_runtime = saved_nrt;
 }
 
 void zan_checker_check(zan_checker_t *c, zan_ast_node_t *unit) {

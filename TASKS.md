@@ -469,9 +469,16 @@ static extern int zan_gui_present(int hwnd, int surfaceId);
 
 ## A4 无运行时执行模式 〔依赖 A0〕
 
-* **A4-1** `[NoRuntime]` 函数：checker 禁止分配 / ARC / throw，irgen 不插 retain-release。
-  （`unsafe` 现在只是 `parser.c:232` 的一个 modifier bit，`TK_UNSAFE` 全库出现 4 次、无语义）
+* **A4-1** ✅ `[NoRuntime]` 方法。checker 在这类方法体内拒绝 `new` / 字符串拼接 /
+  字符串插值 / lambda / `throw` / `try` / `lock` / `foreach`——凡是会落到托管运行时的构造；
+  irgen 在其中一律不插 retain/release（四个 ARC 叶子函数 `emit_arc_retain` /
+  `emit_arc_release` / `emit_string_retain` / `emit_string_release` 统一早退）。
   这是 `rt_crash` 那类"进程已损坏时还要执行"的代码唯一的表达方式。
+  用例：`tests/conformance/no_runtime.zan`（能跑）、`tests/diag/no_runtime_alloc.zan`
+  （分配必须编译失败）、`tests/diag/no_runtime_arc.zan` + `tests/run_no_runtime_ir.cmake`
+  （同一段字符串搬运，托管版必须有 ARC 调用、`[NoRuntime]` 版必须一个都没有——
+  前者同时保证这个断言不是空转）。
+  （`unsafe` 仍只是 `parser.c:232` 的一个 modifier bit，`TK_UNSAFE` 全库出现 4 次、无语义）
 * **A4-2** 外部线程 attach / detach 运行时。X11 / SDL / Cocoa 都会从非 Zan 线程回调进来。
 
 ## A5 SIMD 〔依赖 A1，可选〕

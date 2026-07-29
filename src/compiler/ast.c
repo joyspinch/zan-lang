@@ -17,6 +17,20 @@ zan_ast_node_t *zan_ast_new(zan_arena_t *arena, zan_ast_kind_t kind, zan_loc_t l
     return node;
 }
 
+/* True when `decl` carries the bare attribute `[name]`. */
+bool zan_ast_has_attr(const zan_ast_node_t *decl, const char *name) {
+    if (!decl) return false;
+    size_t n = strlen(name);
+    for (int i = 0; i < decl->attributes.count; i++) {
+        zan_ast_node_t *a = decl->attributes.items[i];
+        if (!a || a->kind != AST_ATTRIBUTE || !a->attribute.name) continue;
+        if (a->attribute.name->kind != AST_IDENTIFIER) continue;
+        zan_istr_t s = a->attribute.name->ident.name;
+        if (s.len == (uint32_t)n && memcmp(s.str, name, n) == 0) return true;
+    }
+    return false;
+}
+
 void zan_ast_list_init(zan_ast_list_t *list) {
     list->items = NULL;
     list->count = 0;

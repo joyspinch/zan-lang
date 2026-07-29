@@ -12,6 +12,9 @@ struct zan_checker {
     zan_arena_t *arena;
     zan_diag_t *diag;
     zan_type_t *current_return_type;
+    /* inside a [NoRuntime] body: anything needing the managed runtime
+     * (allocation, ARC, exceptions, the monitor) is an error there */
+    bool in_no_runtime;
 };
 
 void zan_checker_init(zan_checker_t *c, zan_binder_t *binder,

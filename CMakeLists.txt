@@ -771,6 +771,22 @@ add_test(NAME diag_property_call
 set_tests_properties(diag_property_call PROPERTIES
   WILL_FAIL TRUE TIMEOUT 60)
 
+# A [NoRuntime] method may not use anything that calls into the managed
+# runtime; allocation is the headline case.
+add_test(NAME diag_no_runtime_alloc
+  COMMAND zanc ${CMAKE_SOURCE_DIR}/tests/diag/no_runtime_alloc.zan
+    -o ${CMAKE_BINARY_DIR}/diag_no_runtime_alloc${_exe_ext})
+set_tests_properties(diag_no_runtime_alloc PROPERTIES
+  WILL_FAIL TRUE TIMEOUT 60)
+
+# ...and irgen must not slip ARC calls into its body either.
+add_test(NAME diag_no_runtime_arc COMMAND ${CMAKE_COMMAND}
+  -DZANC=$<TARGET_FILE:zanc>
+  -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/no_runtime_arc.zan
+  -DWORKDIR=${CMAKE_BINARY_DIR}
+  -P ${CMAKE_SOURCE_DIR}/tests/run_no_runtime_ir.cmake)
+set_tests_properties(diag_no_runtime_arc PROPERTIES TIMEOUT 60)
+
 # ---- Golden compiler regression tests ----
 # Freeze the lexer token stream and parse tree for a set of hermetic (stdlib-free)
 # .zan inputs so any lexer/parser/AST regression is caught in CI on every

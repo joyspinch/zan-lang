@@ -46,6 +46,7 @@ struct zan_irgen {
     LLVMValueRef current_this;       /* alloca for 'this' pointer */
     zan_symbol_t *current_type_sym;  /* type symbol for 'this' */
     zan_ast_node_t *current_fn_body; /* root AST body of the fn being compiled */
+    bool current_fn_no_runtime;      /* [NoRuntime]: emit no ARC in this body */
 
     /* runtime function declarations */
     LLVMValueRef rt_println;   /* zan_rt_println(const char*) */

@@ -1090,6 +1090,7 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
         g->current_this = is_static ? NULL : this_alloca;
         g->current_type_sym = type_sym;
         g->current_fn_body = member->method_decl.body;
+        g->current_fn_no_runtime = zan_ast_has_attr(member, "NoRuntime");
 
         /* base construction: a derived constructor first chains to its base
          * class's constructor so inherited fields are initialised (base
@@ -1183,6 +1184,7 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
         g->current_this = saved_this;
         g->current_type_sym = saved_type_sym;
         g->current_fn_body = saved_fn_body;
+        g->current_fn_no_runtime = false;
         free(param_types);
     }
 

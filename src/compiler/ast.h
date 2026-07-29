@@ -447,6 +447,7 @@ struct zan_ast_node {
 /* ---- utility functions ---- */
 
 zan_ast_node_t *zan_ast_new(zan_arena_t *arena, zan_ast_kind_t kind, zan_loc_t loc);
+bool zan_ast_has_attr(const zan_ast_node_t *decl, const char *name);
 void zan_ast_list_init(zan_ast_list_t *list);
 void zan_ast_list_push(zan_ast_list_t *list, zan_ast_node_t *node, zan_arena_t *arena);
 
