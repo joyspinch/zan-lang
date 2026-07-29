@@ -28,26 +28,28 @@ void zan_io_init(void);
 void zan_io_shutdown(void);
 void zan_io_socket_cleanup(void);
 /* `fd` is a socket handle, so it is pointer-width (`intptr_t`): a Windows
- * SOCKET is a UINT_PTR and only a POSIX fd fits in 32 bits. Byte counts and
- * status codes are `int64_t`, flags are `int32_t` -- none of these may be
- * spelled `int`/`long`, whose width differs across our targets. */
+ * SOCKET is a UINT_PTR and only a POSIX fd fits in 32 bits. Byte counts are
+ * `int64_t`; flags, status codes and 0/1 results are `int32_t` -- none of
+ * these may be spelled `int`/`long`, whose width differs across our targets. A
+ * status that fits in 32 bits stays 32 bits: widening it would force every
+ * Zan caller to spell an errno/SO_ERROR code or a boolean `long`. */
 int64_t zan_io_socket_send(intptr_t fd, const void *buf, int64_t len,
                            int32_t flags);
 int64_t zan_io_socket_recv(intptr_t fd, void *buf, int64_t len,
                            int32_t flags);
-int64_t zan_io_socket_ready(intptr_t fd, int32_t write_ready);
+int32_t zan_io_socket_ready(intptr_t fd, int32_t write_ready);
 
 /* Probe the outcome of a non-blocking connect on `fd`.
  * Returns 0 once connected, a positive SO_ERROR code (or -1 when no code is
  * available) once the connect has failed, and -2 while still in progress. */
-int64_t zan_io_connect_status(intptr_t fd);
+int32_t zan_io_connect_status(intptr_t fd);
 
 /* Whether `fd` still refers to an open socket. Non-zero when it does.
  * A readiness-retry loop (accept, in particular) needs this: once its socket
  * has been closed under it -- a listener taken down by Stop() while a coroutine
  * was parked in accept -- the fd can never become ready again, and the loop
  * must report the failure instead of re-arming the watcher forever. */
-int64_t zan_io_socket_alive(intptr_t fd);
+int32_t zan_io_socket_alive(intptr_t fd);
 
 /* ---- stackless (CPS state-machine) ABI ----
  *

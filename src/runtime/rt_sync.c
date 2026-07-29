@@ -527,7 +527,7 @@ static DWORD WINAPI zan_thread_trampoline(LPVOID arg) {
     return 0;
 }
 
-int64_t zan_thread_start(void *body) {
+int32_t zan_thread_start(void *body) {
     if (!body) return 0;
     HANDLE h = CreateThread(NULL, 0, zan_thread_trampoline, body, 0, NULL);
     if (!h) return 0;
@@ -541,7 +541,7 @@ static void *zan_thread_trampoline(void *arg) {
     return NULL;
 }
 
-int64_t zan_thread_start(void *body) {
+int32_t zan_thread_start(void *body) {
     if (!body) return 0;
     pthread_t t;
     if (pthread_create(&t, NULL, zan_thread_trampoline, body) != 0) return 0;
@@ -633,12 +633,12 @@ void zan_dispatch_init(void) {
 
 /* Enqueue a delegate to run on the UI thread. Thread-safe. Returns 1 on
  * success, 0 if the delegate was null or the queue was full. */
-int64_t zan_dispatch_post(void *fn) {
+int32_t zan_dispatch_post(void *fn) {
     if (!fn) return 0;
 #ifdef _WIN32
     if (!g_dispatch_ready) zan_dispatch_init();
 #endif
-    int64_t ok = 0;
+    int32_t ok = 0;
     zan_dispatch_lock();
     int next = (g_dispatch_tail + 1) % ZAN_DISPATCH_CAP;
     if (next != g_dispatch_head) {
@@ -733,10 +733,10 @@ int64_t zan_atomic_int_add(int64_t handle, int64_t delta) {
 }
 
 int64_t zan_shared_table_create(
-    const char *name, int64_t capacity_value, int64_t key_size_value,
+    const char *name, int32_t capacity_value, int32_t key_size_value,
     const char *schema) {
     if (!name || !*name || capacity_value <= 0 ||
-        capacity_value > (int64_t)ZAN_TABLE_MAX_CAPACITY ||
+        capacity_value > (int32_t)ZAN_TABLE_MAX_CAPACITY ||
         key_size_value <= 0 || key_size_value > ZAN_TABLE_MAX_KEY) {
         return 0;
     }
@@ -927,10 +927,10 @@ void zan_shared_table_close(int64_t handle) {
     zan_shared_table_free((zan_shared_table *)(intptr_t)handle);
 }
 
-int64_t zan_shared_table_destroy(int64_t handle) {
+int32_t zan_shared_table_destroy(int64_t handle) {
     zan_shared_table *table = (zan_shared_table *)(intptr_t)handle;
     if (!table) return 0;
-    int64_t result = 1;
+    int32_t result = 1;
 #ifndef _WIN32
     if (unlink(table->map_name) != 0 && errno != ENOENT) result = 0;
     if (unlink(table->lock_name) != 0 && errno != ENOENT) result = 0;
@@ -939,7 +939,7 @@ int64_t zan_shared_table_destroy(int64_t handle) {
     return result;
 }
 
-int64_t zan_shared_table_set_int(
+int32_t zan_shared_table_set_int(
     int64_t handle, const char *key, const char *column_name, int64_t value) {
     zan_shared_table *table = (zan_shared_table *)(intptr_t)handle;
     if (!table) return 0;
@@ -968,7 +968,7 @@ int64_t zan_shared_table_get_int(
     return value;
 }
 
-int64_t zan_shared_table_set_float(
+int32_t zan_shared_table_set_float(
     int64_t handle, const char *key, const char *column_name, double value) {
     zan_shared_table *table = (zan_shared_table *)(intptr_t)handle;
     if (!table) return 0;
@@ -997,7 +997,7 @@ double zan_shared_table_get_float(
     return value;
 }
 
-int64_t zan_shared_table_set_string(
+int32_t zan_shared_table_set_string(
     int64_t handle, const char *key, const char *column_name, const char *value) {
     zan_shared_table *table = (zan_shared_table *)(intptr_t)handle;
     if (!table || !value) return 0;
@@ -1076,7 +1076,7 @@ int64_t zan_shared_table_hash(const char *value) {
     return (int64_t)zan_hash_bytes(value);
 }
 
-int64_t zan_shared_table_set_int_at(
+int32_t zan_shared_table_set_int_at(
     int64_t handle, int64_t key_hash, const char *column_name, int64_t value) {
     zan_shared_table *table = (zan_shared_table *)(intptr_t)handle;
     if (!table) return 0;
@@ -1151,7 +1151,7 @@ int64_t zan_shared_table_extreme_at(
     return stored;
 }
 
-int64_t zan_shared_table_set_string_at(
+int32_t zan_shared_table_set_string_at(
     int64_t handle, int64_t key_hash, const char *column_name,
     const char *value) {
     zan_shared_table *table = (zan_shared_table *)(intptr_t)handle;
@@ -1196,7 +1196,7 @@ const char *zan_shared_table_get_string_at(
  * back to the caller. The route table verifies the original path on every
  * lookup to rule out a hash collision, and returning the column would allocate
  * a string per request just to throw it away. */
-int64_t zan_shared_table_match_at(
+int32_t zan_shared_table_match_at(
     int64_t handle, int64_t key_hash, const char *column_name,
     const char *text) {
     zan_shared_table *table = (zan_shared_table *)(intptr_t)handle;
@@ -1213,13 +1213,13 @@ int64_t zan_shared_table_match_at(
     return equal ? 1 : 0;
 }
 
-int64_t zan_shared_table_exists_at(int64_t handle, int64_t key_hash) {
+int32_t zan_shared_table_exists_at(int64_t handle, int64_t key_hash) {
     zan_shared_table *table = (zan_shared_table *)(intptr_t)handle;
     if (!table) return 0;
     return zan_find_row_hash(table->header, (uint64_t)key_hash, 0) != NULL;
 }
 
-int64_t zan_shared_table_delete_at(int64_t handle, int64_t key_hash) {
+int32_t zan_shared_table_delete_at(int64_t handle, int64_t key_hash) {
     zan_shared_table *table = (zan_shared_table *)(intptr_t)handle;
     if (!table) return 0;
     zan_struct_lock(table->header);
@@ -1236,7 +1236,7 @@ int64_t zan_shared_table_delete_at(int64_t handle, int64_t key_hash) {
     return row != NULL;
 }
 
-int64_t zan_shared_table_delete(int64_t handle, const char *key) {
+int32_t zan_shared_table_delete(int64_t handle, const char *key) {
     zan_shared_table *table = (zan_shared_table *)(intptr_t)handle;
     if (!table) return 0;
     zan_struct_lock(table->header);
@@ -1252,7 +1252,7 @@ int64_t zan_shared_table_delete(int64_t handle, const char *key) {
     return row != NULL;
 }
 
-int64_t zan_shared_table_exists(int64_t handle, const char *key) {
+int32_t zan_shared_table_exists(int64_t handle, const char *key) {
     zan_shared_table *table = (zan_shared_table *)(intptr_t)handle;
     if (!table) return 0;
     return zan_find_row(table->header, key, 0) != NULL;

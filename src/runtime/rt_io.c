@@ -308,7 +308,7 @@ int64_t zan_io_socket_recv(intptr_t fd, void *buf, int64_t len,
 #endif
 }
 
-int64_t zan_io_socket_ready(intptr_t fd, int32_t write_ready) {
+int32_t zan_io_socket_ready(intptr_t fd, int32_t write_ready) {
     fd_set fds;
     FD_ZERO(&fds);
     struct timeval timeout = {0, 0};
@@ -328,7 +328,7 @@ int64_t zan_io_socket_ready(intptr_t fd, int32_t write_ready) {
 }
 
 /* See rt_io.h: whether `fd` is still an open socket. */
-int64_t zan_io_socket_alive(intptr_t fd) {
+int32_t zan_io_socket_alive(intptr_t fd) {
 #if defined(_WIN32)
     if ((SOCKET)fd == INVALID_SOCKET) return 0;
     int type = 0;
@@ -351,7 +351,7 @@ int64_t zan_io_socket_alive(intptr_t fd) {
  * populated until the exception set has actually been polled, so a bare
  * getsockopt(SO_ERROR) after the reactor wake reads 0 for a refused
  * connection. */
-int64_t zan_io_connect_status(intptr_t fd) {
+int32_t zan_io_connect_status(intptr_t fd) {
     fd_set wfds, efds;
     FD_ZERO(&wfds);
     FD_ZERO(&efds);
