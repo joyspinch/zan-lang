@@ -822,6 +822,18 @@ static LLVMValueRef struct_base_ptr(zan_irgen_t *g, local_var_t *local, LLVMType
  * `List.Count`/`string.Length` -- generate valid IR. */
 static void coerce_int_pair(zan_irgen_t *g, LLVMValueRef *a, LLVMValueRef *b) {
     LLVMTypeRef ta = LLVMTypeOf(*a), tb = LLVMTypeOf(*b);
+    /* `float op double` computes in double, as in C#; only float op float
+     * stays 32-bit. */
+    if (LLVMGetTypeKind(ta) == LLVMFloatTypeKind &&
+        LLVMGetTypeKind(tb) == LLVMDoubleTypeKind) {
+        *a = LLVMBuildFPExt(g->builder, *a, tb, "fpair.ext");
+        return;
+    }
+    if (LLVMGetTypeKind(tb) == LLVMFloatTypeKind &&
+        LLVMGetTypeKind(ta) == LLVMDoubleTypeKind) {
+        *b = LLVMBuildFPExt(g->builder, *b, ta, "fpair.ext");
+        return;
+    }
     if (LLVMGetTypeKind(ta) != LLVMIntegerTypeKind ||
         LLVMGetTypeKind(tb) != LLVMIntegerTypeKind) return;
     unsigned wa = LLVMGetIntTypeWidth(ta), wb = LLVMGetIntTypeWidth(tb);
@@ -836,6 +848,15 @@ static void coerce_int_pair(zan_irgen_t *g, LLVMValueRef *a, LLVMValueRef *b) {
  * matching-width values, and non-integer targets, pass through unchanged. */
 static LLVMValueRef coerce_int_to(zan_irgen_t *g, LLVMValueRef v, LLVMTypeRef target) {
     LLVMTypeRef vt = LLVMTypeOf(v);
+    /* `float` slots hold f32 while every literal and arithmetic result is a
+     * double, so a value is rounded on the way in and widened on the way out;
+     * storing the f64 bits raw wrote a denormal (which printed as 0). */
+    if (LLVMGetTypeKind(target) == LLVMFloatTypeKind &&
+        LLVMGetTypeKind(vt) == LLVMDoubleTypeKind)
+        return LLVMBuildFPTrunc(g->builder, v, target, "fit.fptrunc");
+    if (LLVMGetTypeKind(target) == LLVMDoubleTypeKind &&
+        LLVMGetTypeKind(vt) == LLVMFloatTypeKind)
+        return LLVMBuildFPExt(g->builder, v, target, "fit.fpext");
     if (LLVMGetTypeKind(vt) != LLVMIntegerTypeKind ||
         LLVMGetTypeKind(target) != LLVMIntegerTypeKind) return v;
     unsigned wv = LLVMGetIntTypeWidth(vt), wt = LLVMGetIntTypeWidth(target);
@@ -864,6 +885,12 @@ static LLVMValueRef zan_store_fit(zan_irgen_t *g, LLVMValueRef val, LLVMValueRef
             if (LLVMIsAConstantInt(idx))
                 target = LLVMStructGetTypeAtIndex(
                     src, (unsigned)LLVMConstIntGetZExtValue(idx));
+        } else if (src && LLVMGetTypeKind(src) == LLVMFloatTypeKind) {
+            /* An array element GEP walks the element type, so a `float[]` slot
+             * is recoverable here. Only the f32 case is taken: a raw byte view
+             * (Span, string buffers) is an i8 GEP too, and narrowing the value
+             * to its element type there would truncate. */
+            target = src;
         }
     }
     /* A value struct that arrives behind a pointer (`S s = new S();`, a byref

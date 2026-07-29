@@ -380,7 +380,11 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
                 }
                 /* Reuse existing declaration if the symbol already exists in the module
                  * (e.g. built-in malloc/free/strlen, or duplicate DllImport across files). */
-                LLVMValueRef efn = LLVMGetNamedFunction(g->mod, ext_name);
+                /* A struct crossing the boundary is not passed the way LLVM
+                 * passes a first-class aggregate: abi_extern_thunk declares the
+                 * symbol with the platform C signature and wraps it. */
+                LLVMValueRef efn = abi_extern_thunk(g, ext_name, ft);
+                if (!efn) efn = LLVMGetNamedFunction(g->mod, ext_name);
                 if (!efn) {
                     efn = LLVMAddFunction(g->mod, ext_name, ft);
                 }

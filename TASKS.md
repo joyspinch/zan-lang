@@ -405,8 +405,29 @@ static extern int zan_gui_present(int hwnd, int surfaceId);
     crt(46) 与直连 SDL3 的声明没有对应头可比对，只做了人工抽查；
     这些库的头装上后重跑 `sys_audit.py` 即可闭环。
 
-* **A2-1** 结构体按值传参/返回：SysV AMD64 / Win64 / AAPCS64 的 eightbyte 分类，
-  `byval` / `sret` attribute。（四项里唯一的大工程，先做 Win64 + SysV）
+* **A2-1 ✅ 已完成（2026-07-28）结构体按值传参/返回**（`src/compiler/irgen_abi.c`）。
+  声明里出现结构体的 extern 会生成两个函数：真符号按平台 C ABI 的寄存器/内存形态
+  声明，外加一个内部 thunk 保留 Zan 侧签名做转换，调用点不变。
+  - **Win64**：1/2/4/8 字节整体塞进 `i8/i16/i32/i64`，其余按指针间接传、
+    返回走 `sret`（Win64 无 `byval`）。
+  - **SysV AMD64**：前 16 字节按 eightbyte 分 INTEGER / SSE，
+    INTEGER 用实际占用宽度（`i64`/`i32`/`i24`，尾部 padding 不进寄存器），
+    SSE 按 `double` / `<2 x float>` / `float`；>16 字节走 `byval(T) align 8`，
+    返回走 `sret`。
+  - **AAPCS64**：HFA（≤4 个同种浮点）传 `[N x float]`/`[N x double]`
+    （非 Apple 带 `alignstack(8)`）、返回直接用结构体类型；否则 ≤8 字节 `i64`
+    （返回用实际宽度）、≤16 字节 `[2 x i64]`、更大间接 + `sret`。
+  - 其它 target（如 riscv64）遇到按值结构体报错，不再静默生成错误调用。
+  - **对照验证**：27 种形状 × take/make × 4 个 target 的声明，与 clang 对同样 C
+    签名生成的声明逐条比对，**0 处不一致**（工具 `_scratch/a3/`）。
+    Win64 上还跑了真实链接的往返用例（`_scratch/a3/probe.zan` + `abi_probe.dll`）：
+    改之前 `p8_sum` 返回 3、`p12_sum` 直接访问违例。
+  - 用例：`tests/abi/struct_abi.zan` + `tests/abi/expected/<target>.decls`，
+    ctest 里是 `abi_signatures_{win-x64,linux-x64,linux-arm64,macos-arm64}`。
+  - **顺带修掉的既有 bug**：`float` 是 f32 存储而字面量/算术是 double，
+    但存进 float 槽时没有 `fptrunc`（写进去的是 f64 位型，打印出来是 0）、
+    打印时没有 `fpext`（LLVM verify 直接失败）、`float op double` 两边类型不一致。
+    见 `tests/conformance/float_widths.zan`。
 * **A2-2** `[repr(C)]` 布局 + `[StructLayout(Explicit)]` + `[FieldOffset(n)]`。
   **union 不新增类型 kind**——所有字段 `FieldOffset(0)` 的 explicit struct 即 union，
   用来表达 `SDL_Event`(128B) / `XEvent`(192B) / `DEBUG_EVENT`。

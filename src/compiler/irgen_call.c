@@ -278,9 +278,12 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                     zan_call2(g->builder, fn_type, g->rt_println, &arg, 1, "");
                 } else if (LLVMGetTypeKind(arg_type) == LLVMDoubleTypeKind ||
                            LLVMGetTypeKind(arg_type) == LLVMFloatTypeKind) {
+                    LLVMTypeRef dbl = LLVMDoubleTypeInContext(g->ctx);
+                    if (LLVMGetTypeKind(arg_type) == LLVMFloatTypeKind)
+                        arg = LLVMBuildFPExt(g->builder, arg, dbl, "print.ext");
                     LLVMTypeRef fn_type = LLVMFunctionType(
                         LLVMVoidTypeInContext(g->ctx),
-                        (LLVMTypeRef[]){ LLVMDoubleTypeInContext(g->ctx) },
+                        (LLVMTypeRef[]){ dbl },
                         1, 0);
                     zan_call2(g->builder, fn_type, g->rt_print_double, &arg, 1, "");
                 } else {

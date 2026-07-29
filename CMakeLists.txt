@@ -803,6 +803,20 @@ foreach(_case ${_golden_cases})
   endif()
 endforeach()
 
+# ---- Struct-by-value FFI ABI: the C signature per target ----
+# Cross targets only need the LLVM backends zanc already registers; nothing is
+# linked, so these run everywhere the compiler builds.
+foreach(_abi_target win-x64 linux-x64 linux-arm64 macos-arm64)
+  add_test(NAME abi_signatures_${_abi_target} COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/abi/struct_abi.zan
+    -DTARGET=${_abi_target}
+    -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/abi/expected/${_abi_target}.decls
+    -DWORKDIR=${CMAKE_BINARY_DIR}
+    -P ${CMAKE_SOURCE_DIR}/tests/run_abi_case.cmake)
+  set_tests_properties(abi_signatures_${_abi_target} PROPERTIES TIMEOUT 120)
+endforeach()
+
 # ---- DAP integration test (real gdb-backed debug session) ----
 add_executable(dap_integration_test
     tests/dap/dap_integration_test.c
