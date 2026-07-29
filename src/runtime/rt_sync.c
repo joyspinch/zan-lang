@@ -520,10 +520,31 @@ static void zan_shared_table_free(zan_shared_table *table) {
 
 typedef void (*zan_thread_body_fn)(void);
 
+/* Emitted code defines this when the program can throw; it drops the calling
+ * thread's exception-handling state. Weak so a program without exceptions --
+ * or one linked against a runtime older than the emitter -- still links. */
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((weak)) extern void __zan_eh_release(void);
+#else
+extern void __zan_eh_release(void);
+#endif
+
+/* Release whatever per-thread runtime state the calling thread accumulated.
+ * Public so a thread the runtime did not start -- an X11 / SDL / Cocoa
+ * callback thread that ran Zan code -- can hand its slot back instead of
+ * holding one for the life of the process. */
+void zan_thread_detach(void) {
+#if defined(__GNUC__) || defined(__clang__)
+    if (!__zan_eh_release) return;
+#endif
+    __zan_eh_release();
+}
+
 #ifdef _WIN32
 static DWORD WINAPI zan_thread_trampoline(LPVOID arg) {
     zan_thread_body_fn body = (zan_thread_body_fn)arg;
     if (body) body();
+    zan_thread_detach();
     return 0;
 }
 
@@ -538,6 +559,7 @@ int32_t zan_thread_start(void *body) {
 static void *zan_thread_trampoline(void *arg) {
     zan_thread_body_fn body = (zan_thread_body_fn)arg;
     if (body) body();
+    zan_thread_detach();
     return NULL;
 }
 

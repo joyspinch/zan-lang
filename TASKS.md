@@ -479,7 +479,18 @@ static extern int zan_gui_present(int hwnd, int surfaceId);
   （同一段字符串搬运，托管版必须有 ARC 调用、`[NoRuntime]` 版必须一个都没有——
   前者同时保证这个断言不是空转）。
   （`unsafe` 仍只是 `parser.c:232` 的一个 modifier bit，`TK_UNSAFE` 全库出现 4 次、无语义）
-* **A4-2** 外部线程 attach / detach 运行时。X11 / SDL / Cocoa 都会从非 Zan 线程回调进来。
+* **A4-2** 🟡 外部线程 attach / detach。attach 本来就是隐式的：线程第一次用到
+  EH 状态时 `__zan_eh_state()` 会给它建块。缺的是 detach ——
+  块从来不释放，槽位表只有 1024 个且用尽即 `exit`：**1200 个同时存在、各抛一次异常的线程直接
+  "too many live threads for the exception-handling table" 退出**；即使线程 id
+  被 OS 回收（Windows 上顺序起线程就是如此），每个新 id 仍泄漏一个状态块加它的
+  chunk（2000 个顺序线程实测峰值 **102.3 MB**）。
+  现在 `__zan_eh_release()` 把槽位改写成墓碑（可重用、但探测链不断）并释放块和全部
+  chunk；`zan_thread_trampoline` 在 body 返回后调用它，同一程序峰值降到 **3.9 MB**。
+  外部线程（X11 / SDL / Cocoa 回调）可以调 `zan_thread_detach()` 自己交还槽位。
+  用例：`tests/conformance/thread_eh_slots.zan`（3000 个线程各抛一次，必须跑完）。
+  **仍未做**：非 EH 的每线程状态（目前只有 `rt_sync.c` 的 `zan_shared_string`）没有
+  统一的 attach/detach 钩子；GUI 回调线程也还没有真正调用 `zan_thread_detach()`。
 
 ## A5 SIMD 〔依赖 A1，可选〕
 

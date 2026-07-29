@@ -828,6 +828,9 @@ static LLVMValueRef get_dict_set_fn(zan_irgen_t *g) {
 #define ZAN_EH_MARK_OFF    1024
 #define ZAN_EH_TMP_SHIFT   12     /* 4096 unwind-stack entries per chunk */
 #define ZAN_EH_THREADS     1024   /* live threads that can raise exceptions */
+/* A slot whose thread released its block: claimable again, but a probe must
+ * pass through it or it would cut the chain of the keys stored after it. */
+#define ZAN_EH_TOMBSTONE   0xFFFFFFFFFFFFFFFFULL
 
 /* Fields of the per-thread state block. */
 enum {
@@ -967,6 +970,150 @@ static void emit_eh_oom_abort(zan_irgen_t *g, const char *msg) {
     LLVMBuildUnreachable(g->builder);
 }
 
+/* void __zan_eh_release(): drop the calling thread's EH state block.
+ *
+ * Blocks used to be kept forever, so every OS thread that ever entered a try
+ * consumed a table slot for the life of the process and running out was fatal
+ * ("too many live threads..."). A program holding 1200 threads that each throw
+ * once aborted, and a long-lived one leaked a block plus its chunks per thread
+ * even when ids were recycled. Releasing marks the slot with a tombstone --
+ * claimable again, still transparent to a probe -- and frees the block and
+ * every chunk it brought into existence.
+ *
+ * Called from the thread trampoline once the body has returned, and exported
+ * so a foreign thread (an X11 / SDL / Cocoa callback that ran Zan code) can
+ * detach itself via zan_thread_detach. Calling it from a thread that never
+ * used the runtime, or twice, is a no-op. */
+static void emit_eh_release_fn(zan_irgen_t *g, LLVMTypeRef keys_ty,
+                               LLVMTypeRef states_ty, LLVMValueRef keys,
+                               LLVMValueRef states) {
+    if (LLVMGetNamedFunction(g->mod, "__zan_eh_release")) return;
+    LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
+    LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMTypeRef voidt = LLVMVoidTypeInContext(g->ctx);
+    LLVMTypeRef state_ty = get_eh_state_ty(g);
+    LLVMTypeRef tab_ty = LLVMArrayType(i8ptr, ZAN_EH_CHUNKS);
+    LLVMTypeRef free_ty = LLVMFunctionType(voidt, &i8ptr, 1, 0);
+    LLVMValueRef free_fn = get_libc_fn(g, "free", free_ty);
+
+    LLVMValueRef fn = LLVMAddFunction(g->mod, "__zan_eh_release",
+        LLVMFunctionType(voidt, NULL, 0, 0));
+    LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, fn, "entry");
+    LLVMBasicBlockRef probe = LLVMAppendBasicBlockInContext(g->ctx, fn, "probe");
+    LLVMBasicBlockRef found = LLVMAppendBasicBlockInContext(g->ctx, fn, "found");
+    LLVMBasicBlockRef live  = LLVMAppendBasicBlockInContext(g->ctx, fn, "live");
+    LLVMBasicBlockRef cloop = LLVMAppendBasicBlockInContext(g->ctx, fn, "cloop");
+    LLVMBasicBlockRef cbody = LLVMAppendBasicBlockInContext(g->ctx, fn, "cbody");
+    LLVMBasicBlockRef drop  = LLVMAppendBasicBlockInContext(g->ctx, fn, "drop");
+    LLVMBasicBlockRef next  = LLVMAppendBasicBlockInContext(g->ctx, fn, "next");
+    LLVMBasicBlockRef done  = LLVMAppendBasicBlockInContext(g->ctx, fn, "done");
+
+    LLVMPositionBuilderAtEnd(g->builder, entry);
+    LLVMValueRef key = zan_add(g->builder, emit_eh_thread_id(g),
+        LLVMConstInt(i64t, 1, 0), "key");
+    LLVMValueRef h = zan_and(g->builder,
+        LLVMBuildXor(g->builder, key,
+            LLVMBuildLShr(g->builder, key, LLVMConstInt(i64t, 32, 0), "key.hi"),
+            "key.mix"),
+        LLVMConstInt(i64t, ZAN_EH_THREADS - 1, 0), "h");
+    LLVMValueRef i_slot = LLVMBuildAlloca(g->builder, i64t, "i");
+    LLVMValueRef c_slot = LLVMBuildAlloca(g->builder, i64t, "c");
+    LLVMValueRef sp_slot = LLVMBuildAlloca(g->builder, LLVMPointerType(i8ptr, 0), "spp");
+    LLVMValueRef st_slot = LLVMBuildAlloca(g->builder, i8ptr, "stp");
+    LLVMValueRef kp_slot = LLVMBuildAlloca(g->builder, LLVMPointerType(i64t, 0), "kpp");
+    LLVMBuildStore(g->builder, LLVMConstInt(i64t, 0, 0), i_slot);
+    LLVMBuildBr(g->builder, probe);
+
+    LLVMPositionBuilderAtEnd(g->builder, probe);
+    LLVMValueRef zero64 = LLVMConstInt(i64t, 0, 0);
+    LLVMValueRef i = LLVMBuildLoad2(g->builder, i64t, i_slot, "i.v");
+    LLVMValueRef pos = zan_and(g->builder, zan_add(g->builder, h, i, "pos.raw"),
+        LLVMConstInt(i64t, ZAN_EH_THREADS - 1, 0), "pos");
+    LLVMValueRef kp = LLVMBuildGEP2(g->builder, keys_ty, keys,
+        (LLVMValueRef[]){ zero64, pos }, 2, "kp");
+    LLVMValueRef sp = LLVMBuildGEP2(g->builder, states_ty, states,
+        (LLVMValueRef[]){ zero64, pos }, 2, "sp");
+    LLVMBuildStore(g->builder, kp, kp_slot);
+    LLVMBuildStore(g->builder, sp, sp_slot);
+    LLVMValueRef k = LLVMBuildLoad2(g->builder, i64t, kp, "k");
+    LLVMSetAlignment(k, 8);
+    LLVMSetOrdering(k, LLVMAtomicOrderingMonotonic);
+    LLVMBuildCondBr(g->builder,
+        zan_icmp(g->builder, LLVMIntEQ, k, key, "is.mine"), found, next);
+
+    /* Not this thread's slot. An empty one ends the search: the thread never
+     * claimed a block, so there is nothing to release. */
+    LLVMPositionBuilderAtEnd(g->builder, next);
+    LLVMValueRef k2 = LLVMBuildLoad2(g->builder, i64t,
+        LLVMBuildLoad2(g->builder, LLVMPointerType(i64t, 0), kp_slot, "kp.v"),
+        "k2");
+    LLVMValueRef ni = zan_add(g->builder,
+        LLVMBuildLoad2(g->builder, i64t, i_slot, "i.v2"),
+        LLVMConstInt(i64t, 1, 0), "i.next");
+    LLVMBuildStore(g->builder, ni, i_slot);
+    LLVMBuildCondBr(g->builder,
+        LLVMBuildOr(g->builder,
+            zan_icmp(g->builder, LLVMIntEQ, k2, zero64, "is.empty"),
+            zan_icmp(g->builder, LLVMIntUGE, ni,
+                LLVMConstInt(i64t, ZAN_EH_THREADS, 0), "wrapped"), "stop"),
+        done, probe);
+
+    LLVMPositionBuilderAtEnd(g->builder, found);
+    LLVMValueRef st = LLVMBuildLoad2(g->builder, i8ptr,
+        LLVMBuildLoad2(g->builder, LLVMPointerType(i8ptr, 0), sp_slot, "sp.v"),
+        "st");
+    LLVMBuildStore(g->builder, st, st_slot);
+    LLVMBuildCondBr(g->builder,
+        zan_icmp(g->builder, LLVMIntEQ, st, LLVMConstNull(i8ptr), "no.state"),
+        drop, live);
+
+    LLVMPositionBuilderAtEnd(g->builder, live);
+    LLVMBuildStore(g->builder, zero64, c_slot);
+    LLVMBuildBr(g->builder, cloop);
+
+    /* Both chunk tables are walked together: a chunk is calloc'd on first use
+     * and is this thread's alone, so nothing else can be looking at one. */
+    LLVMPositionBuilderAtEnd(g->builder, cloop);
+    LLVMValueRef c = LLVMBuildLoad2(g->builder, i64t, c_slot, "c.v");
+    LLVMBuildCondBr(g->builder,
+        zan_icmp(g->builder, LLVMIntUGE, c,
+            LLVMConstInt(i64t, ZAN_EH_CHUNKS, 0), "chunks.done"), drop, cbody);
+
+    LLVMPositionBuilderAtEnd(g->builder, cbody);
+    LLVMValueRef stp = LLVMBuildBitCast(g->builder,
+        LLVMBuildLoad2(g->builder, i8ptr, st_slot, "st.v"),
+        LLVMPointerType(state_ty, 0), "st.typed");
+    unsigned tabs[2] = { EH_F_BUFS, EH_F_TMPS };
+    for (int t = 0; t < 2; t++) {
+        LLVMValueRef tab = LLVMBuildStructGEP2(g->builder, state_ty, stp,
+            tabs[t], "tab");
+        LLVMValueRef cp = LLVMBuildGEP2(g->builder, tab_ty, tab,
+            (LLVMValueRef[]){ zero64, c }, 2, "cp");
+        LLVMValueRef chunk = LLVMBuildLoad2(g->builder, i8ptr, cp, "chunk");
+        zan_call2(g->builder, free_ty, free_fn, &chunk, 1, "");
+    }
+    LLVMBuildStore(g->builder,
+        zan_add(g->builder, c, LLVMConstInt(i64t, 1, 0), "c.next"), c_slot);
+    LLVMBuildBr(g->builder, cloop);
+
+    LLVMPositionBuilderAtEnd(g->builder, drop);
+    LLVMValueRef stv = LLVMBuildLoad2(g->builder, i8ptr, st_slot, "st.v2");
+    zan_call2(g->builder, free_ty, free_fn, &stv, 1, "");
+    LLVMBuildStore(g->builder, LLVMConstNull(i8ptr),
+        LLVMBuildLoad2(g->builder, LLVMPointerType(i8ptr, 0), sp_slot, "sp.v2"));
+    LLVMValueRef tomb = LLVMBuildStore(g->builder,
+        LLVMConstInt(i64t, ZAN_EH_TOMBSTONE, 0),
+        LLVMBuildLoad2(g->builder, LLVMPointerType(i64t, 0), kp_slot, "kp.v2"));
+    LLVMSetAlignment(tomb, 8);
+    LLVMSetOrdering(tomb, LLVMAtomicOrderingRelease);
+    LLVMBuildBr(g->builder, done);
+
+    LLVMPositionBuilderAtEnd(g->builder, done);
+    LLVMBuildRetVoid(g->builder);
+    (void)i32t;
+}
+
 /* i8* __zan_eh_state(): the calling thread's EH state block, created on that
  * thread's first use of it.
  *
@@ -1044,15 +1191,20 @@ static LLVMValueRef get_eh_state_fn(zan_irgen_t *g) {
     LLVMBuildRet(g->builder, LLVMBuildLoad2(g->builder, i8ptr, sp, "st"));
 
     LLVMPositionBuilderAtEnd(g->builder, claim);
-    LLVMBuildCondBr(g->builder,
+    /* Free (never used) or a tombstone left by a thread that released its
+     * block. Both are claimable; only the tombstone must keep a probe passing
+     * through it, which it does because the probe stops at key 0 alone. */
+    LLVMValueRef reusable = LLVMBuildOr(g->builder,
         zan_icmp(g->builder, LLVMIntEQ, k, LLVMConstInt(i64t, 0, 0), "is.free"),
-        make, next);
+        zan_icmp(g->builder, LLVMIntEQ, k,
+            LLVMConstInt(i64t, ZAN_EH_TOMBSTONE, 0), "is.dead"), "reusable");
+    LLVMBuildCondBr(g->builder, reusable, make, next);
 
     /* Claim it. Losing the race means another thread took this slot between the
      * load and here, so move on to the next one. */
     LLVMPositionBuilderAtEnd(g->builder, make);
     LLVMValueRef xchg = LLVMBuildAtomicCmpXchg(g->builder, kp,
-        LLVMConstInt(i64t, 0, 0), key,
+        k, key,
         LLVMAtomicOrderingSequentiallyConsistent,
         LLVMAtomicOrderingSequentiallyConsistent, 0);
     LLVMBuildCondBr(g->builder,
@@ -1091,6 +1243,9 @@ static LLVMValueRef get_eh_state_fn(zan_irgen_t *g) {
     LLVMPositionBuilderAtEnd(g->builder, full);
     emit_eh_oom_abort(g,
         "zan: too many live threads for the exception-handling table\n");
+
+    emit_eh_release_fn(g, keys_ty, states_ty, keys, states);
+
     if (saved) LLVMPositionBuilderAtEnd(g->builder, saved);
     return fn;
 }

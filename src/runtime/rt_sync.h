@@ -11,6 +11,12 @@ extern "C" {
  * function pointer). Returns 1 on success, 0 on failure. */
 int32_t zan_thread_start(void *body);
 
+/* Drop the calling thread's per-thread runtime state (currently its
+ * exception-handling block). Threads started by zan_thread_start do this
+ * themselves; a foreign callback thread that ran Zan code must call it, or it
+ * keeps a slot in a table with a hard limit. Idempotent. */
+void zan_thread_detach(void);
+
 /* `lock (obj)` statement monitor: process-wide recursive mutex (coarser than
  * C#'s per-object monitor; the object argument is currently unused). */
 void zan_monitor_enter(void *obj);
