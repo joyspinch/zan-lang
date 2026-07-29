@@ -776,6 +776,20 @@ operand type of return inst!
     零开销 happy path，中间帧 cleanup 交给 unwinder，同时能解决 A8-7 记录的其他 EH
     设计落差。与 A0 的 typed async frame 一并规划。
 
+    **代价已量化（2026-07-29，win-x64，`_scratch/eh_cost.zan`）**：同一个循环体
+    （300 万次一个 `x*31+7` 的静态调用），裸循环 **10381 µs**，把循环体包进
+    `try { } catch (Exception e) { }` 后 **26878 µs** —— 什么都没抛，**2.6x**，
+    每次进 try 约 5.5 ns。这就是真 EH 能拿回的部分。
+    EH 状态块指针本身不是热点：`emit_eh_state()` 已经把 `__zan_eh_state()` 提到
+    函数 entry 块并按函数缓存（整个 exe 里只有 5 处调用、2 处 setjmp），
+    剩下的开销是 `setjmp` 本身加 handler 栈的 push/pop。
+    **改动面**：`irgen_stmt.c`（47 处 setjmp/eh 引用）、`irgen_builtins.c`（167）、
+    `irgen_async.c`（27）、`irgen_generics.c`（16）全要重写，再加 personality
+    函数和每个目标的 unwinder（Windows SEH 与 Itanium ABI 是两套），而
+    `toolchain/<target>/zanrt_*.o` 是签入成品、只能在各自平台重编。
+    **结论：暂不动**。当前没有任何已知的正确性缺陷指向 setjmp 方案（A8/A19/A20/A22/A23
+    都已修并有用例），收益是纯性能，而受影响的只有"热循环里包 try"这一种写法。
+
 * **A8-13 ✅ 已修（2026-07-27）catch 里再抛在 async 体内跳错 handler + 被放弃的 handler 泄漏异常**。
   三个独立缺陷，`_scratch/{b,c,d,e,f,g}*.zan` 探针矩阵定位：
   1. **async 恢复后 catch 内 throw 会跳回刚离开的那个 try**（`e4` 打印两次 `inner catch`
