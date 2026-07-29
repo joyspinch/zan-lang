@@ -1559,6 +1559,13 @@ header-only 库 / C 回调 / 结构体字段偏移，全部对应 A2 / A3 / A4�
     文字导出的签名（`surface_id` → `ptr,w,h,stride,clip*`）与三条 present 路径；
     `blit_image` 还挂着 C 里的 stb_image 解码缓存（解码留 C，只搬采样循环）。
     Windows present 已经只要 `pixels/w/h`（`Win32Shell.Blit`），不构成阻塞。
+  - 〔查过一次，不是缺陷，记下来省得下次再查〕`conformance_gui_icon` 一度要跑
+    **331 秒**（全套 `ctest -j8` 的最大热点，还会把并发跑的 wechat determinism
+    挤超时）：`Icon.Draw` 在 box ≤ 15 时每次 7～15 秒，box 16 起 0 毫秒。
+    起因是 `build/` 里的 `zan_gui.dll` 是旧源码编出来的存货——`cmake --build
+    build --target zan_gui` 重编一次之后同一个用例 **0.07 秒**。当前
+    `src/runtime/gui_runtime.c` 的 `zan_gui_draw_line` 没有这个问题。
+    `ctest` 不负责重编 driver DLL，量 GUI 性能前先重编它。
 * **B5-2 🟡 大部分完成**（`067ec4e` 删掉 C Win32 shell 与 link-only shims）。
   〔2026-07-29 核实〕`gui_runtime_shims.c` 从 160 行降到 3.5KB，里面**只剩
   macOS 非-Cocoa（SDL windowing）构建的 22 个 WebView no-op 桩**（`#if defined(__APPLE__)
