@@ -1517,7 +1517,7 @@ header-only 库 / C 回调 / 结构体字段偏移，全部对应 A2 / A3 / A4�
   `internal_surface_data/clip` 两个内部口子随之删除，其余全是跟随项。
   动手前先给 `blur_rect` / `fill_radial` / `blit_image` 做基准，
   它们是玻璃主题下单帧最贵的循环。
-  - **✅ 阶段 0 基准已做（2026-07-29）**：`_scratch/b51_bench.zan`（`zanc` 编译，
+  - **✅ 阶段 0 基准已做（2026-07-29）**：`tests/gui/raster_bench.zan`（`zanc` 编译，
     1600×900 surface，QueryPerformanceCounter 计时）。**C 版基线**：
     `blur_rect` 800×500 r=24 = **3916 µs/op**（20 次）、
     `fill_radial` r=300 = **1469 µs/op**（200 次）、
