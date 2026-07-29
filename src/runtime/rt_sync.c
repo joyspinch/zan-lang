@@ -642,9 +642,26 @@ static int g_dispatch_head = 0;
 static int g_dispatch_tail = 0;
 
 #ifdef _WIN32
+/* The lock is created by the OS on first use rather than by a `ready` flag the
+ * callers test: two threads posting for the first time both saw the flag clear
+ * and both ran InitializeCriticalSection on the same section, and a thread
+ * could enter it while the other was still initializing it. zan_dispatch_take
+ * did not check the flag at all, so draining before the first post entered an
+ * uninitialized section. */
 static CRITICAL_SECTION g_dispatch_cs;
-static int g_dispatch_ready = 0;
-static void zan_dispatch_lock(void) { EnterCriticalSection(&g_dispatch_cs); }
+static INIT_ONCE g_dispatch_once = INIT_ONCE_STATIC_INIT;
+
+static BOOL CALLBACK zan_dispatch_cs_init(PINIT_ONCE once, PVOID param,
+                                          PVOID *ctx) {
+    (void)once; (void)param; (void)ctx;
+    InitializeCriticalSection(&g_dispatch_cs);
+    return TRUE;
+}
+
+static void zan_dispatch_lock(void) {
+    InitOnceExecuteOnce(&g_dispatch_once, zan_dispatch_cs_init, NULL, NULL);
+    EnterCriticalSection(&g_dispatch_cs);
+}
 static void zan_dispatch_unlock(void) { LeaveCriticalSection(&g_dispatch_cs); }
 #else
 static pthread_mutex_t g_dispatch_mx = PTHREAD_MUTEX_INITIALIZER;
@@ -654,12 +671,6 @@ static void zan_dispatch_unlock(void) { pthread_mutex_unlock(&g_dispatch_mx); }
 
 /* Initialise the queue on the UI thread before any worker is spawned. */
 void zan_dispatch_init(void) {
-#ifdef _WIN32
-    if (!g_dispatch_ready) {
-        InitializeCriticalSection(&g_dispatch_cs);
-        g_dispatch_ready = 1;
-    }
-#endif
     zan_dispatch_lock();
     g_dispatch_head = 0;
     g_dispatch_tail = 0;
@@ -670,9 +681,6 @@ void zan_dispatch_init(void) {
  * success, 0 if the delegate was null or the queue was full. */
 int32_t zan_dispatch_post(void *fn) {
     if (!fn) return 0;
-#ifdef _WIN32
-    if (!g_dispatch_ready) zan_dispatch_init();
-#endif
     int32_t ok = 0;
     zan_dispatch_lock();
     int next = (g_dispatch_tail + 1) % ZAN_DISPATCH_CAP;

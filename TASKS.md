@@ -479,6 +479,15 @@ static extern int zan_gui_present(int hwnd, int surfaceId);
   （同一段字符串搬运，托管版必须有 ARC 调用、`[NoRuntime]` 版必须一个都没有——
   前者同时保证这个断言不是空转）。
   （`unsafe` 仍只是 `parser.c:232` 的一个 modifier bit，`TK_UNSAFE` 全库出现 4 次、无语义）
+* **B7-4** ✅ dispatch 队列首次使用竞态（`rt_sync.c`）。Windows 上锁是由"谁先看到
+  `g_dispatch_ready` 为 0 谁就 `InitializeCriticalSection`"创建的：两个后台线程首次
+  `Post` 会同时初始化同一个 section，且一方可能在另一方初始化完成前就 Enter；
+  `zan_dispatch_take` 根本不看这个标志，先 drain 后 post 就是在未初始化的 section 上
+  Enter。改用 `INIT_ONCE`（和 monitor stripe 同一套）。
+  用例：`tests/conformance/dispatch_first_use.zan`（先 drain 空队列，再 4 线程并发首次 Post）。
+  顺带把 `zan_atomic_int` 的所有权契约写进 `rt_sync.h`：并发 destroy 与 load 是调用方的
+  use-after-free（同 C# Dispose），句柄本身防不住，也不该假装能防。
+
 * **A4-2** 🟡 外部线程 attach / detach。attach 本来就是隐式的：线程第一次用到
   EH 状态时 `__zan_eh_state()` 会给它建块。缺的是 detach ——
   块从来不释放，槽位表只有 1024 个且用尽即 `exit`：**1200 个同时存在、各抛一次异常的线程直接

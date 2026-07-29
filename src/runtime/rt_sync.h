@@ -28,6 +28,12 @@ void zan_dispatch_init(void);
 int32_t zan_dispatch_post(void *fn);
 void *zan_dispatch_take(void);
 
+/* A process-local atomic i64 behind an opaque handle. Every operation on a
+ * live handle is safe from any thread; destroying one is not an operation on
+ * it but the end of its life, so the owner must have joined or otherwise
+ * excluded every user first -- as with C# Dispose, a concurrent destroy and
+ * load is a use-after-free in the caller, not something the handle can defend
+ * against. */
 int64_t zan_atomic_int_create(int64_t initial_value);
 void zan_atomic_int_destroy(int64_t handle);
 int64_t zan_atomic_int_load(int64_t handle);
