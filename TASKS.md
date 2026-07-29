@@ -1559,7 +1559,7 @@ header-only 库 / C 回调 / 结构体字段偏移，全部对应 A2 / A3 / A4�
     文字导出的签名（`surface_id` → `ptr,w,h,stride,clip*`）与三条 present 路径；
     `blit_image` 还挂着 C 里的 stb_image 解码缓存（解码留 C，只搬采样循环）。
     Windows present 已经只要 `pixels/w/h`（`Win32Shell.Blit`），不构成阻塞。
-  - 〔已定位并修掉，`d9dcf1c`〕`conformance_gui_icon` 一度要跑 **331 秒**（全套
+  - 〔已定位并修掉，`92d5826`〕`conformance_gui_icon` 一度要跑 **331 秒**（全套
     `ctest -j8` 的最大热点，还会把并发跑的 wechat determinism 挤超时）：
     `Icon.Draw` 在 box ≤ 15 时每次 7～15 秒，box 16 起 0 毫秒。真正的原因是
     **仓库里签入的 `stdlib/Gui/drivers/win-x64/zan_gui.dll` 是 7-27 的存货**，
