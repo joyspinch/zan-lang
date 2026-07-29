@@ -26,43 +26,42 @@
  * real backend is added here it should map profile_id to that engine's data
  * partitioning -- a WKWebsiteDataStore with a per-profile identifier. Until
  * then it is a no-op stub. */
-EXPORT i64 zan_gui_webview_create(iptr hwnd, const char *profile_id) {
+EXPORT i32 zan_gui_webview_create(iptr hwnd, const char *profile_id) {
     (void)hwnd; (void)profile_id; return 0;
 }
-EXPORT void zan_gui_webview_destroy(i64 h) { (void)h; }
-EXPORT void zan_gui_webview_set_frame(i64 h, i64 x, i64 y, i64 w, i64 hh) {
+EXPORT void zan_gui_webview_destroy(i32 h) { (void)h; }
+EXPORT void zan_gui_webview_set_frame(i32 h, i32 x, i32 y, i32 w, i32 hh) {
     (void)h; (void)x; (void)y; (void)w; (void)hh;
 }
-EXPORT void zan_gui_webview_set_visible(i64 h, i64 visible) {
+EXPORT void zan_gui_webview_set_visible(i32 h, i32 visible) {
     (void)h; (void)visible;
 }
-EXPORT void zan_gui_webview_navigate(i64 h, const char *url) {
+EXPORT void zan_gui_webview_navigate(i32 h, const char *url) {
     (void)h; (void)url;
 }
-EXPORT void zan_gui_webview_load_html(i64 h, const char *html, const char *base_url) {
+EXPORT void zan_gui_webview_load_html(i32 h, const char *html, const char *base_url) {
     (void)h; (void)html; (void)base_url;
 }
-EXPORT void zan_gui_webview_back(i64 h) { (void)h; }
-EXPORT void zan_gui_webview_forward(i64 h) { (void)h; }
-EXPORT void zan_gui_webview_reload(i64 h) { (void)h; }
-EXPORT void zan_gui_webview_stop(i64 h) { (void)h; }
-EXPORT i64 zan_gui_webview_can_go_back(i64 h) { (void)h; return 0; }
-EXPORT i64 zan_gui_webview_can_go_forward(i64 h) { (void)h; return 0; }
-EXPORT i64 zan_gui_webview_is_loading(i64 h) { (void)h; return 0; }
-EXPORT i64 zan_gui_webview_nav_seq(i64 h) { (void)h; return 0; }
-EXPORT i64 zan_gui_webview_last_status(i64 h) { (void)h; return 0; }
-EXPORT const char *zan_gui_webview_get_url(i64 h) { (void)h; return ""; }
-EXPORT const char *zan_gui_webview_get_title(i64 h) { (void)h; return ""; }
-EXPORT const char *zan_gui_webview_last_request(i64 h) { (void)h; return ""; }
-EXPORT const char *zan_gui_webview_eval(i64 h, const char *js) {
+EXPORT void zan_gui_webview_back(i32 h) { (void)h; }
+EXPORT void zan_gui_webview_forward(i32 h) { (void)h; }
+EXPORT void zan_gui_webview_reload(i32 h) { (void)h; }
+EXPORT void zan_gui_webview_stop(i32 h) { (void)h; }
+EXPORT i32 zan_gui_webview_can_go_back(i32 h) { (void)h; return 0; }
+EXPORT i32 zan_gui_webview_can_go_forward(i32 h) { (void)h; return 0; }
+EXPORT i32 zan_gui_webview_is_loading(i32 h) { (void)h; return 0; }
+EXPORT i32 zan_gui_webview_nav_seq(i32 h) { (void)h; return 0; }
+EXPORT i32 zan_gui_webview_last_status(i32 h) { (void)h; return 0; }
+EXPORT const char *zan_gui_webview_get_url(i32 h) { (void)h; return ""; }
+EXPORT const char *zan_gui_webview_get_title(i32 h) { (void)h; return ""; }
+EXPORT const char *zan_gui_webview_last_request(i32 h) { (void)h; return ""; }
+EXPORT const char *zan_gui_webview_eval(i32 h, const char *js) {
     (void)h; (void)js; return "";
 }
-EXPORT const char *zan_gui_webview_get_cookies(i64 h, const char *url) {
+EXPORT const char *zan_gui_webview_get_cookies(i32 h, const char *url) {
     (void)h; (void)url; return "";
 }
-EXPORT void zan_gui_webview_set_cookie(i64 h, const char *url,
-                                       const char *name, const char *value) {
+EXPORT void zan_gui_webview_set_cookie(i32 h, const char *url, const char *name, const char *value) {
     (void)h; (void)url; (void)name; (void)value;
 }
-EXPORT void zan_gui_webview_clear_cookies(i64 h) { (void)h; }
+EXPORT void zan_gui_webview_clear_cookies(i32 h) { (void)h; }
 #endif

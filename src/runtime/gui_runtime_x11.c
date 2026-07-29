@@ -58,8 +58,8 @@ static zan_lwin_t *lwin_find(Window xid) {
     return NULL;
 }
 
-i64 zan_gui_get_dpi_scale(void);
-i64 zan_gui_is_maximized(iptr hwnd_val);
+i32 zan_gui_get_dpi_scale(void);
+i32 zan_gui_is_maximized(iptr hwnd_val);
 
 /* Decoded-event queue: a single XEvent can yield several ABI events (a key
  * press -> keyDown + textInput; a wheel button -> scroll), so decoded events
@@ -219,7 +219,7 @@ static int x11_caption_hit(zan_lwin_t *lw, int x, int y) {
     int w = lw->w, h = lw->h;
     int capW = g_caption_btn_count_l * g_btn_w_l;
     int inCaptionDrag = (y < g_titlebar_h_l && x < w - capW);
-    if (zan_gui_is_maximized((i64)lw->xid)) {
+    if (zan_gui_is_maximized((iptr)lw->xid)) {
         return inCaptionDrag ? ZAN_NWMR_MOVE : -1;
     }
     int b = 8 * g_scale_linux / 100;
@@ -374,7 +374,7 @@ static void x11_translate_event(XEvent *ev) {
     }
 }
 
-EXPORT iptr zan_gui_create_window(const char *title, i64 width, i64 height) {
+EXPORT iptr zan_gui_create_window(const char *title, i32 width, i32 height) {
     if (!g_display) {
         g_display = XOpenDisplay(NULL);
         if (!g_display) return 0;
@@ -466,7 +466,7 @@ EXPORT iptr zan_gui_create_window(const char *title, i64 width, i64 height) {
     return (i64)xid;
 }
 
-EXPORT i64 zan_gui_show_window(i64 win) {
+EXPORT i32 zan_gui_show_window(iptr win) {
     Window xid = win ? (Window)(intptr_t)win : g_x11_window;
     if (g_display && xid) {
         XMapWindow(g_display, xid);
@@ -475,7 +475,7 @@ EXPORT i64 zan_gui_show_window(i64 win) {
     return 0;
 }
 
-EXPORT i64 zan_gui_wait_event(void) {
+EXPORT i32 zan_gui_wait_event(void) {
     if (!g_display) return -1;
     memset(g_pending_event_linux, 0, sizeof(g_pending_event_linux));
     if (evq_pop_linux()) return 0;
@@ -521,7 +521,7 @@ EXPORT i64 zan_gui_wait_event(void) {
 /* Like wait_event but gives up after `ms` milliseconds. Returns 0 when an
  * event was delivered, 1 on timeout, -1 on error. Lets an animation loop idle
  * in the kernel until either input arrives or its next frame deadline. */
-EXPORT i64 zan_gui_wait_event_timeout(i64 ms) {
+EXPORT i32 zan_gui_wait_event_timeout(i32 ms) {
     if (!g_display) return -1;
     memset(g_pending_event_linux, 0, sizeof(g_pending_event_linux));
     if (evq_pop_linux()) return 0;
@@ -571,7 +571,7 @@ EXPORT i64 zan_gui_wait_event_timeout(i64 ms) {
 /* Wake a UI thread blocked in wait_event so it can drain the dispatch queue.
  * write() is async-signal-safe and thread-safe, so this is callable from any
  * thread even though Xlib is not. */
-EXPORT i64 zan_gui_wake(void) {
+EXPORT i32 zan_gui_wake(void) {
     if (g_wake_pipe[1] >= 0) {
         char b = 1;
         ssize_t n = write(g_wake_pipe[1], &b, 1);
@@ -580,7 +580,7 @@ EXPORT i64 zan_gui_wake(void) {
     return 0;
 }
 
-EXPORT i64 zan_gui_poll_event(void) {
+EXPORT i32 zan_gui_poll_event(void) {
     if (!g_display) return -1;
     memset(g_pending_event_linux, 0, sizeof(g_pending_event_linux));
     if (evq_pop_linux()) return 0;
@@ -602,34 +602,34 @@ EXPORT i64 zan_gui_poll_event(void) {
  * drained by poll/wait_event like a real X11 event so App dispatch is
  * exercised unchanged. Called on the UI thread. hwnd_val is unused here (the
  * X11 backend tracks the source window internally). */
-EXPORT i64 zan_gui_inject_event(iptr hwnd_val, i64 kind, i64 x, i64 y,
-                                i64 button, i64 keycode, i64 mods) {
+EXPORT i32 zan_gui_inject_event(
+    iptr hwnd_val, i32 kind, i32 x, i32 y, i32 button, i32 keycode, i32 mods) {
     (void)hwnd_val;
     evq_push_linux((int)kind, (int)x, (int)y, (int)button, (int)keycode, (int)mods);
     zan_gui_wake();
     return 0;
 }
 
-EXPORT i64 zan_gui_inject_pending(void) {
+EXPORT i32 zan_gui_inject_pending(void) {
     return (g_evq_tail_linux - g_evq_head_linux + ZAN_EVQ_CAP) % ZAN_EVQ_CAP;
 }
 
-EXPORT i64 zan_gui_event_kind(void)    { return g_pending_event_linux[0]; }
-EXPORT i64 zan_gui_event_x(void)       { return g_pending_event_linux[1]; }
-EXPORT i64 zan_gui_event_y(void)       { return g_pending_event_linux[2]; }
-EXPORT i64 zan_gui_event_button(void)  { return g_pending_event_linux[3]; }
-EXPORT i64 zan_gui_event_keycode(void) { return g_pending_event_linux[4]; }
-EXPORT i64 zan_gui_event_mods(void)    { return g_pending_event_linux[5]; }
+EXPORT i32 zan_gui_event_kind(void)    { return g_pending_event_linux[0]; }
+EXPORT i32 zan_gui_event_x(void)       { return g_pending_event_linux[1]; }
+EXPORT i32 zan_gui_event_y(void)       { return g_pending_event_linux[2]; }
+EXPORT i32 zan_gui_event_button(void)  { return g_pending_event_linux[3]; }
+EXPORT i32 zan_gui_event_keycode(void) { return g_pending_event_linux[4]; }
+EXPORT i32 zan_gui_event_mods(void)    { return g_pending_event_linux[5]; }
 
-EXPORT i64 zan_gui_window_width(void)  { return g_win_w; }
-EXPORT i64 zan_gui_window_height(void) { return g_win_h; }
+EXPORT i32 zan_gui_window_width(void)  { return g_win_w; }
+EXPORT i32 zan_gui_window_height(void) { return g_win_h; }
 
 EXPORT iptr zan_gui_event_hwnd(void)    { return (iptr)(unsigned)g_pending_event_linux[6]; }
-EXPORT i64 zan_gui_client_width(iptr hwnd_val) {
+EXPORT i32 zan_gui_client_width(iptr hwnd_val) {
     zan_lwin_t *w = lwin_find((Window)(intptr_t)hwnd_val);
     return w ? w->w : g_win_w;
 }
-EXPORT i64 zan_gui_client_height(iptr hwnd_val) {
+EXPORT i32 zan_gui_client_height(iptr hwnd_val) {
     zan_lwin_t *w = lwin_find((Window)(intptr_t)hwnd_val);
     return w ? w->h : g_win_h;
 }
@@ -642,7 +642,7 @@ static int g_dirty[ZAN_DIRTY_MAX * 4];
 static int g_dirty_count;
 static int g_dirty_overflow;
 
-EXPORT i64 zan_gui_present_dirty_add(i64 x, i64 y, i64 w, i64 h) {
+EXPORT i32 zan_gui_present_dirty_add(i32 x, i32 y, i32 w, i32 h) {
     if (w <= 0 || h <= 0) return 0;
     if (g_dirty_count >= ZAN_DIRTY_MAX) { g_dirty_overflow = 1; return 0; }
     g_dirty[g_dirty_count * 4 + 0] = (int)x;
@@ -653,7 +653,7 @@ EXPORT i64 zan_gui_present_dirty_add(i64 x, i64 y, i64 w, i64 h) {
     return 0;
 }
 
-EXPORT i64 zan_gui_present(iptr hwnd_val, i64 surface_id) {
+EXPORT i32 zan_gui_present(iptr hwnd_val, i32 surface_id) {
     if (!g_display) return 1;
     zan_lwin_t *w = lwin_find((Window)(intptr_t)hwnd_val);
     if (!w && g_lwin_count > 0) w = &g_lwins[0];
@@ -712,7 +712,7 @@ EXPORT i64 zan_gui_present(iptr hwnd_val, i64 surface_id) {
     return 0;
 }
 
-EXPORT i64 zan_gui_set_title(iptr hwnd_val, const char *title) {
+EXPORT i32 zan_gui_set_title(iptr hwnd_val, const char *title) {
     Window xid = hwnd_val ? (Window)(intptr_t)hwnd_val : g_x11_window;
     if (g_display && xid) {
         XStoreName(g_display, xid, title);
@@ -721,7 +721,7 @@ EXPORT i64 zan_gui_set_title(iptr hwnd_val, const char *title) {
     return 0;
 }
 
-EXPORT i64 zan_gui_set_cursor(i64 cursor_type) {
+EXPORT i32 zan_gui_set_cursor(i32 cursor_type) {
     if (!g_display || g_lwin_count == 0) return 1;
     int slot = (int)cursor_type;
     if (slot < 0 || slot >= 8) slot = 0;
@@ -746,7 +746,7 @@ EXPORT i64 zan_gui_get_tick_ms(void) {
     return (i64)(ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
 }
 
-EXPORT void zan_gui_sleep_ms(i64 ms) {
+EXPORT void zan_gui_sleep_ms(i32 ms) {
     if (ms <= 0) return;
     struct timespec req;
     req.tv_sec = (time_t)(ms / 1000);

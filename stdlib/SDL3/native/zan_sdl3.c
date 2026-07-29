@@ -14,6 +14,8 @@
 #define ZAN_SDL_API __attribute__((visibility("default")))
 #endif
 
+typedef int32_t zan_i32;
+typedef intptr_t zan_iptr;
 typedef int64_t zan_i64;
 
 static SDL_Event zan_last_event;
@@ -30,7 +32,7 @@ static zan_i64 zan_handle(const void *ptr) {
     return (zan_i64)(intptr_t)ptr;
 }
 
-ZAN_SDL_API zan_i64 zan_sdl_init(zan_i64 flags) {
+ZAN_SDL_API zan_i32 zan_sdl_init(zan_i32 flags) {
     return zan_bool(SDL_Init((SDL_InitFlags)(uint32_t)flags));
 }
 
@@ -43,7 +45,7 @@ ZAN_SDL_API const char *zan_sdl_get_error(void) {
     return error ? error : "";
 }
 
-ZAN_SDL_API zan_i64 zan_sdl_version(void) {
+ZAN_SDL_API zan_i32 zan_sdl_version(void) {
     return (zan_i64)SDL_GetVersion();
 }
 
@@ -51,79 +53,77 @@ ZAN_SDL_API zan_i64 zan_sdl_ticks(void) {
     return (zan_i64)SDL_GetTicks();
 }
 
-ZAN_SDL_API void zan_sdl_delay(zan_i64 milliseconds) {
+ZAN_SDL_API void zan_sdl_delay(zan_i32 milliseconds) {
     SDL_Delay((uint32_t)milliseconds);
 }
 
-ZAN_SDL_API zan_i64 zan_sdl_create_window(
-    const char *title, zan_i64 width, zan_i64 height, zan_i64 flags) {
+ZAN_SDL_API zan_iptr zan_sdl_create_window(const char *title, zan_i32 width, zan_i32 height, zan_i32 flags) {
     SDL_Window *window = SDL_CreateWindow(
         title ? title : "", (int)width, (int)height, (SDL_WindowFlags)(uint64_t)flags);
     return zan_handle(window);
 }
 
-ZAN_SDL_API void zan_sdl_destroy_window(zan_i64 window) {
+ZAN_SDL_API void zan_sdl_destroy_window(zan_iptr window) {
     if (window) SDL_DestroyWindow((SDL_Window *)zan_ptr(window));
 }
 
-ZAN_SDL_API zan_i64 zan_sdl_window_id(zan_i64 window) {
+ZAN_SDL_API zan_i32 zan_sdl_window_id(zan_iptr window) {
     return window ? (zan_i64)SDL_GetWindowID((SDL_Window *)zan_ptr(window)) : 0;
 }
 
-ZAN_SDL_API zan_i64 zan_sdl_window_width(zan_i64 window) {
+ZAN_SDL_API zan_i32 zan_sdl_window_width(zan_iptr window) {
     int width = 0;
     if (!window || !SDL_GetWindowSize((SDL_Window *)zan_ptr(window), &width, NULL)) return 0;
     return (zan_i64)width;
 }
 
-ZAN_SDL_API zan_i64 zan_sdl_window_height(zan_i64 window) {
+ZAN_SDL_API zan_i32 zan_sdl_window_height(zan_iptr window) {
     int height = 0;
     if (!window || !SDL_GetWindowSize((SDL_Window *)zan_ptr(window), NULL, &height)) return 0;
     return (zan_i64)height;
 }
 
-ZAN_SDL_API zan_i64 zan_sdl_set_window_title(zan_i64 window, const char *title) {
+ZAN_SDL_API zan_i32 zan_sdl_set_window_title(zan_iptr window, const char *title) {
     if (!window) return 0;
     return zan_bool(SDL_SetWindowTitle((SDL_Window *)zan_ptr(window), title ? title : ""));
 }
 
-ZAN_SDL_API zan_i64 zan_sdl_set_window_fullscreen(zan_i64 window, zan_i64 enabled) {
+ZAN_SDL_API zan_i32 zan_sdl_set_window_fullscreen(zan_iptr window, zan_i32 enabled) {
     if (!window) return 0;
     return zan_bool(SDL_SetWindowFullscreen((SDL_Window *)zan_ptr(window), enabled != 0));
 }
 
-ZAN_SDL_API zan_i64 zan_sdl_show_window(zan_i64 window) {
+ZAN_SDL_API zan_i32 zan_sdl_show_window(zan_iptr window) {
     return window ? zan_bool(SDL_ShowWindow((SDL_Window *)zan_ptr(window))) : 0;
 }
 
-ZAN_SDL_API zan_i64 zan_sdl_hide_window(zan_i64 window) {
+ZAN_SDL_API zan_i32 zan_sdl_hide_window(zan_iptr window) {
     return window ? zan_bool(SDL_HideWindow((SDL_Window *)zan_ptr(window))) : 0;
 }
 
-ZAN_SDL_API zan_i64 zan_sdl_create_renderer(zan_i64 window, const char *name) {
+ZAN_SDL_API zan_iptr zan_sdl_create_renderer(zan_iptr window, const char *name) {
     if (!window) return 0;
     if (name && name[0] == '\0') name = NULL;
     return zan_handle(SDL_CreateRenderer((SDL_Window *)zan_ptr(window), name));
 }
 
-ZAN_SDL_API void zan_sdl_destroy_renderer(zan_i64 renderer) {
+ZAN_SDL_API void zan_sdl_destroy_renderer(zan_iptr renderer) {
     if (renderer) SDL_DestroyRenderer((SDL_Renderer *)zan_ptr(renderer));
 }
 
-ZAN_SDL_API const char *zan_sdl_renderer_name(zan_i64 renderer) {
+ZAN_SDL_API const char *zan_sdl_renderer_name(zan_iptr renderer) {
     const char *name = renderer
         ? SDL_GetRendererName((SDL_Renderer *)zan_ptr(renderer))
         : NULL;
     return name ? name : "";
 }
 
-ZAN_SDL_API zan_i64 zan_sdl_set_render_vsync(zan_i64 renderer, zan_i64 enabled) {
+ZAN_SDL_API zan_i32 zan_sdl_set_render_vsync(zan_iptr renderer, zan_i32 enabled) {
     if (!renderer) return 0;
     return zan_bool(SDL_SetRenderVSync((SDL_Renderer *)zan_ptr(renderer), enabled ? 1 : 0));
 }
 
-ZAN_SDL_API zan_i64 zan_sdl_set_logical_size(
-    zan_i64 renderer, zan_i64 width, zan_i64 height, zan_i64 mode) {
+ZAN_SDL_API zan_i32 zan_sdl_set_logical_size(zan_iptr renderer, zan_i32 width, zan_i32 height, zan_i32 mode) {
     if (!renderer) return 0;
     return zan_bool(SDL_SetRenderLogicalPresentation(
         (SDL_Renderer *)zan_ptr(renderer),
@@ -132,8 +132,7 @@ ZAN_SDL_API zan_i64 zan_sdl_set_logical_size(
         (SDL_RendererLogicalPresentation)mode));
 }
 
-ZAN_SDL_API double zan_sdl_window_to_render_x(
-    zan_i64 renderer, double window_x, double window_y) {
+ZAN_SDL_API double zan_sdl_window_to_render_x(zan_iptr renderer, double window_x, double window_y) {
     if (!renderer) return window_x;
     float x = (float)window_x;
     float y = (float)window_y;
@@ -148,8 +147,7 @@ ZAN_SDL_API double zan_sdl_window_to_render_x(
     return (double)x;
 }
 
-ZAN_SDL_API double zan_sdl_window_to_render_y(
-    zan_i64 renderer, double window_x, double window_y) {
+ZAN_SDL_API double zan_sdl_window_to_render_y(zan_iptr renderer, double window_x, double window_y) {
     if (!renderer) return window_y;
     float x = (float)window_x;
     float y = (float)window_y;
@@ -164,8 +162,9 @@ ZAN_SDL_API double zan_sdl_window_to_render_y(
     return (double)y;
 }
 
-ZAN_SDL_API zan_i64 zan_sdl_set_draw_color(
-    zan_i64 renderer, zan_i64 red, zan_i64 green, zan_i64 blue, zan_i64 alpha) {
+ZAN_SDL_API zan_i32 zan_sdl_set_draw_color(
+    zan_iptr renderer, zan_i32 red, zan_i32 green, zan_i32 blue,
+    zan_i32 alpha) {
     if (!renderer) return 0;
     if (red == -1)
         return zan_bool(SDL_SetRenderClipRect(
@@ -186,22 +185,21 @@ ZAN_SDL_API zan_i64 zan_sdl_set_draw_color(
         (uint8_t)red, (uint8_t)green, (uint8_t)blue, (uint8_t)alpha));
 }
 
-ZAN_SDL_API zan_i64 zan_sdl_clear(zan_i64 renderer) {
+ZAN_SDL_API zan_i32 zan_sdl_clear(zan_iptr renderer) {
     return renderer ? zan_bool(SDL_RenderClear((SDL_Renderer *)zan_ptr(renderer))) : 0;
 }
 
-ZAN_SDL_API zan_i64 zan_sdl_present(zan_i64 renderer) {
+ZAN_SDL_API zan_i32 zan_sdl_present(zan_iptr renderer) {
     return renderer ? zan_bool(SDL_RenderPresent((SDL_Renderer *)zan_ptr(renderer))) : 0;
 }
 
-ZAN_SDL_API zan_i64 zan_sdl_draw_point(zan_i64 renderer, zan_i64 x, zan_i64 y) {
+ZAN_SDL_API zan_i32 zan_sdl_draw_point(zan_iptr renderer, zan_i32 x, zan_i32 y) {
     return renderer
         ? zan_bool(SDL_RenderPoint((SDL_Renderer *)zan_ptr(renderer), (float)x, (float)y))
         : 0;
 }
 
-ZAN_SDL_API zan_i64 zan_sdl_draw_line(
-    zan_i64 renderer, zan_i64 x1, zan_i64 y1, zan_i64 x2, zan_i64 y2) {
+ZAN_SDL_API zan_i32 zan_sdl_draw_line(zan_iptr renderer, zan_i32 x1, zan_i32 y1, zan_i32 x2, zan_i32 y2) {
     return renderer
         ? zan_bool(SDL_RenderLine(
             (SDL_Renderer *)zan_ptr(renderer),
@@ -218,22 +216,22 @@ static SDL_FRect zan_rect(zan_i64 x, zan_i64 y, zan_i64 width, zan_i64 height) {
     return rect;
 }
 
-ZAN_SDL_API zan_i64 zan_sdl_draw_rect(
-    zan_i64 renderer, zan_i64 x, zan_i64 y, zan_i64 width, zan_i64 height) {
+ZAN_SDL_API zan_i32 zan_sdl_draw_rect(
+    zan_iptr renderer, zan_i32 x, zan_i32 y, zan_i32 width, zan_i32 height) {
     if (!renderer) return 0;
     SDL_FRect rect = zan_rect(x, y, width, height);
     return zan_bool(SDL_RenderRect((SDL_Renderer *)zan_ptr(renderer), &rect));
 }
 
-ZAN_SDL_API zan_i64 zan_sdl_fill_rect(
-    zan_i64 renderer, zan_i64 x, zan_i64 y, zan_i64 width, zan_i64 height) {
+ZAN_SDL_API zan_i32 zan_sdl_fill_rect(
+    zan_iptr renderer, zan_i32 x, zan_i32 y, zan_i32 width, zan_i32 height) {
     if (!renderer) return 0;
     SDL_FRect rect = zan_rect(x, y, width, height);
     return zan_bool(SDL_RenderFillRect((SDL_Renderer *)zan_ptr(renderer), &rect));
 }
 
-ZAN_SDL_API zan_i64 zan_sdl_create_texture_rgba32(
-    zan_i64 renderer, zan_i64 width, zan_i64 height, zan_i64 streaming) {
+ZAN_SDL_API zan_iptr zan_sdl_create_texture_rgba32(
+    zan_iptr renderer, zan_i32 width, zan_i32 height, zan_i32 streaming) {
     if (!renderer) return 0;
     SDL_TextureAccess access = streaming
         ? SDL_TEXTUREACCESS_STREAMING
@@ -248,7 +246,7 @@ ZAN_SDL_API zan_i64 zan_sdl_create_texture_rgba32(
     return zan_handle(texture);
 }
 
-ZAN_SDL_API zan_i64 zan_sdl_load_bmp_texture(zan_i64 renderer, const char *path) {
+ZAN_SDL_API zan_iptr zan_sdl_load_bmp_texture(zan_iptr renderer, const char *path) {
     if (!renderer || !path) return 0;
     SDL_Surface *surface = SDL_LoadBMP(path);
     if (!surface) return 0;
@@ -258,12 +256,9 @@ ZAN_SDL_API zan_i64 zan_sdl_load_bmp_texture(zan_i64 renderer, const char *path)
     return zan_handle(texture);
 }
 
-ZAN_SDL_API zan_i64 zan_sdl_load_bmp_texture_colorkey(
-    zan_i64 renderer,
-    const char *path,
-    zan_i64 red,
-    zan_i64 green,
-    zan_i64 blue) {
+ZAN_SDL_API zan_iptr zan_sdl_load_bmp_texture_colorkey(
+    zan_iptr renderer, const char *path, zan_i32 red, zan_i32 green,
+    zan_i32 blue) {
     if (!renderer || !path) return 0;
     SDL_Surface *surface = SDL_LoadBMP(path);
     if (!surface) return 0;
@@ -280,9 +275,7 @@ ZAN_SDL_API zan_i64 zan_sdl_load_bmp_texture_colorkey(
     return zan_handle(texture);
 }
 
-ZAN_SDL_API zan_i64 zan_sdl_load_image_texture(
-    zan_i64 renderer,
-    const char *path) {
+ZAN_SDL_API zan_iptr zan_sdl_load_image_texture(zan_iptr renderer, const char *path) {
     if (!renderer || !path) return 0;
     int width = 0;
     int height = 0;
@@ -311,18 +304,17 @@ ZAN_SDL_API zan_i64 zan_sdl_load_image_texture(
     return zan_handle(texture);
 }
 
-ZAN_SDL_API void zan_sdl_destroy_texture(zan_i64 texture) {
+ZAN_SDL_API void zan_sdl_destroy_texture(zan_iptr texture) {
     if (texture) SDL_DestroyTexture((SDL_Texture *)zan_ptr(texture));
 }
 
-ZAN_SDL_API zan_i64 zan_sdl_update_texture(
-    zan_i64 texture, const void *pixels, zan_i64 pitch) {
+ZAN_SDL_API zan_i32 zan_sdl_update_texture(zan_iptr texture, const void *pixels, zan_i32 pitch) {
     if (!texture || !pixels) return 0;
     return zan_bool(SDL_UpdateTexture(
         (SDL_Texture *)zan_ptr(texture), NULL, pixels, (int)pitch));
 }
 
-ZAN_SDL_API zan_i64 zan_sdl_set_texture_nearest(zan_i64 texture, zan_i64 nearest) {
+ZAN_SDL_API zan_i32 zan_sdl_set_texture_nearest(zan_iptr texture, zan_i32 nearest) {
     if (!texture) return 0;
     if (nearest >= 256)
         return zan_bool(SDL_SetTextureAlphaMod(
@@ -331,9 +323,9 @@ ZAN_SDL_API zan_i64 zan_sdl_set_texture_nearest(zan_i64 texture, zan_i64 nearest
     return zan_bool(SDL_SetTextureScaleMode((SDL_Texture *)zan_ptr(texture), mode));
 }
 
-ZAN_SDL_API zan_i64 zan_sdl_render_texture(
-    zan_i64 renderer, zan_i64 texture,
-    zan_i64 x, zan_i64 y, zan_i64 width, zan_i64 height) {
+ZAN_SDL_API zan_i32 zan_sdl_render_texture(
+    zan_iptr renderer, zan_iptr texture, zan_i32 x, zan_i32 y,
+    zan_i32 width, zan_i32 height) {
     if (!renderer || !texture) return 0;
     uint64_t packed = (uint64_t)width;
     int actual_width = (int)(uint32_t)packed;
@@ -369,8 +361,7 @@ static SDL_BlendMode zan_blend_mode(zan_i64 mode) {
     return SDL_BLENDMODE_BLEND;
 }
 
-ZAN_SDL_API zan_i64 zan_sdl_create_target_texture(
-    zan_i64 renderer, zan_i64 width, zan_i64 height) {
+ZAN_SDL_API zan_iptr zan_sdl_create_target_texture(zan_iptr renderer, zan_i32 width, zan_i32 height) {
     if (!renderer) return 0;
     SDL_Texture *texture = SDL_CreateTexture(
         (SDL_Renderer *)zan_ptr(renderer),
@@ -381,16 +372,15 @@ ZAN_SDL_API zan_i64 zan_sdl_create_target_texture(
     return zan_handle(texture);
 }
 
-ZAN_SDL_API zan_i64 zan_sdl_set_render_target(zan_i64 renderer, zan_i64 texture) {
+ZAN_SDL_API zan_i32 zan_sdl_set_render_target(zan_iptr renderer, zan_iptr texture) {
     if (!renderer) return 0;
     SDL_Texture *tex = texture ? (SDL_Texture *)zan_ptr(texture) : NULL;
     return zan_bool(SDL_SetRenderTarget((SDL_Renderer *)zan_ptr(renderer), tex));
 }
 
-ZAN_SDL_API zan_i64 zan_sdl_render_texture_region(
-    zan_i64 renderer, zan_i64 texture,
-    zan_i64 sx, zan_i64 sy, zan_i64 sw, zan_i64 sh,
-    zan_i64 dx, zan_i64 dy, zan_i64 dw, zan_i64 dh) {
+ZAN_SDL_API zan_i32 zan_sdl_render_texture_region(
+    zan_iptr renderer, zan_iptr texture, zan_i32 sx, zan_i32 sy,
+    zan_i32 sw, zan_i32 sh, zan_i32 dx, zan_i32 dy, zan_i32 dw, zan_i32 dh) {
     if (!renderer || !texture) return 0;
     SDL_FRect src = zan_rect(sx, sy, sw, sh);
     SDL_FRect dst = zan_rect(dx, dy, dw, dh);
@@ -399,49 +389,48 @@ ZAN_SDL_API zan_i64 zan_sdl_render_texture_region(
         (SDL_Texture *)zan_ptr(texture), &src, &dst));
 }
 
-ZAN_SDL_API zan_i64 zan_sdl_set_texture_alpha(zan_i64 texture, zan_i64 alpha) {
+ZAN_SDL_API zan_i32 zan_sdl_set_texture_alpha(zan_iptr texture, zan_i32 alpha) {
     if (!texture) return 0;
     return zan_bool(SDL_SetTextureAlphaMod(
         (SDL_Texture *)zan_ptr(texture), (Uint8)alpha));
 }
 
-ZAN_SDL_API zan_i64 zan_sdl_set_texture_color(
-    zan_i64 texture, zan_i64 red, zan_i64 green, zan_i64 blue) {
+ZAN_SDL_API zan_i32 zan_sdl_set_texture_color(zan_iptr texture, zan_i32 red, zan_i32 green, zan_i32 blue) {
     if (!texture) return 0;
     return zan_bool(SDL_SetTextureColorMod(
         (SDL_Texture *)zan_ptr(texture), (Uint8)red, (Uint8)green, (Uint8)blue));
 }
 
-ZAN_SDL_API zan_i64 zan_sdl_set_texture_blend(zan_i64 texture, zan_i64 mode) {
+ZAN_SDL_API zan_i32 zan_sdl_set_texture_blend(zan_iptr texture, zan_i32 mode) {
     if (!texture) return 0;
     return zan_bool(SDL_SetTextureBlendMode(
         (SDL_Texture *)zan_ptr(texture), zan_blend_mode(mode)));
 }
 
-ZAN_SDL_API zan_i64 zan_sdl_set_draw_blend(zan_i64 renderer, zan_i64 mode) {
+ZAN_SDL_API zan_i32 zan_sdl_set_draw_blend(zan_iptr renderer, zan_i32 mode) {
     if (!renderer) return 0;
     return zan_bool(SDL_SetRenderDrawBlendMode(
         (SDL_Renderer *)zan_ptr(renderer), zan_blend_mode(mode)));
 }
 
-ZAN_SDL_API zan_i64 zan_sdl_set_render_clip(
-    zan_i64 renderer, zan_i64 x, zan_i64 y, zan_i64 width, zan_i64 height) {
+ZAN_SDL_API zan_i32 zan_sdl_set_render_clip(
+    zan_iptr renderer, zan_i32 x, zan_i32 y, zan_i32 width, zan_i32 height) {
     if (!renderer) return 0;
     SDL_Rect rect;
     rect.x = (int)x; rect.y = (int)y; rect.w = (int)width; rect.h = (int)height;
     return zan_bool(SDL_SetRenderClipRect((SDL_Renderer *)zan_ptr(renderer), &rect));
 }
 
-ZAN_SDL_API zan_i64 zan_sdl_clear_render_clip(zan_i64 renderer) {
+ZAN_SDL_API zan_i32 zan_sdl_clear_render_clip(zan_iptr renderer) {
     if (!renderer) return 0;
     return zan_bool(SDL_SetRenderClipRect((SDL_Renderer *)zan_ptr(renderer), NULL));
 }
 
-ZAN_SDL_API zan_i64 zan_sdl_poll_event(void) {
+ZAN_SDL_API zan_i32 zan_sdl_poll_event(void) {
     return zan_bool(SDL_PollEvent(&zan_last_event));
 }
 
-ZAN_SDL_API zan_i64 zan_sdl_event_type(void) {
+ZAN_SDL_API zan_i32 zan_sdl_event_type(void) {
     return (zan_i64)zan_last_event.type;
 }
 
@@ -449,31 +438,31 @@ ZAN_SDL_API zan_i64 zan_sdl_event_timestamp(void) {
     return (zan_i64)zan_last_event.common.timestamp;
 }
 
-ZAN_SDL_API zan_i64 zan_sdl_event_window_id(void) {
+ZAN_SDL_API zan_i32 zan_sdl_event_window_id(void) {
     return (zan_i64)zan_last_event.window.windowID;
 }
 
-ZAN_SDL_API zan_i64 zan_sdl_event_data1(void) {
+ZAN_SDL_API zan_i32 zan_sdl_event_data1(void) {
     return (zan_i64)zan_last_event.window.data1;
 }
 
-ZAN_SDL_API zan_i64 zan_sdl_event_data2(void) {
+ZAN_SDL_API zan_i32 zan_sdl_event_data2(void) {
     return (zan_i64)zan_last_event.window.data2;
 }
 
-ZAN_SDL_API zan_i64 zan_sdl_event_scancode(void) {
+ZAN_SDL_API zan_i32 zan_sdl_event_scancode(void) {
     return (zan_i64)zan_last_event.key.scancode;
 }
 
-ZAN_SDL_API zan_i64 zan_sdl_event_keycode(void) {
+ZAN_SDL_API zan_i32 zan_sdl_event_keycode(void) {
     return (zan_i64)zan_last_event.key.key;
 }
 
-ZAN_SDL_API zan_i64 zan_sdl_event_keymod(void) {
+ZAN_SDL_API zan_i32 zan_sdl_event_keymod(void) {
     return (zan_i64)zan_last_event.key.mod;
 }
 
-ZAN_SDL_API zan_i64 zan_sdl_event_repeat(void) {
+ZAN_SDL_API zan_i32 zan_sdl_event_repeat(void) {
     return zan_bool(zan_last_event.key.repeat);
 }
 
@@ -507,11 +496,11 @@ ZAN_SDL_API double zan_sdl_event_mouse_dy(void) {
     return (double)zan_last_event.motion.yrel;
 }
 
-ZAN_SDL_API zan_i64 zan_sdl_event_mouse_button(void) {
+ZAN_SDL_API zan_i32 zan_sdl_event_mouse_button(void) {
     return (zan_i64)zan_last_event.button.button;
 }
 
-ZAN_SDL_API zan_i64 zan_sdl_event_mouse_clicks(void) {
+ZAN_SDL_API zan_i32 zan_sdl_event_mouse_clicks(void) {
     return (zan_i64)zan_last_event.button.clicks;
 }
 
@@ -521,7 +510,7 @@ ZAN_SDL_API const char *zan_sdl_event_text(void) {
     return zan_last_event.text.text;
 }
 
-ZAN_SDL_API zan_i64 zan_sdl_key_down(zan_i64 scancode) {
+ZAN_SDL_API zan_i32 zan_sdl_key_down(zan_i32 scancode) {
     int count = 0;
     const bool *state = SDL_GetKeyboardState(&count);
     if (!state || scancode < 0 || scancode >= count) return 0;
@@ -682,7 +671,7 @@ static void zan_gpu_alloc(ZanGpuCtx *ctx) {
     ctx->vbuf = SDL_CreateGPUBuffer(ctx->device, &bci);
 }
 
-ZAN_SDL_API zan_i64 zan_gpu_create(zan_i64 window) {
+ZAN_SDL_API zan_iptr zan_gpu_create(zan_iptr window) {
     SDL_Window *win = (SDL_Window *)zan_ptr(window);
     if (!win) return 0;
     SDL_GPUDevice *dev = SDL_CreateGPUDevice(SDL_GPU_SHADERFORMAT_MSL, false, NULL);
@@ -700,7 +689,7 @@ ZAN_SDL_API zan_i64 zan_gpu_create(zan_i64 window) {
 
 /* Windowless GPU context that renders into a WxH target read back on the CPU;
  * for headless verification and offscreen composition. */
-ZAN_SDL_API zan_i64 zan_gpu_create_offscreen(zan_i64 width, zan_i64 height) {
+ZAN_SDL_API zan_iptr zan_gpu_create_offscreen(zan_i32 width, zan_i32 height) {
     if (width <= 0 || height <= 0) return 0;
     SDL_GPUDevice *dev = SDL_CreateGPUDevice(SDL_GPU_SHADERFORMAT_MSL, false, NULL);
     if (!dev) return 0;
@@ -729,7 +718,7 @@ ZAN_SDL_API zan_i64 zan_gpu_create_offscreen(zan_i64 width, zan_i64 height) {
 }
 
 /* Read one pixel from the last offscreen frame, packed as 0xRRGGBBAA. */
-ZAN_SDL_API zan_i64 zan_gpu_read_pixel(zan_i64 handle, zan_i64 x, zan_i64 y) {
+ZAN_SDL_API zan_i32 zan_gpu_read_pixel(zan_iptr handle, zan_i32 x, zan_i32 y) {
     ZanGpuCtx *ctx = (ZanGpuCtx *)zan_ptr(handle);
     if (!ctx || !ctx->offscreen || !ctx->cpu) return 0;
     if (x < 0 || y < 0 || (Uint32)x >= ctx->off_w || (Uint32)y >= ctx->off_h) return 0;
@@ -738,7 +727,7 @@ ZAN_SDL_API zan_i64 zan_gpu_read_pixel(zan_i64 handle, zan_i64 x, zan_i64 y) {
            ((zan_i64)p[2] << 8) | (zan_i64)p[3];
 }
 
-ZAN_SDL_API void zan_gpu_destroy(zan_i64 handle) {
+ZAN_SDL_API void zan_gpu_destroy(zan_iptr handle) {
     ZanGpuCtx *ctx = (ZanGpuCtx *)zan_ptr(handle);
     if (!ctx) return;
     if (ctx->vbuf) SDL_ReleaseGPUBuffer(ctx->device, ctx->vbuf);
@@ -800,15 +789,14 @@ static zan_i64 zan_gpu_wrap(SDL_GPUTexture *tex, int w, int h) {
     return zan_handle(t);
 }
 
-ZAN_SDL_API zan_i64 zan_gpu_load_texture(
-    zan_i64 handle, zan_i64 width, zan_i64 height, const void *pixels) {
+ZAN_SDL_API zan_iptr zan_gpu_load_texture(zan_iptr handle, zan_i32 width, zan_i32 height, const void *pixels) {
     ZanGpuCtx *ctx = (ZanGpuCtx *)zan_ptr(handle);
     return zan_gpu_wrap(zan_gpu_make_texture(ctx, (int)width, (int)height, pixels),
                         (int)width, (int)height);
 }
 
 /* Solid white WxH texture; tint it via zan_gpu_draw color to get any color. */
-ZAN_SDL_API zan_i64 zan_gpu_solid_texture(zan_i64 handle, zan_i64 width, zan_i64 height) {
+ZAN_SDL_API zan_iptr zan_gpu_solid_texture(zan_iptr handle, zan_i32 width, zan_i32 height) {
     ZanGpuCtx *ctx = (ZanGpuCtx *)zan_ptr(handle);
     if (!ctx || width <= 0 || height <= 0) return 0;
     size_t bytes = (size_t)(width * height * 4);
@@ -820,7 +808,7 @@ ZAN_SDL_API zan_i64 zan_gpu_solid_texture(zan_i64 handle, zan_i64 width, zan_i64
 }
 
 /* Load a BMP file as an RGBA sampler texture. */
-ZAN_SDL_API zan_i64 zan_gpu_load_bmp(zan_i64 handle, const char *path) {
+ZAN_SDL_API zan_iptr zan_gpu_load_bmp(zan_iptr handle, const char *path) {
     ZanGpuCtx *ctx = (ZanGpuCtx *)zan_ptr(handle);
     if (!ctx || !path) return 0;
     SDL_Surface *s = SDL_LoadBMP(path);
@@ -846,7 +834,7 @@ ZAN_SDL_API zan_i64 zan_gpu_load_bmp(zan_i64 handle, const char *path) {
 }
 
 /* Load PNG, JPEG and other stb_image formats as an RGBA sampler texture. */
-ZAN_SDL_API zan_i64 zan_gpu_load_image(zan_i64 handle, const char *path) {
+ZAN_SDL_API zan_iptr zan_gpu_load_image(zan_iptr handle, const char *path) {
     ZanGpuCtx *ctx = (ZanGpuCtx *)zan_ptr(handle);
     if (!ctx || !path) return 0;
     int width = 0;
@@ -864,7 +852,7 @@ ZAN_SDL_API zan_i64 zan_gpu_load_image(zan_i64 handle, const char *path) {
     return zan_gpu_wrap(texture, width, height);
 }
 
-ZAN_SDL_API void zan_gpu_free_texture(zan_i64 handle, zan_i64 texture) {
+ZAN_SDL_API void zan_gpu_free_texture(zan_iptr handle, zan_iptr texture) {
     ZanGpuCtx *ctx = (ZanGpuCtx *)zan_ptr(handle);
     ZanGpuTex *t = (ZanGpuTex *)zan_ptr(texture);
     if (ctx && t) {
@@ -873,18 +861,17 @@ ZAN_SDL_API void zan_gpu_free_texture(zan_i64 handle, zan_i64 texture) {
     }
 }
 
-ZAN_SDL_API zan_i64 zan_gpu_texture_width(zan_i64 texture) {
+ZAN_SDL_API zan_i32 zan_gpu_texture_width(zan_iptr texture) {
     ZanGpuTex *t = (ZanGpuTex *)zan_ptr(texture);
     return t ? t->w : 0;
 }
 
-ZAN_SDL_API zan_i64 zan_gpu_texture_height(zan_i64 texture) {
+ZAN_SDL_API zan_i32 zan_gpu_texture_height(zan_iptr texture) {
     ZanGpuTex *t = (ZanGpuTex *)zan_ptr(texture);
     return t ? t->h : 0;
 }
 
-ZAN_SDL_API zan_i64 zan_gpu_begin(
-    zan_i64 handle, zan_i64 r, zan_i64 g, zan_i64 b, zan_i64 a) {
+ZAN_SDL_API zan_i32 zan_gpu_begin(zan_iptr handle, zan_i32 r, zan_i32 g, zan_i32 b, zan_i32 a) {
     ZanGpuCtx *ctx = (ZanGpuCtx *)zan_ptr(handle);
     if (!ctx) return 0;
     ctx->cmd = SDL_AcquireGPUCommandBuffer(ctx->device);
@@ -914,10 +901,9 @@ static void zan_gpu_push_vertex(
  * texture) into the destination rect (dx,dy,dw,dh in framebuffer pixels),
  * multiplied by the r,g,b,a tint (0-255). */
 ZAN_SDL_API void zan_gpu_draw(
-    zan_i64 handle, zan_i64 texture,
-    zan_i64 dx, zan_i64 dy, zan_i64 dw, zan_i64 dh,
-    zan_i64 sx, zan_i64 sy, zan_i64 sw, zan_i64 sh,
-    zan_i64 r, zan_i64 g, zan_i64 b, zan_i64 a) {
+    zan_iptr handle, zan_iptr texture, zan_i32 dx, zan_i32 dy, zan_i32 dw,
+    zan_i32 dh, zan_i32 sx, zan_i32 sy, zan_i32 sw, zan_i32 sh, zan_i32 r,
+    zan_i32 g, zan_i32 b, zan_i32 a) {
     ZanGpuCtx *ctx = (ZanGpuCtx *)zan_ptr(handle);
     if (!ctx) return;
     ZanGpuTex *t = (ZanGpuTex *)zan_ptr(texture);
@@ -956,7 +942,7 @@ ZAN_SDL_API void zan_gpu_draw(
     }
 }
 
-ZAN_SDL_API void zan_gpu_end(zan_i64 handle) {
+ZAN_SDL_API void zan_gpu_end(zan_iptr handle) {
     ZanGpuCtx *ctx = (ZanGpuCtx *)zan_ptr(handle);
     if (!ctx || !ctx->cmd) return;
     if (!ctx->swap) { SDL_SubmitGPUCommandBuffer(ctx->cmd); ctx->cmd = NULL; return; }

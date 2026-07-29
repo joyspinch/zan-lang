@@ -74,6 +74,7 @@
 
 #include "../common/host_oom.h"
 #include "rt_crash.h"
+typedef int32_t i32;
 typedef int64_t i64;
 /* Native window handle (HWND / X11 Window / NSWindow*): pointer-width, so it
  * must not ride in a type that narrows when Zan `int` becomes 32-bit. */
@@ -183,7 +184,7 @@ static void set_pixel_aa(zan_surface_t *s, int x, int y, u32 color, int coverage
 
 /* ---- Exported rendering functions ---- */
 
-EXPORT i64 zan_gui_create_surface(i64 width, i64 height) {
+EXPORT i32 zan_gui_create_surface(i32 width, i32 height) {
     zan__crash_install(); /* idempotent; ensures GUI processes log hard crashes */
     /* Reuse a slot freed by destroy_surface so repeated resize/maximize cycles
      * (each destroy+create) don't leak the fixed 64-slot table. */
@@ -208,7 +209,7 @@ EXPORT i64 zan_gui_create_surface(i64 width, i64 height) {
     return (i64)id;
 }
 
-EXPORT i64 zan_gui_destroy_surface(i64 id) {
+EXPORT i32 zan_gui_destroy_surface(i32 id) {
     if (id < 0 || id >= g_surface_count || !g_surfaces[id]) return 1;
     free(g_surfaces[id]->pixels);
     free(g_surfaces[id]);
@@ -219,12 +220,12 @@ EXPORT i64 zan_gui_destroy_surface(i64 id) {
     return 0;
 }
 
-EXPORT i64 zan_gui_surface_width(i64 id) {
+EXPORT i32 zan_gui_surface_width(i32 id) {
     if (id < 0 || id >= g_surface_count || !g_surfaces[id]) return 0;
     return g_surfaces[id]->width;
 }
 
-EXPORT i64 zan_gui_surface_height(i64 id) {
+EXPORT i32 zan_gui_surface_height(i32 id) {
     if (id < 0 || id >= g_surface_count || !g_surfaces[id]) return 0;
     return g_surfaces[id]->height;
 }
@@ -259,7 +260,7 @@ void zan_gui_internal_surface_clip(i64 id, int *x0, int *y0, int *x1, int *y1) {
     if (y1) *y1 = s->clip_y1;
 }
 
-EXPORT void zan_gui_clear(i64 surface_id, i64 color) {
+EXPORT void zan_gui_clear(i32 surface_id, i32 color) {
     if (surface_id < 0 || surface_id >= g_surface_count) return;
     zan_surface_t *s = g_surfaces[surface_id];
     if (!s) return;
@@ -273,7 +274,7 @@ EXPORT void zan_gui_clear(i64 surface_id, i64 color) {
 
 /* Intersect the clip window with (x,y,w,h) and save the previous window so a
  * matching zan_gui_pop_clip restores it. Nested pushes can only shrink. */
-EXPORT void zan_gui_push_clip(i64 surface_id, i64 x, i64 y, i64 w, i64 h) {
+EXPORT void zan_gui_push_clip(i32 surface_id, i32 x, i32 y, i32 w, i32 h) {
     if (surface_id < 0 || surface_id >= g_surface_count) return;
     zan_surface_t *s = g_surfaces[surface_id];
     if (!s) return;
@@ -302,7 +303,7 @@ EXPORT void zan_gui_push_clip(i64 surface_id, i64 x, i64 y, i64 w, i64 h) {
 }
 
 /* Restore the clip window saved by the most recent zan_gui_push_clip. */
-EXPORT void zan_gui_pop_clip(i64 surface_id) {
+EXPORT void zan_gui_pop_clip(i32 surface_id) {
     if (surface_id < 0 || surface_id >= g_surface_count) return;
     zan_surface_t *s = g_surfaces[surface_id];
     if (!s) return;
@@ -318,14 +319,14 @@ EXPORT void zan_gui_pop_clip(i64 surface_id) {
 }
 
 /* Drop all clip windows and clip to the whole surface again. */
-EXPORT void zan_gui_reset_clip(i64 surface_id) {
+EXPORT void zan_gui_reset_clip(i32 surface_id) {
     if (surface_id < 0 || surface_id >= g_surface_count) return;
     zan_surface_t *s = g_surfaces[surface_id];
     if (!s) return;
     clip_reset_full(s);
 }
 
-EXPORT void zan_gui_fill_rect(i64 surface_id, i64 x, i64 y, i64 w, i64 h, i64 color) {
+EXPORT void zan_gui_fill_rect(i32 surface_id, i32 x, i32 y, i32 w, i32 h, i32 color) {
     if (surface_id < 0 || surface_id >= g_surface_count) return;
     zan_surface_t *s = g_surfaces[surface_id];
     if (!s) return;
@@ -354,8 +355,9 @@ EXPORT void zan_gui_fill_rect(i64 surface_id, i64 x, i64 y, i64 w, i64 h, i64 co
 /* Vertical linear gradient fill: each row is a lerp between color_top (at y)
  * and color_bottom (at y+h-1). Opaque; used for modern gradient wallpapers
  * (AI / Aurora / Glass backdrops). Single pass, no allocation. */
-EXPORT void zan_gui_fill_vgrad(i64 surface_id, i64 x, i64 y, i64 w, i64 h,
-                               i64 color_top, i64 color_bottom) {
+EXPORT void zan_gui_fill_vgrad(
+    i32 surface_id, i32 x, i32 y, i32 w, i32 h, i32 color_top,
+    i32 color_bottom) {
     if (surface_id < 0 || surface_id >= g_surface_count) return;
     zan_surface_t *s = g_surfaces[surface_id];
     if (!s) return;
@@ -387,7 +389,7 @@ EXPORT void zan_gui_fill_vgrad(i64 surface_id, i64 x, i64 y, i64 w, i64 h,
  * blur the region behind a panel, then overlay a translucent tint. Alpha is
  * forced opaque (the backdrop under an overlay is opaque). Edge samples are
  * clamped to the region. Cost is O(passes * area), independent of radius. */
-EXPORT void zan_gui_blur_rect(i64 surface_id, i64 x, i64 y, i64 w, i64 h, i64 radius) {
+EXPORT void zan_gui_blur_rect(i32 surface_id, i32 x, i32 y, i32 w, i32 h, i32 radius) {
     if (surface_id < 0 || surface_id >= g_surface_count) return;
     zan_surface_t *s = g_surfaces[surface_id];
     if (!s) return;
@@ -576,8 +578,9 @@ typedef struct {
 } zan_blur_cache_t;
 static zan_blur_cache_t g_blur_cache[ZAN_BLUR_CACHE_SLOTS];
 
-EXPORT void zan_gui_blur_rect_cached(i64 surface_id, i64 x, i64 y, i64 w,
-                                     i64 h, i64 radius, i64 slot, i64 dirty) {
+EXPORT void zan_gui_blur_rect_cached(
+    i32 surface_id, i32 x, i32 y, i32 w, i32 h, i32 radius, i32 slot,
+    i32 dirty) {
     if (surface_id < 0 || surface_id >= g_surface_count) return;
     zan_surface_t *s = g_surfaces[surface_id];
     if (!s) return;
@@ -640,8 +643,7 @@ EXPORT void zan_gui_blur_rect_cached(i64 surface_id, i64 x, i64 y, i64 w,
 #define ZAN_SNAP_CACHE_SLOTS 8
 static zan_blur_cache_t g_snap_cache[ZAN_SNAP_CACHE_SLOTS];
 
-EXPORT void zan_gui_snapshot_rect(i64 surface_id, i64 x, i64 y, i64 w,
-                                  i64 h, i64 slot) {
+EXPORT void zan_gui_snapshot_rect(i32 surface_id, i32 x, i32 y, i32 w, i32 h, i32 slot) {
     if (surface_id < 0 || surface_id >= g_surface_count) return;
     zan_surface_t *s = g_surfaces[surface_id];
     if (!s) return;
@@ -670,8 +672,7 @@ EXPORT void zan_gui_snapshot_rect(i64 surface_id, i64 x, i64 y, i64 w,
     c->valid = 1;
 }
 
-EXPORT i64 zan_gui_restore_rect(i64 surface_id, i64 x, i64 y, i64 w,
-                                i64 h, i64 slot) {
+EXPORT i32 zan_gui_restore_rect(i32 surface_id, i32 x, i32 y, i32 w, i32 h, i32 slot) {
     if (surface_id < 0 || surface_id >= g_surface_count) return 0;
     zan_surface_t *s = g_surfaces[surface_id];
     if (!s) return 0;
@@ -700,8 +701,7 @@ EXPORT i64 zan_gui_restore_rect(i64 surface_id, i64 x, i64 y, i64 w,
  * caller can repair many small damaged regions (e.g. the previous animation
  * frame's particles) without copying the whole snapshot back. Returns 1 while
  * the slot holds a valid snapshot for this surface size, 0 otherwise. */
-EXPORT i64 zan_gui_restore_sub_rect(i64 surface_id, i64 x, i64 y, i64 w,
-                                    i64 h, i64 slot) {
+EXPORT i32 zan_gui_restore_sub_rect(i32 surface_id, i32 x, i32 y, i32 w, i32 h, i32 slot) {
     if (surface_id < 0 || surface_id >= g_surface_count) return 0;
     zan_surface_t *s = g_surfaces[surface_id];
     if (!s) return 0;
@@ -725,7 +725,7 @@ EXPORT i64 zan_gui_restore_sub_rect(i64 surface_id, i64 x, i64 y, i64 w,
     return 1;
 }
 
-EXPORT void zan_gui_draw_rect(i64 surface_id, i64 x, i64 y, i64 w, i64 h, i64 color, i64 thickness) {
+EXPORT void zan_gui_draw_rect(i32 surface_id, i32 x, i32 y, i32 w, i32 h, i32 color, i32 thickness) {
     if (surface_id < 0 || surface_id >= g_surface_count) return;
     zan_surface_t *s = g_surfaces[surface_id];
     if (!s) return;
@@ -739,7 +739,7 @@ EXPORT void zan_gui_draw_rect(i64 surface_id, i64 x, i64 y, i64 w, i64 h, i64 co
 }
 
 /* Anti-aliased rounded rectangle */
-EXPORT void zan_gui_fill_rounded_rect(i64 surface_id, i64 x, i64 y, i64 w, i64 h, i64 radius, i64 color) {
+EXPORT void zan_gui_fill_rounded_rect(i32 surface_id, i32 x, i32 y, i32 w, i32 h, i32 radius, i32 color) {
     if (surface_id < 0 || surface_id >= g_surface_count) return;
     zan_surface_t *s = g_surfaces[surface_id];
     if (!s) return;
@@ -791,7 +791,7 @@ EXPORT void zan_gui_fill_rounded_rect(i64 surface_id, i64 x, i64 y, i64 w, i64 h
  * fill_rect between the corners); the four corner arcs are anti-aliased rings
  * that share the fill's corner centres/radius so the border hugs a matching
  * fill_rounded_rect exactly instead of the old square DrawRect outline. */
-EXPORT void zan_gui_draw_rounded_rect(i64 surface_id, i64 x, i64 y, i64 w, i64 h, i64 radius, i64 color, i64 thickness) {
+EXPORT void zan_gui_draw_rounded_rect(i32 surface_id, i32 x, i32 y, i32 w, i32 h, i32 radius, i32 color, i32 thickness) {
     if (surface_id < 0 || surface_id >= g_surface_count) return;
     zan_surface_t *s = g_surfaces[surface_id];
     if (!s) return;
@@ -837,7 +837,7 @@ EXPORT void zan_gui_draw_rounded_rect(i64 surface_id, i64 x, i64 y, i64 w, i64 h
 }
 
 /* Anti-aliased filled circle */
-EXPORT void zan_gui_fill_circle(i64 surface_id, i64 cx, i64 cy, i64 radius, i64 color) {
+EXPORT void zan_gui_fill_circle(i32 surface_id, i32 cx, i32 cy, i32 radius, i32 color) {
     if (surface_id < 0 || surface_id >= g_surface_count) return;
     zan_surface_t *s = g_surfaces[surface_id];
     if (!s) return;
@@ -860,8 +860,8 @@ EXPORT void zan_gui_fill_circle(i64 surface_id, i64 cx, i64 cy, i64 radius, i64 
 
 /* Anti-aliased circle outline: a ring of the given thickness centered on
  * the radius, with smooth coverage falloff at both edges. */
-EXPORT void zan_gui_draw_circle(i64 surface_id, i64 cx, i64 cy, i64 radius,
-                                i64 color, i64 thickness) {
+EXPORT void zan_gui_draw_circle(
+    i32 surface_id, i32 cx, i32 cy, i32 radius, i32 color, i32 thickness) {
     if (surface_id < 0 || surface_id >= g_surface_count) return;
     zan_surface_t *s = g_surfaces[surface_id];
     if (!s) return;
@@ -891,8 +891,7 @@ EXPORT void zan_gui_draw_circle(i64 surface_id, i64 cx, i64 cy, i64 radius,
  * used; `inner_a` drives the peak alpha. The falloff is a smoothstep raised to
  * a higher power to keep a bright, tight core with a long soft tail -- this is
  * the building block for specular highlights, spotlights and border glow. */
-EXPORT void zan_gui_fill_radial(i64 surface_id, i64 cx, i64 cy, i64 radius,
-                                i64 color, i64 inner_a) {
+EXPORT void zan_gui_fill_radial(i32 surface_id, i32 cx, i32 cy, i32 radius, i32 color, i32 inner_a) {
     if (surface_id < 0 || surface_id >= g_surface_count) return;
     zan_surface_t *s = g_surfaces[surface_id];
     if (!s) return;
@@ -924,8 +923,9 @@ EXPORT void zan_gui_fill_radial(i64 surface_id, i64 cx, i64 cy, i64 radius,
 
 /* Anti-aliased filled ring sector (pie / donut slice). Angles in degrees with
  * 0 at 12 o'clock, increasing clockwise. r_inner=0 gives a solid pie slice. */
-EXPORT void zan_gui_fill_sector(i64 surface_id, i64 cx, i64 cy, i64 r_inner, i64 r_outer,
-                                i64 a0_deg, i64 a1_deg, i64 color) {
+EXPORT void zan_gui_fill_sector(
+    i32 surface_id, i32 cx, i32 cy, i32 r_inner, i32 r_outer, i32 a0_deg,
+    i32 a1_deg, i32 color) {
     if (surface_id < 0 || surface_id >= g_surface_count) return;
     zan_surface_t *s = g_surfaces[surface_id];
     if (!s) return;
@@ -981,7 +981,7 @@ EXPORT void zan_gui_fill_sector(i64 surface_id, i64 cx, i64 cy, i64 r_inner, i64
 }
 
 /* Anti-aliased line (Wu's algorithm) */
-EXPORT void zan_gui_draw_line(i64 surface_id, i64 x0, i64 y0, i64 x1, i64 y1, i64 color, i64 thickness) {
+EXPORT void zan_gui_draw_line(i32 surface_id, i32 x0, i32 y0, i32 x1, i32 y1, i32 color, i32 thickness) {
     if (surface_id < 0 || surface_id >= g_surface_count) return;
     zan_surface_t *s = g_surfaces[surface_id];
     if (!s) return;
@@ -1056,7 +1056,7 @@ EXPORT void zan_gui_draw_line(i64 surface_id, i64 x0, i64 y0, i64 x1, i64 y1, i6
     }
 }
 
-EXPORT void *zan_gui_get_pixels(i64 surface_id) {
+EXPORT void *zan_gui_get_pixels(i32 surface_id) {
     if (surface_id < 0 || surface_id >= g_surface_count || !g_surfaces[surface_id]) return NULL;
     return (void *)g_surfaces[surface_id]->pixels;
 }
@@ -1182,11 +1182,11 @@ static zan_img_t *zan_img_load(const char *path) {
     return e;
 }
 
-EXPORT i64 zan_gui_image_width(const char *path) {
+EXPORT i32 zan_gui_image_width(const char *path) {
     zan_img_t *e = zan_img_load(path);
     return e ? (i64)e->w : 0;
 }
-EXPORT i64 zan_gui_image_height(const char *path) {
+EXPORT i32 zan_gui_image_height(const char *path) {
     zan_img_t *e = zan_img_load(path);
     return e ? (i64)e->h : 0;
 }
@@ -1216,9 +1216,9 @@ EXPORT void zan_gui_image_evict(const char *path) {
 /* Blit a region of an image file onto a GUI surface (nearest-neighbour scale).
  * sx/sy/sw/sh = source rect in the image (all zero = use the full image).
  * dx/dy/dw/dh = destination rect on the surface. */
-EXPORT void zan_gui_blit_image(i64 surf_id, const char *path,
-    i64 dx, i64 dy, i64 dw, i64 dh,
-    i64 sx, i64 sy, i64 sw, i64 sh)
+EXPORT void zan_gui_blit_image(
+    i32 surf_id, const char *path, i32 dx, i32 dy, i32 dw, i32 dh, i32 sx,
+    i32 sy, i32 sw, i32 sh)
 {
     zan_img_t *img;
     zan_surface_t *s;

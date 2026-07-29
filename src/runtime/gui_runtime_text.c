@@ -161,8 +161,8 @@ static zan_text_cache_t *zan_text_cache_get(const char *text, int size) {
     return victim;
 }
 
-EXPORT void zan_gui_draw_text(i64 surface_id, i64 x, i64 y,
-                              const char *text, i64 color, i64 font_size) {
+EXPORT void zan_gui_draw_text(
+    i32 surface_id, i32 x, i32 y, const char *text, i32 color, i32 font_size) {
     if (surface_id < 0 || surface_id >= g_surface_count) return;
     zan_surface_t *s = g_surfaces[surface_id];
     if (!s || !text || !*text) return;
@@ -252,7 +252,7 @@ static int measure_text_gdi(const char *text, int size) {
     return (int)text_size.cx;
 }
 
-EXPORT i64 zan_gui_measure_text(const char *text, i64 font_size) {
+EXPORT i32 zan_gui_measure_text(const char *text, i32 font_size) {
     if (!text || !*text) return 0;
     int size = (int)font_size;
     if (size < 8) size = 8;
@@ -294,7 +294,7 @@ static int g_fh_size[16];
 static int g_fh_val[16];
 static int g_fh_count = 0;
 
-EXPORT i64 zan_gui_font_height(i64 font_size) {
+EXPORT i32 zan_gui_font_height(i32 font_size) {
     int size = (int)font_size;
     if (size < 8) size = 8;
 
