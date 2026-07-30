@@ -2864,3 +2864,36 @@ leakcheck 子集全部通过；生成 IR 不含 `setjmp`/`longjmp`/`__zan_eh_tmp
 每个里程碑按「probe → 根因修复 → conformance → determinism → leakcheck → diff/status」闭环；
 禁止把多阶段揉成一次提交。A32-5 之前不删除现有 EH 保护网，A32-5 完成后也不允许以兼容名义
 保留两套 EH。
+
+# A33 · 委托只支持静态函数：捕获 `this` 的 lambda 与实例方法组会崩（2026-07-30，已实测）
+
+发现于「数据组件全面 retained 化」：新组件的对外形状是 `Bind(数据) + On*(方法)`，
+而绑方法这一步在当前编译器下只有**静态方法**和**不捕获的 lambda** 可用。
+
+**根因**：`irgen_expr.c` 的 `emit_lambda_typed` 明确按「lambda 不捕获」实现
+（`(void)locals; /* lambdas are non-capturing */`，并把 `g->current_this` 置空），
+委托值就是一个裸函数指针，没有 env/receiver 槽。于是：
+
+* 捕获局部变量 —— 前端直接报错 `use of undeclared identifier`（`_scratch/probe_cap.zan`）；
+* 捕获 `this` —— **能编译过，运行崩**（`this` 在 lambda 体内是 null，
+  `_scratch/probe_cap2.zan`，exit 0xC0000005）；
+* 实例方法组 `Act a = h.Touch;` —— 同样编译过、运行崩（`_scratch/probe_mg.zan`）。
+
+后两条是静默错误码生成，比缺功能更糟：任何 `btn.Click += this.Save;` 都是崩溃。
+
+**任务**：
+
+1. [ ] A33-1 立刻堵住静默崩溃：lambda 体内引用 `this`/外层局部，或把实例方法组赋给委托时，
+   在 checker 报错（`ZAN####`），并加 `tests/conformance` 的 diag 用例。
+   这一步不引入新能力，只把崩溃变成诊断。
+2. [ ] A33-2 委托带 receiver/env（能力项）：委托值改成「裸函数指针 或 闭包记录」两态，
+   闭包记录持 `fn + env`，调用点按低位标记分派；实例方法组的 env 就是 receiver，
+   捕获 lambda 的 env 是按值捕获的记录（引用类型按 ARC retain）。
+   需要一并处理：委托指针传入 C runtime 的路径（排序比较器等）、`Dispatcher.Post`、
+   async 委托、以及闭包记录本身的释放。
+3. [ ] A33-3 GUI 事件绑定改成实例方法/闭包（依赖 A33-2）：`lv.OnSelect(this.Open)`
+   取代目前的静态 handler + 轮询取值。
+
+**当前替代形状（已与用户说明，A33-2 之前有效）**：数据取值用不捕获 lambda
+（`new ListColumn<T>("Name", i => i.name)` 已实测可用），事件绑定用静态方法或
+把行做成自带状态的 Control 子类（虚方法分派不受此缺陷影响）。

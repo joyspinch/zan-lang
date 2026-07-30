@@ -6,23 +6,37 @@ using Gui.Widget;
 /// news. The page declares structure only -- which element sits in which card
 /// and what class it carries; every size, gap and inset comes from the
 /// stylesheet (`startpage`, `card.recent`, `list.news`, ... in ide.css), so
-/// there is no coordinate arithmetic here and no row building either: the lists
-/// own the mapping from model to rows.
+/// there is no coordinate arithmetic here. The lists are bound straight to the
+/// model (`List<RecentItem>` / `List<NewsItem>`) and each row is a control of
+/// its own, so no row model is built anywhere.
 ///
 /// The shell polls TakeAction() after rendering:
 ///   1/2/3 = New Project / New File / Open, 100+i = open recent i,
-///   200+i = open article i, 300+i = drop recent i from the list.
+///   200+i = open article i; a dropped project comes back from
+///   TakeRemovedPath() as a path.
 class StartPage : Control {
-    RecentList recents;
-    NewsList news;
+    ListView<RecentItem> recents;
+    ListView<NewsItem> news;
     ButtonGroup quick;
     int action;
+    /// The IDE has exactly one start page; the list handlers are bound as
+    /// methods, and a handler reaches the page through this.
+    static StartPage current;
 
     StartPage() {
         this.InitControl("startPage", 5);
         Class = "startpage";
-        recents = RecentList.Create();
-        news = NewsList.Create();
+        current = this;
+        recents = new ListView<RecentItem>(RecentRow.Of);
+        recents.Class = "recent flat";
+        recents.EmptyText(ZanIDE.T("(no recent projects yet)",
+                                   "（还没有最近打开的项目）"));
+        recents.OnSelect(StartPage.RecentPicked);
+        recents.OnActivate(StartPage.RecentPicked);
+        news = new ListView<NewsItem>(NewsRow.Of);
+        news.Class = "news flat";
+        news.OnSelect(StartPage.ArticlePicked);
+        news.OnActivate(StartPage.ArticlePicked);
         quick = ButtonGroup.Bar("quick");
         quick.AddButton(new Button { Text = ZanIDE.T("New Project", "新建项目"), Icon = "plus", Class = "small" });
         quick.AddButton(new Button { Text = ZanIDE.T("New File", "新建文件"), Icon = "file", Class = "small" });
@@ -46,15 +60,31 @@ class StartPage : Control {
 
     override string StyleType() { return "startpage"; }
 
-    void SetRecents(List<RecentItem> items) { recents.SetItems(items); }
+    void SetRecents(List<RecentItem> items) { recents.Bind(items); }
 
-    void SetNews(List<NewsItem> items) { news.SetItems(items); }
+    void SetNews(List<NewsItem> items) { news.Bind(items); }
 
     /// Where recent entry `i` / article `i` leads, so the shell can act on an
     /// action code without keeping its own copy of the model.
-    string RecentPath(int i) { return recents.PathOf(i); }
+    string RecentPath(int i) {
+        if (!recents.Has(i)) { return ""; }
+        return recents.ItemAt(i).path;
+    }
 
-    string NewsLink(int i) { return news.LinkOf(i); }
+    string NewsLink(int i) {
+        if (!news.Has(i)) { return ""; }
+        return news.ItemAt(i).link;
+    }
+
+    static void RecentPicked() {
+        if (current == null) { return; }
+        current.action = 100 + current.recents.SelectedIndex();
+    }
+
+    static void ArticlePicked() {
+        if (current == null) { return; }
+        current.action = 200 + current.news.SelectedIndex();
+    }
 
     override void OnPaint(App app) {
         Theme t = app.theme;
@@ -70,14 +100,12 @@ class StartPage : Control {
     int TakeAction() {
         int pressed = quick.TakePressed();
         if (pressed >= 0) { action = pressed + 1; }
-        int removed = recents.TakeRemoved();
-        if (removed >= 0) { action = 300 + removed; }
-        int opened = recents.TakeOpened();
-        if (opened >= 0) { action = 100 + opened; }
-        int article = news.TakeOpened();
-        if (article >= 0) { action = 200 + article; }
         int a = action;
         action = 0;
         return a;
     }
+
+    /// Project the user asked to drop from the list ("" = none). The row owns
+    /// the entity, so this is a path, not an index.
+    string TakeRemovedPath() { return RecentRow.TakeRemoved(); }
 }

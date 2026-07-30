@@ -7,6 +7,31 @@ using Gui;
 using Gui.Widget;
 using Game.Scene;
 
+/// One line of the asset listing: what it is called, what kind of entry it is
+/// (0 folder, 1 file, 2 linked resource) and the two trailing columns. The list
+/// is bound to a `List<AssetEntry>`, so selection hands back the entry itself
+/// and no code maps an index onto three parallel arrays.
+class AssetEntry {
+    string name;
+    int kind;
+    string chip;
+    string size;
+    string path;   // link target; "" for folders and files
+
+    static AssetEntry Of(string name, int kind, string chip, string size) {
+        AssetEntry e = new AssetEntry();
+        e.name = name;
+        e.kind = kind;
+        e.chip = chip;
+        e.size = size;
+        e.path = "";
+        return e;
+    }
+
+    bool IsDir() { return kind == 0; }
+    bool IsLink() { return kind == 2; }
+}
+
 /// The IDE's asset manager: a modal browser over the project's assets/ tree.
 /// Navigate folders, import single files or whole directories (recursively,
 /// keeping the folder structure), create/rename/delete entries, and author
@@ -19,10 +44,14 @@ using Game.Scene;
 /// folder with a manifest imports exactly what the manifest lists.
 class AssetManager {
     static int lang;   // 0 English, 1 Chinese; the IDE keeps this in sync
+    /// The IDE opens one asset manager at a time; the list handlers are bound
+    /// as methods and reach it through this.
+    static AssetManager current;
 
     string curRel;     // current folder relative to assets/ ("" = root)
-    // Scroll position and selection of the listing, owned by the ListView.
-    ListState list;
+    /// The listing: bound to `entries`, owner of its own scroll and selection.
+    ListView<AssetEntry> list;
+    List<AssetEntry> entries;
     string msg;        // one-line status feedback
     int loopMode;      // anim editor: 0 once, 1 loop, 2 loop-section
     bool confirmDel;   // delete button clicked once (asks to confirm)
@@ -43,10 +72,41 @@ class AssetManager {
         return en;
     }
 
+    /// Activating (clicking again) a folder row enters it; the entry itself says
+    /// whether it is a folder, so no index arithmetic is involved.
+    static void EntryActivated() {
+        AssetManager m = AssetManager.current;
+        if (m == null || !m.list.HasSelection()) { return; }
+        AssetEntry e = m.list.Selected();
+        if (!e.IsDir()) { return; }
+        if (m.curRel.Length > 0) { m.curRel = m.curRel + "/" + e.name; }
+        else { m.curRel = e.name; }
+        m.list.ClearSelection();
+    }
+
+    /// Moving the selection takes back a pending delete confirmation.
+    static void EntrySelected() {
+        AssetManager m = AssetManager.current;
+        if (m == null) { return; }
+        m.confirmDel = false;
+    }
+
     static AssetManager Create() {
         AssetManager m = new AssetManager();
         m.curRel = "";
-        m.list = ListState.Create();
+        m.entries = new List<AssetEntry>();
+        List<ListColumn<AssetEntry>> cols = new List<ListColumn<AssetEntry>>();
+        cols.Add(new ListColumn<AssetEntry>(T("Name", "名称"), 4, e => e.name));
+        cols.Add(new ListColumn<AssetEntry>("", 1, e => e.chip));
+        cols.Add(new ListColumn<AssetEntry>("", 1, e => e.size).Right());
+        m.list = new ListView<AssetEntry>(cols);
+        m.list.Class = "headless";
+        m.list.EmptyText(T("Empty. Import files or a whole folder to begin.",
+                           "空目录。可导入文件或整个文件夹。"));
+        m.list.Bind(m.entries);
+        m.list.OnSelect(AssetManager.EntrySelected);
+        m.list.OnActivate(AssetManager.EntryActivated);
+        AssetManager.current = m;
         m.msg = "";
         m.loopMode = 1;
         m.confirmDel = false;
@@ -563,46 +623,34 @@ class AssetManager {
         // listed only at the assets root as a third segment after dirs+files.
         List<string> lnks = new List<string>();
         if (this.curRel == "") { lnks = ZanIDE.ProjLinks(root); }
-        int dfCount = dirs.Count + files.Count;
-        int total = dfCount + lnks.Count;
         int listX = x + pad;
         int listY = bY2 + ctlH + app.Scale(16);
         int listW = w - pad - pad - app.Scale(310);
         int listH = h - (listY - y) - app.Scale(64);
 
-        List<ListRow> rows = new List<ListRow>();
+        this.entries = new List<AssetEntry>();
         int ri = 0;
-        while (ri < total) {
-            bool isDirRow = ri < dirs.Count;
-            bool isLinkRow = ri >= dfCount;
-            if (isDirRow) {
-                rows.Add(ListRow.Create(dirs[ri]).Chip(T("DIR", "目录"), 4));
-            } else if (isLinkRow) {
-                rows.Add(ListRow.Create(Path.GetFileName(lnks[ri - dfCount]))
-                    .Chip(T("LINK", "链接"), 0));
-            } else {
-                string fn = files[ri - dirs.Count];
-                int fty = typeOf(fn);
-                rows.Add(ListRow.Create(fn)
-                    .Chip(typeLabel(fty), AssetManager.tagVariant(fty))
-                    .Trailing(sizeLabel(File.GetSize(ad + "/" + fn)), 0));
-            }
+        while (ri < dirs.Count) {
+            this.entries.Add(AssetEntry.Of(dirs[ri], 0, T("DIR", "目录"), ""));
             ri = ri + 1;
         }
-
-        ListView.Create().BindState(this.list).Rows(rows)
-            .Empty(T("Empty. Import files or a whole folder to begin.",
-                     "空目录。可导入文件或整个文件夹。"))
-            .DrawAt(app, listX, listY, listW, listH);
-
-        // Activating (clicking an already-selected) folder row enters it.
-        if (this.list.activated >= 0 && this.list.activated < dirs.Count) {
-            string entered = dirs[this.list.activated];
-            if (this.curRel.Length > 0) { this.curRel = this.curRel + "/" + entered; }
-            else { this.curRel = entered; }
-            this.list.Reset();
+        ri = 0;
+        while (ri < files.Count) {
+            string fn = files[ri];
+            this.entries.Add(AssetEntry.Of(fn, 1, typeLabel(typeOf(fn)),
+                                           sizeLabel(File.GetSize(ad + "/" + fn))));
+            ri = ri + 1;
         }
-        if (this.list.clicked >= 0) { this.confirmDel = false; }
+        ri = 0;
+        while (ri < lnks.Count) {
+            AssetEntry e = AssetEntry.Of(Path.GetFileName(lnks[ri]), 2,
+                                         T("LINK", "链接"), "");
+            e.path = lnks[ri];
+            this.entries.Add(e);
+            ri = ri + 1;
+        }
+        this.list.Bind(this.entries);
+        this.list.RenderInside(app, Rect.Create(listX, listY, listW, listH));
 
         // ---- detail panel (right) ----
         int dX = x + w - pad - app.Scale(290);
@@ -615,18 +663,17 @@ class AssetManager {
         int renApplyId = -1;
         int animWriteId = -1;
         int loopBtnId = -1;
-        bool selValid = this.list.selected >= 0 && this.list.selected < total;
-        bool selIsDir = selValid && this.list.selected < dirs.Count;
-        bool selIsLink = selValid && this.list.selected >= dfCount;
+        bool selValid = this.list.HasSelection();
+        bool selIsDir = false;
+        bool selIsLink = false;
         string selName = "";
         string selLinkPath = "";
         if (selValid) {
-            if (selIsDir) { selName = dirs[this.list.selected]; }
-            else if (selIsLink) {
-                selLinkPath = lnks[this.list.selected - dfCount];
-                selName = Path.GetFileName(selLinkPath);
-            }
-            else { selName = files[this.list.selected - dirs.Count]; }
+            AssetEntry sel = this.list.Selected();
+            selIsDir = sel.IsDir();
+            selIsLink = sel.IsLink();
+            selName = sel.name;
+            selLinkPath = sel.path;
             app.canvas.DrawStyledText(
                 Style.Of(app, "label", "", Style.SNormal()),
                 dX + inPad, cy, selName,
@@ -756,7 +803,7 @@ class AssetManager {
         } else if (Ui.Clicked(app, upId)) {
             if (this.curRel.Length > 0) {
                 this.curRel = dirPart(this.curRel);
-                this.list.Reset();
+                this.list.ClearSelection();
                 app.RequestRedraw();
             }
         } else if (Ui.Clicked(app, pkId)) {
@@ -784,7 +831,7 @@ class AssetManager {
                 this.msg = T("Renamed to ", "已重命名为 ") + nn;
                 this.renameFor = "";
                 this.animFor = "";
-                this.list.selected = 0 - 1;
+                this.list.ClearSelection();
                 app.RequestRedraw();
             }
         } else if (delId >= 0 && Ui.Clicked(app, delId)) {
@@ -793,7 +840,7 @@ class AssetManager {
                 log.Add("> Removed linked resource: " + selLinkPath);
                 this.msg = T("Link removed", "已移除链接");
                 this.confirmDel = false;
-                this.list.selected = 0 - 1;
+                this.list.ClearSelection();
                 app.RequestRedraw();
             } else if (!this.confirmDel) {
                 this.confirmDel = true;
@@ -804,7 +851,7 @@ class AssetManager {
                 log.Add("> Asset deleted: " + this.relOf(selName));
                 this.msg = T("Deleted ", "已删除 ") + selName;
                 this.confirmDel = false;
-                this.list.selected = 0 - 1;
+                this.list.ClearSelection();
                 app.RequestRedraw();
             }
         } else if (loopBtnId >= 0 && Ui.Clicked(app, loopBtnId)) {

@@ -13,6 +13,54 @@ class DocsDemoModel {
     int stars;
 }
 
+/// One line of the topic sidebar: a topic (`doc` indexes the doc arrays) or a
+/// category heading (`doc` = -1).
+class DocTopic {
+    int doc;
+    string text;
+
+    static DocTopic Of(int doc, string text) {
+        DocTopic t = new DocTopic();
+        t.doc = doc;
+        t.text = text;
+        return t;
+    }
+
+    static DocTopic Header(string text) { return DocTopic.Of(0 - 1, text); }
+
+    bool IsHeader() { return doc < 0; }
+}
+
+/// A sidebar line as a control of its own: a heading and a topic differ only in
+/// which label class they carry, which is what makes the sidebar a list of
+/// custom rows rather than a list with a row model.
+class DocTopicRow : Control {
+    /// Row template for `new ListView<DocTopic>(DocTopicRow.Of)`.
+    static Control Of(DocTopic t) { return new DocTopicRow(t); }
+
+    DocTopicRow(DocTopic t) {
+        this.InitControl("docTopic", 1);
+        Label text = new Label(t.text);
+        if (t.IsHeader()) {
+            Class = "header";
+            text.Class = "hint tiny";
+        } else {
+            text.Class = "small";
+        }
+        text.dock = 5;
+        this.Add(text);
+    }
+
+    override string Kind() { return "DocTopicRow"; }
+
+    override string StyleType() { return "listrow"; }
+
+    override void OnMeasure(App app) {
+        StyleBox s = this.ResolveStyleAs(app, "listrow", Class, Style.SNormal());
+        prefH = s.HeightOr(app.theme.heightMedium);
+    }
+}
+
 /// The Help / documentation browser, extracted from the shell: the doc
 /// content lists (BuildDocs), the searchable sidebar + detail pane with a
 /// copyable code example (RenderDocsPage) and the live widget previews.
@@ -28,9 +76,25 @@ class DocsPage {
     static SelectBox demoSelect;
     static Rate demoRate;
     static Tabs demoTabs;
-    static ListState docList;
+    static ListView<DocTopic> docList;
+    // Where a picked topic goes: the page is rendered from signals the shell
+    // owns, and the list handler is a method, so they are held here for it.
+    static SignalInt docSel;
+    static SignalInt docCodeScroll;
+    static ListView<string> previewList;
     static Tabs secTabs;
     static List<string> secLbls;
+
+    /// A picked topic moves the shell's selection signal; a category heading is
+    /// not a topic, so it selects nothing.
+    static void TopicPicked() {
+        if (DocsPage.docList == null) { return; }
+        if (!DocsPage.docList.HasSelection()) { return; }
+        DocTopic t = DocsPage.docList.Selected();
+        if (t.IsHeader()) { return; }
+        if (DocsPage.docSel != null) { DocsPage.docSel.Set(t.doc); }
+        if (DocsPage.docCodeScroll != null) { DocsPage.docCodeScroll.Set(0); }
+    }
 
     /// Lazily builds the retained preview widgets and binds each to a field on
     /// the shared model via `.data`. Called once per frame; returns early after
@@ -419,7 +483,7 @@ class DocsPage {
         DocsPage.DocAdd(cat, title, body, code, cWidgets, "ListView",
             ZanIDE.T("Render a compact vertical list of strings.",
                 "渲染紧凑的纵向字符串列表。"),
-            "List<string> items = new List<string>();\nitems.Add(\"Alpha\"); items.Add(\"Beta\");\nListView.Render(app, 40, 60, 280, items);");
+            "List<string> items = new List<string>();\nitems.Add(\"Alpha\"); items.Add(\"Beta\");\nListView<string> list = new ListView<string>(new ListColumn<string>(\"\", s => s));\nlist.Bind(items);\nside.Add(list);      // CSS gives it its box");
         DocsPage.DocAdd(cat, title, body, code, cWidgets, "Loading",
             ZanIDE.T("Draw an animated loading indicator (Spin; Spin.WithTip adds a caption).",
                 "绘制动画加载指示器（Spin；Spin.WithTip 附带说明文字）。"),
@@ -646,30 +710,31 @@ class DocsPage {
         int listTop = sy + sh + app.Scale(10);
         int listBottom = area.y + area.height - app.Scale(8);
 
-        List<ListRow> docRows = new List<ListRow>();
+        List<DocTopic> topics = new List<DocTopic>();
         int selRow = 0 - 1;
         int ri = 0;
         while (ri < rowDoc.Count) {
             if (rowDoc[ri] < 0) {
-                docRows.Add(ListRow.Create(DocsPage.ToUpperCat(rowText[ri])).AsHeader());
+                topics.Add(DocTopic.Header(DocsPage.ToUpperCat(rowText[ri])));
             } else {
-                if (rowDoc[ri] == selAbs) { selRow = docRows.Count; }
-                docRows.Add(ListRow.Create(rowText[ri]));
+                if (rowDoc[ri] == selAbs) { selRow = topics.Count; }
+                topics.Add(DocTopic.Of(rowDoc[ri], rowText[ri]));
             }
             ri = ri + 1;
         }
-        if (DocsPage.docList == null) { DocsPage.docList = ListState.Create(); }
-        DocsPage.docList.selected = selRow;
-        ListView.Create().BindState(DocsPage.docList).Rows(docRows)
-            .Empty(ZanIDE.T("No topics match your search.",
-                            "没有匹配搜索的主题。"))
-            .DrawAt(app, sx, listTop, swid, listBottom - listTop);
-        if (DocsPage.docList.clicked >= 0
-            && DocsPage.docList.clicked < rowDoc.Count) {
-            selSig.Set(rowDoc[DocsPage.docList.clicked]);
-            codeScrollSig.Set(0);
-            app.RequestRedraw();
+        if (DocsPage.docList == null) {
+            DocsPage.docList = new ListView<DocTopic>(DocTopicRow.Of);
+            DocsPage.docList.Class = "flat";
+            DocsPage.docList.EmptyText(ZanIDE.T("No topics match your search.",
+                                                "没有匹配搜索的主题。"));
+            DocsPage.docList.OnSelect(DocsPage.TopicPicked);
         }
+        DocsPage.docSel = selSig;
+        DocsPage.docCodeScroll = codeScrollSig;
+        DocsPage.docList.Bind(topics);
+        DocsPage.docList.SelectIndex(selRow);
+        DocsPage.docList.RenderInside(
+            app, Rect.Create(sx, listTop, swid, listBottom - listTop));
         bool click = app.ClickAvailable();
 
         // ---- Detail pane ----
@@ -838,9 +903,17 @@ class DocsPage {
                 Rect.Create(px, py - app.Scale(20), w - app.Scale(36),
                             app.Scale(96)));
         } else if (name == "ListView") {
-            List<string> items = new List<string>();
-            items.Add("Alpha"); items.Add("Beta"); items.Add("Gamma");
-            ListView.OfStrings(items).DrawList(app, px, py - app.Scale(14), app.Scale(260));
+            if (DocsPage.previewList == null) {
+                List<string> items = new List<string>();
+                items.Add("Alpha"); items.Add("Beta"); items.Add("Gamma");
+                DocsPage.previewList =
+                    new ListView<string>(new ListColumn<string>("", s => s));
+                DocsPage.previewList.Class = "flat";
+                DocsPage.previewList.Bind(items);
+            }
+            DocsPage.previewList.RenderInside(app,
+                Rect.Create(px, py - app.Scale(14), app.Scale(260),
+                            app.Scale(96)));
         } else if (name == "Loading") {
             new Spin(36).RenderAt(app, px + app.Scale(12),
                                   py + app.Scale(6));
