@@ -572,6 +572,17 @@ add_test(NAME conformance_multifile
     -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_multifile${_exe_ext}
     -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
+# ---- Namespace collisions: two namespaces declaring the same simple names,
+#      including static calls through them (see nsresolve.c). ----
+add_test(NAME conformance_nsdup
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/conformance/nsdup/main.zan
+    "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/conformance/nsdup/alpha.zan;${CMAKE_SOURCE_DIR}/tests/conformance/nsdup/beta.zan"
+    -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/nsdup/expected.out
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_nsdup${_exe_ext}
+    -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+
 # ---- Self-hosting: build gen1 with the C host, emit IR for a real program,
 #      clang-compile + run + diff stdout, and verify malformed input fails
 #      closed (non-zero, no .ll). clang is optional -- without it the stdout

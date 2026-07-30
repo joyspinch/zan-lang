@@ -15,6 +15,14 @@
  *      declaration's own namespace, its `using` imports, and explicit qualified
  *      names.  Non-conflicting simple names are never touched, so all existing
  *      single-namespace code binds exactly as before.
+ *
+ * A type name also appears in expression position, as the receiver of a static
+ * member access (`Dispatcher.Post(h)`, `Colors.Red`), where it parses as a plain
+ * identifier and not as a type reference.  Those receivers are rewritten too --
+ * otherwise renaming the declaration leaves every static call to it unresolved.
+ * Identifiers that a local, parameter, foreach/catch variable or lambda
+ * parameter of the enclosing member shadows are left alone, since there the
+ * name means the variable, not the type.
  */
 
 #include "nsresolve.h"
@@ -24,6 +32,7 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <stdlib.h>
 
 /* ---- istr helpers ---- */
 
@@ -100,12 +109,43 @@ typedef struct {
     bool conflicting;
 } nr_type_t;
 
+/* Names bound by the member currently being walked (locals, parameters,
+ * foreach/catch variables, lambda parameters): they shadow a type of the same
+ * name, so a `name.Member` receiver among them is a value, not a type. */
+typedef struct {
+    zan_istr_t *items;
+    int count;
+    int cap;
+} nr_shadow_t;
+
 typedef struct {
     nr_type_t *items;
     int count;
     zan_arena_t *arena;
     zan_diag_t *diag;
+    nr_shadow_t shadow;
 } nr_ctx_t;
+
+static void shadow_add(nr_shadow_t *s, zan_istr_t name) {
+    if (name.len == 0) return;
+    for (int i = 0; i < s->count; i++)
+        if (ns_istr_eq(s->items[i], name)) return;
+    if (s->count == s->cap) {
+        int cap = s->cap ? s->cap * 2 : 16;
+        zan_istr_t *items = (zan_istr_t *)realloc(s->items,
+                                sizeof(zan_istr_t) * (size_t)cap);
+        if (!items) return;
+        s->items = items;
+        s->cap = cap;
+    }
+    s->items[s->count++] = name;
+}
+
+static bool shadow_has(nr_shadow_t *s, zan_istr_t name) {
+    for (int i = 0; i < s->count; i++)
+        if (ns_istr_eq(s->items[i], name)) return true;
+    return false;
+}
 
 static bool is_type_decl_kind(zan_ast_kind_t k) {
     return k == AST_CLASS_DECL || k == AST_STRUCT_DECL ||
@@ -213,6 +253,187 @@ static void resolve_ref(nr_ctx_t *c, zan_ast_node_t *tr,
     }
 }
 
+/* Resolves a simple name in expression position to a declared type, honoring
+ * the referring declaration's namespace and `using` imports, and rewrites it to
+ * that type's (mangled) name.  Anything that does not resolve to a renamed
+ * declaration -- a variable, a builtin, a type whose name never collided -- is
+ * left exactly as it was. */
+static void resolve_static_receiver(nr_ctx_t *c, zan_ast_node_t *id,
+                                    zan_istr_t ctx_ns, zan_ast_list_t *usings) {
+    zan_istr_t R = id->ident.name;
+    if (R.len == 0 || shadow_has(&c->shadow, R)) return;
+
+    nr_type_t *t = NULL;
+    if (ctx_ns.len) t = find_full(c, join_ns(c->arena, ctx_ns, R));
+    if (!t && usings) {
+        for (int i = 0; i < usings->count && !t; i++) {
+            zan_ast_node_t *u = usings->items[i];
+            if (!u || u->kind != AST_USING_DECL || u->using_decl.is_static) continue;
+            zan_istr_t up = flatten_qname(u->using_decl.name, c->arena);
+            t = find_full(c, join_ns(c->arena, up, R));
+        }
+    }
+    if (!t) t = find_full(c, R);
+    if (t && !ns_istr_eq(t->final, R)) id->ident.name = t->final;
+}
+
+/* Flattens a receiver made of identifiers and member accesses (`Gui.Reactive`)
+ * into a dotted name; an empty name means it is something else. */
+static zan_istr_t flatten_receiver(nr_ctx_t *c, zan_ast_node_t *n) {
+    zan_istr_t empty = {0};
+    if (!n) return empty;
+    if (n->kind == AST_IDENTIFIER) return n->ident.name;
+    if (n->kind == AST_MEMBER_ACCESS) {
+        zan_istr_t head = flatten_receiver(c, n->member.object);
+        if (head.len == 0) return empty;
+        return join_ns(c->arena, head, n->member.name);
+    }
+    return empty;
+}
+
+/* Rewrites a namespace-qualified static receiver (`Beta.Log.Line(...)`) to the
+ * renamed declaration: the whole `Beta.Log` chain collapses into the single
+ * identifier the binder knows. Only an exact namespace+type match collapses, so
+ * a field chain (`this.a.b`) or a value's member is never touched. */
+static void resolve_qualified_receiver(nr_ctx_t *c, zan_ast_node_t *recv) {
+    zan_istr_t full = flatten_receiver(c, recv);
+    if (full.len == 0 || !ns_has_dot(full)) return;
+    nr_type_t *t = find_full(c, full);
+    if (!t) return;
+    recv->kind = AST_IDENTIFIER;
+    recv->ident.name = t->final;
+}
+
+/* ---- shadow collection ---- */
+
+static void collect_shadows(nr_ctx_t *c, zan_ast_node_t *n);
+
+static void collect_shadows_list(nr_ctx_t *c, zan_ast_list_t *l) {
+    if (!l) return;
+    for (int i = 0; i < l->count; i++) collect_shadows(c, l->items[i]);
+}
+
+/* Gathers every name the member binds, anywhere in its body: nsresolve has no
+ * scopes, so one flat set per member is what keeps a variable from being
+ * mistaken for a type of the same name. */
+static void collect_shadows(nr_ctx_t *c, zan_ast_node_t *n) {
+    if (!n) return;
+    switch (n->kind) {
+    case AST_PARAM:
+        shadow_add(&c->shadow, n->param.name);
+        collect_shadows(c, n->param.default_val);
+        break;
+    case AST_VAR_DECL:
+        shadow_add(&c->shadow, n->var_decl.name);
+        collect_shadows(c, n->var_decl.initializer);
+        break;
+    case AST_FOREACH_STMT:
+        shadow_add(&c->shadow, n->foreach_stmt.var_name);
+        collect_shadows(c, n->foreach_stmt.collection);
+        collect_shadows(c, n->foreach_stmt.body);
+        break;
+    case AST_CATCH_CLAUSE:
+        shadow_add(&c->shadow, n->catch_clause.var_name);
+        collect_shadows(c, n->catch_clause.body);
+        break;
+    case AST_LAMBDA:
+        collect_shadows_list(c, &n->lambda.params);
+        collect_shadows(c, n->lambda.body);
+        break;
+    case AST_BLOCK:
+        collect_shadows_list(c, &n->block.stmts);
+        break;
+    case AST_EXPR_STMT:  collect_shadows(c, n->expr_stmt.expr); break;
+    case AST_RETURN_STMT: collect_shadows(c, n->ret.value); break;
+    case AST_IF_STMT:
+        collect_shadows(c, n->if_stmt.cond);
+        collect_shadows(c, n->if_stmt.then_body);
+        collect_shadows(c, n->if_stmt.else_body);
+        break;
+    case AST_WHILE_STMT:
+    case AST_DO_WHILE_STMT:
+        collect_shadows(c, n->while_stmt.cond);
+        collect_shadows(c, n->while_stmt.body);
+        break;
+    case AST_FOR_STMT:
+        collect_shadows(c, n->for_stmt.init);
+        collect_shadows(c, n->for_stmt.cond);
+        collect_shadows(c, n->for_stmt.step);
+        collect_shadows(c, n->for_stmt.body);
+        break;
+    case AST_TRY_STMT:
+        collect_shadows(c, n->try_stmt.try_body);
+        collect_shadows_list(c, &n->try_stmt.catches);
+        collect_shadows(c, n->try_stmt.finally_body);
+        break;
+    case AST_SWITCH_STMT:
+        collect_shadows(c, n->switch_stmt.expr);
+        collect_shadows_list(c, &n->switch_stmt.cases);
+        break;
+    case AST_SWITCH_CASE:
+        collect_shadows(c, n->switch_case.body);
+        break;
+    case AST_LOCK_STMT:
+        collect_shadows(c, n->lock_stmt.expr);
+        collect_shadows(c, n->lock_stmt.body);
+        break;
+    case AST_BINARY:
+    case AST_ASSIGNMENT:
+        collect_shadows(c, n->binary.left);
+        collect_shadows(c, n->binary.right);
+        break;
+    case AST_UNARY:
+    case AST_POSTFIX_UNARY:
+        collect_shadows(c, n->unary.operand);
+        break;
+    case AST_CALL:
+        collect_shadows(c, n->call.callee);
+        collect_shadows_list(c, &n->call.args);
+        break;
+    case AST_MEMBER_ACCESS:
+        collect_shadows(c, n->member.object);
+        break;
+    case AST_INDEX:
+        collect_shadows(c, n->index.object);
+        collect_shadows(c, n->index.index);
+        break;
+    case AST_NEW_EXPR:
+        collect_shadows_list(c, &n->new_expr.args);
+        break;
+    case AST_CONDITIONAL:
+        collect_shadows(c, n->conditional.cond);
+        collect_shadows(c, n->conditional.then_expr);
+        collect_shadows(c, n->conditional.else_expr);
+        break;
+    case AST_CAST_EXPR:
+    case AST_TYPEOF_EXPR:
+    case AST_SIZEOF_EXPR:
+        collect_shadows(c, n->cast.expr);
+        break;
+    case AST_IS_EXPR:
+    case AST_AS_EXPR:
+        collect_shadows(c, n->type_test.expr);
+        break;
+    case AST_AWAIT_EXPR:
+        collect_shadows(c, n->await_expr.expr);
+        break;
+    case AST_STRING_INTERP:
+        collect_shadows_list(c, &n->string_interp.parts);
+        break;
+    case AST_REF_ARG:
+        collect_shadows(c, n->ref_arg.expr);
+        break;
+    case AST_THROW_STMT:
+        collect_shadows(c, n->throw_stmt.value);
+        break;
+    case AST_YIELD_STMT:
+        collect_shadows(c, n->yield_stmt.value);
+        break;
+    default:
+        break;
+    }
+}
+
 /* ---- AST walk ---- */
 
 static void nr_walk(nr_ctx_t *c, zan_ast_node_t *n,
@@ -247,6 +468,9 @@ static void nr_walk(nr_ctx_t *c, zan_ast_node_t *n,
     case AST_METHOD_DECL:
     case AST_CONSTRUCTOR_DECL:
     case AST_DESTRUCTOR_DECL:
+        c->shadow.count = 0;
+        collect_shadows_list(c, &n->method_decl.params);
+        collect_shadows(c, n->method_decl.body);
         nr_walk(c, n->method_decl.return_type, ns, usings);
         nr_walk_list(c, &n->method_decl.params, ns, usings);
         nr_walk_list(c, &n->method_decl.where_clauses, ns, usings);
@@ -363,6 +587,10 @@ static void nr_walk(nr_ctx_t *c, zan_ast_node_t *n,
         break;
 
     case AST_MEMBER_ACCESS:
+        if (n->member.object && n->member.object->kind == AST_IDENTIFIER)
+            resolve_static_receiver(c, n->member.object, ns, usings);
+        else if (n->member.object && n->member.object->kind == AST_MEMBER_ACCESS)
+            resolve_qualified_receiver(c, n->member.object);
         nr_walk(c, n->member.object, ns, usings);
         break;
 
@@ -440,6 +668,9 @@ void zan_nsresolve_run(zan_ast_node_t *unit, zan_arena_t *arena, zan_diag_t *dia
     c.arena = arena;
     c.diag = diag;
     c.count = 0;
+    c.shadow.items = NULL;
+    c.shadow.count = 0;
+    c.shadow.cap = 0;
     c.items = (nr_type_t *)zan_arena_alloc(arena,
                     sizeof(nr_type_t) * (size_t)(decls->count + 1));
 
@@ -481,6 +712,8 @@ void zan_nsresolve_run(zan_ast_node_t *unit, zan_arena_t *arena, zan_diag_t *dia
     for (int i = 0; i < decls->count; i++) {
         zan_ast_node_t *d = decls->items[i];
         if (!d) continue;
+        c.shadow.count = 0;
         nr_walk(&c, d, d->ns_name, d->ns_usings);
     }
+    free(c.shadow.items);
 }
