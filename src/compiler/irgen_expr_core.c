@@ -496,6 +496,26 @@ static int type_family(zan_type_t *t) {
     }
 }
 
+/* Type of an expression-bodied lambda read against a delegate signature: its
+ * parameters take the delegate's types, so `i => Wrap(i.name)` types as what
+ * Wrap returns. NULL when the body is a block or nothing resolves. */
+static zan_type_t *lambda_body_type(zan_irgen_t *g, zan_ast_node_t *lam,
+                                    zan_type_t *dt, local_scope_t *locals) {
+    if (!lam || !dt || !locals) return NULL;
+    zan_ast_node_t *body = lam->lambda.body;
+    if (!body || body->kind == AST_BLOCK) return NULL;
+    int mark = locals->count;
+    for (int k = 0; k < lam->lambda.params.count; k++) {
+        zan_ast_node_t *p = lam->lambda.params.items[k];
+        zan_type_t *pt = k < dt->delegate_param_count
+            ? dt->delegate_param_types[k] : NULL;
+        local_add(locals, p->param.name, NULL, pt);
+    }
+    zan_type_t *bt = infer_expr_type(g, body, locals);
+    locals->count = mark;
+    return bt;
+}
+
 static struct zan_ctor_entry *find_ctor(zan_irgen_t *g, zan_symbol_t *type_sym,
                                         zan_ast_list_t *args, local_scope_t *locals,
                                         zan_ast_node_t *exclude) {
@@ -515,6 +535,28 @@ static struct zan_ctor_entry *find_ctor(zan_irgen_t *g, zan_symbol_t *type_sym,
             for (int j = 0; j < argc; j++) {
                 zan_ast_node_t *param = entry->decl->method_decl.params.items[j];
                 zan_type_t *pt = zan_binder_resolve_type(g->binder, param->param.type);
+                /* A lambda converts to a delegate parameter and to nothing
+                 * else, so it both picks the delegate overload and rules the
+                 * others out. Ranking it by inferred type cannot work: a
+                 * lambda expression has no type of its own. */
+                if (pt && args->items[j] && args->items[j]->kind == AST_LAMBDA) {
+                    zan_ast_node_t *lam = args->items[j];
+                    if (pt->kind != TYPE_DELEGATE ||
+                        pt->delegate_param_count != lam->lambda.params.count) {
+                        compatible = false;
+                        break;
+                    }
+                    score += 2;
+                    /* Two delegate overloads differ by what the lambda
+                     * returns, so the body's type decides between them: a row
+                     * template returning a control must not bind to the
+                     * column overload that returns a string. */
+                    zan_type_t *bt = lambda_body_type(g, lam, pt, locals);
+                    if (bt && pt->delegate_ret_type &&
+                        types_concrete_equal(bt, pt->delegate_ret_type))
+                        score += 2;
+                    continue;
+                }
                 zan_type_t *at = infer_expr_type(g, args->items[j], locals);
                 if (!pt || !at || type_mentions_tp(pt) || type_mentions_tp(at))
                     continue;
@@ -870,6 +912,15 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
          * chained member access (e.g. Next().field) can find the struct. */
         zan_ast_node_t *callee = e->call.callee;
         if (!callee) return NULL;
+        /* Invoking a delegate-typed local or field: the call's type is the
+         * delegate's return type. Without this a template call used straight
+         * as a receiver (`rowOf(item).Kind()`) had no type and lowered to a
+         * constant. */
+        if (callee->kind == AST_IDENTIFIER || callee->kind == AST_MEMBER_ACCESS) {
+            zan_type_t *dt = infer_expr_type_raw(g, callee, locals);
+            if (dt && dt->kind == TYPE_DELEGATE)
+                return dt->delegate_ret_type;
+        }
         /* Built-in string instance methods return string but have no symbol to
          * resolve through, so name-match them (mirrors is_string_expr) — lets
          * their owned result be released when passed straight into a call. */

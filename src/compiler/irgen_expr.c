@@ -3059,6 +3059,14 @@ static LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                                 ctor->decl->method_decl.params.items[k];
                             zan_type_t *pt = zan_binder_resolve_type(
                                 g->binder, param->param.type);
+                            /* A generic class's constructor can spell a
+                             * parameter in the class's type parameters
+                             * (`TextOf<T> f`). Resolve it against the
+                             * instantiation, or a lambda argument would be
+                             * converted against an erased signature and the
+                             * stored delegate crashed when invoked. */
+                            if (new_inst && new_inst->type_arg_count > 0)
+                                pt = subst_delegate_sig(g, pt, new_inst);
                             call_args[k + 1] = emit_arg_typed(
                                 g, expr->new_expr.args.items[k], pt, locals);
                         }
