@@ -1,6 +1,7 @@
 using System;
 using Gui.Widget;
 using Gui;
+using System.Json;
 
 namespace Gui.Designer;
 
@@ -661,22 +662,6 @@ partial class Designer {
         return o;
     }
 
-    /// Parses an `"on<Event>": "name"` line into the field's handler table.
-    /// `type` is emitted before handlers, so cur.Events() already reflects the
-    /// correct field type by the time these lines are read.
-    void ParseHandlerLine(FormField cur, string ln) {
-        List<string> evs = cur.Events();
-        int i = 0;
-        while (i < evs.Count) {
-            if (LineKey(ln, "on" + evs[i])) {
-                cur.SetHandler(evs[i], JStr(JAfter(ln)));
-                i = evs.Count;
-            } else {
-                i = i + 1;
-            }
-        }
-    }
-
     string EmitFieldBody(FormField f, int depth) {
         string p = Indent(depth);
         string o = "";
@@ -706,149 +691,127 @@ partial class Designer {
         return o;
     }
 
-    /// Rebuilds the form from a JSON document produced by SaveJson (or hand
-    /// written). Tolerant of pretty-printed whitespace: it scans line by line,
-    /// keys before "fields" set the form config, then each { ... } block in the
-    /// array becomes a field.
+    /// Rebuilds the form from a JSON design document produced by SaveJson (or
+    /// hand written / tool emitted). Parsed with the real JSON reader, so any
+    /// valid formatting - pretty printed, compact, or reordered keys - loads
+    /// identically instead of depending on a one-key-per-line layout.
     void LoadJson(string s) {
-        List<string> lines = Serialize.SplitLines(s);
         fields = new List<FormField>();
-        // Stack of open field objects; a new `{` becomes a child of the field
-        // on top of the stack (its container), or a top-level field when empty.
-        List<FormField> stack = new List<FormField>();
-        bool inFields = false;
-        int total = 0;
-        int i = 0;
-        while (i < lines.Count) {
-            string ln = Trim(lines[i]);
-            if (!inFields) {
-                if (LineKey(ln, "fields")) {
-                    inFields = true;
-                } else if (LineKey(ln, "name")) {
-                    formNameSig.Set(JStr(JAfter(ln)));
-                } else if (LineKey(ln, "labelPos")) {
-                    labelPos = JInt(JAfter(ln));
-                } else if (LineKey(ln, "formSize")) {
-                    formSize = JInt(JAfter(ln));
-                } else if (LineKey(ln, "labelWidth")) {
-                    labelWidth = JInt(JAfter(ln));
-                } else if (LineKey(ln, "hideStar")) {
-                    hideStar = JBool(JAfter(ln));
-                } else if (LineKey(ln, "showSubmit")) {
-                    showSubmit = JBool(JAfter(ln));
-                } else if (LineKey(ln, "showReset")) {
-                    showReset = JBool(JAfter(ln));
-                } else if (LineKey(ln, "submit")) {
-                    submitSig.Set(JStr(JAfter(ln)));
-                } else if (LineKey(ln, "winW")) {
-                    winW = JInt(JAfter(ln));
-                } else if (LineKey(ln, "winH")) {
-                    winH = JInt(JAfter(ln));
-                } else if (LineKey(ln, "winTitle")) {
-                    winTitleSig.Set(JStr(JAfter(ln)));
-                } else if (LineKey(ln, "winResizable")) {
-                    winResizable = JBool(JAfter(ln));
-                } else if (LineKey(ln, "winTool")) {
-                    winTool = JBool(JAfter(ln));
-                } else if (LineKey(ln, "winCenter")) {
-                    winCenter = JBool(JAfter(ln));
-                } else if (LineKey(ln, "winPosX")) {
-                    winPosX = JInt(JAfter(ln));
-                } else if (LineKey(ln, "winPosY")) {
-                    winPosY = JInt(JAfter(ln));
-                }
-            } else {
-                if (StartsWith(ln, "{")) { total = total + 1; }
-                i = ParseFieldLine(lines, i, ln, fields, stack);
-            }
-            i = i + 1;
-        }
-        seq = total;
         sel = null;
         selPrev = null;
         activeContainer = null;
-    }
-
-    /// Handles one line inside the "fields" array (shared by LoadJson and
-    /// ParseComponentFields); returns the possibly-advanced line index (the
-    /// "options" array can span several lines).
-    int ParseFieldLine(List<string> lines, int i, string ln,
-            List<FormField> topList, List<FormField> stack) {
-        if (StartsWith(ln, "{")) {
-            FormField nf = new FormField(0);
-            nf.SetOptionsFrom("");
-            if (stack.Count > 0) {
-                stack[stack.Count - 1].kids.Add(nf);
-            } else {
-                topList.Add(nf);
-            }
-            stack.Add(nf);
-        } else if (StartsWith(ln, "}")) {
-            if (stack.Count > 0) { stack.RemoveAt(stack.Count - 1); }
-        } else if (stack.Count > 0) {
-            FormField cur = stack[stack.Count - 1];
-            if (LineKey(ln, "type")) {
-                cur.ftype = JInt(JAfter(ln));
-            } else if (LineKey(ln, "custom")) {
-                cur.customKind = JStr(JAfter(ln));
-            } else if (LineKey(ln, "label")) {
-                cur.label = JStr(JAfter(ln));
-            } else if (LineKey(ln, "name")) {
-                cur.fname = JStr(JAfter(ln));
-                cur.name = cur.fname;
-            } else if (LineKey(ln, "placeholder")) {
-                cur.placeholder = JStr(JAfter(ln));
-            } else if (LineKey(ln, "bind")) {
-                cur.bindPath = JStr(JAfter(ln));
-            } else if (LineKey(ln, "bindProp")) {
-                cur.bindProp = JStr(JAfter(ln));
-            } else if (LineKey(ln, "required")) {
-                cur.required = JBool(JAfter(ln));
-            } else if (LineKey(ln, "span")) {
-                cur.span = JInt(JAfter(ln));
-            } else if (LineKey(ln, "defOn")) {
-                cur.defOn = JBool(JAfter(ln));
-            } else if (LineKey(ln, "childTab")) {
-                cur.childTab = JInt(JAfter(ln));
-            } else if (LineKey(ln, "activeTab")) {
-                cur.uiState.Set(JInt(JAfter(ln)));
-            } else if (LineKey(ln, "change")) {
-                cur.SetHandler("Change", JStr(JAfter(ln)));
-            } else if (LineKey(ln, "options")) {
-                string rawOptions = JAfter(ln);
-                while (!JsonArrayClosed(rawOptions) && i + 1 < lines.Count) {
-                    i = i + 1;
-                    rawOptions = rawOptions + "\n" + Trim(lines[i]);
-                }
-                ParseOptions(cur, rawOptions);
-            } else {
-                ParseHandlerLine(cur, ln);
-            }
+        JsonValue root = JsonValue.ParseLenient(s);
+        if (root == null || !root.IsObject()) {
+            seq = 0;
+            return;
         }
-        return i;
+        if (root.Has("name")) { formNameSig.Set(root.Str("name", formNameSig.Get())); }
+        labelPos = root.Int("labelPos", labelPos);
+        formSize = root.Int("formSize", formSize);
+        labelWidth = root.Int("labelWidth", labelWidth);
+        hideStar = root.Bool("hideStar", hideStar);
+        showSubmit = root.Bool("showSubmit", showSubmit);
+        showReset = root.Bool("showReset", showReset);
+        if (root.Has("submit")) { submitSig.Set(root.Str("submit", "")); }
+        winW = root.Int("winW", winW);
+        winH = root.Int("winH", winH);
+        if (root.Has("winTitle")) { winTitleSig.Set(root.Str("winTitle", winTitleSig.Get())); }
+        winResizable = root.Bool("winResizable", winResizable);
+        winTool = root.Bool("winTool", winTool);
+        winCenter = root.Bool("winCenter", winCenter);
+        winPosX = root.Int("winPosX", winPosX);
+        winPosY = root.Int("winPosY", winPosY);
+        JsonValue arr = root.Get("fields");
+        if (arr != null && arr.IsArray()) {
+            BuildFieldsFromJson(arr, fields);
+        }
+        seq = CountFields(fields);
     }
 
-    /// Parses just the "fields" array of a design JSON into a fresh list,
-    /// used to instantiate saved user components without touching the form.
+    /// Parses just the "fields" array of a design JSON into a fresh list, used
+    /// to instantiate saved user components without touching the form. Accepts
+    /// either a full design document or a bare fields array.
     List<FormField> ParseComponentFields(string s) {
-        List<string> lines = Serialize.SplitLines(s);
         List<FormField> outp = new List<FormField>();
-        List<FormField> stack = new List<FormField>();
-        bool inFields = false;
-        int i = 0;
-        while (i < lines.Count) {
-            string ln = Trim(lines[i]);
-            if (!inFields) {
-                if (LineKey(ln, "fields")) { inFields = true; }
-            } else {
-                i = ParseFieldLine(lines, i, ln, outp, stack);
-            }
-            i = i + 1;
+        JsonValue root = JsonValue.ParseLenient(s);
+        if (root == null) { return outp; }
+        JsonValue arr = root.Get("fields");
+        if (arr == null && root.IsArray()) { arr = root; }
+        if (arr != null && arr.IsArray()) {
+            BuildFieldsFromJson(arr, outp);
         }
         return outp;
     }
 
-    // --- JSON helpers --------------------------------------------------------
+    /// Appends each object of a JSON array as a FormField (recursing into
+    /// container "kids"), preserving order.
+    void BuildFieldsFromJson(JsonValue arr, List<FormField> dst) {
+        int i = 0;
+        while (i < arr.Count()) {
+            JsonValue o = arr.At(i);
+            if (o != null && o.IsObject()) {
+                dst.Add(FieldFromJson(o));
+            }
+            i = i + 1;
+        }
+    }
+
+    /// Builds one FormField from a JSON object. "type" is applied first so the
+    /// field's event set (Events()) and container-ness reflect the real type
+    /// before handlers, options and children are read.
+    FormField FieldFromJson(JsonValue o) {
+        FormField f = new FormField(0);
+        f.SetOptionsFrom("");
+        f.ftype = o.Int("type", 0);
+        f.customKind = o.Str("custom", f.customKind);
+        f.label = o.Str("label", f.label);
+        f.fname = o.Str("name", f.fname);
+        f.name = f.fname;
+        f.placeholder = o.Str("placeholder", f.placeholder);
+        f.bindPath = o.Str("bind", f.bindPath);
+        f.bindProp = o.Str("bindProp", f.bindProp);
+        f.required = o.Bool("required", f.required);
+        f.span = o.Int("span", f.span);
+        f.defOn = o.Bool("defOn", f.defOn);
+        f.childTab = o.Int("childTab", f.childTab);
+        f.uiState.Set(o.Int("activeTab", f.uiState.Get()));
+        List<string> evs = f.Events();
+        int e = 0;
+        while (e < evs.Count) {
+            string key = "on" + evs[e];
+            if (o.Has(key)) { f.SetHandler(evs[e], o.Str(key, "")); }
+            e = e + 1;
+        }
+        if (o.Has("change")) { f.SetHandler("Change", o.Str("change", "")); }
+        JsonValue opts = o.Get("options");
+        if (opts != null && opts.IsArray()) {
+            f.SetOptionsFrom("");
+            int k = 0;
+            while (k < opts.Count()) {
+                f.AddOption(opts.At(k).AsString(""));
+                k = k + 1;
+            }
+        }
+        JsonValue kids = o.Get("kids");
+        if (kids != null && kids.IsArray()) {
+            BuildFieldsFromJson(kids, f.kids);
+        }
+        return f;
+    }
+
+    /// Total number of fields including nested container children; seeds the
+    /// unique-name counter after a load.
+    int CountFields(List<FormField> lst) {
+        int total = 0;
+        int i = 0;
+        while (i < lst.Count) {
+            total = total + 1 + CountFields(lst[i].kids);
+            i = i + 1;
+        }
+        return total;
+    }
+
+    // --- JSON serialisation helpers (used by SaveJson) ----------------------
 
     string JB(bool b) {
         if (b) { return "true"; }
@@ -870,12 +833,6 @@ partial class Designer {
         return r;
     }
 
-    string JUn(string ch) {
-        if (ch == "n") { return "\n"; }
-        if (ch == "t") { return "\t"; }
-        return ch;
-    }
-
     string JOpts(FormField f) {
         string r = "";
         int o = 0;
@@ -885,136 +842,5 @@ partial class Designer {
             o = o + 1;
         }
         return r;
-    }
-
-    /// Reads quoted strings out of a JSON array literal like ["a", "b"].
-    bool JsonArrayClosed(string raw) {
-        bool quoted = false;
-        bool escaped = false;
-        int i = 0;
-        while (i < raw.Length) {
-            string ch = raw.Substring(i, 1);
-            if (escaped) {
-                escaped = false;
-            } else if (ch == "\\") {
-                escaped = true;
-            } else if (ch == "\"") {
-                quoted = !quoted;
-            } else if (ch == "]" && !quoted) {
-                return true;
-            }
-            i = i + 1;
-        }
-        return false;
-    }
-
-    void ParseOptions(FormField f, string raw) {
-        f.SetOptionsFrom("");
-        int i = 0;
-        while (i < raw.Length) {
-            if (raw.Substring(i, 1) == "\"") {
-                string acc = "";
-                int j = i + 1;
-                bool done = false;
-                while (j < raw.Length && !done) {
-                    string ch = raw.Substring(j, 1);
-                    if (ch == "\\" && j + 1 < raw.Length) {
-                        acc = acc + JUn(raw.Substring(j + 1, 1));
-                        j = j + 2;
-                    } else if (ch == "\"") {
-                        done = true;
-                    } else {
-                        acc = acc + ch;
-                        j = j + 1;
-                    }
-                }
-                f.AddOption(acc);
-                i = j + 1;
-            } else {
-                i = i + 1;
-            }
-        }
-    }
-
-    // True when the trimmed line's key (the token in the leading "...") equals k.
-    bool LineKey(string line, string k) {
-        return StartsWith(line, "\"" + k + "\"");
-    }
-
-    bool StartsWith(string s, string p) {
-        if (s.Length < p.Length) { return false; }
-        return s.Substring(0, p.Length) == p;
-    }
-
-    // Everything after the first ':' on a line (the raw value, still with any
-    // trailing comma and surrounding spaces).
-    string JAfter(string line) {
-        int i = 0;
-        while (i < line.Length) {
-            if (line.Substring(i, 1) == ":") {
-                return Trim(line.Substring(i + 1, line.Length - i - 1));
-            }
-            i = i + 1;
-        }
-        return "";
-    }
-
-    string Trim(string s) {
-        int a = 0;
-        int b = s.Length;
-        while (a < b) {
-            string ch = s.Substring(a, 1);
-            if (ch == " " || ch == "\t" || ch == "\r") { a = a + 1; }
-            else { break; }
-        }
-        while (b > a) {
-            string ch = s.Substring(b - 1, 1);
-            if (ch == " " || ch == "\t" || ch == "\r") { b = b - 1; }
-            else { break; }
-        }
-        return s.Substring(a, b - a);
-    }
-
-    string StripComma(string s) {
-        string t = Trim(s);
-        if (t.Length > 0 && t.Substring(t.Length - 1, 1) == ",") {
-            return Trim(t.Substring(0, t.Length - 1));
-        }
-        return t;
-    }
-
-    // Decodes a JSON scalar value: a quoted string (unescaped) or a bare token.
-    string JStr(string raw) {
-        string t = Trim(raw);
-        if (t.Length == 0) { return ""; }
-        if (t.Substring(0, 1) == "\"") {
-            string acc = "";
-            int j = 1;
-            bool done = false;
-            while (j < t.Length && !done) {
-                string ch = t.Substring(j, 1);
-                if (ch == "\\" && j + 1 < t.Length) {
-                    acc = acc + JUn(t.Substring(j + 1, 1));
-                    j = j + 2;
-                } else if (ch == "\"") {
-                    done = true;
-                } else {
-                    acc = acc + ch;
-                    j = j + 1;
-                }
-            }
-            return acc;
-        }
-        return StripComma(t);
-    }
-
-    int JInt(string raw) {
-        string t = StripComma(raw);
-        if (t.Length == 0) { return 0; }
-        return Convert.ToInt32(t);
-    }
-
-    bool JBool(string raw) {
-        return StripComma(raw) == "true";
     }
 }
