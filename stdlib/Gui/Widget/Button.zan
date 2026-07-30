@@ -18,6 +18,8 @@ namespace Gui.Widget;
 ///     .secondary .ghost .specular .loading        modifiers
 ///     .round .circle                              shape
 ///     .tiny .small .medium .large                 size (height/font/padding)
+///     .stacked                                    icon above the label
+///     .align-left                                 content at the leading edge
 ///
 /// `Style` resolves theme defaults -> skin rules -> hover/press states into one
 /// StyleBox, `BoxContent` paints that box with the icon and label in it, and
@@ -28,8 +30,19 @@ class Button : Control {
     /// frame (compiler-lowered Binding); `btn.Text = "OK";` stores a constant.
     Binding<string> Text;
     string Icon;
-    bool Disabled;
+    /// Bindable on/off state. Bind it to a model field (`btn.Checked = vm.bold;`)
+    /// and the button IS a toggle: a click flips that field and the resolved
+    /// style gets the `selected` state (`button:checked` in a skin).
+    Binding<bool> Checked;
+    /// Hover description, shown under the button once the hover settles. Empty
+    /// = no tip.
+    string Tip;
     int wid;
+    /// True for the frame this button was activated, for hosts that poll a
+    /// group of buttons (a ribbon, a toolbar) instead of binding a handler to
+    /// each one. `Disabled` is inherited from Control (bindable, and inherited
+    /// down the tree, so disabling a group disables its commands).
+    bool clicked;
     /// Fires on the frame the button is clicked (C#-style: `btn.Click += h;`).
     /// Handlers run through the UI-thread dispatch queue (App.DrainPosts), so a
     /// handler may rebuild the control tree, open a dialog or start a background
@@ -41,7 +54,9 @@ class Button : Control {
         this.InitControl(label, 1);
         Text = label;
         Icon = "";
-        Disabled = false;
+        Checked = false;
+        Tip = "";
+        clicked = false;
         wid = WidgetId.Next();
         wiresOwnEvents = true;
         Click = UiEvent.Create();
@@ -59,6 +74,25 @@ class Button : Control {
         return Text.Get();
     }
 
+    /// Current toggle state (false when the button is not a toggle).
+    bool IsChecked() { return Checked.Get(); }
+
+    /// A button whose Checked is bound to a model field is a toggle: a click
+    /// flips that field instead of only raising Click.
+    bool IsToggle() { return Checked.IsLive(); }
+
+    /// True for the frame the button was activated -- the polling counterpart
+    /// of `Click`.
+    bool WasClicked() { return clicked; }
+
+    /// What the hover bubble shows: the label, and under it what the command
+    /// does (the label alone says nothing new).
+    string TipText() {
+        if (Tip == "") { return this.Label(); }
+        if (this.Label() == "") { return Tip; }
+        return this.Label() + "\n" + Tip;
+    }
+
     /// The style this button resolves to right now (size, padding, colours).
     StyleBox ResolvedStyle(App app) {
         return Style.Full(app, "button", Class, name, Style.SNormal());
@@ -72,35 +106,67 @@ class Button : Control {
         StyleBox s = this.ResolvedStyle(app);
         if (Style.Has(Class, "circle")) { return s.HeightOr(t.heightMedium); }
         int fontPx = s.FontOr(t.fontSizeMedium);
+        int pads = s.PadLOr(t.paddingLarge) + s.PadROr(t.paddingLarge);
+        if (Style.Has(Class, "stacked")) {
+            return BoxContent.StackedWidth(app, Icon, this.Label(), fontPx) + pads;
+        }
         return BoxContent.Width(Icon, this.Label(), "", fontPx, s.GapOr(t.gapSmall))
-            + s.PadLOr(t.paddingLarge) + s.PadROr(t.paddingLarge);
+            + pads;
     }
 
-    /// Height from the resolved size class.
+    /// Height from the resolved size class -- or from the content for a stacked
+    /// button, whose icon sits above its label.
     int AutoHeight(App app) {
-        return this.ResolvedStyle(app).HeightOr(app.theme.heightMedium);
+        Theme t = app.theme;
+        StyleBox s = this.ResolvedStyle(app);
+        if (Style.Has(Class, "stacked")) {
+            int fontPx = s.FontOr(t.fontSizeMedium);
+            return s.HeightOr(BoxContent.StackedHeight(app, Icon, this.Label(),
+                                                       fontPx, s.GapOr(t.paddingTiny))
+                              + s.PadTOr(t.paddingSmall) + s.PadBOr(t.paddingSmall));
+        }
+        return s.HeightOr(t.heightMedium);
     }
 
     int Render(App app, int x, int y, int w) {
+        return this.RenderIn(app, x, y, w, 0);
+    }
+
+    /// Paints the button into an explicit box; `h` of 0 takes the height from
+    /// the resolved style (what Render does), any other value wins -- a strip
+    /// that gives its commands a row height (a ribbon band, a toolbar) passes
+    /// it here instead of styling every button.
+    int RenderIn(App app, int x, int y, int w, int h) {
         bool busy = Style.Has(Class, "loading");
+        bool off = this.IsDisabled();
+        clicked = false;
         // One resolve for the whole look: theme defaults for the button's
         // classes, the skin's `button…` rules on top, then the hover/press/focus
         // states cross-faded by the resolved `transition`.
         StyleBox s = this.ResolveEasedStyleAs(app, wid, "button", Class,
-                                              Disabled, false);
+                                              off, this.IsChecked());
         s.SetRadius(s.RadiusOr(app.theme.borderRadiusMedium));
         if (styleRadius != 0) { s.SetRadius(styleRadius); }
         if (w <= 0) { w = this.AutoWidth(app); }
         w = s.ClampW(w);
-        int h = s.ClampH(s.HeightOr(app.theme.heightMedium));
+        if (h <= 0) { h = s.HeightOr(this.AutoHeight(app)); }
+        h = s.ClampH(h);
         BoxContent.Paint(app, wid, "button", Class, name, s, x, y, w, h,
-                         Icon, this.Label(), "", busy, Disabled);
-        if (Disabled || busy) { return wid; }
+                         Icon, this.Label(), "", busy, off);
+        if (off || busy) { return wid; }
         if (Ui.Activate(app, wid, x, y, w, h)) {
+            clicked = true;
+            // A bound Checked makes the button a toggle: the click writes the
+            // model back through the binding before the handlers run.
+            if (this.IsToggle()) { Checked.Set(!this.IsChecked()); }
             Click.Post();
             // Wake the loop so the queued handler runs on the next iteration
             // even if no further OS event arrives.
             app.window.Wake();
+        }
+        if (Tip != "" && Ui.HoverLevel(app, wid) >= 900) {
+            Tooltip.Request(x + w / 2, y + h, this.TipText(), Tooltip.Bottom(),
+                            app.Scale(260));
         }
         On.Fire(app, wid);
         return wid;
@@ -110,37 +176,32 @@ class Button : Control {
 
     override string Kind() { return "Button"; }
 
+    /// Every property points at the field it edits, so reading and writing them
+    /// is the base class's job (Control.GetProp/SetProp) and this list is all the
+    /// property code the widget has.
     override List<PropSpec> Props() {
         List<PropSpec> ps = new List<PropSpec>();
-        ps.Add(PropSpec.Text("text", "Text"));
-        ps.Add(PropSpec.Text("icon", "Icon"));
-        ps.Add(PropSpec.Bool("disabled", "Disabled"));
+        PropSpec text = PropSpec.Text("text", "Text");
+        text.str = Text;
+        ps.Add(text);
+        PropSpec icon = PropSpec.Text("icon", "Icon");
+        icon.str = Icon;
+        ps.Add(icon);
+        PropSpec tip = PropSpec.Text("tip", "Tip");
+        tip.str = Tip;
+        ps.Add(tip);
+        PropSpec off = PropSpec.Bool("disabled", "Disabled");
+        off.flag = Disabled;
+        ps.Add(off);
+        PropSpec on = PropSpec.Bool("checked", "Checked");
+        on.flag = Checked;
+        ps.Add(on);
         // Everything visual is a class: `primary small round ghost loading`,
         // or whatever the skin's CSS defines.
-        ps.Add(PropSpec.Text("class", "Classes"));
+        PropSpec cls = PropSpec.Text("class", "Classes");
+        cls.str = Class;
+        ps.Add(cls);
         return ps;
-    }
-
-    override string GetProp(string key) {
-        if (key == "text") { return this.Label(); }
-        if (key == "icon") { return Icon; }
-        if (key == "class") { return Class; }
-        if (key == "disabled") {
-            if (Disabled) { return "true"; }
-            return "false";
-        }
-        return "";
-    }
-
-    override void SetProp(string key, string val) {
-        if (key == "text") { Text = val; name = val; }
-        else if (key == "icon") { Icon = val; }
-        else if (key == "class") { Class = val; }
-        else if (key == "disabled") { Disabled = (val == "true"); }
-        // Anything else a document stores is a variant class, either as a flag
-        // (`"round": true`) or as a name (`"size": "small"`).
-        else if (val == "true") { Class = Class + " " + key; }
-        else if (val != "" && val != "false") { Class = Class + " " + val; }
     }
 
     override List<string> Events() {
@@ -155,11 +216,11 @@ class Button : Control {
     /// can size the button without hand-computed coordinates.
     override void OnMeasure(App app) {
         StyleBox s = this.ResolveStyleAs(app, "button", Class, Style.SNormal());
-        prefH = s.HeightOr(app.theme.heightMedium);
+        prefH = s.HeightOr(this.AutoHeight(app));
         prefW = s.WidthOr(this.AutoWidth(app));
     }
 
     override void OnPaint(App app) {
-        this.Render(app, bx, by, bw);
+        this.RenderIn(app, bx, by, bw, bh);
     }
 }

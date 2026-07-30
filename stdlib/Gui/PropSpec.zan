@@ -3,27 +3,115 @@ using System;
 namespace Gui;
 
 /// Describes one editable property of a Control for the visual designer and the
-/// serializer. A control returns its list from Props(); the inspector uses each
-/// spec to pick an editor widget and the (de)serializer uses `key` with the
-/// control's GetProp/SetProp to round-trip values as strings.
+/// serializer, AND how to read and write it. A control returns its list from
+/// Props() and points each spec at the field it edits:
+///
+///     PropSpec icon = PropSpec.Text("icon", "Icon");
+///     icon.str = Icon;            // compiler-synthesised accessor pair
+///     ps.Add(icon);
+///
+/// Because the spec carries the accessor pair, `Control.GetProp/SetProp` read
+/// and write every property generically -- a widget declares each property once
+/// instead of repeating it in three string-matching methods.
 ///
 /// kind: 0 text, 1 int, 2 bool, 3 enum (see `options`), 4 color.
 class PropSpec {
     string key;
+    /// Extra keys the same property answers to in documents ("checked on" for a
+    /// "value" flag); never written back by the serializer.
+    string alias;
     string label;
     int kind;
     List<string> options;
+    /// The bound field, exactly one of the three (by `kind`). Assigning a field
+    /// here makes it a live binding, so the value is read and written straight
+    /// through to the widget; assigning an existing Binding shares it.
+    Binding<string> str;
+    Binding<int> num;
+    Binding<bool> flag;
+    /// A signal instead of a field, for the widgets whose value is reactive: the
+    /// write goes through Set, so subscribers still get their change event.
+    SignalString sstr;
+    SignalInt snum;
+    SignalBool sflag;
+    /// True when writing this property also renames the node, so the designer
+    /// tree follows the text a widget is identified by.
+    bool syncName;
 
     PropSpec(string k, string lbl, int kd) {
         key = k;
+        alias = "";
         label = lbl;
         kind = kd;
         options = new List<string>();
+        str = null;
+        num = null;
+        flag = null;
+        sstr = null;
+        snum = null;
+        sflag = null;
+        syncName = false;
+    }
+
+    /// True once the spec points at a field or signal, which is what lets the
+    /// base class serve the property without the widget's help.
+    bool IsBound() {
+        return str != null || num != null || flag != null ||
+               sstr != null || snum != null || sflag != null;
+    }
+
+    /// True when `key` names this property (its own key or one of its aliases).
+    bool Answers(string k) {
+        return key == k || Style.Has(alias, k);
+    }
+
+    /// Marks this property as the one that also names the node.
+    PropSpec AsName() {
+        syncName = true;
+        return this;
+    }
+
+    /// Also answer to `k` in documents (returns this, so it chains).
+    PropSpec Also(string k) {
+        if (alias == "") { alias = k; }
+        else { alias = alias + " " + k; }
+        return this;
+    }
+
+    /// The property's value as the string the designer and the document format
+    /// exchange (`"true"`/`"false"` for a flag, decimal for a number).
+    string Read() {
+        if (str != null) { return str.Get(); }
+        if (num != null) { return Convert.ToString(num.Get()); }
+        if (flag != null) { return PropSpec.Flag(flag.Get()); }
+        if (sstr != null) { return sstr.Get(); }
+        if (snum != null) { return Convert.ToString(snum.Get()); }
+        if (sflag != null) { return PropSpec.Flag(sflag.Get()); }
+        return "";
+    }
+
+    void Write(string val) {
+        if (str != null) { str.Set(val); return; }
+        if (num != null) { num.Set(Convert.ToInt32(val)); return; }
+        if (flag != null) { flag.Set(PropSpec.IsOn(val)); return; }
+        if (sstr != null) { sstr.Set(val); return; }
+        if (snum != null) { snum.Set(Convert.ToInt32(val)); return; }
+        if (sflag != null) { sflag.Set(PropSpec.IsOn(val)); }
+    }
+
+    static string Flag(bool on) {
+        if (on) { return "true"; }
+        return "false";
+    }
+
+    static bool IsOn(string val) {
+        return val == "true" || val == "1";
     }
 
     static PropSpec Text(string k, string lbl) { return new PropSpec(k, lbl, 0); }
     static PropSpec Int(string k, string lbl) { return new PropSpec(k, lbl, 1); }
     static PropSpec Bool(string k, string lbl) { return new PropSpec(k, lbl, 2); }
+    static PropSpec Color(string k, string lbl) { return new PropSpec(k, lbl, 4); }
 
     /// An enum property whose value is one of `opts` (stored as its label text).
     static PropSpec Enum(string k, string lbl, List<string> opts) {

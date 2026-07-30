@@ -100,6 +100,9 @@ class Control {
     /// Space separated CSS classes: `btn.Class = "primary small";` (assign,
     /// no setter) -- every visual variant a widget has is one of these.
     string Class;
+    /// Two-way disabled flag, inherited down the tree: `grp.Disabled = vm.busy;`
+    /// greys out and deafens the whole subtree (see IsDisabled).
+    Binding<bool> Disabled;
     StyleBox computedStyle;
     int computedStyleGen;
     string computedStyleType;
@@ -162,6 +165,7 @@ class Control {
         bindProp = "";
         bindSnapshot = "";
         Class = "";
+        Disabled = false;
         computedStyle = null;
         computedStyleGen = 0 - 1;
         computedStyleType = "";
@@ -214,6 +218,16 @@ class Control {
     Control OnResize(Action a) { Resize.Add(a); return this; }
     Control OnShow(Action a) { Show.Add(a); return this; }
     Control OnHide(Action a) { Hide.Add(a); return this; }
+
+    /// True when this control is disabled itself or sits under a disabled
+    /// ancestor, which is what a widget resolves its `:disabled` style and its
+    /// (missing) interaction from -- disabling a group disables its commands
+    /// without touching any of them.
+    bool IsDisabled() {
+        if (Disabled.Get()) { return true; }
+        if (parent != null) { return parent.IsDisabled(); }
+        return false;
+    }
 
     /// Stable id for this control's common event bundle (see FireCommon).
     int CommonId() {
@@ -956,14 +970,65 @@ class Control {
         On.AddByName(evt, a);
     }
 
-    /// Reads a property by key as text. Base knows nothing; widgets override for
-    /// the keys they publish in Props().
-    virtual string GetProp(string key) {
+    /// The spec for `key`, or null when this control publishes no such bound
+    /// property.
+    PropSpec PropOf(string key) {
+        List<PropSpec> ps = this.Props();
+        int i = 0;
+        while (i < ps.Count) {
+            if (ps[i].Answers(key) && ps[i].IsBound()) { return ps[i]; }
+            i = i + 1;
+        }
+        return null;
+    }
+
+    /// Hook for a property no field can express -- a comma-joined item list, a
+    /// value derived from several fields. Widgets that have one override this
+    /// pair; everything field-backed is served from Props() alone.
+    virtual string GetExtra(string key) {
         return "";
     }
 
-    /// Writes a property by key from text. Base ignores; widgets override.
+    /// Writes an extra property; returns false when the widget has no such key,
+    /// which lets the base fall back to treating it as a style class.
+    virtual bool SetExtra(string key, string val) {
+        return false;
+    }
+
+    /// Reads a property by key as text, through the accessor the widget bound in
+    /// Props() -- so a widget publishes each property once and needs no string
+    /// map of its own. `class`, `name` and `disabled` answer for every control.
+    virtual string GetProp(string key) {
+        if (key == "class") { return Class; }
+        if (key == "name") { return name; }
+        PropSpec p = this.PropOf(key);
+        if (p != null) { return p.Read(); }
+        return this.GetExtra(key);
+    }
+
+    /// Writes a property by key from text (the inverse of GetProp). An unknown
+    /// key names a style class instead, either as a flag (`"round": true`) or as
+    /// a variant name (`"size": "small"`), which is how a document sets the
+    /// visual variants a widget has no field for.
     virtual void SetProp(string key, string val) {
+        if (key == "class") { Class = val; return; }
+        if (key == "name") { name = val; return; }
+        PropSpec p = this.PropOf(key);
+        if (p != null) {
+            p.Write(val);
+            if (p.syncName) { name = val; }
+            return;
+        }
+        if (this.SetExtra(key, val)) { return; }
+        if (val == "true") { this.AddClass(key); }
+        else if (val != "" && val != "false") { this.AddClass(val); }
+    }
+
+    /// Adds a style class if it isn't there yet.
+    void AddClass(string cls) {
+        if (cls == "" || Style.Has(Class, cls)) { return; }
+        if (Class == "") { Class = cls; return; }
+        Class = Class + " " + cls;
     }
 
     /// Lays out and paints this subtree inside `area`: the single call a host

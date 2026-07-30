@@ -730,6 +730,17 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_datatable${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
+  # The property protocol (Props() specs -> Control.GetProp/SetProp) is what
+  # the designer and the serializer talk to, and it is pure computation.
+  add_test(NAME conformance_gui_props
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/prop_test.zan
+      "-DZANC_ARGS=--auto-stdlib;--driver-dir;$<TARGET_FILE_DIR:zan_gui>"
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_props.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_props${_exe_ext}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+
   # The CSS skin pipeline (Css parser -> StyleSheet -> StyleBox) is pure
   # computation, so it is verified headlessly against a golden dump.
   add_test(NAME conformance_gui_css
@@ -753,7 +764,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_webview_interop${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
-  set_tests_properties(runtime_gui conformance_gui_stack conformance_gui_text conformance_gui_codeeditor conformance_gui_datatable conformance_gui_css conformance_gui_webview_interop PROPERTIES
+  set_tests_properties(runtime_gui conformance_gui_stack conformance_gui_text conformance_gui_codeeditor conformance_gui_datatable conformance_gui_css conformance_gui_props conformance_gui_webview_interop PROPERTIES
     ENVIRONMENT "ZAN_LIB_PATH=$<TARGET_FILE_DIR:zan_gui>;LD_LIBRARY_PATH=$<TARGET_FILE_DIR:zan_gui>;DYLD_LIBRARY_PATH=$<TARGET_FILE_DIR:zan_gui>")
 endif()
 

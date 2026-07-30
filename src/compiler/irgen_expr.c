@@ -1071,6 +1071,9 @@ static void get_binding_accessors(zan_irgen_t *g, zan_symbol_t *cls,
  * lowering does not apply and the caller should emit a plain assignment). */
 static LLVMValueRef emit_binding_value(zan_irgen_t *g, zan_type_t *bind_t,
         zan_ast_node_t *rhs, local_scope_t *locals) {
+    /* `b = null` clears the binding rather than wrapping null in a const one,
+     * so an unbound slot stays testable with `b == null`. */
+    if (rhs && rhs->kind == AST_NULL_LITERAL) return NULL;
     zan_symbol_t *bsym = bind_t->sym;
     if (!bsym) {
         zan_istr_t bn = { (char *)"Binding", 7 };
@@ -1092,6 +1095,21 @@ static LLVMValueRef emit_binding_value(zan_irgen_t *g, zan_type_t *bind_t,
     if (fi_target < 0 || fi_getter < 0 || fi_setter < 0 ||
         fi_live < 0 || fi_const < 0) return NULL;
     zan_type_t *T = bind_t->type_arg_count > 0 ? bind_t->type_args[0] : NULL;
+
+    /* A bare field name inside its own class means `this.<field>`, so it binds
+     * live like any other field lvalue (`spec.str = Icon;`). */
+    if (rhs && rhs->kind == AST_IDENTIFIER && g->current_this &&
+        g->current_type_sym && !local_find(locals, rhs->ident.name)) {
+        zan_symbol_t *own = get_field_sym(g->current_type_sym, rhs->ident.name);
+        if (own && !field_member_is_static(own)) {
+            zan_ast_node_t *self = zan_ast_new(g->arena, AST_THIS_EXPR, rhs->loc);
+            zan_ast_node_t *ma = zan_ast_new(g->arena, AST_MEMBER_ACCESS, rhs->loc);
+            ma->member.object = self;
+            ma->member.name = rhs->ident.name;
+            ma->member.null_cond = 0;
+            rhs = ma;
+        }
+    }
 
     /* is the RHS a live-bindable field lvalue? */
     zan_symbol_t *cls = NULL;
