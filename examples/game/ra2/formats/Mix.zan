@@ -7,11 +7,11 @@ namespace Ra2.Formats;
 /// <summary>One file inside a MIX archive. Files are identified by a hash of
 /// their name; the name itself is not stored.</summary>
 class MixEntry {
-    int id;
+    long id;
     int offset;
     int size;
 
-    static MixEntry Create(int id, int offset, int size) {
+    static MixEntry Create(long id, int offset, int size) {
         MixEntry e = new MixEntry();
         e.id = id;
         e.offset = offset;
@@ -19,7 +19,7 @@ class MixEntry {
         return e;
     }
 
-    int Id() { return this.id; }
+    long Id() { return this.id; }
     int Offset() { return this.offset; }
     int Size() { return this.size; }
 }
@@ -48,15 +48,17 @@ class MixArchive {
     int headerLen;        // cached HeaderLength(), 0 until computed
     int dataStart;        // where payloads begin, relative to the archive start
     List<MixEntry> entries;
-    Dictionary<int, int> index;   // entry id -> position in entries
+    Dictionary<long, int> index;   // entry id -> position in entries
 
-    /// <summary>The TS/RA2 filename hash.</summary>
+    /// <summary>The TS/RA2 filename hash, as an unsigned 32-bit value widened
+    /// to <c>long</c>: <c>int</c> is 32 bits, so a hash with the top bit set
+    /// does not fit one.</summary>
     ///
     /// Westwood padded the uppercased name up to a multiple of four before
     /// running CRC32 over it, and the padding is not zeros: it is the length
     /// remainder followed by repeats of the byte at the last 4-byte boundary.
     /// Getting that wrong yields hashes that miss every real file.
-    static int HashName(string name) {
+    static long HashName(string name) {
         string s = name.ToUpper();
         int l = s.Length;
         int a = l >> 2;
@@ -83,13 +85,14 @@ class MixArchive {
         return one.ToStr(0, 1);
     }
 
-    /// Standard reflected CRC32 (polynomial 0xEDB88320), masked to 32 bits
-    /// because Zan's int is 64-bit and would otherwise keep the high garbage.
-    static int Crc32(string buf, int len) {
-        int crc = 0xFFFFFFFF;
+    /// Standard reflected CRC32 (polynomial 0xEDB88320), accumulated in a
+    /// `long` and masked to 32 bits: `int` is 32 bits, so the intermediate
+    /// shifts would overflow it.
+    static long Crc32(string buf, int len) {
+        long crc = 0xFFFFFFFF;
         int i = 0;
         while (i < len) {
-            int c = (crc ^ (buf[i] & 0xFF)) & 0xFF;
+            long c = (crc ^ ((long)buf[i] & 0xFF)) & 0xFF;
             int k = 0;
             while (k < 8) {
                 if ((c & 1) != 0) { c = 0xEDB88320 ^ (c >> 1); }
@@ -109,7 +112,7 @@ class MixArchive {
         m.label = path;
         m.totalLen = File.GetSize(path);
         m.entries = new List<MixEntry>();
-        m.index = new Dictionary<int, int>();
+        m.index = new Dictionary<long, int>();
 
         // The header's length depends on the entry count, which is inside it,
         // so read a small chunk first and grow once the count is known.
@@ -138,7 +141,7 @@ class MixArchive {
         m.totalLen = length;
         m.label = label;
         m.entries = new List<MixEntry>();
-        m.index = new Dictionary<int, int>();
+        m.index = new Dictionary<long, int>();
         m.Parse();
         return m;
     }
@@ -147,11 +150,13 @@ class MixArchive {
         return (this.data[at] & 0xFF) | ((this.data[at + 1] & 0xFF) << 8);
     }
 
-    int U32At(int at) {
-        return (this.data[at] & 0xFF)
-             | ((this.data[at + 1] & 0xFF) << 8)
-             | ((this.data[at + 2] & 0xFF) << 16)
-             | ((this.data[at + 3] & 0xFF) << 24);
+    // Widened to `long`: the top byte shifted into place overflows a 32-bit
+    // `int`, and entry ids use the whole unsigned range.
+    long U32At(int at) {
+        return ((long)this.data[at] & 0xFF)
+             | (((long)this.data[at + 1] & 0xFF) << 8)
+             | (((long)this.data[at + 2] & 0xFF) << 16)
+             | (((long)this.data[at + 3] & 0xFF) << 24);
     }
 
     // True for the TS/RA2 layout. The old format has no flags word, so its
@@ -159,9 +164,9 @@ class MixArchive {
     // Only the checksum and encryption bits are ever set in a real flags word,
     // and its low half is always zero, so anything else means the old layout.
     bool IsNewFormat() {
-        int flags = this.U32At(0);
-        int known = MixArchive.FlagChecksum() | MixArchive.FlagEncrypted();
-        int unknownHigh = flags & 0xFFFF0000 & (0xFFFF0000 ^ known);
+        long flags = this.U32At(0);
+        long known = MixArchive.FlagChecksum() | MixArchive.FlagEncrypted();
+        long unknownHigh = flags & 0xFFFF0000 & (0xFFFF0000 ^ known);
         return (flags & 0x0000FFFF) == 0
             && (flags & 0xFFFF0000) != 0
             && unknownHigh == 0;
@@ -219,7 +224,8 @@ class MixArchive {
         int i = 0;
         while (i < count) {
             int e = tableAt + i * 12;
-            this.AddEntry(this.U32At(e), this.U32At(e + 4), this.U32At(e + 8));
+            this.AddEntry(this.U32At(e), (int)this.U32At(e + 4),
+                          (int)this.U32At(e + 8));
             i = i + 1;
         }
     }
@@ -250,23 +256,23 @@ class MixArchive {
         while (i < count) {
             int e = 6 + i * 12;
             this.AddEntry(MixArchive.BufU32(plain, e),
-                          MixArchive.BufU32(plain, e + 4),
-                          MixArchive.BufU32(plain, e + 8));
+                          (int)MixArchive.BufU32(plain, e + 4),
+                          (int)MixArchive.BufU32(plain, e + 8));
             i = i + 1;
         }
     }
 
-    static int BufU32(string buf, int at) {
-        return (buf[at] & 0xFF)
-             | ((buf[at + 1] & 0xFF) << 8)
-             | ((buf[at + 2] & 0xFF) << 16)
-             | ((buf[at + 3] & 0xFF) << 24);
+    static long BufU32(byte[] buf, int at) {
+        return ((long)buf[at] & 0xFF)
+             | (((long)buf[at + 1] & 0xFF) << 8)
+             | (((long)buf[at + 2] & 0xFF) << 16)
+             | (((long)buf[at + 3] & 0xFF) << 24);
     }
 
-    void AddEntry(int id, int offset, int size) {
+    void AddEntry(long id, int offset, int size) {
         // Indexing a dictionary through `this` drops the write, so bind it to a
         // local first -- the same workaround System.Web.Router uses.
-        Dictionary<int, int> idx = this.index;
+        Dictionary<long, int> idx = this.index;
         // Duplicate ids do occur; the first one wins, matching how the game
         // resolves them.
         if (!idx.ContainsKey(id)) {
@@ -283,8 +289,8 @@ class MixArchive {
     MixEntry EntryAt(int i) { return this.entries[i]; }
 
     MixEntry Find(string name) {
-        int id = MixArchive.HashName(name);
-        Dictionary<int, int> idx = this.index;
+        long id = MixArchive.HashName(name);
+        Dictionary<long, int> idx = this.index;
         if (!idx.ContainsKey(id)) { return null; }
         return this.entries[idx[id]];
     }
@@ -338,6 +344,6 @@ class MixArchive {
         this.data = null;
         this.dataLen = 0;
         this.entries = new List<MixEntry>();
-        this.index = new Dictionary<int, int>();
+        this.index = new Dictionary<long, int>();
     }
 }

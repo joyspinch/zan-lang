@@ -183,6 +183,17 @@
   `ChartView` 里的颜色算术改成 `Color` 上的方法。
 
   **✅ 落地纪要（2026-07-28）**：`map_type` 的 `TYPE_INT` 正式改为 i32（`long` 保持 i64、ARGB 保留负值对齐 C#）。i32 收窄暴露并已修复的回归：集合槽按源类型做符号/零扩展、`List.RemoveAt` 索引先符号扩展再入 i64 槽、`Gate`/`AsyncGate` 句柄（64 位堆指针）改 `long`（修 Firebird 并发池崩溃）、switch 内含 await 的 case 标签改用常量位宽转换（修 async 漏终结符崩溃）、crypto(Bits/Sha512/AesGcm/BigInt) 与 Firebird(FbWire/FbSql) 的 64 位量迁 `long`、JSON 新增 `FK_LONG` + `AsLong/Long/LongOf`。golden IR 与 gui_css/json_entity_mapping golden 已重刷。焦点子集 203/203 通过。
+  **✅ 补修（2026-07-30）RA2 示例的 MIX 名字哈希**：`examples/game/ra2` 写在 A0-1 之前，
+  注释里明确假设"Zan 的 int 是 64 位"。收窄成 32 位后 `MixArchive.Crc32` 的
+  `0xFFFFFFFF` / `0xEDB88320` 变成负数、`U32At` 的 `<<24` 溢出，于是名字哈希全错，
+  VFS 里一个资源都查不到：`ra2.exe` 打印 `maps=0` / `shell art title=0`，
+  开出来是纯黑窗口，随后越界崩（`0xC0000005`）。已把哈希与 entry id 一律改成 `long`
+  （无符号 32 位量），`tests/mix.zan` 的 `PutU32`/id 同步改 `long`，
+  顺带把 `Vfs.Read` 残留的 `string` 返回类型改回 `byte[]`。
+  现在 `maps=18`、`TITLE.PCX` 加载成功、`RA2_SELFTEST=1` 走完整流程并渲染 1328 块地形。
+  这个回归**早就在** `examples/game/ra2/tests/run.sh` 的 golden 里，
+  但 `core.autocrlf=true` 让脚本被检出成 CRLF，bash 直接拒绝执行（`set: - invalid option`），
+  所以谁都没看到红。已加 `.gitattributes`（`*.sh text eol=lf`）。
   **A0-2 / A0-3 已完成**（FFI 按声明位宽 lower 见下条；结构体布局随 A0-2 + A2-2 落地，见 A0-3）。
 * **A0-2** ✅ 已修（2026-07-28）**按声明类型的真实位宽 lower**。
   `map_type`（`irgen.c`）现在给出 `sbyte/byte`=i8、`short/ushort`=i16、
