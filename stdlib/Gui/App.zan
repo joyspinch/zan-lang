@@ -67,17 +67,28 @@ class App {
     int fxKindOverride;
     int accentOverride;
     SignalInt themeDrawerTab;
-    // Built-in skin switching: when autoSkins is on the title-bar theme button
-    // is a menu of Theme.PresetNames and App applies the picked preset itself
+    // Skin switching: when autoSkins is on the title-bar theme button is a menu
+    // of the skins on disk (Skin.Names) and App applies the picked one itself
     // (no per-app handler). appliedSkin is the index last applied so RenderChrome
     // detects a new pick each frame. Every window gets this by default.
     bool autoSkins;
     int appliedSkin;
+    // Every skin is a CSS pack (`skins/<name>/skin.css`): skinPacks is that list
+    // in picker order, so a skin index is just an index into it. skinArt is the
+    // artwork the active pack installed as the wallpaper, so switching to a pack
+    // that ships none drops it without touching a wallpaper the user picked
+    // themselves.
+    List<string> skinPacks;
+    string skinArt;
     // Active skin stylesheet (CSS) every widget resolves its look against, and
     // the name of the skin pack it came from ("" = none, pure theme tokens).
     // Never null: an empty sheet means "theme defaults only", so widgets can
     // always resolve without a null check.
     StyleSheet sheet;
+    // The application's own stylesheet (page layout and app-specific rules).
+    // Kept apart from the skin and re-layered on top of every skin change, so
+    // switching skins restyles the app without dropping its layout.
+    string appCss;
     string skinName;
     // True while the OS is compositing a real translucent backdrop (Win11
     // acrylic / macOS vibrancy / Linux compositor blur) behind this window.
@@ -168,6 +179,17 @@ class App {
     List<AnimSlot> anims;
     int nowMs;
     int lastFrameMs;
+    // Opt-in frame profiler (ZAN_FRAME_PROF=1): accumulates the render and
+    // present cost of every frame and appends one averaged line per 120 frames
+    // to zan_frame_perf.log in the process directory. 0 = env not read yet,
+    // 1 = on, 2 = off.
+    static int perfMode;
+    int perfFrames;
+    int perfRenderMs;
+    int perfPresentMs;
+    int perfBeginMs;
+    int perfFxMs;
+    int perfOverlayMs;
     int lastPresentMs;
     // Wall-clock deadline (ms) at which a *throttled* animation wants its next
     // repaint, or -1 when none is pending. Looping animations (e.g. a loading
@@ -222,6 +244,19 @@ class App {
     // none); fxSnapValid says slot 7 holds the current frame.
     int fxNextMs;
     bool fxSnapValid;
+
+    // ---- damage-clipped (partial) frames ------------------------------------
+    // A pure hover move only changes the widget the pointer left and the one it
+    // entered, yet it used to repaint (and re-blend) the whole window. When
+    // nothing else happened, the next frame is clipped to the union of those two
+    // widget rects: every widget still runs, but its drawing is clipped away, so
+    // the cost drops to the damaged strip and Present uploads only that.
+    bool partialPending;
+    bool partialFrame;
+    int dmgX;
+    int dmgY;
+    int dmgW;
+    int dmgH;
     // Pixel rects (x,y,w,h quads) the effect layer touched in the last
     // composited frame; the next effect tick repairs just these from the
     // slot-7 snapshot instead of restoring the whole frame. null = unknown
@@ -290,16 +325,27 @@ class App {
         app.themeDrawerTab = SignalInt.Create(0);
         app.autoSkins = false;
         app.appliedSkin = -1;
+        app.skinPacks = new List<string>();
+        app.skinArt = "";
         app.sheet = StyleSheet.Create();
+        app.appCss = "";
         app.skinName = "";
         app.anims = new List<AnimSlot>();
         app.nowMs = Window.GetTickMs();
         app.lastFrameMs = app.nowMs;
+        app.perfFrames = 0;
+        app.perfRenderMs = 0;
+        app.perfPresentMs = 0;
+        app.perfBeginMs = 0;
         app.lastPresentMs = 0;
         app.animNextMs = -1;
         app.fxEnabled = true;
         app.fxNextMs = -1;
         app.fxSnapValid = false;
+        app.partialPending = false;
+        app.partialFrame = false;
+        app.dmgW = 0;
+        app.dmgH = 0;
         app.fxDamage = null;
         app.backdropDirty = true;
         app.blurSlotSeq = 0;
@@ -353,6 +399,12 @@ class App {
         glassNative = false;
         this.ApplySurfaceTranslucency();
         bgThemeGen = bgThemeGen + 1;
+        // The cached frame snapshot and the glass blur caches still hold the
+        // previous skin's pixels, and effect ticks restore from them -- leaving
+        // them valid mixed the old skin into the new one after a few switches.
+        fxSnapValid = false;
+        fxDamage = null;
+        backdropDirty = true;
         needsRedraw = true;
     }
 
@@ -363,6 +415,7 @@ class App {
         Skin s = Skin.Load(name);
         if (!s.IsLoaded()) { return false; }
         s.Apply(this);
+        this.ApplyAppCss();
         return true;
     }
 
@@ -372,14 +425,38 @@ class App {
         Skin s = Skin.Reload(skinName);
         if (!s.IsLoaded()) { return false; }
         s.Apply(this);
+        this.ApplyAppCss();
         return true;
+    }
+
+    /// Installs the application's own stylesheet: the CSS that lays its pages
+    /// out (`display: flex`, widths, gaps) and styles its own element classes.
+    /// Unlike UseCss it survives skin changes -- it is re-layered on top of each
+    /// skin's sheet, whose look still wins for anything the app does not name.
+    void UseAppCss(string css) {
+        appCss = css;
+        this.ApplyAppCss();
+        bgThemeGen = bgThemeGen + 1;
+        backdropDirty = true;
+        needsRedraw = true;
+    }
+
+    /// Re-layers the application stylesheet over the active skin's sheet.
+    void ApplyAppCss() {
+        if (appCss == "") { return; }
+        if (sheet == null) { sheet = StyleSheet.Create(); }
+        sheet.MergeSheet(StyleSheet.FromCss(appCss));
     }
 
     /// Installs a stylesheet directly (CSS text authored in-app or shipped as a
     /// resource) without a skin folder.
     void UseCss(string css) {
         sheet = StyleSheet.FromCss(css);
+        this.ApplyAppCss();
         bgThemeGen = bgThemeGen + 1;
+        fxSnapValid = false;
+        fxDamage = null;
+        backdropDirty = true;
         needsRedraw = true;
     }
 
@@ -392,15 +469,18 @@ class App {
         return 150 * 16777216 + rgb;
     }
 
-    /// Turns the title-bar theme button into the built-in skin picker
-    /// (Theme.PresetNames) and has App apply the chosen preset itself ��?no
-    /// per-app change handler or switch statement. Every window enables this by
-    /// default (see Create); call again to preselect a persisted skin. `index`
-    /// must be the skin whose theme is already active so the first frame does
-    /// not re-apply it. Idempotent: the stable id block is allocated once.
+    /// Turns the title-bar theme button into the skin picker (every pack
+    /// `Skin.Names` found on disk) and has App apply the chosen skin itself --
+    /// no per-app change handler or switch statement. Every window enables this
+    /// by default (see Create); call again to preselect a persisted skin.
+    /// `index` must be the skin whose theme is already active so the first frame
+    /// does not re-apply it. Idempotent: the stable id block is allocated once.
     void EnableSkins(int index) {
         autoSkins = true;
-        themeNames = Theme.PresetNames();
+        // Skins are data: `stdlib/Gui/skins`, `./skins` or $ZAN_GUI_SKINS, each
+        // a folder with a skin.css of design tokens (and optional rules/art).
+        skinPacks = Skin.Names();
+        themeNames = Skin.Labels(skinPacks);
         if (themeMenuBaseId == 0) {
             themeMenuBaseId = WidgetId.Block(themeNames.Count + 40);
         }
@@ -413,10 +493,30 @@ class App {
 
     void EnableSkins() { this.EnableSkins(0); }
 
-    /// Applies built-in skin `i` (Theme.PresetAt) with its dark-chrome flag and
-    /// records it as the active skin so the picker stays in sync.
+    /// Number of skins the picker offers.
+    int SkinCount() { return skinPacks.Count; }
+
+    /// The name of skin `i` ("" when out of range).
+    string SkinNameAt(int i) {
+        if (i < 0 || i >= skinPacks.Count) { return ""; }
+        return skinPacks[i];
+    }
+
+    /// The Theme skin index `i` installs -- used for the picker's previews, so
+    /// each card shows its own palette.
+    Theme SkinThemeAt(int i) {
+        Skin s = Skin.Load(this.SkinNameAt(i));
+        if (s.IsLoaded()) {
+            Theme pt = s.NewTheme();
+            if (pt != null) { return pt; }
+        }
+        return Theme.Dark();
+    }
+
+    /// Applies skin `i` (tokens + stylesheet + artwork) and records it as the
+    /// active skin so the picker stays in sync.
     void ApplySkin(int i) {
-        this.ApplyTheme(Theme.PresetAt(i), Theme.PresetDark(i));
+        if (!this.UseSkin(this.SkinNameAt(i))) { return; }
         if (accentOverride != 0) {
             theme.primary = accentOverride;
             theme.borderFocus = accentOverride;
@@ -469,13 +569,10 @@ class App {
         bgThemeGen = bgThemeGen + 1;
         fxSnapValid = false;
         needsRedraw = true;
-        if (bgImagePath == "") {
-            theme.bgPrimary   = App.WithAlpha(theme.bgPrimary, 255);
-            theme.bgSecondary = App.WithAlpha(theme.bgSecondary, 255);
-            theme.bgTertiary  = App.WithAlpha(theme.bgTertiary, 255);
-        } else {
-            this.ApplySurfaceTranslucency();
-        }
+        theme.bgPrimary   = App.WithAlpha(theme.bgPrimary, 255);
+        theme.bgSecondary = App.WithAlpha(theme.bgSecondary, 255);
+        theme.bgTertiary  = App.WithAlpha(theme.bgTertiary, 255);
+        this.ApplySurfaceTranslucency();
     }
 
     /// Replaces the alpha byte of a packed ARGB colour.
@@ -494,12 +591,38 @@ class App {
     /// wallpaper == more see-through chrome. Text, borders and accents keep
     /// their own colours, so contrast is unaffected.
     void ApplySurfaceTranslucency() {
-        if (bgImagePath == "") { return; }
+        if (bgImagePath == "") {
+            // No image, but skins that paint their own backdrop (a gradient or
+            // frosted glass) need see-through surfaces just as much: an opaque
+            // panel fill would cover the very wallpaper the window draws. Flat
+            // skins keep fully opaque surfaces.
+            if (theme.gradient == 0 && theme.glass == 0) { return; }
+            // The document surface stays the most solid (code has to stay
+            // readable over a busy wallpaper); the shell chrome around it is
+            // progressively more see-through.
+            theme.bgPrimary   = App.WithAlpha(theme.bgPrimary, 190);
+            theme.bgSecondary = App.WithAlpha(theme.bgSecondary, 150);
+            theme.bgTertiary  = App.WithAlpha(theme.bgTertiary, 115);
+            return;
+        }
         int strength = this.WallpaperOpacity();
         int alpha = 255 - strength * 110 / 100;
+        // Chrome surfaces (panels, docked panes) go further than the document
+        // surface, not less: they cover most of the window, so leaving them
+        // near-opaque was what hid the wallpaper everywhere but the editor.
+        int chrome = alpha - 40;
+        int rail = alpha - 80;
+        if (chrome < 80) { chrome = 80; }
+        if (rail < 60) { rail = 60; }
         theme.bgPrimary   = App.WithAlpha(theme.bgPrimary, alpha);
-        theme.bgSecondary = App.WithAlpha(theme.bgSecondary, alpha + 30);
-        theme.bgTertiary  = App.WithAlpha(theme.bgTertiary, alpha + 60);
+        theme.bgSecondary = App.WithAlpha(theme.bgSecondary, chrome);
+        theme.bgTertiary  = App.WithAlpha(theme.bgTertiary, rail);
+    }
+
+    /// True when the wallpaper currently painted is the active skin pack's own
+    /// artwork rather than an image the user picked.
+    bool SkinArtWallpaper() {
+        return skinArt != "" && bgImagePath == skinArt;
     }
 
     /// Drops the user wallpaper, restoring the skin's own backdrop.
@@ -565,21 +688,13 @@ class App {
     // in the framework so the IDE, the gallery and any window render identical
     // skins ��?apps just call RenderBackground behind their content.
 
-    /// One soft wallpaper glow: nested translucent disks feathering to a bright
-    /// centre (no hard rim), giving the backdrop blur real colour to soften.
+    /// One soft wallpaper glow: a smooth radial fade to a bright centre (no
+    /// hard rim), giving the backdrop blur real colour to soften.
     void BackdropBlob(int cx, int cy, int r, int cr, int cg, int cb) {
-        Canvas c = canvas;
-        // Smooth radial feather instead of a few hard rings: many faint,
-        // equal-alpha concentric steps from the rim inward. Coverage rises
-        // gently toward the centre, so overlaps blend into one soft light
-        // bloom (no visible "target" rings) and stays light/airy.
-        int steps = 20;
-        int i = steps;
-        while (i > 0) {
-            int rr = r * i / steps;
-            c.FillCircle(cx, cy, rr, Theme.Rgba(cr, cg, cb, 9));
-            i = i - 1;
-        }
+        // One per-pixel radial fade (Canvas.FillRadial) rather than a stack of
+        // translucent disks: stacked disks banded into visible "target" rings
+        // at their edges, and this is a single blit instead of 20.
+        canvas.FillRadial(cx, cy, r, Theme.Rgb(cr, cg, cb), 150);
     }
 
     /// A soft glow coloured from a packed ARGB theme accent.
@@ -701,11 +816,12 @@ class App {
     /// e.g. after a resize.
     bool FxPresent() {
         if (!fxSnapValid || !this.FxActive()) { fxNextMs = -1; return false; }
-        if (!window.IsVisible()) {
-            // The window cannot be seen (minimized or fully covered): stop
-            // ticking so a hidden window costs no CPU. Any event -- including
-            // the visibility-change wake -- re-arms the effect (ProcessEvent /
-            // ApplyEvent).
+        if (!window.IsVisible() || !window.IsFocused()) {
+            // The window cannot be seen (minimized or fully covered) or nobody
+            // is working in it: stop ticking entirely rather than animating at
+            // a reduced rate, which only read as stutter. Any event --
+            // including the focus/visibility wake -- re-arms the effect
+            // (ProcessEvent / ApplyEvent).
             fxNextMs = -1;
             return true;
         }
@@ -746,13 +862,67 @@ class App {
         return true;
     }
 
-    /// How long until the next effect tick. A window nobody is looking at (no
-    /// input focus) drifts at a quarter of the rate: the skin still lives, but
-    /// an IDE left open behind another window stops costing a redraw a frame.
+    /// How long until the next effect tick. Unfocused windows do not tick at
+    /// all (see FxPresent), so this is always the skin's own frame interval.
     int FxIntervalMs() {
-        int ms = BackdropFx.IntervalMs(this.EffectiveFx());
-        if (!window.IsFocused()) { ms = ms * 4; }
-        return ms;
+        return BackdropFx.IntervalMs(this.EffectiveFx());
+    }
+
+    /// Marks the next repaint as a damage-clipped frame covering the widget the
+    /// pointer left and the one it entered (padded, so focus rings and hairlines
+    /// just outside the hit region are included). Any other repaint reason in the
+    /// same event pass cancels it via CancelPartialFrame().
+    void NoteHoverDamage(int oldId, int newId) {
+        if (this.HasOverlays() || this.PointerCaptured()) {
+            partialPending = false;
+            return;
+        }
+        List<int> ra = hitTester.RectOf(oldId);
+        List<int> rb = hitTester.RectOf(newId);
+        if (ra == null && rb == null) {
+            partialPending = false;
+            return;
+        }
+        int pad = this.Scale(6);
+        int x0 = canvas.Width();
+        int y0 = canvas.Height();
+        int x1 = 0;
+        int y1 = 0;
+        if (ra != null) {
+            if (ra[0] < x0) { x0 = ra[0]; }
+            if (ra[1] < y0) { y0 = ra[1]; }
+            if (ra[0] + ra[2] > x1) { x1 = ra[0] + ra[2]; }
+            if (ra[1] + ra[3] > y1) { y1 = ra[1] + ra[3]; }
+        }
+        if (rb != null) {
+            if (rb[0] < x0) { x0 = rb[0]; }
+            if (rb[1] < y0) { y0 = rb[1]; }
+            if (rb[0] + rb[2] > x1) { x1 = rb[0] + rb[2]; }
+            if (rb[1] + rb[3] > y1) { y1 = rb[1] + rb[3]; }
+        }
+        x0 = x0 - pad;
+        y0 = y0 - pad;
+        x1 = x1 + pad;
+        y1 = y1 + pad;
+        if (x0 < 0) { x0 = 0; }
+        if (y0 < 0) { y0 = 0; }
+        if (x1 > canvas.Width()) { x1 = canvas.Width(); }
+        if (y1 > canvas.Height()) { y1 = canvas.Height(); }
+        if (x1 - x0 <= 0 || y1 - y0 <= 0) {
+            partialPending = false;
+            return;
+        }
+        dmgX = x0;
+        dmgY = y0;
+        dmgW = x1 - x0;
+        dmgH = y1 - y0;
+        partialPending = true;
+    }
+
+    /// Forces the next frame to repaint in full (anything that is not a plain
+    /// hover move: scroll, typing, resize, animation, skin change...).
+    void CancelPartialFrame() {
+        partialPending = false;
     }
 
     /// Announces a flat [x,y,w,h,...] damage list to the next Present.
@@ -1035,7 +1205,7 @@ class App {
         }
         hitTester.Register(HitRegion.Create(closeId, closeX, 0, bw, hbar, 3));
 
-        if (window.EventKind() == 3) {
+        if (this.EventKind() == 3) {
             int hit = hitTester.HitTest(mouseX, mouseY);
             if (showThemeButton && hit == themeId) {
                 if (this.ThemeMenuMode()) {
@@ -1325,7 +1495,7 @@ class App {
         wheelCapW = w;
         wheelCapH = h;
         wheelCapOrder = wheelClaimSeq;
-        return window.EventKind() == 13
+        return this.EventKind() == 13
             && wheelOwnerOrder == wheelClaimSeq;
     }
 
@@ -1461,6 +1631,7 @@ class App {
             focus.SetHovered(hitId);
             if (hitId != oldHover) {
                 needsRedraw = true;
+                this.NoteHoverDamage(oldHover, hitId);
             }
             // While a widget is held (e.g. slider/scrollbar drag) keep repainting
             // as the pointer moves so the value tracks the cursor live.
@@ -1607,21 +1778,12 @@ class App {
             return false;
         }
         if (!mine) {
-            // Another window's press/click: clear this window's stale press and
-            // click targets. Ui.Clicked tests the GLOBAL event kind against the
-            // per-window target id, so a leftover target from an earlier click
-            // here would fire again on a click made in a sibling window (e.g.
-            // re-opening the same dialog).
-            if (kind == 2) {
-                pressTargetId = -1;
-                rightPressTargetId = -1;
-                focus.SetPressed(-1);
-            }
-            if (kind == 3) {
-                clickTargetId = -1;
-                rightClickTargetId = -1;
-                pointerDown = false;
-            }
+            // Not this window's event: leave every piece of interaction state
+            // alone. Widgets no longer test the shared native event kind (they
+            // go through App.EventKind, which reports "no event" here), so a
+            // sibling window's click cannot reach this window's widgets, and
+            // clearing press/click/focus state would instead break a drag or a
+            // pressed button that is legitimately live in this window.
             return true;
         }
 
@@ -1737,25 +1899,82 @@ class App {
     }
 
     void PresentFrame() {
+        int perfT0 = 0;
+        if (App.PerfOn()) { perfT0 = Window.GetTickMs(); }
         // Draw + dispatch popups last so they sit above all content and own the
         // top-most hit regions (framework-owned overlay/z-order layer).
         RunOverlays();
+        int perfT1 = 0;
+        if (App.PerfOn()) { perfT1 = Window.GetTickMs(); }
         // Signature skin motion: snapshot the finished frame (slot 7), then
         // composite the effect layer on top. Later pure effect ticks restore
         // the snapshot and re-composite (FxPresent) without re-rendering.
         if (this.FxActive()) {
             Canvas fc = canvas;
-            fc.SnapshotRect(0, 0, fc.Width(), fc.Height(), 7);
-            fxSnapValid = true;
+            // The snapshot only exists to let a later *idle* tick re-composite
+            // the effect without re-rendering. While frames follow each other
+            // back to back (scrolling, typing, dragging) the next frame is a
+            // full render anyway, so copying the whole surface every frame is
+            // pure overhead -- on a 2646x1646 window it is the single largest
+            // block of pixel traffic in the frame. Skip it during that burst and
+            // arm a wake shortly after activity stops; that frame is far enough
+            // from its predecessor to snapshot and resume idle ticking.
+            int fxNow = Window.GetTickMs();
+            bool burst = lastPresentMs > 0 && fxNow - lastPresentMs < 120;
+            if (burst) {
+                fxSnapValid = false;
+                fxDamage = null;
+                fxNextMs = fxNow + 150;
+            } else {
+                fc.SnapshotRect(0, 0, fc.Width(), fc.Height(), 7);
+                fxSnapValid = true;
+            }
             BackdropFx.Render(fc, this.EffectiveFx(), 0, 0, fc.Width(), fc.Height(),
-                              Window.GetTickMs(), theme, dpiScale);
-            fxDamage = BackdropFx.TakeDamage();
-            fxNextMs = Window.GetTickMs() + this.FxIntervalMs();
-            if (!window.IsVisible()) { fxNextMs = -1; }
+                              fxNow, theme, dpiScale);
+            if (!burst) {
+                fxDamage = BackdropFx.TakeDamage();
+                fxNextMs = Window.GetTickMs() + this.FxIntervalMs();
+            } else {
+                BackdropFx.TakeDamage();
+            }
+            if (!window.IsVisible() || !window.IsFocused()) { fxNextMs = -1; }
         } else {
             fxNextMs = -1;
         }
+        int perfPreMs = 0;
+        if (App.PerfOn()) {
+            perfPreMs = Window.GetTickMs();
+            perfOverlayMs = perfOverlayMs + (perfT1 - perfT0);
+            perfFxMs = perfFxMs + (perfPreMs - perfT1);
+        }
+        if (partialFrame) {
+            canvas.PopClip();
+            window.PresentDirty(dmgX, dmgY, dmgW, dmgH);
+        }
         window.Present(canvas);
+        if (App.PerfOn()) {
+            int endMs = Window.GetTickMs();
+            perfRenderMs = perfRenderMs + (perfPreMs - perfBeginMs);
+            perfPresentMs = perfPresentMs + (endMs - perfPreMs);
+            perfFrames = perfFrames + 1;
+            if (perfFrames >= 30) {
+                File.AppendAllText("zan_frame_perf.log",
+                    "frames=" + Convert.ToString(perfFrames)
+                    + " render_ms=" + Convert.ToString(perfRenderMs / perfFrames)
+                    + " present_ms=" + Convert.ToString(perfPresentMs / perfFrames)
+                    + " overlay_ms=" + Convert.ToString(perfOverlayMs / perfFrames)
+                    + " fx_ms=" + Convert.ToString(perfFxMs / perfFrames)
+                    + " surface=" + Convert.ToString(canvas.Width())
+                    + "x" + Convert.ToString(canvas.Height()) + "\n");
+                File.AppendAllText("zan_frame_perf.log",
+                    "  raster/frame " + App.RasterLine(perfFrames) + "\n");
+                perfFrames = 0;
+                perfRenderMs = 0;
+                perfPresentMs = 0;
+                perfOverlayMs = 0;
+                perfFxMs = 0;
+            }
+        }
         frameCount = frameCount + 1;
         lastPresentMs = Window.GetTickMs();
         // Snapshot hover/focus/press as this frame's "previous" baseline so the
@@ -1764,7 +1983,63 @@ class App {
         focus.RollFrame();
     }
 
+    /// True when the opt-in frame profiler is enabled (ZAN_FRAME_PROF=1).
+    static bool PerfOn() {
+        if (App.perfMode == 0) {
+            App.perfMode = 2;
+            if (Interop.EnvVar("ZAN_FRAME_PROF") == "1") { App.perfMode = 1; }
+        }
+        return App.perfMode == 1;
+    }
+
+    /// One line of per-frame rasterizer work for the frame profiler: calls and
+    /// thousands of pixels per primitive, averaged over `frames` frames.
+    static string RasterLine(int frames) {
+        List<string> names = new List<string>();
+        names.Add("fill");
+        names.Add("blend");
+        names.Add("grad");
+        names.Add("round");
+        names.Add("radial");
+        names.Add("blur");
+        names.Add("blurhit");
+        names.Add("img");
+        names.Add("snap");
+        names.Add("restore");
+        names.Add("glyph");
+        string line = "";
+        int i = 0;
+        while (i < names.Count) {
+            int calls = Canvas.RasterStat(i, 0);
+            int kpx = Canvas.RasterStat(i, 1);
+            if (calls > 0 || kpx > 0) {
+                line = line + names[i] + "=" + Convert.ToString(calls / frames)
+                    + "/" + Convert.ToString(kpx / frames) + "kpx ";
+            }
+            i = i + 1;
+        }
+        int rank = 0;
+        while (rank < 6) {
+            int kpx = Canvas.RasterTopBlend(rank, 0);
+            int bx = Canvas.RasterTopBlend(rank, 1);
+            int by = Canvas.RasterTopBlend(rank, 2);
+            int bw = Canvas.RasterTopBlend(rank, 3);
+            int ba = Canvas.RasterTopBlend(rank, 5);
+            int bh = Canvas.RasterTopBlend(rank, 4);
+            if (kpx > 0) {
+                line = line + "top" + Convert.ToString(rank) + "="
+                    + Convert.ToString(kpx) + "kpx@" + Convert.ToString(bx)
+                    + "," + Convert.ToString(by) + "+" + Convert.ToString(bw)
+                    + "x" + Convert.ToString(bh) + "a" + Convert.ToString(ba)
+                    + " ";
+            }
+            rank = rank + 1;
+        }
+        return line;
+    }
+
     void BeginFrame() {
+        if (App.PerfOn()) { perfBeginMs = Window.GetTickMs(); }
         // Apply a freshly-picked built-in skin before anything paints, so the
         // whole window (content + chrome) redraws in the new theme this frame.
         this.SyncSkin();
@@ -1792,8 +2067,19 @@ class App {
         blocksInputBelow = false;
         clickClaimed = false;
         hitTester.Clear();
+        window.ClearHitGuards();
         focus.ResetIds();
         overlays = new List<OverlayPopup>();
+        partialFrame = false;
+        if (partialPending && dmgW > 0 && dmgH > 0 && !this.FxActive()) {
+            partialFrame = true;
+        }
+        partialPending = false;
+        if (partialFrame) {
+            // Everything below paints as usual; the clip keeps it inside the
+            // damaged strip, so untouched pixels of the last frame stand.
+            canvas.PushClip(dmgX, dmgY, dmgW, dmgH);
+        }
         if (glassNative) {
             // Frosted sheet: clear the whole window to a *semi-transparent* tint
             // (not fully transparent) so the OS backdrop shows through evenly
@@ -1802,9 +2088,17 @@ class App {
             // (and borderless) over light backgrounds.
             int rgb = theme.bgPrimary % 16777216;
             if (rgb < 0) { rgb = rgb + 16777216; }
-            canvas.Clear(198 * 16777216 + rgb);
+            if (partialFrame) {
+                canvas.FillRect(dmgX, dmgY, dmgW, dmgH, 198 * 16777216 + rgb);
+            } else {
+                canvas.Clear(198 * 16777216 + rgb);
+            }
         } else {
-            canvas.Clear(theme.bgPrimary);
+            if (partialFrame) {
+                canvas.FillRect(dmgX, dmgY, dmgW, dmgH, theme.bgPrimary);
+            } else {
+                canvas.Clear(theme.bgPrimary);
+            }
         }
     }
 
@@ -1813,6 +2107,9 @@ class App {
     /// <see cref="RunOverlays"/>.
     void AddOverlay(OverlayPopup p) {
         overlays.Add(p);
+        // A popup/tooltip appearing during a damage-clipped frame would be
+        // clipped away: ask for one full frame right after it registers.
+        if (partialFrame) { needsRedraw = true; }
     }
 
     /// Draws + dispatches every overlay registered this frame, in registration
@@ -1858,6 +2155,16 @@ class App {
         return id;
     }
 
+    /// Claims [x,y,w,h] for the client area against the window frame's edge
+    /// resize grips. A control drawn flush with the window edge -- a scrollbar
+    /// in the last few pixels -- is otherwise unclickable there: the frame's
+    /// grip answers the OS hit test first, so the press never reaches the
+    /// client and only the wheel still scrolls. Corner grips keep priority, so
+    /// a diagonal resize stays reachable. Call once per frame while drawing.
+    void ReserveEdgeHit(int x, int y, int w, int h) {
+        window.AddHitGuard(x, y, w, h);
+    }
+
     /// Full-window BlockHitsRect: the standard scrim for a modal overlay whose
     /// dimmed backdrop covers the whole window.
     int BlockHitsBelow() {
@@ -1875,6 +2182,20 @@ class App {
         return id;
     }
 
+    /// The kind of the OS event being processed, or 0 ("no event") when that
+    /// event belongs to a different window. The native event state is
+    /// process-global: a surface that read window.EventKind() directly also saw
+    /// clicks and keys delivered to a sibling or child window, and fired its own
+    /// widget whenever the ids happened to line up. Every window-owned surface
+    /// must ask its App, not the shared native state.
+    int EventKind() {
+        if (Window.EventHwnd() != window.GetHandle()) { return 0; }
+        return window.EventKind();
+    }
+
+    /// True when the event being processed was delivered to this App's window.
+    bool EventIsMine() { return Window.EventHwnd() == window.GetHandle(); }
+
     /// True while a primary click (mouse-up) event is live this frame and may
     /// be acted on by the surface being rendered right now. Immediate-mode
     /// surfaces should test this instead of window.EventKind() == 3: it is
@@ -1885,7 +2206,7 @@ class App {
     /// modal's own internals render after its scrim, where this is true
     /// again, so clicks never fall through a modal to the page beneath.
     bool ClickAvailable() {
-        if (window.EventKind() != 3 || clickClaimed) { return false; }
+        if (this.EventKind() != 3 || clickClaimed) { return false; }
         if (inputBlockPrevious && !blocksInputBelow) { return false; }
         // Same rule for rect-scoped blockers (floating windows, popovers,
         // selects): a click over a blocker that was up last frame belongs to

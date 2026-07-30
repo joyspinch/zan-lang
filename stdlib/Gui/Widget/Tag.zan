@@ -3,87 +3,169 @@ using Gui;
 
 namespace Gui.Widget;
 
-/// Tag/chip with type variants and optional close icon.
+/// A tag / chip. Same shape as Button: plain assignment, everything visual is a
+/// class, and the box plus its content are painted by the shared layers.
+///
+///     Tag t = new Tag { Text = "必读", Class = "error small" };
+///     t.Closable = true;
+///     t.Close += () => { tags.RemoveAt(i); };
+///
+/// Recognised classes are just selectors a skin defines:
+///
+///     tag                                         default
+///     .primary .info .success .warning .error     semantic type
+///     .tiny .small .medium .large                 size (shared with button)
+///     .round                                      shape
 class Tag : Control {
-    string text;
-    int tagType;
+    Binding<string> Text;
+    string Icon;
+    /// Adds a trailing close glyph that raises Close when clicked.
+    bool Closable;
+    int wid;
+    /// Fires when the close glyph is clicked; queued on the UI thread like
+    /// Button.Click, so a handler may remove the tag from its model.
+    UiEvent Close;
 
-    void InitTag(string txt, int tt) {
-        this.InitControl(txt, 1);
-        text = txt;
-        tagType = tt;
+    void InitTag(string label) {
+        this.InitControl(label, 1);
+        Text = label;
+        Icon = "";
+        Closable = false;
+        wid = WidgetId.Next();
+        wiresOwnEvents = true;
+        Close = UiEvent.Create();
     }
 
-    /// Retained-mode constructor: `Tag t = new Tag("New", 3);`
-    Tag(string txt, int tt) {
-        InitTag(txt, tt);
+    Tag() { InitTag(""); }
+    Tag(string label) { InitTag(label); }
+
+    string Label() {
+        if (Text == null) { return ""; }
+        return Text.Get();
     }
 
-    override void OnMeasure(App app) {
+    StyleBox ResolvedStyle(App app) {
+        return Style.Full(app, "tag", Class, name, Style.SNormal());
+    }
+
+    int AutoWidth(App app) { return Tag.Width(app, this.Label(), Class); }
+
+    int Render(App app, int x, int y) {
+        StyleBox s = this.ResolveEasedStyleAs(app, wid, "tag", Class, false, false);
+        int w = this.AutoWidth(app);
+        int h = s.ClampH(s.HeightOr(app.theme.heightTiny));
+        string trailing = "";
+        if (Closable) { trailing = "close"; }
+        int closeX = BoxContent.Paint(app, wid, "tag", Class, name, s, x, y, w, h,
+                                      Icon, this.Label(), trailing, false, false);
+        if (!Closable) { return wid; }
+        int glyph = BoxContent.GlyphSize(s.FontOr(app.theme.fontSizeSmall));
+        if (Ui.Activate(app, wid, closeX, y, glyph, h)) {
+            Close.Post();
+            app.window.Wake();
+        }
+        On.Fire(app, wid);
+        return wid;
+    }
+
+    /// Width a chip of `text` in `cls` occupies, so a row of chips lays out with
+    /// the exact spacing Render draws.
+    static int Width(App app, string text, string cls) {
         Theme t = app.theme;
-        prefW = Canvas.MeasureText(text, t.fontSizeSmall) + t.paddingSmall * 2;
-        prefH = t.heightTiny;
+        StyleBox s = Style.Of(app, "tag", cls, Style.SNormal());
+        int fontPx = s.FontOr(t.fontSizeSmall);
+        return BoxContent.Width("", text, "", fontPx, s.GapOr(t.gapSmall))
+            + s.PadLOr(t.paddingSmall) + s.PadROr(t.paddingSmall);
     }
 
-    override void OnPaint(App app) {
-        // center inside the docked bounds (rows are usually taller than the chip)
-        int py = by;
-        int th = app.theme.heightTiny;
-        if (bh > th) { py = by + (bh - th) / 2; }
-        Tag.Render(app, bx, py, text, tagType);
-    }
-
-    static void Render(App app, int x, int y, string text, int tagType) {
-        Canvas c = app.canvas;
+    /// Immediate-mode chip for painters that own their own layout (list rows,
+    /// designer overlays): the same box and content, without an instance.
+    static void Chip(App app, int x, int y, string text, string cls) {
         Theme t = app.theme;
-
-        int tw = Canvas.MeasureText(text, t.fontSizeSmall) + t.paddingSmall * 2;
-        int th = t.heightTiny;
-
-        int bgColor = t.bgTertiary;
-        int textColor = t.textPrimary;
-
-        if (tagType == 1) { bgColor = t.primary; textColor = t.textInverse; }
-        if (tagType == 2) { bgColor = t.info; textColor = t.textInverse; }
-        if (tagType == 3) { bgColor = t.success; textColor = t.textInverse; }
-        if (tagType == 4) { bgColor = t.warning; textColor = t.textInverse; }
-        if (tagType == 5) { bgColor = t.error; textColor = t.textInverse; }
-
-        c.FillRoundRect(x, y, tw, th, t.borderRadiusSmall, bgColor);
-        c.DrawTextCentered(x, y, tw, th, text, textColor, t.fontSizeSmall);
+        StyleBox s = Style.Of(app, "tag", cls, Style.SNormal());
+        int w = Tag.Width(app, text, cls);
+        int h = s.HeightOr(t.heightTiny);
+        BoxContent.Paint(app, 0, "tag", cls, "", s, x, y, w, h, "", text, "",
+                         false, false);
     }
 
-    static int RenderClosable(App app, int x, int y, string text, int tagType) {
-        Canvas c = app.canvas;
+    /// Immediate-mode closable chip; returns the close glyph's hit id.
+    static int ChipClosable(App app, int x, int y, string text, string cls) {
         Theme t = app.theme;
+        StyleBox s = Style.Of(app, "tag", cls, Style.SNormal());
         int id = app.focus.AllocId();
-
-        int textW = Canvas.MeasureText(text, t.fontSizeSmall);
-        int closeSz = t.fontSizeSmall;
-        int gap = t.gapSmall;
-        int tw = t.paddingSmall + textW + gap + closeSz + t.paddingSmall;
-        int th = t.heightTiny;
-
-        int bgColor = t.bgTertiary;
-        int textColor = t.textPrimary;
-        if (tagType == 1) { bgColor = t.primary; textColor = t.textInverse; }
-        if (tagType == 3) { bgColor = t.success; textColor = t.textInverse; }
-        if (tagType == 5) { bgColor = t.error; textColor = t.textInverse; }
-
-        c.FillRoundRect(x, y, tw, th, t.borderRadiusSmall, bgColor);
-        c.DrawText(x + t.paddingSmall, y + (th - Canvas.FontHeight(t.fontSizeSmall)) / 2, text, textColor, t.fontSizeSmall);
-        int closeX = x + t.paddingSmall + textW + gap;
-        Icon.DrawCenteredIn(c, "close", closeX, y, closeSz, th, closeSz, textColor);
-
-        app.hitTester.Register(HitRegion.Create(id, closeX, y, closeSz + t.paddingSmall, th, 0));
+        int fontPx = s.FontOr(t.fontSizeSmall);
+        int gap = s.GapOr(t.gapSmall);
+        int glyph = BoxContent.GlyphSize(fontPx);
+        int w = Tag.Width(app, text, cls) + gap + glyph;
+        int h = s.HeightOr(t.heightTiny);
+        int closeX = BoxContent.Paint(app, id, "tag", cls, "", s, x, y, w, h,
+                                      "", text, "close", false, false);
+        app.hitTester.Register(HitRegion.Create(id, closeX, y, glyph, h, 0));
         return id;
     }
 
-    /// Device-px width of a closable tag, so callers can lay out a row of chips
-    /// with the exact spacing RenderClosable draws.
-    static int ClosableWidth(App app, string text) {
+    /// Width the closable form occupies, so a row of chips lays out exactly.
+    static int ClosableWidth(App app, string text, string cls) {
         Theme t = app.theme;
-        return t.paddingSmall + Canvas.MeasureText(text, t.fontSizeSmall)
-            + t.gapSmall + t.fontSizeSmall + t.paddingSmall;
+        StyleBox s = Style.Of(app, "tag", cls, Style.SNormal());
+        int fontPx = s.FontOr(t.fontSizeSmall);
+        return Tag.Width(app, text, cls) + s.GapOr(t.gapSmall)
+            + BoxContent.GlyphSize(fontPx);
+    }
+
+    // ---- designer / serialization model -------------------------------------
+
+    override string Kind() { return "Tag"; }
+
+    override List<PropSpec> Props() {
+        List<PropSpec> ps = new List<PropSpec>();
+        ps.Add(PropSpec.Text("text", "Text"));
+        ps.Add(PropSpec.Text("icon", "Icon"));
+        ps.Add(PropSpec.Bool("closable", "Closable"));
+        ps.Add(PropSpec.Text("class", "Classes"));
+        return ps;
+    }
+
+    override string GetProp(string key) {
+        if (key == "text") { return this.Label(); }
+        if (key == "icon") { return Icon; }
+        if (key == "class") { return Class; }
+        if (key == "closable") {
+            if (Closable) { return "true"; }
+            return "false";
+        }
+        return "";
+    }
+
+    override void SetProp(string key, string val) {
+        if (key == "text") { Text = val; name = val; }
+        else if (key == "icon") { Icon = val; }
+        else if (key == "class") { Class = val; }
+        else if (key == "closable") { Closable = (val == "true"); }
+        else if (val == "true") { Class = Class + " " + key; }
+        else if (val != "" && val != "false") { Class = Class + " " + val; }
+    }
+
+    override List<string> Events() {
+        List<string> e = Control.CommonEvents();
+        e.Add("Close");
+        return e;
+    }
+
+    // ---- retained-mode hooks (Control) --------------------------------------
+
+    override void OnMeasure(App app) {
+        StyleBox s = this.ResolveStyleAs(app, "tag", Class, Style.SNormal());
+        prefW = s.WidthOr(this.AutoWidth(app));
+        prefH = s.HeightOr(app.theme.heightTiny);
+    }
+
+    override void OnPaint(App app) {
+        // Rows are usually taller than a chip, so center in the docked bounds.
+        int h = this.ResolvedStyle(app).HeightOr(app.theme.heightTiny);
+        int py = by;
+        if (bh > h) { py = by + (bh - h) / 2; }
+        this.Render(app, bx, py);
     }
 }

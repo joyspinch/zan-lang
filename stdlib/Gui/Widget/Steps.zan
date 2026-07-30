@@ -16,7 +16,20 @@ class Step {
     }
 }
 
-/// Steps indicator with reactive current step.
+/// A steps indicator: numbered circles joined by a connector, with the current
+/// step read from a signal. Circles, connector and labels are styled parts
+/// (`steps::circle`, `::line`, `::label`, `::desc`), each resolved with the
+/// step's state as a class, so a skin restyles them and the code side is plain
+/// assignment:
+///
+///     Steps s = new Steps(SignalInt.Create(0)) { Class = "vertical" };
+///     s.AddStep("Details");
+///     s.AddStepDesc("Account", "Email and password");
+///     s.ErrorIndex = 1;
+///
+/// Classes: `vertical` stacks the steps, the semantic roles (`primary` … `error`)
+/// pick the accent; the per-step state classes a skin can target are `done`,
+/// `active`, `pending` and `error`.
 class Steps : Control {
     List<Step> steps;
     SignalInt model;
@@ -24,28 +37,24 @@ class Steps : Control {
     /// field and the indicator in sync (compiler-lowered Binding). Optional;
     /// when unset the indicator reads its internal SignalInt only.
     Binding<int> data;
-    int orient;      // 0 = horizontal, 1 = vertical
-    int errorIndex;  // -1 = none
+    /// Step painted as errored; -1 for none.
+    int ErrorIndex;
 
     void InitSteps(SignalInt m) {
         this.InitControl("steps", 1);
         steps = new List<Step>();
         model = m;
         data = null;
-        orient = 0;
-        errorIndex = -1;
+        ErrorIndex = -1;
     }
+
+    Steps(SignalInt m) { InitSteps(m); }
 
     /// Pull the bound model value into the local signal (model -> UI).
     void SyncBinding() {
         if (data == null) { return; }
         int cur = data.Get();
         if (cur != model.Get()) { model.Set(cur); }
-    }
-
-    /// Retained-mode constructor: `Steps s = new Steps(model); s.AddStep("Info");`
-    Steps(SignalInt m) {
-        InitSteps(m);
     }
 
     void AddStep(string label) {
@@ -57,108 +66,151 @@ class Steps : Control {
         steps.Add(new Step(label, desc));
     }
 
-    /// Fluent: stack vertically instead of horizontally.
-    Steps Vertical() { orient = 1; return this; }
-
-    /// Fluent: mark step `i` (0-based) as errored (red circle with `!`).
-    Steps Error(int i) { errorIndex = i; return this; }
+    bool IsVertical() { return Style.Has(Class, "vertical"); }
 
     int RowGap(App app) { return app.Scale(48); }
 
     override void OnMeasure(App app) {
-        Theme t = app.theme;
-        if (orient == 1) {
+        StyleBox s = this.ResolveStyleAs(app, "steps", Class, Style.SNormal());
+        if (this.IsVertical()) {
             int count = steps.Count;
             if (count < 1) { count = 1; }
             prefH = count * this.RowGap(app);
-            prefW = app.Scale(280);
+            prefW = s.WidthOr(app.Scale(280));
         } else {
-            prefH = app.Scale(13) * 2 + app.Scale(8) + Canvas.FontHeight(t.fontSizeSmall);
-            prefW = app.Scale(320);
+            prefH = s.HeightOr(app.Scale(13) * 2 + app.Scale(8)
+                + Canvas.FontHeight(app.theme.fontSizeSmall));
+            prefW = s.WidthOr(app.Scale(320));
         }
     }
 
     override void OnPaint(App app) {
         SyncBinding();
-        if (orient == 1) {
-            Steps.RenderVertical(app, bx, by, this.RowGap(app), steps, model.Get(), errorIndex);
+        if (this.IsVertical()) {
+            Steps.PaintVertical(app, bx, by, this.RowGap(app), steps,
+                                model.Get(), ErrorIndex, Class);
         } else {
-            List<string> labels = new List<string>();
-            foreach (Step s in steps) { labels.Add(s.label); }
-            Steps.RenderStatus(app, bx, by, bw, labels, model.Get(), errorIndex);
+            Steps.PaintHorizontal(app, bx, by, bw, steps, model.Get(),
+                                  ErrorIndex, Class);
         }
     }
 
-    static void Render(App app, int x, int y, int totalWidth, List<string> labels, SignalInt model) {
+    /// Immediate-mode horizontal steps from a label list.
+    static void Render(App app, int x, int y, int totalWidth,
+                       List<string> labels, SignalInt model) {
         Steps.RenderStatus(app, x, y, totalWidth, labels, model.Get(), -1);
     }
 
-    // Draws a step circle: completed (check), error (×), active/pending (number).
-    static void StepCircle(App app, int cx, int cy, int circleR, int index,
-                           int current, int errorIndex) {
+    /// Immediate-mode horizontal steps with an errored step (-1 for none).
+    static void RenderStatus(App app, int x, int y, int totalWidth,
+                             List<string> labels, int current, int errorIndex) {
+        List<Step> items = new List<Step>();
+        int i = 0;
+        while (i < labels.Count) {
+            items.Add(new Step(labels[i], ""));
+            i = i + 1;
+        }
+        Steps.PaintHorizontal(app, x, y, totalWidth, items, current, errorIndex,
+                              "");
+    }
+
+    /// The class list a step's position in the sequence stands for, so every
+    /// part of a step (circle, label, description) resolves from one state. The
+    /// state names are the design system's shared sequence vocabulary.
+    static string StateClass(string cls, int index, int current,
+                             int errorIndex) {
+        return cls + " " + Style.StateClass(index, current, errorIndex);
+    }
+
+    /// A step circle: completed (check), errored (!), active or pending (number).
+    static void Circle(App app, int cx, int cy, int r, int index, int current,
+                       int errorIndex, string cls) {
         Canvas c = app.canvas;
         Theme t = app.theme;
-        bool done = index < current;
-        bool active = index == current;
-        bool error = index == errorIndex;
+        string state = Steps.StateClass(cls, index, current, errorIndex);
+        StyleBox s = Style.Of(app, "steps", cls, Style.SNormal());
+        StyleBox cs = Style.Part(app, "steps", "circle", "", state, "",
+                                 Style.SNormal());
+        int accent = s.AccentOr(t.primary);
 
-        int circleColor = t.borderPrimary;
-        int glyphColor = t.textPrimary;
-        if (done || active) { circleColor = t.primary; glyphColor = t.textInverse; }
-        if (error) { circleColor = t.error; glyphColor = t.textInverse; }
+        int fill = t.borderPrimary;
+        int glyph = t.textPrimary;
+        if (index < current || index == current) { fill = accent; glyph = t.textInverse; }
+        if (index == errorIndex) { fill = t.error; glyph = t.textInverse; }
+        fill = cs.BgOr(fill);
+        glyph = cs.FgOr(glyph);
 
-        c.FillCircle(cx, cy, circleR, circleColor);
-        int fh = Canvas.FontHeight(t.fontSizeSmall);
-        if (error) {
-            c.DrawTextCentered(cx - circleR, cy - fh / 2, circleR * 2, fh, "!", glyphColor, t.fontSizeSmall);
-        } else if (done) {
+        c.FillCircle(cx, cy, cs.HeightOr(r * 2) / 2, fill);
+        int fs = cs.FontOr(t.fontSizeSmall);
+        int fh = Canvas.FontHeight(fs);
+        if (index == errorIndex) {
+            c.DrawTextCentered(cx - r, cy - fh / 2, r * 2, fh, "!", glyph, fs);
+        } else if (index < current) {
             int ck = app.Scale(12);
-            Icon.Draw(c, "check", cx - ck / 2, cy - ck / 2, ck, t.textInverse);
+            Icon.Draw(c, "check", cx - ck / 2, cy - ck / 2, ck, glyph);
         } else {
-            c.DrawTextCentered(cx - circleR, cy - fh / 2, circleR * 2, fh, Convert.ToString(index + 1), glyphColor, t.fontSizeSmall);
+            c.DrawTextCentered(cx - r, cy - fh / 2, r * 2, fh,
+                               Convert.ToString(index + 1), glyph, fs);
         }
     }
 
-    /// Horizontal steps with an optional error step (pass -1 for none).
-    static void RenderStatus(App app, int x, int y, int totalWidth,
-                             List<string> labels, int current, int errorIndex) {
+    /// The connector between two circles, in the style the later step selects.
+    static void Line(App app, int x0, int y0, int x1, int y1, int index,
+                     int current, int errorIndex, string cls) {
+        Theme t = app.theme;
+        StyleBox s = Style.Of(app, "steps", cls, Style.SNormal());
+        StyleBox ls = Style.Part(app, "steps", "line", "",
+                                 Steps.StateClass(cls, index, current,
+                                                  errorIndex),
+                                 "", Style.SNormal());
+        int color = t.borderPrimary;
+        if (index <= current) { color = s.AccentOr(t.primary); }
+        app.canvas.DrawLine(x0, y0, x1, y1, ls.BgOr(color),
+                            ls.HeightOr(app.Scale(1)));
+    }
+
+    /// Horizontal steps: circles across `totalWidth` with the label under each.
+    static void PaintHorizontal(App app, int x, int y, int totalWidth,
+                                List<Step> steps, int current, int errorIndex,
+                                string cls) {
         Canvas c = app.canvas;
         Theme t = app.theme;
-
-        int count = labels.Count;
+        int count = steps.Count;
         if (count == 0) { return; }
 
         int stepW = totalWidth / count;
         int circleR = app.Scale(13);
         int i = 0;
-
         while (i < count) {
             int cx = x + i * stepW + stepW / 2;
-
             if (i > 0) {
                 int prevCx = x + (i - 1) * stepW + stepW / 2;
-                int lineColor = t.borderPrimary;
-                if (i <= current) { lineColor = t.primary; }
-                c.DrawLine(prevCx + circleR + app.Scale(2), y + circleR, cx - circleR - app.Scale(2), y + circleR, lineColor, app.Scale(1));
+                Steps.Line(app, prevCx + circleR + app.Scale(2), y + circleR,
+                           cx - circleR - app.Scale(2), y + circleR, i, current,
+                           errorIndex, cls);
             }
+            Steps.Circle(app, cx, y + circleR, circleR, i, current, errorIndex,
+                         cls);
 
-            Steps.StepCircle(app, cx, y + circleR, circleR, i, current, errorIndex);
-
-            int labelY = y + circleR * 2 + app.Scale(8);
-            int labelColor = t.textSecondary;
-            if (i == current) { labelColor = t.textPrimary; }
-            if (i == errorIndex) { labelColor = t.error; }
-            c.DrawTextCentered(cx - stepW / 2, labelY, stepW, Canvas.FontHeight(t.fontSizeSmall), labels[i], labelColor, t.fontSizeSmall);
-
+            StyleBox ls = Style.Part(app, "steps", "label", "",
+                                     Steps.StateClass(cls, i, current,
+                                                      errorIndex),
+                                     "", Style.SNormal());
+            int fs = ls.FontOr(t.fontSizeSmall);
+            c.DrawTextCentered(cx - stepW / 2, y + circleR * 2 + app.Scale(8),
+                               stepW, Canvas.FontHeight(fs), steps[i].label,
+                               ls.FgOr(Steps.LabelColor(t, i, current,
+                                                        errorIndex)),
+                               fs);
             i = i + 1;
         }
     }
 
     /// Vertical steps: circles stacked top-to-bottom with a connector line and
     /// a label (+ optional description) to the right of each circle.
-    static void RenderVertical(App app, int x, int y, int rowGap,
-                               List<Step> steps,
-                               int current, int errorIndex) {
+    static void PaintVertical(App app, int x, int y, int rowGap,
+                              List<Step> steps, int current, int errorIndex,
+                              string cls) {
         Canvas c = app.canvas;
         Theme t = app.theme;
         int count = steps.Count;
@@ -168,35 +220,71 @@ class Steps : Control {
         int i = 0;
         while (i < count) {
             int cy = y + i * rowGap + circleR;
-
             if (i > 0) {
                 int prevCy = y + (i - 1) * rowGap + circleR;
-                int lineColor = t.borderPrimary;
-                if (i <= current) { lineColor = t.primary; }
-                c.DrawLine(x + circleR, prevCy + circleR + app.Scale(2), x + circleR, cy - circleR - app.Scale(2), lineColor, app.Scale(1));
+                Steps.Line(app, x + circleR, prevCy + circleR + app.Scale(2),
+                           x + circleR, cy - circleR - app.Scale(2), i, current,
+                           errorIndex, cls);
             }
+            Steps.Circle(app, x + circleR, cy, circleR, i, current, errorIndex,
+                         cls);
 
-            Steps.StepCircle(app, x + circleR, cy, circleR, i, current, errorIndex);
-
+            string state = Steps.StateClass(cls, i, current, errorIndex);
+            StyleBox ls = Style.Part(app, "steps", "label", "", state, "",
+                                     Style.SNormal());
+            StyleBox ds = Style.Part(app, "steps", "desc", "", state, "",
+                                     Style.SNormal());
+            int lf = ls.FontOr(t.fontSizeMedium);
+            int df = ds.FontOr(t.fontSizeSmall);
+            int labelColor = ls.FgOr(Steps.LabelColor(t, i, current,
+                                                      errorIndex));
             int tx = x + circleR * 2 + app.Scale(12);
-            int fh = Canvas.FontHeight(t.fontSizeMedium);
-            int sh = Canvas.FontHeight(t.fontSizeSmall);
-            int labelColor = t.textSecondary;
-            if (i == current) { labelColor = t.textPrimary; }
-            if (i == errorIndex) { labelColor = t.error; }
+            int fh = Canvas.FontHeight(lf);
             Step st = steps[i];
-            bool hasDesc = st.desc != "";
-            if (hasDesc) {
+            if (st.desc == "") {
+                c.DrawText(tx, cy - fh / 2, st.label, labelColor, lf);
+            } else {
                 // Two-line block (label over description) vertically centred on
                 // the circle, both left-aligned so they never overlap.
-                int blockTop = cy - (fh + sh) / 2;
-                c.DrawText(tx, blockTop, st.label, labelColor, t.fontSizeMedium);
-                c.DrawText(tx, blockTop + fh, st.desc, t.textTertiary, t.fontSizeSmall);
-            } else {
-                c.DrawText(tx, cy - fh / 2, st.label, labelColor, t.fontSizeMedium);
+                int blockTop = cy - (fh + Canvas.FontHeight(df)) / 2;
+                c.DrawText(tx, blockTop, st.label, labelColor, lf);
+                c.DrawText(tx, blockTop + fh, st.desc,
+                           ds.FgOr(t.textTertiary), df);
             }
-
             i = i + 1;
         }
+    }
+
+    static int LabelColor(Theme t, int index, int current, int errorIndex) {
+        if (index == errorIndex) { return t.error; }
+        if (index == current) { return t.textPrimary; }
+        return t.textSecondary;
+    }
+
+    // ---- designer / serialization model -------------------------------------
+
+    override string Kind() { return "Steps"; }
+
+    override List<PropSpec> Props() {
+        List<PropSpec> ps = new List<PropSpec>();
+        ps.Add(PropSpec.Int("current", "Current step"));
+        ps.Add(PropSpec.Int("error", "Errored step"));
+        ps.Add(PropSpec.Text("class", "Classes"));
+        return ps;
+    }
+
+    override string GetProp(string key) {
+        if (key == "current") { return Convert.ToString(model.Get()); }
+        if (key == "error") { return Convert.ToString(ErrorIndex); }
+        if (key == "class") { return Class; }
+        return "";
+    }
+
+    override void SetProp(string key, string val) {
+        if (key == "current") { model.Set(Convert.ToInt32(val)); }
+        else if (key == "error") { ErrorIndex = Convert.ToInt32(val); }
+        else if (key == "class") { Class = val; }
+        else if (val == "true") { Class = Class + " " + key; }
+        else if (val != "" && val != "false") { Class = Class + " " + val; }
     }
 }

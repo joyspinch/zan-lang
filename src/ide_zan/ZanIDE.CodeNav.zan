@@ -1269,38 +1269,41 @@ partial class ZanIDE {
         return formPath + ".zan";
     }
 
-    /// Emits the Zan draw statements for one designed control, used inside the
-    /// generated RenderDesign. The y position is offset by the title-bar height
-    /// so controls sit in the window's client area.
-    /// Emits the draw calls for one control. `sx`/`sy`/`sw`/`sh` are Zan
-    /// expressions (absolute window coordinates), so the caller can pass
-    /// either literals (free placement) or the dock-layout variables.
-    static string EmitControlDraw(string type, string nm, string sx, string sy, string sw, string sh) {
+    /// Emits the statement that renders one designed control, used inside the
+    /// generated RenderDesign. `sx`/`sy`/`sw`/`sh` are Zan expressions
+    /// (absolute window coordinates), so the caller can pass either literals
+    /// (free placement) or the dock-layout variables. Every control is a
+    /// stdlib widget: the generated preview never draws to the canvas itself.
+    /// Stateful widgets refer to the fields EmitControlState declares.
+    static string EmitControlDraw(string type, string nm, string sx, string sy,
+                                  string sw, string sh, string fieldVar) {
         string s = "        // " + type + " " + nm + "\n";
         if (type == "Label") {
-            s = s + "        app.canvas.DrawText(" + sx + ", " + sy + ", \"" + nm + "\", app.theme.textPrimary, app.theme.fontSizeMedium);\n";
+            s = s + "        Label.Render(app, " + sx + ", " + sy + ", \"" + nm + "\");\n";
         } else if (type == "Button") {
-            s = s + "        app.canvas.FillRoundRect(" + sx + ", " + sy + ", " + sw + ", " + sh + ", 4, 0xFF0E639C);\n";
-            s = s + "        app.canvas.DrawText(" + sx + " + 10, " + sy + " + 6, \"" + nm + "\", 0xFFFFFFFF, app.theme.fontSizeSmall);\n";
+            s = s + "        new Button { Text = \"\" + nm + \"\", Class = \"primary\" }.Render(app, " + sx + ", " + sy + ", " + sw + ");\n";
         } else if (type == "TextBox" || type == "RichTextBox") {
-            s = s + "        app.canvas.FillRect(" + sx + ", " + sy + ", " + sw + ", " + sh + ", 0xFF1E1E1E);\n";
-            s = s + "        app.canvas.DrawRect(" + sx + ", " + sy + ", " + sw + ", " + sh + ", 0xFF555555, 1);\n";
-            s = s + "        app.canvas.DrawText(" + sx + " + 6, " + sy + " + 6, \"" + nm + "\", 0xFF888888, app.theme.fontSizeSmall);\n";
+            s = s + "        " + fieldVar + ".Render(app, " + sx + ", " + sy + ", " + sw + ", " + sh + ");\n";
         } else if (type == "CheckBox") {
-            s = s + "        app.canvas.DrawRect(" + sx + ", " + sy + " + 2, 14, 14, 0xFF888888, 1);\n";
-            s = s + "        app.canvas.DrawText(" + sx + " + 20, " + sy + ", \"" + nm + "\", app.theme.textPrimary, app.theme.fontSizeSmall);\n";
+            s = s + "        Checkbox.Render(app, " + sx + ", " + sy + ", \"" + nm + "\", " + fieldVar + ");\n";
         } else if (type == "ProgressBar") {
-            s = s + "        app.canvas.DrawRect(" + sx + ", " + sy + ", " + sw + ", " + sh + ", 0xFF555555, 1);\n";
-            s = s + "        app.canvas.FillRect(" + sx + " + 2, " + sy + " + 2, (" + sw + " - 4) * 60 / 100, " + sh + " - 4, 0xFF007ACC);\n";
-        } else if (type == "Panel" || type == "GroupBox") {
-            s = s + "        app.canvas.DrawRect(" + sx + ", " + sy + ", " + sw + ", " + sh + ", 0xFF555555, 1);\n";
-            s = s + "        app.canvas.DrawText(" + sx + " + 6, " + sy + " + 4, \"" + nm + "\", app.theme.textSecondary, app.theme.fontSizeSmall);\n";
+            s = s + "        Progress.Render(app, " + sx + ", " + sy + ", " + sw + ", 60, 0);\n";
         } else {
-            s = s + "        app.canvas.FillRect(" + sx + ", " + sy + ", " + sw + ", " + sh + ", 0xFF3C3C3C);\n";
-            s = s + "        app.canvas.DrawRect(" + sx + ", " + sy + ", " + sw + ", " + sh + ", 0xFF555555, 1);\n";
-            s = s + "        app.canvas.DrawText(" + sx + " + 6, " + sy + " + 4, \"" + nm + "\", app.theme.textPrimary, app.theme.fontSizeSmall);\n";
+            s = s + "        Card.Render(app, " + sx + ", " + sy + ", " + sw + ", " + sh + ", \"" + nm + "\");\n";
         }
         return s;
+    }
+
+    /// The field declaration a control needs to keep its state between frames
+    /// ("" for stateless ones), paired with EmitControlDraw's statement.
+    static string EmitControlState(string type, string fieldVar) {
+        if (type == "TextBox" || type == "RichTextBox") {
+            return "    static Input " + fieldVar + " = new Input(\"\");\n";
+        }
+        if (type == "CheckBox") {
+            return "    static SignalBool " + fieldVar + " = SignalBool.Create(false);\n";
+        }
+        return "";
     }
 
     /// True when the .zform body is a designer JSON document (as saved by the
@@ -1373,21 +1376,26 @@ partial class ZanIDE {
         return "TextBox";
     }
 
-    /// Emits one label + control-preview row per designer field (recursing into
+    /// Emits one label + control row per designer field (recursing into
     /// container children) using a running `fy` so the generated form lays out
-    /// vertically like the designer preview.
-    static string EmitFieldRows(List<FormField> fields) {
+    /// vertically like the designer preview. Widget state fields are collected
+    /// into `state`, whose entries the caller emits next to RenderDesign.
+    static string EmitFieldRows(List<FormField> fields, List<string> state) {
         string o = "";
         int i = 0;
         while (i < fields.Count) {
             FormField f = fields[i];
             string lbl = f.label;
             if (lbl.Length == 0) { lbl = f.fname; }
-            o = o + "        app.canvas.DrawText(24, fy, \"" + lbl + "\", app.theme.textSecondary, app.theme.fontSizeSmall);\n";
-            o = o + ZanIDE.EmitControlDraw(ZanIDE.FieldDrawType(f.ftype), f.fname, "170", "fy - 6", "280", "30");
+            string ty = ZanIDE.FieldDrawType(f.ftype);
+            string fieldVar = "dsg" + Convert.ToString(state.Count);
+            string decl = ZanIDE.EmitControlState(ty, fieldVar);
+            if (decl != "") { state.Add(decl); }
+            o = o + "        Label.Render(app, 24, fy, \"" + lbl + "\");\n";
+            o = o + ZanIDE.EmitControlDraw(ty, f.fname, "170", "fy - 6", "280", "30", fieldVar);
             o = o + "        fy = fy + 46;\n";
             if (f.IsContainer()) {
-                o = o + ZanIDE.EmitFieldRows(f.kids);
+                o = o + ZanIDE.EmitFieldRows(f.kids, state);
             }
             i = i + 1;
         }
@@ -1402,13 +1410,17 @@ partial class ZanIDE {
         s = s + "    // Generated from the visual design in " + name + ".zform. This whole\n";
         s = s + "    // region is rewritten by the designer - do not edit it; put your own\n";
         s = s + "    // initialization and event logic in OnLoad below.\n";
+        List<string> state = new List<string>();
+        string rows = ZanIDE.EmitFieldRows(fields, state);
+        if (fields.Count == 0) {
+            rows = "        // (no components yet - add some in the form designer)\n";
+        }
+        int si = 0;
+        while (si < state.Count) { s = s + state[si]; si = si + 1; }
         s = s + "    static void RenderDesign(App app) {\n";
         s = s + "        int top = app.titlebarH;\n";
         s = s + "        int fy = top + 24;\n";
-        if (fields.Count == 0) {
-            s = s + "        // (no components yet - add some in the form designer)\n";
-        }
-        s = s + ZanIDE.EmitFieldRows(fields);
+        s = s + rows;
         s = s + "    }\n\n";
         s = s + "    static void Main() {\n";
         s = s + "        App app = App.CreateDark(\"" + name + "\", " + Convert.ToString(fw) + ", " + Convert.ToString(fh) + ");\n";
@@ -1454,7 +1466,8 @@ partial class ZanIDE {
     /// A fresh code-behind file around an already-built designer region.
     static string CodeBehindShell(string name, string region) {
         string s = "using System;\n";
-        s = s + "using Gui;\n\n";
+        s = s + "using Gui;\n";
+        s = s + "using Gui.Widget;\n\n";
         s = s + "// Code-behind for " + name + ".zform.\n";
         s = s + "// The window is designed visually in " + name + ".zform. The region\n";
         s = s + "// between the ZAN-DESIGNER markers is generated from it - do not edit it;\n";
@@ -1573,7 +1586,7 @@ partial class ZanIDE {
     static string CtorExpr(FormField f, string wt) {
         if (wt == "Input") { return "new Input(\"" + ZanIDE.EscZ(f.placeholder) + "\")"; }
         if (wt == "TextArea") { return "TextArea.Create(\"" + ZanIDE.EscZ(f.placeholder) + "\")"; }
-        if (wt == "Button") { return "Button.Create(\"" + ZanIDE.EscZ(ZanIDE.FieldCaption(f)) + "\")"; }
+        if (wt == "Button") { return "new Button { Text = \"\" + ZanIDE.EscZ(ZanIDE.FieldCaption(f)) + \"\" }"; }
         if (wt == "Checkbox") { return "new Checkbox(\"" + ZanIDE.EscZ(ZanIDE.FieldCaption(f)) + "\")"; }
         if (wt == "Switch") { return "Switch.Create()"; }
         if (wt == "Radio") { return "new Radio(SignalInt.Create(0), 0, \"" + ZanIDE.EscZ(ZanIDE.FieldCaption(f)) + "\")"; }

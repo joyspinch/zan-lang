@@ -373,10 +373,14 @@ static SDL_HitTestResult SDLCALL zan_sdl_hittest(SDL_Window *win,
         if (top && right)    return SDL_HITTEST_RESIZE_TOPRIGHT;
         if (bottom && left)  return SDL_HITTEST_RESIZE_BOTTOMLEFT;
         if (bottom && right) return SDL_HITTEST_RESIZE_BOTTOMRIGHT;
-        if (left)   return SDL_HITTEST_RESIZE_LEFT;
-        if (right)  return SDL_HITTEST_RESIZE_RIGHT;
-        if (top)    return SDL_HITTEST_RESIZE_TOP;
-        if (bottom) return SDL_HITTEST_RESIZE_BOTTOM;
+        /* Corners first, then let a control drawn flush with the edge (a
+         * scrollbar in the last few pixels) keep its own presses. */
+        if (!zan_gui_in_hit_guard((iptr)(intptr_t)win, x, y)) {
+            if (left)   return SDL_HITTEST_RESIZE_LEFT;
+            if (right)  return SDL_HITTEST_RESIZE_RIGHT;
+            if (top)    return SDL_HITTEST_RESIZE_TOP;
+            if (bottom) return SDL_HITTEST_RESIZE_BOTTOM;
+        }
     }
     if (inButtons) return SDL_HITTEST_NORMAL;
     if (y < g_titlebar_h) return SDL_HITTEST_DRAGGABLE;

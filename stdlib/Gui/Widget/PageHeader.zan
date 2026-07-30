@@ -3,57 +3,155 @@ using Gui;
 
 namespace Gui.Widget;
 
-/// PageHeader: a back arrow, a title and an optional subtitle line.
-/// Returns the hit id of the back arrow (use Button.WasClicked-style test).
+/// A page header: a back arrow, a title and an optional subtitle line. Like a
+/// button it owns its interaction (the arrow posts `Back`) and its looks are
+/// classes and styled parts (`pageheader::back`, `::title`, `::subtitle`):
+///
+///     PageHeader h = new PageHeader { Text = "Details" };
+///     h.Subtitle = "GUI reference";
+///     h.Back.On(vm.GoBack);
 class PageHeader : Control {
-    string title;
-    string subtitle;
+    Binding<string> Text;
+    Binding<string> Subtitle;
+    /// Glyph of the back affordance; "" hides it.
+    string Icon;
+    int wid;
+    UiEvent Back;
 
     void InitPageHeader(string ttl, string sub) {
         this.InitControl(ttl, 1);
-        title = ttl;
-        subtitle = sub;
+        Text = ttl;
+        Subtitle = sub;
+        Icon = "arrow-left";
+        wid = WidgetId.Next();
+        wiresOwnEvents = true;
+        Back = UiEvent.Create();
     }
 
-    /// Retained-mode constructor: `PageHeader h = new PageHeader("Details", "");`
-    PageHeader(string ttl, string sub) {
-        InitPageHeader(ttl, sub);
+    PageHeader() { InitPageHeader("", ""); }
+    PageHeader(string ttl, string sub) { InitPageHeader(ttl, sub); }
+
+    string Label() {
+        if (Text == null) { return ""; }
+        return Text.Get();
+    }
+
+    string Sub() {
+        if (Subtitle == null) { return ""; }
+        return Subtitle.Get();
+    }
+
+    StyleBox ResolvedStyle(App app) {
+        return this.ResolveStyleAs(app, "pageheader", Class, Style.SNormal());
     }
 
     override void OnMeasure(App app) {
         Theme t = app.theme;
-        int titleLineH = Canvas.FontHeight(t.fontSizeLarge + 2);
+        StyleBox s = this.ResolvedStyle(app);
+        int titleLineH = Canvas.FontHeight(PageHeader.TitleFont(app, Class));
         prefH = titleLineH;
-        if (subtitle != "") {
-            prefH = titleLineH + t.gapSmall + Canvas.FontHeight(t.fontSizeMedium);
+        if (this.Sub() != "") {
+            prefH = titleLineH + t.gapSmall
+                  + Canvas.FontHeight(t.fontSizeMedium);
         }
-        prefW = app.Scale(320);
+        prefW = s.WidthOr(app.Scale(320));
     }
 
     override void OnPaint(App app) {
-        PageHeader.Render(app, bx, by, bw, title, subtitle);
+        PageHeader.Paint(app, wid, bx, by, bw, this.Label(), this.Sub(), Icon,
+                         Class);
+        if (Icon != "" && Ui.Clicked(app, wid)) {
+            Back.Post();
+            app.window.Wake();
+        }
     }
 
-    static int Render(App app, int x, int y, int w, string title, string subtitle) {
-        int id = app.focus.AllocId();
+    /// Title font: the heading class the header carries, `h3` by default.
+    static int TitleFont(App app, string cls) {
+        StyleBox ts = Style.Part(app, "pageheader", "title", "", cls, "",
+                                 Style.SNormal());
+        return ts.FontOr(app.theme.fontSizeLarge + 2);
+    }
+
+    /// Paints the header and registers the back arrow's hit region under `id`.
+    static void Paint(App app, int id, int x, int y, int w, string title,
+                      string subtitle, string icon, string cls) {
         Canvas c = app.canvas;
         Theme t = app.theme;
+        StyleBox bs = Style.Part(app, "pageheader", "back", "", cls, "",
+                                 Style.SNormal());
+        StyleBox ts = Style.Part(app, "pageheader", "title", "", cls, "",
+                                 Style.SNormal());
+        StyleBox ss = Style.Part(app, "pageheader", "subtitle", "", cls, "",
+                                 Style.SNormal());
 
-        bool hovered = app.focus.IsHovered(id);
-        int arrowBox = t.iconSizeMedium;
-        int titleLineH = Canvas.FontHeight(t.fontSizeLarge + 2);
-        int arrowColor = t.textSecondary;
-        if (hovered) { arrowColor = t.primary; }
-        Icon.DrawCenteredIn(c, "arrow-left", x, y, arrowBox, titleLineH, arrowBox, arrowColor);
-        app.hitTester.Register(HitRegion.Create(id, x, y, arrowBox, titleLineH, 0));
-
-        int titleX = x + arrowBox + t.paddingMedium;
-        c.DrawText(titleX, y - 2, title, t.textPrimary, t.fontSizeLarge + 2);
-
-        if (subtitle != "") {
-            int subY = y + Canvas.FontHeight(t.fontSizeLarge + 2) + t.gapSmall;
-            c.DrawText(titleX, subY, subtitle, t.textTertiary, t.fontSizeMedium);
+        int titleFont = ts.FontOr(t.fontSizeLarge + 2);
+        int titleLineH = Canvas.FontHeight(titleFont);
+        int titleX = x;
+        if (icon != "") {
+            int arrowBox = bs.WidthOr(t.iconSizeMedium);
+            int arrowColor = bs.FgOr(t.textSecondary);
+            // The arrow is the only interactive part, so it hovers on its own
+            // box rather than the whole header line.
+            if (app.focus.IsHovered(id)) {
+                arrowColor = bs.AccentOr(t.primary);
+            }
+            Icon.DrawCenteredIn(c, icon, x, y, arrowBox, titleLineH, arrowBox,
+                                arrowColor);
+            app.hitTester.Register(HitRegion.Create(id, x, y, arrowBox,
+                                                    titleLineH, 0));
+            titleX = x + arrowBox + t.paddingMedium;
         }
+
+        c.DrawText(titleX, y - 2, title, ts.FgOr(t.textPrimary), titleFont);
+        if (subtitle == "") { return; }
+        int subFont = ss.FontOr(t.fontSizeMedium);
+        c.DrawText(titleX, y + titleLineH + t.gapSmall, subtitle,
+                   ss.FgOr(t.textTertiary), subFont);
+    }
+
+    /// Immediate-mode header; returns the hit id of the back arrow (test it
+    /// with Ui.Clicked).
+    static int Render(App app, int x, int y, int w, string title,
+                      string subtitle) {
+        int id = app.focus.AllocId();
+        PageHeader.Paint(app, id, x, y, w, title, subtitle, "arrow-left", "");
         return id;
+    }
+
+    // ---- designer / serialization model -------------------------------------
+
+    override string Kind() { return "PageHeader"; }
+
+    override List<PropSpec> Props() {
+        List<PropSpec> ps = new List<PropSpec>();
+        ps.Add(PropSpec.Text("text", "Text"));
+        ps.Add(PropSpec.Text("subtitle", "Subtitle"));
+        ps.Add(PropSpec.Text("icon", "Back icon"));
+        ps.Add(PropSpec.Text("class", "Classes"));
+        return ps;
+    }
+
+    override List<string> Events() {
+        List<string> es = Control.CommonEvents();
+        es.Add("Back");
+        return es;
+    }
+
+    override string GetProp(string key) {
+        if (key == "text") { return this.Label(); }
+        if (key == "subtitle") { return this.Sub(); }
+        if (key == "icon") { return Icon; }
+        if (key == "class") { return Class; }
+        return "";
+    }
+
+    override void SetProp(string key, string val) {
+        if (key == "text") { Text = val; name = val; }
+        else if (key == "subtitle") { Subtitle = val; }
+        else if (key == "icon") { Icon = val; }
+        else if (key == "class") { Class = val; }
+        else if (val == "true") { Class = Class + " " + key; }
+        else if (val != "" && val != "false") { Class = Class + " " + val; }
     }
 }

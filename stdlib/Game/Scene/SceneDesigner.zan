@@ -52,6 +52,7 @@ class SceneDesigner {
     List<string> redoStack;
     string clipJson;     // copied element (single-element scene JSON)
     int resPick;         // resource picker popup: 0 closed, 1 image, 2 background
+    ListState resList;   // resource picker list scroll/selection
     bool ctxOpen;        // canvas right-click context menu
     int ctxX;
     int ctxY;
@@ -241,8 +242,7 @@ class SceneDesigner {
     }
 
     static bool IsSlotKind(string kind) {
-        return kind == "skillslot" || kind == "quickslot"
-            || kind == "bagslot" || kind == "itemslot";
+        return SceneView.IsSlotKind(kind);
     }
 
     // Sensible starting size/tint/grid for each kind so a fresh element is
@@ -285,21 +285,11 @@ class SceneDesigner {
     }
 
     static int PackColor(int r, int g, int b, int a) {
-        return a * 16777216 + r * 65536 + g * 256 + b;
+        return SceneView.PackColor(r, g, b, a);
     }
 
     static List<string> SplitItems(string items) {
-        List<string> o = new List<string>();
-        string cur = "";
-        int i = 0;
-        while (i < items.Length) {
-            string c = items.Substring(i, 1);
-            if (c == ";") { o.Add(cur); cur = ""; }
-            else { cur = cur + c; }
-            i = i + 1;
-        }
-        if (cur.Length > 0) { o.Add(cur); }
-        return o;
+        return SceneView.SplitItems(items);
     }
 
     // Design-space top-left of an element (anchor resolved at 1:1 against the
@@ -578,7 +568,7 @@ class SceneDesigner {
 
         // Palette drag ghost: a floating chip following the cursor until it is
         // dropped on the canvas (handled in RenderCanvas) or released elsewhere.
-        int gek = app.window.EventKind();
+        int gek = app.EventKind();
         if (app.PointerCaptured()) { gek = 0; }
         if (this.palDrag.Length > 0) {
             if (gek == 1) { this.palMoved = true; }
@@ -591,8 +581,8 @@ class SceneDesigner {
                 int gh = app.Scale(24);
                 c.FillRoundRect(app.mouseX + app.Scale(10), app.mouseY + app.Scale(10),
                     gw, gh, app.Scale(4), SceneDesigner.PackColor(70, 110, 200, 220));
-                c.DrawText(app.mouseX + app.Scale(18), app.mouseY + app.Scale(14),
-                    gl, 0xFFFFFFFF, t.fontSizeSmall);
+                Label.SmallColored(app, app.mouseX + app.Scale(18),
+                    app.mouseY + app.Scale(14), gl, t.textInverse);
             }
             app.RequestRedraw();
         }
@@ -647,62 +637,48 @@ class SceneDesigner {
             }
         }
         int mW = app.Scale(300);
-        int rowH = Canvas.FontHeight(t.fontSizeSmall) + app.Scale(12);
-        int rows = files.Count;
+        int rowH = ListView.RowHeight(app);
+        int rows = files.Count + 1;
         if (rows > 10) { rows = 10; }
-        int mH = app.Scale(40) + rowH;  // header + clear row
-        mH = mH + rows * rowH + app.Scale(10);
-        if (files.Count == 0) { mH = mH + rowH; }
+        int listH = rows * rowH + app.Scale(4);
+        int mH = app.Scale(34) + listH;
         int mx = x + (w - mW) / 2;
         int my = y + (h - mH) / 2;
-        c.FillRoundRect(mx + 1, my + 2, mW, mH, app.Scale(6), t.shadowColor);
-        c.FillRoundRect(mx, my, mW, mH, app.Scale(6), t.bgSecondary);
-        c.DrawRect(mx, my, mW, mH, t.borderPrimary, 1);
+
         string title = SceneDesigner.T("Pick a resource (assets/)", "选择资源（assets/）");
         if (this.resPick == 2) {
             title = SceneDesigner.T("Pick a background (assets/)", "选择背景（assets/）");
         }
-        c.DrawText(mx + app.Scale(10), my + app.Scale(8), title, t.textSecondary, t.fontSizeSmall);
-        int ek = app.window.EventKind();
-        if (app.PointerCaptured()) { ek = 0; }
-        int iy = my + app.Scale(32);
-        bool inside = SceneDesigner.InRect(app.mouseX, app.mouseY, mx, my, mW, mH);
-        // "(none)" clears the field.
-        bool overClr = SceneDesigner.InRect(app.mouseX, app.mouseY, mx, iy, mW, rowH);
-        if (overClr) { c.FillRect(mx + 2, iy, mW - 4, rowH, t.bgTertiary); }
-        c.DrawText(mx + app.Scale(12), iy + app.Scale(5),
-            SceneDesigner.T("(none)", "（无）"), t.textTertiary, t.fontSizeSmall);
-        if (overClr && ek == 3) {
-            if (this.resPick == 1) { this.imgIn.SetText(""); }
-            else { this.bgIn.SetText(""); }
-            this.resPick = 0;
-        }
-        iy = iy + rowH;
-        if (files.Count == 0) {
-            c.DrawText(mx + app.Scale(12), iy + app.Scale(5),
-                SceneDesigner.T("no image resources; add files via Project Config",
-                    "暂无图片资源，可在项目配置中添加"),
-                t.textTertiary, t.fontSizeTiny);
-        }
+        Prompt.Surface(app, mx, my, mW, mH, "");
+        Prompt.Caption(app, mx, my, title);
+        app.BlockHitsRect(mx, my, mW, mH);
+
+        List<ListRow> rws = new List<ListRow>();
+        rws.Add(ListRow.Create(SceneDesigner.T("(none)", "（无）")));
         int i = 0;
-        while (i < rows) {
-            bool over = SceneDesigner.InRect(app.mouseX, app.mouseY, mx, iy, mW, rowH);
-            if (over) { c.FillRect(mx + 2, iy, mW - 4, rowH, t.bgTertiary); }
-            c.DrawText(mx + app.Scale(12), iy + app.Scale(5), files[i], t.textPrimary, t.fontSizeSmall);
-            if (over && ek == 3) {
-                if (this.resPick == 1) { this.imgIn.SetText(files[i]); }
-                else { this.bgIn.SetText(files[i]); }
-                this.resPick = 0;
-            }
-            iy = iy + rowH;
+        while (i < files.Count) {
+            rws.Add(ListRow.Create(files[i]));
             i = i + 1;
         }
-        if (files.Count > rows) {
-            c.DrawText(mx + app.Scale(12), iy + app.Scale(2),
-                "+" + SceneDoc.IntStr(files.Count - rows), t.textTertiary, t.fontSizeTiny);
+        if (this.resList == null) { this.resList = ListState.Create(); }
+        ListView.RenderRows(app, mx + app.Scale(6), my + app.Scale(30),
+            mW - app.Scale(12), listH, rws, this.resList,
+            SceneDesigner.T("no image resources; add files via Project Config",
+                "暂无图片资源，可在项目配置中添加"));
+        int picked = this.resList.clicked;
+        if (picked >= 0) {
+            string val = "";
+            if (picked > 0) { val = files[picked - 1]; }
+            if (this.resPick == 1) { this.imgIn.SetText(val); }
+            else { this.bgIn.SetText(val); }
+            this.resPick = 0;
         }
-        // Click outside closes the popup; swallow the event either way.
-        if (ek == 2 && !inside) { this.resPick = 0; }
+
+        // A click outside the popup dismisses it.
+        if (app.ClickAvailable()
+            && !SceneDesigner.InRect(app.mouseX, app.mouseY, mx, my, mW, mH)) {
+            this.resPick = 0;
+        }
         app.RequestRedraw();
     }
 
@@ -720,8 +696,8 @@ class SceneDesigner {
         int i = 0;
         while (i < items.Count) {
             int bw = Canvas.MeasureText(items[i], t.fontSizeSmall) + app.Scale(14);
-            int id = Button.Create(items[i]).SetSize(1).Render(app, bx, by, bw);
-            if (Button.WasClicked(app, id)) {
+            int id = new Button { Text = items[i], Class = "small" }.Render(app, bx, by, bw);
+            if (Ui.Clicked(app, id)) {
                 this.barClickGroup = group;
                 this.barClickIndex = i;
             }
@@ -730,8 +706,8 @@ class SceneDesigner {
         }
         // Group caption centred under the buttons.
         int cw2 = Canvas.MeasureText(caption, t.fontSizeTiny);
-        c.DrawText(gx + (bx - app.Scale(4) - gx - cw2) / 2,
-            y + t.heightSmall + app.Scale(3), caption, t.textTertiary, t.fontSizeTiny);
+        Label.Tiny(app, gx + (bx - app.Scale(4) - gx - cw2) / 2,
+            y + t.heightSmall + app.Scale(3), caption);
         // Separator between groups.
         bx = bx + app.Scale(4);
         c.FillRect(bx, y + app.Scale(2), 1, h - app.Scale(4), t.borderPrimary);
@@ -812,9 +788,8 @@ class SceneDesigner {
                 + SceneDesigner.T(" element(s)", " 个元素");
         }
         int hw = Canvas.MeasureText(hint, t.fontSizeSmall);
-        c.DrawText(x + w - hw - app.Scale(10),
-            y + (t.heightSmall - Canvas.FontHeight(t.fontSizeSmall)) / 2, hint,
-            t.textTertiary, t.fontSizeSmall);
+        Label.Hint(app, x + w - hw - app.Scale(10),
+            y + (t.heightSmall - Canvas.FontHeight(t.fontSizeSmall)) / 2, hint);
     }
 
     // Floating right-click menu for the selected canvas element.
@@ -833,71 +808,17 @@ class SceneDesigner {
         if (this.sel.Locked()) { items.Add(SceneDesigner.T("Unlock", "解锁")); }
         else { items.Add(SceneDesigner.T("Lock", "锁定")); }
 
-        int fontSize = t.fontSizeSmall;
-        int itemH = Canvas.FontHeight(fontSize) + app.Scale(10);
-        int sepH = app.Scale(7);
-        int mW = app.Scale(140);
-        int i = 0;
-        while (i < items.Count) {
-            if (items[i] != "-") {
-                int lw = Canvas.MeasureText(items[i], fontSize) + app.Scale(28);
-                if (lw > mW) { mW = lw; }
-            }
-            i = i + 1;
+        int choice = ContextMenu.Render(app, this.ctxX, this.ctxY, items);
+        if (choice == 0 - 2) {
+            this.ctxOpen = false;
+        } else if (choice >= 0) {
+            this.ApplyContextAction(choice);
+            this.ctxOpen = false;
         }
-        int mH = app.Scale(8);
-        i = 0;
-        while (i < items.Count) {
-            if (items[i] == "-") { mH = mH + sepH; } else { mH = mH + itemH; }
-            i = i + 1;
-        }
-        int mx = this.ctxX;
-        int my = this.ctxY;
-        if (mx + mW > app.canvas.Width()) { mx = app.canvas.Width() - mW - app.Scale(4); }
-        if (my + mH > app.canvas.Height()) { my = app.canvas.Height() - mH - app.Scale(4); }
-
-        c.FillRoundRect(mx + 1, my + 2, mW, mH, app.Scale(6), t.shadowColor);
-        c.FillRoundRect(mx, my, mW, mH, app.Scale(6), t.bgSecondary);
-        c.DrawRect(mx, my, mW, mH, t.borderPrimary, 1);
-
-        int ek = app.window.EventKind();
-        if (app.PointerCaptured()) { ek = 0; }
-        int hover = 0 - 1;
-        int iy = my + app.Scale(4);
-        i = 0;
-        while (i < items.Count) {
-            if (items[i] == "-") {
-                c.FillRect(mx + app.Scale(8), iy + sepH / 2, mW - app.Scale(16), 1, t.borderPrimary);
-                iy = iy + sepH;
-            } else {
-                bool over = SceneDesigner.InRect(app.mouseX, app.mouseY, mx, iy, mW, itemH);
-                if (over) {
-                    hover = i;
-                    c.FillRoundRect(mx + app.Scale(4), iy, mW - app.Scale(8), itemH, app.Scale(4), t.bgTertiary);
-                }
-                c.DrawText(mx + app.Scale(14), iy + app.Scale(5), items[i], t.textPrimary, fontSize);
-                iy = iy + itemH;
-            }
-            i = i + 1;
-        }
-        this.ctxHover = hover;
-
-        // Left press picks/dismisses; the right press that opened the menu is
-        // ignored here (it carries button 1).
-        if (ek == 2 && app.window.EventButton() == 0) {
-            if (hover >= 0) {
-                this.ApplyContextAction(hover);
-                this.ctxOpen = false;
-            } else if (!SceneDesigner.InRect(app.mouseX, app.mouseY, mx, my, mW, mH)) {
-                this.ctxOpen = false;
-            }
-            app.RequestRedraw();
-        }
-        if (ek == 4 && app.window.EventKeyCode() == 27) {
+        if (app.EventKind() == 4 && app.window.EventKeyCode() == 27) {
             this.ctxOpen = false;
             app.RequestRedraw();
         }
-        app.RequestRedraw();
     }
 
     void ApplyContextAction(int idx) {
@@ -926,18 +847,18 @@ class SceneDesigner {
     // drops it at a specific spot instead. Returns the y after the section.
     int PaletteSection(App app, Canvas c, Theme t, int x, int y, int w,
             string title, List<string> kinds) {
-        c.DrawText(x, y, title, t.textTertiary, t.fontSizeSmall);
+        Label.Hint(app, x, y, title);
         int iy = y + app.Scale(18);
         int bw = (w - app.Scale(6)) / 2;
         int bh = app.Scale(26);
-        int ek = app.window.EventKind();
+        int ek = app.EventKind();
         if (app.PointerCaptured()) { ek = 0; }
         int k = 0;
         while (k < kinds.Count) {
             int col = k % 2;
             int bx = x + col * (bw + app.Scale(6));
-            int chipId = Button.Create(SceneDesigner.KindLabel(kinds[k])).Render(app, bx, iy, bw);
-            if (Button.WasClicked(app, chipId)) {
+            int chipId = new Button { Text = SceneDesigner.KindLabel(kinds[k]) }.Render(app, bx, iy, bw);
+            if (Ui.Clicked(app, chipId)) {
                 // Simple click: add at the canvas centre, no drag needed.
                 this.AddElement(kinds[k]);
                 this.palDrag = "";
@@ -957,8 +878,7 @@ class SceneDesigner {
     }
 
     void RenderPalette(App app, Canvas c, Theme t, int x, int y, int w, int h) {
-        c.FillRoundRect(x, y, w, h, app.Scale(8), t.bgSecondary);
-        c.DrawRect(x, y, w, h, t.borderPrimary, 1);
+        Panel.OutlinedSurface(app, x, y, w, h, t.borderRadiusLarge, t.bgSecondary);
         int ix = x + app.Scale(8);
         int iw = w - app.Scale(16);
         int iy = y + app.Scale(10);
@@ -968,27 +888,27 @@ class SceneDesigner {
         iy = this.PaletteSection(app, c, t, ix, iy, iw,
             SceneDesigner.T("COMPONENTS", "组件"), SceneDesigner.ComponentKinds());
 
-        c.DrawText(ix, iy, SceneDesigner.T("CANVAS", "画布"), t.textTertiary, t.fontSizeSmall);
+        Label.Hint(app, ix, iy, SceneDesigner.T("CANVAS", "画布"));
         iy = iy + app.Scale(18);
         int bh = app.Scale(26);
         int bw = (iw - app.Scale(6)) / 2;
         string gl = SceneDesigner.T("Grid: off", "网格:关");
         if (this.showGrid) { gl = SceneDesigner.T("Grid: on", "网格:开"); }
-        int gid = Button.Create(gl).Render(app, ix, iy, bw);
-        if (Button.WasClicked(app, gid)) { this.showGrid = !this.showGrid; app.RequestRedraw(); }
+        int gid = new Button { Text = gl }.Render(app, ix, iy, bw);
+        if (Ui.Clicked(app, gid)) { this.showGrid = !this.showGrid; app.RequestRedraw(); }
         string sl = SceneDesigner.T("Snap: off", "吸附:关");
         if (this.snap) { sl = SceneDesigner.T("Snap: on", "吸附:开"); }
-        int sid = Button.Create(sl).Render(app, ix + bw + app.Scale(6), iy, bw);
-        if (Button.WasClicked(app, sid)) { this.snap = !this.snap; app.RequestRedraw(); }
+        int sid = new Button { Text = sl }.Render(app, ix + bw + app.Scale(6), iy, bw);
+        if (Ui.Clicked(app, sid)) { this.snap = !this.snap; app.RequestRedraw(); }
         iy = iy + bh + app.Scale(4);
         string tl = SceneDesigner.T("Tags: off", "标签:关");
         if (this.showTags) { tl = SceneDesigner.T("Tags: on", "标签:开"); }
-        int tid = Button.Create(tl).Render(app, ix, iy, bw);
-        if (Button.WasClicked(app, tid)) { this.showTags = !this.showTags; app.RequestRedraw(); }
+        int tid = new Button { Text = tl }.Render(app, ix, iy, bw);
+        if (Ui.Clicked(app, tid)) { this.showTags = !this.showTags; app.RequestRedraw(); }
         // Grid size cycles 4 -> 8 -> 16 -> 32 (design px per cell).
         string gsl = SceneDesigner.T("Grid ", "网格 ") + SceneDoc.IntStr(this.grid) + "px";
-        int gsid = Button.Create(gsl).Render(app, ix + bw + app.Scale(6), iy, bw);
-        if (Button.WasClicked(app, gsid)) {
+        int gsid = new Button { Text = gsl }.Render(app, ix + bw + app.Scale(6), iy, bw);
+        if (Ui.Clicked(app, gsid)) {
             if (this.grid == 4) { this.grid = 8; }
             else if (this.grid == 8) { this.grid = 16; }
             else if (this.grid == 16) { this.grid = 32; }
@@ -999,170 +919,9 @@ class SceneDesigner {
 
     // --- canvas (free placement over the design resolution) ------------------
 
-    // Draws one element at screen rect (ex,ey,exw,exh), approximating how the
-    // runtime renders that kind so the design view reads like the real HUD.
-    void DrawElement(App app, Canvas c, Theme t, SceneElement e,
-            int ex, int ey, int exw, int exh, int psMilli) {
-        string kind = e.Kind();
-        int alpha = e.A();
-        if (!e.Visible()) { alpha = 60; }
-        int fill = SceneDesigner.PackColor(e.R(), e.G(), e.B(), alpha);
-        string cap = e.Text();
-        if (cap.Length == 0) { cap = e.Name(); }
-
-        if (SceneDesigner.IsSlotKind(kind)) {
-            // Grid group: rows x cols cells of the cell size with gaps.
-            int cw = e.W() * psMilli / 1000;
-            int chh = e.H() * psMilli / 1000;
-            int gx = e.GapX() * psMilli / 1000;
-            int gy = e.GapY() * psMilli / 1000;
-            int r = 0;
-            while (r < e.Rows()) {
-                int col = 0;
-                while (col < e.Cols()) {
-                    int sx = ex + col * (cw + gx);
-                    int sy = ey + r * (chh + gy);
-                    c.FillRoundRect(sx, sy, cw, chh, app.Scale(3), fill);
-                    c.DrawRect(sx, sy, cw, chh, t.borderSecondary, 1);
-                    col = col + 1;
-                }
-                r = r + 1;
-            }
-            return;
-        }
-        if (kind == "circle") {
-            int rad = exw;
-            if (exh < rad) { rad = exh; }
-            rad = rad / 2;
-            c.FillCircle(ex + exw / 2, ey + exh / 2, rad, fill);
-            return;
-        }
-        if (kind == "progressbar" || kind == "slider" || kind == "scrollbar") {
-            int v = e.Value();
-            if (v < 0) { v = 0; }
-            if (v > 100) { v = 100; }
-            c.FillRoundRect(ex, ey, exw, exh, app.Scale(3),
-                SceneDesigner.PackColor(20, 22, 34, alpha));
-            c.DrawRect(ex, ey, exw, exh, t.borderSecondary, 1);
-            if (kind == "progressbar") {
-                c.FillRoundRect(ex, ey, exw * v / 100, exh, app.Scale(3), fill);
-            } else if (kind == "slider") {
-                int kx = ex + (exw - app.Scale(8)) * v / 100;
-                c.FillRect(ex, ey + exh / 2 - 1, exw, 2, t.borderPrimary);
-                c.FillRoundRect(kx, ey, app.Scale(8), exh, app.Scale(3), t.primary);
-            } else {
-                // vertical thumb proportional to value
-                int th = exh / 4;
-                int ty = ey + (exh - th) * v / 100;
-                c.FillRoundRect(ex + 1, ty, exw - 2, th, app.Scale(3), t.primary);
-            }
-            return;
-        }
-        if (kind == "text" || kind == "label") {
-            c.DrawText(ex, ey, cap, SceneDesigner.PackColor(e.R(), e.G(), e.B(), alpha), t.fontSizeMedium);
-            return;
-        }
-        if (kind == "arttext") {
-            // faux outline: shadow offset + bright face
-            c.DrawText(ex + 2, ey + 2, cap, SceneDesigner.PackColor(20, 12, 4, alpha), t.fontSizeLarge);
-            c.DrawText(ex, ey, cap, fill, t.fontSizeLarge);
-            return;
-        }
-        if (kind == "checkbox") {
-            int bs = exh;
-            if (bs > app.Scale(18)) { bs = app.Scale(18); }
-            c.DrawRect(ex, ey + (exh - bs) / 2, bs, bs, t.borderPrimary, 1);
-            if (e.Value() != 0) {
-                c.FillRect(ex + 3, ey + (exh - bs) / 2 + 3, bs - 6, bs - 6, t.primary);
-            }
-            c.DrawText(ex + bs + app.Scale(6), ey + (exh - t.fontSizeSmall) / 2 - 2,
-                cap, t.textPrimary, t.fontSizeSmall);
-            return;
-        }
-        if (kind == "tabbox") {
-            c.FillRoundRect(ex, ey, exw, exh, app.Scale(4), fill);
-            c.DrawRect(ex, ey, exw, exh, t.borderSecondary, 1);
-            List<string> tabs = SceneDesigner.SplitItems(e.Items());
-            int th = app.Scale(20);
-            int tx = ex;
-            int i = 0;
-            while (i < tabs.Count) {
-                int tw = app.Scale(12) + tabs[i].Length * t.fontSizeTiny;
-                int tc = t.bgTertiary;
-                if (i == 0) { tc = t.primary; }
-                c.FillRoundRect(tx, ey, tw, th, app.Scale(3), tc);
-                c.DrawText(tx + app.Scale(6), ey + app.Scale(3), tabs[i], t.textInverse, t.fontSizeTiny);
-                tx = tx + tw + app.Scale(2);
-                i = i + 1;
-            }
-            return;
-        }
-        if (kind == "combobox" || kind == "input") {
-            c.FillRoundRect(ex, ey, exw, exh, app.Scale(3),
-                SceneDesigner.PackColor(20, 22, 34, alpha));
-            c.DrawRect(ex, ey, exw, exh, t.borderPrimary, 1);
-            string txt = e.Text();
-            if (kind == "combobox") {
-                List<string> its = SceneDesigner.SplitItems(e.Items());
-                if (its.Count > 0) { txt = its[0]; }
-                c.DrawText(ex + exw - app.Scale(14), ey + app.Scale(2), "v", t.textTertiary, t.fontSizeSmall);
-            }
-            c.DrawText(ex + app.Scale(5), ey + app.Scale(4), txt, t.textPrimary, t.fontSizeSmall);
-            return;
-        }
-        if (kind == "listbox") {
-            c.FillRoundRect(ex, ey, exw, exh, app.Scale(3),
-                SceneDesigner.PackColor(20, 22, 34, alpha));
-            c.DrawRect(ex, ey, exw, exh, t.borderPrimary, 1);
-            List<string> its = SceneDesigner.SplitItems(e.Items());
-            int iy = ey + app.Scale(3);
-            int i = 0;
-            while (i < its.Count && iy < ey + exh - app.Scale(10)) {
-                c.DrawText(ex + app.Scale(5), iy, its[i], t.textPrimary, t.fontSizeTiny);
-                iy = iy + app.Scale(14);
-                i = i + 1;
-            }
-            return;
-        }
-        if (kind == "minimap") {
-            c.FillRoundRect(ex, ey, exw, exh, app.Scale(4), fill);
-            c.DrawRect(ex, ey, exw, exh, t.borderSecondary, 1);
-            c.FillCircle(ex + exw / 2, ey + exh / 2, app.Scale(3), t.primary);
-            c.DrawRect(ex + exw / 4, ey + exh / 4, exw / 2, exh / 2, t.borderPrimary, 1);
-            return;
-        }
-        if (kind == "avatarbox") {
-            c.FillRoundRect(ex, ey, exw, exh, app.Scale(4), fill);
-            c.DrawRect(ex, ey, exw, exh, t.borderSecondary, 1);
-            int ps = exh - app.Scale(8);
-            c.FillCircle(ex + app.Scale(4) + ps / 2, ey + app.Scale(4) + ps / 2, ps / 2,
-                SceneDesigner.PackColor(90, 130, 220, alpha));
-            c.FillRoundRect(ex + ps + app.Scale(10), ey + app.Scale(8),
-                exw - ps - app.Scale(18), app.Scale(8), app.Scale(2),
-                SceneDesigner.PackColor(210, 70, 70, alpha));
-            c.FillRoundRect(ex + ps + app.Scale(10), ey + app.Scale(20),
-                (exw - ps - app.Scale(18)) * 3 / 4, app.Scale(8), app.Scale(2),
-                SceneDesigner.PackColor(70, 120, 210, alpha));
-            return;
-        }
-        // generic box-like kinds: button, imagebox, animbox, textbox, container,
-        // sprite, rect, anim, legacy bar/panel...
-        c.FillRoundRect(ex, ey, exw, exh, app.Scale(4), fill);
-        c.DrawRect(ex, ey, exw, exh, t.borderSecondary, 1);
-        if (kind == "imagebox" || kind == "sprite") {
-            // picture placeholder: crossed diagonals
-            c.DrawText(ex + app.Scale(4), ey + app.Scale(3),
-                "IMG " + e.ImageId(), t.textInverse, t.fontSizeTiny);
-        } else if (kind == "animbox" || kind == "anim") {
-            c.DrawText(ex + app.Scale(4), ey + app.Scale(3), "ANIM", t.textInverse, t.fontSizeTiny);
-        } else {
-            c.DrawText(ex + app.Scale(4), ey + app.Scale(3), cap, t.textInverse, t.fontSizeTiny);
-        }
-    }
 
     void RenderCanvas(App app, Canvas c, Theme t, int x, int y, int w, int h) {
-        c.FillRoundRect(x, y, w, h, app.Scale(8), t.bgTertiary);
-        c.DrawRect(x, y, w, h, t.borderPrimary, 1);
+        Panel.OutlinedSurface(app, x, y, w, h, t.borderRadiusLarge, t.bgTertiary);
 
         int dw = this.doc.DesignWidth();
         int dh = this.doc.DesignHeight();
@@ -1208,8 +967,8 @@ class SceneDesigner {
         c.FillRect(ox, oy, cw, ch, SceneDesigner.PackColor(bgR, bgG, bgB, 255));
         c.DrawRect(ox, oy, cw, ch, t.borderSecondary, 1);
         if (this.doc.Background().Length > 0) {
-            c.DrawText(ox + app.Scale(6), oy + app.Scale(6),
-                "bg: " + this.doc.Background(), t.textTertiary, t.fontSizeTiny);
+            Label.SmallStrong(app, ox + app.Scale(6), oy + app.Scale(6),
+                "bg: " + this.doc.Background());
         }
 
         // Grid overlay: one line per grid cell (the snapping unit). When the
@@ -1232,7 +991,7 @@ class SceneDesigner {
             }
         }
 
-        int ek = app.window.EventKind();
+        int ek = app.EventKind();
         if (app.PointerCaptured()) { ek = 0; }
 
         // Draw elements back-to-front (lower z first) and hit-test front-to-back.
@@ -1245,7 +1004,7 @@ class SceneDesigner {
             int ey = oy + this.DesignTop(e) * psMilli / 1000;
             int exw = e.TotalW() * psMilli / 1000;
             int exh = e.TotalH() * psMilli / 1000;
-            this.DrawElement(app, c, t, e, ex, ey, exw, exh, psMilli);
+            SceneView.DrawElement(app, c, t, e, ex, ey, exw, exh, psMilli);
             // Design-time affordance: a two-tone outline (dark inner + light
             // outer) around every element so components stay visible against
             // any canvas background.
@@ -1697,7 +1456,7 @@ class SceneDesigner {
     // inspector input has focus so typing there is unaffected.
     void HandleKeys(App app) {
         if (this.AnyInputFocused(app)) { return; }
-        int ek = app.window.EventKind();
+        int ek = app.EventKind();
         if (app.PointerCaptured()) { ek = 0; }
         // Ctrl+letter shortcuts arrive as text input control codes:
         // ^Z=26 undo, ^Y=25 redo, ^C=3 copy, ^V=22 paste, ^D=4 duplicate.
@@ -1752,47 +1511,46 @@ class SceneDesigner {
     // --- inspector -----------------------------------------------------------
 
     int Stepper(App app, Canvas c, Theme t, int x, int y, int w, string label, int cur, int step) {
-        c.DrawText(x, y + app.Scale(6), label, t.textSecondary, t.fontSizeSmall);
+        Label.Small(app, x, y + app.Scale(6), label);
         int bw = app.Scale(26);
         int valW = app.Scale(58);
         int rx = x + w - bw * 2 - valW - app.Scale(8);
-        int minusId = Button.Create("-").Render(app, rx, y, bw);
+        int minusId = new Button { Text = "-" }.Render(app, rx, y, bw);
         int vX = rx + bw + app.Scale(4);
-        c.FillRoundRect(vX, y, valW, app.Scale(28), app.Scale(4), t.bgPrimary);
-        c.DrawRect(vX, y, valW, app.Scale(28), t.borderPrimary, 1);
+        Panel.OutlinedSurface(app, vX, y, valW, app.Scale(28),
+            t.borderRadiusSmall, t.bgPrimary);
         int res = cur;
-        c.DrawText(vX + app.Scale(6), y + app.Scale(6), SceneDoc.IntStr(cur), t.textPrimary, t.fontSizeSmall);
-        int plusId = Button.Create("+").Render(app, vX + valW + app.Scale(4), y, bw);
-        if (Button.WasClicked(app, minusId)) { res = cur - step; app.RequestRedraw(); }
-        if (Button.WasClicked(app, plusId)) { res = cur + step; app.RequestRedraw(); }
+        Label.SmallStrong(app, vX + app.Scale(6), y + app.Scale(6), SceneDoc.IntStr(cur));
+        int plusId = new Button { Text = "+" }.Render(app, vX + valW + app.Scale(4), y, bw);
+        if (Ui.Clicked(app, minusId)) { res = cur - step; app.RequestRedraw(); }
+        if (Ui.Clicked(app, plusId)) { res = cur + step; app.RequestRedraw(); }
         return res;
     }
 
     // Two side-by-side steppers on one row (label pairs like rows/cols).
     int StepperHalf(App app, Canvas c, Theme t, int x, int y, int w, string label, int cur, int step) {
-        c.DrawText(x, y + app.Scale(6), label, t.textSecondary, t.fontSizeSmall);
+        Label.Small(app, x, y + app.Scale(6), label);
         int labW = app.Scale(30);
         int bw = app.Scale(24);
         int vX = x + labW + bw + app.Scale(3);
         int valW = w - labW - bw * 2 - app.Scale(6);
         if (valW < app.Scale(24)) { valW = app.Scale(24); }
-        int minusId = Button.Create("-").SetSize(1).Render(app, x + labW, y, bw);
-        c.FillRoundRect(vX, y, valW, t.heightSmall, app.Scale(4), t.bgPrimary);
-        c.DrawRect(vX, y, valW, t.heightSmall, t.borderPrimary, 1);
+        int minusId = new Button { Text = "-", Class = "small" }.Render(app, x + labW, y, bw);
+        Panel.OutlinedSurface(app, vX, y, valW, t.heightSmall,
+            t.borderRadiusSmall, t.bgPrimary);
         int res = cur;
         string vs = SceneDoc.IntStr(cur);
         c.DrawText(vX + (valW - Canvas.MeasureText(vs, t.fontSizeSmall)) / 2,
             y + (t.heightSmall - Canvas.FontHeight(t.fontSizeSmall)) / 2, vs,
             t.textPrimary, t.fontSizeSmall);
-        int plusId = Button.Create("+").SetSize(1).Render(app, vX + valW + app.Scale(3), y, bw);
-        if (Button.WasClicked(app, minusId)) { res = cur - step; app.RequestRedraw(); }
-        if (Button.WasClicked(app, plusId)) { res = cur + step; app.RequestRedraw(); }
+        int plusId = new Button { Text = "+", Class = "small" }.Render(app, vX + valW + app.Scale(3), y, bw);
+        if (Ui.Clicked(app, minusId)) { res = cur - step; app.RequestRedraw(); }
+        if (Ui.Clicked(app, plusId)) { res = cur + step; app.RequestRedraw(); }
         return res;
     }
 
     void RenderInspector(App app, Canvas c, Theme t, int x, int y, int w, int h) {
-        c.FillRoundRect(x, y, w, h, app.Scale(8), t.bgSecondary);
-        c.DrawRect(x, y, w, h, t.borderPrimary, 1);
+        Panel.OutlinedSurface(app, x, y, w, h, t.borderRadiusLarge, t.bgSecondary);
         int ix = x + app.Scale(12);
         int iw = w - app.Scale(24);
         int iy = y + app.Scale(12);
@@ -1808,7 +1566,7 @@ class SceneDesigner {
         iy = iy + rowH;
 
         // Scale mode selector.
-        c.DrawText(ix, iy + app.Scale(6), SceneDesigner.T("scale", "缩放"), t.textSecondary, t.fontSizeSmall);
+        Label.Small(app, ix, iy + app.Scale(6), SceneDesigner.T("scale", "缩放"));
         int mbw = (iw - app.Scale(52) - app.Scale(6)) / 4;
         int mx = ix + app.Scale(52);
         List<string> modes = new List<string>();
@@ -1818,20 +1576,20 @@ class SceneDesigner {
         modes.Add("1:1");
         int m = 0;
         while (m < modes.Count) {
-            int mid = Button.Typed(modes[m], this.ModeType(m)).SetSize(1).Render(app, mx + m * (mbw + app.Scale(2)), iy, mbw);
-            if (Button.WasClicked(app, mid)) { this.doc.SetMode(m); app.RequestRedraw(); }
+            int mid = new Button { Text = modes[m], Class = "small " + Style.TypeClass(this.ModeType(m)) }.Render(app, mx + m * (mbw + app.Scale(2)), iy, mbw);
+            if (Ui.Clicked(app, mid)) { this.doc.SetMode(m); app.RequestRedraw(); }
             m = m + 1;
         }
         iy = iy + rowH;
 
         // Window position: center on show (default) vs manual X/Y.
-        c.DrawText(ix, iy + app.Scale(6), SceneDesigner.T("pos", "位置"), t.textSecondary, t.fontSizeSmall);
+        Label.Small(app, ix, iy + app.Scale(6), SceneDesigner.T("pos", "位置"));
         int pbw = (iw - app.Scale(52) - app.Scale(2)) / 2;
         int ppx = ix + app.Scale(52);
-        int cId = Button.Typed(SceneDesigner.T("Center", "居中"), this.CenterType(1)).SetSize(1).Render(app, ppx, iy, pbw);
-        if (Button.WasClicked(app, cId)) { this.doc.SetWinCenter(1); app.RequestRedraw(); }
-        int mId = Button.Typed(SceneDesigner.T("Manual", "手动"), this.CenterType(0)).SetSize(1).Render(app, ppx + pbw + app.Scale(2), iy, pbw);
-        if (Button.WasClicked(app, mId)) { this.doc.SetWinCenter(0); app.RequestRedraw(); }
+        int cId = new Button { Text = SceneDesigner.T("Center", "居中"), Class = "small " + Style.TypeClass(this.CenterType(1)) }.Render(app, ppx, iy, pbw);
+        if (Ui.Clicked(app, cId)) { this.doc.SetWinCenter(1); app.RequestRedraw(); }
+        int mId = new Button { Text = SceneDesigner.T("Manual", "手动"), Class = "small " + Style.TypeClass(this.CenterType(0)) }.Render(app, ppx + pbw + app.Scale(2), iy, pbw);
+        if (Ui.Clicked(app, mId)) { this.doc.SetWinCenter(0); app.RequestRedraw(); }
         iy = iy + rowH;
         if (this.doc.WinCenter() == 0) {
             int nx = this.StepperHalf(app, c, t, ix, iy, halfW, "X", this.doc.WinPosX(), 20);
@@ -1840,11 +1598,11 @@ class SceneDesigner {
             iy = iy + rowH;
         }
 
-        c.DrawText(ix, iy + app.Scale(6), SceneDesigner.T("bg", "背景"), t.textSecondary, t.fontSizeSmall);
+        Label.Small(app, ix, iy + app.Scale(6), SceneDesigner.T("bg", "背景"));
         this.inpIdBg = this.bgIn.Render(app, ix + app.Scale(52), iy,
             iw - app.Scale(52) - app.Scale(32), app.Scale(28));
-        int bgBr = Button.Create("…").SetSize(1).Render(app, ix + iw - app.Scale(28), iy, app.Scale(28));
-        if (Button.WasClicked(app, bgBr)) { this.resPick = 2; app.RequestRedraw(); }
+        int bgBr = new Button { Text = "…", Class = "small" }.Render(app, ix + iw - app.Scale(28), iy, app.Scale(28));
+        if (Ui.Clicked(app, bgBr)) { this.resPick = 2; app.RequestRedraw(); }
         this.doc.SetBackground(this.bgIn.GetText());
         iy = iy + rowH + app.Scale(6);
 
@@ -1861,25 +1619,25 @@ class SceneDesigner {
             t.textTertiary, t.fontSizeSmall);
         iy = iy + app.Scale(20);
 
-        c.DrawText(ix, iy + app.Scale(6), SceneDesigner.T("name", "名称"), t.textSecondary, t.fontSizeSmall);
+        Label.Small(app, ix, iy + app.Scale(6), SceneDesigner.T("name", "名称"));
         this.inpIdName = this.nameIn.Render(app, ix + app.Scale(52), iy, iw - app.Scale(52), app.Scale(28));
         this.sel.ename = this.nameIn.GetText();
         iy = iy + rowH;
 
-        c.DrawText(ix, iy + app.Scale(6), SceneDesigner.T("image", "图片"), t.textSecondary, t.fontSizeSmall);
+        Label.Small(app, ix, iy + app.Scale(6), SceneDesigner.T("image", "图片"));
         this.inpIdImg = this.imgIn.Render(app, ix + app.Scale(52), iy,
             iw - app.Scale(52) - app.Scale(32), app.Scale(28));
-        int imBr = Button.Create("…").SetSize(1).Render(app, ix + iw - app.Scale(28), iy, app.Scale(28));
-        if (Button.WasClicked(app, imBr)) { this.resPick = 1; app.RequestRedraw(); }
+        int imBr = new Button { Text = "…", Class = "small" }.Render(app, ix + iw - app.Scale(28), iy, app.Scale(28));
+        if (Ui.Clicked(app, imBr)) { this.resPick = 1; app.RequestRedraw(); }
         this.sel.image = this.imgIn.GetText();
         iy = iy + rowH;
 
-        c.DrawText(ix, iy + app.Scale(6), SceneDesigner.T("text", "文本"), t.textSecondary, t.fontSizeSmall);
+        Label.Small(app, ix, iy + app.Scale(6), SceneDesigner.T("text", "文本"));
         this.inpIdText = this.textIn.Render(app, ix + app.Scale(52), iy, iw - app.Scale(52), app.Scale(28));
         this.sel.text = this.textIn.GetText();
         iy = iy + rowH;
 
-        c.DrawText(ix, iy + app.Scale(6), SceneDesigner.T("items", "选项"), t.textSecondary, t.fontSizeSmall);
+        Label.Small(app, ix, iy + app.Scale(6), SceneDesigner.T("items", "选项"));
         this.inpIdItems = this.itemsIn.Render(app, ix + app.Scale(52), iy, iw - app.Scale(52), app.Scale(28));
         this.sel.items = this.itemsIn.GetText();
         iy = iy + rowH;
@@ -1920,7 +1678,7 @@ class SceneDesigner {
         iy = iy + rowH;
 
         // Anchor nine-grid.
-        c.DrawText(ix, iy + app.Scale(6), SceneDesigner.T("anchor", "锚点"), t.textSecondary, t.fontSizeSmall);
+        Label.Small(app, ix, iy + app.Scale(6), SceneDesigner.T("anchor", "锚点"));
         int abw = t.heightSmall;
         int ax0 = ix + app.Scale(52);
         int r = 0;
@@ -1931,10 +1689,10 @@ class SceneDesigner {
                 int avy = r * 500;
                 string glyph = "·";
                 if (this.sel.AnchorX() == av && this.sel.AnchorY() == avy) { glyph = "●"; }
-                int aid = Button.Create(glyph).SetSize(1).Render(app,
+                int aid = new Button { Text = glyph, Class = "small" }.Render(app,
                     ax0 + col * (abw + app.Scale(3)),
                     iy + r * (abw + app.Scale(3)), abw);
-                if (Button.WasClicked(app, aid)) {
+                if (Ui.Clicked(app, aid)) {
                     // Re-anchor in place: recompute the x/y offsets so the
                     // element stays where it is on the canvas.
                     int kL = this.DesignLeft(this.sel);
@@ -1950,18 +1708,18 @@ class SceneDesigner {
         iy = iy + 3 * (abw + app.Scale(3)) + app.Scale(8);
 
         int btnRowH = t.heightSmall + app.Scale(6);
-        int visId = Button.Create(this.VisLabel()).SetSize(1).Render(app, ix, iy, (iw - app.Scale(6)) / 2);
-        if (Button.WasClicked(app, visId)) { this.sel.SetVisible(!this.sel.Visible()); app.RequestRedraw(); }
-        int dupId = Button.Create(SceneDesigner.T("Duplicate", "复制")).SetSize(1).Render(app, ix + (iw + app.Scale(6)) / 2, iy, (iw - app.Scale(6)) / 2);
-        if (Button.WasClicked(app, dupId)) { this.DuplicateSel(); app.RequestRedraw(); }
+        int visId = new Button { Text = this.VisLabel(), Class = "small" }.Render(app, ix, iy, (iw - app.Scale(6)) / 2);
+        if (Ui.Clicked(app, visId)) { this.sel.SetVisible(!this.sel.Visible()); app.RequestRedraw(); }
+        int dupId = new Button { Text = SceneDesigner.T("Duplicate", "复制"), Class = "small" }.Render(app, ix + (iw + app.Scale(6)) / 2, iy, (iw - app.Scale(6)) / 2);
+        if (Ui.Clicked(app, dupId)) { this.DuplicateSel(); app.RequestRedraw(); }
         iy = iy + btnRowH;
-        int upId = Button.Create(SceneDesigner.T("forward", "上移一层")).SetSize(1).Render(app, ix, iy, (iw - app.Scale(6)) / 2);
-        if (Button.WasClicked(app, upId)) { this.RaiseSel(1); app.RequestRedraw(); }
-        int dnId = Button.Create(SceneDesigner.T("back", "下移一层")).SetSize(1).Render(app, ix + (iw + app.Scale(6)) / 2, iy, (iw - app.Scale(6)) / 2);
-        if (Button.WasClicked(app, dnId)) { this.RaiseSel(0 - 1); app.RequestRedraw(); }
+        int upId = new Button { Text = SceneDesigner.T("forward", "上移一层"), Class = "small" }.Render(app, ix, iy, (iw - app.Scale(6)) / 2);
+        if (Ui.Clicked(app, upId)) { this.RaiseSel(1); app.RequestRedraw(); }
+        int dnId = new Button { Text = SceneDesigner.T("back", "下移一层"), Class = "small" }.Render(app, ix + (iw + app.Scale(6)) / 2, iy, (iw - app.Scale(6)) / 2);
+        if (Ui.Clicked(app, dnId)) { this.RaiseSel(0 - 1); app.RequestRedraw(); }
         iy = iy + btnRowH;
-        int delId = Button.Typed(SceneDesigner.T("Delete", "删除"), 5).SetSize(1).Render(app, ix, iy, iw);
-        if (Button.WasClicked(app, delId)) { this.DeleteSel(); app.RequestRedraw(); }
+        int delId = new Button { Text = SceneDesigner.T("Delete", "删除"), Class = "error small" }.Render(app, ix, iy, iw);
+        if (Ui.Clicked(app, delId)) { this.DeleteSel(); app.RequestRedraw(); }
     }
 
     string VisLabel() {

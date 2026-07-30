@@ -108,7 +108,20 @@ partial class CodeEditor {
             }
             i = i + 1;
         }
-        if (acAllItems.Count > 0) {
+        if (acItems.Count == 0 && acAllItems.Count > 0) {
+            // The kind filter the user left on has no candidate for the word
+            // being typed now. Keeping it showed an empty popup (and Enter/Tab
+            // accepted a row that was not there), so the filter is dropped.
+            acFilter = "";
+            i = 0;
+            while (i < acAllItems.Count) {
+                acItems.Add(acAllItems[i]);
+                if (i < acAllKinds.Count) { acKinds.Add(acAllKinds[i]); }
+                else { acKinds.Add("W"); }
+                i = i + 1;
+            }
+        }
+        if (acItems.Count > 0) {
             acActive = true;
             if (acSel >= acItems.Count) { acSel = acItems.Count - 1; }
             if (acSel < 0) { acSel = 0; }
@@ -1322,10 +1335,8 @@ partial class CodeEditor {
     bool IsProjectType(string name) {
         EnsureProjectScan();
         if (CodeEditor.HasProjType(projTypes, name)) { return true; }
-        List<string> tn = new List<string>();
-        List<string> tm = new List<string>();
-        CodeEditor.ScanTypesInto(GetText(), tn, tm);
-        return CodeEditor.Has(tn, name);
+        EnsureBufTypes();
+        return CodeEditor.Has(muTypeNames, name);
     }
 
     /// Looks up the declared members of user type `typeName` (project files, then
@@ -1340,9 +1351,9 @@ partial class CodeEditor {
             }
             i = i + 1;
         }
-        List<string> tn = new List<string>();
-        List<string> tm = new List<string>();
-        CodeEditor.ScanTypesInto(GetText(), tn, tm);
+        EnsureBufTypes();
+        List<string> tn = muTypeNames;
+        List<string> tm = muTypeMembers;
         int j = 0;
         while (j < tn.Count) {
             if (tn[j] == typeName) {
@@ -1450,9 +1461,9 @@ partial class CodeEditor {
             }
             i = i + 1;
         }
-        List<string> tn = new List<string>();
-        List<string> tm = new List<string>();
-        CodeEditor.ScanTypesInto(GetText(), tn, tm);
+        EnsureBufTypes();
+        List<string> tn = muTypeNames;
+        List<string> tm = muTypeMembers;
         int a = 0;
         while (a < tn.Count) {
             if (!CodeEditor.Has(cand, tn[a])) { cand.Add(tn[a]); kinds.Add("T"); }
@@ -1485,17 +1496,39 @@ partial class CodeEditor {
 
     /// Scans the buffer for `using X;` type usages that require an import which is
     /// missing, recording a diagnostic + quick-fix per offending line.
+    /// Type names (and their members) declared in the current buffer, parsed at
+    /// most once per buffer change. GetText() materialises the whole document
+    /// and ScanTypesInto reparses it, and completion/diagnostics ask for this
+    /// on every keystroke and caret move, so the result is memoised against
+    /// TextStamp().
+    void EnsureBufTypes() {
+        int stamp = TextStamp();
+        if (muTypeNames != null && stamp == muTypesStamp) { return; }
+        muTypeNames = new List<string>();
+        muTypeMembers = new List<string>();
+        CodeEditor.ScanTypesInto(GetText(), muTypeNames, muTypeMembers);
+        muTypesStamp = stamp;
+    }
+
+    /// True for the bytes that make up an identifier (ASCII letters, digits,
+    /// underscore). Byte test instead of InSet(str, Substring(p, 1)), which
+    /// allocated a string and rescanned a 63-character set for every character
+    /// of the document.
+    static bool IdentByte(int b) {
+        if (b >= 97 && b <= 122) { return true; }
+        if (b >= 65 && b <= 90) { return true; }
+        if (b >= 48 && b <= 57) { return true; }
+        return b == 95;
+    }
+
     void AnalyzeMissingUsings() {
         EnsureProjectScan();
         fixes = new List<QuickFix>();
         List<string> usings = new List<string>();
         ParseUsingsInto(usings);
         string fileNs = FileNamespace();
-        List<string> tn = new List<string>();
-        List<string> tm = new List<string>();
-        CodeEditor.ScanTypesInto(GetText(), tn, tm);
-        string idset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
-        string upper = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        EnsureBufTypes();
+        List<string> tn = muTypeNames;
         int li = 0;
         while (li < lines.Count) {
             string tr = CodeEditor.TrimStr(lines[li]);
@@ -1507,17 +1540,15 @@ partial class CodeEditor {
             int p = 0;
             int n = ln.Length;
             while (p < n) {
-                string ch = ln.Substring(p, 1);
-                if (CodeEditor.InSet(idset, ch)) {
+                if (CodeEditor.IdentByte(ln[p])) {
                     int s2 = p;
-                    string w = "";
-                    while (p < n && CodeEditor.InSet(idset, ln.Substring(p, 1))) {
-                        w = w + ln.Substring(p, 1); p = p + 1;
-                    }
-                    bool dotAfter = (p < n && ln.Substring(p, 1) == ".");
-                    bool dotBefore = (s2 > 0 && ln.Substring(s2 - 1, 1) == ".");
-                    bool cap = (w.Length > 0 && CodeEditor.InSet(upper, w.Substring(0, 1)));
+                    while (p < n && CodeEditor.IdentByte(ln[p])) { p = p + 1; }
+                    bool dotAfter = (p < n && ln[p] == 46);
+                    bool dotBefore = (s2 > 0 && ln[s2 - 1] == 46);
+                    int first = ln[s2];
+                    bool cap = (first >= 65 && first <= 90);
                     if (dotAfter && !dotBefore && cap) {
+                        string w = ln.Substring(s2, p - s2);
                         string ns = CodeEditor.NsForStdlibType(w);
                         if (ns.Length > 0) {
                             bool imported = CodeEditor.Has(usings, ns);

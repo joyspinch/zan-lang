@@ -900,6 +900,17 @@ EXPORT i32 zan_gui_client_height(iptr hwnd_val) {
     return (i64)[mw->view bounds].size.height;
 }
 
+/* ---- client-priority hit guards ----------------------------------------
+ * Accepted for ABI parity with the Win32/SDL/X11 backends. AppKit owns the
+ * resize border of a borderless resizable window and never routes it through
+ * app code, so a control drawn flush with the edge keeps its presses anyway
+ * and there is nothing to yield. */
+EXPORT i32 zan_gui_clear_hit_guards(iptr hwnd) { (void)hwnd; return 0; }
+EXPORT i32 zan_gui_add_hit_guard(iptr hwnd, i32 x, i32 y, i32 w, i32 h) {
+    (void)hwnd; (void)x; (void)y; (void)w; (void)h;
+    return 0;
+}
+
 /* ---- client-side title-bar metrics (borderless window) ---- */
 
 EXPORT i32 zan_gui_titlebar_height(void) { return (i32)zan_titlebar_h(); }

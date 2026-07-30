@@ -97,7 +97,9 @@ class Control {
     string bindSnapshot;
     /// Optional style class (JSON `class`), used by a StyleSheet to cascade
     /// declarations onto this control by `.class` selector. Empty = none.
-    string styleClass;
+    /// Space separated CSS classes: `btn.Class = "primary small";` (assign,
+    /// no setter) -- every visual variant a widget has is one of these.
+    string Class;
     StyleBox computedStyle;
     int computedStyleGen;
     string computedStyleType;
@@ -128,6 +130,8 @@ class Control {
         prefH = 0;
         mx = 0;
         my = 0;
+        paneMin = 0;
+        paneMax = 0;
         padL = 0;
         padT = 0;
         padR = 0;
@@ -157,7 +161,7 @@ class Control {
         bindPath = "";
         bindProp = "";
         bindSnapshot = "";
-        styleClass = "";
+        Class = "";
         computedStyle = null;
         computedStyleGen = 0 - 1;
         computedStyleType = "";
@@ -186,7 +190,6 @@ class Control {
     Control TextColor(int c) { styleColor = c; computedStyle = null; return this; }
     Control FontPx(int px) { styleFontPx = px; computedStyle = null; return this; }
     Control Transition(int ms) { styleTransitionMs = ms; computedStyle = null; return this; }
-    Control Style(string cls) { styleClass = cls; computedStyle = null; return this; }
 
     // --- Chainable event subscription (a C#-close alternative to BindEvent;
     // `btn.OnClick(Handler)` reads like `btn.Click += Handler`). Each appends
@@ -257,8 +260,16 @@ class Control {
         return fallback;
     }
 
+    /// CSS type selector this control answers to. Defaults to its Kind, but a
+    /// control whose Kind names a surface while the instance is only an
+    /// invisible layout node overrides it, so stylesheet rules for the surface
+    /// (padding, background, blur) do not apply to the layout node.
+    virtual string StyleType() {
+        return this.Kind().ToLower();
+    }
+
     StyleBox ResolveStyle(App app, int state) {
-        return this.ResolveStyleAs(app, this.Kind().ToLower(), styleClass, state);
+        return this.ResolveStyleAs(app, this.StyleType(), Class, state);
     }
 
     StyleBox ResolveStyleAs(App app, string type, string cls, int state) {
@@ -267,7 +278,7 @@ class Control {
         computedStyle = box;
         computedStyleGen = app.bgThemeGen;
         computedStyleType = type;
-        computedStyleClass = styleClass;
+        computedStyleClass = Class;
         computedStyleId = name;
         return box;
     }
@@ -279,7 +290,7 @@ class Control {
         computedStyle = box;
         computedStyleGen = app.bgThemeGen;
         computedStyleType = type;
-        computedStyleClass = styleClass;
+        computedStyleClass = Class;
         computedStyleId = name;
         return box;
     }
@@ -294,14 +305,14 @@ class Control {
         computedStyle = box;
         computedStyleGen = app.bgThemeGen;
         computedStyleType = type;
-        computedStyleClass = styleClass;
+        computedStyleClass = Class;
         computedStyleId = name;
         return box;
     }
 
     StyleBox ResolvePart(App app, string part, string fallbackType, int state) {
-        return this.ResolvePartAs(app, this.Kind().ToLower(), part,
-                                  fallbackType, styleClass, state);
+        return this.ResolvePartAs(app, this.StyleType(), part,
+                                  fallbackType, Class, state);
     }
 
     StyleBox ResolvePartAs(App app, string type, string part,
@@ -327,9 +338,9 @@ class Control {
     }
 
     bool ComputedStyleCurrent(App app) {
-        string type = this.Kind().ToLower();
+        string type = this.StyleType();
         return computedStyle != null && computedStyleGen == app.bgThemeGen
-            && computedStyleType == type && computedStyleClass == styleClass
+            && computedStyleType == type && computedStyleClass == Class
             && computedStyleId == name;
     }
 
@@ -348,7 +359,10 @@ class Control {
         return padL;
     }
 
-    int StylePadT() {
+    /// Top inset of the content box. Virtual because a container that draws
+    /// its own chrome (a Card's title row) must keep room for it whatever the
+    /// stylesheet says about padding.
+    virtual int StylePadT() {
         if (computedStyle != null) { return computedStyle.PadTOr(padT); }
         return padT;
     }
@@ -362,6 +376,37 @@ class Control {
         if (computedStyle != null) { return computedStyle.PadBOr(padB); }
         return padB;
     }
+
+    /// CSS `display` of this node: 0 block (children dock), 1 flex (children are
+    /// laid out along flex-direction), 2 none.
+    int StyleDisplay() {
+        if (computedStyle == null) { return 0; }
+        return computedStyle.display;
+    }
+
+    /// Declared main/cross size inside a containing block of `avail` px, with
+    /// percentages resolved and min/max applied; falls back to the measured
+    /// preference (prefW/prefH) when the style declares no size.
+    int StyleWidthIn(int avail) {
+        if (computedStyle == null) { return prefW; }
+        return computedStyle.ClampWIn(avail, computedStyle.WidthIn(avail, prefW));
+    }
+
+    int StyleHeightIn(int avail) {
+        if (computedStyle == null) { return prefH; }
+        return computedStyle.ClampHIn(avail, computedStyle.HeightIn(avail, prefH));
+    }
+
+    /// CSS `flex-grow` of this node (0 = keep its own size).
+    int StyleGrow() {
+        if (computedStyle == null) { return 0; }
+        return computedStyle.grow;
+    }
+
+    int StyleMarL() { if (computedStyle == null) { return 0; } return computedStyle.marL; }
+    int StyleMarT() { if (computedStyle == null) { return 0; } return computedStyle.marT; }
+    int StyleMarR() { if (computedStyle == null) { return 0; } return computedStyle.marR; }
+    int StyleMarB() { if (computedStyle == null) { return 0; } return computedStyle.marB; }
 
     int StyleGap() {
         if (computedStyle != null) { return computedStyle.GapOr(gap); }
@@ -456,6 +501,15 @@ class Control {
         c.parent = this;
         children.Add(c);
         return this;
+    }
+
+    /// Main-axis size to dock this child at, given the space its parent still
+    /// has free: the stylesheet decides, so `width: 34%; min-width: 260px` on a
+    /// docked pane behaves exactly as it would in a browser; a child without a
+    /// styled size keeps its measured one.
+    int DockSize(int avail, bool horizontal) {
+        if (horizontal) { return this.StyleWidthIn(avail); }
+        return this.StyleHeightIn(avail);
     }
 
     /// Marks this node to fill the remaining main-axis space of its flow parent.
@@ -617,32 +671,36 @@ class Control {
         int ch = ph - innerPadT - innerPadB;
         if (cw < 0) { cw = 0; }
         if (ch < 0) { ch = 0; }
+        if (this.StyleDisplay() == 1) {
+            this.ArrangeFlex(cx, cy, cw, ch, innerGap);
+            return;
+        }
         int i = 0;
         while (i < children.Count) {
             Control c = children[i];
             if (c.StyleVisible()) {
                 if (c.dock == 1) {
-                    int hh = Control.FitSize(c.StyleHeight(), ch);
+                    int hh = Control.FitSize(c.DockSize(ch, false), ch);
                     c.Arrange(cx, cy, cw, hh);
                     int restH = ch - hh;
                     int gh = Control.FitGap(innerGap, restH);
                     cy = cy + hh + gh;
                     ch = restH - gh;
                 } else if (c.dock == 2) {
-                    int hh = Control.FitSize(c.StyleHeight(), ch);
+                    int hh = Control.FitSize(c.DockSize(ch, false), ch);
                     c.Arrange(cx, cy + ch - hh, cw, hh);
                     int restH = ch - hh;
                     int gh = Control.FitGap(innerGap, restH);
                     ch = restH - gh;
                 } else if (c.dock == 3) {
-                    int ww = Control.FitSize(c.StyleWidth(), cw);
+                    int ww = Control.FitSize(c.DockSize(cw, true), cw);
                     c.Arrange(cx, cy, ww, ch);
                     int restW = cw - ww;
                     int gw = Control.FitGap(innerGap, restW);
                     cx = cx + ww + gw;
                     cw = restW - gw;
                 } else if (c.dock == 4) {
-                    int ww = Control.FitSize(c.StyleWidth(), cw);
+                    int ww = Control.FitSize(c.DockSize(cw, true), cw);
                     c.Arrange(cx + cw - ww, cy, ww, ch);
                     int restW = cw - ww;
                     int gw = Control.FitGap(innerGap, restW);
@@ -659,6 +717,163 @@ class Control {
             }
             i = i + 1;
         }
+    }
+
+    /// Lays the children out as a CSS flex line inside this node's content box:
+    /// each child takes its declared main size (px or % of the box) or, when it
+    /// declares none, its measured preference; `flex-grow` shares whatever is
+    /// left; `justify-content` places the remainder and `align-items` sizes the
+    /// cross axis (stretch by default). Margins and `gap` are honoured, and a
+    /// line that overflows is shrunk proportionally instead of spilling out.
+    void ArrangeFlex(int cx, int cy, int cw, int ch, int gapPx) {
+        bool row = true;
+        if (computedStyle != null && computedStyle.flexDir == 1) { row = false; }
+        int mainBox = cw;
+        int crossBox = ch;
+        if (!row) { mainBox = ch; crossBox = cw; }
+
+        List<Control> items = new List<Control>();
+        int i = 0;
+        while (i < children.Count) {
+            if (children[i].StyleVisible()) { items.Add(children[i]); }
+            i = i + 1;
+        }
+        int n = items.Count;
+        if (n == 0) { return; }
+
+        List<int> sizes = new List<int>();
+        int used = 0;
+        int totalGrow = 0;
+        i = 0;
+        while (i < n) {
+            Control c = items[i];
+            int sz;
+            if (row) { sz = c.StyleWidthIn(cw); } else { sz = c.StyleHeightIn(ch); }
+            if (sz < 0) { sz = 0; }
+            sizes.Add(sz);
+            used = used + sz + c.MarMain(row);
+            totalGrow = totalGrow + c.StyleGrow();
+            i = i + 1;
+        }
+        int gaps = 0;
+        if (n > 1) { gaps = (n - 1) * gapPx; }
+        int free = mainBox - used - gaps;
+
+        if (free > 0 && totalGrow > 0) {
+            // Two passes: share the free space by flex-grow, clamp the results
+            // to max-width/height, then hand what the clamped items gave back
+            // to the ones that can still take it.
+            int pass = 0;
+            while (pass < 2 && free > 0) {
+                int share = free;
+                int growable = 0;
+                i = 0;
+                while (i < n) {
+                    int g = items[i].StyleGrow();
+                    if (g > 0) { growable = growable + g; }
+                    i = i + 1;
+                }
+                if (growable == 0) { pass = 2; }
+                else {
+                    int taken = 0;
+                    i = 0;
+                    while (i < n) {
+                        int g = items[i].StyleGrow();
+                        if (g > 0) {
+                            int want = sizes[i] + share * g / growable;
+                            int got = want;
+                            if (row) { got = items[i].StyleClampW(cw, want); }
+                            else { got = items[i].StyleClampH(ch, want); }
+                            taken = taken + got - sizes[i];
+                            sizes[i] = got;
+                        }
+                        i = i + 1;
+                    }
+                    free = free - taken;
+                    if (taken == 0) { pass = 2; }
+                    pass = pass + 1;
+                }
+            }
+            if (free < 0) { free = 0; }
+        } else if (free < 0 && used > 0) {
+            // Overflowing line: shrink the items proportionally (flex-shrink: 1).
+            int room = mainBox - gaps;
+            if (room < 0) { room = 0; }
+            int placedSize = 0;
+            i = 0;
+            while (i < n) {
+                int sz = sizes[i] * room / used;
+                if (i == n - 1) { sz = room - placedSize; }
+                if (sz < 0) { sz = 0; }
+                placedSize = placedSize + sz;
+                sizes[i] = sz;
+                i = i + 1;
+            }
+            free = 0;
+        }
+
+        int offset = 0;
+        int between = gapPx;
+        int justify = 0;
+        if (computedStyle != null) { justify = computedStyle.justify; }
+        if (justify == 1) { offset = free / 2; }
+        else if (justify == 2) { offset = free; }
+        else if (justify == 3 && n > 1) { between = between + free / (n - 1); }
+        else if (justify == 4) {
+            int slots = n + 1;
+            offset = free / slots;
+            between = between + offset;
+        }
+
+        int align = 0;
+        if (computedStyle != null) { align = computedStyle.alignItems; }
+        int pos = offset;
+        i = 0;
+        while (i < n) {
+            Control c = items[i];
+            int main = sizes[i];
+            int crossAvail = crossBox - c.MarCross(row);
+            if (crossAvail < 0) { crossAvail = 0; }
+            int cross;
+            if (row) { cross = c.StyleHeightIn(ch); } else { cross = c.StyleWidthIn(cw); }
+            if (align == 0 || cross <= 0) { cross = crossAvail; }
+            if (cross > crossAvail) { cross = crossAvail; }
+            int crossPos = 0;
+            if (align == 2) { crossPos = (crossAvail - cross) / 2; }
+            else if (align == 3) { crossPos = crossAvail - cross; }
+            if (row) {
+                c.Arrange(cx + pos + c.StyleMarL(),
+                          cy + crossPos + c.StyleMarT(), main, cross);
+            } else {
+                c.Arrange(cx + crossPos + c.StyleMarL(),
+                          cy + pos + c.StyleMarT(), cross, main);
+            }
+            pos = pos + main + c.MarMain(row) + between;
+            i = i + 1;
+        }
+    }
+
+    /// Applies this node's min/max-width (or -height) to `v`, resolving
+    /// percentage bounds against a containing block of `avail`.
+    int StyleClampW(int avail, int v) {
+        if (computedStyle == null) { return v; }
+        return computedStyle.ClampWIn(avail, v);
+    }
+
+    int StyleClampH(int avail, int v) {
+        if (computedStyle == null) { return v; }
+        return computedStyle.ClampHIn(avail, v);
+    }
+
+    /// Total margin along / across a flex line.
+    int MarMain(bool row) {
+        if (row) { return this.StyleMarL() + this.StyleMarR(); }
+        return this.StyleMarT() + this.StyleMarB();
+    }
+
+    int MarCross(bool row) {
+        if (row) { return this.StyleMarT() + this.StyleMarB(); }
+        return this.StyleMarL() + this.StyleMarR();
     }
 
     /// Draws this node's own visuals. Base draws nothing; subclasses override.
@@ -749,6 +964,14 @@ class Control {
 
     /// Writes a property by key from text. Base ignores; widgets override.
     virtual void SetProp(string key, string val) {
+    }
+
+    /// Lays out and paints this subtree inside `area`: the single call a host
+    /// needs to hand a rectangle to a retained component (measure, dock, paint).
+    void RenderInside(App app, Rect area) {
+        this.MeasureTree(app);
+        this.Arrange(area.x, area.y, area.width, area.height);
+        this.RenderTree(app);
     }
 
     /// Renders the subtree: self, then children clipped to this node's box so a

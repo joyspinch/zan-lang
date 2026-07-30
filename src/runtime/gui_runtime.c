@@ -326,6 +326,82 @@ EXPORT void zan_gui_reset_clip(i32 surface_id) {
     clip_reset_full(s);
 }
 
+/* ---- opt-in raster statistics ------------------------------------------- *
+ * Counts calls and touched pixels per primitive so a frame's cost can be
+ * attributed to fills / blends / blurs / images / text instead of guessed at.
+ * zan_gui_perf_dump appends one line and resets. Zero cost when unused. */
+typedef struct { long long calls, px; } zan_stat_t;
+static zan_stat_t g_st_fill_op, g_st_fill_blend, g_st_grad, g_st_round,
+                  g_st_radial, g_st_blur, g_st_blur_hit, g_st_img,
+                  g_st_snap, g_st_restore, g_st_glyph;
+#define ZAN_STAT(s, n) do { (s).calls++; (s).px += (long long)(n); } while (0)
+
+EXPORT void zan_gui_stat_glyphs(i32 n) { ZAN_STAT(g_st_glyph, n); }
+
+/* The widest translucent fills of the frame, so a profile can name the layers
+ * that dominate blending instead of only totalling them. */
+#define ZAN_TOP_N 6
+static int g_top_a[ZAN_TOP_N], g_top_x[ZAN_TOP_N], g_top_y[ZAN_TOP_N],
+           g_top_w[ZAN_TOP_N], g_top_h[ZAN_TOP_N], g_top_c[ZAN_TOP_N];
+
+static void stat_top_blend(int area, int x, int y, int w, int h, u32 color) {
+    int slot = -1;
+    for (int i = 0; i < ZAN_TOP_N; i++) {
+        if (area > g_top_a[i]) { slot = i; break; }
+    }
+    if (slot < 0) return;
+    for (int i = ZAN_TOP_N - 1; i > slot; i--) {
+        g_top_a[i] = g_top_a[i - 1]; g_top_x[i] = g_top_x[i - 1];
+        g_top_y[i] = g_top_y[i - 1]; g_top_w[i] = g_top_w[i - 1];
+        g_top_h[i] = g_top_h[i - 1]; g_top_c[i] = g_top_c[i - 1];
+    }
+    g_top_a[slot] = area; g_top_x[slot] = x; g_top_y[slot] = y;
+    g_top_w[slot] = w; g_top_h[slot] = h; g_top_c[slot] = (int)color;
+}
+
+/* field: 0 area/1000, 1 x, 2 y, 3 w, 4 h; reading field 4 clears the entry. */
+EXPORT i32 zan_gui_stat_top(i32 rank, i32 field) {
+    if (rank < 0 || rank >= ZAN_TOP_N) return 0;
+    switch (field) {
+        case 0: return g_top_a[rank] / 1000;
+        case 1: return g_top_x[rank];
+        case 2: return g_top_y[rank];
+        case 3: return g_top_w[rank];
+        case 5: return (g_top_c[rank] >> 24) & 0xFF;
+        default: break;
+    }
+    i32 h = g_top_h[rank];
+    g_top_a[rank] = 0;
+    return h;
+}
+
+/* Reads one counter and clears it: idx selects the primitive (see the switch),
+ * kind 0 = call count, 1 = touched pixels / 1000. Cleared on read of kind 1 so
+ * the caller reads both then moves to the next primitive. Formatting lives in
+ * the Zan side (App's frame profiler). */
+EXPORT i32 zan_gui_stat_read(i32 idx, i32 kind) {
+    zan_stat_t *t = 0;
+    switch (idx) {
+        case 0: t = &g_st_fill_op; break;
+        case 1: t = &g_st_fill_blend; break;
+        case 2: t = &g_st_grad; break;
+        case 3: t = &g_st_round; break;
+        case 4: t = &g_st_radial; break;
+        case 5: t = &g_st_blur; break;
+        case 6: t = &g_st_blur_hit; break;
+        case 7: t = &g_st_img; break;
+        case 8: t = &g_st_snap; break;
+        case 9: t = &g_st_restore; break;
+        case 10: t = &g_st_glyph; break;
+        default: return 0;
+    }
+    if (kind == 0) { return (i32)t->calls; }
+    i32 kpx = (i32)(t->px / 1000);
+    t->calls = 0;
+    t->px = 0;
+    return kpx;
+}
+
 EXPORT void zan_gui_fill_rect(i32 surface_id, i32 x, i32 y, i32 w, i32 h, i32 color) {
     if (surface_id < 0 || surface_id >= g_surface_count) return;
     zan_surface_t *s = g_surfaces[surface_id];
@@ -336,12 +412,17 @@ EXPORT void zan_gui_fill_rect(i32 surface_id, i32 x, i32 y, i32 w, i32 h, i32 co
     int x1 = clamp_i((int)(x + w), s->clip_x0, s->clip_x1);
     int y1 = clamp_i((int)(y + h), s->clip_y0, s->clip_y1);
     u32 sa = (c >> 24) & 0xFF;
+    long long area = (long long)(x1 - x0) * (long long)(y1 - y0);
+    if (area < 0) area = 0;
     if (sa == 255) {
+        ZAN_STAT(g_st_fill_op, area);
         for (int py = y0; py < y1; py++) {
             u32 *row = s->pixels + py * s->stride;
             for (int px = x0; px < x1; px++) row[px] = c;
         }
     } else if (sa != 0) {
+        ZAN_STAT(g_st_fill_blend, area);
+        stat_top_blend((int)area, x0, y0, x1 - x0, y1 - y0, c);
         /* Rect is already clamped to the clip window, so blend straight into
          * the row instead of re-clipping every pixel via set_pixel -- these
          * translucent fills (scrims, hover/selection tints) cover large areas. */
@@ -368,6 +449,7 @@ EXPORT void zan_gui_fill_vgrad(
     int rh = (int)h;
     if (rh < 1) rh = 1;
     int denom = rh > 1 ? rh - 1 : 1;
+    ZAN_STAT(g_st_grad, (long long)(x1 - x0) * (long long)(y1 - y0));
     u32 ct = (u32)color_top, cb = (u32)color_bottom;
     int tr = (ct >> 16) & 0xFF, tg = (ct >> 8) & 0xFF, tb = ct & 0xFF;
     int mr = (cb >> 16) & 0xFF, mg = (cb >> 8) & 0xFF, mb = cb & 0xFF;
@@ -407,6 +489,7 @@ EXPORT void zan_gui_blur_rect(i32 surface_id, i32 x, i32 y, i32 w, i32 h, i32 ra
      * dominant glass cost; for the large radii glass uses we downscale the
      * region, blur the small copy, then bilinearly upscale. Visually identical
      * for frost, but the blur runs on ~1/(ds*ds) of the pixels. */
+    ZAN_STAT(g_st_blur, (long long)rw * (long long)rh);
     int ds = 1;
     if (r >= 12) { ds = 4; } else if (r >= 6) { ds = 2; }
     int dw = (rw + ds - 1) / ds;
@@ -606,6 +689,7 @@ EXPORT void zan_gui_blur_rect_cached(
     if (!dirty && c->valid && c->pixels && c->sid == (int)surface_id
         && c->x0 == x0 && c->y0 == y0 && c->rw == rw && c->rh == rh
         && c->r == r) {
+        ZAN_STAT(g_st_blur_hit, (long long)rw * (long long)rh);
         for (int j = 0; j < rh; j++) {
             u32 *row = s->pixels + (y0 + j) * s->stride + x0;
             u32 *src = c->pixels + (size_t)j * rw;
@@ -654,6 +738,7 @@ EXPORT void zan_gui_snapshot_rect(i32 surface_id, i32 x, i32 y, i32 w, i32 h, i3
     int y1 = clamp_i((int)(y + h), 0, s->height);
     int rw = x1 - x0, rh = y1 - y0;
     if (rw <= 0 || rh <= 0) return;
+    ZAN_STAT(g_st_snap, (long long)rw * (long long)rh);
     zan_blur_cache_t *c = &g_snap_cache[slot];
     size_t n = (size_t)rw * (size_t)rh;
     if (c->cap < n) {
@@ -688,10 +773,19 @@ EXPORT i32 zan_gui_restore_rect(i32 surface_id, i32 x, i32 y, i32 w, i32 h, i32 
         || c->x0 != x0 || c->y0 != y0 || c->rw != rw || c->rh != rh) {
         return 0;
     }
-    for (int j = 0; j < rh; j++) {
-        u32 *row = s->pixels + (y0 + j) * s->stride + x0;
-        u32 *src = c->pixels + (size_t)j * rw;
-        for (int i = 0; i < rw; i++) row[i] = src[i];
+    /* Like every other drawing op, a restore writes only inside the clip
+     * window: a partial (damage-clipped) frame restores just the background it
+     * is allowed to touch and leaves the rest of the last frame standing. */
+    int cx0 = x0 > s->clip_x0 ? x0 : s->clip_x0;
+    int cy0 = y0 > s->clip_y0 ? y0 : s->clip_y0;
+    int cx1 = x1 < s->clip_x1 ? x1 : s->clip_x1;
+    int cy1 = y1 < s->clip_y1 ? y1 : s->clip_y1;
+    if (cx1 <= cx0 || cy1 <= cy0) return 1;
+    ZAN_STAT(g_st_restore, (long long)(cx1 - cx0) * (long long)(cy1 - cy0));
+    for (int j = cy0; j < cy1; j++) {
+        u32 *row = s->pixels + j * s->stride + cx0;
+        u32 *src = c->pixels + (size_t)(j - y0) * rw + (cx0 - x0);
+        for (int i = 0; i < cx1 - cx0; i++) row[i] = src[i];
     }
     return 1;
 }
@@ -749,6 +843,7 @@ EXPORT void zan_gui_fill_rounded_rect(i32 surface_id, i32 x, i32 y, i32 w, i32 h
     if (r <= 0) { zan_gui_fill_rect(surface_id, x, y, w, h, color); return; }
     if (r > iw/2) r = iw/2;
     if (r > ih/2) r = ih/2;
+    ZAN_STAT(g_st_round, (long long)iw * (long long)ih);
 
     /* Fill the interior as three rects that EXCLUDE the four r*r corner squares,
      * then draw each corner as a quarter circle over just its square. Every
@@ -903,6 +998,7 @@ EXPORT void zan_gui_fill_radial(i32 surface_id, i32 cx, i32 cy, i32 radius, i32 
     if (peak > 255) peak = 255;
     if (peak <= 0) return;
     int r2 = r * r;
+    ZAN_STAT(g_st_radial, (long long)(2 * r + 1) * (long long)(2 * r + 1));
     /* Integer squared-distance falloff (no per-pixel sqrt/double): t is 256 at
      * the centre and 0 at the edge, squared for a bright tight core and a soft
      * tail. This is called hundreds of times per animated frame, so the hot
@@ -1237,6 +1333,7 @@ EXPORT void zan_gui_blit_image(
     y0 = idy  > s->clip_y0 ? idy  : s->clip_y0;
     x1 = idx2 + idw < s->clip_x1 ? idx2 + idw : s->clip_x1;
     y1 = idy  + idh < s->clip_y1 ? idy  + idh : s->clip_y1;
+    ZAN_STAT(g_st_img, (long long)(x1 - x0) * (long long)(y1 - y0));
     for (py = y0; py < y1; py++) {
         int sry = isy + (py - idy) * ish / idh;
         if (sry < 0 || sry >= img->h) continue;
@@ -1247,6 +1344,54 @@ EXPORT void zan_gui_blit_image(
                 blend_over(s->pixels[py * s->stride + px], img->pix[sry * img->w + srx]);
         }
     }
+}
+
+/* ---- client-priority hit guards ----------------------------------------
+ * The app draws controls flush with the window edge -- a scrollbar sits in
+ * the last few pixels -- and the borderless frame's resize border on top of
+ * one swallows every press meant for it, leaving the wheel as the only way to
+ * scroll. A rect registered here makes the edge border yield to the client;
+ * corner grips keep priority so a diagonal resize stays reachable. Rects are
+ * client pixels of one window, re-registered by the app every frame; they are
+ * kept per window because sibling windows register overlapping offsets.
+ */
+#define ZAN_GUI_MAX_HIT_GUARDS 64
+static int g_hit_guards[ZAN_GUI_MAX_HIT_GUARDS][4];
+static iptr g_hit_guard_win[ZAN_GUI_MAX_HIT_GUARDS];
+static int g_hit_guard_count;
+
+EXPORT i32 zan_gui_clear_hit_guards(iptr hwnd) {
+    int n = 0;
+    for (int i = 0; i < g_hit_guard_count; i++) {
+        if (g_hit_guard_win[i] == hwnd) continue;
+        if (n != i) {
+            memcpy(g_hit_guards[n], g_hit_guards[i], sizeof(g_hit_guards[0]));
+            g_hit_guard_win[n] = g_hit_guard_win[i];
+        }
+        n++;
+    }
+    g_hit_guard_count = n;
+    return 0;
+}
+
+EXPORT i32 zan_gui_add_hit_guard(iptr hwnd, i32 x, i32 y, i32 w, i32 h) {
+    if (w <= 0 || h <= 0) return 0;
+    if (g_hit_guard_count >= ZAN_GUI_MAX_HIT_GUARDS) return 0;
+    int *g = g_hit_guards[g_hit_guard_count];
+    g_hit_guard_win[g_hit_guard_count++] = hwnd;
+    g[0] = (int)x; g[1] = (int)y; g[2] = (int)w; g[3] = (int)h;
+    return 0;
+}
+
+/* static inline: backends that draw no client-side frame never call it. */
+static inline int zan_gui_in_hit_guard(iptr hwnd, int x, int y) {
+    for (int i = 0; i < g_hit_guard_count; i++) {
+        const int *g = g_hit_guards[i];
+        if (g_hit_guard_win[i] != hwnd) continue;
+        if (x >= g[0] && x < g[0] + g[2] && y >= g[1] && y < g[1] + g[3])
+            return 1;
+    }
+    return 0;
 }
 
 /* ---- gui_runtime translation-unit parts (order matters) ----------------

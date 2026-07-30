@@ -3,27 +3,37 @@ using Gui;
 
 namespace Gui.Widget;
 
-/// A single timeline entry: a time/meta label, a title and a description.
+/// A single timeline entry: a time/meta label, a title, a description and the
+/// classes its dot carries (`success`, `error`, … — the shared semantic roles).
 class TimelineItem {
     string time;
     string title;
     string description;
+    string cls;
 
     static TimelineItem Create(string time, string title, string description) {
+        return TimelineItem.Create(time, title, description, "");
+    }
+
+    static TimelineItem Create(string time, string title, string description,
+                               string cls) {
         TimelineItem it = new TimelineItem();
         it.time = time;
         it.title = title;
         it.description = description;
+        it.cls = cls;
         return it;
     }
 }
 
-/// Vertical timeline (NaiveUI n-timeline). Each entry has a colored dot,
-/// a connecting line and a time / title / description block. Feed it a single
-/// list of TimelineItem records:
-///     List<TimelineItem> items = new List<TimelineItem>();
-///     items.Add(TimelineItem.Create("09:00", "Created", "Project initialized"));
-///     Timeline.Render(app, x, y, items);
+/// A vertical timeline: a dot and a connector per entry, with a time / title /
+/// description block beside it. Dots, connector and the three text lines are
+/// styled parts (`timeline::dot`, `::line`, `::time`, `::title`, `::desc`), so a
+/// skin restyles them and the code side is plain assignment:
+///
+///     Timeline tl = new Timeline { Class = "primary" };
+///     tl.AddItem("09:00", "Created", "Project initialized");
+///     tl.Add(TimelineItem.Create("12:30", "Published", "", "success"));
 class Timeline : Control {
     List<TimelineItem> items;
 
@@ -32,27 +42,23 @@ class Timeline : Control {
         items = new List<TimelineItem>();
     }
 
-    /// Retained-mode constructor: `Timeline tl = new Timeline();
-    /// tl.AddItem("09:00", "Created", "...");`
-    Timeline() {
-        InitTimeline();
-    }
+    Timeline() { InitTimeline(); }
 
-    void Add(TimelineItem it) {
-        items.Add(it);
-    }
+    void Add(TimelineItem it) { items.Add(it); }
 
     void AddItem(string time, string title, string desc) {
         items.Add(TimelineItem.Create(time, title, desc));
     }
 
     override void OnMeasure(App app) {
+        StyleBox s = this.ResolveStyleAs(app, "timeline", Class,
+                                         Style.SNormal());
         prefH = Timeline.RowHeight(app) * items.Count;
-        prefW = app.Scale(240);
+        prefW = s.WidthOr(app.Scale(240));
     }
 
     override void OnPaint(App app) {
-        Timeline.Render(app, bx, by, items);
+        Timeline.Paint(app, bx, by, items, Class);
     }
 
     static int RowHeight(App app) {
@@ -63,9 +69,69 @@ class Timeline : Control {
              + t.paddingTiny + t.gapSmall + t.paddingMedium;
     }
 
-    /// Compatibility overload: build records from parallel title / description
-    /// lists (no time column).
-    static void Render(App app, int x, int y, List<string> titles, List<string> descs) {
+    static void Paint(App app, int x, int y, List<TimelineItem> items,
+                      string cls) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        StyleBox s = Style.Of(app, "timeline", cls, Style.SNormal());
+        StyleBox ln = Style.Part(app, "timeline", "line", "", cls, "",
+                                 Style.SNormal());
+        StyleBox tm = Style.Part(app, "timeline", "time", "", cls, "",
+                                 Style.SNormal());
+        StyleBox ti = Style.Part(app, "timeline", "title", "", cls, "",
+                                 Style.SNormal());
+        StyleBox de = Style.Part(app, "timeline", "desc", "", cls, "",
+                                 Style.SNormal());
+
+        int n = items.Count;
+        int rowH = Timeline.RowHeight(app);
+        int dotR = app.Scale(5);
+        int lw = ln.HeightOr(app.Scale(2));
+        int lineX = x + dotR;
+        int timeFont = tm.FontOr(t.fontSizeSmall);
+        int titleFont = ti.FontOr(t.fontSizeMedium);
+        int descFont = de.FontOr(t.fontSizeSmall);
+
+        int i = 0;
+        while (i < n) {
+            TimelineItem it = items[i];
+            int top = y + i * rowH;
+            int cy = top + dotR + app.Scale(2);
+            if (i < n - 1) {
+                c.FillRect(lineX - lw / 2, cy, lw, rowH,
+                           ln.BgOr(t.divider));
+            }
+            // The entry's own classes select its dot, so one errored step is a
+            // class on the record, not a colour argument at the call site.
+            StyleBox dot = Style.Part(app, "timeline", "dot", "",
+                                      cls + " " + it.cls, "", Style.SNormal());
+            int dotColor = dot.BgOr(Style.RoleBase(t, it.cls));
+            if (dotColor == 0) { dotColor = s.AccentOr(t.primary); }
+            c.FillCircle(lineX, cy, dot.HeightOr(dotR * 2) / 2, dotColor);
+
+            int tx = x + dotR * 2 + t.gapLarge;
+            int ty = top;
+            if (it.time != "") {
+                c.DrawText(tx, ty, it.time, tm.FgOr(t.textTertiary), timeFont);
+                ty = ty + Canvas.FontHeight(timeFont) + t.paddingTiny;
+            }
+            c.DrawText(tx, ty, it.title, ti.FgOr(t.textPrimary), titleFont);
+            ty = ty + Canvas.FontHeight(titleFont) + t.gapSmall;
+            if (it.description != "") {
+                c.DrawText(tx, ty, it.description, de.FgOr(t.textSecondary),
+                           descFont);
+            }
+            i = i + 1;
+        }
+    }
+
+    static void Render(App app, int x, int y, List<TimelineItem> items) {
+        Timeline.Paint(app, x, y, items, "");
+    }
+
+    /// Entries built from parallel title / description lists (no time column).
+    static void Render(App app, int x, int y, List<string> titles,
+                       List<string> descs) {
         List<TimelineItem> items = new List<TimelineItem>();
         int i = 0;
         while (i < titles.Count) {
@@ -74,42 +140,27 @@ class Timeline : Control {
             items.Add(TimelineItem.Create("", titles[i], ds));
             i = i + 1;
         }
-        Timeline.Render(app, x, y, items);
+        Timeline.Paint(app, x, y, items, "");
     }
 
-    static void Render(App app, int x, int y, List<TimelineItem> items) {
-        Canvas c = app.canvas;
-        Theme t = app.theme;
-        int n = items.Count;
-        int rowH = Timeline.RowHeight(app);
-        int dotR = app.Scale(5);
-        int lw = app.Scale(2);
-        int lineX = x + dotR;
+    // ---- designer / serialization model -------------------------------------
 
-        int i = 0;
-        while (i < n) {
-            TimelineItem it = items[i];
-            int top = y + i * rowH;
-            int cy = top + dotR + app.Scale(2);
-            if (i < n - 1) {
-                c.FillRect(lineX - lw / 2, cy, lw, rowH, t.divider);
-            }
-            int dotColor = t.primary;
-            if (i == 0) { dotColor = t.success; }
-            c.FillCircle(lineX, cy, dotR, dotColor);
+    override string Kind() { return "Timeline"; }
 
-            int tx = x + dotR * 2 + t.gapLarge;
-            int ty = top;
-            if (it.time != "") {
-                c.DrawText(tx, ty, it.time, t.textTertiary, t.fontSizeSmall);
-                ty = ty + Canvas.FontHeight(t.fontSizeSmall) + t.paddingTiny;
-            }
-            c.DrawText(tx, ty, it.title, t.textPrimary, t.fontSizeMedium);
-            ty = ty + Canvas.FontHeight(t.fontSizeMedium) + t.gapSmall;
-            if (it.description != "") {
-                c.DrawText(tx, ty, it.description, t.textSecondary, t.fontSizeSmall);
-            }
-            i = i + 1;
-        }
+    override List<PropSpec> Props() {
+        List<PropSpec> ps = new List<PropSpec>();
+        ps.Add(PropSpec.Text("class", "Classes"));
+        return ps;
+    }
+
+    override string GetProp(string key) {
+        if (key == "class") { return Class; }
+        return "";
+    }
+
+    override void SetProp(string key, string val) {
+        if (key == "class") { Class = val; }
+        else if (val == "true") { Class = Class + " " + key; }
+        else if (val != "" && val != "false") { Class = Class + " " + val; }
     }
 }

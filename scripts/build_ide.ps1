@@ -53,8 +53,10 @@ try {
     }
     $files += (Join-Path (Get-Location) "stdlib\System\IO\File.zan")
     $files += (Join-Path (Get-Location) "stdlib\System\IO\Directory.zan")
+    # File timestamps: the editor uses them to notice outside changes.
+    $files += (Join-Path (Get-Location) "stdlib\System\IO\FileInfo.zan")
     $files += (Join-Path (Get-Location) "stdlib\System\Diagnostics\Process.zan")
-    $files += (Join-Path (Get-Location) "stdlib\Game\Scene\SceneDoc.zan")
+    $files += (Get-ChildItem stdlib\Game\Scene\*.zan).FullName
     # Crypto + encrypted resource pack (.zrp publishing from the Asset Manager).
     $files += (Get-ChildItem stdlib\System\Security\Cryptography\*.zan).FullName
     $files += (Join-Path (Get-Location) "stdlib\System\Resources\ResourcePack.zan")
@@ -83,6 +85,9 @@ try {
     }
     Copy-Item -LiteralPath (Join-Path $driverDir "SDL3.dll") `
         -Destination (Join-Path (Get-Location) "build\SDL3.dll") -Force
+    # The IDE's own stylesheet (page layout) ships next to the executable.
+    Copy-Item -LiteralPath (Join-Path (Get-Location) "src\ide_zan\ide.css") `
+        -Destination (Join-Path (Get-Location) "build\ide.css") -Force
 } catch {
     Write-Output $_
     $failed = $true

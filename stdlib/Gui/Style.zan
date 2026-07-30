@@ -129,7 +129,8 @@ class Style {
 
     /// Resolution including an id selector (`#name`), the most specific level.
     static StyleBox Full(App app, string type, string cls, string id, int state) {
-        string key = type + "|" + cls + "|" + id + "|" + Convert.ToString(state);
+        string key = type + "|" + cls + "|" + id + "|" + Convert.ToString(state)
+            + "@" + Convert.ToString(app.dpiScale);
         StyleBox hit = Style.CacheGet(app, key);
         if (hit != null) { return hit.Clone(); }
 
@@ -138,6 +139,7 @@ class Style {
         StyleSheet sheet = app.sheet;
         if (sheet != null) {
             Style.ApplySheet(sheet, b, type, cls, id, state);
+            Style.ScaleLayout(app, b);
         }
         Style.CachePut(key, b);
         return b.Clone();
@@ -163,6 +165,29 @@ class Style {
         }
         Style.CachePut(key, b);
         return b.Clone();
+    }
+
+    /// Scales the stylesheet's layout lengths (box sizes and margins) to the
+    /// display: CSS is authored at 100%, the theme's own metrics are already
+    /// DPI-scaled, so a sheet's `width: 260px` must follow the same factor to
+    /// stay the same physical size. Percentages need no scaling.
+    static void ScaleLayout(App app, StyleBox b) {
+        if (app.dpiScale == 100) { return; }
+        if (b.width >= 0) { b.width = app.Scale(b.width); }
+        if (b.height >= 0) { b.height = app.Scale(b.height); }
+        if (b.minW >= 0) { b.minW = app.Scale(b.minW); }
+        if (b.minH >= 0) { b.minH = app.Scale(b.minH); }
+        if (b.maxW >= 0) { b.maxW = app.Scale(b.maxW); }
+        if (b.maxH >= 0) { b.maxH = app.Scale(b.maxH); }
+        if (b.gap >= 0) { b.gap = app.Scale(b.gap); }
+        b.marL = app.Scale(b.marL);
+        b.marT = app.Scale(b.marT);
+        b.marR = app.Scale(b.marR);
+        b.marB = app.Scale(b.marB);
+        if (b.padL >= 0) { b.padL = app.Scale(b.padL); }
+        if (b.padT >= 0) { b.padT = app.Scale(b.padT); }
+        if (b.padR >= 0) { b.padR = app.Scale(b.padR); }
+        if (b.padB >= 0) { b.padB = app.Scale(b.padB); }
     }
 
     /// Layers the sheet's matching rules onto `b` in ascending specificity:
@@ -287,6 +312,7 @@ class Style {
             return Style.Full(app, type, cls, name, Style.SDisabled() + latched);
         }
         StyleBox base0 = Style.Full(app, type, cls, name, latched);
+        base0.fxId = id;
         int ms = base0.TransitionOr(0 - 1);
         int hv = Ui.HoverLevelMs(app, id, ms);
         int pv = Ui.PressLevelMs(app, id, ms);
@@ -305,6 +331,7 @@ class Style {
             StyleBox foc = Style.Full(app, type, cls, name, latched + Style.SFocus());
             cur = StyleBox.Blend(cur, foc, Style.Curve(base0.easing, fv));
         }
+        cur.fxId = id;
         return cur;
     }
 
@@ -445,9 +472,61 @@ class Style {
             b.bg = 0;
             b.borderW = 0;
             b.shadow = 0;
-        } else if (type == "label" || type == "text") {
-            b.bg = 0;
+        } else if (type == "tag") {
+            Style.TagDefaults(app, b, cls);
+        } else if (type == "badge" || type == "avatar") {
+            Style.MarkerDefaults(app, b, cls);
+        } else if (type == "label" || type == "text"
+                   || type == "statistic") {
+            Style.TextDefaults(app, b, cls);
+        } else if (type == "empty" || type == "result" || type == "spin"
+                   || type == "timeline" || type == "steps"
+                   || type == "breadcrumb" || type == "pageheader") {
+            // Content displays: they paint their own glyphs and text into the
+            // area they are given, so they own no surface and no inset (a card
+            // background here would draw a second panel inside the one their
+            // content already sits in). Their role class carries the accent
+            // their marks are drawn in.
+            Style.TextDefaults(app, b, cls);
+            b.accent = t.primary;
+            int caccent = Style.RoleBase(t, cls);
+            // A role on a content display tints its marks (a glyph, a dot, a
+            // step circle), not its copy, so the text stays readable.
+            if (caccent != 0) { b.accent = caccent; b.fg = t.textPrimary; }
+        } else if (type == "skeleton") {
+            // A placeholder is only a fill: `skeleton { background }` recolours
+            // every one and `skeleton.text { border-radius }` reshapes the
+            // copy lines.
+            b.bg = t.bgTertiary;
+            b.fg = t.bgTertiary;
+            b.borderW = 0;
+            b.shadow = 0;
+            b.SetRadius(t.borderRadiusMedium);
+            Style.SizeDefaults(app, b, cls);
+            b.height = -1;
+            b.padL = -1;
+            b.padR = -1;
+            if (Style.Has(cls, "text")) { b.SetRadius(t.borderRadiusSmall); }
+            if (Style.Has(cls, "circle")) { b.SetRadius(999); }
+        } else if (type == "divider") {
+            // A rule paints as a 1px box of the divider colour, so `divider {
+            // background: ...; height: 2px }` recolours and thickens every one.
+            b.bg = t.divider;
             b.fg = t.textPrimary;
+            b.height = 1;
+            b.borderW = 0;
+            b.shadow = 0;
+            b.SetRadius(0);
+        } else if (type == "stack" || type == "list" || type == "buttonbar"
+                   || type == "page" || type == "startpage") {
+            // Layout containers and content areas (Panel.Row/Column, a list,
+            // a button strip, a page) paint nothing and own no inset: giving
+            // them the surface defaults below charged a card's padding on every
+            // side and drew a second panel inside the card their content already
+            // sits in.
+            b.bg = 0;
+            b.borderW = 0;
+            b.shadow = 0;
         } else {
             Style.SurfaceDefaults(app, b, cls);
         }
@@ -457,7 +536,7 @@ class Style {
         // offset shadow and presses into it; glass skins frost their surfaces.
         bool internalParts = type == "checkbox" || type == "radio" || type == "switch"
             || type == "slider" || type == "progress";
-        if (t.brutal == 1 && type != "label" && type != "text" && !internalParts) {
+        if (t.brutal == 1 && !Style.FlatType(type) && !internalParts) {
             b.shadow = t.shadowColor;
             b.shadowDx = 4;
             b.shadowDy = 4;
@@ -468,6 +547,241 @@ class Style {
         }
     }
 
+    /// True for types that paint text or marks straight into the area they are
+    /// given and own no surface, so a skin's global border-and-shadow shell must
+    /// not draw a box around them.
+    static bool FlatType(string type) {
+        return type == "label" || type == "text" || type == "empty"
+            || type == "result" || type == "spin" || type == "timeline"
+            || type == "steps" || type == "breadcrumb" || type == "pageheader";
+    }
+
+    /// Text of any kind (a label, a heading, a statistic, the lines a content
+    /// display paints): no surface, the shared size scale, and the class list
+    /// picks the colour. `secondary` / `hint` de-emphasise, `inverse` reads on
+    /// an accent, `title` and `h1`…`h6` are the display steps, `paragraph` is
+    /// body copy, and a role class colours the text itself.
+    static void TextDefaults(App app, StyleBox b, string cls) {
+        Theme t = app.theme;
+        b.bg = 0;
+        b.fg = t.textPrimary;
+        b.borderW = 0;
+        b.shadow = 0;
+        // Sizes come from the shared scale, so `label.small` is the same step
+        // as `button.small`.
+        Style.SizeDefaults(app, b, cls);
+        b.height = -1;
+        b.padL = -1;
+        b.padR = -1;
+        int heading = Style.HeadingFont(t, cls);
+        if (heading != 0) { b.fontPx = heading; }
+        if (Style.Has(cls, "paragraph")) {
+            b.fontPx = t.fontSizeMedium;
+            b.fg = t.textSecondary;
+        }
+        if (Style.Has(cls, "secondary")) { b.fg = t.textSecondary; }
+        if (Style.Has(cls, "hint")) { b.fg = t.textTertiary; }
+        if (Style.Has(cls, "inverse")) { b.fg = t.textInverse; }
+        int role = Style.RoleBase(t, cls);
+        if (role != 0) { b.fg = role; }
+    }
+
+    /// Font size of the heading class a list carries (`title` is `h1`'s twin),
+    /// or 0 when it names no heading. One ladder for every text widget, so
+    /// `label.h3` and a Typography heading of level 3 are the same step.
+    static int HeadingFont(Theme t, string cls) {
+        if (Style.Has(cls, "h1") || Style.Has(cls, "title")) {
+            return t.fontSizeHuge;
+        }
+        if (Style.Has(cls, "h2")) { return t.fontSizeLarge + t.fontSizeTiny / 2; }
+        if (Style.Has(cls, "h3")) { return t.fontSizeLarge; }
+        if (Style.Has(cls, "h4")) { return t.fontSizeMedium + 2; }
+        if (Style.Has(cls, "h5")) { return t.fontSizeMedium; }
+        if (Style.Has(cls, "h6")) { return t.fontSizeSmall; }
+        return 0;
+    }
+
+    /// A tag / chip: its semantic role class ("primary", "info", "success",
+    /// "warning", "error") picks the fill from the theme's palette with the
+    /// inverse text that reads on it; an unclassed tag is the neutral chip. A
+    /// skin restyles any of them with a `tag.<role>` rule.
+    /// The size scale a `tiny` / `small` / `medium` / `large` class stands for,
+    /// applied to height, font size and horizontal padding. Every sized widget
+    /// (button, tag, ...) shares it, so `button.large` and `tag.large` mean the
+    /// same step, and a skin can still override any of the three.
+    static void SizeDefaults(App app, StyleBox b, string cls) {
+        Theme t = app.theme;
+        if (Style.Has(cls, "tiny")) {
+            b.height = t.heightTiny; b.fontPx = t.fontSizeTiny;
+            b.padL = t.paddingSmall; b.padR = t.paddingSmall;
+        } else if (Style.Has(cls, "small")) {
+            b.height = t.heightSmall; b.fontPx = t.fontSizeSmall;
+            b.padL = t.paddingMedium; b.padR = t.paddingMedium;
+        } else if (Style.Has(cls, "large")) {
+            b.height = t.heightLarge; b.fontPx = t.fontSizeLarge;
+            b.padL = t.paddingLarge + t.gapSmall;
+            b.padR = t.paddingLarge + t.gapSmall;
+        } else if (Style.Has(cls, "medium")) {
+            b.height = t.heightMedium; b.fontPx = t.fontSizeMedium;
+            b.padL = t.paddingLarge; b.padR = t.paddingLarge;
+        }
+        // No size class: nothing is set, so every reader falls back to the
+        // medium theme metric it passes to HeightOr/FontOr/PadLOr.
+    }
+
+    /// A badge or avatar: a small filled marker. Its role class picks the fill
+    /// ("error" for an unread count, "primary" for an accented avatar) and an
+    /// unclassed one is neutral; its height is the size scale's, so `badge.dot`
+    /// or `avatar.large` in CSS resizes it. Radius stays a pill/circle because
+    /// StyleBox clamps a large radius to half the box.
+    static void MarkerDefaults(App app, StyleBox b, string cls) {
+        Theme t = app.theme;
+        int role = Style.RoleBase(t, cls);
+        b.borderW = 0;
+        b.shadow = 0;
+        b.SetRadius(999);
+        b.fontPx = t.fontSizeSmall;
+        b.height = t.heightTiny;
+        if (Style.Has(cls, "dot")) {
+            b.height = t.gapMedium;
+            b.padL = 0;
+            b.padR = 0;
+        }
+        Style.SizeDefaults(app, b, cls);
+        if (role == 0) {
+            b.bg = t.bgTertiary;
+            b.fg = t.textPrimary;
+        } else {
+            b.bg = role;
+            b.fg = t.textInverse;
+        }
+    }
+
+    static void TagDefaults(App app, StyleBox b, string cls) {
+        Theme t = app.theme;
+        int role = Style.RoleBase(t, cls);
+        b.SetRadius(t.borderRadiusSmall);
+        b.padL = t.paddingSmall;
+        b.padR = t.paddingSmall;
+        b.borderW = 0;
+        b.shadow = 0;
+        b.fontPx = t.fontSizeSmall;
+        b.height = t.heightTiny;
+        Style.SizeDefaults(app, b, cls);
+        if (role == 0) {
+            b.bg = t.bgTertiary;
+            b.fg = t.textPrimary;
+        } else {
+            b.bg = role;
+            b.fg = t.textInverse;
+        }
+    }
+
+    // ---- design-system class names -----------------------------------------
+    // The names below are the design system's vocabulary: a widget only ever
+    // hands a class list to the resolver, and a skin restyles any of them in
+    // CSS. The int forms exist for data-driven callers (a designer document, a
+    // scene file) that store a variant as a number.
+
+    /// Semantic type: 1 primary, 2 info, 3 success, 4 warning, 5 error.
+    static string TypeClass(int type) {
+        switch (type) {
+            case 1: return "primary";
+            case 2: return "info";
+            case 3: return "success";
+            case 4: return "warning";
+            case 5: return "error";
+            default: return "";
+        }
+    }
+
+    /// The role class a list already carries ("primary" … "error"), or "" when
+    /// it is neutral. Widgets that pick a glyph or a part style per role read
+    /// this instead of testing every role name themselves.
+    static string RoleClass(string cls) {
+        int i = 1;
+        while (i <= 5) {
+            string role = Style.TypeClass(i);
+            if (Style.Has(cls, role)) { return role; }
+            i = i + 1;
+        }
+        return "";
+    }
+
+    /// Fill treatment: 1 outline, 2 text, 3 dashed (0 = solid, no class).
+    static string FillClass(int fill) {
+        switch (fill) {
+            case 1: return "outline";
+            case 2: return "text";
+            case 3: return "dashed";
+            default: return "";
+        }
+    }
+
+    /// Size: 0 tiny, 1 small, 2 medium, 3 large.
+    static string SizeClass(int size) {
+        switch (size) {
+            case 0: return "tiny";
+            case 1: return "small";
+            case 3: return "large";
+            default: return "medium";
+        }
+    }
+
+    /// Where an item sits in a sequence: `done` behind the current one,
+    /// `active` on it, `pending` ahead of it, `error` when it failed. Shared by
+    /// every sequence display (a step indicator, a timeline, a wizard rail) so
+    /// one skin rule styles the same state everywhere.
+    static string StateClass(int index, int current, int errorIndex) {
+        if (index == errorIndex) { return "error"; }
+        if (index < current) { return "done"; }
+        if (index == current) { return "active"; }
+        return "pending";
+    }
+
+    // ---- semantic type colours ---------------------------------------------
+    // For widgets that paint button-typed surfaces without a StyleBox of their
+    // own (button groups, ribbons, toolbars), which is why they take an int.
+
+    /// Accent colour of a button type (default falls back to the primary text
+    /// colour so tinted/ghost/text styles still read).
+    static int TypeColor(Theme t, int type) {
+        if (type == 1) { return t.primary; }
+        if (type == 2) { return t.info; }
+        if (type == 3) { return t.success; }
+        if (type == 4) { return t.warning; }
+        if (type == 5) { return t.error; }
+        return t.textPrimary;
+    }
+
+    /// Background of a button-typed surface for the given interaction state.
+    /// `style` 0 = solid, 1 = outline.
+    static int TypeFill(Theme t, int type, int style, bool hovered, bool pressed) {
+        int tc = Style.TypeColor(t, type);
+        if (style == 1) {
+            if (pressed) { return App.LerpColor(t.bgPrimary, tc, 55); }
+            if (hovered) { return App.LerpColor(t.bgPrimary, tc, 28); }
+            return t.bgPrimary;
+        }
+        if (type == 0) {
+            if (pressed) { return t.bgActive; }
+            if (hovered) { return t.bgHover; }
+            return t.bgPrimary;
+        }
+        if (pressed) { return App.LerpColor(tc, 4278190080, 150); }
+        if (hovered) { return App.LerpColor(tc, 4294967295, 150); }
+        return tc;
+    }
+
+    /// Foreground (label) colour matching TypeFill.
+    static int TypeFg(Theme t, int type, int style) {
+        if (style == 1 || type == 0) {
+            if (type == 0) { return t.textPrimary; }
+            return Style.TypeColor(t, type);
+        }
+        return t.textInverse;
+    }
+
     static void ButtonDefaults(App app, StyleBox b, string cls, bool hover,
                                bool active, bool focus, bool disabled) {
         Theme t = app.theme;
@@ -476,6 +790,18 @@ class Style {
         b.SetRadius(t.borderRadiusMedium);
         b.gap = t.gapSmall;
         b.align = 1;
+        Style.SizeDefaults(app, b, cls);
+        // Shape and decoration are class-selected here so the widget paints one
+        // resolved box and a skin can override any of it in CSS.
+        if (Style.Has(cls, "round") || Style.Has(cls, "circle")) {
+            b.SetRadius(9999);
+        }
+        if (Style.Has(cls, "dashed")) { b.borderStyle = 1; }
+        if (Style.Has(cls, "specular")) { b.specular = 1; }
+        if (t.neu == 1 && !disabled) {
+            b.emboss = 1;
+            if (active) { b.emboss = 2; }
+        }
 
         if (disabled) {
             // Keep a clearly visible muted shape on any theme: fill with the
@@ -584,7 +910,11 @@ class Style {
             // it instead of an opaque fill.
             b.blur = 36;
             b.bg = App.ScaleAlpha(t.bgPrimary, 260);
-            b.borderColor = App.ScaleAlpha(t.textPrimary, 110);
+            // No light rim: a hairline of near-white around every card, panel
+            // and popup read as a drawn-on outline (and doubled up against the
+            // dividers next to it). The frost and tint already separate a glass
+            // surface from the backdrop.
+            b.borderW = 0;
         }
     }
 

@@ -1,0 +1,107 @@
+using System;
+using Gui;
+
+namespace Gui.Widget;
+
+/// The standard "box with glyphs and a label in it" every compact widget paints:
+/// button, tag, chip, segment, menu item. It resolves the CSS parts
+/// (`<type>::icon`, `::label`, `::spinner`), paints the box, adds the press
+/// ripple, then centers a leading icon (or a spinner while busy), the label and
+/// an optional trailing glyph, eliding the label when the box is too small.
+///
+/// Widgets call it instead of laying content out themselves:
+///
+///     BoxContent.Paint(app, wid, "button", Class, name, style, x, y, w, h,
+///                      Icon, this.Label(), "", busy, Disabled);
+///
+/// It returns the trailing glyph's left edge, which is what a closable chip
+/// registers its close-hit region on.
+class BoxContent {
+    /// Glyph size for a box whose text is `fontPx`: glyphs read ~1.33x the text
+    /// (NaiveUI proportion) so an icon-only control isn't smaller than a
+    /// labelled one.
+    static int GlyphSize(int fontPx) { return fontPx * 4 / 3; }
+
+    /// Content width of the glyphs + label at `fontPx`, without the box's own
+    /// padding -- what a widget adds its padding to when measuring itself.
+    static int Width(string icon, string label, string trailing,
+                     int fontPx, int gap) {
+        int w = 0;
+        if (icon != "") { w = BoxContent.GlyphSize(fontPx); }
+        if (label != "") {
+            if (w > 0) { w = w + gap; }
+            w = w + Canvas.MeasureText(label, fontPx);
+        }
+        if (trailing != "") { w = w + gap + BoxContent.GlyphSize(fontPx); }
+        return w;
+    }
+
+    static int Paint(App app, int id, string type, string cls, string name,
+                     StyleBox s, int x, int y, int w, int h,
+                     string icon, string label, string trailing,
+                     bool busy, bool disabled) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int bob = s.FloatOffset(app);
+        s.Paint(app, x, y + bob, w, h);
+        y = y + bob;
+        int fgColor = s.FgOr(t.textPrimary);
+
+        // Press ripple over the fill, skipped when there is no fill to ripple on
+        // (a text/ghost style) so it doesn't flash a disc on the background.
+        int bgColor = s.BgOr(0);
+        if (!disabled && !busy && bgColor != 0) {
+            Ui.Ripple(app, id, x, y, w, h, App.LerpColor(bgColor, 4294967295, 320));
+        }
+
+        StyleBox iconStyle = Style.EasedPartId(app, id, type, "icon", "", cls,
+                                               name, disabled, false);
+        StyleBox labelStyle = Style.EasedPartId(app, id, type, "label", "", cls,
+                                                name, disabled, false);
+        StyleBox spinStyle = Style.EasedPartId(app, id, type, "spinner", "", cls,
+                                               name, disabled, false);
+        int fontPx = s.FontOr(t.fontSizeMedium);
+        int labelFont = labelStyle.FontOr(fontPx);
+        int glyph = iconStyle.FontOr(BoxContent.GlyphSize(fontPx));
+        int gap = s.GapOr(t.gapSmall);
+        string lead = icon;
+        if (busy) { lead = "spinner"; }
+        int contentW = BoxContent.Width(lead, label, trailing, labelFont, gap);
+
+        int hpad = s.PadLOr(t.paddingLarge);
+        int cx = x + (w - contentW) / 2;
+        // Content wider than the box: start at the inner edge and elide the
+        // label, so a squeezed control clips its own text instead of painting
+        // over its neighbours.
+        if (contentW > w - hpad * 2) { cx = x + hpad; }
+        if (busy) {
+            c.PushClip(x, y, w, h);
+            Spin.Render(app, cx + glyph / 2, y + h / 2, glyph / 2,
+                        spinStyle.FgOr(fgColor));
+            c.PopClip();
+            cx = cx + glyph + gap;
+        } else if (icon != "") {
+            Icon.Draw(c, icon, cx, y + (h - glyph) / 2, glyph,
+                      iconStyle.FgOr(fgColor));
+            cx = cx + glyph + gap;
+        }
+        int tailW = 0;
+        if (trailing != "") { tailW = glyph + gap; }
+        if (label != "") {
+            int avail = x + w - hpad - tailW - cx;
+            if (avail > 0) {
+                string shown = label;
+                if (Canvas.MeasureText(shown, labelFont) > avail) {
+                    shown = Ellipsis.Fit(shown, avail, labelFont);
+                }
+                c.DrawText(cx, y + (h - Canvas.FontHeight(labelFont)) / 2, shown,
+                           labelStyle.FgOr(fgColor), labelFont);
+                cx = cx + Canvas.MeasureText(shown, labelFont) + gap;
+            }
+        }
+        if (trailing == "") { return 0; }
+        Icon.Draw(c, trailing, cx, y + (h - glyph) / 2, glyph,
+                  iconStyle.FgOr(fgColor));
+        return cx;
+    }
+}

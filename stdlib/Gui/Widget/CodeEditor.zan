@@ -199,6 +199,16 @@ partial class CodeEditor {
     // (tracked by cErrStamp = buffer length when the diagnostics were set).
     List<Diagnostic> compErrors;
     int cErrStamp;
+    // Per-frame memo for CompilerDiagStale: -1 unknown, 0 live, 1 stale. The
+    // staleness test walks the whole buffer, and every visible line asks for
+    // it, so on a large file the answer is computed once per frame instead of
+    // once per row (InvalidateDiagStale runs after input handling).
+    int diagStaleFrame;
+    // Types declared in this buffer (names + space-separated member lists),
+    // cached against the TextStamp() they were parsed at. See EnsureBufTypes.
+    List<string> muTypeNames;
+    List<string> muTypeMembers;
+    int muTypesStamp;
 
     // ---- symbol index (accurate, using-aware completion) ----
     // Types (class/struct/enum) declared across the project's other files, and
@@ -311,6 +321,10 @@ partial class CodeEditor {
         e.lastDiagLine = -1;
         e.compErrors = new List<Diagnostic>();
         e.cErrStamp = -1;
+        e.diagStaleFrame = -1;
+        e.muTypeNames = null;
+        e.muTypeMembers = null;
+        e.muTypesStamp = -1;
         e.projTypes = new List<ProjType>();
         e.projFileSrc = new List<string>();
         e.projScanDirty = false;
@@ -441,6 +455,7 @@ partial class CodeEditor {
             i = i + 1;
         }
         cErrStamp = BufLen();
+        diagStaleFrame = 0 - 1;
         if (compErrors.Count > 0) {
             GoToLine(compErrors[0].line);
         }
@@ -449,8 +464,17 @@ partial class CodeEditor {
     /// True once the buffer has changed since the compiler diagnostics were set,
     /// so stale errors stop being drawn the moment the user starts editing.
     bool CompilerDiagStale() {
-        return cErrStamp < 0 || BufLen() != cErrStamp;
+        if (diagStaleFrame == 0) { return false; }
+        if (diagStaleFrame == 1) { return true; }
+        bool stale = cErrStamp < 0 || BufLen() != cErrStamp;
+        diagStaleFrame = 0;
+        if (stale) { diagStaleFrame = 1; }
+        return stale;
     }
+
+    /// Drops the per-frame staleness memo; the render pass calls this once the
+    /// buffer can no longer change this frame.
+    void InvalidateDiagStale() { diagStaleFrame = 0 - 1; }
 
     /// The compiler-diagnostic message for a line, or "" when none/stale.
     string CompilerErrMsg(int ln) {
@@ -1221,7 +1245,7 @@ partial class CodeEditor {
         }
 
         // Left-click selects an item or dismisses the menu.
-        if (app.window.EventKind() == 3 && app.window.EventButton() == 0) {
+        if (app.EventKind() == 3 && app.window.EventButton() == 0) {
             bool inside = app.mouseX >= mX && app.mouseX < mX + mW
                           && app.mouseY >= mY && app.mouseY < mY + mH;
             if (inside) {
@@ -1256,22 +1280,28 @@ partial class CodeEditor {
             string tr = ln;
             // Trim leading whitespace
             int si = 0;
-            while (si < tr.Length) {
-                string sch = tr.Substring(si, 1);
-                if (sch == " " || sch == "\t") { si = si + 1; }
+            int trLen = tr.Length;
+            while (si < trLen) {
+                int sch = tr[si];
+                if (sch == 32 || sch == 9) { si = si + 1; }
                 else { break; }
             }
             if (si > 0) { tr = tr.Substring(si, tr.Length - si); }
             // Skip empty/comment lines
             if (tr.Length > 0 && tr.Substring(0, 1) != "/" && tr.Substring(0, 1) != "*") {
                 // Check brace/paren balance per line
+                // Byte comparisons, not Substring(ci, 1): this loop walks
+                // every character of the document, and allocating a
+                // one-character string per byte dominated the pass on a large
+                // file.
                 int ci = 0;
-                while (ci < ln.Length) {
-                    string ch = ln.Substring(ci, 1);
-                    if (ch == "{") { braceDepth = braceDepth + 1; }
-                    if (ch == "}") { braceDepth = braceDepth - 1; }
-                    if (ch == "(") { parenDepth = parenDepth + 1; }
-                    if (ch == ")") { parenDepth = parenDepth - 1; }
+                int lnLen = ln.Length;
+                while (ci < lnLen) {
+                    int ch = ln[ci];
+                    if (ch == 123) { braceDepth = braceDepth + 1; }
+                    else if (ch == 125) { braceDepth = braceDepth - 1; }
+                    else if (ch == 40) { parenDepth = parenDepth + 1; }
+                    else if (ch == 41) { parenDepth = parenDepth - 1; }
                     ci = ci + 1;
                 }
                 if (braceDepth < 0) {
@@ -1282,65 +1312,18 @@ partial class CodeEditor {
                     errors.Add(new Diagnostic(li, "Unexpected ')'"));
                     parenDepth = 0;
                 }
-                // Check for a missing semicolon / stray statement. A code line
-                // must terminate in ';' '{' '}' etc.; a line that ends on an
-                // identifier or literal (e.g. `Utils.Equals`) is flagged.
-                if (tr.Length >= 1) {
-                    string lastCh = tr.Substring(tr.Length - 1, 1);
-                    string firstCh = tr.Substring(0, 1);
-                    bool needsSemi = true;
-                    // Terminators / continuation characters that make a line OK as-is
-                    // (ends a block, a statement, or clearly continues onto the next).
-                    string endOk = "{};,:.([+-*/=<>&|?)!%^~";
-                    if (CodeEditor.InSet(endOk, lastCh)) { needsSemi = false; }
-                    if (firstCh == "/" || firstCh == "*" || firstCh == "#" || firstCh == "@") { needsSemi = false; }
-                    // Control / declaration headers that legitimately stand without ';'.
-                    if (CodeEditor.StartsWithP(tr, "class ") || CodeEditor.StartsWithP(tr, "struct ")
-                        || CodeEditor.StartsWithP(tr, "if ") || CodeEditor.StartsWithP(tr, "if(")
-                        || CodeEditor.StartsWithP(tr, "else") || CodeEditor.StartsWithP(tr, "while")
-                        || CodeEditor.StartsWithP(tr, "for") || CodeEditor.StartsWithP(tr, "foreach")
-                        || CodeEditor.StartsWithP(tr, "switch") || CodeEditor.StartsWithP(tr, "case ")
-                        || CodeEditor.StartsWithP(tr, "default") || CodeEditor.StartsWithP(tr, "do")
-                        || CodeEditor.StartsWithP(tr, "try") || CodeEditor.StartsWithP(tr, "catch")
-                        || CodeEditor.StartsWithP(tr, "finally") || CodeEditor.StartsWithP(tr, "namespace")
-                        || CodeEditor.StartsWithP(tr, "enum") || CodeEditor.StartsWithP(tr, "interface")
-                        || CodeEditor.StartsWithP(tr, "public") || CodeEditor.StartsWithP(tr, "private")
-                        || CodeEditor.StartsWithP(tr, "protected") || CodeEditor.StartsWithP(tr, "internal")
-                        || CodeEditor.StartsWithP(tr, "static") || CodeEditor.StartsWithP(tr, "void ")
-                        || CodeEditor.StartsWithP(tr, "abstract") || CodeEditor.StartsWithP(tr, "override")
-                        || CodeEditor.StartsWithP(tr, "virtual")) { needsSemi = false; }
-                    // Never flag the line the caret is currently on: it is
-                    // expected to be incomplete while the user is typing it.
-                    if (li == curLine) { needsSemi = false; }
-                    if (li != curLine && CodeEditor.StartsWithP(tr, "using ") && lastCh != ";") {
-                        errors.Add(new Diagnostic(li, "Missing ';' after using"));
-                        needsSemi = false;
-                    }
-                    // A following line that starts with a joining character means
-                    // this line is part of a multi-line expression (fluent chain,
-                    // continued operator) — don't flag it.
-                    if (needsSemi) {
-                        string nxt = "";
-                        int nj = li + 1;
-                        while (nj < lines.Count) {
-                            string ns = CodeEditor.LTrim(lines[nj]);
-                            if (ns.Length > 0 && ns.Substring(0, 1) != "/" && ns.Substring(0, 1) != "*") {
-                                nxt = ns; break;
-                            }
-                            nj = nj + 1;
-                        }
-                        if (nxt.Length > 0) {
-                            string joinSet = ".)+-*/=<>&|?:,]}";
-                            if (CodeEditor.InSet(joinSet, nxt.Substring(0, 1))) { needsSemi = false; }
-                        }
-                    }
-                    // The generic "missing semicolon" guess produced too many
-                    // false positives (multi-line calls, attributes, generics);
-                    // real, accurate diagnostics now come from the compiler after
-                    // Run/Build, so this heuristic is intentionally dropped.
-                    if (false && needsSemi) {
-                        errors.Add(new Diagnostic(li, "Missing ';' (or incomplete statement)"));
-                    }
+                // The only surviving heuristic here: a `using` directive that
+                // does not end in ';'. The generic "missing semicolon" guess
+                // produced too many false positives (multi-line calls,
+                // attributes, generics) and was already disabled; real
+                // diagnostics come from the compiler after Run/Build. Its
+                // keyword tests and forward line scan ran for every line of a
+                // pass that reruns whenever the caret changes line, so they go
+                // with it.
+                if (tr.Length >= 1 && li != curLine
+                    && CodeEditor.StartsWithP(tr, "using ")
+                    && tr.Substring(tr.Length - 1, 1) != ";") {
+                    errors.Add(new Diagnostic(li, "Missing ';' after using"));
                 }
             }
             li = li + 1;

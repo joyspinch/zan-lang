@@ -3,422 +3,110 @@ using Gui;
 
 namespace Gui.Widget;
 
-/// NaiveUI Button with icon+text composition.
-/// Types: default(0), primary(1), info(2), success(3), warning(4), error(5)
-/// Styles: solid(0), outline(1), text(2), dashed(3)
-/// Sizes: tiny(0), small(1), medium(2), large(3)
+/// A button. Its whole look is CSS, so a skin restyles it without a line of
+/// code here, and the code side is plain assignment -- no setter methods:
+///
+///     Button save = new Button { Text = "Save", Class = "primary small" };
+///     save.Click += () => { ... };
+///     save.Disabled = busy;
+///
+/// The recognised classes are just selectors a skin can define:
+///
+///     button                                      default
+///     .primary .info .success .warning .error     semantic type
+///     .outline .text .dashed                      fill treatment
+///     .secondary .ghost .specular .loading        modifiers
+///     .round .circle                              shape
+///     .tiny .small .medium .large                 size (height/font/padding)
+///
+/// `Style` resolves theme defaults -> skin rules -> hover/press states into one
+/// StyleBox, `BoxContent` paints that box with the icon and label in it, and
+/// `Ui.Activate` makes it clickable -- so this class only measures itself and
+/// raises Click.
 class Button : Control {
-    /// Bindable label: `btn.text = vm.title;` re-reads the model field every
-    /// frame (compiler-lowered Binding); `btn.text = "OK";` stores a constant.
-    Binding<string> text;
-    string icon;
-    int btnType;
-    int btnStyle;
-    int size;
-    bool disabled;
-    bool round;
-    bool circle;
-    bool block;
-    bool loading;
-    bool ghost;
-    bool secondary;
-    bool specular;
-    int customColor;
+    /// Bindable label: `btn.Text = vm.title;` re-reads the model field every
+    /// frame (compiler-lowered Binding); `btn.Text = "OK";` stores a constant.
+    Binding<string> Text;
+    string Icon;
+    bool Disabled;
     int wid;
     /// Fires on the frame the button is clicked (C#-style: `btn.Click += h;`).
+    /// Handlers run through the UI-thread dispatch queue (App.DrainPosts), so a
+    /// handler may rebuild the control tree, open a dialog or start a background
+    /// job without mutating the tree that is being painted right now.
     /// The common bundle (Enter/Leave/MouseDown/...) is inherited as Control.On.
     UiEvent Click;
 
-    /// Shared initialiser for both the immediate-mode factory (Create) and the
-    /// retained-mode constructor. Sets up the Control base (name = label, docks
-    /// to the top by default so an appended button auto-snaps) then the
-    /// button-specific state.
     void InitButton(string label) {
         this.InitControl(label, 1);
-        text = label;
-        icon = "";
-        btnType = 0;
-        btnStyle = 0;
-        size = 2;
-        disabled = false;
-        round = false;
-        circle = false;
-        block = false;
-        loading = false;
-        ghost = false;
-        secondary = false;
-        specular = false;
-        customColor = 0;
+        Text = label;
+        Icon = "";
+        Disabled = false;
         wid = WidgetId.Next();
         wiresOwnEvents = true;
         Click = UiEvent.Create();
     }
 
-    /// Retained-mode constructor: `Button save = new Button("Save");`
-    Button(string label) {
-        InitButton(label);
-    }
+    /// `new Button { Text = "Save", Class = "primary" }`
+    Button() { InitButton(""); }
 
-    static Button Create(string text) {
-        Button b = new Button(text);
-        return b;
-    }
-
-    static Button Primary(string text) {
-        Button b = Button.Create(text);
-        b.btnType = 1;
-        return b;
-    }
-
-    static Button WithIcon(string text, string iconName) {
-        Button b = Button.Create(text);
-        b.icon = iconName;
-        return b;
-    }
-
-    static Button IconOnly(string iconName) {
-        Button b = Button.Create("");
-        b.icon = iconName;
-        b.circle = true;
-        return b;
-    }
-
-    /// Static factories that fully configure a button without fluent chaining.
-    /// (zanc miscompiles chains of two+ instance calls, e.g. .SetType().Render(),
-    /// so prefer these over chained setters when calling Render on the result.)
-    static Button Typed(string text, int type) {
-        Button b = Button.Create(text);
-        b.btnType = type;
-        return b;
-    }
-
-    static Button Styled(string text, int type, int style) {
-        Button b = Button.Create(text);
-        b.btnType = type;
-        b.btnStyle = style;
-        return b;
-    }
-
-    static Button Round(string text, int type) {
-        Button b = Button.Create(text);
-        b.btnType = type;
-        b.round = true;
-        return b;
-    }
-
-    /// Secondary: a subtly tinted fill with type-colored text.
-    static Button Secondary(string text, int type) {
-        Button b = Button.Typed(text, type);
-        b.secondary = true;
-        return b;
-    }
-
-    /// Ghost: transparent fill with a type-colored border + text (reads on any
-    /// background).
-    static Button Ghost(string text, int type) {
-        Button b = Button.Typed(text, type);
-        b.ghost = true;
-        return b;
-    }
-
-    /// Specular: an opt-in luminous sheen - on hover a soft light follows the
-    /// cursor inside the button (reactbits "specular-button"). Clipped to the
-    /// button, so nothing spills onto neighbours.
-    static Button Specular(string text, int type) {
-        Button b = Button.Typed(text, type);
-        b.specular = true;
-        return b;
-    }
-
-    /// Enable/disable the specular sheen on an existing button.
-    void SetSpecular(bool v) {
-        specular = v;
-    }
-
-    /// Loading: shows an animated spinner and ignores clicks until cleared.
-    static Button Loading(string text, int type) {
-        Button b = Button.Typed(text, type);
-        b.loading = true;
-        return b;
-    }
-
-    /// Custom color: a solid button painted from an arbitrary ARGB base color.
-    static Button Colored(string text, int color) {
-        Button b = Button.Create(text);
-        b.customColor = color;
-        return b;
-    }
-
-    static Button IconTyped(string iconName, int type) {
-        Button b = Button.IconOnly(iconName);
-        b.btnType = type;
-        return b;
-    }
-
-    static Button IconTextTyped(string text, string iconName, int type) {
-        Button b = Button.WithIcon(text, iconName);
-        b.btnType = type;
-        return b;
-    }
-
-    Button SetType(int t) { btnType = t; return this; }
-    Button SetStyle(int s) { btnStyle = s; return this; }
-    Button SetSize(int s) { size = s; return this; }
-    Button SetDisabled(bool d) { disabled = d; return this; }
-    Button SetRound(bool r) { round = r; return this; }
-    Button SetCircle(bool c) { circle = c; return this; }
-    Button SetBlock(bool b) { block = b; return this; }
-    Button SetIcon(string i) { icon = i; return this; }
-    Button SetText(string s) { text = s; return this; }
+    /// `new Button("Save")` -- same thing with the label up front.
+    Button(string label) { InitButton(label); }
 
     /// Current label text (resolved through the binding).
     string Label() {
-        if (text == null) { return ""; }
-        return text.Get();
-    }
-    Button SetLoading(bool l) { loading = l; return this; }
-    Button SetGhost(bool g) { ghost = g; return this; }
-    Button SetSecondary(bool s) { secondary = s; return this; }
-    Button SetColor(int col) { customColor = col; return this; }
-
-    /// The button's semantic accent color for its type (default falls back to
-    /// the primary text color so tinted/ghost/text styles still read).
-    int TypeColor(Theme t) {
-        if (btnType == 1) { return t.primary; }
-        if (btnType == 2) { return t.info; }
-        if (btnType == 3) { return t.success; }
-        if (btnType == 4) { return t.warning; }
-        if (btnType == 5) { return t.error; }
-        return t.textPrimary;
+        if (Text == null) { return ""; }
+        return Text.Get();
     }
 
-    int GetHeight(Theme t) {
-        if (size == 0) { return t.heightTiny; }
-        if (size == 1) { return t.heightSmall; }
-        if (size == 3) { return t.heightLarge; }
-        return t.heightMedium;
+    /// The style this button resolves to right now (size, padding, colours).
+    StyleBox ResolvedStyle(App app) {
+        return Style.Full(app, "button", Class, name, Style.SNormal());
     }
 
-    int GetFontSize(Theme t) {
-        if (size == 0) { return t.fontSizeTiny; }
-        if (size == 1) { return t.fontSizeSmall; }
-        if (size == 3) { return t.fontSizeLarge; }
-        return t.fontSizeMedium;
+    /// Natural width with the resolved style applied, which is what Render lays
+    /// out with -- a strip that measures buttons this way never ellipsizes a
+    /// label it had room for.
+    int AutoWidth(App app) {
+        Theme t = app.theme;
+        StyleBox s = this.ResolvedStyle(app);
+        if (Style.Has(Class, "circle")) { return s.HeightOr(t.heightMedium); }
+        int fontPx = s.FontOr(t.fontSizeMedium);
+        return BoxContent.Width(Icon, this.Label(), "", fontPx, s.GapOr(t.gapSmall))
+            + s.PadLOr(t.paddingLarge) + s.PadROr(t.paddingLarge);
     }
 
-    /// Horizontal inner padding per size. Auto-sized buttons reserve this on
-    /// each side of the icon/text so short labels never read as cramped.
-    int GetHPad(Theme t) {
-        if (size == 0) { return t.paddingSmall; }
-        if (size == 1) { return t.paddingMedium; }
-        if (size == 3) { return t.paddingLarge + t.gapSmall; }
-        return t.paddingLarge;
-    }
-
-    /// Natural width: text + icon + horizontal padding, matching Render's
-    /// auto-sizing when w <= 0. Lets layouts avoid widths that ellipsize.
-    int GetAutoWidth(Theme t) {
-        int fontSize = GetFontSize(t);
-        string label = Label();
-        int textW = 0;
-        if (label != "") { textW = Canvas.MeasureText(label, fontSize); }
-        int iconW = 0;
-        if (icon != "") { iconW = fontSize * 4 / 3 + t.gapSmall; }
-        int w = textW + iconW + this.GetHPad(t) * 2;
-        if (circle) { w = GetHeight(t); }
-        return w;
-    }
-
-    /// The CSS class list this button matches: its type (`primary`, `error`,
-    /// ...), style (`outline`, `text`, `dashed`), modifier variants and whatever
-    /// the app set through `Control.Style(...)`. This is what lets a skin restyle
-    /// buttons without a line of code here.
-    string Classes() {
-        string cls = "";
-        if (btnType == 1) { cls = "primary"; }
-        else if (btnType == 2) { cls = "info"; }
-        else if (btnType == 3) { cls = "success"; }
-        else if (btnType == 4) { cls = "warning"; }
-        else if (btnType == 5) { cls = "error"; }
-        if (btnStyle == 1) { cls = cls + " outline"; }
-        else if (btnStyle == 2) { cls = cls + " text"; }
-        else if (btnStyle == 3) { cls = cls + " dashed"; }
-        if (ghost) { cls = cls + " ghost"; }
-        if (secondary) { cls = cls + " secondary"; }
-        if (round) { cls = cls + " round"; }
-        if (circle) { cls = cls + " circle"; }
-        if (block) { cls = cls + " block"; }
-        if (loading) { cls = cls + " loading"; }
-        if (styleClass != "") { cls = cls + " " + styleClass; }
-        return cls;
+    /// Height from the resolved size class.
+    int AutoHeight(App app) {
+        return this.ResolvedStyle(app).HeightOr(app.theme.heightMedium);
     }
 
     int Render(App app, int x, int y, int w) {
-        int id = wid;
-        Canvas c = app.canvas;
-        Theme t = app.theme;
-
-        bool pressed = app.focus.IsPressed(id);
+        bool busy = Style.Has(Class, "loading");
         // One resolve for the whole look: theme defaults for the button's
         // classes, the skin's `button…` rules on top, then the hover/press/focus
         // states cross-faded by the resolved `transition`.
-        StyleBox s = this.ResolveEasedStyleAs(app, id, "button", this.Classes(),
-                                                   disabled, false);
-        if (customColor != 0 && !disabled) {
-            // A custom base colour keeps its eased hover/press shading: lighten
-            // on hover, darken while pressed.
-            int hvc = Ui.HoverLevelMs(app, id, s.TransitionOr(t.animFastMs));
-            int pvc = Ui.PressLevelMs(app, id, s.TransitionOr(t.animFastMs));
-            int col = App.LerpColor(customColor,
-                                   App.LerpColor(customColor, 4294967295, 150), hvc);
-            col = App.LerpColor(col,
-                               App.LerpColor(customColor, 4278190080, 150), pvc);
-            s.bg = col;
-            s.bgTo = 0;
-            s.fg = t.textInverse;
-            s.borderColor = col;
-        }
-
-        int h = s.HeightOr(GetHeight(t));
-        int fontSize = s.FontOr(GetFontSize(t));
-        int radius = s.RadiusOr(t.borderRadiusMedium);
-        if (round || circle) { radius = h / 2; }
-        if (styleRadius != 0) { radius = styleRadius; }
-        s.SetRadius(radius);
-        int hpad = s.PadLOr(this.GetHPad(t));
-
-        string label = Label();
-        if (w <= 0) {
-            int textW = 0;
-            if (label != "") { textW = Canvas.MeasureText(label, fontSize); }
-            int iconW = 0;
-            if (icon != "") { iconW = fontSize * 4 / 3 + t.gapSmall; }
-            w = textW + iconW + hpad + s.PadROr(this.GetHPad(t));
-            if (circle) { w = h; }
-        }
-        if (block) { w = app.canvas.Width() - x * 2; }
+        StyleBox s = this.ResolveEasedStyleAs(app, wid, "button", Class,
+                                              Disabled, false);
+        s.SetRadius(s.RadiusOr(app.theme.borderRadiusMedium));
+        if (styleRadius != 0) { s.SetRadius(styleRadius); }
+        if (w <= 0) { w = this.AutoWidth(app); }
         w = s.ClampW(w);
-        h = s.ClampH(h);
-
-        // Neumorphism draws its raised/inset pair behind the fill; the offset
-        // shadow of brutalist skins comes from the resolved box itself.
-        if (t.neu == 1 && !disabled) {
-            int noff = app.Scale(4);
-            int lite = App.LerpColor(t.bgPrimary, 4294967295, 70);
-            int dark = App.LerpColor(t.bgPrimary, 4278190080, 45);
-            if (pressed) {
-                c.FillRoundRect(x - noff, y - noff, w, h, radius, dark);
-                c.FillRoundRect(x + noff, y + noff, w, h, radius, lite);
-            } else {
-                c.FillRoundRect(x - noff, y - noff, w, h, radius, lite);
-                c.FillRoundRect(x + noff, y + noff, w, h, radius, dark);
-            }
+        int h = s.ClampH(s.HeightOr(app.theme.heightMedium));
+        BoxContent.Paint(app, wid, "button", Class, name, s, x, y, w, h,
+                         Icon, this.Label(), "", busy, Disabled);
+        if (Disabled || busy) { return wid; }
+        if (Ui.Activate(app, wid, x, y, w, h)) {
+            Click.Post();
+            // Wake the loop so the queued handler runs on the next iteration
+            // even if no further OS event arrives.
+            app.window.Wake();
         }
-
-        int bob = s.FloatOffset(app);
-        s.Paint(app, x, y + bob, w, h);
-        y = y + bob;
-        int bgColor = s.BgOr(t.bgPrimary);
-        int fgColor = s.FgOr(t.textPrimary);
-        int borderColor = s.BorderOr(bgColor);
-
-        // A dashed style keeps a real dashed edge (the renderer has no dash
-        // pattern, so the sides are stepped by hand over the painted box).
-        if (btnStyle == 3) {
-            int dl = app.Scale(6);
-            int dstep = dl + app.Scale(4);
-            if (dstep < 1) { dstep = 1; }
-            int hx = x;
-            while (hx < x + w) {
-                int seg = dl;
-                if (hx + seg > x + w) { seg = x + w - hx; }
-                c.FillRect(hx, y, seg, 1, borderColor);
-                c.FillRect(hx, y + h - 1, seg, 1, borderColor);
-                hx = hx + dstep;
-            }
-            int vy = y;
-            while (vy < y + h) {
-                int seg = dl;
-                if (vy + seg > y + h) { seg = y + h - vy; }
-                c.FillRect(x, vy, 1, seg, borderColor);
-                c.FillRect(x + w - 1, vy, 1, seg, borderColor);
-                vy = vy + dstep;
-            }
-        }
-
-        // Click ripple over the fill (skip the no-fill text style so a bare
-        // text button doesn't flash a disc on a transparent background).
-        if (!disabled && !loading && btnStyle != 2) {
-            Ui.Ripple(app, id, x, y, w, h, App.LerpColor(bgColor, 4294967295, 320));
-        }
-
-        // Opt-in specular sheen: two small symmetric arcs of light on the
-        // border track the cursor and ease in on hover, clipped to the button
-        // so nothing spills onto neighbours or the label (reactbits
-        // "specular-button").
-        if (specular && !disabled && !loading) {
-            Fx.Specular(app, id, x, y, w, h, radius, 4294967295);
-        }
-
-        // Content (icon/spinner + text), centered. Button glyphs read ~1.33x
-        // the text size (NaiveUI proportion) so icon buttons don't look small.
-        int contentW = 0;
-        StyleBox iconStyle = this.ResolveEasedPartAs(app, id, "button", "icon", "",
-                                                     this.Classes(), disabled, false);
-        StyleBox labelStyle = this.ResolveEasedPartAs(app, id, "button", "label", "",
-                                                      this.Classes(), disabled, false);
-        StyleBox spinnerStyle = this.ResolveEasedPartAs(app, id, "button", "spinner", "",
-                                                        this.Classes(), disabled, false);
-        int labelFont = labelStyle.FontOr(fontSize);
-        int iconSize = iconStyle.FontOr(fontSize * 4 / 3);
-        bool lead = loading || icon != "";
-        if (lead) { contentW = contentW + iconSize; }
-        if (lead && label != "") { contentW = contentW + t.gapSmall; }
-        if (label != "") { contentW = contentW + Canvas.MeasureText(label, labelFont); }
-
-        int cx = x + (w - contentW) / 2;
-        int iconY = y + (h - iconSize) / 2;
-        if (loading) {
-            c.PushClip(x, y, w, h);
-            Spin.Render(app, cx + iconSize / 2, y + h / 2, iconSize / 2,
-                        spinnerStyle.FgOr(fgColor));
-            c.PopClip();
-            cx = cx + iconSize + t.gapSmall;
-        } else if (icon != "") {
-            Icon.Draw(c, icon, cx, iconY, iconSize, iconStyle.FgOr(fgColor));
-            cx = cx + iconSize + t.gapSmall;
-        }
-        if (label != "") {
-            int textY = y + (h - Canvas.FontHeight(labelFont)) / 2;
-            c.DrawText(cx, textY, label, labelStyle.FgOr(fgColor), labelFont);
-        }
-
-        if (!disabled && !loading) {
-            app.hitTester.Register(HitRegion.Create(id, x, y, w, h, 0));
-            app.focus.RegisterFocusable(id);
-            bool fire = Ui.Clicked(app, id);
-            // Keyboard activation: Enter/Space on the focused button.
-            if (Ui.Focused(app, id) && app.window.EventKind() == 4) {
-                int kc = app.window.EventKeyCode();
-                if (kc == 13 || kc == 32) { fire = true; app.RequestRedraw(); }
-            }
-            Click.RaiseIf(fire);
-            On.Fire(app, id);
-        }
-        return id;
+        On.Fire(app, wid);
+        return wid;
     }
 
-    static bool WasClicked(App app, int id) {
-        // Use the click target resolved once per event against the PREVIOUS
-        // frame's complete hit regions (top-most wins), not a live HitTest
-        // against the partially-registered current frame. A live test would
-        // let a button see its own click before an overlay/blocker registered
-        // later in the same frame (loading mask, layer, modal scrim) could
-        // swallow it -- the pointer "passed through" the mask.
-        return Ui.Clicked(app, id);
-    }
-
-    // --- Designer / serialization model ---
+    // ---- designer / serialization model -------------------------------------
 
     override string Kind() { return "Button"; }
 
@@ -426,44 +114,33 @@ class Button : Control {
         List<PropSpec> ps = new List<PropSpec>();
         ps.Add(PropSpec.Text("text", "Text"));
         ps.Add(PropSpec.Text("icon", "Icon"));
-        PropSpec ty = PropSpec.Enum("type", "Type", new List<string>());
-        ty.Option("default"); ty.Option("primary"); ty.Option("info");
-        ty.Option("success"); ty.Option("warning"); ty.Option("error");
-        ps.Add(ty);
-        PropSpec st = PropSpec.Enum("style", "Style", new List<string>());
-        st.Option("solid"); st.Option("outline"); st.Option("text"); st.Option("dashed");
-        ps.Add(st);
         ps.Add(PropSpec.Bool("disabled", "Disabled"));
-        ps.Add(PropSpec.Bool("round", "Round"));
-        ps.Add(PropSpec.Bool("secondary", "Secondary"));
-        ps.Add(PropSpec.Bool("ghost", "Ghost"));
-        ps.Add(PropSpec.Bool("loading", "Loading"));
+        // Everything visual is a class: `primary small round ghost loading`,
+        // or whatever the skin's CSS defines.
+        ps.Add(PropSpec.Text("class", "Classes"));
         return ps;
     }
 
     override string GetProp(string key) {
-        if (key == "text") { return Label(); }
-        if (key == "icon") { return icon; }
-        if (key == "type") { return Convert.ToString(btnType); }
-        if (key == "style") { return Convert.ToString(btnStyle); }
-        if (key == "disabled") { if (disabled) { return "true"; } return "false"; }
-        if (key == "round") { if (round) { return "true"; } return "false"; }
-        if (key == "secondary") { if (secondary) { return "true"; } return "false"; }
-        if (key == "ghost") { if (ghost) { return "true"; } return "false"; }
-        if (key == "loading") { if (loading) { return "true"; } return "false"; }
+        if (key == "text") { return this.Label(); }
+        if (key == "icon") { return Icon; }
+        if (key == "class") { return Class; }
+        if (key == "disabled") {
+            if (Disabled) { return "true"; }
+            return "false";
+        }
         return "";
     }
 
     override void SetProp(string key, string val) {
-        if (key == "text") { text = val; name = val; }
-        else if (key == "icon") { icon = val; }
-        else if (key == "type") { btnType = Convert.ToInt32(val); }
-        else if (key == "style") { btnStyle = Convert.ToInt32(val); }
-        else if (key == "disabled") { disabled = (val == "true"); }
-        else if (key == "round") { round = (val == "true"); }
-        else if (key == "secondary") { secondary = (val == "true"); }
-        else if (key == "ghost") { ghost = (val == "true"); }
-        else if (key == "loading") { loading = (val == "true"); }
+        if (key == "text") { Text = val; name = val; }
+        else if (key == "icon") { Icon = val; }
+        else if (key == "class") { Class = val; }
+        else if (key == "disabled") { Disabled = (val == "true"); }
+        // Anything else a document stores is a variant class, either as a flag
+        // (`"round": true`) or as a name (`"size": "small"`).
+        else if (val == "true") { Class = Class + " " + key; }
+        else if (val != "" && val != "false") { Class = Class + " " + val; }
     }
 
     override List<string> Events() {
@@ -472,28 +149,16 @@ class Button : Control {
         return e;
     }
 
-    // --- Retained-mode hooks (Control) ---
+    // ---- retained-mode hooks (Control) --------------------------------------
 
-    /// Preferred size from the theme + content, so docking/auto-layout can size
-    /// the button without hand-computed coordinates.
+    /// Preferred size from the resolved style + content, so docking/auto-layout
+    /// can size the button without hand-computed coordinates.
     override void OnMeasure(App app) {
-        Theme t = app.theme;
-        StyleBox s = this.ResolveStyleAs(app, "button", this.Classes(), Style.SNormal());
-        int fontSize = s.FontOr(GetFontSize(t));
-        prefH = s.HeightOr(GetHeight(t));
-        string label = Label();
-        int textW = 0;
-        if (label != "") { textW = Canvas.MeasureText(label, fontSize); }
-        int iconW = 0;
-        if (icon != "") { iconW = fontSize * 4 / 3 + t.gapSmall; }
-        int w = textW + iconW + s.PadLOr(this.GetHPad(t))
-            + s.PadROr(this.GetHPad(t));
-        if (circle) { w = prefH; }
-        prefW = s.WidthOr(w);
+        StyleBox s = this.ResolveStyleAs(app, "button", Class, Style.SNormal());
+        prefH = s.HeightOr(app.theme.heightMedium);
+        prefW = s.WidthOr(this.AutoWidth(app));
     }
 
-    /// Retained paint reuses the immediate renderer at the resolved bounds, so
-    /// drawing, hit-testing and the Click event all stay in one place.
     override void OnPaint(App app) {
         this.Render(app, bx, by, bw);
     }

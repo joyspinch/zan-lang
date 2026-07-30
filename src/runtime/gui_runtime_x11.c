@@ -229,10 +229,14 @@ static int x11_caption_hit(zan_lwin_t *lw, int x, int y) {
     if (top && right) return ZAN_NWMR_TOPRIGHT;
     if (bottom && left) return ZAN_NWMR_BOTTOMLEFT;
     if (bottom && right) return ZAN_NWMR_BOTTOMRIGHT;
-    if (left) return ZAN_NWMR_LEFT;
-    if (right) return ZAN_NWMR_RIGHT;
-    if (top) return ZAN_NWMR_TOP;
-    if (bottom) return ZAN_NWMR_BOTTOM;
+    /* Corners first, then let a control drawn flush with the edge (a scrollbar
+     * in the last few pixels) keep its own presses. */
+    if (!zan_gui_in_hit_guard((iptr)lw->xid, x, y)) {
+        if (left) return ZAN_NWMR_LEFT;
+        if (right) return ZAN_NWMR_RIGHT;
+        if (top) return ZAN_NWMR_TOP;
+        if (bottom) return ZAN_NWMR_BOTTOM;
+    }
     if (inCaptionDrag) return ZAN_NWMR_MOVE;
     return -1;
 }

@@ -1872,6 +1872,44 @@ binding_lowered:
                     }
                 }
             }
+            /* Robustness: `obj.name = v` where obj's class (or its base chain)
+             * has no member of that name: nothing is stored, silently. A
+             * dropped field then looks like a working assignment while the
+             * value is lost, so diagnose it like the missing-method case. */
+            {
+                zan_symbol_t *acls = expr_class_sym(g, obj_expr, locals);
+                if (!acls && obj_expr->kind == AST_IDENTIFIER &&
+                    !local_find(locals, obj_expr->ident.name)) {
+                    zan_symbol_t *ts = zan_binder_lookup(g->binder,
+                                                         obj_expr->ident.name);
+                    if (ts && (ts->kind == SYM_CLASS || ts->kind == SYM_STRUCT))
+                        acls = ts;
+                }
+                if (acls && (acls->kind == SYM_CLASS || acls->kind == SYM_STRUCT)) {
+                    zan_istr_t an = expr->binary.left->member.name;
+                    int afound = 0;
+                    zan_symbol_t *acur = acls;
+                    while (acur && !afound) {
+                        for (int ami = 0; ami < acur->member_count; ami++) {
+                            zan_symbol_t *am = acur->members[ami];
+                            if (am && am->name.len == an.len &&
+                                memcmp(am->name.str, an.str, an.len) == 0) {
+                                afound = 1;
+                                break;
+                            }
+                        }
+                        zan_symbol_t *abase = (acur->type && acur->type->base_type)
+                            ? acur->type->base_type->sym : NULL;
+                        acur = (abase && abase != acur) ? abase : NULL;
+                    }
+                    if (!afound) {
+                        zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+                            "'%.*s' has no member '%.*s'",
+                            (int)acls->name.len, acls->name.str,
+                            (int)an.len, an.str);
+                    }
+                }
+            }
         }
         return right;
     return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
@@ -2956,8 +2994,25 @@ static LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                      * user generic class, prefer the specialized constructor so
                      * the body runs with the instantiation context. */
                     zan_type_t *new_inst = resolve_type_ctx(g, expr->new_expr.type);
+                    /* An object initializer (`new T(a) { Field = v, ... }`) is
+                     * parsed with the field writes appended to the arg list.
+                     * Split them off the tail so construction still resolves
+                     * and runs the constructor for the positional args alone,
+                     * and the field writes are applied to the built object. */
+                    int init_start = expr->new_expr.args.count;
+                    while (init_start > 0) {
+                        zan_ast_node_t *a =
+                            expr->new_expr.args.items[init_start - 1];
+                        if (a->kind != AST_ASSIGNMENT ||
+                            a->binary.left->kind != AST_IDENTIFIER ||
+                            get_field_index(sym, a->binary.left->ident.name) < 0)
+                            break;
+                        init_start--;
+                    }
+                    zan_ast_list_t ctor_arg_list = expr->new_expr.args;
+                    ctor_arg_list.count = init_start;
                     struct zan_ctor_entry *ctor = find_ctor(
-                        g, sym, &expr->new_expr.args, locals, NULL);
+                        g, sym, &ctor_arg_list, locals, NULL);
                     LLVMValueRef ctor_fn = NULL;
                     LLVMTypeRef ctor_ft = NULL;
                     if (ctor && new_inst && new_inst->type_arg_count > 0)
@@ -2970,7 +3025,7 @@ static LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                         ctor_ft = ctor->fn_type;
                     }
                     if (ctor_fn) {
-                        int argc = expr->new_expr.args.count + 1;
+                        int argc = ctor_arg_list.count + 1;
                         LLVMValueRef *call_args = (LLVMValueRef *)calloc((size_t)argc, sizeof(LLVMValueRef));
                         call_args[0] = alloca; /* this ptr */
                         /* the fresh object must survive a throwing ctor (or a
@@ -2981,7 +3036,7 @@ static LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                             emit_eh_tmp_push(g, alloca);
                             obj_eh_pushed = 1;
                         }
-                        for (int k = 0; k < expr->new_expr.args.count; k++) {
+                        for (int k = 0; k < ctor_arg_list.count; k++) {
                             zan_ast_node_t *param =
                                 ctor->decl->method_decl.params.items[k];
                             zan_type_t *pt = zan_binder_resolve_type(
@@ -2992,7 +3047,7 @@ static LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                         coerce_args_to_params(g, ctor_ft, call_args, argc);
                         zan_call2(g->builder, ctor_ft, ctor_fn, call_args, (unsigned)argc, "");
                         if (obj_eh_pushed) emit_eh_tmp_pop(g);
-                        for (int k = 0; k < expr->new_expr.args.count; k++) {
+                        for (int k = 0; k < ctor_arg_list.count; k++) {
                             emit_release_owned_call_temp(g, expr->new_expr.args.items[k],
                                 call_args[k + 1], locals);
                         }
@@ -3009,16 +3064,29 @@ static LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                         if (fields_eh_pushed) emit_eh_tmp_pop(g);
                     }
 
-                    /* if no constructor, handle field initializers */
-                    if (g->ctor_count == 0 || 1) {
-                        for (int i = 0; i < expr->new_expr.args.count; i++) {
+                    /* object-initializer field writes, after construction */
+                    {
+                        for (int i = init_start; i < expr->new_expr.args.count; i++) {
                             zan_ast_node_t *arg = expr->new_expr.args.items[i];
                             if (arg->kind == AST_ASSIGNMENT && arg->binary.left->kind == AST_IDENTIFIER) {
                                 int fi = get_field_index(sym, arg->binary.left->ident.name);
                                 if (fi >= 0) {
                                     LLVMValueRef fptr = emit_field_ptr(g, sym, st, alloca, fi, "finit");
                                     zan_symbol_t *fsym = get_field_sym(sym, arg->binary.left->ident.name);
-                                    LLVMValueRef fval =
+                                    /* `Binding<T> Field = <T expr>` is the same
+                                     * sugar as in a plain assignment: wrap the
+                                     * value in a binding instead of storing a
+                                     * raw T where a Binding is expected. */
+                                    int fval_owned = 0;
+                                    LLVMValueRef fval = NULL;
+                                    if (fsym && fsym->type && type_is_binding(fsym->type) &&
+                                        !type_is_binding(infer_expr_type(g, arg->binary.right, locals))) {
+                                        fval = emit_binding_value(g, fsym->type,
+                                                                  arg->binary.right, locals);
+                                        if (fval) fval_owned = 1;
+                                    }
+                                    if (!fval)
+                                        fval =
                                         (fsym && fsym->type && fsym->type->kind == TYPE_DELEGATE &&
                                          arg->binary.right->kind == AST_LAMBDA)
                                             ? emit_lambda_typed(g, arg->binary.right, fsym->type, locals)
@@ -3034,6 +3102,7 @@ static LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                                     /* ARC: retain a borrowed RC value captured into the
                                      * field so it survives release of any source local. */
                                     if (fsym && fsym->type && is_rc_managed_type(fsym->type) &&
+                                        !fval_owned &&
                                         !expr_yields_owned_ref(arg->binary.right)) {
                                         emit_rc_retain_for_type(g, fsym->type, fval);
                                     }

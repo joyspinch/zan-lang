@@ -3,10 +3,211 @@ using Gui;
 
 namespace Gui.Widget;
 
+/// One row of a ListView: an optional leading chip, the row text and an
+/// optional right-aligned trailing text. Every label and colour is supplied by
+/// the caller, so the widget stays free of any knowledge of what it lists.
+/// A colour of 0 means "use the theme's default for that slot"; the chip is a
+/// Tag, so it follows the theme's semantic variants.
+class ListRow {
+    string chip;
+    string chipKind;    // Tag kind ("" neutral, "info", "warning", ...)
+    string text;
+    int textColor;
+    string trailing;
+    int trailingColor;
+    bool header;        // a non-selectable section caption row
+    string avatar;      // leading Avatar initial(s), "" for none
+    string sub;         // second line under the text ("" = single-line row)
+    string action;      // hover-only trailing icon action ("" = none)
+    bool plain;         // no divider above the row (borderless list look)
+
+    static ListRow Create(string text) {
+        ListRow r = new ListRow();
+        r.chip = "";
+        r.chipKind = "";
+        r.text = text;
+        r.textColor = 0;
+        r.trailing = "";
+        r.trailingColor = 0;
+        r.header = false;
+        r.avatar = "";
+        r.sub = "";
+        r.action = "";
+        r.plain = false;
+        return r;
+    }
+
+    /// Leading chip, drawn as a Tag of the given variant.
+    ListRow Chip(string label, int variant) {
+        chip = label; chipKind = Style.TypeClass(variant);
+        return this;
+    }
+
+    /// Leading chip carrying a semantic kind ("info", "warning", "error", ...);
+    /// the style layer owns what that looks like.
+    ListRow ChipKind(string label, string kind) {
+        chip = label; chipKind = kind;
+        return this;
+    }
+
+    ListRow Trailing(string s, int color) {
+        trailing = s; trailingColor = color;
+        return this;
+    }
+
+    ListRow Color(int c) { textColor = c; return this; }
+
+    /// Leading round avatar built from the given initial(s).
+    ListRow WithAvatar(string initial) { avatar = initial; return this; }
+
+    /// Secondary line under the main text (makes the row two-line).
+    ListRow Sub(string s) { sub = s; return this; }
+
+    /// A trailing icon button revealed on hover (e.g. "close" to remove the
+    /// row); clicking it reports the row through ListState.actioned instead of
+    /// selecting it.
+    ListRow Action(string iconName) { action = iconName; return this; }
+
+    /// Drops the divider above this row, for lists drawn inside a card.
+    ListRow Plain() { plain = true; return this; }
+
+    /// Marks the row as a section caption: muted, not hoverable, not selectable.
+    ListRow AsHeader() { header = true; return this; }
+}
+
+/// Scroll and selection state of a ListView. The caller owns it so the list
+/// keeps its position across frames, and reads back what the user did this
+/// frame from `clicked` / `activated`.
+class ListState {
+    SignalInt scroll;   // pixel offset of the first visible row
+    int selected;       // selected row, -1 for none
+    int clicked;        // row clicked this frame, -1 for none
+    int activated;      // row clicked while already selected, -1 for none
+    int actioned;       // row whose trailing action was clicked, -1 for none
+    int contextRow;     // row right-clicked this frame, -1 for none
+    int hovered;        // row under the pointer, -1 for none
+    bool flat;          // draw without the container surface and border
+
+    // Events, so a caller never has to poll the fields above or hit-test
+    // rows itself. Each is raised from inside RenderRows (UI thread) after
+    // the corresponding field has been updated.
+    UiEvent RowClick;          // a row was clicked (read `clicked`)
+    UiEvent RowActivated;      // a selected row was clicked again (`activated`)
+    UiEvent RowAction;         // a row's trailing action was clicked (`actioned`)
+    UiEvent RowContext;        // a row was right-clicked (read `contextRow`)
+    UiEvent SelectionChanged;  // `selected` changed (read `selected`)
+    UiEvent HoverChanged;      // `hovered` changed (read `hovered`)
+    UiEvent Scrolled;          // the scroll offset changed (read `scroll`)
+
+    /// A list drawn straight onto its host surface (inside a Card or Panel).
+    static ListState CreateFlat() {
+        ListState s = ListState.Create();
+        s.flat = true;
+        return s;
+    }
+
+    static ListState Create() {
+        ListState s = new ListState();
+        s.scroll = SignalInt.Create(0);
+        s.selected = 0 - 1;
+        s.clicked = 0 - 1;
+        s.activated = 0 - 1;
+        s.actioned = 0 - 1;
+        s.contextRow = 0 - 1;
+        s.hovered = 0 - 1;
+        s.flat = false;
+        s.RowClick = UiEvent.Create();
+        s.RowActivated = UiEvent.Create();
+        s.RowAction = UiEvent.Create();
+        s.RowContext = UiEvent.Create();
+        s.SelectionChanged = UiEvent.Create();
+        s.HoverChanged = UiEvent.Create();
+        s.Scrolled = UiEvent.Create();
+        return s;
+    }
+
+    void Reset() {
+        selected = 0 - 1;
+        scroll.Set(0);
+    }
+
+    /// Sets the selection programmatically and raises SelectionChanged when it
+    /// actually moved, so code paths that select a row behave like a click.
+    void Select(int row) {
+        if (selected == row) { return; }
+        selected = row;
+        SelectionChanged.Raise();
+    }
+}
+
+/// A list as a retained control: it owns its rows, its interaction state and
+/// its scroll offset, so a page adds it to a tree (`display: flex` / CSS sizing
+/// decides how big it is) and reads its events instead of laying rows out.
+///
+///   ListPanel projects = ListPanel.Create("recent");   // style class
+///   projects.SetRows(rows);
+///   projects.state.RowClick += OpenSelected;
+class ListPanel : Control {
+    List<ListRow> rows;
+    ListState state;
+    string emptyText;
+
+    static ListPanel Create(string cls) {
+        ListPanel p = new ListPanel();
+        p.InitControl("list", 5);
+        p.Class = cls;
+        p.rows = new List<ListRow>();
+        p.state = ListState.CreateFlat();
+        p.emptyText = "";
+        return p;
+    }
+
+    override string Kind() { return "ListPanel"; }
+
+    override string StyleType() { return "list"; }
+
+    /// Text centred in the panel while it has no rows ("" draws nothing).
+    ListPanel Empty(string text) {
+        emptyText = text;
+        return this;
+    }
+
+    void SetRows(List<ListRow> src) { rows = src; }
+
+    int Count() { return rows.Count; }
+
+    /// Natural height of the rows, so a list in a column layout can size itself
+    /// (CSS `height` / `flex` still wins when the sheet declares one).
+    override void OnMeasure(App app) {
+        prefH = ListView.RowsHeight(app, rows);
+    }
+
+    override void OnPaint(App app) {
+        ListView.RenderRows(app, bx, by, bw, bh, rows, state, emptyText);
+    }
+}
+
 /// Bordered list container (NaiveUI n-list) with divided rows.
 class ListView {
     static int RowHeight(App app) {
         return app.theme.heightLarge;
+    }
+
+    /// Row height for a list whose rows carry a secondary line.
+    static int RowHeightTwoLine(App app) {
+        return app.theme.heightLarge + Canvas.FontHeight(app.theme.fontSizeSmall);
+    }
+
+    /// The natural height of `rows` laid out by RenderRows.
+    static int RowsHeight(App app, List<ListRow> rows) {
+        int h = 0;
+        int i = 0;
+        while (i < rows.Count) {
+            if (rows[i].sub != "") { h = h + ListView.RowHeightTwoLine(app); }
+            else { h = h + ListView.RowHeight(app); }
+            i = i + 1;
+        }
+        return h;
     }
 
     static int Height(App app, int count) {
@@ -37,5 +238,194 @@ class ListView {
             i = i + 1;
         }
         c.PopClip();
+    }
+
+    /// Rect-taking form of <see cref="RenderRows"/>, for callers whose area came
+    /// from a layout (Stack / Split / Dock) instead of hand-computed coordinates.
+    static void RenderRowsIn(App app, Rect r, List<ListRow> rows, ListState st,
+                             string emptyText) {
+        ListView.RenderRows(app, r.x, r.y, r.width, r.height, rows, st, emptyText);
+    }
+
+    /// Scrollable, selectable list of rich rows inside the rect x,y,w,h.
+    /// Hover and selection highlighting, wheel scrolling and a draggable
+    /// scrollbar are handled here; the caller only supplies the rows and reads
+    /// `st.clicked` / `st.activated` afterwards. `emptyText` is drawn centred
+    /// when there are no rows ("" draws nothing).
+    static void RenderRows(App app, int x, int y, int w, int h,
+                           List<ListRow> rows, ListState st, string emptyText) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        st.clicked = 0 - 1;
+        st.activated = 0 - 1;
+        st.actioned = 0 - 1;
+        st.contextRow = 0 - 1;
+        int scrollBefore = st.scroll.Get();
+        int hoverBefore = st.hovered;
+        st.hovered = 0 - 1;
+        if (w <= 0 || h <= 0) { return; }
+
+        bool twoLine = false;
+        int li = 0;
+        while (li < rows.Count) {
+            if (rows[li].sub != "") { twoLine = true; }
+            li = li + 1;
+        }
+        int rowH = ListView.RowHeight(app);
+        if (twoLine) { rowH = ListView.RowHeightTwoLine(app); }
+        int n = rows.Count;
+        int contentH = n * rowH;
+
+        if (!st.flat) {
+            c.SurfaceRoundRect(x, y, w, h, t.borderRadiusMedium, t.bgPrimary,
+                               t.borderSecondary, 1);
+        }
+        if (n == 0) {
+            if (emptyText != "") {
+                int tw = Canvas.MeasureText(emptyText, t.fontSizeSmall);
+                c.DrawText(x + (w - tw) / 2,
+                           y + (h - Canvas.FontHeight(t.fontSizeSmall)) / 2,
+                           emptyText, t.textSecondary, t.fontSizeSmall);
+            }
+            return;
+        }
+
+        Scrollbar.HandleWheel(app, x, y, w, h, contentH, st.scroll);
+        int maxOff = contentH - h;
+        if (maxOff < 0) { maxOff = 0; }
+        if (st.scroll.Get() > maxOff) { st.scroll.Set(maxOff); }
+        if (st.scroll.Get() < 0) { st.scroll.Set(0); }
+        int off = st.scroll.Get();
+
+        bool overflow = contentH > h;
+        int barW = app.Scale(10);
+        int rowW = w;
+        if (overflow) { rowW = w - barW; }
+
+        int first = off / rowH;
+        int last = (off + h) / rowH;
+        if (last >= n) { last = n - 1; }
+
+        bool click = app.ClickAvailable();
+        int pad = t.paddingMedium;
+        int gap = app.Scale(6);
+
+        c.PushClip(x, y, rowW, h);
+        int i = first;
+        while (i <= last) {
+            ListRow r = rows[i];
+            int ry = y + i * rowH - off;
+            if (r.header) {
+                c.DrawText(x + pad,
+                           ry + (rowH - Canvas.FontHeight(t.fontSizeTiny)) / 2,
+                           Ellipsis.Fit(r.text, rowW - pad * 2, t.fontSizeTiny),
+                           t.textTertiary, t.fontSizeTiny);
+                i = i + 1;
+                continue;
+            }
+            int id = app.focus.AllocId();
+            app.hitTester.Register(HitRegion.Create(id, x, ry, rowW, rowH, 0));
+            bool hovered = app.focus.IsHovered(id);
+            if (hovered) { st.hovered = i; }
+            if (i == st.selected) {
+                c.FillRect(x, ry, rowW, rowH, t.bgTertiary);
+            } else if (hovered) {
+                c.FillRect(x, ry, rowW, rowH, t.bgSecondary);
+            }
+            if (i > 0 && !r.plain) { c.FillRect(x, ry, rowW, 1, t.divider); }
+
+            int cx = x + pad;
+            if (r.avatar != "") {
+                int avSize = rowH - app.Scale(12);
+                Avatar.Render(app, cx, ry + (rowH - avSize) / 2, avSize, r.avatar);
+                cx = cx + avSize + gap;
+            }
+            if (r.chip != "") {
+                int chipW = Tag.Width(app, r.chip, r.chipKind);
+                Tag.Chip(app, cx, ry + (rowH - t.heightTiny) / 2,
+                         r.chip, r.chipKind);
+                cx = cx + chipW + gap;
+            }
+
+            int trailW = 0;
+            if (r.trailing != "") {
+                trailW = Canvas.MeasureText(r.trailing, t.fontSizeTiny) + gap;
+                int trailColor = r.trailingColor;
+                if (trailColor == 0) { trailColor = t.textTertiary; }
+                c.DrawText(x + rowW - pad - trailW + gap,
+                           ry + (rowH - Canvas.FontHeight(t.fontSizeTiny)) / 2,
+                           r.trailing, trailColor, t.fontSizeTiny);
+            }
+
+            // A hover-only trailing icon action, reserved before the text so
+            // long text never runs underneath it.
+            int actW = 0;
+            int actId = 0 - 1;
+            int actX = 0;
+            int actY = 0;
+            int actSize = app.Scale(20);
+            if (r.action != "") {
+                actW = actSize + gap;
+                actX = x + rowW - pad - actSize;
+                actY = ry + (rowH - actSize) / 2;
+                if (hovered) {
+                    actId = app.focus.AllocId();
+                    app.hitTester.Register(
+                        HitRegion.Create(actId, actX, actY, actSize, actSize, 0));
+                    bool actHov = app.focus.IsHovered(actId);
+                    int glyph = t.textSecondary;
+                    if (actHov) {
+                        Panel.ChromeSurface(app, actX, actY, actSize, actSize,
+                                            t.borderRadiusSmall, t.bgActive);
+                        glyph = t.textPrimary;
+                    }
+                    Icon.Draw(c, r.action, actX + app.Scale(4),
+                              actY + app.Scale(4), actSize - app.Scale(8), glyph);
+                }
+            }
+
+            int textColor = r.textColor;
+            if (textColor == 0) { textColor = t.textPrimary; }
+            int textW = x + rowW - pad - trailW - actW - cx;
+            int ty = ry + (rowH - Canvas.FontHeight(t.fontSizeSmall)) / 2;
+            if (r.sub != "") { ty = ry + app.Scale(6); }
+            c.DrawText(cx, ty, Ellipsis.Fit(r.text, textW, t.fontSizeSmall),
+                       textColor, t.fontSizeSmall);
+            if (r.sub != "") {
+                c.DrawText(cx, ty + Canvas.FontHeight(t.fontSizeSmall) + app.Scale(2),
+                           Ellipsis.Fit(r.sub, textW, t.fontSizeSmall),
+                           t.textSecondary, t.fontSizeSmall);
+            }
+
+            if (click && actId >= 0
+                && app.hitTester.HitTest(app.mouseX, app.mouseY) == actId) {
+                st.actioned = i;
+                st.RowAction.Raise();
+                app.RequestRedraw();
+            } else if (click && app.hitTester.HitTest(app.mouseX, app.mouseY) == id) {
+                bool wasSelected = (st.selected == i);
+                if (wasSelected) { st.activated = i; }
+                st.clicked = i;
+                st.selected = i;
+                st.RowClick.Raise();
+                if (wasSelected) { st.RowActivated.Raise(); }
+                else { st.SelectionChanged.Raise(); }
+                app.RequestRedraw();
+            } else if (app.EventKind() == 2 && app.window.EventButton() == 1
+                       && app.hitTester.HitTest(app.mouseX, app.mouseY) == id) {
+                st.contextRow = i;
+                st.RowContext.Raise();
+                app.RequestRedraw();
+            }
+            i = i + 1;
+        }
+        c.PopClip();
+
+        if (overflow) {
+            Scrollbar.RenderVerticalScroll(app, x + w - barW, y, h, h,
+                                           contentH, st.scroll);
+        }
+        if (st.scroll.Get() != scrollBefore) { st.Scrolled.Raise(); }
+        if (st.hovered != hoverBefore) { st.HoverChanged.Raise(); }
     }
 }

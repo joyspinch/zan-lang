@@ -48,6 +48,47 @@ class TreeNode {
     }
 }
 
+/// Optional event sink for a TreeView. Pass one to RenderEvents and the tree
+/// reports what the user did through events instead of the caller polling
+/// return values: node clicks, selection moves, expand/collapse, checkbox
+/// toggles and right-clicks. The `*Row` fields carry the node index of the
+/// event being raised.
+class TreeEvents {
+    int clickedRow;      // node clicked this frame, -1 for none
+    int contextRow;      // node right-clicked this frame, -1 for none
+    int toggledRow;      // directory expanded/collapsed this frame, -1 for none
+    int checkedRow;      // node whose checkbox toggled this frame, -1 for none
+
+    UiEvent NodeClick;
+    UiEvent SelectionChanged;
+    UiEvent NodeExpanded;
+    UiEvent NodeCollapsed;
+    UiEvent NodeContext;
+    UiEvent CheckChanged;
+
+    static TreeEvents Create() {
+        TreeEvents e = new TreeEvents();
+        e.clickedRow = 0 - 1;
+        e.contextRow = 0 - 1;
+        e.toggledRow = 0 - 1;
+        e.checkedRow = 0 - 1;
+        e.NodeClick = UiEvent.Create();
+        e.SelectionChanged = UiEvent.Create();
+        e.NodeExpanded = UiEvent.Create();
+        e.NodeCollapsed = UiEvent.Create();
+        e.NodeContext = UiEvent.Create();
+        e.CheckChanged = UiEvent.Create();
+        return e;
+    }
+
+    void BeginFrame() {
+        clickedRow = 0 - 1;
+        contextRow = 0 - 1;
+        toggledRow = 0 - 1;
+        checkedRow = 0 - 1;
+    }
+}
+
 /// <summary>
 /// A collapsible file tree built from a flat, pre-ordered `List<TreeNode>`. A
 /// node is hidden when any ancestor directory is collapsed. Clicking a
@@ -110,7 +151,25 @@ class TreeView {
     static int Render(App app, Rect area, List<TreeNode> nodes,
                       SignalInt selected, int scrollOffset) {
         return TreeView.RenderImpl(app, area, nodes, selected, scrollOffset,
-            false);
+            false, null);
+    }
+
+    /// Render with an event sink: identical drawing, but every interaction is
+    /// also reported through `ev` so the caller never inspects return codes or
+    /// diffs the node list itself.
+    static int RenderEvents(App app, Rect area, List<TreeNode> nodes,
+                            SignalInt selected, int scrollOffset,
+                            TreeEvents ev) {
+        return TreeView.RenderImpl(app, area, nodes, selected, scrollOffset,
+            false, ev);
+    }
+
+    /// RenderChecked with an event sink.
+    static int RenderCheckedEvents(App app, Rect area, List<TreeNode> nodes,
+                                   SignalInt selected, int scrollOffset,
+                                   TreeEvents ev) {
+        return TreeView.RenderImpl(app, area, nodes, selected, scrollOffset,
+            true, ev);
     }
 
     /// Same as Render but draws a selection checkbox in front of every row.
@@ -119,11 +178,13 @@ class TreeView {
     static int RenderChecked(App app, Rect area, List<TreeNode> nodes,
                              SignalInt selected, int scrollOffset) {
         return TreeView.RenderImpl(app, area, nodes, selected, scrollOffset,
-            true);
+            true, null);
     }
 
     static int RenderImpl(App app, Rect area, List<TreeNode> nodes,
-                          SignalInt selected, int scrollOffset, bool showChecks) {
+                          SignalInt selected, int scrollOffset, bool showChecks,
+                          TreeEvents ev) {
+        if (ev != null) { ev.BeginFrame(); }
         Canvas c = app.canvas;
         Theme t = app.theme;
         int rowH = TreeView.RowHeight(app);
@@ -178,25 +239,29 @@ class TreeView {
                         int by = rowY + (rowH - box) / 2;
                         int state = TreeView.CheckState(nodes, k);
                         int bd = t.borderPrimary;
-                        if (state == 1 || state == 2) {
+                        if (state == 2) {
+                            // Indeterminate is the tree's own state (some
+                            // descendants checked); the checked / empty boxes
+                            // come from Checkbox so they match everywhere.
                             c.FillRoundRect(bx, by, box, box, t.borderRadiusSmall, t.primary);
-                            if (state == 1) {
-                                Icon.DrawCenteredIn(c, "check", bx, by, box, box,
-                                    box - app.Scale(4), t.bgPrimary);
-                            } else {
-                                c.FillRect(bx + app.Scale(4), by + box / 2 - app.Scale(1),
-                                    box - app.Scale(8), app.Scale(2), t.bgPrimary);
-                            }
+                            c.FillRect(bx + app.Scale(4), by + box / 2 - app.Scale(1),
+                                box - app.Scale(8), app.Scale(2), t.bgPrimary);
                         } else {
-                            c.DrawRoundRect(bx, by, box, box, t.borderRadiusSmall, bd, 1);
+                            int lvl = 0;
+                            if (state == 1) { lvl = 1000; }
+                            Checkbox.PaintBox(app, bx, by, box, lvl, t.primary, bd);
                         }
                         // checkbox click toggles the node instead of selecting
-                        if (app.window.EventKind() == 3
+                        if (app.EventKind() == 3
                             && app.window.EventButton() == 0
                             && app.mouseX >= bx && app.mouseX < bx + box
                             && app.mouseY >= rowY && app.mouseY < rowY + rowH) {
                             TreeView.ToggleCheck(nodes, k);
                             checkClick = true;
+                            if (ev != null) {
+                                ev.checkedRow = k;
+                                ev.CheckChanged.Raise();
+                            }
                             app.RequestRedraw();
                         }
                     }
@@ -256,14 +321,25 @@ class TreeView {
             c.FillRect(barX, thumbY, barW, thumbH, t.textTertiary);
         }
 
-        if (!checkClick && app.window.EventKind() == 3
+        if (!checkClick && app.EventKind() == 3
             && app.window.EventButton() == 0) {
             int hit = app.ClickTarget();
             int idx = hit - firstId;
             if (idx >= 0 && idx < count) {
                 TreeNode n = nodes[idx];
+                bool moved = selected.Get() != idx;
                 selected.Set(idx);
                 if (n.isDir) { n.expanded = !n.expanded; }
+                if (ev != null) {
+                    ev.clickedRow = idx;
+                    ev.NodeClick.Raise();
+                    if (moved) { ev.SelectionChanged.Raise(); }
+                    if (n.isDir) {
+                        ev.toggledRow = idx;
+                        if (n.expanded) { ev.NodeExpanded.Raise(); }
+                        else { ev.NodeCollapsed.Raise(); }
+                    }
+                }
                 app.RequestRedraw();
             }
         }
@@ -271,16 +347,59 @@ class TreeView {
         // Right button pressed over a row -> select it and report the index so
         // the caller can raise a context menu at the cursor.
         int rightIdx = 0 - 1;
-        if (app.window.EventKind() == 2 && app.window.EventButton() == 1) {
+        if (app.EventKind() == 2 && app.window.EventButton() == 1) {
             int rhit = app.RightPressTarget();
             int ridx = rhit - firstId;
             if (ridx >= 0 && ridx < count) {
+                bool moved = selected.Get() != ridx;
                 selected.Set(ridx);
                 rightIdx = ridx;
+                if (ev != null) {
+                    ev.contextRow = ridx;
+                    if (moved) { ev.SelectionChanged.Raise(); }
+                    ev.NodeContext.Raise();
+                }
                 app.RequestRedraw();
             }
         }
         return rightIdx;
+    }
+
+    /// Makes the overlay scrollbar Render draws usable with the pointer: drag
+    /// the thumb, or click the track to jump there. Call right after Render
+    /// with the same area and node list, so the bar's hit region registers
+    /// above the row regions (which span the full width) and wins over them.
+    static void HandleScrollbar(App app, Rect area, List<TreeNode> nodes,
+                                SignalInt scroll) {
+        int contentH = TreeView.ContentHeight(app, nodes);
+        if (contentH <= area.height || area.height <= 0) { return; }
+        int id = app.focus.AllocId();
+        int barW = app.Scale(6);
+        // A grab margin on the content side: the bar is 6dp of window-edge
+        // pixels, too thin a target on its own.
+        int grab = app.Scale(6);
+        int barX = area.x + area.width - barW;
+        int maxScroll = contentH - area.height;
+        int thumbH = area.height * area.height / contentH;
+        int minThumb = app.Scale(24);
+        if (thumbH < minThumb) { thumbH = minThumb; }
+        if (thumbH > area.height) { thumbH = area.height; }
+        int travel = area.height - thumbH;
+        if (app.focus.IsPressed(id) && travel > 0) {
+            int rel = app.mouseY - area.y - thumbH / 2;
+            if (rel < 0) { rel = 0; }
+            if (rel > travel) { rel = travel; }
+            int off = rel * maxScroll / travel;
+            if (off != scroll.Get()) {
+                scroll.Set(off);
+                app.RequestRedraw();
+            }
+        }
+        app.hitTester.Register(
+            HitRegion.Create(id, barX - grab, area.y, barW + grab, area.height, 0));
+        // A tree docked to the right edge sits under the frame's resize grip,
+        // which answers the OS hit test first and would swallow every press.
+        app.ReserveEdgeHit(barX - grab, area.y, barW + grab, area.height);
     }
 
     /// Index of the last visible descendant of `idx` (exclusive upper bound is

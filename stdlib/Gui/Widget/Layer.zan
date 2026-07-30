@@ -42,6 +42,9 @@ class LayerState {
     bool twoButtons;     // confirm/prompt (OK+Cancel) vs alert (OK only)
     string okText;
     string cancelText;
+    // Optional third way out ("Don't save"), drawn left of Cancel and reported
+    // as action 4. "" for the usual two-button dialog.
+    string altText;
     Input promptInput;   // text field for kind 2 (null otherwise)
     int openMs;          // wall-clock ms the layer was opened (entrance anim)
 
@@ -74,6 +77,7 @@ class LayerState {
         s.twoButtons = true;
         s.okText = "OK";
         s.cancelText = "Cancel";
+        s.altText = "";
         s.promptInput = null;
         s.openMs = 0;
         return s;
@@ -87,6 +91,18 @@ class LayerState {
         s.modal = true;
         s.dtype = dtype;
         s.twoButtons = true;
+        return s;
+    }
+
+    /// A centered modal dialog offering three ways out -- the "save this, throw
+    /// it away, or stay where I am" question a closing editor has to ask. The
+    /// primary action reports 1, cancel (and the X) 2 / 3, the alternative 4.
+    static LayerState Choose(string title, string body, int dtype, string okText,
+                             string altText, string cancelText) {
+        LayerState s = LayerState.Confirm(title, body, dtype);
+        s.okText = okText;
+        s.altText = altText;
+        s.cancelText = cancelText;
         return s;
     }
 
@@ -166,6 +182,14 @@ class Layer {
         if (Layer.notifs == null) { Layer.notifs = new List<ToastItem>(); }
     }
 
+    /// Width of a dialog action button: its natural label width, never below
+    /// the standard dialog button width so a strip of them stays even.
+    static int ActionWidth(App app, Button b, int minW) {
+        int w = b.AutoWidth(app);
+        if (w < minW) { w = minW; }
+        return w;
+    }
+
     static int Clamp01(int v) {
         if (v < 0) { return 0; }
         if (v > 1000) { return 1000; }
@@ -185,8 +209,10 @@ class Layer {
 
     /// Fills an overlay panel body. Under a frosted-glass theme (and once the
     /// panel has settled, a >= 900) it blurs the backdrop behind the panel and
-    /// lays a translucent tint + a hairline top sheen over it; otherwise it is a
+    /// lays the themed tint over it; otherwise it is a
     /// plain (optionally fading) opaque fill. `a` is the permille fade alpha.
+    /// The tint is the surface colour only -- no white wash -- so the window
+    /// backdrop keeps its own hue instead of every pane reading as milk glass.
     static void GlassFill(App app, int x, int y, int w, int h,
                           int radius, int color, int a) {
         Canvas c = app.canvas;
@@ -198,37 +224,13 @@ class Layer {
             // light translucent frost over the live backdrop so the panel reads
             // as glass without turning into a dark opaque slab.
             c.FillRoundRect(x, y, w, h, radius, Layer.Fade(color, 300));
-            c.FillRoundRect(x, y, w, h, radius, Layer.Fade(t.textPrimary, 55));
-            c.FillRoundRect(x, y, w, app.Scale(2), radius,
-                            Layer.Fade(t.textPrimary, 150));
-            c.DrawRoundRect(x, y, w, h, radius, Layer.Fade(t.textPrimary, 120), 1);
         } else if (t.glass != 0 && a >= 900) {
-            // Frosted-glass skin (software faux glass, no OS backdrop): strong
-            // backdrop blur + a light translucent tint so the frosted wallpaper
-            // clearly shows through, plus a hairline top sheen and a soft rim.
+            // Frosted-glass skin (software faux glass, no OS backdrop): a
+            // backdrop blur plus the themed surface tint, so the wallpaper hue
+            // still reads through the pane. Only a hairline rim marks the edge.
             c.BlurRectCached(x, y, w, h, app.Scale(36),
                 app.NextBlurSlot(), app.BackdropDirty());
-            c.FillRoundRect(x, y, w, h, radius, Layer.Fade(color, 260));
-            c.FillRoundRect(x, y, w, h, radius, Layer.Fade(t.textPrimary, 40));
-            // Top-down light sheen (a few fading bands) so the pane reads as
-            // lit acrylic with depth instead of a flat frosted slab.
-            int bands = 5;
-            int bh = h / 4 / bands;
-            if (bh < 1) { bh = 1; }
-            int bi = 0;
-            while (bi < bands) {
-                c.FillRect(x + app.Scale(1), y + app.Scale(1) + bi * bh,
-                           w - app.Scale(2), bh,
-                           Layer.Fade(t.textPrimary, 70 - bi * 13));
-                bi = bi + 1;
-            }
-            // Specular rim: bright hairline on top, soft edge all around and a
-            // faint dark seat at the bottom so the pane visually floats.
-            c.FillRoundRect(x, y, w, app.Scale(2), radius,
-                            Layer.Fade(t.textPrimary, 220));
-            c.DrawRoundRect(x, y, w, h, radius, Layer.Fade(t.textPrimary, 110), 1);
-            c.FillRect(x + app.Scale(2), y + h - 1, w - app.Scale(4), 1,
-                       Layer.Fade(0, 180));
+            c.FillRoundRect(x, y, w, h, radius, Layer.Fade(color, 520));
         } else {
             c.FillRoundRect(x, y, w, h, radius, Layer.Fade(color, a));
         }
@@ -507,10 +509,10 @@ class Layer {
         int cancelX = okX - t.gapSmall - bw;
 
         int result = 0;
-        int cancelId = Button.Styled(cancelText, 1, 1).Render(app, cancelX, by, bw);
-        if (Button.WasClicked(app, cancelId)) { result = 2; }
-        int okId = Button.Primary(okText).Render(app, okX, by, bw);
-        if (Button.WasClicked(app, okId)) { result = 1; }
+        int cancelId = new Button { Text = cancelText, Class = "primary outline" }.Render(app, cancelX, by, bw);
+        if (Ui.Clicked(app, cancelId)) { result = 2; }
+        int okId = new Button { Text = okText, Class = "primary" }.Render(app, okX, by, bw);
+        if (Ui.Clicked(app, okId)) { result = 1; }
         return result;
     }
 
@@ -554,7 +556,7 @@ class Layer {
         c.FillRoundRect(bx, byy, bw, bw, bw / 2, chip);
         Icon.DrawCenteredIn(c, "close", bx, byy, bw, bw, t.iconSizeSmall, t.onScrim);
         app.hitTester.Register(HitRegion.Create(closeId, bx, byy, bw, bw, 0));
-        if (app.window.EventKind() == 3
+        if (app.EventKind() == 3
             && app.ClickTarget() == closeId) {
             return true;
         }
@@ -628,7 +630,7 @@ class Layer {
     /// any window raises it; only the top-most under the pointer (or the one
     /// being dragged) consumes mouse events.
     static void RenderStack(App app, List<LayerState> list) {
-        int ek = app.window.EventKind();
+        int ek = app.EventKind();
         int mx = app.mouseX;
         int my = app.mouseY;
 
@@ -695,7 +697,7 @@ class Layer {
 
         int mx = app.mouseX;
         int my = app.mouseY;
-        int ek = app.window.EventKind();
+        int ek = app.EventKind();
 
         int bw = Layer.BtnW(app);
         int closeX = ex + ew - bw;
@@ -841,10 +843,10 @@ class Layer {
                 int okX = ex + ew - pad - fbw;
                 int cancelX = okX - t.gapMedium - fbw;
                 int fby = fy + (footH - t.heightMedium) / 2;
-                int cancelId = Button.Styled(s.cancelText, 1, 1).Render(app, cancelX, fby, fbw);
-                if (Button.WasClicked(app, cancelId)) { s.action = 2; }
-                int okId = Button.Primary(s.okText).Render(app, okX, fby, fbw);
-                if (Button.WasClicked(app, okId)) { s.action = 1; }
+                int cancelId = new Button { Text = s.cancelText, Class = "primary outline" }.Render(app, cancelX, fby, fbw);
+                if (Ui.Clicked(app, cancelId)) { s.action = 2; }
+                int okId = new Button { Text = s.okText, Class = "primary" }.Render(app, okX, fby, fbw);
+                if (Ui.Clicked(app, okId)) { s.action = 1; }
             }
         }
     }
@@ -896,18 +898,47 @@ class Layer {
             s.promptInput.Render(app, x + pad, iy, w - pad * 2, t.heightMedium);
         }
 
-        int bw = app.Scale(88);
-        int gap = t.gapMedium;
+        // Right-aligned action strip: [alt] [cancel] [ok]. Each button keeps at
+        // least the standard dialog width but grows for a longer label, so a
+        // translated "Don't save" is never clipped.
         int by = y + h - t.heightMedium - pad;
-        int okX = x + w - pad - bw;
-        int cancelX = okX - gap - bw;
+        Button okBtn = new Button { Text = s.okText, Class = "primary" };
+        Button cancelBtn = new Button { Text = s.cancelText };
+        Button altBtn = null;
+        if (s.altText != "") { altBtn = new Button { Text = s.altText }; }
 
-        if (s.twoButtons) {
-            int cancelId = Button.Create(s.cancelText).Render(app, cancelX, by, bw);
-            if (Button.WasClicked(app, cancelId)) { s.action = 2; }
+        int minBw = app.Scale(88);
+        List<int> bws = new List<int>();
+        if (altBtn != null) { bws.Add(Layer.ActionWidth(app, altBtn, minBw)); }
+        if (s.twoButtons) { bws.Add(Layer.ActionWidth(app, cancelBtn, minBw)); }
+        bws.Add(Layer.ActionWidth(app, okBtn, minBw));
+
+        Stack actions = Stack.Row(x + pad, by, w - pad * 2, t.heightMedium);
+        actions.SetGap(t.gapMedium);
+        int strip = 0;
+        int bi = 0;
+        while (bi < bws.Count) {
+            strip = strip + bws[bi] + t.gapMedium;
+            bi = bi + 1;
         }
-        int okId = Button.Primary(s.okText).Render(app, okX, by, bw);
-        if (Button.WasClicked(app, okId)) { s.action = 1; }
+        actions.Space(actions.MainSize() - strip);
+        bi = 0;
+        if (altBtn != null) {
+            Rect altSlot = actions.Slot(bws[bi]);
+            int altId = altBtn.Render(app, altSlot.x, altSlot.y, altSlot.width);
+            if (Ui.Clicked(app, altId)) { s.action = 4; }
+            bi = bi + 1;
+        }
+        if (s.twoButtons) {
+            Rect cancelSlot = actions.Slot(bws[bi]);
+            int cancelId = cancelBtn.Render(app, cancelSlot.x, cancelSlot.y,
+                                            cancelSlot.width);
+            if (Ui.Clicked(app, cancelId)) { s.action = 2; }
+            bi = bi + 1;
+        }
+        Rect okSlot = actions.Slot(bws[bi]);
+        int okId = okBtn.Render(app, okSlot.x, okSlot.y, okSlot.width);
+        if (Ui.Clicked(app, okId)) { s.action = 1; }
 
         int closeId = app.focus.AllocId();
         int closeX = x + w - t.heightMedium;
@@ -920,7 +951,7 @@ class Layer {
                             t.heightMedium, t.iconSizeSmall, t.textSecondary);
         app.hitTester.Register(
             HitRegion.Create(closeId, closeX, closeY, t.heightMedium, t.heightMedium, 0));
-        if (app.window.EventKind() == 3
+        if (app.EventKind() == 3
             && app.ClickTarget() == closeId) {
             s.action = 3;
         }

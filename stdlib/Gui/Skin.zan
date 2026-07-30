@@ -96,14 +96,33 @@ class Skin {
     /// True when the pack was found on disk.
     bool IsLoaded() { return dir != ""; }
 
+    /// A new Theme built from this pack's `:root` tokens, or null when the pack
+    /// only carries rules. Callers own the result and may mutate it.
+    Theme NewTheme() {
+        if (theme == null) { return null; }
+        return Skin.ThemeOf(sheet);
+    }
+
     /// Installs the skin on `app`: the theme from `:root` (falling back to the
     /// current theme), the stylesheet every widget resolves against, and the
     /// backdrop artwork.
     void Apply(App app) {
         app.sheet = sheet;
         app.skinName = name;
-        if (theme != null) { app.ApplyTheme(theme, dark); }
-        if (art != "") { app.SetWallpaper(art, artOpacity); }
+        // A fresh Theme every time: ApplyTheme mutates the instance it is given
+        // (DPI scaling, surface translucency), so handing it the cached one
+        // compounded those on every switch back to this pack.
+        Theme fresh = this.NewTheme();
+        if (fresh != null) { app.ApplyTheme(fresh, dark); }
+        bool hadArt = app.SkinArtWallpaper();
+        app.skinArt = art;
+        if (art != "") {
+            app.SetWallpaper(art, artOpacity);
+        } else if (hadArt) {
+            // Leaving a pack that installed artwork for one that ships none:
+            // its illustration must go with it.
+            app.ClearWallpaper();
+        }
         app.bgThemeGen = app.bgThemeGen + 1;
         app.needsRedraw = true;
     }
@@ -148,15 +167,66 @@ class Skin {
             List<string> dirs = Directory.GetDirectories(root);
             int k = 0;
             while (k < dirs.Count) {
-                string d = dirs[k];
+                // Directory.GetDirectories yields bare entry names, so the root
+                // has to be joined back on before probing for skin.css.
+                string nm = Skin.Leaf(dirs[k]);
+                string d = root + "/" + nm;
                 k = k + 1;
-                string nm = Skin.Leaf(d);
                 if (!File.Exists(d + "/skin.css")) { continue; }
                 if (Skin.Contains(names, nm)) { continue; }
                 names.Add(nm);
             }
         }
         return names;
+    }
+
+    /// Every skin, in picker order: `--order` first (the built-in packs number
+    /// themselves 0..n), then alphabetically for packs that state none. This is
+    /// the one skin list the app, the title-bar picker and persisted settings
+    /// all index into.
+    static List<string> Names() {
+        List<string> names = Skin.Available();
+        List<string> outp = new List<string>();
+        while (names.Count > 0) {
+            int best = 0;
+            int i = 1;
+            while (i < names.Count) {
+                if (Skin.OrderOf(names[i]) < Skin.OrderOf(names[best])) {
+                    best = i;
+                }
+                i = i + 1;
+            }
+            outp.Add(names[best]);
+            names.RemoveAt(best);
+        }
+        return outp;
+    }
+
+    /// Sort key from `--order` (packs without one land after the built-ins).
+    static int OrderOf(string name) {
+        Skin s = Skin.Load(name);
+        string v = s.sheet.Var("--order");
+        if (v == "") { return 1000; }
+        return StyleSheet.Num(v);
+    }
+
+    /// Display name from `--name`, falling back to the folder name.
+    static string LabelOf(string name) {
+        Skin s = Skin.Load(name);
+        string v = s.sheet.Var("--name");
+        if (v == "") { return name; }
+        return Skin.Unquote(v);
+    }
+
+    /// Display names for `names`, in the same order.
+    static List<string> Labels(List<string> names) {
+        List<string> outp = new List<string>();
+        int i = 0;
+        while (i < names.Count) {
+            outp.Add(Skin.LabelOf(names[i]));
+            i = i + 1;
+        }
+        return outp;
     }
 
     /// The skin's illustration: whatever `--art` names, else a conventional
@@ -200,21 +270,11 @@ class Skin {
         return t;
     }
 
-    /// The preset a skin starts from (`--base: light | dark | <preset name> |
-    /// <index>`), defaulting to the dark theme.
+    /// The token baseline a skin starts from (`--base: light | dark`), defaulting
+    /// to dark. There are only these two: every other skin is a CSS pack that
+    /// overrides them.
     static Theme BaseOf(StyleSheet sheet) {
-        string b = sheet.Var("--base");
-        if (b == "") { return Theme.Dark(); }
-        string lo = b.ToLower();
-        if (lo == "light") { return Theme.Light(); }
-        if (lo == "dark") { return Theme.Dark(); }
-        List<string> names = Theme.PresetNames();
-        int i = 0;
-        while (i < names.Count) {
-            if (names[i].ToLower() == lo) { return Theme.PresetAt(i); }
-            i = i + 1;
-        }
-        if (StyleSheet.IsNumeric(b)) { return Theme.PresetAt(StyleSheet.Num(b)); }
+        if (sheet.Var("--base").ToLower() == "light") { return Theme.Light(); }
         return Theme.Dark();
     }
 
@@ -223,16 +283,7 @@ class Skin {
     static bool DarkOf(StyleSheet sheet) {
         string d = sheet.Var("--dark");
         if (d != "") { return StyleSheet.Num(d) != 0; }
-        string b = sheet.Var("--base").ToLower();
-        if (b == "light") { return false; }
-        if (b == "" || b == "dark") { return true; }
-        List<string> names = Theme.PresetNames();
-        int i = 0;
-        while (i < names.Count) {
-            if (names[i].ToLower() == b) { return Theme.PresetDark(i); }
-            i = i + 1;
-        }
-        return true;
+        return sheet.Var("--base").ToLower() != "light";
     }
 
     /// `--bg-primary` / `--bgPrimary` / `bg-primary` -> `bgPrimary`.
@@ -255,6 +306,19 @@ class Skin {
     }
 
     // ---- small helpers ------------------------------------------------------
+
+    /// Drops the quotes around a CSS string value (`--name: "Liquid Glass"`).
+    static string Unquote(string v) {
+        if (v.Length >= 2) {
+            string q = v.Substring(0, 1);
+            if (q == "\"" || q == "'") {
+                if (v.Substring(v.Length - 1, 1) == q) {
+                    return v.Substring(1, v.Length - 2);
+                }
+            }
+        }
+        return v;
+    }
 
     static string ReadIfExists(string path) {
         if (!File.Exists(path)) { return ""; }

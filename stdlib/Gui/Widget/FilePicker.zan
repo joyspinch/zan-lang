@@ -51,6 +51,13 @@ class FilePicker {
     bool filterOpen;
     bool filtersCustom;
 
+    // Events, so a host does not have to poll TakeResult() every frame.
+    UiEvent Accepted;      // the user confirmed (read SelectedPath())
+    UiEvent Cancelled;     // the dialog was dismissed
+    UiEvent Closed;        // the dialog closed, either way
+    UiEvent PathChanged;   // the browsed directory changed
+    UiEvent FilterChanged; // the extension filter changed
+
     static FilePicker Create() {
         FilePicker picker = new FilePicker();
         picker.pathInput = Input.Bind(SignalString.Create(""), "path");
@@ -79,6 +86,12 @@ class FilePicker {
         picker.filterSel = SignalInt.Create(0);
         picker.filterOpen = false;
         picker.filtersCustom = false;
+        picker.Accepted = UiEvent.Create();
+        picker.Cancelled = UiEvent.Create();
+        picker.Closed = UiEvent.Create();
+        picker.PathChanged = UiEvent.Create();
+        picker.FilterChanged = UiEvent.Create();
+        picker.filterSel.Changed.Add(picker.RaiseFilterChanged);
         return picker;
     }
 
@@ -191,12 +204,12 @@ class FilePicker {
     }
 
     static bool Clicked(App app, int x, int y, int w, int h) {
-        return app.window.EventKind() == 3
+        return app.EventKind() == 3
             && FilePicker.Inside(app, x, y, w, h);
     }
 
     static bool Pressed(App app, int x, int y, int w, int h) {
-        return app.window.EventKind() == 2
+        return app.EventKind() == 2
             && FilePicker.Inside(app, x, y, w, h);
     }
 
@@ -420,12 +433,16 @@ class FilePicker {
         return FilePicker.Normalize(pathInput.GetText());
     }
 
+    void RaiseFilterChanged() { FilterChanged.Raise(); }
+
     void Finish(int action) {
         if (!open) { return; }
         result = action;
         open = false;
         closing = true;
         if (popup != null) { popup.window.Close(); }
+        if (action == 1) { Accepted.Raise(); } else { Cancelled.Raise(); }
+        Closed.Raise();
     }
 
     void Close() {
@@ -435,11 +452,13 @@ class FilePicker {
 
     bool ApplyEvent(nint evHwnd) {
         if (!OwnsWindow(evHwnd)) { return true; }
-        int kind = popup.window.EventKind();
+        int kind = popup.EventKind();
         if (kind == 8) {
             if (!closing && result == 0) {
                 result = 2;
                 selectedPath = "";
+                Cancelled.Raise();
+                Closed.Raise();
             }
             open = false;
             closing = false;
@@ -468,6 +487,7 @@ class FilePicker {
         selectedPath = "";
         statusText = "";
         listScroll.Set(0);
+        PathChanged.Raise();
         ExpandAncestors(dir);
         if (popup != null) { popup.RequestRedraw(); }
     }
@@ -504,14 +524,14 @@ class FilePicker {
         int pathX = pad + upW + t.gapSmall;
         int pathW = W - pad - pad - upW - goW - newW
             - t.gapSmall - t.gapSmall - t.gapMedium;
-        Button.Create(FilePicker.T("Up", "上一级")).Render(
+        new Button { Text = FilePicker.T("Up", "上一级") }.Render(
             app, pad, top, upW);
         pathInput.Render(app, pathX, top, pathW, t.heightMedium);
         int goX = pathX + pathW + t.gapSmall;
-        Button.Create(FilePicker.T("Go", "转到")).Render(
+        new Button { Text = FilePicker.T("Go", "转到") }.Render(
             app, goX, top, goW);
         int newX = goX + goW + t.gapMedium;
-        Button.Create(FilePicker.T("New Folder", "新建文件夹")).Render(
+        new Button { Text = FilePicker.T("New Folder", "新建文件夹") }.Render(
             app, newX, top, newW);
 
         string dir = FilePicker.Normalize(pathInput.GetText());
@@ -530,10 +550,10 @@ class FilePicker {
             int inputW = W - inputX - pad - buttonsW - t.gapMedium;
             folderInput.Render(app, inputX, paneY, inputW, t.heightMedium);
             int createX = inputX + inputW + t.gapMedium;
-            Button.Primary(FilePicker.T("Create", "创建")).Render(
+            new Button { Text = FilePicker.T("Create", "创建"), Class = "primary" }.Render(
                 app, createX, paneY, createW);
             int folderCancelX = createX + createW + t.gapSmall;
-            Button.Create(FilePicker.T("Cancel", "取消")).Render(
+            new Button { Text = FilePicker.T("Cancel", "取消") }.Render(
                 app, folderCancelX, paneY, cancelW);
 
             if (FilePicker.Clicked(
@@ -621,7 +641,7 @@ class FilePicker {
                     }
                     fi2 = fi2 + 1;
                 }
-                if (app.window.EventKind() == 3) {
+                if (app.EventKind() == 3) {
                     filterOpen = false;
                     app.RequestRedraw();
                 }
@@ -744,7 +764,7 @@ class FilePicker {
                 }
                 app.RequestRedraw();
             }
-            if (treeDragging && app.window.EventKind() == 1 && range > 0) {
+            if (treeDragging && app.EventKind() == 1 && range > 0) {
                 treeOff = (app.mouseY - paneY - treeDragOffset)
                     * treeMax / range;
                 app.RequestRedraw();
@@ -884,7 +904,7 @@ class FilePicker {
                 }
                 app.RequestRedraw();
             }
-            if (listDragging && app.window.EventKind() == 1 && range > 0) {
+            if (listDragging && app.EventKind() == 1 && range > 0) {
                 listOff = (app.mouseY - paneY - listDragOffset)
                     * listMax / range;
                 app.RequestRedraw();
@@ -898,7 +918,7 @@ class FilePicker {
         treeScroll.Set(treeOff);
         listScroll.Set(listOff);
 
-        if (app.window.EventKind() == 3) {
+        if (app.EventKind() == 3) {
             treeDragging = false;
             listDragging = false;
         }
@@ -973,9 +993,9 @@ class FilePicker {
             "Select Folder", "选择文件夹");
         if (mode == 1) { acceptText = FilePicker.T("Open", "打开"); }
         if (mode == 2) { acceptText = FilePicker.T("Save", "保存"); }
-        Button.Create(FilePicker.T("Cancel", "取消")).Render(
+        new Button { Text = FilePicker.T("Cancel", "取消") }.Render(
             app, cancelX, footerY, buttonW);
-        Button.Primary(acceptText).Render(
+        new Button { Text = acceptText, Class = "primary" }.Render(
             app, acceptX, footerY, buttonW);
 
         // Extension-filter dropdown, painted after the buttons so its open menu
