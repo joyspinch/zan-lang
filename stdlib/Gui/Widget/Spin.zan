@@ -15,10 +15,18 @@ namespace Gui.Widget;
 class Spin : Control {
     /// Diameter in CSS px; a `width` / `height` rule wins over it.
     int Size;
+    /// Dot colour; 0 takes the `spin` rule's accent (a host painting a spinner
+    /// inside its own content, e.g. a loading button, sets its foreground).
+    int Accent;
+    /// Caption under the dots (styled by the `spin::label` part); empty for a
+    /// bare spinner.
+    Binding<string> Tip;
 
     void InitSpin(int size) {
         this.InitControl("spin", 1);
         Size = size;
+        Accent = 0;
+        Tip = "";
     }
 
     Spin() { InitSpin(36); }
@@ -29,15 +37,76 @@ class Spin : Control {
             .HeightOr(app.Scale(Size));
     }
 
+    string Caption() {
+        if (Tip == null) { return ""; }
+        return Tip.Get();
+    }
+
+    int TipFont(App app) {
+        return Style.Part(app, "spin", "label", "", "", "", Style.SNormal())
+            .FontOr(app.theme.fontSizeSmall);
+    }
+
     override void OnMeasure(App app) {
         prefW = this.Diameter(app);
         prefH = prefW;
+        if (this.Caption() == "") { return; }
+        prefH = prefH + app.theme.gapMedium
+              + Canvas.FontHeight(this.TipFont(app));
     }
 
     override void OnPaint(App app) {
-        int d = this.Diameter(app);
-        Spin.Paint(app, bx + d / 2, by + d / 2, d / 2, Class);
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        StyleBox s = this.ResolveStyleAs(app, "spin", Class, Style.SNormal());
+        int accent = Accent;
+        if (accent == 0) { accent = s.AccentOr(t.primary); }
+        int rest = s.BgOr(t.bgTertiary);
+        string tip = this.Caption();
+        int dots = bh;
+        if (tip != "") {
+            dots = this.Diameter(app);
+            int fs = this.TipFont(app);
+            c.DrawTextCentered(bx, by + dots + app.theme.gapMedium, bw,
+                               Canvas.FontHeight(fs), tip,
+                               Style.Part(app, "spin", "label", "", "", "",
+                                          Style.SNormal())
+                                   .FgOr(t.textSecondary), fs);
+        }
+        int box = bw;
+        if (dots < box) { box = dots; }
+        int radius = box / 2;
+        int cx = bx + bw / 2;
+        int cy = by + dots / 2;
+        int dotR = radius / 4;
+        if (dotR < app.Scale(2)) { dotR = app.Scale(2); }
+        // Wall-clock phase (one step every 90ms) so the spin rate is fixed
+        // regardless of how often the page actually repaints.
+        int active = (Window.GetTickMs() / 90) % 8;
+        int i = 0;
+        while (i < 8) {
+            int px = cx + PivotSafeMul(Spin.OffX(i), radius);
+            int py = cy + PivotSafeMul(Spin.OffY(i), radius);
+            int d = (active - i + 8) % 8;
+            int dc = rest;
+            int dr = dotR;
+            switch (d) {
+                case 0: dc = accent; dr = dotR + app.Scale(1); break;
+                case 1: dc = accent; break;
+                case 2: dc = t.textTertiary; break;
+                case 3: dc = t.borderPrimary; break;
+                default: break;
+            }
+            c.FillCircle(px, py, dr, dc);
+            i = i + 1;
+        }
+        // Only keep the page repainting while the spinner is actually on
+        // screen. An off-screen spinner (e.g. scrolled out of a long page)
+        // must not drive repaints, or it pins the CPU animating nothing.
+        // When visible, throttle to ~11fps instead of a 60fps busy loop.
+        if (Spin.OnScreen(app, cx, cy, radius)) { app.RequestAnimationFrame(90); }
     }
+
 
     // 8 unit-circle offsets (x1000) at 45-degree steps, starting at the top.
     static int OffX(int i) {
@@ -66,52 +135,9 @@ class Spin : Control {
         }
     }
 
-    /// A spinner of `radius` centred on (cx, cy) in the style `cls` selects.
-    static void Paint(App app, int cx, int cy, int radius, string cls) {
-        StyleBox s = Style.Of(app, "spin", cls, Style.SNormal());
-        Spin.Dots(app, cx, cy, radius, s.AccentOr(app.theme.primary),
-                  s.BgOr(app.theme.bgTertiary));
-    }
 
-    /// A spinner in a caller-supplied colour, for painters that carry their own
-    /// accent (a button's busy state, a syntax-coloured log line).
-    static void Render(App app, int cx, int cy, int radius, int color) {
-        Spin.Dots(app, cx, cy, radius, color,
-                  Style.Of(app, "spin", "", Style.SNormal())
-                      .BgOr(app.theme.bgTertiary));
-    }
 
-    static void Dots(App app, int cx, int cy, int radius, int color, int rest) {
-        Canvas c = app.canvas;
-        Theme t = app.theme;
-        int dotR = radius / 4;
-        if (dotR < app.Scale(2)) { dotR = app.Scale(2); }
-        // Wall-clock phase (one step every 90ms) so the spin rate is fixed
-        // regardless of how often the page actually repaints.
-        int active = (Window.GetTickMs() / 90) % 8;
-        int i = 0;
-        while (i < 8) {
-            int px = cx + PivotSafeMul(Spin.OffX(i), radius);
-            int py = cy + PivotSafeMul(Spin.OffY(i), radius);
-            int d = (active - i + 8) % 8;
-            int dc = rest;
-            int dr = dotR;
-            switch (d) {
-                case 0: dc = color; dr = dotR + app.Scale(1); break;
-                case 1: dc = color; break;
-                case 2: dc = t.textTertiary; break;
-                case 3: dc = t.borderPrimary; break;
-                default: break;
-            }
-            c.FillCircle(px, py, dr, dc);
-            i = i + 1;
-        }
-        // Only keep the page repainting while the spinner is actually on
-        // screen. An off-screen spinner (e.g. scrolled out of a long page)
-        // must not drive repaints, or it pins the CPU animating nothing.
-        // When visible, throttle to ~11fps instead of a 60fps busy loop.
-        if (Spin.OnScreen(app, cx, cy, radius)) { app.RequestAnimationFrame(90); }
-    }
+
 
     /// True when the spinner's bounding box overlaps the window surface.
     static bool OnScreen(App app, int cx, int cy, int radius) {
@@ -126,21 +152,6 @@ class Spin : Control {
         return (per1000 * radius) / 1000;
     }
 
-    /// Spinner with a caption below it, centered in a box. The caption is the
-    /// `spin::label` part.
-    static void WithTip(App app, int x, int y, int w, int h, string tip) {
-        Theme t = app.theme;
-        int cx = x + w / 2;
-        int cy = y + h / 2 - app.Scale(10);
-        Spin.Paint(app, cx, cy, app.Scale(18), "");
-        if (tip == "") { return; }
-        StyleBox ls = Style.Part(app, "spin", "label", "", "", "",
-                                 Style.SNormal());
-        int fs = ls.FontOr(t.fontSizeSmall);
-        app.canvas.DrawTextCentered(x, cy + app.Scale(30), w,
-                                    Canvas.FontHeight(fs), tip,
-                                    ls.FgOr(t.textSecondary), fs);
-    }
 
     // ---- designer / serialization model -------------------------------------
 
@@ -151,6 +162,9 @@ class Spin : Control {
         PropSpec size = PropSpec.Int("size", "Size");
         size.num = Size;
         ps.Add(size);
+        PropSpec tip = PropSpec.Text("tip", "Tip");
+        tip.str = Tip;
+        ps.Add(tip);
         ps.Add(PropSpec.Text("class", "Classes"));
         return ps;
     }
