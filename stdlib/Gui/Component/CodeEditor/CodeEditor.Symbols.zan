@@ -1,0 +1,220 @@
+using System;
+using System.IO;
+using Gui;
+using Gui.Widget;
+
+namespace Gui.Component.CodeEditor;
+
+/// CodeEditor part: the symbol index produced by `zanc --emit-symbols`.
+///
+/// Completion used to answer member queries from tables written by hand in
+/// CodeEditor.Completion.zan, which drifted from the compiler: it offered
+/// File.OpenRead(), Math.Clamp() and Convert.ToDecimal() (none of which exist)
+/// while hiding File.GetSize(). Whatever the compiler wrote into the index wins
+/// over those tables; they stay as the fallback for a workspace that has not
+/// been indexed yet.
+partial class CodeEditor {
+    static List<string> symOwners;   // owning type of each member record
+    static List<string> symNames;    // member name
+    static List<string> symKinds;    // M method, P property, F field, C ctor, E event
+    static List<string> symSigs;     // display signature
+    static List<string> symTypes;    // every type name in the index
+    static List<string> symBases;    // base list of symTypes[i], comma-separated
+
+    /// True once an index has been loaded successfully.
+    static bool SymbolIndexLoaded() {
+        return symTypes != null && symTypes.Count > 0;
+    }
+
+    /// Drops the loaded index (used before reloading after a build).
+    static void ClearSymbolIndex() {
+        symOwners = new List<string>();
+        symNames = new List<string>();
+        symKinds = new List<string>();
+        symSigs = new List<string>();
+        symTypes = new List<string>();
+        symBases = new List<string>();
+    }
+
+    /// Loads the index written by `zanc --emit-symbols <path>`: TAB-separated
+    /// `T kind namespace name bases` and `M owner name kind static signature`
+    /// records. Returns false when the file is missing or has no records, in
+    /// which case completion keeps using its built-in tables.
+    static bool LoadSymbolIndex(string path) {
+        CodeEditor.ClearSymbolIndex();
+        if (path.Length == 0 || !File.Exists(path)) { return false; }
+        string text = File.ReadAllText(path);
+        if (text.Length == 0) { return false; }
+        List<string> ls = text.Split("\n");
+        int i = 0;
+        while (i < ls.Count) {
+            string line = ls[i];
+            i = i + 1;
+            if (line.Length == 0) { continue; }
+            if (line.EndsWith("\r")) { line = line.Substring(0, line.Length - 1); }
+            if (line.StartsWith("#")) { continue; }
+            List<string> f = line.Split("\t");
+            if (f.Count < 4) { continue; }
+            if (f[0] == "T") {
+                string tn = f[3];
+                if (tn.Length > 0 && !CodeEditor.Has(symTypes, tn)) {
+                    symTypes.Add(tn);
+                    if (f.Count > 4) { symBases.Add(f[4]); } else { symBases.Add(""); }
+                }
+            } else if (f[0] == "M" && f.Count >= 6) {
+                symOwners.Add(f[1]);
+                symNames.Add(f[2]);
+                symKinds.Add(f[3]);
+                symSigs.Add(f[5]);
+            }
+        }
+        return symTypes.Count > 0;
+    }
+
+    /// True when the index describes `typeName`.
+    static bool HasSymbolType(string typeName) {
+        if (!CodeEditor.SymbolIndexLoaded()) { return false; }
+        return CodeEditor.Has(symTypes, typeName);
+    }
+
+    /// Appends the members the compiler really has for `typeName`, following
+    /// base types so inherited members show up too.
+    static void SymbolMembers(string typeName, List<string> out2) {
+        if (!CodeEditor.SymbolIndexLoaded()) { return; }
+        string cur = typeName;
+        int depth = 0;
+        while (cur.Length > 0 && depth < 8) {
+            int i = 0;
+            while (i < symOwners.Count) {
+                if (symOwners[i] == cur && symKinds[i] != "C") {
+                    if (!CodeEditor.Has(out2, symNames[i])) { out2.Add(symNames[i]); }
+                }
+                i = i + 1;
+            }
+            cur = CodeEditor.SymbolFirstBase(cur);
+            depth = depth + 1;
+        }
+    }
+
+    /// The first base type of `typeName` in the index ("" when none).
+    static string SymbolFirstBase(string typeName) {
+        if (!CodeEditor.SymbolIndexLoaded()) { return ""; }
+        int i = 0;
+        while (i < symTypes.Count) {
+            if (symTypes[i] == typeName) {
+                string b = symBases[i];
+                if (b.Length == 0) { return ""; }
+                int c = b.IndexOf(",");
+                if (c >= 0) { b = b.Substring(0, c); }
+                int lt = b.IndexOf("<");
+                if (lt >= 0) { b = b.Substring(0, lt); }
+                return b;
+            }
+            i = i + 1;
+        }
+        return "";
+    }
+
+    /// The declared signature of `typeName.member` ("" when the index has no
+    /// such member). With overloads this is the first declaration.
+    static string SymbolSignature(string typeName, string member) {
+        if (!CodeEditor.SymbolIndexLoaded()) { return ""; }
+        string cur = typeName;
+        int depth = 0;
+        while (cur.Length > 0 && depth < 8) {
+            int i = 0;
+            while (i < symOwners.Count) {
+                if (symOwners[i] == cur && symNames[i] == member) { return symSigs[i]; }
+                i = i + 1;
+            }
+            cur = CodeEditor.SymbolFirstBase(cur);
+            depth = depth + 1;
+        }
+        // An extension method is declared on another type ("static string
+        // PadLeft(this string s, ...)"), so look for a `this <typeName>`
+        // receiver as well.
+        string want = "(this " + typeName;
+        int k = 0;
+        while (k < symOwners.Count) {
+            if (symNames[k] == member) {
+                int at = symSigs[k].IndexOf(want);
+                if (at >= 0) { return symSigs[k]; }
+            }
+            k = k + 1;
+        }
+        return "";
+    }
+
+    /// The first signature the index has for a member of any type, used for the
+    /// hover/signature strip where the receiver type is unknown.
+    static string SymbolSignatureAny(string member) {
+        if (!CodeEditor.SymbolIndexLoaded()) { return ""; }
+        int i = 0;
+        while (i < symNames.Count) {
+            if (symNames[i] == member) { return symSigs[i]; }
+            i = i + 1;
+        }
+        return "";
+    }
+
+    /// Every signature declared for `typeName.member`, i.e. the overload set.
+    static void SymbolOverloads(string typeName, string member, List<string> out2) {
+        if (!CodeEditor.SymbolIndexLoaded()) { return; }
+        string want = "(this " + typeName;
+        int i = 0;
+        while (i < symOwners.Count) {
+            bool mine = symOwners[i] == typeName && symNames[i] == member;
+            bool ext = symNames[i] == member && symSigs[i].IndexOf(want) >= 0;
+            if (mine || ext) {
+                if (!CodeEditor.Has(out2, symSigs[i])) { out2.Add(symSigs[i]); }
+            }
+            i = i + 1;
+        }
+    }
+
+    /// The kind letter completion shows for `typeName.member`, or "" when the
+    /// index does not describe it.
+    static string SymbolKind(string typeName, string member) {
+        if (!CodeEditor.SymbolIndexLoaded()) { return ""; }
+        int i = 0;
+        while (i < symOwners.Count) {
+            if (symOwners[i] == typeName && symNames[i] == member) { return symKinds[i]; }
+            i = i + 1;
+        }
+        return "";
+    }
+
+    /// Every indexed type name whose spelling starts with `prefix`
+    /// (case-insensitive), for type-name completion.
+    static void SymbolTypesStartingWith(string prefix, List<string> out2) {
+        if (!CodeEditor.SymbolIndexLoaded()) { return; }
+        int i = 0;
+        while (i < symTypes.Count) {
+            if (CodeEditor.StartsWithI(symTypes[i], prefix)) {
+                if (!CodeEditor.Has(out2, symTypes[i])) { out2.Add(symTypes[i]); }
+            }
+            i = i + 1;
+        }
+    }
+
+    /// Extension methods in the index that apply to `typeName`: a static method
+    /// whose first parameter is declared `this <typeName>`.
+    static void SymbolExtensionsFor(string typeName, List<string> out2) {
+        if (!CodeEditor.SymbolIndexLoaded()) { return; }
+        string want = "(this " + typeName;
+        int i = 0;
+        while (i < symOwners.Count) {
+            string sig = symSigs[i];
+            int at = sig.IndexOf(want);
+            if (at >= 0) {
+                int after = at + want.Length;
+                string next = "";
+                if (after < sig.Length) { next = sig.Substring(after, 1); }
+                if (next == " " || next == "<") {
+                    if (!CodeEditor.Has(out2, symNames[i])) { out2.Add(symNames[i]); }
+                }
+            }
+            i = i + 1;
+        }
+    }
+}

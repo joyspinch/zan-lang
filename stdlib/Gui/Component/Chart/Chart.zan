@@ -1,0 +1,1047 @@
+using System;
+using System.Json;
+using Gui;
+using Gui.Backend;
+
+namespace Gui.Component.Chart;
+
+/// One data series: a name, its Y values (one per category label) and a color.
+/// axisIndex selects which value (Y) axis it is measured against (0 = left,
+/// 1 = right) for dual-axis charts; kind overrides the chart family for this
+/// one series (-1 = follow the chart's kind) so a bar chart can carry a line.
+class ChartSeries {
+    string name;
+    List<int> values;
+    int color;
+    int axisIndex;   // 0 = left/primary Y axis, 1 = right/secondary Y axis
+    int kind;        // -1 = follow chart kind, else ChartType.* (mixed series)
+    bool hidden;     // toggled off via the interactive legend
+
+    static ChartSeries Create(string name, List<int> values, int color) {
+        ChartSeries s = new ChartSeries();
+        s.name = name;
+        s.values = values;
+        s.color = color;
+        s.axisIndex = 0;
+        s.kind = -1;
+        s.hidden = false;
+        return s;
+    }
+
+    // Same as Create but bound to a specific value axis (0 left / 1 right).
+    static ChartSeries OnAxis(string name, List<int> values, int color, int axisIndex) {
+        ChartSeries s = ChartSeries.Create(name, values, color);
+        s.axisIndex = axisIndex;
+        return s;
+    }
+
+    // Same as Create but overriding the chart family for this series (mixed
+    // bar + line charts: e.g. ChartSeries.AsKind("Trend", vs, 0, ChartType.Line())).
+    static ChartSeries AsKind(string name, List<int> values, int color, int kind) {
+        ChartSeries s = ChartSeries.Create(name, values, color);
+        s.kind = kind;
+        return s;
+    }
+}
+
+/// One funnel/rose stage: a value, its fill color and a display name. Replaces
+/// the old vals/cols/names parallel-list convention used by GatherStages.
+class ChartStage {
+    int val;
+    int color;
+    string name;
+
+    ChartStage(int v, int col, string nm) {
+        val = v;
+        color = col;
+        name = nm;
+    }
+}
+
+/// Internal holder for the computed plot rectangle plus the resolved value-axis
+/// ranges (left + optional right) so every renderer maps values -> pixels the
+/// same way. leftMin/leftMax always valid; rightMin/rightMax only when hasRight.
+class ChartFrame {
+    int plotX;
+    int plotY;
+    int plotW;
+    int plotH;
+    int leftMin;
+    int leftMax;
+    int rightMin;
+    int rightMax;
+    bool hasRight;
+    bool reversed;
+
+    // Pixel Y for a value on the left (axisIndex 0) or right (1) axis, honoring
+    // axis reversal via a precomputed flag set by the axis builder.
+    int YOf(int v, int axisIndex) {
+        int lo = this.leftMin;
+        int hi = this.leftMax;
+        if (axisIndex == 1) { lo = this.rightMin; hi = this.rightMax; }
+        int span = hi - lo;
+        if (span == 0) { span = 1; }
+        int d = (v - lo) * this.plotH / span;
+        if (this.reversed) { return this.plotY + d; }
+        return this.plotY + this.plotH - d;
+    }
+}
+
+/// Virtual, pull-based data source for charts — the chart never has to own the
+/// raw point arrays, so a series of millions of points costs no per-cell object
+/// allocation (mirrors DataTable's DataSource). Subclass it and read points on
+/// demand from your own columnar/typed storage, or wrap an in-memory
+/// List<ChartSeries> with SeriesListSource.
+class ChartSource {
+    virtual int SeriesCount() { return 0; }
+    virtual string SeriesName(int s) { return ""; }
+    virtual int SeriesColor(int s) { return 0; }   // 0 = auto (palette)
+    virtual int PointCount(int s) { return 0; }
+    virtual int ValueAt(int s, int i) { return 0; }
+}
+
+/// Adapter that exposes an existing List<ChartSeries> as a ChartSource, so the
+/// high-performance path accepts plain in-memory data with no restructuring.
+class SeriesListSource : ChartSource {
+    List<ChartSeries> series;
+
+    static SeriesListSource Of(List<ChartSeries> series) {
+        SeriesListSource s = new SeriesListSource();
+        s.series = series;
+        return s;
+    }
+
+    override int SeriesCount() { return this.series.Count; }
+    override string SeriesName(int s) { return this.series[s].name; }
+    override int SeriesColor(int s) { return this.series[s].color; }
+    override int PointCount(int s) { return this.series[s].values.Count; }
+    override int ValueAt(int s, int i) { return this.series[s].values[i]; }
+}
+
+/// ECharts-inspired chart library built on the raw Canvas primitives:
+/// line, area, grouped/stacked/horizontal bars, pie, donut and scatter.
+/// Integer maths, category + value axes, gridlines, legend, per-series colors.
+class Chart {
+
+    // ---- colors ----
+
+    // Opaque 0xFFRRGGBB packed as a positive int (Canvas casts to u32).
+    static int Rgb(int r, int g, int b) {
+        return 4278190080 + r * 65536 + g * 256 + b;
+    }
+
+    // Same RGB as a packed opaque color but with a custom alpha (for area fills).
+    static int WithAlpha(int packed, int a) {
+        return (packed - 4278190080) + a * 16777216;
+    }
+
+    // ECharts' default qualitative palette.
+    static int Palette(Theme t, int i) {
+        int m = i % 8;
+        if (m == 0) { return Chart.Rgb(84, 112, 198); }   // blue
+        if (m == 1) { return Chart.Rgb(145, 204, 117); }  // green
+        if (m == 2) { return Chart.Rgb(250, 200, 88); }   // yellow
+        if (m == 3) { return Chart.Rgb(238, 102, 102); }  // red
+        if (m == 4) { return Chart.Rgb(115, 192, 222); }  // cyan
+        if (m == 5) { return Chart.Rgb(59, 162, 114); }   // teal
+        if (m == 6) { return Chart.Rgb(252, 132, 82); }   // orange
+        return Chart.Rgb(154, 96, 180);                    // purple
+    }
+
+    // ---- scale helpers ----
+
+    // Round a raw maximum up to a friendly axis bound (2/5/10 * 10^n).
+    static int NiceMax(int v) {
+        if (v <= 5) { return 5; }
+        int mag = 1;
+        while (mag * 10 <= v) { mag = mag * 10; }
+        int unit = v / mag;
+        int nice = 10;
+        if (unit < 2) { nice = 2; } else if (unit < 5) { nice = 5; }
+        return nice * mag;
+    }
+
+    static int MaxOf(List<ChartSeries> series) {
+        int mx = 0;
+        int i = 0;
+        while (i < series.Count) {
+            List<int> vs = series[i].values;
+            int j = 0;
+            while (j < vs.Count) { if (vs[j] > mx) { mx = vs[j]; } j = j + 1; }
+            i = i + 1;
+        }
+        return mx;
+    }
+
+    // Max stacked total across categories (for stacked bars).
+    static int MaxStack(List<ChartSeries> series, int n) {
+        int mx = 0;
+        int i = 0;
+        while (i < n) {
+            int sum = 0;
+            int s = 0;
+            while (s < series.Count) {
+                List<int> vs = series[s].values;
+                if (i < vs.Count) { sum = sum + vs[i]; }
+                s = s + 1;
+            }
+            if (sum > mx) { mx = sum; }
+            i = i + 1;
+        }
+        return mx;
+    }
+
+    static int MaxInt(List<int> vs) {
+        int mx = 0;
+        int i = 0;
+        while (i < vs.Count) { if (vs[i] > mx) { mx = vs[i]; } i = i + 1; }
+        return mx;
+    }
+
+    // ---- shared chrome ----
+
+    // Panel background + title + legend swatches. Returns the y just below the
+    // title/legend band so callers can lay out the plot area beneath it.
+    static int DrawPanel(App app, int x, int y, int w, int h, string title,
+                         List<ChartSeries> series) {
+        return Chart.DrawPanelI(app, x, y, w, h, title, series, 0);
+    }
+
+    // Legend hidden-state key for series `si` of interaction id `wid`.
+    static int LegendKey(int wid, int si) { return 6000000 + wid * 64 + si; }
+
+    // dataZoom window state keys (permille 0..1000 of the category range).
+    static int ZoomLoKey(int wid) { return 7000000 + wid * 2; }
+    static int ZoomHiKey(int wid) { return 7000000 + wid * 2 + 1; }
+
+    // Resolve the zoom window to an inclusive category index range [i0,i1].
+    static int ZoomI0(App app, int wid, int n) {
+        int lo = app.StateGet(Chart.ZoomLoKey(wid), 0);
+        int i0 = lo * (n - 1) / 1000;
+        if (i0 < 0) { i0 = 0; }
+        if (i0 > n - 1) { i0 = n - 1; }
+        return i0;
+    }
+    static int ZoomI1(App app, int wid, int n) {
+        int hi = app.StateGet(Chart.ZoomHiKey(wid), 1000);
+        int i1 = hi * (n - 1) / 1000;
+        if (i1 < 0) { i1 = 0; }
+        if (i1 > n - 1) { i1 = n - 1; }
+        int i0 = Chart.ZoomI0(app, wid, n);
+        if (i1 < i0) { i1 = i0; }
+        return i1;
+    }
+
+    // A shallow window [i0,i1] of every series (values sliced, metadata kept).
+    static List<ChartSeries> Window(List<ChartSeries> series, int i0, int i1) {
+        List<ChartSeries> outp = new List<ChartSeries>();
+        int s = 0;
+        while (s < series.Count) {
+            ChartSeries src = series[s];
+            List<int> vs = new List<int>();
+            int i = i0;
+            while (i <= i1 && i < src.values.Count) { vs.Add(src.values[i]); i = i + 1; }
+            ChartSeries d = ChartSeries.Create(src.name, vs, src.color);
+            d.axisIndex = src.axisIndex;
+            d.kind = src.kind;
+            d.hidden = src.hidden;
+            outp.Add(d);
+            s = s + 1;
+        }
+        return outp;
+    }
+
+    static List<string> WindowLabels(List<string> labels, int i0, int i1) {
+        List<string> outp = new List<string>();
+        int i = i0;
+        while (i <= i1 && i < labels.Count) { outp.Add(labels[i]); i = i + 1; }
+        return outp;
+    }
+
+    // Draw the dataZoom range slider and process handle drags. Two handles set
+    // the window bounds (permille); dragging the selected band pans it. The
+    // window is persisted in the App state map keyed by wid.
+    static void DrawZoomBar(App app, int plotX, int plotW, int barY, int barH,
+                            int wid, int n) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        if (plotW < 4 || n < 2) { return; }
+
+        int lo = app.StateGet(Chart.ZoomLoKey(wid), 0);
+        int hi = app.StateGet(Chart.ZoomHiKey(wid), 1000);
+
+        int hw = app.Scale(6);
+        int loX = plotX + lo * plotW / 1000;
+        int hiX = plotX + hi * plotW / 1000;
+
+        // track + selected window
+        c.FillRoundRect(plotX, barY, plotW, barH, t.borderRadiusSmall, t.bgSecondary);
+        c.FillRect(loX, barY, hiX - loX, barH, t.bgHover);
+        c.DrawRect(loX, barY, hiX - loX, barH, t.borderHover, 1);
+
+        // handles
+        c.FillRoundRect(loX - hw, barY, hw * 2, barH, t.borderRadiusSmall, t.primary);
+        c.FillRoundRect(hiX - hw, barY, hw * 2, barH, t.borderRadiusSmall, t.primary);
+
+        int loId = app.focus.AllocId();
+        int hiId = app.focus.AllocId();
+        int bandId = app.focus.AllocId();
+        app.hitTester.Register(HitRegion.Create(loId, loX - hw, barY, hw * 2, barH, 3));
+        app.hitTester.Register(HitRegion.Create(hiId, hiX - hw, barY, hw * 2, barH, 3));
+        app.hitTester.Register(HitRegion.Create(bandId, loX + hw, barY, hiX - loX - hw * 2, barH, 3));
+
+        int mxPm = (app.mouseX - plotX) * 1000 / plotW;
+        if (mxPm < 0) { mxPm = 0; }
+        if (mxPm > 1000) { mxPm = 1000; }
+        int minGap = 1000 / (n - 1);
+        if (minGap < 20) { minGap = 20; }
+
+        if (Ui.Pressed(app, loId)) {
+            lo = mxPm;
+            if (lo > hi - minGap) { lo = hi - minGap; }
+            if (lo < 0) { lo = 0; }
+            app.StateSet(Chart.ZoomLoKey(wid), lo);
+            app.RequestRedraw();
+        } else if (Ui.Pressed(app, hiId)) {
+            hi = mxPm;
+            if (hi < lo + minGap) { hi = lo + minGap; }
+            if (hi > 1000) { hi = 1000; }
+            app.StateSet(Chart.ZoomHiKey(wid), hi);
+            app.RequestRedraw();
+        } else if (Ui.Pressed(app, bandId)) {
+            // pan: keep the band width, center it on the pointer
+            int width = hi - lo;
+            int nlo = mxPm - width / 2;
+            if (nlo < 0) { nlo = 0; }
+            if (nlo + width > 1000) { nlo = 1000 - width; }
+            app.StateSet(Chart.ZoomLoKey(wid), nlo);
+            app.StateSet(Chart.ZoomHiKey(wid), nlo + width);
+            app.RequestRedraw();
+        }
+    }
+
+    // Panel + interactive legend. When wid != 0 each swatch is a hit region:
+    // clicking toggles that series' visibility (persisted in the App state map
+    // keyed by wid), and the resolved hidden flag is written back onto the
+    // series so every downstream renderer skips it. A hidden series is drawn
+    // dimmed with a strike so it can be brought back.
+    static int DrawPanelI(App app, int x, int y, int w, int h, string title,
+                          List<ChartSeries> series, int wid) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int pad = t.paddingMedium;
+
+        c.SurfaceRoundRect(x, y, w, h, t.borderRadiusMedium, t.bgPrimary, t.borderPrimary, 1);
+
+        int top = y + pad;
+        if (title.Length > 0) {
+            c.DrawText(x + pad, top, title, t.textPrimary, t.fontSizeLarge);
+        }
+
+        // legend (top-right), one swatch + name per series, right-to-left
+        int lx = x + w - pad;
+        int sw = app.Scale(12);
+        int lgY = y + pad;
+        int si = series.Count - 1;
+        while (si >= 0) {
+            // Resolve persisted visibility first so both the legend and the
+            // plot agree this frame.
+            bool hid = series[si].hidden;
+            if (wid != 0) {
+                hid = app.StateGet(Chart.LegendKey(wid, si), 0) == 1;
+            }
+
+            string nm = series[si].name;
+            int tw = Canvas.MeasureText(nm, t.fontSizeSmall);
+            int rowLeft = lx - tw - app.Scale(6) - sw;
+            int swatchX = lx - tw - app.Scale(6) - sw;
+
+            int txtCol = t.textSecondary;
+            int swCol = series[si].color;
+            if (hid) { txtCol = t.textTertiary; swCol = t.borderPrimary; }
+
+            c.DrawText(lx - tw, lgY + app.Scale(2), nm, txtCol, t.fontSizeSmall);
+            c.FillRoundRect(swatchX, lgY + app.Scale(3), sw, sw, t.borderRadiusSmall, swCol);
+            if (hid) {
+                int my = lgY + app.Scale(2) + Canvas.FontHeight(t.fontSizeSmall) / 2;
+                c.FillRect(lx - tw, my, tw, 1, t.textTertiary);
+            }
+
+            if (wid != 0) {
+                int hitId = app.focus.AllocId();
+                app.hitTester.Register(HitRegion.Create(hitId, rowLeft,
+                    lgY, (lx) - rowLeft, sw + app.Scale(4), 3));
+                if (Ui.Clicked(app, hitId)) {
+                    int nv = 1;
+                    if (hid) { nv = 0; }
+                    app.StateSet(Chart.LegendKey(wid, si), nv);
+                    hid = (nv == 1);
+                    app.RequestRedraw();
+                }
+            }
+
+            series[si].hidden = hid;
+            lx = rowLeft - app.Scale(14);
+            si = si - 1;
+        }
+
+        return top + Canvas.FontHeight(t.fontSizeLarge) + app.Scale(6);
+    }
+
+    // Shaded markArea band [markLo, markHi] on the left axis (drawn behind the
+    // series). No-op unless both bounds are set.
+    static void DrawMarkArea(App app, ChartFrame f, ChartOptions o) {
+        if (o.markLo == ChartOptions.Auto() || o.markHi == ChartOptions.Auto()) { return; }
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int y0 = f.YOf(o.markHi, 0);
+        int y1 = f.YOf(o.markLo, 0);
+        if (y1 < y0) { int tmp = y0; y0 = y1; y1 = tmp; }
+        c.FillRect(f.plotX, y0, f.plotW, y1 - y0, Chart.WithAlpha(t.primary, 28));
+    }
+
+    // Horizontal threshold line at markLine on the left axis, with an optional
+    // right-aligned label (drawn on top of the series).
+    static void DrawMarkLine(App app, ChartFrame f, ChartOptions o) {
+        if (o.markLine == ChartOptions.Auto()) { return; }
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int my = f.YOf(o.markLine, 0);
+        // dashed line
+        int dx = f.plotX;
+        int dash = app.Scale(6);
+        while (dx < f.plotX + f.plotW) {
+            int seg = dash;
+            if (dx + seg > f.plotX + f.plotW) { seg = f.plotX + f.plotW - dx; }
+            c.FillRect(dx, my, seg, 1, t.error);
+            dx = dx + dash * 2;
+        }
+        if (o.markLabel.Length > 0) {
+            int fs = t.fontSizeSmall;
+            int lw = Canvas.MeasureText(o.markLabel, fs);
+            c.DrawText(f.plotX + f.plotW - lw, my - Canvas.FontHeight(fs) - app.Scale(1),
+                o.markLabel, t.error, fs);
+        }
+    }
+
+    // Cartesian frame with value gridlines (left) + category labels (bottom).
+    static ChartFrame DrawFrame(App app, int x, int y, int w, int h, int plotTop,
+                                List<string> labels, int maxV) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int pad = t.paddingMedium;
+        int axisFs = t.fontSizeSmall;
+
+        int leftGut = Canvas.MeasureText(Convert.ToString(maxV), axisFs) + app.Scale(12);
+        int botGut = Canvas.FontHeight(axisFs) + app.Scale(8);
+
+        int plotX = x + pad + leftGut;
+        int plotY = plotTop;
+        int plotW = (x + w - pad) - plotX;
+        int plotH = (y + h - pad - botGut) - plotY;
+        if (plotW < app.Scale(20)) { plotW = app.Scale(20); }
+        if (plotH < app.Scale(20)) { plotH = app.Scale(20); }
+
+        int ticks = 5;
+        int k = 0;
+        while (k <= ticks) {
+            int gy = plotY + plotH - (k * plotH / ticks);
+            c.FillRect(plotX, gy, plotW, 1, t.divider);
+            int val = maxV * k / ticks;
+            string vs = Convert.ToString(val);
+            int vw = Canvas.MeasureText(vs, axisFs);
+            c.DrawText(plotX - app.Scale(6) - vw, gy - Canvas.FontHeight(axisFs) / 2, vs, t.textTertiary, axisFs);
+            k = k + 1;
+        }
+        c.FillRect(plotX, plotY, 1, plotH, t.borderSecondary);
+        c.FillRect(plotX, plotY + plotH, plotW, 1, t.borderSecondary);
+
+        int n = labels.Count;
+        if (n > 0) {
+            int step = plotW / n;
+            int ci = 0;
+            while (ci < n) {
+                int cxs = plotX + ci * step;
+                c.DrawTextCentered(cxs, plotY + plotH + app.Scale(4), step, botGut, labels[ci], t.textTertiary, axisFs);
+                ci = ci + 1;
+            }
+        }
+
+        ChartFrame f = new ChartFrame();
+        f.plotX = plotX;
+        f.plotY = plotY;
+        f.plotW = plotW;
+        f.plotH = plotH;
+        return f;
+    }
+
+    // Cartesian frame over an explicit value range [lo, hi] (supports non-zero
+    // baselines / negatives), used by candlestick, box-plot and error charts.
+    static ChartFrame DrawFrameLoHi(App app, int x, int y, int w, int h, int plotTop,
+                                    List<string> labels, int lo, int hi) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int pad = t.paddingMedium;
+        int axisFs = t.fontSizeSmall;
+        if (hi <= lo) { hi = lo + 1; }
+
+        int gw0 = Canvas.MeasureText(Convert.ToString(hi), axisFs);
+        int gw1 = Canvas.MeasureText(Convert.ToString(lo), axisFs);
+        int leftGut = gw0;
+        if (gw1 > leftGut) { leftGut = gw1; }
+        leftGut = leftGut + app.Scale(12);
+        int botGut = Canvas.FontHeight(axisFs) + app.Scale(8);
+
+        int plotX = x + pad + leftGut;
+        int plotY = plotTop;
+        int plotW = (x + w - pad) - plotX;
+        int plotH = (y + h - pad - botGut) - plotY;
+        if (plotW < app.Scale(20)) { plotW = app.Scale(20); }
+        if (plotH < app.Scale(20)) { plotH = app.Scale(20); }
+
+        int span = hi - lo;
+        int ticks = 5;
+        int k = 0;
+        while (k <= ticks) {
+            int gy = plotY + plotH - (k * plotH / ticks);
+            c.FillRect(plotX, gy, plotW, 1, t.divider);
+            int val = lo + span * k / ticks;
+            string vs = Convert.ToString(val);
+            int vw = Canvas.MeasureText(vs, axisFs);
+            c.DrawText(plotX - app.Scale(6) - vw, gy - Canvas.FontHeight(axisFs) / 2, vs, t.textTertiary, axisFs);
+            k = k + 1;
+        }
+        c.FillRect(plotX, plotY, 1, plotH, t.borderSecondary);
+        c.FillRect(plotX, plotY + plotH, plotW, 1, t.borderSecondary);
+
+        int n = labels.Count;
+        if (n > 0) {
+            int step = plotW / n;
+            int ci = 0;
+            while (ci < n) {
+                int cxs = plotX + ci * step;
+                c.DrawTextCentered(cxs, plotY + plotH + app.Scale(4), step, botGut, labels[ci], t.textTertiary, axisFs);
+                ci = ci + 1;
+            }
+        }
+
+        ChartFrame f = new ChartFrame();
+        f.plotX = plotX;
+        f.plotY = plotY;
+        f.plotW = plotW;
+        f.plotH = plotH;
+        return f;
+    }
+
+    // ---- coordinate system (dual axis + nice ticks + titles) ----
+
+    // Largest value across the (visible) series bound to the given value axis.
+    static int AxisMaxFor(List<ChartSeries> series, int axisIndex) {
+        int mx = 0;
+        int i = 0;
+        while (i < series.Count) {
+            ChartSeries s = series[i];
+            if (!s.hidden && s.axisIndex == axisIndex) {
+                int j = 0;
+                while (j < s.values.Count) { if (s.values[j] > mx) { mx = s.values[j]; } j = j + 1; }
+            }
+            i = i + 1;
+        }
+        return mx;
+    }
+
+    static bool AnyOnAxis(List<ChartSeries> series, int axisIndex) {
+        int i = 0;
+        while (i < series.Count) {
+            if (!series[i].hidden && series[i].axisIndex == axisIndex) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    // Resolve one value axis' [lo, hi] range from data + fixed overrides.
+    static int AxisLo(ChartOptions o, int dataMax, int fixedLo) {
+        if (fixedLo != ChartOptions.Auto()) { return fixedLo; }
+        return 0;
+    }
+    static int AxisHi(ChartOptions o, int dataMax, int fixedHi, int lo) {
+        int hi = Chart.NiceMax(dataMax);
+        if (fixedHi != ChartOptions.Auto()) { hi = fixedHi; }
+        if (hi <= lo) { hi = lo + 1; }
+        return hi;
+    }
+
+    // Widest tick label (px) for a [lo, hi] range divided into `ticks` steps.
+    static int TickLabelW(int lo, int hi, int ticks, int fs) {
+        int span = hi - lo;
+        int wmax = 0;
+        int k = 0;
+        while (k <= ticks) {
+            int val = lo + span * k / ticks;
+            int lw = Canvas.MeasureText(Convert.ToString(val), fs);
+            if (lw > wmax) { wmax = lw; }
+            k = k + 1;
+        }
+        return wmax;
+    }
+
+    // Full cartesian coordinate system: left (+ optional right) value axes with
+    // nice ticks / fixed bounds / reversal, category (or numeric) x axis, grid
+    // padding overrides and axis titles. Returns a ChartFrame carrying both axis
+    // ranges so every renderer maps values via f.YOf(v, axisIndex).
+    static ChartFrame BuildAxes(App app, int x, int y, int w, int h, int plotTop,
+                                List<string> labels, ChartOptions o, List<ChartSeries> series) {
+        return Chart.BuildAxesR(app, x, y, w, h, plotTop, labels, o, series, 0 - 1, 0 - 1);
+    }
+
+    // As BuildAxes but with explicit data maxima for the left / right axes
+    // (-1 = derive per-point from the series); stacked charts pass the stack sum.
+    static ChartFrame BuildAxesR(App app, int x, int y, int w, int h, int plotTop,
+                                 List<string> labels, ChartOptions o, List<ChartSeries> series,
+                                 int leftDataMax, int rightDataMax) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int pad = t.paddingMedium;
+        int fs = t.fontSizeSmall;
+        int fh = Canvas.FontHeight(fs);
+        int ticks = o.yTicks;
+        if (ticks < 1) { ticks = 5; }
+
+        int lData = leftDataMax;
+        if (lData < 0) { lData = Chart.AxisMaxFor(series, 0); }
+        int leftLo = Chart.AxisLo(o, 0, o.yMinFixed);
+        int leftHi = Chart.AxisHi(o, lData, o.yMaxFixed, leftLo);
+        bool hasRight = Chart.AnyOnAxis(series, 1);
+        int rightLo = 0;
+        int rightHi = 1;
+        if (hasRight) {
+            int rData = rightDataMax;
+            if (rData < 0) { rData = Chart.AxisMaxFor(series, 1); }
+            rightLo = Chart.AxisLo(o, 0, o.y2MinFixed);
+            rightHi = Chart.AxisHi(o, rData, o.y2MaxFixed, rightLo);
+        }
+
+        int leftGut = Chart.TickLabelW(leftLo, leftHi, ticks, fs) + app.Scale(12);
+        int rightGut = pad;
+        if (hasRight) { rightGut = Chart.TickLabelW(rightLo, rightHi, ticks, fs) + app.Scale(12); }
+        int botGut = fh + app.Scale(8);
+        if (o.xTitle.Length > 0) { botGut = botGut + fh + app.Scale(2); }
+        int topGut = 0;
+        if (o.yTitle.Length > 0 || o.y2Title.Length > 0) { topGut = fh + app.Scale(2); }
+
+        int plotX = x + pad + leftGut;
+        if (o.gridLeft >= 0) { plotX = x + app.Scale(o.gridLeft); }
+        int plotY = plotTop + topGut;
+        if (o.gridTop >= 0) { plotY = y + app.Scale(o.gridTop); }
+        int plotRight = x + w - rightGut;
+        if (o.gridRight >= 0) { plotRight = x + w - app.Scale(o.gridRight); }
+        int plotBot = y + h - pad - botGut;
+        if (o.gridBottom >= 0) { plotBot = y + h - app.Scale(o.gridBottom); }
+        int plotW = plotRight - plotX;
+        int plotH = plotBot - plotY;
+        if (plotW < app.Scale(20)) { plotW = app.Scale(20); }
+        if (plotH < app.Scale(20)) { plotH = app.Scale(20); }
+
+        ChartFrame f = new ChartFrame();
+        f.plotX = plotX;
+        f.plotY = plotY;
+        f.plotW = plotW;
+        f.plotH = plotH;
+        f.leftMin = leftLo;
+        f.leftMax = leftHi;
+        f.rightMin = rightLo;
+        f.rightMax = rightHi;
+        f.hasRight = hasRight;
+        f.reversed = o.yReversed;
+
+        // gridlines + left/right value labels
+        int leftSpan = leftHi - leftLo;
+        int rightSpan = rightHi - rightLo;
+        int k = 0;
+        while (k <= ticks) {
+            int lv = leftLo + leftSpan * k / ticks;
+            int gy = f.YOf(lv, 0);
+            if (o.showGrid) { c.FillRect(plotX, gy, plotW, 1, t.divider); }
+            string ls = Convert.ToString(lv);
+            int lw = Canvas.MeasureText(ls, fs);
+            c.DrawText(plotX - app.Scale(6) - lw, gy - fh / 2, ls, t.textTertiary, fs);
+            if (hasRight) {
+                int rv = rightLo + rightSpan * k / ticks;
+                c.DrawText(plotRight + app.Scale(6), gy - fh / 2, Convert.ToString(rv), t.textTertiary, fs);
+            }
+            k = k + 1;
+        }
+        c.FillRect(plotX, plotY, 1, plotH, t.borderSecondary);
+        c.FillRect(plotX, plotY + plotH, plotW, 1, t.borderSecondary);
+        if (hasRight) { c.FillRect(plotX + plotW, plotY, 1, plotH, t.borderSecondary); }
+
+        // x category labels
+        int n = labels.Count;
+        if (n > 0) {
+            int step = plotW / n;
+            int ci = 0;
+            while (ci < n) {
+                int cxs = plotX + ci * step;
+                c.DrawTextCentered(cxs, plotBot + app.Scale(4), step, fh + app.Scale(4), labels[ci], t.textTertiary, fs);
+                ci = ci + 1;
+            }
+        }
+
+        // axis titles
+        if (o.xTitle.Length > 0) {
+            c.DrawTextCentered(plotX, plotBot + app.Scale(6) + fh, plotW, fh, o.xTitle, t.textSecondary, fs);
+        }
+        if (o.yTitle.Length > 0) {
+            c.DrawText(plotX, plotTop, o.yTitle, t.textSecondary, fs);
+        }
+        if (o.y2Title.Length > 0) {
+            int yw = Canvas.MeasureText(o.y2Title, fs);
+            c.DrawText(plotX + plotW - yw, plotTop, o.y2Title, t.textSecondary, fs);
+        }
+
+        return f;
+    }
+
+    // ---- line / area ----
+
+    static void LineCore(App app, int x, int y, int w, int h, string title,
+                         List<string> labels, List<ChartSeries> series, bool filled) {
+        Canvas c = app.canvas;
+        c.PushClip(x, y, w, h);
+        int maxV = Chart.NiceMax(Chart.MaxOf(series));
+        int plotTop = Chart.DrawPanel(app, x, y, w, h, title, series);
+        ChartFrame f = Chart.DrawFrame(app, x, y, w, h, plotTop, labels, maxV);
+
+        int n = labels.Count;
+        if (n < 1) { c.PopClip(); return; }
+        int step = f.plotW / n;
+        int half = step / 2;
+        int th = app.Scale(2);
+        int rad = app.Scale(3);
+        int baseY = f.plotY + f.plotH;
+
+        int si = 0;
+        while (si < series.Count) {
+            ChartSeries s = series[si];
+            List<int> vs = s.values;
+
+            if (filled) {
+                List<int> fx = new List<int>();
+                List<int> fy = new List<int>();
+                int i = 0;
+                while (i < n && i < vs.Count) {
+                    fx.Add(f.plotX + i * step + half);
+                    fy.Add(f.plotY + f.plotH - (vs[i] * f.plotH / maxV));
+                    i = i + 1;
+                }
+                ChartView.FillUnder(c, fx, fy, baseY, s.color, false, 56, 56);
+            }
+
+            int prevX = 0;
+            int prevY = 0;
+            int j = 0;
+            while (j < n && j < vs.Count) {
+                int px = f.plotX + j * step + half;
+                int py = f.plotY + f.plotH - (vs[j] * f.plotH / maxV);
+                if (j > 0) { c.DrawLine(prevX, prevY, px, py, s.color, th); }
+                prevX = px;
+                prevY = py;
+                j = j + 1;
+            }
+            int m = 0;
+            while (m < n && m < vs.Count) {
+                int px = f.plotX + m * step + half;
+                int py = f.plotY + f.plotH - (vs[m] * f.plotH / maxV);
+                c.FillCircle(px, py, rad, s.color);
+                m = m + 1;
+            }
+            si = si + 1;
+        }
+        c.PopClip();
+    }
+
+    /// Multi-series line chart.
+    static void Line(App app, int x, int y, int w, int h, string title,
+                     List<string> labels, List<ChartSeries> series) {
+        Chart.LineCore(app, x, y, w, h, title, labels, series, false);
+    }
+
+    /// Line chart with the area under each series filled (translucent).
+    static void Area(App app, int x, int y, int w, int h, string title,
+                     List<string> labels, List<ChartSeries> series) {
+        Chart.LineCore(app, x, y, w, h, title, labels, series, true);
+    }
+
+    // ---- bars ----
+
+    /// Grouped vertical bar / column chart.
+    static void Bar(App app, int x, int y, int w, int h, string title,
+                    List<string> labels, List<ChartSeries> series) {
+        Canvas c = app.canvas;
+        c.PushClip(x, y, w, h);
+        int maxV = Chart.NiceMax(Chart.MaxOf(series));
+        int plotTop = Chart.DrawPanel(app, x, y, w, h, title, series);
+        ChartFrame f = Chart.DrawFrame(app, x, y, w, h, plotTop, labels, maxV);
+
+        int n = labels.Count;
+        int ns = series.Count;
+        if (n < 1 || ns < 1) { c.PopClip(); return; }
+        int step = f.plotW / n;
+        int groupW = step * 7 / 10;
+        int gap = app.Scale(2);
+        int barW = (groupW - gap * (ns - 1)) / ns;
+        if (barW < app.Scale(2)) { barW = app.Scale(2); }
+        int groupX0 = (step - groupW) / 2;
+        int rad = app.Scale(2);
+
+        int i = 0;
+        while (i < n) {
+            int slotX = f.plotX + i * step + groupX0;
+            int si = 0;
+            while (si < ns) {
+                List<int> vs = series[si].values;
+                int v = 0;
+                if (i < vs.Count) { v = vs[i]; }
+                int bh = v * f.plotH / maxV;
+                if (bh < 0) { bh = 0; }
+                int bx = slotX + si * (barW + gap);
+                int by = f.plotY + f.plotH - bh;
+                c.FillRoundRect(bx, by, barW, bh, rad, series[si].color);
+                si = si + 1;
+            }
+            i = i + 1;
+        }
+        c.PopClip();
+    }
+
+    /// Stacked vertical bar chart (series summed per category).
+    static void StackedBar(App app, int x, int y, int w, int h, string title,
+                           List<string> labels, List<ChartSeries> series) {
+        Canvas c = app.canvas;
+        c.PushClip(x, y, w, h);
+        int n = labels.Count;
+        int ns = series.Count;
+        int maxV = Chart.NiceMax(Chart.MaxStack(series, n));
+        int plotTop = Chart.DrawPanel(app, x, y, w, h, title, series);
+        ChartFrame f = Chart.DrawFrame(app, x, y, w, h, plotTop, labels, maxV);
+        if (n < 1 || ns < 1) { c.PopClip(); return; }
+
+        int step = f.plotW / n;
+        int barW = step * 5 / 10;
+        int barX0 = (step - barW) / 2;
+
+        int i = 0;
+        while (i < n) {
+            int bx = f.plotX + i * step + barX0;
+            int acc = 0;
+            int si = 0;
+            while (si < ns) {
+                List<int> vs = series[si].values;
+                int v = 0;
+                if (i < vs.Count) { v = vs[i]; }
+                int yTop = f.plotY + f.plotH - ((acc + v) * f.plotH / maxV);
+                int yBot = f.plotY + f.plotH - (acc * f.plotH / maxV);
+                c.FillRect(bx, yTop, barW, yBot - yTop, series[si].color);
+                acc = acc + v;
+                si = si + 1;
+            }
+            i = i + 1;
+        }
+        c.PopClip();
+    }
+
+    /// Grouped horizontal bar chart (categories down the left, values across).
+    static void HBar(App app, int x, int y, int w, int h, string title,
+                     List<string> labels, List<ChartSeries> series) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        c.PushClip(x, y, w, h);
+        int pad = t.paddingMedium;
+        int axisFs = t.fontSizeSmall;
+        int maxV = Chart.NiceMax(Chart.MaxOf(series));
+        int plotTop = Chart.DrawPanel(app, x, y, w, h, title, series);
+
+        int n = labels.Count;
+        int ns = series.Count;
+        if (n < 1 || ns < 1) { c.PopClip(); return; }
+
+        // widest category label sets the left gutter
+        int leftGut = app.Scale(20);
+        int li = 0;
+        while (li < n) {
+            int lw = Canvas.MeasureText(labels[li], axisFs);
+            if (lw + app.Scale(12) > leftGut) { leftGut = lw + app.Scale(12); }
+            li = li + 1;
+        }
+        int botGut = Canvas.FontHeight(axisFs) + app.Scale(8);
+        int plotX = x + pad + leftGut;
+        int plotY = plotTop;
+        int plotW = (x + w - pad) - plotX;
+        int plotH = (y + h - pad - botGut) - plotY;
+        if (plotW < app.Scale(20)) { plotW = app.Scale(20); }
+
+        // vertical value gridlines + labels
+        int ticks = 5;
+        int k = 0;
+        while (k <= ticks) {
+            int gx = plotX + k * plotW / ticks;
+            c.FillRect(gx, plotY, 1, plotH, t.divider);
+            string vs = Convert.ToString(maxV * k / ticks);
+            c.DrawTextCentered(gx - app.Scale(20), plotY + plotH + app.Scale(4), app.Scale(40), botGut, vs, t.textTertiary, axisFs);
+            k = k + 1;
+        }
+        c.FillRect(plotX, plotY, 1, plotH, t.borderSecondary);
+
+        int rowH = plotH / n;
+        int groupH = rowH * 7 / 10;
+        int gap = app.Scale(2);
+        int barH = (groupH - gap * (ns - 1)) / ns;
+        if (barH < app.Scale(2)) { barH = app.Scale(2); }
+        int groupY0 = (rowH - groupH) / 2;
+        int rad = app.Scale(2);
+
+        int i = 0;
+        while (i < n) {
+            int rowY = plotY + i * rowH;
+            c.DrawTextCentered(x + pad, rowY, leftGut - app.Scale(6), rowH, labels[i], t.textSecondary, axisFs);
+            int si = 0;
+            while (si < ns) {
+                List<int> vs = series[si].values;
+                int v = 0;
+                if (i < vs.Count) { v = vs[i]; }
+                int bw = v * plotW / maxV;
+                int by = rowY + groupY0 + si * (barH + gap);
+                c.FillRoundRect(plotX + 1, by, bw, barH, rad, series[si].color);
+                si = si + 1;
+            }
+            i = i + 1;
+        }
+        c.PopClip();
+    }
+
+    // ---- pie / donut ----
+
+    static void PieCore(App app, int x, int y, int w, int h, string title,
+                        List<string> names, List<int> values, int innerPct) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int pad = t.paddingMedium;
+
+        c.PushClip(x, y, w, h);
+        c.SurfaceRoundRect(x, y, w, h, t.borderRadiusMedium, t.bgPrimary, t.borderPrimary, 1);
+        int top = y + pad;
+        if (title.Length > 0) {
+            c.DrawText(x + pad, top, title, t.textPrimary, t.fontSizeLarge);
+        }
+        top = top + Canvas.FontHeight(t.fontSizeLarge) + app.Scale(6);
+
+        int total = 0;
+        int i = 0;
+        while (i < values.Count) { total = total + values[i]; i = i + 1; }
+        if (total <= 0) { c.PopClip(); return; }
+
+        // legend column on the right; pie fills the left region
+        int legendW = app.Scale(120);
+        int areaW = w - pad * 2 - legendW;
+        int areaH = (y + h - pad) - top;
+        int rOuter = areaW / 2;
+        if (areaH / 2 < rOuter) { rOuter = areaH / 2; }
+        if (rOuter < app.Scale(10)) { rOuter = app.Scale(10); }
+        int cx = x + pad + areaW / 2;
+        int cy = top + areaH / 2;
+        int rInner = rOuter * innerPct / 100;
+
+        int acc = 0;
+        int k = 0;
+        while (k < values.Count) {
+            int a0 = acc * 360 / total;
+            int a1 = (acc + values[k]) * 360 / total;
+            c.FillSector(cx, cy, rInner, rOuter, a0, a1, Chart.Palette(t, k));
+            acc = acc + values[k];
+            k = k + 1;
+        }
+
+        // legend: swatch + name + percent
+        int lx = x + w - pad - legendW;
+        int ly = top;
+        int sw = app.Scale(12);
+        int lh = Canvas.FontHeight(t.fontSizeSmall) + app.Scale(6);
+        int j = 0;
+        while (j < names.Count) {
+            c.FillRoundRect(lx, ly + app.Scale(2), sw, sw, t.borderRadiusSmall, Chart.Palette(t, j));
+            int pct = values[j] * 100 / total;
+            string lbl = names[j] + "  " + Convert.ToString(pct) + "%";
+            c.DrawText(lx + sw + app.Scale(6), ly + app.Scale(1), lbl, t.textSecondary, t.fontSizeSmall);
+            ly = ly + lh;
+            j = j + 1;
+        }
+        c.PopClip();
+    }
+
+    /// Pie chart with a right-hand legend showing each slice's percentage.
+    static void Pie(App app, int x, int y, int w, int h, string title,
+                    List<string> names, List<int> values) {
+        Chart.PieCore(app, x, y, w, h, title, names, values, 0);
+    }
+
+    /// Donut (ring) chart — a pie with a hollow center.
+    static void Donut(App app, int x, int y, int w, int h, string title,
+                      List<string> names, List<int> values) {
+        Chart.PieCore(app, x, y, w, h, title, names, values, 55);
+    }
+
+    // ---- scatter ----
+
+    /// Scatter plot of numeric (xs[i], ys[i]) points on value axes.
+    static void Scatter(App app, int x, int y, int w, int h, string title,
+                        List<int> xs, List<int> ys, int color) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int pad = t.paddingMedium;
+        int axisFs = t.fontSizeSmall;
+
+        c.PushClip(x, y, w, h);
+        c.SurfaceRoundRect(x, y, w, h, t.borderRadiusMedium, t.bgPrimary, t.borderPrimary, 1);
+        int top = y + pad;
+        if (title.Length > 0) {
+            c.DrawText(x + pad, top, title, t.textPrimary, t.fontSizeLarge);
+        }
+        top = top + Canvas.FontHeight(t.fontSizeLarge) + app.Scale(6);
+
+        int maxX = Chart.NiceMax(Chart.MaxInt(xs));
+        int maxY = Chart.NiceMax(Chart.MaxInt(ys));
+        int leftGut = Canvas.MeasureText(Convert.ToString(maxY), axisFs) + app.Scale(12);
+        int botGut = Canvas.FontHeight(axisFs) + app.Scale(8);
+        int plotX = x + pad + leftGut;
+        int plotY = top;
+        int plotW = (x + w - pad) - plotX;
+        int plotH = (y + h - pad - botGut) - plotY;
+        if (plotW < app.Scale(20)) { plotW = app.Scale(20); }
+        if (plotH < app.Scale(20)) { plotH = app.Scale(20); }
+
+        int ticks = 5;
+        int k = 0;
+        while (k <= ticks) {
+            int gy = plotY + plotH - (k * plotH / ticks);
+            c.FillRect(plotX, gy, plotW, 1, t.divider);
+            string vs = Convert.ToString(maxY * k / ticks);
+            int vw = Canvas.MeasureText(vs, axisFs);
+            c.DrawText(plotX - app.Scale(6) - vw, gy - Canvas.FontHeight(axisFs) / 2, vs, t.textTertiary, axisFs);
+            int gx = plotX + k * plotW / ticks;
+            c.DrawTextCentered(gx - app.Scale(20), plotY + plotH + app.Scale(4), app.Scale(40), botGut, Convert.ToString(maxX * k / ticks), t.textTertiary, axisFs);
+            k = k + 1;
+        }
+        c.FillRect(plotX, plotY, 1, plotH, t.borderSecondary);
+        c.FillRect(plotX, plotY + plotH, plotW, 1, t.borderSecondary);
+
+        int rad = app.Scale(4);
+        int i = 0;
+        while (i < xs.Count && i < ys.Count) {
+            int px = plotX + xs[i] * plotW / maxX;
+            int py = plotY + plotH - (ys[i] * plotH / maxY);
+            c.FillCircle(px, py, rad, color);
+            i = i + 1;
+        }
+        c.PopClip();
+    }
+}

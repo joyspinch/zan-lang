@@ -1,0 +1,287 @@
+using System;
+using Gui;
+using Gui.Backend;
+
+namespace Gui.Component;
+
+/// Embedded native web view (browser control).
+///
+/// Backed by a platform browser engine (WebViewBackend): an Edge WebView2
+/// controller on Windows, driven from Zan straight against its COM interfaces,
+/// a WKWebView on macOS, a placeholder elsewhere (a backend without a native
+/// engine returns no handle, so IsSupported() is false and Render paints an
+/// in-canvas notice instead of embedding a live browser).
+///
+/// The native view is a sibling layer that floats above the software-rendered
+/// surface, so drive it every frame from the owning region:
+///   WebView web = WebView.Create();
+///   web.NavComplete += () => { ... };   // fires when a load finishes
+///   web.Navigate("https://example.com");
+///   // per frame, for the visible tab:
+///   web.Render(app, x, y, w, h);
+///   // per frame, for hidden tabs:
+///   web.Hide();
+///
+/// Common browser features are exposed: history (Back/Forward/Reload/Stop),
+/// URL + title monitoring (reactive Url()/Title() signals + NavComplete),
+/// the last request URL and HTTP status, JavaScript evaluation (Eval, the
+/// general escape hatch for reading request params / response bodies) and
+/// cookie access (GetCookies/SetCookie/ClearCookies).
+class WebView {
+    int handle;        // native webview handle (0 = not yet created / unsupported)
+    string profileId;  // isolation profile: "" = shared default store, else per-account
+    bool created;      // native create attempted
+    bool supported;    // native backend produced a live webview
+    int lastNavSeq;    // last navigation counter observed (URL-change monitor)
+    string pendingUrl; // navigate requested before native creation
+    string pendingHtml;
+    string pendingBase;
+
+    string lastSeenRequest;
+    string lastSeenTitle;
+    bool lastSeenLoading;
+
+    SignalString url;
+    SignalString title;
+
+    /// Fires when a navigation finishes (or fails), i.e. the current URL/title
+    /// may have changed. Reactive Url()/Title() are updated just before it.
+    UiEvent NavComplete;
+    /// Fires when a new navigation is requested (LastRequest() is its URL).
+    UiEvent NavStart;
+    /// Fires when the document title changes, including in-page updates.
+    UiEvent TitleChanged;
+    /// Fires when loading starts or stops (IsLoading() tells which).
+    UiEvent LoadingChanged;
+
+    static WebView Create() {
+        return WebView.CreateWithProfile("");
+    }
+
+    /// Creates a WebView bound to an isolation profile. WebViews sharing the
+    /// same non-empty profileId share cookies/localStorage/session (same
+    /// account); different profileIds are fully isolated, so several accounts
+    /// can stay logged in at once. An empty profileId uses the shared default
+    /// store (legacy behavior). Profiles are honored on Windows (a per-profile
+    /// WebView2 user-data folder) and macOS; other platforms accept and ignore
+    /// the id.
+    static WebView CreateWithProfile(string profileId) {
+        WebView w = new WebView();
+        w.handle = 0;
+        w.profileId = profileId;
+        w.created = false;
+        w.supported = true;
+        w.lastNavSeq = 0;
+        w.pendingUrl = "";
+        w.pendingHtml = "";
+        w.pendingBase = "";
+        w.lastSeenRequest = "";
+        w.lastSeenTitle = "";
+        w.lastSeenLoading = false;
+        w.url = SignalString.Create("");
+        w.title = SignalString.Create("");
+        w.NavComplete = UiEvent.Create();
+        w.NavStart = UiEvent.Create();
+        w.TitleChanged = UiEvent.Create();
+        w.LoadingChanged = UiEvent.Create();
+        return w;
+    }
+
+    /// The isolation profile id this view was created with ("" = shared).
+    string ProfileId() { return profileId; }
+
+    void EnsureCreated(App app) {
+        if (created) { return; }
+        created = true;
+        handle = WebViewBackend.Create(app.window.GetHandle(), profileId);
+        if (handle == 0) {
+            supported = false;
+            return;
+        }
+        supported = true;
+        if (pendingUrl != "") {
+            WebViewBackend.Navigate(handle, pendingUrl);
+            pendingUrl = "";
+        } else if (pendingHtml != "") {
+            WebViewBackend.LoadHtml(handle, pendingHtml, pendingBase);
+            pendingHtml = "";
+            pendingBase = "";
+        }
+    }
+
+    /// True when a live native web view is available on this platform.
+    bool IsSupported() { return supported; }
+
+    /// Reactive current URL / document title (updated on each navigation).
+    SignalString Url() { return url; }
+    SignalString Title() { return title; }
+    string CurrentUrl() { return url.Get(); }
+    string CurrentTitle() { return title.Get(); }
+
+    /// Navigates to a URL. A bare host (no scheme) is treated as https://.
+    void Navigate(string target) {
+        string u = WebView.Normalize(target);
+        if (!created || !supported) {
+            pendingUrl = u;
+            pendingHtml = "";
+            return;
+        }
+        WebViewBackend.Navigate(handle, u);
+    }
+
+    /// Loads an in-memory HTML string (baseUrl resolves relative links; "" ok).
+    void LoadHtml(string html, string baseUrl) {
+        if (!created || !supported) {
+            pendingHtml = html;
+            pendingBase = baseUrl;
+            pendingUrl = "";
+            return;
+        }
+        WebViewBackend.LoadHtml(handle, html, baseUrl);
+    }
+
+    void Back() { if (supported && handle != 0) { WebViewBackend.Back(handle); } }
+    void Forward() { if (supported && handle != 0) { WebViewBackend.Forward(handle); } }
+    void Reload() { if (supported && handle != 0) { WebViewBackend.Reload(handle); } }
+    void Stop() { if (supported && handle != 0) { WebViewBackend.Stop(handle); } }
+
+    bool CanGoBack() {
+        if (!supported || handle == 0) { return false; }
+        return WebViewBackend.CanGoBack(handle);
+    }
+    bool CanGoForward() {
+        if (!supported || handle == 0) { return false; }
+        return WebViewBackend.CanGoForward(handle);
+    }
+    bool IsLoading() {
+        if (!supported || handle == 0) { return false; }
+        return WebViewBackend.IsLoading(handle);
+    }
+
+    /// HTTP status code of the last response (0 if none / non-HTTP).
+    int LastStatus() {
+        if (!supported || handle == 0) { return 0; }
+        return WebViewBackend.LastStatus(handle);
+    }
+    /// URL of the most recent navigation request seen by the view.
+    string LastRequest() {
+        if (!supported || handle == 0) { return ""; }
+        return WebViewBackend.LastRequest(handle);
+    }
+
+    /// Runs JavaScript in the page and returns its result stringified ("" on
+    /// error / no result). Use it to read request parameters, DOM state or a
+    /// response body fetched from the page.
+    string Eval(string js) {
+        if (!supported || handle == 0) { return ""; }
+        return WebViewBackend.Eval(handle, js);
+    }
+
+    /// Cookies for `url` serialized as "name=value; name2=value2" ("" if none).
+    /// Pass "" to get every cookie in the store.
+    string GetCookies(string forUrl) {
+        if (!supported || handle == 0) { return ""; }
+        return WebViewBackend.GetCookies(handle, forUrl);
+    }
+    /// Sets a cookie on the store for `url`'s host (path defaults to "/").
+    void SetCookie(string forUrl, string cookieName, string cookieValue) {
+        if (supported && handle != 0) {
+            WebViewBackend.SetCookie(handle, forUrl, cookieName, cookieValue);
+        }
+    }
+    /// Clears all cookies from the shared store.
+    void ClearCookies() {
+        if (supported && handle != 0) { WebViewBackend.ClearCookies(handle); }
+    }
+
+    /// Hides the native view (call for tabs/panes that are not on screen).
+    void Hide() {
+        if (created && supported && handle != 0) {
+            WebViewBackend.SetVisible(handle, false);
+        }
+    }
+
+    /// Destroys the native view and releases its resources.
+    void Destroy() {
+        if (created && supported && handle != 0) {
+            WebViewBackend.Destroy(handle);
+        }
+        handle = 0;
+        created = false;
+    }
+
+    /// Places the native view at the given client-area rect and shows it, then
+    /// polls the engine for changes, updating Url()/Title() and raising
+    /// NavStart / LoadingChanged / TitleChanged / NavComplete. The browser runs
+    /// on its own thread, so its events reach the UI as this per-frame diff.
+    /// On platforms without a native web view it paints an in-canvas
+    /// placeholder covering the same rect.
+    int Render(App app, int x, int y, int w, int h) {
+        EnsureCreated(app);
+        if (!supported) {
+            WebView.PaintPlaceholder(app, x, y, w, h);
+            return handle;
+        }
+        WebViewBackend.SetFrame(handle, x, y, w, h);
+        WebViewBackend.SetVisible(handle, true);
+
+        bool dirty = false;
+        string request = WebViewBackend.LastRequest(handle);
+        if (request != lastSeenRequest) {
+            lastSeenRequest = request;
+            if (request != "") { NavStart.Raise(); }
+            dirty = true;
+        }
+        bool busy = WebViewBackend.IsLoading(handle);
+        if (busy != lastSeenLoading) {
+            lastSeenLoading = busy;
+            LoadingChanged.Raise();
+            dirty = true;
+        }
+
+        int seq = WebViewBackend.NavSeq(handle);
+        if (seq != lastNavSeq) {
+            lastNavSeq = seq;
+            url.Set(WebViewBackend.GetUrl(handle));
+            title.Set(WebViewBackend.GetTitle(handle));
+            NavComplete.Raise();
+            dirty = true;
+        }
+        string docTitle = title.Get();
+        if (docTitle != lastSeenTitle) {
+            lastSeenTitle = docTitle;
+            TitleChanged.Raise();
+            dirty = true;
+        }
+        if (dirty) { app.RequestRedraw(); }
+        return handle;
+    }
+
+    static void PaintPlaceholder(App app, int x, int y, int w, int h) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        c.FillRect(x, y, w, h, t.bgSecondary);
+        c.DrawRect(x, y, w, h, t.borderPrimary, t.borderWidth);
+        c.DrawGlyphIn("globe", x, y - app.Scale(28),
+            w, h, t.iconSizeLarge, t.textTertiary);
+        c.DrawTextCentered(x, y + app.Scale(18), w, h,
+            "WebView needs a native backend (Windows WebView2 / macOS WKWebView)",
+            t.textSecondary, t.fontSizeMedium);
+    }
+
+    static string Normalize(string target) {
+        if (target == "") { return ""; }
+        if (WebView.HasScheme(target)) { return target; }
+        return "https://" + target;
+    }
+
+    static bool HasScheme(string s) {
+        int n = s.Length;
+        int i = 0;
+        while (i + 2 < n) {
+            if (s[i] == ':' && s[i + 1] == '/' && s[i + 2] == '/') { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+}

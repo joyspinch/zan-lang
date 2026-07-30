@@ -1,0 +1,1072 @@
+using System;
+using System.IO;
+using Gui;
+using Gui.Widget;
+
+namespace Gui.Component;
+
+/// One footer extension filter: a display label and its ";"-separated pattern
+/// ("" matches every file). One entity instead of parallel label/pattern lists.
+class FileFilter {
+    string label;
+    string pattern;
+
+    FileFilter(string label, string pattern) {
+        this.label = label;
+        this.pattern = pattern;
+    }
+}
+
+/// Reusable in-app path picker hosted in its own GUI window.
+class FilePicker {
+    static int lang;
+
+    Input pathInput;
+    Input nameInput;
+    Input folderInput;
+    SignalInt treeScroll;
+    SignalInt listScroll;
+    SignalBool showHidden;
+    App popup;
+    bool open;
+    bool closing;
+    bool creatingFolder;
+    bool treeDragging;
+    bool listDragging;
+    int treeDragOffset;
+    int listDragOffset;
+    int mode;
+    int result;
+    int skinIndex;
+    string title;
+    string suffix;
+    string selectedPath;
+    string statusText;
+    List<string> expanded;
+    /// Extension filters shown in the footer dropdown. Each FileFilter pairs a
+    /// human label (e.g. "Zan source (*.zan)") with a ";"-separated extension
+    /// pattern ("" = every file). filterSel is the chosen index; filterOpen
+    /// tracks the dropdown popup.
+    List<FileFilter> filters;
+    SignalInt filterSel;
+    bool filterOpen;
+    bool filtersCustom;
+
+    // Events, so a host does not have to poll TakeResult() every frame.
+    UiEvent Accepted;      // the user confirmed (read SelectedPath())
+    UiEvent Cancelled;     // the dialog was dismissed
+    UiEvent Closed;        // the dialog closed, either way
+    UiEvent PathChanged;   // the browsed directory changed
+    UiEvent FilterChanged; // the extension filter changed
+
+    static FilePicker Create() {
+        FilePicker picker = new FilePicker();
+        picker.pathInput = Input.Bind(SignalString.Create(""), "path");
+        picker.nameInput = Input.Bind(SignalString.Create(""), "file name");
+        picker.folderInput = Input.Bind(SignalString.Create(""), "folder name");
+        picker.treeScroll = SignalInt.Create(0);
+        picker.listScroll = SignalInt.Create(0);
+        picker.showHidden = SignalBool.Create(false);
+        picker.popup = null;
+        picker.open = false;
+        picker.closing = false;
+        picker.creatingFolder = false;
+        picker.treeDragging = false;
+        picker.listDragging = false;
+        picker.treeDragOffset = 0;
+        picker.listDragOffset = 0;
+        picker.mode = 0;
+        picker.result = 0;
+        picker.skinIndex = 0;
+        picker.title = "";
+        picker.suffix = "";
+        picker.selectedPath = "";
+        picker.statusText = "";
+        picker.expanded = new List<string>();
+        picker.filters = new List<FileFilter>();
+        picker.filterSel = SignalInt.Create(0);
+        picker.filterOpen = false;
+        picker.filtersCustom = false;
+        picker.Accepted = UiEvent.Create();
+        picker.Cancelled = UiEvent.Create();
+        picker.Closed = UiEvent.Create();
+        picker.PathChanged = UiEvent.Create();
+        picker.FilterChanged = UiEvent.Create();
+        picker.filterSel.Changed.Add(picker.RaiseFilterChanged);
+        return picker;
+    }
+
+    /// Provide explicit extension filters for the next open. Each entry pairs a
+    /// display label with a ";"-separated extension pattern ("" matches all),
+    /// e.g. SetFilters(["Zan (*.zan)", "Text (*.txt;*.md)", "All (*.*)"],
+    ///                  [".zan", ".txt;.md", ""]).
+    void SetFilters(List<string> labels, List<string> patterns) {
+        filters = new List<FileFilter>();
+        int i = 0;
+        while (i < labels.Count) {
+            string pat = "";
+            if (i < patterns.Count) { pat = patterns[i]; }
+            filters.Add(new FileFilter(labels[i], pat));
+            i = i + 1;
+        }
+        filtersCustom = true;
+        filterSel.Set(0);
+    }
+
+    static string T(string en, string zh) {
+        if (FilePicker.lang == 1) { return zh; }
+        return en;
+    }
+
+    static string Normalize(string path) {
+        string resultText = "";
+        int i = 0;
+        while (i < path.Length) {
+            string ch = path.Substring(i, 1);
+            if (ch == "\\") { resultText = resultText + "/"; }
+            else { resultText = resultText + ch; }
+            i = i + 1;
+        }
+        while (resultText.Length > 3
+               && resultText.Substring(resultText.Length - 1, 1) == "/") {
+            resultText = resultText.Substring(0, resultText.Length - 1);
+        }
+        return resultText;
+    }
+
+    static string LowerAscii(string text) {
+        string upper = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        string lower = "abcdefghijklmnopqrstuvwxyz";
+        string resultText = "";
+        int i = 0;
+        while (i < text.Length) {
+            string ch = text.Substring(i, 1);
+            int j = 0;
+            bool found = false;
+            while (j < 26 && !found) {
+                if (upper.Substring(j, 1) == ch) {
+                    resultText = resultText + lower.Substring(j, 1);
+                    found = true;
+                }
+                j = j + 1;
+            }
+            if (!found) { resultText = resultText + ch; }
+            i = i + 1;
+        }
+        return resultText;
+    }
+
+    static bool EndsWith(string text, string ending) {
+        if (ending == "") { return true; }
+        string left = FilePicker.LowerAscii(text);
+        string right = FilePicker.LowerAscii(ending);
+        if (right.Length > left.Length) { return false; }
+        return left.Substring(left.Length - right.Length, right.Length) == right;
+    }
+
+    static string Join(string dir, string name) {
+        if (dir.Length > 0 && dir.Substring(dir.Length - 1, 1) == "/") {
+            return dir + name;
+        }
+        return dir + "/" + name;
+    }
+
+    static string ParentDirectory(string dir) {
+        string parent = FilePicker.Normalize(Path.GetDirectoryName(dir));
+        if (parent.Length == 2
+            && parent.Substring(1, 1) == ":") {
+            parent = parent + "/";
+        }
+        return parent;
+    }
+
+    static string ValidDirectory(string initial) {
+        string dir = FilePicker.Normalize(initial);
+        if (Directory.FileExistsUtf8(dir)) {
+            dir = FilePicker.ParentDirectory(dir);
+        }
+        if (Directory.ExistsUtf8(dir)) { return dir; }
+        if (Directory.ExistsUtf8(".")) { return "."; }
+        return "";
+    }
+
+    static string RootOf(string dir) {
+        dir = FilePicker.Normalize(dir);
+        if (dir.Length >= 3 && dir.Substring(1, 2) == ":/") {
+            return dir.Substring(0, 3);
+        }
+        if (dir.Length > 0 && dir.Substring(0, 1) == "/") { return "/"; }
+        return dir;
+    }
+
+    static bool Inside(App app, int x, int y, int w, int h) {
+        return app.mouseX >= x && app.mouseX < x + w
+            && app.mouseY >= y && app.mouseY < y + h;
+    }
+
+    static bool Clicked(App app, int x, int y, int w, int h) {
+        return app.EventKind() == 3
+            && FilePicker.Inside(app, x, y, w, h);
+    }
+
+    static bool Pressed(App app, int x, int y, int w, int h) {
+        return app.EventKind() == 2
+            && FilePicker.Inside(app, x, y, w, h);
+    }
+
+    static int WheelStep(App app) {
+        int delta = app.window.EventKeyCode();
+        int step = delta / 120;
+        if (step == 0) {
+            if (delta > 0) { step = 1; }
+            else if (delta < 0) { step = 0 - 1; }
+        }
+        return step;
+    }
+
+    static bool ValidFolderName(string name) {
+        if (name == "" || name == "." || name == "..") { return false; }
+        int i = 0;
+        while (i < name.Length) {
+            string ch = name.Substring(i, 1);
+            if (ch == "/" || ch == "\\") { return false; }
+            i = i + 1;
+        }
+        return true;
+    }
+
+    bool IsExpanded(string path) {
+        int i = 0;
+        while (i < expanded.Count) {
+            if (expanded[i] == path) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    void Expand(string path) {
+        if (!IsExpanded(path)) { expanded.Add(path); }
+    }
+
+    void Collapse(string path) {
+        List<string> keep = new List<string>();
+        int i = 0;
+        while (i < expanded.Count) {
+            if (expanded[i] != path) { keep.Add(expanded[i]); }
+            i = i + 1;
+        }
+        expanded = keep;
+    }
+
+    void ExpandAncestors(string dir) {
+        string current = FilePicker.Normalize(dir);
+        int guard = 0;
+        while (current != "" && guard < 128) {
+            Expand(current);
+            string parent = FilePicker.ParentDirectory(current);
+            if (parent == "" || parent == current) { break; }
+            current = parent;
+            guard = guard + 1;
+        }
+    }
+
+    void BuildTree(
+        string dir,
+        int depth,
+        List<string> paths,
+        List<int> depths
+    ) {
+        if (paths.Count >= 400 || !Directory.ExistsUtf8(dir)) { return; }
+        paths.Add(dir);
+        depths.Add(depth);
+        if (!IsExpanded(dir)) { return; }
+
+        List<string> dirs = Directory.GetDirectoriesFiltered(
+            dir, showHidden.Get());
+        int i = 0;
+        while (i < dirs.Count && paths.Count < 400) {
+            string child = FilePicker.Join(dir, dirs[i]);
+            BuildTree(child, depth + 1, paths, depths);
+            i = i + 1;
+        }
+    }
+
+    void Begin(
+        int pickerMode,
+        string initial,
+        string extension,
+        string defaultName,
+        string dialogTitle
+    ) {
+        // Re-opening while a dialog is already up must not orphan the old
+        // window: close it first so exactly one picker window ever exists.
+        if (popup != null) {
+            popup.window.Close();
+            popup.window.Destroy();
+            popup = null;
+            open = false;
+        }
+        mode = pickerMode;
+        title = dialogTitle;
+        suffix = extension;
+        selectedPath = "";
+        statusText = "";
+        creatingFolder = false;
+        treeDragging = false;
+        listDragging = false;
+        filterOpen = false;
+        filterSel.Set(0);
+        // Rebuild auto filters each open (custom filters set via SetFilters are
+        // preserved). With no explicit filter set, synthesise one from
+        // `extension` plus an "All files" fallback so the footer always offers a
+        // filter dropdown.
+        if (!filtersCustom) {
+            filters = new List<FileFilter>();
+        }
+        if (pickerMode != 0 && filters.Count == 0) {
+            if (extension != "") {
+                filters.Add(new FileFilter(FilePicker.T("Files", "文件")
+                    + " (*" + extension + ")", extension));
+            }
+            filters.Add(new FileFilter(FilePicker.T("All files", "所有文件")
+                + " (*.*)", ""));
+        }
+        result = 0;
+        string dir = FilePicker.ValidDirectory(initial);
+        pathInput.SetText(dir);
+        nameInput.SetText(defaultName);
+        folderInput.SetText(FilePicker.T("New Folder", "新建文件夹"));
+        treeScroll.Set(0);
+        listScroll.Set(0);
+        showHidden.Set(false);
+        expanded = new List<string>();
+        ExpandAncestors(dir);
+        popup = App.CreateDark(dialogTitle, 980, 640);
+        popup.ApplySkin(skinIndex);
+        popup.SetChromeButtons(false, false, true, false);
+        popup.Show();
+        popup.RequestRedraw();
+        open = true;
+        closing = false;
+    }
+
+    void BeginFolder(string initial, string dialogTitle) {
+        Begin(0, initial, "", "", dialogTitle);
+    }
+
+    void BeginOpenFile(string initial, string extension, string dialogTitle) {
+        Begin(1, initial, extension, "", dialogTitle);
+    }
+
+    /// Open-file dialog with an explicit set of extension filters.
+    void BeginOpenFileFilters(
+        string initial,
+        List<string> labels,
+        List<string> patterns,
+        string dialogTitle
+    ) {
+        SetFilters(labels, patterns);
+        string first = "";
+        if (patterns.Count > 0) { first = FilePicker.FirstExt(patterns[0]); }
+        Begin(1, initial, first, "", dialogTitle);
+    }
+
+    /// First extension of a ";"-separated pattern ("" if the pattern is empty).
+    static string FirstExt(string pattern) {
+        if (pattern == "") { return ""; }
+        int i = 0;
+        while (i < pattern.Length) {
+            if (pattern.Substring(i, 1) == ";") { return pattern.Substring(0, i); }
+            i = i + 1;
+        }
+        return pattern;
+    }
+
+    /// True when `name` passes the currently-selected filter. An empty pattern
+    /// (All files) matches everything; otherwise any of the ";"-separated
+    /// extensions may match.
+    bool MatchesCurrentFilter(string name) {
+        if (filters.Count == 0) {
+            return FilePicker.EndsWith(name, suffix);
+        }
+        int sel = filterSel.Get();
+        if (sel < 0 || sel >= filters.Count) { return true; }
+        string pattern = filters[sel].pattern;
+        if (pattern == "") { return true; }
+        int start = 0;
+        int i = 0;
+        while (i <= pattern.Length) {
+            bool end = i == pattern.Length;
+            if (end || pattern.Substring(i, 1) == ";") {
+                string ext = pattern.Substring(start, i - start);
+                if (ext != "" && FilePicker.EndsWith(name, ext)) { return true; }
+                start = i + 1;
+            }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    void BeginSaveFile(
+        string initial,
+        string extension,
+        string defaultName,
+        string dialogTitle
+    ) {
+        Begin(2, initial, extension, defaultName, dialogTitle);
+    }
+
+    void ApplySkin(int index) {
+        if (skinIndex == index) { return; }
+        skinIndex = index;
+        if (popup != null) { popup.ApplySkin(index); }
+    }
+
+    bool IsOpen() { return open; }
+    bool NeedsRedraw() {
+        return open && popup != null && popup.needsRedraw;
+    }
+    bool OwnsWindow(nint hwnd) {
+        return popup != null && hwnd == popup.WindowHandle();
+    }
+    string SelectedPath() { return selectedPath; }
+    string CurrentDirectory() {
+        return FilePicker.Normalize(pathInput.GetText());
+    }
+
+    void RaiseFilterChanged() { FilterChanged.Raise(); }
+
+    void Finish(int action) {
+        if (!open) { return; }
+        result = action;
+        open = false;
+        closing = true;
+        if (popup != null) { popup.window.Close(); }
+        if (action == 1) { Accepted.Raise(); } else { Cancelled.Raise(); }
+        Closed.Raise();
+    }
+
+    void Close() {
+        selectedPath = "";
+        Finish(2);
+    }
+
+    bool ApplyEvent(nint evHwnd) {
+        if (!OwnsWindow(evHwnd)) { return true; }
+        int kind = popup.EventKind();
+        if (kind == 8) {
+            if (!closing && result == 0) {
+                result = 2;
+                selectedPath = "";
+                Cancelled.Raise();
+                Closed.Raise();
+            }
+            open = false;
+            closing = false;
+            popup.window.Destroy();
+            popup = null;
+            return false;
+        }
+        bool keep = popup.ApplyEvent(evHwnd);
+        if (kind == 13 && popup != null) { popup.RequestRedraw(); }
+        return keep;
+    }
+
+    int TakeResult() {
+        int resultCode = result;
+        result = 0;
+        return resultCode;
+    }
+
+    void Navigate(string dir) {
+        dir = FilePicker.Normalize(dir);
+        if (!Directory.ExistsUtf8(dir)) {
+            statusText = FilePicker.T("Folder not found.", "找不到文件夹。");
+            return;
+        }
+        pathInput.SetText(dir);
+        selectedPath = "";
+        statusText = "";
+        listScroll.Set(0);
+        PathChanged.Raise();
+        ExpandAncestors(dir);
+        if (popup != null) { popup.RequestRedraw(); }
+    }
+
+    void RenderWindow() {
+        if (!open || popup == null || !popup.needsRedraw) { return; }
+        popup.BeginFrame();
+        // The dialog is immediate-mode but shares the process-wide WidgetId
+        // counter with the main window, which only the main loop rewinds. Pin a
+        // fixed high baseline for the dialog's own frame so its buttons get
+        // identical ids every frame (otherwise hover/press never match the
+        // pointer target the framework resolved on the previous frame) without
+        // colliding with the main app's id space; restore afterwards.
+        int savedSeq = WidgetId.SeqValue();
+        WidgetId.SetSeq(900000);
+        RenderContent(popup);
+        popup.RenderChrome(title);
+        WidgetId.SetSeq(savedSeq);
+        popup.PresentFrame();
+    }
+
+    void RenderContent(App app) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int W = c.Width();
+        int H = c.Height();
+        app.RenderBackground(0, 0, W, H, 6);
+        int pad = t.paddingLarge;
+        int top = app.ContentTop() + pad;
+
+        int upW = app.Scale(72);
+        int goW = app.Scale(64);
+        int newW = app.Scale(132);
+        int pathX = pad + upW + t.gapSmall;
+        int pathW = W - pad - pad - upW - goW - newW
+            - t.gapSmall - t.gapSmall - t.gapMedium;
+        new Button { Text = FilePicker.T("Up", "上一级") }.Render(
+            app, pad, top, upW);
+        pathInput.Render(app, pathX, top, pathW, t.heightMedium);
+        int goX = pathX + pathW + t.gapSmall;
+        new Button { Text = FilePicker.T("Go", "转到") }.Render(
+            app, goX, top, goW);
+        int newX = goX + goW + t.gapMedium;
+        new Button { Text = FilePicker.T("New Folder", "新建文件夹") }.Render(
+            app, newX, top, newW);
+
+        string dir = FilePicker.Normalize(pathInput.GetText());
+        bool valid = Directory.ExistsUtf8(dir);
+        int paneY = top + t.heightMedium + t.gapMedium;
+
+        if (creatingFolder) {
+            int labelW = app.Scale(112);
+            int createW = app.Scale(88);
+            int cancelW = app.Scale(88);
+            c.DrawText(pad, paneY + app.Scale(8),
+                FilePicker.T("Folder name", "文件夹名称"),
+                t.textSecondary, t.fontSizeMedium);
+            int inputX = pad + labelW;
+            int buttonsW = createW + cancelW + t.gapSmall;
+            int inputW = W - inputX - pad - buttonsW - t.gapMedium;
+            folderInput.Render(app, inputX, paneY, inputW, t.heightMedium);
+            int createX = inputX + inputW + t.gapMedium;
+            new Button { Text = FilePicker.T("Create", "创建"), Class = "primary" }.Render(
+                app, createX, paneY, createW);
+            int folderCancelX = createX + createW + t.gapSmall;
+            new Button { Text = FilePicker.T("Cancel", "取消") }.Render(
+                app, folderCancelX, paneY, cancelW);
+
+            if (FilePicker.Clicked(
+                    app, createX, paneY, createW, t.heightMedium)) {
+                string folderName = folderInput.GetText();
+                if (!valid) {
+                    statusText = FilePicker.T(
+                        "Choose a valid parent folder.",
+                        "请选择有效的父文件夹。");
+                } else if (!FilePicker.ValidFolderName(folderName)) {
+                    statusText = FilePicker.T(
+                        "Enter a valid folder name.",
+                        "请输入有效的文件夹名称。");
+                } else {
+                    string created = FilePicker.Join(dir, folderName);
+                    if (!Directory.ExistsUtf8(created)) {
+                        Directory.CreateDirectoryUtf8(created);
+                    }
+                    if (Directory.ExistsUtf8(created)) {
+                        creatingFolder = false;
+                        Navigate(created);
+                    } else {
+                        statusText = FilePicker.T(
+                            "Could not create the folder.",
+                            "无法创建文件夹。");
+                    }
+                }
+            } else if (FilePicker.Clicked(
+                    app, folderCancelX, paneY, cancelW, t.heightMedium)) {
+                creatingFolder = false;
+                statusText = "";
+                app.RequestRedraw();
+            }
+            paneY = paneY + t.heightMedium + t.gapMedium;
+        }
+
+        int footerH = t.heightMedium + t.gapMedium;
+        if (mode == 2) {
+            footerH = t.heightMedium * 2 + t.gapMedium * 2;
+        }
+        int paneH = H - paneY - footerH - pad;
+        int treeW = app.Scale(292);
+        int paneGap = t.gapMedium;
+        int listX = pad + treeW + paneGap;
+        int listW = W - listX - pad;
+        int scrollW = app.Scale(12);
+        int rowH = app.Scale(32);
+
+        c.FillRoundRect(
+            pad, paneY, treeW, paneH,
+            t.borderRadiusMedium, t.bgSecondary);
+        c.DrawRoundRect(pad, paneY, treeW, paneH, t.borderRadiusMedium, t.borderSecondary, 1);
+        c.FillRoundRect(
+            listX, paneY, listW, paneH,
+            t.borderRadiusMedium, t.bgSecondary);
+        c.DrawRoundRect(listX, paneY, listW, paneH, t.borderRadiusMedium, t.borderSecondary, 1);
+
+        // --- Extension-filter dropdown geometry + interaction (footer, left of
+        // the accept/cancel buttons). Handled here, before the tree/list click
+        // gate, so an open menu swallows this frame's click. Painted last. ---
+        bool showFilter = mode != 0 && filters.Count > 0;
+        int fBtnW = app.Scale(112);
+        int fCancelX = W - pad - fBtnW - t.gapMedium - fBtnW;
+        int filterW = app.Scale(210);
+        int filterX = fCancelX - t.gapMedium - filterW;
+        int filterRowY = paneY + paneH + t.gapMedium;
+        if (mode == 2) { filterRowY = filterRowY + t.heightMedium + t.gapMedium; }
+        int filterMenuH = filters.Count * t.heightMedium + t.paddingTiny * 2;
+        int filterMenuY = filterRowY - filterMenuH - app.Scale(4);
+        bool suppressOthers = false;
+        if (showFilter) {
+            bool onTrigger = FilePicker.Clicked(
+                app, filterX, filterRowY, filterW, t.heightMedium);
+            if (filterOpen) {
+                suppressOthers = true;
+                int fi2 = 0;
+                while (fi2 < filters.Count) {
+                    int iy = filterMenuY + t.paddingTiny + fi2 * t.heightMedium;
+                    if (FilePicker.Clicked(app, filterX, iy, filterW, t.heightMedium)
+                            && fi2 != filterSel.Get()) {
+                        filterSel.Set(fi2);
+                        suffix = FilePicker.FirstExt(filters[fi2].pattern);
+                        selectedPath = "";
+                        listScroll.Set(0);
+                    }
+                    fi2 = fi2 + 1;
+                }
+                if (app.EventKind() == 3) {
+                    filterOpen = false;
+                    app.RequestRedraw();
+                }
+            } else if (onTrigger) {
+                filterOpen = true;
+                suppressOthers = true;
+                app.RequestRedraw();
+            }
+        }
+
+        bool releaseConsumed = treeDragging || listDragging || suppressOthers;
+
+        List<string> treePaths = new List<string>();
+        List<int> treeDepths = new List<int>();
+        List<string> roots = Directory.GetRootsUtf8();
+        int rootIndex = 0;
+        while (rootIndex < roots.Count) {
+            if (Directory.ExistsUtf8(roots[rootIndex])) {
+                BuildTree(
+                    roots[rootIndex], 0, treePaths, treeDepths);
+            }
+            rootIndex = rootIndex + 1;
+        }
+
+        int treeRows = paneH / rowH;
+        if (treeRows < 1) { treeRows = 1; }
+        int treeMax = treePaths.Count - treeRows;
+        if (treeMax < 0) { treeMax = 0; }
+        int treeOff = treeScroll.Get();
+        bool overTree = FilePicker.Inside(
+            app, pad, paneY, treeW, paneH);
+        bool ownsTreeWheel = app.CaptureWheel(pad, paneY, treeW, paneH);
+        if (overTree && ownsTreeWheel) {
+            treeOff = treeOff - FilePicker.WheelStep(app) * 3;
+            app.RequestRedraw();
+        }
+        if (treeOff < 0) { treeOff = 0; }
+        if (treeOff > treeMax) { treeOff = treeMax; }
+
+        int treeShown = 0;
+        while (treeOff + treeShown < treePaths.Count
+               && treeShown < treeRows) {
+            int idx = treeOff + treeShown;
+            string path = treePaths[idx];
+            int depth = treeDepths[idx];
+            int rowY = paneY + treeShown * rowH;
+            int rowId = app.focus.AllocId();
+            bool selected = path == dir;
+            if (selected) {
+                c.FillRect(
+                    pad + 1, rowY, treeW - scrollW - 2,
+                    rowH, t.primaryHover);
+            } else if (app.focus.IsHovered(rowId)) {
+                c.FillRect(
+                    pad + 1, rowY, treeW - scrollW - 2,
+                    rowH, t.bgHover);
+            }
+            int indent = app.Scale(16) * depth;
+            int arrowX = pad + t.paddingSmall + indent;
+            string chev = "chevron-right";
+            if (IsExpanded(path)) { chev = "chevron-down"; }
+            c.DrawGlyphIn(chev, arrowX, rowY, t.iconSizeSmall, rowH,
+                t.iconSizeSmall, t.textSecondary);
+            string display = Path.GetFileName(path);
+            if (display == "") { display = path; }
+            int textX = arrowX + app.Scale(18);
+            int textW = pad + treeW - scrollW
+                - app.Scale(8) - textX;
+            display = Ellipsis.Fit(
+                display, textW, t.fontSizeMedium);
+            c.DrawText(
+                textX, rowY + app.Scale(7),
+                display, t.textPrimary, t.fontSizeMedium);
+            app.hitTester.Register(HitRegion.Create(
+                rowId, pad + 1, rowY,
+                treeW - scrollW - 2, rowH, 0));
+
+            if (!releaseConsumed && FilePicker.Clicked(
+                    app, arrowX - app.Scale(4), rowY,
+                    app.Scale(20), rowH)) {
+                if (IsExpanded(path)) { Collapse(path); }
+                else { Expand(path); }
+                app.RequestRedraw();
+            } else if (!releaseConsumed && FilePicker.Clicked(
+                    app, arrowX + app.Scale(16), rowY,
+                    treeW - (arrowX - pad) - scrollW - app.Scale(16),
+                    rowH)) {
+                Navigate(path);
+            }
+            treeShown = treeShown + 1;
+        }
+
+        if (treePaths.Count > treeRows) {
+            int trackX = pad + treeW - scrollW;
+            int thumbH = paneH * treeRows / treePaths.Count;
+            if (thumbH < app.Scale(24)) { thumbH = app.Scale(24); }
+            int range = paneH - thumbH;
+            int thumbY = paneY;
+            if (treeMax > 0) {
+                thumbY = paneY + range * treeOff / treeMax;
+            }
+            c.FillRect(trackX, paneY, scrollW, paneH, t.bgTertiary);
+            c.FillRoundRect(
+                trackX + app.Scale(2), thumbY,
+                scrollW - app.Scale(4), thumbH,
+                app.Scale(3), t.primary);
+
+            if (FilePicker.Pressed(
+                    app, trackX, thumbY, scrollW, thumbH)) {
+                treeDragging = true;
+                treeDragOffset = app.mouseY - thumbY;
+            } else if (FilePicker.Pressed(
+                    app, trackX, paneY, scrollW, paneH)) {
+                treeDragging = true;
+                treeDragOffset = thumbH / 2;
+                if (range > 0) {
+                    treeOff = (app.mouseY - paneY - treeDragOffset)
+                        * treeMax / range;
+                }
+                app.RequestRedraw();
+            }
+            if (treeDragging && app.EventKind() == 1 && range > 0) {
+                treeOff = (app.mouseY - paneY - treeDragOffset)
+                    * treeMax / range;
+                app.RequestRedraw();
+            }
+        }
+
+        List<string> names = new List<string>();
+        List<string> paths = new List<string>();
+        List<int> kinds = new List<int>();
+        if (valid) {
+            List<string> dirs = Directory.GetDirectoriesFiltered(
+                dir, showHidden.Get());
+            int di = 0;
+            while (di < dirs.Count) {
+                names.Add(dirs[di]);
+                paths.Add(FilePicker.Join(dir, dirs[di]));
+                kinds.Add(1);
+                di = di + 1;
+            }
+            if (mode != 0) {
+                List<string> files = Directory.GetFilesFiltered(
+                    dir, showHidden.Get());
+                int fi = 0;
+                while (fi < files.Count) {
+                    if (MatchesCurrentFilter(files[fi])) {
+                        names.Add(files[fi]);
+                        paths.Add(FilePicker.Join(dir, files[fi]));
+                        kinds.Add(0);
+                    }
+                    fi = fi + 1;
+                }
+            }
+        }
+
+        int listRows = paneH / rowH;
+        if (listRows < 1) { listRows = 1; }
+        int listMax = names.Count - listRows;
+        if (listMax < 0) { listMax = 0; }
+        int listOff = listScroll.Get();
+        bool overList = FilePicker.Inside(
+            app, listX, paneY, listW, paneH);
+        bool ownsListWheel = app.CaptureWheel(
+            listX, paneY, listW, paneH);
+        if (overList && ownsListWheel) {
+            listOff = listOff - FilePicker.WheelStep(app) * 3;
+            app.RequestRedraw();
+        }
+        if (listOff < 0) { listOff = 0; }
+        if (listOff > listMax) { listOff = listMax; }
+
+        int clicked = 0 - 1;
+        int shown = 0;
+        while (listOff + shown < names.Count && shown < listRows) {
+            int idx = listOff + shown;
+            int rowY = paneY + shown * rowH;
+            int rowId = app.focus.AllocId();
+            bool selected = selectedPath == paths[idx];
+            if (selected) {
+                c.FillRect(
+                    listX + 1, rowY, listW - scrollW - 2,
+                    rowH, t.primaryHover);
+            } else if (app.focus.IsHovered(rowId)) {
+                c.FillRect(
+                    listX + 1, rowY, listW - scrollW - 2,
+                    rowH, t.bgHover);
+            }
+            int color = t.textPrimary;
+            string iconName = "file";
+            int iconColor = t.textSecondary;
+            if (kinds[idx] == 1) {
+                iconName = "folder";
+                iconColor = t.primary;
+                color = t.primary;
+            }
+            int iconSize = t.iconSizeSmall;
+            int iconX = listX + t.paddingMedium;
+            int iconY = rowY + (rowH - iconSize) / 2;
+            c.DrawGlyph(iconName, iconX, iconY, iconSize, iconColor);
+            int textX = iconX + iconSize + t.gapSmall;
+            int textW = listX + listW - scrollW
+                - app.Scale(8) - textX;
+            string shownName = Ellipsis.Fit(
+                names[idx], textW, t.fontSizeMedium);
+            c.DrawText(
+                textX, rowY + app.Scale(7),
+                shownName, color, t.fontSizeMedium);
+            app.hitTester.Register(HitRegion.Create(
+                rowId, listX + 1, rowY,
+                listW - scrollW - 2, rowH, 0));
+            if (!releaseConsumed && FilePicker.Clicked(
+                    app, listX + 1, rowY,
+                    listW - scrollW - 2, rowH)) {
+                clicked = idx;
+            }
+            shown = shown + 1;
+        }
+
+        if (names.Count == 0) {
+            string emptyText = FilePicker.T(
+                "This folder is empty.", "此文件夹为空。");
+            if (!valid) {
+                emptyText = FilePicker.T(
+                    "Folder not found.", "找不到文件夹。");
+            }
+            c.DrawText(
+                listX + pad, paneY + pad,
+                emptyText, t.textTertiary, t.fontSizeMedium);
+        }
+
+        if (names.Count > listRows) {
+            int trackX = listX + listW - scrollW;
+            int thumbH = paneH * listRows / names.Count;
+            if (thumbH < app.Scale(24)) { thumbH = app.Scale(24); }
+            int range = paneH - thumbH;
+            int thumbY = paneY;
+            if (listMax > 0) {
+                thumbY = paneY + range * listOff / listMax;
+            }
+            c.FillRect(trackX, paneY, scrollW, paneH, t.bgTertiary);
+            c.FillRoundRect(
+                trackX + app.Scale(2), thumbY,
+                scrollW - app.Scale(4), thumbH,
+                app.Scale(3), t.primary);
+
+            if (FilePicker.Pressed(
+                    app, trackX, thumbY, scrollW, thumbH)) {
+                listDragging = true;
+                listDragOffset = app.mouseY - thumbY;
+            } else if (FilePicker.Pressed(
+                    app, trackX, paneY, scrollW, paneH)) {
+                listDragging = true;
+                listDragOffset = thumbH / 2;
+                if (range > 0) {
+                    listOff = (app.mouseY - paneY - listDragOffset)
+                        * listMax / range;
+                }
+                app.RequestRedraw();
+            }
+            if (listDragging && app.EventKind() == 1 && range > 0) {
+                listOff = (app.mouseY - paneY - listDragOffset)
+                    * listMax / range;
+                app.RequestRedraw();
+            }
+        }
+
+        if (treeOff < 0) { treeOff = 0; }
+        if (treeOff > treeMax) { treeOff = treeMax; }
+        if (listOff < 0) { listOff = 0; }
+        if (listOff > listMax) { listOff = listMax; }
+        treeScroll.Set(treeOff);
+        listScroll.Set(listOff);
+
+        if (app.EventKind() == 3) {
+            treeDragging = false;
+            listDragging = false;
+        }
+
+        if (!suppressOthers && FilePicker.Clicked(
+                app, pad, top, upW, t.heightMedium)) {
+            string parent = FilePicker.ParentDirectory(dir);
+            if (Directory.ExistsUtf8(parent)) { Navigate(parent); }
+        } else if (!suppressOthers && FilePicker.Clicked(
+                app, goX, top, goW, t.heightMedium)) {
+            Navigate(pathInput.GetText());
+        } else if (!suppressOthers && FilePicker.Clicked(
+                app, newX, top, newW, t.heightMedium)) {
+            if (valid) {
+                creatingFolder = true;
+                folderInput.SetText(FilePicker.T(
+                    "New Folder", "新建文件夹"));
+                statusText = "";
+                app.RequestRedraw();
+            }
+        } else if (!suppressOthers && clicked >= 0 && clicked < paths.Count) {
+            if (kinds[clicked] == 1) {
+                Navigate(paths[clicked]);
+            } else {
+                selectedPath = paths[clicked];
+                nameInput.SetText(names[clicked]);
+                statusText = "";
+                app.RequestRedraw();
+            }
+        }
+
+        int footerY = paneY + paneH + t.gapMedium;
+        if (mode == 2) {
+            c.DrawText(
+                pad, footerY + app.Scale(8),
+                FilePicker.T("File name", "文件名"),
+                t.textSecondary, t.fontSizeMedium);
+            nameInput.Render(
+                app, pad + app.Scale(84), footerY,
+                W - pad - pad - app.Scale(84),
+                t.heightMedium);
+            footerY = footerY + t.heightMedium + t.gapMedium;
+        }
+
+        string info = "";
+        if (mode != 0 && selectedPath != "") {
+            info = Path.GetFileName(selectedPath);
+        }
+        if (statusText != "") { info = statusText; }
+        int infoColor = t.textTertiary;
+        if (statusText != "") { infoColor = t.error; }
+        bool hiddenBefore = showHidden.Get();
+        Checkbox hidden = Checkbox.Bind(
+            FilePicker.T("Show hidden files", "显示隐藏文件"), showHidden);
+        // The filter popup owns the click while it is open.
+        hidden.Disabled = suppressOthers;
+        hidden.Render(app, pad, footerY);
+        if (hiddenBefore != showHidden.Get()) {
+            treeScroll.Set(0);
+            listScroll.Set(0);
+            app.RequestRedraw();
+        }
+        int infoX = pad + app.Scale(176);
+        c.DrawText(
+            infoX, footerY + app.Scale(8),
+            info, infoColor, t.fontSizeSmall);
+
+        int buttonW = app.Scale(112);
+        int acceptX = W - pad - buttonW;
+        int cancelX = acceptX - t.gapMedium - buttonW;
+        string acceptText = FilePicker.T(
+            "Select Folder", "选择文件夹");
+        if (mode == 1) { acceptText = FilePicker.T("Open", "打开"); }
+        if (mode == 2) { acceptText = FilePicker.T("Save", "保存"); }
+        new Button { Text = FilePicker.T("Cancel", "取消") }.Render(
+            app, cancelX, footerY, buttonW);
+        new Button { Text = acceptText, Class = "primary" }.Render(
+            app, acceptX, footerY, buttonW);
+
+        // Extension-filter dropdown, painted after the buttons so its open menu
+        // layers above them. Interaction was resolved earlier in the frame.
+        if (showFilter) {
+            int fTextY = filterRowY
+                + (t.heightMedium - Canvas.FontHeight(t.fontSizeMedium)) / 2;
+            c.FillRoundRect(filterX, filterRowY, filterW, t.heightMedium,
+                t.borderRadiusMedium, t.bgTertiary);
+            c.DrawRoundRect(filterX, filterRowY, filterW, t.heightMedium,
+                t.borderRadiusMedium, t.borderPrimary, 1);
+            string flabel = Ellipsis.Fit(filters[filterSel.Get()].label,
+                filterW - t.paddingMedium * 2 - t.iconSizeSmall, t.fontSizeMedium);
+            c.DrawText(filterX + t.paddingMedium, fTextY, flabel,
+                t.textPrimary, t.fontSizeMedium);
+            c.DrawGlyphIn("chevron-down",
+                filterX + filterW - t.paddingMedium - t.iconSizeSmall, filterRowY,
+                t.iconSizeSmall, t.heightMedium, t.iconSizeSmall, t.textSecondary);
+            if (filterOpen) {
+                c.FillRoundRect(filterX + 1, filterMenuY + 2, filterW,
+                    filterMenuH, t.borderRadiusMedium, t.shadowColor);
+                c.FillRoundRect(filterX, filterMenuY, filterW, filterMenuH,
+                    t.borderRadiusMedium, t.bgPrimary);
+                c.DrawRoundRect(filterX, filterMenuY, filterW, filterMenuH,
+                    t.borderRadiusMedium, t.borderPrimary, 1);
+                app.BlockHitsRect(filterX, filterMenuY, filterW, filterMenuH);
+                int mi = 0;
+                while (mi < filters.Count) {
+                    int iy = filterMenuY + t.paddingTiny + mi * t.heightMedium;
+                    if (mi == filterSel.Get()) {
+                        c.FillRect(filterX + 1, iy, filterW - 2,
+                            t.heightMedium, t.bgActive);
+                    } else if (FilePicker.Inside(app, filterX, iy, filterW,
+                            t.heightMedium)) {
+                        c.FillRect(filterX + 1, iy, filterW - 2,
+                            t.heightMedium, t.bgHover);
+                    }
+                    int iTextY = iy
+                        + (t.heightMedium - Canvas.FontHeight(t.fontSizeMedium)) / 2;
+                    c.DrawText(filterX + t.paddingMedium, iTextY,
+                        filters[mi].label, t.textPrimary, t.fontSizeMedium);
+                    mi = mi + 1;
+                }
+            }
+        }
+
+        if (!suppressOthers && FilePicker.Clicked(
+                app, cancelX, footerY, buttonW, t.heightMedium)) {
+            selectedPath = "";
+            Finish(2);
+        } else if (!suppressOthers && FilePicker.Clicked(
+                app, acceptX, footerY, buttonW, t.heightMedium)) {
+            if (mode == 0 && valid) {
+                selectedPath = dir;
+                Finish(1);
+            } else if (mode == 1
+                       && Directory.FileExistsUtf8(selectedPath)) {
+                Finish(1);
+            } else if (mode == 1) {
+                statusText = FilePicker.T(
+                    "Select a file first.", "请先选择文件。");
+                app.RequestRedraw();
+            } else if (mode == 2
+                       && valid && nameInput.GetText() != "") {
+                string name = nameInput.GetText();
+                if (suffix != ""
+                    && !FilePicker.EndsWith(name, suffix)) {
+                    name = name + suffix;
+                }
+                selectedPath = FilePicker.Join(dir, name);
+                Finish(1);
+            }
+        }
+    }
+}

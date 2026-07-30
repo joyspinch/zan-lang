@@ -1,0 +1,1289 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+namespace Gui.Component.DataTable;
+
+/// A column descriptor for DataTable.
+/// cellType: 0 text, 1 link, 2 tag, 3 progress, 4 badge
+/// align:    0 left, 1 center, 2 right
+class DataColumn {
+    string title;
+    /// Stable name for this column, independent of its position and of its
+    /// (translatable) title. Set it with `DataColumn.Field(c, "name")` and pass
+    /// it to `DataTable.Col(cols, "name")` to get the index, so application code
+    /// and saved layouts survive a column being inserted, moved or renamed.
+    /// Empty means "unnamed": such a column can only be addressed by index.
+    string field;
+    int width;
+    int cellType;
+    int align;
+    bool sortable;
+    bool filterable;
+    bool resizable;
+    int tagType;
+    bool numeric;
+    int summary;   // total-row aggregate: 0 none,1 sum,2 avg,3 min,4 max,5 count,6 derived
+
+    // ---- derived summary (summary==6): computed from OTHER columns' aggregate
+    // values, so it costs O(1) and never scans the rows.
+    // deriveOp: 0 percent (A*100/B), 1 ratio (A/B), 2 diff (A-B), 3 sum (A+B), 4 product (A*B)
+    // deriveA / deriveB: source column indices whose aggregate values feed the op
+    int deriveOp;
+    int deriveA;
+    int deriveB;
+
+    // ---- conditional formatting ----
+    int cfMode;    // 0 none,1 data bar,2 color scale,3 highlight >,4 highlight <
+    int cfColor;   // data-bar / low-end / highlight accent color
+    int cfColor2;  // color-scale high-end color
+    int cfThreshold; // highlight comparison value
+
+    // ---- display formatting (affects the rendered string only; sort/filter
+    // still see the raw cell value) ----
+    int fmt;       // 0 raw, 1 formatted (prefix + optionally grouped digits + suffix)
+    bool grouped;  // insert thousands separators into the integer part
+    string prefix; // leading text, e.g. a currency symbol
+    string suffix; // trailing text, e.g. "%"
+
+    // Fractional digits for a numeric column. 0 keeps the historical integer
+    // path (sort/aggregate via CellNum); > 0 switches the column to the real
+    // path: values are parsed as double, compared and totalled without losing
+    // the fraction, and rendered at exactly this many decimal places.
+    int decimals;
+
+    // ---- date columns ----
+    // isDate switches the column onto the day-number key path: cells are parsed
+    // with ParseDate, sorted and grouped on days since the epoch, and rendered
+    // with FormatDate. dateOrder names the field order of the *stored* text
+    // (0 y-m-d, 1 d-m-y, 2 m-d-y); dateFmt names the rendered pattern; and
+    // dateGroup buckets values when grouping (0 day, 1 year, 2 month,
+    // 3 quarter, 4 weekday).
+    bool isDate;
+    int dateOrder;
+    int dateFmt;
+    int dateGroup;
+
+    // ---- bool columns ----
+    // isBool switches the column onto the truth-value key path: cells are read
+    // with ParseBool, sorted false-before-true, and drawn per boolStyle
+    // (0 checkbox, 1 check/cross glyph, 2 text). boolTrue/boolFalse name the
+    // text form written back on toggle and shown by style 2.
+    bool isBool;
+    int boolStyle;
+    string boolTrue;
+    string boolFalse;
+
+    // ---- editing ----
+    bool editable; // cell values can be edited inline (opt-in)
+
+    // Which editor a cell opens. 0 = plain text box; 1 = dropdown, picking from
+    // `choices`; 2 = calendar, for date columns; 3 = numeric spinner stepping by
+    // `editStep`. Bool columns ignore this — they toggle in place.
+    int editorKind;
+    List<string> choices;   // dropdown items (editorKind 1)
+    bool choicesStrict;     // dropdown: reject anything not in `choices`
+    double editStep;        // spinner increment (editorKind 3)
+
+    // Declarative validation, checked on commit before the CellValidating event
+    // gets its say. A column may use any combination.
+    bool required;          // reject an empty value
+    int maxLength;          // reject longer input (0 = unlimited)
+    bool hasMin;            // enforce editMin as a lower bound
+    bool hasMax;            // enforce editMax as an upper bound
+    double editMin;
+    double editMax;
+
+    // ---- pinning / freeze ----
+    // 0 = scrolls with the rest, 1 = frozen to the left edge, 2 = frozen to the
+    // right edge. A frozen column is hoisted out of the scrolling band and
+    // keeps its screen position while the middle pans underneath it.
+    int freeze;
+
+    // ---- band (multi-level header) ----
+    // Slash-separated path of the header groups this column sits under, outermost
+    // first: "" is ungrouped, "Contact" is one level, "Contact/Address" is two.
+    // The header grows one row per level and spans a group across the adjacent
+    // columns sharing its path — so the grouping is a property of the columns
+    // themselves and cannot fall out of sync with them.
+    string band;
+
+    static DataColumn Create(string title, int width) {
+        DataColumn col = new DataColumn();
+        col.title = title;
+        col.field = "";
+        col.width = width;
+        col.cellType = 0;
+        col.align = 0;
+        col.sortable = true;
+        col.filterable = true;
+        col.resizable = true;
+        col.tagType = 1;
+        col.numeric = false;
+        col.summary = 0;
+        col.deriveOp = 0;
+        col.deriveA = 0;
+        col.deriveB = -1;
+        col.cfMode = 0;
+        col.cfColor = 0;
+        col.cfColor2 = 0;
+        col.cfThreshold = 0;
+        col.fmt = 0;
+        col.grouped = false;
+        col.prefix = "";
+        col.suffix = "";
+        col.decimals = 0;
+        col.isDate = false;
+        col.dateOrder = 0;
+        col.dateFmt = 0;
+        col.dateGroup = 0;
+        col.isBool = false;
+        col.boolStyle = 0;
+        col.boolTrue = "true";
+        col.boolFalse = "false";
+        col.editable = false;
+        col.editorKind = 0;
+        col.choices = new List<string>();
+        col.choicesStrict = true;
+        col.editStep = 1.0;
+        col.required = false;
+        col.maxLength = 0;
+        col.hasMin = false;
+        col.hasMax = false;
+        col.editMin = 0.0;
+        col.editMax = 0.0;
+        col.freeze = 0;
+        col.band = "";
+        return col;
+    }
+
+    /// Name this column so it can be addressed by `DataTable.Col(cols, name)`
+    /// instead of a literal index. Composes like the other builders:
+    ///
+    /// ```zan
+    /// cols.Add(DataColumn.Field(DataColumn.Text("Name", 140), "name"));
+    /// int ci = DataTable.Col(cols, "name");
+    /// ```
+    static DataColumn Field(DataColumn c, string name) {
+        c.field = name; return c;
+    }
+
+    /// Opt a column in to inline editing (double/second-click a cell or press
+    /// F2/Enter). Numeric columns validate input on commit.
+    static DataColumn Editable(DataColumn c) {
+        c.editable = true; return c;
+    }
+
+    // ---- editor configurators (all imply Editable) ----
+    /// Edit this column through a dropdown list. Typing filters the list, and
+    /// by default only a listed value commits; pass `strict = false` to allow
+    /// free text alongside the suggestions.
+    static DataColumn Dropdown(DataColumn c, List<string> items, bool strict) {
+        c.editable = true;
+        c.editorKind = 1;
+        c.choices = items;
+        c.choicesStrict = strict;
+        return c;
+    }
+
+    /// Edit this column through a month calendar. Implies `AsDate` so the
+    /// picked day round-trips through the column's own parse/format pair.
+    static DataColumn DatePicker(DataColumn c) {
+        c.editable = true;
+        c.editorKind = 2;
+        c.isDate = true;
+        return c;
+    }
+
+    /// Edit this column through a numeric spinner: Up/Down and the +/- buttons
+    /// step by `step`, and the value stays a number.
+    static DataColumn Spinner(DataColumn c, double step) {
+        c.editable = true;
+        c.editorKind = 3;
+        c.numeric = true;
+        c.align = 2;
+        if (step <= 0.0) { step = 1.0; }
+        c.editStep = step;
+        return c;
+    }
+
+    // ---- declarative validation (checked on commit) ----
+    /// Reject an empty value.
+    static DataColumn Required(DataColumn c) {
+        c.required = true; return c;
+    }
+
+    /// Reject input longer than `n` characters (0 clears the limit).
+    static DataColumn MaxLength(DataColumn c, int n) {
+        if (n < 0) { n = 0; }
+        c.maxLength = n; return c;
+    }
+
+    /// Constrain a numeric column to [lo, hi] on commit.
+    static DataColumn Range(DataColumn c, double lo, double hi) {
+        c.numeric = true;
+        c.hasMin = true; c.hasMax = true;
+        c.editMin = lo; c.editMax = hi;
+        return c;
+    }
+
+    /// Constrain a numeric column to values >= lo.
+    static DataColumn MinValue(DataColumn c, double lo) {
+        c.numeric = true; c.hasMin = true; c.editMin = lo; return c;
+    }
+
+    /// Constrain a numeric column to values <= hi.
+    static DataColumn MaxValue(DataColumn c, double hi) {
+        c.numeric = true; c.hasMax = true; c.editMax = hi; return c;
+    }
+
+    /// Freeze a column to the left edge: it is hoisted ahead of the scrolling
+    /// columns and stays put while they pan underneath it.
+    static DataColumn Pin(DataColumn c) {
+        c.freeze = 1; return c;
+    }
+
+    /// Freeze a column to the right edge, where a running total or a row's
+    /// actions belong: it stays reachable no matter how far the middle is
+    /// scrolled, which is the whole reason to put them there.
+    static DataColumn PinRight(DataColumn c) {
+        c.freeze = 2; return c;
+    }
+
+    /// Put this column under a header group, growing the header a row:
+    ///
+    /// ```zan
+    /// cols.Add(DataColumn.Band(DataColumn.Text("Street", 160), "Address"));
+    /// cols.Add(DataColumn.Band(DataColumn.Text("City", 120), "Address"));
+    /// ```
+    ///
+    /// Adjacent columns with the same path share one spanning cell. Nest with a
+    /// slash, outermost first — "Contact/Address" sits under a "Contact" cell
+    /// that also spans whatever else names Contact. Passing "" ungroups.
+    static DataColumn Band(DataColumn c, string path) {
+        c.band = path; return c;
+    }
+
+    // ---- display-format configurators (compose onto any column) ----
+    /// Fractional digits for a numeric column: switches sorting, aggregation
+    /// and conditional formatting onto the real (double) path and renders at
+    /// exactly `n` decimal places. `Decimals(c, 0)` restores the integer path.
+    static DataColumn Decimals(DataColumn c, int n) {
+        if (n < 0) { n = 0; }
+        c.decimals = n; c.numeric = true; c.align = 2;
+        if (n > 0) { c.fmt = 1; }
+        return c;
+    }
+
+    /// A fractional numeric column, e.g. `DataColumn.Real("Rate", 90, 2)`.
+    static DataColumn Real(string title, int width, int decimals) {
+        return DataColumn.Decimals(DataColumn.Create(title, width), decimals);
+    }
+
+    // ---- date configurators ----
+    /// Treat a column as a date: cells are parsed to a day number, so they sort
+    /// and group chronologically instead of lexically. `order` names the field
+    /// order of the stored text (0 y-m-d, 1 d-m-y, 2 m-d-y); a 4-digit leading
+    /// field is always read as the year regardless.
+    static DataColumn AsDate(DataColumn c, int order) {
+        c.isDate = true;
+        c.dateOrder = order;
+        c.numeric = false;
+        return c;
+    }
+
+    /// An ISO-style date column, e.g. `DataColumn.Date("Ordered", 110)`.
+    static DataColumn Date(string title, int width) {
+        return DataColumn.AsDate(DataColumn.Create(title, width), 0);
+    }
+
+    /// Rendered date pattern: 0 YYYY-MM-DD, 1 DD/MM/YYYY, 2 MM/DD/YYYY,
+    /// 3 YYYY年M月D日, 4 YYYY-MM, 5 YYYY, 6 "1 Jan 2026".
+    static DataColumn DateFormat(DataColumn c, int fmt) {
+        c.isDate = true; c.dateFmt = fmt; return c;
+    }
+
+    /// Bucket dates when this column is grouped: 0 exact day, 1 year, 2 month,
+    /// 3 quarter, 4 weekday.
+    static DataColumn DateGroup(DataColumn c, int mode) {
+        c.isDate = true; c.dateGroup = mode; return c;
+    }
+
+    // ---- bool configurators ----
+    /// Treat a column as a truth value: cells are read with ParseBool ("1",
+    /// "true", "yes", "y", "on", "\u2713" and their negatives, case-insensitive),
+    /// sort false-before-true, and draw centred per `style`
+    /// (0 checkbox, 1 check/cross glyph, 2 text).
+    static DataColumn AsBool(DataColumn c, int style) {
+        c.isBool = true;
+        c.boolStyle = style;
+        c.align = 1;
+        c.numeric = false;
+        return c;
+    }
+
+    /// A checkbox column, e.g. `DataColumn.Bool("Active", 70)`. Combine with
+    /// `Editable` to let a click toggle the cell.
+    static DataColumn Bool(string title, int width) {
+        return DataColumn.AsBool(DataColumn.Create(title, width), 0);
+    }
+
+    /// The text written back when a bool cell is toggled, and shown by style 2.
+    /// Defaults to "true"/"false"; use e.g. `BoolText(c, "Yes", "No")`.
+    static DataColumn BoolText(DataColumn c, string yes, string no) {
+        c.isBool = true; c.boolTrue = yes; c.boolFalse = no; return c;
+    }
+
+    /// Currency: thousands-grouped digits with a leading symbol, right-aligned.
+    /// Defaults to 2 decimal places; use `Decimals` afterwards to override.
+    static DataColumn Money(DataColumn c, string symbol) {
+        c.fmt = 1; c.grouped = true; c.prefix = symbol; c.numeric = true; c.align = 2;
+        if (c.decimals == 0) { c.decimals = 2; }
+        return c;
+    }
+    /// Percent: appends "%", right-aligned.
+    static DataColumn Percent(DataColumn c) {
+        c.fmt = 1; c.suffix = "%"; c.numeric = true; c.align = 2; return c;
+    }
+    /// Thousands separators only (e.g. 1234567 -> 1,234,567).
+    static DataColumn Grouped(DataColumn c) {
+        c.fmt = 1; c.grouped = true; c.numeric = true; c.align = 2; return c;
+    }
+    /// Arbitrary prefix/suffix (either may be empty), e.g. units like " kg".
+    static DataColumn Affix(DataColumn c, string prefix, string suffix) {
+        c.fmt = 1; c.prefix = prefix; c.suffix = suffix; return c;
+    }
+
+    // ---- conditional-format configurators (static so they compose without
+    // relying on instance-method chaining) ----
+    static DataColumn DataBar(DataColumn c, int color) {
+        c.cfMode = 1; c.cfColor = color; return c;
+    }
+    static DataColumn ColorScale(DataColumn c, int lowColor, int highColor) {
+        c.cfMode = 2; c.cfColor = lowColor; c.cfColor2 = highColor; return c;
+    }
+    static DataColumn HighlightGreater(DataColumn c, int threshold, int color) {
+        c.cfMode = 3; c.cfThreshold = threshold; c.cfColor = color; return c;
+    }
+    static DataColumn HighlightLess(DataColumn c, int threshold, int color) {
+        c.cfMode = 4; c.cfThreshold = threshold; c.cfColor = color; return c;
+    }
+
+    /// Marks a column as fixed-width: users can't drag its right border and the
+    /// pointer shows a not-allowed cursor over the (would-be) resize grip.
+    static DataColumn NotResizable(DataColumn c) {
+        c.resizable = false; return c;
+    }
+
+    static DataColumn Text(string title, int width) {
+        return DataColumn.Create(title, width);
+    }
+
+    static DataColumn Numeric(string title, int width) {
+        DataColumn c = DataColumn.Create(title, width);
+        c.numeric = true;
+        c.align = 2;
+        return c;
+    }
+
+    static DataColumn Link(string title, int width) {
+        DataColumn c = DataColumn.Create(title, width);
+        c.cellType = 1;
+        return c;
+    }
+
+    static DataColumn TagCol(string title, int width, int tagType) {
+        DataColumn c = DataColumn.Create(title, width);
+        c.cellType = 2;
+        c.tagType = tagType;
+        c.align = 1;
+        return c;
+    }
+
+    static DataColumn ProgressCol(string title, int width) {
+        DataColumn c = DataColumn.Create(title, width);
+        c.cellType = 3;
+        c.numeric = true;
+        return c;
+    }
+
+    static DataColumn BadgeCol(string title, int width) {
+        DataColumn c = DataColumn.Create(title, width);
+        c.cellType = 4;
+        c.align = 1;
+        return c;
+    }
+
+    /// A numeric column whose summary is derived from other columns' aggregates
+    /// (no per-row scan). `op` is 0 percent / 1 ratio / 2 diff / 3 sum / 4 product;
+    /// `a` and `b` are the source column indices.
+    static DataColumn Derived(string title, int width, int op, int a, int b) {
+        DataColumn c = DataColumn.Create(title, width);
+        c.numeric = true;
+        c.align = 2;
+        c.summary = 6;
+        c.deriveOp = op;
+        c.deriveA = a;
+        c.deriveB = b;
+        return c;
+    }
+
+    // ---- footer-aggregate configurators (show a total row for this column) ----
+    static DataColumn Sum(DataColumn c) { c.summary = 1; return c; }
+    static DataColumn Avg(DataColumn c) { c.summary = 2; return c; }
+    static DataColumn Min(DataColumn c) { c.summary = 3; return c; }
+    static DataColumn Max(DataColumn c) { c.summary = 4; return c; }
+    static DataColumn Count(DataColumn c) { c.summary = 5; return c; }
+}
+
+/// One row of string cells. Build with Create() then Push() per column.
+class DataRow {
+    List<string> cells;
+
+    static DataRow Create() {
+        DataRow r = new DataRow();
+        r.cells = new List<string>();
+        return r;
+    }
+
+    void Push(string v) {
+        cells.Add(v);
+    }
+
+    string At(int i) {
+        if (i < 0) { return ""; }
+        if (i >= cells.Count) { return ""; }
+        return cells[i];
+    }
+
+    void Set(int i, string v) {
+        if (i < 0) { return; }
+        while (cells.Count <= i) { cells.Add(""); }
+        cells[i] = v;
+    }
+}
+
+/// Per-column filter with three cooperating stages (all optional):
+///  1. set filter   \u2014 values present in `hidden` are removed (Values tab);
+///  2. text filter  \u2014 `textMode` (1 contains / 2 equals / 3 starts / 4 ends)
+///     tested against `textQuery` (Text Filters tab);
+///  3. batch filter \u2014 each entry in `batchTerms` is matched (exact or
+///     substring per `batchExact`); `batchKeep` keeps matches, else excludes.
+class ColFilter {
+    List<string> hidden;
+    int textMode;
+    string textQuery;
+    List<string> batchTerms;
+    bool batchExact;
+    bool batchKeep;
+
+    // ---- comparison filter (stage 4) ----
+    // Compares the cell against cmpA (and cmpB for the two-sided modes) using
+    // the column's own ordering, so a numeric column compares by value, a date
+    // column by day and a bool column by truth — never lexically.
+    // cmpMode: 0 off, 1 >, 2 >=, 3 <, 4 <=, 5 ==, 6 !=, 7 between (inclusive),
+    //          8 not between, 9 is empty, 10 is not empty
+    int cmpMode;
+    string cmpA;
+    string cmpB;
+
+    // ---- date preset (stage 5) ----
+    // A relative window resolved against "today" at filter time, so a saved
+    // layout keeps meaning tomorrow. Resolves to an inclusive day range.
+    // 0 off, 1 today, 2 yesterday, 3 this week (from Sunday), 4 last 7 days,
+    // 5 this month, 6 last 30 days, 7 this quarter, 8 this year, 9 year to
+    // date, 10 past (before today), 11 future (after today)
+    int datePreset;
+
+    // ---- top-N (stage 6, applied to the whole set, not per row) ----
+    // 0 off, 1 top N, 2 bottom N, 3 top N percent, 4 bottom N percent,
+    // 5 above average, 6 below average
+    int topMode;
+    int topN;
+
+    static ColFilter Create() {
+        ColFilter f = new ColFilter();
+        f.hidden = new List<string>();
+        f.textMode = 1;
+        f.textQuery = "";
+        f.batchTerms = new List<string>();
+        f.batchExact = false;
+        f.batchKeep = true;
+        f.cmpMode = 0;
+        f.cmpA = "";
+        f.cmpB = "";
+        f.datePreset = 0;
+        f.topMode = 0;
+        f.topN = 10;
+        return f;
+    }
+
+    bool IsHidden(string v) {
+        return hidden.Contains(v);
+    }
+
+    void Toggle(string v) {
+        int idx = hidden.IndexOf(v);
+        if (idx >= 0) {
+            hidden.RemoveAt(idx);
+        } else {
+            hidden.Add(v);
+        }
+    }
+
+    bool Active() {
+        if (hidden.Count > 0) { return true; }
+        if (textQuery.Length > 0) { return true; }
+        if (batchTerms.Count > 0) { return true; }
+        if (cmpMode != 0) { return true; }
+        if (datePreset != 0) { return true; }
+        if (topMode != 0) { return true; }
+        return false;
+    }
+
+    /// Whether this filter needs the whole filtered set before it can decide
+    /// (top-N and above/below-average), rather than judging one row at a time.
+    bool NeedsSetPass() { return topMode != 0; }
+
+    /// Drop every stage, restoring the column to unfiltered.
+    void Reset() {
+        hidden.Clear();
+        textMode = 1;
+        textQuery = "";
+        batchTerms.Clear();
+        batchExact = false;
+        batchKeep = true;
+        cmpMode = 0;
+        cmpA = "";
+        cmpB = "";
+        datePreset = 0;
+        topMode = 0;
+        topN = 10;
+    }
+}
+
+/// One active sort key: the column index and its direction (1 asc, 2 desc).
+/// Replaces the old index-aligned sortCols/sortDirs parallel lists.
+class SortKey {
+    int col;
+    int dir;
+
+    SortKey(int c, int d) {
+        col = c;
+        dir = d;
+    }
+}
+
+/// One bar in the chart-from-selection overlay: its category label and value.
+/// Replaces the old index-aligned chartLabels/chartVals parallel lists.
+class ChartBar {
+    string label;
+    int val;
+
+    ChartBar(string l, int v) {
+        label = l;
+        val = v;
+    }
+}
+
+/// One spanning cell in a multi-level header: the group's own label, the header
+/// row it occupies (0 = outermost), and the half-open slice [from, to) of the
+/// *visible order* it covers. `path` is the full slash-separated key, which is
+/// what collapse state is stored under — the label alone would collide between
+/// two groups that happen to share a leaf name under different parents.
+class BandSpan {
+    string label;
+    string path;
+    int level;
+    int from;
+    int to;
+
+    BandSpan(string l, string p, int lv, int f, int tt) {
+        label = l;
+        path = p;
+        level = lv;
+        from = f;
+        to = tt;
+    }
+}
+
+/// One entry in the flattened display model: `kind` 0 = data row, 1 = group
+/// header, 2 = detail band (a master-detail panel under an expanded data row);
+/// `row` = data-row index (kind 0 and kind 2) or GroupRow index (kind 1);
+/// `no` = 1-based data ordinal for data rows, else 0. Replaces the old
+/// index-aligned dispKind/dispRow/dispNo parallel lists.
+///
+/// A detail band occupies `DataTable.DetailSlots(st)` *consecutive* kind-2
+/// entries, all naming the same master row. Keeping the band an integer number
+/// of row slots is what lets the body keep addressing rows by
+/// `bodyTop + slot * rowH` — a genuinely variable row height would force every
+/// scroll, hit-test and drag calculation onto a cumulative-height table. `part`
+/// says which slot of the band this is (0 = first), so the renderer can draw the
+/// panel once, on its first slot, and skip the rest.
+class DispRow {
+    int kind;
+    int row;
+    int no;
+    /// Index of this slot within a multi-slot detail band (0 for every other
+    /// kind). Only meaningful when kind == 2.
+    int part;
+
+    DispRow(int k, int r, int n) {
+        kind = k;
+        row = r;
+        no = n;
+        part = 0;
+    }
+}
+
+/// One group-header row in a grouped table: caption, nesting level, contained
+/// data-row count, full path key (collapse lookup) and collapsed snapshot.
+/// Replaces the old index-aligned grpLabel/grpLevel/grpCount/grpKey/grpCollapsed
+/// parallel lists.
+///
+/// `aggValues` / `aggTexts` are the per-column subtotal for just this group's
+/// member rows (index-aligned with the table's column list), computed once in
+/// BuildDisplay so the group header can show DevExpress-style group summaries
+/// (e.g. "Category: Electronics (42)  Revenue: \u00a51,234,567") at no extra
+/// per-frame cost.
+class GroupRow {
+    string label;
+    int level;
+    int count;
+    string key;
+    bool collapsed;
+    List<int> aggValues;
+    List<string> aggTexts;
+
+    GroupRow(string lb, int lv, int cnt, string k, bool coll) {
+        label = lb;
+        level = lv;
+        count = cnt;
+        key = k;
+        collapsed = coll;
+        aggValues = new List<int>();
+        aggTexts = new List<string>();
+    }
+}
+
+/// Per-frame layout geometry for one DataTable render. Computed once by
+/// `DataTable.ComputeFrame` (the render prologue) and read by every drawing /
+/// hit-test / interaction pass, so header / filter row / cells / summary /
+/// scrollbars all stay aligned by construction. Purely transient: nothing here
+/// is persisted between frames (that is `DataTableState`).
+///
+/// `vorder` is the visible column order sliced into three bands
+/// [frozen-left | scrolling | frozen-right]; `colX`/`colBand` give each entry's
+/// screen x and owning band (0/1/2). All coordinates are already resolved for
+/// the current `scrollX`, group-panel strip and frozen-band clamping.
+class DataTableFrame {
+    int y;                 // header top (below the group panel, if shown)
+    int viewH;             // widget height minus the group-panel strip
+    int numW;              // row-number gutter width (0 when hidden)
+    int selW;              // selection gutter width (0 when hidden)
+    int gridColor;
+    int menuIconW;
+    int clipRight;         // right edge content may not spill past
+    int firstDataX;        // left edge of the first data column
+    int dataViewW;
+    int titleRowH;
+    int rowH;
+    int fs;                // body font size
+    int bandRowH;          // multi-level header band row height
+    int bandLevels;        // number of band rows above the titles
+    int headerH;           // full header height (bands + titles)
+    int titleTop;          // top of the column-title row
+    int pinnedW;           // left frozen band width
+    int pinnedRW;          // right frozen band width
+    int bandX;             // left edge of the scrolling middle band
+    int bandW;             // width of the scrolling middle band
+    int bandNatW;          // natural (unscrolled) width of the middle band
+    int maxScrollX;        // horizontal scroll range
+    int rightX;            // left edge of the right frozen band
+    int panelY;            // group-panel strip top
+    int groupPanelH;       // group-panel strip height (0 when hidden)
+    List<int> vorder;      // visible column order (frozen-left|middle|frozen-right)
+    List<int> colX;        // screen x per vorder entry
+    List<int> colBand;     // owning band per vorder entry (0/1/2)
+}
+
+/// Persisted DataTable state — create once (outside the frame loop) and pass in
+/// every frame so selection / sort / filter / scroll survive across repaints.
+class DataTableState {
+    bool inited;
+    int sortCol;
+    int sortDir;
+    // Multi-column sort keys (outer→inner priority). sortCol/sortDir mirror the
+    // primary (index 0) key for back-compat; an empty list means "unsorted".
+    List<SortKey> sortKeys;
+    List<bool> selected;
+    List<int> colWidths;
+    List<int> dispW;
+    List<int> order;
+    List<ColFilter> filters;
+    int openMenu;
+    int scrollRow;
+    int scrollX;               // horizontal pixel offset into the data columns
+    int resizeCol;
+    int resizeStartX;
+    int resizeStartW;
+    bool dirty;
+
+    int filterTab;
+    string searchText;
+    int valScroll;
+    int editFocus;
+    List<string> batchLines;
+    int batchExactFlag;
+    List<string> menuVals;
+    List<string> menuMatched;
+    string menuSearchCache;
+
+    bool showRowNum;
+    bool showSelect;
+    bool striped;
+
+    // ---- summary (total) row ----
+    bool showSummary;
+    List<int> aggMode;         // per column: 0 none,1 sum,2 avg,3 min,4 max,5 count,6 derived
+    List<int> aggValue;        // cached raw aggregate value per column (feeds derived columns)
+    List<double> aggReal;      // exact aggregate per column (fractional columns / averages)
+    List<string> summaryText;  // cached formatted aggregate per column
+
+    // ---- conditional formatting: per-column min/max over the filtered set,
+    // cached so data-bar / color-scale cells normalise without a per-frame scan ----
+    List<int> cfMin;
+    List<int> cfMax;
+    // Same range as cfMin/cfMax but exact, so data bars and colour scales on
+    // fractional columns normalise without collapsing to integer buckets.
+    List<double> cfMinR;
+    List<double> cfMaxR;
+
+    // ---- pagination ----
+    bool paged;
+    SignalInt pageModel;       // 1-based current page, bound to the Pagination widget
+    int pageRows;              // rows per page (auto-fit), recomputed each frame
+
+    // ---- two-way data bindings (compiler-lowered Binding; optional) ----
+    /// Bound primary selection: `st.selection = vm.selectedRow;` keeps the
+    /// selected row in sync both ways. The bound value is the source-row index
+    /// of the first selected row (-1 when nothing is selected); writing it from
+    /// the model exclusively selects that row.
+    Binding<int> selection;
+    /// Bound current page: `st.page = vm.page;` keeps the 1-based page number
+    /// (pageModel) in sync both ways.
+    Binding<int> page;
+    int lastSelSync;           // last reconciled selection value (newer side wins)
+    int lastPageSync;          // last reconciled page value (newer side wins)
+
+    // ---- selection & interaction ----
+    int selAnchor;             // order-index anchor for shift range row-select (-1 none)
+    int rangeR0;               // cell-range start row (order-index, -1 = no range)
+    int rangeC0;               // cell-range start column
+    int rangeR1;               // cell-range end row (order-index)
+    int rangeC1;               // cell-range end column
+    bool rangeDrag;            // currently drag-selecting a cell range
+    int dragRow;               // order-index position of row being drag-reordered (-1 none)
+    int dragStartY;            // pointer Y where a row press began
+    bool dragMoved;            // pointer moved enough to become a reorder drag
+    bool ctxOpen;              // right-click context menu open
+    int ctxX;                  // context-menu anchor X
+    int ctxY;                  // context-menu anchor Y
+    List<bool> colHidden;      // per-column visibility (true = hidden from view)
+    List<int> colFreeze;       // per-column freeze: 0 none, 1 left edge, 2 right edge
+    List<int> colOrder;        // user column order (master sequence of column indices)
+    // Header-band paths the user has collapsed. A collapsed band shows only its
+    // first column, so a wide group can be folded down to a stub without
+    // hiding it outright — the columns keep their state and come back intact.
+    List<string> bandCollapsed;
+    // Columns hidden by the collapse above, so unfolding restores exactly those
+    // and leaves any column the user hid by hand alone.
+    List<int> bandAutoHidden;
+    int dragCol;               // column index being header-drag-reordered (-1 none)
+    int dragColStartX;         // pointer X where the header press began
+    bool dragColMoved;         // pointer moved enough to become a reorder drag
+    int dropVis;               // visual insertion slot during a column drag (-1 none)
+    bool hdrCtxOpen;           // header right-click context menu open
+    int hdrCtxCol;             // column the header context menu targets
+    int hdrCtxX;               // header context-menu anchor X
+    int hdrCtxY;               // header context-menu anchor Y
+    string toast;              // transient status message (copy/export feedback)
+    int toastFrames;           // frames remaining to show the toast
+
+    // ---- filter row (DevExpress-style inline quick-filter below the header) ----
+    // Each visible column gets a text input. Typing in it filters the table in
+    // real time using a case-insensitive Contains match (same as textMode 1).
+    bool showFilterRow;        // draw the filter row (default false)
+    List<string> filterRowText;// per-column current filter text (parallel to cols)
+    int filterRowFocusCol;     // column whose input is currently focused (-1 none)
+    string filterRowBuf;       // edit buffer for the focused cell
+    int filterRowCur;          // caret byte-offset inside filterRowBuf
+
+    // ---- status bar (DevExpress-style bottom strip) ----
+    // Shows row count / selected count / range aggregates (sum, avg, count) for
+    // the current cell-range or selected rows — zero cost when hidden.
+    bool showStatusBar;        // draw the status bar (default false)
+
+    // ---- chart-from-selection overlay ----
+    bool chartOpen;            // bar-chart overlay drawn on top of the grid
+    string chartTitle;         // chart caption (value column name)
+    List<ChartBar> chartBars;  // per-bar {category label, value}
+    int chartMax;              // largest bar value (>=1), for scaling
+
+    // ---- row grouping (ag-Grid / DevExpress style) ----
+    List<int> groupCols;       // grouped columns, outer→inner (empty = flat table)
+    List<string> collapsedKeys;// group path keys whose rows are collapsed away
+    List<DispRow> dispRows;     // flattened display model (see DispRow)
+    List<GroupRow> groups;     // group-header rows (see GroupRow)
+
+    // ---- group panel (DevExpress-style strip above the header) ----
+    // A drop target that turns "group by this column" into a drag: pull a column
+    // header up into the strip to group by it, drag its chip sideways to renest,
+    // click the chip's × to ungroup just that one. The strip sits above the
+    // header, so it shifts the header and body down when shown.
+    bool showGroupPanel;       // draw the strip (default false)
+    int dragChip;              // group column being dragged within the strip (-1 none)
+    int chipDropVis;           // insertion slot shown while dragging (-1 none)
+    bool hdrDragToPanel;       // a header drag has been pulled up over the strip
+
+    // ---- semantic event surface (sender = this state; handlers pull context
+    // via HitRow()/HitCol()/SortColIndex()/... per the parameterless model) ----
+    UiEvent FilterChanged;     // any filter change (filter row, popup, batch)
+    UiEvent HeaderClick;       // a sortable/filterable header title was clicked
+    UiEvent Sort;              // sort column/direction changed (read SortColIndex/SortDirection)
+    UiEvent RowClick;          // a row was clicked (read HitRow/HitOrderIndex)
+    UiEvent RowDoubleClick;    // a row was double-clicked
+    UiEvent CellClick;         // a data cell was clicked (read HitRow/HitCol)
+    UiEvent CellEdit;          // an in-cell edit committed (read EditRow/EditCol/EditValue)
+    UiEvent CellValidating;    // a commit is being checked: read EditRow/EditCol/EditValue
+                               // and call Reject(msg) to refuse it (see editError)
+    UiEvent SelectionChanged;  // the selected-row set changed
+    UiEvent ColumnResize;      // a column width changed by dragging (read HitCol)
+    UiEvent ScrollChanged;     // the virtual row window scrolled (read ScrollTop)
+    UiEvent GroupChanged;      // grouping columns changed (read GroupCount)
+    UiEvent ColumnReorder;     // a column was drag-reordered (read HitCol)
+    UiEvent RowInserted;       // a row was added (read HitRow for its index)
+    UiEvent RowDeleted;        // a row was removed (read HitRow for its index)
+    UiEvent BandToggled;       // a header band was folded or unfolded
+    int hitRow;                // data-row index of the last row/cell interaction
+    int hitOrder;              // order-position (post sort/filter) of that row
+    int hitCol;                // column index of the last header/cell interaction
+    int editRow;               // data-row index being edited (CellEdit)
+    int editCol;               // column index being edited (CellEdit)
+    string editVal;            // committed value (CellEdit)
+    bool editing;              // an inline editor is currently open
+    string editBuf;            // working text inside the open editor
+    int editCur;               // caret position (chars) in editBuf
+
+    // ---- validation ----
+    // A rejected commit keeps the editor open and shows editError beneath it, so
+    // the user can correct the value instead of silently losing it.
+    string editError;          // rejection message ("" = the value is fine)
+    bool editRejected;         // set by Reject() while CellValidating runs
+
+    // ---- editor popups (dropdown list / calendar) ----
+    bool edPopOpen;            // the open editor is showing its popup
+    int edPopSel;              // highlighted dropdown item, or calendar day
+    int edPopScroll;           // first visible dropdown item
+    List<int> edPopItems;      // dropdown: indices into the column's `choices`
+                               // that match the typed text, in list order
+    int edCalMonth;            // calendar: displayed month as y * 12 + (m - 1)
+    bool edPopHot;             // per-frame: the pointer is over the editor popup,
+                               // so the body must not also act on the press
+
+    // ---- appearance hooks ----
+    CellStyler styler;         // optional row/cell colouring + custom cell paint
+                               // (null = stock appearance; see CellStyler)
+
+    // ---- master-detail ----
+    // Rows the user has expanded, held as *source* row indices so an expansion
+    // follows its row through sorting and filtering instead of pinning to a
+    // display position. null provider = the feature is off and costs nothing.
+    DetailProvider detail;
+    List<int> expandedRows;
+
+    // ---- row add / delete + undo ----
+    // The journal is capped (undoLimit) so a long editing session can't grow it
+    // without bound; the oldest entry is dropped when it overflows.
+    List<RowEdit> undoLog;     // reversible changes, oldest first
+    int undoLimit;             // max journal entries (default 100)
+    bool allowAddRow;          // show the new-row placeholder under the last row
+    bool undoing;              // an undo is applying: don't journal its own writes
+    int lastAddedRow;          // data-row index of the most recent insert (-1 none)
+    int undoGroup;             // group id stamped on new entries (0 = ungrouped)
+    int undoGroupSeq;          // last group id handed out by BeginUndoGroup
+
+    static DataTableState Create() {
+        DataTableState s = new DataTableState();
+        s.inited = false;
+        s.sortCol = -1;
+        s.sortDir = 1;
+        s.sortKeys = new List<SortKey>();
+        s.selected = new List<bool>();
+        s.colWidths = new List<int>();
+        s.dispW = new List<int>();
+        s.order = new List<int>();
+        s.filters = new List<ColFilter>();
+        s.openMenu = -1;
+        s.scrollRow = 0;
+        s.scrollX = 0;
+        s.resizeCol = -1;
+        s.resizeStartX = 0;
+        s.resizeStartW = 0;
+        s.dirty = true;
+        s.filterTab = 0;
+        s.searchText = "";
+        s.valScroll = 0;
+        s.editFocus = 0;
+        s.batchLines = new List<string>();
+        s.batchLines.Add("");
+        s.batchExactFlag = 0;
+        s.menuVals = new List<string>();
+        s.menuMatched = new List<string>();
+        s.menuSearchCache = "";
+        s.showRowNum = true;
+        s.showSelect = true;
+        s.striped = true;
+        s.showSummary = false;
+        s.aggMode = new List<int>();
+        s.aggValue = new List<int>();
+        s.aggReal = new List<double>();
+        s.summaryText = new List<string>();
+        s.cfMin = new List<int>();
+        s.cfMax = new List<int>();
+        s.cfMinR = new List<double>();
+        s.cfMaxR = new List<double>();
+        s.paged = false;
+        s.pageModel = SignalInt.Create(1);
+        s.pageRows = 0;
+        s.selection = null;
+        s.page = null;
+        s.lastSelSync = -1;
+        s.lastPageSync = 1;
+        s.selAnchor = -1;
+        s.rangeR0 = -1;
+        s.rangeC0 = -1;
+        s.rangeR1 = -1;
+        s.rangeC1 = -1;
+        s.rangeDrag = false;
+        s.dragRow = -1;
+        s.dragStartY = 0;
+        s.dragMoved = false;
+        s.ctxOpen = false;
+        s.ctxX = 0;
+        s.ctxY = 0;
+        s.colHidden = new List<bool>();
+        s.colFreeze = new List<int>();
+        s.bandCollapsed = new List<string>();
+        s.bandAutoHidden = new List<int>();
+        s.colOrder = new List<int>();
+        s.dragCol = -1;
+        s.dragColStartX = 0;
+        s.dragColMoved = false;
+        s.dropVis = -1;
+        s.hdrCtxOpen = false;
+        s.hdrCtxCol = -1;
+        s.hdrCtxX = 0;
+        s.hdrCtxY = 0;
+        s.toast = "";
+        s.toastFrames = 0;
+        s.showFilterRow = false;
+        s.filterRowText = new List<string>();
+        s.filterRowFocusCol = -1;
+        s.filterRowBuf = "";
+        s.filterRowCur = 0;
+        s.showStatusBar = false;
+        s.chartOpen = false;
+        s.chartTitle = "";
+        s.chartBars = new List<ChartBar>();
+        s.chartMax = 1;
+        s.FilterChanged = UiEvent.Create();
+        s.HeaderClick = UiEvent.Create();
+        s.Sort = UiEvent.Create();
+        s.RowClick = UiEvent.Create();
+        s.RowDoubleClick = UiEvent.Create();
+        s.CellClick = UiEvent.Create();
+        s.CellEdit = UiEvent.Create();
+        s.CellValidating = UiEvent.Create();
+        s.SelectionChanged = UiEvent.Create();
+        s.ColumnResize = UiEvent.Create();
+        s.ScrollChanged = UiEvent.Create();
+        s.GroupChanged = UiEvent.Create();
+        s.ColumnReorder = UiEvent.Create();
+        s.RowInserted = UiEvent.Create();
+        s.RowDeleted = UiEvent.Create();
+        s.BandToggled = UiEvent.Create();
+        s.groupCols = new List<int>();
+        s.collapsedKeys = new List<string>();
+        s.showGroupPanel = false;
+        s.dragChip = -1;
+        s.chipDropVis = -1;
+        s.hdrDragToPanel = false;
+        s.dispRows = new List<DispRow>();
+        s.groups = new List<GroupRow>();
+        s.hitRow = -1;
+        s.hitOrder = -1;
+        s.hitCol = -1;
+        s.editRow = -1;
+        s.editCol = -1;
+        s.editVal = "";
+        s.editing = false;
+        s.editBuf = "";
+        s.editCur = 0;
+        s.editError = "";
+        s.editRejected = false;
+        s.edPopOpen = false;
+        s.edPopSel = -1;
+        s.edPopScroll = 0;
+        s.edPopItems = new List<int>();
+        s.edCalMonth = 0;
+        s.edPopHot = false;
+        s.styler = null;
+        s.detail = null;
+        s.expandedRows = new List<int>();
+        s.undoLog = new List<RowEdit>();
+        s.undoLimit = 100;
+        s.allowAddRow = false;
+        s.undoing = false;
+        s.lastAddedRow = -1;
+        s.undoGroup = 0;
+        s.undoGroupSeq = 0;
+        return s;
+    }
+
+    // ---- event context accessors (option A: handlers read the sender) ----
+    int HitRow() { return hitRow; }
+    int HitOrderIndex() { return hitOrder; }
+    int HitCol() { return hitCol; }
+    int SortColIndex() { return sortCol; }
+    int SortDirection() { return sortDir; }
+    int ScrollTop() { return scrollRow; }
+    int EditRow() { return editRow; }
+    int EditCol() { return editCol; }
+    string EditValue() { return editVal; }
+
+    /// Refuse the value being validated. Call from a `CellValidating` handler:
+    /// the editor stays open with `msg` shown beneath it, and no write reaches
+    /// the data source.
+    void Reject(string msg) {
+        editRejected = true;
+        editError = msg;
+    }
+
+    /// The current rejection message ("" when the last commit was accepted).
+    string EditError() { return editError; }
+}
+
+/// Virtual data source for DataTable (DevExpress-style ValueNeeded).
+///
+/// The grid never stores rows itself — it pulls cells on demand for the visible
+/// window, and reads a typed key (`CellNum`) for sorting / aggregation without
+/// re-parsing strings. Subclass this and back it with columnar storage (one
+/// array per column) to hold millions of rows in a fraction of the memory a
+/// `List<DataRow>` of string cells would cost, and to sort / total without
+/// per-cell string parsing.
+class DataSource {
+    /// Number of source rows.
+    virtual int RowCount() { return 0; }
+    /// Display text for a cell (row = source index, col = column index).
+    virtual string CellText(int row, int col) { return ""; }
+    /// Numeric key for a cell, used for sorting/aggregating numeric columns.
+    /// Return 0 for non-numeric columns.
+    virtual int CellNum(int row, int col) { return 0; }
+
+    /// Fractional key for a cell, used by columns declared with `decimals > 0`.
+    /// The default parses CellText, so existing sources gain decimal support
+    /// for free; override it when the backing store already holds doubles.
+    virtual double CellReal(int row, int col) {
+        return DataTable.ParseReal(this.CellText(row, col));
+    }
+
+    /// Day-number key (days since 1970-01-01) for a cell in a date column.
+    /// The default parses CellText with the column's declared field order, so
+    /// existing sources gain date support for free; override it when the
+    /// backing store already holds day numbers or timestamps. `order` is the
+    /// column's `dateOrder`; return `DataTable.NoDate()` for a blank cell.
+    virtual int CellDay(int row, int col, int order) {
+        return DataTable.ParseDate(this.CellText(row, col), order);
+    }
+
+    /// Truth value for a cell in a bool column. The default parses CellText, so
+    /// existing sources gain checkbox columns for free; override it when the
+    /// backing store already holds flags.
+    virtual bool CellBool(int row, int col) {
+        return DataTable.ParseBool(this.CellText(row, col));
+    }
+
+    /// Write a cell value back into the underlying data (inline editing).
+    /// Read-only sources ignore the write.
+    virtual void SetCell(int row, int col, string v) { }
+
+    /// True when this source supports InsertRow / RemoveRow. The grid hides its
+    /// add/delete affordances (and the new-row placeholder) when it is false,
+    /// so a read-only or computed source needs no extra guarding.
+    virtual bool CanInsert() { return false; }
+
+    /// Insert a blank row so that it lands at index `at` (`at == RowCount()`
+    /// appends). Return true when the row was actually inserted.
+    virtual bool InsertRow(int at) { return false; }
+
+    /// Remove the row at `at`. Return true when it was actually removed.
+    virtual bool RemoveRow(int at) { return false; }
+}
+
+/// Backward-compatible adapter: serves an in-memory `List<DataRow>` of string
+/// cells through the DataSource interface, so existing `DataTable.Render(...,
+/// rows, ...)` calls keep working unchanged.
+class RowListSource : DataSource {
+    List<DataRow> rows;
+
+    static RowListSource Create(List<DataRow> rows) {
+        RowListSource s = new RowListSource();
+        s.rows = rows;
+        return s;
+    }
+
+    override int RowCount() { return this.rows.Count; }
+    override string CellText(int row, int col) { return this.rows[row].At(col); }
+    override int CellNum(int row, int col) { return DataTable.ParseInt(this.rows[row].At(col)); }
+    override void SetCell(int row, int col, string v) { this.rows[row].Set(col, v); }
+
+    /// An in-memory list can always grow or shrink.
+    override bool CanInsert() { return true; }
+
+    override bool InsertRow(int at) {
+        if (at < 0 || at > this.rows.Count) { return false; }
+        this.rows.Insert(at, DataRow.Create());
+        return true;
+    }
+
+    override bool RemoveRow(int at) {
+        if (at < 0 || at >= this.rows.Count) { return false; }
+        this.rows.RemoveAt(at);
+        return true;
+    }
+}
+
+/// One reversible change, recorded so Ctrl+Z can put it back.
+///
+/// `kind` is 0 cell-edit, 1 row-insert, 2 row-delete. A delete keeps the whole
+/// row's text in `cells`, because the source is free to drop the storage the
+/// moment RemoveRow returns — the journal, not the source, is what makes the
+/// row recoverable.
+class RowEdit {
+    int kind;
+    int row;          // data-row index the change applied to
+    int col;          // cell-edit: the column; otherwise -1
+    string before;    // cell-edit: the value that was there
+    string after;     // cell-edit: the value written
+    List<string> cells;  // row-delete: the removed row, cell by cell
+
+    /// Entries sharing a group are undone together. A paste that touched fifty
+    /// cells must come back in one Ctrl+Z, not fifty — so the group, not the
+    /// entry, is the unit of undo. 0 means "on its own".
+    int group;
+
+    static RowEdit Cell(int row, int col, string before, string after) {
+        RowEdit e = new RowEdit();
+        e.kind = 0;
+        e.row = row;
+        e.col = col;
+        e.before = before;
+        e.after = after;
+        e.cells = new List<string>();
+        e.group = 0;
+        return e;
+    }
+
+    static RowEdit Insert(int row) {
+        RowEdit e = new RowEdit();
+        e.kind = 1;
+        e.row = row;
+        e.col = -1;
+        e.before = "";
+        e.after = "";
+        e.cells = new List<string>();
+        e.group = 0;
+        return e;
+    }
+
+    static RowEdit Delete(int row, List<string> cells) {
+        RowEdit e = new RowEdit();
+        e.kind = 2;
+        e.row = row;
+        e.col = -1;
+        e.before = "";
+        e.after = "";
+        e.cells = cells;
+        e.group = 0;
+        return e;
+    }
+}
+
+/// Appearance + custom-paint hook for DataTable (DevExpress-style
+/// RowStyle / CustomDrawCell).
+///
+/// Zan delegates can't capture locals or bind `this`, so a per-cell callback
+/// can't be a lambda over the view model — it is a *subclass* instead, exactly
+/// like <see cref="DataSource"/>. Assign one to <c>st.styler</c>; every method
+/// is optional and the defaults keep the grid's stock appearance.
+///
+/// Colours are packed ARGB. **0 means "no override"** — it is fully
+/// transparent black, so it can never be a colour anyone meant to paint.
+///
+/// ```zan
+/// class OverdueStyle : CellStyler {
+///     override int RowBg(DataSource src, int row) {
+///         if (src.CellText(row, 4) == "Overdue") { return DataTable.Rgb(255, 236, 236); }
+///         return 0;
+///     }
+/// }
+/// st.styler = new OverdueStyle();
+/// ```
+class CellStyler {
+    /// Background for a whole data row, or 0 to keep the grid's striping.
+    /// Selection and hover still show through: they blend with this colour
+    /// rather than replacing it, so a row stays recognisable while active.
+    virtual int RowBg(DataSource src, int row) { return 0; }
+
+    /// Text colour for a whole data row, or 0 for the theme default.
+    virtual int RowFg(DataSource src, int row) { return 0; }
+
+    /// Background for one cell, or 0 to inherit the row background.
+    virtual int CellBg(DataSource src, int row, int col) { return 0; }
+
+    /// Text colour for one cell, or 0 to inherit <see cref="RowFg"/>.
+    virtual int CellFg(DataSource src, int row, int col) { return 0; }
+
+    /// Paint a cell yourself. Return true when you drew it — the built-in
+    /// renderer is then skipped entirely for that cell (conditional formatting,
+    /// tags, progress bars and all). The canvas is clipped to [x,y,w,h], so a
+    /// custom painter cannot bleed into its neighbours.
+    virtual bool PaintCell(App app, DataSource src, int row, int col,
+                           int x, int y, int w, int h) { return false; }
+}
+
+/// Master-detail hook: supplies the panel drawn under an expanded row.
+///
+/// Subclass it, override `Paint` (and optionally `Slots` / `CanExpand`), and hand
+/// it to the grid with `DataTable.SetDetail(st, provider)`. A row then grows an
+/// expander chevron in the row-number gutter; clicking it opens a band beneath
+/// the row for the detail panel to draw into — a child table, a form, a chart.
+///
+/// The band is an integer number of ordinary row slots high (`Slots`), which is
+/// what keeps the body's scroll and hit-test arithmetic uniform; see `DispRow`.
+class DetailProvider {
+    /// Height of the detail band for `row`, counted in ordinary row heights.
+    /// Clamped to at least 1 by the grid. Override to size per row (e.g. by the
+    /// number of child records).
+    virtual int Slots(DataSource src, int row) { return 3; }
+
+    /// Whether `row` can be expanded at all. Return false for a row with nothing
+    /// to show and it keeps a blank gutter instead of a dead chevron.
+    virtual bool CanExpand(DataSource src, int row) { return true; }
+
+    /// Draw the detail panel for `row` into [x,y,w,h]. The canvas is clipped to
+    /// that rectangle, so the panel cannot bleed into neighbouring rows.
+    virtual void Paint(App app, DataSource src, int row,
+                       int x, int y, int w, int h) { }
+}

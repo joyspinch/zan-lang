@@ -1,0 +1,785 @@
+using System;
+using Gui;
+
+namespace Gui.Component.DataTable;
+
+/// DataTable part: derived display — top-N/set-pass filtering, row
+/// grouping, master-detail expansion, the visible display list, footer
+/// summaries and column statistics.
+partial class DataTable {
+    // ---- top-N / above-average set pass ----
+
+    /// Drop from `order` every row that the set-relative stage of one column's
+    /// filter excludes. Unlike the per-cell stages this needs the whole surviving
+    /// set, so it runs after the row scan.
+    static void ApplySetPass(DataTableState st, List<DataColumn> cols, DataSource src, int c) {
+        ColFilter f = st.filters[c];
+        int mode = f.topMode;
+        if (mode == 0 || st.order.Count == 0) { return; }
+        DataColumn col = cols[c];
+
+        if (mode == 5 || mode == 6) {
+            // above / below the mean of the surviving rows
+            double sum = 0.0;
+            int i = 0;
+            while (i < st.order.Count) {
+                sum = sum + src.CellReal(st.order[i], c);
+                i = i + 1;
+            }
+            double avg = sum / (double)st.order.Count;
+            List<int> kept = new List<int>();
+            int k = 0;
+            while (k < st.order.Count) {
+                double v = src.CellReal(st.order[k], c);
+                bool ok = v > avg;
+                if (mode == 6) { ok = v < avg; }
+                if (ok) { kept.Add(st.order[k]); }
+                k = k + 1;
+            }
+            st.order = kept;
+            return;
+        }
+
+        // top/bottom N (or N%): rank by value, then keep the leading slice.
+        int n = f.topN;
+        if (mode == 3 || mode == 4) { n = st.order.Count * f.topN / 100; }
+        if (n < 1) { n = 1; }
+        if (n >= st.order.Count) { return; }
+
+        // Sort a copy of the surviving rows by value; the original order is
+        // restored by filtering st.order against the kept set, so the user's
+        // sort is never disturbed by the filter.
+        List<int> byVal = new List<int>();
+        int b = 0;
+        while (b < st.order.Count) { byVal.Add(st.order[b]); b = b + 1; }
+        bool desc = (mode == 1 || mode == 3);
+        DataTable.SortRowsByReal(byVal, src, c, desc);
+
+        // A tie on the cut line keeps every row that ties, the way a leaderboard
+        // shows joint places rather than truncating mid-tie.
+        double cut = src.CellReal(byVal[n - 1], c);
+        List<int> keep = new List<int>();
+        int m = 0;
+        while (m < st.order.Count) {
+            double v = src.CellReal(st.order[m], c);
+            bool ok = v <= cut;
+            if (desc) { ok = v >= cut; }
+            if (ok) { keep.Add(st.order[m]); }
+            m = m + 1;
+        }
+        st.order = keep;
+    }
+
+    static void SortRowsByReal(List<int> rows, DataSource src, int col, bool desc) {
+        // insertion sort: the set pass only ever ranks the rows that survived
+        // the cell filters, and N is small in every realistic top-N use
+        int i = 1;
+        while (i < rows.Count) {
+            int r = rows[i];
+            double v = src.CellReal(r, col);
+            int j = i - 1;
+            bool moving = true;
+            while (j >= 0 && moving) {
+                double w = src.CellReal(rows[j], col);
+                bool swap = w > v;
+                if (desc) { swap = w < v; }
+                if (swap) {
+                    rows[j + 1] = rows[j];
+                    j = j - 1;
+                } else {
+                    moving = false;
+                }
+            }
+            rows[j + 1] = r;
+            i = i + 1;
+        }
+    }
+
+    static void Recompute(DataTableState st, List<DataColumn> cols, DataSource src) {
+        if (!st.dirty) { return; }
+        st.order.Clear();
+        int nrows = src.RowCount();
+
+        // Collect the columns that actually have an active filter (usually none).
+        // The common no-filter case then skips the O(rows * cols) predicate scan
+        // entirely — a big win when re-sorting a million unfiltered rows.
+        List<int> af = new List<int>();
+        List<int> sf = new List<int>();
+        bool anyPreset = false;
+        int fc = 0;
+        while (fc < cols.Count) {
+            if (st.filters[fc].Active()) { af.Add(fc); }
+            if (st.filters[fc].NeedsSetPass()) { sf.Add(fc); }
+            if (st.filters[fc].datePreset != 0) { anyPreset = true; }
+            fc = fc + 1;
+        }
+
+        // Read the clock only when a relative preset is in play, so a grid with
+        // no date rule recomputes to the same thing regardless of the date.
+        int today = 0;
+        if (anyPreset) { today = DataTable.Today(); }
+        int i = 0;
+        if (af.Count == 0) {
+            while (i < nrows) { st.order.Add(i); i = i + 1; }
+        } else {
+            while (i < nrows) {
+                if (DataTable.RowPassesActive(st, cols, src, af, i, today)) { st.order.Add(i); }
+                i = i + 1;
+            }
+        }
+        // Top-N / above-average stages need the surviving set, so they run once
+        // the per-cell scan is done.
+        int si = 0;
+        while (si < sf.Count) {
+            DataTable.ApplySetPass(st, cols, src, sf[si]);
+            si = si + 1;
+        }
+        if (st.groupCols.Count > 0) {
+            DataTable.SortOrderGrouped(st, cols, src);
+        } else if (st.sortKeys.Count == 1) {
+            // fast path: decorate-sort a single key (sortCol mirrors sortKeys[0])
+            DataTable.SortOrder(st, cols, src);
+        } else if (st.sortKeys.Count > 1) {
+            DataTable.SortOrderMulti(st, cols, src);
+        }
+        // Apply filter-row quick-filter as a second pass over the ColFilter result.
+        // This keeps it orthogonal to the popup filter so both can coexist.
+        if (st.showFilterRow) {
+            bool frAny = false;
+            int fri = 0;
+            while (fri < st.filterRowText.Count) {
+                if (st.filterRowText[fri].Length > 0) { frAny = true; }
+                fri = fri + 1;
+            }
+            if (frAny) {
+                List<int> kept = new List<int>();
+                int fro = 0;
+                while (fro < st.order.Count) {
+                    if (DataTable.RowPassesFilterRow(st, src, st.order[fro])) { kept.Add(st.order[fro]); }
+                    fro = fro + 1;
+                }
+                st.order = kept;
+            }
+        }
+        if (st.showSummary) { DataTable.ComputeSummary(st, cols, src); }
+        DataTable.ComputeColStats(st, cols, src);
+        DataTable.BuildDisplay(st, cols, src);
+        int maxScroll = st.dispRows.Count - 1;
+        if (st.scrollRow > maxScroll) { st.scrollRow = maxScroll; }
+        if (st.scrollRow < 0) { st.scrollRow = 0; }
+        st.dirty = false;
+    }
+
+    // Derived aggregate for a summary==6 column, computed from OTHER columns'
+    // already-aggregated values — O(1), no row scan.
+    static int DeriveValue(DataColumn col, List<int> agg) {
+        int a = 0;
+        int b = 0;
+        if (col.deriveA >= 0 && col.deriveA < agg.Count) { a = agg[col.deriveA]; }
+        if (col.deriveB >= 0 && col.deriveB < agg.Count) { b = agg[col.deriveB]; }
+        int op = col.deriveOp;
+        if (op == 0) { if (b != 0) { return a * 100 / b; } return 0; }
+        if (op == 1) { if (b != 0) { return a / b; } return 0; }
+        if (op == 2) { return a - b; }
+        if (op == 3) { return a + b; }
+        if (op == 4) { return a * b; }
+        return a;
+    }
+
+    // Real counterpart of DeriveValue: percent and ratio keep their fraction
+    // instead of truncating to an int.
+    static double DeriveReal(DataColumn col, List<double> agg) {
+        double a = 0.0;
+        double b = 0.0;
+        if (col.deriveA >= 0 && col.deriveA < agg.Count) { a = agg[col.deriveA]; }
+        if (col.deriveB >= 0 && col.deriveB < agg.Count) { b = agg[col.deriveB]; }
+        int op = col.deriveOp;
+        if (op == 0) { if (b != 0.0) { return a * 100.0 / b; } return 0.0; }
+        if (op == 1) { if (b != 0.0) { return a / b; } return 0.0; }
+        if (op == 2) { return a - b; }
+        if (op == 3) { return a + b; }
+        if (op == 4) { return a * b; }
+        return a;
+    }
+
+    // ---------- row grouping ----------
+    static bool IsGrouped(DataTableState st) { return st.groupCols.Count > 0; }
+    static int GroupCount(DataTableState st) { return st.groupCols.Count; }
+
+    static void CollapseAll(DataTableState st) {
+        foreach (GroupRow g in st.groups) {
+            if (st.collapsedKeys.IndexOf(g.key) < 0) { st.collapsedKeys.Add(g.key); }
+        }
+        st.dirty = true;
+    }
+
+    static void ExpandAll(DataTableState st) {
+        st.collapsedKeys.Clear();
+        st.dirty = true;
+    }
+
+    static void GroupBy(DataTableState st, int col) {
+        if (col < 0) { return; }
+        if (st.groupCols.IndexOf(col) >= 0) { return; }
+        st.groupCols.Add(col);
+        st.dirty = true;
+    }
+
+    static void Ungroup(DataTableState st) {
+        st.groupCols.Clear();
+        st.collapsedKeys.Clear();
+        st.dirty = true;
+    }
+
+    /// Drop one column out of the grouping, keeping the rest in order. Used by the
+    /// group panel's per-chip remove button, where `Ungroup`'s clear-everything
+    /// would be too blunt.
+    static void UngroupOne(DataTableState st, int col) {
+        int i = st.groupCols.IndexOf(col);
+        if (i < 0) { return; }
+        st.groupCols.RemoveAt(i);
+        // Group keys are built from the whole path, so any collapse state recorded
+        // against the old nesting no longer addresses anything: drop it rather
+        // than leave keys that can never match again.
+        st.collapsedKeys.Clear();
+        st.dirty = true;
+    }
+
+    /// Move a grouped column to a new nesting depth. `to` is the destination
+    /// index in the outer-to-inner list; out-of-range values clamp to the ends,
+    /// so a drag past either edge does the sensible thing instead of nothing.
+    static void MoveGroup(DataTableState st, int col, int to) {
+        int fi = st.groupCols.IndexOf(col);
+        if (fi < 0) { return; }
+        int dst = to;
+        if (dst < 0) { dst = 0; }
+        if (dst > st.groupCols.Count - 1) { dst = st.groupCols.Count - 1; }
+        if (dst == fi) { return; }
+        st.groupCols.RemoveAt(fi);
+        st.groupCols.Insert(dst, col);
+        st.collapsedKeys.Clear();
+        st.dirty = true;
+    }
+
+    /// Nesting depth of a grouped column (0 = outermost), or -1 when the column
+    /// isn't grouped.
+    static int GroupDepth(DataTableState st, int col) {
+        return st.groupCols.IndexOf(col);
+    }
+
+    /// Insert a column into the grouping at a given depth, rather than appending
+    /// it innermost the way `GroupBy` does. Feeds the panel's drop-at-position
+    /// gesture; a column that is already grouped is moved instead of duplicated.
+    static void GroupByAt(DataTableState st, int col, int at) {
+        if (col < 0) { return; }
+        if (st.groupCols.IndexOf(col) >= 0) { DataTable.MoveGroup(st, col, at); return; }
+        int dst = at;
+        if (dst < 0) { dst = 0; }
+        if (dst > st.groupCols.Count) { dst = st.groupCols.Count; }
+        st.groupCols.Insert(dst, col);
+        st.collapsedKeys.Clear();
+        st.dirty = true;
+    }
+
+    static bool IsCollapsed(DataTableState st, string key) {
+        return st.collapsedKeys.IndexOf(key) >= 0;
+    }
+
+    static void ToggleCollapse(DataTableState st, string key) {
+        int idx = st.collapsedKeys.IndexOf(key);
+        if (idx >= 0) { st.collapsedKeys.RemoveAt(idx); }
+        else { st.collapsedKeys.Add(key); }
+        st.dirty = true;
+    }
+
+    // ---------- master-detail ----------
+    // A row can open a panel beneath itself: a child table, a form, a chart.
+    // Expansion is tracked by *source* row index, so it follows a row through
+    // sorting and filtering rather than pinning to a display position.
+
+    /// Attach the hook that draws detail panels, switching the feature on. Pass
+    /// null to turn it back off (every row collapses; nothing else is disturbed).
+    static void SetDetail(DataTableState st, DetailProvider p) {
+        st.detail = p;
+        if (p == null) { st.expandedRows.Clear(); }
+        st.dirty = true;
+    }
+
+    /// Whether master-detail is active at all.
+    static bool HasDetail(DataTableState st) { return st.detail != null; }
+
+    /// Height of a detail band in whole row heights, at least 1. Asking the
+    /// provider keeps a per-row size (say, one slot per child record) possible.
+    static int DetailSlots(DataTableState st, DataSource src, int row) {
+        if (st.detail == null) { return 0; }
+        int n = st.detail.Slots(src, row);
+        if (n < 1) { n = 1; }
+        return n;
+    }
+
+    /// Whether `row` (a source index) is currently expanded.
+    static bool IsExpanded(DataTableState st, int row) {
+        return st.expandedRows.IndexOf(row) >= 0;
+    }
+
+    /// Whether `row` offers a detail panel — false when the feature is off or the
+    /// provider declines this row, in which case no chevron is drawn.
+    static bool CanExpand(DataTableState st, DataSource src, int row) {
+        if (st.detail == null) { return false; }
+        if (row < 0 || row >= src.RowCount()) { return false; }
+        return st.detail.CanExpand(src, row);
+    }
+
+    /// Open `row`'s detail panel. A row the provider declines, or one already
+    /// open, is left as it is.
+    static void ExpandRow(DataTableState st, DataSource src, int row) {
+        if (!DataTable.CanExpand(st, src, row)) { return; }
+        if (st.expandedRows.IndexOf(row) >= 0) { return; }
+        st.expandedRows.Add(row);
+        st.dirty = true;
+    }
+
+    /// Close `row`'s detail panel. A row that isn't open is left as it is.
+    static void CollapseRow(DataTableState st, int row) {
+        int i = st.expandedRows.IndexOf(row);
+        if (i < 0) { return; }
+        st.expandedRows.RemoveAt(i);
+        st.dirty = true;
+    }
+
+    /// Flip `row`'s detail panel open or shut.
+    static void ToggleDetail(DataTableState st, DataSource src, int row) {
+        if (DataTable.IsExpanded(st, row)) { DataTable.CollapseRow(st, row); }
+        else { DataTable.ExpandRow(st, src, row); }
+    }
+
+    /// Close every open detail panel.
+    static void CollapseAllDetail(DataTableState st) {
+        if (st.expandedRows.Count == 0) { return; }
+        st.expandedRows.Clear();
+        st.dirty = true;
+    }
+
+    /// How many rows currently have their detail panel open.
+    static int ExpandedCount(DataTableState st) { return st.expandedRows.Count; }
+
+    // Path key for the group that data row `rowIdx` belongs to at nesting
+    // `level` — the concatenation of its group-column values down to that level,
+    // joined by a control separator so distinct paths never collide.
+    static string PathKey(DataTableState st, List<DataColumn> cols, DataSource src,
+                          int rowIdx, int level) {
+        string sep = Text.ByteChar(31);
+        string k = "";
+        int g = 0;
+        while (g <= level && g < st.groupCols.Count) {
+            k = k + DataTable.GroupValue(cols, src, rowIdx, st.groupCols[g]) + sep;
+            g = g + 1;
+        }
+        return k;
+    }
+
+    // The value a row contributes to its group at column `gc`. Date columns
+    // collapse to their bucket label (year / month / quarter / weekday), so
+    // grouping by a date does not produce one group per distinct day.
+    static string GroupValue(List<DataColumn> cols, DataSource src, int rowIdx, int gc) {
+        if (gc >= 0 && gc < cols.Count) {
+            DataColumn c = cols[gc];
+            if (c.isDate) {
+                return DataTable.DateGroupKey(src.CellDay(rowIdx, gc, c.dateOrder), c.dateGroup);
+            }
+            // Two buckets, whatever the cells are spelled like.
+            if (c.isBool) {
+                if (src.CellBool(rowIdx, gc)) { return c.boolTrue; }
+                return c.boolFalse;
+            }
+        }
+        return src.CellText(rowIdx, gc);
+    }
+
+    // Compare two data rows by the grouping columns (outer→inner), then by the
+    // active sort column as a tiebreak, so rows of the same group stay adjacent.
+    static int CmpGroupRow(DataTableState st, List<DataColumn> cols, DataSource src, int ra, int rb) {
+        int g = 0;
+        while (g < st.groupCols.Count) {
+            int gc = st.groupCols[g];
+            int cmp = DataTable.CompareStr(src.CellText(ra, gc), src.CellText(rb, gc));
+            if (gc >= 0 && gc < cols.Count) {
+                DataColumn gcol = cols[gc];
+                if (gcol.isDate) {
+                    // Order by the bucket, not the raw day: grouping by weekday
+                    // must put every Monday together, which a day-number sort
+                    // would scatter. Within one bucket the raw day still breaks
+                    // the tie so rows stay chronological.
+                    cmp = DataTable.CmpDateGroup(gcol,
+                                                 src.CellDay(ra, gc, gcol.dateOrder),
+                                                 src.CellDay(rb, gc, gcol.dateOrder));
+                } else {
+                    cmp = DataTable.CompareCellCol(gcol, src.CellText(ra, gc), src.CellText(rb, gc));
+                }
+            }
+            if (cmp != 0) { return cmp; }
+            g = g + 1;
+        }
+        return DataTable.CmpMultiKey(st, cols, src, ra, rb);
+    }
+
+    // Order two date cells by their group bucket, falling back to the raw day
+    // so rows inside a bucket stay chronological. Weekday buckets (mode 4) are
+    // ordered Sunday..Saturday rather than by date.
+    static int CmpDateGroup(DataColumn col, int da, int db) {
+        int ka = da;
+        int kb = db;
+        if (col.dateGroup == 4) {
+            ka = DataTable.WeekdayOf(da);
+            kb = DataTable.WeekdayOf(db);
+        }
+        if (ka < kb) { return -1; }
+        if (ka > kb) { return 1; }
+        if (da < db) { return -1; }
+        if (da > db) { return 1; }
+        return 0;
+    }
+
+    // Day of week (0=Sunday) for a day number; blanks sort first.
+    static int WeekdayOf(int days) {
+        if (days == DataTable.NoDate()) { return -1; }
+        return DateTime.FloorMod(days + 4, 7);
+    }
+
+    static void MergeGrp(DataTableState st, List<DataColumn> cols, DataSource src,
+                         int lo, int mid, int hi, List<int> tmp) {
+        int i = lo;
+        int j = mid;
+        int k = lo;
+        while (i < mid && j < hi) {
+            if (DataTable.CmpGroupRow(st, cols, src, st.order[i], st.order[j]) <= 0) {
+                tmp[k] = st.order[i]; i = i + 1;
+            } else {
+                tmp[k] = st.order[j]; j = j + 1;
+            }
+            k = k + 1;
+        }
+        while (i < mid) { tmp[k] = st.order[i]; i = i + 1; k = k + 1; }
+        while (j < hi) { tmp[k] = st.order[j]; j = j + 1; k = k + 1; }
+        int p = lo;
+        while (p < hi) { st.order[p] = tmp[p]; p = p + 1; }
+    }
+
+    static void SortOrderGrouped(DataTableState st, List<DataColumn> cols, DataSource src) {
+        int n = st.order.Count;
+        if (n < 2) { return; }
+        List<int> tmp = new List<int>();
+        int z = 0;
+        while (z < n) { tmp.Add(0); z = z + 1; }
+        int width = 1;
+        while (width < n) {
+            int lo = 0;
+            while (lo < n) {
+                int mid = lo + width;
+                if (mid > n) { mid = n; }
+                int hi = lo + width * 2;
+                if (hi > n) { hi = n; }
+                if (mid < hi) { DataTable.MergeGrp(st, cols, src, lo, mid, hi, tmp); }
+                lo = lo + width * 2;
+            }
+            width = width * 2;
+        }
+    }
+
+    // Compute per-column aggregates for a contiguous slice of st.order[lo..hi)
+    // and store the results in grp.aggValues / grp.aggTexts (index-aligned with
+    // cols). Only columns whose aggMode > 0 and != 6 (derived) are scanned;
+    // derived columns are left at 0 (they reference footer-level agg values, not
+    // per-group ones). O(|hi-lo| * agg-column-count).
+    static void FillGroupAgg(DataTableState st, List<DataColumn> cols, DataSource src,
+                             GroupRow grp, int lo, int hi) {
+        int nc = cols.Count;
+        while (grp.aggValues.Count < nc) { grp.aggValues.Add(0); }
+        while (grp.aggTexts.Count < nc) { grp.aggTexts.Add(""); }
+        int col = 0;
+        while (col < nc) {
+            int m = 0;
+            if (col < st.aggMode.Count) { m = st.aggMode[col]; }
+            if (m == 0 || m == 6) { col = col + 1; continue; }
+            int dec = cols[col].decimals;
+            double s = 0.0;
+            double mn = 0.0;
+            double mx = 0.0;
+            int cnt2 = 0;
+            int k = lo;
+            while (k < hi && k < st.order.Count) {
+                double v = 0.0;
+                if (dec > 0) { v = src.CellReal(st.order[k], col); }
+                else { v = (double)src.CellNum(st.order[k], col); }
+                if (cnt2 == 0) { mn = v; mx = v; }
+                else { if (v < mn) { mn = v; } if (v > mx) { mx = v; } }
+                s = s + v;
+                cnt2 = cnt2 + 1;
+                k = k + 1;
+            }
+            double av = 0.0;
+            if (m == 1) { av = s; }
+            else if (m == 2) { if (cnt2 > 0) { av = s / (double)cnt2; } }
+            else if (m == 3) { av = mn; }
+            else if (m == 4) { av = mx; }
+            else if (m == 5) { av = (double)cnt2; }
+            grp.aggValues[col] = (int)av;
+            // Averages keep a fraction even on integer columns (DevExpress does
+            // the same), so a whole-number column still reads e.g. "3.5".
+            int showDec = dec;
+            if (m == 2 && showDec == 0) { showDec = 2; }
+            if (m == 5) { showDec = 0; }
+            grp.aggTexts[col] = DataTable.FormatCell(cols[col], DataTable.FormatReal(av, showDec));
+            col = col + 1;
+        }
+    }
+
+    // Build the flat display model (group headers interleaved with data rows)
+    // from the already filtered+sorted st.order. When no grouping is active the
+    // model mirrors st.order one-to-one, so every downstream render/hit path
+    // behaves exactly as before.
+    static void BuildDisplay(DataTableState st, List<DataColumn> cols, DataSource src) {
+        st.dispRows.Clear();
+        st.groups.Clear();
+        int G = st.groupCols.Count;
+        if (G == 0) {
+            int i = 0;
+            while (i < st.order.Count) {
+                st.dispRows.Add(new DispRow(0, st.order[i], i + 1));
+                DataTable.EmitDetail(st, src, st.order[i]);
+                i = i + 1;
+            }
+            return;
+        }
+        int N = st.order.Count;
+        int dataNo = 0;
+        int p = 0;
+        while (p < N) {
+            int rowIdx = st.order[p];
+            int L = 0;
+            while (L < G) {
+                bool isNew = false;
+                if (p == 0) { isNew = true; }
+                else if (DataTable.PathKey(st, cols, src, st.order[p], L)
+                      != DataTable.PathKey(st, cols, src, st.order[p - 1], L)) { isNew = true; }
+                if (isNew) {
+                    string key = DataTable.PathKey(st, cols, src, rowIdx, L);
+                    bool ancColl = false;
+                    int a = 0;
+                    while (a < L) {
+                        if (DataTable.IsCollapsed(st, DataTable.PathKey(st, cols, src, rowIdx, a))) {
+                            ancColl = true;
+                        }
+                        a = a + 1;
+                    }
+                    int cnt = 0;
+                    int q = p;
+                    while (q < N && DataTable.PathKey(st, cols, src, st.order[q], L) == key) {
+                        cnt = cnt + 1; q = q + 1;
+                    }
+                    int gi = st.groups.Count;
+                    GroupRow newGrp = new GroupRow(
+                        cols[st.groupCols[L]].title + ": "
+                            + DataTable.GroupValue(cols, src, rowIdx, st.groupCols[L]),
+                        L, cnt, key, DataTable.IsCollapsed(st, key));
+                    DataTable.FillGroupAgg(st, cols, src, newGrp, p, p + cnt);
+                    st.groups.Add(newGrp);
+                    if (!ancColl) {
+                        st.dispRows.Add(new DispRow(1, gi, 0));
+                    }
+                }
+                L = L + 1;
+            }
+            bool anyColl = false;
+            int a2 = 0;
+            while (a2 < G) {
+                if (DataTable.IsCollapsed(st, DataTable.PathKey(st, cols, src, rowIdx, a2))) {
+                    anyColl = true;
+                }
+                a2 = a2 + 1;
+            }
+            dataNo = dataNo + 1;
+            if (!anyColl) {
+                st.dispRows.Add(new DispRow(0, rowIdx, dataNo));
+                DataTable.EmitDetail(st, src, rowIdx);
+            }
+            p = p + 1;
+        }
+    }
+
+    /// Append a detail band for `row` when it is expanded: `DetailSlots` blank
+    /// kind-2 entries, each naming the master row and numbered by `part`. A
+    /// collapsed row, or one in a table with no provider, contributes nothing —
+    /// so an unexpanded grid flattens exactly as it did before the feature.
+    ///
+    /// The band takes whole row slots rather than a free-form pixel height so the
+    /// body can keep converting between a slot and its Y with a multiply; see
+    /// `DispRow`.
+    static void EmitDetail(DataTableState st, DataSource src, int row) {
+        if (st.detail == null) { return; }
+        if (st.expandedRows.IndexOf(row) < 0) { return; }
+        // A row the provider has since declined (its children were deleted, say)
+        // stays in expandedRows but contributes no band, so the list needs no
+        // pruning when the underlying data changes.
+        if (!st.detail.CanExpand(src, row)) { return; }
+        int n = DataTable.DetailSlots(st, src, row);
+        int k = 0;
+        while (k < n) {
+            DispRow d = new DispRow(2, row, 0);
+            d.part = k;
+            st.dispRows.Add(d);
+            k = k + 1;
+        }
+    }
+
+    // Per-column aggregate over the current filtered set (st.order), cached as
+    // formatted strings so the summary row costs nothing to redraw per frame.
+    //
+    // Base aggregates (sum/avg/min/max) are gathered in a SINGLE pass over the
+    // visible rows — all such columns accumulate together, so N aggregated
+    // columns cost one traversal, not one traversal each. Derived columns
+    // (summary==6) are then computed from those cached aggregates in O(1) each,
+    // never touching the rows again.
+    static void ComputeSummary(DataTableState st, List<DataColumn> cols, DataSource src) {
+        int nc = cols.Count;
+        while (st.aggMode.Count < nc) { st.aggMode.Add(0); }
+        int n = st.order.Count;
+
+        // per-column accumulators + the compact set of columns that need a scan
+        List<double> sumV = new List<double>();
+        List<double> minV = new List<double>();
+        List<double> maxV = new List<double>();
+        List<int> baseCols = new List<int>();
+        int col = 0;
+        while (col < nc) {
+            sumV.Add(0.0);
+            minV.Add(0.0);
+            maxV.Add(0.0);
+            int m = st.aggMode[col];
+            if (m >= 1 && m <= 4) { baseCols.Add(col); }
+            col = col + 1;
+        }
+
+        // ---- accumulate every base column over the visible rows ----
+        // Accumulation is kept in scalars and written back to the per-column
+        // lists ONCE (outside the row loop): index-writing a list inside a hot
+        // million-iteration loop hits a -O0 codegen bug that leaks stack. This
+        // still costs one CellNum read per (base column, row) — the same total
+        // work as a single interleaved pass — and only the aggregated columns
+        // are ever scanned.
+        int bi = 0;
+        while (bi < baseCols.Count) {
+            int bc = baseCols[bi];
+            bool realCol = cols[bc].decimals > 0;
+            double s = 0.0;
+            double mn = 0.0;
+            double mx = 0.0;
+            int k = 0;
+            while (k < n) {
+                double v = 0.0;
+                if (realCol) { v = src.CellReal(st.order[k], bc); }
+                else { v = (double)src.CellNum(st.order[k], bc); }
+                s = s + v;
+                if (k == 0) { mn = v; mx = v; }
+                else {
+                    if (v < mn) { mn = v; }
+                    if (v > mx) { mx = v; }
+                }
+                k = k + 1;
+            }
+            sumV[bc] = s;
+            minV[bc] = mn;
+            maxV[bc] = mx;
+            bi = bi + 1;
+        }
+
+        // resolve each column's raw aggregate value (base first, then derived so
+        // derived columns read finished aggregates). aggReal carries the exact
+        // value; aggValue keeps its historical int form for DeriveValue and any
+        // caller that reads it.
+        st.aggValue.Clear();
+        st.aggReal.Clear();
+        col = 0;
+        while (col < nc) { st.aggValue.Add(0); st.aggReal.Add(0.0); col = col + 1; }
+        col = 0;
+        while (col < nc) {
+            int m = st.aggMode[col];
+            if (m == 1) { st.aggReal[col] = sumV[col]; }
+            else if (m == 2) { if (n > 0) { st.aggReal[col] = sumV[col] / (double)n; } }
+            else if (m == 3) { st.aggReal[col] = minV[col]; }
+            else if (m == 4) { st.aggReal[col] = maxV[col]; }
+            else if (m == 5) { st.aggReal[col] = (double)n; }
+            st.aggValue[col] = (int)st.aggReal[col];
+            col = col + 1;
+        }
+        col = 0;
+        while (col < nc) {
+            if (st.aggMode[col] == 6) {
+                st.aggValue[col] = DataTable.DeriveValue(cols[col], st.aggValue);
+                st.aggReal[col] = DataTable.DeriveReal(cols[col], st.aggReal);
+            }
+            col = col + 1;
+        }
+
+        // format (no row scan)
+        st.summaryText.Clear();
+        col = 0;
+        while (col < nc) {
+            int m = st.aggMode[col];
+            int dec = cols[col].decimals;
+            // Averages always carry a fraction, even on integer columns.
+            int showDec = dec;
+            if (m == 2 && showDec == 0) { showDec = 2; }
+            string val = DataTable.FormatCell(cols[col], DataTable.FormatReal(st.aggReal[col], showDec));
+            string txt = "";
+            if (m == 1) { txt = "Σ " + val; }
+            else if (m == 2) { txt = "avg " + val; }
+            else if (m == 3) { txt = "min " + val; }
+            else if (m == 4) { txt = "max " + val; }
+            else if (m == 5) { txt = "n " + Convert.ToString(n); }
+            else if (m == 6) {
+                int ddec = dec;
+                if (cols[col].deriveOp == 0 || cols[col].deriveOp == 1) {
+                    if (ddec == 0) { ddec = 2; }
+                }
+                txt = DataTable.FormatReal(st.aggReal[col], ddec);
+                if (cols[col].deriveOp == 0) { txt = txt + "%"; }
+            }
+            st.summaryText.Add(txt);
+            col = col + 1;
+        }
+    }
+
+    // Per-column min/max over the filtered set, for data-bar & color-scale
+    // normalisation. Only columns with cfMode 1 or 2 are scanned.
+    static void ComputeColStats(DataTableState st, List<DataColumn> cols, DataSource src) {
+        st.cfMin.Clear();
+        st.cfMax.Clear();
+        st.cfMinR.Clear();
+        st.cfMaxR.Clear();
+        int n = st.order.Count;
+        int col = 0;
+        while (col < cols.Count) {
+            double mn = 0.0;
+            double mx = 0.0;
+            if (cols[col].cfMode == 1 || cols[col].cfMode == 2) {
+                bool realCol = cols[col].decimals > 0;
+                int k = 0;
+                while (k < n) {
+                    double v = 0.0;
+                    if (realCol) { v = src.CellReal(st.order[k], col); }
+                    else { v = (double)src.CellNum(st.order[k], col); }
+                    if (k == 0) { mn = v; mx = v; }
+                    else { if (v < mn) { mn = v; } if (v > mx) { mx = v; } }
+                    k = k + 1;
+                }
+            }
+            st.cfMinR.Add(mn);
+            st.cfMaxR.Add(mx);
+            st.cfMin.Add((int)mn);
+            st.cfMax.Add((int)mx);
+            col = col + 1;
+        }
+    }
+
+}

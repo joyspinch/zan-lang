@@ -172,19 +172,20 @@ class Css {
         return s;
     }
 
-    /// Blanks out `/* ... */` comments, preserving length-independent content.
+    /// Drops `/* ... */` comments (slice by slice, so a large sheet costs one
+    /// pass rather than a string per character).
     static string StripComments(string src) {
         string outp = "";
         int i = 0;
         while (i < src.Length) {
-            if (i + 1 < src.Length && src.Substring(i, 2) == "/*") {
-                int end = Css.IndexFrom(src, "*/", i + 2);
-                if (end < 0) { return outp; }
-                i = end + 2;
-                continue;
+            int open = Css.IndexFrom(src, "/*", i);
+            if (open < 0) {
+                return outp + src.Substring(i, src.Length - i);
             }
-            outp = outp + src.Substring(i, 1);
-            i = i + 1;
+            outp = outp + src.Substring(i, open - i);
+            int end = Css.IndexFrom(src, "*/", open + 2);
+            if (end < 0) { return outp; }
+            i = end + 2;
         }
         return outp;
     }
@@ -202,13 +203,12 @@ class Css {
     }
 
     static int IndexFrom(string s, string needle, int start) {
-        int n = needle.Length;
-        int i = start;
-        while (i + n <= s.Length) {
-            if (s.Substring(i, n) == needle) { return i; }
-            i = i + 1;
-        }
-        return -1;
+        int from = start;
+        if (from < 0) { from = 0; }
+        if (from > s.Length) { return -1; }
+        int at = s.Substring(from, s.Length - from).IndexOf(needle);
+        if (at < 0) { return -1; }
+        return from + at;
     }
 
     static bool Space(string ch) {
@@ -221,5 +221,90 @@ class Css {
         while (a < b && Css.Space(s.Substring(a, 1))) { a = a + 1; }
         while (b > a && Css.Space(s.Substring(b - 1, 1))) { b = b - 1; }
         return s.Substring(a, b - a);
+    }
+}
+
+/// One parsed selector: `button.ghost.primary::icon:hover` split into the type
+/// name, its class chain, an optional id, an optional `::part` and an optional
+/// `:state`. This is all the selector grammar the engine models — enough for a
+/// component's whole look (its parts and states) to be written in CSS, and
+/// small enough that matching stays a table scan.
+class Selector {
+    string type;
+    string classes;   // space separated, "" when none
+    string id;
+    string part;
+    string state;
+
+    /// Parses one selector, or returns null for a form this engine does not
+    /// model (descendant/child combinators, attribute selectors, `:root`), which
+    /// then simply never matches.
+    static Selector Parse(string sel) {
+        string s = Css.Trim(sel);
+        if (s == "" || s == ":root") { return null; }
+        Selector p = new Selector();
+        p.type = "";
+        p.classes = "";
+        p.id = "";
+        p.part = "";
+        p.state = "";
+        int i = 0;
+        int n = s.Length;
+        while (i < n && Selector.NameChar(s.Substring(i, 1))) {
+            p.type = p.type + s.Substring(i, 1);
+            i = i + 1;
+        }
+        while (i < n) {
+            string ch = s.Substring(i, 1);
+            int start = i + 1;
+            bool part = false;
+            if (ch == ":" && i + 1 < n && s.Substring(i + 1, 1) == ":") {
+                start = i + 2;
+                part = true;
+            } else if (ch != "." && ch != "#" && ch != ":") {
+                return null;
+            }
+            int j = start;
+            string name = "";
+            while (j < n && Selector.NameChar(s.Substring(j, 1))) {
+                name = name + s.Substring(j, 1);
+                j = j + 1;
+            }
+            if (name == "") { return null; }
+            if (ch == ".") {
+                if (p.classes == "") { p.classes = name; }
+                else { p.classes = p.classes + " " + name; }
+            } else if (ch == "#") {
+                p.id = name;
+            } else if (part) {
+                p.part = name;
+            } else {
+                p.state = name;
+            }
+            i = j;
+        }
+        return p;
+    }
+
+    /// The weight this selector carries in the cascade. A pseudo-state outranks
+    /// everything else so `:hover` keeps layering on top of the base look
+    /// wherever the author wrote it; below that the CSS order holds: type <
+    /// class < class chain < id.
+    int Specificity() {
+        int spec = 0;
+        if (type != "") { spec = spec + 1; }
+        spec = spec + Style.Classes(classes).Count * 100;
+        if (id != "") { spec = spec + 10000; }
+        if (state != "") { spec = spec + 1000000; }
+        return spec;
+    }
+
+    /// True for a character that can appear in a type / class / id / part name.
+    static bool NameChar(string ch) {
+        if (ch == "." || ch == "#" || ch == ":" || ch == "*") { return false; }
+        if (ch == "," || ch == ">" || ch == "+" || ch == "~" || ch == "[") {
+            return false;
+        }
+        return !Css.Space(ch);
     }
 }

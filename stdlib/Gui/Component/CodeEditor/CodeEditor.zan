@@ -1,0 +1,1342 @@
+using System;
+using Gui;
+using Gui.Widget;
+using Gui.Backend;
+
+namespace Gui.Component.CodeEditor;
+
+/// <summary>One line's cached syntax highlighting: the source it was computed
+/// from plus the parallel token/colour segments, so an unchanged line is not
+/// re-tokenised (and re-allocated) on every repaint.</summary>
+class CeHlLine {
+    string src;
+    List<string> toks;
+    List<int> cols;
+}
+
+/// <summary>One undo/redo entry: the full buffer text plus the caret line/col to
+/// restore. One entity instead of parallel text/line/col stacks.</summary>
+class EditSnapshot {
+    string text;
+    int line;
+    int col;
+
+    EditSnapshot(string text, int line, int col) {
+        this.text = text;
+        this.line = line;
+        this.col = col;
+    }
+}
+
+/// <summary>One diagnostic: the 0-based line it sits on and its message. One
+/// entity instead of parallel line/message lists.</summary>
+class Diagnostic {
+    int line;
+    string msg;
+
+    Diagnostic(int line, string msg) {
+        this.line = line;
+        this.msg = msg;
+    }
+}
+
+/// <summary>One missing-`using` quick-fix: the line whose error it resolves and
+/// the namespace to import. One entity instead of parallel line/ns lists.</summary>
+class QuickFix {
+    int line;
+    string ns;
+
+    QuickFix(int line, string ns) {
+        this.line = line;
+        this.ns = ns;
+    }
+}
+
+/// <summary>One secondary caret's position (line + column). One entity instead
+/// of parallel line/column lists.</summary>
+class Caret {
+    int line;
+    int col;
+
+    Caret(int line, int col) {
+        this.line = line;
+        this.col = col;
+    }
+}
+
+/// <summary>One CodeLens "N references" annotation: the declaration line and
+/// name it decorates plus its clickable screen rect (x/y/width). One entity
+/// instead of five parallel lists.</summary>
+class CodeLensRef {
+    int line;
+    string name;
+    int x;
+    int y;
+    int w;
+
+    CodeLensRef(int line, string name, int x, int y, int w) {
+        this.line = line;
+        this.name = name;
+        this.x = x;
+        this.y = y;
+        this.w = w;
+    }
+}
+
+/// <summary>One project type: its name and the space-separated list of its
+/// declared member names. One entity instead of parallel name/members lists.</summary>
+class ProjType {
+    string name;
+    string members;
+
+    ProjType(string name, string members) {
+        this.name = name;
+        this.members = members;
+    }
+}
+
+/// <summary>
+/// A multi-line, line-numbered plain-text code editor. Holds its own buffer
+/// (a list of lines) and cursor, and edits itself in response to keyboard input
+/// while it has focus — the editing surface of the IDE. Immediate-mode: create
+/// one, keep it across frames, and call Render(app, area) each frame.
+///
+///   CodeEditor ed = CodeEditor.Create();      // once
+///   ed.LoadText("using System;\n\nclass Main {}");
+///   ...
+///   ed.Render(app, editorRect);               // every frame
+/// </summary>
+partial class CodeEditor {
+    /// UI language for editor-owned chrome (context menu): 0 = English,
+    /// 1 = Chinese. Set by the host application; display-only.
+    static int lang;
+
+    List<string> lines;
+    int curLine;
+    int curCol;
+    int scrollLine;
+    // Line the view was last auto-scrolled to keep visible. The "keep caret in
+    // view" clamp only fires when the caret line changes (typing/arrows/click),
+    // so plain wheel/scrollbar scrolling is not yanked back to the caret line.
+    int ensuredCaretLine;
+    int lastId;
+
+    // ---- autocomplete popup state ----
+    List<string> acItems;   // current candidate list (filtered by prefix + kind)
+    List<string> acAllItems; // candidates before the kind filter is applied
+    List<string> acAllKinds; // kind tag per acAllItems entry
+    string acFilter;        // "" = show all kinds; else a single kind letter
+    // Geometry of the popup's kind-filter strip (for click hit-testing).
+    int filtX;
+    int filtY;
+    int filtW;
+    int filtH;
+    List<string> acFull;    // full unfiltered candidates (for dot-mode re-filter)
+    // CodeLens: clickable "N references" annotations (rebuilt each render).
+    List<CodeLensRef> codeLens;
+    // Expandable reference list popup (opened by clicking a CodeLens count).
+    bool refPopOpen;
+    string refPopName;
+    List<int> refPopLines;
+    int refPopX;
+    int refPopY;
+    int refPopSel;
+    // Final clamped popup geometry from the last render, used for hit testing.
+    int refPopGX;
+    int refPopGY;
+    int refPopGW;
+    int refPopGH;
+    int refPopRowH;
+    int refPopHeadH;
+    int refPopShown;
+    // Set when a Ctrl+click asks the host to run Go to Definition.
+    bool gotoRequested;
+    int acSel;              // selected candidate index
+    bool acActive;          // popup currently shown
+    int acStart;            // column where the in-progress word begins
+    bool acDot;             // true when popup was triggered by '.' (member completion)
+    bool acForced;          // Ctrl+Space: list everything, even with no prefix
+    List<string> acKinds;   // kind tag per item: "M"=method, "P"=property, "T"=type, "K"=keyword, "S"=snippet, "F"=field
+
+    // ---- popup geometry (set during Render, read during click) ----
+    int popX;
+    int popY;
+    int popW;
+    int popH;
+    int popItemH;
+    int popFirst;
+    int popShown;
+
+    // ---- selection ----
+    bool selActive;
+    int selAnchorLine;
+    int selAnchorCol;
+    // True while the left button is held and dragging out a selection.
+    bool mouseSelecting;
+    // True while the left button is held on the right-edge scroll strip; the
+    // view then follows the pointer (thumb drag) without moving the caret.
+    bool barDragging;
+    // Double/triple-click detection: consecutive clicks at (roughly) the same
+    // spot within a short window select the word, then the whole line.
+    int lastClickMs;
+    int lastClickLine;
+    int lastClickCol;
+    int clickCount;
+    // Number of fully visible text rows from the last Render (for Page Up/Down).
+    int pageRows;
+
+    // ---- multi-cursor (secondary carets, each on a distinct line) ----
+    List<Caret> carets;
+
+    // ---- clipboard & undo ----
+    string clipboard;
+    List<EditSnapshot> undoStack;
+    List<EditSnapshot> redoStack;
+
+    // ---- error diagnostics ----
+    List<Diagnostic> errors;
+    int lastDiagLine;       // caret line at last CheckErrors run (-1 = never)
+    // Real compiler diagnostics from the last Run/Build, mapped onto this file.
+    // Kept separate from the heuristic ones and invalidated on the next edit
+    // (tracked by cErrStamp = buffer length when the diagnostics were set).
+    List<Diagnostic> compErrors;
+    int cErrStamp;
+    // Per-frame memo for CompilerDiagStale: -1 unknown, 0 live, 1 stale. The
+    // staleness test walks the whole buffer, and every visible line asks for
+    // it, so on a large file the answer is computed once per frame instead of
+    // once per row (InvalidateDiagStale runs after input handling).
+    int diagStaleFrame;
+    // Types declared in this buffer (names + space-separated member lists),
+    // cached against the TextStamp() they were parsed at. See EnsureBufTypes.
+    List<string> muTypeNames;
+    List<string> muTypeMembers;
+    int muTypesStamp;
+
+    // ---- symbol index (accurate, using-aware completion) ----
+    // Types (class/struct/enum) declared across the project's other files, and
+    // for each, a space-separated list of its declared member names. Fed by the
+    // host IDE via SetProjectFiles() so `Utils.` completes with Utils's real
+    // members instead of guesswork. The current buffer is scanned on demand.
+    List<ProjType> projTypes;
+    // Raw source of every other project file, kept so signature help can parse
+    // the real parameter list of a user/project method (not just its name).
+    List<string> projFileSrc;
+    // Cross-file type scan is deferred: SetProjectFiles() only stores the
+    // sources (cheap, keeps tab switches snappy) and marks this dirty; the
+    // actual per-file ScanTypesInto only runs the first time completion needs
+    // it, via EnsureProjectScan().
+    bool projScanDirty;
+    // Per-line syntax-highlight cache, aligned to `lines` by index and validated
+    // by source text, so scrolling/idling re-tokenises nothing. hlThemeSig
+    // invalidates the whole cache when the palette (theme/overrides) changes.
+    List<CeHlLine> hlCache;
+    int hlThemeSig;
+    // Missing-`using` quick-fixes: each maps an error line to the namespace to
+    // import to resolve it.
+    List<QuickFix> fixes;
+
+    // ---- debugging ----
+    List<int> bps;
+    int execLine;
+    List<string> dbgVars;   // tab-separated "name\ttype\tvalue" entries for hover tooltip
+    string hoverTip;        // current hover tooltip text
+    int hoverTipX;
+    int hoverTipY;
+
+    // Right-click context menu state.
+    bool ctxOpen;
+    int ctxX;
+    int ctxY;
+    string ctxCmd;          // command the host IDE must handle ("find"/"gotoline")
+
+    // ---- appearance (font + syntax colors), set by the host via ApplyTheme ----
+    // edFont is the code font size; 0 means "use the UI theme's medium size".
+    // The syntax colors are ARGB; 0 means "fall back to the built-in default".
+    int edFont;
+    int synKw;
+    int synTy;
+    int synStr;
+    int synCom;
+    int synNum;
+    int synText;
+
+    /// Sets the editor's code font size and syntax-highlight colors. A 0 for any
+    /// argument keeps that aspect at its built-in default.
+    void ApplyTheme(int fontPx, int kw, int ty, int str, int com, int num, int text) {
+        edFont = fontPx;
+        synKw = kw; synTy = ty; synStr = str; synCom = com; synNum = num; synText = text;
+    }
+
+    /// The code font size to render with, honoring the theme's default when unset.
+    int FontSize(Theme t) {
+        if (edFont > 0) { return edFont; }
+        return t.fontSizeMedium;
+    }
+
+    static CodeEditor Create() {
+        CodeEditor e = new CodeEditor();
+        e.edFont = 0;
+        e.synKw = 0; e.synTy = 0; e.synStr = 0; e.synCom = 0; e.synNum = 0; e.synText = 0;
+        e.lines = new List<string>();
+        e.lines.Add("");
+        e.curLine = 0;
+        e.curCol = 0;
+        e.scrollLine = 0;
+        e.ensuredCaretLine = -1;
+        e.lastId = -1;
+        e.acItems = new List<string>();
+        e.acAllItems = new List<string>();
+        e.acAllKinds = new List<string>();
+        e.acFilter = "";
+        e.filtX = 0; e.filtY = 0; e.filtW = 0; e.filtH = 0;
+        e.acFull = new List<string>();
+        e.codeLens = new List<CodeLensRef>();
+        e.refPopOpen = false;
+        e.refPopName = "";
+        e.refPopLines = new List<int>();
+        e.refPopX = 0; e.refPopY = 0; e.refPopSel = 0;
+        e.refPopGX = 0; e.refPopGY = 0; e.refPopGW = 0; e.refPopGH = 0;
+        e.refPopRowH = 0; e.refPopHeadH = 0; e.refPopShown = 0;
+        e.gotoRequested = false;
+        e.acSel = 0;
+        e.acActive = false;
+        e.acStart = 0;
+        e.acDot = false;
+        e.acKinds = new List<string>();
+        e.popX = 0; e.popY = 0; e.popW = 0; e.popH = 0;
+        e.popItemH = 0; e.popFirst = 0; e.popShown = 0;
+        e.selActive = false;
+        e.selAnchorLine = 0;
+        e.selAnchorCol = 0;
+        e.mouseSelecting = false;
+        e.barDragging = false;
+        e.lastClickMs = 0 - 100000;
+        e.lastClickLine = -1;
+        e.lastClickCol = -1;
+        e.clickCount = 0;
+        e.pageRows = 20;
+        e.carets = new List<Caret>();
+        e.clipboard = "";
+        e.undoStack = new List<EditSnapshot>();
+        e.redoStack = new List<EditSnapshot>();
+        e.errors = new List<Diagnostic>();
+        e.lastDiagLine = -1;
+        e.compErrors = new List<Diagnostic>();
+        e.cErrStamp = -1;
+        e.diagStaleFrame = -1;
+        e.muTypeNames = null;
+        e.muTypeMembers = null;
+        e.muTypesStamp = -1;
+        e.projTypes = new List<ProjType>();
+        e.projFileSrc = new List<string>();
+        e.projScanDirty = false;
+        e.hlCache = new List<CeHlLine>();
+        e.hlThemeSig = 0;
+        e.fixes = new List<QuickFix>();
+        e.bps = new List<int>();
+        e.execLine = -1;
+        e.dbgVars = new List<string>();
+        e.hoverTip = "";
+        e.hoverTipX = 0;
+        e.hoverTipY = 0;
+        e.ctxOpen = false;
+        e.ctxX = 0;
+        e.ctxY = 0;
+        e.ctxCmd = "";
+        return e;
+    }
+
+    /// Splits a string into lines on '\n' (stripping '\r').
+    static List<string> SplitLines(string s) {
+        return s.Replace("\r", "").Split("\n");
+    }
+
+    void SetLines(List<string> ls) {
+        lines = ls;
+        if (lines.Count == 0) { lines.Add(""); }
+        curLine = 0;
+        curCol = 0;
+        scrollLine = 0;
+        ensuredCaretLine = -1;
+        lastDiagLine = -1;  // force diagnostics to recompute for the new content
+    }
+
+    void LoadText(string s) {
+        SetLines(CodeEditor.SplitLines(s));
+    }
+
+    string GetText() {
+        return string.Join("\n", lines);
+    }
+
+    /// Cheap content fingerprint (line count + total characters); lets hosts
+    /// detect buffer changes each frame without materialising the full text.
+    int TextStamp() {
+        int n = 0;
+        int i = 0;
+        while (i < lines.Count) {
+            n = n + lines[i].Length;
+            i = i + 1;
+        }
+        return n * 131 + lines.Count;
+    }
+
+    int LineCount() {
+        return lines.Count;
+    }
+
+    int CurLine() { return curLine; }
+    int CurCol() { return curCol; }
+
+    // ---- automation / introspection accessors (used by Gui.UiDriver) ----
+    // Read-only views of the autocomplete popup so an AI driver can assert
+    // completion candidates and selection without screen-scraping the popup.
+    /// True while the completion popup is shown.
+    bool CompletionActive() { return acActive; }
+    /// Number of visible completion candidates.
+    int CompletionCount() { return acItems.Count; }
+    /// Index of the highlighted candidate (0-based).
+    int CompletionSel() { return acSel; }
+    /// Candidate label at index i ("" when out of range).
+    string CompletionItem(int i) {
+        if (i < 0 || i >= acItems.Count) { return ""; }
+        return acItems[i];
+    }
+    /// Candidate kind tag at index i: M/P/T/K/S/F ("" when out of range).
+    string CompletionKind(int i) {
+        if (i < 0 || i >= acKinds.Count) { return ""; }
+        return acKinds[i];
+    }
+
+    /// Returns the identifier under the caret (empty string when none).
+    string WordAtCaret() {
+        if (curLine < 0 || curLine >= lines.Count) { return ""; }
+        string s = lines[curLine];
+        int col = curCol;
+        if (col >= s.Length) { col = s.Length - 1; }
+        if (col < 0) { return ""; }
+        return CodeEditor.WordAt(s, col);
+    }
+
+    /// Returns true once after a Ctrl+click requested Go to Definition,
+    /// clearing the flag so the host handles it exactly once.
+    bool ConsumeGotoRequest() {
+        if (gotoRequested) { gotoRequested = false; return true; }
+        return false;
+    }
+
+    void SetDebugVars(List<string> vars) { dbgVars = vars; }
+
+    void GoToLine(int line) {
+        if (line < 0) { line = 0; }
+        if (line >= lines.Count) { line = lines.Count - 1; }
+        curLine = line;
+        curCol = 0;
+        selActive = false;
+    }
+
+    /// Total buffer size, used only as a cheap change signal for invalidating
+    /// compiler diagnostics when the user edits the file.
+    int BufLen() {
+        int n = 0;
+        int i = 0;
+        while (i < lines.Count) { n = n + lines[i].Length + 1; i = i + 1; }
+        return n;
+    }
+
+    /// Replaces the compiler diagnostics shown as red underlines + tooltips with
+    /// the real errors reported by the last Run/Build for this file, and jumps
+    /// the caret to the first one so its reason is visible immediately.
+    void SetCompilerDiagnostics(List<int> errLines, List<string> msgs) {
+        compErrors = new List<Diagnostic>();
+        int i = 0;
+        while (i < errLines.Count) {
+            string m = "";
+            if (i < msgs.Count) { m = msgs[i]; }
+            compErrors.Add(new Diagnostic(errLines[i], m));
+            i = i + 1;
+        }
+        cErrStamp = BufLen();
+        diagStaleFrame = 0 - 1;
+        if (compErrors.Count > 0) {
+            GoToLine(compErrors[0].line);
+        }
+    }
+
+    /// True once the buffer has changed since the compiler diagnostics were set,
+    /// so stale errors stop being drawn the moment the user starts editing.
+    bool CompilerDiagStale() {
+        if (diagStaleFrame == 0) { return false; }
+        if (diagStaleFrame == 1) { return true; }
+        bool stale = cErrStamp < 0 || BufLen() != cErrStamp;
+        diagStaleFrame = 0;
+        if (stale) { diagStaleFrame = 1; }
+        return stale;
+    }
+
+    /// Drops the per-frame staleness memo; the render pass calls this once the
+    /// buffer can no longer change this frame.
+    void InvalidateDiagStale() { diagStaleFrame = 0 - 1; }
+
+    /// The compiler-diagnostic message for a line, or "" when none/stale.
+    string CompilerErrMsg(int ln) {
+        if (CompilerDiagStale()) { return ""; }
+        return CodeEditor.DiagMsg(compErrors, ln);
+    }
+
+    /// True when line `ln` currently carries a live compiler diagnostic.
+    bool HasCompilerErr(int ln) {
+        if (CompilerDiagStale()) { return false; }
+        return CodeEditor.DiagHas(compErrors, ln);
+    }
+
+    void GoToLineCol(int line, int col) {
+        GoToLine(line);
+        curCol = col;
+        ClampCol();
+    }
+
+    // ---- edit primitives ----
+    void InsertStr(string ins) {
+        string ln = lines[curLine];
+        lines[curLine] = Text.InsertAt(ln, curCol, ins);
+        curCol = curCol + ins.Length;
+    }
+
+    void NewLine() {
+        string ln = lines[curLine];
+        string left = Text.Left(ln, curCol);
+        string right = Text.Right(ln, curCol);
+        // Auto-indent: carry the split line's leading whitespace (ASCII space/
+        // tab, so byte offsets are safe) onto the new line and place the caret
+        // after it, matching the usual code-editor behaviour.
+        int ws = 0;
+        while (ws < left.Length) {
+            string ch = left.Substring(ws, 1);
+            if (ch == " " || ch == "\t") { ws = ws + 1; } else { break; }
+        }
+        string indent = Text.Left(left, ws);
+        lines[curLine] = left;
+        lines.Insert(curLine + 1, indent + right);
+        curLine = curLine + 1;
+        curCol = ws;
+    }
+
+    void BackspaceEdit() {
+        if (curCol > 0) {
+            string ln = lines[curLine];
+            int start = Text.PrevCharStart(ln, curCol);
+            lines[curLine] = Text.DeleteBefore(ln, curCol);
+            curCol = start;
+        } else if (curLine > 0) {
+            string prev = lines[curLine - 1];
+            string cur = lines[curLine];
+            int newCol = prev.Length;
+            lines[curLine - 1] = prev + cur;
+            lines.RemoveAt(curLine);
+            curLine = curLine - 1;
+            curCol = newCol;
+        }
+    }
+
+    void DeleteEdit() {
+        string ln = lines[curLine];
+        if (curCol < ln.Length) {
+            lines[curLine] = Text.RemoveAt(ln, curCol);
+        } else if (curLine + 1 < lines.Count) {
+            string next = lines[curLine + 1];
+            lines[curLine] = ln + next;
+            lines.RemoveAt(curLine + 1);
+        }
+    }
+
+    void ClampCol() {
+        string ln = lines[curLine];
+        if (curCol > ln.Length) { curCol = ln.Length; }
+        if (curCol < 0) { curCol = 0; }
+    }
+
+    void MoveLeft() {
+        if (curCol > 0) {
+            curCol = Text.PrevCharStart(lines[curLine], curCol);
+        } else if (curLine > 0) {
+            curLine = curLine - 1;
+            curCol = lines[curLine].Length;
+        }
+    }
+
+    void MoveRight() {
+        string ln = lines[curLine];
+        if (curCol < ln.Length) {
+            curCol = Text.NextCharEnd(ln, curCol);
+        } else if (curLine + 1 < lines.Count) {
+            curLine = curLine + 1;
+            curCol = 0;
+        }
+    }
+
+    void MoveUp() {
+        if (curLine > 0) {
+            curLine = curLine - 1;
+            ClampCol();
+        }
+    }
+
+    void MoveDown() {
+        if (curLine + 1 < lines.Count) {
+            curLine = curLine + 1;
+            ClampCol();
+        }
+    }
+
+    /// Moves the caret to the start of the previous word (Ctrl+Left).
+    void MoveWordLeft() {
+        if (curCol == 0) {
+            if (curLine > 0) { curLine = curLine - 1; curCol = lines[curLine].Length; }
+            return;
+        }
+        string s = lines[curLine];
+        int c = curCol;
+        while (c > 0 && s.Substring(c - 1, 1) == " ") { c = c - 1; }
+        if (c > 0 && CodeEditor.IsIdentChar(s.Substring(c - 1, 1))) {
+            while (c > 0 && CodeEditor.IsIdentChar(s.Substring(c - 1, 1))) { c = c - 1; }
+        } else {
+            while (c > 0 && !CodeEditor.IsIdentChar(s.Substring(c - 1, 1))
+                   && s.Substring(c - 1, 1) != " ") { c = c - 1; }
+        }
+        curCol = c;
+    }
+
+    /// Moves the caret to the start of the next word (Ctrl+Right).
+    void MoveWordRight() {
+        string s = lines[curLine];
+        int n = s.Length;
+        if (curCol >= n) {
+            if (curLine + 1 < lines.Count) { curLine = curLine + 1; curCol = 0; }
+            return;
+        }
+        int c = curCol;
+        if (CodeEditor.IsIdentChar(s.Substring(c, 1))) {
+            while (c < n && CodeEditor.IsIdentChar(s.Substring(c, 1))) { c = c + 1; }
+        } else if (s.Substring(c, 1) != " ") {
+            while (c < n && !CodeEditor.IsIdentChar(s.Substring(c, 1))
+                   && s.Substring(c, 1) != " ") { c = c + 1; }
+        }
+        while (c < n && s.Substring(c, 1) == " ") { c = c + 1; }
+        curCol = c;
+    }
+
+    /// Smart Home target: first non-whitespace column, or column 0 when the
+    /// caret is already there (toggles, like Visual Studio / JetBrains).
+    int SmartHomeCol() {
+        string s = lines[curLine];
+        int i = 0;
+        while (i < s.Length && s.Substring(i, 1) == " ") { i = i + 1; }
+        if (curCol == i) { return 0; }
+        return i;
+    }
+
+    /// Swaps the current line with the one above (Alt+Up).
+    void MoveLineUp() {
+        if (curLine == 0) { return; }
+        SaveUndo();
+        string tmp = lines[curLine - 1];
+        lines[curLine - 1] = lines[curLine];
+        lines[curLine] = tmp;
+        curLine = curLine - 1;
+        ClampCol();
+        selActive = false;
+    }
+
+    /// Swaps the current line with the one below (Alt+Down).
+    void MoveLineDown() {
+        if (curLine + 1 >= lines.Count) { return; }
+        SaveUndo();
+        string tmp = lines[curLine + 1];
+        lines[curLine + 1] = lines[curLine];
+        lines[curLine] = tmp;
+        curLine = curLine + 1;
+        ClampCol();
+        selActive = false;
+    }
+
+    /// Adds one indent level to every line touched by the selection (Tab).
+    void IndentSelection() {
+        SaveUndo();
+        int a = selAnchorLine;
+        int b = curLine;
+        if (a > b) { int tmp = a; a = b; b = tmp; }
+        int i = a;
+        while (i <= b) {
+            lines[i] = "    " + lines[i];
+            i = i + 1;
+        }
+        selAnchorCol = selAnchorCol + 4;
+        curCol = curCol + 4;
+    }
+
+    /// Removes up to one indent level from every selected line (Shift+Tab).
+    void OutdentSelection() {
+        SaveUndo();
+        int a = selAnchorLine;
+        int b = curLine;
+        if (a > b) { int tmp = a; a = b; b = tmp; }
+        int i = a;
+        while (i <= b) {
+            string s = lines[i];
+            int rem = 0;
+            while (rem < 4 && rem < s.Length && s.Substring(rem, 1) == " ") { rem = rem + 1; }
+            lines[i] = s.Substring(rem, s.Length - rem);
+            if (i == selAnchorLine) {
+                selAnchorCol = selAnchorCol - rem;
+                if (selAnchorCol < 0) { selAnchorCol = 0; }
+            }
+            if (i == curLine) {
+                curCol = curCol - rem;
+                if (curCol < 0) { curCol = 0; }
+            }
+            i = i + 1;
+        }
+    }
+
+    /// Removes up to one indent level from the current line (Shift+Tab, no
+    /// selection).
+    void OutdentCurrentLine() {
+        SaveUndo();
+        string s = lines[curLine];
+        int rem = 0;
+        while (rem < 4 && rem < s.Length && s.Substring(rem, 1) == " ") { rem = rem + 1; }
+        lines[curLine] = s.Substring(rem, s.Length - rem);
+        curCol = curCol - rem;
+        if (curCol < 0) { curCol = 0; }
+    }
+
+    // ---- undo / redo ----
+    void SaveUndo() {
+        undoStack.Add(new EditSnapshot(GetText(), curLine, curCol));
+        if (undoStack.Count > 50) {
+            undoStack.RemoveAt(0);
+        }
+        // A fresh edit invalidates the redo history.
+        redoStack = new List<EditSnapshot>();
+    }
+
+    void Undo() {
+        if (undoStack.Count == 0) { return; }
+        int last = undoStack.Count - 1;
+        EditSnapshot s = undoStack[last];
+        undoStack.RemoveAt(last);
+        // Remember the pre-undo state so Redo can restore it.
+        redoStack.Add(new EditSnapshot(GetText(), curLine, curCol));
+        LoadText(s.text);
+        curLine = s.line;
+        curCol = s.col;
+        ClampCol();
+        selActive = false;
+    }
+
+    void Redo() {
+        if (redoStack.Count == 0) { return; }
+        int last = redoStack.Count - 1;
+        EditSnapshot s = redoStack[last];
+        redoStack.RemoveAt(last);
+        undoStack.Add(new EditSnapshot(GetText(), curLine, curCol));
+        LoadText(s.text);
+        curLine = s.line;
+        curCol = s.col;
+        ClampCol();
+        selActive = false;
+    }
+
+    // ---- selection ----
+    void SelectAll() {
+        selAnchorLine = 0;
+        selAnchorCol = 0;
+        curLine = lines.Count - 1;
+        curCol = lines[curLine].Length;
+        selActive = true;
+    }
+
+    void ClearSelection() { selActive = false; }
+
+    /// Selects the identifier under the caret (double-click). If the caret sits
+    /// at a word's right edge (on the following separator) the preceding word is
+    /// selected, matching Visual Studio / JetBrains behaviour.
+    void SelectWordCaret() {
+        string s = lines[curLine];
+        int n = s.Length;
+        int probe = curCol;
+        bool onIdent = probe < n && CodeEditor.IsIdentChar(s.Substring(probe, 1));
+        if (!onIdent && probe > 0 && CodeEditor.IsIdentChar(s.Substring(probe - 1, 1))) {
+            probe = probe - 1;
+            onIdent = true;
+        }
+        if (!onIdent) { return; }
+        int start = probe;
+        int end = probe + 1;
+        while (start > 0 && CodeEditor.IsIdentChar(s.Substring(start - 1, 1))) { start = start - 1; }
+        while (end < n && CodeEditor.IsIdentChar(s.Substring(end, 1))) { end = end + 1; }
+        selAnchorLine = curLine;
+        selAnchorCol = start;
+        curCol = end;
+        selActive = true;
+        ClearExtraCarets();
+    }
+
+    /// Selects the whole current line, including its trailing newline when there
+    /// is a following line (triple-click).
+    void SelectLineCaret() {
+        selAnchorLine = curLine;
+        selAnchorCol = 0;
+        if (curLine + 1 < lines.Count) {
+            curLine = curLine + 1;
+            curCol = 0;
+        } else {
+            curCol = lines[curLine].Length;
+        }
+        selActive = true;
+        ClearExtraCarets();
+    }
+
+    /// Prepares selection state before a caret move: when `shift` is held the
+    /// anchor is planted at the current caret (if not already selecting) so the
+    /// move extends the selection; otherwise the selection is dropped.
+    void SelPrepare(bool shift) {
+        if (shift) {
+            if (!selActive) {
+                selAnchorLine = curLine;
+                selAnchorCol = curCol;
+                selActive = true;
+            }
+        } else {
+            selActive = false;
+        }
+    }
+
+    /// Places the caret from a mouse position (pixels) inside the text area.
+    void CaretFromMouse(App app, Rect area, int gutterW, int fontSize) {
+        int textX = area.x + gutterW + app.theme.paddingSmall;
+        int rel = app.mouseY - area.y;
+        int clicked = scrollLine + rel / (Canvas.FontHeight(fontSize) + app.Scale(4));
+        if (clicked >= lines.Count) { clicked = lines.Count - 1; }
+        if (clicked < 0) { clicked = 0; }
+        curLine = clicked;
+        curCol = CodeEditor.ColFromX(lines[curLine], app.mouseX - textX, fontSize);
+    }
+
+    // ---- multi-cursor ----
+    void ClearExtraCarets() { carets = new List<Caret>(); }
+
+    /// Adds a secondary caret one line below the lowest active caret.
+    void AddCaretBelow() {
+        int maxL = curLine;
+        int i = 0;
+        while (i < carets.Count) { if (carets[i].line > maxL) { maxL = carets[i].line; } i = i + 1; }
+        if (maxL + 1 < lines.Count) { carets.Add(new Caret(maxL + 1, curCol)); }
+    }
+
+    /// Adds a secondary caret one line above the highest active caret.
+    void AddCaretAbove() {
+        int minL = curLine;
+        int i = 0;
+        while (i < carets.Count) { if (carets[i].line < minL) { minL = carets[i].line; } i = i + 1; }
+        if (minL - 1 >= 0) { carets.Add(new Caret(minL - 1, curCol)); }
+    }
+
+    /// Inserts `ins` at the primary caret and every secondary caret.
+    /// All carets sit on distinct lines, so per-line edits stay independent.
+    void McInsertStr(string ins) {
+        InsertStr(ins);
+        int i = 0;
+        while (i < carets.Count) {
+            int L = carets[i].line;
+            if (L >= 0 && L < lines.Count) {
+                int C = carets[i].col;
+                if (C > lines[L].Length) { C = lines[L].Length; }
+                lines[L] = Text.InsertAt(lines[L], C, ins);
+                carets[i].col = C + ins.Length;
+            }
+            i = i + 1;
+        }
+    }
+
+    /// Backspace at every caret. Collapses to a single caret when the primary
+    /// caret is at column 0 (which would merge lines and shift indices).
+    void McBackspace() {
+        if (curCol <= 0) { ClearExtraCarets(); SaveUndo(); BackspaceEdit(); return; }
+        SaveUndo();
+        string ln = lines[curLine];
+        int start = Text.PrevCharStart(ln, curCol);
+        lines[curLine] = Text.DeleteBefore(ln, curCol);
+        curCol = start;
+        int i = 0;
+        while (i < carets.Count) {
+            int L = carets[i].line;
+            int C = carets[i].col;
+            if (L >= 0 && L < lines.Count && C > 0) {
+                int cs = Text.PrevCharStart(lines[L], C);
+                lines[L] = Text.DeleteBefore(lines[L], C);
+                carets[i].col = cs;
+            }
+            i = i + 1;
+        }
+    }
+
+    void StartSelection() {
+        if (!selActive) {
+            selAnchorLine = curLine;
+            selAnchorCol = curCol;
+            selActive = true;
+        }
+    }
+
+    string GetSelectedText() {
+        if (!selActive) { return ""; }
+        int sL = selAnchorLine;
+        int sC = selAnchorCol;
+        int eL = curLine;
+        int eC = curCol;
+        if (sL > eL || (sL == eL && sC > eC)) {
+            int tmpL = sL; sL = eL; eL = tmpL;
+            int tmpC = sC; sC = eC; eC = tmpC;
+        }
+        if (sL == eL) {
+            string ln = lines[sL];
+            if (sC > ln.Length) { sC = ln.Length; }
+            if (eC > ln.Length) { eC = ln.Length; }
+            return ln.Substring(sC, eC - sC);
+        }
+        string result = "";
+        string firstLn = lines[sL];
+        if (sC <= firstLn.Length) {
+            result = firstLn.Substring(sC, firstLn.Length - sC);
+        }
+        int mi = sL + 1;
+        while (mi < eL) {
+            result = result + "\n" + lines[mi];
+            mi = mi + 1;
+        }
+        string lastLn = lines[eL];
+        if (eC > lastLn.Length) { eC = lastLn.Length; }
+        result = result + "\n" + lastLn.Substring(0, eC);
+        return result;
+    }
+
+    void DeleteSelection() {
+        if (!selActive) { return; }
+        int sL = selAnchorLine;
+        int sC = selAnchorCol;
+        int eL = curLine;
+        int eC = curCol;
+        if (sL > eL || (sL == eL && sC > eC)) {
+            int tmpL = sL; sL = eL; eL = tmpL;
+            int tmpC = sC; sC = eC; eC = tmpC;
+        }
+        SaveUndo();
+        if (sL == eL) {
+            string ln = lines[sL];
+            if (sC > ln.Length) { sC = ln.Length; }
+            if (eC > ln.Length) { eC = ln.Length; }
+            lines[sL] = ln.Substring(0, sC) + ln.Substring(eC, ln.Length - eC);
+        } else {
+            string firstLn = lines[sL];
+            string lastLn = lines[eL];
+            if (sC > firstLn.Length) { sC = firstLn.Length; }
+            if (eC > lastLn.Length) { eC = lastLn.Length; }
+            string keep = firstLn.Substring(0, sC) + lastLn.Substring(eC, lastLn.Length - eC);
+            lines[sL] = keep;
+            int ri = eL;
+            while (ri > sL) {
+                lines.RemoveAt(ri);
+                ri = ri - 1;
+            }
+        }
+        curLine = sL;
+        curCol = sC;
+        selActive = false;
+    }
+
+    void CopySelection() {
+        if (!selActive) { return; }
+        clipboard = GetSelectedText();
+        Clipboard.SetText(clipboard);
+    }
+
+    void CutSelection() {
+        if (!selActive) { return; }
+        clipboard = GetSelectedText();
+        Clipboard.SetText(clipboard);
+        DeleteSelection();
+    }
+
+    void PasteClipboard() {
+        // Prefer the OS clipboard so text copied in other apps pastes here;
+        // fall back to the in-editor buffer when the OS clipboard has no text.
+        string os = Clipboard.GetText();
+        if (os.Length > 0) { clipboard = os; }
+        if (clipboard.Length == 0) { return; }
+        InsertBlock(clipboard);
+    }
+
+    /// Inserts possibly multi-line text at the caret (replacing the active
+    /// selection), exactly like pasting `ins`.
+    void InsertBlock(string ins) {
+        if (selActive) { DeleteSelection(); }
+        else { SaveUndo(); }
+        List<string> pLines = CodeEditor.SplitLines(ins);
+        if (pLines.Count == 1) {
+            InsertStr(pLines[0]);
+        } else {
+            string ln = lines[curLine];
+            string left = ln.Substring(0, curCol);
+            string right = "";
+            if (curCol < ln.Length) {
+                right = ln.Substring(curCol, ln.Length - curCol);
+            }
+            lines[curLine] = left + pLines[0];
+            int pi = 1;
+            while (pi < pLines.Count - 1) {
+                lines.Insert(curLine + pi, pLines[pi]);
+                pi = pi + 1;
+            }
+            int lastIdx = pLines.Count - 1;
+            string lastP = pLines[lastIdx];
+            lines.Insert(curLine + lastIdx, lastP + right);
+            curLine = curLine + lastIdx;
+            curCol = lastP.Length;
+        }
+    }
+
+    // ---- line editing (context-menu / VS-style commands) ----
+
+    /// Deletes the active selection, or the character at the caret otherwise.
+    void DeleteAtCaret() {
+        if (selActive) { DeleteSelection(); }
+        else { SaveUndo(); DeleteEdit(); }
+    }
+
+    /// Toggles a leading "// " line comment on the current line, or on every
+    /// line spanned by the selection.
+    void ToggleComment() {
+        SaveUndo();
+        int a = curLine;
+        int b = curLine;
+        if (selActive) {
+            a = selAnchorLine;
+            b = curLine;
+            if (a > b) { int tmp = a; a = b; b = tmp; }
+        }
+        // If every line in range is already commented, uncomment; else comment.
+        bool allComment = true;
+        int i = a;
+        while (i <= b) {
+            string s = lines[i];
+            string trimmed = CodeEditor.LTrim(s);
+            if (trimmed.Length < 2 || trimmed.Substring(0, 2) != "//") {
+                if (trimmed.Length > 0) { allComment = false; }
+            }
+            i = i + 1;
+        }
+        i = a;
+        while (i <= b) {
+            string s = lines[i];
+            if (allComment) {
+                lines[i] = CodeEditor.Uncomment(s);
+            } else {
+                if (CodeEditor.LTrim(s).Length > 0) {
+                    lines[i] = "// " + s;
+                }
+            }
+            i = i + 1;
+        }
+        selActive = false;
+        ClampCol();
+    }
+
+    /// Duplicates the current line directly below it.
+    void DuplicateLine() {
+        SaveUndo();
+        string s = lines[curLine];
+        lines.Insert(curLine + 1, s);
+        curLine = curLine + 1;
+        ClampCol();
+    }
+
+    /// Removes the current line entirely.
+    void DeleteLine() {
+        SaveUndo();
+        if (lines.Count <= 1) {
+            lines[0] = "";
+            curLine = 0;
+            curCol = 0;
+            return;
+        }
+        lines.RemoveAt(curLine);
+        if (curLine >= lines.Count) { curLine = lines.Count - 1; }
+        ClampCol();
+    }
+
+    static string LTrim(string s) {
+        int i = 0;
+        while (i < s.Length) {
+            string ch = s.Substring(i, 1);
+            if (ch == " " || ch == "\t") { i = i + 1; }
+            else { break; }
+        }
+        return s.Substring(i, s.Length - i);
+    }
+
+    /// Removes the first "// " (or "//") after leading whitespace.
+    static string Uncomment(string s) {
+        int i = 0;
+        while (i < s.Length) {
+            string ch = s.Substring(i, 1);
+            if (ch == " " || ch == "\t") { i = i + 1; }
+            else { break; }
+        }
+        string lead = s.Substring(0, i);
+        string rest = s.Substring(i, s.Length - i);
+        if (rest.Length >= 2 && rest.Substring(0, 2) == "//") {
+            rest = rest.Substring(2, rest.Length - 2);
+            if (rest.Length >= 1 && rest.Substring(0, 1) == " ") {
+                rest = rest.Substring(1, rest.Length - 1);
+            }
+        }
+        return lead + rest;
+    }
+
+    /// Returns and clears any pending host command requested from the context
+    /// menu (e.g. "find", "gotoline"); empty string when none.
+    string TakeCommand() {
+        string cmd = ctxCmd;
+        ctxCmd = "";
+        return cmd;
+    }
+
+    /// Localized label: English or Chinese per <see cref="lang"/>.
+    static string T(string en, string zh) {
+        if (CodeEditor.lang == 1) { return zh; }
+        return en;
+    }
+
+    /// Fills the parallel label / shortcut / action lists for the context menu.
+    /// Action 0 marks a separator row.
+    static void BuildCtxMenu(List<string> labels, List<string> keys, List<int> acts) {
+        labels.Add(CodeEditor.T("Cut", "剪切")); keys.Add("Ctrl+X"); acts.Add(1);
+        labels.Add(CodeEditor.T("Copy", "复制")); keys.Add("Ctrl+C"); acts.Add(2);
+        labels.Add(CodeEditor.T("Paste", "粘贴")); keys.Add("Ctrl+V"); acts.Add(3);
+        labels.Add(CodeEditor.T("Delete", "删除")); keys.Add("Del"); acts.Add(4);
+        labels.Add(""); keys.Add(""); acts.Add(0);
+        labels.Add(CodeEditor.T("Select All", "全选")); keys.Add("Ctrl+A"); acts.Add(5);
+        labels.Add(""); keys.Add(""); acts.Add(0);
+        labels.Add(CodeEditor.T("Toggle Comment", "切换注释")); keys.Add("Ctrl+/"); acts.Add(6);
+        labels.Add(CodeEditor.T("Duplicate Line", "复制当前行")); keys.Add("Ctrl+D"); acts.Add(7);
+        labels.Add(CodeEditor.T("Delete Line", "删除当前行")); keys.Add("Ctrl+L"); acts.Add(8);
+        labels.Add(""); keys.Add(""); acts.Add(0);
+        labels.Add(CodeEditor.T("Add Cursor Above", "在上方添加光标")); keys.Add("Ctrl+Alt+Up"); acts.Add(13);
+        labels.Add(CodeEditor.T("Add Cursor Below", "在下方添加光标")); keys.Add("Ctrl+Alt+Down"); acts.Add(14);
+        labels.Add(""); keys.Add(""); acts.Add(0);
+        labels.Add(""); keys.Add(""); acts.Add(0);
+        labels.Add(CodeEditor.T("Go to Definition", "转到定义")); keys.Add("F12"); acts.Add(11);
+        labels.Add(CodeEditor.T("Find All References", "查找所有引用")); keys.Add("Shift+F12"); acts.Add(12);
+        labels.Add(""); keys.Add(""); acts.Add(0);
+        labels.Add(CodeEditor.T("Find...", "查找...")); keys.Add("Ctrl+F"); acts.Add(9);
+        labels.Add(CodeEditor.T("Go to Line...", "跳转到行...")); keys.Add("Ctrl+G"); acts.Add(10);
+    }
+
+    /// Runs a context-menu action by id (see BuildCtxMenu).
+    void RunCtxAction(App app, int act) {
+        if (act == 1) { CutSelection(); CheckErrors(); }
+        else if (act == 2) { CopySelection(); }
+        else if (act == 3) { PasteClipboard(); CheckErrors(); UpdateCompletion(); }
+        else if (act == 4) { DeleteAtCaret(); CheckErrors(); }
+        else if (act == 5) { SelectAll(); }
+        else if (act == 6) { ToggleComment(); CheckErrors(); }
+        else if (act == 7) { DuplicateLine(); CheckErrors(); }
+        else if (act == 8) { DeleteLine(); CheckErrors(); }
+        else if (act == 9) { ctxCmd = "find"; }
+        else if (act == 10) { ctxCmd = "gotoline"; }
+        else if (act == 11) { ctxCmd = "gotodef"; }
+        else if (act == 12) { ctxCmd = "findrefs"; }
+        else if (act == 13) { AddCaretAbove(); }
+        else if (act == 14) { AddCaretBelow(); }
+        else if (act == 20) { ApplyQuickFix(); }
+        ctxOpen = false;
+        app.RequestRedraw();
+    }
+
+    bool CtxMenuOpen() { return ctxOpen; }
+
+    /// Draws the context menu as a top-level overlay (clamped to the whole
+    /// window, not the editor rect) and handles item clicks. Must be called at
+    /// the very end of the frame so nothing paints over it.
+    void RenderCtxMenu(App app) {
+        if (!ctxOpen) { return; }
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        EditorPalette pal = EditorPalette.For(t);
+        int fontSize = t.fontSizeMedium;
+        int lineH = Canvas.FontHeight(fontSize) + app.Scale(4);
+        if (lineH < 1) { lineH = 1; }
+
+        List<string> mLabels = new List<string>();
+        List<string> mKeys = new List<string>();
+        List<int> mActs = new List<int>();
+        CodeEditor.BuildCtxMenu(mLabels, mKeys, mActs);
+        // Quick-fix: offer to insert a missing `using` when the caret line uses
+        // a stdlib type whose namespace has not been imported.
+        string qfNs = QuickFixNs();
+        if (qfNs.Length > 0) {
+            mLabels.Insert(0, ""); mKeys.Insert(0, ""); mActs.Insert(0, 0);
+            mLabels.Insert(0, CodeEditor.T("Add using ", "添加 using ") + qfNs + ";"); mKeys.Insert(0, "Ctrl+."); mActs.Insert(0, 20);
+        }
+        int itemH = lineH;
+        int sepH = app.Scale(7);
+        int mW = app.Scale(150);
+        int wi = 0;
+        while (wi < mLabels.Count) {
+            if (mActs[wi] != 0) {
+                int lw = Canvas.MeasureText(mLabels[wi], fontSize)
+                         + Canvas.MeasureText(mKeys[wi], fontSize) + app.Scale(44);
+                if (lw > mW) { mW = lw; }
+            }
+            wi = wi + 1;
+        }
+        int mH = app.Scale(6);
+        int hi = 0;
+        while (hi < mActs.Count) {
+            if (mActs[hi] == 0) { mH = mH + sepH; } else { mH = mH + itemH; }
+            hi = hi + 1;
+        }
+
+        int winW = c.Width();
+        int winH = c.Height();
+        int topB = app.titlebarH;
+        int mX = ctxX;
+        int mY = ctxY;
+        if (mX + mW > winW) { mX = winW - mW - app.Scale(4); }
+        if (mY + mH > winH) { mY = winH - mH - app.Scale(4); }
+        if (mX < 0) { mX = 0; }
+        if (mY < topB) { mY = topB; }
+
+        c.FillRoundRect(mX + 2, mY + 2, mW, mH, app.Scale(4), pal.shadow);
+        c.SurfaceRoundRect(mX, mY, mW, mH, app.Scale(4), pal.popupBg, pal.border, 1);
+        app.BlockHitsRect(mX, mY, mW, mH);
+
+        int ry = mY + app.Scale(3);
+        int ri = 0;
+        while (ri < mActs.Count) {
+            if (mActs[ri] == 0) {
+                c.FillRect(mX + app.Scale(6), ry + sepH / 2, mW - app.Scale(12), 1, pal.border);
+                ry = ry + sepH;
+            } else {
+                bool hov = app.mouseX >= mX && app.mouseX < mX + mW
+                           && app.mouseY >= ry && app.mouseY < ry + itemH;
+                int tcol = pal.menuText;
+                if (hov) {
+                    c.FillRect(mX + app.Scale(2), ry, mW - app.Scale(4), itemH, pal.selBg);
+                    tcol = pal.textSel;
+                }
+                int ty = ry + (itemH - Canvas.FontHeight(fontSize)) / 2;
+                c.DrawText(mX + app.Scale(12), ty, mLabels[ri], tcol, fontSize);
+                int kw = Canvas.MeasureText(mKeys[ri], fontSize);
+                c.DrawText(mX + mW - kw - app.Scale(10), ty, mKeys[ri], pal.muted, fontSize);
+                ry = ry + itemH;
+            }
+            ri = ri + 1;
+        }
+
+        // Left-click selects an item or dismisses the menu.
+        if (app.EventKind() == 3 && app.window.EventButton() == 0) {
+            bool inside = app.mouseX >= mX && app.mouseX < mX + mW
+                          && app.mouseY >= mY && app.mouseY < mY + mH;
+            if (inside) {
+                int cy2 = mY + app.Scale(3);
+                int ci = 0;
+                int chosen = 0 - 1;
+                while (ci < mActs.Count) {
+                    int rh = itemH;
+                    if (mActs[ci] == 0) { rh = sepH; }
+                    if (mActs[ci] != 0 && app.mouseY >= cy2 && app.mouseY < cy2 + rh) {
+                        chosen = mActs[ci];
+                    }
+                    cy2 = cy2 + rh;
+                    ci = ci + 1;
+                }
+                if (chosen >= 0) { RunCtxAction(app, chosen); }
+            } else {
+                ctxOpen = false;
+                app.RequestRedraw();
+            }
+        }
+    }
+
+    // ---- error diagnostics ----
+    void CheckErrors() {
+        errors = new List<Diagnostic>();
+        int braceDepth = 0;
+        int parenDepth = 0;
+        int li = 0;
+        while (li < lines.Count) {
+            string ln = lines[li];
+            string tr = ln;
+            // Trim leading whitespace
+            int si = 0;
+            int trLen = tr.Length;
+            while (si < trLen) {
+                int sch = tr[si];
+                if (sch == 32 || sch == 9) { si = si + 1; }
+                else { break; }
+            }
+            if (si > 0) { tr = tr.Substring(si, tr.Length - si); }
+            // Skip empty/comment lines
+            if (tr.Length > 0 && tr.Substring(0, 1) != "/" && tr.Substring(0, 1) != "*") {
+                // Check brace/paren balance per line
+                // Byte comparisons, not Substring(ci, 1): this loop walks
+                // every character of the document, and allocating a
+                // one-character string per byte dominated the pass on a large
+                // file.
+                int ci = 0;
+                int lnLen = ln.Length;
+                while (ci < lnLen) {
+                    int ch = ln[ci];
+                    if (ch == 123) { braceDepth = braceDepth + 1; }
+                    else if (ch == 125) { braceDepth = braceDepth - 1; }
+                    else if (ch == 40) { parenDepth = parenDepth + 1; }
+                    else if (ch == 41) { parenDepth = parenDepth - 1; }
+                    ci = ci + 1;
+                }
+                if (braceDepth < 0) {
+                    errors.Add(new Diagnostic(li, "Unexpected '}'"));
+                    braceDepth = 0;
+                }
+                if (parenDepth < 0) {
+                    errors.Add(new Diagnostic(li, "Unexpected ')'"));
+                    parenDepth = 0;
+                }
+                // The only surviving heuristic here: a `using` directive that
+                // does not end in ';'. The generic "missing semicolon" guess
+                // produced too many false positives (multi-line calls,
+                // attributes, generics) and was already disabled; real
+                // diagnostics come from the compiler after Run/Build. Its
+                // keyword tests and forward line scan ran for every line of a
+                // pass that reruns whenever the caret changes line, so they go
+                // with it.
+                if (tr.Length >= 1 && li != curLine
+                    && CodeEditor.StartsWithP(tr, "using ")
+                    && tr.Substring(tr.Length - 1, 1) != ";") {
+                    errors.Add(new Diagnostic(li, "Missing ';' after using"));
+                }
+            }
+            li = li + 1;
+        }
+        if (braceDepth > 0) {
+            errors.Add(new Diagnostic(lines.Count - 1, "Missing closing '}'"));
+        }
+        if (parenDepth > 0) {
+            errors.Add(new Diagnostic(lines.Count - 1, "Missing closing ')'"));
+        }
+        // Flag stdlib types used without the required `using` import.
+        AnalyzeMissingUsings();
+    }
+}

@@ -1,0 +1,590 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+namespace Gui.Component.DataTable;
+
+/// DataTable part: column model — field-name addressing, visibility &
+/// auto-fit, footer aggregation, pinning/freeze and multi-level header bands.
+partial class DataTable {
+    // ---------- field-name addressing ----------
+    // Every operation below takes a column *index*, which couples callers to
+    // the order the columns happen to be declared in: insert one at the front
+    // and every literal index shifts. Naming a column with DataColumn.Field
+    // breaks that coupling — the name is also what a saved layout stores, so a
+    // layout survives its table being rearranged.
+
+    /// Index of the column named `field`, or -1 when no column carries that
+    /// name. Unnamed columns (field == "") never match, so an empty argument
+    /// can't accidentally select the first one.
+    static int Col(List<DataColumn> cols, string field) {
+        if (field.Length == 0) { return -1; }
+        int i = 0;
+        while (i < cols.Count) {
+            if (cols[i].field == field) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    /// True when `field` names a column in `cols`.
+    static bool HasCol(List<DataColumn> cols, string field) {
+        return DataTable.Col(cols, field) >= 0;
+    }
+
+    /// A cell addressed by field name, or "" when the field is unknown — so a
+    /// styler or event handler reads `Cell(src, cols, row, "state")` instead of
+    /// a bare `src.CellText(row, 4)`.
+    static string Cell(DataSource src, List<DataColumn> cols, int row, string field) {
+        int c = DataTable.Col(cols, field);
+        if (c < 0) { return ""; }
+        return src.CellText(row, c);
+    }
+
+    /// Numeric value of a cell addressed by field name, or 0.0 when unknown.
+    static double CellValue(DataSource src, List<DataColumn> cols, int row, string field) {
+        int c = DataTable.Col(cols, field);
+        if (c < 0) { return 0.0; }
+        return src.CellReal(row, c);
+    }
+
+    /// Write a cell addressed by field name. An unknown field is a no-op rather
+    /// than a write to some other column.
+    static void SetCellField(DataSource src, List<DataColumn> cols, int row, string field, string v) {
+        int c = DataTable.Col(cols, field);
+        if (c < 0) { return; }
+        src.SetCell(row, c, v);
+    }
+
+    /// Sort by a named column (dir: 1 asc, 2 desc). Unknown field: no-op.
+    static void SortByField(DataTableState st, List<DataColumn> cols, string field, int dir) {
+        int c = DataTable.Col(cols, field);
+        if (c >= 0) { DataTable.SortBy(st, c, dir); }
+    }
+
+    /// Append a secondary sort key on a named column. Unknown field: no-op.
+    static void AddSortField(DataTableState st, List<DataColumn> cols, string field, int dir) {
+        int c = DataTable.Col(cols, field);
+        if (c >= 0) { DataTable.AddSort(st, c, dir); }
+    }
+
+    /// Group by a named column. Unknown field: no-op.
+    static void GroupByField(DataTableState st, List<DataColumn> cols, string field) {
+        int c = DataTable.Col(cols, field);
+        if (c >= 0) { DataTable.GroupBy(st, c); }
+    }
+
+    /// Footer aggregate for a named column (see SetAggregate). Unknown: no-op.
+    static void SetAggregateField(DataTableState st, List<DataColumn> cols, string field, int mode) {
+        int c = DataTable.Col(cols, field);
+        if (c >= 0) { DataTable.SetAggregate(st, c, mode); }
+    }
+
+    /// Freeze / unfreeze a named column. Unknown field: no-op.
+    static void PinField(DataTableState st, List<DataColumn> cols, string field, bool on) {
+        int c = DataTable.Col(cols, field);
+        if (c < 0) { return; }
+        if (on) { DataTable.PinColumn(st, c); } else { DataTable.UnpinColumn(st, c); }
+    }
+
+    /// Show / hide a named column. Unknown field: no-op.
+    static void HideField(DataTableState st, List<DataColumn> cols, string field, bool hidden) {
+        int c = DataTable.Col(cols, field);
+        if (c < 0 || c >= st.colHidden.Count) { return; }
+        st.colHidden[c] = hidden;
+        st.dirty = true;
+    }
+
+    /// The field name of the column last interacted with (`st.hitCol`), or ""
+    /// when nothing was hit or that column is unnamed. Lets a CellClick handler
+    /// branch on a name instead of comparing HitCol() against a literal.
+    static string HitField(DataTableState st, List<DataColumn> cols) {
+        int c = st.hitCol;
+        if (c < 0 || c >= cols.Count) { return ""; }
+        return cols[c].field;
+    }
+
+    /// The field name of the column being edited (`st.editCol`), or "".
+    static string EditField(DataTableState st, List<DataColumn> cols) {
+        int c = st.editCol;
+        if (c < 0 || c >= cols.Count) { return ""; }
+        return cols[c].field;
+    }
+
+    // ---------- column visibility / auto-fit helpers ----------
+
+    static int HiddenCount(DataTableState st) {
+        int n = 0;
+        int i = 0;
+        while (i < st.colHidden.Count) {
+            if (st.colHidden[i]) { n = n + 1; }
+            i = i + 1;
+        }
+        return n;
+    }
+
+    static void ShowAllColumns(DataTableState st) {
+        int i = 0;
+        while (i < st.colHidden.Count) { st.colHidden[i] = false; i = i + 1; }
+    }
+
+    // ---------- footer aggregation ----------
+    // Set a column's total-row aggregate (0 none,1 sum,2 avg,3 min,4 max,5 count)
+    // and auto-toggle the footer to match whether any column still aggregates.
+    static void SetAggregate(DataTableState st, int col, int mode) {
+        while (st.aggMode.Count <= col) { st.aggMode.Add(0); }
+        if (col < 0 || col >= st.aggMode.Count) { return; }
+        st.aggMode[col] = mode;
+        bool any = false;
+        int i = 0;
+        while (i < st.aggMode.Count) { if (st.aggMode[i] > 0) { any = true; } i = i + 1; }
+        st.showSummary = any;
+        st.dirty = true;
+    }
+
+    // ---------- column pinning / freeze ----------
+    // Freeze codes: 0 scrolls, 1 pinned to the left edge, 2 pinned to the right.
+    // A frozen column leaves the scrolling band entirely — it is not merely
+    // hoisted in the order, it is drawn in its own pass at a fixed x.
+
+    static void FreezeColumn(DataTableState st, int col, int side) {
+        if (col < 0 || col >= st.colFreeze.Count) { return; }
+        if (side < 0 || side > 2) { side = 0; }
+        st.colFreeze[col] = side;
+        st.dirty = true;
+    }
+
+    static void PinColumn(DataTableState st, int col) {
+        DataTable.FreezeColumn(st, col, 1);
+    }
+
+    static void PinColumnRight(DataTableState st, int col) {
+        DataTable.FreezeColumn(st, col, 2);
+    }
+
+    static void UnpinColumn(DataTableState st, int col) {
+        DataTable.FreezeColumn(st, col, 0);
+    }
+
+    /// Cycle a column through none → left → right → none, which is what a
+    /// single menu entry or a repeated shortcut needs.
+    static void TogglePin(DataTableState st, int col) {
+        if (col < 0 || col >= st.colFreeze.Count) { return; }
+        DataTable.FreezeColumn(st, col, (st.colFreeze[col] + 1) % 3);
+    }
+
+    static int FreezeOf(DataTableState st, int col) {
+        if (col < 0 || col >= st.colFreeze.Count) { return 0; }
+        return st.colFreeze[col];
+    }
+
+    static bool IsPinned(DataTableState st, int col) {
+        return DataTable.FreezeOf(st, col) == 1;
+    }
+
+    static bool IsPinnedRight(DataTableState st, int col) {
+        return DataTable.FreezeOf(st, col) == 2;
+    }
+
+    /// Freeze a named column to a side (0 none, 1 left, 2 right). Unknown
+    /// field: no-op, like every other field-addressed operation.
+    static void FreezeField(DataTableState st, List<DataColumn> cols, string field, int side) {
+        int c = DataTable.Col(cols, field);
+        if (c >= 0) { DataTable.FreezeColumn(st, c, side); }
+    }
+
+    // ---------- header bands (multi-level header) ----------
+    // A column's `band` is a slash-separated path of the groups above it, so the
+    // header structure is carried by the columns and cannot drift out of sync
+    // with them. Everything below derives the spanning cells from the *visible
+    // order*, which means freezing, reordering and hiding all fall out for free:
+    // a group spans whatever adjacent slots happen to share its path, and a
+    // group split across two bands simply becomes two spans.
+
+    /// The band path of a column, or "" when it belongs to no group.
+    static string BandOf(List<DataColumn> cols, int col) {
+        if (col < 0 || col >= cols.Count) { return ""; }
+        return cols[col].band;
+    }
+
+    /// The first `depth` segments of a band path, e.g. Prefix("a/b/c", 2) is
+    /// "a/b". Fewer segments than `depth` yields the whole path.
+    static string BandPrefix(string path, int depth) {
+        if (path == "" || depth <= 0) { return ""; }
+        List<string> parts = path.Split("/");
+        string outp = "";
+        int i = 0;
+        while (i < parts.Count && i < depth) {
+            if (i > 0) { outp = outp + "/"; }
+            outp = outp + parts[i];
+            i = i + 1;
+        }
+        return outp;
+    }
+
+    /// How many groups sit above a column.
+    static int BandDepth(string path) {
+        if (path == "") { return 0; }
+        return path.Split("/").Count;
+    }
+
+    /// Deepest band nesting among the visible columns — the number of extra
+    /// header rows to draw above the column titles. 0 means a plain header.
+    static int BandLevels(List<DataColumn> cols, List<int> vorder) {
+        int m = 0;
+        int i = 0;
+        while (i < vorder.Count) {
+            int d = DataTable.BandDepth(DataTable.BandOf(cols, vorder[i]));
+            if (d > m) { m = d; }
+            i = i + 1;
+        }
+        return m;
+    }
+
+    /// The spanning header cells for one level, left to right. A run of adjacent
+    /// slots sharing a prefix becomes one span; slots with no group at this
+    /// depth produce no span at all, leaving the column title to reach up into
+    /// the empty rows above it.
+    static List<BandSpan> BandRow(DataTableState st, List<DataColumn> cols,
+                                  List<int> vorder, int level) {
+        List<BandSpan> spans = new List<BandSpan>();
+        int i = 0;
+        while (i < vorder.Count) {
+            string p = DataTable.BandPrefix(DataTable.BandOf(cols, vorder[i]), level + 1);
+            if (DataTable.BandDepth(p) <= level) {
+                // No group at this depth: the title cell below owns the space.
+                i = i + 1;
+            } else {
+                int j = i + 1;
+                while (j < vorder.Count
+                       && DataTable.BandPrefix(DataTable.BandOf(cols, vorder[j]), level + 1) == p) {
+                    j = j + 1;
+                }
+                List<string> segs = p.Split("/");
+                spans.Add(new BandSpan(segs[segs.Count - 1], p, level, i, j));
+                i = j;
+            }
+        }
+        return spans;
+    }
+
+    /// All spanning cells, outermost level first.
+    static List<BandSpan> BandSpans(DataTableState st, List<DataColumn> cols,
+                                    List<int> vorder) {
+        List<BandSpan> all = new List<BandSpan>();
+        int levels = DataTable.BandLevels(cols, vorder);
+        int lv = 0;
+        while (lv < levels) {
+            List<BandSpan> row = DataTable.BandRow(st, cols, vorder, lv);
+            int i = 0;
+            while (i < row.Count) { all.Add(row[i]); i = i + 1; }
+            lv = lv + 1;
+        }
+        return all;
+    }
+
+    static bool BandIsCollapsed(DataTableState st, string path) {
+        if (path == "") { return false; }
+        return st.bandCollapsed.IndexOf(path) >= 0;
+    }
+
+    /// Fold a band down to its first column, or unfold it. Collapsing hides the
+    /// group's other columns rather than deleting anything, so their widths,
+    /// filters and sort keys survive the round trip.
+    static void SetBandCollapsed(DataTableState st, List<DataColumn> cols,
+                                 string path, bool collapsed) {
+        if (path == "") { return; }
+        int at = st.bandCollapsed.IndexOf(path);
+        if (collapsed && at < 0) { st.bandCollapsed.Add(path); }
+        if (!collapsed && at >= 0) { st.bandCollapsed.RemoveAt(at); }
+        DataTable.ApplyBandCollapse(st, cols);
+        st.dirty = true;
+    }
+
+    static void ToggleBand(DataTableState st, List<DataColumn> cols, string path) {
+        DataTable.SetBandCollapsed(st, cols, path, !DataTable.BandIsCollapsed(st, path));
+    }
+
+    /// Re-derive `colHidden` from the collapsed set: within a collapsed band
+    /// every column but the first is hidden.
+    ///
+    /// `bandAutoHidden` records exactly which columns *this* mechanism hid, so
+    /// unfolding restores those and only those. Without it a column the user hid
+    /// by hand would be silently brought back the next time an unrelated band
+    /// was collapsed — hiding is the user's decision and collapsing must not
+    /// quietly overwrite it.
+    static void ApplyBandCollapse(DataTableState st, List<DataColumn> cols) {
+        List<int> nowHidden = new List<int>();
+        int i = 0;
+        while (i < cols.Count && i < st.colHidden.Count) {
+            string p = cols[i].band;
+            if (p != "") {
+                // Outermost collapsed ancestor wins: folding an outer group
+                // folds everything under it whatever the inner state says.
+                string keep = "";
+                int d = 1;
+                while (d <= DataTable.BandDepth(p) && keep == "") {
+                    string pref = DataTable.BandPrefix(p, d);
+                    if (DataTable.BandIsCollapsed(st, pref)) { keep = pref; }
+                    d = d + 1;
+                }
+                if (keep != "") {
+                    // The band's first column stays behind as the visible stub.
+                    int first = -1;
+                    int k = 0;
+                    while (k < cols.Count && first < 0) {
+                        if (DataTable.BandPrefix(cols[k].band, DataTable.BandDepth(keep)) == keep) {
+                            first = k;
+                        }
+                        k = k + 1;
+                    }
+                    if (i != first) {
+                        st.colHidden[i] = true;
+                        nowHidden.Add(i);
+                    } else if (st.bandAutoHidden.IndexOf(i) >= 0) {
+                        st.colHidden[i] = false;
+                    }
+                } else if (st.bandAutoHidden.IndexOf(i) >= 0) {
+                    st.colHidden[i] = false;
+                }
+            }
+            i = i + 1;
+        }
+        st.bandAutoHidden = nowHidden;
+    }
+
+    // Column indices in on-screen order: left-frozen first, then active group
+    // columns, then the scrolling columns, and finally the right-frozen ones.
+    // Hidden columns are excluded. Every layout pass (header / filter row /
+    // cells / hit-test / summary) iterates this one list, so they stay aligned
+    // by construction rather than by four copies of the same arithmetic.
+
+    static List<int> VisibleOrder(DataTableState st, List<DataColumn> cols) {
+        // Master sequence is the user column order (drag-reorderable); pinned and
+        // grouped columns are still hoisted to the front, preserving their
+        // relative position within that order.
+        List<int> seq = new List<int>();
+        int s = 0;
+        while (s < st.colOrder.Count) {
+            int ci = st.colOrder[s];
+            if (ci >= 0 && ci < cols.Count && seq.IndexOf(ci) < 0) { seq.Add(ci); }
+            s = s + 1;
+        }
+        int a = 0;
+        while (a < cols.Count) {
+            if (seq.IndexOf(a) < 0) { seq.Add(a); }
+            a = a + 1;
+        }
+
+        List<int> ord = new List<int>();
+        // 1) frozen-left columns first, in user order.
+        int p = 0;
+        while (p < seq.Count) {
+            int pc = seq[p];
+            if (!st.colHidden[pc] && DataTable.IsPinned(st, pc) && ord.IndexOf(pc) < 0) { ord.Add(pc); }
+            p = p + 1;
+        }
+        // 2) active group columns hoisted next — but never a right-frozen one:
+        // grouping by a column parked at the right edge would drag it back to
+        // the left, which is the opposite of what freezing it asked for.
+        int g = 0;
+        while (g < st.groupCols.Count) {
+            int gc = st.groupCols[g];
+            if (gc >= 0 && gc < cols.Count && !st.colHidden[gc]
+                && !DataTable.IsPinnedRight(st, gc) && ord.IndexOf(gc) < 0) {
+                ord.Add(gc);
+            }
+            g = g + 1;
+        }
+        // 3) the scrolling columns in user order.
+        int i = 0;
+        while (i < seq.Count) {
+            int rc = seq[i];
+            if (!st.colHidden[rc] && !DataTable.IsPinnedRight(st, rc) && ord.IndexOf(rc) < 0) {
+                ord.Add(rc);
+            }
+            i = i + 1;
+        }
+        // 4) frozen-right columns last, so the order still reads left-to-right.
+        int q = 0;
+        while (q < seq.Count) {
+            int qc = seq[q];
+            if (!st.colHidden[qc] && DataTable.IsPinnedRight(st, qc) && ord.IndexOf(qc) < 0) {
+                ord.Add(qc);
+            }
+            q = q + 1;
+        }
+        return ord;
+    }
+
+    /// How many entries at the front of `vorder` are frozen to the left edge.
+    /// The render passes slice the order into [left | scrolling | right] with
+    /// this and RightFrozenCount, so a column can never be drawn in two bands.
+    static int LeftFrozenCount(DataTableState st, List<int> vorder) {
+        int n = 0;
+        while (n < vorder.Count && DataTable.IsPinned(st, vorder[n])) { n = n + 1; }
+        return n;
+    }
+
+    /// How many entries at the end of `vorder` are frozen to the right edge.
+    static int RightFrozenCount(DataTableState st, List<int> vorder) {
+        int n = 0;
+        while (n < vorder.Count && DataTable.IsPinnedRight(st, vorder[vorder.Count - 1 - n])) {
+            n = n + 1;
+        }
+        return n;
+    }
+
+    // Reorder a column in the user column order: move `from` so it sits just
+    // before `beforeCol` (or to the end when beforeCol < 0). No-op when the
+    // move would not change anything.
+    static void MoveColumn(DataTableState st, int from, int beforeCol) {
+        int fi = st.colOrder.IndexOf(from);
+        if (fi < 0) { return; }
+        if (from == beforeCol) { return; }
+        st.colOrder.RemoveAt(fi);
+        if (beforeCol < 0) {
+            st.colOrder.Add(from);
+        } else {
+            int bi = st.colOrder.IndexOf(beforeCol);
+            if (bi < 0) { st.colOrder.Add(from); }
+            else { st.colOrder.Insert(bi, from); }
+        }
+        st.dirty = true;
+    }
+
+    // Combined width of the frozen-left columns at their natural size.
+    static int PinnedWidth(DataTableState st) {
+        int w = 0;
+        int i = 0;
+        while (i < st.colWidths.Count) {
+            if (!st.colHidden[i] && DataTable.IsPinned(st, i)) { w = w + st.colWidths[i]; }
+            i = i + 1;
+        }
+        return w;
+    }
+
+    // Combined width of the frozen-right columns.
+    static int PinnedRightWidth(DataTableState st) {
+        int w = 0;
+        int i = 0;
+        while (i < st.colWidths.Count) {
+            if (!st.colHidden[i] && DataTable.IsPinnedRight(st, i)) { w = w + st.colWidths[i]; }
+            i = i + 1;
+        }
+        return w;
+    }
+
+    /// Screen x of a column relative to the table's data origin, given the
+    /// scroll offset — the single place that knows a frozen column ignores
+    /// `scrollX` and a right-frozen one is measured back from the right edge.
+    ///
+    /// `dataViewW` is the width of the whole data region (gutters excluded).
+    /// Returns the offset from the data origin; the caller adds firstDataX.
+    static int ColumnOffset(DataTableState st, List<int> vorder, int col,
+                            int dataViewW, int scrollX) {
+        int nL = DataTable.LeftFrozenCount(st, vorder);
+        int nR = DataTable.RightFrozenCount(st, vorder);
+        int pos = vorder.IndexOf(col);
+        if (pos < 0) { return -1; }
+        int off = 0;
+        int i = 0;
+        if (pos < nL) {
+            while (i < pos) { off = off + st.dispW[vorder[i]]; i = i + 1; }
+            return off;
+        }
+        if (pos >= vorder.Count - nR) {
+            // Measured back from the right edge, so the band stays glued there
+            // however wide the table is.
+            int rw = 0;
+            i = vorder.Count - nR;
+            while (i < vorder.Count) { rw = rw + st.dispW[vorder[i]]; i = i + 1; }
+            off = dataViewW - rw;
+            i = vorder.Count - nR;
+            while (i < pos) { off = off + st.dispW[vorder[i]]; i = i + 1; }
+            return off;
+        }
+        // Scrolling band: starts after the left band and pans with scrollX.
+        i = 0;
+        while (i < nL) { off = off + st.dispW[vorder[i]]; i = i + 1; }
+        int mid = 0;
+        i = nL;
+        while (i < pos) { mid = mid + st.dispW[vorder[i]]; i = i + 1; }
+        return off + mid - scrollX;
+    }
+
+    // Widest rendered cell (title + data) for a column, used by auto-fit. Scans
+    // the filtered view so the width matches what's actually on screen.
+    static int MeasureColWidth(App app, List<DataColumn> cols, DataSource src,
+                               DataTableState st, int col) {
+        int fs = app.theme.fontSizeMedium;
+        int w = Canvas.MeasureText(cols[col].title, fs);
+        int i = 0;
+        while (i < st.order.Count) {
+            int cw = Canvas.MeasureText(DataTable.FormatCell(cols[col], src.CellText(st.order[i], col)), fs);
+            if (cw > w) { w = cw; }
+            i = i + 1;
+        }
+        // padding on both sides + room for the sort arrow / header menu icon.
+        int fit = w + app.theme.paddingSmall * 2 + app.Scale(26);
+        if (fit < app.Scale(48)) { fit = app.Scale(48); }
+        return fit;
+    }
+
+    static void AutoFitColumn(App app, List<DataColumn> cols, DataSource src,
+                              DataTableState st, int col) {
+        if (col < 0 || col >= st.colWidths.Count) { return; }
+        st.colWidths[col] = DataTable.MeasureColWidth(app, cols, src, st, col);
+    }
+
+    static void AutoFitAll(App app, List<DataColumn> cols, DataSource src,
+                           DataTableState st) {
+        int i = 0;
+        while (i < cols.Count && i < st.colWidths.Count) {
+            if (!st.colHidden[i]) {
+                st.colWidths[i] = DataTable.MeasureColWidth(app, cols, src, st, i);
+            }
+            i = i + 1;
+        }
+    }
+
+    // Whether a row passes the filter-row quick-filter (case-insensitive Contains
+    // per column). Columns whose filterRowText is empty are always passed.
+    static bool RowPassesFilterRow(DataTableState st, DataSource src, int row) {
+        int c = 0;
+        while (c < st.filterRowText.Count) {
+            string q = st.filterRowText[c];
+            if (q.Length > 0) {
+                if (!DataTable.ContainsCI(src.CellText(row, c), q)) { return false; }
+            }
+            c = c + 1;
+        }
+        return true;
+    }
+
+    static bool RowPasses(DataTableState st, List<DataColumn> cols, DataSource src, int row) {
+        int today = DataTable.Today();
+        int i = 0;
+        while (i < cols.Count) {
+            ColFilter f = st.filters[i];
+            if (f.Active()) {
+                if (!DataTable.CellPassesCol(f, cols[i], src.CellText(row, i), today)) { return false; }
+            }
+            i = i + 1;
+        }
+        return true;
+    }
+
+    // Filter predicate over only the columns known to have an active filter.
+    static bool RowPassesActive(DataTableState st, List<DataColumn> cols, DataSource src,
+                                List<int> af, int row, int today) {
+        int a = 0;
+        while (a < af.Count) {
+            int c = af[a];
+            if (!DataTable.CellPassesCol(st.filters[c], cols[c], src.CellText(row, c), today)) { return false; }
+            a = a + 1;
+        }
+        return true;
+    }
+
+}

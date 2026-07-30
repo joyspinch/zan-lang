@@ -1,0 +1,1255 @@
+using System;
+using Gui.Widget;
+using Gui;
+
+namespace Gui.Designer;
+
+/// A FormCreate / form-builder style visual designer, self-contained and reusable.
+///
+/// Instead of free-form pixel dragging it edits an ordered list of form FIELDS
+/// (FormField controls held as children of a `form` root panel) and renders them
+/// as a vertical, labelled form — the layout everyone builds by hand in VB /
+/// WinForms / element-plus form designers, but without touching coordinates.
+///
+/// Surface:
+///   * a categorised field palette on the left (click a type to append a row),
+///   * the vertical form preview in the centre (label + required star + a preview
+///     of each field control; click a row to select it),
+///   * a right-hand inspector with a Field / Form tab pair: Field edits the
+///     selected row (label, model name, placeholder, required, options, change
+///     handler); Form edits form-level config (name, label position, size, label
+///     width, required-star visibility, submit/reset buttons, submit handler),
+///   * a status bar.
+///
+/// Everything round-trips through Serialize: the form config is a header line and
+/// the fields are the serialized Control subtree, so relationships, order,
+/// properties and event bindings all persist.
+///
+/// Usage:
+///   Designer d = Designer.Create();   // once
+///   d.Seed(app);                      // optional sample fields
+///   d.Render(app, x, y, w, h);        // each frame
+
+/// One saved user component: its display name and its design JSON. One entity
+/// instead of parallel name/json lists.
+class UserComponent {
+    string name;
+    string json;
+
+    UserComponent(string name, string json) {
+        this.name = name;
+        this.json = json;
+    }
+}
+
+partial class Designer {
+    // 0 = English, 1 = 简体中文. Set by the host (e.g. the IDE) so the designer
+    // chrome follows the host UI language; read via T(en, zh).
+    static int lang;
+
+    List<FormField> fields;
+    FormField sel;
+    FormField selPrev;
+    string doc;
+    string msg;
+    int inspTab;      // 0 = field, 1 = form
+    bool preview;
+    int seq;          // running counter for generated field names
+
+    // Container into which the palette adds new components: the selected
+    // container, or the parent container of the selected child, or null for
+    // the top-level form. Lets you click a Card / Tabs then drop components in.
+    FormField activeContainer;
+    bool rowClicked;  // set while a row consumes a mousedown, so background
+                      // clicks can deselect
+    int paletteScroll; // vertical scroll offset for the component palette
+    int palClipTop;    // visible top/bottom of the palette body (for culling)
+    int palClipBot;
+    int formScroll;    // vertical scroll offset for the form preview
+    int formClipTop;   // visible top/bottom of the form body (for culling)
+    int formClipBot;
+
+    // Form-level configuration.
+    int labelPos;     // 0 left, 1 right, 2 top
+    int formSize;     // 0 large, 1 default, 2 small
+    int labelWidth;   // logical px reserved for the label column
+    bool hideStar;    // hide the required-field red star
+    bool showSubmit;
+    bool showReset;
+
+    // Drag state (palette -> form to add; within form to reorder).
+    bool dragging;
+    bool dragFromPalette;
+    bool dragMoved;
+    int dragKind;     // field type being dragged out of the palette
+    string dragCustomKind; // custom component tag when dragKind == 100
+    int dragIndex;    // source row index when reordering
+    int dropIndex;    // computed insertion index
+    int dropY;        // y of the insertion indicator
+    int dragMouseX;
+    int dragMouseY;
+    // Container currently under the drag pointer (recomputed every frame while
+    // dragging); the drop nests into it instead of the top-level form.
+    FormField dropContainer;
+    int dragUserComp; // index of the user component being dragged, else -1
+
+    // Palette hover (for the tooltip drawn on top after the panels).
+    int hoverFt;
+    int hoverX;
+    int hoverY;
+
+    // Inline editors (persist across frames; reseeded when the selection changes).
+    SignalString labelSig;
+    Input labelInput;
+    SignalString nameSig;
+    Input nameInput;
+    SignalString phSig;
+    Input phInput;
+    SignalString bindSig;
+    Input bindInput;
+    SignalString bindPropSig;
+    Input bindPropInput;
+    SignalString customSig;
+    Input customInput;
+    SignalString optSig;
+    Input optInput;
+    SignalString optFieldSig;   // data field key for table columns
+    Input optFieldInput;
+    SignalString evtSig;
+    Input evtInput;
+    string evtEditing;   // which event of the selected field the handler box edits
+    SignalString formNameSig;
+    Input formNameInput;
+    SignalString submitSig;
+    Input submitInput;
+
+    // Root window (the outermost component being designed): its own properties
+    // and event handlers. Edited by the inspector whenever no child is selected.
+    SignalString winTitleSig;
+    Input winTitleInput;
+    int winW;
+    int winH;
+    bool winResizable;
+    bool winTool;
+    bool winCenter;
+    bool winGlass;
+    int winPosX;   // manual window X (used when winCenter is false)
+    int winPosY;   // manual window Y (used when winCenter is false)
+    List<EventBinding> winEvents;  // window event -> handler bindings
+    string winEvtEditing;          // which window event the handler box edits
+
+    // Component palette filter (search box) + inspector scroll state.
+    SignalString filterSig;
+    Input filterInput;
+    int inspScroll;
+    int inspContentH;
+
+    // Bindable variables scanned from the paired code-behind file (host IDE
+    // supplies them via SetBindVars). The inspector's bind-path row offers
+    // them in a small picker so a component can be two-way bound to a code
+    // variable without typing its name.
+    List<string> bindVars;
+    bool bindPickOpen;
+
+    // Editable JSON drawer: the single source-of-truth text box for the design
+    // (replaces the old opaque Save/Load/Export buttons). Editing it and
+    // pressing Apply rebuilds the design; opening it dumps the current design.
+    SignalString jsonSig;
+    TextArea jsonArea;
+    bool jsonOpen;
+    bool evtRootPrev;              // last event-tab target was the window root
+    FormField evtSelPrev;         // last event-tab component target
+
+    // Project user components: designs saved as reusable components (the host
+    // IDE persists them as components/*.zcomp and feeds them back in). The
+    // save request is raised by the inspector and consumed by the host.
+    List<UserComponent> userComps;
+    bool saveCompRequested;
+
+    /// Picks the string for the current UI language.
+    static string T(string en, string zh) {
+        if (Designer.lang == 1) { return zh; }
+        return en;
+    }
+
+    static Designer Create() {
+        Designer d = new Designer();
+        d.fields = new List<FormField>();
+        d.sel = null;
+        d.selPrev = null;
+        d.doc = "";
+        d.msg = Designer.T("click a field type on the left to add a row", "点击左侧组件类型以添加一行");
+        d.inspTab = 0;
+        d.preview = false;
+        d.seq = 0;
+        d.activeContainer = null;
+        d.rowClicked = false;
+        d.paletteScroll = 0;
+        d.formScroll = 0;
+        d.labelPos = 0;
+        d.formSize = 1;
+        d.labelWidth = 92;
+        d.hideStar = false;
+        d.showSubmit = false;
+        d.showReset = false;
+        d.dragging = false;
+        d.dragFromPalette = false;
+        d.dragCustomKind = "";
+        d.dragMoved = false;
+        d.dragKind = 0;
+        d.dragIndex = -1;
+        d.dropIndex = -1;
+        d.dropY = 0;
+        d.dragMouseX = 0;
+        d.dragMouseY = 0;
+        d.dropContainer = null;
+        d.dragUserComp = -1;
+        d.hoverFt = -1;
+        d.hoverX = 0;
+        d.hoverY = 0;
+        d.labelSig = SignalString.Create("");
+        d.labelInput = Input.Bind(d.labelSig, Designer.T("label", "标签"));
+        d.nameSig = SignalString.Create("");
+        d.nameInput = Input.Bind(d.nameSig, Designer.T("field name", "字段名"));
+        d.phSig = SignalString.Create("");
+        d.phInput = Input.Bind(d.phSig, Designer.T("placeholder", "占位文本"));
+        d.bindSig = SignalString.Create("");
+        d.bindInput = Input.Bind(d.bindSig, "model.path");
+        d.bindPropSig = SignalString.Create("");
+        d.bindPropInput = Input.Bind(d.bindPropSig, "value");
+        d.customSig = SignalString.Create("");
+        d.customInput = Input.Bind(d.customSig, Designer.T("component kind", "组件类型"));
+        d.optSig = SignalString.Create("");
+        d.optInput = Input.Bind(d.optSig, Designer.T("new option", "新选项"));
+        d.optFieldSig = SignalString.Create("");
+        d.optFieldInput = Input.Bind(d.optFieldSig, Designer.T("field", "字段"));
+        d.evtSig = SignalString.Create("");
+        d.evtInput = Input.Bind(d.evtSig, Designer.T("handler", "处理器"));
+        d.evtEditing = "";
+        d.formNameSig = SignalString.Create(Designer.T("My form", "我的表单"));
+        d.formNameInput = Input.Bind(d.formNameSig, Designer.T("form name", "表单名称"));
+        d.submitSig = SignalString.Create("");
+        d.submitInput = Input.Bind(d.submitSig, Designer.T("handler", "处理器"));
+        d.winTitleSig = SignalString.Create(Designer.T("Tool Window", "工具窗口"));
+        d.winTitleInput = Input.Bind(d.winTitleSig, Designer.T("window title", "窗口标题"));
+        d.winW = 480;
+        d.winH = 360;
+        d.winResizable = true;
+        d.winTool = true;
+        d.winCenter = true;
+        d.winGlass = false;
+        d.winPosX = 0;
+        d.winPosY = 0;
+        d.winEvents = new List<EventBinding>();
+        d.winEvtEditing = "";
+        d.filterSig = SignalString.Create("");
+        d.filterInput = Input.Bind(d.filterSig, Designer.T("filter…", "筛选…"));
+        d.inspScroll = 0;
+        d.inspContentH = 0;
+        d.bindVars = new List<string>();
+        d.bindPickOpen = false;
+        d.evtRootPrev = false;
+        d.evtSelPrev = null;
+        d.jsonSig = SignalString.Create("");
+        d.jsonArea = TextArea.Bind(d.jsonSig, Designer.T("paste or edit the design JSON, then Apply", "粘贴或编辑设计 JSON，然后点击应用"));
+        d.jsonOpen = false;
+        d.userComps = new List<UserComponent>();
+        d.saveCompRequested = false;
+        return d;
+    }
+
+    void ScrollPaletteToEnd() {
+        paletteScroll = 1000000000;
+    }
+
+    /// Optional sample content so a fresh designer isn't an empty form —
+    /// including a Card and a Tabs container with nested components so the
+    /// composition / tab-switching behaviour is visible out of the box.
+    void Seed(App app) {
+        activeContainer = null;
+        // A 24-column grid: two halves, then thirds, showing 等分 layout.
+        AddField(0); fields[fields.Count - 1].span = 12;
+        AddField(2); fields[fields.Count - 1].span = 12;
+        AddField(3); fields[fields.Count - 1].span = 8;
+        AddField(6); fields[fields.Count - 1].span = 8;
+        AddField(7); fields[fields.Count - 1].span = 8;
+
+        // A Card container with nested children.
+        activeContainer = null;
+        AddField(18);
+        AddField(15);
+        AddField(0);
+
+        // A Tabs container: table + statistic on tab 1, alert on tab 2.
+        activeContainer = null;
+        AddField(36);
+        AddField(23);
+        AddField(22);
+        if (activeContainer != null) { activeContainer.uiState.Set(1); }
+        AddField(28);
+        if (activeContainer != null) { activeContainer.uiState.Set(0); }
+
+        // A full-width chart.
+        activeContainer = null;
+        AddField(43);
+
+        activeContainer = null;
+        sel = null;
+        selPrev = null;
+        inspTab = 0;
+    }
+
+    // --- Field mutation ------------------------------------------------------
+
+    /// Adds a new component. When a container is active the component is nested
+    /// inside it (into the active tab for Tabs); otherwise it is appended to
+    /// the top-level form. Adding a container makes it the active container so
+    /// you can immediately drop components inside.
+    void AddField(int ftype) {
+        FormField f = FormField.New(ftype, seq);
+        seq = seq + 1;
+        if (FormField.IsNonVisualOf(ftype)) {
+            // Non-visual components always live at the top level: the tray
+            // below the canvas shows them, never a container.
+            fields.Add(f);
+            sel = f;
+            inspTab = 0;
+            msg = Designer.T("added ", "已添加 ") + FormField.TypeName(ftype);
+            return;
+        }
+        if (activeContainer != null) {
+            f.childTab = 0;
+            if (activeContainer.ftype == 36) { f.childTab = activeContainer.uiState.Get(); }
+            activeContainer.kids.Add(f);
+        } else {
+            fields.Add(f);
+        }
+        sel = f;
+        inspTab = 0;
+        if (f.IsContainer()) { activeContainer = f; }
+        msg = Designer.T("added ", "已添加 ") + FormField.TypeName(ftype);
+    }
+
+    /// The host IDE supplies the bindable variable names scanned from the
+    /// form's paired code-behind file (see the inspector's bind-path picker).
+    void SetBindVars(List<string> vars) {
+        bindVars = vars;
+        bindPickOpen = false;
+    }
+
+    /// The host IDE supplies the project's saved user components (parallel
+    /// name / design-JSON lists, from components/*.zcomp).
+    void SetUserComponents(List<string> names, List<string> jsons) {
+        userComps = new List<UserComponent>();
+        int i = 0;
+        while (i < names.Count) {
+            string js = "";
+            if (i < jsons.Count) { js = jsons[i]; }
+            userComps.Add(new UserComponent(names[i], js));
+            i = i + 1;
+        }
+    }
+
+    /// True exactly once after the user asked to save the current design as a
+    /// reusable component; the host IDE persists it and reloads the list.
+    bool ConsumeSaveComponent() {
+        if (saveCompRequested) { saveCompRequested = false; return true; }
+        return false;
+    }
+
+    /// Instantiates a saved user component onto the form: a single-container
+    /// design is inserted as itself, anything else is wrapped in a Card named
+    /// after the component (WinForms UserControl style).
+    void AddUserComponent(int k) {
+        if (k < 0 || k >= userComps.Count) { return; }
+        List<FormField> parsed = ParseComponentFields(userComps[k].json);
+        FormField f;
+        if (parsed.Count == 1 && parsed[0].IsContainer()) {
+            f = parsed[0];
+        } else {
+            f = FormField.New(18, seq);
+            f.label = userComps[k].name;
+            f.kids = parsed;
+            int ci = 0;
+            while (ci < parsed.Count) { parsed[ci].childTab = 0; ci = ci + 1; }
+        }
+        f.fname = userComps[k].name + Convert.ToString(seq);
+        f.name = f.fname;
+        seq = seq + 1;
+        if (activeContainer != null && activeContainer != f) {
+            f.childTab = 0;
+            if (activeContainer.ftype == 36) { f.childTab = activeContainer.uiState.Get(); }
+            activeContainer.kids.Add(f);
+        } else {
+            fields.Add(f);
+        }
+        sel = f;
+        inspTab = 0;
+        msg = Designer.T("added ", "已添加 ") + userComps[k].name;
+    }
+
+    /// Adds a discovered project custom component (by its CustomComponents tag)
+    /// to the form / active container, mirroring AddField for built-ins.
+    void AddCustomField(string kind) {
+        FormField f = FormField.NewCustom(kind, seq);
+        seq = seq + 1;
+        if (activeContainer != null) {
+            f.childTab = 0;
+            if (activeContainer.ftype == 36) { f.childTab = activeContainer.uiState.Get(); }
+            activeContainer.kids.Add(f);
+        } else {
+            fields.Add(f);
+        }
+        sel = f;
+        inspTab = 0;
+        msg = Designer.T("added ", "已添加 ") + kind;
+    }
+
+    /// True when `inner` lives anywhere inside `owner`'s subtree.
+    bool InSubtree(FormField owner, FormField inner) {
+        if (!owner.IsContainer()) { return false; }
+        if (ContainsRef(owner.kids, inner)) { return true; }
+        int i = 0;
+        while (i < owner.kids.Count) {
+            if (InSubtree(owner.kids[i], inner)) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    bool ContainsRef(List<FormField> lst, FormField target) {
+        int i = 0;
+        while (i < lst.Count) {
+            if (lst[i] == target) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    int IndexIn(List<FormField> lst, FormField f) {
+        int i = 0;
+        while (i < lst.Count) {
+            if (lst[i] == f) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    /// The container that holds `target` in its kids, or null when target is a
+    /// top-level field (or not found). Searched recursively.
+    FormField ParentContainerOf(FormField target) {
+        if (ContainsRef(fields, target)) { return null; }
+        return FindOwner(fields, target);
+    }
+
+    FormField FindOwner(List<FormField> lst, FormField target) {
+        int i = 0;
+        while (i < lst.Count) {
+            FormField f = lst[i];
+            if (f.IsContainer()) {
+                if (ContainsRef(f.kids, target)) { return f; }
+                FormField r = FindOwner(f.kids, target);
+                if (r != null) { return r; }
+            }
+            i = i + 1;
+        }
+        return null;
+    }
+
+    /// Rebuilds `lst` without `target` (mid-list RemoveAt is used elsewhere but
+    /// rebuilding keeps parity with the Insert workaround below).
+    List<FormField> ListRemove(List<FormField> lst, FormField target) {
+        List<FormField> nl = new List<FormField>();
+        int i = 0;
+        while (i < lst.Count) {
+            if (lst[i] != target) { nl.Add(lst[i]); }
+            i = i + 1;
+        }
+        return nl;
+    }
+
+    /// Moves the element at `from` to land at `to`, rebuilt via Add (the
+    /// runtime's mid-list Insert overruns its buffer and corrupts the heap).
+    List<FormField> ListMove(List<FormField> lst, int from, int to) {
+        if (from < 0 || from >= lst.Count) { return lst; }
+        FormField mv = lst[from];
+        List<FormField> rest = new List<FormField>();
+        int i = 0;
+        while (i < lst.Count) {
+            if (i != from) { rest.Add(lst[i]); }
+            i = i + 1;
+        }
+        if (to < 0) { to = 0; }
+        if (to > rest.Count) { to = rest.Count; }
+        List<FormField> nl = new List<FormField>();
+        i = 0;
+        while (i < rest.Count) {
+            if (i == to) { nl.Add(mv); }
+            nl.Add(rest[i]);
+            i = i + 1;
+        }
+        if (to >= rest.Count) { nl.Add(mv); }
+        return nl;
+    }
+
+    void MoveSel(int delta) {
+        if (sel == null) { return; }
+        FormField pc = ParentContainerOf(sel);
+        if (pc == null) {
+            int idx = IndexIn(fields, sel);
+            if (idx < 0) { return; }
+            int to = idx + delta;
+            if (to < 0) { to = 0; }
+            if (to >= fields.Count) { to = fields.Count - 1; }
+            if (to != idx) { fields = ListMove(fields, idx, to); }
+        } else {
+            int idx = IndexIn(pc.kids, sel);
+            if (idx < 0) { return; }
+            int to = idx + delta;
+            if (to < 0) { to = 0; }
+            if (to >= pc.kids.Count) { to = pc.kids.Count - 1; }
+            if (to != idx) { pc.kids = ListMove(pc.kids, idx, to); }
+        }
+    }
+
+    /// Inserts `nf` so it ends up at index `at` in the top-level list.
+    void InsertFieldAt(int at, FormField nf) {
+        if (at < 0) { at = 0; }
+        if (at > fields.Count) { at = fields.Count; }
+        List<FormField> nl = new List<FormField>();
+        int i = 0;
+        while (i < fields.Count) {
+            if (i == at) { nl.Add(nf); }
+            nl.Add(fields[i]);
+            i = i + 1;
+        }
+        if (at >= fields.Count) { nl.Add(nf); }
+        fields = nl;
+    }
+
+    void DeleteSel() {
+        if (sel == null) { return; }
+        FormField pc = ParentContainerOf(sel);
+        if (pc == null) {
+            fields = ListRemove(fields, sel);
+        } else {
+            pc.kids = ListRemove(pc.kids, sel);
+        }
+        sel = null;
+        selPrev = null;
+        activeContainer = null;
+        msg = Designer.T("deleted field", "已删除组件");
+    }
+
+    // --- Top-level layout ----------------------------------------------------
+
+    void Render(App app, int x, int y, int w, int h) {
+        // The designer builds its buttons/segments/steppers immediate-mode
+        // every frame, but the host (the IDE) is retained-style and never
+        // rewinds the process-wide WidgetId counter. Pin a fixed high
+        // baseline for the designer's frame so every control gets the SAME
+        // id each frame -- hover/press/click are keyed by id and resolved
+        // against the previous frame's hit regions, so drifting ids made the
+        // whole inspector unclickable. Restore the counter afterwards (same
+        // pattern as FilePicker's dialog, which pins 900000).
+        int savedSeq = WidgetId.SeqValue();
+        WidgetId.SetSeq(800000);
+        RenderPinned(app, x, y, w, h);
+        WidgetId.SetSeq(savedSeq);
+    }
+
+    void RenderPinned(App app, int x, int y, int w, int h) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int statusH = app.Scale(20);
+        int top = y + app.Scale(6);
+        int bodyY = top;
+        int bot = y + h - statusH - app.Scale(6);
+
+        int palX = x + app.Scale(12);
+        int palW = app.Scale(176);
+        int inspW = app.Scale(288);
+        int canX = palX + palW + app.Scale(12);
+        // The canvas fills the whole middle column (通栏) between the palette
+        // and the inspector.
+        int canW = w - palW - inspW - app.Scale(60);
+        if (canW < app.Scale(240)) { canW = app.Scale(240); }
+        int inspX = canX + canW + app.Scale(12);
+        int bodyH = bot - bodyY;
+
+        int ek = app.EventKind();
+        // Track pointer while a drag is in flight; the actual drop is resolved
+        // by RenderForm (it owns the row geometry).
+        if (dragging && ek == 1) {
+            if (app.mouseX != dragMouseX || app.mouseY != dragMouseY) { dragMoved = true; }
+            dragMouseX = app.mouseX;
+            dragMouseY = app.mouseY;
+            app.RequestRedraw();
+        }
+
+        hoverFt = -1;
+        // Delete removes the selected component; ignored while a text input
+        // has keyboard focus so typing is unaffected.
+        if (!preview && ek == 4 && app.window.EventKeyCode() == 46
+            && sel != null && app.focus.focusedId < 0) {
+            DeleteSel();
+            app.RequestRedraw();
+        }
+        if (jsonOpen) {
+            RenderJsonPanel(app, c, t, canX, bodyY, canW, bodyH);
+        } else {
+            // WinForms-style component tray below the canvas: non-visual
+            // components (context menus, layers, timers, popups...) live
+            // there instead of occupying space inside the designed window.
+            int trayH = app.Scale(46);
+            RenderForm(app, c, t, canX, bodyY, canW, bodyH - trayH - app.Scale(8));
+            RenderTray(app, c, t, canX, bodyY + bodyH - trayH, canW, trayH);
+        }
+        RenderPalette(app, c, t, palX, bodyY, palW, bodyH);
+        RenderInspector(app, c, t, inspX, bodyY, inspW, bodyH);
+        RenderStatus(app, c, t, palX, bot + app.Scale(4), inspX + inspW - palX);
+
+        // A drag that ends anywhere outside the form is simply cancelled.
+        if (dragging && ek == 3) {
+            dragging = false;
+            dragFromPalette = false;
+            dragMoved = false;
+            dragIndex = -1;
+            dragUserComp = -1;
+            dropContainer = null;
+            app.RequestRedraw();
+        }
+
+        // Palette tooltip (name + description), drawn on top of every panel.
+        if (hoverFt >= 0 && !dragging) {
+            Tooltip.RenderRich(app, hoverX, hoverY,
+                FormField.TypeName(hoverFt), FieldDesc(hoverFt));
+        }
+        // Ghost chip that follows the cursor while dragging — for both a new
+        // field from the palette and an existing row being reordered — so it's
+        // always clear which component is in flight.
+        if (dragging && dragMoved) {
+            int gkind = dragKind;
+            if (!dragFromPalette && dragIndex >= 0 && dragIndex < fields.Count) {
+                gkind = fields[dragIndex].ftype;
+            }
+            string gl = FormField.TypeName(gkind);
+            if (gkind == 200 && dragUserComp >= 0 && dragUserComp < userComps.Count) {
+                gl = userComps[dragUserComp].name;
+                gkind = 18;
+            }
+            int gh = app.Scale(26);
+            int icoW = app.Scale(22);
+            int gw = icoW + Canvas.MeasureText(gl, t.fontSizeSmall) + app.Scale(16);
+            int gx = dragMouseX + app.Scale(8);
+            int gy = dragMouseY - gh / 2;
+            c.FillRoundRect(gx + 1, gy + 2, gw, gh, t.borderRadiusSmall, t.shadowColor);
+            c.FillRoundRect(gx, gy, gw, gh, t.borderRadiusSmall, t.primary);
+            c.DrawGlyphIn(FieldIcon(gkind), gx + app.Scale(4), gy, icoW, gh,
+                t.fontSizeSmall, t.textInverse);
+            c.DrawText(gx + icoW + app.Scale(4), gy + app.Scale(6), gl, t.textInverse, t.fontSizeSmall);
+        }
+    }
+
+    // --- Toolbar -------------------------------------------------------------
+
+    /// The editable JSON drawer shown in place of the canvas when JSON is on.
+    /// The text box IS the document: Apply rebuilds the design from it,
+    /// Regenerate re-dumps the current design into it.
+    void RenderJsonPanel(App app, Canvas c, Theme t, int x, int y, int w, int h) {
+        int fs = t.fontSizeSmall;
+        c.FillRoundRect(x, y, w, h, app.Scale(6), t.bgSecondary);
+        c.DrawRect(x, y, w, h, t.borderPrimary, 1);
+        int pad = app.Scale(12);
+        int ix = x + pad;
+        int iw = w - pad * 2;
+        int iy = y + app.Scale(10);
+        c.DrawText(ix, iy, Designer.T("DESIGN JSON  ·  edit then Apply", "设计 JSON  ·  编辑后点击应用"), t.textTertiary, fs);
+        iy = iy + app.Scale(24);
+        int btnH = app.Scale(30);
+        int taH = y + h - iy - btnH - app.Scale(20);
+        if (taH < app.Scale(80)) { taH = app.Scale(80); }
+        jsonArea.Render(app, ix, iy, iw, taH);
+        int by = iy + taH + app.Scale(8);
+        int applyId = new Button { Text = Designer.T("Apply", "应用"), Class = "primary" }.Render(app, ix, by, app.Scale(80));
+        if (Ui.Clicked(app, applyId)) {
+            LoadJson(jsonSig.Get());
+            msg = Designer.T("loaded ", "已从 JSON 加载 ") + Convert.ToString(fields.Count) + Designer.T(" components from JSON", " 个组件");
+        }
+        int dumpId = new Button { Text = Designer.T("Regenerate", "重新生成") }.Render(app, ix + app.Scale(88), by, app.Scale(104));
+        if (Ui.Clicked(app, dumpId)) {
+            jsonArea.SetText(SaveJson());
+            msg = Designer.T("regenerated JSON from the current design", "已根据当前设计重新生成 JSON");
+        }
+        int closeId = new Button { Text = Designer.T("Close", "关闭") }.Render(app, ix + iw - app.Scale(70), by, app.Scale(70));
+        if (Ui.Clicked(app, closeId)) { jsonOpen = false; }
+    }
+
+    // --- Field palette -------------------------------------------------------
+
+    void RenderPalette(App app, Canvas c, Theme t, int px, int py, int pw, int ph) {
+        int fs = t.fontSizeSmall;
+        c.FillRoundRect(px, py, pw, ph, app.Scale(6), t.bgSecondary);
+        c.DrawRect(px, py, pw, ph, t.borderPrimary, 1);
+
+        // Filter / search box, fixed at the top of the palette.
+        int fpad = app.Scale(8);
+        filterInput.Render(app, px + fpad, py + app.Scale(7), pw - fpad * 2, app.Scale(28));
+        string q = filterSig.Get();
+        int headH = app.Scale(42);
+        int bodyY = py + headH;
+        int bodyH = ph - headH;
+
+        // The palette scrolls internally: claim the wheel while the pointer is
+        // over the body (otherwise the whole page scrolls) and clamp the offset.
+        int contentH = PaletteContentH(app, q);
+        int maxScroll = contentH - bodyH;
+        if (maxScroll < 0) { maxScroll = 0; }
+        if (InRect(app.mouseX, app.mouseY, px, bodyY, pw, bodyH)) {
+            bool ownsWheel = app.CaptureWheel(px, bodyY, pw, bodyH);
+            if (ownsWheel) {
+                int delta = app.window.EventKeyCode();
+                paletteScroll = paletteScroll - delta * app.Scale(40) / 120;
+                app.RequestRedraw();
+            }
+        }
+        if (paletteScroll < 0) { paletteScroll = 0; }
+        if (paletteScroll > maxScroll) { paletteScroll = maxScroll; }
+
+        c.PushClip(px + 1, bodyY, pw - 2, bodyH);
+        palClipTop = bodyY;
+        palClipBot = bodyY + bodyH;
+        int ix = px + app.Scale(8);
+        int iw = pw - app.Scale(16);
+        if (maxScroll > 0) { iw = iw - app.Scale(6); }
+        int iy = bodyY + app.Scale(8) - paletteScroll;
+
+        if (q != "") {
+            iy = PaletteFiltered(app, c, t, q, ix, iy, iw);
+        } else {
+            if (PalVisible(app, iy, app.Scale(14))) {
+                c.DrawText(ix, iy, Designer.T("COMPONENTS", "组件"), t.textTertiary, fs);
+            }
+            iy = iy + app.Scale(20);
+            iy = PaletteGroup(app, c, t, Designer.T("Basic", "基础"), 0, 8, ix, iy, iw);
+            iy = PaletteGroup(app, c, t, Designer.T("Advanced", "高级"), 8, 15, ix, iy, iw);
+            iy = PaletteGroup(app, c, t, Designer.T("Layout", "布局"), 15, 18, ix, iy, iw);
+            iy = PaletteGroup(app, c, t, Designer.T("Display", "展示"), 18, 28, ix, iy, iw);
+            iy = PaletteGroup(app, c, t, Designer.T("Feedback", "反馈"), 28, 34, ix, iy, iw);
+            iy = PaletteGroup(app, c, t, Designer.T("Navigation", "导航"), 34, 40, ix, iy, iw);
+            iy = PaletteGroup(app, c, t, Designer.T("Display+", "展示+"), 40, 47, ix, iy, iw);
+            iy = PaletteGroup(app, c, t, Designer.T("Feedback+", "反馈+"), 47, 53, ix, iy, iw);
+            iy = PaletteGroup(app, c, t, Designer.T("More", "更多"), 53, 55, ix, iy, iw);
+            iy = PaletteGroup(app, c, t, Designer.T("Non-visual", "功能组件"), 55, 58, ix, iy, iw);
+            iy = CustomPaletteGroup(app, c, t, ix, iy, iw);
+            iy = UserPaletteGroup(app, c, t, ix, iy, iw);
+        }
+        c.PopClip();
+
+        if (maxScroll > 0) {
+            Scrollbar.RenderVertical(app, px + pw - app.Scale(7), bodyY,
+                bodyH, contentH, paletteScroll);
+        }
+    }
+
+    /// True when a field type's key or display name contains the filter query.
+    bool MatchesFilter(int ft, string q) {
+        if (q == "") { return true; }
+        return Designer.Contains(FormField.TypeKey(ft), q)
+            || Designer.Contains(FormField.TypeName(ft), q);
+    }
+
+    /// Flat search results grid shown while the filter box is non-empty: every
+    /// built-in component whose name matches, in one 4-across grid.
+    int PaletteFiltered(App app, Canvas c, Theme t, string q, int ix, int iy, int iw) {
+        int fs = t.fontSizeSmall;
+        List<int> hits = new List<int>();
+        int ft = 0;
+        while (ft < 58) {
+            if (MatchesFilter(ft, q)) { hits.Add(ft); }
+            ft = ft + 1;
+        }
+        if (PalVisible(app, iy, app.Scale(14))) {
+            c.DrawText(ix, iy, Designer.T("MATCHES (", "匹配 (") + Convert.ToString(hits.Count) + ")", t.textTertiary, fs);
+        }
+        iy = iy + app.Scale(20);
+        if (hits.Count == 0) {
+            if (PalVisible(app, iy, app.Scale(16))) {
+                c.DrawText(ix, iy, Designer.T("No components match.", "没有匹配的组件。"), t.textSecondary, fs);
+            }
+            return iy + app.Scale(24);
+        }
+        int cols = 4;
+        int gapx = app.Scale(4);
+        int tileW = (iw - (cols - 1) * gapx) / cols;
+        int tileH = app.Scale(34);
+        int rowStep = tileH + app.Scale(6);
+        int ek = app.EventKind();
+        int hi = 0;
+        int col = 0;
+        while (hi < hits.Count) {
+            int fft = hits[hi];
+            int bx = ix + col * (tileW + gapx);
+            if (PalVisible(app, iy, tileH)) {
+                if (!preview && ek == 2 && !dragging
+                    && InRect(app.mouseX, app.mouseY, bx, iy, tileW, tileH)) {
+                    dragging = true;
+                    dragFromPalette = true;
+                    dragMoved = false;
+                    dragKind = fft;
+                    dragMouseX = app.mouseX;
+                    dragMouseY = app.mouseY;
+                }
+                Button b = new Button { Icon = FieldIcon(fft), Class = "medium" };
+                int id = b.Render(app, bx, iy, tileW);
+                if (Ui.Clicked(app, id) && !dragMoved) { AddField(fft); }
+                if (!dragging && InRect(app.mouseX, app.mouseY, bx, iy, tileW, tileH)) {
+                    hoverFt = fft;
+                    hoverX = ix + iw + app.Scale(10);
+                    hoverY = iy;
+                    app.RequestRedraw();
+                }
+            }
+            col = col + 1;
+            if (col == cols) { col = 0; iy = iy + rowStep; }
+            hi = hi + 1;
+        }
+        if (col != 0) { iy = iy + rowStep; }
+        return iy + app.Scale(10);
+    }
+
+    /// Total pixel height of all palette groups, mirroring the layout in
+    /// RenderPalette / PaletteGroup so scrolling can be clamped correctly.
+    int PaletteContentH(App app, string q) {
+        if (q != "") {
+            int m = 0;
+            int ft = 0;
+            while (ft < 58) {
+                if (MatchesFilter(ft, q)) { m = m + 1; }
+                ft = ft + 1;
+            }
+            int fh = app.Scale(8) + app.Scale(20);
+            if (m > 0) { fh = fh + PaletteGroupH(app, m); }
+            else { fh = fh + app.Scale(24); }
+            return fh + app.Scale(8);
+        }
+        int h = app.Scale(8) + app.Scale(20);
+        h = h + PaletteGroupH(app, 8);   // Basic
+        h = h + PaletteGroupH(app, 7);   // Advanced
+        h = h + PaletteGroupH(app, 3);   // Layout
+        h = h + PaletteGroupH(app, 10);  // Display
+        h = h + PaletteGroupH(app, 6);   // Feedback
+        h = h + PaletteGroupH(app, 6);   // Navigation
+        h = h + PaletteGroupH(app, 7);   // Display+
+        h = h + PaletteGroupH(app, 6);   // Feedback+
+        h = h + PaletteGroupH(app, 2);   // More
+        h = h + PaletteGroupH(app, 3);   // Non-visual
+        int nc = CustomComponents.Kinds().Count;
+        if (nc > 0) { h = h + PaletteGroupH(app, nc); }  // Custom
+        if (userComps.Count > 0) {                       // My Components
+            h = h + app.Scale(18)
+                + userComps.Count * (app.Scale(28) + app.Scale(6))
+                + app.Scale(10);
+        }
+        return h + app.Scale(8);
+    }
+
+    int PaletteGroupH(App app, int count) {
+        int cols = 4;
+        int rows = (count + cols - 1) / cols;
+        int rowStep = app.Scale(34) + app.Scale(6);
+        return app.Scale(18) + rows * rowStep + app.Scale(10);
+    }
+
+    /// Renders a 4-across grid of icon-only palette tiles for field types
+    /// [lo, hi) and returns the next y. Hovering a tile arms a tooltip; pressing
+    /// one begins a drag that can be dropped onto the form to add the field.
+    int PaletteGroup(App app, Canvas c, Theme t, string title, int lo, int hi,
+            int ix, int iy, int iw) {
+        int fs = t.fontSizeSmall;
+        if (PalVisible(app, iy, app.Scale(14))) {
+            c.DrawText(ix, iy, title, t.textSecondary, fs);
+        }
+        iy = iy + app.Scale(18);
+        int cols = 4;
+        int gapx = app.Scale(4);
+        int tileW = (iw - (cols - 1) * gapx) / cols;
+        int tileH = app.Scale(34);
+        int rowStep = tileH + app.Scale(6);
+        int ek = app.EventKind();
+        int ft = lo;
+        int col = 0;
+        while (ft < hi) {
+            int bx = ix + col * (tileW + gapx);
+            // Only draw / hit-test tiles that fit fully inside the palette body;
+            // the clip doesn't contain child widgets, so partial tiles are culled.
+            if (PalVisible(app, iy, tileH)) {
+                if (!preview && ek == 2 && !dragging
+                    && InRect(app.mouseX, app.mouseY, bx, iy, tileW, tileH)) {
+                    dragging = true;
+                    dragFromPalette = true;
+                    dragMoved = false;
+                    dragKind = ft;
+                    dragMouseX = app.mouseX;
+                    dragMouseY = app.mouseY;
+                }
+                Button b = new Button { Icon = FieldIcon(ft), Class = "medium" };
+                int id = b.Render(app, bx, iy, tileW);
+                if (Ui.Clicked(app, id) && !dragMoved) { AddField(ft); }
+                if (!dragging && InRect(app.mouseX, app.mouseY, bx, iy, tileW, tileH)) {
+                    hoverFt = ft;
+                    hoverX = ix + iw + app.Scale(10);
+                    hoverY = iy;
+                    app.RequestRedraw();
+                }
+            }
+            col = col + 1;
+            if (col == cols) { col = 0; iy = iy + rowStep; }
+            ft = ft + 1;
+        }
+        if (col != 0) { iy = iy + rowStep; }
+        return iy + app.Scale(10);
+    }
+
+    /// Palette group for project custom components discovered at build time
+    /// (CustomComponents). Renders one tile per component (using its declared
+    /// icon); clicking adds it, dragging drops it onto the form. Empty when the
+    /// project defines no custom components, so nothing shows by default.
+    int CustomPaletteGroup(App app, Canvas c, Theme t, int ix, int iy, int iw) {
+        List<string> kinds = CustomComponents.Kinds();
+        if (kinds.Count == 0) { return iy; }
+        int fs = t.fontSizeSmall;
+        if (PalVisible(app, iy, app.Scale(14))) {
+            c.DrawText(ix, iy, Designer.T("Custom", "自定义"), t.textSecondary, fs);
+        }
+        iy = iy + app.Scale(18);
+        int cols = 4;
+        int gapx = app.Scale(4);
+        int tileW = (iw - (cols - 1) * gapx) / cols;
+        int tileH = app.Scale(34);
+        int rowStep = tileH + app.Scale(6);
+        int ek = app.EventKind();
+        int k = 0;
+        int col = 0;
+        while (k < kinds.Count) {
+            int bx = ix + col * (tileW + gapx);
+            if (PalVisible(app, iy, tileH)) {
+                if (!preview && ek == 2 && !dragging
+                    && InRect(app.mouseX, app.mouseY, bx, iy, tileW, tileH)) {
+                    dragging = true;
+                    dragFromPalette = true;
+                    dragMoved = false;
+                    dragKind = 100;
+                    dragCustomKind = kinds[k];
+                    dragMouseX = app.mouseX;
+                    dragMouseY = app.mouseY;
+                }
+                string icon = CustomComponents.IconOf(kinds[k]);
+                if (icon == "") { icon = "puzzle"; }
+                Button b = new Button { Icon = icon, Class = "medium" };
+                int id = b.Render(app, bx, iy, tileW);
+                if (Ui.Clicked(app, id) && !dragMoved) { AddCustomField(kinds[k]); }
+            }
+            col = col + 1;
+            if (col == cols) { col = 0; iy = iy + rowStep; }
+            k = k + 1;
+        }
+        if (col != 0) { iy = iy + rowStep; }
+        return iy + app.Scale(10);
+    }
+
+    /// Palette group for the project's saved user components (windows saved as
+    /// reusable components). One named row per component; click to add, drag to
+    /// drop it onto the form like any built-in.
+    int UserPaletteGroup(App app, Canvas c, Theme t, int ix, int iy, int iw) {
+        if (userComps.Count == 0) { return iy; }
+        int fs = t.fontSizeSmall;
+        if (PalVisible(app, iy, app.Scale(14))) {
+            c.DrawText(ix, iy, Designer.T("My Components", "我的组件"), t.textSecondary, fs);
+        }
+        iy = iy + app.Scale(18);
+        int rowH2 = app.Scale(28);
+        int ek = app.EventKind();
+        int k = 0;
+        while (k < userComps.Count) {
+            if (PalVisible(app, iy, rowH2)) {
+                if (!preview && ek == 2 && !dragging
+                    && InRect(app.mouseX, app.mouseY, ix, iy, iw, rowH2)) {
+                    dragging = true;
+                    dragFromPalette = true;
+                    dragMoved = false;
+                    dragKind = 200;
+                    dragUserComp = k;
+                    dragMouseX = app.mouseX;
+                    dragMouseY = app.mouseY;
+                }
+                Button b = new Button { Text = userComps[k].name, Icon = "layout",
+                                        Class = "small" };
+                int id = b.Render(app, ix, iy, iw);
+                if (Ui.Clicked(app, id) && !dragMoved) { AddUserComponent(k); }
+            }
+            iy = iy + rowH2 + app.Scale(6);
+            k = k + 1;
+        }
+        return iy + app.Scale(10);
+    }
+
+    bool InRect(int mx, int my, int x, int y, int w, int h) {
+        return mx >= x && mx <= x + w && my >= y && my <= y + h;
+    }
+
+    /// True when a palette element of the given height fits fully inside the
+    /// palette body. The canvas clip alone doesn't contain child widgets here,
+    /// so tiles that would straddle the edge are culled instead of drawn.
+    bool PalVisible(App app, int yy, int h) {
+        return yy >= palClipTop && yy + h <= palClipBot;
+    }
+
+    /// True when a form element of the given height fits fully inside the form
+    /// body. Like the palette, rows that would straddle the edge are culled.
+    bool FormVisible(int yy, int h) {
+        return yy >= formClipTop && yy + h <= formClipBot;
+    }
+
+    /// Total pixel height of the form preview (header + all rows + submit bar),
+    /// mirroring RenderForm's layout so the scroll offset can be clamped.
+    int FormContentH(App app) {
+        int pad = app.Scale(14);
+        int h = pad + app.Scale(24) + app.Scale(10);
+        List<int> visIdx = new List<int>();
+        int vf = 0;
+        while (vf < fields.Count) {
+            if (!fields[vf].IsNonVisual()) { visIdx.Add(vf); }
+            vf = vf + 1;
+        }
+        int n = visIdx.Count;
+        int i = 0;
+        while (i < n) {
+            int cols = 0;
+            int rowEnd = i;
+            while (rowEnd < n) {
+                int sp = ClampSpan(fields[visIdx[rowEnd]].span);
+                if (rowEnd > i && cols + sp > 24) { break; }
+                cols = cols + sp;
+                rowEnd = rowEnd + 1;
+                if (cols >= 24) { break; }
+            }
+            int rowH = 0;
+            int k = i;
+            while (k < rowEnd) {
+                int hk = FieldHeight(app, fields[visIdx[k]]);
+                if (labelPos == 2 && !fields[visIdx[k]].IsDisplay()) { hk = hk + app.Scale(18); }
+                if (hk > rowH) { rowH = hk; }
+                k = k + 1;
+            }
+            h = h + rowH + app.Scale(6);
+            i = rowEnd;
+        }
+        return h + pad;
+    }
+
+    /// WinForms-style component tray: every non-visual component on the form
+    /// shows as a chip here. Clicking a chip selects it so its properties and
+    /// events edit in the inspector; the selected chip is highlighted.
+    void RenderTray(App app, Canvas c, Theme t, int x, int y, int w, int h) {
+        int fs = t.fontSizeSmall;
+        c.FillRoundRect(x, y, w, h, app.Scale(6), t.bgSecondary);
+        c.DrawRect(x, y, w, h, t.borderPrimary, 1);
+        bool overTray = dragging && dragFromPalette
+            && FormField.IsNonVisualOf(dragKind)
+            && InRect(dragMouseX, dragMouseY, x, y, w, h);
+        if (overTray) { c.DrawRect(x, y, w, h, t.primary, 2); }
+        int bx = x + app.Scale(10);
+        int by = y + (h - app.Scale(28)) / 2;
+        bool any = false;
+        int i = 0;
+        while (i < fields.Count) {
+            FormField f = fields[i];
+            if (f.IsNonVisual()) {
+                any = true;
+                string nm = f.fname;
+                if (nm == "") { nm = FormField.TypeName(f.ftype); }
+                int ty = 0;
+                if (!preview && f == sel) { ty = 1; }
+                Button b = new Button { Text = nm, Icon = FieldIcon(f.ftype),
+                                        Class = "small " + Style.TypeClass(ty) };
+                int bw = Canvas.MeasureText(nm, fs) + app.Scale(44);
+                int id = b.Render(app, bx, by, bw);
+                if (!preview && Ui.Clicked(app, id)) {
+                    sel = f;
+                    activeContainer = null;
+                    inspTab = 0;
+                    app.RequestRedraw();
+                }
+                bx = bx + bw + app.Scale(8);
+            }
+            i = i + 1;
+        }
+        if (!any) {
+            c.DrawText(bx, y + (h - Canvas.FontHeight(fs)) / 2,
+                Designer.T("Component tray — context menus, layers, timers and other non-visual components land here.",
+                    "组件托盘 —— 右键菜单、Layer、定时器等功能组件会放在这里。"),
+                t.textTertiary, fs);
+        }
+        // Dropping a non-visual palette drag anywhere over the tray adds it.
+        if (overTray && app.EventKind() == 3) {
+            activeContainer = null;
+            AddField(dragKind);
+            dragging = false;
+            dragFromPalette = false;
+            dragMoved = false;
+            dropContainer = null;
+            app.RequestRedraw();
+        }
+    }
+
+    /// Clamp a field's column span into the valid 1..24 grid range.
+    int ClampSpan(int sp) {
+        if (sp < 1) { return 24; }
+        if (sp > 24) { return 24; }
+        return sp;
+    }
+
+    /// One-line description shown in the palette hover tooltip.
+    string FieldDesc(int ft) {
+        if (ft == 0) { return Designer.T("Single-line text input", "单行文本输入框"); }
+        if (ft == 1) { return Designer.T("Multi-line text area", "多行文本域"); }
+        if (ft == 2) { return Designer.T("Masked password input", "密码输入框"); }
+        if (ft == 3) { return Designer.T("Numeric stepper input", "数字步进输入框"); }
+        if (ft == 4) { return Designer.T("Single choice from options", "单选项"); }
+        if (ft == 5) { return Designer.T("Multiple choice from options", "多选项"); }
+        if (ft == 6) { return Designer.T("Dropdown selector", "下拉选择器"); }
+        if (ft == 7) { return Designer.T("On / off toggle", "开 / 关开关"); }
+        if (ft == 8) { return Designer.T("Star rating", "星级评分"); }
+        if (ft == 9) { return Designer.T("Value slider", "滑块"); }
+        if (ft == 10) { return Designer.T("Date picker", "日期选择器"); }
+        if (ft == 11) { return Designer.T("Time picker", "时间选择器"); }
+        if (ft == 12) { return Designer.T("File upload area", "文件上传区域"); }
+        if (ft == 13) { return Designer.T("Colour picker", "颜色选择器"); }
+        if (ft == 14) { return Designer.T("Rich text editor", "富文本编辑器"); }
+        if (ft == 15) { return Designer.T("Section heading text", "章节标题文本"); }
+        if (ft == 16) { return Designer.T("Static paragraph text", "静态段落文本"); }
+        if (ft == 17) { return Designer.T("Horizontal separator", "水平分隔线"); }
+        if (ft == 18) { return Designer.T("Content card panel", "内容卡片面板"); }
+        if (ft == 19) { return Designer.T("Coloured label tag", "彩色标签"); }
+        if (ft == 20) { return Designer.T("Count / status badge", "计数 / 状态徽标"); }
+        if (ft == 21) { return Designer.T("User avatar circle", "用户头像"); }
+        if (ft == 22) { return Designer.T("Statistic figure", "统计数值"); }
+        if (ft == 23) { return Designer.T("Data table with columns", "带列的数据表格"); }
+        if (ft == 24) { return Designer.T("Vertical timeline", "垂直时间轴"); }
+        if (ft == 25) { return Designer.T("Tree / hierarchy", "树 / 层级结构"); }
+        if (ft == 26) { return Designer.T("Collapsible panels", "折叠面板"); }
+        if (ft == 27) { return Designer.T("Empty-state placeholder", "空状态占位"); }
+        if (ft == 28) { return Designer.T("Inline alert banner", "内联警告横幅"); }
+        if (ft == 29) { return Designer.T("Progress bar", "进度条"); }
+        if (ft == 30) { return Designer.T("Result / status page", "结果 / 状态页"); }
+        if (ft == 31) { return Designer.T("Skeleton placeholder", "骨架屏占位"); }
+        if (ft == 32) { return Designer.T("Loading spinner", "加载动画"); }
+        if (ft == 33) { return Designer.T("Tooltip trigger", "提示气泡触发器"); }
+        if (ft == 34) { return Designer.T("Step progress", "步骤条"); }
+        if (ft == 35) { return Designer.T("Breadcrumb trail", "面包屑导航"); }
+        if (ft == 36) { return Designer.T("Tab bar", "标签页栏"); }
+        if (ft == 37) { return Designer.T("Pagination controls", "分页控件"); }
+        if (ft == 38) { return Designer.T("Navigation menu", "导航菜单"); }
+        if (ft == 39) { return Designer.T("Page header", "页面头部"); }
+        if (ft == 40) { return Designer.T("Scrollable list of rows", "可滚动行列表"); }
+        if (ft == 41) { return Designer.T("Sortable data grid", "可排序数据网格"); }
+        if (ft == 42) { return Designer.T("Image / slide carousel", "图片 / 幻灯轮播"); }
+        if (ft == 43) { return Designer.T("Bar chart", "柱状图"); }
+        if (ft == 44) { return Designer.T("Truncated text with ellipsis", "带省略号的截断文本"); }
+        if (ft == 45) { return Designer.T("Titled content panel", "带标题内容面板"); }
+        if (ft == 46) { return Designer.T("Vertical scrollbar", "垂直滚动条"); }
+        if (ft == 47) { return Designer.T("Loading indicator", "加载指示器"); }
+        if (ft == 48) { return Designer.T("Dropdown trigger", "下拉触发器"); }
+        if (ft == 49) { return Designer.T("Floating action button", "悬浮操作按钮"); }
+        if (ft == 50) { return Designer.T("Anchored popover", "锚定气泡卡片"); }
+        if (ft == 51) { return Designer.T("Inline confirm popover", "内联确认气泡"); }
+        if (ft == 52) { return Designer.T("Notification toast", "通知提示"); }
+        if (ft == 53) { return Designer.T("Command ribbon", "命令功能区"); }
+        if (ft == 54) { return Designer.T("Standalone icon", "独立图标"); }
+        if (ft == 55) { return Designer.T("Right-click context menu (component tray)", "右键上下文菜单（组件托盘）"); }
+        if (ft == 56) { return Designer.T("Popup layer / overlay (component tray)", "弹出层 / 遮罩（组件托盘）"); }
+        if (ft == 57) { return Designer.T("Interval timer (component tray)", "定时器（组件托盘）"); }
+        return Designer.T("Form field", "表单字段");
+    }
+
+    /// Maps a field type to a Segoe MDL2 icon name for the palette.
+    string FieldIcon(int ft) {
+        if (ft == 0) { return "edit"; }
+        if (ft == 1) { return "menu"; }
+        if (ft == 2) { return "lock"; }
+        if (ft == 3) { return "sort"; }
+        if (ft == 4) { return "like"; }
+        if (ft == 5) { return "check"; }
+        if (ft == 6) { return "chevron-down"; }
+        if (ft == 7) { return "settings"; }
+        if (ft == 8) { return "star"; }
+        if (ft == 9) { return "more"; }
+        if (ft == 10) { return "calendar"; }
+        if (ft == 11) { return "clock"; }
+        if (ft == 12) { return "upload"; }
+        if (ft == 13) { return "color"; }
+        if (ft == 14) { return "font"; }
+        if (ft == 15) { return "font"; }
+        if (ft == 16) { return "align-left"; }
+        if (ft == 17) { return "minus"; }
+        if (ft == 18) { return "grid"; }
+        if (ft == 19) { return "pin"; }
+        if (ft == 20) { return "bell"; }
+        if (ft == 21) { return "user"; }
+        if (ft == 22) { return "sort"; }
+        if (ft == 23) { return "table"; }
+        if (ft == 24) { return "more"; }
+        if (ft == 25) { return "folder"; }
+        if (ft == 26) { return "chevron-down"; }
+        if (ft == 27) { return "file"; }
+        if (ft == 28) { return "warning"; }
+        if (ft == 29) { return "refresh"; }
+        if (ft == 30) { return "success"; }
+        if (ft == 31) { return "copy"; }
+        if (ft == 32) { return "refresh"; }
+        if (ft == 33) { return "info"; }
+        if (ft == 34) { return "check"; }
+        if (ft == 35) { return "chevron-right"; }
+        if (ft == 36) { return "layout"; }
+        if (ft == 37) { return "more"; }
+        if (ft == 38) { return "menu"; }
+        if (ft == 39) { return "arrow-left"; }
+        if (ft == 40) { return "menu"; }
+        if (ft == 41) { return "grid"; }
+        if (ft == 42) { return "image"; }
+        if (ft == 43) { return "sort"; }
+        if (ft == 44) { return "more"; }
+        if (ft == 45) { return "layout"; }
+        if (ft == 46) { return "more"; }
+        if (ft == 47) { return "refresh"; }
+        if (ft == 48) { return "chevron-down"; }
+        if (ft == 49) { return "plus"; }
+        if (ft == 50) { return "info"; }
+        if (ft == 51) { return "warning"; }
+        if (ft == 52) { return "bell"; }
+        if (ft == 53) { return "grid"; }
+        if (ft == 54) { return "star"; }
+        if (ft == 55) { return "menu"; }
+        if (ft == 56) { return "copy"; }
+        if (ft == 57) { return "clock"; }
+        return "file";
+    }
+
+    /// Renders a small (height 28) button and returns its id. Used throughout
+    /// the inspector so controls fit inside compact rows.
+    int SmallBtn(App app, string text, int type, int x, int y, int w) {
+        Button b = new Button { Text = text, Class = "small " + Style.TypeClass(type) };
+        return b.Render(app, x, y, w);
+    }
+
+    /// Small (height 28) icon-only button — same footprint as SmallBtn but the
+    /// label is a vector Icon glyph instead of a text character.
+    int SmallIconBtn(App app, string iconName, int type, int x, int y, int w) {
+        Button b = new Button { Icon = iconName,
+                                Class = "circle small " + Style.TypeClass(type) };
+        return b.Render(app, x, y, w);
+    }
+
+    // --- Form preview --------------------------------------------------------
+}

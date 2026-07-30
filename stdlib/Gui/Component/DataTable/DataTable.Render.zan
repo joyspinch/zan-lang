@@ -1,0 +1,1936 @@
+using System;
+using Gui;
+using Gui.Widget;
+using Gui.Backend;
+
+namespace Gui.Component.DataTable;
+
+/// DataTable part: cell rendering (conditional formatting, cell types)
+/// and the virtualised main render path (header / body / footer /
+/// interaction).
+partial class DataTable {
+    // ---------- cell rendering ----------
+
+    /// `fgOverride` is a packed colour from the state's CellStyler, or 0 for
+    /// none. It replaces the theme's text colour on plain and link cells, but a
+    /// conditional-format colour still wins — there, the colour *is* the
+    /// information the cell carries.
+    static void DrawCell(App app, DataColumn col, string val, int cx, int cy, int cw, int rowH, double cfLo, double cfHi, int fgOverride) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int fs = t.fontSizeMedium;
+        int pad = t.paddingSmall;
+        int innerW = cw - pad * 2;
+
+        // ---- conditional formatting (plain text/numeric cells only) ----
+        int cfText = t.textPrimary;
+        if (fgOverride != 0) { cfText = fgOverride; }
+        if (col.cfMode != 0 && col.cellType == 0) {
+            double v = DataTable.ParseReal(val);
+            if (col.cfMode == 1) {
+                // data bar proportional to value across the column's min..max
+                double span = cfHi - cfLo;
+                if (span <= 0.0) { span = 1.0; }
+                int frac = (int)((v - cfLo) * 100.0 / span);
+                if (frac < 0) { frac = 0; }
+                if (frac > 100) { frac = 100; }
+                int barH = rowH - app.Scale(8);
+                int barY = cy + app.Scale(4);
+                int barW = frac * innerW / 100;
+                int tint = DataTable.ColorAlpha(col.cfColor, 95);
+                int rad = app.Scale(2);
+                if (barW > 0) {
+                    // Clean flat data bar with a slight corner radius; fall back to
+                    // a plain rect when the bar is too short to round without the
+                    // straight-segment math underflowing.
+                    if (barW < rad * 2) { c.FillRect(cx + pad, barY, barW, barH, tint); }
+                    else { c.FillRoundRect(cx + pad, barY, barW, barH, rad, tint); }
+                }
+                string sb = DataTable.Truncate(DataTable.FormatCell(col, val), fs, innerW);
+                int twb = Canvas.MeasureText(sb, fs);
+                int tyb = cy + (rowH - Canvas.FontHeight(fs)) / 2;
+                c.DrawText(cx + cw - pad - twb, tyb, sb, cfText, fs);
+                return;
+            } else if (col.cfMode == 2) {
+                // Scale the 0..1 position to a 0..1000 integer ramp so the lerp
+                // keeps its integer signature while fractional columns still
+                // spread across the gradient.
+                double cspan = cfHi - cfLo;
+                if (cspan <= 0.0) { cspan = 1.0; }
+                int pos = (int)((v - cfLo) * 1000.0 / cspan);
+                if (pos < 0) { pos = 0; }
+                if (pos > 1000) { pos = 1000; }
+                c.FillRect(cx, cy, cw, rowH, DataTable.LerpColor(col.cfColor, col.cfColor2, pos, 1000));
+            } else if (col.cfMode == 3 && v > (double)col.cfThreshold) {
+                c.FillRect(cx, cy, cw, rowH, DataTable.ColorAlpha(col.cfColor, 38));
+                cfText = col.cfColor;
+            } else if (col.cfMode == 4 && v < (double)col.cfThreshold) {
+                c.FillRect(cx, cy, cw, rowH, DataTable.ColorAlpha(col.cfColor, 38));
+                cfText = col.cfColor;
+            }
+        }
+
+        // ---- bool: a checkbox, a check/cross glyph, or plain text ----
+        if (col.isBool) {
+            bool on = DataTable.ParseBool(val);
+            if (col.boolStyle == 2) {
+                string bt = col.boolFalse;
+                if (on) { bt = col.boolTrue; }
+                int btw = Canvas.MeasureText(bt, fs);
+                int btx = cx + (cw - btw) / 2;
+                if (col.align == 0) { btx = cx + pad; }
+                if (col.align == 2) { btx = cx + cw - pad - btw; }
+                c.DrawText(btx, cy + (rowH - Canvas.FontHeight(fs)) / 2, bt, cfText, fs);
+                return;
+            }
+            int box = app.Scale(16);
+            int bx = cx + (cw - box) / 2;
+            int by = cy + (rowH - box) / 2;
+            int ins = app.Scale(3);
+            if (col.boolStyle == 1) {
+                // Glyph style: no frame, just a green check or a muted cross.
+                if (on) { c.DrawGlyph("check", bx + ins, by + ins, box - ins * 2, t.success); }
+                else { c.DrawGlyph("close", bx + ins, by + ins, box - ins * 2, t.textTertiary); }
+                return;
+            }
+            if (on) {
+                c.FillRoundRect(bx, by, box, box, t.borderRadiusSmall, t.primary);
+                c.DrawGlyph("check", bx + ins, by + ins, box - ins * 2, t.textInverse);
+            } else {
+                c.FillRoundRect(bx, by, box, box, t.borderRadiusSmall, t.bgPrimary);
+                c.DrawRect(bx, by, box, box, t.borderPrimary, 1);
+            }
+            return;
+        }
+
+        if (col.cellType == 3) {
+            int pct = DataTable.ParseInt(val);
+            if (pct < 0) { pct = 0; }
+            if (pct > 100) { pct = 100; }
+            int barH = app.Scale(6);
+            int barY = cy + (rowH - barH) / 2;
+            int barW = innerW - app.Scale(40);
+            if (barW < app.Scale(20)) { barW = app.Scale(20); }
+            c.FillRoundRect(cx + pad, barY, barW, barH, barH / 2, t.bgTertiary);
+            int fillW = pct * barW / 100;
+            int barColor = t.primary;
+            if (pct >= 100) { barColor = t.success; }
+            c.FillRoundRect(cx + pad, barY, fillW, barH, barH / 2, barColor);
+            int txtY = cy + (rowH - Canvas.FontHeight(t.fontSizeSmall)) / 2;
+            c.DrawText(cx + pad + barW + app.Scale(6), txtY, Convert.ToString(pct) + "%", t.textSecondary, t.fontSizeSmall);
+            return;
+        }
+
+        if (col.cellType == 2) {
+            int tc = DataTable.TypeColor(t, col.tagType);
+            int tagH = t.heightSmall;
+            int tagY = cy + (rowH - tagH) / 2;
+            string label = DataTable.Truncate(val, t.fontSizeSmall, innerW - pad * 2);
+            int tagW = Canvas.MeasureText(label, t.fontSizeSmall) + pad * 2;
+            int tagX = cx + pad;
+            if (col.align == 1) { tagX = cx + (cw - tagW) / 2; }
+            c.FillRoundRect(tagX, tagY, tagW, tagH, t.borderRadiusSmall, t.bgSecondary);
+            c.DrawRect(tagX, tagY, tagW, tagH, tc, 1);
+            int txtY = tagY + (tagH - Canvas.FontHeight(t.fontSizeSmall)) / 2;
+            c.DrawText(tagX + pad, txtY, label, tc, t.fontSizeSmall);
+            return;
+        }
+
+        if (col.cellType == 4) {
+            int dotR = app.Scale(4);
+            int dotColor = t.success;
+            if (val == "0" || val == "" || val == "Offline" || val == "Idle" || val == "Inactive" || val == "Closed") { dotColor = t.textTertiary; }
+            int cxc = cx + pad + dotR;
+            if (col.align == 1) { cxc = cx + cw / 2 - Canvas.MeasureText(val, fs) / 2 - dotR - app.Scale(4); }
+            c.FillCircle(cxc, cy + rowH / 2, dotR, dotColor);
+            int txtY = cy + (rowH - Canvas.FontHeight(fs)) / 2;
+            c.DrawText(cxc + dotR + app.Scale(4), txtY, val, cfText, fs);
+            return;
+        }
+
+        int color = cfText;
+        if (col.cellType == 1 && fgOverride == 0) { color = t.primary; }
+        string shown = DataTable.Truncate(DataTable.FormatCell(col, val), fs, innerW);
+        int tw = Canvas.MeasureText(shown, fs);
+        int tx = cx + pad;
+        if (col.align == 1) { tx = cx + (cw - tw) / 2; }
+        if (col.align == 2) { tx = cx + cw - pad - tw; }
+        int ty = cy + (rowH - Canvas.FontHeight(fs)) / 2;
+        c.DrawText(tx, ty, shown, color, fs);
+    }
+
+    // ---------- frozen-band geometry ----------
+    // The data region is three side-by-side strips: 0 frozen-left, 1 scrolling,
+    // 2 frozen-right. Every pass asks these three for its strip rather than
+    // recomputing the arithmetic, so the header, filter row, cells and summary
+    // cannot drift apart.
+
+    static int BandLeft(int band, int firstDataX, int bandX, int rightX) {
+        if (band == 0) { return firstDataX; }
+        if (band == 2) { return rightX; }
+        return bandX;
+    }
+
+    static int BandRight(int band, int firstDataX, int bandX, int bandW,
+                         int rightX, int pinnedW, int pinnedRW, int clipRight) {
+        if (band == 0) { return firstDataX + pinnedW; }
+        if (band == 2) { return rightX + pinnedRW; }
+        int r = bandX + bandW;
+        if (r > clipRight) { r = clipRight; }
+        return r;
+    }
+
+    static void PushBandClip(Canvas c, int band, int firstDataX, int bandX, int bandW,
+                             int rightX, int pinnedW, int pinnedRW,
+                             int y, int h, int clipRight) {
+        int l = DataTable.BandLeft(band, firstDataX, bandX, rightX);
+        int r = DataTable.BandRight(band, firstDataX, bandX, bandW, rightX,
+                                    pinnedW, pinnedRW, clipRight);
+        int w = r - l;
+        if (w < 0) { w = 0; }
+        c.PushClip(l, y, w, h);
+    }
+
+    // ---------- group panel ----------
+
+    /// Chip x positions and widths for the group panel, outer-to-inner. Shared
+    /// by the strip's painting, its hit tests and the header drop, so all three
+    /// agree on the geometry by construction.
+    static void GroupChipLayout(App app, List<DataColumn> cols, DataTableState st,
+                                int x, List<int> outX, List<int> outW) {
+        Theme t = app.theme;
+        int fs = t.fontSizeSmall;
+        int cx = x + app.Scale(10);
+        int i = 0;
+        while (i < st.groupCols.Count) {
+            int w = Canvas.MeasureText(cols[st.groupCols[i]].title, fs) + app.Scale(38);
+            outX.Add(cx);
+            outW.Add(w);
+            cx = cx + w + app.Scale(8);
+            i = i + 1;
+        }
+    }
+
+    /// Insertion slot (0..count) the pointer addresses: the number of chips whose
+    /// midpoint sits left of it.
+    static int GroupDropSlot(App app, List<int> cxs, List<int> cws) {
+        int slot = 0;
+        int i = 0;
+        while (i < cxs.Count) {
+            if (app.mouseX > cxs[i] + cws[i] / 2) { slot = i + 1; }
+            i = i + 1;
+        }
+        return slot;
+    }
+
+    /// The grouping strip above the header: one chip per grouped column
+    /// (outer-to-inner) with a remove button, an insertion indicator while
+    /// something is dragged over it, and a hint while the table is flat.
+    /// `headerDrag` is true while a column header is being dragged, so the strip
+    /// can advertise itself as a drop target.
+    static void RenderGroupPanel(App app, int x, int y, int viewW, int h,
+                                 List<DataColumn> cols, DataTableState st,
+                                 bool headerDrag) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int fs = t.fontSizeSmall;
+        bool over = app.mouseX >= x && app.mouseX < x + viewW
+                    && app.mouseY >= y && app.mouseY < y + h;
+        int bg = t.bgTertiary;
+        if (headerDrag && over) { bg = t.bgActive; }
+        c.FillRect(x, y, viewW, h, bg);
+        c.FillRect(x, y + h - 1, viewW, 1, t.divider);
+        c.PushClip(x, y, viewW, h);
+
+        List<int> cxs = new List<int>();
+        List<int> cws = new List<int>();
+        DataTable.GroupChipLayout(app, cols, st, x, cxs, cws);
+        int chipH = h - app.Scale(10);
+        int chipY = y + app.Scale(5);
+
+        if (st.groupCols.Count == 0) {
+            c.DrawText(x + app.Scale(10), y + (h - Canvas.FontHeight(fs)) / 2,
+                       "Drag a column header here to group by it",
+                       t.textTertiary, fs);
+        }
+
+        int i = 0;
+        while (i < st.groupCols.Count) {
+            int col = st.groupCols[i];
+            int cxp = cxs[i];
+            int cwp = cws[i];
+            bool dragged = st.dragChip == col;
+            int fill = t.bgSecondary;
+            if (dragged) { fill = t.primary; }
+            c.FillRoundRect(cxp, chipY, cwp, chipH, chipH / 2, fill);
+            int lc = t.textPrimary;
+            if (dragged) { lc = t.textInverse; }
+            int rsz = app.Scale(14);
+            int rx = cxp + cwp - rsz - app.Scale(6);
+            int ry = chipY + (chipH - rsz) / 2;
+            string lbl = DataTable.Truncate(cols[col].title, fs,
+                                            rx - cxp - app.Scale(14));
+            c.DrawText(cxp + app.Scale(10),
+                       chipY + (chipH - Canvas.FontHeight(fs)) / 2, lbl, lc, fs);
+            int rmId = app.focus.AllocId();
+            c.DrawGlyphIn("close", rx, ry, rsz, rsz, app.Scale(10), lc);
+            app.hitTester.Register(HitRegion.Create(rmId, rx, ry, rsz, rsz, 0));
+            int chipId = app.focus.AllocId();
+            app.hitTester.Register(HitRegion.Create(chipId, cxp, chipY,
+                                                    rx - cxp, chipH, 0));
+            if (app.EventKind() == 3 && app.window.EventButton() == 0
+                && app.hitTester.HitTest(app.mouseX, app.mouseY) == rmId) {
+                DataTable.UngroupOne(st, col);
+                st.GroupChanged.Raise();
+                app.RequestRedraw();
+            }
+            if (app.EventKind() == 2 && app.window.EventButton() == 0
+                && app.hitTester.HitTest(app.mouseX, app.mouseY) == chipId) {
+                st.dragChip = col;
+                app.RequestRedraw();
+            }
+            i = i + 1;
+        }
+
+        if (st.dragChip >= 0 || (headerDrag && over)) {
+            int slot = DataTable.GroupDropSlot(app, cxs, cws);
+            int lineX = x + app.Scale(6);
+            if (slot > 0) { lineX = cxs[slot - 1] + cws[slot - 1] + app.Scale(2); }
+            c.FillRect(lineX, chipY, app.Scale(2), chipH, t.primary);
+        }
+        c.PopClip();
+
+        // Finalize a chip drag on release (the App clears the press before this
+        // render runs, exactly as for the header drag).
+        if (st.dragChip >= 0 && app.focus.pressedId < 0) {
+            int from = DataTable.GroupDepth(st, st.dragChip);
+            int dst = DataTable.GroupDropSlot(app, cxs, cws);
+            if (dst > from) { dst = dst - 1; }
+            if (from >= 0 && dst != from) {
+                DataTable.MoveGroup(st, st.dragChip, dst);
+                st.GroupChanged.Raise();
+            }
+            st.dragChip = -1;
+            app.RequestRedraw();
+        }
+    }
+
+    // ---------- main render ----------
+
+    /// Convenience overload: render an in-memory List<DataRow> (wraps it in a
+    /// RowListSource). For large / virtual data, use RenderSource with a custom
+    /// DataSource subclass instead.
+    static void Render(App app, int x, int y, int viewW, int viewH,
+                       List<DataColumn> cols, List<DataRow> rows, DataTableState st) {
+        DataTable.RenderSource(app, x, y, viewW, viewH, cols, RowListSource.Create(rows), st);
+    }
+
+    /// Render prologue: resolve all per-frame layout geometry into a
+    /// DataTableFrame — ensure/sync/recompute state, header & band metrics,
+    /// row-number/select gutters, frozen-band widths and per-column screen x,
+    /// and paint the group panel. Every later pass reads the frame instead of
+    /// recomputing geometry.
+    static DataTableFrame ComputeFrame(App app, int x, int y, int viewW, int viewH,
+                       List<DataColumn> cols, DataSource src, DataTableState st) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+
+        DataTable.EnsureInit(st, cols, src);
+        DataTable.SyncBindings(st);
+        DataTable.Recompute(st, cols, src);
+
+        int titleRowH = t.heightMedium;
+        int rowH = t.heightMedium;
+        int fs = t.fontSizeMedium;
+        // Band rows sit above the column titles and are a little shorter — they
+        // carry a group name, not a sort arrow or a filter icon. `headerH` stays
+        // the full header height, so every later measurement (body top, menu
+        // anchors, the outside-click test) keeps working unchanged.
+        int bandRowH = t.heightSmall;
+        int bandLevels = 0;
+        int headerH = titleRowH;
+
+        // The group panel is a strip above the header, so it moves the header's
+        // top edge down while `y` stays the widget's own top. Every vertical
+        // measurement below is taken from `hdrY`, which equals `y` when the strip
+        // is hidden — so a table without the panel lays out exactly as before.
+        int groupPanelH = 0;
+        if (st.showGroupPanel) { groupPanelH = app.Scale(34); }
+        int hdrY = y + groupPanelH;
+        int panelY = y;
+        if (st.showGroupPanel) {
+            DataTable.RenderGroupPanel(app, x, panelY, viewW, groupPanelH, cols, st,
+                                       st.dragCol >= 0 && st.dragColMoved);
+        }
+        y = hdrY;
+        viewH = viewH - groupPanelH;
+
+        int numW = 0;
+        if (st.showRowNum) {
+            // Wide enough for the largest row number so 7-digit counts never
+            // spill into the neighbouring column.
+            numW = app.Scale(46);
+            int needW = Canvas.MeasureText(Convert.ToString(src.RowCount()), t.fontSizeSmall)
+                        + app.Scale(16);
+            if (needW > numW) { numW = needW; }
+        }
+        int selW = 0;
+        if (st.showSelect) { selW = app.Scale(40); }
+
+        int gridColor = t.divider;
+        int menuIconW = app.Scale(22);
+
+        // Right edge that content may not spill past (leaves room for the
+        // vertical scrollbar). Columns whose right side would exceed this are
+        // clamped, and any column starting beyond it is skipped — so cells and
+        // headers never draw outside the table's own border.
+        int sbGutter = app.Scale(12);
+        int clipRight = x + viewW - sbGutter;
+
+        // total data width (hidden columns contribute nothing)
+        int dataW = 0;
+        int ci = 0;
+        while (ci < st.colWidths.Count) {
+            if (!st.colHidden[ci]) { dataW = dataW + st.colWidths[ci]; }
+            ci = ci + 1;
+        }
+        int totalW = numW + selW + dataW;
+
+        // Columns keep their natural widths; when the total exceeds the
+        // available band the data region pans horizontally (st.scrollX) and
+        // only the visible column window is drawn — so wide tables scroll
+        // instead of squeezing every column into the viewport. Hidden columns
+        // collapse to zero width; frozen (pinned) and grouped columns are
+        // hoisted to the front of the visible order.
+        int availData = clipRight - (x + numW + selW);
+        if (availData < app.Scale(80)) { availData = app.Scale(80); }
+        st.dispW.Clear();
+        int di = 0;
+        while (di < st.colWidths.Count) {
+            if (st.colHidden[di]) { st.dispW.Add(0); }
+            else { st.dispW.Add(st.colWidths[di]); }
+            di = di + 1;
+        }
+        int firstDataX = x + numW + selW;
+        int dataViewW = clipRight - firstDataX;
+
+        // Column display order, sliced into three bands: [frozen-left |
+        // scrolling | frozen-right]. Computed once and shared by every layout
+        // pass so header / filter row / cells / hit-test / summary stay aligned
+        // by construction.
+        List<int> vorder = DataTable.VisibleOrder(st, cols);
+        int nLeft = DataTable.LeftFrozenCount(st, vorder);
+        int nRight = DataTable.RightFrozenCount(st, vorder);
+        int pinnedW = DataTable.PinnedWidth(st);
+        int pinnedRW = DataTable.PinnedRightWidth(st);
+        // The frozen bands may not eat the whole table: past that point there
+        // would be nothing left to scroll and the middle would be unreachable,
+        // so the right band yields first (it is the one the user just added).
+        int minBand = app.Scale(80);
+        while (nRight > 0 && dataViewW - pinnedW - pinnedRW < minBand) {
+            pinnedRW = pinnedRW - st.dispW[vorder[vorder.Count - nRight]];
+            nRight = nRight - 1;
+        }
+        while (nLeft > 1 && dataViewW - pinnedW - pinnedRW < minBand) {
+            nLeft = nLeft - 1;
+            pinnedW = pinnedW - st.dispW[vorder[nLeft]];
+        }
+        // Only the middle band scrolls, so only its overflow sets the range.
+        int bandX = firstDataX + pinnedW;                  // left edge of the middle
+        int bandW = dataViewW - pinnedW - pinnedRW;        // its width
+        if (bandW < 1) { bandW = 1; }
+        int bandNatW = 0;
+        int bi = nLeft;
+        while (bi < vorder.Count - nRight) { bandNatW = bandNatW + st.dispW[vorder[bi]]; bi = bi + 1; }
+        int maxScrollX = bandNatW - bandW;
+        if (maxScrollX < 0) { maxScrollX = 0; }
+        if (st.scrollX > maxScrollX) { st.scrollX = maxScrollX; }
+        if (st.scrollX < 0) { st.scrollX = 0; }
+        int rightX = firstDataX + dataViewW - pinnedRW;    // left edge of the right band
+
+        // Header height is known only now: a banded table grows one row per
+        // nesting level above the titles. The column titles keep their own row
+        // at the bottom, so `y + headerH` still means "below the whole header".
+        bandLevels = DataTable.BandLevels(cols, vorder);
+        headerH = titleRowH + bandLevels * bandRowH;
+        int titleTop = y + bandLevels * bandRowH;
+
+        // Screen x and owning band for every entry of `vorder`, computed once.
+        // Each band is clipped to its own strip, so a scrolled middle column can
+        // never paint (or register a hit region) over a frozen one — which makes
+        // the drawing order between the bands irrelevant, and keeps all four
+        // passes below to a single loop each.
+        List<int> colX = new List<int>();
+        List<int> colBand = new List<int>();
+        int cxAcc = firstDataX;
+        int bpos = 0;
+        while (bpos < vorder.Count) {
+            if (bpos == nLeft) { cxAcc = bandX - st.scrollX; }
+            if (bpos == vorder.Count - nRight) { cxAcc = rightX; }
+            colX.Add(cxAcc);
+            if (bpos < nLeft) { colBand.Add(0); }
+            else if (bpos >= vorder.Count - nRight) { colBand.Add(2); }
+            else { colBand.Add(1); }
+            cxAcc = cxAcc + st.dispW[vorder[bpos]];
+            bpos = bpos + 1;
+        }
+        DataTableFrame f = new DataTableFrame();
+        f.y = y;
+        f.viewH = viewH;
+        f.numW = numW;
+        f.selW = selW;
+        f.gridColor = gridColor;
+        f.menuIconW = menuIconW;
+        f.clipRight = clipRight;
+        f.firstDataX = firstDataX;
+        f.dataViewW = dataViewW;
+        f.titleRowH = titleRowH;
+        f.rowH = rowH;
+        f.fs = fs;
+        f.bandRowH = bandRowH;
+        f.bandLevels = bandLevels;
+        f.headerH = headerH;
+        f.titleTop = titleTop;
+        f.pinnedW = pinnedW;
+        f.pinnedRW = pinnedRW;
+        f.bandX = bandX;
+        f.bandW = bandW;
+        f.bandNatW = bandNatW;
+        f.maxScrollX = maxScrollX;
+        f.rightX = rightX;
+        f.panelY = panelY;
+        f.groupPanelH = groupPanelH;
+        f.vorder = vorder;
+        f.colX = colX;
+        f.colBand = colBand;
+        return f;
+    }
+
+    static void RenderSource(App app, int x, int y, int viewW, int viewH,
+                       List<DataColumn> cols, DataSource src, DataTableState st) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+
+        DataTableFrame f = DataTable.ComputeFrame(app, x, y, viewW, viewH, cols, src, st);
+        int numW = f.numW;
+        int selW = f.selW;
+        int gridColor = f.gridColor;
+        int menuIconW = f.menuIconW;
+        int clipRight = f.clipRight;
+        int firstDataX = f.firstDataX;
+        int dataViewW = f.dataViewW;
+        int titleRowH = f.titleRowH;
+        int rowH = f.rowH;
+        int fs = f.fs;
+        int bandRowH = f.bandRowH;
+        int bandLevels = f.bandLevels;
+        int headerH = f.headerH;
+        int titleTop = f.titleTop;
+        int pinnedW = f.pinnedW;
+        int pinnedRW = f.pinnedRW;
+        int bandX = f.bandX;
+        int bandW = f.bandW;
+        int bandNatW = f.bandNatW;
+        int maxScrollX = f.maxScrollX;
+        int rightX = f.rightX;
+        int panelY = f.panelY;
+        int groupPanelH = f.groupPanelH;
+        List<int> vorder = f.vorder;
+        List<int> colX = f.colX;
+        List<int> colBand = f.colBand;
+        y = f.y;
+        viewH = f.viewH;
+
+        // outer border
+        c.FillRoundRect(x, y, viewW, viewH, t.borderRadiusMedium, t.bgPrimary);
+        c.DrawRect(x, y, viewW, viewH, t.borderPrimary, 1);
+
+        // ---------------- header ----------------
+        c.FillRect(x, y, viewW, headerH, t.bgSecondary);
+        int hx = x;
+
+        if (st.showRowNum) {
+            c.DrawTextCentered(hx, y, numW, headerH, "#", t.textTertiary, t.fontSizeSmall);
+            hx = hx + numW;
+            c.FillRect(hx, y, 1, headerH, gridColor);
+        }
+        if (st.showSelect) {
+            // select-all checkbox
+            int allId = app.focus.AllocId();
+            bool allChecked = st.order.Count > 0;
+            int oi = 0;
+            while (oi < st.order.Count) {
+                if (!st.selected[st.order[oi]]) { allChecked = false; oi = st.order.Count; } else { oi = oi + 1; }
+            }
+            int box = app.Scale(16);
+            int bx = hx + (selW - box) / 2;
+            int by = y + (headerH - box) / 2;
+            if (allChecked) {
+                c.FillRoundRect(bx, by, box, box, t.borderRadiusSmall, t.primary);
+                int ins = app.Scale(3);
+                c.DrawGlyph("check", bx + ins, by + ins, box - ins * 2, t.textInverse);
+            } else {
+                c.FillRoundRect(bx, by, box, box, t.borderRadiusSmall, t.bgPrimary);
+                c.DrawRect(bx, by, box, box, t.borderPrimary, 1);
+            }
+            app.hitTester.Register(HitRegion.Create(allId, hx, y, selW, headerH, 0));
+            if (app.EventKind() == 3 && app.window.EventButton() == 0 && app.hitTester.HitTest(app.mouseX, app.mouseY) == allId) {
+                bool target = !allChecked;
+                int k = 0;
+                while (k < st.order.Count) { st.selected[st.order[k]] = target; k = k + 1; }
+                st.SelectionChanged.Raise();
+                app.RequestRedraw();
+            }
+            hx = hx + selW;
+            c.FillRect(hx, y, 1, headerH, gridColor);
+        }
+
+        // ---------------- band rows (multi-level header) ----------------
+        // One row per nesting level above the titles. A span covers a run of
+        // adjacent slots in the visible order, so it is clipped to its own
+        // frozen strip exactly like the columns underneath it — a group split
+        // by a freeze boundary simply draws as two spans, one per band, which
+        // is also what it means: those columns are no longer adjacent.
+        int blv = 0;
+        while (blv < bandLevels) {
+            int by0 = y + blv * bandRowH;
+            List<BandSpan> spans = DataTable.BandRow(st, cols, vorder, blv);
+            int si = 0;
+            while (si < spans.Count) {
+                BandSpan sp = spans[si];
+                // A span is only ever drawn inside one strip; a run crossing a
+                // band boundary is emitted once per strip it touches.
+                int seg = sp.from;
+                while (seg < sp.to) {
+                    int segBand = colBand[seg];
+                    int segEnd = seg;
+                    while (segEnd < sp.to && colBand[segEnd] == segBand) { segEnd = segEnd + 1; }
+                    int sx0 = colX[seg];
+                    int sx1 = colX[segEnd - 1] + st.dispW[vorder[segEnd - 1]];
+                    int sbL = DataTable.BandLeft(segBand, firstDataX, bandX, rightX);
+                    int sbR = DataTable.BandRight(segBand, firstDataX, bandX, bandW,
+                                                  rightX, pinnedW, pinnedRW, clipRight);
+                    if (sx1 > sbL && sx0 < sbR) {
+                        DataTable.PushBandClip(c, segBand, firstDataX, bandX, bandW, rightX,
+                                               pinnedW, pinnedRW, by0, bandRowH, clipRight);
+                        int vx0 = sx0;
+                        if (vx0 < sbL) { vx0 = sbL; }
+                        int vx1 = sx1;
+                        if (vx1 > sbR) { vx1 = sbR; }
+                        c.FillRect(sx0, by0, sx1 - sx0, bandRowH - 1, t.bgTertiary);
+                        c.FillRect(sx1 - 1, by0, 1, bandRowH, gridColor);
+
+                        // The chevron reads as "there is more here", so it is
+                        // only offered on the segment that owns the band's first
+                        // column — collapsing from a fragment on the far side of
+                        // a freeze would fold columns the user isn't looking at.
+                        int capX = sx0;
+                        int capW = sx1 - sx0;
+                        bool owner = seg == sp.from;
+                        if (owner) {
+                            int chev = app.Scale(14);
+                            int chId = app.focus.AllocId();
+                            string chIcon = "chevron-down";
+                            if (DataTable.BandIsCollapsed(st, sp.path)) { chIcon = "chevron-right"; }
+                            int chX = sx0 + app.Scale(4);
+                            c.DrawGlyphIn(chIcon, chX, by0, chev, bandRowH,
+                                                app.Scale(11), t.textTertiary);
+                            app.hitTester.Register(HitRegion.Create(chId, chX, by0, chev, bandRowH, 0));
+                            if (app.EventKind() == 3 && app.window.EventButton() == 0
+                                && app.hitTester.HitTest(app.mouseX, app.mouseY) == chId) {
+                                DataTable.ToggleBand(st, cols, sp.path);
+                                st.BandToggled.Raise();
+                                app.RequestRedraw();
+                            }
+                            capX = chX + chev;
+                            capW = sx1 - capX;
+                        }
+                        int capPad = app.Scale(4);
+                        capW = capW - capPad * 2;
+                        if (capW < 0) { capW = 0; }
+                        string capT = DataTable.Truncate(sp.label, t.fontSizeSmall, capW);
+                        c.DrawTextCentered(capX + capPad, by0, capW, bandRowH, capT,
+                                           t.textSecondary, t.fontSizeSmall);
+                        c.PopClip();
+                    }
+                    seg = segEnd;
+                }
+                si = si + 1;
+            }
+            c.FillRect(x, by0 + bandRowH - 1, viewW, 1, gridColor);
+            blv = blv + 1;
+        }
+
+        // Column drag-reorder in progress this frame (a header title is held and
+        // the pointer has moved past the start threshold). dropVisLocal is the
+        // visual slot the dragged column would land before; dropX is its screen x.
+        bool colDragging = st.dragCol >= 0 && st.dragColMoved;
+        int dropVisLocal = -1;
+        int dropX = -1;
+
+        int hoi = 0;
+        int hcl = firstDataX;
+        int hBand = -1;
+        while (hoi < vorder.Count) {
+            int i = vorder[hoi];
+            DataColumn col = cols[i];
+            int cw = st.dispW[i];
+            // Each band gets its own clip strip, entered when the band changes.
+            // The middle is clipped between the two frozen bands, so a panned
+            // column is cut off at their edges instead of drawing over them.
+            if (colBand[hoi] != hBand) {
+                if (hBand >= 0) { c.PopClip(); }
+                hBand = colBand[hoi];
+                DataTable.PushBandClip(c, hBand, firstDataX, bandX, bandW, rightX,
+                                       pinnedW, pinnedRW, titleTop, titleRowH, clipRight);
+            }
+            hcl = colX[hoi];
+            // Ids are allocated for every column — visible or not — so the id
+            // sequence stays identical across frames while panning; otherwise
+            // widgets registered after the header (scrollbars) would change id
+            // mid-drag whenever a column entered/left the viewport.
+            int titleId = app.focus.AllocId();
+            int menuId = -1;
+            if (col.filterable || col.sortable) { menuId = app.focus.AllocId(); }
+            int rzId = app.focus.AllocId();
+            // Clip the hit region to the band as well as the viewport: a middle
+            // column scrolled under the frozen band must not stay clickable
+            // there, or the user would hit a column they cannot see.
+            int bandL = DataTable.BandLeft(colBand[hoi], firstDataX, bandX, rightX);
+            int bandR = DataTable.BandRight(colBand[hoi], firstDataX, bandX, bandW,
+                                            rightX, pinnedW, pinnedRW, clipRight);
+            if (hcl + cw <= bandL || hcl >= bandR) {
+                hoi = hoi + 1;
+            } else {
+            hx = hcl;
+            // visible slice of this column (for hit regions / hover fill)
+            int visX = hx;
+            if (visX < bandL) { visX = bandL; }
+            int visR = hx + cw;
+            if (visR > bandR) { visR = bandR; }
+            int visW = visR - visX;
+            // drag-reorder drop slot: first column whose left half contains the
+            // pointer becomes the insertion target.
+            if (colDragging && dropVisLocal < 0 && app.mouseX < hx + cw / 2) {
+                dropVisLocal = hoi;
+                dropX = visX;
+            }
+            bool hHover = app.focus.IsHovered(titleId);
+            if (hHover) { c.FillRect(visX, titleTop, visW, titleRowH, t.bgHover); }
+
+            int pad = t.paddingSmall;
+            int availTitle = cw - pad * 2 - menuIconW;
+            string ht = DataTable.Truncate(col.title, fs, availTitle);
+            int ty = titleTop + (titleRowH - Canvas.FontHeight(fs)) / 2;
+            c.DrawText(hx + pad, ty, ht, t.textSecondary, fs);
+
+            // sort indicator — arrow per key, plus a 1-based priority badge when
+            // more than one column feeds a multi-column sort.
+            int spos = DataTable.SortIndexOf(st, i);
+            if (spos >= 0) {
+                string arrow = "arrow-up";
+                if (st.sortKeys[spos].dir == 2) { arrow = "arrow-down"; }
+                int aw = app.Scale(12);
+                int ax = hx + pad + Canvas.MeasureText(ht, fs) + app.Scale(4);
+                c.DrawGlyph(arrow, ax, titleTop + (titleRowH - aw) / 2, aw, t.primary);
+                if (st.sortKeys.Count > 1) {
+                    c.DrawText(ax + aw + app.Scale(1), ty,
+                               Convert.ToString(spos + 1), t.primary, t.fontSizeSmall);
+                }
+            }
+
+            // header menu icon — DevExpress-style: only revealed when the mouse
+            // is over the header cell, when this column has an active filter, or
+            // while its menu is open. `menuId` is always allocated so widget ids
+            // stay stable across frames regardless of the icon's visibility.
+            if (menuId >= 0) {
+                int mIx = hx + cw - menuIconW - app.Scale(2);
+                bool active = st.filters[i].Active();
+                bool cellHover = app.mouseX >= visX && app.mouseX < visR
+                                 && app.mouseY >= titleTop && app.mouseY < titleTop + titleRowH;
+                bool showIcon = active || cellHover || st.openMenu == i;
+                if (showIcon) {
+                    int mColor = t.textTertiary;
+                    if (active) { mColor = t.primary; }
+                    if (app.focus.IsHovered(menuId)) { mColor = t.textPrimary; }
+                    c.DrawGlyphIn("filter", mIx, titleTop, menuIconW, titleRowH, app.Scale(13), mColor);
+                    app.hitTester.Register(HitRegion.Create(menuId, mIx, titleTop, menuIconW, titleRowH, 0));
+                    if (!st.dragColMoved && app.EventKind() == 3 && app.window.EventButton() == 0 && app.hitTester.HitTest(app.mouseX, app.mouseY) == menuId) {
+                        if (st.openMenu == i) { st.openMenu = -1; } else {
+                            st.openMenu = i;
+                            st.filterTab = 0;
+                            st.searchText = "";
+                            st.valScroll = 0;
+                            st.editFocus = 0;
+                            st.batchLines = new List<string>();
+                            st.batchLines.Add("");
+                            st.batchExactFlag = 0;
+                            st.menuVals = DataTable.DistinctFiltered(st, src, i);
+                            st.menuMatched = st.menuVals;
+                            st.menuSearchCache = "";
+                        }
+                        app.RequestRedraw();
+                    }
+                }
+            }
+
+            // header title: press starts a potential drag-reorder; a click (no
+            // drag) cycles the sort. The dragged column is dimmed while moving.
+            int titleW = visW - menuIconW;
+            if (titleW < 0) { titleW = 0; }
+            app.hitTester.Register(HitRegion.Create(titleId, visX, titleTop, titleW, titleRowH, 0));
+            if (app.EventKind() == 2 && app.window.EventButton() == 0 && app.hitTester.HitTest(app.mouseX, app.mouseY) == titleId) {
+                st.dragCol = i;
+                st.dragColStartX = app.mouseX;
+                st.dragColMoved = false;
+            }
+            if (st.dragCol == i && app.focus.pressedId == titleId) {
+                int dd = app.mouseX - st.dragColStartX;
+                if (dd < 0) { dd = 0 - dd; }
+                if (!st.dragColMoved && dd > app.Scale(5)) {
+                    st.dragColMoved = true;
+                }
+                if (st.dragColMoved) { app.RequestRedraw(); }
+            }
+            if (colDragging && st.dragCol == i) {
+                c.FillRect(visX, titleTop, visW, titleRowH, t.bgHover);
+            }
+            if (col.sortable && !st.dragColMoved && app.EventKind() == 3 && app.window.EventButton() == 0 && app.ClickTarget() == titleId) {
+                st.hitCol = i;
+                st.HeaderClick.Raise();
+                bool addSort = Modifiers.HasShift(app.window.EventMods());
+                DataTable.CycleSort(st, i, addSort);
+                st.dirty = true;
+                st.Sort.Raise();
+                app.RequestRedraw();
+            }
+
+            // right-click a header cell => column context menu (sort / auto-fit /
+            // hide). Geometry-based so it wins regardless of the overlapping
+            // title / menu-icon / resize ids registered for this cell.
+            if (app.EventKind() == 2 && app.window.EventButton() == 1
+                && st.openMenu < 0
+                && app.mouseX >= hx && app.mouseX < hx + cw
+                && app.mouseY >= titleTop && app.mouseY < titleTop + titleRowH) {
+                st.hdrCtxOpen = true;
+                st.hdrCtxCol = i;
+                st.hdrCtxX = app.mouseX;
+                st.hdrCtxY = app.mouseY;
+                st.hitCol = i;
+                app.RequestRedraw();
+            }
+
+            // resize handle (right border). Draggable columns get a horizontal
+            // resize cursor (widget type 4); fixed columns show the not-allowed
+            // cursor (widget type 6) so the grip clearly reads as disabled.
+            int rzW = app.Scale(6);
+            int rzX = hx + cw - rzW / 2;
+            int rzCursor = 4;
+            if (!col.resizable) { rzCursor = 6; }
+            app.hitTester.Register(HitRegion.Create(rzId, rzX, titleTop, rzW, titleRowH, rzCursor));
+            if (col.resizable && app.EventKind() == 2 && app.window.EventButton() == 0 && app.PressTarget() == rzId) {
+                st.resizeCol = i;
+                st.resizeStartX = app.mouseX;
+                st.resizeStartW = st.colWidths[i];
+            }
+            if (col.resizable && st.resizeCol == i && app.focus.pressedId == rzId) {
+                int nw = st.resizeStartW + (app.mouseX - st.resizeStartX);
+                if (nw < app.Scale(48)) { nw = app.Scale(48); }
+                if (nw != st.colWidths[i]) {
+                    st.colWidths[i] = nw;
+                    st.hitCol = i;
+                    st.ColumnResize.Raise();
+                    app.RequestRedraw();
+                }
+            }
+
+            if (st.resizeCol == i && app.EventKind() == 3 && app.window.EventButton() == 0) {
+                st.hitCol = i;
+                st.resizeCol = -1;
+                st.ColumnResizeEnd.Raise();
+            }
+
+            c.FillRect(hx + cw, titleTop, 1, titleRowH, gridColor);
+            hoi = hoi + 1;
+            }
+        }
+        if (hBand >= 0) { c.PopClip(); }
+        c.FillRect(x, y + headerH - 1, viewW, 1, gridColor);
+
+        // Column drag feedback + drop: a 2px accent line marks the insertion
+        // boundary and a floating chip follows the pointer. On release the
+        // column is moved before the target slot (or to the end).
+        if (colDragging) {
+            if (dropVisLocal < 0) { dropX = hx; }
+            // The insertion line spans the whole header — including the band
+            // rows, since dropping between two columns can also move one out of
+            // a group — but the chip rides the title row it came from.
+            c.FillRect(dropX - 1, y, app.Scale(2), headerH, t.primary);
+            string dl = cols[st.dragCol].title;
+            int chW = Canvas.MeasureText(dl, fs) + app.Scale(16);
+            int chX = app.mouseX - chW / 2;
+            if (chX < x) { chX = x; }
+            if (chX + chW > x + viewW) { chX = x + viewW - chW; }
+            c.FillRoundRect(chX, titleTop + app.Scale(3), chW, titleRowH - app.Scale(6),
+                            t.borderRadiusSmall, t.primary);
+            c.DrawText(chX + app.Scale(8),
+                       titleTop + (titleRowH - Canvas.FontHeight(fs)) / 2, dl, t.textInverse, fs);
+        }
+        // Remember the drop slot while the button is held, so the finalize below
+        // uses the last live drag position rather than wherever the pointer sits
+        // on the frame that happens to flush the release.
+        if (colDragging && app.focus.pressedId >= 0) { st.dropVis = dropVisLocal; }
+        // Finalize when the button is no longer held. The App clears the press on
+        // mouse-up before this render runs, so `pressedId < 0` reliably marks the
+        // release frame even when the synthetic event's kind is coalesced away.
+        if (st.dragCol >= 0 && app.focus.pressedId < 0) {
+            // Released over the group strip: that is a "group by this column"
+            // gesture at the slot the pointer addresses, not a reorder.
+            bool toPanel = st.showGroupPanel && st.dragColMoved
+                && app.mouseX >= x && app.mouseX < x + viewW
+                && app.mouseY >= panelY && app.mouseY < panelY + groupPanelH;
+            if (toPanel) {
+                List<int> gcx = new List<int>();
+                List<int> gcw = new List<int>();
+                DataTable.GroupChipLayout(app, cols, st, x, gcx, gcw);
+                DataTable.GroupByAt(st, st.dragCol,
+                                    DataTable.GroupDropSlot(app, gcx, gcw));
+                st.GroupChanged.Raise();
+            } else if (st.dragColMoved) {
+                int beforeCol = -1;
+                if (st.dropVis >= 0 && st.dropVis < vorder.Count) {
+                    beforeCol = vorder[st.dropVis];
+                }
+                if (beforeCol != st.dragCol) {
+                    DataTable.MoveColumn(st, st.dragCol, beforeCol);
+                    st.hitCol = st.dragCol;
+                    st.ColumnReorder.Raise();
+                }
+            }
+            st.dragCol = -1;
+            st.dragColMoved = false;
+            st.dropVis = -1;
+            app.RequestRedraw();
+        }
+
+        // ---------------- body (virtualised) ----------------
+        int total = st.dispRows.Count;
+        int summaryH = 0;
+        if (st.showSummary) { summaryH = rowH; }
+        int pagerH = 0;
+        if (st.paged) { pagerH = app.Scale(38); }
+
+        int filterRowH = 0;
+        if (st.showFilterRow) { filterRowH = t.heightMedium; }
+        int statusBarH = 0;
+        if (st.showStatusBar) { statusBarH = app.Scale(28); }
+        int bodyTop = y + headerH + filterRowH;
+        int bodyH = viewH - headerH - filterRowH - summaryH - pagerH - statusBarH;
+        if (bodyH < rowH) { bodyH = rowH; }
+        int visRows = bodyH / rowH;
+        if (visRows < 1) { visRows = 1; }
+
+        // In paged mode the visible window is a whole page; otherwise it is the
+        // virtual-scroll offset.
+        int start = 0;
+        if (st.paged) {
+            st.pageRows = visRows;
+            int totalPages = 1;
+            if (total > 0) { totalPages = (total + visRows - 1) / visRows; }
+            int cur = st.pageModel.Get();
+            if (cur > totalPages) { cur = totalPages; st.pageModel.Set(cur); }
+            if (cur < 1) { cur = 1; st.pageModel.Set(cur); }
+            start = (cur - 1) * visRows;
+        } else {
+            start = st.scrollRow;
+            if (start > total - visRows) { start = total - visRows; }
+            if (start < 0) { start = 0; }
+            st.scrollRow = start;
+        }
+
+        // ---------------- filter row (DevExpress inline quick-filter) ----------------
+        // A row of per-column text inputs just below the header. Clicking any
+        // cell focuses it; typing applies a real-time Contains filter on that
+        // column orthogonally to the popup filter. Only drawn when showFilterRow.
+        if (st.showFilterRow && filterRowH > 0) {
+            int fry = y + headerH;
+            c.FillRect(x + 1, fry, viewW - 2, filterRowH, t.bgSecondary);
+            c.FillRect(x + 1, fry, numW + selW - 2, filterRowH, t.bgTertiary);
+
+            // small funnel icon in the gutter to signal the row's purpose
+            if (st.showRowNum && numW > 0) {
+                c.DrawGlyphIn("filter", x, fry, numW, filterRowH, app.Scale(12), t.textTertiary);
+            }
+
+            int froi = 0;
+            int frBand = -1;
+            while (froi < vorder.Count) {
+                int fri = vorder[froi];
+                int fcw = st.dispW[fri];
+                if (colBand[froi] != frBand) {
+                    if (frBand >= 0) { c.PopClip(); }
+                    frBand = colBand[froi];
+                    DataTable.PushBandClip(c, frBand, firstDataX, bandX, bandW, rightX,
+                                           pinnedW, pinnedRW, fry, filterRowH, clipRight);
+                }
+                int frcl = colX[froi];
+                int frBandL = DataTable.BandLeft(colBand[froi], firstDataX, bandX, rightX);
+                int frBandR = DataTable.BandRight(colBand[froi], firstDataX, bandX, bandW,
+                                                  rightX, pinnedW, pinnedRW, clipRight);
+                if (frcl + fcw > frBandL && frcl < frBandR) {
+                    int pad2 = t.paddingSmall;
+                    bool frFoc = st.filterRowFocusCol == fri;
+                    string frTxt = st.filterRowText[fri];
+                    if (frFoc) { frTxt = st.filterRowBuf; }
+                    int frid2 = app.focus.AllocId();
+                    int frX = frcl;
+                    int frW = fcw;
+                    if (frX < frBandL) { frW = frW - (frBandL - frX); frX = frBandL; }
+                    if (frX + frW > frBandR) { frW = frBandR - frX; }
+                    bool frAct = frTxt.Length > 0 || frFoc;
+                    int frBg = t.bgPrimary;
+                    if (frAct) { frBg = t.bgSecondary; }
+                    if (frFoc) { frBg = t.bgPrimary; }
+                    c.FillRect(frX + 2, fry + 3, frW - 4, filterRowH - 6, frBg);
+                    int frBorder = t.borderPrimary;
+                    if (frFoc) { frBorder = t.borderFocus; }
+                    c.DrawRoundRect(frX + 2, fry + 3, frW - 4, filterRowH - 6, t.borderRadiusSmall, frBorder, 1);
+                    int frInner = frW - 4 - pad2 * 2;
+                    if (frInner < 0) { frInner = 0; }
+                    int frfs = t.fontSizeSmall;
+                    int frtY = fry + (filterRowH - Canvas.FontHeight(frfs)) / 2;
+                    c.PushClip(frX + 2 + pad2, fry, frInner, filterRowH);
+                    if (frTxt.Length == 0 && !frFoc) {
+                        c.DrawText(frX + 2 + pad2, frtY, "搜索...", t.textTertiary, frfs);
+                    } else {
+                        c.DrawText(frX + 2 + pad2, frtY, frTxt, t.textPrimary, frfs);
+                        if (frFoc) {
+                            int fcaretW = Canvas.MeasureText(Text.Left(frTxt, st.filterRowCur), frfs);
+                            c.FillRect(frX + 2 + pad2 + fcaretW, frtY, 1, Canvas.FontHeight(frfs), t.primary);
+                        }
+                    }
+                    c.PopClip();
+                    app.hitTester.Register(HitRegion.Create(frid2, frX, fry, frW, filterRowH, 1));
+                    if (app.EventKind() == 3 && app.window.EventButton() == 0
+                        && app.hitTester.HitTest(app.mouseX, app.mouseY) == frid2) {
+                        if (st.filterRowFocusCol != fri) {
+                            st.filterRowFocusCol = fri;
+                            st.filterRowBuf = st.filterRowText[fri];
+                            st.filterRowCur = st.filterRowBuf.Length;
+                        }
+                        app.RequestRedraw();
+                    }
+                }
+                froi = froi + 1;
+            }
+            if (frBand >= 0) { c.PopClip(); }
+            c.FillRect(x + 1, fry + filterRowH - 1, viewW - 2, 1, gridColor);
+        }
+
+        // Normalised cell-range bounds (order-index rows + column indices) for
+        // highlighting the drag-selected rectangle behind the cells.
+        bool hasRange = DataTable.HasRange(st);
+        int rgR0 = 0;
+        int rgR1 = -1;
+        int rgC0 = 0;
+        int rgC1 = -1;
+        if (hasRange) {
+            rgR0 = DataTable.MinI(st.rangeR0, st.rangeR1);
+            rgR1 = DataTable.MaxI(st.rangeR0, st.rangeR1);
+            rgC0 = DataTable.MinI(st.rangeC0, st.rangeC1);
+            rgC1 = DataTable.MaxI(st.rangeC0, st.rangeC1);
+        }
+
+        // screen rect of the cell currently being edited (captured in the loop
+        // so the inline editor can be drawn over it after the rows are painted)
+        int edX = 0;
+        int edY = 0;
+        int edW = 0;
+        int edH = 0;
+        bool edVis = false;
+
+        int r = 0;
+        while (r < visRows && (start + r) < total) {
+            int oiRow = start + r;
+            int ry = bodyTop + r * rowH;
+
+            // Group header row: indented chevron + caption + row count. It
+            // occupies a display slot but carries no data-row payload.
+            if (st.dispRows[oiRow].kind == 1) {
+                int gi = st.dispRows[oiRow].row;
+                GroupRow grp = st.groups[gi];
+                int lvl = grp.level;
+                c.FillRect(x + 1, ry, viewW - 2, rowH, t.bgTertiary);
+                int gcx = x + numW + selW + lvl * app.Scale(16) + app.Scale(6);
+                bool gcoll = grp.collapsed;
+                string chev = "chevron-down";
+                if (gcoll) { chev = "chevron-right"; }
+                int chSz = app.Scale(14);
+                c.DrawGlyph(chev, gcx, ry + (rowH - chSz) / 2, chSz, t.textSecondary);
+                string glbl = grp.label + "  (" + Convert.ToString(grp.count) + ")";
+                // Append group-level aggregate summaries for columns that have
+                // an aggMode set (DevExpress-style group subtotals).
+                // Format: "  |  Revenue: ¥1,234,567  |  Avg CTR: 3.2%"
+                int gagg = 0;
+                while (gagg < grp.aggTexts.Count && gagg < cols.Count) {
+                    string gat = grp.aggTexts[gagg];
+                    if (gat.Length > 0) {
+                        glbl = glbl + "    " + cols[gagg].title + ": " + gat;
+                    }
+                    gagg = gagg + 1;
+                }
+                c.DrawText(gcx + chSz + app.Scale(4),
+                    ry + (rowH - t.fontSizeMedium) / 2, glbl, t.textPrimary, t.fontSizeMedium);
+                c.FillRect(x + 1, ry + rowH - 1, viewW - 2, 1, gridColor);
+                r = r + 1;
+                continue;
+            }
+
+            // Detail band: a master-detail panel under an expanded row. The band
+            // spans DetailSlots consecutive slots; it is drawn once, on its first
+            // slot, over the full height so the panel sees one rectangle rather
+            // than a series of row-high strips. Later parts of the same band draw
+            // nothing — the first part already covered their pixels.
+            if (st.dispRows[oiRow].kind == 2) {
+                if (st.dispRows[oiRow].part != 0) { r = r + 1; continue; }
+                int dRow = st.dispRows[oiRow].row;
+                // Count this band's remaining slots so the panel gets its whole
+                // height even when the band starts on-screen and runs past the
+                // bottom edge (the clip keeps the overspill invisible).
+                int span = 1;
+                int ns = oiRow + 1;
+                while (ns < total && st.dispRows[ns].kind == 2
+                       && st.dispRows[ns].part != 0 && st.dispRows[ns].row == dRow) {
+                    span = span + 1;
+                    ns = ns + 1;
+                }
+                int dh = span * rowH;
+                c.FillRect(x + 1, ry, viewW - 2, dh, t.bgSecondary);
+                // A left accent ties the panel to the master row above it.
+                c.FillRect(x + 1, ry, app.Scale(3), dh, t.primary);
+                if (st.detail != null) {
+                    int dx = x + app.Scale(4);
+                    int dw = viewW - app.Scale(6);
+                    c.PushClip(dx, ry, dw, dh);
+                    st.detail.Paint(app, src, dRow, dx, ry, dw, dh);
+                    c.PopClip();
+                }
+                c.FillRect(x + 1, ry + dh - 1, viewW - 2, 1, gridColor);
+                r = r + 1;
+                continue;
+            }
+
+            int rowIdx = st.dispRows[oiRow].row;
+            bool rowInRange = hasRange && oiRow >= rgR0 && oiRow <= rgR1;
+
+            int rowId = app.focus.AllocId();
+            app.hitTester.Register(HitRegion.Create(rowId, x, ry, viewW, rowH, 0));
+            bool rHover = app.focus.IsHovered(rowId);
+            bool rSel = st.selected[rowIdx];
+
+            int stripeBg = t.bgPrimary;
+            if (st.striped && (st.dispRows[oiRow].no % 2 == 0)) { stripeBg = t.bgSecondary; }
+            int rowBg = DataTable.RowBackground(st, src, rowIdx, stripeBg,
+                                                t.bgActive, t.bgHover, rSel, rHover);
+            c.FillRect(x + 1, ry, viewW - 2, rowH, rowBg);
+
+            int cx2 = x;
+            if (st.showRowNum) {
+                // Sequential display position (1,2,3…) in the current sorted/
+                // filtered view — NOT the original data index, so the row-number
+                // column stays ordered instead of jumping around when the user
+                // sorts or filters.
+                c.DrawTextCentered(cx2, ry, numW, rowH, Convert.ToString(st.dispRows[oiRow].no), t.textTertiary, t.fontSizeSmall);
+                // Master-detail expander, tucked into the left of the gutter so
+                // the row number stays legible beside it. Only rows the provider
+                // accepts get one, so a childless row shows a blank margin
+                // instead of a chevron that does nothing.
+                if (DataTable.CanExpand(st, src, rowIdx)) {
+                    int exSz = app.Scale(12);
+                    int exX = cx2 + app.Scale(2);
+                    int exY = ry + (rowH - exSz) / 2;
+                    bool isExp = DataTable.IsExpanded(st, rowIdx);
+                    string exCh = "chevron-right";
+                    if (isExp) { exCh = "chevron-down"; }
+                    int exId = app.focus.AllocId();
+                    app.hitTester.Register(HitRegion.Create(exId, cx2, ry, app.Scale(16), rowH, 0));
+                    int exCol = t.textTertiary;
+                    if (app.focus.IsHovered(exId)) { exCol = t.primary; }
+                    c.DrawGlyph(exCh, exX, exY, exSz, exCol);
+                    if (app.EventKind() == 3 && app.window.EventButton() == 0
+                        && app.hitTester.HitTest(app.mouseX, app.mouseY) == exId) {
+                        DataTable.ToggleDetail(st, src, rowIdx);
+                        app.RequestRedraw();
+                    }
+                }
+                cx2 = cx2 + numW;
+            }
+            if (st.showSelect) {
+                int box = app.Scale(16);
+                int bx = cx2 + (selW - box) / 2;
+                int by = ry + (rowH - box) / 2;
+                if (rSel) {
+                    c.FillRoundRect(bx, by, box, box, t.borderRadiusSmall, t.primary);
+                    int ins = app.Scale(3);
+                    c.DrawGlyph("check", bx + ins, by + ins, box - ins * 2, t.textInverse);
+                } else {
+                    c.FillRoundRect(bx, by, box, box, t.borderRadiusSmall, t.bgPrimary);
+                    c.DrawRect(bx, by, box, box, t.borderPrimary, 1);
+                }
+                int selId = app.focus.AllocId();
+                app.hitTester.Register(HitRegion.Create(selId, cx2, ry, selW, rowH, 0));
+                if (app.EventKind() == 3 && app.window.EventButton() == 0 && app.hitTester.HitTest(app.mouseX, app.mouseY) == selId) {
+                    st.selected[rowIdx] = !rSel;
+                    st.hitRow = rowIdx;
+                    st.SelectionChanged.Raise();
+                    app.RequestRedraw();
+                }
+                cx2 = cx2 + selW;
+            }
+
+            int coi = 0;
+            int cBand = -1;
+            while (coi < vorder.Count) {
+                int cc = vorder[coi];
+                int cw = st.dispW[cc];
+                if (colBand[coi] != cBand) {
+                    if (cBand >= 0) { c.PopClip(); }
+                    cBand = colBand[coi];
+                    DataTable.PushBandClip(c, cBand, firstDataX, bandX, bandW, rightX,
+                                           pinnedW, pinnedRW, ry, rowH, clipRight);
+                }
+                int ccl = colX[coi];
+                int cBandL = DataTable.BandLeft(colBand[coi], firstDataX, bandX, rightX);
+                int cBandR = DataTable.BandRight(colBand[coi], firstDataX, bandX, bandW,
+                                                 rightX, pinnedW, pinnedRW, clipRight);
+                if (ccl + cw > cBandL && ccl < cBandR) {
+                    // A per-cell style background paints under the range
+                    // highlight, so a selected cell still reads as selected.
+                    int cellBg = DataTable.CellBackground(st, src, rowIdx, cc);
+                    if (cellBg != 0) { c.FillRect(ccl, ry, cw, rowH, cellBg); }
+                    if (rowInRange && cc >= rgC0 && cc <= rgC1) {
+                        c.FillRect(ccl, ry, cw, rowH, t.bgActive);
+                    }
+                    if (st.editing && rowIdx == st.editRow && cc == st.editCol) {
+                        edX = ccl; edY = ry; edW = cw; edH = rowH; edVis = true;
+                    }
+                    // A custom painter owns the cell outright. Clipping it to
+                    // its own rect means a misbehaving one can't bleed over its
+                    // neighbours or escape the table.
+                    bool painted = false;
+                    if (st.styler != null) {
+                        c.PushClip(ccl, ry, cw, rowH);
+                        painted = st.styler.PaintCell(app, src, rowIdx, cc, ccl, ry, cw, rowH);
+                        c.PopClip();
+                    }
+                    if (!painted) {
+                        double cfLo = 0.0;
+                        double cfHi = 0.0;
+                        if (cc < st.cfMinR.Count) { cfLo = st.cfMinR[cc]; cfHi = st.cfMaxR[cc]; }
+                        DataTable.DrawCell(app, cols[cc], src.CellText(rowIdx, cc), ccl, ry, cw, rowH,
+                                           cfLo, cfHi, DataTable.CellForeground(st, src, rowIdx, cc));
+                    }
+                    // An editable bool cell toggles on a single click, rather
+                    // than opening the text editor an inline edit would use.
+                    if (cols[cc].isBool && cols[cc].editable) {
+                        int tgId = app.focus.AllocId();
+                        app.hitTester.Register(HitRegion.Create(tgId, ccl, ry, cw, rowH, 0));
+                        if (app.EventKind() == 3 && app.window.EventButton() == 0
+                            && app.hitTester.HitTest(app.mouseX, app.mouseY) == tgId) {
+                            DataTable.ToggleBoolCell(st, cols, src, rowIdx, cc);
+                            app.RequestRedraw();
+                        }
+                    }
+                }
+                coi = coi + 1;
+            }
+            if (cBand >= 0) { c.PopClip(); }
+
+            c.FillRect(x + 1, ry + rowH - 1, viewW - 2, 1, gridColor);
+            r = r + 1;
+        }
+
+        // ---------------- new-row placeholder ----------------
+        // The empty row under the last one, DevExpress's "click here to add".
+        // It is drawn only when the view is scrolled to the bottom (`r` stops
+        // short of visRows exactly then), so it always sits after the final
+        // row rather than floating in the middle of a scrolled page. It is not
+        // a display slot: it carries no data, so nothing selects or sorts it.
+        if (st.allowAddRow && src.CanInsert() && r < visRows) {
+            int ay = bodyTop + r * rowH;
+            int addId = app.focus.AllocId();
+            app.hitTester.Register(HitRegion.Create(addId, x, ay, viewW, rowH, 0));
+            bool aHover = app.focus.IsHovered(addId);
+            int aBg = t.bgPrimary;
+            if (aHover) { aBg = t.bgHover; }
+            c.FillRect(x + 1, ay, viewW - 2, rowH, aBg);
+            int aIco = app.Scale(12);
+            int aIx = x + app.Scale(8);
+            int aFg = t.textTertiary;
+            if (aHover) { aFg = t.primary; }
+            c.DrawGlyph("plus", aIx, ay + (rowH - aIco) / 2, aIco, aFg);
+            c.DrawText(aIx + aIco + app.Scale(6),
+                       ay + (rowH - t.fontSizeSmall) / 2,
+                       "点击添加新行  Click to add row", aFg, t.fontSizeSmall);
+            c.FillRect(x + 1, ay + rowH - 1, viewW - 2, 1, gridColor);
+            if (app.EventKind() == 3 && app.window.EventButton() == 0
+                && app.hitTester.HitTest(app.mouseX, app.mouseY) == addId) {
+                int newRow = DataTable.AppendRow(st, cols, src);
+                if (newRow >= 0) {
+                    // Recompute first: the row has to exist in the display order
+                    // before the cursor can be parked on it, or BeginEdit would
+                    // open on a slot that isn't there yet.
+                    DataTable.Recompute(st, cols, src);
+                    DataTable.FocusRow(st, cols, src, newRow);
+                }
+                app.RequestRedraw();
+            }
+        }
+
+        // ---------------- freeze boundaries ----------------
+        // A divider on the inner edge of each frozen band marks where the
+        // scrolling region begins and ends, so the columns that stay put read
+        // as deliberately parked rather than as a rendering glitch.
+        if (pinnedW > 0 && bandX < clipRight) {
+            c.FillRect(bandX, y, app.Scale(2), bodyTop + bodyH - y, t.borderPrimary);
+        }
+        if (pinnedRW > 0 && rightX > firstDataX) {
+            c.FillRect(rightX - app.Scale(2), y, app.Scale(2), bodyTop + bodyH - y, t.borderPrimary);
+        }
+
+        // ---------------- row-drag drop indicator ----------------
+        if (st.dragRow >= 0 && st.dragMoved) {
+            int dropRow = (app.mouseY - bodyTop) / rowH;
+            if (dropRow < 0) { dropRow = 0; }
+            if (dropRow > visRows) { dropRow = visRows; }
+            int dy = bodyTop + dropRow * rowH;
+            if (dy < bodyTop) { dy = bodyTop; }
+            if (dy > bodyTop + bodyH) { dy = bodyTop + bodyH; }
+            c.FillRect(x + 1, dy - 1, viewW - 2, app.Scale(2), t.primary);
+        }
+
+        // ---------------- inline cell editor overlay ----------------
+        st.edPopHot = false;
+        if (st.editing && edVis && edW > app.Scale(8)) {
+            DataTable.RenderEditor(app, cols, src, st, edX, edY, edW, edH);
+        }
+
+        // ---------------- body pointer interaction ----------------
+        // Map the pointer to an order-position row and a data column purely from
+        // geometry (works for range-extend / reorder even outside hit regions).
+        int ptrOi = -1;
+        if (app.mouseY >= bodyTop && app.mouseY < bodyTop + bodyH && app.mouseX >= x && app.mouseX < clipRight) {
+            int rr2 = (app.mouseY - bodyTop) / rowH;
+            if (rr2 >= 0 && rr2 < visRows && (start + rr2) < total) { ptrOi = start + rr2; }
+            // A detail band is the provider's own surface, not a row: presses
+            // there must not start a range selection, a reorder drag or an
+            // editor. Dropping it here keeps every ptrOi consumer below honest
+            // without each having to re-test the kind.
+            if (ptrOi >= 0 && st.dispRows[ptrOi].kind == 2) { ptrOi = -1; }
+        }
+        int ptrCol = -1;
+        if (ptrOi >= 0 && app.mouseX >= firstDataX) {
+            // Scanned back-to-front so the frozen bands win: a middle column
+            // scrolled underneath one occupies the same x, and the column the
+            // user can actually see is the one they meant to hit.
+            int pci = vorder.Count - 1;
+            while (pci >= 0) {
+                int cci = vorder[pci];
+                int colL = colX[pci];
+                int colR = colL + st.dispW[cci];
+                int pbL = DataTable.BandLeft(colBand[pci], firstDataX, bandX, rightX);
+                int pbR = DataTable.BandRight(colBand[pci], firstDataX, bandX, bandW,
+                                              rightX, pinnedW, pinnedRW, clipRight);
+                if (colL < pbL) { colL = pbL; }
+                if (colR > pbR) { colR = pbR; }
+                if (app.mouseX >= colL && app.mouseX < colR) { ptrCol = cci; pci = -1; }
+                else { pci = pci - 1; }
+            }
+        }
+        int ek = app.EventKind();
+        int eb = app.window.EventButton();
+        int emods = app.window.EventMods();
+
+        // ---------------- filter row keyboard handling ----------------
+        // When a filter-row cell is focused it consumes keyboard events
+        // (printable chars, Backspace, Delete, Left/Right, Escape, Enter/Tab)
+        // before the body interaction and inline editor see them.
+        if (st.filterRowFocusCol >= 0) {
+            int frc = st.filterRowFocusCol;
+            bool frKeyHandled = false;
+            if (ek == 6) {
+                int fkc = app.window.EventKeyCode();
+                if (fkc == 27) {
+                    // Escape: clear this column's filter and blur
+                    st.filterRowBuf = "";
+                    if (st.filterRowText[frc].Length > 0) {
+                        st.filterRowText[frc] = "";
+                        st.dirty = true;
+                        st.FilterChanged.Raise();
+                    }
+                    st.filterRowFocusCol = -1;
+                } else if (fkc == 8) {
+                    // Backspace
+                    if (st.filterRowCur > 0) {
+                        int prevStart = Text.PrevCharStart(st.filterRowBuf, st.filterRowCur);
+                        st.filterRowBuf = Text.DeleteBefore(st.filterRowBuf, st.filterRowCur);
+                        st.filterRowCur = prevStart;
+                        st.filterRowText[frc] = st.filterRowBuf;
+                        st.dirty = true;
+                        st.FilterChanged.Raise();
+                    }
+                } else if (fkc == 46) {
+                    // Delete
+                    if (st.filterRowCur < st.filterRowBuf.Length) {
+                        st.filterRowBuf = Text.RemoveAt(st.filterRowBuf, st.filterRowCur);
+                        st.filterRowText[frc] = st.filterRowBuf;
+                        st.dirty = true;
+                        st.FilterChanged.Raise();
+                    }
+                } else {
+                    string fch = Text.CharStr(fkc);
+                    if (fch.Length > 0) {
+                        st.filterRowBuf = Text.InsertAt(st.filterRowBuf, st.filterRowCur, fch);
+                        st.filterRowCur = st.filterRowCur + fch.Length;
+                        st.filterRowText[frc] = st.filterRowBuf;
+                        st.dirty = true;
+                        st.FilterChanged.Raise();
+                    }
+                }
+                frKeyHandled = true;
+            } else if (ek == 4) {
+                int fkc2 = app.window.EventKeyCode();
+                if (fkc2 == 13 || fkc2 == 9) {
+                    // Enter / Tab: commit and blur
+                    st.filterRowText[frc] = st.filterRowBuf;
+                    st.filterRowFocusCol = -1;
+                } else if (fkc2 == 37) {
+                    if (st.filterRowCur > 0) { st.filterRowCur = Text.PrevCharStart(st.filterRowBuf, st.filterRowCur); }
+                } else if (fkc2 == 39) {
+                    if (st.filterRowCur < st.filterRowBuf.Length) { st.filterRowCur = Text.NextCharEnd(st.filterRowBuf, st.filterRowCur); }
+                } else if (fkc2 == 36) {
+                    st.filterRowCur = 0;
+                } else if (fkc2 == 35) {
+                    st.filterRowCur = st.filterRowBuf.Length;
+                }
+                frKeyHandled = true;
+            }
+            // A click outside the filter row blurs the focused cell
+            if (ek == 2 && (app.mouseY < y + headerH || app.mouseY >= y + headerH + filterRowH)) {
+                st.filterRowText[frc] = st.filterRowBuf;
+                st.filterRowFocusCol = -1;
+            }
+            if (frKeyHandled) { ek = 0; app.RequestRedraw(); }
+        }
+        // While the context menu is open it is modal: swallow body events so a
+        // click on a menu item can't also start a range/selection behind it.
+        // (RenderContextMenu reads the raw event to drive item hits / dismiss.)
+        if (st.ctxOpen) { ek = 0; }
+        if (st.hdrCtxOpen) { ek = 0; }
+        // Same for an open editor popup: its list/calendar handled the press
+        // itself, so the cell beneath must not treat it as a new selection.
+        if (st.edPopHot) { ek = 0; }
+
+        // ---------------- inline editor key handling ----------------
+        // While an editor is open it owns the keyboard: printable input, caret
+        // movement and commit/cancel. Events are swallowed so they don't also
+        // drive selection/scroll behind the editor.
+        // Only keyboard events are swallowed here; mouse presses fall through to
+        // the press handler, which commits the edit before re-selecting.
+        if (st.editing) {
+            DataColumn ecol = cols[st.editCol];
+            if (ek == 6) {
+                int code = app.window.EventKeyCode();
+                if (code == 13) { DataTable.CommitEdit(st, cols, src); }
+                else if (code == 27) { DataTable.CancelEdit(st); }
+                else if (code == 9) { DataTable.CommitEdit(st, cols, src); }
+                else if (code == 8) {
+                    if (st.editCur > 0) {
+                        int startp = Text.PrevCharStart(st.editBuf, st.editCur);
+                        st.editBuf = Text.DeleteBefore(st.editBuf, st.editCur);
+                        st.editCur = startp;
+                        // Typing invalidates the previous rejection: the value
+                        // under the message no longer exists.
+                        st.editError = "";
+                        if (ecol.editorKind == 1) { DataTable.RefreshChoices(st, ecol); }
+                    }
+                } else {
+                    string ch = Text.CharStr(code);
+                    if (ch.Length > 0) {
+                        st.editBuf = Text.InsertAt(st.editBuf, st.editCur, ch);
+                        st.editCur = st.editCur + ch.Length;
+                        st.editError = "";
+                        if (ecol.editorKind == 1) {
+                            st.edPopOpen = true;
+                            DataTable.RefreshChoices(st, ecol);
+                        }
+                    }
+                }
+                app.RequestRedraw();
+                ek = 0;
+            } else if (ek == 4) {
+                int kc = app.window.EventKeyCode();
+                // Up/Down drive whatever the editor's vertical affordance is:
+                // the dropdown highlight, the calendar week, or the spinner.
+                bool consumed = true;
+                if (kc == 38 || kc == 40) {
+                    int dir = 1;
+                    if (kc == 38) { dir = -1; }
+                    if (ecol.editorKind == 1) {
+                        st.edPopOpen = true;
+                        DataTable.MoveChoice(st, dir);
+                    } else if (ecol.editorKind == 2) {
+                        DataTable.CalendarStep(st, ecol, dir * 7);
+                    } else if (ecol.editorKind == 3) {
+                        st.editBuf = DataTable.StepValue(ecol, st.editBuf, 0 - dir);
+                        st.editCur = st.editBuf.Length;
+                        st.editError = "";
+                    } else { consumed = false; }
+                } else if (kc == 27) {
+                    // Escape closes the popup first, and only then the editor —
+                    // so dismissing a list doesn't throw away the typed text.
+                    if (st.edPopOpen) { st.edPopOpen = false; }
+                    else { DataTable.CancelEdit(st); }
+                } else if (kc == 13) { DataTable.CommitEdit(st, cols, src); }
+                else if (kc == 37) {
+                    if (ecol.editorKind == 2) { DataTable.CalendarStep(st, ecol, -1); }
+                    else if (st.editCur > 0) { st.editCur = Text.PrevCharStart(st.editBuf, st.editCur); }
+                } else if (kc == 39) {
+                    if (ecol.editorKind == 2) { DataTable.CalendarStep(st, ecol, 1); }
+                    else if (st.editCur < st.editBuf.Length) { st.editCur = Text.NextCharEnd(st.editBuf, st.editCur); }
+                } else if (kc == 33 && ecol.editorKind == 2) { st.edCalMonth = st.edCalMonth - 1; }
+                else if (kc == 34 && ecol.editorKind == 2) { st.edCalMonth = st.edCalMonth + 1; }
+                else if (kc == 36) { st.editCur = 0; }
+                else if (kc == 35) { st.editCur = st.editBuf.Length; }
+                else if (kc == 46) {
+                    if (st.editCur < st.editBuf.Length) {
+                        st.editBuf = Text.RemoveAt(st.editBuf, st.editCur);
+                        st.editError = "";
+                        if (ecol.editorKind == 1) { DataTable.RefreshChoices(st, ecol); }
+                    }
+                } else { consumed = false; }
+                app.RequestRedraw();
+                if (consumed) { ek = 0; }
+            }
+        }
+
+        // F2 / Enter opens an editor on the active editable cell (Excel-style).
+        // A bool cell has no text to edit: the same keys flip it in place.
+        if (!st.editing && ek == 4) {
+            int kc2 = app.window.EventKeyCode();
+            if ((kc2 == 113 || kc2 == 13) && st.hitRow >= 0 && st.hitCol >= 0
+                && st.hitCol < cols.Count && cols[st.hitCol].editable) {
+                if (cols[st.hitCol].isBool) {
+                    DataTable.ToggleBoolCell(st, cols, src, st.hitRow, st.hitCol);
+                } else {
+                    DataTable.BeginEdit(st, cols, src, st.hitRow, st.hitCol);
+                }
+                ek = 0;
+                app.RequestRedraw();
+            }
+        }
+
+        // ---------------- cell-cursor keyboard navigation ----------------
+        // Arrows / PgUp / PgDn / Home / End move the cursor, Shift extends the
+        // range, and Ctrl+C/V/X/A act on it. Gated on the grid having been
+        // interacted with (st.hitRow), since the widget has no keyboard focus of
+        // its own — otherwise an untouched grid would swallow Tab and the arrow
+        // keys from every other widget on the page. Also yields whenever
+        // something else owns the keyboard: an open editor, a focused filter-row
+        // cell, or a modal popup.
+        if (!st.editing && ek == 4 && st.hitRow >= 0
+            && st.filterRowFocusCol < 0 && st.openMenu < 0) {
+            if (DataTable.HandleNavKey(app, cols, src, st, vorder, visRows,
+                                       dataViewW, pinnedW, app.window.EventKeyCode(), emods)) {
+                ek = 0;
+                app.RequestRedraw();
+            }
+        }
+
+        // left press
+        if (ek == 2 && eb == 0 && ptrOi >= 0) {
+            if (st.dispRows[ptrOi].kind == 1) {
+                // group header press: toggle collapse of that group
+                int gi = st.dispRows[ptrOi].row;
+                DataTable.ToggleCollapse(st, st.groups[gi].key);
+                app.RequestRedraw();
+            } else if (app.mouseX >= x && app.mouseX < x + numW) {
+                // row-number press: could become a row click or a reorder drag
+                st.dragRow = ptrOi;
+                st.dragStartY = app.mouseY;
+                st.dragMoved = false;
+            } else if (app.mouseX >= firstDataX && ptrCol >= 0) {
+                // A press on the cell that's already the sole active selection
+                // (a slow second click) opens the inline editor; otherwise begin
+                // a rectangular range selection. A press while editing commits
+                // first, then re-selects.
+                bool sameCell = (!st.editing) && st.hitOrder == ptrOi && st.hitCol == ptrCol
+                    && st.rangeR0 == st.rangeR1 && st.rangeC0 == st.rangeC1;
+                if (st.editing) { DataTable.CommitEdit(st, cols, src); }
+                // A refused commit keeps its editor open; moving the selection
+                // now would strand it over an unrelated cell, so the press is
+                // spent on surfacing the error instead.
+                if (st.editing) {
+                    app.RequestRedraw();
+                } else if (sameCell && cols[ptrCol].editable && !cols[ptrCol].isBool) {
+                    DataTable.BeginEdit(st, cols, src, st.dispRows[ptrOi].row, ptrCol);
+                    app.RequestRedraw();
+                } else {
+                    st.rangeR0 = ptrOi;
+                    st.rangeR1 = ptrOi;
+                    st.rangeC0 = ptrCol;
+                    st.rangeC1 = ptrCol;
+                    st.rangeDrag = true;
+                    st.selAnchor = ptrOi;
+                    st.hitOrder = ptrOi;
+                    st.hitRow = st.dispRows[ptrOi].row;
+                    st.hitCol = ptrCol;
+                    st.CellClick.Raise();
+                    app.RequestRedraw();
+                }
+            }
+        }
+
+        // drag move
+        if (ek == 1) {
+            if (st.rangeDrag && ptrOi >= 0) {
+                st.rangeR1 = ptrOi;
+                if (ptrCol >= 0) { st.rangeC1 = ptrCol; }
+                app.RequestRedraw();
+            }
+            if (st.dragRow >= 0) {
+                int dd = app.mouseY - st.dragStartY;
+                if (dd < 0) { dd = 0 - dd; }
+                if (dd > rowH / 2) { st.dragMoved = true; app.RequestRedraw(); }
+            }
+        }
+
+        // left release
+        if (ek == 3 && eb == 0) {
+            if (st.rangeDrag) { st.rangeDrag = false; app.RequestRedraw(); }
+            if (st.dragRow >= 0) {
+                if (st.groupCols.Count == 0 && st.dragMoved && ptrOi >= 0 && ptrOi != st.dragRow
+                    && st.dispRows[ptrOi].kind == 0) {
+                    DataTable.MoveOrder(st, st.dragRow, ptrOi);
+                    // manual order — drop any active sort without re-running
+                    // Recompute (which would rebuild st.order and lose the move).
+                    st.sortKeys.Clear();
+                    DataTable.SyncPrimary(st);
+                    app.RequestRedraw();
+                } else if (!st.dragMoved && st.dispRows[st.dragRow].kind == 0) {
+                    // treat as a row-selection click (按行选择)
+                    int ri = st.dispRows[st.dragRow].row;
+                    st.hitOrder = st.dragRow;
+                    st.hitRow = ri;
+                    st.hitCol = -1;
+                    st.RowClick.Raise();
+                    st.SelectionChanged.Raise();
+                    bool shift = (emods & 2) != 0;
+                    bool ctrl = (emods & 1) != 0;
+                    if (shift && st.selAnchor >= 0) {
+                        DataTable.SelectAllRows(st, false);
+                        int a = DataTable.MinI(st.selAnchor, st.dragRow);
+                        int b = DataTable.MaxI(st.selAnchor, st.dragRow);
+                        int kk = a;
+                        while (kk <= b) { if (kk >= 0 && kk < st.dispRows.Count && st.dispRows[kk].kind == 0) { st.selected[st.dispRows[kk].row] = true; } kk = kk + 1; }
+                    } else if (ctrl) {
+                        st.selected[ri] = !st.selected[ri];
+                        st.selAnchor = st.dragRow;
+                    } else {
+                        DataTable.SelectAllRows(st, false);
+                        st.selected[ri] = true;
+                        st.selAnchor = st.dragRow;
+                        DataTable.ClearRange(st);
+                    }
+                    app.RequestRedraw();
+                }
+                st.dragRow = -1;
+                st.dragMoved = false;
+            }
+        }
+
+        // double-click on a body row
+        if (ek == 3 && eb == 0 && ptrOi >= 0 && st.dispRows[ptrOi].kind == 0 && app.DoubleClickNow()) {
+            st.hitOrder = ptrOi;
+            st.hitRow = st.dispRows[ptrOi].row;
+            st.RowDoubleClick.Raise();
+        }
+
+        // right press => context menu
+        if (ek == 2 && eb == 1 && st.openMenu < 0
+            && app.mouseX >= x && app.mouseX < x + viewW
+            && app.mouseY >= bodyTop && app.mouseY < bodyTop + bodyH) {
+            // if right-clicking a row outside any current range/selection, make
+            // that row the selection so the menu's copy/export act on something.
+            if (ptrOi >= 0 && st.dispRows[ptrOi].kind == 0 && !DataTable.HasRange(st)) {
+                int ri = st.dispRows[ptrOi].row;
+                if (!st.selected[ri]) {
+                    DataTable.SelectAllRows(st, false);
+                    st.selected[ri] = true;
+                    st.selAnchor = ptrOi;
+                }
+            }
+            st.ctxOpen = true;
+            st.ctxX = app.mouseX;
+            st.ctxY = app.mouseY;
+            app.RequestRedraw();
+        }
+
+        // empty state
+        if (total == 0) {
+            c.DrawTextCentered(x, bodyTop, viewW, bodyH, "No matching rows", t.textTertiary, t.fontSizeMedium);
+        }
+
+        // ---------------- summary (total) row ----------------
+        if (st.showSummary) {
+            int sumY = bodyTop + bodyH;
+            c.FillRect(x + 1, sumY, viewW - 2, summaryH, t.bgSecondary);
+            c.FillRect(x + 1, sumY, viewW - 2, 1, gridColor);
+            int sx = x + numW + selW;
+            if (st.showRowNum || st.showSelect) {
+                c.DrawTextCentered(x, sumY, numW + selW, summaryH, "Σ", t.textTertiary, t.fontSizeSmall);
+            }
+            int soi = 0;
+            int sBand = -1;
+            while (soi < vorder.Count) {
+                int sc = vorder[soi];
+                int cw = st.dispW[sc];
+                if (colBand[soi] != sBand) {
+                    if (sBand >= 0) { c.PopClip(); }
+                    sBand = colBand[soi];
+                    DataTable.PushBandClip(c, sBand, firstDataX, bandX, bandW, rightX,
+                                           pinnedW, pinnedRW, sumY, summaryH, clipRight);
+                }
+                sx = colX[soi];
+                int sBandL = DataTable.BandLeft(colBand[soi], firstDataX, bandX, rightX);
+                int sBandR = DataTable.BandRight(colBand[soi], firstDataX, bandX, bandW,
+                                                 rightX, pinnedW, pinnedRW, clipRight);
+                if (sx + cw > sBandL && sx < sBandR) {
+                    string stxt = "";
+                    if (sc < st.summaryText.Count) { stxt = st.summaryText[sc]; }
+                    if (stxt.Length > 0) {
+                        int pad = t.paddingSmall;
+                        string shown = DataTable.Truncate(stxt, fs, cw - pad * 2);
+                        int tw = Canvas.MeasureText(shown, fs);
+                        int tx = sx + pad;
+                        if (cols[sc].align == 2) { tx = sx + cw - pad - tw; }
+                        else if (cols[sc].align == 1) { tx = sx + (cw - tw) / 2; }
+                        int ty = sumY + (summaryH - Canvas.FontHeight(fs)) / 2;
+                        c.DrawText(tx, ty, shown, t.textPrimary, fs);
+                    }
+                }
+                soi = soi + 1;
+            }
+            if (sBand >= 0) { c.PopClip(); }
+        }
+
+        // ---------------- pager footer (reuses the Pagination widget) ----------------
+        if (st.paged) {
+            int fY = bodyTop + bodyH + summaryH;
+            c.FillRect(x + 1, fY, viewW - 2, pagerH, t.bgSecondary);
+            c.FillRect(x + 1, fY, viewW - 2, 1, gridColor);
+            int totalPages = 1;
+            if (total > 0) { totalPages = (total + visRows - 1) / visRows; }
+            int cur = st.pageModel.Get();
+            int pgW = Pagination.MeasureWidth(app, totalPages, cur);
+            int pgX = x + (viewW - pgW) / 2;
+            if (pgX < x + t.paddingMedium) { pgX = x + t.paddingMedium; }
+            int pgY = fY + (pagerH - t.heightMedium) / 2;
+            Pagination.Of(totalPages, st.pageModel).RenderAt(app, pgX, pgY);
+            // range info on the left
+            int from = (cur - 1) * visRows + 1;
+            int to = cur * visRows;
+            if (to > total) { to = total; }
+            if (total == 0) { from = 0; }
+            string info = Convert.ToString(from) + "-" + Convert.ToString(to) + " / " + Convert.ToString(total);
+            c.DrawText(x + t.paddingMedium, pgY + (t.heightMedium - Canvas.FontHeight(t.fontSizeSmall)) / 2, info, t.textTertiary, t.fontSizeSmall);
+        }
+
+        // ---------------- status bar (DevExpress-style bottom strip) ----------------
+        // Left: filtered/total row count + selected-row count. Right: live
+        // sum/avg/cell-count for the current cell-range selection (numeric
+        // columns only) — lets the user eyeball a quick total without leaving
+        // the grid, same as Excel's/DevExpress's status strip.
+        if (st.showStatusBar) {
+            int sbY = bodyTop + bodyH + summaryH + pagerH;
+            c.FillRect(x + 1, sbY, viewW - 2, statusBarH, t.bgSecondary);
+            c.FillRect(x + 1, sbY, viewW - 2, 1, gridColor);
+            int sbFs = t.fontSizeSmall;
+            int sbTy = sbY + (statusBarH - Canvas.FontHeight(sbFs)) / 2;
+
+            int totalSrc = src.RowCount();
+            int shownRows = st.order.Count;
+            string rowInfo = "行数: " + Convert.ToString(shownRows);
+            if (shownRows != totalSrc) { rowInfo = rowInfo + " / " + Convert.ToString(totalSrc); }
+            int selCount = 0;
+            int sci = 0;
+            while (sci < st.selected.Count) { if (st.selected[sci]) { selCount = selCount + 1; } sci = sci + 1; }
+            if (selCount > 0) { rowInfo = rowInfo + "    已选: " + Convert.ToString(selCount); }
+            c.DrawText(x + t.paddingMedium, sbTy, rowInfo, t.textSecondary, sbFs);
+
+            if (DataTable.HasRange(st)) {
+                int rC0 = DataTable.MinI(st.rangeC0, st.rangeC1);
+                int rC1 = DataTable.MaxI(st.rangeC0, st.rangeC1);
+                int rR0 = DataTable.MinI(st.rangeR0, st.rangeR1);
+                int rR1 = DataTable.MaxI(st.rangeR0, st.rangeR1);
+                int rsum = 0;
+                int rcount = 0;
+                int rri = rR0;
+                while (rri <= rR1 && rri < st.dispRows.Count) {
+                    if (st.dispRows[rri].kind == 0) {
+                        int drow = st.dispRows[rri].row;
+                        int rci = rC0;
+                        while (rci <= rC1 && rci < cols.Count) {
+                            if (cols[rci].numeric) {
+                                rsum = rsum + src.CellNum(drow, rci);
+                                rcount = rcount + 1;
+                            }
+                            rci = rci + 1;
+                        }
+                    }
+                    rri = rri + 1;
+                }
+                if (rcount > 0) {
+                    int ravg = rsum / rcount;
+                    string rangeInfo = "选区求和: " + Convert.ToString(rsum)
+                        + "    平均: " + Convert.ToString(ravg)
+                        + "    单元格: " + Convert.ToString(rcount);
+                    int rw = Canvas.MeasureText(rangeInfo, sbFs);
+                    c.DrawText(x + viewW - t.paddingMedium - rw, sbTy, rangeInfo, t.textSecondary, sbFs);
+                }
+            }
+        }
+
+        // ---------------- vertical scrollbar ----------------
+        if (!st.paged && total > visRows && visRows > 0) {
+            int sbW = app.Scale(8);
+            int sbX = x + viewW - sbW - app.Scale(2);
+            int trackY = bodyTop + app.Scale(2);
+            int trackH = bodyH - app.Scale(4);
+            int thumbH = trackH * visRows / total;
+            if (thumbH < app.Scale(24)) { thumbH = app.Scale(24); }
+            int maxStart = total - visRows;
+            int thumbY = trackY;
+            if (maxStart > 0) { thumbY = trackY + (trackH - thumbH) * start / maxStart; }
+
+            int sbId = app.focus.AllocId();
+            bool sbHover = app.focus.IsHovered(sbId);
+            int thumbColor = t.scrollbar;
+            if (sbHover || app.focus.pressedId == sbId) { thumbColor = t.scrollbarHover; }
+            c.FillRoundRect(sbX, thumbY, sbW, thumbH, sbW / 2, thumbColor);
+            app.hitTester.Register(HitRegion.Create(sbId, sbX, trackY, sbW, trackH, 0));
+            if (app.focus.pressedId == sbId && maxStart > 0) {
+                int rel = app.mouseY - trackY - thumbH / 2;
+                int denom = trackH - thumbH;
+                if (denom < 1) { denom = 1; }
+                int ns = rel * maxStart / denom;
+                if (ns < 0) { ns = 0; }
+                if (ns > maxStart) { ns = maxStart; }
+                if (ns != st.scrollRow) { st.scrollRow = ns; st.ScrollChanged.Raise(); app.RequestRedraw(); }
+            }
+        }
+
+        // ---------------- horizontal scrollbar ----------------
+        if (maxScrollX > 0) {
+            int hbH = app.Scale(8);
+            int hbY = bodyTop + bodyH - hbH - app.Scale(2);
+            // The bar spans only the band that actually scrolls, so its thumb
+            // stays a truthful picture of where the middle is.
+            int htrackX = bandX + app.Scale(2);
+            int htrackW = bandW - app.Scale(4);
+            if (htrackW < app.Scale(24)) { htrackW = app.Scale(24); }
+            int thumbW = htrackW * bandW / bandNatW;
+            if (thumbW < app.Scale(24)) { thumbW = app.Scale(24); }
+            int thumbX = htrackX + (htrackW - thumbW) * st.scrollX / maxScrollX;
+            int hbId = app.focus.AllocId();
+            bool hbHover = app.focus.IsHovered(hbId);
+            int hbColor = t.scrollbar;
+            if (hbHover || app.focus.pressedId == hbId) { hbColor = t.scrollbarHover; }
+            c.FillRoundRect(thumbX, hbY, thumbW, hbH, hbH / 2, hbColor);
+            app.hitTester.Register(HitRegion.Create(hbId, htrackX, hbY, htrackW, hbH, 0));
+            if (app.focus.pressedId == hbId) {
+                int rel = app.mouseX - htrackX - thumbW / 2;
+                int denom = htrackW - thumbW;
+                if (denom < 1) { denom = 1; }
+                int ns = rel * maxScrollX / denom;
+                if (ns < 0) { ns = 0; }
+                if (ns > maxScrollX) { ns = maxScrollX; }
+                if (ns != st.scrollX) { st.scrollX = ns; app.RequestRedraw(); }
+            }
+        }
+
+        // ---------------- mouse-wheel scrolls the table body ----------------
+        // Claim the wheel while the pointer is over the body so the surrounding
+        // page doesn't scroll instead, then advance the virtual row window.
+        bool ownsBodyWheel = false;
+        if (visRows > 0) {
+            ownsBodyWheel = app.CaptureWheel(x, bodyTop, viewW, bodyH);
+        }
+        if (st.openMenu < 0 && ownsBodyWheel
+            && maxScrollX > 0 && (app.window.EventMods() & 2) != 0) {
+            // Shift+wheel pans the columns horizontally.
+            int hDelta = app.window.EventKeyCode();
+            int hStep = hDelta / 120;
+            if (hStep == 0) { if (hDelta > 0) { hStep = 1; } else if (hDelta < 0) { hStep = 0 - 1; } }
+            int nsx = st.scrollX - hStep * app.Scale(48);
+            if (nsx < 0) { nsx = 0; }
+            if (nsx > maxScrollX) { nsx = maxScrollX; }
+            if (nsx != st.scrollX) { st.scrollX = nsx; app.RequestRedraw(); }
+        } else if (st.openMenu < 0 && ownsBodyWheel) {
+            if (total > visRows) {
+                int delta = app.window.EventKeyCode();
+                int step = delta / 120;
+                if (step == 0) { if (delta > 0) { step = 1; } else if (delta < 0) { step = 0 - 1; } }
+                if (st.paged) {
+                    // wheel flips whole pages
+                    int totalPages = (total + visRows - 1) / visRows;
+                    int cp = st.pageModel.Get();
+                    int np = cp - step;
+                    if (np < 1) { np = 1; }
+                    if (np > totalPages) { np = totalPages; }
+                    if (np != cp) { st.pageModel.Set(np); app.RequestRedraw(); }
+                } else {
+                    int ns = st.scrollRow - step * 3;
+                    int maxStart = total - visRows;
+                    if (ns < 0) { ns = 0; }
+                    if (ns > maxStart) { ns = maxStart; }
+                    if (ns != st.scrollRow) { st.scrollRow = ns; st.ScrollChanged.Raise(); app.RequestRedraw(); }
+                }
+            }
+        }
+
+        // ---------------- header set-filter menu (overlay, drawn last) ----------------
+        if (st.openMenu >= 0 && st.openMenu < cols.Count) {
+            DataTable.RenderMenu(app, x, y, viewW, headerH, numW, selW, cols, src, st);
+        }
+
+        // ---------------- right-click context menu (overlay) ----------------
+        if (st.ctxOpen) {
+            DataTable.RenderContextMenu(app, x, y, viewW, viewH, cols, src, st);
+        }
+
+        // ---------------- header column context menu (overlay) ----------------
+        if (st.hdrCtxOpen) {
+            DataTable.RenderHeaderMenu(app, x, y, viewW, viewH, cols, src, st);
+        }
+
+        // ---------------- chart-from-selection overlay ----------------
+        if (st.chartOpen) {
+            DataTable.RenderChart(app, x, y, viewW, viewH, st);
+        }
+
+        // ---------------- transient toast (copy/export feedback) ----------------
+        if (st.toastFrames > 0 && st.toast.Length > 0) {
+            int tfs = t.fontSizeSmall;
+            int tw = Canvas.MeasureText(st.toast, tfs) + app.Scale(24);
+            int th = t.heightMedium;
+            int tx = x + (viewW - tw) / 2;
+            int tyy = y + viewH - th - app.Scale(12);
+            c.FillRoundRect(tx, tyy, tw, th, t.borderRadiusMedium, t.textPrimary);
+            c.DrawTextCentered(tx, tyy, tw, th, st.toast, t.bgPrimary, tfs);
+            st.toastFrames = st.toastFrames - 1;
+            if (st.toastFrames > 0) { app.RequestRedraw(); }
+        }
+    }
+
+}

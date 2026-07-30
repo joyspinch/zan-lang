@@ -28,11 +28,27 @@ class StyleSheet {
     /// ("hover", "active", "focus", "disabled"; "" = base look only).
     string state;
 
+    // ---- selector index (the cascade) --------------------------------------
+    // Selectors are parsed once into their parts so resolution is a real match
+    // ("does this rule apply to this control?") instead of a lookup of the few
+    // selector spellings a resolver thought to try. That is what makes
+    // compound selectors (`button.ghost.primary:hover`) work, and it is why a
+    // component's default look can live in a stylesheet instead of in code.
+    List<string> selText;
+    List<string> selType;
+    List<string> selClasses;   // space separated, "" when the rule names none
+    List<string> selId;
+    List<string> selPart;
+    List<string> selState;
+    List<int> selSpec;
+    int indexedCount;
+
     static StyleSheet Create() {
         StyleSheet s = new StyleSheet();
         s.rules = JsonValue.NewObject();
         s.vars = JsonValue.NewObject();
         s.state = "";
+        s.indexedCount = 0 - 1;
         return s;
     }
 
@@ -104,6 +120,94 @@ class StyleSheet {
             StyleSheet.Decl(b, k, StyleSheet.ValStr(v));
             i = i + 1;
         }
+    }
+
+    // ---- the cascade -------------------------------------------------------
+
+    /// Applies every rule that matches a control to `b`, weakest match first,
+    /// so the most specific declaration wins. `classes` is the control's class
+    /// list, `part` selects `type::part` rules ("" for the control itself) and
+    /// `stateBits` is a Style.S* mask.
+    ///
+    /// Ordering is state-dominant: all stateless rules apply first (by CSS
+    /// specificity: type < class < class chain < id), then the rules of every
+    /// active state, so `:hover` only names what changes no matter where the
+    /// author put it in the file.
+    void ApplyMatch(StyleBox b, string type, string cls, string id, string part,
+                    int stateBits) {
+        this.Index();
+        List<string> want = Style.Classes(cls);
+        int i = 0;
+        while (i < selText.Count) {
+            if (this.Matches(i, type, want, id, part, stateBits)) {
+                this.ApplyBox(b, selText[i]);
+            }
+            i = i + 1;
+        }
+    }
+
+    /// True when rule `i` selects the given control/part/state.
+    bool Matches(int i, string type, List<string> classes, string id,
+                 string part, int stateBits) {
+        if (selPart[i] != part) { return false; }
+        if (selType[i] != "" && selType[i] != type) { return false; }
+        if (selId[i] != "" && (id == "" || selId[i] != id)) { return false; }
+        string st = selState[i];
+        if (st != "") {
+            int bit = Style.StateBit(st);
+            if (bit == 0) { return false; }
+            if ((stateBits / bit) % 2 != 1) { return false; }
+        }
+        if (selClasses[i] == "") { return true; }
+        List<string> need = Style.Classes(selClasses[i]);
+        int k = 0;
+        while (k < need.Count) {
+            if (!StyleSheet.Holds(classes, need[k])) { return false; }
+            k = k + 1;
+        }
+        return true;
+    }
+
+    static bool Holds(List<string> list, string name) {
+        int i = 0;
+        while (i < list.Count) {
+            if (list[i] == name) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    /// Parses every selector once and keeps the rules ordered by weight, so a
+    /// match is a scan of an already sorted table.
+    void Index() {
+        if (rules == null) { return; }
+        if (indexedCount == rules.Count()) { return; }
+        selText = new List<string>();
+        selType = new List<string>();
+        selClasses = new List<string>();
+        selId = new List<string>();
+        selPart = new List<string>();
+        selState = new List<string>();
+        selSpec = new List<int>();
+        int i = 0;
+        while (i < rules.Count()) {
+            string sel = rules.KeyAt(i);
+            i = i + 1;
+            Selector p = Selector.Parse(sel);
+            if (p == null) { continue; }
+            int spec = p.Specificity();
+            // Insert last among the rules of equal weight (document order).
+            int at = selSpec.Count;
+            while (at > 0 && selSpec[at - 1] > spec) { at = at - 1; }
+            selText.Insert(at, sel);
+            selType.Insert(at, p.type);
+            selClasses.Insert(at, p.classes);
+            selId.Insert(at, p.id);
+            selPart.Insert(at, p.part);
+            selState.Insert(at, p.state);
+            selSpec.Insert(at, spec);
+        }
+        indexedCount = rules.Count();
     }
 
     /// A declaration value as text (numbers stringify so `radius: 8` in a JSON

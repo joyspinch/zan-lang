@@ -1,0 +1,430 @@
+using System;
+using System.Json;
+using Gui;
+
+namespace Gui.Component.DataTable;
+
+/// Layout persistence for DataTable: the view state a user builds up by hand —
+/// column widths, order, visibility, freezing, sort keys, grouping, per-column
+/// aggregates and the full filter stack — serialised to JSON and read back.
+///
+///   string s = DataTable.SaveLayout(st, cols);   // e.g. into a settings file
+///   DataTable.LoadLayout(st, cols, s);           // next launch
+///
+/// Columns are keyed by `DataColumn.Field` name, never by position, so a layout
+/// keeps its meaning after columns are inserted, moved or renamed. A column the
+/// layout doesn't mention keeps its declared defaults; a name in the layout that
+/// no longer exists is skipped. That makes `LoadLayout` safe to point at a stale
+/// file — it degrades to a partial restore instead of discarding the layout or
+/// mis-assigning one column's width to another.
+///
+/// Unnamed columns (`field == ""`) cannot be addressed and are skipped by both
+/// directions: naming a column with `DataColumn.Field` is what opts it in.
+partial class DataTable {
+    /// Layout format version, written as `ver`. Bumped when the shape changes so
+    /// a future reader can migrate rather than mis-parse; `LoadLayout` refuses a
+    /// version it doesn't know.
+    static int LayoutVersion() { return 1; }
+
+    // ---------- save ----------
+
+    /// Serialise `st`'s view state to a JSON string. Only state a *user* changes
+    /// is written: scroll offset, selection, in-flight edits and drag state are
+    /// deliberately left out, since restoring them would fight the next session.
+    static string SaveLayout(DataTableState st, List<DataColumn> cols) {
+        JsonValue root = JsonValue.NewObject();
+        root.Put("ver", JsonValue.NewNum(Convert.ToString(DataTable.LayoutVersion())));
+
+        // ---- per-column state, keyed by field name ----
+        JsonValue arr = JsonValue.NewArray();
+        int i = 0;
+        while (i < cols.Count) {
+            string f = cols[i].field;
+            // An unnamed column can't be matched on load, so writing it would
+            // only add noise the reader must skip anyway.
+            if (f.Length > 0) {
+                JsonValue c = JsonValue.NewObject();
+                c.Put("field", JsonValue.NewStr(f));
+                if (i < st.colWidths.Count) {
+                    c.Put("w", JsonValue.NewNum(Convert.ToString(st.colWidths[i])));
+                }
+                if (i < st.colHidden.Count && st.colHidden[i]) {
+                    c.Put("hidden", JsonValue.NewBool(true));
+                }
+                if (i < st.colFreeze.Count && st.colFreeze[i] != 0) {
+                    c.Put("freeze", JsonValue.NewNum(Convert.ToString(st.colFreeze[i])));
+                }
+                if (i < st.aggMode.Count && st.aggMode[i] != 0) {
+                    c.Put("agg", JsonValue.NewNum(Convert.ToString(st.aggMode[i])));
+                }
+                if (i < st.filterRowText.Count && st.filterRowText[i].Length > 0) {
+                    c.Put("frow", JsonValue.NewStr(st.filterRowText[i]));
+                }
+                if (i < st.filters.Count) {
+                    JsonValue fj = DataTable.FilterToJson(st.filters[i]);
+                    if (fj != null) { c.Put("filter", fj); }
+                }
+                arr.Append(c);
+            }
+            i = i + 1;
+        }
+        root.Put("cols", arr);
+
+        // ---- column order, as field names in display sequence ----
+        JsonValue ord = JsonValue.NewArray();
+        int o = 0;
+        while (o < st.colOrder.Count) {
+            int ci = st.colOrder[o];
+            if (ci >= 0 && ci < cols.Count && cols[ci].field.Length > 0) {
+                ord.Append(JsonValue.NewStr(cols[ci].field));
+            }
+            o = o + 1;
+        }
+        root.Put("order", ord);
+
+        // ---- sort keys, outer to inner ----
+        JsonValue sk = JsonValue.NewArray();
+        int s = 0;
+        while (s < st.sortKeys.Count) {
+            int sc = st.sortKeys[s].col;
+            if (sc >= 0 && sc < cols.Count && cols[sc].field.Length > 0) {
+                JsonValue e = JsonValue.NewObject();
+                e.Put("field", JsonValue.NewStr(cols[sc].field));
+                e.Put("dir", JsonValue.NewNum(Convert.ToString(st.sortKeys[s].dir)));
+                sk.Append(e);
+            }
+            s = s + 1;
+        }
+        root.Put("sort", sk);
+
+        // ---- grouping columns, outer to inner ----
+        JsonValue gr = JsonValue.NewArray();
+        int g = 0;
+        while (g < st.groupCols.Count) {
+            int gc = st.groupCols[g];
+            if (gc >= 0 && gc < cols.Count && cols[gc].field.Length > 0) {
+                gr.Append(JsonValue.NewStr(cols[gc].field));
+            }
+            g = g + 1;
+        }
+        root.Put("group", gr);
+
+        // ---- collapsed header bands (already keyed by their own path) ----
+        JsonValue bc = JsonValue.NewArray();
+        int b = 0;
+        while (b < st.bandCollapsed.Count) {
+            bc.Append(JsonValue.NewStr(st.bandCollapsed[b]));
+            b = b + 1;
+        }
+        root.Put("bands", bc);
+
+        // ---- expanded master-detail rows, by source row index ----
+        // Row indices only mean anything against the same data, so this restores
+        // usefully for a stable table and harmlessly (an unrelated row opens) for
+        // one whose rows have shifted — the panel itself is always redrawn from
+        // the current data.
+        JsonValue ex = JsonValue.NewArray();
+        int e2 = 0;
+        while (e2 < st.expandedRows.Count) {
+            ex.Append(JsonValue.NewNum(Convert.ToString(st.expandedRows[e2])));
+            e2 = e2 + 1;
+        }
+        root.Put("expanded", ex);
+
+        // ---- table-level toggles ----
+        JsonValue v = JsonValue.NewObject();
+        v.Put("rowNum", JsonValue.NewBool(st.showRowNum));
+        v.Put("select", JsonValue.NewBool(st.showSelect));
+        v.Put("striped", JsonValue.NewBool(st.striped));
+        v.Put("summary", JsonValue.NewBool(st.showSummary));
+        v.Put("filterRow", JsonValue.NewBool(st.showFilterRow));
+        v.Put("statusBar", JsonValue.NewBool(st.showStatusBar));
+        v.Put("paged", JsonValue.NewBool(st.paged));
+        root.Put("view", v);
+
+        return root.ToJson();
+    }
+
+    /// Serialise one column's filter, or null when it carries no active stage —
+    /// an unfiltered column contributes nothing to the layout.
+    static JsonValue FilterToJson(ColFilter f) {
+        if (!f.Active()) { return null; }
+        JsonValue o = JsonValue.NewObject();
+        if (f.hidden.Count > 0) {
+            JsonValue h = JsonValue.NewArray();
+            int i = 0;
+            while (i < f.hidden.Count) {
+                h.Append(JsonValue.NewStr(f.hidden[i]));
+                i = i + 1;
+            }
+            o.Put("hidden", h);
+        }
+        if (f.textQuery.Length > 0) {
+            o.Put("tq", JsonValue.NewStr(f.textQuery));
+            o.Put("tm", JsonValue.NewNum(Convert.ToString(f.textMode)));
+        }
+        if (f.batchTerms.Count > 0) {
+            JsonValue b = JsonValue.NewArray();
+            int i = 0;
+            while (i < f.batchTerms.Count) {
+                b.Append(JsonValue.NewStr(f.batchTerms[i]));
+                i = i + 1;
+            }
+            o.Put("batch", b);
+            o.Put("bExact", JsonValue.NewBool(f.batchExact));
+            o.Put("bKeep", JsonValue.NewBool(f.batchKeep));
+        }
+        if (f.cmpMode != 0) {
+            o.Put("cmp", JsonValue.NewNum(Convert.ToString(f.cmpMode)));
+            o.Put("cmpA", JsonValue.NewStr(f.cmpA));
+            o.Put("cmpB", JsonValue.NewStr(f.cmpB));
+        }
+        if (f.datePreset != 0) {
+            o.Put("dpre", JsonValue.NewNum(Convert.ToString(f.datePreset)));
+        }
+        if (f.topMode != 0) {
+            o.Put("top", JsonValue.NewNum(Convert.ToString(f.topMode)));
+            o.Put("topN", JsonValue.NewNum(Convert.ToString(f.topN)));
+        }
+        return o;
+    }
+
+    // ---------- load ----------
+
+    /// Restore a layout written by `SaveLayout`. Returns false — leaving `st`
+    /// untouched — when the text isn't a usable layout of a known version, so a
+    /// corrupt or foreign settings file can't half-apply.
+    ///
+    /// Safe to call before the grid's first frame: the index-aligned per-column
+    /// lists are grown to fit `cols` first.
+    static bool LoadLayout(DataTableState st, List<DataColumn> cols, string text) {
+        if (text.Length == 0) { return false; }
+        JsonValue root = JsonValue.ParseLenient(text);
+        if (root == null) { return false; }
+        if (!root.IsObject()) { return false; }
+        int ver = root.Int("ver", 0);
+        // Refuse a version this build doesn't understand rather than guess at a
+        // shape that may have moved fields around.
+        if (ver != DataTable.LayoutVersion()) { return false; }
+
+        // The per-column lists are index-aligned with `cols`; make sure they are
+        // long enough before writing through a column index, so a layout loaded
+        // before the first frame can't run off the end.
+        DataTable.EnsureLayoutSlots(st, cols);
+
+        DataTable.LoadColumnState(st, cols, root);
+        DataTable.LoadColumnOrder(st, cols, root);
+        DataTable.LoadSortKeys(st, cols, root);
+        DataTable.LoadGrouping(st, cols, root);
+        DataTable.LoadCollapsedBands(st, root);
+        DataTable.LoadExpandedRows(st, root);
+        DataTable.LoadViewToggles(st, root);
+
+        // Restoring a layout invalidates the derived view (order, groups,
+        // aggregates, conditional-format ranges); the next Recompute rebuilds it.
+        st.dirty = true;
+        return true;
+    }
+
+    /// per-column state: width / hidden / freeze / aggregate / filter row / filter.
+    static void LoadColumnState(DataTableState st, List<DataColumn> cols, JsonValue root) {
+        JsonValue arr = root.Get("cols");
+        if (arr != null && arr.IsArray()) {
+            int i = 0;
+            while (i < arr.Count()) {
+                JsonValue c = arr.At(i);
+                if (c.IsObject()) {
+                    int ci = DataTable.Col(cols, c.Str("field", ""));
+                    // A column named in the layout but absent from this table
+                    // (renamed, or dropped in a later version) is skipped.
+                    if (ci >= 0) {
+                        int w = c.Int("w", 0);
+                        // Guard against a zero/negative width in a hand-edited
+                        // file collapsing the column to nothing.
+                        if (w > 0) { st.colWidths[ci] = w; }
+                        st.colHidden[ci] = c.Bool("hidden", false);
+                        int fz = c.Int("freeze", 0);
+                        if (fz >= 0 && fz <= 2) { st.colFreeze[ci] = fz; }
+                        int ag = c.Int("agg", 0);
+                        if (ag >= 0 && ag <= 6) { st.aggMode[ci] = ag; }
+                        st.filterRowText[ci] = c.Str("frow", "");
+                        st.filters[ci].Reset();
+                        JsonValue fj = c.Get("filter");
+                        if (fj != null && fj.IsObject()) {
+                            DataTable.FilterFromJson(st.filters[ci], fj);
+                        }
+                    }
+                }
+                i = i + 1;
+            }
+        }
+    }
+
+    /// column order: listed columns first, in the saved sequence, then any
+    /// column the layout didn't mention (one added since it was written) in its
+    /// declared position, so no column goes missing.
+    static void LoadColumnOrder(DataTableState st, List<DataColumn> cols, JsonValue root) {
+        JsonValue ord = root.Get("order");
+        if (ord != null && ord.IsArray() && ord.Count() > 0) {
+            List<int> next = new List<int>();
+            int o = 0;
+            while (o < ord.Count()) {
+                int ci = DataTable.Col(cols, ord.At(o).AsString(""));
+                if (ci >= 0 && next.IndexOf(ci) < 0) { next.Add(ci); }
+                o = o + 1;
+            }
+            int c2 = 0;
+            while (c2 < cols.Count) {
+                if (next.IndexOf(c2) < 0) { next.Add(c2); }
+                c2 = c2 + 1;
+            }
+            st.colOrder = next;
+        }
+    }
+
+    /// sort keys, with sortCol/sortDir mirroring the primary key for back-compat.
+    static void LoadSortKeys(DataTableState st, List<DataColumn> cols, JsonValue root) {
+        st.sortKeys.Clear();
+        st.sortCol = -1;
+        st.sortDir = 1;
+        JsonValue sk = root.Get("sort");
+        if (sk != null && sk.IsArray()) {
+            int s = 0;
+            while (s < sk.Count()) {
+                JsonValue e = sk.At(s);
+                if (e.IsObject()) {
+                    int ci = DataTable.Col(cols, e.Str("field", ""));
+                    int dir = e.Int("dir", 1);
+                    if (ci >= 0 && (dir == 1 || dir == 2)) {
+                        st.sortKeys.Add(new SortKey(ci, dir));
+                    }
+                }
+                s = s + 1;
+            }
+        }
+        // sortCol/sortDir mirror the primary key for back-compat (see
+        // DataTableState), so keep them consistent with the list just built.
+        if (st.sortKeys.Count > 0) {
+            st.sortCol = st.sortKeys[0].col;
+            st.sortDir = st.sortKeys[0].dir;
+        }
+    }
+
+    /// grouping columns; collapse state starts fresh (keys on group values).
+    static void LoadGrouping(DataTableState st, List<DataColumn> cols, JsonValue root) {
+        st.groupCols.Clear();
+        // Collapse state keys on group *values*, which mean nothing until the
+        // groups are rebuilt, so it starts fresh: every group opens.
+        st.collapsedKeys.Clear();
+        JsonValue gr = root.Get("group");
+        if (gr != null && gr.IsArray()) {
+            int g = 0;
+            while (g < gr.Count()) {
+                int ci = DataTable.Col(cols, gr.At(g).AsString(""));
+                if (ci >= 0 && st.groupCols.IndexOf(ci) < 0) { st.groupCols.Add(ci); }
+                g = g + 1;
+            }
+        }
+    }
+
+    /// collapsed header bands; the hidden columns are re-derived next frame.
+    static void LoadCollapsedBands(DataTableState st, JsonValue root) {
+        st.bandCollapsed.Clear();
+        // Which columns a collapsed band hid is re-derived on the next frame.
+        st.bandAutoHidden.Clear();
+        JsonValue bc = root.Get("bands");
+        if (bc != null && bc.IsArray()) {
+            int b = 0;
+            while (b < bc.Count()) {
+                string p = bc.At(b).AsString("");
+                if (p.Length > 0) { st.bandCollapsed.Add(p); }
+                b = b + 1;
+            }
+        }
+    }
+
+    /// expanded master-detail rows (each still vetted via CanExpand on flatten).
+    static void LoadExpandedRows(DataTableState st, JsonValue root) {
+        // A row still gets vetted through CanExpand on flattening, so a stale
+        // index can't force a band the provider would refuse.
+        st.expandedRows.Clear();
+        JsonValue ex = root.Get("expanded");
+        if (ex != null && ex.IsArray()) {
+            int e2 = 0;
+            while (e2 < ex.Count()) {
+                int rw = ex.At(e2).AsInt(-1);
+                if (rw >= 0 && st.expandedRows.IndexOf(rw) < 0) { st.expandedRows.Add(rw); }
+                e2 = e2 + 1;
+            }
+        }
+    }
+
+    /// table-level display toggles.
+    static void LoadViewToggles(DataTableState st, JsonValue root) {
+        JsonValue v = root.Get("view");
+        if (v != null && v.IsObject()) {
+            st.showRowNum = v.Bool("rowNum", st.showRowNum);
+            st.showSelect = v.Bool("select", st.showSelect);
+            st.striped = v.Bool("striped", st.striped);
+            st.showSummary = v.Bool("summary", st.showSummary);
+            st.showFilterRow = v.Bool("filterRow", st.showFilterRow);
+            st.showStatusBar = v.Bool("statusBar", st.showStatusBar);
+            st.paged = v.Bool("paged", st.paged);
+        }
+    }
+
+    /// Restore one column's filter from its saved object. The caller resets the
+    /// filter first, so only the stages the layout carries are set.
+    static void FilterFromJson(ColFilter f, JsonValue o) {
+        JsonValue h = o.Get("hidden");
+        if (h != null && h.IsArray()) {
+            int i = 0;
+            while (i < h.Count()) {
+                f.hidden.Add(h.At(i).AsString(""));
+                i = i + 1;
+            }
+        }
+        f.textQuery = o.Str("tq", "");
+        f.textMode = o.Int("tm", 1);
+        JsonValue b = o.Get("batch");
+        if (b != null && b.IsArray()) {
+            int i = 0;
+            while (i < b.Count()) {
+                f.batchTerms.Add(b.At(i).AsString(""));
+                i = i + 1;
+            }
+        }
+        f.batchExact = o.Bool("bExact", false);
+        f.batchKeep = o.Bool("bKeep", true);
+        int cm = o.Int("cmp", 0);
+        if (cm >= 0 && cm <= 10) { f.cmpMode = cm; }
+        f.cmpA = o.Str("cmpA", "");
+        f.cmpB = o.Str("cmpB", "");
+        int dp = o.Int("dpre", 0);
+        if (dp >= 0 && dp <= 11) { f.datePreset = dp; }
+        int tm2 = o.Int("top", 0);
+        if (tm2 >= 0 && tm2 <= 6) { f.topMode = tm2; }
+        f.topN = o.Int("topN", 10);
+    }
+
+    /// Grow the index-aligned per-column lists to cover every column, so
+    /// LoadLayout can write through a column index even when it runs before the
+    /// grid's own first-frame init. Mirrors the tail of EnsureInit.
+    static void EnsureLayoutSlots(DataTableState st, List<DataColumn> cols) {
+        int i = st.colWidths.Count;
+        while (i < cols.Count) { st.colWidths.Add(cols[i].width); i = i + 1; }
+        while (st.filters.Count < cols.Count) { st.filters.Add(ColFilter.Create()); }
+        int a = st.aggMode.Count;
+        while (a < cols.Count) { st.aggMode.Add(cols[a].summary); a = a + 1; }
+        while (st.summaryText.Count < cols.Count) { st.summaryText.Add(""); }
+        while (st.colHidden.Count < cols.Count) { st.colHidden.Add(false); }
+        int fz = st.colFreeze.Count;
+        while (fz < cols.Count) { st.colFreeze.Add(cols[fz].freeze); fz = fz + 1; }
+        while (st.filterRowText.Count < cols.Count) { st.filterRowText.Add(""); }
+        int co = 0;
+        while (co < cols.Count) {
+            if (st.colOrder.IndexOf(co) < 0) { st.colOrder.Add(co); }
+            co = co + 1;
+        }
+    }
+}
