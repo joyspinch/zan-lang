@@ -3,9 +3,56 @@ using Gui;
 
 namespace Gui.Widget;
 
-/// Accordion (NaiveUI n-collapse). Single panel open at a time; `openIdx`
-/// holds the open panel index (-1 = all collapsed).
-class Collapse {
+/// Accordion (NaiveUI n-collapse). One panel open at a time; `Active` holds the
+/// open panel index (-1 = all collapsed) and is two-way bindable:
+///
+///     Collapse c = new Collapse();
+///     c.AddPanel("General", "Theme, language and startup");
+///     c.Active = vm.openPanel;
+class Collapse : Control {
+    List<string> titles;
+    List<string> bodies;
+    SignalInt open;
+    /// Two-way open index; -1 collapses every panel.
+    Binding<int> Active;
+    /// Fires when a header toggles the open panel.
+    UiEvent Change;
+    int baseId;
+    int idCount;
+
+    void InitCollapse(SignalInt m) {
+        this.InitControl("collapse", 1);
+        titles = new List<string>();
+        bodies = new List<string>();
+        open = m;
+        baseId = 0;
+        idCount = 0;
+        wiresOwnEvents = true;
+        Change = UiEvent.Create();
+    }
+
+    Collapse() { InitCollapse(SignalInt.Create(0 - 1)); }
+    Collapse(SignalInt m) { InitCollapse(m); }
+
+    /// Named AddPanel (not Add) so it does not shadow Control.Add(Control).
+    void AddPanel(string title, string body) {
+        titles.Add(title);
+        bodies.Add(body);
+    }
+
+    /// An accordion over existing title/body lists.
+    static Collapse Of(List<string> titles, List<string> bodies, SignalInt m) {
+        Collapse col = new Collapse(m);
+        int i = 0;
+        while (i < titles.Count) {
+            string b = "";
+            if (i < bodies.Count) { b = bodies[i]; }
+            col.AddPanel(titles[i], b);
+            i = i + 1;
+        }
+        return col;
+    }
+
     static int HeaderHeight(App app) {
         return app.theme.heightLarge;
     }
@@ -20,78 +67,136 @@ class Collapse {
         return h;
     }
 
-    static int Render(App app, int x, int y, int w,
-                      List<string> titles, List<string> bodies, SignalInt openIdx) {
-        int n = titles.Count;
-        int firstId = app.focus.AllocId();
-        int i = 1;
-        while (i < n) {
-            app.focus.AllocId();
-            i = i + 1;
-        }
+    /// Panel headers take one id each, reserved as one contiguous block so the
+    /// hit ids stay stable while the panel list does not change.
+    void EnsureIds() {
+        if (idCount >= titles.Count) { return; }
+        baseId = WidgetId.Block(titles.Count);
+        idCount = titles.Count;
+    }
 
+    void SyncBinding() {
+        if (Active == null) { return; }
+        int cur = Active.Get();
+        if (cur != open.Get()) { open.Set(cur); }
+    }
+
+    override void OnMeasure(App app) {
+        StyleBox s = this.ResolveStyleAs(app, "collapse", Class,
+                                         Style.SNormal());
+        prefH = Collapse.Height(app, titles.Count, open);
+        prefW = s.WidthOr(app.Scale(240));
+    }
+
+    override void OnPaint(App app) {
         Canvas c = app.canvas;
         Theme t = app.theme;
-        int open = openIdx.Get();
-        int headerH = Collapse.HeaderHeight(app);
-        int bodyH = Collapse.BodyHeight(app);
-        int ico = t.iconSizeSmall;
-        int cy = y;
+        this.SyncBinding();
+        this.EnsureIds();
+        StyleBox hs = this.ResolvePartAs(app, "collapse", "header", "", Class,
+                                         Style.SNormal());
+        StyleBox as2 = this.ResolvePartAs(app, "collapse", "arrow", "", Class,
+                                          Style.SNormal());
+        StyleBox bs = this.ResolvePartAs(app, "collapse", "body", "", Class,
+                                         Style.SNormal());
+        int headerH = hs.HeightOr(Collapse.HeaderHeight(app));
+        int bodyH = bs.HeightOr(Collapse.BodyHeight(app));
+        int headFont = hs.FontOr(t.fontSizeMedium);
+        int bodyFont = bs.FontOr(t.fontSizeSmall);
+        int ico = as2.WidthOr(t.iconSizeSmall);
+        int n = titles.Count;
+        int opened = open.Get();
+        int cy = by;
 
         // Clip everything to the accordion's own box so long titles/body text
         // are truncated instead of spilling out to the right or below.
-        int totalH = Collapse.Height(app, n, openIdx);
-        c.PushClip(x, y, w, totalH);
-
-        i = 0;
+        c.PushClip(bx, by, bw, bh);
+        int i = 0;
         while (i < n) {
-            int id = firstId + i;
-            bool hovered = app.focus.IsHovered(id);
-            bool isOpen = i == open;
-
-            if (i > 0) { c.FillRect(x, cy, w, 1, t.divider); }
-
-            int hbg = t.bgPrimary;
-            if (hovered) { hbg = t.bgHover; }
-            c.FillRect(x, cy + 1, w, headerH - 1, hbg);
+            int id = baseId + i;
+            bool isOpen = i == opened;
+            if (i > 0) { c.FillRect(bx, cy, bw, 1, t.divider); }
+            int hbg = hs.BgOr(t.bgPrimary);
+            if (app.focus.IsHovered(id)) {
+                hbg = this.ResolvePartAs(app, "collapse", "header", "",
+                                         Class, Style.SHover())
+                    .BgOr(t.bgHover);
+            }
+            c.FillRect(bx, cy + 1, bw, headerH - 1, hbg);
 
             string ar = "chevron-right";
             if (isOpen) { ar = "chevron-down"; }
-            c.DrawGlyph(ar, x + t.paddingMedium, cy + (headerH - ico) / 2, ico, t.textSecondary);
+            c.DrawGlyph(ar, bx + t.paddingMedium, cy + (headerH - ico) / 2, ico,
+                        as2.FgOr(t.textSecondary));
 
-            int textX = x + t.paddingMedium + ico + t.gapMedium;
-            int textMaxW = x + w - t.paddingMedium - textX;
-            c.DrawText(textX, cy + (headerH - Canvas.FontHeight(t.fontSizeMedium)) / 2,
-                       Ellipsis.Fit(titles[i], textMaxW, t.fontSizeMedium),
-                       t.textPrimary, t.fontSizeMedium);
+            int textX = bx + t.paddingMedium + ico + t.gapMedium;
+            int textMaxW = bx + bw - t.paddingMedium - textX;
+            c.DrawText(textX, cy + (headerH - Canvas.FontHeight(headFont)) / 2,
+                       Ellipsis.Fit(titles[i], textMaxW, headFont),
+                       hs.FgOr(t.textPrimary), headFont);
 
-            app.hitTester.Register(HitRegion.Create(id, x, cy, w, headerH, 0));
+            app.hitTester.Register(HitRegion.Create(id, bx, cy, bw, headerH, 0));
             cy = cy + headerH;
 
             if (isOpen && i < bodies.Count) {
-                c.FillRect(x, cy, w, bodyH, t.bgSecondary);
-                c.DrawText(textX, cy + (bodyH - Canvas.FontHeight(t.fontSizeSmall)) / 2,
-                           Ellipsis.Fit(bodies[i], textMaxW, t.fontSizeSmall),
-                           t.textSecondary, t.fontSizeSmall);
+                c.FillRect(bx, cy, bw, bodyH, bs.BgOr(t.bgSecondary));
+                c.DrawText(textX,
+                           cy + (bodyH - Canvas.FontHeight(bodyFont)) / 2,
+                           Ellipsis.Fit(bodies[i], textMaxW, bodyFont),
+                           bs.FgOr(t.textSecondary), bodyFont);
                 cy = cy + bodyH;
             }
             i = i + 1;
         }
         c.PopClip();
-        return firstId;
+
+        if (this.IsDisabled() || app.EventKind() != 3) { return; }
+        int hit = app.ClickTarget();
+        if (hit < baseId || hit >= baseId + n) { return; }
+        int idx = hit - baseId;
+        if (open.Get() == idx) { idx = 0 - 1; }
+        open.Set(idx);
+        if (Active != null) { Active.Set(idx); }
+        Change.Raise();
+        app.RequestRedraw();
     }
 
-    static void HandleClick(App app, int firstId, int count, SignalInt openIdx) {
-        if (app.EventKind() != 3) { return; }
-        int hit = app.ClickTarget();
-        if (hit >= firstId && hit < firstId + count) {
-            int idx = hit - firstId;
-            if (openIdx.Get() == idx) {
-                openIdx.Set(-1);
-            } else {
-                openIdx.Set(idx);
-            }
-            app.RequestRedraw();
-        }
+    // ---- designer / serialization model -------------------------------------
+
+    override string Kind() { return "Collapse"; }
+
+    override List<PropSpec> Props() {
+        List<PropSpec> ps = new List<PropSpec>();
+        ps.Add(PropSpec.Text("titles", "Panel titles (comma separated)"));
+        ps.Add(PropSpec.Text("bodies", "Panel bodies (comma separated)"));
+        PropSpec act = PropSpec.Int("active", "Open panel (-1 = none)");
+        act.snum = open;
+        ps.Add(act);
+        ps.Add(PropSpec.Text("class", "Classes"));
+        return ps;
+    }
+
+    /// Panels are lists, so they travel as comma-separated values.
+    override string GetExtra(string key) {
+        if (key == "titles") { return string.Join(",", titles); }
+        if (key == "bodies") { return string.Join(",", bodies); }
+        return "";
+    }
+
+    override bool SetExtra(string key, string val) {
+        if (key == "titles") { titles = val.Split(","); return true; }
+        if (key == "bodies") { bodies = val.Split(","); return true; }
+        return false;
+    }
+
+    override List<string> Events() {
+        List<string> e = Control.CommonEvents();
+        e.Add("Change");
+        return e;
+    }
+
+    override void BindEvent(string evt, Action a) {
+        if (evt == "Change") { Change.Add(a); return; }
+        On.AddByName(evt, a);
     }
 }

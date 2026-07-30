@@ -5,9 +5,55 @@ namespace Gui.Widget;
 
 /// A read-only code panel: a captioned header with a copy action and the
 /// scrollable, monospaced-looking source lines below it. The caller owns the
-/// lines, the scroll signal and what "copy" does, so the widget carries no
-/// knowledge of the language or the document it shows.
-class CodeBlock {
+/// lines and what "copy" does, so the widget carries no knowledge of the
+/// language or the document it shows.
+///
+///     CodeBlock cb = new CodeBlock("Zan", lines);
+///     cb.Copy += () => { Clipboard.Set(text); };
+///     cb.RenderInside(app, rect);
+class CodeBlock : Control {
+    List<string> lines;
+    /// Header caption, usually the language.
+    Binding<string> Caption;
+    /// Label on the copy action.
+    Binding<string> CopyLabel;
+    SignalInt scroll;
+    bool copied;
+    int wid;
+    /// Fires when the copy action is clicked.
+    UiEvent Copy;
+
+    void InitCodeBlock(string caption, List<string> src) {
+        this.InitControl("codeblock", 1);
+        lines = src;
+        Caption = caption;
+        CopyLabel = "Copy";
+        scroll = SignalInt.Create(0);
+        copied = false;
+        wid = WidgetId.Next();
+        wiresOwnEvents = true;
+        Copy = UiEvent.Create();
+    }
+
+    CodeBlock() { InitCodeBlock("", new List<string>()); }
+    CodeBlock(string caption, List<string> src) { InitCodeBlock(caption, src); }
+
+    /// Scrolls through a signal the host owns, so the offset survives a
+    /// rebuild of the panel.
+    void UseScroll(SignalInt s) {
+        scroll = s;
+    }
+
+    /// True when the copy action was clicked in the frame just painted, for
+    /// hosts that would rather test than subscribe to `Copy`.
+    bool Copied() { return copied; }
+
+    /// The lines shown; assigning replaces them and rewinds the scroll.
+    void SetLines(List<string> src) {
+        lines = src;
+        scroll.Set(0);
+    }
+
     static int LineHeight(App app) {
         return Canvas.FontHeight(app.theme.fontSizeSmall) + app.Scale(4);
     }
@@ -20,34 +66,51 @@ class CodeBlock {
             + lineCount * CodeBlock.LineHeight(app) + app.Scale(16);
     }
 
-    /// Renders the panel. Returns true when the copy action was clicked.
-    static bool Render(App app, int x, int y, int w, int h, string caption,
-                       string copyLabel, List<string> lines, SignalInt scroll) {
+    override void OnMeasure(App app) {
+        prefH = CodeBlock.Height(app, lines.Count);
+        int fs = app.theme.fontSizeSmall;
+        int widest = 0;
+        int i = 0;
+        while (i < lines.Count) {
+            int lw = Canvas.MeasureText(lines[i], fs);
+            if (lw > widest) { widest = lw; }
+            i = i + 1;
+        }
+        prefW = widest + app.Scale(34);
+    }
+
+    override void OnPaint(App app) {
         Canvas c = app.canvas;
         Theme t = app.theme;
         EditorPalette pal = EditorPalette.For(t);
+        StyleBox s = this.ResolveStyleAs(app, "codeblock", Class,
+                                         Style.SNormal());
 
         int hdrH = CodeBlock.HeaderHeight(app);
         int lineH = CodeBlock.LineHeight(app);
-        c.FillRoundRect(x, y, w, h, t.borderRadiusMedium, pal.hoverBg);
-        c.DrawRect(x, y, w, h, t.borderPrimary, 1);
-        c.FillRect(x, y + hdrH, w, 1, pal.panelBg);
-        app.canvas.DrawStyledText(
-            Style.Of(app, "label", "hint small", Style.SNormal()),
-            x + app.Scale(12), y + app.Scale(7), caption,
-            app.theme.textPrimary, app.theme.fontSizeMedium);
+        c.FillRoundRect(bx, by, bw, bh, s.RadiusOr(t.borderRadiusMedium),
+                        s.BgOr(pal.hoverBg));
+        c.DrawRect(bx, by, bw, bh, s.BorderOr(t.borderPrimary),
+                   s.BorderWOr(1));
+        c.FillRect(bx, by + hdrH, bw, 1, pal.panelBg);
+        StyleBox cs = this.ResolvePartAs(app, "codeblock", "caption", "", Class,
+                                         Style.SNormal());
+        int capFont = cs.FontOr(t.fontSizeMedium);
+        c.DrawText(bx + app.Scale(12), by + app.Scale(7), Caption.Get(),
+                   cs.FgOr(t.textPrimary), capFont);
 
+        string copyLabel = CopyLabel.Get();
         int cpW = Canvas.MeasureText(copyLabel, t.fontSizeSmall) + app.Scale(34);
         int cpId = new Button { Text = copyLabel, Icon = "copy", Class = "small" }
-            .Render(app, x + w - cpW - app.Scale(8), y + app.Scale(3), cpW);
+            .Render(app, bx + bw - cpW - app.Scale(8), by + app.Scale(3), cpW);
 
-        int textY = y + hdrH + app.Scale(8);
-        int bottom = y + h - app.Scale(6);
+        int textY = by + hdrH + app.Scale(8);
+        int bottom = by + bh - app.Scale(6);
         int visible = (bottom - textY) / lineH;
         if (visible < 1) { visible = 1; }
         int maxScroll = lines.Count - visible;
         if (maxScroll < 0) { maxScroll = 0; }
-        if (app.CaptureWheel(x, y, w, h)) {
+        if (app.CaptureWheel(bx, by, bw, bh)) {
             int delta = app.window.EventKeyCode();
             int step = delta / 120;
             if (step == 0) {
@@ -62,21 +125,25 @@ class CodeBlock {
         if (off < 0) { off = 0; }
         scroll.Set(off);
 
-        c.PushClip(x, y + hdrH, w, h - hdrH);
+        StyleBox ls = this.ResolvePartAs(app, "codeblock", "line", "", Class,
+                                         Style.SNormal());
+        int lineFont = ls.FontOr(t.fontSizeSmall);
+        int lineColor = ls.FgOr(pal.menuText);
+        c.PushClip(bx, by + hdrH, bw, bh - hdrH);
         int i = off;
         while (i < lines.Count && textY + lineH <= bottom) {
-            c.DrawText(x + app.Scale(12), textY, lines[i], pal.menuText,
-                       t.fontSizeSmall);
+            c.DrawText(bx + app.Scale(12), textY, lines[i], lineColor,
+                       lineFont);
             textY = textY + lineH;
             i = i + 1;
         }
         c.PopClip();
 
         if (maxScroll > 0) {
-            int viewH = h - hdrH - app.Scale(8);
+            int viewH = bh - hdrH - app.Scale(8);
             SignalInt px = SignalInt.Create(off * lineH);
-            Scrollbar.RenderVerticalScroll(app, x + w - app.Scale(10),
-                y + hdrH + app.Scale(4), viewH, viewH,
+            Scrollbar.RenderVerticalScroll(app, bx + bw - app.Scale(10),
+                by + hdrH + app.Scale(4), viewH, viewH,
                 lines.Count * lineH, px);
             int moved = px.Get() / lineH;
             if (moved != off) {
@@ -84,6 +151,38 @@ class CodeBlock {
                 app.RequestRedraw();
             }
         }
-        return Ui.Clicked(app, cpId);
+        copied = Ui.Clicked(app, cpId);
+        if (copied) {
+            Copy.Raise();
+            app.RequestRedraw();
+        }
+        On.Fire(app, wid);
+    }
+
+    // ---- designer / serialization model -------------------------------------
+
+    override string Kind() { return "CodeBlock"; }
+
+    override List<PropSpec> Props() {
+        List<PropSpec> ps = new List<PropSpec>();
+        PropSpec cap = PropSpec.Text("caption", "Caption");
+        cap.str = Caption;
+        ps.Add(cap);
+        PropSpec cp = PropSpec.Text("copyLabel", "Copy label");
+        cp.str = CopyLabel;
+        ps.Add(cp);
+        ps.Add(PropSpec.Text("class", "Classes"));
+        return ps;
+    }
+
+    override List<string> Events() {
+        List<string> e = Control.CommonEvents();
+        e.Add("Copy");
+        return e;
+    }
+
+    override void BindEvent(string evt, Action a) {
+        if (evt == "Copy") { Copy.Add(a); return; }
+        On.AddByName(evt, a);
     }
 }
