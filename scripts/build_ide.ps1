@@ -44,8 +44,9 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "SCAN_FAILED" }
 
     $files = @()
-    $files += (Get-ChildItem stdlib\Gui\*.zan).FullName
-    $files += (Get-ChildItem stdlib\Gui\Widget\*.zan).FullName
+    # The GUI stdlib is namespaced across subfolders (Gui root + Widget /
+    # Component/* / Backend / Designer); recurse so every part is compiled.
+    $files += (Get-ChildItem stdlib\Gui -Recurse -Include *.zan).FullName
     $files += (Get-ChildItem src\ide_zan\components\*.zan).FullName
     if (Test-Path src\ide_zan\views) {
         $viewFiles = Get-ChildItem src\ide_zan\views\*.zan -ErrorAction SilentlyContinue
