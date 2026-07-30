@@ -20,25 +20,69 @@ class TabHit {
 
 /// <summary>
 /// A horizontal strip of closable tabs with an optional trailing "+" button —
-/// the document-tab bar of an editor/IDE. Stateless and immediate-mode: the
-/// caller owns the `labels` list and the `active` index signal; Render draws
-/// the bar and returns a TabHit describing any click, and Apply performs the
-/// usual add/close/select bookkeeping on the model.
+/// the document-tab bar of an editor/IDE. The host owns the `labels` list and
+/// the active-index signal; painting and hit testing happen in the control, and
+/// `Hit()` reports the interaction of the frame so a host can veto it (asking
+/// about unsaved edits, raising a per-tab menu) instead of having the model
+/// changed behind its back. `Apply(newLabel)` does the usual bookkeeping.
 ///
-///   TabHit hit = TabView.Render(app, x, y, w, h, files, active, true);
-///   TabView.Apply(hit, files, active, "untitled");
+///   TabView tv = TabView.Of(files, active);
+///   tv.RenderAt(app, x, y, w);
+///   TabHit hit = tv.Hit();
+///   tv.Apply("untitled");
 /// </summary>
-class TabView {
+class TabView : Control {
+    List<string> labels;
+    SignalInt active;
+    /// Two-way active tab index.
+    Binding<int> Active;
+    /// Shows the trailing "+" button.
+    Binding<bool> ShowAdd;
+    TabHit hit;
+    int baseId;
+    int idCount;
+
+    void InitTabView(List<string> src, SignalInt model) {
+        this.InitControl("tabview", 1);
+        labels = src;
+        active = model;
+        ShowAdd = true;
+        hit = TabHit.Create(0, 0 - 1);
+        baseId = 0;
+        idCount = 0;
+        wiresOwnEvents = true;
+    }
+
+    TabView(List<string> src, SignalInt model) { InitTabView(src, model); }
+
+    static TabView Of(List<string> src, SignalInt model) {
+        return new TabView(src, model);
+    }
+
+    /// Strip height, so a host can lay the editor out below the bar before the
+    /// control is measured.
     static int Height(App app) {
         return app.theme.heightLarge;
+    }
+
+    /// The interaction of the last painted frame.
+    TabHit Hit() { return hit; }
+
+    /// Two ids per tab (body + close box) plus the "+" button, reserved as one
+    /// contiguous block so the layout and the hit test agree.
+    void EnsureIds() {
+        int need = labels.Count * 2 + 1;
+        if (idCount >= need) { return; }
+        baseId = WidgetId.Block(need);
+        idCount = need;
     }
 
     /// Registers a hit region intersected with the tab strip's horizontal clip
     /// [clipX, clipX+clipW). The visual strip is clipped with PushClip, but that
     /// only affects drawing — without this clamp an overflowing tab's clickable
     /// rect would extend past the visible strip and swallow clicks outside it.
-    static void RegisterClipped(App app, int id, int rx, int ry, int rw, int rh,
-                                int clipX, int clipW) {
+    void RegisterClipped(App app, int id, int rx, int ry, int rw, int rh,
+                         int clipX, int clipW) {
         int x0 = rx;
         int x1 = rx + rw;
         if (x0 < clipX) { x0 = clipX; }
@@ -47,25 +91,42 @@ class TabView {
         app.hitTester.Register(HitRegion.Create(id, x0, ry, x1 - x0, rh, 0));
     }
 
-    static TabHit Render(App app, int x, int y, int w, int h,
-                         List<string> labels, SignalInt active, bool showAdd) {
-        Canvas c = app.canvas;
-        Theme t = app.theme;
-        int count = labels.Count;
-
-        int firstId = app.focus.AllocId();
-        int need = count * 2;
-        if (showAdd) { need = need + 1; }
-        int i = 1;
-        while (i < need) {
-            app.focus.AllocId();
+    override void OnMeasure(App app) {
+        StyleBox s = this.ResolveStyleAs(app, "tabview", Class,
+                                        Style.SNormal());
+        prefH = s.HeightOr(app.theme.heightLarge);
+        prefW = 0;
+        int fs = s.FontOr(app.theme.fontSizeMedium);
+        int i = 0;
+        while (i < labels.Count) {
+            prefW = prefW + app.theme.paddingMedium * 2 + app.theme.gapSmall
+                + fs + Canvas.MeasureText(labels[i], fs);
             i = i + 1;
         }
+        if (ShowAdd.Get()) { prefW = prefW + prefH; }
+    }
 
+    override void OnPaint(App app) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int x = bx;
+        int y = by;
+        int w = bw;
+        int h = bh;
+        int count = labels.Count;
+        bool showAdd = ShowAdd.Get();
+        hit = TabHit.Create(0, 0 - 1);
+        this.EnsureIds();
+        if (Active != null && Active.Get() != active.Get()) {
+            active.Set(Active.Get());
+        }
+
+        StyleBox strip = this.ResolveStyleAs(app, "tabview", Class,
+                                            Style.SNormal());
         // Plain themed strip: the surface colour is already translucent on skins
         // with their own backdrop, so it shows through without a blur.
-        c.FillRect(x, y, w, h, t.bgSecondary);
-        c.FillRect(x, y + h - 1, w, 1, t.divider);
+        c.FillRect(x, y, w, h, strip.BgOr(t.bgSecondary));
+        c.FillRect(x, y + h - 1, w, 1, strip.BorderOr(t.divider));
 
         // Clip the tab strip to the bar so that, when there are more tabs than
         // fit, the overflowing tabs / "+" button are cut at the right edge
@@ -73,7 +134,7 @@ class TabView {
         c.PushClip(x, y, w, h);
 
         int activeIdx = active.Get();
-        int fontSize = t.fontSizeMedium;
+        int fontSize = strip.FontOr(t.fontSizeMedium);
         int closeBox = fontSize;
         int padX = t.paddingMedium;
         int gap = t.gapSmall;
@@ -84,8 +145,8 @@ class TabView {
             string label = labels[j];
             int labelW = Canvas.MeasureText(label, fontSize);
             int tabW = padX + labelW + gap + closeBox + padX;
-            int tabId = firstId + j * 2;
-            int closeId = firstId + j * 2 + 1;
+            int tabId = baseId + j * 2;
+            int closeId = baseId + j * 2 + 1;
             bool isActive = j == activeIdx;
             bool hovered = app.focus.IsHovered(tabId);
             bool closeHover = app.focus.IsHovered(closeId);
@@ -121,19 +182,22 @@ class TabView {
             int cby = y + (h - closeBox) / 2;
             int closeColor = t.textTertiary;
             if (closeHover) {
-                c.FillRoundRect(cbx - 2, cby - 2, closeBox + 4, closeBox + 4, t.borderRadiusSmall, t.bgActive);
+                c.FillRoundRect(cbx - 2, cby - 2, closeBox + 4, closeBox + 4,
+                                t.borderRadiusSmall, t.bgActive);
                 closeColor = t.textPrimary;
             }
-            c.DrawGlyphIn("close", cbx, cby, closeBox, closeBox, closeBox - 3, closeColor);
+            c.DrawGlyphIn("x", cbx, cby, closeBox, closeBox, closeBox,
+                          closeColor);
 
-            TabView.RegisterClipped(app, tabId, tabX, y, tabW, h, x, w);
-            TabView.RegisterClipped(app, closeId, cbx - 2, cby - 2, closeBox + 4, closeBox + 4, x, w);
+            this.RegisterClipped(app, tabId, tabX, y, tabW, h, x, w);
+            this.RegisterClipped(app, closeId, cbx - 2, cby - 2, closeBox + 4,
+                                 closeBox + 4, x, w);
 
             tabX = tabX + tabW;
             j = j + 1;
         }
 
-        int addId = firstId + count * 2;
+        int addId = baseId + count * 2;
         if (showAdd) {
             int addW = h;
             bool addHover = app.focus.IsHovered(addId);
@@ -145,45 +209,54 @@ class TabView {
             int addColor = t.textSecondary;
             if (addHover) { addColor = t.primary; }
             c.DrawGlyphIn("plus", tabX, y, addW, h, t.iconSizeSmall, addColor);
-            TabView.RegisterClipped(app, addId, tabX, y, addW, h, x, w);
+            this.RegisterClipped(app, addId, tabX, y, addW, h, x, w);
         }
 
         c.PopClip();
+        if (this.IsDisabled()) { return; }
 
         if (app.EventKind() == 3) {
-            int hit = app.ClickTarget();
-            if (showAdd && hit == addId) { return TabHit.Create(3, -1); }
+            int click = app.ClickTarget();
+            if (showAdd && click == addId) {
+                hit = TabHit.Create(3, 0 - 1);
+                return;
+            }
             int k = 0;
             while (k < count) {
-                int tabId = firstId + k * 2;
-                int closeId = firstId + k * 2 + 1;
-                if (hit == closeId) { return TabHit.Create(2, k); }
-                if (hit == tabId) { return TabHit.Create(1, k); }
+                if (click == baseId + k * 2 + 1) {
+                    hit = TabHit.Create(2, k);
+                    return;
+                }
+                if (click == baseId + k * 2) {
+                    hit = TabHit.Create(1, k);
+                    return;
+                }
                 k = k + 1;
             }
         }
 
         // Right button pressed over a tab -> report a context request so the
-        // caller can raise a per-tab menu.
+        // host can raise a per-tab menu.
         if (app.EventKind() == 2 && app.window.EventButton() == 1) {
             int rhit = app.RightPressTarget();
             int rk = 0;
             while (rk < count) {
-                int tabId = firstId + rk * 2;
-                int closeId = firstId + rk * 2 + 1;
-                if (rhit == tabId || rhit == closeId) { return TabHit.Create(4, rk); }
+                if (rhit == baseId + rk * 2 || rhit == baseId + rk * 2 + 1) {
+                    hit = TabHit.Create(4, rk);
+                    return;
+                }
                 rk = rk + 1;
             }
         }
-        return TabHit.Create(0, -1);
     }
 
-    /// Applies a TabHit to the model, doing the usual bookkeeping:
-    /// select -> set active; close -> remove tab and clamp active; add -> append
-    /// `newLabel` and focus it. Returns true if the model changed (redraw).
-    static bool Apply(TabHit hit, List<string> labels, SignalInt active, string newLabel) {
+    /// Applies the frame's interaction to the model, doing the usual
+    /// bookkeeping: select -> set active; close -> remove the tab and clamp
+    /// active; add -> append `newLabel` and focus it. Returns true if the model
+    /// changed (redraw).
+    bool Apply(string newLabel) {
         if (hit.action == 1) {
-            active.Set(hit.index);
+            this.Select(hit.index);
             return true;
         }
         if (hit.action == 2) {
@@ -193,14 +266,47 @@ class TabView {
             if (a > hit.index) { a = a - 1; }
             if (a >= labels.Count) { a = labels.Count - 1; }
             if (a < 0) { a = 0; }
-            active.Set(a);
+            this.Select(a);
             return true;
         }
         if (hit.action == 3) {
             labels.Add(newLabel);
-            active.Set(labels.Count - 1);
+            this.Select(labels.Count - 1);
             return true;
         }
+        return false;
+    }
+
+    void Select(int i) {
+        active.Set(i);
+        if (Active != null) { Active.Set(i); }
+    }
+
+    // ---- designer / serialization model -------------------------------------
+
+    override string Kind() { return "TabView"; }
+
+    override List<PropSpec> Props() {
+        List<PropSpec> ps = new List<PropSpec>();
+        ps.Add(PropSpec.Text("tabs", "Tab labels (comma separated)"));
+        PropSpec act = PropSpec.Int("active", "Active tab");
+        act.snum = active;
+        ps.Add(act);
+        PropSpec add = PropSpec.Bool("showAdd", "Trailing + button");
+        add.flag = ShowAdd;
+        ps.Add(add);
+        ps.Add(PropSpec.Text("class", "Classes"));
+        return ps;
+    }
+
+    /// Labels are a list, so they travel as comma-separated values.
+    override string GetExtra(string key) {
+        if (key == "tabs") { return string.Join(",", labels); }
+        return "";
+    }
+
+    override bool SetExtra(string key, string val) {
+        if (key == "tabs") { labels = val.Split(","); return true; }
         return false;
     }
 }

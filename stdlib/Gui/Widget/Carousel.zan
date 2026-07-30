@@ -3,8 +3,8 @@ using Gui;
 
 namespace Gui.Widget;
 
-/// Per-carousel transition state. Owned by the caller so the slide animation
-/// survives across immediate-mode frames. Create once: `CarouselAnim.Create()`.
+/// Per-carousel transition state, kept as its own object so a host that rebuilds
+/// the control every frame can still own the running animation.
 class CarouselAnim {
     int shown;
     int from;
@@ -23,9 +23,58 @@ class CarouselAnim {
     }
 }
 
-/// Carousel: a slide panel with prev/next arrows and indicator dots.
-/// Id layout: prev = firstId, next = firstId+1, dots = firstId+2 .. firstId+1+count.
-class Carousel {
+/// Carousel: a slide panel with prev/next arrows and indicator dots. The active
+/// slide is a two-way binding; `Animate(anim)` slides the panels horizontally
+/// when it changes.
+///
+///     Carousel car = Carousel.Of(slides, idx);
+///     car.Animate(Gallery.carAnim);
+///     car.RenderInside(app, rect);
+class Carousel : Control {
+    List<string> slides;
+    SignalInt model;
+    /// Two-way active slide index.
+    Binding<int> Index;
+    CarouselAnim anim;
+    /// Fires when the active slide changes.
+    UiEvent Change;
+    int baseId;
+    int idCount;
+
+    void InitCarousel(SignalInt m) {
+        this.InitControl("carousel", 1);
+        slides = new List<string>();
+        model = m;
+        anim = null;
+        baseId = 0;
+        idCount = 0;
+        wiresOwnEvents = true;
+        Change = UiEvent.Create();
+    }
+
+    Carousel() { InitCarousel(SignalInt.Create(0)); }
+    Carousel(SignalInt m) { InitCarousel(m); }
+
+    /// Named AddSlide (not Add) so it does not shadow Control.Add(Control).
+    void AddSlide(string label) { slides.Add(label); }
+
+    static Carousel Of(List<string> labels, SignalInt m) {
+        Carousel car = new Carousel(m);
+        int i = 0;
+        while (i < labels.Count) {
+            car.AddSlide(labels[i]);
+            i = i + 1;
+        }
+        return car;
+    }
+
+    /// Slides the outgoing and incoming panels; `state` is host-owned so the
+    /// transition survives a rebuild of the control.
+    Carousel Animate(CarouselAnim state) {
+        anim = state;
+        return this;
+    }
+
     static int SlideColor(Theme t, int i) {
         int m = i % 5;
         if (m == 0) { return t.primary; }
@@ -35,148 +84,195 @@ class Carousel {
         return t.success;
     }
 
-    /// Draws one slide (body + centered label) at an arbitrary x, used both for
-    /// the static path and for the two panels during a transition.
-    static void Slide(App app, int x, int y, int w, int h, List<string> slides, int i) {
+    /// Prev, next, then one id per dot; reserved as one contiguous block.
+    void EnsureIds() {
+        int need = slides.Count + 2;
+        if (idCount >= need) { return; }
+        baseId = WidgetId.Block(need);
+        idCount = need;
+    }
+
+    void SyncBinding() {
+        if (Index == null) { return; }
+        int cur = Index.Get();
+        if (cur != model.Get()) { model.Set(cur); }
+    }
+
+    void GoTo(App app, int i) {
+        int count = slides.Count;
+        if (count == 0) { return; }
+        int v = i;
+        if (v < 0) { v = count - 1; }
+        if (v >= count) { v = 0; }
+        if (v == model.Get()) { return; }
+        model.Set(v);
+        if (Index != null) { Index.Set(v); }
+        Change.Raise();
+        app.RequestRedraw();
+    }
+
+    override void OnMeasure(App app) {
+        StyleBox s = this.ResolveStyleAs(app, "carousel", Class,
+                                        Style.SNormal());
+        prefW = s.WidthOr(app.Scale(320));
+        prefH = s.HeightOr(app.Scale(160));
+    }
+
+    override void OnPaint(App app) {
+        Canvas c = app.canvas;
+        this.SyncBinding();
+        this.EnsureIds();
+        int count = slides.Count;
+        if (count == 0) { return; }
+        int cur = model.Get();
+        if (cur < 0) { cur = 0; }
+        if (cur >= count) { cur = count - 1; }
+
+        c.PushClip(bx, by, bw, bh);
+        if (anim == null) {
+            this.PaintSlide(app, bx, cur);
+        } else {
+            // Kick off a transition when the target index changes.
+            if (!anim.animating && anim.shown != cur) {
+                anim.from = anim.shown;
+                anim.animating = true;
+                anim.startFrame = app.frameCount;
+                if (cur == (anim.from - 1 + count) % count) { anim.dir = 0 - 1; }
+                else { anim.dir = 1; }
+            }
+            int dur = 10;
+            int prog = 1000;
+            if (anim.animating) {
+                int elapsed = app.frameCount - anim.startFrame;
+                prog = elapsed * 1000 / dur;
+                if (prog >= 1000) {
+                    prog = 1000;
+                    anim.animating = false;
+                    anim.shown = cur;
+                }
+            }
+            if (anim.animating) {
+                int shift = bw * prog / 1000;
+                int outX = bx - anim.dir * shift;
+                int inX = outX + anim.dir * bw;
+                this.PaintSlide(app, outX, anim.from);
+                this.PaintSlide(app, inX, cur);
+                app.RequestRedraw();
+            } else {
+                this.PaintSlide(app, bx, cur);
+            }
+        }
+        c.PopClip();
+
+        this.PaintChrome(app, count, cur);
+
+        if (this.IsDisabled() || app.EventKind() != 3) { return; }
+        int hit = app.ClickTarget();
+        if (hit == baseId) { this.GoTo(app, model.Get() - 1); }
+        else if (hit == baseId + 1) { this.GoTo(app, model.Get() + 1); }
+        else if (hit >= baseId + 2 && hit < baseId + 2 + count) {
+            this.GoTo(app, hit - baseId - 2);
+        }
+    }
+
+    /// One slide (body + centered label) at an arbitrary x, so a transition can
+    /// paint the outgoing and incoming panels side by side.
+    void PaintSlide(App app, int x, int i) {
         Canvas c = app.canvas;
         Theme t = app.theme;
+        StyleBox s = this.ResolvePartAs(app, "carousel", "slide", "", Class,
+                                        Style.SNormal());
         // Clip to the slide box so a long label can't spill past its edges.
-        c.PushClip(x, y, w, h);
-        c.FillRoundRect(x, y, w, h, t.borderRadiusLarge, SlideColor(t, i));
-        int fs = t.fontSizeHuge;
+        c.PushClip(x, by, bw, bh);
+        c.FillRoundRect(x, by, bw, bh, s.RadiusOr(t.borderRadiusLarge),
+                        s.BgOr(Carousel.SlideColor(t, i)));
+        int fs = s.FontOr(t.fontSizeHuge);
         int tw = Canvas.MeasureText(slides[i], fs);
-        c.DrawText(x + (w - tw) / 2, y + (h - Canvas.FontHeight(fs)) / 2,
-                   slides[i], t.textInverse, fs);
+        c.DrawText(x + (bw - tw) / 2, by + (bh - Canvas.FontHeight(fs)) / 2,
+                   slides[i], s.FgOr(t.textInverse), fs);
         c.PopClip();
     }
 
-    /// Draws the arrows + dots chrome and registers their hit regions.
-    static void Chrome(App app, int prevId, int x, int y, int w, int h,
-                       int count, int cur) {
+    /// The arrows and indicator dots, plus their hit regions.
+    void PaintChrome(App app, int count, int cur) {
         Canvas c = app.canvas;
         Theme t = app.theme;
+        StyleBox arrow = this.ResolvePartAs(app, "carousel", "arrow", "", Class,
+                                            Style.SNormal());
+        StyleBox dotStyle = this.ResolvePartAs(app, "carousel", "dot", "", Class,
+                                               Style.SNormal());
+        StyleBox dotOn = this.ResolvePartAs(app, "carousel", "dot", "", Class,
+                                            Style.SChecked());
 
-        int ab = t.heightMedium;
-        int ay = y + (h - ab) / 2;
-        int prevX = x + t.paddingMedium;
-        int nextX = x + w - ab - t.paddingMedium;
-        int pbg = t.overlay;
-        c.FillRoundRect(prevX, ay, ab, ab, ab / 2, pbg);
-        c.FillRoundRect(nextX, ay, ab, ab, ab / 2, pbg);
-        int gl = t.iconSizeSmall;
-        c.DrawGlyphIn("arrow-left", prevX, ay, ab, ab, gl, t.textInverse);
-        c.DrawGlyphIn("arrow-right", nextX, ay, ab, ab, gl, t.textInverse);
-        app.hitTester.Register(HitRegion.Create(prevId, prevX, ay, ab, ab, 0));
-        app.hitTester.Register(HitRegion.Create(prevId + 1, nextX, ay, ab, ab, 0));
+        int ab = arrow.HeightOr(t.heightMedium);
+        int ay = by + (bh - ab) / 2;
+        int prevX = bx + t.paddingMedium;
+        int nextX = bx + bw - ab - t.paddingMedium;
+        int abg = arrow.BgOr(t.overlay);
+        c.FillRoundRect(prevX, ay, ab, ab, arrow.RadiusOr(ab / 2), abg);
+        c.FillRoundRect(nextX, ay, ab, ab, arrow.RadiusOr(ab / 2), abg);
+        int gl = arrow.WidthOr(t.iconSizeSmall);
+        int afg = arrow.FgOr(t.textInverse);
+        c.DrawGlyphIn("arrow-left", prevX, ay, ab, ab, gl, afg);
+        c.DrawGlyphIn("arrow-right", nextX, ay, ab, ab, gl, afg);
+        app.hitTester.Register(HitRegion.Create(baseId, prevX, ay, ab, ab, 0));
+        app.hitTester.Register(HitRegion.Create(baseId + 1, nextX, ay, ab, ab, 0));
 
-        int dot = t.gapSmall;
-        int dotGap = t.gapSmall;
+        int dot = dotStyle.HeightOr(t.gapSmall);
+        int dotGap = dotStyle.GapOr(t.gapSmall);
         int dotsW = count * dot + (count - 1) * dotGap;
-        int dx = x + (w - dotsW) / 2;
-        int dy = y + h - t.paddingLarge;
+        int dx = bx + (bw - dotsW) / 2;
+        int dy = by + bh - t.paddingLarge;
         int i = 0;
         while (i < count) {
-            int dcolor = t.overlay;
+            int dcolor = dotStyle.BgOr(t.overlay);
             int dw = dot;
-            if (i == cur) { dcolor = t.textInverse; dw = dot * 2; }
+            if (i == cur) {
+                dcolor = dotOn.BgOr(t.textInverse);
+                dw = dot * 2;
+            }
             c.FillRoundRect(dx, dy, dw, dot, dot / 2, dcolor);
-            app.hitTester.Register(HitRegion.Create(prevId + 2 + i, dx, dy - dot, dw + dot, dot * 3, 0));
+            app.hitTester.Register(HitRegion.Create(baseId + 2 + i, dx,
+                                                    dy - dot, dw + dot,
+                                                    dot * 3, 0));
             dx = dx + dw + dotGap;
             i = i + 1;
         }
     }
 
-    static int Render(App app, int x, int y, int w, int h, List<string> slides, SignalInt idx) {
-        int prevId = app.focus.AllocId();
-        int nextId = app.focus.AllocId();
-        int count = slides.Count;
-        int i = 0;
-        while (i < count) {
-            app.focus.AllocId();
-            i = i + 1;
-        }
+    // ---- designer / serialization model -------------------------------------
 
-        int cur = idx.Get();
-        if (cur < 0) { cur = 0; }
-        if (cur >= count) { cur = count - 1; }
+    override string Kind() { return "Carousel"; }
 
-        Carousel.Slide(app, x, y, w, h, slides, cur);
-        Carousel.Chrome(app, prevId, x, y, w, h, count, cur);
-        return prevId;
+    override List<PropSpec> Props() {
+        List<PropSpec> ps = new List<PropSpec>();
+        ps.Add(PropSpec.Text("slides", "Slide labels (comma separated)"));
+        PropSpec idx = PropSpec.Int("index", "Active slide");
+        idx.snum = model;
+        ps.Add(idx);
+        ps.Add(PropSpec.Text("class", "Classes"));
+        return ps;
     }
 
-    /// Like Render but slides the outgoing and incoming panels horizontally when
-    /// the active index changes. Pass a caller-owned CarouselAnim.
-    static int RenderAnimated(App app, int x, int y, int w, int h,
-                              List<string> slides, SignalInt idx, CarouselAnim anim) {
-        int prevId = app.focus.AllocId();
-        int nextId = app.focus.AllocId();
-        int count = slides.Count;
-        int i = 0;
-        while (i < count) {
-            app.focus.AllocId();
-            i = i + 1;
-        }
-
-        Canvas c = app.canvas;
-        int cur = idx.Get();
-        if (cur < 0) { cur = 0; }
-        if (cur >= count) { cur = count - 1; }
-
-        // Kick off a transition when the target index changes.
-        if (!anim.animating && anim.shown != cur) {
-            anim.from = anim.shown;
-            anim.animating = true;
-            anim.startFrame = app.frameCount;
-            if (cur == (anim.from - 1 + count) % count) { anim.dir = 0 - 1; }
-            else { anim.dir = 1; }
-        }
-
-        int dur = 10;
-        int prog = 1000;
-        if (anim.animating) {
-            int elapsed = app.frameCount - anim.startFrame;
-            prog = elapsed * 1000 / dur;
-            if (prog >= 1000) {
-                prog = 1000;
-                anim.animating = false;
-                anim.shown = cur;
-            }
-        }
-
-        c.PushClip(x, y, w, h);
-        if (anim.animating) {
-            int shift = w * prog / 1000;
-            int outX = x - anim.dir * shift;
-            int inX = outX + anim.dir * w;
-            Carousel.Slide(app, outX, y, w, h, slides, anim.from);
-            Carousel.Slide(app, inX, y, w, h, slides, cur);
-        } else {
-            Carousel.Slide(app, x, y, w, h, slides, cur);
-        }
-        c.PopClip();
-
-        Carousel.Chrome(app, prevId, x, y, w, h, count, cur);
-        if (anim.animating) { app.RequestRedraw(); }
-        return prevId;
+    /// Slides are a list, so they travel as comma-separated values.
+    override string GetExtra(string key) {
+        if (key == "slides") { return string.Join(",", slides); }
+        return "";
     }
 
-    static void HandleClick(App app, int firstId, int count, SignalInt idx) {
-        if (app.EventKind() != 3) { return; }
-        int hit = app.ClickTarget();
-        if (hit == firstId) {
-            int v = idx.Get() - 1;
-            if (v < 0) { v = count - 1; }
-            idx.Set(v);
-            app.RequestRedraw();
-        } else if (hit == firstId + 1) {
-            int v = idx.Get() + 1;
-            if (v >= count) { v = 0; }
-            idx.Set(v);
-            app.RequestRedraw();
-        } else if (hit >= firstId + 2 && hit < firstId + 2 + count) {
-            idx.Set(hit - firstId - 2);
-            app.RequestRedraw();
-        }
+    override bool SetExtra(string key, string val) {
+        if (key == "slides") { slides = val.Split(","); return true; }
+        return false;
+    }
+
+    override List<string> Events() {
+        List<string> e = Control.CommonEvents();
+        e.Add("Change");
+        return e;
+    }
+
+    override void BindEvent(string evt, Action a) {
+        if (evt == "Change") { Change.Add(a); return; }
+        On.AddByName(evt, a);
     }
 }
