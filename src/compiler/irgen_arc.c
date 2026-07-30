@@ -83,6 +83,151 @@ static void emit_rc_release_for_type(zan_irgen_t *g, zan_type_t *type, LLVMValue
     }
 }
 
+static int type_contains_collection_rc(zan_irgen_t *g, zan_type_t *type,
+                                       unsigned depth) {
+    if (!type || depth > 32) return 0;
+    type = concretize(g, type);
+    if (!type) return 0;
+    if (is_rc_managed_type(type)) return 1;
+    if (type->kind != TYPE_STRUCT || !type->sym) return 0;
+    for (int i = 0; i < type->sym->member_count; i++) {
+        zan_symbol_t *m = type->sym->members[i];
+        if ((m->kind != SYM_FIELD && m->kind != SYM_PROPERTY) ||
+            field_member_is_static(m) || (m->modifiers & MOD_WEAK)) continue;
+        zan_type_t *ft = subst_type_param_deep(g, m->type, type);
+        if (type_contains_collection_rc(g, ft, depth + 1)) return 1;
+    }
+    return 0;
+}
+
+static void emit_collection_value_retain(zan_irgen_t *g, zan_type_t *type,
+                                         LLVMValueRef value, unsigned depth) {
+    if (!type || !value || depth > 32) return;
+    type = concretize(g, type);
+    if (!type) return;
+    if (is_rc_managed_type(type)) {
+        emit_rc_retain_for_type(g, type, value);
+        return;
+    }
+    if (type->kind != TYPE_STRUCT || !type->sym ||
+        LLVMGetTypeKind(LLVMTypeOf(value)) != LLVMStructTypeKind) return;
+    unsigned fi = (unsigned)class_vptr_offset(type->sym);
+    for (int i = 0; i < type->sym->member_count; i++) {
+        zan_symbol_t *m = type->sym->members[i];
+        if ((m->kind != SYM_FIELD && m->kind != SYM_PROPERTY) ||
+            field_member_is_static(m)) continue;
+        LLVMValueRef field = LLVMBuildExtractValue(g->builder, value, fi++, "arc.vf");
+        if (m->modifiers & MOD_WEAK) continue;
+        zan_type_t *ft = subst_type_param_deep(g, m->type, type);
+        emit_collection_value_retain(g, ft, field, depth + 1);
+    }
+}
+
+static void emit_collection_value_release(zan_irgen_t *g, zan_type_t *type,
+                                          LLVMValueRef value, unsigned depth) {
+    if (!type || !value || depth > 32) return;
+    type = concretize(g, type);
+    if (!type) return;
+    if (is_rc_managed_type(type)) {
+        emit_rc_release_for_type(g, type, value);
+        return;
+    }
+    if (type->kind != TYPE_STRUCT || !type->sym ||
+        LLVMGetTypeKind(LLVMTypeOf(value)) != LLVMStructTypeKind) return;
+    unsigned fi = (unsigned)class_vptr_offset(type->sym);
+    for (int i = 0; i < type->sym->member_count; i++) {
+        zan_symbol_t *m = type->sym->members[i];
+        if ((m->kind != SYM_FIELD && m->kind != SYM_PROPERTY) ||
+            field_member_is_static(m)) continue;
+        LLVMValueRef field = LLVMBuildExtractValue(g->builder, value, fi++, "arc.vf");
+        if (m->modifiers & MOD_WEAK) continue;
+        zan_type_t *ft = subst_type_param_deep(g, m->type, type);
+        emit_collection_value_release(g, ft, field, depth + 1);
+    }
+}
+
+static LLVMValueRef load_dict_value_words(zan_irgen_t *g, LLVMValueRef raw) {
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+    LLVMValueRef dict = LLVMBuildBitCast(g->builder, raw,
+        LLVMPointerType(g->dict_struct_type, 0), "dvw.dp");
+    LLVMValueRef words_ptr = LLVMBuildStructGEP2(g->builder,
+        g->dict_struct_type, dict, 7, "dvw.p");
+    return LLVMBuildLoad2(g->builder, i64, words_ptr, "dvw");
+}
+
+static void emit_collection_slot_store(zan_irgen_t *g, zan_type_t *elem_type,
+                                       LLVMTypeRef slot_ty, LLVMValueRef slot_ptr,
+                                       LLVMValueRef value,
+                                       zan_ast_node_t *rhs, local_scope_t *locals,
+                                       int overwrite_old) {
+    LLVMTypeRef elem_llvm = elem_type ? map_type(g, elem_type) : slot_ty;
+    LLVMTypeKind elem_kind = LLVMGetTypeKind(elem_llvm);
+    LLVMValueRef old = NULL;
+    if (overwrite_old) {
+        old = elem_kind == LLVMStructTypeKind
+            ? load_struct_from_slot(g, slot_ptr, elem_llvm)
+            : LLVMBuildLoad2(g->builder, slot_ty, slot_ptr, "arc.old");
+    }
+    if (!expr_yields_owned_rc_value(g, rhs, locals))
+        emit_collection_value_retain(g, elem_type, value, 0);
+
+    LLVMValueRef stored = value;
+    LLVMTypeKind slot_kind = LLVMGetTypeKind(slot_ty);
+    LLVMTypeKind value_kind = LLVMGetTypeKind(LLVMTypeOf(stored));
+    if (value_kind == LLVMStructTypeKind) {
+        store_struct_in_slot(g, stored, slot_ptr, rhs);
+    } else {
+        if (slot_kind == LLVMPointerTypeKind) {
+            if (value_kind == LLVMIntegerTypeKind) {
+                LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+                if (elem_llvm && LLVMGetTypeKind(elem_llvm) == LLVMIntegerTypeKind &&
+                    LLVMGetIntTypeWidth(elem_llvm) < LLVMGetIntTypeWidth(LLVMTypeOf(stored)))
+                    stored = LLVMBuildTrunc(g->builder, stored, elem_llvm, "slot.knw");
+                if (LLVMGetIntTypeWidth(LLVMTypeOf(stored)) < 64)
+                    stored = extend_int_for_slot(g, stored, elem_type, i64);
+                stored = LLVMBuildIntToPtr(g->builder, stored, slot_ty, "slot.ip");
+            } else if (value_kind == LLVMPointerTypeKind && LLVMTypeOf(stored) != slot_ty) {
+                stored = LLVMBuildBitCast(g->builder, stored, slot_ty, "slot.bc");
+            }
+        } else if (slot_kind == LLVMIntegerTypeKind) {
+            if (value_kind == LLVMPointerTypeKind) {
+                stored = LLVMBuildPtrToInt(g->builder, stored, slot_ty, "slot.pi");
+            } else if (value_kind == LLVMIntegerTypeKind) {
+                if (elem_llvm && LLVMGetTypeKind(elem_llvm) == LLVMIntegerTypeKind &&
+                    LLVMGetIntTypeWidth(elem_llvm) < LLVMGetIntTypeWidth(LLVMTypeOf(stored)))
+                    stored = LLVMBuildTrunc(g->builder, stored, elem_llvm, "slot.elw");
+                if (LLVMGetIntTypeWidth(LLVMTypeOf(stored)) < LLVMGetIntTypeWidth(slot_ty))
+                    stored = extend_int_for_slot(g, stored, elem_type, slot_ty);
+            } else if (value_kind == LLVMDoubleTypeKind) {
+                stored = LLVMBuildBitCast(g->builder, stored, slot_ty, "slot.fb");
+            }
+        }
+        LLVMBuildStore(g->builder, stored, slot_ptr);
+    }
+    if (overwrite_old) {
+        LLVMValueRef old_value = old;
+        if (elem_kind == LLVMPointerTypeKind &&
+            LLVMGetTypeKind(LLVMTypeOf(old)) == LLVMIntegerTypeKind)
+            old_value = LLVMBuildIntToPtr(g->builder, old, elem_llvm, "slot.old");
+        emit_collection_value_release(g, elem_type, old_value, 0);
+    }
+}
+
+static void emit_collection_release_raw_slot(zan_irgen_t *g, zan_type_t *elem_type,
+                                             LLVMValueRef raw, LLVMTypeRef slot_ty) {
+    if (!elem_type || !type_contains_collection_rc(g, elem_type, 0)) return;
+    LLVMTypeRef elem_llvm = map_type(g, elem_type);
+    LLVMValueRef value = raw;
+    if (LLVMGetTypeKind(elem_llvm) == LLVMPointerTypeKind &&
+        LLVMGetTypeKind(LLVMTypeOf(raw)) == LLVMIntegerTypeKind)
+        value = LLVMBuildIntToPtr(g->builder, raw, elem_llvm, "slot.old");
+    else if (LLVMGetTypeKind(slot_ty) == LLVMPointerTypeKind &&
+             LLVMTypeOf(raw) != elem_llvm &&
+             LLVMGetTypeKind(LLVMTypeOf(raw)) == LLVMPointerTypeKind)
+        value = LLVMBuildBitCast(g->builder, raw, elem_llvm, "slot.old");
+    emit_collection_value_release(g, elem_type, value, 0);
+}
+
 /* ---- object-graph release (per-class destructors) ------------------------
  * User class instances carry a 16-byte rc header; their RC-managed fields
  * (strings, other class instances, and the elements held by a List field) are
@@ -134,7 +279,7 @@ static LLVMValueRef get_class_release_decl(zan_irgen_t *g, zan_symbol_t *sym,
  * non-RC element types. Only the tracked elements are released; the header-less
  * List struct/buffer are not rc-counted and are left as-is. */
 static void emit_list_release_elems(zan_irgen_t *g, zan_type_t *elem_type, LLVMValueRef col) {
-    if (!elem_type || !is_rc_managed_type(elem_type)) return;
+    if (!elem_type || !type_contains_collection_rc(g, elem_type, 0)) return;
     if (!col || LLVMGetTypeKind(LLVMTypeOf(col)) != LLVMPointerTypeKind) return;
     LLVMContextRef c = g->ctx;
     LLVMBuilderRef b = g->builder;
@@ -161,8 +306,12 @@ static void emit_list_release_elems(zan_irgen_t *g, zan_type_t *elem_type, LLVMV
     LLVMValueRef lt = zan_icmp(b, LLVMIntSLT, iphi, cnt, "lt");
     LLVMBuildCondBr(b, lt, body, done);
     LLVMPositionBuilderAtEnd(b, body);
-    LLVMValueRef slot = LLVMBuildGEP2(b, i64, data, &iphi, 1, "slot");
-    LLVMValueRef raw = LLVMBuildLoad2(b, i64, slot, "raw");
+    LLVMValueRef word = slot_word_index(g, iphi, elem_slot_words(g, elem_type));
+    LLVMValueRef slot = LLVMBuildGEP2(b, i64, data, &word, 1, "slot");
+    LLVMTypeRef elem_llvm = map_type(g, elem_type);
+    LLVMValueRef raw = LLVMGetTypeKind(elem_llvm) == LLVMStructTypeKind
+        ? load_struct_from_slot(g, slot, elem_llvm)
+        : LLVMBuildLoad2(b, i64, slot, "raw");
     emit_collection_release_raw_slot(g, elem_type, raw, i64);
     LLVMValueRef inext = zan_add(b, iphi, LLVMConstInt(i64, 1, 0), "inext");
     LLVMBasicBlockRef body_end = LLVMGetInsertBlock(b);
@@ -181,7 +330,7 @@ static void emit_dict_release_elems(zan_irgen_t *g, zan_type_t *dict_type, LLVMV
     zan_type_t *kt = dict_key_type(g, dict_type);
     zan_type_t *vt = dict_value_type(dict_type);
     bool krc = kt && is_rc_managed_type(kt);
-    bool vrc = vt && is_rc_managed_type(vt);
+    bool vrc = vt && type_contains_collection_rc(g, vt, 0);
     if (!krc && !vrc) return;
     if (!col || LLVMGetTypeKind(LLVMTypeOf(col)) != LLVMPointerTypeKind) return;
     LLVMContextRef c = g->ctx;
@@ -205,6 +354,8 @@ static void emit_dict_release_elems(zan_irgen_t *g, zan_type_t *dict_type, LLVMV
         LLVMBuildStructGEP2(b, g->dict_struct_type, dp, 2, "kp"), "ks");
     LLVMValueRef vs = LLVMBuildLoad2(b, LLVMPointerType(i64, 0),
         LLVMBuildStructGEP2(b, g->dict_struct_type, dp, 3, "vp"), "vs");
+    LLVMValueRef value_words = LLVMBuildLoad2(b, i64,
+        LLVMBuildStructGEP2(b, g->dict_struct_type, dp, 7, "vwp"), "vw");
     LLVMBuildBr(b, head);
     LLVMPositionBuilderAtEnd(b, head);
     LLVMValueRef iphi = LLVMBuildPhi(b, i64, "i");
@@ -217,8 +368,12 @@ static void emit_dict_release_elems(zan_irgen_t *g, zan_type_t *dict_type, LLVMV
         emit_collection_release_raw_slot(g, kt, kv, i8ptr);
     }
     if (vrc) {
-        LLVMValueRef vslot = LLVMBuildGEP2(b, i64, vs, &iphi, 1, "vslot");
-        LLVMValueRef vv = LLVMBuildLoad2(b, i64, vslot, "vv");
+        LLVMValueRef word = zan_mul(b, iphi, value_words, "dv.word");
+        LLVMValueRef vslot = LLVMBuildGEP2(b, i64, vs, &word, 1, "vslot");
+        LLVMTypeRef value_llvm = map_type(g, vt);
+        LLVMValueRef vv = LLVMGetTypeKind(value_llvm) == LLVMStructTypeKind
+            ? load_struct_from_slot(g, vslot, value_llvm)
+            : LLVMBuildLoad2(b, i64, vslot, "vv");
         emit_collection_release_raw_slot(g, vt, vv, i64);
     }
     LLVMValueRef inext = zan_add(b, iphi, LLVMConstInt(i64, 1, 0), "inext");
@@ -798,7 +953,8 @@ static LLVMValueRef find_generic_fn(zan_irgen_t *g, zan_symbol_t *msym,
 }
 
 static void add_generic_ctor(zan_irgen_t *g, zan_symbol_t *type_sym,
-                             zan_type_t **args, int argc, int param_count,
+                             zan_ast_node_t *decl, zan_type_t **args, int argc,
+                             int param_count,
                              LLVMValueRef fn, LLVMTypeRef fn_type) {
     if (g->generic_ctor_count >= g->generic_ctor_cap) {
         int ncap = g->generic_ctor_cap ? g->generic_ctor_cap * 2 : 64;
@@ -807,6 +963,7 @@ static void add_generic_ctor(zan_irgen_t *g, zan_symbol_t *type_sym,
         g->generic_ctor_cap = ncap;
     }
     g->generic_ctors[g->generic_ctor_count].type_sym = type_sym;
+    g->generic_ctors[g->generic_ctor_count].decl = decl;
     g->generic_ctors[g->generic_ctor_count].args = args;
     g->generic_ctors[g->generic_ctor_count].argc = argc;
     g->generic_ctors[g->generic_ctor_count].param_count = param_count;
@@ -816,12 +973,13 @@ static void add_generic_ctor(zan_irgen_t *g, zan_symbol_t *type_sym,
 }
 
 static LLVMValueRef find_generic_ctor(zan_irgen_t *g, zan_symbol_t *type_sym,
+                                      zan_ast_node_t *decl,
                                       zan_type_t **args, int argc,
-                                      int param_count, LLVMTypeRef *out_fn_type) {
+                                      LLVMTypeRef *out_fn_type) {
     if (!type_sym || argc <= 0 || !args) return NULL;
     for (int i = 0; i < g->generic_ctor_count; i++) {
         if (g->generic_ctors[i].type_sym == type_sym &&
-            g->generic_ctors[i].param_count == param_count &&
+            g->generic_ctors[i].decl == decl &&
             type_arglists_equal(g->generic_ctors[i].args, g->generic_ctors[i].argc,
                                 args, argc)) {
             if (out_fn_type) *out_fn_type = g->generic_ctors[i].fn_type;

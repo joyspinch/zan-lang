@@ -98,6 +98,12 @@ class Control {
     /// Optional style class (JSON `class`), used by a StyleSheet to cascade
     /// declarations onto this control by `.class` selector. Empty = none.
     string styleClass;
+    StyleBox computedStyle;
+    int computedStyleGen;
+    string computedStyleType;
+    string computedStyleClass;
+    string computedStyleId;
+    bool styleSurfaceOwned;
 
     // --- CSS-like style layer (all 0 = unset). Honoured by PaintStyleBox for
     // surfaces and by text widgets for color/font. Set via the fluent
@@ -152,6 +158,12 @@ class Control {
         bindProp = "";
         bindSnapshot = "";
         styleClass = "";
+        computedStyle = null;
+        computedStyleGen = 0 - 1;
+        computedStyleType = "";
+        computedStyleClass = "";
+        computedStyleId = "";
+        styleSurfaceOwned = false;
         styleBg = 0;
         styleBgTo = 0;
         styleRadius = 0;
@@ -166,15 +178,15 @@ class Control {
 
     // --- CSS-like fluent style setters (chainable). Names are unique across
     // the widget set so they never collide with a subclass method. ---
-    Control Bg(int c) { styleBg = c; styleBgTo = 0; return this; }
-    Control Gradient(int top, int bottom) { styleBg = top; styleBgTo = bottom; return this; }
-    Control Radius(int r) { styleRadius = r; return this; }
-    Control Border(int color, int w) { styleBorderColor = color; styleBorderWidth = w; return this; }
-    Control Shadow(int color, int dy) { styleShadow = color; styleShadowDy = dy; return this; }
-    Control TextColor(int c) { styleColor = c; return this; }
-    Control FontPx(int px) { styleFontPx = px; return this; }
-    Control Transition(int ms) { styleTransitionMs = ms; return this; }
-    Control Style(string cls) { styleClass = cls; return this; }
+    Control Bg(int c) { styleBg = c; styleBgTo = 0; computedStyle = null; return this; }
+    Control Gradient(int top, int bottom) { styleBg = top; styleBgTo = bottom; computedStyle = null; return this; }
+    Control Radius(int r) { styleRadius = r; computedStyle = null; return this; }
+    Control Border(int color, int w) { styleBorderColor = color; styleBorderWidth = w; computedStyle = null; return this; }
+    Control Shadow(int color, int dy) { styleShadow = color; styleShadowDy = dy; computedStyle = null; return this; }
+    Control TextColor(int c) { styleColor = c; computedStyle = null; return this; }
+    Control FontPx(int px) { styleFontPx = px; computedStyle = null; return this; }
+    Control Transition(int ms) { styleTransitionMs = ms; computedStyle = null; return this; }
+    Control Style(string cls) { styleClass = cls; computedStyle = null; return this; }
 
     // --- Chainable event subscription (a C#-close alternative to BindEvent;
     // `btn.OnClick(Handler)` reads like `btn.Click += Handler`). Each appends
@@ -238,8 +250,128 @@ class Control {
     /// Ui.HoverLevelMs/PressLevelMs so the `transition` property actually
     /// drives how fast hover/press states cross-fade via App.AnimTo.
     int TransitionMs(int fallback) {
+        if (computedStyle != null && computedStyle.transitionMs >= 0) {
+            return computedStyle.transitionMs;
+        }
         if (styleTransitionMs > 0) { return styleTransitionMs; }
         return fallback;
+    }
+
+    StyleBox ResolveStyle(App app, int state) {
+        return this.ResolveStyleAs(app, this.Kind().ToLower(), styleClass, state);
+    }
+
+    StyleBox ResolveStyleAs(App app, string type, string cls, int state) {
+        StyleBox box = Style.Full(app, type, cls, name, state);
+        Style.Inline(box, this);
+        computedStyle = box;
+        computedStyleGen = app.bgThemeGen;
+        computedStyleType = type;
+        computedStyleClass = styleClass;
+        computedStyleId = name;
+        return box;
+    }
+
+    StyleBox ResolveEasedStyleAs(App app, int id, string type, string cls,
+                                 bool disabled, bool selected) {
+        StyleBox box = Style.EasedId(app, id, type, cls, name, disabled, selected);
+        Style.Inline(box, this);
+        computedStyle = box;
+        computedStyleGen = app.bgThemeGen;
+        computedStyleType = type;
+        computedStyleClass = styleClass;
+        computedStyleId = name;
+        return box;
+    }
+
+    StyleBox ResolveEasedLatchedStyleAs(App app, int id, string type, string cls,
+                                        bool disabled, int latched, int progress) {
+        StyleBox off = Style.EasedStateId(app, id, type, cls, name, disabled, 0);
+        StyleBox on = Style.EasedStateId(app, id, type, cls, name, disabled, latched);
+        Style.Inline(off, this);
+        Style.Inline(on, this);
+        StyleBox box = StyleBox.Blend(off, on, progress);
+        computedStyle = box;
+        computedStyleGen = app.bgThemeGen;
+        computedStyleType = type;
+        computedStyleClass = styleClass;
+        computedStyleId = name;
+        return box;
+    }
+
+    StyleBox ResolvePart(App app, string part, string fallbackType, int state) {
+        return this.ResolvePartAs(app, this.Kind().ToLower(), part,
+                                  fallbackType, styleClass, state);
+    }
+
+    StyleBox ResolvePartAs(App app, string type, string part,
+                           string fallbackType, string cls, int state) {
+        return Style.Part(app, type, part, fallbackType, cls, name, state);
+    }
+
+    StyleBox ResolveEasedPartAs(App app, int id, string type, string part,
+                                string fallbackType, string cls,
+                                bool disabled, bool selected) {
+        return Style.EasedPartId(app, id, type, part, fallbackType, cls, name,
+                                 disabled, selected);
+    }
+
+    StyleBox ResolveEasedLatchedPartAs(App app, int id, string type, string part,
+                                       string fallbackType, string cls,
+                                       bool disabled, int latched, int progress) {
+        StyleBox off = Style.EasedPartStateId(app, id, type, part, fallbackType,
+                                              cls, name, disabled, 0);
+        StyleBox on = Style.EasedPartStateId(app, id, type, part, fallbackType,
+                                             cls, name, disabled, latched);
+        return StyleBox.Blend(off, on, progress);
+    }
+
+    bool ComputedStyleCurrent(App app) {
+        string type = this.Kind().ToLower();
+        return computedStyle != null && computedStyleGen == app.bgThemeGen
+            && computedStyleType == type && computedStyleClass == styleClass
+            && computedStyleId == name;
+    }
+
+    int StyleWidth() {
+        if (computedStyle == null) { return prefW; }
+        return computedStyle.ClampW(computedStyle.WidthOr(prefW));
+    }
+
+    int StyleHeight() {
+        if (computedStyle == null) { return prefH; }
+        return computedStyle.ClampH(computedStyle.HeightOr(prefH));
+    }
+
+    int StylePadL() {
+        if (computedStyle != null) { return computedStyle.PadLOr(padL); }
+        return padL;
+    }
+
+    int StylePadT() {
+        if (computedStyle != null) { return computedStyle.PadTOr(padT); }
+        return padT;
+    }
+
+    int StylePadR() {
+        if (computedStyle != null) { return computedStyle.PadROr(padR); }
+        return padR;
+    }
+
+    int StylePadB() {
+        if (computedStyle != null) { return computedStyle.PadBOr(padB); }
+        return padB;
+    }
+
+    int StyleGap() {
+        if (computedStyle != null) { return computedStyle.GapOr(gap); }
+        return gap;
+    }
+
+    bool StyleVisible() {
+        if (!visible) { return false; }
+        if (computedStyle == null) { return true; }
+        return computedStyle.display != 2 && computedStyle.visible != 0;
     }
 
     /// Paints this node's CSS surface (shadow, background/gradient, border)
@@ -248,23 +380,11 @@ class Control {
     /// OnPaint only draw their own content on top. No-op when nothing is set,
     /// so existing widgets that paint their own surface are unaffected.
     void PaintStyleBox(App app) {
-        Canvas c = app.canvas;
-        int r = styleRadius;
-        if (styleShadow != 0) {
-            int dy = styleShadowDy;
-            if (r > 0) { c.FillRoundRect(bx, by + dy, bw, bh, r, styleShadow); }
-            else { c.FillRect(bx, by + dy, bw, bh, styleShadow); }
+        if (wiresOwnEvents || styleSurfaceOwned) { return; }
+        if (!this.ComputedStyleCurrent(app)) {
+            this.ResolveStyle(app, Style.SNormal());
         }
-        if (styleBg != 0 && styleBgTo != 0) {
-            c.FillVGrad(bx, by, bw, bh, styleBg, styleBgTo);
-        } else if (styleBg != 0) {
-            if (r > 0) { c.FillRoundRect(bx, by, bw, bh, r, styleBg); }
-            else { c.FillRect(bx, by, bw, bh, styleBg); }
-        }
-        if (styleBorderWidth > 0 && styleBorderColor != 0) {
-            if (r > 0) { c.DrawRoundRect(bx, by, bw, bh, r, styleBorderColor, styleBorderWidth); }
-            else { c.DrawRect(bx, by, bw, bh, styleBorderColor, styleBorderWidth); }
-        }
+        computedStyle.Paint(app, bx, by, bw, bh);
     }
 
     /// Fires the common event bundle for this node against `id`. Widgets call
@@ -356,6 +476,7 @@ class Control {
     /// Find() or targeted by the designer/serializer.
     Control Named(string n) {
         name = n;
+        computedStyle = null;
         return this;
     }
 
@@ -400,7 +521,7 @@ class Control {
     /// The deepest visible descendant whose resolved bounds contain the point,
     /// preferring later (top-most) children. Used for designer hit-selection.
     Control HitTest(int x, int y) {
-        if (!visible) { return null; }
+        if (!this.StyleVisible()) { return null; }
         if (x < bx || y < by || x >= bx + bw || y >= by + bh) { return null; }
         int i = children.Count - 1;
         while (i >= 0) {
@@ -454,6 +575,8 @@ class Control {
     /// Lets a node set its preferred size from the theme, bottom-up (children
     /// first). Subclasses override OnMeasure. Runs before Arrange.
     void MeasureTree(App app) {
+        this.ResolveStyle(app, Style.SNormal());
+        if (!this.StyleVisible()) { return; }
         int i = 0;
         while (i < children.Count) {
             children[i].MeasureTree(app);
@@ -483,47 +606,52 @@ class Control {
         by = py;
         bw = pw;
         bh = ph;
-        int cx = px + padL;
-        int cy = py + padT;
-        int cw = pw - padL - padR;
-        int ch = ph - padT - padB;
+        int innerPadL = this.StylePadL();
+        int innerPadT = this.StylePadT();
+        int innerPadR = this.StylePadR();
+        int innerPadB = this.StylePadB();
+        int innerGap = this.StyleGap();
+        int cx = px + innerPadL;
+        int cy = py + innerPadT;
+        int cw = pw - innerPadL - innerPadR;
+        int ch = ph - innerPadT - innerPadB;
         if (cw < 0) { cw = 0; }
         if (ch < 0) { ch = 0; }
         int i = 0;
         while (i < children.Count) {
             Control c = children[i];
-            if (c.visible) {
+            if (c.StyleVisible()) {
                 if (c.dock == 1) {
-                    int hh = Control.FitSize(c.prefH, ch);
+                    int hh = Control.FitSize(c.StyleHeight(), ch);
                     c.Arrange(cx, cy, cw, hh);
                     int restH = ch - hh;
-                    int gh = Control.FitGap(gap, restH);
+                    int gh = Control.FitGap(innerGap, restH);
                     cy = cy + hh + gh;
                     ch = restH - gh;
                 } else if (c.dock == 2) {
-                    int hh = Control.FitSize(c.prefH, ch);
+                    int hh = Control.FitSize(c.StyleHeight(), ch);
                     c.Arrange(cx, cy + ch - hh, cw, hh);
                     int restH = ch - hh;
-                    int gh = Control.FitGap(gap, restH);
+                    int gh = Control.FitGap(innerGap, restH);
                     ch = restH - gh;
                 } else if (c.dock == 3) {
-                    int ww = Control.FitSize(c.prefW, cw);
+                    int ww = Control.FitSize(c.StyleWidth(), cw);
                     c.Arrange(cx, cy, ww, ch);
                     int restW = cw - ww;
-                    int gw = Control.FitGap(gap, restW);
+                    int gw = Control.FitGap(innerGap, restW);
                     cx = cx + ww + gw;
                     cw = restW - gw;
                 } else if (c.dock == 4) {
-                    int ww = Control.FitSize(c.prefW, cw);
+                    int ww = Control.FitSize(c.StyleWidth(), cw);
                     c.Arrange(cx + cw - ww, cy, ww, ch);
                     int restW = cw - ww;
-                    int gw = Control.FitGap(gap, restW);
+                    int gw = Control.FitGap(innerGap, restW);
                     cw = restW - gw;
                 } else if (c.dock == 5) {
                     c.Arrange(cx, cy, cw, ch);
                 } else {
-                    int ww = c.prefW;
-                    int hh = c.prefH;
+                    int ww = c.StyleWidth();
+                    int hh = c.StyleHeight();
                     if (ww < 0) { ww = 0; }
                     if (hh < 0) { hh = 0; }
                     c.Arrange(cx + c.mx, cy + c.my, ww, hh);
@@ -628,7 +756,10 @@ class Control {
     /// RenderTree (not Paint) because several widgets already declare a static
     /// Paint and the compiler resolves method calls by name only.
     void RenderTree(App app) {
-        if (!visible) {
+        if (!this.ComputedStyleCurrent(app)) {
+            this.ResolveStyle(app, Style.SNormal());
+        }
+        if (!this.StyleVisible()) {
             if (lastVisible && Hide.Count() > 0) { Hide.Raise(); }
             lastVisible = false;
             return;

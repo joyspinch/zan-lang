@@ -496,6 +496,51 @@ static int type_family(zan_type_t *t) {
     }
 }
 
+static struct zan_ctor_entry *find_ctor(zan_irgen_t *g, zan_symbol_t *type_sym,
+                                        zan_ast_list_t *args, local_scope_t *locals,
+                                        zan_ast_node_t *exclude) {
+    struct zan_ctor_entry *first = NULL;
+    struct zan_ctor_entry *best = NULL;
+    int best_score = -1;
+    int argc = args ? args->count : 0;
+    for (int i = 0; i < g->ctor_count; i++) {
+        struct zan_ctor_entry *entry = &g->ctors[i];
+        if (entry->type_sym != type_sym || entry->param_count != argc ||
+            entry->decl == exclude)
+            continue;
+        if (!first) first = entry;
+        int score = 0;
+        bool compatible = true;
+        if (entry->decl && locals) {
+            for (int j = 0; j < argc; j++) {
+                zan_ast_node_t *param = entry->decl->method_decl.params.items[j];
+                zan_type_t *pt = zan_binder_resolve_type(g->binder, param->param.type);
+                zan_type_t *at = infer_expr_type(g, args->items[j], locals);
+                if (!pt || !at || type_mentions_tp(pt) || type_mentions_tp(at))
+                    continue;
+                if (types_concrete_equal(pt, at)) {
+                    score += 4;
+                    continue;
+                }
+                int pf = type_family(pt), af = type_family(at);
+                if (pf == af && pf != FAM_UNKNOWN) {
+                    score += 2;
+                    continue;
+                }
+                if (pf == FAM_FLOAT && af == FAM_INT)
+                    continue;
+                compatible = false;
+                break;
+            }
+        }
+        if (compatible && score > best_score) {
+            best = entry;
+            best_score = score;
+        }
+    }
+    return locals ? best : first;
+}
+
 /* Type family of an expression, recognising the comparison/logical/arithmetic
  * shapes infer_expr_type leaves untyped (a lambda body like `u.age >= 18` or
  * `x * 2` still ranks against a delegate's declared return type). */

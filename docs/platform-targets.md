@@ -72,8 +72,8 @@ Key properties:
   any host.
 - **Windows cross is the restricted one**: no async-socket and no atomics/shared-
   table. For a full-feature Windows program, build **natively on Windows**.
-- **macOS cross is feature-complete for `arm64`** (console, async, atomics, Cocoa
-  GUI), but only link-verified — no real-Mac run has happened yet.
+- **macOS cross is link-complete for both architectures** (console, async, atomics,
+  Cocoa GUI), but only link-verified — no real-Mac run has happened yet.
 - The sync runtime (`AtomicInt`/`SharedTable`) is available natively everywhere and,
   when cross-compiling, for **Linux and macOS** targets (`main.c` errors early on the
   remaining ones).
@@ -101,7 +101,7 @@ A target is only "complete" when these back ends exist for it. Current coverage:
 | C FFI (`DllImport`)  | crt/msvcrt → CRT | libc | libc | resolved by the linker; names unified as `crt` |
 | Filesystem / dirent  | ✅      | glibc layout | Darwin layout | `Directory.zan` branches on dirent offsets |
 | Monotonic clock      | ✅      | `CLOCK_MONOTONIC`=1 | =6 | `Stopwatch` |
-| GUI backend          | Win32   | X11   | Cocoa | Wayland and all other windowing systems are stubs; macOS **cross** links only `libSystem` (no Cocoa) |
+| GUI backend          | Win32   | X11   | Cocoa | Wayland and all other windowing systems are stubs; macOS cross links the committed `macos-<arch>/libzan_gui.dylib`, whose Cocoa/WebKit dependencies bind on the target Mac |
 | Native DB drivers    | `win-x64`/`win-arm64` | `linux-x64`/`linux-arm64` | `macos-x64`/`macos-arm64` | `<stdlib>/System/Data/<Module>/drivers/<target>/`; binaries gitignored |
 
 Anything not listed (Wayland, BSD, mobile, WASM GUI, bare-metal) has **no** back end
@@ -124,7 +124,7 @@ Difficulty is for **CLI/compute** first; GUI is a separate, larger effort on eac
 - Still open for Windows: the same objects in the mingw ABI, staged beside
   `toolchain/win-<arch>/`.
 
-### macOS GUI cross (Cocoa) — done for arm64
+### macOS GUI cross (Cocoa) — link-complete for arm64 and x64
 - `src/runtime/gui_runtime_mac.m` is Objective-C against Cocoa/CoreText/QuartzCore/
   IOSurface/WebKit headers, which only the Apple SDK provides, so it is built on a
   Mac by `.github/workflows/drivers.yml` and the resulting `libzan_gui.dylib` is
@@ -175,20 +175,22 @@ that would fail:
 | macOS      | `macos-x64`, `macos-arm64`, `linux-x64`, `linux-arm64`       |
 | Linux      | `linux-x64`, `linux-arm64`                                   |
 
-- The host's **own** OS/arch is built natively (full support); the *other* arch of
-  the same OS and all Linux targets use the cross paths in §2 (Linux cross is full;
-  the other Windows/macOS arch carries that OS's cross restrictions).
-- Cross to a *different* desktop OS (Windows ⇄ macOS) is intentionally **not**
-  offered in the dialog: it is either impossible or too restricted for typical
-  (GUI) projects. Such builds remain available from the `zanc --target` CLI subject
-  to §2.
+- The host's **own** OS/arch is built natively; the other same-OS architecture
+  and all Linux targets use the cross paths in §2.
+- Cross to a *different* desktop OS (Windows ⇄ macOS) is currently not offered by
+  `ZanIDE.PublishTargetIds`. This is a conservative IDE product policy, not a
+  compiler/linker limitation: `zanc --target macos-{x64,arm64}` can link console,
+  async, atomics and Cocoa GUI from another host as described in §2, but those
+  outputs have not yet been executed on real Mac hardware. The CLI remains the
+  source of truth for cross-target capability.
 
 ---
 
 ## 6. Recommended order
 
-1. Stage `zanrt_io.o` / `zanrt_sync.o` for the Windows & macOS ABIs to lift the
-   async-socket / sync-runtime cross restrictions (§4).
+1. Stage `zanrt_io.o` / `zanrt_sync.o` for the Windows ABI to lift its
+   async-socket / sync-runtime cross restrictions (§4). macOS runtime objects are
+   already staged for both architectures.
 2. Android / OHOS CLI (Linux-like reactor, per-NDK sysroot).
 3. `wasm32` WASI networking/threads model.
 4. iOS, then bare-metal.

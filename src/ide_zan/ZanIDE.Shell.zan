@@ -1,0 +1,389 @@
+using System;
+using System.IO;
+using System.Diagnostics;
+using System.Json;
+using Gui;
+using Gui.Widget;
+using Game.Scene;
+
+/// ZanIDE part: the child-window and file-picker pumps of the main loop.
+///
+/// Each method renders (at most) one frame of one secondary top-level window
+/// and applies whatever action it reported, operating on the shared instance
+/// state declared in `ZanIDE.State.zan`. `Run()`'s loop calls them in order
+/// after it has drawn the main window.
+partial class ZanIDE {
+    /// Pumps the New Project / New File / Save-as-Template wizard child window:
+    /// renders one frame with a pinned widget-id baseline, then applies the
+    /// Create / Cancel / Browse action it reports.
+    void PumpWizardWindow() {
+        // ---------------- wizard child window ----------------
+        if (dlg != null) {
+            if (dlg.needsRedraw && !pathPicker.IsOpen()) {
+                dlg.BeginFrame();
+                // The wizard is immediate-mode but shares the process-wide
+                // WidgetId counter with the main window (which the IDE never
+                // rewinds). Pin a fixed high baseline for the dialog's own
+                // frame so its buttons (Create/Cancel/Browse) get identical
+                // ids every frame -- otherwise hover/press/click never match
+                // the pointer target resolved on the previous frame and the
+                // Cancel/Create buttons appear dead. Restore afterwards.
+                int savedSeq = WidgetId.SeqValue();
+                WidgetId.SetSeq(850000);
+                int action = 0;
+                if (dlgMode == 1) {
+                    action = Wizard.RenderCategorized(dlg, ZanIDE.T("New Project", "新建项目"), catNames, catSel,
+                                                      wizTpls, pSel,
+                                                      pNameInput, pLocInput,
+                                                      platforms, platformGroups);
+                } else if (dlgMode == 3) {
+                    action = Wizard.Render(dlg, ZanIDE.T("Save as Template", "另存为模板"), saveItems,
+                                           tmplCatSel, tmplNameInput, tmplNameInput, false);
+                } else {
+                    action = Wizard.Render(dlg, ZanIDE.T("New File", "新建文件"), fileItems, fSel,
+                                           fNameInput, fNameInput, false);
+                }
+                WidgetId.SetSeq(savedSeq);
+                dlg.PresentFrame();
+                lastPresent = Window.GetTickMs();
+
+                if (action == 1) {
+                    bool dlgDone = true;
+                    if (dlgMode == 1) {
+                        string parent = pLocInput.GetText();
+                        string name = pNameInput.GetText();
+                        int gi = pSel.Get();
+                        if (gi >= 0 && gi < tpls.Count && tpls[gi].ptype == "gui" && ZanIDE.IsGuiReservedName(name)) {
+                            Wizard.notice = ZanIDE.T(
+                                "That name conflicts with a built-in Gui/System type. Choose another.",
+                                "该名称与内置的 Gui/System 类型冲突，请换一个名称。");
+                            dlgDone = false;
+                        } else if (gi >= 0 && gi < tpls.Count) {
+                            string plats = ZanIDE.PlatformCsv(platforms);
+                            ZanIDE.WriteLastPickerDirectory(parent);
+                            string newDir = ZanIDE.CreateProjectT(tpls[gi], parent, name, plats, log);
+                            if (newDir == "") {
+                                // Target folder exists and is not empty: keep the
+                                // wizard open (with an inline notice) so the user
+                                // can pick another name/location.
+                                Wizard.notice = ZanIDE.T(
+                                    "Target folder exists and is not empty.",
+                                    "目标文件夹已存在且非空。");
+                                dlgDone = false;
+                            } else {
+                                root = newDir;
+                                haveProject = true;
+                                Layer.Notify(ZanIDE.T("Project created: ", "项目已创建：") + name, 3);
+                                ZanIDE.WriteLastProject(root);
+                                tabNames = new List<string>();
+                                tabBodies = new List<string>();
+                                tabPaths = new List<string>();
+                                activeTab.Set(0);
+                                lastActive = 0 - 1;
+                                ZanIDE.OpenFirst(tabNames, tabBodies, tabPaths, activeTab, root);
+                            }
+                        }
+                    } else if (dlgMode == 3) {
+                        string cat = saveItems[tmplCatSel.Get()].name;
+                        string tname = tmplNameInput.GetText();
+                        ZanIDE.SaveAsTemplate(root, cat, tname, log);
+                        Layer.Notify(ZanIDE.T("Template saved: ", "模板已保存：") + tname, 3);
+                    } else {
+                        string name = fNameInput.GetText();
+                        if (fSel.Get() == 5 && ZanIDE.IsGuiReservedName(name)) {
+                            Wizard.notice = ZanIDE.T(
+                                "That name conflicts with a built-in Gui/System type. Choose another.",
+                                "该名称与内置的 Gui/System 类型冲突，请换一个名称。");
+                            dlgDone = false;
+                        } else {
+                            string p = ZanIDE.CreateFile(fSel.Get(), root, name, log);
+                            if (!Directory.Exists(p)) {
+                                ZanIDE.OpenPath(tabNames, tabBodies, tabPaths, activeTab, p, Path.GetFileName(p));
+                            }
+                            Layer.Notify(ZanIDE.T("Created: ", "已创建：") + Path.GetFileName(p), 3);
+                        }
+                    }
+                    if (dlgDone) {
+                        rescan = true;
+                        Wizard.notice = "";
+                        dlg.window.Close();
+                        dlg = null;
+                        dlgMode = 0;
+                    } else {
+                        dlg.RequestRedraw();
+                    }
+                    app.RequestRedraw();
+                } else if (action == 2) {
+                    Wizard.notice = "";
+                    dlg.window.Close();
+                    dlg = null;
+                    dlgMode = 0;
+                    app.RequestRedraw();
+                } else if (action == 3) {
+                    if (dlgMode == 1 && !pathPicker.IsOpen()) {
+                        pathPicker.BeginFolder(ZanIDE.ReadLastPickerDirectory(pLocInput.GetText()),
+                            ZanIDE.T("Select project location", "选择项目位置"));
+                        pathPickerOwner = 1;
+                        dlg.RequestRedraw();
+                    }
+                }
+            }
+        }
+    }
+
+    /// Pumps the publish child window. "Publish" only closes it and arms
+    /// `pubPending`, so the blocking cross-compile never runs behind a frozen
+    /// window.
+    void PumpPublishWindow() {
+        // ---------------- publish child window ----------------
+        if (pubWin != null && pubWin.needsRedraw && !pathPicker.IsOpen()) {
+            string pubName = Path.GetFileName(root);
+            if (pubName == "") { pubName = "project"; }
+            pubWin.BeginFrame();
+            int savedSeqP = WidgetId.SeqValue();
+            WidgetId.SetSeq(860000);
+            int pAct = Dialogs.RenderPublishDialog(pubWin, root, pubName, pubSel);
+            WidgetId.SetSeq(savedSeqP);
+            pubWin.PresentFrame();
+            lastPresent = Window.GetTickMs();
+            if (pAct == 1) {
+                // Close first, then publish next frame so the (blocking)
+                // cross-compile never leaves a frozen window.
+                pubWin.window.Close();
+                pubWin = null;
+                pubPending = true;
+                app.RequestRedraw();
+            } else if (pAct == 2) {
+                pubWin.window.Close();
+                pubWin = null;
+                app.RequestRedraw();
+            }
+        }
+    }
+
+    /// Pumps the project-configuration child window (icon / resources /
+    /// platforms), including the picker requests and the Asset Manager
+    /// hand-off it asks for.
+    void PumpConfigWindow() {
+        // ---------------- project configuration child window ----------------
+        if (cfgWin != null && cfgWin.needsRedraw && !pathPicker.IsOpen()) {
+            cfgWin.BeginFrame();
+            int savedSeqC = WidgetId.SeqValue();
+            WidgetId.SetSeq(870000);
+            int cAct = Dialogs.RenderProjectConfigDialog(cfgWin, root, log);
+            WidgetId.SetSeq(savedSeqC);
+            cfgWin.PresentFrame();
+            lastPresent = Window.GetTickMs();
+            if (cAct == 1) {
+                cfgWin.window.Close();
+                cfgWin = null;
+                lastActive = 0 - 1;
+                app.RequestRedraw();
+            } else if (cAct == 2) {
+                pathPicker.BeginOpenFile(
+                    ZanIDE.ReadLastPickerDirectory(root), ".ico",
+                    ZanIDE.T("Select application icon (.ico)", "选择应用图标 (.ico)"));
+                pathPickerOwner = 2;
+                app.RequestRedraw();
+            } else if (cAct == 3) {
+                pathPicker.BeginOpenFile(
+                    ZanIDE.ReadLastPickerDirectory(root), "",
+                    ZanIDE.T("Add a static resource (copy)", "导入静态资源（复制）"));
+                pathPickerOwner = 3;
+                app.RequestRedraw();
+            } else if (cAct == 4) {
+                pathPicker.BeginOpenFile(
+                    ZanIDE.ReadLastPickerDirectory(root), "",
+                    ZanIDE.T("Add a linked resource (referenced in place)", "导入链接资源（引用原位置）"));
+                pathPickerOwner = 5;
+                app.RequestRedraw();
+            } else if (cAct == 5) {
+                cfgWin.window.Close();
+                cfgWin = null;
+                if (assetWin == null) {
+                    assetWin = App.CreateDark(ZanIDE.T("Asset Manager", "资源管理器"), 900, 660);
+                    assetWin.ApplySkin(app.ThemeMenuIndex());
+                    assetWin.SetChromeButtons(false, false, true, true);
+                    assetWin.Show();
+                    assetWin.SetWindowOpacity(app.WindowOpacity());
+                    assetWin.SetWallpaper(app.WallpaperPath(), app.WallpaperOpacity());
+                }
+                app.RequestRedraw();
+            }
+        }
+    }
+
+    /// Pumps the Asset Manager child window and the import / link picker
+    /// requests it raises.
+    void PumpAssetWindow() {
+        // ---------------- asset manager child window ----------------
+        if (assetWin != null && assetWin.needsRedraw && !pathPicker.IsOpen()) {
+            AssetManager.lang = ZanIDE.uiLang;
+            assetWin.BeginFrame();
+            int savedSeqA2 = WidgetId.SeqValue();
+            WidgetId.SetSeq(890000);
+            int aAct = assetMgr.Render(assetWin, root, log);
+            WidgetId.SetSeq(savedSeqA2);
+            assetWin.PresentFrame();
+            lastPresent = Window.GetTickMs();
+            if (aAct == 1) {
+                assetWin.window.Close();
+                assetWin = null;
+                lastActive = 0 - 1;
+                app.RequestRedraw();
+            } else if (aAct == 2) {
+                pathPicker.BeginOpenFile(
+                    ZanIDE.ReadLastPickerDirectory(root), "",
+                    ZanIDE.T("Import an asset file", "导入素材文件"));
+                pathPickerOwner = 6;
+                app.RequestRedraw();
+            } else if (aAct == 3) {
+                pathPicker.BeginFolder(
+                    ZanIDE.ReadLastPickerDirectory(root),
+                    ZanIDE.T("Import an asset folder (recursive)", "导入素材文件夹（递归）"));
+                pathPickerOwner = 7;
+                app.RequestRedraw();
+            } else if (aAct == 4) {
+                pathPicker.BeginOpenFile(
+                    ZanIDE.ReadLastPickerDirectory(root), "",
+                    ZanIDE.T("Link a resource (referenced in place)", "链接资源（引用原位置）"));
+                pathPickerOwner = 8;
+                app.RequestRedraw();
+            }
+        }
+    }
+
+    /// Pumps the two UiDoc-based settings windows (editor appearance and AI
+    /// providers), applying a language switch, saved editor prefs or reloaded
+    /// AI profiles.
+    void PumpSettingsWindows() {
+        if (settingsWindow != null) {
+            // Pin the child window's widget ids to a fixed baseline (the
+            // main window's per-frame widget count varies, and drifting
+            // ids would leave the settings controls unresponsive).
+            int savedSeqS = WidgetId.SeqValue();
+            WidgetId.SetSeq(880000);
+            settingsWindow.Render();
+            WidgetId.SetSeq(savedSeqS);
+            edThemeIdx = settingsWindow.ThemeIndex();
+            edFontPx = settingsWindow.FontSize();
+            if (settingsWindow.TakeLanguageChanged()) {
+                ZanIDE.uiLang = settingsWindow.Language();
+                Wizard.lang = ZanIDE.uiLang;
+                Designer.lang = ZanIDE.uiLang;
+                ribbonTabs = ZanIDE.RibbonTabs();
+                ZanIDE.ApplyPanelLabels(dock);
+                dockOutlineTitle = "";
+                dockErrorsTitle = "";
+                lastActive = 0 - 1;
+                app.RequestRedraw();
+            }
+            if (settingsWindow.TakeSaved()) {
+                ZanIDE.WriteEditorPrefs(edThemeIdx, edFontPx);
+                log.Add("> Editor theme: "
+                    + ZanIDE.EditorThemeName(edThemeIdx)
+                    + "; font " + Convert.ToString(
+                        ZanIDE.EditorFontOr(edFontPx, defFontPx))
+                    + "px.");
+                app.RequestRedraw();
+            }
+            if (!settingsWindow.IsOpen()) {
+                settingsWindow = null;
+            }
+        }
+
+        if (aiWindow != null) {
+            // Same fixed id baseline trick as the settings window above.
+            int savedSeqA = WidgetId.SeqValue();
+            WidgetId.SetSeq(885000);
+            aiWindow.Render();
+            WidgetId.SetSeq(savedSeqA);
+            if (aiWindow.TakeSaved()) {
+                // Reload the chat's profile lists from disk so the enabled
+                // profile / model dropdown follow the dialog immediately.
+                aiProfNames = new List<string>();
+                aiProfBases = new List<string>();
+                aiProfKeys = new List<string>();
+                aiProfModels = new List<string>();
+                aiProfLists = new List<string>();
+                aiProfActive = ZanIDE.AiProfilesLoad(aiProfNames, aiProfBases,
+                    aiProfKeys, aiProfModels, aiProfLists);
+                aiModelSelProf = 0 - 1;
+                app.RequestRedraw();
+            }
+            if (!aiWindow.IsOpen()) {
+                aiWindow = null;
+            }
+        }
+    }
+
+    /// Renders the shared file picker and dispatches its result to whoever
+    /// opened it (`pathPickerOwner`).
+    void PumpFilePicker() {
+        if (pathPicker.NeedsRedraw()) {
+            pathPicker.RenderWindow();
+            lastPresent = Window.GetTickMs();
+        }
+        int pickerResult = pathPicker.TakeResult();
+        if (pickerResult == 1) {
+            string picked = pathPicker.SelectedPath();
+            ZanIDE.WriteLastPickerDirectory(
+                pathPicker.CurrentDirectory());
+            if (pathPickerOwner == 1) {
+                pLocInput.SetText(picked);
+                if (dlg != null) { dlg.RequestRedraw(); }
+            } else if (pathPickerOwner == 2) {
+                string ad = ZanIDE.AssetsDir(root);
+                Directory.CreateDirectoryRecursive(ad);
+                File.Copy(picked, ad + "/app.ico");
+                ZanIDE.SetProjectIcon(root, "assets/app.ico");
+                log.Add(
+                    "> App icon set: assets/app.ico (embedded into the exe on the next Build/Run/Publish).");
+            } else if (pathPickerOwner == 3) {
+                string ad = ZanIDE.AssetsDir(root);
+                Directory.CreateDirectoryRecursive(ad);
+                string nm = Path.GetFileName(picked);
+                File.Copy(picked, ad + "/" + nm);
+                log.Add("> Added resource: assets/" + nm);
+                Layer.Msg(ZanIDE.T("Resource copied: ", "已复制资源：") + nm, 3);
+            } else if (pathPickerOwner == 6) {
+                assetMgr.ImportFile(picked, root, log);
+                Layer.Msg(ZanIDE.T("Asset imported", "素材已导入"), 3);
+            } else if (pathPickerOwner == 7) {
+                assetMgr.ImportFolder(picked, root, log);
+                Layer.Msg(ZanIDE.T("Folder imported", "文件夹已导入"), 3);
+            } else if (pathPickerOwner == 5 || pathPickerOwner == 8) {
+                ZanIDE.AddProjLink(root, picked);
+                log.Add("> Linked resource: " + picked);
+                Layer.Msg(ZanIDE.T("Resource linked: ", "已链接资源：") + Path.GetFileName(picked), 3);
+            } else if (pathPickerOwner == 9) {
+                app.SetWallpaper(picked, app.WallpaperOpacity());
+            } else if (pathPickerOwner == 4) {
+                string projectRoot = ZanIDE.FindProjectRoot(picked);
+                haveProject = projectRoot != "";
+                if (haveProject) {
+                    root = projectRoot;
+                    ZanIDE.WriteLastProject(root);
+                } else {
+                    root = ZanIDE.DirOf(picked);
+                }
+                ZanIDE.OpenPath(
+                    tabNames, tabBodies, tabPaths, activeTab,
+                    picked, Path.GetFileName(picked));
+                lastActive = 0 - 1;
+                rescan = true;
+                log.Add("> Opened " + picked + ".");
+            }
+            pathPickerOwner = 0;
+            if (cfgWin != null) { cfgWin.RequestRedraw(); }
+            if (assetWin != null) { assetWin.RequestRedraw(); }
+            app.RequestRedraw();
+        } else if (pickerResult == 2) {
+            pathPickerOwner = 0;
+            if (dlg != null) { dlg.RequestRedraw(); }
+            if (cfgWin != null) { cfgWin.RequestRedraw(); }
+            if (assetWin != null) { assetWin.RequestRedraw(); }
+            app.RequestRedraw();
+        }
+    }
+}

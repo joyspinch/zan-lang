@@ -724,8 +724,8 @@ static LLVMValueRef get_dict_set_fn(zan_irgen_t *g) {
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
     LLVMTypeRef i64ptr = LLVMPointerType(i64, 0);
     LLVMTypeRef i8pp = LLVMPointerType(i8ptr, 0);
-    LLVMTypeRef fnty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx),
-        (LLVMTypeRef[]){ i8ptr, i8ptr, i64, i64 }, 4, 0);
+    LLVMTypeRef fnty = LLVMFunctionType(i64,
+        (LLVMTypeRef[]){ i8ptr, i8ptr, i64 }, 3, 0);
     fn = LLVMAddFunction(g->mod, "__zan_dict_set", fnty);
     LLVMSetLinkage(fn, LLVMInternalLinkage);
     LLVMTypeRef realloc_ty = LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i8ptr, i64 }, 2, 0);
@@ -738,8 +738,7 @@ static LLVMValueRef get_dict_set_fn(zan_irgen_t *g) {
     LLVMPositionBuilderAtEnd(g->builder, entry);
     LLVMValueRef draw = LLVMGetParam(fn, 0);
     LLVMValueRef key = LLVMGetParam(fn, 1);
-    LLVMValueRef val = LLVMGetParam(fn, 2);
-    LLVMValueRef is_str = LLVMGetParam(fn, 3);
+    LLVMValueRef is_str = LLVMGetParam(fn, 2);
     LLVMValueRef dp = LLVMBuildBitCast(g->builder, draw,
         LLVMPointerType(g->dict_struct_type, 0), "dp");
     LLVMValueRef cntp = LLVMBuildStructGEP2(g->builder, g->dict_struct_type, dp, 0, "cntp");
@@ -747,8 +746,10 @@ static LLVMValueRef get_dict_set_fn(zan_irgen_t *g) {
     LLVMValueRef capp = LLVMBuildStructGEP2(g->builder, g->dict_struct_type, dp, 1, "capp");
     LLVMValueRef kp = LLVMBuildStructGEP2(g->builder, g->dict_struct_type, dp, 2, "kp");
     LLVMValueRef vp = LLVMBuildStructGEP2(g->builder, g->dict_struct_type, dp, 3, "vp");
+    LLVMValueRef vwp = LLVMBuildStructGEP2(g->builder, g->dict_struct_type, dp, 7, "vwp");
     LLVMValueRef ks = LLVMBuildLoad2(g->builder, i8pp, kp, "ks");
     LLVMValueRef vs = LLVMBuildLoad2(g->builder, i64ptr, vp, "vs");
+    LLVMValueRef value_words = LLVMBuildLoad2(g->builder, i64, vwp, "vw");
     LLVMValueRef findf = get_dict_find_fn(g);
     LLVMValueRef ci = zan_call2(g->builder, LLVMGlobalGetValueType(findf), findf,
         (LLVMValueRef[]){ draw, key, is_str }, 3, "dset.find");
@@ -756,9 +757,7 @@ static LLVMValueRef get_dict_set_fn(zan_irgen_t *g) {
         LLVMConstInt(i64, 0, 0), "eq");
     LLVMBuildCondBr(g->builder, eq, hit_bb, app_bb);
     LLVMPositionBuilderAtEnd(g->builder, hit_bb);
-    LLVMValueRef vslot = LLVMBuildGEP2(g->builder, i64, vs, &ci, 1, "vsl");
-    LLVMBuildStore(g->builder, val, vslot);
-    LLVMBuildRetVoid(g->builder);
+    LLVMBuildRet(g->builder, ci);
     /* append: grow when full */
     LLVMPositionBuilderAtEnd(g->builder, app_bb);
     LLVMValueRef cap = LLVMBuildLoad2(g->builder, i64, capp, "cap");
@@ -770,27 +769,25 @@ static LLVMValueRef get_dict_set_fn(zan_irgen_t *g) {
     LLVMValueRef ncap = LLVMBuildSelect(g->builder, cap0,
         LLVMConstInt(i64, 16, 0),
         zan_mul(g->builder, cap, LLVMConstInt(i64, 2, 0), "cap2"), "ncap");
-    LLVMValueRef nbytes = zan_mul(g->builder, ncap, LLVMConstInt(i64, 8, 0), "nbytes");
+    LLVMValueRef key_bytes = zan_mul(g->builder, ncap, LLVMConstInt(i64, 8, 0), "kbytes");
+    LLVMValueRef value_bytes = zan_mul(g->builder, key_bytes, value_words, "vbytes");
     LLVMValueRef ks8 = LLVMBuildBitCast(g->builder, ks, i8ptr, "ks8");
     LLVMValueRef nks8 = zan_call2(g->builder, realloc_ty, g->fn_realloc,
-        (LLVMValueRef[]){ ks8, nbytes }, 2, "nks8");
+        (LLVMValueRef[]){ ks8, key_bytes }, 2, "nks8");
     LLVMBuildStore(g->builder, LLVMBuildBitCast(g->builder, nks8, i8pp, "nks"), kp);
     LLVMValueRef vs8 = LLVMBuildBitCast(g->builder, vs, i8ptr, "vs8");
     LLVMValueRef nvs8 = zan_call2(g->builder, realloc_ty, g->fn_realloc,
-        (LLVMValueRef[]){ vs8, nbytes }, 2, "nvs8");
+        (LLVMValueRef[]){ vs8, value_bytes }, 2, "nvs8");
     LLVMBuildStore(g->builder, LLVMBuildBitCast(g->builder, nvs8, i64ptr, "nvs"), vp);
     LLVMBuildStore(g->builder, ncap, capp);
     LLVMBuildBr(g->builder, put_bb);
     LLVMPositionBuilderAtEnd(g->builder, put_bb);
     LLVMValueRef ks2 = LLVMBuildLoad2(g->builder, i8pp, kp, "ks2");
-    LLVMValueRef vs2 = LLVMBuildLoad2(g->builder, i64ptr, vp, "vs2");
     LLVMValueRef kslot2 = LLVMBuildGEP2(g->builder, i8ptr, ks2, &cnt, 1, "ksl2");
     LLVMBuildStore(g->builder, key, kslot2);
-    LLVMValueRef vslot2 = LLVMBuildGEP2(g->builder, i64, vs2, &cnt, 1, "vsl2");
-    LLVMBuildStore(g->builder, val, vslot2);
     LLVMBuildStore(g->builder,
         zan_add(g->builder, cnt, LLVMConstInt(i64, 1, 0), "ncnt"), cntp);
-    LLVMBuildRetVoid(g->builder);
+    LLVMBuildRet(g->builder, cnt);
     if (saved) LLVMPositionBuilderAtEnd(g->builder, saved);
     return fn;
 }

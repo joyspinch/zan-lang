@@ -342,8 +342,9 @@ class SelectBox : Control {
     }
 
     override void OnMeasure(App app) {
-        prefH = this.HeadHeight(app.theme);
-        prefW = app.Scale(200);
+        StyleBox s = this.ResolveStyleAs(app, "select", styleClass, Style.SNormal());
+        prefH = s.HeightOr(this.HeadHeight(app.theme));
+        prefW = s.WidthOr(app.Scale(200));
     }
 
     override void OnPaint(App app) {
@@ -357,6 +358,10 @@ class SelectBox : Control {
 
         int h = this.HeadHeight(t);
         int fs = this.FontSize(t);
+        StyleBox s = this.ResolveEasedStyleAs(app, wid, "select", styleClass,
+                                              false, open);
+        h = s.HeightOr(h);
+        fs = s.FontOr(fs);
         app.focus.RegisterFocusable(wid);
         app.hitTester.Register(HitRegion.Create(wid, x, y, w, h, 1));
 
@@ -368,43 +373,62 @@ class SelectBox : Control {
             && app.mouseY >= y && app.mouseY < y + h;
 
         // Clear button geometry (left of the arrow) when there is a value.
-        int arrowSlot = t.paddingLarge + t.iconSizeSmall;
-        int clearX = x + w - arrowSlot - t.iconSizeSmall - t.paddingSmall;
+        int partState = Style.StateOf(app, wid, false);
+        if (open) { partState = partState + Style.SSelected(); }
+        StyleBox arrowStyle = this.ResolvePartAs(app, "select", "arrow", "",
+                                                 styleClass, partState);
+        StyleBox clearStyle = this.ResolvePartAs(app, "select", "clear", "",
+                                                 styleClass, partState);
+        int arrowSize = arrowStyle.FontOr(t.iconSizeSmall);
+        int arrowSlot = arrowStyle.WidthOr(t.paddingLarge + arrowSize);
+        int clearSize = clearStyle.FontOr(t.iconSizeSmall);
+        int clearX = x + w - arrowSlot - clearSize - t.paddingSmall;
         bool showClear = clearable && this.HasValue() && overHead;
         bool overClear = showClear && app.mouseX >= clearX
-            && app.mouseX < clearX + t.iconSizeSmall;
+            && app.mouseX < clearX + clearSize;
 
         // ---- trigger ----
         // Resolved from the style layer as a `select` control, so a skin styles
         // it exactly like an input (`select:hover`, `select:focus`, ...); the
         // validation status still overrides the border colour.
-        StyleBox s = Style.EasedId(app, wid, "select", styleClass, name, false, open);
-        Style.Inline(s, this);
         if (status != 0) { s.borderColor = this.StatusBorder(t, overHead || open); }
-        fs = s.FontOr(fs);
         int pad = s.PadLOr(t.paddingSmall);
         s.Paint(app, x, y, w, h);
 
         int textY = y + (h - Canvas.FontHeight(fs)) / 2;
         int headMaxW = w - pad - arrowSlot - t.paddingSmall;
-        if (showClear) { headMaxW = headMaxW - t.iconSizeSmall - t.paddingSmall; }
+        if (showClear) { headMaxW = headMaxW - clearSize - t.paddingSmall; }
         string shown = this.Text();
+        StyleBox placeholderStyle = this.ResolvePartAs(app, "select", "placeholder", "",
+                                                        styleClass, partState);
         if (shown == "") {
-            c.DrawText(x + pad, textY,
-                Ellipsis.Fit(hint, headMaxW, fs), t.textTertiary, fs);
+            int hintFs = placeholderStyle.FontOr(fs);
+            int hintY = y + (h - Canvas.FontHeight(hintFs)) / 2;
+            c.DrawText(x + pad, hintY,
+                Ellipsis.Fit(hint, headMaxW, hintFs),
+                placeholderStyle.FgOr(t.textTertiary), hintFs);
         } else {
             c.DrawText(x + pad, textY,
                 Ellipsis.Fit(shown, headMaxW, fs), s.FgOr(t.textPrimary), fs);
         }
 
         if (showClear) {
-            int cc = t.textTertiary;
-            if (overClear) { cc = t.error; }
-            Icon.DrawCenteredIn(c, "close", clearX, y, t.iconSizeSmall, h,
-                t.iconSizeSmall, cc);
+            int clearState = Style.SNormal();
+            if (open) { clearState = clearState + Style.SSelected(); }
+            if (app.focus.IsFocused(wid)) { clearState = clearState + Style.SFocus(); }
+            if (overClear) { clearState = clearState + Style.SHover(); }
+            if (overClear && app.focus.IsPressed(wid)) {
+                clearState = clearState + Style.SActive();
+            }
+            clearStyle = this.ResolvePartAs(app, "select", "clear", "",
+                                            styleClass, clearState);
+            int cc = clearStyle.FgOr(t.textTertiary);
+            if (overClear && clearStyle.fg == 0) { cc = t.error; }
+            Icon.DrawCenteredIn(c, "close", clearX, y, clearSize, h,
+                clearSize, cc);
         }
         Icon.DrawCenteredIn(c, "chevron-down", x + w - arrowSlot, y,
-            t.iconSizeSmall, h, t.iconSizeSmall, t.textSecondary);
+            arrowSlot, h, arrowSize, arrowStyle.FgOr(t.textSecondary));
 
         // ---- trigger input (closed state only) ----
         // The popup's own clicks (option pick / outside-dismiss) are handled in
@@ -443,10 +467,12 @@ class SelectBox : Control {
         int x = trigX;
         int y = trigY;
         int w = trigW;
-        int h = this.HeadHeight(t);
-        int fs = this.FontSize(t);
+        int h = computedStyle.HeightOr(this.HeadHeight(t));
+        int fs = computedStyle.FontOr(this.FontSize(t));
         int optH = h;
-        int arrowSlot = t.paddingLarge + t.iconSizeSmall;
+        StyleBox arrowStyle = this.ResolvePartAs(app, "select", "arrow", "",
+                                                 styleClass, Style.SSelected());
+        int arrowSlot = arrowStyle.WidthOr(t.paddingLarge + t.iconSizeSmall);
 
         int ek = app.window.EventKind();
 
@@ -477,7 +503,8 @@ class SelectBox : Control {
         if (scrollY < 0) { scrollY = 0; }
 
         app.BlockHitsBelow();
-        StyleBox pop = Style.Of(app, "popup", styleClass, Style.SNormal());
+        StyleBox pop = this.ResolvePartAs(app, "select", "popup", "popup",
+                                          styleClass, Style.SSelected());
         pop.Paint(app, popX, popY, w, viewH);
         app.BlockHitsRect(popX, popY, w, viewH);
 
@@ -497,7 +524,8 @@ class SelectBox : Control {
                 int st = Style.SNormal();
                 if (overRow) { st = st + Style.SHover(); }
                 if (isSel) { st = st + Style.SSelected(); }
-                StyleBox row = Style.Of(app, "option", styleClass, st);
+                StyleBox row = this.ResolvePartAs(app, "select", "option", "option",
+                                                   styleClass, st);
                 row.Paint(app, popX + 1, oy, w - 2, optH);
                 int rowFs = row.FontOr(fs);
                 int rowPad = row.PadLOr(t.paddingSmall);
@@ -507,9 +535,12 @@ class SelectBox : Control {
                     Ellipsis.Fit(opts[i].label, oMaxW, rowFs),
                     row.FgOr(States.Text(t, isSel, false)), rowFs);
                 if (isSel) {
+                    StyleBox checkStyle = this.ResolvePartAs(app, "select", "checkmark", "",
+                                                              styleClass, st);
+                    int checkSize = checkStyle.FontOr(t.iconSizeSmall);
                     Icon.DrawCenteredIn(c, "check", popX + w - arrowSlot, oy,
-                        t.iconSizeSmall, optH, t.iconSizeSmall,
-                        row.AccentOr(t.primary));
+                        arrowSlot, optH, checkSize,
+                        checkStyle.FgOr(checkStyle.AccentOr(row.AccentOr(t.primary))));
                 }
             }
             i = i + 1;
@@ -518,7 +549,9 @@ class SelectBox : Control {
 
         // Popup scrollbar (clipped to the popup, clamped to its track).
         if (contentH > viewH && viewH > 0) {
-            int barW = app.Scale(6);
+            StyleBox scrollbarStyle = this.ResolvePartAs(app, "select", "scrollbar", "",
+                                                          styleClass, Style.SSelected());
+            int barW = scrollbarStyle.WidthOr(app.Scale(6));
             int bx = popX + w - barW - app.Scale(2);
             int minThumb = app.Scale(24);
             if (minThumb > viewH) { minThumb = viewH; }
@@ -532,7 +565,9 @@ class SelectBox : Control {
             if (thumbY < popY) { thumbY = popY; }
             if (thumbY + thumbH > popY + viewH) { thumbY = popY + viewH - thumbH; }
             c.PushClip(popX, popY, w, viewH);
-            c.FillRoundRect(bx, thumbY, barW, thumbH, barW / 2, t.scrollbar);
+            c.FillRoundRect(bx, thumbY, barW, thumbH,
+                            scrollbarStyle.RadiusOr(barW / 2),
+                            scrollbarStyle.BgOr(t.scrollbar));
             c.PopClip();
         }
 

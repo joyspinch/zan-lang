@@ -876,9 +876,9 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
      * empty), rebuilt lazily by __zan_dict_find whenever `indexed_count` no
      * longer matches `count` or a removal invalidated it (index_capacity 0). */
     LLVMTypeRef dict_fields[] = { i64, i64, LLVMPointerType(i8ptr, 0), LLVMPointerType(i64, 0),
-                                  LLVMPointerType(i64, 0), i64, i64 };
+                                  LLVMPointerType(i64, 0), i64, i64, i64 };
     g->dict_struct_type = LLVMStructCreateNamed(g->ctx, "Dict");
-    LLVMStructSetBody(g->dict_struct_type, dict_fields, 7, 0);
+    LLVMStructSetBody(g->dict_struct_type, dict_fields, 8, 0);
 
     /* Task struct: { completed: i64, result: i64, thread_handle: i64 } */
     g->task_struct_type = LLVMStructCreateNamed(g->ctx, "Task");
@@ -2509,87 +2509,9 @@ static void emit_collection_slot_store(zan_irgen_t *g, zan_type_t *elem_type,
                                        LLVMTypeRef slot_ty, LLVMValueRef slot_ptr,
                                        LLVMValueRef value,
                                        zan_ast_node_t *rhs, local_scope_t *locals,
-                                       int overwrite_old) {
-    LLVMValueRef old = NULL;
-    if (overwrite_old) {
-        old = LLVMBuildLoad2(g->builder, slot_ty, slot_ptr, "arc.old");
-    }
-    if (!expr_yields_owned_rc_value(g, rhs, locals)) {
-        emit_rc_retain_for_type(g, elem_type, value);
-    }
-
-    LLVMValueRef stored = value;
-    LLVMTypeKind slot_k = LLVMGetTypeKind(slot_ty);
-    LLVMTypeKind val_k = LLVMGetTypeKind(LLVMTypeOf(stored));
-    if (slot_k == LLVMPointerTypeKind) {
-        if (val_k == LLVMIntegerTypeKind) {
-            /* A scalar Dict key stored inttoptr'd: normalize to the declared
-             * key width (Dict<int,...> keys are i32) so a literal and a
-             * same-valued variable produce one raw key. */
-            LLVMTypeRef kem = elem_type ? map_type(g, elem_type) : NULL;
-            LLVMTypeRef i64k = LLVMInt64TypeInContext(g->ctx);
-            if (kem && LLVMGetTypeKind(kem) == LLVMIntegerTypeKind &&
-                LLVMGetIntTypeWidth(kem) < LLVMGetIntTypeWidth(LLVMTypeOf(stored)))
-                stored = LLVMBuildTrunc(g->builder, stored, kem, "slot.knw");
-            if (LLVMGetIntTypeWidth(LLVMTypeOf(stored)) < 64)
-                stored = extend_int_for_slot(g, stored, elem_type, i64k);
-            stored = LLVMBuildIntToPtr(g->builder, stored, slot_ty, "slot.ip");
-        } else if (val_k == LLVMPointerTypeKind && LLVMTypeOf(stored) != slot_ty) {
-            stored = LLVMBuildBitCast(g->builder, stored, slot_ty, "slot.bc");
-        }
-    } else if (slot_k == LLVMIntegerTypeKind) {
-        if (val_k == LLVMStructTypeKind) {
-            /* value struct: written inline across the element's own words */
-            store_struct_in_slot(g, stored, slot_ptr, rhs);
-            return;
-        } else if (val_k == LLVMPointerTypeKind) {
-            stored = LLVMBuildPtrToInt(g->builder, stored, slot_ty, "slot.pi");
-        } else if (val_k == LLVMIntegerTypeKind) {
-            /* Normalize to the declared element width first so a generic
-             * List<int>/Dict<...,int> enforces i32 like every other int
-             * context: a wider (e.g. i64 literal) value is truncated to the
-             * element width, then re-extended into the i64 slot per the
-             * element's signedness. */
-            LLVMTypeRef eem = elem_type ? map_type(g, elem_type) : NULL;
-            if (eem && LLVMGetTypeKind(eem) == LLVMIntegerTypeKind &&
-                LLVMGetIntTypeWidth(eem) < LLVMGetIntTypeWidth(LLVMTypeOf(stored)))
-                stored = LLVMBuildTrunc(g->builder, stored, eem, "slot.elw");
-            if (LLVMGetIntTypeWidth(LLVMTypeOf(stored)) < LLVMGetIntTypeWidth(slot_ty))
-                stored = extend_int_for_slot(g, stored, elem_type, slot_ty);
-        } else if (val_k == LLVMDoubleTypeKind) {
-            /* double element packed into an i64 slot: bitcast, not fptoint. */
-            stored = LLVMBuildBitCast(g->builder, stored, slot_ty, "slot.fb");
-        }
-    }
-    LLVMBuildStore(g->builder, stored, slot_ptr);
-    if (overwrite_old) {
-        if (LLVMGetTypeKind(slot_ty) == LLVMPointerTypeKind) {
-            emit_rc_release_for_type(g, elem_type, old);
-        } else if (LLVMGetTypeKind(slot_ty) == LLVMIntegerTypeKind && is_rc_managed_type(elem_type)) {
-            LLVMTypeRef mt = map_type(g, elem_type);
-            if (LLVMGetTypeKind(mt) == LLVMPointerTypeKind) {
-                LLVMValueRef old_ptr = LLVMBuildIntToPtr(g->builder, old, mt, "slot.old");
-                emit_rc_release_for_type(g, elem_type, old_ptr);
-            }
-        }
-    }
-}
-
+                                       int overwrite_old);
 static void emit_collection_release_raw_slot(zan_irgen_t *g, zan_type_t *elem_type,
-                                             LLVMValueRef raw, LLVMTypeRef slot_ty) {
-    if (!elem_type || !is_rc_managed_type(elem_type)) return;
-    if (LLVMGetTypeKind(slot_ty) == LLVMPointerTypeKind) {
-        emit_rc_release_for_type(g, elem_type, raw);
-        return;
-    }
-    if (LLVMGetTypeKind(slot_ty) == LLVMIntegerTypeKind) {
-        LLVMTypeRef mt = map_type(g, elem_type);
-        if (LLVMGetTypeKind(mt) == LLVMPointerTypeKind) {
-            LLVMValueRef ptr = LLVMBuildIntToPtr(g->builder, raw, mt, "slot.old");
-            emit_rc_release_for_type(g, elem_type, ptr);
-        }
-    }
-}
+                                             LLVMValueRef raw, LLVMTypeRef slot_ty);
 
 static LLVMValueRef get_calloc_fn(zan_irgen_t *g) {
     LLVMValueRef f = LLVMGetNamedFunction(g->mod, "calloc");

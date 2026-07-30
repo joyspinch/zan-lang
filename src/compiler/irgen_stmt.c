@@ -404,27 +404,39 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
 
                             /* try calling constructor */
                             bool ctor_called = false;
-                            for (int ci = 0; ci < g->ctor_count; ci++) {
-                                if (g->ctors[ci].type_sym == sym &&
-                                    g->ctors[ci].param_count == init->new_expr.args.count) {
-                                    int argc = init->new_expr.args.count + 1;
-                                    LLVMValueRef *call_args = (LLVMValueRef *)calloc((size_t)argc, sizeof(LLVMValueRef));
-                                    call_args[0] = alloca;
-                                    for (int k = 0; k < init->new_expr.args.count; k++) {
-                                        call_args[k + 1] = emit_expr(g, init->new_expr.args.items[k], locals);
-                                    }
-                                    coerce_args_to_params(g, g->ctors[ci].fn_type,
-                                                          call_args, argc);
-                                    zan_call2(g->builder, g->ctors[ci].fn_type,
-                                        g->ctors[ci].fn, call_args, (unsigned)argc, "");
-                                    free(call_args);
-                                    ctor_called = true;
-                                    break;
+                            struct zan_ctor_entry *ctor = find_ctor(
+                                g, sym, &init->new_expr.args, locals, NULL);
+                            if (ctor) {
+                                int argc = init->new_expr.args.count + 1;
+                                LLVMValueRef *call_args = (LLVMValueRef *)calloc(
+                                    (size_t)argc, sizeof(LLVMValueRef));
+                                call_args[0] = alloca;
+                                for (int k = 0; k < init->new_expr.args.count; k++) {
+                                    zan_ast_node_t *param =
+                                        ctor->decl->method_decl.params.items[k];
+                                    zan_type_t *pt = zan_binder_resolve_type(
+                                        g->binder, param->param.type);
+                                    call_args[k + 1] = emit_arg_typed(
+                                        g, init->new_expr.args.items[k], pt, locals);
                                 }
+                                coerce_args_to_params(g, ctor->fn_type, call_args, argc);
+                                zan_call2(g->builder, ctor->fn_type, ctor->fn,
+                                    call_args, (unsigned)argc, "");
+                                for (int k = 0; k < init->new_expr.args.count; k++)
+                                    emit_release_owned_call_temp(g,
+                                        init->new_expr.args.items[k],
+                                        call_args[k + 1], locals);
+                                free(call_args);
+                                ctor_called = true;
                             }
 
                             /* if no constructor, handle field initializers */
                             if (!ctor_called) {
+                                zan_type_t *new_inst = resolve_type_ctx(
+                                    g, init->new_expr.type);
+                                emit_implicit_field_initializers(
+                                    g, sym, new_inst ? new_inst : sym->type,
+                                    alloca, locals);
                                 for (int i = 0; i < init->new_expr.args.count; i++) {
                                     zan_ast_node_t *arg = init->new_expr.args.items[i];
                                     if (arg->kind == AST_ASSIGNMENT && arg->binary.left->kind == AST_IDENTIFIER) {

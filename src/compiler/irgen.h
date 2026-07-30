@@ -165,6 +165,7 @@ struct zan_irgen {
     /* constructors */
     struct zan_ctor_entry {
         zan_symbol_t *type_sym;
+        zan_ast_node_t *decl;
         LLVMValueRef fn;
         LLVMTypeRef fn_type;
         int param_count;
@@ -194,6 +195,7 @@ struct zan_irgen {
     int generic_fn_cap;
     struct zan_generic_ctor {
         zan_symbol_t *type_sym;
+        zan_ast_node_t *decl;
         zan_type_t  **args;
         int           argc;
         int           param_count;

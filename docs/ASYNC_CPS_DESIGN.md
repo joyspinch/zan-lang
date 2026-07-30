@@ -1,15 +1,16 @@
 # Async/await → CPS state-machine lowering (design)
 
-## Goal
-Compile `async` functions into real resumable **state machines** driven by a
-cooperative scheduler, so `await` genuinely suspends (yielding to other tasks /
-the IO reactor) instead of the current behaviour:
+## Goal and current status
+Zan lowers `async` functions into resumable **CPS state machines** driven by a
+cooperative scheduler. `await` suspends the current frame, yields to other tasks
+or the IO reactor, and resumes at a numbered state.
 
-- today `checker` ignores `async`; `irgen` compiles an `async` function as an
-  ordinary synchronous function and `await e` just evaluates `e` (a busy-wait
-  poll loop on a compiler-invented `Task{completed,result,handle}` struct that
-  is never populated by any scheduler). The real coroutine runtime
-  (`zan_spawn`/`zan_task_await` in `rt_sched.c`) is never called by generated code.
+This design is implemented. The compiler emits a ramp and `$resume` function for
+each async body, emits the single-threaded scheduler inline by default, and can
+link the multi-worker driver from `rt_io.c` when `--async-workers` is selected.
+Socket/file readiness uses the `zan_io_*_co` bridge to requeue frames. The sections
+below describe the current lowering; the staging section is retained as completed
+implementation history.
 
 ## Why an explicit state machine (not `llvm.coro.*`)
 Two findings from the codebase drove this:
@@ -37,6 +38,18 @@ just materialised by us rather than by `CoroSplit`.
     i8*   awaiter         ; frame waiting on this one (or null)
     void(i8*)* awaiter_step ; awaiter's resume fn (or null)
     i64   result         ; return value, encoded (see "Result slot" below)
+    void(i8*)* cleanup ; releases owned slots and frees the frame
+    i32   hcount       ; active try handlers recorded across suspension
+    void(i8*)* self_step
+    i8*   exc          ; uncaught exception value
+    i8*   exc_tid      ; dynamic exception type descriptor
+    i32   exc_owned    ; whether exc carries a +1 reference
+    i32   cancel
+    i8*   child
+    i8*   lnext
+    i32[] hstack       ; active handler ids, innermost last
+    ; per-try catch exception value/ownership/type arrays
+    ; per-finally-depth exception value/ownership/type arrays
     ; --- captured params ---
     <param0>, <param1>, ...
     ; --- captured named locals (live across any await) ---
@@ -45,11 +58,11 @@ just materialised by us rather than by `CoroSplit`.
     i8*   sub0, i8* sub1, ...
 }
 ```
-The header continues past the first 5 fields (cleanup fn, handler count, own
-resume fn, pending-exception triple, `cancel`, `child`, `lnext`); that prefix is
-a fixed **header** at known offsets (`%zan.co.header`) so runtime helpers, the
-await protocol and the cancellation helpers can touch any frame without knowing
-which function it belongs to.
+The first 14 fields form a fixed **header** at known offsets (`%zan.co.header`) so
+runtime helpers, the await protocol, exception propagation and cancellation can
+touch any frame without knowing which function it belongs to. Handler and
+catch/finally arrays follow the fixed header and are sized from the async body's
+try/finally structure; captured parameters and locals follow them.
 
 ## Result slot
 The slot is physically 64 bits for every async function -- it sits at a fixed
@@ -71,6 +84,33 @@ and reads a `float` at the wrong width, and it silently truncates `int` once
 `int` is 32 bits wide. The return expression is converted to the declared return
 type *before* it is encoded, so `async double F() { return 3; }` puts a double in
 the slot rather than the integer bits.
+
+## Exception propagation across suspension
+The synchronous exception implementation uses `setjmp`/`longjmp`, but a coroutine
+must never jump into an earlier `$resume` invocation after that invocation has
+returned to the scheduler. The async lowering preserves this invariant as follows:
+
+1. Every `$resume` invocation arms an outer trampoline plus the try handlers
+   recorded in `frame.hcount` / `frame.hstack` before dispatching on `state`.
+2. Before every suspension or completion, `emit_async_eh_unarm` restores the
+   global handler stack to the invocation's entry depth. No dead stack handler
+   remains reachable while the frame is parked.
+3. On resume, the prologue re-arms the handlers for the try regions that span the
+   suspension. A throw then lands in a handler belonging to the current, live
+   `$resume` invocation.
+4. An exception escaping the async body is moved into `frame.exc`, `exc_tid` and
+   `exc_owned`; the coroutine completes and wakes its awaiter. At the await resume
+   point, the awaiter moves that exception back into its own EH globals and
+   rethrows it inside its live invocation.
+5. Exceptions being handled by `catch` and exceptions crossing `finally` are
+   stored in per-region frame arrays. This preserves the original exception,
+   dynamic type and ownership across an `await`, including bare `throw;`.
+
+Owned locals remain frame-resident across suspension and are released on normal,
+exceptional or cancelled completion. This is a compensation layer over the
+current setjmp/longjmp EH. Moving to LLVM `invoke`/landingpad/personality remains
+a future performance and simplification project, not a correctness prerequisite
+for the implemented async state machine.
 
 ## Cancellation
 Cancellation is cooperative and lives entirely in the generated program (the
@@ -131,21 +171,25 @@ ret void                          ; SUSPEND self
 resume_k:                         ; scheduler re-enters Self$resume, switch → here
 x = sub.result                    ; sub is guaranteed done before we're re-scheduled
 ```
-Fast path: if `sub.done` is already 1 right after the ramp (e.g. a sub that
-never awaits), we may fall through without suspending (optional optimisation;
-initial version always suspends for uniformity/correctness).
+The current lowering always schedules the sub-task and suspends the awaiting
+frame, even when the sub-task could complete immediately. A `sub.done` fast path
+would be a valid future optimisation, but is not part of the current protocol.
 
-## Runtime (Stage 1, `rt_sched.c`/new `rt_co.c`)
-Minimal cooperative driver for stackless frames, independent of the existing
-ucontext fiber scheduler:
+## Runtime and scheduler
+The compiler-facing scheduler ABI is:
 ```
 void zan_co_sched_init(void);
-void zan_co_ready(void *frame, void (*step)(void*)); ; enqueue (frame,step)
-void zan_co_sched_run(void);   ; pop & step until ready-queue AND IO reactor empty
+void zan_co_ready(void *frame, void (*step)(void*));
+void zan_co_sched_run(void);
 ```
-IO await bridges to the existing `rt_io` reactor: a one-shot registration
-`when fd ready → zan_co_ready(frame, step)` (added when we wire `await` on
-sockets; not needed for the compute-only first slice).
+The default single-threaded implementation is emitted into the generated module.
+When `--async-workers` is used, `zanrt_io_mt` supplies the same ABI with an OS
+worker pool. IO await operations register a one-shot watcher through `rt_io`; when
+it completes, the reactor calls `zan_co_ready(frame, step)`.
+
+The ready queue and IO reactor are driven together: the scheduler drains ready
+frames, pumps IO while watchers remain, and stops when no runnable or pending IO
+work is left.
 
 ## Entry / driving
 If `Main` (or any root) awaits, `main()` becomes:
@@ -160,24 +204,30 @@ Non-async callers that `await` an async call are handled the same way at the
 nearest async boundary; a synchronous function that calls an async one without
 awaiting just receives the task handle.
 
-## Staging (each lands green on CI)
-- **S1 runtime**: `zan_co_*` driver + unit test (spawn N compute frames, run,
-  assert results). No compiler changes.
-- **S2 irgen**: detect `MOD_ASYNC`; emit ramp + resume skeleton with frame;
-  no awaits yet (async fn with a plain `return` → task whose result is set).
-- **S3 await**: state splitting + await protocol; `await` suspends/resumes.
-  End-to-end: `async_test.zan` prints `42` via the scheduler (verified by IR
-  showing ramp/resume/switch + a real run).
-- **S4**: broaden — multiple awaits, await in `if`/loop, async-calls-async,
-  `await` on runtime IO (bridge to `rt_io`); golden-IR cases + runnable e2e.
+## Implementation history
+The original staged plan has landed:
+- **S1 runtime — complete**: cooperative ready queue and scheduler ABI.
+- **S2 irgen — complete**: ramp + `$resume` skeleton and heap frame.
+- **S3 await — complete**: state splitting, suspension and resumption.
+- **S4 control flow / IO — complete**: multiple awaits, conditionals, loops,
+  nested async calls and runtime IO bridges.
+- **EH / ARC / cancellation follow-up — complete for current semantics**:
+  try/catch/finally across suspension, cross-coroutine exception propagation,
+  frame-resident ownership cleanup and cooperative cancellation.
+
+Async generic-method monomorphization remains a separate compiler limitation;
+it requires cloning the specialized frame, ramp and `$resume` together.
 
 ## Test strategy
-- Golden IR (`--emit-ir`, "must-contain" symbols): `C_M$frame`, `C_M$resume`,
-  `switch`, `zan_co_ready`, `state` store — locks the transform shape
-  cross-platform without pinning exact LLVM text.
-- Runnable e2e: compile+run async programs, assert stdout (compute, chained
-  awaits, loop-with-await, async IO echo).
-- Sanitizers: run the e2e + `zan_co_*` unit under ASan/UBSan (existing job).
+- Runnable conformance cases cover compute and chained awaits, loop/foreach and
+  control-flow awaits, IO, cancellation, try/catch/finally, rethrow and exceptions
+  crossing coroutine boundaries.
+- Determinism and leakcheck variants exercise the same programs and lock frame
+  ownership behavior.
+- Targeted IR inspection remains useful for transform-shape regressions: ramp,
+  `$resume`, state dispatch, `zan_co_ready`, frame exception slots and handler
+  re-arm blocks.
+- Sanitizer runs of the scheduler/reactor remain the native-runtime safety gate.
 
 ## Risks / scope notes
 - Temporaries that straddle an await (e.g. `f(await a, await b)`): handled by

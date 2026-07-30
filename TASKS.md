@@ -289,15 +289,17 @@ static extern int zan_gui_present(int hwnd, int surfaceId);
 `checker.c` 只有 463 行、根本不做赋值/初始化的转换检查，真正的类型推断在 irgen。
 这意味着 int=32 一旦切换，"用 `int` 变量接住 64 位句柄"的地方会**静默截断且不报错**。
 
-**实现**：`irgen_expr_core.c` 新增 `conv_rank()` / `warn_narrowing()`，
+**实现（2026-07-30 复核）**：`irgen_expr_core.c` 的 `check_implicit_narrowing()`
 按 C# 规则判定（只有目标能容纳源的全部取值才是隐式转换；`nint` 视为指针宽，
-`nint → int` 属于窄化）。挂了三个点：变量初始化（`irgen_stmt.c`）、
-赋值（`emit_expr_assignment`）、实参传递（`emit_arg_typed`）。
-`ZAN_WARN_NARROW=1` 开启，**在切 int=32 的同一次改动里改成默认报错**。
+`nint → int` 属于窄化）。普通数值窄化继续由 `ZAN_WARN_NARROW=1` 作为迁移诊断；
+`nint → int` 会无条件报错，避免 64 位句柄静默截断。已覆盖变量初始化、赋值、实参、
+普通/async `return`、表达式体方法、泛型特化体和表达式体 lambda；`zan_irgen` 新增
+`current_fn_zan_ret_type` 保存源码返回类型。8 个独立编译失败测试
+`diag_nint_to_int_{initializer,assignment,argument,return,expr_return,async_return,lambda_return,generic_return}`
+全部通过。
 
-**尚未挂的点**（记下来，别当已完成）：`return` 语句还没查——irgen 里没有
-"当前方法返回类型"的 `zan_type_t`，需要先补 `g->current_fn_ret_zan_type`。
-字段赋值经由 `assign_lhs_type` 已覆盖，但字段**初始化器**未覆盖。
+**仍未覆盖**：字段赋值经由 `assign_lhs_type` 已覆盖，但静态/实例字段的声明初始化器
+仍直接发射表达式，没有走 `check_implicit_narrowing()`。
 
 ### A0-1 的实际工作量（扫描发现）
 
@@ -575,9 +577,10 @@ operand type of return inst!
   新增回归 `tests/conformance/generic_tp_member_call.zan`（含 conformance /
   determinism / leakcheck 三份）。全量 `ctest -j8`：**547/547 通过，37.23 s**。
 
-  **仍未覆盖的边界**（不要当已完成）：实例方法和 async 泛型方法的单态化尚未实现，
-  这类体现在是明确报错而不是编译成垃圾；B3-1 的 `DbPool<TConn>` 若需要
-  **实例**泛型方法，得先把 spec 扩展到带 `this` 的形态。
+  **后续状态（2026-07-30 回填）**：普通类上的实例（非 static）泛型方法已在
+  **A29-1** 完成，所以上述“实例方法尚未实现”只保留为当时的历史边界。当前真正
+  剩余的是**泛型类的实例泛型方法**（`Pool<T>.M<U>()`）与 **async 泛型方法**，
+  详见 A29 末尾。
 * **A7-2 ✅ 已修**（构造类型上的静态成员访问）。`Box<int>.Create(7)` /
   `Pair<int, string>.Of(3, "three")` / `Counter<double>.Twice(21)` 现在都解析并
   绑定到对应实例化。回归：`tests/conformance/generic_static_member_access.zan`
@@ -617,8 +620,9 @@ operand type of return inst!
   循环内反复覆盖、`Acc<string>` / `Acc<List<string>>` / `Acc<int>`、`Pair<Node,int>`、
   临时接收者的字段读），conformance / determinism / leakcheck 三份全绿；
   全量 `ctest -j8` **588/588**。
-  **注意**：这一项解掉了 B3-1 的阻塞——`DbPool<TConn>` 的 `TConn` 字段现在按真实类型
-  管理所有权。仍未做的是**实例泛型方法的单态化**（A7-1 结尾那条），与本项无关。
+  **注意（历史记录）**：这一项当时只解掉了 B3-1 的泛型字段所有权阻塞；
+  普通类上的实例泛型方法后来已在 **A29-1** 完成。当前只剩泛型类上的实例泛型方法
+  与 async 泛型方法，不能再把“实例泛型方法”整体列为未完成。
 
 ## A8 ARC / 异常 / 协程交互 〔**已实测，三份 repro 全部仍成立**，2026-07-27〕
 
@@ -773,8 +777,9 @@ operand type of return inst!
     `conformance` / `determinism` / `leakcheck` 三档 3/3 Passed，无泄漏、无重复释放。
   * 这仍然是 setjmp/longjmp EH 之上的补偿机制，happy path 上每个持有型局部多一次
     push、一次 pop。**终局仍应换成 LLVM 真 EH（invoke/landingpad + personality）**：
-    零开销 happy path，中间帧 cleanup 交给 unwinder，同时能解决 A8-7 记录的其他 EH
-    设计落差。与 A0 的 typed async frame 一并规划。
+    零开销 happy path，中间帧 cleanup 交给 unwinder，并简化目前由 trampoline、
+    帧内 handler/catch/finally 状态实现的 async EH 补偿层。与 typed async frame
+    的现有布局兼容性需要一并规划。
 
     **代价已量化（2026-07-29，win-x64，`_scratch/eh_cost.zan`）**：同一个循环体
     （300 万次一个 `x*31+7` 的静态调用），裸循环 **10381 µs**，把循环体包进
@@ -882,15 +887,19 @@ catch 块内的挂起、foreach 的降级与状态切分冲突。所以是**定�
   正常路径不受影响。仍是一处应当补齐的缺陷（形如 `if (c) switch (...) { ... await ... }`
   会漏规范化），但按**低危补漏**处理，不要当成 A8-1 的解释。
 
-### A8-7 设计文档与实现的落差〔文档待修，归入 C 组〕
+### A8-7 ✅ 设计文档与实现的落差已同步（2026-07-30）
 
-`docs/ASYNC_CPS_DESIGN.md` 的分阶段计划里，S4 才"broaden 到 await in if/loop"，
-**try/catch 从头到尾没有出现**——即 await 与异常处理的交互从设计阶段就不在覆盖范围内。
-实现后来补了协程 EH（trampoline + 帧内 hstack 重新 arm），但设计文档没同步。
-另外 frame 布局写死 `i64 result` / "all scalars are i64 in this backend"，
-**与 A0（int=32）直接冲突**。**已修（A27）**：`ASYNC_CPS_DESIGN.md` 增补了
-"Result slot"（按声明类型编解码）与 "Cancellation" 两节，帧布局说明也补了 header
-后半段（cancel / child / lnext）。EH 与 await 交互的落差仍未在文档里补齐。
+`docs/ASYNC_CPS_DESIGN.md` 原来的 Goal/S1-S4 仍按实现前状态描述，且没有说明
+await 与 try/catch/finally 的交互。现在已改为“当前实现 + 历史路线”分层：
+- Goal 明确 ramp / `$resume` 状态机、调度器、IO bridge 均已接入；
+- frame layout 补齐 cleanup、handler、异常、取消、child/live-list，以及 catch/finally
+  跨挂起槽；
+- 新增 **Exception propagation across suspension**，记录挂起前 unarm、恢复时按
+  `hcount/hstack` re-arm、未捕获异常经 frame 传给 awaiter、catch/finally 状态帧驻留；
+- S1-S4 标为已落地的历史阶段，测试策略改成当前回归范围。
+
+A27 的 typed result/cancellation 内容保留并与真实 frame header 对齐。终局 LLVM
+`invoke`/landingpad/personality 仍是 A8-12 的性能型后续，不属于本次文档漂移。
 
 ---
 
@@ -2523,7 +2532,7 @@ Wechat 那两个 leakcheck 则随生成脚本那边收尾后参数个数对上�
 
 ---
 
-# A30 · 集合元素槽不再固定 8 字节（A15-4，已完成）
+# A30 · 集合元素槽不再固定 8 字节（A15-4，✅ 主体已完成；剩余边界另列）
 
 `List<T>` 的数据缓冲区仍是 `i64*`，但一个元素占**整数个 8 字节字**：标量/引用元素
 1 个字，值 struct 占 `ceil(sizeof/8)` 个字并**内联**存放（原来是打包进单个 i64，
@@ -2537,9 +2546,10 @@ Wechat 那两个 leakcheck 则随生成脚本那边收尾后参数个数对上�
 * **顺带修**：`list[i].field` 这类"在 struct 右值上取字段"一直落到
   `emit_expr_member_access` 的兜底 `return 0`——`a[0].x` 静默返回 0（与元素宽度无关，
   1 个 int 的 struct 也中招）。现在对寄存器里的 struct 右值走 `extractvalue`。
-* 仍受限（给明确编译错误，不产生错 IR）：宽 struct 元素的 `IndexOf` / `Contains` /
-  `Insert` / `Reverse` / `AddRange`（这些按单字做相等比较或整字搬运），
-  以及 `Dictionary` 的值槽仍是 8 字节。
+* **A30 后续边界（未完成，不回退 A30 主体状态）**：宽 struct 元素的 `IndexOf` /
+  `Contains` / `Insert` / `Reverse` / `AddRange` 仍给明确编译错误，因为这些路径还按单字
+  比较或搬运；`Dictionary` 的值槽也仍是 8 字节。后续任务应分别扩展这些操作和
+  Dictionary stride，不能据此把已完成的 List 存储/索引/遍历主体重新标成未完成。
 
 证据：`tests/conformance/list_wide_struct_elements.zan`（12 字节 P3 与 32 字节 Big：
 10 个元素的下标/字段访问、foreach 求和、扩容、整元素覆盖写、`RemoveAt` 左移、
@@ -2618,9 +2628,216 @@ Wechat 那两个 leakcheck 则随生成脚本那边收尾后参数个数对上�
   Linux 上实跑输出 `hi from mac`）；`conformance_(console|io_|hello|string|threading|async_)`
   **31/31 Passed**。
 
-**仍未做**（不算在本项内）：① 没有 Mac 机器，未在真实 macOS x64/arm64 上执行产物，
-只做到「链接 + Mach-O/签名结构」级别验证；② GUI 交叉仍不可用（只有 libSystem stub，
-Cocoa/CoreText/QuartzCore/IOSurface/WebKit 都没有 `.tbd`，且 `gui_runtime_mac.m` 是
-Objective-C，需要 Mac runner 编出对象），见 `docs/platform-targets.md` §4；
-③ 分发用 Developer ID 签名 + 公证（需要证书 + App Store Connect API key，
-可用 rcodesign 在非 Mac 上做）未接。
+**仍未做（不算在本项内）**：① 没有 Mac 机器，未在真实 macOS x64/arm64 上执行产物，
+只做到「链接 + Mach-O/签名结构」级别验证；② **GUI 交叉链接已完成，不再是缺口**：
+`stdlib/Gui/drivers/macos-{arm64,x64}/libzan_gui.dylib` 均已签入，`main.c` 会按目标发现
+并传给 `ld64.lld`，记录 `@loader_path` rpath，`--publish` 随程序分发；Cocoa/WebKit
+依赖由目标 Mac 的 dyld 绑定，不需要在交叉宿主提供 framework `.tbd`。当前 GUI 遗留
+只是同样缺真实 Mac 实机运行；③ 分发用 Developer ID 签名 + 公证（需要证书 +
+App Store Connect API key，可用 rcodesign 在非 Mac 上做）未接。
+
+---
+
+# A32 · 审计遗留问题彻底收尾路线（2026-07-30，计划）
+
+## 完成定义与约束
+
+本路线不把「已有明确报错」「保留旧补偿层」「只链接未执行」算完成。最终状态必须同时满足：
+
+1. 字段声明初始化器与所有现有转换边界使用同一套窄化规则；
+2. `List<T>` 的公开操作和 `Dictionary<K,V>` 的值槽都支持任意已知布局的值类型；
+3. 泛型类实例上的泛型方法和 async 泛型方法都走具体特化，不再有这两类拒绝分支；
+4. async-to-async `await` 对同步完成子任务有无竞争 fast path；
+5. `setjmp`/`longjmp`、展开临时栈和 async trampoline EH 补偿层最终由目标原生 LLVM EH
+   取代并删除；
+6. macOS 交叉产物由真实 macOS runner 执行；签名、公证流水线具备凭据后可直接启用。
+
+硬约束：先在 `_scratch/` 做最小复现，根因修在 compiler/runtime，不改写 Zan 代码绕过；
+每个里程碑单独提交、单独回归。编译器改动只跑受影响子集；全量测试只作为整条路线的
+最终 release gate。
+
+## A32-0 · 冻结基线与失败矩阵（S，所有阶段前置）
+
+* 为下列边界各建最小探针并记录当前结果：静态/实例字段声明初始化器窄化；
+  `Pool<T>.M<U>()`；static/instance async `M<T>()`；宽 struct 的五个 List 操作；
+  宽 struct 与含引用字段 struct 的 Dictionary 增删改查/枚举；同步完成 await 链。
+* 先确认实例字段声明初始化器的**语义本身**是否执行。当前 codegen 只明确看到
+  `irgen_emit.c` 的静态字段入口；若实例初始化器未执行，A32-1 必须同时补语义，不能只加诊断。
+* 保存当前 async EH 正确性与成本基线：A8-12 的同步/async 混合栈矩阵、
+  `_scratch/eh_cost.zan` 的裸循环/空 try 中位数、生成 IR 中 setjmp/push/pop 数量。
+* 基线命令：构建 `zanc`，再分别跑 `diag_nint_to_int_`、`generic`、
+  `list_wide_struct_elements`、`dict`、`exception|throw|catch|async|try|await` 的精确子集。
+
+**退出标准**：每个后续条目都有「当前失败的最小探针 + 预期输出/诊断」，且没有把探针
+放进版本库测试目录；只有开始修复时才把对应案例提升为正式测试。
+
+## A32-1 · 字段声明初始化器转换与语义补齐（S）
+
+**实现点**：`irgen_emit.c` 静态字段初始化入口、对象/值类型构造路径
+`irgen_expr.c` / `irgen_stmt.c`、`irgen_expr_core.c::check_implicit_narrowing()`。
+
+1. 提取声明初始化器的共同检查入口：以字段经泛型替换后的声明类型为目标、初始化表达式
+   推断类型为源，在任何 `emit_expr`/coerce/store 之前调用 `check_implicit_narrowing()`。
+2. 静态字段直接接入现有 main-entry 初始化循环；诊断位置必须指向初始化表达式。
+3. 若 A32-0 证实实例初始化器未执行，生成每类型一次的 defaults lowering，并从所有 class/
+   struct 构造入口调用；顺序、继承和「每对象只执行一次」按 Zan 既有 C# 兼容目标定型。
+   RC 字段必须复用 typed retain/store，构造失败或异常路径不得泄漏。
+4. 覆盖普通类、struct、泛型类型特化、显式构造器/无构造器、static/instance 字段。
+
+**正式测试**：新增 static/instance/generic field initializer 三个编译失败诊断；再加一份
+`field_decl_initializers.zan` 覆盖执行顺序、一次性和 RC 字段。其 conformance、determinism、
+leakcheck 全部通过；显式 cast 版本必须编译运行成功。
+
+## A32-2 · 统一 stride-aware 集合元素操作（L，先于泛型/EH 大改）
+
+**设计决策**：不逐个复制 `IndexOf`/`Insert` 的补丁。先在 irgen 公共层建立 typed element
+primitives：`address/load/store/copy/move/equal/release/zero`，参数包含 Zan 元素类型和
+`elem_slot_words()` stride。struct 比较复用语言的逐字段/运算符语义，不用可能比较 padding
+的裸 `memcmp`；含 RC 字段的 struct 复制、覆盖和删除必须逐字段遵守所有权。
+
+### A32-2a List 全操作
+
+* `AddRange`：容量按 `count * stride`，支持 self-AddRange 的源快照和重叠搬运。
+* `Insert`：按整元素 stride 右移并 typed-store 新值。
+* `Reverse`：交换完整元素，不重复 retain/release。
+* `IndexOf` / `Contains`：走 typed equality，覆盖 12/32 字节 struct 及自定义 `==`。
+* 删除 `irgen_call.c` 中这五条 `wide_elem_unsupported()` 拒绝路径；保留标量/引用快路径只能
+  是优化，不能成为不同语义。
+
+### A32-2b Dictionary 宽值槽
+
+* 将 `irgen.h::dict_struct_type` 的 values 从隐含单 `i64` 语义改为带 `value_words` 的
+  stride buffer；keys/hash index 仍保持现有插入序布局。
+* 拆掉 `__zan_dict_set(i8*, i8*, i64, i64)` 对值 ABI 的固化：runtime helper 只负责
+  find/ensure-capacity/返回 entry，具体值由调用点通过 typed element primitives 写入。
+* 同步修改 new/initializer/indexer set/get/`Add`/`Remove`/`Clear`/`Values`/扩容/析构；
+  覆盖替换旧值、删除后左移、hash index 失效重建和 RC 递归释放。
+* Dictionary 是编译进最终 module 的内部布局，无需兼容旧二进制；同一提交内完成全部消费者，
+  禁止暂留新旧双布局。
+
+**正式测试**：扩展 `list_wide_struct_elements.zan` 覆盖五个操作；新增
+`dict_wide_struct_values.zan`，用 12/32 字节纯值 struct 和含 string/class 字段 struct 覆盖
+initializer/Add/upsert/indexer/Values/Remove/Clear/扩容。三档测试全部通过，且代码中不再有
+这五个 List 宽元素拒绝分支或 Dictionary 单值槽假设。
+
+## A32-3 · 统一「声明类型实例 + 方法类型参数」特化（XL）
+
+**根因**：`zan_method_spec` 目前只以 `msym + method bind[]` 为 key；
+`get_or_create_method_spec()` 明确拒绝 generic declaring type，body emission 又把
+`g->cur_inst = NULL`。async 则由 `emit_user_methods()` 单独按原方法符号建立 ramp/frame/resume，
+无法复用普通 method spec。
+
+### A32-3a 泛型类的实例泛型方法
+
+1. 把特化 key 扩为 `{method symbol, owner instantiation, method type args}`；mangling 同时编码
+   `Pool<OwnerT>` 与 `M<U>`，重载序号只处理真正签名冲突。
+2. 引入显式 substitution context，同时保存 owner type args 与 method type args；
+   `resolve_type_ctx`、参数/返回类型、字段类型、receiver layout、ARC concretize 都从同一 context
+   解析，停止靠互斥的 `cur_inst`/`cur_mbind` 隐式状态拼接。
+3. 特化 `this` 使用 owner instantiation 的具体布局；内部 self-call、跨模板转发、任意表达式
+   receiver 和递归调用都路由到同一个特化缓存。
+4. 只有调用点确实无法得到具体类型参数时才发源码级诊断，不允许回落到会 abort/产坏 IR 的
+   erased template。
+
+### A32-3b async 泛型方法
+
+1. 从 `emit_user_methods()` 提取可复用的 async-specialization emitter，输入完整 substitution
+   context，输出一组 ramp/frame/resume/cleanup，而不是复制第二套 CPS lowering。
+2. async method spec 记录 ramp、resume、frame type、await/local/handler 布局；所有名字包含
+   owner + method type args，避免不同特化共用错误 frame。
+3. 调用点仍返回统一 task handle；frame result、参数槽、跨 await locals、异常和 cancellation
+   全部使用替换后的具体类型与 ARC 规则。
+4. 支持 static/instance、普通类/泛型类、嵌套泛型调用和 async generic 调 async generic；
+   不以禁用 try/catch、引用类型或 cancellation 换取通过。
+
+**正式测试**：新增 `generic_class_instance_generic_method.zan`、
+`async_generic_method.zan`、`generic_class_async_generic_method.zan`，覆盖值/引用参数、T 成员访问、
+模板转发、两种 owner instantiation、正常完成、跨 await 局部、throw/catch、取消和 RC。
+三档测试全部通过；源码中删除「async generic methods / instance generic methods of a generic type
+cannot be monomorphized」拒绝分支。
+
+## A32-4 · await 同步完成 fast path 与无竞争握手（L）
+
+不能简单在当前 lowering 后读 `sub.done`：ramp 只分配 frame，且先写 awaiter 再调度是当前避免
+丢唤醒的保证。推荐把协议升级为：async ramp 同步执行到首次真实挂起或完成，再由一个原子的
+`link-or-observe-complete` runtime primitive 完成 awaiter 登记。该 primitive 必须保证「看到 done
+直接继续」与「登记 awaiter 后由完成方唤醒」二者恰有一个发生，多 worker 下也不能丢唤醒或
+重复 resume。
+
+**实现/验收**：
+
+* 明确 `DONE` 的发布/获取顺序和 awaiter 写入协议；Windows/Linux/macOS runtime driver 使用
+  同一语义，不靠单线程时序侥幸正确。
+* 同步完成子任务不调用 `zan_co_ready(self)`、不 `ret void` 挂起；真正挂起路径行为不变。
+* 新增无 await 子任务、首步完成、首步挂起、深链、throw-before-first-await、取消、
+  `--async-workers` 竞争压力测试；重复运行不得挂起、重复输出或 use-after-free。
+* IR 断言同步完成案例存在 done 分支且 fast path 不经过 self suspend；记录优化前后 resume/
+  enqueue 次数，作为后续性能回归基线。
+
+## A32-5 · LLVM 原生 EH 迁移并删除补偿层（XL，最高风险，单独里程碑）
+
+这不是把 `setjmp` 名字机械替换成 `landingpad`。Linux/macOS 使用 Itanium unwind 模型；
+Windows x64 需要 funclet/SEH 形态。先在 `_scratch/` 用最小 LLVM probe 证明目标 personality、
+throw carrier、typed catch、cleanup、rethrow 在 win-x64、linux-x64、macos-{x64,arm64} 均能
+生成并链接；任一目标未证明前不改生产 lowering。
+
+### A32-5a 建立目标无关 EH 层
+
+* 新建 compiler 内部 EH abstraction，向 stmt/expr/ARC 只暴露 try region、typed handler、
+  cleanup、throw/rethrow；目标 backend 分别产生 landingpad 或 Windows funclet IR。
+* exception carrier 继续携带对象、type descriptor 和 owned 标志；personality/type match 与
+  现有 typed catch 语义一致，跨模块符号和 runtime ABI 写入 `docs/ABI.md`。
+* 所有可能抛出的调用由 abstraction 决定 call/invoke；普通不抛路径不引入运行时 push/pop。
+
+### A32-5b 同步 EH 与 ARC cleanup
+
+* 先迁移同步 try/catch/finally、throw/rethrow、return/break/continue 穿 finally；
+  将持有型局部释放放进 cleanup path，正常路径与异常路径各释放一次。
+* 同步矩阵稳定后删除同步 `__zan_eh_*` handler stack、`__zan_eh_tmp_push/pop` 和 longjmp 调用，
+  不保留双机制作为永久 fallback。
+
+### A32-5c async EH
+
+* unwind 只发生在一次 live resume invocation 内，绝不跨挂起点；resume 边界捕获未处理异常，
+  存入 frame exception slots，awaiter 在自己的 live invocation 中重新 throw。
+* 迁移跨 await try/catch/finally 后，删除 `emit_async_eh_prologue/unarm`、frame handler stack 和
+  trampoline；随后收缩 frame header，并同步 `docs/ASYNC_CPS_DESIGN.md`。
+* cancellation、child frame cleanup、异常对象所有权与 finally 恰好一次执行必须保留。
+
+**退出标准**：现有 exception/throw/catch/finally/async EH 的 conformance、determinism、
+leakcheck 子集全部通过；生成 IR 不含 `setjmp`/`longjmp`/`__zan_eh_tmp_push`；A8-12 混合栈和
+递归深栈无泄漏；空 try happy path 无 handler push/pop，10 轮中位数相对裸循环开销目标
+不高于 15%。最后才删除旧字段/函数并跑 release 全量测试。
+
+## A32-6 · macOS 实机、签名与公证发布门（M + 外部阻塞）
+
+当前没有本地 Mac、Developer ID 证书或 App Store Connect 凭据。代码侧仍可完成到
+「凭据一到即可启用」，但**不能把未实际签名/公证写成完成**。
+
+1. 在 GitHub Actions 增加跨宿主闭环：Windows/Linux job 用发布版 `zanc` 产出
+   macos-x64/arm64 console、async+atomic、GUI fixtures；artifact 传给 macOS Intel/Apple
+   Silicon runner，执行并比对输出。GUI fixture 创建窗口、跑一次事件循环后自行退出，并检查
+   dylib/rpath 加载；runner 不可用时 job 明确 blocked，不能降级成只看 Mach-O。
+2. 增加发布签名脚本与 gated workflow：先签 nested dylib/framework，再签 executable/app；
+   secrets 缺失时只做 ad-hoc/dry-run 和结构检查，存在时使用 Developer ID、提交 notary service、
+   等待成功、staple，并用 `codesign --verify --strict`、`spctl --assess` 验证。
+3. 凭据只放 CI secret；日志不得输出证书、private key、issuer/key id。发布文档列出 secret 名、
+   轮换/吊销和本地 rcodesign 备用路径。
+4. 最终外部门：取得证书与公证凭据后，对 x64/arm64 GUI 发布包各完成一次签名、公证、staple，
+   并在干净 macOS 环境启动。此前 A32-6 状态保持「自动化完成，发布验收 blocked」。
+
+## 依赖与提交顺序
+
+| 顺序 | 里程碑 | 依赖 | 可并行项 |
+|---|---|---|---|
+| 1 | A32-0 基线 | 无 | macOS workflow 设计 |
+| 2 | A32-1 字段初始化器 | A32-0 | A32-6 无凭据自动化 |
+| 3 | A32-2 集合 stride | A32-1 | A32-6 |
+| 4 | A32-3 泛型统一特化 | A32-2 | 无 |
+| 5 | A32-4 await fast path | A32-3 async emitter 稳定 | A32-6 |
+| 6 | A32-5 LLVM EH | 前述 IR/frame/layout 均冻结 | 无 |
+| 7 | release gate + A32-6 外部验收 | A32-1..5；Mac/凭据 | 无 |
+
+每个里程碑按「probe → 根因修复 → conformance → determinism → leakcheck → diff/status」闭环；
+禁止把多阶段揉成一次提交。A32-5 之前不删除现有 EH 保护网，A32-5 完成后也不允许以兼容名义
+保留两套 EH。

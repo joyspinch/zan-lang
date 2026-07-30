@@ -806,6 +806,18 @@ foreach(_nint_boundary initializer assignment argument return expr_return async_
   set_tests_properties(diag_nint_to_int_${_nint_boundary} PROPERTIES TIMEOUT 60)
 endforeach()
 
+foreach(_field_init_kind static instance generic)
+  add_test(NAME diag_field_initializer_narrowing_${_field_init_kind}
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/field_initializer_narrowing_${_field_init_kind}.zan
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_field_initializer_narrowing_${_field_init_kind}${_exe_ext}
+      "-DEXPECT_REGEX=narrowing conversion from 'nint' to 'int' in field initializer"
+      -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+  set_tests_properties(diag_field_initializer_narrowing_${_field_init_kind}
+    PROPERTIES TIMEOUT 60)
+endforeach()
+
 # ---- Golden compiler regression tests ----
 # Freeze the lexer token stream and parse tree for a set of hermetic (stdlib-free)
 # .zan inputs so any lexer/parser/AST regression is caught in CI on every

@@ -143,6 +143,28 @@ class Style {
         return b.Clone();
     }
 
+    static StyleBox Part(App app, string type, string part, string fallbackType,
+                         string cls, string id, int state) {
+        string key = type + "::" + part + "|" + fallbackType + "|" + cls
+            + "|" + id + "|" + Convert.ToString(state);
+        StyleBox hit = Style.CacheGet(app, key);
+        if (hit != null) { return hit.Clone(); }
+
+        StyleBox b = StyleBox.Create();
+        if (fallbackType != "") {
+            Style.Defaults(app, b, fallbackType, cls, state);
+        }
+        StyleSheet sheet = app.sheet;
+        if (sheet != null) {
+            if (fallbackType != "") {
+                Style.ApplySheet(sheet, b, fallbackType, cls, "", state);
+            }
+            Style.ApplyPartSheet(sheet, b, type, part, cls, id, state);
+        }
+        Style.CachePut(key, b);
+        return b.Clone();
+    }
+
     /// Layers the sheet's matching rules onto `b` in ascending specificity:
     /// type, each class, type.class, id — first for the base look, then once per
     /// active state bit so `:hover` only names what changes.
@@ -171,6 +193,42 @@ class Style {
             if (c != "") {
                 sheet.ApplyBox(b, "." + c + suffix);
                 if (type != "") { sheet.ApplyBox(b, type + "." + c + suffix); }
+            }
+            i = i + 1;
+        }
+        if (id != "") { sheet.ApplyBox(b, "#" + id + suffix); }
+    }
+
+    static void ApplyPartSheet(StyleSheet sheet, StyleBox b, string type,
+                               string part, string cls, string id, int state) {
+        Style.ApplyPartLevel(sheet, b, type, part, cls, id, "");
+        int bit = 1;
+        while (bit <= Style.SChecked()) {
+            if ((state / bit) % 2 == 1) {
+                string st = Style.StateName(bit);
+                if (st != "") {
+                    Style.ApplyPartLevel(sheet, b, type, part, cls, id, st);
+                }
+            }
+            bit = bit * 2;
+        }
+    }
+
+    static void ApplyPartLevel(StyleSheet sheet, StyleBox b, string type,
+                               string part, string cls, string id, string state) {
+        string suffix = "::" + part;
+        if (state != "") { suffix = suffix + ":" + state; }
+        sheet.ApplyBox(b, suffix);
+        if (type != "") { sheet.ApplyBox(b, type + suffix); }
+        List<string> classes = Style.Classes(cls);
+        int i = 0;
+        while (i < classes.Count) {
+            string c = classes[i];
+            if (c != "") {
+                sheet.ApplyBox(b, "." + c + suffix);
+                if (type != "") {
+                    sheet.ApplyBox(b, type + "." + c + suffix);
+                }
             }
             i = i + 1;
         }
@@ -218,28 +276,73 @@ class Style {
     /// interaction, so it is layered before the hover/press fades).
     static StyleBox EasedId(App app, int id, string type, string cls, string name,
                             bool disabled, bool selected) {
-        int selBit = 0;
-        if (selected) { selBit = Style.SSelected(); }
+        int latched = 0;
+        if (selected) { latched = Style.SSelected(); }
+        return Style.EasedStateId(app, id, type, cls, name, disabled, latched);
+    }
+
+    static StyleBox EasedStateId(App app, int id, string type, string cls,
+                                 string name, bool disabled, int latched) {
         if (disabled) {
-            return Style.Full(app, type, cls, name, Style.SDisabled() + selBit);
+            return Style.Full(app, type, cls, name, Style.SDisabled() + latched);
         }
-        StyleBox base0 = Style.Full(app, type, cls, name, selBit);
+        StyleBox base0 = Style.Full(app, type, cls, name, latched);
         int ms = base0.TransitionOr(0 - 1);
         int hv = Ui.HoverLevelMs(app, id, ms);
         int pv = Ui.PressLevelMs(app, id, ms);
         int fv = Ui.FocusLevelMs(app, id, ms);
         StyleBox cur = base0;
         if (hv > 0) {
-            StyleBox hover = Style.Full(app, type, cls, name, selBit + Style.SHover());
+            StyleBox hover = Style.Full(app, type, cls, name, latched + Style.SHover());
             cur = StyleBox.Blend(cur, hover, Style.Curve(base0.easing, hv));
         }
         if (pv > 0) {
             StyleBox act = Style.Full(app, type, cls, name,
-                                      selBit + Style.SHover() + Style.SActive());
+                                      latched + Style.SHover() + Style.SActive());
             cur = StyleBox.Blend(cur, act, Style.Curve(base0.easing, pv));
         }
         if (fv > 0) {
-            StyleBox foc = Style.Full(app, type, cls, name, selBit + Style.SFocus());
+            StyleBox foc = Style.Full(app, type, cls, name, latched + Style.SFocus());
+            cur = StyleBox.Blend(cur, foc, Style.Curve(base0.easing, fv));
+        }
+        return cur;
+    }
+
+    static StyleBox EasedPartId(App app, int id, string type, string part,
+                                string fallbackType, string cls, string name,
+                                bool disabled, bool selected) {
+        int latched = 0;
+        if (selected) { latched = Style.SSelected(); }
+        return Style.EasedPartStateId(app, id, type, part, fallbackType, cls,
+                                      name, disabled, latched);
+    }
+
+    static StyleBox EasedPartStateId(App app, int id, string type, string part,
+                                     string fallbackType, string cls, string name,
+                                     bool disabled, int latched) {
+        if (disabled) {
+            return Style.Part(app, type, part, fallbackType, cls, name,
+                              Style.SDisabled() + latched);
+        }
+        StyleBox base0 = Style.Part(app, type, part, fallbackType, cls, name, latched);
+        int ms = base0.TransitionOr(0 - 1);
+        int hv = Ui.HoverLevelMs(app, id, ms);
+        int pv = Ui.PressLevelMs(app, id, ms);
+        int fv = Ui.FocusLevelMs(app, id, ms);
+        StyleBox cur = base0;
+        if (hv > 0) {
+            StyleBox hover = Style.Part(app, type, part, fallbackType, cls, name,
+                                        latched + Style.SHover());
+            cur = StyleBox.Blend(cur, hover, Style.Curve(base0.easing, hv));
+        }
+        if (pv > 0) {
+            StyleBox act = Style.Part(app, type, part, fallbackType, cls, name,
+                                      latched + Style.SHover() + Style.SActive());
+            cur = StyleBox.Blend(cur, act, Style.Curve(base0.easing, pv));
+        }
+        if (fv > 0) {
+            StyleBox foc = Style.Part(app, type, part, fallbackType, cls, name,
+                                      latched + Style.SFocus());
             cur = StyleBox.Blend(cur, foc, Style.Curve(base0.easing, fv));
         }
         return cur;
@@ -337,6 +440,11 @@ class Style {
             }
         } else if (type == "option" || type == "item" || type == "row") {
             Style.ItemDefaults(app, b, cls, hover, active, selected, disabled);
+        } else if (type == "checkbox" || type == "radio" || type == "switch"
+                   || type == "slider" || type == "progress") {
+            b.bg = 0;
+            b.borderW = 0;
+            b.shadow = 0;
         } else if (type == "label" || type == "text") {
             b.bg = 0;
             b.fg = t.textPrimary;
@@ -347,7 +455,9 @@ class Style {
         if (disabled) { b.fg = t.textDisabled; }
         // Skin shells that apply to every control: neo-brutalism casts a hard
         // offset shadow and presses into it; glass skins frost their surfaces.
-        if (t.brutal == 1 && type != "label" && type != "text") {
+        bool internalParts = type == "checkbox" || type == "radio" || type == "switch"
+            || type == "slider" || type == "progress";
+        if (t.brutal == 1 && type != "label" && type != "text" && !internalParts) {
             b.shadow = t.shadowColor;
             b.shadowDx = 4;
             b.shadowDy = 4;
