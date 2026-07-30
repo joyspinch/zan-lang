@@ -2,16 +2,54 @@
 // SDL-based (games always run on the SDL backend). No dependency on the ZGM UI
 // stack; the bitmap font is embedded here so each game is standalone.
 using System;
+using System.Diagnostics;
 using System.IO;
 using System.Security;
 using SDL3;
 
 namespace GameKit;
 
-// Resolves repo-relative asset paths regardless of the working directory the
-// game was launched from (repo root, build/, or a double-click on the exe).
+// Resolves repo-relative asset paths against the RUNNING EXECUTABLE rather than
+// the working directory, which the launcher (IDE Run, a shortcut, a shell in
+// another directory) picks arbitrarily -- getting it wrong loaded no texture at
+// all and the game opened as a black window. Both layouts keep the assets
+// repo-relative, so anchoring at the exe directory and walking up its parents
+// finds them from build/game.exe as well as from a packaged dist/game.exe.
+// The working directory is still tried last, for `zanc run` style launches
+// where the exe lives in a temp directory.
 class Assets {
+    static string exeDir;
+    static bool exeDirReady;
+
+    static string ExeDir() {
+        if (Assets.exeDirReady) { return Assets.exeDir; }
+        Assets.exeDirReady = true;
+        Assets.exeDir = Assets.Parent(ProcessHost.SelfExe());
+        return Assets.exeDir;
+    }
+
+    // Directory part of a path, "" when it has none.
+    static string Parent(string path) {
+        int cut = -1;
+        int i = 0;
+        while (i < path.Length) {
+            string c = path.Substring(i, 1);
+            if (c == "/" || c == "\\") { cut = i; }
+            i = i + 1;
+        }
+        if (cut <= 0) { return ""; }
+        return path.Substring(0, cut);
+    }
+
     static string Find(string rel) {
+        string dir = Assets.ExeDir();
+        int up = 0;
+        while (dir != "" && up < 4) {
+            string p = dir + "/" + rel;
+            if (File.Exists(p)) { return p; }
+            dir = Assets.Parent(dir);
+            up = up + 1;
+        }
         if (File.Exists(rel)) { return rel; }
         if (File.Exists("../" + rel)) { return "../" + rel; }
         if (File.Exists("../../" + rel)) { return "../../" + rel; }

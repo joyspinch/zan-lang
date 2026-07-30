@@ -1633,6 +1633,18 @@ header-only 库 / C 回调 / 结构体字段偏移，全部对应 A2 / A3 / A4�
     `scripts\build_gui_driver.ps1` 把 `stdlib/Gui/drivers/win-x64/` 一起更新；
     只有 win-x64 能在本机重生成，linux/macOS 的驱动仍是 `c168ffc` 的存货，
     同样的 A2-0b 位宽问题还在，等对应平台上重编。
+  - 〔同一个坑，SDL3 侧，2026-07-30 修〕`stdlib/SDL3/drivers/win-x64/zan_sdl3.dll`
+    也是 A2-0b（`e577ce2` 改了 `zan_sdl3.c` 的参数宽度）之前的存货，于是
+    **所有贴图绘制静默失效**：`SDL_RenderTexture` 拿到的宽度带寄存器残留，
+    旧 DLL 还把它当打包的 `width | angle<<32` 解，画出去的四边形落在屏幕外，
+    但返回成功、`SDL_GetError()` 为空；`Clear`/`FillRect` 不带贴图所以看着正常。
+    GameKit 每帧都是「画进 3x 超采样 render target → blit 回窗口」，blit 一失效
+    **examples/game 全部只剩黑窗口**（斗地主/五子棋/象棋/贪吃蛇…）。
+    `scripts\stage_sdl3.ps1` 重编驱动后全部恢复。linux/macOS/win-arm64 的
+    `zan_sdl3` 驱动同样是存货，等对应平台上重编。
+    **遗留**：`SdlRenderer.DrawTextureRotated` 把角度打包进宽度的高 32 位，
+    A2-0b 之后宽度就是 i32，角度必然丢成 0（当前 examples/stdlib 无人调用）。
+    要修得给 `zan_sdl3.c` 加一个独立 `angle` 参数的导出，届时六个平台的驱动都要重编。
 * **B5-2 🟡 大部分完成**（`067ec4e` 删掉 C Win32 shell 与 link-only shims）。
   〔2026-07-29 核实〕`gui_runtime_shims.c` 从 160 行降到 3.5KB，里面**只剩
   macOS 非-Cocoa（SDL windowing）构建的 22 个 WebView no-op 桩**（`#if defined(__APPLE__)

@@ -627,7 +627,18 @@ partial class ZanIDE {
     /// folder don't clash (e.g. two Main methods).
     static string SmartInputs(string root, string dir, string entry) {
         bool proj = File.Exists(root + "/zan.proj") || File.Exists(dir + "/zan.proj");
-        if (!proj) { return "\"" + entry + "\""; }
+        // Every file already on the command line, so the namespace resolution
+        // below cannot add one a second time: passing a file twice makes the
+        // compiler see every type in it twice (`duplicate type declaration`).
+        List<string> have = new List<string>();
+        have.Add(entry);
+        if (!proj) {
+            // A loose file still needs the modules it imports: the examples put
+            // their shared library in a sibling folder (examples/game/common,
+            // `namespace GameKit`) and every game does `using GameKit;`, so
+            // compiling main.zan alone fails on every type it defines.
+            return ZanIDE.WithUsedModules("\"" + entry + "\"", dir, entry, have);
+        }
         // Feed the project's other files in for cross-file types, but skip any
         // that declare their own Main: when the focused tab is a runnable
         // snippet, compiling it together with the project entry's Main would
@@ -640,10 +651,130 @@ partial class ZanIDE {
             string f = all[i];
             if (f != entry && !ZanIDE.FileHasMain(f)) {
                 args = args + " \"" + f + "\"";
+                have.Add(f);
             }
             i = i + 1;
         }
+        return ZanIDE.WithUsedModules(args, dir, entry, have);
+    }
+
+    /// Appends the source files that provide the namespaces `entry` imports but
+    /// that do not live beside it. Namespaces are looked for by walking up from
+    /// the entry's folder and scanning each ancestor's direct files and its
+    /// immediate sub-folders (bounded, so this stays cheap on a big tree); a
+    /// file matches when it declares `namespace <Name>;`. Resolution is
+    /// transitive, so a shared module may import another one. `have` lists the
+    /// files already on the command line and is extended in place; a whole-
+    /// project build passes all of them, so a namespace served from inside the
+    /// project (`src/framework/Cache.zan` for `using ZanWeb;`) is not appended
+    /// again.
+    static string WithUsedModules(string args, string dir, string entry,
+                                  List<string> have) {
+        List<string> want = new List<string>();
+        ZanIDE.CollectUsings(entry, want);
+        if (want.Count == 0) { return args; }
+        int guard = 0;
+        while (want.Count > 0 && guard < 32) {
+            guard = guard + 1;
+            string ns = want[0];
+            want.RemoveAt(0);
+            string found = ZanIDE.FindNamespaceFile(dir, ns, entry, have);
+            if (found == "") { continue; }
+            have.Add(found);
+            args = args + " \"" + found + "\"";
+            ZanIDE.CollectUsings(found, want);
+        }
         return args;
+    }
+
+    /// Namespace names of the `using X;` lines at the top of `path`.
+    static void CollectUsings(string path, List<string> outp) {
+        if (!File.Exists(path)) { return; }
+        List<string> lines = ZanIDE.SplitLinesOf(File.ReadAllText(path));
+        int i = 0;
+        while (i < lines.Count) {
+            string ln = lines[i].Trim();
+            if (ZanIDE.StartsWith(ln, "using ") && ZanIDE.EndsWithStr(ln, ";")) {
+                string ns = ln.Substring(6, ln.Length - 7).Trim();
+                if (ns != "" && !outp.Contains(ns)) { outp.Add(ns); }
+            }
+            i = i + 1;
+        }
+    }
+
+    /// First file declaring `namespace ns;` near `dir`, or "".
+    static string FindNamespaceFile(string dir, string ns, string entry,
+                                    List<string> skip) {
+        string at = dir;
+        int up = 0;
+        while (up < 4) {
+            List<string> cand = new List<string>();
+            ZanIDE.ListZanFilesIn(at, cand);
+            List<string> subs = Directory.GetDirectories(at);
+            int s = 0;
+            while (s < subs.Count) {
+                string sn = subs[s];
+                if (sn.Substring(0, 1) != "." && sn != "build" && sn != "dist"
+                    && sn != "bin" && sn != "obj" && sn != "publish") {
+                    ZanIDE.ListZanFilesIn(at + "/" + sn, cand);
+                }
+                s = s + 1;
+            }
+            int i = 0;
+            while (i < cand.Count) {
+                string f = cand[i];
+                if (f != entry && !skip.Contains(f)
+                    && ZanIDE.DeclaresNamespace(f, ns)
+                    && !ZanIDE.FileHasMain(f)) {
+                    return f;
+                }
+                i = i + 1;
+            }
+            string parent = ZanIDE.DirOf(at);
+            if (parent == at || parent == ".") { return ""; }
+            at = parent;
+            up = up + 1;
+        }
+        return "";
+    }
+
+    /// Full paths of the .zan files directly inside `dir` (no recursion).
+    static void ListZanFilesIn(string dir, List<string> outp) {
+        if (!Directory.Exists(dir)) { return; }
+        List<string> files = Directory.GetFiles(dir);
+        int i = 0;
+        while (i < files.Count) {
+            string nm = files[i];
+            if (ZanIDE.IsZanFile(nm) && nm.Substring(0, 1) != ".") {
+                outp.Add(dir + "/" + nm);
+            }
+            i = i + 1;
+        }
+    }
+
+    /// True when `path` declares `namespace ns;`.
+    static bool DeclaresNamespace(string path, string ns) {
+        if (!File.Exists(path)) { return false; }
+        return ZanIDE.IndexOfStr(File.ReadAllText(path), "namespace " + ns + ";") >= 0;
+    }
+
+    static bool EndsWithStr(string s, string suffix) {
+        if (s.Length < suffix.Length) { return false; }
+        return s.Substring(s.Length - suffix.Length, suffix.Length) == suffix;
+    }
+
+    static List<string> SplitLinesOf(string text) {
+        List<string> outp = new List<string>();
+        string cur = "";
+        int i = 0;
+        while (i < text.Length) {
+            string ch = text.Substring(i, 1);
+            if (ch == "\n") { outp.Add(cur); cur = ""; }
+            else if (ch != "\r") { cur = cur + ch; }
+            i = i + 1;
+        }
+        if (cur != "") { outp.Add(cur); }
+        return outp;
     }
 
     /// True when the file declares a `static ... Main(` entry point.
@@ -876,6 +1007,16 @@ partial class ZanIDE {
     /// freezes the UI -- same pattern as the publish pipeline.
     static string BuildLogPath() { return ZanIDE.UserConfigDir() + "/build.log"; }
     static string BuildDonePath() { return ZanIDE.UserConfigDir() + "/build_done.txt"; }
+
+    /// Working directory for a launched program. Relative paths in a program
+    /// (`config/app.json`, an example's `assets/` folder) are resolved against
+    /// it, so it has to be the project root the sources sit in -- inheriting the
+    /// IDE's own directory instead means the program finds none of its data and
+    /// e.g. a game opens as a black window with no textures.
+    static string RunCwd(string root, string exe) {
+        if (root != "" && Directory.Exists(root)) { return root; }
+        return ZanIDE.DirOf(exe);
+    }
 
     /// Starts a DETACHED Run build of `target` and returns the executable it
     /// will produce, so every caller (Run ribbon, hot reload, the Tools panel)
