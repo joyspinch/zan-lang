@@ -3,80 +3,154 @@ using Gui;
 
 namespace Gui.Widget;
 
-/// Dropdown: a trigger button that opens a menu of action items.
-///
-/// C#-style retained instance — owns its open state and defers the action list
-/// to the framework overlay layer, so the popup always draws above later
-/// content, dims/blocks everything beneath it (no parent/child click-through)
-/// and closes on an outside press or Esc — all through one centralized
-/// dispatch:
-///     Dropdown menu = Dropdown.Create("Actions", items);
-///     menu.Change += () => { int a = menu.Chosen(); ... };
-///     menu.Render(app, x, y, w, h);
-/// Legacy immediate-mode statics (RenderTrigger + RenderMenu) are kept for
-/// callers that drive the open state themselves.
-class Dropdown : Control {
-    List<string> items;
-    string label;
-    int wid;
-    int optBaseId;
-    SignalBool open;
-    SignalInt chosen;
-    SignalInt popupScroll;
-    /// Fires when an action is chosen (C#-style: `menu.Change += h;`).
-    UiEvent Change;
+/// The trigger-button chrome shared by every widget that hangs a panel under
+/// a button (Dropdown, Popover, property editors).
+class DropdownChrome {
+    /// Draws the trigger button with the given id and registers its hit box.
+    static void PaintTrigger(App app, int id, int x, int y, int w, int h,
+                             string label, bool open) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
 
-    void InitDropdown(List<string> its, string lbl) {
-        this.InitControl("dropdown", 1);
-        items = its;
-        label = lbl;
+        int hv = Ui.HoverLevel(app, id);
+        if (open) { hv = 1000; }
+        int border = App.LerpColor(t.borderPrimary, t.borderHover, hv);
+
+        c.SurfaceRoundRect(x, y, w, h, t.borderRadiusMedium, t.bgPrimary,
+                           border, 1);
+        int textY = y + (h - Canvas.FontHeight(t.fontSizeMedium)) / 2;
+        c.DrawText(x + t.paddingMedium, textY, label, t.textPrimary,
+                   t.fontSizeMedium);
+        c.DrawGlyphIn("chevron-down",
+                      x + w - t.paddingLarge - t.iconSizeSmall, y,
+                      t.iconSizeSmall, h, t.iconSizeSmall, t.textSecondary);
+
+        app.hitTester.Register(HitRegion.Create(id, x, y, w, h, 0));
+    }
+}
+
+/// <summary>
+/// Dropdown&lt;T&gt;: a trigger that drops a list of T.
+///
+/// Same shape as ListView&lt;T&gt; — items are plain entities, the widget owns
+/// everything else (open state, placement, scrolling, hit testing, selection):
+///
+///     Dropdown&lt;City&gt; pick = new Dropdown&lt;City&gt;(c =&gt; c.name);
+///     pick.Bind(cities);
+///     pick.OnChange(OnCity);
+///     parent.Add(pick);            // size and position come from the layout
+///
+/// Items can be whole components instead of text, exactly like list rows:
+///
+///     Dropdown&lt;User&gt; who = new Dropdown&lt;User&gt;(u =&gt; UserCard(u));
+///
+/// The panel is deferred to the framework overlay layer, so it always draws
+/// above later content, blocks click-through and closes on an outside press
+/// or Escape.
+/// </summary>
+class Dropdown<T> : Control {
+    /// The panel content: a list owns the rows, templates and scrolling.
+    ListView<T> list;
+    CellOf<T> textOf;
+    string hint;
+    bool open;
+    int wid;
+    /// Trigger geometry stashed each frame so the deferred panel (drawn in the
+    /// overlay pass) can place itself under the trigger.
+    int trigX;
+    int trigY;
+    int trigW;
+    int trigH;
+    int lastSel;
+    int maxVisible;
+
+    /// Fires when a different item is picked.
+    UiEvent Change;
+    UiEvent Opened;
+    UiEvent Closed;
+
+    void InitDropdown(ListView<T> content) {
+        this.InitControl("dropdown", 0);
         wid = WidgetId.Next();
         wiresOwnEvents = true;
-        optBaseId = WidgetId.Block(its.Count);
-        open = SignalBool.Create(false);
-        chosen = SignalInt.Create(-1);
-        popupScroll = SignalInt.Create(0);
+        hint = "";
+        open = false;
+        maxVisible = 8;
+        lastSel = 0 - 1;
         Change = UiEvent.Create();
+        Opened = UiEvent.Create();
+        Closed = UiEvent.Create();
+        list = content;
+        list.Class = "flat headless";
     }
 
-    /// Retained-mode constructor: `Dropdown d = Dropdown.Create("Actions", items);`
-    Dropdown(List<string> its, string lbl) {
-        InitDropdown(its, lbl);
+    /// Text items: `new Dropdown<City>(c => c.name)`.
+    Dropdown(CellOf<T> text) {
+        textOf = text;
+        this.InitDropdown(new ListView<T>(new ListColumn<T>("", text)));
     }
 
-    static Dropdown Create(string label, List<string> items) {
-        return new Dropdown(items, label);
+    /// Component items: `new Dropdown<User>(u => UserCard(u))`.
+    Dropdown(RowOf<T> item) {
+        this.InitDropdown(new ListView<T>(item));
     }
 
-    /// Index of the last chosen action, or -1.
-    int Chosen() { return chosen.Get(); }
-    bool IsOpen() { return open.Get(); }
-    void Open() { open.Set(true); popupScroll.Set(0); }
+    override string Kind() { return "Dropdown"; }
 
-    int Render(App app, int x, int y, int w, int h) {
-        int id = wid;
-        Dropdown.PaintTrigger(app, id, x, y, w, h, label, open.Get());
-        app.focus.RegisterFocusable(id);
+    override string StyleType() { return "select"; }
 
-        bool toggle = Ui.Clicked(app, id);
-        if (Ui.Focused(app, id) && app.EventKind() == 4) {
-            int kc = app.window.EventKeyCode();
-            if (kc == 13 || kc == 32) { toggle = true; }
-        }
-        if (toggle) {
-            if (!open.Get()) { popupScroll.Set(0); }
-            open.Set(!open.Get());
-            app.RequestRedraw();
-        }
+    /// Binds the data source; the list re-reads it every frame.
+    Dropdown<T> Bind(List<T> src) {
+        list.Bind(src);
+        lastSel = list.SelectedIndex();
+        return this;
+    }
 
-        // Defer the action list to the framework overlay layer.
-        if (open.Get()) {
-            int py = y + h + app.Scale(4);
-            app.AddOverlay(OverlayPopup.Menu(x, py, w, items,
-                optBaseId, chosen, id, open, popupScroll, Change));
+    Dropdown<T> OnChange(Action a) { Change.Add(a); return this; }
+    Dropdown<T> OnOpen(Action a) { Opened.Add(a); return this; }
+    Dropdown<T> OnClose(Action a) { Closed.Add(a); return this; }
+
+    /// Text shown while nothing is picked.
+    Dropdown<T> Hint(string text) { hint = text; return this; }
+
+    /// How many items the panel shows before it scrolls.
+    Dropdown<T> Rows(int n) {
+        if (n > 0) { maxVisible = n; }
+        return this;
+    }
+
+    int Count() { return list.Count(); }
+    int SelectedIndex() { return list.SelectedIndex(); }
+    bool HasSelection() { return list.HasSelection(); }
+    T Selected() { return list.Selected(); }
+
+    void SelectIndex(int row) {
+        list.SelectIndex(row);
+        lastSel = list.SelectedIndex();
+    }
+
+    void Clear() {
+        list.ClearSelection();
+        lastSel = 0 - 1;
+    }
+
+    bool IsOpen() { return open; }
+
+    void SetOpen(bool want) {
+        if (open == want) { return; }
+        open = want;
+        if (open) { Opened.Post(); } else { Closed.Post(); }
+    }
+
+    void Open() { this.SetOpen(true); }
+    void Close() { this.SetOpen(false); }
+
+    /// The trigger label: the picked item's text, else the hint.
+    string TriggerText() {
+        if (list.HasSelection() && textOf != null) {
+            return textOf(list.Selected());
         }
-        On.Fire(app, id);
-        return id;
+        return hint;
     }
 
     override void OnMeasure(App app) {
@@ -85,64 +159,83 @@ class Dropdown : Control {
     }
 
     override void OnPaint(App app) {
-        this.Render(app, bx, by, bw, bh);
-    }
+        trigX = bx;
+        trigY = by;
+        trigW = bw;
+        trigH = bh;
+        DropdownChrome.PaintTrigger(app, wid, bx, by, bw, bh,
+                                    this.TriggerText(), open);
+        app.focus.RegisterFocusable(wid);
 
-    /// Draws the trigger button chrome with the given id.
-    static void PaintTrigger(App app, int id, int x, int y, int w, int h, string label, bool open) {
-        Canvas c = app.canvas;
-        Theme t = app.theme;
-
-        int hv = Ui.HoverLevel(app, id);
-        if (open) { hv = 1000; }
-        int border = App.LerpColor(t.borderPrimary, t.borderHover, hv);
-
-        c.SurfaceRoundRect(x, y, w, h, t.borderRadiusMedium, t.bgPrimary, border, 1);
-        int textY = y + (h - Canvas.FontHeight(t.fontSizeMedium)) / 2;
-        c.DrawText(x + t.paddingMedium, textY, label, t.textPrimary, t.fontSizeMedium);
-        c.DrawGlyphIn("chevron-down", x + w - t.paddingLarge - t.iconSizeSmall, y, t.iconSizeSmall, h, t.iconSizeSmall, t.textSecondary);
-
-        app.hitTester.Register(HitRegion.Create(id, x, y, w, h, 0));
-    }
-
-    /// Legacy immediate-mode trigger. Returns its hit id.
-    static int RenderTrigger(App app, int x, int y, int w, int h, string label, bool open) {
-        int id = app.focus.AllocId();
-        Dropdown.PaintTrigger(app, id, x, y, w, h, label, open);
-        return id;
-    }
-
-    /// Legacy immediate-mode menu (caller owns open state). Draws the open menu
-    /// of items and returns the first item's hit id.
-    static int RenderMenu(App app, int x, int y, int w, List<string> items) {
-        int firstId = app.focus.AllocId();
-        int count = items.Count;
-        int i = 1;
-        while (i < count) {
-            app.focus.AllocId();
-            i = i + 1;
+        bool toggle = Ui.Clicked(app, wid);
+        if (Ui.Focused(app, wid) && app.EventKind() == 4) {
+            int kc = app.window.EventKeyCode();
+            if (kc == 13 || kc == 32) { toggle = true; }
         }
-
-        Canvas c = app.canvas;
-        Theme t = app.theme;
-        int optH = t.heightMedium;
-        int totalH = count * optH + t.paddingTiny * 2;
-
-        c.FillRoundRect(x + 1, y + 2, w, totalH, t.borderRadiusMedium, t.shadowColor);
-        c.SurfaceRoundRect(x, y, w, totalH, t.borderRadiusMedium, t.bgPrimary, t.borderPrimary, 1);
-        app.BlockHitsRect(x, y, w, totalH);
-
-        i = 0;
-        while (i < count) {
-            int optId = firstId + i;
-            int optY = y + t.paddingTiny + i * optH;
-            int ohv = Ui.HoverLevel(app, optId);
-            if (ohv > 0) { c.FillRect(x + 1, optY, w - 2, optH, App.ScaleAlpha(t.bgHover, ohv)); }
-            c.DrawText(x + t.paddingMedium, optY + (optH - Canvas.FontHeight(t.fontSizeMedium)) / 2,
-                       items[i], t.textPrimary, t.fontSizeMedium);
-            app.hitTester.Register(HitRegion.Create(optId, x, optY, w, optH, 0));
-            i = i + 1;
+        if (toggle) {
+            bool want = !open;
+            this.SetOpen(want);
+            // Claim the opening click so the just-shown panel does not read it
+            // as an outside press and close again the same frame.
+            if (want) { app.ClaimClick(); }
+            app.RequestRedraw();
         }
-        return firstId;
+        On.Fire(app, wid);
+
+        if (open) { app.AddOverlay(OverlayPopup.Host(this)); }
+    }
+
+    /// The deferred panel: drawn and dispatched after all content, so it sits
+    /// above every widget and takes the top-most hits.
+    override void OnPaintOverlay(App app) {
+        if (!open) { return; }
+        Theme t = app.theme;
+        int rowH = t.heightMedium;
+        int vis = list.Count();
+        if (vis > maxVisible) { vis = maxVisible; }
+        if (vis < 1) { vis = 1; }
+        int viewH = OverlayPopup.FitH(app, vis * rowH + app.Scale(2));
+        int popX = OverlayPopup.FitX(app, trigX, trigW);
+        int popY = OverlayPopup.FitY(app, trigY + trigH + app.Scale(4),
+                                     trigH, viewH);
+
+        app.BlockHitsBelow();
+        StyleBox pop = this.ResolvePartAs(app, "select", "popup", "popup",
+                                          Class, Style.SSelected());
+        pop.Paint(app, popX, popY, trigW, viewH);
+        app.BlockHitsRect(popX, popY, trigW, viewH);
+
+        list.RenderInside(app, Rect.Create(popX, popY, trigW, viewH));
+
+        // The list owns picking; a changed selection closes the panel and is
+        // reported as one Change.
+        if (list.SelectedIndex() != lastSel) {
+            lastSel = list.SelectedIndex();
+            this.SetOpen(false);
+            Change.Post();
+            app.ClaimClick();
+            app.RequestRedraw();
+            return;
+        }
+        if (app.ClickAvailable()) {
+            bool inside = app.mouseX >= popX && app.mouseX < popX + trigW
+                && app.mouseY >= popY && app.mouseY < popY + viewH;
+            if (!inside) {
+                this.SetOpen(false);
+                app.RequestRedraw();
+            }
+        }
+        if (app.EventKind() == 4 && app.window.EventKeyCode() == 27) {
+            this.SetOpen(false);
+            app.RequestRedraw();
+        }
+    }
+
+    override List<string> Events() {
+        List<string> e = Control.CommonEvents();
+        e.Add("Change");
+        e.Add("Opened");
+        e.Add("Closed");
+        return e;
     }
 }
