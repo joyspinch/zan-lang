@@ -89,6 +89,13 @@ try {
     # The IDE's own stylesheet (page layout) ships next to the executable.
     Copy-Item -LiteralPath (Join-Path (Get-Location) "src\ide_zan\ide.css") `
         -Destination (Join-Path (Get-Location) "build\ide.css") -Force
+    # Skin packs (skin.css + artwork) are runtime resources: ship them beside
+    # the executable like ide.css so the title-bar skin picker finds them no
+    # matter what working directory the IDE is launched from.
+    $skinsDst = Join-Path (Get-Location) "build\skins"
+    New-Item -ItemType Directory -Force -Path $skinsDst | Out-Null
+    Copy-Item -Path (Join-Path (Get-Location) "stdlib\Gui\skins\*") `
+        -Destination $skinsDst -Recurse -Force
 } catch {
     Write-Output $_
     $failed = $true
