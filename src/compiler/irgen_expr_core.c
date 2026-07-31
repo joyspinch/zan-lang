@@ -477,6 +477,28 @@ static bool types_concrete_equal(zan_type_t *a, zan_type_t *b) {
     return true;
 }
 
+/* Structural equality that reads a type parameter as a wildcard, so a
+ * declared `Col<T>` matches an argument of `Col<Item>`. Overloads that differ
+ * only inside their type arguments -- `Bag(Col<T>)` against
+ * `Bag(List<Col<T>>)` -- are indistinguishable otherwise, because every
+ * T-mentioning parameter is skipped and declaration order decides. */
+static bool types_match_modulo_tp(zan_type_t *a, zan_type_t *b) {
+    if (!a || !b) return false;
+    if (a->kind == TYPE_TYPE_PARAM || b->kind == TYPE_TYPE_PARAM) return true;
+    if (a->kind != b->kind) return false;
+    if ((a->kind == TYPE_CLASS || a->kind == TYPE_STRUCT ||
+         a->kind == TYPE_INTERFACE || a->kind == TYPE_ENUM) &&
+        a->sym != b->sym)
+        return false;
+    if (a->kind == TYPE_ARRAY || a->kind == TYPE_NULLABLE)
+        return types_match_modulo_tp(a->element_type, b->element_type);
+    if (a->type_arg_count != b->type_arg_count) return false;
+    for (int i = 0; i < a->type_arg_count; i++)
+        if (!types_match_modulo_tp(a->type_args[i], b->type_args[i]))
+            return false;
+    return true;
+}
+
 /* Coarse type family used to rank overload candidates: 0 = unknown (never
  * ranked against), then bool / integral / floating / string / reference. */
 enum { FAM_UNKNOWN = 0, FAM_BOOL, FAM_INT, FAM_FLOAT, FAM_STRING, FAM_REF };
@@ -514,6 +536,52 @@ static zan_type_t *lambda_body_type(zan_irgen_t *g, zan_ast_node_t *lam,
     zan_type_t *bt = infer_expr_type(g, body, locals);
     locals->count = mark;
     return bt;
+}
+
+/* A static method named but not called -- `RecentRow.Of` -- is a method group:
+ * like a lambda it converts to a delegate parameter and to nothing else, and it
+ * has no type of its own to rank by. Returns the referenced method (preferring
+ * the overload of `arity` parameters, -1 = any), NULL when the expression is
+ * not a static method reference. */
+static zan_symbol_t *arg_method_group(zan_irgen_t *g, zan_ast_node_t *a,
+                                      local_scope_t *locals, int arity) {
+    if (!a || a->kind != AST_MEMBER_ACCESS) return NULL;
+    zan_ast_node_t *obj = a->member.object;
+    if (!obj || obj->kind != AST_IDENTIFIER) return NULL;
+    if (locals && local_find(locals, obj->ident.name)) return NULL;
+    zan_symbol_t *cs = zan_binder_lookup(g->binder, obj->ident.name);
+    if (!cs || (cs->kind != SYM_CLASS && cs->kind != SYM_STRUCT)) return NULL;
+    if (get_field_sym(cs, a->member.name)) return NULL;
+    zan_symbol_t *m = arity >= 0 ? resolve_overload(cs, a->member.name, arity)
+                                 : NULL;
+    if (!m) m = get_method_sym(cs, a->member.name);
+    if (!m || !m->decl || m->decl->kind != AST_METHOD_DECL) return NULL;
+    return m;
+}
+
+/* Ranks a method-group argument against a candidate's parameter type the way
+ * the lambda branch ranks a lambda: -1 when the parameter is not a delegate of
+ * the method's shape, otherwise 2 plus 2 for a matching return type. */
+static int method_group_score(zan_irgen_t *g, zan_symbol_t *mg, zan_type_t *pt) {
+    if (!pt || pt->kind != TYPE_DELEGATE) return -1;
+    if (mg->decl->method_decl.params.count != pt->delegate_param_count) return -1;
+    int score = 2;
+    zan_type_t *rt = mg->decl->method_decl.return_type
+        ? zan_binder_resolve_type(g->binder, mg->decl->method_decl.return_type)
+        : NULL;
+    zan_type_t *dr = pt->delegate_ret_type;
+    if (rt && dr && !type_mentions_tp(rt) && !type_mentions_tp(dr)) {
+        /* An exact return type settles two delegate overloads of the same
+         * arity; a different family (a control where text is wanted) rules the
+         * candidate out. A merely derived return type stays acceptable, so two
+         * reference returns are never ranked against each other. */
+        if (types_concrete_equal(rt, dr)) score += 2;
+        else if (type_family(rt) != type_family(dr) &&
+                 type_family(rt) != FAM_UNKNOWN &&
+                 type_family(dr) != FAM_UNKNOWN)
+            return -1;
+    }
+    return score;
 }
 
 static struct zan_ctor_entry *find_ctor(zan_irgen_t *g, zan_symbol_t *type_sym,
@@ -557,7 +625,31 @@ static struct zan_ctor_entry *find_ctor(zan_irgen_t *g, zan_symbol_t *type_sym,
                         score += 2;
                     continue;
                 }
+                /* A method group is the same kind of argument as a lambda:
+                 * it only converts to a delegate, so a non-delegate parameter
+                 * rules the candidate out instead of scoring zero and letting
+                 * declaration order pick it. Binding `new ListView<T>(Row.Of)`
+                 * to the List<ListColumn<T>> overload stored a function
+                 * pointer in an ARC field and crashed on the retain. */
+                zan_symbol_t *mg = arg_method_group(
+                    g, args->items[j], locals,
+                    (pt && pt->kind == TYPE_DELEGATE)
+                        ? pt->delegate_param_count : -1);
+                if (mg) {
+                    int ms = method_group_score(g, mg, pt);
+                    if (ms < 0) { compatible = false; break; }
+                    score += ms;
+                    continue;
+                }
                 zan_type_t *at = infer_expr_type(g, args->items[j], locals);
+                if (pt && at && type_mentions_tp(pt) && !type_mentions_tp(at)) {
+                    /* The parameter is phrased in the class's own type
+                     * parameters; rank it by shape rather than skipping it,
+                     * but never disqualify on it -- unifying the argument
+                     * against the declaration is the binder's job. */
+                    if (types_match_modulo_tp(pt, at)) score += 3;
+                    continue;
+                }
                 if (!pt || !at || type_mentions_tp(pt) || type_mentions_tp(at))
                     continue;
                 if (types_concrete_equal(pt, at)) {
@@ -662,6 +754,16 @@ static int method_args_score(zan_irgen_t *g, zan_symbol_t *m,
                 if (bf == df) score += 2;
                 else return -1;
             }
+            continue;
+        }
+        zan_type_t *dp0 = method_param_type_at(g, m, j, call, recv_expr, locals);
+        zan_symbol_t *mg = arg_method_group(
+            g, a, locals,
+            (dp0 && dp0->kind == TYPE_DELEGATE) ? dp0->delegate_param_count : -1);
+        if (mg) {
+            int ms = method_group_score(g, mg, dp0);
+            if (ms < 0) return -1;
+            score += ms;
             continue;
         }
         zan_type_t *pt = zan_binder_resolve_type(g->binder, ps->items[j]->param.type);
