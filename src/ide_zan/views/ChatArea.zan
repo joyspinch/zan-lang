@@ -132,10 +132,22 @@ class ChatArea {
     /// Builds the wrapped, markdown-aware line cache for the chat transcript.
     /// kinds: 0 = normal text, 1 = code (drawn on a code background),
     /// 2 = heading, 3 = message header row.
+    static bool HasInt(List<int> xs, int v) {
+        int i = 0;
+        while (i < xs.Count) {
+            if (xs[i] == v) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
     static void ChatBuildLines(App app, List<string> roles, List<string> texts,
-            List<string> reason, int textW, bool thinkOpen, List<string> lines,
-            List<int> colors, List<int> kinds) {
+            List<string> reason, int textW, bool thinkOpen, List<int> toolOpen,
+            List<string> lines, List<int> colors, List<int> kinds,
+            List<int> meta) {
         Theme t = app.theme;
+        List<int> togPos = new List<int>();
+        List<int> togMsg = new List<int>();
         int i = 0;
         while (i < roles.Count) {
             string head = "AI";
@@ -153,33 +165,48 @@ class ChatArea {
                 headCol = t.textTertiary;
                 bodyCol = t.textTertiary;
             }
-            lines.Add(head);
-            colors.Add(headCol);
-            kinds.Add(3);
-            // A tool result is evidence the assistant read, not conversation:
-            // show what it looked at and the first few lines, so a long file
-            // dump cannot bury the answer.
+            // A tool call/result is collapsed to ONE clickable summary line
+            // (its first line, e.g. "list_dir src/"); clicking expands the full
+            // result below it. This keeps a long dump from burying the answer
+            // while staying inspectable -- like a mainstream AI coding tool.
             if (roles[i] == "tool") {
                 List<string> tl = CodeEditor.SplitLines(texts[i]);
-                int shown = tl.Count;
-                if (shown > 6) { shown = 6; }
-                int k = 0;
-                while (k < shown) {
-                    int before = lines.Count;
-                    ChatArea.WrapInto(tl[k], textW, t.fontSizeSmall, lines);
-                    if (lines.Count == before) { lines.Add(""); }
-                    while (colors.Count < lines.Count) { colors.Add(bodyCol); kinds.Add(0); }
-                    k = k + 1;
+                string summary = "";
+                if (tl.Count > 0) { summary = tl[0]; }
+                bool open = ChatArea.HasInt(toolOpen, i);
+                bool expandable = tl.Count > 1;
+                string prefix = "  ";
+                if (expandable) {
+                    if (open) { prefix = "▼ "; } else { prefix = "▶ "; }
                 }
-                if (tl.Count > shown) {
-                    lines.Add("... " + Convert.ToString(tl.Count - shown)
-                        + ZanIDE.T(" more lines", " 行已折叠"));
-                    colors.Add(bodyCol);
-                    kinds.Add(0);
+                List<string> tmp = new List<string>();
+                ChatArea.WrapInto(prefix + head + ": " + summary, textW,
+                    t.fontSizeSmall, tmp);
+                string sline = prefix + head;
+                if (tmp.Count > 0) {
+                    sline = tmp[0];
+                    if (tmp.Count > 1) { sline = sline + " …"; }
+                }
+                if (expandable) { togPos.Add(lines.Count); togMsg.Add(i); }
+                lines.Add(sline);
+                colors.Add(headCol);
+                if (expandable) { kinds.Add(5); } else { kinds.Add(3); }
+                if (open) {
+                    int k = 1;
+                    while (k < tl.Count) {
+                        int before = lines.Count;
+                        ChatArea.WrapInto(tl[k], textW, t.fontSizeSmall, lines);
+                        if (lines.Count == before) { lines.Add(""); }
+                        while (colors.Count < lines.Count) { colors.Add(bodyCol); kinds.Add(0); }
+                        k = k + 1;
+                    }
                 }
                 i = i + 1;
                 continue;
             }
+            lines.Add(head);
+            colors.Add(headCol);
+            kinds.Add(3);
             // F: the model's reasoning is shown as its own dim "Thinking"
             // section above the answer, kept separate from the answer text (and
             // out of the transcript sent back to the model).
@@ -249,6 +276,13 @@ class ChatArea {
             kinds.Add(0);
             i = i + 1;
         }
+        // meta[row] = the message index a kind-5 toggle row controls (else -1).
+        while (meta.Count < lines.Count) { meta.Add(0 - 1); }
+        int tpi = 0;
+        while (tpi < togPos.Count) {
+            if (togPos[tpi] < meta.Count) { meta[togPos[tpi]] = togMsg[tpi]; }
+            tpi = tpi + 1;
+        }
     }
 
     /// Strips light markdown syntax for plain-text display: heading hashes,
@@ -287,7 +321,8 @@ class ChatArea {
     /// `area`; code lines get a code-colored background strip. Returns the
     /// maximum scroll offset.
     static int RenderChatArea(App app, Rect area, List<string> lines,
-            List<int> colors, List<int> kinds, int scroll, bool busy,
+            List<int> colors, List<int> kinds, List<int> meta,
+            List<int> toolOpen, int scroll, bool busy,
             LogState sel, bool interactive, SignalInt thinkOpen) {
         Canvas c = app.canvas;
         Theme t = app.theme;
@@ -341,6 +376,22 @@ class ChatArea {
                     // reasoning instead of starting a text selection.
                     thinkOpen.Set(1 - thinkOpen.Get());
                     app.RequestRedraw();
+                } else if (ri >= 0 && ri < kinds.Count && kinds[ri] == 5) {
+                    // Clicking a tool summary row expands/collapses that one
+                    // tool result (toggles its message index in toolOpen).
+                    int mid = 0 - 1;
+                    if (ri < meta.Count) { mid = meta[ri]; }
+                    if (mid >= 0) {
+                        int at = 0 - 1;
+                        int z = 0;
+                        while (z < toolOpen.Count) {
+                            if (toolOpen[z] == mid) { at = z; }
+                            z = z + 1;
+                        }
+                        if (at >= 0) { toolOpen.RemoveAt(at); }
+                        else { toolOpen.Add(mid); }
+                        app.RequestRedraw();
+                    }
                 } else {
                     int cc = LogView.ColAt(lines[ri], area.x + pad,
                         t.fontSizeSmall, app.mouseX);

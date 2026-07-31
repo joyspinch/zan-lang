@@ -6,16 +6,20 @@ using System.Net.Http;
 using System.Net.Http.Client;
 
 /// The AI chat transport: a real HTTPS request made with the Net standard
-/// library instead of a detached curl process. The request runs on a
-/// background thread that drives the async reactor and streams the decoded
-/// response body (a text/event-stream) into a file as chunks arrive; the GUI
-/// polls that file every frame, so the answer appears incrementally while the
-/// SDL event loop stays responsive.
+/// library. The request runs in a SEPARATE CHILD PROCESS (the IDE re-executes
+/// itself in a headless streaming mode) which streams the decoded response body
+/// (a text/event-stream) into a file as chunks arrive; the GUI polls that file
+/// every frame, so the answer appears incrementally while the SDL event loop
+/// stays responsive.
 ///
-/// The worker is a plain static delegate with no captured state, so the
-/// request parameters are handed over through static fields set right before
-/// the thread starts. Only one chat request is in flight at a time (the panel
-/// enforces this with `aiBusy`), so the single set of fields is enough.
+/// Why a child process and not a background thread: the Zan runtime's GC and
+/// coroutine allocator are not thread-safe, so driving the async network
+/// reactor on a second OS thread races the GUI thread's allocations and
+/// corrupts the shared heap (observed: `Invalid address to RtlFreeHeap` while
+/// the tool loop reads a project). A child process has its own heap, so the
+/// network work and the GUI never touch the same allocator. The request
+/// parameters are handed to the child through a small descriptor file whose
+/// path is passed in the `ZAN_AI_REQ` environment variable.
 class AiNet {
     static string sHost;
     static int sPort;
@@ -28,9 +32,8 @@ class AiNet {
     static string sDone;
     static int sTimeout;
 
-    /// The background request: builds the client from the shared fields and
-    /// streams the response to the output file. `await` runs on this worker
-    /// thread's own reactor, so it never blocks the GUI thread.
+    /// The request itself: builds the client from the shared fields and streams
+    /// the response to the output file. `await` runs on this process's reactor.
     static async int RunReq() {
         HttpClient cli;
         if (AiNet.sTls) { cli = HttpClient.CreateHttps(AiNet.sHost, AiNet.sPort); }
@@ -45,9 +48,115 @@ class AiNet {
         return rr;
     }
 
+    /// True when a done-marker text means success (it begins with "ok"; the
+    /// streamer can occasionally append it twice -> "okok").
+    static bool IsOk(string marker) {
+        string s = marker;
+        int a = 0;
+        while (a < s.Length) {
+            string ch = s.Substring(a, 1);
+            if (ch != " " && ch != "\r" && ch != "\n" && ch != "\t") { break; }
+            a = a + 1;
+        }
+        return a + 2 <= s.Length && s.Substring(a, 2) == "ok";
+    }
+
+    /// Drives the request to completion, retrying transient failures. Run on a
+    /// dedicated OS thread: the thread's coroutine scheduler pumps every `await`
+    /// (connect/recv) until PostSseToFileAsync finishes and writes its marker.
+    /// Each attempt streams into a private marker file; only the final outcome
+    /// is published to the real done file, so the GUI never sees a mid-retry
+    /// error and a dropped connection recovers on its own (like mainstream AI
+    /// coding tools). Up to 3 attempts with a short backoff.
     static void Worker() {
         Socket.Initialize();
-        int _r = await AiNet.RunReq();
+        string realDone = AiNet.sDone;
+        string tryDone = realDone + ".try";
+        int attempt = 0;
+        string last = "";
+        while (attempt < 3) {
+            if (File.Exists(tryDone)) { File.Delete(tryDone); }
+            AiNet.sDone = tryDone;
+            int _r = await AiNet.RunReq();
+            last = "";
+            if (File.Exists(tryDone)) { last = File.ReadAllText(tryDone); }
+            if (AiNet.IsOk(last)) {
+                HttpClient.AppendText(realDone, "ok");
+                if (File.Exists(tryDone)) { File.Delete(tryDone); }
+                return;
+            }
+            attempt = attempt + 1;
+            if (attempt < 3) { Thread.Sleep(800 * attempt); }
+        }
+        // All attempts failed: surface the last transport error to the GUI.
+        string msg = last;
+        if (msg == "") { msg = "err: streamer failed"; }
+        HttpClient.AppendText(realDone, msg);
+        if (File.Exists(tryDone)) { File.Delete(tryDone); }
+    }
+
+    /// Headless entry point: the child process runs this instead of the GUI
+    /// when `ZAN_AI_REQ` points at a request descriptor. The request runs on a
+    /// worker thread (so its scheduler drives the async reactor to completion —
+    /// a top-level `await` in this plain entry point would return at the first
+    /// suspension and exit the process mid-stream); the main thread simply waits
+    /// for the done-marker the worker writes when the stream ends, then exits.
+    static void RunStreamerMain(string descFile) {
+        List<string> ln = AiNet.ReadLines(descFile);
+        if (ln.Count < 8) { return; }
+        string baseUrl = ln[0];
+        string suffix = ln[1];
+        string key = ln[2];
+        string bodyFile = ln[3];
+        string outFile = ln[4];
+        string doneFile = ln[5];
+        int timeout = AiNet.ParseInt(ln[6], 180000);
+        bool verify = ln[7] == "1";
+        string body = "";
+        if (File.Exists(bodyFile)) { body = File.ReadAllText(bodyFile); }
+        AiNet.SetUrl(baseUrl, suffix);
+        AiNet.sKey = key;
+        AiNet.sBody = body;
+        AiNet.sOut = outFile;
+        AiNet.sDone = doneFile;
+        AiNet.sTimeout = timeout;
+        AiNet.sVerify = verify;
+        Thread.Start(AiNet.Worker);
+        // Wait for the worker to publish the real done-marker (it does so last,
+        // after any retries). Allow slack over the request timeout for a retry.
+        int limit = timeout + 30000;
+        int waited = 0;
+        while (!File.Exists(doneFile) && waited < limit) {
+            Thread.Sleep(50);
+            waited = waited + 50;
+        }
+        // Let the worker fully unwind after it wrote the marker.
+        Thread.Sleep(150);
+        if (!File.Exists(doneFile)) {
+            HttpClient.AppendText(doneFile, "err: streamer timeout");
+        }
+    }
+
+    /// Splits a descriptor file into its lines (trailing CR stripped).
+    static List<string> ReadLines(string path) {
+        List<string> res = new List<string>();
+        if (!File.Exists(path)) { return res; }
+        string raw = File.ReadAllText(path);
+        int i = 0;
+        int n = raw.Length;
+        int start = 0;
+        while (i <= n) {
+            if (i == n || (raw[i] & 255) == 10) {
+                string line = raw.Substring(start, i - start);
+                if (line.Length > 0 && (line[line.Length - 1] & 255) == 13) {
+                    line = line.Substring(0, line.Length - 1);
+                }
+                res.Add(line);
+                start = i + 1;
+            }
+            i = i + 1;
+        }
+        return res;
     }
 
     /// Parses `baseUrl` (scheme://host[:port][/base]) into the transport
@@ -110,23 +219,52 @@ class AiNet {
         return v;
     }
 
-    /// Kicks off the request on a background thread. `outFile` is truncated and
-    /// `doneFile` removed first so the poller reads only this request's output.
-    /// Returns "" on success or a readable error when the thread cannot start.
+    /// Directory part of a path (no trailing separator); "" when there is none.
+    static string ParentDir(string p) {
+        int cut = 0 - 1;
+        int i = 0;
+        while (i < p.Length) {
+            int c = p[i] & 255;
+            if (c == 47 || c == 92) { cut = i; }
+            i = i + 1;
+        }
+        if (cut < 0) { return ""; }
+        return p.Substring(0, cut);
+    }
+
+    /// Kicks off the request in a detached child process. `outFile` is
+    /// truncated and `doneFile` removed first so the poller reads only this
+    /// request's output. The child receives every parameter through a
+    /// descriptor file (path in `ZAN_AI_REQ`); the request body is written to
+    /// its own file to avoid any escaping. Returns "" on success or a readable
+    /// error when the child cannot be launched.
     static string Start(string baseUrl, string suffix, string key, string body,
             string outFile, string doneFile, int timeoutMs, bool verify) {
-        AiNet.SetUrl(baseUrl, suffix);
-        AiNet.sKey = key;
-        AiNet.sBody = body;
-        AiNet.sOut = outFile;
-        AiNet.sDone = doneFile;
-        AiNet.sTimeout = timeoutMs;
-        AiNet.sVerify = verify;
         HttpClient.TruncateFile(outFile);
         if (File.Exists(doneFile)) { File.Delete(doneFile); }
-        bool ok = Thread.Start(AiNet.Worker);
-        if (!ok) {
-            return "could not start the network thread for the AI request.";
+
+        string dir = AiNet.ParentDir(outFile);
+        string descFile = dir + "/ai_net.txt";
+        string bodyFile = dir + "/ai_body.txt";
+        File.WriteAllText(bodyFile, body);
+        string vf = "0";
+        if (verify) { vf = "1"; }
+        string desc = baseUrl + "\n" + suffix + "\n" + key + "\n"
+            + bodyFile + "\n" + outFile + "\n" + doneFile + "\n"
+            + Convert.ToString(timeoutMs) + "\n" + vf + "\n";
+        File.WriteAllText(descFile, desc);
+
+        string exe = ZanIDE.ExePath();
+        #if WINDOWS
+        // `cmd.exe /c set "VAR=..."&& "exe"` sets the variable only for the
+        // child's environment (the `set "VAR=val"` form keeps the value clean).
+        string cmd = "set \"ZAN_AI_REQ=" + descFile + "\"&& \"" + exe + "\"";
+        #else
+        string cmd = "ZAN_AI_REQ=\"" + descFile + "\" \"" + exe + "\"";
+        #endif
+        int rc = Process.RunDetached(cmd);
+        if (rc != 0) {
+            return "could not start the AI request process.";
         }
         return "";
     }

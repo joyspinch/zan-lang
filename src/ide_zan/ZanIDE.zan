@@ -1063,6 +1063,14 @@ partial class ZanIDE {
     }
 
     static void Main() {
+        // Headless AI streaming child: when launched with ZAN_AI_REQ set, run
+        // the network request in this separate process (its own heap, so it
+        // cannot race the GUI's GC) and exit before any window is created.
+        string aiReq = ZanIDE.getenv("ZAN_AI_REQ");
+        if (aiReq != null && aiReq != "" && File.Exists(aiReq)) {
+            AiNet.RunStreamerMain(aiReq);
+            return;
+        }
         ZanIDE ide = new ZanIDE();
         ZanIDE.current = ide;
         ide.Run();
@@ -2714,6 +2722,7 @@ partial class ZanIDE {
                         ChatArea.ChatUnpack(aiSessions[sNewCur], aiRole, aiText, aiPlanText, aiPlanDone);
                         aiSessCur = sNewCur;
                         aiCacheKey = "";
+                        aiToolOpen = new List<int>();
                         aiScroll.Set(0);
                         app.RequestRedraw();
                     } else if (aiBusy.Get() == 0 && sAct.created) {
@@ -2725,6 +2734,7 @@ partial class ZanIDE {
                         aiPlanDone = new List<int>();
                         aiSessCur = aiSessions.Count - 1;
                         aiCacheKey = "";
+                        aiToolOpen = new List<int>();
                         aiScroll.Set(0);
                         app.RequestRedraw();
                     } else if (aiBusy.Get() == 0 && sAct.selected >= 0
@@ -2737,6 +2747,7 @@ partial class ZanIDE {
                         ChatArea.ChatUnpack(aiSessions[sAct.selected], aiRole, aiText, aiPlanText, aiPlanDone);
                         aiSessCur = sAct.selected;
                         aiCacheKey = "";
+                        aiToolOpen = new List<int>();
                         aiScroll.Set(0);
                         app.RequestRedraw();
                     }
@@ -2881,6 +2892,7 @@ partial class ZanIDE {
                         aiText.Add(summ);
                         aiSessCur = aiSessions.Count - 1;
                         aiCacheKey = "";
+                        aiToolOpen = new List<int>();
                         aiScroll.Set(0);
                         Layer.Msg(ZanIDE.T("Forked into a new session",
                             "已基于摘要分叉新会话"), 3);
@@ -2945,26 +2957,34 @@ partial class ZanIDE {
                             + aiReason[atli].Length;
                         atli = atli + 1;
                     }
+                    int aiToolSig = aiToolOpen.Count;
+                    int aiTsi = 0;
+                    while (aiTsi < aiToolOpen.Count) {
+                        aiToolSig = aiToolSig * 131 + aiToolOpen[aiTsi] + 1;
+                        aiTsi = aiTsi + 1;
+                    }
                     string aiKeyNow = Convert.ToString(aiRole.Count) + ":"
                         + Convert.ToString(aiTotLen) + ":" + Convert.ToString(aiTextW)
                         + ":" + Convert.ToString(edFontPx)
-                        + ":" + Convert.ToString(aiThinkOpen.Get());
+                        + ":" + Convert.ToString(aiThinkOpen.Get())
+                        + ":" + Convert.ToString(aiToolSig);
                     if (aiKeyNow != aiCacheKey) {
                         aiCacheLines = new List<string>();
                         aiCacheColors = new List<int>();
                         aiCacheKinds = new List<int>();
+                        aiCacheMeta = new List<int>();
                         ChatArea.ChatBuildLines(app, aiRole, aiText, aiReason,
-                            aiTextW, aiThinkOpen.Get() == 1,
-                            aiCacheLines, aiCacheColors, aiCacheKinds);
+                            aiTextW, aiThinkOpen.Get() == 1, aiToolOpen,
+                            aiCacheLines, aiCacheColors, aiCacheKinds, aiCacheMeta);
                         aiCacheKey = aiKeyNow;
                         // Rewrapping remaps every line index, so a stale
                         // selection would highlight the wrong text: drop it.
                         aiChatSel.ClearSelection();
                     }
                     int aiMax = ChatArea.RenderChatArea(app, aiChat,
-                        aiCacheLines, aiCacheColors, aiCacheKinds,
-                        aiScroll.Get(), aiBusy.Get() == 1, aiChatSel, true,
-                        aiThinkOpen);
+                        aiCacheLines, aiCacheColors, aiCacheKinds, aiCacheMeta,
+                        aiToolOpen, aiScroll.Get(), aiBusy.Get() == 1,
+                        aiChatSel, true, aiThinkOpen);
                     if (aiScroll.Get() > aiMax) { aiScroll.Set(aiMax); }
                     if (aiScroll.Get() < 0) { aiScroll.Set(0); }
                     // Ctrl+C copies the selected transcript text when the
@@ -3684,13 +3704,18 @@ partial class ZanIDE {
                             aiTokCompletion = fa.completionTokens;
                             aiTokTotal = fa.totalTokens;
                         }
-                        if (doneTxt != "ok" || fa.error != "") {
+                        // A success marker begins with "ok" (the streamer can
+                        // occasionally append it twice -> "okok"); anything
+                        // starting with "err" is a failure.
+                        bool doneOk = doneTxt.Length >= 2
+                            && doneTxt.Substring(0, 2) == "ok";
+                        if (!doneOk || fa.error != "") {
                             string emsg = doneTxt;
                             if (emsg.Length >= 5 && emsg.Substring(0, 5) == "err: ") {
                                 emsg = emsg.Substring(5, emsg.Length - 5);
                             }
                             if (fa.error != "") {
-                                if (emsg != "" && doneTxt != "ok") {
+                                if (emsg != "" && !doneOk) {
                                     emsg = emsg + ": " + fa.error;
                                 } else { emsg = fa.error; }
                             }
@@ -4744,6 +4769,8 @@ partial class ZanIDE {
         aiCacheLines = new List<string>();
         aiCacheColors = new List<int>();
         aiCacheKinds = new List<int>();
+        aiCacheMeta = new List<int>();
+        aiToolOpen = new List<int>();
         aiCacheKey = "";
         aiChatSel = LogState.Create();
         aiReason = new List<string>();
