@@ -5,6 +5,15 @@
  * irgen_expr.c; not compiled standalone.
  */
 
+/* True when the identifier names an instance field of the class being
+ * compiled, i.e. it reads as `this.<name>`. Such a field shadows a type of the
+ * same name wherever a receiver is resolved. */
+static bool ident_names_own_field(zan_irgen_t *g, zan_ast_node_t *e) {
+    if (!e || e->kind != AST_IDENTIFIER) return false;
+    if (!g->current_this || !g->current_type_sym) return false;
+    return get_field_index(g->current_type_sym, e->ident.name) >= 0;
+}
+
 /* True when the call's receiver names a class compiled from source (user or
  * stdlib) that defines the called method. Builtin lowerings that duplicate a
  * stdlib class (File.*) step aside so the source implementation — with its
@@ -16,6 +25,7 @@ static bool src_method_takes_over(zan_irgen_t *g, zan_ast_node_t *expr,
     if (callee->kind != AST_MEMBER_ACCESS ||
         callee->member.object->kind != AST_IDENTIFIER) return false;
     if (local_find(locals, callee->member.object->ident.name)) return false;
+    if (ident_names_own_field(g, callee->member.object)) return false;
     zan_symbol_t *ts = zan_binder_lookup(g->binder, callee->member.object->ident.name);
     if (!ts || (ts->kind != SYM_CLASS && ts->kind != SYM_STRUCT)) return false;
     return get_method_sym(ts, callee->member.name) != NULL;
@@ -2988,8 +2998,17 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                     }
                 }
 
-                /* try as static method: ClassName.Method(args) */
-                zan_symbol_t *type_sym = zan_binder_lookup(g->binder, callee->member.object->ident.name);
+                /* try as static method: ClassName.Method(args).
+                 * A field of the enclosing class shadows a type of the same
+                 * name, exactly as a local does: in a class holding a field
+                 * `Collapse`, `Collapse.Add(h)` calls that field's method and
+                 * not a static of the widget class named Collapse. Without
+                 * this the receiver silently became the type and the call was
+                 * emitted against the wrong (instance) signature. */
+                zan_symbol_t *type_sym = NULL;
+                if (!ident_names_own_field(g, callee->member.object))
+                    type_sym = zan_binder_lookup(g->binder,
+                        callee->member.object->ident.name);
                 if (type_sym && (type_sym->kind == SYM_CLASS || type_sym->kind == SYM_STRUCT)) {
                     zan_symbol_t *method_sym = resolve_overload_typed(g, type_sym, callee->member.name, expr, locals);
                     if (method_sym) pack_params_args(g, expr, method_sym, locals);

@@ -124,6 +124,9 @@ typedef struct {
     zan_arena_t *arena;
     zan_diag_t *diag;
     nr_shadow_t shadow;
+    /* Field names of the class being walked: like locals, a field shadows a
+     * type of the same name when it is used as a receiver. */
+    nr_shadow_t fields;
 } nr_ctx_t;
 
 static void shadow_add(nr_shadow_t *s, zan_istr_t name) {
@@ -458,17 +461,27 @@ static void nr_walk(nr_ctx_t *c, zan_ast_node_t *n,
     case AST_CLASS_DECL:
     case AST_STRUCT_DECL:
     case AST_INTERFACE_DECL:
-    case AST_ENUM_DECL:
+    case AST_ENUM_DECL: {
+        int saved_fields = c->fields.count;
+        for (int i = 0; i < n->type_decl.members.count; i++) {
+            zan_ast_node_t *m = n->type_decl.members.items[i];
+            if (m && (m->kind == AST_FIELD_DECL || m->kind == AST_PROPERTY_DECL))
+                shadow_add(&c->fields, m->field_decl.name);
+        }
         nr_walk_list(c, &n->type_decl.bases, ns, usings);
         nr_walk_list(c, &n->type_decl.where_clauses, ns, usings);
         nr_walk_list(c, &n->type_decl.members, ns, usings);
+        c->fields.count = saved_fields;
         break;
+    }
 
     case AST_DELEGATE_DECL:
     case AST_METHOD_DECL:
     case AST_CONSTRUCTOR_DECL:
     case AST_DESTRUCTOR_DECL:
         c->shadow.count = 0;
+        for (int i = 0; i < c->fields.count; i++)
+            shadow_add(&c->shadow, c->fields.items[i]);
         collect_shadows_list(c, &n->method_decl.params);
         collect_shadows(c, n->method_decl.body);
         nr_walk(c, n->method_decl.return_type, ns, usings);
@@ -671,6 +684,9 @@ void zan_nsresolve_run(zan_ast_node_t *unit, zan_arena_t *arena, zan_diag_t *dia
     c.shadow.items = NULL;
     c.shadow.count = 0;
     c.shadow.cap = 0;
+    c.fields.items = NULL;
+    c.fields.count = 0;
+    c.fields.cap = 0;
     c.items = (nr_type_t *)zan_arena_alloc(arena,
                     sizeof(nr_type_t) * (size_t)(decls->count + 1));
 
