@@ -15,11 +15,17 @@ using System;
 /// endpoint, including local models that do not implement function calling.
 ///
 /// Read tools (`read_file`, `list_dir`, `grep`, `repo_map`) run silently.
-/// The mutating tools (`write_file`, `edit_file`, `build`, `run`) wait for the
-/// user's Approve unless "Auto-execute" is on -- that gate is enforced by the
-/// panel, not by trusting the model. Every file tool is confined to the
-/// project directory: `SafePath` rejects absolute paths and any `..` that
-/// would escape the root.
+/// The mutating tools (`write_file`, `edit_file`, `build`, `run`, `ui_check`)
+/// wait for the user's Approve unless "Auto-execute" is on -- that gate is
+/// enforced by the panel, not by trusting the model. Every file tool is
+/// confined to the project directory: `SafePath` rejects absolute paths and
+/// any `..` that would escape the root.
+///
+/// `ui_check` closes the loop the four rules ask for: the model can build the
+/// program, drive its real UI with a script (the Gui UiDriver injects synthetic
+/// input through the same event loop a human does) and read back the hit-region
+/// geometry and assertion results -- so it verifies a fix against actual pixel
+/// coordinates instead of claiming success.
 class AiAgent {
     /// Hard ceiling on tool calls per user question, so a model that keeps
     /// asking for files can never spin forever. Higher than the read-only
@@ -172,20 +178,21 @@ class AiAgent {
             return AiAgent.EditFile(root, v.Str("path", ""),
                                     v.Str("old", ""), v.Str("new", ""));
         }
-        if (tool == "build" || tool == "run") {
-            // These need the IDE's async build machinery, so the panel drives
-            // them directly; they never reach here.
+        if (tool == "build" || tool == "run" || tool == "ui_check") {
+            // These need the IDE's async build / run machinery, so the panel
+            // drives them directly; they never reach here.
             return "error: '" + tool + "' is run by the IDE, not this dispatch.";
         }
         return "error: unknown tool '" + tool + "'. Available: read_file,"
-            + " list_dir, grep, repo_map, write_file, edit_file, build, run.";
+            + " list_dir, grep, repo_map, write_file, edit_file, build, run,"
+            + " ui_check.";
     }
 
     /// True for a tool that changes the project or runs code, so the panel
     /// asks the user before it runs (unless Auto-execute is on).
     static bool IsMutating(string tool) {
         return tool == "write_file" || tool == "edit_file"
-            || tool == "build" || tool == "run";
+            || tool == "build" || tool == "run" || tool == "ui_check";
     }
 
     /// The tool name of a call, or "" for a malformed one.
@@ -207,7 +214,60 @@ class AiAgent {
         if (tool == "repo_map") { return "repo_map"; }
         if (tool == "build") { return "build"; }
         if (tool == "run") { return "run"; }
+        if (tool == "ui_check") { return "ui_check"; }
         return tool + " " + v.Str("path", "");
+    }
+
+    /// Makes a model-supplied UiDriver script safe to run unattended: appends a
+    /// hit-region dump and a `quit` when they are missing, so the driven window
+    /// always closes (never hanging the check) and geometry is always captured.
+    static string NormalizeUiScript(string script) {
+        StringBuilder sb = new StringBuilder();
+        sb.Append(script);
+        if (script.Length == 0 || script.Substring(script.Length - 1, 1) != "\n") {
+            sb.Append("\n");
+        }
+        if (ZanIDE.IndexOfStr(script, "dump hitregions") < 0) {
+            sb.Append("wait 200\ndump hitregions regions.json\n");
+        }
+        if (ZanIDE.IndexOfStr(script, "quit") < 0) {
+            sb.Append("wait 200\nquit\n");
+        }
+        return sb.ToString();
+    }
+
+    /// Builds the ui_check result handed back to the model: the driver's
+    /// assertion/step log first, then the hit-region geometry it dumped, so the
+    /// model reasons over real coordinates rather than a screenshot it cannot
+    /// see. Either part may be empty when the run produced nothing.
+    static string UiResult(string resultsLog, string regionsJson, bool timedOut) {
+        StringBuilder sb = new StringBuilder();
+        if (timedOut) {
+            sb.Append("ui_check TIMED OUT (the window did not close in time);"
+                + " partial output below.\n");
+        } else {
+            sb.Append("ui_check finished.\n");
+        }
+        if (resultsLog != "") {
+            string rl = resultsLog;
+            if (rl.Length > 4000) {
+                rl = rl.Substring(rl.Length - 4000, 4000);
+            }
+            sb.Append("--- driver log ---\n" + rl);
+            if (rl.Length > 0 && rl.Substring(rl.Length - 1, 1) != "\n") {
+                sb.Append("\n");
+            }
+        } else {
+            sb.Append("--- driver log --- (empty: script produced no output)\n");
+        }
+        if (regionsJson != "") {
+            string rj = regionsJson;
+            if (rj.Length > 6000) {
+                rj = rj.Substring(0, 6000) + " ...(truncated)";
+            }
+            sb.Append("--- hit regions (x,y,w,h per widget) ---\n" + rj + "\n");
+        }
+        return sb.ToString();
     }
 
     // --- tools ---------------------------------------------------------------
@@ -461,6 +521,15 @@ class AiAgent {
             + "- build {}: compile the current run target and send you the"
             + " compiler errors/warnings.\n"
             + "- run {}: build, then launch the program.\n"
+            + "- ui_check {script}: build the target, launch it, and drive its"
+            + " real UI with `script` (one UiDriver command per line), then send"
+            + " you the assertion log and the hit-region geometry it dumped."
+            + " Commands: `wait <ms>`, `move/click <x> <y>`, `clickid <id>`,"
+            + " `type \\\"text\\\"`, `keydown/keyup <code> [mods]`,"
+            + " `dump hitregions <file>`, `assert probe <name> contains|equals"
+            + " <text>`, `log <text>`, `quit`. It auto-dumps regions and quits"
+            + " if you omit them. This is how you VERIFY a UI fix: read the"
+            + " widget x/y/w/h back and check the real numbers.\n"
             + "Paths are relative to the project root; absolute paths and '..'"
             + " are refused. The IDE runs the tool and sends you the result,"
             + " then you continue. One tool call per reply, at most "

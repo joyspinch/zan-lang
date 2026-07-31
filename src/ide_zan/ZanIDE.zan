@@ -3313,25 +3313,95 @@ partial class ZanIDE {
                         if (aiBuildForAi) {
                             aiBuildForAi = false;
                             bool aiOk = File.Exists(buildExe);
-                            aiRole.Add("tool");
-                            if (buildThenRun) { aiText.Add("run\n"
-                                + AiAgent.BuildResult(bout, aiOk, true)); }
-                            else { aiText.Add("build\n"
-                                + AiAgent.BuildResult(bout, aiOk, false)); }
-                            string aiBe = ZanIDE.AiLaunch(aiRole, aiText,
-                                aiRunCtxName, aiRunCtxCode, root,
-                                aiProfBases[aiProfActive],
-                                aiProfKeys[aiProfActive], aiRunModel);
-                            if (aiBe != "") {
-                                aiRole.Add("error"); aiText.Add(aiBe);
-                                aiBusy.Set(0);
+                            if (aiUiPending) {
+                                // ui_check: on a good build, launch the target
+                                // under the UiDriver script and let the ui poll
+                                // gather the log + hit regions; a failed build
+                                // goes straight back so the model can fix it.
+                                aiUiPending = false;
+                                if (aiOk) {
+                                    string uid = root + "/_scratch/uidrv";
+                                    string uiCwd = ZanIDE.RunCwd(root,
+                                        buildTargetPath, buildExe);
+                                    ZanIDE.LaunchUnderUiDriver(buildExe, uiCwd,
+                                        uid + "/ai_script.txt", uid,
+                                        uid + "/ai_done.txt");
+                                    aiUiRunning = true;
+                                    aiUiDeadline = Window.GetTickMs() + 30000;
+                                    log.Add(ZanIDE.T("> [AI] Driving UI...",
+                                        "> [AI] 正在驱动 UI 自检..."));
+                                    app.RequestAnimationFrame(120);
+                                } else {
+                                    aiRole.Add("tool");
+                                    aiText.Add("ui_check\n"
+                                        + AiAgent.BuildResult(bout, false, false));
+                                    string ube = ZanIDE.AiLaunch(aiRole, aiText,
+                                        aiRunCtxName, aiRunCtxCode, root,
+                                        aiProfBases[aiProfActive],
+                                        aiProfKeys[aiProfActive], aiRunModel);
+                                    if (ube != "") {
+                                        aiRole.Add("error"); aiText.Add(ube);
+                                        aiBusy.Set(0);
+                                    }
+                                    aiScroll.Set(0);
+                                }
+                            } else {
+                                aiRole.Add("tool");
+                                if (buildThenRun) { aiText.Add("run\n"
+                                    + AiAgent.BuildResult(bout, aiOk, true)); }
+                                else { aiText.Add("build\n"
+                                    + AiAgent.BuildResult(bout, aiOk, false)); }
+                                string aiBe = ZanIDE.AiLaunch(aiRole, aiText,
+                                    aiRunCtxName, aiRunCtxCode, root,
+                                    aiProfBases[aiProfActive],
+                                    aiProfKeys[aiProfActive], aiRunModel);
+                                if (aiBe != "") {
+                                    aiRole.Add("error"); aiText.Add(aiBe);
+                                    aiBusy.Set(0);
+                                }
+                                aiScroll.Set(0);
                             }
-                            aiScroll.Set(0);
                         }
                         coLog.Reset();
                         app.RequestRedraw();
                     }
                     app.RequestAnimationFrame(80);
+                }
+                // ui_check in flight: the target is being driven by the
+                // UiDriver script. Wait (without blocking) for its done-marker
+                // or the deadline, then feed the driver log + hit-region dump
+                // back so the model can verify the UI against real geometry.
+                if (aiUiRunning) {
+                    string uidP = root + "/_scratch/uidrv";
+                    bool uiDone = File.Exists(uidP + "/ai_done.txt");
+                    bool uiTo = Window.GetTickMs() > aiUiDeadline;
+                    if (uiDone || uiTo) {
+                        aiUiRunning = false;
+                        if (uiDone) { File.Delete(uidP + "/ai_done.txt"); }
+                        string rlog = "";
+                        if (File.Exists(uidP + "/results.log")) {
+                            rlog = File.ReadAllText(uidP + "/results.log");
+                        }
+                        string rjson = "";
+                        if (File.Exists(uidP + "/regions.json")) {
+                            rjson = File.ReadAllText(uidP + "/regions.json");
+                        }
+                        aiRole.Add("tool");
+                        aiText.Add("ui_check\n"
+                            + AiAgent.UiResult(rlog, rjson, uiTo && !uiDone));
+                        string uce = ZanIDE.AiLaunch(aiRole, aiText,
+                            aiRunCtxName, aiRunCtxCode, root,
+                            aiProfBases[aiProfActive],
+                            aiProfKeys[aiProfActive], aiRunModel);
+                        if (uce != "") {
+                            aiRole.Add("error"); aiText.Add(uce);
+                            aiBusy.Set(0);
+                        }
+                        aiScroll.Set(0);
+                        app.RequestRedraw();
+                    } else {
+                        app.RequestAnimationFrame(150);
+                    }
                 }
                 // Poll the in-flight detached publish: compiler output streams
                 // into the Output tab and a done-marker file signals completion,
@@ -4112,6 +4182,10 @@ partial class ZanIDE {
         aiPendingCall = "";
         aiAutoExec = false;
         aiBuildForAi = false;
+        aiUiPending = false;
+        aiUiRunning = false;
+        aiUiScript = "";
+        aiUiDeadline = 0;
         aiApproveBtn = new Button { Text = ZanIDE.T("Approve", "批准"), Class = "primary small" };
         aiRejectBtn = new Button { Text = ZanIDE.T("Reject", "拒绝"), Class = "small" };
         aiAutoBtn = new Button { Text = ZanIDE.T("Auto: off", "自动:关"), Class = "small" };
@@ -4133,7 +4207,7 @@ partial class ZanIDE {
     /// compiler output back. A launch error stops the loop.
     void AiDispatchTool(string call) {
         string tool = AiAgent.ToolName(call);
-        if (tool == "build" || tool == "run") {
+        if (tool == "build" || tool == "run" || tool == "ui_check") {
             string apB = ZanIDE.PathOf(tabPaths, activeTab);
             string rpB = ZanIDE.RibbonRunTarget(apB, root);
             if (rpB == "") {
@@ -4146,6 +4220,25 @@ partial class ZanIDE {
                     aiProfKeys[aiProfActive], aiRunModel);
                 if (e2 != "") { aiRole.Add("error"); aiText.Add(e2); aiBusy.Set(0); }
                 return;
+            }
+            if (tool == "ui_check") {
+                // Stage the driver script under _scratch/uidrv, then build; the
+                // completion poll launches the target under ZAN_UI_SCRIPT.
+                JsonValue uv = JsonValue.ParseLenient(call);
+                string script = "";
+                if (uv != null) { script = uv.Str("script", ""); }
+                aiUiScript = AiAgent.NormalizeUiScript(script);
+                string uid = root + "/_scratch/uidrv";
+                Directory.CreateDirectoryRecursive(uid);
+                File.WriteAllText(uid + "/ai_script.txt", aiUiScript);
+                File.WriteAllText(uid + "/results.log", "");
+                if (File.Exists(uid + "/regions.json")) {
+                    File.Delete(uid + "/regions.json");
+                }
+                if (File.Exists(uid + "/ai_done.txt")) {
+                    File.Delete(uid + "/ai_done.txt");
+                }
+                aiUiPending = true;
             }
             buildBusy = true;
             buildThenRun = (tool == "run");
