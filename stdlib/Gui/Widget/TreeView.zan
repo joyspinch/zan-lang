@@ -3,10 +3,10 @@ using Gui;
 
 namespace Gui.Widget;
 
-/// One row of a TreeView, in pre-order. `depth` is the indent level (root = 0).
+/// One node of a tree, in pre-order. `depth` is the indent level (root = 0).
 /// Directories can be expanded/collapsed; files are leaves. `icon` overrides the
 /// default folder/file glyph when non-empty. `path` optionally carries the real
-/// filesystem path this row represents (empty for purely in-memory trees).
+/// filesystem path this node represents (empty for purely in-memory trees).
 /// `checked` backs the optional selection checkbox column.
 class TreeNode {
     string label;
@@ -48,428 +48,561 @@ class TreeNode {
     }
 }
 
-/// Optional event sink for a TreeView. Pass one to RenderEvents and the tree
-/// reports what the user did through events instead of the caller polling
-/// return values: node clicks, selection moves, expand/collapse, checkbox
-/// toggles and right-clicks. The `*Row` fields carry the node index of the
-/// event being raised.
-class TreeEvents {
-    int clickedRow;      // node clicked this frame, -1 for none
-    int contextRow;      // node right-clicked this frame, -1 for none
-    int toggledRow;      // directory expanded/collapsed this frame, -1 for none
-    int checkedRow;      // node whose checkbox toggled this frame, -1 for none
-
-    UiEvent NodeClick;
-    UiEvent SelectionChanged;
-    UiEvent NodeExpanded;
-    UiEvent NodeCollapsed;
-    UiEvent NodeContext;
-    UiEvent CheckChanged;
-
-    static TreeEvents Create() {
-        TreeEvents e = new TreeEvents();
-        e.clickedRow = 0 - 1;
-        e.contextRow = 0 - 1;
-        e.toggledRow = 0 - 1;
-        e.checkedRow = 0 - 1;
-        e.NodeClick = UiEvent.Create();
-        e.SelectionChanged = UiEvent.Create();
-        e.NodeExpanded = UiEvent.Create();
-        e.NodeCollapsed = UiEvent.Create();
-        e.NodeContext = UiEvent.Create();
-        e.CheckChanged = UiEvent.Create();
-        return e;
-    }
-
-    void BeginFrame() {
-        clickedRow = 0 - 1;
-        contextRow = 0 - 1;
-        toggledRow = 0 - 1;
-        checkedRow = 0 - 1;
-    }
-}
+/// Builds a node's own control subtree, for a tree whose rows are a custom
+/// component instead of the built-in glyph + label row.
+delegate Control NodeOf(TreeNode node);
 
 /// <summary>
-/// A collapsible file tree built from a flat, pre-ordered `List<TreeNode>`. A
-/// node is hidden when any ancestor directory is collapsed. Clicking a
-/// directory toggles it; clicking any row selects it (row index -> `selected`).
-/// When rendered with checkboxes, clicking a box toggles that node (and, for a
-/// directory, all of its descendants). Interaction is handled inside Render
-/// (immediate-mode), so a single call both draws and updates the model.
+/// A collapsible tree bound to the caller's own `List<TreeNode>`. Like every
+/// retained widget it sits in a control tree and CSS decides its box, so no call
+/// site computes a rectangle, tracks a scroll offset or polls a return code:
+///
+///     TreeView files = new TreeView();
+///     files.Bind(model.nodes);          // the caller's list, not copied
+///     files.OnSelect(OpenSelected);
+///     files.OnContext(ShowMenu);        // read ContextRow / ContextX / ContextY
+///     side.Add(files);
+///
+/// A node can be a component of its own instead of the built-in row:
+///
+///     TreeView tv = new TreeView(n => NodeCard(n));
+///
+/// Clicking a directory toggles it and hides its subtree; wheel scrolling, the
+/// overlay scrollbar, the optional inline filter row and the optional checkbox
+/// column are all handled inside the control. Handlers are marshalled onto the
+/// UI thread (UiEvent.Post), so a background job that rebuilds the bound list
+/// and calls Refresh() is safe.
 /// </summary>
-class TreeView {
-    // ---- retained instance ----------------------------------------------
-    // A TreeView object binds the per-tree state (the displayed node list plus
-    // the selection / scroll signals and optional filter input) so a host holds
-    // one instance and calls `tv.Draw(app, area)` instead of threading every
-    // field through the immediate-mode static Render each frame. The bound
-    // signals/input are the retained state; the node list is refreshed with
-    // SetNodes when the host recomputes a filtered view.
-    List<TreeNode> iNodes;
-    SignalInt iSel;
-    SignalInt iScroll;
-    Input iFilter;
-    TreeEvents iEvents;
-    bool iChecks;
+class TreeView : Control {
+    /// The caller's nodes, read every frame: mutating the list shows up on the
+    /// next paint (call Refresh() when custom node controls must be rebuilt).
+    List<TreeNode> data;
+    SignalInt sel;
+    SignalInt scroll;
+    Input filter;
+    bool checks;
+    NodeOf tpl;
+    bool rowsStale;
+    int builtFor;
 
-    TreeView() {}
+    /// Set while a handler runs: the node the event is about, and where the
+    /// pointer was, so a context menu can anchor itself without the call site
+    /// reading mouse state.
+    int ctxRow;
+    int ctxX;
+    int ctxY;
 
-    /// Retained-mode constructor. Selection and scroll get fresh signals unless
-    /// the host rebinds them to its own via Bind*.
-    static TreeView Create(List<TreeNode> nodes) {
-        TreeView tv = new TreeView();
-        tv.iNodes = nodes;
-        tv.iSel = SignalInt.Create(0 - 1);
-        tv.iScroll = SignalInt.Create(0);
-        tv.iFilter = null;
-        tv.iEvents = null;
-        tv.iChecks = false;
-        return tv;
+    /// Centred while the tree has no nodes ("" draws nothing).
+    string Empty;
+
+    /// A node was selected (read SelectedIndex / Selected).
+    UiEvent Select;
+    /// A node was double-clicked (open / run it).
+    UiEvent Activate;
+    /// A directory was expanded.
+    UiEvent Expand;
+    /// A directory was collapsed.
+    UiEvent Collapse;
+    /// A node was right-clicked (read ContextRow / ContextX / ContextY).
+    UiEvent Context;
+    /// A checkbox was toggled (read ContextRow for the node).
+    UiEvent Check;
+
+    void InitTree() {
+        this.InitControl("tree", 5);
+        data = new List<TreeNode>();
+        sel = SignalInt.Create(0 - 1);
+        scroll = SignalInt.Create(0);
+        filter = null;
+        checks = false;
+        tpl = null;
+        rowsStale = true;
+        builtFor = 0 - 1;
+        ctxRow = 0 - 1;
+        ctxX = 0;
+        ctxY = 0;
+        Empty = "";
+        wiresOwnEvents = true;
+        Select = UiEvent.Create();
+        Activate = UiEvent.Create();
+        Expand = UiEvent.Create();
+        Collapse = UiEvent.Create();
+        Context = UiEvent.Create();
+        Check = UiEvent.Create();
     }
 
-    TreeView BindSel(SignalInt s) { iSel = s; return this; }
-    TreeView BindScroll(SignalInt s) { iScroll = s; return this; }
-    TreeView BindFilter(Input f) { iFilter = f; return this; }
-    TreeView WithChecks() { iChecks = true; return this; }
-    TreeView WithEvents() { iEvents = TreeEvents.Create(); return this; }
+    TreeView() { InitTree(); }
 
-    TreeEvents Events() { return iEvents; }
-    SignalInt Sel() { return iSel; }
-    SignalInt Scroll() { return iScroll; }
-    List<TreeNode> Nodes() { return iNodes; }
-    void SetNodes(List<TreeNode> n) { iNodes = n; }
-
-    /// Instance filter row: consumes the top of `area` for the bound input and
-    /// returns the remaining rows area (unchanged when no filter is bound).
-    Rect FilterAt(App app, Rect area) {
-        if (iFilter == null) { return area; }
-        return TreeView.FilterBar(app, area, iFilter);
+    /// Custom rows: the template builds each node's control subtree.
+    TreeView(NodeOf template) {
+        InitTree();
+        tpl = template;
     }
 
-    int RowH(App app) { return TreeView.RowHeight(app); }
-    int ContentH(App app) { return TreeView.ContentHeight(app, iNodes); }
+    override string Kind() { return "TreeView"; }
 
-    /// Draws the tree this frame and returns the right-clicked row index (or -1),
-    /// mirroring the static Render. Uses the bound selection/scroll signals.
-    int Draw(App app, Rect area) {
-        return TreeView.RenderImpl(app, area, iNodes, iSel, iScroll.Get(),
-            iChecks, iEvents);
+    override string StyleType() { return "tree"; }
+
+    // ---- data ---------------------------------------------------------------
+
+    /// Binds the caller's node list; nothing is copied.
+    TreeView Bind(List<TreeNode> nodes) {
+        if (nodes == null) { data = new List<TreeNode>(); }
+        else { data = nodes; }
+        rowsStale = true;
+        if (sel.Get() >= data.Count) { sel.Set(0 - 1); }
+        return this;
     }
 
-    /// Pointer handling for the overlay scrollbar the Draw pass paints.
-    void ScrollbarAt(App app, Rect area) {
-        TreeView.HandleScrollbar(app, area, iNodes, iScroll);
+    /// Marks the bound nodes as changed, so custom rows rebuild next frame.
+    void Refresh() { rowsStale = true; }
+
+    /// Shares the caller's selection signal, for a host that persists the
+    /// selection across rebuilds of the node list.
+    TreeView BindSel(SignalInt s) {
+        if (s != null) { sel = s; }
+        return this;
     }
 
-    List<int> CheckedIndicesI() { return TreeView.CheckedIndices(iNodes); }
-    List<string> CheckedLabelsI() { return TreeView.CheckedLabels(iNodes); }
-
-    static int RowHeight(App app) {
-        return app.theme.heightSmall;
+    /// Draws an inline filter row at the top of the tree and filters nothing by
+    /// itself: the host rebinds the filtered list when the input changes.
+    TreeView WithFilter(Input f) {
+        filter = f;
+        return this;
     }
 
-    /// Draws an inline filter row at the top of a tree's area — a small
-    /// search glyph plus a compact input on the tree's own background, so it
-    /// reads as part of the tree — and returns the remaining area for the
-    /// rows below. Skipped (area returned unchanged) when the area is too
-    /// short to fit both the bar and at least one row.
-    static Rect FilterBar(App app, Rect area, Input filter) {
-        Canvas c = app.canvas;
-        Theme t = app.theme;
-        int barH = app.Scale(26);
-        if (area.height < barH + TreeView.RowHeight(app)) { return area; }
-        int pad = app.Scale(6);
-        int glyph = app.Scale(12);
-        c.DrawGlyphIn("search", area.x + pad, area.y, glyph, barH,
-            glyph, t.textTertiary);
-        int inX = area.x + pad * 2 + glyph;
-        filter.Render(app, inX, area.y + app.Scale(2),
-            area.width - (inX - area.x) - pad, barH - app.Scale(4));
-        return Rect.Create(area.x, area.y + barH, area.width,
-            area.height - barH);
+    /// Draws a tri-state checkbox in front of every node.
+    TreeView WithChecks() {
+        checks = true;
+        return this;
     }
 
-    /// Total pixel height of the currently-visible rows (for scrollbar math).
-    static int ContentHeight(App app, List<TreeNode> nodes) {
-        int rowH = TreeView.RowHeight(app);
-        int visible = 0;
-        int hideDepth = -1;
+    int Count() { return data.Count; }
+
+    /// The bound list itself, for a host that keeps its own view of the nodes a
+    /// handler was raised about.
+    List<TreeNode> Nodes() { return data; }
+
+    bool Has(int row) { return row >= 0 && row < data.Count; }
+
+    TreeNode NodeAt(int row) { return data[row]; }
+
+    int SelectedIndex() { return sel.Get(); }
+
+    bool HasSelection() { return this.Has(sel.Get()); }
+
+    /// The selected node; only valid while HasSelection().
+    TreeNode Selected() { return data[sel.Get()]; }
+
+    void SelectIndex(int row) {
+        if (row < 0 - 1 || row >= data.Count) { return; }
+        if (sel.Get() == row) { return; }
+        sel.Set(row);
+        Select.Post();
+    }
+
+    void ClearSelection() { sel.Set(0 - 1); }
+
+    /// The node the running handler is about (right-clicked or check-toggled).
+    int ContextRow() { return ctxRow; }
+    int ContextX() { return ctxX; }
+    int ContextY() { return ctxY; }
+
+    // ---- handlers -----------------------------------------------------------
+
+    TreeView OnSelect(Action a) { Select.Add(a); return this; }
+    TreeView OnActivate(Action a) { Activate.Add(a); return this; }
+    TreeView OnExpand(Action a) { Expand.Add(a); return this; }
+    TreeView OnCollapse(Action a) { Collapse.Add(a); return this; }
+    TreeView OnContext(Action a) { Context.Add(a); return this; }
+    TreeView OnCheck(Action a) { Check.Add(a); return this; }
+
+    /// Text shown while the tree is empty.
+    TreeView EmptyText(string text) { Empty = text; return this; }
+
+    // ---- expansion / checkbox state (the tree owns its own model) -----------
+
+    void ExpandAll() {
         int k = 0;
-        while (k < nodes.Count) {
-            TreeNode n = nodes[k];
+        while (k < data.Count) {
+            if (data[k].isDir) { data[k].expanded = true; }
+            k = k + 1;
+        }
+        rowsStale = true;
+    }
+
+    void CollapseAll() {
+        int k = 0;
+        while (k < data.Count) {
+            if (data[k].isDir) { data[k].expanded = false; }
+            k = k + 1;
+        }
+        rowsStale = true;
+    }
+
+    void SetAllChecked(bool on) {
+        int k = 0;
+        while (k < data.Count) { data[k].checked = on; k = k + 1; }
+    }
+
+    void Toggle(int row) {
+        if (!this.Has(row)) { return; }
+        TreeView.ToggleCheck(data, row);
+    }
+
+    /// Indices of every checked node (directories included).
+    List<int> CheckedIndices() {
+        List<int> res = new List<int>();
+        int k = 0;
+        while (k < data.Count) {
+            if (data[k].checked) { res.Add(k); }
+            k = k + 1;
+        }
+        return res;
+    }
+
+    /// Labels of every checked leaf node.
+    List<string> CheckedLabels() {
+        List<string> res = new List<string>();
+        int k = 0;
+        while (k < data.Count) {
+            if (data[k].checked && !data[k].isDir) { res.Add(data[k].label); }
+            k = k + 1;
+        }
+        return res;
+    }
+
+    int CheckedCount() { return this.CheckedLabels().Count; }
+
+    // ---- internals ----------------------------------------------------------
+
+    bool Templated() { return tpl != null; }
+
+    int RowHeight(App app) {
+        StyleBox s = this.ResolveStyleAs(app, "tree", Class, Style.SNormal());
+        return s.HeightOr(app.theme.heightSmall);
+    }
+
+    int FilterHeight(App app) {
+        if (filter == null) { return 0; }
+        return app.Scale(26);
+    }
+
+    /// True when no collapsed ancestor hides `row`.
+    bool Shown(int row) {
+        int d = data[row].depth;
+        int j = row - 1;
+        while (j >= 0) {
+            if (data[j].depth < d) {
+                if (data[j].isDir && !data[j].expanded) { return false; }
+                d = data[j].depth;
+            }
+            j = j - 1;
+        }
+        return true;
+    }
+
+    /// Pixel height of the visible rows, which is what a column layout sizes the
+    /// tree from when the sheet declares no height.
+    int ContentHeight(App app) {
+        int rowH = this.RowHeight(app);
+        int h = 0;
+        int hideDepth = 0 - 1;
+        int k = 0;
+        while (k < data.Count) {
+            TreeNode n = data[k];
             bool shown = true;
             if (hideDepth >= 0) {
                 if (n.depth > hideDepth) { shown = false; }
-                else { hideDepth = -1; }
+                else { hideDepth = 0 - 1; }
             }
             if (shown) {
-                visible = visible + 1;
-                if (n.isDir) { if (!n.expanded) { hideDepth = n.depth; } }
+                if (this.Templated() && k < children.Count) {
+                    h = h + this.RowExtent(app, children[k]);
+                } else {
+                    h = h + rowH;
+                }
+                if (n.isDir && !n.expanded) { hideDepth = n.depth; }
             }
             k = k + 1;
         }
-        return visible * rowH;
+        return h;
     }
 
-    /// Draws the tree and handles interaction. Returns the index of a node the
-    /// user right-clicked this frame (for the caller to open a context menu),
-    /// or -1 if none. Left-click select/expand is handled internally.
-    static int Render(App app, Rect area, List<TreeNode> nodes,
-                      SignalInt selected, int scrollOffset) {
-        return TreeView.RenderImpl(app, area, nodes, selected, scrollOffset,
-            false, null);
+    int RowExtent(App app, Control row) {
+        int h = row.prefH;
+        if (h <= 0) { h = this.RowHeight(app); }
+        return h;
     }
 
-    /// Render with an event sink: identical drawing, but every interaction is
-    /// also reported through `ev` so the caller never inspects return codes or
-    /// diffs the node list itself.
-    static int RenderEvents(App app, Rect area, List<TreeNode> nodes,
-                            SignalInt selected, int scrollOffset,
-                            TreeEvents ev) {
-        return TreeView.RenderImpl(app, area, nodes, selected, scrollOffset,
-            false, ev);
-    }
-
-    /// RenderChecked with an event sink.
-    static int RenderCheckedEvents(App app, Rect area, List<TreeNode> nodes,
-                                   SignalInt selected, int scrollOffset,
-                                   TreeEvents ev) {
-        return TreeView.RenderImpl(app, area, nodes, selected, scrollOffset,
-            true, ev);
-    }
-
-    /// Same as Render but draws a selection checkbox in front of every row.
-    /// Toggling a directory box cascades to its descendants; read the result
-    /// with CheckedIndices / CheckedLabels.
-    static int RenderChecked(App app, Rect area, List<TreeNode> nodes,
-                             SignalInt selected, int scrollOffset) {
-        return TreeView.RenderImpl(app, area, nodes, selected, scrollOffset,
-            true, null);
-    }
-
-    static int RenderImpl(App app, Rect area, List<TreeNode> nodes,
-                          SignalInt selected, int scrollOffset, bool showChecks,
-                          TreeEvents ev) {
-        if (ev != null) { ev.BeginFrame(); }
-        Canvas c = app.canvas;
-        Theme t = app.theme;
-        int rowH = TreeView.RowHeight(app);
-        int count = nodes.Count;
-
-        int firstId = app.focus.AllocId();
-        int i = 1;
-        while (i < count) {
-            app.focus.AllocId();
+    /// Rebuilds one child control per node through the template. Children are
+    /// measured here because the tree's measure pass has already walked past
+    /// them by the time a rebuild is noticed.
+    void BuildRows(App app) {
+        if (!rowsStale && builtFor == data.Count) { return; }
+        children = new List<Control>();
+        int i = 0;
+        while (i < data.Count) {
+            Control row = tpl(data[i]);
+            if (row != null) {
+                row.parent = this;
+                row.dock = 1;
+                children.Add(row);
+            }
             i = i + 1;
         }
+        rowsStale = false;
+        builtFor = data.Count;
+        int k = 0;
+        while (k < children.Count) {
+            children[k].MeasureTree(app);
+            k = k + 1;
+        }
+    }
 
-        int sel = selected.Get();
-        int indent = app.Scale(14);
+    /// The filter row, drawn on the tree's own background so it reads as part of
+    /// the tree. Returns the rows area below it.
+    Rect PaintFilter(App app) {
+        int barH = this.FilterHeight(app);
+        Rect rows = Rect.Create(bx, by + barH, bw, bh - barH);
+        if (barH == 0) { return rows; }
+        Theme t = app.theme;
+        int pad = app.Scale(6);
+        int glyph = app.Scale(12);
+        app.canvas.DrawGlyphIn("search", bx + pad, by, glyph, barH,
+            glyph, t.textTertiary);
+        int inX = bx + pad * 2 + glyph;
+        filter.Render(app, inX, by + app.Scale(2),
+            bw - (inX - bx) - pad, barH - app.Scale(4));
+        return rows;
+    }
+
+    /// Selection / expansion / context for one row's box. Returns the id it
+    /// registered so hover state can be painted from it.
+    int RowInteract(App app, int index, Rect row) {
+        int id = app.focus.AllocId();
+        app.hitTester.Register(
+            HitRegion.Create(id, row.x, row.y, row.width, row.height, 0));
+        int hit = app.hitTester.HitTest(app.mouseX, app.mouseY);
+        if (hit != id) { return id; }
+        if (app.ClickAvailable()) {
+            TreeNode n = data[index];
+            bool moved = sel.Get() != index;
+            sel.Set(index);
+            ctxRow = index;
+            if (n.isDir) {
+                n.expanded = !n.expanded;
+                rowsStale = true;
+                if (n.expanded) { Expand.Post(); } else { Collapse.Post(); }
+            }
+            if (moved) { Select.Post(); }
+            if (app.DoubleClickNow()) { Activate.Post(); }
+            app.RequestRedraw();
+            app.window.Wake();
+        } else if (app.EventKind() == 2 && app.window.EventButton() == 1) {
+            // A right-click moves the selection to the row the menu is about
+            // without raising Select: opening a context menu is not a pick.
+            sel.Set(index);
+            ctxRow = index;
+            ctxX = app.mouseX;
+            ctxY = app.mouseY;
+            Context.Post();
+            app.RequestRedraw();
+            app.window.Wake();
+        }
+        return id;
+    }
+
+    /// Checkbox in front of a row: draws the tri-state box and toggles the node
+    /// (and, for a directory, its descendants) when clicked. Returns true when
+    /// it consumed the click, so the row does not also select.
+    bool PaintCheck(App app, int row, int cx, int rowY, int rowH, int box) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int cy = rowY + (rowH - box) / 2;
+        int state = TreeView.CheckState(data, row);
+        if (state == 2) {
+            // Indeterminate is the tree's own state (some descendants checked);
+            // the checked / empty boxes come from Checkbox so they match
+            // everywhere.
+            c.FillRoundRect(cx, cy, box, box, t.borderRadiusSmall, t.primary);
+            c.FillRect(cx + app.Scale(4), cy + box / 2 - app.Scale(1),
+                box - app.Scale(8), app.Scale(2), t.bgPrimary);
+        } else {
+            int lvl = 0;
+            if (state == 1) { lvl = 1000; }
+            Checkbox.PaintBox(app, cx, cy, box, lvl, t.primary, t.borderPrimary);
+        }
+        if (app.EventKind() == 3 && app.window.EventButton() == 0
+            && app.mouseX >= cx && app.mouseX < cx + box
+            && app.mouseY >= rowY && app.mouseY < rowY + rowH) {
+            TreeView.ToggleCheck(data, row);
+            ctxRow = row;
+            Check.Post();
+            app.RequestRedraw();
+            return true;
+        }
+        return false;
+    }
+
+    /// The built-in row: chevron, icon and label, indented by depth.
+    void PaintRow(App app, int row, Rect box, int checkCol, bool active) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        TreeNode n = data[row];
         int fontSize = t.fontSizeMedium;
+        int indent = app.Scale(14);
+        int x0 = box.x + t.paddingSmall + checkCol + n.depth * indent;
+        if (n.isDir) {
+            string chev = "chevron-right";
+            if (n.expanded) { chev = "chevron-down"; }
+            c.DrawGlyphIn(chev, x0, box.y, fontSize, box.height,
+                fontSize - 4, t.textTertiary);
+        }
+        int iconX = x0 + fontSize + t.gapSmall / 2;
+        string ic = n.icon;
+        if (ic == "") {
+            if (n.isDir) { ic = "folder"; } else { ic = "file"; }
+        }
+        int iconColor = t.textSecondary;
+        if (n.isDir) { iconColor = t.primary; }
+        c.DrawGlyphIn(ic, iconX, box.y, fontSize, box.height, fontSize, iconColor);
+        int textX = iconX + fontSize + t.gapSmall;
+        int textColor = t.textPrimary;
+        if (active) { textColor = t.primary; }
+        int textY = box.y + (box.height - Canvas.FontHeight(fontSize)) / 2;
+        int labelMaxW = box.x + box.width - t.paddingSmall - textX;
+        c.DrawText(textX, textY, Ellipsis.Fit(n.label, labelMaxW, fontSize),
+            textColor, fontSize);
+    }
+
+    /// Wheel + clamped scroll offset for `contentH` inside the rows area.
+    int ScrollOffset(App app, Rect rows, int contentH) {
+        Scrollbar.HandleWheel(app, rows.x, rows.y, rows.width, rows.height,
+            contentH, scroll);
+        int maxOff = contentH - rows.height;
+        if (maxOff < 0) { maxOff = 0; }
+        if (scroll.Get() > maxOff) { scroll.Set(maxOff); }
+        if (scroll.Get() < 0) { scroll.Set(0); }
+        return scroll.Get();
+    }
+
+    void PaintRows(App app, Rect rows) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int rowH = this.RowHeight(app);
+        if (rows.height <= 0 || rowH <= 0) { return; }
+        int contentH = this.ContentHeight(app);
+        int off = this.ScrollOffset(app, rows, contentH);
+        bool overflow = contentH > rows.height;
+        int barW = app.Scale(6);
+        int rowW = rows.width;
+        if (overflow) { rowW = rows.width - barW; }
         int box = app.Scale(16);
         int checkCol = 0;
-        if (showChecks) { checkCol = box + app.Scale(6); }
-        int hideDepth = -1;
-        int rowY = area.y - scrollOffset;
+        if (checks) { checkCol = box + app.Scale(6); }
+        int selRow = sel.Get();
         bool checkClick = false;
+        int hideDepth = 0 - 1;
+        int y = rows.y - off;
 
-        // Clip all rows to the viewport so labels/icons and partially-scrolled
-        // rows never paint outside the tree's bounds.
-        c.PushClip(area.x, area.y, area.width, area.height);
+        c.PushClip(rows.x, rows.y, rows.width, rows.height);
         int k = 0;
-        while (k < count) {
-            TreeNode n = nodes[k];
+        while (k < data.Count) {
+            TreeNode n = data[k];
             bool shown = true;
             if (hideDepth >= 0) {
                 if (n.depth > hideDepth) { shown = false; }
-                else { hideDepth = -1; }
+                else { hideDepth = 0 - 1; }
             }
             if (shown) {
-                int id = firstId + k;
-                bool onscreen = rowY + rowH > area.y && rowY < area.y + area.height;
-                if (onscreen) {
-                    bool active = k == sel;
-                    if (active) {
-                        c.FillRect(area.x, rowY, area.width, rowH, t.bgActive);
-                        c.FillRect(area.x, rowY, app.Scale(3), rowH, t.primary);
-                    } else {
-                        int hv = Ui.HoverLevel(app, id);
-                        if (hv > 0) {
-                            c.FillRect(area.x, rowY, area.width, rowH, App.ScaleAlpha(t.bgHover, hv));
-                        }
-                    }
-
-                    int rowLeft = area.x + t.paddingSmall;
-                    if (showChecks) {
-                        int bx = rowLeft;
-                        int by = rowY + (rowH - box) / 2;
-                        int state = TreeView.CheckState(nodes, k);
-                        int bd = t.borderPrimary;
-                        if (state == 2) {
-                            // Indeterminate is the tree's own state (some
-                            // descendants checked); the checked / empty boxes
-                            // come from Checkbox so they match everywhere.
-                            c.FillRoundRect(bx, by, box, box, t.borderRadiusSmall, t.primary);
-                            c.FillRect(bx + app.Scale(4), by + box / 2 - app.Scale(1),
-                                box - app.Scale(8), app.Scale(2), t.bgPrimary);
-                        } else {
-                            int lvl = 0;
-                            if (state == 1) { lvl = 1000; }
-                            Checkbox.PaintBox(app, bx, by, box, lvl, t.primary, bd);
-                        }
-                        // checkbox click toggles the node instead of selecting
-                        if (app.EventKind() == 3
-                            && app.window.EventButton() == 0
-                            && app.mouseX >= bx && app.mouseX < bx + box
-                            && app.mouseY >= rowY && app.mouseY < rowY + rowH) {
-                            TreeView.ToggleCheck(nodes, k);
-                            checkClick = true;
-                            if (ev != null) {
-                                ev.checkedRow = k;
-                                ev.CheckChanged.Raise();
-                            }
-                            app.RequestRedraw();
-                        }
-                    }
-
-                    int x0 = rowLeft + checkCol + n.depth * indent;
-                    if (n.isDir) {
-                        string chev = "chevron-right";
-                        if (n.expanded) { chev = "chevron-down"; }
-                        c.DrawGlyphIn(chev, x0, rowY, fontSize, rowH, fontSize - 4, t.textTertiary);
-                    }
-                    int iconX = x0 + fontSize + t.gapSmall / 2;
-                    string ic = n.icon;
-                    if (ic == "") {
-                        if (n.isDir) { ic = "folder"; } else { ic = "file"; }
-                    }
-                    int iconColor = t.textSecondary;
-                    if (n.isDir) { iconColor = t.primary; }
-                    c.DrawGlyphIn(ic, iconX, rowY, fontSize, rowH, fontSize, iconColor);
-
-                    int textX = iconX + fontSize + t.gapSmall;
-                    int textColor = t.textPrimary;
-                    if (active) { textColor = t.primary; }
-                    int textY = rowY + (rowH - Canvas.FontHeight(fontSize)) / 2;
-                    int labelMaxW = area.x + area.width - t.paddingSmall - textX;
-                    c.DrawText(textX, textY, Ellipsis.Fit(n.label, labelMaxW, fontSize), textColor, fontSize);
-
-                    app.hitTester.Register(HitRegion.Create(id, area.x, rowY, area.width, rowH, 0));
+                int rh = rowH;
+                Control child = null;
+                if (this.Templated() && k < children.Count) {
+                    child = children[k];
+                    rh = this.RowExtent(app, child);
                 }
-                rowY = rowY + rowH;
-                if (n.isDir) { if (!n.expanded) { hideDepth = n.depth; } }
+                bool onscreen = y + rh > rows.y && y < rows.y + rows.height;
+                Rect rb = Rect.Create(rows.x, y, rowW, rh);
+                if (child != null) {
+                    child.Arrange(rb.x, rb.y, rb.width, rb.height);
+                    child.visible = onscreen;
+                }
+                if (onscreen) {
+                    bool active = k == selRow;
+                    if (checks) {
+                        if (this.PaintCheck(app, k, rb.x + t.paddingSmall,
+                                            rb.y, rh, box)) {
+                            checkClick = true;
+                        }
+                    }
+                    int id = 0 - 1;
+                    if (!checkClick) { id = this.RowInteract(app, k, rb); }
+                    if (active) {
+                        c.FillRect(rb.x, rb.y, rowW, rh, t.bgActive);
+                        c.FillRect(rb.x, rb.y, app.Scale(3), rh, t.primary);
+                    } else if (id >= 0 && app.focus.IsHovered(id)) {
+                        c.FillRect(rb.x, rb.y, rowW, rh, t.bgHover);
+                    }
+                    if (child == null) {
+                        this.PaintRow(app, k, rb, checkCol, active);
+                    }
+                }
+                y = y + rh;
+                if (n.isDir && !n.expanded) { hideDepth = n.depth; }
+            } else if (this.Templated() && k < children.Count) {
+                children[k].visible = false;
             }
             k = k + 1;
         }
         c.PopClip();
 
-        // Overlay scrollbar thumb on the right edge when the rows overflow the
-        // viewport (wheel-scroll updates `scrollOffset`); gives a visual cue
-        // that there is more content, like VS Code's minimal scrollbars.
-        int contentH = TreeView.ContentHeight(app, nodes);
-        if (contentH > area.height && area.height > 0) {
-            int barW = app.Scale(6);
-            int barX = area.x + area.width - barW;
-            c.FillRect(barX, area.y, barW, area.height, t.bgActive);
-            int thumbH = area.height * area.height / contentH;
-            int minThumb = app.Scale(24);
-            if (thumbH < minThumb) { thumbH = minThumb; }
-            if (thumbH > area.height) { thumbH = area.height; }
-            int maxScroll = contentH - area.height;
-            int thumbY = area.y;
-            if (maxScroll > 0) {
-                thumbY = area.y + scrollOffset * (area.height - thumbH) / maxScroll;
-            }
-            if (thumbY < area.y) { thumbY = area.y; }
-            if (thumbY + thumbH > area.y + area.height) {
-                thumbY = area.y + area.height - thumbH;
-            }
-            c.FillRect(barX, thumbY, barW, thumbH, t.textTertiary);
+        if (overflow) {
+            Scrollbar.RenderVerticalScroll(app, rows.x + rows.width - barW,
+                rows.y, rows.height, rows.height, contentH, scroll);
         }
-
-        if (!checkClick && app.EventKind() == 3
-            && app.window.EventButton() == 0) {
-            int hit = app.ClickTarget();
-            int idx = hit - firstId;
-            if (idx >= 0 && idx < count) {
-                TreeNode n = nodes[idx];
-                bool moved = selected.Get() != idx;
-                selected.Set(idx);
-                if (n.isDir) { n.expanded = !n.expanded; }
-                if (ev != null) {
-                    ev.clickedRow = idx;
-                    ev.NodeClick.Raise();
-                    if (moved) { ev.SelectionChanged.Raise(); }
-                    if (n.isDir) {
-                        ev.toggledRow = idx;
-                        if (n.expanded) { ev.NodeExpanded.Raise(); }
-                        else { ev.NodeCollapsed.Raise(); }
-                    }
-                }
-                app.RequestRedraw();
-            }
-        }
-
-        // Right button pressed over a row -> select it and report the index so
-        // the caller can raise a context menu at the cursor.
-        int rightIdx = 0 - 1;
-        if (app.EventKind() == 2 && app.window.EventButton() == 1) {
-            int rhit = app.RightPressTarget();
-            int ridx = rhit - firstId;
-            if (ridx >= 0 && ridx < count) {
-                bool moved = selected.Get() != ridx;
-                selected.Set(ridx);
-                rightIdx = ridx;
-                if (ev != null) {
-                    ev.contextRow = ridx;
-                    if (moved) { ev.SelectionChanged.Raise(); }
-                    ev.NodeContext.Raise();
-                }
-                app.RequestRedraw();
-            }
-        }
-        return rightIdx;
     }
 
-    /// Makes the overlay scrollbar Render draws usable with the pointer: drag
-    /// the thumb, or click the track to jump there. Call right after Render
-    /// with the same area and node list, so the bar's hit region registers
-    /// above the row regions (which span the full width) and wins over them.
-    static void HandleScrollbar(App app, Rect area, List<TreeNode> nodes,
-                                SignalInt scroll) {
-        int contentH = TreeView.ContentHeight(app, nodes);
-        if (contentH <= area.height || area.height <= 0) { return; }
-        int id = app.focus.AllocId();
-        int barW = app.Scale(6);
-        // A grab margin on the content side: the bar is 6dp of window-edge
-        // pixels, too thin a target on its own.
-        int grab = app.Scale(6);
-        int barX = area.x + area.width - barW;
-        int maxScroll = contentH - area.height;
-        int thumbH = area.height * area.height / contentH;
-        int minThumb = app.Scale(24);
-        if (thumbH < minThumb) { thumbH = minThumb; }
-        if (thumbH > area.height) { thumbH = area.height; }
-        int travel = area.height - thumbH;
-        if (app.focus.IsPressed(id) && travel > 0) {
-            int rel = app.mouseY - area.y - thumbH / 2;
-            if (rel < 0) { rel = 0; }
-            if (rel > travel) { rel = travel; }
-            int off = rel * maxScroll / travel;
-            if (off != scroll.Get()) {
-                scroll.Set(off);
-                app.RequestRedraw();
-            }
-        }
-        app.hitTester.Register(
-            HitRegion.Create(id, barX - grab, area.y, barW + grab, area.height, 0));
-        // A tree docked to the right edge sits under the frame's resize grip,
-        // which answers the OS hit test first and would swallow every press.
-        app.ReserveEdgeHit(barX - grab, area.y, barW + grab, area.height);
+    // ---- retained hooks -----------------------------------------------------
+
+    override void OnMeasure(App app) {
+        if (this.Templated()) { this.BuildRows(app); }
+        prefH = this.ContentHeight(app) + this.FilterHeight(app);
     }
 
-    /// Index of the last visible descendant of `idx` (exclusive upper bound is
-    /// the first later node whose depth is <= nodes[idx].depth).
+    override void OnPaint(App app) {
+        if (this.Templated()) { this.BuildRows(app); }
+        Rect rows = this.PaintFilter(app);
+        if (data.Count == 0) {
+            this.PaintEmpty(app, rows);
+            return;
+        }
+        this.PaintRows(app, rows);
+    }
+
+    void PaintEmpty(App app, Rect rows) {
+        if (Empty == "") { return; }
+        Theme t = app.theme;
+        app.canvas.DrawStyledText(
+            Style.Of(app, "label", "hint small", Style.SNormal()),
+            rows.x + t.paddingMedium, rows.y + t.paddingSmall, Empty,
+            t.textPrimary, t.fontSizeMedium);
+    }
+
+    override List<string> Events() {
+        List<string> e = Control.CommonEvents();
+        e.Add("Select");
+        e.Add("Activate");
+        e.Add("Expand");
+        e.Add("Collapse");
+        e.Add("Context");
+        e.Add("Check");
+        return e;
+    }
+
+    // ---- node-list math the tree uses on its own model ----------------------
+
+    /// Index of the first node after `idx`'s subtree.
     static int SubtreeEnd(List<TreeNode> nodes, int idx) {
         int d = nodes[idx].depth;
         int j = idx + 1;
@@ -518,53 +651,5 @@ class TreeView {
         int end = TreeView.SubtreeEnd(nodes, idx);
         int j = idx + 1;
         while (j < end) { nodes[j].checked = target; j = j + 1; }
-    }
-
-    /// Indices of every checked node (directories and files).
-    static List<int> CheckedIndices(List<TreeNode> nodes) {
-        List<int> res = new List<int>();
-        int k = 0;
-        while (k < nodes.Count) {
-            if (nodes[k].checked) { res.Add(k); }
-            k = k + 1;
-        }
-        return res;
-    }
-
-    /// Labels of every checked leaf (file) node.
-    static List<string> CheckedLabels(List<TreeNode> nodes) {
-        List<string> res = new List<string>();
-        int k = 0;
-        while (k < nodes.Count) {
-            if (nodes[k].checked && !nodes[k].isDir) { res.Add(nodes[k].label); }
-            k = k + 1;
-        }
-        return res;
-    }
-
-    /// Number of checked leaf (file) nodes.
-    static int CheckedCount(List<TreeNode> nodes) {
-        return TreeView.CheckedLabels(nodes).Count;
-    }
-
-    static void SetAllChecked(List<TreeNode> nodes, bool on) {
-        int k = 0;
-        while (k < nodes.Count) { nodes[k].checked = on; k = k + 1; }
-    }
-
-    static void ExpandAll(List<TreeNode> nodes) {
-        int k = 0;
-        while (k < nodes.Count) {
-            if (nodes[k].isDir) { nodes[k].expanded = true; }
-            k = k + 1;
-        }
-    }
-
-    static void CollapseAll(List<TreeNode> nodes) {
-        int k = 0;
-        while (k < nodes.Count) {
-            if (nodes[k].isDir) { nodes[k].expanded = false; }
-            k = k + 1;
-        }
     }
 }

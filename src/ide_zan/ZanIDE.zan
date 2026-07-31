@@ -1890,46 +1890,18 @@ partial class ZanIDE {
                 }
                 dock.Begin(app, area);
 
-                // Section 1: Explorer (inline filter bar owned by the tree)
+                // Section 1: Explorer. The tree owns its filter row, scrolling,
+                // scrollbar and selection; opening a file and raising the
+                // context menu are handlers.
                 if (explorerTv == null) {
-                    explorerTv = TreeView.Create(treeShow)
-                        .BindSel(treeSel).BindScroll(treeScrollY).BindFilter(treeFilter);
+                    explorerTv = new TreeView();
+                    explorerTv.BindSel(treeSel).WithFilter(treeFilter);
+                    explorerTv.OnSelect(ZanIDE.ExplorerPicked);
+                    explorerTv.OnContext(ZanIDE.ExplorerContext);
                 }
-                Rect treeArea = dock.ContentParked("explorer");
-                treeArea = explorerTv.FilterAt(app, treeArea);
                 treeShow = ZanIDE.FilterNodes(tree, treeFilter.GetText());
-                explorerTv.SetNodes(treeShow);
-                // Wheel-scroll the tree when the pointer is over it. Scroll in
-                // whole-row steps so rows always align to the region top (the
-                // renderer only draws rows fully inside the area).
-                int treeRowH = explorerTv.RowH(app);
-                int treeVis = treeArea.height / treeRowH;
-                if (treeVis < 1) { treeVis = 1; }
-                int treeContentH = explorerTv.ContentH(app);
-                int treeMaxScroll = treeContentH - treeVis * treeRowH;
-                if (treeMaxScroll < 0) { treeMaxScroll = 0; }
-                int tScroll = treeScrollY.Get();
-                bool ownsTreeWheel = app.CaptureWheel(
-                    treeArea.x, treeArea.y, treeArea.width, treeArea.height);
-                if (ownsTreeWheel) {
-                    int td = app.window.EventKeyCode();
-                    int step = td / 120;
-                    if (step == 0) {
-                        if (td > 0) { step = 1; }
-                        else if (td < 0) { step = 0 - 1; }
-                    }
-                    tScroll = tScroll - step * treeRowH;
-                    app.RequestRedraw();
-                }
-                if (tScroll > treeMaxScroll) { tScroll = treeMaxScroll; }
-                if (tScroll < 0) { tScroll = 0; }
-                treeScrollY.Set(tScroll);
-                int trRight = explorerTv.Draw(app, treeArea);
-                explorerTv.ScrollbarAt(app, treeArea);
-                if (trRight >= 0) {
-                    ctxKind = 1; ctxX = app.mouseX; ctxY = app.mouseY;
-                    ctxTarget = trRight; app.RequestRedraw();
-                }
+                explorerTv.Bind(treeShow);
+                explorerTv.RenderInside(app, dock.ContentParked("explorer"));
 
                 // Section 2: Structure / Components. Shows a code outline for
                 // source tabs, and the form's component tree in the designer.
@@ -1968,158 +1940,27 @@ partial class ZanIDE {
                         structTree = ZanIDE.BuildSceneTree(scn, sceneDesigner);
                     }
                     structSel.Set(0 - 1);
-                    lastStructSel = 0 - 1;
                 }
                 if (structTv == null) {
-                    structTv = TreeView.Create(structShow)
-                        .BindSel(structSel).BindScroll(structScrollY).BindFilter(structFilter);
+                    structTv = new TreeView();
+                    structTv.BindSel(structSel).WithFilter(structFilter);
+                    structTv.EmptyText(ZanIDE.T("No symbols", "无符号"));
+                    structTv.OnSelect(ZanIDE.StructurePicked);
                 }
-                Rect stArea = dock.ContentParked("structure");
-                stArea = structTv.FilterAt(app, stArea);
                 structShow = ZanIDE.FilterNodes(structTree, structFilter.GetText());
-                structTv.SetNodes(structShow);
-                int stRowH = structTv.RowH(app);
-                int stVis = stArea.height / stRowH;
-                if (stVis < 1) { stVis = 1; }
-                int stContentH = structTv.ContentH(app);
-                int stMaxScroll = stContentH - stVis * stRowH;
-                if (stMaxScroll < 0) { stMaxScroll = 0; }
-                int stSc = structScrollY.Get();
-                bool ownsStructWheel = app.CaptureWheel(stArea.x, stArea.y, stArea.width, stArea.height);
-                if (ownsStructWheel) {
-                    int std2 = app.window.EventKeyCode();
-                    int ststep = std2 / 120;
-                    if (ststep == 0) {
-                        if (std2 > 0) { ststep = 1; }
-                        else if (std2 < 0) { ststep = 0 - 1; }
-                    }
-                    stSc = stSc - ststep * stRowH;
-                    app.RequestRedraw();
-                }
-                if (stSc > stMaxScroll) { stSc = stMaxScroll; }
-                if (stSc < 0) { stSc = 0; }
-                structScrollY.Set(stSc);
-                if (structShow.Count == 0) {
-                    app.canvas.DrawStyledText(
-                        Style.Of(app, "label", "hint small", Style.SNormal()),
-                        stArea.x + t.paddingMedium, stArea.y + t.paddingSmall, ZanIDE.T("No symbols", "无符号"),
-                        app.theme.textPrimary, app.theme.fontSizeMedium);
-                } else {
-                    structTv.Draw(app, stArea);
-                    structTv.ScrollbarAt(app, stArea);
-                }
-                // Clicking a node navigates: an outline symbol jumps the editor
-                // to its line; a component selects that control in the designer.
-                int stSelV = structSel.Get();
-                if (stSelV != lastStructSel) {
-                    lastStructSel = stSelV;
-                    if (stSelV >= 0 && stSelV < structShow.Count) {
-                        if (designerMode) {
-                            int ci = ZanIDE.OutlineLineOf(structShow[stSelV].path);
-                            List<FormField> flatSel = new List<FormField>();
-                            ZanIDE.FlattenFields(formDesigner.fields, flatSel);
-                            if (ci >= 0 && ci < flatSel.Count) {
-                                formDesigner.sel = flatSel[ci];
-                                app.RequestRedraw();
-                            }
-                        } else if (sceneMode) {
-                            int ci = ZanIDE.OutlineLineOf(structShow[stSelV].path);
-                            List<SceneElement> ordSel = sceneDesigner.OrderedByZ();
-                            if (ci >= 0 && ci < ordSel.Count) {
-                                sceneDesigner.sel = ordSel[ci];
-                                sceneDesigner.selExtra = new List<SceneElement>();
-                                app.RequestRedraw();
-                            }
-                        } else {
-                            int gln = ZanIDE.OutlineLineOf(structShow[stSelV].path);
-                            if (gln >= 0) {
-                                pendingGotoLine = gln; pendingGotoCol = 0;
-                                app.RequestRedraw();
-                            }
-                        }
-                    }
-                }
+                structTv.Bind(structShow);
+                structTv.RenderInside(app, dock.ContentParked("structure"));
 
                 // Section 3: Examples (collapsible tree, click a leaf to open)
                 if (stdlibTv == null) {
-                    stdlibTv = TreeView.Create(exShow)
-                        .BindSel(exSel).BindScroll(exTreeScrollY).BindFilter(exFilter);
+                    stdlibTv = new TreeView();
+                    stdlibTv.BindSel(exSel).WithFilter(exFilter);
+                    stdlibTv.OnSelect(ZanIDE.ExamplePicked);
+                    stdlibTv.OnContext(ZanIDE.StdlibContext);
                 }
-                Rect exArea = dock.ContentParked("stdlib");
-                exArea = stdlibTv.FilterAt(app, exArea);
                 exShow = ZanIDE.FilterNodes(exTree, exFilter.GetText());
-                stdlibTv.SetNodes(exShow);
-                int exRowH = stdlibTv.RowH(app);
-                int exVis = exArea.height / exRowH;
-                if (exVis < 1) { exVis = 1; }
-                int exContentH = stdlibTv.ContentH(app);
-                int exMaxScroll = exContentH - exVis * exRowH;
-                if (exMaxScroll < 0) { exMaxScroll = 0; }
-                int exSc = exTreeScrollY.Get();
-                bool ownsExampleWheel = app.CaptureWheel(
-                    exArea.x, exArea.y, exArea.width, exArea.height);
-                if (ownsExampleWheel) {
-                    int exd = app.window.EventKeyCode();
-                    int exstep = exd / 120;
-                    if (exstep == 0) {
-                        if (exd > 0) { exstep = 1; }
-                        else if (exd < 0) { exstep = 0 - 1; }
-                    }
-                    exSc = exSc - exstep * exRowH;
-                    app.RequestRedraw();
-                }
-                if (exSc > exMaxScroll) { exSc = exMaxScroll; }
-                if (exSc < 0) { exSc = 0; }
-                exTreeScrollY.Set(exSc);
-                int exRight = stdlibTv.Draw(app, exArea);
-                stdlibTv.ScrollbarAt(app, exArea);
-                if (exRight >= 0) {
-                    ctxKind = 2; ctxX = app.mouseX; ctxY = app.mouseY;
-                    ctxTarget = exRight; app.RequestRedraw();
-                }
-
-                int sel = treeSel.Get();
-                if (sel != lastTreeSel) {
-                    lastTreeSel = sel;
-                    if (ctxKind == 0 && sel >= 0 && sel < treeShow.Count) {
-                        TreeNode node = treeShow[sel];
-                        if (!node.isDir) {
-                            ZanIDE.OpenPath(tabNames, tabBodies, tabPaths, activeTab, node.path, node.label);
-                            log.Add("> Opened " + node.path + ".");
-                        }
-                    }
-                }
-
-                // Open an example when its tree leaf is clicked. Real files
-                // (scanned from examples/) open by path so Run/Debug compile
-                // the actual source; the "@ex:" pseudo-leaf is the built-in
-                // component center used only when no examples ship on disk.
-                int exSelV = exSel.Get();
-                if (exSelV != lastExSel) {
-                    lastExSel = exSelV;
-                    if (exSelV >= 0 && exSelV < exShow.Count) {
-                        TreeNode en = exShow[exSelV];
-                        if (!en.isDir && ZanIDE.StartsWith(en.path, "@ex:")) {
-                            int di = ZanIDE.FindTabByPath(tabPaths, "@docs");
-                            if (di >= 0) {
-                                activeTab.Set(di);
-                            } else {
-                                tabNames.Add(ZanIDE.T("Components", "组件中心"));
-                                tabBodies.Add("");
-                                tabPaths.Add("@docs");
-                                activeTab.Set(tabNames.Count - 1);
-                            }
-                            lastActive = 0 - 1;
-                            log.Add("> Opened the GUI component center.");
-                            app.RequestRedraw();
-                        } else if (!en.isDir && en.path != "") {
-                            ZanIDE.OpenPath(tabNames, tabBodies, tabPaths,
-                                activeTab, en.path, en.label);
-                            log.Add("> Opened " + en.path + ".");
-                            app.RequestRedraw();
-                        }
-                    }
-                }
+                stdlibTv.Bind(exShow);
+                stdlibTv.RenderInside(app, dock.ContentParked("stdlib"));
 
                 // The editor is the dock's fixed center panel, so it always has
                 // a rect; every tool panel is parked off-screen while closed.
@@ -3284,110 +3125,33 @@ partial class ZanIDE {
                         }
                     }
                 }
-                // ---- Tools and Examples panels: a filter bar + file tree each.
-                // Single click selects; double-click RUNS a tool (tools are Zan
-                // code) or opens the source in the editor (examples);
-                // right-click on a tool opens its source in the editor. Both
-                // panels are the same view over a different tree, so one pass
-                // renders each (rTab 1 = tools, 2 = examples).
-                int rTab = 1;
-                while (rTab <= 2) {
-                    Rect rtArea = dock.ContentParked("tools");
-                    List<TreeNode> rtNodes = rtToolTree;
-                    SignalInt rtSel = rtToolSel;
-                    SignalInt rtScroll = rtToolScroll;
-                    Input rtFilter = rtToolFilter;
-                    if (rTab == 2) {
-                        rtArea = dock.ContentParked("examples");
-                        rtNodes = rtExTree;
-                        rtSel = rtExSel;
-                        rtScroll = rtExScroll;
-                        rtFilter = rtExFilter;
-                    }
-                    app.FillChrome(rtArea.x, rtArea.y, rtArea.width, rtArea.height, 0, t.bgPrimary);
-                    TreeView rtTv = TreeView.Create(rtNodes)
-                        .BindSel(rtSel).BindScroll(rtScroll).BindFilter(rtFilter);
-                    rtArea = rtTv.FilterAt(app, rtArea);
-                    List<TreeNode> rtShow = ZanIDE.FilterNodes(rtNodes, rtFilter.GetText());
-                    rtTv.SetNodes(rtShow);
-                    int rtRowH = rtTv.RowH(app);
-                    int rtVis = rtArea.height / rtRowH;
-                    if (rtVis < 1) { rtVis = 1; }
-                    int rtContentH = rtTv.ContentH(app);
-                    int rtMax = rtContentH - rtVis * rtRowH;
-                    if (rtMax < 0) { rtMax = 0; }
-                    int rtSc = rtScroll.Get();
-                    if (app.CaptureWheel(rtArea.x, rtArea.y, rtArea.width, rtArea.height)) {
-                        int rtd = app.window.EventKeyCode();
-                        int rtstep = rtd / 120;
-                        if (rtstep == 0) {
-                            if (rtd > 0) { rtstep = 1; }
-                            else if (rtd < 0) { rtstep = 0 - 1; }
-                        }
-                        rtSc = rtSc - rtstep * rtRowH;
-                        app.RequestRedraw();
-                    }
-                    if (rtSc > rtMax) { rtSc = rtMax; }
-                    if (rtSc < 0) { rtSc = 0; }
-                    rtScroll.Set(rtSc);
-                    if (rtShow.Count == 0) {
-                        string rtEmpty = ZanIDE.T("No files found in ", "没有找到文件：")
-                            + ZanIDE.BaseDir() + "/tools";
-                        if (rTab == 2) {
-                            rtEmpty = ZanIDE.T("No examples found.", "没有找到示例。");
-                        }
-                        app.canvas.DrawStyledText(
-                            Style.Of(app, "label", "hint small", Style.SNormal()),
-                            rtArea.x + app.Scale(8), rtArea.y + app.Scale(8), rtEmpty,
-                            app.theme.textPrimary, app.theme.fontSizeMedium);
-                    } else {
-                        int rtRight = rtTv.Draw(app, rtArea);
-                        rtTv.ScrollbarAt(app, rtArea);
-                        // Right-click on any row: open a context menu.
-                        if (rtRight >= 0 && rtRight < rtShow.Count) {
-                            rtCtxShow = rtShow;
-                            if (rTab == 1) { ctxKind = 4; } else { ctxKind = 5; }
-                            ctxX = app.mouseX; ctxY = app.mouseY;
-                            ctxTarget = rtRight; app.RequestRedraw();
-                        }
-                    }
-                    // Double-click on a leaf: run the tool / open the example.
-                    if (app.ClickAvailable() && app.window.EventButton() == 0
-                        && app.DoubleClickNow()
-                        && app.mouseX >= rtArea.x && app.mouseX < rtArea.x + rtArea.width
-                        && app.mouseY >= rtArea.y && app.mouseY < rtArea.y + rtArea.height) {
-                        int rtSelV = rtSel.Get();
-                        if (rtSelV >= 0 && rtSelV < rtShow.Count) {
-                            TreeNode rtn = rtShow[rtSelV];
-                            if (!rtn.isDir && rtn.path != "" && !ZanIDE.StartsWith(rtn.path, "@")) {
-                                if (rTab == 1) {
-                                    // Same DETACHED pipeline as the Run ribbon:
-                                    // compiling a tool takes as long as any
-                                    // other program, and must not freeze the UI.
-                                    string rtT = ZanIDE.RunTarget(rtn.path, root);
-                                    if (buildBusy) {
-                                        Layer.Msg(ZanIDE.T("Build already running…", "构建进行中…"), 2);
-                                    } else if (rtT != "") {
-                                        log.Add(ZanIDE.T("> Running tool ", "> 运行工具 ") + rtn.path + " ...");
-                                        buildBusy = true;
-                                        buildThenRun = true;
-                                        buildExe = ZanIDE.RunBuildBegin(root, rtT);
-                                        buildIsGui = ZanIDE.IsWindowedTarget(root, rtT);
-                                        buildTargetPath = rtn.path;
-                                        buildLogLen = 0;
-                                        dock.Focus("output");
-                                        app.RequestAnimationFrame(80);
-                                    }
-                                } else {
-                                    ZanIDE.OpenPath(tabNames, tabBodies, tabPaths, activeTab, rtn.path, rtn.label);
-                                    log.Add("> Opened " + rtn.path + ".");
-                                }
-                                app.RequestRedraw();
-                            }
-                        }
-                    }
-                    rTab = rTab + 1;
+                // ---- Tools and Examples panels: a tree each, both owning their
+                // filter row, scrolling and selection. A double-click RUNS a
+                // tool (tools are Zan code) or opens an example's source in the
+                // editor; a right-click raises the panel's context menu.
+                if (toolsTv == null) {
+                    toolsTv = new TreeView();
+                    toolsTv.BindSel(rtToolSel).WithFilter(rtToolFilter);
+                    toolsTv.EmptyText(ZanIDE.T("No files found in ", "没有找到文件：")
+                        + ZanIDE.BaseDir() + "/tools");
+                    toolsTv.OnActivate(ZanIDE.ToolActivated);
+                    toolsTv.OnContext(ZanIDE.ToolContext);
+                    examplesTv = new TreeView();
+                    examplesTv.BindSel(rtExSel).WithFilter(rtExFilter);
+                    examplesTv.EmptyText(ZanIDE.T("No examples found.", "没有找到示例。"));
+                    examplesTv.OnActivate(ZanIDE.ExampleActivated);
+                    examplesTv.OnContext(ZanIDE.ExampleContext);
                 }
+                Rect toolsArea = dock.ContentParked("tools");
+                app.FillChrome(toolsArea.x, toolsArea.y, toolsArea.width,
+                    toolsArea.height, 0, t.bgPrimary);
+                toolsTv.Bind(ZanIDE.FilterNodes(rtToolTree, rtToolFilter.GetText()));
+                toolsTv.RenderInside(app, toolsArea);
+                Rect exsArea = dock.ContentParked("examples");
+                app.FillChrome(exsArea.x, exsArea.y, exsArea.width,
+                    exsArea.height, 0, t.bgPrimary);
+                examplesTv.Bind(ZanIDE.FilterNodes(rtExTree, rtExFilter.GetText()));
+                examplesTv.RenderInside(app, exsArea);
                 // Stream new shell output from a launched program into the
                 // Output tab. Poll on the throttled animation clock so a live
                 // session doesn't spin the CPU but output appears promptly.
@@ -3859,7 +3623,6 @@ partial class ZanIDE {
                 tree = new List<TreeNode>();
                 if (haveProject) { tree = ZanIDE.ScanTree(root); }
                 treeSel.Set(-1);
-                lastTreeSel = -1;
             }
         }
         // Persist window + panel sizes so the next launch restores them.
@@ -4265,8 +4028,6 @@ partial class ZanIDE {
         rtExSel = SignalInt.Create(-1);
         rtToolFilter = new Input(ZanIDE.T("Filter...", "筛选..."));
         rtExFilter = new Input(ZanIDE.T("Filter...", "筛选..."));
-        rtToolScroll = SignalInt.Create(0);
-        rtExScroll = SignalInt.Create(0);
         rtCtxShow = new List<TreeNode>();
         // Chat transcript: parallel role ("user"/"assistant"/"error") + text.
         aiRole = new List<string>();
@@ -4360,7 +4121,6 @@ partial class ZanIDE {
         // DETACHED rebuild (never a synchronous compile on the UI thread).
         hotReloadReq = false;
         treeSel = SignalInt.Create(-1);
-        lastTreeSel = -1;
     }
 
     /// Sidebar sections: explorer / structure / stdlib trees, their filters and
@@ -4368,7 +4128,6 @@ partial class ZanIDE {
     void InitSidebarState() {
         // Vertical scroll offsets for the sidebar sections, so long lists stay
         // inside their region (EXPLORER in pixels, COMPONENTS/EXAMPLES in rows).
-        treeScrollY = SignalInt.Create(0);
 
         // Third sidebar section: the standard library as a collapsible tree
         // (browse/open stdlib sources directly, like aardio's 库 pane).
@@ -4384,16 +4143,12 @@ partial class ZanIDE {
         treeShow = new List<TreeNode>();
         structShow = new List<TreeNode>();
         exShow = new List<TreeNode>();
-        lastExSel = -1;
-        exTreeScrollY = SignalInt.Create(0);
 
         // STRUCTURE (code outline): types + their members for the active code
         // file, rebuilt only when the buffer signature changes so navigation
         // stays cheap. Clicking a member jumps the editor to its line.
         structTree = new List<TreeNode>();
         structSel = SignalInt.Create(-1);
-        lastStructSel = -1;
-        structScrollY = SignalInt.Create(0);
         structSig = "@none";
     }
 
