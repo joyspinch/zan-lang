@@ -1,4 +1,5 @@
 using System;
+using System.IO;
 using System.Net.Sockets;
 using System.Net.Http;
 using System.Net.Tls;
@@ -44,6 +45,17 @@ class HttpClient {
 
     [DllImport("crt")]
     static extern int fclose(nint fp);
+
+    // Binary-safe file IO for uploads/resumable downloads (strings are
+    // length-tracked, so fwrite/fread move raw bytes, NULs included).
+    [DllImport("crt")]
+    static extern long fwrite(string buf, long size, long count, nint fp);
+
+    [DllImport("crt")]
+    static extern int fseek(nint fp, int offset, int origin);
+
+    [DllImport("crt")]
+    static extern int ftell(nint fp);
 
     HttpClient() {
         this.host = "";
@@ -663,5 +675,283 @@ class HttpClient {
             HttpClient.AppendText(doneFile, "err: HTTP " + Convert.ToString(status));
         }
         return 0;
+    }
+
+    // True when the final bytes of `s` equal `suf` (ASCII case-insensitive).
+    static bool EndsWithCi(string s, string suf) {
+        int sl = s.Length;
+        int fl = suf.Length;
+        if (sl < fl) { return false; }
+        return HttpClient.AsciiNameEquals(s.Substring(sl - fl, fl), suf, fl);
+    }
+
+    // Maps a filename suffix to a content type, defaulting to octet-stream.
+    static string GuessMime(string name) {
+        if (HttpClient.EndsWithCi(name, ".png")) { return "image/png"; }
+        if (HttpClient.EndsWithCi(name, ".jpg")
+            || HttpClient.EndsWithCi(name, ".jpeg")) { return "image/jpeg"; }
+        if (HttpClient.EndsWithCi(name, ".gif")) { return "image/gif"; }
+        if (HttpClient.EndsWithCi(name, ".txt")) { return "text/plain"; }
+        if (HttpClient.EndsWithCi(name, ".json")) { return "application/json"; }
+        if (HttpClient.EndsWithCi(name, ".pdf")) { return "application/pdf"; }
+        return "application/octet-stream";
+    }
+
+    // Reads an integer-valued response header (case-insensitive, matched at a
+    // line start), e.g. HeaderInt(head, "content-length"). 0 when absent.
+    static int HeaderInt(string head, string lowerName) {
+        int n = head.Length;
+        int nl = lowerName.Length;
+        int i = 0;
+        while (i + nl <= n) {
+            if ((i == 0 || (head[i - 1] & 255) == 10)
+                && HttpClient.AsciiNameEquals(head.Substring(i, nl), lowerName, nl)) {
+                int j = i + nl;
+                while (j < n && ((head[j] & 255) == 32 || (head[j] & 255) == 58)) {
+                    j = j + 1;
+                }
+                int v = 0;
+                bool any = false;
+                while (j < n && (head[j] & 255) >= 48 && (head[j] & 255) <= 57) {
+                    v = v * 10 + ((head[j] & 255) - 48);
+                    j = j + 1;
+                    any = true;
+                }
+                if (any) { return v; }
+            }
+            i = i + 1;
+        }
+        return 0;
+    }
+
+    // Total resource size from a "Content-Range: bytes X-Y/Z" header (the Z),
+    // or 0 when there is no such header.
+    static int RangeTotal(string head) {
+        int n = head.Length;
+        string key = "content-range";
+        int kl = key.Length;
+        int idx = 0 - 1;
+        int i = 0;
+        while (i + kl <= n) {
+            if ((i == 0 || (head[i - 1] & 255) == 10)
+                && HttpClient.AsciiNameEquals(head.Substring(i, kl), key, kl)) {
+                idx = i;
+                i = n;
+            } else {
+                i = i + 1;
+            }
+        }
+        if (idx < 0) { return 0; }
+        int slash = HttpClient.IndexOf(head, "/", idx);
+        if (slash < 0) { return 0; }
+        int v = 0;
+        bool any = false;
+        int j = slash + 1;
+        while (j < n && (head[j] & 255) >= 48 && (head[j] & 255) <= 57) {
+            v = v * 10 + ((head[j] & 255) - 48);
+            j = j + 1;
+            any = true;
+        }
+        if (any) { return v; }
+        return 0;
+    }
+
+    /// <summary>Uploads a local file to <paramref name="path"/> as one
+    /// multipart/form-data field (<paramref name="field"/> is the form name,
+    /// <paramref name="fileName"/> the name reported to the server). Reads the
+    /// whole file into memory, so it suits modest files. Returns the parsed
+    /// response.</summary>
+    async HttpResponse UploadFileAsync(string path, string field,
+            string localPath, string fileName) {
+        string fileData = File.ReadAllText(localPath);
+        string boundary = "----ZanFormBoundary"
+            + Convert.ToString(fileData.Length) + "z" + Convert.ToString(field.Length);
+        StringBuilder sb = new StringBuilder();
+        sb.Append("--");
+        sb.Append(boundary);
+        sb.Append("\r\n");
+        sb.Append("Content-Disposition: form-data; name=\"");
+        sb.Append(field);
+        sb.Append("\"; filename=\"");
+        sb.Append(fileName);
+        sb.Append("\"\r\n");
+        sb.Append("Content-Type: ");
+        sb.Append(HttpClient.GuessMime(fileName));
+        sb.Append("\r\n\r\n");
+        sb.Append(fileData);
+        sb.Append("\r\n--");
+        sb.Append(boundary);
+        sb.Append("--\r\n");
+        string bodyStr = sb.ToString();
+        if (!this.HasHeaderName("Content-Type")) {
+            this.SetHeader("Content-Type",
+                "multipart/form-data; boundary=" + boundary);
+        }
+        string raw = await this.RequestAsync("POST", path, bodyStr);
+        return HttpResponse.Parse(raw);
+    }
+
+    /// <summary>Downloads <paramref name="path"/> to
+    /// <paramref name="localPath"/>, resuming an interrupted transfer: it sends
+    /// `Range: bytes=&lt;existing&gt;-` so a server that supports ranges (HTTP
+    /// 206) continues where the local file left off instead of restarting; a
+    /// server that ignores it (200) restarts from scratch, and 416 means the
+    /// file is already complete. Progress ("&lt;received&gt;/&lt;total&gt;") is
+    /// written to <paramref name="progressFile"/> as bytes arrive. Returns the
+    /// byte count now on disk, or -1 on a connection/handshake failure.</summary>
+    async int DownloadRangeToFileAsync(string path, string localPath,
+            string progressFile) {
+        int have = 0;
+        nint probe = fopen(localPath, "rb");
+        if (probe != 0) {
+            fseek(probe, 0, 2);
+            have = ftell(probe);
+            fclose(probe);
+        }
+
+        Socket.Initialize();
+        TcpClient conn = await TcpClient.ConnectAsync(this.host, this.port, this.timeout);
+        if (conn == null) { return 0 - 1; }
+        TlsStream stream = null;
+        TlsContext ctx = null;
+        if (this.useTls) {
+            if (this.clientCertificateFile.Length > 0
+                && this.clientPrivateKeyFile.Length > 0) {
+                ctx = TlsContext.CreateClientWithCertificate(
+                    this.clientCertificateFile, this.clientPrivateKeyFile);
+            } else {
+                ctx = TlsContext.CreateClient();
+            }
+            if (ctx == null) { conn.Close(); return 0 - 1; }
+            if (!this.verifyTls) { ctx.DisableVerify(); }
+            this.ApplyPinning(ctx);
+            stream = await TlsStream.ConnectAsync(ctx, conn.Sock(), this.host);
+            if (stream == null) { conn.Close(); ctx.Free(); return 0 - 1; }
+        }
+
+        int watch = HttpDeadline.Arm(conn.Sock(), this.timeout);
+        StringBuilder sb = new StringBuilder();
+        sb.Append("GET ");
+        sb.Append(path);
+        sb.Append(" HTTP/1.1\r\n");
+        sb.Append("Host: ");
+        sb.Append(this.host);
+        sb.Append("\r\n");
+        int hi = 0;
+        while (hi < this.defaultHeaders.Count) {
+            sb.Append(this.defaultHeaders[hi]);
+            sb.Append("\r\n");
+            hi = hi + 1;
+        }
+        if (have > 0) {
+            sb.Append("Range: bytes=");
+            sb.Append(Convert.ToString(have));
+            sb.Append("-\r\n");
+        }
+        sb.Append("Connection: close\r\n\r\n");
+        string req = sb.ToString();
+        if (this.useTls) { int _s = await stream.SendAsync(req, req.Length); }
+        else { int _s2 = await conn.SendAsync(req); }
+
+        string head = "";
+        int hb = 0 - 1;
+        while (hb < 0) {
+            string c;
+            if (this.useTls) { c = await stream.RecvAsync(65536); }
+            else { c = await conn.RecvAsync(65536); }
+            if (c.Length == 0) { break; }
+            head = head + c;
+            hb = HttpClient.IndexOf(head, "\r\n\r\n", 0);
+        }
+        int status = HttpClient.HeadStatus(head);
+        bool chunked = HttpClient.HeadIsChunked(head);
+        string pending = "";
+        if (hb >= 0) { pending = head.Substring(hb + 4, head.Length - hb - 4); }
+
+        // 416 Range Not Satisfiable: the file is already fully downloaded.
+        if (status == 416) {
+            HttpDeadline.Disarm(watch);
+            if (this.useTls) { stream.Close(); conn.Close(); ctx.Free(); }
+            else { conn.Close(); }
+            File.WriteAllText(progressFile,
+                Convert.ToString(have) + "/" + Convert.ToString(have));
+            return have;
+        }
+
+        bool resume = status == 206;
+        int total = HttpClient.RangeTotal(head);
+        int written = 0;
+        if (resume) {
+            written = have;
+            if (total <= 0) {
+                int cl = HttpClient.HeaderInt(head, "content-length");
+                if (cl > 0) { total = have + cl; }
+            }
+        } else {
+            have = 0;
+            if (total <= 0) { total = HttpClient.HeaderInt(head, "content-length"); }
+        }
+
+        string mode = "wb";
+        if (resume) { mode = "ab"; }
+        nint outfp = fopen(localPath, mode);
+        if (outfp == 0) {
+            HttpDeadline.Disarm(watch);
+            if (this.useTls) { stream.Close(); conn.Close(); ctx.Free(); }
+            else { conn.Close(); }
+            return 0 - 1;
+        }
+
+        bool finished = false;
+        while (!finished) {
+            if (chunked) {
+                bool progressed = true;
+                while (progressed) {
+                    progressed = false;
+                    int crlf = HttpClient.IndexOf(pending, "\r\n", 0);
+                    if (crlf >= 0) {
+                        int size = HttpClient.ParseHex(pending.Substring(0, crlf));
+                        if (size == 0) {
+                            finished = true;
+                        } else {
+                            int need = crlf + 2 + size + 2;
+                            if (pending.Length >= need) {
+                                string piece = pending.Substring(crlf + 2, size);
+                                int _w = (int)fwrite(piece, 1, piece.Length, outfp);
+                                written = written + piece.Length;
+                                pending = pending.Substring(need, pending.Length - need);
+                                progressed = true;
+                            }
+                        }
+                    }
+                }
+            } else {
+                if (pending.Length > 0) {
+                    int _w2 = (int)fwrite(pending, 1, pending.Length, outfp);
+                    written = written + pending.Length;
+                    pending = "";
+                }
+                if (total > 0 && written >= total) { finished = true; }
+            }
+            File.WriteAllText(progressFile,
+                Convert.ToString(written) + "/" + Convert.ToString(total));
+            if (!finished) {
+                string c;
+                if (this.useTls) { c = await stream.RecvAsync(65536); }
+                else { c = await conn.RecvAsync(65536); }
+                if (c.Length == 0) { finished = true; }
+                else { pending = pending + c; }
+            }
+        }
+        fclose(outfp);
+
+        bool late = HttpDeadline.Expired(watch);
+        HttpDeadline.Disarm(watch);
+        if (this.useTls) { stream.Close(); conn.Close(); ctx.Free(); }
+        else { conn.Close(); }
+        File.WriteAllText(progressFile,
+            Convert.ToString(written) + "/" + Convert.ToString(total));
+        if (late) { return 0 - 1; }
+        return written;
     }
 }
