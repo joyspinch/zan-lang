@@ -178,14 +178,54 @@ class AiAgent {
             return AiAgent.EditFile(root, v.Str("path", ""),
                                     v.Str("old", ""), v.Str("new", ""));
         }
-        if (tool == "build" || tool == "run" || tool == "ui_check") {
-            // These need the IDE's async build / run machinery, so the panel
+        if (tool == "build" || tool == "run" || tool == "ui_check"
+            || tool == "plan") {
+            // These need the IDE's own state / async machinery, so the panel
             // drives them directly; they never reach here.
             return "error: '" + tool + "' is run by the IDE, not this dispatch.";
         }
         return "error: unknown tool '" + tool + "'. Available: read_file,"
-            + " list_dir, grep, repo_map, write_file, edit_file, build, run,"
-            + " ui_check.";
+            + " list_dir, grep, repo_map, plan, write_file, edit_file, build,"
+            + " run, ui_check.";
+    }
+
+    /// Fills `outText` / `outDone` from a `plan` tool call's `items` array,
+    /// replacing whatever they held. Each item is either a short step string
+    /// (optionally prefixed "[x] " / "[ ] " to mark it done) or an object
+    /// {"t"|"text", "d"|"done"}. Returns the resulting step count.
+    static int ParsePlan(string json, List<string> outText, List<int> outDone) {
+        JsonValue v = JsonValue.ParseLenient(json);
+        if (v == null) { return 0; }
+        JsonValue items = v.Get("items");
+        if (items == null || !items.IsArray()) { return 0; }
+        int i = 0;
+        while (i < items.Count()) {
+            JsonValue it = items.At(i);
+            string txt = "";
+            bool done = false;
+            if (it.IsObject()) {
+                txt = it.Str("t", it.Str("text", ""));
+                done = it.Bool("d", it.Bool("done", false));
+            } else {
+                txt = it.AsString("");
+                if (txt.Length >= 4) {
+                    string pre = txt.Substring(0, 4);
+                    if (pre == "[x] " || pre == "[X] ") {
+                        done = true;
+                        txt = txt.Substring(4, txt.Length - 4);
+                    } else if (pre == "[ ] ") {
+                        txt = txt.Substring(4, txt.Length - 4);
+                    }
+                }
+            }
+            txt = AiAgent.Trim(txt);
+            if (txt != "") {
+                outText.Add(txt);
+                if (done) { outDone.Add(1); } else { outDone.Add(0); }
+            }
+            i = i + 1;
+        }
+        return outText.Count;
     }
 
     /// True for a tool that changes the project or runs code, so the panel
@@ -212,6 +252,7 @@ class AiAgent {
             return "grep \"" + v.Str("pattern", "") + "\"";
         }
         if (tool == "repo_map") { return "repo_map"; }
+        if (tool == "plan") { return "plan"; }
         if (tool == "build") { return "build"; }
         if (tool == "run") { return "run"; }
         if (tool == "ui_check") { return "ui_check"; }
@@ -509,6 +550,11 @@ class AiAgent {
             + "- grep {pattern, path, ext}: substring search across the project;"
             + " returns path:line: text.\n"
             + "- repo_map {}: outline of the whole codebase, when available.\n"
+            + "- plan {items}: show/update the task-plan checklist above the"
+            + " chat. `items` is an array of short step strings (prefix"
+            + " \"[x] \" to mark a step done); it replaces the current plan."
+            + " For a multi-step task, lay out a brief plan first, then resend"
+            + " it with steps marked done as you finish them. Runs silently.\n"
             + "Action tools (the IDE asks the user to approve each one first,"
             + " unless they turned on Auto-execute):\n"
             + "- edit_file {path, old, new}: replace the UNIQUE occurrence of"

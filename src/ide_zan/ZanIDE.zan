@@ -2695,7 +2695,7 @@ partial class ZanIDE {
                     app.canvas.FillRect(rp.x + aiSideW, rp.y, 1, rp.height, t.divider);
                     if (aiBusy.Get() == 0 && sAct.deleted >= 0
                         && aiSessions.Count > 1) {
-                        aiSessions[aiSessCur] = ChatArea.ChatPack(aiRole, aiText);
+                        aiSessions[aiSessCur] = ChatArea.ChatPack(aiRole, aiText, aiPlanText, aiPlanDone);
                         int sDel = sAct.deleted;
                         aiSessions.RemoveAt(sDel);
                         int sNewCur = aiSessCur;
@@ -2707,26 +2707,32 @@ partial class ZanIDE {
                         }
                         aiRole = new List<string>();
                         aiText = new List<string>();
-                        ChatArea.ChatUnpack(aiSessions[sNewCur], aiRole, aiText);
+                        aiPlanText = new List<string>();
+                        aiPlanDone = new List<int>();
+                        ChatArea.ChatUnpack(aiSessions[sNewCur], aiRole, aiText, aiPlanText, aiPlanDone);
                         aiSessCur = sNewCur;
                         aiCacheKey = "";
                         aiScroll.Set(0);
                         app.RequestRedraw();
                     } else if (aiBusy.Get() == 0 && sAct.created) {
-                        aiSessions[aiSessCur] = ChatArea.ChatPack(aiRole, aiText);
+                        aiSessions[aiSessCur] = ChatArea.ChatPack(aiRole, aiText, aiPlanText, aiPlanDone);
                         aiSessions.Add("");
                         aiRole = new List<string>();
                         aiText = new List<string>();
+                        aiPlanText = new List<string>();
+                        aiPlanDone = new List<int>();
                         aiSessCur = aiSessions.Count - 1;
                         aiCacheKey = "";
                         aiScroll.Set(0);
                         app.RequestRedraw();
                     } else if (aiBusy.Get() == 0 && sAct.selected >= 0
                         && sAct.selected != aiSessCur) {
-                        aiSessions[aiSessCur] = ChatArea.ChatPack(aiRole, aiText);
+                        aiSessions[aiSessCur] = ChatArea.ChatPack(aiRole, aiText, aiPlanText, aiPlanDone);
                         aiRole = new List<string>();
                         aiText = new List<string>();
-                        ChatArea.ChatUnpack(aiSessions[sAct.selected], aiRole, aiText);
+                        aiPlanText = new List<string>();
+                        aiPlanDone = new List<int>();
+                        ChatArea.ChatUnpack(aiSessions[sAct.selected], aiRole, aiText, aiPlanText, aiPlanDone);
                         aiSessCur = sAct.selected;
                         aiCacheKey = "";
                         aiScroll.Set(0);
@@ -2800,8 +2806,13 @@ partial class ZanIDE {
                     string chatModel = aiProfModels[aiProfActive];
                     int selMi = aiModelSel.Selected();
                     if (selMi >= 0 && selMi < aiModelOpts.Count) { chatModel = aiModelOpts[selMi]; }
-                    Rect aiChat = Rect.Create(rBody.x, rBody.y + aiHdrH,
-                        rBody.width, rBody.height - aiHdrH);
+                    int aiPlanH = AiPlanHeight(app);
+                    if (aiPlanH > 0) {
+                        AiRenderPlan(app, Rect.Create(rBody.x, rBody.y + aiHdrH,
+                            rBody.width, aiPlanH));
+                    }
+                    Rect aiChat = Rect.Create(rBody.x, rBody.y + aiHdrH + aiPlanH,
+                        rBody.width, rBody.height - aiHdrH - aiPlanH);
                     // Wheel-scroll the transcript (lines up from the bottom).
                     bool ownsAiWheel = app.CaptureWheel(aiChat.x, aiChat.y, aiChat.width, aiChat.height);
                     if (ownsAiWheel) {
@@ -4276,6 +4287,9 @@ partial class ZanIDE {
         // Chat transcript: parallel role ("user"/"assistant"/"error") + text.
         aiRole = new List<string>();
         aiText = new List<string>();
+        aiPlanText = new List<string>();
+        aiPlanDone = new List<int>();
+        aiPlanCollapsed = false;
         aiScroll = SignalInt.Create(0);
         // 1 while a completion request is in flight (curl runs detached and the
         // event loop polls for its done-marker file, so the UI never blocks).
@@ -4307,6 +4321,7 @@ partial class ZanIDE {
         aiApplyBtn = new Button { Text = ZanIDE.T("Insert code", "插入代码"), Icon = "code", Class = "small" };
         // "Replace file" swaps the whole active file for the last AI code block.
         aiReplaceBtn = new Button { Text = ZanIDE.T("Replace file", "替换整文件"), Class = "small" };
+        aiPlanClearBtn = new Button { Text = ZanIDE.T("Clear plan", "清空计划"), Class = "small" };
     }
 
     /// Runs one assistant tool call inside the open project and continues the
@@ -4317,6 +4332,19 @@ partial class ZanIDE {
     /// compiler output back. A launch error stops the loop.
     void AiDispatchTool(string call) {
         string tool = AiAgent.ToolName(call);
+        if (tool == "plan") {
+            aiPlanText = new List<string>();
+            aiPlanDone = new List<int>();
+            int nsteps = AiAgent.ParsePlan(call, aiPlanText, aiPlanDone);
+            aiRole.Add("tool");
+            aiText.Add(AiAgent.Describe(call) + "\nplan updated: "
+                + Convert.ToString(nsteps) + " step(s).");
+            string plerr = ZanIDE.AiLaunch(aiRole, aiText, aiRunCtxName,
+                aiRunCtxCode, root, aiProfBases[aiProfActive],
+                aiProfKeys[aiProfActive], aiRunModel);
+            if (plerr != "") { aiRole.Add("error"); aiText.Add(plerr); aiBusy.Set(0); }
+            return;
+        }
         if (tool == "build" || tool == "run" || tool == "ui_check") {
             string apB = ZanIDE.PathOf(tabPaths, activeTab);
             string rpB = ZanIDE.RibbonRunTarget(apB, root);
@@ -4371,6 +4399,93 @@ partial class ZanIDE {
             aiRunCtxCode, root, aiProfBases[aiProfActive],
             aiProfKeys[aiProfActive], aiRunModel);
         if (terr != "") { aiRole.Add("error"); aiText.Add(terr); aiBusy.Set(0); }
+    }
+
+    /// Height of the task-plan strip drawn above the chat, or 0 when the
+    /// current session has no plan. G: a per-session checklist that survives
+    /// session switching and context compaction (it lives in the session
+    /// record, not the transcript).
+    int AiPlanHeight(App app) {
+        if (aiPlanText.Count == 0) { return 0; }
+        int hdr = app.Scale(24);
+        if (aiPlanCollapsed) { return hdr; }
+        int rows = aiPlanText.Count;
+        if (rows > 8) { rows = 8; }
+        return hdr + rows * app.Scale(20) + app.Scale(6);
+    }
+
+    /// Draws the task-plan checklist into `area`: a header (progress count +
+    /// collapse + Clear) and one clickable checkbox row per step. Clicking a
+    /// row toggles its done state; clicking the header collapses the panel.
+    void AiRenderPlan(App app, Rect area) {
+        Theme t = app.theme;
+        Canvas c = app.canvas;
+        int pad = app.Scale(6);
+        int hdr = app.Scale(24);
+        app.FillChrome(area.x, area.y, area.width, hdr, 0, t.bgTertiary);
+        int done = 0;
+        int di = 0;
+        while (di < aiPlanDone.Count) {
+            if (aiPlanDone[di] != 0) { done = done + 1; }
+            di = di + 1;
+        }
+        string caret = "v ";
+        if (aiPlanCollapsed) { caret = "> "; }
+        string title = caret + ZanIDE.T("Plan", "任务计划") + " "
+            + Convert.ToString(done) + "/" + Convert.ToString(aiPlanText.Count);
+        c.DrawText(area.x + pad, area.y + app.Scale(5), title, t.textPrimary,
+            Style.Of(app, "label", "small", Style.SNormal())
+                .FontOr(app.theme.fontSizeSmall));
+        int btnW = app.Scale(72);
+        int clrId = aiPlanClearBtn.Render(app,
+            area.x + area.width - btnW - pad, area.y + app.Scale(2), btnW);
+        bool clrClicked = Ui.Clicked(app, clrId);
+        Rect hdrHit = Rect.Create(area.x, area.y,
+            area.width - btnW - pad * 2, hdr);
+        if (app.ClickAvailable() && hdrHit.Contains(app.mouseX, app.mouseY)) {
+            aiPlanCollapsed = !aiPlanCollapsed;
+            app.ClaimClick();
+            app.RequestRedraw();
+        }
+        if (clrClicked) {
+            aiPlanText = new List<string>();
+            aiPlanDone = new List<int>();
+            app.RequestRedraw();
+            return;
+        }
+        c.FillRect(area.x, area.y + area.height - 1, area.width, 1, t.divider);
+        if (aiPlanCollapsed) { return; }
+        int rowH = app.Scale(20);
+        int box = app.Scale(12);
+        c.PushClip(area.x, area.y + hdr, area.width, area.height - hdr);
+        int idx = 0;
+        while (idx < aiPlanText.Count) {
+            int ry = area.y + hdr + idx * rowH;
+            if (ry + rowH > area.y + area.height) { break; }
+            int bx = area.x + pad;
+            int by = ry + (rowH - box) / 2;
+            bool dn = idx < aiPlanDone.Count && aiPlanDone[idx] != 0;
+            app.FillChrome(bx, by, box, box, app.Scale(2), t.divider);
+            int fill = t.bgPrimary;
+            if (dn) { fill = t.success; }
+            app.FillChrome(bx + app.Scale(1), by + app.Scale(1),
+                box - app.Scale(2), box - app.Scale(2), app.Scale(1), fill);
+            int col = t.textPrimary;
+            if (dn) { col = t.textTertiary; }
+            c.DrawText(bx + box + pad, ry + app.Scale(3), aiPlanText[idx], col,
+                Style.Of(app, "label", "small", Style.SNormal())
+                    .FontOr(app.theme.fontSizeSmall));
+            Rect rowHit = Rect.Create(area.x, ry, area.width, rowH);
+            if (app.ClickAvailable() && rowHit.Contains(app.mouseX, app.mouseY)
+                && idx < aiPlanDone.Count) {
+                if (aiPlanDone[idx] != 0) { aiPlanDone[idx] = 0; }
+                else { aiPlanDone[idx] = 1; }
+                app.ClaimClick();
+                app.RequestRedraw();
+            }
+            idx = idx + 1;
+        }
+        c.PopClip();
     }
 
     /// AI assistant: provider profiles, chat sessions, transcript cache and the
