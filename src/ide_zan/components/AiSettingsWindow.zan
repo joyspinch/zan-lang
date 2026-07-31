@@ -23,6 +23,9 @@ class AiSettingsWindow {
     List<string> lists;
     /// Per profile: JSON map `<model id> -> {ctx, out}` (token counts).
     List<string> limits;
+    /// The current profile's fetched models as row entities (model/ctx/out),
+    /// the single source the limits table renders and commits from.
+    List<ModelLimitRow> modelRows;
     int active;
     int sel;
     int modelSel;
@@ -70,6 +73,9 @@ class AiSettingsWindow {
     }
 
     string DocJson() {
+        // Rebuild the limits-table entities + their bound inputs for the
+        // current profile before laying out (fetch/add/switch all rebuild).
+        this.SeedModelLimits();
         // ---- Left column: saved configurations + presets ----
         UiNode left = UiNode.Column().Dock("left").Width(230).Gap(6);
         left.Child(UiNode.Label(AiSettingsWindow.T(lang, "Configurations", "配置列表"))
@@ -132,19 +138,6 @@ class AiSettingsWindow {
         modelRow.Child(UiNode.Of("Input").Dock("fill").Bind("model")
             .Str("hint", "gpt-4o-mini"));
         right.Child(modelRow);
-        // Per-model limits (apply to the model in the field above). Both are
-        // token counts; blank means "use the built-in default".
-        right.Child(UiNode.Label(AiSettingsWindow.T(lang,
-            "This model: context length (tokens, default 200000)",
-            "该模型：上下文长度（tokens，默认 200000）"))
-            .Class("secondary small").Dock("top").Height(18));
-        right.Child(UiNode.Of("Input").Dock("top").Height(30).Bind("ctx")
-            .Str("hint", "200000"));
-        right.Child(UiNode.Label(AiSettingsWindow.T(lang,
-            "Max output (tokens)", "最大输出（tokens）"))
-            .Class("secondary small").Dock("top").Height(18));
-        right.Child(UiNode.Of("Input").Dock("top").Height(30).Bind("out")
-            .Str("hint", "4096"));
         right.Child(UiNode.Of("Label").Dock("top").Height(18)
             .BindProp("status", "text"));
         // Actions are pinned to the bottom, reserved before the model list
@@ -155,24 +148,38 @@ class AiSettingsWindow {
         actRow.Child(UiNode.Button(AiSettingsWindow.T(lang, "Save & enable", "保存并启用"))
             .OnClick("enable").Class("primary").Dock("left").Width(150));
         right.Child(actRow);
-        // Fetched models as an inline, always-clickable list (no popup).
+        // Per-model limits as a table: one entity (ModelLimitRow) per fetched
+        // model, columns = model / context length / max output. Clicking the
+        // model cell also picks it as the default. The list scrolls.
         List<string> mopts = ZanIDE.SplitList(lists[SelClamped()]);
         if (mopts.Count > 0) {
-            right.Child(UiNode.Label(AiSettingsWindow.T(lang, "Pick a model", "选择模型"))
+            right.Child(UiNode.Label(AiSettingsWindow.T(lang,
+                "Pick a model; set its context / max-output (tokens, blank = default 200000)",
+                "选择模型；设置其上下文 / 最大输出（tokens，留空 = 默认 200000）"))
                 .Class("secondary small").Dock("top").Height(18));
-            int cap = mopts.Count;
-            if (cap > 12) { cap = 12; }
+            UiNode hdr = UiNode.Row().Dock("top").Height(24).Gap(8);
+            hdr.Child(UiNode.Label(AiSettingsWindow.T(lang, "Max out", "最大输出"))
+                .Class("secondary small").Dock("right").Width(92));
+            hdr.Child(UiNode.Label(AiSettingsWindow.T(lang, "Context", "上下文"))
+                .Class("secondary small").Dock("right").Width(92));
+            hdr.Child(UiNode.Label(AiSettingsWindow.T(lang, "Model", "模型"))
+                .Class("secondary small").Dock("fill"));
+            right.Child(hdr);
+            UiNode tbl = UiNode.Of("ScrollColumn").Dock("fill").Gap(4);
             int m = 0;
-            while (m < cap) {
-                right.Child(UiNode.Of("Segment").Index(m).Str("label", mopts[m])
-                    .Dock("top").Height(30).Bind("modelsel"));
+            while (m < modelRows.Count) {
+                string mi = Convert.ToString(m);
+                UiNode trow = UiNode.Row().Dock("top").Height(32).Gap(8);
+                trow.Child(UiNode.Of("Input").Dock("right").Width(92)
+                    .Bind("out_" + mi).Str("hint", ""));
+                trow.Child(UiNode.Of("Input").Dock("right").Width(92)
+                    .Bind("ctx_" + mi).Str("hint", "200000"));
+                trow.Child(UiNode.Of("Segment").Index(m).Str("label", modelRows[m].model)
+                    .Dock("fill").Bind("modelsel"));
+                tbl.Child(trow);
                 m = m + 1;
             }
-            if (mopts.Count > cap) {
-                right.Child(UiNode.Label(AiSettingsWindow.T(
-                    lang, "... more: type it above", "…更多请在上方手填"))
-                    .Class("secondary small").Dock("top").Height(18));
-            }
+            right.Child(tbl);
         }
 
         UiNode row = UiNode.Row().Dock("fill").Pad(16).Gap(14);
@@ -210,15 +217,41 @@ class AiSettingsWindow {
         model.Set("base", JsonValue.NewStr(bases[i]));
         model.Set("key", JsonValue.NewStr(keys[i]));
         model.Set("model", JsonValue.NewStr(models[i]));
-        this.LoadModelLimits(models[i]);
+        this.SeedModelLimits();
         this.SyncModelSel();
     }
 
-    /// Loads a model's saved context / output limits into the bound inputs.
-    void LoadModelLimits(string mdl) {
+    /// Builds one ModelLimitRow entity per fetched model of the current profile
+    /// and seeds its bound inputs (ctx_i / out_i). This is the single source the
+    /// limits table renders from and commits back to.
+    void SeedModelLimits() {
         int i = SelClamped();
-        model.Set("ctx", JsonValue.NewStr(ZanIDE.AiLimitStr(limits[i], mdl, "ctx")));
-        model.Set("out", JsonValue.NewStr(ZanIDE.AiLimitStr(limits[i], mdl, "out")));
+        List<string> mopts = ZanIDE.SplitList(lists[i]);
+        modelRows = new List<ModelLimitRow>();
+        int m = 0;
+        while (m < mopts.Count) {
+            int cv = ZanIDE.AiLimitInt(limits[i], mopts[m], "ctx");
+            int ov = ZanIDE.AiLimitInt(limits[i], mopts[m], "out");
+            modelRows.Add(ModelLimitRow.Of(mopts[m], cv, ov));
+            string mi = Convert.ToString(m);
+            model.Set("ctx_" + mi, JsonValue.NewStr(ModelLimitRow.Fmt(cv)));
+            model.Set("out_" + mi, JsonValue.NewStr(ModelLimitRow.Fmt(ov)));
+            m = m + 1;
+        }
+    }
+
+    /// Reads the table's bound inputs back into the profile's limits map.
+    void CommitModelLimits() {
+        int i = SelClamped();
+        int m = 0;
+        while (m < modelRows.Count) {
+            string mi = Convert.ToString(m);
+            limits[i] = ZanIDE.AiLimitSet(limits[i], modelRows[m].model, "ctx",
+                model.PathGet("ctx_" + mi).AsString(""));
+            limits[i] = ZanIDE.AiLimitSet(limits[i], modelRows[m].model, "out",
+                model.PathGet("out_" + mi).AsString(""));
+            m = m + 1;
+        }
     }
 
     /// Points the inline model list at the profile's current default model
@@ -243,12 +276,7 @@ class AiSettingsWindow {
         bases[i] = model.PathGet("base").AsString(bases[i]);
         keys[i] = model.PathGet("key").AsString(keys[i]);
         models[i] = model.PathGet("model").AsString(models[i]);
-        // The limit inputs apply to the current default model.
-        string mdl = models[i];
-        limits[i] = ZanIDE.AiLimitSet(limits[i], mdl, "ctx",
-            model.PathGet("ctx").AsString(""));
-        limits[i] = ZanIDE.AiLimitSet(limits[i], mdl, "out",
-            model.PathGet("out").AsString(""));
+        this.CommitModelLimits();
     }
 
     void Persist() {
@@ -376,7 +404,6 @@ class AiSettingsWindow {
             List<string> mo = ZanIDE.SplitList(lists[SelClamped()]);
             if (nextModel >= 0 && nextModel < mo.Count) {
                 model.Set("model", JsonValue.NewStr(mo[nextModel]));
-                this.LoadModelLimits(mo[nextModel]);
             }
             host.RequestRedraw();
         }
@@ -485,7 +512,6 @@ class AiSettingsWindow {
                     if (models[i] == "") {
                         models[i] = gm[0];
                         model.Set("model", JsonValue.NewStr(gm[0]));
-                        this.LoadModelLimits(gm[0]);
                     }
                     this.Persist();
                     this.SyncModelSel();
