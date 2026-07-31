@@ -300,6 +300,9 @@ partial class ZanIDE {
     static string AiReqPath() { return ZanIDE.UserConfigDir() + "/ai_req.json"; }
     static string AiRespPath() { return ZanIDE.UserConfigDir() + "/ai_resp.json"; }
     static string AiDonePath() { return ZanIDE.UserConfigDir() + "/ai_done.txt"; }
+    /// The decoded response body of a streaming chat request, appended to by
+    /// the Net worker thread and tailed by the panel each frame.
+    static string AiStreamPath() { return ZanIDE.UserConfigDir() + "/ai_stream.txt"; }
 
     /// Reads `key = value` from `content` (same line format as zan.proj).
     static string KvField(string content, string key) {
@@ -614,7 +617,8 @@ partial class ZanIDE {
         if (baseUrl == "") { baseUrl = "https://api.openai.com/v1"; }
         if (model == "") { model = "gpt-4o-mini"; }
         StringBuilder body = new StringBuilder();
-        body.Append("{\"model\":\"" + ZanIDE.JsonEsc(model) + "\",\"messages\":[");
+        body.Append("{\"model\":\"" + ZanIDE.JsonEsc(model)
+            + "\",\"stream\":true,\"messages\":[");
         // The standing instructions, the tool protocol, the open file and the
         // RepoMap outline all come from the agent layer, so the loop that runs
         // the tools and the prompt that describes them can never drift apart.
@@ -639,20 +643,15 @@ partial class ZanIDE {
         }
         body.Append("]}");
         Directory.CreateDirectoryRecursive(ZanIDE.UserConfigDir());
+        // The request is made with the Net standard library on a background
+        // thread that streams the decoded response into AiStreamPath as it
+        // arrives; the panel tails that file each frame for incremental output.
+        // Certificate verification stays on (the platform trust store is
+        // bridged into OpenSSL by the Tls layer). AiReqPath is kept as a
+        // debugging artifact of the exact body sent.
         File.WriteAllText(ZanIDE.AiReqPath(), body.ToString());
-        if (File.Exists(ZanIDE.AiRespPath())) { File.Delete(ZanIDE.AiRespPath()); }
-        if (File.Exists(ZanIDE.AiDonePath())) { File.Delete(ZanIDE.AiDonePath()); }
-        string cmd = "curl -s --max-time 180 \"" + baseUrl + "/chat/completions\""
-            + " -H \"Content-Type: application/json\""
-            + " -H \"Authorization: Bearer " + key + "\""
-            + " --data-binary @\"" + ZanIDE.AiReqPath() + "\""
-            + " -o \"" + ZanIDE.AiRespPath() + "\"";
-        #if WINDOWS
-        Process.RunDetached("(" + cmd + ") & echo ok > \"" + ZanIDE.AiDonePath() + "\"");
-        #else
-        Process.RunDetached("(" + cmd + ") ; echo ok > \"" + ZanIDE.AiDonePath() + "\"");
-        #endif
-        return "";
+        return AiNet.Start(baseUrl, "/chat/completions", key, body.ToString(),
+            ZanIDE.AiStreamPath(), ZanIDE.AiDonePath(), 180000, true);
     }
 
     /// Extracts the assistant reply (or a readable error) from the response.

@@ -3451,83 +3451,147 @@ partial class ZanIDE {
                     }
                     app.RequestAnimationFrame(250);
                 }
-                // Poll the in-flight AI request: curl runs detached and drops a
-                // done-marker when the response file is complete. Two guards
-                // keep it from hanging: a settled response file is accepted even
-                // if the marker was lost, and a wait that produces neither is
-                // timed out so the panel always leaves the 'thinking' state.
+                // Poll the in-flight AI request. The Net worker thread streams
+                // the decoded response body into AiStreamPath as it arrives and
+                // writes "ok"/"err: ..." to AiDonePath when it ends. Each frame
+                // the panel tails the stream file to show the answer building up
+                // live, and a wall-clock backstop times the wait out so the
+                // panel never hangs on 'thinking' if the worker dies silently.
                 if (aiBusy.Get() == 1) {
                     bool aiToolRunning = buildBusy || aiUiRunning || runStreaming;
                     if (aiToolRunning) {
                         aiWaitStart = 0;
-                        aiChatFirstResp = 0;
                     }
                     bool aiMarker = File.Exists(ZanIDE.AiDonePath());
-                    bool aiRespReady = false;
                     bool aiTimedOut = false;
                     if (!aiToolRunning && !aiMarker) {
-                        int aiNow = Window.GetTickMs();
-                        if (File.Exists(ZanIDE.AiRespPath())) {
-                            if (aiChatFirstResp == 0) { aiChatFirstResp = aiNow; }
-                            if (aiNow - aiChatFirstResp > 1200) { aiRespReady = true; }
+                        // Live tail: re-parse only when the decoded body grew,
+                        // and drop a stale live bubble if a new request just
+                        // truncated the file.
+                        string sraw = "";
+                        if (File.Exists(ZanIDE.AiStreamPath())) {
+                            sraw = File.ReadAllText(ZanIDE.AiStreamPath());
+                        }
+                        if (sraw.Length < aiStreamLen) {
+                            if (aiStreamMsgIdx >= 0
+                                && aiStreamMsgIdx == aiText.Count - 1) {
+                                aiRole.RemoveAt(aiStreamMsgIdx);
+                                aiText.RemoveAt(aiStreamMsgIdx);
+                            }
+                            aiStreamMsgIdx = 0 - 1;
+                            aiStreamLen = 0;
+                        }
+                        if (sraw.Length != aiStreamLen) {
+                            aiStreamLen = sraw.Length;
+                            SseAnswer pa = AiAgent.ParseSse(sraw);
+                            string live = pa.content;
+                            if (live == "" && pa.reasoning != "") {
+                                live = ZanIDE.T("(thinking) ", "(思考中) ")
+                                    + pa.reasoning;
+                            }
+                            if (live != "") {
+                                if (aiStreamMsgIdx < 0) {
+                                    aiRole.Add("assistant");
+                                    aiText.Add(live);
+                                    aiStreamMsgIdx = aiText.Count - 1;
+                                } else if (aiStreamMsgIdx < aiText.Count) {
+                                    aiText[aiStreamMsgIdx] = live;
+                                }
+                                aiScroll.Set(0);
+                            }
+                            aiWaitStart = 0;
                         } else {
-                            aiChatFirstResp = 0;
+                            int aiNow = Window.GetTickMs();
                             if (aiWaitStart == 0) { aiWaitStart = aiNow; }
-                            else if (aiNow - aiWaitStart > 210000) { aiTimedOut = true; }
+                            else if (aiNow - aiWaitStart > 210000) {
+                                aiTimedOut = true;
+                            }
                         }
                     }
                     if (aiTimedOut) {
                         aiWaitStart = 0;
-                        aiChatFirstResp = 0;
+                        if (aiStreamMsgIdx >= 0
+                            && aiStreamMsgIdx == aiText.Count - 1) {
+                            aiRole.RemoveAt(aiStreamMsgIdx);
+                            aiText.RemoveAt(aiStreamMsgIdx);
+                        }
+                        aiStreamMsgIdx = 0 - 1;
+                        aiStreamLen = 0;
                         aiRole.Add("error");
                         aiText.Add(ZanIDE.T(
                             "[error] AI request timed out - no response received.",
                             "[错误] AI 请求超时——未收到响应。"));
                         aiBusy.Set(0);
                         aiScroll.Set(0);
-                    } else if (aiMarker || aiRespReady) {
+                    } else if (aiMarker) {
                         aiWaitStart = 0;
-                        aiChatFirstResp = 0;
-                        if (aiMarker) { File.Delete(ZanIDE.AiDonePath()); }
-                        string reply = ZanIDE.AiReadAnswer();
-                        // Consume the response file so its mere presence never
-                        // stands in for a later request while a tool runs.
-                        if (File.Exists(ZanIDE.AiRespPath())) {
-                            File.Delete(ZanIDE.AiRespPath());
+                        string doneTxt = AiAgent.Trim(
+                            File.ReadAllText(ZanIDE.AiDonePath()));
+                        File.Delete(ZanIDE.AiDonePath());
+                        // Drop the live preview bubble; the final turns are added
+                        // below from the fully decoded stream.
+                        if (aiStreamMsgIdx >= 0
+                            && aiStreamMsgIdx == aiText.Count - 1) {
+                            aiRole.RemoveAt(aiStreamMsgIdx);
+                            aiText.RemoveAt(aiStreamMsgIdx);
                         }
-                        // A reply that asks for a tool is one step of the
-                        // assistant loop, not the answer: run the tool inside
-                        // the project, hand the result back and ask again, so
-                        // the model reads the real code instead of guessing.
-                        string call = AiAgent.ToolBlock(reply);
-                        bool more = call != ""
-                            && AiAgent.StepsSinceUser(aiRole) < AiAgent.MaxSteps();
-                        string said = reply;
-                        if (call != "") { said = AiAgent.StripToolBlock(reply); }
-                        if (said != "") {
-                            aiRole.Add("assistant");
-                            aiText.Add(said);
+                        aiStreamMsgIdx = 0 - 1;
+                        aiStreamLen = 0;
+                        string sraw = "";
+                        if (File.Exists(ZanIDE.AiStreamPath())) {
+                            sraw = File.ReadAllText(ZanIDE.AiStreamPath());
                         }
-                        if (more) {
-                            string tname = AiAgent.ToolName(call);
-                            if (AiAgent.IsMutating(tname) && !aiAutoExec) {
-                                // A write / build / run pauses for the user:
-                                // park the call and switch to the confirm state
-                                // (aiBusy == 2). Nothing touches the project
-                                // until they Approve it in the panel.
-                                aiPendingCall = call;
-                                aiBusy.Set(2);
-                            } else {
-                                AiDispatchTool(call);
+                        SseAnswer fa = AiAgent.ParseSse(sraw);
+                        if (doneTxt != "ok" || fa.error != "") {
+                            string emsg = doneTxt;
+                            if (emsg.Length >= 5 && emsg.Substring(0, 5) == "err: ") {
+                                emsg = emsg.Substring(5, emsg.Length - 5);
                             }
-                        } else {
-                            if (call != "") {
-                                aiRole.Add("error");
-                                aiText.Add(ZanIDE.T(
-                                    "Tool limit reached for this question.",
-                                    "本次提问的工具调用次数已达上限。"));
+                            if (fa.error != "") {
+                                if (emsg != "" && doneTxt != "ok") {
+                                    emsg = emsg + ": " + fa.error;
+                                } else { emsg = fa.error; }
                             }
+                            if (emsg == "") { emsg = "the AI request failed."; }
+                            aiRole.Add("error");
+                            aiText.Add("[error] " + emsg);
                             aiBusy.Set(0);
+                        } else {
+                            // A reply that asks for a tool is one step of the
+                            // assistant loop, not the answer: run the tool inside
+                            // the project, hand the result back and ask again, so
+                            // the model reads the real code instead of guessing.
+                            string reply = fa.content;
+                            string call = AiAgent.ToolBlock(reply);
+                            bool more = call != ""
+                                && AiAgent.StepsSinceUser(aiRole) < AiAgent.MaxSteps();
+                            string said = reply;
+                            if (call != "") { said = AiAgent.StripToolBlock(reply); }
+                            if (said != "") {
+                                aiRole.Add("assistant");
+                                aiText.Add(said);
+                            }
+                            if (more) {
+                                string tname = AiAgent.ToolName(call);
+                                if (AiAgent.IsMutating(tname) && !aiAutoExec) {
+                                    // A write / build / run pauses for the user:
+                                    // park the call and switch to the confirm
+                                    // state (aiBusy == 2). Nothing touches the
+                                    // project until they Approve it in the panel.
+                                    aiPendingCall = call;
+                                    aiBusy.Set(2);
+                                } else {
+                                    AiDispatchTool(call);
+                                }
+                            } else {
+                                if (call != "") {
+                                    aiRole.Add("error");
+                                    aiText.Add(ZanIDE.T(
+                                        "Tool limit reached for this question.",
+                                        "本次提问的工具调用次数已达上限。"));
+                                }
+                                aiBusy.Set(0);
+                            }
                         }
                         aiScroll.Set(0);
                     }
@@ -4230,6 +4294,8 @@ partial class ZanIDE {
         aiUiDeadline = 0;
         aiChatFirstResp = 0;
         aiWaitStart = 0;
+        aiStreamMsgIdx = 0 - 1;
+        aiStreamLen = 0;
         aiApproveBtn = new Button { Text = ZanIDE.T("Approve", "批准"), Class = "primary small" };
         aiRejectBtn = new Button { Text = ZanIDE.T("Reject", "拒绝"), Class = "small" };
         aiAutoBtn = new Button { Text = ZanIDE.T("Auto: off", "自动:关"), Class = "small" };

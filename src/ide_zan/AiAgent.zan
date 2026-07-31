@@ -570,6 +570,62 @@ class AiAgent {
         return sb.ToString();
     }
 
+    // --- streaming (SSE) parsing ---------------------------------------------
+
+    /// Folds a text/event-stream reply into an answer. The stream is a series
+    /// of `data: {json}` lines; each JSON carries a `choices[0].delta` with an
+    /// incremental `content` (the answer) and/or `reasoning_content` (the
+    /// model's thinking). Concatenating the deltas in order rebuilds both. A
+    /// provider `error` object or the terminal `data: [DONE]` are surfaced too,
+    /// and malformed lines are skipped so a half-written tail never throws.
+    static SseAnswer ParseSse(string raw) {
+        SseAnswer a = new SseAnswer();
+        a.content = "";
+        a.reasoning = "";
+        a.error = "";
+        a.done = false;
+        StringBuilder c = new StringBuilder();
+        StringBuilder r = new StringBuilder();
+        int n = raw.Length;
+        int i = 0;
+        while (i < n) {
+            int nl = i;
+            while (nl < n && (raw[nl] & 255) != 10) { nl = nl + 1; }
+            int lineEnd = nl;
+            if (lineEnd > i && (raw[lineEnd - 1] & 255) == 13) {
+                lineEnd = lineEnd - 1;
+            }
+            string line = raw.Substring(i, lineEnd - i);
+            if (line.Length >= 6 && line.Substring(0, 6) == "data: ") {
+                string payload = line.Substring(6, line.Length - 6);
+                if (payload == "[DONE]") {
+                    a.done = true;
+                } else {
+                    JsonValue v = JsonValue.ParseLenient(payload);
+                    if (v != null) {
+                        JsonValue err = v.Get("error");
+                        if (err != null && a.error == "") {
+                            a.error = err.Str("message", payload);
+                        }
+                        JsonValue ch = v.Get("choices");
+                        if (ch != null && ch.IsArray() && ch.Count() > 0) {
+                            JsonValue delta = ch.At(0).Get("delta");
+                            if (delta != null) {
+                                c.Append(delta.Str("content", ""));
+                                r.Append(delta.Str("reasoning_content", ""));
+                            }
+                        }
+                    }
+                }
+            }
+            if (nl >= n) { break; }
+            i = nl + 1;
+        }
+        a.content = c.ToString();
+        a.reasoning = r.ToString();
+        return a;
+    }
+
     // --- context compaction --------------------------------------------------
 
     /// Character budget for the running transcript (everything after the system
@@ -683,4 +739,14 @@ class AiMessages {
     List<string> texts;
     bool compacted;
     int dropped;
+}
+
+/// A text/event-stream reply folded by `AiAgent.ParseSse`: `content` is the
+/// answer so far, `reasoning` the model's thinking so far, `error` a provider
+/// error message (or "") and `done` whether the terminal `[DONE]` arrived.
+class SseAnswer {
+    string content;
+    string reasoning;
+    string error;
+    bool done;
 }

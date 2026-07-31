@@ -1,0 +1,133 @@
+using System;
+using System.IO;
+using System.Threading;
+using System.Net.Sockets;
+using System.Net.Http;
+using System.Net.Http.Client;
+
+/// The AI chat transport: a real HTTPS request made with the Net standard
+/// library instead of a detached curl process. The request runs on a
+/// background thread that drives the async reactor and streams the decoded
+/// response body (a text/event-stream) into a file as chunks arrive; the GUI
+/// polls that file every frame, so the answer appears incrementally while the
+/// SDL event loop stays responsive.
+///
+/// The worker is a plain static delegate with no captured state, so the
+/// request parameters are handed over through static fields set right before
+/// the thread starts. Only one chat request is in flight at a time (the panel
+/// enforces this with `aiBusy`), so the single set of fields is enough.
+class AiNet {
+    static string sHost;
+    static int sPort;
+    static bool sTls;
+    static bool sVerify;
+    static string sPath;
+    static string sKey;
+    static string sBody;
+    static string sOut;
+    static string sDone;
+    static int sTimeout;
+
+    /// The background request: builds the client from the shared fields and
+    /// streams the response to the output file. `await` runs on this worker
+    /// thread's own reactor, so it never blocks the GUI thread.
+    static async int RunReq() {
+        HttpClient cli;
+        if (AiNet.sTls) { cli = HttpClient.CreateHttps(AiNet.sHost, AiNet.sPort); }
+        else { cli = HttpClient.Create(AiNet.sHost, AiNet.sPort); }
+        if (!AiNet.sVerify) { cli.DisableTlsVerify(); }
+        if (AiNet.sKey != "") { cli.SetHeader("Authorization", "Bearer " + AiNet.sKey); }
+        cli.SetHeader("Content-Type", "application/json");
+        cli.SetHeader("Accept", "text/event-stream");
+        cli.SetTimeout(AiNet.sTimeout);
+        int rr = await cli.PostSseToFileAsync(AiNet.sPath, AiNet.sBody,
+                                              AiNet.sOut, AiNet.sDone);
+        return rr;
+    }
+
+    static void Worker() {
+        Socket.Initialize();
+        int _r = await AiNet.RunReq();
+    }
+
+    /// Parses `baseUrl` (scheme://host[:port][/base]) into the transport
+    /// fields and appends `suffix` (e.g. "/chat/completions") to its path.
+    static void SetUrl(string baseUrl, string suffix) {
+        string u = baseUrl;
+        bool tls = true;
+        int defPort = 443;
+        if (u.Length >= 8 && u.Substring(0, 8) == "https://") {
+            u = u.Substring(8, u.Length - 8); tls = true; defPort = 443;
+        } else if (u.Length >= 7 && u.Substring(0, 7) == "http://") {
+            u = u.Substring(7, u.Length - 7); tls = false; defPort = 80;
+        }
+        int slash = AiNet.FindByte(u, 47, 0);
+        string hostport = u;
+        string basePath = "";
+        if (slash >= 0) {
+            hostport = u.Substring(0, slash);
+            basePath = u.Substring(slash, u.Length - slash);
+        }
+        while (basePath.Length > 0
+            && (basePath[basePath.Length - 1] & 255) == 47) {
+            basePath = basePath.Substring(0, basePath.Length - 1);
+        }
+        int port = defPort;
+        string host = hostport;
+        int colon = AiNet.FindByte(hostport, 58, 0);
+        if (colon >= 0) {
+            host = hostport.Substring(0, colon);
+            port = AiNet.ParseInt(hostport.Substring(colon + 1,
+                hostport.Length - colon - 1), defPort);
+        }
+        AiNet.sHost = host;
+        AiNet.sPort = port;
+        AiNet.sTls = tls;
+        AiNet.sPath = basePath + suffix;
+    }
+
+    static int FindByte(string s, int b, int from) {
+        int i = from;
+        while (i < s.Length) {
+            if ((s[i] & 255) == b) { return i; }
+            i = i + 1;
+        }
+        return 0 - 1;
+    }
+
+    static int ParseInt(string s, int fallback) {
+        int v = 0;
+        int i = 0;
+        bool any = false;
+        while (i < s.Length) {
+            int c = s[i] & 255;
+            if (c < 48 || c > 57) { break; }
+            v = v * 10 + (c - 48);
+            any = true;
+            i = i + 1;
+        }
+        if (!any) { return fallback; }
+        return v;
+    }
+
+    /// Kicks off the request on a background thread. `outFile` is truncated and
+    /// `doneFile` removed first so the poller reads only this request's output.
+    /// Returns "" on success or a readable error when the thread cannot start.
+    static string Start(string baseUrl, string suffix, string key, string body,
+            string outFile, string doneFile, int timeoutMs, bool verify) {
+        AiNet.SetUrl(baseUrl, suffix);
+        AiNet.sKey = key;
+        AiNet.sBody = body;
+        AiNet.sOut = outFile;
+        AiNet.sDone = doneFile;
+        AiNet.sTimeout = timeoutMs;
+        AiNet.sVerify = verify;
+        HttpClient.TruncateFile(outFile);
+        if (File.Exists(doneFile)) { File.Delete(doneFile); }
+        bool ok = Thread.Start(AiNet.Worker);
+        if (!ok) {
+            return "could not start the network thread for the AI request.";
+        }
+        return "";
+    }
+}

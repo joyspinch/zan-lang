@@ -394,4 +394,230 @@ class HttpClient {
             fclose(fp);
         }
     }
+
+    // Byte-wise substring search (no per-character Substring allocations).
+    static int IndexOf(string s, string needle, int from) {
+        int n = s.Length;
+        int m = needle.Length;
+        if (m == 0) { return from; }
+        int i = from;
+        while (i + m <= n) {
+            int j = 0;
+            while (j < m && (s[i + j] & 255) == (needle[j] & 255)) { j = j + 1; }
+            if (j == m) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    // Parses a hexadecimal chunk-size prefix, stopping at the first non-hex
+    // byte (e.g. ';' chunk extension or CR).
+    static int ParseHex(string s) {
+        int v = 0;
+        int i = 0;
+        while (i < s.Length) {
+            int c = s[i] & 255;
+            int d = 0 - 1;
+            if (c >= 48 && c <= 57) { d = c - 48; }
+            else if (c >= 97 && c <= 102) { d = c - 97 + 10; }
+            else if (c >= 65 && c <= 70) { d = c - 65 + 10; }
+            else { i = s.Length; }
+            if (d >= 0) { v = v * 16 + d; }
+            i = i + 1;
+        }
+        return v;
+    }
+
+    static void AppendText(string file, string s) {
+        nint fp = fopen(file, "ab");
+        if (fp != 0) {
+            fputs(s, fp);
+            fclose(fp);
+        }
+    }
+
+    static void TruncateFile(string file) {
+        nint fp = fopen(file, "wb");
+        if (fp != 0) { fclose(fp); }
+    }
+
+    // True when the response head advertises chunked transfer-encoding.
+    static bool HeadIsChunked(string head) {
+        int i = 0;
+        int n = head.Length;
+        // Scan for "chunked" preceded by a transfer-encoding header; a plain
+        // case-insensitive contains is enough here since SSE responses do not
+        // carry the word elsewhere.
+        while (i + 7 <= n) {
+            int a = head[i] & 255;
+            if (a == 99 || a == 67) {
+                if (HttpClient.AsciiNameEquals(head.Substring(i, 7), "chunked", 7)) {
+                    return true;
+                }
+            }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    // Parses the numeric status code out of "HTTP/1.1 200 OK".
+    static int HeadStatus(string head) {
+        int sp = HttpClient.IndexOf(head, " ", 0);
+        if (sp < 0) { return 0; }
+        int code = 0;
+        int i = sp + 1;
+        while (i < head.Length && (head[i] & 255) >= 48 && (head[i] & 255) <= 57) {
+            code = code * 10 + ((head[i] & 255) - 48);
+            i = i + 1;
+        }
+        return code;
+    }
+
+    /// <summary>Streams a response body to <paramref name="outFile"/> as it
+    /// arrives (decoding chunked transfer-encoding), so a caller polling the
+    /// file sees incremental output -- e.g. a text/event-stream (SSE) reply.
+    /// Never throws: the outcome is written to <paramref name="doneFile"/> as
+    /// "ok" on a clean end or "err: ..." otherwise (including a non-2xx status,
+    /// whose error body is still streamed to outFile).</summary>
+    async int PostSseToFileAsync(string path, string body, string outFile, string doneFile) {
+        HttpClient.TruncateFile(outFile);
+        Socket.Initialize();
+        TcpClient conn = await TcpClient.ConnectAsync(this.host, this.port, this.timeout);
+        if (conn == null) {
+            HttpClient.AppendText(doneFile, "err: connect to " + this.host + " failed");
+            return 0;
+        }
+
+        TlsStream stream = null;
+        TlsContext ctx = null;
+        if (this.useTls) {
+            if (this.clientCertificateFile.Length > 0
+                && this.clientPrivateKeyFile.Length > 0) {
+                ctx = TlsContext.CreateClientWithCertificate(
+                    this.clientCertificateFile, this.clientPrivateKeyFile);
+            } else {
+                ctx = TlsContext.CreateClient();
+            }
+            if (ctx == null) {
+                conn.Close();
+                HttpClient.AppendText(doneFile, "err: TLS context");
+                return 0;
+            }
+            if (!this.verifyTls) { ctx.DisableVerify(); }
+            stream = await TlsStream.ConnectAsync(ctx, conn.Sock(), this.host);
+            if (stream == null) {
+                conn.Close();
+                ctx.Free();
+                HttpClient.AppendText(doneFile, "err: TLS handshake with " + this.host + " failed");
+                return 0;
+            }
+        }
+
+        int watch = HttpDeadline.Arm(conn.Sock(), this.timeout);
+        string requestData = BuildRequest("POST", path, body);
+        if (this.useTls) {
+            int _s = await stream.SendAsync(requestData, requestData.Length);
+        } else {
+            int _s2 = await conn.SendAsync(requestData);
+        }
+
+        // Read the response head so we can split status/headers from the body.
+        string head = "";
+        int hb = 0 - 1;
+        while (hb < 0) {
+            string c;
+            if (this.useTls) { c = await stream.RecvAsync(65536); }
+            else { c = await conn.RecvAsync(65536); }
+            if (c.Length == 0) { break; }
+            head = head + c;
+            hb = HttpClient.IndexOf(head, "\r\n\r\n", 0);
+        }
+
+        int status = HttpClient.HeadStatus(head);
+        bool chunked = HttpClient.HeadIsChunked(head);
+        string pending = "";
+        if (hb >= 0) {
+            pending = head.Substring(hb + 4, head.Length - hb - 4);
+        }
+
+        bool finished = false;
+        string doneScan = "";
+        bool sawDone = false;
+        while (!finished) {
+            if (chunked) {
+                bool progressed = true;
+                while (progressed) {
+                    progressed = false;
+                    int crlf = HttpClient.IndexOf(pending, "\r\n", 0);
+                    if (crlf < 0) { progressed = false; }
+                    else {
+                        string sizeLine = pending.Substring(0, crlf);
+                        int size = HttpClient.ParseHex(sizeLine);
+                        if (size == 0) {
+                            finished = true;
+                            progressed = false;
+                        } else {
+                            int need = crlf + 2 + size + 2;
+                            if (pending.Length >= need) {
+                                string piece = pending.Substring(crlf + 2, size);
+                                HttpClient.AppendText(outFile, piece);
+                                doneScan = doneScan + piece;
+                                if (doneScan.Length > 64) {
+                                    doneScan = doneScan.Substring(doneScan.Length - 64, 64);
+                                }
+                                if (HttpClient.IndexOf(doneScan, "[DONE]", 0) >= 0) {
+                                    sawDone = true;
+                                }
+                                pending = pending.Substring(need, pending.Length - need);
+                                progressed = true;
+                            }
+                        }
+                    }
+                }
+            } else {
+                if (pending.Length > 0) {
+                    HttpClient.AppendText(outFile, pending);
+                    doneScan = doneScan + pending;
+                    if (doneScan.Length > 64) {
+                        doneScan = doneScan.Substring(doneScan.Length - 64, 64);
+                    }
+                    if (HttpClient.IndexOf(doneScan, "[DONE]", 0) >= 0) {
+                        sawDone = true;
+                    }
+                    pending = "";
+                }
+            }
+            if (sawDone) { finished = true; }
+            if (finished) {
+                // reached the terminal chunk
+            } else {
+                string c;
+                if (this.useTls) { c = await stream.RecvAsync(65536); }
+                else { c = await conn.RecvAsync(65536); }
+                if (c.Length == 0) { finished = true; }
+                else { pending = pending + c; }
+            }
+        }
+
+        bool late = HttpDeadline.Expired(watch);
+        HttpDeadline.Disarm(watch);
+        if (this.useTls) {
+            stream.Close();
+            conn.Close();
+            ctx.Free();
+        } else {
+            conn.Close();
+        }
+
+        if (late) {
+            HttpClient.AppendText(doneFile, "err: timeout");
+        } else if (status >= 200 && status < 300) {
+            HttpClient.AppendText(doneFile, "ok");
+        } else if (status == 0) {
+            HttpClient.AppendText(doneFile, "err: no response");
+        } else {
+            HttpClient.AppendText(doneFile, "err: HTTP " + Convert.ToString(status));
+        }
+        return 0;
+    }
 }
