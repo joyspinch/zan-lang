@@ -22,8 +22,14 @@ namespace Gui.Widget;
 /// resolves its focus/click, and it reports the caret so the IME composition
 /// window follows the cursor. For read-only code display / syntax features use
 /// CodeEditor; this is the plain editable multi-line field.
+///
+/// It is also a retained Control, so a designed form can dock it in a tree:
+///
+///   TextArea body = new TextArea("Write something...");
+///   body.Dock(Dock.Top()).Prefer(0, 90);
+///   root.Add(body);
 /// </summary>
-class TextArea {
+class TextArea : Control {
     SignalString model;
     /// Two-way bound text: `notes.data = doc.body;` keeps the model field and
     /// the textarea in sync both ways (compiler-lowered Binding).
@@ -35,18 +41,32 @@ class TextArea {
     /// Fires whenever the text changes (C#-style: `area.Change += h;`).
     UiEvent Change;
 
+    /// Shared initialiser for the immediate-mode factories and the retained
+    /// constructor: sets up the Control base (docks top so an appended area
+    /// auto-snaps) then the textarea-specific state.
+    void InitTextArea(SignalString sig, string hintText) {
+        this.InitControl("textarea", 1);
+        model = sig;
+        hint = hintText;
+        cursorPos = 0;
+        scrollY = 0;
+        wid = WidgetId.Next();
+        wiresOwnEvents = true;
+        Change = UiEvent.Create();
+    }
+
+    /// Retained-mode constructor: `TextArea notes = new TextArea("Notes...");`
+    TextArea(string hintText) {
+        InitTextArea(SignalString.Create(""), hintText);
+    }
+
     static TextArea Create(string hintText) {
-        return TextArea.Bind(SignalString.Create(""), hintText);
+        return new TextArea(hintText);
     }
 
     static TextArea Bind(SignalString sig, string hintText) {
-        TextArea a = new TextArea();
+        TextArea a = new TextArea(hintText);
         a.model = sig;
-        a.hint = hintText;
-        a.cursorPos = 0;
-        a.scrollY = 0;
-        a.wid = WidgetId.Next();
-        a.Change = UiEvent.Create();
         return a;
     }
 
@@ -257,7 +277,7 @@ class TextArea {
         // Vertical scrollbar when the content overflows (clamped + clipped).
         if (contentH > innerH && innerH > 0) {
             int barW = app.Scale(6);
-            int bx = x + w - barW - app.Scale(2);
+            int barX = x + w - barW - app.Scale(2);
             int minThumb = app.Scale(24);
             if (minThumb > innerH) { minThumb = innerH; }
             int thumbH = innerH * innerH / contentH;
@@ -270,8 +290,8 @@ class TextArea {
             if (thumbY < innerY) { thumbY = innerY; }
             if (thumbY + thumbH > innerY + innerH) { thumbY = innerY + innerH - thumbH; }
             c.PushClip(innerX, innerY, innerW, innerH);
-            c.FillRoundRect(bx, innerY, barW, innerH, barW / 2, t.bgTertiary);
-            c.FillRoundRect(bx, thumbY, barW, thumbH, barW / 2, t.scrollbar);
+            c.FillRoundRect(barX, innerY, barW, innerH, barW / 2, t.bgTertiary);
+            c.FillRoundRect(barX, thumbY, barW, thumbH, barW / 2, t.scrollbar);
             c.PopClip();
         }
 
@@ -291,6 +311,60 @@ class TextArea {
             app.RequestRedraw();
         }
 
+        On.Fire(app, id);
         return id;
     }
+
+    // --- Designer / serialization model ---
+
+    override string Kind() { return "TextArea"; }
+
+    override string StyleType() { return "textarea"; }
+
+    override List<PropSpec> Props() {
+        List<PropSpec> ps = new List<PropSpec>();
+        PropSpec ph = PropSpec.Text("hint", "Placeholder");
+        ph.str = hint;
+        ph.Also("placeholder");
+        ps.Add(ph);
+        ps.Add(PropSpec.Text("text", "Text"));
+        return ps;
+    }
+
+    /// Text goes through SetText so the caret stays in range.
+    override string GetExtra(string key) {
+        if (key == "text" || key == "value") { return model.Get(); }
+        return "";
+    }
+
+    override bool SetExtra(string key, string val) {
+        if (key != "text" && key != "value") { return false; }
+        this.SetText(val);
+        return true;
+    }
+
+    override List<string> Events() {
+        List<string> e = Control.CommonEvents();
+        e.Add("Change");
+        return e;
+    }
+
+    override void BindEvent(string evt, Action a) {
+        if (evt == "Change") { Change.Add(a); return; }
+        On.AddByName(evt, a);
+    }
+
+    // --- Retained-mode hooks (Control) ---
+
+    override void OnMeasure(App app) {
+        Theme t = app.theme;
+        StyleBox s = this.ResolveStyleAs(app, "textarea", Class, Style.SNormal());
+        prefH = s.HeightOr(app.Scale(90));
+        prefW = s.WidthOr(app.Scale(220));
+    }
+
+    override void OnPaint(App app) {
+        this.Render(app, bx, by, bw, bh);
+    }
 }
+
