@@ -309,10 +309,49 @@ jobs:
       - name: Build cross runtime objects
         run: bash scripts/build_win_rt.sh "${{ matrix.target }}"
 
+      # The GUI runtime DLL a published Windows program links against. The
+      # committed win-x64 copy comes from the CMake build on a developer's
+      # machine; win-arm64 has no such host, so it is built here from the same
+      # source with the same Win32 backend, and the import library is derived
+      # from the DLL's export table exactly like scripts/build_gui_driver.ps1.
+      - name: Stage GUI driver
+        if: matrix.target == 'win-arm64'
+        run: |
+          set -eux
+          DEST="stdlib/Gui/drivers/${{ matrix.target }}"
+          mkdir -p "$DEST"
+          cc -O2 -shared -o "$DEST/zan_gui.dll" src/runtime/gui_runtime.c \
+            -Wl,--out-implib,"$DEST/libzan_gui.dll.a" -static-libgcc \
+            -luser32 -lgdi32 -ldwmapi -lshcore -limm32 -lole32 -lrpcrt4
+          # WebView2Loader: the WebView widget resolves it at run time, so the
+          # matching arch has to travel with the program.
+          curl -fsSL -o wv2.zip \
+            "https://www.nuget.org/api/v2/package/Microsoft.Web.WebView2/1.0.2903.40"
+          mkdir -p wv2 && unzip -qo wv2.zip -d wv2
+          WVARCH=$([ "${{ matrix.target }}" = win-arm64 ] && echo arm64 || echo x64)
+          cp "wv2/build/native/$WVARCH/WebView2Loader.dll" "$DEST/WebView2Loader.dll"
+          printf 'zan_gui.dll\nWebView2Loader.dll\n' > "$DEST/zan_gui.bundle"
+
+      # Import libraries the cross bundles were assembled without: a native
+      # Windows link picks these up from the host mingw, so they only go
+      # missing when zanc cross-links (psapi backs Process/memory queries).
+      - name: Top up the cross mingw import libs
+        run: |
+          set -eux
+          P="$(cygpath -u "$MINGW_PREFIX")"
+          for lib in psapi version setupapi; do
+            [ -f "$P/lib/lib$lib.a" ] \
+              && cp -n "$P/lib/lib$lib.a" "toolchain/${{ matrix.target }}/mingw/lib/" \
+              || true
+          done
+
       - uses: actions/upload-artifact@v4
         with:
           name: winrt-${{ matrix.target }}
-          path: toolchain/${{ matrix.target }}/zanrt_*.o
+          path: |
+            toolchain/${{ matrix.target }}/zanrt_*.o
+            toolchain/${{ matrix.target }}/mingw/lib/lib*.a
+            stdlib/Gui/drivers/${{ matrix.target }}/
 
       # PowerShell, not the job's msys2 shell: the MSYS2 environments here ship
       # no git, so the runner's own git has to do the commit.
@@ -327,12 +366,16 @@ jobs:
           # cross publish works from a plain checkout.
           $sub = 'toolchain/${{ matrix.target }}'
           git add -f "$sub/zanrt_io.o" "$sub/zanrt_io_mt.o" "$sub/zanrt_sync.o"
+          git add "$sub/mingw/lib"
+          if ('${{ matrix.target }}' -eq 'win-arm64') {
+            git add 'stdlib/Gui/drivers/win-arm64'
+          }
           git diff --cached --quiet
           if ($LASTEXITCODE -eq 0) {
             Write-Output 'runtime objects already current'
             exit 0
           }
-          git commit -m 'drivers: rebuild ${{ matrix.target }} runtime objects'
+          git commit -m 'drivers: refresh the ${{ matrix.target }} cross-link bundle'
           git pull --rebase --autostash origin main
           git push origin HEAD:main
 
