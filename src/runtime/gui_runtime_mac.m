@@ -680,6 +680,53 @@ EXPORT i32 zan_gui_wake(void) {
     return 0;
 }
 
+/* Queue a synthetic input event for the automation driver (see Gui.UiDriver).
+ * It goes onto the same decoded-event queue real NSEvents feed, so the pump
+ * serves it exactly like OS input and the whole App + widget dispatch path runs
+ * unchanged. Must be called on the UI thread, which the driver is; the wake
+ * unblocks a pump parked in nextEventMatchingMask. */
+EXPORT i32 zan_gui_inject_event(iptr hwnd_val, i32 kind, i32 x, i32 y,
+                                i32 button, i32 keycode, i32 mods) {
+    long prev = g_evt_win;
+    if (hwnd_val) g_evt_win = (long)hwnd_val;
+    else if (g_mwin_count > 0) g_evt_win = (long)(intptr_t)g_mwins[0].window;
+    evq_push(kind, x, y, button, keycode, mods);
+    g_evt_win = prev;
+    zan_gui_wake();
+    return 0;
+}
+
+/* Number of decoded events still queued. 0 means the driver's last injected
+ * batch has been fully consumed. */
+EXPORT i32 zan_gui_inject_pending(void) {
+    return (i32)((g_evq_tail - g_evq_head + ZAN_EVQ_CAP) % ZAN_EVQ_CAP);
+}
+
+/* Announce a rect the caller repainted. The Cocoa present uploads the whole
+ * surface through one IOSurface/CALayer swap, which costs the same whatever
+ * changed, so the rects are accepted for ABI parity and dropped. */
+EXPORT i32 zan_gui_present_dirty_add(i32 x, i32 y, i32 w, i32 h) {
+    (void)x; (void)y; (void)w; (void)h;
+    return 0;
+}
+
+/* Re-center a window on the screen it currently sits on. */
+EXPORT i32 zan_gui_center_window(iptr hwnd_val) {
+    zan_mwin_t *mw = mwin_find((long)hwnd_val);
+    NSWindow *win = mw ? mw->window
+                       : (g_mwin_count > 0 ? g_mwins[0].window : nil);
+    if (!win) return 0;
+    NSScreen *screen = [win screen];
+    if (!screen) screen = [NSScreen mainScreen];
+    if (!screen) { [win center]; return 1; }
+    NSRect vis = [screen visibleFrame];
+    NSRect f = [win frame];
+    NSPoint o = NSMakePoint(vis.origin.x + (vis.size.width - f.size.width) / 2.0,
+                            vis.origin.y + (vis.size.height - f.size.height) / 2.0);
+    [win setFrameOrigin:o];
+    return 1;
+}
+
 EXPORT i32 zan_gui_event_kind(void)    { return g_evt[0]; }
 EXPORT i32 zan_gui_event_x(void)       { return g_evt[1]; }
 EXPORT i32 zan_gui_event_y(void)       { return g_evt[2]; }
