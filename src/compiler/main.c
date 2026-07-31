@@ -2505,6 +2505,23 @@ int main(int argc, char **argv) {
                         while (l > 0 && (line[l-1] == '\n' || line[l-1] == '\r'
                                          || line[l-1] == ' ' || line[l-1] == '\t'))
                             line[--l] = '\0';
+                        /* "<file> if <symbol-prefix>": an optional dependency
+                         * the driver only needs for programs that use the
+                         * feature owning it (e.g. WebView2Loader.dll, which
+                         * the WebView widget loads at run time). */
+                        char *cond = strstr(line, " if ");
+                        if (cond) {
+                            *cond = '\0';
+                            const char *pfx = cond + 4;
+                            while (*pfx == ' ' || *pfx == '\t') pfx++;
+                            size_t nl = strlen(line);
+                            while (nl > 0 && (line[nl-1] == ' '
+                                              || line[nl-1] == '\t'))
+                                line[--nl] = '\0';
+                            l = nl;
+                            if (!zan_irgen_defines_prefix(&irgen, pfx))
+                                continue;
+                        }
                         if (l > 0) {
                             if (zan_is_safe_bundle_name(line)) {
                                 snprintf(cands[ncand++], sizeof(cands[0]), "%s", line);

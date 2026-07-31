@@ -473,4 +473,10 @@ zan_status_t zan_irgen_write_obj(zan_irgen_t *g, const char *path);
  * whole publish failing. Returns the number of functions stubbed. */
 int zan_irgen_stub_extern_lib(zan_irgen_t *g, const char *lib, int lib_len);
 
+/* True when the module defines a function whose (mangled `Class_Member`) name
+ * starts with `prefix`. Lets a driver bundle a dependency only for programs
+ * that actually use the feature owning it (see the `if` clause of a
+ * `<driver>.bundle` manifest). */
+bool zan_irgen_defines_prefix(zan_irgen_t *g, const char *prefix);
+
 #endif /* ZAN_IRGEN_H */

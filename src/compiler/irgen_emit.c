@@ -1878,6 +1878,19 @@ int zan_irgen_stub_extern_lib(zan_irgen_t *g, const char *lib, int lib_len) {
     return stubbed;
 }
 
+bool zan_irgen_defines_prefix(zan_irgen_t *g, const char *prefix) {
+    size_t plen = strlen(prefix);
+    if (!plen) return false;
+    for (LLVMValueRef fn = LLVMGetFirstFunction(g->mod); fn;
+         fn = LLVMGetNextFunction(fn)) {
+        if (LLVMCountBasicBlocks(fn) == 0) continue; /* declaration only */
+        size_t nlen = 0;
+        const char *nm = LLVMGetValueName2(fn, &nlen);
+        if (nm && nlen >= plen && memcmp(nm, prefix, plen) == 0) return true;
+    }
+    return false;
+}
+
 /* wasm32 libc adapters (see zan_irgen_write_obj): define `fn` (which must be
  * a body-less function of type src_ft) as a thin wrapper that converts its
  * arguments to `lft` (the real 32-bit libc signature), calls `real`, and
