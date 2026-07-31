@@ -732,6 +732,25 @@ static const char *zan_dllimport_lname(const char *lib, int lib_len,
     return name;
 }
 
+/* Windows system import libraries. A [DllImport] on one of these is a
+ * Windows-only code path that the stdlib guards behind a platform check, so
+ * stubbing it out when the target is not Windows is the expected outcome, not
+ * something to warn about. */
+static bool zan_win_system_lib(const char *lib, int lib_len) {
+    static const char *const names[] = {
+        "kernel32", "user32", "gdi32", "advapi32", "shell32", "shlwapi",
+        "ole32", "oleaut32", "comdlg32", "comctl32", "gdiplus", "dwmapi",
+        "shcore", "uxtheme", "msimg32", "winmm", "ws2_32", "opengl32",
+        "psapi", "version", "setupapi", "secur32", "iphlpapi", "crypt32",
+        "bcrypt", "wininet", "winhttp", "urlmon", "userenv", "uuid",
+        "rpcrt4", "imm32", NULL };
+    for (int i = 0; names[i]; i++)
+        if ((int)strlen(names[i]) == lib_len
+            && memcmp(names[i], lib, (size_t)lib_len) == 0)
+            return true;
+    return false;
+}
+
 /* Registry of third-party native drivers a published program must carry,
  * unlike system libs (kernel32/msvcrt/libc/.) that already exist on every
  * target. Instead of hardcoding the set in the compiler, it is DISCOVERED from
@@ -1553,7 +1572,9 @@ int main(int argc, char **argv) {
                     int n = zan_irgen_stub_extern_lib(
                         &irgen, irgen.extern_libs[li].str,
                         (int)irgen.extern_libs[li].len);
-                    if (n > 0) {
+                    if (n > 0 && !zan_win_system_lib(
+                            irgen.extern_libs[li].str,
+                            (int)irgen.extern_libs[li].len)) {
                         fprintf(stderr,
                                 "warning: no static %s archive for "
                                 "[DllImport(\"%.*s\")]; its %d function(s) "
@@ -1604,7 +1625,9 @@ int main(int argc, char **argv) {
                     int n = zan_irgen_stub_extern_lib(
                         &irgen, irgen.extern_libs[li].str,
                         (int)irgen.extern_libs[li].len);
-                    if (n > 0) {
+                    if (n > 0 && !zan_win_system_lib(
+                            irgen.extern_libs[li].str,
+                            (int)irgen.extern_libs[li].len)) {
                         fprintf(stderr,
                                 "warning: no %s driver dylib for "
                                 "[DllImport(\"%.*s\")]; its %d function(s) "
@@ -2447,8 +2470,13 @@ int main(int argc, char **argv) {
          * with the OpenSSL DLLs); absent a manifest, common default file names
          * are tried. Static linking folds the driver into the exe, so nothing
          * is copied there. */
+        /* --link-mode static folds a driver into the exe only where a static
+         * archive was actually linked; the macOS cross path always resolves
+         * its drivers as @rpath dylibs, so those still have to travel next to
+         * the executable. */
+        bool drivers_are_shared = !link_static_drivers || cross_dylib_count > 0;
         if ((publish_mode || target.os == ZAN_OS_WINDOWS) &&
-            !link_static_drivers && used_driver_count > 0) {
+            drivers_are_shared && used_driver_count > 0) {
             char outdir[1024];
             snprintf(outdir, sizeof(outdir), "%s", obj_path);
             { char *s1 = strrchr(outdir, '/'); char *s2 = strrchr(outdir, '\\');

@@ -97,4 +97,20 @@ try {
 }
 
 if ($failed) { exit 1 }
+
+# Single-file packing needs the packer beside zanc (ZanIDE.CanPackSingle), the
+# same layout publish_ide.ps1 ships. Without it a dev build silently publishes
+# loose DLLs even with "single-file exe" checked in the project.
+$tc = Join-Path (Get-Location) "build\toolchain"
+New-Item -ItemType Directory -Force -Path $tc | Out-Null
+Copy-Item -LiteralPath (Join-Path (Get-Location) "scripts\pack_single.ps1") `
+    -Destination (Join-Path $tc "pack_single.ps1") -Force
+$stub = Join-Path $tc "pkg_stub.exe"
+$stubSrc = Join-Path (Get-Location) "scripts\pkg_stub.c"
+if (-not (Test-Path $stub) -or
+    (Get-Item $stubSrc).LastWriteTime -gt (Get-Item $stub).LastWriteTime) {
+    & clang -O2 -mwindows $stubSrc -o $stub
+    if ($LASTEXITCODE -ne 0) { Write-Output "PKG_STUB_BUILD_FAILED"; exit 1 }
+}
+
 Write-Output "IDE_BUILD_OK"

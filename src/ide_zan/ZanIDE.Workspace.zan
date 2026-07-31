@@ -1170,7 +1170,20 @@ partial class ZanIDE {
         string sep = " ; ";
         #endif
         string seq = "";
-        bool pack = ZanIDE.CanPackSingle() && ZanIDE.ProjSingleFile(root);
+        bool wantPack = ZanIDE.ProjSingleFile(root);
+        bool pack = ZanIDE.CanPackSingle() && wantPack;
+        // Silently falling back to loose DLLs is what makes "I checked
+        // single-file and still got DLLs" look like a bug, so say why.
+        if (wantPack && !pack) {
+            log.Add(ZanIDE.T(
+                "> Single-file packing unavailable (no pkg_stub.exe / pack_single.ps1 in "
+                    + ZanIDE.ToolchainDir() + "); publishing loose files.",
+                "> 单文件打包不可用（" + ZanIDE.ToolchainDir()
+                    + " 下缺 pkg_stub.exe / pack_single.ps1），改为普通发布。"));
+        } else if (!wantPack) {
+            log.Add(ZanIDE.T("> Single-file packing is off for this project.",
+                             "> 本项目未启用单文件打包。"));
+        }
         // Host-aware target set (see PublishTargetIds); sel is parallel to it.
         // Each id maps to zanc's supported path for this host: native for the
         // host OS, self-contained musl-static for Linux, --target cross for the
@@ -1181,8 +1194,12 @@ partial class ZanIDE {
         while (ti < ids.Count) {
             if (ti < sel.Count && sel[ti] == 1) {
                 string id = ids[ti];
+                // One directory per target: a publish drops driver DLLs /
+                // dylibs and resources next to its executable, so sharing a
+                // directory would mix incompatible binaries of the same name.
+                string outDir = ZanIDE.PublishDir(root, id);
                 if (id == "windows-x64") {
-                    string exe = root + "/publish/" + baseName + "-windows-x64.exe";
+                    string exe = outDir + "/" + baseName + "-windows-x64.exe";
                     string ll = bd + "/.zanpub_x64.ll";
                     if (seq != "") { seq = seq + sep; }
                     if (pack) {
@@ -1200,7 +1217,7 @@ partial class ZanIDE {
                     exes.Add(exe);
                     log.Add("> Publishing windows-x64 ...");
                 } else if (id == "windows-arm64") {
-                    string exe = root + "/publish/" + baseName + "-windows-arm64.exe";
+                    string exe = outDir + "/" + baseName + "-windows-arm64.exe";
                     if (seq != "") { seq = seq + sep; }
                     // Cross-compile ARM64 through zanc's bundled toolchain
                     // (win-arm64 target) -- no external clang needed.
@@ -1221,7 +1238,7 @@ partial class ZanIDE {
                     // (ld64.lld, the bundled libSystem stub and the committed
                     // Cocoa driver). Either way the output is a bare Mach-O, so
                     // there is no single-file pack step.
-                    string exe = root + "/publish/" + baseName + "-" + id;
+                    string exe = outDir + "/" + baseName + "-" + id;
                     if (seq != "") { seq = seq + sep; }
                     if (id == hostId) {
                         seq = seq + "(" + ZanIDE.CompileToExe(root, p, inputs, "", exe, true) + ")";
@@ -1232,7 +1249,7 @@ partial class ZanIDE {
                     log.Add("> Publishing " + id + " ...");
                 } else if (id == "linux-x64") {
                     // Self-contained musl static single file (cross from any host).
-                    string exe = root + "/publish/" + baseName + "-linux-x64";
+                    string exe = outDir + "/" + baseName + "-linux-x64";
                     if (seq != "") { seq = seq + sep; }
                     seq = seq + "(" + zc + " --publish " + inputs
                         + " --target linux-musl --link-mode static -o \"" + exe + "\")";
@@ -1240,7 +1257,7 @@ partial class ZanIDE {
                     log.Add("> Publishing linux-x64 ...");
                 } else if (id == "linux-arm64") {
                     // Same musl static path as linux-x64; only triple/sysroot differ.
-                    string exe = root + "/publish/" + baseName + "-linux-arm64";
+                    string exe = outDir + "/" + baseName + "-linux-arm64";
                     if (seq != "") { seq = seq + sep; }
                     seq = seq + "(" + zc + " --publish " + inputs
                         + " --target linux-arm64 --link-mode static -o \"" + exe + "\")";
@@ -1408,6 +1425,14 @@ partial class ZanIDE {
             i = i + 1;
         }
         return outp;
+    }
+
+    /// The (created) output directory of one publish target, e.g.
+    /// `<root>/publish/macos-arm64`.
+    static string PublishDir(string root, string id) {
+        string dir = root + "/publish/" + id;
+        Directory.CreateDirectoryRecursive(dir);
+        return dir;
     }
 
     /// Copies the project's bundled resources (assets/, minus app.ico) into an
