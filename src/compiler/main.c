@@ -1707,7 +1707,7 @@ int main(int argc, char **argv) {
         }
 #endif
         if (cross_compiling && rt_sync_obj && target.os != ZAN_OS_LINUX
-            && target.os != ZAN_OS_MACOS) {
+            && target.os != ZAN_OS_MACOS && target.os != ZAN_OS_WINDOWS) {
             fprintf(stderr,
                     "error: AtomicInt and SharedTable are not available for "
                     "this cross-compilation target yet\n");
@@ -1959,10 +1959,25 @@ int main(int argc, char **argv) {
                 free(source);
                 return 1;
             }
-            if (rt_io_obj) {
+            /* The host objects next to zanc are built for the host arch, so a
+             * cross-link needs the target's own copies, staged beside the
+             * mingw runtime as win-<arch>/zanrt_*.o (scripts/build_win_rt.sh,
+             * refreshed by the drivers workflow). */
+            char winrt_io[1400] = {0};
+            char winrt_sync[1400] = {0};
+            if (rt_io_obj)
+                snprintf(winrt_io, sizeof(winrt_io), "%s/%s/%s", exe_dir2, wsub,
+                         mt_scheduler ? "zanrt_io_mt.o" : "zanrt_io.o");
+            if (rt_sync_obj)
+                snprintf(winrt_sync, sizeof(winrt_sync), "%s/%s/zanrt_sync.o",
+                         exe_dir2, wsub);
+            if ((winrt_io[0] && !zan_file_exists(winrt_io))
+                || (winrt_sync[0] && !zan_file_exists(winrt_sync))) {
                 fprintf(stderr,
-                        "error: socket-async programs are not available for "
-                        "this cross-compilation target yet\n");
+                        "error: bundled %s runtime objects not found in "
+                        "'%s/%s'; reinstall zan or rebuild with toolchain/%s "
+                        "present (see scripts/build_win_rt.sh)\n",
+                        wsub, exe_dir2, wsub, wsub);
                 remove(obj_tmp);
                 zan_irgen_destroy(&irgen);
                 zan_arena_free(arena);
@@ -1994,6 +2009,14 @@ int main(int argc, char **argv) {
             }
             { size_t cur = strlen(cmd);
               snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"", obj_tmp); }
+            if (winrt_io[0]) {
+                size_t cur = strlen(cmd);
+                snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"", winrt_io);
+            }
+            if (winrt_sync[0]) {
+                size_t cur = strlen(cmd);
+                snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"", winrt_sync);
+            }
             for (int ei = 0; ei < extra_link_input_count; ei++) {
                 size_t cur = strlen(cmd);
                 snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"",
@@ -2003,6 +2026,10 @@ int main(int argc, char **argv) {
               snprintf(cmd + cur, sizeof(cmd) - cur, " --start-group"
                        " -lmingw32 -lmoldname -lmingwex -lmsvcrt"
                        " -lkernel32 -ladvapi32 -lshell32 -luser32"); }
+            if (winrt_io[0]) {
+                size_t cur = strlen(cmd);
+                snprintf(cmd + cur, sizeof(cmd) - cur, " -lws2_32");
+            }
             { size_t cur = strlen(cmd);
               snprintf(cmd + cur, sizeof(cmd) - cur, have_gcc
                        ? " -lgcc -lgcc_eh"
