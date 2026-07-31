@@ -1,0 +1,503 @@
+using System;
+
+/// The tool layer behind the AI assistant panel.
+///
+/// The assistant is a loop, not a single question: the model answers with a
+/// fenced `zan-tool` block, the IDE runs that tool inside the project, appends
+/// the result to the transcript and asks again. That is what lets it look at
+/// the real code instead of guessing from the one file that happens to be open.
+///
+///     ```zan-tool
+///     {"tool": "read_file", "path": "src/Main.zan", "offset": 1, "limit": 200}
+///     ```
+///
+/// The protocol is plain text on purpose: it works with any OpenAI-compatible
+/// endpoint, including local models that do not implement function calling.
+///
+/// Read tools (`read_file`, `list_dir`, `grep`, `repo_map`) run silently.
+/// The mutating tools (`write_file`, `edit_file`, `build`, `run`) wait for the
+/// user's Approve unless "Auto-execute" is on -- that gate is enforced by the
+/// panel, not by trusting the model. Every file tool is confined to the
+/// project directory: `SafePath` rejects absolute paths and any `..` that
+/// would escape the root.
+class AiAgent {
+    /// Hard ceiling on tool calls per user question, so a model that keeps
+    /// asking for files can never spin forever. Higher than the read-only
+    /// era because an edit -> build -> read-error -> fix cycle spends a few
+    /// steps per change.
+    static int MaxSteps() { return 20; }
+
+    /// Largest slice of a file handed to the model in one read.
+    static int MaxReadChars() { return 12000; }
+
+    /// The fenced marker the model wraps a tool call in.
+    static string Fence() { return "```zan-tool"; }
+
+    /// Extracts the first `zan-tool` block's JSON from a model reply, or ""
+    /// when the reply is a normal answer.
+    static string ToolBlock(string reply) {
+        int a = ZanIDE.IndexOfStr(reply, AiAgent.Fence());
+        if (a < 0) { return ""; }
+        int s = a + AiAgent.Fence().Length;
+        while (s < reply.Length && reply.Substring(s, 1) != "\n") { s = s + 1; }
+        s = s + 1;
+        if (s >= reply.Length) { return ""; }
+        string rest = reply.Substring(s, reply.Length - s);
+        int b = ZanIDE.IndexOfStr(rest, "```");
+        if (b < 0) { return ""; }
+        return rest.Substring(0, b);
+    }
+
+    /// The reply with its tool block removed -- what is worth showing in the
+    /// transcript while the tool runs.
+    static string StripToolBlock(string reply) {
+        int a = ZanIDE.IndexOfStr(reply, AiAgent.Fence());
+        if (a < 0) { return reply; }
+        return AiAgent.Trim(reply.Substring(0, a));
+    }
+
+    static string Trim(string s) {
+        int a = 0;
+        while (a < s.Length) {
+            string ch = s.Substring(a, 1);
+            if (ch != " " && ch != "\n" && ch != "\r" && ch != "\t") { break; }
+            a = a + 1;
+        }
+        int b = s.Length;
+        while (b > a) {
+            string ch = s.Substring(b - 1, 1);
+            if (ch != " " && ch != "\n" && ch != "\r" && ch != "\t") { break; }
+            b = b - 1;
+        }
+        return s.Substring(a, b - a);
+    }
+
+    /// How many tool calls have already run for the question being answered:
+    /// the trailing run of tool results since the last thing the user typed.
+    static int StepsSinceUser(List<string> roles) {
+        int n = 0;
+        int i = roles.Count - 1;
+        while (i >= 0) {
+            if (roles[i] == "user") { return n; }
+            if (roles[i] == "tool") { n = n + 1; }
+            i = i - 1;
+        }
+        return n;
+    }
+
+    // --- path sandbox --------------------------------------------------------
+
+    /// Resolves a project-relative path against `root`, or returns "" when it
+    /// is absolute or climbs out of the project. Every tool goes through this,
+    /// so the assistant cannot read the user's whole disk.
+    static string SafePath(string root, string rel) {
+        if (root == "") { return ""; }
+        string p = AiAgent.Trim(rel);
+        if (p == "" || p == ".") { return root; }
+        p = AiAgent.Slashes(p);
+        if (ZanIDE.IndexOfStr(p, "..") >= 0) { return ""; }
+        if (p.Substring(0, 1) == "/") { return ""; }
+        if (p.Length >= 2 && p.Substring(1, 1) == ":") { return ""; }
+        return root + "/" + p;
+    }
+
+    static string Slashes(string p) {
+        StringBuilder sb = new StringBuilder();
+        int i = 0;
+        while (i < p.Length) {
+            string ch = p.Substring(i, 1);
+            if (ch == "\\") { sb.Append("/"); } else { sb.Append(ch); }
+            i = i + 1;
+        }
+        return sb.ToString();
+    }
+
+    /// Directories a code search never needs to walk into.
+    static bool SkipDir(string name) {
+        return name == ".git" || name == "build" || name == "publish"
+            || name == "node_modules" || name == ".zanmap" || name == "obj"
+            || name == "bin" || name == "_scratch";
+    }
+
+    /// True for a file worth searching: source and config text, not binaries.
+    static bool TextFile(string name) {
+        string e = AiAgent.ExtOf(name);
+        return e == "zan" || e == "css" || e == "json" || e == "md"
+            || e == "txt" || e == "proj" || e == "zform" || e == "zscene"
+            || e == "c" || e == "h" || e == "ps1" || e == "yml" || e == "cfg";
+    }
+
+    static string ExtOf(string name) {
+        int i = name.Length - 1;
+        while (i >= 0) {
+            if (name.Substring(i, 1) == ".") {
+                return name.Substring(i + 1, name.Length - i - 1);
+            }
+            if (name.Substring(i, 1) == "/") { return ""; }
+            i = i - 1;
+        }
+        return "";
+    }
+
+    // --- dispatch ------------------------------------------------------------
+
+    /// Runs one tool call and returns the text handed back to the model.
+    /// Never throws at the caller: a bad call comes back as an `error:` line
+    /// the model can read and correct itself from.
+    static string Run(string root, string json) {
+        JsonValue v = JsonValue.ParseLenient(json);
+        if (v == null) {
+            return "error: the tool call is not valid JSON.";
+        }
+        string tool = v.Str("tool", "");
+        if (tool == "read_file") {
+            return AiAgent.ReadFile(root, v.Str("path", ""),
+                                    v.Int("offset", 1), v.Int("limit", 300));
+        }
+        if (tool == "list_dir") {
+            return AiAgent.ListDir(root, v.Str("path", ""));
+        }
+        if (tool == "grep") {
+            return AiAgent.Grep(root, v.Str("pattern", ""), v.Str("path", ""),
+                                v.Str("ext", ""));
+        }
+        if (tool == "repo_map") {
+            return AiAgent.RepoMap(root);
+        }
+        if (tool == "write_file") {
+            return AiAgent.WriteFile(root, v.Str("path", ""),
+                                     v.Str("content", ""));
+        }
+        if (tool == "edit_file") {
+            return AiAgent.EditFile(root, v.Str("path", ""),
+                                    v.Str("old", ""), v.Str("new", ""));
+        }
+        if (tool == "build" || tool == "run") {
+            // These need the IDE's async build machinery, so the panel drives
+            // them directly; they never reach here.
+            return "error: '" + tool + "' is run by the IDE, not this dispatch.";
+        }
+        return "error: unknown tool '" + tool + "'. Available: read_file,"
+            + " list_dir, grep, repo_map, write_file, edit_file, build, run.";
+    }
+
+    /// True for a tool that changes the project or runs code, so the panel
+    /// asks the user before it runs (unless Auto-execute is on).
+    static bool IsMutating(string tool) {
+        return tool == "write_file" || tool == "edit_file"
+            || tool == "build" || tool == "run";
+    }
+
+    /// The tool name of a call, or "" for a malformed one.
+    static string ToolName(string json) {
+        JsonValue v = JsonValue.ParseLenient(json);
+        if (v == null) { return ""; }
+        return v.Str("tool", "");
+    }
+
+    /// A one-line description of a call, shown folded in the transcript so the
+    /// user can see what the assistant looked at.
+    static string Describe(string json) {
+        JsonValue v = JsonValue.ParseLenient(json);
+        if (v == null) { return "tool"; }
+        string tool = v.Str("tool", "?");
+        if (tool == "grep") {
+            return "grep \"" + v.Str("pattern", "") + "\"";
+        }
+        if (tool == "repo_map") { return "repo_map"; }
+        if (tool == "build") { return "build"; }
+        if (tool == "run") { return "run"; }
+        return tool + " " + v.Str("path", "");
+    }
+
+    // --- tools ---------------------------------------------------------------
+
+    /// Reads `limit` lines from `path` starting at 1-based `offset`, numbered
+    /// so the model can quote exact line numbers back.
+    static string ReadFile(string root, string path, int offset, int limit) {
+        string full = AiAgent.SafePath(root, path);
+        if (full == "") { return "error: path outside the project: " + path; }
+        if (!File.Exists(full)) { return "error: no such file: " + path; }
+        int from = offset;
+        if (from < 1) { from = 1; }
+        int max = limit;
+        if (max < 1) { max = 1; }
+        if (max > 600) { max = 600; }
+        List<string> lines = CodeEditor.SplitLines(File.ReadAllText(full));
+        StringBuilder sb = new StringBuilder();
+        sb.Append(path + " (" + Convert.ToString(lines.Count) + " lines)\n");
+        int i = from - 1;
+        int shown = 0;
+        while (i < lines.Count && shown < max) {
+            sb.Append(Convert.ToString(i + 1) + ": " + lines[i] + "\n");
+            if (sb.Length > AiAgent.MaxReadChars()) {
+                sb.Append("... truncated, read again with a larger offset\n");
+                return sb.ToString();
+            }
+            i = i + 1;
+            shown = shown + 1;
+        }
+        if (i < lines.Count) {
+            sb.Append("... " + Convert.ToString(lines.Count - i)
+                + " more lines; read again with offset "
+                + Convert.ToString(i + 1) + "\n");
+        }
+        return sb.ToString();
+    }
+
+    /// Lists one directory: sub-directories first, then files.
+    static string ListDir(string root, string path) {
+        string full = AiAgent.SafePath(root, path);
+        if (full == "") { return "error: path outside the project: " + path; }
+        if (!Directory.Exists(full)) { return "error: no such directory: " + path; }
+        StringBuilder sb = new StringBuilder();
+        List<string> dirs = Directory.GetDirectories(full);
+        int i = 0;
+        while (i < dirs.Count) {
+            sb.Append(Path.GetFileName(dirs[i]) + "/\n");
+            i = i + 1;
+        }
+        List<string> files = Directory.GetFiles(full);
+        int f = 0;
+        while (f < files.Count) {
+            sb.Append(Path.GetFileName(files[f]) + "\n");
+            f = f + 1;
+        }
+        if (dirs.Count == 0 && files.Count == 0) { return "(empty)"; }
+        return sb.ToString();
+    }
+
+    /// Substring search across the project's text files, reported as
+    /// `path:line: text` -- the assistant's way of finding where a symbol is
+    /// actually defined and used before it changes anything.
+    static string Grep(string root, string pattern, string path, string ext) {
+        if (pattern == "") { return "error: grep needs a 'pattern'."; }
+        string start = AiAgent.SafePath(root, path);
+        if (start == "") { return "error: path outside the project: " + path; }
+        if (!Directory.Exists(start)) { start = root; }
+        List<string> hits = new List<string>();
+        AiAgent.GrepDir(start, root, pattern, ext, hits, 0);
+        if (hits.Count == 0) { return "no match for \"" + pattern + "\""; }
+        StringBuilder sb = new StringBuilder();
+        int i = 0;
+        while (i < hits.Count) { sb.Append(hits[i] + "\n"); i = i + 1; }
+        if (hits.Count >= 80) {
+            sb.Append("... more matches; narrow the pattern\n");
+        }
+        return sb.ToString();
+    }
+
+    static void GrepDir(string dir, string root, string pattern, string ext,
+                        List<string> hits, int depth) {
+        if (hits.Count >= 80 || depth > 8) { return; }
+        List<string> files = Directory.GetFiles(dir);
+        int f = 0;
+        while (f < files.Count && hits.Count < 80) {
+            string name = Path.GetFileName(files[f]);
+            bool want = AiAgent.TextFile(name);
+            if (ext != "" && AiAgent.ExtOf(name) != ext) { want = false; }
+            if (want) { AiAgent.GrepFile(files[f], root, pattern, hits); }
+            f = f + 1;
+        }
+        List<string> dirs = Directory.GetDirectories(dir);
+        int d = 0;
+        while (d < dirs.Count && hits.Count < 80) {
+            if (!AiAgent.SkipDir(Path.GetFileName(dirs[d]))) {
+                AiAgent.GrepDir(dirs[d], root, pattern, ext, hits, depth + 1);
+            }
+            d = d + 1;
+        }
+    }
+
+    static void GrepFile(string full, string root, string pattern,
+                         List<string> hits) {
+        string body = File.ReadAllText(full);
+        if (ZanIDE.IndexOfStr(body, pattern) < 0) { return; }
+        string rel = full;
+        if (rel.Length > root.Length + 1 && rel.Substring(0, root.Length) == root) {
+            rel = rel.Substring(root.Length + 1, rel.Length - root.Length - 1);
+        }
+        rel = AiAgent.Slashes(rel);
+        List<string> lines = CodeEditor.SplitLines(body);
+        int i = 0;
+        while (i < lines.Count && hits.Count < 80) {
+            if (ZanIDE.IndexOfStr(lines[i], pattern) >= 0) {
+                string txt = lines[i];
+                if (txt.Length > 200) { txt = txt.Substring(0, 200) + "..."; }
+                hits.Add(rel + ":" + Convert.ToString(i + 1) + ": " + txt);
+            }
+            i = i + 1;
+        }
+    }
+
+    /// The RepoMap outline (files, classes, method signatures) produced by the
+    /// RepoMap tool, when the project has one.
+    static string RepoMap(string root) {
+        string mapPath = root + "/.zanmap/repo.map.txt";
+        if (!File.Exists(mapPath)) {
+            return "error: this project has no RepoMap yet; run the RepoMap"
+                + " tool from the IDE first, or use list_dir / grep.";
+        }
+        string rm = File.ReadAllText(mapPath);
+        if (rm.Length > 12000) { rm = rm.Substring(0, 12000) + "\n... truncated"; }
+        return rm;
+    }
+
+    // --- write tools ---------------------------------------------------------
+
+    /// Writes `content` to `path`, creating parent directories as needed.
+    /// Used for new files or full rewrites; prefer `edit_file` for a small
+    /// change to an existing file. Confined to the project by `SafePath`.
+    static string WriteFile(string root, string path, string content) {
+        string full = AiAgent.SafePath(root, path);
+        if (full == "") { return "error: path outside the project: " + path; }
+        string dir = ZanIDE.DirOf(full);
+        if (dir != "" && dir != "." && !Directory.Exists(dir)) {
+            Directory.CreateDirectoryRecursive(dir);
+        }
+        File.WriteAllText(full, content);
+        List<string> lines = CodeEditor.SplitLines(content);
+        return "wrote " + path + " (" + Convert.ToString(lines.Count)
+            + " lines, " + Convert.ToString(content.Length) + " chars)";
+    }
+
+    /// Replaces the single occurrence of `old` in `path` with `new`. The match
+    /// must be unique -- if `old` is missing or appears more than once the edit
+    /// is refused with an error the model can correct from, so a change never
+    /// lands in the wrong place.
+    static string EditFile(string root, string path, string oldS, string newS) {
+        if (oldS == "") {
+            return "error: edit_file needs the 'old' text to find and replace.";
+        }
+        string full = AiAgent.SafePath(root, path);
+        if (full == "") { return "error: path outside the project: " + path; }
+        if (!File.Exists(full)) { return "error: no such file: " + path; }
+        string body = File.ReadAllText(full);
+        int first = ZanIDE.IndexOfStr(body, oldS);
+        if (first < 0) {
+            return "error: 'old' text not found in " + path
+                + "; read the file and copy the exact text (including indentation).";
+        }
+        int after = first + oldS.Length;
+        string rest = body.Substring(after, body.Length - after);
+        if (ZanIDE.IndexOfStr(rest, oldS) >= 0) {
+            return "error: 'old' text appears more than once in " + path
+                + "; include more surrounding lines so the match is unique.";
+        }
+        string updated = body.Substring(0, first) + newS + rest;
+        File.WriteAllText(full, updated);
+        return "edited " + path + " (replaced 1 occurrence, now "
+            + Convert.ToString(updated.Length) + " chars)";
+    }
+
+    /// Turns a finished build's compiler output into the result handed back to
+    /// the model: the pass/fail line, then the actual error/warning lines (or
+    /// a tail of the log when there are none) so it reads real diagnostics
+    /// rather than a summary it has to trust.
+    static string BuildResult(List<string> lines, bool ok, bool ran) {
+        StringBuilder sb = new StringBuilder();
+        if (ok) { sb.Append("build succeeded"); }
+        else { sb.Append("build FAILED"); }
+        if (ok && ran) { sb.Append("; program launched"); }
+        sb.Append(".\n");
+        List<string> keep = new List<string>();
+        int i = 0;
+        while (i < lines.Count) {
+            string ln = lines[i];
+            if (ZanIDE.IndexOfStr(ln, "error") >= 0
+                || ZanIDE.IndexOfStr(ln, "Error") >= 0
+                || ZanIDE.IndexOfStr(ln, "warning") >= 0) {
+                keep.Add(ln);
+            }
+            i = i + 1;
+        }
+        if (keep.Count == 0) {
+            int from = lines.Count - 20;
+            if (from < 0) { from = 0; }
+            int k = from;
+            while (k < lines.Count) { sb.Append(lines[k] + "\n"); k = k + 1; }
+        } else {
+            int shown = keep.Count;
+            if (shown > 40) { shown = 40; }
+            int k = 0;
+            while (k < shown) { sb.Append(keep[k] + "\n"); k = k + 1; }
+            if (keep.Count > shown) {
+                sb.Append("... " + Convert.ToString(keep.Count - shown)
+                    + " more diagnostic lines\n");
+            }
+        }
+        return sb.ToString();
+    }
+
+    // --- prompt --------------------------------------------------------------
+
+    /// The assistant's standing instructions. The rules are what keep a model
+    /// from guessing: look before answering, fix the general layer, and never
+    /// claim something works without having checked it.
+    static string SystemPrompt(string ctxName, string ctxCode, string root) {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("You are the AI assistant built into Zan IDE, the IDE of the"
+            + " Zan programming language. Help the user develop the project"
+            + " that is open. Answer concisely, in the user's language.\n\n");
+        sb.Append("TOOLS. You can look at the project yourself. To call a tool,"
+            + " reply with ONLY a fenced block and nothing else:\n"
+            + AiAgent.Fence() + "\n{\"tool\": \"read_file\", \"path\":"
+            + " \"src/Main.zan\", \"offset\": 1, \"limit\": 200}\n```\n"
+            + "Read tools (run silently):\n"
+            + "- read_file {path, offset, limit}: numbered lines of one file.\n"
+            + "- list_dir {path}: entries of one directory (\"\" = project root).\n"
+            + "- grep {pattern, path, ext}: substring search across the project;"
+            + " returns path:line: text.\n"
+            + "- repo_map {}: outline of the whole codebase, when available.\n"
+            + "Action tools (the IDE asks the user to approve each one first,"
+            + " unless they turned on Auto-execute):\n"
+            + "- edit_file {path, old, new}: replace the UNIQUE occurrence of"
+            + " `old` with `new` in an existing file. Copy `old` verbatim from a"
+            + " read_file, including indentation; if it is not unique the edit is"
+            + " refused, so include enough surrounding lines. Prefer this for"
+            + " small changes.\n"
+            + "- write_file {path, content}: create a new file or fully rewrite"
+            + " one. `content` is the whole file.\n"
+            + "- build {}: compile the current run target and send you the"
+            + " compiler errors/warnings.\n"
+            + "- run {}: build, then launch the program.\n"
+            + "Paths are relative to the project root; absolute paths and '..'"
+            + " are refused. The IDE runs the tool and sends you the result,"
+            + " then you continue. One tool call per reply, at most "
+            + Convert.ToString(AiAgent.MaxSteps()) + " per question. If the user"
+            + " rejects an action, do not repeat it -- propose something else or"
+            + " ask.\n\n");
+        sb.Append("RULES.\n"
+            + "1. Look before you touch. Read the code a change depends on"
+            + " first; find the real source of a value with grep before editing."
+            + " Never invent a file, symbol or API you have not seen.\n"
+            + "2. Cite what you found as path:line so the user can check you.\n"
+            + "3. Fix the general layer, not the symptom: prefer changing the"
+            + " shared style/layout/helper over special-casing one screen, and"
+            + " never hard-code coordinates or magic values to hide a bug.\n"
+            + "4. After you edit code, build (or run) to verify it. Do not claim"
+            + " anything is fixed, built or tested unless a tool actually ran and"
+            + " you read the result; if a build fails, read the errors and fix"
+            + " them. Say plainly what is still unverified.\n"
+            + "5. Keep edits minimal and in the surrounding style; prefer"
+            + " edit_file over rewriting a whole file. Do not change code that is"
+            + " not part of the question.\n"
+            + "6. Lead with the answer or the bad news; skip preamble.\n\n");
+        if (ctxName != "") {
+            string ctx = ctxCode;
+            if (ctx.Length > 6000) { ctx = ctx.Substring(0, 6000); }
+            sb.Append("The user is currently editing " + ctxName
+                + ". Its current content:\n" + ctx + "\n\n");
+        }
+        if (root != "") {
+            string mapPath = root + "/.zanmap/repo.map.txt";
+            if (File.Exists(mapPath)) {
+                string rm = File.ReadAllText(mapPath);
+                if (rm.Length > 8000) { rm = rm.Substring(0, 8000); }
+                sb.Append("Project structure (RepoMap outline -- files, classes"
+                    + " and method signatures):\n" + rm + "\n");
+            }
+        }
+        return sb.ToString();
+    }
+}

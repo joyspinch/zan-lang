@@ -2902,7 +2902,61 @@ partial class ZanIDE {
                         }
                         app.RequestRedraw();
                     }
-                    int aiInpId = aiInput.Render(app, rp.x + rPad, rInY, rInW, rInH);
+                    // Input row: an [Auto] toggle, the prompt box and Send --
+                    // or, while a write / build / run waits, an Approve /
+                    // Reject bar. Auto-execute OFF means every action tool asks
+                    // first; ON lets the loop edit, build and run on its own.
+                    aiAutoBtn.Text = aiAutoExec ? ZanIDE.T("Auto: on", "自动:开")
+                        : ZanIDE.T("Auto: off", "自动:关");
+                    aiAutoBtn.Class = aiAutoExec ? "primary small" : "small";
+                    int aiAutoW = app.Scale(84);
+                    int aiAutoId = aiAutoBtn.Render(app, rp.x + rPad, rInY, aiAutoW);
+                    if (Ui.Clicked(app, aiAutoId)) {
+                        aiAutoExec = !aiAutoExec;
+                        app.RequestRedraw();
+                    }
+                    if (aiBusy.Get() == 2) {
+                        // Confirm bar: show the parked action and let the user
+                        // Approve (run it) or Reject (tell the model to try
+                        // something else). Nothing ran while it waited here.
+                        string pdesc = ZanIDE.T("Run ", "执行 ")
+                            + AiAgent.Describe(aiPendingCall) + " ?";
+                        if (pdesc.Length > 44) { pdesc = pdesc.Substring(0, 44) + "..."; }
+                        app.canvas.DrawText(rp.x + rPad * 2 + aiAutoW, rInY + app.Scale(8),
+                            pdesc, app.theme.textPrimary, app.theme.fontSizeSmall);
+                        int rjId = aiRejectBtn.Render(app,
+                            rp.x + rp.width - rBtnW * 2 - rPad * 2, rInY, rBtnW);
+                        int apId = aiApproveBtn.Render(app,
+                            rp.x + rp.width - rBtnW - rPad, rInY, rBtnW);
+                        if (Ui.Clicked(app, apId)) {
+                            string capC = aiPendingCall;
+                            aiPendingCall = "";
+                            aiBusy.Set(1);
+                            AiDispatchTool(capC);
+                            aiScroll.Set(0);
+                            app.RequestRedraw();
+                        }
+                        if (Ui.Clicked(app, rjId)) {
+                            string capR = aiPendingCall;
+                            aiPendingCall = "";
+                            aiRole.Add("tool");
+                            aiText.Add(AiAgent.Describe(capR) + "\n"
+                                + "user declined this action; do not repeat it --"
+                                + " propose an alternative or ask what to do instead.");
+                            string rerr = ZanIDE.AiLaunch(aiRole, aiText, aiRunCtxName,
+                                aiRunCtxCode, root, aiProfBases[aiProfActive],
+                                aiProfKeys[aiProfActive], aiRunModel);
+                            if (rerr != "") {
+                                aiRole.Add("error"); aiText.Add(rerr); aiBusy.Set(0);
+                            } else { aiBusy.Set(1); }
+                            aiScroll.Set(0);
+                            app.RequestRedraw();
+                        }
+                    } else {
+                    int aiInpX = rp.x + rPad * 2 + aiAutoW;
+                    int aiInpW = rInW - aiAutoW - rPad;
+                    if (aiInpW < app.Scale(40)) { aiInpW = app.Scale(40); }
+                    int aiInpId = aiInput.Render(app, aiInpX, rInY, aiInpW, rInH);
                     int sendId = aiSendBtn.Render(app, rp.x + rPad * 2 + rInW, rInY, rBtnW);
                     bool doSend = Ui.Clicked(app, sendId);
                     if (!doSend && app.EventKind() == 6
@@ -2924,6 +2978,9 @@ partial class ZanIDE {
                                 if (ZanIDE.IsFormPath(tabPaths[act])) { aiCtxCode = tabBodies[act]; }
                                 else { aiCtxCode = editor.GetText(); }
                             }
+                            aiRunModel = chatModel;
+                            aiRunCtxName = aiCtxName;
+                            aiRunCtxCode = aiCtxCode;
                             string aerr = ZanIDE.AiLaunch(aiRole, aiText, aiCtxName, aiCtxCode, root,
                                 aiProfBases[aiProfActive], aiProfKeys[aiProfActive], chatModel);
                             if (aerr != "") {
@@ -2935,6 +2992,7 @@ partial class ZanIDE {
                             aiScroll.Set(0);
                             app.RequestRedraw();
                         }
+                    }
                     }
                 }
                 {
@@ -3249,6 +3307,27 @@ partial class ZanIDE {
                         // the previous build produced.
                         ZanIDE.LoadSymbolIndexFor(root);
                         ZanIDE.EmitSymbolsDetach(root, buildTargetPath);
+                        // An AI-initiated build/run: hand the compiler result
+                        // back to the assistant loop so it reads the real
+                        // errors and can fix them, then continue.
+                        if (aiBuildForAi) {
+                            aiBuildForAi = false;
+                            bool aiOk = File.Exists(buildExe);
+                            aiRole.Add("tool");
+                            if (buildThenRun) { aiText.Add("run\n"
+                                + AiAgent.BuildResult(bout, aiOk, true)); }
+                            else { aiText.Add("build\n"
+                                + AiAgent.BuildResult(bout, aiOk, false)); }
+                            string aiBe = ZanIDE.AiLaunch(aiRole, aiText,
+                                aiRunCtxName, aiRunCtxCode, root,
+                                aiProfBases[aiProfActive],
+                                aiProfKeys[aiProfActive], aiRunModel);
+                            if (aiBe != "") {
+                                aiRole.Add("error"); aiText.Add(aiBe);
+                                aiBusy.Set(0);
+                            }
+                            aiScroll.Set(0);
+                        }
                         coLog.Reset();
                         app.RequestRedraw();
                     }
@@ -3303,9 +3382,41 @@ partial class ZanIDE {
                 if (aiBusy.Get() == 1) {
                     if (File.Exists(ZanIDE.AiDonePath())) {
                         File.Delete(ZanIDE.AiDonePath());
-                        aiRole.Add("assistant");
-                        aiText.Add(ZanIDE.AiReadAnswer());
-                        aiBusy.Set(0);
+                        string reply = ZanIDE.AiReadAnswer();
+                        // A reply that asks for a tool is one step of the
+                        // assistant loop, not the answer: run the tool inside
+                        // the project, hand the result back and ask again, so
+                        // the model reads the real code instead of guessing.
+                        string call = AiAgent.ToolBlock(reply);
+                        bool more = call != ""
+                            && AiAgent.StepsSinceUser(aiRole) < AiAgent.MaxSteps();
+                        string said = reply;
+                        if (call != "") { said = AiAgent.StripToolBlock(reply); }
+                        if (said != "") {
+                            aiRole.Add("assistant");
+                            aiText.Add(said);
+                        }
+                        if (more) {
+                            string tname = AiAgent.ToolName(call);
+                            if (AiAgent.IsMutating(tname) && !aiAutoExec) {
+                                // A write / build / run pauses for the user:
+                                // park the call and switch to the confirm state
+                                // (aiBusy == 2). Nothing touches the project
+                                // until they Approve it in the panel.
+                                aiPendingCall = call;
+                                aiBusy.Set(2);
+                            } else {
+                                AiDispatchTool(call);
+                            }
+                        } else {
+                            if (call != "") {
+                                aiRole.Add("error");
+                                aiText.Add(ZanIDE.T(
+                                    "Tool limit reached for this question.",
+                                    "本次提问的工具调用次数已达上限。"));
+                            }
+                            aiBusy.Set(0);
+                        }
                         aiScroll.Set(0);
                     }
                     app.RequestRedraw();
@@ -3993,6 +4104,17 @@ partial class ZanIDE {
         // 1 while a completion request is in flight (curl runs detached and the
         // event loop polls for its done-marker file, so the UI never blocks).
         aiBusy = SignalInt.Create(0);
+        aiRunModel = "";
+        aiRunCtxName = "";
+        aiRunCtxCode = "";
+        // Action tools start gated: nothing is written, built or run until the
+        // user approves it, until they flip Auto-execute on.
+        aiPendingCall = "";
+        aiAutoExec = false;
+        aiBuildForAi = false;
+        aiApproveBtn = new Button { Text = ZanIDE.T("Approve", "批准"), Class = "primary small" };
+        aiRejectBtn = new Button { Text = ZanIDE.T("Reject", "拒绝"), Class = "small" };
+        aiAutoBtn = new Button { Text = ZanIDE.T("Auto: off", "自动:关"), Class = "small" };
         aiInput = new Input(
             ZanIDE.T("Ask AI about your code...", "向 AI 提问，辅助开发..."));
         aiSendBtn = new Button { Text = ZanIDE.T("Send", "发送"), Class = "primary small" };
@@ -4001,6 +4123,51 @@ partial class ZanIDE {
         aiApplyBtn = new Button { Text = ZanIDE.T("Insert code", "插入代码"), Icon = "code", Class = "small" };
         // "Replace file" swaps the whole active file for the last AI code block.
         aiReplaceBtn = new Button { Text = ZanIDE.T("Replace file", "替换整文件"), Class = "small" };
+    }
+
+    /// Runs one assistant tool call inside the open project and continues the
+    /// loop. File tools (`write_file` / `edit_file`, and the read tools) run
+    /// here and their result is handed straight back to the model. `build` /
+    /// `run` go through the IDE's detached build so the window never freezes;
+    /// they leave `aiBusy` at 1 and the build-completion poll feeds the
+    /// compiler output back. A launch error stops the loop.
+    void AiDispatchTool(string call) {
+        string tool = AiAgent.ToolName(call);
+        if (tool == "build" || tool == "run") {
+            string apB = ZanIDE.PathOf(tabPaths, activeTab);
+            string rpB = ZanIDE.RibbonRunTarget(apB, root);
+            if (rpB == "") {
+                aiRole.Add("tool");
+                aiText.Add(AiAgent.Describe(call)
+                    + "\nerror: no buildable/run target is selected in the IDE;"
+                    + " open a program file (with a Main) first.");
+                string e2 = ZanIDE.AiLaunch(aiRole, aiText, aiRunCtxName,
+                    aiRunCtxCode, root, aiProfBases[aiProfActive],
+                    aiProfKeys[aiProfActive], aiRunModel);
+                if (e2 != "") { aiRole.Add("error"); aiText.Add(e2); aiBusy.Set(0); }
+                return;
+            }
+            buildBusy = true;
+            buildThenRun = (tool == "run");
+            buildExe = ZanIDE.RunBuildBegin(root, rpB);
+            buildIsGui = ZanIDE.IsWindowedTarget(root, rpB);
+            buildTargetPath = apB;
+            buildLogLen = 0;
+            aiBuildForAi = true;
+            dock.Focus("output");
+            log.Add(ZanIDE.T("> [AI] Building ", "> [AI] 正在构建 ") + rpB + " ...");
+            app.RequestAnimationFrame(80);
+            return;
+        }
+        string result = AiAgent.Run(root, call);
+        aiRole.Add("tool");
+        aiText.Add(AiAgent.Describe(call) + "\n" + result);
+        // A write may touch a file open in a tab; the disk-change poll picks
+        // that up and offers a reload, so the editor and disk stay in sync.
+        string terr = ZanIDE.AiLaunch(aiRole, aiText, aiRunCtxName,
+            aiRunCtxCode, root, aiProfBases[aiProfActive],
+            aiProfKeys[aiProfActive], aiRunModel);
+        if (terr != "") { aiRole.Add("error"); aiText.Add(terr); aiBusy.Set(0); }
     }
 
     /// AI assistant: provider profiles, chat sessions, transcript cache and the
