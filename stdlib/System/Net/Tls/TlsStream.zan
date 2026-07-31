@@ -1,5 +1,6 @@
 using System;
 using System.Net.Sockets;
+using System.Security.Cryptography;
 
 namespace System.Net.Tls;
 
@@ -57,11 +58,52 @@ class TlsContext {
     string ctx;
     bool server;
     string error;
+    // Public-key (SPKI) pinning: base64 SHA-256 of the server's
+    // SubjectPublicKeyInfo. When required and non-empty, the client rejects a
+    // handshake whose peer key hashes to none of these -- defeating a MITM
+    // that presents an otherwise valid (system-trusted) certificate.
+    List<string> pins;
+    bool pinRequired;
 
     TlsContext() {
         this.ctx = null;
         this.server = false;
         this.error = "";
+        this.pins = null;
+        this.pinRequired = false;
+    }
+
+    /// <summary>Adds an accepted server public-key pin: the base64-encoded
+    /// SHA-256 of the DER SubjectPublicKeyInfo (the value produced by
+    /// `openssl ... -pubkey | openssl pkey -pubin -outform der
+    /// | openssl dgst -sha256 -binary | base64`).</summary>
+    void AddPin(string spkiSha256Base64) {
+        if (this.pins == null) { this.pins = new List<string>(); }
+        this.pins.Add(spkiSha256Base64);
+    }
+
+    /// <summary>Turns pin enforcement on/off. Release builds keep it on so a
+    /// shipped binary always checks configured pins; the development switch in
+    /// the HTTP client is the only way to relax it.</summary>
+    void RequirePinning(bool on) {
+        this.pinRequired = on;
+    }
+
+    /// <summary>True when a handshake must satisfy at least one configured
+    /// pin.</summary>
+    bool PinningActive() {
+        return this.pinRequired && this.pins != null && this.pins.Count > 0;
+    }
+
+    /// <summary>True when `got` (a base64 SPKI SHA-256) matches any pin.</summary>
+    bool PinMatches(string got) {
+        if (this.pins == null) { return false; }
+        int i = 0;
+        while (i < this.pins.Count) {
+            if (this.pins[i] == got) { return true; }
+            i = i + 1;
+        }
+        return false;
     }
 
     /// <summary>Creates a server-side TLS context from a PEM certificate chain
@@ -251,6 +293,20 @@ class TlsStream {
     [DllImport("crypto")]
     static extern int BIO_ctrl_pending(string bio);
 
+    // Public-key pinning: read the peer certificate's SubjectPublicKeyInfo.
+    [DllImport("ssl")]
+    static extern string SSL_get1_peer_certificate(string ssl);
+    [DllImport("crypto")]
+    static extern string X509_get_X509_PUBKEY(string x);
+    [DllImport("crypto")]
+    static extern int i2d_X509_PUBKEY(string pubkey, byte[] pp);
+    [DllImport("crypto")]
+    static extern void X509_free(string x);
+    [DllImport("crypto", EntryPoint = "CRYPTO_free")]
+    static extern void OpenSslFree(nint p, string file, int line);
+    [DllImport("crt", EntryPoint = "memcpy")]
+    static extern nint PlatMemCopyIn(byte[] dst, nint src, long n);
+
     string ssl;
     string rbio;   // socket -> SSL (encrypted in)
     string wbio;   // SSL -> socket (encrypted out)
@@ -321,7 +377,49 @@ class TlsStream {
             s.Close();
             return null;
         }
+        if (ctx.PinningActive()) {
+            string got = TlsStream.SpkiPinOf(s.ssl);
+            if (got == "" || !ctx.PinMatches(got)) {
+                s.Close();
+                return null;
+            }
+        }
         return s;
+    }
+
+    /// <summary>The base64 SHA-256 of the peer certificate's DER
+    /// SubjectPublicKeyInfo (the value pinned via TlsContext.AddPin), or ""
+    /// when no peer certificate / encoding is available.</summary>
+    static string SpkiPinOf(string ssl) {
+        string cert = SSL_get1_peer_certificate(ssl);
+        if (cert == null) { return ""; }
+        string pubkey = X509_get_X509_PUBKEY(cert);
+        if (pubkey == null) {
+            X509_free(cert);
+            return "";
+        }
+        // A zeroed pointer cell means *out == NULL, so i2d allocates the DER
+        // buffer itself and writes the pointer back into `cell`.
+        byte[] cell = new byte[8];
+        int len = Norm(i2d_X509_PUBKEY(pubkey, cell));
+        X509_free(cert);
+        if (len <= 0) { return ""; }
+        nint der = 0;
+        nint mul = 1;
+        int k = 0;
+        while (k < 8) {
+            der = der + (cell[k] & 255) * mul;
+            mul = mul * 256;
+            k = k + 1;
+        }
+        if (der == 0) { return ""; }
+        byte[] spki = new byte[len];
+        PlatMemCopyIn(spki, der, len);
+        OpenSslFree(der, null, 0);
+        string spkiStr = spki.ToStr(0, len);
+        byte[] digest = Sha256.Hash(spkiStr, len);
+        string dstr = digest.ToStr(0, 32);
+        return Base64.Encode(dstr, 32);
     }
 
     // Flushes any pending encrypted output bytes from wbio to the socket.

@@ -30,6 +30,11 @@ class HttpClient {
     string clientCertificateFile;
     string clientPrivateKeyFile;
     List<string> defaultHeaders;
+    // Public-key pinning: accepted server SPKI SHA-256 pins (base64) and
+    // whether they are enforced. Enforcement stays on in release builds; the
+    // dev switch below is compiled out of a shipped binary.
+    List<string> tlsPins;
+    bool pinningEnabled;
 
     [DllImport("crt")]
     static extern nint fopen(string path, string mode);
@@ -49,6 +54,8 @@ class HttpClient {
         this.clientCertificateFile = "";
         this.clientPrivateKeyFile = "";
         this.defaultHeaders = new List<string>();
+        this.tlsPins = null;
+        this.pinningEnabled = false;
     }
 
     /// <summary>Creates an HTTP client for a given host and port.</summary>
@@ -77,6 +84,41 @@ class HttpClient {
     HttpClient DisableTlsVerify() {
         this.verifyTls = false;
         return this;
+    }
+
+    /// <summary>Pins an accepted server public key: the base64 SHA-256 of its
+    /// DER SubjectPublicKeyInfo. Once any pin is set the handshake rejects a
+    /// server whose key matches none of them, even if its certificate is
+    /// otherwise system-trusted -- blocking a MITM proxy. Call twice to pin a
+    /// backup key for rotation.</summary>
+    HttpClient PinPublicKey(string spkiSha256Base64) {
+        if (this.tlsPins == null) { this.tlsPins = new List<string>(); }
+        this.tlsPins.Add(spkiSha256Base64);
+        this.pinningEnabled = true;
+        this.useTls = true;
+        return this;
+    }
+
+    /// <summary>Development-only escape hatch that relaxes pinning so a local
+    /// proxy or self-signed dev server works. Guarded by ZAN_DEV, so a release
+    /// build compiles it out and always enforces configured pins.</summary>
+    HttpClient DisablePinning() {
+        #if ZAN_DEV
+        this.pinningEnabled = false;
+        #endif
+        return this;
+    }
+
+    // Copies the configured pins onto a freshly created client context and
+    // arms enforcement. No-op when pinning is disabled or unconfigured.
+    void ApplyPinning(TlsContext ctx) {
+        if (!this.pinningEnabled || this.tlsPins == null) { return; }
+        int i = 0;
+        while (i < this.tlsPins.Count) {
+            ctx.AddPin(this.tlsPins[i]);
+            i = i + 1;
+        }
+        ctx.RequirePinning(true);
     }
 
     /// <summary>Configures a PEM certificate chain and matching PEM private
@@ -278,6 +320,7 @@ class HttpClient {
         if (!this.verifyTls) {
             ctx.DisableVerify();
         }
+        this.ApplyPinning(ctx);
         TlsStream stream = await TlsStream.ConnectAsync(ctx, conn.Sock(), this.host);
         if (stream == null) {
             conn.Close();
@@ -504,6 +547,7 @@ class HttpClient {
                 return 0;
             }
             if (!this.verifyTls) { ctx.DisableVerify(); }
+            this.ApplyPinning(ctx);
             stream = await TlsStream.ConnectAsync(ctx, conn.Sock(), this.host);
             if (stream == null) {
                 conn.Close();
