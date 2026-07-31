@@ -35,6 +35,24 @@ class TlsContext {
     static extern void SSL_CTX_set_verify(string ctx, int mode, string callback);
     [DllImport("ssl")]
     static extern int SSL_CTX_set_default_verify_paths(string ctx);
+    [DllImport("ssl")]
+    static extern string SSL_CTX_get_cert_store(string ctx);
+    [DllImport("crypto")]
+    static extern string d2i_X509(string px, byte[] pp, int len);
+    [DllImport("crypto")]
+    static extern int X509_STORE_add_cert(string store, string x);
+    [DllImport("crypto")]
+    static extern void X509_free(string x);
+    [DllImport("crt", EntryPoint = "memcpy")]
+    static extern nint PlatMemCopyIn(byte[] dst, nint src, long n);
+    #if WINDOWS
+    [DllImport("crypt32", EntryPoint = "CertOpenSystemStoreA")]
+    static extern nint CertOpenSystemStore(nint prov, string name);
+    [DllImport("crypt32")]
+    static extern nint CertEnumCertificatesInStore(nint store, nint prev);
+    [DllImport("crypt32")]
+    static extern int CertCloseStore(nint store, int flags);
+    #endif
 
     string ctx;
     bool server;
@@ -79,6 +97,12 @@ class TlsContext {
         c.ctx = SSL_CTX_new(TLS_client_method());
         if (c.ctx == null) { return null; }
         int _v = SSL_CTX_set_default_verify_paths(c.ctx);
+        #if WINDOWS
+        // OpenSSL's compiled-in default trust paths do not exist on Windows,
+        // so mirror what schannel-based tools (curl) get for free: pull the
+        // machine/user ROOT certificate store into this context's X509_STORE.
+        TlsContext.LoadSystemRootsWindows(c.ctx);
+        #endif
         // 1 = SSL_VERIFY_PEER
         SSL_CTX_set_verify(c.ctx, 1, null);
         return c;
@@ -109,6 +133,61 @@ class TlsContext {
     void DisableVerify() {
         SSL_CTX_set_verify(this.ctx, 0, null);
     }
+
+    // Reads a native pointer-width field out of a struct at ptr + off.
+    static nint PtrAt(nint ptr, int off) {
+        byte[] x = new byte[8];
+        PlatMemCopyIn(x, ptr + off, 8);
+        nint r = 0;
+        nint m = 1;
+        int k = 0;
+        while (k < 8) {
+            r = r + (x[k] & 255) * m;
+            m = m * 256;
+            k = k + 1;
+        }
+        return r;
+    }
+
+    // Reads a little-endian 32-bit field out of a struct at ptr + off.
+    static int IntAt(nint ptr, int off) {
+        byte[] x = new byte[4];
+        PlatMemCopyIn(x, ptr + off, 4);
+        return (x[0] & 255) + ((x[1] & 255) << 8)
+            + ((x[2] & 255) << 16) + ((x[3] & 255) << 24);
+    }
+
+    #if WINDOWS
+    // Enumerates the Windows "ROOT" certificate store and adds every trusted
+    // root (including any locally installed proxy/MITM CA) to the OpenSSL
+    // X509_STORE backing sslctx, so verification matches the system trust.
+    static void LoadSystemRootsWindows(string sslctx) {
+        nint store = CertOpenSystemStore(0, "ROOT");
+        if (store == 0) { return; }
+        string x509store = SSL_CTX_get_cert_store(sslctx);
+        if (x509store == null) {
+            CertCloseStore(store, 0);
+            return;
+        }
+        nint cert = CertEnumCertificatesInStore(store, 0);
+        while (cert != 0) {
+            // CERT_CONTEXT: pbCertEncoded (BYTE*) at +8, cbCertEncoded at +16.
+            nint der = TlsContext.PtrAt(cert, 8);
+            int len = TlsContext.IntAt(cert, 16);
+            if (der != 0 && len > 0) {
+                byte[] pp = new byte[8];
+                PlatMemCopyIn(pp, cert + 8, 8);
+                string x = d2i_X509(null, pp, len);
+                if (x != null) {
+                    X509_STORE_add_cert(x509store, x);
+                    X509_free(x);
+                }
+            }
+            cert = CertEnumCertificatesInStore(store, cert);
+        }
+        CertCloseStore(store, 0);
+    }
+    #endif
 
     string Handle() {
         return this.ctx;

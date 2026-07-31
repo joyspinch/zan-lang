@@ -326,6 +326,9 @@ class Socket {
             ipAddr = 0;
         } else {
             ipAddr = inet_addr(ip);
+            if (ipAddr == 0 - 1) {
+                ipAddr = Socket.ResolveIpv4(ip);
+            }
         }
         addr[4] = (byte)(ipAddr & 255);
         addr[5] = (byte)((ipAddr >> 8) & 255);
@@ -635,6 +638,46 @@ class Socket {
         await Socket.ReadReady(sock);
         string result = RecvFromPeer(sock, bufSize);
         return result;
+    }
+
+    [DllImport("crt", EntryPoint = "memcpy")]
+    static extern nint PlatMemCopyIn(byte[] dst, nint src, long n);
+
+    // Reads a native pointer-width field (8 bytes, little-endian on the LP64
+    // targets this stack builds for) out of a struct at base + off.
+    static nint PtrFieldAt(nint ptr, int off) {
+        byte[] x = new byte[8];
+        PlatMemCopyIn(x, ptr + off, 8);
+        nint p = 0;
+        nint mul = 1;
+        int k = 0;
+        while (k < 8) {
+            p = p + (x[k] & 255) * mul;
+            mul = mul * 256;
+            k = k + 1;
+        }
+        return p;
+    }
+
+    /// <summary>Resolves a hostname to an IPv4 address packed like
+    /// <c>inet_addr</c> (first octet in the low byte), or 0 when it cannot be
+    /// resolved. Pinned to IPv4 via gethostbyname/AF_INET, so a dual-stack host
+    /// that also advertises AAAA records is never reached over an IPv6 path
+    /// that may be advertised but not actually routable.</summary>
+    static int ResolveIpv4(string hostname) {
+        nint he = gethostbyname(hostname);
+        if (he == 0) { return 0; }
+        // struct hostent keeps h_addr_list (char**) at offset 24 on LP64
+        // (Windows x64 and Linux/macOS x64 alike); its first entry points at
+        // the 4 network-order bytes of the address.
+        nint list = Socket.PtrFieldAt(he, 24);
+        if (list == 0) { return 0; }
+        nint first = Socket.PtrFieldAt(list, 0);
+        if (first == 0) { return 0; }
+        byte[] ip = new byte[4];
+        PlatMemCopyIn(ip, first, 4);
+        return (ip[0] & 255) + ((ip[1] & 255) << 8)
+            + ((ip[2] & 255) << 16) + ((ip[3] & 255) << 24);
     }
 
     /// <summary>Resolves a hostname to an IP address.</summary>
