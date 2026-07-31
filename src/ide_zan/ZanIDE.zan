@@ -3452,11 +3452,49 @@ partial class ZanIDE {
                     app.RequestAnimationFrame(250);
                 }
                 // Poll the in-flight AI request: curl runs detached and drops a
-                // done-marker when the response file is complete.
+                // done-marker when the response file is complete. Two guards
+                // keep it from hanging: a settled response file is accepted even
+                // if the marker was lost, and a wait that produces neither is
+                // timed out so the panel always leaves the 'thinking' state.
                 if (aiBusy.Get() == 1) {
-                    if (File.Exists(ZanIDE.AiDonePath())) {
-                        File.Delete(ZanIDE.AiDonePath());
+                    bool aiToolRunning = buildBusy || aiUiRunning || runStreaming;
+                    if (aiToolRunning) {
+                        aiWaitStart = 0;
+                        aiChatFirstResp = 0;
+                    }
+                    bool aiMarker = File.Exists(ZanIDE.AiDonePath());
+                    bool aiRespReady = false;
+                    bool aiTimedOut = false;
+                    if (!aiToolRunning && !aiMarker) {
+                        int aiNow = Window.GetTickMs();
+                        if (File.Exists(ZanIDE.AiRespPath())) {
+                            if (aiChatFirstResp == 0) { aiChatFirstResp = aiNow; }
+                            if (aiNow - aiChatFirstResp > 1200) { aiRespReady = true; }
+                        } else {
+                            aiChatFirstResp = 0;
+                            if (aiWaitStart == 0) { aiWaitStart = aiNow; }
+                            else if (aiNow - aiWaitStart > 210000) { aiTimedOut = true; }
+                        }
+                    }
+                    if (aiTimedOut) {
+                        aiWaitStart = 0;
+                        aiChatFirstResp = 0;
+                        aiRole.Add("error");
+                        aiText.Add(ZanIDE.T(
+                            "[error] AI request timed out - no response received.",
+                            "[错误] AI 请求超时——未收到响应。"));
+                        aiBusy.Set(0);
+                        aiScroll.Set(0);
+                    } else if (aiMarker || aiRespReady) {
+                        aiWaitStart = 0;
+                        aiChatFirstResp = 0;
+                        if (aiMarker) { File.Delete(ZanIDE.AiDonePath()); }
                         string reply = ZanIDE.AiReadAnswer();
+                        // Consume the response file so its mere presence never
+                        // stands in for a later request while a tool runs.
+                        if (File.Exists(ZanIDE.AiRespPath())) {
+                            File.Delete(ZanIDE.AiRespPath());
+                        }
                         // A reply that asks for a tool is one step of the
                         // assistant loop, not the answer: run the tool inside
                         // the project, hand the result back and ask again, so
@@ -4190,6 +4228,8 @@ partial class ZanIDE {
         aiUiRunning = false;
         aiUiScript = "";
         aiUiDeadline = 0;
+        aiChatFirstResp = 0;
+        aiWaitStart = 0;
         aiApproveBtn = new Button { Text = ZanIDE.T("Approve", "批准"), Class = "primary small" };
         aiRejectBtn = new Button { Text = ZanIDE.T("Reject", "拒绝"), Class = "small" };
         aiAutoBtn = new Button { Text = ZanIDE.T("Auto: off", "自动:关"), Class = "small" };
