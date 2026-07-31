@@ -1,6 +1,7 @@
 using System;
 using Gui;
 using Gui.Widget;
+using Gui.Component;
 
 /// The AI chat transcript view, extracted from the shell: transcript
 /// serialization (ChatPack/ChatUnpack), the wrapped markdown-aware line
@@ -239,11 +240,24 @@ class ChatArea {
         return sb.ToString();
     }
 
+    /// The display-line index under `mouseY` for a bottom-anchored transcript
+    /// whose first visible line is `start`.
+    static int RowAtChat(Rect area, int pad, int rowH, int start,
+            int count, int mouseY) {
+        int rel = (mouseY - (area.y + pad)) / rowH;
+        if (rel < 0) { rel = 0; }
+        int ri = start + rel;
+        if (ri < 0) { ri = 0; }
+        if (ri >= count) { ri = count - 1; }
+        return ri;
+    }
+
     /// Draws the (pre-wrapped, cached) chat transcript bottom-anchored inside
     /// `area`; code lines get a code-colored background strip. Returns the
     /// maximum scroll offset.
     static int RenderChatArea(App app, Rect area, List<string> lines,
-            List<int> colors, List<int> kinds, int scroll, bool busy) {
+            List<int> colors, List<int> kinds, int scroll, bool busy,
+            LogState sel, bool interactive) {
         Canvas c = app.canvas;
         Theme t = app.theme;
         int pad = app.Scale(6);
@@ -277,6 +291,47 @@ class ChatArea {
         if (scroll < 0) { scroll = 0; }
         int start = total - maxRows - scroll;
         if (start < 0) { start = 0; }
+        // Drag-to-select over the wrapped display lines, reusing the LogView
+        // selection model (LogState + LogView.ColAt / SelectionText). Wheel
+        // scrolling stays with the caller so it keeps its own scroll model.
+        if (interactive && lines.Count > 0) {
+            int hid = app.focus.AllocId();
+            app.hitTester.Register(HitRegion.Create(hid, area.x, area.y,
+                area.width, area.height, 1));
+            int kind = app.EventKind();
+            bool over = app.mouseX >= area.x && app.mouseX < area.x + area.width
+                && app.mouseY >= area.y && app.mouseY < area.y + area.height;
+            if (kind == 2 && app.window.EventButton() == 0 && over
+                && !app.PointerCaptured()) {
+                int ri = ChatArea.RowAtChat(area, pad, rowH, start,
+                    lines.Count, app.mouseY);
+                int cc = LogView.ColAt(lines[ri], area.x + pad,
+                    t.fontSizeSmall, app.mouseX);
+                sel.selR0 = ri; sel.selC0 = cc;
+                sel.selR1 = ri; sel.selC1 = cc;
+                sel.selDrag = true;
+                app.RequestRedraw();
+            }
+            if (kind == 1 && sel.selDrag) {
+                int ri = ChatArea.RowAtChat(area, pad, rowH, start,
+                    lines.Count, app.mouseY);
+                int cc = LogView.ColAt(lines[ri], area.x + pad,
+                    t.fontSizeSmall, app.mouseX);
+                sel.selR1 = ri; sel.selC1 = cc;
+                app.RequestRedraw();
+            }
+            if (kind == 3 && sel.selDrag) {
+                sel.selDrag = false;
+                app.RequestRedraw();
+            }
+        }
+        int sr0 = sel.selR0; int sc0 = sel.selC0;
+        int sr1 = sel.selR1; int sc1 = sel.selC1;
+        if (sr0 >= 0 && (sr0 > sr1 || (sr0 == sr1 && sc0 > sc1))) {
+            int tr = sr0; sr0 = sr1; sr1 = tr;
+            int tc = sc0; sc0 = sc1; sc1 = tc;
+        }
+        int selCol = App.ScaleAlpha(t.primary, 90);
         c.PushClip(area.x, area.y, area.width, area.height);
         int row = 0;
         int idx = start;
@@ -286,6 +341,25 @@ class ChatArea {
             if (idx < lines.Count) {
                 if (kinds[idx] == 1) {
                     app.FillChrome(area.x + pad - app.Scale(2), ry - app.Scale(1), area.width - pad * 2 + app.Scale(4), rowH, 0, codeBg);
+                }
+                if (sr0 >= 0 && idx >= sr0 && idx <= sr1) {
+                    string ln = lines[idx];
+                    int hs = 0;
+                    int he = ln.Length;
+                    if (idx == sr0) { hs = sc0; }
+                    if (idx == sr1) { he = sc1; }
+                    if (hs < 0) { hs = 0; }
+                    if (he > ln.Length) { he = ln.Length; }
+                    if (hs > he) { hs = he; }
+                    int hx0 = area.x + pad
+                        + Canvas.MeasureText(Text.Left(ln, hs), t.fontSizeSmall);
+                    int hx1 = area.x + pad
+                        + Canvas.MeasureText(Text.Left(ln, he), t.fontSizeSmall);
+                    if (idx < sr1) { hx1 = hx1 + pad; }
+                    if (hx1 < hx0 + 2) { hx1 = hx0 + 2; }
+                    c.FillRect(hx0, ry, hx1 - hx0, rowH, selCol);
+                }
+                if (kinds[idx] == 1) {
                     app.canvas.DrawText(area.x + pad + app.Scale(4), ry, lines[idx], colors[idx],
                         Style.Of(app, "label", "small", Style.SNormal())
                             .FontOr(app.theme.fontSizeSmall));
