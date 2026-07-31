@@ -832,15 +832,24 @@ EXPORT void zan_gui_draw_rect(i32 surface_id, i32 x, i32 y, i32 w, i32 h, i32 co
     /* right */ zan_gui_fill_rect(surface_id, ix + iw - t, iy + t, t, ih - 2*t, color);
 }
 
-/* Anti-aliased rounded rectangle */
-EXPORT void zan_gui_fill_rounded_rect(i32 surface_id, i32 x, i32 y, i32 w, i32 h, i32 radius, i32 color) {
+/* Anti-aliased rounded rectangle whose corners are rounded selectively:
+ * `mask` is a bitset of ZAN_CORNER_TL/TR/BR/BL, so welded neighbours (the
+ * buttons of a group, a tab against its panel) share a square seam while the
+ * outer corners stay round. zan_gui_fill_rounded_rect is this with all four. */
+#define ZAN_CORNER_TL 1
+#define ZAN_CORNER_TR 2
+#define ZAN_CORNER_BR 4
+#define ZAN_CORNER_BL 8
+
+EXPORT void zan_gui_fill_rounded_rect_mask(i32 surface_id, i32 x, i32 y, i32 w, i32 h, i32 radius, i32 mask, i32 color) {
     if (surface_id < 0 || surface_id >= g_surface_count) return;
     zan_surface_t *s = g_surfaces[surface_id];
     if (!s) return;
     u32 c = (u32)color;
     int r = (int)radius;
     int ix = (int)x, iy = (int)y, iw = (int)w, ih = (int)h;
-    if (r <= 0) { zan_gui_fill_rect(surface_id, x, y, w, h, color); return; }
+    int m = (int)mask;
+    if (r <= 0 || (m & 15) == 0) { zan_gui_fill_rect(surface_id, x, y, w, h, color); return; }
     if (r > iw/2) r = iw/2;
     if (r > ih/2) r = ih/2;
     ZAN_STAT(g_st_round, (long long)iw * (long long)ih);
@@ -867,7 +876,13 @@ EXPORT void zan_gui_fill_rounded_rect(i32 surface_id, i32 x, i32 y, i32 w, i32 h
     };
     int zx[4] = {ix, xr, ix, xr};
     int zy[4] = {iy, iy, yb, yb};
+    int bit[4] = {ZAN_CORNER_TL, ZAN_CORNER_TR, ZAN_CORNER_BL, ZAN_CORNER_BR};
     for (int ci = 0; ci < 4; ci++) {
+        if (!(m & bit[ci])) {
+            /* Square corner: its r*r zone is plain fill. */
+            zan_gui_fill_rect(surface_id, zx[ci], zy[ci], r, r, color);
+            continue;
+        }
         double ccx = cc[ci][0], ccy = cc[ci][1];
         for (int py = zy[ci]; py < zy[ci] + r; py++) {
             for (int px = zx[ci]; px < zx[ci] + r; px++) {
@@ -882,19 +897,24 @@ EXPORT void zan_gui_fill_rounded_rect(i32 surface_id, i32 x, i32 y, i32 w, i32 h
     }
 }
 
+EXPORT void zan_gui_fill_rounded_rect(i32 surface_id, i32 x, i32 y, i32 w, i32 h, i32 radius, i32 color) {
+    zan_gui_fill_rounded_rect_mask(surface_id, x, y, w, h, radius, 15, color);
+}
+
 /* Anti-aliased stroked rounded rectangle. Straight edges are crisp (solid
  * fill_rect between the corners); the four corner arcs are anti-aliased rings
  * that share the fill's corner centres/radius so the border hugs a matching
  * fill_rounded_rect exactly instead of the old square DrawRect outline. */
-EXPORT void zan_gui_draw_rounded_rect(i32 surface_id, i32 x, i32 y, i32 w, i32 h, i32 radius, i32 color, i32 thickness) {
+EXPORT void zan_gui_draw_rounded_rect_mask(i32 surface_id, i32 x, i32 y, i32 w, i32 h, i32 radius, i32 mask, i32 color, i32 thickness) {
     if (surface_id < 0 || surface_id >= g_surface_count) return;
     zan_surface_t *s = g_surfaces[surface_id];
     if (!s) return;
     u32 c = (u32)color;
     int ix = (int)x, iy = (int)y, iw = (int)w, ih = (int)h;
     int r = (int)radius, th = (int)thickness;
+    int m = (int)mask;
     if (th < 1) th = 1;
-    if (r <= 0) { zan_gui_draw_rect(surface_id, x, y, w, h, color, thickness); return; }
+    if (r <= 0 || (m & 15) == 0) { zan_gui_draw_rect(surface_id, x, y, w, h, color, thickness); return; }
     if (r > iw/2) r = iw/2;
     if (r > ih/2) r = ih/2;
     if (th > r) th = r;
@@ -912,8 +932,18 @@ EXPORT void zan_gui_draw_rounded_rect(i32 surface_id, i32 x, i32 y, i32 w, i32 h
     };
     int zx[4] = {ix, xr, ix, xr};
     int zy[4] = {iy, iy, yb, yb};
+    int bit[4] = {ZAN_CORNER_TL, ZAN_CORNER_TR, ZAN_CORNER_BL, ZAN_CORNER_BR};
+    int hx[4] = {ix, xr, ix, xr};          /* square-corner horizontal arm */
     double rin = (double)r - (double)th;   /* inner arc radius */
     for (int ci = 0; ci < 4; ci++) {
+        if (!(m & bit[ci])) {
+            /* Square corner: the two straight edges meet as an L. */
+            int cy = (ci < 2) ? zy[ci] : zy[ci] + r - th;
+            int cx = (ci % 2 == 0) ? hx[ci] : hx[ci] + r - th;
+            zan_gui_fill_rect(surface_id, zx[ci], cy, r, th, color);
+            zan_gui_fill_rect(surface_id, cx, zy[ci], th, r, color);
+            continue;
+        }
         double ccx = cc[ci][0], ccy = cc[ci][1];
         for (int py = zy[ci]; py < zy[ci] + r; py++) {
             for (int px = zx[ci]; px < zx[ci] + r; px++) {
@@ -929,6 +959,10 @@ EXPORT void zan_gui_draw_rounded_rect(i32 surface_id, i32 x, i32 y, i32 w, i32 h
             }
         }
     }
+}
+
+EXPORT void zan_gui_draw_rounded_rect(i32 surface_id, i32 x, i32 y, i32 w, i32 h, i32 radius, i32 color, i32 thickness) {
+    zan_gui_draw_rounded_rect_mask(surface_id, x, y, w, h, radius, 15, color, thickness);
 }
 
 /* Anti-aliased filled circle */

@@ -196,6 +196,33 @@ class StyleBox {
     int HeightOr(int fb)  { if (height >= 0) { return height; } return fb; }
     int WidthOr(int fb)   { if (width >= 0) { return width; } return fb; }
 
+    /// Which corners the radius actually applies to (Corner.TL|TR|BR|BL). A
+    /// corner whose own radius is declared as 0 is square, so `border-radius:
+    /// 6 6 0 0` (a tab, the end button of a welded group) paints as a real
+    /// half-rounded box instead of rounding all four.
+    int Corners() {
+        if (radiusTL < 0 && radiusTR < 0 && radiusBR < 0 && radiusBL < 0) {
+            return Corner.All();
+        }
+        int m = 0;
+        if (radiusTL != 0) { m = m + Corner.TL(); }
+        if (radiusTR != 0) { m = m + Corner.TR(); }
+        if (radiusBR != 0) { m = m + Corner.BR(); }
+        if (radiusBL != 0) { m = m + Corner.BL(); }
+        return m;
+    }
+
+    /// Squares off the corners outside `m`, keeping the radius on the rest.
+    void SetCorners(int m) {
+        int r = radius;
+        if (r < 0) { r = 0; }
+        radiusTL = 0; radiusTR = 0; radiusBR = 0; radiusBL = 0;
+        if (m / Corner.TL() % 2 == 1) { radiusTL = r; }
+        if (m / Corner.TR() % 2 == 1) { radiusTR = r; }
+        if (m / Corner.BR() % 2 == 1) { radiusBR = r; }
+        if (m / Corner.BL() % 2 == 1) { radiusBL = r; }
+    }
+
     /// Resolves a metric against the containing block: a percentage wins, then
     /// an absolute declaration, then the caller's fallback.
     static int MetricIn(int pm, int abs, int avail, int fb) {
@@ -413,11 +440,12 @@ class StyleBox {
             Fx.Emboss(app, rx, ry, rw, rh, r, emboss == 2);
         }
 
+        int corners = this.Corners();
         int fill = this.Fade(bg);
         if (bgTo != 0) {
             this.PaintGradient(app, rx, ry, rw, rh, r);
         } else if (fill != 0) {
-            if (r > 0) { c.FillRoundRect(rx, ry, rw, rh, r, fill); }
+            if (r > 0) { c.FillRoundRectIn(rx, ry, rw, rh, r, corners, fill); }
             else { c.FillRect(rx, ry, rw, rh, fill); }
         }
 
@@ -541,7 +569,10 @@ class StyleBox {
             return;
         }
         // Vertical (or diagonal, approximated vertically) with rounded corners:
-        // fill the silhouette, then lay bands inset by the corner arc.
+        // bands down the straight middle, and single pixel rows through the
+        // corner arcs. A whole band inset to the arc turned the corners into a
+        // staircase as tall as the band, which read as teeth on a big surface;
+        // per-row insets follow the same silhouette FillRoundRect draws.
         int bands = h / 3;
         if (bands < 8) { bands = 8; }
         if (bands > 96) { bands = 96; }
@@ -556,9 +587,13 @@ class StyleBox {
                 int p = k * 1000 / bands;
                 int col = StyleBox.MixColor(from, to, p);
                 if (bgVia != 0) { col = StyleBox.ViaColor(from, bgVia, to, p); }
-                int inset = StyleBox.CornerInset(r, by - y, seg, h);
-                if (inset > 0) {
-                    c.FillRoundRect(x + inset, by, w - inset * 2, seg, 0, col);
+                if (by < y + r || by + seg > y + h - r) {
+                    int row = by;
+                    while (row < by + seg) {
+                        int inset = StyleBox.CornerInset(r, row - y, 1, h);
+                        c.FillRect(x + inset, row, w - inset * 2, 1, col);
+                        row = row + 1;
+                    }
                 } else {
                     c.FillRect(x, by, w, seg, col);
                 }
@@ -606,7 +641,7 @@ class StyleBox {
             int bc = this.Fade(borderColor);
             if (bw > 0 && bc != 0) {
                 if (borderStyle == 1) { Fx.DashedBorder(app, x, y, w, h, bc); }
-                else if (r > 0) { c.DrawRoundRect(x, y, w, h, r, bc, bw); }
+                else if (r > 0) { c.DrawRoundRectIn(x, y, w, h, r, this.Corners(), bc, bw); }
                 else { c.DrawRect(x, y, w, h, bc, bw); }
             }
             return;
