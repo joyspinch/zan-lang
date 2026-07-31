@@ -122,6 +122,10 @@ struct zan_binder {
     zan_type_t *type_object;
     zan_type_t *type_nint;
     zan_type_t *type_error;
+
+    /* Set once every declaration is bound: a type reference's meaning is only
+     * stable after that, so zan_binder_resolve_type memoizes from here on. */
+    bool binding_done;
 };
 
 void zan_binder_init(zan_binder_t *b, zan_arena_t *arena, zan_diag_t *diag);

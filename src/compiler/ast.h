@@ -128,6 +128,12 @@ struct zan_ast_node {
      * specialization. NULL on every other node. */
     zan_ast_node_t *inst_type_ref;
 
+    /* Memo for zan_binder_resolve_type on AST_TYPE_REF nodes: the type it
+     * resolved to and the scope that resolution ran in (a type reference can
+     * mean different things in different scopes, e.g. a type parameter). */
+    void *rt_type;
+    void *rt_scope;
+
     union {
         /* literals */
         int64_t int_val;

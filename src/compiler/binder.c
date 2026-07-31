@@ -205,6 +205,16 @@ zan_type_t *zan_binder_resolve_type(zan_binder_t *b, zan_ast_node_t *type_ref) {
         return b->type_error;
     }
 
+    /* Resolving is pure for a given (type reference, scope) pair but allocates
+     * a fresh instantiation type for every generic reference. Overload
+     * resolution re-resolves the same signatures over and over while inferring
+     * an expression's type, so without this memo a deeply nested expression
+     * grows the arena without bound -- large single-file programs ran the host
+     * out of memory. */
+    if (b->binding_done && type_ref->rt_type &&
+        type_ref->rt_scope == (void *)b->current_scope)
+        return (zan_type_t *)type_ref->rt_type;
+
     zan_istr_t name = type_ref->type_ref.name;
 
     /* Resolve the base (element) type first, then apply array / nullable
@@ -327,6 +337,10 @@ zan_type_t *zan_binder_resolve_type(zan_binder_t *b, zan_ast_node_t *type_ref) {
         zan_type_t *nullable = make_type(b->arena, TYPE_NULLABLE, name.str, name.len);
         nullable->element_type = resolved;
         resolved = nullable;
+    }
+    if (b->binding_done && resolved && resolved != b->type_error) {
+        type_ref->rt_type = resolved;
+        type_ref->rt_scope = (void *)b->current_scope;
     }
     return resolved;
 }
@@ -685,4 +699,6 @@ void zan_binder_bind(zan_binder_t *b, zan_ast_node_t *unit) {
 
     /* keep generic type parameters resolvable for the checker / irgen passes */
     register_type_params(b, &unit->comp_unit.decls);
+
+    b->binding_done = true;
 }

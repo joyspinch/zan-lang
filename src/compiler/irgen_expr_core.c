@@ -793,8 +793,57 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
  * `T` in Box<Square> is a Square here. Method lookup and element ownership
  * both go through this, so leaving T unresolved silently lowered
  * `item.Area()` to a 0 and dropped the stored element's retain. */
-static zan_type_t *infer_expr_type(zan_irgen_t *g, zan_ast_node_t *e,
-                                   local_scope_t *locals) {
+/* Inference is re-entered for the same subexpression many times over: a member
+ * access infers its object, and overload scoring infers every argument again,
+ * so a chain like `a.Next().Next().Value()` costs 2^depth inferences -- deeply
+ * nested expressions took minutes and exhausted the host's memory. Results only
+ * depend on the emit context (the locals in scope, the active specialization
+ * and `this`), so they are memoized per AST node and the whole table is dropped
+ * whenever that context changes. */
+#define INFER_CACHE_SLOTS 8192   /* power of two */
+
+typedef struct {
+    zan_ast_node_t *node;
+    zan_type_t *type;
+} infer_cache_slot_t;
+
+static infer_cache_slot_t g_infer_cache[INFER_CACHE_SLOTS];
+static struct {
+    void *locals;
+    int lcount;
+    unsigned gen;
+    void *inst;
+    void *mtps;
+    void *mbind;
+    void *tsym;
+    bool live;
+} g_infer_ctx;
+
+static infer_cache_slot_t *infer_cache_slot(zan_irgen_t *g, zan_ast_node_t *e,
+                                            local_scope_t *locals) {
+    if (!e || !locals) return NULL;
+    if (!g_infer_ctx.live || g_infer_ctx.locals != (void *)locals ||
+        g_infer_ctx.lcount != locals->count || g_infer_ctx.gen != g_local_gen ||
+        g_infer_ctx.inst != (void *)g->cur_inst ||
+        g_infer_ctx.mtps != (void *)g->cur_mtps ||
+        g_infer_ctx.mbind != (void *)g->cur_mbind ||
+        g_infer_ctx.tsym != (void *)g->current_type_sym) {
+        memset(g_infer_cache, 0, sizeof(g_infer_cache));
+        g_infer_ctx.locals = (void *)locals;
+        g_infer_ctx.lcount = locals->count;
+        g_infer_ctx.gen = g_local_gen;
+        g_infer_ctx.inst = (void *)g->cur_inst;
+        g_infer_ctx.mtps = (void *)g->cur_mtps;
+        g_infer_ctx.mbind = (void *)g->cur_mbind;
+        g_infer_ctx.tsym = (void *)g->current_type_sym;
+        g_infer_ctx.live = true;
+    }
+    size_t h = ((size_t)(uintptr_t)e >> 4) * 2654435761u;
+    return &g_infer_cache[h & (INFER_CACHE_SLOTS - 1)];
+}
+
+static zan_type_t *infer_expr_type_uncached(zan_irgen_t *g, zan_ast_node_t *e,
+                                            local_scope_t *locals) {
     zan_type_t *t = infer_expr_type_raw(g, e, locals);
     if (!t || !g->cur_inst || type_is_concrete(t)) return t;
     /* Delegates keep their type parameters: a T-returning delegate is invoked
@@ -807,6 +856,21 @@ static zan_type_t *infer_expr_type(zan_irgen_t *g, zan_ast_node_t *e,
      * and loaded with the ownership rules of the real element type. */
     if (t->kind == TYPE_TYPE_PARAM) return t;
     return subst_type_param_deep(g, t, g->cur_inst);
+}
+
+static zan_type_t *infer_expr_type(zan_irgen_t *g, zan_ast_node_t *e,
+                                   local_scope_t *locals) {
+    infer_cache_slot_t *slot = infer_cache_slot(g, e, locals);
+    if (slot && slot->node == e) return slot->type;
+    zan_type_t *t = infer_expr_type_uncached(g, e, locals);
+    /* The nested inference may have moved the context on (a query registers its
+     * range variable), which drops the table -- re-check before publishing. */
+    slot = infer_cache_slot(g, e, locals);
+    if (slot) {
+        slot->node = e;
+        slot->type = t;
+    }
+    return t;
 }
 
 static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,

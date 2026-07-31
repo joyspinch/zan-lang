@@ -14,6 +14,8 @@ zan_ast_node_t *zan_ast_new(zan_arena_t *arena, zan_ast_kind_t kind, zan_loc_t l
     node->orig_name.str = NULL; node->orig_name.len = 0;
     node->ns_usings = NULL;
     node->inst_type_ref = NULL;
+    node->rt_type = NULL;
+    node->rt_scope = NULL;
     return node;
 }
 

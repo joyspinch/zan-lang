@@ -2275,7 +2275,12 @@ static LLVMTypeRef local_slot_type(zan_irgen_t *g, local_var_t *v) {
     return map_type(g, v->type);
 }
 
+/* Bumped whenever a local is declared: the expression type cache keys on it so
+ * a changed binding can never be served a stale inference. */
+static unsigned g_local_gen;
+
 static void local_add(local_scope_t *scope, zan_istr_t name, LLVMValueRef alloca, zan_type_t *type) {
+    g_local_gen++;
     if (scope->count >= scope->cap) {
         int new_cap = scope->cap > 0 ? scope->cap * 2 : MAX_LOCALS;
         local_var_t *grown = (local_var_t *)zan_arena_alloc(scope->arena,
