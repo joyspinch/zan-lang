@@ -1,0 +1,191 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+namespace Gui.Component;
+
+/// What a SessionList reported for one frame: at most one of a switch, a
+/// delete or a new-chat click. Indices are into the caller's own title list,
+/// so the host maps them straight back to its sessions.
+class SessionListAction {
+    int selected;   // index the user clicked to switch to, or -1
+    int deleted;    // index whose delete (x) was clicked, or -1
+    bool created;   // the "new" button was clicked
+
+    static SessionListAction None() {
+        SessionListAction a = new SessionListAction();
+        a.selected = 0 - 1;
+        a.deleted = 0 - 1;
+        a.created = false;
+        return a;
+    }
+
+    bool Any() { return selected >= 0 || deleted >= 0 || created; }
+}
+
+/// A vertical, searchable list of named items with a per-row delete and a
+/// "new" button on top -- the chat/session sidebar, kept generic: it holds
+/// only its own search box and scroll, and knows nothing about what the rows
+/// stand for. The host passes the titles and the active index each frame and
+/// acts on the returned SessionListAction.
+///
+///     SessionList nav = SessionList.Create("Search chats...", "New chat");
+///     ...
+///     SessionListAction a = nav.Render(app, x, y, w, h, titles, current);
+///     if (a.created) { ... }
+///     if (a.selected >= 0) { ... }
+///     if (a.deleted >= 0) { ... }
+class SessionList {
+    Input search;
+    SignalInt scroll;
+    Button newBtn;
+    string emptyText;
+
+    static SessionList Create(string searchHint, string newLabel) {
+        SessionList s = new SessionList();
+        s.search = new Input(searchHint);
+        s.scroll = SignalInt.Create(0);
+        s.newBtn = new Button { Text = newLabel, Class = "primary small" };
+        s.emptyText = "";
+        return s;
+    }
+
+    /// Text drawn centred when no row matches the current search ("" = none).
+    SessionList EmptyText(string text) { emptyText = text; return this; }
+
+    /// The current search text, so a host can also filter its own state.
+    string Query() { return search.GetText(); }
+
+    static int RowH(App app) { return app.Scale(30); }
+
+    // ASCII-case-insensitive substring test over UTF-8 bytes: only A-Z fold, so
+    // CJK titles match exactly and Latin queries ignore case.
+    static int Fold(int b) {
+        if (b >= 65 && b <= 90) { return b + 32; }
+        return b;
+    }
+
+    static bool CiContains(string hay, string needle) {
+        int m = needle.Length;
+        if (m == 0) { return true; }
+        int n = hay.Length;
+        int i = 0;
+        while (i + m <= n) {
+            int k = 0;
+            while (k < m) {
+                if (SessionList.Fold(hay[i + k]) != SessionList.Fold(needle[k])) {
+                    k = 0 - 1;
+                    break;
+                }
+                k = k + 1;
+            }
+            if (k == m) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    /// Draws the whole sidebar into the given box and returns what was clicked.
+    SessionListAction Render(App app, int x, int y, int w, int h,
+                             List<string> titles, int cur) {
+        SessionListAction act = SessionListAction.None();
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int pad = app.Scale(6);
+        int gap = app.Scale(6);
+
+        int newId = newBtn.Render(app, x, y, w);
+        if (Ui.Clicked(app, newId)) { act.created = true; }
+        int nbH = newBtn.AutoHeight(app);
+
+        int sy = y + nbH + gap;
+        int srH = app.Scale(28);
+        search.Render(app, x, sy, w, srH);
+
+        int ly = sy + srH + gap;
+        int lh = y + h - ly;
+        if (lh < app.Scale(20)) { lh = app.Scale(20); }
+
+        string q = search.GetText();
+        List<int> vis = new List<int>();
+        int ti = 0;
+        while (ti < titles.Count) {
+            if (SessionList.CiContains(titles[ti], q)) { vis.Add(ti); }
+            ti = ti + 1;
+        }
+
+        if (vis.Count == 0) {
+            if (emptyText != "") {
+                int fw = Canvas.MeasureText(emptyText, t.fontSizeSmall);
+                c.DrawText(x + (w - fw) / 2, ly + app.Scale(10), emptyText,
+                    t.textTertiary, t.fontSizeSmall);
+            }
+            return act;
+        }
+
+        int rowH = SessionList.RowH(app);
+        int contentH = vis.Count * rowH;
+        Scrollbar.HandleWheel(app, x, ly, w, lh, contentH, scroll);
+        int maxOff = contentH - lh;
+        if (maxOff < 0) { maxOff = 0; }
+        if (scroll.Get() > maxOff) { scroll.Set(maxOff); }
+        if (scroll.Get() < 0) { scroll.Set(0); }
+        int off = scroll.Get();
+        bool overflow = contentH > lh;
+        int barW = app.Scale(10);
+        int rowW = w;
+        if (overflow) { rowW = w - barW; }
+        int delW = app.Scale(26);
+
+        c.PushClip(x, ly, rowW, lh);
+        int first = off / rowH;
+        int last = (off + lh) / rowH;
+        if (last >= vis.Count) { last = vis.Count - 1; }
+        int r = first;
+        while (r <= last) {
+            int orig = vis[r];
+            int ry = ly + r * rowH - off;
+
+            int selId = app.focus.AllocId();
+            app.hitTester.Register(HitRegion.Create(selId, x, ry, rowW - delW, rowH, 0));
+            bool selHover = app.focus.IsHovered(selId);
+            if (app.hitTester.HitTest(app.mouseX, app.mouseY) == selId
+                && app.ClickAvailable()) {
+                act.selected = orig;
+                app.RequestRedraw();
+            }
+
+            int delId = app.focus.AllocId();
+            app.hitTester.Register(HitRegion.Create(delId, x + rowW - delW, ry, delW, rowH, 0));
+            bool delHover = app.focus.IsHovered(delId);
+            if (app.hitTester.HitTest(app.mouseX, app.mouseY) == delId
+                && app.ClickAvailable()) {
+                act.deleted = orig;
+                app.RequestRedraw();
+            }
+
+            if (orig == cur) { c.FillRect(x, ry, rowW, rowH, t.bgTertiary); }
+            else if (selHover) { c.FillRect(x, ry, rowW, rowH, t.bgSecondary); }
+            if (r > first || off > 0) { c.FillRect(x, ry, rowW, 1, t.divider); }
+
+            int ty = ry + (rowH - Canvas.FontHeight(t.fontSizeSmall)) / 2;
+            string label = titles[orig];
+            if (label == "") { label = "..."; }
+            label = Ellipsis.Fit(label, rowW - delW - pad * 2, t.fontSizeSmall);
+            int col = t.textSecondary;
+            if (orig == cur) { col = t.textPrimary; }
+            c.DrawText(x + pad, ty, label, col, t.fontSizeSmall);
+
+            int dcol = t.textTertiary;
+            if (delHover) { dcol = t.textPrimary; }
+            c.DrawText(x + rowW - delW + app.Scale(9), ty, "×", dcol, t.fontSizeSmall);
+
+            r = r + 1;
+        }
+        c.PopClip();
+        if (overflow) {
+            Scrollbar.RenderVerticalScroll(app, x + w - barW, ly, lh, lh, contentH, scroll);
+        }
+        return act;
+    }
+}
