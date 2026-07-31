@@ -2,9 +2,16 @@
  *
  * package_games.ps1 appends a zip payload (game exe + SDL DLLs + assets) and a
  * 16-byte footer: <8-byte LE payload size> "ZANPKG1\0". On launch the stub
- * extracts the payload to %LOCALAPPDATA%\ZanGames\<exe-name>\ (skipped when
- * already extracted, keyed by payload size) and starts the inner game with
- * that directory as its working directory, so asset paths resolve.
+ * extracts the payload to %LOCALAPPDATA%\ZanGames\<exe-name>\ (skipped when the
+ * cache already holds this exact payload) and starts the inner game with that
+ * directory as its working directory, so asset paths resolve.
+ *
+ * Extraction hands the launcher itself to bsdtar (tar.exe, shipped with Windows
+ * since 10/1803): libarchive finds the zip's end-of-central-directory record
+ * past our footer and reads the entries in place, so the payload is never
+ * copied to a temporary zip first. PowerShell -- whose start-up alone costs
+ * more than the extraction, before Expand-Archive walks the archive entry by
+ * entry -- is only the fallback on Windows without tar.exe.
  *
  * Build: gcc -O2 -mwindows scripts/pkg_stub.c -o build/pkg_stub.exe
  */
@@ -13,10 +20,102 @@
 #include <string.h>
 
 #define FOOTER_MAGIC "ZANPKG1\0"
+#define STAMP_MAGIC "ZANPKG2"
 
 static void die(const char *msg) {
     MessageBoxA(NULL, msg, "Zan Game Launcher", MB_ICONERROR);
     ExitProcess(1);
+}
+
+/* Identity of a payload, cheap enough to compute on every launch: its size
+ * plus a hash of its tail. The zip central directory lives there and carries
+ * every entry's name, size and CRC, so any change to any packaged file changes
+ * this -- unlike the size alone, which happily matched a stale cache after a
+ * rebuild and is why a fixed bug could come back on the next run. */
+static unsigned long long payload_id(FILE *f, long long poff, long long psize) {
+    long long tail = psize > (1 << 20) ? (1 << 20) : psize;
+    unsigned long long h = 1469598103934665603ULL; /* FNV-1a */
+    if (_fseeki64(f, poff + psize - tail, SEEK_SET) != 0) return 0;
+    unsigned char buf[1 << 16];
+    long long left = tail;
+    while (left > 0) {
+        size_t take = left > (long long)sizeof(buf) ? sizeof(buf) : (size_t)left;
+        size_t got = fread(buf, 1, take, f);
+        if (got == 0) break;
+        for (size_t i = 0; i < got; i++) {
+            h ^= buf[i];
+            h *= 1099511628211ULL;
+        }
+        left -= (long long)got;
+    }
+    return h ^ (unsigned long long)psize;
+}
+
+/* Extracts the zip appended to `archive` into `dir` with bsdtar. */
+static int extract_via_tar(const char *tar, const char *archive,
+                           const char *dir) {
+    char line[2 * MAX_PATH + 64];
+    snprintf(line, sizeof(line), "\"%s\" -xf \"%s\" -C \"%s\"", tar, archive,
+             dir);
+    STARTUPINFOA si;
+    PROCESS_INFORMATION pi;
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    if (!CreateProcessA(NULL, line, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL,
+                        NULL, &si, &pi))
+        return -1;
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD code = 1;
+    GetExitCodeProcess(pi.hProcess, &code);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    return (int)code;
+}
+
+/* Fallback for Windows without tar.exe: the old copy-then-PowerShell path. */
+static int extract_via_powershell(const char *dir, FILE *f, long long poff,
+                                  long long psize) {
+    char zip[MAX_PATH];
+    snprintf(zip, MAX_PATH, "%s\\payload.zip", dir);
+    FILE *z = fopen(zip, "wb");
+    if (!z) return -1;
+    if (_fseeki64(f, poff, SEEK_SET) != 0) { fclose(z); return -1; }
+    char buf[1 << 16];
+    long long left = psize;
+    while (left > 0) {
+        size_t take = left > (long long)sizeof(buf) ? sizeof(buf) : (size_t)left;
+        size_t got = fread(buf, 1, take, f);
+        if (got == 0) { fclose(z); return -1; }
+        fwrite(buf, 1, got, z);
+        left -= (long long)got;
+    }
+    fclose(z);
+
+    char ps[2 * MAX_PATH + 256];
+    snprintf(ps, sizeof(ps),
+             "powershell -NoProfile -ExecutionPolicy Bypass -Command "
+             "\"Expand-Archive -LiteralPath '%s' -DestinationPath '%s' -Force\"",
+             zip, dir);
+    STARTUPINFOA si;
+    PROCESS_INFORMATION pi;
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    if (!CreateProcessA(NULL, ps, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL,
+                        NULL, &si, &pi)) {
+        DeleteFileA(zip);
+        return -1;
+    }
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD code = 1;
+    GetExitCodeProcess(pi.hProcess, &code);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    DeleteFileA(zip);
+    return (int)code;
 }
 
 int WINAPI WinMain(HINSTANCE hi, HINSTANCE hp, LPSTR cmd, int show) {
@@ -41,19 +140,22 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE hp, LPSTR cmd, int show) {
     lstrcpynA(base, bs ? bs + 1 : self, MAX_PATH);
     char *dot = strrchr(base, '.');
     if (dot) *dot = 0;
-    char root[MAX_PATH], dir[MAX_PATH], zip[MAX_PATH], stamp[MAX_PATH];
+    char root[MAX_PATH], dir[MAX_PATH], stamp[MAX_PATH];
     if (GetEnvironmentVariableA("LOCALAPPDATA", root, MAX_PATH) == 0)
         die("LOCALAPPDATA not set");
     snprintf(dir, MAX_PATH, "%s\\ZanGames\\%s", root, base);
-    snprintf(zip, MAX_PATH, "%s\\payload.zip", dir);
-    snprintf(stamp, MAX_PATH, "%s\\payload.size", dir);
+    snprintf(stamp, MAX_PATH, "%s\\payload.id", dir);
 
-    /* skip extraction when the stamp matches the current payload size */
+    /* skip extraction when the cache already holds this exact payload */
+    unsigned long long id = payload_id(f, poff, psize);
     int need = 1;
     FILE *sf = fopen(stamp, "rb");
     if (sf) {
-        long long old = 0;
-        if (fscanf(sf, "%lld", &old) == 1 && old == psize) need = 0;
+        char tag[16];
+        unsigned long long old = 0;
+        if (fscanf(sf, "%15s %llu", tag, &old) == 2
+            && strcmp(tag, STAMP_MAGIC) == 0 && old == id)
+            need = 0;
         fclose(sf);
     }
 
@@ -62,40 +164,22 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE hp, LPSTR cmd, int show) {
         snprintf(mk, sizeof(mk), "%s\\ZanGames", root);
         CreateDirectoryA(mk, NULL);
         CreateDirectoryA(dir, NULL);
-        /* copy payload bytes into payload.zip */
-        FILE *z = fopen(zip, "wb");
-        if (!z) die("cannot write payload.zip");
-        _fseeki64(f, poff, SEEK_SET);
-        char buf[1 << 16];
-        long long left = psize;
-        while (left > 0) {
-            size_t take = left > (long long)sizeof(buf) ? sizeof(buf) : (size_t)left;
-            size_t got = fread(buf, 1, take, f);
-            if (got == 0) die("payload read error");
-            fwrite(buf, 1, got, z);
-            left -= (long long)got;
+        /* A stale stamp must not survive a half-written extraction. */
+        DeleteFileA(stamp);
+
+        char tar[MAX_PATH];
+        UINT n = GetSystemDirectoryA(tar, MAX_PATH);
+        int code = -1;
+        if (n > 0 && n < MAX_PATH - 16) {
+            lstrcatA(tar, "\\tar.exe");
+            if (GetFileAttributesA(tar) != INVALID_FILE_ATTRIBUTES)
+                code = extract_via_tar(tar, self, dir);
         }
-        fclose(z);
-        /* extract with PowerShell (present on every supported Windows) */
-        char ps[2 * MAX_PATH + 256];
-        snprintf(ps, sizeof(ps),
-                 "powershell -NoProfile -ExecutionPolicy Bypass -Command "
-                 "\"Expand-Archive -LiteralPath '%s' -DestinationPath '%s' -Force\"",
-                 zip, dir);
-        STARTUPINFOA si; PROCESS_INFORMATION pi;
-        ZeroMemory(&si, sizeof(si)); si.cb = sizeof(si);
-        si.dwFlags = STARTF_USESHOWWINDOW; si.wShowWindow = SW_HIDE;
-        if (!CreateProcessA(NULL, ps, NULL, NULL, FALSE, CREATE_NO_WINDOW,
-                            NULL, NULL, &si, &pi))
-            die("failed to run extractor");
-        WaitForSingleObject(pi.hProcess, INFINITE);
-        DWORD code = 1;
-        GetExitCodeProcess(pi.hProcess, &code);
-        CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
+        if (code != 0) code = extract_via_powershell(dir, f, poff, psize);
         if (code != 0) die("payload extraction failed");
-        DeleteFileA(zip);
+
         sf = fopen(stamp, "wb");
-        if (sf) { fprintf(sf, "%lld", psize); fclose(sf); }
+        if (sf) { fprintf(sf, "%s %llu", STAMP_MAGIC, id); fclose(sf); }
     }
     fclose(f);
 
