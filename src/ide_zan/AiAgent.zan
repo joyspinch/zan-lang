@@ -569,4 +569,118 @@ class AiAgent {
         }
         return sb.ToString();
     }
+
+    // --- context compaction --------------------------------------------------
+
+    /// Character budget for the running transcript (everything after the system
+    /// prompt). Beyond this the oldest turns are folded into a compact digest so
+    /// a long agent session keeps going instead of growing until it overflows
+    /// the model's context window.
+    static int MaxContextChars() { return 40000; }
+
+    /// The most recent turns are always sent verbatim, even past the budget, so
+    /// the model never loses the thread it is actively working on.
+    static int MinRecentTurns() { return 6; }
+
+    static string FirstLine(string s) {
+        int i = ZanIDE.IndexOfStr(s, "\n");
+        if (i < 0) { return s; }
+        return s.Substring(0, i);
+    }
+
+    static string Cap(string s, int n) {
+        if (s.Length <= n) { return s; }
+        return s.Substring(0, n) + " ...";
+    }
+
+    /// One line standing in for a turn that fell out of the verbatim window:
+    /// the user's questions and the assistant's conclusions are kept, while a
+    /// tool result collapses to its header plus first result line so the bulky
+    /// file/JSON bodies do not survive into every later request.
+    static string DigestTurn(string role, string text) {
+        if (role == "user") {
+            return "USER: " + AiAgent.Cap(AiAgent.FirstLine(text), 300);
+        }
+        if (role == "assistant") {
+            string t = AiAgent.StripToolBlock(text);
+            if (AiAgent.Trim(t) == "") {
+                string call = AiAgent.ToolBlock(text);
+                return "ASSISTANT: (called " + AiAgent.Describe(call) + ")";
+            }
+            return "ASSISTANT: " + AiAgent.Cap(t, 400);
+        }
+        if (role == "tool") {
+            string head = AiAgent.FirstLine(text);
+            string body = "";
+            if (text.Length > head.Length + 1) {
+                body = AiAgent.FirstLine(
+                    text.Substring(head.Length + 1, text.Length - head.Length - 1));
+            }
+            string line = "TOOL " + head;
+            if (body != "") { line = line + " -> " + AiAgent.Cap(body, 200); }
+            return line;
+        }
+        return AiAgent.Cap(AiAgent.FirstLine(text), 200);
+    }
+
+    /// Builds the message list actually sent to the model: recent turns kept
+    /// whole, and everything older than the budget replaced by a single digest
+    /// message. Returns the turns unchanged when the transcript is small.
+    static AiMessages BuildContext(List<string> roles, List<string> texts) {
+        AiMessages m = new AiMessages();
+        m.roles = new List<string>();
+        m.texts = new List<string>();
+        m.compacted = false;
+        m.dropped = 0;
+        int n = roles.Count;
+        int budget = AiAgent.MaxContextChars();
+        int acc = 0;
+        int keepFrom = n;
+        int i = n - 1;
+        while (i >= 0) {
+            acc = acc + texts[i].Length;
+            int kept = n - i;
+            if (acc > budget && kept > AiAgent.MinRecentTurns()) { break; }
+            keepFrom = i;
+            i = i - 1;
+        }
+        if (keepFrom <= 0) {
+            int k = 0;
+            while (k < n) {
+                m.roles.Add(roles[k]); m.texts.Add(texts[k]); k = k + 1;
+            }
+            return m;
+        }
+        StringBuilder d = new StringBuilder();
+        d.Append("[Earlier turns were compacted to save context; digest of the"
+            + " conversation so far -- decisions, files touched and findings:]\n");
+        int j = 0;
+        while (j < keepFrom) {
+            d.Append(AiAgent.DigestTurn(roles[j], texts[j]) + "\n");
+            if (d.Length > 6000) {
+                d.Append("... (older turns elided)\n");
+                break;
+            }
+            j = j + 1;
+        }
+        m.roles.Add("user");
+        m.texts.Add(d.ToString());
+        int r = keepFrom;
+        while (r < n) {
+            m.roles.Add(roles[r]); m.texts.Add(texts[r]); r = r + 1;
+        }
+        m.compacted = true;
+        m.dropped = keepFrom;
+        return m;
+    }
+}
+
+/// The message list handed to the endpoint after compaction: `roles`/`texts`
+/// are parallel, `compacted` is true when older turns were folded into a
+/// digest and `dropped` counts how many raw turns that digest replaced.
+class AiMessages {
+    List<string> roles;
+    List<string> texts;
+    bool compacted;
+    int dropped;
 }
