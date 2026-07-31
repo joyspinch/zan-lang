@@ -21,6 +21,8 @@ class AiSettingsWindow {
     List<string> keys;
     List<string> models;
     List<string> lists;
+    /// Per profile: JSON map `<model id> -> {ctx, out}` (token counts).
+    List<string> limits;
     int active;
     int sel;
     int modelSel;
@@ -96,11 +98,13 @@ class AiSettingsWindow {
                 .Dock("top").Height(28).Bind("preset"));
             p = p + 1;
         }
+        // Dock the fixed-width button first so the "fill" one takes only the
+        // space that is left -- otherwise the two overlap.
         UiNode preRow = UiNode.Row().Dock("top").Height(34).Gap(8);
-        preRow.Child(UiNode.Button(AiSettingsWindow.T(lang, "Add preset", "用预设新增"))
-            .OnClick("preAdd").Dock("fill"));
         preRow.Child(UiNode.Button(AiSettingsWindow.T(lang, "Sign up", "注册"))
             .OnClick("reg").Dock("right").Width(70));
+        preRow.Child(UiNode.Button(AiSettingsWindow.T(lang, "Add preset", "用预设新增"))
+            .OnClick("preAdd").Dock("fill"));
         left.Child(preRow);
 
         // ---- Right column: editable fields of the selected profile ----
@@ -116,16 +120,31 @@ class AiSettingsWindow {
         right.Child(UiNode.Label(AiSettingsWindow.T(lang, "API Key / Token", "API 密钥 / Token"))
             .Dock("top").Height(18));
         right.Child(UiNode.Of("Input").Dock("top").Height(30).Bind("key")
-            .Str("hint", "sk-..."));
+            .Str("hint", "sk-...").Str("iconLead", "lock").Str("password", "true"));
         right.Child(UiNode.Label(AiSettingsWindow.T(lang, "Default model", "默认模型"))
             .Dock("top").Height(18));
-        UiNode modelRow = UiNode.Row().Dock("top").Height(30).Gap(8);
-        modelRow.Child(UiNode.Of("Input").Dock("fill").Bind("model")
-            .Str("hint", "gpt-4o-mini"));
         string fetchLbl = AiSettingsWindow.T(lang, "Fetch models", "获取模型");
         if (fetchBusy) { fetchLbl = AiSettingsWindow.T(lang, "Fetching...", "获取中..."); }
+        UiNode modelRow = UiNode.Row().Dock("top").Height(30).Gap(8);
+        // Fixed-width button first: under dock layout a "fill" sibling keeps the
+        // whole remaining width, so it must be added after the docked button.
         modelRow.Child(UiNode.Button(fetchLbl).OnClick("fetch").Dock("right").Width(100));
+        modelRow.Child(UiNode.Of("Input").Dock("fill").Bind("model")
+            .Str("hint", "gpt-4o-mini"));
         right.Child(modelRow);
+        // Per-model limits (apply to the model in the field above). Both are
+        // token counts; blank means "use the built-in default".
+        right.Child(UiNode.Label(AiSettingsWindow.T(lang,
+            "This model: context length (tokens, default 200000)",
+            "该模型：上下文长度（tokens，默认 200000）"))
+            .Class("secondary small").Dock("top").Height(18));
+        right.Child(UiNode.Of("Input").Dock("top").Height(30).Bind("ctx")
+            .Str("hint", "200000"));
+        right.Child(UiNode.Label(AiSettingsWindow.T(lang,
+            "Max output (tokens)", "最大输出（tokens）"))
+            .Class("secondary small").Dock("top").Height(18));
+        right.Child(UiNode.Of("Input").Dock("top").Height(30).Bind("out")
+            .Str("hint", "4096"));
         right.Child(UiNode.Of("Label").Dock("top").Height(18)
             .BindProp("status", "text"));
         // Actions are pinned to the bottom, reserved before the model list
@@ -191,7 +210,15 @@ class AiSettingsWindow {
         model.Set("base", JsonValue.NewStr(bases[i]));
         model.Set("key", JsonValue.NewStr(keys[i]));
         model.Set("model", JsonValue.NewStr(models[i]));
+        this.LoadModelLimits(models[i]);
         this.SyncModelSel();
+    }
+
+    /// Loads a model's saved context / output limits into the bound inputs.
+    void LoadModelLimits(string mdl) {
+        int i = SelClamped();
+        model.Set("ctx", JsonValue.NewStr(ZanIDE.AiLimitStr(limits[i], mdl, "ctx")));
+        model.Set("out", JsonValue.NewStr(ZanIDE.AiLimitStr(limits[i], mdl, "out")));
     }
 
     /// Points the inline model list at the profile's current default model
@@ -216,10 +243,16 @@ class AiSettingsWindow {
         bases[i] = model.PathGet("base").AsString(bases[i]);
         keys[i] = model.PathGet("key").AsString(keys[i]);
         models[i] = model.PathGet("model").AsString(models[i]);
+        // The limit inputs apply to the current default model.
+        string mdl = models[i];
+        limits[i] = ZanIDE.AiLimitSet(limits[i], mdl, "ctx",
+            model.PathGet("ctx").AsString(""));
+        limits[i] = ZanIDE.AiLimitSet(limits[i], mdl, "out",
+            model.PathGet("out").AsString(""));
     }
 
     void Persist() {
-        ZanIDE.AiProfilesSave(active, names, bases, keys, models, lists);
+        ZanIDE.AiProfilesSave(active, names, bases, keys, models, lists, limits);
         saved = true;
     }
 
@@ -246,7 +279,9 @@ class AiSettingsWindow {
         w.keys = new List<string>();
         w.models = new List<string>();
         w.lists = new List<string>();
-        w.active = ZanIDE.AiProfilesLoad(w.names, w.bases, w.keys, w.models, w.lists);
+        w.limits = new List<string>();
+        w.active = ZanIDE.AiProfilesLoad(w.names, w.bases, w.keys, w.models,
+            w.lists, w.limits);
         w.sel = w.active;
         w.preNames = new List<string>();
         w.preBases = new List<string>();
@@ -257,6 +292,8 @@ class AiSettingsWindow {
         w.model.Set("sel", JsonValue.NewNum(Convert.ToString(w.sel)));
         w.model.Set("preset", JsonValue.NewNum("0"));
         w.model.Set("status", JsonValue.NewStr(""));
+        w.model.Set("ctx", JsonValue.NewStr(""));
+        w.model.Set("out", JsonValue.NewStr(""));
         w.LoadFields();
         w.BuildUi();
         w.host = App.CreateDark(
@@ -339,6 +376,7 @@ class AiSettingsWindow {
             List<string> mo = ZanIDE.SplitList(lists[SelClamped()]);
             if (nextModel >= 0 && nextModel < mo.Count) {
                 model.Set("model", JsonValue.NewStr(mo[nextModel]));
+                this.LoadModelLimits(mo[nextModel]);
             }
             host.RequestRedraw();
         }
@@ -352,6 +390,7 @@ class AiSettingsWindow {
             keys.Add("");
             models.Add("");
             lists.Add("");
+            limits.Add("{}");
             sel = names.Count - 1;
             model.Set("sel", JsonValue.NewNum(Convert.ToString(sel)));
             this.LoadFields();
@@ -367,6 +406,7 @@ class AiSettingsWindow {
             keys.Add("");
             models.Add(preModels[p]);
             lists.Add("");
+            limits.Add("{}");
             sel = names.Count - 1;
             model.Set("sel", JsonValue.NewNum(Convert.ToString(sel)));
             this.LoadFields();
@@ -389,6 +429,7 @@ class AiSettingsWindow {
                 keys.RemoveAt(i);
                 models.RemoveAt(i);
                 lists.RemoveAt(i);
+                limits.RemoveAt(i);
                 if (active >= names.Count) { active = 0; }
                 if (sel >= names.Count) { sel = names.Count - 1; }
                 model.Set("sel", JsonValue.NewNum(Convert.ToString(sel)));
@@ -444,6 +485,7 @@ class AiSettingsWindow {
                     if (models[i] == "") {
                         models[i] = gm[0];
                         model.Set("model", JsonValue.NewStr(gm[0]));
+                        this.LoadModelLimits(gm[0]);
                     }
                     this.Persist();
                     this.SyncModelSel();

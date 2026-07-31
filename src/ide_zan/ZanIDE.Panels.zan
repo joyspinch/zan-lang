@@ -340,7 +340,10 @@ partial class ZanIDE {
     }
 
     // ---- AI provider profiles (ai_profiles.json) ----
-    // {"active": 0, "profiles": [{"name", "base", "key", "model", "models": []}]}
+    // {"active": 0, "profiles": [{"name", "base", "key", "model",
+    //   "models": [], "limits": {"<model id>": {"ctx": 128000, "out": 4096}}}]}
+    // `limits` holds each model's configured context length and maximum output
+    // length (both in tokens); a missing / zero entry means "use the default".
     static string AiProfilesPath() { return ZanIDE.UserConfigDir() + "/ai_profiles.json"; }
     static string AiModelsRespPath() { return ZanIDE.UserConfigDir() + "/ai_models.json"; }
     static string AiModelsDonePath() { return ZanIDE.UserConfigDir() + "/ai_models_done.txt"; }
@@ -352,7 +355,8 @@ partial class ZanIDE {
     /// active index. Falls back to a single profile synthesized from the
     /// legacy ai.cfg / environment settings when ai_profiles.json is missing.
     static int AiProfilesLoad(List<string> names, List<string> bases,
-            List<string> keys, List<string> models, List<string> lists) {
+            List<string> keys, List<string> models, List<string> lists,
+            List<string> limits) {
         int active = 0;
         if (File.Exists(ZanIDE.AiProfilesPath())) {
             JsonValue v = JsonValue.ParseLenient(File.ReadAllText(ZanIDE.AiProfilesPath()));
@@ -381,6 +385,12 @@ partial class ZanIDE {
                             }
                         }
                         lists.Add(ml);
+                        JsonValue lim = p.Get("limits");
+                        if (lim != null && lim.IsObject()) {
+                            limits.Add(lim.ToJson());
+                        } else {
+                            limits.Add("{}");
+                        }
                         i = i + 1;
                     }
                 }
@@ -392,6 +402,7 @@ partial class ZanIDE {
             keys.Add(ZanIDE.AiSetting("key", "OPENAI_API_KEY", ""));
             models.Add(ZanIDE.AiSetting("model", "OPENAI_MODEL", "gpt-4o-mini"));
             lists.Add("");
+            limits.Add("{}");
             active = 0;
         }
         if (active < 0 || active >= names.Count) { active = 0; }
@@ -399,7 +410,8 @@ partial class ZanIDE {
     }
 
     static void AiProfilesSave(int active, List<string> names, List<string> bases,
-            List<string> keys, List<string> models, List<string> lists) {
+            List<string> keys, List<string> models, List<string> lists,
+            List<string> limits) {
         StringBuilder sb = new StringBuilder();
         sb.Append("{\"active\": " + Convert.ToString(active) + ", \"profiles\": [");
         int i = 0;
@@ -417,12 +429,69 @@ partial class ZanIDE {
                 sb.Append("\"" + ZanIDE.JsonEsc(ms[j]) + "\"");
                 j = j + 1;
             }
-            sb.Append("]}");
+            sb.Append("]");
+            string lim = "{}";
+            if (i < limits.Count && limits[i] != "") { lim = limits[i]; }
+            sb.Append(", \"limits\": " + lim);
+            sb.Append("}");
             i = i + 1;
         }
         sb.Append("]}");
         Directory.CreateDirectoryRecursive(ZanIDE.UserConfigDir());
         File.WriteAllText(ZanIDE.AiProfilesPath(), sb.ToString());
+    }
+
+    /// Parses a run of leading digits into an int (ignores anything else); the
+    /// per-model limit inputs are free text, so a stray unit / space is fine.
+    static int ParseIntSafe(string s) {
+        int n = 0;
+        bool any = false;
+        int i = 0;
+        while (i < s.Length) {
+            int d = ZanIDE.IndexOfStr("0123456789", s.Substring(i, 1));
+            if (d >= 0) {
+                n = n * 10 + d;
+                any = true;
+            } else if (any) {
+                break;
+            }
+            i = i + 1;
+        }
+        return n;
+    }
+
+    /// Reads a per-model limit (`ctx` / `out`, in tokens) from a profile's
+    /// `limits` JSON map; 0 when absent.
+    static int AiLimitInt(string mapJson, string model, string field) {
+        if (mapJson == "" || model == "") { return 0; }
+        JsonValue v = JsonValue.ParseLenient(mapJson);
+        if (v == null || !v.IsObject()) { return 0; }
+        JsonValue mo = v.Get(model);
+        if (mo == null || !mo.IsObject()) { return 0; }
+        return mo.Int(field, 0);
+    }
+
+    /// The limit as editable text ("" when unset), for the settings inputs.
+    static string AiLimitStr(string mapJson, string model, string field) {
+        int n = ZanIDE.AiLimitInt(mapJson, model, field);
+        if (n <= 0) { return ""; }
+        return Convert.ToString(n);
+    }
+
+    /// Returns `mapJson` with `field` for `model` set to the parsed value (0 =
+    /// unset). Creates the map / model object as needed.
+    static string AiLimitSet(string mapJson, string model, string field, string val) {
+        if (model == "") { return mapJson; }
+        JsonValue v = JsonValue.ParseLenient(mapJson);
+        if (v == null || !v.IsObject()) { v = JsonValue.NewObject(); }
+        JsonValue mo = v.Get(model);
+        if (mo == null || !mo.IsObject()) {
+            mo = JsonValue.NewObject();
+            v.Set(model, mo);
+        }
+        int n = ZanIDE.ParseIntSafe(val);
+        mo.Set(field, JsonValue.NewNum(Convert.ToString(n)));
+        return v.ToJson();
     }
 
     /// Splits a `;`-separated list, skipping empty entries.
@@ -641,7 +710,13 @@ partial class ZanIDE {
             }
             i = i + 1;
         }
-        body.Append("]}");
+        body.Append("]");
+        // Apply the enabled model's configured maximum output length.
+        int maxOut = AiAgent.MaxOutTokens();
+        if (maxOut > 0) {
+            body.Append(",\"max_tokens\":" + Convert.ToString(maxOut));
+        }
+        body.Append("}");
         Directory.CreateDirectoryRecursive(ZanIDE.UserConfigDir());
         // The request is made with the Net standard library on a background
         // thread that streams the decoded response into AiStreamPath as it

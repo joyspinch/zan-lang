@@ -36,6 +36,27 @@ class AiAgent {
     /// Largest slice of a file handed to the model in one read.
     static int MaxReadChars() { return 12000; }
 
+    /// Largest file (bytes) the reader will pull fully into memory. A project
+    /// contains build artifacts (.build/*.exe) and assets (images) far bigger
+    /// than any source file; loading one of those as a string and splitting it
+    /// into lines exhausts memory and takes the IDE down, so anything past this
+    /// is refused with a hint rather than read.
+    static int MaxFileBytes() { return 1048576; }
+
+    /// True when the head of `s` contains a NUL byte -- the cheap, reliable
+    /// signal that a file is binary rather than text, so the reader can decline
+    /// instead of feeding megabytes of garbage into the transcript and shaper.
+    static bool LooksBinary(string s) {
+        int n = s.Length;
+        if (n > 4096) { n = 4096; }
+        int i = 0;
+        while (i < n) {
+            if ((s[i] & 255) == 0) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
     /// The fenced marker the model wraps a tool call in.
     static string Fence() { return "```zan-tool"; }
 
@@ -319,12 +340,22 @@ class AiAgent {
         string full = AiAgent.SafePath(root, path);
         if (full == "") { return "error: path outside the project: " + path; }
         if (!File.Exists(full)) { return "error: no such file: " + path; }
+        int fsz = File.GetSize(full);
+        if (fsz > AiAgent.MaxFileBytes()) {
+            return "error: file too large to read (" + Convert.ToString(fsz)
+                + " bytes) -- likely a build artifact or asset, not source."
+                + " Use grep to find what you need, or read a source file.";
+        }
         int from = offset;
         if (from < 1) { from = 1; }
         int max = limit;
         if (max < 1) { max = 1; }
         if (max > 600) { max = 600; }
-        List<string> lines = CodeEditor.SplitLines(File.ReadAllText(full));
+        string raw = File.ReadAllText(full);
+        if (AiAgent.LooksBinary(raw)) {
+            return "error: this is a binary file (not text); skipping " + path + ".";
+        }
+        List<string> lines = CodeEditor.SplitLines(raw);
         StringBuilder sb = new StringBuilder();
         sb.Append(path + " (" + Convert.ToString(lines.Count) + " lines)\n");
         int i = from - 1;
@@ -412,6 +443,7 @@ class AiAgent {
 
     static void GrepFile(string full, string root, string pattern,
                          List<string> hits) {
+        if (File.GetSize(full) > AiAgent.MaxFileBytes()) { return; }
         string body = File.ReadAllText(full);
         if (ZanIDE.IndexOfStr(body, pattern) < 0) { return; }
         string rel = full;
@@ -473,6 +505,10 @@ class AiAgent {
         string full = AiAgent.SafePath(root, path);
         if (full == "") { return "error: path outside the project: " + path; }
         if (!File.Exists(full)) { return "error: no such file: " + path; }
+        if (File.GetSize(full) > AiAgent.MaxFileBytes()) {
+            return "error: file too large to edit (" + Convert.ToString(File.GetSize(full))
+                + " bytes); this tool only edits source-sized text files.";
+        }
         string body = File.ReadAllText(full);
         int first = ZanIDE.IndexOfStr(body, oldS);
         if (first < 0) {
@@ -685,11 +721,37 @@ class AiAgent {
 
     // --- context compaction --------------------------------------------------
 
+    // Per-model request limits set by the IDE from the enabled profile before
+    // each request: `gCtxTokens` is the selected model's context length (tokens,
+    // 0 = use the built-in default) and `gMaxOut` its maximum output length
+    // (tokens, 0 = don't send max_tokens). Globals so the many AiLaunch call
+    // sites and the context-usage ring share one source without threading two
+    // extra parameters through every one of them.
+    static int gCtxTokens;
+    static int gMaxOut;
+
+    /// Records the enabled model's configured limits for the next request.
+    static void SetLimits(int ctxTokens, int maxOut) {
+        AiAgent.gCtxTokens = ctxTokens;
+        AiAgent.gMaxOut = maxOut;
+    }
+
+    /// The configured maximum output length (tokens); 0 means "unset".
+    static int MaxOutTokens() { return AiAgent.gMaxOut; }
+
+    /// Default context length (tokens) for a model with no explicit setting.
+    static int DefaultCtxTokens() { return 200000; }
+
     /// Character budget for the running transcript (everything after the system
     /// prompt). Beyond this the oldest turns are folded into a compact digest so
     /// a long agent session keeps going instead of growing until it overflows
-    /// the model's context window.
-    static int MaxContextChars() { return 40000; }
+    /// the model's context window. Derived from the selected model's configured
+    /// context length (tokens ~= 4 chars) when set, else a safe default.
+    static int MaxContextChars() {
+        int tok = AiAgent.gCtxTokens;
+        if (tok <= 0) { tok = AiAgent.DefaultCtxTokens(); }
+        return tok * 4;
+    }
 
     /// Total characters of the running transcript -- the quantity BuildContext
     /// measures against MaxContextChars() to decide when to compact, and what

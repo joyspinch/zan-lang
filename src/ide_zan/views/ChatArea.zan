@@ -133,7 +133,7 @@ class ChatArea {
     /// kinds: 0 = normal text, 1 = code (drawn on a code background),
     /// 2 = heading, 3 = message header row.
     static void ChatBuildLines(App app, List<string> roles, List<string> texts,
-            List<string> reason, int textW, List<string> lines,
+            List<string> reason, int textW, bool thinkOpen, List<string> lines,
             List<int> colors, List<int> kinds) {
         Theme t = app.theme;
         int i = 0;
@@ -177,9 +177,6 @@ class ChatArea {
                     colors.Add(bodyCol);
                     kinds.Add(0);
                 }
-                lines.Add("");
-                colors.Add(bodyCol);
-                kinds.Add(0);
                 i = i + 1;
                 continue;
             }
@@ -187,24 +184,32 @@ class ChatArea {
             // section above the answer, kept separate from the answer text (and
             // out of the transcript sent back to the model).
             if (roles[i] == "assistant" && i < reason.Count && reason[i] != "") {
-                lines.Add(ZanIDE.T("Thinking", "思考过程"));
-                colors.Add(t.textTertiary);
-                kinds.Add(3);
-                List<string> rsrc = CodeEditor.SplitLines(reason[i]);
-                int rk = 0;
-                while (rk < rsrc.Count) {
-                    int rbefore = lines.Count;
-                    ChatArea.WrapInto(ChatArea.MdStrip(rsrc[rk]), textW,
-                        t.fontSizeSmall, lines);
-                    if (lines.Count == rbefore) { lines.Add(""); }
-                    while (colors.Count < lines.Count) {
-                        colors.Add(t.textTertiary); kinds.Add(0);
-                    }
-                    rk = rk + 1;
+                // Collapsed by default: only a clickable one-line toggle (kind 4)
+                // shows, so the thinking never buries the answer. Clicking it
+                // (handled in RenderChatArea) expands the full reasoning.
+                if (thinkOpen) {
+                    lines.Add(ZanIDE.T("Thinking (click to hide)",
+                        "思考过程（点击收起）"));
+                } else {
+                    lines.Add(ZanIDE.T("Thinking (click to show)",
+                        "思考过程（点击展开）"));
                 }
-                lines.Add("");
                 colors.Add(t.textTertiary);
-                kinds.Add(0);
+                kinds.Add(4);
+                if (thinkOpen) {
+                    List<string> rsrc = CodeEditor.SplitLines(reason[i]);
+                    int rk = 0;
+                    while (rk < rsrc.Count) {
+                        int rbefore = lines.Count;
+                        ChatArea.WrapInto(ChatArea.MdStrip(rsrc[rk]), textW,
+                            t.fontSizeSmall, lines);
+                        if (lines.Count == rbefore) { lines.Add(""); }
+                        while (colors.Count < lines.Count) {
+                            colors.Add(t.textTertiary); kinds.Add(0);
+                        }
+                        rk = rk + 1;
+                    }
+                }
             }
             // Markdown-lite: fenced code blocks get a code background and
             // color; headings/bullets/inline `code`/**bold** markers are
@@ -237,6 +242,8 @@ class ChatArea {
                 }
                 li = li + 1;
             }
+            // One blank row separates turns; the per-turn header (kind 3) plus
+            // this single gap keeps messages distinct without the old sprawl.
             lines.Add("");
             colors.Add(bodyCol);
             kinds.Add(0);
@@ -281,7 +288,7 @@ class ChatArea {
     /// maximum scroll offset.
     static int RenderChatArea(App app, Rect area, List<string> lines,
             List<int> colors, List<int> kinds, int scroll, bool busy,
-            LogState sel, bool interactive) {
+            LogState sel, bool interactive, SignalInt thinkOpen) {
         Canvas c = app.canvas;
         Theme t = app.theme;
         int pad = app.Scale(6);
@@ -329,12 +336,19 @@ class ChatArea {
                 && !app.PointerCaptured()) {
                 int ri = ChatArea.RowAtChat(area, pad, rowH, start,
                     lines.Count, app.mouseY);
-                int cc = LogView.ColAt(lines[ri], area.x + pad,
-                    t.fontSizeSmall, app.mouseX);
-                sel.selR0 = ri; sel.selC0 = cc;
-                sel.selR1 = ri; sel.selC1 = cc;
-                sel.selDrag = true;
-                app.RequestRedraw();
+                if (ri >= 0 && ri < kinds.Count && kinds[ri] == 4) {
+                    // Clicking a "Thinking" toggle row expands/collapses the
+                    // reasoning instead of starting a text selection.
+                    thinkOpen.Set(1 - thinkOpen.Get());
+                    app.RequestRedraw();
+                } else {
+                    int cc = LogView.ColAt(lines[ri], area.x + pad,
+                        t.fontSizeSmall, app.mouseX);
+                    sel.selR0 = ri; sel.selC0 = cc;
+                    sel.selR1 = ri; sel.selC1 = cc;
+                    sel.selDrag = true;
+                    app.RequestRedraw();
+                }
             }
             if (kind == 1 && sel.selDrag) {
                 int ri = ChatArea.RowAtChat(area, pad, rowH, start,

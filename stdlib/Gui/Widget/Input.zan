@@ -32,6 +32,14 @@ class Input : Control {
     // plain caret move or edit.
     int selAnchor;
     int wid;
+    /// Password mask: when set the text renders as `*` until revealed.
+    bool password;
+    /// Whether a masked field is currently showing plaintext (eye toggled).
+    bool reveal;
+    /// Optional leading / trailing icon names (Gui.Icon). A password field
+    /// draws a clickable eye at the trailing edge regardless of `iconTrail`.
+    string iconLead;
+    string iconTrail;
     /// Fires whenever the text changes (C#-style: `inp.Change += h;`).
     UiEvent Change;
     /// Fires when Enter is pressed while focused.
@@ -47,6 +55,10 @@ class Input : Control {
         cursorPos = 0;
         selAnchor = -1;
         wid = WidgetId.Next();
+        password = false;
+        reveal = false;
+        iconLead = "";
+        iconTrail = "";
         wiresOwnEvents = true;
         Change = UiEvent.Create();
         Submit = UiEvent.Create();
@@ -66,6 +78,15 @@ class Input : Control {
         Input inp = new Input(hintText);
         inp.model = sig;
         return inp;
+    }
+
+    /// A string of `*` as long (in bytes) as `s`, so the masked display keeps
+    /// the same byte layout and the caret/selection math stays valid.
+    static string Mask(string s) {
+        string m = "";
+        int i = 0;
+        while (i < s.Length) { m = m + "*"; i = i + 1; }
+        return m;
     }
 
     string GetText() { return model.Get(); }
@@ -250,10 +271,25 @@ class Input : Control {
         int accent = s.AccentOr(t.primary);
 
         int pad = s.PadLOr(t.paddingSmall);
-        int innerX = x + pad;
-        int innerW = w - pad - s.PadROr(t.paddingSmall);
+        // Reserve a square slot for each icon so the text never runs under it.
+        // A password field always gets a trailing eye toggle.
+        int glyphSz = fs;
+        string trailIcon = iconTrail;
+        if (password) { trailIcon = "eye"; }
+        int leadSlot = 0;
+        if (iconLead != "") { leadSlot = glyphSz + pad; }
+        int trailSlot = 0;
+        if (trailIcon != "") { trailSlot = glyphSz + pad; }
+        int innerX = x + pad + leadSlot;
+        int innerW = w - pad - s.PadROr(t.paddingSmall) - leadSlot - trailSlot;
         if (innerW < 0) { innerW = 0; }
         int textY = y + (h - Canvas.FontHeight(fs)) / 2;
+        // Masked display: same byte length so cursorPos still indexes it.
+        string disp = txt;
+        if (password && !reveal) { disp = Input.Mask(txt); }
+        int trailX = x + w - trailSlot;
+        bool onTrail = trailSlot > 0 && app.mouseX >= trailX
+            && app.mouseX < x + w && app.mouseY >= y && app.mouseY < y + h;
 
         StyleBox placeholderStyle = this.ResolveEasedPartAs(
             app, id, "input", "placeholder", "", Class, false, false);
@@ -265,8 +301,8 @@ class Input : Control {
         int caretColor = caretStyle.BgOr(caretStyle.FgOr(caretStyle.AccentOr(accent)));
 
         int caretW = 0;
-        if (txt != "") {
-            caretW = Canvas.MeasureText(Text.Left(txt, cursorPos), fs);
+        if (disp != "") {
+            caretW = Canvas.MeasureText(Text.Left(disp, cursorPos), fs);
         }
         int scrollX = 0;
         if (caretW > innerW) { scrollX = caretW - innerW; }
@@ -274,8 +310,8 @@ class Input : Control {
         c.PushClip(innerX, y, innerW, h);
         if (focused && HasSel()) {
             // Selection highlight behind the text.
-            int selPx0 = Canvas.MeasureText(Text.Left(txt, SelStart()), fs);
-            int selPx1 = Canvas.MeasureText(Text.Left(txt, SelEnd()), fs);
+            int selPx0 = Canvas.MeasureText(Text.Left(disp, SelStart()), fs);
+            int selPx1 = Canvas.MeasureText(Text.Left(disp, SelEnd()), fs);
             int selH = Canvas.FontHeight(fs);
             int selectionColor = selectionStyle.BgOr(
                 App.LerpColor(s.BgOr(t.bgPrimary), accent, 96));
@@ -287,7 +323,7 @@ class Input : Control {
             c.DrawText(innerX, placeholderY, hint,
                        placeholderStyle.FgOr(t.textTertiary), placeholderFont);
         } else {
-            c.DrawText(innerX - scrollX, textY, txt, s.FgOr(t.textPrimary), fs);
+            c.DrawText(innerX - scrollX, textY, disp, s.FgOr(t.textPrimary), fs);
         }
 
         if (focused) {
@@ -300,14 +336,37 @@ class Input : Control {
         }
         c.PopClip();
 
+        // Icons sit in the padding slots reserved outside the text clip, so
+        // they are drawn after PopClip -- otherwise the text clip (which spans
+        // only innerX..innerX+innerW) would cut them off and nothing shows.
+        if (iconLead != "") {
+            c.DrawGlyphIn(iconLead, x + pad, y, glyphSz, h, glyphSz,
+                s.FgOr(t.textTertiary));
+        }
+        if (trailIcon != "") {
+            int eyeColor = s.FgOr(t.textTertiary);
+            if (password && reveal) { eyeColor = accent; }
+            if (onTrail) { eyeColor = accent; }
+            c.DrawGlyphIn(trailIcon, trailX, y, glyphSz, h, glyphSz, eyeColor);
+        }
+
         app.hitTester.Register(HitRegion.Create(id, x, y, w, h, 1));
+
+        // Password reveal: a left-click release on the trailing eye toggles
+        // plaintext and consumes the click so the caret does not move.
+        if (password && onTrail && app.EventKind() == 3
+                && app.window.EventButton() == 0 && app.ClickAvailable()) {
+            reveal = !reveal;
+            app.ClaimClick();
+            app.RequestRedraw();
+        }
 
         // Mouse selection: press anchors the selection and places the caret;
         // dragging while pressed moves the caret end; release keeps the range
         // (collapsed ranges clear the anchor).
-        if (Ui.PressedDown(app, id)) {
+        if (Ui.PressedDown(app, id) && !onTrail) {
             int rel = app.mouseX - innerX + scrollX;
-            cursorPos = CodeEditor.ColFromX(txt, rel, fs);
+            cursorPos = CodeEditor.ColFromX(disp, rel, fs);
             if (Modifiers.HasShift(app.window.EventMods()) && selAnchor >= 0) {
                 // Shift+click extends from the existing anchor.
             } else {
@@ -317,7 +376,7 @@ class Input : Control {
         } else if (focused && app.focus.IsPressed(id)
                    && app.EventKind() == 1) {
             int rel = app.mouseX - innerX + scrollX;
-            int drag = CodeEditor.ColFromX(txt, rel, fs);
+            int drag = CodeEditor.ColFromX(disp, rel, fs);
             if (drag != cursorPos) {
                 cursorPos = drag;
                 app.RequestRedraw();
@@ -325,9 +384,9 @@ class Input : Control {
         }
         // Single-consumer click: place the caret when this input is the click
         // target resolved by the framework.
-        if (Ui.Clicked(app, id)) {
+        if (Ui.Clicked(app, id) && !onTrail) {
             int rel = app.mouseX - innerX + scrollX;
-            cursorPos = CodeEditor.ColFromX(txt, rel, fs);
+            cursorPos = CodeEditor.ColFromX(disp, rel, fs);
             if (selAnchor == cursorPos) { selAnchor = -1; }
             app.RequestRedraw();
         }
@@ -358,9 +417,11 @@ class Input : Control {
     }
 
     override bool SetExtra(string key, string val) {
-        if (key != "text" && key != "value") { return false; }
-        this.SetText(val);
-        return true;
+        if (key == "text" || key == "value") { this.SetText(val); return true; }
+        if (key == "password") { password = (val == "true"); return true; }
+        if (key == "iconLead" || key == "icon") { iconLead = val; return true; }
+        if (key == "iconTrail") { iconTrail = val; return true; }
+        return false;
     }
 
     override List<string> Events() {
