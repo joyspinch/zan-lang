@@ -11,9 +11,22 @@ on:
   workflow_dispatch:
   push:
     tags: ['v*', 'drivers-*']
+    # The Cocoa GUI driver is the one bundle that cannot be built off a Mac,
+    # so the committed dylib is only as new as the last run of this workflow.
+    # Touching the GUI runtime rebuilds and re-commits it, which is what keeps
+    # `zanc --target macos-*` able to link a GUI program from Windows/Linux.
+    branches: [main]
+    paths:
+      - '.github/workflows/drivers.yml'
+      - 'src/runtime/gui_runtime.c'
+      - 'src/runtime/gui_runtime.h'
+      - 'src/runtime/gui_runtime_mac.m'
   pull_request:
     paths:
       - '.github/workflows/drivers.yml'
+      - 'src/runtime/gui_runtime.c'
+      - 'src/runtime/gui_runtime.h'
+      - 'src/runtime/gui_runtime_mac.m'
       - 'stdlib/SDL3/**'
       - 'stdlib/System/Data/**'
       - 'scripts/stage_*'
@@ -127,6 +140,12 @@ jobs:
           - { target: macos-arm64, runner: macos-14 }
           - { target: macos-x64,   runner: macos-13 }
     runs-on: ${{ matrix.runner }}
+    # Intel runners can sit queued for the full 24h job limit, which used to
+    # hold the whole run (and its artifacts) hostage. The GUI driver for x64 is
+    # cross-built on the arm64 runner below, so this job only carries the
+    # brew-built bundles: let it give up early and never block the others.
+    timeout-minutes: ${{ matrix.target == 'macos-x64' && 45 || 60 }}
+    continue-on-error: ${{ matrix.target == 'macos-x64' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -215,6 +234,27 @@ jobs:
         with:
           name: gui-macos-x64
           path: stdlib/Gui/drivers/macos-x64/
+
+      # Refresh the committed dylibs. A cross link reads them straight out of
+      # the working tree, so a GUI runtime change that is not mirrored here
+      # fails every `--target macos-*` publish with undefined symbols -- which
+      # is exactly what a developer on Windows sees, days later.
+      - name: Commit refreshed macOS GUI drivers
+        if: >-
+          matrix.target == 'macos-arm64' && github.event_name == 'push'
+          && github.ref == 'refs/heads/main'
+        run: |
+          set -eux
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add stdlib/Gui/drivers/macos-arm64 stdlib/Gui/drivers/macos-x64
+          if git diff --cached --quiet; then
+            echo "drivers already current"
+            exit 0
+          fi
+          git commit -m 'drivers: rebuild macOS GUI dylibs (arm64 + x64)'
+          git pull --rebase origin main
+          git push origin HEAD:main
 
       - uses: actions/upload-artifact@v4
         with:
