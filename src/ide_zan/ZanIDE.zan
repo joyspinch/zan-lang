@@ -2778,12 +2778,15 @@ partial class ZanIDE {
                     int aiRow1H = app.Scale(34);
                     int aiHdrH = app.Scale(4) + aiRow1H + app.Scale(8);
                     int aiSmBtnW = app.Scale(52);
-                    int aiSelW = rBody.width - rPad * 4 - aiSmBtnW * 2;
+                    // D: reserve a square at the far right of the header for the
+                    // context-usage ring.
+                    int aiRingBox = aiRow1H;
+                    int aiSelW = rBody.width - rPad * 5 - aiSmBtnW * 2 - aiRingBox;
                     if (aiSelW < app.Scale(60)) {
                         // A narrow panel cannot hold the natural sizes: share
                         // the strip instead of letting the buttons run past the
                         // right edge (and over each other).
-                        int aiStrip = rBody.width - rPad * 4;
+                        int aiStrip = rBody.width - rPad * 5 - aiRingBox;
                         if (aiStrip < app.Scale(48)) { aiStrip = app.Scale(48); }
                         aiSmBtnW = aiStrip * 22 / 100;
                         if (aiSmBtnW < app.Scale(24)) { aiSmBtnW = app.Scale(24); }
@@ -2795,6 +2798,10 @@ partial class ZanIDE {
                         rBody.x + rPad * 2 + aiSelW, aiRow1Y, aiSmBtnW);
                     int aiCfgId = aiCfgBtn.Render(app,
                         rBody.x + rPad * 3 + aiSelW + aiSmBtnW, aiRow1Y, aiSmBtnW);
+                    int aiRingR = aiRingBox / 2 - app.Scale(3);
+                    int aiRingCx = rBody.x + rBody.width - rPad - aiRingBox / 2;
+                    int aiRingCy = aiRow1Y + aiRow1H / 2;
+                    AiRenderContextRing(app, aiRingCx, aiRingCy, aiRingR);
                     if (Ui.Clicked(app, aiCfgId)) {
                         if (aiWindow == null || !aiWindow.IsOpen()) {
                             aiWindow = AiSettingsWindow.Open(app, ZanIDE.uiLang);
@@ -3566,6 +3573,11 @@ partial class ZanIDE {
                             sraw = File.ReadAllText(ZanIDE.AiStreamPath());
                         }
                         SseAnswer fa = AiAgent.ParseSse(sraw);
+                        if (fa.totalTokens > 0 || fa.promptTokens > 0) {
+                            aiTokPrompt = fa.promptTokens;
+                            aiTokCompletion = fa.completionTokens;
+                            aiTokTotal = fa.totalTokens;
+                        }
                         if (doneTxt != "ok" || fa.error != "") {
                             string emsg = doneTxt;
                             if (emsg.Length >= 5 && emsg.Substring(0, 5) == "err: ") {
@@ -4414,6 +4426,69 @@ partial class ZanIDE {
         if (terr != "") { aiRole.Add("error"); aiText.Add(terr); aiBusy.Set(0); }
     }
 
+    /// D: a small ring at the top-right of the AI panel showing how full the
+    /// running transcript is against the compaction budget, with a hover
+    /// tooltip that breaks down the last reply's token usage.
+    void AiRenderContextRing(App app, int cx, int cy, int r) {
+        Theme t = app.theme;
+        Canvas c = app.canvas;
+        if (r < app.Scale(5)) { return; }
+        int used = AiAgent.ContextChars(aiText);
+        int budget = AiAgent.MaxContextChars();
+        int pct = 0;
+        if (budget > 0) { pct = used * 100 / budget; }
+        double frac = (double)pct / 100.0;
+        if (frac > 1.0) { frac = 1.0; }
+        int col = t.success;
+        if (pct >= 75) { col = t.warning; }
+        if (pct >= 100) { col = t.warningPressed; }
+        int thick = app.Scale(3);
+        c.DrawCircle(cx, cy, r, t.divider, thick);
+        // Foreground arc from 12 o'clock, clockwise, covering `frac` of a turn.
+        int segs = (int)(frac * 48.0);
+        if (segs < 1 && pct > 0) { segs = 1; }
+        int px = cx;
+        int py = cy - r;
+        int s = 1;
+        while (s <= segs) {
+            double a = 0.0 - IconVector.Pi() / 2.0
+                + 2.0 * IconVector.Pi() * (double)s / 48.0;
+            int nx = cx + (int)(Math.Cos(a) * (double)r);
+            int ny = cy + (int)(Math.Sin(a) * (double)r);
+            c.DrawLine(px, py, nx, ny, col, thick);
+            px = nx; py = ny;
+            s = s + 1;
+        }
+        int fs = t.fontSizeSmall;
+        string lbl = Convert.ToString(pct) + "%";
+        int lw = Canvas.MeasureText(lbl, fs);
+        c.DrawText(cx - lw / 2, cy - fs / 2 - app.Scale(1), lbl,
+            t.textSecondary, fs);
+        bool over = app.mouseX >= cx - r && app.mouseX <= cx + r
+            && app.mouseY >= cy - r && app.mouseY <= cy + r;
+        if (over) {
+            string tip = ZanIDE.T("Context", "上下文") + ": "
+                + Convert.ToString(used) + " / " + Convert.ToString(budget)
+                + " " + ZanIDE.T("chars", "字符") + " ("
+                + Convert.ToString(pct) + "%)";
+            if (pct >= 100) {
+                tip = tip + "\n" + ZanIDE.T(
+                    "Oldest turns are compacted into a digest.",
+                    "较早的对话已压缩为摘要。");
+            }
+            if (aiTokTotal > 0 || aiTokPrompt > 0) {
+                tip = tip + "\n" + ZanIDE.T("Last reply tokens", "上次回复 token")
+                    + ": " + ZanIDE.T("prompt", "输入") + " "
+                    + Convert.ToString(aiTokPrompt) + " + "
+                    + ZanIDE.T("output", "输出") + " "
+                    + Convert.ToString(aiTokCompletion) + " = "
+                    + Convert.ToString(aiTokTotal);
+            }
+            Tooltip.Request(cx, cy + r + app.Scale(4), tip, Tooltip.Bottom(),
+                app.Scale(240));
+        }
+    }
+
     /// Height of the task-plan strip drawn above the chat, or 0 when the
     /// current session has no plan. G: a per-session checklist that survives
     /// session switching and context compaction (it lives in the session
@@ -4544,6 +4619,9 @@ partial class ZanIDE {
         aiCacheKinds = new List<int>();
         aiCacheKey = "";
         aiChatSel = LogState.Create();
+        aiTokPrompt = 0;
+        aiTokCompletion = 0;
+        aiTokTotal = 0;
         // In-flight "AI continue at caret" request (tab it was started from).
         aiPredBusy = SignalInt.Create(0);
         aiPredTab = 0 - 1;
