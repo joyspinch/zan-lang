@@ -1857,8 +1857,12 @@ int zan_irgen_stub_extern_lib(zan_irgen_t *g, const char *lib, int lib_len) {
             LLVMBuildRetVoid(b);
             break;
         case LLVMIntegerTypeKind:
-            /* -1 doubles as SQL_ERROR / a generic nonzero failure code */
-            LLVMBuildRet(b, LLVMConstInt(rt, (unsigned long long)-1, 1));
+            /* -1 doubles as SQL_ERROR / a generic nonzero failure code, but a
+             * pointer-wide result is a handle (LoadLibrary, GetProcAddress,
+             * ...) that callers null-check and otherwise call through, so -1
+             * there turns "stubbed" into a jump to 0xffff...ffff. */
+            LLVMBuildRet(b, LLVMConstInt(rt,
+                LLVMGetIntTypeWidth(rt) >= 64 ? 0 : (unsigned long long)-1, 1));
             break;
         case LLVMFloatTypeKind:
         case LLVMDoubleTypeKind:
