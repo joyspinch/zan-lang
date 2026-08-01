@@ -1,5 +1,6 @@
 using System;
 using Gui;
+using Gui.Backend;
 
 namespace Gui.Widget;
 
@@ -81,6 +82,11 @@ class TreeView : Control {
     SignalInt scroll;
     Input filter;
     bool checks;
+    /// Multi-select mode: Ctrl-click toggles a row in/out of the selection,
+    /// Shift-click extends it from the focused row. `marks` holds the extra
+    /// selected rows beside `sel` (the focused row).
+    bool multi;
+    List<int> marks;
     NodeOf tpl;
     bool rowsStale;
     int builtFor;
@@ -115,6 +121,8 @@ class TreeView : Control {
         scroll = SignalInt.Create(0);
         filter = null;
         checks = false;
+        multi = false;
+        marks = new List<int>();
         tpl = null;
         rowsStale = true;
         builtFor = 0 - 1;
@@ -165,6 +173,11 @@ class TreeView : Control {
         else { data = nodes; }
         rowsStale = true;
         if (sel.Get() >= data.Count) { sel.Set(0 - 1); }
+        int mi = marks.Count - 1;
+        while (mi >= 0) {
+            if (marks[mi] >= data.Count) { marks.RemoveAt(mi); }
+            mi = mi - 1;
+        }
         return this;
     }
 
@@ -188,6 +201,12 @@ class TreeView : Control {
     /// Draws a tri-state checkbox in front of every node.
     TreeView WithChecks() {
         checks = true;
+        return this;
+    }
+
+    /// Enables Ctrl-click (toggle) and Shift-click (range) multi-selection.
+    TreeView WithMultiSelect() {
+        multi = true;
         return this;
     }
 
@@ -215,7 +234,36 @@ class TreeView : Control {
         Select.Post();
     }
 
-    void ClearSelection() { sel.Set(0 - 1); }
+    void ClearSelection() {
+        sel.Set(0 - 1);
+        marks = new List<int>();
+    }
+
+    /// True when `row` is part of the selection (the focused row included).
+    bool IsMarked(int row) {
+        if (row < 0) { return false; }
+        if (row == sel.Get()) { return true; }
+        int i = 0;
+        while (i < marks.Count) {
+            if (marks[i] == row) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    /// Every selected row in ascending order (focused row included).
+    List<int> SelectedIndices() {
+        List<int> outp = new List<int>();
+        int n = data.Count;
+        int i = 0;
+        while (i < n) {
+            if (this.IsMarked(i)) { outp.Add(i); }
+            i = i + 1;
+        }
+        return outp;
+    }
+
+    int SelectionCount() { return this.SelectedIndices().Count; }
 
     /// The node the running handler is about (right-clicked or check-toggled).
     int ContextRow() { return ctxRow; }
@@ -401,7 +449,46 @@ class TreeView : Control {
         if (hit != id) { return id; }
         if (app.ClickAvailable()) {
             TreeNode n = data[index];
+            int mods = app.window.EventMods();
+            if (multi && Modifiers.HasCtrl(mods)) {
+                // Toggle the row in/out of the multi-selection. No Select is
+                // raised (a toggle is not a pick) and directories keep their
+                // expansion state so a selection can include closed folders.
+                bool was = false;
+                int mi = 0;
+                while (mi < marks.Count) {
+                    if (marks[mi] == index) { marks.RemoveAt(mi); was = true; break; }
+                    mi = mi + 1;
+                }
+                if (sel.Get() == index) { sel.Set(0 - 1); was = true; }
+                if (!was) {
+                    if (sel.Get() < 0) { sel.Set(index); }
+                    else { marks.Add(index); }
+                }
+                ctxRow = index;
+                app.RequestRedraw();
+                app.window.Wake();
+                return id;
+            }
+            if (multi && Modifiers.HasShift(mods) && sel.Get() >= 0) {
+                // Extend the selection from the focused row to this one,
+                // marking only visible rows so children of collapsed
+                // directories are never silently included.
+                int a = sel.Get();
+                int b = index;
+                if (b < a) { int tmp = a; a = b; b = tmp; }
+                int r = a;
+                while (r <= b) {
+                    if (!this.IsMarked(r) && this.Shown(r)) { marks.Add(r); }
+                    r = r + 1;
+                }
+                ctxRow = index;
+                app.RequestRedraw();
+                app.window.Wake();
+                return id;
+            }
             bool moved = sel.Get() != index;
+            if (multi) { marks = new List<int>(); }
             sel.Set(index);
             ctxRow = index;
             if (n.isDir) {
@@ -416,7 +503,12 @@ class TreeView : Control {
         } else if (app.EventKind() == 2 && app.window.EventButton() == 1) {
             // A right-click moves the selection to the row the menu is about
             // without raising Select: opening a context menu is not a pick.
-            sel.Set(index);
+            // A right-click on a row that is already part of a multi-selection
+            // keeps the selection, so a context action can target all of it.
+            if (!(multi && this.IsMarked(index))) {
+                if (multi) { marks = new List<int>(); }
+                sel.Set(index);
+            }
             ctxRow = index;
             ctxX = app.mouseX;
             ctxY = app.mouseY;
@@ -543,7 +635,7 @@ class TreeView : Control {
                     child.visible = onscreen;
                 }
                 if (onscreen) {
-                    bool active = k == selRow;
+                    bool active = k == selRow || (multi && this.IsMarked(k));
                     if (checks) {
                         if (this.PaintCheck(app, k, rb.x + t.paddingSmall,
                                             rb.y, rh, box)) {
