@@ -1,6 +1,7 @@
 using System;
 using Gui.Widget;
 using Gui.Component;
+using Gui.Backend;
 using Gui;
 using Gui.Component.Chart;
 
@@ -46,6 +47,14 @@ partial class Designer {
         int fx = cx + pad;
         int fw = cw - pad * 2;
         if (maxScroll > 0) { fw = fw - app.Scale(8); }
+        // Honour the designed window width (LVGL-style size preview): when the
+        // design size is narrower than the panel, the form is rendered at that
+        // width, centred, so the flow layout is checked against the target
+        // resolution instead of whatever the editor pane happens to be.
+        if (winW > 40 && app.Scale(winW) < fw) {
+            fw = app.Scale(winW);
+            fx = cx + (cw - fw) / 2;
+        }
         int fy = bodyY + pad - formScroll;
 
         string head = formNameSig.Get();
@@ -225,24 +234,27 @@ partial class Designer {
         int bh = app.Scale(28);
 
         List<string> zooms = new List<string>();
-        zooms.Add("Fit"); zooms.Add("50%"); zooms.Add("100%"); zooms.Add("150%");
+        zooms.Add("Fit"); zooms.Add("50%"); zooms.Add("100%");
+        zooms.Add("150%"); zooms.Add("200%");
         int zSel = 0;
         if (winZoom == 500) { zSel = 1; }
         else if (winZoom == 1000) { zSel = 2; }
         else if (winZoom == 1500) { zSel = 3; }
+        else if (winZoom == 2000) { zSel = 4; }
         int i = 0;
         while (i < zooms.Count) {
             int bt = 0;
             if (i == zSel) { bt = 1; }
-            int id = new Button { Text = zooms[i], Class = Style.TypeClass(bt) }.Render(app, bx, by, app.Scale(52));
+            int id = new Button { Text = zooms[i], Class = Style.TypeClass(bt) }.Render(app, bx, by, app.Scale(48));
             if (Ui.Clicked(app, id)) {
                 if (i == 0) { winZoom = 0; }
                 else if (i == 1) { winZoom = 500; }
                 else if (i == 2) { winZoom = 1000; }
-                else { winZoom = 1500; }
+                else if (i == 3) { winZoom = 1500; }
+                else { winZoom = 2000; }
                 app.RequestRedraw();
             }
-            bx = bx + app.Scale(56);
+            bx = bx + app.Scale(52);
             i = i + 1;
         }
         bx = bx + app.Scale(4);
@@ -257,32 +269,75 @@ partial class Designer {
         if (Ui.Clicked(app, sId)) { snapGrid = !snapGrid; app.RequestRedraw(); }
         bx = bx + app.Scale(60);
 
-        // Design-size presets (LVGL-style multi-size design): switch the
-        // designed window's resolution while keeping the layout, so one form
-        // can be checked against phone / tablet / desktop targets.
-        List<string> szNames = new List<string>();
-        szNames.Add(Designer.T("Phone", "手机"));
-        szNames.Add(Designer.T("Tablet", "平板"));
-        szNames.Add(Designer.T("Desktop", "桌面"));
-        List<int> szW = new List<int>{ 390, 768, 1280 };
-        List<int> szH = new List<int>{ 844, 1024, 720 };
-        int si = 0;
-        while (si < szNames.Count) {
-            int st2 = 0;
-            if (winW == szW[si] && winH == szH[si]) { st2 = 1; }
-            int sid2 = new Button { Text = szNames[si], Class = Style.TypeClass(st2) }.Render(app, bx, by, app.Scale(56));
-            if (Ui.Clicked(app, sid2)) {
-                winW = szW[si];
-                winH = szH[si];
+        // Design-size presets (LVGL-style multi-size design): a dropdown of
+        // common display / device resolutions plus an orientation-swap button.
+        // Picking one switches the designed window's resolution while keeping
+        // the layout, so one form can be checked against every target size.
+        List<int> szW = FreePresetW();
+        List<int> szH = FreePresetH();
+        if (freeSizeSel == null) {
+            freeSizeSel = SelectBox.Create(Designer.T("Size", "尺寸"));
+            int po = 0;
+            while (po < szW.Count) {
+                freeSizeSel.AddOption(FreePresetName(po)
+                    + "  " + Convert.ToString(szW[po]) + "x" + Convert.ToString(szH[po]));
+                po = po + 1;
+            }
+        }
+        // Re-sync the dropdown when the size was edited elsewhere (inspector
+        // Width/Height rows, JSON drawer, orientation swap).
+        int cur = 0 - 1;
+        int pf = 0;
+        while (pf < szW.Count) {
+            if (winW == szW[pf] && winH == szH[pf]) { cur = pf; }
+            pf = pf + 1;
+        }
+        if (freeSizeSel.Selected() != cur && freeSizeApplied == freeSizeSel.Selected()) {
+            freeSizeSel.Select(cur);
+            freeSizeApplied = cur;
+        }
+        freeSizeSel.Render(app, bx, by, app.Scale(150));
+        int pick = freeSizeSel.Selected();
+        if (pick != freeSizeApplied) {
+            freeSizeApplied = pick;
+            if (pick >= 0 && pick < szW.Count) {
+                winW = szW[pick];
+                winH = szH[pick];
                 app.RequestRedraw();
             }
-            bx = bx + app.Scale(60);
-            si = si + 1;
+        }
+        bx = bx + app.Scale(156);
+        int rotId = new Button { Text = Designer.T("Rotate", "横竖切换"), Class = "small" }
+            .Render(app, bx, by, app.Scale(70));
+        if (Ui.Clicked(app, rotId)) {
+            int tmpW = winW;
+            winW = winH;
+            winH = tmpW;
+            app.RequestRedraw();
         }
 
         string sz = Convert.ToString(winW) + " x " + Convert.ToString(winH);
         int sw = Canvas.MeasureText(sz, fs);
         c.DrawText(x + w - sw - app.Scale(10), by + app.Scale(7), sz, t.textTertiary, fs);
+    }
+
+    /// Common design-size presets (LVGL display sizes + phone/tablet/desktop).
+    static List<int> FreePresetW() {
+        return new List<int>{ 320, 480, 800, 1024, 390, 768, 1280, 1366, 1920 };
+    }
+    static List<int> FreePresetH() {
+        return new List<int>{ 240, 320, 480, 600, 844, 1024, 720, 768, 1080 };
+    }
+    static string FreePresetName(int i) {
+        if (i == 0) { return "QVGA"; }
+        if (i == 1) { return "HVGA"; }
+        if (i == 2) { return "WVGA"; }
+        if (i == 3) { return "WSVGA"; }
+        if (i == 4) { return Designer.T("Phone", "手机"); }
+        if (i == 5) { return Designer.T("Tablet", "平板"); }
+        if (i == 6) { return "HD"; }
+        if (i == 7) { return "WXGA"; }
+        return "FHD";
     }
 
     /// Design-space -> screen-space for a free-canvas element (children carry
@@ -428,6 +483,22 @@ partial class Designer {
             while (gy <= dh) {
                 c.FillRect(ox, oy + gy * psMilli / 1000, cw2, 1, t.borderSecondary);
                 gy = gy + gstep;
+            }
+        }
+
+        // Ctrl+wheel zooms the canvas around the current zoom level (Fit picks
+        // up from the effective fit scale, so zooming out of Fit is smooth).
+        if (InRect(app.mouseX, app.mouseY, inX, inY, inW, inH)
+                && Modifiers.HasCtrl(app.window.EventMods())) {
+            if (app.CaptureWheel(inX, inY, inW, inH)) {
+                int wdelta = app.window.EventKeyCode();
+                int z = psMilli;
+                if (wdelta > 0) { z = z * 110 / 100; }
+                else if (wdelta < 0) { z = z * 100 / 110; }
+                if (z < 100) { z = 100; }
+                if (z > 4000) { z = 4000; }
+                winZoom = z;
+                app.RequestRedraw();
             }
         }
 
