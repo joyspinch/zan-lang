@@ -17,6 +17,11 @@ int32_t zan_thread_start(void *body);
  * keeps a slot in a table with a hard limit. Idempotent. */
 void zan_thread_detach(void);
 
+/* Drop the calling thread's exception-handling state. Emitted by the compiler
+ * as the epilogue of a thread body that can throw; the runtime object provides
+ * a weak fallback definition, the produced program overrides it when needed. */
+void __zan_eh_release(void);
+
 /* `lock (obj)` statement monitor: process-wide recursive mutex (coarser than
  * C#'s per-object monitor; the object argument is currently unused). */
 void zan_monitor_enter(void *obj);
@@ -43,6 +48,9 @@ int64_t zan_atomic_int_compare_exchange(
     int64_t handle, int64_t expected, int64_t desired);
 int64_t zan_atomic_int_add(int64_t handle, int64_t delta);
 
+/* Monotonic microseconds (no allocation; the Zan-side clock wrapper allocates). */
+int64_t zan_monotonic_us(void);
+
 int64_t zan_shared_table_create(
     const char *name, int32_t capacity, int32_t key_size, const char *schema);
 int64_t zan_shared_table_open(const char *name);
@@ -66,6 +74,30 @@ int32_t zan_shared_table_delete(int64_t handle, const char *key);
 int32_t zan_shared_table_exists(int64_t handle, const char *key);
 int64_t zan_shared_table_count(int64_t handle);
 void zan_shared_table_clear(int64_t handle);
+
+/* Hash-keyed variants of the shared-table operations. The stdlib precomputes
+ * zan_shared_table_hash() on the hot path so lookups skip the string scan;
+ * the keyed API above is the same operations keyed by name. */
+int64_t zan_shared_table_hash(const char *value);
+int32_t zan_shared_table_set_int_at(
+    int64_t handle, int64_t key_hash, const char *column_name, int64_t value);
+int64_t zan_shared_table_get_int_at(
+    int64_t handle, int64_t key_hash, const char *column_name);
+int64_t zan_shared_table_increment_at(
+    int64_t handle, int64_t key_hash, const char *column_name, int64_t delta);
+int64_t zan_shared_table_extreme_at(
+    int64_t handle, int64_t key_hash, const char *column_name, int64_t value,
+    int64_t keep_larger);
+int32_t zan_shared_table_set_string_at(
+    int64_t handle, int64_t key_hash, const char *column_name,
+    const char *value);
+const char *zan_shared_table_get_string_at(
+    int64_t handle, int64_t key_hash, const char *column_name);
+int32_t zan_shared_table_match_at(
+    int64_t handle, int64_t key_hash, const char *column_name,
+    const char *text);
+int32_t zan_shared_table_exists_at(int64_t handle, int64_t key_hash);
+int32_t zan_shared_table_delete_at(int64_t handle, int64_t key_hash);
 
 /* filesystem helpers for the compiler driver */
 long long zan_exe_dir_into(char *out, long long cap);
