@@ -301,11 +301,11 @@ partial class ZanIDE {
                     File.WriteAllText(dir + "/src/" + name + ".zform", body);
                     File.Delete(dir + "/src/App.zform");
                 }
-                // Generate each form's strongly-typed layout file (Name.g.zan)
-                // from its .zform, and ensure the business file exists. The
-                // window's Main lives in the generated file, so that is the entry.
+                // 2-file model: the .zform IS the compiled design source (zanc's
+                // formgen projects its typed fields + Main at compile time), so
+                // only ensure the business file exists; the form is the entry.
                 ZanIDE.SyncFormCodeBehinds(dir + "/src");
-                entry = "src/" + name + ".g.zan";
+                entry = "src/" + name + ".zform";
             }
         } else {
             typeName = "empty";
@@ -335,9 +335,10 @@ partial class ZanIDE {
         return dir;
     }
 
-    /// After a GUI project is scaffolded from a disk template, regenerate each
-    /// form's code-behind designer region from its .zform so the shipped window
-    /// actually renders the designed controls (single source of truth = .zform).
+    /// After a GUI project is scaffolded from a disk template, make sure each
+    /// form has its business file (.zan). The .zform itself is the single
+    /// source of truth: zanc compiles it directly, so there is no generated
+    /// layout file to keep in sync. Scenes keep their generated Name.g.zan.
     static void SyncFormCodeBehinds(string srcDir) {
         if (!Directory.Exists(srcDir)) { return; }
         List<string> files = Directory.GetFiles(srcDir);
@@ -347,11 +348,6 @@ partial class ZanIDE {
             i = i + 1;
             if (ZanIDE.IsFormPath(fp)) {
                 string fbase = ZanIDE.FormBaseName(fp);
-                Designer d = Designer.Create();
-                d.LoadJson(File.ReadAllText(fp));
-                // The generated layout file is rewritten wholesale from the design.
-                File.WriteAllText(ZanIDE.GenFilePath(fp),
-                    ZanIDE.GenFormFile(fbase, d.fields, d.winW, d.winH, d.winTitleSig.Get(), d.winCenter, d.winPosX, d.winPosY));
                 // The business file is created only if absent - never overwritten.
                 string cbp = ZanIDE.CodeBehindPath(fp);
                 if (!File.Exists(cbp)) {
@@ -391,14 +387,12 @@ partial class ZanIDE {
         }
         if (kind == 5) {
             string formPath = root + "/src/" + name + ".zform";
-            string genPath = ZanIDE.GenFilePath(formPath);
             string cbPath = ZanIDE.CodeBehindPath(formPath);
             File.WriteAllText(formPath, "{\"name\":\"" + name + "\",\"winW\":480,\"winH\":520,\"fields\":[]}");
-            File.WriteAllText(genPath, ZanIDE.GenFormFile(name, new List<FormField>(), 480, 520, name, true, 0, 0));
             if (!File.Exists(cbPath)) {
                 File.WriteAllText(cbPath, ZanIDE.GenBusinessShell(name));
             }
-            log.Add("> Created form " + formPath + " (+ " + genPath + ", " + cbPath + ").");
+            log.Add("> Created form " + formPath + " (+ " + cbPath + ").");
             return formPath;
         }
         if (kind == 7) {
@@ -588,9 +582,10 @@ partial class ZanIDE {
     }
 
     /// Resolves the source file Run/Build/Debug/Publish should compile for
-    /// the active tab: a .zform maps to its code-behind (falling back to the
-    /// project entry), and the special @start/@docs tabs map to the
-    /// project entry when one exists. Returns "" when there is no target.
+    /// the active tab: a .zform compiles directly (zanc's formgen projects its
+    /// fields + Main), a form's business .zan routes to its paired .zform, and
+    /// the special @start/@docs tabs map to the project entry when one exists.
+    /// Returns "" when there is no target.
     static string RunTarget(string p, string root) {
         if (p == "@start" || p == "@docs") {
             string entry = ZanIDE.ProjectEntry(root);
@@ -598,11 +593,9 @@ partial class ZanIDE {
             return "";
         }
         if (ZanIDE.IsFormPath(p)) {
-            string gen = ZanIDE.GenFilePath(p);
-            if (File.Exists(gen)) { return gen; }
-            string cb = ZanIDE.CodeBehindPath(p);
-            if (File.Exists(cb)) { return cb; }
-            return ZanIDE.ProjectEntry(root);
+            // 2-file model: the .zform is the compiled input; its business
+            // file (Name.zan) rides along through SmartInputs.
+            return p;
         }
         if (ZanIDE.IsScenePath(p)) {
             string sgen = ZanIDE.SceneGenFilePath(p);
@@ -611,11 +604,11 @@ partial class ZanIDE {
             if (File.Exists(scb)) { return scb; }
             return ZanIDE.ProjectEntry(root);
         }
-        // A form's business file (Name.zan) has no Main; compile via its
-        // generated sibling (Name.g.zan), which owns the window's entry point.
+        // A form's business file (Name.zan) has no Main of its own; compile via
+        // its paired .zform, which zanc projects into the window's entry point.
         if (ZanIDE.IsZanFilePath(p) && !ZanIDE.IsGenPath(p)) {
-            string gen = p.Substring(0, p.Length - 4) + ".g.zan";
-            if (File.Exists(gen)) { return gen; }
+            string form = p.Substring(0, p.Length - 4) + ".zform";
+            if (File.Exists(form)) { return form; }
         }
         return p;
     }
@@ -645,7 +638,14 @@ partial class ZanIDE {
             // their shared library in a sibling folder (examples/game/common,
             // `namespace GameKit`) and every game does `using GameKit;`, so
             // compiling main.zan alone fails on every type it defines.
-            return ZanIDE.WithUsedModules("\"" + entry + "\"", dir, entry, have);
+            string args0 = "\"" + entry + "\"";
+            // A loose .zform compiles together with its business half (Name.zan)
+            // - OnLoad / registered handlers live there.
+            if (ZanIDE.IsFormPath(entry)) {
+                string cbp0 = ZanIDE.CodeBehindPath(entry);
+                if (File.Exists(cbp0)) { args0 = args0 + " \"" + cbp0 + "\""; have.Add(cbp0); }
+            }
+            return ZanIDE.WithUsedModules(args0, dir, entry, have);
         }
         // Feed the project's other files in for cross-file types, but skip any
         // that declare their own Main: when the focused tab is a runnable

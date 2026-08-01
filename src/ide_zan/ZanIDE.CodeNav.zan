@@ -1328,20 +1328,9 @@ partial class ZanIDE {
         return o;
     }
 
-    // ---- retained-mode form code generation (single source of truth: .zform) -
+    // ---- form design model (2-file: .zform design + .zan business) ---------
 
-    /// Path of the generated, strongly-typed layout file for a .zform, e.g.
-    /// src/Login.zform -> src/Login.g.zan. This file is fully rewritten from the
-    /// design on every save; the user's logic lives in the sibling Login.zan.
-    static string GenFilePath(string formPath) {
-        int n = formPath.Length;
-        if (n >= 6 && formPath.Substring(n - 6, 6) == ".zform") {
-            return formPath.Substring(0, n - 6) + ".g.zan";
-        }
-        return formPath + ".g.zan";
-    }
-
-    /// True for a generated layout file (Name.g.zan).
+    /// True for a generated layout file (Name.g.zan) - scenes still use one.
     static bool IsGenPath(string p) {
         int n = p.Length;
         if (n < 6) { return false; }
@@ -1378,183 +1367,6 @@ partial class ZanIDE {
         return false;
     }
 
-    /// Concrete Gui widget type for a field type. Interactive kinds map to their
-    /// real widget; anything else falls back to Label so the form always
-    /// compiles and shows its caption. Containers map to Panel.
-    static string WidgetTypeOf(int ft) {
-        if (ft == 0 || ft == 2 || ft == 3) { return "Input"; }
-        if (ft == 1 || ft == 14) { return "TextArea"; }
-        if (ft == 4) { return "Radio"; }
-        if (ft == 5) { return "Checkbox"; }
-        if (ft == 6 || ft == 48) { return "SelectBox"; }
-        if (ft == 7) { return "Switch"; }
-        if (ft == 8) { return "Rate"; }
-        if (ft == 9) { return "Slider"; }
-        if (ft == 29) { return "Progress"; }
-        if (ft == 49) { return "Button"; }
-        if (ft == 18 || ft == 45 || ft == 36) { return "Panel"; }
-        return "Label";
-    }
-
-    /// Whether a field needs a separate caption Label above the control
-    /// (data inputs) versus self-captioning controls (buttons/checkboxes/text).
-    static bool FieldNeedsCaption(int ft) {
-        return ft == 0 || ft == 1 || ft == 2 || ft == 3 || ft == 4
-            || ft == 6 || ft == 8 || ft == 9 || ft == 29 || ft == 14 || ft == 48;
-    }
-
-    static int PrefHOf(int ft) {
-        if (ft == 1 || ft == 14) { return 90; }
-        if (ft == 29) { return 16; }
-        if (ft == 15) { return 30; }
-        if (ft == 5 || ft == 7 || ft == 4 || ft == 8) { return 26; }
-        if (ft == 49) { return 36; }
-        return 32;
-    }
-
-    static string FieldCaption(FormField f) {
-        if (f.label.Length > 0) { return f.label; }
-        return f.fname;
-    }
-
-    static string JoinOpts(List<string> o) {
-        string s = "";
-        int i = 0;
-        while (i < o.Count) {
-            if (i > 0) { s = s + "|"; }
-            s = s + o[i];
-            i = i + 1;
-        }
-        return s;
-    }
-
-    /// The `new ...` / `Xxx.Create(...)` expression that builds one widget.
-    static string CtorExpr(FormField f, string wt) {
-        if (wt == "Input") { return "new Input(\"" + ZanIDE.EscZ(f.placeholder) + "\")"; }
-        if (wt == "TextArea") { return "TextArea.Create(\"" + ZanIDE.EscZ(f.placeholder) + "\")"; }
-        if (wt == "Button") { return "new Button { Text = \"" + ZanIDE.EscZ(ZanIDE.FieldCaption(f)) + "\" }"; }
-        if (wt == "Checkbox") { return "new Checkbox(\"" + ZanIDE.EscZ(ZanIDE.FieldCaption(f)) + "\")"; }
-        if (wt == "Switch") { return "Switch.Create()"; }
-        if (wt == "Radio") { return "new Radio(SignalInt.Create(0), 0, \"" + ZanIDE.EscZ(ZanIDE.FieldCaption(f)) + "\")"; }
-        if (wt == "Slider") { return "new Slider(0, 100, SignalInt.Create(0))"; }
-        if (wt == "SelectBox") { return "SelectBox.FromOptions(new List<string>(), \"\")"; }
-        if (wt == "Progress") { return "new Progress(50, 1)"; }
-        if (wt == "Rate") { return "new Rate(SignalInt.Create(0), 5)"; }
-        if (wt == "Panel") { return "new Panel(\"" + ZanIDE.EscZ(f.fname) + "\")"; }
-        return "new Label(\"" + ZanIDE.EscZ(ZanIDE.FieldCaption(f)) + "\")";
-    }
-
-    /// Extra per-widget initialisation (checked/on state, select options).
-    static void EmitFieldSetup(FormField f, string wt, string vn, List<string> body) {
-        if (wt == "Checkbox" && f.defOn) { body.Add("        " + vn + ".SetChecked(true);"); }
-        if (wt == "Switch" && f.defOn) { body.Add("        " + vn + ".SetOn(true);"); }
-        if (wt == "SelectBox") {
-            string opts = ZanIDE.JoinOpts(f.options);
-            if (opts.Length > 0) {
-                body.Add("        " + vn + ".SetOptionsText(\"" + ZanIDE.EscZ(opts) + "\");");
-            }
-        }
-    }
-
-    /// Emits the construction of one designed field into `body`, declaring a
-    /// strongly-typed static field (in `decls`) when the field has a fresh
-    /// identifier name so it can be referenced from the business file. Returns
-    /// the next free local-var id. Recurses into container children.
-    static int EmitBuildField(FormField f, string parentVar, int id,
-            List<string> decls, List<string> used, List<string> body) {
-        int ft = f.ftype;
-        string wt = ZanIDE.WidgetTypeOf(ft);
-        int next = id + 1;
-        if (ZanIDE.FieldNeedsCaption(ft)) {
-            string capVar = "cap" + Convert.ToString(id);
-            body.Add("        Label " + capVar + " = new Label(\"" + ZanIDE.EscZ(ZanIDE.FieldCaption(f)) + "\");");
-            body.Add("        " + capVar + ".Dock(Dock.Top());");
-            body.Add("        " + capVar + ".Prefer(0, 18);");
-            body.Add("        " + parentVar + ".Add(" + capVar + ");");
-        }
-        string vn;
-        bool typed = ZanIDE.IsIdent(f.fname) && !ZanIDE.ListHasStr(used, f.fname);
-        if (typed) {
-            vn = f.fname;
-            used.Add(vn);
-            decls.Add("    static " + wt + " " + vn + ";");
-        } else {
-            vn = "c" + Convert.ToString(id);
-            body.Add("        " + wt + " " + vn + ";");
-        }
-        body.Add("        " + vn + " = " + ZanIDE.CtorExpr(f, wt) + ";");
-        body.Add("        " + vn + ".name = \"" + ZanIDE.EscZ(f.fname) + "\";");
-        ZanIDE.EmitFieldSetup(f, wt, vn, body);
-        body.Add("        " + vn + ".Dock(Dock.Top());");
-        int ph = ZanIDE.PrefHOf(ft);
-        if (f.IsContainer()) {
-            ph = 44 + 44 * f.kids.Count;
-            body.Add("        " + vn + ".Pad(10);");
-        }
-        body.Add("        " + vn + ".Prefer(0, " + Convert.ToString(ph) + ");");
-        body.Add("        " + parentVar + ".Add(" + vn + ");");
-        if (f.IsContainer()) {
-            int i = 0;
-            while (i < f.kids.Count) {
-                next = ZanIDE.EmitBuildField(f.kids[i], vn, next, decls, used, body);
-                i = i + 1;
-            }
-        }
-        return next;
-    }
-
-    /// Generates the whole strongly-typed layout file (Name.g.zan): typed control
-    /// fields, a BuildForm() that assembles the real interactive widget tree, and
-    /// a Main() that runs the window through Form.Run and calls the user's OnLoad.
-    static string GenFormFile(string name, List<FormField> fields, int fw, int fh, string title, bool center, int posX, int posY) {
-        List<string> decls = new List<string>();
-        List<string> used = new List<string>();
-        List<string> body = new List<string>();
-        int id = 0;
-        int i = 0;
-        while (i < fields.Count) {
-            id = ZanIDE.EmitBuildField(fields[i], "root", id, decls, used, body);
-            i = i + 1;
-        }
-        string ttl = title;
-        if (ttl.Length == 0) { ttl = name; }
-        int ww = fw; if (ww <= 0) { ww = 480; }
-        int hh = fh; if (hh <= 0) { hh = 520; }
-        string s = "// <auto-generated> Window layout for " + name + ".zform.\n";
-        s = s + "// Regenerated from the visual designer on every save - do not edit.\n";
-        s = s + "// Write your initialization and event logic in " + name + ".zan.\n";
-        s = s + "using System;\n";
-        s = s + "using Gui;\n";
-        s = s + "using Gui.Widget;\n\n";
-        s = s + "partial class " + name + " {\n";
-        int d = 0;
-        while (d < decls.Count) { s = s + decls[d] + "\n"; d = d + 1; }
-        if (decls.Count > 0) { s = s + "\n"; }
-        s = s + "    /// Builds the designed control tree (real, interactive widgets).\n";
-        s = s + "    static Control BuildForm() {\n";
-        s = s + "        Panel root = new Panel(\"root\");\n";
-        s = s + "        root.Dock(Dock.Fill());\n";
-        s = s + "        root.Pad(16);\n";
-        s = s + "        root.gap = 10;\n";
-        int b = 0;
-        while (b < body.Count) { s = s + body[b] + "\n"; b = b + 1; }
-        s = s + "        return root;\n";
-        s = s + "    }\n\n";
-        s = s + "    static void Main() {\n";
-        s = s + "        Form form = Form.CreateDark(\"" + ZanIDE.EscZ(ttl) + "\", " + Convert.ToString(ww) + ", " + Convert.ToString(hh) + ");\n";
-        s = s + "        form.Add(BuildForm());\n";
-        if (center) {
-            s = s + "        form.GetApp().CenterWindow();\n";
-        } else {
-            s = s + "        form.GetApp().SetWindowPos(" + Convert.ToString(posX) + ", " + Convert.ToString(posY) + ");\n";
-        }
-        s = s + "        " + name + ".OnLoad(form);\n";
-        s = s + "        form.Run();\n";
-        s = s + "    }\n";
-        s = s + "}\n";
-        return s;
-    }
-
     /// A fresh business file (Name.zan): the user's half of the partial class.
     /// The designer never overwrites this - only creates it when missing.
     static string GenBusinessShell(string name) {
@@ -1562,7 +1374,8 @@ partial class ZanIDE {
         s = s + "using Gui;\n";
         s = s + "using Gui.Widget;\n\n";
         s = s + "// Business logic for " + name + ". The window is designed visually in\n";
-        s = s + "// " + name + ".zform; its typed controls are generated into " + name + ".g.zan.\n";
+        s = s + "// " + name + ".zform. At compile time zanc projects its typed controls\n";
+        s = s + "// and Main from the design, so there is no generated file to keep in sync.\n";
         s = s + "// This file is yours - the designer never overwrites it.\n";
         s = s + "partial class " + name + " {\n";
         s = s + "    // Runs once after the window is built, before the event loop.\n";
