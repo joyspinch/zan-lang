@@ -14,7 +14,9 @@ typedef enum {
     ZAN_OPT_BASIC = 1,
     ZAN_OPT_FULL = 2,
     ZAN_OPT_SIZE = 3,
-    ZAN_OPT_AGGRESSIVE = 4
+    ZAN_OPT_AGGRESSIVE = 4,
+    /* Oz: minimum-size codegen for edge/embedded deployments. */
+    ZAN_OPT_SIZE_MIN = 5
 } zan_opt_level_t;
 
 /* ---- ARC optimization ---- */

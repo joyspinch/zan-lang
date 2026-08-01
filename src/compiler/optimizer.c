@@ -339,6 +339,7 @@ void zan_opt_configure_llvm_passes(zan_irgen_t *g, zan_opt_level_t level) {
     case ZAN_OPT_FULL: passes = "default<O2>"; break;
     case ZAN_OPT_SIZE: passes = "default<Os>"; break;
     case ZAN_OPT_AGGRESSIVE: passes = "default<O3>"; break;
+    case ZAN_OPT_SIZE_MIN: passes = "default<Oz>"; break;
     default: return;
     }
 
@@ -346,7 +347,9 @@ void zan_opt_configure_llvm_passes(zan_irgen_t *g, zan_opt_level_t level) {
     LLVMPassBuilderOptionsSetVerifyEach(opts, 0);
     LLVMPassBuilderOptionsSetDebugLogging(opts, 0);
 
-    if (level >= ZAN_OPT_FULL) {
+    /* Vectorization/unrolling grow code; only the speed levels want them
+     * (Os/Oz optimize for size). */
+    if (level == ZAN_OPT_FULL || level == ZAN_OPT_AGGRESSIVE) {
         LLVMPassBuilderOptionsSetLoopInterleaving(opts, 1);
         LLVMPassBuilderOptionsSetLoopVectorization(opts, 1);
         LLVMPassBuilderOptionsSetSLPVectorization(opts, 1);

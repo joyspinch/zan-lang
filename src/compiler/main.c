@@ -1044,7 +1044,8 @@ static void print_usage(void) {
     fprintf(stderr, "  --driver-dir <d> Override the bundled native driver directory\n");
     fprintf(stderr, "  --stdlib-path <dir>  Path to stdlib directory\n");
     fprintf(stderr, "  --auto-stdlib    Automatically find and include stdlib .zan files\n");
-    fprintf(stderr, "  -O0/-O1/-O2/-O3  Set optimization level (default: O0, --publish: O2)\n");
+    fprintf(stderr, "  -O0..-O3/-Os/-Oz Set optimization level (default: O0; --publish: Os;\n");
+    fprintf(stderr, "                   -Oz = minimum size for edge/embedded deployments)\n");
     fprintf(stderr, "  -g, --debug      Emit DWARF debug info for source-level debugging (forces -O0)\n");
     fprintf(stderr, "  --target <name>  Cross-compile for target (e.g. linux-x64, linux-musl)\n");
     fprintf(stderr, "  --list-targets   Show available cross-compilation targets\n");
@@ -1168,7 +1169,11 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "-O2") == 0) {
             opt_level = 2;
         } else if (strcmp(argv[i], "-O3") == 0) {
-            opt_level = 3;
+            opt_level = ZAN_OPT_AGGRESSIVE;
+        } else if (strcmp(argv[i], "-Os") == 0) {
+            opt_level = ZAN_OPT_SIZE;
+        } else if (strcmp(argv[i], "-Oz") == 0) {
+            opt_level = ZAN_OPT_SIZE_MIN;
         } else if (strcmp(argv[i], "--subsystem") == 0 && i + 1 < argc) {
             link_subsystem = argv[++i];
         } else if (strcmp(argv[i], "--time") == 0) {
