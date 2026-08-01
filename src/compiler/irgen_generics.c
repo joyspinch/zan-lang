@@ -1223,7 +1223,10 @@ static bool is_str_concat_node(zan_irgen_t *g, zan_ast_node_t *e, local_scope_t 
 static void collect_concat_ops(zan_irgen_t *g, zan_ast_node_t *e, local_scope_t *locals,
                                zan_ast_node_t **ops, int *n, int max) {
     if (*n < max - 1 && is_str_concat_node(g, e, locals)) {
-        collect_concat_ops(g, e->binary.left, locals, ops, n, max);
+        /* Reserve one slot for the right subtree while descending left, so a
+         * long left spine can never fill the array before the pending right
+         * leaves are stored (each pending right needs at least one slot). */
+        collect_concat_ops(g, e->binary.left, locals, ops, n, max - 1);
         collect_concat_ops(g, e->binary.right, locals, ops, n, max);
     } else {
         ops[(*n)++] = e;
