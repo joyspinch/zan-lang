@@ -938,6 +938,11 @@ partial class ZanIDE {
     static string CompileToExe(string root, string p, string inputs, string ll, string exe, bool publish) {
         string pub = "";
         if (publish) { pub = " --publish"; }
+        if (ZanIDE.IsLibraryProject(root)) {
+            // A library has no subsystem or icon; zanc picks the library
+            // format (shared/static) from the -o extension.
+            return ZanIDE.ZancCmd() + pub + " " + inputs + " -o \"" + exe + "\"";
+        }
         string sub = "";
         if (ZanIDE.IsWindowedTarget(root, p)) { sub = " --subsystem windows"; }
         return ZanIDE.ZancCmd() + pub + " " + inputs + " -o \"" + exe + "\"" + sub
@@ -1039,6 +1044,37 @@ partial class ZanIDE {
     /// zan.proj explicitly sets `singleFile = false`.
     static bool ProjSingleFile(string root) {
         return ZanIDE.ProjField(root, "singleFile") != "false";
+    }
+
+    /// True when the project builds a library instead of a runnable program
+    /// (zan.proj `target = dll/lib/so/dylib/a` or `type = library`). Library
+    /// projects are compiled to the platform's library format and never
+    /// launched after a build.
+    static bool IsLibraryProject(string root) {
+        string t = ZanIDE.ProjField(root, "target");
+        if (t == "dll" || t == "lib" || t == "so" || t == "dylib" || t == "a") {
+            return true;
+        }
+        return ZanIDE.ProjField(root, "type") == "library";
+    }
+
+    /// The shared-library extension of the machine the IDE runs on.
+    static string HostLibExt() {
+        #if WINDOWS
+        return ".dll";
+        #elif MACOS
+        return ".dylib";
+        #else
+        return ".so";
+        #endif
+    }
+
+    /// The shared-library extension for a publish target id
+    /// (windows-* -> .dll, macos-* -> .dylib, linux-* -> .so).
+    static string LibExtFor(string id) {
+        if (ZanIDE.StartsWith(id, "windows")) { return ".dll"; }
+        if (ZanIDE.StartsWith(id, "macos")) { return ".dylib"; }
+        return ".so";
     }
 
     /// The icon a produced executable should carry: the project's configured
@@ -1693,14 +1729,17 @@ partial class ZanIDE {
                             log.Add(ZanIDE.T("> Nothing to run (open and save a source file first).", "> 没有可运行的目标（请先打开并保存源文件）。"));
                         } else {
                             buildBusy = true;
-                            buildThenRun = true;
+                            // A library has no entry point to launch: Run on a
+                            // library project builds the shared library only.
+                            buildThenRun = !ZanIDE.IsLibraryProject(root);
                             buildExe = ZanIDE.RunBuildBegin(root, rpB);
                             buildIsGui = ZanIDE.IsWindowedTarget(root, rpB);
                             buildTargetPath = apB;
                             buildLogLen = 0;
                             dock.Focus("output");
                             log.Add("> Building " + rpB + " ...");
-                            if (rc == 4) { Layer.Msg(ZanIDE.T("Building & running…", "正在构建并运行…"), 2); }
+                            if (rc == 4 && !buildThenRun) { Layer.Msg(ZanIDE.T("Building library…", "正在构建库…"), 2); }
+                            else if (rc == 4) { Layer.Msg(ZanIDE.T("Building & running…", "正在构建并运行…"), 2); }
                             else { Layer.Msg(ZanIDE.T("Building…", "正在构建…"), 2); }
                             app.RequestAnimationFrame(80);
                         }
@@ -2048,6 +2087,11 @@ partial class ZanIDE {
                             if (!File.Exists(cbpS)) {
                                 File.WriteAllText(cbpS, ZanIDE.GenBusinessShell(fname));
                             }
+                            // Push the new design to zan-lsp so the code-behind's
+                            // completion sees added/renamed/deleted controls at once.
+                            if (lspSess != null && lspSess.Alive()) {
+                                lspSess.SyncDoc(fpath, newser);
+                            }
                         }
                         formCache = newser;
                     }
@@ -2101,6 +2145,12 @@ partial class ZanIDE {
                             string scbP = ZanIDE.SceneCodeBehindPath(spath);
                             if (!File.Exists(scbP)) {
                                 File.WriteAllText(scbP, ZanIDE.GenSceneBusinessShell(sname));
+                            }
+                            // Push the design and the regenerated typed file to
+                            // zan-lsp so element completion tracks the designer.
+                            if (lspSess != null && lspSess.Alive()) {
+                                lspSess.SyncDoc(spath, snewser);
+                                lspSess.SyncDoc(sgenP, sgenNew);
                             }
                         }
                         sceneCache = snewser;
@@ -3346,7 +3396,7 @@ partial class ZanIDE {
                             string exeHr = bdHr + "/.zanrun" + ZanIDE.ExeSuffix();
                             ZanIDE.HotKillRunExe(exeHr);
                             buildBusy = true;
-                            buildThenRun = true;
+                            buildThenRun = !ZanIDE.IsLibraryProject(root);
                             buildExe = ZanIDE.RunBuildBegin(root, rpHr);
                             buildIsGui = ZanIDE.IsWindowedTarget(root, rpHr);
                             buildTargetPath = apHr;
@@ -3866,7 +3916,7 @@ partial class ZanIDE {
                                 dlgMode = 2;
                             } else if (chosen == 1 && dlg == null) {
                                 dlg = ZanIDE.OpenWizard(app, ZanIDE.T("New Folder", "新建文件夹"), fSel, fNameInput, "NewFolder");
-                                fSel.Set(7);
+                                fSel.Set(8);
                                 dlgMode = 2;
                             } else if (chosen == 3) {
                                 if (ctxTarget >= 0 && ctxTarget < treeShow.Count) {
@@ -4018,8 +4068,14 @@ partial class ZanIDE {
 
             if (rescan) {
                 rescan = false;
+                // Keep the user's expanded folders across the rebuild: a
+                // rescan after e.g. deleting a file must not collapse the tree.
+                List<string> expKeep = ZanIDE.ExpandedPaths(tree);
                 tree = new List<TreeNode>();
-                if (haveProject) { tree = ZanIDE.ScanTree(root); }
+                if (haveProject) {
+                    tree = ZanIDE.ScanTree(root);
+                    ZanIDE.ApplyExpanded(tree, expKeep);
+                }
                 treeSel.Set(-1);
             }
         }
@@ -4166,6 +4222,7 @@ partial class ZanIDE {
             new WizardItem(ZanIDE.T("Interface", "接口"), "copy", ZanIDE.T("Code file: a base class defining a contract.", "代码文件：定义契约的基类。")),
             new WizardItem(ZanIDE.T("Empty File", "空文件"), "file", ZanIDE.T("Code file: a blank .zan file.", "代码文件：空白的 .zan 文件。")),
             new WizardItem(ZanIDE.T("Form (Designer)", "表单 (设计器)"), "layout", ZanIDE.T("Form: creates Name.zform (visual layout) + Name.zan (code-behind).", "表单：创建 Name.zform（可视化布局）+ Name.zan（代码后置）。")),
+            new WizardItem(ZanIDE.T("Free Layout Window", "自由布局窗口"), "grid", ZanIDE.T("Form: free-canvas designer, every control absolutely positioned (layoutMode 1).", "表单：自由画布设计器，控件绝对定位（layoutMode 1）。")),
             new WizardItem(ZanIDE.T("Game Scene (Designer)", "游戏场景 (设计器)"), "maximize", ZanIDE.T("Scene: creates Name.zscene, a free-canvas game window layout.", "场景：创建 Name.zscene，自由画布式游戏窗口布局。")),
             new WizardItem(ZanIDE.T("Folder", "文件夹"), "folder", ZanIDE.T("Creates a new folder under src/.", "在 src/ 下创建一个新文件夹。")) };
     }
@@ -4185,6 +4242,9 @@ partial class ZanIDE {
         catSel = SignalInt.Create(0);
         pSel = SignalInt.Create(0);
         fSel = SignalInt.Create(0);
+        // Default to the classic 480x520 window so existing behavior is
+        // unchanged until the user picks a phone/tablet/desktop preset.
+        fSizeSel = SignalInt.Create(3);
 
         // Target platforms for New Project (multi-select OS + architecture).
         // One column per OS; two architecture chips stacked per column. Chip
@@ -4546,7 +4606,7 @@ partial class ZanIDE {
                 aiUiPending = true;
             }
             buildBusy = true;
-            buildThenRun = (tool == "run");
+            buildThenRun = (tool == "run") && !ZanIDE.IsLibraryProject(root);
             buildExe = ZanIDE.RunBuildBegin(root, rpB);
             buildIsGui = ZanIDE.IsWindowedTarget(root, rpB);
             buildTargetPath = apB;
@@ -4924,4 +4984,4 @@ partial class ZanIDE {
         }
         active.Set(0);
     }
-}
+}

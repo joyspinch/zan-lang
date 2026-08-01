@@ -92,10 +92,6 @@ partial class ZanIDE {
         t.ptarget = ZanIDE.ManifestField(m, "target", "exe");
         t.pentry = ZanIDE.ManifestField(m, "entry", "src/main.zan");
         t.order = ZanIDE.ParseInt(ZanIDE.ManifestField(m, "order", "1000"));
-        // A34 (zanc has no library output yet): hide dll/so/dylib/a templates so
-        // the wizard cannot scaffold a project the compiler cannot build. The
-        // template dirs stay on disk; remove this gate once A34 lands.
-        if (t.ptarget == "dll") { return; }
         ts.Add(t);
     }
 
@@ -375,12 +371,23 @@ partial class ZanIDE {
     }
 
     /// Creates a file from the chosen file template; returns the path to open.
-    /// For a Form (kind 5) this follows the C#-style rule and creates BOTH the
-    /// visual layout file (Name.zform) and its code-behind (Name.zan), returning
-    /// the .zform so it opens in the designer.
-    static string CreateFile(int kind, string root, string name, List<string> log) {
+    /// The kinds match the New File wizard's item order (fileItems): 0-4 code
+    /// templates, 5 Form (flow layout, layoutMode 0), 6 Free Layout Window
+    /// (free-canvas absolute layout, layoutMode 1), 7 Game Scene, 8 Folder.
+    /// For a Form / Free Layout Window this follows the C#-style rule and
+    /// creates BOTH the visual layout file (Name.zform) and its code-behind
+    /// (Name.zan), returning the .zform so it opens in the designer.
+    /// `sizeSel` picks the designed window's
+    /// size preset (0 Phone 390x844, 1 Tablet 768x1024, 2 Desktop 1280x720,
+    /// 3 Default 480x520) for the form-producing kinds.
+    static string CreateFile(int kind, string root, string name, int sizeSel, List<string> log) {
+        int winW = 480;
+        int winH = 520;
+        if (sizeSel == 0) { winW = 390; winH = 844; }
+        else if (sizeSel == 1) { winW = 768; winH = 1024; }
+        else if (sizeSel == 2) { winW = 1280; winH = 720; }
         Directory.CreateDirectory(root + "/src");
-        if (kind == 6) {
+        if (kind == 7) {
             string scenePath = root + "/src/" + name + ".zscene";
             string sgenPath = ZanIDE.SceneGenFilePath(scenePath);
             string scbPath = ZanIDE.SceneCodeBehindPath(scenePath);
@@ -396,14 +403,28 @@ partial class ZanIDE {
         if (kind == 5) {
             string formPath = root + "/src/" + name + ".zform";
             string cbPath = ZanIDE.CodeBehindPath(formPath);
-            File.WriteAllText(formPath, "{\"name\":\"" + name + "\",\"winW\":480,\"winH\":520,\"layoutMode\":0,\"fields\":[]}");
+            File.WriteAllText(formPath, "{\"name\":\"" + name + "\",\"winW\":" + Convert.ToString(winW) + ",\"winH\":" + Convert.ToString(winH) + ",\"layoutMode\":0,\"fields\":[]}");
             if (!File.Exists(cbPath)) {
                 File.WriteAllText(cbPath, ZanIDE.GenBusinessShell(name));
             }
             log.Add("> Created form " + formPath + " (+ " + cbPath + ").");
             return formPath;
         }
-        if (kind == 7) {
+        if (kind == 6) {
+            // Free-canvas layout window: same 2-file model as a Form, but the
+            // design uses layoutMode 1 so every control is absolutely placed on
+            // the canvas (the designer's Free mode), with a starter sample that
+            // also demonstrates required-field validation and a wrapping hint.
+            string formPath = root + "/src/" + name + ".zform";
+            string cbPath = ZanIDE.CodeBehindPath(formPath);
+            File.WriteAllText(formPath, ZanIDE.FreeFormBody(name, winW, winH));
+            if (!File.Exists(cbPath)) {
+                File.WriteAllText(cbPath, ZanIDE.GenFreeShell(name));
+            }
+            log.Add("> Created free-layout form " + formPath + " (+ " + cbPath + ").");
+            return formPath;
+        }
+        if (kind == 8) {
             string dirPath = root + "/src/" + name;
             Directory.CreateDirectoryRecursive(dirPath);
             log.Add("> Created folder " + dirPath + ".");
@@ -480,6 +501,32 @@ partial class ZanIDE {
         ZanIDE.ScanInto(
             nodes, root, Path.GetFileName(root), 0, true);
         return nodes;
+    }
+
+    /// The filesystem paths of the currently expanded directory nodes, so a
+    /// rescan can rebuild the tree without collapsing what the user opened.
+    static List<string> ExpandedPaths(List<TreeNode> nodes) {
+        List<string> outp = new List<string>();
+        int i = 0;
+        while (i < nodes.Count) {
+            TreeNode n = nodes[i];
+            if (n.isDir && n.expanded && n.path != "") { outp.Add(n.path); }
+            i = i + 1;
+        }
+        return outp;
+    }
+
+    /// Re-expands the directory nodes whose paths were expanded before a
+    /// rescan (counterpart of ExpandedPaths).
+    static void ApplyExpanded(List<TreeNode> nodes, List<string> exp) {
+        int i = 0;
+        while (i < nodes.Count) {
+            TreeNode n = nodes[i];
+            if (n.isDir && n.path != "" && exp.Contains(n.path)) {
+                n.expanded = true;
+            }
+            i = i + 1;
+        }
     }
 
     static void ScanInto(List<TreeNode> nodes, string dirPath, string dirName, int depth, bool expanded) {
@@ -1059,6 +1106,13 @@ partial class ZanIDE {
     static string RunBuildBegin(string root, string target) {
         string bd = ZanIDE.EnsureBuildDir(root);
         string exe = bd + "/.zanrun" + ZanIDE.ExeSuffix();
+        if (ZanIDE.IsLibraryProject(root)) {
+            // Library project: build the platform's shared library (zanc picks
+            // library output from the -o extension) instead of a runnable exe.
+            string baseName = Path.GetFileName(root);
+            if (baseName == "") { baseName = "lib"; }
+            exe = bd + "/" + baseName + ZanIDE.HostLibExt();
+        }
         if (File.Exists(exe)) { File.Delete(exe); }
         string inputs = ZanIDE.SmartInputs(root, ZanIDE.DirOf(target), target);
         ZanIDE.BuildDetach(
@@ -1178,11 +1232,15 @@ partial class ZanIDE {
         string sep = " ; ";
         #endif
         string seq = "";
-        bool wantPack = ZanIDE.ProjSingleFile(root);
+        bool isLib = ZanIDE.IsLibraryProject(root);
+        bool wantPack = ZanIDE.ProjSingleFile(root) && !isLib;
         bool pack = ZanIDE.CanPackSingle() && wantPack;
         // Silently falling back to loose DLLs is what makes "I checked
         // single-file and still got DLLs" look like a bug, so say why.
-        if (wantPack && !pack) {
+        if (isLib) {
+            log.Add(ZanIDE.T("> Library project: publishing shared libraries.",
+                             "> 库项目：发布为共享库。"));
+        } else if (wantPack && !pack) {
             log.Add(ZanIDE.T(
                 "> Single-file packing unavailable (no pkg_stub.exe / pack_single.ps1 in "
                     + ZanIDE.ToolchainDir() + "); publishing loose files.",
@@ -1206,7 +1264,25 @@ partial class ZanIDE {
                 // dylibs and resources next to its executable, so sharing a
                 // directory would mix incompatible binaries of the same name.
                 string outDir = ZanIDE.PublishDir(root, id);
-                if (id == "windows-x64") {
+                if (isLib) {
+                    // Library project: one shared library per target, named
+                    // with the platform's extension (.dll/.so/.dylib). zanc
+                    // picks the library format from the -o extension; cross
+                    // targets go through its bundled toolchain.
+                    string lib = outDir + "/" + baseName + "-" + id + ZanIDE.LibExtFor(id);
+                    if (seq != "") { seq = seq + sep; }
+                    if (id == hostId) {
+                        seq = seq + "(" + zc + " --publish " + inputs + " -o \"" + lib + "\")";
+                    } else {
+                        string ct = id;
+                        if (id == "windows-arm64") { ct = "win-arm64"; }
+                        if (id == "linux-x64") { ct = "linux-musl"; }
+                        seq = seq + "(" + zc + " --publish --target " + ct + " "
+                            + inputs + " -o \"" + lib + "\")";
+                    }
+                    exes.Add(lib);
+                    log.Add("> Publishing " + id + " library ...");
+                } else if (id == "windows-x64") {
                     string exe = outDir + "/" + baseName + "-windows-x64.exe";
                     string ll = bd + "/.zanpub_x64.ll";
                     if (seq != "") { seq = seq + sep; }

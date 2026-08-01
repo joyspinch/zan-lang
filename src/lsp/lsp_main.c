@@ -665,6 +665,39 @@ static void ensure_project_indexed(lsp_server_t *s) {
     intel_index_project(g_project_intel, s->workspace_root);
 }
 
+/* Native filesystem path for a file:// URI (mirrors handle_initialize's
+ * root conversion), so a document update can replace the project index's
+ * entry for the same file instead of adding a duplicate keyed by URI. */
+static void uri_to_native_path(const char *uri, char *out, size_t cap) {
+    if (strncmp(uri, "file:///", 8) == 0) {
+#ifdef _WIN32
+        strncpy(out, uri + 8, cap - 1);
+        out[cap - 1] = '\0';
+        for (char *p = out; *p; p++) {
+            if (*p == '/') *p = '\\';
+        }
+#else
+        strncpy(out, uri + 7, cap - 1);
+        out[cap - 1] = '\0';
+#endif
+    } else {
+        strncpy(out, uri, cap - 1);
+        out[cap - 1] = '\0';
+    }
+}
+
+/* Re-index one changed document into the shared project index so completion
+ * from OTHER files (e.g. a form's code-behind after the designer edited the
+ * .zform) sees the change immediately, without a full project rescan. */
+static void update_project_index(lsp_server_t *s, const char *uri,
+                                 const char *text) {
+    if (!g_project_intel || !uri || !text) return;
+    char path[1024];
+    uri_to_native_path(uri, path, sizeof(path));
+    intel_parse_file(g_project_intel, path, text, strlen(text));
+    (void)s;
+}
+
 static void handle_did_open(lsp_server_t *s, json_value *params) {
     json_value *td = json_obj_get(params, "textDocument");
     const char *uri = json_get_str(json_obj_get(td, "uri"));
@@ -674,6 +707,7 @@ static void handle_did_open(lsp_server_t *s, json_value *params) {
 
     /* Index the project on first file open */
     ensure_project_indexed(s);
+    update_project_index(s, uri, text);
 
     publish_diagnostics(s, uri, text);
 }
@@ -690,6 +724,7 @@ static void handle_did_change(lsp_server_t *s, json_value *params) {
     const char *text = json_get_str(json_obj_get(last, "text"));
     if (!text) return;
     lsp_set_doc(s, uri, text);
+    update_project_index(s, uri, text);
     publish_diagnostics(s, uri, text);
 }
 

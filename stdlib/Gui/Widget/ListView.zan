@@ -1,5 +1,6 @@
 using System;
 using Gui;
+using Gui.Backend;
 
 namespace Gui.Widget;
 
@@ -73,6 +74,11 @@ class ListView<T> : Control {
     string Empty;
     int sel;
     int hover;
+    /// Multi-select mode (WithMultiSelect): Ctrl+click toggles rows in/out of
+    /// `marks`, Shift+click extends from the anchor. `sel` stays the focused
+    /// row so single-select callers are unaffected.
+    bool multi;
+    List<int> marks;
     SignalInt scroll;
     /// Template mode: one allocated row id per built child, so selection
     /// survives a frame in which nothing was rebuilt.
@@ -94,6 +100,8 @@ class ListView<T> : Control {
         Empty = "";
         sel = -1;
         hover = -1;
+        multi = false;
+        marks = new List<int>();
         scroll = SignalInt.Create(0);
         rowsStale = true;
         builtFor = -1;
@@ -137,6 +145,11 @@ class ListView<T> : Control {
         data = src;
         rowsStale = true;
         if (sel >= this.Count()) { sel = -1; }
+        int mi = marks.Count - 1;
+        while (mi >= 0) {
+            if (marks[mi] >= this.Count()) { marks.RemoveAt(mi); }
+            mi = mi - 1;
+        }
         return this;
     }
 
@@ -169,7 +182,36 @@ class ListView<T> : Control {
         Select.Post();
     }
 
-    void ClearSelection() { sel = -1; }
+    void ClearSelection() { sel = -1; marks = new List<int>(); }
+
+    /// Enables multi-select (Ctrl+click toggle, Shift+click range).
+    ListView<T> WithMultiSelect() { multi = true; return this; }
+
+    /// True when `row` is part of the multi-selection (or is the focused row).
+    bool IsMarked(int row) {
+        if (row == sel && sel >= 0) { return true; }
+        int i = 0;
+        while (i < marks.Count) {
+            if (marks[i] == row) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    /// Every selected row index (the marks plus the focused row), ascending.
+    List<int> SelectedIndices() {
+        List<int> outp = new List<int>();
+        int n = this.Count();
+        int i = 0;
+        while (i < n) {
+            if (this.IsMarked(i)) { outp.Add(i); }
+            i = i + 1;
+        }
+        return outp;
+    }
+
+    /// Number of selected rows.
+    int SelectionCount() { return this.SelectedIndices().Count; }
 
     // ---- handlers -----------------------------------------------------------
 
@@ -250,10 +292,36 @@ class ListView<T> : Control {
         int hit = app.hitTester.HitTest(app.mouseX, app.mouseY);
         if (hit != id) { return id; }
         if (app.ClickAvailable()) {
-            bool again = (sel == index);
-            sel = index;
-            if (again) { Activate.Post(); }
-            else { Select.Post(); }
+            int mods = app.window.EventMods();
+            if (multi && Modifiers.HasCtrl(mods)) {
+                // Toggle the row in/out of the multi-selection.
+                bool was = false;
+                int mi = 0;
+                while (mi < marks.Count) {
+                    if (marks[mi] == index) { marks.RemoveAt(mi); was = true; break; }
+                    mi = mi + 1;
+                }
+                if (sel == index) { sel = -1; was = true; }
+                if (!was) { marks.Add(index); if (sel < 0) { sel = index; } }
+                Select.Post();
+            } else if (multi && Modifiers.HasShift(mods) && sel >= 0) {
+                // Extend the selection from the focused row to this one.
+                int a = sel;
+                int b = index;
+                if (b < a) { int tmp = a; a = b; b = tmp; }
+                int r = a;
+                while (r <= b) {
+                    if (!this.IsMarked(r)) { marks.Add(r); }
+                    r = r + 1;
+                }
+                Select.Post();
+            } else {
+                bool again = (sel == index);
+                if (multi) { marks = new List<int>(); }
+                sel = index;
+                if (again) { Activate.Post(); }
+                else { Select.Post(); }
+            }
             app.RequestRedraw();
             app.window.Wake();
         } else if (app.EventKind() == 2 && app.window.EventButton() == 1) {
@@ -355,7 +423,9 @@ class ListView<T> : Control {
         while (i <= last) {
             int ry = viewY + i * rowH - off;
             int id = this.RowInteract(app, i, bx, ry, rowW, rowH);
-            if (i == sel) { c.FillRect(bx, ry, rowW, rowH, t.bgTertiary); }
+            if (i == sel || (multi && this.IsMarked(i))) {
+                c.FillRect(bx, ry, rowW, rowH, t.bgTertiary);
+            }
             else if (app.focus.IsHovered(id)) {
                 c.FillRect(bx, ry, rowW, rowH, t.bgSecondary);
             }
@@ -414,7 +484,9 @@ class ListView<T> : Control {
             row.visible = (y + rh > viewY && y < viewY + viewH);
             if (row.visible) {
                 int id = this.RowInteract(app, i, bx, y, rowW, rh);
-                if (i == sel) { app.canvas.FillRect(bx, y, rowW, rh, t.bgTertiary); }
+                if (i == sel || (multi && this.IsMarked(i))) {
+                    app.canvas.FillRect(bx, y, rowW, rh, t.bgTertiary);
+                }
                 else if (app.focus.IsHovered(id)) {
                     app.canvas.FillRect(bx, y, rowW, rh, t.bgSecondary);
                 }

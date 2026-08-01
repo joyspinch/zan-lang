@@ -18,6 +18,7 @@
 #ifndef _WIN32
 #include <strings.h>
 #define _strnicmp strncasecmp
+#define _strdup strdup
 #endif
 
 #ifdef _WIN32
@@ -433,6 +434,63 @@ static void intel_parse_zform(intellisense_t *is, const char *filepath,
     json_free(root);
 }
 
+/* ---- .zscene design-document indexing ----
+ *
+ * A .zscene file is the scene designer's JSON description (see
+ * stdlib/Game/Scene/SceneDoc.zan). The IDE regenerates <Name>.g.zan from it,
+ * declaring each validly-named element as `static SceneElement <name>` on
+ * `partial class <Name>`. Index that same projection directly from the JSON
+ * so the business file's completion sees the elements even while the
+ * generated file is stale or missing. */
+static void intel_parse_zscene(intellisense_t *is, const char *filepath,
+                               const char *content, size_t len) {
+    char *text = (char *)malloc(len + 1);
+    if (!text) return;
+    memcpy(text, content, len);
+    text[len] = '\0';
+
+    json_value *root = json_parse(text);
+    free(text);
+    if (!root || root->type != JSON_OBJ) { json_free(root); return; }
+
+    const char *class_name = json_get_str(json_obj_get(root, "name"));
+    if (!class_name || !class_name[0]) { json_free(root); return; }
+
+    add_symbol_ex(is, class_name, "object", NULL, NULL, filepath, NULL,
+                  ISYM_CLASS, 0, 0, false, 0);
+
+    /* element name -> JSON line map for go-to-def */
+    const char *name_lines[64], *name_vals[64];
+    int name_count = intel_zform_name_lines(content, len, name_lines,
+                                            name_vals, 64);
+
+    json_value *els = json_obj_get(root, "elements");
+    if (els && els->type == JSON_ARR) {
+        for (int i = 0; i < els->as.arr.count; i++) {
+            json_value *e = els->as.arr.items[i];
+            if (!e || e->type != JSON_OBJ) continue;
+            const char *ename = json_get_str(json_obj_get(e, "name"));
+            if (!ename || !ename[0] || !isalpha((unsigned char)ename[0]))
+                continue;
+            int eline = 0;
+            for (int k = 0; k < name_count; k++) {
+                if (name_vals[k] && strcmp(name_vals[k], ename) == 0) {
+                    eline = atoi(name_lines[k]);
+                    break;
+                }
+            }
+            add_symbol(is, ename, "SceneElement", class_name, NULL,
+                       filepath, ISYM_FIELD, eline, 0);
+        }
+    }
+
+    for (int k = 0; k < name_count; k++) {
+        free((void *)name_lines[k]);
+        free((void *)name_vals[k]);
+    }
+    json_free(root);
+}
+
 /* Simple lexical scanner to extract symbols from Zan source. .zform files
  * (design documents) are indexed through their JSON projection instead. */
 void intel_parse_file(intellisense_t *is, const char *filepath,
@@ -464,6 +522,10 @@ void intel_parse_file(intellisense_t *is, const char *filepath,
         size_t fl = strlen(filepath);
         if (fl > 6 && strcmp(filepath + fl - 6, ".zform") == 0) {
             intel_parse_zform(is, filepath, content, len);
+            return;
+        }
+        if (fl > 7 && strcmp(filepath + fl - 7, ".zscene") == 0) {
+            intel_parse_zscene(is, filepath, content, len);
             return;
         }
     }
@@ -1751,7 +1813,9 @@ static void index_directory_recursive(intellisense_t *is, const char *dir_path) 
                           strcmp(fd.cFileName + name_len - 4, ".zan") == 0;
             bool is_zform = name_len > 6 &&
                             strcmp(fd.cFileName + name_len - 6, ".zform") == 0;
-            if (is_zan || is_zform) {
+            bool is_zscene = name_len > 7 &&
+                             strcmp(fd.cFileName + name_len - 7, ".zscene") == 0;
+            if (is_zan || is_zform || is_zscene) {
                 /* read file and parse it */
                 HANDLE hFile = CreateFileA(full_path, GENERIC_READ, FILE_SHARE_READ,
                                           NULL, OPEN_EXISTING, 0, NULL);
@@ -1808,7 +1872,9 @@ static void index_directory_recursive(intellisense_t *is, const char *dir_path) 
                           strcmp(entry->d_name + name_len - 4, ".zan") == 0;
             bool is_zform = name_len > 6 &&
                             strcmp(entry->d_name + name_len - 6, ".zform") == 0;
-            if (is_zan || is_zform) {
+            bool is_zscene = name_len > 7 &&
+                             strcmp(entry->d_name + name_len - 7, ".zscene") == 0;
+            if (is_zan || is_zform || is_zscene) {
                 FILE *f = fopen(full_path, "rb");
                 if (f) {
                     fseek(f, 0, SEEK_END);
