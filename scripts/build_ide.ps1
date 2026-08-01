@@ -20,7 +20,20 @@ if (-not $cache) {
 $pkg = Join-Path $cache.FullName ((Get-ChildItem $cache.FullName -Filter "SDL3-*" -Directory | Select-Object -First 1).Name)
 $pkg = Join-Path $pkg "x86_64-w64-mingw32"
 $inc = Join-Path $pkg "include"
-$sdlLibDir = Join-Path $pkg "lib"   # contains libSDL3.dll.a (mingw import lib)
+$sdlLibDir = Join-Path $pkg "lib"
+# The IDE links SDL3 statically (no SDL3.dll beside the exe); the static
+# archive is built from source by stage_sdl3.ps1 the first time.
+$sdlStatic = Join-Path $sdlLibDir "libSDL3.a"
+if (-not (Test-Path -LiteralPath $sdlStatic)) {
+    Write-Output "Static libSDL3.a not staged; running stage_sdl3.ps1 ..."
+    & powershell -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot "stage_sdl3.ps1")
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $sdlStatic)) {
+        Write-Output "SDL3_STATIC_STAGE_FAILED"; exit 1
+    }
+}
+# Copy under a distinct name so ld cannot pick the import lib (libSDL3.dll.a)
+# that sits in the same staged directory.
+Copy-Item -LiteralPath $sdlStatic -Destination "build\libSDL3_s.a" -Force
 
 # ---- native GUI runtime (static, mingw ABI) -------------------------------
 # Compiled for zanc's own x86_64-w64-windows-gnu link ABI so it can be linked
@@ -89,10 +102,15 @@ try {
     $zanArgs += @("-o", "build\ZanIDE.exe", "--subsystem", "windows")
     $zanArgs += @("--libpath", "build", "--link-lib", "zan_gui_ide_gnu")
     $zanArgs += @("--link-input", (Join-Path (Get-Location) "build\embed_gen.o"))
-    $zanArgs += @("--libpath", $sdlLibDir, "--link-lib", "SDL3")
+    $zanArgs += @("--link-lib", "SDL3_s")
     $zanArgs += @("--link-lib", "ws2_32", "--link-lib", "mswsock")
     $zanArgs += @("--link-lib", "psapi", "--link-lib", "advapi32")
     $zanArgs += @("--link-lib", "dwmapi", "--link-lib", "gdi32", "--link-lib", "imm32")
+    # Static SDL3 needs its private system deps (sdl3.pc Libs.private).
+    $zanArgs += @("--link-lib", "user32", "--link-lib", "winmm")
+    $zanArgs += @("--link-lib", "ole32", "--link-lib", "oleaut32")
+    $zanArgs += @("--link-lib", "version", "--link-lib", "uuid")
+    $zanArgs += @("--link-lib", "setupapi", "--link-lib", "shell32")
     $zanArgs += @("--icon", (Join-Path (Get-Location) "assets\zan.ico"))
     $out = & $zanc @zanArgs 2>&1
     $code = $LASTEXITCODE
@@ -100,18 +118,16 @@ try {
         $out | Select-Object -Last 40
         throw "IDE_LINK_FAILED code=$code"
     }
-    Copy-Item -LiteralPath (Join-Path $driverDir "SDL3.dll") `
-        -Destination (Join-Path (Get-Location) "build\SDL3.dll") -Force
+    # SDL3 is statically linked: make sure no stale SDL3.dll shadows that fact.
+    Remove-Item -LiteralPath (Join-Path (Get-Location) "build\SDL3.dll") `
+        -Force -ErrorAction SilentlyContinue
     # The IDE's own stylesheet (page layout) ships next to the executable.
     Copy-Item -LiteralPath (Join-Path (Get-Location) "src\ide_zan\ide.css") `
         -Destination (Join-Path (Get-Location) "build\ide.css") -Force
-    # Skin packs (skin.css + artwork) are runtime resources: ship them beside
-    # the executable like ide.css so the title-bar skin picker finds them no
-    # matter what working directory the IDE is launched from.
-    $skinsDst = Join-Path (Get-Location) "build\skins"
-    New-Item -ItemType Directory -Force -Path $skinsDst | Out-Null
-    Copy-Item -Path (Join-Path (Get-Location) "stdlib\Gui\skins\*") `
-        -Destination $skinsDst -Recurse -Force
+    # Skin packs are baked into the exe (embed_gen above); the on-disk copy
+    # beside the executable is redundant, so drop any stale one.
+    Remove-Item -LiteralPath (Join-Path (Get-Location) "build\skins") `
+        -Recurse -Force -ErrorAction SilentlyContinue
 } catch {
     Write-Output $_
     $failed = $true

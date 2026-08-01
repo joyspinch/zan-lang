@@ -6,15 +6,11 @@
 # to run the IDE and compile/run Zan programs. Nothing else should be dropped
 # into dist -- treat it as the single, clean release output.
 #
-# ZanIDE.exe in the release is a self-extracting wrapper (scripts\pkg_stub.c)
-# carrying only the real IDE exe + SDL3.dll as its zip payload: no loose
-# SDL3.dll ships, everything else stays as normal folders next to the exe. On
-# first run the wrapper extracts to %LOCALAPPDATA%\ZanGames\ZanIDE\, exports
-# ZAN_APP_DIR=<wrapper's folder> and starts the real IDE, which resolves
-# toolchain\ / stdlib\ / examples\ / templates\ / tools\ via ZAN_APP_DIR.
+# ZanIDE.exe is the real IDE, shipped flat: SDL3 and the skin packs are
+# statically linked / embedded inside the exe, so it has no dll beside it.
 #
 #   dist\win-x64\
-#     ZanIDE.exe           self-extracting wrapper (real IDE + SDL3.dll inside)
+#     ZanIDE.exe           the IDE (SDL3 statically linked, skins embedded)
 #     toolchain\          the Zan compiler + its self-contained linker bundle:
 #                           zanc.exe, ld.exe, mingw\, linux-musl\ ...
 #                         (the IDE finds zanc here; zanc finds its linker next
@@ -75,11 +71,8 @@ Write-Output "[3/4] Copying IDE + compiler + stdlib ..."
 $distTc = Join-Path $dist 'toolchain'
 New-Item -ItemType Directory -Path $distTc | Out-Null
 Copy-Item $ideExe (Join-Path $dist 'ZanIDE.exe')
-# The IDE window is an SDL3 window (built with ZAN_GUI_SDL), so SDL3.dll must
-# ship beside ZanIDE.exe or the published IDE fails to start.
-$sdlDll = Join-Path $b 'SDL3.dll'
-if (Test-Path $sdlDll) { Copy-Item $sdlDll (Join-Path $dist 'SDL3.dll') }
-else { Write-Output "PUBLISH_FAILED: build\SDL3.dll missing (IDE needs it to run)"; exit 1 }
+# SDL3 is statically linked into ZanIDE.exe (build_ide.ps1), so no SDL3.dll
+# ships beside the IDE.
 Copy-Item $stdlib (Join-Path $dist 'stdlib') -Recurse
 
 # ---- the IDE's own page-layout stylesheet, beside the install root ----
@@ -214,9 +207,8 @@ Zan IDE - self-contained release
 ================================
 
 Contents
-  ZanIDE.exe     The Zan IDE. It runs from this folder; SDL3.dll ships beside
-                 it and skins/ide.css/stdlib/toolchain resolve from here.
-  SDL3.dll       The windowing runtime the IDE needs; keep it next to the exe.
+  ZanIDE.exe     The Zan IDE. It runs from this folder; SDL3 is statically
+                 linked in, and ide.css/stdlib/toolchain resolve from here.
   ide.css        The IDE's page-layout stylesheet.
   (skins)        Skin packs are baked into ZanIDE.exe (embedded resources) and
                  read from memory -- no skins\ folder is required. Drop a
@@ -263,11 +255,10 @@ $n = (Get-ChildItem $dist -Recurse -File | Measure-Object).Count
 Write-Output "STAGE_OK -> $dist ($n files)"
 
 # ---- flat layout: the real IDE exe runs from the install dir ---------------
-# No self-extract wrapper. ZanIDE.exe (the real IDE) and SDL3.dll ship loose in
-# $dist and the exe runs right here, so skins/ide.css/stdlib/toolchain resolve
-# from the exe's own directory -- no %LOCALAPPDATA% extraction, no ZAN_APP_DIR
-# indirection, no "resources next to the extracted copy are missing" bugs.
-Write-Output "[5/5] Finalizing flat layout (real exe + SDL3.dll beside it) ..."
+# No self-extract wrapper. ZanIDE.exe (the real IDE) ships loose in $dist and
+# runs right here, so ide.css/stdlib/toolchain resolve from the exe's own
+# directory -- no %LOCALAPPDATA% extraction, no ZAN_APP_DIR indirection.
+Write-Output "[5/5] Finalizing flat layout (real exe, no dlls) ..."
 
 # Still ship the single-file packer into the toolchain so the published IDE can
 # wrap USER programs into single-file exes (its Publish flow calls
@@ -292,6 +283,5 @@ if ($gcc) {
 }
 
 if (-not (Test-Path (Join-Path $dist 'ZanIDE.exe'))) { Write-Output "PUBLISH_FAILED: dist\ZanIDE.exe missing"; exit 1 }
-if (-not (Test-Path (Join-Path $dist 'SDL3.dll')))   { Write-Output "PUBLISH_FAILED: dist\SDL3.dll missing"; exit 1 }
 $sz = (Get-Item (Join-Path $dist 'ZanIDE.exe')).Length
-Write-Output "PUBLISH_OK -> $dist\ZanIDE.exe (flat, real exe, $sz bytes; SDL3.dll beside it)"
+Write-Output "PUBLISH_OK -> $dist\ZanIDE.exe (flat, real exe, $sz bytes; SDL3 statically linked)"
