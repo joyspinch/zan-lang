@@ -16,6 +16,7 @@
 #include "diag.h"
 #include <string.h>
 #include <stdio.h>
+#include <stdarg.h>
 
 /* ---- helpers ---- */
 
@@ -912,21 +913,15 @@ static zan_ast_node_t *parse_postfix(zan_parser_t *p) {
             n->index.object = expr;
             n->index.index = idx;
             expr = n;
-        } else if (parser_match(p, TK_PLUS_PLUS) || p->previous.kind == TK_MINUS_MINUS) {
-            /* defer: check if we just matched */
-            if (p->previous.kind == TK_PLUS_PLUS || p->previous.kind == TK_MINUS_MINUS) {
-                zan_ast_node_t *n = zan_ast_new(p->arena, AST_POSTFIX_UNARY, loc);
-                n->unary.op = p->previous.kind;
-                n->unary.operand = expr;
-                expr = n;
-            }
-            break;
-        } else if (parser_check(p, TK_MINUS_MINUS)) {
-            parser_advance(p);
+        } else if (parser_check(p, TK_PLUS_PLUS) || parser_check(p, TK_MINUS_MINUS)) {
+            /* postfix ++/--: consume exactly one operator and stop, so
+             * `x++`/`x--` lower to a single AST_POSTFIX_UNARY. */
             zan_ast_node_t *n = zan_ast_new(p->arena, AST_POSTFIX_UNARY, loc);
-            n->unary.op = TK_MINUS_MINUS;
+            n->unary.op = p->current.kind;
+            parser_advance(p);
             n->unary.operand = expr;
             expr = n;
+            break;
         } else {
             break;
         }
@@ -2581,21 +2576,38 @@ static zan_ast_node_t *find_delegate_decl(zan_ast_node_t *unit, zan_istr_t name)
     return NULL;
 }
 
+/* Bounded append into the synthetic-source buffers (tref_write,
+ * gen_event_holder, gen_record_class). `*off` saturates at cap once the
+ * buffer is full, so cap - *off can never underflow to a huge size_t (which
+ * would let snprintf overflow the stack buffer). Returns the bytes appended
+ * (0 once full). */
+static int zsrc_append(char *buf, int cap, int *off, const char *fmt, ...) {
+    if (*off >= cap) return 0;
+    va_list ap;
+    va_start(ap, fmt);
+    int w = vsnprintf(buf + *off, (size_t)(cap - *off), fmt, ap);
+    va_end(ap);
+    if (w < 0) return 0;
+    *off += w;
+    if (*off > cap) *off = cap;
+    return w;
+}
+
 static int tref_write(char *buf, int cap, zan_ast_node_t *t) {
     int n = 0;
-    if (!t || t->kind != AST_TYPE_REF) return 0;
-    n += snprintf(buf + n, (size_t)(cap - n), "%.*s",
-                  (int)t->type_ref.name.len, t->type_ref.name.str);
+    if (!t || t->kind != AST_TYPE_REF || cap <= 0) return 0;
+    n += zsrc_append(buf, cap, &n, "%.*s",
+                     (int)t->type_ref.name.len, t->type_ref.name.str);
     if (t->type_ref.type_args.count > 0) {
-        n += snprintf(buf + n, (size_t)(cap - n), "<");
+        n += zsrc_append(buf, cap, &n, "<");
         for (int i = 0; i < t->type_ref.type_args.count; i++) {
-            if (i > 0) n += snprintf(buf + n, (size_t)(cap - n), ", ");
+            if (i > 0) n += zsrc_append(buf, cap, &n, ", ");
             n += tref_write(buf + n, cap - n, t->type_ref.type_args.items[i]);
         }
-        n += snprintf(buf + n, (size_t)(cap - n), ">");
+        n += zsrc_append(buf, cap, &n, ">");
     }
-    if (t->type_ref.is_array) n += snprintf(buf + n, (size_t)(cap - n), "[]");
-    if (t->type_ref.is_nullable) n += snprintf(buf + n, (size_t)(cap - n), "?");
+    if (t->type_ref.is_array) n += zsrc_append(buf, cap, &n, "[]");
+    if (t->type_ref.is_nullable) n += zsrc_append(buf, cap, &n, "?");
     return n;
 }
 
@@ -2604,7 +2616,7 @@ static void gen_event_holder(zan_ast_node_t *unit, zan_ast_node_t *ddecl,
                              zan_arena_t *arena, zan_diag_t *diag) {
     char src[8192];
     int n = 0;
-    n += snprintf(src + n, sizeof(src) - (size_t)n,
+    n += zsrc_append(src, (int)sizeof(src), &n,
         "class %s {\n"
         "    List<%s> hs;\n"
         "    static %s op_add(%s self, %s h) {\n"
@@ -2628,21 +2640,21 @@ static void gen_event_holder(zan_ast_node_t *unit, zan_ast_node_t *ddecl,
         hname, hname, dname);
     for (int i = 0; i < ddecl->method_decl.params.count; i++) {
         zan_ast_node_t *pp = ddecl->method_decl.params.items[i];
-        if (i > 0) n += snprintf(src + n, sizeof(src) - (size_t)n, ", ");
+        if (i > 0) n += zsrc_append(src, (int)sizeof(src), &n, ", ");
         n += tref_write(src + n, (int)sizeof(src) - n, pp->param.type);
-        n += snprintf(src + n, sizeof(src) - (size_t)n, " a%d", i);
+        n += zsrc_append(src, (int)sizeof(src), &n, " a%d", i);
     }
-    n += snprintf(src + n, sizeof(src) - (size_t)n,
+    n += zsrc_append(src, (int)sizeof(src), &n,
         ") {\n"
         "        int i = 0;\n"
         "        while (i < hs.Count) {\n"
         "            %s d = hs[i];\n"
         "            d(", dname);
     for (int i = 0; i < ddecl->method_decl.params.count; i++) {
-        n += snprintf(src + n, sizeof(src) - (size_t)n, "%sa%d",
-                      i > 0 ? ", " : "", i);
+        n += zsrc_append(src, (int)sizeof(src), &n, "%sa%d",
+                         i > 0 ? ", " : "", i);
     }
-    n += snprintf(src + n, sizeof(src) - (size_t)n,
+    n += zsrc_append(src, (int)sizeof(src), &n,
         ");\n"
         "            i = i + 1;\n"
         "        }\n"
@@ -2670,31 +2682,31 @@ static void gen_record_class(zan_ast_node_t *unit, zan_istr_t rname,
     char nm[256];
     int n = 0;
     snprintf(nm, sizeof(nm), "%.*s", (int)rname.len, rname.str);
-    n += snprintf(src + n, sizeof(src) - (size_t)n, "class %s {\n", nm);
+    n += zsrc_append(src, (int)sizeof(src), &n, "class %s {\n", nm);
     for (int i = 0; i < params->count; i++) {
         zan_ast_node_t *pp = params->items[i];
-        n += snprintf(src + n, sizeof(src) - (size_t)n, "    public ");
+        n += zsrc_append(src, (int)sizeof(src), &n, "    public ");
         n += tref_write(src + n, (int)sizeof(src) - n, pp->param.type);
-        n += snprintf(src + n, sizeof(src) - (size_t)n, " %.*s;\n",
-                      (int)pp->param.name.len, pp->param.name.str);
+        n += zsrc_append(src, (int)sizeof(src), &n, " %.*s;\n",
+                         (int)pp->param.name.len, pp->param.name.str);
     }
-    n += snprintf(src + n, sizeof(src) - (size_t)n, "    public %s(", nm);
+    n += zsrc_append(src, (int)sizeof(src), &n, "    public %s(", nm);
     for (int i = 0; i < params->count; i++) {
         zan_ast_node_t *pp = params->items[i];
-        if (i > 0) n += snprintf(src + n, sizeof(src) - (size_t)n, ", ");
+        if (i > 0) n += zsrc_append(src, (int)sizeof(src), &n, ", ");
         n += tref_write(src + n, (int)sizeof(src) - n, pp->param.type);
-        n += snprintf(src + n, sizeof(src) - (size_t)n, " %.*s",
-                      (int)pp->param.name.len, pp->param.name.str);
+        n += zsrc_append(src, (int)sizeof(src), &n, " %.*s",
+                         (int)pp->param.name.len, pp->param.name.str);
     }
-    n += snprintf(src + n, sizeof(src) - (size_t)n, ") {\n");
+    n += zsrc_append(src, (int)sizeof(src), &n, ") {\n");
     for (int i = 0; i < params->count; i++) {
         zan_ast_node_t *pp = params->items[i];
-        n += snprintf(src + n, sizeof(src) - (size_t)n,
-                      "        this.%.*s = %.*s;\n",
-                      (int)pp->param.name.len, pp->param.name.str,
-                      (int)pp->param.name.len, pp->param.name.str);
+        n += zsrc_append(src, (int)sizeof(src), &n,
+                         "        this.%.*s = %.*s;\n",
+                         (int)pp->param.name.len, pp->param.name.str,
+                         (int)pp->param.name.len, pp->param.name.str);
     }
-    n += snprintf(src + n, sizeof(src) - (size_t)n,
+    n += zsrc_append(src, (int)sizeof(src), &n,
         "    }\n"
         "    static bool op_eq(%s l, %s r) {\n"
         "        if (l == null) { return r == null; }\n"
@@ -2702,12 +2714,12 @@ static void gen_record_class(zan_ast_node_t *unit, zan_istr_t rname,
         "        return true", nm, nm);
     for (int i = 0; i < params->count; i++) {
         zan_ast_node_t *pp = params->items[i];
-        n += snprintf(src + n, sizeof(src) - (size_t)n,
-                      " && l.%.*s == r.%.*s",
-                      (int)pp->param.name.len, pp->param.name.str,
-                      (int)pp->param.name.len, pp->param.name.str);
+        n += zsrc_append(src, (int)sizeof(src), &n,
+                         " && l.%.*s == r.%.*s",
+                         (int)pp->param.name.len, pp->param.name.str,
+                         (int)pp->param.name.len, pp->param.name.str);
     }
-    n += snprintf(src + n, sizeof(src) - (size_t)n,
+    n += zsrc_append(src, (int)sizeof(src), &n,
         ";\n"
         "    }\n"
         "    static bool op_neq(%s l, %s r) { return !(l == r); }\n"
@@ -2719,15 +2731,15 @@ static void gen_record_class(zan_ast_node_t *unit, zan_istr_t rname,
         int is_str = pt && pt->kind == AST_TYPE_REF && !pt->type_ref.is_array &&
                      pt->type_ref.name.len == 6 &&
                      memcmp(pt->type_ref.name.str, "string", 6) == 0;
-        n += snprintf(src + n, sizeof(src) - (size_t)n,
-                      " + \"%s %.*s = \" + %s%.*s%s",
-                      i > 0 ? "," : "",
-                      (int)pp->param.name.len, pp->param.name.str,
-                      is_str ? "" : "Convert.ToString(",
-                      (int)pp->param.name.len, pp->param.name.str,
-                      is_str ? "" : ")");
+        n += zsrc_append(src, (int)sizeof(src), &n,
+                         " + \"%s %.*s = \" + %s%.*s%s",
+                         i > 0 ? "," : "",
+                         (int)pp->param.name.len, pp->param.name.str,
+                         is_str ? "" : "Convert.ToString(",
+                         (int)pp->param.name.len, pp->param.name.str,
+                         is_str ? "" : ")");
     }
-    n += snprintf(src + n, sizeof(src) - (size_t)n,
+    n += zsrc_append(src, (int)sizeof(src), &n,
         " + \" }\";\n"
         "    }\n"
         "}\n");

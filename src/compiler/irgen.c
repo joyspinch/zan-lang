@@ -2,7 +2,7 @@
  *
  * For M1 this generates code for:
  *   - Static Main() method as program entry point
- *   - Console.WriteLine() calls â†?zan_rt_println / printf
+ *   - Console.WriteLine() calls ï¿½?zan_rt_println / printf
  *   - Integer and floating-point arithmetic
  *   - Local variable declarations and assignments
  *   - Control flow (if, while, for)
@@ -751,6 +751,11 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         g->g_site_dtors = LLVMAddGlobal(g->mod, g->site_dtors_type, "__zan_site_dtors");
         LLVMSetInitializer(g->g_site_dtors, LLVMConstNull(g->site_dtors_type));
         LLVMSetLinkage(g->g_site_dtors, LLVMInternalLinkage);
+        /* per-site ancestor-name list pointers for runtime `is`/`as` checks */
+        g->site_tynames_type = LLVMArrayType(i8p, ZAN_MAX_LEAK_SITES);
+        g->g_site_tynames = LLVMAddGlobal(g->mod, g->site_tynames_type, "__zan_site_tynames");
+        LLVMSetInitializer(g->g_site_tynames, LLVMConstNull(g->site_tynames_type));
+        LLVMSetLinkage(g->g_site_tynames, LLVMInternalLinkage);
         g->site_syms = (zan_symbol_t **)calloc(ZAN_MAX_LEAK_SITES, sizeof(zan_symbol_t *));
         g->site_coll = (int *)calloc(ZAN_MAX_LEAK_SITES, sizeof(int));
         g->site_coll_elem = (zan_type_t **)calloc(ZAN_MAX_LEAK_SITES, sizeof(zan_type_t *));
@@ -765,7 +770,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
     g->fn_printf = printf_fn;
     g->printf_type = printf_type;
 
-    /* declare zan_rt_println(const char*) â†?calls printf("%s\n", str) */
+    /* declare zan_rt_println(const char*) ï¿½?calls printf("%s\n", str) */
     LLVMTypeRef println_args[] = { LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0) };
     LLVMTypeRef println_type = LLVMFunctionType(
         LLVMVoidTypeInContext(g->ctx), println_args, 1, 0);
@@ -793,7 +798,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
     zan_call2(g->builder, printf_type, printf_fn, iargs, 2, "");
     LLVMBuildRetVoid(g->builder);
 
-    /* declare zan_rt_print_uint(uint64) â†?unsigned (%llu) println for ulong */
+    /* declare zan_rt_print_uint(uint64) ï¿½?unsigned (%llu) println for ulong */
     g->rt_print_uint = LLVMAddFunction(g->mod, "zan_rt_print_uint", pint_type);
 
     LLVMBasicBlockRef puint_entry = LLVMAppendBasicBlockInContext(g->ctx, g->rt_print_uint, "entry");
@@ -836,13 +841,13 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
     LLVMTypeRef free_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), free_args, 1, 0);
     g->fn_free = LLVMAddFunction(g->mod, "free", free_type);
 
-    /* void exit(int) â†?used by runtime-check panics */
+    /* void exit(int) ï¿½?used by runtime-check panics */
     LLVMTypeRef exit_args[] = { i32 };
     g->exit_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), exit_args, 1, 0);
     g->fn_exit = LLVMAddFunction(g->mod, "exit", g->exit_type);
 
     if (g->check_leaks) {
-        /* int atexit(void(*)(void)) â†?used to schedule the leak report */
+        /* int atexit(void(*)(void)) ï¿½?used to schedule the leak report */
         LLVMTypeRef void_fn_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), NULL, 0, 0);
         LLVMTypeRef void_fn_ptr = LLVMPointerType(void_fn_type, 0);
         LLVMTypeRef atexit_args[] = { void_fn_ptr };
@@ -953,7 +958,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
     g->uses_socket_async = false;
 
     /* Emit the cooperative coroutine driver inline (the whole Zan runtime is
-     * emitted into the module, so produced programs are self-contained â†?see
+     * emitted into the module, so produced programs are self-contained ï¿½?see
      * the ARC/List helpers below). The ready queue is a singly-linked FIFO of
      * malloc'd nodes {next, frame, step}; zan_co_ready appends, zan_co_sched_run
      * drains, popping+freeing a node before invoking its step (which may itself
@@ -2061,7 +2066,7 @@ static void register_struct_type(zan_irgen_t *g, zan_symbol_t *sym) {
     /* Create and register the named struct *before* resolving field types,
      * so that a self- or mutually-referential class field (a pointer to this
      * type) resolves to `%struct.X*` via map_type instead of falling back to
-     * i8* â†?which produced type-mismatched IR (rejected under typed pointers). */
+     * i8* ï¿½?which produced type-mismatched IR (rejected under typed pointers). */
     char name_buf[256];
     snprintf(name_buf, sizeof(name_buf), "struct.%.*s", (int)sym->name.len, sym->name.str);
     LLVMTypeRef st = LLVMStructCreateNamed(g->ctx, name_buf);
@@ -2331,7 +2336,7 @@ static local_var_t *local_find(local_scope_t *scope, zan_istr_t name) {
  * classes with a member layout. List and StringBuilder now carry the same
  * 16-byte rc header (allocated via zan_rt_alloc) and participate in ARC like
  * classes; Dict remains header-less (its backing buffers are still not
- * reclaimed) so ARC must continue to exclude it by name â†?retaining/releasing a
+ * reclaimed) so ARC must continue to exclude it by name ï¿½?retaining/releasing a
  * header-less struct reads a refcount at obj-16 that lands in unrelated heap
  * memory and corrupts it. */
 static int is_builtin_collection_type(zan_type_t *t) {

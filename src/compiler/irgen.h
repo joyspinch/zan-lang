@@ -261,6 +261,9 @@ struct zan_irgen {
     LLVMTypeRef  site_names_type; /* [N x i8*] array type */
     LLVMValueRef g_site_dtors;    /* [N x i8*] global: release fn per alloc site */
     LLVMTypeRef  site_dtors_type; /* [N x i8*] array type */
+    LLVMValueRef g_site_tynames;  /* [N x i8*] global: ancestor-name list ptr
+                                   * per site, for runtime `is`/`as` checks */
+    LLVMTypeRef  site_tynames_type; /* [N x i8*] array type */
     zan_symbol_t **site_syms;    /* concrete class symbol per alloc site */
     zan_type_t   **site_inst;    /* per site: the instantiated class type, so a
                                   * generic class's destructor releases the
@@ -340,6 +343,7 @@ struct zan_irgen {
     LLVMTypeRef  rt_io_pump_timeout_type;
     bool         uses_socket_async; /* set when a socket await is lowered */
     bool         uses_sync_runtime; /* set by AtomicInt/SharedTable externs */
+    bool         uses_embed_api;    /* set by zan_embed_* extern references */
     /* goto/label support: label blocks keyed by (function, name), created on
      * first reference from either the label statement or a goto */
     struct {

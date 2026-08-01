@@ -82,6 +82,19 @@ if (Test-Path $sdlDll) { Copy-Item $sdlDll (Join-Path $dist 'SDL3.dll') }
 else { Write-Output "PUBLISH_FAILED: build\SDL3.dll missing (IDE needs it to run)"; exit 1 }
 Copy-Item $stdlib (Join-Path $dist 'stdlib') -Recurse
 
+# ---- the IDE's own page-layout stylesheet, beside the install root ----
+# ide.css (flex/widths/gaps) is resolved from BaseDir()/ExeDir(); ship it in the
+# install root so it loads without falling back to the source tree.
+$ideCss = Join-Path $root 'src\ide_zan\ide.css'
+if (Test-Path $ideCss) { Copy-Item $ideCss (Join-Path $dist 'ide.css') -Force }
+else { Write-Output "PUBLISH_WARN: src\ide_zan\ide.css missing (IDE uses default layout)" }
+
+# ---- skin packs are baked into ZanIDE.exe as embedded resources -----------
+# (scripts\gen_embed.ps1, linked in by build_ide.ps1). The skin picker reads
+# them from the exe in memory, so no external skins\ folder ships at the root.
+# The filesystem is only a fallback for user overrides (an on-disk skins\ or
+# stdlib\Gui\skins still wins if present).
+
 # ---- copy the app icon so the IDE can stamp new projects with it ----
 # zanc also carries a compiled-in copy (see CMakeLists.txt), so a produced .exe
 # has an icon even when this file is missing.
@@ -201,9 +214,13 @@ Zan IDE - self-contained release
 ================================
 
 Contents
-  ZanIDE.exe     The Zan IDE, as a self-extracting single exe: the real IDE
-                 and the SDL3 runtime it needs are embedded and unpacked to a
-                 per-user cache on first launch -- no loose SDL3.dll here.
+  ZanIDE.exe     The Zan IDE. It runs from this folder; SDL3.dll ships beside
+                 it and skins/ide.css/stdlib/toolchain resolve from here.
+  SDL3.dll       The windowing runtime the IDE needs; keep it next to the exe.
+  ide.css        The IDE's page-layout stylesheet.
+  (skins)        Skin packs are baked into ZanIDE.exe (embedded resources) and
+                 read from memory -- no skins\ folder is required. Drop a
+                 skins\ folder next to the exe only to override/add packs.
   toolchain\     The Zan compiler and everything it links with, all as siblings:
                    zanc.exe                the compiler
                    zan-lsp.exe             language server (for external editors)
@@ -245,44 +262,36 @@ Set-Content -Path (Join-Path $dist 'README.txt') -Value $readme -Encoding UTF8
 $n = (Get-ChildItem $dist -Recurse -File | Measure-Object).Count
 Write-Output "STAGE_OK -> $dist ($n files)"
 
-# ---- embed SDL3.dll into ZanIDE.exe via the self-extract wrapper -----------
-# Same mechanism as package_games.ps1, but the payload is ONLY the real IDE
-# exe + SDL3.dll. The wrapper extracts them to %LOCALAPPDATA%\ZanGames\ZanIDE\
-# and starts the IDE with ZAN_APP_DIR pointing back at this folder, so the
-# sibling toolchain\/stdlib\/... resolve normally and no SDL3.dll ships loose.
-Write-Output "[5/5] Wrapping ZanIDE.exe (embedding SDL3.dll) ..."
+# ---- flat layout: the real IDE exe runs from the install dir ---------------
+# No self-extract wrapper. ZanIDE.exe (the real IDE) and SDL3.dll ship loose in
+# $dist and the exe runs right here, so skins/ide.css/stdlib/toolchain resolve
+# from the exe's own directory -- no %LOCALAPPDATA% extraction, no ZAN_APP_DIR
+# indirection, no "resources next to the extracted copy are missing" bugs.
+Write-Output "[5/5] Finalizing flat layout (real exe + SDL3.dll beside it) ..."
+
+# Still ship the single-file packer into the toolchain so the published IDE can
+# wrap USER programs into single-file exes (its Publish flow calls
+# toolchain\pack_single.ps1 with toolchain\pkg_stub.exe). This is independent of
+# how the IDE itself ships; skip gracefully if no C compiler is available.
 $gcc = 'C:\TDM-GCC-64\bin\gcc.exe'
 if (-not (Test-Path $gcc)) {
     $cc = Get-Command gcc -ErrorAction SilentlyContinue
-    if ($cc) { $gcc = $cc.Source }
-    else { Write-Output "PUBLISH_FAILED: gcc not found (needed for the launcher stub)"; exit 1 }
+    if ($cc) { $gcc = $cc.Source } else { $gcc = $null }
 }
-$stub = Join-Path $b 'pkg_stub.exe'
-& $gcc -O2 -mwindows (Join-Path $root 'scripts\pkg_stub.c') -o $stub
-if ($LASTEXITCODE -ne 0) { Write-Output "PUBLISH_FAILED: launcher stub build failed"; exit 1 }
-
-# Ship the packer into the payload's toolchain so the published IDE can wrap
-# user programs into single-file exes too (its Publish flow calls
-# toolchain\pack_single.ps1 with toolchain\pkg_stub.exe).
-Copy-Item $stub (Join-Path $distTc 'pkg_stub.exe') -Force
-Copy-Item (Join-Path $root 'scripts\pack_single.ps1') (Join-Path $distTc 'pack_single.ps1') -Force
-
-$packStage = Join-Path $b 'ide_pack'
-if (Test-Path $packStage) { Remove-Item $packStage -Recurse -Force }
-New-Item -ItemType Directory -Path $packStage | Out-Null
-Copy-Item (Join-Path $dist 'ZanIDE.exe') (Join-Path $packStage 'ZanIDE.exe')
-Copy-Item (Join-Path $dist 'SDL3.dll') (Join-Path $packStage 'SDL3.dll')
-
-$single = Join-Path $b 'ZanIDE_single.exe'
-& powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'scripts\pack_single.ps1') `
-    -Stage $packStage -Stub $stub -Out $single -Icon (Join-Path $root 'assets\zan.ico')
-if ($LASTEXITCODE -ne 0 -or -not (Test-Path $single)) {
-    Write-Output "PUBLISH_FAILED: wrapper packing failed"; exit 1
+if ($gcc) {
+    $stub = Join-Path $b 'pkg_stub.exe'
+    & $gcc -O2 -mwindows (Join-Path $root 'scripts\pkg_stub.c') -o $stub
+    if ($LASTEXITCODE -eq 0 -and (Test-Path $stub)) {
+        Copy-Item $stub (Join-Path $distTc 'pkg_stub.exe') -Force
+        Copy-Item (Join-Path $root 'scripts\pack_single.ps1') (Join-Path $distTc 'pack_single.ps1') -Force
+    } else {
+        Write-Output "PUBLISH_WARN: launcher stub build failed; user single-file publish unavailable"
+    }
+} else {
+    Write-Output "PUBLISH_WARN: gcc not found; user single-file publish unavailable (IDE itself ships flat, unaffected)"
 }
 
-# Replace the loose exe + dll with the wrapper; everything else stays as-is.
-Remove-Item (Join-Path $dist 'ZanIDE.exe') -Force
-Remove-Item (Join-Path $dist 'SDL3.dll') -Force
-Move-Item $single (Join-Path $dist 'ZanIDE.exe') -Force
+if (-not (Test-Path (Join-Path $dist 'ZanIDE.exe'))) { Write-Output "PUBLISH_FAILED: dist\ZanIDE.exe missing"; exit 1 }
+if (-not (Test-Path (Join-Path $dist 'SDL3.dll')))   { Write-Output "PUBLISH_FAILED: dist\SDL3.dll missing"; exit 1 }
 $sz = (Get-Item (Join-Path $dist 'ZanIDE.exe')).Length
-Write-Output "PUBLISH_OK -> $dist\ZanIDE.exe (SDL3 embedded, $sz bytes)"
+Write-Output "PUBLISH_OK -> $dist\ZanIDE.exe (flat, real exe, $sz bytes; SDL3.dll beside it)"

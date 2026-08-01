@@ -87,6 +87,7 @@ add_executable(zanc
     src/compiler/ast.c
     src/compiler/parser.c
     src/compiler/jsongen.c
+    src/compiler/formgen.c
     src/compiler/dbgen.c
     src/compiler/routegen.c
     src/compiler/nsresolve.c
@@ -150,6 +151,26 @@ add_custom_command(
 add_custom_target(zanrt_io ALL DEPENDS ${ZAN_RT_IO_OBJ})
 add_dependencies(zanc zanrt_io)
 target_compile_definitions(zanc PRIVATE ZAN_RT_IO_OBJ="${ZAN_RT_IO_OBJ}")
+
+# Generic embedded-resource read API (src/runtime/zan_embed_api.c). The data
+# table is registered by a generated object (scripts/gen_embed.ps1) when a
+# program embeds resources; the API object itself is injected whenever a
+# program *references* the zan_embed_* functions (e.g. any GUI program calling
+# Skin.EmbedRead), so linking succeeds even with nothing embedded (reads return
+# empty). Mirrors the zanrt_io object pattern; compiled with the same MinGW C
+# compiler so the object matches the ABI of zanc's emitted objects.
+set(ZAN_EMBED_OBJ "${CMAKE_BINARY_DIR}/zan_embed_api${CMAKE_C_OUTPUT_EXTENSION}")
+add_custom_command(
+    OUTPUT ${ZAN_EMBED_OBJ}
+    COMMAND ${ZAN_RT_IO_CC} -O2
+            -c ${CMAKE_SOURCE_DIR}/src/runtime/zan_embed_api.c
+            -o ${ZAN_EMBED_OBJ}
+    DEPENDS ${CMAKE_SOURCE_DIR}/src/runtime/zan_embed_api.c
+    COMMENT "Building embedded-resource API object (zan_embed_api)"
+    VERBATIM)
+add_custom_target(zan_embed_api ALL DEPENDS ${ZAN_EMBED_OBJ})
+add_dependencies(zanc zan_embed_api)
+target_compile_definitions(zanc PRIVATE ZAN_EMBED_OBJ="${ZAN_EMBED_OBJ}")
 
 # Multi-worker variant of the reactor: same source compiled with -DZAN_CO_DRIVER
 # so it also supplies the thread-pool cooperative coroutine driver. zanc links
@@ -727,7 +748,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/codeeditor_test.zan
-      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/stdlib/Gui/Widget/CodeEditor.zan;--auto-stdlib;--driver-dir;$<TARGET_FILE_DIR:zan_gui>"
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/stdlib/Gui/Component/CodeEditor/CodeEditor.zan;--auto-stdlib;--driver-dir;$<TARGET_FILE_DIR:zan_gui>"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_codeeditor.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_codeeditor${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
@@ -736,7 +757,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/datatable_test.zan
-      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/stdlib/Gui/Widget/DataTable.zan;--auto-stdlib;--driver-dir;$<TARGET_FILE_DIR:zan_gui>"
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/stdlib/Gui/Component/DataTable/DataTable.zan;--auto-stdlib;--driver-dir;$<TARGET_FILE_DIR:zan_gui>"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_datatable.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_datatable${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
@@ -770,7 +791,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/webview_interop_test.zan
-      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/stdlib/Gui/WebView2.zan;--auto-stdlib;--driver-dir;$<TARGET_FILE_DIR:zan_gui>"
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/stdlib/Gui/Component/WebView/WebView2.zan;--auto-stdlib;--driver-dir;$<TARGET_FILE_DIR:zan_gui>"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_webview_interop.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_webview_interop${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)

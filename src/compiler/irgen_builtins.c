@@ -1365,12 +1365,18 @@ static void add_enum_attr(zan_irgen_t *g, LLVMValueRef fn, LLVMValueRef call,
                                  attr);
 }
 
-/* i32 setjmp on the current target: `_setjmp(buf, NULL)` on Windows (frame
- * NULL disables SEH unwinding), `_setjmp(buf)` elsewhere (no sigmask save).
- * The call carries `returns_twice`: without it the backend is free to keep
- * values in registers across the setjmp, and whatever the longjmp'd-to catch
- * block reads afterwards is garbage (it showed up as corrupted exception
- * messages and access violations in unoptimized builds). */
+/* i32 setjmp on the current target: `_setjmp(buf, NULL)` on Windows, `_setjmp(buf)`
+ * elsewhere (no sigmask save). The Windows form is load-bearing, not a
+ * redundant argument: on the bundled toolchain the generated program links
+ * msvcrt.dll, whose `_setjmp` follows the MSVC x64 convention of saving the
+ * caller's return address from rdx into jmp_buf[0] (longjmp restores it), and
+ * it is the two-argument call shape that makes the LLVM backend emit the
+ * `rdx = return address` preamble for `_setjmp`. A one-argument call leaves
+ * rdx as garbage, longjmp jumps to it, and every throw crashes. The call
+ * carries `returns_twice`: without it the backend is free to keep values in
+ * registers across the setjmp, and whatever the longjmp'd-to catch block reads
+ * afterwards is garbage (it showed up as corrupted exception messages and
+ * access violations in unoptimized builds). */
 static LLVMValueRef emit_eh_setjmp(zan_irgen_t *g, LLVMValueRef bufp) {
     LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);

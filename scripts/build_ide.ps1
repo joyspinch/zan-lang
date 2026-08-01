@@ -30,9 +30,24 @@ Write-Output "[0/2] Building native GUI runtime (SDL3, static, mingw ABI)..."
 clang --target=x86_64-w64-windows-gnu -O2 -DZAN_GUI_STATIC -DZAN_GUI_SDL "-I$inc" `
     -c src\runtime\gui_runtime.c -o build\zan_gui_ide_gnu.o
 if ($LASTEXITCODE -ne 0) { Write-Output "RUNTIME_COMPILE_FAILED"; exit 1 }
-llvm-ar rcs build\libzan_gui_ide_gnu.a build\zan_gui_ide_gnu.o
+# Generic embedded-resource read API (skins/DB drivers/etc. are pulled from the
+# exe by name at runtime); the data comes from a generated object linked below.
+clang --target=x86_64-w64-windows-gnu -O2 `
+    -c src\runtime\zan_embed_api.c -o build\zan_embed_api.o
+if ($LASTEXITCODE -ne 0) { Write-Output "EMBED_API_COMPILE_FAILED"; exit 1 }
+llvm-ar rcs build\libzan_gui_ide_gnu.a build\zan_gui_ide_gnu.o build\zan_embed_api.o
 if ($LASTEXITCODE -ne 0) { Write-Output "RUNTIME_LIB_FAILED"; exit 1 }
 
+# Bake the skin packs (skin.css + base.css + artwork) into the IDE as embedded
+# resources so they ship inside ZanIDE.exe -- no external skins\ folder needed.
+& powershell -ExecutionPolicy Bypass -File scripts\gen_embed.ps1 `
+    -Root stdlib\Gui\skins -Prefix skins `
+    -OutC build\embed_gen.c -OutO build\embed_gen.o -Clang clang
+if ($LASTEXITCODE -ne 0) { Write-Output "EMBED_GEN_FAILED"; exit 1 }
+
+
+$zanc = if (Test-Path "build\zanc.exe") { "build\zanc.exe" } else { "dist\win-x64\toolchain\zanc.exe" }
+Write-Output "[zanc] $zanc"
 
 $registryPath = Join-Path $root "stdlib\Gui\CustomComponents.zan"
 $registryOriginal = [System.IO.File]::ReadAllText($registryPath)
@@ -73,12 +88,13 @@ try {
     $zanArgs += $files
     $zanArgs += @("-o", "build\ZanIDE.exe", "--subsystem", "windows")
     $zanArgs += @("--libpath", "build", "--link-lib", "zan_gui_ide_gnu")
+    $zanArgs += @("--link-input", (Join-Path (Get-Location) "build\embed_gen.o"))
     $zanArgs += @("--libpath", $sdlLibDir, "--link-lib", "SDL3")
     $zanArgs += @("--link-lib", "ws2_32", "--link-lib", "mswsock")
     $zanArgs += @("--link-lib", "psapi", "--link-lib", "advapi32")
     $zanArgs += @("--link-lib", "dwmapi", "--link-lib", "gdi32", "--link-lib", "imm32")
     $zanArgs += @("--icon", (Join-Path (Get-Location) "assets\zan.ico"))
-    $out = & build\zanc.exe @zanArgs 2>&1
+    $out = & $zanc @zanArgs 2>&1
     $code = $LASTEXITCODE
     if ($code -ne 0) {
         $out | Select-Object -Last 40

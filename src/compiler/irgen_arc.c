@@ -648,6 +648,60 @@ static void emit_site_dtor_table(zan_irgen_t *g) {
     free(elems);
 }
 
+/* Fill __zan_site_tynames[site] with a pointer to the site class's ancestor
+ * name list: the class itself plus every base class, most-derived first, with
+ * a trailing null. `x is T` (T a strict base of the static type) walks it to
+ * test the object's runtime class against the target. Collections contribute
+ * their intrinsic name (List/StringBuilder/Dict). Runs at finalize, after all
+ * sites are registered. */
+static void emit_site_tyname_table(zan_irgen_t *g) {
+    if (!g->site_syms) return;
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+    int n = ZAN_MAX_LEAK_SITES;
+    LLVMValueRef *elems = (LLVMValueRef *)calloc((size_t)n, sizeof(LLVMValueRef));
+    for (int i = 0; i < n; i++) {
+        elems[i] = LLVMConstNull(i8ptr);
+        if (i >= g->leak_site_count) continue;
+        const char *names[64];
+        int k = 0;
+        if (g->site_coll && g->site_coll[i]) {
+            int ck = g->site_coll[i];
+            names[k++] = ck == 1 ? "List" : (ck == 2 ? "StringBuilder" : "Dict");
+        } else if (g->site_syms[i]) {
+            zan_symbol_t *cur = g->site_syms[i];
+            while (cur && k < 63) {
+                char buf[320];
+                int len = (int)cur->name.len;
+                if (len > 319) len = 319;
+                memcpy(buf, cur->name.str, (size_t)len);
+                buf[len] = 0;
+                names[k++] = zan_arena_strdup(g->arena, buf, (size_t)len);
+                cur = (cur->type && cur->type->base_type)
+                          ? cur->type->base_type->sym : NULL;
+            }
+        }
+        if (k == 0) continue;
+        LLVMValueRef *nptr = (LLVMValueRef *)calloc((size_t)k + 1, sizeof(LLVMValueRef));
+        for (int j = 0; j < k; j++)
+            nptr[j] = LLVMBuildGlobalStringPtr(g->builder, names[j], "tn");
+        nptr[k] = LLVMConstNull(i8ptr);
+        LLVMTypeRef at = LLVMArrayType(i8ptr, (unsigned)k + 1);
+        char gname[64];
+        snprintf(gname, sizeof(gname), "__zan_tynames_%d", i);
+        LLVMValueRef gv = LLVMAddGlobal(g->mod, at, gname);
+        LLVMSetInitializer(gv, LLVMConstArray(i8ptr, nptr, (unsigned)k + 1));
+        LLVMSetLinkage(gv, LLVMInternalLinkage);
+        LLVMSetGlobalConstant(gv, 1);
+        LLVMSetUnnamedAddr(gv, LLVMGlobalUnnamedAddr);
+        free(nptr);
+        LLVMValueRef idxs[] = { LLVMConstInt(i64, 0, 0), LLVMConstInt(i64, 0, 0) };
+        elems[i] = LLVMBuildGEP2(g->builder, at, gv, idxs, 2, "tn.ptr");
+    }
+    LLVMSetInitializer(g->g_site_tynames, LLVMConstArray(i8ptr, elems, (unsigned)n));
+    free(elems);
+}
+
 /* ---- virtual dispatch: vtable globals + dynamic call ---------------------
  * Each class with virtual/override methods gets an internal global
  * __zan_vtable_<Class> : [N x i8*], one slot per virtual method (base-first
@@ -702,9 +756,13 @@ static void emit_vtables(zan_irgen_t *g) {
         if (!sym || !class_has_virtual_methods(sym)) continue;
         int n = count_virtual_methods(sym);
         if (n < 1) continue;
-        zan_symbol_t *decls[128];
+        /* The slot-defining decl list is as large as the slot count; a fixed
+         * 128-entry stack array silently truncated deep hierarchies, leaving
+         * the tail slots null and any virtual call through them a null call. */
+        zan_symbol_t **decls = (zan_symbol_t **)calloc((size_t)n,
+                                                       sizeof(zan_symbol_t *));
         int nd = 0;
-        collect_vslot_decls(sym, decls, &nd, 128);
+        collect_vslot_decls(sym, decls, &nd, n);
         LLVMValueRef *elems = (LLVMValueRef *)calloc((size_t)n, sizeof(LLVMValueRef));
         for (int s = 0; s < n; s++) {
             LLVMValueRef e = LLVMConstNull(i8ptr);
@@ -720,6 +778,7 @@ static void emit_vtables(zan_irgen_t *g) {
         LLVMValueRef gv = get_vtable_global(g, sym);
         LLVMSetInitializer(gv, LLVMConstArray(i8ptr, elems, (unsigned)n));
         free(elems);
+        free(decls);
     }
 }
 

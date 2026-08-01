@@ -391,6 +391,9 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
                 if (strncmp(ext_name, "zan_gate_", 9) == 0) {
                     g->uses_socket_async = true;
                 }
+                if (strncmp(ext_name, "zan_embed_", 10) == 0) {
+                    g->uses_embed_api = true;
+                }
                 /* Reuse existing declaration if the symbol already exists in the module
                  * (e.g. built-in malloc/free/strlen, or duplicate DllImport across files). */
                 /* A struct crossing the boundary is not passed the way LLVM
@@ -1775,6 +1778,7 @@ done:
     di_clear(g); /* the following are synthetic fns; no user source scope */
     emit_all_class_releases(g);
     emit_site_dtor_table(g);
+    emit_site_tyname_table(g);
     emit_vtables(g);
     /* An error diagnostic emitted during codegen (e.g. an unsupported await
      * form flagged by the ANF pass) must fail the build — the driver only

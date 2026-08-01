@@ -1288,13 +1288,63 @@ static LLVMValueRef get_co_reap_fn(zan_irgen_t *g) {
     LLVMValueRef reap = LLVMGetNamedFunction(g->mod, "__zan_co_reap");
     if (reap) return reap;
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
     LLVMTypeRef reap_ty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), &i8ptr, 1, 0);
     reap = LLVMAddFunction(g->mod, "__zan_co_reap", reap_ty);
     LLVMSetLinkage(reap, LLVMInternalLinkage);
     LLVMBasicBlockRef saved = LLVMGetInsertBlock(g->builder);
-    LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, reap, "entry");
-    LLVMPositionBuilderAtEnd(g->builder, entry);
+    LLVMTypeRef hdr = g->co_header_type;
     LLVMValueRef arg = LLVMGetParam(reap, 0);
+
+    LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, reap, "entry");
+    LLVMBasicBlockRef rel_bb = LLVMAppendBasicBlockInContext(g->ctx, reap, "release");
+    LLVMBasicBlockRef done = LLVMAppendBasicBlockInContext(g->ctx, reap, "done");
+    LLVMPositionBuilderAtEnd(g->builder, entry);
+    /* A detached (spawned) coroutine that completed by throwing parks its
+     * exception in the frame header; no awaiter will ever take ownership of
+     * it, so drop the +1 reference the frame holds before freeing the frame.
+     * Class objects go through the RTTI-dispatch releaser, strings through
+     * the string releaser (their headers differ). */
+    LLVMValueRef exc_p = LLVMBuildStructGEP2(g->builder, hdr, arg,
+        ASYNC_FRAME_EXC, "r.exc.p");
+    LLVMValueRef exc = LLVMBuildLoad2(g->builder, i8ptr, exc_p, "r.exc");
+    LLVMValueRef own_p = LLVMBuildStructGEP2(g->builder, hdr, arg,
+        ASYNC_FRAME_EXC_OWNED, "r.own.p");
+    LLVMValueRef own = LLVMBuildLoad2(g->builder, i32, own_p, "r.own");
+    LLVMValueRef nonnull = zan_icmp(g->builder, LLVMIntNE, exc,
+        LLVMConstNull(i8ptr), "r.nonnull");
+    LLVMValueRef owns = zan_icmp(g->builder, LLVMIntNE, own,
+        LLVMConstInt(i32, 0, 0), "r.owns");
+    LLVMBuildCondBr(g->builder, zan_and(g->builder, nonnull, owns, "r.rel"),
+        rel_bb, done);
+
+    LLVMPositionBuilderAtEnd(g->builder, rel_bb);
+    {
+        LLVMValueRef tid_p = LLVMBuildStructGEP2(g->builder, hdr, arg,
+            ASYNC_FRAME_EXC_TID, "r.tid.p");
+        LLVMValueRef tid = LLVMBuildLoad2(g->builder, i8ptr, tid_p, "r.tid");
+        LLVMValueRef is_obj = zan_icmp(g->builder, LLVMIntNE, tid,
+            LLVMConstNull(i8ptr), "r.isobj");
+        LLVMBasicBlockRef rel_obj = LLVMAppendBasicBlockInContext(g->ctx, reap, "rel.obj");
+        LLVMBasicBlockRef rel_str = LLVMAppendBasicBlockInContext(g->ctx, reap, "rel.str");
+        LLVMBasicBlockRef rel_done = LLVMAppendBasicBlockInContext(g->ctx, reap, "rel.done");
+        LLVMBuildCondBr(g->builder, is_obj, rel_obj, rel_str);
+
+        LLVMPositionBuilderAtEnd(g->builder, rel_obj);
+        zan_call2(g->builder, LLVMGlobalGetValueType(g->rt_release_dyn),
+            g->rt_release_dyn, &exc, 1, "");
+        LLVMBuildBr(g->builder, rel_done);
+
+        LLVMPositionBuilderAtEnd(g->builder, rel_str);
+        zan_call2(g->builder, LLVMGlobalGetValueType(g->rt_str_release),
+            g->rt_str_release, &exc, 1, "");
+        LLVMBuildBr(g->builder, rel_done);
+
+        LLVMPositionBuilderAtEnd(g->builder, rel_done);
+        LLVMBuildBr(g->builder, done);
+    }
+
+    LLVMPositionBuilderAtEnd(g->builder, done);
     /* drop the frame from the live-handle registry first: a Task.Spawn handle
      * the program kept must stop naming this frame before it is freed */
     LLVMValueRef untrack = get_co_untrack_fn(g);

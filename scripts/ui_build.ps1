@@ -1,19 +1,27 @@
 # Zgm UI backend build profiles. Selects the render backend at compile time.
 #
-#   .\build\ui_build.ps1 -mode gpu       # SDL3 + GPU-accelerated renderer
-#   .\build\ui_build.ps1 -mode software  # pure CPU rasterizer, no SDL3
-#   .\build\ui_build.ps1 -mode headless  # no window, no SDL3 (CI / tools)
+#   .\scripts\ui_build.ps1 -mode gpu -src <your.zan>       # SDL3 + GPU
+#   .\scripts\ui_build.ps1 -mode software -src <your.zan>  # pure CPU rasterizer
+#   .\scripts\ui_build.ps1 -mode headless -src <your.zan>  # no window (CI/tools)
+#
+# `-src` is required: the old examples/ui_backend/ui_render_demo.zan smoke
+# demo was removed, so pass the Zan program you want to build against the
+# backend.
 #
 # Only the -mode gpu profile passes the SDL3 backend file (UiRenderSdl.zan) and
 # defines UI_GPU, so software/headless binaries never pull in stdlib/SDL3.
 param(
     [ValidateSet("gpu", "software", "headless")]
     [string]$mode = "headless",
-    [string]$src  = "examples\ui_backend\ui_render_demo.zan",
+    [string]$src  = "",
     [string]$out  = ""
 )
 
 $ErrorActionPreference = "Stop"
+if ($src -eq "") {
+    Write-Error "ui_build.ps1: -src is required (e.g. -src examples\my_demo.zan)"
+    exit 1
+}
 $root = Split-Path -Parent $PSScriptRoot
 $zanc = Join-Path $root "build\zanc.exe"
 $sdlBackend = Join-Path $root "stdlib\Game\Zgm\optional\UiRenderSdl.zan"
