@@ -423,6 +423,26 @@ static void method_call_context(const char *text, size_t offset,
 
 /* Run the front-end over `text` and publish diagnostics for `uri`. */
 static void publish_diagnostics(lsp_server_t *s, const char *uri, const char *text) {
+    size_t ul = strlen(uri);
+    if (ul > 6 && strcmp(uri + ul - 6, ".zform") == 0) {
+        /* .zform is the designer's JSON document, not Zan source: the zanc
+         * front-end cannot parse it (formgen projects it at compile time),
+         * and the designer itself validates the JSON. Publish an empty list
+         * so any previously shown errors clear on close. */
+        json_value *params = json_new_obj();
+        json_obj_set(params, "uri", json_new_str(uri));
+        json_obj_set(params, "diagnostics", json_new_arr());
+        json_value *note = json_new_obj();
+        json_obj_set(note, "jsonrpc", json_new_str("2.0"));
+        json_obj_set(note, "method", json_new_str("textDocument/publishDiagnostics"));
+        json_obj_set(note, "params", params);
+        char *payload = json_serialize(note);
+        lsp_write(s, payload);
+        free(payload);
+        json_free(note);
+        return;
+    }
+
     zan_arena_t *arena = zan_arena_new();
     zan_diag_t *diag = zan_diag_new(arena);
     zan_diag_set_capture(diag, true);
@@ -834,6 +854,10 @@ static void handle_hover(lsp_server_t *s, json_value *id, json_value *params) {
     intel_init(is);
     intel_parse_file(is, uri, doc->text, strlen(doc->text));
     hover_info_t h = intel_hover(is, word);
+    /* cross-file symbols (e.g. a .zform-projected widget field referenced from
+     * the business file) live in the project index */
+    if (!h.valid && g_project_intel)
+        h = intel_hover(g_project_intel, word);
     intel_free(is);
     free(is);
     if (!h.valid) { send_response(s, id, json_new_null()); return; }
@@ -871,12 +895,22 @@ static void handle_definition(lsp_server_t *s, json_value *id, json_value *param
     intel_init(is);
     intel_parse_file(is, uri, doc->text, strlen(doc->text));
     goto_def_t g = intel_goto_def(is, word);
+    if (!g.found && g_project_intel)
+        g = intel_goto_def(g_project_intel, word);
     intel_free(is);
     free(is);
     if (!g.found) { send_response(s, id, json_new_null()); return; }
 
     int dl, dc;
-    offset_to_linecol(doc->text, g.col, &dl, &dc);
+    if (g.file[0] && strcmp(g.file, uri) != 0) {
+        /* cross-file symbol (e.g. a .zform-projected field): the target file
+         * is not open here, so use the recorded line directly; .zform symbols
+         * carry the JSON line of their "name" key. */
+        dl = g.line;
+        dc = 0;
+    } else {
+        offset_to_linecol(doc->text, g.col, &dl, &dc);
+    }
 
     json_value *loc = json_new_obj();
     json_obj_set(loc, "uri", json_new_str(g.file[0] ? g.file : uri));

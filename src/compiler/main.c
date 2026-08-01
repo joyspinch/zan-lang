@@ -9,6 +9,7 @@
 #include "lexer.h"
 #include "parser.h"
 #include "jsongen.h"
+#include "formgen.h"
 #include "dbgen.h"
 #include "routegen.h"
 #include "nsresolve.h"
@@ -1243,6 +1244,18 @@ int main(int argc, char **argv) {
                 size_t slen3 = 0;
                 char *src3 = read_file(input_files[fi], &slen3);
                 if (!src3) continue;
+                /* A .zform input is a JSON design document, so the raw text has
+                 * no `using` directives to scan. Translate it first (formgen
+                 * projects a `partial class` with `using System/Gui/...`) so
+                 * the auto-stdlib pull-in covers the widgets the design uses
+                 * even when the .zform is compiled without its sibling .zan. */
+                size_t fl3 = strlen(input_files[fi]);
+                char *owned = NULL;
+                if (fl3 > 6 && strcmp(input_files[fi] + fl3 - 6, ".zform") == 0) {
+                    char *translated = zan_formgen_translate(src3, slen3,
+                                                             input_files[fi], NULL);
+                    if (translated) { free(src3); src3 = translated; owned = translated; }
+                }
                 const char *p = src3;
                 while ((p = strstr(p, "using ")) != NULL) {
                     /* require the match to start a token (not e.g. "reusing ") */
@@ -1276,7 +1289,7 @@ int main(int argc, char **argv) {
                                         &input_files, &input_count, &input_cap);
                     }
                 }
-                free(src3);
+                free(owned ? owned : src3);
             }
             scanned = round_end;
         }
@@ -1302,7 +1315,10 @@ int main(int argc, char **argv) {
 
     /* Parse every input file and merge their declarations into a single
      * compilation unit so that names resolve across files (multi-file
-     * compilation: zanc a.zan b.zan ... -o out). */
+     * compilation: zanc a.zan b.zan ... -o out). A .zform input is a visual
+     * design document: it is translated first (formgen) to a synthetic
+     * `partial class` -- typed widget fields, __BuildForm, __WireForm and
+     * Main -- which is then parsed and merged exactly like a source file. */
     zan_ast_node_t *ast = NULL;
     for (int fi = 0; fi < input_count; fi++) {
         size_t slen = 0;
@@ -1313,6 +1329,29 @@ int main(int argc, char **argv) {
             zan_arena_free(arena);
             free(source);
             return 1;
+        }
+        {
+            size_t fl = strlen(input_files[fi]);
+            if (fl > 6 && strcmp(input_files[fi] + fl - 6, ".zform") == 0) {
+                char *translated = zan_formgen_translate(src, slen,
+                                                         input_files[fi], diag);
+                if (!translated) {
+                    fprintf(stderr,
+                            "error: cannot translate design document '%s'\n",
+                            input_files[fi]);
+                    zan_arena_free(arena);
+                    free(source);
+                    return 1;
+                }
+                free(src);
+                src = translated;
+                slen = strlen(translated);
+                /* The translation replaces the first source buffer: the caller
+                 * still owns `source` (freed on every exit path below), so it
+                 * must now point at the translation, not the freed original -
+                 * otherwise the exit-path free() double-frees. */
+                if (fi == 0) source = translated;
+            }
         }
         zan_diag_add_file(diag, input_files[fi], src);
 
@@ -1697,6 +1736,7 @@ int main(int argc, char **argv) {
         zan_exe_dir(link_exe_dir, sizeof(link_exe_dir));
         char rt_io_buf[1200];
         char rt_sync_buf[1200];
+        char rt_embed_buf[1200];
 
         /* Socket-async programs (await Socket.ReadReady/WriteReady) link the
          * readiness reactor object shipped with zanc; it provides zan_io_wait_co
@@ -1727,6 +1767,20 @@ int main(int argc, char **argv) {
             snprintf(rt_sync_buf, sizeof(rt_sync_buf), "%s/%s",
                      link_exe_dir, zan_path_basename(ZAN_RT_SYNC_OBJ));
             rt_sync_obj = rt_sync_buf;
+        }
+#endif
+        /* Embedded-resource API (zan_embed_read/has/list/raw/register): any
+         * program that references it (e.g. a GUI program calling Skin.EmbedRead)
+         * links the tiny API object, so building succeeds even when no resource
+         * data object was generated (every read returns empty, callers fall
+         * back to the filesystem). The generated data object itself registers
+         * the table via zan_embed_register when resources ARE embedded. */
+        const char *rt_embed_obj = NULL;
+#ifdef ZAN_EMBED_OBJ
+        if (irgen.uses_embed_api) {
+            snprintf(rt_embed_buf, sizeof(rt_embed_buf), "%s/%s",
+                     link_exe_dir, zan_path_basename(ZAN_EMBED_OBJ));
+            rt_embed_obj = rt_embed_buf;
         }
 #endif
         if (cross_compiling && rt_sync_obj && target.os != ZAN_OS_LINUX
@@ -1925,6 +1979,12 @@ int main(int argc, char **argv) {
                 size_t cur = strlen(cmd);
                 snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s/zanrt_sync.o\"", sys);
             }
+            if (irgen.uses_embed_api) {
+                /* embedded-resource API; pure C, compiled for the target in the
+                 * same sysroot build that produces zanrt_io.o */
+                size_t cur = strlen(cmd);
+                snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s/zan_embed_api.o\"", sys);
+            }
             /* Small-object allocator in front of musl's mallocng: ARC programs
              * allocate one short-lived block per string/object/frame, which is
              * mallocng's worst case. Wrapping malloc/free also catches libc's
@@ -1988,14 +2048,19 @@ int main(int argc, char **argv) {
              * refreshed by the drivers workflow). */
             char winrt_io[1400] = {0};
             char winrt_sync[1400] = {0};
+            char winrt_embed[1400] = {0};
             if (rt_io_obj)
                 snprintf(winrt_io, sizeof(winrt_io), "%s/%s/%s", exe_dir2, wsub,
                          mt_scheduler ? "zanrt_io_mt.o" : "zanrt_io.o");
             if (rt_sync_obj)
                 snprintf(winrt_sync, sizeof(winrt_sync), "%s/%s/zanrt_sync.o",
                          exe_dir2, wsub);
+            if (rt_embed_obj)
+                snprintf(winrt_embed, sizeof(winrt_embed),
+                         "%s/%s/zan_embed_api.o", exe_dir2, wsub);
             if ((winrt_io[0] && !zan_file_exists(winrt_io))
-                || (winrt_sync[0] && !zan_file_exists(winrt_sync))) {
+                || (winrt_sync[0] && !zan_file_exists(winrt_sync))
+                || (winrt_embed[0] && !zan_file_exists(winrt_embed))) {
                 fprintf(stderr,
                         "error: bundled %s runtime objects not found in "
                         "'%s/%s'; reinstall zan or rebuild with toolchain/%s "
@@ -2039,6 +2104,10 @@ int main(int argc, char **argv) {
             if (winrt_sync[0]) {
                 size_t cur = strlen(cmd);
                 snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"", winrt_sync);
+            }
+            if (winrt_embed[0]) {
+                size_t cur = strlen(cmd);
+                snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"", winrt_embed);
             }
             for (int ei = 0; ei < extra_link_input_count; ei++) {
                 size_t cur = strlen(cmd);
@@ -2155,6 +2224,7 @@ int main(int argc, char **argv) {
                      (target.arch == ZAN_ARCH_AARCH64) ? "arm64" : "x64");
             char macrt_io[1400] = {0};
             char macrt_sync[1400] = {0};
+            char macrt_embed[1400] = {0};
             if (rt_io_obj) {
                 snprintf(macrt_io, sizeof(macrt_io), "%s/%s", macrt,
                          mt_scheduler ? "zanrt_io_mt.o" : "zanrt_io.o");
@@ -2163,8 +2233,13 @@ int main(int argc, char **argv) {
                 snprintf(macrt_sync, sizeof(macrt_sync), "%s/zanrt_sync.o",
                          macrt);
             }
+            if (rt_embed_obj) {
+                snprintf(macrt_embed, sizeof(macrt_embed),
+                         "%s/zan_embed_api.o", macrt);
+            }
             if ((macrt_io[0] && !zan_file_exists(macrt_io))
-                || (macrt_sync[0] && !zan_file_exists(macrt_sync))) {
+                || (macrt_sync[0] && !zan_file_exists(macrt_sync))
+                || (macrt_embed[0] && !zan_file_exists(macrt_embed))) {
                 fprintf(stderr,
                         "error: bundled macOS runtime objects not found in "
                         "'%s'; reinstall zan or rebuild with toolchain/macos "
@@ -2188,6 +2263,10 @@ int main(int argc, char **argv) {
             if (macrt_sync[0]) {
                 size_t cur = strlen(cmd);
                 snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"", macrt_sync);
+            }
+            if (macrt_embed[0]) {
+                size_t cur = strlen(cmd);
+                snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"", macrt_embed);
             }
             for (int ei = 0; ei < extra_link_input_count; ei++) {
                 size_t cur = strlen(cmd);
@@ -2278,6 +2357,7 @@ int main(int argc, char **argv) {
             argv[a++] = obj_tmp;
             if (rt_io_obj) argv[a++] = rt_io_obj;
             if (rt_sync_obj) argv[a++] = rt_sync_obj;
+            if (rt_embed_obj) argv[a++] = rt_embed_obj;
             /* caller-supplied objects/resources (--link-input) */
             for (int ei = 0; ei < extra_link_input_count && a < 130; ei++)
                 argv[a++] = extra_link_inputs[ei];
@@ -2326,6 +2406,10 @@ int main(int argc, char **argv) {
             if (rt_sync_obj) {
                 size_t cur = strlen(link_cmd);
                 snprintf(link_cmd + cur, sizeof(link_cmd) - cur, " \"%s\"", rt_sync_obj);
+            }
+            if (rt_embed_obj) {
+                size_t cur = strlen(link_cmd);
+                snprintf(link_cmd + cur, sizeof(link_cmd) - cur, " \"%s\"", rt_embed_obj);
             }
             for (int di = 0; di < zan_lib_ndirs; di++) {
                 size_t cur = strlen(link_cmd);

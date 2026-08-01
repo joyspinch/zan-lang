@@ -9,6 +9,7 @@
  *   - Better doc-comment extraction
  */
 #include "intellisense.h"
+#include "../common/json.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -88,6 +89,30 @@ static const stdlib_class_t stdlib_classes[] = {
               "Sin", "Cos", "Tan", "Log", "Exp", "PI", "E", NULL}},
     {"Environment", {"ArgCount", "ArgAt", "Exit", "GetEnvironmentVariable", NULL}},
     {"String", {"IsNullOrEmpty", "Format", "Join", "Split", "Concat", NULL}},
+    /* ---- Gui widget API (from stdlib/Gui; Control's fluent event/style
+     * setters are inherited by every widget) ---- */
+    {"Control", {"OnClick", "OnChange", "OnFocus", "OnBlur", "OnKeyDown",
+                 "OnMouseDown", "OnMouseUp", "OnEnter", "OnLeave", "OnWheel",
+                 "IsDisabled", "Bg", "Gradient", "Radius", "Border", "Shadow",
+                 "TextColor", "FontPx", "Transition", NULL}},
+    {"Input", {"GetText", "SetText", "HasSel", "SelText", "OnChange", "OnFocus",
+               "OnBlur", "OnKeyDown", "OnEnter", "OnLeave", "IsDisabled", "Bg",
+               "Radius", "Border", "TextColor", "FontPx", NULL}},
+    {"TextArea", {"GetText", "SetText", "OnChange", "OnFocus", "OnBlur",
+                  "IsDisabled", "Bg", "TextColor", NULL}},
+    {"Button", {"Label", "IsChecked", "IsToggle", "WasClicked", "TipText",
+                "OnClick", "OnDoubleClick", "OnRightClick", "IsDisabled", "Bg",
+                "Radius", "TextColor", "FontPx", NULL}},
+    {"Checkbox", {"IsChecked", "SetChecked", "OnChange", "OnClick", "OnFocus",
+                  "IsDisabled", "Bg", NULL}},
+    {"Switch", {"IsOn", "SetOn", "OnChange", "OnClick", "IsDisabled", "Bg",
+                NULL}},
+    {"SelectBox", {"Value", "SetOptionsText", "OptionsText", "AddOption",
+                   "Choose", "Selected", "HasValue", "Clear", "IsOpen",
+                   "SetOpen", "Text", "OnChange", "OnClick", "IsDisabled",
+                   "Bg", NULL}},
+    {"Radio", {"IsSelected", "OnChange", "OnClick", "IsDisabled", "Bg", NULL}},
+    {"Form", {"Ctl", "Get", "Handle", "On", "Call", "GetApp", NULL}},
     {NULL, {NULL}}
 };
 
@@ -240,7 +265,176 @@ void intel_register_snippets(intellisense_t *is) {
     }
 }
 
-/* Simple lexical scanner to extract symbols from Zan source */
+/* ---- .zform design-document indexing ----
+ *
+ * A .zform file is the visual designer's JSON description of a form (see
+ * stdlib/Gui/Designer and src/ide_zan/ZanIDE.CodeNav.zan GenFormFile for the
+ * format). At compile time formgen.c projects it onto a synthetic
+ * `partial class <Name>` with a static widget field per entry and event
+ * bindings wired by handler name. The index mirrors that projection so the
+ * business file's autocomplete, go-to-def and hover see the typed fields and
+ * event handlers without the compiler having to run:
+ *
+ *   - the form name becomes a class symbol whose base type is Form,
+ *   - each field (recursing into container kids) becomes a static field whose
+ *     type is the mapped widget class (same table as formgen's fg_widget_type),
+ *   - each on*Event handler name and the top-level "submit" name become method
+ *     symbols on the class.
+ */
+
+/* Concrete Gui widget type for a field type (must match
+ * src/compiler/formgen.c fg_widget_type). */
+static const char *intel_zform_widget(int ft) {
+    if (ft == 0 || ft == 2 || ft == 3) return "Input";
+    if (ft == 1 || ft == 14) return "TextArea";
+    if (ft == 4) return "Radio";
+    if (ft == 5) return "Checkbox";
+    if (ft == 6 || ft == 48) return "SelectBox";
+    if (ft == 7) return "Switch";
+    if (ft == 8) return "Rate";
+    if (ft == 9) return "Slider";
+    if (ft == 29) return "Progress";
+    if (ft == 49) return "Button";
+    if (ft == 18 || ft == 45 || ft == 36) return "Panel";
+    return "Label";
+}
+
+/* Recursively index one .zform field object: its typed field symbol plus the
+ * handlers named by its on*Event keys, then its container kids. */
+static void intel_zform_field(intellisense_t *is, const char *filepath,
+                              const char *class_name, json_value *field,
+                              int line, int col,
+                              const char *const *name_lines,
+                              const char *const *name_vals, int name_count) {
+    if (!field || field->type != JSON_OBJ) return;
+
+    const char *fname = json_get_str(json_obj_get(field, "name"));
+    if (fname && fname[0] && isalpha((unsigned char)fname[0])) {
+        json_value *tv = json_obj_get(field, "type");
+        int ft = (tv && tv->type == JSON_NUM) ? (int)tv->as.num : 0;
+        /* locate the "name" key's JSON line so go-to-def lands on the field */
+        int fline = line;
+        for (int k = 0; k < name_count; k++) {
+            if (name_vals[k] && strcmp(name_vals[k], fname) == 0) {
+                fline = atoi(name_lines[k]);
+                break;
+            }
+        }
+        add_symbol(is, fname, intel_zform_widget(ft), class_name, NULL,
+                   filepath, ISYM_FIELD, fline, col);
+    }
+
+    /* event handler names: every key starting with "on" whose value is a
+     * non-empty string names a handler the business file may implement. */
+    for (int i = 0; i < field->as.obj.count; i++) {
+        const char *key = field->as.obj.keys[i];
+        if (!key || key[0] != 'o' || key[1] != 'n') continue;
+        const char *h = json_get_str(field->as.obj.vals[i]);
+        if (h && h[0])
+            add_symbol(is, h, "void", class_name, "void handler()",
+                       filepath, ISYM_METHOD, line, col);
+    }
+
+    json_value *kids = json_obj_get(field, "kids");
+    if (kids && kids->type == JSON_ARR) {
+        for (int i = 0; i < kids->as.arr.count; i++)
+            intel_zform_field(is, filepath, class_name,
+                              kids->as.arr.items[i], line, col,
+                              name_lines, name_vals, name_count);
+    }
+}
+
+/* Scan the raw .zform text for `"name": "xxx"` key/value pairs and record the
+ * 0-based line of each so field symbols can point at their JSON definition. */
+static int intel_zform_name_lines(const char *text, size_t len,
+                                  const char *lines[64], const char *vals[64],
+                                  int max) {
+    int n = 0, line = 0;
+    const char *p = text, *end = text + len;
+    while (p < end && n < max) {
+        const char *nl = memchr(p, '\n', (size_t)(end - p));
+        const char *el = nl ? nl : end;
+        const char *q = p;
+        while (q + 6 < el &&
+               !(q[0] == '"' && q[1] == 'n' && q[2] == 'a' && q[3] == 'm' &&
+                 q[4] == 'e' && q[5] == '"')) {
+            q++;
+        }
+        if (q + 6 < el) {
+            const char *v = q + 6;
+            while (v < el && (*v == ' ' || *v == '\t' || *v == ':')) v++;
+            if (v < el && *v == '"') {
+                v++;
+                const char *vs = v;
+                while (v < el && *v != '"') v++;
+                char val[128];
+                size_t vl = (size_t)(v - vs);
+                if (vl < sizeof(val)) {
+                    memcpy(val, vs, vl);
+                    val[vl] = '\0';
+                    char *ln = (char *)malloc(16);
+                    if (ln) {
+                        snprintf(ln, 16, "%d", line);
+                        lines[n] = ln;
+                        vals[n] = _strdup(val);
+                        n++;
+                    }
+                }
+            }
+        }
+        if (!nl) break;
+        p = nl + 1;
+        line++;
+    }
+    return n;
+}
+
+static void intel_parse_zform(intellisense_t *is, const char *filepath,
+                              const char *content, size_t len) {
+    char *text = (char *)malloc(len + 1);
+    if (!text) return;
+    memcpy(text, content, len);
+    text[len] = '\0';
+
+    json_value *root = json_parse(text);
+    free(text);
+    if (!root || root->type != JSON_OBJ) { json_free(root); return; }
+
+    const char *class_name = json_get_str(json_obj_get(root, "name"));
+    if (!class_name || !class_name[0]) { json_free(root); return; }
+
+    /* the form class, base type Form (member completion walks inheritance) */
+    add_symbol_ex(is, class_name, "Form", NULL, NULL, filepath, NULL,
+                  ISYM_CLASS, 0, 0, false, 0);
+
+    /* top-level "submit" names the default button handler */
+    const char *submit = json_get_str(json_obj_get(root, "submit"));
+    if (submit && submit[0])
+        add_symbol(is, submit, "void", class_name, "void handler()",
+                   filepath, ISYM_METHOD, 0, 0);
+
+    /* field name -> JSON line map for go-to-def */
+    const char *name_lines[64], *name_vals[64];
+    int name_count = intel_zform_name_lines(content, len, name_lines,
+                                            name_vals, 64);
+
+    json_value *fields = json_obj_get(root, "fields");
+    if (fields && fields->type == JSON_ARR) {
+        for (int i = 0; i < fields->as.arr.count; i++)
+            intel_zform_field(is, filepath, class_name,
+                              fields->as.arr.items[i], 0, 0,
+                              name_lines, name_vals, name_count);
+    }
+
+    for (int k = 0; k < name_count; k++) {
+        free((void *)name_lines[k]);
+        free((void *)name_vals[k]);
+    }
+    json_free(root);
+}
+
+/* Simple lexical scanner to extract symbols from Zan source. .zform files
+ * (design documents) are indexed through their JSON projection instead. */
 void intel_parse_file(intellisense_t *is, const char *filepath,
                       const char *content, size_t len) {
     /* clear previous symbols from this file */
@@ -263,6 +457,16 @@ void intel_parse_file(intellisense_t *is, const char *filepath,
     }
 
     if (!content || len == 0) return;
+
+    /* .zform design documents are JSON, not Zan source: index their
+     * compile-time projection (class + typed fields + event handlers). */
+    {
+        size_t fl = strlen(filepath);
+        if (fl > 6 && strcmp(filepath + fl - 6, ".zform") == 0) {
+            intel_parse_zform(is, filepath, content, len);
+            return;
+        }
+    }
 
     char current_class[128] = {0};
     char current_ns[128] = {0};
@@ -1541,9 +1745,13 @@ static void index_directory_recursive(intellisense_t *is, const char *dir_path) 
                 index_directory_recursive(is, full_path);
             }
         } else {
-            /* check if it's a .zan file */
+            /* check if it's a .zan or .zform file */
             size_t name_len = strlen(fd.cFileName);
-            if (name_len > 4 && strcmp(fd.cFileName + name_len - 4, ".zan") == 0) {
+            bool is_zan = name_len > 4 &&
+                          strcmp(fd.cFileName + name_len - 4, ".zan") == 0;
+            bool is_zform = name_len > 6 &&
+                            strcmp(fd.cFileName + name_len - 6, ".zform") == 0;
+            if (is_zan || is_zform) {
                 /* read file and parse it */
                 HANDLE hFile = CreateFileA(full_path, GENERIC_READ, FILE_SHARE_READ,
                                           NULL, OPEN_EXISTING, 0, NULL);
@@ -1596,7 +1804,11 @@ static void index_directory_recursive(intellisense_t *is, const char *dir_path) 
             }
         } else if (S_ISREG(st.st_mode)) {
             size_t name_len = strlen(entry->d_name);
-            if (name_len > 4 && strcmp(entry->d_name + name_len - 4, ".zan") == 0) {
+            bool is_zan = name_len > 4 &&
+                          strcmp(entry->d_name + name_len - 4, ".zan") == 0;
+            bool is_zform = name_len > 6 &&
+                            strcmp(entry->d_name + name_len - 6, ".zform") == 0;
+            if (is_zan || is_zform) {
                 FILE *f = fopen(full_path, "rb");
                 if (f) {
                     fseek(f, 0, SEEK_END);
