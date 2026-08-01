@@ -10,6 +10,11 @@ if(NOT ZANDOC OR NOT SRC OR NOT EXPECTED_MD OR NOT EXPECTED_HTML OR NOT OUTFILE)
   message(FATAL_ERROR "run_zandoc.cmake: ZANDOC, SRC, EXPECTED_MD, EXPECTED_HTML and OUTFILE are required")
 endif()
 
+if(NOT EXISTS "${ZANDOC}")
+  message(FATAL_ERROR "zandoc binary not found at '${ZANDOC}'.
+Run 'cmake --build <build-dir>' first so the ALL targets (zanfmt, zandoc) are built.")
+endif()
+
 function(zandoc_check mode expected_file)
   execute_process(COMMAND ${ZANDOC} ${SRC} ${mode}
     RESULT_VARIABLE rc OUTPUT_VARIABLE actual ENCODING UTF-8)

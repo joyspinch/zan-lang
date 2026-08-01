@@ -11,6 +11,11 @@ if(NOT ZANFMT OR NOT SRC OR NOT EXPECTED OR NOT WORKFILE)
   message(FATAL_ERROR "run_zanfmt.cmake: ZANFMT, SRC, EXPECTED and WORKFILE are required")
 endif()
 
+if(NOT EXISTS "${ZANFMT}")
+  message(FATAL_ERROR "zanfmt binary not found at '${ZANFMT}'.
+Run 'cmake --build <build-dir>' first so the ALL targets (zanfmt, zandoc) are built.")
+endif()
+
 file(READ ${EXPECTED} expected)
 string(REPLACE "\r\n" "\n" expected "${expected}")
 
