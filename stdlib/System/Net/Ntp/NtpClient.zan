@@ -1,0 +1,52 @@
+using System;
+using System.Net.Sockets;
+using System.Threading;
+
+namespace System.Net.Ntp;
+
+/// <summary>
+/// SNTP client (RFC 4330) -- fetches wall-clock time over UDP port 123, the
+/// usual way a device without a battery-backed RTC learns the date.
+///
+/// Usage:
+///   long unix = await NtpClient.QueryAsync("pool.ntp.org", 123, 3000);
+///   if (unix > 0) { /* seconds since 1970-01-01 UTC */ }
+/// </summary>
+class NtpClient {
+    // Seconds between the NTP epoch (1900) and the Unix epoch (1970).
+    static long EPOCH_DELTA = 2208988800;
+
+    /// <summary>Sends one SNTP request and returns Unix seconds (UTC), or -1
+    /// on timeout / malformed reply. <paramref name="timeoutMs"/> bounds the
+    /// wait for the reply datagram.</summary>
+    static async long QueryAsync(string host, int port, int timeoutMs) {
+        UdpClient udp = UdpClient.Create();
+        byte[] pkt = new byte[48];
+        pkt[0] = (byte)((0 << 6) + (4 << 3) + 3);   // LI=0, VN=4, mode=3 (client)
+        string wire = pkt.ToStr(0, 48);
+        int _s = await udp.SendBytesToAsync(wire, 48, host, port);
+
+        long start = Stopwatch.GetMilliseconds();
+        byte[] d = new byte[64];
+        int n = 0;
+        while (n == 0
+               && Stopwatch.GetMilliseconds() - start < timeoutMs) {
+            if (Socket.IsReadable(udp.GetSocket())) {
+                n = udp.RecvBytesFrom(d, 64);
+            } else {
+                await Task.Delay(20);
+            }
+        }
+        udp.Close();
+        if (n < 44) { return -1; }
+        // Transmit timestamp: 32-bit seconds at offset 40.
+        long secs = 0;
+        int i = 40;
+        while (i < 44) {
+            secs = (secs << 8) + (d[i] & 255);
+            i = i + 1;
+        }
+        if (secs == 0) { return -1; }
+        return secs - NtpClient.EPOCH_DELTA;
+    }
+}

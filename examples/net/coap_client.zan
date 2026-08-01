@@ -1,0 +1,78 @@
+// ============================================================================
+// CoAP 客户端 —— 受限设备的请求/应答协议（RFC 7252，UDP 5683）
+// ----------------------------------------------------------------------------
+// 演示内容：
+//   1. CoapClient.Create + GetAsync/PutAsync：像 HTTP 一样按路径读写资源
+//   2. CON 可靠传输：内置按 RFC 的重传（2s 起倍增，默认 4 次），对端死了
+//      也能干净超时（r.code == 0）而不是永远挂起
+//   3. 响应码 2.05/4.04 等的判读（r.ok / r.CodeText()）
+//   4. 本例在同进程里用 UdpClient 起一个最小 CoAP 服务端，无需外部服务；
+//      真实设备场景把地址换成设备/网关即可，公网可用 coap.me 验证
+//
+// 运行：zanc examples/net/coap_client.zan --auto-stdlib -o coap.exe && ./coap.exe
+// ============================================================================
+using System;
+using System.Net.Coap;
+using System.Net.Sockets;
+
+class Program {
+    static int PORT = 56683;
+    static bool serverUp = false;
+
+    // ---- 最小 CoAP 服务端 ---------------------------------------------------
+    // 对每个请求回一个携带 2.05 Content 的 ACK：版本/类型/消息号/令牌按规范
+    // 回填（客户端靠 message id 匹配应答），负载放在 0xFF 标记之后。
+    // 只服务固定次数后退出：调度器会等所有协程结束，永久阻塞在 recv 上的
+    // 服务协程会让进程无法退出。
+    static async void Server() {
+        UdpClient udp = UdpClient.Bind("127.0.0.1", PORT);
+        serverUp = true;
+        int handled = 0;
+        while (handled < 2) {
+            handled = handled + 1;
+            string req = await Socket.RecvFromPeerAsync(udp.GetSocket(), 2048);
+            // 字符串长度按 strlen 计（首个 NUL 截断），但底层字节仍在缓冲里；
+            // 这里只需要头 6 字节：mid 与 2 字节 token 一定在 NUL 前出现之前
+            // 也可能包含 NUL，所以服务端用固定偏移直接取。
+            int mid1 = req[2] & 255;
+            int mid2 = req[3] & 255;
+            int tok1 = req[4] & 255;
+            int tok2 = req[5] & 255;
+            string payload = "21.5C";
+            byte[] resp = new byte[16 + payload.Length];
+            int o = 0;
+            resp[o] = (byte)((1 << 6) + (2 << 4) + 2);   // ver=1, type=ACK, tkl=2
+            o = o + 1;
+            resp[o] = 69;                                // 2.05 Content
+            o = o + 1;
+            resp[o] = (byte)(mid1); o = o + 1;
+            resp[o] = (byte)(mid2); o = o + 1;
+            resp[o] = (byte)(tok1); o = o + 1;
+            resp[o] = (byte)(tok2); o = o + 1;
+            resp[o] = 255; o = o + 1;                    // payload 标记
+            int i = 0;
+            while (i < payload.Length) {
+                resp[o] = (byte)(payload[i]);
+                o = o + 1;
+                i = i + 1;
+            }
+            string wire = resp.ToStr(0, o);
+            int _s = udp.SendBytesTo(wire, o, Socket.PeerIp(), Socket.PeerPort());
+        }
+        udp.Close();
+    }
+
+    static async int Main() {
+        Task.Spawn(Program.Server());
+        while (!serverUp) { await Task.Delay(10); }
+
+        CoapClient c = CoapClient.Create("127.0.0.1", PORT).SetTimeout(1000, 2);
+
+        CoapResponse r = await c.GetAsync("sensors/temp");
+        Console.WriteLine("GET sensors/temp -> " + r.CodeText() + " " + r.payload);
+
+        CoapResponse w = await c.PutAsync("actuators/led", "on");
+        Console.WriteLine("PUT actuators/led -> " + w.CodeText());
+        return 0;
+    }
+}

@@ -1,0 +1,123 @@
+// ============================================================================
+// Modbus TCP 主站 —— 工业物联网最常见的 PLC/仪表寄存器协议（端口 502）
+// ----------------------------------------------------------------------------
+// 演示内容：
+//   1. ModbusClient.ConnectAsync：连接从站（unit id 对多数 TCP 设备是 1）
+//   2. ReadHoldingAsync / WriteRegisterAsync / WriteRegistersAsync：
+//      读写 16 位保持寄存器（地址从 0 起：文档里的 40001 即地址 0）
+//   3. LastError()：区分异常应答（如非法地址）与链路断开
+//   4. 本例在同进程里用 TcpListener 起一个 16 寄存器的最小从站，无需外部
+//      设备；接真实 PLC 时换成它的 IP 即可
+//
+// 运行：zanc examples/net/modbus_master.zan --auto-stdlib -o modbus.exe && ./modbus.exe
+// ============================================================================
+using System;
+using System.Net.Modbus;
+using System.Net.Sockets;
+
+class Program {
+    static int PORT = 55502;
+    static bool serverUp = false;
+    static bool done = false;
+    static List<int> regs = new List<int>();
+
+    // 精确读 need 字节（TCP 是字节流，一次 Recv 不保证收满一个报文）。
+    static async byte[] ReadExact(nint sock, int need) {
+        byte[] buf = new byte[need + 1];
+        byte[] tmp = new byte[need + 1];
+        int got = 0;
+        while (got < need) {
+            await Socket.ReadReady(sock);
+            int n = Socket.Recv(sock, tmp, need - got);
+            if (n <= 0) { return buf; }
+            int i = 0;
+            while (i < n) {
+                buf[got] = (byte)(tmp[i]);
+                got = got + 1;
+                i = i + 1;
+            }
+        }
+        return buf;
+    }
+
+    // ---- 最小 Modbus TCP 从站：支持功能码 3（读保持）与 6/16（写） ----------
+    static async void Slave() {
+        TcpListener srv = TcpListener.CreateAndStart("127.0.0.1", PORT, 8);
+        serverUp = true;
+        nint cli = await srv.AcceptAsync();
+        while (!done) {
+            byte[] mbap = await ReadExact(cli, 7);
+            int len = ((mbap[4] & 255) << 8) + (mbap[5] & 255);
+            if (len < 2) { break; }
+            byte[] pdu = await ReadExact(cli, len - 1);
+            int fc = pdu[0] & 255;
+            int addr = ((pdu[1] & 255) << 8) + (pdu[2] & 255);
+            byte[] resp = new byte[7 + 256];
+            resp[0] = (byte)(mbap[0]); resp[1] = (byte)(mbap[1]);   // tid 回显
+            resp[6] = (byte)(mbap[6]);                              // unit 回显
+            int plen = 0;
+            if (fc == 3) {
+                int count = ((pdu[3] & 255) << 8) + (pdu[4] & 255);
+                resp[7] = 3;
+                resp[8] = (byte)(count * 2);
+                int k = 0;
+                while (k < count) {
+                    int v = regs[addr + k];
+                    resp[9 + k * 2] = (byte)((v >> 8) & 255);
+                    resp[10 + k * 2] = (byte)(v & 255);
+                    k = k + 1;
+                }
+                plen = 2 + count * 2;
+            } else if (fc == 6) {
+                regs[addr] = ((pdu[3] & 255) << 8) + (pdu[4] & 255);
+                int j = 0;
+                while (j < 5) { resp[7 + j] = (byte)(pdu[j]); j = j + 1; }
+                plen = 5;
+            } else if (fc == 16) {
+                int count = ((pdu[3] & 255) << 8) + (pdu[4] & 255);
+                int k2 = 0;
+                while (k2 < count) {
+                    regs[addr + k2] = ((pdu[6 + k2 * 2] & 255) << 8)
+                        + (pdu[7 + k2 * 2] & 255);
+                    k2 = k2 + 1;
+                }
+                int j2 = 0;
+                while (j2 < 5) { resp[7 + j2] = (byte)(pdu[j2]); j2 = j2 + 1; }
+                plen = 5;
+            } else {
+                resp[7] = (byte)(fc + 128);   // 异常应答
+                resp[8] = 1;                  // illegal function
+                plen = 2;
+            }
+            resp[4] = (byte)(((plen + 1) >> 8) & 255);
+            resp[5] = (byte)((plen + 1) & 255);
+            string wire = resp.ToStr(0, 7 + plen);
+            int _s = await Socket.SendAsync(cli, wire, 7 + plen);
+        }
+        Socket.Close(cli);
+        srv.Stop();
+    }
+
+    static async int Main() {
+        int i = 0;
+        while (i < 16) { regs.Add(100 + i); i = i + 1; }
+        Task.Spawn(Program.Slave());
+        while (!serverUp) { await Task.Delay(10); }
+
+        ModbusClient m = await ModbusClient.ConnectAsync("127.0.0.1", PORT, 1);
+
+        List<int> vals = await m.ReadHoldingAsync(0, 4);
+        Console.WriteLine("读保持寄存器 0..3: " + Convert.ToString(vals[0]) + " "
+            + Convert.ToString(vals[1]) + " " + Convert.ToString(vals[2]) + " "
+            + Convert.ToString(vals[3]));
+
+        int ok = await m.WriteRegisterAsync(2, 1234);
+        List<int> after = await m.ReadHoldingAsync(2, 1);
+        Console.WriteLine("写寄存器 2=1234 -> ok=" + Convert.ToString(ok)
+            + " 回读=" + Convert.ToString(after[0]));
+
+        done = true;
+        m.Close();
+        return 0;
+    }
+}

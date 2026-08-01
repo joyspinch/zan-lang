@@ -1,0 +1,264 @@
+using System;
+using System.Net.Sockets;
+using System.Threading;
+
+namespace System.Net.Coap;
+
+/// CoAP method / response codes (RFC 7252 section 12.1).
+class CoapCode {
+    static int GET    = 1;   // 0.01
+    static int POST   = 2;   // 0.02
+    static int PUT    = 3;   // 0.03
+    static int DELETE = 4;   // 0.04
+}
+
+/// <summary>A parsed CoAP response: <c>code</c> is the class.detail byte
+/// (e.g. 69 = 2.05 Content, 132 = 4.04 Not Found), <c>payload</c> the bytes
+/// after the 0xFF marker ("" when none), and <c>ok</c> true for a 2.xx
+/// class. <c>CodeText</c> renders the dotted form for logs.</summary>
+class CoapResponse {
+    int code;
+    string payload;
+    bool ok;
+
+    static CoapResponse Create(int code, string payload) {
+        CoapResponse r = new CoapResponse();
+        r.code = code;
+        r.payload = payload;
+        r.ok = (code >> 5) == 2;
+        return r;
+    }
+
+    /// <summary>"2.05"-style dotted rendering of the response code.</summary>
+    string CodeText() {
+        return Convert.ToString(this.code >> 5) + "."
+            + CoapResponse.Two(this.code & 31);
+    }
+
+    static string Two(int v) {
+        if (v < 10) { return "0" + Convert.ToString(v); }
+        return Convert.ToString(v);
+    }
+}
+
+/// <summary>
+/// CoAP client (RFC 7252) over UDP -- the standard request/response protocol
+/// for constrained IoT devices, default port 5683.
+///
+/// Requests are confirmable (CON) with the spec's retransmission schedule
+/// (2s initial timeout doubling per retry, 4 retransmits), so a lost datagram
+/// is retried and a dead endpoint fails cleanly instead of hanging. Responses
+/// are matched on message id (ACK piggyback) or token (separate reply).
+///
+/// Usage:
+///   CoapClient c = CoapClient.Create("192.168.1.50", 5683);
+///   CoapResponse r = await c.GetAsync("sensors/temp");
+///   if (r.ok) { Console.WriteLine(r.payload); }
+///   CoapResponse w = await c.PutAsync("actuators/led", "on");
+/// </summary>
+class CoapClient {
+    string host;
+    int port;
+    int nextMsgId;
+    // RFC 7252 defaults; SetTimeout scales the initial ACK window.
+    int ackTimeoutMs;
+    int maxRetransmit;
+
+    CoapClient() {
+        this.host = "";
+        this.port = 5683;
+        this.nextMsgId = 1;
+        this.ackTimeoutMs = 2000;
+        this.maxRetransmit = 4;
+    }
+
+    /// <summary>Creates a client for one CoAP endpoint.</summary>
+    static CoapClient Create(string host, int port) {
+        CoapClient c = new CoapClient();
+        c.host = host;
+        c.port = port;
+        return c;
+    }
+
+    /// <summary>Sets the initial ACK timeout (doubled per retransmit) and the
+    /// retransmit count. The worst-case wait is timeoutMs * (2^retries - 1).</summary>
+    CoapClient SetTimeout(int timeoutMs, int retries) {
+        if (timeoutMs > 0) { this.ackTimeoutMs = timeoutMs; }
+        if (retries >= 0) { this.maxRetransmit = retries; }
+        return this;
+    }
+
+    /// <summary>GET a resource path like "sensors/temp".</summary>
+    async CoapResponse GetAsync(string path) {
+        CoapResponse r = await RequestAsync(CoapCode.GET, path, "");
+        return r;
+    }
+
+    /// <summary>POST a payload to a resource path.</summary>
+    async CoapResponse PostAsync(string path, string payload) {
+        CoapResponse r = await RequestAsync(CoapCode.POST, path, payload);
+        return r;
+    }
+
+    /// <summary>PUT a payload to a resource path.</summary>
+    async CoapResponse PutAsync(string path, string payload) {
+        CoapResponse r = await RequestAsync(CoapCode.PUT, path, payload);
+        return r;
+    }
+
+    /// <summary>DELETE a resource path.</summary>
+    async CoapResponse DeleteAsync(string path) {
+        CoapResponse r = await RequestAsync(CoapCode.DELETE, path, "");
+        return r;
+    }
+
+    // Builds one CON request datagram: 4-byte header, 2-byte token, Uri-Path
+    // options (one per '/'-separated segment), then 0xFF + payload.
+    byte[] BuildRequest(int code, string path, string payload, int msgId,
+                        int tok, List<int> outLen) {
+        byte[] p = new byte[4 + 2 + 4 + path.Length + 2 * 8 + 1 + payload.Length + 8];
+        int o = 0;
+        p[o] = (byte)((1 << 6) + (0 << 4) + 2);   // ver=1, type=CON, tkl=2
+        o = o + 1;
+        p[o] = (byte)(code);
+        o = o + 1;
+        p[o] = (byte)((msgId >> 8) & 255);
+        o = o + 1;
+        p[o] = (byte)(msgId & 255);
+        o = o + 1;
+        p[o] = (byte)((tok >> 8) & 255);
+        o = o + 1;
+        p[o] = (byte)(tok & 255);
+        o = o + 1;
+
+        // Uri-Path (option 11), repeated per segment; deltas are 11 then 0.
+        int prevOpt = 0;
+        int i = 0;
+        int segStart = 0;
+        while (i <= path.Length) {
+            bool atEnd = i == path.Length;
+            bool atSep = false;
+            if (!atEnd) { atSep = (path[i] & 255) == 47; }
+            if (atEnd || atSep) {
+                int segLen = i - segStart;
+                if (segLen > 0) {
+                    int delta = 11 - prevOpt;
+                    prevOpt = 11;
+                    if (segLen < 13) {
+                        p[o] = (byte)((delta << 4) + segLen);
+                        o = o + 1;
+                    } else {
+                        p[o] = (byte)((delta << 4) + 13);
+                        o = o + 1;
+                        p[o] = (byte)(segLen - 13);
+                        o = o + 1;
+                    }
+                    int k = segStart;
+                    while (k < i) {
+                        p[o] = (byte)(path[k]);
+                        o = o + 1;
+                        k = k + 1;
+                    }
+                }
+                segStart = i + 1;
+            }
+            i = i + 1;
+        }
+
+        if (payload.Length > 0) {
+            p[o] = 255;
+            o = o + 1;
+            int k2 = 0;
+            while (k2 < payload.Length) {
+                p[o] = (byte)(payload[k2]);
+                o = o + 1;
+                k2 = k2 + 1;
+            }
+        }
+        outLen.Add(o);
+        return p;
+    }
+
+    // Parses a response datagram (n valid bytes in d); null when it is not
+    // addressed to us (message id and token both mismatch) or is a bare
+    // empty ACK.
+    static CoapResponse ParseResponse(byte[] d, int n, int msgId, int tok) {
+        if (n < 4) { return null; }
+        int tkl = d[0] & 15;
+        int code = d[1] & 255;
+        int mid = ((d[2] & 255) << 8) + (d[3] & 255);
+        int o = 4;
+        int rtok = 0;
+        int t = 0;
+        while (t < tkl && o < n) {
+            rtok = (rtok << 8) + (d[o] & 255);
+            o = o + 1;
+            t = t + 1;
+        }
+        bool ours = mid == msgId || (tkl == 2 && rtok == tok);
+        if (!ours) { return null; }
+        if (code == 0) { return null; }   // empty ACK: real reply comes later
+
+        // Skip options up to the payload marker.
+        while (o < n && (d[o] & 255) != 255) {
+            int b = d[o] & 255;
+            o = o + 1;
+            int delta = (b >> 4) & 15;
+            int len = b & 15;
+            if (delta == 13) { o = o + 1; }
+            else if (delta == 14) { o = o + 2; }
+            if (len == 13) {
+                if (o < n) { len = 13 + (d[o] & 255); }
+                o = o + 1;
+            } else if (len == 14) {
+                if (o + 1 < n) {
+                    len = 269 + ((d[o] & 255) << 8) + (d[o + 1] & 255);
+                }
+                o = o + 2;
+            }
+            o = o + len;
+        }
+        string payload = "";
+        if (o < n && (d[o] & 255) == 255 && o + 1 < n) {
+            payload = d.ToStr(o + 1, n - o - 1);
+        }
+        return CoapResponse.Create(code, payload);
+    }
+
+    /// <summary>Sends one confirmable request and awaits the matching
+    /// response, retransmitting per RFC 7252. Returns a response with code 0
+    /// (ok=false) when every retry timed out.</summary>
+    async CoapResponse RequestAsync(int code, string path, string payload) {
+        UdpClient udp = UdpClient.Create();
+        int msgId = this.nextMsgId & 65535;
+        this.nextMsgId = this.nextMsgId + 1;
+        int tok = (msgId * 31 + 7) & 65535;
+        List<int> lenBox = new List<int>();
+        byte[] pkt = BuildRequest(code, path, payload, msgId, tok, lenBox);
+        int pktLen = lenBox[0];
+        string wire = pkt.ToStr(0, pktLen);
+
+        int attempt = 0;
+        int window = this.ackTimeoutMs;
+        CoapResponse result = null;
+        while (result == null && attempt <= this.maxRetransmit) {
+            int _s = await udp.SendBytesToAsync(wire, pktLen, this.host, this.port);
+            long start = Stopwatch.GetMilliseconds();
+            while (result == null
+                   && Stopwatch.GetMilliseconds() - start < window) {
+                if (Socket.IsReadable(udp.GetSocket())) {
+                    byte[] rb = new byte[2048];
+                    int rn = udp.RecvBytesFrom(rb, 2048);
+                    result = CoapClient.ParseResponse(rb, rn, msgId, tok);
+                } else {
+                    await Task.Delay(20);
+                }
+            }
+            attempt = attempt + 1;
+            window = window * 2;
+        }
+        udp.Close();
+        if (result == null) { result = CoapResponse.Create(0, ""); }
+        return result;
+    }
+}

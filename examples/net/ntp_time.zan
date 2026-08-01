@@ -1,0 +1,55 @@
+// ============================================================================
+// NTP 对时 —— 无 RTC 设备开机取墙钟时间的标准做法（SNTP，UDP 123）
+// ----------------------------------------------------------------------------
+// 演示内容：
+//   1. NtpClient.QueryAsync：一次请求拿到 Unix 秒（UTC），超时返回 -1
+//   2. 本例在同进程里起一个最小 SNTP 服务端回一个固定时间戳，无需外网；
+//      真实使用把地址换成 pool.ntp.org / ntp.aliyun.com 等公共池即可：
+//        long unix = await NtpClient.QueryAsync("pool.ntp.org", 123, 3000);
+//
+// 运行：zanc examples/net/ntp_time.zan --auto-stdlib -o ntp.exe && ./ntp.exe
+// ============================================================================
+using System;
+using System.Net.Ntp;
+using System.Net.Sockets;
+
+class Program {
+    static int PORT = 55123;
+    static bool serverUp = false;
+    // 2026-01-01 00:00:00 UTC 的 NTP 秒（Unix 1767225600 + 1900↔1970 差值）。
+    static long FAKE_NTP_SECS = 1767225600 + 2208988800;
+
+    // ---- 最小 SNTP 服务端：不看请求内容，回 48 字节、mode=4 的应答 ----------
+    // 只服务一次请求就退出：调度器会等所有协程结束，永久阻塞在
+    // recv 上的服务协程会让进程无法退出。
+    static async void Server() {
+        UdpClient udp = UdpClient.Bind("127.0.0.1", PORT);
+        serverUp = true;
+        int handled = 0;
+        while (handled < 1) {
+            string req = await Socket.RecvFromPeerAsync(udp.GetSocket(), 256);
+            handled = handled + 1;
+            byte[] resp = new byte[48];
+            resp[0] = (byte)((0 << 6) + (4 << 3) + 4);   // LI=0, VN=4, mode=4
+            resp[1] = 1;                                 // stratum 1
+            long s = FAKE_NTP_SECS;
+            resp[40] = (byte)((s >> 24) & 255);          // 传输时间戳（秒）
+            resp[41] = (byte)((s >> 16) & 255);
+            resp[42] = (byte)((s >> 8) & 255);
+            resp[43] = (byte)(s & 255);
+            string wire = resp.ToStr(0, 48);
+            int _s = udp.SendBytesTo(wire, 48, Socket.PeerIp(), Socket.PeerPort());
+        }
+        udp.Close();
+    }
+
+    static async int Main() {
+        Task.Spawn(Program.Server());
+        while (!serverUp) { await Task.Delay(10); }
+
+        long unix = await NtpClient.QueryAsync("127.0.0.1", PORT, 2000);
+        Console.WriteLine("Unix 秒: " + Convert.ToString(unix)
+            + "（应为 1767225600 = 2026-01-01 00:00:00 UTC）");
+        return 0;
+    }
+}

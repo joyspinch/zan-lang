@@ -1,0 +1,114 @@
+using System;
+using System.Net.Sockets;
+using System.Net.Sip;
+using System.Threading;
+
+namespace System.Net.Sip;
+
+/// <summary>
+/// SIP user-agent client over UDP (RFC 3261) -- the signaling side only.
+///
+/// Scope: non-INVITE client transactions (OPTIONS keep-alive/capability ping,
+/// REGISTER) with Timer E/F retransmission (500ms doubling to 4s, 32s total).
+/// Digest authentication, INVITE dialogs, and RTP media are NOT implemented;
+/// a 401/407 response is returned to the caller as-is so the application can
+/// decide what to do.
+///
+/// Usage:
+///   SipClient c = SipClient.Create("sip.example.com", 5060, "zan-ua");
+///   SipMessage r = await c.OptionsAsync();          // null on timeout
+///   if (r != null && r.status == 200) { ... }
+///   SipMessage reg = await c.RegisterAsync("alice", 3600);
+/// </summary>
+class SipClient {
+    string host;
+    int port;
+    string localTag;
+    int cseq;
+
+    SipClient() {
+        this.host = "";
+        this.port = 5060;
+        this.localTag = "zan";
+        this.cseq = 1;
+    }
+
+    /// <summary>Creates a client for one SIP server/proxy.</summary>
+    static SipClient Create(string host, int port, string tag) {
+        SipClient c = new SipClient();
+        c.host = host;
+        c.port = port;
+        if (tag.Length > 0) { c.localTag = tag; }
+        return c;
+    }
+
+    /// <summary>Sends OPTIONS and awaits the final response -- the standard
+    /// "is the server alive / what does it support" ping. Null on timeout.</summary>
+    async SipMessage OptionsAsync() {
+        string target = "sip:" + this.host;
+        SipMessage req = SipMessage.Request("OPTIONS", target);
+        AddCommon(req, target, "OPTIONS");
+        SipMessage r = await TransactAsync(req);
+        return r;
+    }
+
+    /// <summary>Sends REGISTER for <paramref name="user"/> with the given
+    /// expiry. The response is returned as-is: a 401/407 carries the
+    /// WWW-Authenticate challenge for the caller. Null on timeout.</summary>
+    async SipMessage RegisterAsync(string user, int expires) {
+        string target = "sip:" + this.host;
+        SipMessage req = SipMessage.Request("REGISTER", target);
+        AddCommon(req, "sip:" + user + "@" + this.host, "REGISTER");
+        req.Add("Contact", "<sip:" + user + "@" + this.host + ">");
+        req.Add("Expires", Convert.ToString(expires));
+        SipMessage r = await TransactAsync(req);
+        return r;
+    }
+
+    // Mandatory headers shared by every request (RFC 3261 section 8.1.1).
+    void AddCommon(SipMessage req, string aor, string method) {
+        int seq = this.cseq;
+        this.cseq = this.cseq + 1;
+        string branch = "z9hG4bK" + this.localTag + Convert.ToString(seq)
+            + Convert.ToString(Stopwatch.GetMilliseconds() & 65535);
+        req.Add("Via", "SIP/2.0/UDP 0.0.0.0:5060;branch=" + branch);
+        req.Add("Max-Forwards", "70");
+        req.Add("From", "<" + aor + ">;tag=" + this.localTag);
+        req.Add("To", "<" + aor + ">");
+        req.Add("Call-ID", this.localTag + "-" + Convert.ToString(seq) + "-"
+            + Convert.ToString(Stopwatch.GetMilliseconds()));
+        req.Add("CSeq", Convert.ToString(seq) + " " + method);
+    }
+
+    // Non-INVITE client transaction: retransmit at 500ms doubling to 4s,
+    // give up after 32s (Timers E/F). Provisional 1xx responses restart
+    // nothing but are skipped; the first final (>=200) response wins.
+    async SipMessage TransactAsync(SipMessage req) {
+        UdpClient udp = UdpClient.Create();
+        string wire = req.Serialize();
+        long start = Stopwatch.GetMilliseconds();
+        long nextSend = start;
+        int interval = 500;
+        SipMessage result = null;
+        while (result == null
+               && Stopwatch.GetMilliseconds() - start < 32000) {
+            if (Stopwatch.GetMilliseconds() >= nextSend) {
+                int _s = await udp.SendToAsync(wire, this.host, this.port);
+                nextSend = Stopwatch.GetMilliseconds() + interval;
+                interval = interval * 2;
+                if (interval > 4000) { interval = 4000; }
+            }
+            if (Socket.IsReadable(udp.GetSocket())) {
+                string d = udp.RecvFrom(65536);
+                SipMessage m = SipMessage.Parse(d);
+                if (m != null && !m.isRequest && m.status >= 200) {
+                    result = m;
+                }
+            } else {
+                await Task.Delay(20);
+            }
+        }
+        udp.Close();
+        return result;
+    }
+}

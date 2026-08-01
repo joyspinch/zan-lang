@@ -187,6 +187,45 @@ static void emit_main_method(zan_irgen_t *g, zan_ast_node_t *method, zan_symbol_
         g->current_this = saved_this;
     }
 
+    /* An async Main was emitted in Pass 2 as a normal ramp/$resume pair (see
+     * the Main skip in emit_user_methods). Call the ramp, enqueue the frame,
+     * and run the scheduler to completion so root-level awaits and Task.Spawn
+     * share one ready queue. */
+    if ((method->method_decl.modifiers & MOD_ASYNC) &&
+        method->method_decl.params.count == 0 && type_sym) {
+        char ramp_name[512];
+        snprintf(ramp_name, sizeof(ramp_name), "%.*s_Main",
+                 (int)type_sym->name.len, type_sym->name.str);
+        LLVMValueRef ramp = LLVMGetNamedFunction(g->mod, ramp_name);
+        char res_name[520];
+        snprintf(res_name, sizeof(res_name), "%s$resume", ramp_name);
+        LLVMValueRef resume = LLVMGetNamedFunction(g->mod, res_name);
+        if (ramp && resume) {
+            LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+            LLVMTypeRef mi8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+            LLVMValueRef sub = zan_call2(g->builder, LLVMGlobalGetValueType(ramp),
+                ramp, NULL, 0, "main.task");
+            LLVMValueRef sub_i8 = LLVMBuildBitCast(g->builder, sub, mi8ptr, "main.task8");
+            LLVMValueRef sched_args[] = { sub_i8, resume };
+            zan_call2(g->builder, g->rt_co_ready_type, g->rt_co_ready, sched_args, 2, "");
+            zan_call2(g->builder, g->rt_co_sched_run_type, g->rt_co_sched_run, NULL, 0, "");
+            emit_async_check_sub_exc(g, sub_i8);
+            LLVMValueRef rptr = LLVMBuildStructGEP2(g->builder, g->co_header_type,
+                sub_i8, ASYNC_FRAME_RESULT, "main.res.p");
+            LLVMValueRef res = LLVMBuildLoad2(g->builder, i64, rptr, "main.res");
+            zan_call2(g->builder, LLVMGlobalGetValueType(g->fn_free),
+                g->fn_free, &sub_i8, 1, "");
+            emit_release_static_rc_fields(g, unit);
+            /* void Main: the result slot is zero-initialized, so this still
+             * returns 0. */
+            LLVMBuildRet(g->builder, LLVMBuildTrunc(g->builder, res,
+                LLVMInt32TypeInContext(g->ctx), "main.ret"));
+            g->current_type_sym = NULL;
+            g->current_fn_body = NULL;
+            return;
+        }
+    }
+
     local_scope_t *locals = local_scope_new(g->arena);
 
     if (method->method_decl.body) {
@@ -453,10 +492,16 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
 
             if (!member->method_decl.body) continue;
 
-            /* skip static Main — handled separately */
+            /* skip static Main — handled separately. An `async` Main IS
+             * emitted here, as an ordinary ramp/$resume pair: the real `main`
+             * (emit_main_method) then drives it on the scheduler. Inlining an
+             * async Main's body at the root would lower every `await
+             * Task.Delay` to a bare sleep that never runs the ready queue, so
+             * coroutines spawned with Task.Spawn would starve. */
             bool is_static = !is_ctor && (member->method_decl.modifiers & MOD_STATIC) != 0;
             if (is_static && member->method_decl.name.len == 4 &&
-                memcmp(member->method_decl.name.str, "Main", 4) == 0) continue;
+                memcmp(member->method_decl.name.str, "Main", 4) == 0 &&
+                !(member->method_decl.modifiers & MOD_ASYNC)) continue;
 
             /* build function name: TypeName_MethodName or TypeName_ctor,
              * plus a per-instantiation suffix (e.g. HashSet_Add$string) for a
