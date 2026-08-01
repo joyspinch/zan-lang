@@ -265,7 +265,7 @@ partial class Designer {
         bx = bx + app.Scale(56);
         int sT = 0;
         if (snapGrid) { sT = 1; }
-        int sId = new Button { Text = Designer.T("Snap", "吸附"), Class = Style.TypeClass(sT) }.Render(app, bx, by, app.Scale(52));
+        int sId = new Button { Text = Designer.T("Snap to grid", "对齐网格"), Class = Style.TypeClass(sT) }.Render(app, bx, by, app.Scale(52));
         if (Ui.Clicked(app, sId)) { snapGrid = !snapGrid; app.RequestRedraw(); }
         bx = bx + app.Scale(60);
 
@@ -302,6 +302,7 @@ partial class Designer {
             freeSizeApplied = pick;
             if (pick >= 0 && pick < szW.Count) {
                 ApplyDesignSize(szW[pick], szH[pick]);
+                winRound = FreePresetRound(pick);
                 app.RequestRedraw();
             }
         }
@@ -318,12 +319,15 @@ partial class Designer {
         c.DrawText(x + w - sw - app.Scale(10), by + app.Scale(7), sz, t.textTertiary, fs);
     }
 
-    /// Common design-size presets (LVGL display sizes + phone/tablet/desktop).
+    /// Common design-size presets (LVGL display sizes + phone/tablet/desktop
+    /// + smart-watch/band edge devices).
     static List<int> FreePresetW() {
-        return new List<int>{ 320, 480, 800, 1024, 390, 768, 1280, 1366, 1920 };
+        return new List<int>{ 320, 480, 800, 1024, 390, 768, 1280, 1366, 1920,
+                              466, 368, 194 };
     }
     static List<int> FreePresetH() {
-        return new List<int>{ 240, 320, 480, 600, 844, 1024, 720, 768, 1080 };
+        return new List<int>{ 240, 320, 480, 600, 844, 1024, 720, 768, 1080,
+                              466, 448, 368 };
     }
     static string FreePresetName(int i) {
         if (i == 0) { return "QVGA"; }
@@ -334,7 +338,14 @@ partial class Designer {
         if (i == 5) { return Designer.T("Tablet", "平板"); }
         if (i == 6) { return "HD"; }
         if (i == 7) { return "WXGA"; }
-        return "FHD";
+        if (i == 8) { return "FHD"; }
+        if (i == 9) { return Designer.T("Watch ○", "手表圆"); }
+        if (i == 10) { return Designer.T("Watch □", "手表方"); }
+        return Designer.T("Band", "手环");
+    }
+    /// Whether preset `i` is a round (circular) display.
+    static bool FreePresetRound(int i) {
+        return i == 9;
     }
 
     /// Switches the designed window to a new size, keeping one independent
@@ -397,7 +408,11 @@ partial class Designer {
                 k = k + 1;
             }
         } else {
+            // Previews follow the canvas zoom so text and chrome scale with
+            // the design instead of staying at 1:1.
+            pvScale = psMilli;
             PreviewControl(app, c, t, f, ex, ey, ew, eh);
+            pvScale = 1000;
         }
 
         // Selection outline + resize handles.
@@ -494,8 +509,23 @@ partial class Designer {
         }
         int cw2 = dw * psMilli / 1000;
         int ch2 = dh * psMilli / 1000;
-        int ox = inX + (inW - cw2) / 2;
-        int oy = inY + (inH - ch2) / 2;
+        // Pan: when the zoomed design is larger than the pane the viewport is
+        // draggable (press empty canvas space) and wheel-scrollable; the pan
+        // offset is clamped so the design never scrolls fully out of view.
+        int panMaxX = (cw2 - inW) / 2 + app.Scale(40);
+        int panMaxY = (ch2 - inH) / 2 + app.Scale(40);
+        if (cw2 <= inW) { freePanX = 0; }
+        if (ch2 <= inH) { freePanY = 0; }
+        if (freePanX > panMaxX) { freePanX = panMaxX; }
+        if (freePanX < 0 - panMaxX) { freePanX = 0 - panMaxX; }
+        if (freePanY > panMaxY) { freePanY = panMaxY; }
+        if (freePanY < 0 - panMaxY) { freePanY = 0 - panMaxY; }
+        int ox = inX + (inW - cw2) / 2 - freePanX;
+        int oy = inY + (inH - ch2) / 2 - freePanY;
+
+        // Everything from here on stays inside the editor pane, so a zoomed
+        // design cannot paint over the toolbar / neighbouring panels.
+        c.PushClip(inX, inY, inW, inH);
 
         // Canvas backdrop + frame.
         c.FillRect(ox, oy, cw2, ch2, t.bgSecondary);
@@ -529,6 +559,20 @@ partial class Designer {
                 if (z < 100) { z = 100; }
                 if (z > 4000) { z = 4000; }
                 winZoom = z;
+                app.RequestRedraw();
+            }
+        } else if (InRect(app.mouseX, app.mouseY, inX, inY, inW, inH)) {
+            // Plain wheel pans vertically, Shift+wheel horizontally.
+            if (app.CaptureWheel(inX, inY, inW, inH)) {
+                int wdelta = app.window.EventKeyCode();
+                int step = app.Scale(48);
+                if (Modifiers.HasShift(app.window.EventMods())) {
+                    if (wdelta > 0) { freePanX = freePanX - step; }
+                    else if (wdelta < 0) { freePanX = freePanX + step; }
+                } else {
+                    if (wdelta > 0) { freePanY = freePanY - step; }
+                    else if (wdelta < 0) { freePanY = freePanY + step; }
+                }
                 app.RequestRedraw();
             }
         }
@@ -593,8 +637,32 @@ partial class Designer {
                 } else {
                     sel = null;
                     activeContainer = null;
+                    // Empty press starts a viewport pan-drag (canvas-style).
+                    freePanning = true;
+                    freePanSX = app.mouseX;
+                    freePanSY = app.mouseY;
+                    freePanOX = freePanX;
+                    freePanOY = freePanY;
                 }
             }
+            app.RequestRedraw();
+        }
+
+        // Pressing the pane outside the design window also pans.
+        if (ek == 2 && app.window.EventButton() == 0 && !freePanning
+                && !freeDragging && !freeResizing
+                && InRect(app.mouseX, app.mouseY, inX, inY, inW, inH)) {
+            freePanning = true;
+            freePanSX = app.mouseX;
+            freePanSY = app.mouseY;
+            freePanOX = freePanX;
+            freePanOY = freePanY;
+        }
+
+        // Pan-drag: move the viewport with the pointer.
+        if (freePanning && ek == 1) {
+            freePanX = freePanOX - (app.mouseX - freePanSX);
+            freePanY = freePanOY - (app.mouseY - freePanSY);
             app.RequestRedraw();
         }
 
@@ -648,12 +716,26 @@ partial class Designer {
             app.RequestRedraw();
         }
 
-        // Pointer release anywhere ends the drag/resize.
+        // Pointer release anywhere ends the drag/resize/pan.
         if (ek == 3) {
             freeDragging = false;
             freeResizing = false;
+            freePanning = false;
             app.RequestRedraw();
         }
+
+        // Round display (smart watch): overlay the circular visible area so
+        // the designed UI can be checked against the watch face's real shape.
+        if (winRound) {
+            int rcx = ox + cw2 / 2;
+            int rcy = oy + ch2 / 2;
+            int rr2 = cw2;
+            if (ch2 < rr2) { rr2 = ch2; }
+            rr2 = rr2 / 2;
+            c.DrawCircle(rcx, rcy, rr2, t.primary, 2);
+        }
+
+        c.PopClip();
     }
 
     /// Adds a palette field onto the free canvas at design-space (dx, dy),
@@ -903,11 +985,21 @@ partial class Designer {
         c.DrawText(tx, ly, f.label, t.textSecondary, fs);
     }
 
+    // ---- zoom-aware preview metrics -------------------------------------
+    // The free canvas renders control previews at the canvas zoom (pvScale,
+    // permille); flow mode leaves it at 1000 so previews render 1:1.
+    int PvS(App app, int v) { return app.Scale(v) * pvScale / 1000; }
+    int PvFont(int fsz) {
+        int f2 = fsz * pvScale / 1000;
+        if (f2 < 7) { f2 = 7; }
+        return f2;
+    }
+
     /// Draws a non-interactive preview of the field's input control.
     void PreviewControl(App app, Canvas c, Theme t, FormField f, int x, int y, int w, int avail) {
-        int fs = t.fontSizeSmall;
-        int line = app.Scale(28);
-        if (w < app.Scale(40)) { w = app.Scale(40); }
+        int fs = PvFont(t.fontSizeSmall);
+        int line = PvS(app, 28);
+        if (w < PvS(app, 40)) { w = PvS(app, 40); }
         int ft = f.ftype;
 
         // Display / layout / feedback / navigation components (ftype >= 15).
@@ -920,14 +1012,14 @@ partial class Designer {
         }
 
         if (ft == 1) {                       // textarea
-            int bh = avail - app.Scale(6);
+            int bh = avail - PvS(app, 6);
             if (bh < line) { bh = line; }
             Box(c, t, x, y, w, bh);
-            c.DrawText(x + app.Scale(8), y + app.Scale(6), f.placeholder, t.textTertiary, fs);
+            c.DrawText(x + PvS(app, 8), y + PvS(app, 6), f.placeholder, t.textTertiary, fs);
             return;
         }
         if (ft == 12) {                      // upload
-            int bh = avail - app.Scale(6);
+            int bh = avail - PvS(app, 6);
             if (bh < line) { bh = line; }
             c.FillRoundRect(x, y, w, bh, t.borderRadiusMedium, t.bgSecondary);
             c.DrawRoundRect(x, y, w, bh, t.borderRadiusMedium, t.borderSecondary, 1);
@@ -935,12 +1027,12 @@ partial class Designer {
             return;
         }
         if (ft == 14) {                      // rich text
-            int bh = avail - app.Scale(6);
+            int bh = avail - PvS(app, 6);
             if (bh < line * 2) { bh = line * 2; }
             Box(c, t, x, y, w, bh);
-            c.FillRect(x, y + app.Scale(24), w, 1, t.divider);
-            c.DrawText(x + app.Scale(8), y + app.Scale(5), "B  I  U  •", t.textTertiary, fs);
-            c.DrawText(x + app.Scale(8), y + app.Scale(30), f.placeholder, t.textTertiary, fs);
+            c.FillRect(x, y + PvS(app, 24), w, 1, t.divider);
+            c.DrawText(x + PvS(app, 8), y + PvS(app, 5), "B  I  U  •", t.textTertiary, fs);
+            c.DrawText(x + PvS(app, 8), y + PvS(app, 30), f.placeholder, t.textTertiary, fs);
             return;
         }
 
@@ -949,8 +1041,8 @@ partial class Designer {
             return;
         }
         if (ft == 7) {                       // switch
-            int sw = app.Scale(40);
-            int sh = app.Scale(20);
+            int sw = PvS(app, 40);
+            int sh = PvS(app, 20);
             int syy = y + (line - sh) / 2;
             int track = t.bgTertiary;
             int knobX = x + sh / 2;
@@ -959,11 +1051,11 @@ partial class Designer {
                 knobX = x + sw - sh / 2;
             }
             c.FillRoundRect(x, syy, sw, sh, sh / 2, track);
-            c.FillCircle(knobX, syy + sh / 2, sh / 2 - app.Scale(2), t.bgPrimary);
+            c.FillCircle(knobX, syy + sh / 2, sh / 2 - PvS(app, 2), t.bgPrimary);
             return;
         }
         if (ft == 8) {                       // rate
-            int r = app.Scale(6);
+            int r = PvS(app, 6);
             int syy = y + line / 2;
             int sx = x + r;
             int k = 0;
@@ -971,23 +1063,23 @@ partial class Designer {
                 int col = t.borderSecondary;
                 if (k < 3) { col = t.warning; }
                 c.FillCircle(sx, syy, r, col);
-                sx = sx + r * 2 + app.Scale(6);
+                sx = sx + r * 2 + PvS(app, 6);
                 k = k + 1;
             }
             return;
         }
         if (ft == 9) {                       // slider
             int syy = y + line / 2;
-            c.FillRect(x, syy, w, app.Scale(3), t.bgTertiary);
-            c.FillRect(x, syy, w * 2 / 5, app.Scale(3), t.primary);
-            c.FillCircle(x + w * 2 / 5, syy + app.Scale(1), app.Scale(7), t.primary);
+            c.FillRect(x, syy, w, PvS(app, 3), t.bgTertiary);
+            c.FillRect(x, syy, w * 2 / 5, PvS(app, 3), t.primary);
+            c.FillCircle(x + w * 2 / 5, syy + PvS(app, 1), PvS(app, 7), t.primary);
             return;
         }
         if (ft == 13) {                      // color
             Box(c, t, x, y, w, line);
-            c.FillRoundRect(x + app.Scale(6), y + app.Scale(6), app.Scale(16), line - app.Scale(12),
+            c.FillRoundRect(x + PvS(app, 6), y + PvS(app, 6), PvS(app, 16), line - PvS(app, 12),
                 t.borderRadiusSmall, t.primary);
-            c.DrawText(x + app.Scale(30), y + app.Scale(6), "#3366FF", t.textSecondary, fs);
+            c.DrawText(x + PvS(app, 30), y + PvS(app, 6), "#3366FF", t.textSecondary, fs);
             return;
         }
 
@@ -997,16 +1089,16 @@ partial class Designer {
         int txtCol = t.textTertiary;
         if (ft == 2) { txt = "••••••••"; }
         if (ft == 6 && f.OptionCount() > 0) { txt = f.OptionAt(0); txtCol = t.textSecondary; }
-        c.DrawText(x + app.Scale(8), y + app.Scale(6), txt, txtCol, fs);
+        c.DrawText(x + PvS(app, 8), y + PvS(app, 6), txt, txtCol, fs);
         if (ft == 6 || ft == 10 || ft == 11) {
-            c.DrawGlyphIn("chevron-down", x + w - app.Scale(20), y, app.Scale(16), line,
-                app.Scale(11), t.textTertiary);
+            c.DrawGlyphIn("chevron-down", x + w - PvS(app, 20), y, PvS(app, 16), line,
+                PvS(app, 11), t.textTertiary);
         }
         if (ft == 3) {
-            c.DrawGlyphIn("chevron-up", x + w - app.Scale(18), y,
-                app.Scale(14), line / 2, app.Scale(9), t.textTertiary);
-            c.DrawGlyphIn("chevron-down", x + w - app.Scale(18), y + line / 2,
-                app.Scale(14), line / 2, app.Scale(9), t.textTertiary);
+            c.DrawGlyphIn("chevron-up", x + w - PvS(app, 18), y,
+                PvS(app, 14), line / 2, PvS(app, 9), t.textTertiary);
+            c.DrawGlyphIn("chevron-down", x + w - PvS(app, 18), y + line / 2,
+                PvS(app, 14), line / 2, PvS(app, 9), t.textTertiary);
         }
     }
 
@@ -1014,18 +1106,18 @@ partial class Designer {
     /// navigation component (ftype >= 15). Each case paints a recognisable
     /// miniature of the corresponding stdlib widget.
     void PreviewDisplay(App app, Canvas c, Theme t, FormField f, int x, int y, int w, int avail, int line) {
-        int fs = t.fontSizeSmall;
+        int fs = PvFont(t.fontSizeSmall);
         int ft = f.ftype;
 
         if (ft == 100) {                     // project custom component
-            int bh = line + app.Scale(8);
+            int bh = line + PvS(app, 8);
             c.FillRoundRect(x, y, w, bh, t.borderRadiusMedium, t.bgSecondary);
             c.DrawRoundRect(x, y, w, bh, t.borderRadiusMedium, t.primary, 1);
             string icon = CustomComponents.IconOf(f.customKind);
             if (icon == "") { icon = "puzzle"; }
-            c.DrawGlyphIn(icon, x + app.Scale(6), y, app.Scale(20), bh,
-                app.Scale(13), t.primary);
-            c.DrawText(x + app.Scale(30), y + (bh - fs) / 2, f.customKind, t.textSecondary, fs);
+            c.DrawGlyphIn(icon, x + PvS(app, 6), y, PvS(app, 20), bh,
+                PvS(app, 13), t.primary);
+            c.DrawText(x + PvS(app, 30), y + (bh - fs) / 2, f.customKind, t.textSecondary, fs);
             return;
         }
         if (ft == 15) {                      // title / heading
@@ -1042,34 +1134,34 @@ partial class Designer {
                                      Style.Of(app, "divider", "", Style.SNormal()).BgOr(app.theme.divider)); }
             else {
                 new Divider(f.label).RenderInside(app,
-                    Rect.Create(x, y + app.Scale(2), w, line));
+                    Rect.Create(x, y + PvS(app, 2), w, line));
             }
             return;
         }
         if (ft == 18) {                      // card
-            int bh = avail - app.Scale(6);
-            if (bh < app.Scale(56)) { bh = app.Scale(56); }
+            int bh = avail - PvS(app, 6);
+            if (bh < PvS(app, 56)) { bh = PvS(app, 56); }
             c.FillRoundRect(x, y, w, bh, t.borderRadiusMedium, t.bgPrimary);
             c.DrawRoundRect(x, y, w, bh, t.borderRadiusMedium, t.borderPrimary, 1);
-            c.DrawText(x + app.Scale(10), y + app.Scale(8), f.label, t.textPrimary, t.fontSizeMedium);
-            c.FillRect(x, y + app.Scale(30), w, 1, t.divider);
-            c.DrawText(x + app.Scale(10), y + app.Scale(38), Designer.T("Card body content", "卡片内容"), t.textTertiary, fs);
+            c.DrawText(x + PvS(app, 10), y + PvS(app, 8), f.label, t.textPrimary, PvFont(t.fontSizeMedium));
+            c.FillRect(x, y + PvS(app, 30), w, 1, t.divider);
+            c.DrawText(x + PvS(app, 10), y + PvS(app, 38), Designer.T("Card body content", "卡片内容"), t.textTertiary, fs);
             return;
         }
         if (ft == 19) {                      // tag
-            Tag.Chip(app, x, y + app.Scale(3), f.label, "primary");
+            Tag.Chip(app, x, y + PvS(app, 3), f.label, "primary");
             return;
         }
         if (ft == 20) {                      // badge
-            c.DrawText(x, y + app.Scale(6), f.label, t.textPrimary, fs);
+            c.DrawText(x, y + PvS(app, 6), f.label, t.textPrimary, fs);
             int bw = Canvas.MeasureText(f.label, fs);
-            Badge.CountAt(app, x + bw + app.Scale(10), y + app.Scale(2), 5);
+            Badge.CountAt(app, x + bw + PvS(app, 10), y + PvS(app, 2), 5);
             return;
         }
         if (ft == 21) {                      // avatar
             new Avatar(f.label).RenderInside(app,
-                Rect.Create(x, y + app.Scale(2), app.Scale(34),
-                            app.Scale(34)));
+                Rect.Create(x, y + PvS(app, 2), PvS(app, 34),
+                            PvS(app, 34)));
             return;
         }
         if (ft == 22) {                      // statistic
@@ -1085,7 +1177,7 @@ partial class Designer {
             List<string> descs = new List<string>();
             int i = 0;
             while (i < f.OptionCount()) { titles.Add(f.OptionAt(i)); descs.Add(""); i = i + 1; }
-            Timeline.OfTitles(titles, descs).RenderAt(app, x, y + app.Scale(2), w);
+            Timeline.OfTitles(titles, descs).RenderAt(app, x, y + PvS(app, 2), w);
             return;
         }
         if (ft == 25) {                      // tree
@@ -1096,7 +1188,7 @@ partial class Designer {
                 else { nodes.Add(TreeNode.File(f.OptionAt(i), 1)); }
                 i = i + 1;
             }
-            Rect area = Rect.Create(x, y + app.Scale(2), w, avail - app.Scale(6));
+            Rect area = Rect.Create(x, y + PvS(app, 2), w, avail - PvS(app, 6));
             TreeView tv = new TreeView();
             tv.BindSel(f.uiState).Bind(nodes);
             tv.RenderInside(app, area);
@@ -1110,12 +1202,12 @@ partial class Designer {
             Collapse col = Collapse.Of(titles, bodies, f.uiState);
             // The designer canvas owns the click while laying a form out.
             col.Disabled = preview;
-            col.RenderAt(app, x, y + app.Scale(2), w);
+            col.RenderAt(app, x, y + PvS(app, 2), w);
             return;
         }
         if (ft == 27) {                      // empty
-            int eh = avail - app.Scale(6);
-            if (eh < app.Scale(56)) { eh = app.Scale(56); }
+            int eh = avail - PvS(app, 6);
+            if (eh < PvS(app, 56)) { eh = PvS(app, 56); }
             new Empty(f.label).RenderInside(app, Rect.Create(x, y, w, eh));
             return;
         }
@@ -1124,7 +1216,7 @@ partial class Designer {
             return;
         }
         if (ft == 29) {                      // progress
-            new Progress(60, 1).RenderAt(app, x, y + app.Scale(8), w);
+            new Progress(60, 1).RenderAt(app, x, y + PvS(app, 8), w);
             return;
         }
         if (ft == 30) {                      // result
@@ -1135,36 +1227,36 @@ partial class Designer {
             return;
         }
         if (ft == 31) {                      // skeleton
-            Skeleton.Line(app, w).RenderAt(app, x, y + app.Scale(4));
-            Skeleton.Line(app, w).RenderAt(app, x, y + app.Scale(24));
-            Skeleton.Line(app, w * 3 / 5).RenderAt(app, x, y + app.Scale(44));
+            Skeleton.Line(app, w).RenderAt(app, x, y + PvS(app, 4));
+            Skeleton.Line(app, w).RenderAt(app, x, y + PvS(app, 24));
+            Skeleton.Line(app, w * 3 / 5).RenderAt(app, x, y + PvS(app, 44));
             return;
         }
         if (ft == 32) {                      // spin
-            new Spin(20).RenderInside(app, Rect.Create(x + app.Scale(2),
-                y + app.Scale(6), app.Scale(20), app.Scale(20)));
-            c.DrawText(x + app.Scale(30), y + app.Scale(10), Designer.T("Loading...", "加载中..."), t.textTertiary, fs);
+            new Spin(20).RenderInside(app, Rect.Create(x + PvS(app, 2),
+                y + PvS(app, 6), PvS(app, 20), PvS(app, 20)));
+            c.DrawText(x + PvS(app, 30), y + PvS(app, 10), Designer.T("Loading...", "加载中..."), t.textTertiary, fs);
             return;
         }
         if (ft == 33) {                      // tooltip trigger
-            int bw = Canvas.MeasureText(f.label, fs) + app.Scale(20);
-            c.FillRoundRect(x, y + app.Scale(2), bw, app.Scale(24), t.borderRadiusMedium, t.bgSecondary);
-            c.DrawRoundRect(x, y + app.Scale(2), bw, app.Scale(24), t.borderRadiusMedium, t.borderSecondary, 1);
-            c.DrawText(x + app.Scale(10), y + app.Scale(7), f.label, t.textSecondary, fs);
+            int bw = Canvas.MeasureText(f.label, fs) + PvS(app, 20);
+            c.FillRoundRect(x, y + PvS(app, 2), bw, PvS(app, 24), t.borderRadiusMedium, t.bgSecondary);
+            c.DrawRoundRect(x, y + PvS(app, 2), bw, PvS(app, 24), t.borderRadiusMedium, t.borderSecondary, 1);
+            c.DrawText(x + PvS(app, 10), y + PvS(app, 7), f.label, t.textSecondary, fs);
             return;
         }
         if (ft == 34) {                      // steps
             List<string> labels = new List<string>();
             int i = 0;
             while (i < f.OptionCount()) { labels.Add(f.OptionAt(i)); i = i + 1; }
-            Steps.Of(labels, f.uiState).RenderAt(app, x, y + app.Scale(2), w);
+            Steps.Of(labels, f.uiState).RenderAt(app, x, y + PvS(app, 2), w);
             return;
         }
         if (ft == 35) {                      // breadcrumb
             List<string> items = new List<string>();
             int i = 0;
             while (i < f.OptionCount()) { items.Add(f.OptionAt(i)); i = i + 1; }
-            Breadcrumb.Of(items).RenderAt(app, x, y + app.Scale(4), w);
+            Breadcrumb.Of(items).RenderAt(app, x, y + PvS(app, 4), w);
             return;
         }
         if (ft == 36) {                      // tabs
@@ -1173,31 +1265,31 @@ partial class Designer {
             int i = 0;
             while (i < nn) {
                 string it = "Tab"; if (i < f.OptionCount()) { it = f.OptionAt(i); }
-                int tw = Canvas.MeasureText(it, fs) + app.Scale(16);
+                int tw = Canvas.MeasureText(it, fs) + PvS(app, 16);
                 int col = t.textTertiary;
                 if (i == 0) { col = t.primary; }
-                c.DrawText(gx + app.Scale(8), y + app.Scale(4), it, col, fs);
-                if (i == 0) { c.FillRect(gx, y + app.Scale(24), tw, app.Scale(2), t.primary); }
+                c.DrawText(gx + PvS(app, 8), y + PvS(app, 4), it, col, fs);
+                if (i == 0) { c.FillRect(gx, y + PvS(app, 24), tw, PvS(app, 2), t.primary); }
                 gx = gx + tw;
                 i = i + 1;
             }
-            c.FillRect(x, y + app.Scale(25), w, 1, t.divider);
-            c.DrawText(x + app.Scale(4), y + app.Scale(38), Designer.T("Tab panel content", "标签页内容"), t.textTertiary, fs);
+            c.FillRect(x, y + PvS(app, 25), w, 1, t.divider);
+            c.DrawText(x + PvS(app, 4), y + PvS(app, 38), Designer.T("Tab panel content", "标签页内容"), t.textTertiary, fs);
             return;
         }
         if (ft == 37) {                      // pagination
             Pagination pg = Pagination.Of(10, f.uiState);
             // The designer canvas owns the click while laying a form out.
             pg.Disabled = preview;
-            pg.RenderAt(app, x, y + app.Scale(2));
+            pg.RenderAt(app, x, y + PvS(app, 2));
             return;
         }
         if (ft == 38) {                      // menu
             List<string> items = new List<string>();
             int i = 0;
             while (i < f.OptionCount()) { items.Add(f.OptionAt(i)); i = i + 1; }
-            int mh = avail - app.Scale(4);
-            Menu.RenderVertical(app, x, y + app.Scale(2), w, y + app.Scale(2) + mh,
+            int mh = avail - PvS(app, 4);
+            Menu.RenderVertical(app, x, y + PvS(app, 2), w, y + PvS(app, 2) + mh,
                 t.heightMedium, items, f.uiState, 0);
             return;
         }
@@ -1215,7 +1307,7 @@ partial class Designer {
                 new ListColumn<string>("", s => s));
             lv.Class = "flat";
             lv.Bind(items);
-            lv.RenderInside(app, Rect.Create(x, y + app.Scale(2), w,
+            lv.RenderInside(app, Rect.Create(x, y + PvS(app, 2), w,
                 items.Count * app.theme.heightLarge));
             return;
         }
@@ -1228,8 +1320,8 @@ partial class Designer {
             int i = 0;
             while (i < f.OptionCount()) { slides.Add(f.OptionAt(i)); i = i + 1; }
             if (slides.Count == 0) { slides.Add("Slide 1"); }
-            int chh = avail - app.Scale(6);
-            if (chh < app.Scale(70)) { chh = app.Scale(70); }
+            int chh = avail - PvS(app, 6);
+            if (chh < PvS(app, 70)) { chh = PvS(app, 70); }
             Carousel car = Carousel.Of(slides, f.uiState);
             car.Disabled = preview;
             car.RenderInside(app, Rect.Create(x, y, w, chh));
@@ -1240,12 +1332,12 @@ partial class Designer {
             return;
         }
         if (ft == 44) {                      // ellipsis
-            Ellipsis.Render(app, x, y + app.Scale(4), w, f.label);
+            Ellipsis.Render(app, x, y + PvS(app, 4), w, f.label);
             return;
         }
         if (ft == 45) {                      // panel
-            int ph = avail - app.Scale(6);
-            if (ph < app.Scale(70)) { ph = app.Scale(70); }
+            int ph = avail - PvS(app, 6);
+            if (ph < PvS(app, 70)) { ph = PvS(app, 70); }
             Panel p = new Panel(f.label).Titled(f.label);
             p.RenderInside(app, Rect.Create(x, y, w, ph));
             Rect r = p.Inner();
@@ -1253,45 +1345,45 @@ partial class Designer {
             return;
         }
         if (ft == 46) {                      // scrollbar
-            int sh = avail - app.Scale(6);
-            if (sh < app.Scale(70)) { sh = app.Scale(70); }
+            int sh = avail - PvS(app, 6);
+            if (sh < PvS(app, 70)) { sh = PvS(app, 70); }
             c.DrawRect(x, y, w, sh, t.borderPrimary, 1);
-            c.DrawText(x + app.Scale(8), y + app.Scale(8),
+            c.DrawText(x + PvS(app, 8), y + PvS(app, 8),
                 Designer.T("Scrollable content", "可滚动内容"), t.textTertiary, fs);
-            Scrollbar.RenderVertical(app, x + w - app.Scale(10), y, sh,
-                sh * 3, app.Scale(20));
+            Scrollbar.RenderVertical(app, x + w - PvS(app, 10), y, sh,
+                sh * 3, PvS(app, 20));
             return;
         }
         if (ft == 47) {                      // loading
-            int r = app.Scale(12);
-            new Spin(24).RenderInside(app, Rect.Create(x + app.Scale(4),
-                y + app.Scale(8), r * 2, r * 2));
-            c.DrawText(x + r * 2 + app.Scale(16), y + r,
+            int r = PvS(app, 12);
+            new Spin(24).RenderInside(app, Rect.Create(x + PvS(app, 4),
+                y + PvS(app, 8), r * 2, r * 2));
+            c.DrawText(x + r * 2 + PvS(app, 16), y + r,
                 Designer.T("Loading...", "加载中..."), t.textTertiary, fs);
             return;
         }
         if (ft == 48) {                      // dropdown trigger
             DropdownChrome.PaintTrigger(app, app.focus.AllocId(),
-                x, y + app.Scale(2), app.Scale(180), t.heightMedium,
+                x, y + PvS(app, 2), PvS(app, 180), t.heightMedium,
                 f.label, false);
             return;
         }
         if (ft == 49) {                      // float button
             new FloatButton("plus") { Class = "primary" }
-                .Render(app, x, y + app.Scale(2));
+                .Render(app, x, y + PvS(app, 2));
             return;
         }
         if (ft == 50) {                      // popover
-            Popover.Render(app, x + app.Scale(90), y,
-                app.Scale(180), app.Scale(60), f.label, Designer.T("Popover body text", "气泡内容"));
+            Popover.Render(app, x + PvS(app, 90), y,
+                PvS(app, 180), PvS(app, 60), f.label, Designer.T("Popover body text", "气泡内容"));
             return;
         }
         if (ft == 51) {                      // popconfirm
-            Layer.DrawPopconfirm(app, x + app.Scale(110), y, f.label, Designer.T("OK", "确定"), Designer.T("Cancel", "取消"));
+            Layer.DrawPopconfirm(app, x + PvS(app, 110), y, f.label, Designer.T("OK", "确定"), Designer.T("Cancel", "取消"));
             return;
         }
         if (ft == 52) {                      // notification
-            Layer.DrawNotify(app, x, y + app.Scale(2), w, f.label, 3);
+            Layer.DrawNotify(app, x, y + PvS(app, 2), w, f.label, 3);
             return;
         }
         if (ft == 53) {                      // ribbon
@@ -1304,9 +1396,9 @@ partial class Designer {
             return;
         }
         if (ft == 54) {                      // icon
-            int sz = app.Scale(24);
+            int sz = PvS(app, 24);
             c.DrawGlyphIn("star", x, y, sz, sz, t.iconSizeLarge, t.primary);
-            c.DrawText(x + sz + app.Scale(8), y + app.Scale(4),
+            c.DrawText(x + sz + PvS(app, 8), y + PvS(app, 4),
                 f.label, t.textSecondary, fs);
             return;
         }
@@ -1329,8 +1421,8 @@ partial class Designer {
     /// chart type the stdlib Chart widget provides.
     void PreviewChart(App app, Canvas c, Theme t, FormField f, int x, int y, int w, int avail) {
         int kind = f.uiState.Get();
-        int hh = avail - app.Scale(6);
-        if (hh < app.Scale(120)) { hh = app.Scale(120); }
+        int hh = avail - PvS(app, 6);
+        if (hh < PvS(app, 120)) { hh = PvS(app, 120); }
 
         List<string> labels = new List<string>();
         labels.Add("Mon"); labels.Add("Tue"); labels.Add("Wed");
@@ -1382,7 +1474,7 @@ partial class Designer {
         }
         int totalW = colW * nc;
         int rowH = t.heightMedium;
-        int bh = avail - app.Scale(6);
+        int bh = avail - PvS(app, 6);
         if (bh < rowH * 3) { bh = rowH * 3; }
         c.PushClip(x, y, totalW, bh);
         Table.RenderHeader(app, x, y, cols, widths);
@@ -1399,11 +1491,11 @@ partial class Designer {
 
     /// Renders a horizontal preview of a radio/checkbox field's options.
     void PreviewChoice(App app, Canvas c, Theme t, FormField f, int x, int y, int w, int line) {
-        int fs = t.fontSizeSmall;
+        int fs = PvFont(t.fontSizeSmall);
         bool radio = (f.ftype == 4);
         int cy = y + line / 2;
         int gx = x;
-        int mark = app.Scale(14);
+        int mark = PvS(app, 14);
         int i = 0;
         while (i < f.OptionCount()) {
             string opt = f.OptionAt(i);
@@ -1415,11 +1507,11 @@ partial class Designer {
                 c.FillRoundRect(gx, cy - mark / 2, mark, mark, t.borderRadiusSmall, t.bgPrimary);
                 c.DrawRoundRect(gx, cy - mark / 2, mark, mark, t.borderRadiusSmall, t.borderPrimary, 1);
             }
-            int tx = gx + mark + app.Scale(4);
-            c.DrawText(tx, y + app.Scale(6), opt, t.textSecondary, fs);
-            int ow = mark + app.Scale(8) + Canvas.MeasureText(opt, fs) + app.Scale(12);
+            int tx = gx + mark + PvS(app, 4);
+            c.DrawText(tx, y + PvS(app, 6), opt, t.textSecondary, fs);
+            int ow = mark + PvS(app, 8) + Canvas.MeasureText(opt, fs) + PvS(app, 12);
             gx = gx + ow;
-            if (gx > x + w - app.Scale(30)) { i = f.OptionCount(); }
+            if (gx > x + w - PvS(app, 30)) { i = f.OptionCount(); }
             i = i + 1;
         }
     }
