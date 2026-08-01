@@ -611,7 +611,9 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
                  * handle (i8*); the body runs later in resume(frame). */
                 fn_type = LLVMFunctionType(i8ptr, param_types, (unsigned)total_params, 0);
                 fn = LLVMAddFunction(g->mod, fn_name, fn_type);
-                zan_set_module_local(fn);
+                if (!(g->emit_lib &&
+                      (member->method_decl.modifiers & MOD_PUBLIC) != 0))
+                    zan_set_module_local(fn);
 
                 char resume_name[560];
                 snprintf(resume_name, sizeof(resume_name), "%s$resume", fn_name);
@@ -620,7 +622,9 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
             } else {
                 fn_type = LLVMFunctionType(llvm_ret, param_types, (unsigned)total_params, 0);
                 fn = LLVMAddFunction(g->mod, fn_name, fn_type);
-                zan_set_module_local(fn);
+                if (!(g->emit_lib &&
+                      (member->method_decl.modifiers & MOD_PUBLIC) != 0))
+                    zan_set_module_local(fn);
             }
 
             /* register in function/ctor table. For async methods the ramp is
@@ -1734,6 +1738,23 @@ static void emit_pending_method_specs(zan_irgen_t *g) {
     }
 }
 
+/* A minimal Windows DLL entry point: `BOOL DllMain(...) { return TRUE; }`.
+ * The loader passes (hinstDLL, reason, reserved) but a zero-arg function
+ * ignores them; the non-zero return keeps the process running. External
+ * linkage keeps it alive through GlobalDCE and lets the linker resolve
+ * `-e DllMain`. */
+static void emit_windows_dll_main(zan_irgen_t *g) {
+    LLVMValueRef existing = LLVMGetNamedFunction(g->mod, "DllMain");
+    if (existing) return;
+    LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
+    LLVMTypeRef ft = LLVMFunctionType(i32, NULL, 0, 0);
+    LLVMValueRef fn = LLVMAddFunction(g->mod, "DllMain", ft);
+    LLVMSetLinkage(fn, LLVMExternalLinkage);
+    LLVMBasicBlockRef bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "entry");
+    LLVMPositionBuilderAtEnd(g->builder, bb);
+    LLVMBuildRet(g->builder, LLVMConstInt(i32, 1, 0));
+}
+
 zan_status_t zan_irgen_emit(zan_irgen_t *g, zan_ast_node_t *unit) {
     if (!unit || unit->kind != AST_COMPILATION_UNIT) return ZAN_ERROR;
     g_di_emit_ctx = g; /* so local_add can forward variables to di_declare_var */
@@ -1780,6 +1801,14 @@ done:
     emit_site_dtor_table(g);
     emit_site_tyname_table(g);
     emit_vtables(g);
+    /* A Windows DLL must carry a real entry point: without one the PE
+     * AddressOfEntryPoint falls back to the start of .text, so the Windows
+     * loader calls the first exported function (often zan_rt_println) as
+     * DllMain on process attach/detach, printing garbage to stdout (the
+     * "MZ" PE magic of the image base it was handed as hinstDLL). Emit a
+     * minimal DllMain returning TRUE (non-zero) and link with `-e DllMain`. */
+    if (g->emit_lib && g->emit_shared && g->target_is_windows)
+        emit_windows_dll_main(g);
     /* An error diagnostic emitted during codegen (e.g. an unsupported await
      * form flagged by the ANF pass) must fail the build — the driver only
      * checks diagnostics before codegen, so surface it here. */

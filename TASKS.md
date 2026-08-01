@@ -2897,3 +2897,58 @@ leakcheck 子集全部通过；生成 IR 不含 `setjmp`/`longjmp`/`__zan_eh_tmp
 **当前替代形状（已与用户说明，A33-2 之前有效）**：数据取值用不捕获 lambda
 （`new ListColumn<T>("Name", i => i.name)` 已实测可用），事件绑定用静态方法或
 把行做成自带状态的 Control 子类（虚方法分派不受此缺陷影响）。
+
+# A34 · zanc 无库输出：不能编译 DLL/.so/.dylib/.a（2026-08-01，已实测）
+
+**发现**：全量验证 `templates/` 时 `library/dll-class`、`library/dll-export` 两个
+模板建出的项目**无法编译**。最小探针 `_scratch/tplverify/TplDllClass`（`lib.zan`
+仅含 `class TplDllClass { static int Version() { return 1; } }`，无 `Main`）：
+`zanc --auto-stdlib -o out.exe lib.zan` → `ld.exe: ... undefined reference to WinMain`。
+
+**根因**：zanc 的链接路径（`src/compiler/main.c`）只支持**可执行文件**输出：
+Windows 本机走 `ld -m i386pep` + `crt2.o/crtbegin.o/crtend.o`；Linux 交叉走
+`ld.lld -static` + `crt1.o/crti.o/crtn.o`；Windows 交叉走 `ld.lld` MinGW 驱动。
+三条路径都固定链接 CRT 启动对象、生成带入口的 PE/ELF，**没有 `-shared`/
+`-dynamiclib`/静态归档分支**，也没有 `--emit-lib`/`--target=lib` 之类的开关。
+`templates/library/*` 的 `target=dll` 写进了 zan.proj 但编译器从未消费。
+
+**缺口（跨平台全家桶，不是只有 Windows DLL）**：
+
+| 平台 | 共享库 | 静态库 |
+|---|---|---|
+| Windows | `.dll`（`ld -shared` + 导出符号） | `.lib`（对象归档） |
+| Linux | `.so`（`-shared` + PIC） | `.a`（`ar` 归档） |
+| macOS | `.dylib`（`-dynamiclib`） | `.a` |
+
+**任务**：
+
+1. [x] A34-1 编译器新增库输出模式（`--emit-lib <name>` 或按输出后缀
+   `.dll/.so/.dylib/.a` 自动切换）：共享库走目标平台的 `-shared`（Windows 需
+   导出符号表、Linux/macOS 需 PIC），静态库把生成的 `.o` 归档。对象生成阶段
+   （`zan_irgen_write_obj`）需按目标 OS 补 PIC/导出标记；不链接 CRT 启动对象。
+   验收：`tests/conformance` 新增三个探针（win `.dll`、linux `.so`、macos
+   `.dylib`）+ 静态归档各一，`ctest -R 'emit_lib|...'` 通过；`--list-targets`
+   每个平台都能产出库。
+   **已实现（2026-08-01）**：`main.c` 按 `-o` 后缀自动切库模式（`emit_lib`/
+   `lib_shared` 在 `zan_irgen_init` 前判定）；`irgen_emit.c` 仅在库模式下对
+   `public` 方法跳过 `zan_set_module_local`（保证 GlobalDCE 后仍导出），并给
+   Windows 共享库发射 `DllMain`（返回 1，不导出）。Windows DLL 用 bundled
+   `ld -shared -e DllMainCRTStartup` + `dllcrt2.o` 启动、`--start-group` CRT
+   组、`-out-implib` 产出 import lib（命名按 ld 的 `-l<name>`→`lib<name>.a`
+   规则：`foo.dll`→`libfoo.dll.a`、`libfoo.dll`→`libfoo.dll.a`）；`[DllImport]`
+   的 Windows 系统库只在 Windows 目标加入链接行（修 ELF/dylib 误链 kernel32）。
+   Linux `.so` 走 `ld.lld -shared`，macOS `.dylib` 走 `ld64.lld -dylib` +
+    bundled libSystem.tbd；runtime 对象（IO reactor/sync/embed）按
+   `irgen.uses_*` 按需链接，纯函数库零 runtime，cross 共享库需要 runtime 时
+   明确报错。测试：`tests/emit_lib/` + `tests/run_emit_lib.cmake`，注册
+   `emit_lib_static`/`emit_lib_windows_dll`（含消费者经 `[DllImport]` 链接并
+   运行比对输出）/`emit_lib_linux_so`/`emit_lib_macos_dylib`，`ctest -R
+   emit_lib` 4/4 通过；`--list-targets` 各平台均产出库（win DLL/linux
+   ELF/macos Mach-O/ar 归档魔数逐一验证）。
+2. [ ] A34-2 IDE 消费库目标：`ZanIDE.Workspace.zan` 的 `CreateProjectT` 已把
+   `target=dll` 写进 zan.proj，但 `CompileToExe`/`RunBuildBegin` 一律按 exe 编译。
+   库项目应编译成库（Build 产出库文件、不 Run），Publish 按目标平台出对应
+   扩展名；`dll-class`/`dll-export` 模板恢复可建可用。
+3. [ ] A34-3 库的消费侧：同一 zan.proj 内 SmartInputs 已支持把兄弟 `.zan`
+   一起编译（源码复用）；A34-1/2 之后补「引用已编译库」的 `--link-lib`/
+   `link =` 路径，与 `[DllImport]` 消费外部原生库的既有机制对齐。

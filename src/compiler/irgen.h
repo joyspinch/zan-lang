@@ -276,6 +276,10 @@ struct zan_irgen {
     bool         runtime_checks;  /* insert div-by-zero (etc.) guards; default true */
     bool         check_leaks;     /* emit a leak report at program exit */
     bool         fast_codegen;    /* machine codegen at -O0 (fast turnaround) */
+    bool         emit_lib;        /* library output: keep `public` members as
+                                     exported (external-linkage) symbols */
+    bool         emit_shared;     /* shared library (not static archive): emit a
+                                     real entry point for the platform (DllMain) */
 
     /* Binding<T> lowering: synthesized per-(class,field) accessor functions
      * (see emit_binding_value in irgen_expr.c), cached so each field pair is

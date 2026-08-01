@@ -982,11 +982,57 @@ static const char *zan_path_basename(const char *p) {
     return b;
 }
 
+/* Write a single-member ar archive (a static library) containing `obj`.
+ * The ar format is trivial: the "!<arch>\n" magic, then one 60-byte member
+ * header followed by the member data (padded to even length with '\n').
+ * This lets `zanc lib.zan -o libfoo.a` produce a real archive without
+ * depending on an external ar/llvm-ar binary; GNU ld and lld both extract
+ * members from a symbol-less single-member archive fine. */
+static int zan_write_static_lib(const char *obj, const char *arc) {
+    FILE *in = fopen(obj, "rb");
+    if (!in) return -1;
+    if (fseek(in, 0, SEEK_END) != 0) { fclose(in); return -1; }
+    long sz = ftell(in);
+    if (sz < 0) { fclose(in); return -1; }
+    if (fseek(in, 0, SEEK_SET) != 0) { fclose(in); return -1; }
+    FILE *out = fopen(arc, "wb");
+    if (!out) { fclose(in); return -1; }
+    fwrite("!<arch>\n", 1, 8, out);
+    char hdr[60];
+    memset(hdr, ' ', sizeof(hdr));
+    const char *nm = "obj.o";               /* short member name */
+    size_t nl = strlen(nm);
+    if (nl > 16) nl = 16;
+    memcpy(hdr, nm, nl);
+    snprintf(hdr + 16, 13, "%-12ld", 0L);   /* mtime  */
+    snprintf(hdr + 28, 7,  "%-6d", 0);      /* uid    */
+    snprintf(hdr + 34, 7,  "%-6d", 0);      /* gid    */
+    snprintf(hdr + 40, 9,  "%-8o", 0644);   /* mode   */
+    snprintf(hdr + 48, 11, "%-10ld", sz);   /* size   */
+    hdr[58] = '`'; hdr[59] = '\n';
+    fwrite(hdr, 1, sizeof(hdr), out);
+    char buf[65536];
+    long left = sz;
+    while (left > 0) {
+        size_t want = (left > (long)sizeof(buf)) ? sizeof(buf) : (size_t)left;
+        size_t got = fread(buf, 1, want, in);
+        if (got == 0) break;
+        fwrite(buf, 1, got, out);
+        left -= (long)got;
+    }
+    if (sz % 2 == 1) fwrite("\n", 1, 1, out); /* ar pads odd-sized members */
+    fclose(in);
+    fclose(out);
+    return 0;
+}
+
 static void print_usage(void) {
     fprintf(stderr, "Zan Compiler v%s\n", ZAN_VERSION);
     fprintf(stderr, "Usage: zanc <source.zan> [options]\n");
     fprintf(stderr, "Options:\n");
-    fprintf(stderr, "  -o <output>     Output file\n");
+    fprintf(stderr, "  -o <output>     Output file (library: .dll/.so/.dylib shared,\n");
+    fprintf(stderr, "                   .a/.lib static; executable: any other suffix)\n");
+    fprintf(stderr, "  --emit-lib      Force library output (no CRT/entry point)\n");
     fprintf(stderr, "  --dump-tokens   Dump lexer tokens\n");
     fprintf(stderr, "  --dump-ast      Dump parse tree\n");
     fprintf(stderr, "  --emit-ir       Emit LLVM IR to stdout\n");
@@ -1060,6 +1106,8 @@ int main(int argc, char **argv) {
     const char *link_subsystem = NULL;
     const char *icon_path = NULL;   /* --icon <file.ico>: Windows exe icon */
     bool no_icon = false;           /* --no-icon: not even the built-in default */
+    bool emit_lib = false;          /* --emit-lib / -o lib suffix: library output */
+    bool lib_shared = false;        /* library is shared (.dll/.so/.dylib), not static */
     const char *extra_link_inputs[32]; int extra_link_input_count = 0;
     const char *extra_link_libs[32];   int extra_link_lib_count = 0;
     const char *extra_lib_paths[16];   int extra_lib_path_count = 0;
@@ -1126,6 +1174,8 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "--time") == 0) {
             g_time_phases = true;
             g_phase_start = now_ms();
+        } else if (strcmp(argv[i], "--emit-lib") == 0) {
+            emit_lib = true;
         } else if (strcmp(argv[i], "--no-icon") == 0) {
             no_icon = true;
         } else if (strcmp(argv[i], "--icon") == 0 && i + 1 < argc) {
@@ -1496,6 +1546,29 @@ int main(int argc, char **argv) {
         else
             irgen_triple = target.triple;
     }
+    /* Library output is selected by the -o extension (.dll/.so/.dylib for
+     * shared, .a/.lib for static) or forced with --emit-lib (which then
+     * guesses shared/static from the extension, defaulting to static). The
+     * decision must happen before IR emission: `public` members of a library
+     * are kept as exported (external-linkage) symbols, and the pre-object
+     * dead-code sweep must not remove them. */
+    if (output_file && !emit_lib) {
+        const char *ext = strrchr(output_file, '.');
+        if (ext) {
+            if (strcmp(ext, ".dll") == 0 || strcmp(ext, ".so") == 0 ||
+                strcmp(ext, ".dylib") == 0) {
+                emit_lib = true; lib_shared = true;
+            } else if (strcmp(ext, ".a") == 0 || strcmp(ext, ".lib") == 0) {
+                emit_lib = true; lib_shared = false;
+            }
+        }
+    }
+    if (emit_lib && output_file && !lib_shared) {
+        const char *ext = strrchr(output_file, '.');
+        if (ext && (strcmp(ext, ".dll") == 0 || strcmp(ext, ".so") == 0 ||
+                    strcmp(ext, ".dylib") == 0))
+            lib_shared = true;
+    }
     if (zan_irgen_init(&irgen, arena, diag, &binder, input_file,
                        irgen_triple,
                        target.os == ZAN_OS_WINDOWS, mt_scheduler,
@@ -1508,6 +1581,8 @@ int main(int argc, char **argv) {
     irgen.runtime_checks = runtime_checks;
     irgen.emit_debug = debug_info;
     irgen.fast_codegen = false;
+    irgen.emit_lib = emit_lib;
+    irgen.emit_shared = lib_shared;
 
     if (zan_irgen_emit(&irgen, ast) != ZAN_OK) {
         fprintf(stderr, "error: code generation failed\n");
@@ -1692,10 +1767,11 @@ int main(int argc, char **argv) {
 
         /* An icon is just another link input: compile the .ico into a .rsrc
          * object here (no windres needed) and hand it to whichever linker
-         * branch runs below. Only PE targets carry resources. */
+         * branch runs below. Only PE targets carry resources, and libraries
+         * (which have no entry point / UI) never embed one. */
         char icon_obj[1100];
         icon_obj[0] = '\0';
-        if (!no_icon && target.os == ZAN_OS_WINDOWS) {
+        if (!no_icon && !emit_lib && target.os == ZAN_OS_WINDOWS) {
             int arm64 = target.arch == ZAN_ARCH_AARCH64;
             snprintf(icon_obj, sizeof(icon_obj), "%s.icon.o", obj_path);
             int ires;
@@ -1936,7 +2012,329 @@ int main(int argc, char **argv) {
             }
         }
 
-        if (cross_compiling && target.os == ZAN_OS_LINUX) {
+        if (emit_lib) {
+            /* ---- library output ----------------------------------------
+             * A library is the same object file, linked WITHOUT the CRT
+             * startup objects and entry point. Static (.a/.lib) is just an
+             * ar archive of the object; shared (.dll/.so/.dylib) links the
+             * object with -shared. Objects are already emitted PIC
+             * (LLVMRelocPIC in zan_irgen_write_obj), so the same object works
+             * for both static and shared on every target.
+             *
+             * Runtime objects (IO reactor, sync runtime, embed API) are only
+             * pulled in when the library actually uses them (irgen.uses_*);
+             * a pure-function library links with no runtime at all. On a
+             * cross build the host-side rt_*_obj pointers below are host
+             * objects, not target ones, so a cross shared library that needs
+             * the runtime is rejected (cross static archives are fine: the
+             * consumer links the runtime). */
+            if (!lib_shared) {
+                /* static library: ar archive of the single object */
+                if (zan_write_static_lib(obj_tmp, obj_path) != 0) {
+                    fprintf(stderr, "error: failed to write static library '%s'\n",
+                            obj_path);
+                    remove(obj_tmp);
+                    zan_irgen_destroy(&irgen);
+                    zan_arena_free(arena);
+                    free(source);
+                    return 1;
+                }
+                link_ret = 0;
+            } else {
+                bool need_rt = (irgen.uses_socket_async || irgen.uses_sync_runtime
+                                || irgen.uses_embed_api);
+                if (cross_compiling && need_rt) {
+                    fprintf(stderr,
+                            "error: cross-compiled shared libraries that use the "
+                            "Zan runtime are not supported yet (link a static "
+                            "library, or build the shared library on the target "
+                            "host)\n");
+                    remove(obj_tmp);
+                    zan_irgen_destroy(&irgen);
+                    zan_arena_free(arena);
+                    free(source);
+                    return 1;
+                }
+                char cmd[8192];
+                bool lib_spawned = false; /* Windows: linked via _spawnv */
+                char exe_dir[1024];
+                zan_exe_dir(exe_dir, sizeof(exe_dir));
+                /* Windows DLLs get an import library so a consumer links with
+                 * just `-L <dir>` + [DllImport("foo.dll")]. GNU ld resolves
+                 * -l<name> against lib<name>.a, and [DllImport] strips a
+                 * leading "lib" from the library name (zan_dllimport_lname), so
+                 * the archive must carry the lib prefix and the lname spelling:
+                 * foo.dll -> libfoo.dll.a, libfoo.dll -> libfoo.dll.a. */
+                char implib[1100] = {0};
+                if (target.os == ZAN_OS_WINDOWS) {
+                    const char *sep = strrchr(obj_path, '\\');
+                    if (!sep) sep = strrchr(obj_path, '/');
+                    const char *base = sep ? sep + 1 : obj_path;
+                    int llen;
+                    const char *lname = zan_dllimport_lname(
+                        base, (int)strlen(base), &llen);
+                    if (!lname) { lname = base; llen = (int)strlen(base); }
+                    size_t plen = (size_t)(base - obj_path);
+                    snprintf(implib, sizeof(implib), "%.*slib%.*s.a",
+                             (int)plen, obj_path, llen, lname);
+                }
+                if (target.os == ZAN_OS_WINDOWS) {
+#ifdef _WIN32
+                    /* On Windows the linker is spawned with an argv array
+                     * (not system()) because cmd.exe mangles a quoted
+                     * executable path followed by further quoted args. */
+                    char dll_exe_dir[1024]; dll_exe_dir[0] = '\0';
+                    GetModuleFileNameA(NULL, dll_exe_dir, sizeof(dll_exe_dir));
+                    { char *s = strrchr(dll_exe_dir, '\\'); if (s) *s = '\0'; }
+                    char ld_path[1200];
+                    snprintf(ld_path, sizeof(ld_path), "%s\\ld.exe", dll_exe_dir);
+                    const char *dll_ld = ld_path;
+                    if (!zan_file_exists(ld_path)) {
+                        /* no bundled ld: fall back to ld.lld from PATH */
+                        dll_ld = "ld.lld";
+                    }
+                    const char *argv[160];
+                    int a = 0;
+                    argv[a++] = dll_ld;
+                    argv[a++] = "-m";
+                    argv[a++] = (target.arch == ZAN_ARCH_AARCH64)
+                                    ? "arm64pe" : "i386pep";
+                    argv[a++] = "-shared";
+                    argv[a++] = "-Bdynamic";
+                    /* DLL entry point: prefer the bundled mingw DLL startup
+                     * dllcrt2.o (provides DllMainCRTStartup, which runs CRT
+                     * init and calls our emitted DllMain, plus the PE386
+                     * runtime relocator). Without any proper entry the loader
+                     * calls the first .text function on attach/detach (stdout
+                     * garbage). Fall back to our minimal DllMain if the bundle
+                     * lacks dllcrt2.o. */
+                    char dllcrt2[1300];
+                    snprintf(dllcrt2, sizeof(dllcrt2),
+                             "%s\\mingw\\lib\\dllcrt2.o", dll_exe_dir);
+                    const char *dll_entry =
+                        zan_file_exists(dllcrt2) ? "DllMainCRTStartup"
+                                                 : "DllMain";
+                    argv[a++] = "-e";
+                    argv[a++] = dll_entry;
+                    argv[a++] = "-o";
+                    argv[a++] = obj_path;
+                    argv[a++] = obj_tmp;
+                    if (zan_file_exists(dllcrt2) && a < 120)
+                        argv[a++] = dllcrt2;
+                    /* runtime objects the library actually uses (IO reactor,
+                     * sync runtime, embed API); host objects == target here,
+                     * and they must precede the -l libs (single-pass ld) */
+                    if (rt_io_obj && a < 120) argv[a++] = rt_io_obj;
+                    if (rt_sync_obj && a < 120) argv[a++] = rt_sync_obj;
+                    if (rt_embed_obj && a < 120) argv[a++] = rt_embed_obj;
+                    /* Also emit an import library (see implib naming note
+                     * above) so a consumer can link with just `-L <dir>` +
+                     * [DllImport("foo.dll")]. */
+                    argv[a++] = "-out-implib";
+                    argv[a++] = implib;
+                    char ldirbufs[20][520]; int nld = 0;
+                    if (dll_exe_dir[0] &&
+                        zan_file_exists(dll_exe_dir + 0) /* always true */) {
+                        /* bundled mingw runtime: must be on the search path
+                         * for -lmingw32 etc. */
+                        char mlib[1300];
+                        snprintf(mlib, sizeof(mlib), "%s\\mingw\\lib",
+                                 dll_exe_dir);
+                        if (zan_file_exists(mlib) && nld < 20 && a < 120) {
+                            snprintf(ldirbufs[nld], sizeof(ldirbufs[0]),
+                                     "-L%s", mlib);
+                            argv[a++] = ldirbufs[nld++];
+                        }
+                    }
+                    for (int di = 0; di < zan_lib_ndirs && nld < 20 && a < 120;
+                         di++) {
+                        snprintf(ldirbufs[nld], sizeof(ldirbufs[0]),
+                                 "-L%s", zan_lib_dirs[di]);
+                        argv[a++] = ldirbufs[nld++];
+                    }
+                    for (int di = 0; di < extra_lib_path_count && nld < 20 &&
+                         a < 120; di++) {
+                        snprintf(ldirbufs[nld], sizeof(ldirbufs[0]),
+                                 "-L%s", extra_lib_paths[di]);
+                        argv[a++] = ldirbufs[nld++];
+                    }
+                    /* CRT libs in a group: mingw import/static libs reference
+                     * each other, so a single-pass scan needs the group (the
+                     * runtime objects above are already on the link line). */
+                    argv[a++] = "--start-group";
+                    static const char *const dllcrt[] = {
+                        "-lmingw32", "-lgcc", "-lmoldname", "-lmingwex",
+                        "-lmsvcrt", "-lkernel32", NULL };
+                    for (int li = 0; dllcrt[li] && a < 150; li++)
+                        argv[a++] = dllcrt[li];
+                    /* the IO reactor uses Winsock */
+                    if (rt_io_obj && a < 150) argv[a++] = "-lws2_32";
+                    /* extern [DllImport] libraries */
+                    char libbufs[24][128]; int nb = 0;
+                    for (int li = 0; li < irgen.extern_lib_count && nb < 24
+                         && a < 150; li++) {
+                        int nlen;
+                        const char *nm = zan_dllimport_lname(
+                            irgen.extern_libs[li].str,
+                            (int)irgen.extern_libs[li].len, &nlen);
+                        if (!nm) continue;
+                        snprintf(libbufs[nb], sizeof(libbufs[0]),
+                                 "-l%.*s", nlen, nm);
+                        argv[a++] = libbufs[nb++];
+                    }
+                    argv[a++] = "--end-group";
+                    argv[a] = NULL;
+                    if (getenv("ZAN_VERBOSE_LINK")) {
+                        fprintf(stderr, "[link]");
+                        for (int ai = 0; ai < a; ai++)
+                            fprintf(stderr, " %s", argv[ai]);
+                        fprintf(stderr, "\n");
+                    }
+                    link_ret = (int)_spawnv(_P_WAIT, dll_ld, argv);
+                    lib_spawned = true;
+#else
+                    /* Cross-linking a DLL from a non-Windows host: ld.lld
+                     * (no quotes around the first token, so system() is
+                     * safe here). */
+                    const char *wsub = (target.arch == ZAN_ARCH_AARCH64)
+                                       ? "arm64pe" : "i386pep";
+                    snprintf(cmd, sizeof(cmd),
+                             "ld.lld -m %s -shared -e DllMain -o \"%s\" \"%s\""
+                             " -out-implib \"%s\"",
+                             wsub, obj_path, obj_tmp, implib);
+                    { size_t cur = strlen(cmd);
+                      snprintf(cmd + cur, sizeof(cmd) - cur,
+                               " -lmingw32 -lmoldname -lmingwex -lmsvcrt"
+                               " -lkernel32"); }
+                    for (int di = 0; di < zan_lib_ndirs; di++) {
+                        size_t cur = strlen(cmd);
+                        snprintf(cmd + cur, sizeof(cmd) - cur, " -L\"%s\"",
+                                 zan_lib_dirs[di]);
+                    }
+                    for (int di = 0; di < extra_lib_path_count; di++) {
+                        size_t cur = strlen(cmd);
+                        snprintf(cmd + cur, sizeof(cmd) - cur, " -L\"%s\"",
+                                 extra_lib_paths[di]);
+                    }
+                    for (int li = 0; li < irgen.extern_lib_count; li++) {
+                        int nlen;
+                        const char *nm = zan_dllimport_lname(
+                            irgen.extern_libs[li].str,
+                            (int)irgen.extern_libs[li].len, &nlen);
+                        if (!nm) continue;
+                        size_t cur = strlen(cmd);
+                        snprintf(cmd + cur, sizeof(cmd) - cur, " -l%.*s",
+                                 nlen, nm);
+                    }
+                    if (getenv("ZAN_VERBOSE_LINK"))
+                        fprintf(stderr, "[link] %s\n", cmd);
+                    link_ret = system(cmd);
+#endif
+                } else if (target.os == ZAN_OS_LINUX) {
+                    snprintf(cmd, sizeof(cmd),
+                             "ld.lld -shared -o \"%s\" \"%s\"", obj_path, obj_tmp);
+                    /* native Linux build: link host runtime objects the library
+                     * actually uses (cross builds needing them were rejected) */
+                    if (rt_io_obj) {
+                        size_t cur = strlen(cmd);
+                        snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"",
+                                 rt_io_obj);
+                    }
+                    if (rt_sync_obj) {
+                        size_t cur = strlen(cmd);
+                        snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"",
+                                 rt_sync_obj);
+                    }
+                    if (rt_embed_obj) {
+                        size_t cur = strlen(cmd);
+                        snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"",
+                                 rt_embed_obj);
+                    }
+                } else if (target.os == ZAN_OS_MACOS) {
+                    const char *march = (target.arch == ZAN_ARCH_AARCH64)
+                                        ? "arm64" : "x86_64";
+                    /* Resolve libc/libm/printf/malloc against the bundled
+                     * libSystem text stub, exactly like the macOS exe path. */
+                    char tbd[1200];
+                    snprintf(tbd, sizeof(tbd), "%s/macos/libSystem.tbd",
+                             exe_dir);
+                    if (!zan_file_exists(tbd)) {
+                        fprintf(stderr,
+                                "error: bundled macOS libSystem stub not found "
+                                "at '%s'; reinstall zan or rebuild with "
+                                "toolchain/macos present\n", tbd);
+                        remove(obj_tmp);
+                        zan_irgen_destroy(&irgen);
+                        zan_arena_free(arena);
+                        free(source);
+                        return 1;
+                    }
+                    snprintf(cmd, sizeof(cmd),
+                             "ld64.lld -dylib -arch %s -platform_version macos "
+                             "11.0 11.0 -o \"%s\" \"%s\" \"%s\"",
+                             march, obj_path, obj_tmp, tbd);
+                    /* native macOS build: link host runtime objects the
+                     * library actually uses (cross builds rejected above) */
+                    if (rt_io_obj) {
+                        size_t cur = strlen(cmd);
+                        snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"",
+                                 rt_io_obj);
+                    }
+                    if (rt_sync_obj) {
+                        size_t cur = strlen(cmd);
+                        snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"",
+                                 rt_sync_obj);
+                    }
+                    if (rt_embed_obj) {
+                        size_t cur = strlen(cmd);
+                        snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"",
+                                 rt_embed_obj);
+                    }
+                } else {
+                    fprintf(stderr, "error: shared libraries are not supported "
+                            "for this target yet\n");
+                    remove(obj_tmp);
+                    zan_irgen_destroy(&irgen);
+                    zan_arena_free(arena);
+                    free(source);
+                    return 1;
+                }
+                /* library search dirs + extern [DllImport] libs, so a library
+                 * that binds a native dependency resolves it like an exe does */
+                if (!lib_spawned) {
+                    for (int di = 0; di < zan_lib_ndirs; di++) {
+                        size_t cur = strlen(cmd);
+                        snprintf(cmd + cur, sizeof(cmd) - cur, " -L\"%s\"",
+                                 zan_lib_dirs[di]);
+                    }
+                    for (int di = 0; di < extra_lib_path_count; di++) {
+                        size_t cur = strlen(cmd);
+                        snprintf(cmd + cur, sizeof(cmd) - cur, " -L\"%s\"",
+                                 extra_lib_paths[di]);
+                    }
+                    for (int li = 0; li < irgen.extern_lib_count; li++) {
+                        /* Windows system libraries (kernel32, user32, ...)
+                         * only make sense for a Windows DLL; a cross-built
+                         * ELF/dylib must not try to resolve them. */
+                        if (target.os != ZAN_OS_WINDOWS &&
+                            zan_win_system_lib(irgen.extern_libs[li].str,
+                                               (int)irgen.extern_libs[li].len))
+                            continue;
+                        int nlen;
+                        const char *nm = zan_dllimport_lname(
+                            irgen.extern_libs[li].str,
+                            (int)irgen.extern_libs[li].len, &nlen);
+                        if (!nm) continue;
+                        size_t cur = strlen(cmd);
+                        snprintf(cmd + cur, sizeof(cmd) - cur, " -l%.*s",
+                                 nlen, nm);
+                    }
+                    if (getenv("ZAN_VERBOSE_LINK"))
+                        fprintf(stderr, "[link] %s\n", cmd);
+                    link_ret = system(cmd);
+                }
+            }
+        } else if (cross_compiling && target.os == ZAN_OS_LINUX) {
             /* Self-contained cross-compile to Linux: static-link the ELF object
              * against a bundled musl sysroot with ld.lld. The result is a
              * dependency-free static binary - no glibc, no shared libs, no WSL

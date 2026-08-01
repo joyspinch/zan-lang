@@ -604,6 +604,62 @@ add_test(NAME conformance_nsdup
     -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_nsdup${_exe_ext}
     -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
+# ---- Library output: static archive + shared libraries (.dll/.so/.dylib) ----
+# A library has no entry point, so these bypass the compile-run-compare GLOB:
+# the artifact is validated by format magic (and, on Windows, a consumer that
+# links the DLL via [DllImport] and runs, proving the public method is exported
+# and the generated import library resolves). .so/.dylib are cross-produced;
+# they cannot execute on the host, so format + successful link is the gate.
+set(_emitlib_src ${CMAKE_SOURCE_DIR}/tests/emit_lib/lib.zan)
+set(_emitlib_consumer ${CMAKE_SOURCE_DIR}/tests/emit_lib/consumer.zan)
+set(_emitlib_expected ${CMAKE_SOURCE_DIR}/tests/emit_lib/expected.out)
+
+add_test(NAME emit_lib_static
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${_emitlib_src}
+    -DOUT=${CMAKE_BINARY_DIR}/emitlib_test.a
+    -DMODE=static
+    -DSTDLIB_STAMP=${_stdlib_stamp}
+    -P ${CMAKE_SOURCE_DIR}/tests/run_emit_lib.cmake)
+set_tests_properties(emit_lib_static PROPERTIES TIMEOUT 120)
+
+if(WIN32)
+  add_test(NAME emit_lib_windows_dll
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${_emitlib_src}
+      -DOUT=${CMAKE_BINARY_DIR}/emitlib_test.dll
+      -DMODE=dll
+      -DCONSUMER=${_emitlib_consumer}
+      -DEXPECTED=${_emitlib_expected}
+      -DSTDLIB_STAMP=${_stdlib_stamp}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_emit_lib.cmake)
+  set_tests_properties(emit_lib_windows_dll PROPERTIES TIMEOUT 120)
+endif()
+
+add_test(NAME emit_lib_linux_so
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${_emitlib_src}
+    -DOUT=${CMAKE_BINARY_DIR}/emitlib_test.so
+    -DMODE=so
+    -DTARGET=linux-musl
+    -DSTDLIB_STAMP=${_stdlib_stamp}
+    -P ${CMAKE_SOURCE_DIR}/tests/run_emit_lib.cmake)
+set_tests_properties(emit_lib_linux_so PROPERTIES TIMEOUT 120)
+
+add_test(NAME emit_lib_macos_dylib
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${_emitlib_src}
+    -DOUT=${CMAKE_BINARY_DIR}/emitlib_test.dylib
+    -DMODE=dylib
+    -DTARGET=macos-x64
+    -DSTDLIB_STAMP=${_stdlib_stamp}
+    -P ${CMAKE_SOURCE_DIR}/tests/run_emit_lib.cmake)
+set_tests_properties(emit_lib_macos_dylib PROPERTIES TIMEOUT 120)
+
 # ---- Self-hosting: build gen1 with the C host, emit IR for a real program,
 #      clang-compile + run + diff stdout, and verify malformed input fails
 #      closed (non-zero, no .ll). clang is optional -- without it the stdout
