@@ -1,0 +1,382 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+namespace Gui.Component.DataTable;
+
+/// Reads one column's display text out of a bound entity:
+/// `grid.Col("Name", 140, u => u.name)`.
+delegate string GridText<T>(T row);
+
+/// Reads an integer key out of an entity, used to sort / aggregate a numeric
+/// column by value instead of by its rendered string.
+delegate int GridInt<T>(T row);
+
+/// Reads a fractional key out of an entity, for a column declared with
+/// `decimals > 0` (currency, rates): sorting and totals keep the fraction.
+delegate double GridReal<T>(T row);
+
+/// Reads a truth value out of an entity, for a checkbox / bool column.
+delegate bool GridBool<T>(T row);
+
+/// Writes an edited value back into the entity (inline editing). Without one a
+/// column is display-only even when the grid allows editing elsewhere.
+delegate void GridSet<T>(T row, string v);
+
+/// Creates a fresh, blank row entity for the new-row placeholder and the
+/// context-menu insert command (`() => new User()`). A generic front cannot
+/// `new T()` on its own, so this is what turns AllowAddRow on into a working
+/// insert; without it the grid stays read-only for row counts.
+delegate T GridNew<T>();
+
+/// One column of a `DataGrid<T>`: the reusable `DataColumn` descriptor the
+/// engine already understands, paired with the accessors that read this
+/// column's value straight out of a bound `T` — so the grid binds to real
+/// domain objects (`List<User>`) instead of positional string cells.
+///
+/// The configurators mirror `DataColumn`'s (Money / Percent / Sortable / …) and
+/// mutate the descriptor in place, so they compose fluently:
+///
+/// ```zan
+/// grid.RealCol("Amount", 110, 2, o => o.amount).Money("¥").Sum();
+/// ```
+class GridColumn<T> {
+    /// The descriptor the DataTable engine reads (title, width, type, format,
+    /// summary, editing, freeze, band …). Shared by reference with the list the
+    /// grid hands the engine every frame.
+    DataColumn desc;
+
+    /// Display text. When null the grid derives it from whichever typed
+    /// accessor the column has, so a numeric / bool column needs no separate
+    /// text reader.
+    GridText<T> text;
+    /// Integer sort/aggregate key (numeric columns). Falls back to parsing the
+    /// display text when null.
+    GridInt<T> num;
+    /// Fractional sort/aggregate key (decimals > 0). Falls back to parsing the
+    /// display text when null.
+    GridReal<T> real;
+    /// Truth key (bool columns). Falls back to parsing the display text.
+    GridBool<T> truth;
+    /// Write-back for inline editing. Null means the column is display-only.
+    GridSet<T> setter;
+
+    GridColumn(DataColumn d) {
+        this.desc = d;
+        this.text = null;
+        this.num = null;
+        this.real = null;
+        this.truth = null;
+        this.setter = null;
+    }
+
+    // ---- editing ----
+    /// Make this column editable and route committed values back into the
+    /// entity through `w`.
+    GridColumn<T> Editable(GridSet<T> w) {
+        this.setter = w;
+        DataColumn.Editable(this.desc);
+        return this;
+    }
+
+    // ---- descriptor pass-throughs (mutate desc, return this for chaining) ----
+    GridColumn<T> Field(string name) { DataColumn.Field(this.desc, name); return this; }
+    GridColumn<T> Right() { this.desc.align = 2; return this; }
+    GridColumn<T> Center() { this.desc.align = 1; return this; }
+    GridColumn<T> NotSortable() { this.desc.sortable = false; return this; }
+    GridColumn<T> NotResizable() { DataColumn.NotResizable(this.desc); return this; }
+    GridColumn<T> Money(string symbol) { DataColumn.Money(this.desc, symbol); return this; }
+    GridColumn<T> Percent() { DataColumn.Percent(this.desc); return this; }
+    GridColumn<T> Grouped() { DataColumn.Grouped(this.desc); return this; }
+    GridColumn<T> Affix(string prefix, string suffix) { DataColumn.Affix(this.desc, prefix, suffix); return this; }
+    GridColumn<T> Pin() { DataColumn.Pin(this.desc); return this; }
+    GridColumn<T> PinRight() { DataColumn.PinRight(this.desc); return this; }
+    GridColumn<T> Band(string path) { DataColumn.Band(this.desc, path); return this; }
+    GridColumn<T> Sum() { DataColumn.Sum(this.desc); return this; }
+    GridColumn<T> Avg() { DataColumn.Avg(this.desc); return this; }
+    GridColumn<T> Min() { DataColumn.Min(this.desc); return this; }
+    GridColumn<T> Max() { DataColumn.Max(this.desc); return this; }
+    GridColumn<T> Count() { DataColumn.Count(this.desc); return this; }
+
+    /// The raw (unformatted) cell string the engine reads for display, sorting
+    /// keys and export. The engine applies the column's display format
+    /// (grouping / prefix / suffix / date / bool) on top of this, so the raw
+    /// value stays parseable. Derives from the typed accessor when no text
+    /// reader was given.
+    string Raw(T row) {
+        if (this.text != null) { return this.text(row); }
+        if (this.real != null) { return DataTable.FormatReal(this.real(row), this.desc.decimals); }
+        if (this.num != null) { return Convert.ToString(this.num(row)); }
+        if (this.truth != null) {
+            if (this.truth(row)) { return this.desc.boolTrue; }
+            return this.desc.boolFalse;
+        }
+        return "";
+    }
+}
+
+/// Adapts a `List<T>` plus a column's accessors to the engine's `DataSource`,
+/// so the powerful DataTable engine (sort / filter / group / aggregate / edit /
+/// virtualise) runs unchanged over the caller's own objects. Nothing is copied:
+/// cells are read from the live list every frame.
+class GridSource<T> : DataSource {
+    List<T> data;
+    List<GridColumn<T>> cols;
+    /// Factory for a blank row entity; null keeps the source read-only.
+    GridNew<T> factory;
+
+    override int RowCount() {
+        if (this.data == null) { return 0; }
+        return this.data.Count;
+    }
+
+    override string CellText(int row, int col) {
+        if (col < 0 || col >= this.cols.Count) { return ""; }
+        return this.cols[col].Raw(this.data[row]);
+    }
+
+    override int CellNum(int row, int col) {
+        GridColumn<T> gc = this.cols[col];
+        if (gc.num != null) { return gc.num(this.data[row]); }
+        return DataTable.ParseInt(this.CellText(row, col));
+    }
+
+    override double CellReal(int row, int col) {
+        GridColumn<T> gc = this.cols[col];
+        if (gc.real != null) { return gc.real(this.data[row]); }
+        return DataTable.ParseReal(this.CellText(row, col));
+    }
+
+    override bool CellBool(int row, int col) {
+        GridColumn<T> gc = this.cols[col];
+        if (gc.truth != null) { return gc.truth(this.data[row]); }
+        return DataTable.ParseBool(this.CellText(row, col));
+    }
+
+    override void SetCell(int row, int col, string v) {
+        if (col < 0 || col >= this.cols.Count) { return; }
+        GridColumn<T> gc = this.cols[col];
+        if (gc.setter != null) { gc.setter(this.data[row], v); }
+    }
+
+    /// A column with a write-back accessor makes the grid editable; a source
+    /// with no such column stays read-only. Row insert/delete is enabled by
+    /// `DataGrid.RowFactory`, which supplies the blank-entity constructor a
+    /// generic front cannot synthesise.
+    override bool CanInsert() { return this.factory != null; }
+
+    override bool InsertRow(int at) {
+        if (this.factory == null) { return false; }
+        if (at < 0 || at > this.data.Count) { return false; }
+        this.data.Insert(at, this.factory());
+        return true;
+    }
+
+    override bool RemoveRow(int at) {
+        if (at < 0 || at >= this.data.Count) { return false; }
+        this.data.RemoveAt(at);
+        return true;
+    }
+}
+
+/// A data grid bound to the caller's own list of entities, in the same shape as
+/// `ListView<T>` / `Dropdown<T>` — declare columns with an accessor, hand it the
+/// data, and nothing about layout, storage or per-cell strings leaks to the
+/// call site:
+///
+/// ```zan
+/// DataGrid<User> grid = new DataGrid<User>();
+/// grid.Col("Name", 140, u => u.name);
+/// grid.Col("Email", 200, u => u.email);
+/// grid.NumCol("Age", 80, u => u.age).Right();
+/// grid.Bind(users);          // the caller's List<User>, read every frame
+/// side.Add(grid);
+/// ```
+///
+/// Under the hood it drives the full DataTable engine (sortable / filterable /
+/// groupable / editable / virtualised), so the generic front loses none of its
+/// power — see `DataGrid.State()` for the escape hatch to the raw
+/// `DataTableState`.
+class DataGrid<T> : Control {
+    List<GridColumn<T>> gcols;
+    List<T> data;
+    DataTableState st;
+    GridSource<T> source;
+    /// The `List<DataColumn>` handed to the engine each frame, kept in step with
+    /// `gcols` so a column added after construction still shows up.
+    List<DataColumn> descs;
+
+    void InitGrid() {
+        this.InitControl("datatable", 5);
+        this.gcols = new List<GridColumn<T>>();
+        this.data = null;
+        this.st = DataTableState.Create();
+        this.source = new GridSource<T>();
+        this.source.cols = this.gcols;
+        this.source.data = null;
+        this.source.factory = null;
+        this.descs = new List<DataColumn>();
+        // The engine does its own hit-testing / painting for the whole grid, so
+        // the base control must not also wire a hit region or stamp a surface.
+        this.wiresOwnEvents = true;
+    }
+
+    DataGrid() { this.InitGrid(); }
+
+    override string Kind() { return "DataGrid"; }
+
+    override string StyleType() { return "datatable"; }
+
+    // ---- data ---------------------------------------------------------------
+
+    /// Binds the caller's list. Not copied — the grid reads it every frame, so
+    /// mutating the list shows up on the next paint.
+    DataGrid<T> Bind(List<T> src) {
+        this.data = src;
+        this.source.data = src;
+        return this;
+    }
+
+    int Count() {
+        if (this.data == null) { return 0; }
+        return this.data.Count;
+    }
+
+    /// The live `DataTableState`, for advanced configuration the fluent methods
+    /// don't cover (custom `CellStyler`, master-detail provider, bindings) and
+    /// for reading interaction context inside handlers (HitRow / HitCol / …).
+    DataTableState State() { return this.st; }
+
+    // ---- columns ------------------------------------------------------------
+
+    GridColumn<T> Add(GridColumn<T> col) {
+        this.gcols.Add(col);
+        return col;
+    }
+
+    /// A plain text column.
+    GridColumn<T> Col(string title, int width, GridText<T> read) {
+        GridColumn<T> c = new GridColumn<T>(DataColumn.Text(title, width));
+        c.text = read;
+        return this.Add(c);
+    }
+
+    /// An integer column: right-aligned, sorted and totalled by value.
+    GridColumn<T> NumCol(string title, int width, GridInt<T> read) {
+        GridColumn<T> c = new GridColumn<T>(DataColumn.Numeric(title, width));
+        c.num = read;
+        return this.Add(c);
+    }
+
+    /// A fractional numeric column with `decimals` places.
+    GridColumn<T> RealCol(string title, int width, int decimals, GridReal<T> read) {
+        GridColumn<T> c = new GridColumn<T>(DataColumn.Real(title, width, decimals));
+        c.real = read;
+        return this.Add(c);
+    }
+
+    /// A checkbox / truth column.
+    GridColumn<T> BoolCol(string title, int width, GridBool<T> read) {
+        GridColumn<T> c = new GridColumn<T>(DataColumn.Bool(title, width));
+        c.truth = read;
+        return this.Add(c);
+    }
+
+    /// A date column; `order` names the field order of the stored text
+    /// (0 y-m-d, 1 d-m-y, 2 m-d-y).
+    GridColumn<T> DateCol(string title, int width, int order, GridText<T> read) {
+        GridColumn<T> c = new GridColumn<T>(DataColumn.AsDate(DataColumn.Create(title, width), order));
+        c.text = read;
+        return this.Add(c);
+    }
+
+    // ---- appearance toggles (forwarded to the state) ------------------------
+
+    DataGrid<T> RowNumbers(bool on) { this.st.showRowNum = on; return this; }
+    DataGrid<T> Selectable(bool on) { this.st.showSelect = on; return this; }
+    DataGrid<T> Striped(bool on) { this.st.striped = on; return this; }
+    DataGrid<T> Summary(bool on) { this.st.showSummary = on; return this; }
+    DataGrid<T> FilterRow(bool on) { this.st.showFilterRow = on; return this; }
+    DataGrid<T> StatusBar(bool on) { this.st.showStatusBar = on; return this; }
+    DataGrid<T> GroupPanel(bool on) { this.st.showGroupPanel = on; return this; }
+    /// Shows the "click here to add" placeholder under the last row and the
+    /// context-menu insert/delete commands. The commands only work once a row
+    /// factory is installed — see RowFactory.
+    DataGrid<T> AllowAddRow(bool on) { this.st.allowAddRow = on; return this; }
+
+    /// Enables row insert/delete by giving the source a factory that builds a
+    /// blank entity for each new row: `grid.RowFactory(() => new User());`
+    /// Without one the generic front cannot construct a `T`, so the grid stays
+    /// fixed-size no matter what AllowAddRow says.
+    DataGrid<T> RowFactory(GridNew<T> f) {
+        this.source.factory = f;
+        return this;
+    }
+
+    // ---- handlers -----------------------------------------------------------
+    // The state is the event sender; a handler reads context off State()
+    // (HitRow / HitCol / EditRow / EditValue / …), matching the engine's model.
+
+    DataGrid<T> OnRowClick(Action a) { this.st.RowClick.Add(a); return this; }
+    DataGrid<T> OnRowDoubleClick(Action a) { this.st.RowDoubleClick.Add(a); return this; }
+    DataGrid<T> OnCellClick(Action a) { this.st.CellClick.Add(a); return this; }
+    DataGrid<T> OnCellEdit(Action a) { this.st.CellEdit.Add(a); return this; }
+    DataGrid<T> OnSelectionChanged(Action a) { this.st.SelectionChanged.Add(a); return this; }
+    DataGrid<T> OnSort(Action a) { this.st.Sort.Add(a); return this; }
+    DataGrid<T> OnFilterChanged(Action a) { this.st.FilterChanged.Add(a); return this; }
+
+    // ---- internals ----------------------------------------------------------
+
+    /// Refresh the engine's descriptor list from the current columns. The
+    /// descriptors are shared by reference, so an in-place configurator edit is
+    /// already visible; this only re-syncs the list length when columns are
+    /// added.
+    void SyncDescs() {
+        if (this.descs.Count == this.gcols.Count) { return; }
+        this.descs = new List<DataColumn>();
+        int i = 0;
+        while (i < this.gcols.Count) {
+            this.descs.Add(this.gcols[i].desc);
+            i = i + 1;
+        }
+    }
+
+    // ---- retained hooks -----------------------------------------------------
+
+    override void OnMeasure(App app) {
+        this.prefW = app.Scale(360);
+        this.prefH = app.Scale(240);
+    }
+
+    override void OnPaint(App app) {
+        this.SyncDescs();
+        DataTable.RenderSource(app, bx, by, bw, bh, this.descs, this.source, this.st);
+    }
+
+    override List<string> Events() {
+        List<string> e = Control.CommonEvents();
+        e.Add("RowClick");
+        e.Add("RowDoubleClick");
+        e.Add("CellClick");
+        e.Add("CellEdit");
+        e.Add("SelectionChanged");
+        e.Add("Sort");
+        e.Add("FilterChanged");
+        return e;
+    }
+
+    /// Routes the grid's semantic events onto the engine state's own UiEvent
+    /// fields (the same queues the fluent `OnRowClick`/… subscribe to), so a
+    /// JSON/designer `onRowClick` handler works; everything else falls through
+    /// to the common bundle on `On`.
+    override void BindEvent(string evt, Action a) {
+        if (evt == "RowClick") { this.st.RowClick.Add(a); return; }
+        if (evt == "RowDoubleClick") { this.st.RowDoubleClick.Add(a); return; }
+        if (evt == "CellClick") { this.st.CellClick.Add(a); return; }
+        if (evt == "CellEdit") { this.st.CellEdit.Add(a); return; }
+        if (evt == "SelectionChanged") { this.st.SelectionChanged.Add(a); return; }
+        if (evt == "Sort") { this.st.Sort.Add(a); return; }
+        if (evt == "FilterChanged") { this.st.FilterChanged.Add(a); return; }
+        On.AddByName(evt, a);
+    }
+}

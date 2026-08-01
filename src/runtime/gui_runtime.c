@@ -466,12 +466,36 @@ EXPORT void zan_gui_fill_vgrad(
     }
 }
 
+/* Is local pixel (i,j) inside a rounded-rect mask of size rw*rh with corner
+ * radius cr (corner bits per ZAN_CORNER_*)? Corner geometry matches
+ * zan_gui_fill_rounded_rect_mask so a rounded blur lines up exactly with the
+ * translucent rounded tint drawn over it. cr<=0 means the whole rect. */
+static int zan_round_in(int i, int j, int rw, int rh, int cr, int cmask) {
+    if (cr <= 0) return 1;
+    if (cr > rw / 2) cr = rw / 2;
+    if (cr > rh / 2) cr = rh / 2;
+    if (cr <= 0) return 1;
+    if ((i >= cr && i < rw - cr) || (j >= cr && j < rh - cr)) return 1;
+    int cx, cy, bit;
+    if (i < cr && j < cr)              { cx = cr;      cy = cr;      bit = 1; }
+    else if (i >= rw - cr && j < cr)   { cx = rw - cr; cy = cr;      bit = 2; }
+    else if (i < cr && j >= rh - cr)   { cx = cr;      cy = rh - cr; bit = 8; }
+    else                               { cx = rw - cr; cy = rh - cr; bit = 4; }
+    if (!(cmask & bit)) return 1;                 /* square (welded) corner */
+    double dx = (double)i + 0.5 - (double)cx;
+    double dy = (double)j + 0.5 - (double)cy;
+    return (dx * dx + dy * dy) <= (double)cr * (double)cr ? 1 : 0;
+}
+
 /* Backdrop blur: separable box blur (3 passes ~ Gaussian) over a rectangular
  * region, in place. Used to render frosted-glass panels — draw the backdrop,
  * blur the region behind a panel, then overlay a translucent tint. Alpha is
  * forced opaque (the backdrop under an overlay is opaque). Edge samples are
- * clamped to the region. Cost is O(passes * area), independent of radius. */
-EXPORT void zan_gui_blur_rect(i32 surface_id, i32 x, i32 y, i32 w, i32 h, i32 radius) {
+ * clamped to the region. Cost is O(passes * area), independent of radius.
+ * When cr>0 the blurred output is written only inside a rounded-rect mask, so
+ * the panel's corners keep the sharp backdrop instead of a blurred square that
+ * a translucent rounded tint can never paint back over. */
+static void zan_blur_rect_core(i32 surface_id, i32 x, i32 y, i32 w, i32 h, i32 radius, int cr, int cmask) {
     if (surface_id < 0 || surface_id >= g_surface_count) return;
     zan_surface_t *s = g_surfaces[surface_id];
     if (!s) return;
@@ -596,7 +620,8 @@ EXPORT void zan_gui_blur_rect(i32 surface_id, i32 x, i32 y, i32 w, i32 h, i32 ra
                 int rC = clamp_i((int)((px >> 16) & 0xFF) + nz, 0, 255);
                 int gC = clamp_i((int)((px >> 8) & 0xFF) + nz, 0, 255);
                 int bC = clamp_i((int)(px & 0xFF) + nz, 0, 255);
-                row[i] = 0xFF000000u | ((u32)rC << 16) | ((u32)gC << 8) | (u32)bC;
+                if (cr <= 0 || zan_round_in(i, j, rw, rh, cr, cmask))
+                    row[i] = 0xFF000000u | ((u32)rC << 16) | ((u32)gC << 8) | (u32)bC;
             }
         }
     } else {
@@ -633,11 +658,16 @@ EXPORT void zan_gui_blur_rect(i32 surface_id, i32 x, i32 y, i32 w, i32 h, i32 ra
                 rC = clamp_i(rC + nz, 0, 255);
                 gC = clamp_i(gC + nz, 0, 255);
                 bC = clamp_i(bC + nz, 0, 255);
-                row[i] = 0xFF000000u | ((u32)rC << 16) | ((u32)gC << 8) | (u32)bC;
+                if (cr <= 0 || zan_round_in(i, j, rw, rh, cr, cmask))
+                    row[i] = 0xFF000000u | ((u32)rC << 16) | ((u32)gC << 8) | (u32)bC;
             }
         }
     }
     free(a); free(b);
+}
+
+EXPORT void zan_gui_blur_rect(i32 surface_id, i32 x, i32 y, i32 w, i32 h, i32 radius) {
+    zan_blur_rect_core(surface_id, x, y, w, h, radius, 0, 15);
 }
 
 /* --- Frosted-glass blur cache ---------------------------------------------
@@ -661,14 +691,14 @@ typedef struct {
 } zan_blur_cache_t;
 static zan_blur_cache_t g_blur_cache[ZAN_BLUR_CACHE_SLOTS];
 
-EXPORT void zan_gui_blur_rect_cached(
+static void zan_blur_cached_core(
     i32 surface_id, i32 x, i32 y, i32 w, i32 h, i32 radius, i32 slot,
-    i32 dirty) {
+    i32 dirty, int cr, int cmask) {
     if (surface_id < 0 || surface_id >= g_surface_count) return;
     zan_surface_t *s = g_surfaces[surface_id];
     if (!s) return;
     if (slot < 0 || slot >= ZAN_BLUR_CACHE_SLOTS) {
-        zan_gui_blur_rect(surface_id, x, y, w, h, radius);
+        zan_blur_rect_core(surface_id, x, y, w, h, radius, cr, cmask);
         return;
     }
     int x0 = clamp_i((int)x, 0, s->width);
@@ -693,13 +723,15 @@ EXPORT void zan_gui_blur_rect_cached(
         for (int j = 0; j < rh; j++) {
             u32 *row = s->pixels + (y0 + j) * s->stride + x0;
             u32 *src = c->pixels + (size_t)j * rw;
-            for (int i = 0; i < rw; i++) row[i] = src[i];
+            for (int i = 0; i < rw; i++)
+                if (cr <= 0 || zan_round_in(i, j, rw, rh, cr, cmask))
+                    row[i] = src[i];
         }
         return;
     }
 
     /* Recompute in place (identical clamping), then snapshot into the slot. */
-    zan_gui_blur_rect(surface_id, x, y, w, h, radius);
+    zan_blur_rect_core(surface_id, x, y, w, h, radius, cr, cmask);
     if (c->cap < n) {
         u32 *np = (u32 *)realloc(c->pixels, n * sizeof(u32));
         if (!np) { c->valid = 0; return; }
@@ -714,6 +746,23 @@ EXPORT void zan_gui_blur_rect_cached(
     c->x0 = x0; c->y0 = y0; c->rw = rw; c->rh = rh; c->r = r;
     c->sid = (int)surface_id;
     c->valid = 1;
+}
+
+EXPORT void zan_gui_blur_rect_cached(
+    i32 surface_id, i32 x, i32 y, i32 w, i32 h, i32 radius, i32 slot,
+    i32 dirty) {
+    zan_blur_cached_core(surface_id, x, y, w, h, radius, slot, dirty, 0, 15);
+}
+
+/* Rounded frosted-glass blur: like zan_gui_blur_rect_cached but the blurred
+ * output is clipped to a rounded-rect (corner radius cr, corner bits cmask) so
+ * a panel's corners keep the sharp backdrop and line up with the rounded tint
+ * drawn over them. */
+EXPORT void zan_gui_blur_round_cached(
+    i32 surface_id, i32 x, i32 y, i32 w, i32 h, i32 radius, i32 slot,
+    i32 dirty, i32 corner_radius, i32 corner_mask) {
+    zan_blur_cached_core(surface_id, x, y, w, h, radius, slot, dirty,
+                         (int)corner_radius, (int)corner_mask);
 }
 
 /* --- Static-backdrop snapshot cache ---------------------------------------

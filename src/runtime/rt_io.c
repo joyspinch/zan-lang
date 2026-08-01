@@ -684,6 +684,7 @@ int32_t zan_io_set_nonblocking(intptr_t fd) {
 static void io_register(intptr_t fd, int32_t interest, void *co, zan_co_step_t step) {
     if (io_reject_dead_fd(fd, co, step)) return;
     zan_io_entry_t *e = (zan_io_entry_t *)calloc(1, sizeof(*e));
+    if (!e) { io_reject_dead_fd(-1, co, step); return; }
     e->fd = (int)fd;
     e->interest = interest;
     e->co = co;
@@ -1220,6 +1221,7 @@ static void io_register(intptr_t fd, int32_t interest, void *co, zan_co_step_t s
     if (fd >= FD_SETSIZE) { io_reject_dead_fd(-1, co, step); return; }
     if (io_reject_dead_fd(fd, co, step)) return;
     zan_io_entry_t *e = (zan_io_entry_t *)calloc(1, sizeof(*e));
+    if (!e) { io_reject_dead_fd(-1, co, step); return; }
     e->fd = (int)fd;
     e->interest = interest;
     e->co = co;

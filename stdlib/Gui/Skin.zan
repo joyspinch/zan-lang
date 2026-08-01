@@ -32,6 +32,7 @@ class Skin {
     /// ships none) and how strongly it is laid over the wallpaper (percent).
     string art;
     int artOpacity;
+    bool loaded;
 
     static List<string> cacheNames;
     static List<Skin> cacheSkins;
@@ -45,6 +46,7 @@ class Skin {
         s.dark = true;
         s.art = "";
         s.artOpacity = 100;
+        s.loaded = false;
         return s;
     }
 
@@ -63,9 +65,14 @@ class Skin {
         }
         Skin s = Skin.Create(name);
         s.dir = Skin.FindDir(name);
-        if (s.dir != "") {
-            string css = Skin.ReadIfExists(s.dir + "/skin.css");
-            if (css != "") { s.sheet = StyleSheet.FromCss(css); }
+        // CSS from disk (lets a user override a baked-in pack), else from the
+        // resource baked into the exe.
+        string css = "";
+        if (s.dir != "") { css = Skin.ReadIfExists(s.dir + "/skin.css"); }
+        if (css == "") { css = Skin.EmbedRead("skins/" + name + "/skin.css"); }
+        if (css != "") {
+            s.loaded = true;
+            s.sheet = StyleSheet.FromCss(css);
             s.art = Skin.FindArt(s.dir);
             s.theme = Skin.ThemeOf(s.sheet);
             s.dark = Skin.DarkOf(s.sheet);
@@ -95,7 +102,10 @@ class Skin {
     }
 
     /// True when the pack was found on disk.
-    bool IsLoaded() { return dir != ""; }
+    bool IsLoaded() { return loaded; }
+
+    /// The pack's own backdrop illustration path ("" when it ships none).
+    string ArtPath() { return art; }
 
     /// A new Theme built from this pack's `:root` tokens, or null when the pack
     /// only carries rules. Callers own the result and may mutate it.
@@ -106,7 +116,9 @@ class Skin {
 
     /// Installs the skin on `app`: the theme from `:root` (falling back to the
     /// current theme), the stylesheet every widget resolves against, and the
-    /// backdrop artwork.
+    /// backdrop artwork. The pack's art fills the backdrop only when the user
+    /// has not picked their own wallpaper -- a user wallpaper always wins, so
+    /// switching skins never swaps someone's chosen backdrop for a pack's.
     void Apply(App app) {
         app.sheet = sheet;
         app.skinName = name;
@@ -115,13 +127,19 @@ class Skin {
         // compounded those on every switch back to this pack.
         Theme fresh = this.NewTheme();
         if (fresh != null) { app.ApplyTheme(fresh, dark); }
+        // Was the current wallpaper the PREVIOUS pack's art? (skinArt still names
+        // the old pack here -- this.ApplyTheme does not touch it.)
         bool hadArt = app.SkinArtWallpaper();
+        // A user wallpaper is any non-art image; remember it before skinArt is
+        // overwritten below.
+        bool hadUser = app.HasUserWallpaper();
         app.skinArt = art;
-        if (art != "") {
+        app.skinArtOpacity = artOpacity;
+        if (art != "" && !hadUser) {
             app.SetWallpaper(art, artOpacity);
-        } else if (hadArt) {
+        } else if (hadArt && art == "" && !hadUser) {
             // Leaving a pack that installed artwork for one that ships none:
-            // its illustration must go with it.
+            // its illustration must go with it (but never a user wallpaper).
             app.ClearWallpaper();
         }
         app.bgThemeGen = app.bgThemeGen + 1;
@@ -136,6 +154,15 @@ class Skin {
         List<string> r = new List<string>();
         string env = Skin.Env("ZAN_GUI_SKINS");
         if (env != "") { r.Add(env); }
+        // Install dir passed by the self-extract launcher (which unpacks the exe
+        // to a per-user cache): skins/base.css live here, not next to the
+        // extracted exe, so resolve them via ZAN_APP_DIR too.
+        string appdir = Skin.Env("ZAN_APP_DIR");
+        if (appdir != "") {
+            r.Add(appdir + "/skins");
+            r.Add(appdir + "/assets/skins");
+            r.Add(appdir + "/stdlib/Gui/skins");
+        }
         // Skin packs ship beside the executable (like ide.css / SDL3.dll), so
         // resolve them from the exe location first -- discovery then works no
         // matter what working directory the process was launched from.
@@ -205,7 +232,42 @@ class Skin {
                 names.Add(nm);
             }
         }
+        // Packs baked into the exe (each "skins/<name>/skin.css").
+        string emb = Skin.EmbedList("skins/");
+        int p = 0;
+        int start = 0;
+        while (p <= emb.Length) {
+            bool brk = false;
+            if (p == emb.Length) { brk = true; }
+            else if (emb[p] == '\n') { brk = true; }
+            if (brk) {
+                if (p > start) {
+                    string line = emb.Substring(start, p - start);
+                    string nm = Skin.EmbedSkinName(line);
+                    if (nm != "" && !Skin.Contains(names, nm)) { names.Add(nm); }
+                }
+                start = p + 1;
+            }
+            p = p + 1;
+        }
         return names;
+    }
+
+    /// "skins/dark/skin.css" -> "dark"; "" for names without a pack folder
+    /// (e.g. the top-level "skins/base.css").
+    static string EmbedSkinName(string line) {
+        string pre = "skins/";
+        if (line.Length <= pre.Length) { return ""; }
+        if (line.Substring(0, pre.Length) != pre) { return ""; }
+        string rest = line.Substring(pre.Length, line.Length - pre.Length);
+        int slash = -1;
+        int i = 0;
+        while (i < rest.Length) {
+            if (rest[i] == '/') { slash = i; i = rest.Length; }
+            else { i = i + 1; }
+        }
+        if (slash <= 0) { return ""; }
+        return rest.Substring(0, slash);
     }
 
     /// Every skin, in picker order: `--order` first (the built-in packs number
@@ -365,7 +427,7 @@ class Skin {
             i = i + 1;
             if (File.Exists(cand)) { return File.ReadAllText(cand); }
         }
-        return "";
+        return Skin.EmbedRead("skins/base.css");
     }
 
     static string Leaf(string path) {
@@ -393,6 +455,27 @@ class Skin {
 
     static string Env(string name) {
         string v = getenv(name);
+        if (v == null) { return ""; }
+        return v;
+    }
+
+    // ---- embedded resources (baked into the exe) ---------------------------
+    static extern string zan_embed_read(string name);
+    static extern int zan_embed_has(string name);
+    static extern string zan_embed_list(string prefix);
+
+    /// Text resource baked into the exe, "" when absent (or none embedded).
+    static string EmbedRead(string name) {
+        string v = Skin.zan_embed_read(name);
+        if (v == null) { return ""; }
+        return v;
+    }
+
+    static bool EmbedHas(string name) { return Skin.zan_embed_has(name) != 0; }
+
+    /// '\n'-joined embedded resource names under `prefix`.
+    static string EmbedList(string prefix) {
+        string v = Skin.zan_embed_list(prefix);
         if (v == null) { return ""; }
         return v;
     }

@@ -99,7 +99,20 @@ static void zan_mem_build_classes(void) {
         while (c < ZAN_MEM_NCLASS && k_class_size[c] < s) c++;
         g_size_class[s] = (unsigned char)(c < ZAN_MEM_NCLASS ? c : ZAN_MEM_NCLASS - 1);
     }
-    g_class_ready = 1;
+    __atomic_store_n(&g_class_ready, 1, __ATOMIC_RELEASE);
+}
+
+/* Build the size-class table once. g_class_ready is a plain int in the
+ * original code, and zan_mem_small can be reached from any thread the
+ * scheduler runs (coroutine workers and Thread.Start bodies alike), so two
+ * threads could race on it. The table itself is deterministic, but the
+ * unsynchronized read/write is a C data race; guard it with the slab lock and
+ * an atomic flag. */
+static void zan_mem_ensure_classes(void) {
+    if (__atomic_load_n(&g_class_ready, __ATOMIC_ACQUIRE)) return;
+    zan_mem_lock();
+    if (!g_class_ready) zan_mem_build_classes();
+    zan_mem_unlock();
 }
 
 static unsigned zan_mem_hash(uintptr_t base) {
@@ -157,7 +170,7 @@ static int zan_mem_new_slab(void) {
 }
 
 static void *zan_mem_small(size_t n) {
-    if (!g_class_ready) zan_mem_build_classes();
+    zan_mem_ensure_classes();
     int cls = g_size_class[n];
     void *p = t_free_list[cls];
     if (p) {
@@ -206,6 +219,11 @@ void *__wrap_calloc(size_t n, size_t m) {
 
 void *__wrap_realloc(void *p, size_t n) {
     if (!p) return __wrap_malloc(n);
+    /* realloc(p, 0) must free p; the standard leaves only the return value
+     * implementation-defined (NULL or a unique 0-size block). Free and
+     * report NULL rather than returning p unchanged, which would both leak
+     * nothing but also pretend the block still exists. */
+    if (n == 0) { __wrap_free(p); return NULL; }
     if (!zan_mem_owns(p)) return __real_realloc(p, n);
     zan_mem_hdr_t *h = (zan_mem_hdr_t *)((char *)p - ZAN_MEM_HDR);
     size_t old = k_class_size[h->cls];

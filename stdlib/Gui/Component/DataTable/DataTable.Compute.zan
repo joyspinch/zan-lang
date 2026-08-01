@@ -161,9 +161,19 @@ partial class DataTable {
                 st.order = kept;
             }
         }
-        if (st.showSummary) { DataTable.ComputeSummary(st, cols, src); }
         DataTable.ComputeColStats(st, cols, src);
+        // BuildDisplay runs before the footer so a grouped table can reuse the
+        // per-group aggregates it produces: the grand total is then folded from
+        // the group subtotals (one aggregation pass) instead of rescanning every
+        // row. A flat table has no groups, so it still does the direct scan.
         DataTable.BuildDisplay(st, cols, src);
+        if (st.showSummary) {
+            if (st.groupCols.Count > 0) {
+                DataTable.ComputeSummaryFromGroups(st, cols);
+            } else {
+                DataTable.ComputeSummary(st, cols, src);
+            }
+        }
         int maxScroll = st.dispRows.Count - 1;
         if (st.scrollRow > maxScroll) { st.scrollRow = maxScroll; }
         if (st.scrollRow < 0) { st.scrollRow = 0; }
@@ -402,7 +412,10 @@ partial class DataTable {
         int g = 0;
         while (g < st.groupCols.Count) {
             int gc = st.groupCols[g];
-            int cmp = DataTable.CompareStr(src.CellText(ra, gc), src.CellText(rb, gc));
+            // Compute the comparison exactly once per group column. The valid-
+            // column branch fully determines `cmp`; only a stray out-of-range
+            // group column falls back to a plain string compare.
+            int cmp = 0;
             if (gc >= 0 && gc < cols.Count) {
                 DataColumn gcol = cols[gc];
                 if (gcol.isDate) {
@@ -416,6 +429,8 @@ partial class DataTable {
                 } else {
                     cmp = DataTable.CompareCellCol(gcol, src.CellText(ra, gc), src.CellText(rb, gc));
                 }
+            } else {
+                cmp = DataTable.CompareStr(src.CellText(ra, gc), src.CellText(rb, gc));
             }
             if (cmp != 0) { return cmp; }
             g = g + 1;
@@ -465,9 +480,121 @@ partial class DataTable {
         while (p < hi) { st.order[p] = tmp[p]; p = p + 1; }
     }
 
+    // Order two representative rows by a single group column, matching
+    // CmpGroupRow's per-column ordering (date buckets, then column-aware value).
+    static int CmpGroupCol(DataColumn gcol, DataSource src, int ra, int rb, int kd, int col) {
+        if (kd == 3) {
+            return DataTable.CmpDateGroup(gcol,
+                                          src.CellDay(ra, col, gcol.dateOrder),
+                                          src.CellDay(rb, col, gcol.dateOrder));
+        }
+        return DataTable.CompareCellCol(gcol, src.CellText(ra, col), src.CellText(rb, col));
+    }
+
+    // O(N) grouping order for the common case of ONE group column and no active
+    // within-group sort: instead of an O(N log N) comparison merge sort, make a
+    // single pass assigning each row a small group slot (via a typed hash — no
+    // string key for numeric columns), rank the handful of distinct slots by
+    // group order, then a stable counting sort places rows into contiguous
+    // groups. Removes the ~20 merge sweeps over a million rows.
+    static void SortOrderGroupBucket(DataTableState st, List<DataColumn> cols, DataSource src) {
+        int n = st.order.Count;
+        int col = st.groupCols[0];
+        int kd = 0;                 // 0 text/real, 1 int, 2 bool, 3 date-bucket
+        DataColumn gcol = cols[0];
+        if (col >= 0 && col < cols.Count) {
+            gcol = cols[col];
+            if (gcol.isDate) { kd = 3; }
+            else if (gcol.isBool) { kd = 2; }
+            else if (gcol.numeric && gcol.decimals == 0) { kd = 1; }
+        }
+
+        List<int> rowSlot = new List<int>();
+        int z = 0;
+        while (z < n) { rowSlot.Add(0); z = z + 1; }
+        List<int> repRow = new List<int>();
+
+        if (kd == 1 || kd == 2) {
+            Dictionary<int,int> di = new Dictionary<int,int>();
+            int p = 0;
+            while (p < n) {
+                int row = st.order[p];
+                int v = 0;
+                if (kd == 2) { if (src.CellBool(row, col)) { v = 1; } }
+                else { v = src.CellNum(row, col); }
+                int slot = 0;
+                if (di.ContainsKey(v)) { slot = di[v]; }
+                else { slot = repRow.Count; di[v] = slot; repRow.Add(row); }
+                rowSlot[p] = slot;
+                p = p + 1;
+            }
+        } else {
+            Dictionary<string,int> ds = new Dictionary<string,int>();
+            int p = 0;
+            while (p < n) {
+                int row = st.order[p];
+                string v = "";
+                if (kd == 3) { v = DataTable.DateGroupKey(src.CellDay(row, col, gcol.dateOrder), gcol.dateGroup); }
+                else { v = src.CellText(row, col); }
+                int slot = 0;
+                if (ds.ContainsKey(v)) { slot = ds[v]; }
+                else { slot = repRow.Count; ds[v] = slot; repRow.Add(row); }
+                rowSlot[p] = slot;
+                p = p + 1;
+            }
+        }
+
+        int K = repRow.Count;
+        // Rank the (few) distinct slots into group order; insertion sort is fine.
+        List<int> slotOrder = new List<int>();
+        int s = 0;
+        while (s < K) { slotOrder.Add(s); s = s + 1; }
+        int a = 1;
+        while (a < K) {
+            int cur = slotOrder[a];
+            int b = a - 1;
+            while (b >= 0 && DataTable.CmpGroupCol(gcol, src, repRow[slotOrder[b]], repRow[cur], kd, col) > 0) {
+                slotOrder[b + 1] = slotOrder[b];
+                b = b - 1;
+            }
+            slotOrder[b + 1] = cur;
+            a = a + 1;
+        }
+        List<int> rank = new List<int>();
+        int r0 = 0;
+        while (r0 < K) { rank.Add(0); r0 = r0 + 1; }
+        int r1 = 0;
+        while (r1 < K) { rank[slotOrder[r1]] = r1; r1 = r1 + 1; }
+
+        // Stable counting sort of the row order by group rank.
+        List<int> counts = new List<int>();
+        int c0 = 0;
+        while (c0 < K + 1) { counts.Add(0); c0 = c0 + 1; }
+        int p2 = 0;
+        while (p2 < n) { int r = rank[rowSlot[p2]]; counts[r + 1] = counts[r + 1] + 1; p2 = p2 + 1; }
+        int c1 = 1;
+        while (c1 <= K) { counts[c1] = counts[c1] + counts[c1 - 1]; c1 = c1 + 1; }
+        List<int> outp = new List<int>();
+        int o0 = 0;
+        while (o0 < n) { outp.Add(0); o0 = o0 + 1; }
+        int p3 = 0;
+        while (p3 < n) {
+            int r = rank[rowSlot[p3]];
+            outp[counts[r]] = st.order[p3];
+            counts[r] = counts[r] + 1;
+            p3 = p3 + 1;
+        }
+        st.order = outp;
+    }
+
     static void SortOrderGrouped(DataTableState st, List<DataColumn> cols, DataSource src) {
         int n = st.order.Count;
         if (n < 2) { return; }
+        // O(N) fast path: single group column, no within-group sort to preserve.
+        if (st.groupCols.Count == 1 && st.sortKeys.Count == 0) {
+            DataTable.SortOrderGroupBucket(st, cols, src);
+            return;
+        }
         List<int> tmp = new List<int>();
         int z = 0;
         while (z < n) { tmp.Add(0); z = z + 1; }
@@ -492,7 +619,7 @@ partial class DataTable {
     // derived columns are left at 0 (they reference footer-level agg values, not
     // per-group ones). O(|hi-lo| * agg-column-count).
     static void FillGroupAgg(DataTableState st, List<DataColumn> cols, DataSource src,
-                             GroupRow grp, int lo, int hi) {
+                             GroupRow grp, int lo, int hi, bool toGrand) {
         int nc = cols.Count;
         while (grp.aggValues.Count < nc) { grp.aggValues.Add(0); }
         while (grp.aggTexts.Count < nc) { grp.aggTexts.Add(""); }
@@ -517,6 +644,15 @@ partial class DataTable {
                 cnt2 = cnt2 + 1;
                 k = k + 1;
             }
+            // Fold this group's scalars into the grand total. Done once per
+            // (group, column) OUTSIDE the hot row loop, and only for the L==0
+            // groups (which tile every row exactly once, so nested levels never
+            // double-count). This is what lets the footer skip its own scan.
+            if (toGrand && cnt2 > 0) {
+                if (col < st.aggSumR.Count) { st.aggSumR[col] = st.aggSumR[col] + s; }
+                if (col < st.aggMinR.Count && mn < st.aggMinR[col]) { st.aggMinR[col] = mn; }
+                if (col < st.aggMaxR.Count && mx > st.aggMaxR[col]) { st.aggMaxR[col] = mx; }
+            }
             double av = 0.0;
             if (m == 1) { av = s; }
             else if (m == 2) { if (cnt2 > 0) { av = s / (double)cnt2; } }
@@ -534,10 +670,34 @@ partial class DataTable {
         }
     }
 
+    // Whether two rows fall in the same group at column `gc`, decided on the
+    // TYPED value (kd: 0 text/real-as-text, 1 int, 2 bool, 3 date-bucket) so the
+    // hot row loop never builds a string key. Matches GroupValue's identity:
+    // numeric integer columns key on the int, real columns and plain text on the
+    // formatted text, bools on the flag, dates on their bucket label.
+    static bool GroupLevelEq(List<DataColumn> cols, DataSource src, int ra, int rb, int gc, int kd) {
+        if (kd == 1) { return src.CellNum(ra, gc) == src.CellNum(rb, gc); }
+        if (kd == 2) { return src.CellBool(ra, gc) == src.CellBool(rb, gc); }
+        if (kd == 3) {
+            DataColumn c = cols[gc];
+            return DataTable.CompareStr(
+                DataTable.DateGroupKey(src.CellDay(ra, gc, c.dateOrder), c.dateGroup),
+                DataTable.DateGroupKey(src.CellDay(rb, gc, c.dateOrder), c.dateGroup)) == 0;
+        }
+        return DataTable.CompareStr(src.CellText(ra, gc), src.CellText(rb, gc)) == 0;
+    }
+
     // Build the flat display model (group headers interleaved with data rows)
     // from the already filtered+sorted st.order. When no grouping is active the
     // model mirrors st.order one-to-one, so every downstream render/hit path
     // behaves exactly as before.
+    //
+    // Grouped path is single-pass: a group boundary is found by comparing the
+    // current row's TYPED group values against the previous row (st.order is
+    // already sorted so members are contiguous), instead of rebuilding a
+    // concatenated string key ~4x per row. The concatenated key (for collapse
+    // identity) is built only once per group header (a handful), and each
+    // group's subtotal is filled once when the group closes.
     static void BuildDisplay(DataTableState st, List<DataColumn> cols, DataSource src) {
         st.dispRows.Clear();
         st.groups.Clear();
@@ -552,50 +712,91 @@ partial class DataTable {
             return;
         }
         int N = st.order.Count;
+        // Grand-total accumulators are seeded here and folded by FillGroupAgg
+        // over the outermost groups, so the footer needs no scan of its own.
+        DataTable.ResetGrandAgg(st, cols.Count);
+
+        // Per-level metadata: column index and the typed key kind. Computed once
+        // (G is tiny) so the per-row boundary test is a plain typed compare.
+        List<int> gc = new List<int>();
+        List<int> gkind = new List<int>();
+        int lm = 0;
+        while (lm < G) {
+            int c = st.groupCols[lm];
+            gc.Add(c);
+            int kd = 0;
+            if (c >= 0 && c < cols.Count) {
+                if (cols[c].isDate) { kd = 3; }
+                else if (cols[c].isBool) { kd = 2; }
+                else if (cols[c].numeric && cols[c].decimals == 0) { kd = 1; }
+            }
+            gkind.Add(kd);
+            lm = lm + 1;
+        }
+
+        // Open group per level (null = none), and where it started in st.order.
+        // Written only at group boundaries (a handful of times), never per row.
+        List<GroupRow> curGrp = new List<GroupRow>();
+        List<int> grpStart = new List<int>();
+        int li = 0;
+        while (li < G) { curGrp.Add(null); grpStart.Add(0); li = li + 1; }
+
         int dataNo = 0;
         int p = 0;
         while (p < N) {
             int rowIdx = st.order[p];
-            int L = 0;
-            while (L < G) {
-                bool isNew = false;
-                if (p == 0) { isNew = true; }
-                else if (DataTable.PathKey(st, cols, src, st.order[p], L)
-                      != DataTable.PathKey(st, cols, src, st.order[p - 1], L)) { isNew = true; }
-                if (isNew) {
-                    string key = DataTable.PathKey(st, cols, src, rowIdx, L);
-                    bool ancColl = false;
-                    int a = 0;
-                    while (a < L) {
-                        if (DataTable.IsCollapsed(st, DataTable.PathKey(st, cols, src, rowIdx, a))) {
-                            ancColl = true;
-                        }
-                        a = a + 1;
-                    }
-                    int cnt = 0;
-                    int q = p;
-                    while (q < N && DataTable.PathKey(st, cols, src, st.order[q], L) == key) {
-                        cnt = cnt + 1; q = q + 1;
-                    }
-                    int gi = st.groups.Count;
-                    GroupRow newGrp = new GroupRow(
-                        cols[st.groupCols[L]].title + ": "
-                            + DataTable.GroupValue(cols, src, rowIdx, st.groupCols[L]),
-                        L, cnt, key, DataTable.IsCollapsed(st, key));
-                    DataTable.FillGroupAgg(st, cols, src, newGrp, p, p + cnt);
-                    st.groups.Add(newGrp);
-                    if (!ancColl) {
-                        st.dispRows.Add(new DispRow(1, gi, 0));
-                    }
+
+            // outermost level whose group differs from the previous row.
+            int firstNew = G;
+            if (p == 0) { firstNew = 0; }
+            else {
+                int prev = st.order[p - 1];
+                int L = 0;
+                while (L < G) {
+                    if (!DataTable.GroupLevelEq(cols, src, rowIdx, prev, gc[L], gkind[L])) {
+                        firstNew = L; L = G;
+                    } else { L = L + 1; }
                 }
-                L = L + 1;
             }
+
+            // close the groups that ended here (levels firstNew..G-1), inner
+            // first, filling each subtotal once over its now-known row range.
+            if (p > 0) {
+                int fe = G - 1;
+                while (fe >= firstNew) {
+                    if (curGrp[fe] != null) {
+                        curGrp[fe].count = p - grpStart[fe];
+                        DataTable.FillGroupAgg(st, cols, src, curGrp[fe], grpStart[fe], p, fe == 0);
+                    }
+                    fe = fe - 1;
+                }
+            }
+
+            // open the new groups (levels firstNew..G-1), outer first.
+            int nl = firstNew;
+            while (nl < G) {
+                bool ancColl = false;
+                int a = 0;
+                while (a < nl) {
+                    if (curGrp[a] != null && curGrp[a].collapsed) { ancColl = true; }
+                    a = a + 1;
+                }
+                string key = DataTable.PathKey(st, cols, src, rowIdx, nl);
+                int gi = st.groups.Count;
+                GroupRow newGrp = new GroupRow(
+                    cols[gc[nl]].title + ": " + DataTable.GroupValue(cols, src, rowIdx, gc[nl]),
+                    nl, 0, key, DataTable.IsCollapsed(st, key));
+                st.groups.Add(newGrp);
+                curGrp[nl] = newGrp;
+                grpStart[nl] = p;
+                if (!ancColl) { st.dispRows.Add(new DispRow(1, gi, 0)); }
+                nl = nl + 1;
+            }
+
             bool anyColl = false;
             int a2 = 0;
             while (a2 < G) {
-                if (DataTable.IsCollapsed(st, DataTable.PathKey(st, cols, src, rowIdx, a2))) {
-                    anyColl = true;
-                }
+                if (curGrp[a2] != null && curGrp[a2].collapsed) { anyColl = true; }
                 a2 = a2 + 1;
             }
             dataNo = dataNo + 1;
@@ -604,6 +805,16 @@ partial class DataTable {
                 DataTable.EmitDetail(st, src, rowIdx);
             }
             p = p + 1;
+        }
+
+        // close the final open groups.
+        int fz = G - 1;
+        while (fz >= 0) {
+            if (curGrp[fz] != null) {
+                curGrp[fz].count = N - grpStart[fz];
+                DataTable.FillGroupAgg(st, cols, src, curGrp[fz], grpStart[fz], N, fz == 0);
+            }
+            fz = fz - 1;
         }
     }
 
@@ -693,13 +904,21 @@ partial class DataTable {
             bi = bi + 1;
         }
 
-        // resolve each column's raw aggregate value (base first, then derived so
-        // derived columns read finished aggregates). aggReal carries the exact
-        // value; aggValue keeps its historical int form for DeriveValue and any
-        // caller that reads it.
+        DataTable.FinalizeSummary(st, cols, sumV, minV, maxV, n);
+    }
+
+    // Turn per-column base accumulators (sum/min/max over `n` rows) into the
+    // cached footer: base modes resolve directly, derived (mode 6) columns read
+    // the finished base aggregates, and everything is formatted once. Shared by
+    // the flat row-scan path (ComputeSummary) and the grouped combine path
+    // (ComputeSummaryFromGroups), so both produce byte-identical footers.
+    static void FinalizeSummary(DataTableState st, List<DataColumn> cols,
+                                List<double> sumV, List<double> minV,
+                                List<double> maxV, int n) {
+        int nc = cols.Count;
         st.aggValue.Clear();
         st.aggReal.Clear();
-        col = 0;
+        int col = 0;
         while (col < nc) { st.aggValue.Add(0); st.aggReal.Add(0.0); col = col + 1; }
         col = 0;
         while (col < nc) {
@@ -746,6 +965,56 @@ partial class DataTable {
                 if (cols[col].deriveOp == 0) { txt = txt + "%"; }
             }
             st.summaryText.Add(txt);
+            col = col + 1;
+        }
+    }
+
+    // Grouped footer: combine the per-group base aggregates already gathered by
+    // BuildDisplay/FillGroupAgg (into st.aggSumR/aggMinR/aggMaxR over the L==0
+    // groups, which partition every row exactly once) into the grand total,
+    // WITHOUT a second million-row scan. Sum of group sums = grand sum, min of
+    // group mins = grand min, max of group maxs = grand max, and avg = grand sum
+    // / total rows — so the footer matches a flat recompute exactly.
+    static void ComputeSummaryFromGroups(DataTableState st, List<DataColumn> cols) {
+        int nc = cols.Count;
+        while (st.aggMode.Count < nc) { st.aggMode.Add(0); }
+        int n = st.order.Count;
+        List<double> sumV = new List<double>();
+        List<double> minV = new List<double>();
+        List<double> maxV = new List<double>();
+        int col = 0;
+        while (col < nc) {
+            double sv = 0.0;
+            double mnv = 0.0;
+            double mxv = 0.0;
+            if (col < st.aggSumR.Count) { sv = st.aggSumR[col]; }
+            if (col < st.aggMinR.Count) { mnv = st.aggMinR[col]; }
+            if (col < st.aggMaxR.Count) { mxv = st.aggMaxR[col]; }
+            // No group ever contributed (e.g. an empty table): fall back to 0 so
+            // the footer reads like a flat recompute over zero rows.
+            if (mnv > 0.9e300) { mnv = 0.0; }
+            if (mxv < -0.9e300) { mxv = 0.0; }
+            sumV.Add(sv);
+            minV.Add(mnv);
+            maxV.Add(mxv);
+            col = col + 1;
+        }
+        DataTable.FinalizeSummary(st, cols, sumV, minV, maxV, n);
+    }
+
+    // Reset the grand-total accumulators that FillGroupAgg feeds. min/max start
+    // at sentinels so the first contributing group seeds them without a per-
+    // column "seen" flag; a column with no scanned rows keeps a 0 aggregate via
+    // its aggMode branch in FinalizeSummary.
+    static void ResetGrandAgg(DataTableState st, int nc) {
+        st.aggSumR.Clear();
+        st.aggMinR.Clear();
+        st.aggMaxR.Clear();
+        int col = 0;
+        while (col < nc) {
+            st.aggSumR.Add(0.0);
+            st.aggMinR.Add(1.0e300);
+            st.aggMaxR.Add(-1.0e300);
             col = col + 1;
         }
     }

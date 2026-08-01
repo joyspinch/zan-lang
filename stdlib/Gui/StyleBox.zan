@@ -546,11 +546,18 @@ class StyleBox {
             return;
         }
         if (bgDir == 1) {
-            // Horizontal: vertical bands (no native primitive).
+            // Horizontal: vertical bands (no native primitive). Columns through
+            // the corner arcs get per-column insets (the mirror of the
+            // vertical path's per-row insets) so the arcs are smooth 1px
+            // cutouts that follow the corners mask; the straight middle fills
+            // as full-height bands. Before this, the corners were only a 1px
+            // outline stroked over a square fill, which left every gradient
+            // button square with a faint arc.
             int bands = w / 4;
             if (bands < 8) { bands = 8; }
             if (bands > 96) { bands = 96; }
             int bw = (w + bands - 1) / bands;
+            int corners = this.Corners();
             int i = 0;
             while (i < bands) {
                 int bx = x + i * bw;
@@ -561,7 +568,35 @@ class StyleBox {
                     int p = i * 1000 / bands;
                     int col = StyleBox.MixColor(from, to, p);
                     if (bgVia != 0) { col = StyleBox.ViaColor(from, bgVia, to, p); }
-                    c.FillRect(bx, y, seg, h, col);
+                    if (r > 0 && (bx < x + r || bx + seg > x + w - r)) {
+                        int colX = bx;
+                        while (colX < bx + seg) {
+                            int insetT = 0;
+                            int insetB = 0;
+                            int dl = colX - x;
+                            int dr = x + w - colX - 1;
+                            if (dl < r) {
+                                int ins = StyleBox.CornerInsetAt(r, dl);
+                                if ((corners / Corner.TL() % 2) == 1) { insetT = ins; }
+                                if ((corners / Corner.BL() % 2) == 1) { insetB = ins; }
+                            }
+                            if (dr < r) {
+                                int ins = StyleBox.CornerInsetAt(r, dr);
+                                if ((corners / Corner.TR() % 2) == 1) {
+                                    if (ins > insetT) { insetT = ins; }
+                                }
+                                if ((corners / Corner.BR() % 2) == 1) {
+                                    if (ins > insetB) { insetB = ins; }
+                                }
+                            }
+                            int top = y + insetT;
+                            int bot = y + h - insetB;
+                            if (bot > top) { c.FillRect(colX, top, 1, bot - top, col); }
+                            colX = colX + 1;
+                        }
+                    } else {
+                        c.FillRect(bx, y, seg, h, col);
+                    }
                     i = i + 1;
                 }
             }
@@ -572,7 +607,10 @@ class StyleBox {
         // bands down the straight middle, and single pixel rows through the
         // corner arcs. A whole band inset to the arc turned the corners into a
         // staircase as tall as the band, which read as teeth on a big surface;
-        // per-row insets follow the same silhouette FillRoundRect draws.
+        // per-row insets follow the same silhouette FillRoundRect draws, and
+        // honour the corners mask so a welded neighbour's square seam stays
+        // square instead of being rounded into a nub.
+        int corners = this.Corners();
         int bands = h / 3;
         if (bands < 8) { bands = 8; }
         if (bands > 96) { bands = 96; }
@@ -590,8 +628,24 @@ class StyleBox {
                 if (by < y + r || by + seg > y + h - r) {
                     int row = by;
                     while (row < by + seg) {
-                        int inset = StyleBox.CornerInset(r, row - y, 1, h);
-                        c.FillRect(x + inset, row, w - inset * 2, 1, col);
+                        int rowRel = row - y;
+                        int insetL = 0;
+                        int insetR = 0;
+                        if (rowRel < r) {
+                            int ins = StyleBox.CornerInsetAt(r, rowRel);
+                            if ((corners / Corner.TL() % 2) == 1) { insetL = ins; }
+                            if ((corners / Corner.TR() % 2) == 1) { insetR = ins; }
+                        }
+                        if (rowRel >= h - r) {
+                            int ins = StyleBox.CornerInsetAt(r, h - rowRel - 1);
+                            if ((corners / Corner.BL() % 2) == 1) {
+                                if (ins > insetL) { insetL = ins; }
+                            }
+                            if ((corners / Corner.BR() % 2) == 1) {
+                                if (ins > insetR) { insetR = ins; }
+                            }
+                        }
+                        c.FillRect(x + insetL, row, w - insetL - insetR, 1, col);
                         row = row + 1;
                     }
                 } else {
@@ -600,14 +654,57 @@ class StyleBox {
                 k = k + 1;
             }
         }
-        this.PaintCornerMask(app, x, y, w, h, r);
+        if (r > 0) { this.PaintCornerMask(app, x, y, w, h, r); }
     }
 
-    /// Re-draws the rounded outline in the gradient's own end colors so the
-    /// banded fill keeps clean anti-aliased corners.
+    /// Re-draws the rounded outline so the banded gradient fill keeps clean
+    /// anti-aliased corners. Clips to each corner square so only the arc's AA
+    /// ring is stroked -- the straight edges of the bands are already exact
+    /// pixel fills, and repainting them with one flat colour would stripe the
+    /// fade. Each arc uses the gradient colour at its end of the box (start
+    /// colour on the left/top corners, end colour on the right/bottom), and
+    /// only corners the box actually rounds (the corners mask) get an arc, so
+    /// a welded group's square seams stay square.
     void PaintCornerMask(App app, int x, int y, int w, int h, int r) {
         Canvas c = app.canvas;
-        c.DrawRoundRect(x, y, w, h, r, this.Fade(bg), 1);
+        int corners = this.Corners();
+        if (corners == 0 || r <= 0) { return; }
+        int colA = this.Fade(bg);
+        int colB = colA;
+        if (bgTo != 0) {
+            colB = this.Fade(bgTo);
+            if (bgDir == 3) { int sw = colA; colA = colB; colB = sw; }
+        }
+        // Horizontal: the fade runs left->right, so the left corners take the
+        // start colour and the right corners the end colour. Vertical/diagonal:
+        // the fade runs top->bottom, so the top corners take the start colour.
+        bool horiz = bgDir == 1;
+        int colTL = colA;
+        int colTR = 0;
+        int colBL = 0;
+        int colBR = colB;
+        if (horiz) { colTR = colB; colBL = colA; }
+        else { colTR = colA; colBL = colB; }
+        if ((corners / Corner.TL() % 2) == 1) {
+            c.PushClip(x, y, r, r);
+            c.DrawRoundRectIn(x, y, w, h, r, Corner.TL(), colTL, 1);
+            c.PopClip();
+        }
+        if ((corners / Corner.TR() % 2) == 1) {
+            c.PushClip(x + w - r, y, r, r);
+            c.DrawRoundRectIn(x + w - r, y, w, h, r, Corner.TR(), colTR, 1);
+            c.PopClip();
+        }
+        if ((corners / Corner.BL() % 2) == 1) {
+            c.PushClip(x, y + h - r, r, r);
+            c.DrawRoundRectIn(x, y + h - r, w, h, r, Corner.BL(), colBL, 1);
+            c.PopClip();
+        }
+        if ((corners / Corner.BR() % 2) == 1) {
+            c.PushClip(x + w - r, y + h - r, r, r);
+            c.DrawRoundRectIn(x + w - r, y + h - r, w, h, r, Corner.BR(), colBR, 1);
+            c.PopClip();
+        }
     }
 
     /// Horizontal inset of a rounded rect at row offset `dy` (0 outside the
@@ -618,6 +715,20 @@ class StyleBox {
         if (dy > h - r) { d = h - dy - seg; }
         else { d = dy; }
         if (d >= r) { return 0; }
+        if (d < 0) { d = 0; }
+        int arm = r - d;
+        int inner = r * r - arm * arm;
+        if (inner < 0) { inner = 0; }
+        return r - Fx.Isqrt(inner);
+    }
+
+    /// Inset of a corner arc at `d` px from the box edge (0 at the edge, r at
+    /// the arc's apex): the silhouette's inset at that offset, 0 beyond the
+    /// arc. Lets a gradient band follow the rounded outline in either axis --
+    /// a vertical band insets the top/bottom by the arc at its column, a
+    /// horizontal one the left/right at its row -- without per-pixel sampling.
+    static int CornerInsetAt(int r, int d) {
+        if (r <= 0 || d >= r) { return 0; }
         if (d < 0) { d = 0; }
         int arm = r - d;
         int inner = r * r - arm * arm;

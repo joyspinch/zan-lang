@@ -81,6 +81,10 @@ class App {
     // themselves.
     List<string> skinPacks;
     string skinArt;
+    // Opacity the active pack's art was installed with (percent), kept so the
+    // art can be reinstalled at the same strength when the user wallpaper is
+    // cleared.
+    int skinArtOpacity;
     // Active skin stylesheet (CSS) every widget resolves its look against, and
     // the name of the skin pack it came from ("" = none, pure theme tokens).
     // Never null: an empty sheet means "theme defaults only", so widgets can
@@ -226,6 +230,12 @@ class App {
     // snapshot, so the scaled blit happens only on a skin/size/wallpaper change.
     string bgImagePath;
     int bgImageOpacity;
+    // The USER's own wallpaper, distinct from the active skin pack's art: the
+    // pack's illustration fills the backdrop only while this is empty, and a
+    // skin switch never replaces it. Persisted by the app, so a user-chosen
+    // background survives both skin switches and restarts.
+    string userWallpaperPath;
+    int userWallpaperOpacity;
     // Set when the appearance drawer asks for a wallpaper file. Hosts that own a
     // file picker consume it (ConsumeWallpaperPick) and call SetWallpaper with
     // the chosen path; windows without one ignore it.
@@ -328,6 +338,7 @@ class App {
         app.appliedSkin = -1;
         app.skinPacks = new List<string>();
         app.skinArt = "";
+        app.skinArtOpacity = 100;
         app.sheet = StyleSheet.Create();
         app.appCss = "";
         app.skinName = "";
@@ -356,6 +367,8 @@ class App {
         app.bgSnapGen = 0;
         app.bgImagePath = "";
         app.bgImageOpacity = 100;
+        app.userWallpaperPath = "";
+        app.userWallpaperOpacity = 100;
         app.bgImagePickWanted = false;
         app.canvas = Canvas.Create(width, height);
         // Reset the UI-thread dispatch queue up front (on the UI thread) so
@@ -503,6 +516,26 @@ class App {
         return skinPacks[i];
     }
 
+    /// The index of the pack named `name`, or -1 when no pack matches. Lookups
+    /// by name (not index) let persisted settings survive skins being added or
+    /// removed, which shifts every index.
+    int SkinIndexOf(string name) {
+        if (name == "") { return 0 - 1; }
+        int i = 0;
+        while (i < skinPacks.Count) {
+            if (skinPacks[i] == name) { return i; }
+            i = i + 1;
+        }
+        return 0 - 1;
+    }
+
+    /// Applies the pack named `name`, leaving the current look untouched when
+    /// it is not installed (e.g. a config written against an older skin list).
+    void ApplySkinName(string name) {
+        int i = this.SkinIndexOf(name);
+        if (i >= 0) { this.ApplySkin(i); }
+    }
+
     /// The Theme skin index `i` installs -- used for the picker's previews, so
     /// each card shows its own palette.
     Theme SkinThemeAt(int i) {
@@ -557,7 +590,8 @@ class App {
 
     /// Paints `path` (PNG/BMP/JPG) as this window's backdrop, scaled to cover,
     /// blended `opacity` percent (10..100) over the skin's own backdrop. An
-    /// empty path clears it.
+    /// empty path clears it. Used for the skin pack's art and a user wallpaper
+    /// alike; the skin layer decides which one is showing (see SetUserWallpaper).
     void SetWallpaper(string path, int opacity) {
         int op = opacity;
         if (op < 10) { op = 10; }
@@ -574,6 +608,37 @@ class App {
         theme.bgSecondary = App.WithAlpha(theme.bgSecondary, 255);
         theme.bgTertiary  = App.WithAlpha(theme.bgTertiary, 255);
         this.ApplySurfaceTranslucency();
+    }
+
+    /// The user's own wallpaper path ("" = none) -- the image the user picked,
+    /// as opposed to the active skin pack's art. A skin switch never touches it,
+    /// so a chosen backdrop survives changing skins.
+    string UserWallpaperPath() { return userWallpaperPath; }
+
+    /// The opacity the user's own wallpaper was set with (100 until set).
+    int UserWallpaperOpacity() {
+        if (userWallpaperOpacity <= 0) { return 100; }
+        return userWallpaperOpacity;
+    }
+
+    /// Sets the USER's wallpaper: recorded separately from the skin's art so a
+    /// pack switch never replaces it, then painted like any wallpaper. An empty
+    /// path clears the user wallpaper and restores the active pack's art (if
+    /// the pack ships one).
+    void SetUserWallpaper(string path, int opacity) {
+        int op = opacity;
+        if (op < 10) { op = 10; }
+        if (op > 100) { op = 100; }
+        userWallpaperPath = path;
+        userWallpaperOpacity = op;
+        if (path == "") {
+            // Back to the pack's own backdrop: the art it installed (at its
+            // own strength), or nothing when it ships none.
+            if (skinArt != "") { this.SetWallpaper(skinArt, skinArtOpacity); }
+            else { this.SetWallpaper("", op); }
+            return;
+        }
+        this.SetWallpaper(path, op);
     }
 
     /// Replaces the alpha byte of a packed ARGB colour.
@@ -604,16 +669,27 @@ class App {
             theme.bgTertiary  = App.WithAlpha(theme.bgTertiary, 205);
             return;
         }
-        // A full-strength wallpaper still keeps the surfaces at three quarters
-        // opacity: the image reads through the panels as colour, not as the
-        // content behind them.
+        // The pack's OWN artwork is the skin's designed backdrop: surfaces sit
+        // low so the illustration reads through the start page, panels and dock
+        // alike. A user wallpaper is a personal choice layered over the skin, so
+        // it tints the surfaces more; the wallpaper-opacity slider still varies
+        // it (100% opacity ~= opaque panels, 10% ~= almost bare wallpaper).
         int strength = this.WallpaperOpacity();
-        int alpha = 255 - strength * 65 / 100;
-        int chrome = alpha - 10;
-        int rail = alpha - 20;
-        if (alpha < 190) { alpha = 190; }
-        if (chrome < 180) { chrome = 180; }
-        if (rail < 170) { rail = 170; }
+        int alpha;
+        int chrome;
+        int rail;
+        if (this.SkinArtWallpaper()) {
+            alpha = 180;
+            chrome = 168;
+            rail = 156;
+        } else {
+            alpha = 255 - strength * 85 / 100;
+            chrome = alpha - 10;
+            rail = alpha - 20;
+            if (alpha < 190) { alpha = 190; }
+            if (chrome < 180) { chrome = 180; }
+            if (rail < 170) { rail = 170; }
+        }
         theme.bgPrimary   = App.WithAlpha(theme.bgPrimary, alpha);
         theme.bgSecondary = App.WithAlpha(theme.bgSecondary, chrome);
         theme.bgTertiary  = App.WithAlpha(theme.bgTertiary, rail);
@@ -623,6 +699,35 @@ class App {
     /// artwork rather than an image the user picked.
     bool SkinArtWallpaper() {
         return skinArt != "" && bgImagePath == skinArt;
+    }
+
+    /// True when the user has their own wallpaper set (distinct from the active
+    /// pack's art). The user wallpaper always wins over the pack's art, and a
+    /// skin switch never replaces it.
+    bool HasUserWallpaper() {
+        return userWallpaperPath != "";
+    }
+
+    /// True when `path` is ANY installed pack's own artwork (not just the active
+    /// one). Persisted settings used to save the pack's art as the wallpaper, so
+    /// a config written against an older skin list can point at a banner that no
+    /// longer belongs to the active skin; the IDE ignores such stale paths.
+    bool IsSkinArtPath(string path) {
+        if (path == "") { return false; }
+        string norm = path;
+        norm = norm.Replace("\\", "/");
+        norm = norm.ToLower();
+        int i = 0;
+        while (i < skinPacks.Count) {
+            Skin s = Skin.Load(skinPacks[i]);
+            string a = s.ArtPath();
+            if (a != "") {
+                string an = a.Replace("\\", "/").ToLower();
+                if (an == norm) { return true; }
+            }
+            i = i + 1;
+        }
+        return false;
     }
 
     /// Drops the user wallpaper, restoring the skin's own backdrop.
@@ -673,9 +778,12 @@ class App {
         canvas.BlitImage(bgImagePath, x, y, w, h,
                          (iw - sw) / 2, (ih - sh) / 2, sw, sh);
         // Fade toward the skin backdrop: a scrim in the page colour at the
-        // complement of the requested opacity.
+        // complement of the requested opacity. The skin's OWN artwork is
+        // authored to be the backdrop -- it reads at full strength, with the
+        // translucent surfaces doing the blending -- so only a user-picked
+        // wallpaper gets the scrim.
         int fade = 100 - this.WallpaperOpacity();
-        if (fade > 0) {
+        if (fade > 0 && !this.SkinArtWallpaper()) {
             int rgb = theme.bgPrimary % 16777216;
             if (rgb < 0) { rgb = rgb + 16777216; }
             canvas.FillRect(x, y, w, h, (fade * 255 / 100) * 16777216 + rgb);
@@ -1458,6 +1566,13 @@ class App {
         return 4278190080 + r * 65536 + g * 256 + b;
     }
 
+    /// Darkens a packed color toward opaque black by permille p (0..1000): a
+    /// named shade anchor so widgets never spell out the black constant inline.
+    static int Darken(int color, int p) { return App.LerpColor(color, 4278190080, p); }
+
+    /// Lightens a packed color toward opaque white by permille p (0..1000).
+    static int Lighten(int color, int p) { return App.LerpColor(color, 4294967295, p); }
+
     /// Scales a packed color's existing alpha channel by permille p (0..1000),
     /// keeping its RGB. p=1000 returns the color unchanged; p=0 makes it fully
     /// transparent. Works for both opaque colors and ones that already carry an
@@ -1523,8 +1638,17 @@ class App {
         if (glassNative && a >= 900) {
             canvas.FillRoundRect(x, y, w, h, radius, Style.Fade(color, 300));
         } else if (theme.glass != 0 && a >= 900) {
-            canvas.BlurRectCached(x, y, w, h, this.Scale(36),
-                                  this.NextBlurSlot(), this.BackdropDirty());
+            // Clip the frosted blur to the panel's corner radius so the corners
+            // keep the sharp wallpaper; a translucent rounded tint over a square
+            // blur can never repaint the blurred corners back to the backdrop.
+            if (radius > 0) {
+                canvas.BlurRoundCached(x, y, w, h, this.Scale(36),
+                                       this.NextBlurSlot(), this.BackdropDirty(),
+                                       radius, 15);
+            } else {
+                canvas.BlurRectCached(x, y, w, h, this.Scale(36),
+                                      this.NextBlurSlot(), this.BackdropDirty());
+            }
             canvas.FillRoundRect(x, y, w, h, radius, Style.Fade(color, 520));
         } else {
             canvas.FillRoundRect(x, y, w, h, radius, Style.Fade(color, a));
