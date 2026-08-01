@@ -10,21 +10,29 @@ namespace Gui.Designer;
 /// drop placement and the live widget previews.
 partial class Designer {
     void RenderForm(App app, Canvas c, Theme t, int cx, int cy, int cw, int ch) {
+        int barH = app.Scale(34);
+        RenderModeBar(app, c, t, cx, cy, cw);
+        int bodyY = cy + barH;
+        int bodyH = ch - barH;
+        if (layoutMode == 1) {
+            RenderFreeCanvas(app, c, t, cx, bodyY, cw, bodyH);
+            return;
+        }
         int fs = t.fontSizeSmall;
-        c.FillRoundRect(cx, cy, cw, ch, app.Scale(6), t.bgPrimary);
-        c.DrawRect(cx, cy, cw, ch, t.borderPrimary, 1);
-        c.PushClip(cx + 1, cy + 1, cw - 2, ch - 2);
-        formClipTop = cy + 1;
-        formClipBot = cy + ch - 1;
+        c.FillRoundRect(cx, bodyY, cw, bodyH, app.Scale(6), t.bgPrimary);
+        c.DrawRect(cx, bodyY, cw, bodyH, t.borderPrimary, 1);
+        c.PushClip(cx + 1, bodyY + 1, cw - 2, bodyH - 2);
+        formClipTop = bodyY + 1;
+        formClipBot = bodyY + bodyH - 1;
 
         // The form can grow past its panel, so it scrolls internally. Claim the
         // wheel while the pointer is over it and clamp the offset (skip while a
         // drag is in progress so dropping isn't fighting the scroll).
         int contentH = FormContentH(app);
-        int maxScroll = contentH - ch;
+        int maxScroll = contentH - bodyH;
         if (maxScroll < 0) { maxScroll = 0; }
-        if (!dragging && InRect(app.mouseX, app.mouseY, cx, cy, cw, ch)) {
-            bool ownsWheel = app.CaptureWheel(cx, cy, cw, ch);
+        if (!dragging && InRect(app.mouseX, app.mouseY, cx, bodyY, cw, bodyH)) {
+            bool ownsWheel = app.CaptureWheel(cx, bodyY, cw, bodyH);
             if (ownsWheel) {
                 int fdelta = app.window.EventKeyCode();
                 formScroll = formScroll - fdelta * app.Scale(40) / 120;
@@ -38,7 +46,7 @@ partial class Designer {
         int fx = cx + pad;
         int fw = cw - pad * 2;
         if (maxScroll > 0) { fw = fw - app.Scale(8); }
-        int fy = cy + pad - formScroll;
+        int fy = bodyY + pad - formScroll;
 
         string head = formNameSig.Get();
         if (preview) { head = head + Designer.T("   (preview)", "  （预览）"); }
@@ -65,7 +73,7 @@ partial class Designer {
                 Designer.T("Empty form — pick a component on the left, or drag one in.", "空表单 —— 在左侧选择一个组件，或拖入一个组件。"),
                 t.textTertiary, fs);
         }
-        bool active = dragging && InRect(dragMouseX, dragMouseY, cx, cy, cw, ch);
+        bool active = dragging && InRect(dragMouseX, dragMouseY, cx, bodyY, cw, bodyH);
         bool dropSet = false;
         dropIndex = fields.Count;
         dropY = fy - app.Scale(4);
@@ -198,6 +206,383 @@ partial class Designer {
             }
         }
         dropContainer = null;
+    }
+
+    // ---- free-canvas mode (layoutMode == 1) --------------------------------
+    //
+    // The designed window (winW x winH) is letterboxed into the editor
+    // viewport and every field is drawn at its absolute design-space position,
+    // scene-designer style: drag to move, corner/edge handles to resize, grid
+    // snap, live widget previews. Container children are positioned relative
+    // to the container's content box (matching DockManual + Place at runtime).
+
+    /// Toolbar strip above the free canvas: zoom presets, grid/snap toggles and
+    /// the current design size.
+    void RenderFreeBar(App app, Canvas c, Theme t, int x, int y, int w) {
+        int fs = t.fontSizeSmall;
+        int bx = x + app.Scale(8);
+        int by = y + app.Scale(3);
+        int bh = app.Scale(28);
+
+        List<string> zooms = new List<string>();
+        zooms.Add("Fit"); zooms.Add("50%"); zooms.Add("100%"); zooms.Add("150%");
+        int zSel = 0;
+        if (winZoom == 500) { zSel = 1; }
+        else if (winZoom == 1000) { zSel = 2; }
+        else if (winZoom == 1500) { zSel = 3; }
+        int i = 0;
+        while (i < zooms.Count) {
+            int bt = 0;
+            if (i == zSel) { bt = 1; }
+            int id = new Button { Text = zooms[i], Class = Style.TypeClass(bt) }.Render(app, bx, by, app.Scale(52));
+            if (Ui.Clicked(app, id)) {
+                if (i == 0) { winZoom = 0; }
+                else if (i == 1) { winZoom = 500; }
+                else if (i == 2) { winZoom = 1000; }
+                else { winZoom = 1500; }
+                app.RequestRedraw();
+            }
+            bx = bx + app.Scale(56);
+            i = i + 1;
+        }
+        bx = bx + app.Scale(4);
+        int gT = 0;
+        if (showGrid) { gT = 1; }
+        int gId = new Button { Text = Designer.T("Grid", "网格"), Class = Style.TypeClass(gT) }.Render(app, bx, by, app.Scale(52));
+        if (Ui.Clicked(app, gId)) { showGrid = !showGrid; app.RequestRedraw(); }
+        bx = bx + app.Scale(56);
+        int sT = 0;
+        if (snapGrid) { sT = 1; }
+        int sId = new Button { Text = Designer.T("Snap", "吸附"), Class = Style.TypeClass(sT) }.Render(app, bx, by, app.Scale(52));
+        if (Ui.Clicked(app, sId)) { snapGrid = !snapGrid; app.RequestRedraw(); }
+
+        string sz = Convert.ToString(winW) + " x " + Convert.ToString(winH);
+        int sw = Canvas.MeasureText(sz, fs);
+        c.DrawText(x + w - sw - app.Scale(10), by + app.Scale(7), sz, t.textTertiary, fs);
+    }
+
+    /// Design-space -> screen-space for a free-canvas element (children carry
+    /// the parent content-box offset already accumulated in px/py).
+    void RenderFreeField(App app, Canvas c, Theme t, FormField f, int ox, int oy,
+            int psMilli, int px, int py) {
+        int fs = t.fontSizeSmall;
+        int ex = ox + (px + f.fx) * psMilli / 1000;
+        int ey = oy + (py + f.fy) * psMilli / 1000;
+        int ew = f.fw * psMilli / 1000;
+        int eh = f.fh * psMilli / 1000;
+        if (ew < 2) { ew = 2; }
+        if (eh < 2) { eh = 2; }
+        bool selected = !preview && (f == sel);
+
+        if (f.IsContainer()) {
+            // Container: chrome + title, children placed inside the content box.
+            c.FillRoundRect(ex, ey, ew, eh, app.Scale(4), t.bgTertiary);
+            c.DrawRect(ex, ey, ew, eh, t.borderSecondary, 1);
+            c.DrawText(ex + app.Scale(6), ey + app.Scale(4), f.label, t.textSecondary, fs);
+            int kidPX = px + f.fx + 6;
+            int kidPY = py + f.fy + 26;
+            int k = 0;
+            while (k < f.KidCount()) {
+                RenderFreeField(app, c, t, f.KidAt(k), ox, oy, psMilli, kidPX, kidPY);
+                k = k + 1;
+            }
+        } else {
+            PreviewControl(app, c, t, f, ex, ey, ew, eh);
+        }
+
+        // Selection outline + resize handles.
+        if (selected) {
+            c.DrawRect(ex - 1, ey - 1, ew + 2, eh + 2, t.primary, 1);
+            int hs = app.Scale(7);
+            int hn = 0;
+            while (hn < 8) {
+                int hx = FreeHandleX(hn, ex, ew) - hs / 2;
+                int hy = FreeHandleY(hn, ey, eh) - hs / 2;
+                c.FillRect(hx, hy, hs, hs, t.primary);
+                hn = hn + 1;
+            }
+        } else {
+            c.DrawRect(ex, ey, ew, eh, t.borderSecondary, 1);
+        }
+        // Small identifying badge in the top-left corner.
+        string tag = FormField.TypeName(f.ftype);
+        if (f.fname.Length > 0) { tag = tag + " · " + f.fname; }
+        int tgw = Canvas.MeasureText(tag, t.fontSizeTiny) + app.Scale(8);
+        int tgh = Canvas.FontHeight(t.fontSizeTiny) + app.Scale(4);
+        if (tgh + app.Scale(6) <= eh && tgw + app.Scale(6) <= ew) {
+            c.FillRoundRect(ex + app.Scale(3), ey + app.Scale(3), tgw, tgh, app.Scale(3),
+                t.shadowColor);
+            c.DrawText(ex + app.Scale(7), ey + app.Scale(5), tag,
+                t.textTertiary, t.fontSizeTiny);
+        }
+    }
+
+    /// Topmost field under design-space (mx, my), searching `lst` back-to-front
+    /// so later siblings win; children win over their container. The parent
+    /// content-box origin is stored in freeSelPX/freeSelPY for dragging.
+    FormField FreePick(List<FormField> lst, int mx, int my, int px, int py) {
+        int i = lst.Count - 1;
+        while (i >= 0) {
+            FormField f = lst[i];
+            int ex = px + f.fx;
+            int ey = py + f.fy;
+            if (mx >= ex && mx < ex + f.fw && my >= ey && my < ey + f.fh) {
+                if (f.IsContainer() && f.KidCount() > 0) {
+                    FormField ch = FreePick(f.kids, mx, my, ex + 6, ey + 26);
+                    if (ch != null) { return ch; }
+                }
+                freeSelPX = px;
+                freeSelPY = py;
+                return f;
+            }
+            i = i - 1;
+        }
+        return null;
+    }
+
+    static int FreeHandleX(int hn, int ex, int ew) {
+        if (hn == 2 || hn == 3 || hn == 4) { return ex + ew; }
+        if (hn == 0 || hn == 6 || hn == 7) { return ex; }
+        return ex + ew / 2;
+    }
+
+    static int FreeHandleY(int hn, int ey, int eh) {
+        if (hn == 0 || hn == 1 || hn == 2) { return ey; }
+        if (hn == 4 || hn == 5 || hn == 6) { return ey + eh; }
+        return ey + eh / 2;
+    }
+
+    /// The free-canvas design area. letterboxed window + grid + fields + the
+    /// scene-designer interaction model (select / drag / resize / palette drop).
+    void RenderFreeCanvas(App app, Canvas c, Theme t, int cx, int cy, int cw, int ch) {
+        int fs = t.fontSizeSmall;
+        c.FillRoundRect(cx, cy, cw, ch, app.Scale(6), t.bgPrimary);
+        c.DrawRect(cx, cy, cw, ch, t.borderPrimary, 1);
+
+        int dw = winW;
+        int dh = winH;
+        if (dw < 40) { dw = 40; }
+        if (dh < 40) { dh = 40; }
+
+        int barH = app.Scale(34);
+        RenderFreeBar(app, c, t, cx, cy, cw);
+        int inX = cx + app.Scale(12);
+        int inY = cy + barH + app.Scale(6);
+        int inW = cw - app.Scale(24);
+        int inH = ch - barH - app.Scale(18);
+        if (inW < 20) { inW = 20; }
+        if (inH < 20) { inH = 20; }
+
+        int psMilli;
+        if (winZoom > 0) { psMilli = winZoom; }
+        else {
+            int fw2 = inW * 1000 / dw;
+            int fh2 = inH * 1000 / dh;
+            psMilli = fw2;
+            if (fh2 < psMilli) { psMilli = fh2; }
+            if (psMilli < 1) { psMilli = 1; }
+        }
+        int cw2 = dw * psMilli / 1000;
+        int ch2 = dh * psMilli / 1000;
+        int ox = inX + (inW - cw2) / 2;
+        int oy = inY + (inH - ch2) / 2;
+
+        // Canvas backdrop + frame.
+        c.FillRect(ox, oy, cw2, ch2, t.bgSecondary);
+        c.DrawRect(ox, oy, cw2, ch2, t.borderPrimary, 1);
+
+        // Grid overlay (skip lines that would collapse at low zoom).
+        if (showGrid && gridSize > 0) {
+            int gstep = gridSize;
+            while (gstep * psMilli / 1000 < app.Scale(6)) { gstep = gstep * 2; }
+            int gx = 0;
+            while (gx <= dw) {
+                c.FillRect(ox + gx * psMilli / 1000, oy, 1, ch2, t.borderSecondary);
+                gx = gx + gstep;
+            }
+            int gy = 0;
+            while (gy <= dh) {
+                c.FillRect(ox, oy + gy * psMilli / 1000, cw2, 1, t.borderSecondary);
+                gy = gy + gstep;
+            }
+        }
+
+        int ek = app.EventKind();
+        if (app.PointerCaptured()) { ek = 0; }
+
+        // Render visual top-level fields (non-visual ones live in the tray).
+        c.PushClip(ox, oy, cw2, ch2);
+        int i = 0;
+        while (i < fields.Count) {
+            if (!fields[i].IsNonVisual()) {
+                RenderFreeField(app, c, t, fields[i], ox, oy, psMilli, 0, 0);
+            }
+            i = i + 1;
+        }
+        c.PopClip();
+
+        // Palette drag release over the canvas adds the field at the cursor
+        // (centred), converted into design space.
+        if (dragging && dragFromPalette && ek == 3
+                && InRect(app.mouseX, app.mouseY, ox, oy, cw2, ch2)) {
+            int mDesX = (app.mouseX - ox) * 1000 / psMilli;
+            int mDesY = (app.mouseY - oy) * 1000 / psMilli;
+            DropFreePalette(mDesX, mDesY);
+        }
+
+        // Pointer press: resize handle of the selection wins, else select and
+        // begin a drag; empty press clears the selection.
+        if (ek == 2 && app.window.EventButton() == 0
+                && InRect(app.mouseX, app.mouseY, ox, oy, cw2, ch2)) {
+            bool started = false;
+            if (sel != null) {
+                int sx = ox + (freeSelPX + sel.fx) * psMilli / 1000;
+                int sy = oy + (freeSelPY + sel.fy) * psMilli / 1000;
+                int sw2 = sel.fw * psMilli / 1000;
+                int sh2 = sel.fh * psMilli / 1000;
+                int hs = app.Scale(10);
+                int hn = 0;
+                while (hn < 8 && !started) {
+                    int hx = FreeHandleX(hn, sx, sw2);
+                    int hy = FreeHandleY(hn, sy, sh2);
+                    if (InRect(app.mouseX, app.mouseY,
+                            hx - hs, hy - hs, hs * 2, hs * 2)) {
+                        freeResizing = true;
+                        freeResizeH = hn;
+                        started = true;
+                    }
+                    hn = hn + 1;
+                }
+            }
+            if (!started) {
+                int mDesX = (app.mouseX - ox) * 1000 / psMilli;
+                int mDesY = (app.mouseY - oy) * 1000 / psMilli;
+                FormField hit = FreePick(fields, mDesX, mDesY, 0, 0);
+                if (hit != null) {
+                    sel = hit;
+                    inspTab = 0;
+                    freeDragging = true;
+                    freeDragDx = mDesX - (freeSelPX + hit.fx);
+                    freeDragDy = mDesY - (freeSelPY + hit.fy);
+                } else {
+                    sel = null;
+                    activeContainer = null;
+                }
+            }
+            app.RequestRedraw();
+        }
+
+        // Drag: move the selection in design space with grid snap.
+        if (freeDragging && ek == 1 && sel != null) {
+            int mDesX = (app.mouseX - ox) * 1000 / psMilli;
+            int mDesY = (app.mouseY - oy) * 1000 / psMilli;
+            int newLeft = mDesX - freeDragDx;
+            int newTop = mDesY - freeDragDy;
+            if (snapGrid && gridSize > 0) {
+                newLeft = (newLeft + gridSize / 2) / gridSize * gridSize;
+                newTop = (newTop + gridSize / 2) / gridSize * gridSize;
+            }
+            sel.fx = newLeft - freeSelPX;
+            sel.fy = newTop - freeSelPY;
+            app.RequestRedraw();
+        }
+
+        // Resize: drag any of the 8 handles.
+        if (freeResizing && ek == 1 && sel != null) {
+            int mDesX = (app.mouseX - ox) * 1000 / psMilli;
+            int mDesY = (app.mouseY - oy) * 1000 / psMilli;
+            if (snapGrid && gridSize > 0) {
+                mDesX = (mDesX + gridSize / 2) / gridSize * gridSize;
+                mDesY = (mDesY + gridSize / 2) / gridSize * gridSize;
+            }
+            int oldL = freeSelPX + sel.fx;
+            int oldT = freeSelPY + sel.fy;
+            int oldR = oldL + sel.fw;
+            int oldB = oldT + sel.fh;
+            int newL = oldL;
+            int newT = oldT;
+            int newR = oldR;
+            int newB = oldB;
+            int hn = freeResizeH;
+            // 0=TL 1=T 2=TR 3=R 4=BR 5=B 6=BL 7=L
+            if (hn == 0 || hn == 6 || hn == 7) { newL = mDesX; }
+            if (hn == 0 || hn == 1 || hn == 2) { newT = mDesY; }
+            if (hn == 2 || hn == 3 || hn == 4) { newR = mDesX; }
+            if (hn == 4 || hn == 5 || hn == 6) { newB = mDesY; }
+            if (newR - newL < 8) {
+                if (hn == 0 || hn == 6 || hn == 7) { newL = newR - 8; } else { newR = newL + 8; }
+            }
+            if (newB - newT < 8) {
+                if (hn == 0 || hn == 1 || hn == 2) { newT = newB - 8; } else { newB = newT + 8; }
+            }
+            sel.fx = newL - freeSelPX;
+            sel.fy = newT - freeSelPY;
+            sel.fw = newR - newL;
+            sel.fh = newB - newT;
+            app.RequestRedraw();
+        }
+
+        // Pointer release anywhere ends the drag/resize.
+        if (ek == 3) {
+            freeDragging = false;
+            freeResizing = false;
+            app.RequestRedraw();
+        }
+    }
+
+    /// Adds a palette field onto the free canvas at design-space (dx, dy),
+    /// centring the fresh element on the cursor.
+    void DropFreePalette(int dx, int dy) {
+        int ftype = dragKind;
+        if (ftype == 100) {
+            FormField nf = FormField.NewCustom(dragCustomKind, seq);
+            seq = seq + 1;
+            nf.fx = dx - nf.fw / 2;
+            nf.fy = dy - nf.fh / 2;
+            fields.Add(nf);
+            sel = nf;
+            inspTab = 0;
+            msg = Designer.T("added ", "已添加 ") + dragCustomKind;
+            return;
+        }
+        if (ftype == 200) {
+            AddUserComponent(dragUserComp);
+            if (sel != null) {
+                sel.fx = dx - sel.fw / 2;
+                sel.fy = dy - sel.fh / 2;
+            }
+            return;
+        }
+        FormField f = FormField.New(ftype, seq);
+        seq = seq + 1;
+        if (FormField.IsNonVisualOf(ftype)) {
+            fields.Add(f);
+            sel = f;
+            inspTab = 0;
+            msg = Designer.T("added ", "已添加 ") + FormField.TypeName(ftype);
+            return;
+        }
+        f.fw = DefaultFreeW(f);
+        f.fh = DefaultFreeH(f);
+        f.fx = dx - f.fw / 2;
+        f.fy = dy - f.fh / 2;
+        fields.Add(f);
+        sel = f;
+        inspTab = 0;
+        if (f.IsContainer()) { activeContainer = f; }
+        msg = Designer.T("added ", "已添加 ") + FormField.TypeName(ftype);
+    }
+
+    int DefaultFreeW(FormField f) {
+        if (f.ftype == 36 || f.ftype == 23 || f.ftype == 24 || f.ftype == 25
+            || f.ftype == 38 || f.ftype == 40 || f.ftype == 41 || f.ftype == 42
+            || f.ftype == 43 || f.ftype == 45 || f.ftype == 46) { return 320; }
+        if (f.ftype == 15) { return 480; }
+        return 200;
+    }
+
+    int DefaultFreeH(FormField f) {
+        return f.RowUnits();
     }
 
     void RenderRow(App app, Canvas c, Theme t, FormField f, int rx, int ry, int rw, int rowH, int idx, bool topLevel) {

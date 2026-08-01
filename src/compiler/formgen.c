@@ -243,6 +243,12 @@ static bool fg_obj_bool(zan_json_value_t *o, const char *key) {
     return v && v->type == ZAN_JSON_BOOL && v->bool_val;
 }
 
+static int fg_obj_num(zan_json_value_t *o, const char *key, int def) {
+    zan_json_value_t *v = zan_json_get(o, key);
+    if (v && v->type == ZAN_JSON_NUMBER) return (int)v->number_val;
+    return def;
+}
+
 static const char *fg_obj_str(zan_json_value_t *o, const char *key) {
     zan_json_value_t *v = zan_json_get(o, key);
     if (v && v->type == ZAN_JSON_STRING && v->string_val.str)
@@ -368,17 +374,23 @@ static int fg_children_count(zan_json_value_t *o) {
 }
 
 /* Emit one field's declarations/construction into `decls`/`body`, its event
- * wiring into `wire`, recursing into container kids. Returns next local id. */
+ * wiring into `wire`, its required-field validation lines into `valid`,
+ * recursing into container kids. `freeMode` selects the free-canvas layout:
+ * absolute DockManual+Place placement with no caption row (the designer's
+ * layoutMode == 1), vs. the flow 24-column docking. Returns next local id. */
 static int fg_emit_field(fg_buf_t *decls, fg_buf_t *body, fg_buf_t *wire,
-                         zan_json_value_t *o, const char *parent, int id,
-                         fg_used_t *used) {
+                         fg_buf_t *valid, zan_json_value_t *o,
+                         const char *parent, int id,
+                         fg_used_t *used, bool freeMode) {
     int ft = fg_ftype_of(o);
     const char *wt = fg_widget_type(ft);
     const char *fname = fg_obj_str(o, "name");
     char fallback[24];
     int next = id + 1;
+    bool req = fg_obj_bool(o, "required");
+    bool isInput = strcmp(wt, "Input") == 0;
 
-    if (fg_needs_caption(ft)) {
+    if (!freeMode && fg_needs_caption(ft)) {
         fg_putf(body, "        Label cap%d = new Label(\"", id);
         fg_esc_cstr(body, fg_caption(o));
         fg_putf(body, "\");\n");
@@ -394,6 +406,12 @@ static int fg_emit_field(fg_buf_t *decls, fg_buf_t *body, fg_buf_t *wire,
         vn = fname;
         if (used->count < 128) used->names[used->count++] = fname;
         fg_putf(decls, "    static %s %s;\n", wt, vn);
+    } else if (req && isInput) {
+        // A required field must stay reachable from __ValidateForm, so it is
+        // hoisted to a static field even when its name is not an identifier.
+        snprintf(fallback, sizeof(fallback), "c%d", id);
+        vn = fallback;
+        fg_putf(decls, "    static %s %s;\n", wt, vn);
     } else {
         snprintf(fallback, sizeof(fallback), "c%d", id);
         vn = fallback;
@@ -407,13 +425,32 @@ static int fg_emit_field(fg_buf_t *decls, fg_buf_t *body, fg_buf_t *wire,
     fg_esc_cstr(body, fname);
     fg_putf(body, "\";\n");
     fg_field_setup(body, o, ft, wt, vn);
-    fg_putf(body, "        %s.Dock(Dock.Top());\n", vn);
-    if (fg_is_container(ft)) {
-        fg_putf(body, "        %s.Pad(10);\n", vn);
-        int ph = 44 + 44 * (int)fg_children_count(o);
-        fg_putf(body, "        %s.Prefer(0, %d);\n", vn, ph);
+    if (strcmp(wt, "Label") == 0 && fg_obj_bool(o, "wrap")) {
+        fg_putf(body, "        %s.wrap = true;\n", vn);
+    }
+    if (req && isInput) {
+        fg_putf(valid, "        if (TextWrap.Trim(%s.GetText()) == \"\") { %s.SetError(\"Required\"); ok = false; }\n", vn, vn);
+    }
+    if (freeMode) {
+        int fx = fg_obj_num(o, "fx", 0);
+        int fy = fg_obj_num(o, "fy", 0);
+        int fw = fg_obj_num(o, "fw", 200);
+        int fh = fg_obj_num(o, "fh", 32);
+        fg_putf(body, "        %s.Dock(Dock.Manual());\n", vn);
+        fg_putf(body, "        %s.Place(%d, %d);\n", vn, fx, fy);
+        fg_putf(body, "        %s.Prefer(%d, %d);\n", vn, fw, fh);
+        if (fg_is_container(ft)) {
+            fg_putf(body, "        %s.Pad(0);\n", vn);
+        }
     } else {
-        fg_putf(body, "        %s.Prefer(0, %d);\n", vn, fg_pref_h(ft));
+        fg_putf(body, "        %s.Dock(Dock.Top());\n", vn);
+        if (fg_is_container(ft)) {
+            fg_putf(body, "        %s.Pad(10);\n", vn);
+            int ph = 44 + 44 * (int)fg_children_count(o);
+            fg_putf(body, "        %s.Prefer(0, %d);\n", vn, ph);
+        } else {
+            fg_putf(body, "        %s.Prefer(0, %d);\n", vn, fg_pref_h(ft));
+        }
     }
     fg_putf(body, "        %s.Add(%s);\n", parent, vn);
     fg_emit_handlers(wire, o, vn);
@@ -421,8 +458,9 @@ static int fg_emit_field(fg_buf_t *decls, fg_buf_t *body, fg_buf_t *wire,
     zan_json_value_t *kids = zan_json_get(o, "kids");
     if (fg_is_container(ft) && kids && kids->type == ZAN_JSON_ARRAY) {
         for (int i = 0; i < kids->array_val.count; i++)
-            next = fg_emit_field(decls, body, wire, kids->array_val.items[i],
-                                 vn, next, used);
+            next = fg_emit_field(decls, body, wire, valid,
+                                 kids->array_val.items[i],
+                                 vn, next, used, freeMode);
     }
     return next;
 }
@@ -462,6 +500,7 @@ char *zan_formgen_translate(const char *json, size_t json_len,
     if (w && w->type == ZAN_JSON_NUMBER && w->number_val > 0) win_w = (int)w->number_val;
     zan_json_value_t *h = zan_json_get(root, "winH");
     if (h && h->type == ZAN_JSON_NUMBER && h->number_val > 0) win_h = (int)h->number_val;
+    bool free_mode = fg_obj_num(root, "layoutMode", 0) == 1;
     const char *title = fg_obj_str(root, "winTitle");
     if (!title[0]) title = name;
     bool center = fg_obj_bool(root, "winCenter");
@@ -471,14 +510,15 @@ char *zan_formgen_translate(const char *json, size_t json_len,
     zan_json_value_t *py = zan_json_get(root, "winPosY");
     if (py && py->type == ZAN_JSON_NUMBER) pos_y = (int)py->number_val;
 
-    fg_buf_t decls = {0}, body = {0}, wire = {0}, out = {0};
+    fg_buf_t decls = {0}, body = {0}, wire = {0}, valid = {0}, out = {0};
     fg_used_t used = {0};
 
     if (fields && fields->type == ZAN_JSON_ARRAY) {
         int id = 0;
         for (int i = 0; i < fields->array_val.count; i++)
-            id = fg_emit_field(&decls, &body, &wire, fields->array_val.items[i],
-                               "root", id, &used);
+            id = fg_emit_field(&decls, &body, &wire, &valid,
+                               fields->array_val.items[i],
+                               "root", id, &used, free_mode);
     }
 
     /* ---- assemble the synthetic partial class ---- */
@@ -501,10 +541,26 @@ char *zan_formgen_translate(const char *json, size_t json_len,
     fg_putf(&out, "    static Control __BuildForm() {\n");
     fg_putf(&out, "        Panel root = new Panel(\"root\");\n");
     fg_putf(&out, "        root.Dock(Dock.Fill());\n");
-    fg_putf(&out, "        root.Pad(16);\n");
-    fg_putf(&out, "        root.gap = 10;\n");
+    if (free_mode) {
+        // Free-canvas design: coordinates are absolute window pixels, so the
+        // root must not add its own padding/gap.
+        fg_putf(&out, "        root.Pad(0);\n");
+        fg_putf(&out, "        root.gap = 0;\n");
+    } else {
+        fg_putf(&out, "        root.Pad(16);\n");
+        fg_putf(&out, "        root.gap = 10;\n");
+    }
     if (body.buf) fg_putf(&out, "%s", body.buf);
     fg_putf(&out, "        return root;\n");
+    fg_putf(&out, "    }\n\n");
+    fg_putf(&out, "    /// Validates the required fields: flags every empty required\n");
+    fg_putf(&out, "    /// input (red border + message) and reports whether the form is\n");
+    fg_putf(&out, "    /// OK to submit. Call it from the submit handler:\n");
+    fg_putf(&out, "    ///     if (!__ValidateForm()) { return; }\n");
+    fg_putf(&out, "    static bool __ValidateForm() {\n");
+    fg_putf(&out, "        bool ok = true;\n");
+    if (valid.buf) fg_putf(&out, "%s", valid.buf);
+    fg_putf(&out, "        return ok;\n");
     fg_putf(&out, "    }\n\n");
     fg_putf(&out, "    /// Subscribes every designed `on<Event>` binding to the handler\n");
     fg_putf(&out, "    /// registry on the form (see Form.On / Form.Handle). Unregistered\n");
