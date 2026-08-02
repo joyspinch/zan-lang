@@ -3091,7 +3091,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                 local_var_t *local = local_find(locals, callee->member.object->ident.name);
                 if (local && local->type && local->type->sym) {
                     zan_symbol_t *type_sym = local->type->sym;
-                    zan_symbol_t *method_sym = resolve_overload(type_sym, callee->member.name, expr->call.args.count);
+                    zan_symbol_t *method_sym = resolve_overload_typed(g, type_sym, callee->member.name, expr, locals);
                     if (method_sym) pack_params_args(g, expr, method_sym, locals);
                     if (method_sym) {
                         /* a generic instance method monomorphizes with the
@@ -3217,7 +3217,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
             zan_ast_node_t *callee = expr->call.callee;
             zan_symbol_t *recv_cls = expr_class_sym(g, callee->member.object, locals);
             if (recv_cls) {
-                zan_symbol_t *method_sym = resolve_overload(recv_cls, callee->member.name, expr->call.args.count);
+                zan_symbol_t *method_sym = resolve_overload_typed(g, recv_cls, callee->member.name, expr, locals);
                     if (method_sym) pack_params_args(g, expr, method_sym, locals);
                 if (method_sym) {
                     int spec = try_method_spec(g, method_sym, expr,
@@ -3414,7 +3414,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
             if (is_name_path(obj) && head && !local_find(locals, head->ident.name)) {
                 zan_symbol_t *type_sym = zan_binder_lookup(g->binder, obj->member.name);
                 if (type_sym && (type_sym->kind == SYM_CLASS || type_sym->kind == SYM_STRUCT)) {
-                    zan_symbol_t *method_sym = resolve_overload(type_sym, callee->member.name, expr->call.args.count);
+                    zan_symbol_t *method_sym = resolve_overload_typed(g, type_sym, callee->member.name, expr, locals);
                     if (method_sym) pack_params_args(g, expr, method_sym, locals);
                     if (method_sym) {
                         for (int fi = irgen_find_function(g, method_sym); fi >= 0; fi = -1) {

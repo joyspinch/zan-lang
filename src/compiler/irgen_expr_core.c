@@ -768,6 +768,10 @@ static int method_args_score(zan_irgen_t *g, zan_symbol_t *m,
         }
         zan_type_t *pt = zan_binder_resolve_type(g->binder, ps->items[j]->param.type);
         if (!pt || type_mentions_tp(pt)) continue;
+        /* An interface parameter takes any implementing class; scoring
+         * cannot see the implements list, so it stays neutral here
+         * instead of disqualifying the candidate. */
+        if (pt->kind == TYPE_INTERFACE) continue;
         zan_type_t *at = infer_expr_type(g, a, locals);
         if (at && !type_mentions_tp(at)) {
             if (types_concrete_equal(pt, at)) { score += 4; continue; }
@@ -1264,6 +1268,12 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
         return g->binder->type_string;
     case AST_CAST_EXPR:
         return resolve_type_ctx(g, e->cast.type);
+    case AST_CONDITIONAL:
+        /* A conditional's type is its then-branch's type (the checker already
+         * types it that way), so a `cond ? call() : 0` feeds the call's declared
+         * type into narrowing checks and lets the ternary IR unify both sides
+         * against the same target. */
+        return infer_expr_type(g, e->conditional.then_expr, locals);
     default:
         return NULL;
     }

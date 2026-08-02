@@ -3339,6 +3339,24 @@ static LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
     return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
 }
 
+/* Unify a ternary branch value to the PHI's type. Integer widths and
+ * float/double widths are handled by coerce_int_to; an integer branch meeting
+ * a float PHI (or vice versa) is converted with sitofp/fptosi so a mixed
+ * `cond ? 1.5 : 0` never feeds a mismatched PHI operand. */
+static LLVMValueRef coerce_ternary_value(zan_irgen_t *g, LLVMValueRef v,
+                                         LLVMTypeRef target) {
+    if (!v || !target) return v;
+    int vk = LLVMGetTypeKind(LLVMTypeOf(v));
+    int tk = LLVMGetTypeKind(target);
+    if (vk == LLVMIntegerTypeKind &&
+        (tk == LLVMFloatTypeKind || tk == LLVMDoubleTypeKind))
+        return LLVMBuildSIToFP(g->builder, v, target, "tern.sitofp");
+    if ((vk == LLVMFloatTypeKind || vk == LLVMDoubleTypeKind) &&
+        tk == LLVMIntegerTypeKind)
+        return LLVMBuildFPToSI(g->builder, v, target, "tern.fptosi");
+    return coerce_int_to(g, v, target);
+}
+
 static LLVMValueRef emit_expr_conditional(zan_irgen_t *g, zan_ast_node_t *expr,
         local_scope_t *locals) {
         /* ternary: condition ? then_expr : else_expr */
@@ -3359,15 +3377,54 @@ static LLVMValueRef emit_expr_conditional(zan_irgen_t *g, zan_ast_node_t *expr,
         LLVMPositionBuilderAtEnd(g->builder, then_bb);
         LLVMValueRef then_val = emit_expr(g, expr->conditional.then_expr, locals);
         LLVMBasicBlockRef then_end = LLVMGetInsertBlock(g->builder);
-        LLVMBuildBr(g->builder, merge_bb);
 
         LLVMPositionBuilderAtEnd(g->builder, else_bb);
         LLVMValueRef else_val = emit_expr(g, expr->conditional.else_expr, locals);
         LLVMBasicBlockRef else_end = LLVMGetInsertBlock(g->builder);
+
+        /* The branch values can disagree in width: an integer literal is always
+         * i64 while a method call returns its declared type (i32 for `int`), so
+         * `on ? F() : 0` would feed an i64 constant into an i32 PHI and fail
+         * LLVM verification. Unify both sides to the inferred type (the then
+         * branch's type, as the checker types conditionals) when one exists,
+         * otherwise to the wider of the two branches; the conversions live in
+         * their branch blocks so they dominate the PHI (which must stay grouped
+         * at the top of the merge block). */
+        LLVMTypeRef tty = LLVMTypeOf(then_val);
+        LLVMTypeRef ety = LLVMTypeOf(else_val);
+        LLVMTypeRef phi_ty = tty;
+        if (tty != ety) {
+            zan_type_t *st = infer_expr_type(g, expr, locals);
+            if (st) {
+                LLVMTypeRef want = map_type(g, st);
+                if (want) phi_ty = want;
+            }
+            if (phi_ty == tty) {
+                int tk = LLVMGetTypeKind(tty), ek = LLVMGetTypeKind(ety);
+                if (tk == LLVMIntegerTypeKind && ek == LLVMIntegerTypeKind) {
+                    if (LLVMGetIntTypeWidth(ety) > LLVMGetIntTypeWidth(tty))
+                        phi_ty = ety;
+                } else if ((tk == LLVMFloatTypeKind || tk == LLVMDoubleTypeKind) &&
+                           (ek == LLVMFloatTypeKind || ek == LLVMDoubleTypeKind)) {
+                    if ((ek == LLVMDoubleTypeKind) &&
+                        !(tk == LLVMDoubleTypeKind)) phi_ty = ety;
+                } else if (ek == LLVMFloatTypeKind || ek == LLVMDoubleTypeKind) {
+                    phi_ty = ety;
+                }
+            }
+            LLVMPositionBuilderAtEnd(g->builder, then_end);
+            then_val = coerce_ternary_value(g, then_val, phi_ty);
+            LLVMPositionBuilderAtEnd(g->builder, else_end);
+            else_val = coerce_ternary_value(g, else_val, phi_ty);
+        }
+
+        LLVMPositionBuilderAtEnd(g->builder, then_end);
+        LLVMBuildBr(g->builder, merge_bb);
+        LLVMPositionBuilderAtEnd(g->builder, else_end);
         LLVMBuildBr(g->builder, merge_bb);
 
         LLVMPositionBuilderAtEnd(g->builder, merge_bb);
-        LLVMValueRef phi = LLVMBuildPhi(g->builder, LLVMTypeOf(then_val), "tern");
+        LLVMValueRef phi = LLVMBuildPhi(g->builder, phi_ty, "tern");
         LLVMValueRef incoming_vals[] = { then_val, else_val };
         LLVMBasicBlockRef incoming_bbs[] = { then_end, else_end };
         LLVMAddIncoming(phi, incoming_vals, incoming_bbs, 2);
