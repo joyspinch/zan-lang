@@ -54,6 +54,13 @@ class Control {
     int padT;
     int padR;
     int padB;
+    /// Set by Pad()/Padding(): the caller pinned the inner padding, so a
+    /// widget's OnMeasure must not overwrite it with its themed default.
+    bool padSet;
+    /// Set by Prefer() (and UiDoc's `width`/`height`): the caller pinned the
+    /// preferred size, so a container that measures itself from its children
+    /// keeps the axis that was given.
+    bool prefSet;
     int gap;
     bool visible;
     /// Resolved bounds in canvas coordinates (set by Arrange).
@@ -139,6 +146,8 @@ class Control {
         padT = 0;
         padR = 0;
         padB = 0;
+        padSet = false;
+        prefSet = false;
         gap = 0;
         visible = true;
         bx = 0;
@@ -368,7 +377,11 @@ class Control {
         return computedStyle.ClampH(computedStyle.HeightOr(prefH));
     }
 
+    /// Left inset of the content box. An explicit Pad()/Padding() wins over
+    /// the themed default the resolved style carries (a free-canvas root pins
+    /// it to 0); without a call the stylesheet decides.
     int StylePadL() {
+        if (padSet) { return padL; }
         if (computedStyle != null) { return computedStyle.PadLOr(padL); }
         return padL;
     }
@@ -377,16 +390,19 @@ class Control {
     /// its own chrome (a Card's title row) must keep room for it whatever the
     /// stylesheet says about padding.
     virtual int StylePadT() {
+        if (padSet) { return padT; }
         if (computedStyle != null) { return computedStyle.PadTOr(padT); }
         return padT;
     }
 
     int StylePadR() {
+        if (padSet) { return padR; }
         if (computedStyle != null) { return computedStyle.PadROr(padR); }
         return padR;
     }
 
     int StylePadB() {
+        if (padSet) { return padB; }
         if (computedStyle != null) { return computedStyle.PadBOr(padB); }
         return padB;
     }
@@ -409,6 +425,18 @@ class Control {
     int StyleHeightIn(int avail) {
         if (computedStyle == null) { return prefH; }
         return computedStyle.ClampHIn(avail, computedStyle.HeightIn(avail, prefH));
+    }
+
+    /// True when the stylesheet declares a width/height (a size class like
+    /// `button.large`), as opposed to the measured preference. A docked row
+    /// child that declares its cross size keeps it (and is centred) instead of
+    /// being stretched to the row height.
+    bool StyleDeclaresWidth() {
+        return computedStyle != null && computedStyle.width >= 0;
+    }
+
+    bool StyleDeclaresHeight() {
+        return computedStyle != null && computedStyle.height >= 0;
     }
 
     /// CSS `flex-grow` of this node (0 = keep its own size).
@@ -461,6 +489,7 @@ class Control {
     Control Prefer(int w, int h) {
         prefW = w;
         prefH = h;
+        prefSet = true;
         return this;
     }
 
@@ -475,6 +504,7 @@ class Control {
         padT = p;
         padR = p;
         padB = p;
+        padSet = true;
         return this;
     }
 
@@ -483,6 +513,7 @@ class Control {
         padR = right;
         padB = bottom;
         padL = left;
+        padSet = true;
         return this;
     }
 
@@ -650,7 +681,20 @@ class Control {
             children[i].MeasureTree(app);
             i = i + 1;
         }
+        // A size the author asked for (Prefer(), or `width`/`height` in a
+        // UiDoc) outranks the one the widget measures for itself: OnMeasure
+        // assigns prefW/prefH unconditionally, which used to throw away the
+        // 92px a docked table column was given and dock the control at its
+        // natural width instead -- so the columns of a row overlapped.
+        int keepW = prefW;
+        int keepH = prefH;
+        bool keepSet = prefSet;
         OnMeasure(app);
+        if (keepSet) {
+            if (keepW > 0) { prefW = keepW; }
+            if (keepH > 0) { prefH = keepH; }
+            prefSet = true;
+        }
     }
 
     static int FitSize(int requested, int available) {
@@ -709,14 +753,24 @@ class Control {
                     ch = restH - gh;
                 } else if (c.dock == 3) {
                     int ww = Control.FitSize(c.DockSize(cw, true), cw);
-                    c.Arrange(cx, cy, ww, ch);
+                    if (c.StyleDeclaresHeight()) {
+                        int hh = Control.FitSize(c.StyleHeightIn(ch), ch);
+                        c.Arrange(cx, cy + (ch - hh) / 2, ww, hh);
+                    } else {
+                        c.Arrange(cx, cy, ww, ch);
+                    }
                     int restW = cw - ww;
                     int gw = Control.FitGap(innerGap, restW);
                     cx = cx + ww + gw;
                     cw = restW - gw;
                 } else if (c.dock == 4) {
                     int ww = Control.FitSize(c.DockSize(cw, true), cw);
-                    c.Arrange(cx + cw - ww, cy, ww, ch);
+                    if (c.StyleDeclaresHeight()) {
+                        int hh = Control.FitSize(c.StyleHeightIn(ch), ch);
+                        c.Arrange(cx + cw - ww, cy + (ch - hh) / 2, ww, hh);
+                    } else {
+                        c.Arrange(cx + cw - ww, cy, ww, ch);
+                    }
                     int restW = cw - ww;
                     int gw = Control.FitGap(innerGap, restW);
                     cw = restW - gw;
@@ -851,8 +905,10 @@ class Control {
             if (crossAvail < 0) { crossAvail = 0; }
             int cross;
             if (row) { cross = c.StyleHeightIn(ch); } else { cross = c.StyleWidthIn(cw); }
-            if (align == 0 || cross <= 0) { cross = crossAvail; }
+            bool declaresCross = row ? c.StyleDeclaresHeight() : c.StyleDeclaresWidth();
             if (cross > crossAvail) { cross = crossAvail; }
+            if (align == 0 && !declaresCross) { cross = crossAvail; }
+            if (cross <= 0) { cross = crossAvail; }
             int crossPos = 0;
             if (align == 2) { crossPos = (crossAvail - cross) / 2; }
             else if (align == 3) { crossPos = crossAvail - cross; }

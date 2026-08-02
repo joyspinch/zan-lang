@@ -42,6 +42,7 @@ class FilePicker {
     string suffix;
     string selectedPath;
     string statusText;
+    string lastFilter;
     List<string> expanded;
     /// Extension filters shown in the footer dropdown. Each FileFilter pairs a
     /// human label (e.g. "Zan source (*.zan)") with a ";"-separated extension
@@ -82,6 +83,7 @@ class FilePicker {
         picker.suffix = "";
         picker.selectedPath = "";
         picker.statusText = "";
+        picker.lastFilter = "";
         picker.expanded = new List<string>();
         picker.filters = new List<FileFilter>();
         picker.filterSel = SignalInt.Create(0);
@@ -311,6 +313,7 @@ class FilePicker {
         suffix = extension;
         selectedPath = "";
         statusText = "";
+        lastFilter = "";
         creatingFolder = false;
         treeDragging = false;
         listDragging = false;
@@ -380,6 +383,20 @@ class FilePicker {
             i = i + 1;
         }
         return pattern;
+    }
+
+    /// Case-insensitive substring test for the name filter box ("" matches all).
+    static bool ContainsText(string text, string needle) {
+        if (needle == "") { return true; }
+        string left = FilePicker.LowerAscii(text);
+        string right = FilePicker.LowerAscii(needle);
+        if (right.Length > left.Length) { return false; }
+        int i = 0;
+        while (i + right.Length <= left.Length) {
+            if (left.Substring(i, right.Length) == right) { return true; }
+            i = i + 1;
+        }
+        return false;
     }
 
     /// True when `name` passes the currently-selected filter. An empty pattern
@@ -592,7 +609,7 @@ class FilePicker {
         }
 
         int footerH = t.heightMedium + t.gapMedium;
-        if (mode == 2) {
+        if (mode != 0) {
             footerH = t.heightMedium * 2 + t.gapMedium * 2;
         }
         int paneH = H - paneY - footerH - pad;
@@ -621,7 +638,7 @@ class FilePicker {
         int filterW = app.Scale(210);
         int filterX = fCancelX - t.gapMedium - filterW;
         int filterRowY = paneY + paneH + t.gapMedium;
-        if (mode == 2) { filterRowY = filterRowY + t.heightMedium + t.gapMedium; }
+        if (mode != 0) { filterRowY = filterRowY + t.heightMedium + t.gapMedium; }
         int filterMenuH = filters.Count * t.heightMedium + t.paddingTiny * 2;
         int filterMenuY = filterRowY - filterMenuH - app.Scale(4);
         bool suppressOthers = false;
@@ -775,13 +792,25 @@ class FilePicker {
         List<string> paths = new List<string>();
         List<int> kinds = new List<int>();
         if (valid) {
+            // The name box filters BOTH files and folders by substring, so
+            // typing "rep" narrows a directory of reports as well as its
+            // subfolders; "" shows everything.
+            string nameFilter = "";
+            if (mode != 0) { nameFilter = nameInput.GetText(); }
+            if (nameFilter != lastFilter) {
+                lastFilter = nameFilter;
+                listScroll.Set(0);
+                app.RequestRedraw();
+            }
             List<string> dirs = Directory.GetDirectoriesFiltered(
                 dir, showHidden.Get());
             int di = 0;
             while (di < dirs.Count) {
-                names.Add(dirs[di]);
-                paths.Add(FilePicker.Join(dir, dirs[di]));
-                kinds.Add(1);
+                if (FilePicker.ContainsText(dirs[di], nameFilter)) {
+                    names.Add(dirs[di]);
+                    paths.Add(FilePicker.Join(dir, dirs[di]));
+                    kinds.Add(1);
+                }
                 di = di + 1;
             }
             if (mode != 0) {
@@ -789,7 +818,8 @@ class FilePicker {
                     dir, showHidden.Get());
                 int fi = 0;
                 while (fi < files.Count) {
-                    if (MatchesCurrentFilter(files[fi])) {
+                    if (MatchesCurrentFilter(files[fi])
+                            && FilePicker.ContainsText(files[fi], nameFilter)) {
                         names.Add(files[fi]);
                         paths.Add(FilePicker.Join(dir, files[fi]));
                         kinds.Add(0);
@@ -950,7 +980,7 @@ class FilePicker {
         }
 
         int footerY = paneY + paneH + t.gapMedium;
-        if (mode == 2) {
+        if (mode != 0) {
             c.DrawText(
                 pad, footerY + app.Scale(8),
                 FilePicker.T("File name", "文件名"),
@@ -1054,9 +1084,27 @@ class FilePicker {
                        && Directory.FileExistsUtf8(selectedPath)) {
                 Finish(1);
             } else if (mode == 1) {
-                statusText = FilePicker.T(
-                    "Select a file first.", "请先选择文件。");
-                app.RequestRedraw();
+                // The name box doubles as the picker: typing a full name (or a
+                // folder to descend into) and pressing Open resolves it.
+                string typed = nameInput.GetText();
+                if (typed != "") {
+                    string typedPath = FilePicker.Join(dir, typed);
+                    if (Directory.FileExistsUtf8(typedPath)) {
+                        selectedPath = typedPath;
+                        Finish(1);
+                    } else if (Directory.ExistsUtf8(typedPath)) {
+                        selectedPath = "";
+                        Navigate(typedPath);
+                    } else {
+                        statusText = FilePicker.T(
+                            "No such file or folder.", "没有此文件或文件夹。");
+                        app.RequestRedraw();
+                    }
+                } else {
+                    statusText = FilePicker.T(
+                        "Select a file first.", "请先选择文件。");
+                    app.RequestRedraw();
+                }
             } else if (mode == 2
                        && valid && nameInput.GetText() != "") {
                 string name = nameInput.GetText();

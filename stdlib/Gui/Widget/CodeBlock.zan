@@ -22,6 +22,17 @@ class CodeBlock : Control {
     SignalInt scroll;
     bool copied;
     int wid;
+    // Selection state. The code is read-only but selectable (drag, Ctrl+A,
+    // Ctrl+C), and only one block can own a selection at a time, so the state
+    // is shared and tagged with the owning block's focus id -- which also lets
+    // it survive hosts that rebuild the widget every frame.
+    static int selOwner;
+    static bool selActive;
+    static bool selDragging;
+    static int selAnchorLine;
+    static int selAnchorCol;
+    static int selLine;
+    static int selCol;
     /// Fires when the copy action is clicked.
     UiEvent Copy;
 
@@ -50,17 +61,101 @@ class CodeBlock : Control {
     /// hosts that would rather test than subscribe to `Copy`.
     bool Copied() { return copied; }
 
-    /// The lines shown; assigning replaces them and rewinds the scroll.
+    /// The lines shown; assigning replaces them, rewinds the scroll and drops
+    /// any selection.
     void SetLines(List<string> src) {
         lines = src;
         scroll.Set(0);
+        CodeBlock.ClearSelection();
     }
+
+    /// Drops the shared selection, whoever owned it.
+    static void ClearSelection() {
+        CodeBlock.selActive = false;
+        CodeBlock.selDragging = false;
+        CodeBlock.selOwner = 0 - 1;
+    }
+
+    /// The whole snippet as one string.
+    string AllText() { return string.Join("\n", lines); }
+
+    /// The selected text, or "" when this block holds no selection.
+    string SelectedText(int owner) {
+        if (!CodeBlock.selActive || CodeBlock.selOwner != owner) { return ""; }
+        int sL = CodeBlock.selAnchorLine;
+        int sC = CodeBlock.selAnchorCol;
+        int eL = CodeBlock.selLine;
+        int eC = CodeBlock.selCol;
+        if (sL > eL || (sL == eL && sC > eC)) {
+            int tL = sL; sL = eL; eL = tL;
+            int tC = sC; sC = eC; eC = tC;
+        }
+        if (sL < 0) { sL = 0; }
+        if (eL >= lines.Count) { eL = lines.Count - 1; }
+        string acc = "";
+        int i = sL;
+        while (i <= eL) {
+            string ln = lines[i];
+            int a = 0;
+            int b = ln.Length;
+            if (i == sL) { a = sC; }
+            if (i == eL) { b = eC; }
+            if (a < 0) { a = 0; }
+            if (b > ln.Length) { b = ln.Length; }
+            if (b > a) { acc = acc + ln.Substring(a, b - a); }
+            if (i < eL) { acc = acc + "\n"; }
+            i = i + 1;
+        }
+        return acc;
+    }
+
+    /// Selects the whole snippet (Ctrl+A).
+    void SelectAll(int owner) {
+        if (lines.Count == 0) { return; }
+        CodeBlock.selOwner = owner;
+        CodeBlock.selAnchorLine = 0;
+        CodeBlock.selAnchorCol = 0;
+        CodeBlock.selLine = lines.Count - 1;
+        CodeBlock.selCol = lines[lines.Count - 1].Length;
+        CodeBlock.selActive = true;
+    }
+
+    /// Maps the pointer to a (line, column) caret inside the code area.
+    void CaretFromMouse(App app, int codeX, int topY, int lineH, int off,
+                        int font, bool moveAnchor) {
+        int l = off + (app.mouseY - topY) / lineH;
+        if (l < 0) { l = 0; }
+        if (l >= lines.Count) { l = lines.Count - 1; }
+        if (l < 0) { return; }
+        int col = CodeEditor.ColFromX(lines[l], app.mouseX - codeX, font);
+        if (moveAnchor) {
+            CodeBlock.selAnchorLine = l;
+            CodeBlock.selAnchorCol = col;
+        }
+        CodeBlock.selLine = l;
+        CodeBlock.selCol = col;
+    }
+
 
     static int LineHeight(App app) {
         return Canvas.FontHeight(app.theme.fontSizeSmall) + app.Scale(4);
     }
 
     static int HeaderHeight(App app) { return app.Scale(28); }
+
+    /// Width of the line-number gutter for `lineCount` lines.
+    static int GutterWidth(App app, int lineCount) {
+        int digits = Canvas.MeasureText(Convert.ToString(lineCount),
+                                        app.theme.fontSizeSmall);
+        return digits + app.Scale(18);
+    }
+
+    /// Default surface: the editor backdrop at ~70% opacity, so the skin's
+    /// wallpaper (or the frosted panel behind it) reads through the block
+    /// instead of a flat slab. A stylesheet `background` still wins.
+    static int SurfaceColor(EditorPalette pal) {
+        return 180 * 16777216 + (pal.hoverBg % 16777216);
+    }
 
     /// Natural height for `lineCount` lines (clamp it to the space available).
     static int Height(App app, int lineCount) {
@@ -91,7 +186,7 @@ class CodeBlock : Control {
         int hdrH = CodeBlock.HeaderHeight(app);
         int lineH = CodeBlock.LineHeight(app);
         c.FillRoundRect(bx, by, bw, bh, s.RadiusOr(t.borderRadiusMedium),
-                        s.BgOr(pal.hoverBg));
+                        s.BgOr(CodeBlock.SurfaceColor(pal)));
         c.DrawRect(bx, by, bw, bh, s.BorderOr(t.borderPrimary),
                    s.BorderWOr(1));
         c.FillRect(bx, by + hdrH, bw, 1, pal.panelBg);
@@ -101,10 +196,15 @@ class CodeBlock : Control {
         c.DrawText(bx + app.Scale(12), by + app.Scale(7), Caption.Get(),
                    cs.FgOr(t.textPrimary), capFont);
 
-        string copyLabel = CopyLabel.Get();
-        int cpW = Canvas.MeasureText(copyLabel, t.fontSizeSmall) + app.Scale(34);
-        int cpId = new Button { Text = copyLabel, Icon = "copy", Class = "small" }
-            .Render(app, bx + bw - cpW - app.Scale(8), by + app.Scale(3), cpW);
+        // The copy action sits inside the caption bar: its natural width (icon
+        // + label + padding, so a translated label is never ellipsized) at the
+        // header's height less a small inset, instead of the style's own.
+        Button cp = new Button { Text = CopyLabel.Get(), Icon = "copy",
+                                 Class = "small" };
+        int cpH = hdrH - app.Scale(8);
+        int cpW = cp.AutoWidth(app);
+        int cpId = cp.RenderIn(app, bx + bw - cpW - app.Scale(8),
+                               by + app.Scale(4), cpW, cpH);
 
         int textY = by + hdrH + app.Scale(8);
         int bottom = by + bh - app.Scale(6);
@@ -130,12 +230,93 @@ class CodeBlock : Control {
         StyleBox ls = this.ResolvePartAs(app, "codeblock", "line", "", Class,
                                          Style.SNormal());
         int lineFont = ls.FontOr(t.fontSizeSmall);
-        int lineColor = ls.FgOr(pal.menuText);
+        int lineColor = ls.FgOr(pal.plain);
+        int gutW = CodeBlock.GutterWidth(app, lines.Count);
+        // Gutter: a faint column behind right-aligned line numbers, separated
+        // from the code by a hairline -- the editor's reading rhythm in a
+        // read-only block.
+        c.FillRect(bx + 1, by + hdrH + 1, gutW, bh - hdrH - 2,
+                   34 * 16777216 + (pal.panelBg % 16777216));
+        c.FillRect(bx + gutW, by + hdrH + 1, 1, bh - hdrH - 2,
+                   60 * 16777216 + (pal.border % 16777216));
+        int codeX = bx + gutW + app.Scale(10);
+        // ---- selectable, read-only text: drag to select, Ctrl+A, Ctrl+C ----
+        int fid = app.focus.AllocId();
+        bool focused = app.focus.IsFocused(fid);
+        bool overCode = app.mouseX >= bx + gutW && app.mouseX < bx + bw
+            && app.mouseY >= textY && app.mouseY < bottom;
+        if (app.EventKind() == 2 && app.window.EventButton() == 0 && overCode) {
+            app.focus.SetFocused(fid);
+            focused = true;
+            bool shift = Modifiers.HasShift(app.window.EventMods());
+            bool keep = shift && CodeBlock.selOwner == fid;
+            CodeBlock.selOwner = fid;
+            this.CaretFromMouse(app, codeX, textY, lineH, off, lineFont, !keep);
+            CodeBlock.selActive = keep;
+            CodeBlock.selDragging = true;
+            app.RequestRedraw();
+        }
+        if (app.EventKind() == 1 && CodeBlock.selDragging
+            && CodeBlock.selOwner == fid) {
+            this.CaretFromMouse(app, codeX, textY, lineH, off, lineFont, false);
+            CodeBlock.selActive = CodeBlock.selLine != CodeBlock.selAnchorLine
+                || CodeBlock.selCol != CodeBlock.selAnchorCol;
+            app.RequestRedraw();
+        }
+        if (app.EventKind() == 3 && app.window.EventButton() == 0) {
+            CodeBlock.selDragging = false;
+        }
+        if (focused && app.EventKind() == 6) {
+            int key = app.window.EventKeyCode();
+            if (key == 1) {                                  // Ctrl+A
+                this.SelectAll(fid);
+                app.RequestRedraw();
+            } else if (key == 3) {                           // Ctrl+C
+                string sel = this.SelectedText(fid);
+                if (sel == "") { sel = this.AllText(); }
+                Clipboard.SetText(sel);
+                app.RequestRedraw();
+            }
+        }
+        bool showSel = CodeBlock.selActive && CodeBlock.selOwner == fid;
+
         c.PushClip(bx, by + hdrH, bw, bh - hdrH);
+        // Block comments span lines, so the tokenizer state is carried over
+        // from the first line -- not from the first *visible* one.
+        bool inBlock = false;
+        int pre = 0;
+        while (pre < off && pre < lines.Count) {
+            List<string> pt = new List<string>();
+            List<int> pc = new List<int>();
+            inBlock = CodeEditor.HighlightSpans(lines[pre], pal.keyword,
+                pal.type, pal.str, pal.comment, pal.number, lineColor,
+                inBlock, pt, pc);
+            pre = pre + 1;
+        }
         int i = off;
         while (i < lines.Count && textY + lineH <= bottom) {
-            c.DrawText(bx + app.Scale(12), textY, lines[i], lineColor,
-                       lineFont);
+            string no = Convert.ToString(i + 1);
+            int noW = Canvas.MeasureText(no, lineFont);
+            c.DrawText(bx + gutW - app.Scale(8) - noW, textY, no,
+                       pal.lineNo, lineFont);
+            if (showSel) {
+                CodeEditor.DrawSelHighlight(c, app, CodeBlock.selAnchorLine,
+                    CodeBlock.selAnchorCol, CodeBlock.selLine, CodeBlock.selCol,
+                    i, lines[i], codeX, textY, lineH, lineFont,
+                    Rect.Create(bx, by, bw, bh));
+            }
+            List<string> segT = new List<string>();
+            List<int> segC = new List<int>();
+            inBlock = CodeEditor.HighlightSpans(lines[i], pal.keyword,
+                pal.type, pal.str, pal.comment, pal.number, lineColor,
+                inBlock, segT, segC);
+            int tx = codeX;
+            int g = 0;
+            while (g < segT.Count) {
+                c.DrawText(tx, textY, segT[g], segC[g], lineFont);
+                tx = tx + Canvas.MeasureText(segT[g], lineFont);
+                g = g + 1;
+            }
             textY = textY + lineH;
             i = i + 1;
         }

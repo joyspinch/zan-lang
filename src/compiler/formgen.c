@@ -436,9 +436,15 @@ static int fg_emit_field(fg_buf_t *decls, fg_buf_t *body, fg_buf_t *wire,
         int fy = fg_obj_num(o, "fy", 0);
         int fw = fg_obj_num(o, "fw", 200);
         int fh = fg_obj_num(o, "fh", 32);
+        /* Free-canvas coordinates are authored at 100%: scale them to the
+         * display like the theme metrics and the stylesheet lengths already
+         * are, so a design keeps its proportions (and stays inside its
+         * winShape silhouette, which the runtime scales too) at 125/150/200%. */
         fg_putf(body, "        %s.Dock(Dock.Manual());\n", vn);
-        fg_putf(body, "        %s.Place(%d, %d);\n", vn, fx, fy);
-        fg_putf(body, "        %s.Prefer(%d, %d);\n", vn, fw, fh);
+        fg_putf(body, "        %s.Place(%d * __dp / 100, %d * __dp / 100);\n",
+                vn, fx, fy);
+        fg_putf(body, "        %s.Prefer(%d * __dp / 100, %d * __dp / 100);\n",
+                vn, fw, fh);
         if (fg_is_container(ft)) {
             fg_putf(body, "        %s.Pad(0);\n", vn);
         }
@@ -509,6 +515,73 @@ char *zan_formgen_translate(const char *json, size_t json_len,
     if (px && px->type == ZAN_JSON_NUMBER) pos_x = (int)px->number_val;
     zan_json_value_t *py = zan_json_get(root, "winPosY");
     if (py && py->type == ZAN_JSON_NUMBER) pos_y = (int)py->number_val;
+    /* Window appearance options: winShape (0 rect, 1 rounded rect with
+     * winShapeRadius, 2 ellipse, or a JSON array of shape regions
+     * [{t,x,y,w,h,r},...] whose union is the silhouette), winChrome (custom
+     * title bar, default true), winGlass (OS-native acrylic), winOpacity
+     * (10..100, 0 = keep opaque). Projected onto the App API in Main. */
+    int win_shape = fg_obj_num(root, "winShape", 0);
+    int win_shape_radius = fg_obj_num(root, "winShapeRadius", 0);
+    int win_shadow = fg_obj_num(root, "winShadow", 0);
+    int win_opacity = fg_obj_num(root, "winOpacity", 0);
+    bool win_glass = fg_obj_bool(root, "winGlass");
+    bool win_chrome = true;
+    zan_json_value_t *wch = zan_json_get(root, "winChrome");
+    if (wch && wch->type == ZAN_JSON_BOOL) win_chrome = wch->bool_val;
+    /* Compose the silhouette spec string: "t,x,y,w,h,r;..." in logical px. */
+    char shape_spec[512];
+    shape_spec[0] = '\0';
+    zan_json_value_t *wshape = zan_json_get(root, "winShape");
+    if (wshape && wshape->type == ZAN_JSON_ARRAY) {
+        int n = 0;
+        for (int i = 0; i < wshape->array_val.count; i++) {
+            zan_json_value_t *reg = wshape->array_val.items[i];
+            int t = fg_obj_num(reg, "t", 1);
+            int rx = fg_obj_num(reg, "x", 0);
+            int ry = fg_obj_num(reg, "y", 0);
+            int rw = fg_obj_num(reg, "w", 0);
+            int rh = fg_obj_num(reg, "h", 0);
+            int rr = fg_obj_num(reg, "r", 0);
+            if (rw <= 0 || rh <= 0) { continue; }
+            if (n > 0) {
+                size_t L = strlen(shape_spec);
+                if (L + 2 < sizeof(shape_spec)) { strcat(shape_spec, ";"); }
+            }
+            snprintf(shape_spec + strlen(shape_spec),
+                     sizeof(shape_spec) - strlen(shape_spec),
+                     "%d,%d,%d,%d,%d,%d", t, rx, ry, rw, rh, rr);
+            n = n + 1;
+        }
+    } else if (win_shape == 1) {
+        snprintf(shape_spec, sizeof(shape_spec), "1,0,0,%d,%d,%d",
+                 win_w, win_h, win_shape_radius);
+    } else if (win_shape == 2) {
+        int d = win_w;
+        if (win_h < d) { d = win_h; }
+        snprintf(shape_spec, sizeof(shape_spec), "2,0,0,%d,%d,0", d, d);
+    }
+
+    /* winShadow: prepend a type-3 "shadow band" region — a full-window rounded
+     * rect whose radius tracks the shape's — so the OS surface covers the
+     * drop-shadow pixels App paints around the silhouette (type 3 is treated
+     * as a rounded rect by the backend and casts no shadow itself). */
+    if (win_shadow > 0 && shape_spec[0] != '\0') {
+        int max_r = win_shape_radius;
+        if (wshape && wshape->type == ZAN_JSON_ARRAY) {
+            for (int i = 0; i < wshape->array_val.count; i++) {
+                int rr = fg_obj_num(wshape->array_val.items[i], "r", 0);
+                if (rr > max_r) { max_r = rr; }
+            }
+        }
+        int band_r = max_r + win_shadow;
+        if (band_r < 8) { band_r = 8; }
+        if (band_r > 64) { band_r = 64; }
+        char band[64];
+        snprintf(band, sizeof(band), "3,0,0,%d,%d,%d;", win_w, win_h, band_r);
+        char tmp[576];
+        snprintf(tmp, sizeof(tmp), "%s%s", band, shape_spec);
+        snprintf(shape_spec, sizeof(shape_spec), "%s", tmp);
+    }
 
     fg_buf_t decls = {0}, body = {0}, wire = {0}, valid = {0}, out = {0};
     fg_used_t used = {0};
@@ -546,6 +619,7 @@ char *zan_formgen_translate(const char *json, size_t json_len,
         // root must not add its own padding/gap.
         fg_putf(&out, "        root.Pad(0);\n");
         fg_putf(&out, "        root.gap = 0;\n");
+        fg_putf(&out, "        int __dp = Canvas.GetDpiScale();\n");
     } else {
         fg_putf(&out, "        root.Pad(16);\n");
         fg_putf(&out, "        root.gap = 10;\n");
@@ -578,6 +652,23 @@ char *zan_formgen_translate(const char *json, size_t json_len,
         fg_putf(&out, "        form.GetApp().CenterWindow();\n");
     } else {
         fg_putf(&out, "        form.GetApp().SetWindowPos(%d, %d);\n", pos_x, pos_y);
+    }
+    if (shape_spec[0] != '\0') {
+        fg_putf(&out, "        form.GetApp().SetWindowShape(\"");
+        fg_esc_cstr(&out, shape_spec);
+        fg_putf(&out, "\");\n");
+    }
+    if (win_shadow > 0) {
+        fg_putf(&out, "        form.GetApp().SetWindowShadow(%d);\n", win_shadow);
+    }
+    if (!win_chrome) {
+        fg_putf(&out, "        form.GetApp().SetChromeVisible(false);\n");
+    }
+    if (win_glass) {
+        fg_putf(&out, "        form.GetApp().SetNativeGlass(true);\n");
+    }
+    if (win_opacity > 0 && win_opacity < 100) {
+        fg_putf(&out, "        form.GetApp().SetWindowOpacity(%d);\n", win_opacity);
     }
     fg_putf(&out, "        %s.OnLoad(form);\n", name);
     fg_putf(&out, "        %s.__WireForm(form);\n", name);

@@ -104,6 +104,27 @@ class App {
     // Whole-window opacity percent last set via SetWindowOpacity (0 = never
     // set, treated as 100/opaque).
     int windowOpacity;
+    // Window silhouette: 0 = rectangle, 1 = shaped. Non-zero windows are
+    // composed with per-pixel alpha (layered window) or a classic region when
+    // DWM is off: BeginFrame clears the surface fully transparent, the tree
+    // paints the shape, and the OS composites it. shapeSpec holds the union
+    // spec ("t,x,y,w,h,r;..." logical px) and shapeRadius the first region's
+    // corner radius (for WindowShapeRadius()).
+    int shapeMode;
+    int shapeRadius;
+    string shapeSpec;
+    // Shaped-silhouette drop shadow (logical px spread, 0 = none): painted by
+    // RenderBackground before the tree, so each shape region casts a soft
+    // shadow. The design's winShadow also makes formgen prepend a type-3
+    // "shadow band" region (a full-window rounded rect) to the spec, so the OS
+    // surface covers the shadow pixels. shapeRects mirrors the parsed spec in
+    // logical px so App can draw the shadow without touching the backend.
+    int shapeShadow;
+    List<int> shapeRects;
+    // Whether the custom title-bar chrome (brand + caption buttons) is drawn.
+    // Hidden for shaped/borderless windows whose design supplies its own header;
+    // the OS keeps the top TitlebarHeight() strip draggable either way.
+    bool showChrome;
     // Rect (in canvas coords) that wants to consume mouse-wheel events this
     // frame — e.g. a DataTable body with its own internal row scroll. When the
     // pointer is inside it, ProcessEvent suppresses page scrolling so the wheel
@@ -321,6 +342,10 @@ class App {
         app.overlays = new List<OverlayPopup>();
         app.isDark = false;
         app.isTopmost = false;
+        app.shapeMode = 0;
+        app.shapeRadius = 0;
+        app.shapeSpec = "";
+        app.showChrome = true;
         app.showThemeButton = true;
         app.showPinButton = true;
         app.showMinimizeButton = true;
@@ -586,6 +611,120 @@ class App {
         return windowOpacity;
     }
 
+    /// Window silhouette as the union of shape regions. `spec` is
+    /// "t,x,y,w,h,r;t,x,y,w,h,r;..." in logical px: type 1 = rounded rect
+    /// (r = corner radius), type 2 = ellipse (w/h = bounding box). "" restores
+    /// a plain opaque rectangle. Multiple regions union into one silhouette,
+    /// e.g. a big rounded card with a circle poking out of it. Composed with
+    /// per-pixel alpha on Windows (region fallback without DWM, still Win7
+    /// compatible); the area outside every region is transparent to paint and
+    /// clicks. Mutually exclusive with native glass. Call before Run.
+    void SetWindowShape(string spec) {
+        shapeSpec = spec;
+        shapeRects = new List<int>();
+        if (spec.Length > 0) {
+            List<string> parts = spec.Split(";");
+            int i = 0;
+            while (i < parts.Count) {
+                List<string> nums = parts[i].Split(",");
+                if (nums.Count >= 6) {
+                    shapeRects.Add(Convert.ToInt32(nums[0]));
+                    shapeRects.Add(Convert.ToInt32(nums[1]));
+                    shapeRects.Add(Convert.ToInt32(nums[2]));
+                    shapeRects.Add(Convert.ToInt32(nums[3]));
+                    shapeRects.Add(Convert.ToInt32(nums[4]));
+                    shapeRects.Add(Convert.ToInt32(nums[5]));
+                }
+                i = i + 1;
+            }
+        }
+        if (spec.Length == 0) {
+            shapeMode = 0;
+            shapeRadius = 0;
+        } else {
+            shapeMode = 1;
+            shapeRadius = 0;
+            // Surface the first region's radius for WindowShapeRadius().
+            int c1 = spec.IndexOf(",");
+            if (c1 > 0) {
+                int c2 = spec.IndexOf(",", c1 + 1);
+                if (c2 > 0) {
+                    int c3 = spec.IndexOf(",", c2 + 1);
+                    if (c3 > 0) {
+                        int c4 = spec.IndexOf(",", c3 + 1);
+                        if (c4 > 0) {
+                            int c5 = spec.IndexOf(",", c4 + 1);
+                            if (c5 > 0) {
+                                shapeRadius = Convert.ToInt32(spec.Substring(c4 + 1, c5 - c4 - 1));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if (shapeMode != 0 && glassNative) {
+            window.DisableGlass();
+            glassNative = false;
+        }
+        window.SetShape(spec);
+        needsRedraw = true;
+    }
+
+    /// Soft drop shadow cast around the shaped silhouette. `px` is the logical
+    /// spread of the shadow (0 disables). The design should also carry a
+    /// winShadow so formgen prepends a type-3 shadow-band region to the shape
+    /// spec — without it the OS surface stops at the silhouette and the shadow
+    /// pixels are clipped away. Call before Run, after SetWindowShape.
+    void SetWindowShadow(int px) {
+        if (px < 0) { px = 0; }
+        shapeShadow = px;
+        needsRedraw = true;
+    }
+
+    /// The shaped-silhouette shadow spread in logical px (0 = none).
+    int WindowShadow() { return shapeShadow; }
+
+    /// The active window silhouette spec (see SetWindowShape); "" = rectangle.
+    string WindowShapeSpec() { return shapeSpec; }
+
+    /// The active window silhouette (see SetWindowShape).
+    int WindowShape() { return shapeMode; }
+
+    /// The corner radius of the rounded-rect silhouette (see SetWindowShape).
+    int WindowShapeRadius() { return shapeRadius; }
+
+    /// Shows/hides the custom title-bar chrome. Hidden: the OS still lets the
+    /// top TitlebarHeight() strip drag the window and content starts at y=0.
+    void SetChromeVisible(bool on) {
+        showChrome = on;
+        int n = 0;
+        if (on) { n = ChromeButtonCount(); }
+        window.SetCaptionButtons(n);
+        needsRedraw = true;
+    }
+
+    /// True while the custom title-bar chrome is visible.
+    bool ChromeVisible() { return showChrome; }
+
+    /// Enables/disables OS-native translucent glass (Win11 acrylic): the
+    /// desktop is blurred behind the window wherever the surface is
+    /// semi-transparent. Distinct from the software-rendered frosted-glass
+    /// skins. Mutually exclusive with a shaped window.
+    void SetNativeGlass(bool on) {
+        if (on) {
+            if (shapeMode != 0) { this.SetWindowShape(""); }
+            window.EnableGlass(this.GlassTint());
+            glassNative = true;
+        } else {
+            window.DisableGlass();
+            glassNative = false;
+        }
+        needsRedraw = true;
+    }
+
+    /// True while OS-native translucent glass is enabled (see SetNativeGlass).
+    bool NativeGlass() { return glassNative; }
+
     // ---- user wallpaper image ----------------------------------------------
 
     /// Paints `path` (PNG/BMP/JPG) as this window's backdrop, scaled to cover,
@@ -849,6 +988,14 @@ class App {
     void RenderBackground(int x, int y, int w, int h, int slot) {
         Canvas c = canvas;
         Theme t = theme;
+        // Shaped window: the silhouette is drawn entirely by the tree, so the
+        // backdrop stays transparent (the surface was cleared to alpha 0 in
+        // BeginFrame and the OS composites the shape per-pixel). A soft drop
+        // shadow (SetWindowShadow) paints first, under the tree.
+        if (shapeMode != 0) {
+            if (shapeShadow > 0) { this.PaintShapeShadow(); }
+            return;
+        }
         // Native glass: the window is a flat semi-transparent sheet (cleared in
         // BeginFrame) over the OS-blurred desktop. Add a soft top-down light
         // sheen so the glass reads with depth (brighter near the top) like real
@@ -898,6 +1045,56 @@ class App {
         }
     }
 
+    /// Paints the soft drop shadow of the shaped silhouette into the surface,
+    /// under the tree (called from RenderBackground). Every non-band region
+    /// casts concentric anti-aliased rings — the software renderer has no
+    /// gaussian shadow, so the falloff is layered like StyleBox's own shadow.
+    /// Each ring is stroked ONCE (a 1px rounded-rect/circle outline), so the
+    /// translucent layers never double-blend into a saturated dark edge the
+    /// way overlapping fills did. Type-3 shadow-band regions (added by
+    /// formgen for winShadow) only extend the OS surface; they cast no shadow.
+    void PaintShapeShadow() {
+        if (shapeRects.Count == 0 || shapeShadow <= 0) { return; }
+        Canvas c = canvas;
+        int blur = this.Scale(shapeShadow);
+        if (blur <= 0) { return; }
+        int baseCol = theme.shadowColor;
+        if (baseCol == 0) { baseCol = 0x50000000; }
+        // Peak alpha: the theme's shadow tint (very faint) but never so dark
+        // the glow reads as a hard outline.
+        int peak = (baseCol >> 24) & 255;
+        if (peak < 40) { peak = 40; }
+        if (peak > 110) { peak = 110; }
+        int rgb = baseCol % 16777216;
+        if (rgb < 0) { rgb = rgb + 16777216; }
+        int i = 0;
+        while (i + 5 < shapeRects.Count) {
+            int t = shapeRects[i];
+            if (t == 3) { i = i + 6; continue; }
+            int x = this.Scale(shapeRects[i + 1]);
+            int y = this.Scale(shapeRects[i + 2]);
+            int w = this.Scale(shapeRects[i + 3]);
+            int h = this.Scale(shapeRects[i + 4]);
+            int r = this.Scale(shapeRects[i + 5]);
+            // One ring per pixel of spread; adjacent rings tile without gaps
+            // (a 1px stroke centred on the path covers [k-0.5, k+0.5]).
+            int k = 1;
+            while (k <= blur) {
+                int a = peak * (blur - k + 1) / blur;
+                int col = (a << 24) | rgb;
+                if (t == 2) {
+                    int rad = (w + k * 2) / 2;
+                    c.DrawCircle(x + w / 2, y + h / 2, rad, col, 1);
+                } else {
+                    c.DrawRoundRect(x - k, y - k, w + k * 2, h + k * 2,
+                                    r + k, col, 1);
+                }
+                k = k + 1;
+            }
+            i = i + 6;
+        }
+    }
+
     /// The backdrop-effect kind in force: the drawer's override when set,
     /// otherwise the active skin's own effect. 0 = none.
     int EffectiveFx() {
@@ -905,9 +1102,13 @@ class App {
         return theme.fx;
     }
 
-    /// True when the active skin's animated backdrop effect is running.
+    /// True when the active skin's animated backdrop effect is running. Never
+    /// over a shaped window: the effect layer is composited across the whole
+    /// surface, so its particles would light up the transparent pixels outside
+    /// the silhouette instead of the design.
     bool FxActive() {
-        return fxEnabled && this.EffectiveFx() != 0 && !glassNative;
+        return fxEnabled && this.EffectiveFx() != 0 && !glassNative
+            && shapeMode == 0;
     }
 
     /// Enables/disables the animated backdrop effect for this window's skins.
@@ -1119,7 +1320,9 @@ class App {
         captionBtnW = Window.CaptionButtonWidth();
         if (titlebarH < 24) { titlebarH = Scale(32); }
         if (captionBtnW < 24) { captionBtnW = Scale(46); }
-        window.SetCaptionButtons(ChromeButtonCount());
+        int nCap = 0;
+        if (showChrome) { nCap = ChromeButtonCount(); }
+        window.SetCaptionButtons(nCap);
         // Arm the AI automation driver when ZAN_UI_SCRIPT is set (inert otherwise).
         UiDriver.Begin(this);
     }
@@ -1140,7 +1343,9 @@ class App {
     }
 
     /// Height reserved by the custom title bar; content should start below it.
+    /// 0 when the chrome is hidden (see SetChromeVisible).
     int ContentTop() {
+        if (!showChrome) { return 0; }
         return titlebarH;
     }
 
@@ -1148,6 +1353,9 @@ class App {
     /// caption buttons) and processes clicks on the caption buttons. Should be
     /// drawn last each frame so it overlays content.
     void RenderChrome(string title) {
+        // Shaped/borderless windows are their own design: no title-bar chrome
+        // unless the app explicitly re-enables it with SetChromeVisible(true).
+        if (!showChrome) { return; }
         Canvas c = canvas;
         Theme t = theme;
         int W = c.Width();
@@ -2231,7 +2439,16 @@ class App {
             // damaged strip, so untouched pixels of the last frame stand.
             canvas.PushClip(dmgX, dmgY, dmgW, dmgH);
         }
-        if (glassNative) {
+        if (shapeMode != 0) {
+            // Shaped window: clear the whole surface fully transparent so only
+            // the tree's pixels define the silhouette (the OS composites it
+            // with per-pixel alpha and anti-aliased edges).
+            if (partialFrame) {
+                canvas.FillRect(dmgX, dmgY, dmgW, dmgH, 0);
+            } else {
+                canvas.Clear(0);
+            }
+        } else if (glassNative) {
             // Frosted sheet: clear the whole window to a *semi-transparent* tint
             // (not fully transparent) so the OS backdrop shows through evenly
             // blurred while the window stays a solid, bordered glass panel. A

@@ -9,6 +9,8 @@ delegate nint ZanWndProc(nint hwnd, int msg, nint wp, nint lp);
 
 /// SetWindowCompositionAttribute (undocumented user32 entry, resolved lazily).
 delegate int SetWinCompAttrFn(nint hwnd, nint data);
+/// DwmIsCompositionEnabled (dwmapi, Vista+): false on Win7 when DWM is off.
+delegate int DwmIsCompFn(nint outEnabled);
 /// SetProcessDpiAwareness (Shcore) / SetProcessDPIAware (user32) fallbacks.
 delegate int SetProcessDpiAwarenessFn(int level);
 delegate int SetProcessDpiAwareFn();
@@ -27,6 +29,16 @@ delegate int SetProcessDpiAwareFn();
 class Win32Shell {
     [DllImport("user32", EntryPoint = "RegisterClassExW")]
     static extern ushort RegisterClassExW(nint wc);
+    // Drag & drop of files onto a window (WM_DROPFILES).
+    [DllImport("shell32", EntryPoint = "DragAcceptFiles")]
+    static extern void DragAcceptFiles(nint hwnd, int accept);
+    [DllImport("shell32", EntryPoint = "DragQueryFileW")]
+    static extern int DragQueryFileW(nint hdrop, int index, nint buf, int cch);
+    [DllImport("shell32", EntryPoint = "DragQueryPoint")]
+    static extern int DragQueryPoint(nint hdrop, nint pt);
+    [DllImport("shell32", EntryPoint = "DragFinish")]
+    static extern void DragFinish(nint hdrop);
+
     [DllImport("user32", EntryPoint = "CreateWindowExW")]
     static extern nint CreateWindowExW(int exStyle, nint cls, nint title,
                                        int style, int x, int y, int w, int h,
@@ -153,6 +165,14 @@ class Win32Shell {
     static extern int DeleteDC(nint dc);
     [DllImport("gdi32", EntryPoint = "GetDeviceCaps")]
     static extern int GetDeviceCaps(nint dc, int index);
+    [DllImport("gdi32", EntryPoint = "CreateRoundRectRgn")]
+    static extern nint CreateRoundRectRgn(int l, int t, int r, int b, int rw, int rh);
+    [DllImport("gdi32", EntryPoint = "CreateEllipticRgn")]
+    static extern nint CreateEllipticRgn(int l, int t, int r, int b);
+    [DllImport("gdi32", EntryPoint = "CombineRgn")]
+    static extern int CombineRgn(nint dst, nint src1, nint src2, int mode);
+    [DllImport("user32", EntryPoint = "SetWindowRgn")]
+    static extern int SetWindowRgn(nint hwnd, nint rgn, bool redraw);
 
     [DllImport("kernel32", EntryPoint = "GetModuleHandleW")]
     static extern nint GetModuleHandleW(nint name);
@@ -215,6 +235,10 @@ class Win32Shell {
     // Window the event currently published by Post belongs to.
     static nint evHwnd;
 
+    // Paths of the files the last WM_DROPFILES delivered, drained by
+    // Window.TakeDroppedFiles() when the app sees the kind-9 event.
+    static List<string> dropped;
+
     // Last reported event: kind, x, y, button, keycode, mods.
     static int evKind;
     static int evX;
@@ -240,6 +264,21 @@ class Win32Shell {
 
     static bool glassOn;
     static int glassTint;
+    // Shape-window mode: 0 = rectangle, 1 = shaped. A shaped window's
+    // silhouette is the UNION of shapeRegions (type,x,y,w,h,r groups of six,
+    // logical px: type 1 = rounded rect, type 2 = ellipse). Enforced with
+    // per-pixel alpha composition (WS_EX_LAYERED + UpdateLayeredWindow) when
+    // DWM composition is on (Windows 7 included), and with a combined
+    // SetWindowRgn when DWM is off, so shaped windows work even on Win7
+    // without the DWM. Pixels outside every region pass clicks through.
+    static int shapeMode;
+    static List<int> shapeRegions;
+    // Cached per-pixel coverage mask for the layered path (0..255, straight
+    // alpha): rebuilt only when the window or the shape list changes.
+    static List<byte> shapeMask;
+    static int shapeMaskW;
+    static int shapeMaskH;
+    static int shapeMaskGen;
 
     // Per-window last presented surface, so WM_PAINT repaints the frame that
     // belongs to *this* window rather than whichever one presented last.
@@ -384,6 +423,47 @@ class Win32Shell {
         Win32Shell.hasEvent = true;
     }
 
+    /// Collects the paths of a file drop and publishes it as a kind-9 event at
+    /// the drop point (client px), so the app can route it to whatever widget
+    /// is under the cursor. The paths wait in `dropped` until it takes them.
+    static void OnDropFiles(nint hwnd, nint hdrop) {
+        if (Win32Shell.dropped == null) {
+            Win32Shell.dropped = new List<string>();
+        }
+        // Index -1 (0xFFFFFFFF) asks for the file count.
+        int n = Win32Shell.DragQueryFileW(hdrop, 0 - 1, 0, 0);
+        nint buf = NativeMemory.Alloc(2048);
+        int i = 0;
+        while (i < n) {
+            int len = Win32Shell.DragQueryFileW(hdrop, i, buf, 1024);
+            if (len > 0) { Win32Shell.dropped.Add(Wide.Read(buf)); }
+            i = i + 1;
+        }
+        NativeMemory.Free(buf);
+        nint pt = NativeMemory.Alloc(8);
+        new Span<int>(pt, 1)[0] = 0;
+        new Span<int>(pt + 4, 1)[0] = 0;
+        Win32Shell.DragQueryPoint(hdrop, pt);
+        int px = Win32Shell.S32(pt, 0);
+        int py = Win32Shell.S32(pt, 4);
+        NativeMemory.Free(pt);
+        Win32Shell.DragFinish(hdrop);
+        Win32Shell.Post(hwnd, 9, px, py, 0, 0, 0);
+    }
+
+    /// Hands over (and clears) the paths of the last drop.
+    static List<string> TakeDropped() {
+        List<string> outp = new List<string>();
+        if (Win32Shell.dropped == null) { return outp; }
+        int i = 0;
+        while (i < Win32Shell.dropped.Count) {
+            outp.Add(Win32Shell.dropped[i]);
+            i = i + 1;
+        }
+        Win32Shell.dropped = new List<string>();
+        return outp;
+    }
+
     static nint OnMessage(nint hwnd, int msg, nint wp, nint lp) {
         Win32Shell.eventHwnd = hwnd;
         if (msg == 0x010D || msg == 0x010F || msg == 0x0281) {
@@ -402,12 +482,14 @@ class Win32Shell {
             }
             return 0;
         } else if (msg == 0x0231) {                // WM_ENTERSIZEMOVE
-            if (Win32Shell.glassOn) {
+            if (Win32Shell.glassOn && Win32Shell.shapeMode == 0) {
                 Win32Shell.AcrylicApply(hwnd, 3, Win32Shell.glassTint);
             }
         } else if (msg == 0x0232) {                // WM_EXITSIZEMOVE
-            if (Win32Shell.glassOn) {
+            if (Win32Shell.glassOn && Win32Shell.shapeMode == 0) {
                 Win32Shell.AcrylicApply(hwnd, 4, Win32Shell.glassTint);
+            }
+            if (Win32Shell.glassOn) {
                 if (Win32Shell.lastSurface >= 0) {
                     Win32Shell.PresentLayered(hwnd, Win32Shell.lastSurface);
                 }
@@ -422,15 +504,21 @@ class Win32Shell {
             Win32Shell.Post(hwnd, 7, Win32Shell.windowWidth, Win32Shell.windowHeight,
                 0, 0, 0);
             return 0;
-        } else if (msg == 0x0024 && hwnd == Win32Shell.mainHwnd) {
+        } else if (msg == 0x0024 && hwnd == Win32Shell.mainHwnd
+                && Win32Shell.shapeMode == 0) {
             // WM_GETMINMAXINFO: MINMAXINFO.ptMinTrackSize (offset 24). The
             // shell layout stops being usable below 800x600 logical pixels, so
             // the main frame refuses to be dragged smaller (child windows keep
-            // the default limits).
+            // the default limits). Shaped windows are exempt: their size is
+            // the shape's bounding box (SetShape calls FitShapeWindow), which
+            // is typically far smaller than 800x600.
             int scale = Win32Shell.dpi;
             if (scale <= 0) { scale = 96; }
             new Span<int>(lp + 24, 1)[0] = 800 * scale / 96;
             new Span<int>(lp + 28, 1)[0] = 600 * scale / 96;
+            return 0;
+        } else if (msg == 0x0233) {                // WM_DROPFILES
+            Win32Shell.OnDropFiles(hwnd, wp);
             return 0;
         } else if (msg == 512) {                   // WM_MOUSEMOVE
             Win32Shell.Post(hwnd, 1, Win32Shell.LoWord(lp), Win32Shell.HiWord(lp),
@@ -778,14 +866,38 @@ class Win32Shell {
             Win32Shell.lwH = sh;
         }
         int n = sw * sh;
+        List<byte> mask = null;
+        if (Win32Shell.shapeMode != 0) {
+            mask = Win32Shell.ShapeMask(sw, sh);
+        }
         int i = 0;
         while (i < n) {
             int p = Win32Shell.S32(pixels, i * 4);
             int a = (p >> 24) & 255;
-            int r = ((p >> 16) & 255) * a / 255;
-            int g = ((p >> 8) & 255) * a / 255;
-            int b = (p & 255) * a / 255;
-            new Span<int>(Win32Shell.lwBits + i * 4, 1)[0] = (a << 24) | (r << 16) | (g << 8) | b;
+            if (mask != null) {
+                int cov = mask[i];
+                if (cov <= 0) {
+                    a = 0;
+                    new Span<int>(Win32Shell.lwBits + i * 4, 1)[0] = 0;
+                    i = i + 1;
+                    continue;
+                }
+                if (cov < 255) {
+                    // Premultiplied: scale alpha and colour channels alike.
+                    a = a * cov / 255;
+                    int r = ((p >> 16) & 255) * cov / 255;
+                    int g = ((p >> 8) & 255) * cov / 255;
+                    int b = (p & 255) * cov / 255;
+                    new Span<int>(Win32Shell.lwBits + i * 4, 1)[0] =
+                        (a << 24) | (r << 16) | (g << 8) | b;
+                    i = i + 1;
+                    continue;
+                }
+            }
+            int r2 = ((p >> 16) & 255) * a / 255;
+            int g2 = ((p >> 8) & 255) * a / 255;
+            int b2 = (p & 255) * a / 255;
+            new Span<int>(Win32Shell.lwBits + i * 4, 1)[0] = (a << 24) | (r2 << 16) | (g2 << 8) | b2;
             i = i + 1;
         }
         nint screenDc = Win32Shell.GetDC(0);
@@ -801,7 +913,7 @@ class Win32Shell {
         new Span<byte>(blend + 2, 1)[0] = 255;
         new Span<byte>(blend + 3, 1)[0] = 1;         // AC_SRC_ALPHA
         // pptDst = 0: update only the content, never the OS-owned position.
-        Win32Shell.UpdateLayeredWindow(hwnd, screenDc, 0, size,
+        int ulw = Win32Shell.UpdateLayeredWindow(hwnd, screenDc, 0, size,
             Win32Shell.lwDc, src, 0, blend, 2);
         NativeMemory.Free(blend);
         NativeMemory.Free(src);
@@ -887,6 +999,8 @@ class Win32Shell {
             Win32Shell.instance, 0);
         Wide.Free(wtitle);
         if (hwnd == 0) { return 0; }
+        // Accept files dragged in from Explorer (they arrive as WM_DROPFILES).
+        Win32Shell.DragAcceptFiles(hwnd, 1);
 
         if (Win32Shell.mainHwnd == 0) {
             Win32Shell.mainHwnd = hwnd;
@@ -1154,12 +1268,305 @@ class Win32Shell {
         Win32Shell.SetLayeredWindowAttributes(hwnd, 0, percent * 255 / 100, 2);
     }
 
+    /// Window silhouette as the UNION of shape regions. `spec` is
+    /// "t,x,y,w,h,r;t,x,y,w,h,r;..." in logical px (type 1 = rounded rect with
+    /// corner radius r, type 2 = ellipse with w/h its bounding box; r unused).
+    /// "" restores a plain opaque rectangle. Two paths, both Windows-7 safe:
+    /// with DWM composition on the window is layered and composited per-pixel
+    /// (anti-aliased edges, outside pixels click through); with DWM off it
+    /// falls back to a combined SetWindowRgn (hard edges, same click-through).
+    /// No SetWindowCompositionAttribute is involved (Win8+ only).
+    static void SetShape(nint hwnd, string spec) {
+        Win32Shell.Init();
+        if (hwnd == 0) { return; }
+        List<int> regs = new List<int>();
+        if (spec.Length > 0) {
+            List<string> parts = spec.Split(";");
+            int i = 0;
+            while (i < parts.Count) {
+                List<string> nums = parts[i].Split(",");
+                if (nums.Count >= 6) {
+                    regs.Add(Convert.ToInt32(nums[0]));
+                    regs.Add(Convert.ToInt32(nums[1]));
+                    regs.Add(Convert.ToInt32(nums[2]));
+                    regs.Add(Convert.ToInt32(nums[3]));
+                    regs.Add(Convert.ToInt32(nums[4]));
+                    regs.Add(Convert.ToInt32(nums[5]));
+                }
+                i = i + 1;
+            }
+        }
+        if (regs.Count == 0) {
+            // Plain opaque window again: clear any region + layered style.
+            Win32Shell.SetWindowRgn(hwnd, 0, true);
+            nint ex = Win32Shell.GetWindowLongPtrW(hwnd, 0 - 20);
+            if ((ex & 0x00080000) != 0) {
+                Win32Shell.SetLayeredWindowAttributes(hwnd, 0, 255, 2);
+                Win32Shell.SetWindowLongPtrW(hwnd, 0 - 20, ex & ~0x00080000);
+            }
+            Win32Shell.shapeMode = 0;
+            Win32Shell.shapeRegions = new List<int>();
+            Win32Shell.shapeMask = new List<byte>();
+            Win32Shell.glassOn = false;
+            return;
+        }
+        Win32Shell.shapeRegions = regs;
+        Win32Shell.shapeMask = new List<byte>();
+        // Flag the shape BEFORE shrinking: FitShapeWindow's SetWindowPos must
+        // not be clamped by the main frame's 800x600 WM_GETMINMAXINFO minimum.
+        Win32Shell.shapeMode = 1;
+        Win32Shell.FitShapeWindow(hwnd, regs);
+        if (Win32Shell.DwmComposited()) {
+            // Layered per-pixel alpha path: no acrylic blur, just the shape.
+            nint ex = Win32Shell.GetWindowLongPtrW(hwnd, 0 - 20);
+            if ((ex & 0x00080000) == 0) {              // WS_EX_LAYERED
+                Win32Shell.SetWindowLongPtrW(hwnd, 0 - 20, ex | 0x00080000);
+            }
+            Win32Shell.glassOn = true;                 // route Present through PresentLayered
+            int own = Win32Shell.SurfaceOf(hwnd);
+            if (own >= 0) { Win32Shell.PresentLayered(hwnd, own); }
+        } else {
+            // No DWM (e.g. Win7 with composition disabled): a classic region
+            // window. Region coords are client pixels (scaled to physical).
+            Win32Shell.glassOn = false;
+            nint ex = Win32Shell.GetWindowLongPtrW(hwnd, 0 - 20);
+            if ((ex & 0x00080000) != 0) {
+                Win32Shell.SetLayeredWindowAttributes(hwnd, 0, 255, 2);
+                Win32Shell.SetWindowLongPtrW(hwnd, 0 - 20, ex & ~0x00080000);
+            }
+            Win32Shell.SetShapeRgn(hwnd, regs);
+            int own = Win32Shell.SurfaceOf(hwnd);
+            if (own >= 0) { Win32Shell.Blit(hwnd, own); }
+        }
+    }
+
+    /// Shrinks (or grows) the window so its client area exactly matches the
+    /// bounding box of the shape regions, scaled to physical px. Without this
+    /// a small shaped design would be padded to the 800x600 main-frame minimum
+    /// and the silhouette would be mis-sized. Keeps the window centered. The
+    /// regions are expected window-relative (min x/y >= 0); shapes that extend
+    /// above/left of the window are left alone.
+    static void FitShapeWindow(nint hwnd, List<int> regs) {
+        if (regs.Count == 0) { return; }
+        int minX = 2147483647;
+        int minY = 2147483647;
+        int maxX = -2147483648;
+        int maxY = -2147483648;
+        int i = 0;
+        while (i + 5 < regs.Count) {
+            int x = regs[i + 1];
+            int y = regs[i + 2];
+            int w = regs[i + 3];
+            int h = regs[i + 4];
+            if (x < minX) { minX = x; }
+            if (y < minY) { minY = y; }
+            int x2 = x + w;
+            if (x2 > maxX) { maxX = x2; }
+            int y2 = y + h;
+            if (y2 > maxY) { maxY = y2; }
+            i = i + 6;
+        }
+        if (minX < 0 || minY < 0) { return; }
+        int scale = Win32Shell.DpiScale();
+        int cw = (maxX - minX) * scale / 100;
+        int ch = (maxY - minY) * scale / 100;
+        if (cw <= 0 || ch <= 0) { return; }
+        nint rc = NativeMemory.Alloc(16);
+        Win32Shell.GetWindowRect(hwnd, rc);
+        int winW = Win32Shell.S32(rc, 8) - Win32Shell.S32(rc, 0);
+        int winH = Win32Shell.S32(rc, 12) - Win32Shell.S32(rc, 4);
+        int cx = Win32Shell.S32(rc, 0) + winW / 2;
+        int cy = Win32Shell.S32(rc, 4) + winH / 2;
+        NativeMemory.Free(rc);
+        // Outer size that yields the requested client size (client = bbox).
+        // Measure the ACTUAL chrome delta (DWM frame extension eats the frame,
+        // so AdjustWindowRect's estimate is off) and add it to the target.
+        nint cr = NativeMemory.Alloc(16);
+        Win32Shell.GetClientRect(hwnd, cr);
+        int curCw = Win32Shell.S32(cr, 8) - Win32Shell.S32(cr, 0);
+        int curCh = Win32Shell.S32(cr, 12) - Win32Shell.S32(cr, 4);
+        NativeMemory.Free(cr);
+        int outerW = cw + (winW - curCw);
+        int outerH = ch + (winH - curCh);
+        if (outerW == winW && outerH == winH) { return; }
+        // SWP_NOZORDER | SWP_NOACTIVATE: size + reposition, keep the center.
+        Win32Shell.SetWindowPos(hwnd, 0, cx - outerW / 2, cy - outerH / 2,
+            outerW, outerH, 4 | 16);
+    }
+
+    /// True while DWM desktop composition is enabled (Vista+; Win7 returns
+    /// true normally and false only when the user switched it off).
+    static bool DwmComposited() {
+        nint fn = Interop.Entry("dwmapi.dll", "DwmIsCompositionEnabled");
+        if (fn == 0) { return true; }   // assume composited when unknown
+        nint slot = NativeMemory.Alloc(4);
+        DwmIsCompFn call = (DwmIsCompFn)fn;
+        call(slot);
+        int enabled = new Span<int>(slot, 1)[0];
+        NativeMemory.Free(slot);
+        return enabled != 0;
+    }
+
+    /// Classic region fallback (Win7 without DWM): union of rounded-rect and
+    /// ellipse regions. The window owns the merged region after SetWindowRgn.
+    static void SetShapeRgn(nint hwnd, List<int> regs) {
+        int scale = Win32Shell.DpiScale();
+        nint merged = 0;
+        int i = 0;
+        while (i + 5 < regs.Count) {
+            int t = regs[i];
+            int x = regs[i + 1] * scale / 100;
+            int y = regs[i + 2] * scale / 100;
+            int w = regs[i + 3] * scale / 100;
+            int h = regs[i + 4] * scale / 100;
+            int r = regs[i + 5] * scale / 100;
+            nint rgn = 0;
+            if (t == 2) {
+                rgn = Win32Shell.CreateEllipticRgn(x, y, x + w, y + h);
+            } else {
+                if (r < 0) { r = 0; }
+                rgn = Win32Shell.CreateRoundRectRgn(x, y, x + w, y + h, r, r);
+            }
+            if (rgn != 0) {
+                if (merged == 0) { merged = rgn; }
+                else {
+                    Win32Shell.CombineRgn(merged, merged, rgn, 2); // RGN_OR
+                    Win32Shell.DeleteObject(rgn);
+                }
+            }
+            i = i + 6;
+        }
+        if (merged != 0) { Win32Shell.SetWindowRgn(hwnd, merged, true); }
+    }
+
+    /// Signed distance (in 1/16-pixel fixed point, negative inside) from the
+    /// subpixel sample (sx, sy) — also 1/16-pixel units — to the nearest edge
+    /// of the shaped silhouette. Rounded rects use the standard SDF; ellipses
+    /// the exact SDF. All arithmetic is 64-bit so large windows can't
+    /// overflow the squared distances.
+    static long ShapeSdfFp(List<int> regs, long sx, long sy, int scale) {
+        long best = 9223372036854775807;
+        int i = 0;
+        while (i + 5 < regs.Count) {
+            int t = regs[i];
+            long x = (long)(regs[i + 1] * scale / 100) * 16;
+            long y = (long)(regs[i + 2] * scale / 100) * 16;
+            long w = (long)(regs[i + 3] * scale / 100) * 16;
+            long h = (long)(regs[i + 4] * scale / 100) * 16;
+            long r = (long)(regs[i + 5] * scale / 100) * 16;
+            long d = 0;
+            if (t == 2) {
+                long cx = x + w / 2;
+                long cy = y + h / 2;
+                long rad = w / 2;
+                if (rad < 1) { rad = 1; }
+                long dx = sx - cx;
+                long dy = sy - cy;
+                long dist = Win32Shell.ISqrt64(dx * dx + dy * dy);
+                d = dist - rad;
+            } else {
+                if (r < 0) { r = 0; }
+                if (r * 2 > w) { r = w / 2; }
+                if (r * 2 > h) { r = h / 2; }
+                // Standard rounded-rect SDF: the point is expressed as an
+                // absolute offset (ax, ay) from the centre; q is the offset
+                // beyond the un-rounded core, and the distance is
+                // length(max(q,0)) - r. Negative inside, positive outside.
+                long ax = sx - (x + w / 2);
+                if (ax < 0) { ax = 0 - ax; }
+                long ay = sy - (y + h / 2);
+                if (ay < 0) { ay = 0 - ay; }
+                long hw2 = w / 2 - r;
+                long hh2 = h / 2 - r;
+                long qx = ax - hw2;
+                long qy = ay - hh2;
+                if (qx < 0) { qx = 0; }
+                if (qy < 0) { qy = 0; }
+                long dist = Win32Shell.ISqrt64(qx * qx + qy * qy);
+                d = dist - r;
+            }
+            if (d < best) { best = d; }
+            i = i + 6;
+        }
+        return best;
+    }
+
+    /// 64-bit integer square root (floor) via Newton iteration — converges in
+    /// a handful of steps regardless of magnitude, unlike a linear scan.
+    static long ISqrt64(long v) {
+        if (v <= 0) { return 0; }
+        long x = v;
+        long y = (x + 1) / 2;
+        while (y < x) {
+            x = y;
+            y = (x + v / x) / 2;
+        }
+        return x;
+    }
+
+    /// Rebuilds the per-pixel coverage mask (0..255) for the current shape
+    /// list at physical size sw x sh, unless a matching cached mask exists.
+    /// Each pixel is supersampled 4x4: sixteen subpixel samples (at 1/16-pixel
+    /// resolution, i.e. sample centres 1/8, 3/8, 5/8, 7/8 of the way across
+    /// the pixel) are SDF-tested and averaged. A single centre sample leaves
+    /// rounded corners as a 1px staircase; the supersampled mean reads as a
+    /// smooth anti-aliased edge that lines up with the renderer's own
+    /// double-precision corner arcs.
+    static List<byte> ShapeMask(int sw, int sh) {
+        if (Win32Shell.shapeMask != null
+                && Win32Shell.shapeMaskW == sw && Win32Shell.shapeMaskH == sh) {
+            return Win32Shell.shapeMask;
+        }
+        int scale = Win32Shell.DpiScale();
+        List<byte> mask = new List<byte>();
+        int n = sw * sh;
+        int i = 0;
+        while (i < n) {
+            int px = i % sw;
+            int py = i / sw;
+            int sum = 0;
+            int sa = 0;
+            while (sa < 4) {
+                int sb = 0;
+                while (sb < 4) {
+                    long sx = (long)px * 16 + sa * 4 + 2;
+                    long sy = (long)py * 16 + sb * 4 + 2;
+                    long d = Win32Shell.ShapeSdfFp(Win32Shell.shapeRegions,
+                                                   sx, sy, scale);
+                    // coverage = clamp(0.5 - sdf, 0, 1) in 1/16-pixel units:
+                    // 0.5px = 8/16, so the ramp is cov = 8 - d over [0,16].
+                    long cov = 8 - d;
+                    if (cov < 0) { cov = 0; }
+                    if (cov > 16) { cov = 16; }
+                    sum = sum + (int)cov;
+                    sb = sb + 1;
+                }
+                sa = sa + 1;
+            }
+            int c2 = sum; // 16 samples * 0..16 = 0..256
+            if (c2 > 255) { c2 = 255; }
+            mask.Add((byte)c2);
+            i = i + 1;
+        }
+        Win32Shell.shapeMask = mask;
+        Win32Shell.shapeMaskW = sw;
+        Win32Shell.shapeMaskH = sh;
+        return mask;
+    }
+
     static void Present(nint hwnd, int surface) {
         Win32Shell.Init();
         if (Win32Shell.zan_gui_get_pixels(surface) == 0) { return; }
         Win32Shell.lastSurface = surface;
         Win32Shell.RememberSurface(hwnd, surface);
-        Win32Shell.Blit(hwnd, surface);
+        if (Win32Shell.shapeMode != 0) {
+            // Shaped window: per-pixel alpha composite with the silhouette
+            // mask (PresentLayered premultiplies and lets the OS blend the
+            // transparent outside of the shape against the desktop).
+            Win32Shell.PresentLayered(hwnd, surface);
+        } else {
+            Win32Shell.Blit(hwnd, surface);
+        }
     }
 
     static void PresentDirty(int x, int y, int w, int h) {
