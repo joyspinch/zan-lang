@@ -1,0 +1,269 @@
+using System;
+using System.Json;
+using Gui;
+using Gui.Widget;
+
+/// Base class for every IDE child window (Publish, Project Configuration,
+/// Asset Manager, Editor Settings, AI Settings, ...).
+///
+/// A child window is a top-level OS window of its own, so it needs more than a
+/// shared look: it has to be woken, animated, event-routed, pumped and closed
+/// by the main loop. Doing that per window meant wiring each new window into
+/// six places in `ZanIDE.Run()`, and every miss showed up as a window that
+/// stopped repainting. Here the plumbing lives once, and `ChildWindows` keeps
+/// the registry the main loop iterates, so opening a window -- including one
+/// opened from another child window -- is enough to make it work.
+///
+/// A subclass supplies the title/size/widget-id baseline, builds `ui`, and may
+/// override `Pending()` (extra repaint reasons) and `AfterFrame()` (work to do
+/// once the frame is on screen).
+class ChildWindow {
+    App host;
+    UiDoc ui;
+    bool open;
+    bool destroyed;
+    int idBase;
+
+    ChildWindow() {
+        host = null;
+        ui = null;
+        open = false;
+        destroyed = false;
+        idBase = 900000;
+    }
+
+    /// OS window caption.
+    virtual string Title() { return "Zan"; }
+
+    /// Initial client size, in unscaled pixels.
+    virtual int Width() { return 560; }
+    virtual int Height() { return 560; }
+
+    /// Fixed WidgetId baseline for this window's frames. The main window never
+    /// rewinds the process-wide counter, so a child that did not pin its own
+    /// baseline would get different ids every frame and its buttons would
+    /// never see the hover/press resolved on the previous frame.
+    virtual int IdBase() { return 900000; }
+
+    /// Extra reasons to repaint: actions raised by UiDoc handlers between
+    /// frames, background work still running, ...
+    virtual bool Pending() { return false; }
+
+    /// Runs right after the frame is presented (model sync, deferred work).
+    virtual void AfterFrame() { }
+
+    /// Creates and shows the window with the parent's look, then registers it
+    /// with the pump. Subclasses call this at the end of their `Open`.
+    void OpenHost(App parent) {
+        open = true;
+        idBase = this.IdBase();
+        host = App.CreateDark(this.Title(), this.Width(), this.Height());
+        host.ApplySkin(parent.ThemeMenuIndex());
+        host.Show();
+        host.SetWindowOpacity(parent.WindowOpacity());
+        host.SetUserWallpaper(parent.UserWallpaperPath(),
+                              parent.UserWallpaperOpacity());
+        host.RequestRedraw();
+        ChildWindows.Register(this);
+    }
+
+    /// Renders one frame, with this window's widget ids pinned.
+    void Render() {
+        if (!this.NeedsRedraw()) { return; }
+        int saved = WidgetId.SeqValue();
+        WidgetId.SetSeq(idBase);
+        host.BeginFrame();
+        ui.RenderInto(host, 0, 0, host.canvas.Width(), host.canvas.Height());
+        host.PresentFrame();
+        WidgetId.SetSeq(saved);
+        this.AfterFrame();
+    }
+
+    bool NeedsRedraw() {
+        return open && (host.needsRedraw || this.Pending());
+    }
+
+    bool IsOpen() { return open; }
+
+    bool OwnsWindow(nint hwnd) {
+        return open && hwnd == host.WindowHandle();
+    }
+
+    /// Applies one OS event addressed to this window; a close event just marks
+    /// it closed (the main loop drops it on the next pump).
+    void ApplyEvent(nint hwnd) {
+        if (!this.OwnsWindow(hwnd)) { return; }
+        if (host.EventKind() == 8) {
+            open = false;
+            this.Teardown();
+            return;
+        }
+        host.ApplyEvent(hwnd);
+    }
+
+    void Close() {
+        if (open) { host.window.Close(); }
+        open = false;
+        this.Teardown();
+    }
+
+    /// Destroys the OS window for good. `Window.Close()` only *requests* a
+    /// close (it posts the close event to the window's own loop); a child the
+    /// IDE has already let go of never reads that event, so without this the
+    /// window lingers on screen, unpainted and dead to clicks. Idempotent.
+    void Teardown() {
+        if (destroyed) { return; }
+        destroyed = true;
+        if (host != null) { host.window.Destroy(); }
+    }
+
+    void RequestRedraw() {
+        if (open) { host.RequestRedraw(); }
+    }
+
+    int AnimNextMs() {
+        if (!open) { return 0 - 1; }
+        return host.animNextMs;
+    }
+
+    int FxNextMs() {
+        if (!open) { return 0 - 1; }
+        return host.fxNextMs;
+    }
+
+    void FollowSkin(int i) {
+        if (!open) { return; }
+        host.ApplySkin(i);
+        host.RequestRedraw();
+    }
+
+    void FollowOpacity(int percent) {
+        if (!open) { return; }
+        host.SetWindowOpacity(percent);
+    }
+
+    void FollowWallpaper(string path, int opacity) {
+        if (!open) { return; }
+        host.SetUserWallpaper(path, opacity);
+    }
+}
+
+/// The registry of open child windows the main loop drives.
+///
+/// `ZanIDE.Run()` asks it, once per iteration, whether anything needs a
+/// repaint, folds in the animation deadlines, routes the OS event to whoever
+/// owns it, and pumps a frame for each open window. Nothing in the loop names
+/// an individual window, so a window opened from a child window is driven the
+/// same way as one opened from the ribbon.
+class ChildWindows {
+    static List<ChildWindow> wins;
+
+    static List<ChildWindow> All() {
+        if (ChildWindows.wins == null) {
+            ChildWindows.wins = new List<ChildWindow>();
+        }
+        return ChildWindows.wins;
+    }
+
+    static void Register(ChildWindow w) {
+        ChildWindows.All().Add(w);
+    }
+
+    /// Forgets windows that have closed.
+    static void Prune() {
+        List<ChildWindow> all = ChildWindows.All();
+        List<ChildWindow> keep = new List<ChildWindow>();
+        foreach (ChildWindow w in all) {
+            if (w.IsOpen()) { keep.Add(w); }
+            else { w.Teardown(); }
+        }
+        ChildWindows.wins = keep;
+    }
+
+    static bool AnyOpen() {
+        foreach (ChildWindow w in ChildWindows.All()) {
+            if (w.IsOpen()) { return true; }
+        }
+        return false;
+    }
+
+    /// True when any open window has a frame to draw (so the loop polls
+    /// instead of blocking).
+    static bool Wants() {
+        foreach (ChildWindow w in ChildWindows.All()) {
+            if (w.NeedsRedraw()) { return true; }
+        }
+        return false;
+    }
+
+    /// Folds every open window's animation / effect deadline into `deadline`
+    /// (-1 means "no deadline"), so idle waits wake up for child animations.
+    static int Deadline(int deadline) {
+        int d = deadline;
+        foreach (ChildWindow w in ChildWindows.All()) {
+            int a = w.AnimNextMs();
+            if (a >= 0 && (d < 0 || a < d)) { d = a; }
+            int f = w.FxNextMs();
+            if (f >= 0 && (d < 0 || f < d)) { d = f; }
+        }
+        return d;
+    }
+
+    /// Requests a repaint on every window whose deadline has passed; true when
+    /// at least one was due.
+    static bool TickDue(int now) {
+        bool due = false;
+        foreach (ChildWindow w in ChildWindows.All()) {
+            int a = w.AnimNextMs();
+            int f = w.FxNextMs();
+            if (a >= 0 && now >= a) { due = true; w.RequestRedraw(); }
+            if (f >= 0 && now >= f) { due = true; w.RequestRedraw(); }
+        }
+        return due;
+    }
+
+    /// Hands the event to the window it is addressed to; false when no child
+    /// owns it (it belongs to the main window or the file picker).
+    static bool Route(nint hwnd) {
+        foreach (ChildWindow w in ChildWindows.All()) {
+            if (w.OwnsWindow(hwnd)) {
+                w.ApplyEvent(hwnd);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Renders one frame of every open window, then drops (and destroys) the
+    /// closed ones. Safe to call more than once per loop iteration: a window
+    /// opened from another window's action handler is rendered by the second
+    /// call instead of staying blank until the next OS event.
+    static void PumpAll() {
+        foreach (ChildWindow w in ChildWindows.All()) {
+            if (w.IsOpen()) { w.Render(); }
+        }
+        ChildWindows.Prune();
+    }
+
+    static void FollowSkin(int i) {
+        foreach (ChildWindow w in ChildWindows.All()) { w.FollowSkin(i); }
+    }
+
+    static void FollowOpacity(int percent) {
+        foreach (ChildWindow w in ChildWindows.All()) {
+            w.FollowOpacity(percent);
+        }
+    }
+
+    static void FollowWallpaper(string path, int opacity) {
+        foreach (ChildWindow w in ChildWindows.All()) {
+            w.FollowWallpaper(path, opacity);
+        }
+    }
+
+    /// Repaints every open window (used after the shared file picker returns:
+    /// whoever asked for it must show the result).
+    static void RequestRedrawAll() {
+        foreach (ChildWindow w in ChildWindows.All()) { w.RequestRedraw(); }
+    }
+}

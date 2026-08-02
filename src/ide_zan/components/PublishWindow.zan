@@ -1,0 +1,188 @@
+using System;
+using System.Json;
+using Gui;
+
+/// The Publish child window: host-aware platform checkboxes plus the
+/// single-file / static-library companion toggle, with Publish / Cancel.
+/// Rendered through the shared WindowShell so it matches every other IDE
+/// window (same themed background, title bar and close button) instead of
+/// painting its own dialog chrome.
+class PublishWindow : ChildWindow {
+    JsonValue model;
+    string root;
+    List<int> sel;      // parallel to ZanIDE.PublishTargetIds()
+    int lang;           // 0 English, 1 Chinese
+    static bool publish;
+    static bool cancel;
+
+    static string T(int lang, string en, string zh) {
+        if (lang == 1) { return zh; }
+        return en;
+    }
+
+    static void OnPublish() { PublishWindow.publish = true; }
+    static void OnCancel() { PublishWindow.cancel = true; }
+
+    static string DocJson(int lang, string projName, string root) {
+        List<string> ids = ZanIDE.PublishTargetIds();
+        UiNode inner = UiNode.Column().Dock("fill").Pad(16).Gap(6);
+        inner.Child(UiNode.Label(PublishWindow.T(lang, "Project: ", "项目：") + projName)
+            .Class("secondary small").Dock("top").Height(20));
+        inner.Child(UiNode.Label(PublishWindow.T(lang, "Platforms", "目标平台"))
+            .Class("secondary small").Dock("top").Height(20));
+
+        bool anyLinux = false;
+        int i = 0;
+        while (i < ids.Count) {
+            string mi = Convert.ToString(i);
+            string lbl = ZanIDE.PublishTargetLabel(ids[i]);
+            inner.Child(UiNode.Of("Checkbox").Text(lbl)
+                .Dock("top").Bind("plat_" + mi));
+            if (ids[i].Length > 6 && ids[i].Substring(0, 6) == "linux-") {
+                anyLinux = true;
+            }
+            i = i + 1;
+        }
+        if (anyLinux) {
+            inner.Child(UiNode.Label(PublishWindow.T(
+                lang, "Linux is cross-compiled here as a static single file.",
+                "Linux 为本机交叉编译的静态单文件产物。"))
+                .Class("secondary small").Dock("top").Height(16));
+            inner.Child(UiNode.Label(PublishWindow.T(
+                lang, "Run it on Linux (a server or container).",
+                "需在 Linux（服务器或容器）上运行。"))
+                .Class("secondary small").Dock("top").Height(16));
+        }
+        if (ZanIDE.IsLibraryProject(root)) {
+            inner.Child(UiNode.Of("Checkbox").Text(PublishWindow.T(
+                lang,
+                "Also publish static libraries (.lib on Windows, .a elsewhere)",
+                "同时发布静态库（Windows 为 .lib，其余平台为 .a）"))
+                .Dock("top").Bind("staticLib"));
+        } else {
+            inner.Child(UiNode.Of("Checkbox").Text(PublishWindow.T(
+                lang,
+                "Single-file exe (bundle DLLs into a self-extracting exe, Windows)",
+                "打包为单文件（把 DLL 打进自解压 exe，仅 Windows）"))
+                .Dock("top").Bind("singleFile"));
+        }
+        UiNode btns = UiNode.Row().Dock("bottom").Height(40).Gap(10);
+        btns.Child(UiNode.Button(PublishWindow.T(lang, "Cancel", "取消"))
+            .OnClick("cancel").Dock("left").Width(100));
+        btns.Child(UiNode.Button(PublishWindow.T(lang, "Publish", "发布"))
+            .OnClick("publish").Class("primary").Dock("left").Width(110));
+        inner.Child(btns);
+
+        UiNode shell = UiNode.Of("WindowShell")
+            .Text(PublishWindow.T(lang, "Publish Project", "发布项目"))
+            .Str("onClose", "cancel");
+        shell.Child(inner);
+        return shell.ToJson();
+    }
+
+    void BuildUi() {
+        string pname = Path.GetFileName(root);
+        if (pname == "") { pname = "project"; }
+        ui = UiDoc.FromJson(PublishWindow.DocJson(lang, pname, root)).Bind(model);
+        ui.Handle("publish", PublishWindow.OnPublish);
+        ui.Handle("cancel", PublishWindow.OnCancel);
+        ui.Wire();
+    }
+
+    static PublishWindow Open(App parent, string root, List<int> sel, int uiLang) {
+        PublishWindow w = new PublishWindow();
+        w.root = root;
+        w.sel = sel;
+        w.lang = uiLang;
+        w.open = true;
+        PublishWindow.publish = false;
+        PublishWindow.cancel = false;
+        w.model = JsonValue.NewObject();
+        List<string> ids = ZanIDE.PublishTargetIds();
+        int i = 0;
+        while (i < ids.Count) {
+            string mi = Convert.ToString(i);
+            string v = "0";
+            if (i < sel.Count && sel[i] == 1) { v = "1"; }
+            w.model.Set("plat_" + mi, JsonValue.NewStr(v));
+            i = i + 1;
+        }
+        if (ZanIDE.IsLibraryProject(root)) {
+            string sl = "0";
+            if (ZanIDE.ProjStaticLib(root)) { sl = "1"; }
+            w.model.Set("staticLib", JsonValue.NewStr(sl));
+        } else {
+            string sf = "1";
+            if (!ZanIDE.ProjSingleFile(root)) { sf = "0"; }
+            w.model.Set("singleFile", JsonValue.NewStr(sf));
+        }
+        w.BuildUi();
+        w.OpenHost(parent);
+        return w;
+    }
+
+    override string Title() {
+        return PublishWindow.T(lang, "Publish Project", "发布项目");
+    }
+
+    override int Width() { return 470; }
+    override int Height() { return 400; }
+    override int IdBase() { return 860000; }
+
+    override bool Pending() {
+        return PublishWindow.publish || PublishWindow.cancel;
+    }
+
+    /// Writes the bound checkboxes back into the shared selection list and the
+    /// zan.proj flags they mirror (called after every presented frame).
+    void SyncFlags() {
+        List<string> ids = ZanIDE.PublishTargetIds();
+        int i = 0;
+        while (i < ids.Count) {
+            string v = model.PathGet("plat_" + Convert.ToString(i)).AsString("0");
+            int on = 0;
+            if (v == "1" || v == "true") { on = 1; }
+            if (i < sel.Count && sel[i] != on) { sel[i] = on; }
+            i = i + 1;
+        }
+        if (ZanIDE.IsLibraryProject(root)) {
+            bool want = model.PathGet("staticLib").AsString("0") == "1";
+            if (ZanIDE.ProjStaticLib(root) != want) {
+                string sv = "false";
+                if (want) { sv = "true"; }
+                ZanIDE.SetProjField(root, "staticLib", sv);
+            }
+        } else {
+            bool want = model.PathGet("singleFile").AsString("1") != "0";
+            if (ZanIDE.ProjSingleFile(root) != want) {
+                string sv = "false";
+                if (want) { sv = "true"; }
+                ZanIDE.SetProjField(root, "singleFile", sv);
+            }
+        }
+    }
+
+    override void AfterFrame() {
+        this.SyncFlags();
+    }
+
+    /// True once the user pressed Publish (also closes the window).
+    bool TakePublish() {
+        if (PublishWindow.publish) {
+            PublishWindow.publish = false;
+            open = false;
+            return true;
+        }
+        return false;
+    }
+
+    /// True once the user pressed Cancel or the shell close button.
+    bool TakeCancel() {
+        if (PublishWindow.cancel) {
+            PublishWindow.cancel = false;
+            open = false;
+            return true;
+        }
+        return false;
+    }
+}

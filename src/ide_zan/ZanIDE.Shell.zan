@@ -150,30 +150,23 @@ partial class ZanIDE {
         }
     }
 
-    /// Pumps the publish child window. "Publish" only closes it and arms
-    /// `pubPending`, so the blocking cross-compile never runs behind a frozen
-    /// window.
+    /// Applies what the publish child window reported. "Publish" only closes
+    /// it and arms `pubPending`, so the blocking cross-compile never runs
+    /// behind a frozen window.
     void PumpPublishWindow() {
         // ---------------- publish child window ----------------
-        if (pubWin != null && pubWin.needsRedraw && !pathPicker.IsOpen()) {
-            string pubName = Path.GetFileName(root);
-            if (pubName == "") { pubName = "project"; }
-            pubWin.BeginFrame();
-            int savedSeqP = WidgetId.SeqValue();
-            WidgetId.SetSeq(860000);
-            int pAct = Dialogs.RenderPublishDialog(pubWin, root, pubName, pubSel);
-            WidgetId.SetSeq(savedSeqP);
-            pubWin.PresentFrame();
-            lastPresent = Window.GetTickMs();
-            if (pAct == 1) {
-                // Close first, then publish next frame so the (blocking)
-                // cross-compile never leaves a frozen window.
-                pubWin.window.Close();
+        if (pubWin != null) {
+            if (pubWin.TakePublish()) {
+                pubWin.Close();
                 pubWin = null;
                 pubPending = true;
                 app.RequestRedraw();
-            } else if (pAct == 2) {
-                pubWin.window.Close();
+            } else if (pubWin.TakeCancel()) {
+                pubWin.Close();
+                pubWin = null;
+                app.RequestRedraw();
+            } else if (!pubWin.IsOpen()) {
+                // Closed through the OS caption / ESC: just drop it.
                 pubWin = null;
                 app.RequestRedraw();
             }
@@ -185,48 +178,29 @@ partial class ZanIDE {
     /// hand-off it asks for.
     void PumpConfigWindow() {
         // ---------------- project configuration child window ----------------
-        if (cfgWin != null && cfgWin.needsRedraw && !pathPicker.IsOpen()) {
-            cfgWin.BeginFrame();
-            int savedSeqC = WidgetId.SeqValue();
-            WidgetId.SetSeq(870000);
-            int cAct = Dialogs.RenderProjectConfigDialog(cfgWin, root, log);
-            WidgetId.SetSeq(savedSeqC);
-            cfgWin.PresentFrame();
-            lastPresent = Window.GetTickMs();
-            if (cAct == 1) {
-                cfgWin.window.Close();
+        if (cfgWin != null) {
+            if (cfgWin.TakeDone()) {
+                cfgWin.Close();
                 cfgWin = null;
                 lastActive = 0 - 1;
                 app.RequestRedraw();
-            } else if (cAct == 2) {
+            } else if (cfgWin.TakeChoose()) {
                 pathPicker.BeginOpenFile(
                     ZanIDE.ReadLastPickerDirectory(root), ".ico",
                     ZanIDE.T("Select application icon (.ico)", "选择应用图标 (.ico)"));
                 pathPickerOwner = 2;
                 app.RequestRedraw();
-            } else if (cAct == 3) {
-                pathPicker.BeginOpenFile(
-                    ZanIDE.ReadLastPickerDirectory(root), "",
-                    ZanIDE.T("Add a static resource (copy)", "导入静态资源（复制）"));
-                pathPickerOwner = 3;
-                app.RequestRedraw();
-            } else if (cAct == 4) {
-                pathPicker.BeginOpenFile(
-                    ZanIDE.ReadLastPickerDirectory(root), "",
-                    ZanIDE.T("Add a linked resource (referenced in place)", "导入链接资源（引用原位置）"));
-                pathPickerOwner = 5;
-                app.RequestRedraw();
-            } else if (cAct == 5) {
-                cfgWin.window.Close();
+            } else if (cfgWin.TakeAsset()) {
+                cfgWin.Close();
                 cfgWin = null;
                 if (assetWin == null) {
-                    assetWin = App.CreateDark(ZanIDE.T("Asset Manager", "资源管理器"), 900, 660);
-                    assetWin.ApplySkin(app.ThemeMenuIndex());
-                    assetWin.SetChromeButtons(false, false, true, true);
-                    assetWin.Show();
-                    assetWin.SetWindowOpacity(app.WindowOpacity());
-                    assetWin.SetUserWallpaper(app.UserWallpaperPath(), app.UserWallpaperOpacity());
+                    assetWin = AssetManagerWindow.Open(app, root, log, ZanIDE.uiLang);
                 }
+                app.RequestRedraw();
+            } else if (!cfgWin.IsOpen()) {
+                // Closed through the OS caption / ESC: just drop it.
+                cfgWin = null;
+                lastActive = 0 - 1;
                 app.RequestRedraw();
             }
         }
@@ -236,17 +210,10 @@ partial class ZanIDE {
     /// requests it raises.
     void PumpAssetWindow() {
         // ---------------- asset manager child window ----------------
-        if (assetWin != null && assetWin.needsRedraw && !pathPicker.IsOpen()) {
-            AssetManager.lang = ZanIDE.uiLang;
-            assetWin.BeginFrame();
-            int savedSeqA2 = WidgetId.SeqValue();
-            WidgetId.SetSeq(890000);
-            int aAct = assetMgr.Render(assetWin, root, log);
-            WidgetId.SetSeq(savedSeqA2);
-            assetWin.PresentFrame();
-            lastPresent = Window.GetTickMs();
-            if (aAct == 1) {
-                assetWin.window.Close();
+        if (assetWin != null) {
+            int aAct = assetWin.TakeAction();
+            if (aAct == 1 || assetWin.TakeClose() || !assetWin.IsOpen()) {
+                assetWin.Close();
                 assetWin = null;
                 lastActive = 0 - 1;
                 app.RequestRedraw();
@@ -277,13 +244,6 @@ partial class ZanIDE {
     /// AI profiles.
     void PumpSettingsWindows() {
         if (settingsWindow != null) {
-            // Pin the child window's widget ids to a fixed baseline (the
-            // main window's per-frame widget count varies, and drifting
-            // ids would leave the settings controls unresponsive).
-            int savedSeqS = WidgetId.SeqValue();
-            WidgetId.SetSeq(880000);
-            settingsWindow.Render();
-            WidgetId.SetSeq(savedSeqS);
             edThemeIdx = settingsWindow.ThemeIndex();
             edFontPx = settingsWindow.FontSize();
             if (settingsWindow.TakeLanguageChanged()) {
@@ -312,11 +272,6 @@ partial class ZanIDE {
         }
 
         if (aiWindow != null) {
-            // Same fixed id baseline trick as the settings window above.
-            int savedSeqA = WidgetId.SeqValue();
-            WidgetId.SetSeq(885000);
-            aiWindow.Render();
-            WidgetId.SetSeq(savedSeqA);
             if (aiWindow.TakeSaved()) {
                 // Reload the chat's profile lists from disk so the enabled
                 // profile / model dropdown follow the dialog immediately.
@@ -396,14 +351,12 @@ partial class ZanIDE {
                 log.Add("> Opened " + picked + ".");
             }
             pathPickerOwner = 0;
-            if (cfgWin != null) { cfgWin.RequestRedraw(); }
-            if (assetWin != null) { assetWin.RequestRedraw(); }
+            ChildWindows.RequestRedrawAll();
             app.RequestRedraw();
         } else if (pickerResult == 2) {
             pathPickerOwner = 0;
             if (dlg != null) { dlg.RequestRedraw(); }
-            if (cfgWin != null) { cfgWin.RequestRedraw(); }
-            if (assetWin != null) { assetWin.RequestRedraw(); }
+            ChildWindows.RequestRedrawAll();
             app.RequestRedraw();
         }
     }

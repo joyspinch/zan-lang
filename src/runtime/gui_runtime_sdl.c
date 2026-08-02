@@ -38,6 +38,25 @@ static bool g_mouse_captured = false;  /* holding a client-widget drag */
 static int g_window_width = 0, g_window_height = 0; /* last-resized size (px) */
 static int g_sdl_ready = 0;
 static int g_quit = 0;
+
+/* Files dropped onto a window: SDL reports one path per SDL_EVENT_DROP_FILE,
+ * so they are queued here and reported to Zan as a single kind-9 event
+ * carrying the drop position. Zan drains the paths with drop_take(). */
+#define ZAN_DROP_CAP 64
+static char *g_drop_q[ZAN_DROP_CAP];
+static int g_drop_head = 0, g_drop_tail = 0;
+
+static void drop_push(const char *path) {
+    if (!path || !*path) return;
+    int next = (g_drop_tail + 1) % ZAN_DROP_CAP;
+    if (next == g_drop_head) return; /* full: ignore the extra paths */
+    size_t n = strlen(path);
+    char *copy = (char *)malloc(n + 1);
+    if (!copy) return;
+    memcpy(copy, path, n + 1);
+    g_drop_q[g_drop_tail] = copy;
+    g_drop_tail = next;
+}
 static Uint32 g_wake_event = 0; /* user event type posted by zan_gui_wake */
 static int g_ime_x = 0, g_ime_y = 0;
 
@@ -334,6 +353,14 @@ static void sdl_translate(const SDL_Event *e) {
             SDL_Window *w = SDL_GetWindowFromID(e->key.windowID);
             zq_push(5, 0, 0, 0, sdl_key_to_vk(e->key.key),
                     sdl_mods_to_bits(e->key.mod), w);
+            break;
+        }
+        case SDL_EVENT_DROP_FILE: {
+            /* One event per file; the app reads the paths off the queue when
+             * it sees the kind-9 event (drop position in x/y). */
+            SDL_Window *w = SDL_GetWindowFromID(e->drop.windowID);
+            drop_push(e->drop.data);
+            zq_push(9, (int)e->drop.x, (int)e->drop.y, 0, 0, cur_mod_bits(), w);
             break;
         }
         case SDL_EVENT_TEXT_INPUT: {
@@ -943,6 +970,19 @@ EXPORT const char *zan_gui_get_clipboard(void) {
     free(g_clip_buf);
     g_clip_buf = nb;
     return g_clip_buf;
+}
+
+/* Pops the oldest path dropped on a window, or "" when the queue is empty.
+ * The returned buffer stays valid until the next call. */
+EXPORT const char *zan_gui_drop_take(void) {
+    static char *g_drop_buf = NULL;
+    if (g_drop_head == g_drop_tail) return "";
+    char *p = g_drop_q[g_drop_head];
+    g_drop_q[g_drop_head] = NULL;
+    g_drop_head = (g_drop_head + 1) % ZAN_DROP_CAP;
+    free(g_drop_buf);
+    g_drop_buf = p;
+    return g_drop_buf ? g_drop_buf : "";
 }
 
 EXPORT void zan_gui_set_ime_pos(i32 x, i32 y) {
