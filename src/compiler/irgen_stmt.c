@@ -200,9 +200,57 @@ static void emit_eh_propagate_tail(zan_irgen_t *g) {
     LLVMValueRef printf_fn = LLVMGetNamedFunction(g->mod, "printf");
     if (printf_fn) {
         LLVMTypeRef printf_ty = LLVMFunctionType(i32t, &i8ptr, 1, 1);
-        LLVMValueRef fmt = LLVMBuildGlobalStringPtr(g->builder,
-            "Unhandled exception\n", "rexfmt");
-        zan_call2(g->builder, printf_ty, printf_fn, &fmt, 1, "");
+        /* Report the in-flight exception so an uncaught throw in a published
+         * app shows WHY it died, not just "Unhandled exception". A string
+         * throw prints its text (string user data is NUL-terminated); a class
+         * throw prints a type note -- its ToString would need a vtable call
+         * this tail block cannot afford. */
+        LLVMValueRef exc = LLVMBuildLoad2(g->builder, i8ptr, exc_g, "reh.exc");
+        LLVMValueRef tid = LLVMBuildLoad2(g->builder, i8ptr,
+            get_eh_exc_tid_global(g), "reh.tid");
+        LLVMValueRef hasExc = zan_icmp(g->builder, LLVMIntNE, exc,
+            LLVMConstNull(i8ptr), "reh.has");
+        LLVMValueRef isStr = zan_icmp(g->builder, LLVMIntEQ, tid,
+            LLVMConstNull(i8ptr), "reh.isstr");
+        LLVMBasicBlockRef reh_check_bb =
+            LLVMAppendBasicBlockInContext(g->ctx, fn, "reh.check");
+        LLVMBasicBlockRef reh_str_bb =
+            LLVMAppendBasicBlockInContext(g->ctx, fn, "reh.str");
+        LLVMBasicBlockRef reh_cls_bb =
+            LLVMAppendBasicBlockInContext(g->ctx, fn, "reh.cls");
+        LLVMBasicBlockRef reh_none_bb =
+            LLVMAppendBasicBlockInContext(g->ctx, fn, "reh.none");
+        LLVMBasicBlockRef reh_cont_bb =
+            LLVMAppendBasicBlockInContext(g->ctx, fn, "reh.cont");
+        LLVMBuildCondBr(g->builder, hasExc, reh_check_bb, reh_none_bb);
+        LLVMPositionBuilderAtEnd(g->builder, reh_check_bb);
+        LLVMBuildCondBr(g->builder, isStr, reh_str_bb, reh_cls_bb);
+        /* string throw: print the message itself */
+        LLVMPositionBuilderAtEnd(g->builder, reh_str_bb);
+        {
+            LLVMValueRef sfmt = LLVMBuildGlobalStringPtr(g->builder,
+                "Unhandled exception: %s\n", "reh.sfmt");
+            LLVMValueRef sargs[2] = { sfmt, exc };
+            zan_call2(g->builder, printf_ty, printf_fn, sargs, 2, "");
+        }
+        LLVMBuildBr(g->builder, reh_cont_bb);
+        /* class throw: name the category, the object is opaque here */
+        LLVMPositionBuilderAtEnd(g->builder, reh_cls_bb);
+        {
+            LLVMValueRef cfmt = LLVMBuildGlobalStringPtr(g->builder,
+                "Unhandled exception (class object)\n", "reh.cfmt");
+            zan_call2(g->builder, printf_ty, printf_fn, &cfmt, 1, "");
+        }
+        LLVMBuildBr(g->builder, reh_cont_bb);
+        /* no exception object in flight (internal rethrow miss) */
+        LLVMPositionBuilderAtEnd(g->builder, reh_none_bb);
+        {
+            LLVMValueRef nfmt = LLVMBuildGlobalStringPtr(g->builder,
+                "Unhandled exception\n", "reh.nfmt");
+            zan_call2(g->builder, printf_ty, printf_fn, &nfmt, 1, "");
+        }
+        LLVMBuildBr(g->builder, reh_cont_bb);
+        LLVMPositionBuilderAtEnd(g->builder, reh_cont_bb);
     }
     LLVMTypeRef exit_ty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), &i32t, 1, 0);
     LLVMValueRef exit_fn = get_libc_fn(g, "exit", exit_ty);
@@ -1950,21 +1998,61 @@ throw_unwind:
             LLVMBuildUnreachable(g->builder);
             LLVMPositionBuilderAtEnd(g->builder, die_bb);
             emit_eh_hook_call(g, "__zan_eh_unhandled");
-        }
-        LLVMValueRef printf_fn = LLVMGetNamedFunction(g->mod, "printf");
-        if (printf_fn) {
-            LLVMTypeRef printf_ty = LLVMFunctionType(LLVMInt32TypeInContext(g->ctx),
-                &i8ptr, 1, 1);
-            if (val && LLVMTypeOf(val) == i8ptr) {
-                LLVMValueRef fmt = LLVMBuildGlobalStringPtr(g->builder,
-                    "Unhandled exception: %s\n", "exfmt");
-                LLVMValueRef args[] = { fmt, val };
-                zan_call2(g->builder, printf_ty, printf_fn, args, 2, "");
-            } else {
-                LLVMValueRef fmt = LLVMBuildGlobalStringPtr(g->builder,
-                    "Unhandled exception\n", "exfmt");
-                LLVMValueRef args[] = { fmt };
-                zan_call2(g->builder, printf_ty, printf_fn, args, 1, "");
+            LLVMValueRef printf_fn = LLVMGetNamedFunction(g->mod, "printf");
+            if (printf_fn) {
+                LLVMTypeRef printf_ty = LLVMFunctionType(LLVMInt32TypeInContext(g->ctx),
+                    &i8ptr, 1, 1);
+                /* A string throw prints its message; a class throw prints a
+                 * type note. The thrown value alone is not enough: a class
+                 * object is also an i8*, and printing it as text yields
+                 * garbage. The type descriptor (null = string) tells the two
+                 * apart. */
+                LLVMValueRef dexc = LLVMBuildLoad2(g->builder, i8ptr, exc_g,
+                    "die.exc");
+                LLVMValueRef dtid = LLVMBuildLoad2(g->builder, i8ptr,
+                    get_eh_exc_tid_global(g), "die.tid");
+                LLVMValueRef dhas = zan_icmp(g->builder, LLVMIntNE, dexc,
+                    LLVMConstNull(i8ptr), "die.has");
+                LLVMValueRef dstr = zan_icmp(g->builder, LLVMIntEQ, dtid,
+                    LLVMConstNull(i8ptr), "die.str");
+                LLVMBasicBlockRef die_check_bb =
+                    LLVMAppendBasicBlockInContext(g->ctx, fn2, "die.check");
+                LLVMBasicBlockRef die_str_bb =
+                    LLVMAppendBasicBlockInContext(g->ctx, fn2, "die.str");
+                LLVMBasicBlockRef die_cls_bb =
+                    LLVMAppendBasicBlockInContext(g->ctx, fn2, "die.cls");
+                LLVMBasicBlockRef die_none_bb =
+                    LLVMAppendBasicBlockInContext(g->ctx, fn2, "die.none");
+                LLVMBasicBlockRef die_cont_bb =
+                    LLVMAppendBasicBlockInContext(g->ctx, fn2, "die.cont");
+                LLVMBuildCondBr(g->builder, dhas, die_check_bb, die_none_bb);
+                LLVMPositionBuilderAtEnd(g->builder, die_check_bb);
+                LLVMBuildCondBr(g->builder, dstr, die_str_bb, die_cls_bb);
+                LLVMPositionBuilderAtEnd(g->builder, die_str_bb);
+                {
+                    LLVMValueRef fmt = LLVMBuildGlobalStringPtr(g->builder,
+                        "Unhandled exception: %s\n", "die.sfmt");
+                    LLVMValueRef args[] = { fmt, dexc };
+                    zan_call2(g->builder, printf_ty, printf_fn, args, 2, "");
+                }
+                LLVMBuildBr(g->builder, die_cont_bb);
+                LLVMPositionBuilderAtEnd(g->builder, die_cls_bb);
+                {
+                    LLVMValueRef fmt = LLVMBuildGlobalStringPtr(g->builder,
+                        "Unhandled exception (class object)\n", "die.cfmt");
+                    LLVMValueRef args[] = { fmt };
+                    zan_call2(g->builder, printf_ty, printf_fn, args, 1, "");
+                }
+                LLVMBuildBr(g->builder, die_cont_bb);
+                LLVMPositionBuilderAtEnd(g->builder, die_none_bb);
+                {
+                    LLVMValueRef fmt = LLVMBuildGlobalStringPtr(g->builder,
+                        "Unhandled exception\n", "die.nfmt");
+                    LLVMValueRef args[] = { fmt };
+                    zan_call2(g->builder, printf_ty, printf_fn, args, 1, "");
+                }
+                LLVMBuildBr(g->builder, die_cont_bb);
+                LLVMPositionBuilderAtEnd(g->builder, die_cont_bb);
             }
         }
         /* ARC cleanup: release all managed locals before aborting */

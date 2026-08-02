@@ -290,12 +290,12 @@ partial class ZanIDE {
     /// Environment variables OPENAI_API_KEY / OPENAI_BASE_URL / OPENAI_MODEL
     /// are the fallback so the panel works with a plain OpenAI-compatible setup.
     static string AiCfgPath() { return ZanIDE.UserConfigDir() + "/ai.cfg"; }
-    static string AiReqPath() { return ZanIDE.UserConfigDir() + "/ai_req.json"; }
-    static string AiRespPath() { return ZanIDE.UserConfigDir() + "/ai_resp.json"; }
-    static string AiDonePath() { return ZanIDE.UserConfigDir() + "/ai_done.txt"; }
+    static string AiReqPath() { return ZanIDE.CacheDir() + "/ai_req.json"; }
+    static string AiRespPath() { return ZanIDE.CacheDir() + "/ai_resp.json"; }
+    static string AiDonePath() { return ZanIDE.CacheDir() + "/ai_done.txt"; }
     /// The decoded response body of a streaming chat request, appended to by
     /// the Net worker thread and tailed by the panel each frame.
-    static string AiStreamPath() { return ZanIDE.UserConfigDir() + "/ai_stream.txt"; }
+    static string AiStreamPath() { return ZanIDE.CacheDir() + "/ai_stream.txt"; }
 
     /// Reads `key = value` from `content` (same line format as zan.proj).
     static string KvField(string content, string key) {
@@ -338,11 +338,11 @@ partial class ZanIDE {
     // `limits` holds each model's configured context length and maximum output
     // length (both in tokens); a missing / zero entry means "use the default".
     static string AiProfilesPath() { return ZanIDE.UserConfigDir() + "/ai_profiles.json"; }
-    static string AiModelsRespPath() { return ZanIDE.UserConfigDir() + "/ai_models.json"; }
-    static string AiModelsDonePath() { return ZanIDE.UserConfigDir() + "/ai_models_done.txt"; }
-    static string AiPredReqPath() { return ZanIDE.UserConfigDir() + "/ai_pred_req.json"; }
-    static string AiPredRespPath() { return ZanIDE.UserConfigDir() + "/ai_pred.json"; }
-    static string AiPredDonePath() { return ZanIDE.UserConfigDir() + "/ai_pred_done.txt"; }
+    static string AiModelsRespPath() { return ZanIDE.CacheDir() + "/ai_models.json"; }
+    static string AiModelsDonePath() { return ZanIDE.CacheDir() + "/ai_models_done.txt"; }
+    static string AiPredReqPath() { return ZanIDE.CacheDir() + "/ai_pred_req.json"; }
+    static string AiPredRespPath() { return ZanIDE.CacheDir() + "/ai_pred.json"; }
+    static string AiPredDonePath() { return ZanIDE.CacheDir() + "/ai_pred_done.txt"; }
 
     /// Loads the AI provider profiles into the parallel lists and returns the
     /// active index. Falls back to a single profile synthesized from the
@@ -514,7 +514,7 @@ partial class ZanIDE {
             return ZanIDE.T("Set the API key first.", "请先填写 API 密钥。");
         }
         if (baseUrl == "") { baseUrl = "https://api.openai.com/v1"; }
-        Directory.CreateDirectoryRecursive(ZanIDE.UserConfigDir());
+        ZanIDE.EnsureCacheDir();
         if (File.Exists(ZanIDE.AiModelsRespPath())) { File.Delete(ZanIDE.AiModelsRespPath()); }
         if (File.Exists(ZanIDE.AiModelsDonePath())) { File.Delete(ZanIDE.AiModelsDonePath()); }
         string cmd = "curl -s --max-time 60 \"" + baseUrl + "/models\""
@@ -586,7 +586,7 @@ partial class ZanIDE {
         body.Append("{\"role\":\"user\",\"content\":\""
             + ZanIDE.JsonEsc(before + "<CURSOR>" + after) + "\"}");
         body.Append("]}");
-        Directory.CreateDirectoryRecursive(ZanIDE.UserConfigDir());
+        ZanIDE.EnsureCacheDir();
         File.WriteAllText(ZanIDE.AiPredReqPath(), body.ToString());
         if (File.Exists(ZanIDE.AiPredRespPath())) { File.Delete(ZanIDE.AiPredRespPath()); }
         if (File.Exists(ZanIDE.AiPredDonePath())) { File.Delete(ZanIDE.AiPredDonePath()); }
@@ -710,7 +710,7 @@ partial class ZanIDE {
             body.Append(",\"max_tokens\":" + Convert.ToString(maxOut));
         }
         body.Append("}");
-        Directory.CreateDirectoryRecursive(ZanIDE.UserConfigDir());
+        ZanIDE.EnsureCacheDir();
         // The request is made with the Net standard library on a background
         // thread that streams the decoded response into AiStreamPath as it
         // arrives; the panel tails that file each frame for incremental output.
@@ -719,7 +719,7 @@ partial class ZanIDE {
         // debugging artifact of the exact body sent.
         File.WriteAllText(ZanIDE.AiReqPath(), body.ToString());
         return AiNet.Start(baseUrl, "/chat/completions", key, body.ToString(),
-            ZanIDE.AiStreamPath(), ZanIDE.AiDonePath(), 180000, true);
+            ZanIDE.AiStreamPath(), ZanIDE.AiDonePath(), 600000, true);
     }
 
     /// Extracts the assistant reply (or a readable error) from the response.
@@ -751,13 +751,13 @@ partial class ZanIDE {
 
     /// Runs a shell command in the project root, appending its output to the
     /// terminal history (capped so the transcript can't grow without bound).
-    static string TermLogPath() { return ZanIDE.UserConfigDir() + "/term_session.log"; }
+    static string TermLogPath() { return ZanIDE.CacheDir() + "/term_session.log"; }
 
     /// Starts the persistent interactive shell session rooted at the project
     /// directory. The session's stdin is the returned pipe; stdout/stderr
     /// stream into the session log file, which the UI polls each frame.
     static nint TermOpen(string root) {
-        Directory.CreateDirectoryRecursive(ZanIDE.UserConfigDir());
+        ZanIDE.EnsureCacheDir();
         File.WriteAllText(ZanIDE.TermLogPath(), "");
         #if WINDOWS
         string cmd = "cmd /q /k cd /d \"" + root + "\" >>\"" + ZanIDE.TermLogPath() + "\" 2>&1";
@@ -770,27 +770,53 @@ partial class ZanIDE {
     /// Appends any new complete lines from the given log file to `outLog`.
     /// Returns the new consumed length (only whole lines are consumed, so a
     /// partially-written line is picked up on a later poll).
+    ///
+    /// Reads only the bytes past `consumed` (seek, not a full-file re-read), so
+    /// a chatty program's output cannot make polling O(total) and grind the UI
+    /// to a halt. A runaway log is trimmed at 8 MB: the counter resets to 0 and
+    /// everything after the trim is genuinely new output. Never throws: a file
+    /// race with the writer is swallowed and polling continues next frame.
     static int PollLogFile(string path, int consumed, List<string> outLog) {
         if (!File.Exists(path)) { return consumed; }
-        string raw = File.ReadAllText(path);
-        if (raw.Length <= consumed) { return consumed; }
-        // Consume up to the last newline only.
-        int last = 0 - 1;
-        int i = raw.Length - 1;
-        while (i >= consumed) {
-            if (raw.Substring(i, 1) == "\n") { last = i; i = consumed - 1; }
-            i = i - 1;
+        FileStream fs = null;
+        try {
+            fs = FileStream.OpenRead(path);
+            long total = fs.Length();
+            if (total > 8388608) {
+                fs.Close();
+                fs = null;
+                File.WriteAllText(path, "");
+                return 0;
+            }
+            if (consumed > total) { consumed = 0; }
+            if (consumed >= total) { fs.Close(); return consumed; }
+            int want = (int)(total - consumed);
+            if (want > 1048576) { want = 1048576; }
+            fs.SeekTo(consumed);
+            string chunk = fs.Read(want);
+            fs.Close();
+            fs = null;
+            if (chunk.Length == 0) { return consumed; }
+            // Consume up to the last newline only (partial line waits).
+            int last = 0 - 1;
+            int i = chunk.Length - 1;
+            while (i >= 0) {
+                if (chunk.Substring(i, 1) == "\n") { last = i; i = 0 - 1; }
+                i = i - 1;
+            }
+            if (last < 0) { return consumed; }
+            List<string> nl = CodeEditor.SplitLines(chunk.Substring(0, last + 1));
+            int k = 0;
+            while (k < nl.Count) {
+                if (!(k == nl.Count - 1 && nl[k] == "")) { outLog.Add(nl[k]); }
+                k = k + 1;
+            }
+            while (outLog.Count > 2000) { outLog.RemoveAt(0); }
+            return consumed + last + 1;
+        } catch (Exception e) {
+            if (fs != null) { fs.Close(); }
+            return consumed;
         }
-        if (last < consumed) { return consumed; }
-        string chunk = raw.Substring(consumed, last + 1 - consumed);
-        List<string> nl = CodeEditor.SplitLines(chunk);
-        int k = 0;
-        while (k < nl.Count) {
-            if (!(k == nl.Count - 1 && nl[k] == "")) { outLog.Add(nl[k]); }
-            k = k + 1;
-        }
-        while (outLog.Count > 2000) { outLog.RemoveAt(0); }
-        return last + 1;
     }
 
     /// Appends any new complete lines from the terminal session log to the
@@ -801,7 +827,12 @@ partial class ZanIDE {
 
     /// Log file that a launched console program's output is mirrored into so
     /// the IDE Output tab can show it alongside the real console window.
-    static string RunLogPath() { return ZanIDE.UserConfigDir() + "/run_output.log"; }
+    static string RunLogPath() { return ZanIDE.CacheDir() + "/run_output.log"; }
+
+    /// Marker file written once the launched console program has exited. The
+    /// main loop watches it to stop streaming (and lift the 4 fps throttle)
+    /// when the program finishes instead of polling a dead log forever.
+    static string RunDonePath() { return ZanIDE.CacheDir() + "/run_done.marker"; }
 
     /// Launches a console executable in its own visible console window while
     /// teeing its combined stdout/stderr into RunLogPath. The program's output
@@ -809,21 +840,27 @@ partial class ZanIDE {
     /// Console.ReadLine works) and, mirrored, in the IDE Output tab. Truncates
     /// the mirror log first; the caller resets its consumed counter to 0.
     /// Starts in `cwd` (the project root) so the program's relative paths work.
+    /// Writes RunDonePath once the program exits so the IDE stops streaming.
     static void RunConsole(string exe, string cwd) {
-        Directory.CreateDirectoryRecursive(ZanIDE.UserConfigDir());
+        ZanIDE.EnsureCacheDir();
         File.WriteAllText(ZanIDE.RunLogPath(), "");
+        if (File.Exists(ZanIDE.RunDonePath())) { File.Delete(ZanIDE.RunDonePath()); }
         #if WINDOWS
         // Echo each line to the host (so the console window shows it) and append
         // it to the mirror log as UTF-8 without BOM (Tee-Object/Out-File default
         // to UTF-16 on Windows PowerShell, which the log reader cannot decode).
+        // The marker is written AFTER the pipeline completes (i.e. the program
+        // exited); -NoExit keeps the console window open for reading the output.
         string ps = "$e=New-Object System.Text.UTF8Encoding $false; & '" + exe
             + "' 2>&1 | %{ $_; [IO.File]::AppendAllText('" + ZanIDE.RunLogPath()
-            + "',$_+[Environment]::NewLine,$e) }";
+            + "',($_ -as [string])+[Environment]::NewLine,$e) }; [IO.File]::WriteAllText('"
+            + ZanIDE.RunDonePath() + "','1')";
         Process.RunDetached("cmd /c start \"Zan Run\" /D \"" + ZanIDE.ToWinPath(cwd)
             + "\" powershell -NoProfile -ExecutionPolicy Bypass -NoExit -Command \"" + ps + "\"");
         #else
         Process.RunDetached("sh -c 'cd \"" + cwd + "\" && \"" + exe
-            + "\" 2>&1 | tee \"" + ZanIDE.RunLogPath() + "\"' &");
+            + "\" 2>&1 | tee \"" + ZanIDE.RunLogPath()
+            + "\"; echo 1 > \"" + ZanIDE.RunDonePath() + "\"' &");
         #endif
     }
 
@@ -857,8 +894,8 @@ partial class ZanIDE {
     // Git panel helpers (right panel "Git" tab)
     // ================================================================
 
-    static string GitLogPath() { return ZanIDE.UserConfigDir() + "/git_job.log"; }
-    static string GitDonePath() { return ZanIDE.UserConfigDir() + "/git_job_done.txt"; }
+    static string GitLogPath() { return ZanIDE.CacheDir() + "/git_job.log"; }
+    static string GitDonePath() { return ZanIDE.CacheDir() + "/git_job_done.txt"; }
 
     /// Marker line separating the two commands of a refresh job's output.
     static string GitRefreshMark() { return "--zan-git-branch--"; }
@@ -873,7 +910,7 @@ partial class ZanIDE {
 
     /// Starts one detached shell command as the current git job.
     static void GitBeginRaw(string cmd) {
-        Directory.CreateDirectoryRecursive(ZanIDE.UserConfigDir());
+        ZanIDE.EnsureCacheDir();
         File.WriteAllText(ZanIDE.GitLogPath(), "");
         if (File.Exists(ZanIDE.GitDonePath())) { File.Delete(ZanIDE.GitDonePath()); }
         #if WINDOWS

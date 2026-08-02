@@ -917,6 +917,45 @@ foreach(_field_init_kind static instance generic)
     PROPERTIES TIMEOUT 60)
 endforeach()
 
+# A33-1: delegates cannot capture a receiver or enclosing locals yet. Every
+# shape that used to silently lower to a bare function pointer (and crashed at
+# runtime with 0xC0000005) must be a compile error.
+add_test(NAME diag_a33_lambda_capture_this
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/lambda_capture_this.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_lambda_capture_this${_exe_ext}
+    "-DEXPECT_REGEX=a lambda cannot capture 'this'"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_a33_lambda_capture_this PROPERTIES TIMEOUT 60)
+
+add_test(NAME diag_a33_lambda_capture_local
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/lambda_capture_local.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_lambda_capture_local${_exe_ext}
+    "-DEXPECT_REGEX=use of undeclared identifier 'n'"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_a33_lambda_capture_local PROPERTIES TIMEOUT 60)
+
+add_test(NAME diag_a33_instance_method_group
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/instance_method_group.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_instance_method_group${_exe_ext}
+    "-DEXPECT_REGEX=instance method group 'Touch' cannot be used as a value"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_a33_instance_method_group PROPERTIES TIMEOUT 60)
+
+add_test(NAME diag_a33_instance_method_ident
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/instance_method_ident.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_instance_method_ident${_exe_ext}
+    "-DEXPECT_REGEX=instance method 'Touch' cannot be used as a value"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_a33_instance_method_ident PROPERTIES TIMEOUT 60)
+
 # ---- Golden compiler regression tests ----
 # Freeze the lexer token stream and parse tree for a set of hermetic (stdlib-free)
 # .zan inputs so any lexer/parser/AST regression is caught in CI on every

@@ -100,6 +100,45 @@ class ChatArea {
         }
     }
 
+    /// Serializes the whole session list (each session is a ChatPack JSON
+    /// string) plus the active index, for disk persistence. Sessions are
+    /// JSON-escaped so their own quoting survives nesting.
+    static string ChatPackSessions(List<string> sessions, int cur) {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("{\"cur\":" + Convert.ToString(cur) + ",\"s\":[");
+        int i = 0;
+        while (i < sessions.Count) {
+            if (i > 0) { sb.Append(","); }
+            sb.Append("\"" + ZanIDE.JsonEsc(sessions[i]) + "\"");
+            i = i + 1;
+        }
+        sb.Append("]}");
+        return sb.ToString();
+    }
+
+    /// Restores a session list from ChatPackSessions output; returns the
+    /// active index (clamped to the restored list).
+    static int ChatUnpackSessions(string packed, List<string> sessions) {
+        sessions.Clear();
+        if (packed == "") { return 0; }
+        JsonValue v = JsonValue.ParseLenient(packed);
+        if (v == null) { return 0; }
+        JsonValue s = v.Get("s");
+        if (s != null && s.IsArray()) {
+            int i = 0;
+            while (i < s.Count()) {
+                JsonValue it = s.At(i);
+                string p = "";
+                if (it != null) { p = it.AsString(""); }
+                sessions.Add(p);
+                i = i + 1;
+            }
+        }
+        int c = v.Int("cur", 0);
+        if (c < 0 || c >= sessions.Count) { c = 0; }
+        return c;
+    }
+
     /// First line of `s`, capped to a title length (for the session list).
     static string TitleLine(string s) {
         List<string> hard = CodeEditor.SplitLines(s);
@@ -275,11 +314,10 @@ class ChatArea {
                 }
                 li = li + 1;
             }
-            // One blank row separates turns; the per-turn header (kind 3) plus
-            // this single gap keeps messages distinct without the old sprawl.
-            lines.Add("");
-            colors.Add(bodyCol);
-            kinds.Add(0);
+            // No blank row between turns: the per-turn header (kind 3) with its
+            // background band already separates messages, so a trailing blank
+            // row would just add wasted vertical space. Messages stack tightly
+            // like a Devin-style transcript.
             i = i + 1;
         }
         // meta[row] = the message index a kind-5 toggle row controls (else -1).
@@ -431,11 +469,17 @@ class ChatArea {
         int row = 0;
         int idx = start;
         int codeBg = App.ScaleAlpha(t.bgTertiary, 160);
+        int headBg = App.ScaleAlpha(t.bgTertiary, 70);
         while (idx < total && row < maxRows) {
             int ry = area.y + pad + row * rowH;
             if (idx < lines.Count) {
                 if (kinds[idx] == 1) {
                     c.FillRect(area.x + pad - app.Scale(2), ry - app.Scale(1), area.width - pad * 2 + app.Scale(4), rowH, codeBg);
+                } else if (kinds[idx] == 3) {
+                    // Message header band: a soft full-width strip behind the
+                    // role label ("AI" / "You"), so adjacent turns read as
+                    // distinct blocks without any blank gap between them.
+                    c.FillRect(area.x + pad, ry, area.width - pad * 2, rowH, headBg);
                 }
                 if (sr0 >= 0 && idx >= sr0 && idx <= sr1) {
                     string ln = lines[idx];

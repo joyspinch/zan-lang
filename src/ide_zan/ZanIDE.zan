@@ -2,6 +2,8 @@ using System;
 using System.IO;
 using System.Diagnostics;
 using System.Json;
+using System.Data;
+using System.Data.Sqlite;
 using Gui;
 using Gui.Widget;
 using Gui.Designer;
@@ -149,6 +151,18 @@ partial class ZanIDE {
         #endif
     }
 
+    /// Volatile, per-run files live here: mirrored program logs, terminal
+    /// session transcripts, AI stream/request temp files and the chat-session
+    /// database. It sits beside the IDE executable (<exe dir>/cache) so a run
+    /// never writes into the system profile and logs stay with the install.
+    static string CacheDir() {
+        return ZanIDE.ExeDir() + "/cache";
+    }
+
+    static void EnsureCacheDir() {
+        Directory.CreateDirectoryRecursive(ZanIDE.CacheDir());
+    }
+
     /// Default parent for user projects. Projects are user-owned and never
     /// created under the install dir; the wizard lets the user pick any path.
     static string ProjectsHome() { return ZanIDE.HomeDir() + "/ZanProjects"; }
@@ -190,6 +204,117 @@ partial class ZanIDE {
     static void WriteDockLayout(string layout) {
         Directory.CreateDirectoryRecursive(ZanIDE.UserConfigDir());
         File.WriteAllText(ZanIDE.DockLayoutPath(), layout);
+    }
+
+    // ---- AI chat sessions (disk persistence) -------------------------------
+    /// Where the AI chat session list lives (a SQLite database in the cache
+    /// dir), so closing the IDE does not lose the conversation: each row is one
+    /// session's ChatPack JSON, plus a meta row holding the active index.
+    /// Saved on every session change and (throttled) whenever the transcript
+    /// grows.
+    static string AiSessionsDbPath() { return ZanIDE.CacheDir() + "/ai_sessions.db"; }
+
+    void SaveAiSessions() {
+        // Fold the live transcript into the current slot first, so the on-disk
+        // copy always matches what the user sees.
+        if (aiSessCur >= 0 && aiSessCur < aiSessions.Count) {
+            aiSessions[aiSessCur] = ChatArea.ChatPack(aiRole, aiText, aiReason,
+                aiPlanText, aiPlanDone);
+        }
+        SqliteConnection db = null;
+        try {
+            ZanIDE.EnsureCacheDir();
+            db = SqliteConnection.Open(ZanIDE.AiSessionsDbPath());
+            if (db == null || !db.IsConnected()) { return; }
+            db.Execute("CREATE TABLE IF NOT EXISTS sessions ("
+                + "id INTEGER PRIMARY KEY, pack TEXT NOT NULL)");
+            db.Execute("CREATE TABLE IF NOT EXISTS meta ("
+                + "key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+            db.Execute("DELETE FROM sessions");
+            int i = 0;
+            while (i < aiSessions.Count) {
+                db.Execute("INSERT INTO sessions (id, pack) VALUES (?, ?)",
+                    DbParams.Create().AddInt(i).Add(aiSessions[i]));
+                i = i + 1;
+            }
+            db.Execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('cur', ?)",
+                DbParams.Create().Add(Convert.ToString(aiSessCur)));
+        } catch (Exception e) {
+            // Never let a storage failure crash the IDE's main loop.
+            int skip = 0;
+        } finally {
+            if (db != null) { db.Close(); }
+        }
+    }
+
+    void LoadAiSessions() {
+        aiSessions.Clear();
+        // One-time migration from the pre-SQLite JSON file (ai_sessions.json in
+        // the config dir) when the cache database does not exist yet.
+        string legacy = ZanIDE.UserConfigDir() + "/ai_sessions.json";
+        if (!File.Exists(ZanIDE.AiSessionsDbPath()) && File.Exists(legacy)) {
+            try {
+                JsonValue v = JsonValue.ParseLenient(File.ReadAllText(legacy));
+                if (v != null) {
+                    JsonValue s = v.Get("s");
+                    if (s != null && s.IsArray()) {
+                        int i = 0;
+                        while (i < s.Count()) {
+                            JsonValue it = s.At(i);
+                            if (it != null) { aiSessions.Add(it.AsString("")); }
+                            i = i + 1;
+                        }
+                    }
+                    aiSessCur = v.Int("cur", 0);
+                    if (aiSessions.Count == 0) { aiSessions.Add(""); aiSessCur = 0; }
+                    if (aiSessCur < 0 || aiSessCur >= aiSessions.Count) { aiSessCur = 0; }
+                    // Persist the migrated data immediately (A35 fixed: calling
+                    // the try/catch/finally SaveAiSessions from inside this
+                    // try/catch no longer trips the LLVM "Incorrect number of
+                    // arguments" IR bug).
+                    SaveAiSessions();
+                }
+            } catch (Exception e) {
+                // Corrupt legacy file: fall through to the empty database.
+                int skip = 0;
+            }
+        }
+        if (File.Exists(ZanIDE.AiSessionsDbPath())) {
+            SqliteConnection db = null;
+            try {
+                db = SqliteConnection.Open(ZanIDE.AiSessionsDbPath());
+                if (db != null && db.IsConnected()) {
+                    DbResult rs = db.Query("SELECT id, pack FROM sessions ORDER BY id");
+                    int r = 0;
+                    while (r < rs.RowCount()) {
+                        aiSessions.Add(rs.GetString(r, 1));
+                        r = r + 1;
+                    }
+                    string curS = db.ExecuteScalar("SELECT value FROM meta WHERE key = 'cur'");
+                    int c = ZanIDE.ParseIntSafe(curS);
+                    if (aiSessions.Count == 0) { aiSessions.Add(""); c = 0; }
+                    if (c < 0 || c >= aiSessions.Count) { c = 0; }
+                    aiSessCur = c;
+                }
+            } catch (Exception e) {
+                if (aiSessions.Count == 0) { aiSessions.Add(""); aiSessCur = 0; }
+            } finally {
+                if (db != null) { db.Close(); }
+            }
+        } else {
+            if (aiSessions.Count == 0) { aiSessions.Add(""); aiSessCur = 0; }
+        }
+        // Restore the active session's transcript into the live lists.
+        aiRole = new List<string>();
+        aiText = new List<string>();
+        aiReason = new List<string>();
+        aiPlanText = new List<string>();
+        aiPlanDone = new List<int>();
+        if (aiSessCur >= 0 && aiSessCur < aiSessions.Count) {
+            ChatArea.ChatUnpack(aiSessions[aiSessCur], aiRole, aiText, aiReason,
+                aiPlanText, aiPlanDone);
+        }
+        aiCacheKey = "";
     }
 
     // ---- Recently opened projects (start page MRU, newest first) ----
@@ -1121,9 +1246,26 @@ partial class ZanIDE {
             AiNet.RunStreamerMain(aiReq);
             return;
         }
-        ZanIDE ide = new ZanIDE();
-        ZanIDE.current = ide;
-        ide.Run();
+        try {
+            ZanIDE ide = new ZanIDE();
+            ZanIDE.current = ide;
+            ide.Run();
+        } catch (Exception e) {
+            // The IDE must never vanish without a trace: a stray exception in
+            // the main loop used to end the process silently. Write the message
+            // to the cache crash log and show it (a Windows GUI program has no
+            // console, so the compiler's "Unhandled exception" stderr print
+            // would be invisible). The handler stays on field access and
+            // finally-free calls only (A35: a call into a finally-bearing
+            // method from a try region of this giant module fails to compile).
+            string m = e.Message;
+            if (m == "") { m = "unknown error"; }
+            string p = ZanIDE.CacheDir() + "/ide_error.log";
+            File.WriteAllText(p, "ZanIDE crashed: " + m + "\n");
+            #if WINDOWS
+            System.Windows.Forms.MessageBox.Show("ZanIDE crashed: " + m, "ZanIDE");
+            #endif
+        }
     }
 
     /// The IDE itself: builds the window and state, then pumps the main
@@ -2775,6 +2917,7 @@ partial class ZanIDE {
                         aiCacheKey = "";
                         aiToolOpen = new List<int>();
                         aiScroll.Set(0);
+                        SaveAiSessions();
                         app.RequestRedraw();
                     } else if (aiBusy.Get() == 0 && sAct.created) {
                         aiSessions[aiSessCur] = ChatArea.ChatPack(aiRole, aiText, aiReason, aiPlanText, aiPlanDone);
@@ -2788,6 +2931,7 @@ partial class ZanIDE {
                         aiCacheKey = "";
                         aiToolOpen = new List<int>();
                         aiScroll.Set(0);
+                        SaveAiSessions();
                         app.RequestRedraw();
                     } else if (aiBusy.Get() == 0 && sAct.selected >= 0
                         && sAct.selected != aiSessCur) {
@@ -2802,6 +2946,7 @@ partial class ZanIDE {
                         aiCacheKey = "";
                         aiToolOpen = new List<int>();
                         aiScroll.Set(0);
+                        SaveAiSessions();
                         app.RequestRedraw();
                     }
                     rp = Rect.Create(rp.x + aiSideW, rp.y,
@@ -2949,6 +3094,7 @@ partial class ZanIDE {
                         aiCacheKey = "";
                         aiToolOpen = new List<int>();
                         aiScroll.Set(0);
+                        SaveAiSessions();
                         Layer.Msg(ZanIDE.T("Forked into a new session",
                             "已基于摘要分叉新会话"), 3);
                         app.RequestRedraw();
@@ -3397,6 +3543,19 @@ partial class ZanIDE {
                         coLog.Reset();
                         app.RequestRedraw();
                     }
+                    // The launched program exited: drain any trailing output and
+                    // stop streaming so the 4 fps throttle lifts and the log is
+                    // no longer polled (it also caps the mirror file's growth).
+                    if (File.Exists(ZanIDE.RunDonePath())) {
+                        File.Delete(ZanIDE.RunDonePath());
+                        int rfinal = ZanIDE.RunPoll(runLogLen, log);
+                        if (rfinal != runLogLen) {
+                            runLogLen = rfinal;
+                            coLog.Reset();
+                            app.RequestRedraw();
+                        }
+                        runStreaming = false;
+                    }
                     app.RequestAnimationFrame(250);
                 }
                 // Save-triggered hot reload (autoRun ON): rebuild + restart the
@@ -3446,6 +3605,18 @@ partial class ZanIDE {
                         app.RequestRedraw();
                     } else {
                         app.RequestAnimationFrame(120);
+                    }
+                }
+                // Poll the on-disk symbol index: a background EmitSymbolsDetach
+                // (or a build) may have written a newer one; reload it so member
+                // completion follows the newest code without a restart.
+                if (haveProject) {
+                    string idxP = ZanIDE.SymbolIndexPath(root);
+                    if (File.Exists(idxP)) {
+                        long stI = FileInfo.GetLastWriteTime(idxP);
+                        if (stI > symbolIdxStamp) {
+                            if (ZanIDE.LoadSymbolIndexFor(root)) { symbolIdxStamp = stI; }
+                        }
                     }
                 }
                 // Poll the in-flight detached build (Run/Build ribbon): stream
@@ -3517,7 +3688,12 @@ partial class ZanIDE {
                         // A build means the code changed: re-index so
                         // completion follows it, and pick up the index
                         // the previous build produced.
-                        ZanIDE.LoadSymbolIndexFor(root);
+                        if (ZanIDE.LoadSymbolIndexFor(root)) {
+                            string idxPB = ZanIDE.SymbolIndexPath(root);
+                            if (File.Exists(idxPB)) {
+                                symbolIdxStamp = FileInfo.GetLastWriteTime(idxPB);
+                            }
+                        }
                         ZanIDE.EmitSymbolsDetach(root, buildTargetPath);
                         // An AI-initiated build/run: hand the compiler result
                         // back to the assistant loop so it reads the real
@@ -3711,7 +3887,13 @@ partial class ZanIDE {
                         } else {
                             int aiNow = Window.GetTickMs();
                             if (aiWaitStart == 0) { aiWaitStart = aiNow; }
-                            else if (aiNow - aiWaitStart > 210000) {
+                            // Mirrors the transport's idle window (600s): a
+                            // model that is still thinking emits nothing for
+                            // minutes, so only give up after the same silence
+                            // the Net layer would time out on. Any byte of
+                            // stream content (or a retry that truncates the
+                            // file) re-arms the wait above.
+                            else if (aiNow - aiWaitStart > 600000) {
                                 aiTimedOut = true;
                             }
                         }
@@ -3820,6 +4002,20 @@ partial class ZanIDE {
                             }
                         }
                         aiScroll.Set(0);
+                    }
+                    // Autosave the AI transcript (throttled to 1/s): every new
+                    // user turn, tool result or streamed answer is folded into
+                    // the current session and written to disk, so restarting the
+                    // IDE keeps the conversation instead of losing it.
+                    int aiNowMs = Window.GetTickMs();
+                    if (aiNowMs - aiLastSave > 1000) {
+                        aiLastSave = aiNowMs;
+                        string curPack = ChatArea.ChatPack(aiRole, aiText,
+                            aiReason, aiPlanText, aiPlanDone);
+                        if (aiSessions[aiSessCur] != curPack) {
+                            aiSessions[aiSessCur] = curPack;
+                            SaveAiSessions();
+                        }
                     }
                     app.RequestRedraw();
                 }
@@ -4202,11 +4398,15 @@ partial class ZanIDE {
         // whatever the last build left behind and refresh it in the
         // background so it follows the code.
         if (haveProject) {
+            string idxPath0 = ZanIDE.SymbolIndexPath(root);
             if (!ZanIDE.LoadSymbolIndexFor(root)) {
                 // Never built here: generate the index in the background so
                 // hover and completion show real signatures (including stdlib
-                // ones) instead of falling back to guesses.
-                ZanIDE.EmitSymbolsDetach(root, root + "/src/main.zan");
+                // ones) instead of falling back to guesses. The entry comes
+                // from the manifest: window-app templates have no main.zan.
+                ZanIDE.EmitSymbolsDetach(root, ZanIDE.ProjectEntryPath(root));
+            } else if (File.Exists(idxPath0)) {
+                symbolIdxStamp = FileInfo.GetLastWriteTime(idxPath0);
             }
         }
         tree = new List<TreeNode>();
@@ -4883,6 +5083,10 @@ partial class ZanIDE {
         aiSessions = new List<string>();
         aiSessCur = 0;
         aiSessions.Add("");
+        // Restore sessions persisted on disk so a restart continues the last
+        // conversation instead of starting from an empty chat.
+        LoadAiSessions();
+        aiLastSave = 0;
         aiSessPrevBtn = new Button { Text = "<", Class = "small" };
         aiSessNextBtn = new Button { Text = ">", Class = "small" };
         aiSessNewBtn = new Button { Text = ZanIDE.T("New chat", "新会话"), Class = "small" };

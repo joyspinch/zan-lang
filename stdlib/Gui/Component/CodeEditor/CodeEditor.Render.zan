@@ -52,6 +52,11 @@ partial class CodeEditor {
     /// Returns the cached highlight for line `ln`, re-tokenising only when the
     /// line's text (or the palette) changed. On a steady frame every visible
     /// line hits the cache, so scrolling does no tokenising or allocation.
+    /// Block-comment state flows top-to-bottom: a line ending inside an
+    /// unterminated /* colours the following lines as comment until a closing
+    /// */. When the previous line is not cached yet (first paint after a jump),
+    /// the state is re-derived by tokenising forward from the nearest cached
+    /// line.
     CeHlLine GetHl(int ln, string text, Theme t) {
         int sig = HlThemeSig(t);
         if (sig != hlThemeSig) {
@@ -61,19 +66,58 @@ partial class CodeEditor {
         while (hlCache.Count <= ln) { hlCache.Add(null); }
         CeHlLine cur = hlCache[ln];
         if (cur != null && cur.src == text) { return cur; }
+
+        bool inBlock = false;
+        if (ln > 0) {
+            int prev = ln - 1;
+            if (prev < hlCache.Count && hlCache[prev] != null) {
+                inBlock = hlCache[prev].blockOpen;
+            } else {
+                // Nearest cached line above, then forward-tokenise to ln-1 so
+                // the block state is correct even after a caret jump.
+                int baseLine = prev;
+                while (baseLine >= 0 &&
+                       (baseLine >= hlCache.Count || hlCache[baseLine] == null)) {
+                    baseLine = baseLine - 1;
+                }
+                if (baseLine >= 0) {
+                    inBlock = hlCache[baseLine].blockOpen;
+                    int k = baseLine + 1;
+                    while (k < ln) {
+                        string kt = lines[k];
+                        CeHlLine ke = new CeHlLine();
+                        ke.src = kt;
+                        ke.toks = new List<string>();
+                        ke.cols = new List<int>();
+                        ke.blockOpen = Highlight(kt, t, inBlock, ke.toks, ke.cols);
+                        inBlock = ke.blockOpen;
+                        while (hlCache.Count <= k) { hlCache.Add(null); }
+                        hlCache[k] = ke;
+                        k = k + 1;
+                    }
+                }
+                // baseLine < 0: nothing cached above, so start from top of file
+                // (inBlock stays false).
+            }
+        }
+
         CeHlLine ne = new CeHlLine();
         ne.src = text;
         ne.toks = new List<string>();
         ne.cols = new List<int>();
-        Highlight(text, t, ne.toks, ne.cols);
+        ne.blockOpen = Highlight(text, t, inBlock, ne.toks, ne.cols);
         hlCache[ln] = ne;
         return ne;
     }
 
     /// Splits `line` into colored segments (parallel outT/outC lists): keywords,
-    /// types (Capitalized identifiers), strings, line comments and numbers get
-    /// distinct colors; everything else uses the default text color.
-    void Highlight(string line, Theme t, List<string> outT, List<int> outC) {
+    /// types (Capitalized identifiers), strings, line comments, /* block
+    /// comments (single-line and spanning) and numbers get distinct colors;
+    /// everything else uses the default text color. `inBlock` is the inherited
+    /// block-comment state from the previous line; the return value is the
+    /// state at the end of this line.
+    bool Highlight(string line, Theme t, bool inBlock,
+                   List<string> outT, List<int> outC) {
         // Defaults follow the active skin: a light background gets a
         // light-friendly palette, a dark one keeps the classic dark palette.
         EditorPalette pal = EditorPalette.For(t);
@@ -89,14 +133,17 @@ partial class CodeEditor {
         if (synCom != 0) { comC = synCom; }
         if (synNum != 0) { numC = synNum; }
         if (synText != 0) { def = synText; }
-        CodeEditor.HighlightSpans(line, kwC, tyC, strC, comC, numC, def, outT, outC);
+        return CodeEditor.HighlightSpans(line, kwC, tyC, strC, comC, numC, def,
+                                         inBlock, outT, outC);
     }
 
     /// Static tokenizer used by both the editor and read-only code views (e.g.
     /// the component gallery). Splits `line` into colored segments (parallel
-    /// outT/outC lists) using the given palette.
-    static void HighlightSpans(string line, int kwC, int tyC, int strC,
-            int comC, int numC, int def, List<string> outT, List<int> outC) {
+    /// outT/outC lists) using the given palette. `inBlock` is the inherited
+    /// /* block-comment state; returns the state at the end of the line.
+    static bool HighlightSpans(string line, int kwC, int tyC, int strC,
+            int comC, int numC, int def, bool inBlock,
+            List<string> outT, List<int> outC) {
         // Classify by raw byte code (line[i]) and emit each token with a single
         // Substring, instead of allocating a one-char string per byte and
         // scanning character sets. ASCII identifiers/keywords/numbers/strings
@@ -105,9 +152,37 @@ partial class CodeEditor {
         int n = line.Length;
         int i = 0;
         int pstart = -1;   // start of the current default-colored run, -1 = none
+        if (inBlock) {
+            // Line starts inside a block comment: scan for the closing */.
+            int j = i;
+            while (j + 1 < n && !(line[j] == 42 && line[j + 1] == 47)) { j = j + 1; }
+            if (j + 1 < n) {
+                outT.Add(line.Substring(i, j + 2 - i)); outC.Add(comC);
+                i = j + 2;
+                inBlock = false;
+            } else {
+                outT.Add(line.Substring(i, n - i)); outC.Add(comC);
+                return true;
+            }
+        }
         while (i < n) {
             int b = line[i];
-            if (b == 47 && i + 1 < n && line[i + 1] == 47) {          // "//" comment
+            if (b == 47 && i + 1 < n && line[i + 1] == 42) {          // "/*"
+                if (pstart >= 0) { outT.Add(line.Substring(pstart, i - pstart)); outC.Add(def); pstart = -1; }
+                int j = i + 2;
+                bool closed = false;
+                while (j + 1 < n) {
+                    if (line[j] == 42 && line[j + 1] == 47) { j = j + 2; closed = true; break; }
+                    j = j + 1;
+                }
+                if (closed) {
+                    outT.Add(line.Substring(i, j - i)); outC.Add(comC);
+                    i = j;
+                } else {
+                    outT.Add(line.Substring(i, n - i)); outC.Add(comC);
+                    return true;
+                }
+            } else if (b == 47 && i + 1 < n && line[i + 1] == 47) {    // "//" comment
                 if (pstart >= 0) { outT.Add(line.Substring(pstart, i - pstart)); outC.Add(def); pstart = -1; }
                 outT.Add(line.Substring(i, n - i)); outC.Add(comC);
                 i = n;
@@ -154,6 +229,7 @@ partial class CodeEditor {
             }
         }
         if (pstart >= 0) { outT.Add(line.Substring(pstart, n - pstart)); outC.Add(def); }
+        return false;
     }
 
     /// A background is "light" when its RGB channels are collectively bright;

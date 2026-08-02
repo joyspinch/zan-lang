@@ -67,14 +67,15 @@ class AiNet {
     /// Each attempt streams into a private marker file; only the final outcome
     /// is published to the real done file, so the GUI never sees a mid-retry
     /// error and a dropped connection recovers on its own (like mainstream AI
-    /// coding tools). Up to 3 attempts with a short backoff.
+    /// coding tools). Up to 4 attempts (3 retries) with a growing backoff for
+    /// transient network blips / provider 5xx.
     static void Worker() {
         Socket.Initialize();
         string realDone = AiNet.sDone;
         string tryDone = realDone + ".try";
         int attempt = 0;
         string last = "";
-        while (attempt < 3) {
+        while (attempt < 4) {
             if (File.Exists(tryDone)) { File.Delete(tryDone); }
             AiNet.sDone = tryDone;
             int _r = await AiNet.RunReq();
@@ -86,7 +87,9 @@ class AiNet {
                 return;
             }
             attempt = attempt + 1;
-            if (attempt < 3) { Thread.Sleep(800 * attempt); }
+            // Backoff 1s / 2s / 3s between retries: enough for a dropped
+            // connection to recover, short enough to not stall the reply.
+            if (attempt < 4) { Thread.Sleep(1000 * attempt); }
         }
         // All attempts failed: surface the last transport error to the GUI.
         string msg = last;
@@ -110,7 +113,7 @@ class AiNet {
         string bodyFile = ln[3];
         string outFile = ln[4];
         string doneFile = ln[5];
-        int timeout = AiNet.ParseInt(ln[6], 180000);
+        int timeout = AiNet.ParseInt(ln[6], 600000);
         bool verify = ln[7] == "1";
         string body = "";
         if (File.Exists(bodyFile)) { body = File.ReadAllText(bodyFile); }
@@ -126,29 +129,19 @@ class AiNet {
         // last, after any retries). The transport's own timeout is an IDLE
         // window (every received chunk re-arms it), so a model that keeps
         // streaming -- e.g. a long thinking phase -- must not be killed by a
-        // fixed total budget. Give the wait an idle backstop of its own
-        // (silence past the request timeout + slack) plus a hard cap that
-        // covers the worker's three retries: a healthy stream always gets to
-        // finish, while a truly dead streamer still surfaces an error.
+        // fixed total budget. The main thread only waits for the worker to
+        // finish all its attempts: an idle backstop here would race the
+        // transport (whose window resets per attempt) and kill a request that
+        // is mid-retry, so the only bound is the hard cap covering the
+        // worker's four attempts. A truly dead streamer still surfaces an
+        // error through the cap.
         int baseTimeout = timeout;
-        if (baseTimeout <= 0) { baseTimeout = 180000; }
-        int hardCap = baseTimeout * 3 + 60000;
+        if (baseTimeout <= 0) { baseTimeout = 600000; }
+        int hardCap = baseTimeout * 4 + 60000;
         int waited = 0;
-        int idleMs = 0;
-        int lastSize = 0 - 1;
-        if (File.Exists(outFile)) { lastSize = File.GetSize(outFile); }
         while (!File.Exists(doneFile) && waited < hardCap) {
             Thread.Sleep(50);
             waited = waited + 50;
-            int sz = 0;
-            if (File.Exists(outFile)) { sz = File.GetSize(outFile); }
-            if (sz != lastSize) {
-                lastSize = sz;
-                idleMs = 0;
-            } else {
-                idleMs = idleMs + 50;
-            }
-            if (idleMs > baseTimeout + 30000) { break; }
         }
         // Let the worker fully unwind after it wrote the marker.
         Thread.Sleep(150);

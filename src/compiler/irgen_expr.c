@@ -406,10 +406,22 @@ static LLVMValueRef emit_expr_identifier(zan_irgen_t *g, zan_ast_node_t *expr,
             }
         }
         /* method reference as delegate value: MethodName used as a value
-         * (not called) → return the function pointer */
+         * (not called) → return the function pointer. Only static methods are
+         * usable this way: an instance method needs a receiver, which the
+         * delegate representation cannot carry yet (A33), so invoking it would
+         * crash. Reject instead of emitting the pointer. */
         if (g->current_type_sym) {
             zan_symbol_t *method_sym = get_method_sym(g->current_type_sym, expr->ident.name);
             if (method_sym) {
+                if (method_sym->decl && method_sym->decl->kind == AST_METHOD_DECL &&
+                    (method_sym->decl->method_decl.modifiers & MOD_STATIC) == 0) {
+                    zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+                        "instance method '%.*s' cannot be used as a value: "
+                        "delegates cannot capture a receiver yet",
+                        (int)expr->ident.name.len, expr->ident.name.str);
+                    return LLVMConstNull(
+                        LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0));
+                }
                 for (int fi = irgen_find_function(g, method_sym); fi >= 0; fi = -1) {
                     if (g->functions[fi].sym == method_sym) {
                         return g->functions[fi].fn;
@@ -2552,6 +2564,26 @@ static LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr
                 }
             }
         }
+        /* instance method group used as a value — `Act a = this.Touch;` or
+         * `Act a = obj.Touch;`. The delegate representation has no receiver
+         * slot, so invoking it would call the method with a garbage/absent
+         * `this` and crash (A33). Static method groups were handled above.
+         * Reject instead of silently lowering to 0. */
+        {
+            zan_symbol_t *cls = expr_class_sym(g, expr->member.object, locals);
+            if (cls) {
+                zan_symbol_t *ms = get_method_sym(cls, expr->member.name);
+                if (ms && ms->decl && ms->decl->kind == AST_METHOD_DECL &&
+                    (ms->decl->method_decl.modifiers & MOD_STATIC) == 0) {
+                    zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+                        "instance method group '%.*s' cannot be used as a value: "
+                        "delegates cannot capture a receiver yet",
+                        (int)expr->member.name.len, expr->member.name.str);
+                    return LLVMConstNull(
+                        LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0));
+                }
+            }
+        }
         return LLVMConstInt(LLVMInt64TypeInContext(g->ctx), 0, 0);
     return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
 }
@@ -4156,10 +4188,15 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
             return LLVMBuildLoad2(g->builder, LLVMGetAllocatedType(g->current_this),
                 g->current_this, "this");
         }
-        LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder));
-        if (LLVMCountParams(fn) > 0) {
-            return LLVMGetParam(fn, 0);
-        }
+        /* No receiver is bound: inside a lambda (non-capturing, A33) `this` was
+         * silently lowered to param 0 / null and crashed on first field access.
+         * A static method/initializer has no receiver at all. Reject instead of
+         * emitting garbage. */
+        zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+            "cannot use 'this' here: %s has no receiver binding",
+            g->lambda_depth > 0
+                ? "a lambda cannot capture 'this' (lambdas are non-capturing)"
+                : "a static context");
         return LLVMConstNull(LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0));
     }
 
@@ -4169,10 +4206,11 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
             return LLVMBuildLoad2(g->builder, LLVMGetAllocatedType(g->current_this),
                 g->current_this, "this");
         }
-        LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder));
-        if (LLVMCountParams(fn) > 0) {
-            return LLVMGetParam(fn, 0);
-        }
+        zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+            "cannot use 'base' here: %s has no receiver binding",
+            g->lambda_depth > 0
+                ? "a lambda cannot capture 'this' (lambdas are non-capturing)"
+                : "a static context");
         return LLVMConstNull(LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0));
     }
 
@@ -4245,6 +4283,7 @@ static LLVMValueRef emit_lambda_typed(zan_irgen_t *g, zan_ast_node_t *expr,
     g->throw_catch_base = 0;
     g->current_this = NULL;
     g->current_async_frame = NULL;
+    g->lambda_depth++;
 
     local_scope_t lambda_locals;
     local_scope_init(&lambda_locals, g->arena);
@@ -4300,6 +4339,7 @@ static LLVMValueRef emit_lambda_typed(zan_irgen_t *g, zan_ast_node_t *expr,
     g->throw_catch_base = saved_throw_cb;
     g->current_this = saved_this;
     g->current_async_frame = saved_async_frame;
+    g->lambda_depth--;
     LLVMPositionBuilderAtEnd(g->builder, saved_bb);
     free(param_types);
     free(ptypes);

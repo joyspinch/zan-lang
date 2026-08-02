@@ -805,8 +805,17 @@ class DockHost {
         if (hasR) { rw = rightW; hr = hs; }
         if (hasB) { bh = bottomH; hb = hs; }
 
-        if (hasL && lw < minSide) { lw = minSide; }
-        if (hasR && rw < minSide) { rw = minSide; }
+        // A minimized window reports a tiny client rect (e.g. 237x39) and a
+        // window can be resized far below what the side panels need. The
+        // clamps below are display-only in that case: writing the clamped
+        // width back would permanently shrink panels the user sized, so
+        // minimize -> restore would jump every split to its minimum. Only
+        // persist an extent that was actually laid out unclamped.
+        bool lClamped = false;
+        bool rClamped = false;
+        bool bClamped = false;
+        if (hasL && lw < minSide) { lw = minSide; lClamped = true; }
+        if (hasR && rw < minSide) { rw = minSide; rClamped = true; }
         int budget = a.width - hl - hr - minCenter;
         if (budget < 0) { budget = 0; }
         int over = lw + rw - budget;
@@ -814,21 +823,23 @@ class DockHost {
             int cut = over;
             if (cut > rw) { cut = rw; }
             rw = rw - cut;
+            if (cut > 0) { rClamped = true; }
             over = over - cut;
             if (over > 0) {
                 lw = lw - over;
                 if (lw < 0) { lw = 0; }
+                lClamped = true;
             }
         }
         if (hasB) {
             int maxB = a.height - hb - app.Scale(120);
-            if (bh > maxB) { bh = maxB; }
-            if (bh < minBottom) { bh = minBottom; }
-            if (bh < 0) { bh = 0; }
+            if (bh > maxB) { bh = maxB; bClamped = true; }
+            if (bh < minBottom) { bh = minBottom; bClamped = true; }
+            if (bh < 0) { bh = 0; bClamped = true; }
         }
-        if (hasL) { leftW = lw; }
-        if (hasR) { rightW = rw; }
-        if (hasB) { bottomH = bh; }
+        if (hasL && !lClamped) { leftW = lw; }
+        if (hasR && !rClamped) { rightW = rw; }
+        if (hasB && !bClamped) { bottomH = bh; }
 
         int midX = a.x + lw + hl;
         int midW = a.width - lw - hl - rw - hr;
@@ -899,6 +910,12 @@ class DockHost {
         total = total - hs * (n - 1);
         if (total < n) { total = n; }
         int minG = app.Scale(56);
+        // A window too small to give every group its minimum (a minimized
+        // window reports a tiny client rect, e.g. 237x39) must not rescale the
+        // persisted extents either: the layout is display-only while the
+        // window is unusable, so restore never moves the user's split
+        // positions. `tiny` keeps the extent writes below from landing.
+        bool tiny = minG * n > total;
         if (minG * n > total) { minG = total / n; }
 
         // Materialise extents from weights the first time, then keep their sum
@@ -912,7 +929,7 @@ class DockHost {
             else { sum = sum + gs[i].extent; }
             i = i + 1;
         }
-        if (unset > 0) {
+        if (unset > 0 && !tiny) {
             int rest = total - sum;
             if (rest < unset * minG) { rest = unset * minG; }
             if (wsum <= 0) { wsum = unset; }
@@ -926,7 +943,7 @@ class DockHost {
                 i = i + 1;
             }
         }
-        if (sum != total && sum > 0) {
+        if (sum != total && sum > 0 && !tiny) {
             int acc = 0;
             i = 0;
             while (i < n - 1) {
@@ -951,7 +968,10 @@ class DockHost {
                 if (vertical) { ext = r.Bottom() - pos; }
                 else { ext = r.Right() - pos; }
                 if (ext < 1) { ext = 1; }
-                g.extent = ext;
+                // The last group always absorbs the remainder, but that
+                // remainder is only a real size when the window is big enough
+                // to lay out normally; while tiny it is display-only.
+                if (!tiny) { g.extent = ext; }
             }
             if (vertical) { g.bounds = Rect.Create(r.x, pos, r.width, ext); }
             else { g.bounds = Rect.Create(pos, r.y, ext, r.height); }
@@ -1012,15 +1032,12 @@ class DockHost {
         g.header = Rect.Create(b.x, b.y, b.width, hh);
         g.body = Rect.Create(b.x, b.y + hh, b.width, b.height - hh);
 
-        if (g.side != DockSide.Center()) {
-            // The dock owns the pane surface, so every panel shares one
-            // material: under a glass skin App.FillChrome frosts the backdrop
-            // (blur + the themed tint), otherwise it is a plain themed fill.
-            // Hosts never paint their own surface on top of this -- the panel
-            // content renders directly into `body`, and a second fill there
-            // would read as a different material beside its neighbours.
-            app.FillChrome(b.x, b.y, b.width, b.height, 0, t.bgTertiary);
-        }
+        // The dock owns every pane surface, the fixed center included: a
+        // translucent host (docs, start page) reads as the same material as
+        // its neighbours instead of letting the window wallpaper show through
+        // as a darker, busier surface. Hosts that paint their own surface
+        // (the editor fills the document area) simply cover it.
+        app.FillChrome(b.x, b.y, b.width, b.height, 0, t.bgTertiary);
         if (!chrome) {
             ap.body = g.body;
             return;

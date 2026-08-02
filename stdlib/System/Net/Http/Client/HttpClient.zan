@@ -624,6 +624,12 @@ class HttpClient {
         nint outfp = fopen(outFile, "ab");
 
         bool finished = false;
+        // A stream only counts as done when the peer said so: the [DONE] sentinel
+        // (or, for chunked replies, the terminating zero-size chunk). A 0-byte
+        // read means the connection dropped mid-stream -- the model may have
+        // been cut off before finishing -- so that is a retryable failure, not
+        // a success, and the caller (AiNet.Worker) will retry it.
+        bool cleanEnd = false;
         string doneScan = "";
         bool sawDone = false;
         while (!finished) {
@@ -638,6 +644,7 @@ class HttpClient {
                         int size = HttpClient.ParseHex(sizeLine);
                         if (size == 0) {
                             finished = true;
+                            cleanEnd = true;
                             progressed = false;
                         } else {
                             int need = crlf + 2 + size + 2;
@@ -674,7 +681,7 @@ class HttpClient {
                     pending = "";
                 }
             }
-            if (sawDone) { finished = true; }
+            if (sawDone) { finished = true; cleanEnd = true; }
             if (finished) {
                 // reached the terminal chunk
             } else {
@@ -706,6 +713,10 @@ class HttpClient {
 
         if (late) {
             HttpClient.AppendText(doneFile, "err: timeout");
+        } else if (!cleanEnd) {
+            // The peer closed before the terminal chunk: the stream was cut
+            // off, so surface it as a retryable failure instead of a success.
+            HttpClient.AppendText(doneFile, "err: connection closed");
         } else if (status >= 200 && status < 300) {
             HttpClient.AppendText(doneFile, "ok");
         } else if (status == 0) {

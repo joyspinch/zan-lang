@@ -442,6 +442,11 @@ class AiAgent {
         return sb.ToString();
     }
 
+    /// Recursive grep walk. Directory.GetDirectories/GetFiles return bare
+    /// entry names, so each recursion re-joins the full path -- a bare name
+    /// would be resolved against the process working directory, which is not
+    /// guaranteed to be the project root, and File.GetSize/ReadAllText would
+    /// then throw on a file that is actually there.
     static void GrepDir(string dir, string root, string pattern, string ext,
                         List<string> hits, int depth) {
         if (hits.Count >= 80 || depth > 8) { return; }
@@ -451,14 +456,15 @@ class AiAgent {
             string name = Path.GetFileName(files[f]);
             bool want = AiAgent.TextFile(name);
             if (ext != "" && AiAgent.ExtOf(name) != ext) { want = false; }
-            if (want) { AiAgent.GrepFile(files[f], root, pattern, hits); }
+            if (want) { AiAgent.GrepFile(dir + "/" + name, root, pattern, hits); }
             f = f + 1;
         }
         List<string> dirs = Directory.GetDirectories(dir);
         int d = 0;
         while (d < dirs.Count && hits.Count < 80) {
-            if (!AiAgent.SkipDir(Path.GetFileName(dirs[d]))) {
-                AiAgent.GrepDir(dirs[d], root, pattern, ext, hits, depth + 1);
+            string dn = dirs[d];
+            if (!AiAgent.SkipDir(dn)) {
+                AiAgent.GrepDir(dir + "/" + dn, root, pattern, ext, hits, depth + 1);
             }
             d = d + 1;
         }
@@ -487,16 +493,66 @@ class AiAgent {
     }
 
     /// The RepoMap outline (files, classes, method signatures) produced by the
-    /// RepoMap tool, when the project has one.
+    /// RepoMap tool, when the project has one. Without one the project tree is
+    /// generated on the fly so the assistant still sees the whole project
+    /// shape before it starts reading files.
     static string RepoMap(string root) {
         string mapPath = root + "/.zanmap/repo.map.txt";
-        if (!File.Exists(mapPath)) {
-            return "error: this project has no RepoMap yet; run the RepoMap"
-                + " tool from the IDE first, or use list_dir / grep.";
+        if (File.Exists(mapPath)) {
+            string rm = File.ReadAllText(mapPath);
+            if (rm.Length > 12000) { rm = rm.Substring(0, 12000) + "\n... truncated"; }
+            return rm;
         }
-        string rm = File.ReadAllText(mapPath);
-        if (rm.Length > 12000) { rm = rm.Substring(0, 12000) + "\n... truncated"; }
-        return rm;
+        StringBuilder sb = new StringBuilder();
+        sb.Append("(no RepoMap outline yet; auto-generated project tree)\n");
+        AiAgent.AutoMap(root, sb, 0);
+        string tree = sb.ToString();
+        if (tree.Length > 12000) { tree = tree.Substring(0, 12000) + "\n... truncated"; }
+        return tree;
+    }
+
+    /// Walks `dir` appending a tree of directories and text files to `sb`.
+    /// `depth` caps recursion so a deep tree cannot blow the size budget;
+    /// files carry a line count (byte size when too large to read cheaply).
+    /// Directory.GetDirectories/GetFiles return bare entry names, so every
+    /// recursion and file access re-joins the full path (never rely on the
+    /// process working directory matching the project root).
+    static void AutoMap(string dir, StringBuilder sb, int depth) {
+        if (depth > 6 || sb.Length > 11000) { return; }
+        List<string> dirs = Directory.GetDirectories(dir);
+        int d = 0;
+        while (d < dirs.Count && sb.Length <= 11000) {
+            string name = dirs[d];
+            if (!AiAgent.SkipDir(name)) {
+                int k = 0;
+                string ind = "";
+                while (k < depth) { ind = ind + "  "; k = k + 1; }
+                sb.Append(ind + name + "/\n");
+                AiAgent.AutoMap(dir + "/" + name, sb, depth + 1);
+            }
+            d = d + 1;
+        }
+        List<string> files = Directory.GetFiles(dir);
+        int f = 0;
+        while (f < files.Count && sb.Length <= 11000) {
+            string name = Path.GetFileName(files[f]);
+            if (AiAgent.TextFile(name)) {
+                int k = 0;
+                string ind = "";
+                while (k < depth) { ind = ind + "  "; k = k + 1; }
+                int size = File.GetSize(dir + "/" + name);
+                if (size > 0 && size <= 262144) {
+                    List<string> lines = CodeEditor.SplitLines(
+                        File.ReadAllText(dir + "/" + name));
+                    sb.Append(ind + name + " ("
+                        + Convert.ToString(lines.Count) + " lines)\n");
+                } else {
+                    sb.Append(ind + name + " ("
+                        + Convert.ToString(size) + " bytes)\n");
+                }
+            }
+            f = f + 1;
+        }
     }
 
     // --- write tools ---------------------------------------------------------
@@ -608,7 +664,9 @@ class AiAgent {
             + "- list_dir {path}: entries of one directory (\"\" = project root).\n"
             + "- grep {pattern, path, ext}: substring search across the project;"
             + " returns path:line: text.\n"
-            + "- repo_map {}: outline of the whole codebase, when available.\n"
+            + "- repo_map {}: full outline of the codebase. A project tree is"
+            + " ALREADY included in this system message, so you rarely need it;"
+            + " call it only when you need a deeper tree than the one here.\n"
             + "- stdlib_read {path, offset, limit} / stdlib_grep {pattern, path,"
             + " ext}: read/search the Zan STANDARD LIBRARY source shipped with"
             + " the IDE (paths relative to the stdlib root, e.g."
@@ -709,12 +767,20 @@ class AiAgent {
         }
         if (root != "") {
             string mapPath = root + "/.zanmap/repo.map.txt";
+            string rm = "";
             if (File.Exists(mapPath)) {
-                string rm = File.ReadAllText(mapPath);
-                if (rm.Length > 8000) { rm = rm.Substring(0, 8000); }
-                sb.Append("Project structure (RepoMap outline -- files, classes"
-                    + " and method signatures):\n" + rm + "\n");
+                rm = File.ReadAllText(mapPath);
+            } else {
+                // No RepoMap outline: generate the project tree on the fly so
+                // the model still starts with the project's shape.
+                StringBuilder am = new StringBuilder();
+                am.Append("(auto-generated project tree; no RepoMap outline)\n");
+                AiAgent.AutoMap(root, am, 0);
+                rm = am.ToString();
             }
+            if (rm.Length > 8000) { rm = rm.Substring(0, 8000); }
+            sb.Append("Project structure (RepoMap outline -- files, classes"
+                + " and method signatures):\n" + rm + "\n");
         }
         return sb.ToString();
     }

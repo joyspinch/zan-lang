@@ -48,6 +48,10 @@ struct zan_irgen {
     zan_symbol_t *current_type_sym;  /* type symbol for 'this' */
     zan_ast_node_t *current_fn_body; /* root AST body of the fn being compiled */
     bool current_fn_no_runtime;      /* [NoRuntime]: emit no ARC in this body */
+    /* >0 while emitting a lambda body: lambdas are non-capturing, so current_this
+     * is NULL inside them and a `this`/`base` reference would silently load a
+     * garbage receiver (A33). Emitting AST_THIS_EXPR checks this to reject. */
+    int lambda_depth;
 
     /* runtime function declarations */
     LLVMValueRef rt_println;   /* zan_rt_println(const char*) */

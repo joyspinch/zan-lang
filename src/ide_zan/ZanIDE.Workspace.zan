@@ -256,10 +256,52 @@ partial class ZanIDE {
         return outp;
     }
 
+    /// True when `name` is usable as a new project's folder/file name:
+    /// non-empty, no Windows-reserved characters or path separators (which
+    /// would escape the parent directory or crash the scaffolding file calls),
+    /// not "." / "..", and not a reserved device name (CON, PRN, NUL, COM1-9,
+    /// LPT1-9 -- CreateDirectory fails or aliases hardware on Windows).
+    static bool IsValidProjectName(string name) {
+        if (name == "") { return false; }
+        if (name == "." || name == "..") { return false; }
+        string bad = "<>:\"/\\|?*";
+        int i = 0;
+        while (i < name.Length) {
+            string ch = name.Substring(i, 1);
+            int j = 0;
+            while (j < bad.Length) {
+                if (bad.Substring(j, 1) == ch) { return false; }
+                j = j + 1;
+            }
+            i = i + 1;
+        }
+        // Uppercase the name (ASCII only) to compare against Windows device names.
+        StringBuilder ub = new StringBuilder();
+        i = 0;
+        while (i < name.Length) {
+            string ch = name.Substring(i, 1);
+            int code = ch[0] & 255;
+            if (code < 32 || code == 127) { return false; }   // control chars
+            if (code >= 97 && code <= 122) { code = code - 32; }
+            ub.Append(Text.CharStr(code));
+            i = i + 1;
+        }
+        string upper = ub.ToString();
+        string reserved = " CON PRN AUX NUL COM1 COM2 COM3 COM4 COM5 COM6 COM7 COM8 COM9 LPT1 LPT2 LPT3 LPT4 LPT5 LPT6 LPT7 LPT8 LPT9 ";
+        if (ZanIDE.Has(reserved, " " + upper + " ")) { return false; }
+        return true;
+    }
+
     /// Scaffolds a new project from a template descriptor; returns its directory.
     /// platforms is a comma-separated target-platform id list written to zan.proj.
     static string CreateProjectT(Tpl tpl, string parent, string name, string platforms, List<string> log) {
+        if (!ZanIDE.IsValidProjectName(name)) {
+            log.Add(ZanIDE.T("> Cannot create project: invalid name '",
+                "> 无法创建项目：名称非法 '") + name + "'.");
+            return "";
+        }
         string dir = parent + "/" + name;
+        try {
         // Scaffolding into an existing non-empty folder would mix template
         // files into unrelated user data, so refuse and return "" (the caller
         // keeps the wizard open).
@@ -337,6 +379,15 @@ partial class ZanIDE {
         }
         log.Add("> Created " + typeName + " project for [" + platforms + "] at " + dir + " (template: " + tpl.name + ").");
         return dir;
+        } catch (Exception e) {
+            // Any filesystem failure (permission, read-only volume, path too
+            // long, template file locked, ...) used to escape to the main loop
+            // and crash the IDE. Surface it in the Output tab and keep the
+            // wizard open instead.
+            log.Add(ZanIDE.T("> Failed to create project: ",
+                "> 创建项目失败：") + e.Message);
+            return "";
+        }
     }
 
     /// After a GUI project is scaffolded from a disk template, make sure each
@@ -1081,14 +1132,14 @@ partial class ZanIDE {
     }
 
     /// Streamed log + done-marker used by the detached (non-blocking) publish.
-    static string PubLogPath() { return ZanIDE.UserConfigDir() + "/publish.log"; }
-    static string PubDonePath() { return ZanIDE.UserConfigDir() + "/publish_done.txt"; }
+    static string PubLogPath() { return ZanIDE.CacheDir() + "/publish.log"; }
+    static string PubDonePath() { return ZanIDE.CacheDir() + "/publish_done.txt"; }
 
     /// Streamed log + done-marker for the DETACHED (non-blocking) Run/Build
     /// ribbon actions, so a slow compile (e.g. a many-file GUI app) never
     /// freezes the UI -- same pattern as the publish pipeline.
-    static string BuildLogPath() { return ZanIDE.UserConfigDir() + "/build.log"; }
-    static string BuildDonePath() { return ZanIDE.UserConfigDir() + "/build_done.txt"; }
+    static string BuildLogPath() { return ZanIDE.CacheDir() + "/build.log"; }
+    static string BuildDonePath() { return ZanIDE.CacheDir() + "/build_done.txt"; }
 
     /// Working directory for a launched program. Relative paths in a program
     /// (`config/app.json`, an example's `assets/` folder) are resolved against
@@ -1140,12 +1191,36 @@ partial class ZanIDE {
         return ZanIDE.EnsureBuildDir(root) + "/symbols.idx";
     }
 
+    /// The project's manifest-declared entry source (zan.proj `entry`), as an
+    /// absolute path. Window-app templates keep a .zform entry (never
+    /// src/main.zan), so the hardcoded main.zan fallback only applies to
+    /// projects that do not declare one. A `Name.g.zan` entry is a leftover
+    /// from the pre-formgen IDE: the .zform is the single design source (the
+    /// compiler synthesises the partial class at build time, see formgen.h),
+    /// so it is mapped back to the .zform when that file exists.
+    static string ProjectEntryPath(string root) {
+        string entry = "src/main.zan";
+        string mpath = root + "/zan.proj";
+        if (File.Exists(mpath)) {
+            entry = ZanIDE.ManifestField(File.ReadAllText(mpath), "entry", entry);
+        }
+        string full = root + "/" + entry;
+        if (ZanIDE.IsGenPath(full)) {
+            string form = full.Substring(0, full.Length - 6) + ".zform";
+            if (File.Exists(form)) { return form; }
+        }
+        if (!File.Exists(full)) { full = root + "/src/main.zan"; }
+        return full;
+    }
+
     /// Regenerates the symbol index in the background: `zanc --emit-symbols`
     /// parses the project plus the standard library and writes every type and
     /// member it found. Completion reads that instead of guessing, so it stops
     /// offering members the compiler does not have. Runs detached (it never
     /// blocks the UI) and via its own marker file, so it cannot disturb an
-    /// in-flight build's log.
+    /// in-flight build's log. The index is only installed when the compiler
+    /// exits successfully (`&&`), so a parse failure never replaces a good
+    /// index with a partial one.
     static void EmitSymbolsDetach(string root, string target) {
         string idx = ZanIDE.SymbolIndexPath(root);
         string tmp = idx + ".tmp";
@@ -1153,13 +1228,21 @@ partial class ZanIDE {
         string cmd = ZanIDE.ZancCmd() + " --emit-symbols \"" + tmp + "\" " + inputs
             + " --auto-stdlib";
         #if WINDOWS
-        string sep = " & ";
-        string mv = "move /y \"" + tmp + "\" \"" + idx + "\"";
+        string sep = " && ";
+        // cmd's built-in `move` rejects forward-slash paths (unlike zanc,
+        // which uses the C runtime), so flip the separators for the install.
+        string mvSrc = ZanIDE.ReplaceAll(tmp, "/", "\\");
+        string mvDst = ZanIDE.ReplaceAll(idx, "/", "\\");
+        string mv = "move /y \"" + mvSrc + "\" \"" + mvDst + "\"";
         #else
-        string sep = " ; ";
+        string sep = " && ";
         string mv = "mv -f \"" + tmp + "\" \"" + idx + "\"";
         #endif
-        Process.RunDetached("((" + cmd + ") > \"" + idx + ".log\" 2>&1)" + sep + mv);
+        // Log the exact command first so a failure is diagnosable from the
+        // index log (it also marks the run start).
+        File.WriteAllText(idx + ".log", "CMD: " + cmd + "\n");
+        Process.RunDetached("((" + cmd + ") >> \"" + idx + ".log\" 2>&1)" + sep + mv
+            + " >> \"" + idx + ".log\" 2>&1");
     }
 
     /// Loads the symbol index for `root` into the editor's completion engine.
@@ -1173,7 +1256,7 @@ partial class ZanIDE {
     /// BuildDonePath on completion. The main loop polls both to stream compiler
     /// output and, once done, apply diagnostics + launch the built program.
     static void BuildDetach(string cmd) {
-        Directory.CreateDirectoryRecursive(ZanIDE.UserConfigDir());
+        ZanIDE.EnsureCacheDir();
         File.WriteAllText(ZanIDE.BuildLogPath(), "");
         if (File.Exists(ZanIDE.BuildDonePath())) { File.Delete(ZanIDE.BuildDonePath()); }
         #if WINDOWS
@@ -1388,7 +1471,7 @@ partial class ZanIDE {
             if (File.Exists(exes[di])) { File.Delete(exes[di]); }
             di = di + 1;
         }
-        Directory.CreateDirectoryRecursive(ZanIDE.UserConfigDir());
+        ZanIDE.EnsureCacheDir();
         File.WriteAllText(ZanIDE.PubLogPath(), "");
         if (File.Exists(ZanIDE.PubDonePath())) { File.Delete(ZanIDE.PubDonePath()); }
         string run = "((" + seq + ") >> \"" + ZanIDE.PubLogPath() + "\" 2>&1)"
@@ -1401,24 +1484,7 @@ partial class ZanIDE {
     /// to the Output tab; returns the new consumed length (same contract as
     /// TermPoll).
     static int PubPoll(int consumed, List<string> log) {
-        if (!File.Exists(ZanIDE.PubLogPath())) { return consumed; }
-        string raw = File.ReadAllText(ZanIDE.PubLogPath());
-        if (raw.Length <= consumed) { return consumed; }
-        int last = 0 - 1;
-        int i = raw.Length - 1;
-        while (i >= consumed) {
-            if (raw.Substring(i, 1) == "\n") { last = i; i = consumed - 1; }
-            i = i - 1;
-        }
-        if (last < consumed) { return consumed; }
-        string chunk = raw.Substring(consumed, last + 1 - consumed);
-        List<string> nl = CodeEditor.SplitLines(chunk);
-        int k = 0;
-        while (k < nl.Count) {
-            if (!(k == nl.Count - 1 && nl[k] == "")) { log.Add(nl[k]); }
-            k = k + 1;
-        }
-        return last + 1;
+        return ZanIDE.PollLogFile(ZanIDE.PubLogPath(), consumed, log);
     }
 
     /// Registers a clickable hit region for a dialog button so the shared

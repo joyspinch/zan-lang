@@ -1467,7 +1467,12 @@ static LLVMValueRef get_class_tid_global(zan_irgen_t *g, zan_symbol_t *sym) {
 
 /* i1 __zan_eh_tid_match(i8* thrown, i8* want): walks the thrown descriptor's
  * base chain looking for `want`. A null thrown descriptor (string / legacy
- * throw) matches any clause, preserving pre-dispatch behaviour. */
+ * throw) matches NO typed clause: the object is not an Exception subclass, so
+ * binding it to a typed catch variable (and then reading fields off it, e.g.
+ * e.Message) would dereference string data as an object and crash. A string
+ * throw is only caught by an untyped `catch { }` (or a non-class clause like
+ * `catch (string s)`), which the emitter routes straight to its body without
+ * calling this function. */
 static LLVMValueRef get_eh_tid_match_fn(zan_irgen_t *g) {
     LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "__zan_eh_tid_match");
     if (fn) return fn;
@@ -1490,7 +1495,7 @@ static LLVMValueRef get_eh_tid_match_fn(zan_irgen_t *g) {
     LLVMBuildStore(g->builder, thrown, cur);
     LLVMValueRef thrown_null = zan_icmp(g->builder, LLVMIntEQ, thrown,
         LLVMConstNull(i8ptr), "tnull");
-    LLVMBuildCondBr(g->builder, thrown_null, yes, loop);
+    LLVMBuildCondBr(g->builder, thrown_null, no, loop);
     LLVMPositionBuilderAtEnd(g->builder, loop);
     LLVMValueRef c = LLVMBuildLoad2(g->builder, i8ptr, cur, "c");
     LLVMValueRef cnull = zan_icmp(g->builder, LLVMIntEQ, c,

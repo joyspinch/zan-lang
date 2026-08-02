@@ -2883,9 +2883,19 @@ leakcheck 子集全部通过；生成 IR 不含 `setjmp`/`longjmp`/`__zan_eh_tmp
 
 **任务**：
 
-1. [ ] A33-1 立刻堵住静默崩溃：lambda 体内引用 `this`/外层局部，或把实例方法组赋给委托时，
-   在 checker 报错（`ZAN####`），并加 `tests/conformance` 的 diag 用例。
+1. [x] A33-1 立刻堵住静默崩溃：lambda 体内引用 `this`/外层局部，或把实例方法组赋给委托时，
+   在 checker 报错，并加 `tests/conformance` 的 diag 用例。
    这一步不引入新能力，只把崩溃变成诊断。
+   **已实现（2026-08-02）**：`irgen_expr.c` 三处诊断——`emit_lambda_typed` 内
+   `this`/`base` 引用报 `cannot use 'this' here: a lambda cannot capture 'this'
+   (lambdas are non-capturing)`（新增 `g->lambda_depth` 区分 lambda 与静态上下文）；
+   `emit_expr_member_access` 报 `instance method group 'X' cannot be used as a value:
+   delegates cannot capture a receiver yet`；`emit_ident` 对裸实例方法名报同样诊断。
+   捕获外层局部原本就走 binder 的 `use of undeclared identifier`。四个探针
+   （`_scratch/a33*.zan`）从静默崩溃变为编译错误。
+   **测试**：`tests/diag/lambda_capture_this.zan` / `lambda_capture_local.zan` /
+   `instance_method_group.zan` / `instance_method_ident.zan`，注册为
+   `diag_a33_*` 四个用例，`ctest -R diag_` 19/19 通过。
 2. [ ] A33-2 委托带 receiver/env（能力项）：委托值改成「裸函数指针 或 闭包记录」两态，
    闭包记录持 `fn + env`，调用点按低位标记分派；实例方法组的 env 就是 receiver，
    捕获 lambda 的 env 是按值捕获的记录（引用类型按 ARC retain）。
@@ -2952,3 +2962,119 @@ Windows 本机走 `ld -m i386pep` + `crt2.o/crtbegin.o/crtend.o`；Linux 交叉�
 3. [ ] A34-3 库的消费侧：同一 zan.proj 内 SmartInputs 已支持把兄弟 `.zan`
    一起编译（源码复用）；A34-1/2 之后补「引用已编译库」的 `--link-lib`/
    `link =` 路径，与 `[DllImport]` 消费外部原生库的既有机制对齐。
+
+# A35 · 同一方法内多次 try/catch/finally + 调用含 finally 的方法 → LLVM "Incorrect number of arguments"（2026-08-02，已修复）
+
+**发现**：IDE 会话持久化迁移到 SQLite 时，`ZanIDE.LoadAiSessions()` 在
+**两段独立的 try/catch/finally**（一段迁移 JSON 临时块、一段读库块）之外，
+于迁移块内调用含 finally 的 `SaveAiSessions()`（自身又是 try/catch/finally），
+编译报：
+
+```
+stdlib/Gui/Backend/Native.zan:0:0: error: LLVM verification failed in
+ZanIDE_LoadAiSessions: Incorrect number of arguments passed to called function!
+```
+
+**已排除**（用 `_scratch/sqprobe/` 探针逐级逼近，全部正常编译运行）：
+SQLite 调用本身、`DbParams` 链式调用、`DbResult` 遍历、try+return+finally、
+同函数多 try/finally、catch 内赋值、`JsonValue` 迁移模式、索引赋值等——
+最小探针无法复现，仅在 IDE 大模块（`ZanIDE.zan` 数万行、跨 partial 文件）
+中出现，怀疑与 IR 栈帧/异常槽在**大函数 + 多异常区 + 嵌套调用含 finally
+方法**时的参数计数有关。
+
+**临时形状（已清理）**：见下方任务 A35-2 说明；迁移块曾改为不直接调用，
+由主循环 1 秒节流自动保存。
+
+**任务**：
+
+1. [x] A35-1 在 `_scratch/` 找到一个能触发该 IR 错误的最小复现（需要逼近
+   IDE 的模块规模或 EH 区数量），定位 `src/compiler/irgen_emit.c` 中
+   `finally` 补偿/调用参数计数的根因。
+   **结论（2026-08-02）**：无法再构造最小复现——把 `LoadAiSessions` 迁移块内的
+   `SaveAiSessions()` 直接调用**恢复**后，`--emit-ir` 全量 IR 生成 + LLVM
+   verify 通过（`ZanIDE_LoadAiSessions` 体内第 657136 行可见
+   `call void @ZanIDE_SaveAiSessions(ptr %this120)`），完整 IDE 构建
+   `IDE_BUILD_OK`。判定为被 A36（`__zan_eh_tid_match` null 描述符语义）与
+   A37（`emit_eh_propagate_tail` finally 内 throw 传播调用生成）顺带修复：
+   这两处改动都触及 finally 内 throw 传播路径的调用参数生成，正是 A35 报
+   "Incorrect number of arguments" 的代码面。
+2. [x] A35-2 修复后，把 `LoadAiSessions` 迁移块恢复为直接调用
+   `SaveAiSessions()`，并删掉本条目中的「临时形状」说明。
+   **已恢复（2026-08-02）**：迁移块内直接 `SaveAiSessions()` 持久化，
+   「临时形状」说明已删除；IDE 全量编译链接通过。
+
+
+# A36 · finally 内 throw + 外层类型不匹配的 catch → 访问违规 0xC0000005（2026-08-02，已修复）
+
+**发现**：`try { try { throw "inner"; } finally { throw "from finally"; } } catch (Exception e) {...}`
+中，字符串异常不匹配 `catch (Exception e)`，异常从 finally 向外传播时程序崩溃
+（0xC0000005），且**不打印**任何 "Unhandled exception" 输出。
+
+**复现探针**：`_scratch/ehprobe/finprobe.zan`（见会话记录；`_scratch/` 被 ignore，
+探针文件以 exec 写入）。
+
+**根因（2026-08-02 已定位并修复）**：`__zan_eh_tid_match` 把 null 类型描述符
+（字符串 throw）当作"匹配任何子句"，于是 `catch (Exception e)` 捕获了字符串对象，
+catch body 里 `e.Message` 解引用字符串数据 → 0xC0000005。无字段访问的变体
+（`catch (Exception e) { Console.WriteLine("caught"); }`）不崩溃，确认是 catch
+绑定后访问的问题，而非传播路径。
+
+**修复**：`src/compiler/irgen_builtins.c` 的 `__zan_eh_tid_match`——null 描述符
+（字符串/legacy throw）不再匹配任何类型化子句；字符串 throw 只被未类型化
+`catch { }`（或非类子句）捕获，该类子句由发射器直接路由到 body，不经过
+tid_match。类异常的类型 dispatch（含基类链）不受影响。
+
+**验证**：`tests/conformance/string_throw_dispatch.zan`（含 A36 原始形状 + 字符串
+throw 各语义 + 类异常回归对照）。EH 相关 conformance/determinism/leakcheck 共 27
+个用例全部通过。原 finprobe 现输出 "Unhandled exception: from finally" 退出码 1，
+不再崩溃。
+
+**临时形状（已清理）**：`_scratch/ehprobe/` 探针保留备查。
+
+# A37 · 未捕获异常诊断增强（已完成，2026-08-02）
+
+**改动**：
+1. `emit_eh_propagate_tail`（finally 内 throw 无 handler 路径）现在按 in-flight
+   异常打印：字符串 throw → `Unhandled exception: <文本>`；类对象 → 
+   `Unhandled exception (class object)`；无对象 → `Unhandled exception`。原实现只打印
+   固定字符串。
+2. `AST_THROW_STMT` 的 die_bb（直接 throw 无 handler 路径）原按 `val` 是否为 i8*
+   判断，类对象指针也被当字符串打印出垃圾；改为按类型描述符（null = string）区分，
+   与 propagate tail 输出一致。
+3. IDE `Main()` 外层加 try/catch 兜底：未捕获异常写入 `<exe>/cache/ide_error.log`
+   并弹 MessageBox（Windows），不再静默退出。catch 块只做字段访问和无 finally 的调用
+   （规避 A35：大模块 try 区内调用含 finally 方法无法编译）。
+
+**验证**：`_scratch/ehprobe/ehprobe.zan`（字符串）→ "Unhandled exception: the disk is
+on fire"；`clsprobe.zan`（类对象）→ "Unhandled exception (class object)"；IDE 构建
+IDE_BUILD_OK。遗留 A36 崩溃场景与本次改动无关（改动前同样崩溃）。
+
+# A38 · event/record 降级生成源码被未初始化栈内存污染 → "unexpected character '\0'"（2026-08-02，已修复）
+
+**现象**：`tests/conformance/events.zan` 编译报大量 `unexpected character '\0' (0x00)`，
+行号固定在生成源码第 19 行（`void Invoke(`）附近，列号从 17 连续递增；`--dump-tokens`
+却完全正常（不触发降级路径）。`stash` 全部改动后依旧复现，与 A33/A35 无关。
+
+**根因**（C 未定义行为）：`parser.c` 的 `zsrc_append(char *buf, int cap, int *off, ...)`
+通过 `*off` 记账，而调用点写成 `n += zsrc_append(buf, cap, &n, ...)`。复合赋值
+`n += f(&n)` 中，`n` 旧值的读取与函数调用的求值顺序未指定；MinGW GCC 实际先调用函数
+（`*off` 已把 `n` 累加）再读 `n`，结果每次调用**双倍记账**（`n = n_已改 + w`）。
+于是写入位置跳跃（如 620 → 1240 → 1640），中间全是未初始化栈字节（NUL + 指针垃圾），
+`zan_arena_strdup` 连同垃圾一起复制，lexer 重新解析生成源码时报 NUL 错误，且因为
+file_id=0，错误行号/源码行错乱显示成主文件。`gen_event_holder`（event 降级）、
+`gen_record_class`（record 降级）、`tref_write`（类型引用序列化）共 25 处命中。
+
+**修复**（`src/compiler/parser.c`）：
+1. 25 处 `n += zsrc_append(buf, cap, &n, ...)` 改为 `zsrc_append(buf, cap, &n, ...)`
+   （函数内部已通过指针更新 `n`，返回值不再被接收）。
+2. `zsrc_append` 返回值改为 `void` 并在注释里写明禁用 `n += zsrc_append(&n)` 写法，
+   今后误用会直接编译报错，从根上防止复发。
+3. `tref_write` 递归调用 `n += tref_write(buf + n, cap - n, ...)` 是纯值调用，保留。
+
+**验证**：
+- `build/zanc tests/conformance/events.zan --auto-stdlib` 编译通过；
+  运行输出 `none / hi / bye / lambda / 3 / hi / lambda / payload`，订阅、Count、移除、
+  带参事件全部正确。
+- `ctest --test-dir build -R "conformance_(events|delegate|record)"` 4/4 通过。
+- 全库无其他 `+= f(&var)` 同类模式（dbgen/routegen/jsongen 用结构体 buf，安全）。
+
