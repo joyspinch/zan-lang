@@ -1,0 +1,60 @@
+// Verifies a Zan delegate can be handed to Win32 as an enumeration callback
+// (__stdcall, invoked synchronously on the calling thread): EnumWindows walks
+// every top-level window and calls back per window. This is the trampoline
+// question the aardio migration plan flags as its biggest prerequisite --
+// hooks, EnumDisplayMonitors, directory watchers all need the same shape.
+// The callback counts windows and collects the first few titles.
+using System;
+
+#if WINDOWS
+namespace Conf;
+
+delegate int EnumWindowsProc(nint hwnd, nint lParam);
+
+class Prog {
+    [DllImport("user32", EntryPoint = "EnumWindows")]
+    static extern int EnumWindows(EnumWindowsProc cb, nint lParam);
+
+    [DllImport("user32", EntryPoint = "GetWindowTextLengthW")]
+    static extern int GetWindowTextLengthW(nint hwnd);
+
+    [DllImport("user32", EntryPoint = "GetWindowTextW")]
+    static extern int GetWindowTextW(nint hwnd, nint buf, int max);
+
+    static int count;
+    static List<string> titles;
+
+    static int OnWindow(nint hwnd, nint lParam) {
+        Prog.count = Prog.count + 1;
+        int len = Prog.GetWindowTextLengthW(hwnd);
+        if (len > 0 && Prog.titles.Count < 3) {
+            nint buf = NativeMemory.Alloc(len * 2 + 2);
+            Prog.GetWindowTextW(hwnd, buf, len + 1);
+            Prog.titles.Add(Wide.Read(buf));
+            NativeMemory.Free(buf);
+        }
+        return 1;   // keep enumerating
+    }
+
+    static void Main() {
+        Prog.titles = new List<string>();
+        Prog.count = 0;
+        EnumWindowsProc cb = Prog.OnWindow;
+        EnumWindows(cb, 0);
+        // Deterministic assertion: the callback must have been invoked at
+        // least once (any interactive Windows session has top-level windows).
+        // The absolute count varies by machine, so it is not part of the
+        // golden output.
+        Console.WriteLine("callback: " + Convert.ToString(Prog.count > 0 ? 1 : 0));
+        Console.WriteLine("title-read: " + Convert.ToString(Prog.titles.Count > 0 ? 1 : 0));
+    }
+}
+#else
+namespace Conf;
+class Prog {
+    static void Main() {
+        Console.WriteLine("windows: 0");
+        Console.WriteLine("first-title: (none)");
+    }
+}
+#endif

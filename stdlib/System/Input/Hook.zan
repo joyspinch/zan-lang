@@ -1,0 +1,198 @@
+using System;
+using System.Threading;
+
+namespace System.Input;
+
+/// <summary>
+/// True when a low-level keyboard event is consumed (the event is swallowed,
+/// nothing downstream sees it). Return false to let the event through.
+/// `vk`/`scan` are the key code and hardware scan code, `flags` the LLKHF_*
+/// bits, `injected` tells synthetic (SendInput) events apart from physical
+/// ones, `keyUp` is true for a key release.
+/// </summary>
+delegate bool KeyboardHookCallback(int vk, int scan, int flags, bool injected,
+                                   bool keyUp);
+
+/// <summary>
+/// True when a low-level mouse event is consumed. `x`/`y` are screen
+/// coordinates, `msg` the WM_* mouse message id (WM_LBUTTONDOWN, ...),
+/// `data` the wheel delta or X-button index, `injected` marks synthetic
+/// events.
+/// </summary>
+delegate bool MouseHookCallback(int x, int y, int msg, int data, bool injected);
+
+#if WINDOWS
+/// The native low-level hook proc (WINAPI calling convention).
+delegate nint HookProc(int code, nint wp, nint lp);
+#endif
+
+/// <summary>
+/// Global low-level keyboard/mouse hooks (WH_KEYBOARD_LL / WH_MOUSE_LL).
+/// A dedicated background thread installs the hook and runs a GetMessage
+/// loop, which is where the OS dispatches low-level hook callbacks; the
+/// callback runs on that thread. Return true from the callback to swallow
+/// the event (e.g. a hotkey that should not also reach the active app).
+///
+/// Only ONE hook (keyboard or mouse) can be installed at a time; install
+/// the other after Uninstall. The callback is a plain static method --
+/// delegates cannot capture state, so keep per-callback data in static
+/// fields, exactly like Thread.Start workers.
+///
+/// Non-Windows builds expose the same API and throw
+/// PlatformNotSupportedException.
+/// </summary>
+class Hook {
+    #if WINDOWS
+    [DllImport("user32", EntryPoint = "SetWindowsHookExW")]
+    static extern nint SetWindowsHookExW(int idHook, HookProc lpfn, nint hmod,
+                                         int dwThreadId);
+
+    [DllImport("user32", EntryPoint = "UnhookWindowsHookEx")]
+    static extern int UnhookWindowsHookEx(nint hhk);
+
+    [DllImport("user32", EntryPoint = "CallNextHookEx")]
+    static extern nint CallNextHookEx(nint hhk, int code, nint wp, nint lp);
+
+    [DllImport("user32", EntryPoint = "GetMessageW")]
+    static extern int GetMessageW(nint msg, nint hwnd, int min, int max);
+
+    [DllImport("user32", EntryPoint = "PostThreadMessageW")]
+    static extern int PostThreadMessageW(int threadId, int msg, nint wp, nint lp);
+
+    [DllImport("kernel32", EntryPoint = "GetCurrentThreadId")]
+    static extern int GetCurrentThreadId();
+
+    // The native hook proc. Held in a static field so ARC never frees the
+    // delegate while user32 still has its address.
+    static HookProc hookProc;
+
+    static nint hookHandle;
+    static int hookKind;       // 13 = keyboard, 14 = mouse
+    static int hookThreadId;
+    static int wantUnhook;
+    static int threadFailed;
+
+    static KeyboardHookCallback keyboardCb;
+    static MouseHookCallback mouseCb;
+    #endif
+
+    /// <summary>Installs a low-level keyboard hook. True when the hook is
+    /// live. Returns false if one is already installed.</summary>
+    static bool InstallKeyboard(KeyboardHookCallback cb) {
+        #if WINDOWS
+        return Hook.Install(13, cb, null);
+        #else
+        throw new PlatformNotSupportedException(
+            "Hook.InstallKeyboard is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>Installs a low-level mouse hook. True when the hook is
+    /// live. Returns false if one is already installed.</summary>
+    static bool InstallMouse(MouseHookCallback cb) {
+        #if WINDOWS
+        return Hook.Install(14, null, cb);
+        #else
+        throw new PlatformNotSupportedException(
+            "Hook.InstallMouse is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>Uninstalls the hook and joins the hook thread. Safe to call
+    /// when nothing is installed.</summary>
+    static void Uninstall() {
+        #if WINDOWS
+        if (Hook.hookHandle == 0) { return; }
+        Hook.wantUnhook = 1;
+        // Wake the GetMessage loop; the thread unhooks and exits on its own.
+        Hook.PostThreadMessageW(Hook.hookThreadId, 0x0012 /*WM_QUIT*/, 0, 0);
+        while (Hook.hookHandle != 0) { Thread.Sleep(1); }
+        Hook.wantUnhook = 0;
+        Hook.keyboardCb = null;
+        Hook.mouseCb = null;
+        #else
+        throw new PlatformNotSupportedException(
+            "Hook.Uninstall is not implemented on this platform");
+        #endif
+    }
+
+    #if WINDOWS
+    static bool Install(int kind, KeyboardHookCallback kcb, MouseHookCallback mcb) {
+        if (Hook.hookHandle != 0) { return false; }
+        Hook.keyboardCb = kcb;
+        Hook.mouseCb = mcb;
+        Hook.hookKind = kind;
+        Hook.wantUnhook = 0;
+        Hook.threadFailed = 0;
+        Thread.Start(Hook.HookThreadEntry);
+        // Wait until the hook is live (or the thread failed to install it).
+        int waited = 0;
+        while (Hook.hookHandle == 0 && Hook.threadFailed == 0 && waited < 3000) {
+            Thread.Sleep(1);
+            waited = waited + 1;
+        }
+        if (Hook.hookHandle == 0) {
+            Hook.keyboardCb = null;
+            Hook.mouseCb = null;
+            return false;
+        }
+        return true;
+    }
+
+    /// Runs on the hook thread: installs, then pumps GetMessage forever.
+    static void HookThreadEntry() {
+        int kind = Hook.hookKind;
+        int tid = Hook.GetCurrentThreadId();
+        Hook.hookThreadId = tid;
+        Hook.hookProc = Hook.HookProcImpl;
+        nint h = Hook.SetWindowsHookExW(kind, Hook.hookProc, 0, 0);
+        if (h == 0) {
+            Hook.threadFailed = 1;
+            return;
+        }
+        Hook.hookHandle = h;
+        nint msg = NativeMemory.Alloc(64);
+        while (Hook.wantUnhook == 0) {
+            int r = Hook.GetMessageW(msg, 0, 0, 0);
+            if (r <= 0) { break; }
+            // Low-level hook callbacks fire inside GetMessage; nothing else
+            // needs dispatching (LL hooks see events before the target
+            // window's queue).
+        }
+        NativeMemory.Free(msg);
+        Hook.UnhookWindowsHookEx(h);
+        Hook.hookHandle = 0;
+    }
+
+    /// The OS-invoked hook proc (runs on the hook thread).
+    static nint HookProcImpl(int code, nint wp, nint lp) {
+        if (code >= 0) {
+            if (Hook.hookKind == 13 && Hook.keyboardCb != null) {
+                // KBDLLHOOKSTRUCT (x64): vkCode, scanCode, flags, time, extra.
+                Span<int> k = new Span<int>(lp, 6);
+                int vk = k[0];
+                int scan = k[1];
+                int flags = k[2];
+                bool injected = (flags & 0x10) != 0;   // LLKHF_INJECTED
+                bool up = (flags & 0x80) != 0;         // LLKHF_UP
+                if (Hook.keyboardCb(vk, scan, flags, injected, up)) {
+                    return (nint)1;   // swallow
+                }
+            } else if (Hook.hookKind == 14 && Hook.mouseCb != null) {
+                // MSLLHOOKSTRUCT (x64): pt.x, pt.y, mouseData, flags, time,
+                // extra.
+                Span<int> m = new Span<int>(lp, 8);
+                int x = m[0];
+                int y = m[1];
+                int data = m[2];
+                int flags = m[3];
+                bool injected = (flags & 0x01) != 0;   // LLMHF_INJECTED
+                if (Hook.mouseCb(x, y, (int)wp, data, injected)) {
+                    return (nint)1;
+                }
+            }
+        }
+        return Hook.CallNextHookEx(0, code, wp, lp);
+    }
+    #endif
+}

@@ -1,0 +1,433 @@
+using System;
+using System.Threading;
+
+namespace System.Input;
+
+/// <summary>
+/// Keyboard input: key macros, Unicode text, press/release/repeat, lock-key
+/// state and the VK name table. Windows injects through SendInput, so the
+/// events look like a physical keyboard to every layer (games, remote
+/// sessions, elevation prompts). Other platforms expose the same API and
+/// throw PlatformNotSupportedException.
+///
+///   Keyboard.Send("{Ctrl}{C}");        // macro: modifiers down, key, up
+///   Keyboard.SendText("你好, Zan");      // literal Unicode text
+///   Keyboard.Press(Keyboard.VK("Enter"));
+///
+/// A macro is a sequence of key names in braces (modifiers stay down until
+/// the end) and literal text outside them. Single letters and digits are
+/// pressed as keys; any other printable text is typed as Unicode. Modifiers
+/// are released in reverse order when the macro ends.
+/// </summary>
+class Keyboard {
+    /// Modifier keys, usable anywhere a VK code is accepted.
+    static int Ctrl() { return 0x11; }
+    static int Shift() { return 0x10; }
+    static int Alt() { return 0x12; }
+    static int Win() { return 0x5B; }
+
+    #if WINDOWS
+    [DllImport("user32", EntryPoint = "SendInput")]
+    static extern int WinSendInput(int count, nint inputs, int cbSize);
+
+    [DllImport("user32", EntryPoint = "GetAsyncKeyState")]
+    static extern short WinGetAsyncKeyState(int vk);
+
+    [DllImport("user32", EntryPoint = "GetKeyState")]
+    static extern short WinGetKeyState(int vk);
+
+    [DllImport("user32", EntryPoint = "GetKeyboardState")]
+    static extern int WinGetKeyboardState(nint buf);
+
+    [DllImport("user32", EntryPoint = "SetKeyboardState")]
+    static extern int WinSetKeyboardState(nint buf);
+
+    [DllImport("user32", EntryPoint = "MapVirtualKeyW")]
+    static extern int WinMapVirtualKey(int code, int mapType);
+
+    // KEYEVENTF_* flags.
+    static int FExtended() { return 0x0001; }
+    static int FKeyUp() { return 0x0002; }
+    static int FUnicode() { return 0x0004; }
+    #endif
+
+    /// <summary>Holds `vk` down.</summary>
+    static void Down(int vk) {
+        #if WINDOWS
+        Keyboard.SendKey(vk, 0);
+        #else
+        throw new PlatformNotSupportedException(
+            "Keyboard.Down is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>Releases `vk`.</summary>
+    static void Up(int vk) {
+        #if WINDOWS
+        Keyboard.SendKey(vk, Keyboard.FKeyUp());
+        #else
+        throw new PlatformNotSupportedException(
+            "Keyboard.Up is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>Presses and releases `vk` once.</summary>
+    static void Press(int vk) {
+        Keyboard.Down(vk);
+        Keyboard.Up(vk);
+    }
+
+    /// <summary>Presses and releases `vk` `n` times in a row.</summary>
+    static void Repeat(int vk, int n) {
+        int i = 0;
+        while (i < n) {
+            Keyboard.Press(vk);
+            i = i + 1;
+        }
+    }
+
+    /// <summary>Types `text` as literal Unicode input -- layout-independent
+    /// and safe for CJK and symbols (uses KEYEVENTF_UNICODE, not VK codes).</summary>
+    static void SendText(string text) {
+        #if WINDOWS
+        int i = 0;
+        while (i < text.Length) {
+            Keyboard.SendUnicode(text.Substring(i, 1), 0);
+            Keyboard.SendUnicode(text.Substring(i, 1), Keyboard.FKeyUp());
+            i = i + 1;
+        }
+        #else
+        throw new PlatformNotSupportedException(
+            "Keyboard.SendText is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>Plays a key macro; see the class docs for the format.</summary>
+    static void Send(string macro) {
+        List<int> held = new List<int>();
+        int i = 0;
+        while (i < macro.Length) {
+            string ch = macro.Substring(i, 1);
+            if (ch == "{") {
+                int close = Keyboard.IndexOf(macro, "}", i + 1);
+                if (close < 0) { break; }   // unclosed brace: stop
+                string name = macro.Substring(i + 1, close - i - 1);
+                int vk = Keyboard.VK(name);
+                if (vk != 0) {
+                    Keyboard.Down(vk);
+                    held.Add(vk);
+                }
+                i = close + 1;
+            } else if (ch == "}") {
+                i = i + 1;   // stray closing brace: ignore
+            } else {
+                // Run of literal text up to the next brace (or end).
+                int b = i;
+                while (b < macro.Length && macro.Substring(b, 1) != "{") {
+                    b = b + 1;
+                }
+                string text = macro.Substring(i, b - i);
+                if (text.Length == 1 && Keyboard.IsKeyChar(text)) {
+                    Keyboard.Press(Keyboard.CharVK(text));
+                } else if (text != "") {
+                    Keyboard.SendText(text);
+                }
+                i = b;
+            }
+        }
+        // Release modifiers in reverse order of pressing.
+        int j = held.Count - 1;
+        while (j >= 0) {
+            Keyboard.Up(held[j]);
+            j = j - 1;
+        }
+    }
+
+    /// <summary>True while `vk` is physically held down.</summary>
+    static bool IsDown(int vk) {
+        #if WINDOWS
+        return (Keyboard.WinGetAsyncKeyState(vk) & 0x8000) != 0;
+        #else
+        throw new PlatformNotSupportedException(
+            "Keyboard.IsDown is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>True when a toggle key (`CapsLock`/`NumLock`/`ScrollLock`)
+    /// is currently toggled on.</summary>
+    static bool IsToggled(int vk) {
+        #if WINDOWS
+        return (Keyboard.WinGetKeyState(vk) & 0x0001) != 0;
+        #else
+        throw new PlatformNotSupportedException(
+            "Keyboard.IsToggled is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>True when CapsLock is on.</summary>
+    static bool CapsLock() {
+        return Keyboard.IsToggled(0x14);
+    }
+
+    /// <summary>True when NumLock is on.</summary>
+    static bool NumLock() {
+        return Keyboard.IsToggled(0x90);
+    }
+
+    /// <summary>True when ScrollLock is on.</summary>
+    static bool ScrollLock() {
+        return Keyboard.IsToggled(0x91);
+    }
+
+    /// <summary>Sets CapsLock state (0x14).</summary>
+    static void SetCapsLock(bool on) {
+        Keyboard.SetToggle(0x14, on);
+    }
+
+    /// <summary>Sets NumLock state (0x90).</summary>
+    static void SetNumLock(bool on) {
+        Keyboard.SetToggle(0x90, on);
+    }
+
+    /// <summary>Sets ScrollLock state (0x91).</summary>
+    static void SetScrollLock(bool on) {
+        Keyboard.SetToggle(0x91, on);
+    }
+
+    /// <summary>Blocks until `vk` is released. Polls with a 1 ms sleep.</summary>
+    static void WaitUp(int vk) {
+        while (Keyboard.IsDown(vk)) { Thread.Sleep(1); }
+    }
+
+    /// <summary>Blocks until `vk` is pressed. Polls with a 1 ms sleep.</summary>
+    static void Wait(int vk) {
+        while (!Keyboard.IsDown(vk)) { Thread.Sleep(1); }
+    }
+
+    /// <summary>Key name to VK code. Names are case-insensitive. Recognises
+    /// modifiers, function keys, navigation keys and single letters/digits;
+    /// returns 0 for an unknown name.</summary>
+    static int VK(string name) {
+        string n = name.ToUpper();
+        if (n == "CTRL" || n == "CONTROL") { return 0x11; }
+        if (n == "SHIFT") { return 0x10; }
+        if (n == "ALT") { return 0x12; }
+        if (n == "WIN" || n == "META") { return 0x5B; }
+        if (n == "ENTER" || n == "RETURN") { return 0x0D; }
+        if (n == "ESC" || n == "ESCAPE") { return 0x1B; }
+        if (n == "TAB") { return 0x09; }
+        if (n == "BACKSPACE" || n == "BS") { return 0x08; }
+        if (n == "SPACE") { return 0x20; }
+        if (n == "DELETE" || n == "DEL") { return 0x2E; }
+        if (n == "INSERT" || n == "INS") { return 0x2D; }
+        if (n == "HOME") { return 0x24; }
+        if (n == "END") { return 0x23; }
+        if (n == "PAGEUP" || n == "PGUP") { return 0x21; }
+        if (n == "PAGEDOWN" || n == "PGDN") { return 0x22; }
+        if (n == "UP") { return 0x26; }
+        if (n == "DOWN") { return 0x28; }
+        if (n == "LEFT") { return 0x25; }
+        if (n == "RIGHT") { return 0x27; }
+        if (n == "CAPSLOCK") { return 0x14; }
+        if (n == "NUMLOCK") { return 0x90; }
+        if (n == "SCROLLLOCK") { return 0x91; }
+        // F1..F24
+        if (n.Length >= 2 && n.Substring(0, 1) == "F") {
+            int num = Keyboard.ParseInt(n.Substring(1, n.Length - 1));
+            if (num >= 1 && num <= 24) { return 0x6F + num; }
+        }
+        // Single letters / digits
+        if (n.Length == 1) {
+            int c = Keyboard.CharVK(n);
+            if (c != 0) { return c; }
+        }
+        return 0;
+    }
+
+    /// <summary>VK code to a display name ("Ctrl", "F5", "A", ...). Returns
+    /// "VK-0xNN" for codes without a name.</summary>
+    static string VKName(int vk) {
+        if (vk == 0x11) { return "Ctrl"; }
+        if (vk == 0x10) { return "Shift"; }
+        if (vk == 0x12) { return "Alt"; }
+        if (vk == 0x5B) { return "Win"; }
+        if (vk == 0x0D) { return "Enter"; }
+        if (vk == 0x1B) { return "Esc"; }
+        if (vk == 0x09) { return "Tab"; }
+        if (vk == 0x08) { return "Backspace"; }
+        if (vk == 0x20) { return "Space"; }
+        if (vk == 0x2E) { return "Delete"; }
+        if (vk == 0x2D) { return "Insert"; }
+        if (vk == 0x24) { return "Home"; }
+        if (vk == 0x23) { return "End"; }
+        if (vk == 0x21) { return "PageUp"; }
+        if (vk == 0x22) { return "PageDown"; }
+        if (vk == 0x26) { return "Up"; }
+        if (vk == 0x28) { return "Down"; }
+        if (vk == 0x25) { return "Left"; }
+        if (vk == 0x27) { return "Right"; }
+        if (vk >= 0x41 && vk <= 0x5A) {
+            return Keyboard.Letter(vk - 0x41);
+        }
+        if (vk >= 0x30 && vk <= 0x39) {
+            return Keyboard.Digit(vk - 0x30);
+        }
+        if (vk >= 0x70 && vk <= 0x87) {
+            return "F" + Convert.ToString(vk - 0x6F);
+        }
+        return "VK-0x" + Keyboard.Hex(vk);
+    }
+
+    #if WINDOWS
+    /// Sends one keyboard INPUT event (x64 INPUT layout: type + padding +
+    /// KEYBDINPUT; wVk/wScan share the 32-bit word at offset 8).
+    static void SendKey(int vk, int flags) {
+        nint input = NativeMemory.Alloc(32);
+        Span<int> w = new Span<int>(input, 8);
+        w[0] = 1;            // INPUT type: keyboard
+        int scan = 0;
+        if ((flags & Keyboard.FKeyUp()) == 0 && vk != 0) {
+            scan = Keyboard.MapScan(vk);
+        }
+        w[2] = vk + scan * 65536;   // wVk (low word) + wScan (high word)
+        w[3] = flags;        // KEYBDINPUT.dwFlags
+        w[4] = 0;            // KEYBDINPUT.time
+        // KEYBDINPUT.dwExtraInfo lives at offset 24; w[6..7] are zero-filled.
+        WinSendInput(1, input, 32);
+        NativeMemory.Free(input);
+    }
+
+    /// Sends one Unicode (KEYEVENTF_UNICODE) key event for `ch`.
+    static void SendUnicode(string ch, int flags) {
+        nint input = NativeMemory.Alloc(32);
+        Span<int> w = new Span<int>(input, 8);
+        w[0] = 1;            // INPUT type: keyboard
+        int scan = Keyboard.CodeOf(ch);
+        w[2] = scan * 65536; // wScan carries the code point (wVk = 0)
+        w[3] = flags | Keyboard.FUnicode();
+        w[4] = 0;
+        WinSendInput(1, input, 32);
+        NativeMemory.Free(input);
+    }
+    #endif
+
+    #if WINDOWS
+    /// MapVirtualKey(MAPVK_VK_TO_VSC, 0): VK code to hardware scan code.
+    static int MapScan(int vk) {
+        return Keyboard.WinMapVirtualKey(vk, 0);
+    }
+    #endif
+
+    /// Lowercase hex of `v` (no leading zeros), for VK-0x display names.
+    static string Hex(int v) {
+        if (v == 0) { return "0"; }
+        string digits = "0123456789abcdef";
+        string s = "";
+        int n = v;
+        while (n > 0) {
+            int d = n % 16;
+            s = digits.Substring(d, 1) + s;
+            n = n / 16;
+        }
+        return s;
+    }
+
+    /// Toggles a lock key to `on` by pressing it only when it is in the
+    /// wrong state (avoids an unconditional press flipping it the wrong way).
+    static void SetToggle(int vk, bool on) {
+        #if WINDOWS
+        if (Keyboard.IsToggled(vk) != on) { Keyboard.Press(vk); }
+        #else
+        throw new PlatformNotSupportedException(
+            "Keyboard lock-key control is not implemented on this platform");
+        #endif
+    }
+
+    /// True for a single letter or digit (typed as a VK press in macros).
+    static bool IsKeyChar(string ch) {
+        if (ch.Length != 1) { return false; }
+        int c = Keyboard.CodeOf(ch);
+        return (c >= 0x41 && c <= 0x5A) || (c >= 0x61 && c <= 0x7A)
+            || (c >= 0x30 && c <= 0x39);
+    }
+
+    /// VK code for a single letter/digit, 0 otherwise.
+    static int CharVK(string ch) {
+        int c = Keyboard.CodeOf(ch);
+        if (c >= 0x61 && c <= 0x7A) { return c - 0x20; }   // a-z -> A-Z VK
+        if (c >= 0x41 && c <= 0x5A) { return c; }
+        if (c >= 0x30 && c <= 0x39) { return c; }
+        return 0;
+    }
+
+    /// Code point of a one-character string (UTF-8 decode of the first byte
+    /// run; ASCII fast path). Returns 0 for an empty string.
+    static int CodeOf(string ch) {
+        if (ch.Length == 0) { return 0; }
+        nint buf = NativeMemory.Alloc(8);
+        NativeMemory.PutString(buf, 0, ch, ch.Length);
+        Span<byte> b = new Span<byte>(buf, 4);
+        int c0 = b[0];
+        int cp = 0;
+        if ((c0 & 0x80) == 0) {
+            cp = c0;
+        } else if ((c0 & 0xE0) == 0xC0 && ch.Length >= 2) {
+            cp = ((c0 & 0x1F) << 6) | (b[1] & 0x3F);
+        } else if ((c0 & 0xF0) == 0xE0 && ch.Length >= 3) {
+            cp = ((c0 & 0x0F) << 12) | ((b[1] & 0x3F) << 6) | (b[2] & 0x3F);
+        } else if ((c0 & 0xF8) == 0xF0 && ch.Length >= 4) {
+            cp = ((c0 & 0x07) << 18) | ((b[1] & 0x3F) << 12)
+                | ((b[2] & 0x3F) << 6) | (b[3] & 0x3F);
+        }
+        NativeMemory.Free(buf);
+        return cp;
+    }
+
+    /// First index of `needle` in `hay` at or after `from`, or -1.
+    static int IndexOf(string hay, string needle, int from) {
+        int n = needle.Length;
+        int h = hay.Length;
+        int i = from;
+        while (i + n <= h) {
+            if (hay.Substring(i, n) == needle) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    /// Parses a non-negative decimal integer; -1 when malformed.
+    static int ParseInt(string s) {
+        if (s.Length == 0) { return -1; }
+        int v = 0;
+        int i = 0;
+        while (i < s.Length) {
+            string ch = s.Substring(i, 1);
+            int c = Keyboard.CodeOf(ch);
+            if (c < 0x30 || c > 0x39) { return -1; }
+            v = v * 10 + (c - 0x30);
+            i = i + 1;
+        }
+        return v;
+    }
+
+    /// "A".."Z" for 0..25.
+    static string Letter(int index) {
+        int c = 0x41 + index;
+        return Keyboard.FromCode(c);
+    }
+
+    /// "0".."9" for 0..9.
+    static string Digit(int index) {
+        return Keyboard.FromCode(0x30 + index);
+    }
+
+    /// ASCII code point to a one-character string.
+    static string FromCode(int c) {
+        nint buf = NativeMemory.Alloc(2);
+        Span<byte> b = new Span<byte>(buf, 2);
+        b[0] = (byte)c;
+        string s = NativeMemory.GetString(buf, 0, 1);
+        NativeMemory.Free(buf);
+        return s;
+    }
+}

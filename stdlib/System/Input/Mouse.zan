@@ -1,0 +1,237 @@
+using System;
+using System.Drawing;
+using System.Threading;
+
+namespace System.Input;
+
+/// <summary>
+/// Mouse input: position, movement (with an optional stepped trajectory),
+/// clicks, drag and the wheel. Windows drives the real cursor through
+/// SendInput (the same path a physical device takes, so it works in
+/// elevated/remote sessions where SetCursorPos alone is ignored). Other
+/// platforms expose the same API and throw PlatformNotSupportedException,
+/// so code using it compiles and runs everywhere and fails loudly where the
+/// OS has no supported input-injection path yet.
+///
+///   Mouse.SetPos(100, 100);
+///   Mouse.MoveTo(200, 200, 12);     // 12-step eased trajectory
+///   Mouse.Click(Mouse.Left());
+///
+/// Button constants: <see cref="Left"/>, <see cref="Middle"/>,
+/// <see cref="Right"/>, <see cref="XButton1"/>, <see cref="XButton2"/>.
+/// </summary>
+class Mouse {
+    /// Primary (left) button.
+    static int Left() { return 0; }
+    /// Middle (wheel) button.
+    static int Middle() { return 1; }
+    /// Secondary (right) button.
+    static int Right() { return 2; }
+    /// First extra button (browser "back").
+    static int XButton1() { return 3; }
+    /// Second extra button (browser "forward").
+    static int XButton2() { return 4; }
+
+    #if WINDOWS
+    [DllImport("user32", EntryPoint = "GetCursorPos")]
+    static extern int WinGetCursorPos(nint pt);
+
+    [DllImport("user32", EntryPoint = "SetCursorPos")]
+    static extern int WinSetCursorPos(int x, int y);
+
+    [DllImport("user32", EntryPoint = "SendInput")]
+    static extern int WinSendInput(int count, nint inputs, int cbSize);
+
+    [DllImport("user32", EntryPoint = "GetAsyncKeyState")]
+    static extern short WinGetAsyncKeyState(int vk);
+
+    // MOUSEEVENTF_* flags (user32).
+    static int FMove() { return 0x0001; }
+    static int FLeftDown() { return 0x0002; }
+    static int FLeftUp() { return 0x0004; }
+    static int FRightDown() { return 0x0008; }
+    static int FRightUp() { return 0x0010; }
+    static int FMiddleDown() { return 0x0020; }
+    static int FMiddleUp() { return 0x0040; }
+    static int FXDown() { return 0x0080; }
+    static int FXUp() { return 0x0100; }
+    static int FWheel() { return 0x0800; }
+    static int FAbsolute() { return 0x8000; }
+
+    // VK codes for GetAsyncKeyState.
+    static int VkLeft() { return 0x01; }
+    static int VkRight() { return 0x02; }
+    static int VkMiddle() { return 0x04; }
+    static int VkX1() { return 0x05; }
+    static int VkX2() { return 0x06; }
+    #endif
+
+    /// <summary>Current cursor position in screen coordinates.</summary>
+    static Point GetPos() {
+        #if WINDOWS
+        nint pt = NativeMemory.Alloc(8);
+        WinGetCursorPos(pt);
+        Span<int> p = new Span<int>(pt, 2);
+        int x = p[0];
+        int y = p[1];
+        NativeMemory.Free(pt);
+        return Point.Create(x, y);
+        #else
+        throw new PlatformNotSupportedException(
+            "Mouse.GetPos is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>Moves the cursor to an absolute screen position.</summary>
+    static void SetPos(int x, int y) {
+        #if WINDOWS
+        WinSetCursorPos(x, y);
+        #else
+        throw new PlatformNotSupportedException(
+            "Mouse.SetPos is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>Moves the cursor to `x`,`y` in one jump.</summary>
+    static void MoveTo(int x, int y) {
+        Mouse.MoveTo(x, y, 0);
+    }
+
+    /// <summary>Moves the cursor to `x`,`y` in `steps` interpolated hops,
+    /// each with a short settle sleep. Steps 0 or 1 jump straight there.
+    /// A stepped trajectory looks like a human drag/glide instead of a
+    /// teleport, which some targets (games, remote-desktop session guards)
+    /// require.</summary>
+    static void MoveTo(int x, int y, int steps) {
+        #if WINDOWS
+        if (steps <= 1) {
+            WinSetCursorPos(x, y);
+            return;
+        }
+        Point from = Mouse.GetPos();
+        int i = 1;
+        while (i <= steps) {
+            int px = from.x + (x - from.x) * i / steps;
+            int py = from.y + (y - from.y) * i / steps;
+            WinSetCursorPos(px, py);
+            Thread.Sleep(1);
+            i = i + 1;
+        }
+        #else
+        throw new PlatformNotSupportedException(
+            "Mouse.MoveTo is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>Presses `button` down without releasing it.</summary>
+    static void Down(int button) {
+        #if WINDOWS
+        int flags = 0;
+        if (button == 0) { flags = Mouse.FLeftDown(); }
+        else if (button == 1) { flags = Mouse.FMiddleDown(); }
+        else if (button == 2) { flags = Mouse.FRightDown(); }
+        else if (button == 3 || button == 4) { flags = Mouse.FXDown(); }
+        else { throw new ArgumentException("invalid mouse button"); }
+        int data = 0;
+        if (button == 3) { data = 1; }
+        if (button == 4) { data = 2; }
+        Mouse.SendMouse(0, 0, data, flags);
+        #else
+        throw new PlatformNotSupportedException(
+            "Mouse.Down is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>Releases `button`.</summary>
+    static void Up(int button) {
+        #if WINDOWS
+        int flags = 0;
+        if (button == 0) { flags = Mouse.FLeftUp(); }
+        else if (button == 1) { flags = Mouse.FMiddleUp(); }
+        else if (button == 2) { flags = Mouse.FRightUp(); }
+        else if (button == 3 || button == 4) { flags = Mouse.FXUp(); }
+        else { throw new ArgumentException("invalid mouse button"); }
+        int data = 0;
+        if (button == 3) { data = 1; }
+        if (button == 4) { data = 2; }
+        Mouse.SendMouse(0, 0, data, flags);
+        #else
+        throw new PlatformNotSupportedException(
+            "Mouse.Up is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>Presses and releases `button` at the current position.</summary>
+    static void Click(int button) {
+        Mouse.Down(button);
+        Mouse.Up(button);
+    }
+
+    /// <summary>Two quick clicks at the current position.</summary>
+    static void DoubleClick(int button) {
+        Mouse.Click(button);
+        Mouse.Click(button);
+    }
+
+    /// <summary>Drags from `fx`,`fy` to `tx`,`ty` holding `button`: move to
+    /// the start, press, glide in steps, release.</summary>
+    static void Drag(int fx, int fy, int tx, int ty) {
+        Mouse.Drag(fx, fy, tx, ty, Mouse.Left(), 16);
+    }
+
+    /// <summary>Drags with an explicit button and trajectory step count.</summary>
+    static void Drag(int fx, int fy, int tx, int ty, int button, int steps) {
+        Mouse.SetPos(fx, fy);
+        Mouse.Down(button);
+        Mouse.MoveTo(tx, ty, steps);
+        Mouse.Up(button);
+    }
+
+    /// <summary>Scrolls the wheel. Positive `delta` scrolls up, negative
+    /// down; one notch is 120 (WHEEL_DELTA), so pass multiples of 120 for
+    /// whole notches.</summary>
+    static void Wheel(int delta) {
+        #if WINDOWS
+        Mouse.SendMouse(0, 0, delta, Mouse.FWheel());
+        #else
+        throw new PlatformNotSupportedException(
+            "Mouse.Wheel is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>True while `button` is physically held down.</summary>
+    static bool IsDown(int button) {
+        #if WINDOWS
+        int vk = 0;
+        if (button == 0) { vk = Mouse.VkLeft(); }
+        else if (button == 1) { vk = Mouse.VkMiddle(); }
+        else if (button == 2) { vk = Mouse.VkRight(); }
+        else if (button == 3) { vk = Mouse.VkX1(); }
+        else if (button == 4) { vk = Mouse.VkX2(); }
+        else { throw new ArgumentException("invalid mouse button"); }
+        return (Mouse.WinGetAsyncKeyState(vk) & 0x8000) != 0;
+        #else
+        throw new PlatformNotSupportedException(
+            "Mouse.IsDown is not implemented on this platform");
+        #endif
+    }
+
+    #if WINDOWS
+    /// Sends one mouse INPUT event (x64 INPUT layout: 4-byte type + padding
+    /// + 32-byte MOUSEINPUT; dwExtraInfo is ULONG_PTR-aligned at offset 32).
+    static void SendMouse(int dx, int dy, int data, int flags) {
+        nint input = NativeMemory.Alloc(40);
+        Span<int> w = new Span<int>(input, 10);
+        w[0] = 0;            // INPUT type: mouse
+        w[2] = dx;           // MOUSEINPUT.dx
+        w[3] = dy;           // MOUSEINPUT.dy
+        w[4] = data;         // MOUSEINPUT.mouseData (wheel delta / X button)
+        w[5] = flags;        // MOUSEINPUT.dwFlags
+        w[6] = 0;            // MOUSEINPUT.time
+        // MOUSEINPUT.dwExtraInfo lives at offset 32 (ULONG_PTR-aligned);
+        // w[8..9] are zero already (NativeMemory.Alloc zero-fills).
+        WinSendInput(1, input, 40);
+        NativeMemory.Free(input);
+    }
+    #endif
+}
