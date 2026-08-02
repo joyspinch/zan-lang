@@ -1,0 +1,104 @@
+// FreeSql-style ORM surface: CodeFirst SyncStructure, chained
+// Insert/Update/Delete and the lambda Select chain, all over SQLite.
+using System;
+using System.Data;
+using System.Data.Orm;
+using System.Data.Sqlite;
+using System.IO;
+
+[Table(Name = "t_blog")]
+class Blog {
+    [Column(IsIdentity = true)]
+    int id;
+    [Column(Name = "title", StringLength = 64)]
+    string title;
+    int clicks;
+    double score;
+    bool online;
+
+    static Blog Of(string title, int clicks, double score, bool online) {
+        Blog b = new Blog();
+        b.title = title;
+        b.clicks = clicks;
+        b.score = score;
+        b.online = online;
+        return b;
+    }
+}
+
+class Program {
+    static void Main() {
+        string path = "orm_freesql.tmp.db";
+        File.Delete(path);
+        SqliteConnection db = SqliteConnection.Open(path);
+
+        // 1. CodeFirst: create the table from the entity, idempotently
+        db.SyncStructure<Blog>();
+        db.SyncStructure<Blog>();
+
+        // 2. Insert one row, identity primary key comes back
+        int id = db.Insert<Blog>(Blog.Of("hello", 3, 1.5, true)).ExecuteIdentity();
+        Console.WriteLine("id: " + Convert.ToString(id));
+
+        // 3. Batch insert (collection initializer, one statement)
+        List<Blog> more = new List<Blog> {
+            Blog.Of("zan orm", 10, 2.0, true),
+            Blog.Of("freesql style", 40, 3.5, false),
+            Blog.Of("draft", 1, 0.5, false)
+        };
+        Console.WriteLine("ins: " + Convert.ToString(db.Insert<Blog>(more).ExecuteAffrows()));
+
+        // 4. Chained update: assignment + increment, lambda condition
+        int up = db.Update<Blog>()
+            .Set(a => a.title, "hello zan")
+            .SetIncr(a => a.clicks, 5)
+            .Where(a => a.id == id)
+            .ExecuteAffrows();
+        Console.WriteLine("up: " + Convert.ToString(up));
+
+        // 5. Select chain
+        List<Blog> hot = db.Select<Blog>()
+            .Where(a => a.clicks >= 8)
+            .OrderByDescending(a => a.clicks)
+            .ToList();
+        Console.WriteLine("hot: " + Convert.ToString(hot.Count) + " " + hot[0].title);
+
+        Blog one = db.Select<Blog>().Where(a => a.id == id).ToOne();
+        Console.WriteLine("one: " + one.title + " clicks=" + Convert.ToString(one.clicks)
+            + " online=" + Convert.ToString(one.online));
+
+        // 6. Aggregates
+        Console.WriteLine("sum: " + Convert.ToString(db.Select<Blog>().Sum(a => a.clicks)));
+        Console.WriteLine("max: " + Convert.ToString(db.Select<Blog>().Max(a => a.clicks)));
+        Console.WriteLine("avg: " + Convert.ToString(db.Select<Blog>().Avg(a => a.score)));
+        Console.WriteLine("any: " + Convert.ToString(db.Select<Blog>().Where(a => a.online).Any()));
+
+        // 7. Paging
+        List<Blog> page = db.Select<Blog>().OrderBy(a => a.id).Page(2, 2).ToList();
+        Console.WriteLine("page: " + Convert.ToString(page.Count) + " " + page[0].title);
+
+        // 8. WhereIf: the filter (and its parameters) apply only when the
+        //    condition holds, so optional search boxes need no SQL strings
+        string kw = "free";
+        bool useKw = true;
+        bool useDraft = false;
+        List<Blog> found = db.Select<Blog>()
+            .WhereIf(useDraft, a => a.title == "draft")
+            .WhereIf(useKw, a => a.title.StartsWith(kw))
+            .ToList();
+        Console.WriteLine("found: " + Convert.ToString(found.Count) + " " + found[0].title);
+
+        // 9. SetSource updates every non-key column from an entity
+        one.score = 9.5;
+        one.online = false;
+        Console.WriteLine("src: " + Convert.ToString(db.Update<Blog>().SetSource(one).ExecuteAffrows()));
+        Console.WriteLine("score: " + Convert.ToString(db.Select<Blog>().Where(a => a.id == id).ToOne().score));
+
+        // 10. Delete
+        Console.WriteLine("del: " + Convert.ToString(db.Delete<Blog>().Where(a => a.clicks < 5).ExecuteAffrows()));
+        Console.WriteLine("left: " + Convert.ToString(db.Select<Blog>().Count()));
+
+        db.Close();
+        File.Delete(path);
+    }
+}

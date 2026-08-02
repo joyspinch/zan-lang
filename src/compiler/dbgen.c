@@ -109,6 +109,11 @@ typedef struct {
     zan_istr_t name;
     zan_istr_t type_name; /* declared type (enum/nav class name) */
     dg_fk_t kind;
+    zan_istr_t col;       /* column name ([Column(Name=)] or the field name) */
+    bool is_pk;           /* [Column(IsPrimary = true)], or a field named id */
+    bool is_ident;        /* [Column(IsIdentity = true)]; implied by int pk */
+    bool not_null;        /* [Column(IsNullable = false)] */
+    int str_len;          /* [Column(StringLength = n)], 0 = provider default */
 } dg_field_t;
 
 typedef struct {
@@ -124,6 +129,62 @@ static bool dg_is_int_name(zan_istr_t n) {
 
 static bool dg_is_float_name(zan_istr_t n) {
     return istr_is(n, "double") || istr_is(n, "float") || istr_is(n, "decimal");
+}
+
+/* ---- [Table] / [Column] attribute readers ---- */
+
+static zan_ast_node_t *dg_attr(const zan_ast_node_t *decl, const char *name) {
+    if (!decl) return NULL;
+    size_t n = strlen(name);
+    for (int i = 0; i < decl->attributes.count; i++) {
+        zan_ast_node_t *a = decl->attributes.items[i];
+        if (!a || a->kind != AST_ATTRIBUTE || !a->attribute.name) continue;
+        if (a->attribute.name->kind != AST_IDENTIFIER) continue;
+        zan_istr_t s = a->attribute.name->ident.name;
+        if (s.len == (uint32_t)n && memcmp(s.str, name, n) == 0) return a;
+    }
+    return NULL;
+}
+
+/* The value of a named attribute argument (`Name = expr`), or NULL. */
+static zan_ast_node_t *dg_attr_arg(zan_ast_node_t *attr, const char *key) {
+    if (!attr) return NULL;
+    size_t n = strlen(key);
+    for (int i = 0; i < attr->attribute.args.count; i++) {
+        zan_ast_node_t *a = attr->attribute.args.items[i];
+        if (!a || a->kind != AST_ASSIGNMENT) continue;
+        zan_ast_node_t *l = a->binary.left;
+        if (!l || l->kind != AST_IDENTIFIER) continue;
+        if (l->ident.name.len == (uint32_t)n &&
+            memcmp(l->ident.name.str, key, n) == 0)
+            return a->binary.right;
+    }
+    return NULL;
+}
+
+static zan_istr_t dg_attr_str(zan_ast_node_t *attr, const char *key) {
+    zan_ast_node_t *v = dg_attr_arg(attr, key);
+    zan_istr_t none = { NULL, 0 };
+    if (!v || v->kind != AST_STRING_LITERAL) return none;
+    return v->str_val;
+}
+
+static zan_istr_t dg_table_of(zan_ast_node_t *unit, zan_istr_t cls) {
+    zan_ast_node_t *decl = dg_find_class(unit, cls);
+    zan_istr_t n = dg_attr_str(dg_attr(decl, "Table"), "Name");
+    return n.len ? n : cls;
+}
+
+static bool dg_attr_bool(zan_ast_node_t *attr, const char *key, bool dflt) {
+    zan_ast_node_t *v = dg_attr_arg(attr, key);
+    if (!v || v->kind != AST_BOOL_LITERAL) return dflt;
+    return v->bool_val;
+}
+
+static int dg_attr_int(zan_ast_node_t *attr, const char *key, int dflt) {
+    zan_ast_node_t *v = dg_attr_arg(attr, key);
+    if (!v || v->kind != AST_INT_LITERAL) return dflt;
+    return (int)v->int_val;
 }
 
 static dg_fk_t dg_classify(zan_ast_node_t *unit, zan_ast_node_t *tref) {
@@ -155,8 +216,17 @@ static void dg_collect_fields(zan_ast_node_t *unit, zan_ast_node_t *cls,
         if (m->field_decl.modifiers & MOD_STATIC) continue;
         if (out->count >= 128) return;
         dg_field_t *f = &out->items[out->count];
+        memset(f, 0, sizeof(*f));
         f->name = m->field_decl.name;
         f->kind = dg_classify(unit, m->field_decl.type);
+        zan_ast_node_t *ca = dg_attr(m, "Column");
+        zan_istr_t cn = dg_attr_str(ca, "Name");
+        f->col = cn.len ? cn : f->name;
+        f->is_pk = dg_attr_bool(ca, "IsPrimary", istr_is(f->name, "id"));
+        f->is_ident = dg_attr_bool(ca, "IsIdentity",
+                                   f->is_pk && f->kind == DF_INT);
+        f->not_null = !dg_attr_bool(ca, "IsNullable", !f->is_pk);
+        f->str_len = dg_attr_int(ca, "StringLength", 0);
         f->type_name = (m->field_decl.type &&
                         m->field_decl.type->kind == AST_TYPE_REF)
                            ? m->field_decl.type->type_ref.name
@@ -590,18 +660,35 @@ static void dg_where_cond(dg_where_t *w, zan_ast_node_t *e) {
 
 /* ---- chain recognition & rewriting ---- */
 
-/* Walks a fluent chain receiver down to a rewritten `__DbBind.Q_<T>(db)`
- * root and returns the entity name (len 0 when not a db query chain). */
-static zan_istr_t dg_chain_entity(zan_ast_node_t *recv) {
+/* Which statement a fluent chain builds; the root method name encodes it
+ * (`__DbBind.Q_T` / `I_T` / `U_T` / `D_T`). */
+typedef enum { CK_NONE, CK_SELECT, CK_INSERT, CK_UPDATE, CK_DELETE } dg_ck_t;
+
+static dg_ck_t dg_prefix_kind(zan_istr_t m) {
+    if (m.len < 3 || m.str[1] != '_') return CK_NONE;
+    switch (m.str[0]) {
+    case 'Q': return CK_SELECT;
+    case 'I': return CK_INSERT;
+    case 'U': return CK_UPDATE;
+    case 'D': return CK_DELETE;
+    default: return CK_NONE;
+    }
+}
+
+/* Walks a fluent chain receiver down to a rewritten `__DbBind.X_<T>(db)`
+ * root and returns the entity name (len 0 when not a db chain). */
+static zan_istr_t dg_chain_entity2(zan_ast_node_t *recv, dg_ck_t *kind) {
     zan_istr_t none = { NULL, 0 };
+    if (kind) *kind = CK_NONE;
     while (recv && recv->kind == AST_CALL) {
         zan_ast_node_t *callee = recv->call.callee;
         if (!callee || callee->kind != AST_MEMBER_ACCESS) return none;
         zan_ast_node_t *obj = callee->member.object;
         if (obj && obj->kind == AST_IDENTIFIER &&
-            istr_is(obj->ident.name, "__DbBind") &&
-            callee->member.name.len > 2 &&
-            memcmp(callee->member.name.str, "Q_", 2) == 0) {
+            istr_is(obj->ident.name, "__DbBind")) {
+            dg_ck_t k = dg_prefix_kind(callee->member.name);
+            if (k == CK_NONE) return none;
+            if (kind) *kind = k;
             zan_istr_t r = { callee->member.name.str + 2,
                              callee->member.name.len - 2 };
             return r;
@@ -611,14 +698,30 @@ static zan_istr_t dg_chain_entity(zan_ast_node_t *recv) {
     return none;
 }
 
-/* True when `call` is `<recv>.Query<T>()` with a known entity class T. */
-static bool dg_is_query_root(dg_ctx_t *c, zan_ast_node_t *call,
-                             zan_istr_t *cls_out) {
+static zan_istr_t dg_chain_entity(zan_ast_node_t *recv) {
+    return dg_chain_entity2(recv, NULL);
+}
+
+/* `<recv>.Query<T>()` / `Select<T>()` / `Insert<T>(..)` / `Update<T>()` /
+ * `Delete<T>()` / `SyncStructure<T>()` with a known entity class T. The
+ * out params carry the entity and which statement the chain builds;
+ * `SyncStructure` is reported through *sync (it is not a chain). */
+static bool dg_is_root(dg_ctx_t *c, zan_ast_node_t *call, zan_istr_t *cls_out,
+                       dg_ck_t *kind_out, bool *sync_out) {
     if (call->kind != AST_CALL) return false;
     zan_ast_node_t *callee = call->call.callee;
     if (!callee || callee->kind != AST_MEMBER_ACCESS) return false;
-    if (!istr_is(callee->member.name, "Query")) return false;
-    if (call->call.type_args.count != 1 || call->call.args.count != 0)
+    zan_istr_t m = callee->member.name;
+    dg_ck_t k = CK_NONE;
+    bool sync = false;
+    int maxargs = 0;
+    if (istr_is(m, "Query") || istr_is(m, "Select")) k = CK_SELECT;
+    else if (istr_is(m, "Insert")) { k = CK_INSERT; maxargs = 1; }
+    else if (istr_is(m, "Update")) k = CK_UPDATE;
+    else if (istr_is(m, "Delete")) k = CK_DELETE;
+    else if (istr_is(m, "SyncStructure")) sync = true;
+    else return false;
+    if (call->call.type_args.count != 1 || call->call.args.count > maxargs)
         return false;
     zan_ast_node_t *targ = call->call.type_args.items[0];
     if (!targ || targ->kind != AST_TYPE_REF || targ->type_ref.is_array ||
@@ -626,22 +729,28 @@ static bool dg_is_query_root(dg_ctx_t *c, zan_ast_node_t *call,
         return false;
     if (!dg_find_class(c->unit, targ->type_ref.name)) return false;
     *cls_out = targ->type_ref.name;
+    *kind_out = k;
+    *sync_out = sync;
     return true;
 }
 
-static void dg_rewrite_query_root(dg_ctx_t *c, zan_ast_node_t *call,
-                                  zan_istr_t cls) {
+/* `db.Xxx<T>(args)` -> `__DbBind.<P>_T(db, args)`. */
+static void dg_rewrite_root(dg_ctx_t *c, zan_ast_node_t *call, zan_istr_t cls,
+                            char prefix) {
     dg_need_add(&c->need, cls);
     c->any = true;
     zan_ast_node_t *callee = call->call.callee;
     zan_ast_node_t *recv = callee->member.object;
+    zan_ast_node_t *extra =
+        call->call.args.count > 0 ? call->call.args.items[0] : NULL;
     char mname[160];
-    snprintf(mname, sizeof(mname), "Q_%.*s", (int)cls.len, cls.str);
+    snprintf(mname, sizeof(mname), "%c_%.*s", prefix, (int)cls.len, cls.str);
     callee->member.object = nb_ident(c, call->loc, "__DbBind");
     callee->member.name = dg_istr(c, mname, strlen(mname));
     call->call.type_args.count = 0;
     zan_ast_list_init(&call->call.args);
     zan_ast_list_push(&call->call.args, recv, c->arena);
+    if (extra) zan_ast_list_push(&call->call.args, extra, c->arena);
 }
 
 static const char *dg_bind_method(dg_bk_t k) {
@@ -656,44 +765,86 @@ static const char *dg_bind_method(dg_bk_t k) {
     return "P";
 }
 
-static void dg_rewrite_where(dg_ctx_t *c, zan_ast_node_t *call,
-                             zan_istr_t cls) {
-    zan_ast_node_t *lambda = call->call.args.items[0];
+/* Builds the SQL fragment + bind list for a Where/WhereIf lambda. Returns
+ * NULL when the lambda could not be translated (a diagnostic was emitted). */
+static zan_ast_node_t *dg_where_frag(dg_ctx_t *c, zan_ast_node_t *call,
+                                     zan_istr_t cls, zan_ast_node_t *lambda,
+                                     dg_where_t *w) {
     if (lambda->kind != AST_LAMBDA || lambda->lambda.params.count != 1) {
         zan_diag_emit(c->diag, DIAG_ERROR, call->loc,
-                      "db.Query<T>().Where expects a one-parameter lambda");
-        return;
+                      "Where expects a one-parameter lambda");
+        return NULL;
     }
     zan_ast_node_t *body = lambda->lambda.body;
     if (body && body->kind == AST_BLOCK) {
         zan_diag_emit(c->diag, DIAG_ERROR, call->loc,
                       "Where lambda must be an expression (no block body)");
-        return;
+        return NULL;
     }
-    dg_fields_t fields;
+    static dg_fields_t fields;
     memset(&fields, 0, sizeof(fields));
     dg_collect_fields(c->unit, dg_find_class(c->unit, cls), &fields, 0);
 
-    dg_where_t w;
-    memset(&w, 0, sizeof(w));
-    w.c = c;
-    w.pname = lambda->lambda.params.items[0]->param.name;
-    w.fields = &fields;
-    w.frag.loc = call->loc;
-    w.ok = true;
-    dg_where_cond(&w, body);
-    if (!w.ok) {
-        free(w.frag.lit.buf);
-        return;
+    memset(w, 0, sizeof(*w));
+    w->c = c;
+    w->pname = lambda->lambda.params.items[0]->param.name;
+    w->fields = &fields;
+    w->frag.loc = call->loc;
+    w->ok = true;
+    dg_where_cond(w, body);
+    if (!w->ok) {
+        free(w->frag.lit.buf);
+        return NULL;
     }
-    wf_flush(&w);
-    zan_ast_node_t *frag = w.frag.expr;
-    free(w.frag.lit.buf);
+    wf_flush(w);
+    zan_ast_node_t *frag = w->frag.expr;
+    free(w->frag.lit.buf);
     if (!frag) frag = nb_strlit(c, call->loc, "1 = 1", 5);
+    return frag;
+}
 
+/* Chains `.W(frag).P(v)...` onto the receiver, replacing the call node. */
+static void dg_emit_where(dg_ctx_t *c, zan_ast_node_t *call,
+                          zan_ast_node_t *frag, dg_where_t *w) {
     zan_ast_node_t *recv = call->call.callee->member.object;
     zan_ast_node_t *node = nb_call1(
         c, call->loc, nb_member(c, call->loc, recv, dg_istr(c, "W", 1)), frag);
+    for (int i = 0; i < w->bind_count; i++) {
+        const char *mn = dg_bind_method(w->binds[i].kind);
+        node = nb_call1(c, call->loc,
+                        nb_member(c, call->loc, node,
+                                  dg_istr(c, mn, strlen(mn))),
+                        w->binds[i].expr);
+    }
+    *call = *node;
+}
+
+static void dg_rewrite_where(dg_ctx_t *c, zan_ast_node_t *call,
+                             zan_istr_t cls) {
+    dg_where_t w;
+    zan_ast_node_t *frag =
+        dg_where_frag(c, call, cls, call->call.args.items[0], &w);
+    if (!frag) return;
+    dg_emit_where(c, call, frag, &w);
+}
+
+/* `WhereIf(cond, p => ...)`: the fragment and its parameters are applied
+ * only when `cond` holds, so an optional filter costs one `if` at runtime
+ * instead of a hand-built SQL string. */
+static void dg_rewrite_where_if(dg_ctx_t *c, zan_ast_node_t *call,
+                                zan_istr_t cls) {
+    zan_ast_node_t *cond = call->call.args.items[0];
+    dg_where_t w;
+    zan_ast_node_t *frag =
+        dg_where_frag(c, call, cls, call->call.args.items[1], &w);
+    if (!frag) return;
+    zan_ast_node_t *recv = call->call.callee->member.object;
+    zan_ast_node_t *node =
+        nb_call1(c, call->loc,
+                 nb_member(c, call->loc, recv, dg_istr(c, "CondBegin", 9)),
+                 cond);
+    node = nb_call1(c, call->loc,
+                    nb_member(c, call->loc, node, dg_istr(c, "W", 1)), frag);
     for (int i = 0; i < w.bind_count; i++) {
         const char *mn = dg_bind_method(w.binds[i].kind);
         node = nb_call1(c, call->loc,
@@ -701,7 +852,126 @@ static void dg_rewrite_where(dg_ctx_t *c, zan_ast_node_t *call,
                                   dg_istr(c, mn, strlen(mn))),
                         w.binds[i].expr);
     }
+    node = nb_call1(c, call->loc,
+                    nb_member(c, call->loc, node, dg_istr(c, "CondEnd", 7)),
+                    NULL);
     *call = *node;
+}
+
+/* The column a `p => p.field` selector names, or NULL (diagnostic emitted). */
+static const dg_field_t *dg_sel_column(dg_ctx_t *c, zan_ast_node_t *call,
+                                       zan_istr_t cls, dg_fields_t *fields,
+                                       const char *what) {
+    zan_ast_node_t *lambda = call->call.args.items[0];
+    memset(fields, 0, sizeof(*fields));
+    dg_collect_fields(c->unit, dg_find_class(c->unit, cls), fields, 0);
+    zan_ast_node_t *body =
+        (lambda->kind == AST_LAMBDA && lambda->lambda.params.count == 1)
+            ? lambda->lambda.body
+            : NULL;
+    const dg_field_t *col = NULL;
+    if (body && body->kind == AST_MEMBER_ACCESS &&
+        body->member.object->kind == AST_IDENTIFIER &&
+        istr_eq(body->member.object->ident.name,
+                lambda->lambda.params.items[0]->param.name))
+        col = dg_field_find(fields, body->member.name);
+    if (!col || col->kind == DF_NAV)
+        zan_diag_emit(c->diag, DIAG_ERROR, call->loc,
+                      "%s expects p => p.<scalar field>", what);
+    return col;
+}
+
+/* `Set(a => a.col, value)` / `SetIncr(a => a.col, delta)`. */
+static void dg_rewrite_set(dg_ctx_t *c, zan_ast_node_t *call, zan_istr_t cls,
+                           bool incr) {
+    dg_fields_t fields;
+    const dg_field_t *col =
+        dg_sel_column(c, call, cls, &fields, incr ? "SetIncr" : "Set");
+    if (!col) return;
+    zan_ast_node_t *val = call->call.args.items[1];
+    const char *m = NULL;
+    zan_ast_node_t *arg = val;
+    switch (col->kind) {
+    case DF_INT: m = incr ? "SetIncrI" : "SetI"; break;
+    case DF_ENUM:
+        m = incr ? "SetIncrI" : "SetI";
+        arg = nb_cast_int(c, val->loc, val);
+        break;
+    case DF_DOUBLE: m = incr ? "SetIncrD" : "SetD"; break;
+    case DF_STRING: m = "SetS"; break;
+    case DF_BOOL: m = "SetB"; break;
+    default: break;
+    }
+    if (!m || (incr && (col->kind == DF_STRING || col->kind == DF_BOOL))) {
+        zan_diag_emit(c->diag, DIAG_ERROR, call->loc,
+                      "unsupported column type for Set/SetIncr");
+        return;
+    }
+    zan_ast_node_t *recv = call->call.callee->member.object;
+    zan_ast_node_t *node =
+        nb_call1(c, call->loc,
+                 nb_member(c, call->loc, recv, dg_istr(c, m, strlen(m))),
+                 nb_strlit(c, call->loc, col->col.str, col->col.len));
+    zan_ast_list_push(&node->call.args, arg, c->arena);
+    *call = *node;
+}
+
+/* `Sum/Avg/Max/Min(a => a.col)`: the terminal returns the column's own type
+ * (AVG always a double, like SQL). */
+static void dg_rewrite_agg(dg_ctx_t *c, zan_ast_node_t *call, zan_istr_t cls,
+                           const char *fn) {
+    dg_fields_t fields;
+    const dg_field_t *col = dg_sel_column(c, call, cls, &fields, fn);
+    if (!col) return;
+    if (col->kind != DF_INT && col->kind != DF_DOUBLE) {
+        zan_diag_emit(c->diag, DIAG_ERROR, call->loc,
+                      "%s requires an int or double column", fn);
+        return;
+    }
+    char buf[200];
+    snprintf(buf, sizeof(buf), "%s(t.%.*s)", fn, (int)col->col.len,
+             col->col.str);
+    bool as_int = col->kind == DF_INT && strcmp(fn, "AVG") != 0;
+    const char *m = as_int ? "AggI" : "AggD";
+    zan_ast_node_t *recv = call->call.callee->member.object;
+    zan_ast_node_t *node =
+        nb_call1(c, call->loc,
+                 nb_member(c, call->loc, recv, dg_istr(c, m, strlen(m))),
+                 nb_strlit(c, call->loc, buf, strlen(buf)));
+    *call = *node;
+}
+
+/* `InsertColumns(a => a.col)` / `IgnoreColumns(a => a.col)`. */
+static void dg_rewrite_cols(dg_ctx_t *c, zan_ast_node_t *call, zan_istr_t cls,
+                            bool only) {
+    dg_fields_t fields;
+    const dg_field_t *col = dg_sel_column(
+        c, call, cls, &fields,
+        only ? "InsertColumns/UpdateColumns" : "IgnoreColumns");
+    if (!col) return;
+    const char *m = only ? "Only" : "Skip";
+    zan_ast_node_t *recv = call->call.callee->member.object;
+    zan_ast_node_t *node =
+        nb_call1(c, call->loc,
+                 nb_member(c, call->loc, recv, dg_istr(c, m, strlen(m))),
+                 nb_strlit(c, call->loc, col->col.str, col->col.len));
+    *call = *node;
+}
+
+/* `db.SyncStructure<T>()` -> `__DbBind.CF_T(db)` (CodeFirst DDL). */
+static void dg_rewrite_sync(dg_ctx_t *c, zan_ast_node_t *call,
+                            zan_istr_t cls) {
+    dg_need_add(&c->need, cls);
+    c->any = true;
+    zan_ast_node_t *callee = call->call.callee;
+    zan_ast_node_t *recv = callee->member.object;
+    char mname[160];
+    snprintf(mname, sizeof(mname), "CF_%.*s", (int)cls.len, cls.str);
+    callee->member.object = nb_ident(c, call->loc, "__DbBind");
+    callee->member.name = dg_istr(c, mname, strlen(mname));
+    call->call.type_args.count = 0;
+    zan_ast_list_init(&call->call.args);
+    zan_ast_list_push(&call->call.args, recv, c->arena);
 }
 
 static void dg_rewrite_orderby(dg_ctx_t *c, zan_ast_node_t *call,
@@ -777,26 +1047,62 @@ static void dg_visit_call(dg_ctx_t *c, zan_ast_node_t *e) {
     dg_visit_list(c, &e->call.args);
 
     zan_istr_t cls;
-    if (dg_is_query_root(c, e, &cls)) {
-        dg_rewrite_query_root(c, e, cls);
+    dg_ck_t rk = CK_NONE;
+    bool sync = false;
+    if (dg_is_root(c, e, &cls, &rk, &sync)) {
+        if (sync) dg_rewrite_sync(c, e, cls);
+        else dg_rewrite_root(c, e, cls,
+                             rk == CK_SELECT   ? 'Q'
+                             : rk == CK_INSERT ? 'I'
+                             : rk == CK_UPDATE ? 'U'
+                                               : 'D');
         return;
     }
     zan_ast_node_t *callee = e->call.callee;
     if (!callee || callee->kind != AST_MEMBER_ACCESS) return;
     zan_istr_t mn = callee->member.name;
+    dg_ck_t ck = CK_NONE;
+    zan_istr_t entity = dg_chain_entity2(callee->member.object, &ck);
+    if (entity.len == 0) return;
+
     bool is_where = istr_is(mn, "Where");
+    bool is_whereif = istr_is(mn, "WhereIf");
     bool is_ob = istr_is(mn, "OrderBy");
     bool is_obd = istr_is(mn, "OrderByDescending");
     bool is_inc = istr_is(mn, "Include");
-    if (!is_where && !is_ob && !is_obd && !is_inc) return;
-    if (e->call.args.count != 1 ||
-        e->call.args.items[0]->kind != AST_LAMBDA)
+    bool is_set = istr_is(mn, "Set");
+    bool is_incr = istr_is(mn, "SetIncr");
+    bool is_only = istr_is(mn, "InsertColumns") || istr_is(mn, "UpdateColumns");
+    bool is_skip = istr_is(mn, "IgnoreColumns");
+    const char *agg = istr_is(mn, "Sum")   ? "SUM"
+                      : istr_is(mn, "Avg") ? "AVG"
+                      : istr_is(mn, "Max") ? "MAX"
+                      : istr_is(mn, "Min") ? "MIN"
+                                           : NULL;
+
+    if (is_whereif) {
+        if (e->call.args.count != 2 ||
+            e->call.args.items[1]->kind != AST_LAMBDA)
+            return;
+        dg_rewrite_where_if(c, e, entity);
         return;
-    zan_istr_t entity = dg_chain_entity(callee->member.object);
-    if (entity.len == 0) return;
+    }
+    if ((is_set || is_incr) && ck == CK_UPDATE) {
+        if (e->call.args.count != 2 ||
+            e->call.args.items[0]->kind != AST_LAMBDA)
+            return;
+        dg_rewrite_set(c, e, entity, is_incr);
+        return;
+    }
+    if (e->call.args.count != 1 || e->call.args.items[0]->kind != AST_LAMBDA)
+        return;
     if (is_where) dg_rewrite_where(c, e, entity);
-    else if (is_inc) dg_rewrite_include(c, e, entity);
-    else dg_rewrite_orderby(c, e, entity, is_obd);
+    else if (is_inc && ck == CK_SELECT) dg_rewrite_include(c, e, entity);
+    else if ((is_ob || is_obd) && ck == CK_SELECT)
+        dg_rewrite_orderby(c, e, entity, is_obd);
+    else if (agg && ck == CK_SELECT) dg_rewrite_agg(c, e, entity, agg);
+    else if ((is_only || is_skip) && (ck == CK_INSERT || ck == CK_UPDATE))
+        dg_rewrite_cols(c, e, entity, is_only);
 }
 
 static void dg_visit_expr(dg_ctx_t *c, zan_ast_node_t *e) {
@@ -905,6 +1211,9 @@ static void dg_gen_entity(dg_ctx_t *c, dg_buf_t *out, zan_istr_t cls) {
     dg_fields_t fs;
     memset(&fs, 0, sizeof(fs));
     dg_collect_fields(c->unit, decl, &fs, 0);
+    zan_istr_t tbl = dg_table_of(c->unit, cls);
+    int TBL = (int)tbl.len;
+    const char *TBS = tbl.str;
 
     int nbase = 0;
     for (int i = 0; i < fs.count; i++)
@@ -913,11 +1222,13 @@ static void dg_gen_entity(dg_ctx_t *c, dg_buf_t *out, zan_istr_t cls) {
     dg_putf(out, "class __DbQ_%.*s {\n", CL, CS);
     dg_putf(out,
         "    IDbExecutor db;\n"
+        "    string tbl;\n"
         "    string w;\n"
         "    DbParams ps;\n"
         "    string ob;\n"
         "    int limN;\n"
-        "    int offN;\n");
+        "    int offN;\n"
+        "    bool on;\n");
     for (int i = 0; i < fs.count; i++)
         if (fs.items[i].kind == DF_NAV)
             dg_putf(out, "    bool j_%.*s;\n", (int)fs.items[i].name.len,
@@ -926,6 +1237,8 @@ static void dg_gen_entity(dg_ctx_t *c, dg_buf_t *out, zan_istr_t cls) {
         "    static __DbQ_%.*s Create(IDbExecutor db) {\n"
         "        __DbQ_%.*s q = new __DbQ_%.*s();\n"
         "        q.db = db;\n"
+        "        q.tbl = \"%.*s\";\n"
+        "        q.on = true;\n"
         "        q.w = \"\";\n"
         "        q.ps = DbParams.Create();\n"
         "        q.ob = \"\";\n"
@@ -933,27 +1246,54 @@ static void dg_gen_entity(dg_ctx_t *c, dg_buf_t *out, zan_istr_t cls) {
         "        q.offN = -1;\n"
         "        return q;\n"
         "    }\n",
-        CL, CS, CL, CS, CL, CS);
+        CL, CS, CL, CS, CL, CS, TBL, TBS);
     dg_putf(out,
         "    __DbQ_%.*s W(string f) {\n"
+        "        if (!this.on) { return this; }\n"
         "        if (this.w.Length == 0) { this.w = f; }\n"
         "        else { this.w = this.w + \" AND \" + f; }\n"
         "        return this;\n"
         "    }\n"
-        "    __DbQ_%.*s P(string v) { this.ps.Add(v); return this; }\n"
-        "    __DbQ_%.*s Pi(int v) { this.ps.AddInt(v); return this; }\n"
-        "    __DbQ_%.*s Pd(double v) { this.ps.AddDouble(v); return this; }\n"
+        "    __DbQ_%.*s WhereDict(DbValues v) {\n"
+        "        if (!this.on) { return this; }\n"
+        "        int i = 0;\n"
+        "        while (i < v.Count()) {\n"
+        "            string c = %.*sCols.Require(v.NameAt(i));\n"
+        "            W(\"t.\" + c + \" = ?\");\n"
+        "            v.BindAs(this.ps, i, %.*sCols.Kind(c));\n"
+        "            i = i + 1;\n"
+        "        }\n"
+        "        return this;\n"
+        "    }\n"
+        "    __DbQ_%.*s CondBegin(bool c) { this.on = c; return this; }\n"
+        "    __DbQ_%.*s CondEnd() { this.on = true; return this; }\n"
+        "    __DbQ_%.*s AsTable(string t) { this.tbl = t; return this; }\n"
+        "    __DbQ_%.*s P(string v) {\n"
+        "        if (this.on) { this.ps.Add(v); }\n"
+        "        return this;\n"
+        "    }\n"
+        "    __DbQ_%.*s Pi(int v) {\n"
+        "        if (this.on) { this.ps.AddInt(v); }\n"
+        "        return this;\n"
+        "    }\n"
+        "    __DbQ_%.*s Pd(double v) {\n"
+        "        if (this.on) { this.ps.AddDouble(v); }\n"
+        "        return this;\n"
+        "    }\n"
         "    __DbQ_%.*s InI(List<int> vs) {\n"
+        "        if (!this.on) { return this; }\n"
         "        int i = 0;\n"
         "        while (i < vs.Count) { this.ps.AddInt(vs[i]); i = i + 1; }\n"
         "        return this;\n"
         "    }\n"
         "    __DbQ_%.*s InS(List<string> vs) {\n"
+        "        if (!this.on) { return this; }\n"
         "        int i = 0;\n"
         "        while (i < vs.Count) { this.ps.Add(vs[i]); i = i + 1; }\n"
         "        return this;\n"
         "    }\n"
         "    __DbQ_%.*s InD(List<double> vs) {\n"
+        "        if (!this.on) { return this; }\n"
         "        int i = 0;\n"
         "        while (i < vs.Count) { this.ps.AddDouble(vs[i]); i = i + 1; }\n"
         "        return this;\n"
@@ -965,9 +1305,20 @@ static void dg_gen_entity(dg_ctx_t *c, dg_buf_t *out, zan_istr_t cls) {
         "    }\n"
         "    __DbQ_%.*s OBD(string col) { return OB(col + \" DESC\"); }\n"
         "    __DbQ_%.*s Take(int n) { this.limN = n; return this; }\n"
-        "    __DbQ_%.*s Skip(int n) { this.offN = n; return this; }\n",
+        "    __DbQ_%.*s Skip(int n) { this.offN = n; return this; }\n"
+        "    __DbQ_%.*s Limit(int n) { this.limN = n; return this; }\n"
+        "    __DbQ_%.*s Offset(int n) { this.offN = n; return this; }\n"
+        "    __DbQ_%.*s Page(int index, int size) {\n"
+        "        if (index < 1) { index = 1; }\n"
+        "        this.limN = size;\n"
+        "        this.offN = (index - 1) * size;\n"
+        "        return this;\n"
+        "    }\n",
         CL, CS, CL, CS, CL, CS, CL, CS, CL, CS, CL, CS, CL, CS, CL, CS,
-        CL, CS, CL, CS, CL, CS);
+        CL, CS, CL, CS, CL, CS, CL, CS, CL, CS, CL, CS, CL, CS, CL, CS,
+        CL, CS,
+        CL, CS, CL, CS,
+        CL, CS);
     for (int i = 0; i < fs.count; i++)
         if (fs.items[i].kind == DF_NAV)
             dg_putf(out,
@@ -988,7 +1339,7 @@ static void dg_gen_entity(dg_ctx_t *c, dg_buf_t *out, zan_istr_t cls) {
         for (int i = 0; i < fs.count; i++) {
             if (fs.items[i].kind == DF_NAV) continue;
             dg_putf(&cols, "%st.%.*s", first ? "" : ", ",
-                    (int)fs.items[i].name.len, fs.items[i].name.str);
+                    (int)fs.items[i].col.len, fs.items[i].col.str);
             first = false;
         }
         dg_putf(out, "        sb.Append(\"%s\");\n", cols.buf ? cols.buf : "");
@@ -1007,20 +1358,28 @@ static void dg_gen_entity(dg_ctx_t *c, dg_buf_t *out, zan_istr_t cls) {
         for (int k = 0; k < nfs.count; k++) {
             if (nfs.items[k].kind == DF_NAV) continue;
             dg_putf(&cols, ", j_%.*s.%.*s", FL, FS,
-                    (int)nfs.items[k].name.len, nfs.items[k].name.str);
+                    (int)nfs.items[k].col.len, nfs.items[k].col.str);
         }
         dg_putf(out,
             "        if (this.j_%.*s) { sb.Append(\"%s\"); }\n",
             FL, FS, cols.buf ? cols.buf : "");
         free(cols.buf);
     }
-    dg_putf(out, "        sb.Append(\" FROM %.*s t\");\n", CL, CS);
+    {
+        zan_istr_t tb = dg_table_of(c->unit, cls);
+        dg_putf(out,
+                "        sb.Append(\" FROM \");\n"
+                "        sb.Append(this.tbl);\n"
+                "        sb.Append(\" t\");\n");
+        (void)tb;
+    }
     for (int i = 0; i < fs.count; i++) {
         if (fs.items[i].kind != DF_NAV) continue;
         int FL = (int)fs.items[i].name.len;
         const char *FS = fs.items[i].name.str;
-        int TL = (int)fs.items[i].type_name.len;
-        const char *TS = fs.items[i].type_name.str;
+        zan_istr_t ntb = dg_table_of(c->unit, fs.items[i].type_name);
+        int TL = (int)ntb.len;
+        const char *TS = ntb.str;
         dg_putf(out,
             "        if (this.j_%.*s) { sb.Append(\" LEFT JOIN %.*s j_%.*s "
             "ON t.%.*sId = j_%.*s.id\"); }\n",
@@ -1122,17 +1481,605 @@ static void dg_gen_entity(dg_ctx_t *c, dg_buf_t *out, zan_istr_t cls) {
         "        return null;\n"
         "    }\n"
         "    %.*s FirstOrDefault() { return First(); }\n"
+        "    %.*s ToOne() { return First(); }\n"
         "    int Count() {\n"
+        "        return AggI(\"COUNT(*)\");\n"
+        "    }\n"
+        "    bool Any() { return Count() > 0; }\n"
+        "    DbResult AggR(string expr) {\n"
         "        StringBuilder sb = new StringBuilder();\n"
-        "        sb.Append(\"SELECT COUNT(*) FROM %.*s t\");\n"
+        "        sb.Append(\"SELECT \" + expr + \" FROM \" + this.tbl + \" t\");\n"
         "        if (this.w.Length > 0) { sb.Append(\" WHERE \"); "
         "sb.Append(this.w); }\n"
-        "        DbResult r = this.db.Query(sb.ToString(), this.ps);\n"
+        "        return this.db.Query(sb.ToString(), this.ps);\n"
+        "    }\n"
+        "    int AggI(string expr) {\n"
+        "        DbResult r = AggR(expr);\n"
         "        if (r.RowCount() == 0) { return 0; }\n"
         "        return r.GetInt(0, 0);\n"
         "    }\n"
+        "    double AggD(string expr) {\n"
+        "        DbResult r = AggR(expr);\n"
+        "        if (r.RowCount() == 0) { return 0.0; }\n"
+        "        return r.GetDouble(0, 0);\n"
+        "    }\n"
         "}\n",
         CL, CS, CL, CS, CL, CS, CL, CS);
+}
+
+
+/* ---- write-side code generation (Insert / Update / Delete / CodeFirst) ---- */
+
+/* Column kind code understood by `__DbBind.Ty` (DDL type mapping). */
+static int dg_ty_code(dg_fk_t k) {
+    switch (k) {
+    case DF_DOUBLE: return 1;
+    case DF_BOOL: return 2;
+    case DF_STRING: return 3;
+    default: return 0; /* int, enum */
+    }
+}
+
+/* Appends `o.<field>` as a bound parameter of the right type. */
+static void dg_bind_field(dg_buf_t *out, const char *ind, const dg_field_t *f,
+                          const char *obj) {
+    int FL = (int)f->name.len;
+    const char *FS = f->name.str;
+    switch (f->kind) {
+    case DF_INT:
+        dg_putf(out, "%sps.AddInt(%s.%.*s);\n", ind, obj, FL, FS);
+        break;
+    case DF_ENUM:
+        /* enum -> int is implicit; a temp keeps it out of an expression */
+        dg_putf(out, "%sint ev_%.*s = %s.%.*s;\n%sps.AddInt(ev_%.*s);\n", ind,
+                FL, FS, obj, FL, FS, ind, FL, FS);
+        break;
+    case DF_DOUBLE:
+        dg_putf(out, "%sps.AddDouble(%s.%.*s);\n", ind, obj, FL, FS);
+        break;
+    case DF_BOOL:
+        dg_putf(out,
+                "%sif (%s.%.*s) { ps.AddInt(1); } else { ps.AddInt(0); }\n",
+                ind, obj, FL, FS);
+        break;
+    default:
+        dg_putf(out, "%sps.Add(%s.%.*s);\n", ind, obj, FL, FS);
+        break;
+    }
+}
+
+/* `<Entity>Cols`: the column names as constants, so dynamic (DbValues) code
+ * gets autocompletion and a compile-time check instead of bare strings. */
+static void dg_gen_cols(dg_ctx_t *c, dg_buf_t *out, zan_istr_t cls,
+                        const dg_fields_t *fs) {
+    (void)c;
+    int CL = (int)cls.len;
+    const char *CS = cls.str;
+    dg_putf(out, "class %.*sCols {\n", CL, CS);
+    for (int i = 0; i < fs->count; i++) {
+        const dg_field_t *f = &fs->items[i];
+        if (f->kind == DF_NAV) continue;
+        dg_putf(out, "    static string %.*s = \"%.*s\";\n", (int)f->name.len,
+                f->name.str, (int)f->col.len, f->col.str);
+    }
+    dg_putf(out, "    static bool Has(string c) {\n        return false");
+    for (int i = 0; i < fs->count; i++) {
+        const dg_field_t *f = &fs->items[i];
+        if (f->kind == DF_NAV) continue;
+        dg_putf(out, "\n            || c == \"%.*s\"", (int)f->col.len,
+                f->col.str);
+    }
+    dg_putf(out, ";\n    }\n");
+    /* the column's declared kind, so dynamic values are converted to it */
+    dg_putf(out, "    static int Kind(string c) {\n");
+    for (int i = 0; i < fs->count; i++) {
+        const dg_field_t *f = &fs->items[i];
+        if (f->kind == DF_NAV) continue;
+        const char *k = (f->kind == DF_DOUBLE) ? "KindDouble"
+                        : (f->kind == DF_STRING) ? "KindText"
+                                                 : "KindInt";
+        dg_putf(out, "        if (c == \"%.*s\") { return DbParams.%s; }\n",
+                (int)f->col.len, f->col.str, k);
+    }
+    dg_putf(out, "        return DbParams.KindNull;\n    }\n");
+    dg_putf(out,
+        "    static string Require(string c) {\n"
+        "        if (!%.*sCols.Has(c)) {\n"
+        "            throw new Exception(\"%.*s has no column: \" + c);\n"
+        "        }\n"
+        "        return c;\n"
+        "    }\n"
+        "}\n",
+        CL, CS, CL, CS);
+}
+
+static void dg_gen_insert(dg_ctx_t *c, dg_buf_t *out, zan_istr_t cls,
+                          const dg_fields_t *fs, zan_istr_t tbl) {
+    (void)c;
+    int CL = (int)cls.len;
+    const char *CS = cls.str;
+    int TBL = (int)tbl.len;
+    const char *TBS = tbl.str;
+    dg_putf(out,
+        "class __DbI_%.*s {\n"
+        "    IDbExecutor db;\n"
+        "    string tbl;\n"
+        "    List<%.*s> rows;\n"
+        "    List<DbValues> dicts;\n"
+        "    List<string> only;\n"
+        "    List<string> skip;\n"
+        "    static __DbI_%.*s Create(IDbExecutor db) {\n"
+        "        __DbI_%.*s q = new __DbI_%.*s();\n"
+        "        q.db = db;\n"
+        "        q.tbl = \"%.*s\";\n"
+        "        q.rows = new List<%.*s>();\n"
+        "        q.dicts = new List<DbValues>();\n"
+        "        q.only = new List<string>();\n"
+        "        q.skip = new List<string>();\n"
+        "        return q;\n"
+        "    }\n"
+        "    static __DbI_%.*s Create(IDbExecutor db, %.*s o) {\n"
+        "        return __DbI_%.*s.Create(db).AppendData(o);\n"
+        "    }\n"
+        "    static __DbI_%.*s Create(IDbExecutor db, List<%.*s> l) {\n"
+        "        return __DbI_%.*s.Create(db).AppendData(l);\n"
+        "    }\n"
+        "    __DbI_%.*s AppendData(%.*s o) { this.rows.Add(o); return this; }\n"
+        "    __DbI_%.*s AppendData(List<%.*s> l) {\n"
+        "        int i = 0;\n"
+        "        while (i < l.Count) { this.rows.Add(l[i]); i = i + 1; }\n"
+        "        return this;\n"
+        "    }\n"
+        "    __DbI_%.*s AsTable(string t) { this.tbl = t; return this; }\n"
+        "    __DbI_%.*s AppendDict(DbValues v) {\n"
+        "        int i = 0;\n"
+        "        while (i < v.Count()) { %.*sCols.Require(v.NameAt(i)); i = i + 1; }\n"
+        "        this.dicts.Add(v);\n"
+        "        return this;\n"
+        "    }\n"
+        "    __DbI_%.*s AppendDict(List<DbValues> l) {\n"
+        "        int i = 0;\n"
+        "        while (i < l.Count) { AppendDict(l[i]); i = i + 1; }\n"
+        "        return this;\n"
+        "    }\n"
+        "    __DbI_%.*s Only(string c) { this.only.Add(c); return this; }\n"
+        "    __DbI_%.*s Skip(string c) { this.skip.Add(c); return this; }\n"
+        "    bool Use(string c, bool identity) {\n"
+        "        if (this.only.Count > 0) { return __DbBind.Has(this.only, c); }\n"
+        "        if (identity) { return false; }\n"
+        "        return !__DbBind.Has(this.skip, c);\n"
+        "    }\n",
+        CL, CS, CL, CS, CL, CS, CL, CS, CL, CS, TBL, TBS, CL, CS,
+        CL, CS, CL, CS, CL, CS, CL, CS, CL, CS, CL, CS, CL, CS, CL, CS,
+        CL, CS, CL, CS, CL, CS, CL, CS, CL, CS, CL, CS, CL, CS,
+        CL, CS);
+
+    dg_putf(out,
+        "    int ExecuteDicts() {\n"
+        "        DbParams ps = DbParams.Create();\n"
+        "        DbValues head = this.dicts[0];\n"
+        "        StringBuilder sb = new StringBuilder();\n"
+        "        sb.Append(\"INSERT INTO \");\n"
+        "        sb.Append(this.tbl);\n"
+        "        sb.Append(\" (\");\n"
+        "        int c = 0;\n"
+        "        while (c < head.Count()) {\n"
+        "            if (c > 0) { sb.Append(\", \"); }\n"
+        "            sb.Append(head.NameAt(c));\n"
+        "            c = c + 1;\n"
+        "        }\n"
+        "        sb.Append(\") VALUES \");\n"
+        "        int i = 0;\n"
+        "        while (i < this.dicts.Count) {\n"
+        "            DbValues v = this.dicts[i];\n"
+        "            if (i > 0) { sb.Append(\", \"); }\n"
+        "            sb.Append(\"(\");\n"
+        "            int k = 0;\n"
+        "            while (k < head.Count()) {\n"
+        "                if (k > 0) { sb.Append(\", \"); }\n"
+        "                sb.Append(\"?\");\n"
+        "                int at = v.IndexOf(head.NameAt(k));\n"
+        "                if (at < 0) { ps.AddNull(); } else {\n"
+        "                    v.BindAs(ps, at, %.*sCols.Kind(head.NameAt(k)));\n"
+        "                }\n"
+        "                k = k + 1;\n"
+        "            }\n"
+        "            sb.Append(\")\");\n"
+        "            i = i + 1;\n"
+        "        }\n"
+        "        return this.db.Execute(sb.ToString(), ps);\n"
+        "    }\n"
+        "    int ExecuteAffrows() {\n"
+        "        if (this.dicts.Count > 0) { return ExecuteDicts(); }\n"
+        "        if (this.rows.Count == 0) { return 0; }\n"
+        "        DbParams ps = DbParams.Create();\n"
+        "        string cols = \"\";\n", CL, CS);
+    for (int i = 0; i < fs->count; i++) {
+        const dg_field_t *f = &fs->items[i];
+        if (f->kind == DF_NAV) continue;
+        dg_putf(out,
+            "        if (this.Use(\"%.*s\", %s)) {\n"
+            "            if (cols.Length > 0) { cols = cols + \", \"; }\n"
+            "            cols = cols + \"%.*s\";\n"
+            "        }\n",
+            (int)f->col.len, f->col.str, f->is_ident ? "true" : "false",
+            (int)f->col.len, f->col.str);
+    }
+    dg_putf(out,
+        "        if (cols.Length == 0) { return 0; }\n"
+        "        StringBuilder sb = new StringBuilder();\n"
+        "        sb.Append(\"INSERT INTO \");\n"
+        "        sb.Append(this.tbl);\n"
+        "        sb.Append(\" (\");\n"
+        "        sb.Append(cols);\n"
+        "        sb.Append(\") VALUES \");\n"
+        "        int i = 0;\n"
+        "        while (i < this.rows.Count) {\n"
+        "            %.*s o = this.rows[i];\n"
+        "            if (i > 0) { sb.Append(\", \"); }\n"
+        "            string marks = \"\";\n",
+        CL, CS);
+    for (int i = 0; i < fs->count; i++) {
+        const dg_field_t *f = &fs->items[i];
+        if (f->kind == DF_NAV) continue;
+        dg_putf(out,
+            "            if (this.Use(\"%.*s\", %s)) {\n"
+            "                if (marks.Length > 0) { marks = marks + \", \"; }\n"
+            "                marks = marks + \"?\";\n",
+            (int)f->col.len, f->col.str, f->is_ident ? "true" : "false");
+        dg_bind_field(out, "                ", f, "o");
+        dg_putf(out, "            }\n");
+    }
+    dg_putf(out,
+        "            sb.Append(\"(\");\n"
+        "            sb.Append(marks);\n"
+        "            sb.Append(\")\");\n"
+        "            i = i + 1;\n"
+        "        }\n"
+        "        return this.db.Execute(sb.ToString(), ps);\n"
+        "    }\n"
+        "    int ExecuteIdentity() {\n"
+        "        if (ExecuteAffrows() == 0) { return 0; }\n"
+        "        return __DbBind.LastId(this.db);\n"
+        "    }\n"
+        "}\n");
+}
+
+static void dg_gen_update(dg_ctx_t *c, dg_buf_t *out, zan_istr_t cls,
+                          const dg_fields_t *fs, zan_istr_t tbl) {
+    (void)c;
+    int CL = (int)cls.len;
+    const char *CS = cls.str;
+    int TBL = (int)tbl.len;
+    const char *TBS = tbl.str;
+    const dg_field_t *pk = NULL;
+    for (int i = 0; i < fs->count; i++)
+        if (fs->items[i].is_pk && fs->items[i].kind != DF_NAV)
+            pk = &fs->items[i];
+    dg_putf(out,
+        "class __DbU_%.*s {\n"
+        "    IDbExecutor db;\n"
+        "    string tbl;\n"
+        "    %.*s src;\n"
+        "    List<string> only;\n"
+        "    List<string> skip;\n"
+        "    string sets;\n"
+        "    DbParams sp;\n"
+        "    string w;\n"
+        "    DbParams wp;\n"
+        "    bool on;\n"
+        "    static __DbU_%.*s Create(IDbExecutor db) {\n"
+        "        __DbU_%.*s q = new __DbU_%.*s();\n"
+        "        q.db = db;\n"
+        "        q.tbl = \"%.*s\";\n"
+        "        q.only = new List<string>();\n"
+        "        q.skip = new List<string>();\n"
+        "        q.sets = \"\";\n"
+        "        q.sp = DbParams.Create();\n"
+        "        q.w = \"\";\n"
+        "        q.wp = DbParams.Create();\n"
+        "        q.on = true;\n"
+        "        return q;\n"
+        "    }\n"
+        "    __DbU_%.*s AsTable(string t) { this.tbl = t; return this; }\n"
+        "    __DbU_%.*s Only(string c) { this.only.Add(c); return this; }\n"
+        "    __DbU_%.*s Skip(string c) { this.skip.Add(c); return this; }\n"
+        "    bool Use(string c) {\n"
+        "        if (this.only.Count > 0) { return __DbBind.Has(this.only, c); }\n"
+        "        return !__DbBind.Has(this.skip, c);\n"
+        "    }\n"
+        "    __DbU_%.*s SetDict(DbValues v) {\n"
+        "        int i = 0;\n"
+        "        while (i < v.Count()) {\n"
+        "            string c = %.*sCols.Require(v.NameAt(i));\n"
+        "            if (Use(c)) {\n"
+        "                v.BindAs(this.sp, i, %.*sCols.Kind(c));\n"
+        "                Frag(c + \" = ?\");\n"
+        "            }\n"
+        "            i = i + 1;\n"
+        "        }\n"
+        "        return this;\n"
+        "    }\n"
+        "    __DbU_%.*s WhereDict(DbValues v) {\n"
+        "        if (!this.on) { return this; }\n"
+        "        int i = 0;\n"
+        "        while (i < v.Count()) {\n"
+        "            string c = %.*sCols.Require(v.NameAt(i));\n"
+        "            W(c + \" = ?\");\n"
+        "            v.BindAs(this.wp, i, %.*sCols.Kind(c));\n"
+        "            i = i + 1;\n"
+        "        }\n"
+        "        return this;\n"
+        "    }\n"
+        "    __DbU_%.*s CondBegin(bool c) { this.on = c; return this; }\n"
+        "    __DbU_%.*s CondEnd() { this.on = true; return this; }\n"
+        "    __DbU_%.*s W(string f) {\n"
+        "        if (!this.on) { return this; }\n"
+        "        string u = __DbBind.Unalias(f);\n"
+        "        if (this.w.Length == 0) { this.w = u; }\n"
+        "        else { this.w = this.w + \" AND \" + u; }\n"
+        "        return this;\n"
+        "    }\n"
+        "    __DbU_%.*s P(string v) {\n"
+        "        if (this.on) { this.wp.Add(v); }\n"
+        "        return this;\n"
+        "    }\n"
+        "    __DbU_%.*s Pi(int v) {\n"
+        "        if (this.on) { this.wp.AddInt(v); }\n"
+        "        return this;\n"
+        "    }\n"
+        "    __DbU_%.*s Pd(double v) {\n"
+        "        if (this.on) { this.wp.AddDouble(v); }\n"
+        "        return this;\n"
+        "    }\n"
+        "    __DbU_%.*s InI(List<int> vs) {\n"
+        "        if (!this.on) { return this; }\n"
+        "        int i = 0;\n"
+        "        while (i < vs.Count) { this.wp.AddInt(vs[i]); i = i + 1; }\n"
+        "        return this;\n"
+        "    }\n"
+        "    __DbU_%.*s InS(List<string> vs) {\n"
+        "        if (!this.on) { return this; }\n"
+        "        int i = 0;\n"
+        "        while (i < vs.Count) { this.wp.Add(vs[i]); i = i + 1; }\n"
+        "        return this;\n"
+        "    }\n"
+        "    __DbU_%.*s InD(List<double> vs) {\n"
+        "        if (!this.on) { return this; }\n"
+        "        int i = 0;\n"
+        "        while (i < vs.Count) { this.wp.AddDouble(vs[i]); i = i + 1; }\n"
+        "        return this;\n"
+        "    }\n"
+        "    __DbU_%.*s Frag(string f) {\n"
+        "        if (this.sets.Length > 0) { this.sets = this.sets + \", \"; }\n"
+        "        this.sets = this.sets + f;\n"
+        "        return this;\n"
+        "    }\n"
+        "    __DbU_%.*s SetI(string c, int v) {\n"
+        "        this.sp.AddInt(v);\n"
+        "        return Frag(c + \" = ?\");\n"
+        "    }\n"
+        "    __DbU_%.*s SetD(string c, double v) {\n"
+        "        this.sp.AddDouble(v);\n"
+        "        return Frag(c + \" = ?\");\n"
+        "    }\n"
+        "    __DbU_%.*s SetS(string c, string v) {\n"
+        "        this.sp.Add(v);\n"
+        "        return Frag(c + \" = ?\");\n"
+        "    }\n"
+        "    __DbU_%.*s SetB(string c, bool v) {\n"
+        "        if (v) { this.sp.AddInt(1); } else { this.sp.AddInt(0); }\n"
+        "        return Frag(c + \" = ?\");\n"
+        "    }\n"
+        "    __DbU_%.*s SetIncrI(string c, int v) {\n"
+        "        this.sp.AddInt(v);\n"
+        "        return Frag(c + \" = \" + c + \" + ?\");\n"
+        "    }\n"
+        "    __DbU_%.*s SetIncrD(string c, double v) {\n"
+        "        this.sp.AddDouble(v);\n"
+        "        return Frag(c + \" = \" + c + \" + ?\");\n"
+        "    }\n",
+        CL, CS, CL, CS, CL, CS, CL, CS, CL, CS, TBL, TBS, CL, CS, CL, CS, CL, CS, CL, CS, CL, CS, CL, CS, CL, CS, CL, CS, CL, CS, CL, CS, CL, CS, CL, CS, CL, CS, CL, CS, CL, CS, CL, CS, CL, CS, CL, CS, CL, CS, CL, CS, CL, CS, CL, CS, CL, CS,
+        CL, CS, CL, CS);
+
+    /* SetSource records the entity; the columns are expanded at execute
+     * time so UpdateColumns/IgnoreColumns work in any chain order. */
+    dg_putf(out,
+        "    __DbU_%.*s SetSource(%.*s o) { this.src = o; return this; }\n"
+        "    void ApplySource() {\n"
+        "        if (this.src == null) { return; }\n"
+        "        %.*s o = this.src;\n"
+        "        this.src = null;\n",
+        CL, CS, CL, CS, CL, CS);
+    if (!pk) {
+        /* no primary key: nothing to key the row on */
+        dg_putf(out, "    }\n");
+    } else {
+        for (int i = 0; i < fs->count; i++) {
+            const dg_field_t *f = &fs->items[i];
+            if (f->kind == DF_NAV || f->is_pk) continue;
+            int L = (int)f->col.len;
+            const char *S = f->col.str;
+            int NL = (int)f->name.len;
+            const char *NS = f->name.str;
+            dg_putf(out, "        if (Use(\"%.*s\")) {\n", L, S);
+            switch (f->kind) {
+            case DF_INT:
+                dg_putf(out, "            SetI(\"%.*s\", o.%.*s);\n", L, S, NL, NS);
+                break;
+            case DF_ENUM:
+                dg_putf(out,
+                        "            int ev_%.*s = o.%.*s;\n"
+                        "            SetI(\"%.*s\", ev_%.*s);\n",
+                        NL, NS, NL, NS, L, S, NL, NS);
+                break;
+            case DF_DOUBLE:
+                dg_putf(out, "            SetD(\"%.*s\", o.%.*s);\n", L, S, NL, NS);
+                break;
+            case DF_BOOL:
+                dg_putf(out, "            SetB(\"%.*s\", o.%.*s);\n", L, S, NL, NS);
+                break;
+            default:
+                dg_putf(out, "            SetS(\"%.*s\", o.%.*s);\n", L, S, NL, NS);
+                break;
+            }
+            dg_putf(out, "        }\n");
+        }
+        const char *pm = pk->kind == DF_STRING   ? "P"
+                         : pk->kind == DF_DOUBLE ? "Pd"
+                                                 : "Pi";
+        dg_putf(out,
+            "        W(\"%.*s = ?\");\n"
+            "        %s(o.%.*s);\n"
+            "    }\n",
+            (int)pk->col.len, pk->col.str, pm, (int)pk->name.len,
+            pk->name.str);
+    }
+
+    dg_putf(out,
+        "    int ExecuteAffrows() {\n"
+        "        ApplySource();\n"
+        "        if (this.sets.Length == 0) { return 0; }\n"
+        "        if (this.w.Length == 0) { return 0; }\n"
+        "        string sql = \"UPDATE \" + this.tbl + \" SET \" + this.sets\n"
+        "            + \" WHERE \" + this.w;\n"
+        "        return this.db.Execute(sql, __DbBind.Cat(this.sp, this.wp));\n"
+        "    }\n"
+        "}\n");
+}
+
+static void dg_gen_delete(dg_ctx_t *c, dg_buf_t *out, zan_istr_t cls,
+                          zan_istr_t tbl) {
+    (void)c;
+    int CL = (int)cls.len;
+    const char *CS = cls.str;
+    int TBL = (int)tbl.len;
+    const char *TBS = tbl.str;
+    dg_putf(out,
+        "class __DbD_%.*s {\n"
+        "    IDbExecutor db;\n"
+        "    string tbl;\n"
+        "    string w;\n"
+        "    DbParams ps;\n"
+        "    bool on;\n"
+        "    static __DbD_%.*s Create(IDbExecutor db) {\n"
+        "        __DbD_%.*s q = new __DbD_%.*s();\n"
+        "        q.db = db;\n"
+        "        q.tbl = \"%.*s\";\n"
+        "        q.w = \"\";\n"
+        "        q.ps = DbParams.Create();\n"
+        "        q.on = true;\n"
+        "        return q;\n"
+        "    }\n"
+        "    __DbD_%.*s AsTable(string t) { this.tbl = t; return this; }\n"
+        "    __DbD_%.*s CondBegin(bool c) { this.on = c; return this; }\n"
+        "    __DbD_%.*s CondEnd() { this.on = true; return this; }\n"
+        "    __DbD_%.*s W(string f) {\n"
+        "        if (!this.on) { return this; }\n"
+        "        string u = __DbBind.Unalias(f);\n"
+        "        if (this.w.Length == 0) { this.w = u; }\n"
+        "        else { this.w = this.w + \" AND \" + u; }\n"
+        "        return this;\n"
+        "    }\n"
+        "    __DbD_%.*s WhereDict(DbValues v) {\n"
+        "        if (!this.on) { return this; }\n"
+        "        int i = 0;\n"
+        "        while (i < v.Count()) {\n"
+        "            string c = %.*sCols.Require(v.NameAt(i));\n"
+        "            W(c + \" = ?\");\n"
+        "            v.BindAs(this.ps, i, %.*sCols.Kind(c));\n"
+        "            i = i + 1;\n"
+        "        }\n"
+        "        return this;\n"
+        "    }\n"
+        "    __DbD_%.*s P(string v) {\n"
+        "        if (this.on) { this.ps.Add(v); }\n"
+        "        return this;\n"
+        "    }\n"
+        "    __DbD_%.*s Pi(int v) {\n"
+        "        if (this.on) { this.ps.AddInt(v); }\n"
+        "        return this;\n"
+        "    }\n"
+        "    __DbD_%.*s Pd(double v) {\n"
+        "        if (this.on) { this.ps.AddDouble(v); }\n"
+        "        return this;\n"
+        "    }\n"
+        "    __DbD_%.*s InI(List<int> vs) {\n"
+        "        if (!this.on) { return this; }\n"
+        "        int i = 0;\n"
+        "        while (i < vs.Count) { this.ps.AddInt(vs[i]); i = i + 1; }\n"
+        "        return this;\n"
+        "    }\n"
+        "    __DbD_%.*s InS(List<string> vs) {\n"
+        "        if (!this.on) { return this; }\n"
+        "        int i = 0;\n"
+        "        while (i < vs.Count) { this.ps.Add(vs[i]); i = i + 1; }\n"
+        "        return this;\n"
+        "    }\n"
+        "    __DbD_%.*s InD(List<double> vs) {\n"
+        "        if (!this.on) { return this; }\n"
+        "        int i = 0;\n"
+        "        while (i < vs.Count) { this.ps.AddDouble(vs[i]); i = i + 1; }\n"
+        "        return this;\n"
+        "    }\n"
+        "    int ExecuteAffrows() {\n"
+        "        if (this.w.Length == 0) { return 0; }\n"
+        "        string sql = \"DELETE FROM \" + this.tbl + \" WHERE \" + this.w;\n"
+        "        return this.db.Execute(sql, this.ps);\n"
+        "    }\n"
+        "}\n",
+        CL, CS, CL, CS, CL, CS, CL, CS, TBL, TBS, CL, CS, CL, CS, CL, CS,
+        CL, CS, CL, CS, CL, CS, CL, CS, CL, CS, CL, CS, CL, CS,
+        CL, CS, CL, CS,
+        CL, CS);
+}
+
+/* CodeFirst: creates the table when missing, otherwise adds columns the
+ * entity gained since the table was created (never drops or retypes). */
+static void dg_gen_codefirst(dg_ctx_t *c, dg_buf_t *out, zan_istr_t cls,
+                             const dg_fields_t *fs, zan_istr_t tbl) {
+    (void)c;
+    int CL = (int)cls.len;
+    const char *CS = cls.str;
+    int TBL = (int)tbl.len;
+    const char *TBS = tbl.str;
+    dg_putf(out,
+        "class __DbCF_%.*s {\n"
+        "    static void Sync(IDbExecutor db) {\n"
+        "        int p = db.GetProvider();\n"
+        "        string t = \"%.*s\";\n"
+        "        if (!__DbBind.HasTable(db, t)) {\n"
+        "            string ddl = \"CREATE TABLE \" + t + \" (\";\n",
+        CL, CS, TBL, TBS);
+    bool first = true;
+    for (int i = 0; i < fs->count; i++) {
+        const dg_field_t *f = &fs->items[i];
+        if (f->kind == DF_NAV) continue;
+        dg_putf(out,
+            "            ddl = ddl + \"%s%.*s \" + __DbBind.Ty(p, %d, %s, %s, %d);\n",
+            first ? "" : ", ", (int)f->col.len, f->col.str,
+            dg_ty_code(f->kind), f->is_pk ? "true" : "false",
+            f->is_ident ? "true" : "false", f->str_len);
+        first = false;
+    }
+    dg_putf(out,
+        "            ddl = ddl + \")\";\n"
+        "            db.Execute(ddl);\n"
+        "            return;\n"
+        "        }\n"
+        "        List<string> have = __DbBind.Cols(db, t);\n");
+    for (int i = 0; i < fs->count; i++) {
+        const dg_field_t *f = &fs->items[i];
+        if (f->kind == DF_NAV) continue;
+        dg_putf(out,
+            "        if (!__DbBind.Has(have, \"%.*s\")) {\n"
+            "            db.Execute(\"ALTER TABLE \" + t + \" ADD COLUMN %.*s \"\n"
+            "                + __DbBind.Ty(p, %d, false, false, %d));\n"
+            "        }\n",
+            (int)f->col.len, f->col.str, (int)f->col.len, f->col.str,
+            dg_ty_code(f->kind), f->str_len);
+    }
+    dg_putf(out, "    }\n}\n");
 }
 
 /* ---- entry point ---- */
@@ -1160,16 +2107,49 @@ void zan_dbgen_run(zan_ast_node_t *unit, zan_arena_t *arena,
 
     if (!c.any || zan_diag_has_errors(diag)) return;
 
+    /* Entities first: generating one may pull navigation entities into the
+     * worklist, and __DbBind needs an entry for every entity in it. */
+    dg_buf_t ents;
+    memset(&ents, 0, sizeof(ents));
+    for (int i = 0; i < c.need.count; i++) {
+        zan_istr_t cls = c.need.names[i];
+        dg_fields_t fs;
+        memset(&fs, 0, sizeof(fs));
+        dg_collect_fields(unit, dg_find_class(unit, cls), &fs, 0);
+        zan_istr_t tbl = dg_table_of(unit, cls);
+        dg_gen_cols(&c, &ents, cls, &fs);
+        dg_gen_entity(&c, &ents, cls);
+        dg_gen_insert(&c, &ents, cls, &fs, tbl);
+        dg_gen_update(&c, &ents, cls, &fs, tbl);
+        dg_gen_delete(&c, &ents, cls, tbl);
+        dg_gen_codefirst(&c, &ents, cls, &fs, tbl);
+    }
+
     dg_buf_t out;
     memset(&out, 0, sizeof(out));
     dg_putf(&out, "class __DbBind {\n");
     for (int i = 0; i < c.need.count; i++) {
         zan_istr_t cls = c.need.names[i];
+        int L = (int)cls.len;
+        const char *S = cls.str;
         dg_putf(&out,
             "    static __DbQ_%.*s Q_%.*s(IDbExecutor db) { "
-            "return __DbQ_%.*s.Create(db); }\n",
-            (int)cls.len, cls.str, (int)cls.len, cls.str, (int)cls.len,
-            cls.str);
+            "return __DbQ_%.*s.Create(db); }\n"
+            "    static __DbI_%.*s I_%.*s(IDbExecutor db) { "
+            "return __DbI_%.*s.Create(db); }\n"
+            "    static __DbI_%.*s I_%.*s(IDbExecutor db, %.*s o) { "
+            "return __DbI_%.*s.Create(db, o); }\n"
+            "    static __DbI_%.*s I_%.*s(IDbExecutor db, List<%.*s> l) { "
+            "return __DbI_%.*s.Create(db, l); }\n"
+            "    static __DbU_%.*s U_%.*s(IDbExecutor db) { "
+            "return __DbU_%.*s.Create(db); }\n"
+            "    static __DbD_%.*s D_%.*s(IDbExecutor db) { "
+            "return __DbD_%.*s.Create(db); }\n"
+            "    static void CF_%.*s(IDbExecutor db) { "
+            "__DbCF_%.*s.Sync(db); }\n",
+            L, S, L, S, L, S, L, S, L, S, L, S, L, S, L, S, L, S, L, S,
+            L, S, L, S, L, S, L, S, L, S, L, S, L, S, L, S, L, S, L, S,
+            L, S, L, S);
     }
     dg_putf(&out,
         "    static string M(int n) {\n"
@@ -1182,10 +2162,122 @@ void zan_dbgen_run(zan_ast_node_t *unit, zan_arena_t *arena,
         "        }\n"
         "        return sb.ToString();\n"
         "    }\n"
+        "    static bool Has(List<string> l, string v) {\n"
+        "        int i = 0;\n"
+        "        while (i < l.Count) {\n"
+        "            if (l[i] == v) { return true; }\n"
+        "            i = i + 1;\n"
+        "        }\n"
+        "        return false;\n"
+        "    }\n"
+        /* UPDATE/DELETE take no table alias in SQLite and friends, so the
+         * `t.` the WHERE builder emits is dropped there. */
+        "    static string Unalias(string f) { return f.Replace(\"t.\", \"\"); }\n"
+        "    static DbParams Cat(DbParams a, DbParams b) {\n"
+        "        DbParams r = DbParams.Create();\n"
+        "        __DbBind.CopyInto(a, r);\n"
+        "        __DbBind.CopyInto(b, r);\n"
+        "        return r;\n"
+        "    }\n"
+        "    static void CopyInto(DbParams src, DbParams dst) {\n"
+        "        int i = 0;\n"
+        "        while (i < src.Count()) {\n"
+        "            int k = src.KindAt(i);\n"
+        "            if (k == DbParams.KindInt) { dst.AddInt(src.IntAt(i)); }\n"
+        "            else if (k == DbParams.KindDouble) { "
+        "dst.AddDouble(src.DoubleAt(i)); }\n"
+        "            else if (k == DbParams.KindText) { dst.Add(src.TextAt(i)); }\n"
+        "            else { dst.AddNull(); }\n"
+        "            i = i + 1;\n"
+        "        }\n"
+        "    }\n"
+        "    static int LastId(IDbExecutor db) {\n"
+        "        int p = db.GetProvider();\n"
+        "        string sql = \"SELECT last_insert_rowid()\";\n"
+        "        if (p == DbProvider.MySQL || p == DbProvider.MariaDB) {\n"
+        "            sql = \"SELECT LAST_INSERT_ID()\";\n"
+        "        } else if (p == DbProvider.PostgreSQL "
+        "|| p == DbProvider.OpenGauss || p == DbProvider.Kingbase) {\n"
+        "            sql = \"SELECT lastval()\";\n"
+        "        } else if (p == DbProvider.SqlServer || p == DbProvider.DM) {\n"
+        "            sql = \"SELECT SCOPE_IDENTITY()\";\n"
+        "        }\n"
+        "        DbResult r = db.Query(sql);\n"
+        "        if (r.RowCount() == 0) { return 0; }\n"
+        "        return r.GetInt(0, 0);\n"
+        "    }\n"
+        "    static bool HasTable(IDbExecutor db, string t) {\n"
+        "        int p = db.GetProvider();\n"
+        "        string sql = \"SELECT COUNT(*) FROM information_schema.tables"
+        " WHERE table_name = ?\";\n"
+        "        if (p == DbProvider.SQLite) {\n"
+        "            sql = \"SELECT COUNT(*) FROM sqlite_master WHERE"
+        " type = 'table' AND name = ?\";\n"
+        "        }\n"
+        "        DbResult r = db.Query(sql, DbParams.Create().Add(t));\n"
+        "        if (r.RowCount() == 0) { return false; }\n"
+        "        return r.GetInt(0, 0) > 0;\n"
+        "    }\n"
+        "    static List<string> Cols(IDbExecutor db, string t) {\n"
+        "        List<string> cols = new List<string>();\n"
+        "        int p = db.GetProvider();\n"
+        "        DbResult r;\n"
+        "        int nameCol = 0;\n"
+        "        if (p == DbProvider.SQLite) {\n"
+        "            r = db.Query(\"PRAGMA table_info(\" + t + \")\");\n"
+        "            nameCol = 1;\n"
+        "        } else {\n"
+        "            r = db.Query(\"SELECT column_name FROM"
+        " information_schema.columns WHERE table_name = ?\",\n"
+        "                DbParams.Create().Add(t));\n"
+        "        }\n"
+        "        int i = 0;\n"
+        "        while (i < r.RowCount()) {\n"
+        "            cols.Add(r.GetString(i, nameCol));\n"
+        "            i = i + 1;\n"
+        "        }\n"
+        "        return cols;\n"
+        "    }\n"
+        /* kind: 0 int/enum, 1 double, 2 bool, 3 string */
+        "    static string Ty(int p, int kind, bool pk, bool ident, int len) {\n"
+        "        bool my = p == DbProvider.MySQL || p == DbProvider.MariaDB;\n"
+        "        bool pg = p == DbProvider.PostgreSQL"
+        " || p == DbProvider.OpenGauss || p == DbProvider.Kingbase;\n"
+        "        bool ms = p == DbProvider.SqlServer || p == DbProvider.DM;\n"
+        "        if (len <= 0) { len = 255; }\n"
+        "        if (ident) {\n"
+        "            if (my) { return \"INT NOT NULL AUTO_INCREMENT PRIMARY KEY\"; }\n"
+        "            if (pg) { return \"SERIAL PRIMARY KEY\"; }\n"
+        "            if (ms) { return \"INT IDENTITY(1,1) PRIMARY KEY\"; }\n"
+        "            return \"INTEGER PRIMARY KEY AUTOINCREMENT\";\n"
+        "        }\n"
+        "        string t = \"INTEGER\";\n"
+        "        if (kind == 1) {\n"
+        "            t = \"DOUBLE PRECISION\";\n"
+        "            if (my) { t = \"DOUBLE\"; }\n"
+        "            if (ms) { t = \"FLOAT\"; }\n"
+        "            if (p == DbProvider.SQLite) { t = \"REAL\"; }\n"
+        "        } else if (kind == 2) {\n"
+        "            t = \"BOOLEAN\";\n"
+        "            if (my) { t = \"TINYINT(1)\"; }\n"
+        "            if (ms) { t = \"BIT\"; }\n"
+        "            if (p == DbProvider.SQLite) { t = \"INTEGER\"; }\n"
+        "        } else if (kind == 3) {\n"
+        "            t = \"VARCHAR(\" + Convert.ToString(len) + \")\";\n"
+        "            if (p == DbProvider.SQLite) { t = \"TEXT\"; }\n"
+        "            if (ms) { t = \"NVARCHAR(\" + Convert.ToString(len) + \")\"; }\n"
+        "        } else {\n"
+        "            if (my || ms) { t = \"INT\"; }\n"
+        "        }\n"
+        "        if (pk) { t = t + \" PRIMARY KEY\"; }\n"
+        "        return t;\n"
+        "    }\n"
         "}\n");
-    /* dg_gen_entity may add nav classes to the worklist while generating */
-    for (int i = 0; i < c.need.count; i++)
-        dg_gen_entity(&c, &out, c.need.names[i]);
+    dg_putf(&out, "%.*s", (int)ents.len, ents.buf);
+    free(ents.buf);
+
+    /* ZAN_DBGEN_DUMP=1 prints the generated ORM source (debugging aid). */
+    if (getenv("ZAN_DBGEN_DUMP")) fprintf(stderr, "%.*s\n", (int)out.len, out.buf);
 
     char *gsrc = zan_arena_strdup(arena, out.buf, out.len);
     size_t glen = out.len;

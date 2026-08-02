@@ -1215,7 +1215,23 @@ static bool looks_like_var_decl(zan_parser_t *p) {
                 while (q < n && ZAN_IDCONT(s[q])) q++;
             }
             while (q < n && ZAN_WS(s[q])) q++;
-            if (q < n && s[q] == '<') return true;
+            if (q < n && s[q] == '<') {
+                /* `A.B<T> name` declares a variable, but `db.Select<T>()` is
+                 * a generic call: only a name after the matching `>` makes
+                 * this a declaration. */
+                int gd = 0; size_t r = q;
+                while (r < n) {
+                    char gc = s[r];
+                    if (gc == '<') gd++;
+                    else if (gc == '>') { gd--; if (gd == 0) { r++; break; } }
+                    else if (gc == ';' || gc == '(' || gc == ')' ||
+                             gc == '{' || gc == '}') break;
+                    r++;
+                }
+                if (gd != 0) return false;
+                while (r < n && ZAN_WS(s[r])) r++;
+                return r < n && ZAN_IDSTART(s[r]);
+            }
             if (q < n && s[q] == '[') {
                 size_t r = q + 1;
                 while (r < n && ZAN_WS(s[r])) r++;

@@ -1,0 +1,93 @@
+// ORM over a pooled connection: the chained API works on anything that is an
+// IDbExecutor, so a connection checked out of DbPool (or a typed SqlitePool)
+// drives Select/Insert/Update/Delete exactly like a directly opened one.
+using System;
+using System.Data;
+using System.Data.Sqlite;
+using System.IO;
+using System.Threading;
+
+class Task2 {
+    int id;
+    string name;
+    bool done;
+}
+
+class Program {
+    static async void Seed(DbPool pool) {
+        IDbConnection db = await pool.AcquireAsync();
+        db.SyncStructure<Task2>();
+
+        List<Task2> batch = new List<Task2> {
+            Program.Of("write docs", false),
+            Program.Of("ship orm", false),
+            Program.Of("drink tea", true)
+        };
+        Console.WriteLine("seed: " + Convert.ToString(
+            db.Insert<Task2>(batch).ExecuteAffrows()));
+        pool.Release(db);
+    }
+
+    static Task2 Of(string name, bool done) {
+        Task2 t = new Task2();
+        t.name = name;
+        t.done = done;
+        return t;
+    }
+
+    static async void Work(DbPool pool, List<string> log) {
+        IDbConnection db = await pool.AcquireAsync();
+        List<Task2> open = db.Select<Task2>()
+            .Where(t => t.done == false)
+            .OrderBy(t => t.name)
+            .ToList();
+        int i = 0;
+        while (i < open.Count) {
+            log.Add(open[i].name);
+            i = i + 1;
+        }
+        log.Add("closed: " + Convert.ToString(
+            db.Select<Task2>().Where(t => t.done).Count()));
+        pool.Release(db);
+    }
+
+    static async void Tx(SqlitePool pool) {
+        SqliteConnection db = await pool.AcquireAsync();
+        db.BeginTransaction();
+        db.Update<Task2>().Set(t => t.done, true).Where(t => t.id == 1)
+            .ExecuteAffrows();
+        db.Rollback();
+        Console.WriteLine("after rollback: " + Convert.ToString(
+            db.Select<Task2>().Where(t => t.done).Count()));
+
+        db.BeginTransaction();
+        db.Update<Task2>().Set(t => t.done, true).Where(t => t.id == 1)
+            .ExecuteAffrows();
+        db.Commit();
+        Console.WriteLine("after commit: " + Convert.ToString(
+            db.Select<Task2>().Where(t => t.done).Count()));
+        pool.Release(db);
+    }
+
+    static void Main() {
+        string path = "orm_pool.tmp.db";
+        File.Delete(path);
+        DbPool pool = SqliteConnector.Pool(path, 2);
+
+        await Program.Seed(pool);
+        List<string> log = new List<string>();
+        await Program.Work(pool, log);
+        SqlitePool typed = SqlitePool.Create(path, 2);
+        await Program.Tx(typed);
+        typed.Close();
+
+        int i = 0;
+        while (i < log.Count) {
+            Console.WriteLine("log: " + log[i]);
+            i = i + 1;
+        }
+        Console.WriteLine("idle: " + Convert.ToString(pool.IdleCount()));
+        pool.Close();
+        File.Delete(path);
+    }
+}

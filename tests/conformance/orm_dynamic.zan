@@ -1,0 +1,96 @@
+// ORM: dynamic (runtime-shaped) writes -- a submitted form or parsed JSON is
+// a DbValues bag, bound by the entity's declared column types.
+using System;
+using System.Data;
+using System.Data.Sqlite;
+using System.IO;
+
+class Blog {
+    int id;
+    string title;
+    int clicks;
+    double score;
+}
+
+class Program {
+    static void Main() {
+        string path = "orm_dynamic.tmp.db";
+        File.Delete(path);
+        SqliteConnection db = SqliteConnection.Open(path);
+        db.SyncStructure<Blog>();
+
+        DbValues form = DbValues.Create()
+            .Set(BlogCols.title, "dynamic")
+            .Set(BlogCols.clicks, 3)
+            .Set(BlogCols.score, 1.5);
+        Console.WriteLine("ins: " + Convert.ToString(
+            db.Insert<Blog>().AppendDict(form).ExecuteAffrows()));
+
+        List<DbValues> batch = new List<DbValues> {
+            DbValues.Create().Set(BlogCols.title, "a").Set(BlogCols.clicks, 1)
+                .Set(BlogCols.score, 0.5),
+            DbValues.Create().Set(BlogCols.title, "b").Set(BlogCols.clicks, 2)
+                .Set(BlogCols.score, 2.5)
+        };
+        Console.WriteLine("batch: " + Convert.ToString(
+            db.Insert<Blog>().AppendDict(batch).ExecuteAffrows()));
+
+        DbValues patch = DbValues.Create()
+            .Set(BlogCols.title, "patched")
+            .Set(BlogCols.clicks, 99);
+        Console.WriteLine("upd: " + Convert.ToString(
+            db.Update<Blog>().SetDict(patch).Where(a => a.id == 1).ExecuteAffrows()));
+
+        Blog one = db.Select<Blog>().Where(a => a.id == 1).First();
+        Console.WriteLine("row: " + one.title + " " + Convert.ToString(one.clicks)
+            + " " + Convert.ToString(one.score));
+
+        Blog e = new Blog();
+        e.id = 1;
+        e.title = "entity";
+        e.clicks = 7;
+        e.score = 9.5;
+        Console.WriteLine("src: " + Convert.ToString(
+            db.Update<Blog>().SetSource(e).UpdateColumns(a => a.title).ExecuteAffrows()));
+        Blog two = db.Select<Blog>().Where(a => a.id == 1).First();
+        Console.WriteLine("row2: " + two.title + " " + Convert.ToString(two.clicks));
+
+        DbValues cond = DbValues.Create().Set(BlogCols.title, "a");
+        Console.WriteLine("dyn: " + Convert.ToString(
+            db.Select<Blog>().WhereDict(cond).Count()));
+        Console.WriteLine("del: " + Convert.ToString(
+            db.Delete<Blog>().WhereDict(cond).ExecuteAffrows()));
+
+        // text-only input still binds by column type
+        DbValues text = DbValues.Create()
+            .Set(BlogCols.title, "typed")
+            .Set(BlogCols.clicks, "42")
+            .Set(BlogCols.score, "3");
+        Console.WriteLine("txt: " + Convert.ToString(
+            db.Insert<Blog>().AppendDict(text).ExecuteAffrows()));
+        Blog t3 = db.Select<Blog>().Where(a => a.title == "typed").First();
+        Console.WriteLine("typed: " + Convert.ToString(t3.clicks + 1)
+            + " " + Convert.ToString(t3.score + 0.5));
+
+        DbValues wrong = DbValues.Create()
+            .Set(BlogCols.title, "x")
+            .Set(BlogCols.clicks, "abc");
+        try {
+            db.Insert<Blog>().AppendDict(wrong).ExecuteAffrows();
+            Console.WriteLine("cast: not rejected");
+        } catch (Exception ce) {
+            Console.WriteLine("cast: " + ce.Message);
+        }
+
+        DbValues unknown = DbValues.Create().Set("nope", 1);
+        try {
+            db.Update<Blog>().SetDict(unknown).Where(a => a.id == 1).ExecuteAffrows();
+            Console.WriteLine("bad: not rejected");
+        } catch (Exception ex) {
+            Console.WriteLine("bad: " + ex.Message);
+        }
+
+        db.Close();
+        File.Delete(path);
+    }
+}
