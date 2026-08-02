@@ -170,6 +170,12 @@ class Semaphore {
 
     [DllImport("crt", EntryPoint = "dispatch_release")]
     static extern void MacSemRelease(string sem);
+
+    [DllImport("crt", EntryPoint = "dispatch_semaphore_wait")]
+    static extern int MacSemWaitUntil(string sem, long when);
+
+    [DllImport("crt", EntryPoint = "dispatch_time")]
+    static extern long MacDispatchTime(long base, long deltaNs);
     #else
     [DllImport("crt", EntryPoint = "calloc")]
     static extern string SemCalloc(long count, long size);
@@ -188,6 +194,12 @@ class Semaphore {
 
     [DllImport("crt", EntryPoint = "sem_destroy")]
     static extern int SemDestroy(string sem);
+
+    [DllImport("crt", EntryPoint = "sem_timedwait")]
+    static extern int SemTimedWait(string sem, nint absTime);
+
+    [DllImport("crt", EntryPoint = "clock_gettime")]
+    static extern int SemClockGettime(int clkId, nint tp);
     #endif
 
     #if WINDOWS
@@ -197,6 +209,13 @@ class Semaphore {
 
     static void Wait(nint handle) {
         WinWaitForSingleObject(handle, -1);
+    }
+
+    /// <summary>Waits at most `timeoutMs` for a permit. True when one was
+    /// taken, false when the wait timed out (nothing is consumed then).
+    /// A negative timeout waits forever, 0 polls.</summary>
+    static bool WaitFor(nint handle, int timeoutMs) {
+        return WinWaitForSingleObject(handle, timeoutMs) == 0;
     }
 
     static void Release(nint handle) {
@@ -215,6 +234,16 @@ class Semaphore {
         MacSemWait(handle, -1);   // -1 == DISPATCH_TIME_FOREVER
     }
 
+    static bool WaitFor(string handle, int timeoutMs) {
+        if (timeoutMs < 0) {
+            MacSemWait(handle, -1);
+            return true;
+        }
+        // dispatch_time(DISPATCH_TIME_NOW, delta) takes nanoseconds.
+        long when = MacDispatchTime(0, Convert.ToLong(timeoutMs) * 1000000);
+        return MacSemWaitUntil(handle, when) == 0;
+    }
+
     static void Release(string handle) {
         MacSemSignal(handle);
     }
@@ -231,6 +260,24 @@ class Semaphore {
 
     static void Wait(string handle) {
         SemWait(handle);
+    }
+
+    static bool WaitFor(string handle, int timeoutMs) {
+        if (timeoutMs < 0) {
+            SemWait(handle);
+            return true;
+        }
+        // sem_timedwait takes an ABSOLUTE CLOCK_REALTIME deadline, so read the
+        // clock and add the timeout rather than passing a duration.
+        nint ts = NativeMemory.Alloc(16);
+        SemClockGettime(0, ts);
+        Span<long> f = new Span<long>(ts, 2);
+        long ns = f[1] + Convert.ToLong(timeoutMs) * 1000000;
+        f[0] = f[0] + ns / 1000000000;
+        f[1] = ns % 1000000000;
+        int r = SemTimedWait(handle, ts);
+        NativeMemory.Free(ts);
+        return r == 0;
     }
 
     static void Release(string handle) {

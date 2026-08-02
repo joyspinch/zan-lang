@@ -1,0 +1,193 @@
+using System;
+using System.Threading;
+
+/// <summary>Destination of a streamed response body (a text/event-stream, or
+/// any reply consumed while it arrives).
+///
+/// Two modes:
+///   * file  -- chunks are appended to a file, the outcome to a marker file.
+///     A separate process or a poller tails them.
+///   * memory -- chunks accumulate in a buffer guarded by a mutex, so the
+///     request can run on a worker thread while another thread (a GUI loop,
+///     say) drains it with <c>Take</c> each frame. Nothing touches the disk.
+///
+/// The memory mode is what lets a streaming request live inside the process
+/// that renders it: only the buffer and the outcome string cross threads, and
+/// both are handed over under the lock.</summary>
+class SseSink {
+    /// Output file in file mode; "" in memory mode.
+    string path;
+    /// Marker file in file mode; "" in memory mode.
+    string donePath;
+    /// Open handle for the whole stream in file mode (0 = none).
+    nint fp;
+    /// Chunks written but not yet taken (memory mode).
+    string buf;
+    /// Outcome of the attempt that just ended ("" while one is running).
+    string attempt;
+    /// Outcome published by the owner once it will not retry ("" until then).
+    string done;
+    /// Total bytes written, so a poller can tell "still streaming" from
+    /// "nothing yet" without draining the buffer.
+    int total;
+    #if WINDOWS
+    nint lockHandle;
+    #else
+    string lockHandle;
+    #endif
+
+    [DllImport("crt", EntryPoint = "fopen")]
+    static extern nint fopen(string path, string mode);
+
+    [DllImport("crt", EntryPoint = "fclose")]
+    static extern int fclose(nint fp);
+
+    [DllImport("crt", EntryPoint = "fwrite")]
+    static extern long fwrite(string buf, long size, long count, nint fp);
+
+    /// <summary>A sink that appends the body to <paramref name="outFile"/> and
+    /// the outcome to <paramref name="doneFile"/>.</summary>
+    static SseSink ToFile(string outFile, string doneFile) {
+        SseSink s = new SseSink();
+        s.path = outFile;
+        s.donePath = doneFile;
+        s.fp = 0;
+        s.buf = "";
+        s.attempt = "";
+        s.done = "";
+        s.total = 0;
+        s.lockHandle = Mutex.Create();
+        return s;
+    }
+
+    /// <summary>A sink that keeps the body in memory for another thread to
+    /// read with <c>All</c> (or drain with <c>Take</c>).</summary>
+    static SseSink ToMemory() {
+        SseSink s = new SseSink();
+        s.path = "";
+        s.donePath = "";
+        s.fp = 0;
+        s.buf = "";
+        s.attempt = "";
+        s.done = "";
+        s.total = 0;
+        s.lockHandle = Mutex.Create();
+        return s;
+    }
+
+    /// <summary>Prepares the sink for a new stream (truncates the file, drops
+    /// any buffered text). Called by the transport before the first chunk.
+    /// </summary>
+    void Begin() {
+        Mutex.Lock(this.lockHandle);
+        this.buf = "";
+        this.attempt = "";
+        this.total = 0;
+        Mutex.Unlock(this.lockHandle);
+        if (this.path != "") {
+            nint t = SseSink.fopen(this.path, "wb");
+            if (t != 0) { SseSink.fclose(t); }
+            this.fp = SseSink.fopen(this.path, "ab");
+        }
+    }
+
+    /// <summary>Appends one decoded chunk.</summary>
+    void Write(string piece) {
+        if (piece.Length == 0) { return; }
+        if (this.path != "") {
+            if (this.fp != 0) {
+                long _w = SseSink.fwrite(piece, 1, piece.Length, this.fp);
+            }
+            Mutex.Lock(this.lockHandle);
+            this.total = this.total + piece.Length;
+            Mutex.Unlock(this.lockHandle);
+            return;
+        }
+        Mutex.Lock(this.lockHandle);
+        this.buf = this.buf + piece;
+        this.total = this.total + piece.Length;
+        Mutex.Unlock(this.lockHandle);
+    }
+
+    /// <summary>Ends one attempt with an outcome marker ("ok" or "err: ...").
+    /// An owner that retries reads it with <c>Attempt</c> and publishes the
+    /// final outcome itself; a plain single-shot caller (the file mode) gets
+    /// it written to the marker file right here.</summary>
+    void Finish(string marker) {
+        if (this.fp != 0) { SseSink.fclose(this.fp); this.fp = 0; }
+        if (this.donePath != "") {
+            nint dp = SseSink.fopen(this.donePath, "ab");
+            if (dp != 0) {
+                long _w = SseSink.fwrite(marker, 1, marker.Length, dp);
+                SseSink.fclose(dp);
+            }
+        }
+        Mutex.Lock(this.lockHandle);
+        this.attempt = marker;
+        if (this.path != "") { this.done = marker; }
+        Mutex.Unlock(this.lockHandle);
+    }
+
+    /// <summary>The outcome of the last finished attempt ("" while one runs).
+    /// </summary>
+    string Attempt() {
+        Mutex.Lock(this.lockHandle);
+        string s = this.attempt;
+        Mutex.Unlock(this.lockHandle);
+        return s;
+    }
+
+    /// <summary>Publishes the final outcome to readers of <c>Done</c>.
+    /// </summary>
+    void Publish(string marker) {
+        Mutex.Lock(this.lockHandle);
+        this.done = marker;
+        Mutex.Unlock(this.lockHandle);
+    }
+
+    /// <summary>Everything received since <c>Begin</c>, without consuming it
+    /// (memory mode). A reader that re-parses the whole body each frame -- a
+    /// UI showing the answer build up -- wants this rather than <c>Take</c>.
+    /// </summary>
+    string All() {
+        Mutex.Lock(this.lockHandle);
+        string s = this.buf;
+        Mutex.Unlock(this.lockHandle);
+        return s;
+    }
+
+    /// <summary>Removes and returns everything buffered so far (memory mode).
+    /// </summary>
+    string Take() {
+        Mutex.Lock(this.lockHandle);
+        string s = this.buf;
+        this.buf = "";
+        Mutex.Unlock(this.lockHandle);
+        return s;
+    }
+
+    /// <summary>The outcome marker, or "" while the stream is still running.
+    /// </summary>
+    string Done() {
+        Mutex.Lock(this.lockHandle);
+        string s = this.done;
+        Mutex.Unlock(this.lockHandle);
+        return s;
+    }
+
+    /// <summary>Bytes received so far (an idle watchdog can watch this).
+    /// </summary>
+    int Total() {
+        Mutex.Lock(this.lockHandle);
+        int n = this.total;
+        Mutex.Unlock(this.lockHandle);
+        return n;
+    }
+
+    /// <summary>Releases the lock handle. The sink must not be used after
+    /// this.</summary>
+    void Dispose() {
+        if (this.fp != 0) { SseSink.fclose(this.fp); this.fp = 0; }
+        Mutex.Destroy(this.lockHandle);
+    }
+}

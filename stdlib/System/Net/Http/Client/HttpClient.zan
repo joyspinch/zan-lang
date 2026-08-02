@@ -541,11 +541,23 @@ class HttpClient {
     /// "ok" on a clean end or "err: ..." otherwise (including a non-2xx status,
     /// whose error body is still streamed to outFile).</summary>
     async int PostSseToFileAsync(string path, string body, string outFile, string doneFile) {
-        HttpClient.TruncateFile(outFile);
+        SseSink sink = SseSink.ToFile(outFile, doneFile);
+        int r = await this.PostSseToSinkAsync(path, body, sink);
+        sink.Dispose();
+        return r;
+    }
+
+    /// <summary>Same stream, but delivered to an <see cref="SseSink"/>. A
+    /// memory sink keeps the whole exchange inside the process: the request
+    /// can run on a worker thread while the thread that renders the answer
+    /// drains the sink, with no temporary files and no helper process.
+    /// </summary>
+    async int PostSseToSinkAsync(string path, string body, SseSink sink) {
+        sink.Begin();
         Socket.Initialize();
         TcpClient conn = await TcpClient.ConnectAsync(this.host, this.port, this.timeout);
         if (conn == null) {
-            HttpClient.AppendText(doneFile, "err: connect to " + this.host + " failed");
+            sink.Finish("err: connect to " + this.host + " failed");
             return 0;
         }
 
@@ -561,7 +573,7 @@ class HttpClient {
             }
             if (ctx == null) {
                 conn.Close();
-                HttpClient.AppendText(doneFile, "err: TLS context");
+                sink.Finish("err: TLS context");
                 return 0;
             }
             if (!this.verifyTls) { ctx.DisableVerify(); }
@@ -570,7 +582,7 @@ class HttpClient {
             if (stream == null) {
                 conn.Close();
                 ctx.Free();
-                HttpClient.AppendText(doneFile, "err: TLS handshake with " + this.host + " failed");
+                sink.Finish("err: TLS handshake with " + this.host + " failed");
                 return 0;
             }
         }
@@ -607,7 +619,7 @@ class HttpClient {
             HttpDeadline.Disarm(watch);
             if (this.useTls) { stream.Close(); conn.Close(); ctx.Free(); }
             else { conn.Close(); }
-            HttpClient.AppendText(doneFile, "err: no response head");
+            sink.Finish("err: no response head");
             return 0;
         }
 
@@ -617,11 +629,6 @@ class HttpClient {
         string pending = head.Substring(hb + 4, head.Length - hb - 4);
         head = "";
         headOnly = "";
-
-        // One open handle for the whole stream: an fopen/fclose per chunk (the
-        // old AppendText) costs a filesystem round-trip for every SSE token.
-        // fwrite keeps NUL bytes intact where fputs would truncate.
-        nint outfp = fopen(outFile, "ab");
 
         bool finished = false;
         // A stream only counts as done when the peer said so: the [DONE] sentinel
@@ -650,9 +657,7 @@ class HttpClient {
                             int need = crlf + 2 + size + 2;
                             if (pending.Length >= need) {
                                 string piece = pending.Substring(crlf + 2, size);
-                                if (outfp != 0) {
-                                    long _w = fwrite(piece, 1, piece.Length, outfp);
-                                }
+                                sink.Write(piece);
                                 doneScan = doneScan + piece;
                                 if (doneScan.Length > 64) {
                                     doneScan = doneScan.Substring(doneScan.Length - 64, 64);
@@ -668,9 +673,7 @@ class HttpClient {
                 }
             } else {
                 if (pending.Length > 0) {
-                    if (outfp != 0) {
-                        long _w2 = fwrite(pending, 1, pending.Length, outfp);
-                    }
+                    sink.Write(pending);
                     doneScan = doneScan + pending;
                     if (doneScan.Length > 64) {
                         doneScan = doneScan.Substring(doneScan.Length - 64, 64);
@@ -699,8 +702,6 @@ class HttpClient {
                 }
             }
         }
-        if (outfp != 0) { fclose(outfp); }
-
         bool late = HttpDeadline.Expired(watch);
         HttpDeadline.Disarm(watch);
         if (this.useTls) {
@@ -712,17 +713,17 @@ class HttpClient {
         }
 
         if (late) {
-            HttpClient.AppendText(doneFile, "err: timeout");
+            sink.Finish("err: timeout");
         } else if (!cleanEnd) {
             // The peer closed before the terminal chunk: the stream was cut
             // off, so surface it as a retryable failure instead of a success.
-            HttpClient.AppendText(doneFile, "err: connection closed");
+            sink.Finish("err: connection closed");
         } else if (status >= 200 && status < 300) {
-            HttpClient.AppendText(doneFile, "ok");
+            sink.Finish("ok");
         } else if (status == 0) {
-            HttpClient.AppendText(doneFile, "err: no response");
+            sink.Finish("err: no response");
         } else {
-            HttpClient.AppendText(doneFile, "err: HTTP " + Convert.ToString(status));
+            sink.Finish("err: HTTP " + Convert.ToString(status));
         }
         return 0;
     }
@@ -1027,3 +1028,4 @@ class HttpClient {
         return written;
     }
 }
+

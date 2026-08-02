@@ -1,0 +1,241 @@
+using System;
+
+namespace System.Threading;
+
+/// <summary>
+/// A hand-off queue between OS threads -- the equivalent of C#'s
+/// <c>BlockingCollection</c> / <c>Channel</c>.
+///
+/// <code>
+/// BlockingQueue&lt;string&gt; q = BlockingQueue&lt;string&gt;.Create(null);
+/// Thread.Start(() =&gt; { q.Enqueue("row"); q.Complete(); });
+/// string row = q.Dequeue();          // parks until an item or completion
+/// while (row != null) { ...; row = q.Dequeue(); }
+/// </code>
+///
+/// <see cref="Channel"/> is a coroutine primitive: it hands values between
+/// tasks driven by ONE thread's scheduler and would spin (or miss a wake-up)
+/// across real threads. This queue is the cross-thread one: the item list is
+/// guarded by a mutex, and a consumer with nothing to take parks on an OS
+/// semaphore until a producer posts. `Dequeue` returns null once the queue is
+/// completed and drained, so a consumer loop ends on its own -- `empty` is
+/// the sentinel the queue hands back then, supplied at Create because a
+/// generic value type has no null.
+/// </summary>
+class BlockingQueue<T> {
+    List<T> items;
+    /// Index of the next item to hand out; the list is compacted lazily so a
+    /// long-lived queue does not shift every element on each take.
+    int head;
+    /// Set by Complete: no more items will arrive, so parked consumers are
+    /// released with null instead of waiting forever.
+    bool closed;
+    int waiters;
+    /// Items the queue may hold before producers are made to wait; 0 means
+    /// unbounded.
+    int capacity;
+    /// Producers parked on `slots` because the queue is full.
+    int posters;
+    /// Handed back by a take that has nothing to give.
+    T empty;
+
+    #if WINDOWS
+    nint lockHandle;
+    nint sem;
+    nint slots;
+    #else
+    string lockHandle;
+    string sem;
+    string slots;
+    #endif
+
+    BlockingQueue() {
+        this.head = 0;
+        this.closed = false;
+        this.waiters = 0;
+        this.capacity = 0;
+        this.posters = 0;
+    }
+
+    static BlockingQueue<T> Create(T empty) {
+        return BlockingQueue<T>.CreateBounded(empty, 0);
+    }
+
+    /// <summary>A queue that holds at most `capacity` items: once it is full a
+    /// producer parks in Enqueue until a consumer takes one, so a fast
+    /// producer cannot outrun its consumer and grow the queue without bound.
+    /// A capacity of 0 is unbounded.</summary>
+    static BlockingQueue<T> CreateBounded(T empty, int capacity) {
+        BlockingQueue<T> q = new BlockingQueue<T>();
+        q.items = new List<T>();
+        q.empty = empty;
+        if (capacity < 0) { capacity = 0; }
+        q.capacity = capacity;
+        q.lockHandle = Mutex.Create();
+        q.sem = Semaphore.Create(0, 1048576);
+        q.slots = Semaphore.Create(0, 1048576);
+        return q;
+    }
+
+    /// <summary>Posts one item and wakes a parked consumer, parking the caller
+    /// while a bounded queue is full. False once the queue is completed.</summary>
+    bool Enqueue(T item) {
+        while (true) {
+            Mutex.Lock(this.lockHandle);
+            if (this.closed) {
+                Mutex.Unlock(this.lockHandle);
+                return false;
+            }
+            if (this.capacity > 0
+                && this.items.Count - this.head >= this.capacity) {
+                this.posters = this.posters + 1;
+                Mutex.Unlock(this.lockHandle);
+                Semaphore.Wait(this.slots);
+                // Woken by a take or by Complete: re-check under the lock.
+                continue;
+            }
+            this.items.Add(item);
+            bool wake = this.waiters > 0;
+            if (wake) { this.waiters = this.waiters - 1; }
+            Mutex.Unlock(this.lockHandle);
+            if (wake) { Semaphore.Release(this.sem); }
+            return true;
+        }
+    }
+
+    /// <summary>Takes the next item, or the `empty` sentinel when the queue
+    /// has nothing right now.</summary>
+    T TryDequeue() {
+        Mutex.Lock(this.lockHandle);
+        T v = this.TakeLocked();
+        bool room = this.posters > 0;
+        if (room) { this.posters = this.posters - 1; }
+        Mutex.Unlock(this.lockHandle);
+        if (room) { Semaphore.Release(this.slots); }
+        return v;
+    }
+
+    /// <summary>Takes the next item, waiting at most `timeoutMs` for one.
+    /// Returns the `empty` sentinel both when the wait runs out and when the
+    /// queue is completed and drained; <see cref="IsCompleted"/> tells the two
+    /// apart. A negative timeout waits forever.</summary>
+    T DequeueFor(int timeoutMs) {
+        while (true) {
+            Mutex.Lock(this.lockHandle);
+            if (this.head < this.items.Count) {
+                T v = this.TakeLocked();
+                bool room = this.posters > 0;
+                if (room) { this.posters = this.posters - 1; }
+                Mutex.Unlock(this.lockHandle);
+                if (room) { Semaphore.Release(this.slots); }
+                return v;
+            }
+            if (this.closed) {
+                Mutex.Unlock(this.lockHandle);
+                return this.empty;
+            }
+            this.waiters = this.waiters + 1;
+            Mutex.Unlock(this.lockHandle);
+            if (Semaphore.WaitFor(this.sem, timeoutMs)) { continue; }
+            // Timed out: withdraw the registration unless a producer has
+            // already paired it with a post, in which case loop once more and
+            // pick the item up.
+            Mutex.Lock(this.lockHandle);
+            bool parked = this.waiters > 0;
+            if (parked) { this.waiters = this.waiters - 1; }
+            Mutex.Unlock(this.lockHandle);
+            if (parked) { return this.empty; }
+            Semaphore.Wait(this.sem);
+        }
+    }
+
+    /// <summary>Takes the next item, parking the calling thread until one is
+    /// posted. Returns the `empty` sentinel once the queue is completed and
+    /// drained.</summary>
+    T Dequeue() {
+        while (true) {
+            Mutex.Lock(this.lockHandle);
+            if (this.head < this.items.Count) {
+                T v = this.TakeLocked();
+                bool room = this.posters > 0;
+                if (room) { this.posters = this.posters - 1; }
+                Mutex.Unlock(this.lockHandle);
+                if (room) { Semaphore.Release(this.slots); }
+                return v;
+            }
+            if (this.closed) {
+                Mutex.Unlock(this.lockHandle);
+                return this.empty;
+            }
+            this.waiters = this.waiters + 1;
+            Mutex.Unlock(this.lockHandle);
+            Semaphore.Wait(this.sem);
+            // Woken for an item or for completion: loop and re-read under the
+            // lock, which is also what makes a spurious wake harmless.
+        }
+    }
+
+    /// <summary>Ends the queue: no further items are accepted and every
+    /// parked consumer is released.</summary>
+    void Complete() {
+        Mutex.Lock(this.lockHandle);
+        this.closed = true;
+        int wake = this.waiters;
+        this.waiters = 0;
+        int free = this.posters;
+        this.posters = 0;
+        Mutex.Unlock(this.lockHandle);
+        int i = 0;
+        while (i < wake) {
+            Semaphore.Release(this.sem);
+            i = i + 1;
+        }
+        // A producer parked on a full queue must come back and see `closed`
+        // instead of waiting for room that will never be taken.
+        int j = 0;
+        while (j < free) {
+            Semaphore.Release(this.slots);
+            j = j + 1;
+        }
+    }
+
+    bool IsCompleted() {
+        Mutex.Lock(this.lockHandle);
+        bool v = this.closed && this.head >= this.items.Count;
+        Mutex.Unlock(this.lockHandle);
+        return v;
+    }
+
+    /// <summary>Items waiting to be taken.</summary>
+    int Count() {
+        Mutex.Lock(this.lockHandle);
+        int v = this.items.Count - this.head;
+        Mutex.Unlock(this.lockHandle);
+        return v;
+    }
+
+    void Dispose() {
+        Semaphore.Destroy(this.sem);
+        Semaphore.Destroy(this.slots);
+        Mutex.Destroy(this.lockHandle);
+    }
+
+    /// Pops one item; the caller holds the lock. Compacts once the consumed
+    /// prefix is the bigger half, which keeps both ends O(1) amortized.
+    T TakeLocked() {
+        if (this.head >= this.items.Count) { return this.empty; }
+        T v = this.items[this.head];
+        this.head = this.head + 1;
+        if (this.head > 64 && this.head * 2 >= this.items.Count) {
+            List<T> rest = new List<T>();
+            int i = this.head;
+            while (i < this.items.Count) {
+                rest.Add(this.items[i]);
+                i = i + 1;
+            }
+            this.items = rest;
+            this.head = 0;
+        }
+        return v;
+    }
+}

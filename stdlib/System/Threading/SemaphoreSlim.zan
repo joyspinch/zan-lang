@@ -1,0 +1,177 @@
+using System;
+
+namespace System.Threading;
+
+/// <summary>
+/// A counting throttle whose limit can be changed while work is in flight --
+/// the equivalent of C#'s <c>SemaphoreSlim</c> plus a live
+/// <c>maxConcurrency</c> knob.
+///
+/// <code>
+/// SemaphoreSlim gate = SemaphoreSlim.Create(4);   // 4 workers at a time
+/// gate.Wait();
+/// try { ... } finally { gate.Release(); }
+/// gate.SetLimit(8);                               // ramp up, waiters wake
+/// </code>
+///
+/// Admission is decided under a mutex; a caller that cannot be admitted parks
+/// on an OS semaphore and is woken by whoever frees a slot -- no spinning and
+/// no timer. Raising the limit admits exactly as many parked waiters as the
+/// new headroom allows. Lowering it never interrupts work already running:
+/// the extra permits simply stop being handed out as callers return them, so
+/// concurrency drains down to the new limit.
+/// </summary>
+class SemaphoreSlim {
+    /// Slots that may be held at once. Changed at any time by SetLimit.
+    int limit;
+    /// Slots currently held by callers that returned from Wait.
+    int active;
+    /// Callers parked on `sem` waiting for a slot.
+    int waiters;
+
+    #if WINDOWS
+    nint lockHandle;
+    nint sem;
+    #else
+    string lockHandle;
+    string sem;
+    #endif
+
+    SemaphoreSlim() {
+        this.limit = 1;
+        this.active = 0;
+        this.waiters = 0;
+    }
+
+    /// <summary>A throttle that admits `limit` callers at a time.</summary>
+    static SemaphoreSlim Create(int limit) {
+        SemaphoreSlim s = new SemaphoreSlim();
+        if (limit < 0) { limit = 0; }
+        s.limit = limit;
+        s.lockHandle = Mutex.Create();
+        // The OS semaphore only parks waiters; the permit count that matters
+        // is `limit - active`, kept under the mutex. Its own maximum is just
+        // an upper bound on parked threads.
+        s.sem = Semaphore.Create(0, 1048576);
+        return s;
+    }
+
+    /// <summary>Takes a slot, blocking the calling thread until one is
+    /// free.</summary>
+    void Wait() {
+        Mutex.Lock(this.lockHandle);
+        if (this.active < this.limit) {
+            this.active = this.active + 1;
+            Mutex.Unlock(this.lockHandle);
+            return;
+        }
+        this.waiters = this.waiters + 1;
+        Mutex.Unlock(this.lockHandle);
+        // The slot is handed over by the releaser (it already counted this
+        // caller in `active`), so there is nothing to re-check on wake-up.
+        Semaphore.Wait(this.sem);
+    }
+
+    /// <summary>Takes a slot, waiting at most `timeoutMs` for one. True when
+    /// a slot was taken (the caller must Release it), false when the wait ran
+    /// out. A negative timeout waits forever.</summary>
+    bool WaitFor(int timeoutMs) {
+        Mutex.Lock(this.lockHandle);
+        if (this.active < this.limit) {
+            this.active = this.active + 1;
+            Mutex.Unlock(this.lockHandle);
+            return true;
+        }
+        this.waiters = this.waiters + 1;
+        Mutex.Unlock(this.lockHandle);
+        if (Semaphore.WaitFor(this.sem, timeoutMs)) { return true; }
+
+        // Timed out. Withdraw the registration -- unless every registration
+        // has already been paired with a hand-off, in which case a releaser
+        // counted this caller into `active` and posted (or is posting) the
+        // permit: consume it rather than leaking the slot.
+        Mutex.Lock(this.lockHandle);
+        if (this.waiters > 0) {
+            this.waiters = this.waiters - 1;
+            Mutex.Unlock(this.lockHandle);
+            return false;
+        }
+        Mutex.Unlock(this.lockHandle);
+        Semaphore.Wait(this.sem);
+        return true;
+    }
+
+    /// <summary>Takes a slot only if one is free right now. True when it
+    /// was taken -- the caller must Release it.</summary>
+    bool TryWait() {
+        Mutex.Lock(this.lockHandle);
+        bool got = this.active < this.limit;
+        if (got) { this.active = this.active + 1; }
+        Mutex.Unlock(this.lockHandle);
+        return got;
+    }
+
+    /// <summary>Returns a slot. Wakes one waiter when the limit allows.</summary>
+    void Release() {
+        Mutex.Lock(this.lockHandle);
+        if (this.active > 0) { this.active = this.active - 1; }
+        bool wake = this.waiters > 0 && this.active < this.limit;
+        if (wake) {
+            this.waiters = this.waiters - 1;
+            this.active = this.active + 1;
+        }
+        Mutex.Unlock(this.lockHandle);
+        if (wake) { Semaphore.Release(this.sem); }
+    }
+
+    /// <summary>Changes how many callers may hold a slot at once, at any
+    /// time. Returns how many parked waiters the new limit let in.</summary>
+    int SetLimit(int limit) {
+        if (limit < 0) { limit = 0; }
+        Mutex.Lock(this.lockHandle);
+        this.limit = limit;
+        int wake = 0;
+        while (this.waiters > 0 && this.active < this.limit) {
+            this.waiters = this.waiters - 1;
+            this.active = this.active + 1;
+            wake = wake + 1;
+        }
+        Mutex.Unlock(this.lockHandle);
+        int i = 0;
+        while (i < wake) {
+            Semaphore.Release(this.sem);
+            i = i + 1;
+        }
+        return wake;
+    }
+
+    /// <summary>The current limit.</summary>
+    int Limit() {
+        Mutex.Lock(this.lockHandle);
+        int v = this.limit;
+        Mutex.Unlock(this.lockHandle);
+        return v;
+    }
+
+    /// <summary>Slots held right now.</summary>
+    int Active() {
+        Mutex.Lock(this.lockHandle);
+        int v = this.active;
+        Mutex.Unlock(this.lockHandle);
+        return v;
+    }
+
+    /// <summary>Callers parked waiting for a slot.</summary>
+    int Waiting() {
+        Mutex.Lock(this.lockHandle);
+        int v = this.waiters;
+        Mutex.Unlock(this.lockHandle);
+        return v;
+    }
+
+    /// <summary>Frees the OS handles. No caller may be parked.</summary>
+    void Dispose() {
+        Semaphore.Destroy(this.sem);
+        Mutex.Destroy(this.lockHandle);
+    }
+}
