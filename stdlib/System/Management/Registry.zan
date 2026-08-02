@@ -1,0 +1,371 @@
+using System;
+
+namespace System.Management;
+
+/// <summary>
+/// One registry value: `name` ("" for the default value), `type` (one of
+/// the <see cref="Registry"/> type constants) and the raw byte payload.
+/// Decode with the typed getters.
+/// </summary>
+class RegistryValue {
+    public string name;
+    public int type;
+    public byte[] data;
+}
+
+/// <summary>
+/// Windows registry access: open/create keys, read/write the common value
+/// types (DWORD/QWORD/SZ/EXPAND_SZ/MULTI_SZ/BINARY), enumerate subkeys and
+/// values, delete keys and values. Root keys are passed as the HKLM/HKCU/...
+/// constants. This module is Windows-only; other platforms throw
+/// PlatformNotSupportedException.
+///
+///   int k = Registry.OpenKey(Registry.Hkcu(), "Software\\MyApp", true);
+///   Registry.SetDword(k, "Count", 3);
+///   int n = Registry.GetDword(k, "Count");
+///   Registry.CloseKey(k);
+/// </summary>
+class Registry {
+    /// Root key handles (advapi32 predefined keys).
+    static nint Hkcr() { return (nint)0x80000000; }
+    static nint Hkcu() { return (nint)0x80000001; }
+    static nint Hklm() { return (nint)0x80000002; }
+    static nint Hkusers() { return (nint)0x80000003; }
+    static nint HkcurrentConfig() { return (nint)0x80000005; }
+
+    /// Value type constants (reg.h).
+    static int TypeNone() { return 0; }
+    static int TypeSz() { return 1; }
+    static int TypeExpandSz() { return 2; }
+    static int TypeBinary() { return 3; }
+    static int TypeDword() { return 4; }
+    static int TypeMultiSz() { return 7; }
+    static int TypeQword() { return 11; }
+
+    #if WINDOWS
+    [DllImport("advapi32", EntryPoint = "RegOpenKeyExW")]
+    static extern int RegOpenKeyExW(nint hKey, nint subKey, int options,
+                                    int access, nint result);
+
+    [DllImport("advapi32", EntryPoint = "RegCreateKeyExW")]
+    static extern int RegCreateKeyExW(nint hKey, nint subKey, int reserved,
+                                      nint classBuf, int options, int access,
+                                      nint secAttrs, nint result, nint disp);
+
+    [DllImport("advapi32", EntryPoint = "RegCloseKey")]
+    static extern int RegCloseKey(nint hKey);
+
+    [DllImport("advapi32", EntryPoint = "RegQueryValueExW")]
+    static extern int RegQueryValueExW(nint hKey, nint name, nint reserved,
+                                       nint type, nint data, nint dataSize);
+
+    [DllImport("advapi32", EntryPoint = "RegSetValueExW")]
+    static extern int RegSetValueExW(nint hKey, nint name, int reserved,
+                                     int type, nint data, int dataSize);
+
+    [DllImport("advapi32", EntryPoint = "RegDeleteValueW")]
+    static extern int RegDeleteValueW(nint hKey, nint name);
+
+    [DllImport("advapi32", EntryPoint = "RegDeleteKeyW")]
+    static extern int RegDeleteKeyW(nint hKey, nint subKey);
+
+    [DllImport("advapi32", EntryPoint = "RegDeleteTreeW")]
+    static extern int RegDeleteTreeW(nint hKey, nint subKey);
+
+    [DllImport("advapi32", EntryPoint = "RegEnumKeyExW")]
+    static extern int RegEnumKeyExW(nint hKey, int index, nint nameBuf,
+                                    nint nameSize, nint reserved, nint classBuf,
+                                    nint classSize, nint lastWrite);
+
+    [DllImport("advapi32", EntryPoint = "RegEnumValueW")]
+    static extern int RegEnumValueW(nint hKey, int index, nint nameBuf,
+                                    nint nameSize, nint reserved, nint type,
+                                    nint data, nint dataSize);
+    #endif
+
+    /// <summary>Opens an existing key with read (or write when `write` is
+    /// true) access. Returns the key handle (nonzero), or 0 when the key
+    /// does not exist or access is denied. Close with <see cref="CloseKey"/>.</summary>
+    static nint OpenKey(nint root, string subKey, bool write) {
+        #if WINDOWS
+        int access = 0x20019;   // KEY_READ
+        if (write) { access = 0x2001F; }   // KEY_READ | KEY_WRITE
+        nint wkey = Wide.Of(subKey);
+        nint result = NativeMemory.Alloc(8);
+        int r = Registry.RegOpenKeyExW(root, wkey, 0, access, result);
+        Wide.Free(wkey);
+        nint h = 0;
+        if (r == 0) { h = new Span<nint>(result, 1)[0]; }
+        NativeMemory.Free(result);
+        return h;
+        #else
+        throw new PlatformNotSupportedException(
+            "Registry is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>Creates (or opens) a key, creating missing parents.
+    /// Returns the key handle (nonzero) or 0 on failure.</summary>
+    static nint CreateKey(nint root, string subKey) {
+        #if WINDOWS
+        nint wkey = Wide.Of(subKey);
+        nint result = NativeMemory.Alloc(8);
+        int r = Registry.RegCreateKeyExW(root, wkey, 0, 0, 0,
+            0x2001F /*KEY_READ | KEY_WRITE*/, 0, result, 0);
+        Wide.Free(wkey);
+        nint h = 0;
+        if (r == 0) { h = new Span<nint>(result, 1)[0]; }
+        NativeMemory.Free(result);
+        return h;
+        #else
+        throw new PlatformNotSupportedException(
+            "Registry is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>Closes a key handle opened by OpenKey/CreateKey.</summary>
+    static void CloseKey(nint key) {
+        #if WINDOWS
+        if (key != 0) { Registry.RegCloseKey(key); }
+        #else
+        throw new PlatformNotSupportedException(
+            "Registry is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>Reads a DWORD value. `fallback` is returned when the value
+    /// is missing or has a different type.</summary>
+    static int GetDword(nint key, string name, int fallback) {
+        #if WINDOWS
+        nint wname = Wide.Of(name);
+        nint data = NativeMemory.Alloc(4);
+        nint size = NativeMemory.Alloc(4);
+        nint type = NativeMemory.Alloc(4);
+        new Span<int>(size, 1)[0] = 4;
+        int r = Registry.RegQueryValueExW(key, wname, 0, type, data, size);
+        int v = fallback;
+        if (r == 0 && new Span<int>(type, 1)[0] == 4) {
+            v = new Span<int>(data, 1)[0];
+        }
+        NativeMemory.Free(data);
+        NativeMemory.Free(size);
+        NativeMemory.Free(type);
+        Wide.Free(wname);
+        return v;
+        #else
+        throw new PlatformNotSupportedException(
+            "Registry is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>Writes a DWORD value (creates it if missing).</summary>
+    static void SetDword(nint key, string name, int val) {
+        #if WINDOWS
+        nint wname = Wide.Of(name);
+        nint data = NativeMemory.Alloc(4);
+        new Span<int>(data, 1)[0] = val;
+        Registry.RegSetValueExW(key, wname, 0, 4, data, 4);
+        NativeMemory.Free(data);
+        Wide.Free(wname);
+        #else
+        throw new PlatformNotSupportedException(
+            "Registry is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>Reads a QWORD (64-bit) value. 0 when missing or mistyped.</summary>
+    static long GetQword(nint key, string name) {
+        #if WINDOWS
+        nint wname = Wide.Of(name);
+        nint data = NativeMemory.Alloc(8);
+        nint size = NativeMemory.Alloc(4);
+        nint type = NativeMemory.Alloc(4);
+        new Span<int>(size, 1)[0] = 8;
+        int r = Registry.RegQueryValueExW(key, wname, 0, type, data, size);
+        long v = 0;
+        if (r == 0 && new Span<int>(type, 1)[0] == 11) {
+            v = new Span<long>(data, 1)[0];
+        }
+        NativeMemory.Free(data);
+        NativeMemory.Free(size);
+        NativeMemory.Free(type);
+        Wide.Free(wname);
+        return v;
+        #else
+        throw new PlatformNotSupportedException(
+            "Registry is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>Writes a QWORD (64-bit) value.</summary>
+    static void SetQword(nint key, string name, long val) {
+        #if WINDOWS
+        nint wname = Wide.Of(name);
+        nint data = NativeMemory.Alloc(8);
+        new Span<long>(data, 1)[0] = val;
+        Registry.RegSetValueExW(key, wname, 0, 11, data, 8);
+        NativeMemory.Free(data);
+        Wide.Free(wname);
+        #else
+        throw new PlatformNotSupportedException(
+            "Registry is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>Reads a REG_SZ value. "" when missing.</summary>
+    static string GetString(nint key, string name) {
+        #if WINDOWS
+        nint wname = Wide.Of(name);
+        nint data = NativeMemory.Alloc(4096);
+        nint size = NativeMemory.Alloc(4);
+        nint type = NativeMemory.Alloc(4);
+        new Span<int>(size, 1)[0] = 4096;
+        int r = Registry.RegQueryValueExW(key, wname, 0, type, data, size);
+        string s = "";
+        int t = 0;
+        if (r == 0) { t = new Span<int>(type, 1)[0]; }
+        if (r == 0 && (t == 1 || t == 2)) {
+            int bytes = new Span<int>(size, 1)[0];
+            if (bytes > 2) { s = Wide.Read(data); }
+        }
+        NativeMemory.Free(data);
+        NativeMemory.Free(size);
+        NativeMemory.Free(type);
+        Wide.Free(wname);
+        return s;
+        #else
+        throw new PlatformNotSupportedException(
+            "Registry is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>Writes a REG_SZ value.</summary>
+    static void SetString(nint key, string name, string val) {
+        #if WINDOWS
+        nint wname = Wide.Of(name);
+        nint wval = Wide.Of(val);
+        // RegSetValueExW needs the wide length including the NUL terminator.
+        int len = Registry.WideLen(wval);
+        Registry.RegSetValueExW(key, wname, 0, 1, wval, len);
+        Wide.Free(wval);
+        Wide.Free(wname);
+        #else
+        throw new PlatformNotSupportedException(
+            "Registry is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>Deletes a value (no-op when it does not exist).</summary>
+    static void DeleteValue(nint key, string name) {
+        #if WINDOWS
+        nint wname = Wide.Of(name);
+        Registry.RegDeleteValueW(key, wname);
+        Wide.Free(wname);
+        #else
+        throw new PlatformNotSupportedException(
+            "Registry is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>Deletes a subkey and everything below it. 0 on success,
+    /// nonzero on failure (key has open handles, or does not exist).
+    /// Uses RegDeleteTreeW, so a key tree with nested subkeys is removed
+    /// in one call (RegDeleteKeyW alone refuses non-empty trees on
+    /// Vista+ with ERROR_ACCESS_DENIED).</summary>
+    static int DeleteKey(nint root, string subKey) {
+        #if WINDOWS
+        nint wkey = Wide.Of(subKey);
+        int r = Registry.RegDeleteTreeW(root, wkey);
+        Wide.Free(wkey);
+        return r;
+        #else
+        throw new PlatformNotSupportedException(
+            "Registry is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>Names of every subkey of `key`. Empty when none.</summary>
+    static List<string> EnumKeys(nint key) {
+        List<string> list = new List<string>();
+        #if WINDOWS
+        nint nameBuf = NativeMemory.Alloc(512 * 2 + 2);
+        nint nameSize = NativeMemory.Alloc(4);
+        int index = 0;
+        bool done = false;
+        while (!done) {
+            new Span<int>(nameSize, 1)[0] = 512;
+            int r = Registry.RegEnumKeyExW(key, index, nameBuf, nameSize,
+                0, 0, 0, 0);
+            if (r == 0) {
+                list.Add(Wide.Read(nameBuf));
+                index = index + 1;
+            } else {
+                done = true;
+            }
+        }
+        NativeMemory.Free(nameBuf);
+        NativeMemory.Free(nameSize);
+        #else
+        throw new PlatformNotSupportedException(
+            "Registry is not implemented on this platform");
+        #endif
+        return list;
+    }
+
+    /// <summary>Every value of `key` (name/type/raw bytes). Empty when none.</summary>
+    static List<RegistryValue> EnumValues(nint key) {
+        List<RegistryValue> list = new List<RegistryValue>();
+        #if WINDOWS
+        nint nameBuf = NativeMemory.Alloc(512 * 2 + 2);
+        nint nameSize = NativeMemory.Alloc(4);
+        nint type = NativeMemory.Alloc(4);
+        nint data = NativeMemory.Alloc(65536);
+        nint dataSize = NativeMemory.Alloc(4);
+        int index = 0;
+        bool done = false;
+        while (!done) {
+            new Span<int>(nameSize, 1)[0] = 512;
+            new Span<int>(dataSize, 1)[0] = 65536;
+            int r = Registry.RegEnumValueW(key, index, nameBuf, nameSize,
+                0, type, data, dataSize);
+            if (r == 0 || r == 234 /*ERROR_MORE_DATA*/) {
+                RegistryValue v = new RegistryValue();
+                v.name = Wide.Read(nameBuf);
+                v.type = new Span<int>(type, 1)[0];
+                int bytes = new Span<int>(dataSize, 1)[0];
+                v.data = new byte[bytes];
+                int k = 0;
+                while (k < bytes) {
+                    v.data[k] = new Span<byte>(data, bytes)[k];
+                    k = k + 1;
+                }
+                list.Add(v);
+                index = index + 1;
+            } else {
+                done = true;
+            }
+        }
+        NativeMemory.Free(nameBuf);
+        NativeMemory.Free(nameSize);
+        NativeMemory.Free(type);
+        NativeMemory.Free(data);
+        NativeMemory.Free(dataSize);
+        #else
+        throw new PlatformNotSupportedException(
+            "Registry is not implemented on this platform");
+        #endif
+        return list;
+    }
+
+    #if WINDOWS
+    /// UTF-16 code units before the NUL terminator of a wide buffer
+    /// (the byte count RegSetValueExW expects, terminator included).
+    static int WideLen(nint p) {
+        int n = 0;
+        while (new Span<ushort>(p + n * 2, 1)[0] != 0) { n = n + 1; }
+        return (n + 1) * 2;
+    }
+    #endif
+}
+
+

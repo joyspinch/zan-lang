@@ -1,0 +1,384 @@
+using System;
+using System.IO;
+
+namespace System.Diagnostics;
+
+/// <summary>
+/// One process snapshot entry. `name` is the image name without extension
+/// (Windows) or the executable basename (Linux). `exePath` and `memoryBytes`
+/// are filled by <see cref="ProcessList.ByPid"/> (they cost a handle open,
+/// so the bulk <see cref="ProcessList.List"/> omits them).
+/// </summary>
+class ProcessEntry {
+    public int pid;
+    public string name;
+    public string exePath;
+    public int parentPid;
+    public int threads;
+    /// Working set in bytes (Windows) / resident set (Linux). -1 when the
+    /// value could not be read (access denied, zombie, race).
+    public long memoryBytes;
+}
+
+/// <summary>
+/// Process enumeration. Windows walks a Toolhelp32 snapshot; Linux scans
+/// /proc. Both fill pid/name/parentPid/threads for every process and can
+/// resolve the executable path and memory usage of a single pid. Other
+/// platforms throw PlatformNotSupportedException.
+/// </summary>
+class ProcessList {
+    /// <summary>Snapshot of every visible process (pid, name, parent,
+    /// thread count). Cheap -- no per-process handle opens.</summary>
+    static List<ProcessEntry> List() {
+        #if WINDOWS
+        return ProcessList.WinList();
+        #elif LINUX
+        return ProcessList.LinuxList();
+        #else
+        throw new PlatformNotSupportedException(
+            "ProcessList.List is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>Every process whose name equals `name` (case-insensitive,
+    /// with or without the .exe extension on Windows). Empty when none.</summary>
+    static List<ProcessEntry> ByName(string name) {
+        List<ProcessEntry> all = ProcessList.List();
+        List<ProcessEntry> hits = new List<ProcessEntry>();
+        string want = name.ToLower();
+        if (ProcessList.EndsWith(want, ".exe")) {
+            want = want.Substring(0, want.Length - 4);
+        }
+        int i = 0;
+        while (i < all.Count) {
+            string n = all[i].name.ToLower();
+            if (n == want) { hits.Add(all[i]); }
+            i = i + 1;
+        }
+        return hits;
+    }
+
+    /// <summary>Details for one pid: adds exePath and memoryBytes. Returns
+    /// null when the process does not exist (or access is denied).</summary>
+    static ProcessEntry ByPid(int pid) {
+        List<ProcessEntry> all = ProcessList.List();
+        int i = 0;
+        while (i < all.Count) {
+            if (all[i].pid == pid) {
+                ProcessEntry e = all[i];
+                e.exePath = ProcessList.ExePath(pid);
+                e.memoryBytes = ProcessList.MemoryUsage(pid);
+                return e;
+            }
+            i = i + 1;
+        }
+        return null;
+    }
+
+    /// <summary>PID of the current process.</summary>
+    static int SelfPid() {
+        #if WINDOWS
+        return ProcessList.WinGetCurrentProcessId();
+        #elif LINUX
+        // /proc/self/stat begins "<pid> (comm) ...".
+        string stat = File.ReadAllText("/proc/self/stat");
+        int sp = ProcessList.IndexOf(stat, " ", 0);
+        if (sp < 0) { return 0; }
+        return ProcessList.ParseInt(stat.Substring(0, sp));
+        #else
+        return 0;
+        #endif
+    }
+
+    /// <summary>Working set (Windows) / resident set (Linux) of `pid` in
+    /// bytes; -1 when unreadable.</summary>
+    static long MemoryUsage(int pid) {
+        #if WINDOWS
+        return ProcessList.WinMemory(pid);
+        #elif LINUX
+        return ProcessList.LinuxMemory(pid);
+        #else
+        return -1;
+        #endif
+    }
+
+    /// <summary>Full path of the process image; "" when unreadable.</summary>
+    static string ExePath(int pid) {
+        #if WINDOWS
+        return ProcessList.WinExePath(pid);
+        #elif LINUX
+        return ProcessList.LinuxExePath(pid);
+        #else
+        return "";
+        #endif
+    }
+
+    #if WINDOWS
+    [DllImport("kernel32", EntryPoint = "CreateToolhelp32Snapshot")]
+    static extern nint WinCreateSnapshot(int flags, int pid);
+
+    [DllImport("kernel32", EntryPoint = "Process32FirstW")]
+    static extern int WinProcess32FirstW(nint snap, nint entry);
+
+    [DllImport("kernel32", EntryPoint = "Process32NextW")]
+    static extern int WinProcess32NextW(nint snap, nint entry);
+
+    [DllImport("kernel32", EntryPoint = "CloseHandle")]
+    static extern int WinCloseHandle(nint handle);
+
+    [DllImport("kernel32", EntryPoint = "GetCurrentProcessId")]
+    static extern int WinGetCurrentProcessId();
+
+    [DllImport("kernel32", EntryPoint = "OpenProcess")]
+    static extern nint WinOpenProcess(int access, int inherit, int pid);
+
+    [DllImport("psapi", EntryPoint = "GetProcessMemoryInfo")]
+    static extern int WinGetProcessMemoryInfo(nint proc, nint counters, int cb);
+
+    [DllImport("kernel32", EntryPoint = "QueryFullProcessImageNameW")]
+    static extern int WinQueryFullProcessImageNameW(nint proc, int flags,
+                                                    nint buf, nint size);
+
+    static List<ProcessEntry> WinList() {
+        List<ProcessEntry> list = new List<ProcessEntry>();
+        nint snap = ProcessList.WinCreateSnapshot(0x00000002 /*TH32CS_SNAPPROCESS*/, 0);
+        if (snap == 0 || snap == (nint)(0 - 1)) { return list; }
+        // PROCESSENTRY32W (x64): dwSize(4) cntUsage(4) pid(4) pad(4)
+        // heapId(8) moduleId(4) threads(4) parentPid(4) prio(4) flags(4)
+        // exe[260] = 564 bytes, aligned up to 568 -- dwSize must be the
+        // full aligned sizeof or Process32FirstW fails with
+        // ERROR_INVALID_DATA.
+        nint entry = NativeMemory.Alloc(568);
+        new Span<int>(entry, 2)[0] = 568;   // dwSize
+        bool first = true;
+        int ok = 1;
+        while (ok != 0) {
+            if (first) {
+                ok = ProcessList.WinProcess32FirstW(snap, entry);
+                first = false;
+            } else {
+                ok = ProcessList.WinProcess32NextW(snap, entry);
+            }
+            if (ok == 0) { break; }
+            Span<int> w = new Span<int>(entry, 11);
+            ProcessEntry e = new ProcessEntry();
+            e.pid = w[2];
+            e.threads = w[7];
+            e.parentPid = w[8];
+            e.name = ProcessList.BaseName(Wide.Read(entry + 44));
+            list.Add(e);
+        }
+        NativeMemory.Free(entry);
+        ProcessList.WinCloseHandle(snap);
+        return list;
+    }
+
+    static long WinMemory(int pid) {
+        nint proc = ProcessList.WinOpenProcess(0x1000 /*PROCESS_QUERY_LIMITED_INFORMATION*/, 0, pid);
+        if (proc == 0) { return -1; }
+        nint counters = NativeMemory.Alloc(80);
+        int ok = ProcessList.WinGetProcessMemoryInfo(proc, counters, 80);
+        long mem = -1;
+        if (ok != 0) {
+            // PROCESS_MEMORY_COUNTERS (x64): cb(4) pf(4) peakWS(8) ws(8)...
+            mem = new Span<long>(counters + 8, 9)[1];   // WorkingSetSize @ 16
+        }
+        NativeMemory.Free(counters);
+        ProcessList.WinCloseHandle(proc);
+        return mem;
+    }
+
+    static string WinExePath(int pid) {
+        nint proc = ProcessList.WinOpenProcess(0x1000 /*PROCESS_QUERY_LIMITED_INFORMATION*/, 0, pid);
+        if (proc == 0) { return ""; }
+        nint buf = NativeMemory.Alloc(512 * 2 + 2);
+        nint size = NativeMemory.Alloc(4);
+        new Span<int>(size, 1)[0] = 512;
+        int ok = ProcessList.WinQueryFullProcessImageNameW(proc, 0, buf, size);
+        string s = "";
+        if (ok != 0) { s = Wide.Read(buf); }
+        NativeMemory.Free(buf);
+        NativeMemory.Free(size);
+        ProcessList.WinCloseHandle(proc);
+        return s;
+    }
+    #endif
+
+    #if LINUX
+    static List<ProcessEntry> LinuxList() {
+        List<ProcessEntry> list = new List<ProcessEntry>();
+        List<string> dirs = Directory.GetDirectories("/proc");
+        int i = 0;
+        while (i < dirs.Count) {
+            string d = dirs[i];
+            string name = ProcessList.BaseName(d);
+            int pid = ProcessList.ParseInt(name);
+            if (pid > 0) {
+                ProcessEntry e = ProcessList.LinuxEntry(pid);
+                if (e != null) { list.Add(e); }
+            }
+            i = i + 1;
+        }
+        return list;
+    }
+
+    static ProcessEntry LinuxEntry(int pid) {
+        // /proc/<pid>/stat: pid (comm) state ppid ... -- comm may contain
+        // spaces and parentheses, so find the last ')'.
+        string stat = "";
+        try {
+            stat = File.ReadAllText("/proc/" + Convert.ToString(pid) + "/stat");
+        } catch {
+            return null;
+        }
+        int rp = ProcessList.LastIndexOf(stat, ")");
+        if (rp < 0) { return null; }
+        string rest = stat.Substring(rp + 2, stat.Length - rp - 2);
+        // rest: state ppid pgrp session tty ... starttime ... threads ...
+        // Field 4 (1-based after comm) is ppid, field 20 is threads.
+        int stateEnd = ProcessList.IndexOf(rest, " ", 0);
+        if (stateEnd < 0) { return null; }
+        string ppidTok = rest.Substring(stateEnd + 1, ProcessList.TokenLen(rest, stateEnd + 1));
+        int ppid = ProcessList.ParseInt(ppidTok);
+        int threads = ProcessList.StatField(rest, 19);   // field 20 (1-based)
+        ProcessEntry e = new ProcessEntry();
+        e.pid = pid;
+        e.name = ProcessList.BaseName(stat.Substring(2, rp - 2));   // comm
+        e.parentPid = ppid;
+        e.threads = threads;
+        e.memoryBytes = -1;
+        return e;
+    }
+
+    /// Field `index` (0-based) of the space-separated tokens in `s`.
+    static int StatField(string s, int index) {
+        int field = 0;
+        int i = 0;
+        while (i < s.Length && field < index) {
+            int len = ProcessList.TokenLen(s, i);
+            if (len == 0) { i = i + 1; continue; }
+            field = field + 1;
+            i = i + len;
+        }
+        if (field != index) { return 0; }
+        int tlen = ProcessList.TokenLen(s, i);
+        if (tlen == 0) { return 0; }
+        return ProcessList.ParseInt(s.Substring(i, tlen));
+    }
+
+    static int TokenLen(string s, int from) {
+        int i = from;
+        while (i < s.Length && s.Substring(i, 1) != " ") { i = i + 1; }
+        return i - from;
+    }
+
+    static long LinuxMemory(int pid) {
+        string status = "";
+        try {
+            status = File.ReadAllText("/proc/" + Convert.ToString(pid) + "/status");
+        } catch {
+            return -1;
+        }
+        // VmRSS:   12345 kB
+        int idx = ProcessList.IndexOf(status, "VmRSS:", 0);
+        if (idx < 0) { return -1; }
+        int eol = ProcessList.IndexOf(status, "\n", idx);
+        if (eol < 0) { eol = status.Length; }
+        string line = status.Substring(idx, eol - idx);
+        int kbEnd = ProcessList.IndexOf(line, " ", 6);
+        if (kbEnd < 0) { return -1; }
+        long kb = ProcessList.ParseLong(line.Substring(6, kbEnd - 6).Trim());
+        if (kb < 0) { return -1; }
+        return kb * 1024;
+    }
+
+    static string LinuxExePath(int pid) {
+        // cmdline is NUL-separated; argv[0] is first. Fall back to the
+        // comm name when cmdline is empty (kernel threads, zombies).
+        string cmd = "";
+        try {
+            cmd = File.ReadAllText("/proc/" + Convert.ToString(pid) + "/cmdline");
+        } catch {
+            return "";
+        }
+        if (cmd == "") { return ""; }
+        int nul = ProcessList.IndexOf(cmd, "\0", 0);
+        if (nul < 0) { return cmd; }
+        return cmd.Substring(0, nul);
+    }
+    #endif
+
+    /// Last component of a path ("C:\a\b.exe" -> "b.exe", "/a/b" -> "b").
+    static string BaseName(string path) {
+        int bs = ProcessList.LastIndexOf(path, "\\");
+        int fs = ProcessList.LastIndexOf(path, "/");
+        int at = bs;
+        if (fs > at) { at = fs; }
+        if (at < 0) { return path; }
+        return path.Substring(at + 1, path.Length - at - 1);
+    }
+
+    static int IndexOf(string hay, string needle, int from) {
+        int n = needle.Length;
+        int h = hay.Length;
+        int i = from;
+        while (i + n <= h) {
+            if (hay.Substring(i, n) == needle) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    static int LastIndexOf(string hay, string needle) {
+        int found = -1;
+        int i = 0;
+        while (i + needle.Length <= hay.Length) {
+            if (hay.Substring(i, needle.Length) == needle) { found = i; }
+            i = i + 1;
+        }
+        return found;
+    }
+
+    static bool EndsWith(string s, string tail) {
+        if (tail.Length > s.Length) { return false; }
+        return s.Substring(s.Length - tail.Length, tail.Length) == tail;
+    }
+
+    static int ParseInt(string s) {
+        if (s.Length == 0) { return -1; }
+        int v = 0;
+        int i = 0;
+        while (i < s.Length) {
+            string ch = s.Substring(i, 1);
+            int c = ProcessList.CodeOf(ch);
+            if (c < 0x30 || c > 0x39) { return -1; }
+            v = v * 10 + (c - 0x30);
+            i = i + 1;
+        }
+        return v;
+    }
+
+    static long ParseLong(string s) {
+        if (s.Length == 0) { return -1; }
+        long v = 0;
+        int i = 0;
+        while (i < s.Length) {
+            string ch = s.Substring(i, 1);
+            int c = ProcessList.CodeOf(ch);
+            if (c < 0x30 || c > 0x39) { return -1; }
+            v = v * 10 + (c - 0x30);
+            i = i + 1;
+        }
+        return v;
+    }
+
+    static int CodeOf(string ch) {
+        if (ch.Length == 0) { return 0; }
+        nint buf = NativeMemory.Alloc(8);
+        NativeMemory.PutString(buf, 0, ch, ch.Length);
+        Span<byte> b = new Span<byte>(buf, 4);
+        int c0 = b[0];
+        NativeMemory.Free(buf);
+        return c0;
+    }
+}

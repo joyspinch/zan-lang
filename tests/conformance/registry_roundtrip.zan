@@ -1,0 +1,64 @@
+// Registry round-trip test under HKCU\Software\ZanTest_<pid>. The key is
+// created, exercised with every supported type, enumerated, then fully
+// deleted -- nothing is left behind in the real registry.
+using System;
+using System.Management;
+using System.Diagnostics;
+
+namespace Conf;
+
+class Prog {
+    static void Main() {
+        int bad = 0;
+        string keyPath = "Software\\ZanTest_" + Convert.ToString(ProcessList.SelfPid());
+        nint key = Registry.CreateKey(Registry.Hkcu(), keyPath);
+        if (key == 0) { bad = bad + 1; }
+        else {
+            // DWORD round trip.
+            Registry.SetDword(key, "Count", 42);
+            int d = Registry.GetDword(key, "Count", -1);
+            if (d != 42) { bad = bad + 1; }
+            // Missing value returns fallback.
+            int missing = Registry.GetDword(key, "NoSuch", -7);
+            if (missing != -7) { bad = bad + 1; }
+            // QWORD round trip.
+            Registry.SetQword(key, "Big", 0x1_0000_0001);
+            long q = Registry.GetQword(key, "Big");
+            if (q != 0x1_0000_0001) { bad = bad + 1; }
+            // SZ round trip (Unicode content survives UTF-16 marshalling).
+            Registry.SetString(key, "Title", "你好 Zan");
+            string s = Registry.GetString(key, "Title");
+            if (s != "你好 Zan") { bad = bad + 1; }
+            // Enumeration sees the three values.
+            List<RegistryValue> vals = Registry.EnumValues(key);
+            if (vals.Count < 3) { bad = bad + 1; }
+            // Subkey creation + enumeration.
+            nint sub = Registry.CreateKey(key, "Sub");
+            if (sub != 0) {
+                Registry.SetString(sub, "K", "V");
+                Registry.CloseKey(sub);
+            }
+            List<string> keys = Registry.EnumKeys(key);
+            bool sawSub = false;
+            int i = 0;
+            while (i < keys.Count) {
+                if (keys[i] == "Sub") { sawSub = true; }
+                i = i + 1;
+            }
+            if (!sawSub) { bad = bad + 1; }
+            // Delete a value, then the whole key tree.
+            Registry.DeleteValue(key, "Count");
+            int gone = Registry.GetDword(key, "Count", -9);
+            if (gone != -9) { bad = bad + 1; }
+            Registry.CloseKey(key);
+        }
+        Registry.DeleteKey(Registry.Hkcu(), keyPath);
+        // Key is gone: OpenKey must now fail.
+        nint goneKey = Registry.OpenKey(Registry.Hkcu(), keyPath, false);
+        if (goneKey != 0) {
+            bad = bad + 1;
+            Registry.CloseKey(goneKey);
+        }
+        Console.WriteLine("reg-ok: " + Convert.ToString(bad == 0 ? 1 : 0));
+    }
+}

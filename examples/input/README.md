@@ -53,6 +53,8 @@ build/mouse_demo.exe
 | `System.Management.Storage` | `Drives()`(枚举)、`Root()`、`Usage(path)` → `DiskUsage`(总量/空闲/可用、占用率) |
 | `System.Management.Display` | `ScreenWidth/ScreenHeight/RefreshRate/ColorDepth/Monitors()`(多显示器) |
 | `System.Management.Power` | `GetStatus` → `PowerStatus`(电池状态/电量/续航)、`OnBattery` |
+| `System.Management.Registry` | Windows 注册表:`OpenKey/CreateKey/CloseKey`、DWORD/QWORD/SZ 读写、`EnumKeys/EnumValues`、`DeleteValue/DeleteKey`(递归) |
+| `System.Diagnostics.ProcessList` | 进程枚举:`List/ByName/ByPid`、`MemoryUsage/ExePath/SelfPid`(Windows Toolhelp32 / Linux /proc) |
 
 ### 示例(只读,安全)
 
@@ -69,3 +71,5 @@ build/sysinfo_demo.exe
 - `tests/conformance/input_mouse_pos.zan` — 鼠标位置只读查询(Windows 实测)
 - `tests/conformance/input_hook_hotkey.zan` — 钩子/热键安装与卸载生命周期(Windows 实测)
 - `tests/conformance/management_smoke.zan` — 信息族结构不变量(Windows 实测)
+- `tests/conformance/process_list_smoke.zan` — 进程枚举与自身详情(Windows 实测)
+- `tests/conformance/registry_roundtrip.zan` — 注册表读写往返(临时键,测完删除)
