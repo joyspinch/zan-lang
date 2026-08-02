@@ -20,6 +20,12 @@ namespace System.Threading;
 /// new headroom allows. Lowering it never interrupts work already running:
 /// the extra permits simply stop being handed out as callers return them, so
 /// concurrency drains down to the new limit.
+///
+/// <see cref="Cancel"/> is the shutdown path: it wakes every parked waiter and
+/// makes every later admission attempt fail, so a worker pool being torn down
+/// stops cleanly instead of hanging on a gate nobody will release. Treat it as
+/// one-way -- after Cancel the gate must be disposed, and callers must not
+/// hand slots out (Release / SetLimit) concurrently with it.
 /// </summary>
 class SemaphoreSlim {
     /// Slots that may be held at once. Changed at any time by SetLimit.
@@ -28,6 +34,8 @@ class SemaphoreSlim {
     int active;
     /// Callers parked on `sem` waiting for a slot.
     int waiters;
+    /// Set by Cancel: the gate is dead, no admission will succeed again.
+    int canceled;
 
     #if WINDOWS
     nint lockHandle;
@@ -41,6 +49,7 @@ class SemaphoreSlim {
         this.limit = 1;
         this.active = 0;
         this.waiters = 0;
+        this.canceled = 0;
     }
 
     /// <summary>A throttle that admits `limit` callers at a time.</summary>
@@ -57,11 +66,11 @@ class SemaphoreSlim {
     }
 
     /// <summary>Takes a slot, blocking the calling thread until one is
-    /// free.</summary>
+    /// free. Returns immediately without a slot after <see cref="Cancel"/>.</summary>
     void Wait() {
         Mutex.Lock(this.lockHandle);
-        if (this.active < this.limit) {
-            this.active = this.active + 1;
+        if (this.canceled != 0 || this.active < this.limit) {
+            if (this.canceled == 0) { this.active = this.active + 1; }
             Mutex.Unlock(this.lockHandle);
             return;
         }
@@ -69,14 +78,20 @@ class SemaphoreSlim {
         Mutex.Unlock(this.lockHandle);
         // The slot is handed over by the releaser (it already counted this
         // caller in `active`), so there is nothing to re-check on wake-up.
+        // A Cancel wakes the same semaphore without handing a slot over; the
+        // caller tells the two apart with IsCanceled.
         Semaphore.Wait(this.sem);
     }
 
     /// <summary>Takes a slot, waiting at most `timeoutMs` for one. True when
     /// a slot was taken (the caller must Release it), false when the wait ran
-    /// out. A negative timeout waits forever.</summary>
+    /// out or the gate was cancelled. A negative timeout waits forever.</summary>
     bool WaitFor(int timeoutMs) {
         Mutex.Lock(this.lockHandle);
+        if (this.canceled != 0) {
+            Mutex.Unlock(this.lockHandle);
+            return false;
+        }
         if (this.active < this.limit) {
             this.active = this.active + 1;
             Mutex.Unlock(this.lockHandle);
@@ -84,7 +99,12 @@ class SemaphoreSlim {
         }
         this.waiters = this.waiters + 1;
         Mutex.Unlock(this.lockHandle);
-        if (Semaphore.WaitFor(this.sem, timeoutMs)) { return true; }
+        if (Semaphore.WaitFor(this.sem, timeoutMs)) {
+            Mutex.Lock(this.lockHandle);
+            bool ok = this.canceled == 0;
+            Mutex.Unlock(this.lockHandle);
+            return ok;
+        }
 
         // Timed out. Withdraw the registration -- unless every registration
         // has already been paired with a hand-off, in which case a releaser
@@ -98,24 +118,30 @@ class SemaphoreSlim {
         }
         Mutex.Unlock(this.lockHandle);
         Semaphore.Wait(this.sem);
-        return true;
+        Mutex.Lock(this.lockHandle);
+        bool took = this.canceled == 0;
+        Mutex.Unlock(this.lockHandle);
+        return took;
     }
 
     /// <summary>Takes a slot only if one is free right now. True when it
-    /// was taken -- the caller must Release it.</summary>
+    /// was taken -- the caller must Release it. Always false after Cancel.</summary>
     bool TryWait() {
         Mutex.Lock(this.lockHandle);
-        bool got = this.active < this.limit;
+        bool got = this.canceled == 0 && this.active < this.limit;
         if (got) { this.active = this.active + 1; }
         Mutex.Unlock(this.lockHandle);
         return got;
     }
 
-    /// <summary>Returns a slot. Wakes one waiter when the limit allows.</summary>
+    /// <summary>Returns a slot. Wakes one waiter when the limit allows.
+    /// No-op for admission after <see cref="Cancel"/> (holders may still
+    /// return their slots, but nobody is woken).</summary>
     void Release() {
         Mutex.Lock(this.lockHandle);
         if (this.active > 0) { this.active = this.active - 1; }
-        bool wake = this.waiters > 0 && this.active < this.limit;
+        bool wake = this.canceled == 0 && this.waiters > 0
+            && this.active < this.limit;
         if (wake) {
             this.waiters = this.waiters - 1;
             this.active = this.active + 1;
@@ -131,7 +157,8 @@ class SemaphoreSlim {
         Mutex.Lock(this.lockHandle);
         this.limit = limit;
         int wake = 0;
-        while (this.waiters > 0 && this.active < this.limit) {
+        while (this.canceled == 0 && this.waiters > 0
+               && this.active < this.limit) {
             this.waiters = this.waiters - 1;
             this.active = this.active + 1;
             wake = wake + 1;
@@ -143,6 +170,32 @@ class SemaphoreSlim {
             i = i + 1;
         }
         return wake;
+    }
+
+    /// <summary>One-way shutdown: wakes every parked waiter and makes all
+    /// later Wait / WaitFor / TryWait fail immediately. Work already holding
+    /// a slot keeps it (its Release stays a no-op for admission). After this
+    /// the gate must be <see cref="Dispose"/>d, and callers must not hand
+    /// slots out concurrently with it.</summary>
+    void Cancel() {
+        Mutex.Lock(this.lockHandle);
+        this.canceled = 1;
+        int wake = this.waiters;
+        this.waiters = 0;
+        Mutex.Unlock(this.lockHandle);
+        int i = 0;
+        while (i < wake) {
+            Semaphore.Release(this.sem);
+            i = i + 1;
+        }
+    }
+
+    /// <summary>True after <see cref="Cancel"/>: the gate admits nothing.</summary>
+    bool IsCanceled() {
+        Mutex.Lock(this.lockHandle);
+        int v = this.canceled;
+        Mutex.Unlock(this.lockHandle);
+        return v != 0;
     }
 
     /// <summary>The current limit.</summary>

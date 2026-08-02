@@ -704,6 +704,16 @@ void *zan_dispatch_take(void) {
     return fn;
 }
 
+/* Drop every queued delegate. Called on the UI thread when a window closes:
+ * work a background worker posted for the dead window must not run on the
+ * next window, whose frame loop reuses the same global queue. */
+void zan_dispatch_clear(void) {
+    zan_dispatch_lock();
+    g_dispatch_head = 0;
+    g_dispatch_tail = 0;
+    zan_dispatch_unlock();
+}
+
 int64_t zan_atomic_int_create(int64_t initial_value) {
     zan_atomic_int *atomic = (zan_atomic_int *)malloc(sizeof(*atomic));
     if (!atomic) return 0;

@@ -1,0 +1,41 @@
+// SemaphoreSlim.Cancel: the one-way shutdown path. It wakes every parked
+// waiter and makes every later admission attempt fail, so a worker pool being
+// torn down stops cleanly instead of hanging on a gate nobody will release.
+using System;
+using System.Threading;
+
+class Prog {
+    static SemaphoreSlim gate;
+    static AtomicInt result;   // 0 = still parked, 1 = got a slot, 2 = cancelled
+
+    static void Worker() {
+        bool ok = Prog.gate.WaitFor(5000);
+        if (ok) { Prog.result.Store(1); } else { Prog.result.Store(2); }
+    }
+
+    static void Main() {
+        Prog.gate = SemaphoreSlim.Create(1);
+        Prog.result = new AtomicInt(0);
+
+        // Hold the only slot, then park a worker on WaitFor.
+        Prog.gate.Wait();
+        Thread.Start(Prog.Worker);
+        while (Prog.gate.Waiting() < 1) { Thread.Sleep(1); }
+
+        // Cancel wakes the parked worker; its WaitFor must report failure.
+        Prog.gate.Cancel();
+        while (Prog.result.Load() == 0) { Thread.Sleep(1); }
+        Console.WriteLine("worker: " + Convert.ToString(Prog.result.Load()));
+        Console.WriteLine("canceled: " + Convert.ToString(Prog.gate.IsCanceled() ? 1 : 0));
+
+        // After Cancel no admission succeeds, not even with a free slot.
+        Console.WriteLine("waitfor: " + Convert.ToString(Prog.gate.WaitFor(0) ? 1 : 0));
+        Console.WriteLine("trywait: " + Convert.ToString(Prog.gate.TryWait() ? 1 : 0));
+
+        // Returning the held slot after Cancel must not re-admit anyone.
+        Prog.gate.Release();
+        Console.WriteLine("after-release: " + Convert.ToString(Prog.gate.TryWait() ? 1 : 0));
+
+        Prog.gate.Dispose();
+    }
+}

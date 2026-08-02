@@ -1,0 +1,65 @@
+// BlockingQueue fault propagation and Cancel: CompleteWithFault ends the
+// queue with a message consumers see after draining; Cancel aborts it,
+// discards pending items and wakes parked consumers and producers.
+using System;
+using System.Threading;
+
+class Prog {
+    static BlockingQueue<string> q;
+    static AtomicInt woke;   // 0 = dequeue still blocked, 1 = woken with empty
+    static BlockingQueue<string> bq;
+
+    static void Canceller() {
+        Thread.Sleep(50);
+        Prog.q.Cancel();
+    }
+
+    static void BqCanceller() {
+        Thread.Sleep(50);
+        Prog.bq.Cancel();
+    }
+
+    static void Main() {
+        // --- fault propagation: drain, then read the message ---
+        BlockingQueue<string> fq = BlockingQueue<string>.Create("");
+        fq.Enqueue("a");
+        fq.Enqueue("b");
+        fq.CompleteWithFault("disk full");
+        string a = fq.Dequeue();
+        string b = fq.Dequeue();
+        string e = fq.Dequeue();
+        Console.WriteLine("drained: " + a + b + "|" + e);
+        Console.WriteLine("fault: " + fq.GetFault());
+        Console.WriteLine("closed: " + Convert.ToString(fq.IsCompleted() ? 1 : 0));
+        Console.WriteLine("enq-after: " + Convert.ToString(fq.Enqueue("x") ? 1 : 0));
+        fq.Dispose();
+
+        // --- cancel wakes a parked consumer ---
+        Prog.q = BlockingQueue<string>.Create("");
+        Prog.woke = new AtomicInt(0);
+        Thread.Start(Prog.Canceller);
+        string v = Prog.q.Dequeue();   // parks until the canceller wakes it
+        Prog.woke.Store(v == "" ? 1 : 0);
+        while (Prog.woke.Load() == 0) { Thread.Sleep(1); }
+        Console.WriteLine("cancel-wake: " + Convert.ToString(Prog.q.IsCanceled() ? 1 : 0));
+        Console.WriteLine("cancel-fault: [" + Prog.q.GetFault() + "]");
+        Prog.q.Dispose();
+
+        // --- cancel drops items that were queued ---
+        BlockingQueue<string> dq = BlockingQueue<string>.Create("");
+        dq.Enqueue("keep?");
+        dq.Cancel();
+        string gone = dq.Dequeue();
+        Console.WriteLine("dropped: [" + gone + "]");
+        Console.WriteLine("cancel-completed: " + Convert.ToString(dq.IsCompleted() ? 1 : 0));
+        dq.Dispose();
+
+        // --- cancel unblocks a producer parked on a full bounded queue ---
+        Prog.bq = BlockingQueue<string>.CreateBounded("", 1);
+        Prog.bq.Enqueue("full");
+        Thread.Start(Prog.BqCanceller);
+        bool enq = Prog.bq.Enqueue("blocked");   // false once cancel wakes it
+        Console.WriteLine("bounded-enq: " + Convert.ToString(enq ? 1 : 0));
+        Prog.bq.Dispose();
+    }
+}

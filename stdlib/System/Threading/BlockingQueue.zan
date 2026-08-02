@@ -21,6 +21,14 @@ namespace System.Threading;
 /// completed and drained, so a consumer loop ends on its own -- `empty` is
 /// the sentinel the queue hands back then, supplied at Create because a
 /// generic value type has no null.
+///
+/// A producer that fails can shut the queue down with
+/// <see cref="CompleteWithFault"/> instead of a plain <see cref="Complete"/>:
+/// consumers drain whatever is left, then see the message in
+/// <see cref="GetFault"/> instead of a clean EOF. <see cref="Cancel"/> is the
+/// abort path: it discards everything still queued, wakes every parked
+/// consumer and producer, and marks the queue so <see cref="IsCanceled"/>
+/// reports true.
 /// </summary>
 class BlockingQueue<T> {
     List<T> items;
@@ -38,6 +46,10 @@ class BlockingQueue<T> {
     int posters;
     /// Handed back by a take that has nothing to give.
     T empty;
+    /// Failure message from CompleteWithFault; "" means no fault.
+    string fault;
+    /// Set by Cancel: the queue was aborted, pending items were dropped.
+    bool canceled;
 
     #if WINDOWS
     nint lockHandle;
@@ -55,6 +67,8 @@ class BlockingQueue<T> {
         this.waiters = 0;
         this.capacity = 0;
         this.posters = 0;
+        this.fault = "";
+        this.canceled = false;
     }
 
     static BlockingQueue<T> Create(T empty) {
@@ -178,8 +192,16 @@ class BlockingQueue<T> {
     /// <summary>Ends the queue: no further items are accepted and every
     /// parked consumer is released.</summary>
     void Complete() {
+        this.CompleteWithFault("");
+    }
+
+    /// <summary>Ends the queue with a failure. Consumers drain what is left,
+    /// then see the message via <see cref="GetFault"/> instead of a clean
+    /// EOF; Enqueue refuses new items from here on.</summary>
+    void CompleteWithFault(string message) {
         Mutex.Lock(this.lockHandle);
         this.closed = true;
+        this.fault = message;
         int wake = this.waiters;
         this.waiters = 0;
         int free = this.posters;
@@ -197,6 +219,51 @@ class BlockingQueue<T> {
             Semaphore.Release(this.slots);
             j = j + 1;
         }
+    }
+
+    /// <summary>Aborts the queue: drops every item still waiting, wakes all
+    /// parked consumers and producers, and marks the queue cancelled so
+    /// <see cref="IsCanceled"/> reports true. Consumers see the empty sentinel
+    /// (the queue is closed and drained); Enqueue returns false.</summary>
+    void Cancel() {
+        Mutex.Lock(this.lockHandle);
+        this.canceled = true;
+        this.closed = true;
+        this.fault = "";
+        this.head = this.items.Count;   // discard everything queued
+        int wake = this.waiters;
+        this.waiters = 0;
+        int free = this.posters;
+        this.posters = 0;
+        Mutex.Unlock(this.lockHandle);
+        int i = 0;
+        while (i < wake) {
+            Semaphore.Release(this.sem);
+            i = i + 1;
+        }
+        int j = 0;
+        while (j < free) {
+            Semaphore.Release(this.slots);
+            j = j + 1;
+        }
+    }
+
+    /// <summary>True after <see cref="Cancel"/>: the queue was aborted rather
+    /// than completed.</summary>
+    bool IsCanceled() {
+        Mutex.Lock(this.lockHandle);
+        bool v = this.canceled;
+        Mutex.Unlock(this.lockHandle);
+        return v;
+    }
+
+    /// <summary>The failure message from <see cref="CompleteWithFault"/>, or
+    /// "" when the queue ended cleanly or was cancelled.</summary>
+    string GetFault() {
+        Mutex.Lock(this.lockHandle);
+        string v = this.fault;
+        Mutex.Unlock(this.lockHandle);
+        return v;
     }
 
     bool IsCompleted() {
