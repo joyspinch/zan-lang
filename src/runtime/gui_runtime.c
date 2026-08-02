@@ -1277,6 +1277,104 @@ EXPORT void zan_gui_draw_line(i32 surface_id, i32 x0, i32 y0, i32 x1, i32 y1, i3
     }
 }
 
+/* --------------------------------------------------------------------------
+ * Whole-polyline anti-aliased stroke.
+ *
+ * The per-segment draw_line above leaves two aliasing artifacts on curves:
+ *  1. each segment is anti-aliased independently, so pixels on the far side of
+ *     a joint get only one segment's coverage -- corners look notched/jagged;
+ *  2. a joint's two round caps overlap, and the overlap is blended TWICE
+ *     (source-over is not idempotent), so corners look brighter/beadier.
+ *
+ * This entry point rasterises the whole path in ONE coverage pass: for every
+ * pixel we take the MAX coverage over all segments it lies near (round join,
+ * like the union of the segment strokes), then blend each touched pixel
+ * exactly once. Segments share one scratch coverage buffer (reused across
+ * calls, no per-frame allocation); only the pixels a pass actually touches
+ * are stored in a dirty list and re-zeroed after blending, so consecutive
+ * calls never see stale coverage.
+ *
+ * pts holds n*2 int32s: x0,y0,x1,y1,... in device pixels.
+ * ------------------------------------------------------------------------ */
+static u8  *g_poly_cov = NULL;    /* surface-sized coverage scratch (reused) */
+static i32  g_poly_cov_w = 0;
+static i32  g_poly_cov_h = 0;
+static i32 *g_poly_dirty = NULL;  /* packed (y<<16)|x of pixels this pass touched */
+static i32  g_poly_dirty_n = 0;
+static i32  g_poly_dirty_cap = 0;
+
+EXPORT void zan_gui_draw_polyline(i32 surface_id, const i32 *pts, i32 n,
+                                  i32 color, i32 thickness) {
+    if (surface_id < 0 || surface_id >= g_surface_count) return;
+    zan_surface_t *s = g_surfaces[surface_id];
+    if (!s || !pts || n < 2) return;
+    int W = s->width, H = s->height;
+    int t = (int)thickness;
+    if (t < 1) t = 1;
+    u32 c = (u32)color;
+
+    if (g_poly_cov_w < W || g_poly_cov_h < H) {
+        free(g_poly_cov);
+        g_poly_cov = (u8*)malloc((size_t)W * (size_t)H);
+        g_poly_cov_w = W;
+        g_poly_cov_h = H;
+    }
+    g_poly_dirty_n = 0;
+
+    double half = t * 0.5;
+    for (i32 i = 0; i + 1 < n; i++) {
+        int x0 = pts[i * 2], y0 = pts[i * 2 + 1];
+        int x1 = pts[i * 2 + 2], y1 = pts[i * 2 + 3];
+        if (x0 == x1 && y0 == y1) continue;
+        double dx = (double)(x1 - x0), dy = (double)(y1 - y0);
+        double len2 = dx * dx + dy * dy;
+        if (len2 < 0.0001) continue;
+        int minx = (x0 < x1 ? x0 : x1) - t - 1;
+        int maxx = (x0 > x1 ? x0 : x1) + t + 1;
+        int miny = (y0 < y1 ? y0 : y1) - t - 1;
+        int maxy = (y0 > y1 ? y0 : y1) + t + 1;
+        if (minx < 0) minx = 0;
+        if (miny < 0) miny = 0;
+        if (maxx >= W) maxx = W - 1;
+        if (maxy >= H) maxy = H - 1;
+        for (int py = miny; py <= maxy; py++) {
+            for (int px = minx; px <= maxx; px++) {
+                double proj = ((px - (double)x0) * dx + (py - (double)y0) * dy) / len2;
+                if (proj < 0.0) proj = 0.0;
+                if (proj > 1.0) proj = 1.0;
+                double cxp = (double)x0 + proj * dx;
+                double cyp = (double)y0 + proj * dy;
+                double ddx = px - cxp, ddy = py - cyp;
+                double dist = sqrt(ddx * ddx + ddy * ddy);
+                double cov = half - dist + 0.5;   /* ~1px anti-aliased edge */
+                if (cov <= 0.0) continue;
+                int icov = cov >= 1.0 ? 255 : (int)(cov * 255.0);
+                int idx = py * W + px;
+                if (g_poly_cov[idx] == 0) {       /* first touch this pass */
+                    if (g_poly_dirty_n >= g_poly_dirty_cap) {
+                        g_poly_dirty_cap = g_poly_dirty_cap ? g_poly_dirty_cap * 2 : 1024;
+                        g_poly_dirty = (i32*)realloc(g_poly_dirty,
+                            (size_t)g_poly_dirty_cap * sizeof(i32));
+                    }
+                    g_poly_dirty[g_poly_dirty_n++] = (py << 16) | (px & 0xFFFF);
+                }
+                if (icov > g_poly_cov[idx]) g_poly_cov[idx] = (u8)icov;
+            }
+        }
+    }
+
+    /* Single blend pass: every touched pixel exactly once. */
+    for (i32 d = 0; d < g_poly_dirty_n; d++) {
+        int px = g_poly_dirty[d] & 0xFFFF;
+        int py = (g_poly_dirty[d] >> 16) & 0xFFFF;
+        int idx = py * W + px;
+        int cov = g_poly_cov[idx];
+        g_poly_cov[idx] = 0;
+        if (cov >= 255) set_pixel(s, px, py, c);
+        else set_pixel_aa(s, px, py, c, cov);
+    }
+}
+
 EXPORT void *zan_gui_get_pixels(i32 surface_id) {
     if (surface_id < 0 || surface_id >= g_surface_count || !g_surfaces[surface_id]) return NULL;
     return (void *)g_surfaces[surface_id]->pixels;
