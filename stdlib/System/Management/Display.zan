@@ -1,0 +1,142 @@
+using System;
+
+namespace System.Management;
+
+/// <summary>
+/// One monitor: index (0 = primary), name, pixel size, refresh rate and
+/// colour depth.
+/// </summary>
+class DisplayInfo {
+    public int index;
+    public string name;
+    public int width;
+    public int height;
+    /// Refresh rate in Hz (0 when unknown).
+    public int refreshHz;
+    /// Colour depth in bits per pixel (0 when unknown).
+    public int bitsPerPixel;
+}
+
+/// <summary>
+/// Display topology. Windows queries GetSystemMetrics for the primary
+/// screen and EnumDisplayMonitors/EnumDisplaySettingsW for every monitor;
+/// other platforms return 0/empty values rather than throwing.
+/// </summary>
+class Display {
+    /// <summary>Primary screen width in pixels.</summary>
+    static int ScreenWidth() {
+        #if WINDOWS
+        return Display.WinGetSystemMetrics(0);
+        #else
+        return 0;
+        #endif
+    }
+
+    /// <summary>Primary screen height in pixels.</summary>
+    static int ScreenHeight() {
+        #if WINDOWS
+        return Display.WinGetSystemMetrics(1);
+        #else
+        return 0;
+        #endif
+    }
+
+    /// <summary>Primary screen refresh rate in Hz (0 when unknown).</summary>
+    static int RefreshRate() {
+        #if WINDOWS
+        return Display.WinMode(0xFFFFFFFF /*ENUM_CURRENT_SETTINGS*/, 184);
+        #else
+        return 0;
+        #endif
+    }
+
+    /// <summary>Primary screen colour depth in bits per pixel.</summary>
+    static int ColorDepth() {
+        #if WINDOWS
+        return Display.WinMode(0xFFFFFFFF /*ENUM_CURRENT_SETTINGS*/, 168);
+        #else
+        return 0;
+        #endif
+    }
+
+    /// <summary>Every monitor (index 0 = primary). Empty when enumeration
+    /// is unavailable.</summary>
+    static List<DisplayInfo> Monitors() {
+        List<DisplayInfo> list = new List<DisplayInfo>();
+        #if WINDOWS
+        Display.monitorResults = list;
+        Display.monitorProc = Display.WinMonitorProc;
+        Display.WinEnumDisplayMonitors(0, 0, Display.monitorProc, 0);
+        #endif
+        return list;
+    }
+
+    #if WINDOWS
+    [DllImport("user32", EntryPoint = "GetSystemMetrics")]
+    static extern int WinGetSystemMetrics(int index);
+
+    [DllImport("user32", EntryPoint = "EnumDisplaySettingsW")]
+    static extern int WinEnumDisplaySettingsW(nint name, int mode, nint devMode);
+
+    [DllImport("user32", EntryPoint = "EnumDisplayMonitors")]
+    static extern int WinEnumDisplayMonitors(nint hdc, nint clip, MonitorEnumProc proc,
+                                             nint data);
+
+    [DllImport("user32", EntryPoint = "GetMonitorInfoW")]
+    static extern int WinGetMonitorInfoW(nint monitor, nint info);
+
+    [DllImport("user32", EntryPoint = "MonitorFromPoint")]
+    static extern nint WinMonitorFromPoint(nint pt, int flags);
+
+    // Native monitor-enumeration callback (WINAPI).
+    static MonitorEnumProc monitorProc;
+
+    static List<DisplayInfo> monitorResults;
+
+    static int WinMonitorProc(nint monitor, nint hdc, nint rect, nint data) {
+        // MONITORINFOEXW: cbSize(4) rcMonitor(16) rcWork(16) dwFlags(4)
+        // szDevice[32] WCHAR (64) = 104 bytes total.
+        nint info = NativeMemory.Alloc(112);
+        new Span<int>(info, 2)[0] = 104;   // cbSize
+        if (Display.WinGetMonitorInfoW(monitor, info) != 0) {
+            DisplayInfo d = new DisplayInfo();
+            d.index = Display.monitorResults.Count;
+            d.name = Wide.Read(info + 40);
+            // Current mode for this monitor.
+            nint dev = NativeMemory.Alloc(220);
+            new Span<int>(dev, 55)[17] = 220;   // dmSize @ 68
+            int ok = Display.WinEnumDisplaySettingsW(info + 40, 0xFFFFFFFF, dev);
+            if (ok != 0) {
+                Span<int> m = new Span<int>(dev, 48);
+                d.bitsPerPixel = m[42];   // dmBitsPerPel @ 168
+                d.width = m[43];          // dmPelsWidth @ 172
+                d.height = m[44];         // dmPelsHeight @ 176
+                d.refreshHz = m[46];      // dmDisplayFrequency @ 184
+            }
+            NativeMemory.Free(dev);
+            Display.monitorResults.Add(d);
+        }
+        NativeMemory.Free(info);
+        return 1;   // continue enumerating
+    }
+
+    /// Reads a DWORD field of the current DEVMODEW for the primary display.
+    static int WinMode(int mode, int offset) {
+        nint dev = NativeMemory.Alloc(220);
+        new Span<int>(dev, 55)[17] = 220;   // dmSize @ 68
+        int ok = Display.WinEnumDisplaySettingsW(0, mode, dev);
+        int v = 0;
+        if (ok != 0) {
+            Span<int> m = new Span<int>(dev, 48);
+            v = m[offset / 4];
+        }
+        NativeMemory.Free(dev);
+        return v;
+    }
+    #endif
+}
+
+#if WINDOWS
+/// Native monitor-enumeration callback (WINAPI).
+delegate int MonitorEnumProc(nint monitor, nint hdc, nint rect, nint data);
+#endif

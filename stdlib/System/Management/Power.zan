@@ -1,0 +1,161 @@
+using System;
+
+namespace System.Management;
+
+/// <summary>
+/// Power state of the machine and its battery.
+/// </summary>
+class PowerStatus {
+    /// True when running on battery (AC line is not connected).
+    public bool onBattery;
+    /// Battery charge in percent (0..100; -1 when no battery).
+    public int batteryPercent;
+    /// Remaining battery runtime in seconds (-1 when unknown/unlimited).
+    public long batteryLifeSeconds;
+}
+
+/// <summary>
+/// Power/battery status. Windows calls GetSystemPowerStatus; Linux reads
+/// /sys/class/power_supply (BAT* entries). Other platforms throw
+/// PlatformNotSupportedException.
+/// </summary>
+class Power {
+    /// <summary>Current power status snapshot.</summary>
+    static PowerStatus GetStatus() {
+        #if WINDOWS
+        return Power.WinStatus();
+        #elif LINUX
+        return Power.LinuxStatus();
+        #else
+        throw new PlatformNotSupportedException(
+            "Power.GetStatus is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>True when the machine is running on battery.</summary>
+    static bool OnBattery() {
+        return Power.GetStatus().onBattery;
+    }
+
+    #if WINDOWS
+    [DllImport("kernel32", EntryPoint = "GetSystemPowerStatus")]
+    static extern int WinGetSystemPowerStatus(nint buf);
+
+    static PowerStatus WinStatus() {
+        // SYSTEM_POWER_STATUS: ACLineStatus(1) BatteryFlag(1)
+        // BatteryLifePercent(1) SystemStatusFlag(1) BatteryLifeTime(4)
+        // BatteryFullLifeTime(4).
+        nint buf = NativeMemory.Alloc(16);
+        Power.WinGetSystemPowerStatus(buf);
+        Span<byte> b = new Span<byte>(buf, 16);
+        Span<int> w = new Span<int>(buf + 4, 2);
+        PowerStatus s = new PowerStatus();
+        int ac = b[0];
+        int flag = b[1];
+        int pct = b[2];
+        // ACLineStatus: 1 = online (AC), 0 = offline (battery).
+        s.onBattery = ac != 1;
+        if (pct == 255) { s.batteryPercent = -1; }   // unknown
+        else { s.batteryPercent = pct; }
+        if (flag == 255) {
+            // No system battery.
+            s.batteryPercent = -1;
+        }
+        int life = w[0];
+        if (life == 0xFFFFFFFF) { s.batteryLifeSeconds = -1; }
+        else { s.batteryLifeSeconds = life; }
+        NativeMemory.Free(buf);
+        return s;
+    }
+    #endif
+
+    #if LINUX
+    static PowerStatus LinuxStatus() {
+        PowerStatus s = new PowerStatus();
+        s.batteryPercent = -1;
+        s.batteryLifeSeconds = -1;
+        string type = Power.SysClass("type");
+        if (type != "Battery") {
+            // No battery; running on AC.
+            s.onBattery = false;
+            return s;
+        }
+        string status = Power.SysClass("status");
+        s.onBattery = status == "Discharging";
+        int energyNow = Power.SysInt("energy_now");
+        int energyFull = Power.SysInt("energy_full");
+        int powerNow = Power.SysInt("power_now");
+        if (energyFull > 0 && energyNow >= 0) {
+            s.batteryPercent = energyNow * 100 / energyFull;
+            if (s.batteryPercent > 100) { s.batteryPercent = 100; }
+        }
+        if (powerNow > 0 && energyNow > 0) {
+            // energy_now is in µWh, power_now in µW -> hours, then seconds.
+            s.batteryLifeSeconds = (long)energyNow * 3600 / powerNow;
+        }
+        return s;
+    }
+
+    /// First BAT* power supply: read `field` from /sys/class/power_supply.
+    static string SysField(string field) {
+        string txt = "";
+        try {
+            txt = File.ReadAllText("/sys/class/power_supply/BAT0/" + field);
+        } catch {
+            return "";
+        }
+        return txt.Trim();
+    }
+
+    static string SysClass(string field) {
+        string v = Power.SysField(field);
+        if (v != "") { return v; }
+        return Power.SysField2(field);
+    }
+
+    /// Try BAT1..BAT9 when BAT0 does not exist.
+    static string SysField2(string field) {
+        int i = 1;
+        while (i <= 9) {
+            string path = "/sys/class/power_supply/BAT" + Convert.ToString(i)
+                + "/" + field;
+            try {
+                return File.ReadAllText(path).Trim();
+            } catch {
+            }
+            i = i + 1;
+        }
+        return "";
+    }
+
+    static int SysInt(string field) {
+        string v = Power.SysClass(field);
+        if (v == "") { return -1; }
+        return Power.ParseInt(v);
+    }
+
+    static int ParseInt(string s) {
+        if (s.Length == 0) { return -1; }
+        int v = 0;
+        int i = 0;
+        while (i < s.Length) {
+            string ch = s.Substring(i, 1);
+            int c = Power.CodeOf(ch);
+            if (c < 0x30 || c > 0x39) { return -1; }
+            v = v * 10 + (c - 0x30);
+            i = i + 1;
+        }
+        return v;
+    }
+
+    static int CodeOf(string ch) {
+        if (ch.Length == 0) { return 0; }
+        nint buf = NativeMemory.Alloc(8);
+        NativeMemory.PutString(buf, 0, ch, ch.Length);
+        Span<byte> b = new Span<byte>(buf, 4);
+        int c0 = b[0];
+        NativeMemory.Free(buf);
+        return c0;
+    }
+    #endif
+}

@@ -1,0 +1,154 @@
+using System;
+
+namespace System.Management;
+
+/// <summary>
+/// Snapshot of physical/virtual memory, all sizes in bytes. Linux values
+/// come from /proc/meminfo; Windows from GlobalMemoryStatusEx.
+/// </summary>
+class MemoryStatus {
+    public long totalPhys;
+    public long availPhys;
+    public long totalPageFile;
+    public long availPageFile;
+    public long totalVirtual;
+    public long availVirtual;
+    /// Physical memory utilisation in percent (0..100).
+    public int usagePercent;
+
+    /// True when the system is low on physical memory.
+    public bool IsLow() {
+        if (totalPhys <= 0) { return false; }
+        return usagePercent >= 90;
+    }
+}
+
+/// <summary>
+/// Memory statistics. Cross-platform: Windows uses GlobalMemoryStatusEx,
+/// Linux parses /proc/meminfo; other platforms throw
+/// PlatformNotSupportedException.
+/// </summary>
+class Memory {
+    /// <summary>Current memory snapshot.</summary>
+    static MemoryStatus GetStatus() {
+        #if WINDOWS
+        return Memory.WinStatus();
+        #elif LINUX
+        return Memory.LinuxStatus();
+        #else
+        throw new PlatformNotSupportedException(
+            "Memory.GetStatus is not implemented on this platform");
+        #endif
+    }
+
+    #if WINDOWS
+    [DllImport("kernel32", EntryPoint = "GlobalMemoryStatusEx")]
+    static extern int GlobalMemoryStatusEx(nint buf);
+
+    static MemoryStatus WinStatus() {
+        // MEMORYSTATUSEX (x64): dwLength(4) dwMemoryLoad(4) ullTotalPhys(8)
+        // ullAvailPhys(8) ullTotalPageFile(8) ullAvailPageFile(8)
+        // ullTotalVirtual(8) ullAvailVirtual(8) ullAvailExtendedVirtual(8).
+        nint buf = NativeMemory.Alloc(64);
+        new Span<int>(buf, 2)[0] = 64;   // dwLength
+        Memory.GlobalMemoryStatusEx(buf);
+        Span<long> q = new Span<long>(buf + 8, 7);
+        MemoryStatus s = new MemoryStatus();
+        s.totalPhys = q[0];
+        s.availPhys = q[1];
+        s.totalPageFile = q[2];
+        s.availPageFile = q[3];
+        s.totalVirtual = q[4];
+        s.availVirtual = q[5];
+        s.usagePercent = new Span<int>(buf + 4, 1)[0];
+        NativeMemory.Free(buf);
+        return s;
+    }
+    #endif
+
+    #if LINUX
+    static MemoryStatus LinuxStatus() {
+        MemoryStatus s = new MemoryStatus();
+        string txt = "";
+        try {
+            txt = File.ReadAllText("/proc/meminfo");
+        } catch {
+            throw new PlatformNotSupportedException(
+                "cannot read /proc/meminfo");
+        }
+        s.totalPhys = Memory.KbField(txt, "MemTotal") * 1024;
+        long avail = Memory.KbField(txt, "MemAvailable");
+        if (avail == 0) {
+            // Older kernels: MemFree + Buffers + Cached.
+            avail = Memory.KbField(txt, "MemFree")
+                  + Memory.KbField(txt, "Buffers")
+                  + Memory.KbField(txt, "Cached");
+        }
+        s.availPhys = avail * 1024;
+        s.totalPageFile = (Memory.KbField(txt, "SwapTotal") + 0) * 1024;
+        s.availPageFile = Memory.KbField(txt, "SwapFree") * 1024;
+        s.totalVirtual = s.totalPhys + s.totalPageFile;
+        s.availVirtual = s.availPhys + s.availPageFile;
+        if (s.totalPhys > 0) {
+            long used = s.totalPhys - s.availPhys;
+            s.usagePercent = (int)(used * 100 / s.totalPhys);
+        }
+        return s;
+    }
+
+    /// First `key` value in kB from /proc/meminfo text, 0 when missing.
+    static long KbField(string txt, string key) {
+        int i = 0;
+        while (i < txt.Length) {
+            int eol = Memory.IndexOf(txt, "\n", i);
+            if (eol < 0) { eol = txt.Length; }
+            string line = txt.Substring(i, eol - i);
+            if (line.StartsWith(key + ":")) {
+                string rest = line.Substring(key.Length + 1, line.Length - key.Length - 1).Trim();
+                // rest is like "16384000 kB" -- take the first token.
+                int sp = Memory.IndexOf(rest, " ", 0);
+                if (sp < 0) { return 0; }
+                string num = rest.Substring(0, sp).Trim();
+                return Memory.ParseLong(num);
+            }
+            i = eol + 1;
+        }
+        return 0;
+    }
+
+    static int IndexOf(string hay, string needle, int from) {
+        int n = needle.Length;
+        int h = hay.Length;
+        int i = from;
+        while (i + n <= h) {
+            if (hay.Substring(i, n) == needle) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    static long ParseLong(string s) {
+        if (s.Length == 0) { return 0; }
+        long v = 0;
+        int i = 0;
+        while (i < s.Length) {
+            string ch = s.Substring(i, 1);
+            int c = Memory.CodeOf(ch);
+            if (c < 0x30 || c > 0x39) { return 0; }
+            v = v * 10 + (c - 0x30);
+            i = i + 1;
+        }
+        return v;
+    }
+
+    static int CodeOf(string ch) {
+        if (ch.Length == 0) { return 0; }
+        nint buf = NativeMemory.Alloc(8);
+        NativeMemory.PutString(buf, 0, ch, ch.Length);
+        Span<byte> b = new Span<byte>(buf, 4);
+        int c0 = b[0];
+        NativeMemory.Free(buf);
+        return c0;
+    }
+    #endif
+}

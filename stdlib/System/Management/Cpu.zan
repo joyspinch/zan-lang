@@ -1,0 +1,320 @@
+using System;
+using System.Threading;
+
+namespace System.Management;
+
+/// <summary>
+/// CPU identity and load. Windows reads the brand/frequency from the
+/// registry (the CPUID-reported values Windows caches under
+/// HKLM\HARDWARE\DESCRIPTION\System\CentralProcessor), the core count from
+/// GetSystemInfo and the load from GetSystemTimes. Linux reads
+/// /proc/cpuinfo and /proc/stat. Other platforms throw
+/// PlatformNotSupportedException.
+/// </summary>
+class Cpu {
+    /// <summary>CPU brand string, e.g. "Intel(R) Core(TM) i7-10750H CPU @
+    /// 2.60GHz". Empty when it cannot be read.</summary>
+    static string Brand() {
+        #if WINDOWS
+        return Cpu.RegString(
+            0x80000002 /*HKLM*/,
+            "HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0",
+            "ProcessorNameString");
+        #elif LINUX
+        return Cpu.ProcField("/proc/cpuinfo", "model name");
+        #else
+        return "";
+        #endif
+    }
+
+    /// <summary>CPU vendor, e.g. "GenuineIntel" / "AuthenticAMD". Empty when
+    /// it cannot be read.</summary>
+    static string Vendor() {
+        #if WINDOWS
+        return Cpu.RegString(
+            0x80000002 /*HKLM*/,
+            "HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0",
+            "VendorIdentifier");
+        #elif LINUX
+        return Cpu.ProcField("/proc/cpuinfo", "vendor_id");
+        #else
+        return "";
+        #endif
+    }
+
+    /// <summary>Nominal clock frequency in MHz, or 0 when unknown.</summary>
+    static int FrequencyMHz() {
+        #if WINDOWS
+        return Cpu.RegDword(
+            0x80000002 /*HKLM*/,
+            "HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0",
+            "~MHz");
+        #elif LINUX
+        string mhz = Cpu.ProcField("/proc/cpuinfo", "cpu MHz");
+        return Cpu.ParseInt(mhz);
+        #else
+        return 0;
+        #endif
+    }
+
+    /// <summary>Number of logical processors visible to the OS.</summary>
+    static int LogicalCores() {
+        #if WINDOWS
+        nint info = NativeMemory.Alloc(64);
+        Cpu.WinGetSystemInfo(info);
+        // SYSTEM_INFO (x64): arch(4) pageSize(4) minAddr(8) maxAddr(8)
+        // procMask(8) numberOfProcessors(4 @ offset 32) type(4) granularity(4)
+        // level(2) revision(2).
+        Span<int> w = new Span<int>(info, 16);
+        int n = w[8];
+        NativeMemory.Free(info);
+        return n;
+        #elif LINUX
+        return Cpu.CountCpuLines();
+        #else
+        return 1;
+        #endif
+    }
+
+    /// <summary>Overall CPU utilisation in percent (0..100) over a ~300 ms
+    /// sampling window. The first call samples twice and sleeps.</summary>
+    static int Usage() {
+        #if WINDOWS
+        nint t1 = NativeMemory.Alloc(24);
+        nint t2 = NativeMemory.Alloc(24);
+        Cpu.WinGetSystemTimes(t1);
+        Thread.Sleep(300);
+        Cpu.WinGetSystemTimes(t2);
+        Span<long> a = new Span<long>(t1, 3);
+        Span<long> b = new Span<long>(t2, 3);
+        long idle = b[0] - a[0];
+        long busy = (b[1] + b[2]) - (a[1] + a[2]);
+        NativeMemory.Free(t1);
+        NativeMemory.Free(t2);
+        if (busy <= 0) { return 0; }
+        long pct = (busy - idle) * 100 / busy;
+        if (pct < 0) { return 0; }
+        if (pct > 100) { return 100; }
+        return (int)pct;
+        #elif LINUX
+        // /proc/stat first line: cpu user nice system idle iowait irq softirq
+        // steal. Busy = total - idle - iowait; sample twice 300 ms apart.
+        long[] a = Cpu.CpuJiffies();
+        Thread.Sleep(300);
+        long[] b = Cpu.CpuJiffies();
+        long busy = (b[0] - a[0]) - (b[1] - a[1]);
+        long total = b[0] - a[0];
+        if (total <= 0) { return 0; }
+        long pct = busy * 100 / total;
+        if (pct < 0) { return 0; }
+        if (pct > 100) { return 100; }
+        return (int)pct;
+        #else
+        return 0;
+        #endif
+    }
+
+    #if WINDOWS
+    [DllImport("kernel32", EntryPoint = "GetSystemInfo")]
+    static extern void WinGetSystemInfo(nint info);
+
+    [DllImport("kernel32", EntryPoint = "GetSystemTimes")]
+    static extern int WinGetSystemTimes(nint times);
+
+    [DllImport("advapi32", EntryPoint = "RegOpenKeyExW")]
+    static extern int RegOpenKeyExW(nint hKey, nint subKey, int options,
+                                    int access, nint result);
+
+    [DllImport("advapi32", EntryPoint = "RegQueryValueExW")]
+    static extern int RegQueryValueExW(nint hKey, nint name, nint reserved,
+                                       nint type, nint data, nint dataSize);
+
+    [DllImport("advapi32", EntryPoint = "RegCloseKey")]
+    static extern int RegCloseKey(nint hKey);
+
+    /// Reads a REG_SZ value under HKLM\<subKey>. "" when missing.
+    static string RegString(nint root, string subKey, string name) {
+        nint wkey = Wide.Of(subKey);
+        nint hk = NativeMemory.Alloc(8);
+        int r = Cpu.RegOpenKeyExW(root, wkey, 0, 0x20019 /*KEY_READ*/, hk);
+        Wide.Free(wkey);
+        if (r != 0) { NativeMemory.Free(hk); return ""; }
+        nint hKey = new Span<nint>(hk, 1)[0];
+        nint wname = Wide.Of(name);
+        nint buf = NativeMemory.Alloc(1024);
+        nint size = NativeMemory.Alloc(4);
+        new Span<int>(size, 1)[0] = 512;
+        r = Cpu.RegQueryValueExW(hKey, wname, 0, 0, buf, size);
+        string s = "";
+        if (r == 0) {
+            int bytes = new Span<int>(size, 1)[0];
+            if (bytes > 2) { s = Wide.Read(buf); }
+        }
+        NativeMemory.Free(buf);
+        NativeMemory.Free(size);
+        Wide.Free(wname);
+        Cpu.RegCloseKey(hKey);
+        NativeMemory.Free(hk);
+        return s;
+    }
+
+    /// Reads a REG_DWORD value under HKLM\<subKey>. 0 when missing.
+    static int RegDword(nint root, string subKey, string name) {
+        nint wkey = Wide.Of(subKey);
+        nint hk = NativeMemory.Alloc(8);
+        int r = Cpu.RegOpenKeyExW(root, wkey, 0, 0x20019 /*KEY_READ*/, hk);
+        Wide.Free(wkey);
+        if (r != 0) { NativeMemory.Free(hk); return 0; }
+        nint hKey = new Span<nint>(hk, 1)[0];
+        nint wname = Wide.Of(name);
+        nint data = NativeMemory.Alloc(4);
+        nint size = NativeMemory.Alloc(4);
+        new Span<int>(size, 1)[0] = 4;
+        r = Cpu.RegQueryValueExW(hKey, wname, 0, 0, data, size);
+        int v = 0;
+        if (r == 0) { v = new Span<int>(data, 1)[0]; }
+        NativeMemory.Free(data);
+        NativeMemory.Free(size);
+        Wide.Free(wname);
+        Cpu.RegCloseKey(hKey);
+        NativeMemory.Free(hk);
+        return v;
+    }
+    #endif
+
+    #if LINUX
+    /// First `field` value (after the colon) in a /proc key: value file.
+    static string ProcField(string path, string field) {
+        string txt = "";
+        try {
+            txt = File.ReadAllText(path);
+        } catch {
+            return "";
+        }
+        // Line scan: field + ":" + value
+        int i = 0;
+        while (i < txt.Length) {
+            int eol = Cpu.IndexOf(txt, "\n", i);
+            if (eol < 0) { eol = txt.Length; }
+            string line = txt.Substring(i, eol - i);
+            int colon = Cpu.IndexOf(txt, ":", i);
+            if (colon >= 0 && colon < eol) {
+                string key = txt.Substring(i, colon - i).Trim();
+                if (key == field) {
+                    return txt.Substring(colon + 1, eol - colon - 1).Trim();
+                }
+            }
+            i = eol + 1;
+        }
+        return "";
+    }
+
+    static int CountCpuLines() {
+        string txt = "";
+        try {
+            txt = File.ReadAllText("/proc/cpuinfo");
+        } catch {
+            return 1;
+        }
+        int n = 0;
+        int i = 0;
+        while (i < txt.Length) {
+            int eol = Cpu.IndexOf(txt, "\n", i);
+            if (eol < 0) { eol = txt.Length; }
+            string line = txt.Substring(i, eol - i).Trim();
+            if (line.StartsWith("processor")) { n = n + 1; }
+            i = eol + 1;
+        }
+        if (n < 1) { n = 1; }
+        return n;
+    }
+
+    /// [0] = total jiffies, [1] = idle jiffies (from /proc/stat line 1).
+    static long[] CpuJiffies() {
+        long[] r = new long[2];
+        string txt = "";
+        try {
+            txt = File.ReadAllText("/proc/stat");
+        } catch {
+            return r;
+        }
+        int eol = Cpu.IndexOf(txt, "\n", 0);
+        if (eol < 0) { eol = txt.Length; }
+        string line = txt.Substring(0, eol);
+        // "cpu  user nice system idle iowait irq softirq steal ..."
+        // Tokenise the numbers and sum: total = all, idle = field 4 + 5.
+        long total = 0;
+        long idle = 0;
+        int idx = 0;
+        int field = 0;
+        while (idx < line.Length) {
+            while (idx < line.Length && line.Substring(idx, 1) == " ") {
+                idx = idx + 1;
+            }
+            if (idx >= line.Length) { break; }
+            int start = idx;
+            while (idx < line.Length && line.Substring(idx, 1) != " ") {
+                idx = idx + 1;
+            }
+            string tok = line.Substring(start, idx - start);
+            if (field >= 1) {
+                long v = Cpu.ParseLong(tok);
+                total = total + v;
+                if (field == 4 || field == 5) { idle = idle + v; }
+            }
+            field = field + 1;
+        }
+        r[0] = total;
+        r[1] = idle;
+        return r;
+    }
+    #endif
+
+    /// First index of `needle` in `hay` at or after `from`, or -1.
+    static int IndexOf(string hay, string needle, int from) {
+        int n = needle.Length;
+        int h = hay.Length;
+        int i = from;
+        while (i + n <= h) {
+            if (hay.Substring(i, n) == needle) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    /// Parses a decimal long; -1 when malformed.
+    static long ParseLong(string s) {        if (s.Length == 0) { return -1; }
+        bool neg = false;
+        int i = 0;
+        if (s.Substring(0, 1) == "-") { neg = true; i = 1; }
+        long v = 0;
+        while (i < s.Length) {
+            string ch = s.Substring(i, 1);
+            int c = Cpu.CodeOf(ch);
+            if (c < 0x30 || c > 0x39) { return -1; }
+            v = v * 10 + (c - 0x30);
+            i = i + 1;
+        }
+        if (neg) { v = 0 - v; }
+        return v;
+    }
+
+    /// Parses a decimal int; -1 when malformed.
+    static int ParseInt(string s) {
+        long v = Cpu.ParseLong(s);
+        if (v > 2147483647) { return -1; }
+        return (int)v;
+    }
+
+    /// Code point of a one-character string (ASCII fast path).
+    static int CodeOf(string ch) {
+        if (ch.Length == 0) { return 0; }
+        nint buf = NativeMemory.Alloc(8);
+        NativeMemory.PutString(buf, 0, ch, ch.Length);
+        Span<byte> b = new Span<byte>(buf, 4);
+        int c0 = b[0];
+        int cp = c0;
+        NativeMemory.Free(buf);
+        return cp;
+    }
+}

@@ -1,0 +1,215 @@
+using System;
+
+namespace System.Management;
+
+/// <summary>
+/// Capacity info for one drive/mount. `name` is the drive letter ("C:")
+/// on Windows or the mount point ("/", "/home") on Linux; sizes are in
+/// bytes.
+/// </summary>
+class DiskUsage {
+    public string name;
+    public long totalBytes;
+    public long freeBytes;
+    /// Bytes available to an unprivileged user (excludes reserved blocks).
+    public long availBytes;
+
+    public int UsagePercent() {
+        if (totalBytes <= 0) { return 0; }
+        long used = totalBytes - freeBytes;
+        if (used < 0) { used = 0; }
+        return (int)(used * 100 / totalBytes);
+    }
+}
+
+/// <summary>
+/// Drive/partition enumeration and capacity. Windows walks the logical
+/// drives (GetLogicalDriveStringsW + GetDiskFreeSpaceExW); Linux parses
+/// /proc/mounts and calls statvfs per mount point. Other platforms throw
+/// PlatformNotSupportedException.
+/// </summary>
+class Storage {
+    /// <summary>All fixed/removable drives (Windows) or mounted filesystems
+    /// (Linux). Pseudo-filesystems (proc, sysfs, tmpfs, devpts, cgroup,
+    /// overlay...) are skipped on Linux.</summary>
+    static List<DiskUsage> Drives() {
+        #if WINDOWS
+        return Storage.WinDrives();
+        #elif LINUX
+        return Storage.LinuxDrives();
+        #else
+        throw new PlatformNotSupportedException(
+            "Storage.Drives is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>The system drive (Windows) or root filesystem (Linux).
+    /// Returns an empty usage object when it cannot be read.</summary>
+    static DiskUsage Root() {
+        #if WINDOWS
+        return Storage.Usage("C:");
+        #elif LINUX
+        return Storage.Usage("/");
+        #else
+        return new DiskUsage();
+        #endif
+    }
+
+    /// <summary>Capacity of one drive letter ("C:") or mount point ("/").</summary>
+    static DiskUsage Usage(string path) {
+        #if WINDOWS
+        return Storage.WinUsage(path);
+        #elif LINUX
+        return Storage.Statvfs(path);
+        #else
+        throw new PlatformNotSupportedException(
+            "Storage.Usage is not implemented on this platform");
+        #endif
+    }
+
+    #if WINDOWS
+    [DllImport("kernel32", EntryPoint = "GetLogicalDriveStringsW")]
+    static extern int WinGetLogicalDriveStringsW(int len, nint buf);
+
+    [DllImport("kernel32", EntryPoint = "GetDriveTypeW")]
+    static extern int WinGetDriveTypeW(nint root);
+
+    [DllImport("kernel32", EntryPoint = "GetDiskFreeSpaceExW")]
+    static extern int WinGetDiskFreeSpaceExW(nint dir, nint avail, nint total,
+                                             nint free);
+
+    static List<DiskUsage> WinDrives() {
+        List<DiskUsage> list = new List<DiskUsage>();
+        int need = Storage.WinGetLogicalDriveStringsW(0, 0);
+        if (need <= 0) { return list; }
+        nint buf = NativeMemory.Alloc(need * 2 + 2);
+        Storage.WinGetLogicalDriveStringsW(need, buf);
+        // Buffer is a list of NUL-terminated wide strings, ending with a
+        // double NUL. Each is like "C:\".
+        nint p = buf;
+        while (Storage.WideLen(p) > 0) {
+            string root = Wide.Read(p);
+            int type = Storage.WinGetDriveTypeW(p);
+            if (type == 2 /*DRIVE_REMOVABLE*/ || type == 3 /*DRIVE_FIXED*/) {
+                DiskUsage u = Storage.WinUsage(root);
+                if (u.totalBytes > 0) { list.Add(u); }
+            }
+            p = p + (Storage.WideLen(p) + 1) * 2;
+        }
+        NativeMemory.Free(buf);
+        return list;
+    }
+
+    static int WideLen(nint p) {
+        int n = 0;
+        while (new Span<ushort>(p + n * 2, 1)[0] != 0) { n = n + 1; }
+        return n;
+    }
+
+    static DiskUsage WinUsage(string root) {
+        nint wroot = Wide.Of(root);
+        nint avail = NativeMemory.Alloc(8);
+        nint total = NativeMemory.Alloc(8);
+        nint free = NativeMemory.Alloc(8);
+        int ok = Storage.WinGetDiskFreeSpaceExW(wroot, avail, total, free);
+        DiskUsage u = new DiskUsage();
+        u.name = root;
+        if (ok != 0) {
+            u.availBytes = new Span<long>(avail, 1)[0];
+            u.totalBytes = new Span<long>(total, 1)[0];
+            u.freeBytes = new Span<long>(free, 1)[0];
+        }
+        Wide.Free(wroot);
+        NativeMemory.Free(avail);
+        NativeMemory.Free(total);
+        NativeMemory.Free(free);
+        return u;
+    }
+    #endif
+
+    #if LINUX
+    [DllImport("crt", EntryPoint = "statvfs")]
+    static extern int StatvfsCall(nint path, nint stat);
+
+    static List<DiskUsage> LinuxDrives() {
+        List<DiskUsage> list = new List<DiskUsage>();
+        string txt = "";
+        try {
+            txt = File.ReadAllText("/proc/mounts");
+        } catch {
+            return list;
+        }
+        int i = 0;
+        while (i < txt.Length) {
+            int eol = Storage.IndexOf(txt, "\n", i);
+            if (eol < 0) { eol = txt.Length; }
+            string line = txt.Substring(i, eol - i);
+            // device mountpoint fstype options dump pass
+            int sp1 = Storage.IndexOf(line, " ", 0);
+            if (sp1 >= 0) {
+                int sp2 = Storage.IndexOf(line, " ", sp1 + 1);
+                if (sp2 >= 0) {
+                    int sp3 = Storage.IndexOf(line, " ", sp2 + 1);
+                    if (sp3 >= 0) {
+                        string mount = line.Substring(sp1 + 1, sp2 - sp1 - 1);
+                        string fstype = line.Substring(sp2 + 1, sp3 - sp2 - 1);
+                        if (Storage.IsRealFs(fstype)) {
+                            DiskUsage u = Storage.Statvfs(mount);
+                            if (u.totalBytes > 0) { list.Add(u); }
+                        }
+                    }
+                }
+            }
+            i = eol + 1;
+        }
+        return list;
+    }
+
+    /// True for filesystems with real on-disk capacity.
+    static bool IsRealFs(string fstype) {
+        if (fstype == "proc" || fstype == "sysfs" || fstype == "devpts"
+            || fstype == "tmpfs" || fstype == "devtmpfs"
+            || fstype == "cgroup" || fstype == "cgroup2"
+            || fstype == "overlay" || fstype == "mqueue"
+            || fstype == "securityfs" || fstype == "pstore"
+            || fstype == "debugfs" || fstype == "tracefs"
+            || fstype == "configfs" || fstype == "fusectl"
+            || fstype == "binfmt_misc" || fstype == "autofs"
+            || fstype == "hugetlbfs" || fstype == "bpf") {
+            return false;
+        }
+        return true;
+    }
+
+    static DiskUsage Statvfs(string path) {
+        // statvfs takes a UTF-8 char*; a Zan string is already UTF-8.
+        nint st = NativeMemory.Alloc(96);
+        int ok = Storage.StatvfsCall(path, st);
+        DiskUsage u = new DiskUsage();
+        u.name = path;
+        if (ok == 0) {
+            Span<long> q = new Span<long>(st, 11);
+            long bsize = q[0];
+            long blocks = q[2];
+            long bfree = q[3];
+            long bavail = q[4];
+            u.totalBytes = blocks * bsize;
+            u.freeBytes = bfree * bsize;
+            u.availBytes = bavail * bsize;
+        }
+        NativeMemory.Free(st);
+        return u;
+    }
+
+    static int IndexOf(string hay, string needle, int from) {
+        int n = needle.Length;
+        int h = hay.Length;
+        int i = from;
+        while (i + n <= h) {
+            if (hay.Substring(i, n) == needle) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+    #endif
+}
