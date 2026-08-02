@@ -272,6 +272,62 @@ class AiAgent {
         return outText.Count;
     }
 
+    /// How many times one request is resent by the panel after a transport
+    /// failure before the error reaches the user (the Net layer retries within
+    /// a request too, so this is the outer, visible loop).
+    static int MaxRetries() { return 2; }
+
+    /// How many times one question may be pushed on with a continue turn.
+    /// Each continue also refills the per-question tool budget, so this bounds
+    /// a runaway loop at MaxContinues() * MaxSteps() tool calls.
+    static int MaxContinues() { return 6; }
+
+    /// True when a failed request looks like a transport hiccup rather than a
+    /// refusal from the provider: a dropped connection, an idle timeout, a
+    /// gateway 5xx or a rate limit. The panel retries those on its own instead
+    /// of ending the task with an error the user has to restart by hand.
+    static bool IsTransient(string msg) {
+        return AiAgent.Has(msg, "timeout") || AiAgent.Has(msg, "timed out")
+            || AiAgent.Has(msg, "streamer") || AiAgent.Has(msg, "connect")
+            || AiAgent.Has(msg, "connection") || AiAgent.Has(msg, "reset")
+            || AiAgent.Has(msg, "closed") || AiAgent.Has(msg, "eof")
+            || AiAgent.Has(msg, "temporarily") || AiAgent.Has(msg, "429")
+            || AiAgent.Has(msg, "500") || AiAgent.Has(msg, "502")
+            || AiAgent.Has(msg, "503") || AiAgent.Has(msg, "504");
+    }
+
+    /// Case-insensitive substring test.
+    static bool Has(string hay, string needle) {
+        return ZanIDE.IndexOfStr(ZanIDE.ToLowerS(hay), needle) >= 0;
+    }
+
+    /// True when the assistant's last words put the ball back in the user's
+    /// court (a question), so the loop must stop and wait instead of
+    /// continuing on its own.
+    static bool AsksUser(string reply) {
+        string t = AiAgent.Trim(reply);
+        if (t == "") { return false; }
+        string tail = t.Substring(t.Length - 1, 1);
+        if (tail == "?") { return true; }
+        // '？' (U+FF1F) is three UTF-8 bytes; compare the whole suffix.
+        if (t.Length >= 3 && t.Substring(t.Length - 3, 3) == "？") { return true; }
+        return false;
+    }
+
+    /// The nudge that keeps a multi-step task moving without the user having
+    /// to type "continue" after every pause.
+    static string ContinuePrompt(bool limitHit) {
+        if (limitHit) {
+            return "[auto] The per-question tool budget ran out mid-task."
+                + " Keep going from where you stopped: re-send the plan with"
+                + " the finished steps marked [x], then continue with the next"
+                + " step. Do not start over.";
+        }
+        return "[auto] Continue with the next unfinished step of the plan."
+            + " Re-send the plan with the finished steps marked [x] as you go."
+            + " When every step is done, say so in one line and stop.";
+    }
+
     /// True for a tool that changes the project or runs code, so the panel
     /// asks the user before it runs (unless Auto-execute is on).
     static bool IsMutating(string tool) {
@@ -652,7 +708,8 @@ class AiAgent {
     /// claim something works without having checked it.
     static string SystemPrompt(string ctxName, string ctxCode, string root) {
         StringBuilder sb = new StringBuilder();
-        sb.Append("You are the AI assistant built into Zan IDE, the IDE of the"
+        sb.Append("You are Xiao Zan (小赞), the assistant built into Zan IDE,"
+            + " the IDE of the"
             + " Zan programming language. Help the user develop the project"
             + " that is open. Answer concisely, in the user's language.\n\n");
         sb.Append("TOOLS. You can look at the project yourself. To call a tool,"
@@ -802,6 +859,7 @@ class AiAgent {
         a.promptTokens = 0;
         a.completionTokens = 0;
         a.totalTokens = 0;
+        a.cachedTokens = 0;
         StringBuilder c = new StringBuilder();
         StringBuilder r = new StringBuilder();
         int n = raw.Length;
@@ -840,6 +898,20 @@ class AiAgent {
                             a.promptTokens = us.Int("prompt_tokens", a.promptTokens);
                             a.completionTokens = us.Int("completion_tokens", a.completionTokens);
                             a.totalTokens = us.Int("total_tokens", a.totalTokens);
+                            // Prompt tokens served from the provider's cache.
+                            // DeepSeek reports them flat as
+                            // `prompt_cache_hit_tokens`, OpenAI-compatible
+                            // providers nest them under
+                            // `prompt_tokens_details.cached_tokens`; either way
+                            // they are a subset of prompt_tokens, not an extra
+                            // charge, so they are shown as such.
+                            a.cachedTokens = us.Int("prompt_cache_hit_tokens",
+                                a.cachedTokens);
+                            JsonValue pd = us.Get("prompt_tokens_details");
+                            if (pd != null && pd.IsObject()) {
+                                a.cachedTokens = pd.Int("cached_tokens",
+                                    a.cachedTokens);
+                            }
                         }
                     }
                 }
@@ -862,6 +934,20 @@ class AiAgent {
     // extra parameters through every one of them.
     static int gCtxTokens;
     static int gMaxOut;
+    // How many requests so far went out with an older part of the chat folded
+    // into a digest, and how many raw turns the LAST such fold replaced. The
+    // usage card reads these so "why is the context never near 200k?" has a
+    // visible answer instead of looking like the limit is not being used.
+    static int gCompactions;
+    static int gLastDropped;
+
+    /// Requests sent with compacted context, and the turns the last one folded.
+    static int Compactions() { return AiAgent.gCompactions; }
+    static int LastDropped() { return AiAgent.gLastDropped; }
+    static void ResetCompaction() {
+        AiAgent.gCompactions = 0;
+        AiAgent.gLastDropped = 0;
+    }
 
     /// Records the enabled model's configured limits for the next request.
     static void SetLimits(int ctxTokens, int maxOut) {
@@ -941,25 +1027,6 @@ class AiAgent {
         return AiAgent.Cap(AiAgent.FirstLine(text), 200);
     }
 
-    /// A compact, human-readable digest of the whole transcript (every turn run
-    /// through DigestTurn), used to seed a forked session so it keeps the
-    /// thread of the conversation without carrying the full history.
-    static string SummarizeTranscript(List<string> roles, List<string> texts) {
-        StringBuilder d = new StringBuilder();
-        d.Append("[Forked from an earlier session. Summary of the conversation"
-            + " so far -- decisions, files touched and findings:]\n");
-        int j = 0;
-        while (j < roles.Count) {
-            d.Append(AiAgent.DigestTurn(roles[j], texts[j]) + "\n");
-            if (d.Length > 6000) {
-                d.Append("... (older turns elided)\n");
-                break;
-            }
-            j = j + 1;
-        }
-        return d.ToString();
-    }
-
     /// Builds the message list actually sent to the model: recent turns kept
     /// whole, and everything older than the budget replaced by a single digest
     /// message. Returns the turns unchanged when the transcript is small.
@@ -1008,6 +1075,8 @@ class AiAgent {
         }
         m.compacted = true;
         m.dropped = keepFrom;
+        AiAgent.gCompactions = AiAgent.gCompactions + 1;
+        AiAgent.gLastDropped = keepFrom;
         return m;
     }
 }
@@ -1033,4 +1102,7 @@ class SseAnswer {
     int promptTokens;
     int completionTokens;
     int totalTokens;
+    /// Prompt tokens the provider served from its cache (a subset of
+    /// promptTokens); 0 when the provider does not report caching.
+    int cachedTokens;
 }

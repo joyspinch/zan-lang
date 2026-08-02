@@ -186,16 +186,65 @@ class ChatArea {
         return false;
     }
 
+    /// Code lines of a fenced block shown before it folds behind a
+    /// "show N more" row.
+    static int CodeFoldLines() { return 14; }
+
+    /// True when `src` holds a fenced block long enough to be folded.
+    static bool HasLongCode(List<string> src) {
+        int i = 0;
+        while (i < src.Count) {
+            string ln = src[i];
+            if (ln.Length >= 3 && ln.Substring(0, 3) == "```") {
+                int endAt = i + 1;
+                while (endAt < src.Count) {
+                    string el = src[endAt];
+                    if (el.Length >= 3 && el.Substring(0, 3) == "```") { break; }
+                    endAt = endAt + 1;
+                }
+                if (endAt - i - 1 > ChatArea.CodeFoldLines() + 2) { return true; }
+                i = endAt + 1;
+                continue;
+            }
+            i = i + 1;
+        }
+        return false;
+    }
+
     static void ChatBuildLines(App app, List<string> roles, List<string> texts,
             List<string> reason, int textW, bool thinkOpen, List<int> toolOpen,
             List<string> lines, List<int> colors, List<int> kinds,
-            List<int> meta) {
+            List<int> meta, List<int> owner) {
+        ChatArea.ChatBuildRange(app, roles, texts, reason, 0, roles.Count,
+            textW, thinkOpen, toolOpen, lines, colors, kinds, meta, owner);
+    }
+
+    /// Speaker code of a transcript role, used to tint whole message blocks:
+    /// 0 = you, 1 = Xiao Zan, 2 = tool, 3 = error.
+    static int RoleCode(string role) {
+        if (role == "user") { return 0; }
+        if (role == "tool") { return 2; }
+        if (role == "error") { return 3; }
+        return 1;
+    }
+
+    /// Wraps only the turns in [from, to) and APPENDS them to the cache lists.
+    /// Splitting the build this way lets the panel keep the wrapped lines of
+    /// the settled turns and re-wrap just the turn that is streaming, instead
+    /// of re-wrapping a whole long conversation on every frame.
+    static void ChatBuildRange(App app, List<string> roles, List<string> texts,
+            List<string> reason, int from, int to, int textW, bool thinkOpen,
+            List<int> toolOpen, List<string> lines, List<int> colors,
+            List<int> kinds, List<int> meta, List<int> owner) {
         Theme t = app.theme;
         List<int> togPos = new List<int>();
         List<int> togMsg = new List<int>();
-        int i = 0;
-        while (i < roles.Count) {
-            string head = "AI";
+        int i = from;
+        if (i < 0) { i = 0; }
+        int stop = to;
+        if (stop > roles.Count) { stop = roles.Count; }
+        while (i < stop) {
+            string head = ZanIDE.T("Xiao Zan", "小赞");
             int headCol = t.success;
             int bodyCol = t.textPrimary;
             if (roles[i] == "user") {
@@ -246,6 +295,7 @@ class ChatArea {
                         k = k + 1;
                     }
                 }
+                while (owner.Count < lines.Count) { owner.Add(2); }
                 i = i + 1;
                 continue;
             }
@@ -288,10 +338,56 @@ class ChatArea {
             // simplified for readable plain-canvas rendering.
             List<string> src = CodeEditor.SplitLines(texts[i]);
             bool inCode = false;
+            // A long code block (a whole file the model printed, or the half
+            // of one a stopped answer left behind) is folded to its first
+            // lines plus a clickable "show N more" row -- like a tool result --
+            // instead of burying the rest of the transcript. Expanding it uses
+            // the same per-message toggle list as tool results.
+            bool codeOpen = ChatArea.HasInt(toolOpen, i);
+            if (codeOpen && ChatArea.HasLongCode(src)) {
+                togPos.Add(lines.Count);
+                togMsg.Add(i);
+                lines.Add("▼ " + ZanIDE.T("collapse code", "收起代码"));
+                colors.Add(t.textTertiary);
+                kinds.Add(5);
+            }
             int li = 0;
             while (li < src.Count) {
                 string ln = src[li];
                 bool fence = ln.Length >= 3 && ln.Substring(0, 3) == "```";
+                if (fence && !inCode && !codeOpen) {
+                    // Opening fence: measure the block before emitting it.
+                    int endAt = li + 1;
+                    while (endAt < src.Count) {
+                        string el = src[endAt];
+                        if (el.Length >= 3 && el.Substring(0, 3) == "```") { break; }
+                        endAt = endAt + 1;
+                    }
+                    int blockLen = endAt - li - 1;
+                    if (blockLen > ChatArea.CodeFoldLines() + 2) {
+                        int keep = ChatArea.CodeFoldLines();
+                        int ck = li + 1;
+                        while (ck < li + 1 + keep) {
+                            int cbefore = lines.Count;
+                            ChatArea.WrapInto(src[ck], textW - app.Scale(8),
+                                t.fontSizeSmall, lines);
+                            if (lines.Count == cbefore) { lines.Add(""); }
+                            while (colors.Count < lines.Count) {
+                                colors.Add(t.info); kinds.Add(1);
+                            }
+                            ck = ck + 1;
+                        }
+                        togPos.Add(lines.Count);
+                        togMsg.Add(i);
+                        lines.Add("▶ " + ZanIDE.T("show ", "展开剩余 ")
+                            + Convert.ToString(blockLen - keep)
+                            + ZanIDE.T(" more code lines", " 行代码"));
+                        colors.Add(t.textTertiary);
+                        kinds.Add(5);
+                        li = endAt + 1;
+                        continue;
+                    }
+                }
                 if (fence) {
                     inCode = !inCode;
                 } else if (inCode) {
@@ -314,6 +410,10 @@ class ChatArea {
                 }
                 li = li + 1;
             }
+            // owner[row] = which speaker this display row belongs to, so the
+            // renderer can paint the whole message as one tinted block.
+            int ownCode = ChatArea.RoleCode(roles[i]);
+            while (owner.Count < lines.Count) { owner.Add(ownCode); }
             // No blank row between turns: the per-turn header (kind 3) with its
             // background band already separates messages, so a trailing blank
             // row would just add wasted vertical space. Messages stack tightly
@@ -366,7 +466,7 @@ class ChatArea {
     /// maximum scroll offset.
     static int RenderChatArea(App app, Rect area, List<string> lines,
             List<int> colors, List<int> kinds, List<int> meta,
-            List<int> toolOpen, int scroll, bool busy,
+            List<int> owner, List<int> toolOpen, int scroll, bool busy,
             LogState sel, bool interactive, SignalInt thinkOpen) {
         Canvas c = app.canvas;
         Theme t = app.theme;
@@ -378,8 +478,8 @@ class ChatArea {
             c.PushClip(area.x, area.y, area.width, area.height);
             List<string> hint = new List<string>();
             ChatArea.WrapInto(ZanIDE.T(
-                "Ask the AI assistant about your project: explain code, find bugs, generate Zan snippets.",
-                "向 AI 助手提问：解释代码、查找问题、生成 Zan 代码片段。"),
+                "Ask Xiao Zan about your project: explain code, find bugs, generate Zan snippets.",
+                "向小赞提问：解释代码、查找问题、生成 Zan 代码片段。"),
                 area.width - pad * 2, t.fontSizeSmall, hint);
             int hi = 0;
             while (hi < hint.Count) {
@@ -437,7 +537,8 @@ class ChatArea {
                         app.RequestRedraw();
                     }
                 } else {
-                    int cc = LogView.ColAt(lines[ri], area.x + pad,
+                    int cc = LogView.ColAt(lines[ri],
+                        area.x + pad + app.Scale(11),
                         t.fontSizeSmall, app.mouseX);
                     sel.selR0 = ri; sel.selC0 = cc;
                     sel.selR1 = ri; sel.selC1 = cc;
@@ -448,7 +549,8 @@ class ChatArea {
             if (kind == 1 && sel.selDrag) {
                 int ri = ChatArea.RowAtChat(area, pad, rowH, start,
                     lines.Count, app.mouseY);
-                int cc = LogView.ColAt(lines[ri], area.x + pad,
+                int cc = LogView.ColAt(lines[ri],
+                    area.x + pad + app.Scale(11),
                     t.fontSizeSmall, app.mouseX);
                 sel.selR1 = ri; sel.selC1 = cc;
                 app.RequestRedraw();
@@ -469,17 +571,36 @@ class ChatArea {
         int row = 0;
         int idx = start;
         int codeBg = App.ScaleAlpha(t.bgTertiary, 160);
-        int headBg = App.ScaleAlpha(t.bgTertiary, 70);
+        // Each turn is painted as one block: a coloured rail down its left
+        // edge plus a tint of the speaker's colour behind every one of its
+        // rows. That -- not a per-line marker -- is what makes a question,
+        // an answer and a tool dump separable at a glance.
+        int barW = app.Scale(3);
+        int blockX = area.x + pad;
+        int textX = blockX + barW + app.Scale(8);
+        int textW2 = area.width - pad * 2 - barW - app.Scale(8);
         while (idx < total && row < maxRows) {
             int ry = area.y + pad + row * rowH;
             if (idx < lines.Count) {
+                int who = 1;
+                if (idx < owner.Count) { who = owner[idx]; }
+                int rail = t.success;
+                int tint = App.ScaleAlpha(t.success, 16);
+                if (who == 0) {
+                    rail = t.primary;
+                    tint = App.ScaleAlpha(t.primary, 34);
+                } else if (who == 2) {
+                    rail = t.textTertiary;
+                    tint = App.ScaleAlpha(t.bgTertiary, 90);
+                } else if (who == 3) {
+                    rail = t.error;
+                    tint = App.ScaleAlpha(t.error, 30);
+                }
+                c.FillRect(blockX, ry, area.width - pad * 2, rowH, tint);
+                c.FillRect(blockX, ry, barW, rowH, rail);
                 if (kinds[idx] == 1) {
-                    c.FillRect(area.x + pad - app.Scale(2), ry - app.Scale(1), area.width - pad * 2 + app.Scale(4), rowH, codeBg);
-                } else if (kinds[idx] == 3) {
-                    // Message header band: a soft full-width strip behind the
-                    // role label ("AI" / "You"), so adjacent turns read as
-                    // distinct blocks without any blank gap between them.
-                    c.FillRect(area.x + pad, ry, area.width - pad * 2, rowH, headBg);
+                    c.FillRect(textX - app.Scale(2), ry,
+                        textW2 + app.Scale(4), rowH, codeBg);
                 }
                 if (sr0 >= 0 && idx >= sr0 && idx <= sr1) {
                     string ln = lines[idx];
@@ -490,27 +611,44 @@ class ChatArea {
                     if (hs < 0) { hs = 0; }
                     if (he > ln.Length) { he = ln.Length; }
                     if (hs > he) { hs = he; }
-                    int hx0 = area.x + pad
+                    int hx0 = textX
                         + Canvas.MeasureText(Text.Left(ln, hs), t.fontSizeSmall);
-                    int hx1 = area.x + pad
+                    int hx1 = textX
                         + Canvas.MeasureText(Text.Left(ln, he), t.fontSizeSmall);
                     if (idx < sr1) { hx1 = hx1 + pad; }
                     if (hx1 < hx0 + 2) { hx1 = hx0 + 2; }
                     c.FillRect(hx0, ry, hx1 - hx0, rowH, selCol);
                 }
-                if (kinds[idx] == 1) {
-                    app.canvas.DrawText(area.x + pad + app.Scale(4), ry, lines[idx], colors[idx],
+                if (kinds[idx] == 3) {
+                    // Name row of a turn: a solid pill in the speaker's colour
+                    // with the name reversed out of it, so the start of every
+                    // message is a coloured chip rather than one more line of
+                    // text the eye has to parse.
+                    int chipH = rowH - app.Scale(2);
+                    int chipTw = Canvas.MeasureText(lines[idx], t.fontSizeSmall);
+                    int chipW = chipTw + app.Scale(14);
+                    c.FillRoundRect(textX, ry + app.Scale(1), chipW, chipH,
+                        chipH / 2, colors[idx]);
+                    int chipFh = Canvas.FontHeight(t.fontSizeSmall);
+                    app.canvas.DrawText(textX + app.Scale(7),
+                        ry + app.Scale(1) + (chipH - chipFh) / 2,
+                        lines[idx], t.bgPrimary,
+                        Style.Of(app, "label", "small", Style.SNormal())
+                            .FontOr(t.fontSizeSmall));
+                } else if (kinds[idx] == 1) {
+                    app.canvas.DrawText(textX + app.Scale(4), ry, lines[idx],
+                        colors[idx],
                         Style.Of(app, "label", "small", Style.SNormal())
                             .FontOr(app.theme.fontSizeSmall));
                 } else {
-                    app.canvas.DrawText(area.x + pad, ry, lines[idx], colors[idx],
+                    app.canvas.DrawText(textX, ry, lines[idx], colors[idx],
                         Style.Of(app, "label", "small", Style.SNormal())
                             .FontOr(app.theme.fontSizeSmall));
                 }
             } else {
                 app.canvas.DrawStyledText(
                     Style.Of(app, "label", "hint small", Style.SNormal()),
-                    area.x + pad, ry, ZanIDE.T("AI is thinking...", "AI 思考中..."),
+                    area.x + pad, ry, ZanIDE.T("Xiao Zan is thinking...", "小赞思考中..."),
                     app.theme.textPrimary, app.theme.fontSizeMedium);
             }
             idx = idx + 1;

@@ -6,20 +6,19 @@ using System.Net.Http;
 using System.Net.Http.Client;
 
 /// The AI chat transport: a real HTTPS request made with the Net standard
-/// library. The request runs in a SEPARATE CHILD PROCESS (the IDE re-executes
-/// itself in a headless streaming mode) which streams the decoded response body
-/// (a text/event-stream) into a file as chunks arrive; the GUI polls that file
-/// every frame, so the answer appears incrementally while the SDL event loop
-/// stays responsive.
+/// library, running on a worker thread INSIDE the IDE process. The decoded
+/// response body (a text/event-stream) lands in an in-memory sink as chunks
+/// arrive; the GUI thread reads the sink every frame, so the answer appears
+/// incrementally while the event loop stays responsive.
 ///
-/// Why a child process and not a background thread: the Zan runtime's GC and
-/// coroutine allocator are not thread-safe, so driving the async network
-/// reactor on a second OS thread races the GUI thread's allocations and
-/// corrupts the shared heap (observed: `Invalid address to RtlFreeHeap` while
-/// the tool loop reads a project). A child process has its own heap, so the
-/// network work and the GUI never touch the same allocator. The request
-/// parameters are handed to the child through a small descriptor file whose
-/// path is passed in the `ZAN_AI_REQ` environment variable.
+/// Nothing is written to disk: the sink hands the bytes and the outcome
+/// across the thread boundary under its own lock. Earlier versions ran the
+/// request in a re-executed child process and passed the stream through
+/// files in the cache directory, because driving the async reactor on a
+/// second OS thread was thought to race the GUI thread's allocator. It does
+/// not: object refcounts are atomic and the allocator is per-thread, and the
+/// scheduler and reactor state a request touches belong to the thread that
+/// drives them.
 class AiNet {
     static string sHost;
     static int sPort;
@@ -28,12 +27,21 @@ class AiNet {
     static string sPath;
     static string sKey;
     static string sBody;
-    static string sOut;
-    static string sDone;
     static int sTimeout;
 
-    /// The request itself: builds the client from the shared fields and streams
-    /// the response to the output file. `await` runs on this process's reactor.
+    /// The sink of the request in flight. Replaced by every new request and
+    /// dropped (set to null) by a cancel: the worker of an abandoned request
+    /// keeps writing into the sink object it captured, which nobody reads any
+    /// more, so a late chunk or a late error can never land in the answer to
+    /// the next question.
+    static SseSink sSink;
+
+    /// The sink the worker thread streams into (captured before the GUI can
+    /// replace `sSink`).
+    static SseSink sWorkerSink;
+
+    /// The request itself: builds the client from the shared fields and
+    /// streams the response into the worker's sink.
     static async int RunReq() {
         HttpClient cli;
         if (AiNet.sTls) { cli = HttpClient.CreateHttps(AiNet.sHost, AiNet.sPort); }
@@ -43,13 +51,12 @@ class AiNet {
         cli.SetHeader("Content-Type", "application/json");
         cli.SetHeader("Accept", "text/event-stream");
         cli.SetTimeout(AiNet.sTimeout);
-        int rr = await cli.PostSseToFileAsync(AiNet.sPath, AiNet.sBody,
-                                              AiNet.sOut, AiNet.sDone);
+        int rr = await cli.PostSseToSinkAsync(AiNet.sPath, AiNet.sBody,
+                                              AiNet.sWorkerSink);
         return rr;
     }
 
-    /// True when a done-marker text means success (it begins with "ok"; the
-    /// streamer can occasionally append it twice -> "okok").
+    /// True when an outcome marker means success (it begins with "ok").
     static bool IsOk(string marker) {
         string s = marker;
         int a = 0;
@@ -61,29 +68,31 @@ class AiNet {
         return a + 2 <= s.Length && s.Substring(a, 2) == "ok";
     }
 
-    /// Drives the request to completion, retrying transient failures. Run on a
-    /// dedicated OS thread: the thread's coroutine scheduler pumps every `await`
-    /// (connect/recv) until PostSseToFileAsync finishes and writes its marker.
-    /// Each attempt streams into a private marker file; only the final outcome
-    /// is published to the real done file, so the GUI never sees a mid-retry
-    /// error and a dropped connection recovers on its own (like mainstream AI
-    /// coding tools). Up to 4 attempts (3 retries) with a growing backoff for
-    /// transient network blips / provider 5xx.
+    /// Drives the request to completion on its own OS thread, retrying
+    /// transient failures. The thread's coroutine scheduler pumps every
+    /// `await` (connect / recv) until the stream ends. Only the final outcome
+    /// is published, so the GUI never sees a mid-retry error and a dropped
+    /// connection recovers on its own. Up to 4 attempts (3 retries) with a
+    /// growing backoff.
     static void Worker() {
         Socket.Initialize();
-        string realDone = AiNet.sDone;
-        string tryDone = realDone + ".try";
+        SseSink sink = AiNet.sWorkerSink;
         int attempt = 0;
         string last = "";
         while (attempt < 4) {
-            if (File.Exists(tryDone)) { File.Delete(tryDone); }
-            AiNet.sDone = tryDone;
-            int _r = await AiNet.RunReq();
             last = "";
-            if (File.Exists(tryDone)) { last = File.ReadAllText(tryDone); }
+            // A throw anywhere in the transport (DNS, TLS, a closed socket)
+            // must still end as a marker: without this the worker dies
+            // silently and the panel waits out its whole backstop before
+            // reporting a timeout that was really a connect error.
+            try {
+                int _r = await AiNet.RunReq();
+            } catch (Exception ex) {
+                last = "err: " + ex.Message;
+            }
+            if (last == "") { last = sink.Attempt(); }
             if (AiNet.IsOk(last)) {
-                HttpClient.AppendText(realDone, "ok");
-                if (File.Exists(tryDone)) { File.Delete(tryDone); }
+                sink.Publish("ok");
                 return;
             }
             attempt = attempt + 1;
@@ -91,85 +100,9 @@ class AiNet {
             // connection to recover, short enough to not stall the reply.
             if (attempt < 4) { Thread.Sleep(1000 * attempt); }
         }
-        // All attempts failed: surface the last transport error to the GUI.
         string msg = last;
-        if (msg == "") { msg = "err: streamer failed"; }
-        HttpClient.AppendText(realDone, msg);
-        if (File.Exists(tryDone)) { File.Delete(tryDone); }
-    }
-
-    /// Headless entry point: the child process runs this instead of the GUI
-    /// when `ZAN_AI_REQ` points at a request descriptor. The request runs on a
-    /// worker thread (so its scheduler drives the async reactor to completion —
-    /// a top-level `await` in this plain entry point would return at the first
-    /// suspension and exit the process mid-stream); the main thread simply waits
-    /// for the done-marker the worker writes when the stream ends, then exits.
-    static void RunStreamerMain(string descFile) {
-        List<string> ln = AiNet.ReadLines(descFile);
-        if (ln.Count < 8) { return; }
-        string baseUrl = ln[0];
-        string suffix = ln[1];
-        string key = ln[2];
-        string bodyFile = ln[3];
-        string outFile = ln[4];
-        string doneFile = ln[5];
-        int timeout = AiNet.ParseInt(ln[6], 600000);
-        bool verify = ln[7] == "1";
-        string body = "";
-        if (File.Exists(bodyFile)) { body = File.ReadAllText(bodyFile); }
-        AiNet.SetUrl(baseUrl, suffix);
-        AiNet.sKey = key;
-        AiNet.sBody = body;
-        AiNet.sOut = outFile;
-        AiNet.sDone = doneFile;
-        AiNet.sTimeout = timeout;
-        AiNet.sVerify = verify;
-        Thread.Start(AiNet.Worker);
-        // Wait for the worker to publish the real done-marker (it does so
-        // last, after any retries). The transport's own timeout is an IDLE
-        // window (every received chunk re-arms it), so a model that keeps
-        // streaming -- e.g. a long thinking phase -- must not be killed by a
-        // fixed total budget. The main thread only waits for the worker to
-        // finish all its attempts: an idle backstop here would race the
-        // transport (whose window resets per attempt) and kill a request that
-        // is mid-retry, so the only bound is the hard cap covering the
-        // worker's four attempts. A truly dead streamer still surfaces an
-        // error through the cap.
-        int baseTimeout = timeout;
-        if (baseTimeout <= 0) { baseTimeout = 600000; }
-        int hardCap = baseTimeout * 4 + 60000;
-        int waited = 0;
-        while (!File.Exists(doneFile) && waited < hardCap) {
-            Thread.Sleep(50);
-            waited = waited + 50;
-        }
-        // Let the worker fully unwind after it wrote the marker.
-        Thread.Sleep(150);
-        if (!File.Exists(doneFile)) {
-            HttpClient.AppendText(doneFile, "err: streamer timeout");
-        }
-    }
-
-    /// Splits a descriptor file into its lines (trailing CR stripped).
-    static List<string> ReadLines(string path) {
-        List<string> res = new List<string>();
-        if (!File.Exists(path)) { return res; }
-        string raw = File.ReadAllText(path);
-        int i = 0;
-        int n = raw.Length;
-        int start = 0;
-        while (i <= n) {
-            if (i == n || (raw[i] & 255) == 10) {
-                string line = raw.Substring(start, i - start);
-                if (line.Length > 0 && (line[line.Length - 1] & 255) == 13) {
-                    line = line.Substring(0, line.Length - 1);
-                }
-                res.Add(line);
-                start = i + 1;
-            }
-            i = i + 1;
-        }
-        return res;
+        if (msg == "") { msg = "err: request failed"; }
+        sink.Publish(msg);
     }
 
     /// Parses `baseUrl` (scheme://host[:port][/base]) into the transport
@@ -232,53 +165,43 @@ class AiNet {
         return v;
     }
 
-    /// Directory part of a path (no trailing separator); "" when there is none.
-    static string ParentDir(string p) {
-        int cut = 0 - 1;
-        int i = 0;
-        while (i < p.Length) {
-            int c = p[i] & 255;
-            if (c == 47 || c == 92) { cut = i; }
-            i = i + 1;
-        }
-        if (cut < 0) { return ""; }
-        return p.Substring(0, cut);
-    }
-
-    /// Kicks off the request in a detached child process. `outFile` is
-    /// truncated and `doneFile` removed first so the poller reads only this
-    /// request's output. The child receives every parameter through a
-    /// descriptor file (path in `ZAN_AI_REQ`); the request body is written to
-    /// its own file to avoid any escaping. Returns "" on success or a readable
-    /// error when the child cannot be launched.
+    /// Kicks off the request on a worker thread. Returns "" on success or a
+    /// readable error when the thread cannot be started.
     static string Start(string baseUrl, string suffix, string key, string body,
-            string outFile, string doneFile, int timeoutMs, bool verify) {
-        HttpClient.TruncateFile(outFile);
-        if (File.Exists(doneFile)) { File.Delete(doneFile); }
-
-        string dir = AiNet.ParentDir(outFile);
-        string descFile = dir + "/ai_net.txt";
-        string bodyFile = dir + "/ai_body.txt";
-        File.WriteAllText(bodyFile, body);
-        string vf = "0";
-        if (verify) { vf = "1"; }
-        string desc = baseUrl + "\n" + suffix + "\n" + key + "\n"
-            + bodyFile + "\n" + outFile + "\n" + doneFile + "\n"
-            + Convert.ToString(timeoutMs) + "\n" + vf + "\n";
-        File.WriteAllText(descFile, desc);
-
-        string exe = ZanIDE.ExePath();
-        #if WINDOWS
-        // `cmd.exe /c set "VAR=..."&& "exe"` sets the variable only for the
-        // child's environment (the `set "VAR=val"` form keeps the value clean).
-        string cmd = "set \"ZAN_AI_REQ=" + descFile + "\"&& \"" + exe + "\"";
-        #else
-        string cmd = "ZAN_AI_REQ=\"" + descFile + "\" \"" + exe + "\"";
-        #endif
-        int rc = Process.RunDetached(cmd);
-        if (rc != 0) {
-            return "could not start the AI request process.";
+            int timeoutMs, bool verify) {
+        AiNet.SetUrl(baseUrl, suffix);
+        AiNet.sKey = key;
+        AiNet.sBody = body;
+        AiNet.sTimeout = timeoutMs;
+        AiNet.sVerify = verify;
+        SseSink sink = SseSink.ToMemory();
+        AiNet.sSink = sink;
+        AiNet.sWorkerSink = sink;
+        if (!Thread.Start(AiNet.Worker)) {
+            AiNet.sSink = null;
+            return "could not start the AI request thread.";
         }
         return "";
+    }
+
+    /// Everything the reply has streamed so far ("" when nothing is in
+    /// flight). Safe to call from the GUI thread every frame.
+    static string Text() {
+        if (AiNet.sSink == null) { return ""; }
+        return AiNet.sSink.All();
+    }
+
+    /// The final outcome of the request in flight ("ok" / "err: ..."), or ""
+    /// while it is still streaming.
+    static string Done() {
+        if (AiNet.sSink == null) { return ""; }
+        return AiNet.sSink.Done();
+    }
+
+    /// Forgets the request in flight. A worker still running keeps streaming
+    /// into the sink it captured; nothing reads it, and it is freed once the
+    /// worker returns.
+    static void Abandon() {
+        AiNet.sSink = null;
     }
 }

@@ -112,8 +112,29 @@ try {
     $zanArgs += @("--link-lib", "version", "--link-lib", "uuid")
     $zanArgs += @("--link-lib", "setupapi", "--link-lib", "shell32")
     $zanArgs += @("--icon", (Join-Path (Get-Location) "assets\zan.ico"))
+    # A running IDE holds a lock on its own executable, so the linker cannot
+    # overwrite it ("Permission denied"). Windows does allow RENAMING a running
+    # image: park it aside (and clear the previous parked copy, which is only
+    # deletable once that older process exited) so a rebuild never needs the
+    # editor to be closed first.
+    $exeOut = Join-Path (Get-Location) "build\ZanIDE.exe"
+    $exeOld = Join-Path (Get-Location) "build\ZanIDE.prev.exe"
+    if (Test-Path -LiteralPath $exeOld) {
+        Remove-Item -LiteralPath $exeOld -Force -ErrorAction SilentlyContinue
+    }
+    if (Test-Path -LiteralPath $exeOut) {
+        Move-Item -LiteralPath $exeOut -Destination $exeOld -Force `
+            -ErrorAction SilentlyContinue
+    }
+    # Under $ErrorActionPreference = "Stop" a redirected native stderr line is
+    # promoted to a terminating NativeCommandError, so a mere compiler warning
+    # (e.g. the unbundled sqlite3 driver) aborted an otherwise successful
+    # build. Only the exit code decides here.
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
     $out = & $zanc @zanArgs 2>&1
     $code = $LASTEXITCODE
+    $ErrorActionPreference = $prevEap
     if ($code -ne 0) {
         $out | Select-Object -Last 40
         throw "IDE_LINK_FAILED code=$code"

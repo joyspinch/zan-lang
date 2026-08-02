@@ -290,12 +290,18 @@ partial class ZanIDE {
     /// Environment variables OPENAI_API_KEY / OPENAI_BASE_URL / OPENAI_MODEL
     /// are the fallback so the panel works with a plain OpenAI-compatible setup.
     static string AiCfgPath() { return ZanIDE.UserConfigDir() + "/ai.cfg"; }
-    static string AiReqPath() { return ZanIDE.CacheDir() + "/ai_req.json"; }
-    static string AiRespPath() { return ZanIDE.CacheDir() + "/ai_resp.json"; }
-    static string AiDonePath() { return ZanIDE.CacheDir() + "/ai_done.txt"; }
-    /// The decoded response body of a streaming chat request, appended to by
-    /// the Net worker thread and tailed by the panel each frame.
-    static string AiStreamPath() { return ZanIDE.CacheDir() + "/ai_stream.txt"; }
+
+    /// Abandons the request in flight: the panel stops reading its sink, so
+    /// a worker that is still streaming (a stop pressed mid-answer, a request
+    /// superseded by the next question) can never land a late chunk or a late
+    /// error in the next answer.
+    static void AiCancelRequest() {
+        AiNet.Abandon();
+    }
+
+    static void DeleteIfExists(string path) {
+        if (File.Exists(path)) { File.Delete(path); }
+    }
 
     /// Reads `key = value` from `content` (same line format as zan.proj).
     static string KvField(string content, string key) {
@@ -340,9 +346,6 @@ partial class ZanIDE {
     static string AiProfilesPath() { return ZanIDE.UserConfigDir() + "/ai_profiles.json"; }
     static string AiModelsRespPath() { return ZanIDE.CacheDir() + "/ai_models.json"; }
     static string AiModelsDonePath() { return ZanIDE.CacheDir() + "/ai_models_done.txt"; }
-    static string AiPredReqPath() { return ZanIDE.CacheDir() + "/ai_pred_req.json"; }
-    static string AiPredRespPath() { return ZanIDE.CacheDir() + "/ai_pred.json"; }
-    static string AiPredDonePath() { return ZanIDE.CacheDir() + "/ai_pred_done.txt"; }
 
     /// Loads the AI provider profiles into the parallel lists and returns the
     /// active index. Falls back to a single profile synthesized from the
@@ -551,58 +554,6 @@ partial class ZanIDE {
         return outp;
     }
 
-    /// Asks the model to continue the code exactly at the caret: the file is
-    /// sent split around a <CURSOR> marker and the model must reply with only
-    /// the code to insert there. Detached like AiLaunch; returns "" or error.
-    static string AiLaunchPredict(string fileName, string code, int caretLine,
-            string baseUrl, string key, string model) {
-        if (key == "") {
-            return ZanIDE.T(
-                "No API key. Open the AI panel's Config editor and fill in the key for the enabled profile.",
-                "未配置 API 密钥。请在 AI 面板的“配置”中为启用的配置填写密钥。");
-        }
-        if (baseUrl == "") { baseUrl = "https://api.openai.com/v1"; }
-        if (model == "") { model = "gpt-4o-mini"; }
-        // Split around the caret line so the marker lands where the insert
-        // happens; keep a bounded window on both sides.
-        List<string> lines = CodeEditor.SplitLines(code);
-        string before = "";
-        string after = "";
-        int i = 0;
-        while (i < lines.Count) {
-            if (i <= caretLine) { before = before + lines[i] + "\n"; }
-            else { after = after + lines[i] + "\n"; }
-            i = i + 1;
-        }
-        if (before.Length > 6000) { before = before.Substring(before.Length - 6000, 6000); }
-        if (after.Length > 2000) { after = after.Substring(0, 2000); }
-        string sysMsg = "You are the inline code completion engine of Zan IDE"
-            + " (Zan programming language). The user's file " + fileName
-            + " is given with a <CURSOR> marker. Reply with ONLY the code to"
-            + " insert at the marker: no explanations, no markdown fences.";
-        StringBuilder body = new StringBuilder();
-        body.Append("{\"model\":\"" + ZanIDE.JsonEsc(model) + "\",\"messages\":[");
-        body.Append("{\"role\":\"system\",\"content\":\"" + ZanIDE.JsonEsc(sysMsg) + "\"},");
-        body.Append("{\"role\":\"user\",\"content\":\""
-            + ZanIDE.JsonEsc(before + "<CURSOR>" + after) + "\"}");
-        body.Append("]}");
-        ZanIDE.EnsureCacheDir();
-        File.WriteAllText(ZanIDE.AiPredReqPath(), body.ToString());
-        if (File.Exists(ZanIDE.AiPredRespPath())) { File.Delete(ZanIDE.AiPredRespPath()); }
-        if (File.Exists(ZanIDE.AiPredDonePath())) { File.Delete(ZanIDE.AiPredDonePath()); }
-        string cmd = "curl -s --max-time 120 \"" + baseUrl + "/chat/completions\""
-            + " -H \"Content-Type: application/json\""
-            + " -H \"Authorization: Bearer " + key + "\""
-            + " --data-binary @\"" + ZanIDE.AiPredReqPath() + "\""
-            + " -o \"" + ZanIDE.AiPredRespPath() + "\"";
-        #if WINDOWS
-        Process.RunDetached("(" + cmd + ") & echo ok > \"" + ZanIDE.AiPredDonePath() + "\"");
-        #else
-        Process.RunDetached("(" + cmd + ") ; echo ok > \"" + ZanIDE.AiPredDonePath() + "\"");
-        #endif
-        return "";
-    }
-
     /// Strips a surrounding ``` fence (with optional language tag) from `s`,
     /// and returns "" for error replies so they are never inserted as code.
     static string AiStripFence(string s) {
@@ -624,6 +575,13 @@ partial class ZanIDE {
         return r;
     }
 
+    /// Two lowercase hex digits for a byte (00-ff).
+    static string HexByte(int b) {
+        string digits = "0123456789abcdef";
+        int v = b & 255;
+        return digits.Substring(v / 16, 1) + digits.Substring(v % 16, 1);
+    }
+
     /// Escapes a string for embedding in a JSON string literal.
     static string JsonEsc(string s) {
         StringBuilder sb = new StringBuilder();
@@ -635,6 +593,14 @@ partial class ZanIDE {
             else if (ch == "\n") { sb.Append("\\n"); }
             else if (ch == "\r") { }
             else if (ch == "\t") { sb.Append("\\t"); }
+            else if (s[i] < 32) {
+                // Any other control byte (a stray \b, \f or 0x01 pasted in
+                // from a terminal capture) is illegal raw inside a JSON
+                // string: left as-is it makes the whole request -- or, for a
+                // saved chat, the whole session record -- unparsable, which
+                // reads as the conversation coming back truncated.
+                sb.Append("\\u00" + ZanIDE.HexByte(s[i]));
+            }
             else { sb.Append(ch); }
             i = i + 1;
         }
@@ -674,13 +640,17 @@ partial class ZanIDE {
         if (key == "") {
             return ZanIDE.T(
                 "No API key. Open the AI panel's Config editor and fill in the key for the enabled profile.",
-                "未配置 API 密钥。请在 AI 面板的“配置”中为启用的配置填写密钥。");
+                "未配置 API 密钥。请在小赞面板的“配置”中为启用的配置填写密钥。");
         }
         if (baseUrl == "") { baseUrl = "https://api.openai.com/v1"; }
         if (model == "") { model = "gpt-4o-mini"; }
         StringBuilder body = new StringBuilder();
+        // stream_options.include_usage: OpenAI-compatible endpoints only put
+        // the token counts in the final chunk of a stream when asked, and the
+        // usage card is only honest when they arrive.
         body.Append("{\"model\":\"" + ZanIDE.JsonEsc(model)
-            + "\",\"stream\":true,\"messages\":[");
+            + "\",\"stream\":true,\"stream_options\":{\"include_usage\":true}"
+            + ",\"messages\":[");
         // The standing instructions, the tool protocol, the open file and the
         // RepoMap outline all come from the agent layer, so the loop that runs
         // the tools and the prompt that describes them can never drift apart.
@@ -710,23 +680,50 @@ partial class ZanIDE {
             body.Append(",\"max_tokens\":" + Convert.ToString(maxOut));
         }
         body.Append("}");
-        ZanIDE.EnsureCacheDir();
-        // The request is made with the Net standard library on a background
-        // thread that streams the decoded response into AiStreamPath as it
-        // arrives; the panel tails that file each frame for incremental output.
+        // The request is made with the Net standard library on a worker
+        // thread that streams the decoded response into an in-memory sink;
+        // the panel reads the sink each frame for incremental output.
         // Certificate verification stays on (the platform trust store is
-        // bridged into OpenSSL by the Tls layer). AiReqPath is kept as a
-        // debugging artifact of the exact body sent.
-        File.WriteAllText(ZanIDE.AiReqPath(), body.ToString());
-        return AiNet.Start(baseUrl, "/chat/completions", key, body.ToString(),
-            ZanIDE.AiStreamPath(), ZanIDE.AiDonePath(), 600000, true);
+        // bridged into OpenSSL by the Tls layer).
+        string serr = AiNet.Start(baseUrl, "/chat/completions", key,
+            body.ToString(), 600000, true);
+        // Counted here, at the one place every request (question, tool result,
+        // retry, continue) actually goes out, so the usage panel can never
+        // drift from what was really sent.
+        if (serr == "") { ZanIDE.aiStatReqs = ZanIDE.aiStatReqs + 1; }
+        return serr;
     }
 
-    /// Extracts the assistant reply (or a readable error) from the response.
-    static string AiReadAnswer() {
-        return ZanIDE.AiReadAnswerFrom(ZanIDE.AiRespPath());
+    // ---- AI usage accounting ----
+    // Totals for the running IDE session, shown broken out in the context
+    // gauge's panel: every request that left the IDE, every one that came back
+    // as an error, and the token counts the provider reported for the ones
+    // that succeeded. Cached prompt tokens are a subset of the input tokens.
+    static int aiStatReqs;
+    static int aiStatFails;
+    static int aiStatPrompt;
+    static int aiStatCompletion;
+    static int aiStatCached;
+    static int aiStatTotal;
+    /// Replies that carried a usage object, so the panel can say "no data"
+    /// instead of showing zeros for a provider that reports none.
+    static int aiStatUsageReplies;
+
+    /// Folds one finished reply's usage into the running totals.
+    static void AiStatAdd(SseAnswer a) {
+        if (a.promptTokens <= 0 && a.completionTokens <= 0
+            && a.totalTokens <= 0) { return; }
+        ZanIDE.aiStatUsageReplies = ZanIDE.aiStatUsageReplies + 1;
+        ZanIDE.aiStatPrompt = ZanIDE.aiStatPrompt + a.promptTokens;
+        ZanIDE.aiStatCompletion = ZanIDE.aiStatCompletion + a.completionTokens;
+        ZanIDE.aiStatCached = ZanIDE.aiStatCached + a.cachedTokens;
+        int tot = a.totalTokens;
+        if (tot <= 0) { tot = a.promptTokens + a.completionTokens; }
+        ZanIDE.aiStatTotal = ZanIDE.aiStatTotal + tot;
     }
 
+    /// Extracts the assistant reply (or a readable error) out of a saved
+    /// non-streaming response body.
     static string AiReadAnswerFrom(string path) {
         if (!File.Exists(path)) {
             return ZanIDE.T("[error] No response received (network problem?).",

@@ -10,17 +10,21 @@ namespace Gui.Component;
 class SessionListAction {
     int selected;   // index the user clicked to switch to, or -1
     int deleted;    // index whose delete (x) was clicked, or -1
+    int archived;   // index whose archive box was clicked, or -1
     bool created;   // the "new" button was clicked
 
     static SessionListAction None() {
         SessionListAction a = new SessionListAction();
         a.selected = 0 - 1;
         a.deleted = 0 - 1;
+        a.archived = 0 - 1;
         a.created = false;
         return a;
     }
 
-    bool Any() { return selected >= 0 || deleted >= 0 || created; }
+    bool Any() {
+        return selected >= 0 || deleted >= 0 || archived >= 0 || created;
+    }
 }
 
 /// A vertical, searchable list of named items with a per-row delete and a
@@ -40,6 +44,11 @@ class SessionList {
     SignalInt scroll;
     Button newBtn;
     string emptyText;
+    /// Footer toggle: archived rows are hidden until this is on.
+    bool showArchived;
+    string archiveTip;
+    string deleteTip;
+    string archivedLabel;
 
     static SessionList Create(string searchHint, string newLabel) {
         SessionList s = new SessionList();
@@ -47,7 +56,20 @@ class SessionList {
         s.scroll = SignalInt.Create(0);
         s.newBtn = new Button { Text = newLabel, Class = "primary small" };
         s.emptyText = "";
+        s.showArchived = false;
+        s.archiveTip = "";
+        s.deleteTip = "";
+        s.archivedLabel = "Archived";
         return s;
+    }
+
+    /// Labels for the per-row archive / delete hit areas and the footer
+    /// toggle, so the host owns the wording (and its translation).
+    SessionList Labels(string archive, string delete, string archived) {
+        archiveTip = archive;
+        deleteTip = delete;
+        archivedLabel = archived;
+        return this;
     }
 
     /// Text drawn centred when no row matches the current search ("" = none).
@@ -88,6 +110,15 @@ class SessionList {
     /// Draws the whole sidebar into the given box and returns what was clicked.
     SessionListAction Render(App app, int x, int y, int w, int h,
                              List<string> titles, int cur) {
+        return this.RenderEx(app, x, y, w, h, titles, cur, new List<int>());
+    }
+
+    /// Same, with an archive flag per title (1 = archived). Archived rows are
+    /// hidden behind the footer toggle and each row gains an archive box next
+    /// to its delete cross.
+    SessionListAction RenderEx(App app, int x, int y, int w, int h,
+                               List<string> titles, int cur,
+                               List<int> archived) {
         SessionListAction act = SessionListAction.None();
         Canvas c = app.canvas;
         Theme t = app.theme;
@@ -104,14 +135,49 @@ class SessionList {
 
         int ly = sy + srH + gap;
         int lh = y + h - ly;
+        // Footer strip for the "archived (n)" toggle, kept out of the list.
+        int archCount = 0;
+        int aci = 0;
+        while (aci < titles.Count) {
+            if (aci < archived.Count && archived[aci] != 0) {
+                archCount = archCount + 1;
+            }
+            aci = aci + 1;
+        }
+        int footH = 0;
+        if (archCount > 0) { footH = app.Scale(26); }
+        lh = lh - footH;
         if (lh < app.Scale(20)) { lh = app.Scale(20); }
 
         string q = search.GetText();
         List<int> vis = new List<int>();
         int ti = 0;
         while (ti < titles.Count) {
-            if (SessionList.CiContains(titles[ti], q)) { vis.Add(ti); }
+            bool isArch = ti < archived.Count && archived[ti] != 0;
+            if ((showArchived || !isArch) && SessionList.CiContains(titles[ti], q)) {
+                vis.Add(ti);
+            }
             ti = ti + 1;
+        }
+
+        if (footH > 0) {
+            int fy = ly + lh;
+            int ftId = app.focus.AllocId();
+            app.hitTester.Register(HitRegion.Create(ftId, x, fy, w, footH, 0));
+            if (app.hitTester.HitTest(app.mouseX, app.mouseY) == ftId
+                && app.ClickAvailable()) {
+                showArchived = !showArchived;
+                app.RequestRedraw();
+            }
+            int fcol = t.textTertiary;
+            if (showArchived || app.focus.IsHovered(ftId)) { fcol = t.textSecondary; }
+            string flab = archivedLabel + " (" + Convert.ToString(archCount) + ")";
+            c.FillRect(x, fy, w, 1, t.divider);
+            c.DrawGlyphIn(showArchived ? "chevron-up" : "chevron-down",
+                x + pad, fy, app.Scale(14), footH, t.fontSizeSmall, fcol);
+            c.DrawText(x + pad + app.Scale(18),
+                fy + (footH - Canvas.FontHeight(t.fontSizeSmall)) / 2,
+                flab, fcol, t.fontSizeSmall);
         }
 
         if (vis.Count == 0) {
@@ -136,6 +202,7 @@ class SessionList {
         int rowW = w;
         if (overflow) { rowW = w - barW; }
         int delW = app.Scale(26);
+        int arcW = app.Scale(24);
 
         c.PushClip(x, ly, rowW, lh);
         int first = off / rowH;
@@ -147,12 +214,27 @@ class SessionList {
             int ry = ly + r * rowH - off;
 
             int selId = app.focus.AllocId();
-            app.hitTester.Register(HitRegion.Create(selId, x, ry, rowW - delW, rowH, 0));
+            app.hitTester.Register(HitRegion.Create(selId, x, ry,
+                rowW - delW - arcW, rowH, 0));
             bool selHover = app.focus.IsHovered(selId);
             if (app.hitTester.HitTest(app.mouseX, app.mouseY) == selId
                 && app.ClickAvailable()) {
                 act.selected = orig;
                 app.RequestRedraw();
+            }
+
+            int arcId = app.focus.AllocId();
+            app.hitTester.Register(HitRegion.Create(arcId,
+                x + rowW - delW - arcW, ry, arcW, rowH, 0));
+            bool arcHover = app.focus.IsHovered(arcId);
+            if (app.hitTester.HitTest(app.mouseX, app.mouseY) == arcId
+                && app.ClickAvailable()) {
+                act.archived = orig;
+                app.RequestRedraw();
+            }
+            if (arcHover && archiveTip != "") {
+                Tooltip.RequestBox(app, x + rowW - delW - arcW, ry, arcW, rowH,
+                    archiveTip, 0, app.Scale(220));
             }
 
             int delId = app.focus.AllocId();
@@ -163,6 +245,10 @@ class SessionList {
                 act.deleted = orig;
                 app.RequestRedraw();
             }
+            if (delHover && deleteTip != "") {
+                Tooltip.RequestBox(app, x + rowW - delW, ry, delW, rowH,
+                    deleteTip, 0, app.Scale(220));
+            }
 
             if (orig == cur) { c.FillRect(x, ry, rowW, rowH, t.bgTertiary); }
             else if (selHover) { c.FillRect(x, ry, rowW, rowH, t.bgSecondary); }
@@ -171,10 +257,18 @@ class SessionList {
             int ty = ry + (rowH - Canvas.FontHeight(t.fontSizeSmall)) / 2;
             string label = titles[orig];
             if (label == "") { label = "..."; }
-            label = Ellipsis.Fit(label, rowW - delW - pad * 2, t.fontSizeSmall);
+            label = Ellipsis.Fit(label, rowW - delW - arcW - pad * 2,
+                t.fontSizeSmall);
             int col = t.textSecondary;
             if (orig == cur) { col = t.textPrimary; }
+            bool rowArch = orig < archived.Count && archived[orig] != 0;
+            if (rowArch) { col = t.textTertiary; }
             c.DrawText(x + pad, ty, label, col, t.fontSizeSmall);
+
+            int acol = t.textTertiary;
+            if (arcHover) { acol = t.textPrimary; }
+            c.DrawGlyphIn(rowArch ? "upload" : "archive",
+                x + rowW - delW - arcW, ry, arcW, rowH, t.fontSizeSmall, acol);
 
             int dcol = t.textTertiary;
             if (delHover) { dcol = t.textPrimary; }
