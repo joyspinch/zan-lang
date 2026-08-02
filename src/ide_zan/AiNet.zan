@@ -122,13 +122,33 @@ class AiNet {
         AiNet.sTimeout = timeout;
         AiNet.sVerify = verify;
         Thread.Start(AiNet.Worker);
-        // Wait for the worker to publish the real done-marker (it does so last,
-        // after any retries). Allow slack over the request timeout for a retry.
-        int limit = timeout + 30000;
+        // Wait for the worker to publish the real done-marker (it does so
+        // last, after any retries). The transport's own timeout is an IDLE
+        // window (every received chunk re-arms it), so a model that keeps
+        // streaming -- e.g. a long thinking phase -- must not be killed by a
+        // fixed total budget. Give the wait an idle backstop of its own
+        // (silence past the request timeout + slack) plus a hard cap that
+        // covers the worker's three retries: a healthy stream always gets to
+        // finish, while a truly dead streamer still surfaces an error.
+        int baseTimeout = timeout;
+        if (baseTimeout <= 0) { baseTimeout = 180000; }
+        int hardCap = baseTimeout * 3 + 60000;
         int waited = 0;
-        while (!File.Exists(doneFile) && waited < limit) {
+        int idleMs = 0;
+        int lastSize = 0 - 1;
+        if (File.Exists(outFile)) { lastSize = File.GetSize(outFile); }
+        while (!File.Exists(doneFile) && waited < hardCap) {
             Thread.Sleep(50);
             waited = waited + 50;
+            int sz = 0;
+            if (File.Exists(outFile)) { sz = File.GetSize(outFile); }
+            if (sz != lastSize) {
+                lastSize = sz;
+                idleMs = 0;
+            } else {
+                idleMs = idleMs + 50;
+            }
+            if (idleMs > baseTimeout + 30000) { break; }
         }
         // Let the worker fully unwind after it wrote the marker.
         Thread.Sleep(150);
