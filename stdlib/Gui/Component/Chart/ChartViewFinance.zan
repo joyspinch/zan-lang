@@ -1,0 +1,376 @@
+using System;
+using System.Json;
+using Gui;
+
+namespace Gui.Component.Chart;
+
+partial class ChartView {
+    // ---- candlestick / financial (buckets to plot width for huge data) ----
+
+    static void DrawCandles(App app, int x, int y, int w, int h,
+                            ChartOption o, int g) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        List<Candle> cs = o.series[0].candles;
+        int n = cs.Count;
+        int plotTop = ChartView.PanelHead(app, x, y, w, h, o.title);
+        if (n < 1) { return; }
+
+        int lo = cs[0].low;
+        int hi = cs[0].high;
+        int i = 0;
+        while (i < n) {
+            if (cs[i].low < lo) { lo = cs[i].low; }
+            if (cs[i].high > hi) { hi = cs[i].high; }
+            i = i + 1;
+        }
+        // Line-family overlays (e.g. MA moving averages) share the price axis,
+        // so include their range in lo/hi too.
+        int ov0 = 1;
+        while (ov0 < o.series.Count) {
+            ChartSeries s = o.series[ov0];
+            if (!s.hidden && ChartView.IsLineFamily(s.type)) {
+                int k = 0;
+                while (k < s.Count()) {
+                    int v = s.Value(k);
+                    if (v < lo) { lo = v; }
+                    if (v > hi) { hi = v; }
+                    k = k + 1;
+                }
+            }
+            ov0 = ov0 + 1;
+        }
+        int pad2 = (hi - lo) / 20;
+        if (pad2 < 1) { pad2 = 1; }
+        lo = lo - pad2;
+        hi = hi + pad2;
+        List<string> noLab = new List<string>();
+        ChartFrame f = Chart.DrawFrameLoHi(app, x, y, w, h, plotTop, noLab, lo, hi);
+        int span = hi - lo;
+        if (span < 1) { span = 1; }
+
+        int cols = f.plotW / app.Scale(5);
+        if (cols < 1) { cols = 1; }
+        if (cols > n) { cols = n; }
+        int cw = f.plotW / cols;
+        int upC = Chart.Rgb(38, 166, 89);
+        int dnC = Chart.Rgb(229, 72, 77);
+
+        int bc = 0;
+        while (bc < cols) {
+            int i0 = bc * n / cols;
+            int i1 = (bc + 1) * n / cols;
+            if (i1 <= i0) { i1 = i0 + 1; }
+            if (i1 > n) { i1 = n; }
+            int open = cs[i0].open;
+            int close = cs[i1 - 1].close;
+            int chi = cs[i0].high;
+            int clo = cs[i0].low;
+            int k = i0;
+            while (k < i1) {
+                if (cs[k].high > chi) { chi = cs[k].high; }
+                if (cs[k].low < clo) { clo = cs[k].low; }
+                k = k + 1;
+            }
+            int cx = f.plotX + bc * cw + cw / 2;
+            int yHigh = f.plotY + f.plotH - (chi - lo) * f.plotH / span;
+            int yLow = f.plotY + f.plotH - (clo - lo) * f.plotH / span;
+            int yOpen = f.plotY + f.plotH - (open - lo) * f.plotH / span;
+            int yClose = f.plotY + f.plotH - (close - lo) * f.plotH / span;
+            int col = upC;
+            if (close < open) { col = dnC; }
+            c.DrawLine(cx, yHigh, cx, yLow, col, app.Scale(1));
+            int bw = cw * 6 / 10;
+            if (bw < app.Scale(2)) { bw = app.Scale(2); }
+            int bodyTop = yOpen;
+            int bodyBot = yClose;
+            if (yClose < yOpen) { bodyTop = yClose; bodyBot = yOpen; }
+            int bh = bodyBot - bodyTop;
+            if (bh < app.Scale(1)) { bh = app.Scale(1); }
+            c.FillRoundRect(cx - bw / 2, bodyTop, bw, bh, app.Scale(1), col);
+            bc = bc + 1;
+        }
+
+        string cap = Convert.ToString(n) + " bars";
+        int cwid = Canvas.MeasureText(cap, t.fontSizeSmall);
+        c.DrawText(x + w - t.paddingMedium - cwid, y + h - t.paddingMedium - Canvas.FontHeight(t.fontSizeSmall),
+            cap, t.textTertiary, t.fontSizeSmall);
+
+        // Line overlays (MA lines) drawn on the same price axis, bucket-aligned
+        // to the candle columns so a moving average lines up with its bars.
+        int ov = 1;
+        while (ov < o.series.Count) {
+            ChartSeries s = o.series[ov];
+            if (!s.hidden && ChartView.IsLineFamily(s.type)) {
+                List<int> lpx = new List<int>();
+                List<int> lpy = new List<int>();
+                int k2 = 0;
+                while (k2 < cols && k2 < s.Count()) {
+                    int li2 = (k2 + 1) * n / cols;
+                    if (li2 > n) { li2 = n; }
+                    if (li2 < 1) { li2 = 1; }
+                    int v = s.Value(li2 - 1);
+                    lpx.Add(f.plotX + k2 * cw + cw / 2);
+                    lpy.Add(f.plotY + f.plotH - (v - lo) * f.plotH / span);
+                    k2 = k2 + 1;
+                }
+                bool smooth = o.smooth;
+                if (s.smooth == 1) { smooth = true; } else if (s.smooth == 0) { smooth = false; }
+                ChartView.PolyLine(c, lpx, lpy, smooth, s.color, app.Scale(2));
+            }
+            ov = ov + 1;
+        }
+
+        if (o.showTooltip) {
+            int mx = app.mouseX;
+            int my = app.mouseY;
+            if (mx >= f.plotX && mx < f.plotX + f.plotW
+                && my >= f.plotY && my < f.plotY + f.plotH) {
+                int tIdx = (mx - f.plotX) / cw;
+                if (tIdx < 0) { tIdx = 0; }
+                if (tIdx > cols - 1) { tIdx = cols - 1; }
+                int tI0 = tIdx * n / cols;
+                int tI1 = (tIdx + 1) * n / cols;
+                if (tI1 <= tI0) { tI1 = tI0 + 1; }
+                if (tI1 > n) { tI1 = n; }
+                int topen = cs[tI0].open;
+                int tclose = cs[tI1 - 1].close;
+                int thi = cs[tI0].high;
+                int tlo = cs[tI0].low;
+                int tk = tI0;
+                while (tk < tI1) {
+                    if (cs[tk].high > thi) { thi = cs[tk].high; }
+                    if (cs[tk].low < tlo) { tlo = cs[tk].low; }
+                    tk = tk + 1;
+                }
+                List<int> tcols = new List<int>();
+                List<string> tlines = new List<string>();
+                string thdr = "#" + Convert.ToString(tI0 + 1);
+                if (tI1 - 1 > tI0) { thdr = thdr + "-" + Convert.ToString(tI1); }
+                tcols.Add(0); tlines.Add(thdr);
+                tcols.Add(upC); tlines.Add("O  " + Convert.ToString(topen));
+                tcols.Add(dnC); tlines.Add("H  " + Convert.ToString(thi));
+                tcols.Add(dnC); tlines.Add("L  " + Convert.ToString(tlo));
+                tcols.Add(upC); tlines.Add("C  " + Convert.ToString(tclose));
+                ChartView.TooltipCard(app, mx, my, f.plotX + f.plotW, tcols, tlines);
+            }
+        }
+    }
+
+    // ---- weighted scatter / bubbles (strides for huge data) ----
+
+    static void DrawBubbles(App app, int x, int y, int w, int h,
+                            ChartOption o, int g) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        List<Bubble> bs = o.series[0].bubbles;
+        int n = bs.Count;
+        int plotTop = ChartView.PanelHead(app, x, y, w, h, o.title);
+        if (n < 1) { return; }
+
+        int maxX = 1;
+        int maxY = 1;
+        int maxW = 1;
+        int i = 0;
+        while (i < n) {
+            if (bs[i].x > maxX) { maxX = bs[i].x; }
+            if (bs[i].y > maxY) { maxY = bs[i].y; }
+            if (bs[i].weight > maxW) { maxW = bs[i].weight; }
+            i = i + 1;
+        }
+        int niceY = Chart.NiceMax(maxY);
+        int niceX = Chart.NiceMax(maxX);
+        List<string> noLab = new List<string>();
+        ChartFrame f = Chart.DrawFrame(app, x, y, w, h, plotTop, noLab, niceY);
+        int color = t.primary;
+        if (o.series[0].color != 0) { color = o.series[0].color; }
+        int maxR = app.Scale(20);
+        int rootMaxW = ChartView.ISqrt(maxW);
+        if (rootMaxW < 1) { rootMaxW = 1; }
+        int stride = 1;
+        if (n > f.plotW) { stride = n / f.plotW; if (stride < 1) { stride = 1; } }
+
+        int j = 0;
+        while (j < n) {
+            int px = f.plotX + bs[j].x * f.plotW / niceX;
+            int py = f.plotY + f.plotH - (bs[j].y * f.plotH / niceY);
+            int rr = ChartView.ISqrt(bs[j].weight) * maxR / rootMaxW;
+            if (rr < app.Scale(2)) { rr = app.Scale(2); }
+            rr = rr * g / 1000;
+            c.FillCircle(px, py, rr, Chart.WithAlpha(color, 80));
+            j = j + stride;
+        }
+
+        if (o.showTooltip) {
+            int mx = app.mouseX;
+            int my = app.mouseY;
+            if (mx >= f.plotX && mx < f.plotX + f.plotW
+                && my >= f.plotY && my < f.plotY + f.plotH) {
+                int best = 0 - 1;
+                int bestD = 0;
+                int j2 = 0;
+                while (j2 < n) {
+                    int px2 = f.plotX + bs[j2].x * f.plotW / niceX;
+                    int py2 = f.plotY + f.plotH - (bs[j2].y * f.plotH / niceY);
+                    int ddx = mx - px2;
+                    int ddy = my - py2;
+                    int d2 = ddx * ddx + ddy * ddy;
+                    if (best < 0 || d2 < bestD) { best = j2; bestD = d2; }
+                    j2 = j2 + stride;
+                }
+                int hitR = app.Scale(10);
+                if (best >= 0 && bestD <= hitR * hitR) {
+                    List<int> tcols = new List<int>();
+                    List<string> tlines = new List<string>();
+                    tcols.Add(color); tlines.Add("x  " + Convert.ToString(bs[best].x));
+                    tcols.Add(color); tlines.Add("y  " + Convert.ToString(bs[best].y));
+                    tcols.Add(color); tlines.Add("w  " + Convert.ToString(bs[best].weight));
+                    ChartView.TooltipCard(app, mx, my, f.plotX + f.plotW, tcols, tlines);
+                }
+            }
+        }
+    }
+
+    // ---- box-and-whisker ----
+
+    static void DrawBox(App app, int x, int y, int w, int h,
+                        ChartOption o, int g) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        List<BoxItem> bx = o.series[0].boxes;
+        int n = bx.Count;
+        int plotTop = ChartView.PanelHead(app, x, y, w, h, o.title);
+        if (n < 1) { return; }
+
+        int lo = bx[0].lo;
+        int hi = bx[0].hi;
+        int i = 0;
+        while (i < n) {
+            if (bx[i].lo < lo) { lo = bx[i].lo; }
+            if (bx[i].hi > hi) { hi = bx[i].hi; }
+            i = i + 1;
+        }
+        int pad2 = (hi - lo) / 20;
+        if (pad2 < 1) { pad2 = 1; }
+        lo = lo - pad2;
+        hi = hi + pad2;
+        ChartFrame f = Chart.DrawFrameLoHi(app, x, y, w, h, plotTop, o.XCategories(), lo, hi);
+        int span = hi - lo;
+        if (span < 1) { span = 1; }
+        int step = f.plotW / n;
+        int bw = step * 5 / 10;
+        if (bw < app.Scale(6)) { bw = app.Scale(6); }
+
+        int k = 0;
+        while (k < n) {
+            int cx = f.plotX + k * step + step / 2;
+            int col = Chart.Palette(t, k);
+            if (o.series[0].color != 0) { col = o.series[0].color; }
+            int yLo = f.plotY + f.plotH - (bx[k].lo - lo) * f.plotH / span;
+            int yQ1 = f.plotY + f.plotH - (bx[k].q1 - lo) * f.plotH / span;
+            int yMed = f.plotY + f.plotH - (bx[k].med - lo) * f.plotH / span;
+            int yQ3 = f.plotY + f.plotH - (bx[k].q3 - lo) * f.plotH / span;
+            int yHi = f.plotY + f.plotH - (bx[k].hi - lo) * f.plotH / span;
+            c.DrawLine(cx, yHi, cx, yQ3, col, app.Scale(1));
+            c.DrawLine(cx, yQ1, cx, yLo, col, app.Scale(1));
+            c.DrawLine(cx - bw / 4, yHi, cx + bw / 4, yHi, col, app.Scale(1));
+            c.DrawLine(cx - bw / 4, yLo, cx + bw / 4, yLo, col, app.Scale(1));
+            int boxH = yQ1 - yQ3;
+            if (boxH < app.Scale(1)) { boxH = app.Scale(1); }
+            c.SurfaceRoundRect(cx - bw / 2, yQ3, bw, boxH, app.Scale(2), Chart.WithAlpha(col, 70), col, 1);
+            c.DrawLine(cx - bw / 2, yMed, cx + bw / 2, yMed, col, app.Scale(2));
+            k = k + 1;
+        }
+
+        if (o.showTooltip) {
+            int mx = app.mouseX;
+            int my = app.mouseY;
+            if (mx >= f.plotX && mx < f.plotX + f.plotW
+                && my >= f.plotY && my < f.plotY + f.plotH) {
+                int tIdx = (mx - f.plotX) / step;
+                if (tIdx < 0) { tIdx = 0; }
+                if (tIdx > n - 1) { tIdx = n - 1; }
+                List<string> labs = o.XCategories();
+                string hdr = "";
+                if (tIdx < labs.Count) { hdr = labs[tIdx]; }
+                if (hdr.Length == 0) { hdr = "Service " + Convert.ToString(tIdx + 1); }
+                int col = Chart.Palette(t, tIdx);
+                if (o.series[0].color != 0) { col = o.series[0].color; }
+                List<int> tcols = new List<int>();
+                List<string> tlines = new List<string>();
+                tcols.Add(0); tlines.Add(hdr);
+                tcols.Add(col); tlines.Add("min   " + Convert.ToString(bx[tIdx].lo));
+                tcols.Add(col); tlines.Add("Q1    " + Convert.ToString(bx[tIdx].q1));
+                tcols.Add(col); tlines.Add("med   " + Convert.ToString(bx[tIdx].med));
+                tcols.Add(col); tlines.Add("Q3    " + Convert.ToString(bx[tIdx].q3));
+                tcols.Add(col); tlines.Add("max   " + Convert.ToString(bx[tIdx].hi));
+                ChartView.TooltipCard(app, mx, my, f.plotX + f.plotW, tcols, tlines);
+            }
+        }
+    }
+
+    // ---- error bars (value +/- margin over categories) ----
+
+    static void DrawError(App app, int x, int y, int w, int h,
+                          ChartOption o, int g) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        List<ErrorItem> es = o.series[0].errors;
+        int n = es.Count;
+        int plotTop = ChartView.PanelHead(app, x, y, w, h, o.title);
+        if (n < 1) { return; }
+
+        int maxV = 0;
+        int i = 0;
+        while (i < n) {
+            int top = es[i].y + es[i].err;
+            if (top > maxV) { maxV = top; }
+            i = i + 1;
+        }
+        int nice = Chart.NiceMax(maxV);
+        if (nice < 1) { nice = 1; }
+        ChartFrame f = Chart.DrawFrame(app, x, y, w, h, plotTop, o.XCategories(), nice);
+        int step = f.plotW / n;
+        int color = t.primary;
+        if (o.series[0].color != 0) { color = o.series[0].color; }
+        int prevX = 0;
+        int prevY = 0;
+
+        int k = 0;
+        while (k < n) {
+            int cx = f.plotX + k * step + step / 2;
+            int vy = f.plotY + f.plotH - (es[k].y * g / 1000 * f.plotH / nice);
+            int eTop = f.plotY + f.plotH - ((es[k].y + es[k].err) * f.plotH / nice);
+            int eBot = f.plotY + f.plotH - ((es[k].y - es[k].err) * f.plotH / nice);
+            c.DrawLine(cx, eTop, cx, eBot, Chart.WithAlpha(color, 160), app.Scale(1));
+            c.DrawLine(cx - app.Scale(4), eTop, cx + app.Scale(4), eTop, color, app.Scale(1));
+            c.DrawLine(cx - app.Scale(4), eBot, cx + app.Scale(4), eBot, color, app.Scale(1));
+            if (k > 0) { c.DrawLine(prevX, prevY, cx, vy, color, app.Scale(2)); }
+            c.FillCircle(cx, vy, app.Scale(3), color);
+            prevX = cx;
+            prevY = vy;
+            k = k + 1;
+        }
+
+        if (o.showTooltip) {
+            int mx = app.mouseX;
+            int my = app.mouseY;
+            if (mx >= f.plotX && mx < f.plotX + f.plotW
+                && my >= f.plotY && my < f.plotY + f.plotH) {
+                int tIdx = (mx - f.plotX) / step;
+                if (tIdx < 0) { tIdx = 0; }
+                if (tIdx > n - 1) { tIdx = n - 1; }
+                List<string> labs = o.XCategories();
+                string hdr = "";
+                if (tIdx < labs.Count) { hdr = labs[tIdx]; }
+                if (hdr.Length == 0) { hdr = "Item " + Convert.ToString(tIdx + 1); }
+                List<int> tcols = new List<int>();
+                List<string> tlines = new List<string>();
+                tcols.Add(0); tlines.Add(hdr);
+                tcols.Add(color);
+                tlines.Add(Convert.ToString(es[tIdx].y) + " ± " + Convert.ToString(es[tIdx].err));
+                ChartView.TooltipCard(app, mx, my, f.plotX + f.plotW, tcols, tlines);
+            }
+        }
+    }
+}

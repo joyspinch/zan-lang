@@ -1,0 +1,491 @@
+using System;
+using System.Json;
+using Gui;
+
+namespace Gui.Component.Chart;
+
+partial class ChartView {
+    static void DrawPie(App app, int x, int y, int w, int h,
+                        ChartOption o, int innerPct, bool sliceLabels, int g) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int pad = t.paddingMedium;
+
+        c.SurfaceRoundRect(x, y, w, h, t.borderRadiusMedium, t.bgPrimary, t.borderPrimary, 1);
+        int top = y + pad;
+        if (o.title.Length > 0) {
+            c.DrawText(x + pad, top, o.title, t.textPrimary, t.fontSizeLarge);
+        }
+        top = top + Canvas.FontHeight(t.fontSizeLarge) + app.Scale(6);
+
+        // Totals come from the FULL data (not g-scaled) so the pie geometry is
+        // stable; the grow-in is a radial sweep to sweepMax degrees. This avoids
+        // integer division collapsing small early-frame values to 0 (which used
+        // to leave the whole chart blank).
+        int total = 0;
+        int i = 0;
+        while (i < o.series.Count) {
+            ChartSeries s = o.series[i];
+            int v = 0;
+            if (s.Count() > 0) { v = s.Value(0); }
+            total = total + v;
+            i = i + 1;
+        }
+        if (total <= 0) { return; }
+
+        int legendW = app.Scale(120);
+        int areaW = w - pad * 2 - legendW;
+        int areaH = (y + h - pad) - top;
+        int rOuter = areaW / 2;
+        if (areaH / 2 < rOuter) { rOuter = areaH / 2; }
+        if (rOuter < app.Scale(10)) { rOuter = app.Scale(10); }
+        int cx = x + pad + areaW / 2;
+        int cy = top + areaH / 2;
+        int rInner = rOuter * innerPct / 100;
+        int sweepMax = 360 * g / 1000;
+
+        int acc = 0;
+        int k = 0;
+        while (k < o.series.Count) {
+            ChartSeries s = o.series[k];
+            int v = 0;
+            if (s.Count() > 0) { v = s.Value(0); }
+            int a0 = acc * 360 / total;
+            int a1 = (acc + v) * 360 / total;
+            int aEnd = a1;
+            if (aEnd > sweepMax) { aEnd = sweepMax; }
+            if (aEnd > a0) {
+                c.FillSector(cx, cy, rInner, rOuter, a0, aEnd, s.color);
+            }
+            acc = acc + v;
+            k = k + 1;
+        }
+
+        // Optional on-slice percentage labels, placed at the sector mid-angle.
+        if (sliceLabels) {
+            int rLbl = (rInner + rOuter) / 2;
+            if (rInner < app.Scale(4)) { rLbl = rOuter * 62 / 100; }
+            int acc2 = 0;
+            int p = 0;
+            while (p < o.series.Count) {
+                ChartSeries s = o.series[p];
+                int v2 = 0;
+                if (s.Count() > 0) { v2 = s.Value(0); }
+                int a0 = acc2 * 360 / total;
+                int a1 = (acc2 + v2) * 360 / total;
+                int pct = v2 * 100 / total;
+                if (a1 <= sweepMax && pct >= 4) {
+                    int mid = (a0 + a1) / 2;
+                    int lxp = cx + ChartView.CosDeg(mid) * rLbl / 1000;
+                    int lyp = cy + ChartView.SinDeg(mid) * rLbl / 1000;
+                    string pl = Convert.ToString(pct) + "%";
+                    int pw = Canvas.MeasureText(pl, t.fontSizeSmall);
+                    c.DrawText(lxp - pw / 2, lyp - Canvas.FontHeight(t.fontSizeSmall) / 2,
+                        pl, 4294967295, t.fontSizeSmall);
+                }
+                acc2 = acc2 + v2;
+                p = p + 1;
+            }
+        }
+
+        // Donut centre caption: the running total, so the hole is informative.
+        if (rInner > app.Scale(18)) {
+            string tot = Convert.ToString(total);
+            int tw = Canvas.MeasureText(tot, t.fontSizeLarge);
+            c.DrawText(cx - tw / 2, cy - Canvas.FontHeight(t.fontSizeLarge) / 2,
+                tot, t.textPrimary, t.fontSizeLarge);
+        }
+
+        // Legend: swatch + name + percent (always drawn).
+        int lx = x + w - pad - legendW;
+        int ly = top;
+        int sw = app.Scale(12);
+        int lh = Canvas.FontHeight(t.fontSizeSmall) + app.Scale(6);
+        int j = 0;
+        while (j < o.series.Count) {
+            ChartSeries s = o.series[j];
+            int v = 0;
+            if (s.Count() > 0) { v = s.Value(0); }
+            c.FillRoundRect(lx, ly + app.Scale(2), sw, sw, t.borderRadiusSmall, s.color);
+            int pct = v * 100 / total;
+            string lbl = s.name + "  " + Convert.ToString(pct) + "%";
+            c.DrawText(lx + sw + app.Scale(6), ly + app.Scale(1), lbl, t.textSecondary, t.fontSizeSmall);
+            ly = ly + lh;
+            j = j + 1;
+        }
+
+        if (o.showTooltip) {
+            int mx = app.mouseX;
+            int my = app.mouseY;
+            int ddx = mx - cx;
+            int ddy = my - cy;
+            int dist = ChartView.ISqrt(ddx * ddx + ddy * ddy);
+            if (dist >= rInner && dist <= rOuter) {
+                int ang = ChartView.AngleOf(ddx, ddy);
+                int acc3 = 0;
+                int k3 = 0;
+                while (k3 < o.series.Count) {
+                    ChartSeries s = o.series[k3];
+                    int v3 = 0;
+                    if (s.Count() > 0) { v3 = s.Value(0); }
+                    int a0 = acc3 * 360 / total;
+                    int a1 = (acc3 + v3) * 360 / total;
+                    if (ang >= a0 && ang < a1) {
+                        int pct3 = v3 * 100 / total;
+                        List<int> tcols = new List<int>();
+                        List<string> tlines = new List<string>();
+                        tcols.Add(0); tlines.Add(o.title);
+                        tcols.Add(s.color);
+                        tlines.Add(s.name + "  " + Convert.ToString(v3)
+                            + "  (" + Convert.ToString(pct3) + "%)");
+                        ChartView.TooltipCard(app, mx, my, x + w, tcols, tlines);
+                        break;
+                    }
+                    acc3 = acc3 + v3;
+                    k3 = k3 + 1;
+                }
+            }
+        }
+    }
+    // ---- gauge (half-ring speedometer; sweep grows with g) ----
+
+    static void DrawGauge(App app, int x, int y, int w, int h,
+                          ChartOption o, int g) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int pad = t.paddingMedium;
+        int top = ChartView.PanelHead(app, x, y, w, h, o.title);
+
+        int val = 0;
+        int color = t.primary;
+        if (o.series.Count > 0) {
+            ChartSeries s0 = o.series[0];
+            if (s0.Count() > 0) { val = s0.Value(0); }
+            if (s0.color != 0) { color = s0.color; }
+        }
+        int max = o.gaugeMax;
+        if (max <= 0) { max = 100; }
+        if (val < 0) { val = 0; }
+        if (val > max) { val = max; }
+
+        int areaW = w - pad * 2;
+        int areaH = (y + h - pad) - top;
+        int rOuter = areaW / 2;
+        if (rOuter > areaH - app.Scale(16)) { rOuter = areaH - app.Scale(16); }
+        if (rOuter < app.Scale(20)) { rOuter = app.Scale(20); }
+        int cx = x + w / 2;
+        int cy = top + rOuter;
+        int ring = rOuter * 32 / 100;
+        int rInner = rOuter - ring;
+
+        // Track (top semicircle split into left/right halves to avoid 0/360 wrap)
+        c.FillSector(cx, cy, rInner, rOuter, 270, 360, t.bgTertiary);
+        c.FillSector(cx, cy, rInner, rOuter, 0, 90, t.bgTertiary);
+
+        // Value arc, swept clockwise from the left (270 deg) and animated by g.
+        int sweep = 180 * val / max;
+        sweep = sweep * g / 1000;
+        int leftDeg = sweep;
+        if (leftDeg > 90) { leftDeg = 90; }
+        if (leftDeg > 0) {
+            c.FillSector(cx, cy, rInner, rOuter, 270, 270 + leftDeg, color);
+        }
+        if (sweep > 90) {
+            c.FillSector(cx, cy, rInner, rOuter, 0, sweep - 90, color);
+        }
+
+        // Big centred value + 0 / max end labels.
+        string vs = Convert.ToString(val);
+        int tw = Canvas.MeasureText(vs, t.fontSizeLarge);
+        c.DrawText(cx - tw / 2, cy - Canvas.FontHeight(t.fontSizeLarge) - app.Scale(2),
+            vs, t.textPrimary, t.fontSizeLarge);
+        c.DrawText(cx - rOuter, cy + app.Scale(4), "0", t.textTertiary, t.fontSizeSmall);
+        string mxs = Convert.ToString(max);
+        int mw = Canvas.MeasureText(mxs, t.fontSizeSmall);
+        c.DrawText(cx + rOuter - mw, cy + app.Scale(4), mxs, t.textTertiary, t.fontSizeSmall);
+
+        if (o.showTooltip) {
+            int mx = app.mouseX;
+            int my = app.mouseY;
+            int ddx = mx - cx;
+            int ddy = my - cy;
+            int dist = ChartView.ISqrt(ddx * ddx + ddy * ddy);
+            if (ddy <= 0 && dist >= rInner && dist <= rOuter) {
+                string nm = "load";
+                if (o.series.Count > 0 && o.series[0].name.Length > 0) { nm = o.series[0].name; }
+                List<int> tcols = new List<int>();
+                List<string> tlines = new List<string>();
+                tcols.Add(0); tlines.Add(o.title);
+                tcols.Add(color);
+                tlines.Add(nm + "  " + Convert.ToString(val) + " / " + Convert.ToString(max));
+                ChartView.TooltipCard(app, mx, my, x + w, tcols, tlines);
+            }
+        }
+    }
+
+    // ---- radial bars (concentric progress rings; sweep grows with g) ----
+
+    static void DrawRadialBars(App app, int x, int y, int w, int h,
+                               ChartOption o, int g) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int pad = t.paddingMedium;
+        int top = ChartView.PanelHead(app, x, y, w, h, o.title);
+
+        int max = o.gaugeMax;
+        if (max <= 0) { max = 100; }
+        int n = o.series.Count;
+        if (n < 1) { return; }
+
+        int legendW = app.Scale(120);
+        int areaW = w - pad * 2 - legendW;
+        int areaH = (y + h - pad) - top;
+        int rMax = areaW / 2;
+        if (areaH / 2 < rMax) { rMax = areaH / 2; }
+        if (rMax < app.Scale(20)) { rMax = app.Scale(20); }
+        int cx = x + pad + areaW / 2;
+        int cy = top + areaH / 2;
+
+        int band = rMax * 70 / 100 / n;
+        int gap = band * 22 / 100;
+        int i = 0;
+        while (i < n) {
+            int ringOuter = rMax - i * band;
+            int ringInner = ringOuter - band + gap;
+            if (ringInner < 0) { ringInner = 0; }
+            int val = 0;
+            if (o.series[i].Count() > 0) { val = o.series[i].Value(0); }
+            if (val < 0) { val = 0; }
+            if (val > max) { val = max; }
+            c.FillSector(cx, cy, ringInner, ringOuter, 0, 360, t.bgTertiary);
+            int sweep = 360 * val / max;
+            sweep = sweep * g / 1000;
+            if (sweep > 0) {
+                c.FillSector(cx, cy, ringInner, ringOuter, 0, sweep, o.series[i].color);
+            }
+            i = i + 1;
+        }
+
+        // Legend: swatch + name + value.
+        int lx = x + w - pad - legendW;
+        int ly = top;
+        int sw = app.Scale(12);
+        int lh = Canvas.FontHeight(t.fontSizeSmall) + app.Scale(6);
+        int j = 0;
+        while (j < n) {
+            int val = 0;
+            if (o.series[j].Count() > 0) { val = o.series[j].Value(0); }
+            c.FillRoundRect(lx, ly + app.Scale(2), sw, sw, t.borderRadiusSmall, o.series[j].color);
+            string lbl = o.series[j].name + "  " + Convert.ToString(val);
+            c.DrawText(lx + sw + app.Scale(6), ly + app.Scale(1), lbl, t.textSecondary, t.fontSizeSmall);
+            ly = ly + lh;
+            j = j + 1;
+        }
+
+        if (o.showTooltip) {
+            int mx = app.mouseX;
+            int my = app.mouseY;
+            int ddx = mx - cx;
+            int ddy = my - cy;
+            int dist = ChartView.ISqrt(ddx * ddx + ddy * ddy);
+            int i2 = 0;
+            while (i2 < n) {
+                int ringOuter = rMax - i2 * band;
+                int ringInner = ringOuter - band + gap;
+                if (ringInner < 0) { ringInner = 0; }
+                if (dist >= ringInner && dist <= ringOuter) {
+                    int v2 = 0;
+                    if (o.series[i2].Count() > 0) { v2 = o.series[i2].Value(0); }
+                    List<int> tcols = new List<int>();
+                    List<string> tlines = new List<string>();
+                    tcols.Add(0); tlines.Add(o.title);
+                    tcols.Add(o.series[i2].color);
+                    tlines.Add(o.series[i2].name + "  " + Convert.ToString(v2)
+                        + " / " + Convert.ToString(max));
+                    ChartView.TooltipCard(app, mx, my, x + w, tcols, tlines);
+                    break;
+                }
+                i2 = i2 + 1;
+            }
+        }
+    }
+
+    // ---- heatmap (row=series, col=value index; intensity fades in with g) ----
+    // Gather funnel/pyramid/rose stages: one value+color+name per stage, from
+    // either multiple single-value series or one multi-value series.
+    static List<ChartStage> GatherStages(App app, List<ChartSeries> series) {
+        Theme t = app.theme;
+        List<ChartStage> stages = new List<ChartStage>();
+        if (series.Count > 1) {
+            for (int i = 0; i < series.Count; i = i + 1) {
+                int v = 0;
+                if (series[i].Count() > 0) { v = series[i].Value(0); }
+                int col = series[i].color;
+                if (col == 0) { col = Chart.Palette(t, i); }
+                stages.Add(new ChartStage(v, col, series[i].name));
+            }
+        } else if (series.Count == 1) {
+            int n = series[0].Count();
+            for (int i = 0; i < n; i = i + 1) {
+                stages.Add(new ChartStage(series[0].Value(i), Chart.Palette(t, i), ""));
+            }
+        }
+        return stages;
+    }
+
+    // ---- funnel / pyramid ----
+
+    static void DrawFunnel(App app, int x, int y, int w, int h,
+                           ChartOption o, int g, bool pyramid) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int pad = t.paddingMedium;
+        int top = ChartView.PanelHead(app, x, y, w, h, o.title);
+
+        List<ChartStage> stages = ChartView.GatherStages(app, o.series);
+        int n = stages.Count;
+        if (n < 1) { return; }
+        int maxV = 1;
+        foreach (ChartStage st in stages) { if (st.val > maxV) { maxV = st.val; } }
+
+        int legendW = app.Scale(120);
+        int areaW = w - pad * 2 - legendW;
+        int areaH = (y + h - pad) - top;
+        int cx = x + pad + areaW / 2;
+        int rowH = areaH / n;
+
+        for (int i2 = 0; i2 < n; i2 = i2 + 1) {
+            int idx = i2;
+            if (pyramid) { idx = n - 1 - i2; }
+            int vTop = stages[idx].val;
+            int vBot = vTop;
+            int nextIdx = idx + 1;
+            if (pyramid) { nextIdx = idx - 1; }
+            if (nextIdx >= 0 && nextIdx < n) { vBot = stages[nextIdx].val; }
+            int wTop = vTop * areaW / maxV * g / 1000;
+            int wBot = vBot * areaW / maxV * g / 1000;
+            int ry = top + i2 * rowH;
+            int col = stages[idx].color;
+            int r = 0;
+            int strip = rowH - app.Scale(3);
+            while (r < strip) {
+                int tt = 0;
+                if (strip > 0) { tt = r * 1000 / strip; }
+                int ww = wTop + (wBot - wTop) * tt / 1000;
+                c.FillRect(cx - ww / 2, ry + r, ww, 1, col);
+                r = r + 1;
+            }
+            string lbl = stages[idx].name;
+            if (lbl.Length == 0) { lbl = Convert.ToString(stages[idx].val); }
+            c.DrawTextCentered(cx - areaW / 2, ry + rowH / 2 - Canvas.FontHeight(t.fontSizeSmall) / 2,
+                areaW, Canvas.FontHeight(t.fontSizeSmall), lbl, t.textPrimary, t.fontSizeSmall);
+        }
+
+        int lx = x + w - pad - legendW;
+        int ly = top;
+        int sw = app.Scale(12);
+        int lh = Canvas.FontHeight(t.fontSizeSmall) + app.Scale(6);
+        for (int j = 0; j < n; j = j + 1) {
+            ChartStage st = stages[j];
+            c.FillRoundRect(lx, ly + app.Scale(2), sw, sw, t.borderRadiusSmall, st.color);
+            string nm = st.name;
+            if (nm.Length == 0) { nm = ChartView.StageName(j); }
+            c.DrawText(lx + sw + app.Scale(6), ly + app.Scale(1),
+                nm + "  " + Convert.ToString(st.val), t.textSecondary, t.fontSizeSmall);
+            ly = ly + lh;
+        }
+
+        if (o.showTooltip) {
+            int mx = app.mouseX;
+            int my = app.mouseY;
+            if (mx >= x + pad && mx < x + w - pad - legendW
+                && my >= top && my < y + h - pad) {
+                int idx = (my - top) / rowH;
+                if (idx < 0) { idx = 0; }
+                if (idx > n - 1) { idx = n - 1; }
+                ChartStage st = stages[idx];
+                string nm = st.name;
+                if (nm.Length == 0) { nm = ChartView.StageName(idx); }
+                List<int> tcols = new List<int>();
+                List<string> tlines = new List<string>();
+                tcols.Add(0); tlines.Add(o.title);
+                tcols.Add(st.color);
+                tlines.Add(nm + "  " + Convert.ToString(st.val));
+                ChartView.TooltipCard(app, mx, my, x + w, tcols, tlines);
+            }
+        }
+    }
+
+    static string StageName(int i) { return "Stage " + Convert.ToString(i + 1); }
+
+    // ---- rose / nightingale (equal angles, radius by value) ----
+
+    static void DrawRose(App app, int x, int y, int w, int h,
+                         ChartOption o, int g) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int pad = t.paddingMedium;
+        int top = ChartView.PanelHead(app, x, y, w, h, o.title);
+
+        List<ChartStage> stages = ChartView.GatherStages(app, o.series);
+        int n = stages.Count;
+        if (n < 1) { return; }
+        int maxV = 1;
+        foreach (ChartStage st in stages) { if (st.val > maxV) { maxV = st.val; } }
+
+        int legendW = app.Scale(120);
+        int areaW = w - pad * 2 - legendW;
+        int areaH = (y + h - pad) - top;
+        int rMax = areaW / 2;
+        if (areaH / 2 < rMax) { rMax = areaH / 2; }
+        if (rMax < app.Scale(10)) { rMax = app.Scale(10); }
+        int cx = x + pad + areaW / 2;
+        int cy = top + areaH / 2;
+        int sweepMax = 360 * g / 1000;
+
+        for (int i = 0; i < n; i = i + 1) {
+            int a0 = i * 360 / n;
+            int a1 = (i + 1) * 360 / n;
+            if (a1 > sweepMax) { a1 = sweepMax; }
+            int r = rMax * stages[i].val / maxV;
+            if (r < app.Scale(6)) { r = app.Scale(6); }
+            if (a1 > a0) { c.FillSector(cx, cy, 0, r, a0, a1, stages[i].color); }
+        }
+
+        int lx = x + w - pad - legendW;
+        int ly = top;
+        int sw = app.Scale(12);
+        int lh = Canvas.FontHeight(t.fontSizeSmall) + app.Scale(6);
+        for (int j = 0; j < n; j = j + 1) {
+            ChartStage st = stages[j];
+            c.FillRoundRect(lx, ly + app.Scale(2), sw, sw, t.borderRadiusSmall, st.color);
+            string nm = st.name;
+            if (nm.Length == 0) { nm = "Item " + Convert.ToString(j + 1); }
+            c.DrawText(lx + sw + app.Scale(6), ly + app.Scale(1),
+                nm + "  " + Convert.ToString(st.val), t.textSecondary, t.fontSizeSmall);
+            ly = ly + lh;
+        }
+
+        if (o.showTooltip) {
+            int mx = app.mouseX;
+            int my = app.mouseY;
+            int ddx = mx - cx;
+            int ddy = my - cy;
+            int dist = ChartView.ISqrt(ddx * ddx + ddy * ddy);
+            if (dist <= rMax) {
+                int ang = ChartView.AngleOf(ddx, ddy);
+                int idx = ang * n / 360;
+                if (idx > n - 1) { idx = n - 1; }
+                ChartStage st = stages[idx];
+                string nm = st.name;
+                if (nm.Length == 0) { nm = "Item " + Convert.ToString(idx + 1); }
+                List<int> tcols = new List<int>();
+                List<string> tlines = new List<string>();
+                tcols.Add(0); tlines.Add(o.title);
+                tcols.Add(st.color);
+                tlines.Add(nm + "  " + Convert.ToString(st.val));
+                ChartView.TooltipCard(app, mx, my, x + w, tcols, tlines);
+            }
+        }
+    }
+}

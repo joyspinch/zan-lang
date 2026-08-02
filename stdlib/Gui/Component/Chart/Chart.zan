@@ -165,6 +165,8 @@ class Chart {
 
     // Max cumulative total when every series stacks into one band (stacked area
     // / stacked line: series accumulate in order regardless of stackName).
+    // Hidden series (legend toggled off) are skipped, so hiding a series
+    // rescales the axis and the remaining band re-stacks correctly.
     static int MaxStackAll(List<ChartSeries> series, int n) {
         int mx = 0;
         int i = 0;
@@ -173,7 +175,7 @@ class Chart {
             int s = 0;
             while (s < series.Count) {
                 ChartSeries cs = series[s];
-                if (i < cs.Count()) { sum = sum + cs.Value(i); }
+                if (!cs.hidden && i < cs.Count()) { sum = sum + cs.Value(i); }
                 s = s + 1;
             }
             if (sum > mx) { mx = sum; }
@@ -204,6 +206,9 @@ class Chart {
     // dataZoom window state keys (permille 0..1000 of the category range).
     static int ZoomLoKey(int wid) { return 7000000 + wid * 2; }
     static int ZoomHiKey(int wid) { return 7000000 + wid * 2 + 1; }
+
+    // RenderCache fingerprint key for snapshot slot (see ChartView.RenderCached).
+    static int CacheKey(int slot) { return 9000000 + slot; }
 
     // Resolve the zoom window to an inclusive category index range [i0,i1].
     static int ZoomI0(App app, int wid, int n) {
@@ -545,6 +550,22 @@ class Chart {
         return mx;
     }
 
+    // Smallest value across the (visible) series bound to the given value axis
+    // (0 when nothing is negative), so the axis can span negatives natively.
+    static int AxisMinFor(List<ChartSeries> series, int axisIndex) {
+        int mn = 0;
+        int i = 0;
+        while (i < series.Count) {
+            ChartSeries s = series[i];
+            if (!s.hidden && s.axisIndex == axisIndex) {
+                int j = 0;
+                while (j < s.Count()) { if (s.Value(j) < mn) { mn = s.Value(j); } j = j + 1; }
+            }
+            i = i + 1;
+        }
+        return mn;
+    }
+
     static bool AnyOnAxis(List<ChartSeries> series, int axisIndex) {
         int i = 0;
         while (i < series.Count) {
@@ -554,10 +575,25 @@ class Chart {
         return false;
     }
 
-    // Resolve one value axis' [lo, hi] range from data + fixed overrides.
-    static int AxisLo(int fixedLo) {
+    // Round a raw minimum down to a friendly negative axis bound (2/5/10 * 10^n);
+    // returns 0 when there is nothing negative to cover.
+    static int NiceMin(int v) {
+        if (v >= 0) { return 0; }
+        int av = 0 - v;
+        if (av <= 5) { return 0 - 5; }
+        int mag = 1;
+        while (mag * 10 <= av) { mag = mag * 10; }
+        int unit = av / mag;
+        int nice = 10;
+        if (unit < 2) { nice = 2; } else if (unit < 5) { nice = 5; }
+        return 0 - nice * mag;
+    }
+
+    // Resolve one value axis' [lo, hi] range from data + fixed overrides. The
+    // lower bound auto-extends below 0 when any value is negative.
+    static int AxisLo(int fixedLo, int dataMin) {
         if (fixedLo != ChartOption.Auto()) { return fixedLo; }
-        return 0;
+        return Chart.NiceMin(dataMin);
     }
     static int AxisHi(int fixedHi, int dataMax, int lo) {
         int hi = Chart.NiceMax(dataMax);
@@ -607,7 +643,7 @@ class Chart {
 
         int lData = leftDataMax;
         if (lData < 0) { lData = Chart.AxisMaxFor(series, 0); }
-        int leftLo = Chart.AxisLo(y0.min);
+        int leftLo = Chart.AxisLo(y0.min, Chart.AxisMinFor(series, 0));
         int leftHi = Chart.AxisHi(y0.max, lData, leftLo);
         bool hasRight = Chart.AnyOnAxis(series, 1);
         if (o.yAxes.Count > 1) { hasRight = true; }
@@ -616,7 +652,7 @@ class Chart {
         if (hasRight) {
             int rData = rightDataMax;
             if (rData < 0) { rData = Chart.AxisMaxFor(series, 1); }
-            rightLo = Chart.AxisLo(y1.min);
+            rightLo = Chart.AxisLo(y1.min, Chart.AxisMinFor(series, 1));
             rightHi = Chart.AxisHi(y1.max, rData, rightLo);
         }
 

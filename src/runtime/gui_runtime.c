@@ -772,15 +772,44 @@ EXPORT void zan_gui_blur_round_cached(
  * slots snapshot a region's pixels after it is drawn; on animation-only frames
  * the caller restores the snapshot with a single copy instead of re-painting
  * the backdrop. Geometry must match (else restore reports failure and the
- * caller repaints normally, e.g. after a resize). */
+ * caller repaints normally, e.g. after a resize).
+ *
+ * The pool is dynamic: ZAN_SNAP_CACHE_SLOTS is just the compile-time floor.
+ * The runtime grows the array (realloc) on demand up to
+ * ZAN_SNAP_CACHE_MAX_SLOTS, and zan_gui_surface_release frees a slot's pixels
+ * so a caller (e.g. a grid cell that embeds a chart and then scrolls away) can
+ * hand the memory back instead of holding it for the session. */
 #define ZAN_SNAP_CACHE_SLOTS 8
-static zan_blur_cache_t g_snap_cache[ZAN_SNAP_CACHE_SLOTS];
+#define ZAN_SNAP_CACHE_MAX_SLOTS 512
+static zan_blur_cache_t *g_snap_cache;
+static int g_snap_cache_count;
+static void zan_snap_ensure(int slot) {
+    if (slot < 0 || slot >= ZAN_SNAP_CACHE_MAX_SLOTS) return;
+    if (slot < g_snap_cache_count) return;
+    int grow = slot + 1;
+    if (grow < ZAN_SNAP_CACHE_SLOTS) grow = ZAN_SNAP_CACHE_SLOTS;
+    zan_blur_cache_t *np = (zan_blur_cache_t *)realloc(
+        g_snap_cache, (size_t)grow * sizeof(zan_blur_cache_t));
+    if (!np) return;
+    for (int i = g_snap_cache_count; i < grow; i++) {
+        np[i].valid = 0; np[i].pixels = NULL; np[i].cap = 0;
+    }
+    g_snap_cache = np;
+    g_snap_cache_count = grow;
+}
+static zan_blur_cache_t *zan_snap_slot(int slot) {
+    if (slot < 0 || slot >= ZAN_SNAP_CACHE_MAX_SLOTS) return NULL;
+    zan_snap_ensure(slot);
+    if (slot >= g_snap_cache_count) return NULL;
+    return &g_snap_cache[slot];
+}
 
 EXPORT void zan_gui_snapshot_rect(i32 surface_id, i32 x, i32 y, i32 w, i32 h, i32 slot) {
     if (surface_id < 0 || surface_id >= g_surface_count) return;
     zan_surface_t *s = g_surfaces[surface_id];
     if (!s) return;
-    if (slot < 0 || slot >= ZAN_SNAP_CACHE_SLOTS) return;
+    zan_blur_cache_t *c = zan_snap_slot(slot);
+    if (!c) return;
     int x0 = clamp_i((int)x, 0, s->width);
     int y0 = clamp_i((int)y, 0, s->height);
     int x1 = clamp_i((int)(x + w), 0, s->width);
@@ -788,7 +817,6 @@ EXPORT void zan_gui_snapshot_rect(i32 surface_id, i32 x, i32 y, i32 w, i32 h, i3
     int rw = x1 - x0, rh = y1 - y0;
     if (rw <= 0 || rh <= 0) return;
     ZAN_STAT(g_st_snap, (long long)rw * (long long)rh);
-    zan_blur_cache_t *c = &g_snap_cache[slot];
     size_t n = (size_t)rw * (size_t)rh;
     if (c->cap < n) {
         u32 *np = (u32 *)realloc(c->pixels, n * sizeof(u32));
@@ -810,14 +838,14 @@ EXPORT i32 zan_gui_restore_rect(i32 surface_id, i32 x, i32 y, i32 w, i32 h, i32 
     if (surface_id < 0 || surface_id >= g_surface_count) return 0;
     zan_surface_t *s = g_surfaces[surface_id];
     if (!s) return 0;
-    if (slot < 0 || slot >= ZAN_SNAP_CACHE_SLOTS) return 0;
+    zan_blur_cache_t *c = zan_snap_slot(slot);
+    if (!c) return 0;
     int x0 = clamp_i((int)x, 0, s->width);
     int y0 = clamp_i((int)y, 0, s->height);
     int x1 = clamp_i((int)(x + w), 0, s->width);
     int y1 = clamp_i((int)(y + h), 0, s->height);
     int rw = x1 - x0, rh = y1 - y0;
     if (rw <= 0 || rh <= 0) return 0;
-    zan_blur_cache_t *c = &g_snap_cache[slot];
     if (!c->valid || !c->pixels || c->sid != (int)surface_id
         || c->x0 != x0 || c->y0 != y0 || c->rw != rw || c->rh != rh) {
         return 0;
@@ -848,8 +876,8 @@ EXPORT i32 zan_gui_restore_sub_rect(i32 surface_id, i32 x, i32 y, i32 w, i32 h, 
     if (surface_id < 0 || surface_id >= g_surface_count) return 0;
     zan_surface_t *s = g_surfaces[surface_id];
     if (!s) return 0;
-    if (slot < 0 || slot >= ZAN_SNAP_CACHE_SLOTS) return 0;
-    zan_blur_cache_t *c = &g_snap_cache[slot];
+    zan_blur_cache_t *c = zan_snap_slot(slot);
+    if (!c) return 0;
     if (!c->valid || !c->pixels || c->sid != (int)surface_id) return 0;
     int x0 = clamp_i((int)x, c->x0, c->x0 + c->rw);
     int y0 = clamp_i((int)y, c->y0, c->y0 + c->rh);
@@ -866,6 +894,20 @@ EXPORT i32 zan_gui_restore_sub_rect(i32 surface_id, i32 x, i32 y, i32 w, i32 h, 
         for (int i = 0; i < x1 - x0; i++) row[i] = src[i];
     }
     return 1;
+}
+
+/* Frees the pixel buffer owned by a snapshot slot and marks it invalid, so the
+ * memory a cached region holds (e.g. a chart embedded in a grid cell that just
+ * scrolled out of view) is returned to the allocator instead of being retained
+ * for the session. No-op on a free / out-of-range slot. */
+EXPORT void zan_gui_surface_release(i32 surface_id, i32 slot) {
+    (void)surface_id;
+    zan_blur_cache_t *c = zan_snap_slot(slot);
+    if (!c) return;
+    free(c->pixels);
+    c->pixels = NULL;
+    c->cap = 0;
+    c->valid = 0;
 }
 
 EXPORT void zan_gui_draw_rect(i32 surface_id, i32 x, i32 y, i32 w, i32 h, i32 color, i32 thickness) {

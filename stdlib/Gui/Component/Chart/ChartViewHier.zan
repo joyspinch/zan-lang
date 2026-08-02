@@ -1,0 +1,493 @@
+using System;
+using System.Json;
+using Gui;
+
+namespace Gui.Component.Chart;
+
+partial class ChartView {
+    // ---- treemap (recursive slice-and-dice, alternating split direction) ----
+
+    static void DrawTreemap(App app, int x, int y, int w, int h,
+                            ChartOption o, int g) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        List<ChartSeries> series = o.series;
+        if (series.Count < 1 || series[0].tree.Count < 1) { return; }
+        ChartNode root = series[0].tree[0];
+        int plotTop = ChartView.PanelHead(app, x, y, w, h, o.title);
+        int pad = t.paddingMedium;
+        int areaX = x + pad;
+        int areaY = plotTop;
+        int areaW = w - pad * 2;
+        int areaH = (y + h - pad) - plotTop;
+        if (areaW < app.Scale(10) || areaH < app.Scale(10)) { return; }
+        int gw = areaW * g / 1000;
+        int gh = areaH * g / 1000;
+        areaX = areaX + (areaW - gw) / 2;
+        areaY = areaY + (areaH - gh) / 2;
+        areaW = gw;
+        areaH = gh;
+        if (areaW < app.Scale(4) || areaH < app.Scale(4)) { return; }
+
+        if (root.children.Count == 0) {
+            c.FillRoundRect(areaX, areaY, areaW, areaH, app.Scale(4), Chart.Palette(t, 0));
+            ChartView.TreemapCell(app, areaX, areaY, areaW, areaH, root.name,
+                Convert.ToString(root.val));
+            return;
+        }
+        ChartView.TreemapSlice(app, areaX, areaY, areaW, areaH, root.children, 0);
+
+        if (o.showTooltip) {
+            int mx = app.mouseX;
+            int my = app.mouseY;
+            if (mx >= areaX && mx < areaX + areaW
+                && my >= areaY && my < areaY + areaH) {
+                ChartView.ttName = "";
+                ChartView.ttVal = 0;
+                ChartView.TreemapHit(app, areaX, areaY, areaW, areaH,
+                    root.children, 0, mx, my);
+                if (ChartView.ttName.Length > 0) {
+                    // Outline the exact hovered cell.
+                    c.DrawRoundRect(ChartView.ttX, ChartView.ttY,
+                        ChartView.ttW, ChartView.ttH, app.Scale(2), 4294967295, app.Scale(2));
+                    List<int> tcols = new List<int>();
+                    List<string> tlines = new List<string>();
+                    tcols.Add(0); tlines.Add(o.title);
+                    tcols.Add(4294967295);
+                    tlines.Add(ChartView.ttName + "  " + Convert.ToString(ChartView.ttVal));
+                    ChartView.TooltipCard(app, mx, my, x + w, tcols, tlines);
+                }
+            }
+        }
+    }
+
+    // One level of the split; recurses into children when the cell is big
+    // enough, otherwise labels the cell with name + value.
+    static void TreemapSlice(App app, int x, int y, int w, int h,
+                             List<ChartNode> nodes, int depth) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int total = 0;
+        int i = 0;
+        while (i < nodes.Count) { total = total + nodes[i].Total(); i = i + 1; }
+        if (total < 1) { return; }
+        bool vert = (depth % 2) == 0;
+        int acc = 0;
+        int j = 0;
+        while (j < nodes.Count) {
+            ChartNode nd = nodes[j];
+            int v = nd.Total();
+            int cell = vert ? (h * v / total) : (w * v / total);
+            int cx = x;
+            int cy = y;
+            int cw = w;
+            int ch = h;
+            if (vert) { ch = cell; cy = y + acc; }
+            else { cw = cell; cx = x + acc; }
+            acc = acc + cell;
+
+            int col = Chart.Palette(t, j);
+            if (depth > 0) { col = App.LerpColor(col, t.bgPrimary, depth * 130); }
+            int rr = app.Scale(2);
+            if (depth == 0) { rr = app.Scale(4); }
+            if (cw > app.Scale(2) && ch > app.Scale(2)) {
+                c.FillRoundRect(cx, cy, cw, ch, rr, col);
+                c.DrawRoundRect(cx, cy, cw, ch, rr, t.bgPrimary, app.Scale(1));
+            }
+            if (nd.children.Count > 0 && cw > app.Scale(34) && ch > app.Scale(26)) {
+                int inset = app.Scale(3);
+                ChartView.TreemapSlice(app, cx + inset, cy + inset,
+                    cw - inset * 2, ch - inset * 2, nd.children, depth + 1);
+            } else {
+                ChartView.TreemapCell(app, cx, cy, cw, ch, nd.name, Convert.ToString(v));
+            }
+            j = j + 1;
+        }
+    }
+
+    // Name (+ value) label inside a treemap cell, only when it fits.
+    static void TreemapCell(App app, int x, int y, int w, int h, string name, string val) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int fs = t.fontSizeSmall;
+        int fh = Canvas.FontHeight(fs);
+        if (w < app.Scale(20) || h < fh + app.Scale(4)) { return; }
+        int nw = Canvas.MeasureText(name, fs);
+        if (nw > w - app.Scale(6)) { nw = w - app.Scale(6); }
+        c.DrawText(x + app.Scale(3), y + app.Scale(2), name, 4294967295, fs);
+        if (h > fh * 2 + app.Scale(4) && val.Length > 0) {
+            c.DrawText(x + app.Scale(3), y + app.Scale(2) + fh, val,
+                Chart.WithAlpha(4294967295, 200), fs);
+        }
+    }
+
+    // ---- sunburst (concentric rings; innermost = root's children) ----
+
+    static int TreeDepth(ChartNode n) {
+        int md = 0;
+        int i = 0;
+        while (i < n.children.Count) {
+            int d = ChartView.TreeDepth(n.children[i]);
+            if (d > md) { md = d; }
+            i = i + 1;
+        }
+        return md + 1;
+    }
+
+    // Hit-test a treemap: walk the same slice layout as TreemapSlice, recursing
+    // into a child cell only when the pointer is inside it (and it was deep
+    // enough to have been split). Fills the static ttName/ttVal hit fields.
+    static void TreemapHit(App app, int x, int y, int w, int h,
+                           List<ChartNode> nodes, int depth, int px, int py) {
+        int total = 0;
+        int i = 0;
+        while (i < nodes.Count) { total = total + nodes[i].Total(); i = i + 1; }
+        if (total < 1) { return; }
+        bool vert = (depth % 2) == 0;
+        int acc = 0;
+        int j = 0;
+        while (j < nodes.Count) {
+            ChartNode nd = nodes[j];
+            int v = nd.Total();
+            int cell = vert ? (h * v / total) : (w * v / total);
+            int cx = x;
+            int cy = y;
+            int cw = w;
+            int ch = h;
+            if (vert) { ch = cell; cy = y + acc; }
+            else { cw = cell; cx = x + acc; }
+            acc = acc + cell;
+            if (px >= cx && px < cx + cw && py >= cy && py < cy + ch) {
+                if (nd.children.Count > 0 && cw > app.Scale(34) && ch > app.Scale(26)) {
+                    int inset = app.Scale(3);
+                    ChartView.TreemapHit(app, cx + inset, cy + inset,
+                        cw - inset * 2, ch - inset * 2, nd.children, depth + 1, px, py);
+                } else {
+                    ChartView.ttName = nd.name;
+                    ChartView.ttVal = v;
+                    ChartView.ttX = cx;
+                    ChartView.ttY = cy;
+                    ChartView.ttW = cw;
+                    ChartView.ttH = ch;
+                }
+                return;
+            }
+            j = j + 1;
+        }
+    }
+
+    // Hit-test a sunburst ring: walk the same angular sweep as SunburstRing,
+    // recursing into the child sector when the pointer is inside it. Fills the
+    // static ttName/ttVal hit fields.
+    static void SunburstHit(App app, int cx, int cy, int ringH, ChartNode node,
+                            int depth, int a0, int a1, int px, int py) {
+        int total = node.Total();
+        if (total < 1) { return; }
+        int kids = node.children.Count;
+        if (kids == 0) { return; }
+        int ddx = px - cx;
+        int ddy = py - cy;
+        int dist = ChartView.ISqrt(ddx * ddx + ddy * ddy);
+        if (dist < depth * ringH || dist > (depth + 1) * ringH) { return; }
+        int ang = ChartView.AngleOf(ddx, ddy);
+        int a = a0;
+        int i = 0;
+        while (i < kids) {
+            ChartNode k = node.children[i];
+            int v = k.Total();
+            int span = (a1 - a0) * v / total;
+            int aEnd = a + span;
+            if (ang >= a && ang < aEnd) {
+                if (k.children.Count > 0) {
+                    ChartView.SunburstHit(app, cx, cy, ringH, k, depth + 1,
+                        a, aEnd, px, py);
+                } else {
+                    ChartView.ttName = k.name;
+                    ChartView.ttVal = v;
+                    ChartView.ttA0 = a;
+                    ChartView.ttA1 = aEnd;
+                    ChartView.ttDepth = depth;
+                }
+                return;
+            }
+            a = a + span;
+            i = i + 1;
+        }
+    }
+
+    static void DrawSunburst(App app, int x, int y, int w, int h,
+                             ChartOption o, int g) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        List<ChartSeries> series = o.series;
+        if (series.Count < 1 || series[0].tree.Count < 1) { return; }
+        ChartNode root = series[0].tree[0];
+        int top = ChartView.PanelHead(app, x, y, w, h, o.title);
+        int pad = t.paddingMedium;
+        int areaY = top;
+        int areaH = (y + h - pad) - top;
+        if (areaH < app.Scale(16)) { areaH = app.Scale(16); }
+        int cx = x + w / 2;
+        int cy = areaY + areaH / 2;
+        int rMax = (w - pad * 2) / 2;
+        if (areaH / 2 < rMax) { rMax = areaH / 2; }
+        if (rMax < app.Scale(10)) { rMax = app.Scale(10); }
+        int sweepMax = 360 * g / 1000;
+
+        int rings = ChartView.TreeDepth(root);
+        if (rings < 1) { rings = 1; }
+        int ringH = rMax / (rings + 1);
+        if (ringH < app.Scale(4)) { ringH = app.Scale(4); }
+        ChartView.SunburstRing(app, cx, cy, ringH, root, 0, 0, 360, sweepMax, 0);
+
+        // centre label = root name
+        if (root.name.Length > 0) {
+            int fs = t.fontSizeSmall;
+            c.DrawTextCentered(cx - ringH / 2, cy - Canvas.FontHeight(fs) / 2,
+                ringH, Canvas.FontHeight(fs), root.name, t.textSecondary, fs);
+        }
+
+        if (o.showTooltip) {
+            int mx = app.mouseX;
+            int my = app.mouseY;
+            int ddx = mx - cx;
+            int ddy = my - cy;
+            int dist = ChartView.ISqrt(ddx * ddx + ddy * ddy);
+            if (dist <= rMax) {
+                ChartView.ttName = "";
+                ChartView.ttVal = 0;
+                ChartView.SunburstHit(app, cx, cy, ringH, root, 0, 0, 360, mx, my);
+                if (ChartView.ttName.Length > 0) {
+                    // Bright ring along the outer edge of the hovered sector.
+                    int hiInner = (ChartView.ttDepth + 1) * ringH - app.Scale(2);
+                    int hiOuter = (ChartView.ttDepth + 1) * ringH;
+                    if (hiInner < 0) { hiInner = 0; }
+                    c.FillSector(cx, cy, hiInner, hiOuter,
+                        ChartView.ttA0, ChartView.ttA1, 4294967295);
+                    List<int> tcols = new List<int>();
+                    List<string> tlines = new List<string>();
+                    tcols.Add(0); tlines.Add(o.title);
+                    tcols.Add(4294967295);
+                    tlines.Add(ChartView.ttName + "  " + Convert.ToString(ChartView.ttVal));
+                    ChartView.TooltipCard(app, mx, my, x + w, tcols, tlines);
+                }
+            }
+        }
+    }
+
+    static void SunburstRing(App app, int cx, int cy, int ringH, ChartNode node,
+                             int depth, int a0, int a1, int sweepMax, int parentCol) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int total = node.Total();
+        if (total < 1) { return; }
+        int kids = node.children.Count;
+        if (kids == 0) { return; }
+        int rInner = depth * ringH;
+        int rOuter = (depth + 1) * ringH;
+        int a = a0;
+        int i = 0;
+        while (i < kids) {
+            ChartNode k = node.children[i];
+            int v = k.Total();
+            int span = (a1 - a0) * v / total;
+            int aEnd = a + span;
+            if (aEnd > sweepMax) { aEnd = sweepMax; }
+            int col = Chart.Palette(t, i);
+            if (depth > 0) { col = App.LerpColor(parentCol, 4294967295, 100 + depth * 70); }
+            if (aEnd > a && rOuter > rInner) {
+                c.FillSector(cx, cy, rInner, rOuter, a, aEnd, col);
+                if (k.children.Count > 0) {
+                    ChartView.SunburstRing(app, cx, cy, ringH, k, depth + 1,
+                        a, aEnd, sweepMax, col);
+                }
+            }
+            a = a + span;
+            i = i + 1;
+        }
+    }
+
+    // ---- sankey (flow links between layered nodes) ----
+
+    static int SankeyIndex(List<string> names, string n) {
+        int i = 0;
+        while (i < names.Count) {
+            if (names[i] == n) { return i; }
+            i = i + 1;
+        }
+        return 0 - 1;
+    }
+
+    static void DrawSankey(App app, int x, int y, int w, int h,
+                           ChartOption o, int g) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        List<ChartSeries> series = o.series;
+        if (series.Count < 1 || series[0].links.Count < 1) { return; }
+        List<ChartLink> links = series[0].links;
+        int top = ChartView.PanelHead(app, x, y, w, h, o.title);
+        int pad = t.paddingMedium;
+
+        // Node list (first-appearance order) + layer (column) per node.
+        List<string> names = new List<string>();
+        List<int> layers = new List<int>();
+        int li = 0;
+        while (li < links.Count) {
+            ChartLink lk = links[li];
+            if (ChartView.SankeyIndex(names, lk.from) < 0) { names.Add(lk.from); layers.Add(0); }
+            if (ChartView.SankeyIndex(names, lk.to) < 0) { names.Add(lk.to); layers.Add(0); }
+            li = li + 1;
+        }
+        // Longest-path layering: layer(to) >= layer(from) + 1.
+        bool changed = true;
+        while (changed) {
+            changed = false;
+            li = 0;
+            while (li < links.Count) {
+                ChartLink lk = links[li];
+                int fi = ChartView.SankeyIndex(names, lk.from);
+                int ti = ChartView.SankeyIndex(names, lk.to);
+                if (layers[ti] < layers[fi] + 1) {
+                    layers[ti] = layers[fi] + 1;
+                    changed = true;
+                }
+                li = li + 1;
+            }
+        }
+        int maxLayer = 0;
+        int nk = 0;
+        while (nk < names.Count) { if (layers[nk] > maxLayer) { maxLayer = layers[nk]; } nk = nk + 1; }
+        if (maxLayer < 1) { maxLayer = 1; }
+        int nLayers = maxLayer + 1;
+
+        // Per-node flow (larger of in/out) to scale node height.
+        int nn = names.Count;
+        List<int> flowOut = new List<int>();
+        List<int> flowIn = new List<int>();
+        int ni = 0;
+        while (ni < nn) { flowOut.Add(0); flowIn.Add(0); ni = ni + 1; }
+        li = 0;
+        while (li < links.Count) {
+            ChartLink lk = links[li];
+            int fi = ChartView.SankeyIndex(names, lk.from);
+            int ti = ChartView.SankeyIndex(names, lk.to);
+            flowOut[fi] = flowOut[fi] + lk.val;
+            flowIn[ti] = flowIn[ti] + lk.val;
+            li = li + 1;
+        }
+
+        int colW = (w - pad * 2) / nLayers;
+        int nodeW = colW * 3 / 8;
+        if (nodeW < app.Scale(18)) { nodeW = app.Scale(18); }
+        int areaH = (y + h - pad) - top;
+        int colH = areaH * 8 / 10;
+
+        // Per-column flow totals for vertical stacking.
+        List<int> colTotal = new List<int>();
+        List<int> colCum = new List<int>();
+        int lc = 0;
+        while (lc < nLayers) { colTotal.Add(0); colCum.Add(0); lc = lc + 1; }
+        ni = 0;
+        while (ni < nn) {
+            int fl = flowOut[ni];
+            if (fl < flowIn[ni]) { fl = flowIn[ni]; }
+            colTotal[layers[ni]] = colTotal[layers[ni]] + fl;
+            ni = ni + 1;
+        }
+
+        List<int> nodeX = new List<int>();
+        List<int> nodeY = new List<int>();
+        List<int> nodeH = new List<int>();
+        ni = 0;
+        while (ni < nn) {
+            int lay = layers[ni];
+            int fl = flowOut[ni];
+            if (fl < flowIn[ni]) { fl = flowIn[ni]; }
+            int th2 = colTotal[lay];
+            if (th2 < 1) { th2 = 1; }
+            int hgt = colH * fl / th2;
+            if (hgt < app.Scale(4)) { hgt = app.Scale(4); }
+            int yTop = top + (areaH - colH) / 2 + colCum[lay];
+            nodeX.Add(x + pad + lay * colW);
+            nodeY.Add(yTop);
+            nodeH.Add(hgt);
+            colCum[lay] = colCum[lay] + hgt + app.Scale(4);
+            ni = ni + 1;
+        }
+
+        // Links first (nodes cover their edges): thick rounded bands from the
+        // source node's right edge to the target node's left edge.
+        int maxFlow = 1;
+        li = 0;
+        while (li < links.Count) { if (links[li].val > maxFlow) { maxFlow = links[li].val; } li = li + 1; }
+        int maxTh = app.Scale(10);
+        li = 0;
+        while (li < links.Count) {
+            ChartLink lk = links[li];
+            int fi = ChartView.SankeyIndex(names, lk.from);
+            int ti = ChartView.SankeyIndex(names, lk.to);
+            int th = maxTh * lk.val / maxFlow;
+            if (th < app.Scale(2)) { th = app.Scale(2); }
+            int x0 = nodeX[fi] + nodeW;
+            int y0 = nodeY[fi] + nodeH[fi] / 2;
+            int x1 = nodeX[ti];
+            int y1 = nodeY[ti] + nodeH[ti] / 2;
+            c.DrawLine(x0, y0, x1, y1, Chart.WithAlpha(Chart.Palette(t, fi), 170), th);
+            li = li + 1;
+        }
+
+        // Nodes + labels (source column labels left-aligned, others right).
+        ni = 0;
+        while (ni < nn) {
+            c.FillRoundRect(nodeX[ni], nodeY[ni], nodeW, nodeH[ni],
+                app.Scale(3), Chart.Palette(t, ni));
+            int fs = t.fontSizeSmall;
+            int fh = Canvas.FontHeight(fs);
+            int lx2 = nodeX[ni] + nodeW + app.Scale(4);
+            if (layers[ni] == 0) {
+                lx2 = nodeX[ni] - app.Scale(4) - Canvas.MeasureText(names[ni], fs);
+            }
+            c.DrawText(lx2, nodeY[ni] + nodeH[ni] / 2 - fh / 2,
+                names[ni], t.textSecondary, fs);
+            ni = ni + 1;
+        }
+
+        if (o.showTooltip) {
+            int mx = app.mouseX;
+            int my = app.mouseY;
+            // Link hover: nearest link within the half-thickness band.
+            int bestL = 0 - 1;
+            int bestD = 0;
+            li = 0;
+            while (li < links.Count) {
+                ChartLink lk = links[li];
+                int fi = ChartView.SankeyIndex(names, lk.from);
+                int ti = ChartView.SankeyIndex(names, lk.to);
+                int x0 = nodeX[fi] + nodeW;
+                int y0 = nodeY[fi] + nodeH[fi] / 2;
+                int x1 = nodeX[ti];
+                int y1 = nodeY[ti] + nodeH[ti] / 2;
+                int d = ChartView.DistToSeg(mx, my, x0, y0, x1, y1);
+                if (bestL < 0 || d < bestD) { bestL = li; bestD = d; }
+                li = li + 1;
+            }
+            int linkR = app.Scale(8);
+            if (bestL >= 0 && bestD <= linkR) {
+                ChartLink hk = links[bestL];
+                int fi = ChartView.SankeyIndex(names, hk.from);
+                int ti = ChartView.SankeyIndex(names, hk.to);
+                int x0 = nodeX[fi] + nodeW;
+                int y0 = nodeY[fi] + nodeH[fi] / 2;
+                int x1 = nodeX[ti];
+                int y1 = nodeY[ti] + nodeH[ti] / 2;
+                c.DrawLine(x0, y0, x1, y1, 4294967295, app.Scale(3));
+                List<int> tcols = new List<int>();
+                List<string> tlines = new List<string>();
+                tcols.Add(0); tlines.Add(o.title);
+                tcols.Add(Chart.Palette(t, fi));
+                tlines.Add(hk.from + " → " + hk.to + "  " + Convert.ToString(hk.val));
+                ChartView.TooltipCard(app, mx, my, x + w, tcols, tlines);
+            }
+        }
+    }
+}

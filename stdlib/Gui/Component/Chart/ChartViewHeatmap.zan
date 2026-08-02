@@ -1,0 +1,159 @@
+using System;
+using System.Json;
+using Gui;
+
+namespace Gui.Component.Chart;
+
+partial class ChartView {
+    // ---- heatmap (row=series, col=value index; intensity fades in with g) ----
+
+    static void DrawHeatmap(App app, int x, int y, int w, int h,
+                            ChartOption o, int g) {
+        ChartView.DrawHeatmapCore(app, x, y, w, h, o, g);
+        ChartView.HeatmapHover(app, x, y, w, h, o);
+    }
+
+    /// The heatmap body only (panel, headers, colour cells) — no hover overlay,
+    /// so it can be cached by RenderCached and the pointer feedback redrawn on
+    /// top after a cache hit.
+    static void DrawHeatmapCore(App app, int x, int y, int w, int h,
+                                ChartOption o, int g) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int pad = t.paddingMedium;
+        int top = ChartView.PanelHead(app, x, y, w, h, o.title);
+
+        int rows = o.series.Count;
+        if (rows < 1) { return; }
+        int cols = 0;
+        int r = 0;
+        while (r < rows) {
+            if (o.series[r].Count() > cols) { cols = o.series[r].Count(); }
+            r = r + 1;
+        }
+        if (cols < 1) { return; }
+
+        // Global min/max for the colour ramp.
+        int lo = 0;
+        if (o.series[0].Count() > 0) { lo = o.series[0].Value(0); }
+        int hi = lo;
+        r = 0;
+        while (r < rows) {
+            int cc = 0;
+            while (cc < o.series[r].Count()) {
+                int v = o.series[r].Value(cc);
+                if (v < lo) { lo = v; }
+                if (v > hi) { hi = v; }
+                cc = cc + 1;
+            }
+            r = r + 1;
+        }
+        int span = hi - lo;
+        if (span < 1) { span = 1; }
+
+        int rowLabelW = app.Scale(56);
+        int colHeadH = app.Scale(16);
+        int gridX = x + pad + rowLabelW;
+        int gridY = top + colHeadH;
+        int gridW = w - pad * 2 - rowLabelW;
+        int gridH = (y + h - pad) - gridY;
+        int cellW = gridW / cols;
+        int cellH = gridH / rows;
+        if (cellW < 1 || cellH < 1) { return; }
+        int cellGap = app.Scale(2);
+
+        // Column headers (category labels); skipped on dense grids where the
+        // cells are too narrow for text (a 96-column heatmap has no room).
+        List<string> labels = o.XCategories();
+        if (cellW >= app.Scale(16)) {
+            int ci = 0;
+            while (ci < cols) {
+                if (ci < labels.Count) {
+                    c.DrawTextCentered(gridX + ci * cellW, top, cellW, colHeadH,
+                        labels[ci], t.textTertiary, t.fontSizeSmall);
+                }
+                ci = ci + 1;
+            }
+        }
+
+        r = 0;
+        while (r < rows) {
+            // Row label (series name); skipped when the rows are too thin for
+            // text -- a dense grid reads by colour, not by row name.
+            if (cellH >= app.Scale(12)) {
+                c.DrawText(x + pad, gridY + r * cellH + (cellH - Canvas.FontHeight(t.fontSizeSmall)) / 2,
+                    o.series[r].name, t.textSecondary, t.fontSizeSmall);
+            }
+            int cc = 0;
+            while (cc < cols) {
+                int v = lo;
+                if (cc < o.series[r].Count()) { v = o.series[r].Value(cc); }
+                int inten = (v - lo) * 1000 / span;
+                inten = inten * g / 1000;
+                int cellCol = App.LerpColor(t.bgTertiary, o.series[r].color, inten);
+                int bx = gridX + cc * cellW;
+                int by = gridY + r * cellH;
+                c.FillRoundRect(bx, by, cellW - cellGap, cellH - cellGap,
+                    t.borderRadiusSmall, cellCol);
+                cc = cc + 1;
+            }
+            r = r + 1;
+        }
+    }
+
+    /// Hover overlay for a heatmap: highlights the cell under the pointer and
+    /// shows its value. Drawn after DrawHeatmapCore (or after a RenderCached
+    /// restore) so the cached body needs no repaint on mouse move.
+    static void HeatmapHover(App app, int x, int y, int w, int h, ChartOption o) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int pad = t.paddingMedium;
+        int top = ChartView.PanelHead(app, x, y, w, h, o.title);
+        int rows = o.series.Count;
+        if (rows < 1) { return; }
+        int cols = 0;
+        int r = 0;
+        while (r < rows) {
+            if (o.series[r].Count() > cols) { cols = o.series[r].Count(); }
+            r = r + 1;
+        }
+        if (cols < 1) { return; }
+        int rowLabelW = app.Scale(56);
+        int colHeadH = app.Scale(16);
+        int gridX = x + pad + rowLabelW;
+        int gridY = top + colHeadH;
+        int gridW = w - pad * 2 - rowLabelW;
+        int gridH = (y + h - pad) - gridY;
+        int cellW = gridW / cols;
+        int cellH = gridH / rows;
+        if (cellW < 1 || cellH < 1) { return; }
+        int cellGap = app.Scale(2);
+
+        if (!o.showTooltip) { return; }
+        int mx = app.mouseX;
+        int my = app.mouseY;
+        if (mx >= gridX && mx < gridX + gridW
+            && my >= gridY && my < gridY + gridH) {
+            int cc2 = (mx - gridX) / cellW;
+            int rr2 = (my - gridY) / cellH;
+            if (cc2 < 0) { cc2 = 0; }
+            if (rr2 < 0) { rr2 = 0; }
+            if (cc2 > cols - 1) { cc2 = cols - 1; }
+            if (rr2 > rows - 1) { rr2 = rows - 1; }
+            int bx = gridX + cc2 * cellW;
+            int by = gridY + rr2 * cellH;
+            c.DrawRect(bx, by, cellW - cellGap, cellH - cellGap, t.textPrimary, 1);
+            int v2 = 0;
+            if (cc2 < o.series[rr2].Count()) { v2 = o.series[rr2].Value(cc2); }
+            string lbl = "";
+            List<string> labels = o.XCategories();
+            if (cc2 < labels.Count) { lbl = labels[cc2]; }
+            if (lbl.Length == 0) { lbl = "#" + Convert.ToString(cc2 + 1); }
+            List<int> tcols = new List<int>();
+            List<string> tlines = new List<string>();
+            tcols.Add(o.series[rr2].color);
+            tlines.Add(o.series[rr2].name + " · " + lbl + "  " + Convert.ToString(v2));
+            ChartView.TooltipCard(app, mx, my, x + w, tcols, tlines);
+        }
+    }
+}
