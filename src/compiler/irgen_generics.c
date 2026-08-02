@@ -203,11 +203,28 @@ static LLVMValueRef route_generic_method(zan_irgen_t *g, zan_type_t *recv_ty,
                                          LLVMTypeRef erased_ty,
                                          LLVMTypeRef *out_ty) {
     if (out_ty) *out_ty = erased_ty;
-    if (!recv_ty || recv_ty->type_arg_count <= 0 || !recv_ty->sym) return erased_fn;
+    if (!recv_ty || !recv_ty->sym) return erased_fn;
     if (!is_user_generic_sym(recv_ty->sym)) return erased_fn;
+    zan_type_t **args = recv_ty->type_args;
+    int argc = recv_ty->type_arg_count;
+    /* `this.Helper()` inside a specialized body: the receiver's static type is
+     * still the open form (Queue<T>), so the plain lookup misses and the call
+     * lands in the ERASED copy -- whose T is not RC-managed, so a returned
+     * element is handed out unretained and the caller's release frees it while
+     * the collection still holds it. Route through the instantiation being
+     * emitted instead. */
+    if (g->cur_inst && g->cur_inst->sym == recv_ty->sym) {
+        bool concrete = argc > 0;
+        for (int i = 0; i < argc && concrete; i++)
+            concrete = type_is_concrete(args[i]);
+        if (!concrete) {
+            args = g->cur_inst->type_args;
+            argc = g->cur_inst->type_arg_count;
+        }
+    }
+    if (argc <= 0) return erased_fn;
     LLVMTypeRef st = NULL;
-    LLVMValueRef sfn = find_generic_fn(g, method_sym, recv_ty->type_args,
-                                       recv_ty->type_arg_count, &st);
+    LLVMValueRef sfn = find_generic_fn(g, method_sym, args, argc, &st);
     if (sfn) {
         if (out_ty) *out_ty = st;
         return sfn;
@@ -902,6 +919,16 @@ static LLVMValueRef zan_store_fit(zan_irgen_t *g, LLVMValueRef val, LLVMValueRef
         LLVMGetTypeKind(LLVMTypeOf(val)) == LLVMPointerTypeKind)
         val = LLVMBuildLoad2(g->builder, target, val, "sv.copy");
     if (target) val = coerce_int_to(g, val, target);
+    /* An erased generic value (an opaque pointer) landing in a slot the
+     * specialized body typed concretely (i32 for Box<int>) must be narrowed,
+     * or the store writes eight bytes into a four-byte slot and clobbers its
+     * stack neighbour. */
+    if (target && LLVMTypeOf(val) != target &&
+        LLVMGetTypeKind(LLVMTypeOf(val)) == LLVMPointerTypeKind &&
+        (LLVMGetTypeKind(target) == LLVMIntegerTypeKind ||
+         LLVMGetTypeKind(target) == LLVMFloatTypeKind ||
+         LLVMGetTypeKind(target) == LLVMDoubleTypeKind))
+        val = emit_boundary_coerce(g, val, target);
     return LLVMBuildStore(g->builder, val, ptr);
 }
 

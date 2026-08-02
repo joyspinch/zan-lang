@@ -798,6 +798,13 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                     /* e.g. `return null` (i8*) from a method returning a
                      * concrete class pointer, or vice versa */
                     val = LLVMBuildBitCast(g->builder, val, fn_ret, "retcast");
+                } else if (LLVMGetTypeKind(fn_ret) == LLVMPointerTypeKind ||
+                           LLVMGetTypeKind(val_t) == LLVMPointerTypeKind) {
+                    /* A specialized generic body computes a T-typed value in
+                     * its concrete form (i32 for Queue<int>) while the
+                     * signature keeps the erased pointer form; the caller
+                     * coerces back. */
+                    val = emit_boundary_coerce(g, val, fn_ret);
                 }
             }
             LLVMBuildRet(g->builder, val);
