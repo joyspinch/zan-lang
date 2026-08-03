@@ -1,0 +1,299 @@
+using System;
+
+namespace System.Windows.Clipboard;
+
+/// <summary>
+/// Clipboard format constants (winuser.h).
+/// </summary>
+class ClipFormat {
+    static int Text() { return 1; }        // CF_TEXT
+    static int Bitmap() { return 2; }      // CF_BITMAP
+    static int UnicodeText() { return 13; }   // CF_UNICODETEXT
+    static int Hdrop() { return 15; }      // CF_HDROP (file list)
+    static int Html() { return 0x0D01; }   // "HTML Format" registered id
+    static int Rtf() { return 0x0D02; }    // "Rich Text Format" registered id
+}
+
+/// <summary>
+/// Clipboard access: Unicode text, file lists (CF_HDROP), format probing and
+/// enumeration. Windows-only; other platforms throw
+/// PlatformNotSupportedException.
+///
+///   if (Clipboard.HasText()) {
+///       string t = Clipboard.GetText();
+///   }
+///   Clipboard.SetText("hello");
+///   Clipboard.SetFiles(paths);          // Explorer sees a real file drop
+///   List<string> files = Clipboard.GetFiles();
+/// </summary>
+class Clipboard {
+    #if WINDOWS
+    [DllImport("user32", EntryPoint = "OpenClipboard")]
+    static extern int WinOpenClipboard(nint hwnd);
+
+    [DllImport("user32", EntryPoint = "CloseClipboard")]
+    static extern int WinCloseClipboard();
+
+    [DllImport("user32", EntryPoint = "EmptyClipboard")]
+    static extern int WinEmptyClipboard();
+
+    [DllImport("user32", EntryPoint = "SetClipboardData")]
+    static extern nint WinSetClipboardData(int format, nint mem);
+
+    [DllImport("user32", EntryPoint = "GetClipboardData")]
+    static extern nint WinGetClipboardData(int format);
+
+    [DllImport("user32", EntryPoint = "IsClipboardFormatAvailable")]
+    static extern int WinIsClipboardFormatAvailable(int format);
+
+    [DllImport("user32", EntryPoint = "CountClipboardFormats")]
+    static extern int WinCountClipboardFormats();
+
+    [DllImport("user32", EntryPoint = "EnumClipboardFormats")]
+    static extern int WinEnumClipboardFormats(int last);
+
+    [DllImport("user32", EntryPoint = "RegisterClipboardFormatW")]
+    static extern int WinRegisterClipboardFormat(nint name);
+
+    [DllImport("user32", EntryPoint = "GetClipboardFormatNameW")]
+    static extern int WinGetClipboardFormatName(int format, nint buf, int size);
+
+    [DllImport("kernel32", EntryPoint = "GlobalAlloc")]
+    static extern nint WinGlobalAlloc(int flags, int bytes);
+
+    [DllImport("kernel32", EntryPoint = "GlobalLock")]
+    static extern nint WinGlobalLock(nint mem);
+
+    [DllImport("kernel32", EntryPoint = "GlobalUnlock")]
+    static extern int WinGlobalUnlock(nint mem);
+
+    [DllImport("kernel32", EntryPoint = "GlobalFree")]
+    static extern nint WinGlobalFree(nint mem);
+
+    [DllImport("shell32", EntryPoint = "DragQueryFileW")]
+    static extern int WinDragQueryFileW(nint hdrop, int index, nint buf, int size);
+
+    [DllImport("shell32", EntryPoint = "DragFinish")]
+    static extern void WinDragFinish(nint hdrop);
+    #endif
+
+    /// True when unicode text is on the clipboard.
+    static bool HasText() {
+        #if WINDOWS
+        return Clipboard.WinIsClipboardFormatAvailable(13) != 0;
+        #else
+        throw new PlatformNotSupportedException(
+            "Clipboard is not implemented on this platform");
+        #endif
+    }
+
+    /// True when a file list (CF_HDROP) is on the clipboard.
+    static bool HasFiles() {
+        #if WINDOWS
+        return Clipboard.WinIsClipboardFormatAvailable(15) != 0;
+        #else
+        throw new PlatformNotSupportedException(
+            "Clipboard is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>Reads unicode text; "" when unavailable.</summary>
+    static string GetText() {
+        #if WINDOWS
+        if (Clipboard.WinIsClipboardFormatAvailable(13) == 0) { return ""; }
+        if (Clipboard.WinOpenClipboard(0) == 0) { return ""; }
+        nint handle = Clipboard.WinGetClipboardData(13);
+        string s = "";
+        if (handle != 0) {
+            nint text = Clipboard.WinGlobalLock(handle);
+            if (text != 0) {
+                s = Wide.Read(text);
+                Clipboard.WinGlobalUnlock(handle);
+            }
+        }
+        Clipboard.WinCloseClipboard();
+        return s;
+        #else
+        throw new PlatformNotSupportedException(
+            "Clipboard is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>Places unicode text on the clipboard. True on success.</summary>
+    static bool SetText(string text) {
+        #if WINDOWS
+        nint wide = Wide.Of(text);
+        int units = Wide.Length(wide);
+        nint mem = Clipboard.WinGlobalAlloc(2 /*GMEM_MOVEABLE*/, (units + 1) * 2);
+        if (mem == 0) { Wide.Free(wide); return false; }
+        nint dst = Clipboard.WinGlobalLock(mem);
+        if (dst == 0) {
+            Clipboard.WinGlobalFree(mem);
+            Wide.Free(wide);
+            return false;
+        }
+        NativeMemory.Copy(dst, wide, (units + 1) * 2);
+        Clipboard.WinGlobalUnlock(mem);
+        Wide.Free(wide);
+        if (Clipboard.WinOpenClipboard(0) == 0) {
+            Clipboard.WinGlobalFree(mem);
+            return false;
+        }
+        Clipboard.WinEmptyClipboard();
+        nint ok = Clipboard.WinSetClipboardData(13, mem);   // CF_UNICODETEXT
+        Clipboard.WinCloseClipboard();
+        if (ok == 0) {
+            Clipboard.WinGlobalFree(mem);
+            return false;
+        }
+        return true;
+        #else
+        throw new PlatformNotSupportedException(
+            "Clipboard is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>Empties the clipboard.</summary>
+    static void Clear() {
+        #if WINDOWS
+        if (Clipboard.WinOpenClipboard(0) != 0) {
+            Clipboard.WinEmptyClipboard();
+            Clipboard.WinCloseClipboard();
+        }
+        #else
+        throw new PlatformNotSupportedException(
+            "Clipboard is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>Places a file list (CF_HDROP) on the clipboard. True on
+    /// success.</summary>
+    static bool SetFiles(List<string> paths) {
+        #if WINDOWS
+        // DROPFILES: pFiles(4) pt(8) fNC(4) fWide(4) = 20 bytes, then the
+        // UTF-16 file list, each NUL-terminated, double-NUL at the end.
+        int total = 20;
+        int i = 0;
+        while (i < paths.Count) {
+            nint w = Wide.Of(paths[i]);
+            total = total + (Wide.Length(w) + 1) * 2;
+            Wide.Free(w);
+            i = i + 1;
+        }
+        total = total + 2;   // final double NUL
+        nint mem = Clipboard.WinGlobalAlloc(2, total);
+        if (mem == 0) { return false; }
+        nint dst = Clipboard.WinGlobalLock(mem);
+        if (dst == 0) {
+            Clipboard.WinGlobalFree(mem);
+            return false;
+        }
+        new Span<int>(dst, 1)[0] = 20;        // DROPFILES.pFiles
+        new Span<int>(dst + 16, 1)[0] = 1;    // DROPFILES.fWide = TRUE
+        int offset = 20;
+        i = 0;
+        while (i < paths.Count) {
+            nint w = Wide.Of(paths[i]);
+            int units = Wide.Length(w);
+            NativeMemory.Copy(dst + offset, w, (units + 1) * 2);
+            Wide.Free(w);
+            offset = offset + (units + 1) * 2;
+            i = i + 1;
+        }
+        new Span<ushort>(dst + offset, 1)[0] = 0;   // final double NUL
+        Clipboard.WinGlobalUnlock(mem);
+        if (Clipboard.WinOpenClipboard(0) == 0) {
+            Clipboard.WinGlobalFree(mem);
+            return false;
+        }
+        Clipboard.WinEmptyClipboard();
+        nint ok = Clipboard.WinSetClipboardData(15, mem);   // CF_HDROP
+        Clipboard.WinCloseClipboard();
+        if (ok == 0) {
+            Clipboard.WinGlobalFree(mem);
+            return false;
+        }
+        return true;
+        #else
+        throw new PlatformNotSupportedException(
+            "Clipboard is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>Reads the file list (CF_HDROP); empty when unavailable.</summary>
+    static List<string> GetFiles() {
+        List<string> list = new List<string>();
+        #if WINDOWS
+        if (Clipboard.WinIsClipboardFormatAvailable(15) == 0) { return list; }
+        if (Clipboard.WinOpenClipboard(0) == 0) { return list; }
+        nint hdrop = Clipboard.WinGetClipboardData(15);
+        if (hdrop != 0) {
+            int count = Clipboard.WinDragQueryFileW(hdrop, 0xFFFFFFFF, 0, 0);
+            int i = 0;
+            while (i < count) {
+                int len = Clipboard.WinDragQueryFileW(hdrop, i, 0, 0);
+                nint buf = NativeMemory.Alloc((len + 1) * 2 + 2);
+                Clipboard.WinDragQueryFileW(hdrop, i, buf, len + 1);
+                list.Add(Wide.Read(buf));
+                NativeMemory.Free(buf);
+                i = i + 1;
+            }
+        }
+        Clipboard.WinCloseClipboard();
+        #else
+        throw new PlatformNotSupportedException(
+            "Clipboard is not implemented on this platform");
+        #endif
+        return list;
+    }
+
+    /// <summary>Numeric ids of every format currently on the clipboard
+    /// (including registered custom formats), in enumeration order.</summary>
+    static List<int> Formats() {
+        List<int> list = new List<int>();
+        #if WINDOWS
+        if (Clipboard.WinOpenClipboard(0) == 0) { return list; }
+        int fmt = 0;
+        bool done = false;
+        while (!done) {
+            fmt = Clipboard.WinEnumClipboardFormats(fmt);
+            if (fmt == 0) { done = true; }
+            else { list.Add(fmt); }
+        }
+        Clipboard.WinCloseClipboard();
+        #else
+        throw new PlatformNotSupportedException(
+            "Clipboard is not implemented on this platform");
+        #endif
+        return list;
+    }
+
+    /// <summary>Registers (or looks up) a custom format name. The returned
+    /// id is stable for the process lifetime.</summary>
+    static int RegisterFormat(string name) {
+        #if WINDOWS
+        nint w = Wide.Of(name);
+        int id = Clipboard.WinRegisterClipboardFormat(w);
+        Wide.Free(w);
+        return id;
+        #else
+        throw new PlatformNotSupportedException(
+            "Clipboard is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>Name of a (registered) format id, "" for the built-ins.</summary>
+    static string FormatName(int format) {
+        #if WINDOWS
+        nint buf = NativeMemory.Alloc(512 * 2 + 2);
+        int n = Clipboard.WinGetClipboardFormatName(format, buf, 512);
+        string s = "";
+        if (n > 0) { s = Wide.Read(buf); }
+        NativeMemory.Free(buf);
+        return s;
+        #else
+        throw new PlatformNotSupportedException(
+            "Clipboard is not implemented on this platform");
+        #endif
+    }
+}
