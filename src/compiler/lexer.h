@@ -18,6 +18,9 @@ typedef struct {
 struct zan_token {
     zan_token_kind_t kind;
     zan_loc_t loc;
+    /* Integer literal suffix encoding (TK_INT_LIT only): 0=none, 1=L/l
+     * (long), 2=U/u (uint), 3=UL/LU in either case (ulong). */
+    int lit_suffix;
     union {
         int64_t int_val;
         double float_val;

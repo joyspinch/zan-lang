@@ -1059,7 +1059,13 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                                     LLVMDoubleTypeInContext(g->ctx), "ext");
                             }
                         } else {
-                            fmt = LLVMBuildGlobalStringPtr(g->builder, "%lld", "itoa_fmt");
+                            /* signed by default; a ulong argument must print
+                             * with %llu or values >= 2^63 come out negative. */
+                            bool is_ul = expr_is_ulong(
+                                g, expr->call.args.items[0], locals);
+                            fmt = is_ul
+                                ? LLVMBuildGlobalStringPtr(g->builder, "%llu", "utoa_fmt")
+                                : LLVMBuildGlobalStringPtr(g->builder, "%lld", "itoa_fmt");
                             num_arg = emit_widen_i64_for_print(g, arg);
                         }
                         LLVMValueRef sn_args[] = { buf, LLVMConstInt(i64, 32, 0), fmt, num_arg };
@@ -2900,6 +2906,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                         LLVMValueRef val_v = emit_expr(g, expr->call.args.items[1], locals);
                         emit_dict_value_set(g, dict_type, raw, key_val, val_v,
                             expr->call.args.items[0], expr->call.args.items[1], locals);
+                        emit_release_owned_call_temp(g, callee_d->member.object, raw, locals);
                         return LLVMConstInt(i32t, 0, 0);
                     }
 
@@ -2908,6 +2915,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                         LLVMValueRef found = emit_dict_find(g, dict_type, raw, search);
                         LLVMValueRef hit = zan_icmp(g->builder, LLVMIntSGE, found,
                             LLVMConstInt(i64, 0, 0), "ckhit");
+                        emit_release_owned_call_temp(g, callee_d->member.object, raw, locals);
                         return LLVMBuildZExt(g->builder, hit, i32t, "ckres");
                     }
                     if (mname.len == 11 && memcmp(mname.str, "TryGetValue", 11) == 0 && expr->call.args.count == 2) {
@@ -2954,6 +2962,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                         LLVMBuildStore(g->builder, LLVMConstInt(i32t, 0, 0), res_a);
                         LLVMBuildBr(g->builder, done_bb);
                         LLVMPositionBuilderAtEnd(g->builder, done_bb);
+                        emit_release_owned_call_temp(g, callee_d->member.object, raw, locals);
                         return LLVMBuildLoad2(g->builder, i32t, res_a, "tgv.out");
                     }
                     if (mname.len == 5 && memcmp(mname.str, "Clear", 5) == 0 && expr->call.args.count == 0) {
@@ -2994,6 +3003,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                         LLVMBuildStore(g->builder, LLVMConstInt(i64, 0, 0),
                             LLVMBuildStructGEP2(g->builder, g->dict_struct_type,
                                 dp, 5, "icapp"));
+                        emit_release_owned_call_temp(g, callee_d->member.object, raw, locals);
                         return LLVMConstInt(i32t, 0, 0);
                     }
                 }
@@ -3127,6 +3137,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                         LLVMBuildStore(g->builder, ni, idx_a);
                         LLVMBuildBr(g->builder, cond_bb);
                         LLVMPositionBuilderAtEnd(g->builder, done_bb);
+                        emit_release_owned_call_temp(g, callee_d->member.object, raw, locals);
                         return LLVMConstInt(i32t, 0, 0);
             }
         }

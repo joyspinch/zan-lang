@@ -412,6 +412,7 @@ static zan_ast_node_t *parse_primary(zan_parser_t *p) {
         parser_advance(p);
         zan_ast_node_t *n = zan_ast_new(p->arena, AST_INT_LITERAL, loc);
         n->int_val = p->previous.int_val;
+        n->lit_suffix = p->previous.lit_suffix;
         return n;
     }
     case TK_FLOAT_LIT: {

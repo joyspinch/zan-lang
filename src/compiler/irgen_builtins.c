@@ -1953,6 +1953,20 @@ static LLVMValueRef get_static_field_global(zan_irgen_t *g, zan_symbol_t *class_
     gv = LLVMAddGlobal(g->mod, ft, name);
     LLVMSetLinkage(gv, LLVMInternalLinkage);
     LLVMSetInitializer(gv, LLVMConstNull(ft));
+    /* Register rc-managed static fields for program-exit cleanup: the
+     * main-unit sweep below can only see the unit containing main(), but
+     * stdlib singletons (Pinyin.cache, ...) live in other units. */
+    if (fsym->type && is_rc_managed_type(fsym->type)) {
+        if (g->static_field_count >= g->static_field_cap) {
+            g->static_field_cap = g->static_field_cap ? g->static_field_cap * 2 : 16;
+            g->static_fields = (struct zan_static_field_ref *)realloc(
+                g->static_fields,
+                (size_t)g->static_field_cap * sizeof(*g->static_fields));
+        }
+        g->static_fields[g->static_field_count].type = fsym->type;
+        g->static_fields[g->static_field_count].gv = gv;
+        g->static_field_count++;
+    }
     return gv;
 }
 

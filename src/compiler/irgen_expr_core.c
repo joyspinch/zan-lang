@@ -992,11 +992,24 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
      * needs them to reach a type at all. */
     case AST_INT_LITERAL:
         /* Value-based type: literals outside i32 are `long`, so assigning one
-         * to an `int` target is a real narrowing (ZAN_WARN_NARROW). */
+         * to an `int` target is a real narrowing (ZAN_WARN_NARROW). A suffix
+         * pins the type regardless of value: L/l -> long, U/u -> uint (ulong
+         * when the value overflows uint), UL/LU -> ulong. */
         if (!g->binder) return NULL;
-        if (e->int_val < -2147483648LL || e->int_val > 2147483647LL)
+        switch (e->lit_suffix) {
+        case 1:
             return g->binder->type_long;
-        return g->binder->type_int;
+        case 2:
+            if (e->int_val < 0 || e->int_val > 4294967295LL)
+                return g->binder->type_ulong;
+            return g->binder->type_uint;
+        case 3:
+            return g->binder->type_ulong;
+        default:
+            if (e->int_val < -2147483648LL || e->int_val > 2147483647LL)
+                return g->binder->type_long;
+            return g->binder->type_int;
+        }
     case AST_FLOAT_LITERAL:
         return g->binder ? g->binder->type_double : NULL;
     case AST_CHAR_LITERAL:

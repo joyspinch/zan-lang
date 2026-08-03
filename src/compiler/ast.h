@@ -111,6 +111,10 @@ struct zan_ast_node {
     zan_ast_kind_t kind;
     zan_loc_t loc;
 
+    /* Integer literal suffix (AST_INT_LITERAL only): 0=none, 1=L/l (long),
+     * 2=U/u (uint), 3=UL/LU in either case (ulong). */
+    int lit_suffix;
+
     /* [Attr(...)] usages attached to a declaration; empty list if none. */
     zan_ast_list_t attributes;
 

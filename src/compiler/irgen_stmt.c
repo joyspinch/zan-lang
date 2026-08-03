@@ -2088,29 +2088,21 @@ throw_unwind:
 /* Release every RC-managed static field into its backing global at program
  * exit, so long-lived singletons held in static fields do not leak. Mirrors
  * the static-field initializer pass at main() entry. Runs before the leak
- * report (which is scheduled via atexit and therefore fires afterwards). */
+ * report (which is scheduled via atexit and therefore fires afterwards).
+ *
+ * The sweep walks the registry built by get_static_field_global rather than
+ * the compilation unit passed in: that unit only contains main()'s own
+ * declarations, while stdlib singletons (Pinyin.cache, ...) are compiled into
+ * separate units whose static fields would otherwise stay alive. */
 static void emit_release_static_rc_fields(zan_irgen_t *g, zan_ast_node_t *unit) {
-    if (!unit || unit->kind != AST_COMPILATION_UNIT) return;
-    zan_symbol_t *saved_type = g->current_type_sym;
-    for (int di = 0; di < unit->comp_unit.decls.count; di++) {
-        zan_ast_node_t *d = unit->comp_unit.decls.items[di];
-        if (d->kind != AST_CLASS_DECL && d->kind != AST_STRUCT_DECL) continue;
-        zan_symbol_t *csym = zan_binder_lookup(g->binder, d->type_decl.name);
-        if (!csym) continue;
-        g->current_type_sym = csym;
-        for (int mi = 0; mi < d->type_decl.members.count; mi++) {
-            zan_ast_node_t *m = d->type_decl.members.items[mi];
-            if (m->kind != AST_FIELD_DECL) continue;
-            if (!(m->field_decl.modifiers & MOD_STATIC)) continue;
-            zan_symbol_t *fs = get_field_sym(csym, m->field_decl.name);
-            if (!fs || !fs->type || !is_rc_managed_type(fs->type)) continue;
-            LLVMValueRef gv = get_static_field_global(g, csym, fs);
-            if (!gv) continue;
-            LLVMTypeRef ft = map_type(g, fs->type);
-            LLVMValueRef old = LLVMBuildLoad2(g->builder, ft, gv, "sf.rel");
-            emit_rc_release_for_type(g, fs->type, old);
-            zan_store_fit(g, LLVMConstNull(ft), gv);
-        }
+    (void)unit;
+    for (int i = 0; i < g->static_field_count; i++) {
+        zan_type_t *ft = g->static_fields[i].type;
+        if (!ft) continue;
+        LLVMValueRef gv = g->static_fields[i].gv;
+        LLVMTypeRef lt = map_type(g, ft);
+        LLVMValueRef old = LLVMBuildLoad2(g->builder, lt, gv, "sf.rel");
+        emit_rc_release_for_type(g, ft, old);
+        zan_store_fit(g, LLVMConstNull(lt), gv);
     }
-    g->current_type_sym = saved_type;
 }

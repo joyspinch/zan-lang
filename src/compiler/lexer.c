@@ -565,6 +565,26 @@ static zan_token_t lexer_ident_or_keyword(zan_lexer_t *lex) {
 
 /* ---- number literal ---- */
 
+/* Consume a C#-style integer literal suffix and return its encoding:
+ * 0=none, 1=L/l (long), 2=U/u (uint), 3=UL/LU in either case (ulong).
+ * Only one L and one U may appear, in either order. */
+static int lexer_int_suffix(zan_lexer_t *lex) {
+    int enc = 0;
+    char c = lexer_peek_ch(lex);
+    if (c == 'L' || c == 'l') {
+        enc |= 1;
+        lexer_advance(lex);
+        c = lexer_peek_ch(lex);
+        if (c == 'U' || c == 'u') { enc |= 2; lexer_advance(lex); }
+    } else if (c == 'U' || c == 'u') {
+        enc |= 2;
+        lexer_advance(lex);
+        c = lexer_peek_ch(lex);
+        if (c == 'L' || c == 'l') { enc |= 1; lexer_advance(lex); }
+    }
+    return enc;
+}
+
 static zan_token_t lexer_number(zan_lexer_t *lex) {
     zan_loc_t loc = lexer_loc(lex);
     size_t start = lex->pos;
@@ -585,11 +605,14 @@ static zan_token_t lexer_number(zan_lexer_t *lex) {
                 }
             }
             zan_token_t tok = lexer_make(lex, TK_INT_LIT, loc);
+            tok.lit_suffix = lexer_int_suffix(lex);
             /* parse hex value, ignoring underscores */
             char buf[64];
             size_t bi = 0;
             for (size_t i = start + 2; i < lex->pos && bi < 63; i++) {
-                if (lex->source[i] != '_') buf[bi++] = lex->source[i];
+                if (lex->source[i] != '_' && lex->source[i] != 'L'
+                    && lex->source[i] != 'l' && lex->source[i] != 'U'
+                    && lex->source[i] != 'u') buf[bi++] = lex->source[i];
             }
             buf[bi] = '\0';
             tok.int_val = (int64_t)strtoull(buf, NULL, 16);
@@ -607,10 +630,13 @@ static zan_token_t lexer_number(zan_lexer_t *lex) {
                 }
             }
             zan_token_t tok = lexer_make(lex, TK_INT_LIT, loc);
+            tok.lit_suffix = lexer_int_suffix(lex);
             char buf[128];
             size_t bi = 0;
             for (size_t i = start + 2; i < lex->pos && bi < 127; i++) {
-                if (lex->source[i] != '_') buf[bi++] = lex->source[i];
+                if (lex->source[i] != '_' && lex->source[i] != 'L'
+                    && lex->source[i] != 'l' && lex->source[i] != 'U'
+                    && lex->source[i] != 'u') buf[bi++] = lex->source[i];
             }
             buf[bi] = '\0';
             tok.int_val = (int64_t)strtoull(buf, NULL, 2);
@@ -628,10 +654,13 @@ static zan_token_t lexer_number(zan_lexer_t *lex) {
                 }
             }
             zan_token_t tok = lexer_make(lex, TK_INT_LIT, loc);
+            tok.lit_suffix = lexer_int_suffix(lex);
             char buf[64];
             size_t bi = 0;
             for (size_t i = start + 2; i < lex->pos && bi < 63; i++) {
-                if (lex->source[i] != '_') buf[bi++] = lex->source[i];
+                if (lex->source[i] != '_' && lex->source[i] != 'L'
+                    && lex->source[i] != 'l' && lex->source[i] != 'U'
+                    && lex->source[i] != 'u') buf[bi++] = lex->source[i];
             }
             buf[bi] = '\0';
             tok.int_val = (int64_t)strtoull(buf, NULL, 8);
@@ -682,12 +711,19 @@ static zan_token_t lexer_number(zan_lexer_t *lex) {
         lexer_advance(lex);
     }
 
-    /* build clean number string (no underscores) */
+    /* suffix: L/l (long), U/u (uint), UL/LU (ulong) — integer literals only */
+    int lit_suffix = 0;
+    if (!is_float) {
+        lit_suffix = lexer_int_suffix(lex);
+    }
+
+    /* build clean number string (no underscores, no suffixes) */
     char buf[128];
     size_t bi = 0;
     for (size_t i = start; i < lex->pos && bi < 127; i++) {
         char ch = lex->source[i];
-        if (ch != '_' && ch != 'f' && ch != 'F' && ch != 'm' && ch != 'M') {
+        if (ch != '_' && ch != 'f' && ch != 'F' && ch != 'm' && ch != 'M'
+            && ch != 'L' && ch != 'l' && ch != 'U' && ch != 'u') {
             buf[bi++] = ch;
         }
     }
@@ -699,6 +735,7 @@ static zan_token_t lexer_number(zan_lexer_t *lex) {
         return tok;
     } else {
         zan_token_t tok = lexer_make(lex, TK_INT_LIT, loc);
+        tok.lit_suffix = lit_suffix;
         /* Decimal literals above long.MaxValue are ulong in C#; strtoll would
          * clamp them to LLONG_MAX, so keep the unsigned bit pattern instead
          * (the hex/binary/octal paths already do). */

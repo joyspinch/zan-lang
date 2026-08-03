@@ -3106,3 +3106,58 @@ file_id=0，错误行号/源码行错乱显示成主文件。`gen_event_holder`�
 - `ctest --test-dir build -R "conformance_(events|delegate|record)"` 4/4 通过。
 - 全库无其他 `+= f(&var)` 同类模式（dbgen/routegen/jsongen 用结构体 buf，安全）。
 
+# A39 · 整型字面量后缀 L/l/U/u（2026-08-03，已完成）
+
+**背景**：`1L` 此前被解析成 `1` 后跟标识符 `L`，报 `expected ';', got 'IDENT'`，
+与 C# 语法不兼容（`Background.zan` 只能用 `((long)1) << 30` 的丑陋形状）。
+
+**实现**（编译器五段式）：
+1. `lexer.h` / `ast.h`：`zan_token` 与 `zan_ast_node` 增加 `lit_suffix` 字段存字面量后缀。
+2. `lexer.c`：十进制/十六进制/二进制/八进制整型字面量统一解析 `L/l/U/u` 及组合
+   （`ul`/`lu`/`UL`/`Lu` 等），非法组合报诊断。
+3. `parser.c`：把 token 的 `lit_suffix` 传给 AST 字面量节点。
+4. `checker.c` / `irgen_expr_core.c`：按后缀推断类型——`U`→`uint`、`L`→`long`、
+   `UL`→`ulong`，无后缀保持默认 `int`（超范围按原有规则升型）。
+5. `irgen_call.c`：`Convert.ToString(ulong)` 原用 `%lld` 使 ≥2^63 的值打印成负数，
+   按实参是否 `ulong` 改用 `%llu`。
+
+**配套**：`stdlib/System/Input/Background.zan` 的 `((long)1) << 30` 等改回自然写法
+`1L << 30`。新增 conformance `tests/conformance/int_literal_suffix.zan`：
+`1L/1U/1UL`、十六/二/八进制后缀、`ulong` 打印边界值（`18446744073709551615`）。
+
+**验证**：`ctest --test-dir build -R "int_literal_suffix"` 通过（conformance +
+determinism + leakcheck 三档），`suffix-ok: 1`。
+
+# A40 · 静态字段跨编译单元泄漏：Pinyin.cache 与 Dict 方法 receiver（2026-08-03，已完成）
+
+**现象**：`leakcheck_tryget_pinyin` 报 `1 object(s) leaked, allocated at
+Pinyin.zan:78:40 [Dictionary<Dict>]`，且泄漏量达 13527 个对象（整张拼音表的键值对）。
+
+**根因**（两层）：
+1. **静态字段释放只扫主单元**：`emit_release_static_rc_fields` 遍历的是含 `main()`
+   的编译单元声明，stdlib 各模块（`Pinyin.zan` 等）编成独立单元，其 `static`
+   RC 字段（`Pinyin.cache`）从未在退出时释放。探针 `_scratch/static_leak_{a,b,c}.zan`
+   证实：静态初始化器路径不泄漏、方法内赋值路径泄漏。
+2. **Dict 方法/属性缺 owned receiver 释放**：`dictFactory.Get().TryGetValue(...)`、
+   `.Add(...)`、`.ContainsKey(...)`、`.Clear()`、`.Remove(...)` 五个方法分支和
+   `Dict.Count` 属性分支，对"方法调用返回的 owned 字典"没有 `emit_release_owned_call_temp`，
+   而 `List.Count` / `String.Length` / `StringBuilder.Length` / `Dict.Keys` / `Dict.Values`
+   都有——`Pinyin.Table().TryGetValue(...)` 每查一次多 retain 一次，静态字段里的字典
+   引用计数虚高，退出释放后仍"可达"。
+
+**修复**：
+1. `irgen_builtins.c`：`get_static_field_global` 创建 backing global 时把
+   `is_rc_managed_type` 的静态字段登记进 `g->static_fields` 注册表（`irgen.h` 新增
+   字段，`irgen.c` destroy 释放数组）。
+2. `irgen_stmt.c`：`emit_release_static_rc_fields` 改走注册表，覆盖全部编译单元。
+3. `irgen_expr.c`：`Dict.Count` 补 `emit_release_owned_call_temp`。
+4. `irgen_call.c`：`Dict.Add/ContainsKey/TryGetValue/Clear/Remove` 五个分支补
+   receiver 释放。
+
+**验证**：
+- `leakcheck_tryget_pinyin` 通过（基线 13527 对象泄漏 → 0）。
+- `ctest --test-dir build -R "tryget_pinyin|int_literal|leakcheck_generic"` 23/23 通过。
+- 全量 `leakcheck*` 279 例中 8 个失败均为基线预存（`field_decl_initializers`
+  0xC0000005 崩溃、`type_test_ops`/`firebird_wire`/`http_*`/`sdk_jd_*` 泄漏、
+  `sqlserver_tds` 超时），stash 对比确认与本次改动无关。
+

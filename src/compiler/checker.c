@@ -138,12 +138,25 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
 
     switch (expr->kind) {
     case AST_INT_LITERAL:
-        /* Type an integer literal by its value so it agrees with IRGen and so
-         * a narrowing target (`int x = 0xFFFFFFFF`) is diagnosable: a value
-         * outside i32 is `long`. */
-        if (expr->int_val < -2147483648LL || expr->int_val > 2147483647LL)
+        /* Type an integer literal by its value (and suffix) so it agrees with
+         * IRGen and so a narrowing target (`int x = 0xFFFFFFFF`) is
+         * diagnosable: a value outside i32 is `long`. A suffix pins the type:
+         * L/l -> long, U/u -> uint (ulong when the value overflows uint),
+         * UL/LU -> ulong. */
+        switch (expr->lit_suffix) {
+        case 1:
             return c->binder->type_long;
-        return c->binder->type_int;
+        case 2:
+            if (expr->int_val < 0 || expr->int_val > 4294967295LL)
+                return c->binder->type_ulong;
+            return c->binder->type_uint;
+        case 3:
+            return c->binder->type_ulong;
+        default:
+            if (expr->int_val < -2147483648LL || expr->int_val > 2147483647LL)
+                return c->binder->type_long;
+            return c->binder->type_int;
+        }
     case AST_FLOAT_LITERAL:
         return c->binder->type_double;
     case AST_STRING_LITERAL:

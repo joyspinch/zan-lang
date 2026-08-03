@@ -1725,6 +1725,9 @@ void zan_irgen_destroy(zan_irgen_t *g) {
     free(g->method_specs);
     g->method_specs = NULL;
     g->method_spec_count = g->method_spec_cap = g->method_spec_emitted = 0;
+    free(g->static_fields);
+    g->static_fields = NULL;
+    g->static_field_count = g->static_field_cap = 0;
     g->cur_mtps = NULL;
     g->cur_mbind = NULL;
 }

@@ -258,6 +258,16 @@ struct zan_irgen {
     LLVMTypeRef  exit_type;
     LLVMValueRef fn_atexit;       /* int atexit(void(*)(void)) */
     LLVMTypeRef  atexit_type;
+    /* RC-managed static fields, registered as their backing globals are
+     * created, so program-exit cleanup can release them across EVERY
+     * compilation unit — the unit containing main() only sees its own
+     * declarations, and stdlib singletons (Pinyin.cache, ...) would leak. */
+    struct zan_static_field_ref {
+        zan_type_t   *type;  /* the field's declared (rc-managed) type */
+        LLVMValueRef  gv;    /* backing global */
+    } *static_fields;
+    int static_field_count;
+    int static_field_cap;
     LLVMValueRef g_live;          /* i64 global: net live ARC allocations */
     LLVMValueRef g_site_live;     /* [N x i64] global: live count per alloc site */
     LLVMValueRef g_site_names;    /* [N x i8*] global: "file:line:col" per site */

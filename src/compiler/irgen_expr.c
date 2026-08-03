@@ -2312,7 +2312,11 @@ static LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr
             }
         }
 
-        /* Dict.Count — return number of entries (locals and fields alike) */
+        /* Dict.Count — return number of entries (locals and fields alike).
+         * An owned receiver temp (`dictFactory.Get().Count`) is consumed by
+         * the read and must be released, exactly as List.Count does below;
+         * without it a method returning the dict retained one reference per
+         * count read. */
         if (expr->member.name.len == 5 && memcmp(expr->member.name.str, "Count", 5) == 0) {
             zan_type_t *dt = infer_expr_type(g, expr->member.object, locals);
             if (dt && dt->name.len == 4 && memcmp(dt->name.str, "Dict", 4) == 0) {
@@ -2322,7 +2326,9 @@ static LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr
                 LLVMValueRef dp = LLVMBuildBitCast(g->builder, raw,
                     LLVMPointerType(g->dict_struct_type, 0), "dp");
                 LLVMValueRef cntp = LLVMBuildStructGEP2(g->builder, g->dict_struct_type, dp, 0, "cntp");
-                return LLVMBuildLoad2(g->builder, i64, cntp, "dcnt");
+                LLVMValueRef cnt = LLVMBuildLoad2(g->builder, i64, cntp, "dcnt");
+                emit_release_owned_call_temp(g, expr->member.object, raw, locals);
+                return cnt;
             }
         }
 
