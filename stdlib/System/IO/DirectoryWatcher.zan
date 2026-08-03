@@ -1,0 +1,141 @@
+using System;
+using System.IO;
+using System.Threading;
+
+namespace System.IO;
+
+/// <summary>File system change kinds reported by <see cref="DirectoryWatcher"/>.</summary>
+class FileChange {
+    static int Added() { return 1; }
+    static int Removed() { return 2; }
+    static int Modified() { return 3; }
+}
+
+/// <summary>Change callback for <see cref="DirectoryWatcher.Watch"/>:
+/// entry name plus a <see cref="FileChange"/> kind.</summary>
+delegate void FileChangeFn(string name, int change);
+
+/// <summary>
+/// Watches a directory and reports file changes (added / removed / modified).
+/// A background thread polls the directory listing every ~250 ms and compares
+/// it with the previous snapshot by name + last-write time, so it works the
+/// same on every platform (no ReadDirectoryChangesW / inotify plumbing) at
+/// the cost of up to ~250 ms latency. Subdirectories are not recursed.
+///
+///   DirectoryWatcher.Watch("C:\\data", OnChange);
+///   ...
+///   DirectoryWatcher.Stop();
+///
+/// The callback receives the entry name and a <see cref="FileChange"/> kind,
+/// and must be non-capturing.
+/// </summary>
+class DirectoryWatcher {
+    static List<string> lastNames = new List<string>();
+    static List<long> lastTimes = new List<long>();
+    static List<long> lastSizes = new List<long>();
+    static bool watching = false;
+
+    /// <summary>Starts watching `path`. Returns false when the directory
+    /// does not exist or a watcher is already running.</summary>
+    static bool Watch(string path, FileChangeFn callback) {
+        if (watching) { return false; }
+        if (!Directory.Exists(path)) { return false; }
+        DirectoryWatcher.dir = path;
+        DirectoryWatcher.cb = callback;
+        DirectoryWatcher.Snapshot(DirectoryWatcher.lastNames,
+            DirectoryWatcher.lastTimes, DirectoryWatcher.lastSizes);
+        watching = true;
+        return Thread.Start(DirectoryWatcher.Poll);
+    }
+
+    /// <summary>Stops watching. The current poll finishes; no further events
+    /// are delivered.</summary>
+    static void Stop() {
+        watching = false;
+    }
+
+    static void Poll() {
+        while (DirectoryWatcher.watching) {
+            Thread.Sleep(250);
+            List<string> names = new List<string>();
+            List<long> times = new List<long>();
+            List<long> sizes = new List<long>();
+            DirectoryWatcher.Snapshot(names, times, sizes);
+            DirectoryWatcher.Compare(names, times, sizes);
+            DirectoryWatcher.lastNames = names;
+            DirectoryWatcher.lastTimes = times;
+            DirectoryWatcher.lastSizes = sizes;
+        }
+    }
+
+    // Builds a sorted name + last-write-time + size snapshot. A file is
+    // "modified" when either its size or its (second-resolution) write time
+    // changes; a same-size rewrite within the same second is not detectable
+    // by polling -- the documented latency/accuracy trade-off.
+    static void Snapshot(List<string> names, List<long> times, List<long> sizes) {
+        List<string> files = Directory.GetFiles(DirectoryWatcher.dir);
+        int i = 0;
+        while (i < files.Count) {
+            // GetFiles returns bare entry names; join the watched directory
+            // so the stat calls read the right file.
+            string full = Path.Combine(DirectoryWatcher.dir, files[i]);
+            names.Add(files[i]);
+            times.Add(FileInfo.GetLastWriteTime(full));
+            sizes.Add(FileInfo.GetLength(full));
+            i = i + 1;
+        }
+        // Sort all three lists by name so comparison is a linear merge.
+        int k = 1;
+        while (k < names.Count) {
+            string key = names[k];
+            long tkey = times[k];
+            long skey = sizes[k];
+            int j = k - 1;
+            while (j >= 0 && names[j].CompareTo(key) > 0) {
+                names[j + 1] = names[j];
+                times[j + 1] = times[j];
+                sizes[j + 1] = sizes[j];
+                j = j - 1;
+            }
+            names[j + 1] = key;
+            times[j + 1] = tkey;
+            sizes[j + 1] = skey;
+            k = k + 1;
+        }
+    }
+
+    // Merge previous vs current snapshots, firing callbacks for deltas.
+    static void Compare(List<string> curNames, List<long> curTimes, List<long> curSizes) {
+        int i = 0;   // index into previous
+        int j = 0;   // index into current
+        while (i < DirectoryWatcher.lastNames.Count || j < curNames.Count) {
+            if (i >= DirectoryWatcher.lastNames.Count) {
+                DirectoryWatcher.cb(curNames[j], FileChange.Added());
+                j = j + 1;
+            } else if (j >= curNames.Count) {
+                DirectoryWatcher.cb(DirectoryWatcher.lastNames[i], FileChange.Removed());
+                i = i + 1;
+            } else {
+                int cmp = DirectoryWatcher.lastNames[i].CompareTo(curNames[j]);
+                if (cmp < 0) {
+                    DirectoryWatcher.cb(DirectoryWatcher.lastNames[i], FileChange.Removed());
+                    i = i + 1;
+                } else if (cmp > 0) {
+                    DirectoryWatcher.cb(curNames[j], FileChange.Added());
+                    j = j + 1;
+                } else {
+                    if (DirectoryWatcher.lastTimes[i] != curTimes[j]
+                        || DirectoryWatcher.lastSizes[i] != curSizes[j]) {
+                        DirectoryWatcher.cb(curNames[j], FileChange.Modified());
+                    }
+                    i = i + 1;
+                    j = j + 1;
+                }
+            }
+        }
+    }
+
+    static string dir = "";
+    static FileChangeFn cb;
+}
+

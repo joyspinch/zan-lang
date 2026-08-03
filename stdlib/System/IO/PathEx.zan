@@ -1,0 +1,201 @@
+using System;
+
+namespace System.IO;
+
+/// <summary>
+/// Path helpers beyond the basics: glob matching (<c>*</c>, <c>?</c>,
+/// <c>**</c>), relative-path resolution, and canonical clean-up of
+/// <c>.</c>/<c>..</c> segments. Pure string logic, platform-agnostic.
+///
+///   bool hit = PathEx.IsMatch("src/**/*.zan", "src/a/b/c.zan");   // true
+///   string rel = PathEx.GetRelativePath("C:\\a\\b", "C:\\a\\b\\c\\d.txt");
+/// </summary>
+class PathEx {
+    /// <summary>True when `path` matches the glob `pattern`. Both accept
+    /// `/` or `\` separators. <c>*</c> matches within one segment,
+    /// <c>?</c> one character, <c>**</c> zero or more segments.</summary>
+    static bool IsMatch(string pattern, string path) {
+        List<string> pat = PathEx.SplitSegments(pattern);
+        List<string> pth = PathEx.SplitSegments(path);
+        return PathEx.MatchSegments(pat, 0, pth, 0);
+    }
+
+    /// <summary>True when `path` is a directory prefix of `dir` (or equal),
+    /// compared segment-wise case-insensitively on Windows.</summary>
+    static bool IsUnder(string dir, string path) {
+        List<string> a = PathEx.SplitSegments(dir);
+        List<string> b = PathEx.SplitSegments(path);
+        if (b.Count < a.Count) { return false; }
+        int i = 0;
+        while (i < a.Count) {
+            if (!PathEx.Same(a[i], b[i])) { return false; }
+            i = i + 1;
+        }
+        return true;
+    }
+
+    /// <summary>Removes <c>.</c> and resolves <c>..</c> segments
+    /// ("a/./b/../c" -> "a/c"). Leading <c>..</c> that cannot resolve are
+    /// kept. Separators are preserved as given in the input.</summary>
+    static string Clean(string path) {
+        string sep = "/";
+        if (PathEx.IndexOf(path, "\\", 0) >= 0) { sep = "\\"; }
+        bool rooted = path.Length > 0 && (path.Substring(0, 1) == "/"
+                                          || path.Substring(0, 1) == "\\"
+                                          || (path.Length > 1 && path.Substring(1, 1) == ":"));
+        List<string> segs = PathEx.SplitSegments(path);
+        List<string> outSegs = new List<string>();
+        int i = 0;
+        while (i < segs.Count) {
+            string seg = segs[i];
+            if (seg == "." || seg == "") {
+                // skip
+            } else if (seg == "..") {
+                if (outSegs.Count > 0 && outSegs[outSegs.Count - 1] != "..") {
+                    outSegs.RemoveAt(outSegs.Count - 1);
+                } else if (!rooted) {
+                    outSegs.Add("..");
+                }
+            } else {
+                outSegs.Add(seg);
+            }
+            i = i + 1;
+        }
+        StringBuilder sb = new StringBuilder();
+        i = 0;
+        while (i < outSegs.Count) {
+            if (i > 0) { sb.Append(sep); }
+            sb.Append(outSegs[i]);
+            i = i + 1;
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>Relative path from `from` (a directory) to `to` (a path
+    /// under or beside it). Both are split into segments; common prefixes
+    /// are dropped and the remainder is joined with "../" hops.
+    /// Windows drive letters are compared case-insensitively.</summary>
+    static string GetRelativePath(string from, string to) {
+        string sep = "/";
+        if (PathEx.IndexOf(from, "\\", 0) >= 0 || PathEx.IndexOf(to, "\\", 0) >= 0) {
+            sep = "\\";
+        }
+        List<string> a = PathEx.SplitSegments(from);
+        List<string> b = PathEx.SplitSegments(to);
+        int common = 0;
+        while (common < a.Count && common < b.Count && PathEx.Same(a[common], b[common])) {
+            common = common + 1;
+        }
+        List<string> parts = new List<string>();
+        int up = a.Count - common;
+        int k = 0;
+        while (k < up) {
+            parts.Add("..");
+            k = k + 1;
+        }
+        int j = common;
+        while (j < b.Count) {
+            parts.Add(b[j]);
+            j = j + 1;
+        }
+        if (parts.Count == 0) { return "."; }
+        StringBuilder sb = new StringBuilder();
+        k = 0;
+        while (k < parts.Count) {
+            if (k > 0) { sb.Append(sep); }
+            sb.Append(parts[k]);
+            k = k + 1;
+        }
+        return sb.ToString();
+    }
+
+    static bool MatchSegments(List<string> pat, int pi, List<string> pth, int ti) {
+        if (pi >= pat.Count) { return ti >= pth.Count; }
+        string p = pat[pi];
+        if (p == "**") {
+            // Zero or more segments; try consuming 0..remaining.
+            int k = 0;
+            while (ti + k <= pth.Count) {
+                if (PathEx.MatchSegments(pat, pi + 1, pth, ti + k)) { return true; }
+                k = k + 1;
+            }
+            return false;
+        }
+        if (ti >= pth.Count) { return false; }
+        if (!PathEx.SegmentMatch(p, pth[ti])) { return false; }
+        return PathEx.MatchSegments(pat, pi + 1, pth, ti + 1);
+    }
+
+    // One-segment wildcard match: '*' any run, '?' one char. Case-insensitive
+    // on Windows.
+    static bool SegmentMatch(string pattern, string segment) {
+        return PathEx.SegMatch(pattern, 0, segment, 0);
+    }
+
+    static bool SegMatch(string pat, int pi, string seg, int si) {
+        if (pi >= pat.Length) { return si >= seg.Length; }
+        string pc = pat.Substring(pi, 1);
+        if (pc == "*") {
+            // Collapse consecutive stars, then try any run length.
+            while (pi < pat.Length && pat.Substring(pi, 1) == "*") { pi = pi + 1; }
+            int k = 0;
+            while (si + k <= seg.Length) {
+                if (PathEx.SegMatch(pat, pi, seg, si + k)) { return true; }
+                k = k + 1;
+            }
+            return false;
+        }
+        if (si >= seg.Length) { return false; }
+        if (pc == "?") {
+            return PathEx.SegMatch(pat, pi + 1, seg, si + 1);
+        }
+        if (!PathEx.CharEqual(pc, seg.Substring(si, 1))) { return false; }
+        return PathEx.SegMatch(pat, pi + 1, seg, si + 1);
+    }
+
+    // Splits a path on '/' or '\' (empty segments kept for rooted paths).
+    static List<string> SplitSegments(string path) {
+        List<string> segs = new List<string>();
+        StringBuilder sb = new StringBuilder();
+        int i = 0;
+        while (i < path.Length) {
+            string ch = path.Substring(i, 1);
+            if (ch == "/" || ch == "\\") {
+                segs.Add(sb.ToString());
+                sb = new StringBuilder();
+            } else {
+                sb.Append(ch);
+            }
+            i = i + 1;
+        }
+        segs.Add(sb.ToString());
+        return segs;
+    }
+
+    static bool Same(string a, string b) {
+        #if WINDOWS
+        return a.ToLower() == b.ToLower();
+        #else
+        return a == b;
+        #endif
+    }
+
+    static bool CharEqual(string a, string b) {
+        #if WINDOWS
+        return a.ToLower() == b.ToLower();
+        #else
+        return a == b;
+        #endif
+    }
+
+    static int IndexOf(string hay, string needle, int from) {
+        int n = needle.Length;
+        int h = hay.Length;
+        int i = from;
+        while (i + n <= h) {
+            if (hay.Substring(i, n) == needle) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+}
