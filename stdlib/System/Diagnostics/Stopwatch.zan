@@ -1,0 +1,120 @@
+using System;
+
+namespace System.Diagnostics;
+
+/// <summary>
+/// High-resolution stopwatch. Uses QueryPerformanceCounter on Windows and
+/// clock_gettime(CLOCK_MONOTONIC) on POSIX -- both are immune to wall-clock
+/// changes (NTP sync, manual clock edits), so elapsed times stay correct.
+///
+///   Stopwatch sw = new Stopwatch();
+///   sw.Start();
+///   ... work ...
+///   sw.Stop();
+///   long ms = sw.ElapsedMilliseconds();
+/// </summary>
+class Stopwatch {
+    #if WINDOWS
+    [DllImport("kernel32", EntryPoint = "QueryPerformanceFrequency")]
+    static extern int PlatQueryPerformanceFrequency(nint freq);
+
+    [DllImport("kernel32", EntryPoint = "QueryPerformanceCounter")]
+    static extern int PlatQueryPerformanceCounter(nint count);
+    #else
+    [DllImport("crt", EntryPoint = "clock_gettime")]
+    static extern int PlatClockGettime(int clockId, nint timespec);
+    #endif
+
+    long startTicks;
+    long accumulated;   // ticks between Start and Stop, in frequency units
+    bool running;
+
+    /// <summary>Starts (or resumes) timing. Safe to call repeatedly.</summary>
+    static Stopwatch StartNew() {
+        Stopwatch sw = new Stopwatch();
+        sw.Start();
+        return sw;
+    }
+
+    /// <summary>Starts (or resumes) the stopwatch.</summary>
+    void Start() {
+        if (running) { return; }
+        running = true;
+        startTicks = Stopwatch.NowTicks();
+    }
+
+    /// <summary>Stops timing; elapsed time accumulates across Start/Stop pairs.</summary>
+    void Stop() {
+        if (!running) { return; }
+        accumulated = accumulated + Stopwatch.NowTicks() - startTicks;
+        running = false;
+    }
+
+    /// <summary>Resets the accumulated time (and stops if running).</summary>
+    void Reset() {
+        running = false;
+        accumulated = 0;
+    }
+
+    /// <summary>Restarts: reset to zero and start.</summary>
+    void Restart() {
+        Reset();
+        Start();
+    }
+
+    /// <summary>Total elapsed time in milliseconds (double precision).
+    /// The stopwatch may keep running; the current reading is included.</summary>
+    double ElapsedMilliseconds() {
+        return (double)ElapsedTicks() / (double)Stopwatch.Frequency() * 1000.0;
+    }
+
+    /// <summary>Total elapsed time in seconds (double precision).</summary>
+    double ElapsedSeconds() {
+        return (double)ElapsedTicks() / (double)Stopwatch.Frequency();
+    }
+
+    /// <summary>Elapsed time in raw frequency units (see <see cref="Frequency"/>).</summary>
+    long ElapsedTicks() {
+        long total = accumulated;
+        if (running) {
+            total = total + Stopwatch.NowTicks() - startTicks;
+        }
+        return total;
+    }
+
+    /// <summary>True while the stopwatch is running.</summary>
+    bool IsRunning() {
+        return running;
+    }
+
+    /// <summary>Ticks per second of the high-resolution clock.</summary>
+    static long Frequency() {
+        #if WINDOWS
+        nint buf = NativeMemory.Alloc(8);
+        PlatQueryPerformanceFrequency(buf);
+        long f = new Span<long>(buf, 1)[0];
+        NativeMemory.Free(buf);
+        return f;
+        #else
+        return 1000000000;   // clock_gettime is nanoseconds
+        #endif
+    }
+
+    /// <summary>Current monotonic clock reading, in frequency units.</summary>
+    static long NowTicks() {
+        #if WINDOWS
+        nint buf = NativeMemory.Alloc(8);
+        PlatQueryPerformanceCounter(buf);
+        long t = new Span<long>(buf, 1)[0];
+        NativeMemory.Free(buf);
+        return t;
+        #else
+        nint ts = NativeMemory.Alloc(16);
+        PlatClockGettime(1 /*CLOCK_MONOTONIC*/, ts);
+        Span<long> v = new Span<long>(ts, 2);
+        long ns = v[0] * 1000000000 + v[1];
+        NativeMemory.Free(ts);
+        return ns;
+        #endif
+    }
+}

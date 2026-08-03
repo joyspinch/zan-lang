@@ -1,0 +1,112 @@
+using System;
+using System.Diagnostics;
+
+namespace System.Threading;
+
+/// <summary>
+/// A simple periodic timer. <see cref="Start"/> registers the timer with a
+/// shared timer thread that wakes every ~10 ms and fires each due timer's
+/// callback; <see cref="Stop"/> unregisters it. A slow callback delays every
+/// other timer on the shared thread, so keep callbacks short or hand work
+/// off to another thread.
+///
+///   Timer t = new Timer(1000, () => { counter = counter + 1; });
+///   t.Start();
+///   ...
+///   t.Stop();
+/// </summary>
+class Timer {
+    int intervalMs;
+    ThreadStart callback;
+    bool running;
+    int tickCount;
+    long nextDue;   // monotonic ms (ServerMetrics.MonoMillis) of the next fire
+
+    /// Creates a timer that fires `callback` every `intervalMs` ms.
+    /// It does not start until <see cref="Start"/> is called.
+    Timer(int intervalMs, ThreadStart callback) {
+        this.intervalMs = intervalMs;
+        this.callback = callback;
+        this.running = false;
+        this.tickCount = 0;
+        this.nextDue = 0;
+    }
+
+    /// <summary>Starts the timer. No-op when already running.
+    /// Returns true when the timer is live.</summary>
+    bool Start() {
+        if (running) { return true; }
+        if (intervalMs < 1) { return false; }
+        running = true;
+        nextDue = Timer.Now() + intervalMs;
+        Timer.timers.Add(this);
+        if (!Timer.pumpRunning) {
+            Timer.pumpRunning = true;
+            Thread.Start(Timer.Pump);
+        }
+        return true;
+    }
+
+    /// <summary>Stops the timer and unregisters it. The in-flight tick (if
+    /// any) finishes; subsequent ticks do not fire. No-op when not running.</summary>
+    void Stop() {
+        if (!running) { return; }
+        running = false;
+        int i = 0;
+        while (i < Timer.timers.Count) {
+            if (Timer.timers[i] == this) {
+                Timer.timers.RemoveAt(i);
+                break;
+            }
+            i = i + 1;
+        }
+    }
+
+    /// <summary>Number of completed ticks since Start (or the last Reset).</summary>
+    int TickCount() {
+        return tickCount;
+    }
+
+    /// <summary>Resets the tick counter to zero.</summary>
+    void Reset() {
+        tickCount = 0;
+    }
+
+    /// True while the timer is live (between Start and Stop).
+    bool IsRunning() {
+        return running;
+    }
+
+    // Shared pump thread: every ~10 ms walk the registry and fire due timers.
+    // The walk goes backwards so a callback that stops/removes a timer (its
+    // own or another, at or after the current index) cannot skip entries.
+    static void Pump() {
+        while (Timer.HasWork()) {
+            Thread.Sleep(10);
+            long now = Timer.Now();
+            int i = Timer.timers.Count - 1;
+            while (i >= 0) {
+                Timer t = Timer.timers[i];
+                if (t.running && now >= t.nextDue) {
+                    t.nextDue = now + t.intervalMs;
+                    t.tickCount = t.tickCount + 1;
+                    t.callback();
+                }
+                i = i - 1;
+            }
+        }
+        Timer.pumpRunning = false;
+    }
+
+    // True while at least one timer remains registered.
+    static bool HasWork() {
+        return Timer.timers.Count > 0;
+    }
+
+    static long Now() {
+        return ServerMetrics.MonoMillis();
+    }
+
+    static List<Timer> timers = new List<Timer>();
+    static bool pumpRunning = false;
+}
