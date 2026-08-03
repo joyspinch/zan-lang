@@ -1,0 +1,739 @@
+using System;
+
+/// One member of the assistant team.
+///
+/// `next` is the role work flows to when this member's stage passes, which is
+/// what makes the pipeline a fixed chain instead of six agents guessing who
+/// goes next: 产品经理 -> 架构师 -> 开发者 -> 测试工程师 -> 代码审查员 ->
+/// 安全审计员 -> 产品经理. A member that finds a defect always sends it back
+/// to the developer (`AiTeam.FixOwner()`), never onward.
+class AiRole {
+    string id;
+    string en;
+    string zh;
+    string next;
+    string duty;
+    /// Palette slot for the member's Avatar tint, resolved against the theme
+    /// so the six members stay distinguishable in every skin.
+    int tint;
+
+    static AiRole Create(string id, string en, string zh, string next,
+            string duty, int tint) {
+        AiRole r = new AiRole();
+        r.id = id;
+        r.en = en;
+        r.zh = zh;
+        r.next = next;
+        r.duty = duty;
+        r.tint = tint;
+        return r;
+    }
+}
+
+/// One card on the team task board.
+///
+/// Replaces the flat `AiPlanStep` for team sessions: a task now has an owner
+/// and an acceptance criterion, because the whole point of the architect
+/// writing `accept` is that the tester verifies against it instead of
+/// inventing its own idea of "done".
+class AiTask {
+    string id;
+    string title;
+    string owner;
+    /// 0 todo, 1 acked, 2 doing, 3 blocked, 4 in review, 5 done.
+    int state;
+    int progress;
+    string accept;
+
+    static AiTask Create(string id, string title, string owner) {
+        AiTask t = new AiTask();
+        t.id = id;
+        t.title = title;
+        t.owner = owner;
+        t.state = 0;
+        t.progress = 0;
+        t.accept = "";
+        return t;
+    }
+}
+
+/// Where a team session is, so "继续" after a crash or a stopped run resumes
+/// the member that was mid-stage instead of restarting the whole pipeline at
+/// the product manager.
+class AiTeamState {
+    string activeAgent;
+    string activeTask;
+    /// True while a `question` is outstanding: the pipeline is parked and only
+    /// the user's answer may restart it.
+    bool awaitingUser;
+    /// The member whose question is waiting, so the answer routes back to it.
+    string askedBy;
+
+    static AiTeamState Create() {
+        AiTeamState s = new AiTeamState();
+        s.activeAgent = AiTeam.Pm();
+        s.activeTask = "";
+        s.awaitingUser = false;
+        s.askedBy = "";
+        return s;
+    }
+}
+
+/// The parsed routing header of one team message: who it is for, what kind of
+/// beat it is in the protocol, which task it belongs to and the body with the
+/// header removed.
+class AiEnvelope {
+    List<string> to;
+    string kind;
+    string taskId;
+    int progress;
+    string body;
+
+    static AiEnvelope Create() {
+        AiEnvelope e = new AiEnvelope();
+        e.to = new List<string>();
+        e.kind = "";
+        e.taskId = "";
+        e.progress = 0;
+        e.body = "";
+        return e;
+    }
+}
+
+/// The team layer: role definitions, @-routing, per-member tool whitelists and
+/// per-member system prompts.
+///
+/// The single assistant becomes a group chat by adding three things to the
+/// existing agent loop, and nothing else: an envelope on each message (who
+/// spoke, who it is for, which beat of the protocol), a private context view
+/// per member, and a fixed handoff chain. The loop, the tools and the
+/// approval gate are unchanged -- a team member is the same `AiAgent` running
+/// with a different system prompt and a narrower tool whitelist.
+class AiTeam {
+    // --- roles ---------------------------------------------------------------
+
+    static string Pm() { return "pm"; }
+    static string Arch() { return "arch"; }
+    static string Dev() { return "dev"; }
+    static string Qa() { return "qa"; }
+    static string Rev() { return "rev"; }
+    static string Sec() { return "sec"; }
+
+    /// The member a defect always goes back to.
+    static string FixOwner() { return AiTeam.Dev(); }
+
+    static List<AiRole> Roles() {
+        List<AiRole> rs = new List<AiRole>();
+        rs.Add(AiRole.Create(AiTeam.Pm(), "Product Manager", "产品经理",
+            AiTeam.Arch(),
+            "澄清需求、写需求卡、对用户负责", 0));
+        rs.Add(AiRole.Create(AiTeam.Arch(), "Architect", "架构师",
+            AiTeam.Dev(),
+            "拆任务、定接口与文件边界、写验收标准", 1));
+        rs.Add(AiRole.Create(AiTeam.Dev(), "Developer", "开发者",
+            AiTeam.Qa(),
+            "实现任务卡并保证能编译通过", 2));
+        rs.Add(AiRole.Create(AiTeam.Qa(), "Test Engineer", "测试工程师",
+            AiTeam.Rev(),
+            "跑真实程序与真实 UI，出可复现的失败证据", 3));
+        rs.Add(AiRole.Create(AiTeam.Rev(), "Code Reviewer", "代码审查员",
+            AiTeam.Sec(),
+            "审 diff：正确性、边界、风格一致", 4));
+        rs.Add(AiRole.Create(AiTeam.Sec(), "Security Auditor", "安全审计员",
+            AiTeam.Pm(),
+            "审明文密钥、注入、路径逃逸、权限", 5));
+        return rs;
+    }
+
+    static AiRole RoleOf(string id) {
+        List<AiRole> rs = AiTeam.Roles();
+        for (int i = 0; i < rs.Count; i = i + 1) {
+            if (rs[i].id == id) { return rs[i]; }
+        }
+        return null;
+    }
+
+    /// The member's name in the user's language, or "" for a non-member
+    /// speaker (the user, a tool result, an error).
+    static string DisplayName(string id) {
+        AiRole r = AiTeam.RoleOf(id);
+        if (r == null) { return ""; }
+        return ZanIDE.T(r.en, r.zh);
+    }
+
+    /// The member work flows to when `id`'s stage passes.
+    static string NextOf(string id) {
+        AiRole r = AiTeam.RoleOf(id);
+        if (r == null) { return AiTeam.Pm(); }
+        return r.next;
+    }
+
+    // --- @ routing -----------------------------------------------------------
+
+    /// Resolves one @name to a role id: the Chinese name, the English name,
+    /// the bare id, and the short aliases a user actually types. "" when the
+    /// name is not a member.
+    static string RoleIdOfName(string name) {
+        string n = AiAgent.Trim(name);
+        if (n == "") { return ""; }
+        List<AiRole> rs = AiTeam.Roles();
+        for (int i = 0; i < rs.Count; i = i + 1) {
+            if (n == rs[i].zh || n == rs[i].id) { return rs[i].id; }
+        }
+        string low = ZanIDE.ToLowerS(n);
+        for (int i = 0; i < rs.Count; i = i + 1) {
+            if (low == ZanIDE.ToLowerS(rs[i].en)) { return rs[i].id; }
+            if (low == rs[i].id) { return rs[i].id; }
+        }
+        // Aliases: the words people use instead of the formal title.
+        if (n == "项目经理" || n == "产品" || low == "pm") { return AiTeam.Pm(); }
+        if (n == "架构" || low == "architect") { return AiTeam.Arch(); }
+        if (n == "开发" || n == "程序员" || low == "dev"
+            || low == "developer") { return AiTeam.Dev(); }
+        if (n == "测试" || low == "qa" || low == "test"
+            || low == "tester") { return AiTeam.Qa(); }
+        if (n == "审查" || n == "代码审查" || low == "review"
+            || low == "reviewer") { return AiTeam.Rev(); }
+        if (n == "安全" || n == "安全审计" || low == "sec"
+            || low == "security") { return AiTeam.Sec(); }
+        return "";
+    }
+
+    /// The broadcast handle.
+    static bool IsEveryone(string name) {
+        string low = ZanIDE.ToLowerS(AiAgent.Trim(name));
+        return name == "所有人" || name == "全体" || low == "all"
+            || low == "everyone" || low == "team";
+    }
+
+    /// True for an ASCII byte that ends an @name: whitespace or punctuation.
+    /// A name runs to the first of these, so "@dev: fix" resolves. Multi-byte
+    /// (UTF-8) content is handled by BreakLen so Chinese names survive but the
+    /// Chinese comma/space between two names still separates them.
+    static bool NameBreak(int ch) {
+        if (ch >= 128) { return false; }
+        if (ch == 32 || ch == 9 || ch == 10 || ch == 13) { return true; }
+        if (ch == 44 || ch == 58 || ch == 59 || ch == 46) { return true; }
+        if (ch == 33 || ch == 63 || ch == 91 || ch == 93) { return true; }
+        if (ch == 64) { return true; }
+        return false;
+    }
+
+    /// Byte length of a name-separator at `i`: 1 for an ASCII break, 3 for a
+    /// full-width CJK comma "，", enumeration comma "、", colon "：" or space
+    /// "　" (the ones a user actually types between two @names), else 0. The
+    /// scanner works on bytes, so a three-byte separator has to be recognised
+    /// explicitly or "@测试，@审查" would read as one impossible name.
+    static int BreakLen(string t, int i) {
+        int ch = t[i] & 255;
+        if (ch < 128) {
+            if (AiTeam.NameBreak(ch)) { return 1; }
+            return 0;
+        }
+        if (i + 2 < t.Length) {
+            int b2 = t[i + 1] & 255;
+            int b3 = t[i + 2] & 255;
+            // ，(EF BC 8C)  ：(EF BC 9A)
+            if (ch == 239 && b2 == 188 && (b3 == 140 || b3 == 154)) {
+                return 3;
+            }
+            // 、(E3 80 81)  full-width space (E3 80 80)
+            if (ch == 227 && b2 == 128 && (b3 == 129 || b3 == 128)) {
+                return 3;
+            }
+        }
+        return 0;
+    }
+
+    /// Every role id mentioned with @ in `text`, in order, without duplicates.
+    /// `@所有人` expands to the whole team. Only the leading run of mentions
+    /// is routing: an @name deeper in a sentence is prose, not an address, so
+    /// scanning stops at the first non-mention content.
+    static List<string> ParseMentions(string text) {
+        List<string> outIds = new List<string>();
+        int i = 0;
+        while (i < text.Length) {
+            // Skip whitespace and CJK separators between names (but not @).
+            while (i < text.Length && (text[i] & 255) != 64) {
+                int bl = AiTeam.BreakLen(text, i);
+                if (bl == 0) { return outIds; }
+                i = i + bl;
+            }
+            if (i >= text.Length) { return outIds; }
+            if ((text[i] & 255) != 64) { return outIds; }
+            int s = i + 1;
+            int e = s;
+            while (e < text.Length && (text[e] & 255) != 64
+                   && AiTeam.BreakLen(text, e) == 0) {
+                e = e + 1;
+            }
+            string name = text.Substring(s, e - s);
+            if (AiTeam.IsEveryone(name)) {
+                List<AiRole> rs = AiTeam.Roles();
+                for (int k = 0; k < rs.Count; k = k + 1) {
+                    AiTeam.AddOnce(outIds, rs[k].id);
+                }
+            } else {
+                string id = AiTeam.RoleIdOfName(name);
+                if (id == "") { return outIds; }
+                AiTeam.AddOnce(outIds, id);
+            }
+            i = e;
+        }
+        return outIds;
+    }
+
+    static void AddOnce(List<string> xs, string v) {
+        for (int i = 0; i < xs.Count; i = i + 1) {
+            if (xs[i] == v) { return; }
+        }
+        xs.Add(v);
+    }
+
+    static bool HasStr(List<string> xs, string v) {
+        for (int i = 0; i < xs.Count; i = i + 1) {
+            if (xs[i] == v) { return true; }
+        }
+        return false;
+    }
+
+    // --- envelope ------------------------------------------------------------
+
+    static string KindAssign() { return "assign"; }
+    static string KindAck() { return "ack"; }
+    static string KindProgress() { return "progress"; }
+    static string KindHandoff() { return "handoff"; }
+    static string KindQuestion() { return "question"; }
+    static string KindReport() { return "report"; }
+    static string KindBlock() { return "block"; }
+
+    static bool IsKind(string k) {
+        return k == AiTeam.KindAssign() || k == AiTeam.KindAck()
+            || k == AiTeam.KindProgress() || k == AiTeam.KindHandoff()
+            || k == AiTeam.KindQuestion() || k == AiTeam.KindReport()
+            || k == AiTeam.KindBlock();
+    }
+
+    /// Parses the routing header a member puts on the first line of its reply:
+    ///
+    ///     @测试工程师 [handoff T-3] 表单校验已实现，build 通过。
+    ///     [progress T-3 60%] 正在补边界用例
+    ///     [question] 这两种做法哪个是你要的？
+    ///
+    /// Everything is optional, so a plain sentence still parses (to=[], kind=""
+    /// and the whole text as the body) and a model that forgets the header
+    /// degrades to a normal chat message rather than breaking the pipeline.
+    static AiEnvelope ParseEnvelope(string text) {
+        AiEnvelope e = AiEnvelope.Create();
+        e.body = text;
+        e.to = AiTeam.ParseMentions(text);
+        // Consume the mention run so the body does not repeat the addresses.
+        int at = 0;
+        if (e.to.Count > 0) { at = AiTeam.MentionEnd(text); }
+        // A bracket marker is only a marker when it opens the remaining text.
+        int i = at;
+        while (i < text.Length && (text[i] & 255) != 91) {
+            int bl = AiTeam.BreakLen(text, i);
+            if (bl == 0) { break; }
+            i = i + bl;
+        }
+        if (i < text.Length && (text[i] & 255) == 91) {
+            int close = i + 1;
+            while (close < text.Length && (text[close] & 255) != 93) {
+                if ((text[close] & 255) == 10) { break; }
+                close = close + 1;
+            }
+            if (close < text.Length && (text[close] & 255) == 93) {
+                string inner = text.Substring(i + 1, close - i - 1);
+                if (AiTeam.ReadMarker(inner, e)) { at = close + 1; }
+            }
+        }
+        string rest = text.Substring(at, text.Length - at);
+        e.body = AiAgent.Trim(rest);
+        return e;
+    }
+
+    /// End offset of the leading run of @mentions in `text`.
+    static int MentionEnd(string text) {
+        int i = 0;
+        int last = 0;
+        while (i < text.Length) {
+            while (i < text.Length && (text[i] & 255) != 64) {
+                int bl = AiTeam.BreakLen(text, i);
+                if (bl == 0) { return last; }
+                i = i + bl;
+            }
+            if (i >= text.Length) { return last; }
+            if ((text[i] & 255) != 64) { return last; }
+            int s = i + 1;
+            int e = s;
+            while (e < text.Length && (text[e] & 255) != 64
+                   && AiTeam.BreakLen(text, e) == 0) {
+                e = e + 1;
+            }
+            string name = text.Substring(s, e - s);
+            if (!AiTeam.IsEveryone(name) && AiTeam.RoleIdOfName(name) == "") {
+                return last;
+            }
+            last = e;
+            i = e;
+        }
+        return last;
+    }
+
+    /// Reads a `[kind T-3 60%]` marker into `e`; false when the brackets hold
+    /// something else (so it stays part of the body).
+    static bool ReadMarker(string inner, AiEnvelope e) {
+        List<string> parts = new List<string>();
+        int s = 0;
+        for (int i = 0; i <= inner.Length; i = i + 1) {
+            bool end = i == inner.Length;
+            bool sp = false;
+            if (!end) {
+                int ch = inner[i] & 255;
+                sp = ch == 32 || ch == 9;
+            }
+            if (end || sp) {
+                if (i > s) { parts.Add(inner.Substring(s, i - s)); }
+                s = i + 1;
+            }
+        }
+        if (parts.Count == 0) { return false; }
+        string kind = ZanIDE.ToLowerS(parts[0]);
+        if (!AiTeam.IsKind(kind)) { return false; }
+        e.kind = kind;
+        for (int i = 1; i < parts.Count; i = i + 1) {
+            string p = parts[i];
+            if (p.Length > 0 && (p[p.Length - 1] & 255) == 37) {
+                e.progress = AiTeam.NumOf(p.Substring(0, p.Length - 1));
+            } else {
+                e.taskId = p;
+            }
+        }
+        return true;
+    }
+
+    /// Leading decimal digits of `s` as an int (0 when there are none), so a
+    /// malformed percentage can never throw inside the parser.
+    static int NumOf(string s) {
+        int v = 0;
+        for (int i = 0; i < s.Length; i = i + 1) {
+            int ch = s[i] & 255;
+            if (ch < 48 || ch > 57) { break; }
+            v = v * 10 + (ch - 48);
+        }
+        if (v > 100) { v = 100; }
+        return v;
+    }
+
+    /// Formats the header a member is asked to write, used for the prompt
+    /// examples and for the messages the IDE itself injects.
+    static string Header(string toId, string kind, string taskId) {
+        StringBuilder sb = new StringBuilder();
+        if (toId != "") { sb.Append("@" + AiTeam.DisplayName(toId) + " "); }
+        if (kind != "") {
+            sb.Append("[" + kind);
+            if (taskId != "") { sb.Append(" " + taskId); }
+            sb.Append("] ");
+        }
+        return sb.ToString();
+    }
+
+    // --- default recipient ---------------------------------------------------
+
+    /// Who the user's message goes to when they did not type an @name:
+    /// the member that spoke last, else the product manager.
+    ///
+    /// Both halves are the user's rule. Replying to whoever just spoke is what
+    /// makes a group chat feel like a conversation instead of a dispatch form,
+    /// and falling back to the product manager means an unaddressed request is
+    /// always turned into a requirement by the one member who talks to users.
+    static string DefaultRecipient(List<AiChatMsg> msgs) {
+        for (int i = msgs.Count - 1; i >= 0; i = i - 1) {
+            if (msgs[i].role == "user") { continue; }
+            if (msgs[i].agent != "" && AiTeam.RoleOf(msgs[i].agent) != null) {
+                return msgs[i].agent;
+            }
+        }
+        return AiTeam.Pm();
+    }
+
+    /// The recipient of a user message: an explicit @name wins, otherwise the
+    /// default above.
+    static string RouteUser(string text, List<AiChatMsg> msgs) {
+        List<string> ms = AiTeam.ParseMentions(text);
+        if (ms.Count > 0) { return ms[0]; }
+        return AiTeam.DefaultRecipient(msgs);
+    }
+
+    // --- tool whitelist ------------------------------------------------------
+
+    /// True when `roleId` may call `tool`.
+    ///
+    /// The whitelist is the load-bearing part of the separation: only the
+    /// developer can write files, only the tester can drive the UI, and the
+    /// reviewer and auditor are read-only by construction, so a member cannot
+    /// quietly "fix" what it was asked to judge.
+    static bool AllowsTool(string roleId, string tool) {
+        if (roleId == "" || AiTeam.RoleOf(roleId) == null) { return true; }
+        // Everyone may look at code and keep the plan up to date.
+        if (tool == "read_file" || tool == "list_dir" || tool == "grep"
+            || tool == "repo_map" || tool == "stdlib_read"
+            || tool == "stdlib_grep" || tool == "plan") { return true; }
+        if (roleId == AiTeam.Dev()) {
+            return tool == "write_file" || tool == "edit_file"
+                || tool == "build";
+        }
+        if (roleId == AiTeam.Qa()) {
+            return tool == "run" || tool == "build" || tool == "ui_check"
+                || tool == "ui_tree" || tool == "run_errors";
+        }
+        if (roleId == AiTeam.Rev() || roleId == AiTeam.Sec()) {
+            return tool == "diff";
+        }
+        // Product manager and architect stay read-only.
+        return false;
+    }
+
+    /// The refusal handed back when a member reaches for a tool outside its
+    /// remit: it names the member that owns the tool, so the model's next move
+    /// is a handoff rather than another blocked attempt.
+    static string DenyTool(string roleId, string tool) {
+        string owner = AiTeam.Dev();
+        if (tool == "ui_check" || tool == "run" || tool == "ui_tree"
+            || tool == "run_errors") { owner = AiTeam.Qa(); }
+        if (tool == "diff") { owner = AiTeam.Rev(); }
+        return "error: '" + tool + "' is not yours to call as "
+            + AiTeam.DisplayName(roleId) + ". Hand the work to @"
+            + AiTeam.DisplayName(owner) + " with a [handoff] message instead.";
+    }
+
+    // --- per-member context --------------------------------------------------
+
+    /// The private transcript of one member: what it said, what was addressed
+    /// to it, its own tool results, and the user's turns.
+    ///
+    /// A member never sees another member's tool output or internal reasoning,
+    /// which is both the isolation the user asked for and the reason six
+    /// members cost far less than six full transcripts. Cross-member knowledge
+    /// travels only through the envelope bodies, which forces every handoff to
+    /// actually state its conclusion.
+    static List<AiChatMsg> ContextFor(string roleId, List<AiChatMsg> msgs) {
+        List<AiChatMsg> outMsgs = new List<AiChatMsg>();
+        for (int i = 0; i < msgs.Count; i = i + 1) {
+            AiChatMsg m = msgs[i];
+            if (m.role == "user") {
+                // A user turn aimed at another member is still context the
+                // team shares (it is the requirement), but it is relabelled
+                // so this member does not think it was asked.
+                outMsgs.Add(m);
+                continue;
+            }
+            if (m.role == "tool" || m.role == "error") {
+                if (m.agent == roleId) { outMsgs.Add(m); }
+                continue;
+            }
+            if (m.agent == roleId) { outMsgs.Add(m); continue; }
+            if (AiTeam.HasStr(AiTeam.ToListOf(m), roleId)) {
+                outMsgs.Add(m);
+                continue;
+            }
+        }
+        return outMsgs;
+    }
+
+    /// The recipients recorded on a message, as a list (the field is stored as
+    /// a comma-joined string so it round-trips through the session archive
+    /// without a nested array).
+    static List<string> ToListOf(AiChatMsg m) {
+        List<string> ids = new List<string>();
+        if (m.to == "") { return ids; }
+        int s = 0;
+        for (int i = 0; i <= m.to.Length; i = i + 1) {
+            bool end = i == m.to.Length;
+            bool comma = false;
+            if (!end) { comma = (m.to[i] & 255) == 44; }
+            if (end || comma) {
+                if (i > s) { AiTeam.AddOnce(ids, m.to.Substring(s, i - s)); }
+                s = i + 1;
+            }
+        }
+        return ids;
+    }
+
+    static string ToStrOf(List<string> ids) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < ids.Count; i = i + 1) {
+            if (i > 0) { sb.Append(","); }
+            sb.Append(ids[i]);
+        }
+        return sb.ToString();
+    }
+
+    // --- prompts -------------------------------------------------------------
+
+    /// The protocol every member shares: the header format, the beats, and the
+    /// two rules that keep the pipeline honest (acknowledge before working,
+    /// park on a question instead of guessing).
+    static string ProtocolPrompt() {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("TEAM PROTOCOL. You are one member of a six-member team in a"
+            + " group chat with the user. Members: @产品经理 (Product Manager),"
+            + " @架构师 (Architect), @开发者 (Developer), @测试工程师 (Test"
+            + " Engineer), @代码审查员 (Code Reviewer), @安全审计员 (Security"
+            + " Auditor).\n"
+            + "Every message you send starts with a routing header:\n"
+            + "  @<member> [<kind> <taskId> <NN%>] then your text\n"
+            + "Kinds: assign (hand a task over), ack (you accept a task --"
+            + " ALWAYS reply with this first, before doing any work),"
+            + " progress (a percentage and one line), handoff (your stage"
+            + " passed, pass it on), question (you need the USER to decide),"
+            + " report (your conclusion), block (you are stuck).\n"
+            + "Examples:\n"
+            + "  @架构师 [handoff T-1] 需求已确认：三条验收标准如下……\n"
+            + "  [ack T-3] 收到，开始实现表单校验。\n"
+            + "  [progress T-3 60%] 校验规则写完，还剩边界用例。\n"
+            + "  @开发者 [block T-3] ui_check 报 hitregion 缺失，见下。\n"
+            + "RULES.\n"
+            + "1. ACKNOWLEDGE FIRST. When a task is assigned to you, your very"
+            + " next message is [ack] naming what you understood. Only then do"
+            + " you start.\n"
+            + "2. ONE OWNER AT A TIME. When your stage passes, send [handoff]"
+            + " to exactly one member and stop. Do not do the next member's"
+            + " job yourself.\n"
+            + "3. DEFECTS GO BACK TO THE DEVELOPER. If you find a problem,"
+            + " address @开发者 with [block], and always include how to"
+            + " reproduce it, what actually happened and what you expected."
+            + " Never just say it is broken.\n"
+            + "4. PARK ON UNCERTAINTY. If an important decision is genuinely"
+            + " ambiguous, send [question] and STOP -- the user answers it."
+            + " Do not guess and carry on. Route it through @产品经理 unless"
+            + " the user asked you directly.\n"
+            + "5. STAY IN YOUR LANE. Only the tools listed for you below are"
+            + " available; the IDE refuses the rest. If you need one you do"
+            + " not have, hand off to the member who owns it.\n\n");
+        return sb.ToString();
+    }
+
+    /// The tool line for a member, so its prompt only advertises what it can
+    /// actually call.
+    static string ToolsPrompt(string roleId) {
+        if (roleId == AiTeam.Dev()) {
+            return "YOUR TOOLS: the read tools, plus edit_file, write_file,"
+                + " build. You do NOT have run/ui_check (that is the test"
+                + " engineer's) or diff.\n\n";
+        }
+        if (roleId == AiTeam.Qa()) {
+            return "YOUR TOOLS: the read tools, plus build, run, ui_check,"
+                + " ui_tree, run_errors. You do NOT have edit_file/write_file:"
+                + " you prove the defect, the developer fixes it.\n\n";
+        }
+        if (roleId == AiTeam.Rev() || roleId == AiTeam.Sec()) {
+            return "YOUR TOOLS: the read tools, plus diff. You are read-only"
+                + " by design -- you judge the change, you never edit it.\n\n";
+        }
+        return "YOUR TOOLS: the read tools and plan only. You do not edit,"
+            + " build or run anything.\n\n";
+    }
+
+    /// The member's own charter: what it is for, what it must produce, and who
+    /// it hands to.
+    static string DutyPrompt(string roleId) {
+        if (roleId == AiTeam.Pm()) {
+            return "YOU ARE @产品经理 (Product Manager). You are the only member"
+                + " who owns the conversation with the user.\n"
+                + "- First, make the requirement unambiguous. If the request is"
+                + " vague, ask the user ONE round of the few questions that"
+                + " actually change the design -- do not interrogate.\n"
+                + "- Then write a requirement card: goal, scope, acceptance"
+                + " criteria, and explicitly what is NOT in scope.\n"
+                + "- Then [handoff] to @架构师.\n"
+                + "- Other members route their questions through you: fold them"
+                + " into one clear question for the user rather than relaying"
+                + " six separate interruptions.\n"
+                + "- At the end, summarise for the user what shipped and what"
+                + " is still open. Do not design, do not write code.\n\n";
+        }
+        if (roleId == AiTeam.Arch()) {
+            return "YOU ARE @架构师 (Architect). You turn a requirement card"
+                + " into an ordered set of task cards.\n"
+                + "- Read the real code first (grep/read_file/repo_map): decide"
+                + " which existing layer should change, and prefer extending it"
+                + " over adding a parallel one.\n"
+                + "- Emit the task board with the plan tool: each item is one"
+                + " task with the files it touches and an ACCEPTANCE CRITERION"
+                + " the test engineer can check without asking you.\n"
+                + "- Order tasks by dependency; call out the risky one.\n"
+                + "- Then [assign] the first task to @开发者. Do not write the"
+                + " implementation yourself.\n\n";
+        }
+        if (roleId == AiTeam.Dev()) {
+            return "YOU ARE @开发者 (Developer). You implement one task card at"
+                + " a time.\n"
+                + "- [ack] the task, then read the code you are about to change"
+                + " before changing it.\n"
+                + "- Keep the edit minimal and in the surrounding style; fix the"
+                + " general layer, never hard-code a value to hide the bug.\n"
+                + "- build and read the errors. Do not hand off until it"
+                + " compiles.\n"
+                + "- Then [handoff] to @测试工程师 stating what you changed"
+                + " (path:line) and how to exercise it.\n"
+                + "- When a defect comes back to you, reproduce the reported"
+                + " cause before editing; do not re-send a fix that already"
+                + " failed.\n\n";
+        }
+        if (roleId == AiTeam.Qa()) {
+            return "YOU ARE @测试工程师 (Test Engineer). You decide whether the"
+                + " change actually works, against the task's acceptance"
+                + " criterion.\n"
+                + "- Exercise the real program: run it, and for UI work drive"
+                + " it with ui_check and read the widget geometry back with"
+                + " ui_tree. Check real numbers, not your expectations.\n"
+                + "- A failure report must be reproducible: the script or steps,"
+                + " the actual value, the expected value.\n"
+                + "- Fail -> [block] to @开发者. Pass -> [handoff] to"
+                + " @代码审查员 with what you verified and what you could not.\n"
+                + "- Never report a pass for something you did not execute.\n\n";
+        }
+        if (roleId == AiTeam.Rev()) {
+            return "YOU ARE @代码审查员 (Code Reviewer). You read the diff.\n"
+                + "- Look for: wrong edge cases, broken invariants, changes"
+                + " outside the task's scope, duplicated logic that belonged in"
+                + " a shared helper, and tests or checks weakened to make"
+                + " something pass.\n"
+                + "- Judge consistency with the surrounding style, not your"
+                + " personal taste. Cite path:line for every point.\n"
+                + "- Problems -> [block] to @开发者, one concrete change each."
+                + " Clean -> [handoff] to @安全审计员.\n\n";
+        }
+        if (roleId == AiTeam.Sec()) {
+            return "YOU ARE @安全审计员 (Security Auditor). You audit the change"
+                + " for exposure.\n"
+                + "- Look for: secrets/keys/tokens in plain text, injection"
+                + " (SQL/command/path), path traversal escaping the project"
+                + " root, over-broad permissions, and unvalidated external"
+                + " input.\n"
+                + "- Say plainly what is a real risk versus a theoretical one;"
+                + " do not pad the report.\n"
+                + "- Findings -> [block] to @开发者. Clean -> [handoff] to"
+                + " @产品经理 to close out.\n\n";
+        }
+        return "";
+    }
+
+    /// The full system prompt for one member: the shared IDE/agent
+    /// instructions, then the team protocol, then this member's charter and
+    /// tool list. Built on top of the single-assistant prompt on purpose --
+    /// the tool syntax, the Zan language notes and the project outline are the
+    /// same for everyone, so they can never drift per role.
+    static string RolePrompt(string roleId, string ctxName, string ctxCode,
+            string root) {
+        StringBuilder sb = new StringBuilder();
+        sb.Append(AiAgent.SystemPrompt(ctxName, ctxCode, root));
+        sb.Append("\n\n");
+        sb.Append(AiTeam.ProtocolPrompt());
+        sb.Append(AiTeam.DutyPrompt(roleId));
+        sb.Append(AiTeam.ToolsPrompt(roleId));
+        return sb.ToString();
+    }
+}
