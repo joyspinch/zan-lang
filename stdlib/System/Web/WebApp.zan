@@ -4,8 +4,22 @@ using System.Net;
 using System.Net.Sockets;
 using System.Net.Http;
 using System.Diagnostics;
+using System.Json;
 
 namespace System.Web;
+
+/// The uniform error body {"code","msg"} used by WebApp.ErrorJson.
+class ApiErrorBody {
+    string code;
+    string msg;
+}
+
+/// The /api/status snapshot: two counters plus the per-route stats array.
+class WebAppStatusDoc {
+    int total_requests;
+    int active_connections;
+    JsonValue routes;
+}
 
 /// <summary>
 /// The application server: coroutine-per-connection HTTP/1.1 event loop
@@ -365,7 +379,7 @@ class WebApp {
         if (this.globalLimit > 0
             && !this.limiter.Allow("_global_:" + principal, this.globalLimit)) {
             ctx.Status(429, "Too Many Requests").SetHeader("Retry-After", "1");
-            ctx.Json("{\"code\":\"429\",\"msg\":\"too many requests\"}");
+            ctx.Json(WebApp.ErrorJson("429", "too many requests"));
             return ctx.BuildResponse(keepAlive);
         }
 
@@ -377,10 +391,10 @@ class WebApp {
         if (route == null) {
             if (this.router.PathExists(ctx.path)) {
                 ctx.Status(405, "Method Not Allowed");
-                ctx.Json("{\"code\":\"405\",\"msg\":\"method not allowed\"}");
+                ctx.Json(WebApp.ErrorJson("405", "method not allowed"));
             } else {
                 ctx.Status(404, "Not Found");
-                ctx.Json("{\"code\":\"404\",\"msg\":\"not found\"}");
+                ctx.Json(WebApp.ErrorJson("404", "not found"));
             }
             return ctx.BuildResponse(keepAlive);
         }
@@ -394,14 +408,14 @@ class WebApp {
         if (route.rateLimit > 0
             && !this.limiter.Allow(rateKey, route.rateLimit)) {
             ctx.Status(429, "Too Many Requests").SetHeader("Retry-After", "1");
-            ctx.Json("{\"code\":\"429\",\"msg\":\"route rate limit exceeded\"}");
+            ctx.Json(WebApp.ErrorJson("429", "route rate limit exceeded"));
             return ctx.BuildResponse(keepAlive);
         }
 
         if (route.needsLogin || route.needsAuth) {
             if (uid.Length == 0) {
                 ctx.Status(401, "Unauthorized");
-                ctx.Json("{\"code\":\"401\",\"msg\":\"authentication required\"}");
+                ctx.Json(WebApp.ErrorJson("401", "authentication required"));
                 return ctx.BuildResponse(keepAlive);
             }
             if (route.needsAuth) {
@@ -413,7 +427,7 @@ class WebApp {
                 }
                 if (!allowed) {
                     ctx.Status(403, "Forbidden");
-                    ctx.Json("{\"code\":\"403\",\"msg\":\"insufficient permission\"}");
+                    ctx.Json(WebApp.ErrorJson("403", "insufficient permission"));
                     return ctx.BuildResponse(keepAlive);
                 }
             }
@@ -427,7 +441,7 @@ class WebApp {
                 LockManager.KeyFor(route, principal));
             if (lockLease == null) {
                 ctx.Status(429, "Too Many Requests").SetHeader("Retry-After", "1");
-                ctx.Json("{\"code\":\"429\",\"msg\":\"request already in progress\"}");
+                ctx.Json(WebApp.ErrorJson("429", "request already in progress"));
                 return ctx.BuildResponse(keepAlive);
             }
         }
@@ -438,7 +452,7 @@ class WebApp {
         if (lockLease != null) { this.locks.Release(lockLease); }
         if (!ctx.ended) {
             ctx.Status(500, "Internal Server Error");
-            ctx.Json("{\"code\":\"500\",\"msg\":\"handler produced no response\"}");
+            ctx.Json(WebApp.ErrorJson("500", "handler produced no response"));
         }
 
         long elapsedMs = ServerMetrics.MonoMillis() - startMs;
@@ -470,11 +484,21 @@ class WebApp {
         return "";
     }
 
+    /// <summary>Uniform error body {"code","msg"}, built by the JSON writer.</summary>
+    static string ErrorJson(string code, string msg) {
+        ApiErrorBody o = new ApiErrorBody();
+        o.code = code;
+        o.msg = msg;
+        return Json.Serialize<ApiErrorBody>(o);
+    }
+
     /// <summary>Status snapshot for /api/status.</summary>
     string StatusJson() {
-        return "{\"total_requests\":" + Convert.ToString(this.totalRequests)
-            + ",\"active_connections\":" + Convert.ToString(this.activeConnections)
-            + ",\"routes\":" + this.router.StatsJson() + "}";
+        WebAppStatusDoc o = new WebAppStatusDoc();
+        o.total_requests = this.totalRequests;
+        o.active_connections = this.activeConnections;
+        o.routes = JsonValue.ParseLenient(this.router.StatsJson());
+        return Json.Serialize<WebAppStatusDoc>(o);
     }
 
     /// <summary>Full runtime metrics snapshot (CPU, memory, request + query
@@ -484,7 +508,10 @@ class WebApp {
     }
 
     static string SimpleResponse(int code, string text, string msg) {
-        string body = "{\"code\":\"" + Convert.ToString(code) + "\",\"msg\":\"" + msg + "\"}";
+        JsonValue o = JsonValue.NewObject();
+        o.Put("code", JsonValue.NewStr(Convert.ToString(code)));
+        o.Put("msg", JsonValue.NewStr(msg));
+        string body = o.ToJson();
         return "HTTP/1.1 " + Convert.ToString(code) + " " + text
             + "\r\nContent-Type: application/json\r\nContent-Length: "
             + Convert.ToString(body.Length)

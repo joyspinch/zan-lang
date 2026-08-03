@@ -3,6 +3,127 @@ using System.IO;
 using System.Diagnostics;
 using System.Json;
 
+// ---- DAP protocol entities ------------------------------------------------
+// Envelopes and arguments are serialized with Json.Serialize<T>; responses
+// are parsed with Json.Deserialize<T>. `arguments`/`body` are JsonValue
+// because they are optional (null) and carry per-command structure; the
+// zan-dap accessors treat a null node exactly like a missing key.
+
+class DapRequest {
+    int seq;
+    string type;
+    string command;
+    JsonValue arguments;
+}
+
+class DapInitArgs {
+    string clientID;
+    string adapterID;
+    bool linesStartAt1;
+    bool columnsStartAt1;
+}
+
+class DapLaunchArgs {
+    string program;
+    bool stopOnEntry;
+}
+
+class DapSource {
+    string path;
+}
+
+class DapBreakpoint {
+    int line;
+    string condition;   // "" = plain breakpoint (adapter treats it as unset)
+}
+
+class DapSetBreakpointsArgs {
+    DapSource source;
+    List<DapBreakpoint> breakpoints;
+}
+
+class DapEvaluateArgs {
+    string expression;
+    int frameId;
+    string context;
+}
+
+class DapThreadArgs {
+    int threadId;
+}
+
+class DapDisconnectArgs {
+    bool terminateDebuggee;
+}
+
+class DapStackTraceArgs {
+    int threadId;
+    int startFrame;
+    int levels;
+}
+
+class DapScopesArgs {
+    int frameId;
+}
+
+class DapVariablesArgs {
+    int variablesReference;
+}
+
+// ---- DAP response entities (parsed with Json.Deserialize<T>) -------------
+
+class DapFrame {
+    int id;
+    string name;
+    int line;
+    DapSource source;
+}
+
+class DapStackBody {
+    List<DapFrame> stackFrames;
+}
+
+class DapStackResponse {
+    DapStackBody body;
+}
+
+class DapVar {
+    string name;
+    string value;
+    string type;
+}
+
+class DapVarsBody {
+    List<DapVar> variables;
+}
+
+class DapVarsResponse {
+    DapVarsBody body;
+}
+
+class DapScope {
+    int variablesReference;
+}
+
+class DapScopesBody {
+    List<DapScope> scopes;
+}
+
+class DapScopesResponse {
+    DapScopesBody body;
+}
+
+class DapEvalResponse {
+    bool success;
+    JsonValue body;
+}
+
+class DapEvent {
+    string type;
+    string event;
+    JsonValue body;
+}
+
 /// A live Debug Adapter Protocol client that drives a spawned `zan-dap` over a
 /// loopback TCP socket (127.0.0.1). Replaces the IDE's former static
 /// source-instrumentation debugger: stop locations, the call stack, scopes and
@@ -105,13 +226,13 @@ class DebugSession {
         if (!connected) { ws_close(s); return null; }
         d.alive = true;
 
-        d.Request("initialize",
-            "{\"clientID\":\"zanide\",\"adapterID\":\"zan\","
-            + "\"linesStartAt1\":true,\"columnsStartAt1\":true}");
+        d.Request("initialize", DebugSession.InitArgs());
         d.AwaitResponse("initialize");
         d.AwaitEvent("initialized");
-        d.Request("launch", "{\"program\":\"" + DebugSession.JsonEsc(program)
-            + "\",\"stopOnEntry\":false}");
+        DapLaunchArgs launch = new DapLaunchArgs();
+        launch.program = program;
+        launch.stopOnEntry = false;
+        d.Request("launch", Json.Serialize<DapLaunchArgs>(launch));
         d.AwaitResponse("launch");
         d.Request("setBreakpoints", d.BpJson(source, bps));
         d.AwaitResponse("setBreakpoints");
@@ -149,19 +270,27 @@ class DebugSession {
         return addr;
     }
 
+    static string InitArgs() {
+        DapInitArgs o = new DapInitArgs();
+        o.clientID = "zanide";
+        o.adapterID = "zan";
+        o.linesStartAt1 = true;
+        o.columnsStartAt1 = true;
+        return Json.Serialize<DapInitArgs>(o);
+    }
+
     string BpJson(string source, List<DbgBreakpoint> bps) {
-        string arr = "";
+        DapSetBreakpointsArgs o = new DapSetBreakpointsArgs();
+        o.source = new DapSource();
+        o.source.path = source;
+        o.breakpoints = new List<DapBreakpoint>();
         for (int i = 0; i < bps.Count; i = i + 1) {
-            if (i > 0) { arr = arr + ","; }
-            arr = arr + "{\"line\":" + Convert.ToString(bps[i].line);
-            if (bps[i].cond.Length > 0) {
-                arr = arr + ",\"condition\":\""
-                    + DebugSession.JsonEsc(bps[i].cond) + "\"";
-            }
-            arr = arr + "}";
+            DapBreakpoint bp = new DapBreakpoint();
+            bp.line = bps[i].line;
+            bp.condition = bps[i].cond;
+            o.breakpoints.Add(bp);
         }
-        return "{\"source\":{\"path\":\"" + DebugSession.JsonEsc(source)
-            + "\"},\"breakpoints\":[" + arr + "]}";
+        return Json.Serialize<DapSetBreakpointsArgs>(o);
     }
 
     // ---- public control ---------------------------------------------------
@@ -185,22 +314,24 @@ class DebugSession {
     /// expression cannot be evaluated.
     string Evaluate(string expr) {
         if (!this.alive || !this.paused) { return ""; }
-        this.Request("evaluate",
-            "{\"expression\":\"" + DebugSession.JsonEsc(expr)
-            + "\",\"frameId\":" + Convert.ToString(this.frameId)
-            + ",\"context\":\"watch\"}");
+        DapEvaluateArgs args = new DapEvaluateArgs();
+        args.expression = expr;
+        args.frameId = this.frameId;
+        args.context = "watch";
+        this.Request("evaluate", Json.Serialize<DapEvaluateArgs>(args));
         string m = this.AwaitResponseMsg("evaluate");
         if (m.Length == 0) { return "<error>"; }
-        if (DebugSession.IndexOf(m, "\"success\":false", 0) >= 0) {
-            return "<error>";
-        }
-        return DebugSession.JsonStr(m, "result", 0);
+        DapEvalResponse r = Json.Deserialize<DapEvalResponse>(m);
+        if (r == null || !r.success || r.body == null) { return "<error>"; }
+        return r.body.Str("result", "");
     }
 
     void Resume(string cmd) {
         if (!this.alive) { this.paused = false; return; }
         this.paused = false;
-        this.Request(cmd, "{\"threadId\":1}");
+        DapThreadArgs args = new DapThreadArgs();
+        args.threadId = 1;
+        this.Request(cmd, Json.Serialize<DapThreadArgs>(args));
         this.AwaitResponse(cmd);
         this.PumpUntilStop();
     }
@@ -208,7 +339,9 @@ class DebugSession {
     void Stop() {
         if (this.sock >= 0) {
             if (this.alive) {
-                this.Request("disconnect", "{\"terminateDebuggee\":true}");
+                DapDisconnectArgs args = new DapDisconnectArgs();
+                args.terminateDebuggee = true;
+                this.Request("disconnect", Json.Serialize<DapDisconnectArgs>(args));
             }
             ws_close(this.sock);
             this.sock = 0 - 1;
@@ -238,12 +371,15 @@ class DebugSession {
     }
 
     void Request(string cmd, string argsJson) {
-        string body = "{\"seq\":" + Convert.ToString(this.seq)
-            + ",\"type\":\"request\",\"command\":\"" + cmd + "\"";
-        if (argsJson.Length > 0) { body = body + ",\"arguments\":" + argsJson; }
-        body = body + "}";
+        DapRequest o = new DapRequest();
+        o.seq = this.seq;
+        o.type = "request";
+        o.command = cmd;
+        if (argsJson.Length > 0) {
+            o.arguments = JsonValue.ParseLenient(argsJson);
+        }
         this.seq = this.seq + 1;
-        this.SendMsg(body);
+        this.SendMsg(Json.Serialize<DapRequest>(o));
     }
 
     string RecvChunk() {
@@ -283,14 +419,19 @@ class DebugSession {
     /// Handles events that may arrive between a request and its response:
     /// captured program stdout, and exit/termination.
     void Aside(string m) {
-        if (DebugSession.IndexOf(m, "\"event\":\"output\"", 0) >= 0) {
-            string txt = DebugSession.JsonStr(m, "output", 0);
+        DapEvent ev = Json.Deserialize<DapEvent>(m);
+        if (ev == null) { return; }
+        if (ev.event == "output") {
+            string txt = "";
+            if (ev.body != null) { txt = ev.body.Str("output", ""); }
             if (txt.Length > 0) { this.console.Add(DebugSession.RTrimNl(txt)); }
-        } else if (DebugSession.IndexOf(m, "\"event\":\"exited\"", 0) >= 0) {
-            this.exitCode = DebugSession.JsonInt(m, "exitCode", 0);
+        } else if (ev.event == "exited") {
+            int ec = 0;
+            if (ev.body != null) { ec = ev.body.Int("exitCode", 0); }
+            this.exitCode = ec;
             this.alive = false;
             this.paused = false;
-        } else if (DebugSession.IndexOf(m, "\"event\":\"terminated\"", 0) >= 0) {
+        } else if (ev.event == "terminated") {
             this.alive = false;
             this.paused = false;
         }
@@ -360,17 +501,28 @@ class DebugSession {
         this.curLine = 0;
         this.curFile = "";
 
-        this.Request("stackTrace",
-            "{\"threadId\":1,\"startFrame\":0,\"levels\":64}");
+        DapStackTraceArgs stArgs = new DapStackTraceArgs();
+        stArgs.threadId = 1;
+        stArgs.startFrame = 0;
+        stArgs.levels = 64;
+        this.Request("stackTrace", Json.Serialize<DapStackTraceArgs>(stArgs));
         string st = this.AwaitResponseMsg("stackTrace");
         this.ParseFrames(st);
 
-        this.Request("scopes", "{\"frameId\":" + Convert.ToString(this.frameId) + "}");
+        DapScopesArgs scArgs = new DapScopesArgs();
+        scArgs.frameId = this.frameId;
+        this.Request("scopes", Json.Serialize<DapScopesArgs>(scArgs));
         string sc = this.AwaitResponseMsg("scopes");
-        int reff = DebugSession.JsonInt(sc, "variablesReference", 0);
+        int reff = 0;
+        DapScopesResponse scR = Json.Deserialize<DapScopesResponse>(sc);
+        if (scR != null && scR.body != null && scR.body.scopes != null
+                && scR.body.scopes.Count > 0) {
+            reff = scR.body.scopes[0].variablesReference;
+        }
         if (reff != 0) {
-            this.Request("variables",
-                "{\"variablesReference\":" + Convert.ToString(reff) + "}");
+            DapVariablesArgs vArgs = new DapVariablesArgs();
+            vArgs.variablesReference = reff;
+            this.Request("variables", Json.Serialize<DapVariablesArgs>(vArgs));
             string vs = this.AwaitResponseMsg("variables");
             this.ParseVariables(vs);
         }
@@ -380,23 +532,20 @@ class DebugSession {
     /// id, name, line, column, source{path}; the first frame is the stop point.
     void ParseFrames(string m) {
         if (m.Length == 0) { return; }
-        int p = DebugSession.IndexOf(m, "\"stackFrames\":", 0);
-        if (p < 0) { return; }
+        DapStackResponse r = Json.Deserialize<DapStackResponse>(m);
+        if (r == null || r.body == null || r.body.stackFrames == null) { return; }
         bool first = true;
-        for (int count = 0; count < 64; count = count + 1) {
-            int idIdx = DebugSession.IndexOf(m, "\"id\":", p);
-            if (idIdx < 0) { break; }
-            int line = DebugSession.JsonInt(m, "line", idIdx);
-            string name = DebugSession.JsonStr(m, "name", idIdx);
+        for (int i = 0; i < r.body.stackFrames.Count; i = i + 1) {
+            DapFrame f = r.body.stackFrames[i];
+            string name = f.name;
             if (name.Length == 0) { name = "?"; }
-            this.stack.Add(DbgFrame.Create(name, line));
+            this.stack.Add(DbgFrame.Create(name, f.line));
             if (first) {
-                this.frameId = DebugSession.JsonInt(m, "id", idIdx);
-                this.curLine = line;
-                this.curFile = DebugSession.JsonStr(m, "path", idIdx);
+                this.frameId = f.id;
+                this.curLine = f.line;
+                if (f.source != null) { this.curFile = f.source.path; }
                 first = false;
             }
-            p = idIdx + 5;
         }
     }
 
@@ -405,18 +554,11 @@ class DebugSession {
     /// in the order name, value, type.
     void ParseVariables(string m) {
         if (m.Length == 0) { return; }
-        int p = DebugSession.IndexOf(m, "\"variables\":", 0);
-        if (p < 0) { return; }
-        for (int count = 0; count < 512; count = count + 1) {
-            int nameIdx = DebugSession.IndexOf(m, "\"name\":", p);
-            if (nameIdx < 0) { break; }
-            string nm = DebugSession.JsonStr(m, "name", nameIdx);
-            string vv = DebugSession.JsonStr(m, "value", nameIdx);
-            string vt = DebugSession.JsonStr(m, "type", nameIdx);
-            this.locals.Add(DbgVar.Create(nm, vt, vv));
-            int vIdx = DebugSession.IndexOf(m, "\"value\":", nameIdx);
-            if (vIdx < 0) { break; }
-            p = vIdx + 8;
+        DapVarsResponse r = Json.Deserialize<DapVarsResponse>(m);
+        if (r == null || r.body == null || r.body.variables == null) { return; }
+        for (int i = 0; i < r.body.variables.Count; i = i + 1) {
+            DapVar v = r.body.variables[i];
+            this.locals.Add(DbgVar.Create(v.name, v.type, v.value));
         }
     }
 
@@ -496,23 +638,6 @@ class DebugSession {
                 res = res + s.Substring(p, 1);
             }
             p = p + 1;
-        }
-        return res;
-    }
-
-    static string JsonEsc(string s) {
-        string res = "";
-        int i = 0;
-        int sl = s.Length;
-        while (i < sl) {
-            int c = s[i];
-            if (c == 92) { res = res + "\\\\"; }
-            else if (c == 34) { res = res + "\\\""; }
-            else if (c == 10) { res = res + "\\n"; }
-            else if (c == 13) { res = res + "\\r"; }
-            else if (c == 9) { res = res + "\\t"; }
-            else { res = res + s.Substring(i, 1); }
-            i = i + 1;
         }
         return res;
     }

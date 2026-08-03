@@ -3,6 +3,88 @@ using System.IO;
 using System.Diagnostics;
 using System.Json;
 
+// ---- LSP protocol entities ------------------------------------------------
+// Request/notification envelopes and payloads are serialized via
+// Json.Serialize<T> so the wire format is declared once as fields (and
+// completion/rename/etc. payloads get IDE autocomplete + type checking).
+// `processId` and envelope `params` are JsonValue because they are optional
+// (null) and/or carry arbitrary server-defined structure.
+
+class LspNotification {
+    string jsonrpc;
+    string method;
+    JsonValue params;
+}
+
+class LspRequest {
+    string jsonrpc;
+    int id;
+    string method;
+    JsonValue params;
+}
+
+class LspInitParams {
+    JsonValue processId;      // null: the IDE is not a process the server can signal
+    string rootUri;
+    JsonValue capabilities;
+}
+
+class LspTextDocumentItem {
+    string uri;
+    string languageId;
+    int version;
+    string text;
+}
+
+class LspDidOpenParams {
+    LspTextDocumentItem textDocument;
+}
+
+class LspTextDocumentIdentifier {
+    string uri;
+}
+
+class LspPosition {
+    int line;
+    int character;
+}
+
+class LspReferenceContext {
+    bool includeDeclaration;
+}
+
+class LspDocPosParams {
+    LspTextDocumentIdentifier textDocument;
+    LspPosition position;
+}
+
+class LspReferenceParams {
+    LspTextDocumentIdentifier textDocument;
+    LspPosition position;
+    LspReferenceContext context;
+}
+
+class LspRenameParams {
+    LspTextDocumentIdentifier textDocument;
+    LspPosition position;
+    string newName;
+}
+
+// ---- LSP response entities (parsed with Json.Deserialize<T>) -------------
+
+class LspLocation {
+    string uri;
+    JsonValue range;
+}
+
+class LspLocationsResult {
+    List<LspLocation> result;
+}
+
+class LspHoverResult {
+    JsonValue result;
+}
+
 /// A live Language Server Protocol client that drives a spawned `zan-lsp`
 /// over a loopback TCP socket (127.0.0.1), mirroring DebugSession's
 /// transport. Serves semantic go-to-definition, find-references and hover
@@ -148,9 +230,11 @@ class LspSession {
         // The handshake indexes the workspace, so allow it a minute before
         // deciding the server is unusable; ordinary requests stay snappy.
         d.waitBudget = 40;
-        string m = d.RequestWait("initialize",
-            "{\"processId\":null,\"rootUri\":\"" + LspSession.PathToUri(root)
-            + "\",\"capabilities\":{}}");
+        LspInitParams init = new LspInitParams();
+        init.processId = JsonValue.NewNull();
+        init.rootUri = LspSession.PathToUri(root);
+        init.capabilities = JsonValue.NewObject();
+        string m = d.RequestWait("initialize", Json.Serialize<LspInitParams>(init));
         if (m.Length == 0) { d.Shutdown(); return null; }
         d.waitBudget = LspSession.RequestWaits();
         d.Notify("initialized", "{}");
@@ -174,10 +258,13 @@ class LspSession {
     /// Pushes the full current buffer for `path` so subsequent semantic
     /// queries see unsaved edits (full-sync didOpen upserts the document).
     void SyncDoc(string path, string text) {
-        this.Notify("textDocument/didOpen",
-            "{\"textDocument\":{\"uri\":\"" + LspSession.PathToUri(path)
-            + "\",\"languageId\":\"zan\",\"version\":1,\"text\":\""
-            + DebugSession.JsonEsc(text) + "\"}}");
+        LspDidOpenParams p = new LspDidOpenParams();
+        p.textDocument = new LspTextDocumentItem();
+        p.textDocument.uri = LspSession.PathToUri(path);
+        p.textDocument.languageId = "zan";
+        p.textDocument.version = 1;
+        p.textDocument.text = text;
+        this.Notify("textDocument/didOpen", Json.Serialize<LspDidOpenParams>(p));
     }
 
     /// Semantic go-to-definition. Returns "path\tline0" (0-based line) or "".
@@ -185,30 +272,40 @@ class LspSession {
         string m = this.RequestWait("textDocument/definition",
             LspSession.PosParams(path, line0, col0));
         if (m.Length == 0) { return ""; }
-        string uri = DebugSession.JsonStr(m, "uri", 0);
+        LspLocationsResult r = Json.Deserialize<LspLocationsResult>(m);
+        if (r == null || r.result == null || r.result.Count == 0) { return ""; }
+        string uri = r.result[0].uri;
         if (uri.Length == 0) { return ""; }
-        int ui = DebugSession.IndexOf(m, "\"uri\":", 0);
-        int ln = DebugSession.JsonInt(m, "line", ui);
+        int ln = 0;
+        if (r.result[0].range != null) {
+            JsonValue start = r.result[0].range.Get("start");
+            if (start != null) { ln = start.Int("line", 0); }
+        }
         return LspSession.UriToPath(uri) + "\t" + Convert.ToString(ln);
     }
 
     /// Semantic find-references. Returns "path\tline0" rows.
     List<string> References(string path, int line0, int col0) {
         List<string> outp = new List<string>();
+        LspReferenceParams p = new LspReferenceParams();
+        p.textDocument = LspSession.UriObj(path);
+        p.position = LspSession.PosObj(line0, col0);
+        p.context = new LspReferenceContext();
+        p.context.includeDeclaration = true;
         string m = this.RequestWait("textDocument/references",
-            "{\"textDocument\":{\"uri\":\"" + LspSession.PathToUri(path)
-            + "\"},\"position\":{\"line\":" + Convert.ToString(line0)
-            + ",\"character\":" + Convert.ToString(col0)
-            + "},\"context\":{\"includeDeclaration\":true}}");
+            Json.Serialize<LspReferenceParams>(p));
         if (m.Length == 0) { return outp; }
-        int p = 0;
-        for (int count = 0; count < 1000; count = count + 1) {
-            int ui = DebugSession.IndexOf(m, "\"uri\":", p);
-            if (ui < 0) { break; }
-            string uri = DebugSession.JsonStr(m, "uri", ui);
-            int ln = DebugSession.JsonInt(m, "line", ui);
-            outp.Add(LspSession.UriToPath(uri) + "\t" + Convert.ToString(ln));
-            p = ui + 6;
+        LspLocationsResult r = Json.Deserialize<LspLocationsResult>(m);
+        if (r == null || r.result == null) { return outp; }
+        for (int i = 0; i < r.result.Count; i = i + 1) {
+            if (r.result[i].uri.Length == 0) { continue; }
+            int ln = 0;
+            if (r.result[i].range != null) {
+                JsonValue start = r.result[i].range.Get("start");
+                if (start != null) { ln = start.Int("line", 0); }
+            }
+            outp.Add(LspSession.UriToPath(r.result[i].uri) + "\t"
+                + Convert.ToString(ln));
         }
         return outp;
     }
@@ -218,11 +315,12 @@ class LspSession {
     /// the editor. Empty when the server refused the rename.
     List<string> Rename(string path, int line0, int col0, string newName) {
         List<string> outp = new List<string>();
+        LspRenameParams p = new LspRenameParams();
+        p.textDocument = LspSession.UriObj(path);
+        p.position = LspSession.PosObj(line0, col0);
+        p.newName = newName;
         string m = this.RequestWait("textDocument/rename",
-            "{\"textDocument\":{\"uri\":\"" + LspSession.PathToUri(path)
-            + "\"},\"position\":{\"line\":" + Convert.ToString(line0)
-            + ",\"character\":" + Convert.ToString(col0)
-            + "},\"newName\":\"" + DebugSession.JsonEsc(newName) + "\"}");
+            Json.Serialize<LspRenameParams>(p));
         if (m.Length == 0) { return outp; }
         return LspSession.ParseWorkspaceEdit(m);
     }
@@ -278,13 +376,33 @@ class LspSession {
         string m = this.RequestWait("textDocument/hover",
             LspSession.PosParams(path, line0, col0));
         if (m.Length == 0) { return ""; }
-        return DebugSession.JsonStr(m, "value", 0);
+        LspHoverResult r = Json.Deserialize<LspHoverResult>(m);
+        if (r == null || r.result == null) { return ""; }
+        JsonValue contents = r.result.Get("contents");
+        if (contents == null) { return ""; }
+        return contents.Str("value", "");
     }
 
     static string PosParams(string path, int line0, int col0) {
-        return "{\"textDocument\":{\"uri\":\"" + LspSession.PathToUri(path)
-            + "\"},\"position\":{\"line\":" + Convert.ToString(line0)
-            + ",\"character\":" + Convert.ToString(col0) + "}}";
+        LspDocPosParams p = new LspDocPosParams();
+        p.textDocument = LspSession.UriObj(path);
+        p.position = LspSession.PosObj(line0, col0);
+        return Json.Serialize<LspDocPosParams>(p);
+    }
+
+    /// {"uri": ...} document selector object for a native path.
+    static LspTextDocumentIdentifier UriObj(string path) {
+        LspTextDocumentIdentifier o = new LspTextDocumentIdentifier();
+        o.uri = LspSession.PathToUri(path);
+        return o;
+    }
+
+    /// {"line": ..., "character": ...} LSP position object (0-based).
+    static LspPosition PosObj(int line0, int col0) {
+        LspPosition o = new LspPosition();
+        o.line = line0;
+        o.character = col0;
+        return o;
     }
 
     /// file:///-style URI from a native path (backslashes normalized).
@@ -366,10 +484,13 @@ class LspSession {
     }
 
     void Notify(string method, string paramsJson) {
-        string body = "{\"jsonrpc\":\"2.0\",\"method\":\"" + method + "\"";
-        if (paramsJson.Length > 0) { body = body + ",\"params\":" + paramsJson; }
-        body = body + "}";
-        this.SendMsg(body);
+        LspNotification o = new LspNotification();
+        o.jsonrpc = "2.0";
+        o.method = method;
+        if (paramsJson.Length > 0) {
+            o.params = JsonValue.ParseLenient(paramsJson);
+        }
+        this.SendMsg(Json.Serialize<LspNotification>(o));
     }
 
     /// Sends a request and blocks until its response arrives (notifications
@@ -378,11 +499,14 @@ class LspSession {
         if (!this.alive) { return ""; }
         int id = this.seq;
         this.seq = this.seq + 1;
-        string body = "{\"jsonrpc\":\"2.0\",\"id\":" + Convert.ToString(id)
-            + ",\"method\":\"" + method + "\"";
-        if (paramsJson.Length > 0) { body = body + ",\"params\":" + paramsJson; }
-        body = body + "}";
-        this.SendMsg(body);
+        LspRequest o = new LspRequest();
+        o.jsonrpc = "2.0";
+        o.id = id;
+        o.method = method;
+        if (paramsJson.Length > 0) {
+            o.params = JsonValue.ParseLenient(paramsJson);
+        }
+        this.SendMsg(Json.Serialize<LspRequest>(o));
         this.waitsLeft = this.waitBudget;
         int guard = 0;
         while (guard < 100000) {

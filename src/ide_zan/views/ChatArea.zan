@@ -1,7 +1,35 @@
 using System;
+using System.Json;
 using Gui;
 using Gui.Widget;
 using Gui.Component;
+
+// ---- chat transcript persistence entities --------------------------------
+// ChatPack/ChatUnpack round-trip through Json.Serialize/Deserialize. The
+// short keys (r/t/z, m/plan) are kept so on-disk session archives written by
+// older builds stay readable; missing "z" (reason) or "d" (done) default to
+// "" / false exactly as the old reader did.
+
+class ChatMsgDoc {
+    string r;
+    string t;
+    string z;
+}
+
+class ChatPlanStepDoc {
+    string t;
+    bool d;
+}
+
+class ChatPackDoc {
+    List<ChatMsgDoc> m;
+    List<ChatPlanStepDoc> plan;
+}
+
+class ChatSessionsDoc {
+    int cur;
+    List<string> s;
+}
 
 /// The AI chat transcript view, extracted from the shell: transcript
 /// serialization (ChatPack/ChatUnpack), the wrapped markdown-aware line
@@ -114,49 +142,38 @@ class ChatArea {
     /// message content round-trips safely). The per-message reasoning ("z")
     /// rides along so switching sessions keeps each answer's thinking.
     static string ChatPack(List<AiChatMsg> msgs, List<AiPlanStep> plan) {
-        StringBuilder sb = new StringBuilder();
-        sb.Append("{\"m\": [");
+        ChatPackDoc o = new ChatPackDoc();
+        o.m = new List<ChatMsgDoc>();
         for (int i = 0; i < msgs.Count; i = i + 1) {
-            if (i > 0) { sb.Append(", "); }
-            sb.Append("{\"r\": \"" + ZanIDE.JsonEsc(msgs[i].role)
-                + "\", \"t\": \"" + ZanIDE.JsonEsc(msgs[i].text) + "\"");
-            if (msgs[i].reason != "") {
-                sb.Append(", \"z\": \"" + ZanIDE.JsonEsc(msgs[i].reason) + "\"");
-            }
-            sb.Append("}");
+            ChatMsgDoc m = new ChatMsgDoc();
+            m.r = msgs[i].role;
+            m.t = msgs[i].text;
+            m.z = msgs[i].reason;
+            o.m.Add(m);
         }
-        sb.Append("], \"plan\": [");
+        o.plan = new List<ChatPlanStepDoc>();
         for (int p = 0; p < plan.Count; p = p + 1) {
-            if (p > 0) { sb.Append(", "); }
-            string dv = "false";
-            if (plan[p].done != 0) { dv = "true"; }
-            sb.Append("{\"t\": \"" + ZanIDE.JsonEsc(plan[p].text) + "\", \"d\": "
-                + dv + "}");
+            ChatPlanStepDoc s = new ChatPlanStepDoc();
+            s.t = plan[p].text;
+            s.d = (plan[p].done != 0);
+            o.plan.Add(s);
         }
-        sb.Append("]}");
-        return sb.ToString();
+        return Json.Serialize<ChatPackDoc>(o);
     }
 
     static void ChatUnpack(string packed, List<AiChatMsg> msgs,
             List<AiPlanStep> plan) {
         if (packed == "") { return; }
-        JsonValue v = JsonValue.ParseLenient(packed);
-        if (v == null) { return; }
-        JsonValue ms = v.Get("m");
-        if (ms != null && ms.IsArray()) {
-            for (int i = 0; i < ms.Count(); i = i + 1) {
-                JsonValue m = ms.At(i);
-                msgs.Add(AiChatMsg.CreateWithReason(m.Str("r", "assistant"),
-                    m.Str("t", ""), m.Str("z", "")));
-            }
+        ChatPackDoc v = Json.Deserialize<ChatPackDoc>(packed);
+        if (v == null || v.m == null) { return; }
+        for (int i = 0; i < v.m.Count; i = i + 1) {
+            msgs.Add(AiChatMsg.CreateWithReason(v.m[i].r, v.m[i].t, v.m[i].z));
         }
-        JsonValue pl = v.Get("plan");
-        if (pl != null && pl.IsArray()) {
-            for (int j = 0; j < pl.Count(); j = j + 1) {
-                JsonValue p = pl.At(j);
+        if (v.plan != null) {
+            for (int j = 0; j < v.plan.Count; j = j + 1) {
                 int d = 0;
-                if (p.Bool("d", false)) { d = 1; }
-                plan.Add(AiPlanStep.Create(p.Str("t", ""), d));
+                if (v.plan[j].d) { d = 1; }
+                plan.Add(AiPlanStep.Create(v.plan[j].t, d));
             }
         }
     }
@@ -165,14 +182,13 @@ class ChatArea {
     /// string) plus the active index, for disk persistence. Sessions are
     /// JSON-escaped so their own quoting survives nesting.
     static string ChatPackSessions(List<AiSession> sessions, int cur) {
-        StringBuilder sb = new StringBuilder();
-        sb.Append("{\"cur\":" + Convert.ToString(cur) + ",\"s\":[");
+        ChatSessionsDoc o = new ChatSessionsDoc();
+        o.cur = cur;
+        o.s = new List<string>();
         for (int i = 0; i < sessions.Count; i = i + 1) {
-            if (i > 0) { sb.Append(","); }
-            sb.Append("\"" + ZanIDE.JsonEsc(sessions[i].pack) + "\"");
+            o.s.Add(sessions[i].pack);
         }
-        sb.Append("]}");
-        return sb.ToString();
+        return Json.Serialize<ChatSessionsDoc>(o);
     }
 
     /// Restores a session list from ChatPackSessions output; returns the
@@ -180,18 +196,12 @@ class ChatArea {
     static int ChatUnpackSessions(string packed, List<AiSession> sessions) {
         sessions.Clear();
         if (packed == "") { return 0; }
-        JsonValue v = JsonValue.ParseLenient(packed);
-        if (v == null) { return 0; }
-        JsonValue s = v.Get("s");
-        if (s != null && s.IsArray()) {
-            for (int i = 0; i < s.Count(); i = i + 1) {
-                JsonValue it = s.At(i);
-                string p = "";
-                if (it != null) { p = it.AsString(""); }
-                sessions.Add(AiSession.Create(p, 0));
-            }
+        ChatSessionsDoc v = Json.Deserialize<ChatSessionsDoc>(packed);
+        if (v == null || v.s == null) { return 0; }
+        for (int i = 0; i < v.s.Count; i = i + 1) {
+            sessions.Add(AiSession.Create(v.s[i], 0));
         }
-        int c = v.Int("cur", 0);
+        int c = v.cur;
         if (c < 0 || c >= sessions.Count) { c = 0; }
         return c;
     }
@@ -216,13 +226,10 @@ class ChatArea {
     /// Title of a packed (serialized) transcript, without unpacking it whole.
     static string ChatTitle(string packed) {
         if (packed == "") { return ""; }
-        JsonValue v = JsonValue.ParseLenient(packed);
-        if (v == null) { return ""; }
-        JsonValue ms = v.Get("m");
-        if (ms == null || !ms.IsArray()) { return ""; }
-        for (int i = 0; i < ms.Count(); i = i + 1) {
-            JsonValue m = ms.At(i);
-            if (m.Str("r", "") == "user") { return ChatArea.TitleLine(m.Str("t", "")); }
+        ChatPackDoc v = Json.Deserialize<ChatPackDoc>(packed);
+        if (v == null || v.m == null) { return ""; }
+        for (int i = 0; i < v.m.Count; i = i + 1) {
+            if (v.m[i].r == "user") { return ChatArea.TitleLine(v.m[i].t); }
         }
         return "";
     }

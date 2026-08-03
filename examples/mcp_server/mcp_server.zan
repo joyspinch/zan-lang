@@ -18,6 +18,45 @@ using System.Threading;
 ///
 /// SECURITY: binds to localhost only; every path is validated to stay
 /// inside the project root (no absolute paths, no `..` traversal).
+
+// ---- MCP protocol entities -------------------------------------------------
+// Fixed-shape JSON-RPC result bodies are declared as classes and serialized
+// with Json.Serialize<T>. The dynamic parts stay JsonValue: `inputSchema`
+// because its `properties` are a key->schema map, `capabilities` because it
+// is a sparse member map, and the JSON-RPC envelope `id`/`result`/`error`
+// because id may be a number or string and result/error are mutually
+// exclusive (a DTO would emit the unused one as null).
+
+class McpToolDoc {
+    string name;
+    string description;
+    JsonValue inputSchema;
+}
+
+class McpToolsDoc {
+    List<McpToolDoc> tools;
+}
+
+class McpServerInfoDoc {
+    string name;
+    string version;
+}
+
+class McpInitializeResultDoc {
+    string protocolVersion;
+    JsonValue capabilities;
+    McpServerInfoDoc serverInfo;
+}
+
+class McpContentItemDoc {
+    string type;
+    string text;
+}
+
+class McpCallToolResultDoc {
+    List<McpContentItemDoc> content;
+}
+
 class McpServer {
     static string root;
 
@@ -113,9 +152,15 @@ class McpServer {
         if (idv != null) { id = idv.AsString(id); }
         string rpc = v.Str("method", "");
         if (rpc == "initialize") {
+            McpInitializeResultDoc result = new McpInitializeResultDoc();
+            result.protocolVersion = "2024-11-05";
+            result.capabilities = JsonValue.NewObject();
+            result.capabilities.Put("tools", JsonValue.NewObject());
+            result.serverInfo = new McpServerInfoDoc();
+            result.serverInfo.name = "zan-ide-mcp";
+            result.serverInfo.version = "1.0";
             return McpServer.RpcResult(id,
-                "{\"protocolVersion\": \"2024-11-05\", \"capabilities\": {\"tools\": {}}, "
-                + "\"serverInfo\": {\"name\": \"zan-ide-mcp\", \"version\": \"1.0\"}}");
+                Json.Serialize<McpInitializeResultDoc>(result));
         }
         if (rpc == "notifications/initialized" || rpc == "initialized") {
             return "{}";
@@ -132,8 +177,14 @@ class McpServer {
                 targs = p.Get("arguments");
             }
             string text = McpServer.CallTool(name, targs);
+            McpCallToolResultDoc result = new McpCallToolResultDoc();
+            result.content = new List<McpContentItemDoc>();
+            McpContentItemDoc item = new McpContentItemDoc();
+            item.type = "text";
+            item.text = text;
+            result.content.Add(item);
             return McpServer.RpcResult(id,
-                "{\"content\": [{\"type\": \"text\", \"text\": \"" + McpServer.Esc(text) + "\"}]}");
+                Json.Serialize<McpCallToolResultDoc>(result));
         }
         return McpServer.RpcError(id, 0 - 32601, "method not found: " + rpc);
     }
@@ -196,30 +247,80 @@ class McpServer {
     }
 
     static string ToolsJson() {
-        string pathProp = "{\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\"}}, \"required\": [\"path\"]}";
-        string writeProp = "{\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\"}, \"content\": {\"type\": \"string\"}}, \"required\": [\"path\", \"content\"]}";
-        string noProp = "{\"type\": \"object\", \"properties\": {}}";
-        return "{\"tools\": ["
-            + "{\"name\": \"list_files\", \"description\": \"List a directory inside the Zan project (path is project-relative).\", \"inputSchema\": " + pathProp + "}, "
-            + "{\"name\": \"read_file\", \"description\": \"Read a text file inside the Zan project.\", \"inputSchema\": " + pathProp + "}, "
-            + "{\"name\": \"write_file\", \"description\": \"Write a text file inside the Zan project.\", \"inputSchema\": " + writeProp + "}, "
-            + "{\"name\": \"build\", \"description\": \"Build the Zan project (zanc build src/main.zan) and return the compiler output.\", \"inputSchema\": " + noProp + "}"
-            + "]}";
+        McpToolsDoc o = new McpToolsDoc();
+        o.tools = new List<McpToolDoc>();
+        o.tools.Add(McpServer.Tool("list_files",
+            "List a directory inside the Zan project (path is project-relative).",
+            "path"));
+        o.tools.Add(McpServer.Tool("read_file",
+            "Read a text file inside the Zan project.", "path"));
+        o.tools.Add(McpServer.Tool("write_file",
+            "Write a text file inside the Zan project.", "path", "content"));
+        o.tools.Add(McpServer.Tool("build",
+            "Build the Zan project (zanc build src/main.zan) and return the compiler output."));
+        return Json.Serialize<McpToolsDoc>(o);
+    }
+
+    /// One MCP tool declaration: name, description and an inputSchema built
+    /// from the given string-typed parameter names (none = empty schema).
+    static McpToolDoc Tool(string name, string desc) {
+        return McpServer.Tool(name, desc, "");
+    }
+
+    static McpToolDoc Tool(string name, string desc, string p1) {
+        return McpServer.Tool(name, desc, p1, "");
+    }
+
+    static McpToolDoc Tool(string name, string desc, string p1, string p2) {
+        McpToolDoc o = new McpToolDoc();
+        o.name = name;
+        o.description = desc;
+        JsonValue props = JsonValue.NewObject();
+        if (p1.Length > 0) {
+            JsonValue s1 = JsonValue.NewObject();
+            s1.Put("type", JsonValue.NewStr("string"));
+            props.Put(p1, s1);
+        }
+        if (p2.Length > 0) {
+            JsonValue s2 = JsonValue.NewObject();
+            s2.Put("type", JsonValue.NewStr("string"));
+            props.Put(p2, s2);
+        }
+        JsonValue schema = JsonValue.NewObject();
+        schema.Put("type", JsonValue.NewStr("object"));
+        schema.Put("properties", props);
+        JsonValue req = JsonValue.NewArray();
+        if (p1.Length > 0) { req.Append(JsonValue.NewStr(p1)); }
+        if (p2.Length > 0) { req.Append(JsonValue.NewStr(p2)); }
+        schema.Put("required", req);
+        o.inputSchema = schema;
+        return o;
     }
 
     static string RpcResult(string id, string resultJson) {
-        return "{\"jsonrpc\": \"2.0\", \"id\": " + McpServer.IdJson(id)
-            + ", \"result\": " + resultJson + "}";
+        JsonValue o = JsonValue.NewObject();
+        o.Put("jsonrpc", JsonValue.NewStr("2.0"));
+        o.Put("id", McpServer.IdValue(id));
+        JsonValue r = JsonValue.ParseLenient(resultJson);
+        if (r != null) { o.Put("result", r); }
+        return o.ToJson();
     }
 
     static string RpcError(string id, int code, string msg) {
-        return "{\"jsonrpc\": \"2.0\", \"id\": " + McpServer.IdJson(id)
-            + ", \"error\": {\"code\": " + Convert.ToString(code)
-            + ", \"message\": \"" + McpServer.Esc(msg) + "\"}}";
+        JsonValue o = JsonValue.NewObject();
+        o.Put("jsonrpc", JsonValue.NewStr("2.0"));
+        o.Put("id", McpServer.IdValue(id));
+        JsonValue e = JsonValue.NewObject();
+        e.Put("code", JsonValue.NewNum(Convert.ToString(code)));
+        e.Put("message", JsonValue.NewStr(msg));
+        o.Put("error", e);
+        return o.ToJson();
     }
 
-    static string IdJson(string id) {
-        if (id == "") { return "null"; }
+    /// The `id` member of a JSON-RPC message: numeric strings stay numbers
+    /// (clients may use numeric ids), everything else becomes a string.
+    static JsonValue IdValue(string id) {
+        if (id == "") { return JsonValue.NewNull(); }
         bool numeric = true;
         int i = 0;
         while (i < id.Length) {
@@ -227,24 +328,8 @@ class McpServer {
             if (ch < "0" || ch > "9") { numeric = false; }
             i = i + 1;
         }
-        if (numeric) { return id; }
-        return "\"" + McpServer.Esc(id) + "\"";
-    }
-
-    static string Esc(string s) {
-        StringBuilder sb = new StringBuilder();
-        int i = 0;
-        while (i < s.Length) {
-            string ch = s.Substring(i, 1);
-            if (ch == "\"") { sb.Append("\\\""); }
-            else if (ch == "\\") { sb.Append("\\\\"); }
-            else if (ch == "\n") { sb.Append("\\n"); }
-            else if (ch == "\r") { sb.Append("\\r"); }
-            else if (ch == "\t") { sb.Append("\\t"); }
-            else { sb.Append(ch); }
-            i = i + 1;
-        }
-        return sb.ToString();
+        if (numeric) { return JsonValue.NewNum(id); }
+        return JsonValue.NewStr(id);
     }
 
 }

@@ -2,8 +2,29 @@ using System;
 using System.Text;
 using System.Net.WebSocket.Secure;
 using System.Security.Cryptography;
+using System.Json;
 
 namespace Sdk.Wechat.Work;
+
+// ---- WSS command envelope entities ---------------------------------------
+// The aibot wire protocol: {cmd, headers:{req_id}, body}. `body` is a
+// JsonValue passthrough because callers supply arbitrary reply JSON; an empty
+// body serializes to JSON null exactly like the old raw "null" literal.
+
+class WwCommandHeaders {
+    string req_id;
+}
+
+class WwCommandEnvelope {
+    string cmd;
+    WwCommandHeaders headers;
+    JsonValue body;
+}
+
+class WwRobotAuthBody {
+    string bot_id;
+    string secret;
+}
 
 /// <summary>企业微信智能机器人 WSS 长连接客户端。</summary>
 class WechatWorkSmartRobotClient {
@@ -29,9 +50,11 @@ class WechatWorkSmartRobotClient {
         if (this.socket == null || !this.socket.IsConnected()) {
             throw new InvalidOperationException("企业微信智能机器人 WSS 连接失败");
         }
-        string body = "{\"bot_id\":\"" + Encoding.JsonEscape(botId)
-            + "\",\"secret\":\"" + Encoding.JsonEscape(secret) + "\"}";
-        await this.SendCommandAsync("aibot_subscribe", CreateRequestId(), body);
+        WwRobotAuthBody auth = new WwRobotAuthBody();
+        auth.bot_id = botId;
+        auth.secret = secret;
+        await this.SendCommandAsync("aibot_subscribe", CreateRequestId(),
+            Json.Serialize<WwRobotAuthBody>(auth));
     }
 
     async string ReceiveAsync() {
@@ -65,12 +88,14 @@ class WechatWorkSmartRobotClient {
         if (this.socket == null || !this.socket.IsConnected()) {
             throw new InvalidOperationException("企业微信智能机器人长连接尚未建立");
         }
-        string body = bodyJson;
-        if (body.Length == 0) { body = "null"; }
-        string envelope = "{\"cmd\":\"" + Encoding.JsonEscape(command)
-            + "\",\"headers\":{\"req_id\":\""
-            + Encoding.JsonEscape(requestId) + "\"},\"body\":" + body + "}";
-        await this.socket.SendText(envelope);
+        WwCommandEnvelope envelope = new WwCommandEnvelope();
+        envelope.cmd = command;
+        envelope.headers = new WwCommandHeaders();
+        envelope.headers.req_id = requestId;
+        if (bodyJson.Length > 0) {
+            envelope.body = JsonValue.ParseLenient(bodyJson);
+        }
+        await this.socket.SendText(Json.Serialize<WwCommandEnvelope>(envelope));
     }
 
     async void CloseAsync() {

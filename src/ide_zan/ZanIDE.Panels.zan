@@ -6,6 +6,31 @@ using Gui;
 using Gui.Widget;
 using Game.Scene;
 
+// ---- AI profile / chat-completion entities -------------------------------
+// The OpenAI-compatible /chat/completions request body is declared as classes
+// and serialized with Json.Serialize<T>. `limits` and `max_tokens` stay
+// JsonValue because they are optional: null serializes to JSON null, which
+// compatible endpoints treat as "unset" exactly like the old conditional
+// field. ai_profiles.json stays JsonValue too: its "base" key is a reserved
+// word in Zan (no DTO field can carry that name without changing the format).
+
+class AiChatMsgDoc {
+    string role;
+    string content;
+}
+
+class AiStreamOptionsDoc {
+    bool include_usage;
+}
+
+class AiChatBodyDoc {
+    string model;
+    bool stream;
+    AiStreamOptionsDoc stream_options;
+    List<AiChatMsgDoc> messages;
+    JsonValue max_tokens;   // set only when the enabled model has a cap
+}
+
 /// ZanIDE part: settings persistence, the parsed error list, the AI
 /// assistant plumbing (profiles / requests / chat transcripts), the git
 /// panel and integrated-terminal helpers.
@@ -379,30 +404,32 @@ partial class ZanIDE {
     }
 
     static void AiProfilesSave(int active, List<AiProfile> profiles) {
-        StringBuilder sb = new StringBuilder();
-        sb.Append("{\"active\": " + Convert.ToString(active) + ", \"profiles\": [");
+        JsonValue arr = JsonValue.NewArray();
         for (int i = 0; i < profiles.Count; i = i + 1) {
             AiProfile profile = profiles[i];
-            if (i > 0) { sb.Append(", "); }
-            sb.Append("{\"name\": \"" + ZanIDE.JsonEsc(profile.name) + "\"");
-            sb.Append(", \"base\": \"" + ZanIDE.JsonEsc(profile.baseUrl) + "\"");
-            sb.Append(", \"key\": \"" + ZanIDE.JsonEsc(profile.key) + "\"");
-            sb.Append(", \"model\": \"" + ZanIDE.JsonEsc(profile.model) + "\"");
-            sb.Append(", \"models\": [");
-            List<string> ms = ZanIDE.SplitList(profile.models);
-            for (int j = 0; j < ms.Count; j = j + 1) {
-                if (j > 0) { sb.Append(", "); }
-                sb.Append("\"" + ZanIDE.JsonEsc(ms[j]) + "\"");
+            JsonValue o = JsonValue.NewObject();
+            o.Put("name", JsonValue.NewStr(profile.name));
+            o.Put("base", JsonValue.NewStr(profile.baseUrl));
+            o.Put("key", JsonValue.NewStr(profile.key));
+            o.Put("model", JsonValue.NewStr(profile.model));
+            JsonValue ms = JsonValue.NewArray();
+            List<string> models = ZanIDE.SplitList(profile.models);
+            for (int j = 0; j < models.Count; j = j + 1) {
+                ms.Append(JsonValue.NewStr(models[j]));
             }
-            sb.Append("]");
+            o.Put("models", ms);
             string limitMap = profile.limits;
             if (limitMap == "") { limitMap = "{}"; }
-            sb.Append(", \"limits\": " + limitMap);
-            sb.Append("}");
+            JsonValue lm = JsonValue.ParseLenient(limitMap);
+            if (lm == null) { lm = JsonValue.NewObject(); }
+            o.Put("limits", lm);
+            arr.Append(o);
         }
-        sb.Append("]}");
+        JsonValue root = JsonValue.NewObject();
+        root.Put("active", JsonValue.NewNum(Convert.ToString(active)));
+        root.Put("profiles", arr);
         Directory.CreateDirectoryRecursive(ZanIDE.UserConfigDir());
-        File.WriteAllText(ZanIDE.AiProfilesPath(), sb.ToString());
+        File.WriteAllText(ZanIDE.AiProfilesPath(), root.ToJson());
     }
 
     /// Parses a run of leading digits into an int (ignores anything else); the
@@ -536,36 +563,6 @@ partial class ZanIDE {
         return r;
     }
 
-    /// Two lowercase hex digits for a byte (00-ff).
-    static string HexByte(int b) {
-        string digits = "0123456789abcdef";
-        int v = b & 255;
-        return digits.Substring(v / 16, 1) + digits.Substring(v % 16, 1);
-    }
-
-    /// Escapes a string for embedding in a JSON string literal.
-    static string JsonEsc(string s) {
-        StringBuilder sb = new StringBuilder();
-        for (int i = 0; i < s.Length; i = i + 1) {
-            string ch = s.Substring(i, 1);
-            if (ch == "\\") { sb.Append("\\\\"); }
-            else if (ch == "\"") { sb.Append("\\\""); }
-            else if (ch == "\n") { sb.Append("\\n"); }
-            else if (ch == "\r") { }
-            else if (ch == "\t") { sb.Append("\\t"); }
-            else if (s[i] < 32) {
-                // Any other control byte (a stray \b, \f or 0x01 pasted in
-                // from a terminal capture) is illegal raw inside a JSON
-                // string: left as-is it makes the whole request -- or, for a
-                // saved chat, the whole session record -- unparsable, which
-                // reads as the conversation coming back truncated.
-                sb.Append("\\u00" + ZanIDE.HexByte(s[i]));
-            }
-            else { sb.Append(ch); }
-        }
-        return sb.ToString();
-    }
-
     /// Writes the chat transcript as an OpenAI-compatible /chat/completions
     /// request and launches curl DETACHED (response + done-marker files are
     /// polled from the event loop, so the UI stays responsive). Returns "" on
@@ -601,18 +598,23 @@ partial class ZanIDE {
         }
         if (baseUrl == "") { baseUrl = "https://api.openai.com/v1"; }
         if (model == "") { model = "gpt-4o-mini"; }
-        StringBuilder body = new StringBuilder();
         // stream_options.include_usage: OpenAI-compatible endpoints only put
         // the token counts in the final chunk of a stream when asked, and the
         // usage card is only honest when they arrive.
-        body.Append("{\"model\":\"" + ZanIDE.JsonEsc(model)
-            + "\",\"stream\":true,\"stream_options\":{\"include_usage\":true}"
-            + ",\"messages\":[");
+        AiChatBodyDoc body = new AiChatBodyDoc();
+        body.model = model;
+        body.stream = true;
+        body.stream_options = new AiStreamOptionsDoc();
+        body.stream_options.include_usage = true;
+        body.messages = new List<AiChatMsgDoc>();
         // The standing instructions, the tool protocol, the open file and the
         // RepoMap outline all come from the agent layer, so the loop that runs
         // the tools and the prompt that describes them can never drift apart.
         string sysMsg = AiAgent.SystemPrompt(ctxName, ctxCode, projRoot);
-        body.Append("{\"role\":\"system\",\"content\":\"" + ZanIDE.JsonEsc(sysMsg) + "\"}");
+        AiChatMsgDoc sys = new AiChatMsgDoc();
+        sys.role = "system";
+        sys.content = sysMsg;
+        body.messages.Add(sys);
         // Fold the oldest turns into a digest once the transcript passes the
         // budget, so a long agent session keeps working instead of growing
         // until it overflows the model's context window.
@@ -624,24 +626,24 @@ partial class ZanIDE {
             string role = msgs2.msgs[i].role;
             if (role == "tool") { role = "user"; }
             if (role == "user" || role == "assistant") {
-                body.Append(",{\"role\":\"" + role + "\",\"content\":\""
-                    + ZanIDE.JsonEsc(msgs2.msgs[i].text) + "\"}");
+                AiChatMsgDoc m = new AiChatMsgDoc();
+                m.role = role;
+                m.content = msgs2.msgs[i].text;
+                body.messages.Add(m);
             }
         }
-        body.Append("]");
         // Apply the enabled model's configured maximum output length.
         int maxOut = AiAgent.MaxOutTokens();
         if (maxOut > 0) {
-            body.Append(",\"max_tokens\":" + Convert.ToString(maxOut));
+            body.max_tokens = JsonValue.NewNum(Convert.ToString(maxOut));
         }
-        body.Append("}");
         // The request is made with the Net standard library on a worker
         // thread that streams the decoded response into an in-memory sink;
         // the panel reads the sink each frame for incremental output.
         // Certificate verification stays on (the platform trust store is
         // bridged into OpenSSL by the Tls layer).
         string serr = AiNet.Start(baseUrl, "/chat/completions", key,
-            body.ToString(), 600000, true);
+            Json.Serialize<AiChatBodyDoc>(body), 600000, true);
         // Counted here, at the one place every request (question, tool result,
         // retry, continue) actually goes out, so the usage panel can never
         // drift from what was really sent.

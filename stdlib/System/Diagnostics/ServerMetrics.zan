@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using System.Json;
 
 namespace System.Diagnostics;
 
@@ -37,6 +38,50 @@ class SlowEntry {
         this.text = text;
         this.ms = ms;
     }
+}
+
+// ---- metrics-snapshot entities -------------------------------------------
+// SnapshotJson is declared as classes and serialized with Json.Serialize<T>;
+// the JSON keys match the documented /admin/stats shape exactly.
+
+class ServerMetricsRequestDoc {
+    long count;
+    long errors;
+    long avg_ms;
+    long max_ms;
+    long slow_threshold_ms;
+    long slow_count;
+}
+
+class ServerMetricsQueryDoc {
+    long count;
+    long avg_ms;
+    long max_ms;
+    long slow_threshold_ms;
+    long slow_count;
+}
+
+class ServerSlowRequestDoc {
+    string req;
+    long ms;
+}
+
+class ServerSlowQueryDoc {
+    string sql;
+    long ms;
+}
+
+class ServerMetricsDoc {
+    long uptime_ms;
+    long pid;
+    long worker_id;
+    long cpu_ms;
+    long cpu_percent;
+    long mem_rss_bytes;
+    ServerMetricsRequestDoc requests;
+    ServerMetricsQueryDoc queries;
+    List<ServerSlowRequestDoc> slow_requests;
+    List<ServerSlowQueryDoc> slow_queries;
 }
 
 class ServerMetrics {
@@ -247,54 +292,26 @@ class ServerMetrics {
         }
     }
 
-    static string JsonEsc(string s) {
-        StringBuilder sb = new StringBuilder();
-        int i = 0;
-        while (i < s.Length) {
-            string c = s.Substring(i, 1);
-            if (c == "\"") { sb.Append("\\\""); }
-            else if (c == "\\") { sb.Append("\\\\"); }
-            else if (c == "\n") { sb.Append("\\n"); }
-            else if (c == "\r") { sb.Append("\\r"); }
-            else if (c == "\t") { sb.Append("\\t"); }
-            else { sb.Append(c); }
-            i = i + 1;
-        }
-        return sb.ToString();
-    }
-
-    string SlowReqJson() {
-        StringBuilder sb = new StringBuilder();
-        sb.Append("[");
-        bool first = true;
+    List<ServerSlowRequestDoc> SlowReqDocs() {
+        List<ServerSlowRequestDoc> outp = new List<ServerSlowRequestDoc>();
         foreach (SlowEntry e in this.slowReqs) {
-            if (!first) { sb.Append(","); }
-            sb.Append("{\"req\":\"");
-            sb.Append(ServerMetrics.JsonEsc(e.text));
-            sb.Append("\",\"ms\":");
-            sb.Append(Convert.ToString(e.ms));
-            sb.Append("}");
-            first = false;
+            ServerSlowRequestDoc o = new ServerSlowRequestDoc();
+            o.req = e.text;
+            o.ms = e.ms;
+            outp.Add(o);
         }
-        sb.Append("]");
-        return sb.ToString();
+        return outp;
     }
 
-    string SlowQueryJson() {
-        StringBuilder sb = new StringBuilder();
-        sb.Append("[");
-        bool first = true;
+    List<ServerSlowQueryDoc> SlowQueryDocs() {
+        List<ServerSlowQueryDoc> outp = new List<ServerSlowQueryDoc>();
         foreach (SlowEntry e in this.slowQueries) {
-            if (!first) { sb.Append(","); }
-            sb.Append("{\"sql\":\"");
-            sb.Append(ServerMetrics.JsonEsc(e.text));
-            sb.Append("\",\"ms\":");
-            sb.Append(Convert.ToString(e.ms));
-            sb.Append("}");
-            first = false;
+            ServerSlowQueryDoc o = new ServerSlowQueryDoc();
+            o.sql = e.text;
+            o.ms = e.ms;
+            outp.Add(o);
         }
-        sb.Append("]");
-        return sb.ToString();
+        return outp;
     }
 
     /// <summary>Full metrics snapshot as JSON. Recomputes CPU% from the delta
@@ -319,46 +336,32 @@ class ServerMetrics {
         long qAvg = 0;
         if (this.queryCount > 0) { qAvg = this.queryTotalMs / this.queryCount; }
 
-        StringBuilder sb = new StringBuilder();
-        sb.Append("{\"uptime_ms\":");
-        sb.Append(Convert.ToString(uptime));
-        sb.Append(",\"pid\":");
-        sb.Append(Convert.ToString(ProcessHost.Pid()));
-        sb.Append(",\"worker_id\":");
-        sb.Append(Convert.ToString(ProcessHost.WorkerId()));
-        sb.Append(",\"cpu_ms\":");
-        sb.Append(Convert.ToString(cpuMs));
-        sb.Append(",\"cpu_percent\":");
-        sb.Append(Convert.ToString(cpuPct));
-        sb.Append(",\"mem_rss_bytes\":");
-        sb.Append(Convert.ToString(ServerMetrics.MemoryRssBytes()));
-        sb.Append(",\"requests\":{\"count\":");
-        sb.Append(Convert.ToString(this.reqCount));
-        sb.Append(",\"errors\":");
-        sb.Append(Convert.ToString(this.reqErrors));
-        sb.Append(",\"avg_ms\":");
-        sb.Append(Convert.ToString(reqAvg));
-        sb.Append(",\"max_ms\":");
-        sb.Append(Convert.ToString(this.reqMaxMs));
-        sb.Append(",\"slow_threshold_ms\":");
-        sb.Append(Convert.ToString(this.slowReqMs));
-        sb.Append(",\"slow_count\":");
-        sb.Append(Convert.ToString(this.slowReqs.Count));
-        sb.Append("},\"queries\":{\"count\":");
-        sb.Append(Convert.ToString(this.queryCount));
-        sb.Append(",\"avg_ms\":");
-        sb.Append(Convert.ToString(qAvg));
-        sb.Append(",\"max_ms\":");
-        sb.Append(Convert.ToString(this.queryMaxMs));
-        sb.Append(",\"slow_threshold_ms\":");
-        sb.Append(Convert.ToString(this.slowQueryMs));
-        sb.Append(",\"slow_count\":");
-        sb.Append(Convert.ToString(this.slowQueries.Count));
-        sb.Append("},\"slow_requests\":");
-        sb.Append(this.SlowReqJson());
-        sb.Append(",\"slow_queries\":");
-        sb.Append(this.SlowQueryJson());
-        sb.Append("}");
-        return sb.ToString();
+        ServerMetricsRequestDoc requests = new ServerMetricsRequestDoc();
+        requests.count = this.reqCount;
+        requests.errors = this.reqErrors;
+        requests.avg_ms = reqAvg;
+        requests.max_ms = this.reqMaxMs;
+        requests.slow_threshold_ms = this.slowReqMs;
+        requests.slow_count = this.slowReqs.Count;
+
+        ServerMetricsQueryDoc queries = new ServerMetricsQueryDoc();
+        queries.count = this.queryCount;
+        queries.avg_ms = qAvg;
+        queries.max_ms = this.queryMaxMs;
+        queries.slow_threshold_ms = this.slowQueryMs;
+        queries.slow_count = this.slowQueries.Count;
+
+        ServerMetricsDoc o = new ServerMetricsDoc();
+        o.uptime_ms = uptime;
+        o.pid = ProcessHost.Pid();
+        o.worker_id = ProcessHost.WorkerId();
+        o.cpu_ms = cpuMs;
+        o.cpu_percent = cpuPct;
+        o.mem_rss_bytes = ServerMetrics.MemoryRssBytes();
+        o.requests = requests;
+        o.queries = queries;
+        o.slow_requests = this.SlowReqDocs();
+        o.slow_queries = this.SlowQueryDocs();
+        return Json.Serialize<ServerMetricsDoc>(o);
     }
 }
