@@ -1,0 +1,73 @@
+using System;
+using ZanWeb;
+using System.Web;
+
+// pkg-mall -- ZanWeb enterprise web application (layered).
+//
+// main.zan only bootstraps the server and wires routes. Request handling lives
+// in controllers (src/controller), data access in models (src/model), and the
+// cross-cutting plumbing in the framework (src/framework). All runtime settings
+// are parsed ONCE from config/app.json into the typed Cfg entity (Cfg.Server.*,
+// Cfg.Db.*, Cfg.Worker.*, ...) and are NOT compiled into the binary -- edit the
+// file and restart to change host / port / limits / database / cache / workers.
+class Program {
+    // Slow-request threshold (ms), loaded from [log].slowMs at startup.
+    static int slowMs = 1000;
+
+    static void Main() {
+        Cfg.Load("config/app.json");
+        if (!MallDb.Ensure()) {
+            Console.WriteLine("[schema] database unavailable");
+            return;
+        }
+
+        WebApp app = WebApp.Create(Cfg.Server.host, Cfg.Server.port);
+        app.MaxBody(Cfg.Server.maxBodyMB * 1024 * 1024);
+        app.GlobalLimit(Cfg.Server.globalLimitPerSec);
+        WebHost.Use(app);
+        app.AuthResolver(IdentityToken.Resolve);
+        app.PermissionResolver(Identity.Allow);
+        app.RankResolver(Identity.Rank);
+        app.Views("src/controller");    // templates live next to their controllers
+
+        // ---- lifecycle hooks (compile-time typed, run in order) ----
+        // Access logging is OFF by default: a synchronous console write on every
+        // request is a real throughput/CPU cost under load. Turn on [log].access
+        // in app.json when you need to watch requests live.
+        if (Cfg.Log.access) {
+            app.Before(Program.AccessLog);
+        }
+        Program.slowMs = Cfg.Log.slowMs;
+        app.After(Program.Metrics);
+
+        // ---- routes ----
+        // Routes are generated at COMPILE TIME from the [Route]/[Http*]/[Custom]/
+        // [Description] attributes on the controller actions: the compiler's
+        // attr-route pass discovers every controller + action, merges class-level
+        // defaults with method-level overrides, expands [controller]/[action]
+        // tokens, and synthesizes __AttrRoutes.Register(app) below. Add a
+        // controller/action + attributes and rebuild -- no route table, no
+        // generated file to maintain, no external tool. Custom auth ranks plug
+        // in via app.RankResolver(...).
+        __AttrRoutes.Register(app);
+
+        // Single process, or N workers per config. Use
+        // WebServer.RunCommand(app, Cfg.Worker.count) instead to get the
+        // start / start -d / stop / restart / reload / status command line.
+        int r = await WebServer.Run(app, Cfg.Worker.count, Cfg.Worker.daemon);
+    }
+
+    // ---- hooks ----
+
+    static bool AccessLog(HttpContext ctx) {
+        //Console.WriteLine("[req] " + ctx.method + " " + ctx.path);
+        return true;   // false would short-circuit the request
+    }
+
+    static void Metrics(HttpContext ctx, int elapsedMs) {
+        if (elapsedMs > Program.slowMs) {
+            Console.WriteLine("[slow] " + ctx.method + " " + ctx.path + " "
+                + Convert.ToString(elapsedMs) + "ms");
+        }
+    }
+}

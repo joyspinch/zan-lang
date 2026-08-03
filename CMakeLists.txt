@@ -941,6 +941,29 @@ foreach(_field_init_kind static instance generic)
     PROPERTIES TIMEOUT 60)
 endforeach()
 
+# Typed-ORM queries must reject literal/column type mismatches at compile
+# time. dbgen used to lower `p.num == "abc"` / `p.name == 123` to a bound
+# parameter of the wrong shape, silently running a type-coerced comparison.
+foreach(_mismatch int_string string_int)
+  add_test(NAME diag_orm_where_${_mismatch}
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/orm_where_${_mismatch}.zan
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_orm_where_${_mismatch}${_exe_ext}
+      "-DEXPECT_REGEX=type mismatch"
+      -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+  set_tests_properties(diag_orm_where_${_mismatch} PROPERTIES TIMEOUT 60)
+endforeach()
+
+add_test(NAME diag_orm_set_string_int
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/orm_set_string_int.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_orm_set_string_int${_exe_ext}
+    "-DEXPECT_REGEX=type mismatch"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_orm_set_string_int PROPERTIES TIMEOUT 60)
+
 # A33-1: delegates cannot capture a receiver or enclosing locals yet. Every
 # shape that used to silently lower to a bare function pointer (and crashed at
 # runtime with 0xC0000005) must be a compile error.
@@ -990,6 +1013,19 @@ add_test(NAME diag_enum_unknown_member
     "-DEXPECT_REGEX=enum type 'Kind' has no member 'NoSuchMember'"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_enum_unknown_member PROPERTIES TIMEOUT 60)
+
+# A member access on a builtin scalar type (string/int/...) must be a compile
+# error: irgen used to silently lower it to the constant 0, which crashed at
+# runtime when the zero was used as a pointer (`tabs[i].path.path`, the IDE's
+# help-page close crash).
+add_test(NAME diag_scalar_member_access
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/scalar_member_access.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_scalar_member_access${_exe_ext}
+    "-DEXPECT_REGEX=type 'string' has no member 'path'"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_scalar_member_access PROPERTIES TIMEOUT 60)
 
 # ---- Golden compiler regression tests ----
 # Freeze the lexer token stream and parse tree for a set of hermetic (stdlib-free)

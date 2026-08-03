@@ -2334,6 +2334,31 @@ static LLVMValueRef emit_expr_string_interp(zan_irgen_t *g, zan_ast_node_t *expr
 
 static LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr,
         local_scope_t *locals) {
+        /* Guard: a member access whose receiver is a builtin scalar type is
+         * only valid for the compiler-lowered string.Length property. Any
+         * other name was a typo that the checker rejects; this second line of
+         * defence emits an error instead of silently lowering to the constant
+         * 0 (which crashed when the zero was later used as a pointer —
+         * `tabs[i].path.path`). */
+        {
+            zan_type_t *mt = infer_expr_type(g, expr->member.object, locals);
+            if (mt && mt->kind != TYPE_CLASS && mt->kind != TYPE_STRUCT &&
+                mt->kind != TYPE_INTERFACE && mt->kind != TYPE_ENUM &&
+                mt->kind != TYPE_ARRAY && mt->kind != TYPE_NULLABLE &&
+                mt->kind != TYPE_DELEGATE && mt->kind != TYPE_TYPE_PARAM &&
+                mt->kind != TYPE_OBJECT && mt->kind != TYPE_ERROR &&
+                mt->kind != TYPE_VOID && !is_span_type(mt)) {
+                bool is_len = expr->member.name.len == 6 &&
+                    memcmp(expr->member.name.str, "Length", 6) == 0;
+                if (!(mt->kind == TYPE_STRING && is_len)) {
+                    zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+                        "type '%s' has no member '%.*s'",
+                        mt->name.str ? mt->name.str : "?",
+                        (int)expr->member.name.len, expr->member.name.str);
+                    return LLVMConstInt(LLVMInt64TypeInContext(g->ctx), 0, 0);
+                }
+            }
+        }
         /* Math.PI → constant */
         if (expr->member.object->kind == AST_IDENTIFIER) {
             zan_istr_t obj = expr->member.object->ident.name;
@@ -3085,6 +3110,15 @@ static LLVMValueRef emit_expr_query_expr(zan_irgen_t *g, zan_ast_node_t *expr,
 
 static LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
         local_scope_t *locals) {
+        /* Anonymous object literal `new { ... }` must have been consumed by
+         * the dbgen query pass; anything that survives to codegen is an error
+         * (it has no real runtime type). */
+        if (!expr->new_expr.type) {
+            zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+                "anonymous object `new { ... }` is only valid inside a typed "
+                "ORM query (GroupBy/ToList/ToAggregate)");
+            return LLVMConstNull(LLVMInt8TypeInContext(g->ctx));
+        }
         /* new Span<T>(nint base, int length) -- non-owning raw-memory view */
         if (expr->new_expr.type && expr->new_expr.type->kind == AST_TYPE_REF &&
             !expr->new_expr.is_array) {

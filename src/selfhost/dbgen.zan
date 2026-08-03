@@ -166,6 +166,14 @@ class Dbgen {
         return e;
     }
 
+    Node NbCastDouble(Node expr) {
+        Node t = new Node(AK.TypeRef());
+        t.sval = "double";
+        Node e = new Node(AK.CastExpr());
+        e.type = t; e.b = expr; e.line = expr.line; e.col = expr.col;
+        return e;
+    }
+
     // ---- WHERE fragment builder ----
     // The fragment is accumulated as literal text plus runtime expression
     // segments (for dynamic IN mark counts), folded into a string-concat
@@ -230,13 +238,50 @@ class Dbgen {
 
     void WfCol(int fi) { WfText("t." + fNames[fi]); }
 
+    // Compile-time literal/field type matching: catches the common
+    // `p.name == 123` / `p.num == "abc"` mistakes with a clear diagnostic.
+    // Returns "" when the literal shape matches the column, else a message.
+    // Non-literals (identifiers, calls) are trusted to the generated code.
+    string LiteralMismatch(int fi, Node e) {
+        Node lit = e;
+        if (e.kind == AK.Unary() && (e.op == TK.Minus() || e.op == TK.Plus())) {
+            lit = e.a;
+        }
+        int k = fKinds[fi];
+        if (lit.kind == AK.IntLiteral() || lit.kind == AK.CharLiteral()) {
+            if (k == Dbgen.DfInt() || k == Dbgen.DfEnum() || k == Dbgen.DfDouble()) { return ""; }
+            if (k == Dbgen.DfString()) { return "type mismatch: string column compared to an int value"; }
+            return "type mismatch: numeric value for a non-numeric column";
+        }
+        if (lit.kind == AK.FloatLiteral()) {
+            if (k == Dbgen.DfDouble()) { return ""; }
+            return "type mismatch: double value compared to a non-double column";
+        }
+        if (lit.kind == AK.StringLiteral()) {
+            if (k == Dbgen.DfString()) { return ""; }
+            return "type mismatch: string value compared to a numeric column";
+        }
+        if (lit.kind == AK.BoolLiteral()) {
+            if (k == Dbgen.DfBool()) { return ""; }
+            return "type mismatch: bool value compared to a non-bool column";
+        }
+        return "";
+    }
+
     // Emits `?` and records the bind for a scalar comparison value.
     void WfValue(int fi, Node e) {
+        string msg = LiteralMismatch(fi, e);
+        if (msg != "") { WfErr(msg, e.line, e.col); return; }
         WfText("?");
         int k = fKinds[fi];
         if (k == Dbgen.DfInt()) { WfBind(2, e); }
         else if (k == Dbgen.DfEnum()) { WfBind(2, NbCastInt(e)); }
-        else if (k == Dbgen.DfDouble()) { WfBind(3, e); }
+        else if (k == Dbgen.DfDouble()) {
+            // int expressions are promoted to double: a bare Pd(intExpr) would
+            // fail LLVM verification, so cast except for a plain double literal.
+            if (e.kind == AK.FloatLiteral()) { WfBind(3, e); }
+            else { WfBind(3, NbCastDouble(e)); }
+        }
         else if (k == Dbgen.DfString()) { WfBind(1, e); }
         else { WfErr("unsupported column type in comparison", e.line, e.col); }
     }
@@ -251,15 +296,174 @@ class Dbgen {
         return "";
     }
 
-    // p.f.Method(arg) conditions: Like/NotLike/Contains/StartsWith/EndsWith/
-    // In/NotIn. Returns true when `e` was recognized as a column method.
+    // Binds `?` for a scalar value of the given column-kind (used by aggregate
+    // comparisons where the value side has no real column).
+    void WfValueKind(int k, Node e) {
+        WfText("?");
+        if (k == Dbgen.DfInt()) { WfBind(2, e); }
+        else if (k == Dbgen.DfEnum()) { WfBind(2, NbCastInt(e)); }
+        else if (k == Dbgen.DfDouble()) {
+            if (e.kind == AK.FloatLiteral()) { WfBind(3, e); }
+            else { WfBind(3, NbCastDouble(e)); }
+        }
+        else if (k == Dbgen.DfString()) { WfBind(1, e); }
+        else { WfErr("unsupported aggregate comparison value", e.line, e.col); }
+    }
+
+    // FreeSQL-style aggregate in a condition: `p.Count()`, `p.Sum(x => x.col)`,
+    // `p.Avg/Max/Min(x => x.col)`. Emits the SQL text and reports the
+    // comparison value kind. Returns the aggregate name, or "" when `e` is not
+    // an aggregate call on the lambda parameter.
+    string AggCall(Node e, ref int outKind) {
+        if (e == null || e.kind != AK.Call()) { return ""; }
+        Node callee = e.a;
+        if (callee == null || callee.kind != AK.MemberAccess()) { return ""; }
+        Node recv = callee.a;
+        if (recv == null || recv.kind != AK.Identifier() || recv.sval != pname) { return ""; }
+        string mn = callee.sval;
+        string fn = "";
+        if (mn == "Count") { fn = "COUNT"; }
+        else if (mn == "Sum") { fn = "SUM"; }
+        else if (mn == "Avg") { fn = "AVG"; }
+        else if (mn == "Max") { fn = "MAX"; }
+        else if (mn == "Min") { fn = "MIN"; }
+        else { return ""; }
+        if (fn == "COUNT") {
+            if (e.kids.Count != 0) {
+                WfErr("Count() takes no arguments", e.line, e.col);
+                return fn;
+            }
+            WfText("COUNT(*)");
+            outKind = Dbgen.DfInt();
+            return fn;
+        }
+        if (e.kids.Count != 1) {
+            WfErr(fn + " requires x => x.<column>", e.line, e.col);
+            return fn;
+        }
+        Node lam = e.kids[0];
+        if (lam == null || lam.kind != AK.Lambda() || lam.kids.Count < 1) {
+            WfErr(fn + " expects x => x.<column>", e.line, e.col);
+            return fn;
+        }
+        Node body = lam.b;
+        if (body == null || body.kind != AK.MemberAccess() || body.a == null ||
+            body.a.kind != AK.Identifier() || body.a.sval != lam.a.sval) {
+            WfErr(fn + " expects x => x.<column>", e.line, e.col);
+            return fn;
+        }
+        int ci = FieldIndex(body.sval);
+        if (ci < 0 || fKinds[ci] == Dbgen.DfNav()) {
+            WfErr(fn + " expects a scalar column", e.line, e.col);
+            return fn;
+        }
+        WfText(fn + "(t." + body.sval + ")");
+        if (mn == "Avg") { outKind = Dbgen.DfDouble(); }
+        else { outKind = fKinds[ci]; }
+        return fn;
+    }
+
+    // p.f.Method(arg) conditions: null tests, Between/NotBetween, comparison
+    // methods (Eq/Ne/Gt/Ge/Lt/Le), and the string matching Like/NotLike/
+    // Contains/StartsWith/EndsWith/In/NotIn. Returns true when `e` was
+    // recognized as a column method.
     bool WhereMethod(Node e) {
         if (e.kind != AK.Call()) { return false; }
         Node callee = e.a;
         if (callee == null || callee.kind != AK.MemberAccess()) { return false; }
         int col = AsColumn(callee.a);
-        if (col < 0) { return false; }
         string mn = callee.sval;
+
+        // FreeSQL-style `list.Contains(p.col)` -> `p.col IN (?, ...)`. The
+        // receiver is a List (not a column) and the sole argument is a column;
+        // `!list.Contains(p.col)` is handled by the NOT wrapper in
+        // WhereCond. Mirrors `new[]{1,2,3}.Contains(a.Id)` from the docs.
+        if (col < 0 && mn == "Contains" && e.kids.Count == 1) {
+            int inner = AsColumn(e.kids[0]);
+            if (inner >= 0 && fKinds[inner] != Dbgen.DfBool()) {
+                Node list = callee.a;
+                if (MentionsParam(list)) {
+                    WfErr("the list receiver must not reference the lambda parameter", list.line, list.col);
+                    return true;
+                }
+                WfCol(inner);
+                WfText(" IN (");
+                Node cnt = NbMember(list, "Count", list.line, list.col);
+                Node m = NbCall1(NbMember(NbIdent("__DbBind", list.line, list.col), "M", list.line, list.col), cnt, list.line, list.col);
+                WfExpr(m);
+                WfText(")");
+                int k = fKinds[inner];
+                if (k == Dbgen.DfInt() || k == Dbgen.DfEnum()) { WfBind(4, list); }
+                else if (k == Dbgen.DfString()) { WfBind(5, list); }
+                else if (k == Dbgen.DfDouble()) { WfBind(6, list); }
+                else { WfErr("Contains requires an int/string/double column", e.line, e.col); }
+                return true;
+            }
+            return false;
+        }
+
+        if (col < 0) { return false; }
+
+        if (mn == "IsNull" || mn == "IsNotNull") {
+            if (e.kids.Count != 0) {
+                WfErr("IsNull/IsNotNull take no arguments", e.line, e.col);
+                return true;
+            }
+            WfCol(col);
+            if (mn == "IsNull") { WfText(" IS NULL"); } else { WfText(" IS NOT NULL"); }
+            return true;
+        }
+        if (mn == "Between" || mn == "NotBetween") {
+            if (e.kids.Count != 2) {
+                WfErr("Between/NotBetween take exactly two arguments", e.line, e.col);
+                return true;
+            }
+            if (fKinds[col] != Dbgen.DfInt() && fKinds[col] != Dbgen.DfEnum()
+                && fKinds[col] != Dbgen.DfDouble()) {
+                WfErr("Between requires an int/double/enum column", e.line, e.col);
+                return true;
+            }
+            int bi = 0;
+            while (bi < 2) {
+                if (MentionsParam(e.kids[bi])) {
+                    WfErr("argument must not reference the lambda parameter", e.kids[bi].line, e.kids[bi].col);
+                    return true;
+                }
+                bi = bi + 1;
+            }
+            WfCol(col);
+            if (mn == "Between") { WfText(" BETWEEN "); } else { WfText(" NOT BETWEEN "); }
+            WfValue(col, e.kids[0]);
+            WfText(" AND ");
+            WfValue(col, e.kids[1]);
+            return true;
+        }
+        string cmp = "";
+        if (mn == "Eq") { cmp = " = "; }
+        else if (mn == "Ne") { cmp = " <> "; }
+        else if (mn == "Gt") { cmp = " > "; }
+        else if (mn == "Ge") { cmp = " >= "; }
+        else if (mn == "Lt") { cmp = " < "; }
+        else if (mn == "Le") { cmp = " <= "; }
+        if (cmp != "") {
+            if (e.kids.Count != 1) {
+                WfErr("comparison method takes exactly one argument", e.line, e.col);
+                return true;
+            }
+            if (fKinds[col] == Dbgen.DfBool()) {
+                WfErr("bool columns compare with == / !=", e.line, e.col);
+                return true;
+            }
+            if (MentionsParam(e.kids[0])) {
+                WfErr("argument must not reference the lambda parameter", e.kids[0].line, e.kids[0].col);
+                return true;
+            }
+            WfCol(col);
+            WfText(cmp);
+            WfValue(col, e.kids[0]);
+            return true;
+        }
+
         if (e.kids.Count != 1) {
             WfErr("column method takes exactly one argument", e.line, e.col);
             return true;
@@ -309,7 +513,7 @@ class Dbgen {
             else { WfErr("In requires an int/string/double column", e.line, e.col); }
             return true;
         }
-        WfErr("unsupported column method (expected Like/NotLike/Contains/StartsWith/EndsWith/In/NotIn)", e.line, e.col);
+        WfErr("unsupported column method (expected Eq/Ne/Gt/Ge/Lt/Le/Between/NotBetween/IsNull/IsNotNull/Like/NotLike/Contains/StartsWith/EndsWith/In/NotIn)", e.line, e.col);
         return true;
     }
 
@@ -368,6 +572,34 @@ class Dbgen {
                 col = rc;
                 val = l;
                 op = SqlOp(e.op, true);
+            }
+            if (col < 0 && rc < 0) {
+                // FreeSQL-style aggregate comparison: `p.Count() > n`,
+                // `p.Sum(x => x.amount) >= n`, ... The aggregate emits its
+                // own SQL text; the scalar side binds like a column value.
+                int ak = 0;
+                string af = AggCall(l, ref ak);
+                if (af != "") {
+                    if (!wOk) { return; }
+                    if (MentionsParam(r)) {
+                        WfErr("value side must not reference the lambda parameter", r.line, r.col);
+                        return;
+                    }
+                    WfText(op);
+                    WfValueKind(ak, r);
+                    return;
+                }
+                af = AggCall(r, ref ak);
+                if (af != "") {
+                    if (!wOk) { return; }
+                    if (MentionsParam(l)) {
+                        WfErr("value side must not reference the lambda parameter", l.line, l.col);
+                        return;
+                    }
+                    WfValueKind(ak, l);
+                    WfText(op);
+                    return;
+                }
             }
             if (col < 0) {
                 WfErr("one side of a comparison must be a lambda-parameter field (e.g. p.age > x)", e.line, e.col);
@@ -573,6 +805,90 @@ class Dbgen {
         call.kids = new List<Node>();
     }
 
+    void RewriteHaving(Node call, string cls) {
+        Node lambda = call.kids[0];
+        if (lambda.kind != AK.Lambda() || LambdaParamCount(lambda) != 1) {
+            diags.Error("db.Query<T>().Having expects a one-parameter lambda", call.line, call.col);
+            return;
+        }
+        Node body = lambda.a;
+        if (body == null) {
+            diags.Error("Having lambda must be an expression (no block body)", call.line, call.col);
+            return;
+        }
+        LoadFields(cls);
+        wLit = "";
+        wExpr = null;
+        wLine = call.line;
+        wCol = call.col;
+        wParam = LambdaParamName(lambda, 0);
+        bindKinds = new List<int>();
+        bindExprs = new List<Node>();
+        wOk = true;
+        WhereCond(body);
+        if (!wOk) { return; }
+        WfFlush();
+        Node frag = wExpr;
+        if (frag == null) { return; }
+        Node recv = call.a.a;
+        Node node = NbCall1(NbMember(recv, "H", call.line, call.col), frag, call.line, call.col);
+        int i = 0;
+        while (i < bindKinds.Count) {
+            node = NbCall1(NbMember(node, BindMethod(bindKinds[i]), call.line, call.col), bindExprs[i], call.line, call.col);
+            i = i + 1;
+        }
+        CopyInto(call, node);
+    }
+
+    void RewriteGroupBy(Node call, string cls) {
+        Node lambda = call.kids[0];
+        string pname = "";
+        if (lambda.kind == AK.Lambda() && LambdaParamCount(lambda) == 1) { pname = lambda.a.sval; }
+        LoadFields(cls);
+        Node body = lambda.b;
+        string gb = "";
+        if (body != null && body.kind == AK.NewExpr()) {
+            // p => new { p.col1, p.col2, ... } -- multi-column grouping.
+            int i = 0;
+            while (i < body.kids.Count) {
+                Node arg = body.kids[i];
+                int ci = -1;
+                if (arg.kind == AK.MemberAccess() && arg.a.kind == AK.Ident() && arg.a.sval == pname) {
+                    ci = FieldIndex(arg.sval);
+                }
+                if (ci < 0 || fKinds[ci] == Dbgen.DfNav()) {
+                    diags.Error("GroupBy member must be p => p.<scalar field>", arg.line, arg.col);
+                    return;
+                }
+                if (gb.Length > 0) { gb = gb + ", "; }
+                gb = gb + "t." + fNames[ci];
+                i = i + 1;
+            }
+            if (gb.Length == 0) {
+                diags.Error("GroupBy new { } must name at least one field", body.line, body.col);
+                return;
+            }
+        } else {
+            int col = FieldIndex(body.sval);
+            if (body == null || body.kind != AK.MemberAccess() || body.a == null
+                || body.a.kind != AK.Ident() || body.a.sval != pname
+                || col < 0 || fKinds[col] == Dbgen.DfNav()) {
+                diags.Error("GroupBy expects p => p.<scalar field>", call.line, call.col);
+                return;
+            }
+            gb = "t." + fNames[col];
+        }
+        Node arg = NbStr(gb, call.line, call.col);
+        call.a.sval = "GB";
+        call.kids = new List<Node>();
+        call.Add(arg);
+    }
+
+    void RewriteDistinct(Node call) {
+        call.a.sval = "DISTINCT";
+        call.kids = new List<Node>();
+    }
+
     // ---- AST walk ----
 
     void VisitCall(Node e) {
@@ -593,12 +909,22 @@ class Dbgen {
         bool isOb = mn == "OrderBy";
         bool isObd = mn == "OrderByDescending";
         bool isInc = mn == "Include";
-        if (!isWhere && !isOb && !isObd && !isInc) { return; }
-        if (e.kids.Count != 1 || e.kids[0].kind != AK.Lambda()) { return; }
+        bool isGroupBy = mn == "GroupBy";
+        bool isHaving = mn == "Having";
+        bool isDistinct = mn == "Distinct";
+        if (!isWhere && !isOb && !isObd && !isInc && !isGroupBy
+            && !isHaving && !isDistinct) { return; }
         string entity = ChainEntity(callee.a);
         if (entity == "") { return; }
+        if (isDistinct) {
+            if (e.kids.Count == 0) { RewriteDistinct(e); }
+            return;
+        }
+        if (e.kids.Count != 1 || e.kids[0].kind != AK.Lambda()) { return; }
         if (isWhere) { RewriteWhere(e, entity); }
         else if (isInc) { RewriteInclude(e, entity); }
+        else if (isGroupBy) { RewriteGroupBy(e, entity); }
+        else if (isHaving) { RewriteHaving(e, entity); }
         else { RewriteOrderBy(e, entity, isObd); }
     }
 
@@ -640,7 +966,7 @@ class Dbgen {
 
         string q = "__DbQ_" + cls;
         string s = "class " + q + " {\n";
-        s = s + "    IDbExecutor db;\n    string w;\n    DbParams ps;\n    string ob;\n    int limN;\n    int offN;\n";
+        s = s + "    IDbExecutor db;\n    string w;\n    DbParams ps;\n    string ob;\n    string gb;\n    string h;\n    bool distinct;\n    int limN;\n    int offN;\n";
         i = 0;
         while (i < ks.Count) {
             if (ks[i] == Dbgen.DfNav()) { s = s + "    bool j_" + ns[i] + ";\n"; }
@@ -648,7 +974,7 @@ class Dbgen {
         }
         s = s + "    static " + q + " Create(IDbExecutor db) {\n";
         s = s + "        " + q + " x = new " + q + "();\n";
-        s = s + "        x.db = db;\n        x.w = \"\";\n        x.ps = DbParams.Create();\n        x.ob = \"\";\n        x.limN = 0 - 1;\n        x.offN = 0 - 1;\n        return x;\n    }\n";
+        s = s + "        x.db = db;\n        x.w = \"\";\n        x.ps = DbParams.Create();\n        x.ob = \"\";\n        x.gb = \"\";\n        x.h = \"\";\n        x.distinct = false;\n        x.limN = 0 - 1;\n        x.offN = 0 - 1;\n        return x;\n    }\n";
         s = s + "    " + q + " W(string f) {\n";
         s = s + "        if (this.w.Length == 0) { this.w = f; }\n";
         s = s + "        else { this.w = this.w + \" AND \" + f; }\n";
@@ -664,6 +990,12 @@ class Dbgen {
         s = s + "        else { this.ob = this.ob + \", \" + col; }\n";
         s = s + "        return this;\n    }\n";
         s = s + "    " + q + " OBD(string col) { return OB(col + \" DESC\"); }\n";
+        s = s + "    " + q + " GB(string col) { this.gb = col; return this; }\n";
+        s = s + "    " + q + " H(string f) {\n";
+        s = s + "        if (this.h.Length == 0) { this.h = f; }\n";
+        s = s + "        else { this.h = this.h + \" AND \" + f; }\n";
+        s = s + "        return this;\n    }\n";
+        s = s + "    " + q + " DISTINCT() { this.distinct = true; return this; }\n";
         s = s + "    " + q + " Take(int n) { this.limN = n; return this; }\n";
         s = s + "    " + q + " Skip(int n) { this.offN = n; return this; }\n";
         i = 0;
@@ -678,6 +1010,7 @@ class Dbgen {
         s = s + "    string BuildSelect() {\n";
         s = s + "        StringBuilder sb = new StringBuilder();\n";
         s = s + "        sb.Append(\"SELECT \");\n";
+        s = s + "        if (this.distinct) { sb.Append(\"DISTINCT \"); }\n";
         string cols = "";
         bool first = true;
         i = 0;
@@ -715,6 +1048,8 @@ class Dbgen {
             i = i + 1;
         }
         s = s + "        if (this.w.Length > 0) { sb.Append(\" WHERE \"); sb.Append(this.w); }\n";
+        s = s + "        if (this.gb.Length > 0) { sb.Append(\" GROUP BY \"); sb.Append(this.gb); }\n";
+        s = s + "        if (this.h.Length > 0) { sb.Append(\" HAVING \"); sb.Append(this.h); }\n";
         s = s + "        if (this.ob.Length > 0) { sb.Append(\" ORDER BY \"); sb.Append(this.ob); }\n";
         s = s + "        if (this.limN >= 0) { sb.Append(\" LIMIT \"); sb.Append(Convert.ToString(this.limN)); }\n";
         s = s + "        if (this.offN >= 0) { sb.Append(\" OFFSET \"); sb.Append(Convert.ToString(this.offN)); }\n";
@@ -791,13 +1126,40 @@ class Dbgen {
         s = s + "        if (l.Count > 0) { return l[0]; }\n";
         s = s + "        return null;\n    }\n";
         s = s + "    " + cls + " FirstOrDefault() { return First(); }\n";
+        s = s + "    " + cls + " ToOne() { return First(); }\n";
         s = s + "    int Count() {\n";
+        s = s + "        if (this.gb.Length > 0) {\n";
+        s = s + "            StringBuilder sb = new StringBuilder();\n";
+        s = s + "            sb.Append(\"SELECT COUNT(*) FROM (SELECT 1 FROM \" + this.tbl + \" t\");\n";
+        s = s + "            if (this.w.Length > 0) { sb.Append(\" WHERE \" + this.w); }\n";
+        s = s + "            sb.Append(\" GROUP BY \" + this.gb);\n";
+        s = s + "            if (this.h.Length > 0) { sb.Append(\" HAVING \" + this.h); }\n";
+        s = s + "            sb.Append(\")\");\n";
+        s = s + "            DbResult r = this.db.Query(sb.ToString(), this.ps);\n";
+        s = s + "            if (r.RowCount() == 0) { return 0; }\n";
+        s = s + "            return r.GetInt(0, 0);\n";
+        s = s + "        }\n";
+        s = s + "        return AggI(\"COUNT(*)\");\n";
+        s = s + "    }\n";
+        s = s + "    bool Any() { return Count() > 0; }\n";
+        s = s + "    DbResult AggR(string expr) {\n";
         s = s + "        StringBuilder sb = new StringBuilder();\n";
-        s = s + "        sb.Append(\"SELECT COUNT(*) FROM " + cls + " t\");\n";
+        s = s + "        sb.Append(\"SELECT \" + expr + \" FROM \" + this.tbl + \" t\");\n";
         s = s + "        if (this.w.Length > 0) { sb.Append(\" WHERE \"); sb.Append(this.w); }\n";
-        s = s + "        DbResult r = this.db.Query(sb.ToString(), this.ps);\n";
+        s = s + "        if (this.gb.Length > 0) { sb.Append(\" GROUP BY \"); sb.Append(this.gb); }\n";
+        s = s + "        if (this.h.Length > 0) { sb.Append(\" HAVING \"); sb.Append(this.h); }\n";
+        s = s + "        return this.db.Query(sb.ToString(), this.ps);\n";
+        s = s + "    }\n";
+        s = s + "    int AggI(string expr) {\n";
+        s = s + "        DbResult r = AggR(expr);\n";
         s = s + "        if (r.RowCount() == 0) { return 0; }\n";
-        s = s + "        return r.GetInt(0, 0);\n    }\n";
+        s = s + "        return r.GetInt(0, 0);\n";
+        s = s + "    }\n";
+        s = s + "    double AggD(string expr) {\n";
+        s = s + "        DbResult r = AggR(expr);\n";
+        s = s + "        if (r.RowCount() == 0) { return 0.0; }\n";
+        s = s + "        return r.GetDouble(0, 0);\n";
+        s = s + "    }\n";
         s = s + "}\n";
         return s;
     }
@@ -838,6 +1200,7 @@ class Dbgen {
         src = src + "            sb.Append(\"?\");\n";
         src = src + "            i = i + 1;\n";
         src = src + "        }\n";
+        src = src + "        if (sb.Length == 0) { sb.Append(\"NULL\"); }\n";
         src = src + "        return sb.ToString();\n";
         src = src + "    }\n";
         src = src + "}\n";

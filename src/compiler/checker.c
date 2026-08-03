@@ -130,6 +130,24 @@ static bool type_is_numeric(zan_type_t *t) {
     }
 }
 
+/* True for the builtin scalar types that declare no members of their own:
+ * string, the numeric types, bool, char. Their only resolvable member is the
+ * string.Length property (lowered by irgen); their instance methods
+ * (ToString, Substring, ...) are also lowered by irgen from the member name
+ * alone. Any other member access on such a type is a typo. */
+static bool type_is_scalar_primitive(zan_type_t *t) {
+    if (!t) return false;
+    switch (t->kind) {
+    case TYPE_BOOL: case TYPE_BYTE: case TYPE_SHORT: case TYPE_INT:
+    case TYPE_LONG: case TYPE_SBYTE: case TYPE_USHORT: case TYPE_UINT:
+    case TYPE_ULONG: case TYPE_FLOAT: case TYPE_DOUBLE: case TYPE_CHAR:
+    case TYPE_STRING: case TYPE_NINT:
+        return true;
+    default:
+        return false;
+    }
+}
+
 static bool type_is_integral(zan_type_t *t) {
     if (!t) return false;
     switch (t->kind) {
@@ -274,8 +292,19 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
     }
 
     case AST_CALL: {
-        zan_type_t *callee_type =
-            zan_checker_check_expr(c, expr->call.callee);
+        /* Builtin scalar instance methods (string.Trim/Substring/EndsWith/...)
+         * are lowered by irgen from the member name alone; they have no symbol
+         * for the checker to validate. A method group on a scalar type is
+         * therefore skipped here — a bare (non-call) member access on a scalar
+         * is still rejected in the AST_MEMBER_ACCESS case. */
+        zan_type_t *callee_type;
+        if (expr->call.callee && expr->call.callee->kind == AST_MEMBER_ACCESS &&
+            type_is_scalar_primitive(
+                zan_checker_check_expr(c, expr->call.callee->member.object))) {
+            callee_type = c->binder->type_error;
+        } else {
+            callee_type = zan_checker_check_expr(c, expr->call.callee);
+        }
         for (int i = 0; i < expr->call.args.count; i++) {
             zan_checker_check_expr(c, expr->call.args.items[i]);
         }
@@ -366,6 +395,22 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
                 }
             }
         }
+        /* Builtin scalar types (string, int, ...) declare no fields; the only
+         * member they carry is the string.Length property (lowered by irgen).
+         * Anything else is a typo: it used to fall through to irgen, which
+         * silently lowered it to the constant 0 — a crash at runtime when the
+         * zero was used as a pointer (e.g. `tabs[i].path.path`). */
+        if (obj_type && type_is_scalar_primitive(obj_type)) {
+            if (obj_type->kind == TYPE_STRING && expr->member.name.len == 6 &&
+                memcmp(expr->member.name.str, "Length", 6) == 0) {
+                return c->binder->type_int;
+            }
+            zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
+                          "type '%.*s' has no member '%.*s'",
+                          (int)obj_type->name.len, obj_type->name.str,
+                          (int)expr->member.name.len, expr->member.name.str);
+            return c->binder->type_error;
+        }
         return c->binder->type_error;
     }
 
@@ -398,7 +443,17 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
 
     case AST_NEW_EXPR: {
         no_runtime_reject(c, expr->loc, "allocation (`new`)");
-        zan_type_t *type = zan_binder_resolve_type(c->binder, expr->new_expr.type);
+        zan_type_t *type;
+        if (!expr->new_expr.type) {
+            /* Anonymous object literal `new { a.x, b.y }`. Only meaningful as
+             * a dbgen query projection (GroupBy / ToList / ToAggregate); the
+             * checker validates the members and returns a placeholder type. */
+            for (int i = 0; i < expr->new_expr.args.count; i++) {
+                zan_checker_check_expr(c, expr->new_expr.args.items[i]);
+            }
+            return c->binder->type_error;
+        }
+        type = zan_binder_resolve_type(c->binder, expr->new_expr.type);
         check_generic_constraints(c, type, expr->loc);
         for (int i = 0; i < expr->new_expr.args.count; i++) {
             zan_checker_check_expr(c, expr->new_expr.args.items[i]);

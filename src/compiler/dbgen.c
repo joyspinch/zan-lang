@@ -262,11 +262,29 @@ static int dg_need_add(dg_need_t *need, zan_istr_t name) {
     return need->count++;
 }
 
+/* ---- Expr<T> target-typed lambda slots ----
+ *
+ * A method whose declared parameter type is `Expr<T>` receives lambdas as
+ * inspectable expression trees: dbgen rewrites `M(x => x.f > v)` into
+ * `M(Expr<T>.From(DbExpr.Lambda("x", DbExpr.Binary(">", ...))))` so the
+ * ORM / Linq / rules engine can walk the tree in pure Zan at runtime.
+ * The slots are collected by scanning method declarations (parameter type
+ * AST shape `Expr<...>`), which needs no binder — dbgen runs pre-binding. */
+
+typedef struct {
+    zan_istr_t cls;       /* owning class name ("" = any receiver) */
+    zan_istr_t name;      /* method name */
+    int param;            /* parameter index (0-based) */
+    zan_istr_t entity;    /* the T of Expr<T> */
+} dg_expr_slot_t;
+
 typedef struct {
     zan_ast_node_t *unit;
     zan_arena_t *arena;
     zan_diag_t *diag;
     dg_need_t need;
+    dg_expr_slot_t eslots[128];
+    int eslot_count;
     bool any;
     bool sync_all;
 } dg_ctx_t;
@@ -295,6 +313,10 @@ static zan_ast_node_t *nb_ident(dg_ctx_t *c, zan_loc_t loc, const char *name) {
     zan_ast_node_t *e = nb(c, AST_IDENTIFIER, loc);
     e->ident.name = dg_istr(c, name, strlen(name));
     return e;
+}
+
+static zan_ast_node_t *nb_null(dg_ctx_t *c, zan_loc_t loc) {
+    return nb(c, AST_NULL_LITERAL, loc);
 }
 
 static zan_ast_node_t *nb_member(dg_ctx_t *c, zan_loc_t loc,
@@ -329,6 +351,19 @@ static zan_ast_node_t *nb_cast_int(dg_ctx_t *c, zan_loc_t loc,
                                    zan_ast_node_t *expr) {
     zan_ast_node_t *t = nb(c, AST_TYPE_REF, loc);
     t->type_ref.name = dg_istr(c, "int", 3);
+    zan_ast_list_init(&t->type_ref.type_args);
+    t->type_ref.is_nullable = false;
+    t->type_ref.is_array = false;
+    zan_ast_node_t *e = nb(c, AST_CAST_EXPR, loc);
+    e->cast.type = t;
+    e->cast.expr = expr;
+    return e;
+}
+
+static zan_ast_node_t *nb_cast_double(dg_ctx_t *c, zan_loc_t loc,
+                                      zan_ast_node_t *expr) {
+    zan_ast_node_t *t = nb(c, AST_TYPE_REF, loc);
+    t->type_ref.name = dg_istr(c, "double", 6);
     zan_ast_list_init(&t->type_ref.type_args);
     t->type_ref.is_nullable = false;
     t->type_ref.is_array = false;
@@ -449,8 +484,52 @@ static void wf_col(dg_where_t *w, const dg_field_t *f) {
     wf_textn(w, f->name.str, f->name.len);
 }
 
+/* Compile-time literal/field type matching. The dbgen pass runs before type
+ * checking, so only literal shapes can be validated here; anything else
+ * (variables, calls) is left to the generated code's parameter types. The
+ * point is to catch the common `p.name == 123` / `p.num == "abc"` mistakes
+ * with a clear diagnostic instead of a silent wrong result at runtime.
+ * Returns NULL when the literal shape matches the column, else a message. */
+static const char *dg_literal_mismatch(const dg_field_t *f, zan_ast_node_t *e) {
+    zan_ast_node_t *lit = e;
+    if (e->kind == AST_UNARY &&
+        (e->unary.op == TK_MINUS || e->unary.op == TK_PLUS))
+        lit = e->unary.operand;
+    if (lit->kind == AST_INT_LITERAL || lit->kind == AST_CHAR_LITERAL) {
+        if (f->kind == DF_INT || f->kind == DF_ENUM || f->kind == DF_DOUBLE)
+            return NULL;
+        return f->kind == DF_STRING
+                   ? "type mismatch: string column compared to an int value"
+                   : "type mismatch: numeric value for a non-numeric column";
+    }
+    if (lit->kind == AST_FLOAT_LITERAL) {
+        if (f->kind == DF_DOUBLE) return NULL;
+        return "type mismatch: double value compared to a non-double column";
+    }
+    if (lit->kind == AST_STRING_LITERAL) {
+        if (f->kind == DF_STRING) return NULL;
+        return "type mismatch: string value compared to a numeric column";
+    }
+    if (lit->kind == AST_BOOL_LITERAL) {
+        if (f->kind == DF_BOOL) return NULL;
+        return "type mismatch: bool value compared to a non-bool column";
+    }
+    return NULL; /* unknown shapes (identifiers, calls): trust the generated code */
+}
+
+static bool dg_check_value_type(dg_where_t *w, const dg_field_t *f,
+                                zan_ast_node_t *e) {
+    const char *msg = dg_literal_mismatch(f, e);
+    if (msg) {
+        wf_err(w, e->loc, msg);
+        return false;
+    }
+    return true;
+}
+
 /* Emits `?` and records the bind for a scalar comparison value. */
 static void wf_value(dg_where_t *w, const dg_field_t *f, zan_ast_node_t *e) {
+    if (!dg_check_value_type(w, f, e)) return;
     wf_text(w, "?");
     switch (f->kind) {
     case DF_INT:
@@ -460,7 +539,13 @@ static void wf_value(dg_where_t *w, const dg_field_t *f, zan_ast_node_t *e) {
         wf_bind(w, BK_INT, nb_cast_int(w->c, e->loc, e));
         break;
     case DF_DOUBLE:
-        wf_bind(w, BK_DBL, e);
+        /* int expressions are promoted to double: a bare `Pd(intExpr)` would
+         * fail LLVM verification (call parameter type mismatch), so the cast
+         * is always applied except for a plain double literal. */
+        if (e->kind == AST_FLOAT_LITERAL)
+            wf_bind(w, BK_DBL, e);
+        else
+            wf_bind(w, BK_DBL, nb_cast_double(w->c, e->loc, e));
         break;
     case DF_STRING:
         wf_bind(w, BK_STR, e);
@@ -483,17 +568,202 @@ static const char *dg_sql_op(zan_token_kind_t op, bool flip) {
     }
 }
 
+/* FreeSQL-style aggregate in a condition: `p.Count()`, `p.Sum(x => x.col)`,
+ * `p.Avg/Max/Min(x => x.col)`. Emits the SQL text (COUNT(*) / SUM(t.col))
+ * and reports the comparison value kind (DF_INT for COUNT, the column kind
+ * otherwise; AVG is always double). Returns the aggregate name, or NULL when
+ * `e` is not an aggregate call on the lambda parameter. On a malformed
+ * aggregate it emits a diagnostic and returns non-NULL with w->ok cleared. */
+static const char *dg_agg_call(dg_where_t *w, zan_ast_node_t *e,
+                               int *out_kind) {
+    if (!e || e->kind != AST_CALL) return NULL;
+    zan_ast_node_t *callee = e->call.callee;
+    if (!callee || callee->kind != AST_MEMBER_ACCESS) return NULL;
+    zan_ast_node_t *recv = callee->member.object;
+    if (!recv || recv->kind != AST_IDENTIFIER ||
+        !istr_eq(recv->ident.name, w->pname))
+        return NULL;
+    zan_istr_t mn = callee->member.name;
+    const char *fn = istr_is(mn, "Count") ? "COUNT"
+                     : istr_is(mn, "Sum")   ? "SUM"
+                     : istr_is(mn, "Avg")   ? "AVG"
+                     : istr_is(mn, "Max")   ? "MAX"
+                     : istr_is(mn, "Min")   ? "MIN" : NULL;
+    if (!fn) return NULL;
+    if (istr_is(mn, "Count")) {
+        if (e->call.args.count != 0) {
+            wf_err(w, e->loc, "Count() takes no arguments");
+            return fn;
+        }
+        wf_text(w, "COUNT(*)");
+        *out_kind = DF_INT;
+        return fn;
+    }
+    if (e->call.args.count != 1) {
+        char msg[160];
+        snprintf(msg, sizeof(msg), "%s requires x => x.<column>", fn);
+        wf_err(w, e->loc, msg);
+        return fn;
+    }
+    zan_ast_node_t *lam = e->call.args.items[0];
+    if (lam->kind != AST_LAMBDA || lam->lambda.params.count != 1) {
+        char msg[160];
+        snprintf(msg, sizeof(msg), "%s expects x => x.<column>", fn);
+        wf_err(w, e->loc, msg);
+        return fn;
+    }
+    zan_ast_node_t *body = lam->lambda.body;
+    if (body->kind != AST_MEMBER_ACCESS || !body->member.object ||
+        body->member.object->kind != AST_IDENTIFIER ||
+        !istr_eq(body->member.object->ident.name,
+                 lam->lambda.params.items[0]->param.name)) {
+        char msg[160];
+        snprintf(msg, sizeof(msg), "%s expects x => x.<column>", fn);
+        wf_err(w, e->loc, msg);
+        return fn;
+    }
+    const dg_field_t *col = dg_field_find(w->fields, body->member.name);
+    if (!col || col->kind == DF_NAV) {
+        char msg[160];
+        snprintf(msg, sizeof(msg), "%s expects a scalar column", fn);
+        wf_err(w, e->loc, msg);
+        return fn;
+    }
+    char buf[160];
+    snprintf(buf, sizeof(buf), "%s(t.%.*s)", fn, (int)col->col.len,
+             col->col.str);
+    wf_text(w, buf);
+    *out_kind = istr_is(mn, "Avg") ? DF_DOUBLE : col->kind;
+    return fn;
+}
+
 static void dg_where_cond(dg_where_t *w, zan_ast_node_t *e);
 
-/* p.f.Method(arg) conditions: Like/NotLike/Contains/StartsWith/EndsWith/
- * In/NotIn. */
+/* p.f.Method(arg...) conditions. Null tests (0 args), range tests
+ * (Between/NotBetween, 2 args) and comparison methods (Eq/Ne/Gt/Ge/Lt/Le,
+ * 1 arg) join the string-matching methods Like/NotLike/Contains/
+ * StartsWith/EndsWith/In/NotIn. */
 static bool dg_where_method(dg_where_t *w, zan_ast_node_t *e) {
     if (e->kind != AST_CALL) return false;
     zan_ast_node_t *callee = e->call.callee;
     if (!callee || callee->kind != AST_MEMBER_ACCESS) return false;
     const dg_field_t *col = dg_as_column(w, callee->member.object);
-    if (!col) return false;
     zan_istr_t mn = callee->member.name;
+    dg_ctx_t *c = w->c;
+
+    /* FreeSQL-style `list.Contains(p.col)` -> `p.col IN (?, ...)`. The
+     * receiver is a List (not a column) and the sole argument is a column;
+     * `!list.Contains(p.col)` is handled by the NOT wrapper in
+     * dg_where_cond. This mirrors `new[]{1,2,3}.Contains(a.Id)` from the
+     * FreeSQL docs. */
+    if (!col && istr_is(mn, "Contains") && e->call.args.count == 1) {
+        const dg_field_t *inner = dg_as_column(w, e->call.args.items[0]);
+        if (inner && inner->kind != DF_BOOL) {
+            zan_ast_node_t *list = callee->member.object;
+            if (dg_mentions_param(list, w->pname)) {
+                wf_err(w, list->loc,
+                       "the list receiver must not reference the lambda "
+                       "parameter");
+                return true;
+            }
+            wf_col(w, inner);
+            wf_text(w, " IN (");
+            zan_ast_node_t *cnt =
+                nb_member(c, list->loc, list, dg_istr(c, "Count", 5));
+            zan_ast_node_t *m = nb_call1(
+                c, list->loc,
+                nb_member(c, list->loc, nb_ident(c, list->loc, "__DbBind"),
+                          dg_istr(c, "M", 1)),
+                cnt);
+            wf_expr(w, m);
+            wf_text(w, ")");
+            switch (inner->kind) {
+            case DF_INT:
+            case DF_ENUM: wf_bind(w, BK_INI, list); break;
+            case DF_STRING: wf_bind(w, BK_INS, list); break;
+            case DF_DOUBLE: wf_bind(w, BK_IND, list); break;
+            default:
+                wf_err(w, e->loc, "Contains requires an int/string/double "
+                                  "column");
+                break;
+            }
+            return true;
+        }
+        return false;
+    }
+
+    if (!col) return false;
+
+    /* p.x.IsNull() / p.x.IsNotNull() */
+    if (istr_is(mn, "IsNull") || istr_is(mn, "IsNotNull")) {
+        if (e->call.args.count != 0) {
+            wf_err(w, e->loc, "IsNull/IsNotNull take no arguments");
+            return true;
+        }
+        wf_col(w, col);
+        wf_text(w, istr_is(mn, "IsNull") ? " IS NULL" : " IS NOT NULL");
+        return true;
+    }
+
+    /* p.age.Between(lo, hi) / p.age.NotBetween(lo, hi) */
+    if (istr_is(mn, "Between") || istr_is(mn, "NotBetween")) {
+        if (e->call.args.count != 2) {
+            wf_err(w, e->loc,
+                   "Between/NotBetween take exactly two arguments");
+            return true;
+        }
+        if (col->kind != DF_INT && col->kind != DF_ENUM &&
+            col->kind != DF_DOUBLE) {
+            wf_err(w, e->loc, "Between requires an int/double/enum column");
+            return true;
+        }
+        for (int i = 0; i < 2; i++) {
+            if (dg_mentions_param(e->call.args.items[i], w->pname)) {
+                wf_err(w, e->call.args.items[i]->loc,
+                       "argument must not reference the lambda parameter");
+                return true;
+            }
+        }
+        wf_col(w, col);
+        wf_text(w, istr_is(mn, "Between") ? " BETWEEN "
+                                          : " NOT BETWEEN ");
+        wf_value(w, col, e->call.args.items[0]);
+        wf_text(w, " AND ");
+        wf_value(w, col, e->call.args.items[1]);
+        return true;
+    }
+
+    /* p.age.Eq(x) / Ne / Gt / Ge / Lt / Le — same shape as the binary
+     * comparison operators, spelled as a method like FreeSQL. */
+    const char *cmp = NULL;
+    if (istr_is(mn, "Eq")) cmp = " = ";
+    else if (istr_is(mn, "Ne")) cmp = " <> ";
+    else if (istr_is(mn, "Gt")) cmp = " > ";
+    else if (istr_is(mn, "Ge")) cmp = " >= ";
+    else if (istr_is(mn, "Lt")) cmp = " < ";
+    else if (istr_is(mn, "Le")) cmp = " <= ";
+    if (cmp) {
+        if (e->call.args.count != 1) {
+            wf_err(w, e->loc, "comparison method takes exactly one argument");
+            return true;
+        }
+        if (col->kind == DF_BOOL) {
+            wf_err(w, e->loc, "bool columns compare with == / !=");
+            return true;
+        }
+        zan_ast_node_t *arg = e->call.args.items[0];
+        if (dg_mentions_param(arg, w->pname)) {
+            wf_err(w, arg->loc,
+                   "argument must not reference the lambda parameter");
+            return true;
+        }
+        wf_col(w, col);
+        wf_text(w, cmp);
+        wf_value(w, col, arg);
+        return true;
+    }
+
+    /* Remaining methods take exactly one argument. */
     if (e->call.args.count != 1) {
         wf_err(w, e->loc, "column method takes exactly one argument");
         return true;
@@ -504,7 +774,6 @@ static bool dg_where_method(dg_where_t *w, zan_ast_node_t *e) {
                "argument must not reference the lambda parameter");
         return true;
     }
-    dg_ctx_t *c = w->c;
     if (istr_is(mn, "Like") || istr_is(mn, "NotLike")) {
         if (col->kind != DF_STRING) {
             wf_err(w, e->loc, "Like requires a string column");
@@ -557,7 +826,8 @@ static bool dg_where_method(dg_where_t *w, zan_ast_node_t *e) {
         }
         return true;
     }
-    wf_err(w, e->loc, "unsupported column method (expected Like/NotLike/"
+    wf_err(w, e->loc, "unsupported column method (expected Eq/Ne/Gt/Ge/Lt/Le/"
+                      "Between/NotBetween/IsNull/IsNotNull/Like/NotLike/"
                       "Contains/StartsWith/EndsWith/In/NotIn)");
     return true;
 }
@@ -620,6 +890,44 @@ static void dg_where_cond(dg_where_t *w, zan_ast_node_t *e) {
             val = l;
             flip = true;
             op = dg_sql_op(e->binary.op, true);
+        }
+        if (!col && !rc) {
+            /* FreeSQL-style aggregate comparison: `p.Count() > n`,
+             * `p.Sum(x => x.amount) >= n`, ... The aggregate emits its own
+             * SQL text; the scalar side binds like a normal column value. */
+            int ak = 0;
+            const char *af = dg_agg_call(w, l, &ak);
+            if (af) {
+                if (!w->ok) return;
+                if (dg_mentions_param(r, w->pname)) {
+                    wf_err(w, r->loc,
+                           "value side must not reference the lambda "
+                           "parameter");
+                    return;
+                }
+                dg_field_t fake;
+                memset(&fake, 0, sizeof(fake));
+                fake.kind = ak;
+                wf_text(w, op);
+                wf_value(w, &fake, r);
+                return;
+            }
+            af = dg_agg_call(w, r, &ak);
+            if (af) {
+                if (!w->ok) return;
+                if (dg_mentions_param(l, w->pname)) {
+                    wf_err(w, l->loc,
+                           "value side must not reference the lambda "
+                           "parameter");
+                    return;
+                }
+                dg_field_t fake;
+                memset(&fake, 0, sizeof(fake));
+                fake.kind = ak;
+                wf_value(w, &fake, l);
+                wf_text(w, op);
+                return;
+            }
         }
         if (!col) {
             wf_err(w, e->loc,
@@ -826,8 +1134,38 @@ static void dg_emit_where(dg_ctx_t *c, zan_ast_node_t *call,
     *call = *node;
 }
 
+/* ---- Expr<T> lowering forward decls (defined later in this file) ---- */
+static zan_ast_node_t *dg_expr_tree(dg_ctx_t *c, zan_ast_node_t *e,
+                                    zan_istr_t pname);
+static zan_ast_node_t *dg_expr_wrap(dg_ctx_t *c, zan_loc_t loc,
+                                    zan_istr_t entity, zan_istr_t pname,
+                                    zan_ast_node_t *tree);
+static bool dg_expr_compatible(dg_ctx_t *c, const dg_fields_t *fs,
+                               zan_ast_node_t *e, zan_istr_t pname);
+
 static void dg_rewrite_where(dg_ctx_t *c, zan_ast_node_t *call,
                              zan_istr_t cls) {
+    /* Expr path: simple predicates (comparisons / logic / string methods)
+     * lower to an Expr<cls> tree and let stdlib ExprSql build the SQL in
+     * pure Zan. Complex shapes (IN, aggregates, Between, ...) fall back to
+     * the SQL-fragment path below. */
+    dg_fields_t fields;
+    memset(&fields, 0, sizeof(fields));
+    dg_collect_fields(c->unit, dg_find_class(c->unit, cls), &fields, 0);
+    zan_ast_node_t *lambda = call->call.args.items[0];
+    if (lambda->kind == AST_LAMBDA && lambda->lambda.params.count == 1) {
+        zan_istr_t pname = lambda->lambda.params.items[0]->param.name;
+        if (dg_expr_compatible(c, &fields, lambda->lambda.body, pname)) {
+            zan_ast_node_t *tree =
+                dg_expr_tree(c, lambda->lambda.body, pname);
+            if (tree) {
+                call->call.args.items[0] =
+                    dg_expr_wrap(c, call->loc, cls, pname, tree);
+                return; /* method name stays `Where`; the generated class
+                         * has a Where(Expr<cls>) overload */
+            }
+        }
+    }
     dg_where_t w;
     zan_ast_node_t *frag =
         dg_where_frag(c, call, cls, call->call.args.items[0], &w);
@@ -865,6 +1203,98 @@ static void dg_rewrite_where_if(dg_ctx_t *c, zan_ast_node_t *call,
     *call = *node;
 }
 
+/* `Having(p => ...)`: like Where but emitted on the HAVING clause. The
+ * fragment and its bound parameters chain `.H(frag).P(v)...` the same way
+ * Where uses `.W(frag).P(v)...`. */
+static const dg_field_t *dg_sel_column(dg_ctx_t *c, zan_ast_node_t *call,
+                                       zan_istr_t cls, dg_fields_t *fields,
+                                       const char *what);
+static void dg_rewrite_having(dg_ctx_t *c, zan_ast_node_t *call,
+                              zan_istr_t cls) {
+    dg_where_t w;
+    zan_ast_node_t *frag =
+        dg_where_frag(c, call, cls, call->call.args.items[0], &w);
+    if (!frag) return;
+    zan_ast_node_t *recv = call->call.callee->member.object;
+    zan_ast_node_t *node = nb_call1(
+        c, call->loc, nb_member(c, call->loc, recv, dg_istr(c, "H", 1)), frag);
+    for (int i = 0; i < w.bind_count; i++) {
+        const char *mn = dg_bind_method(w.binds[i].kind);
+        node = nb_call1(c, call->loc,
+                        nb_member(c, call->loc, node,
+                                  dg_istr(c, mn, strlen(mn))),
+                        w.binds[i].expr);
+    }
+    *call = *node;
+}
+
+/* `GroupBy(p => p.col)` -> `.GB("t.col")`. */
+static void dg_rewrite_groupby(dg_ctx_t *c, zan_ast_node_t *call,
+                               zan_istr_t cls) {
+    zan_ast_node_t *lambda = call->call.args.items[0];
+    if (lambda->kind != AST_LAMBDA || lambda->lambda.params.count != 1) {
+        zan_diag_emit(c->diag, DIAG_ERROR, call->loc,
+                      "GroupBy expects p => p.<scalar field> or p => new { ... }");
+        return;
+    }
+    zan_ast_node_t *body = lambda->lambda.body;
+    zan_istr_t pname = lambda->lambda.params.items[0]->param.name;
+    dg_fields_t fields;
+    memset(&fields, 0, sizeof(fields));
+    dg_collect_fields(c->unit, dg_find_class(c->unit, cls), &fields, 0);
+
+    dg_buf_t gb;
+    memset(&gb, 0, sizeof(gb));
+    bool first = true;
+    if (body && body->kind == AST_NEW_EXPR) {
+        /* p => new { p.col1, p.col2, ... } -- multi-column grouping. */
+        for (int i = 0; i < body->new_expr.args.count; i++) {
+            zan_ast_node_t *arg = body->new_expr.args.items[i];
+            const dg_field_t *col = NULL;
+            if (arg->kind == AST_MEMBER_ACCESS &&
+                arg->member.object->kind == AST_IDENTIFIER &&
+                istr_eq(arg->member.object->ident.name, pname))
+                col = dg_field_find(&fields, arg->member.name);
+            if (!col || col->kind == DF_NAV) {
+                zan_diag_emit(c->diag, DIAG_ERROR, arg->loc,
+                              "GroupBy member must be p => p.<scalar field>");
+                return;
+            }
+            dg_putf(&gb, "%st.%.*s", first ? "" : ", ", (int)col->name.len,
+                    col->name.str);
+            first = false;
+        }
+        if (first) {
+            zan_diag_emit(c->diag, DIAG_ERROR, body->loc,
+                          "GroupBy new { } must name at least one field");
+            return;
+        }
+    } else {
+        const dg_field_t *col = NULL;
+        if (body && body->kind == AST_MEMBER_ACCESS &&
+            body->member.object->kind == AST_IDENTIFIER &&
+            istr_eq(body->member.object->ident.name, pname))
+            col = dg_field_find(&fields, body->member.name);
+        if (!col || col->kind == DF_NAV) {
+            zan_diag_emit(c->diag, DIAG_ERROR, call->loc,
+                          "GroupBy expects p => p.<scalar field>");
+            return;
+        }
+        dg_putf(&gb, "t.%.*s", (int)col->name.len, col->name.str);
+    }
+    zan_ast_node_t *arg = nb_strlit(c, call->loc, gb.buf, strlen(gb.buf));
+    free(gb.buf);
+    call->call.callee->member.name = dg_istr(c, "GB", 2);
+    zan_ast_list_init(&call->call.args);
+    zan_ast_list_push(&call->call.args, arg, c->arena);
+}
+
+/* `Distinct()` -> `.DISTINCT()`. */
+static void dg_rewrite_distinct(dg_ctx_t *c, zan_ast_node_t *call) {
+    call->call.callee->member.name = dg_istr(c, "DISTINCT", 8);
+    zan_ast_list_init(&call->call.args);
+}
+
 /* The column a `p => p.field` selector names, or NULL (diagnostic emitted). */
 static const dg_field_t *dg_sel_column(dg_ctx_t *c, zan_ast_node_t *call,
                                        zan_istr_t cls, dg_fields_t *fields,
@@ -896,6 +1326,12 @@ static void dg_rewrite_set(dg_ctx_t *c, zan_ast_node_t *call, zan_istr_t cls,
         dg_sel_column(c, call, cls, &fields, incr ? "SetIncr" : "Set");
     if (!col) return;
     zan_ast_node_t *val = call->call.args.items[1];
+    const char *msg = dg_literal_mismatch(col, val);
+    if (msg) {
+        zan_diag_emit(c->diag, DIAG_ERROR, val->loc,
+                      "db.Update<T>().Set: %s", msg);
+        return;
+    }
     const char *m = NULL;
     zan_ast_node_t *arg = val;
     switch (col->kind) {
@@ -904,7 +1340,11 @@ static void dg_rewrite_set(dg_ctx_t *c, zan_ast_node_t *call, zan_istr_t cls,
         m = incr ? "SetIncrI" : "SetI";
         arg = nb_cast_int(c, val->loc, val);
         break;
-    case DF_DOUBLE: m = incr ? "SetIncrD" : "SetD"; break;
+    case DF_DOUBLE:
+        m = incr ? "SetIncrD" : "SetD";
+        if (val->kind != AST_FLOAT_LITERAL)
+            arg = nb_cast_double(c, val->loc, val);
+        break;
     case DF_STRING: m = "SetS"; break;
     case DF_BOOL: m = "SetB"; break;
     default: break;
@@ -1024,6 +1464,482 @@ static void dg_rewrite_orderby(dg_ctx_t *c, zan_ast_node_t *call,
     zan_ast_list_push(&call->call.args, arg, c->arena);
 }
 
+/* `ToList(a => a.field)` -> `.ToListCol("t.field")` returning a scalar
+ * list, and `ToList<TDto>(a => new Dto { ... })` -> `.ToListDto(...)` mapping
+ * columns into the DTO. */
+
+/* ---- Expr<T> target-typed lambda lowering ----
+ *
+ * A method whose declared parameter type is `Expr<T>` receives lambdas as
+ * inspectable expression trees: dbgen rewrites `M(x => x.f > v)` into
+ * `M(Expr<T>.From(DbExpr.Lambda("x", DbExpr.Binary(">", ...))))` so the
+ * ORM / Linq / rules engine can walk the tree in pure Zan at runtime. */
+
+static zan_ast_node_t *nb_type_ref(dg_ctx_t *c, zan_loc_t loc,
+                                   const char *name, size_t n) {
+    zan_ast_node_t *t = nb(c, AST_TYPE_REF, loc);
+    t->type_ref.name = dg_istr(c, name, n);
+    zan_ast_list_init(&t->type_ref.type_args);
+    t->type_ref.is_nullable = false;
+    t->type_ref.is_array = false;
+    return t;
+}
+
+static zan_ast_node_t *nb_call_multi(dg_ctx_t *c, zan_loc_t loc,
+                                     zan_ast_node_t *callee,
+                                     zan_ast_node_t **args, int nargs) {
+    zan_ast_node_t *e = nb(c, AST_CALL, loc);
+    e->call.callee = callee;
+    zan_ast_list_init(&e->call.args);
+    zan_ast_list_init(&e->call.type_args);
+    for (int i = 0; i < nargs; i++)
+        zan_ast_list_push(&e->call.args, args[i], c->arena);
+    return e;
+}
+
+static const char *dg_expr_op(zan_token_kind_t op) {
+    switch (op) {
+    case TK_EQ_EQ: return "==";
+    case TK_BANG_EQ: return "!=";
+    case TK_LESS: return "<";
+    case TK_GREATER: return ">";
+    case TK_LESS_EQ: return "<=";
+    case TK_GREATER_EQ: return ">=";
+    case TK_PLUS: return "+";
+    case TK_MINUS: return "-";
+    case TK_STAR: return "*";
+    case TK_SLASH: return "/";
+    case TK_PERCENT: return "%";
+    case TK_AMP_AMP: return "&&";
+    case TK_PIPE_PIPE: return "||";
+    default: return NULL;
+    }
+}
+
+static zan_ast_node_t *dg_expr_call(dg_ctx_t *c, zan_loc_t loc,
+                                    const char *fn, size_t fn_len,
+                                    zan_ast_node_t **args, int nargs) {
+    zan_ast_node_t *callee =
+        nb_member(c, loc, nb_ident(c, loc, "ExprNode"),
+                  dg_istr(c, fn, fn_len));
+    return nb_call_multi(c, loc, callee, args, nargs);
+}
+
+/* Build a DbExpr construction AST for an expression tree node. `pname` is the
+ * lambda parameter name: `p.field` becomes a Member node and the bare `p`
+ * identifier is an error (the parameter itself has no node). */
+static zan_ast_node_t *dg_expr_tree(dg_ctx_t *c, zan_ast_node_t *e,
+                                    zan_istr_t pname) {
+    if (!e) return NULL;
+    zan_loc_t loc = e->loc;
+    if (e->kind == AST_MEMBER_ACCESS) {
+        if (e->member.object && e->member.object->kind == AST_IDENTIFIER &&
+            istr_eq(e->member.object->ident.name, pname)) {
+            zan_ast_node_t *args[1];
+            args[0] = nb_strlit(c, loc, e->member.name.str,
+                                (size_t)e->member.name.len);
+            return dg_expr_call(c, loc, "Member", 6, args, 1);
+        }
+        zan_diag_emit(c->diag, DIAG_ERROR, loc,
+                      "expression-tree member access must read the lambda "
+                      "parameter (p => p.<field>)");
+        return NULL;
+    }
+    if (e->kind == AST_INT_LITERAL) {
+        zan_ast_node_t *v = nb(c, AST_INT_LITERAL, loc);
+        v->int_val = e->int_val;
+        zan_ast_node_t *args[1];
+        args[0] = v;
+        return dg_expr_call(c, loc, "Const", 5, args, 1);
+    }
+    if (e->kind == AST_FLOAT_LITERAL) {
+        zan_ast_node_t *v = nb(c, AST_FLOAT_LITERAL, loc);
+        v->float_val = e->float_val;
+        zan_ast_node_t *args[1];
+        args[0] = v;
+        return dg_expr_call(c, loc, "Const", 5, args, 1);
+    }
+    if (e->kind == AST_STRING_LITERAL) {
+        zan_ast_node_t *args[1];
+        args[0] = nb_strlit(c, loc, e->str_val.str, (size_t)e->str_val.len);
+        return dg_expr_call(c, loc, "Const", 5, args, 1);
+    }
+    if (e->kind == AST_BOOL_LITERAL) {
+        zan_ast_node_t *v = nb(c, AST_BOOL_LITERAL, loc);
+        v->bool_val = e->bool_val;
+        zan_ast_node_t *args[1];
+        args[0] = v;
+        return dg_expr_call(c, loc, "Const", 5, args, 1);
+    }
+    if (e->kind == AST_BINARY) {
+        const char *op = dg_expr_op(e->binary.op);
+        if (!op) {
+            zan_diag_emit(c->diag, DIAG_ERROR, loc,
+                          "unsupported operator in expression tree");
+            return NULL;
+        }
+        zan_ast_node_t *l = dg_expr_tree(c, e->binary.left, pname);
+        zan_ast_node_t *r = dg_expr_tree(c, e->binary.right, pname);
+        if (!l || !r) return NULL;
+        zan_ast_node_t *args[3];
+        args[0] = nb_strlit(c, loc, op, strlen(op));
+        args[1] = l;
+        args[2] = r;
+        return dg_expr_call(c, loc, "Binary", 6, args, 3);
+    }
+    if (e->kind == AST_UNARY && e->unary.op == TK_BANG) {
+        zan_ast_node_t *x = dg_expr_tree(c, e->unary.operand, pname);
+        if (!x) return NULL;
+        zan_ast_node_t *args[1];
+        args[0] = x;
+        return dg_expr_call(c, loc, "Not", 3, args, 1);
+    }
+    if (e->kind == AST_CALL) {
+        zan_ast_node_t *callee = e->call.callee;
+        if (!callee || callee->kind != AST_MEMBER_ACCESS) {
+            zan_diag_emit(c->diag, DIAG_ERROR, loc,
+                          "expression-tree calls must be p.chain.Method(...)");
+            return NULL;
+        }
+        zan_istr_t mn = callee->member.name;
+        if (!istr_is(mn, "StartsWith") && !istr_is(mn, "EndsWith") &&
+            !istr_is(mn, "Contains")) {
+            zan_diag_emit(c->diag, DIAG_ERROR, loc,
+                          "unsupported method '%.*s' in expression tree",
+                          (int)mn.len, mn.str);
+            return NULL;
+        }
+        if (e->call.args.count > 1) {
+            zan_diag_emit(c->diag, DIAG_ERROR, loc,
+                          "expression-tree calls take at most one argument");
+            return NULL;
+        }
+        /* The receiver is the member chain up to the method name
+         * (`o.region` in `o.region.StartsWith("A")`); a bare `o` receiver
+         * is represented as null (the lambda parameter itself). */
+        zan_ast_node_t *obj = callee->member.object;
+        zan_ast_node_t *recv = NULL;
+        if (obj->kind == AST_IDENTIFIER && istr_eq(obj->ident.name, pname)) {
+            recv = NULL;
+        } else {
+            recv = dg_expr_tree(c, obj, pname);
+            if (!recv) return NULL;
+        }
+        zan_ast_node_t *arg = NULL;
+        if (e->call.args.count == 1) {
+            arg = dg_expr_tree(c, e->call.args.items[0], pname);
+            if (!arg) return NULL;
+        }
+        zan_ast_node_t *args[3];
+        args[0] = nb_strlit(c, loc, callee->member.name.str,
+                            (size_t)callee->member.name.len);
+        args[1] = recv ? recv : nb_null(c, loc);
+        args[2] = arg ? arg : nb_null(c, loc);
+        return dg_expr_call(c, loc, "Call", 4, args, 3);
+    }
+    zan_diag_emit(c->diag, DIAG_ERROR, loc,
+                  "unsupported expression in lambda tree");
+    return NULL;
+}
+
+/* Wrap a lowered tree as Expr<T>.From(ExprNode.Lambda(pname, tree)). */
+static zan_ast_node_t *dg_expr_wrap(dg_ctx_t *c, zan_loc_t loc,
+                                    zan_istr_t entity, zan_istr_t pname,
+                                    zan_ast_node_t *tree) {
+    zan_ast_node_t *largs[2];
+    largs[0] = nb_strlit(c, loc, pname.str, (size_t)pname.len);
+    largs[1] = tree;
+    zan_ast_node_t *lam = dg_expr_call(c, loc, "Lambda", 6, largs, 2);
+    zan_ast_node_t *expr_id = nb_ident(c, loc, "Expr");
+    zan_ast_node_t *ta = nb_type_ref(c, loc, entity.str, (size_t)entity.len);
+    expr_id->inst_type_ref = nb_type_ref(c, loc, "Expr", 4);
+    zan_ast_list_push(&expr_id->inst_type_ref->type_ref.type_args, ta,
+                      c->arena);
+    zan_ast_node_t *from_callee =
+        nb_member(c, loc, expr_id, dg_istr(c, "From", 4));
+    return nb_call1(c, loc, from_callee, lam);
+}
+
+/* True when the receiver chain bottoms out at the lambda parameter
+ * (`o` in `o.region` / `o.region.Sub` / ...). */
+static bool dg_expr_pname_chain(zan_ast_node_t *e, zan_istr_t pname) {
+    if (!e) return false;
+    if (e->kind == AST_IDENTIFIER) return istr_eq(e->ident.name, pname);
+    if (e->kind == AST_MEMBER_ACCESS)
+        return dg_expr_pname_chain(e->member.object, pname);
+    return false;
+}
+
+/* The direct operand of a comparison must be a column read or a literal; a
+ * captured variable cannot be lowered into an Expr tree (its value lives at
+ * runtime) and falls back to the classic fragment path which binds it. */
+static bool dg_expr_is_value(zan_ast_node_t *e, zan_istr_t pname) {
+    if (e->kind == AST_MEMBER_ACCESS)
+        return dg_expr_pname_chain(e->member.object, pname);
+    if (e->kind == AST_INT_LITERAL || e->kind == AST_FLOAT_LITERAL ||
+        e->kind == AST_STRING_LITERAL || e->kind == AST_BOOL_LITERAL)
+        return true;
+    return false;
+}
+
+static const dg_field_t *dg_member_field(const dg_fields_t *fs,
+                                         zan_ast_node_t *e,
+                                         zan_istr_t pname) {
+    if (!fs || e->kind != AST_MEMBER_ACCESS) return NULL;
+    if (!e->member.object || e->member.object->kind != AST_IDENTIFIER ||
+        !istr_eq(e->member.object->ident.name, pname))
+        return NULL;
+    return dg_field_find(fs, e->member.name);
+}
+
+static int dg_lit_kind(zan_ast_node_t *e) {
+    if (e->kind == AST_INT_LITERAL) return DF_INT;
+    if (e->kind == AST_FLOAT_LITERAL) return DF_DOUBLE;
+    if (e->kind == AST_STRING_LITERAL) return DF_STRING;
+    if (e->kind == AST_BOOL_LITERAL) return DF_BOOL;
+    return -1;
+}
+
+/* A literal of kind lk may be compared against a column of kind fk. Keeps the
+ * negative diagnostics (int column vs string literal and vice versa) alive:
+ * those predicates stay on the classic path, which reports the compile-time
+ * type error the test expects. */
+static bool dg_kind_compat(int fk, int lk) {
+    switch (fk) {
+    case DF_INT:
+    case DF_ENUM:
+        return lk == DF_INT || lk == DF_BOOL;
+    case DF_DOUBLE:
+        return lk == DF_INT || lk == DF_DOUBLE;
+    case DF_BOOL:
+        return lk == DF_BOOL || lk == DF_INT;
+    case DF_STRING:
+        return lk == DF_STRING;
+    default:
+        return false;
+    }
+}
+
+static bool dg_expr_type_ok(const dg_fields_t *fs, zan_ast_node_t *l,
+                            zan_ast_node_t *r, zan_istr_t pname) {
+    const dg_field_t *lf = dg_member_field(fs, l, pname);
+    const dg_field_t *rf = dg_member_field(fs, r, pname);
+    int lk = dg_lit_kind(l);
+    int rk = dg_lit_kind(r);
+    if (lf && rk >= 0) return dg_kind_compat(lf->kind, rk);
+    if (rf && lk >= 0) return dg_kind_compat(rf->kind, lk);
+    return true; /* column-vs-column and constant-vs-constant: let SQL decide */
+}
+
+/* True when the lambda body can be lowered to an Expr tree that ExprSql can
+ * build SQL for: member reads, literals, supported binary ops (with operand
+ * type checks), not, and p-chain StartsWith/EndsWith/Contains calls. Anything
+ * else (Eq/Gt/Between/IsNull/Like/In method calls, captured variables,
+ * aggregates, ...) falls back to the classic SQL-fragment path so existing
+ * behavior — including negative type diagnostics — is preserved. */
+static bool dg_expr_compatible(dg_ctx_t *c, const dg_fields_t *fs,
+                               zan_ast_node_t *e, zan_istr_t pname) {
+    (void)c;
+    if (!e) return false;
+    if (e->kind == AST_MEMBER_ACCESS)
+        return dg_expr_pname_chain(e->member.object, pname);
+    if (e->kind == AST_INT_LITERAL || e->kind == AST_FLOAT_LITERAL ||
+        e->kind == AST_STRING_LITERAL || e->kind == AST_BOOL_LITERAL)
+        return true;
+    if (e->kind == AST_BINARY) {
+        const char *op = dg_expr_op(e->binary.op);
+        if (!op) return false;
+        if (!dg_expr_compatible(c, fs, e->binary.left, pname) ||
+            !dg_expr_compatible(c, fs, e->binary.right, pname))
+            return false;
+        if (strcmp(op, "&&") == 0 || strcmp(op, "||") == 0)
+            return true; /* boolean combination: operands already checked */
+        if (!dg_expr_is_value(e->binary.left, pname) ||
+            !dg_expr_is_value(e->binary.right, pname))
+            return false; /* captured variable: classic path binds it */
+        return dg_expr_type_ok(fs, e->binary.left, e->binary.right, pname);
+    }
+    if (e->kind == AST_UNARY && e->unary.op == TK_BANG)
+        return dg_expr_compatible(c, fs, e->unary.operand, pname);
+    if (e->kind == AST_CALL) {
+        zan_ast_node_t *callee = e->call.callee;
+        if (!callee || callee->kind != AST_MEMBER_ACCESS) return false;
+        zan_istr_t mn = callee->member.name;
+        if (!istr_is(mn, "StartsWith") && !istr_is(mn, "EndsWith") &&
+            !istr_is(mn, "Contains"))
+            return false; /* Eq/Gt/Like/In/... stay on the classic path */
+        if (!dg_expr_pname_chain(callee->member.object, pname)) return false;
+        if (e->call.args.count > 1) return false;
+        if (e->call.args.count == 1 &&
+            !dg_expr_compatible(c, fs, e->call.args.items[0], pname))
+            return false;
+        return true;
+    }
+    return false;
+}
+
+/* Scan every type declaration for methods whose parameter type AST is
+ * `Expr<...>` (shape check only — no binder needed) and record a slot so
+ * call sites can lower lambdas into trees. */
+static void dg_collect_expr_slots(dg_ctx_t *c) {
+    zan_ast_node_t *unit = c->unit;
+    for (int i = 0; i < unit->comp_unit.decls.count; i++) {
+        zan_ast_node_t *d = unit->comp_unit.decls.items[i];
+        if (!d || (d->kind != AST_CLASS_DECL && d->kind != AST_STRUCT_DECL)) continue;
+        zan_istr_t cls = d->type_decl.name;
+        for (int m = 0; m < d->type_decl.members.count; m++) {
+            zan_ast_node_t *mem = d->type_decl.members.items[m];
+            if (!mem || mem->kind != AST_METHOD_DECL) continue;
+            for (int p = 0; p < mem->method_decl.params.count; p++) {
+                zan_ast_node_t *pt = mem->method_decl.params.items[p]->param.type;
+                if (!pt || pt->kind != AST_TYPE_REF ||
+                    !istr_is(pt->type_ref.name, "Expr") ||
+                    pt->type_ref.type_args.count != 1)
+                    continue;
+                zan_ast_node_t *ta = pt->type_ref.type_args.items[0];
+                if (c->eslot_count >= 128) return;
+                dg_expr_slot_t *s = &c->eslots[c->eslot_count++];
+                s->cls = cls;
+                s->name = mem->method_decl.name;
+                s->param = p;
+                s->entity = (ta && ta->kind == AST_TYPE_REF)
+                                ? ta->type_ref.name
+                                : (zan_istr_t){NULL, 0};
+            }
+        }
+    }
+}
+
+/* Rewrite `recv.Method(args)` (or bare `Method(args)`) when the argument at
+ * the Expr slot is a lambda: `M(p => body)` becomes
+ * `M(Expr<T>.From(DbExpr.Lambda("p", <tree>)))`. */
+static bool dg_expr_rewrite_call(dg_ctx_t *c, zan_ast_node_t *e) {
+    zan_ast_node_t *callee = e->call.callee;
+    if (!callee) return false;
+    zan_istr_t cls = {NULL, 0};
+    zan_istr_t name;
+    bool direct = false;
+    if (callee->kind == AST_IDENTIFIER) {
+        name = callee->ident.name;
+        direct = true; /* unqualified call: match any class of that name */
+    } else if (callee->kind == AST_MEMBER_ACCESS &&
+               callee->member.object &&
+               callee->member.object->kind == AST_IDENTIFIER) {
+        cls = callee->member.object->ident.name;
+        name = callee->member.name;
+    } else {
+        return false;
+    }
+    for (int i = 0; i < c->eslot_count; i++) {
+        dg_expr_slot_t *s = &c->eslots[i];
+        if (!istr_eq(s->name, name)) continue;
+        if (!direct && !istr_eq(s->cls, cls)) continue;
+        if (s->param >= e->call.args.count) continue;
+        zan_ast_node_t *arg = e->call.args.items[s->param];
+        if (!arg || arg->kind != AST_LAMBDA ||
+            arg->lambda.params.count != 1)
+            continue;
+        zan_istr_t pname = arg->lambda.params.items[0]->param.name;
+        zan_ast_node_t *tree = dg_expr_tree(c, arg->lambda.body, pname);
+        if (!tree) return true; /* diagnostic already emitted */
+        e->call.args.items[s->param] =
+            dg_expr_wrap(c, e->loc, s->entity, pname, tree);
+        return true;
+    }
+    return false;
+}
+
+static void dg_rewrite_tolist(dg_ctx_t *c, zan_ast_node_t *call,
+                              zan_istr_t cls) {
+    zan_ast_node_t *lambda = call->call.args.items[0];
+    if (lambda->kind != AST_LAMBDA || lambda->lambda.params.count != 1) {
+        zan_diag_emit(c->diag, DIAG_ERROR, call->loc,
+                      "ToList expects a one-parameter lambda");
+        return;
+    }
+    zan_ast_node_t *body = lambda->lambda.body;
+    zan_istr_t pname = lambda->lambda.params.items[0]->param.name;
+    dg_fields_t fields;
+    memset(&fields, 0, sizeof(fields));
+    dg_collect_fields(c->unit, dg_find_class(c->unit, cls), &fields, 0);
+
+    /* DTO mapping: ToList<TDto>(a => new Dto { f1 = a.x, f2 = a.y }) */
+    if (call->call.type_args.count == 1) {
+        zan_ast_node_t *targ = call->call.type_args.items[0];
+        zan_istr_t dtc = targ->type_ref.name;
+        if (body->kind != AST_NEW_EXPR) {
+            zan_diag_emit(c->diag, DIAG_ERROR, body->loc,
+                          "ToList<Dto> expects a => new Dto { f = a.col, ... }");
+            return;
+        }
+        dg_buf_t cols;
+        memset(&cols, 0, sizeof(cols));
+        dg_fields_t df;
+        memset(&df, 0, sizeof(df));
+        zan_ast_node_t *ddecl = dg_find_class(c->unit, dtc);
+        if (ddecl) dg_collect_fields(c->unit, ddecl, &df, 0);
+        bool first = true;
+        for (int i = 0; i < body->new_expr.args.count; i++) {
+            zan_ast_node_t *arg = body->new_expr.args.items[i];
+            zan_istr_t dname = {NULL, 0};
+            zan_ast_node_t *src = arg;
+            if (arg->kind == AST_ASSIGNMENT &&
+                arg->binary.left->kind == AST_IDENTIFIER) {
+                dname = arg->binary.left->ident.name;
+                src = arg->binary.right;
+            }
+            const dg_field_t *col = NULL;
+            if (src->kind == AST_MEMBER_ACCESS &&
+                src->member.object->kind == AST_IDENTIFIER &&
+                istr_eq(src->member.object->ident.name, pname))
+                col = dg_field_find(&fields, src->member.name);
+            if (!col || col->kind == DF_NAV) {
+                zan_diag_emit(c->diag, DIAG_ERROR, src->loc,
+                              "ToList<Dto> member must read p => p.<scalar field>");
+                return;
+            }
+            dg_putf(&cols, "%st.%.*s", first ? "" : ", ", (int)col->name.len,
+                    col->name.str);
+            first = false;
+            if (dname.len == 0) dname = src->member.name;
+            (void)dname;
+        }
+        if (first) {
+            zan_diag_emit(c->diag, DIAG_ERROR, body->loc,
+                          "ToList<Dto> must name at least one member");
+            return;
+        }
+        zan_ast_node_t *a1 = nb_strlit(c, call->loc, cols.buf, strlen(cols.buf));
+        free(cols.buf);
+        zan_ast_node_t *a2 = nb_strlit(c, call->loc, dtc.str, dtc.len);
+        call->call.callee->member.name = dg_istr(c, "ToListDto", 9);
+        call->call.type_args.count = 0;
+        zan_ast_list_init(&call->call.args);
+        zan_ast_list_push(&call->call.args, a1, c->arena);
+        zan_ast_list_push(&call->call.args, a2, c->arena);
+        return;
+    }
+
+    /* scalar projection: ToList(a => a.field) */
+    const dg_field_t *col = NULL;
+    if (body->kind == AST_MEMBER_ACCESS &&
+        body->member.object->kind == AST_IDENTIFIER &&
+        istr_eq(body->member.object->ident.name, pname))
+        col = dg_field_find(&fields, body->member.name);
+    if (!col || col->kind == DF_NAV) {
+        zan_diag_emit(c->diag, DIAG_ERROR, body->loc,
+                      "ToList expects a => a.<scalar field>");
+        return;
+    }
+    char buf[160];
+    snprintf(buf, sizeof(buf), "t.%.*s", (int)col->name.len, col->name.str);
+    zan_ast_node_t *arg = nb_strlit(c, call->loc, buf, strlen(buf));
+    call->call.callee->member.name = dg_istr(c, "ToListCol", 9);
+    call->call.type_args.count = 0;
+    zan_ast_list_init(&call->call.args);
+    zan_ast_list_push(&call->call.args, arg, c->arena);
+}
+
 static void dg_rewrite_include(dg_ctx_t *c, zan_ast_node_t *call,
                                zan_istr_t cls) {
     zan_ast_node_t *lambda = call->call.args.items[0];
@@ -1076,6 +1992,9 @@ static void dg_visit_call(dg_ctx_t *c, zan_ast_node_t *e) {
         dg_rewrite_sync_all(c, e);
         return;
     }
+    /* Expr<T> target-typed lambda: rewrite before ORM chain handling so the
+     * tree lowering applies to any method whose parameter is Expr<T>. */
+    if (dg_expr_rewrite_call(c, e)) return;
     if (dg_is_root(c, e, &cls, &rk, &sync)) {
         if (sync) dg_rewrite_sync(c, e, cls);
         else dg_rewrite_root(c, e, cls,
@@ -1101,12 +2020,19 @@ static void dg_visit_call(dg_ctx_t *c, zan_ast_node_t *e) {
     bool is_incr = istr_is(mn, "SetIncr");
     bool is_only = istr_is(mn, "InsertColumns") || istr_is(mn, "UpdateColumns");
     bool is_skip = istr_is(mn, "IgnoreColumns");
+    bool is_groupby = istr_is(mn, "GroupBy");
+    bool is_having = istr_is(mn, "Having");
+    bool is_distinct = istr_is(mn, "Distinct");
     const char *agg = istr_is(mn, "Sum")   ? "SUM"
                       : istr_is(mn, "Avg") ? "AVG"
                       : istr_is(mn, "Max") ? "MAX"
                       : istr_is(mn, "Min") ? "MIN"
                                            : NULL;
 
+    if (is_distinct && ck == CK_SELECT && e->call.args.count == 0) {
+        dg_rewrite_distinct(c, e);
+        return;
+    }
     if (is_whereif) {
         if (e->call.args.count != 2 ||
             e->call.args.items[1]->kind != AST_LAMBDA)
@@ -1128,6 +2054,10 @@ static void dg_visit_call(dg_ctx_t *c, zan_ast_node_t *e) {
     else if ((is_ob || is_obd) && ck == CK_SELECT)
         dg_rewrite_orderby(c, e, entity, is_obd);
     else if (agg && ck == CK_SELECT) dg_rewrite_agg(c, e, entity, agg);
+    else if (is_groupby && ck == CK_SELECT) dg_rewrite_groupby(c, e, entity);
+    else if (is_having && ck == CK_SELECT) dg_rewrite_having(c, e, entity);
+    else if (istr_is(mn, "ToList") && ck == CK_SELECT)
+        dg_rewrite_tolist(c, e, entity);
     else if ((is_only || is_skip) && (ck == CK_INSERT || ck == CK_UPDATE))
         dg_rewrite_cols(c, e, entity, is_only);
 }
@@ -1253,6 +2183,9 @@ static void dg_gen_entity(dg_ctx_t *c, dg_buf_t *out, zan_istr_t cls) {
         "    string w;\n"
         "    DbParams ps;\n"
         "    string ob;\n"
+        "    string gb;\n"
+        "    string h;\n"
+        "    bool distinct;\n"
         "    int limN;\n"
         "    int offN;\n"
         "    bool on;\n");
@@ -1269,6 +2202,9 @@ static void dg_gen_entity(dg_ctx_t *c, dg_buf_t *out, zan_istr_t cls) {
         "        q.w = \"\";\n"
         "        q.ps = DbParams.Create();\n"
         "        q.ob = \"\";\n"
+        "        q.gb = \"\";\n"
+        "        q.h = \"\";\n"
+        "        q.distinct = false;\n"
         "        q.limN = -1;\n"
         "        q.offN = -1;\n"
         "        return q;\n"
@@ -1280,7 +2216,18 @@ static void dg_gen_entity(dg_ctx_t *c, dg_buf_t *out, zan_istr_t cls) {
         "        if (this.w.Length == 0) { this.w = f; }\n"
         "        else { this.w = this.w + \" AND \" + f; }\n"
         "        return this;\n"
-        "    }\n"
+        "    }\n",
+        CL, CS);
+    dg_putf(out,
+        "    __DbQ_%.*s Where(Expr<%.*s> e) {\n"
+        "        if (!this.on) { return this; }\n"
+        "        if (e == null || e.Root == null) { return this; }\n"
+        "        StringBuilder sb = new StringBuilder();\n"
+        "        ExprSql.Build(e.Root, sb, this.ps);\n"
+        "        return this.W(sb.ToString());\n"
+        "    }\n",
+        CL, CS, CL, CS);
+    dg_putf(out,
         "    __DbQ_%.*s WhereDict(DbValues v) {\n"
         "        if (!this.on) { return this; }\n"
         "        int i = 0;\n"
@@ -1291,60 +2238,101 @@ static void dg_gen_entity(dg_ctx_t *c, dg_buf_t *out, zan_istr_t cls) {
         "            i = i + 1;\n"
         "        }\n"
         "        return this;\n"
-        "    }\n"
-        "    __DbQ_%.*s CondBegin(bool c) { this.on = c; return this; }\n"
-        "    __DbQ_%.*s CondEnd() { this.on = true; return this; }\n"
-        "    __DbQ_%.*s AsTable(string t) { this.tbl = t; return this; }\n"
+        "    }\n",
+        CL, CS, CL, CS, CL, CS);
+    dg_putf(out,
+        "    __DbQ_%.*s CondBegin(bool c) { this.on = c; return this; }\n",
+        CL, CS);
+    dg_putf(out,
+        "    __DbQ_%.*s CondEnd() { this.on = true; return this; }\n",
+        CL, CS);
+    dg_putf(out,
+        "    __DbQ_%.*s AsTable(string t) { this.tbl = t; return this; }\n",
+        CL, CS);
+    dg_putf(out,
         "    __DbQ_%.*s P(string v) {\n"
         "        if (this.on) { this.ps.Add(v); }\n"
         "        return this;\n"
-        "    }\n"
+        "    }\n",
+        CL, CS);
+    dg_putf(out,
         "    __DbQ_%.*s Pi(int v) {\n"
         "        if (this.on) { this.ps.AddInt(v); }\n"
         "        return this;\n"
-        "    }\n"
+        "    }\n",
+        CL, CS);
+    dg_putf(out,
         "    __DbQ_%.*s Pd(double v) {\n"
         "        if (this.on) { this.ps.AddDouble(v); }\n"
         "        return this;\n"
-        "    }\n"
+        "    }\n",
+        CL, CS);
+    dg_putf(out,
         "    __DbQ_%.*s InI(List<int> vs) {\n"
         "        if (!this.on) { return this; }\n"
         "        int i = 0;\n"
         "        while (i < vs.Count) { this.ps.AddInt(vs[i]); i = i + 1; }\n"
         "        return this;\n"
-        "    }\n"
+        "    }\n",
+        CL, CS);
+    dg_putf(out,
         "    __DbQ_%.*s InS(List<string> vs) {\n"
         "        if (!this.on) { return this; }\n"
         "        int i = 0;\n"
         "        while (i < vs.Count) { this.ps.Add(vs[i]); i = i + 1; }\n"
         "        return this;\n"
-        "    }\n"
+        "    }\n",
+        CL, CS);
+    dg_putf(out,
         "    __DbQ_%.*s InD(List<double> vs) {\n"
         "        if (!this.on) { return this; }\n"
         "        int i = 0;\n"
         "        while (i < vs.Count) { this.ps.AddDouble(vs[i]); i = i + 1; }\n"
         "        return this;\n"
-        "    }\n"
+        "    }\n",
+        CL, CS);
+    dg_putf(out,
         "    __DbQ_%.*s OB(string col) {\n"
         "        if (this.ob.Length == 0) { this.ob = col; }\n"
         "        else { this.ob = this.ob + \", \" + col; }\n"
         "        return this;\n"
-        "    }\n"
-        "    __DbQ_%.*s OBD(string col) { return OB(col + \" DESC\"); }\n"
-        "    __DbQ_%.*s Take(int n) { this.limN = n; return this; }\n"
-        "    __DbQ_%.*s Skip(int n) { this.offN = n; return this; }\n"
-        "    __DbQ_%.*s Limit(int n) { this.limN = n; return this; }\n"
-        "    __DbQ_%.*s Offset(int n) { this.offN = n; return this; }\n"
+        "    }\n",
+        CL, CS);
+    dg_putf(out,
+        "    __DbQ_%.*s OBD(string col) { return OB(col + \" DESC\"); }\n",
+        CL, CS);
+    dg_putf(out,
+        "    __DbQ_%.*s GB(string col) { this.gb = col; return this; }\n",
+        CL, CS);
+    dg_putf(out,
+        "    __DbQ_%.*s H(string f) {\n"
+        "        if (this.h.Length == 0) { this.h = f; }\n"
+        "        else { this.h = this.h + \" AND \" + f; }\n"
+        "        return this;\n"
+        "    }\n",
+        CL, CS);
+    dg_putf(out,
+        "    __DbQ_%.*s DISTINCT() { this.distinct = true; return this; }\n",
+        CL, CS);
+    dg_putf(out,
+        "    __DbQ_%.*s Take(int n) { this.limN = n; return this; }\n",
+        CL, CS);
+    dg_putf(out,
+        "    __DbQ_%.*s Skip(int n) { this.offN = n; return this; }\n",
+        CL, CS);
+    dg_putf(out,
+        "    __DbQ_%.*s Limit(int n) { this.limN = n; return this; }\n",
+        CL, CS);
+    dg_putf(out,
+        "    __DbQ_%.*s Offset(int n) { this.offN = n; return this; }\n",
+        CL, CS);
+    dg_putf(out,
         "    __DbQ_%.*s Page(int index, int size) {\n"
         "        if (index < 1) { index = 1; }\n"
         "        this.limN = size;\n"
         "        this.offN = (index - 1) * size;\n"
         "        return this;\n"
         "    }\n",
-        CL, CS, CL, CS, CL, CS, CL, CS, CL, CS, CL, CS, CL, CS, CL, CS,
-        CL, CS, CL, CS, CL, CS, CL, CS, CL, CS, CL, CS, CL, CS, CL, CS,
-        CL, CS,
-        CL, CS, CL, CS,
         CL, CS);
     for (int i = 0; i < fs.count; i++)
         if (fs.items[i].kind == DF_NAV)
@@ -1358,7 +2346,8 @@ static void dg_gen_entity(dg_ctx_t *c, dg_buf_t *out, zan_istr_t cls) {
     dg_putf(out,
         "    string BuildSelect() {\n"
         "        StringBuilder sb = new StringBuilder();\n"
-        "        sb.Append(\"SELECT \");\n");
+        "        sb.Append(\"SELECT \");\n"
+        "        if (this.distinct) { sb.Append(\"DISTINCT \"); }\n");
     {
         dg_buf_t cols;
         memset(&cols, 0, sizeof(cols));
@@ -1415,12 +2404,31 @@ static void dg_gen_entity(dg_ctx_t *c, dg_buf_t *out, zan_istr_t cls) {
     dg_putf(out,
         "        if (this.w.Length > 0) { sb.Append(\" WHERE \"); "
         "sb.Append(this.w); }\n"
+        "        if (this.gb.Length > 0) { sb.Append(\" GROUP BY \"); "
+        "sb.Append(this.gb); }\n"
+        "        if (this.h.Length > 0) { sb.Append(\" HAVING \"); "
+        "sb.Append(this.h); }\n"
         "        if (this.ob.Length > 0) { sb.Append(\" ORDER BY \"); "
         "sb.Append(this.ob); }\n"
-        "        if (this.limN >= 0) { sb.Append(\" LIMIT \"); "
+        "        int pv = this.db.GetProvider();\n"
+        "        if (pv == DbProvider.SqlServer || pv == DbProvider.Oracle) {\n"
+        "            int off = this.offN;\n"
+        "            if (off < 0) { off = 0; }\n"
+        "            if (this.ob.Length == 0) {\n"
+        "                if (pv == DbProvider.SqlServer) { "
+        "sb.Append(\" ORDER BY (SELECT 0)\"); }\n"
+        "                else { sb.Append(\" ORDER BY (SELECT 0 FROM DUAL)\"); }\n"
+        "            }\n"
+        "            sb.Append(\" OFFSET \"); "
+        "sb.Append(Convert.ToString(off)); sb.Append(\" ROWS\");\n"
+        "            if (this.limN >= 0) { sb.Append(\" FETCH NEXT \"); "
+        "sb.Append(Convert.ToString(this.limN)); sb.Append(\" ROWS ONLY\"); }\n"
+        "        } else {\n"
+        "            if (this.limN >= 0) { sb.Append(\" LIMIT \"); "
         "sb.Append(Convert.ToString(this.limN)); }\n"
-        "        if (this.offN >= 0) { sb.Append(\" OFFSET \"); "
+        "            if (this.offN >= 0) { sb.Append(\" OFFSET \"); "
         "sb.Append(Convert.ToString(this.offN)); }\n"
+        "        }\n"
         "        return sb.ToString();\n"
         "    }\n");
 
@@ -1501,6 +2509,30 @@ static void dg_gen_entity(dg_ctx_t *c, dg_buf_t *out, zan_istr_t cls) {
         "        return outp;\n"
         "    }\n");
     dg_putf(out,
+        "    List<string> ToListCol(string col) {\n"
+        "        StringBuilder sb = new StringBuilder();\n"
+        "        sb.Append(\"SELECT \" + col + \" FROM \" + this.tbl + \" t\");\n"
+        "        if (this.w.Length > 0) { sb.Append(\" WHERE \" + this.w); }\n"
+        "        if (this.gb.Length > 0) { sb.Append(\" GROUP BY \" + this.gb); }\n"
+        "        if (this.h.Length > 0) { sb.Append(\" HAVING \" + this.h); }\n"
+        "        if (this.ob.Length > 0) { sb.Append(\" ORDER BY \" + this.ob); }\n"
+        "        DbResult r = this.db.Query(sb.ToString(), this.ps);\n"
+        "        List<string> outp = new List<string>();\n"
+        "        int row = 0;\n"
+        "        while (row < r.RowCount()) { outp.Add(r.GetString(row, 0)); row = row + 1; }\n"
+        "        return outp;\n"
+        "    }\n");
+    dg_putf(out,
+        "    DbResult ToListDtoR(string cols) {\n"
+        "        StringBuilder sb = new StringBuilder();\n"
+        "        sb.Append(\"SELECT \" + cols + \" FROM \" + this.tbl + \" t\");\n"
+        "        if (this.w.Length > 0) { sb.Append(\" WHERE \" + this.w); }\n"
+        "        if (this.gb.Length > 0) { sb.Append(\" GROUP BY \" + this.gb); }\n"
+        "        if (this.h.Length > 0) { sb.Append(\" HAVING \" + this.h); }\n"
+        "        if (this.ob.Length > 0) { sb.Append(\" ORDER BY \" + this.ob); }\n"
+        "        return this.db.Query(sb.ToString(), this.ps);\n"
+        "    }\n");
+    dg_putf(out,
         "    %.*s First() {\n"
         "        this.limN = 1;\n"
         "        List<%.*s> l = ToList();\n"
@@ -1510,6 +2542,20 @@ static void dg_gen_entity(dg_ctx_t *c, dg_buf_t *out, zan_istr_t cls) {
         "    %.*s FirstOrDefault() { return First(); }\n"
         "    %.*s ToOne() { return First(); }\n"
         "    int Count() {\n"
+        "        if (this.gb.Length > 0) {\n"
+        "            StringBuilder sb = new StringBuilder();\n"
+        "            sb.Append(\"SELECT COUNT(*) FROM (SELECT 1 FROM \" + "
+        "this.tbl + \" t\");\n"
+        "            if (this.w.Length > 0) { sb.Append(\" WHERE \" + "
+        "this.w); }\n"
+        "            sb.Append(\" GROUP BY \" + this.gb);\n"
+        "            if (this.h.Length > 0) { sb.Append(\" HAVING \" + "
+        "this.h); }\n"
+        "            sb.Append(\")\");\n"
+        "            DbResult r = this.db.Query(sb.ToString(), this.ps);\n"
+        "            if (r.RowCount() == 0) { return 0; }\n"
+        "            return r.GetInt(0, 0);\n"
+        "        }\n"
         "        return AggI(\"COUNT(*)\");\n"
         "    }\n"
         "    bool Any() { return Count() > 0; }\n"
@@ -1518,6 +2564,10 @@ static void dg_gen_entity(dg_ctx_t *c, dg_buf_t *out, zan_istr_t cls) {
         "        sb.Append(\"SELECT \" + expr + \" FROM \" + this.tbl + \" t\");\n"
         "        if (this.w.Length > 0) { sb.Append(\" WHERE \"); "
         "sb.Append(this.w); }\n"
+        "        if (this.gb.Length > 0) { sb.Append(\" GROUP BY \"); "
+        "sb.Append(this.gb); }\n"
+        "        if (this.h.Length > 0) { sb.Append(\" HAVING \"); "
+        "sb.Append(this.h); }\n"
         "        return this.db.Query(sb.ToString(), this.ps);\n"
         "    }\n"
         "    int AggI(string expr) {\n"
@@ -2119,6 +3169,8 @@ void zan_dbgen_run(zan_ast_node_t *unit, zan_arena_t *arena,
     c.arena = arena;
     c.diag = diag;
 
+    dg_collect_expr_slots(&c);
+
     for (int i = 0; i < unit->comp_unit.decls.count; i++) {
         zan_ast_node_t *d = unit->comp_unit.decls.items[i];
         if (d->kind != AST_CLASS_DECL && d->kind != AST_STRUCT_DECL) continue;
@@ -2204,6 +3256,7 @@ void zan_dbgen_run(zan_ast_node_t *unit, zan_arena_t *arena,
         "            sb.Append(\"?\");\n"
         "            i = i + 1;\n"
         "        }\n"
+        "        if (sb.Length == 0) { sb.Append(\"NULL\"); }\n"
         "        return sb.ToString();\n"
         "    }\n"
         "    static bool Has(List<string> l, string v) {\n"

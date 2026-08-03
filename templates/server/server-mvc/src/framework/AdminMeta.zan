@@ -1,0 +1,233 @@
+using System;
+using System.Data;
+using System.Data.Orm;
+using System.Json;
+
+namespace ZanWeb;
+
+/// <summary>表单字段类型：决定管理后台表单渲染成哪种控件。</summary>
+enum FieldKind {
+    Text,     // 单行文本
+    Textarea, // 多行文本
+    Password, // 密码（不回显）
+    Number,   // 数字
+    Select,   // 下拉（选项来自 options）
+    Switch,   // 开关（0/1）
+    Hidden    // 隐藏字段（随表单提交，如 parentId）
+}
+
+/// <summary>一个管理实体在后台的元数据：表名、主键、可配置字段、可搜索字段、
+/// 表头列、表单控件。列表与表单由这套元数据驱动生成，新增实体只需声明一份
+/// 元数据，页面无需手写。</summary>
+class EntityMeta {
+    string table;                 // 数据库表名
+    string key;                   // 主键列名（默认 "id"）
+    string title;                 // 页面标题（如 "用户管理"）
+    string singular;              // 单数名称（用于"新增xx"按钮文案，如 "用户"）
+    List<FieldMeta> fields;       // 所有可读写字段
+    List<string> searchable;      // 参与关键字搜索的字段
+    List<string> columns;         // 列表页显示的列（顺序即显示顺序）
+    string orderBy;               // 列表默认排序（如 "id desc"）
+    List<EntityOption> options;   // 常量选项池：字段名 -> 选项列表
+
+    EntityMeta(string table) {
+        this.table = table;
+        this.key = "id";
+        this.title = "";
+        this.singular = "";
+        this.fields = new List<FieldMeta>();
+        this.searchable = new List<string>();
+        this.columns = new List<string>();
+        this.orderBy = "";
+        this.options = new List<EntityOption>();
+    }
+
+    static EntityMeta Create(string table) {
+        return new EntityMeta(table);
+    }
+
+    EntityMeta Key(string k) { this.key = k; return this; }
+    EntityMeta Title(string t) { this.title = t; return this; }
+    EntityMeta Singular(string s) { this.singular = s; return this; }
+    EntityMeta OrderBy(string o) { this.orderBy = o; return this; }
+
+    /// <summary>注册一个字段。name 为表列名，label 为中文名。</summary>
+    EntityMeta Add(FieldMeta f) {
+        this.fields.Add(f);
+        return this;
+    }
+
+    /// <summary>注册一个常量选项池（如部门状态、角色状态）。</summary>
+    EntityMeta AddOptions(EntityOption pool) {
+        this.options.Add(pool);
+        return this;
+    }
+
+    /// <summary>声明参与关键字搜索的字段。</summary>
+    EntityMeta Search(params string[] names) {
+        int i = 0;
+        while (i < names.Length) {
+            this.searchable.Add(names[i]);
+            i = i + 1;
+        }
+        return this;
+    }
+
+    /// <summary>声明列表页显示的列（按顺序）。</summary>
+    EntityMeta Columns(params string[] names) {
+        int i = 0;
+        while (i < names.Length) {
+            this.columns.Add(names[i]);
+            i = i + 1;
+        }
+        return this;
+    }
+
+    /// <summary>按名称查找字段元数据，找不到返回 null。</summary>
+    FieldMeta Field(string name) {
+        int i = 0;
+        while (i < this.fields.Count) {
+            if (this.fields[i].name == name) { return this.fields[i]; }
+            i = i + 1;
+        }
+        return null;
+    }
+
+    /// <summary>关键字搜索的 SQL 条件（"field1 LIKE ? OR field2 LIKE ?"），
+    /// 无搜索字段时返回空串。</summary>
+    string SearchSql() {
+        if (this.searchable.Count == 0) { return ""; }
+        StringBuilder sb = new StringBuilder();
+        int i = 0;
+        while (i < this.searchable.Count) {
+            if (i > 0) { sb.Append(" OR "); }
+            sb.Append(this.searchable[i]);
+            sb.Append(" LIKE ?");
+            i = i + 1;
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>序列化元数据为 JSON，供前端动态渲染列表与表单。</summary>
+    string ToJson() {
+        JsonValue o = JsonValue.NewObject();
+        o.Put("table", JsonValue.NewStr(this.table));
+        o.Put("key", JsonValue.NewStr(this.key));
+        o.Put("title", JsonValue.NewStr(this.title));
+        o.Put("singular", JsonValue.NewStr(this.singular));
+        JsonValue cols = JsonValue.NewArray();
+        int i = 0;
+        while (i < this.columns.Count) {
+            cols.Append(JsonValue.NewStr(this.columns[i]));
+            i = i + 1;
+        }
+        o.Put("columns", cols);
+        JsonValue fieldsArr = JsonValue.NewArray();
+        i = 0;
+        while (i < this.fields.Count) {
+            fieldsArr.Append(this.fields[i].ToJson());
+            i = i + 1;
+        }
+        o.Put("fields", fieldsArr);
+        // options 池：{"status":[{"value":"0","label":"启用"},...], ...}
+        JsonValue opts = JsonValue.NewObject();
+        i = 0;
+        while (i < this.options.Count) {
+            opts.Put(this.options[i].name, this.options[i].ToJson());
+            i = i + 1;
+        }
+        o.Put("options", opts);
+        return o.ToJson();
+    }
+}
+
+/// <summary>单个字段的元数据：列名、中文名、表单控件类型、是否必填、
+/// 列表是否显示、选项池引用。</summary>
+class FieldMeta {
+    string name;
+    string label;
+    FieldKind kind;
+    bool required;
+    bool inForm;
+    bool inList;
+    string optionsRef;   // 引用 EntityMeta.options 池中的选项名（如 "status"）
+    string def;          // 默认值
+
+    FieldMeta(string name, string label) {
+        this.name = name;
+        this.label = label;
+        this.kind = FieldKind.Text;
+        this.required = false;
+        this.inForm = true;
+        this.inList = true;
+        this.optionsRef = "";
+        this.def = "";
+    }
+
+    static FieldMeta Create(string name, string label) {
+        return new FieldMeta(name, label);
+    }
+
+    FieldMeta Kind(FieldKind k) { this.kind = k; return this; }
+    FieldMeta Required() { this.required = true; return this; }
+    FieldMeta NoForm() { this.inForm = false; return this; }
+    FieldMeta NoList() { this.inList = false; return this; }
+    FieldMeta Options(string refName) { this.optionsRef = refName; return this; }
+    FieldMeta Default(string v) { this.def = v; return this; }
+
+    string KindName() {
+        if (this.kind == FieldKind.Textarea) { return "textarea"; }
+        if (this.kind == FieldKind.Password) { return "password"; }
+        if (this.kind == FieldKind.Number) { return "number"; }
+        if (this.kind == FieldKind.Select) { return "select"; }
+        if (this.kind == FieldKind.Switch) { return "switch"; }
+        if (this.kind == FieldKind.Hidden) { return "hidden"; }
+        return "text";
+    }
+
+    JsonValue ToJson() {
+        JsonValue o = JsonValue.NewObject();
+        o.Put("name", JsonValue.NewStr(this.name));
+        o.Put("label", JsonValue.NewStr(this.label));
+        o.Put("kind", JsonValue.NewStr(this.KindName()));
+        o.Put("required", JsonValue.NewBool(this.required));
+        o.Put("inForm", JsonValue.NewBool(this.inForm));
+        o.Put("inList", JsonValue.NewBool(this.inList));
+        o.Put("options", JsonValue.NewStr(this.optionsRef));
+        o.Put("def", JsonValue.NewStr(this.def));
+        return o.ToJson();
+    }
+}
+
+/// <summary>一个命名选项池：{"name":"status","items":[{"value":"0","label":"启用"},...]}。</summary>
+class EntityOption {
+    string name;
+    List<JsonValue> items;   // {"value","label"}
+
+    EntityOption(string name) {
+        this.name = name;
+        this.items = new List<JsonValue>();
+    }
+
+    static EntityOption Create(string name) {
+        return new EntityOption(name);
+    }
+
+    EntityOption Add(string value, string label) {
+        JsonValue j = JsonValue.NewObject();
+        j.Put("value", JsonValue.NewStr(value));
+        j.Put("label", JsonValue.NewStr(label));
+        this.items.Add(j);
+        return this;
+    }
+
+    JsonValue ToJson() {
+        JsonValue arr = JsonValue.NewArray();
+        int i = 0;
+        while (i < this.items.Count) {
+            arr.Append(this.items[i]);
+            i = i + 1;
+        }
+        return arr;
+    }
+}

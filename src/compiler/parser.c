@@ -599,8 +599,35 @@ static zan_ast_node_t *parse_primary(zan_parser_t *p) {
     }
     case TK_NEW: {
         parser_advance(p); /* new */
+        zan_loc_t newloc = p->previous.loc;
+        zan_ast_node_t *n = NULL;
+
+        /* C#-style anonymous object literal: `new { expr1, expr2, ... }`.
+         * The members are plain expressions; each member's name is taken from
+         * a `p.field` expression (the last segment) when available, else an
+         * implicit `m0, m1, ...`. Lowered to a NEW_EXPR with type == NULL and
+         * args holding the member expressions. */
+        if (parser_check(p, TK_LBRACE)) {
+            parser_advance(p); /* { */
+            n = zan_ast_new(p->arena, AST_NEW_EXPR, newloc);
+            n->new_expr.type = NULL;
+            zan_ast_list_init(&n->new_expr.args);
+            n->new_expr.is_array = false;
+            n->new_expr.array_init = false;
+            int m = 0;
+            while (!parser_check(p, TK_RBRACE) && !parser_check(p, TK_EOF)) {
+                zan_ast_node_t *arg = parse_expression(p);
+                zan_ast_list_push(&n->new_expr.args, arg, p->arena);
+                (void)m;
+                m++;
+                if (!parser_match(p, TK_COMMA)) break;
+            }
+            parser_expect(p, TK_RBRACE);
+            return n;
+        }
+
         zan_ast_node_t *type = parse_type_ref(p);
-        zan_ast_node_t *n = zan_ast_new(p->arena, AST_NEW_EXPR, loc);
+        n = zan_ast_new(p->arena, AST_NEW_EXPR, loc);
         n->new_expr.type = type;
         zan_ast_list_init(&n->new_expr.args);
         n->new_expr.is_array = false;

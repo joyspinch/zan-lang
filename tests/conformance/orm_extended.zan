@@ -1,0 +1,176 @@
+// Conformance stress: typed ORM correctness, injection safety and
+// bulk-volume behavior over SQLite. Exercises the FreeSQL-style method
+// comparisons (Eq/Ne/Gt/Ge/Lt/Le), Between/NotBetween, IsNull/IsNotNull,
+// GroupBy/Having, Distinct, paging, empty-set In() and a 10,000-row load.
+// Every value travels as a bound parameter; injection strings must never
+// change the shape of the query.
+using System;
+using System.Data;
+using System.Data.Orm;
+using System.Data.Sqlite;
+using System.IO;
+
+[Table(Name = "t_ord")]
+class Order {
+    [Column(IsIdentity = true)]
+    int id;
+    [Column(Name = "region", StringLength = 32)]
+    string region;
+    int amount;
+    double score;
+    string note;
+    bool paid;
+    [Column(Name = "cust", StringLength = 32)]
+    string cust;
+
+    static Order Of(string region, int amount, double score, string note,
+                    bool paid, string cust) {
+        Order o = new Order();
+        o.region = region;
+        o.amount = amount;
+        o.score = score;
+        o.note = note;
+        o.paid = paid;
+        o.cust = cust;
+        return o;
+    }
+}
+
+[Table(Name = "t_tag")]
+class Tag {
+    [Column(IsIdentity = true)]
+    int id;
+    [Column(Name = "kind", StringLength = 16)]
+    string kind;
+    int val;
+
+    static Tag Of(string kind, int val) {
+        Tag t = new Tag();
+        t.kind = kind;
+        t.val = val;
+        return t;
+    }
+}
+
+class Program {
+    static void Main() {
+        string path = "orm_extended.tmp.db";
+        File.Delete(path);
+        SqliteConnection db = SqliteConnection.Open(path);
+        db.SyncStructure<Order>();
+        db.SyncStructure<Tag>();
+
+        // ---- 10,000-row load, batched (SQLite caps bound variables) ----
+        int N = 10000;
+        int batch = 200;
+        int done = 0;
+        while (done < N) {
+            List<Order> rows = new List<Order>();
+            int j = 0;
+            while (j < batch) {
+                int i = done + j;
+                int m = i % 4;
+                string region = "NE";
+                if (m == 0) { region = "EA"; }
+                else if (m == 1) { region = "WE"; }
+                else if (m == 2) { region = "CT"; }
+                string note = "note-" + Convert.ToString(i);
+                if (i % 10 == 0) { note = null; }
+                double score = (double)(i % 100) * 0.1;
+                rows.Add(Order.Of(region, (i % 500) + 1, score, note,
+                                  (i % 2) == 0, "C" + Convert.ToString(i % 100)));
+                j = j + 1;
+            }
+            db.Insert<Order>(rows).ExecuteAffrows();
+            done = done + batch;
+        }
+
+        // ---- volume sanity: full scan, aggregates, paging ----
+        Console.WriteLine("cnt: " + Convert.ToString(db.Select<Order>().Count()));
+        Console.WriteLine("sum: " + Convert.ToString(db.Select<Order>().Sum(o => o.amount)));
+        Console.WriteLine("max: " + Convert.ToString(db.Select<Order>().Max(o => o.amount)));
+        Console.WriteLine("min: " + Convert.ToString(db.Select<Order>().Min(o => o.amount)));
+        double avg = db.Select<Order>().Avg(o => o.score);
+        Console.WriteLine("avg: " + Convert.ToString(avg));
+        List<Order> pg = db.Select<Order>().OrderBy(o => o.id).Page(150, 50).ToList();
+        Console.WriteLine("pg: " + Convert.ToString(pg.Count) + " first=" + Convert.ToString(pg[0].id));
+        Console.WriteLine("pgx: " + Convert.ToString(db.Select<Order>().OrderBy(o => o.id).Page(9999, 10).ToList().Count));
+        Console.WriteLine("pg0: " + Convert.ToString(db.Select<Order>().OrderBy(o => o.id).Page(0, 10).ToList().Count));
+
+        // ---- method-style comparisons ----
+        Console.WriteLine("eq: " + Convert.ToString(db.Select<Order>().Where(o => o.region.Eq("EA")).Count()));
+        Console.WriteLine("ne: " + Convert.ToString(db.Select<Order>().Where(o => o.region.Ne("EA")).Count()));
+        Console.WriteLine("gt: " + Convert.ToString(db.Select<Order>().Where(o => o.amount.Gt(400)).Count()));
+        Console.WriteLine("ge: " + Convert.ToString(db.Select<Order>().Where(o => o.amount.Ge(500)).Count()));
+        Console.WriteLine("lt: " + Convert.ToString(db.Select<Order>().Where(o => o.amount.Lt(2)).Count()));
+        Console.WriteLine("le: " + Convert.ToString(db.Select<Order>().Where(o => o.amount.Le(1)).Count()));
+        Console.WriteLine("btw: " + Convert.ToString(db.Select<Order>().Where(o => o.amount.Between(10, 20)).Count()));
+        Console.WriteLine("nbtw: " + Convert.ToString(db.Select<Order>().Where(o => o.amount.NotBetween(10, 20)).Count()));
+
+        // ---- null tests ----
+        Console.WriteLine("null: " + Convert.ToString(db.Select<Order>().Where(o => o.note.IsNull()).Count()));
+        Console.WriteLine("nnull: " + Convert.ToString(db.Select<Order>().Where(o => o.note.IsNotNull()).Count()));
+
+        // ---- GroupBy / Having / Distinct ----
+        List<Tag> tags = new List<Tag>();
+        tags.Add(Tag.Of("a", 1));
+        tags.Add(Tag.Of("a", 1));
+        tags.Add(Tag.Of("b", 2));
+        tags.Add(Tag.Of("a", 1));
+        db.Insert<Tag>(tags).ExecuteAffrows();
+        // On the 10k-row table, HAVING on a non-aggregate column is
+        // nondeterministic (SQLite picks an arbitrary row per group), so the
+        // HAVING assertions run on the small Tag table where each group is a
+        // single row. GroupBy itself is deterministic: 4 region groups.
+        List<Order> grp = db.Select<Order>().GroupBy(o => o.region).ToList();
+        Console.WriteLine("grp: " + Convert.ToString(grp.Count));
+        List<Tag> tg = db.Select<Tag>().GroupBy(t => t.kind).ToList();
+        Console.WriteLine("tgrp: " + Convert.ToString(tg.Count));
+        // HAVING keeps a group when the bound comparison holds (each group is
+        // one row here, so the picked row is the group itself).
+        Console.WriteLine("thav: " + Convert.ToString(db.Select<Tag>().GroupBy(t => t.kind)
+            .Having(t => t.val >= 2).ToList().Count));
+        Console.WriteLine("thav0: " + Convert.ToString(db.Select<Tag>().GroupBy(t => t.kind)
+            .Having(t => t.val >= 100).ToList().Count));
+
+        // ---- Distinct ----
+        Console.WriteLine("dist: " + Convert.ToString(db.Select<Order>().Distinct().Count()));
+        Console.WriteLine("tagcnt: " + Convert.ToString(db.Select<Tag>().Count()));
+        Console.WriteLine("tagdist: " + Convert.ToString(db.Select<Tag>().Distinct().Count()));
+
+        // ---- injection safety: values are bound, never spliced ----
+        string inj1 = "x' OR 1=1 --";
+        Console.WriteLine("inj1: " + Convert.ToString(db.Select<Order>().Where(o => o.note == inj1).Count()));
+        string inj2 = "x\"; DROP TABLE t_ord; --";
+        Console.WriteLine("inj2: " + Convert.ToString(db.Select<Order>().Where(o => o.cust == inj2).Count()));
+        Console.WriteLine("alive: " + Convert.ToString(db.Select<Order>().Count()));
+        string inj3 = "%";
+        Console.WriteLine("likeall: " + Convert.ToString(db.Select<Order>().Where(o => o.region.Like(inj3)).Count()));
+        Console.WriteLine("likeEA: " + Convert.ToString(db.Select<Order>().Where(o => o.region.Like("EA%")).Count()));
+
+        // ---- empty-set In(), composed filters, bool columns ----
+        List<string> empty = new List<string>();
+        Console.WriteLine("in0: " + Convert.ToString(db.Select<Order>().Where(o => o.region.In(empty)).Count()));
+        List<string> regs = new List<string>();
+        regs.Add("EA");
+        regs.Add("NE");
+        int lo = 100;
+        int hi = 200;
+        List<Order> mix = db.Select<Order>()
+            .Where(o => o.amount.Between(lo, hi) && o.region.In(regs))
+            .OrderByDescending(o => o.amount)
+            .Page(1, 1000)
+            .ToList();
+        Console.WriteLine("mix: " + Convert.ToString(mix.Count));
+        Console.WriteLine("paid: " + Convert.ToString(db.Select<Order>().Where(o => o.paid).Count()));
+        Console.WriteLine("unpaid: " + Convert.ToString(db.Select<Order>().Where(o => !o.paid).Count()));
+
+        // ---- empty result sets: First null, aggregates zero ----
+        Order nf = db.Select<Order>().Where(o => o.amount > 100000000).First();
+        if (nf == null) { Console.WriteLine("efirst: null"); }
+        Console.WriteLine("esum: " + Convert.ToString(db.Select<Order>().Where(o => o.amount > 100000000).Sum(o => o.amount)));
+
+        db.Close();
+        File.Delete(path);
+    }
+}

@@ -1,0 +1,127 @@
+using System;
+using System.Data.Redis;
+
+namespace ZanWeb;
+
+class Cache {
+    static StrMap store = StrMap.Create();
+    static StrMap expiry = StrMap.Create();
+    static RedisClient rc = null;
+    static bool rcTried = false;
+
+    static int Digit(string ch) {
+        string d = "0123456789";
+        int i = 0;
+        while (i < 10) {
+            if (d.Substring(i, 1) == ch) { return i; }
+            i = i + 1;
+        }
+        return 0 - 1;
+    }
+
+    static int ToInt(string s) {
+        int v = 0;
+        int i = 0;
+        while (i < s.Length) {
+            int d = Cache.Digit(s.Substring(i, 1));
+            if (d < 0) { break; }
+            v = v * 10 + d;
+            i = i + 1;
+        }
+        return v;
+    }
+
+    static bool Alive(string key) {
+        if (!store.Has(key)) { return false; }
+        string e = expiry.GetOr(key, "0");
+        if (e == "0") { return true; }
+        if (WebApp.NowSeconds() >= Cache.ToInt(e)) {
+            store.Set(key, "");
+            expiry.Set(key, "0");
+            return false;
+        }
+        return true;
+    }
+
+    static bool Has(string key) { return Cache.Alive(key); }
+
+    static string Get(string key) {
+        if (!Cache.Alive(key)) { return ""; }
+        return store.Get(key);
+    }
+
+    static string GetOr(string key, string dflt) {
+        if (!Cache.Alive(key)) { return dflt; }
+        return store.Get(key);
+    }
+
+    static void Set(string key, string val) {
+        store.Set(key, val);
+        expiry.Set(key, "0");
+    }
+
+    static void SetTtl(string key, string val, int seconds) {
+        store.Set(key, val);
+        expiry.Set(key, Convert.ToString(WebApp.NowSeconds() + seconds));
+    }
+
+    static void Del(string key) {
+        store.Set(key, "");
+        expiry.Set(key, "0");
+    }
+
+    static async RedisClient Redis() {
+        if (rc != null) { return rc; }
+        if (rcTried) { return null; }
+        rcTried = true;
+        if (Cfg.Cache.driver != "redis") { return null; }
+        RedisClient c = await RedisClient.ConnectAsync(
+            Cfg.Cache.redisHost, Cfg.Cache.redisPort);
+        bool alive = false;
+        if (c != null) { alive = await c.PingAsync(); }
+        if (!alive) {
+            if (c != null) { c.Close(); }
+            Console.WriteLine("[cache] redis unreachable ("
+                + Cfg.Cache.redisHost + ":" + Convert.ToString(Cfg.Cache.redisPort)
+                + ") -- using in-memory cache");
+            return null;
+        }
+        rc = c;
+        Console.WriteLine("[cache] redis connected");
+        return rc;
+    }
+
+    static async string GetAsync(string key) {
+        RedisClient r = await Cache.Redis();
+        if (r != null) { return await r.GetAsync(key); }
+        return Cache.Get(key);
+    }
+
+    static async void SetAsync(string key, string val) {
+        RedisClient r = await Cache.Redis();
+        if (r != null) {
+            bool ok = await r.SetAsync(key, val);
+            return;
+        }
+        Cache.Set(key, val);
+    }
+
+    static async void SetTtlAsync(string key, string val, int seconds) {
+        RedisClient r = await Cache.Redis();
+        if (r != null) {
+            bool ok = await r.SetAsync(key, val);
+            int changed = await r.ExpireAsync(key, seconds);
+            return;
+        }
+        Cache.SetTtl(key, val, seconds);
+    }
+
+    static async void DelAsync(string key) {
+        RedisClient r = await Cache.Redis();
+        if (r != null) {
+            int changed = await r.DelAsync(key);
+            return;
+        }
+        Cache.Del(key);
+    }
+}
