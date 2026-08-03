@@ -1,0 +1,225 @@
+using System;
+using System.IO;
+
+namespace System.IO.Compression;
+
+/// <summary>One entry inside a tar archive.</summary>
+class TarEntry {
+    /// <summary>Path inside the archive, forward slashes, trailing "/" for directories.</summary>
+    public string name;
+    /// <summary>File content (null for directory entries).</summary>
+    public byte[] data;
+    /// <summary>True for directory entries.</summary>
+    public bool isDirectory;
+    /// <summary>POSIX mode (default 0644 for files, 0755 for dirs).</summary>
+    public int mode;
+
+    TarEntry(string name) {
+        this.name = name;
+    }
+}
+
+/// <summary>
+/// POSIX ustar tar reader/writer (no compression -- tar is a container;
+/// combine with GZip for .tar.gz). Interoperates with bsdtar, GNU tar,
+/// Windows' tar.exe, Python tarfile, and 7-Zip. Names over 100 bytes use
+/// the ustar prefix field, so long paths survive.
+/// </summary>
+class Tar {
+    /// <summary>Builds a tar archive in memory. Directory entries should be
+    /// marked isDirectory (or names ending in "/").</summary>
+    static byte[] Create(List<TarEntry> entries) {
+        // Each header is 512 bytes; data is padded to a 512-byte boundary.
+        int total = 1024;   // two zero blocks at the end
+        int i = 0;
+        while (i < entries.Count) {
+            TarEntry e = entries[i];
+            total = total + 512 + ((e.data == null ? 0 : e.data.Length) + 511) / 512 * 512;
+            i = i + 1;
+        }
+        byte[] out2 = new byte[total];
+        int pos = 0;
+        i = 0;
+        while (i < entries.Count) {
+            TarEntry e = entries[i];
+            int hdr = pos;
+            Tar.WriteHeader(out2, hdr, e);
+            pos = pos + 512;
+            if (e.data != null && e.data.Length > 0) {
+                int k = 0;
+                while (k < e.data.Length) {
+                    out2[pos + k] = e.data[k];
+                    k = k + 1;
+                }
+                pos = pos + ((e.data.Length + 511) / 512) * 512;
+            }
+            i = i + 1;
+        }
+        return out2;
+    }
+
+    /// <summary>Reads all entries from a tar archive (data included).</summary>
+    static List<TarEntry> Read(byte[] tar) {
+        List<TarEntry> entries = new List<TarEntry>();
+        int pos = 0;
+        while (pos + 512 <= tar.Length) {
+            if (Tar.IsZeroBlock(tar, pos)) { break; }
+            if (tar[pos] == 0) { pos = pos + 512; continue; }   // skip padding
+            // Verify checksum (field 148..155, space-padded octal).
+            int stored = Tar.ParseOctal(tar, pos + 148, 8);
+            int computed = Tar.HeaderSum(tar, pos);
+            if (stored != computed) { return null; }             // corrupt
+            string name = Tar.ReadStr(tar, pos, 100);
+            string prefix = Tar.ReadStr(tar, pos + 345, 155);
+            if (prefix.Length > 0) {
+                name = prefix + "/" + name;
+            }
+            int size = Tar.ParseOctal(tar, pos + 124, 12);
+            int type = tar[pos + 156] & 255;
+            TarEntry e = new TarEntry(name);
+            e.mode = Tar.ParseOctal(tar, pos + 100, 8);
+            if (type == 53) {                      // '5' = directory
+                e.isDirectory = true;
+            } else if (type == 0 || type == 48) {  // regular file ('0' or NUL)
+                e.data = new byte[size];
+                int k = 0;
+                while (k < size) {
+                    e.data[k] = tar[pos + 512 + k];
+                    k = k + 1;
+                }
+            } else {
+                e.isDirectory = false;
+                e.data = null;                     // symlink/device/other
+            }
+            entries.Add(e);
+            pos = pos + 512 + ((size + 511) / 512) * 512;
+        }
+        return entries;
+    }
+
+    static void WriteHeader(byte[] b, int off, TarEntry e) {
+        // name (100) + prefix (155) split for long paths.
+        string name = e.name;
+        string prefix = "";
+        if (name.Length > 100) {
+            int slash = name.LastIndexOf("/", 100);
+            if (slash > 0 && name.Length - slash - 1 <= 100) {
+                prefix = name.Substring(0, slash + 1);
+                name = name.Substring(slash + 1, name.Length - slash - 1);
+                if (prefix.Length > 155) { prefix = prefix.Substring(0, 155); }
+            }
+            if (name.Length > 100) { name = name.Substring(0, 100); }
+        }
+        Tar.WriteStr(b, off, name, 100);
+        Tar.WriteOctal(b, off + 100, e.mode == 0 ? (e.isDirectory ? 493 : 420) : e.mode, 8);
+        Tar.WriteOctal(b, off + 108, 0, 8);                 // uid
+        Tar.WriteOctal(b, off + 116, 0, 8);                 // gid
+        int size = (e.isDirectory || e.data == null) ? 0 : e.data.Length;
+        Tar.WriteOctal(b, off + 124, size, 12);
+        Tar.WriteOctal(b, off + 136, 0, 12);                // mtime
+        // checksum field: spaces, computed later
+        int k = 148;
+        while (k < 156) { b[off + k] = 32; k = k + 1; }
+        b[off + 156] = (byte)(e.isDirectory ? 53 : 48);     // typeflag '5'/'0'
+        k = 157;
+        while (k < 257) { b[off + k] = 0; k = k + 1; }      // linkname
+        Tar.WriteStr(b, off + 257, "ustar", 6);             // magic
+        b[off + 263] = 0;
+        Tar.WriteStr(b, off + 265, "00", 2);                // version
+        k = 267;
+        while (k < 345) { b[off + k] = 0; k = k + 1; }      // uname/gname
+        Tar.WriteOctal(b, off + 329, 0, 8);                 // devmajor
+        Tar.WriteOctal(b, off + 337, 0, 8);                 // devminor
+        Tar.WriteStr(b, off + 345, prefix, 155);            // prefix
+        k = 500;
+        while (k < 512) { b[off + k] = 0; k = k + 1; }
+        int sum = Tar.HeaderSum(b, off);
+        Tar.WriteOctal(b, off + 148, sum, 8);
+    }
+
+    static int HeaderSum(byte[] b, int off) {
+        int sum = 0;
+        int i = 0;
+        while (i < 512) {
+            // The checksum field itself counts as 8 spaces.
+            int v = (i >= 148 && i < 156) ? 32 : (b[off + i] & 255);
+            sum = sum + v;
+            i = i + 1;
+        }
+        return sum;
+    }
+
+    static bool IsZeroBlock(byte[] b, int off) {
+        int i = 0;
+        while (i < 512) {
+            if (b[off + i] != 0) { return false; }
+            i = i + 1;
+        }
+        return true;
+    }
+
+    static void WriteStr(byte[] b, int off, string s, int maxLen) {
+        int n = s.Length;
+        if (n > maxLen) { n = maxLen; }
+        int i = 0;
+        while (i < n) {
+            b[off + i] = (byte)s[i];
+            i = i + 1;
+        }
+        while (i < maxLen) {
+            b[off + i] = 0;
+            i = i + 1;
+        }
+    }
+
+    static string ReadStr(byte[] b, int off, int maxLen) {
+        int len = 0;
+        while (len < maxLen && b[off + len] != 0) { len = len + 1; }
+        if (len == 0) { return ""; }
+        nint buf = NativeMemory.Alloc(len + 1);
+        int i = 0;
+        while (i < len) {
+            new Span<byte>(buf + i, 1)[0] = b[off + i];
+            i = i + 1;
+        }
+        string s = NativeMemory.GetString(buf, 0, len);
+        NativeMemory.Free(buf);
+        return s;
+    }
+
+    static void WriteOctal(byte[] b, int off, int v, int fieldLen) {
+        // Octal digits right-aligned, last byte is the terminator (NUL).
+        char[] digits = new char[fieldLen];
+        int i = 0;
+        while (i < fieldLen) {
+            digits[i] = ' ';
+            i = i + 1;
+        }
+        int pos = fieldLen - 2;
+        int val = v;
+        while (val > 0 && pos >= 0) {
+            digits[pos] = (char)('0' + (val & 7));
+            val = val >> 3;
+            pos = pos - 1;
+        }
+        digits[fieldLen - 1] = '\0';
+        i = 0;
+        while (i < fieldLen) {
+            b[off + i] = (byte)digits[i];
+            i = i + 1;
+        }
+    }
+
+    static int ParseOctal(byte[] b, int off, int fieldLen) {
+        int v = 0;
+        int i = 0;
+        while (i < fieldLen) {
+            int c = b[off + i] & 255;
+            if (c >= 48 && c <= 55) {
+                v = (v << 3) | (c - 48);
+            }
+            i = i + 1;
+        }
+        return v;
+    }
+}

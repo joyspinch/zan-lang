@@ -1,0 +1,104 @@
+// System.IO.Compression demo: gzip a string, build a zip archive from
+// in-memory entries, read it back and extract, then do the same with tar.
+// Everything happens in memory and in the current directory's temp files,
+// which are removed at the end.
+//
+// Build & run:
+//   build/zanc examples/input/compression_demo.zan --auto-stdlib -o build/compression_demo.exe
+//   build/compression_demo.exe
+using System;
+using System.IO;
+using System.IO.Compression;
+
+namespace Demo;
+
+class Prog {
+    static byte[] MakePayload(int n) {
+        byte[] data = new byte[n];
+        int i = 0;
+        while (i < n) {
+            data[i] = (byte)(65 + (i % 26));        // A-Z repeating
+            i = i + 1;
+        }
+        return data;
+    }
+
+    static bool BytesEq(byte[] a, byte[] b) {
+        if (a == null || b == null || a.Length != b.Length) { return false; }
+        int i = 0;
+        while (i < a.Length) {
+            if (a[i] != b[i]) { return false; }
+            i = i + 1;
+        }
+        return true;
+    }
+
+    static void Main() {
+        // ---- gzip ----
+        string text = "Zan compression demo: gzip, zip and tar, all in pure Zan. ";
+        byte[] textBytes = text.ToBytes();
+        byte[] gz = GZip.Compress(textBytes, 6);
+        byte[] gzBack = GZip.Decompress(gz);
+        Console.WriteLine("gzip:  " + Convert.ToString(textBytes.Length)
+            + " -> " + Convert.ToString(gz.Length) + " bytes, roundtrip "
+            + Convert.ToString(BytesEq(gzBack, textBytes) ? "ok" : "FAILED"));
+
+        // ---- zip ----
+        List<ZipEntry> entries = new List<ZipEntry>();
+        ZipEntry readme = new ZipEntry("demo/readme.txt");
+        readme.data = "Created by Zan's own zip writer.\n".ToBytes();
+        entries.Add(readme);
+        ZipEntry payload = new ZipEntry("demo/payload.bin");
+        payload.data = MakePayload(50000);          // compresses well
+        entries.Add(payload);
+        ZipEntry dir = new ZipEntry("demo/empty/");
+        dir.isDirectory = true;
+        entries.Add(dir);
+        byte[] zipBytes = Zip.Create(entries, 6);
+        Console.WriteLine("zip:   " + Convert.ToString(zipBytes.Length)
+            + " bytes for 3 entries (payload 50000 -> "
+            + Convert.ToString(payload.compressedSize) + " deflated)");
+        List<ZipEntry> read = Zip.Read(zipBytes);
+        if (read != null) {
+            int i = 0;
+            while (i < read.Count) {
+                Console.WriteLine("  entry " + read[i].name
+                    + (read[i].isDirectory ? " (dir)" : "")
+                    + " " + Convert.ToString(read[i].uncompressedSize));
+                i = i + 1;
+            }
+            Console.WriteLine("  extract readme: "
+                + Zip.Extract(zipBytes, read[0]).ToStr());
+            Console.WriteLine("  payload roundtrip: "
+                + Convert.ToString(BytesEq(Zip.Extract(zipBytes, read[1]),
+                    payload.data) ? "ok" : "FAILED"));
+        }
+
+        // ---- tar ----
+        List<TarEntry> tarEntries = new List<TarEntry>();
+        TarEntry tr = new TarEntry("demo/readme.txt");
+        tr.data = "Created by Zan's own tar writer.\n".ToBytes();
+        tarEntries.Add(tr);
+        TarEntry td = new TarEntry("demo/dir/");
+        td.isDirectory = true;
+        tarEntries.Add(td);
+        byte[] tarBytes = Tar.Create(tarEntries);
+        List<TarEntry> tarRead = Tar.Read(tarBytes);
+        if (tarRead != null) {
+            Console.WriteLine("tar:   " + Convert.ToString(tarBytes.Length)
+                + " bytes, " + Convert.ToString(tarRead.Count) + " entries, "
+                + tarRead[0].name + " roundtrip "
+                + Convert.ToString(BytesEq(tarRead[0].data, tr.data) ? "ok" : "FAILED"));
+        }
+
+        // ---- write the artifacts next to the executable and clean up ----
+        File.WriteAllBytes("compression_demo.gz", gz);
+        File.WriteAllBytes("compression_demo.zip", zipBytes);
+        File.WriteAllBytes("compression_demo.tar", tarBytes);
+        Console.WriteLine("wrote compression_demo.gz/.zip/.tar");
+        File.Delete("compression_demo.gz");
+        File.Delete("compression_demo.zip");
+        File.Delete("compression_demo.tar");
+        Console.WriteLine("cleaned up");
+    }
+}

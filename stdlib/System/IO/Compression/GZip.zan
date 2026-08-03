@@ -1,0 +1,108 @@
+using System;
+
+namespace System.IO.Compression;
+
+/// <summary>
+/// RFC 1952 gzip container: 10-byte header, DEFLATE payload, CRC-32 and
+/// ISIZE trailer. Interoperates with .NET's GZipStream, gzip, zlib, and
+/// any other conforming reader. No external dependency.
+/// </summary>
+class GZip {
+    /// <summary>gzip-compresses `data` (level 1-9; 0 stores the raw bytes).</summary>
+    static byte[] Compress(byte[] data, int level) {
+        byte[] deflated = Deflate.Deflate(data, level);
+        byte[] out2 = new byte[10 + deflated.Length + 8];
+        out2[0] = 31;                       // 1F
+        out2[1] = 139;                      // 8B
+        out2[2] = 8;                        // CM = deflate
+        out2[3] = 0;                        // FLG = 0 (no extras)
+        out2[4] = 0;                        // MTIME
+        out2[5] = 0;
+        out2[6] = 0;
+        out2[7] = 0;
+        out2[8] = 0;                        // XFL
+        out2[9] = 3;                        // OS = Unix
+        int k = 0;
+        while (k < deflated.Length) {
+            out2[10 + k] = deflated[k];
+            k = k + 1;
+        }
+        int crc = Crc32.Compute(data, 0, data.Length, 0);
+        int trailer = 10 + deflated.Length;
+        out2[trailer] = (byte)(crc & 255);
+        out2[trailer + 1] = (byte)((crc >> 8) & 255);
+        out2[trailer + 2] = (byte)((crc >> 16) & 255);
+        out2[trailer + 3] = (byte)((crc >> 24) & 255);
+        out2[trailer + 4] = (byte)(data.Length & 255);
+        out2[trailer + 5] = (byte)((data.Length >> 8) & 255);
+        out2[trailer + 6] = (byte)((data.Length >> 16) & 255);
+        out2[trailer + 7] = (byte)((data.Length >> 24) & 255);
+        return out2;
+    }
+
+    /// <summary>
+    /// Decompresses a gzip stream. Supports multi-member streams
+    /// (concatenated gzip members) and skips FEXTRA/FNAME/FCOMMENT/FHCRC
+    /// header fields. Returns null on malformed input.
+    /// </summary>
+    static byte[] Decompress(byte[] src) {
+        int pos = 0;
+        List<byte[]> parts = new List<byte[]>();
+        int total = 0;
+        while (pos + 18 <= src.Length) {
+            if (src[pos] != 31 || src[pos + 1] != 139 || src[pos + 2] != 8) {
+                return null;                // bad magic or unsupported CM
+            }
+            int flg = src[pos + 3] & 255;
+            int p = pos + 10;
+            if ((flg & 4) != 0) {           // FEXTRA
+                if (p + 2 > src.Length) { return null; }
+                int xlen = (src[p] & 255) | ((src[p + 1] & 255) << 8);
+                p = p + 2 + xlen;
+            }
+            if ((flg & 8) != 0) {           // FNAME
+                while (p < src.Length && src[p] != 0) { p = p + 1; }
+                p = p + 1;
+            }
+            if ((flg & 16) != 0) {          // FCOMMENT
+                while (p < src.Length && src[p] != 0) { p = p + 1; }
+                p = p + 1;
+            }
+            if ((flg & 2) != 0) {           // FHCRC
+                p = p + 2;
+            }
+            if (p >= src.Length) { return null; }
+            int consumed = 0;
+            byte[] member = Deflate.InflateConsumed(src, p, src.Length - p,
+                268435456, ref consumed);
+            if (member == null || consumed <= 0) { return null; }
+            int trailer = p + consumed;
+            if (trailer + 8 > src.Length) { return null; }
+            int crcWant = (int)((uint)(src[trailer] & 255) |
+                (uint)((src[trailer + 1] & 255) << 8) |
+                (uint)((src[trailer + 2] & 255) << 16) |
+                (uint)((src[trailer + 3] & 255) << 24));
+            int crcGot = Crc32.Compute(member, 0, member.Length, 0);
+            int isize = (src[trailer + 4] & 255) | ((src[trailer + 5] & 255) << 8) |
+                ((src[trailer + 6] & 255) << 16) | ((src[trailer + 7] & 255) << 24);
+            if (crcGot != crcWant || isize != member.Length) { return null; }
+            parts.Add(member);
+            total = total + member.Length;
+            pos = trailer + 8;
+        }
+        byte[] all = new byte[total];
+        int at = 0;
+        int i = 0;
+        while (i < parts.Count) {
+            byte[] m = parts[i];
+            int k = 0;
+            while (k < m.Length) {
+                all[at + k] = m[k];
+                k = k + 1;
+            }
+            at = at + m.Length;
+            i = i + 1;
+        }
+        return all;
+    }
+}

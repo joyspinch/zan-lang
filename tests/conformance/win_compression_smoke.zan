@@ -1,0 +1,114 @@
+// System.IO.Compression conformance: Deflate/GZip/Zip/Tar round-trips with
+// content verification, plus cross-checks against known RFC vectors
+// (CRC32("123456789") == 0xCBF43926, gzip magic, zip signatures).
+using System;
+using System.IO;
+using System.IO.Compression;
+
+namespace Conf;
+
+class Prog {
+    static int bad = 0;
+
+    static void Check(bool cond) {
+        if (!cond) { bad = bad + 1; }
+    }
+
+    static bool BytesEq(byte[] a, byte[] b) {
+        if (a == null || b == null || a.Length != b.Length) { return false; }
+        int i = 0;
+        while (i < a.Length) {
+            if (a[i] != b[i]) { return false; }
+            i = i + 1;
+        }
+        return true;
+    }
+
+    static void Main() {
+        // ---- Deflate: several input shapes round-trip ----
+        List<byte[]> inputs = new List<byte[]>();
+        inputs.Add("hello hello hello hello hello world".ToBytes());
+        byte[] rep = new byte[100000];
+        int i = 0;
+        while (i < 100000) { rep[i] = (byte)(65 + (i % 26)); i = i + 1; }
+        inputs.Add(rep);
+        byte[] rnd = new byte[5000];
+        int seed = 12345;
+        i = 0;
+        while (i < 5000) {
+            seed = seed * 1103515245 + 12345;
+            rnd[i] = (byte)((seed >> 16) & 255);
+            i = i + 1;
+        }
+        inputs.Add(rnd);
+        inputs.Add("".ToBytes());
+        inputs.Add("a".ToBytes());
+        inputs.Add("abcabcabc".ToBytes());
+        i = 0;
+        while (i < inputs.Count) {
+            byte[] src = inputs[i];
+            byte[] comp = Deflate.Deflate(src, 6);
+            byte[] back = Deflate.Inflate(comp, 0, comp.Length, src.Length + 100);
+            Check(back != null && BytesEq(back, src));
+            i = i + 1;
+        }
+        // Stored (level 0) round-trips too.
+        byte[] text = "stored block test ".ToBytes();
+        byte[] st = Deflate.Deflate(text, 0);
+        Check(BytesEq(Deflate.Inflate(st, 0, st.Length, 100), text));
+
+        // ---- CRC32 known vector (0xCBF43926 as signed int) ----
+        Check(Crc32.Compute("123456789".ToBytes(), 0, 9, 0) == -873187034);
+
+        // ---- GZip ----
+        byte[] gz = GZip.Compress(text, 6);
+        Check(gz.Length >= 10 && gz[0] == 31 && gz[1] == 139 && gz[2] == 8);
+        Check(BytesEq(GZip.Decompress(gz), text));
+
+        // ---- Zip: create -> read -> extract ----
+        List<ZipEntry> es = new List<ZipEntry>();
+        ZipEntry a = new ZipEntry("hello.txt");
+        a.data = text;
+        es.Add(a);
+        ZipEntry d = new ZipEntry("subdir/");
+        d.isDirectory = true;
+        es.Add(d);
+        ZipEntry b = new ZipEntry("subdir/data.bin");
+        b.data = rnd;
+        es.Add(b);
+        byte[] zip = Zip.Create(es, 6);
+        Check(zip.Length > 0 && zip[0] == 80 && zip[1] == 75);   // "PK"
+        List<ZipEntry> back = Zip.Read(zip);
+        Check(back != null && back.Count == 3);
+        if (back != null && back.Count == 3) {
+            Check(back[0].name == "hello.txt");
+            Check(back[1].isDirectory);
+            Check(back[2].name == "subdir/data.bin");
+            Check(BytesEq(Zip.Extract(zip, back[0]), text));
+            Check(BytesEq(Zip.Extract(zip, back[2]), rnd));
+        }
+
+        // ---- Tar ----
+        List<TarEntry> tes = new List<TarEntry>();
+        TarEntry ta = new TarEntry("hello.txt");
+        ta.data = text;
+        tes.Add(ta);
+        TarEntry td = new TarEntry("subdir/");
+        td.isDirectory = true;
+        tes.Add(td);
+        TarEntry tb = new TarEntry("subdir/data.bin");
+        tb.data = rep;
+        tes.Add(tb);
+        byte[] tar = Tar.Create(tes);
+        List<TarEntry> tback = Tar.Read(tar);
+        Check(tback != null && tback.Count == 3);
+        if (tback != null && tback.Count == 3) {
+            Check(tback[0].name == "hello.txt");
+            Check(tback[1].isDirectory);
+            Check(tback[2].name == "subdir/data.bin");
+            Check(BytesEq(tback[0].data, text));
+            Check(BytesEq(tback[2].data, rep));
+        }
+        Console.WriteLine("win-compression-ok: " + Convert.ToString(bad == 0 ? 1 : 0));
+    }
+}

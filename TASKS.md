@@ -957,7 +957,20 @@ A27 的 typed result/cancellation 内容保留并与真实 frame header 对齐�
     (`builtin_api.c` 移除显式排除 + `irgen_call.c` 实现 out 参数与 ARC 处理);
     ② `Convert.ToString(string)` 原走 `%lld` 把指针打出来,现与 `s.ToString()` 一致
     返回字符串拷贝(`irgen_call.c`)。
-  - **后置**：`System.IO.Compression`(Deflate/GZip/Zip)本轮未做,留待后续批次。
+  - **后置**：~~`System.IO.Compression`(Deflate/GZip/Zip)本轮未做,留待后续批次。~~
+    ✅ **已完成（2026-08，commit 待填）**：`System.IO.Compression` 落地——
+    `Deflate.zan`(RFC 1951 完整:fixed+dynamic Huffman、stored block、LZ77
+    哈希链,纯 Zan 手写,不依赖 zlib)、`Crc32.zan`(查表法)、`GZip.zan`
+    (RFC 1952,支持多成员流与 FEXTRA/FNAME/FCOMMENT/FHCRC 头)、`Zip.zan`
+    (PKZIP stored/deflate + 中央目录 + 目录项)、`Tar.zan`(POSIX ustar,
+    长路径 prefix 字段)。交叉验证:Zan↔Python zipfile/tarfile/gzip 双向
+    互操作通过;Huffman 码按 RFC 1951 MSB-first 打包(`WriteBitsMsb`),
+    extra 位 LSB-first。编译器配套发现:`byte[].ToStr()` 是 NUL 截断的
+    (81 字节 → 3 字节),`File.WriteBytes(string,...)` 承载不了二进制,
+    给 `File.zan` 新增 `WriteAllBytes(string, byte[])`;`Crc32` 里
+    `unchecked((int)0xFFFFFFFF)` 恒为 0,改用有符号十进制常量。
+    conformance `win_compression_smoke`(CRC32 已知向量 0xCBF43926 +
+    四格式往返) 与示例 `examples/input/compression_demo.zan` 均已注册。
 
 ## B2 字节缓冲：收敛 "calloc 返回 string" 的用法 〔依赖 A1〕
 

@@ -79,6 +79,11 @@ build/background_demo.exe
 | `System.Windows.Screen` | 屏幕:`ScreenWidth/Height/Dpi`、`GetPixel`(0xAARRGGBB)、`CapturePixels`(BGRA)、`CaptureToBmp/CaptureAllToBmp`(Windows GDI) |
 | `System.ServiceProcess` | Windows 服务:`List/Get/Start/Stop/Restart/Delete/StateName`(sc.exe 封装,输出编码自动归一) |
 | `System.Management.TaskScheduler` | 计划任务:`List/Get/Exists/Create/Delete/Run/End`(schtasks.exe 封装,中英双语字段解析) |
+| `System.IO.Compression.Deflate` | RFC 1951 DEFLATE:`Deflate(data, level)` / `Inflate(src, offset, len, maxOut)`(fixed+dynamic Huffman、stored block、LZ77,纯 Zan 手写,不依赖 zlib) |
+| `System.IO.Compression.Crc32` | CRC-32(IEEE 802.3,查表法,`Compute(data, offset, len, crc)`) |
+| `System.IO.Compression.GZip` | RFC 1952 gzip:`Compress(data, level)` / `Decompress(src)`(支持多成员流与 FEXTRA/FNAME/FCOMMENT/FHCRC 头) |
+| `System.IO.Compression.Zip` | PKZIP zip:`Zip.Create(entries, level)` / `Read(bytes)` / `Extract(bytes, entry)`(stored+deflate、目录项、中央目录;`ZipEntry{name,data,isDirectory,method,crc32,compressedSize,uncompressedSize}`) |
+| `System.IO.Compression.Tar` | POSIX ustar tar:`Tar.Create(entries)` / `Read(bytes)`(长路径 prefix 字段;与 GZip 组合即 .tar.gz;`TarEntry{name,data,isDirectory,mode}`) |
 
 ### 示例(只读,安全)
 
@@ -89,6 +94,9 @@ build/background_demo.exe
   屏幕取色(截屏后立即删除文件)
 - `service_task_demo.zan` — 打印服务总数/运行数与计划任务总数/就绪数,以及
   前几个条目详情(只读,不创建/启停任何服务或任务)
+- `compression_demo.zan` — gzip 一段文本、构建 zip(文本+5 万字节重复数据+
+  目录项)并读回提取、构建 tar 并读回;把 .gz/.zip/.tar 写到程序旁边再删除
+  (全程内存,无需外部工具)
 
 ```bash
 build/zanc examples/input/sysinfo_demo.zan --auto-stdlib -o build/sysinfo_demo.exe
@@ -111,4 +119,7 @@ build/sysinfo_demo.exe
   不变量(只读,不启停服务)
 - `tests/conformance/win_taskscheduler_smoke.zan` — 计划任务枚举/查询 +
   创建→查询→删除往返(唯一任务名,测完删除)
+- `tests/conformance/win_compression_smoke.zan` — Deflate/GZip/Zip/Tar 往返
+  与内容校验 + CRC32 已知向量("123456789" → 0xCBF43926)、gzip magic、zip "PK"
+  签名(纯算法,全平台)
 - `tests/conformance/registry_roundtrip.zan` — 注册表读写往返(临时键,测完删除)

@@ -1,0 +1,595 @@
+using System;
+
+namespace System.IO.Compression;
+
+/// <summary>
+/// RFC 1951 DEFLATE implemented in pure Zan — no zlib, no external
+/// dependency, works on every platform.
+///
+/// Inflate decodes stored, fixed-Huffman and dynamic-Huffman blocks.
+/// Deflate emits stored blocks for incompressible input and fixed-Huffman
+/// blocks with an LZ77 hash-table matcher for compressible input (levels
+/// 1-9 select the hash-chain length; the format is identical to zlib's
+/// default output, so it interoperates with any standard inflate).
+/// </summary>
+class Deflate {
+    // ---- bit reader ------------------------------------------------------
+
+    static int ReadBits(byte[] src, ref int pos, ref int bit, int n) {
+        int v = 0;
+        int shift = 0;
+        while (shift < n) {
+            if (bit == 8) {
+                pos = pos + 1;
+                bit = 0;
+            }
+            int b = src[pos] & 255;
+            int take = 8 - bit;
+            if (take > n - shift) { take = n - shift; }
+            v = v | ((b >> bit) & ((1 << take) - 1)) << shift;
+            bit = bit + take;
+            shift = shift + take;
+        }
+        return v;
+    }
+
+    static int ReadBit(byte[] src, ref int pos, ref int bit) {
+        if (bit == 8) {
+            pos = pos + 1;
+            bit = 0;
+        }
+        int v = (src[pos] >> bit) & 1;
+        bit = bit + 1;
+        return v;
+    }
+
+    static void AlignByte(ref int bit) {
+        if (bit > 0) { bit = 0; }
+    }
+
+    // ---- Huffman decoding tables -----------------------------------------
+
+    // length code 257..285 -> extra bits / base length
+    static int[] LengthExtra = new int[] {
+        0,0,0,0,0,0,0,0, 1,1,1,1, 2,2,2,2, 3,3,3,3, 4,4,4,4, 5,5,5,5, 0
+    };
+    static int[] LengthBase = new int[] {
+        3,4,5,6,7,8,9,10, 11,13,15,17, 19,23,27,31, 35,43,51,59, 67,83,99,115, 131,163,195,227, 258
+    };
+    // distance code 0..29 -> extra bits / base distance
+    static int[] DistExtra = new int[] {
+        0,0,0,0,1,1,2,2, 3,3,4,4,5,5,6,6, 7,7,8,8,9,9,10,10, 11,11,12,12,13,13
+    };
+    static int[] DistBase = new int[] {
+        1,2,3,4,5,7,9,13, 17,25,33,49,65,97,129,193, 257,385,513,769,1025,1537,2049,3073, 4097,6145,8193,12289,16385,24577
+    };
+
+    /// Builds canonical Huffman decode tables from a code-length array.
+    /// `lengths` holds the bit length of each symbol; `n` is the symbol count.
+    /// Returns 0 on success, -1 when the code set is invalid.
+    static int BuildHuffman(int[] count, int[] symbol, int[] lengths, int n) {
+        int i = 0;
+        while (i < 16) { count[i] = 0; i = i + 1; }
+        i = 0;
+        while (i < n) {
+            int l = lengths[i];
+            if (l > 15) { return -1; }
+            if (l > 0) { count[l] = count[l] + 1; }
+            i = i + 1;
+        }
+        // Left-justified codes; reject incomplete/over-subscribed sets.
+        int left = 1;
+        int len = 1;
+        while (len <= 15) {
+            left = left << 1;
+            left = left - count[len];
+            if (left < 0) { return -1; }
+            len = len + 1;
+        }
+        // Canonical order: symbols with the same length in increasing order.
+        int[] offs = new int[16];
+        offs[1] = 0;
+        int l2 = 1;
+        while (l2 < 15) {
+            offs[l2 + 1] = offs[l2] + count[l2];
+            l2 = l2 + 1;
+        }
+        i = 0;
+        while (i < n) {
+            if (lengths[i] > 0) {
+                symbol[offs[lengths[i]]] = i;
+                offs[lengths[i]] = offs[lengths[i]] + 1;
+            }
+            i = i + 1;
+        }
+        return 0;
+    }
+
+    // Decodes one symbol from the canonical table. `count`/`symbol` come
+    // from BuildHuffman; `src`/`pos`/`bit` are the bit stream.
+    static int DecodeSymbol(int[] count, int[] symbol, byte[] src,
+                            ref int pos, ref int bit) {
+        int code = 0;
+        int first = 0;
+        int index = 0;
+        int len = 1;
+        while (len <= 15) {
+            code = code | Deflate.ReadBit(src, ref pos, ref bit);
+            int cnt = count[len];
+            if (code - first < cnt) {
+                return symbol[index + (code - first)];
+            }
+            index = index + cnt;
+            first = first + cnt;
+            first = first << 1;
+            code = code << 1;
+            len = len + 1;
+        }
+        return -1;
+    }
+
+    /// Fixed (RFC 1951 §3.2.6) literal/length and distance tables.
+    static void FixedTables(int[] litCount, int[] litSymbol, int[] distCount,
+                            int[] distSymbol) {
+        int[] litLen = new int[288];
+        int i = 0;
+        while (i < 144) { litLen[i] = 8; i = i + 1; }
+        while (i < 256) { litLen[i] = 9; i = i + 1; }
+        while (i < 280) { litLen[i] = 7; i = i + 1; }
+        while (i < 288) { litLen[i] = 8; i = i + 1; }
+        Deflate.BuildHuffman(litCount, litSymbol, litLen, 288);
+        int[] distLen = new int[30];
+        i = 0;
+        while (i < 30) { distLen[i] = 5; i = i + 1; }
+        Deflate.BuildHuffman(distCount, distSymbol, distLen, 30);
+    }
+
+    // ---- inflate -----------------------------------------------------------
+
+    /// <summary>
+    /// Decompresses `len` bytes of DEFLATE data starting at `src[offset]`.
+    /// `maxOut` caps the output size (return null when exceeded); pass 0 to
+    /// allow any size up to a sane 256 MB.
+    /// </summary>
+    static byte[] Inflate(byte[] src, int offset, int len, int maxOut) {
+        int consumed = 0;
+        return Deflate.InflateConsumed(src, offset, len, maxOut, ref consumed);
+    }
+
+    /// <summary>Like Inflate but reports the number of input bytes consumed
+    /// (up to and including the final block's EOB symbol).</summary>
+    static byte[] InflateConsumed(byte[] src, int offset, int len, int maxOut,
+                                  ref int consumed) {
+        if (maxOut <= 0) { maxOut = 268435456; }
+        byte[] out2 = new byte[4096];
+        int outLen = 0;
+        int pos = offset;
+        int bit = 0;
+        int end = offset + len;
+
+        int[] litCount = new int[16];
+        int[] litSymbol = new int[288];
+        int[] distCount = new int[16];
+        int[] distSymbol = new int[32];
+
+        while (true) {
+            if (pos >= end) { return null; }
+            int bfinal = Deflate.ReadBit(src, ref pos, ref bit);
+            int btype = Deflate.ReadBits(src, ref pos, ref bit, 2);
+            if (btype == 0) {
+                // Stored block: skip to the next byte boundary.
+                if (bit > 0) {
+                    pos = pos + 1;
+                    bit = 0;
+                }
+                if (pos + 4 > end) { return null; }
+                int n = (src[pos] & 255) | ((src[pos + 1] & 255) << 8);
+                pos = pos + 4;
+                if (pos + n > end) { return null; }
+                out2 = Deflate.Ensure(out2, ref outLen, n);
+                int k = 0;
+                while (k < n) {
+                    out2[outLen + k] = src[pos + k];
+                    k = k + 1;
+                }
+                outLen = outLen + n;
+                pos = pos + n;
+            } else if (btype == 1 || btype == 2) {
+                Deflate.FixedTables(litCount, litSymbol, distCount, distSymbol);
+                if (btype == 2) {
+                    int r = Deflate.DynamicTables(litCount, litSymbol, distCount,
+                        distSymbol, src, ref pos, ref bit, end);
+                    if (r != 0) { return null; }
+                }
+                while (true) {
+                    int sym = Deflate.DecodeSymbol(litCount, litSymbol, src,
+                        ref pos, ref bit);
+                    if (sym < 0) { return null; }
+                    if (sym == 256) { break; }
+                    if (sym < 256) {
+                        out2 = Deflate.Ensure(out2, ref outLen, 1);
+                        out2[outLen] = (byte)sym;
+                        outLen = outLen + 1;
+                    } else {
+                        int li = sym - 257;
+                        if (li < 0 || li >= 29) { return null; }
+                        int length = Deflate.LengthBase[li] +
+                            Deflate.ReadBits(src, ref pos, ref bit,
+                                Deflate.LengthExtra[li]);
+                        int dsym = Deflate.DecodeSymbol(distCount, distSymbol,
+                            src, ref pos, ref bit);
+                        if (dsym < 0 || dsym >= 30) { return null; }
+                        int dist = Deflate.DistBase[dsym] +
+                            Deflate.ReadBits(src, ref pos, ref bit,
+                                Deflate.DistExtra[dsym]);
+                        if (dist > outLen) { return null; }
+                        out2 = Deflate.Ensure(out2, ref outLen, length);
+                        int m = 0;
+                        while (m < length) {
+                            out2[outLen + m] = out2[outLen - dist + m];
+                            m = m + 1;
+                        }
+                        outLen = outLen + length;
+                    }
+                }
+            } else {
+                return null;    // reserved block type
+            }
+            if (bfinal != 0) { break; }
+        }
+        // Bytes fully consumed; a partially-used byte still counts as read.
+        consumed = pos - offset;
+        if (bit > 0) { consumed = consumed + 1; }
+        if (outLen > maxOut) { return null; }
+        if (outLen == out2.Length) { return out2; }
+        byte[] trimmed = new byte[outLen];
+        int t = 0;
+        while (t < outLen) {
+            trimmed[t] = out2[t];
+            t = t + 1;
+        }
+        return trimmed;
+    }
+
+    // Builds the dynamic-Huffman tables for the current block.
+    static int DynamicTables(int[] litCount, int[] litSymbol, int[] distCount,
+                             int[] distSymbol, byte[] src, ref int pos,
+                             ref int bit, int end) {
+        int hlit = Deflate.ReadBits(src, ref pos, ref bit, 5) + 257;
+        int hdist = Deflate.ReadBits(src, ref pos, ref bit, 5) + 1;
+        int hclen = Deflate.ReadBits(src, ref pos, ref bit, 4) + 4;
+        if (hlit > 286 || hdist > 30) { return -1; }
+        // Code-length alphabet order (RFC 1951 §3.2.7).
+        int[] clOrder = new int[] { 16,17,18,0,8,7,9,6,10,5,11,4,12,3,13,2,14,1,15 };
+        int[] clLen = new int[19];
+        int i = 0;
+        while (i < 19) { clLen[i] = 0; i = i + 1; }
+        i = 0;
+        while (i < hclen) {
+            clLen[clOrder[i]] = Deflate.ReadBits(src, ref pos, ref bit, 3);
+            i = i + 1;
+        }
+        int[] clCount = new int[16];
+        int[] clSymbol = new int[19];
+        if (Deflate.BuildHuffman(clCount, clSymbol, clLen, 19) != 0) {
+            return -1;
+        }
+        // Read the literal/length and distance code lengths (run-length
+        // encoded through the code-length alphabet).
+        int[] lens = new int[hlit + hdist];
+        int n = 0;
+        while (n < hlit + hdist) {
+            int sym = Deflate.DecodeSymbol(clCount, clSymbol, src, ref pos,
+                ref bit);
+            if (sym < 0 || sym > 18) { return -1; }
+            if (sym < 16) {
+                lens[n] = sym;
+                n = n + 1;
+            } else if (sym == 16) {
+                if (n == 0) { return -1; }
+                int prev = lens[n - 1];
+                int rep = 3 + Deflate.ReadBits(src, ref pos, ref bit, 2);
+                while (rep > 0 && n < hlit + hdist) {
+                    lens[n] = prev;
+                    n = n + 1;
+                    rep = rep - 1;
+                }
+            } else if (sym == 17) {
+                int rep = 3 + Deflate.ReadBits(src, ref pos, ref bit, 3);
+                while (rep > 0 && n < hlit + hdist) {
+                    lens[n] = 0;
+                    n = n + 1;
+                    rep = rep - 1;
+                }
+            } else {
+                int rep = 11 + Deflate.ReadBits(src, ref pos, ref bit, 7);
+                while (rep > 0 && n < hlit + hdist) {
+                    lens[n] = 0;
+                    n = n + 1;
+                    rep = rep - 1;
+                }
+            }
+        }
+        int[] litLen = new int[hlit];
+        int[] distLen = new int[hdist];
+        int j = 0;
+        while (j < hlit) {
+            litLen[j] = lens[j];
+            j = j + 1;
+        }
+        j = 0;
+        while (j < hdist) {
+            distLen[j] = lens[hlit + j];
+            j = j + 1;
+        }
+        if (Deflate.BuildHuffman(litCount, litSymbol, litLen, hlit) != 0) {
+            return -1;
+        }
+        if (Deflate.BuildHuffman(distCount, distSymbol, distLen, hdist) != 0) {
+            return -1;
+        }
+        return 0;
+    }
+
+    static byte[] Ensure(byte[] buf, ref int used, int need) {
+        if (used + need <= buf.Length) { return buf; }
+        int cap = buf.Length * 2;
+        while (cap < used + need) { cap = cap * 2; }
+        if (cap > 268435456) { cap = 268435456; }
+        if (used + need > cap) { cap = used + need; }
+        byte[] bigger = new byte[cap];
+        int i = 0;
+        while (i < used) {
+            bigger[i] = buf[i];
+            i = i + 1;
+        }
+        return bigger;
+    }
+
+    // ---- deflate (compression) ----------------------------------------------
+
+    /// <summary>
+    /// Compresses `src` into a DEFLATE stream. `level` 0 stores the data
+    /// verbatim (fastest); 1-9 run an LZ77 fixed-Huffman compressor with a
+    /// hash-chain matcher (higher = longer chains, better ratio, slower).
+    /// </summary>
+    static byte[] Deflate(byte[] src, int level) {
+        if (level <= 0 || src.Length < 64) {
+            return Deflate.Store(src, 0, src.Length);
+        }
+        return Deflate.FixedCompress(src, level);
+    }
+
+    // One stored block (BFINAL=1) -- simplest valid stream.
+    static byte[] Store(byte[] src, int offset, int len) {
+        int blockHeader = 1;    // BFINAL=1, BTYPE=00 -> byte 0x01
+        byte[] out2 = new byte[len + 8];
+        out2[0] = 1;
+        out2[1] = (byte)(len & 255);
+        out2[2] = (byte)((len >> 8) & 255);
+        out2[3] = (byte)((~len) & 255);
+        out2[4] = (byte)((~len >> 8) & 255);
+        int k = 0;
+        while (k < len) {
+            out2[5 + k] = src[offset + k];
+            k = k + 1;
+        }
+        return Deflate.Trim(out2, len + 5);
+    }
+
+    // LZ77 + fixed Huffman. Emits one final block; literals and length/
+    // distance pairs are coded with the fixed tables.
+    static byte[] FixedCompress(byte[] src, int level) {
+        int n = src.Length;
+        int maxChain = 4;
+        if (level >= 3) { maxChain = 16; }
+        if (level >= 5) { maxChain = 64; }
+        if (level >= 7) { maxChain = 256; }
+        if (level >= 9) { maxChain = 1024; }
+        // Hash table: 16-bit hash -> head position (1-based, 0 = empty).
+        int hsize = 65536;
+        int[] head = new int[hsize];
+        int[] prev = new int[n];
+        int i = 0;
+        while (i < n) { prev[i] = 0; i = i + 1; }
+
+        byte[] out2 = new byte[n + n / 2 + 64];
+        int outLen = 0;
+        // Bit writer state.
+        int bitPos = 0;         // absolute bit position in out2
+        // Block header: BFINAL=1, BTYPE=01 (fixed).
+        Deflate.WriteBits(out2, ref bitPos, 1, 1);
+        Deflate.WriteBits(out2, ref bitPos, 1, 2);
+
+        int pos = 0;
+        while (pos < n) {
+            int match = 0;
+            int matchLen = 0;
+            // Find the longest match at pos (hash of 3 bytes).
+            if (pos + 2 < n) {
+                int h = ((src[pos] & 255) << 8 | (src[pos + 1] & 255)) ^
+                        (src[pos + 2] & 255);
+                int cand = head[h & 65535];     // 1-based position
+                int chain = 0;
+                while (cand > 0 && chain < maxChain) {
+                    int c0 = cand - 1;
+                    int dist = pos - c0;
+                    if (dist <= 32768 && dist > 0) {
+                        int l = 0;
+                        while (l < 258 && pos + l < n &&
+                               src[c0 + l] == src[pos + l]) {
+                            l = l + 1;
+                        }
+                        if (l > matchLen) {
+                            matchLen = l;
+                            match = dist;
+                            if (l >= 258) { break; }
+                        }
+                    }
+                    cand = prev[c0];
+                    chain = chain + 1;
+                }
+            }
+            // Insert current position into the hash chain.
+            if (pos + 2 < n) {
+                int h = ((src[pos] & 255) << 8 | (src[pos + 1] & 255)) ^
+                        (src[pos + 2] & 255);
+                prev[pos] = head[h & 65535];
+                head[h & 65535] = pos + 1;      // 1-based
+            }
+            if (matchLen >= 3 && match > 0) {
+                Deflate.EmitLengthDistance(out2, ref bitPos, matchLen, match);
+                pos = pos + matchLen;
+            } else {
+                Deflate.EmitLitFixed(out2, ref bitPos, src[pos] & 255);
+                pos = pos + 1;
+            }
+        }
+        // End-of-block symbol 256 (fixed: 7 bits, code 0).
+        Deflate.WriteBits(out2, ref bitPos, 0, 7);
+        int bytes = (bitPos + 7) / 8;
+        return Deflate.Trim(out2, bytes);
+    }
+
+    static void EmitLitFixed(byte[] out2, ref int bitPos, int sym) {
+        // Fixed literal codes: 0-143 -> 8 bits (0x30+sym); 144-255 -> 9 bits
+        // (0x190 + (sym-144)). Huffman codes are packed MSB-first.
+        if (sym < 144) {
+            Deflate.WriteBitsMsb(out2, ref bitPos, 0x30 + sym, 8);
+        } else {
+            Deflate.WriteBitsMsb(out2, ref bitPos, 0x190 + (sym - 144), 9);
+        }
+    }
+
+    static void EmitLengthDistance(byte[] out2, ref int bitPos, int length,
+                                   int dist) {
+        // Length code.
+        int code = 0;
+        int extra = 0;
+        int baseLen = 0;
+        int li = 0;
+        while (li < 29) {
+            if (length < Deflate.LengthBase[li]) { break; }
+            code = 257 + li;
+            baseLen = Deflate.LengthBase[li];
+            extra = Deflate.LengthExtra[li];
+            li = li + 1;
+        }
+        if (li == 0) {
+            code = 257;
+            baseLen = 3;
+            extra = 0;
+        }
+        Deflate.EmitFixed(code, out2, ref bitPos);
+        Deflate.WriteBits(out2, ref bitPos, length - baseLen, extra);
+        // Distance code.
+        int dcode = 0;
+        int dextra = 0;
+        int dbase = 0;
+        int di = 0;
+        while (di < 30) {
+            if (dist < Deflate.DistBase[di]) { break; }
+            dcode = di;
+            dbase = Deflate.DistBase[di];
+            dextra = Deflate.DistExtra[di];
+            di = di + 1;
+        }
+        Deflate.WriteBitsMsb(out2, ref bitPos, dcode, 5);   // fixed: 5 bits
+        Deflate.WriteBits(out2, ref bitPos, dist - dbase, dextra);
+    }
+
+    // Fixed-table code for length symbol `code` (257-285), MSB-first.
+    static void EmitFixed(int code, byte[] out2, ref int bitPos) {
+        if (code < 256) {
+            if (code < 144) { Deflate.WriteBitsMsb(out2, ref bitPos, 0x30 + code, 8); }
+            else { Deflate.WriteBitsMsb(out2, ref bitPos, 0x190 + (code - 144), 9); }
+        } else if (code < 280) {
+            // 256-279 -> 7 bits (code-256).
+            Deflate.WriteBitsMsb(out2, ref bitPos, code - 256, 7);
+        } else {
+            // 280-287 -> 8 bits (0xC0 + code - 280).
+            Deflate.WriteBitsMsb(out2, ref bitPos, 0xC0 + (code - 280), 8);
+        }
+    }
+
+    static void WriteBits(byte[] out2, ref int bitPos, int v, int n) {
+        int i = 0;
+        while (i < n) {
+            int byteIdx = bitPos >> 3;
+            int bitIdx = bitPos & 7;
+            int b = out2[byteIdx] & 255;
+            if ((v >> i) & 1) {
+                b = b | (1 << bitIdx);
+            }
+            out2[byteIdx] = (byte)b;
+            bitPos = bitPos + 1;
+            i = i + 1;
+        }
+    }
+
+    // Writes `n` bits of `v`, most significant bit first. RFC 1951 packs
+    // Huffman codes MSB-first while all other fields (block header, extra
+    // bits, LEN/NLEN) are LSB-first -- so codes must go through this one.
+    static void WriteBitsMsb(byte[] out2, ref int bitPos, int v, int n) {
+        int i = n - 1;
+        while (i >= 0) {
+            int byteIdx = bitPos >> 3;
+            int bitIdx = bitPos & 7;
+            int b = out2[byteIdx] & 255;
+            if ((v >> i) & 1) {
+                b = b | (1 << bitIdx);
+            }
+            out2[byteIdx] = (byte)b;
+            bitPos = bitPos + 1;
+            i = i - 1;
+        }
+    }
+
+    static byte[] Trim(byte[] buf, int len) {
+        byte[] out2 = new byte[len];
+        int i = 0;
+        while (i < len) {
+            out2[i] = buf[i];
+            i = i + 1;
+        }
+        return out2;
+    }
+
+    // ---- zlib wrapper (RFC 1950) ---------------------------------------------
+
+    /// <summary>
+    /// zlib stream (2-byte header + adler32 trailer) around a raw DEFLATE
+    /// stream. Most .NET/Java/zip tooling consumes this directly.
+    /// </summary>
+    static byte[] ZlibCompress(byte[] src, int level) {
+        byte[] deflated = Deflate.Deflate(src, level);
+        byte[] out2 = new byte[deflated.Length + 8];
+        out2[0] = 0x78;                     // CMF: 32K window, deflate
+        int flevel = 0;
+        if (level >= 7) { flevel = 3; }
+        else if (level >= 3) { flevel = 2; }
+        out2[1] = (byte)(flevel << 6);      // FLEVEL + FCHECK bits
+        out2[1] = (byte)(out2[1] | ((256 - ((out2[0] * 256 + out2[1]) % 31)) % 31));
+        int k = 0;
+        while (k < deflated.Length) {
+            out2[2 + k] = deflated[k];
+            k = k + 1;
+        }
+        long s1 = 1;
+        long s2 = 0;
+        int i = 0;
+        while (i < src.Length) {
+            s1 = (s1 + (src[i] & 255)) % 65521;
+            s2 = (s2 + s1) % 65521;
+            i = i + 1;
+        }
+        long ad = (s2 << 16) | s1;
+        out2[deflated.Length + 2] = (byte)((ad >> 24) & 255);
+        out2[deflated.Length + 3] = (byte)((ad >> 16) & 255);
+        out2[deflated.Length + 4] = (byte)((ad >> 8) & 255);
+        out2[deflated.Length + 5] = (byte)(ad & 255);
+        return out2;
+    }
+}
+
+

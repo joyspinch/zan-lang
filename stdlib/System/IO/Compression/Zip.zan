@@ -1,0 +1,309 @@
+using System;
+using System.IO;
+
+namespace System.IO.Compression;
+
+/// <summary>One entry inside a zip archive.</summary>
+class ZipEntry {
+    /// <summary>Path inside the archive, forward slashes, trailing "/" for directories.</summary>
+    public string name;
+    /// <summary>File content (null for directory entries).</summary>
+    public byte[] data;
+    /// <summary>True for directory entries.</summary>
+    public bool isDirectory;
+    // Filled in by Zip.Read / Zip.Extract:
+    public int method;
+    public int crc32;
+    public int compressedSize;
+    public int uncompressedSize;
+
+    ZipEntry(string name) {
+        this.name = name;
+    }
+}
+
+/// <summary>
+/// ZIP archive reader/writer (PKZIP, no encryption, stored + deflate
+/// entries). Interoperates with every standard unzip (Windows Explorer,
+/// .NET ZipArchive, Python zipfile, 7-Zip, Info-ZIP...). No dependency on
+/// zlib or any native library.
+/// </summary>
+class Zip {
+    // Local file header signature PK\x03\x04
+    static int SigLocal = 0x04034B50;
+    // Central directory file header signature PK\x01\x02
+    static int SigCentral = 0x02014B50;
+    // End of central directory signature PK\x05\x06
+    static int SigEnd = 0x06054B50;
+    static int MethodStored = 0;
+    static int MethodDeflate = 8;
+
+    /// <summary>
+    /// Builds a zip archive in memory from `entries`. Directory entries are
+    /// entries whose name ends with "/" or whose isDirectory is true.
+    /// Compression level 1-9 (0 = store). The returned bytes are a complete
+    /// archive: local headers + data, central directory, EOCD.
+    /// </summary>
+    static byte[] Create(List<ZipEntry> entries, int level) {
+        // Pass 1: compress everything so sizes are known.
+        int i = 0;
+        while (i < entries.Count) {
+            ZipEntry e = entries[i];
+            if (!e.isDirectory && e.data != null) {
+                e.crc32 = Crc32.Compute(e.data, 0, e.data.Length, 0);
+                e.uncompressedSize = e.data.Length;
+                if (level > 0 && e.data.Length >= 64) {
+                    e.method = Zip.MethodDeflate;
+                    e.compressedSize = Deflate.Deflate(e.data, level).Length;
+                } else {
+                    e.method = Zip.MethodStored;
+                    e.compressedSize = e.data.Length;
+                }
+            } else {
+                e.method = Zip.MethodStored;
+                e.compressedSize = 0;
+                e.uncompressedSize = 0;
+            }
+            i = i + 1;
+        }
+        // Pass 2: compute total size.
+        int total = 0;
+        i = 0;
+        while (i < entries.Count) {
+            ZipEntry e = entries[i];
+            total = total + 30 + e.name.Length + e.compressedSize;
+            i = i + 1;
+        }
+        int cdStart = total;
+        i = 0;
+        while (i < entries.Count) {
+            ZipEntry e = entries[i];
+            total = total + 46 + e.name.Length;
+            i = i + 1;
+        }
+        total = total + 22;
+        byte[] out2 = new byte[total];
+        int pos = 0;
+        int cdSize = 0;
+        int[] cdOffsets = new int[entries.Count];
+        i = 0;
+        while (i < entries.Count) {
+            ZipEntry e = entries[i];
+            cdOffsets[i] = pos;
+            int nameLen = e.name.Length;
+            Zip.WriteU32(out2, ref pos, Zip.SigLocal);
+            Zip.WriteU16(out2, ref pos, 20);            // version needed
+            Zip.WriteU16(out2, ref pos, 0);             // flags
+            Zip.WriteU16(out2, ref pos, e.method);
+            Zip.WriteU16(out2, ref pos, 0);             // mod time
+            Zip.WriteU16(out2, ref pos, 0);             // mod date
+            Zip.WriteU32(out2, ref pos, e.crc32);
+            Zip.WriteU32(out2, ref pos, e.compressedSize);
+            Zip.WriteU32(out2, ref pos, e.uncompressedSize);
+            Zip.WriteU16(out2, ref pos, nameLen);
+            Zip.WriteU16(out2, ref pos, 0);             // extra len
+            int k = 0;
+            while (k < nameLen) {
+                out2[pos + k] = (byte)e.name[k];
+                k = k + 1;
+            }
+            pos = pos + nameLen;
+            if (e.compressedSize > 0 && e.data != null) {
+                if (e.method == Zip.MethodDeflate) {
+                    byte[] comp = Deflate.Deflate(e.data, level);
+                    k = 0;
+                    while (k < comp.Length) {
+                        out2[pos + k] = comp[k];
+                        k = k + 1;
+                    }
+                } else {
+                    k = 0;
+                    while (k < e.data.Length) {
+                        out2[pos + k] = e.data[k];
+                        k = k + 1;
+                    }
+                }
+                pos = pos + e.compressedSize;
+            }
+            i = i + 1;
+        }
+        // Central directory.
+        int cdPos = pos;
+        i = 0;
+        while (i < entries.Count) {
+            ZipEntry e = entries[i];
+            int nameLen = e.name.Length;
+            Zip.WriteU32(out2, ref pos, Zip.SigCentral);
+            Zip.WriteU16(out2, ref pos, 20);            // version made by
+            Zip.WriteU16(out2, ref pos, 20);            // version needed
+            Zip.WriteU16(out2, ref pos, 0);             // flags
+            Zip.WriteU16(out2, ref pos, e.method);
+            Zip.WriteU16(out2, ref pos, 0);
+            Zip.WriteU16(out2, ref pos, 0);
+            Zip.WriteU32(out2, ref pos, e.crc32);
+            Zip.WriteU32(out2, ref pos, e.compressedSize);
+            Zip.WriteU32(out2, ref pos, e.uncompressedSize);
+            Zip.WriteU16(out2, ref pos, nameLen);
+            Zip.WriteU16(out2, ref pos, 0);             // extra
+            Zip.WriteU16(out2, ref pos, 0);             // comment
+            Zip.WriteU16(out2, ref pos, 0);             // disk start
+            Zip.WriteU16(out2, ref pos, 0);             // internal attrs
+            Zip.WriteU32(out2, ref pos, 0);             // external attrs
+            Zip.WriteU32(out2, ref pos, cdOffsets[i]);
+            int k = 0;
+            while (k < nameLen) {
+                out2[pos + k] = (byte)e.name[k];
+                k = k + 1;
+            }
+            pos = pos + nameLen;
+            cdSize = cdSize + 46 + nameLen;
+            i = i + 1;
+        }
+        // EOCD.
+        Zip.WriteU32(out2, ref pos, Zip.SigEnd);
+        Zip.WriteU16(out2, ref pos, 0);                 // disk number
+        Zip.WriteU16(out2, ref pos, 0);                 // disk with CD
+        Zip.WriteU16(out2, ref pos, entries.Count);
+        Zip.WriteU16(out2, ref pos, entries.Count);
+        Zip.WriteU32(out2, ref pos, cdSize);
+        Zip.WriteU32(out2, ref pos, cdPos);
+        Zip.WriteU16(out2, ref pos, 0);                 // comment len
+        return out2;
+    }
+
+    /// <summary>Reads the central directory; returns the entry list (data not
+    /// loaded).</summary>
+    static List<ZipEntry> Read(byte[] zip) {
+        // Find EOCD by scanning from the end for PK\x05\x06.
+        int eocd = -1;
+        int scan = zip.Length - 22;
+        if (scan < 0) { scan = 0; }
+        while (scan <= zip.Length - 22) {
+            if (Zip.ReadU32(zip, scan) == Zip.SigEnd) { eocd = scan; break; }
+            scan = scan + 1;
+        }
+        if (eocd < 0) { return null; }
+        int entryCount = Zip.ReadU16(zip, eocd + 10);
+        int cdSize = (int)Zip.ReadU32(zip, eocd + 12);
+        int cdPos = (int)Zip.ReadU32(zip, eocd + 16);
+        if (cdPos + cdSize > zip.Length) { return null; }
+        List<ZipEntry> entries = new List<ZipEntry>();
+        int p = cdPos;
+        int i = 0;
+        while (i < entryCount) {
+            if (Zip.ReadU32(zip, p) != Zip.SigCentral) { return null; }
+            int method = Zip.ReadU16(zip, p + 10);
+            int crc = (int)Zip.ReadU32(zip, p + 16);
+            int csize = (int)Zip.ReadU32(zip, p + 20);
+            int usize = (int)Zip.ReadU32(zip, p + 24);
+            int nameLen = Zip.ReadU16(zip, p + 28);
+            int extraLen = Zip.ReadU16(zip, p + 30);
+            int commentLen = Zip.ReadU16(zip, p + 32);
+            int lho = (int)Zip.ReadU32(zip, p + 42);
+            string name = Zip.ReadName(zip, p + 46, nameLen);
+            ZipEntry e = new ZipEntry(name);
+            e.method = method;
+            e.crc32 = crc;
+            e.compressedSize = csize;
+            e.uncompressedSize = usize;
+            e.isDirectory = Zip.EndsWithSlash(name);
+            entries.Add(e);
+            p = p + 46 + nameLen + extraLen + commentLen;
+            i = i + 1;
+        }
+        return entries;
+    }
+
+    /// <summary>Extracts one entry's content (decompressing when needed).
+    /// Returns null if the entry cannot be located or is corrupt.</summary>
+    static byte[] Extract(byte[] zip, ZipEntry e) {
+        if (e.isDirectory) { return null; }
+        // Locate the local header by scanning for PK\x03\x04 near e's data:
+        // we know the central directory offset; walk back is unreliable, so
+        // scan forward from the start for the signature with matching name.
+        int lho = Zip.FindLocal(zip, e.name);
+        if (lho < 0) { return null; }
+        int method = Zip.ReadU16(zip, lho + 8);
+        int csize = (int)Zip.ReadU32(zip, lho + 18);
+        int usize = (int)Zip.ReadU32(zip, lho + 22);
+        int nameLen = Zip.ReadU16(zip, lho + 26);
+        int extraLen = Zip.ReadU16(zip, lho + 28);
+        int dataPos = lho + 30 + nameLen + extraLen;
+        if (dataPos + csize > zip.Length) { return null; }
+        byte[] raw = new byte[csize];
+        int k = 0;
+        while (k < csize) {
+            raw[k] = zip[dataPos + k];
+            k = k + 1;
+        }
+        byte[] content = null;
+        if (method == Zip.MethodDeflate) {
+            content = Deflate.Inflate(raw, 0, raw.Length, usize + 1);
+        } else {
+            content = raw;
+        }
+        if (content == null) { return null; }
+        int got = Crc32.Compute(content, 0, content.Length, 0);
+        if (got != e.crc32 || content.Length != usize) { return null; }
+        return content;
+    }
+
+    static int FindLocal(byte[] zip, string name) {
+        int i = 0;
+        while (i + 30 <= zip.Length) {
+            if (Zip.ReadU32(zip, i) == Zip.SigLocal) {
+                int nameLen = Zip.ReadU16(zip, i + 26);
+                if (nameLen == name.Length) {
+                    bool same = true;
+                    int k = 0;
+                    while (k < nameLen) {
+                        if ((byte)name[k] != zip[i + 30 + k]) { same = false; break; }
+                        k = k + 1;
+                    }
+                    if (same) { return i; }
+                }
+            }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    static bool EndsWithSlash(string s) {
+        return s.Length > 0 && s[s.Length - 1] == '/';
+    }
+
+    static string ReadName(byte[] zip, int off, int len) {
+        nint buf = NativeMemory.Alloc(len + 1);
+        int i = 0;
+        while (i < len) {
+            new Span<byte>(buf + i, 1)[0] = zip[off + i];
+            i = i + 1;
+        }
+        string s = NativeMemory.GetString(buf, 0, len);
+        NativeMemory.Free(buf);
+        return s;
+    }
+
+    static int ReadU16(byte[] b, int off) {
+        return (b[off] & 255) | ((b[off + 1] & 255) << 8);
+    }
+
+    static long ReadU32(byte[] b, int off) {
+        return (long)(b[off] & 255) | ((long)(b[off + 1] & 255) << 8) |
+            ((long)(b[off + 2] & 255) << 16) | ((long)(b[off + 3] & 255) << 24);
+    }
+
+    static void WriteU16(byte[] b, ref int off, int v) {
+        b[off] = (byte)(v & 255);
+        b[off + 1] = (byte)((v >> 8) & 255);
+        off = off + 2;
+    }
+
+    static void WriteU32(byte[] b, ref int off, long v) {
+        b[off] = (byte)(v & 255);
+        b[off + 1] = (byte)((v >> 8) & 255);
+        b[off + 2] = (byte)((v >> 16) & 255);
+        b[off + 3] = (byte)((v >> 24) & 255);
+        off = off + 4;
+    }
+}

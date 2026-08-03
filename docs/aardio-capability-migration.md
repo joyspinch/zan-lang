@@ -82,6 +82,7 @@
 | 18+19 | `System.Windows.TrayIcon` / `Screen` | `stdlib/System/Windows/{TrayIcon,Screen}.zan` | `win_tray_screen_smoke` |
 | 20 | `System.ServiceProcess` | `stdlib/System/ServiceProcess/ServiceProcess.zan` | `win_serviceprocess_smoke` |
 | 21 | `System.Management.TaskScheduler` | `stdlib/System/Management/TaskScheduler.zan` | `win_taskscheduler_smoke` |
+| 23 | `System.IO.Compression` | `stdlib/System/IO/Compression/{Deflate,Crc32,GZip,Zip,Tar}.zan` | `win_compression_smoke` |
 | 33 | `System.Guid` | `stdlib/System/Guid.zan` | `guid_*` |
 | 36 | `Stopwatch` | `stdlib/System/Diagnostics/Stopwatch.zan` | `stopwatch_*` |
 | 37 | `System.Globalization.Lunar` | `stdlib/System/Globalization/Lunar.zan` | `lunar_*` |
@@ -97,6 +98,11 @@
 - **TrayIcon 自包含**：自带隐藏宿主窗口 + 独立线程消息循环，不依赖 Gui 框架；
   任务栏重建（`TaskbarCreated`）后自动重挂图标。
 - **Screen 取色走 BitBlt**：GDI `GetPixel` 在 DWM 合成桌面不可靠，1x1 BitBlt 一致。
+- **Compression 纯手写**：`Deflate` 是 RFC 1951 完整实现（fixed + dynamic Huffman、
+  stored block、LZ77 哈希链），不依赖 zlib；`Crc32` 查表法；`GZip`(RFC 1952)、
+  `Zip`(PKZIP stored/deflate + 中央目录)、`Tar`(POSIX ustar 长路径 prefix) 均与
+  Python zipfile/tarfile/gzip、.NET、Info-ZIP 双向互操作验证过。Huffman 码按
+  RFC 1951 要求 MSB-first 打包（`WriteBitsMsb`），extra 位 LSB-first。
 - **非 Windows 分支**：所有模块 `#else` 抛 `PlatformNotSupportedException`。
 
 ### P0 — 用户明确要的：输入模拟 + 系统信息
