@@ -1,0 +1,276 @@
+using System;
+using System.IO;
+
+namespace System.IO;
+
+/// <summary>One INI section: a name plus ordered key/value entries.</summary>
+class IniSection {
+    public string name;
+    public List<IniEntry> entries = new List<IniEntry>();
+}
+
+/// <summary>One INI key/value pair.</summary>
+class IniEntry {
+    public string key;
+    public string text;
+}
+
+/// <summary>
+/// INI file reader/writer. Sections are <c>[Name]</c>, entries are
+/// <c>key=value</c>, <c>;</c> and <c>#</c> start comments, blank lines are
+/// skipped. Keys and values are trimmed; a value may contain <c>=</c>.
+/// Can parse from text (in-memory) or a file and save back to either.
+///
+///   IniFile ini = IniFile.Load("app.ini");
+///   int port = ini.GetInt("server", "port", 8080);
+///   ini.SetString("server", "name", "dev");
+///   ini.Save("app.ini");
+/// </summary>
+class IniFile {
+    List<IniSection> sections = new List<IniSection>();
+
+    /// <summary>Parses the given text into an in-memory INI.</summary>
+    static IniFile Parse(string text) {
+        IniFile ini = new IniFile();
+        IniSection cur = null;
+        List<string> lines = IniFile.SplitLines(text);
+        int i = 0;
+        while (i < lines.Count) {
+            string line = lines[i].Trim();
+            if (line.Length > 0) {
+                string head = line.Substring(0, 1);
+                if (head == ";" || head == "#") {
+                    // comment
+                } else if (head == "[") {
+                    int close = IniFile.IndexOf(line, "]", 1);
+                    if (close > 1) {
+                        cur = new IniSection();
+                        cur.name = line.Substring(1, close - 1).Trim();
+                        ini.sections.Add(cur);
+                    }
+                } else {
+                    int eq = IniFile.IndexOf(line, "=", 0);
+                    if (eq > 0) {
+                        IniEntry e = new IniEntry();
+                        e.key = line.Substring(0, eq).Trim();
+                        e.text = line.Substring(eq + 1, line.Length - eq - 1).Trim();
+                        if (cur == null) {
+                            cur = new IniSection();
+                            cur.name = "";
+                            ini.sections.Add(cur);
+                        }
+                        cur.entries.Add(e);
+                    }
+                }
+            }
+            i = i + 1;
+        }
+        return ini;
+    }
+
+    /// <summary>Reads and parses the file at `path`. Returns an empty INI
+    /// when the file does not exist.</summary>
+    static IniFile Load(string path) {
+        if (!File.Exists(path)) { return new IniFile(); }
+        return IniFile.Parse(File.ReadAllText(path));
+    }
+
+    /// <summary>An empty in-memory INI.</summary>
+    static IniFile Create() {
+        return new IniFile();
+    }
+
+    /// <summary>Looks up a key in a section. Returns `fallback` when the
+    /// section or key is missing.</summary>
+    string GetString(string section, string key, string fallback) {
+        IniEntry e = IniFile.Find(this, section, key);
+        if (e == null) { return fallback; }
+        return e.text;
+    }
+
+    /// <summary>Numeric lookup; `fallback` on missing or non-numeric value.</summary>
+    int GetInt(string section, string key, int fallback) {
+        IniEntry e = IniFile.Find(this, section, key);
+        if (e == null) { return fallback; }
+        int v = IniFile.ParseInt(e.text);
+        if (v < 0) { return fallback; }
+        return v;
+    }
+
+    /// <summary>Sets a string value, creating the section/key as needed.
+    /// Sections are appended at the end; a new key is appended within its
+    /// section. Existing keys keep their position.</summary>
+    void SetString(string section, string key, string val) {
+        IniSection sec = IniFile.Section(this, section);
+        int i = 0;
+        while (i < sec.entries.Count) {
+            if (sec.entries[i].key == key) {
+                sec.entries[i].text = val;
+                return;
+            }
+            i = i + 1;
+        }
+        IniEntry e = new IniEntry();
+        e.key = key;
+        e.text = val;
+        sec.entries.Add(e);
+    }
+
+    /// <summary>Sets an integer value (stored as decimal text).</summary>
+    void SetInt(string section, string key, int val) {
+        SetString(section, key, Convert.ToString(val));
+    }
+
+    /// <summary>Removes a key. True when it existed.</summary>
+    bool RemoveKey(string section, string key) {
+        IniSection sec = IniFile.FindSection(this, section);
+        if (sec == null) { return false; }
+        int i = 0;
+        while (i < sec.entries.Count) {
+            if (sec.entries[i].key == key) {
+                sec.entries.RemoveAt(i);
+                return true;
+            }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    /// <summary>Removes a whole section (all its keys). True when it existed.</summary>
+    bool RemoveSection(string section) {
+        int i = 0;
+        while (i < sections.Count) {
+            if (sections[i].name == section) {
+                sections.RemoveAt(i);
+                return true;
+            }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    /// <summary>Names of every section (in file order).</summary>
+    List<string> EnumSections() {
+        List<string> names = new List<string>();
+        int i = 0;
+        while (i < sections.Count) {
+            names.Add(sections[i].name);
+            i = i + 1;
+        }
+        return names;
+    }
+
+    /// <summary>Keys of a section (in file order); empty when missing.</summary>
+    List<string> EnumKeys(string section) {
+        List<string> keys = new List<string>();
+        IniSection sec = IniFile.FindSection(this, section);
+        if (sec == null) { return keys; }
+        int i = 0;
+        while (i < sec.entries.Count) {
+            keys.Add(sec.entries[i].key);
+            i = i + 1;
+        }
+        return keys;
+    }
+
+    /// <summary>Serializes the INI to text.</summary>
+    string ToText() {
+        StringBuilder sb = new StringBuilder();
+        int i = 0;
+        while (i < sections.Count) {
+            IniSection sec = sections[i];
+            if (sec.name != "") {
+                sb.Append("[" + sec.name + "]\n");
+            }
+            int k = 0;
+            while (k < sec.entries.Count) {
+                sb.Append(sec.entries[k].key + "=" + sec.entries[k].text + "\n");
+                k = k + 1;
+            }
+            i = i + 1;
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>Writes the INI back to `path`.</summary>
+    void Save(string path) {
+        File.WriteAllText(path, ToText());
+    }
+
+    static IniEntry Find(IniFile ini, string section, string key) {
+        IniSection sec = IniFile.FindSection(ini, section);
+        if (sec == null) { return null; }
+        int i = 0;
+        while (i < sec.entries.Count) {
+            if (sec.entries[i].key == key) { return sec.entries[i]; }
+            i = i + 1;
+        }
+        return null;
+    }
+
+    // Lookup without creating: null when the section is missing.
+    static IniSection FindSection(IniFile ini, string name) {
+        int i = 0;
+        while (i < ini.sections.Count) {
+            if (ini.sections[i].name == name) { return ini.sections[i]; }
+            i = i + 1;
+        }
+        return null;
+    }
+
+    // Returns the section, creating it (appended) when missing.
+    static IniSection Section(IniFile ini, string name) {
+        IniSection existing = IniFile.FindSection(ini, name);
+        if (existing != null) { return existing; }
+        IniSection sec = new IniSection();
+        sec.name = name;
+        ini.sections.Add(sec);
+        return sec;
+    }
+
+    static List<string> SplitLines(string text) {
+        List<string> lines = new List<string>();
+        StringBuilder sb = new StringBuilder();
+        int i = 0;
+        while (i < text.Length) {
+            string ch = text.Substring(i, 1);
+            if (ch == "\n") {
+                lines.Add(sb.ToString());
+                sb = new StringBuilder();
+            } else if (ch != "\r") {
+                sb.Append(ch);
+            }
+            i = i + 1;
+        }
+        string last = sb.ToString();
+        if (last.Length > 0) { lines.Add(last); }
+        return lines;
+    }
+
+    static int IndexOf(string hay, string needle, int from) {
+        int n = needle.Length;
+        int h = hay.Length;
+        int i = from;
+        while (i + n <= h) {
+            if (hay.Substring(i, n) == needle) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    static int ParseInt(string s) {
+        if (s.Length == 0) { return -1; }
+        int v = 0;
+        int i = 0;
+        while (i < s.Length) {
+            string ch = s.Substring(i, 1);
+            int c = ch[0] & 255;
+            if (c < 0x30 || c > 0x39) { return -1; }
+            v = v * 10 + (c - 0x30);
+            i = i + 1;
+        }
+        return v;
+    }
+}
+
+

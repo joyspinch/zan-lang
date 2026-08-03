@@ -1,0 +1,210 @@
+using System;
+using System.IO;
+
+namespace System.IO;
+
+/// <summary>
+/// Well-known user/system folders, plus environment variable access.
+///
+/// The folder lookups resolve through environment variables (%USERPROFILE%,
+/// %APPDATA%, ... on Windows; $HOME, $XDG_CONFIG_HOME, ... on POSIX), so the
+/// same code works on every platform and honours per-user redirection made
+/// through the OS settings. Returns "" when the folder cannot be resolved.
+///
+///   string cfg = KnownFolders.AppData() + Path.Separator() + "myapp";
+///   string home = KnownFolders.Home();
+/// </summary>
+class KnownFolders {
+    /// The user's home directory (Windows: %USERPROFILE%; POSIX: $HOME).
+    static string Home() {
+        #if WINDOWS
+        string p = Interop.EnvVar("USERPROFILE");
+        if (p != "") { return p; }
+        return Interop.EnvVar("HOMEDRIVE") + Interop.EnvVar("HOMEPATH");
+        #else
+        return Interop.EnvVar("HOME");
+        #endif
+    }
+
+    /// The user's Desktop folder.
+    static string Desktop() {
+        string home = KnownFolders.Home();
+        if (home == "") { return ""; }
+        return Path.Combine(home, "Desktop");
+    }
+
+    /// The user's Documents folder.
+    static string Documents() {
+        string home = KnownFolders.Home();
+        if (home == "") { return ""; }
+        return Path.Combine(home, "Documents");
+    }
+
+    /// The user's Downloads folder.
+    static string Downloads() {
+        string home = KnownFolders.Home();
+        if (home == "") { return ""; }
+        return Path.Combine(home, "Downloads");
+    }
+
+    /// Per-user roaming application data (Windows: %APPDATA%;
+    /// POSIX: $XDG_CONFIG_HOME or ~/.config).
+    static string AppData() {
+        #if WINDOWS
+        return Interop.EnvVar("APPDATA");
+        #else
+        string xdg = Interop.EnvVar("XDG_CONFIG_HOME");
+        if (xdg != "") { return xdg; }
+        string home = KnownFolders.Home();
+        if (home == "") { return ""; }
+        return Path.Combine(home, ".config");
+        #endif
+    }
+
+    /// Per-user local (non-roaming) application data
+    /// (Windows: %LOCALAPPDATA%; POSIX: $XDG_DATA_HOME or ~/.local/share).
+    static string LocalAppData() {
+        #if WINDOWS
+        return Interop.EnvVar("LOCALAPPDATA");
+        #else
+        string xdg = Interop.EnvVar("XDG_DATA_HOME");
+        if (xdg != "") { return xdg; }
+        string home = KnownFolders.Home();
+        if (home == "") { return ""; }
+        return Path.Combine(Path.Combine(home, ".local"), "share");
+        #endif
+    }
+
+    /// The system temporary directory (Windows: %TEMP%/%TMP%;
+    /// POSIX: $TMPDIR or /tmp).
+    static string Temp() {
+        string t = Interop.EnvVar("TEMP");
+        if (t == "") { t = Interop.EnvVar("TMP"); }
+        #if !WINDOWS
+        if (t == "") { t = Interop.EnvVar("TMPDIR"); }
+        if (t == "") { t = "/tmp"; }
+        #endif
+        return t;
+    }
+
+    /// The current user's name (Windows: %USERNAME%; POSIX: $USER or $LOGNAME).
+    static string UserName() {
+        string u = Interop.EnvVar("USERNAME");
+        if (u == "") { u = Interop.EnvVar("USER"); }
+        if (u == "") { u = Interop.EnvVar("LOGNAME"); }
+        return u;
+    }
+
+    /// The computer's name (Windows: %COMPUTERNAME%; POSIX: $HOSTNAME).
+    static string ComputerName() {
+        string n = Interop.EnvVar("COMPUTERNAME");
+        if (n == "") { n = Interop.EnvVar("HOSTNAME"); }
+        return n;
+    }
+
+    /// Reads an environment variable; "" when unset.
+    static string GetEnv(string name) {
+        return Interop.EnvVar(name);
+    }
+
+    /// Sets an environment variable for this process (and children).
+    /// An empty value deletes it on Windows.
+    static void SetEnv(string name, string val) {
+        #if WINDOWS
+        nint wname = Wide.Of(name);
+        nint wvalue = Wide.Of(val);
+        nint fn = Interop.Entry("kernel32.dll", "SetEnvironmentVariableW");
+        if (fn != 0) {
+            SetEnvironmentVariableWFn call = (SetEnvironmentVariableWFn)fn;
+            call(wname, wvalue);
+        }
+        Wide.Free(wvalue);
+        Wide.Free(wname);
+        #else
+        KnownFolders.PosixSetenv(name, val);
+        #endif
+    }
+
+    /// <summary>Expands <c>%NAME%</c> tokens (Windows) or <c>$NAME</c>
+    /// tokens (POSIX) from the process environment. Unknown tokens are left
+    /// as-is. On Windows this matches cmd.exe semantics (ExpandEnvironmentStringsW).</summary>
+    static string Expand(string text) {
+        StringBuilder sb = new StringBuilder();
+        int i = 0;
+        while (i < text.Length) {
+            #if WINDOWS
+            if (text.Substring(i, 1) == "%") {
+                int close = KnownFolders.IndexOf(text, "%", i + 1);
+                if (close > i + 1) {
+                    string name = text.Substring(i + 1, close - i - 1);
+                    string v = KnownFolders.GetEnv(name);
+                    if (v != "") {
+                        sb.Append(v);
+                        i = close + 1;
+                    } else {
+                        sb.Append("%" + name + "%");
+                        i = close + 1;
+                    }
+                } else {
+                    sb.Append("%");
+                    i = i + 1;
+                }
+            } else {
+                sb.Append(text.Substring(i, 1));
+                i = i + 1;
+            }
+            #else
+            if (text.Substring(i, 1) == "$") {
+                int end = i + 1;
+                while (end < text.Length) {
+                    string ch = text.Substring(end, 1);
+                    int c = ch[0] & 255;
+                    bool alpha = (c >= 65 && c <= 90) || (c >= 97 && c <= 122)
+                                 || (c >= 48 && c <= 57) || ch == "_";
+                    if (!alpha) { break; }
+                    end = end + 1;
+                }
+                if (end > i + 1) {
+                    string name = text.Substring(i + 1, end - i - 1);
+                    string v = KnownFolders.GetEnv(name);
+                    if (v != "") {
+                        sb.Append(v);
+                        i = end;
+                    } else {
+                        sb.Append("$" + name);
+                        i = end;
+                    }
+                } else {
+                    sb.Append("$");
+                    i = i + 1;
+                }
+            } else {
+                sb.Append(text.Substring(i, 1));
+                i = i + 1;
+            }
+            #endif
+        }
+        return sb.ToString();
+    }
+
+    static int IndexOf(string hay, string needle, int from) {
+        int n = needle.Length;
+        int h = hay.Length;
+        int i = from;
+        while (i + n <= h) {
+            if (hay.Substring(i, n) == needle) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    #if !WINDOWS
+    [DllImport("crt", EntryPoint = "setenv")]
+    static extern int PosixSetenv(string name, string value);
+    #endif
+}
+
+#if WINDOWS
+delegate int SetEnvironmentVariableWFn(nint name, nint val);
+#endif
+
