@@ -736,4 +736,146 @@ class AiTeam {
         sb.Append(AiTeam.ToolsPrompt(roleId));
         return sb.ToString();
     }
+
+    // --- handoff engine (batch 2) --------------------------------------------
+
+    /// The result of examining a member's finished reply: who the pipeline
+    /// hands to next (""=stay), whether it must park for the user, and the
+    /// task the beat referred to. The IDE turns `nextAgent` into the next
+    /// member's turn and `awaitingUser` into the "waiting on you" banner.
+    static AiTeamState Advance(AiTeamState st, string fromAgent,
+            AiEnvelope env) {
+        st.activeAgent = fromAgent;
+        if (env.taskId != "") { st.activeTask = env.taskId; }
+        st.awaitingUser = false;
+        st.askedBy = "";
+        // A question parks the whole pipeline: only the user may restart it,
+        // and the answer routes back to whoever asked.
+        if (env.kind == AiTeam.KindQuestion()) {
+            st.awaitingUser = true;
+            st.askedBy = fromAgent;
+            return st;
+        }
+        // A handoff / block moves ownership to the addressed member; a defect
+        // (block) always lands on the developer regardless of who was named,
+        // so a mis-addressed bug report still reaches the one who can fix it.
+        if (env.kind == AiTeam.KindHandoff() || env.kind == AiTeam.KindBlock()
+            || env.kind == AiTeam.KindAssign()) {
+            string target = "";
+            if (env.to.Count > 0) { target = env.to[0]; }
+            if (env.kind == AiTeam.KindBlock()) { target = AiTeam.FixOwner(); }
+            if (target == "") { target = AiTeam.NextOf(fromAgent); }
+            st.activeAgent = target;
+            return st;
+        }
+        // ack / progress / report keep ownership where it is: the member has
+        // more to do on the same task.
+        return st;
+    }
+
+    /// Who a bare "继续" after a stop or crash should wake. The parked
+    /// question's owner wins (the pipeline is literally waiting on it),
+    /// otherwise the member that was mid-stage; never silently restart at the
+    /// product manager, which would drop the in-flight task.
+    static string ResumeTarget(AiTeamState st) {
+        if (st.awaitingUser && st.askedBy != "") { return st.askedBy; }
+        if (st.activeAgent != "" && AiTeam.RoleOf(st.activeAgent) != null) {
+            return st.activeAgent;
+        }
+        return AiTeam.Pm();
+    }
+
+    /// The continue directive injected as the resumed member's next turn, so
+    /// it picks up its own stage instead of re-greeting the user.
+    static string ResumePrompt(AiTeamState st) {
+        string who = AiTeam.DisplayName(AiTeam.ResumeTarget(st));
+        StringBuilder sb = new StringBuilder();
+        sb.Append("[auto] 恢复中断的流程。你是 @" + who + "。");
+        if (st.activeTask != "") {
+            sb.Append("当前任务 " + st.activeTask + "。");
+        }
+        if (st.awaitingUser) {
+            sb.Append("用户刚刚回答了你之前的提问，据此继续，不要从头开始。");
+        } else {
+            sb.Append("从你上次停下的地方继续本阶段，不要重新问需求、不要从头开始。");
+        }
+        return sb.ToString();
+    }
+
+    // --- per-member context compression (batch 2) ----------------------------
+
+    /// How many of a member's most recent messages stay verbatim; older ones
+    /// are eligible to be folded into one digest. Kept small on purpose --
+    /// the point of the digest is that the recent exchange is enough to keep
+    /// working and everything durable is pinned separately.
+    static int KeepRecent() { return 8; }
+
+    /// A message that must never be compressed away: the task cards a member
+    /// owns and the user's turns (the requirement and the decisions). Folding
+    /// these would lose the pipeline's state, which is exactly the failure the
+    /// user called out.
+    static bool IsPinned(AiChatMsg m) {
+        if (m.role == "user") { return true; }
+        if (m.kind == AiTeam.KindAssign()) { return true; }
+        if (m.kind == AiTeam.KindQuestion()) { return true; }
+        return false;
+    }
+
+    /// Given one member's private context, the indices of the messages to fold
+    /// into a digest: everything past the recent window that is not pinned.
+    /// Returns an empty list when the context is short enough to leave alone,
+    /// so compression only ever runs when it is actually needed.
+    static List<int> Compressible(List<AiChatMsg> ctx) {
+        List<int> outIx = new List<int>();
+        int keepFrom = ctx.Count - AiTeam.KeepRecent();
+        if (keepFrom <= 0) { return outIx; }
+        for (int i = 0; i < keepFrom; i = i + 1) {
+            if (!AiTeam.IsPinned(ctx[i])) { outIx.Add(i); }
+        }
+        return outIx;
+    }
+
+    /// The instruction handed to a member to compress its own old turns: it
+    /// writes a three-part digest (settled conclusions / files touched / open
+    /// questions) so the summary is traceable, not a blind truncation.
+    static string CompressPrompt() {
+        return "[auto] 你的上下文较长，请把较早的历史压缩成一条摘要，分三段："
+            + "1) 已确定的结论与决策；2) 已改动的文件（path:line）；"
+            + "3) 未解决的问题。只输出摘要，保留任务号与验收标准，不要丢状态。";
+    }
+
+    // --- team state persistence (batch 2) ------------------------------------
+
+    /// Serialises the resume state into the compact form stored alongside the
+    /// transcript, so "继续" survives an IDE restart.
+    static string PackState(AiTeamState st) {
+        StringBuilder sb = new StringBuilder();
+        sb.Append(st.activeAgent + "|" + st.activeTask + "|");
+        if (st.awaitingUser) { sb.Append("1"); } else { sb.Append("0"); }
+        sb.Append("|" + st.askedBy);
+        return sb.ToString();
+    }
+
+    /// Reads a state string back; a blank or malformed value yields a fresh
+    /// state parked at the product manager rather than throwing.
+    static AiTeamState UnpackState(string s) {
+        AiTeamState st = AiTeamState.Create();
+        if (AiAgent.Trim(s) == "") { return st; }
+        List<string> parts = new List<string>();
+        int start = 0;
+        for (int i = 0; i <= s.Length; i = i + 1) {
+            bool end = i == s.Length;
+            bool bar = false;
+            if (!end) { bar = (s[i] & 255) == 124; }
+            if (end || bar) {
+                parts.Add(s.Substring(start, i - start));
+                start = i + 1;
+            }
+        }
+        if (parts.Count >= 1 && parts[0] != "") { st.activeAgent = parts[0]; }
+        if (parts.Count >= 2) { st.activeTask = parts[1]; }
+        if (parts.Count >= 3) { st.awaitingUser = parts[2] == "1"; }
+        if (parts.Count >= 4) { st.askedBy = parts[3]; }
+        return st;
+    }
 }
