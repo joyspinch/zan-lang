@@ -50,6 +50,54 @@ partial class ChartView {
         }
     }
 
+    // Same Catmull-Rom curve, but the output vertices are 16.8 fixed-point
+    // (1/256 px). Integer math truncates every vertex to the pixel grid; on a
+    // shallow curve adjacent vertices then differ by 0 or 1 rows, collapsing
+    // the curve into flat runs + single-pixel jumps that no AA ramp can hide
+    // (this is why circles, which are sampled against the true geometry, look
+    // smooth while polyline curves read as a staircase). Sub-pixel vertices
+    // let the stroke rasterizer sample distance to the real curve.
+    static void BuildPathFx(List<int> px, List<int> py, bool smooth,
+                            List<int> ox, List<int> oy) {
+        int n = px.Count;
+        if (n < 1) { return; }
+        if (!smooth || n < 3) {
+            int i = 0;
+            while (i < n) { ox.Add(px[i] * 256); oy.Add(py[i] * 256); i = i + 1; }
+            return;
+        }
+        ox.Add(px[0] * 256); oy.Add(py[0] * 256);
+        int seg = 0;
+        while (seg + 1 < n) {
+            int p0 = seg - 1; if (p0 < 0) { p0 = 0; }
+            int p3 = seg + 2; if (p3 > n - 1) { p3 = n - 1; }
+            long x0 = px[p0]; long y0 = py[p0];
+            long x1 = px[seg]; long y1 = py[seg];
+            long x2 = px[seg + 1]; long y2 = py[seg + 1];
+            long x3 = px[p3]; long y3 = py[p3];
+            int steps = 48;
+            int s = 1;
+            while (s <= steps) {
+                int tt = s * 1000 / steps;
+                int tt2 = tt * tt / 1000;
+                int tt3 = tt2 * tt / 1000;
+                // 64-bit intermediates keep 1/256 precision end to end; the
+                // final /2 rounds to the exact sub-pixel vertex position.
+                long qx = (2 * x1 * 256
+                    + (x2 - x0) * tt * 256 / 1000
+                    + (2 * x0 - 5 * x1 + 4 * x2 - x3) * tt2 * 256 / 1000
+                    + (0 - x0 + 3 * x1 - 3 * x2 + x3) * tt3 * 256 / 1000) / 2;
+                long qy = (2 * y1 * 256
+                    + (y2 - y0) * tt * 256 / 1000
+                    + (2 * y0 - 5 * y1 + 4 * y2 - y3) * tt2 * 256 / 1000
+                    + (0 - y0 + 3 * y1 - 3 * y2 + y3) * tt3 * 256 / 1000) / 2;
+                ox.Add((int)qx); oy.Add((int)qy);
+                s = s + 1;
+            }
+            seg = seg + 1;
+        }
+    }
+
     // Fill the region between a dense (left-to-right) path and baseY, giving the
     // top edge sub-pixel anti-aliased coverage. The interior is filled with
     // solid 1px columns; the single boundary row of each column is blended with
@@ -105,8 +153,8 @@ partial class ChartView {
                          bool smooth, int color, int th) {
         List<int> ox = new List<int>();
         List<int> oy = new List<int>();
-        ChartView.BuildPath(px, py, smooth, ox, oy);
-        c.DrawPolyline(ox, oy, color, th);
+        ChartView.BuildPathFx(px, py, smooth, ox, oy);
+        c.DrawPolylineFx(ox, oy, color, th);
     }
 
     // ---- line / area / stepline (with bar + scatter overlays) ----
@@ -197,10 +245,16 @@ partial class ChartView {
 
                     // Build the (optionally smoothed) path once; the fill and the
                     // stroke share the identical curve so the filled top follows the
-                    // stroke exactly with an anti-aliased edge.
+                    // stroke exactly with an anti-aliased edge. The stroke consumes
+                    // the sub-pixel (16.8) variant so the curve's silhouette is
+                    // sampled against the true geometry; the fill interpolates the
+                    // integer path itself (FillUnder already works in 1/256).
                     List<int> pathX = new List<int>();
                     List<int> pathY = new List<int>();
                     ChartView.BuildPath(pxs, pys, smooth, pathX, pathY);
+                    List<int> fxX = new List<int>();
+                    List<int> fxY = new List<int>();
+                    ChartView.BuildPathFx(pxs, pys, smooth, fxX, fxY);
 
                     if (area) {
                         ChartView.FillUnder(c, pathX, pathY, baseY, s.color, o.gradient, 150, 16);
@@ -223,7 +277,7 @@ partial class ChartView {
                         }
                         c.DrawPolyline(sx, sy, s.color, th);
                     } else {
-                        c.DrawPolyline(pathX, pathY, s.color, th);
+                        c.DrawPolylineFx(fxX, fxY, s.color, th);
                     }
 
                     int m2 = 0;
@@ -308,15 +362,30 @@ partial class ChartView {
             int lastx = f.plotX + (n - 1) * step + half;
             ChartView.FillColumnAA(c, lastx, topY[n - 1] * 256, botY[n - 1],
                                    s.color, o.gradient, 150, 40, 90);
+            // Stacked top edge: the fill interpolates 1/256 px per column, so
+            // the stroke must too — an integer-vertex polyline would draw a
+            // staircase over the smooth filled silhouette. Emit one 16.8
+            // fixed-point vertex per column (same interpolation as FillColumnAA).
             List<int> tx = new List<int>();
             List<int> ty = new List<int>();
             int k2 = 0;
-            while (k2 < n) {
-                tx.Add(f.plotX + k2 * step + half);
-                ty.Add(topY[k2]);
+            while (k2 + 1 < n) {
+                int ax0 = f.plotX + k2 * step + half;
+                int ax1 = f.plotX + (k2 + 1) * step + half;
+                int pxc = ax0;
+                while (pxc < ax1) {
+                    int tt = 0;
+                    if (ax1 > ax0) { tt = (pxc - ax0) * 1000 / (ax1 - ax0); }
+                    tx.Add(pxc * 256);
+                    ty.Add(topY[k2] * 256 + (topY[k2 + 1] - topY[k2]) * tt * 256 / 1000);
+                    pxc = pxc + 1;
+                }
                 k2 = k2 + 1;
             }
-            c.DrawPolyline(tx, ty, s.color, app.Scale(2));
+            int lastx = f.plotX + (n - 1) * step + half;
+            tx.Add(lastx * 256);
+            ty.Add(topY[n - 1] * 256);
+            c.DrawPolylineFx(tx, ty, s.color, app.Scale(2));
             int u = 0;
             while (u < n) {
                 int val = 0;

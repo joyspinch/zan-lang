@@ -183,10 +183,12 @@ static void set_pixel_aa(zan_surface_t *s, int x, int y, u32 color, int coverage
 }
 
 /* Convert a 0..1 coverage value to an alpha byte with a linear ramp. The
- * stroke AA transition is ~2px wide (cov = half - dist + 1.0 at the call
- * sites), so a linear map keeps adjacent columns' edge pixels evenly spaced:
- * a smoothstep on a narrow band pushes mid-ramp pixels toward the ends and
- * re-introduces the column-to-column step it was meant to remove. */
+ * stroke AA transition is a fixed 1px band (cov = half + 0.5 - dist at the
+ * call sites), the same distance-field falloff zan_gui_fill_circle uses —
+ * a linear map matches it exactly, so circles, lines and polylines all get
+ * the identical edge quality at every DPI. A smoothstep on a 1px band would
+ * push mid-tones toward the ends and re-introduce the step it was meant to
+ * remove. */
 static inline int aa_coverage(double cov) {
     if (cov <= 0.0) return 0;
     if (cov >= 1.0) return 255;
@@ -1340,20 +1342,19 @@ EXPORT void zan_gui_draw_line(i32 surface_id, i32 x0, i32 y0, i32 x1, i32 y1, i3
         double dx = (double)(x1 - x0), dy = (double)(y1 - y0);
         double len2 = dx*dx + dy*dy;
         double half = t * 0.5;
-        /* AA transition half-width in PHYSICAL pixels, fixed regardless of DPI.
-         * The canvas is per-monitor DPI aware and already holds physical
-         * pixels; the GUI scales stroke widths by dpi/96 (a 2px line becomes
-         * 3px at 150%), so a fade that tracked the width would stretch the
-         * ramp with the zoom and the aliasing would scale up with it. Keeping
-         * the ramp at ~1 physical pixel makes the edge identically smooth at
-         * 96 / 150 / 200% — the anti-aliasing must never scale. */
-        double fade = 1.0;
+        /* AA transition: fixed 1px band, identical to zan_gui_fill_circle
+         * (cov = half + 0.5 - dist, solid inside half-0.5, 1px falloff).
+         * The circle renderer is the reference that looks smooth at every
+         * DPI precisely because its 1px ramp is in physical pixels and never
+         * scales with the object size — the polyline must match it exactly,
+         * not widen the ramp with the (already DPI-scaled) stroke width,
+         * which would stretch the edge and read as a soft, jagged halo. */
         int lox = (x0 < x1 ? (int)x0 : (int)x1);
         int hix = (x0 > x1 ? (int)x0 : (int)x1);
         int loy = (y0 < y1 ? (int)y0 : (int)y1);
         int hiy = (y0 > y1 ? (int)y0 : (int)y1);
-        int minx = lox - t - 2, maxx = hix + t + 2;
-        int miny = loy - t - 2, maxy = hiy + t + 2;
+        int minx = lox - t - 1, maxx = hix + t + 1;
+        int miny = loy - t - 1, maxy = hiy + t + 1;
         for (int py = miny; py <= maxy; py++) {
             for (int px = minx; px <= maxx; px++) {
                 double proj = 0.0;
@@ -1366,13 +1367,7 @@ EXPORT void zan_gui_draw_line(i32 surface_id, i32 x0, i32 y0, i32 x1, i32 y1, i3
                 double cyp = (double)y0 + proj * dy;
                 double ddx = px - cxp, ddy = py - cyp;
                 double dist = sqrt(ddx*ddx + ddy*ddy);
-                /* Normalized distance-field coverage: solid inside half
-                 * thickness, a fade-px linear ramp outside. A raw
-                 * half-dist+offset leaves the ramp only 1px wide regardless
-                 * of the offset (cov>=1 saturates), which shows just two
-                 * intermediate levels on shallow diagonals and reads as a
-                 * staircase. */
-                double cov = (half + fade - dist) / fade;
+                double cov = half + 0.5 - dist;   /* 1px band, like circle */
                 if (cov <= 0.0) continue;
                 int icov = aa_coverage(cov);
                 if (icov >= 255) set_pixel(s, px, py, c);
@@ -1412,15 +1407,18 @@ static i32 *g_poly_dirty = NULL;  /* packed (y<<16)|x of pixels this pass touche
 static i32  g_poly_dirty_n = 0;
 static i32  g_poly_dirty_cap = 0;
 
-EXPORT void zan_gui_draw_polyline(i32 surface_id, const i32 *pts, i32 n,
-                                  i32 color, i32 thickness) {
-    if (surface_id < 0 || surface_id >= g_surface_count) return;
-    zan_surface_t *s = g_surfaces[surface_id];
-    if (!s || !pts || n < 2) return;
+/* Shared polyline rasterizer. shift=0: pts are integer coords; shift=8: pts
+ * are 16.8 fixed-point (1/256 px), so a Catmull-Rom curve can be handed over
+ * with sub-pixel vertex precision. Sampling the distance field with
+ * sub-pixel endpoints is what makes a shallow curve read as a smooth ramp
+ * instead of the staircase of integer-rounded vertices (the filled-circle
+ * rasterizer is smooth for the same reason: every pixel measures distance to
+ * the ideal geometry, not to a quantized outline). */
+static void zan_polyline_core(zan_surface_t *s, const i32 *pts, i32 n,
+                              u32 c, int t, int shift) {
     int W = s->width, H = s->height;
-    int t = (int)thickness;
-    if (t < 1) t = 1;
-    u32 c = (u32)color;
+    if (W <= 0 || H <= 0) return;
+    double scale = shift == 0 ? 1.0 : (1.0 / 256.0);
 
     if (g_poly_cov_w < W || g_poly_cov_h < H) {
         free(g_poly_cov);
@@ -1435,32 +1433,31 @@ EXPORT void zan_gui_draw_polyline(i32 surface_id, const i32 *pts, i32 n,
     memset(g_poly_cov, 0, (size_t)W * (size_t)H);
 
     double half = t * 0.5;
-    double fade = 1.0;   /* fixed physical px, see draw_line: AA must not scale */
     for (i32 i = 0; i + 1 < n; i++) {
-        int x0 = pts[i * 2], y0 = pts[i * 2 + 1];
-        int x1 = pts[i * 2 + 2], y1 = pts[i * 2 + 3];
+        double x0 = pts[i * 2] * scale, y0 = pts[i * 2 + 1] * scale;
+        double x1 = pts[i * 2 + 2] * scale, y1 = pts[i * 2 + 3] * scale;
         if (x0 == x1 && y0 == y1) continue;
-        double dx = (double)(x1 - x0), dy = (double)(y1 - y0);
+        double dx = x1 - x0, dy = y1 - y0;
         double len2 = dx * dx + dy * dy;
         if (len2 < 0.0001) continue;
-        int minx = (x0 < x1 ? x0 : x1) - t - 2;
-        int maxx = (x0 > x1 ? x0 : x1) + t + 2;
-        int miny = (y0 < y1 ? y0 : y1) - t - 2;
-        int maxy = (y0 > y1 ? y0 : y1) + t + 2;
+        int minx = (int)floor(x0 < x1 ? x0 : x1) - t - 2;
+        int maxx = (int)ceil(x0 > x1 ? x0 : x1) + t + 2;
+        int miny = (int)floor(y0 < y1 ? y0 : y1) - t - 2;
+        int maxy = (int)ceil(y0 > y1 ? y0 : y1) + t + 2;
         if (minx < 0) minx = 0;
         if (miny < 0) miny = 0;
         if (maxx >= W) maxx = W - 1;
         if (maxy >= H) maxy = H - 1;
         for (int py = miny; py <= maxy; py++) {
             for (int px = minx; px <= maxx; px++) {
-                double proj = ((px - (double)x0) * dx + (py - (double)y0) * dy) / len2;
+                double proj = ((px - x0) * dx + (py - y0) * dy) / len2;
                 if (proj < 0.0) proj = 0.0;
                 if (proj > 1.0) proj = 1.0;
-                double cxp = (double)x0 + proj * dx;
-                double cyp = (double)y0 + proj * dy;
+                double cxp = x0 + proj * dx;
+                double cyp = y0 + proj * dy;
                 double ddx = px - cxp, ddy = py - cyp;
                 double dist = sqrt(ddx * ddx + ddy * ddy);
-                double cov = (half + fade - dist) / fade;   /* see draw_line */
+                double cov = half + 0.5 - dist;   /* 1px band, like circle */
                 if (cov <= 0.0) continue;
                 int icov = aa_coverage(cov);
                 int idx = py * W + px;
@@ -1493,6 +1490,28 @@ EXPORT void zan_gui_draw_polyline(i32 surface_id, const i32 *pts, i32 n,
         if (cov >= 255) set_pixel(s, px, py, c);
         else set_pixel_aa(s, px, py, c, cov);
     }
+}
+
+EXPORT void zan_gui_draw_polyline(i32 surface_id, const i32 *pts, i32 n,
+                                  i32 color, i32 thickness) {
+    if (surface_id < 0 || surface_id >= g_surface_count) return;
+    zan_surface_t *s = g_surfaces[surface_id];
+    if (!s || !pts || n < 2) return;
+    int t = (int)thickness;
+    if (t < 1) t = 1;
+    zan_polyline_core(s, pts, n, (u32)color, t, 0);
+}
+
+/* Fixed-point polyline: vertex coordinates are 16.8 (1/256 px), so smooth
+ * curve paths keep sub-pixel shape instead of snapping to the integer grid. */
+EXPORT void zan_gui_draw_polyline_fx(i32 surface_id, const i32 *pts, i32 n,
+                                     i32 color, i32 thickness) {
+    if (surface_id < 0 || surface_id >= g_surface_count) return;
+    zan_surface_t *s = g_surfaces[surface_id];
+    if (!s || !pts || n < 2) return;
+    int t = (int)thickness;
+    if (t < 1) t = 1;
+    zan_polyline_core(s, pts, n, (u32)color, t, 8);
 }
 
 EXPORT void *zan_gui_get_pixels(i32 surface_id) {
