@@ -108,6 +108,7 @@ long long zan_file_time(const char *path, int which);
 long long zan_file_length(const char *path);
 long long zan_file_attributes(const char *path);
 long long zan_file_set_readonly(const char *path, int on);
+long long zan_file_set_time(const char *path, int which, long long unix_sec);
 long long zan_file_open(const char *path, const char *mode);
 long long zan_file_read(long long handle, long long buf, long long count);
 long long zan_file_write(long long handle, long long buf, long long count);
@@ -116,6 +117,15 @@ long long zan_file_tell(long long handle);
 long long zan_file_flush(long long handle);
 long long zan_file_close(long long handle);
 long long zan_file_eof(long long handle);
+
+/* memory-mapped files (System.IO.MemoryMappedFile) */
+long long zan_mmap_create(const char *name, long long size);
+long long zan_mmap_open(const char *name, long long size);
+long long zan_mmap_from_file(const char *path, long long size);
+long long zan_mmap_map(long long handle, long long size);
+long long zan_mmap_unmap(long long ptr, long long size);
+long long zan_mmap_flush(long long ptr, long long size);
+long long zan_mmap_close(long long handle);
 
 #ifdef __cplusplus
 }

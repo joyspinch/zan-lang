@@ -1,0 +1,304 @@
+using System;
+
+namespace System.IO;
+
+/// <summary>
+/// Extended file metadata and operations beyond <see cref="FileInfo"/>:
+/// Windows version-information resource reading (product/file version of an
+/// exe/dll), icon extraction, MIME guessing from the extension, timestamp
+/// writing, hard-link creation and reparse-point (junction/symlink) detection.
+///
+///   FileInfoEx.Version("C:\\Windows\\System32\\notepad.exe"); // "11.2402.23.0"
+///   string mime = FileInfoEx.Mime("archive.zip");            // "application/zip"
+///   FileInfoEx.SetLastWriteTime("out.bin", unixSeconds);
+///   FileInfoEx.CreateHardLink("link.txt", "target.txt");
+///
+/// Everything except Version()/Icon()/IsReparsePoint() is cross-platform.
+/// </summary>
+class FileInfoEx {
+    #if WINDOWS
+    [DllImport("version", EntryPoint = "GetFileVersionInfoSizeW")]
+    static extern int GetFileVersionInfoSizeW(nint path, nint handle);
+
+    [DllImport("version", EntryPoint = "GetFileVersionInfoW")]
+    static extern int GetFileVersionInfoW(nint path, int handle, int len, nint data);
+
+    [DllImport("version", EntryPoint = "VerQueryValueW")]
+    static extern int VerQueryValueW(nint data, nint subBlock, nint buffer, nint size);
+
+    [DllImport("shell32", EntryPoint = "SHGetFileInfoW")]
+    static extern nint SHGetFileInfoW(nint path, int attrs, nint sfi, int sfiSize, int flags);
+
+    [DllImport("user32", EntryPoint = "DestroyIcon")]
+    static extern int DestroyIconNative(nint icon);
+
+    [DllImport("kernel32", EntryPoint = "GetFileAttributesW")]
+    static extern int GetFileAttributesW(nint path);
+
+    [DllImport("kernel32", EntryPoint = "CreateHardLinkW")]
+    static extern int CreateHardLinkW(nint link, nint target, nint secAttrs);
+    #endif
+
+    [DllImport("crt")]
+    static extern long zan_file_set_time(string path, int which, long unixSec);
+
+    // The FILE_ATTRIBUTE_REPARSE_POINT bit from winnt.h.
+    static int ReparsePointAttr() { return 0x400; }
+
+    static int ShgfiIcon() { return 0x100; }        // SHGFI_ICON
+    static int ShgfiSmallIcon() { return 0x1; }     // SHGFI_SMALLICON
+    static int ShgfiUseFileAttributes() { return 0x10; }
+
+    /// <summary>
+    /// Reads the version-information resource of a Windows exe/dll and returns
+    /// it as "major.minor.build.revision" (the VS_FIXEDFILEINFO product or file
+    /// version, whichever is newer). Returns "" when the file has no version
+    /// resource or the platform is not Windows.
+    /// </summary>
+    static string Version(string path) {
+        #if WINDOWS
+        nint wpath = Wide.Of(path);
+        int size = FileInfoEx.GetFileVersionInfoSizeW(wpath, 0);
+        if (size <= 0) { Wide.Free(wpath); return ""; }
+        nint data = NativeMemory.Alloc(size);
+        int ok = FileInfoEx.GetFileVersionInfoW(wpath, 0, size, data);
+        Wide.Free(wpath);
+        string result = "";
+        if (ok != 0) {
+            nint root = NativeMemory.Alloc(8);
+            nint lenCell = NativeMemory.Alloc(8);
+            nint block = Wide.Of("\\");
+            if (FileInfoEx.VerQueryValueW(data, block, root, lenCell) != 0) {
+                nint fixedInfo = new Span<nint>(root, 1)[0];
+                if (fixedInfo != 0) {
+                    // VS_FIXEDFILEINFO: dwSignature[0] dwStrucVersion[1]
+                    // dwFileVersionMS[2] dwFileVersionLS[3]
+                    // dwProductVersionMS[4] dwProductVersionLS[5]
+                    Span<int> ffi = new Span<int>(fixedInfo, 6);
+                    if (ffi[0] == 0xFEEF04BD) {
+                        int fileMs = ffi[2];
+                        int fileLs = ffi[3];
+                        int prodMs = ffi[4];
+                        int prodLs = ffi[5];
+                        // Prefer the product version when it is nonzero.
+                        int ms = prodMs;
+                        int ls = prodLs;
+                        if (ms == 0 && ls == 0) { ms = fileMs; ls = fileLs; }
+                        result = FileInfoEx.JoinVersion(ms, ls);
+                    }
+                }
+            }
+            Wide.Free(block);
+            NativeMemory.Free(root);
+            NativeMemory.Free(lenCell);
+        }
+        NativeMemory.Free(data);
+        return result;
+        #else
+        return "";
+        #endif
+    }
+
+    static string JoinVersion(int ms, int ls) {
+        int v0 = (ms >> 16) & 0xFFFF;
+        int v1 = ms & 0xFFFF;
+        int v2 = (ls >> 16) & 0xFFFF;
+        int v3 = ls & 0xFFFF;
+        StringBuilder sb = new StringBuilder();
+        sb.Append(Convert.ToString(v0));
+        sb.Append(".");
+        sb.Append(Convert.ToString(v1));
+        sb.Append(".");
+        sb.Append(Convert.ToString(v2));
+        sb.Append(".");
+        sb.Append(Convert.ToString(v3));
+        return sb.ToString();
+    }
+
+    /// <summary>
+    /// Extracts the small file-type icon of `path` (an exe's own icon, or the
+    /// shell's icon for the extension when the file does not exist) and returns
+    /// its HICON handle. Caller must release it with <see cref="DestroyIcon"/>.
+    /// Returns 0 when extraction fails or the platform is not Windows.
+    /// </summary>
+    static nint Icon(string path) {
+        #if WINDOWS
+        nint wpath = Wide.Of(path);
+        nint sfi = NativeMemory.Alloc(1024);
+        int flags = FileInfoEx.ShgfiIcon() | FileInfoEx.ShgfiSmallIcon()
+                  | FileInfoEx.ShgfiUseFileAttributes();
+        nint result = FileInfoEx.SHGetFileInfoW(wpath, 0, sfi, 1024, flags);
+        Wide.Free(wpath);
+        nint icon = 0;
+        if (result != 0) {
+            icon = new Span<nint>(sfi, 1)[0];   // SHFILEINFO.hIcon
+        }
+        NativeMemory.Free(sfi);
+        return icon;
+        #else
+        return 0;
+        #endif
+    }
+
+    /// <summary>Releases an icon obtained from <see cref="Icon"/>.
+    /// Cross-platform; a no-op off Windows.</summary>
+    static void DestroyIcon(nint icon) {
+        #if WINDOWS
+        if (icon != 0) { FileInfoEx.DestroyIconNative(icon); }
+        #endif
+    }
+
+    /// <summary>
+    /// Guesses the MIME type of a file from its extension (lowercased).
+    /// Unknown extensions fall back to "application/octet-stream".
+    /// </summary>
+    static string Mime(string path) {
+        string ext = FileInfoEx.Extension(path).ToLower();
+        if (ext == ".png") { return "image/png"; }
+        if (ext == ".jpg" || ext == ".jpeg") { return "image/jpeg"; }
+        if (ext == ".gif") { return "image/gif"; }
+        if (ext == ".bmp") { return "image/bmp"; }
+        if (ext == ".webp") { return "image/webp"; }
+        if (ext == ".svg") { return "image/svg+xml"; }
+        if (ext == ".ico") { return "image/x-icon"; }
+        if (ext == ".tif" || ext == ".tiff") { return "image/tiff"; }
+        if (ext == ".txt") { return "text/plain"; }
+        if (ext == ".md" || ext == ".markdown") { return "text/markdown"; }
+        if (ext == ".html" || ext == ".htm") { return "text/html"; }
+        if (ext == ".css") { return "text/css"; }
+        if (ext == ".csv") { return "text/csv"; }
+        if (ext == ".xml") { return "application/xml"; }
+        if (ext == ".json") { return "application/json"; }
+        if (ext == ".pdf") { return "application/pdf"; }
+        if (ext == ".doc") { return "application/msword"; }
+        if (ext == ".docx") { return "application/vnd.openxmlformats-officedocument.wordprocessingml.document"; }
+        if (ext == ".xls") { return "application/vnd.ms-excel"; }
+        if (ext == ".xlsx") { return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"; }
+        if (ext == ".ppt") { return "application/vnd.ms-powerpoint"; }
+        if (ext == ".pptx") { return "application/vnd.openxmlformats-officedocument.presentationml.presentation"; }
+        if (ext == ".zip") { return "application/zip"; }
+        if (ext == ".rar") { return "application/vnd.rar"; }
+        if (ext == ".7z") { return "application/x-7z-compressed"; }
+        if (ext == ".tar") { return "application/x-tar"; }
+        if (ext == ".gz") { return "application/gzip"; }
+        if (ext == ".bz2") { return "application/x-bzip2"; }
+        if (ext == ".xz") { return "application/x-xz"; }
+        if (ext == ".mp3") { return "audio/mpeg"; }
+        if (ext == ".wav") { return "audio/wav"; }
+        if (ext == ".ogg") { return "audio/ogg"; }
+        if (ext == ".flac") { return "audio/flac"; }
+        if (ext == ".mp4") { return "video/mp4"; }
+        if (ext == ".avi") { return "video/x-msvideo"; }
+        if (ext == ".mkv") { return "video/x-matroska"; }
+        if (ext == ".webm") { return "video/webm"; }
+        if (ext == ".mov") { return "video/quicktime"; }
+        if (ext == ".ttf") { return "font/ttf"; }
+        if (ext == ".otf") { return "font/otf"; }
+        if (ext == ".woff") { return "font/woff"; }
+        if (ext == ".woff2") { return "font/woff2"; }
+        if (ext == ".js") { return "text/javascript"; }
+        if (ext == ".ts") { return "application/typescript"; }
+        if (ext == ".java") { return "text/x-java-source"; }
+        if (ext == ".c") { return "text/x-c"; }
+        if (ext == ".h") { return "text/x-c"; }
+        if (ext == ".cpp") { return "text/x-c++src"; }
+        if (ext == ".hpp") { return "text/x-c++src"; }
+        if (ext == ".cs") { return "text/plain"; }
+        if (ext == ".py") { return "text/x-python"; }
+        if (ext == ".rs") { return "text/x-rust"; }
+        if (ext == ".go") { return "text/x-go"; }
+        if (ext == ".zan") { return "text/plain"; }
+        if (ext == ".exe" || ext == ".dll") { return "application/x-msdownload"; }
+        if (ext == ".so" || ext == ".dylib") { return "application/x-sharedlib"; }
+        return "application/octet-stream";
+    }
+
+    /// <summary>Lowercased extension of `path` including the dot, or "" when
+    /// there is none (a trailing dot or no dot at all).</summary>
+    static string Extension(string path) {
+        int slash = FileInfoEx.LastIndexOfAny(path, "/\\");
+        int dot = -1;
+        int i = path.Length - 1;
+        while (i > slash) {
+            if (path.Substring(i, 1) == ".") { dot = i; break; }
+            i = i - 1;
+        }
+        if (dot < 0) { return ""; }
+        return path.Substring(dot, path.Length - dot);
+    }
+
+    static int LastIndexOfAny(string s, string chars) {
+        int i = s.Length - 1;
+        while (i >= 0) {
+            string c = s.Substring(i, 1);
+            int j = 0;
+            while (j < chars.Length) {
+                if (c == chars.Substring(j, 1)) { return i; }
+                j = j + 1;
+            }
+            i = i - 1;
+        }
+        return -1;
+    }
+
+    /// <summary>Unix timestamp (seconds) of the last write, or 0 when the
+    /// path does not exist. See also <see cref="FileInfo.LastWriteTime"/>.</summary>
+    static long GetLastWriteTime(string path) { return FileInfo.GetLastWriteTime(path); }
+    static long GetCreationTime(string path) { return FileInfo.GetCreationTime(path); }
+    static long GetLastAccessTime(string path) { return FileInfo.GetLastAccessTime(path); }
+
+    /// <summary>Sets the last-write time to a Unix timestamp.
+    /// Returns false when the file does not exist or the platform cannot set it.</summary>
+    static bool SetLastWriteTime(string path, long unixSec) {
+        return FileInfoEx.zan_file_set_time(path, 0, unixSec) == 1;
+    }
+
+    /// <summary>Sets the last-access time to a Unix timestamp.</summary>
+    static bool SetLastAccessTime(string path, long unixSec) {
+        return FileInfoEx.zan_file_set_time(path, 2, unixSec) == 1;
+    }
+
+    /// <summary>Sets the creation time (Windows only; returns false elsewhere).</summary>
+    static bool SetCreationTime(string path, long unixSec) {
+        return FileInfoEx.zan_file_set_time(path, 1, unixSec) == 1;
+    }
+
+    /// <summary>
+    /// Creates a hard link at `link` pointing to the existing file `target`.
+    /// Returns false when the link could not be created (target missing,
+    /// different volume, insufficient privilege).
+    /// </summary>
+    static bool CreateHardLink(string link, string target) {
+        #if WINDOWS
+        nint wlink = Wide.Of(link);
+        nint wtarget = Wide.Of(target);
+        int ok = FileInfoEx.CreateHardLinkW(wlink, wtarget, 0);
+        Wide.Free(wlink);
+        Wide.Free(wtarget);
+        return ok != 0;
+        #else
+        return LinkPosix(link, target) == 0;
+        #endif
+    }
+
+    [DllImport("crt")]
+    static extern int link(string existing, string newLink);
+
+    static int LinkPosix(string link, string target) { return FileInfoEx.link(target, link); }
+
+    /// <summary>
+    /// True when `path` is a reparse point (a directory junction, a symbolic
+    /// link, or a OneDrive placeholder). Windows only; false elsewhere.
+    /// </summary>
+    static bool IsReparsePoint(string path) {
+        #if WINDOWS
+        nint wpath = Wide.Of(path);
+        int attrs = FileInfoEx.GetFileAttributesW(wpath);
+        Wide.Free(wpath);
+        if (attrs == -1) { return false; }
+        return (attrs & FileInfoEx.ReparsePointAttr()) != 0;
+        #else
+        return false;
+        #endif
+    }
+}

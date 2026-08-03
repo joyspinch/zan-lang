@@ -1,0 +1,114 @@
+using System;
+
+namespace System.IO;
+
+/// <summary>
+/// Memory-mapped files and named shared-memory regions. A mapping is a named
+/// byte region (or a view over an existing file) that can be mapped into the
+/// process address space and read/written through a Span, with the OS paging
+/// the contents to and from disk (file-backed) or a shared kernel object
+/// (named regions — visible to other processes that open the same name).
+///
+///   // Writer process:
+///   MemoryMappedFile mmf = MemoryMappedFile.CreateNew("MyApp.Shared", 4096);
+///   nint view = mmf.Map(4096);
+///   new Span<int>(view, 1024)[0] = 42;
+///   mmf.Unmap(view, 4096);
+///   mmf.Close();
+///
+///   // Reader process:
+///   MemoryMappedFile mmf2 = MemoryMappedFile.OpenExisting("MyApp.Shared", 4096);
+///   nint view2 = mmf2.Map(4096);
+///   int value = new Span<int>(view2, 1024)[0];
+///
+/// Names are per-machine; on Windows a "Global\" prefix makes the region
+/// visible to other sessions. File-backed mappings are read-write and shared
+/// (MAP_SHARED), so concurrent readers of the same file see the writes.
+/// </summary>
+class MemoryMappedFile {
+    [DllImport("crt")]
+    static extern long zan_mmap_create(string name, long size);
+    [DllImport("crt")]
+    static extern long zan_mmap_open(string name, long size);
+    [DllImport("crt")]
+    static extern long zan_mmap_from_file(string path, long size);
+    [DllImport("crt")]
+    static extern long zan_mmap_map(long handle, long size);
+    [DllImport("crt")]
+    static extern long zan_mmap_unmap(long ptr, long size);
+    [DllImport("crt")]
+    static extern long zan_mmap_flush(long ptr, long size);
+    [DllImport("crt")]
+    static extern long zan_mmap_close(long handle);
+
+    long handle;
+    string name;
+
+    /// <summary>Creates a NEW named shared-memory region of `size` bytes.
+    /// Fails (throws IOException) when a region with the same name already
+    /// exists. The region persists until every handle to it is closed;
+    /// on POSIX the name stops resolving once the creator closes it.</summary>
+    static MemoryMappedFile CreateNew(string name, long size) {
+        long h = MemoryMappedFile.zan_mmap_create(name, size);
+        if (h == 0) {
+            throw new IOException("Memory-mapped region already exists or could not be created: " + name);
+        }
+        MemoryMappedFile f = new MemoryMappedFile();
+        f.handle = h;
+        f.name = name;
+        return f;
+    }
+
+    /// <summary>Opens an existing named shared-memory region. Throws
+    /// FileNotFoundException when no such region exists.</summary>
+    static MemoryMappedFile OpenExisting(string name, long size) {
+        long h = MemoryMappedFile.zan_mmap_open(name, size);
+        if (h == 0) {
+            throw new FileNotFoundException("Memory-mapped region not found: " + name);
+        }
+        MemoryMappedFile f = new MemoryMappedFile();
+        f.handle = h;
+        f.name = name;
+        return f;
+    }
+
+    /// <summary>Creates a mapping over an existing file. `size` &lt;= 0 maps
+    /// the whole file; otherwise the file is extended/truncated to `size`
+    /// bytes. The mapping is read-write and shared.</summary>
+    static MemoryMappedFile CreateFromFile(string path, long size) {
+        long h = MemoryMappedFile.zan_mmap_from_file(path, size);
+        if (h == 0) {
+            throw new FileNotFoundException("Could not map file: " + path);
+        }
+        MemoryMappedFile f = new MemoryMappedFile();
+        f.handle = h;
+        f.name = path;
+        return f;
+    }
+
+    /// <summary>Maps `size` bytes into the address space and returns the view
+    /// address. Unmap the same size when done. Returns 0 on failure.</summary>
+    nint Map(long size) {
+        return (nint)MemoryMappedFile.zan_mmap_map(this.handle, size);
+    }
+
+    /// <summary>Unmaps a view. `size` must match the mapped size.
+    /// Returns false when the view could not be unmapped.</summary>
+    bool Unmap(nint view, long size) {
+        return MemoryMappedFile.zan_mmap_unmap((long)view, size) == 1;
+    }
+
+    /// <summary>Flushes a mapped view to disk (file-backed mappings).</summary>
+    bool Flush(nint view, long size) {
+        return MemoryMappedFile.zan_mmap_flush((long)view, size) == 1;
+    }
+
+    /// <summary>Closes the mapping handle. Views mapped from it must be
+    /// unmapped first.</summary>
+    void Close() {
+        if (this.handle != 0) {
+            MemoryMappedFile.zan_mmap_close(this.handle);
+            this.handle = 0;
+        }
+    }
+}

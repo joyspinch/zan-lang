@@ -936,6 +936,28 @@ A27 的 typed result/cancellation 内容保留并与真实 frame header 对齐�
   其余候选：公共游戏运行时、实体/组件模型、资源与项目模型、解析器、渲染层。
 * **B1-3** `stdlib/Gui`（103 文件 / 1.9MB / 3.8 万行）是 UI 框架，不搬走，
   但内部模块边界需重划（见 B3-2 / B3-3）。
+* **B1-4 ✅ 已完成（2026-08-03）：System 能力补齐五模块。**
+  - `System.IO.FileInfoEx`：文件版本信息 / 图标 / MIME / 时间戳(创建/修改/访问)/
+    硬链接计数(Windows version.lib + Linux statx,其余平台空实现)。
+  - `System.IO.MemoryMappedFile`：`zan_mmap_*` C shim(`rt_sync.c`)+ Zan 封装,
+    文件映射与命名共享内存、Map/Unmap/Flush/Close,可跨进程共享。
+  - `System.Text.Pinyin`：GB2312 全部 6763 汉字 → 拼音/首字母(多音字取常用读音),
+    数据表按 4095 字节字面量上限分段嵌入。
+  - `System.Input.Background`：后台输入模拟(前台 SendInput 之外的第二种实现)。
+    `FindWindowByTitle/ByClass/FindChild` + `PostMessage`/`SendMessage` 投递
+    WM_KEYDOWN/WM_CHAR/WM_*BUTTON/WM_MOUSEWHEEL,不动真实鼠标键盘;
+    0 句柄容错返回 false;示例 `examples/input/background_demo.zan`(配合记事本)。
+  - `System.Globalization.Lunar`：公历 → 农历(1900-01-31 ~ 2100-12-31)、
+    年/月/日干支(年干支以正月初一为界、月干支以节气月为界、日干支按公历日)、
+    生肖、农历月日中文名、二十四节气(当天匹配)。年表 + 节气表由
+    lunar_python(紫金山天文台历算)导出,与它在 1900..2100 全部 **73384 天逐日核对 0 误差**。
+  - 对应 conformance：`fileinfoex_mmap` / `tryget_pinyin` / `input_background` / `lunar`,
+    determinism + leakcheck 均随 ctest 自动注册。
+  - **编译器配套修复**：① `Dictionary.TryGetValue(out T)` 补齐 lowering
+    (`builtin_api.c` 移除显式排除 + `irgen_call.c` 实现 out 参数与 ARC 处理);
+    ② `Convert.ToString(string)` 原走 `%lld` 把指针打出来,现与 `s.ToString()` 一致
+    返回字符串拷贝(`irgen_call.c`)。
+  - **后置**：`System.IO.Compression`(Deflate/GZip/Zip)本轮未做,留待后续批次。
 
 ## B2 字节缓冲：收敛 "calloc 返回 string" 的用法 〔依赖 A1〕
 

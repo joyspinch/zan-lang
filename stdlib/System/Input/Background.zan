@@ -1,0 +1,435 @@
+using System;
+using System.Threading;
+
+namespace System.Input;
+
+/// <summary>
+/// 后台输入模拟:向目标窗口的消息队列投递 WM_ 消息,不移动真实鼠标、
+/// 不占用真实键盘,用户照常操作其他程序。Windows 实现,其他平台抛
+/// PlatformNotSupportedException。
+///
+///   // 向记事本发送文本与按键(不抢焦点、不动鼠标)
+///   nint hwnd = Background.FindWindowByTitle("无标题 - 记事本");
+///   Background.SendText(hwnd, "后台输入,不影响鼠标键盘");
+///   Background.KeyPress(hwnd, Keyboard.VK("Enter"));
+///   Background.MouseClick(hwnd, Mouse.Left(), 200, 150);
+///
+/// 实现分类(前台 vs 后台):
+///   - 前台模拟(System.Input.Mouse / Keyboard):SendInput 注入,事件进入
+///     系统输入队列,会真实移动鼠标、占用键盘;
+///   - 后台模拟(本类):PostMessage 投递 WM_KEYDOWN / WM_CHAR /
+///     WM_LBUTTONDOWN 等到指定窗口。事件不进系统输入队列,目标窗口收到
+///     消息时按收到标准窗口消息处理(普通 Win32 / 控件 / UI 框架都响应)。
+///     注意:DirectInput / 低层输入的游戏通常不读窗口消息,后台模拟对它们
+///     无效;这是所有消息级注入的固有限制。
+///
+/// 窗口查找:按标题 / 类名 / 子窗口定位,坐标一律是目标窗口客户区坐标。
+/// </summary>
+class Background {
+    #if WINDOWS
+    [DllImport("user32", EntryPoint = "PostMessageW")]
+    static extern long WinPostMessage(nint hwnd, long msg, long wparam, long lparam);
+
+    [DllImport("user32", EntryPoint = "SendMessageW")]
+    static extern long WinSendMessage(nint hwnd, long msg, long wparam, long lparam);
+
+    [DllImport("user32", EntryPoint = "FindWindowW")]
+    static extern long WinFindWindow(string cls, string title);
+
+    [DllImport("user32", EntryPoint = "FindWindowExW")]
+    static extern long WinFindWindowEx(nint parent, nint after, string cls, string title);
+
+    [DllImport("user32", EntryPoint = "MapVirtualKeyW")]
+    static extern int WinMapVirtualKey(int vk, int mapType);
+
+    // WM_ 消息常量(winuser.h)。
+    static long WM_KEYDOWN() { return 0x100; }
+    static long WM_KEYUP() { return 0x101; }
+    static long WM_CHAR() { return 0x102; }
+    static long WM_MOUSEMOVE() { return 0x200; }
+    static long WM_LBUTTONDOWN() { return 0x201; }
+    static long WM_LBUTTONUP() { return 0x202; }
+    static long WM_LBUTTONDBLCLK() { return 0x203; }
+    static long WM_RBUTTONDOWN() { return 0x204; }
+    static long WM_RBUTTONUP() { return 0x205; }
+    static long WM_MBUTTONDOWN() { return 0x207; }
+    static long WM_MBUTTONUP() { return 0x208; }
+    static long WM_MOUSEWHEEL() { return 0x20A; }
+    static long WM_XBUTTONDOWN() { return 0x20B; }
+    static long WM_XBUTTONUP() { return 0x20C; }
+
+    // MAPVK_* 映射类型。
+    static int MapVkToVscEx() { return 4; }
+
+    // 修饰键按下状态(鼠标消息 wParam)。
+    static long MK_LBUTTON() { return 0x1; }
+    static long MK_RBUTTON() { return 0x2; }
+    static long MK_MBUTTON() { return 0x10; }
+    static long MK_XBUTTON1() { return 0x20; }
+    static long MK_XBUTTON2() { return 0x40; }
+    #endif
+
+    // ---- 窗口查找 ----
+
+    /// <summary>顶层窗口句柄,标题匹配(大小写不敏感,子串/全串看系统);
+    /// 0 = 未找到。标题为中文也可(内部转 UTF-16)。</summary>
+    static nint FindWindowByTitle(string title) {
+        #if WINDOWS
+        return (nint)Background.WinFindWindow(null, title);
+        #else
+        throw new PlatformNotSupportedException(
+            "Background.FindWindowByTitle is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>顶层窗口句柄,按窗口类名匹配;0 = 未找到。
+    /// 常用类名:"Notepad"、"ConsoleWindowClass"、"Chrome_WidgetWin_1"。</summary>
+    static nint FindWindowByClass(string cls) {
+        #if WINDOWS
+        return (nint)Background.WinFindWindow(cls, null);
+        #else
+        throw new PlatformNotSupportedException(
+            "Background.FindWindowByClass is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>`parent` 的直接子窗口(类名与标题都匹配才返回;传 "" 表示
+    /// 不限定该项);0 = 未找到。</summary>
+    static nint FindChild(nint parent, string cls, string title) {
+        #if WINDOWS
+        return (nint)Background.WinFindWindowEx(parent, (nint)0, cls, title);
+        #else
+        throw new PlatformNotSupportedException(
+            "Background.FindChild is not implemented on this platform");
+        #endif
+    }
+
+    // ---- 键盘(PostMessage 异步投递) ----
+
+    /// <summary>向 `hwnd` 发送按键按下(WM_KEYDOWN,带扫描码)。
+    /// 返回消息是否成功投递。</summary>
+    static bool KeyDown(nint hwnd, int vk) {
+        #if WINDOWS
+        if (hwnd == 0) { return false; }
+        return Background.Post(hwnd, Background.WM_KEYDOWN(), (long)vk,
+            Background.KeyLParam(vk, false));
+        #else
+        throw new PlatformNotSupportedException(
+            "Background.KeyDown is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>向 `hwnd` 发送按键抬起(WM_KEYUP)。</summary>
+    static bool KeyUp(nint hwnd, int vk) {
+        #if WINDOWS
+        if (hwnd == 0) { return false; }
+        return Background.Post(hwnd, Background.WM_KEYUP(), (long)vk,
+            Background.KeyLParam(vk, true));
+        #else
+        throw new PlatformNotSupportedException(
+            "Background.KeyUp is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>向 `hwnd` 发送一次按下+抬起。</summary>
+    static bool KeyPress(nint hwnd, int vk) {
+        bool a = Background.KeyDown(hwnd, vk);
+        bool b = Background.KeyUp(hwnd, vk);
+        return a && b;
+    }
+
+    /// <summary>向 `hwnd` 连续发送 `n` 次按下+抬起。</summary>
+    static bool Repeat(nint hwnd, int vk, int n) {
+        bool ok = true;
+        int i = 0;
+        while (i < n) {
+            if (!Background.KeyPress(hwnd, vk)) { ok = false; }
+            i = i + 1;
+        }
+        return ok;
+    }
+
+    /// <summary>向 `hwnd` 发送一个字符(WM_CHAR,Unicode 码点)。
+    /// 支持中文等多字节 UTF-8 字符;一次一个字符。</summary>
+    static bool SendChar(nint hwnd, string ch) {
+        #if WINDOWS
+        if (hwnd == 0) { return false; }
+        int w = Background.CharWidth(ch);
+        if (w <= 0) { return false; }
+        int cp = Keyboard.CodeOf(ch);
+        return Background.SendCodePoint(hwnd, cp);
+        #else
+        throw new PlatformNotSupportedException(
+            "Background.SendChar is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>向 `hwnd` 发送整段文本(逐字 WM_CHAR;BMP 单发,代理对拆
+    /// 两个 UTF-16 单元)。返回是否全部投递成功。</summary>
+    static bool SendText(nint hwnd, string text) {
+        #if WINDOWS
+        if (hwnd == 0) { return false; }
+        bool ok = true;
+        int i = 0;
+        while (i < text.Length) {
+            string ch = text.Substring(i, 1);
+            int w = Background.CharWidth(ch);
+            if (w <= 0) { i = i + 1; continue; }
+            if (!Background.SendCodePoint(hwnd, Keyboard.CodeOf(text.Substring(i, w)))) {
+                ok = false;
+            }
+            i = i + w;
+        }
+        return ok;
+        #else
+        throw new PlatformNotSupportedException(
+            "Background.SendText is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>后台版按键宏,语法与 Keyboard.Send 相同:花括号按键名
+    /// (修饰键保持按下直到宏结束,逆序释放)与字面文本;单字符可打印按键
+    /// 按键发,其余文本按 WM_CHAR 发。</summary>
+    static bool SendMacro(nint hwnd, string macro) {
+        #if WINDOWS
+        if (hwnd == 0) { return false; }
+        List<int> held = new List<int>();
+        bool ok = true;
+        int i = 0;
+        while (i < macro.Length) {
+            string ch = macro.Substring(i, 1);
+            if (ch == "{") {
+                int close = Background.IndexOf(macro, "}", i + 1);
+                if (close < 0) { break; }   // 未闭合花括号:停止
+                string name = macro.Substring(i + 1, close - i - 1);
+                int vk = Keyboard.VK(name);
+                if (vk != 0) {
+                    if (!Background.KeyDown(hwnd, vk)) { ok = false; }
+                    held.Add(vk);
+                }
+                i = close + 1;
+            } else if (ch == "}") {
+                i = i + 1;   // 孤立右花括号:忽略
+            } else {
+                int b = i;
+                while (b < macro.Length && macro.Substring(b, 1) != "{") {
+                    b = b + 1;
+                }
+                string text = macro.Substring(i, b - i);
+                if (text.Length == 1 && Background.IsKeyChar(text)) {
+                    if (!Background.KeyPress(hwnd, Background.CharVK(text))) { ok = false; }
+                } else if (text != "") {
+                    if (!Background.SendText(hwnd, text)) { ok = false; }
+                }
+                i = b;
+            }
+        }
+        int j = held.Count - 1;
+        while (j >= 0) {
+            if (!Background.KeyUp(hwnd, held[j])) { ok = false; }
+            j = j - 1;
+        }
+        return ok;
+        #else
+        throw new PlatformNotSupportedException(
+            "Background.SendMacro is not implemented on this platform");
+        #endif
+    }
+
+    // ---- 鼠标(PostMessage 异步投递,坐标为客户区) ----
+
+    /// <summary>向 `hwnd` 客户区坐标 (x, y) 发送鼠标移动(WM_MOUSEMOVE)。</summary>
+    static bool MouseMove(nint hwnd, int x, int y) {
+        #if WINDOWS
+        if (hwnd == 0) { return false; }
+        return Background.Post(hwnd, Background.WM_MOUSEMOVE(), 0,
+            Background.CoordLParam(x, y));
+        #else
+        throw new PlatformNotSupportedException(
+            "Background.MouseMove is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>向 `hwnd` 客户区坐标 (x, y) 发送按键按下(WM_*BUTTONDOWN)。
+    /// `button` 用 Mouse.Left()/Middle()/Right()/XButton1()/XButton2()。</summary>
+    static bool MouseDown(nint hwnd, int button, int x, int y) {
+        #if WINDOWS
+        if (hwnd == 0) { return false; }
+        long msg = Background.ButtonMsg(button, true);
+        if (msg == 0) { return false; }
+        return Background.Post(hwnd, msg, Background.ButtonWParam(button),
+            Background.CoordLParam(x, y));
+        #else
+        throw new PlatformNotSupportedException(
+            "Background.MouseDown is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>向 `hwnd` 客户区坐标 (x, y) 发送按键抬起(WM_*BUTTONUP)。</summary>
+    static bool MouseUp(nint hwnd, int button, int x, int y) {
+        #if WINDOWS
+        if (hwnd == 0) { return false; }
+        long msg = Background.ButtonMsg(button, false);
+        if (msg == 0) { return false; }
+        return Background.Post(hwnd, msg, Background.ButtonWParam(button),
+            Background.CoordLParam(x, y));
+        #else
+        throw new PlatformNotSupportedException(
+            "Background.MouseUp is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>向 `hwnd` 客户区坐标 (x, y) 发送一次按下+抬起。</summary>
+    static bool MouseClick(nint hwnd, int button, int x, int y) {
+        bool a = Background.MouseDown(hwnd, button, x, y);
+        bool b = Background.MouseUp(hwnd, button, x, y);
+        return a && b;
+    }
+
+    /// <summary>向 `hwnd` 发送滚轮(WM_MOUSEWHEEL)。`delta` 是滚动量,
+    /// 正数向上,通常 ±120 或倍数;位置可选,0,0 用当前客户区(0,0)。</summary>
+    static bool MouseWheel(nint hwnd, int delta, int x, int y) {
+        #if WINDOWS
+        if (hwnd == 0) { return false; }
+        long wparam = ((long)(delta & 0xFFFF)) << 16;
+        return Background.Post(hwnd, Background.WM_MOUSEWHEEL(), wparam,
+            Background.CoordLParam(x, y));
+        #else
+        throw new PlatformNotSupportedException(
+            "Background.MouseWheel is not implemented on this platform");
+        #endif
+    }
+
+    // ---- 同步变体(SendMessage:等待目标处理完再返回) ----
+
+    /// <summary>同步发送一次按键(按下+抬起),等待目标窗口过程处理完。
+    /// 适合需要确保目标先收到再继续的脚本;比 PostMessage 慢。</summary>
+    static bool SyncKeyPress(nint hwnd, int vk) {
+        #if WINDOWS
+        if (hwnd == 0) { return false; }
+        Background.WinSendMessage(hwnd, Background.WM_KEYDOWN(), (long)vk,
+            Background.KeyLParam(vk, false));
+        Background.WinSendMessage(hwnd, Background.WM_KEYUP(), (long)vk,
+            Background.KeyLParam(vk, true));
+        return true;
+        #else
+        throw new PlatformNotSupportedException(
+            "Background.SyncKeyPress is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>同步发送一次鼠标点击(按下+抬起),等待目标处理完。</summary>
+    static bool SyncMouseClick(nint hwnd, int button, int x, int y) {
+        #if WINDOWS
+        if (hwnd == 0) { return false; }
+        long msgD = Background.ButtonMsg(button, true);
+        long msgU = Background.ButtonMsg(button, false);
+        if (msgD == 0 || msgU == 0) { return false; }
+        Background.WinSendMessage(hwnd, msgD, Background.ButtonWParam(button),
+            Background.CoordLParam(x, y));
+        Background.WinSendMessage(hwnd, msgU, Background.ButtonWParam(button),
+            Background.CoordLParam(x, y));
+        return true;
+        #else
+        throw new PlatformNotSupportedException(
+            "Background.SyncMouseClick is not implemented on this platform");
+        #endif
+    }
+
+    // ---- 内部辅助 ----
+
+    #if WINDOWS
+    static bool Post(nint hwnd, long msg, long wparam, long lparam) {
+        return Background.WinPostMessage(hwnd, msg, wparam, lparam) != 0;
+    }
+
+    /// <summary>WM_KEYDOWN/UP 的 lParam:低位重复计数,扫描码(扩展键带
+    /// 0x100 前缀,来自 MAPVK_VK_TO_VSC_EX),抬起置位 30/31 位。</summary>
+    static long KeyLParam(int vk, bool up) {
+        int scan = Background.WinMapVirtualKey(vk, Background.MapVkToVscEx());
+        long lparam = ((long)(scan & 0xFF)) << 16;
+        if ((scan & 0x100) != 0) { lparam = lparam | 0x1000000; }
+        if (up) { lparam = lparam | (((long)1) << 30) | (((long)1) << 31); }
+        else { lparam = lparam | 1; }
+        return lparam;
+    }
+
+    /// <summary>客户区坐标 (x, y) → lParam(低 16 位 x,高 16 位 y)。</summary>
+    static long CoordLParam(int x, int y) {
+        return (((long)y & 0xFFFF) << 16) | ((long)x & 0xFFFF);
+    }
+
+    /// <summary>鼠标按钮 → WM_*BUTTONDOWN/UP 消息;未知按钮返回 0。</summary>
+    static long ButtonMsg(int button, bool down) {
+        if (button == 0) { return down ? Background.WM_LBUTTONDOWN() : Background.WM_LBUTTONUP(); }
+        if (button == 1) { return down ? Background.WM_MBUTTONDOWN() : Background.WM_MBUTTONUP(); }
+        if (button == 2) { return down ? Background.WM_RBUTTONDOWN() : Background.WM_RBUTTONUP(); }
+        if (button == 3) { return down ? Background.WM_XBUTTONDOWN() : Background.WM_XBUTTONUP(); }
+        if (button == 4) { return down ? Background.WM_XBUTTONDOWN() : Background.WM_XBUTTONUP(); }
+        return 0;
+    }
+
+    /// <summary>鼠标按钮 → 按下状态 wParam(修饰键位;X1/X2 高 16 位)。</summary>
+    static long ButtonWParam(int button) {
+        if (button == 0) { return Background.MK_LBUTTON(); }
+        if (button == 1) { return Background.MK_MBUTTON(); }
+        if (button == 2) { return Background.MK_RBUTTON(); }
+        if (button == 3) { return Background.MK_XBUTTON1() | (((long)1) << 16); }
+        if (button == 4) { return Background.MK_XBUTTON2() | (((long)2) << 16); }
+        return 0;
+    }
+
+    /// <summary>UTF-8 首字符字节宽度:ASCII 1,双字节 2,汉字 3,四字节 4。</summary>
+    static int CharWidth(string ch) {
+        if (ch.Length == 0) { return 0; }
+        nint buf = NativeMemory.Alloc(8);
+        NativeMemory.PutString(buf, 0, ch, ch.Length);
+        int c0 = new Span<byte>(buf, 4)[0];
+        NativeMemory.Free(buf);
+        if ((c0 & 0x80) == 0) { return 1; }
+        if ((c0 & 0xE0) == 0xC0) { return 2; }
+        if ((c0 & 0xF0) == 0xE0) { return 3; }
+        return 4;
+    }
+
+    /// <summary>码点 → WM_CHAR:BMP 单发,代理对拆两个 UTF-16 单元。</summary>
+    static bool SendCodePoint(nint hwnd, int cp) {
+        if (cp <= 0) { return false; }
+        if (cp <= 0xFFFF) {
+            return Background.Post(hwnd, Background.WM_CHAR(), (long)cp, 1);
+        }
+        long cu = (long)cp - 0x10000;
+        long hi = 0xD800 + (cu >> 10);
+        long lo = 0xDC00 + (cu & 0x3FF);
+        bool a = Background.Post(hwnd, Background.WM_CHAR(), hi, 1);
+        bool b = Background.Post(hwnd, Background.WM_CHAR(), lo, 1);
+        return a && b;
+    }
+
+    /// <summary>单字符是否是可打印按键(a-z/A-Z/0-9)。</summary>
+    static bool IsKeyChar(string ch) {
+        int c = Keyboard.CodeOf(ch);
+        return (c >= 0x61 && c <= 0x7A) || (c >= 0x41 && c <= 0x5A)
+            || (c >= 0x30 && c <= 0x39);
+    }
+
+    /// <summary>可打印字符 → VK(字母大写化)。</summary>
+    static int CharVK(string ch) {
+        int c = Keyboard.CodeOf(ch);
+        if (c >= 0x61 && c <= 0x7A) { return c - 0x20; }
+        return c;
+    }
+
+    /// <summary>`needle` 在 `hay` 中从 `from` 起的首次出现,无则 -1。</summary>
+    static int IndexOf(string hay, string needle, int from) {
+        int n = needle.Length;
+        int h = hay.Length;
+        int i = from;
+        while (i + n <= h) {
+            if (hay.Substring(i, n) == needle) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+    #endif
+}

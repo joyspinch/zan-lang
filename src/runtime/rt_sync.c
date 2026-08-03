@@ -1490,6 +1490,44 @@ long long zan_file_set_readonly(const char *path, int on) {
 #endif
 }
 
+/* Sets one file timestamp to a Unix timestamp. `which` matches zan_file_time:
+ * 0 = last write, 1 = creation (best-effort), 2 = last access. Returns 1 on
+ * success. Creation time is only settable on Windows; elsewhere it is a no-op
+ * that returns 0 so callers can degrade gracefully. */
+long long zan_file_set_time(const char *path, int which, long long unix_sec) {
+    if (!path || !path[0]) return 0;
+    if (which != 0 && which != 1 && which != 2) return 0;
+#ifdef _WIN32
+    HANDLE h = CreateFileA(path, FILE_WRITE_ATTRIBUTES,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                           OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    /* Unix seconds since 1970 -> 100ns ticks since 1601. */
+    unsigned long long ticks = (unsigned long long)(unix_sec + 11644473600LL)
+                             * 10000000ULL;
+    FILETIME ft;
+    ft.dwLowDateTime = (DWORD)(ticks & 0xFFFFFFFFULL);
+    ft.dwHighDateTime = (DWORD)(ticks >> 32);
+    int ok = 0;
+    if (which == 0)      ok = SetFileTime(h, NULL, NULL, &ft);
+    else if (which == 1) ok = SetFileTime(h, &ft, NULL, NULL);
+    else                 ok = SetFileTime(h, NULL, &ft, NULL);
+    CloseHandle(h);
+    return ok ? 1 : 0;
+#else
+    struct stat st;
+    if (stat(path, &st) != 0) return 0;
+    struct timespec times[2];
+    /* atime, mtime */
+    times[0].tv_sec = (which == 2) ? unix_sec : st.st_atime;
+    times[0].tv_nsec = 0;
+    times[1].tv_sec = (which == 0) ? unix_sec : st.st_mtime;
+    times[1].tv_nsec = 0;
+    if (which == 1) return 0;   /* creation time: not settable on POSIX */
+    return utimensat(AT_FDCWD, path, times, 0) == 0 ? 1 : 0;
+#endif
+}
+
 /* ---- file handles (System.IO.FileStream) ---------------------------------
  * FILE*-based stream IO with 64-bit offsets, exposed as an opaque handle so
  * zan code never spells FILE* (its size and the width of fseek's offset both
@@ -1559,3 +1597,186 @@ long long zan_file_eof(long long handle) {
     if (!f) return 1;
     return feof(f) ? 1 : 0;
 }
+
+/* ---- memory-mapped files (System.IO.MemoryMappedFile) -------------------
+ * A handle is an opaque 64-bit value: on Windows a HANDLE to a file mapping
+ * object, on POSIX a heap pointer to a small struct holding the shm/fd pair.
+ * 0 means failure. `map` returns the view address (0 on failure); `unmap`
+ * must be called with the same size that was mapped.
+ */
+#ifdef _WIN32
+typedef struct {
+    HANDLE h;
+} zan_mmap_handle;
+#else
+typedef struct {
+    int fd;
+    char name[64];   /* shm name (kept for shm_unlink), or "" for file-backed */
+} zan_mmap_handle;
+#endif
+
+/* Creates a NEW named shared-memory region of `size` bytes. Fails (returns 0)
+ * when a region with the same name already exists. `name` may include a
+ * leading "Global\\" or "Local\\" prefix (Windows). */
+long long zan_mmap_create(const char *name, long long size) {
+    if (!name || !name[0] || size <= 0) return 0;
+#ifdef _WIN32
+    DWORD hi = (DWORD)(((unsigned long long)size) >> 32);
+    DWORD lo = (DWORD)((unsigned long long)size & 0xFFFFFFFFULL);
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, name, -1, NULL, 0);
+    wchar_t *wname = (wchar_t *)calloc((size_t)wlen, sizeof(wchar_t));
+    if (!wname) return 0;
+    MultiByteToWideChar(CP_UTF8, 0, name, -1, wname, wlen);
+    HANDLE named = CreateFileMappingW(
+        INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, hi, lo, wname);
+    free(wname);
+    if (!named) return 0;
+    if (GetLastError() == ERROR_ALREADY_EXISTS) {
+        CloseHandle(named);
+        return 0;
+    }
+    return (long long)(intptr_t)named;
+#else
+    char shm_name[96];
+    snprintf(shm_name, sizeof(shm_name), "/%s", name);
+    int fd = shm_open(shm_name, O_CREAT | O_EXCL | O_RDWR, 0600);
+    if (fd < 0) return 0;
+    if (ftruncate(fd, (off_t)size) != 0) {
+        shm_unlink(shm_name);
+        close(fd);
+        return 0;
+    }
+    zan_mmap_handle *h = (zan_mmap_handle *)calloc(1, sizeof(zan_mmap_handle));
+    if (!h) { shm_unlink(shm_name); close(fd); return 0; }
+    h->fd = fd;
+    snprintf(h->name, sizeof(h->name), "%s", shm_name);
+    return (long long)(intptr_t)h;
+#endif
+}
+
+/* Opens an EXISTING named shared-memory region. Returns 0 when it does not
+ * exist or `size` is nonzero and does not match the region. */
+long long zan_mmap_open(const char *name, long long size) {
+    if (!name || !name[0]) return 0;
+#ifdef _WIN32
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, name, -1, NULL, 0);
+    wchar_t *wname = (wchar_t *)calloc((size_t)wlen, sizeof(wchar_t));
+    if (!wname) return 0;
+    MultiByteToWideChar(CP_UTF8, 0, name, -1, wname, wlen);
+    HANDLE h = OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE, wname);
+    free(wname);
+    if (!h) return 0;
+    return (long long)(intptr_t)h;
+#else
+    char shm_name[96];
+    snprintf(shm_name, sizeof(shm_name), "/%s", name);
+    int fd = shm_open(shm_name, O_RDWR, 0600);
+    if (fd < 0) return 0;
+    if (size > 0) {
+        struct stat st;
+        if (fstat(fd, &st) != 0 || st.st_size != size) {
+            close(fd);
+            return 0;
+        }
+    }
+    zan_mmap_handle *h = (zan_mmap_handle *)calloc(1, sizeof(zan_mmap_handle));
+    if (!h) { close(fd); return 0; }
+    h->fd = fd;
+    snprintf(h->name, sizeof(h->name), "%s", shm_name);
+    return (long long)(intptr_t)h;
+#endif
+}
+
+/* Creates a mapping over an existing FILE. `size` <= 0 maps the whole file.
+ * The view is read-write; writes are visible to other mappers of the same
+ * file (MAP_SHARED). */
+long long zan_mmap_from_file(const char *path, long long size) {
+    if (!path || !path[0]) return 0;
+#ifdef _WIN32
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, path, -1, NULL, 0);
+    wchar_t *wpath = (wchar_t *)calloc((size_t)wlen, sizeof(wchar_t));
+    if (!wpath) return 0;
+    MultiByteToWideChar(CP_UTF8, 0, path, -1, wpath, wlen);
+    HANDLE fh = CreateFileW(wpath, GENERIC_READ | GENERIC_WRITE,
+                            FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    free(wpath);
+    if (fh == INVALID_HANDLE_VALUE) return 0;
+    DWORD hi = 0, lo = 0;
+    if (size > 0) {
+        hi = (DWORD)(((unsigned long long)size) >> 32);
+        lo = (DWORD)((unsigned long long)size & 0xFFFFFFFFULL);
+    }
+    HANDLE h = CreateFileMappingW(fh, NULL, PAGE_READWRITE, hi, lo, NULL);
+    CloseHandle(fh);
+    if (!h) return 0;
+    return (long long)(intptr_t)h;
+#else
+    int fd = open(path, O_RDWR);
+    if (fd < 0) return 0;
+    if (size > 0) {
+        if (ftruncate(fd, (off_t)size) != 0) { close(fd); return 0; }
+    }
+    zan_mmap_handle *h = (zan_mmap_handle *)calloc(1, sizeof(zan_mmap_handle));
+    if (!h) { close(fd); return 0; }
+    h->fd = fd;
+    h->name[0] = '\0';
+    return (long long)(intptr_t)h;
+#endif
+}
+
+/* Maps `size` bytes of the region into the address space. Returns the view
+ * address, or 0 on failure. */
+long long zan_mmap_map(long long handle, long long size) {
+    if (!handle || size <= 0) return 0;
+#ifdef _WIN32
+    HANDLE h = (HANDLE)(intptr_t)handle;
+    DWORD hi = (DWORD)(((unsigned long long)size) >> 32);
+    DWORD lo = (DWORD)((unsigned long long)size & 0xFFFFFFFFULL);
+    void *p = MapViewOfFile(h, FILE_MAP_ALL_ACCESS, 0, 0, size);
+    return p ? (long long)(intptr_t)p : 0;
+#else
+    zan_mmap_handle *h = (zan_mmap_handle *)(intptr_t)handle;
+    void *p = mmap(NULL, (size_t)size, PROT_READ | PROT_WRITE, MAP_SHARED,
+                   h->fd, 0);
+    if (p == MAP_FAILED) return 0;
+    return (long long)(intptr_t)p;
+#endif
+}
+
+/* Unmaps a view returned by zan_mmap_map. `size` must match the mapped size. */
+long long zan_mmap_unmap(long long ptr, long long size) {
+    if (!ptr) return 0;
+#ifdef _WIN32
+    return UnmapViewOfFile((void *)(intptr_t)ptr) ? 1 : 0;
+#else
+    return munmap((void *)(intptr_t)ptr, (size_t)size) == 0 ? 1 : 0;
+#endif
+}
+
+/* Flushes a mapped view to disk (no-op for shm on Windows). */
+long long zan_mmap_flush(long long ptr, long long size) {
+    if (!ptr) return 1;
+#ifdef _WIN32
+    return FlushViewOfFile((void *)(intptr_t)ptr, (size_t)size) ? 1 : 0;
+#else
+    return msync((void *)(intptr_t)ptr, (size_t)size, MS_SYNC) == 0 ? 1 : 0;
+#endif
+}
+
+/* Closes the mapping handle. Named POSIX regions are unlinked when the
+ * creator closes, so the name stops resolving for new openers. */
+long long zan_mmap_close(long long handle) {
+    if (!handle) return 0;
+#ifdef _WIN32
+    HANDLE h = (HANDLE)(intptr_t)handle;
+    return CloseHandle(h) ? 1 : 0;
+#else
+    zan_mmap_handle *h = (zan_mmap_handle *)(intptr_t)handle;
+    close(h->fd);
+    if (h->name[0]) shm_unlink(h->name);
+    free(h);
+    return 1;
+#endif
+}
+

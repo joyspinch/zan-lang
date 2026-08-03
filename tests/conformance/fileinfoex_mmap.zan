@@ -1,0 +1,108 @@
+using System;
+using System.IO;
+
+/// System.IO.FileInfoEx + System.IO.MemoryMappedFile conformance:
+/// MIME guessing, timestamp write+read, hard links, named shared-memory
+/// roundtrip (create/open/map/unmap/close), duplicate-create guard and
+/// file-backed mapping with Flush persistence. Output is platform-independent
+/// (Windows-only version/icon probes are skipped off Windows).
+class Program {
+    static int bad;
+
+    static void Check(bool ok, string label) {
+        if (!ok) { Console.WriteLine("FAIL " + label); bad = bad + 1; }
+    }
+
+    static void Main() {
+        // ---- MIME guessing ----
+        Check(FileInfoEx.Mime("a.zip") == "application/zip", "mime zip");
+        Check(FileInfoEx.Mime("b.PNG") == "image/png", "mime png case");
+        Check(FileInfoEx.Mime("c.unknownxyz") == "application/octet-stream", "mime fallback");
+        Check(FileInfoEx.Mime("noext") == "application/octet-stream", "mime no ext");
+        Check(FileInfoEx.Mime("d.tar.gz") == "application/gzip", "mime last ext");
+        Check(FileInfoEx.Mime("e.md") == "text/markdown", "mime md");
+        Check(FileInfoEx.Mime("f.json") == "application/json", "mime json");
+
+        // ---- timestamp write + read ----
+        string probe = "_scratch/fiex_t.bin";
+        File.WriteAllText(probe, "hello");
+        long setTo = 1700000000;
+        Check(FileInfoEx.SetLastWriteTime(probe, setTo), "set mtime");
+        long diff = FileInfoEx.GetLastWriteTime(probe) - setTo;
+        if (diff < 0) { diff = -diff; }
+        Check(diff <= 2, "mtime roundtrip");
+        File.Delete(probe);
+
+        // ---- hard link ----
+        string src = "_scratch/fiex_hs.txt";
+        string lnk = "_scratch/fiex_hl.txt";
+        File.Delete(lnk);
+        File.WriteAllText(src, "linked");
+        bool created = FileInfoEx.CreateHardLink(lnk, src);
+        if (created) {
+            Check(File.ReadAllText(lnk) == "linked", "hardlink read");
+            File.Delete(lnk);
+        }
+        File.Delete(src);
+
+        // ---- Windows-only version/icon: exercise but never assert ----
+        string ver = FileInfoEx.Version("build/zanc.exe");
+        Check(ver.Length == 0 || ver.IndexOf(".") > 0, "version shape");
+        nint icon = FileInfoEx.Icon("build/zanc.exe");
+        if (icon != 0) { FileInfoEx.DestroyIcon(icon); }
+
+        // ---- named shared memory roundtrip ----
+        string region = "ZanConfMmap_A";
+        MemoryMappedFile mmf = MemoryMappedFile.CreateNew(region, 4096);
+        nint view = mmf.Map(4096);
+        Check(view != 0, "map");
+        Span<int> words = new Span<int>(view, 1024);
+        words[0] = 42; words[1] = 100; words[2] = -7;
+        Check(mmf.Unmap(view, 4096), "unmap");
+        MemoryMappedFile mmf2 = MemoryMappedFile.OpenExisting(region, 4096);
+        nint view2 = mmf2.Map(4096);
+        Span<int> words2 = new Span<int>(view2, 1024);
+        Check(words2[0] == 42 && words2[1] == 100 && words2[2] == -7, "shared readback");
+        words2[3] = 999;
+        mmf2.Unmap(view2, 4096);
+        mmf2.Close();
+        mmf.Close();
+
+        // ---- duplicate create must fail ----
+        MemoryMappedFile mmf3 = MemoryMappedFile.CreateNew("ZanConfMmap_B", 64);
+        bool dupFailed = false;
+        try {
+            MemoryMappedFile mmf4 = MemoryMappedFile.CreateNew("ZanConfMmap_B", 64);
+            mmf4.Close();
+        } catch (IOException e) {
+            dupFailed = true;
+        }
+        Check(dupFailed, "dup create guard");
+        mmf3.Close();
+
+        // ---- file-backed mapping with flush persistence ----
+        string fpath = "_scratch/fiex_mm.bin";
+        File.WriteAllText(fpath, "0123456789");
+        MemoryMappedFile fm = MemoryMappedFile.CreateFromFile(fpath, 0);
+        nint fv = fm.Map(10);
+        Check(fv != 0, "file map");
+        if (fv != 0) {
+            Span<byte> fb = new Span<byte>(fv, 10);
+            bool okData = true;
+            int i = 0;
+            while (i < 10) {
+                if (fb[i] != (byte)('0' + i)) { okData = false; }
+                i = i + 1;
+            }
+            Check(okData, "file map data");
+            fb[0] = (byte)'X';
+            Check(fm.Flush(fv, 10), "flush");
+            Check(fm.Unmap(fv, 10), "file unmap");
+            Check(File.ReadAllText(fpath).Substring(0, 1) == "X", "file map persist");
+        }
+        fm.Close();
+        File.Delete(fpath);
+
+        Console.WriteLine("fileinfoex-mmap-ok: " + Convert.ToString(bad == 0 ? 1 : 0));
+    }
+}

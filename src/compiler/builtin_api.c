@@ -2,9 +2,10 @@
  *
  * Every entry below was verified by compiling and running a call to it; members
  * that compiled but produced a wrong result (string.PadLeft, List.Sort,
- * Dictionary.TryGetValue, StringBuilder.Clear, ...) are deliberately absent so
- * they either resolve to a standard-library extension method or fail to
- * compile. */
+ * StringBuilder.Clear, ...) are deliberately absent so they either resolve to a
+ * standard-library extension method or fail to compile. Dictionary.TryGetValue
+ * is present: irgen_call.c lowers it to a hash probe + conditional store into
+ * the out parameter (see the Dict method block there). */
 
 #include "builtin_api.h"
 
@@ -47,6 +48,7 @@ static const zan_builtin_member_t members_dict[] = {
     { "Remove",      'M', "void Remove(K key)" },
     { "Clear",       'M', "void Clear()" },
     { "ContainsKey", 'M', "bool ContainsKey(K key)" },
+    { "TryGetValue", 'M', "bool TryGetValue(K key, out V value)" },
 };
 
 static const zan_builtin_member_t members_sb[] = {

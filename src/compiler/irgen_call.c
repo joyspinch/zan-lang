@@ -1024,6 +1024,26 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                         LLVMValueRef arg = emit_expr(g, expr->call.args.items[0], locals);
                         LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
                         LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+                        if (LLVMGetTypeKind(LLVMTypeOf(arg)) == LLVMPointerTypeKind) {
+                            /* string receiver: return an owned copy, exactly
+                             * like `s.ToString()` (the numeric branch below
+                             * would format the pointer with %lld). */
+                            LLVMTypeRef strlen_ty = LLVMFunctionType(i64,
+                                (LLVMTypeRef[]){ i8ptr }, 1, 0);
+                            LLVMTypeRef memcpy_ty = LLVMFunctionType(i8ptr,
+                                (LLVMTypeRef[]){ i8ptr, i8ptr, i64 }, 3, 0);
+                            LLVMValueRef memcpy_fn = get_libc_fn(g, "memcpy", memcpy_ty);
+                            LLVMValueRef n = zan_call2(g->builder, strlen_ty,
+                                g->fn_strlen, &arg, 1, "n");
+                            LLVMValueRef bufsz = zan_add(g->builder, n,
+                                LLVMConstInt(i64, 1, 0), "bsz");
+                            LLVMValueRef buf = emit_string_alloc_rc(g, bufsz);
+                            LLVMValueRef mcargs[] = { buf, arg, bufsz };
+                            zan_call2(g->builder, memcpy_ty, memcpy_fn, mcargs, 3, "");
+                            emit_release_owned_call_temp(
+                                g, expr->call.args.items[0], arg, locals);
+                            return buf;
+                        }
                         /* allocate buffer and sprintf */
                         LLVMValueRef buf_size = LLVMConstInt(i64, 32, 0);
                         LLVMValueRef buf = emit_string_alloc_rc(g, buf_size);
@@ -2889,6 +2909,52 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                         LLVMValueRef hit = zan_icmp(g->builder, LLVMIntSGE, found,
                             LLVMConstInt(i64, 0, 0), "ckhit");
                         return LLVMBuildZExt(g->builder, hit, i32t, "ckres");
+                    }
+                    if (mname.len == 11 && memcmp(mname.str, "TryGetValue", 11) == 0 && expr->call.args.count == 2) {
+                        /* bool TryGetValue(K key, out V value): probe for the
+                         * key; on a hit store a RETAINED copy of the value into
+                         * the out slot (the caller owns it) and return true,
+                         * otherwise leave the slot untouched and return false. */
+                        LLVMValueRef search = coerce_dict_key(g,
+                            emit_expr(g, expr->call.args.items[0], locals),
+                            dict_key_type(g, dict_type));
+                        LLVMValueRef found = emit_dict_find(g, dict_type, raw, search);
+                        LLVMValueRef hit = zan_icmp(g->builder, LLVMIntSGE, found,
+                            LLVMConstInt(i64, 0, 0), "tgv.hit");
+                        zan_ast_node_t *out_arg = expr->call.args.items[1];
+                        LLVMValueRef out_ptr = NULL;
+                        if (out_arg->kind == AST_REF_ARG) {
+                            out_ptr = emit_expr(g, out_arg, locals);
+                        } else if (out_arg->kind == AST_IDENTIFIER) {
+                            local_var_t *ol = local_find(locals, out_arg->ident.name);
+                            if (ol) { out_ptr = ol->alloca; }
+                        }
+                        zan_type_t *value_type = dict_value_type(dict_type);
+                        LLVMTypeRef value_llvm = value_type ? map_type(g, value_type) : i64;
+                        LLVMValueRef res_a = emit_entry_alloca(g, i32t, "tgv.res");
+                        LLVMBasicBlockRef hit_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "tgv.hitbb");
+                        LLVMBasicBlockRef miss_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "tgv.miss");
+                        LLVMBasicBlockRef done_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "tgv.done");
+                        LLVMBuildCondBr(g->builder, hit, hit_bb, miss_bb);
+                        LLVMPositionBuilderAtEnd(g->builder, hit_bb);
+                        LLVMValueRef vp = LLVMBuildStructGEP2(g->builder, g->dict_struct_type, dp, 3, "vp");
+                        LLVMValueRef vs = LLVMBuildLoad2(g->builder, LLVMPointerType(i64, 0), vp, "vs");
+                        LLVMValueRef word = zan_mul(g->builder, found,
+                            load_dict_value_words(g, raw), "tgv.word");
+                        LLVMValueRef vslot = LLVMBuildGEP2(g->builder, i64, vs,
+                            &word, 1, "tgv.vsl");
+                        LLVMValueRef vv = load_collection_slot_value(g, value_type, vslot);
+                        if (value_type && is_rc_managed_type(value_type)) {
+                            emit_rc_retain_for_type(g, value_type, vv);
+                        }
+                        if (out_ptr) { zan_store_fit(g, vv, out_ptr); }
+                        LLVMBuildStore(g->builder, LLVMConstInt(i32t, 1, 0), res_a);
+                        LLVMBuildBr(g->builder, done_bb);
+                        LLVMPositionBuilderAtEnd(g->builder, miss_bb);
+                        LLVMBuildStore(g->builder, LLVMConstInt(i32t, 0, 0), res_a);
+                        LLVMBuildBr(g->builder, done_bb);
+                        LLVMPositionBuilderAtEnd(g->builder, done_bb);
+                        return LLVMBuildLoad2(g->builder, i32t, res_a, "tgv.out");
                     }
                     if (mname.len == 5 && memcmp(mname.str, "Clear", 5) == 0 && expr->call.args.count == 0) {
                         LLVMValueRef cntp = LLVMBuildStructGEP2(g->builder, g->dict_struct_type, dp, 0, "cntp");

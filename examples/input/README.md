@@ -5,7 +5,17 @@
 
 ## System.Input — 输入模拟
 
-Windows 通过 `SendInput` 注入(与物理设备同路径,远程会话/提权窗口也生效)。
+Windows 上的输入模拟按实现方式分两类,都在 `System.Input` 下:
+
+| 分类 | 原理 | 影响 | 适用 |
+| --- | --- | --- | --- |
+| 前台模拟 `Mouse` / `Keyboard` | `SendInput` 注入,与物理设备同路径 | 真实移动鼠标、占用键盘,需要目标处于前台 | 游戏、DirectInput 程序、远程会话 |
+| 后台模拟 `Background` | `PostMessage`/`SendMessage` 向指定窗口投递 WM_ 消息 | 不动真实鼠标、不占真实键盘,可边运行边用电脑 | 普通 Win32 / UI 框架程序(记事本、浏览器、聊天工具...) |
+
+后台模拟的局限:消息级注入只对"读窗口消息"的程序生效,DirectInput 类
+游戏通常不读窗口消息,对它们无效。
+
+### 前台模拟(SendInput)
 
 | 模块 | 内容 |
 | --- | --- |
@@ -14,16 +24,24 @@ Windows 通过 `SendInput` 注入(与物理设备同路径,远程会话/提权�
 | `System.Input.Hook` | 全局低级键盘/鼠标钩子(`InstallKeyboard/InstallMouse/Uninstall`),回调返回 true 可吞掉事件 |
 | `System.Input.Hotkey` | 全局热键(`Register("Ctrl+Shift+A", cb)` / `Unregister`) |
 
-### 示例(交互式,会真实移动鼠标/输入!)
+### 后台模拟(消息级,不影响鼠标键盘)
 
-- `mouse_demo.zan` — 移动、点击、双击、拖拽、滚轮
-- `keyboard_demo.zan` — 按键宏、Unicode 文本、修饰键组合、锁键状态
+| 模块 | 内容 |
+| --- | --- |
+| `System.Input.Background` | 窗口查找(`FindWindowByTitle/ByClass/FindChild`);后台键盘(`KeyDown/Up/Press/Repeat`、`SendChar/SendText/SendMacro`);后台鼠标(`MouseMove/Down/Up/Click/Wheel`,客户区坐标);同步变体(`SyncKeyPress/SyncMouseClick`,SendMessage 等目标处理完) |
 
-运行前请把焦点放到草稿窗口,避免误操作正在使用的程序。
+### 示例
+
+- 前台(交互式,会真实移动鼠标/输入!):`mouse_demo.zan` — 移动、点击、
+  双击、拖拽、滚轮;`keyboard_demo.zan` — 按键宏、Unicode 文本、修饰键
+  组合、锁键状态。运行前请把焦点放到草稿窗口,避免误操作正在使用的程序。
+- 后台(安全,不抢焦点):`background_demo.zan` — 打开记事本后运行,向
+  记事本后台发送文本、按键宏、鼠标点击与滚轮,期间你的鼠标键盘不受影响。
 
 ```bash
 build/zanc examples/input/mouse_demo.zan --auto-stdlib -o build/mouse_demo.exe
-build/mouse_demo.exe
+build/zanc examples/input/background_demo.zan --auto-stdlib -o build/background_demo.exe
+build/background_demo.exe
 ```
 
 ### 按键宏语法
@@ -70,6 +88,7 @@ build/sysinfo_demo.exe
 - `tests/conformance/input_keyboard_vk.zan` — VK 名称表往返(纯函数,全平台)
 - `tests/conformance/input_mouse_pos.zan` — 鼠标位置只读查询(Windows 实测)
 - `tests/conformance/input_hook_hotkey.zan` — 钩子/热键安装与卸载生命周期(Windows 实测)
+- `tests/conformance/input_background.zan` — 后台模拟:窗口查找/0 句柄容错/桌面窗口 PostMessage 链路(Windows 实测)
 - `tests/conformance/management_smoke.zan` — 信息族结构不变量(Windows 实测)
 - `tests/conformance/process_list_smoke.zan` — 进程枚举与自身详情(Windows 实测)
 - `tests/conformance/registry_roundtrip.zan` — 注册表读写往返(临时键,测完删除)
