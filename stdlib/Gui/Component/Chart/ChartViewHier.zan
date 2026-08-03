@@ -705,6 +705,9 @@ partial class ChartView {
         if (leaves < 1) { leaves = 1; }
         if (depth < 1) { depth = 1; }
 
+        int panId = app.focus.AllocId();
+        app.hitTester.Register(HitRegion.Create(panId, ax, ay, aw, ah, 2));
+
         int labelWidth = ChartView.TreeLabelWidth(root, t.fontSizeSmall);
         int labelHeight = Canvas.FontHeight(t.fontSizeSmall);
         int leafGap = labelHeight + app.Scale(16);
@@ -715,10 +718,58 @@ partial class ChartView {
         }
         if (leafGap < app.Scale(40)) { leafGap = app.Scale(40); }
         if (levelGap < app.Scale(48)) { levelGap = app.Scale(48); }
-        int contentSpan = leaves * leafGap;
-        int contentDepth = (depth + 1) * levelGap + app.Scale(8);
+
         int spanLen = horiz ? ah : aw;
         int depLen = horiz ? aw : ah;
+
+        // Zoom: the wheel scales node spacing (and the label size with it), so a
+        // tree that does not fit can be pulled together instead of only being
+        // dragged around. Unset zoom fits the whole tree, which is what a tree
+        // is expected to open as -- panning is then a choice, not the only way
+        // to see the rest of it.
+        int zoom = app.StateGet(Chart.TreeZoomKey(o.iwid), 0);
+        if (zoom == 0) {
+            zoom = 100;
+            int natSpan = leaves * leafGap;
+            int natDepth = (depth + 1) * levelGap + app.Scale(8);
+            if (natSpan > spanLen) { zoom = spanLen * 100 / natSpan; }
+            int depZoom = 100;
+            if (natDepth > depLen) { depZoom = depLen * 100 / natDepth; }
+            if (depZoom < zoom) { zoom = depZoom; }
+            if (zoom < 25) { zoom = 25; }
+            app.StateSet(Chart.TreeZoomKey(o.iwid), zoom);
+        }
+        if (Ui.Wheeled(app, panId)) {
+            int notches = Ui.WheelDelta(app);
+            int next = zoom;
+            int steps = notches;
+            while (steps > 0) { next = next * 115 / 100; steps = steps - 1; }
+            while (steps < 0) { next = next * 100 / 115; steps = steps + 1; }
+            if (next < 20) { next = 20; }
+            if (next > 400) { next = 400; }
+            if (next != zoom) {
+                // Keep the content under the cursor put, so zooming reads as
+                // scaling the tree rather than jumping to another part of it.
+                int oldPanX = app.StateGet(Chart.TreePanXKey(o.iwid), 0);
+                int oldPanY = app.StateGet(Chart.TreePanYKey(o.iwid), 0);
+                int anchorX = app.mouseX - ax + oldPanX;
+                int anchorY = app.mouseY - ay + oldPanY;
+                app.StateSet(Chart.TreePanXKey(o.iwid),
+                    anchorX * next / zoom - (app.mouseX - ax));
+                app.StateSet(Chart.TreePanYKey(o.iwid),
+                    anchorY * next / zoom - (app.mouseY - ay));
+                zoom = next;
+                app.StateSet(Chart.TreeZoomKey(o.iwid), zoom);
+            }
+            app.RequestRedraw();
+        }
+        leafGap = leafGap * zoom / 100;
+        levelGap = levelGap * zoom / 100;
+        if (leafGap < app.Scale(6)) { leafGap = app.Scale(6); }
+        if (levelGap < app.Scale(8)) { levelGap = app.Scale(8); }
+
+        int contentSpan = leaves * leafGap;
+        int contentDepth = (depth + 1) * levelGap + app.Scale(8);
         if (contentSpan < spanLen) { contentSpan = spanLen; }
         if (contentDepth < depLen) { contentDepth = depLen; }
 
@@ -735,8 +786,6 @@ partial class ChartView {
         app.StateSet(Chart.TreePanXKey(o.iwid), panX);
         app.StateSet(Chart.TreePanYKey(o.iwid), panY);
 
-        int panId = app.focus.AllocId();
-        app.hitTester.Register(HitRegion.Create(panId, ax, ay, aw, ah, 2));
         if (Ui.PressedDown(app, panId) && app.window.EventButton() == 0) {
             app.StateSet(Chart.TreeDragXKey(o.iwid), app.mouseX);
             app.StateSet(Chart.TreeDragYKey(o.iwid), app.mouseY);
@@ -777,7 +826,9 @@ partial class ChartView {
         List<TreeLayoutNode> layout = new List<TreeLayoutNode>();
         ChartView.TreeAssign(root, 0, 0, layout);
 
-        int rad = app.Scale(4);
+        int rad = app.Scale(4) * zoom / 100;
+        if (rad > app.Scale(4)) { rad = app.Scale(4); }
+        if (rad < 2) { rad = 2; }
         int lvlH = depG / (depth + 1);
         int col = 0;
         if (lead != null) { col = lead.color; }
@@ -834,7 +885,9 @@ partial class ChartView {
             int nx = horiz ? depG0 + d : spanG0 + span;
             int ny = horiz ? spanG0 + span : depG0 + d;
             c.FillCircle(nx, ny, rad, col);
-            int fs = t.fontSizeSmall;
+            int fs = t.fontSizeSmall * zoom / 100;
+            if (fs > t.fontSizeSmall) { fs = t.fontSizeSmall; }
+            if (fs < app.Scale(7)) { fs = app.Scale(7); }
             string lbl = n.name;
             if (n.children.Count == 0 && n.val > 0) {
                 lbl = n.name + " " + Convert.ToString(n.val);

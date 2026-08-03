@@ -70,6 +70,15 @@ try {
     & powershell -ExecutionPolicy Bypass -File scripts\scan_components.ps1 `
         -Source src\ide_zan\components -Out stdlib\Gui\CustomComponents.zan
     if ($LASTEXITCODE -ne 0) { throw "SCAN_FAILED" }
+    # An empty registry links fine and fails only at runtime: UiDoc.Make falls
+    # back to a blank Panel for every `type` it cannot resolve, so each UiDoc
+    # window silently loses its WindowShell title bar, its cards and the whole
+    # docs page while the hand-drawn dialogs still look right. Refuse to ship
+    # that build instead of leaving it to be spotted on screen.
+    $registryText = [System.IO.File]::ReadAllText($registryPath)
+    $componentCount = ([regex]::Matches($registryText, 'k\.Add\(')).Count
+    if ($componentCount -lt 1) { throw "SCAN_EMPTY_REGISTRY" }
+    Write-Output "COMPONENT_REGISTRY_OK count=$componentCount"
 
     $files = @()
     # The GUI stdlib is namespaced across subfolders (Gui root + Widget /
