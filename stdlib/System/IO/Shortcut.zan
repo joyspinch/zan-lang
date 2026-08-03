@@ -1,0 +1,186 @@
+using System;
+using System.IO;
+
+namespace System.IO;
+
+/// <summary>Structured .lnk content returned by
+/// <see cref="Shortcut.Read"/>.</summary>
+class ShortcutInfo {
+    public string target;
+    public string arguments;
+    public string workingDir;
+    public string description;
+    public string iconPath;
+    public int iconIndex;
+
+    static ShortcutInfo Create() {
+        ShortcutInfo s = new ShortcutInfo();
+        s.target = "";
+        s.arguments = "";
+        s.workingDir = "";
+        s.description = "";
+        s.iconPath = "";
+        s.iconIndex = 0;
+        return s;
+    }
+}
+
+/// <summary>
+/// Creates and parses Windows .lnk shortcuts through the IShellLink COM
+/// interface: target path, arguments, working directory, description and
+/// icon. Windows-only; other platforms throw PlatformNotSupportedException.
+///
+///   Shortcut.Create("C:\\Users\\me\\Desktop\\app.lnk",
+///                   "C:\\app\\app.exe", "--fast", "C:\\app",
+///                   "C:\\app\\app.exe", 0);
+///   ShortcutInfo info = Shortcut.Read("app.lnk");
+///   string t = info.target;
+/// </summary>
+class Shortcut {
+    // CLSID_ShellLink / IID_IShellLinkW / IID_IPersistFile
+    static string ClsidShellLink() { return "00021401-0000-0000-C000-000000000046"; }
+    static string IidShellLinkW() { return "000214F9-0000-0000-C000-000000000046"; }
+    static string IidPersistFile() { return "0000010b-0000-0000-C000-000000000046"; }
+
+    // IShellLinkW vtable slots (after IUnknown 0..2).
+    static int SlotGetPath() { return 3; }
+    static int SlotGetDescription() { return 6; }
+    static int SlotSetDescription() { return 7; }
+    static int SlotGetWorkingDir() { return 8; }
+    static int SlotSetWorkingDir() { return 9; }
+    static int SlotGetArguments() { return 10; }
+    static int SlotSetArguments() { return 11; }
+    static int SlotGetIconLocation() { return 16; }
+    static int SlotSetIconLocation() { return 17; }
+    static int SlotSetPath() { return 20; }
+
+    // IPersistFile vtable slots.
+    static int SlotLoad() { return 5; }
+    static int SlotSave() { return 6; }
+
+    static bool comReady = false;
+
+    static void InitCom() {
+        if (Shortcut.comReady) { return; }
+        Com.Initialize();
+        Shortcut.comReady = true;
+    }
+
+    /// <summary>Creates (or overwrites) a .lnk at `lnkPath` pointing at
+    /// `target`. Optional: arguments, working directory, icon path +
+    /// icon index, description. True on success.</summary>
+    static bool Create(string lnkPath, string target, string arguments,
+                       string workingDir, string iconPath, int iconIndex,
+                       string description) {
+        #if WINDOWS
+        Shortcut.InitCom();
+        nint shell = Com.Create(Shortcut.ClsidShellLink(), Shortcut.IidShellLinkW());
+        if (shell == 0) { return false; }
+        nint persist = Com.Query(shell, Shortcut.IidPersistFile());
+        bool ok = false;
+        if (persist != 0) {
+            nint wt = Wide.Of(target);
+            int hr1 = Com.Call1(shell, Shortcut.SlotSetPath(), wt);
+            Wide.Free(wt);
+            nint wa = Wide.Of(arguments);
+            Com.Call1(shell, Shortcut.SlotSetArguments(), wa);
+            Wide.Free(wa);
+            nint wd = Wide.Of(workingDir);
+            Com.Call1(shell, Shortcut.SlotSetWorkingDir(), wd);
+            Wide.Free(wd);
+            nint wdesc = Wide.Of(description);
+            Com.Call1(shell, Shortcut.SlotSetDescription(), wdesc);
+            Wide.Free(wdesc);
+            if (iconPath.Length > 0) {
+                nint wi = Wide.Of(iconPath);
+                Com.Call2(shell, Shortcut.SlotSetIconLocation(), wi, iconIndex);
+                Wide.Free(wi);
+            }
+            nint wpath = Wide.Of(lnkPath);
+            int hr = Com.Call2(persist, Shortcut.SlotSave(), wpath, 1);
+            Wide.Free(wpath);
+            ok = Com.Ok(hr) && Com.Ok(hr1);
+            Com.Release(persist);
+        }
+        Com.Release(shell);
+        return ok;
+        #else
+        throw new PlatformNotSupportedException(
+            "Shortcut is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>Parses a .lnk file. Fields that the shortcut does not
+    /// define come back empty (iconIndex 0).</summary>
+    static ShortcutInfo Read(string lnkPath) {
+        ShortcutInfo info = ShortcutInfo.Create();
+        #if WINDOWS
+        Shortcut.InitCom();
+        nint shell = Com.Create(Shortcut.ClsidShellLink(), Shortcut.IidShellLinkW());
+        if (shell == 0) { return info; }
+        nint persist = Com.Query(shell, Shortcut.IidPersistFile());
+        if (persist == 0) { Com.Release(shell); return info; }
+        nint wpath = Wide.Of(lnkPath);
+        int hr = Com.Call2(persist, Shortcut.SlotLoad(), wpath, 0);   // STGM_READ
+        Wide.Free(wpath);
+        if (Com.Ok(hr)) {
+            info.target = Shortcut.GetPath(shell);
+            info.arguments = Shortcut.GetText(shell, Shortcut.SlotGetArguments());
+            info.workingDir = Shortcut.GetText(shell, Shortcut.SlotGetWorkingDir());
+            info.description = Shortcut.GetText(shell, Shortcut.SlotGetDescription());
+            info.iconPath = Shortcut.GetIconPath(shell);
+            info.iconIndex = Shortcut.GetIconIndex(shell);
+        }
+        Com.Release(persist);
+        Com.Release(shell);
+        #else
+        throw new PlatformNotSupportedException(
+            "Shortcut is not implemented on this platform");
+        #endif
+        return info;
+    }
+
+    #if WINDOWS
+    // IShellLinkW::GetPath(LPWSTR, int cch, WIN32_FIND_DATAW*, DWORD flags).
+    static string GetPath(nint shell) {
+        nint buf = NativeMemory.Alloc(2048 * 2 + 2);
+        int hr = Com.Call4(shell, Shortcut.SlotGetPath(), buf, 2048, 0, 0);
+        string s = "";
+        if (Com.Ok(hr)) { s = Wide.Read(buf); }
+        NativeMemory.Free(buf);
+        return s;
+    }
+
+    // Getter of the shape (LPWSTR, int cch).
+    static string GetText(nint shell, int slot) {
+        nint buf = NativeMemory.Alloc(2048 * 2 + 2);
+        int hr = Com.Call2(shell, slot, buf, 2048);
+        string s = "";
+        if (Com.Ok(hr)) { s = Wide.Read(buf); }
+        NativeMemory.Free(buf);
+        return s;
+    }
+
+    static string GetIconPath(nint shell) {
+        nint buf = NativeMemory.Alloc(2048 * 2 + 2);
+        nint idx = NativeMemory.Alloc(4);
+        int hr = Com.Call3(shell, Shortcut.SlotGetIconLocation(), buf, 2048, idx);
+        string s = "";
+        if (Com.Ok(hr)) { s = Wide.Read(buf); }
+        NativeMemory.Free(idx);
+        NativeMemory.Free(buf);
+        return s;
+    }
+
+    static int GetIconIndex(nint shell) {
+        nint buf = NativeMemory.Alloc(2048 * 2 + 2);
+        nint idx = NativeMemory.Alloc(4);
+        int hr = Com.Call3(shell, Shortcut.SlotGetIconLocation(), buf, 2048, idx);
+        int v = 0;
+        if (Com.Ok(hr)) { v = new Span<int>(idx, 1)[0]; }
+        NativeMemory.Free(idx);
+        NativeMemory.Free(buf);
+        return v;
+    }
+    #endif
+}
