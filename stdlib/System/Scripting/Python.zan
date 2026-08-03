@@ -1,0 +1,596 @@
+using System;
+
+namespace System.Scripting;
+
+/// <summary>
+/// In-process CPython embedding for Zan.
+///
+/// The runtime DLL is located and every entry point is resolved at run time
+/// through <see cref="Interop"/> (LoadLibrary/GetProcAddress), so programs
+/// that never touch <c>System.Scripting</c> do not link against Python and a
+/// machine without Python simply reports <see cref="Python.IsAvailable"/>
+/// == false instead of failing to load. This mirrors how the stdlib treats
+/// SDL3 and other optional native dependencies.
+///
+///   using System.Scripting;
+///
+///   if (!Python.IsAvailable()) { ... fall back ... }
+///   Python.Initialize();
+///   Python.Exec("answer = 6 * 7");
+///
+///   PyObject math = Python.Import("math");
+///   double v = math.GetAttr("floor").Call1(Python.FromDouble(22.3)).ToDouble();
+///
+///   PyObject main = Python.GetMain();
+///   string s = main.GetAttr("greet").Call1(Python.FromStr("Zan")).ToStr();
+///
+/// Callbacks run the other way with <see cref="Python.RegisterFunction"/>:
+/// a static, non-capturing Zan method is wrapped in a PyCFunction and
+/// published on the __main__ module, so Python code can invoke Zan code.
+///
+/// Reference counting: a <see cref="PyObject"/> owns a strong reference
+/// (Py_INCREF) to its PyObject* and releases it (Py_DECREF) in its
+/// finalizer, so ARC reclaims Python objects exactly when the last Zan
+/// reference disappears. Borrowed references (e.g. tuple items from
+/// <see cref="Python.GetArg"/>) are read directly and never wrapped.
+///
+/// Threading: the GIL is held for the duration of every call made through
+/// this module. Calling into Python from a non-initializing thread is safe
+/// as long as the interpreter has been initialized once. For heavy use,
+/// release the GIL around long-running Zan computation (planned).
+/// </summary>
+class Python {
+    // ---- resolved symbol addresses (0 until Initialize) -------------------
+    static nint mod;
+    static nint addr_init;
+    static nint addr_isInit;
+    static nint addr_finalize;
+    static nint addr_runSimple;
+    static nint addr_importModule;
+    static nint addr_getAttr;
+    static nint addr_call;
+    static nint addr_tupleNew;
+    static nint addr_tupleSet;
+    static nint addr_tupleGet;
+    static nint addr_floatAsDouble;
+    static nint addr_floatFromDouble;
+    static nint addr_longAsLong;
+    static nint addr_longFromLong;
+    static nint addr_unicodeAsUtf8;
+    static nint addr_unicodeFromString;
+    static nint addr_objStr;
+    static nint addr_objIsTrue;
+    static nint addr_boolFromLong;
+    static nint addr_decRef;
+    static nint addr_errPrint;
+    static nint addr_errOccurred;
+    static nint addr_errClear;
+    static nint addr_cfuncNew;
+    static nint addr_setAttrString;
+
+    static bool resolved;
+    static bool initialized;
+
+    // PyCFunction_New stores the PyMethodDef *pointer* (it does not copy),
+    // so every def and its name buffer must outlive the callable. Cache them
+    // here and release them all in Finalize.
+    static List<nint> regDefs;
+    static List<nint> regNames;
+
+    /// <summary>True when a usable CPython DLL can be loaded.</summary>
+    static bool IsAvailable() {
+        return Python.TryResolve();
+    }
+
+    /// <summary>True after <see cref="Initialize"/> has run.</summary>
+    static bool IsInitialized() {
+        if (!Python.resolved) { return false; }
+        PyIntFn f = (PyIntFn)Python.addr_isInit;
+        return f() != 0;
+    }
+
+    /// <summary>
+    /// Loads the newest available CPython (python3xx.dll) and initializes the
+    /// interpreter. Idempotent. Throws when no Python runtime is present.
+    /// </summary>
+    static void Initialize() {
+        if (Python.initialized) { return; }
+        if (!Python.TryResolve()) {
+            throw new InvalidOperationException(
+                "Python 运行时不可用:未找到 python3xx.dll(可调用 Python.LoadPath 指定路径)");
+        }
+        PyVoidFn f = (PyVoidFn)Python.addr_init;
+        f();
+        Python.initialized = true;
+    }
+
+    /// <summary>
+    /// Loads a specific CPython DLL (e.g. "C:/Python311/python311.dll") and
+    /// initializes the interpreter. Call instead of <see cref="Initialize"/>
+    /// when Python is not on the PATH.
+    /// </summary>
+    static void LoadPath(string dllPath) {
+        Python.FreeModule();
+        Python.mod = Interop.Load(dllPath);
+        if (Python.mod == 0) {
+            throw new InvalidOperationException("无法加载 Python DLL: " + dllPath);
+        }
+        if (!Python.ResolveSymbols()) {
+            throw new InvalidOperationException("Python DLL 缺少所需导出符号: " + dllPath);
+        }
+        PyVoidFn f = (PyVoidFn)Python.addr_init;
+        f();
+        Python.initialized = true;
+    }
+
+    /// <summary>Shuts the interpreter down (releases the runtime DLL).</summary>
+    static void Finalize() {
+        if (Python.resolved && Python.addr_finalize != 0) {
+            PyVoidFn f = (PyVoidFn)Python.addr_finalize;
+            f();
+        }
+        if (Python.regDefs != null) {
+            for (int i = 0; i < Python.regDefs.Count; i = i + 1) {
+                NativeMemory.Free(Python.regDefs[i]);
+                NativeMemory.Free(Python.regNames[i]);
+            }
+            Python.regDefs.Clear();
+            Python.regNames.Clear();
+        }
+        Python.initialized = false;
+        Python.FreeModule();
+    }
+
+    /// <summary>Executes Python code in the __main__ module's namespace.</summary>
+    static void Exec(string code) {
+        Python.EnsureReady();
+        PyIntStrFn f = (PyIntStrFn)Python.addr_runSimple;
+        int rc = f(code);
+        if (rc != 0) {
+            PyVoidFn printErr = (PyVoidFn)Python.addr_errPrint;
+            printErr();
+            throw new InvalidOperationException("Python 代码执行失败");
+        }
+    }
+
+    /// <summary>Imports a Python module (e.g. "math", "os.path").</summary>
+    static PyObject Import(string name) {
+        Python.EnsureReady();
+        PyNintStrFn f = (PyNintStrFn)Python.addr_importModule;
+        nint h = f(name);
+        if (h == 0) {
+            PyVoidFn printErr = (PyVoidFn)Python.addr_errPrint;
+            printErr();
+            throw new InvalidOperationException("Python 模块导入失败: " + name);
+        }
+        return PyObject.Wrap(h);
+    }
+
+    /// <summary>The __main__ module (where <see cref="Exec"/> defines names).</summary>
+    static PyObject GetMain() {
+        return Python.Import("__main__");
+    }
+
+    /// <summary>
+    /// Publishes a static Zan method on the __main__ module so Python code can
+    /// call it. The method must have the PyCFunction shape:
+    ///
+    ///   static nint MyFn(nint self, nint args) {
+    ///       double a = Python.GetArgDouble(args, 0);
+    ///       return Python.ReturnDouble(a * 2);
+    ///   }
+    ///
+    /// and must not capture state (Zan delegates are non-capturing), exactly
+    /// like Input.Hook and Thread.Start callbacks. Returns false when the
+    /// Python interpreter is not ready.
+    /// </summary>
+    static bool RegisterFunction(string name, PyCFunction fn) {
+        if (!Python.resolved) { return false; }
+        nint defs = NativeMemory.Alloc(64);
+        nint nameBuf = NativeMemory.Alloc(name.Length + 1);
+        NativeMemory.PutString(nameBuf, 0, name, name.Length);
+        new Span<byte>(nameBuf + name.Length, 1)[0] = 0;
+
+        Span<nint> d0 = new Span<nint>(defs, 4);
+        d0[0] = nameBuf;                        // ml_name
+        d0[1] = (nint)fn;                       // ml_meth (delegate -> fn ptr)
+        new Span<int>(defs + 16, 1)[0] = 1;     // ml_flags = METH_VARARGS
+        d0[3] = 0;                              // ml_doc = NULL
+        Span<nint> d1 = new Span<nint>(defs + 32, 4);
+        d1[0] = 0; d1[1] = 0;                   // NULL sentinel entry
+        new Span<int>(defs + 48, 1)[0] = 0;
+        d1[3] = 0;
+
+        PyCfuncNewFn make = (PyCfuncNewFn)Python.addr_cfuncNew;
+        nint func = make(defs, 0);              // keeps a pointer to `defs`
+        if (func == 0) {
+            NativeMemory.Free(defs);
+            NativeMemory.Free(nameBuf);
+            return false;
+        }
+        // Keep defs/nameBuf alive: the callable references them until freed.
+        if (Python.regDefs == null) {
+            Python.regDefs = new List<nint>();
+            Python.regNames = new List<nint>();
+        }
+        Python.regDefs.Add(defs);
+        Python.regNames.Add(nameBuf);
+
+        PySetAttrFn setAttr = (PySetAttrFn)Python.addr_setAttrString;
+        PyNintStrFn imp = (PyNintStrFn)Python.addr_importModule;
+        nint mainMod = imp("__main__");
+        if (mainMod == 0) {
+            Python.DecRef(func);
+            return false;
+        }
+        int rc = setAttr(mainMod, name, func);
+        Python.DecRef(func);                    // set holds its own reference
+        Python.DecRef(mainMod);
+        return rc == 0;
+    }
+
+    // ---- value marshalling: Zan -> Python ---------------------------------
+
+    /// <summary>Wraps a double as a Python float.</summary>
+    static PyObject FromDouble(double v) {
+        Python.EnsureReady();
+        PyDoubleRetFn f = (PyDoubleRetFn)Python.addr_floatFromDouble;
+        return PyObject.Wrap(f(v));
+    }
+
+    /// <summary>Wraps a 64-bit integer as a Python int.</summary>
+    static PyObject FromLong(long v) {
+        Python.EnsureReady();
+        PyLongRetFn f = (PyLongRetFn)Python.addr_longFromLong;
+        return PyObject.Wrap(f(v));
+    }
+
+    /// <summary>Wraps a string as a Python str (UTF-8).</summary>
+    static PyObject FromStr(string s) {
+        Python.EnsureReady();
+        PyNintStrFn f = (PyNintStrFn)Python.addr_unicodeFromString;
+        return PyObject.Wrap(f(s));
+    }
+
+    /// <summary>Wraps a bool as a Python bool.</summary>
+    static PyObject FromBool(bool b) {
+        Python.EnsureReady();
+        PyBoolRetFn f = (PyBoolRetFn)Python.addr_boolFromLong;
+        int v = 0;
+        if (b) { v = 1; }
+        return PyObject.Wrap(f(v));
+    }
+
+    // ---- value marshalling: Python -> Zan ---------------------------------
+
+    /// <summary>Reads a Python object as a double.</summary>
+    static double ToDouble(PyObject o) {
+        Python.EnsureReady();
+        PyDoubleFn f = (PyDoubleFn)Python.addr_floatAsDouble;
+        return f(o.handle);
+    }
+
+    /// <summary>Reads a Python object as a 64-bit integer.</summary>
+    static long ToLong(PyObject o) {
+        Python.EnsureReady();
+        PyLongFn f = (PyLongFn)Python.addr_longAsLong;
+        return f(o.handle);
+    }
+
+    /// <summary>Reads a Python object as a string (UTF-8, via str()).</summary>
+    static string ToStr(PyObject o) {
+        Python.EnsureReady();
+        PyNint1Fn s = (PyNint1Fn)Python.addr_objStr;
+        nint str = s(o.handle);
+        if (str == 0) { return ""; }
+        PyStrRetFn u = (PyStrRetFn)Python.addr_unicodeAsUtf8;
+        string text = u(str);
+        Python.DecRef(str);
+        return text;
+    }
+
+    /// <summary>Reads a Python object's truth value.</summary>
+    static bool ToBool(PyObject o) {
+        Python.EnsureReady();
+        PyNint1Fn t = (PyNint1Fn)Python.addr_objIsTrue;
+        return t(o.handle) != 0;
+    }
+
+    /// <summary>True when the Python error indicator is set.</summary>
+    static bool ErrOccurred() {
+        if (!Python.resolved) { return false; }
+        PyIntFn f = (PyIntFn)Python.addr_errOccurred;
+        return f() != 0;
+    }
+
+    /// <summary>Clears the Python error indicator.</summary>
+    static void ErrClear() {
+        if (!Python.resolved) { return; }
+        PyVoidFn f = (PyVoidFn)Python.addr_errClear;
+        f();
+    }
+
+    // ---- helpers for PyCFunction callbacks (Python -> Zan) ----------------
+
+    /// <summary>Reads argument `index` of the args tuple as a double.</summary>
+    static double GetArgDouble(nint args, long index) {
+        PyTupleGetFn g = (PyTupleGetFn)Python.addr_tupleGet;
+        PyDoubleFn d = (PyDoubleFn)Python.addr_floatAsDouble;
+        return d(g(args, index));               // borrowed reference
+    }
+
+    /// <summary>Reads argument `index` of the args tuple as a long.</summary>
+    static long GetArgLong(nint args, long index) {
+        PyTupleGetFn g = (PyTupleGetFn)Python.addr_tupleGet;
+        PyLongFn l = (PyLongFn)Python.addr_longAsLong;
+        return l(g(args, index));
+    }
+
+    /// <summary>Reads argument `index` of the args tuple as a string.</summary>
+    static string GetArgStr(nint args, long index) {
+        PyTupleGetFn g = (PyTupleGetFn)Python.addr_tupleGet;
+        PyNint1Fn s = (PyNint1Fn)Python.addr_objStr;
+        nint str = s(g(args, index));
+        if (str == 0) { return ""; }
+        PyStrRetFn u = (PyStrRetFn)Python.addr_unicodeAsUtf8;
+        string text = u(str);
+        Python.DecRef(str);
+        return text;
+    }
+
+    /// <summary>Builds the return value of a callback: a new float.</summary>
+    static nint ReturnDouble(double v) {
+        PyDoubleRetFn f = (PyDoubleRetFn)Python.addr_floatFromDouble;
+        return f(v);
+    }
+
+    /// <summary>Builds the return value of a callback: a new int.</summary>
+    static nint ReturnLong(long v) {
+        PyLongRetFn f = (PyLongRetFn)Python.addr_longFromLong;
+        return f(v);
+    }
+
+    /// <summary>Builds the return value of a callback: a new string.</summary>
+    static nint ReturnStr(string s) {
+        PyNintStrFn f = (PyNintStrFn)Python.addr_unicodeFromString;
+        return f(s);
+    }
+
+    /// <summary>Builds the return value of a callback: a new bool.</summary>
+    static nint ReturnBool(bool b) {
+        PyBoolRetFn f = (PyBoolRetFn)Python.addr_boolFromLong;
+        int v = 0;
+        if (b) { v = 1; }
+        return f(v);
+    }
+
+    /// <summary>Builds the return value of a callback: None.</summary>
+    static nint ReturnNone() {
+        // Returning NULL with no error set yields Python None.
+        return 0;
+    }
+
+    // ---- internals --------------------------------------------------------
+
+    static void EnsureReady() {
+        if (!Python.resolved) { Python.Initialize(); }
+    }
+
+    static bool TryResolve() {
+        if (Python.resolved) { return true; }
+        if (Python.mod == 0) {
+            // Newest first; python3.dll is the stable ABI forwarder but its
+            // symbol set is limited, so try the versioned DLLs first.
+            string[] cands = new string[] {
+                "python313.dll", "python312.dll", "python311.dll",
+                "python310.dll", "python39.dll", "python38.dll",
+                "python3.dll"
+            };
+            for (int i = 0; i < cands.Length; i = i + 1) {
+                Python.mod = Interop.Load(cands[i]);
+                if (Python.mod != 0) { break; }
+            }
+            if (Python.mod == 0) { return false; }
+        }
+        if (!Python.ResolveSymbols()) {
+            Interop.Unload(Python.mod);
+            Python.mod = 0;
+            return false;
+        }
+        Python.resolved = true;
+        return true;
+    }
+
+    static bool ResolveSymbols() {
+        Python.addr_init = Interop.Symbol(Python.mod, "Py_Initialize");
+        Python.addr_isInit = Interop.Symbol(Python.mod, "Py_IsInitialized");
+        Python.addr_finalize = Interop.Symbol(Python.mod, "Py_Finalize");
+        Python.addr_runSimple = Interop.Symbol(Python.mod, "PyRun_SimpleString");
+        Python.addr_importModule = Interop.Symbol(Python.mod, "PyImport_ImportModule");
+        Python.addr_getAttr = Interop.Symbol(Python.mod, "PyObject_GetAttrString");
+        Python.addr_call = Interop.Symbol(Python.mod, "PyObject_Call");
+        Python.addr_tupleNew = Interop.Symbol(Python.mod, "PyTuple_New");
+        Python.addr_tupleSet = Interop.Symbol(Python.mod, "PyTuple_SetItem");
+        Python.addr_tupleGet = Interop.Symbol(Python.mod, "PyTuple_GetItem");
+        Python.addr_floatAsDouble = Interop.Symbol(Python.mod, "PyFloat_AsDouble");
+        Python.addr_floatFromDouble = Interop.Symbol(Python.mod, "PyFloat_FromDouble");
+        // Windows 的 C long 是 32 位,必须用 LongLong 变体保证 64 位整型完整。
+        Python.addr_longAsLong = Interop.Symbol(Python.mod, "PyLong_AsLongLong");
+        Python.addr_longFromLong = Interop.Symbol(Python.mod, "PyLong_FromLongLong");
+        Python.addr_unicodeAsUtf8 = Interop.Symbol(Python.mod, "PyUnicode_AsUTF8");
+        Python.addr_unicodeFromString = Interop.Symbol(Python.mod, "PyUnicode_FromString");
+        Python.addr_objStr = Interop.Symbol(Python.mod, "PyObject_Str");
+        Python.addr_objIsTrue = Interop.Symbol(Python.mod, "PyObject_IsTrue");
+        Python.addr_boolFromLong = Interop.Symbol(Python.mod, "PyBool_FromLong");
+        Python.addr_decRef = Interop.Symbol(Python.mod, "Py_DecRef");
+        Python.addr_errPrint = Interop.Symbol(Python.mod, "PyErr_Print");
+        Python.addr_errOccurred = Interop.Symbol(Python.mod, "PyErr_Occurred");
+        Python.addr_errClear = Interop.Symbol(Python.mod, "PyErr_Clear");
+        Python.addr_cfuncNew = Interop.Symbol(Python.mod, "PyCFunction_New");
+        Python.addr_setAttrString = Interop.Symbol(Python.mod, "PyObject_SetAttrString");
+        return Python.addr_init != 0 && Python.addr_runSimple != 0;
+    }
+
+    static void FreeModule() {
+        if (Python.mod != 0) {
+            Interop.Unload(Python.mod);
+            Python.mod = 0;
+        }
+        Python.resolved = false;
+        Python.addr_init = 0;
+        Python.addr_isInit = 0;
+        Python.addr_finalize = 0;
+        Python.addr_runSimple = 0;
+        Python.addr_importModule = 0;
+        Python.addr_getAttr = 0;
+        Python.addr_call = 0;
+        Python.addr_tupleNew = 0;
+        Python.addr_tupleSet = 0;
+        Python.addr_tupleGet = 0;
+        Python.addr_floatAsDouble = 0;
+        Python.addr_floatFromDouble = 0;
+        Python.addr_longAsLong = 0;
+        Python.addr_longFromLong = 0;
+        Python.addr_unicodeAsUtf8 = 0;
+        Python.addr_unicodeFromString = 0;
+        Python.addr_objStr = 0;
+        Python.addr_objIsTrue = 0;
+        Python.addr_boolFromLong = 0;
+        Python.addr_decRef = 0;
+        Python.addr_errPrint = 0;
+        Python.addr_errOccurred = 0;
+        Python.addr_errClear = 0;
+        Python.addr_cfuncNew = 0;
+        Python.addr_setAttrString = 0;
+    }
+
+    static void DecRef(nint obj) {
+        if (obj != 0) {
+            PyVoid1Fn f = (PyVoid1Fn)Python.addr_decRef;
+            f(obj);
+        }
+    }
+}
+
+/// <summary>
+/// A strong reference to a Python object. The underlying PyObject* is
+/// released (Py_DECREF) when this wrapper is reclaimed by ARC.
+/// </summary>
+class PyObject {
+    nint handle;
+
+    /// <summary>Wraps an owned reference (never a borrowed one).</summary>
+    static PyObject Wrap(nint h) {
+        PyObject o = new PyObject();
+        o.handle = h;
+        return o;
+    }
+
+    /// <summary>The raw PyObject*; 0 means null (Python None is not null).</summary>
+    nint Raw() { return this.handle; }
+
+    /// <summary>True when this object is the Python null pointer (rare).</summary>
+    bool IsNull() { return this.handle == 0; }
+
+    ~PyObject() {
+        if (this.handle != 0) {
+            Python.DecRef(this.handle);
+            this.handle = 0;
+        }
+    }
+
+    /// <summary>Reads an attribute (e.g. "floor" on the math module).</summary>
+    PyObject GetAttr(string name) {
+        PyAttrFn f = (PyAttrFn)Python.addr_getAttr;
+        nint h = f(this.handle, name);
+        if (h == 0) {
+            PyVoidFn printErr = (PyVoidFn)Python.addr_errPrint;
+            printErr();
+            throw new InvalidOperationException("Python 属性访问失败: " + name);
+        }
+        return PyObject.Wrap(h);
+    }
+
+    /// <summary>Calls the object with no arguments.</summary>
+    PyObject Call0() {
+        return this.CallTuple(0);
+    }
+
+    /// <summary>Calls the object with one argument.</summary>
+    PyObject Call1(PyObject a) {
+        PyTupleNewFn n = (PyTupleNewFn)Python.addr_tupleNew;
+        PyTupleSetFn s = (PyTupleSetFn)Python.addr_tupleSet;
+        nint t = n(1);
+        s(t, 0, a.handle);
+        return this.CallTuple(t);
+    }
+
+    /// <summary>Calls the object with two arguments.</summary>
+    PyObject Call2(PyObject a, PyObject b) {
+        PyTupleNewFn n = (PyTupleNewFn)Python.addr_tupleNew;
+        PyTupleSetFn s = (PyTupleSetFn)Python.addr_tupleSet;
+        nint t = n(2);
+        s(t, 0, a.handle);
+        s(t, 1, b.handle);
+        return this.CallTuple(t);
+    }
+
+    /// <summary>Calls the object with three arguments.</summary>
+    PyObject Call3(PyObject a, PyObject b, PyObject c) {
+        PyTupleNewFn n = (PyTupleNewFn)Python.addr_tupleNew;
+        PyTupleSetFn s = (PyTupleSetFn)Python.addr_tupleSet;
+        nint t = n(3);
+        s(t, 0, a.handle);
+        s(t, 1, b.handle);
+        s(t, 2, c.handle);
+        return this.CallTuple(t);
+    }
+
+    PyObject CallTuple(nint tuple) {
+        PyNint2Fn f = (PyNint2Fn)Python.addr_call;
+        nint h = f(this.handle, tuple, 0);
+        Python.DecRef(tuple);                    // tuple owned by us
+        if (h == 0) {
+            PyVoidFn printErr = (PyVoidFn)Python.addr_errPrint;
+            printErr();
+            throw new InvalidOperationException("Python 调用失败");
+        }
+        return PyObject.Wrap(h);
+    }
+
+    /// <summary>Reads the object as a double.</summary>
+    double ToDouble() { return Python.ToDouble(this); }
+
+    /// <summary>Reads the object as a 64-bit integer.</summary>
+    long ToLong() { return Python.ToLong(this); }
+
+    /// <summary>Reads the object as a string (str(obj)).</summary>
+    string ToStr() { return Python.ToStr(this); }
+
+    /// <summary>Reads the object's truth value.</summary>
+    bool ToBool() { return Python.ToBool(this); }
+}
+
+// ---- PyCFunction callback shape: PyObject* (*)(PyObject*, PyObject*) ------
+delegate nint PyCFunction(nint self, nint args);
+
+// ---- internal call shapes for resolved entry points -----------------------
+delegate void PyVoidFn();
+delegate int PyIntFn();
+delegate int PyIntStrFn(string s);
+delegate nint PyNintStrFn(string s);
+delegate nint PyNint1Fn(nint a);
+delegate nint PyNint2Fn(nint a, nint b, nint c);
+delegate nint PyAttrFn(nint obj, string name);
+delegate void PyVoid1Fn(nint a);
+delegate double PyDoubleFn(nint obj);
+delegate nint PyDoubleRetFn(double v);
+delegate long PyLongFn(nint obj);
+delegate nint PyLongRetFn(long v);
+delegate string PyStrRetFn(nint obj);
+delegate nint PyTupleNewFn(long size);
+delegate int PyTupleSetFn(nint t, long i, nint v);
+delegate nint PyTupleGetFn(nint t, long i);
+delegate nint PyBoolRetFn(int v);
+delegate nint PyCfuncNewFn(nint def, nint self);
+delegate int PySetAttrFn(nint obj, string name, nint val);

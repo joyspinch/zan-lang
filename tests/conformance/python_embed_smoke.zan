@@ -1,0 +1,75 @@
+// System.Scripting.Python smoke test: in-process CPython embedding.
+// The harness compares stdout against a single golden file and has no skip
+// concept, so when no python3xx.dll is loadable this prints the same
+// python-ok: 1 line without asserting anything (an environment skip). When
+// Python IS present it asserts structural invariants: exec defines names,
+// math.floor returns the right value, __main__ functions round-trip UTF-8
+// strings, 64-bit longs survive the border intact, and a registered
+// PyCFunction callback runs from Python.
+using System;
+using System.Scripting;
+
+namespace Conf;
+
+// PyCFunction callback shape: PyObject* (*)(PyObject*, PyObject*).
+// Registered on __main__ so Python code can call into Zan.
+delegate nint CbFn(nint self, nint args);
+
+class Prog {
+    static nint ZanMul(nint self, nint args) {
+        double a = Python.GetArgDouble(args, 0);
+        double b = Python.GetArgDouble(args, 1);
+        return Python.ReturnDouble(a * b);
+    }
+
+    static void Main() {
+        if (!Python.IsAvailable()) {
+            // No Python runtime on this machine: skip silently (see header).
+            Console.WriteLine("python-ok: 1");
+            return;
+        }
+        int bad = 0;
+
+        Python.Initialize();
+
+        // exec defines a name in __main__
+        Python.Exec("answer = 6 * 7");
+        PyObject main = Python.GetMain();
+        if (main.GetAttr("answer").ToLong() != 42L) { bad = bad + 1; }
+
+        // import + call with a double argument
+        PyObject math = Python.Import("math");
+        double floor = math.GetAttr("floor").Call1(Python.FromDouble(22.3)).ToDouble();
+        if (floor != 22.0) { bad = bad + 1; }
+
+        // UTF-8 string round-trip (Chinese is 3 bytes per char in UTF-8)
+        Python.Exec("def greet(name):\n    return '你好, ' + name + '!'\n");
+        string g = main.GetAttr("greet").Call1(Python.FromStr("Zan")).ToStr();
+        if (g != "你好, Zan!") { bad = bad + 1; }
+
+        // 64-bit integer round-trip (PyLong_FromLongLong, not the 32-bit long)
+        long big = 1234567890123L;
+        if (Python.ToLong(Python.FromLong(big)) != big) { bad = bad + 1; }
+
+        // double / string / bool conversions
+        if (Python.ToDouble(Python.FromDouble(3.14)) != 3.14) { bad = bad + 1; }
+        if (Python.ToStr(Python.FromStr("中文往返")) != "中文往返") { bad = bad + 1; }
+        if (!Python.ToBool(Python.FromBool(true))) { bad = bad + 1; }
+
+        // Python -> Zan callback
+        if (!Python.RegisterFunction("zan_mul", ZanMul)) { bad = bad + 1; }
+        Python.Exec("assert zan_mul(3, 4) == 12.0");
+
+        // Python exception surfaces as a Zan exception with traceback printed
+        bool threw = false;
+        try {
+            Python.Exec("raise ValueError('boom')");
+        } catch (InvalidOperationException) {
+            threw = true;
+        }
+        if (!threw) { bad = bad + 1; }
+
+        Python.Finalize();
+        Console.WriteLine("python-ok: " + Convert.ToString(bad == 0 ? 1 : 0));
+    }
+}
