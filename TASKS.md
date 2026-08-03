@@ -1246,6 +1246,12 @@ Gui.Text / Game.Rts / Zgm / Windows.Forms —— stdlib 里最后一批 `calloc`
   （删掉 `Theater.free`）、`tests/conformance/rts_{shp,tmp}_parse`、`zgm_net_runtime`。
 * `System/Windows/Forms.zan` 与 `Windows/Forms/Forms.zan`（两份同源）：
   `GetWindowTextA` 出参缓冲按返回长度 `ToStr`，消息循环的 `MSG` 缓冲 → `byte[]`。
+  〔2026-08 实测〕平铺副本 `System/Windows/Forms.zan` 当前**无法编译**：
+  `GetModuleHandleA`/`CreateWindowExA` 已声明返回 `nint`（42faecb 改宽 extern），
+  但内部仍赋值给 `int`，报 narrowing conversion。任何 `using System.Windows;`
+  都会把它拉入 `--auto-stdlib` 并失败（目录映射非递归，`Forms/Forms.zan` 不受
+  影响）。修复见上；修复前新模块勿用 `System.Windows` 命名空间平铺文件，
+  `System.Windows.Clipboard` 已用子目录规避。
 
 〔实测〕全量 `ctest -j4` **711/711 Passed**（159 s）；分组
 `sqlserver|tds|postgres|pg_` 9/9、`firebird` 3/3、`mysql` 6/6、

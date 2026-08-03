@@ -2856,34 +2856,36 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
         }
 
 
-                /* Dict method calls: Add, ContainsKey */
+                /* Dict method calls: Add, ContainsKey, Clear. The receiver is
+                 * resolved by its static type, not by name, so it works for
+                 * locals AND fields (`dict.Add` / `this.dict.Add` /
+                 * `obj.dict.Add`) alike. */
         if (expr->call.callee && expr->call.callee->kind == AST_MEMBER_ACCESS) {
             zan_ast_node_t *callee_d = expr->call.callee;
             zan_istr_t mname = callee_d->member.name;
-            if (callee_d->member.object->kind == AST_IDENTIFIER) {
-                local_var_t *dict_local = local_find(locals, callee_d->member.object->ident.name);
-                if (dict_local && dict_local->type && dict_local->type->name.len == 4 &&
-                    memcmp(dict_local->type->name.str, "Dict", 4) == 0) {
+            zan_type_t *dict_type = infer_expr_type(g, callee_d->member.object, locals);
+            if (dict_type && dict_type->name.len == 4 &&
+                memcmp(dict_type->name.str, "Dict", 4) == 0) {
                     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
                     LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
                     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
-                    LLVMValueRef raw = LLVMBuildLoad2(g->builder, i8ptr, dict_local->alloca, "draw");
+                    LLVMValueRef raw = emit_expr(g, callee_d->member.object, locals);
                     LLVMValueRef dp = LLVMBuildBitCast(g->builder, raw,
                         LLVMPointerType(g->dict_struct_type, 0), "dp");
 
                     if (mname.len == 3 && memcmp(mname.str, "Add", 3) == 0 && expr->call.args.count == 2) {
-                        zan_type_t *key_type = dict_key_type(g, dict_local->type);
+                        zan_type_t *key_type = dict_key_type(g, dict_type);
                         LLVMValueRef key_val = coerce_dict_key(g,
                             emit_expr(g, expr->call.args.items[0], locals), key_type);
                         LLVMValueRef val_v = emit_expr(g, expr->call.args.items[1], locals);
-                        emit_dict_value_set(g, dict_local->type, raw, key_val, val_v,
+                        emit_dict_value_set(g, dict_type, raw, key_val, val_v,
                             expr->call.args.items[0], expr->call.args.items[1], locals);
                         return LLVMConstInt(i32t, 0, 0);
                     }
 
                     if (mname.len == 11 && memcmp(mname.str, "ContainsKey", 11) == 0 && expr->call.args.count == 1) {
-                        LLVMValueRef search = coerce_dict_key(g, emit_expr(g, expr->call.args.items[0], locals), dict_key_type(g, dict_local->type));
-                        LLVMValueRef found = emit_dict_find(g, dict_local->type, raw, search);
+                        LLVMValueRef search = coerce_dict_key(g, emit_expr(g, expr->call.args.items[0], locals), dict_key_type(g, dict_type));
+                        LLVMValueRef found = emit_dict_find(g, dict_type, raw, search);
                         LLVMValueRef hit = zan_icmp(g->builder, LLVMIntSGE, found,
                             LLVMConstInt(i64, 0, 0), "ckhit");
                         return LLVMBuildZExt(g->builder, hit, i32t, "ckres");
@@ -2909,8 +2911,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                         LLVMValueRef ci2 = LLVMBuildLoad2(g->builder, i64, idx_a, "ci2");
                         LLVMValueRef kslot = LLVMBuildGEP2(g->builder, i8ptr, ks, &ci2, 1, "ksl");
                         LLVMValueRef kv = LLVMBuildLoad2(g->builder, i8ptr, kslot, "kv");
-                        emit_collection_release_raw_slot(g, dict_key_type(g, dict_local->type), kv, i8ptr);
-                        zan_type_t *value_type = dict_value_type(dict_local->type);
+                        emit_collection_release_raw_slot(g, dict_key_type(g, dict_type), kv, i8ptr);
+                        zan_type_t *value_type = dict_value_type(dict_type);
                         LLVMValueRef value_words = load_dict_value_words(g, raw);
                         LLVMValueRef value_word = zan_mul(g->builder, ci2,
                             value_words, "dc.word");
@@ -2929,7 +2931,6 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                         return LLVMConstInt(i32t, 0, 0);
                     }
                 }
-            }
         }
 
         /* Dict.Clear() — reset count to 0 */
@@ -2954,19 +2955,19 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
             }
         }
 
-        /* Dict.Remove(key) — find and remove key, shift remaining entries */
+        /* Dict.Remove(key) — find and remove key, shift remaining entries.
+         * Receiver resolved by static type (locals and fields alike). */
         if (expr->call.callee && expr->call.callee->kind == AST_MEMBER_ACCESS) {
             zan_ast_node_t *callee_d = expr->call.callee;
             zan_istr_t mname = callee_d->member.name;
-            if (mname.len == 6 && memcmp(mname.str, "Remove", 6) == 0 && expr->call.args.count == 1) {
-                if (callee_d->member.object->kind == AST_IDENTIFIER) {
-                    local_var_t *dict_local = local_find(locals, callee_d->member.object->ident.name);
-                    if (dict_local && dict_local->type && dict_local->type->name.len == 4 &&
-                        memcmp(dict_local->type->name.str, "Dict", 4) == 0) {
+            zan_type_t *dict_type = infer_expr_type(g, callee_d->member.object, locals);
+            if (mname.len == 6 && memcmp(mname.str, "Remove", 6) == 0 && expr->call.args.count == 1 &&
+                dict_type && dict_type->name.len == 4 &&
+                memcmp(dict_type->name.str, "Dict", 4) == 0) {
                         LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
                         LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
                         LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
-                        LLVMValueRef raw = LLVMBuildLoad2(g->builder, i8ptr, dict_local->alloca, "draw");
+                        LLVMValueRef raw = emit_expr(g, callee_d->member.object, locals);
                         LLVMValueRef dp = LLVMBuildBitCast(g->builder, raw,
                             LLVMPointerType(g->dict_struct_type, 0), "dp");
                         LLVMValueRef cntp = LLVMBuildStructGEP2(g->builder, g->dict_struct_type, dp, 0, "cntp");
@@ -2975,7 +2976,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                         LLVMValueRef ks = LLVMBuildLoad2(g->builder, LLVMPointerType(i8ptr, 0), kp, "ks");
                         LLVMValueRef vp = LLVMBuildStructGEP2(g->builder, g->dict_struct_type, dp, 3, "vp");
                         LLVMValueRef vs = LLVMBuildLoad2(g->builder, LLVMPointerType(i64, 0), vp, "vs");
-                        LLVMValueRef search = coerce_dict_key(g, emit_expr(g, expr->call.args.items[0], locals), dict_key_type(g, dict_local->type));
+                        LLVMValueRef search = coerce_dict_key(g, emit_expr(g, expr->call.args.items[0], locals), dict_key_type(g, dict_type));
                         /* linear search for key */
                         LLVMValueRef idx_a = emit_entry_alloca(g, i64, "di");
                         LLVMBuildStore(g->builder, LLVMConstInt(i64, 0, 0), idx_a);
@@ -2992,7 +2993,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                         LLVMValueRef ci2 = LLVMBuildLoad2(g->builder, i64, idx_a, "ci2");
                         LLVMValueRef kslot = LLVMBuildGEP2(g->builder, i8ptr, ks, &ci2, 1, "ksl");
                         LLVMValueRef kv = LLVMBuildLoad2(g->builder, i8ptr, kslot, "kv");
-                        LLVMValueRef eq = emit_dict_key_eq(g, dict_local->type, kv, search);
+                        LLVMValueRef eq = emit_dict_key_eq(g, dict_type, kv, search);
                         LLVMBuildCondBr(g->builder, eq, found_bb, next_bb);
                         /* found: shift remaining entries left */
                         LLVMPositionBuilderAtEnd(g->builder, found_bb);
@@ -3004,8 +3005,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                         LLVMValueRef last = zan_sub(g->builder, cnt, LLVMConstInt(i64, 1, 0), "last");
                         LLVMValueRef rkey = LLVMBuildGEP2(g->builder, i8ptr, ks, &fi, 1, "rkey");
                         LLVMValueRef rkv = LLVMBuildLoad2(g->builder, i8ptr, rkey, "rkv");
-                        emit_collection_release_raw_slot(g, dict_key_type(g, dict_local->type), rkv, i8ptr);
-                        zan_type_t *value_type = dict_value_type(dict_local->type);
+                        emit_collection_release_raw_slot(g, dict_key_type(g, dict_type), rkv, i8ptr);
+                        zan_type_t *value_type = dict_value_type(dict_type);
                         LLVMValueRef value_words = load_dict_value_words(g, raw);
                         LLVMValueRef removed_word = zan_mul(g->builder, fi,
                             value_words, "dr.word");
@@ -3061,8 +3062,6 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                         LLVMBuildBr(g->builder, cond_bb);
                         LLVMPositionBuilderAtEnd(g->builder, done_bb);
                         return LLVMConstInt(i32t, 0, 0);
-                    }
-                }
             }
         }
 

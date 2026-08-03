@@ -1674,6 +1674,27 @@ binding_lowered:
                             LLVMValueRef slot_ptr = LLVMBuildGEP2(g->builder, i64t, data, &idx, 1, "ep");
                             emit_collection_slot_store(g, container_elem_type(fsym->type), i64t, slot_ptr,
                                 right, expr->binary.right, locals, 1);
+                        } else if (fsym->type && fsym->type->name.len == 4 &&
+                                   memcmp(fsym->type->name.str, "Dict", 4) == 0) {
+                            /* implicit this.dict[key] = value — upsert via the
+                             * shared helper (same shape as the local path) */
+                            LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+                            LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+                            zan_type_t *kt = dict_key_type(g, fsym->type);
+                            LLVMValueRef key = idx;
+                            if (LLVMGetTypeKind(LLVMTypeOf(key)) == LLVMIntegerTypeKind) {
+                                LLVMTypeRef kem = kt ? map_type(g, kt) : NULL;
+                                if (kem && LLVMGetTypeKind(kem) == LLVMIntegerTypeKind &&
+                                    LLVMGetIntTypeWidth(kem) < LLVMGetIntTypeWidth(LLVMTypeOf(key)))
+                                    key = LLVMBuildTrunc(g->builder, key, kem, "k.nw");
+                                if (LLVMGetIntTypeWidth(LLVMTypeOf(key)) < 64)
+                                    key = LLVMBuildSExt(g->builder, key, i64, "k.sx");
+                                key = LLVMBuildIntToPtr(g->builder, key, i8ptr, "k.ip");
+                            } else if (LLVMTypeOf(key) != i8ptr) {
+                                key = LLVMBuildBitCast(g->builder, key, i8ptr, "k.bc");
+                            }
+                            emit_dict_value_set(g, fsym->type, arr_ptr, key, right,
+                                expr->binary.left->index.index, expr->binary.right, locals);
                         } else if (fsym->type && fsym->type->kind == TYPE_STRING) {
                             LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
                             LLVMValueRef elem_ptr = LLVMBuildGEP2(g->builder, i8, arr_ptr, &idx, 1, "eidx");
@@ -1749,6 +1770,25 @@ binding_lowered:
                         LLVMValueRef slot_ptr = LLVMBuildGEP2(g->builder, i64t, data, &idx, 1, "ep");
                         emit_collection_slot_store(g, container_elem_type(at), i64t, slot_ptr,
                             right, expr->binary.right, locals, 1);
+                    } else if (at->name.len == 4 && memcmp(at->name.str, "Dict", 4) == 0) {
+                        /* obj.dict[key] = value — upsert via the shared helper */
+                        LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+                        LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+                        zan_type_t *kt = dict_key_type(g, at);
+                        LLVMValueRef key = idx;
+                        if (LLVMGetTypeKind(LLVMTypeOf(key)) == LLVMIntegerTypeKind) {
+                            LLVMTypeRef kem = kt ? map_type(g, kt) : NULL;
+                            if (kem && LLVMGetTypeKind(kem) == LLVMIntegerTypeKind &&
+                                LLVMGetIntTypeWidth(kem) < LLVMGetIntTypeWidth(LLVMTypeOf(key)))
+                                key = LLVMBuildTrunc(g->builder, key, kem, "k.nw");
+                            if (LLVMGetIntTypeWidth(LLVMTypeOf(key)) < 64)
+                                key = LLVMBuildSExt(g->builder, key, i64, "k.sx");
+                            key = LLVMBuildIntToPtr(g->builder, key, i8ptr, "k.ip");
+                        } else if (LLVMTypeOf(key) != i8ptr) {
+                            key = LLVMBuildBitCast(g->builder, key, i8ptr, "k.bc");
+                        }
+                        emit_dict_value_set(g, at, arr_ptr, key, right,
+                            expr->binary.left->index.index, expr->binary.right, locals);
                     } else if (at->kind == TYPE_STRING) {
                         LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
                         LLVMValueRef elem_ptr = LLVMBuildGEP2(g->builder, i8, arr_ptr, &idx, 1, "eidx");
@@ -2272,15 +2312,13 @@ static LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr
             }
         }
 
-        /* Dict.Count — return number of entries */
-        if (expr->member.name.len == 5 && memcmp(expr->member.name.str, "Count", 5) == 0 &&
-            expr->member.object->kind == AST_IDENTIFIER) {
-            local_var_t *dict_local = local_find(locals, expr->member.object->ident.name);
-            if (dict_local && dict_local->type && dict_local->type->name.len == 4 &&
-                memcmp(dict_local->type->name.str, "Dict", 4) == 0) {
+        /* Dict.Count — return number of entries (locals and fields alike) */
+        if (expr->member.name.len == 5 && memcmp(expr->member.name.str, "Count", 5) == 0) {
+            zan_type_t *dt = infer_expr_type(g, expr->member.object, locals);
+            if (dt && dt->name.len == 4 && memcmp(dt->name.str, "Dict", 4) == 0) {
                 LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
                 LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
-                LLVMValueRef raw = LLVMBuildLoad2(g->builder, i8ptr, dict_local->alloca, "draw");
+                LLVMValueRef raw = emit_expr(g, expr->member.object, locals);
                 LLVMValueRef dp = LLVMBuildBitCast(g->builder, raw,
                     LLVMPointerType(g->dict_struct_type, 0), "dp");
                 LLVMValueRef cntp = LLVMBuildStructGEP2(g->builder, g->dict_struct_type, dp, 0, "cntp");
