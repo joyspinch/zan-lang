@@ -28,13 +28,24 @@
 # Usage:  powershell -ExecutionPolicy Bypass -File scripts\publish_ide.ps1
 #         Add  -SkipBuild  to package the existing build\ artifacts as-is.
 
-param([switch]$SkipBuild)
+param([switch]$SkipBuild, [switch]$NoBump)
 
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 
 $dist = Join-Path $root 'dist\win-x64'
+
+# Every publish is a release, so it gets its own version: the patch component is
+# raised before the build that stamps it into the binaries. -NoBump republishes
+# the current version (e.g. re-packaging after a failed run), and a release that
+# raises major/minor runs scripts\bump_version.ps1 -Part first.
+if (-not $NoBump) {
+    & (Join-Path $root 'scripts\bump_version.ps1')
+    if ($LASTEXITCODE -ne 0) { Write-Output "PUBLISH_FAILED: version bump"; exit 1 }
+}
+$version = (Get-Content (Join-Path $root 'VERSION') -Raw).Trim()
+Write-Output "Publishing version $version"
 
 if (-not $SkipBuild) {
     Write-Output "[1/4] Building the IDE (scripts\build_ide.ps1) ..."
@@ -284,4 +295,4 @@ if ($gcc) {
 
 if (-not (Test-Path (Join-Path $dist 'ZanIDE.exe'))) { Write-Output "PUBLISH_FAILED: dist\ZanIDE.exe missing"; exit 1 }
 $sz = (Get-Item (Join-Path $dist 'ZanIDE.exe')).Length
-Write-Output "PUBLISH_OK -> $dist\ZanIDE.exe (flat, real exe, $sz bytes; SDL3 statically linked)"
+Write-Output "PUBLISH_OK v$version -> $dist\ZanIDE.exe (flat, real exe, $sz bytes; SDL3 statically linked)"

@@ -64,9 +64,31 @@ Write-Output "[zanc] $zanc"
 
 $registryPath = Join-Path $root "stdlib\Gui\CustomComponents.zan"
 $registryOriginal = [System.IO.File]::ReadAllText($registryPath)
+# The IDE reports its own build identity (caption, log line, About), and it can
+# only know it if the build stamps it in: VERSION + date + commit are compiled
+# into IdeVersion.zan the same way the component registry is -- generated for
+# the compile, restored afterwards, so the source tree stays neutral.
+$versionPath = Join-Path $root "src\ide_zan\IdeVersion.zan"
+$versionOriginal = [System.IO.File]::ReadAllText($versionPath)
 $failed = $false
 
 try {
+    $verNum = (Get-Content (Join-Path $root "VERSION") -Raw).Trim()
+    $verDate = (Get-Date).ToString("yyyy-MM-dd")
+    $verCommit = ""
+    try {
+        $verCommit = (& git rev-parse --short HEAD 2>$null)
+        if ($LASTEXITCODE -ne 0) { $verCommit = "" }
+    } catch { $verCommit = "" }
+    if ($verCommit -eq $null) { $verCommit = "" }
+    $verCommit = "$verCommit".Trim()
+    $versionText = $versionOriginal
+    $versionText = $versionText -replace 'Number\(\) \{ return "[^"]*"; \}', ('Number() { return "' + $verNum + '"; }')
+    $versionText = $versionText -replace 'Date\(\) \{ return "[^"]*"; \}', ('Date() { return "' + $verDate + '"; }')
+    $versionText = $versionText -replace 'Commit\(\) \{ return "[^"]*"; \}', ('Commit() { return "' + $verCommit + '"; }')
+    [System.IO.File]::WriteAllText($versionPath, $versionText)
+    Write-Output "IDE_VERSION_OK $verNum ($verDate, $verCommit)"
+
     & powershell -ExecutionPolicy Bypass -File scripts\scan_components.ps1 `
         -Source src\ide_zan\components -Out stdlib\Gui\CustomComponents.zan
     if ($LASTEXITCODE -ne 0) { throw "SCAN_FAILED" }
@@ -163,6 +185,7 @@ try {
     $failed = $true
 } finally {
     [System.IO.File]::WriteAllText($registryPath, $registryOriginal)
+    [System.IO.File]::WriteAllText($versionPath, $versionOriginal)
 }
 
 if ($failed) { exit 1 }

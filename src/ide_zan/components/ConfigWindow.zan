@@ -2,18 +2,20 @@ using System;
 using System.Json;
 using Gui;
 
-/// The Project Configuration child window: application icon picker plus a
-/// resource summary with a link into the Asset Manager. Rendered through the
-/// shared WindowShell so it matches every other IDE window (same themed
-/// background, title bar and close button).
+/// The Project window: everything about the project itself, in two tabs of one
+/// window instead of two windows that had to hand off to each other -- the
+/// application icon and the resource summary, and the Asset Manager. Rendered
+/// through the shared WindowShell so it matches every other IDE window (same
+/// themed background, title bar and close button).
 class ConfigWindow : ChildWindow {
     string root;
     List<string> log;
     int lang;           // 0 English, 1 Chinese
+    int tab;            // 0 configuration, 1 assets
+    JsonValue model;
     static bool done;
     static bool choose;
     static bool clear;
-    static bool asset;
 
     static string T(int lang, string en, string zh) {
         if (lang == 1) { return zh; }
@@ -23,9 +25,10 @@ class ConfigWindow : ChildWindow {
     static void OnDone() { ConfigWindow.done = true; }
     static void OnChoose() { ConfigWindow.choose = true; }
     static void OnClear() { ConfigWindow.clear = true; }
-    static void OnAsset() { ConfigWindow.asset = true; }
 
-    static string DocJson(int lang, string root) {
+    /// The configuration tab: application icon plus a summary of what the
+    /// project carries as resources.
+    static UiNode ConfigTab(int lang, string root) {
         string projName = Path.GetFileName(root);
         string curIco = ZanIDE.ProjField(root, "icon");
         string icoLabel = curIco;
@@ -59,19 +62,14 @@ class ConfigWindow : ChildWindow {
 
         inner.Child(UiNode.Label(ConfigWindow.T(lang, "Resources", "资源"))
             .Class("secondary small").Dock("top").Height(20));
-        UiNode resRow = UiNode.Row().Dock("top").Height(34).Gap(8);
-        resRow.Child(UiNode.Label(counts).Dock("fill"));
-        resRow.Child(UiNode.Button(ConfigWindow.T(lang,
-            "Open Asset Manager", "打开资源管理器"))
-            .OnClick("asset").Class("primary small").Dock("right").Width(170));
-        inner.Child(resRow);
+        inner.Child(UiNode.Label(counts).Dock("top").Height(22));
         inner.Child(UiNode.Label(ConfigWindow.T(lang,
-            "Import files/folders, link resources, choose embed vs copy, and author",
-            "在资源管理器中导入文件/文件夹、链接资源、选择嵌入或复制，并编辑"))
+            "The Assets tab imports files/folders, links resources, chooses embed",
+            "「资源」标签页可导入文件/文件夹、链接资源、选择嵌入或复制，"))
             .Class("secondary small").Dock("top").Height(16));
         inner.Child(UiNode.Label(ConfigWindow.T(lang,
-            "8-direction / frame-sequence animations — all in the Asset Manager.",
-            "八方向 / 序列帧动画——全部集中在资源管理器。"))
+            "vs copy, and authors 8-direction / frame-sequence animations.",
+            "并编辑八方向 / 序列帧动画。"))
             .Class("secondary small").Dock("top").Height(16));
 
         UiNode doneRow = UiNode.Row().Dock("bottom").Height(40).Gap(10);
@@ -86,53 +84,74 @@ class ConfigWindow : ChildWindow {
             "The icon is embedded into the .exe on Build/Run/Publish.",
             "图标会在 构建/运行/发布 时嵌入 .exe。"))
             .Class("secondary small").Dock("bottom").Height(16));
+        return inner;
+    }
+
+    static string DocJson(int lang, string root, int tab) {
+        UiNode page = UiNode.Column().Dock("fill").Pad(0).Gap(0);
+        UiNode tabs = UiNode.Row().Dock("top").Height(38).Pad(8).Gap(8);
+        tabs.Child(UiNode.Of("Segment").Index(0)
+            .Str("label", ConfigWindow.T(lang, "Configuration", "配置"))
+            .Dock("left").Width(120).Bind("tab"));
+        tabs.Child(UiNode.Of("Segment").Index(1)
+            .Str("label", ConfigWindow.T(lang, "Assets", "资源"))
+            .Dock("left").Width(120).Bind("tab"));
+        page.Child(tabs);
+        if (tab == 1) {
+            page.Child(UiNode.Of("AssetManagerView").Dock("fill"));
+        } else {
+            page.Child(ConfigWindow.ConfigTab(lang, root));
+        }
 
         UiNode shell = UiNode.Of("WindowShell")
-            .Text(ConfigWindow.T(lang, "Project Configuration", "项目配置"))
+            .Text(ConfigWindow.T(lang, "Project", "项目配置"))
             .Str("onClose", "done");
-        shell.Child(inner);
+        shell.Child(page);
         return shell.ToJson();
     }
 
     void BuildUi() {
-        ui = UiDoc.FromJson(ConfigWindow.DocJson(lang, root));
+        ui = UiDoc.FromJson(ConfigWindow.DocJson(lang, root, tab)).Bind(model);
         ui.Handle("done", ConfigWindow.OnDone);
         ui.Handle("choose", ConfigWindow.OnChoose);
         ui.Handle("clear", ConfigWindow.OnClear);
-        ui.Handle("asset", ConfigWindow.OnAsset);
         ui.Wire();
     }
 
-    static ConfigWindow Open(App parent, string root, List<string> log, int uiLang) {
+    static ConfigWindow Open(App parent, string root, List<string> log,
+                             int uiLang, int tab) {
         ConfigWindow w = new ConfigWindow();
         w.root = root;
         w.log = log;
         w.lang = uiLang;
+        w.tab = tab;
         w.open = true;
         ConfigWindow.done = false;
         ConfigWindow.choose = false;
         ConfigWindow.clear = false;
-        ConfigWindow.asset = false;
+        AssetManager.BindView(root, log, uiLang);
+        w.model = JsonValue.NewObject();
+        w.model.Set("tab", JsonValue.NewNum(Convert.ToString(tab)));
         w.BuildUi();
         w.OpenHost(parent);
         return w;
     }
 
     override string Title() {
-        return ConfigWindow.T(lang, "Project Configuration", "项目配置");
+        return ConfigWindow.T(lang, "Project", "项目配置");
     }
 
-    override int Width() { return 560; }
-    override int Height() { return 580; }
+    override int Width() { return 900; }
+    override int Height() { return 680; }
     override int IdBase() { return 870000; }
 
     override bool Pending() {
         return ConfigWindow.done || ConfigWindow.choose
-            || ConfigWindow.clear || ConfigWindow.asset;
+            || ConfigWindow.clear || AssetManager.viewAction != 0;
     }
 
-    /// Rebuilds the document when a displayed value (icon path / counts)
-    /// changes.
+    /// Rebuilds the document when a displayed value (icon path / counts) or the
+    /// selected tab changes.
     void Rebuild() {
         this.BuildUi();
         if (open) { host.RequestRedraw(); }
@@ -143,6 +162,14 @@ class ConfigWindow : ChildWindow {
             ConfigWindow.clear = false;
             ZanIDE.SetProjectIcon(root, "");
             log.Add("> App icon cleared (default icon will be used).");
+            this.Rebuild();
+        }
+        // The tab strip is a bound selector, so the switch shows up as a model
+        // change rather than as an action: the page is rebuilt for the tab the
+        // segments now agree on.
+        int picked = model.Int("tab", tab);
+        if (picked != tab) {
+            tab = picked;
             this.Rebuild();
         }
     }
@@ -166,13 +193,10 @@ class ConfigWindow : ChildWindow {
         return false;
     }
 
-    /// True once the user pressed "Open Asset Manager" (closes this window).
-    bool TakeAsset() {
-        if (ConfigWindow.asset) {
-            ConfigWindow.asset = false;
-            open = false;
-            return true;
-        }
-        return false;
+    /// What the Asset Manager tab asked for on its last paint (0 none,
+    /// 2 import file, 3 import folder, 4 link resource); 1 (its own close
+    /// button) closes the window.
+    int TakeAssetAction() {
+        return AssetManager.TakeAction();
     }
 }
