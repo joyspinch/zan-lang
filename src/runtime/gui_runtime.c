@@ -1287,12 +1287,16 @@ EXPORT void zan_gui_draw_line(i32 surface_id, i32 x0, i32 y0, i32 x1, i32 y1, i3
  *     (source-over is not idempotent), so corners look brighter/beadier.
  *
  * This entry point rasterises the whole path in ONE coverage pass: for every
- * pixel we take the MAX coverage over all segments it lies near (round join,
- * like the union of the segment strokes), then blend each touched pixel
- * exactly once. Segments share one scratch coverage buffer (reused across
- * calls, no per-frame allocation); only the pixels a pass actually touches
- * are stored in a dirty list and re-zeroed after blending, so consecutive
- * calls never see stale coverage.
+ * pixel we ACCUMULATE coverage over all segments it lies near (round join,
+ * clamped to full), then blend each touched pixel exactly once. Summing (not
+ * max) matters on bends: a pixel inside a curve lies near two adjacent
+ * segments, each individually covering only part of it, but the union of the
+ * segments covers it fully -- taking the max would leave hollow, double-line
+ * curves. Clamping keeps overlapping round joins from brightening (blend
+ * happens once, so there is no double source-over). Segments share one scratch
+ * coverage buffer (reused across calls, no per-frame allocation); only the
+ * pixels a pass actually touches are stored in a dirty list and re-zeroed
+ * after blending, so consecutive calls never see stale coverage.
  *
  * pts holds n*2 int32s: x0,y0,x1,y1,... in device pixels.
  * ------------------------------------------------------------------------ */
@@ -1320,6 +1324,10 @@ EXPORT void zan_gui_draw_polyline(i32 surface_id, const i32 *pts, i32 n,
         g_poly_cov_h = H;
     }
     g_poly_dirty_n = 0;
+    /* The first-touch marker below relies on a zero buffer (g_poly_cov[idx]==0
+     * means "not seen this pass"). malloc leaves garbage behind, so a dirty
+     * slot can be skipped and its pixel silently dropped -- clear every pass. */
+    memset(g_poly_cov, 0, (size_t)W * (size_t)H);
 
     double half = t * 0.5;
     for (i32 i = 0; i + 1 < n; i++) {
@@ -1358,7 +1366,12 @@ EXPORT void zan_gui_draw_polyline(i32 surface_id, const i32 *pts, i32 n,
                     }
                     g_poly_dirty[g_poly_dirty_n++] = (py << 16) | (px & 0xFFFF);
                 }
-                if (icov > g_poly_cov[idx]) g_poly_cov[idx] = (u8)icov;
+                /* Accumulate segment coverage (clamped): a pixel in a bend is
+                 * covered by several adjacent segments at once; max() leaves
+                 * hollow double-line curves, sum keeps them solid. */
+                int covsum = g_poly_cov[idx] + icov;
+                if (covsum > 255) covsum = 255;
+                g_poly_cov[idx] = (u8)covsum;
             }
         }
     }
