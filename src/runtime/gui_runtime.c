@@ -182,6 +182,18 @@ static void set_pixel_aa(zan_surface_t *s, int x, int y, u32 color, int coverage
     s->pixels[idx] = blend_over(s->pixels[idx], c);
 }
 
+/* Convert a 0..1 coverage value to an alpha byte, easing the ramp with a
+ * smoothstep so the anti-aliased edge reads as a soft falloff instead of a
+ * hard linear stair: mid-ramp pixels stay mid, but pixels near the inside of
+ * the stroke firm up and pixels near the outside fade sooner. This removes
+ * the "stepped" look on shallow diagonals while keeping the stroke crisp. */
+static inline int aa_coverage(double cov) {
+    if (cov <= 0.0) return 0;
+    if (cov >= 1.0) return 255;
+    double s = cov * cov * (3.0 - 2.0 * cov);
+    return (int)(s * 255.0);
+}
+
 /* ---- Exported rendering functions ---- */
 
 EXPORT i32 zan_gui_create_surface(i32 width, i32 height) {
@@ -436,6 +448,7 @@ EXPORT void zan_gui_fill_rect(i32 surface_id, i32 x, i32 y, i32 w, i32 h, i32 co
 /* Vertical linear gradient fill: each row is a lerp between color_top (at y)
  * and color_bottom (at y+h-1). Opaque; used for modern gradient wallpapers
  * (AI / Aurora / Glass backdrops). Single pass, no allocation. */
+static int zan_round_cov(int i, int j, int rw, int rh, int cr, int cmask);
 EXPORT void zan_gui_fill_vgrad(
     i32 surface_id, i32 x, i32 y, i32 w, i32 h, i32 color_top,
     i32 color_bottom) {
@@ -466,6 +479,58 @@ EXPORT void zan_gui_fill_vgrad(
     }
 }
 
+/* Vertical gradient fill clipped to a rounded-rect mask. The plain vgrad above
+ * overwrites every pixel in the rect, so painting it over a FillRoundRect
+ * destroys the corner AA (the arcs' blended edge pixels get replaced by opaque
+ * gradient) and the corners read as jagged teeth. This variant cuts the same
+ * silhouette as zan_gui_fill_rounded_rect_mask: interior pixels are solid, the
+ * 1px corner arc is blended with fractional coverage. */
+EXPORT void zan_gui_fill_vgrad_mask(
+    i32 surface_id, i32 x, i32 y, i32 w, i32 h, i32 radius, i32 mask,
+    i32 color_top, i32 color_bottom) {
+    if (surface_id < 0 || surface_id >= g_surface_count) return;
+    zan_surface_t *s = g_surfaces[surface_id];
+    if (!s) return;
+    int x0 = clamp_i((int)x, s->clip_x0, s->clip_x1);
+    int y0 = clamp_i((int)y, s->clip_y0, s->clip_y1);
+    int x1 = clamp_i((int)(x + w), s->clip_x0, s->clip_x1);
+    int y1 = clamp_i((int)(y + h), s->clip_y0, s->clip_y1);
+    int rw = x1 - x0, rh = y1 - y0;
+    if (rw <= 0 || rh <= 0) return;
+    int r = (int)radius;
+    int m = (int)mask;
+    if (r < 0) r = 0;
+    if (r > 0 && (m & 15) == 0) r = 0;
+    if (r > (int)w / 2) r = (int)w / 2;
+    if (r > (int)h / 2) r = (int)h / 2;
+    int rh2 = (int)h;
+    if (rh2 < 1) rh2 = 1;
+    int denom = rh2 > 1 ? rh2 - 1 : 1;
+    ZAN_STAT(g_st_grad, (long long)rw * (long long)rh);
+    u32 ct = (u32)color_top, cb = (u32)color_bottom;
+    int tr = (ct >> 16) & 0xFF, tg = (ct >> 8) & 0xFF, tb = ct & 0xFF;
+    int mr = (cb >> 16) & 0xFF, mg = (cb >> 8) & 0xFF, mb = cb & 0xFF;
+    for (int py = y0; py < y1; py++) {
+        int num = py - (int)y;
+        if (num < 0) num = 0;
+        if (num > rh2 - 1) num = rh2 - 1;
+        int rr = tr + (mr - tr) * num / denom;
+        int gg = tg + (mg - tg) * num / denom;
+        int bb = tb + (mb - tb) * num / denom;
+        u32 c = 0xFF000000u | ((u32)rr << 16) | ((u32)gg << 8) | (u32)bb;
+        u32 *row = s->pixels + py * s->stride;
+        if (r <= 0) {
+            for (int px = x0; px < x1; px++) row[px] = c;
+            continue;
+        }
+        for (int px = x0; px < x1; px++) {
+            int cov = zan_round_cov(px - (int)x, py - (int)y, (int)w, (int)h, r, m);
+            if (cov >= 255) row[px] = c;
+            else if (cov > 0) set_pixel_aa(s, px, py, c, cov);
+        }
+    }
+}
+
 /* Is local pixel (i,j) inside a rounded-rect mask of size rw*rh with corner
  * radius cr (corner bits per ZAN_CORNER_*)? Corner geometry matches
  * zan_gui_fill_rounded_rect_mask so a rounded blur lines up exactly with the
@@ -485,6 +550,32 @@ static int zan_round_in(int i, int j, int rw, int rh, int cr, int cmask) {
     double dx = (double)i + 0.5 - (double)cx;
     double dy = (double)j + 0.5 - (double)cy;
     return (dx * dx + dy * dy) <= (double)cr * (double)cr ? 1 : 0;
+}
+
+/* Anti-aliased rounded-rect mask: 0..255 coverage of pixel (i,j) for a
+ * rounded rect of size rw*rh and radius cr (corner bits per ZAN_CORNER_*).
+ * 255 = fully inside, 0 = outside, in between = the 1px corner arc edge.
+ * Shares the corner geometry of zan_round_in so translucent fills that blend
+ * per-pixel (gradients) cut the same silhouette FillRoundRect draws. */
+static int zan_round_cov(int i, int j, int rw, int rh, int cr, int cmask) {
+    if (cr <= 0) return 255;
+    if (cr > rw / 2) cr = rw / 2;
+    if (cr > rh / 2) cr = rh / 2;
+    if (cr <= 0) return 255;
+    if ((i >= cr && i < rw - cr) || (j >= cr && j < rh - cr)) return 255;
+    int cx, cy, bit;
+    if (i < cr && j < cr)              { cx = cr;      cy = cr;      bit = 1; }
+    else if (i >= rw - cr && j < cr)   { cx = rw - cr; cy = cr;      bit = 2; }
+    else if (i < cr && j >= rh - cr)   { cx = cr;      cy = rh - cr; bit = 8; }
+    else                               { cx = rw - cr; cy = rh - cr; bit = 4; }
+    if (!(cmask & bit)) return 255;                 /* square (welded) corner */
+    double dx = (double)i + 0.5 - (double)cx;
+    double dy = (double)j + 0.5 - (double)cy;
+    double dist = sqrt(dx * dx + dy * dy);
+    double cov = (double)cr - dist + 0.5;           /* ~1px AA arc edge */
+    if (cov >= 1.0) return 255;
+    if (cov <= 0.0) return 0;
+    return (int)(cov * 255.0);
 }
 
 /* Backdrop blur: separable box blur (3 passes ~ Gaussian) over a rectangular
@@ -1270,8 +1361,9 @@ EXPORT void zan_gui_draw_line(i32 surface_id, i32 x0, i32 y0, i32 x1, i32 y1, i3
                 double dist = sqrt(ddx*ddx + ddy*ddy);
                 double cov = half - dist + 0.5;   /* ~1px anti-aliased edge */
                 if (cov <= 0.0) continue;
-                if (cov >= 1.0) set_pixel(s, px, py, c);
-                else set_pixel_aa(s, px, py, c, (int)(cov * 255.0));
+                int icov = aa_coverage(cov);
+                if (icov >= 255) set_pixel(s, px, py, c);
+                else set_pixel_aa(s, px, py, c, icov);
             }
         }
     }
@@ -1356,7 +1448,7 @@ EXPORT void zan_gui_draw_polyline(i32 surface_id, const i32 *pts, i32 n,
                 double dist = sqrt(ddx * ddx + ddy * ddy);
                 double cov = half - dist + 0.5;   /* ~1px anti-aliased edge */
                 if (cov <= 0.0) continue;
-                int icov = cov >= 1.0 ? 255 : (int)(cov * 255.0);
+                int icov = aa_coverage(cov);
                 int idx = py * W + px;
                 if (g_poly_cov[idx] == 0) {       /* first touch this pass */
                     if (g_poly_dirty_n >= g_poly_dirty_cap) {
