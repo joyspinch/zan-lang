@@ -1866,6 +1866,9 @@ done:
      * minimal DllMain returning TRUE (non-zero) and link with `-e DllMain`. */
     if (g->emit_lib && g->emit_shared && g->target_is_windows)
         emit_windows_dll_main(g);
+    /* --publish: emit the .ctors constructor that un-scrambles string literals
+     * (no-op unless obfuscation is on and literals were recorded). */
+    zan_irgen_emit_string_deobf(g);
     /* An error diagnostic emitted during codegen (e.g. an unsupported await
      * form flagged by the ANF pass) must fail the build — the driver only
      * checks diagnostics before codegen, so surface it here. */

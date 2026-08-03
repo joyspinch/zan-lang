@@ -710,6 +710,19 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
      * emitted below, so the multi-worker mode can skip it. */
     g->mt_scheduler = mt_scheduler;
 
+    /* --publish string obfuscation is off unless the driver turns it on; the
+     * key is a fixed 16-byte pad (see emit_string_literal_rc / the .ctors
+     * constructor). */
+    {
+        static const unsigned char zan_obf_default_key[16] = {
+            0x5a, 0x67, 0xa3, 0x1c, 0xd9, 0x84, 0x2f, 0x70,
+            0xbe, 0x11, 0x4d, 0xe6, 0x93, 0x28, 0xc5, 0x7a
+        };
+        memcpy(g->obf_key, zan_obf_default_key, 16);
+    }
+    g->obfuscate_strings = false;
+    g->obf_literal_count = 0;
+
     g->ctx = LLVMContextCreate();
     g->mod = LLVMModuleCreateWithNameInContext(module_name, g->ctx);
     g->builder = LLVMCreateBuilderInContext(g->ctx);

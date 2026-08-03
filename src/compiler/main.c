@@ -1838,6 +1838,10 @@ int main(int argc, char **argv) {
     }
     irgen.runtime_checks = runtime_checks;
     irgen.emit_debug = debug_info;
+    /* Publish builds scramble string literals in the image (un-scrambled by a
+     * .ctors constructor at startup) so a `strings` pass over the exe reveals
+     * no embedded keys/URLs/SQL/prompts. */
+    irgen.obfuscate_strings = publish_mode;
     irgen.fast_codegen = false;
     irgen.emit_lib = emit_lib;
     irgen.emit_shared = lib_shared;

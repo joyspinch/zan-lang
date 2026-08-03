@@ -1081,7 +1081,6 @@ static LLVMValueRef emit_string_literal_rc(zan_irgen_t *g, zan_istr_t text) {
     snprintf(name, sizeof(name), "__zan.strlit.%d", g->string_literal_count);
     LLVMValueRef global = LLVMAddGlobal(g->mod, lit_ty, name);
     LLVMSetLinkage(global, LLVMPrivateLinkage);
-    LLVMSetGlobalConstant(global, 1);
     LLVMSetUnnamedAddr(global, LLVMGlobalUnnamedAddr);
     unsigned char *blob = (unsigned char *)calloc(total, 1);
     if (!blob) return LLVMConstNull(LLVMPointerType(i8, 0));
@@ -1089,6 +1088,26 @@ static LLVMValueRef emit_string_literal_rc(zan_irgen_t *g, zan_istr_t text) {
     memcpy(blob + 8, &((uint64_t){ ZAN_STRING_MAGIC }), 8);
     if (text.len > 0) memcpy(blob + 16, text.str, (size_t)text.len);
     blob[16 + (size_t)text.len] = 0;
+    /* --publish: XOR-scramble the text bytes in the image and record the
+     * global so the startup constructor can un-scramble it. Only when there is
+     * room to record (else the byte would never be restored) -- overflow just
+     * leaves that literal in plain text, never garbled at runtime. The header
+     * (RC sentinel + magic) and NUL stay intact. The global must be writable
+     * for the constructor to patch it, so it is not marked constant here. */
+    bool obf = g->obfuscate_strings && text.len > 0
+        && g->obf_literal_count <
+           (int)(sizeof(g->obf_literals) / sizeof(g->obf_literals[0]));
+    if (obf) {
+        for (size_t j = 0; j < (size_t)text.len; j++) {
+            unsigned char ks = g->obf_key[j & 15]
+                ^ (unsigned char)((unsigned)text.len * 31u + (unsigned)j * 89u);
+            blob[16 + j] = (unsigned char)(blob[16 + j] ^ ks);
+        }
+        g->obf_literals[g->obf_literal_count].global = global;
+        g->obf_literals[g->obf_literal_count].len = (uint32_t)text.len;
+        g->obf_literal_count++;
+    }
+    LLVMSetGlobalConstant(global, obf ? 0 : 1);
     LLVMValueRef *init_elems = (LLVMValueRef *)calloc(total, sizeof(LLVMValueRef));
     if (!init_elems) {
         free(blob);
@@ -1111,6 +1130,134 @@ static LLVMValueRef emit_string_literal_rc(zan_irgen_t *g, zan_istr_t text) {
         g->string_literal_count++;
     }
     return user_ptr;
+}
+
+void zan_irgen_emit_string_deobf(zan_irgen_t *g) {
+    if (!g->obfuscate_strings || g->obf_literal_count <= 0) return;
+    int n = g->obf_literal_count;
+    LLVMTypeRef i8  = LLVMInt8TypeInContext(g->ctx);
+    LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+    LLVMTypeRef ptr = LLVMPointerType(i8, 0);
+
+    /* key pad -> [16 x i8] constant */
+    LLVMValueRef keyb[16];
+    for (int i = 0; i < 16; i++) keyb[i] = LLVMConstInt(i8, g->obf_key[i], 0);
+    LLVMTypeRef keyty = LLVMArrayType(i8, 16);
+    LLVMValueRef keyg = LLVMAddGlobal(g->mod, keyty, "__zan.obf.key");
+    LLVMSetLinkage(keyg, LLVMPrivateLinkage);
+    LLVMSetGlobalConstant(keyg, 1);
+    LLVMSetUnnamedAddr(keyg, LLVMGlobalUnnamedAddr);
+    LLVMSetInitializer(keyg, LLVMConstArray(i8, keyb, 16));
+
+    /* parallel tables: ptrs[n] (each -> the literal's text at offset 16) and
+     * lens[n]; kept as constants (they only hold addresses + lengths). */
+    LLVMValueRef *pinit = (LLVMValueRef *)calloc((size_t)n, sizeof(LLVMValueRef));
+    LLVMValueRef *linit = (LLVMValueRef *)calloc((size_t)n, sizeof(LLVMValueRef));
+    if (!pinit || !linit) { free(pinit); free(linit); return; }
+    for (int i = 0; i < n; i++) {
+        uint32_t len = g->obf_literals[i].len;
+        size_t total = 16u + (size_t)len + 1u;
+        LLVMTypeRef lit_ty = LLVMArrayType(i8, (unsigned)total);
+        LLVMValueRef idx[] = { LLVMConstInt(i64, 0, 0), LLVMConstInt(i64, 16, 0) };
+        pinit[i] = LLVMConstGEP2(lit_ty, g->obf_literals[i].global, idx, 2);
+        linit[i] = LLVMConstInt(i64, len, 0);
+    }
+    LLVMTypeRef ptab_ty = LLVMArrayType(ptr, (unsigned)n);
+    LLVMTypeRef ltab_ty = LLVMArrayType(i64, (unsigned)n);
+    LLVMValueRef ptab = LLVMAddGlobal(g->mod, ptab_ty, "__zan.obf.ptrs");
+    LLVMValueRef ltab = LLVMAddGlobal(g->mod, ltab_ty, "__zan.obf.lens");
+    LLVMSetLinkage(ptab, LLVMPrivateLinkage); LLVMSetGlobalConstant(ptab, 1);
+    LLVMSetLinkage(ltab, LLVMPrivateLinkage); LLVMSetGlobalConstant(ltab, 1);
+    LLVMSetInitializer(ptab, LLVMConstArray(ptr, pinit, (unsigned)n));
+    LLVMSetInitializer(ltab, LLVMConstArray(i64, linit, (unsigned)n));
+    free(pinit); free(linit);
+
+    /* void __zan.deobf(void): for each literal, XOR its bytes back. */
+    LLVMTypeRef fnty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), NULL, 0, 0);
+    LLVMValueRef fn = LLVMAddFunction(g->mod, "__zan.deobf", fnty);
+    LLVMSetLinkage(fn, LLVMInternalLinkage);
+    LLVMBuilderRef b = LLVMCreateBuilderInContext(g->ctx);
+
+    LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, fn, "entry");
+    LLVMBasicBlockRef ih    = LLVMAppendBasicBlockInContext(g->ctx, fn, "ih");
+    LLVMBasicBlockRef ib    = LLVMAppendBasicBlockInContext(g->ctx, fn, "ib");
+    LLVMBasicBlockRef jh    = LLVMAppendBasicBlockInContext(g->ctx, fn, "jh");
+    LLVMBasicBlockRef jb    = LLVMAppendBasicBlockInContext(g->ctx, fn, "jb");
+    LLVMBasicBlockRef inext = LLVMAppendBasicBlockInContext(g->ctx, fn, "inext");
+    LLVMBasicBlockRef done  = LLVMAppendBasicBlockInContext(g->ctx, fn, "done");
+
+    LLVMPositionBuilderAtEnd(b, entry);
+    LLVMValueRef ia = LLVMBuildAlloca(b, i64, "i");
+    LLVMValueRef ja = LLVMBuildAlloca(b, i64, "j");
+    LLVMValueRef pa = LLVMBuildAlloca(b, ptr, "p");
+    LLVMValueRef la = LLVMBuildAlloca(b, i64, "L");
+    LLVMBuildStore(b, LLVMConstInt(i64, 0, 0), ia);
+    LLVMBuildBr(b, ih);
+
+    LLVMValueRef nconst = LLVMConstInt(i64, (unsigned long long)n, 0);
+    LLVMPositionBuilderAtEnd(b, ih);
+    LLVMValueRef iv = LLVMBuildLoad2(b, i64, ia, "iv");
+    LLVMValueRef icmp = LLVMBuildICmp(b, LLVMIntSLT, iv, nconst, "icmp");
+    LLVMBuildCondBr(b, icmp, ib, done);
+
+    LLVMPositionBuilderAtEnd(b, ib);
+    iv = LLVMBuildLoad2(b, i64, ia, "iv2");
+    LLVMValueRef pidx[] = { LLVMConstInt(i64, 0, 0), iv };
+    LLVMValueRef pslot = LLVMBuildGEP2(b, ptab_ty, ptab, pidx, 2, "pslot");
+    LLVMValueRef pv = LLVMBuildLoad2(b, ptr, pslot, "pv");
+    LLVMBuildStore(b, pv, pa);
+    LLVMValueRef lslot = LLVMBuildGEP2(b, ltab_ty, ltab, pidx, 2, "lslot");
+    LLVMValueRef lv = LLVMBuildLoad2(b, i64, lslot, "lv");
+    LLVMBuildStore(b, lv, la);
+    LLVMBuildStore(b, LLVMConstInt(i64, 0, 0), ja);
+    LLVMBuildBr(b, jh);
+
+    LLVMPositionBuilderAtEnd(b, jh);
+    LLVMValueRef jv = LLVMBuildLoad2(b, i64, ja, "jv");
+    LLVMValueRef Lv = LLVMBuildLoad2(b, i64, la, "Lv");
+    LLVMValueRef jcmp = LLVMBuildICmp(b, LLVMIntSLT, jv, Lv, "jcmp");
+    LLVMBuildCondBr(b, jcmp, jb, inext);
+
+    LLVMPositionBuilderAtEnd(b, jb);
+    jv = LLVMBuildLoad2(b, i64, ja, "jv2");
+    Lv = LLVMBuildLoad2(b, i64, la, "Lv2");
+    LLVMValueRef pcur = LLVMBuildLoad2(b, ptr, pa, "pcur");
+    LLVMValueRef bp = LLVMBuildGEP2(b, i8, pcur, &jv, 1, "bp");
+    LLVMValueRef cur = LLVMBuildLoad2(b, i8, bp, "cur");
+    /* ks = key[j & 15] ^ (i8)(L*31 + j*89) */
+    LLVMValueRef ki = LLVMBuildAnd(b, jv, LLVMConstInt(i64, 15, 0), "ki");
+    LLVMValueRef kidx[] = { LLVMConstInt(i64, 0, 0), ki };
+    LLVMValueRef kslot = LLVMBuildGEP2(b, keyty, keyg, kidx, 2, "kslot");
+    LLVMValueRef kb = LLVMBuildLoad2(b, i8, kslot, "kb");
+    LLVMValueRef m1 = LLVMBuildMul(b, Lv, LLVMConstInt(i64, 31, 0), "m1");
+    LLVMValueRef m2 = LLVMBuildMul(b, jv, LLVMConstInt(i64, 89, 0), "m2");
+    LLVMValueRef ms = LLVMBuildAdd(b, m1, m2, "ms");
+    LLVMValueRef mt = LLVMBuildTrunc(b, ms, i8, "mt");
+    LLVMValueRef ks = LLVMBuildXor(b, kb, mt, "ks");
+    LLVMValueRef nb = LLVMBuildXor(b, cur, ks, "nb");
+    LLVMBuildStore(b, nb, bp);
+    LLVMValueRef jn = LLVMBuildAdd(b, jv, LLVMConstInt(i64, 1, 0), "jn");
+    LLVMBuildStore(b, jn, ja);
+    LLVMBuildBr(b, jh);
+
+    LLVMPositionBuilderAtEnd(b, inext);
+    iv = LLVMBuildLoad2(b, i64, ia, "iv3");
+    LLVMValueRef in = LLVMBuildAdd(b, iv, LLVMConstInt(i64, 1, 0), "in");
+    LLVMBuildStore(b, in, ia);
+    LLVMBuildBr(b, ih);
+
+    LLVMPositionBuilderAtEnd(b, done);
+    LLVMBuildRetVoid(b);
+    LLVMDisposeBuilder(b);
+
+    /* register in llvm.global_ctors: [{ i32 priority, void()* fn, i8* data }] */
+    LLVMValueRef fields[] = { LLVMConstInt(i32, 65535, 0), fn, LLVMConstNull(ptr) };
+    LLVMValueRef entryc = LLVMConstStruct(fields, 3, 0);
+    LLVMTypeRef arrty = LLVMArrayType(LLVMTypeOf(entryc), 1);
+    LLVMValueRef gc = LLVMAddGlobal(g->mod, arrty, "llvm.global_ctors");
+    LLVMSetLinkage(gc, LLVMAppendingLinkage);
+    LLVMSetInitializer(gc, LLVMConstArray(LLVMTypeOf(entryc), &entryc, 1));
 }
 
 /* Coerce a value to an i8* C string. Pointers pass through unchanged; integer

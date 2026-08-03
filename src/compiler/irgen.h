@@ -330,6 +330,16 @@ struct zan_irgen {
     } string_literals[2048];
     int string_literal_count;
 
+    /* --publish string obfuscation. Literal text is stored XOR-scrambled in
+     * the image (emit_string_literal_rc); a .ctors constructor un-scrambles it
+     * in place before main, so a static `strings`/grep over the exe finds no
+     * user text. Not cryptography -- the key ships in the binary -- it only
+     * defeats trivial static extraction. */
+    bool obfuscate_strings;
+    unsigned char obf_key[16];
+    struct { LLVMValueRef global; uint32_t len; } obf_literals[2048];
+    int obf_literal_count;
+
     /* async/await CPS lowering (see docs/ASYNC_CPS_DESIGN.md) */
     LLVMTypeRef  co_step_type;    /* void(i8*) — a frame's resume/step fn */
     LLVMTypeRef  co_step_ptr;     /* void(i8*)* — pointer to a step fn */
@@ -486,6 +496,10 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
 void zan_irgen_destroy(zan_irgen_t *g);
 
 zan_status_t zan_irgen_emit(zan_irgen_t *g, zan_ast_node_t *unit);
+/* --publish only: emit the .ctors constructor that un-scrambles string
+ * literals. No-op unless g->obfuscate_strings and at least one literal was
+ * recorded. Call after all codegen, before module verification. */
+void zan_irgen_emit_string_deobf(zan_irgen_t *g);
 zan_status_t zan_irgen_write_ir(zan_irgen_t *g, const char *path);
 zan_status_t zan_irgen_write_obj(zan_irgen_t *g, const char *path);
 
