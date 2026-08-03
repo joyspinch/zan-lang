@@ -84,6 +84,7 @@ build/background_demo.exe
 | `System.IO.Compression.GZip` | RFC 1952 gzip:`Compress(data, level)` / `Decompress(src)`(支持多成员流与 FEXTRA/FNAME/FCOMMENT/FHCRC 头) |
 | `System.IO.Compression.Zip` | PKZIP zip:`Zip.Create(entries, level)` / `Read(bytes)` / `Extract(bytes, entry)`(stored+deflate、目录项、中央目录;`ZipEntry{name,data,isDirectory,method,crc32,compressedSize,uncompressedSize}`) |
 | `System.IO.Compression.Tar` | POSIX ustar tar:`Tar.Create(entries)` / `Read(bytes)`(长路径 prefix 字段;与 GZip 组合即 .tar.gz;`TarEntry{name,data,isDirectory,mode}`) |
+| `System.Automation.Window` | 窗口自动化(winex 对应):枚举/查找/等待(`EnumTopLevel/EnumChildren/FindAll/FindWindow/FindEx/WaitForWindow/WaitForChild/WaitForClose`)、文本(`GetText/SetText`)、菜单(`GetMenu/FindMenuItem/ClickMenu/ClickCommand`)、坐标(`GetRect/GetClientRect/FromPoint/ToScreen/ToClient`)、样式(`GetStyle/HasStyle/ModifyStyle`)、状态(`IsVisible/IsEnabled/IsHung/IsCloaked/Show/Minimize/Maximize/Close/Flash`) |
 
 ### 示例(只读,安全)
 

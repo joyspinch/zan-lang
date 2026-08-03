@@ -82,6 +82,7 @@
 | 18+19 | `System.Windows.TrayIcon` / `Screen` | `stdlib/System/Windows/{TrayIcon,Screen}.zan` | `win_tray_screen_smoke` |
 | 20 | `System.ServiceProcess` | `stdlib/System/ServiceProcess/ServiceProcess.zan` | `win_serviceprocess_smoke` |
 | 21 | `System.Management.TaskScheduler` | `stdlib/System/Management/TaskScheduler.zan` | `win_taskscheduler_smoke` |
+| 12 | `System.Automation.Window` | `stdlib/System/Automation/Window.zan` | `win_automation_smoke` |
 | 23 | `System.IO.Compression` | `stdlib/System/IO/Compression/{Deflate,Crc32,GZip,Zip,Tar}.zan` | `win_compression_smoke` |
 | 33 | `System.Guid` | `stdlib/System/Guid.zan` | `guid_*` |
 | 36 | `Stopwatch` | `stdlib/System/Diagnostics/Stopwatch.zan` | `stopwatch_*` |
@@ -103,6 +104,11 @@
   `Zip`(PKZIP stored/deflate + 中央目录)、`Tar`(POSIX ustar 长路径 prefix) 均与
   Python zipfile/tarfile/gzip、.NET、Info-ZIP 双向互操作验证过。Huffman 码按
   RFC 1951 要求 MSB-first 打包（`WriteBitsMsb`），extra 位 LSB-first。
+- **Window 自动化直连 Win32**：`Window` 覆盖 winex 的查找/等待/文本/菜单/坐标/
+  样式/状态/进程线程全套，全部走 `user32` 直调；跨进程读文本用
+  `SendMessageTimeoutW`+`SMTO_ABORTIFHUNG`（无响应返回空串不卡调用方）；
+  `ClickMenu` 按 `File/Open` 路径逐级 `GetSubMenu`+`GetMenuStringW` 匹配后
+  `PostMessage(WM_COMMAND)`；conformance 自建弹窗+子控件+菜单全量断言。
 - **非 Windows 分支**：所有模块 `#else` 抛 `PlatformNotSupportedException`。
 
 ### P0 — 用户明确要的：输入模拟 + 系统信息

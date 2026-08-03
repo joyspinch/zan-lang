@@ -1,0 +1,1249 @@
+using System;
+using System.Diagnostics;
+using System.Threading;
+
+namespace System.Automation;
+
+/// <summary>Win32 EnumWindows/EnumChildWindows callback (WINAPI calling
+/// convention). Return 0 to stop the enumeration.</summary>
+delegate int WndEnumProc(nint hwnd, nint lparam);
+
+/// <summary>DwmGetWindowAttribute, resolved lazily so the module still works
+/// when DWM is disabled.</summary>
+delegate int DwmGetAttrFn(nint hwnd, int attr, nint outBuf, int size);
+
+/// <summary>A window rectangle in screen or client coordinates.</summary>
+class WindowRect {
+    public int x;
+    public int y;
+    public int width;
+    public int height;
+
+    static WindowRect Create(int x, int y, int w, int h) {
+        WindowRect r = new WindowRect();
+        r.x = x;
+        r.y = y;
+        r.width = w;
+        r.height = h;
+        return r;
+    }
+
+    int Right() { return x + width; }
+    int Bottom() { return y + height; }
+
+    bool Contains(int px, int py) {
+        return px >= x && px < x + width && py >= y && py < y + height;
+    }
+}
+
+/// <summary>A point in screen or client coordinates.</summary>
+class WindowPoint {
+    public int x;
+    public int y;
+
+    static WindowPoint Create(int x, int y) {
+        WindowPoint p = new WindowPoint();
+        p.x = x;
+        p.y = y;
+        return p;
+    }
+}
+
+/// <summary>Owner thread and process of a window.</summary>
+class WindowThreadInfo {
+    public int tid;
+    public int pid;
+
+    static WindowThreadInfo Create(int tid, int pid) {
+        WindowThreadInfo i = new WindowThreadInfo();
+        i.tid = tid;
+        i.pid = pid;
+        return i;
+    }
+}
+
+/// <summary>
+/// Win32 window automation: enumerate, find and wait for windows and child
+/// controls (class + title + id multi-condition matching with timeout),
+/// read/set text, click controls and menu commands, show/hide/topmost/
+/// foreground/minimize, screen &lt;-&gt; client coordinate conversion, owner
+/// thread/process ids and hung detection.
+///
+///   nint wnd = Window.FindWindowByTitle("无标题 - 记事本");
+///   Window.SetText(wnd, "hello");
+///   string t = Window.GetText(wnd);
+///   Window.ClickMenu(wnd, "文件/保存");
+///   Window.Close(wnd);
+///
+/// Matching is substring (class and title), case-sensitive; "" or 0 means
+/// "any". Titles are read cross-process through SendMessageTimeout, so a hung
+/// window fails a match instead of blocking the caller. Windows only; other
+/// platforms throw PlatformNotSupportedException.
+/// </summary>
+class Window {
+    #if WINDOWS
+    // ---- user32 imports ----
+    [DllImport("user32", EntryPoint = "IsWindow")]
+    static extern int WinIsWindow(nint hwnd);
+
+    [DllImport("user32", EntryPoint = "IsWindowVisible")]
+    static extern int WinIsWindowVisible(nint hwnd);
+
+    [DllImport("user32", EntryPoint = "IsWindowEnabled")]
+    static extern int WinIsWindowEnabled(nint hwnd);
+
+    [DllImport("user32", EntryPoint = "IsIconic")]
+    static extern int WinIsIconic(nint hwnd);
+
+    [DllImport("user32", EntryPoint = "IsZoomed")]
+    static extern int WinIsZoomed(nint hwnd);
+
+    [DllImport("user32", EntryPoint = "IsHungAppWindow")]
+    static extern int WinIsHungAppWindow(nint hwnd);
+
+    [DllImport("user32", EntryPoint = "IsWindowUnicode")]
+    static extern int WinIsWindowUnicode(nint hwnd);
+
+    [DllImport("user32", EntryPoint = "IsChild")]
+    static extern int WinIsChild(nint parent, nint hwnd);
+
+    [DllImport("user32", EntryPoint = "GetClassNameW")]
+    static extern int WinGetClassNameW(nint hwnd, nint buf, int max);
+
+    [DllImport("user32", EntryPoint = "GetWindowThreadProcessId")]
+    static extern int WinGetWindowThreadProcessId(nint hwnd, nint pidOut);
+
+    [DllImport("user32", EntryPoint = "GetParent")]
+    static extern nint WinGetParent(nint hwnd);
+
+    [DllImport("user32", EntryPoint = "GetAncestor")]
+    static extern nint WinGetAncestor(nint hwnd, int flags);
+
+    [DllImport("user32", EntryPoint = "GetWindow")]
+    static extern nint WinGetWindow(nint hwnd, int cmd);
+
+    [DllImport("user32", EntryPoint = "GetWindowLongPtrW")]
+    static extern nint WinGetWindowLongPtrW(nint hwnd, int index);
+
+    [DllImport("user32", EntryPoint = "SetWindowLongPtrW")]
+    static extern nint WinSetWindowLongPtrW(nint hwnd, int index, nint newValue);
+
+    [DllImport("user32", EntryPoint = "GetDlgCtrlID")]
+    static extern int WinGetDlgCtrlID(nint hwnd);
+
+    [DllImport("user32", EntryPoint = "FindWindowExW")]
+    static extern nint WinFindWindowExW(nint parent, nint after, nint cls, nint title);
+
+    [DllImport("user32", EntryPoint = "SendMessageTimeoutW")]
+    static extern nint WinSendMessageTimeoutW(nint hwnd, int msg, nint wp, nint lp,
+                                              int flags, int timeout, nint resultOut);
+
+    [DllImport("user32", EntryPoint = "SendMessageW")]
+    static extern long WinSendMessageW(nint hwnd, int msg, long wp, long lp);
+
+    [DllImport("user32", EntryPoint = "PostMessageW")]
+    static extern int WinPostMessageW(nint hwnd, int msg, long wp, long lp);
+
+    [DllImport("user32", EntryPoint = "PostThreadMessageW")]
+    static extern int WinPostThreadMessageW(int tid, int msg, long wp, long lp);
+
+    [DllImport("user32", EntryPoint = "ShowWindow")]
+    static extern int WinShowWindow(nint hwnd, int cmd);
+
+    [DllImport("user32", EntryPoint = "SetForegroundWindow")]
+    static extern int WinSetForegroundWindow(nint hwnd);
+
+    [DllImport("user32", EntryPoint = "GetForegroundWindow")]
+    static extern nint WinGetForegroundWindow();
+
+    [DllImport("user32", EntryPoint = "GetDesktopWindow")]
+    static extern nint WinGetDesktopWindow();
+
+    [DllImport("user32", EntryPoint = "SetFocus")]
+    static extern nint WinSetFocus(nint hwnd);
+
+    [DllImport("user32", EntryPoint = "EnableWindow")]
+    static extern int WinEnableWindow(nint hwnd, int enable);
+
+    [DllImport("user32", EntryPoint = "SetWindowPos")]
+    static extern int WinSetWindowPos(nint hwnd, nint after, int x, int y, int cx, int cy,
+                                      int flags);
+
+    [DllImport("user32", EntryPoint = "MoveWindow")]
+    static extern int WinMoveWindow(nint hwnd, int x, int y, int w, int h, int repaint);
+
+    [DllImport("user32", EntryPoint = "GetWindowRect")]
+    static extern int WinGetWindowRect(nint hwnd, nint rect);
+
+    [DllImport("user32", EntryPoint = "GetClientRect")]
+    static extern int WinGetClientRect(nint hwnd, nint rect);
+
+    [DllImport("user32", EntryPoint = "SystemParametersInfoW")]
+    static extern int WinSystemParametersInfoW(int action, int param, nint data, int fwinini);
+
+    [DllImport("user32", EntryPoint = "ClientToScreen")]
+    static extern int WinClientToScreen(nint hwnd, nint pt);
+
+    [DllImport("user32", EntryPoint = "ScreenToClient")]
+    static extern int WinScreenToClient(nint hwnd, nint pt);
+
+    [DllImport("user32", EntryPoint = "WindowFromPoint")]
+    static extern nint WinWindowFromPoint(long pt);
+
+    [DllImport("user32", EntryPoint = "ChildWindowFromPointEx")]
+    static extern nint WinChildWindowFromPointEx(nint parent, long pt, int flags);
+
+    [DllImport("user32", EntryPoint = "MapWindowPoints")]
+    static extern int WinMapWindowPoints(nint from, nint to, nint pts, int count);
+
+    [DllImport("user32", EntryPoint = "GetGUIThreadInfo")]
+    static extern int WinGetGUIThreadInfo(int tid, nint info);
+
+    [DllImport("user32", EntryPoint = "FlashWindowEx")]
+    static extern int WinFlashWindowEx(nint fwi);
+
+    [DllImport("user32", EntryPoint = "GetMenu")]
+    static extern nint WinGetMenu(nint hwnd);
+
+    [DllImport("user32", EntryPoint = "GetSubMenu")]
+    static extern nint WinGetSubMenu(nint hMenu, int pos);
+
+    [DllImport("user32", EntryPoint = "GetMenuItemCount")]
+    static extern int WinGetMenuItemCount(nint hMenu);
+
+    [DllImport("user32", EntryPoint = "GetMenuItemID")]
+    static extern int WinGetMenuItemID(nint hMenu, int pos);
+
+    [DllImport("user32", EntryPoint = "GetMenuStringW")]
+    static extern int WinGetMenuStringW(nint hMenu, int item, nint buf, int max, int flags);
+
+    // ---- state for enumerations (delegates cannot capture) ----
+    static List<nint> enumBuf = new List<nint>();
+    static nint dwmModule = 0;
+    static DwmGetAttrFn dwmGetAttr;
+    #endif
+
+    // ---- window text ----
+
+    /// <summary>窗口标题/文本。跨进程安全:通过 SendMessageTimeout 读取
+    /// (WM_GETTEXT),目标无响应时返回 "" 而不是卡死调用方。</summary>
+    static string GetText(nint hwnd) {
+        #if WINDOWS
+        if (!Window.IsWindow(hwnd)) { return ""; }
+        nint lenOut = NativeMemory.Alloc(8);
+        nint ok = Window.WinSendMessageTimeoutW(hwnd, 0x000E /*WM_GETTEXTLENGTH*/,
+            0, 0, 0x0002 /*SMTO_ABORTIFHUNG*/, 500, lenOut);
+        int len = new Span<int>(lenOut, 1)[0];
+        NativeMemory.Free(lenOut);
+        if (ok == 0) { return ""; }
+        if (len <= 0) { return ""; }
+        if (len > 0x10000) { len = 0x10000; }
+        nint buf = NativeMemory.Alloc((len + 1) * 2);
+        Window.WinSendMessageTimeoutW(hwnd, 0x000D /*WM_GETTEXT*/,
+            (nint)(len + 1), buf, 0x0002 /*SMTO_ABORTIFHUNG*/, 500, 0);
+        string text = Wide.Read(buf);
+        NativeMemory.Free(buf);
+        return text;
+        #else
+        throw new PlatformNotSupportedException(
+            "System.Automation.Window is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>设置窗口标题/文本(WM_SETTEXT)。返回是否成功;目标无响应时
+    /// 返回 false 而不是卡死。</summary>
+    static bool SetText(nint hwnd, string text) {
+        #if WINDOWS
+        if (!Window.IsWindow(hwnd)) { return false; }
+        nint wtext = Wide.Of(text);
+        nint res = Window.WinSendMessageTimeoutW(hwnd, 0x000C /*WM_SETTEXT*/,
+            0, wtext, 0x0002 /*SMTO_ABORTIFHUNG*/, 500, 0);
+        Wide.Free(wtext);
+        return res != 0;
+        #else
+        throw new PlatformNotSupportedException(
+            "System.Automation.Window is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>窗口类名(GetClassNameW)。</summary>
+    static string GetClassName(nint hwnd) {
+        #if WINDOWS
+        nint buf = NativeMemory.Alloc(512);
+        int n = Window.WinGetClassNameW(hwnd, buf, 256);
+        string s = "";
+        if (n > 0) { s = Wide.Read(buf); }
+        NativeMemory.Free(buf);
+        return s;
+        #else
+        throw new PlatformNotSupportedException(
+            "System.Automation.Window is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>控件 ID(GetDlgCtrlID);非子控件返回 0。</summary>
+    static int GetId(nint hwnd) {
+        #if WINDOWS
+        return Window.WinGetDlgCtrlID(hwnd);
+        #else
+        throw new PlatformNotSupportedException(
+            "System.Automation.Window is not implemented on this platform");
+        #endif
+    }
+
+    // ---- state queries ----
+
+    /// <summary>句柄是否仍是一个有效窗口。</summary>
+    static bool IsWindow(nint hwnd) {
+        #if WINDOWS
+        return Window.WinIsWindow(hwnd) != 0;
+        #else
+        throw new PlatformNotSupportedException(
+            "System.Automation.Window is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>窗口是否可见(WS_VISIBLE,不含 Cloaked 判断)。</summary>
+    static bool IsVisible(nint hwnd) {
+        #if WINDOWS
+        return Window.WinIsWindowVisible(hwnd) != 0;
+        #else
+        throw new PlatformNotSupportedException(
+            "System.Automation.Window is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>窗口是否真正可见:可见且未被 DWM Cloaked 隐藏(UWP 后台
+    /// 标签页等)。</summary>
+    static bool IsReallyVisible(nint hwnd) {
+        #if WINDOWS
+        if (!Window.IsVisible(hwnd)) { return false; }
+        return !Window.IsCloaked(hwnd);
+        #else
+        throw new PlatformNotSupportedException(
+            "System.Automation.Window is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>DWM 是否把窗口标记为 Cloaked(存在但不可见,如 UWP 后台页)。
+    /// Dwmapi 缺失时返回 false。</summary>
+    static bool IsCloaked(nint hwnd) {
+        #if WINDOWS
+        if (Window.dwmModule == 0) {
+            Window.dwmModule = Interop.Load("dwmapi.dll");
+            if (Window.dwmModule != 0) {
+                nint fn = Interop.Symbol(Window.dwmModule, "DwmGetWindowAttribute");
+                if (fn != 0) { Window.dwmGetAttr = (DwmGetAttrFn)fn; }
+            }
+        }
+        if (Window.dwmGetAttr == null) { return false; }
+        nint buf = NativeMemory.Alloc(4);
+        new Span<int>(buf, 1)[0] = 0;
+        int hr = Window.dwmGetAttr(hwnd, 14 /*DWMWA_CLOAKED*/, buf, 4);
+        int v = new Span<int>(buf, 1)[0];
+        NativeMemory.Free(buf);
+        return hr == 0 && v != 0;
+        #else
+        throw new PlatformNotSupportedException(
+            "System.Automation.Window is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>窗口是否启用(未置 WS_DISABLED)。</summary>
+    static bool IsEnabled(nint hwnd) {
+        #if WINDOWS
+        return Window.WinIsWindowEnabled(hwnd) != 0;
+        #else
+        throw new PlatformNotSupportedException(
+            "System.Automation.Window is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>窗口是否失去响应:IsHungAppWindow 或 WM_NULL 在超时内
+    /// 未被处理。</summary>
+    static bool IsHung(nint hwnd, int timeoutMs) {
+        #if WINDOWS
+        if (Window.WinIsHungAppWindow(hwnd) != 0) { return true; }
+        nint res = Window.WinSendMessageTimeoutW(hwnd, 0x0000 /*WM_NULL*/, 0, 0,
+            0x0002 /*SMTO_ABORTIFHUNG*/, timeoutMs, 0);
+        return res == 0;
+        #else
+        throw new PlatformNotSupportedException(
+            "System.Automation.Window is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>窗口是否最小化(IsIconic)。</summary>
+    static bool IsMinimized(nint hwnd) {
+        #if WINDOWS
+        return Window.WinIsIconic(hwnd) != 0;
+        #else
+        throw new PlatformNotSupportedException(
+            "System.Automation.Window is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>窗口是否最大化(IsZoomed)。</summary>
+    static bool IsMaximized(nint hwnd) {
+        #if WINDOWS
+        return Window.WinIsZoomed(hwnd) != 0;
+        #else
+        throw new PlatformNotSupportedException(
+            "System.Automation.Window is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>窗口是否 Unicode 窗口(IsWindowUnicode)。</summary>
+    static bool IsUnicode(nint hwnd) {
+        #if WINDOWS
+        return Window.WinIsWindowUnicode(hwnd) != 0;
+        #else
+        throw new PlatformNotSupportedException(
+            "System.Automation.Window is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>hwnd 是否 parent 的(直接或间接)子窗口。</summary>
+    static bool IsChild(nint parent, nint hwnd) {
+        #if WINDOWS
+        return Window.WinIsChild(parent, hwnd) != 0;
+        #else
+        throw new PlatformNotSupportedException(
+            "System.Automation.Window is not implemented on this platform");
+        #endif
+    }
+
+    // ---- style ----
+
+    /// <summary>窗口样式 GetWindowLongPtr(GWL_STYLE)。</summary>
+    static int GetStyle(nint hwnd) {
+        #if WINDOWS
+        return (int)Window.WinGetWindowLongPtrW(hwnd, -16);
+        #else
+        throw new PlatformNotSupportedException(
+            "System.Automation.Window is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>扩展样式 GetWindowLongPtr(GWL_EXSTYLE)。</summary>
+    static int GetStyleEx(nint hwnd) {
+        #if WINDOWS
+        return (int)Window.WinGetWindowLongPtrW(hwnd, -20);
+        #else
+        throw new PlatformNotSupportedException(
+            "System.Automation.Window is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>样式位是否全部置位(GetStyle &amp; bits == bits)。</summary>
+    static bool HasStyle(nint hwnd, int bits) {
+        #if WINDOWS
+        return (Window.GetStyle(hwnd) & bits) == bits;
+        #else
+        throw new PlatformNotSupportedException(
+            "System.Automation.Window is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>扩展样式位是否全部置位。</summary>
+    static bool HasStyleEx(nint hwnd, int bits) {
+        #if WINDOWS
+        return (Window.GetStyleEx(hwnd) & bits) == bits;
+        #else
+        throw new PlatformNotSupportedException(
+            "System.Automation.Window is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>增删样式位(GWL_STYLE)并应用 SWP_FRAMECHANGED。</summary>
+    static bool ModifyStyle(nint hwnd, int remove, int add) {
+        #if WINDOWS
+        if (!Window.IsWindow(hwnd)) { return false; }
+        int style = Window.GetStyle(hwnd);
+        int next = (style & ~remove) | add;
+        if (next == style) { return true; }
+        nint r = Window.WinSetWindowLongPtrW(hwnd, -16, (nint)next);
+        if (r == 0 && Window.WinGetWindowLongPtrW(hwnd, -16) == 0) { return false; }
+        Window.WinSetWindowPos(hwnd, (nint)0, 0, 0, 0, 0,
+            0x0020 /*SWP_FRAMECHANGED*/ | 0x0001 /*SWP_NOSIZE*/ |
+            0x0002 /*SWP_NOMOVE*/ | 0x0004 /*SWP_NOZORDER*/ | 0x0010 /*SWP_NOACTIVATE*/);
+        return true;
+        #else
+        throw new PlatformNotSupportedException(
+            "System.Automation.Window is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>增删扩展样式位(GWL_EXSTYLE)。</summary>
+    static bool ModifyStyleEx(nint hwnd, int remove, int add) {
+        #if WINDOWS
+        if (!Window.IsWindow(hwnd)) { return false; }
+        int style = Window.GetStyleEx(hwnd);
+        int next = (style & ~remove) | add;
+        if (next == style) { return true; }
+        nint r = Window.WinSetWindowLongPtrW(hwnd, -20, (nint)next);
+        if (r == 0 && Window.WinGetWindowLongPtrW(hwnd, -20) == 0) { return false; }
+        Window.WinSetWindowPos(hwnd, (nint)0, 0, 0, 0, 0,
+            0x0002 /*SWP_NOMOVE*/ | 0x0004 /*SWP_NOZORDER*/ |
+            0x0010 /*SWP_NOACTIVATE*/);
+        return true;
+        #else
+        throw new PlatformNotSupportedException(
+            "System.Automation.Window is not implemented on this platform");
+        #endif
+    }
+
+    // ---- tree queries ----
+
+    /// <summary>直接父窗口(GetParent)。</summary>
+    static nint GetParent(nint hwnd) {
+        #if WINDOWS
+        return Window.WinGetParent(hwnd);
+        #else
+        throw new PlatformNotSupportedException(
+            "System.Automation.Window is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>根窗口(最上层祖先,GetAncestor GA_ROOT)。</summary>
+    static nint GetRoot(nint hwnd) {
+        #if WINDOWS
+        return Window.WinGetAncestor(hwnd, 2 /*GA_ROOT*/);
+        #else
+        throw new PlatformNotSupportedException(
+            "System.Automation.Window is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>根所有者窗口(GA_ROOTOWNER)。</summary>
+    static nint GetRootOwner(nint hwnd) {
+        #if WINDOWS
+        return Window.WinGetAncestor(hwnd, 3 /*GA_ROOTOWNER*/);
+        #else
+        throw new PlatformNotSupportedException(
+            "System.Automation.Window is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>窗口所有者(GetWindow GW_OWNER,即 owner 而非 parent)。</summary>
+    static nint GetOwner(nint hwnd) {
+        #if WINDOWS
+        return Window.WinGetWindow(hwnd, 4 /*GW_OWNER*/);
+        #else
+        throw new PlatformNotSupportedException(
+            "System.Automation.Window is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>窗口所属线程与进程 ID。</summary>
+    static WindowThreadInfo GetThreadProcess(nint hwnd) {
+        #if WINDOWS
+        nint pidBuf = NativeMemory.Alloc(4);
+        new Span<int>(pidBuf, 1)[0] = 0;
+        int tid = Window.WinGetWindowThreadProcessId(hwnd, pidBuf);
+        int pid = new Span<int>(pidBuf, 1)[0];
+        NativeMemory.Free(pidBuf);
+        return WindowThreadInfo.Create(tid, pid);
+        #else
+        throw new PlatformNotSupportedException(
+            "System.Automation.Window is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>窗口所属线程 ID。</summary>
+    static int GetThreadId(nint hwnd) {
+        #if WINDOWS
+        return Window.GetThreadProcess(hwnd).tid;
+        #else
+        throw new PlatformNotSupportedException(
+            "System.Automation.Window is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>窗口所属进程 ID。</summary>
+    static int GetProcessId(nint hwnd) {
+        #if WINDOWS
+        return Window.GetThreadProcess(hwnd).pid;
+        #else
+        throw new PlatformNotSupportedException(
+            "System.Automation.Window is not implemented on this platform");
+        #endif
+    }
+
+    // ---- find & enumerate ----
+
+    /// <summary>句柄是否满足条件:类名/标题为子串匹配(空串不限),ID 大于 0
+    /// 时须相等。</summary>
+    static bool Match(nint hwnd, string cls, string title, int id) {
+        #if WINDOWS
+        if (cls != "") {
+            if (!Window.GetClassName(hwnd).Contains(cls)) { return false; }
+        }
+        if (title != "") {
+            if (!Window.GetText(hwnd).Contains(title)) { return false; }
+        }
+        if (id > 0) {
+            if (Window.GetId(hwnd) != id) { return false; }
+        }
+        return true;
+        #else
+        throw new PlatformNotSupportedException(
+            "System.Automation.Window is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>枚举所有顶层窗口(Z 序)。</summary>
+    static List<nint> EnumTopLevel() {
+        #if WINDOWS
+        List<nint> out2 = new List<nint>();
+        nint hwnd = Window.WinFindWindowExW((nint)0, (nint)0, null, null);
+        while (hwnd != 0) {
+            out2.Add(hwnd);
+            hwnd = Window.WinFindWindowExW((nint)0, hwnd, null, null);
+        }
+        return out2;
+        #else
+        throw new PlatformNotSupportedException(
+            "System.Automation.Window is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>深度枚举 parent 的所有下级窗口(含直接与间接子窗口)。
+    /// `recursive` 为 false 时只列直接子窗口。顺序:先子后父(后序),
+    /// 与 aardio winex.enum 一致。</summary>
+    static List<nint> EnumChildren(nint parent, bool recursive) {
+        #if WINDOWS
+        Window.enumBuf = new List<nint>();
+        if (recursive) {
+            Window.CollectChildren(parent);
+        } else {
+            nint child = Window.WinFindWindowExW(parent, (nint)0, null, null);
+            while (child != 0) {
+                Window.enumBuf.Add(child);
+                child = Window.WinFindWindowExW(parent, child, null, null);
+            }
+        }
+        return Window.enumBuf;
+        #else
+        throw new PlatformNotSupportedException(
+            "System.Automation.Window is not implemented on this platform");
+        #endif
+    }
+
+    #if WINDOWS
+    /// <summary>后序收集 parent 的全部子孙窗口(子先于父,左先于右)。</summary>
+    static void CollectChildren(nint parent) {
+        nint child = Window.WinFindWindowExW(parent, (nint)0, null, null);
+        while (child != 0) {
+            Window.CollectChildren(child);
+            Window.enumBuf.Add(child);
+            child = Window.WinFindWindowExW(parent, child, null, null);
+        }
+    }
+    #endif
+
+    /// <summary>查找第一个满足条件的顶层窗口(类名+标题子串匹配,可限定
+    /// 进程/线程 ID)。未找到返回 0。</summary>
+    static nint FindWindow(string cls, string title, int pid, int tid) {
+        #if WINDOWS
+        List<nint> tops = Window.EnumTopLevel();
+        int i = 0;
+        while (i < tops.Count) {
+            nint hwnd = tops[i];
+            if (!Window.Match(hwnd, cls, title, 0)) { i = i + 1; continue; }
+            if (pid > 0 || tid > 0) {
+                WindowThreadInfo info = Window.GetThreadProcess(hwnd);
+                if (pid > 0 && info.pid != pid) { i = i + 1; continue; }
+                if (tid > 0 && info.tid != tid) { i = i + 1; continue; }
+            }
+            return hwnd;
+        }
+        return (nint)0;
+        #else
+        throw new PlatformNotSupportedException(
+            "System.Automation.Window is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>按标题查找顶层窗口(子串匹配)。</summary>
+    static nint FindWindowByTitle(string title) {
+        return Window.FindWindow("", title, 0, 0);
+    }
+
+    /// <summary>按类名查找顶层窗口(子串匹配)。</summary>
+    static nint FindWindowByClass(string cls) {
+        return Window.FindWindow(cls, "", 0, 0);
+    }
+
+    /// <summary>在 parent 的后代窗口中查找第 `index`(0 起)个满足条件的
+    /// 窗口(后序遍历,子先于父)。未找到返回 0。</summary>
+    static nint FindEx(nint parent, string cls, string title, int id, int index) {
+        #if WINDOWS
+        List<nint> all = Window.EnumChildren(parent, true);
+        int count = 0;
+        int i = 0;
+        while (i < all.Count) {
+            if (Window.Match(all[i], cls, title, id)) {
+                if (count == index) { return all[i]; }
+                count = count + 1;
+            }
+            i = i + 1;
+        }
+        return (nint)0;
+        #else
+        throw new PlatformNotSupportedException(
+            "System.Automation.Window is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>查找所有满足条件的顶层窗口。</summary>
+    static List<nint> FindAll(string cls, string title, int pid, int tid) {
+        #if WINDOWS
+        List<nint> out2 = new List<nint>();
+        List<nint> tops = Window.EnumTopLevel();
+        int i = 0;
+        while (i < tops.Count) {
+            nint hwnd = tops[i];
+            if (!Window.Match(hwnd, cls, title, 0)) { i = i + 1; continue; }
+            if (pid > 0 || tid > 0) {
+                WindowThreadInfo info = Window.GetThreadProcess(hwnd);
+                if (pid > 0 && info.pid != pid) { i = i + 1; continue; }
+                if (tid > 0 && info.tid != tid) { i = i + 1; continue; }
+            }
+            out2.Add(hwnd);
+            i = i + 1;
+        }
+        return out2;
+        #else
+        throw new PlatformNotSupportedException(
+            "System.Automation.Window is not implemented on this platform");
+        #endif
+    }
+
+    // ---- wait ----
+
+    /// <summary>轮询等待满足条件的顶层窗口出现,每 100ms 一次,超时返回 0。
+    /// </summary>
+    static nint WaitForWindow(string cls, string title, int pid, int tid, int timeoutMs) {
+        #if WINDOWS
+        long start = Stopwatch.NowTicks();
+        long freq = Stopwatch.Frequency() / 1000;
+        while (true) {
+            nint hwnd = Window.FindWindow(cls, title, pid, tid);
+            if (hwnd != 0) { return hwnd; }
+            if ((Stopwatch.NowTicks() - start) / freq >= (long)timeoutMs) { return (nint)0; }
+            Thread.Sleep(100);
+        }
+        #else
+        throw new PlatformNotSupportedException(
+            "System.Automation.Window is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>轮询等待 parent 的后代中出现满足条件的子窗口。</summary>
+    static nint WaitForChild(nint parent, string cls, string title, int id, int timeoutMs) {
+        #if WINDOWS
+        long start = Stopwatch.NowTicks();
+        long freq = Stopwatch.Frequency() / 1000;
+        while (true) {
+            nint hwnd = Window.FindEx(parent, cls, title, id, 0);
+            if (hwnd != 0) { return hwnd; }
+            if ((Stopwatch.NowTicks() - start) / freq >= (long)timeoutMs) { return (nint)0; }
+            Thread.Sleep(100);
+        }
+        #else
+        throw new PlatformNotSupportedException(
+            "System.Automation.Window is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>等待窗口销毁(句柄失效),超时返回 false。</summary>
+    static bool WaitForClose(nint hwnd, int timeoutMs) {
+        #if WINDOWS
+        long start = Stopwatch.NowTicks();
+        long freq = Stopwatch.Frequency() / 1000;
+        while (Window.IsWindow(hwnd)) {
+            if ((Stopwatch.NowTicks() - start) / freq >= (long)timeoutMs) { return false; }
+            Thread.Sleep(100);
+        }
+        return true;
+        #else
+        throw new PlatformNotSupportedException(
+            "System.Automation.Window is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>等待窗口可见/隐藏(WS_VISIBLE),超时返回 false。</summary>
+    static bool WaitForVisible(nint hwnd, bool visible, int timeoutMs) {
+        #if WINDOWS
+        long start = Stopwatch.NowTicks();
+        long freq = Stopwatch.Frequency() / 1000;
+        while (Window.IsVisible(hwnd) != visible) {
+            if ((Stopwatch.NowTicks() - start) / freq >= (long)timeoutMs) { return false; }
+            Thread.Sleep(100);
+        }
+        return true;
+        #else
+        throw new PlatformNotSupportedException(
+            "System.Automation.Window is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>等待窗口启用/禁用,超时返回 false。</summary>
+    static bool WaitForEnabled(nint hwnd, bool enabled, int timeoutMs) {
+        #if WINDOWS
+        long start = Stopwatch.NowTicks();
+        long freq = Stopwatch.Frequency() / 1000;
+        while (Window.IsEnabled(hwnd) != enabled) {
+            if ((Stopwatch.NowTicks() - start) / freq >= (long)timeoutMs) { return false; }
+            Thread.Sleep(100);
+        }
+        return true;
+        #else
+        throw new PlatformNotSupportedException(
+            "System.Automation.Window is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>取屏幕上坐标 (x, y) 处的窗口(WindowFromPoint)。</summary>
+    static nint FromPoint(int x, int y) {
+        #if WINDOWS
+        nint buf = NativeMemory.Alloc(8);
+        new Span<int>(buf, 1)[0] = x;
+        new Span<int>(buf + 4, 1)[0] = y;
+        long pt = new Span<long>(buf, 1)[0];
+        NativeMemory.Free(buf);
+        return Window.WinWindowFromPoint(pt);
+        #else
+        throw new PlatformNotSupportedException(
+            "System.Automation.Window is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>取 parent 客户区 (x, y) 处的子窗口(ChildWindowFromPointEx)。
+    /// flags: 0 全部, 1 跳过不可见, 2 跳过禁用, 4 跳过透明。</summary>
+    static nint FromClientPoint(nint parent, int x, int y, int flags) {
+        #if WINDOWS
+        nint buf = NativeMemory.Alloc(8);
+        new Span<int>(buf, 1)[0] = x;
+        new Span<int>(buf + 4, 1)[0] = y;
+        long pt = new Span<long>(buf, 1)[0];
+        NativeMemory.Free(buf);
+        return Window.WinChildWindowFromPointEx(parent, pt, flags);
+        #else
+        throw new PlatformNotSupportedException(
+            "System.Automation.Window is not implemented on this platform");
+        #endif
+    }
+
+    // ---- show / activate / z-order ----
+
+    /// <summary>ShowWindow。常用命令:0=隐藏,1=正常,2=最小化,3=最大化,
+    /// 6=最小化,9=还原。返回句柄有效即成功(ShowWindow 的返回值是
+    /// "之前是否可见",对调用方没有意义)。</summary>
+    static bool Show(nint hwnd, int cmd) {
+        #if WINDOWS
+        if (!Window.IsWindow(hwnd)) { return false; }
+        Window.WinShowWindow(hwnd, cmd);
+        return true;
+        #else
+        throw new PlatformNotSupportedException(
+            "System.Automation.Window is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>显示窗口并还原到正常大小。</summary>
+    static bool ShowNormal(nint hwnd) { return Window.Show(hwnd, 1); }
+
+    /// <summary>最小化窗口。</summary>
+    static bool Minimize(nint hwnd) { return Window.Show(hwnd, 6); }
+
+    /// <summary>最大化窗口。</summary>
+    static bool Maximize(nint hwnd) { return Window.Show(hwnd, 3); }
+
+    /// <summary>还原最小化/最大化的窗口。</summary>
+    static bool Restore(nint hwnd) { return Window.Show(hwnd, 9); }
+
+    /// <summary>隐藏窗口。</summary>
+    static bool Hide(nint hwnd) { return Window.Show(hwnd, 0); }
+
+    /// <summary>把窗口带到前台(SetForegroundWindow)。前台锁限制下可能
+    /// 失败,返回系统调用结果。</summary>
+    static bool SetForeground(nint hwnd) {
+        #if WINDOWS
+        if (Window.WinGetForegroundWindow() == hwnd) { return true; }
+        return Window.WinSetForegroundWindow(hwnd) != 0;
+        #else
+        throw new PlatformNotSupportedException(
+            "System.Automation.Window is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>置顶/取消置顶(HWND_TOPMOST)。</summary>
+    static bool SetTopmost(nint hwnd, bool top) {
+        #if WINDOWS
+        nint after = (nint)0 - 1;   // HWND_TOPMOST
+        if (!top) { after = (nint)0 - 2; }   // HWND_NOTOPMOST
+        return Window.WinSetWindowPos(hwnd, after, 0, 0, 0, 0,
+            0x0001 /*SWP_NOSIZE*/ | 0x0002 /*SWP_NOMOVE*/ |
+            0x0010 /*SWP_NOACTIVATE*/) != 0;
+        #else
+        throw new PlatformNotSupportedException(
+            "System.Automation.Window is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>发送 WM_CLOSE 请求关闭窗口。</summary>
+    static bool Close(nint hwnd) {
+        #if WINDOWS
+        return Window.WinPostMessageW(hwnd, 0x0010 /*WM_CLOSE*/, 0, 0) != 0;
+        #else
+        throw new PlatformNotSupportedException(
+            "System.Automation.Window is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>向窗口所属线程投递 WM_QUIT(要求线程退出消息循环)。
+    /// 注意:这会让整个线程的消息循环退出,不只关闭该窗口。</summary>
+    static bool Quit(nint hwnd) {
+        #if WINDOWS
+        int tid = Window.GetThreadId(hwnd);
+        if (tid == 0) { return false; }
+        return Window.WinPostThreadMessageW(tid, 0x0012 /*WM_QUIT*/, 0, 0) != 0;
+        #else
+        throw new PlatformNotSupportedException(
+            "System.Automation.Window is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>闪烁窗口标题栏吸引注意(FlashWindowEx)。count=0 表示闪烁
+    /// 到窗口被激活为止。</summary>
+    static bool Flash(nint hwnd, int count, int timeoutMs) {
+        #if WINDOWS
+        nint fwi = NativeMemory.Alloc(28);   // FLASHWINFO: 4+8+4+4+4 = 28
+        NativeMemory.Fill(fwi, 0, 28);
+        new Span<int>(fwi, 1)[0] = 28;                 // cbSize
+        new Span<long>(fwi + 8, 1)[0] = (long)hwnd;    // hwnd
+        new Span<int>(fwi + 16, 1)[0] = 3;             // FLASHW_ALL
+        new Span<int>(fwi + 20, 1)[0] = count;
+        new Span<int>(fwi + 24, 1)[0] = timeoutMs;
+        int ok = Window.WinFlashWindowEx(fwi);
+        NativeMemory.Free(fwi);
+        return ok != 0;
+        #else
+        throw new PlatformNotSupportedException(
+            "System.Automation.Window is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>启用/禁用窗口(EnableWindow)。返回句柄有效即成功
+    /// (EnableWindow 的返回值是"之前是否启用")。</summary>
+    static bool Enable(nint hwnd, bool enable) {
+        #if WINDOWS
+        if (!Window.IsWindow(hwnd)) { return false; }
+        Window.WinEnableWindow(hwnd, enable ? 1 : 0);
+        return true;
+        #else
+        throw new PlatformNotSupportedException(
+            "System.Automation.Window is not implemented on this platform");
+        #endif
+    }
+
+    // ---- geometry ----
+
+    /// <summary>窗口屏幕坐标(含边框)。</summary>
+    static WindowRect GetRect(nint hwnd) {
+        #if WINDOWS
+        nint rc = NativeMemory.Alloc(16);
+        Window.WinGetWindowRect(hwnd, rc);
+        int x = new Span<int>(rc, 1)[0];
+        int y = new Span<int>(rc + 4, 1)[0];
+        int w = new Span<int>(rc + 8, 1)[0] - x;
+        int h = new Span<int>(rc + 12, 1)[0] - y;
+        NativeMemory.Free(rc);
+        return WindowRect.Create(x, y, w, h);
+        #else
+        throw new PlatformNotSupportedException(
+            "System.Automation.Window is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>窗口客户区大小(相对窗口原点,一般 x=y=0)。</summary>
+    static WindowRect GetClientRect(nint hwnd) {
+        #if WINDOWS
+        nint rc = NativeMemory.Alloc(16);
+        Window.WinGetClientRect(hwnd, rc);
+        int w = new Span<int>(rc + 8, 1)[0];
+        int h = new Span<int>(rc + 12, 1)[0];
+        NativeMemory.Free(rc);
+        return WindowRect.Create(0, 0, w, h);
+        #else
+        throw new PlatformNotSupportedException(
+            "System.Automation.Window is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>窗口所在显示器的工作区(不含任务栏)。</summary>
+    static WindowRect GetWorkArea(nint hwnd) {
+        #if WINDOWS
+        nint rc = NativeMemory.Alloc(16);
+        Window.WinSystemParametersInfoW(0x0030 /*SPI_GETWORKAREA*/, 0, rc, 0);
+        int x = new Span<int>(rc, 1)[0];
+        int y = new Span<int>(rc + 4, 1)[0];
+        int w = new Span<int>(rc + 8, 1)[0] - x;
+        int h = new Span<int>(rc + 12, 1)[0] - y;
+        NativeMemory.Free(rc);
+        return WindowRect.Create(x, y, w, h);
+        #else
+        throw new PlatformNotSupportedException(
+            "System.Automation.Window is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>移动/调整窗口(MoveWindow)。</summary>
+    static bool Move(nint hwnd, int x, int y, int w, int h, bool repaint) {
+        #if WINDOWS
+        return Window.WinMoveWindow(hwnd, x, y, w, h, repaint ? 1 : 0) != 0;
+        #else
+        throw new PlatformNotSupportedException(
+            "System.Automation.Window is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>只调整大小,位置不变。</summary>
+    static bool Resize(nint hwnd, int w, int h) {
+        #if WINDOWS
+        return Window.WinSetWindowPos(hwnd, (nint)0, 0, 0, w, h,
+            0x0002 /*SWP_NOMOVE*/ | 0x0004 /*SWP_NOZORDER*/ |
+            0x0010 /*SWP_NOACTIVATE*/) != 0;
+        #else
+        throw new PlatformNotSupportedException(
+            "System.Automation.Window is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>把窗口移动到其显示器工作区中央(位置变化,大小不变)。</summary>
+    static bool CenterOnScreen(nint hwnd) {
+        #if WINDOWS
+        WindowRect wa = Window.GetWorkArea(hwnd);
+        WindowRect r = Window.GetRect(hwnd);
+        int x = wa.x + (wa.width - r.width) / 2;
+        int y = wa.y + (wa.height - r.height) / 2;
+        return Window.Move(hwnd, x, y, r.width, r.height, true);
+        #else
+        throw new PlatformNotSupportedException(
+            "System.Automation.Window is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>屏幕坐标 → 客户区坐标(ScreenToClient)。</summary>
+    static WindowPoint ToClient(nint hwnd, int x, int y) {
+        #if WINDOWS
+        nint pt = NativeMemory.Alloc(8);
+        new Span<int>(pt, 1)[0] = x;
+        new Span<int>(pt + 4, 1)[0] = y;
+        Window.WinScreenToClient(hwnd, pt);
+        int cx = new Span<int>(pt, 1)[0];
+        int cy = new Span<int>(pt + 4, 1)[0];
+        NativeMemory.Free(pt);
+        return WindowPoint.Create(cx, cy);
+        #else
+        throw new PlatformNotSupportedException(
+            "System.Automation.Window is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>客户区坐标 → 屏幕坐标(ClientToScreen)。</summary>
+    static WindowPoint ToScreen(nint hwnd, int x, int y) {
+        #if WINDOWS
+        nint pt = NativeMemory.Alloc(8);
+        new Span<int>(pt, 1)[0] = x;
+        new Span<int>(pt + 4, 1)[0] = y;
+        Window.WinClientToScreen(hwnd, pt);
+        int sx = new Span<int>(pt, 1)[0];
+        int sy = new Span<int>(pt + 4, 1)[0];
+        NativeMemory.Free(pt);
+        return WindowPoint.Create(sx, sy);
+        #else
+        throw new PlatformNotSupportedException(
+            "System.Automation.Window is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>客户区矩形 → 屏幕矩形(MapWindowPoints)。</summary>
+    static WindowRect ClientRectToScreen(nint hwnd, int x, int y, int w, int h) {
+        #if WINDOWS
+        nint rc = NativeMemory.Alloc(16);
+        new Span<int>(rc, 1)[0] = x;
+        new Span<int>(rc + 4, 1)[0] = y;
+        new Span<int>(rc + 8, 1)[0] = x + w;
+        new Span<int>(rc + 12, 1)[0] = y + h;
+        // MapWindowPoints(hwnd, 0, &rc, 2): two points, so screen offset is
+        // added to all four coordinates.
+        int ok = Window.WinMapWindowPoints(hwnd, (nint)0, rc, 2);
+        int sx = new Span<int>(rc, 1)[0];
+        int sy = new Span<int>(rc + 4, 1)[0];
+        int sx2 = new Span<int>(rc + 8, 1)[0];
+        int sy2 = new Span<int>(rc + 12, 1)[0];
+        NativeMemory.Free(rc);
+        if (ok == 0) { return WindowRect.Create(x, y, w, h); }
+        return WindowRect.Create(sx, sy, sx2 - sx, sy2 - sy);
+        #else
+        throw new PlatformNotSupportedException(
+            "System.Automation.Window is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>当前前台窗口。</summary>
+    static nint GetForeground() {
+        #if WINDOWS
+        return Window.WinGetForegroundWindow();
+        #else
+        throw new PlatformNotSupportedException(
+            "System.Automation.Window is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>桌面窗口。</summary>
+    static nint GetDesktop() {
+        #if WINDOWS
+        return Window.WinGetDesktopWindow();
+        #else
+        throw new PlatformNotSupportedException(
+            "System.Automation.Window is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>hwnd 所在线程当前拥有焦点的窗口(GetGUIThreadInfo)。
+    /// hwnd 为 0 时查前台窗口的线程。</summary>
+    static nint GetFocus(nint hwnd) {
+        #if WINDOWS
+        if (hwnd == 0) { hwnd = Window.GetForeground(); }
+        if (hwnd == 0) { return (nint)0; }
+        int tid = Window.GetThreadId(hwnd);
+        if (tid == 0) { return (nint)0; }
+        nint info = NativeMemory.Alloc(80);
+        NativeMemory.Fill(info, 0, 80);
+        new Span<int>(info, 1)[0] = 72;          // sizeof(GUITHREADINFO)
+        int ok = Window.WinGetGUIThreadInfo(tid, info);
+        nint focus = (nint)0;
+        if (ok != 0) { focus = (nint)new Span<long>(info + 16, 1)[0]; }
+        NativeMemory.Free(info);
+        return focus;
+        #else
+        throw new PlatformNotSupportedException(
+            "System.Automation.Window is not implemented on this platform");
+        #endif
+    }
+
+    // ---- interaction ----
+
+    /// <summary>点击按钮控件(投递 BM_CLICK)。</summary>
+    static bool Click(nint hwnd) {
+        #if WINDOWS
+        return Window.WinPostMessageW(hwnd, 0x00F5 /*BM_CLICK*/, 0, 0) != 0;
+        #else
+        throw new PlatformNotSupportedException(
+            "System.Automation.Window is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>向窗口发送 WM_COMMAND 命令(点击菜单项、按钮 ID 等)。</summary>
+    static bool ClickCommand(nint hwnd, int cmdId) {
+        #if WINDOWS
+        return Window.WinPostMessageW(hwnd, 0x0111 /*WM_COMMAND*/, (long)cmdId, 0) != 0;
+        #else
+        throw new PlatformNotSupportedException(
+            "System.Automation.Window is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>窗口主菜单句柄(GetMenu)。</summary>
+    static nint GetMenu(nint hwnd) {
+        #if WINDOWS
+        return Window.WinGetMenu(hwnd);
+        #else
+        throw new PlatformNotSupportedException(
+            "System.Automation.Window is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>在菜单中按文本(子串,忽略 "&")查找项,返回其位置;找不到
+    /// 返回 -1。`label` 不含 "&" 时两边都去掉 "&" 再比。</summary>
+    static int FindMenuItem(nint hMenu, string label) {
+        #if WINDOWS
+        if (hMenu == 0) { return -1; }
+        int count = Window.WinGetMenuItemCount(hMenu);
+        int pos = 0;
+        while (pos < count) {
+            nint buf = NativeMemory.Alloc(1024);
+            int len = Window.WinGetMenuStringW(hMenu, pos, buf, 512, 0x0400 /*MF_BYPOSITION*/);
+            string item = "";
+            if (len > 0) { item = Wide.Read(buf); }
+            NativeMemory.Free(buf);
+            string target = item;
+            if (label.IndexOf("&") < 0) { target = item.Replace("&", ""); }
+            if (target.Contains(label)) { return pos; }
+            pos = pos + 1;
+        }
+        return -1;
+        #else
+        throw new PlatformNotSupportedException(
+            "System.Automation.Window is not implemented on this platform");
+        #endif
+    }
+
+    #if WINDOWS
+    /// <summary>沿菜单路径 `path`(从 level 起)逐层下钻,返回叶项的命令
+    /// ID;任何一层找不到返回 -1。子菜单用 GetSubMenu 进入。</summary>
+    static int WalkMenu(nint hMenu, List<string> path, int level) {
+        int pos = Window.FindMenuItem(hMenu, path[level]);
+        if (pos < 0) { return -1; }
+        int id = Window.WinGetMenuItemID(hMenu, pos);
+        if (id == -1 /*MF_POPUP 子菜单*/) {
+            if (level + 1 >= path.Count) { return -1; }
+            nint sub = Window.WinGetSubMenu(hMenu, pos);
+            if (sub == 0) { return -1; }
+            return Window.WalkMenu(sub, path, level + 1);
+        }
+        return id;
+    }
+    #endif
+
+    /// <summary>点击菜单命令,路径用 "/" 分隔,如 "文件/打开"。按文本
+    /// (子串,忽略 "&")逐层查找后投递 WM_COMMAND。找不到返回 false。</summary>
+    static bool ClickMenu(nint hwnd, string path) {
+        #if WINDOWS
+        nint hMenu = Window.GetMenu(hwnd);
+        if (hMenu == 0) { return false; }
+        List<string> parts = path.Split("/");
+        if (parts.Count < 1) { return false; }
+        int id = Window.WalkMenu(hMenu, parts, 0);
+        if (id < 0) { return false; }
+        return Window.WinPostMessageW(hwnd, 0x0111 /*WM_COMMAND*/, (long)id, 0) != 0;
+        #else
+        throw new PlatformNotSupportedException(
+            "System.Automation.Window is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>同步发送消息(SendMessageW),等待目标处理完成。</summary>
+    static long SendMessage(nint hwnd, int msg, long wp, long lp) {
+        #if WINDOWS
+        return Window.WinSendMessageW(hwnd, msg, wp, lp);
+        #else
+        throw new PlatformNotSupportedException(
+            "System.Automation.Window is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>异步投递消息(PostMessageW)。</summary>
+    static bool PostMessage(nint hwnd, int msg, long wp, long lp) {
+        #if WINDOWS
+        return Window.WinPostMessageW(hwnd, msg, wp, lp) != 0;
+        #else
+        throw new PlatformNotSupportedException(
+            "System.Automation.Window is not implemented on this platform");
+        #endif
+    }
+}

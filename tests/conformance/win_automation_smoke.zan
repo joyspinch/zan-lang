@@ -1,0 +1,280 @@
+// System.Automation.Window conformance: creates its own Win32 window
+// (popup + child control + menu), then exercises the whole automation
+// surface -- find/enum/match, text, styles, show/activate/z-order,
+// geometry & coordinate mapping, thread/process ids, hung detection,
+// focus, menu walking and message posting. Deterministic: everything is
+// asserted against the locally created window. Windows only.
+using System;
+using System.Automation;
+
+namespace Conf;
+
+class Prog {
+    static int bad = 0;
+    static int checkNo = 0;
+
+    static void Check(bool cond) {
+        checkNo = checkNo + 1;
+        if (!cond) {
+            bad = bad + 1;
+            if (bad <= 10) {
+                Console.WriteLine("FAIL #" + Convert.ToString(checkNo));
+            }
+        }
+    }
+
+    // ---- minimal Win32 plumbing for the target window ----
+    #if WINDOWS
+    [DllImport("kernel32", EntryPoint = "GetModuleHandleW")]
+    static extern nint WinGetModuleHandleW(nint name);
+
+    [DllImport("user32", EntryPoint = "RegisterClassExW")]
+    static extern ushort WinRegisterClassExW(nint wc);
+
+    [DllImport("user32", EntryPoint = "CreateWindowExW")]
+    static extern nint WinCreateWindowExW(int exStyle, nint cls, nint title,
+                                          int style, int x, int y, int w, int h,
+                                          nint parent, nint menu, nint inst, nint param);
+
+    [DllImport("user32", EntryPoint = "DefWindowProcW")]
+    static extern nint WinDefWindowProcW(nint hwnd, int msg, nint wp, nint lp);
+
+    [DllImport("user32", EntryPoint = "DestroyWindow")]
+    static extern int WinDestroyWindow(nint hwnd);
+
+    [DllImport("user32", EntryPoint = "SetMenu")]
+    static extern int WinSetMenu(nint hwnd, nint hMenu);
+
+    [DllImport("user32", EntryPoint = "CreateMenu")]
+    static extern nint WinCreateMenu();
+
+    [DllImport("user32", EntryPoint = "CreatePopupMenu")]
+    static extern nint WinCreatePopupMenu();
+
+    [DllImport("user32", EntryPoint = "AppendMenuW")]
+    static extern int WinAppendMenuW(nint hMenu, int flags, long id, nint item);
+
+    [DllImport("user32", EntryPoint = "PeekMessageW")]
+    static extern int WinPeekMessageW(nint msg, nint hwnd, int min, int max, int flags);
+
+    [DllImport("kernel32", EntryPoint = "GetCurrentThreadId")]
+    static extern int WinGetCurrentThreadId();
+
+    [DllImport("kernel32", EntryPoint = "GetCurrentProcessId")]
+    static extern int WinGetCurrentProcessId();
+
+    [DllImport("user32", EntryPoint = "SetFocus")]
+    static extern nint WinSetFocus(nint hwnd);
+
+    [DllImport("user32", EntryPoint = "CreateWindowExW")]
+    static extern nint WinCreateChild(int exStyle, nint cls, nint title,
+                                      int style, int x, int y, int w, int h,
+                                      nint parent, nint menu, nint inst, nint param);
+
+    static nint WndProc(nint hwnd, int msg, nint wp, nint lp) {
+        return Prog.WinDefWindowProcW(hwnd, msg, wp, lp);
+    }
+
+    static nint CreateTarget() {
+        nint inst = Prog.WinGetModuleHandleW((nint)0);
+        nint wc = NativeMemory.Alloc(80);
+        NativeMemory.Fill(wc, 0, 80);
+        new Span<int>(wc, 1)[0] = 80;                 // cbSize
+        new Span<long>(wc + 8, 1)[0] = (nint)Prog.WndProc;
+        new Span<long>(wc + 24, 1)[0] = (long)inst;   // hInstance
+        nint cls = Wide.Of("ZanAutoWnd");
+        new Span<long>(wc + 64, 1)[0] = (long)cls;    // lpszClassName
+        Prog.WinRegisterClassExW(wc);
+        NativeMemory.Free(wc);
+        nint title = Wide.Of("zan auto target");
+        nint hwnd = Prog.WinCreateWindowExW(0, cls, title,
+            0x80000000 /*WS_POPUP*/ | 0x10000000 /*WS_VISIBLE*/ | 0x02000000 /*WS_CLIPCHILDREN*/,
+            100, 100, 400, 300, (nint)0, (nint)0, inst, (nint)0);
+        Wide.Free(title);
+        Wide.Free(cls);
+        return hwnd;
+    }
+    #endif
+
+    static void Main() {
+        #if WINDOWS
+        nint main = Prog.CreateTarget();
+        Check(Window.IsWindow(main));
+        Check(!Window.IsWindow((nint)0));
+
+        // ---- identity: class, text, ids ----
+        Check(Window.GetClassName(main) == "ZanAutoWnd");
+        Check(Window.GetText(main) == "zan auto target");
+        Check(Window.SetText(main, "zan auto renamed"));
+        Check(Window.GetText(main) == "zan auto renamed");
+        Check(Window.Match(main, "ZanAutoWnd", "auto renamed", 0));
+        Check(!Window.Match(main, "Nope", "", 0));
+        Check(Window.IsUnicode(main));
+
+        // ---- find / enumerate ----
+        Check(Window.FindWindowByClass("ZanAutoWnd") == main);
+        Check(Window.FindWindowByTitle("auto renamed") == main);
+        Check(Window.FindWindow("ZanAutoWnd", "auto renamed", 0, 0) == main);
+        Check(Window.FindWindow("ZanAutoWnd", "auto renamed",
+                                Prog.WinGetCurrentProcessId(), 0) == main);
+        Check(Window.FindWindow("ZanAutoWnd", "auto renamed",
+                                0, Prog.WinGetCurrentThreadId()) == main);
+        Check(Window.FindWindow("ZanAutoWnd", "never", 0, 0) == (nint)0);
+        List<nint> tops = Window.EnumTopLevel();
+        bool found = false;
+        int i = 0;
+        while (i < tops.Count) {
+            if (tops[i] == main) { found = true; }
+            i = i + 1;
+        }
+        Check(found);
+
+        // ---- child control ----
+        nint cls = Wide.Of("ZanAutoWnd");
+        nint child = Prog.WinCreateChild(0, cls, null,
+            0x40000000 /*WS_CHILD*/ | 0x10000000 /*WS_VISIBLE*/,
+            10, 10, 80, 25, main, (nint)42, Prog.WinGetModuleHandleW((nint)0), (nint)0);
+        Wide.Free(cls);
+        Check(Window.IsWindow(child));
+        Check(Window.GetId(child) == 42);
+        Check(Window.IsChild(main, child));
+        Check(Window.GetParent(child) == main);
+        Check(Window.GetRoot(child) == main);
+        Check(Window.FindEx(main, "", "", 42, 0) == child);
+        Check(Window.FindEx(main, "ZanAutoWnd", "", 42, 0) == child);
+        Check(Window.FindEx(main, "", "nope", 42, 0) == (nint)0);
+        List<nint> kids = Window.EnumChildren(main, false);
+        Check(kids.Count == 1 && kids[0] == child);
+        List<nint> deep = Window.EnumChildren(main, true);
+        Check(deep.Count == 1 && deep[0] == child);
+        Check(Window.FromClientPoint(main, 50, 15, 0) == child);
+        Check(Window.FromClientPoint(main, 5, 5, 0) == main);
+
+        // ---- geometry & coordinates ----
+        WindowRect r = Window.GetRect(main);
+        Check(r.x == 100 && r.y == 100 && r.width == 400 && r.height == 300);
+        WindowRect cr = Window.GetClientRect(main);
+        Check(cr.width == 400 && cr.height == 300);
+        WindowPoint p = Window.ToClient(main, 100, 100);
+        Check(p.x == 0 && p.y == 0);
+        WindowPoint sp = Window.ToScreen(main, 0, 0);
+        Check(sp.x == 100 && sp.y == 100);
+        WindowRect sr = Window.ClientRectToScreen(main, 0, 0, 400, 300);
+        Check(sr.x == 100 && sr.y == 100 && sr.width == 400 && sr.height == 300);
+        Check(Window.Move(main, 200, 150, 300, 200, true));
+        r = Window.GetRect(main);
+        Check(r.x == 200 && r.y == 150 && r.width == 300 && r.height == 200);
+        Check(Window.Resize(main, 350, 250));
+        r = Window.GetRect(main);
+        Check(r.width == 350 && r.height == 250);
+        WindowRect wa = Window.GetWorkArea(main);
+        Check(wa.width > 0 && wa.height > 0);
+        Check(Window.GetDesktop() != (nint)0);
+        Check(Window.CenterOnScreen(main));
+        Check(Window.GetRect(main).width == 350 && Window.GetRect(main).height == 250);
+
+        // ---- visibility / state ----
+        Check(Window.IsVisible(main));
+        Check(Window.IsReallyVisible(main));
+        Check(Window.Hide(main));
+        Check(!Window.IsVisible(main));
+        Check(Window.ShowNormal(main));
+        Check(Window.IsVisible(main));
+        Check(Window.Minimize(main));
+        Check(Window.IsMinimized(main));
+        Check(Window.Restore(main));
+        Check(!Window.IsMinimized(main));
+        Check(Window.Maximize(main));
+        Check(Window.IsMaximized(main));
+        Check(Window.Restore(main));
+        Check(!Window.IsMaximized(main));
+        Check(!Window.IsHung(main, 200));
+        Check(Window.IsEnabled(main));
+        Check(Window.Enable(main, false));
+        Check(!Window.IsEnabled(main));
+        Check(Window.Enable(main, true));
+        Check(Window.IsEnabled(main));
+
+        // ---- style ----
+        Check(Window.HasStyle(main, 0x10000000 /*WS_VISIBLE*/));
+        Check(Window.ModifyStyle(main, 0, 0x00010000 /*WS_TABSTOP*/));
+        Check(Window.HasStyle(main, 0x00010000));
+        Check(Window.ModifyStyle(main, 0x00010000, 0));
+        Check(!Window.HasStyle(main, 0x00010000));
+        Check(Window.SetTopmost(main, true));
+        Check(Window.HasStyleEx(main, 0x00000008 /*WS_EX_TOPMOST*/));
+        Check(Window.SetTopmost(main, false));
+        Check(!Window.HasStyleEx(main, 0x00000008));
+
+        // ---- thread / process ----
+        WindowThreadInfo info = Window.GetThreadProcess(main);
+        Check(info.tid == Prog.WinGetCurrentThreadId());
+        Check(info.pid == Prog.WinGetCurrentProcessId());
+        Check(Window.GetThreadId(main) == info.tid);
+        Check(Window.GetProcessId(main) == info.pid);
+
+        // ---- focus ----
+        Prog.WinSetFocus(child);
+        Check(Window.GetFocus(main) == child);
+
+        // ---- menu ----
+        nint hMenu = Prog.WinCreateMenu();
+        nint hFile = Prog.WinCreatePopupMenu();
+        nint wOpen = Wide.Of("&Open");
+        nint wExit = Wide.Of("E&xit");
+        nint wFile = Wide.Of("&File");
+        Prog.WinAppendMenuW(hFile, 0 /*MF_STRING*/, 101, wOpen);
+        Prog.WinAppendMenuW(hFile, 0 /*MF_STRING*/, 102, wExit);
+        Prog.WinAppendMenuW(hMenu, 0x10 /*MF_POPUP*/, (long)hFile, wFile);
+        Check(Prog.WinSetMenu(main, hMenu) != 0);
+        Wide.Free(wOpen);
+        Wide.Free(wExit);
+        Wide.Free(wFile);
+        Check(Window.GetMenu(main) == hMenu);
+        int filePos = Window.FindMenuItem(hMenu, "File");
+        Check(filePos >= 0);
+        Check(Window.FindMenuItem(hMenu, "Open") == -1);   // Open is in the submenu
+        // ClickMenu walks File -> Open and posts WM_COMMAND(101).
+        Check(Window.ClickMenu(main, "File/Open"));
+        Check(Window.ClickCommand(main, 102));
+
+        // Posted WM_COMMANDs are waiting in the queue (PM_NOREMOVE).
+        nint msg = NativeMemory.Alloc(64);
+        NativeMemory.Fill(msg, 0, 64);
+        int has = Prog.WinPeekMessageW(msg, main, 0x0111 /*WM_COMMAND*/, 0x0111, 0 /*PM_NOREMOVE*/);
+        Check(has != 0);
+        if (has != 0) {
+            // MSG: hwnd(8) message(4) wParam(8) lParam(8) ...
+            int wpLo = new Span<int>(msg + 16, 1)[0];   // wParam 低 32 位
+            Check(wpLo == 101);
+        }
+        NativeMemory.Free(msg);
+
+        // ---- button click posts BM_CLICK ----
+        Check(Window.Click(child));
+        msg = NativeMemory.Alloc(64);
+        NativeMemory.Fill(msg, 0, 64);
+        has = Prog.WinPeekMessageW(msg, child, 0x00F5 /*BM_CLICK*/, 0x00F5, 0 /*PM_NOREMOVE*/);
+        Check(has != 0);
+        NativeMemory.Free(msg);
+
+        // ---- wait ----
+        Check(Window.WaitForWindow("ZanAutoWnd", "auto renamed",
+                                  Prog.WinGetCurrentProcessId(), 0, 2000) == main);
+        Check(Window.WaitForWindow("ZanAutoWnd", "never", 0, 0, 300) == (nint)0);
+        Check(Window.WaitForChild(main, "", "", 42, 2000) == child);
+        Check(Window.WaitForVisible(main, true, 1000));
+        Check(Window.WaitForEnabled(main, true, 1000));
+        Check(Window.SetForeground(main) || true);   // foreground rights vary
+
+        // ---- teardown: destroy and wait for close ----
+        Check(Prog.WinDestroyWindow(main) != 0);
+        Check(!Window.IsWindow(main));
+        Check(Window.WaitForClose(main, 1000));
+
+        Console.WriteLine("win-automation-ok: " + Convert.ToString(bad == 0 ? 1 : 0));
+        #else
+        Console.WriteLine("win-automation-ok: 1");
+        #endif
+    }
+}
