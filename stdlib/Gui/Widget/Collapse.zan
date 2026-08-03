@@ -3,6 +3,19 @@ using Gui;
 
 namespace Gui.Widget;
 
+/// One accordion panel: its title and body travel together as one record.
+class CollapsePanel {
+    string title;
+    string body;
+
+    static CollapsePanel Create(string title, string body) {
+        CollapsePanel panel = new CollapsePanel();
+        panel.title = title;
+        panel.body = body;
+        return panel;
+    }
+}
+
 /// Accordion (NaiveUI n-collapse). One panel open at a time; `Active` holds the
 /// open panel index (-1 = all collapsed) and is two-way bindable:
 ///
@@ -10,8 +23,7 @@ namespace Gui.Widget;
 ///     c.AddPanel("General", "Theme, language and startup");
 ///     c.Active = vm.openPanel;
 class Collapse : Control {
-    List<string> titles;
-    List<string> bodies;
+    List<CollapsePanel> panels;
     SignalInt open;
     /// Two-way open index; -1 collapses every panel.
     Binding<int> Active;
@@ -22,8 +34,7 @@ class Collapse : Control {
 
     void InitCollapse(SignalInt m) {
         this.InitControl("collapse", 1);
-        titles = new List<string>();
-        bodies = new List<string>();
+        panels = new List<CollapsePanel>();
         open = m;
         baseId = 0;
         idCount = 0;
@@ -36,18 +47,17 @@ class Collapse : Control {
 
     /// Named AddPanel (not Add) so it does not shadow Control.Add(Control).
     void AddPanel(string title, string body) {
-        titles.Add(title);
-        bodies.Add(body);
+        panels.Add(CollapsePanel.Create(title, body));
     }
 
-    /// An accordion over existing title/body lists.
-    static Collapse Of(List<string> titles, List<string> bodies, SignalInt m) {
+    void AddPanel(CollapsePanel panel) { panels.Add(panel); }
+
+    /// An accordion over existing panel records.
+    static Collapse Of(List<CollapsePanel> items, SignalInt m) {
         Collapse col = new Collapse(m);
         int i = 0;
-        while (i < titles.Count) {
-            string b = "";
-            if (i < bodies.Count) { b = bodies[i]; }
-            col.AddPanel(titles[i], b);
+        while (i < items.Count) {
+            col.AddPanel(items[i]);
             i = i + 1;
         }
         return col;
@@ -70,9 +80,9 @@ class Collapse : Control {
     /// Panel headers take one id each, reserved as one contiguous block so the
     /// hit ids stay stable while the panel list does not change.
     void EnsureIds() {
-        if (idCount >= titles.Count) { return; }
-        baseId = WidgetId.Block(titles.Count);
-        idCount = titles.Count;
+        if (idCount >= panels.Count) { return; }
+        baseId = WidgetId.Block(panels.Count);
+        idCount = panels.Count;
     }
 
     void SyncBinding() {
@@ -84,7 +94,7 @@ class Collapse : Control {
     override void OnMeasure(App app) {
         StyleBox s = this.ResolveStyleAs(app, "collapse", Class,
                                          Style.SNormal());
-        prefH = Collapse.Height(app, titles.Count, open);
+        prefH = Collapse.Height(app, panels.Count, open);
         prefW = s.WidthOr(app.Scale(240));
     }
 
@@ -104,7 +114,7 @@ class Collapse : Control {
         int headFont = hs.FontOr(t.fontSizeMedium);
         int bodyFont = bs.FontOr(t.fontSizeSmall);
         int ico = as2.WidthOr(t.iconSizeSmall);
-        int n = titles.Count;
+        int n = panels.Count;
         int opened = open.Get();
         int cy = by;
 
@@ -113,6 +123,7 @@ class Collapse : Control {
         c.PushClip(bx, by, bw, bh);
         int i = 0;
         while (i < n) {
+            CollapsePanel panel = panels[i];
             int id = baseId + i;
             bool isOpen = i == opened;
             if (i > 0) { c.FillRect(bx, cy, bw, 1, t.divider); }
@@ -132,17 +143,17 @@ class Collapse : Control {
             int textX = bx + t.paddingMedium + ico + t.gapMedium;
             int textMaxW = bx + bw - t.paddingMedium - textX;
             c.DrawText(textX, cy + (headerH - Canvas.FontHeight(headFont)) / 2,
-                       Ellipsis.Fit(titles[i], textMaxW, headFont),
+                       Ellipsis.Fit(panel.title, textMaxW, headFont),
                        hs.FgOr(t.textPrimary), headFont);
 
             app.hitTester.Register(HitRegion.Create(id, bx, cy, bw, headerH, 0));
             cy = cy + headerH;
 
-            if (isOpen && i < bodies.Count) {
+            if (isOpen) {
                 c.FillRect(bx, cy, bw, bodyH, bs.BgOr(t.bgSecondary));
                 c.DrawText(textX,
                            cy + (bodyH - Canvas.FontHeight(bodyFont)) / 2,
-                           Ellipsis.Fit(bodies[i], textMaxW, bodyFont),
+                           Ellipsis.Fit(panel.body, textMaxW, bodyFont),
                            bs.FgOr(t.textSecondary), bodyFont);
                 cy = cy + bodyH;
             }
@@ -176,17 +187,43 @@ class Collapse : Control {
         return ps;
     }
 
-    /// Panels are lists, so they travel as comma-separated values.
+    /// The designer still exposes titles and bodies as separate serialized
+    /// properties, but runtime state remains a single panel entity list.
     override string GetExtra(string key) {
-        if (key == "titles") { return string.Join(",", titles); }
-        if (key == "bodies") { return string.Join(",", bodies); }
-        return "";
+        List<string> values = new List<string>();
+        int i = 0;
+        while (i < panels.Count) {
+            if (key == "titles") { values.Add(panels[i].title); }
+            else if (key == "bodies") { values.Add(panels[i].body); }
+            else { return ""; }
+            i = i + 1;
+        }
+        return string.Join(",", values);
     }
 
     override bool SetExtra(string key, string val) {
-        if (key == "titles") { titles = val.Split(","); return true; }
-        if (key == "bodies") { bodies = val.Split(","); return true; }
-        return false;
+        if (key != "titles" && key != "bodies") { return false; }
+        List<string> values = val.Split(",");
+        List<CollapsePanel> next = new List<CollapsePanel>();
+        int count = panels.Count;
+        if (values.Count > count) { count = values.Count; }
+        int i = 0;
+        while (i < count) {
+            string title = "";
+            string body = "";
+            if (i < panels.Count) {
+                title = panels[i].title;
+                body = panels[i].body;
+            }
+            if (i < values.Count) {
+                if (key == "titles") { title = values[i]; }
+                else { body = values[i]; }
+            }
+            next.Add(CollapsePanel.Create(title, body));
+            i = i + 1;
+        }
+        panels = next;
+        return true;
     }
 
     override List<string> Events() {

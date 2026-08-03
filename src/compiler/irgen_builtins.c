@@ -2135,10 +2135,15 @@ static void pack_params_args(zan_irgen_t *g, zan_ast_node_t *call,
         method_sym->decl->kind != AST_METHOD_DECL) return;
     if (!method_is_params_variadic(method_sym)) return;
     zan_ast_list_t *ps = &method_sym->decl->method_decl.params;
-    int fixed = ps->count - 1;
+    /* Operator methods declare an injected receiver (`self`) which does not
+     * appear in the source call's argument list. */
+    int injected = method_sym->name.len == 7 &&
+        memcmp(method_sym->name.str, "op_call", 7) == 0;
+    int visible = ps->count - injected;
+    int fixed = visible - 1;
     int argc = call->call.args.count;
     if (argc < fixed) return;
-    if (argc == ps->count) {
+    if (argc == visible) {
         zan_ast_node_t *la = call->call.args.items[argc - 1];
         if (la->kind == AST_NEW_EXPR) return; /* already packed / explicit list */
         zan_type_t *lt = infer_expr_type(g, la, locals);

@@ -1,0 +1,216 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+class MarketplaceBrowser {
+    static MarketplaceBrowser current;
+    static int lang;
+
+    List<MarketplacePackage> packages;
+    ListView<MarketplacePackage> packageList;
+    MarketplacePackage selectedPackage;
+    string status;
+    bool loading;
+    bool confirmInstall;
+    string requestedPackage;
+
+    static string T(string en, string zh) {
+        if (MarketplaceBrowser.lang == 1) { return zh; }
+        return en;
+    }
+
+    static string PriceLabel(MarketplacePackage package) {
+        if (package.IsFree()) { return T("Free", "免费"); }
+        return Convert.ToString(package.pricePoints) + T(" pts", " 积分");
+    }
+
+    static void Selected() {
+        MarketplaceBrowser browser = MarketplaceBrowser.current;
+        if (browser == null || !browser.packageList.HasSelection()) { return; }
+        browser.selectedPackage = browser.packageList.Selected();
+        browser.confirmInstall = false;
+        browser.loading = true;
+        browser.status = T("Loading package details...", "正在加载库详情...");
+        string err = MarketplaceClient.StartProduct(browser.selectedPackage.id);
+        if (err != "") {
+            browser.loading = false;
+            browser.status = err;
+        }
+    }
+
+    static MarketplaceBrowser Create(int uiLang) {
+        MarketplaceBrowser.lang = uiLang;
+        MarketplaceBrowser browser = new MarketplaceBrowser();
+        browser.packages = new List<MarketplacePackage>();
+        List<ListColumn<MarketplacePackage>> columns = new List<ListColumn<MarketplacePackage>>();
+        columns.Add(new ListColumn<MarketplacePackage>(T("Package", "库"), 3,
+            package => package.displayName));
+        columns.Add(new ListColumn<MarketplacePackage>(T("Namespace", "命名空间"), 2,
+            package => package.packageName));
+        columns.Add(new ListColumn<MarketplacePackage>(T("Category", "分类"), 2,
+            package => package.category));
+        columns.Add(new ListColumn<MarketplacePackage>(T("Price", "价格"), 1,
+            package => MarketplaceBrowser.PriceLabel(package)).Right());
+        browser.packageList = new ListView<MarketplacePackage>(columns);
+        browser.packageList.EmptyText(T("No packages available.", "暂无可用库。"));
+        browser.packageList.Bind(browser.packages);
+        browser.packageList.OnSelect(MarketplaceBrowser.Selected);
+        browser.selectedPackage = null;
+        browser.status = T("Loading marketplace...", "正在加载商城...");
+        browser.loading = true;
+        browser.confirmInstall = false;
+        browser.requestedPackage = "";
+        MarketplaceBrowser.current = browser;
+        string err = MarketplaceClient.StartCatalog();
+        if (err != "") {
+            browser.loading = false;
+            browser.status = err;
+        }
+        return browser;
+    }
+
+    bool Prefix(string text, string prefix) {
+        return text.Length >= prefix.Length
+            && text.Substring(0, prefix.Length) == prefix;
+    }
+
+    void Poll() {
+        if (!loading) { return; }
+        string done = MarketplaceClient.Done();
+        if (done == "") { return; }
+        MarketplaceClient.Clear();
+        loading = false;
+        if (Prefix(done, "err:")) {
+            status = done.Substring(4, done.Length - 4);
+            return;
+        }
+        if (!Prefix(done, "ok:")) {
+            status = T("Invalid marketplace response.", "商城响应无效。");
+            return;
+        }
+        string body = done.Substring(3, done.Length - 3);
+        if (selectedPackage != null && packages.Count > 0) {
+            MarketplacePackage detail = MarketplaceResponse.Product(body);
+            if (detail == null) {
+                status = T("Could not load package details.", "无法加载库详情。");
+                return;
+            }
+            selectedPackage = detail;
+            status = T("Package details loaded.", "库详情已加载。");
+            return;
+        }
+        packages = MarketplaceResponse.Catalog(body);
+        packageList.Bind(packages);
+        status = Convert.ToString(packages.Count) + T(" packages", " 个库");
+        if (requestedPackage != "") {
+            int i = 0;
+            while (i < packages.Count) {
+                if (packages[i].packageName == requestedPackage) {
+                    requestedPackage = "";
+                    packageList.SelectIndex(i);
+                    return;
+                }
+                i = i + 1;
+            }
+            status = T("Missing package is not listed: ", "商城中未找到缺失库：")
+                + requestedPackage;
+            requestedPackage = "";
+        }
+    }
+
+    void Locate(string packageName) {
+        requestedPackage = packageName;
+        int i = 0;
+        while (i < packages.Count) {
+            if (packages[i].packageName == packageName) {
+                requestedPackage = "";
+                packageList.SelectIndex(i);
+                return;
+            }
+            i = i + 1;
+        }
+        if (!loading) { Refresh(); }
+    }
+
+    void Refresh() {
+        if (loading) { return; }
+        selectedPackage = null;
+        packageList.ClearSelection();
+        confirmInstall = false;
+        loading = true;
+        status = T("Loading marketplace...", "正在加载商城...");
+        string err = MarketplaceClient.StartCatalog();
+        if (err != "") {
+            loading = false;
+            status = err;
+        }
+    }
+
+    MarketplacePackage SelectedPackage() { return selectedPackage; }
+
+    int RenderInside(App app, int x, int y, int w, int h) {
+        Poll();
+        int pad = app.Scale(16);
+        int gap = app.Scale(8);
+        int toolbarY = y + pad;
+        Button refresh = new Button { Text = T("Refresh", "刷新"), Icon = "refresh", Class = "small" };
+        int refreshId = refresh.Render(app, x + pad, toolbarY, refresh.AutoWidth(app));
+        app.canvas.DrawStyledText(
+            Style.Of(app, "label", "secondary small", Style.SNormal()),
+            x + pad + refresh.AutoWidth(app) + gap, toolbarY + app.Scale(20), status,
+            app.theme.textPrimary, app.theme.fontSizeMedium);
+
+        int listY = toolbarY + app.Scale(44);
+        int detailW = app.Scale(300);
+        int listW = w - pad - pad - detailW - gap;
+        int contentH = h - (listY - y) - pad;
+        packageList.RenderInside(app, Rect.Create(x + pad, listY, listW, contentH));
+
+        int detailX = x + pad + listW + gap;
+        Style.Of(app, "panel", "", Style.SNormal()).Paint(
+            app, detailX, listY, detailW, contentH);
+        int detailY = listY + app.Scale(12);
+        int installId = 0 - 1;
+        if (selectedPackage != null) {
+            app.canvas.DrawStyledText(
+                Style.Of(app, "label", "", Style.SNormal()), detailX + pad, detailY,
+                selectedPackage.displayName, app.theme.textPrimary, app.theme.fontSizeLarge);
+            detailY = detailY + app.Scale(28);
+            app.canvas.DrawStyledText(
+                Style.Of(app, "label", "secondary small", Style.SNormal()), detailX + pad, detailY,
+                selectedPackage.packageName, app.theme.textPrimary, app.theme.fontSizeMedium);
+            detailY = detailY + app.Scale(24);
+            MarketplaceVersion version = selectedPackage.LatestVersion();
+            if (version != null) {
+                app.canvas.DrawStyledText(
+                    Style.Of(app, "label", "secondary small", Style.SNormal()), detailX + pad, detailY,
+                    T("Version ", "版本 ") + version.version,
+                    app.theme.textPrimary, app.theme.fontSizeMedium);
+                detailY = detailY + app.Scale(28);
+            }
+            if (selectedPackage.IsFree() && version != null) {
+                string label = T("Install", "安装");
+                if (confirmInstall) { label = T("Confirm install", "确认安装"); }
+                installId = new Button { Text = label, Icon = "download", Class = "primary small" }
+                    .Render(app, detailX + pad, detailY, detailW - pad - pad);
+            } else if (!selectedPackage.IsFree()) {
+                app.canvas.DrawStyledText(
+                    Style.Of(app, "label", "secondary small", Style.SNormal()), detailX + pad, detailY,
+                    T("Purchase required", "需要购买"),
+                    app.theme.textPrimary, app.theme.fontSizeMedium);
+            }
+        }
+
+        if (Ui.Clicked(app, refreshId)) { Refresh(); }
+        if (installId >= 0 && Ui.Clicked(app, installId)) {
+            if (!confirmInstall) {
+                confirmInstall = true;
+                status = T("Confirm installing this free package.", "请确认安装这个免费库。");
+            } else {
+                confirmInstall = false;
+                return 2;
+            }
+        }
+        return 0;
+    }
+}

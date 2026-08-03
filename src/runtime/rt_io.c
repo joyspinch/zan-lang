@@ -27,6 +27,7 @@
 #endif
 #include "rt_io.h"
 #include "rt_co.h"
+#include "rt_timer.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -306,6 +307,22 @@ int64_t zan_io_socket_recv(intptr_t fd, void *buf, int64_t len,
 #else
     return (int64_t)recv((int)fd, buf, (size_t)len, (int)flags);
 #endif
+}
+
+const char *zan_io_socket_peer_ip(intptr_t fd) {
+    static char address[INET_ADDRSTRLEN];
+    struct sockaddr_storage peer;
+#if defined(_WIN32)
+    int length = (int)sizeof(peer);
+    if (getpeername((SOCKET)fd, (struct sockaddr *)&peer, &length) != 0) return "";
+#else
+    socklen_t length = (socklen_t)sizeof(peer);
+    if (getpeername((int)fd, (struct sockaddr *)&peer, &length) != 0) return "";
+#endif
+    if (peer.ss_family != AF_INET) return "";
+    if (!inet_ntop(AF_INET, &((struct sockaddr_in *)&peer)->sin_addr,
+                   address, sizeof(address))) return "";
+    return address;
 }
 
 int32_t zan_io_socket_ready(intptr_t fd, int32_t write_ready) {
@@ -1503,15 +1520,7 @@ typedef struct zan_co_node {
     zan_co_step_t       step;
 } zan_co_node;
 
-typedef struct zan_co_timer {
-    struct zan_co_timer *next;
-    long long            due_ms;
-    void                *frame;
-    zan_co_step_t        step;
-} zan_co_timer;
-
-static zan_co_node  *g_rq_head, *g_rq_tail;
-static zan_co_timer *g_tq;
+static zan_co_node *g_rq_head, *g_rq_tail;
 
 #if defined(_WIN32)
 /* ---------------- Windows: real multi-worker pool over IOCP ------------- */
@@ -1647,7 +1656,8 @@ void zan_co_sched_init(void) {
     }
     g_co_workers = co_worker_count();
     g_rq_head = g_rq_tail = NULL;
-    g_tq = NULL;
+    zan_timer_runtime_reset();
+    zan_timer_set_ready_hook(zan_co_ready);
     g_co_running = 0;
     g_co_idle = 0;
     g_co_stop = 0;
@@ -1681,14 +1691,7 @@ void zan_co_ready(void *frame, zan_co_step_t step) {
 }
 
 void zan_co_delay(long long ms, void *frame, zan_co_step_t step) {
-    if (!step) return;
-    zan_co_timer *t = (zan_co_timer *)malloc(sizeof(*t));
-    t->next = NULL;
-    t->due_ms = co_now_ms() + (ms > 0 ? ms : 0);
-    t->frame = frame; t->step = step;
-    EnterCriticalSection(&g_co_lock);
-    t->next = g_tq; g_tq = t;
-    LeaveCriticalSection(&g_co_lock);
+    zan_timer_delay(ms, frame, step);
     if (g_co_idle > 0) co_wake_port();
 }
 
@@ -1765,29 +1768,10 @@ static void co_step_done(void *frame) {
     if (wake) co_wake_port();
 }
 
-/* Move any due timers onto the ready queue; return ms until the next pending
- * timer, or -1 if none remain. */
+/* Dispatch due Delay and public timers; return ms until the next deadline. */
 static long long co_pump_timers(void) {
-    long long now = co_now_ms(), next = -1;
-    EnterCriticalSection(&g_co_lock);
-    zan_co_timer **pp = &g_tq;
-    while (*pp) {
-        zan_co_timer *t = *pp;
-        if (t->due_ms <= now) {
-            *pp = t->next;
-            zan_co_worker_queue *q = &g_co_queues[co_queue_index(t->frame)];
-            EnterCriticalSection(&q->lock);
-            co_enqueue_locked(q, t->frame, t->step);
-            LeaveCriticalSection(&q->lock);
-            free(t);
-        } else {
-            long long d = t->due_ms - now;
-            if (next < 0 || d < next) next = d;
-            pp = &t->next;
-        }
-    }
-    LeaveCriticalSection(&g_co_lock);
-    return next;
+    zan_timer_dispatch_due();
+    return zan_timer_next_timeout();
 }
 
 /* Block on the completion port, re-readying coroutines whose IO completed.
@@ -1827,7 +1811,7 @@ static void co_wait_io(long long timeout_ms) {
 static int co_all_idle(void) {
     int idle = 1;
     EnterCriticalSection(&g_co_lock);
-    if (g_tq != NULL || g_co_running != 0 || g_io_count != 0)
+    if (zan_timer_pending() != 0 || g_co_running != 0 || g_io_count != 0)
         idle = 0;
     for (int i = 0; idle && i < g_co_workers; i++) {
         zan_co_worker_queue *q = &g_co_queues[i];
@@ -1849,7 +1833,7 @@ static void co_worker(int worker) {
          * work -- notably the accept-readiness poll that keeps the listen loop
          * alive -- so new connections stop being accepted. Throttle to ~1ms to
          * bound lock traffic; g_tq is read unlocked as a cheap hint. */
-        if (g_tq) {
+        if (zan_timer_pending() > 0) {
             long long now = co_now_ms();
             if (now - last_pump >= 1) { co_pump_timers(); last_pump = now; }
         }
@@ -1929,7 +1913,11 @@ size_t zan_co_pending(void) {
 #else
 /* ---------------- Non-Windows: single-threaded fallback ---------------- */
 
-void zan_co_sched_init(void) { g_rq_head = g_rq_tail = NULL; g_tq = NULL; }
+void zan_co_sched_init(void) {
+    g_rq_head = g_rq_tail = NULL;
+    zan_timer_runtime_reset();
+    zan_timer_set_ready_hook(zan_co_ready);
+}
 
 void zan_co_ready(void *frame, zan_co_step_t step) {
     if (!step) return;
@@ -1940,16 +1928,7 @@ void zan_co_ready(void *frame, zan_co_step_t step) {
 }
 
 void zan_co_delay(long long ms, void *frame, zan_co_step_t step) {
-    if (!step) return;
-    zan_co_timer *t = (zan_co_timer *)malloc(sizeof(*t));
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    long long now = (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
-    t->next = g_tq;
-    t->due_ms = now + (ms > 0 ? ms : 0);
-    t->frame = frame;
-    t->step = step;
-    g_tq = t;
+    zan_timer_delay(ms, frame, step);
 }
 
 size_t zan_co_pending(void) {
@@ -1967,21 +1946,13 @@ void zan_co_sched_run(void) {
             free(n);
             step(frame);
         }
-        if (g_tq) {
-            zan_co_timer **bp = &g_tq, **pp = &g_tq;
-            for (pp = &(*pp)->next; *pp; pp = &(*pp)->next)
-                if ((*pp)->due_ms < (*bp)->due_ms) bp = pp;
-            zan_co_timer *best = *bp;
-            struct timespec ts;
-            clock_gettime(CLOCK_MONOTONIC, &ts);
-            long long now = (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
-            if (best->due_ms > now) {
-                zan_io_pump_timeout(best->due_ms - now);
+        long long timeout = zan_timer_next_timeout();
+        if (timeout >= 0) {
+            if (timeout > 0) {
+                zan_io_pump_timeout(timeout);
                 continue;
             }
-            *bp = best->next;
-            zan_co_ready(best->frame, best->step);
-            free(best);
+            zan_timer_dispatch_due();
             continue;
         }
         if (zan_io_pump() > 0) continue;

@@ -11,6 +11,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stddef.h>
 
 /* ---- version ---- */
 
@@ -52,6 +53,7 @@ typedef struct {
 typedef struct {
     char name[128];              /* package name */
     zan_version_t version;       /* package version */
+    bool has_version;            /* manifest declared a parseable version */
     char description[256];       /* short description */
     char author[128];            /* author name */
     char license[64];            /* license identifier */
@@ -112,6 +114,32 @@ bool zan_pkg_write_lock(zan_pkg_registry_t *reg);
 
 /* Read lock file for reproducible builds */
 bool zan_pkg_read_lock(zan_pkg_registry_t *reg);
+
+/* ---- package store / marketplace client foundation ---- */
+
+typedef enum {
+    ZAN_PKG_SCOPE_PROJECT,
+    ZAN_PKG_SCOPE_GLOBAL
+} zan_pkg_scope_t;
+
+/* Resolve the platform global store (Windows LOCALAPPDATA, POSIX XDG/HOME). */
+bool zan_pkg_global_store(char *out, size_t out_size);
+
+/* Find installed package stdlib directories containing namespace_path.
+ * Project packages are searched before the user-global store. */
+int zan_pkg_find_namespace(const char *project_dir, const char *namespace_path,
+                           char (*out_dirs)[1024], int max_dirs);
+
+/* Secure local-directory install foundation. The source must contain a valid
+ * zan.pkg whose name matches package_name. Symlinks/reparse points and unsafe
+ * names are rejected; installation is staged then atomically renamed. */
+bool zan_pkg_install_local(const char *source_dir, const char *package_name,
+                           zan_pkg_scope_t scope, const char *project_dir,
+                           char *status, size_t status_size);
+
+/* Validate marketplace transport configuration. Remote transfer is not
+ * available until an in-process HTTP/archive/signature provider is linked. */
+bool zan_pkg_api_validate(const char *api_url, char *status, size_t status_size);
 
 /* ---- cleanup ---- */
 

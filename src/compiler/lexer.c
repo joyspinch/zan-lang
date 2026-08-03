@@ -93,7 +93,10 @@ static const keyword_entry_t s_keywords[] = {
     {"unsafe",    TK_UNSAFE},
     {"ushort",    TK_USHORT},
     {"using",     TK_USING},
-    {"value",     TK_VALUE},
+    /* `value` is a contextual keyword like C#: it is only special inside a
+     * property setter body (the implicit incoming value). The lexer must NOT
+     * reserve it, or ordinary members named `value` (field.value) become
+     * impossible. When setters are implemented, scope it in the parser. */
     {"var",       TK_VAR},
     {"virtual",   TK_VIRTUAL},
     {"void",      TK_VOID},

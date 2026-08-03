@@ -2,6 +2,36 @@ using System;
 
 namespace System.Text;
 
+class Bm25Document {
+    int id;
+    Dictionary<string, int> terms;
+    int length;
+
+    static Bm25Document Create(
+        int id,
+        Dictionary<string, int> terms,
+        int length
+    ) {
+        Bm25Document document = new Bm25Document();
+        document.id = id;
+        document.terms = terms;
+        document.length = length;
+        return document;
+    }
+}
+
+class Bm25Hit {
+    int id;
+    double score;
+
+    static Bm25Hit Create(int id, double score) {
+        Bm25Hit hit = new Bm25Hit();
+        hit.id = id;
+        hit.score = score;
+        return hit;
+    }
+}
+
 /// <summary>
 /// A small in-memory BM25 (Best Matching 25) text index. Documents are
 /// tokenized (lower-cased, split on non-alphanumerics) and scored against a
@@ -17,9 +47,7 @@ namespace System.Text;
 /// (thousands of documents, small tokens) -- every query scans all docs.
 /// </summary>
 class Bm25Index {
-    List<int> docIds = new List<int>();
-    List<Dictionary<string, int>> docTerms = new List<Dictionary<string, int>>();
-    List<int> docLens = new List<int>();
+    List<Bm25Document> documents = new List<Bm25Document>();
     Dictionary<string, int> df = new Dictionary<string, int>();
     int totalLen;
     double k1;
@@ -47,25 +75,23 @@ class Bm25Index {
         // Replace an existing id in place.
         int pos = -1;
         int j = 0;
-        while (j < docIds.Count) {
-            if (docIds[j] == docId) { pos = j; }
+        while (j < documents.Count) {
+            if (documents[j].id == docId) { pos = j; }
             j = j + 1;
         }
         if (pos >= 0) {
             // Subtract the old document from df and totals.
-            List<string> old = docTerms[pos].Keys;
+            List<string> old = documents[pos].terms.Keys;
             int k = 0;
             while (k < old.Count) {
                 DecDf(old[k]);
                 k = k + 1;
             }
-            totalLen = totalLen - docLens[pos];
-            docTerms[pos] = terms;
-            docLens[pos] = len;
+            totalLen = totalLen - documents[pos].length;
+            documents[pos].terms = terms;
+            documents[pos].length = len;
         } else {
-            docIds.Add(docId);
-            docTerms.Add(terms);
-            docLens.Add(len);
+            documents.Add(Bm25Document.Create(docId, terms, len));
         }
         totalLen = totalLen + len;
         // Count document frequency of each term.
@@ -80,45 +106,42 @@ class Bm25Index {
     void Remove(int docId) {
         int pos = -1;
         int j = 0;
-        while (j < docIds.Count) {
-            if (docIds[j] == docId) { pos = j; }
+        while (j < documents.Count) {
+            if (documents[j].id == docId) { pos = j; }
             j = j + 1;
         }
         if (pos < 0) { return; }
-        List<string> old = docTerms[pos].Keys;
+        List<string> old = documents[pos].terms.Keys;
         int k = 0;
         while (k < old.Count) {
             DecDf(old[k]);
             k = k + 1;
         }
-        totalLen = totalLen - docLens[pos];
-        docIds.RemoveAt(pos);
-        docTerms.RemoveAt(pos);
-        docLens.RemoveAt(pos);
+        totalLen = totalLen - documents[pos].length;
+        documents.RemoveAt(pos);
     }
 
     /// <summary>Number of indexed documents.</summary>
-    int Count() { return docIds.Count; }
+    int Count() { return documents.Count; }
 
     /// <summary>Ranks all documents against `query`; ids with a non-zero
     /// score, highest first. An empty query returns nothing.</summary>
     List<int> Search(string query) {
         List<string> terms = Bm25Index.UniqueTerms(query);
         List<int> results = new List<int>();
-        if (terms.Count == 0 || docIds.Count == 0) { return results; }
-        double avgdl = (double)totalLen / (double)docIds.Count;
-        int n = docIds.Count;
-        // Parallel arrays of scored hits, insertion-sorted by score desc.
-        List<int> hitIds = new List<int>();
-        List<double> hitScores = new List<double>();
+        if (terms.Count == 0 || documents.Count == 0) { return results; }
+        double avgdl = (double)totalLen / (double)documents.Count;
+        int n = documents.Count;
+        List<Bm25Hit> hits = new List<Bm25Hit>();
         int d = 0;
-        while (d < docIds.Count) {
+        while (d < documents.Count) {
+            Bm25Document document = documents[d];
             double score = 0.0;
             int t = 0;
             while (t < terms.Count) {
                 string term = terms[t];
                 int tf = 0;
-                Dictionary<string, int> dt = docTerms[d];
+                Dictionary<string, int> dt = document.terms;
                 List<string> dk = dt.Keys;
                 int ki = 0;
                 while (ki < dk.Count) {
@@ -131,29 +154,27 @@ class Bm25Index {
                                                  / ((double)docFreq + 0.5));
                     double denom = (double)tf
                         + k1 * (1.0 - b
-                        + b * (double)docLens[d] / avgdl);
+                        + b * (double)document.length / avgdl);
                     score = score + idf * (double)tf * (k1 + 1.0) / denom;
                 }
                 t = t + 1;
             }
             if (score > 0.0) {
                 // Insertion sort by descending score (stable for ties).
-                int ins = hitScores.Count;
-                hitScores.Add(score);
-                hitIds.Add(docIds[d]);
-                while (ins > 0 && hitScores[ins - 1] < score) {
-                    hitScores[ins] = hitScores[ins - 1];
-                    hitIds[ins] = hitIds[ins - 1];
+                Bm25Hit hit = Bm25Hit.Create(document.id, score);
+                int ins = hits.Count;
+                hits.Add(hit);
+                while (ins > 0 && hits[ins - 1].score < score) {
+                    hits[ins] = hits[ins - 1];
                     ins = ins - 1;
                 }
-                hitScores[ins] = score;
-                hitIds[ins] = docIds[d];
+                hits[ins] = hit;
             }
             d = d + 1;
         }
         int r = 0;
-        while (r < hitIds.Count) {
-            results.Add(hitIds[r]);
+        while (r < hits.Count) {
+            results.Add(hits[r].id);
             r = r + 1;
         }
         return results;

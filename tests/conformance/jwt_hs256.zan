@@ -1,0 +1,67 @@
+using System;
+using System.Security.Cryptography;
+
+// JWT HS256 known-answer, limits, strict JSON, signature, algorithm, and claims checks.
+class Program {
+    static void Show(string label, JwtToken token) {
+        Console.WriteLine(label + "=" + Convert.ToString(token.IsValid()) + ":" + token.Error());
+    }
+
+    static string Repeat(string unit, int times) {
+        string result = "";
+        int i = 0;
+        while (i < times) { result = result + unit; i = i + 1; }
+        return result;
+    }
+
+    static string Sign(string header, string payload, string secret) {
+        string signing = Jwt.Base64UrlEncode(header, header.Length) + "."
+            + Jwt.Base64UrlEncode(payload, payload.Length);
+        byte[] mac = Hmac.Sha256Mac(secret, secret.Length, signing, signing.Length);
+        return signing + "." + Jwt.Base64UrlEncode(mac, 32);
+    }
+
+    static void Main() {
+        string secret = "secret";
+        string payload = "{\"sub\":\"123\",\"iss\":\"issuer\",\"aud\":[\"other\",\"client\"],\"nbf\":100,\"exp\":200}";
+        string token = Jwt.CreateHs256(payload, secret, secret.Length);
+        Console.WriteLine(token);
+        Show("valid", Jwt.ParseHs256(token, secret, secret.Length, 150, "issuer", "client"));
+        Console.WriteLine("sub=" + Jwt.ParseHs256(token, secret, secret.Length, 150, "issuer", "client").Payload().Str("sub", ""));
+
+        string tampered = token.Substring(0, token.Length - 1) + "A";
+        Show("tampered", Jwt.ParseHs256(tampered, secret, secret.Length, 150, "issuer", "client"));
+        Show("expired", Jwt.ParseHs256(token, secret, secret.Length, 200, "issuer", "client"));
+        Show("not-yet", Jwt.ParseHs256(token, secret, secret.Length, 99, "issuer", "client"));
+        Show("issuer", Jwt.ParseHs256(token, secret, secret.Length, 150, "wrong", "client"));
+        Show("audience", Jwt.ParseHs256(token, secret, secret.Length, 150, "issuer", "wrong"));
+
+        string none = "eyJhbGciOiJub25lIn0.e30.AA";
+        Show("none", Jwt.ParseHs256(none, secret, secret.Length, 0, "", ""));
+
+        List<int> decodedLen = new List<int>(); decodedLen.Add(0);
+        byte[] decoded = Jwt.Base64UrlDecode("SGVsbG8td29ybGQ_", decodedLen);
+        Console.WriteLine("b64=" + decoded.ToStr(0, decodedLen[0]));
+        Jwt.Base64UrlDecode("A", decodedLen);
+        Console.WriteLine("bad-b64=" + Convert.ToString(decodedLen[0]));
+        Console.WriteLine("bad-encode-len=" + Convert.ToString(Jwt.Base64UrlEncode("abc", 4).Length));
+        Console.WriteLine("bad-create-len=" + Convert.ToString(Jwt.CreateHs256("{}", secret, 7).Length));
+        Show("bad-parse-len", Jwt.ParseHs256(token, secret, -1, 0, "", ""));
+
+        Show("fraction-exp", Jwt.ParseHs256(Sign("{\"alg\":\"HS256\"}", "{\"exp\":200.9}", secret), secret, secret.Length, 150, "", ""));
+        Show("exponent-nbf", Jwt.ParseHs256(Sign("{\"alg\":\"HS256\"}", "{\"nbf\":1e2}", secret), secret, secret.Length, 150, "", ""));
+        Show("negative-exp", Jwt.ParseHs256(Sign("{\"alg\":\"HS256\"}", "{\"exp\":-1}", secret), secret, secret.Length, 0, "", ""));
+        Show("overflow-exp", Jwt.ParseHs256(Sign("{\"alg\":\"HS256\"}", "{\"exp\":9223372036854775808}", secret), secret, secret.Length, 0, "", ""));
+        Show("duplicate-alg", Jwt.ParseHs256(Sign("{\"alg\":\"HS256\",\"alg\":\"none\"}", "{}", secret), secret, secret.Length, 0, "", ""));
+        Show("duplicate-exp", Jwt.ParseHs256(Sign("{\"alg\":\"HS256\"}", "{\"exp\":200,\"exp\":300}", secret), secret, secret.Length, 0, "", ""));
+        Show("nested-duplicate", Jwt.ParseHs256(Sign("{\"alg\":\"HS256\"}", "{\"x\":{\"a\":1,\"a\":2}}", secret), secret, secret.Length, 0, "", ""));
+        Console.WriteLine("duplicate-create=" + Convert.ToString(Jwt.CreateHs256("{\"x\":1,\"x\":2}", secret, secret.Length).Length));
+
+        string largeHeader = "{\"alg\":\"HS256\",\"x\":\"" + Repeat("a", 8200) + "\"}";
+        Show("large-header", Jwt.ParseHs256(Sign(largeHeader, "{}", secret), secret, secret.Length, 0, "", ""));
+        string largePayload = "{\"x\":\"" + Repeat("a", 65536) + "\"}";
+        Console.WriteLine("large-create=" + Convert.ToString(Jwt.CreateHs256(largePayload, secret, secret.Length).Length));
+        Show("large-payload", Jwt.ParseHs256(Sign("{\"alg\":\"HS256\"}", largePayload, secret), secret, secret.Length, 0, "", ""));
+        Show("large-token", Jwt.ParseHs256(Repeat("a", 131073), secret, secret.Length, 0, "", ""));
+    }
+}

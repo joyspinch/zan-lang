@@ -430,6 +430,10 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
                 if (strncmp(ext_name, "zan_gate_", 9) == 0) {
                     g->uses_socket_async = true;
                 }
+                if (strncmp(ext_name, "zan_timer_", 10) == 0 ||
+                    strncmp(ext_name, "swoole_timer_", 13) == 0) {
+                    g->uses_timer_runtime = true;
+                }
                 if (strncmp(ext_name, "zan_embed_", 10) == 0) {
                     g->uses_embed_api = true;
                 }
@@ -594,6 +598,14 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
                  * so they survive across suspensions. */
                 async_scan_t scan = { g, 0, NULL, 0, 0,
                                       local_scope_new(g->arena), 0, 0 };
+                if (!is_static)
+                    local_add(scan.scope, (zan_istr_t){(char *)"this", 4}, NULL,
+                              type_sym->type);
+                for (int k = 0; k < param_count; k++) {
+                    zan_ast_node_t *param = member->method_decl.params.items[k];
+                    local_add(scan.scope, param->param.name, NULL,
+                              zan_binder_resolve_type(g->binder, param->param.type));
+                }
                 zan_symbol_t *scan_saved_type = g->current_type_sym;
                 g->current_type_sym = type_sym;
                 async_scan_stmt(&scan, member->method_decl.body);

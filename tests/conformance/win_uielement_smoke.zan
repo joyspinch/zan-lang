@@ -1,0 +1,199 @@
+// System.Automation.UiElement conformance: creates its own Win32 window with
+// standard BUTTON / EDIT / STATIC children, then exercises the MSAA
+// (IAccessible) surface -- FromWindow/FromPoint, tree walk, find by
+// name/role, name/value/role/rect/state, Invoke, Focus, SetValue round-trip
+// and role-name
+// mapping. Deterministic: everything is asserted against the locally created
+// window. Windows only.
+using System;
+using System.Automation;
+using System.Threading;
+
+namespace Conf;
+
+class Prog {
+    static int bad = 0;
+    static int checkNo = 0;
+    static nint workerHwnd;
+    static AtomicInt workerDone;
+    static AtomicInt workerOk;
+
+    static void Check(bool cond) {
+        checkNo = checkNo + 1;
+        if (!cond) {
+            bad = bad + 1;
+            if (bad <= 10) {
+                Console.WriteLine("FAIL #" + Convert.ToString(checkNo));
+            }
+        }
+    }
+
+    // ---- minimal Win32 plumbing for the target window ----
+    #if WINDOWS
+    [DllImport("kernel32", EntryPoint = "GetModuleHandleW")]
+    static extern nint WinGetModuleHandleW(nint name);
+
+    [DllImport("user32", EntryPoint = "RegisterClassExW")]
+    static extern ushort WinRegisterClassExW(nint wc);
+
+    [DllImport("user32", EntryPoint = "CreateWindowExW")]
+    static extern nint WinCreateWindowExW(int exStyle, nint cls, nint title,
+                                          int style, int x, int y, int w, int h,
+                                          nint parent, nint menu, nint inst, nint param);
+
+    [DllImport("user32", EntryPoint = "DefWindowProcW")]
+    static extern nint WinDefWindowProcW(nint hwnd, int msg, nint wp, nint lp);
+
+    [DllImport("user32", EntryPoint = "DestroyWindow")]
+    static extern int WinDestroyWindow(nint hwnd);
+
+    [DllImport("user32", EntryPoint = "GetWindowRect")]
+    static extern int WinGetWindowRect(nint hwnd, nint rect);
+
+    static nint WndProc(nint hwnd, int msg, nint wp, nint lp) {
+        return Prog.WinDefWindowProcW(hwnd, msg, wp, lp);
+    }
+
+    static nint CreateMain() {
+        nint inst = Prog.WinGetModuleHandleW((nint)0);
+        nint wc = NativeMemory.Alloc(80);
+        NativeMemory.Fill(wc, 0, 80);
+        new Span<int>(wc, 1)[0] = 80;                 // cbSize
+        new Span<long>(wc + 8, 1)[0] = (nint)Prog.WndProc;
+        new Span<long>(wc + 24, 1)[0] = (long)inst;   // hInstance
+        nint cls = Wide.Of("ZanUiWnd");
+        new Span<long>(wc + 64, 1)[0] = (long)cls;    // lpszClassName
+        Prog.WinRegisterClassExW(wc);
+        NativeMemory.Free(wc);
+        nint title = Wide.Of("zan uielement target");
+        nint hwnd = Prog.WinCreateWindowExW(0, cls, title,
+            0x80000000 /*WS_POPUP*/ | 0x10000000 /*WS_VISIBLE*/ | 0x02000000 /*WS_CLIPCHILDREN*/,
+            100, 100, 400, 300, (nint)0, (nint)0, inst, (nint)0);
+        Wide.Free(title);
+        Wide.Free(cls);
+        return hwnd;
+    }
+
+    static nint CreateChild(nint parent, string clsName, string text,
+                            int id, int x, int y, int w, int h) {
+        nint cls = Wide.Of(clsName);
+        nint txt = Wide.Of(text);
+        nint child = Prog.WinCreateWindowExW(0, cls, txt,
+            0x40000000 /*WS_CHILD*/ | 0x10000000 /*WS_VISIBLE*/,
+            x, y, w, h, parent, (nint)(long)id,
+            Prog.WinGetModuleHandleW((nint)0), (nint)0);
+        Wide.Free(txt);
+        Wide.Free(cls);
+        return child;
+    }
+
+    static void SecondThread() {
+        UiElement root = UiElement.FromWindow(Prog.workerHwnd);
+        if (root.IsValid() && root.ChildCount() >= 3) {
+            Prog.workerOk.Store(1);
+        }
+        root.Dispose();
+        UiElement.Shutdown();
+        Prog.workerDone.Store(1);
+    }
+    #endif
+
+    static void Main() {
+        #if WINDOWS
+        nint main = Prog.CreateMain();
+        Check(Window.IsWindow(main));
+        nint btnHwnd = Prog.CreateChild(main, "BUTTON", "测试按钮", 1001, 10, 10, 120, 30);
+        nint editHwnd = Prog.CreateChild(main, "EDIT", "初始内容", 1002, 10, 50, 200, 25);
+        nint staticHwnd = Prog.CreateChild(main, "STATIC", "静态标签", 1003, 10, 90, 200, 20);
+        Check(Window.IsWindow(btnHwnd));
+        Check(Window.IsWindow(editHwnd));
+        Check(Window.IsWindow(staticHwnd));
+
+        // ---- root element from the window ----
+        UiElement root = UiElement.FromWindow(main);
+        Check(root.IsValid());
+        Check(root.ChildCount() >= 3);
+        Check(UiElement.RoleName(UiElement.RolePushButton()) == "pushbutton");
+        Check(UiElement.RoleName(UiElement.RoleStaticText()) == "statictext");
+        Check(UiElement.RoleName(9999) == "role:9999");
+
+        // ---- find the button by name + role ----
+        UiElement btn = root.FindFirst("测试按钮", UiElement.RolePushButton());
+        Check(btn.IsValid());
+        Check(btn.Name() == "测试按钮");
+        Check(btn.Role() == UiElement.RolePushButton());
+        WindowRect br = Window.GetRect(btnHwnd);
+        Check(br.width > 0 && br.height > 0);
+        WindowRect br2 = btn.Rect();
+        Check(br2.width > 0 && br2.height > 0);
+
+        // ---- Invoke: accDoDefaultAction ----
+        Check(btn.DefaultAction().Length > 0);
+        Check(btn.Invoke());
+
+        // ---- Focus: accSelect(TAKEFOCUS) ----
+        Check(btn.Focus());
+        Check(btn.HasState(UiElement.StateFocusable()));
+
+        // ---- FromPoint: hit the button center ----
+        nint r = NativeMemory.Alloc(16);
+        Prog.WinGetWindowRect(btnHwnd, r);
+        int hitX = (new Span<int>(r, 1)[0] + new Span<int>(r + 8, 1)[0]) / 2;
+        int hitY = (new Span<int>(r + 4, 1)[0] + new Span<int>(r + 12, 1)[0]) / 2;
+        NativeMemory.Free(r);
+        UiElement hit = UiElement.FromPoint(hitX, hitY);
+        Check(hit.IsValid());
+        Check(hit.Role() == UiElement.RolePushButton() || hit.Name() == "测试按钮");
+        hit.Dispose();
+
+        // ---- edit box: value read + SetValue round-trip ----
+        List<UiElement> edits = root.FindAll("", UiElement.RoleText());
+        Check(edits.Count >= 1);
+        UiElement edit = UiElement.FromWindow((nint)0);  // empty placeholder
+        int e = 0;
+        while (e < edits.Count) {
+            if (!edit.IsValid() && edits[e].Value() == "初始内容") {
+                edit = edits[e];
+            } else {
+                edits[e].Dispose();
+            }
+            e = e + 1;
+        }
+        Check(edit.IsValid());
+        Check(edit.Value() == "初始内容");
+        Check(edit.SetValue("新内容"));
+        Check(edit.Value() == "新内容");
+
+        // ---- static text: name + role ----
+        UiElement st = root.FindFirst("静态标签", 0);
+        Check(st.IsValid());
+        Check(st.Role() == UiElement.RoleStaticText());
+
+        // ---- the detached thread owns and shuts down its own COM apartment ----
+        Prog.workerHwnd = main;
+        Prog.workerDone = new AtomicInt(0);
+        Prog.workerOk = new AtomicInt(0);
+        Check(Thread.Start(Prog.SecondThread));
+        while (Prog.workerDone.Load() == 0) { Thread.Sleep(1); }
+        Check(Prog.workerOk.Load() == 1);
+
+        // ---- parent walk ----
+        UiElement parent = btn.Parent();
+        Check(parent.IsValid());
+        parent.Dispose();
+
+        // ---- teardown ----
+        btn.Dispose();
+        edit.Dispose();
+        st.Dispose();
+        root.Dispose();
+        UiElement.Shutdown();
+        Check(Prog.WinDestroyWindow(main) != 0);
+        Check(!Window.IsWindow(main));
+
+        Console.WriteLine("win-uielement-ok: " + Convert.ToString(bad == 0 ? 1 : 0));
+        #else
+        Console.WriteLine("win-uielement-ok: 1");
+        #endif
+    }
+}

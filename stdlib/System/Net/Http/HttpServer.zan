@@ -303,6 +303,8 @@ class HttpServer {
             response = response.SetKeepAlive(keepAlive);
 
             string responseData = response.Build();
+            response.Dispose();
+            response = null;
             int _sent = await client.SendAsync(responseData);
             Worker.BumpSent();
 
@@ -346,6 +348,18 @@ class HttpServer {
     }
 }
 
+class HttpDeadlineSlot {
+    nint sock;
+    int deadline;
+    bool fired;
+
+    HttpDeadlineSlot(nint sock, int deadline) {
+        this.sock = sock;
+        this.deadline = deadline;
+        this.fired = false;
+    }
+}
+
 /// <summary>
 /// Per-connection request deadlines, swept by one coroutine for the whole
 /// process.
@@ -362,9 +376,7 @@ class HttpServer {
 /// that coroutine and leak the slot.
 /// </summary>
 class HttpDeadline {
-    static List<nint> socks = new List<nint>();
-    static List<int> deadlines = new List<int>();
-    static List<bool> fired = new List<bool>();
+    static List<HttpDeadlineSlot> slots = new List<HttpDeadlineSlot>();
     static List<int> freeSlots = new List<int>();
     static bool sweeping = false;
     // Coarse clock kept by the sweeper: reading the real clock costs a syscall
@@ -385,22 +397,20 @@ class HttpDeadline {
         if (n > 0) {
             int slot = freeSlots[n - 1];
             freeSlots.RemoveAt(n - 1);
-            socks[slot] = sock;
-            deadlines[slot] = nowMs + timeoutMs;
-            fired[slot] = false;
+            slots[slot].sock = sock;
+            slots[slot].deadline = nowMs + timeoutMs;
+            slots[slot].fired = false;
             return slot;
         }
-        socks.Add(sock);
-        deadlines.Add(nowMs + timeoutMs);
-        fired.Add(false);
-        return socks.Count - 1;
+        slots.Add(new HttpDeadlineSlot(sock, nowMs + timeoutMs));
+        return slots.Count - 1;
     }
 
     /// <summary>Restarts the window for a slot (called once per request).</summary>
     static void Touch(int slot, int timeoutMs) {
         if (slot < 0) { return; }
-        deadlines[slot] = nowMs + timeoutMs;
-        fired[slot] = false;
+        slots[slot].deadline = nowMs + timeoutMs;
+        slots[slot].fired = false;
     }
 
     /// <summary>True when the sweeper hung up on this slot, i.e. the wake that
@@ -408,13 +418,13 @@ class HttpDeadline {
     /// report timeouts (the HTTP client) must ask before Disarm.</summary>
     static bool Expired(int slot) {
         if (slot < 0) { return false; }
-        return fired[slot];
+        return slots[slot].fired;
     }
 
     /// <summary>Releases a slot when the connection is done.</summary>
     static void Disarm(int slot) {
         if (slot < 0) { return; }
-        socks[slot] = -1;
+        slots[slot].sock = -1;
         freeSlots.Add(slot);
     }
 
@@ -425,19 +435,20 @@ class HttpDeadline {
     static bool SweepOnce() {
         nowMs = Stopwatch.GetMilliseconds();
         int i = 0;
-        int n = socks.Count;
+        int n = slots.Count;
         while (i < n) {
-            nint s = socks[i];
-            if (s >= 0 && nowMs > deadlines[i]) {
+            HttpDeadlineSlot slot = slots[i];
+            nint s = slot.sock;
+            if (s >= 0 && nowMs > slot.deadline) {
                 // Push the deadline out so a slot is only hung up once; the
                 // owning coroutine frees it via Disarm as it unwinds.
-                deadlines[i] = nowMs + 3600000;
-                fired[i] = true;
+                slot.deadline = nowMs + 3600000;
+                slot.fired = true;
                 Socket.ShutdownBoth(s);
             }
             i = i + 1;
         }
-        return socks.Count > freeSlots.Count;
+        return slots.Count > freeSlots.Count;
     }
 
     static void StopSweeping() {

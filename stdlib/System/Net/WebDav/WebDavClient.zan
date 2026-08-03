@@ -1,0 +1,397 @@
+using System;
+using System.Net.Http;
+using System.Net.Http.Client;
+
+namespace System.Net.WebDav;
+
+class WebDavResource {
+    string href;
+    int status;
+    bool collection;
+    long contentLength;
+    string contentType;
+    string etag;
+    string lastModified;
+
+    WebDavResource() {
+        this.href = "";
+        this.status = 0;
+        this.collection = false;
+        this.contentLength = 0;
+        this.contentType = "";
+        this.etag = "";
+        this.lastModified = "";
+    }
+}
+
+class WebDavClient {
+    string host;
+    int port;
+    bool useTls;
+    bool verifyTls;
+    int timeout;
+    List<string> headers;
+
+    WebDavClient() {
+        this.host = "";
+        this.port = 80;
+        this.useTls = false;
+        this.verifyTls = true;
+        this.timeout = 30000;
+        this.headers = new List<string>();
+    }
+
+    static WebDavClient Create(string host, int port) {
+        WebDavClient client = new WebDavClient();
+        client.host = host;
+        client.port = port;
+        return client;
+    }
+
+    static WebDavClient CreateHttps(string host, int port) {
+        WebDavClient client = WebDavClient.Create(host, port);
+        client.useTls = true;
+        return client;
+    }
+
+    WebDavClient SetHeader(string name, string headerValue) {
+        WebDavClient.ValidateHeader(name, headerValue);
+        this.headers.Add(name + ": " + headerValue);
+        return this;
+    }
+
+    WebDavClient SetTimeout(int milliseconds) {
+        this.timeout = milliseconds;
+        return this;
+    }
+
+    WebDavClient DisableTlsVerify() {
+        this.verifyTls = false;
+        this.useTls = true;
+        return this;
+    }
+
+    static string BuildPropFindXml() {
+        return "<?xml version=\"1.0\" encoding=\"utf-8\"?>"
+            + "<D:propfind xmlns:D=\"DAV:\"><D:prop>"
+            + "<D:resourcetype/><D:getcontentlength/><D:getcontenttype/>"
+            + "<D:getetag/><D:getlastmodified/>"
+            + "</D:prop></D:propfind>";
+    }
+
+    static string EscapeXml(string text) {
+        StringBuilder result = new StringBuilder();
+        int i = 0;
+        while (i < text.Length) {
+            string ch = text.Substring(i, 1);
+            if (ch == "&") { result.Append("&amp;"); }
+            else if (ch == "<") { result.Append("&lt;"); }
+            else if (ch == ">") { result.Append("&gt;"); }
+            else if (ch == "\"") { result.Append("&quot;"); }
+            else if (ch == "'") { result.Append("&apos;"); }
+            else { result.Append(ch); }
+            i = i + 1;
+        }
+        return result.ToString();
+    }
+
+    static string UnescapeXml(string text) {
+        StringBuilder result = new StringBuilder();
+        int i = 0;
+        while (i < text.Length) {
+            if (text.Substring(i, 1) == "&") {
+                int semi = WebDavClient.IndexOf(text, ";", i + 1);
+                if (semi > i) {
+                    string entity = text.Substring(i, semi - i + 1);
+                    if (entity == "&amp;") { result.Append("&"); i = semi + 1; }
+                    else if (entity == "&lt;") { result.Append("<"); i = semi + 1; }
+                    else if (entity == "&gt;") { result.Append(">"); i = semi + 1; }
+                    else if (entity == "&quot;") { result.Append("\""); i = semi + 1; }
+                    else if (entity == "&apos;") { result.Append("'"); i = semi + 1; }
+                    else { result.Append("&"); i = i + 1; }
+                } else { result.Append("&"); i = i + 1; }
+            } else {
+                result.Append(text.Substring(i, 1));
+                i = i + 1;
+            }
+        }
+        return result.ToString();
+    }
+
+    static List<WebDavResource> ParseMultiStatus(string xml) {
+        if (xml.Length > 4194304) {
+            throw new ArgumentException("WebDAV Multi-Status exceeds 4194304 bytes");
+        }
+        List<WebDavResource> resources = new List<WebDavResource>();
+        int from = 0;
+        while (from < xml.Length) {
+            int open = WebDavClient.FindOpen(xml, "response", from);
+            if (open < 0) { break; }
+            int bodyStart = WebDavClient.TagEnd(xml, open);
+            if (bodyStart < 0) { break; }
+            int close = WebDavClient.FindClose(xml, "response", bodyStart + 1);
+            if (close < 0) { break; }
+            if (resources.Count >= 10000) {
+                throw new ArgumentException("WebDAV Multi-Status exceeds 10000 resources");
+            }
+            string block = xml.Substring(bodyStart + 1, close - bodyStart - 1);
+            WebDavResource resource = new WebDavResource();
+            resource.href = WebDavClient.TagValue(block, "href");
+            resource.status = WebDavClient.ParseStatus(WebDavClient.LastTagValue(block, "status"));
+            string resourceType = WebDavClient.TagInner(block, "resourcetype");
+            resource.collection = WebDavClient.FindOpen(resourceType, "collection", 0) >= 0;
+            resource.contentLength = WebDavClient.ParseLong(WebDavClient.TagValue(block, "getcontentlength"));
+            resource.contentType = WebDavClient.TagValue(block, "getcontenttype");
+            resource.etag = WebDavClient.TagValue(block, "getetag");
+            resource.lastModified = WebDavClient.TagValue(block, "getlastmodified");
+            resources.Add(resource);
+            int closeEnd = WebDavClient.TagEnd(xml, close);
+            from = closeEnd < 0 ? close + 1 : closeEnd + 1;
+        }
+        return resources;
+    }
+
+    async List<WebDavResource> PropFindAsync(string path, string depth) {
+        WebDavClient.ValidateDepth(depth);
+        HttpClient client = this.NewHttpClient();
+        client.SetHeader("Depth", depth);
+        client.SetHeader("Content-Type", "application/xml; charset=utf-8");
+        HttpResponse response = await client.SendAsync("PROPFIND", path, WebDavClient.BuildPropFindXml());
+        if (response.statusCode != 207) {
+            int statusCode = response.statusCode;
+            response.Dispose();
+            throw new HttpRequestException("PROPFIND expected 207 Multi-Status, got "
+                + Convert.ToString(statusCode));
+        }
+        List<WebDavResource> resources = WebDavClient.ParseMultiStatus(response.body);
+        response.Dispose();
+        return resources;
+    }
+
+    async HttpResponse MkColAsync(string path) {
+        HttpClient client = this.NewHttpClient();
+        return await client.SendAsync("MKCOL", path, "");
+    }
+
+    async HttpResponse GetAsync(string path) {
+        HttpClient client = this.NewHttpClient();
+        return await client.SendAsync("GET", path, "");
+    }
+
+    async HttpResponse PutAsync(string path, string body) {
+        HttpClient client = this.NewHttpClient();
+        client.SetHeader("Content-Type", "application/octet-stream");
+        return await client.SendAsync("PUT", path, body);
+    }
+
+    async HttpResponse DeleteAsync(string path) {
+        HttpClient client = this.NewHttpClient();
+        return await client.SendAsync("DELETE", path, "");
+    }
+
+    async HttpResponse CopyAsync(string path, string destination, bool overwrite) {
+        WebDavClient.ValidateDestination(destination);
+        HttpClient client = this.NewHttpClient();
+        client.SetHeader("Destination", destination);
+        client.SetHeader("Overwrite", overwrite ? "T" : "F");
+        return await client.SendAsync("COPY", path, "");
+    }
+
+    async HttpResponse MoveAsync(string path, string destination, bool overwrite) {
+        WebDavClient.ValidateDestination(destination);
+        HttpClient client = this.NewHttpClient();
+        client.SetHeader("Destination", destination);
+        client.SetHeader("Overwrite", overwrite ? "T" : "F");
+        return await client.SendAsync("MOVE", path, "");
+    }
+
+    HttpClient NewHttpClient() {
+        HttpClient client;
+        if (this.useTls) { client = HttpClient.CreateHttps(this.host, this.port); }
+        else { client = HttpClient.Create(this.host, this.port); }
+        if (!this.verifyTls) { client.DisableTlsVerify(); }
+        client.SetTimeout(this.timeout);
+        int i = 0;
+        while (i < this.headers.Count) {
+            string header = this.headers[i];
+            int colon = header.IndexOf(":");
+            client.SetHeader(header.Substring(0, colon), header.Substring(colon + 2));
+            i = i + 1;
+        }
+        return client;
+    }
+
+    static void ValidateDepth(string depth) {
+        if (depth != "0" && depth != "1" && depth != "infinity") {
+            throw new ArgumentException("WebDAV Depth must be 0, 1, or infinity");
+        }
+    }
+
+    static void ValidateDestination(string destination) {
+        if (destination.Length == 0 || WebDavClient.HasControl(destination)) {
+            throw new ArgumentException("WebDAV Destination is invalid");
+        }
+        bool path = destination.Substring(0, 1) == "/";
+        bool http = destination.Length >= 7 && destination.Substring(0, 7).ToLower() == "http://";
+        bool https = destination.Length >= 8 && destination.Substring(0, 8).ToLower() == "https://";
+        if (!path && !http && !https) {
+            throw new ArgumentException("WebDAV Destination must be an absolute path or HTTP URI");
+        }
+    }
+
+    static void ValidateHeader(string name, string headerValue) {
+        if (name.Length == 0 || name.IndexOf(":") >= 0 || WebDavClient.HasControl(name)
+            || WebDavClient.HasControl(headerValue)) {
+            throw new ArgumentException("HTTP header name or text is invalid");
+        }
+    }
+
+    static bool HasControl(string text) {
+        int i = 0;
+        while (i < text.Length) {
+            int ch = text[i] & 255;
+            if (ch < 32 || ch == 127) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    static string TagValue(string xml, string localName) {
+        return WebDavClient.UnescapeXml(WebDavClient.Trim(WebDavClient.TagInner(xml, localName)));
+    }
+
+    static string LastTagValue(string xml, string localName) {
+        string result = "";
+        int from = 0;
+        while (from < xml.Length) {
+            int open = WebDavClient.FindOpen(xml, localName, from);
+            if (open < 0) { break; }
+            int start = WebDavClient.TagEnd(xml, open);
+            if (start < 0) { break; }
+            int close = WebDavClient.FindClose(xml, localName, start + 1);
+            if (close < 0) { break; }
+            result = WebDavClient.UnescapeXml(WebDavClient.Trim(
+                xml.Substring(start + 1, close - start - 1)));
+            from = close + 1;
+        }
+        return result;
+    }
+
+    static string TagInner(string xml, string localName) {
+        int open = WebDavClient.FindOpen(xml, localName, 0);
+        if (open < 0) { return ""; }
+        int start = WebDavClient.TagEnd(xml, open);
+        if (start < 0 || (start > open && xml.Substring(start - 1, 1) == "/")) { return ""; }
+        int close = WebDavClient.FindClose(xml, localName, start + 1);
+        if (close < 0) { return ""; }
+        return xml.Substring(start + 1, close - start - 1);
+    }
+
+    static int FindOpen(string xml, string localName, int from) {
+        int pos = from;
+        while (pos < xml.Length) {
+            int lt = WebDavClient.IndexOf(xml, "<", pos);
+            if (lt < 0 || lt + 1 >= xml.Length) { return -1; }
+            string first = xml.Substring(lt + 1, 1);
+            if (first != "/" && first != "!" && first != "?") {
+                int end = lt + 1;
+                while (end < xml.Length) {
+                    string ch = xml.Substring(end, 1);
+                    if (ch == ">" || ch == "/" || ch == " " || ch == "\t"
+                        || ch == "\r" || ch == "\n") { break; }
+                    end = end + 1;
+                }
+                string name = xml.Substring(lt + 1, end - lt - 1);
+                int colon = name.IndexOf(":");
+                if (colon >= 0) { name = name.Substring(colon + 1); }
+                if (name == localName) { return lt; }
+            }
+            pos = lt + 1;
+        }
+        return -1;
+    }
+
+    static int FindClose(string xml, string localName, int from) {
+        int pos = from;
+        while (pos < xml.Length) {
+            int lt = WebDavClient.IndexOf(xml, "</", pos);
+            if (lt < 0) { return -1; }
+            int end = lt + 2;
+            while (end < xml.Length && xml.Substring(end, 1) != ">"
+                && xml.Substring(end, 1) != " " && xml.Substring(end, 1) != "\t") {
+                end = end + 1;
+            }
+            string name = xml.Substring(lt + 2, end - lt - 2);
+            int colon = name.IndexOf(":");
+            if (colon >= 0) { name = name.Substring(colon + 1); }
+            if (name == localName) { return lt; }
+            pos = lt + 2;
+        }
+        return -1;
+    }
+
+    static int IndexOf(string haystack, string needle, int from) {
+        int i = from;
+        while (i + needle.Length <= haystack.Length) {
+            if (haystack.Substring(i, needle.Length) == needle) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    static int TagEnd(string xml, int start) {
+        bool quoted = false;
+        string quote = "";
+        int i = start + 1;
+        while (i < xml.Length) {
+            string ch = xml.Substring(i, 1);
+            if (quoted) {
+                if (ch == quote) { quoted = false; }
+            } else if (ch == "\"" || ch == "'") {
+                quoted = true;
+                quote = ch;
+            } else if (ch == ">") { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    static string Trim(string text) {
+        int first = 0;
+        int last = text.Length;
+        while (first < last && WebDavClient.IsSpace(text.Substring(first, 1))) { first = first + 1; }
+        while (last > first && WebDavClient.IsSpace(text.Substring(last - 1, 1))) { last = last - 1; }
+        return text.Substring(first, last - first);
+    }
+
+    static bool IsSpace(string ch) {
+        return ch == " " || ch == "\t" || ch == "\r" || ch == "\n";
+    }
+
+    static int ParseStatus(string text) {
+        int i = 0;
+        while (i + 2 < text.Length) {
+            int a = text[i] & 255;
+            int b = text[i + 1] & 255;
+            int c = text[i + 2] & 255;
+            if (a >= 48 && a <= 57 && b >= 48 && b <= 57 && c >= 48 && c <= 57) {
+                return (a - 48) * 100 + (b - 48) * 10 + c - 48;
+            }
+            i = i + 1;
+        }
+        return 0;
+    }
+
+    static long ParseLong(string text) {
+        if (text.Length == 0) { return 0; }
+        long result = 0;
+        int i = 0;
+        while (i < text.Length) {
+            int ch = text[i] & 255;
+            if (ch < 48 || ch > 57) { return 0; }
+            result = result * 10 + ch - 48;
+            i = i + 1;
+        }
+        return result;
+    }
+}

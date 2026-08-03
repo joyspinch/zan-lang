@@ -50,6 +50,7 @@ int32_t zan_io_connect_status(intptr_t fd);
  * was parked in accept -- the fd can never become ready again, and the loop
  * must report the failure instead of re-arming the watcher forever. */
 int32_t zan_io_socket_alive(intptr_t fd);
+int64_t zan_io_socket_peer_ipv4(intptr_t fd);
 
 /* ---- stackless (CPS state-machine) ABI ----
  *

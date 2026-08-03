@@ -666,16 +666,40 @@ class GroupRow {
     }
 }
 
+/// Geometry for one group-panel chip in the current render.
+class GroupChipGeometry {
+    int x;
+    int width;
+
+    GroupChipGeometry(int xx, int w) {
+        x = xx;
+        width = w;
+    }
+}
+
+/// Geometry for one visible column in the current render. `column` is the
+/// DataColumn index; `band` is 0 frozen-left, 1 scrolling, or 2 frozen-right.
+class FrameColumn {
+    int column;
+    int x;
+    int band;
+
+    FrameColumn(int c, int xx, int b) {
+        column = c;
+        x = xx;
+        band = b;
+    }
+}
+
 /// Per-frame layout geometry for one DataTable render. Computed once by
 /// `DataTable.ComputeFrame` (the render prologue) and read by every drawing /
 /// hit-test / interaction pass, so header / filter row / cells / summary /
 /// scrollbars all stay aligned by construction. Purely transient: nothing here
 /// is persisted between frames (that is `DataTableState`).
 ///
-/// `vorder` is the visible column order sliced into three bands
-/// [frozen-left | scrolling | frozen-right]; `colX`/`colBand` give each entry's
-/// screen x and owning band (0/1/2). All coordinates are already resolved for
-/// the current `scrollX`, group-panel strip and frozen-band clamping.
+/// `columns` is the visible column order sliced into three bands
+/// [frozen-left | scrolling | frozen-right]. All coordinates are already
+/// resolved for the current `scrollX`, group-panel strip and frozen-band clamping.
 class DataTableFrame {
     int y;                 // header top (below the group panel, if shown)
     int viewH;             // widget height minus the group-panel strip
@@ -702,9 +726,7 @@ class DataTableFrame {
     int rightX;            // left edge of the right frozen band
     int panelY;            // group-panel strip top
     int groupPanelH;       // group-panel strip height (0 when hidden)
-    List<int> vorder;      // visible column order (frozen-left|middle|frozen-right)
-    List<int> colX;        // screen x per vorder entry
-    List<int> colBand;     // owning band per vorder entry (0/1/2)
+    List<FrameColumn> columns; // visible columns (frozen-left|middle|frozen-right)
 }
 
 /// Persisted DataTable state — create once (outside the frame loop) and pass in
@@ -1138,6 +1160,48 @@ class DataSource {
 
     /// Remove the row at `at`. Return true when it was actually removed.
     virtual bool RemoveRow(int at) { return false; }
+
+    // ---- server-side / infinite / viewport protocol ----
+    // A source that cannot hand over its whole dataset at once (a remote
+    // database, a file stream, a computed result) implements these five hooks
+    // instead of preloading every row. The grid keeps working unchanged: it
+    // pulls whatever rows the source says exist, requests more as the user
+    // scrolls, and never sorts or filters locally while the server owns the
+    // order. See ServerDataSource for the reference implementation.
+
+    /// True when the source owns its own row order. The grid then skips local
+    /// sorting and filtering — `row` indices passed to CellText/CellNum/... are
+    /// already in the source's final (server-sorted/filtered) sequence, so the
+    /// display order is whatever the server hands out. Local grouping and
+    /// aggregation still apply, over the loaded prefix.
+    virtual bool ServerControlled() { return false; }
+
+    /// Whether the cell's row has been fetched and can be read. Rows that are
+    /// not ready render as a loading placeholder instead of empty text, and the
+    /// grid calls RequestBlock to bring them in. Defaults to true (local
+    /// sources are complete by definition).
+    virtual bool CellReady(int row, int col) { return true; }
+
+    /// Ask the source to fetch the block containing `row`. Safe to call every
+    /// frame: implementations must coalesce duplicate/overlapping requests.
+    virtual void RequestBlock(int row) { }
+
+    /// Ask the source to fetch the next block after the currently loaded
+    /// prefix (scroll-to-bottom keeps pulling until HasMore() turns false).
+    /// Distinct from RequestBlock(row): the caller does not know which row
+    /// begins the unfetched region, so it asks for "whatever is next".
+    virtual void RequestNextBlock() { }
+
+    /// Whether the source may still have rows beyond RowCount(). True for an
+    /// unknown-total source that is still streaming, so the grid asks for the
+    /// next block when the user scrolls to the bottom.
+    virtual bool HasMore() { return false; }
+
+    /// Per-frame poll. Called once per repaint before recompute; return true
+    /// when new data arrived (a fetched block, a server transaction), so the
+    /// grid marks itself dirty and redraws. Cheap and side-effect-free when
+    /// nothing arrived.
+    virtual bool Poll() { return false; }
 }
 
 /// Backward-compatible adapter: serves an in-memory `List<DataRow>` of string

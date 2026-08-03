@@ -1,0 +1,196 @@
+using System;
+using System.Data;
+using System.Data.Orm;
+using System.Diagnostics;
+using System.Security.Cryptography;
+using System.Web;
+
+namespace ZanWeb;
+
+class AuthUser {
+    static Model model = AuthUser.Define();
+    static bool ready = false;
+
+    static Model Define() {
+        return Model.Define("auth_users")
+            .Column("id", "INTEGER", true)
+            .ColumnNotNull("username", "TEXT")
+            .ColumnNotNull("password_salt", "TEXT")
+            .ColumnNotNull("password_hash", "TEXT")
+            .ColumnNotNull("role", "TEXT")
+            .ColumnNotNull("status", "TEXT");
+    }
+
+    static bool Ensure() {
+        if (AuthUser.ready) { return true; }
+        IDbConnection db = Db.Conn();
+        if (db == null || !db.IsConnected()) { return false; }
+        AuthUser.model.CreateTable(db);
+        string count = db.ExecuteScalar("SELECT COUNT(*) FROM auth_users");
+        if (count == "0" || count == "") {
+            string salt = Hex.Encode(RandomNumberGenerator.GetBytes(16), 16);
+            db.Execute("INSERT INTO auth_users(username,password_salt,password_hash,role,status) VALUES(?,?,?,?,?)",
+                DbParams.Create().Add("admin").Add(salt).Add(AuthUser.PasswordHash("admin1234", salt)).Add("admin").Add("active"));
+        }
+        AuthUser.ready = true;
+        return true;
+    }
+
+    static string PasswordHash(string password, string salt) {
+        string material = salt + ":" + password;
+        int i = 0;
+        while (i < 12000) {
+            material = Hex.Encode(Sha256.Hash(material + ":" + salt, material.Length + salt.Length + 1), 32);
+            i = i + 1;
+        }
+        return material;
+    }
+
+    static DbResult ByUsername(string username) {
+        if (!AuthUser.Ensure()) { return null; }
+        return Db.Conn().Query("SELECT id,password_salt,password_hash,role,status FROM auth_users WHERE username=?",
+            DbParams.Create().Add(username));
+    }
+
+    static DbResult ById(string uid) {
+        if (!AuthUser.Ensure()) { return null; }
+        return Db.Conn().Query("SELECT id,username,password_hash,role,status FROM auth_users WHERE id=?",
+            DbParams.Create().Add(uid));
+    }
+
+    static string Login(string username, string password) {
+        DbResult row = AuthUser.ByUsername(username);
+        if (row == null || row.RowCount() == 0 || row.GetByName(0, "status") != "active") { return ""; }
+        string actual = AuthUser.PasswordHash(password, row.GetByName(0, "password_salt"));
+        if (!AuthToken.Equal(actual, row.GetByName(0, "password_hash"))) { return ""; }
+        return AuthToken.Issue(row.GetByName(0, "id"), row.GetByName(0, "password_hash"), WebApp.NowSeconds());
+    }
+
+    static string PasswordPart(string uid) {
+        DbResult row = AuthUser.ById(uid);
+        if (row == null || row.RowCount() == 0 || row.GetByName(0, "status") != "active") { return ""; }
+        string hash = row.GetByName(0, "password_hash");
+        if (hash.Length < 16) { return ""; }
+        return hash.Substring(0, 16);
+    }
+
+    static int Rank(string uid) {
+        DbResult row = AuthUser.ById(uid);
+        if (row == null || row.RowCount() == 0) { return 0; }
+        if (row.GetByName(0, "role") == "admin") { return 9; }
+        return 1;
+    }
+
+    static bool Allow(string uid, string action) {
+        return AuthUser.Rank(uid) >= 9;
+    }
+}
+
+class AuthToken {
+    static string Secret() { return ProcessHost.Env("ZAN_AUTH_SECRET"); }
+
+    static bool Ready() { return AuthToken.Secret().Length >= 32; }
+
+    static bool Equal(string actual, string expected) {
+        int diff = actual.Length ^ expected.Length;
+        int n = expected.Length;
+        int i = 0;
+        while (i < n) {
+            int a = 0;
+            if (i < actual.Length) { a = actual[i] & 255; }
+            diff = diff | (a ^ (expected[i] & 255));
+            i = i + 1;
+        }
+        return diff == 0;
+    }
+
+    static string EncodeUrl(string raw, int len) {
+        string text = Base64.Encode(raw, len).Replace("+", "-").Replace("/", "_");
+        while (text.Length > 0 && text.Substring(text.Length - 1) == "=") {
+            text = text.Substring(0, text.Length - 1);
+        }
+        return text;
+    }
+
+    static byte[] DecodeUrl(string text, List<int> outLen) {
+        int i = 0;
+        while (i < text.Length) {
+            int c = text[i] & 255;
+            bool valid = (c >= 65 && c <= 90) || (c >= 97 && c <= 122)
+                || (c >= 48 && c <= 57) || c == 45 || c == 95;
+            if (!valid) { outLen[0] = -1; return new byte[0]; }
+            i = i + 1;
+        }
+        string base64 = text.Replace("-", "+").Replace("_", "/");
+        int rem = base64.Length & 3;
+        if (rem == 1) { outLen[0] = -1; return new byte[0]; }
+        if (rem == 2) { base64 = base64 + "=="; }
+        else if (rem == 3) { base64 = base64 + "="; }
+        return Base64.Decode(base64, outLen);
+    }
+
+    static byte[] Key() {
+        string secret = AuthToken.Secret();
+        return Sha256.Hash(secret, secret.Length);
+    }
+
+    static string Issue(string uid, string passwordHash, int now) {
+        if (!AuthToken.Ready() || passwordHash.Length < 16) { return ""; }
+        string plain = "1\t" + uid + "\t" + Convert.ToString(now) + "\t"
+            + passwordHash.Substring(0, 16);
+        byte[] key = AuthToken.Key();
+        byte[] iv = RandomNumberGenerator.GetBytes(12);
+        byte[] tag = new byte[16];
+        string aad = "zan.auth.cookie.v1";
+        byte[] cipher = AesGcm.Encrypt(key, 32, iv, aad, aad.Length,
+            plain, plain.Length, tag);
+        byte[] packed = new byte[12 + cipher.Length + 16];
+        int i = 0;
+        while (i < 12) { packed[i] = iv[i]; i = i + 1; }
+        i = 0;
+        while (i < cipher.Length) { packed[12 + i] = cipher[i]; i = i + 1; }
+        i = 0;
+        while (i < 16) { packed[12 + cipher.Length + i] = tag[i]; i = i + 1; }
+        return AuthToken.EncodeUrl(packed, packed.Length);
+    }
+
+    static string Resolve(string token) {
+        if (token.Length < 50 || token.Length > 512) { return ""; }
+        List<int> decodedLen = new List<int>(); decodedLen.Add(0);
+        byte[] packed = AuthToken.DecodeUrl(token, decodedLen);
+        int total = decodedLen[0];
+        if (total < 29) { return ""; }
+        int cipherLen = total - 28;
+        byte[] iv = new byte[12];
+        byte[] cipher = new byte[cipherLen];
+        byte[] tag = new byte[16];
+        int i = 0;
+        while (i < 12) { iv[i] = packed[i]; i = i + 1; }
+        i = 0;
+        while (i < cipherLen) { cipher[i] = packed[12 + i]; i = i + 1; }
+        i = 0;
+        while (i < 16) { tag[i] = packed[12 + cipherLen + i]; i = i + 1; }
+        byte[] key = AuthToken.Key();
+        List<int> ok = new List<int>(); ok.Add(0);
+        string aad = "zan.auth.cookie.v1";
+        byte[] plainBytes = AesGcm.Decrypt(key, 32, iv, aad, aad.Length,
+            cipher, cipherLen, tag, ok);
+        if (ok[0] == 0) { return ""; }
+        string plain = plainBytes.ToStr(0, cipherLen);
+        int first = plain.IndexOf("\t");
+        int second = plain.IndexOf("\t", first + 1);
+        int third = plain.IndexOf("\t", second + 1);
+        if (first != 1 || plain.Substring(0, first) != "1"
+            || second <= first + 1 || third <= second + 1
+            || plain.IndexOf("\t", third + 1) >= 0) { return ""; }
+        string uid = plain.Substring(first + 1, second - first - 1);
+        int issued = Filter.ToInt(plain.Substring(second + 1, third - second - 1), 0);
+        int now = WebApp.NowSeconds();
+        if (issued <= 0 || issued > now + 300 || issued + 864000 <= now) { return ""; }
+        string passwordPart = plain.Substring(third + 1);
+        string currentPart = AuthUser.PasswordPart(uid);
+        if (currentPart.Length == 0 || !AuthToken.Equal(passwordPart, currentPart)) { Console.WriteLine("resolve password failed actual=" + passwordPart + " expected=" + currentPart); return ""; }
+        Console.WriteLine("resolve success uid=" + uid);
+        return uid;
+    }
+}

@@ -1,4 +1,5 @@
 using System;
+using System.Threading;
 
 namespace System.Web;
 
@@ -6,6 +7,8 @@ namespace System.Web;
 /// Plug your user store in via WebApp.RankResolver; the default treats uid "1"
 /// as an administrator (rank 9) and every other logged-in user as rank 1.</summary>
 delegate int RankFn(string uid);
+delegate string AuthFn(string token);
+delegate bool PermissionFn(string uid, string action);
 
 /// <summary>
 /// Request-lock registry: the typed replacement for the PHP "接口请求锁" pattern.
@@ -15,17 +18,40 @@ delegate int RankFn(string uid);
 /// single-threaded event loop per worker, so a plain in-flight key set is race
 /// free -- no OS mutex needed.
 /// </summary>
+class LockLease {
+    string key;
+    long owner;
+
+    LockLease(string key, long owner) {
+        this.key = key;
+        this.owner = owner;
+    }
+}
+
 class LockManager {
-    List<string> active;   // keys currently executing
+    SharedTable table;
+    long ownerSequence;
+    long leaseMs;
 
-    LockManager() { this.active = new List<string>(); }
+    LockManager() {
+        this.table = null;
+        this.ownerSequence = 0;
+        this.leaseMs = 30000;
+    }
 
-    static LockManager Create() { return new LockManager(); }
+    static LockManager Create(string name) {
+        LockManager manager = new LockManager();
+        SharedTable table = new SharedTable(name, 65536);
+        table.KeySize(192);
+        table.ColumnInt("owner");
+        if (!table.Create()) { table = SharedTable.Open(name); }
+        if (table.IsOpen()) { manager.table = table; }
+        return manager;
+    }
 
-    /// <summary>Computes the lock key for a route + principal. "" = no lock.</summary>
-    static string KeyFor(Route route, string uid) {
+    static string KeyFor(Route route, string principal) {
         if (route.lockScope == "user") {
-            string who = uid;
+            string who = principal;
             if (who.Length == 0) { who = "_anon_"; }
             return "u:" + who + ":" + route.Key();
         }
@@ -35,28 +61,20 @@ class LockManager {
         return "";
     }
 
-    /// <summary>Reserves the key; false when another request already holds it.</summary>
-    bool TryAcquire(string key) {
-        if (key.Length == 0) { return true; }
-        int i = 0;
-        while (i < this.active.Count) {
-            if (this.active[i] == key) { return false; }
-            i = i + 1;
+    LockLease TryAcquire(string key) {
+        if (key.Length == 0) { return null; }
+        if (this.table == null) { return null; }
+        this.ownerSequence = this.ownerSequence + 1;
+        long owner = this.ownerSequence;
+        if (!this.table.TryAcquireLease(key, owner, -1, this.leaseMs)) {
+            return null;
         }
-        this.active.Add(key);
-        return true;
+        return new LockLease(key, owner);
     }
 
-    void Release(string key) {
-        if (key.Length == 0) { return; }
-        int i = 0;
-        while (i < this.active.Count) {
-            if (this.active[i] == key) {
-                this.active.RemoveAt(i);
-                return;
-            }
-            i = i + 1;
-        }
+    void Release(LockLease lease) {
+        if (lease == null || this.table == null) { return; }
+        this.table.ReleaseLease(lease.key, lease.owner);
     }
 }
 

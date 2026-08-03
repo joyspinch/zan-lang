@@ -1522,6 +1522,73 @@ binding_lowered:
         } else if (expr->binary.left->kind == AST_INDEX) {
             /* arr[i] = value */
             zan_ast_node_t *arr_expr = expr->binary.left->index.object;
+            /* op_index_set: `obj[i] = v` on a class/struct instance lowers to
+             * a call of the static `op_index_set(self, index, value)` method.
+             * The value parameter is borrowed (like a method argument), so an
+             * owned right side is released after the call. */
+            {
+                zan_type_t *oist = infer_expr_type(g, arr_expr, locals);
+                if (oist && (oist->kind == TYPE_CLASS || oist->kind == TYPE_STRUCT) &&
+                    oist->sym) {
+                    zan_istr_t op_istr = {(char *)"op_index_set", 12};
+                    zan_ast_node_t *op_call = zan_ast_new(g->arena, AST_CALL, expr->loc);
+                    op_call->call.callee = NULL;
+                    zan_ast_list_init(&op_call->call.args);
+                    zan_ast_list_init(&op_call->call.type_args);
+                    zan_ast_list_push(&op_call->call.args,
+                        expr->binary.left->index.index, g->arena);
+                    zan_ast_list_push(&op_call->call.args,
+                        expr->binary.right, g->arena);
+                    zan_symbol_t *op_sym = resolve_op_overload(g, oist->sym,
+                                                               op_istr, op_call, locals);
+                    if (op_sym) {
+                        for (int fi = irgen_find_function(g, op_sym); fi >= 0; fi = -1) {
+                            if (g->functions[fi].sym == op_sym) {
+                                LLVMValueRef recv_val = emit_expr(g, arr_expr, locals);
+                                LLVMValueRef *call_args = (LLVMValueRef *)calloc(3, sizeof(LLVMValueRef));
+                                call_args[0] = recv_val;
+                                if (LLVMGetTypeKind(LLVMTypeOf(recv_val)) == LLVMStructTypeKind) {
+                                    LLVMValueRef rslot = emit_entry_alloca(g,
+                                        LLVMTypeOf(recv_val), "ops.recv");
+                                    LLVMBuildStore(g->builder, recv_val, rslot);
+                                    call_args[0] = rslot;
+                                }
+                                int recv_eh_pushed = 0;
+                                if (oist->kind == TYPE_CLASS &&
+                                    !expr_is_local_ident(arr_expr, locals) &&
+                                    expr_yields_owned_rc_value(g, arr_expr, locals) &&
+                                    LLVMGetTypeKind(LLVMTypeOf(recv_val)) == LLVMPointerTypeKind) {
+                                    emit_eh_tmp_push(g, recv_val);
+                                    recv_eh_pushed = 1;
+                                }
+                                call_args[1] = emit_arg_typed(g, expr->binary.left->index.index,
+                                    method_param_type_at(g, op_sym, 1, NULL, arr_expr, locals), locals);
+                                zan_type_t *vt = method_param_type_at(g, op_sym, 2, NULL, arr_expr, locals);
+                                LLVMValueRef varg = right;
+                                LLVMTypeRef pv2 = vt ? map_type(g, vt) : NULL;
+                                if (pv2 && LLVMGetTypeKind(LLVMTypeOf(varg)) == LLVMPointerTypeKind &&
+                                    LLVMGetTypeKind(pv2) == LLVMPointerTypeKind &&
+                                    LLVMTypeOf(varg) != pv2)
+                                    varg = LLVMBuildBitCast(g->builder, varg, pv2, "ops.v");
+                                call_args[2] = varg;
+                                LLVMTypeRef mft = g->functions[fi].fn_type;
+                                LLVMValueRef mfn = route_generic_method(g, oist,
+                                    op_sym, g->functions[fi].fn, mft, &mft);
+                                const char *cn = (LLVMGetTypeKind(LLVMGetReturnType(mft)) == LLVMVoidTypeKind) ? "" : "ops";
+                                LLVMValueRef result = emit_dispatch_call(g,
+                                    oist->sym, op_sym, mfn, mft, call_args, 3, cn);
+                                result = coerce_generic_result(g, result, op_sym, oist);
+                                if (recv_eh_pushed) emit_eh_tmp_pop(g);
+                                emit_release_owned_call_temp(g, arr_expr, recv_val, locals);
+                                emit_release_owned_call_temp(g, expr->binary.left->index.index, call_args[1], locals);
+                                emit_release_owned_call_temp(g, expr->binary.right, call_args[2], locals);
+                                free(call_args);
+                                return right;
+                            }
+                        }
+                    }
+                }
+            }
             {
                 zan_type_t *sot = infer_expr_type(g, arr_expr, locals);
                 if (is_span_type(sot)) {
@@ -2656,6 +2723,63 @@ static LLVMValueRef finish_index_of_temp(zan_irgen_t *g, zan_ast_node_t *expr,
 
 static LLVMValueRef emit_expr_index(zan_irgen_t *g, zan_ast_node_t *expr,
         local_scope_t *locals) {
+        /* op_index operator: `obj[i]` on a class/struct instance lowers to a
+         * call of the static `op_index(self, index)` method, mirroring how
+         * binary operators lower to static op_add/op_sub/etc. */
+        {
+            zan_type_t *oit = infer_expr_type(g, expr->index.object, locals);
+            if (oit && (oit->kind == TYPE_CLASS || oit->kind == TYPE_STRUCT) &&
+                oit->sym) {
+                zan_istr_t op_istr = {(char *)"op_index", 8};
+                zan_ast_node_t *op_call = zan_ast_new(g->arena, AST_CALL, expr->loc);
+                op_call->call.callee = NULL;
+                zan_ast_list_init(&op_call->call.args);
+                zan_ast_list_init(&op_call->call.type_args);
+                zan_ast_list_push(&op_call->call.args, expr->index.index, g->arena);
+                zan_symbol_t *op_sym = resolve_op_overload(g, oit->sym,
+                                                           op_istr, op_call, locals);
+                if (op_sym) {
+                    for (int fi = irgen_find_function(g, op_sym); fi >= 0; fi = -1) {
+                        if (g->functions[fi].sym == op_sym) {
+                            LLVMValueRef recv_val = emit_expr(g, expr->index.object, locals);
+                            LLVMValueRef *call_args = (LLVMValueRef *)calloc(2, sizeof(LLVMValueRef));
+                            call_args[0] = recv_val;
+                            if (LLVMGetTypeKind(LLVMTypeOf(recv_val)) == LLVMStructTypeKind) {
+                                LLVMValueRef rslot = emit_entry_alloca(g,
+                                    LLVMTypeOf(recv_val), "opx.recv");
+                                LLVMBuildStore(g->builder, recv_val, rslot);
+                                call_args[0] = rslot;
+                            }
+                            int recv_eh_pushed = 0;
+                            if (oit->kind == TYPE_CLASS &&
+                                !expr_is_local_ident(expr->index.object, locals) &&
+                                expr_yields_owned_rc_value(g, expr->index.object, locals) &&
+                                LLVMGetTypeKind(LLVMTypeOf(recv_val)) == LLVMPointerTypeKind) {
+                                emit_eh_tmp_push(g, recv_val);
+                                recv_eh_pushed = 1;
+                            }
+                            call_args[1] = emit_arg_typed(g, expr->index.index,
+                                method_param_type_at(g, op_sym, 1, NULL,
+                                    expr->index.object, locals), locals);
+                            LLVMTypeRef mft = g->functions[fi].fn_type;
+                            LLVMValueRef mfn = route_generic_method(g, oit,
+                                op_sym, g->functions[fi].fn, mft, &mft);
+                            const char *cn = (LLVMGetTypeKind(LLVMGetReturnType(mft)) == LLVMVoidTypeKind) ? "" : "opx";
+                            LLVMValueRef result = emit_dispatch_call(g,
+                                oit->sym, op_sym, mfn, mft, call_args, 2, cn);
+                            result = coerce_generic_result(g, result, op_sym, oit);
+                            if (recv_eh_pushed) emit_eh_tmp_pop(g);
+                            emit_release_owned_call_temp(g, expr->index.object,
+                                recv_val, locals);
+                            emit_release_owned_call_temp(g, expr->index.index,
+                                call_args[1], locals);
+                            free(call_args);
+                            return result;
+                        }
+                    }
+                }
+            }
+        }
         /* arr[i] — array/list element access */
         {
             zan_type_t *sot = infer_expr_type(g, expr->index.object, locals);
@@ -3437,8 +3561,28 @@ static LLVMValueRef emit_expr_conditional(zan_irgen_t *g, zan_ast_node_t *expr,
         LLVMTypeRef tty = LLVMTypeOf(then_val);
         LLVMTypeRef ety = LLVMTypeOf(else_val);
         LLVMTypeRef phi_ty = tty;
+        zan_type_t *conditional_type = infer_expr_type(g, expr, locals);
+        if (conditional_type && is_rc_managed_type(conditional_type)) {
+            int then_owned = expr_yields_owned_rc_value(
+                g, expr->conditional.then_expr, locals);
+            int else_owned = expr_yields_owned_rc_value(
+                g, expr->conditional.else_expr, locals);
+            /* A conditional that can produce an owned reference must have the
+             * same (+1) contract on both edges. Retain only the borrowed edge;
+             * the receiving assignment/call will then consume or release the
+             * PHI exactly as it does any other owned expression. */
+            if (then_owned != else_owned) {
+                if (!then_owned) {
+                    LLVMPositionBuilderAtEnd(g->builder, then_end);
+                    emit_rc_retain_for_type(g, conditional_type, then_val);
+                } else {
+                    LLVMPositionBuilderAtEnd(g->builder, else_end);
+                    emit_rc_retain_for_type(g, conditional_type, else_val);
+                }
+            }
+        }
         if (tty != ety) {
-            zan_type_t *st = infer_expr_type(g, expr, locals);
+            zan_type_t *st = conditional_type;
             if (st) {
                 LLVMTypeRef want = map_type(g, st);
                 if (want) phi_ty = want;

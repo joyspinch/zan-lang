@@ -4,6 +4,19 @@ using Gui.Backend;
 
 namespace Gui.Component.CodeEditor;
 
+/// One syntax-highlighted text span.
+class CodeSpan {
+    string text;
+    int color;
+
+    static CodeSpan Create(string text, int color) {
+        CodeSpan span = new CodeSpan();
+        span.text = text;
+        span.color = color;
+        return span;
+    }
+}
+
 /// CodeEditor part: syntax highlighting (cached per-line tokenisation)
 /// and the main render path (gutter, text, carets, popups, minimap).
 partial class CodeEditor {
@@ -87,9 +100,8 @@ partial class CodeEditor {
                         string kt = lines[k];
                         CeHlLine ke = new CeHlLine();
                         ke.src = kt;
-                        ke.toks = new List<string>();
-                        ke.cols = new List<int>();
-                        ke.blockOpen = Highlight(kt, t, inBlock, ke.toks, ke.cols);
+                        ke.spans = new List<CodeSpan>();
+                        ke.blockOpen = Highlight(kt, t, inBlock, ke.spans);
                         inBlock = ke.blockOpen;
                         while (hlCache.Count <= k) { hlCache.Add(null); }
                         hlCache[k] = ke;
@@ -103,21 +115,17 @@ partial class CodeEditor {
 
         CeHlLine ne = new CeHlLine();
         ne.src = text;
-        ne.toks = new List<string>();
-        ne.cols = new List<int>();
-        ne.blockOpen = Highlight(text, t, inBlock, ne.toks, ne.cols);
+        ne.spans = new List<CodeSpan>();
+        ne.blockOpen = Highlight(text, t, inBlock, ne.spans);
         hlCache[ln] = ne;
         return ne;
     }
 
-    /// Splits `line` into colored segments (parallel outT/outC lists): keywords,
-    /// types (Capitalized identifiers), strings, line comments, /* block
-    /// comments (single-line and spanning) and numbers get distinct colors;
-    /// everything else uses the default text color. `inBlock` is the inherited
-    /// block-comment state from the previous line; the return value is the
-    /// state at the end of this line.
-    bool Highlight(string line, Theme t, bool inBlock,
-                   List<string> outT, List<int> outC) {
+    /// Splits `line` into colored spans: keywords, types (Capitalized
+    /// identifiers), strings, comments and numbers get distinct colors;
+    /// everything else uses the default text color. `inBlock` is inherited from
+    /// the previous line and the return value is the state at this line's end.
+    bool Highlight(string line, Theme t, bool inBlock, List<CodeSpan> spans) {
         // Defaults follow the active skin: a light background gets a
         // light-friendly palette, a dark one keeps the classic dark palette.
         EditorPalette pal = EditorPalette.For(t);
@@ -134,16 +142,15 @@ partial class CodeEditor {
         if (synNum != 0) { numC = synNum; }
         if (synText != 0) { def = synText; }
         return CodeEditor.HighlightSpans(line, kwC, tyC, strC, comC, numC, def,
-                                         inBlock, outT, outC);
+                                         inBlock, spans);
     }
 
     /// Static tokenizer used by both the editor and read-only code views (e.g.
-    /// the component gallery). Splits `line` into colored segments (parallel
-    /// outT/outC lists) using the given palette. `inBlock` is the inherited
-    /// /* block-comment state; returns the state at the end of the line.
+    /// the component gallery). Appends colored spans using the given palette.
+    /// `inBlock` is the inherited /* block-comment state; returns the state at
+    /// the end of the line.
     static bool HighlightSpans(string line, int kwC, int tyC, int strC,
-            int comC, int numC, int def, bool inBlock,
-            List<string> outT, List<int> outC) {
+            int comC, int numC, int def, bool inBlock, List<CodeSpan> spans) {
         // Classify by raw byte code (line[i]) and emit each token with a single
         // Substring, instead of allocating a one-char string per byte and
         // scanning character sets. ASCII identifiers/keywords/numbers/strings
@@ -157,18 +164,18 @@ partial class CodeEditor {
             int j = i;
             while (j + 1 < n && !(line[j] == 42 && line[j + 1] == 47)) { j = j + 1; }
             if (j + 1 < n) {
-                outT.Add(line.Substring(i, j + 2 - i)); outC.Add(comC);
+                spans.Add(CodeSpan.Create(line.Substring(i, j + 2 - i), comC));
                 i = j + 2;
                 inBlock = false;
             } else {
-                outT.Add(line.Substring(i, n - i)); outC.Add(comC);
+                spans.Add(CodeSpan.Create(line.Substring(i, n - i), comC));
                 return true;
             }
         }
         while (i < n) {
             int b = line[i];
             if (b == 47 && i + 1 < n && line[i + 1] == 42) {          // "/*"
-                if (pstart >= 0) { outT.Add(line.Substring(pstart, i - pstart)); outC.Add(def); pstart = -1; }
+                if (pstart >= 0) { spans.Add(CodeSpan.Create(line.Substring(pstart, i - pstart), def)); pstart = -1; }
                 int j = i + 2;
                 bool closed = false;
                 while (j + 1 < n) {
@@ -176,18 +183,18 @@ partial class CodeEditor {
                     j = j + 1;
                 }
                 if (closed) {
-                    outT.Add(line.Substring(i, j - i)); outC.Add(comC);
+                    spans.Add(CodeSpan.Create(line.Substring(i, j - i), comC));
                     i = j;
                 } else {
-                    outT.Add(line.Substring(i, n - i)); outC.Add(comC);
+                    spans.Add(CodeSpan.Create(line.Substring(i, n - i), comC));
                     return true;
                 }
             } else if (b == 47 && i + 1 < n && line[i + 1] == 47) {    // "//" comment
-                if (pstart >= 0) { outT.Add(line.Substring(pstart, i - pstart)); outC.Add(def); pstart = -1; }
-                outT.Add(line.Substring(i, n - i)); outC.Add(comC);
+                if (pstart >= 0) { spans.Add(CodeSpan.Create(line.Substring(pstart, i - pstart), def)); pstart = -1; }
+                spans.Add(CodeSpan.Create(line.Substring(i, n - i), comC));
                 i = n;
             } else if (b == 34) {                                      // string literal
-                if (pstart >= 0) { outT.Add(line.Substring(pstart, i - pstart)); outC.Add(def); pstart = -1; }
+                if (pstart >= 0) { spans.Add(CodeSpan.Create(line.Substring(pstart, i - pstart), def)); pstart = -1; }
                 int j = i + 1;
                 while (j < n) {
                     int cj = line[j];
@@ -195,10 +202,10 @@ partial class CodeEditor {
                     else if (cj == 34) { j = j + 1; break; }
                     else { j = j + 1; }
                 }
-                outT.Add(line.Substring(i, j - i)); outC.Add(strC);
+                spans.Add(CodeSpan.Create(line.Substring(i, j - i), strC));
                 i = j;
             } else if (b >= 48 && b <= 57) {                          // number
-                if (pstart >= 0) { outT.Add(line.Substring(pstart, i - pstart)); outC.Add(def); pstart = -1; }
+                if (pstart >= 0) { spans.Add(CodeSpan.Create(line.Substring(pstart, i - pstart), def)); pstart = -1; }
                 int j = i;
                 while (j < n) {
                     int cj = line[j];
@@ -206,10 +213,10 @@ partial class CodeEditor {
                     if ((cj >= 48 && cj <= 57) || cj == 46 || cj == 120 || hex) { j = j + 1; }
                     else { break; }
                 }
-                outT.Add(line.Substring(i, j - i)); outC.Add(numC);
+                spans.Add(CodeSpan.Create(line.Substring(i, j - i), numC));
                 i = j;
             } else if ((b >= 97 && b <= 122) || (b >= 65 && b <= 90) || b == 95) { // identifier
-                if (pstart >= 0) { outT.Add(line.Substring(pstart, i - pstart)); outC.Add(def); pstart = -1; }
+                if (pstart >= 0) { spans.Add(CodeSpan.Create(line.Substring(pstart, i - pstart), def)); pstart = -1; }
                 int j = i;
                 while (j < n) {
                     int cj = line[j];
@@ -221,14 +228,16 @@ partial class CodeEditor {
                 int col = def;
                 if (CodeEditor.IsKeyword(w)) { col = kwC; }
                 else if (b >= 65 && b <= 90) { col = tyC; }
-                outT.Add(w); outC.Add(col);
+                spans.Add(CodeSpan.Create(w, col));
                 i = j;
             } else {
                 if (pstart < 0) { pstart = i; }
                 i = i + 1;
             }
         }
-        if (pstart >= 0) { outT.Add(line.Substring(pstart, n - pstart)); outC.Add(def); }
+        if (pstart >= 0) {
+            spans.Add(CodeSpan.Create(line.Substring(pstart, n - pstart), def));
+        }
         return false;
     }
 
@@ -621,21 +630,21 @@ partial class CodeEditor {
                     int hoverCol = CodeEditor.ColFromX(lines[hoverLine], app.mouseX - textX, fontSize);
                     string hWord = CodeEditor.WordAt(lines[hoverLine], hoverCol);
                     if (hWord.Length > 0) {
-                        string raw = CodeEditor.LookupVarRaw(dbgVars, hWord);
-                        if (raw.Length > 0) {
+                        DbgVar raw = CodeEditor.LookupVarRaw(dbgVars, hWord);
+                        if (raw != null) {
                             hoverTip = raw;
                             hoverTipX = app.mouseX;
                             hoverTipY = app.mouseY;
                         } else {
-                            hoverTip = "";
+                            hoverTip = null;
                         }
                     } else {
-                        hoverTip = "";
+                        hoverTip = null;
                     }
                 }
             }
             // Draw the (possibly multi-line, JSON-formatted) tooltip.
-            if (hoverTip.Length > 0) {
+            if (hoverTip != null) {
                 List<string> hl = new List<string>();
                 CodeEditor.BuildHoverLines(hoverTip, hl);
                 int rowh = Canvas.FontHeight(fontSize) + app.Scale(2);
@@ -875,13 +884,13 @@ partial class CodeEditor {
                 }
 
                 CeHlLine hl = GetHl(ln, text, t);
-                List<string> segT = hl.toks;
-                List<int> segC = hl.cols;
+                List<CodeSpan> spans = hl.spans;
                 int sx = textX;
                 int si2 = 0;
-                while (si2 < segT.Count) {
-                    c.DrawText(sx, textY, segT[si2], segC[si2], fontSize);
-                    sx = sx + Canvas.MeasureText(segT[si2], fontSize);
+                while (si2 < spans.Count) {
+                    CodeSpan span = spans[si2];
+                    c.DrawText(sx, textY, span.text, span.color, fontSize);
+                    sx = sx + Canvas.MeasureText(span.text, fontSize);
                     si2 = si2 + 1;
                 }
 
@@ -1189,57 +1198,28 @@ partial class CodeEditor {
         return false;
     }
 
-    static string LookupVar(List<string> vars, string name) {
+    static string LookupVar(List<DbgVar> vars, string name) {
         int i = 0;
         while (i < vars.Count) {
-            string entry = vars[i];
-            // entry is "name\ttype\tvalue"
-            int tab1 = -1;
-            int tab2 = -1;
-            int j = 0;
-            while (j < entry.Length) {
-                string ch = entry.Substring(j, 1);
-                if (ch == "\t") {
-                    if (tab1 < 0) { tab1 = j; }
-                    else if (tab2 < 0) { tab2 = j; }
-                }
-                j = j + 1;
-            }
-            if (tab1 > 0) {
-                string vName = entry.Substring(0, tab1);
-                if (vName == name) {
-                    string vType = "";
-                    string vVal = "";
-                    if (tab2 > tab1) {
-                        vType = entry.Substring(tab1 + 1, tab2 - tab1 - 1);
-                        vVal = entry.Substring(tab2 + 1, entry.Length - tab2 - 1);
-                    } else {
-                        vType = entry.Substring(tab1 + 1, entry.Length - tab1 - 1);
-                    }
-                    return vName + " : " + vType + " = " + vVal;
-                }
+            DbgVar v = vars[i];
+            if (v.name == name) {
+                return v.name + " : " + v.type + " = " + v.val;
             }
             i = i + 1;
         }
         return "";
     }
 
-    /// Like LookupVar, but returns the raw "name\ttype\tvalue" entry so the
-    /// caller can render an expandable, formatted tooltip.
-    static string LookupVarRaw(List<string> vars, string name) {
+    /// Like LookupVar, but returns the entry itself so the caller can render
+    /// an expandable, formatted tooltip. Null when the name is not present.
+    static DbgVar LookupVarRaw(List<DbgVar> vars, string name) {
         int i = 0;
         while (i < vars.Count) {
-            string entry = vars[i];
-            int tab1 = -1;
-            int j = 0;
-            while (j < entry.Length) {
-                if (entry.Substring(j, 1) == "\t") { tab1 = j; j = entry.Length; }
-                j = j + 1;
-            }
-            if (tab1 > 0 && entry.Substring(0, tab1) == name) { return entry; }
+            DbgVar v = vars[i];
+            if (v.name == name) { return v; }
             i = i + 1;
         }
-        return "";
+        return null;
     }
 
     static string Indent(int n) {
@@ -1303,38 +1283,15 @@ partial class CodeEditor {
     /// Builds the lines shown in the debug hover tooltip: a header
     /// (`name : type`) followed by the value, pretty-printed if it looks like
     /// JSON / an array / an object.
-    static void BuildHoverLines(string entry, List<string> out2) {
-        int tab1 = -1;
-        int tab2 = -1;
-        int j = 0;
-        while (j < entry.Length) {
-            string ch = entry.Substring(j, 1);
-            if (ch == "\t") {
-                if (tab1 < 0) { tab1 = j; }
-                else if (tab2 < 0) { tab2 = j; }
-            }
-            j = j + 1;
-        }
-        string vName = entry;
-        string vType = "";
-        string vVal = "";
-        if (tab1 > 0) {
-            vName = entry.Substring(0, tab1);
-            if (tab2 > tab1) {
-                vType = entry.Substring(tab1 + 1, tab2 - tab1 - 1);
-                vVal = entry.Substring(tab2 + 1, entry.Length - tab2 - 1);
-            } else {
-                vType = entry.Substring(tab1 + 1, entry.Length - tab1 - 1);
-            }
-        }
-        out2.Add(vName + " : " + vType);
+    static void BuildHoverLines(DbgVar v, List<string> out2) {
+        out2.Add(v.name + " : " + v.type);
         int a = 0;
-        while (a < vVal.Length && vVal.Substring(a, 1) == " ") { a = a + 1; }
-        string vt = vVal.Substring(a, vVal.Length - a);
+        while (a < v.val.Length && v.val.Substring(a, 1) == " ") { a = a + 1; }
+        string vt = v.val.Substring(a, v.val.Length - a);
         if (vt.Length > 0 && (vt.Substring(0, 1) == "{" || vt.Substring(0, 1) == "[")) {
             CodeEditor.PrettyJson(vt, out2, 60);
         } else {
-            out2.Add("= " + CodeEditor.Clip(vVal));
+            out2.Add("= " + CodeEditor.Clip(v.val));
         }
     }
 }

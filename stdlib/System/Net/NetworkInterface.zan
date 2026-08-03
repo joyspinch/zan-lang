@@ -1,0 +1,164 @@
+using System;
+
+namespace System.Net;
+
+/// <summary>
+/// One Windows network adapter and its unicast addresses. Enumeration is backed
+/// by GetAdaptersAddresses and decodes the native x64 ABI layout directly.
+/// </summary>
+class NetworkInterface {
+    public string name;
+    public string description;
+    public int index;
+    public bool up;
+    public string macAddress;
+    public List<string> ipAddresses;
+
+    /// <summary>Releases adapter-owned strings and address entries eagerly.</summary>
+    public void Dispose() {
+        name = null;
+        description = null;
+        macAddress = null;
+        if (ipAddresses != null) { ipAddresses.Clear(); }
+        ipAddresses = null;
+    }
+
+    /// <summary>Returns every adapter known to Windows.</summary>
+    static List<NetworkInterface> GetAllNetworkInterfaces() {
+        #if WINDOWS
+        return NetworkInterface.ReadWindows();
+        #else
+        throw new PlatformNotSupportedException(
+            "System.Net.NetworkInterface is only supported on Windows");
+        #endif
+    }
+
+    #if WINDOWS
+    [DllImport("iphlpapi", EntryPoint = "GetAdaptersAddresses")]
+    static extern int GetAdaptersAddresses(int family, int flags, nint reserved,
+                                           nint addresses, nint size);
+
+    static List<NetworkInterface> ReadWindows() {
+        List<NetworkInterface> result = new List<NetworkInterface>();
+        nint sizeOut = NativeMemory.Alloc(4);
+        int capacity = 15 * 1024;
+        int rc = 111; // ERROR_BUFFER_OVERFLOW
+        nint buffer = 0;
+        int attempts = 0;
+        while (rc == 111 && attempts < 4) {
+            if (buffer != 0) { NativeMemory.Free(buffer); }
+            buffer = NativeMemory.Alloc(capacity);
+            new Span<int>(sizeOut, 1)[0] = capacity;
+            rc = NetworkInterface.GetAdaptersAddresses(0 /*AF_UNSPEC*/, 0, 0,
+                                                        buffer, sizeOut);
+            if (rc == 111) {
+                capacity = new Span<int>(sizeOut, 1)[0];
+                if (capacity < 15 * 1024) { capacity = 15 * 1024; }
+            }
+            attempts = attempts + 1;
+        }
+        NativeMemory.Free(sizeOut);
+        if (rc != 0) {
+            NativeMemory.Free(buffer);
+            return result;
+        }
+
+        nint adapter = buffer;
+        while (adapter != 0) {
+            // IP_ADAPTER_ADDRESSES_LH x64 layout: Length/IfIndex @ 0/4,
+            // Next @ 8, FirstUnicastAddress @ 24, Description/FriendlyName
+            // @ 64/72, PhysicalAddress @ 80, length @ 88, OperStatus @ 104.
+            NetworkInterface item = new NetworkInterface();
+            item.index = new Span<int>(adapter + 4, 1)[0];
+            item.description = Wide.Read(new Span<nint>(adapter + 64, 1)[0]);
+            item.name = Wide.Read(new Span<nint>(adapter + 72, 1)[0]);
+            item.up = new Span<int>(adapter + 104, 1)[0] == 1;
+            item.macAddress = NetworkInterface.ReadMac(adapter + 80,
+                new Span<int>(adapter + 88, 1)[0]);
+            item.ipAddresses = new List<string>();
+
+            nint unicast = new Span<nint>(adapter + 24, 1)[0];
+            while (unicast != 0) {
+                // IP_ADAPTER_UNICAST_ADDRESS_LH x64: Next @ 8 and embedded
+                // SOCKET_ADDRESS @ 16 (sockaddr pointer then int length).
+                nint sockaddr = new Span<nint>(unicast + 16, 1)[0];
+                int sockaddrLen = new Span<int>(unicast + 24, 1)[0];
+                string address = NetworkInterface.ReadAddress(sockaddr, sockaddrLen);
+                if (address != "") { item.ipAddresses.Add(address); }
+                unicast = new Span<nint>(unicast + 8, 1)[0];
+            }
+            result.Add(item);
+            adapter = new Span<nint>(adapter + 8, 1)[0];
+        }
+        NativeMemory.Free(buffer);
+        return result;
+    }
+
+    static string ReadMac(nint bytes, int length) {
+        if (length <= 0) { return ""; }
+        if (length > 8) { length = 8; }
+        string text = "";
+        int i = 0;
+        while (i < length) {
+            if (i > 0) { text = text + ":"; }
+            text = text + NetworkInterface.HexByte(
+                (int)new Span<byte>(bytes + i, 1)[0]);
+            i = i + 1;
+        }
+        return text;
+    }
+
+    static string ReadAddress(nint sockaddr, int length) {
+        if (sockaddr == 0 || length < 2) { return ""; }
+        int family = (int)new Span<ushort>(sockaddr, 1)[0];
+        if (family == 2 && length >= 8) { // sockaddr_in
+            Span<byte> b = new Span<byte>(sockaddr + 4, 4);
+            return Convert.ToString((int)b[0]) + "." + Convert.ToString((int)b[1])
+                + "." + Convert.ToString((int)b[2]) + "." + Convert.ToString((int)b[3]);
+        }
+        if (family == 23 && length >= 24) { // sockaddr_in6
+            string text = "";
+            int i = 0;
+            while (i < 8) {
+                if (i > 0) { text = text + ":"; }
+                int word = ((int)new Span<byte>(sockaddr + 8 + i * 2, 1)[0] << 8)
+                    | (int)new Span<byte>(sockaddr + 9 + i * 2, 1)[0];
+                text = text + NetworkInterface.HexWord(word);
+                i = i + 1;
+            }
+            return text;
+        }
+        return "";
+    }
+
+    static string HexByte(int number) {
+        return NetworkInterface.HexDigit((number >> 4) & 15)
+            + NetworkInterface.HexDigit(number & 15);
+    }
+
+    static string HexWord(int number) {
+        string text = "";
+        bool started = false;
+        int shift = 12;
+        while (shift >= 0) {
+            int digit = (number >> shift) & 15;
+            if (digit != 0 || started || shift == 0) {
+                text = text + NetworkInterface.HexDigit(digit);
+                started = true;
+            }
+            shift = shift - 4;
+        }
+        return text;
+    }
+
+    static string HexDigit(int number) {
+        if (number < 10) { return Convert.ToString(number); }
+        if (number == 10) { return "A"; }
+        if (number == 11) { return "B"; }
+        if (number == 12) { return "C"; }
+        if (number == 13) { return "D"; }
+        if (number == 14) { return "E"; }
+        return "F";
+    }
+    #endif
+}

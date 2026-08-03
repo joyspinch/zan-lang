@@ -1,7 +1,31 @@
+class ArcValue {
+    string text;
+
+    ArcValue(string text) {
+        this.text = text;
+    }
+}
+
+class ArcHolder {
+    ArcValue item;
+}
+
 class Foo {
     int n;
     double d;
     bool flag;
+
+    static ArcValue Owned(string text) {
+        return new ArcValue(text);
+    }
+
+    static ArcValue PickReturn(bool on, ArcValue borrowed) {
+        return on ? borrowed : Foo.Owned("return-owned");
+    }
+
+    static void PrintArg(string label, ArcValue item) {
+        Console.WriteLine(label + "=" + item.text);
+    }
 
     int Count() {
         int c = 1;
@@ -36,5 +60,65 @@ class Foo {
         f.flag = false;
         f.n = f.flag ? f.Count() : 7;
         Console.WriteLine(f.n);
+        // RC ownership must also be uniform across a borrowed literal and an
+        // owned call result, whichever branch is selected.
+        string source = "owned";
+        string a = f.flag ? "borrowed" : source.Substring(0, source.Length);
+        Console.WriteLine(a);
+        f.flag = true;
+        string b = f.flag ? "borrowed" : source.Substring(0, source.Length);
+        Console.WriteLine(b);
+
+        // Class references exercise the same mixed-ownership normalization in
+        // both branch orders and on both runtime paths. Reading text after ARC
+        // churn makes an early release observable as corruption or a crash.
+        ArcValue borrowed = new ArcValue("borrowed-class");
+        ArcValue mixedOwned = false ? borrowed : Foo.Owned("mixed-owned");
+        Console.WriteLine(mixedOwned.text);
+        ArcValue mixedBorrowed = true ? borrowed : Foo.Owned("unused-owned");
+        Console.WriteLine(mixedBorrowed.text);
+        ArcValue reverseOwned = true ? Foo.Owned("reverse-owned") : borrowed;
+        Console.WriteLine(reverseOwned.text);
+        ArcValue reverseBorrowed = false ? Foo.Owned("unused-reverse") : borrowed;
+        Console.WriteLine(reverseBorrowed.text);
+
+        // Uniform contracts: both branches owned, and both branches borrowed.
+        ArcValue ownedBoth = f.flag ? Foo.Owned("owned-left") : Foo.Owned("owned-right");
+        Console.WriteLine(ownedBoth.text);
+        ArcValue borrowedOther = new ArcValue("borrowed-other");
+        ArcValue borrowedBoth = f.flag ? borrowed : borrowedOther;
+        Console.WriteLine(borrowedBoth.text);
+
+        // Return, borrowed argument, owned field, List element and nested PHIs.
+        ArcValue returnedBorrowed = Foo.PickReturn(true, borrowed);
+        Console.WriteLine(returnedBorrowed.text);
+        ArcValue returnedOwned = Foo.PickReturn(false, borrowed);
+        Console.WriteLine(returnedOwned.text);
+        Foo.PrintArg("arg-borrowed", false ? borrowed : Foo.Owned("arg-owned"));
+        Foo.PrintArg("arg-owned", true ? Foo.Owned("arg-owned-left") : borrowed);
+
+        ArcHolder holder = new ArcHolder();
+        holder.item = true ? borrowed : Foo.Owned("field-unused");
+        Console.WriteLine("field=" + holder.item.text);
+        holder.item = false ? borrowed : Foo.Owned("field-replaced");
+        Console.WriteLine("field=" + holder.item.text);
+
+        List<ArcValue> items = new List<ArcValue>();
+        items.Add(false ? borrowed : Foo.Owned("list-owned"));
+        items.Add(true ? borrowed : Foo.Owned("list-unused"));
+        Console.WriteLine("list=" + items[0].text + "," + items[1].text);
+
+        ArcValue nested = false
+            ? Foo.Owned("outer-unused")
+            : (true ? borrowed : Foo.Owned("inner-unused"));
+        Console.WriteLine("nested=" + nested.text);
+
+        // Replacing an old local reference must release the old item while
+        // keeping either selected branch alive.
+        ArcValue replaced = Foo.Owned("old-reference");
+        replaced = false ? borrowed : Foo.Owned("replacement-owned");
+        Console.WriteLine("replace=" + replaced.text);
+        replaced = true ? borrowed : Foo.Owned("replacement-unused");
+        Console.WriteLine("replace=" + replaced.text);
     }
 }

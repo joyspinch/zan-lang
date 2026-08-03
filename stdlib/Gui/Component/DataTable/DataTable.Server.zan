@@ -1,0 +1,208 @@
+using System;
+using Gui;
+
+namespace Gui.Component.DataTable;
+
+/// <summary>
+/// Server-side / infinite / viewport data source: the grid pulls rows in
+/// fixed-size blocks from an underlying service and caches only what it has
+/// fetched, with an unknown total count that grows as the user scrolls.
+///
+/// Subclass it and implement FillBlock — the actual fetch. Two delivery modes:
+///   - synchronous (default): FillBlock runs on the UI thread when the grid
+///     requests a block. Right for fast local sources (a file, a computed
+///     view, an in-process query): the grid's per-frame Poll() folds the
+///     freshly filled block in, so a visible block costs at most one frame.
+///   - asynchronous: override FetchBlock to launch your own background fetch
+///     (a Thread worker, an async I/O call) and call FinishBlock(rows, count)
+///     from wherever the result lands (e.g. an App.Post'd handler). Poll()
+///     only folds the block in once FinishBlock ran, so the UI thread never
+///     waits on the remote. RequestBlock stays coalesced while a fetch is in
+///     flight, so a slow server cannot queue unbounded work.
+///
+/// Row indices are server-ordered: ServerControlled() returns true, so the
+/// grid skips local sort/filter and renders the exact sequence the source
+/// provides. Grouping and aggregation still run locally, over the loaded
+/// prefix (an inherent property of a partial dataset, not a bug).
+///
+/// Total-count modes:
+///   - unknown (default): RowCount() reports the fetched prefix and HasMore()
+///     stays true until a short block (fewer than blockSize rows) announces
+///     the end — or SetKnownTotal pins it explicitly.
+///   - known: SetKnownTotal(n) right after Create gives the grid an exact
+///     scrollbar from the start; blocks stream in behind it on demand.
+/// </summary>
+class ServerDataSource : DataSource {
+    int blockSize;           // rows per fetched block (default 100)
+    List<DataRow> cache;     // fetched rows, index-aligned (0..RowCount)
+    int knownTotal;          // total rows the server declares, -1 = unknown
+    bool loading;            // a fetch is in flight (coalesces RequestBlock)
+    int fetchStart;          // first row of the in-flight fetch
+    bool blockDone;          // the in-flight fetch has produced its result
+    List<DataRow> blockRows; // result buffer for the in-flight fetch
+    int blockCount;          // rows the fetch produced (short = end of data)
+
+    /// Create a server source with the given block size. Call SetKnownTotal
+    /// afterwards to pin the total row count; leave it unknown to grow.
+    static ServerDataSource Create(int blockSize) {
+        ServerDataSource s = new ServerDataSource();
+        s.Setup(blockSize);
+        return s;
+    }
+
+    /// Initialise the source. Subclasses that build their own instances (a
+    /// static factory like RowListSource.Create) call this before use.
+    void Setup(int blockSize) {
+        this.blockSize = blockSize;
+        if (this.blockSize < 1) { this.blockSize = 1; }
+        this.cache = new List<DataRow>();
+        this.knownTotal = -1;
+        this.loading = false;
+        this.fetchStart = 0;
+        this.blockDone = false;
+        this.blockRows = new List<DataRow>();
+        this.blockCount = 0;
+    }
+
+    /// Pin the total row count. Pass -1 to go back to unknown/growing mode.
+    /// The source can call this any time — e.g. once a count query returns —
+    /// and the grid picks it up on the next Poll().
+    void SetKnownTotal(int total) {
+        this.knownTotal = total;
+    }
+
+    /// Current known row count: the declared total when the server announced
+    /// one, otherwise the fetched prefix (so the grid grows as data arrives).
+    override int RowCount() {
+        if (this.knownTotal >= 0) { return this.knownTotal; }
+        return this.cache.Count;
+    }
+
+    /// The server owns the order: the grid must not re-sort or filter locally.
+    override bool ServerControlled() { return true; }
+
+    /// Only fetched rows are readable; everything else renders as a loading
+    /// placeholder and triggers a block request.
+    override bool CellReady(int row, int col) {
+        return row >= 0 && row < this.cache.Count;
+    }
+
+    /// The source is exhausted once the total is known and fetched, or a
+    /// short block marked the end (unknown mode).
+    override bool HasMore() {
+        if (this.knownTotal >= 0) { return this.cache.Count < this.knownTotal; }
+        return true;
+    }
+
+    override void RequestBlock(int row) {
+        if (this.loading) { return; }
+        if (row < 0) { return; }
+        if (!this.HasMore()) { return; }
+        int start = (row / this.blockSize) * this.blockSize;
+        // The block is already fully fetched — nothing to do. A request past
+        // a ragged cache edge (scroll-to-bottom landing mid-block) still
+        // fetches the rest of that block.
+        if (start + this.blockSize <= this.cache.Count) { return; }
+        this.StartFetch(start);
+    }
+
+    /// Fetch the next block after the loaded prefix. The grid calls this when
+    /// the user scrolls to the bottom: it covers the ragged-edge case (the
+    /// prefix ends mid-block, so the next fetch completes that block) and the
+    /// block-aligned case (the prefix ends exactly on a boundary, so the next
+    /// fetch starts a fresh block).
+    override void RequestNextBlock() {
+        if (this.loading) { return; }
+        if (!this.HasMore()) { return; }
+        int bs = this.blockSize;
+        int start = (this.cache.Count / bs) * bs;
+        if (start + bs <= this.cache.Count) { start = start + bs; }
+        this.StartFetch(start);
+    }
+
+    void StartFetch(int start) {
+        this.fetchStart = start;
+        this.loading = true;
+        this.blockDone = false;
+        this.blockRows = new List<DataRow>();
+        this.blockCount = 0;
+        this.FetchBlock(start, this.blockSize);
+    }
+
+    /// Fold a completed fetch into the cache. Called by the grid each frame;
+    /// does nothing until FetchBlock finished (synchronously) or FinishBlock
+    /// was called (async). Returns true when anything changed, so the grid
+    /// marks itself dirty and redraws with the new rows.
+    override bool Poll() {
+        if (!this.loading) { return false; }
+        if (!this.blockDone) { return false; }
+        this.loading = false;
+        this.blockDone = false;
+        int n = this.blockCount;
+        if (n > 0) {
+            int i = 0;
+            while (i < n) { this.cache.Add(this.blockRows[i]); i = i + 1; }
+        }
+        if (this.knownTotal < 0 && n < this.blockSize) {
+            // A short block is the server saying "that was the last one".
+            this.knownTotal = this.cache.Count;
+        }
+        this.blockRows = new List<DataRow>();
+        this.blockCount = 0;
+        return true;
+    }
+
+    /// Start fetching rows [start, start+count) into the block buffer. The
+    /// default runs FillBlock synchronously on the calling (UI) thread, which
+    /// is right for fast local sources. Override for true async delivery and
+    /// call FinishBlock from the completion path.
+    virtual void FetchBlock(int start, int count) {
+        int n = this.FillBlock(start, count, this.blockRows);
+        this.FinishBlock(this.blockRows, n);
+    }
+
+    /// Store the result of an in-flight fetch. Poll() folds it into the cache
+    /// on the next frame.
+    void FinishBlock(List<DataRow> rows, int count) {
+        this.blockRows = rows;
+        this.blockCount = count;
+        this.blockDone = true;
+    }
+
+    /// Fetch up to `count` rows starting at `start`, appending one DataRow
+    /// per row to `dst`. Return the number appended; fewer than `count` means
+    /// the server has no more rows (the total is then pinned). Synchronous
+    /// sources implement this and nothing else.
+    virtual int FillBlock(int start, int count, List<DataRow> dst) { return 0; }
+
+    // ---- cell reads over the cache ----
+    override string CellText(int row, int col) {
+        if (row < 0 || row >= this.cache.Count) { return ""; }
+        return this.cache[row].At(col);
+    }
+
+    override int CellNum(int row, int col) {
+        if (row < 0 || row >= this.cache.Count) { return 0; }
+        return DataTable.ParseInt(this.cache[row].At(col));
+    }
+
+    override double CellReal(int row, int col) {
+        if (row < 0 || row >= this.cache.Count) { return 0.0; }
+        return DataTable.ParseReal(this.cache[row].At(col));
+    }
+
+    override int CellDay(int row, int col, int order) {
+        if (row < 0 || row >= this.cache.Count) { return DataTable.NoDate(); }
+        return DataTable.ParseDate(this.cache[row].At(col), order);
+    }
+
+    override bool CellBool(int row, int col) {
+        if (row < 0 || row >= this.cache.Count) { return false; }
+        return DataTable.ParseBool(this.cache[row].At(col));
+    }
+
+    override void SetCell(int row, int col, string v) {
+        if (row < 0 || row >= this.cache.Count) { return; }
+        this.cache[row].Set(col, v);
+    }
+}

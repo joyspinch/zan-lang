@@ -1,0 +1,866 @@
+using System;
+
+namespace System.Automation;
+
+/// <summary>AccessibleObjectFromWindow — MSAA 入口,按窗口取无障碍对象。</summary>
+delegate int AccFromWindowFn(nint hwnd, int dwId, nint riid, nint outAcc);
+
+/// <summary>AccessibleObjectFromPoint — 按屏幕坐标取无障碍对象。POINT 按值传
+/// (x 低 32 位、y 高 32 位)。</summary>
+delegate int AccFromPointFn(long pt, nint outAcc, nint outVarChild);
+
+/// <summary>AccessibleChildren — 标准 MSAA 子元素枚举。</summary>
+delegate int AccChildrenFn(nint container, int start, int count,
+                           nint variants, nint obtained);
+
+/// <summary>WindowFromAccessibleObject — 从窗口代理还原 HWND。</summary>
+delegate int WindowFromAccFn(nint accessible, nint outHwnd);
+
+/// <summary>SysFreeString — 释放 MSAA 返回的 BSTR。</summary>
+delegate void SysFreeStringFn(nint bstr);
+
+/// <summary>SysAllocString — 创建 COM BSTR。</summary>
+delegate nint SysAllocStringFn(nint wide);
+
+/// <summary>
+/// MSAA (IAccessible) 无障碍元素:从窗口或屏幕坐标取 UI 元素,遍历子元素,
+/// 按名称/角色查找,读名称/值/角色/状态/矩形,执行默认动作/选中/聚焦/设值。
+///
+///   UiElement root = UiElement.FromWindow(wnd);
+///   string name = root.Name();
+///   int role    = root.Role();
+///   List&lt;UiElement&gt; kids = root.Children();
+///   UiElement btn = root.FindFirst("保存", UiElement.RolePushButton());
+///   btn.Invoke();            // 模拟点击
+///   btn.Dispose();
+///
+/// 引用语义:每个 UiElement 拥有一个 IAccessible 引用,用完必须 Dispose();
+/// Children/Parent/HitTest/FindAll 返回的元素都是新引用,各自 Dispose。
+/// 简单元素(无独立 IAccessible 的文本等)借用父对象,仍持有独立引用,安全。
+/// Windows only;其他平台抛 PlatformNotSupportedException。
+/// </summary>
+class UiElement {
+    #if WINDOWS
+    // ---- IAccessible vtable 槽位(IDispatch 0-6 + IAccessible 7-29) ----
+    static int SlotParent() { return 7; }            // get_accParent
+    static int SlotChildCount() { return 8; }        // get_accChildCount
+    static int SlotName() { return 10; }             // get_accName
+    static int SlotValue() { return 11; }            // get_accValue
+    static int SlotDescription() { return 12; }      // get_accDescription
+    static int SlotRole() { return 13; }             // get_accRole
+    static int SlotState() { return 14; }            // get_accState
+    static int SlotKeyboardShortcut() { return 17; } // get_accKeyboardShortcut
+    static int SlotDefaultAction() { return 20; }    // get_accDefaultAction
+    static int SlotSelect() { return 21; }           // accSelect
+    static int SlotLocation() { return 22; }         // accLocation
+    static int SlotHitTest() { return 24; }          // accHitTest
+    static int SlotDoDefaultAction() { return 25; }  // accDoDefaultAction
+    static int SlotPutValue() { return 27; }         // put_accValue
+
+    static string IID_IAccessible() {
+        return "618736e0-3c3d-11cf-810c-00aa00389b71";
+    }
+
+    // OBJID_*(DWORD;以 int 传,-4 = OBJID_CLIENT)
+    static int ObjClient() { return 0 - 4; }
+    static int ObjWindow() { return 0; }
+
+    // VARIANT 常量:VT_I4 + CHILDID_SELF
+    static int VtI4() { return 3; }
+    static int ChildSelf() { return 0; }
+
+    // 动态解析的 oleacc / oleaut32 入口
+    static nint oleacc;
+    static nint fnFromWindow;
+    static nint fnFromPoint;
+    static nint fnChildren;
+    static nint fnWindowFromAcc;
+    static nint fnSysFree;
+    static nint fnSysAlloc;
+
+    nint acc;
+    int childId;
+
+    static nint OleAcc() {
+        if (UiElement.oleacc == 0) { UiElement.oleacc = Interop.Load("oleacc.dll"); }
+        return UiElement.oleacc;
+    }
+
+    static bool EnsureCom() {
+        return Com.Ok(Com.Initialize());
+    }
+
+    static nint FromWindowFn() {
+        if (UiElement.fnFromWindow == 0) {
+            UiElement.fnFromWindow = Interop.Symbol(UiElement.OleAcc(),
+                "AccessibleObjectFromWindow");
+        }
+        return UiElement.fnFromWindow;
+    }
+
+    static nint FromPointFn() {
+        if (UiElement.fnFromPoint == 0) {
+            UiElement.fnFromPoint = Interop.Symbol(UiElement.OleAcc(),
+                "AccessibleObjectFromPoint");
+        }
+        return UiElement.fnFromPoint;
+    }
+
+    static nint ChildrenFn() {
+        if (UiElement.fnChildren == 0) {
+            UiElement.fnChildren = Interop.Symbol(UiElement.OleAcc(),
+                "AccessibleChildren");
+        }
+        return UiElement.fnChildren;
+    }
+
+    static nint WindowFromAccFn() {
+        if (UiElement.fnWindowFromAcc == 0) {
+            UiElement.fnWindowFromAcc = Interop.Symbol(UiElement.OleAcc(),
+                "WindowFromAccessibleObject");
+        }
+        return UiElement.fnWindowFromAcc;
+    }
+
+    static nint Bstr(string s) {
+        if (UiElement.fnSysAlloc == 0) {
+            UiElement.fnSysAlloc = Interop.Entry("oleaut32.dll", "SysAllocString");
+        }
+        if (UiElement.fnSysAlloc == 0) { return 0; }
+        nint w = Wide.Of(s);
+        SysAllocStringFn call = (SysAllocStringFn)UiElement.fnSysAlloc;
+        nint bstr = call(w);
+        Wide.Free(w);
+        return bstr;
+    }
+
+    static void FreeBstr(nint bstr) {
+        if (bstr == 0) { return; }
+        if (UiElement.fnSysFree == 0) {
+            UiElement.fnSysFree = Interop.Entry("oleaut32.dll", "SysFreeString");
+        }
+        if (UiElement.fnSysFree != 0) {
+            SysFreeStringFn call = (SysFreeStringFn)UiElement.fnSysFree;
+            call(bstr);
+        }
+    }
+
+    /// 读取并释放一个 BSTR out 参数。
+    static string TakeBstr(nint bstr) {
+        if (bstr == 0) { return ""; }
+        string s = Wide.Read(bstr);
+        UiElement.FreeBstr(bstr);
+        return s;
+    }
+
+    static nint ChildVariant(int id) {
+        nint v = NativeMemory.Alloc(24);
+        NativeMemory.Fill(v, 0, 24);
+        new Span<short>(v, 1)[0] = UiElement.VtI4();
+        new Span<int>(v + 8, 1)[0] = id;
+        return v;
+    }
+
+    /// 接管引用:acc 必须已是调用方拥有的引用(AddRef 过);Dispose 时释放。
+    /// acc==0 表示空元素。
+    static UiElement Create(nint acc, int childId) {
+        UiElement e = new UiElement();
+        e.acc = acc;
+        e.childId = childId;
+        return e;
+    }
+    #endif
+
+    // ---- 工厂 ----
+
+    /// <summary>从窗口句柄取客户区无障碍根元素(OBJID_CLIENT,失败时回退
+    /// OBJID_WINDOW)。窗口无无障碍对象时返回空元素。</summary>
+    static UiElement FromWindow(nint hwnd) {
+        #if WINDOWS
+        if (!UiElement.EnsureCom()) { return UiElement.Create((nint)0, 0); }
+        nint riid = Com.Guid(UiElement.IID_IAccessible());
+        nint cell = NativeMemory.Alloc(8);
+        new Span<long>(cell, 1)[0] = 0;
+        int hr = 0 - 1;
+        nint fn = UiElement.FromWindowFn();
+        if (fn != 0) {
+            AccFromWindowFn call = (AccFromWindowFn)fn;
+            hr = call(hwnd, UiElement.ObjClient(), riid, cell);
+            if (!Com.Ok(hr)) {
+                nint partial = new Span<long>(cell, 1)[0];
+                if (partial != 0) { Com.Release(partial); }
+                new Span<long>(cell, 1)[0] = 0;
+                hr = call(hwnd, UiElement.ObjWindow(), riid, cell);
+            }
+        }
+        nint acc = new Span<long>(cell, 1)[0];
+        NativeMemory.Free(cell);
+        NativeMemory.Free(riid);
+        if (!Com.Ok(hr)) {
+            if (acc != 0) { Com.Release(acc); }
+            return UiElement.Create((nint)0, 0);
+        }
+        if (acc == 0) { return UiElement.Create((nint)0, 0); }
+        return UiElement.Create(acc, UiElement.ChildSelf());
+        #else
+        throw new PlatformNotSupportedException(
+            "System.Automation.UiElement is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>从屏幕坐标取该点的无障碍元素;该点无元素时返回空元素。</summary>
+    static UiElement FromPoint(int x, int y) {
+        #if WINDOWS
+        if (!UiElement.EnsureCom()) { return UiElement.Create((nint)0, 0); }
+        long pt = ((long)(uint)y << 32) | (long)(uint)x;
+        nint cell = NativeMemory.Alloc(8);
+        nint vcell = NativeMemory.Alloc(24);
+        new Span<long>(cell, 1)[0] = 0;
+        NativeMemory.Fill(vcell, 0, 24);
+        int hr = 0 - 1;
+        nint fn = UiElement.FromPointFn();
+        if (fn != 0) {
+            AccFromPointFn call = (AccFromPointFn)fn;
+            hr = call(pt, cell, vcell);
+        }
+        nint acc = new Span<long>(cell, 1)[0];
+        int child = new Span<int>(vcell + 8, 1)[0];
+        NativeMemory.Free(cell);
+        NativeMemory.Free(vcell);
+        if (!Com.Ok(hr)) {
+            if (acc != 0) { Com.Release(acc); }
+            return UiElement.Create((nint)0, 0);
+        }
+        if (acc == 0) { return UiElement.Create((nint)0, 0); }
+        return UiElement.Create(acc, child);
+        #else
+        throw new PlatformNotSupportedException(
+            "System.Automation.UiElement is not implemented on this platform");
+        #endif
+    }
+
+    // ---- 生命周期 ----
+
+    /// <summary>结束当前线程由 UiElement 隐式建立的 COM apartment。
+    /// 必须在该线程所有 UiElement 都 Dispose 后、线程退出前调用。</summary>
+    static void Shutdown() {
+        #if WINDOWS
+        Com.Shutdown();
+        #else
+        throw new PlatformNotSupportedException(
+            "System.Automation.UiElement is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>释放持有的 IAccessible 引用。与每个工厂/Children/Parent/
+    /// HitTest/FindAll 返回值配对。</summary>
+    void Dispose() {
+        #if WINDOWS
+        if (acc != 0) { Com.Release(acc); acc = 0; }
+        childId = 0;
+        #else
+        throw new PlatformNotSupportedException(
+            "System.Automation.UiElement is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>是否有底层无障碍对象。</summary>
+    bool IsValid() {
+        #if WINDOWS
+        return acc != 0;
+        #else
+        throw new PlatformNotSupportedException(
+            "System.Automation.UiElement is not implemented on this platform");
+        #endif
+    }
+
+    // ---- 属性 ----
+
+    /// <summary>无障碍名称(通常就是控件文本)。</summary>
+    string Name() {
+        #if WINDOWS
+        if (acc == 0) { return ""; }
+        nint cell = NativeMemory.Alloc(8);
+        nint child = UiElement.ChildVariant(childId);
+        new Span<long>(cell, 1)[0] = 0;
+        int hr = Com.Call2(acc, UiElement.SlotName(), child, cell);
+        nint bstr = new Span<long>(cell, 1)[0];
+        NativeMemory.Free(child);
+        NativeMemory.Free(cell);
+        if (!Com.Ok(hr)) { UiElement.FreeBstr(bstr); return ""; }
+        return UiElement.TakeBstr(bstr);
+        #else
+        throw new PlatformNotSupportedException(
+            "System.Automation.UiElement is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>无障碍值(编辑框文本、滚动条位置等);无值返回 ""。</summary>
+    string Value() {
+        #if WINDOWS
+        if (acc == 0) { return ""; }
+        nint cell = NativeMemory.Alloc(8);
+        nint child = UiElement.ChildVariant(childId);
+        new Span<long>(cell, 1)[0] = 0;
+        int hr = Com.Call2(acc, UiElement.SlotValue(), child, cell);
+        nint bstr = new Span<long>(cell, 1)[0];
+        NativeMemory.Free(child);
+        NativeMemory.Free(cell);
+        if (!Com.Ok(hr)) { UiElement.FreeBstr(bstr); return ""; }
+        return UiElement.TakeBstr(bstr);
+        #else
+        throw new PlatformNotSupportedException(
+            "System.Automation.UiElement is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>无障碍描述;无则返回 ""。</summary>
+    string Description() {
+        #if WINDOWS
+        if (acc == 0) { return ""; }
+        nint cell = NativeMemory.Alloc(8);
+        nint child = UiElement.ChildVariant(childId);
+        new Span<long>(cell, 1)[0] = 0;
+        int hr = Com.Call2(acc, UiElement.SlotDescription(), child, cell);
+        nint bstr = new Span<long>(cell, 1)[0];
+        NativeMemory.Free(child);
+        NativeMemory.Free(cell);
+        if (!Com.Ok(hr)) { UiElement.FreeBstr(bstr); return ""; }
+        return UiElement.TakeBstr(bstr);
+        #else
+        throw new PlatformNotSupportedException(
+            "System.Automation.UiElement is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>角色码(ROLE_SYSTEM_*);无对象返回 0。</summary>
+    int Role() {
+        #if WINDOWS
+        if (acc == 0) { return 0; }
+        nint v = NativeMemory.Alloc(24);
+        nint child = UiElement.ChildVariant(childId);
+        NativeMemory.Fill(v, 0, 24);
+        int hr = Com.Call2(acc, UiElement.SlotRole(), child, v);
+        int role = 0;
+        if (Com.Ok(hr) && new Span<short>(v, 1)[0] == UiElement.VtI4()) {
+            role = new Span<int>(v + 8, 1)[0];
+        }
+        NativeMemory.Free(child);
+        NativeMemory.Free(v);
+        return role;
+        #else
+        throw new PlatformNotSupportedException(
+            "System.Automation.UiElement is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>状态位(STATE_SYSTEM_* 的组合);无对象返回 0。</summary>
+    int State() {
+        #if WINDOWS
+        if (acc == 0) { return 0; }
+        nint v = NativeMemory.Alloc(24);
+        nint child = UiElement.ChildVariant(childId);
+        NativeMemory.Fill(v, 0, 24);
+        int hr = Com.Call2(acc, UiElement.SlotState(), child, v);
+        int state = 0;
+        if (Com.Ok(hr) && new Span<short>(v, 1)[0] == UiElement.VtI4()) {
+            state = new Span<int>(v + 8, 1)[0];
+        }
+        NativeMemory.Free(child);
+        NativeMemory.Free(v);
+        return state;
+        #else
+        throw new PlatformNotSupportedException(
+            "System.Automation.UiElement is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>状态位测试:bits 全部置位时为 true。</summary>
+    bool HasState(int bits) {
+        #if WINDOWS
+        return (State() & bits) == bits;
+        #else
+        throw new PlatformNotSupportedException(
+            "System.Automation.UiElement is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>默认动作描述(按钮的"Press"等);无则返回 ""。</summary>
+    string DefaultAction() {
+        #if WINDOWS
+        if (acc == 0) { return ""; }
+        nint cell = NativeMemory.Alloc(8);
+        nint child = UiElement.ChildVariant(childId);
+        new Span<long>(cell, 1)[0] = 0;
+        int hr = Com.Call2(acc, UiElement.SlotDefaultAction(), child, cell);
+        nint bstr = new Span<long>(cell, 1)[0];
+        NativeMemory.Free(child);
+        NativeMemory.Free(cell);
+        if (!Com.Ok(hr)) { UiElement.FreeBstr(bstr); return ""; }
+        return UiElement.TakeBstr(bstr);
+        #else
+        throw new PlatformNotSupportedException(
+            "System.Automation.UiElement is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>快捷键描述(如 "Alt+F");无则返回 ""。</summary>
+    string KeyboardShortcut() {
+        #if WINDOWS
+        if (acc == 0) { return ""; }
+        nint cell = NativeMemory.Alloc(8);
+        nint child = UiElement.ChildVariant(childId);
+        new Span<long>(cell, 1)[0] = 0;
+        int hr = Com.Call2(acc, UiElement.SlotKeyboardShortcut(), child, cell);
+        nint bstr = new Span<long>(cell, 1)[0];
+        NativeMemory.Free(child);
+        NativeMemory.Free(cell);
+        if (!Com.Ok(hr)) { UiElement.FreeBstr(bstr); return ""; }
+        return UiElement.TakeBstr(bstr);
+        #else
+        throw new PlatformNotSupportedException(
+            "System.Automation.UiElement is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>屏幕矩形(get_accLocation)。</summary>
+    WindowRect Rect() {
+        #if WINDOWS
+        if (acc == 0) { return WindowRect.Create(0, 0, 0, 0); }
+        nint cx = NativeMemory.Alloc(8);
+        nint cy = NativeMemory.Alloc(8);
+        nint cw = NativeMemory.Alloc(8);
+        nint ch = NativeMemory.Alloc(8);
+        new Span<long>(cx, 1)[0] = 0;
+        new Span<long>(cy, 1)[0] = 0;
+        new Span<long>(cw, 1)[0] = 0;
+        new Span<long>(ch, 1)[0] = 0;
+        nint child = UiElement.ChildVariant(childId);
+        int hr = Com.Call5(acc, UiElement.SlotLocation(), cx, cy, cw, ch, child);
+        WindowRect r = WindowRect.Create(
+            new Span<int>(cx, 1)[0], new Span<int>(cy, 1)[0],
+            new Span<int>(cw, 1)[0], new Span<int>(ch, 1)[0]);
+        NativeMemory.Free(cx);
+        NativeMemory.Free(cy);
+        NativeMemory.Free(cw);
+        NativeMemory.Free(ch);
+        NativeMemory.Free(child);
+        if (!Com.Ok(hr)) { return WindowRect.Create(0, 0, 0, 0); }
+        return r;
+        #else
+        throw new PlatformNotSupportedException(
+            "System.Automation.UiElement is not implemented on this platform");
+        #endif
+    }
+
+    // ---- 树遍历 ----
+
+    /// <summary>直接子元素数量。</summary>
+    int ChildCount() {
+        #if WINDOWS
+        if (acc == 0 || childId != UiElement.ChildSelf()) { return 0; }
+        nint cell = NativeMemory.Alloc(8);
+        new Span<long>(cell, 1)[0] = 0;
+        int hr = Com.Call1(acc, UiElement.SlotChildCount(), cell);
+        int n = new Span<int>(cell, 1)[0];
+        NativeMemory.Free(cell);
+        if (!Com.Ok(hr) || n < 0) { return 0; }
+        return n;
+        #else
+        throw new PlatformNotSupportedException(
+            "System.Automation.UiElement is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>直接子元素列表(调用方 Dispose 每个元素)。</summary>
+    List<UiElement> Children() {
+        #if WINDOWS
+        List<UiElement> list = new List<UiElement>();
+        if (acc == 0) { return list; }
+        int n = ChildCount();
+        if (n == 0) { return list; }
+        nint variants = NativeMemory.Alloc(n * 24);
+        nint obtained = NativeMemory.Alloc(8);
+        NativeMemory.Fill(variants, 0, n * 24);
+        new Span<long>(obtained, 1)[0] = 0;
+        int hr = Com.Fail();
+        nint fn = UiElement.ChildrenFn();
+        if (fn != 0) {
+            AccChildrenFn call = (AccChildrenFn)fn;
+            hr = call(acc, 0, n, variants, obtained);
+        }
+        int got = new Span<int>(obtained, 1)[0];
+        NativeMemory.Free(obtained);
+        int i = 0;
+        while (Com.Ok(hr) && i < got) {
+            nint variant = variants + i * 24;
+            int vt = new Span<short>(variant, 1)[0];
+            nint raw = new Span<long>(variant + 8, 1)[0];
+            if (vt == 9 && raw != 0) {
+                nint resolved = 0;
+                nint hwndCell = NativeMemory.Alloc(8);
+                new Span<long>(hwndCell, 1)[0] = 0;
+                nint wfn = UiElement.WindowFromAccFn();
+                if (wfn != 0) {
+                    WindowFromAccFn windowCall = (WindowFromAccFn)wfn;
+                    if (Com.Ok(windowCall(raw, hwndCell))) {
+                        nint hwnd = new Span<long>(hwndCell, 1)[0];
+                        UiElement windowElement = UiElement.FromWindow(hwnd);
+                        if (windowElement.IsValid()) {
+                            resolved = Com.Keep(windowElement.acc);
+                        }
+                        windowElement.Dispose();
+                    }
+                }
+                NativeMemory.Free(hwndCell);
+                nint iacc = resolved;
+                if (iacc == 0) { iacc = Com.Query(raw, UiElement.IID_IAccessible()); }
+                Com.Release(raw);
+                if (iacc != 0) {
+                    list.Add(UiElement.Create(iacc, UiElement.ChildSelf()));
+                }
+            } else if (vt == UiElement.VtI4()) {
+                list.Add(UiElement.Create(Com.Keep(acc), (int)raw));
+            }
+            i = i + 1;
+        }
+        NativeMemory.Free(variants);
+        return list;
+        #else
+        throw new PlatformNotSupportedException(
+            "System.Automation.UiElement is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>父元素;已是根时返回空元素。</summary>
+    UiElement Parent() {
+        #if WINDOWS
+        if (acc == 0) { return UiElement.Create((nint)0, 0); }
+        nint cell = NativeMemory.Alloc(8);
+        new Span<long>(cell, 1)[0] = 0;
+        int hr = Com.Call1(acc, UiElement.SlotParent(), cell);
+        nint pdisp = new Span<long>(cell, 1)[0];
+        NativeMemory.Free(cell);
+        if (!Com.Ok(hr) || pdisp == 0) { return UiElement.Create((nint)0, 0); }
+        nint iacc = Com.Query(pdisp, UiElement.IID_IAccessible());
+        Com.Release(pdisp);
+        if (iacc == 0) { return UiElement.Create((nint)0, 0); }
+        return UiElement.Create(iacc, UiElement.ChildSelf());
+        #else
+        throw new PlatformNotSupportedException(
+            "System.Automation.UiElement is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>命中测试:返回该坐标处的子元素;无命中返回空元素。</summary>
+    UiElement HitTest(int x, int y) {
+        #if WINDOWS
+        if (acc == 0) { return UiElement.Create((nint)0, 0); }
+        nint v = NativeMemory.Alloc(24);
+        NativeMemory.Fill(v, 0, 24);
+        int hr = Com.Call3(acc, UiElement.SlotHitTest(),
+            (nint)(long)x, (nint)(long)y, v);
+        int vt = new Span<short>(v, 1)[0];
+        nint raw = new Span<long>(v + 8, 1)[0];
+        NativeMemory.Free(v);
+        if (!Com.Ok(hr)) { return UiElement.Create((nint)0, 0); }
+        if (vt == 3) { return UiElement.Create(Com.Keep(acc), (int)raw); }
+        if (vt != 9 || raw == 0) { return UiElement.Create((nint)0, 0); }
+        nint iacc = Com.Query(raw, UiElement.IID_IAccessible());
+        Com.Release(raw);
+        if (iacc == 0) { return UiElement.Create((nint)0, 0); }
+        return UiElement.Create(iacc, UiElement.ChildSelf());
+        #else
+        throw new PlatformNotSupportedException(
+            "System.Automation.UiElement is not implemented on this platform");
+        #endif
+    }
+
+    // ---- 查找 ----
+
+    /// <summary>递归查找名称(完全相等;"" 表示任意)与角色(0 表示任意)
+    /// 都匹配的元素。返回的元素各自持有独立引用,调用方 Dispose。
+    /// 深度上限 64,防环。</summary>
+    List<UiElement> FindAll(string name, int role) {
+        #if WINDOWS
+        List<UiElement> list = new List<UiElement>();
+        UiElement.Walk(this, name, role, 64, list);
+        return list;
+        #else
+        throw new PlatformNotSupportedException(
+            "System.Automation.UiElement is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>递归查找第一个匹配元素;未找到返回空元素。返回的元素是
+    /// 新引用,调用方 Dispose。</summary>
+    UiElement FindFirst(string name, int role) {
+        #if WINDOWS
+        List<UiElement> all = FindAll(name, role);
+        if (all.Count == 0) { return UiElement.Create((nint)0, 0); }
+        UiElement first = all[0];
+        if (first.acc != 0) { Com.Keep(first.acc); }
+        UiElement result = UiElement.Create(first.acc, first.childId);
+        int i = 0;
+        while (i < all.Count) {
+            all[i].Dispose();
+            i = i + 1;
+        }
+        return result;
+        #else
+        throw new PlatformNotSupportedException(
+            "System.Automation.UiElement is not implemented on this platform");
+        #endif
+    }
+
+    static void Walk(UiElement el, string name, int role, int depth,
+                     List<UiElement> outList) {
+        #if WINDOWS
+        if (el.acc == 0 || depth < 0) { return; }
+        string n = el.Name();
+        if (name == "" || n == name) {
+            int r = el.Role();
+            if (role == 0 || r == role) {
+                outList.Add(UiElement.Create(Com.Keep(el.acc), el.childId));
+            }
+        }
+        List<UiElement> kids = el.Children();
+        int i = 0;
+        while (i < kids.Count) {
+            UiElement.Walk(kids[i], name, role, depth - 1, outList);
+            kids[i].Dispose();
+            i = i + 1;
+        }
+        #else
+        throw new PlatformNotSupportedException(
+            "System.Automation.UiElement is not implemented on this platform");
+        #endif
+    }
+
+    // ---- 操作 ----
+
+    /// <summary>执行默认动作(按钮点击、链接跳转等)。</summary>
+    bool Invoke() {
+        #if WINDOWS
+        if (acc == 0) { return false; }
+        nint child = UiElement.ChildVariant(childId);
+        int hr = Com.Call1(acc, UiElement.SlotDoDefaultAction(), child);
+        NativeMemory.Free(child);
+        return Com.Ok(hr);
+        #else
+        throw new PlatformNotSupportedException(
+            "System.Automation.UiElement is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>选中并聚焦(SELFLAG_TAKEFOCUS | SELFLAG_TAKESELECTION)。</summary>
+    bool Select() {
+        #if WINDOWS
+        if (acc == 0) { return false; }
+        nint child = UiElement.ChildVariant(childId);
+        int hr = Com.Call2(acc, UiElement.SlotSelect(), (nint)3, child);
+        NativeMemory.Free(child);
+        return Com.Ok(hr);
+        #else
+        throw new PlatformNotSupportedException(
+            "System.Automation.UiElement is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>聚焦(SELFLAG_TAKEFOCUS)。</summary>
+    bool Focus() {
+        #if WINDOWS
+        if (acc == 0) { return false; }
+        nint child = UiElement.ChildVariant(childId);
+        int hr = Com.Call2(acc, UiElement.SlotSelect(), (nint)1, child);
+        NativeMemory.Free(child);
+        return Com.Ok(hr);
+        #else
+        throw new PlatformNotSupportedException(
+            "System.Automation.UiElement is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>设置值(put_accValue;编辑框等可写元素生效)。</summary>
+    bool SetValue(string v) {
+        #if WINDOWS
+        if (acc == 0) { return false; }
+        nint child = UiElement.ChildVariant(childId);
+        nint bstr = UiElement.Bstr(v);
+        int hr = Com.Call2(acc, UiElement.SlotPutValue(), child, bstr);
+        NativeMemory.Free(child);
+        UiElement.FreeBstr(bstr);
+        return Com.Ok(hr);
+        #else
+        throw new PlatformNotSupportedException(
+            "System.Automation.UiElement is not implemented on this platform");
+        #endif
+    }
+
+    // ---- 角色常量与名称 ----
+
+    /// <summary>ROLE_SYSTEM_TITLEBAR(1)。</summary>
+    static int RoleTitleBar() { return 0x1; }
+    /// <summary>ROLE_SYSTEM_MENUBAR(2)。</summary>
+    static int RoleMenuBar() { return 0x2; }
+    /// <summary>ROLE_SYSTEM_MENUPOPUP(11)。</summary>
+    static int RoleMenuPopup() { return 0xB; }
+    /// <summary>ROLE_SYSTEM_MENUITEM(12)。</summary>
+    static int RoleMenuItem() { return 0xC; }
+    /// <summary>ROLE_SYSTEM_ALERT(8)。</summary>
+    static int RoleAlert() { return 0x8; }
+    /// <summary>ROLE_SYSTEM_WINDOW(9)。</summary>
+    static int RoleWindow() { return 0x9; }
+    /// <summary>ROLE_SYSTEM_CLIENT(10)。</summary>
+    static int RoleClient() { return 0xA; }
+    /// <summary>ROLE_SYSTEM_APPLICATION(14)。</summary>
+    static int RoleApplication() { return 0xE; }
+    /// <summary>ROLE_SYSTEM_DOCUMENT(15)。</summary>
+    static int RoleDocument() { return 0xF; }
+    /// <summary>ROLE_SYSTEM_PANE(16)。</summary>
+    static int RolePane() { return 0x10; }
+    /// <summary>ROLE_SYSTEM_DIALOG(18)。</summary>
+    static int RoleDialog() { return 0x12; }
+    /// <summary>ROLE_SYSTEM_GROUPING(20)。</summary>
+    static int RoleGrouping() { return 0x14; }
+    /// <summary>ROLE_SYSTEM_TABLE(24)。</summary>
+    static int RoleTable() { return 0x18; }
+    /// <summary>ROLE_SYSTEM_CELL(29)。</summary>
+    static int RoleCell() { return 0x1D; }
+    /// <summary>ROLE_SYSTEM_LINK(30)。</summary>
+    static int RoleLink() { return 0x1E; }
+    /// <summary>ROLE_SYSTEM_LIST(33)。</summary>
+    static int RoleList() { return 0x21; }
+    /// <summary>ROLE_SYSTEM_LISTITEM(34)。</summary>
+    static int RoleListItem() { return 0x22; }
+    /// <summary>ROLE_SYSTEM_OUTLINE(35)。</summary>
+    static int RoleOutline() { return 0x23; }
+    /// <summary>ROLE_SYSTEM_OUTLINEITEM(36)。</summary>
+    static int RoleOutlineItem() { return 0x24; }
+    /// <summary>ROLE_SYSTEM_PAGETAB(37)。</summary>
+    static int RolePageTab() { return 0x25; }
+    /// <summary>ROLE_SYSTEM_GRAPHIC(40)。</summary>
+    static int RoleGraphic() { return 0x28; }
+    /// <summary>ROLE_SYSTEM_STATICTEXT(41)。</summary>
+    static int RoleStaticText() { return 0x29; }
+    /// <summary>ROLE_SYSTEM_TEXT(42)。</summary>
+    static int RoleText() { return 0x2A; }
+    /// <summary>ROLE_SYSTEM_PUSHBUTTON(43)。</summary>
+    static int RolePushButton() { return 0x2B; }
+    /// <summary>ROLE_SYSTEM_CHECKBUTTON(44)。</summary>
+    static int RoleCheckButton() { return 0x2C; }
+    /// <summary>ROLE_SYSTEM_RADIOBUTTON(45)。</summary>
+    static int RoleRadioButton() { return 0x2D; }
+    /// <summary>ROLE_SYSTEM_COMBOBOX(46)。</summary>
+    static int RoleComboBox() { return 0x2E; }
+    /// <summary>ROLE_SYSTEM_DROPLIST(47)。</summary>
+    static int RoleDropList() { return 0x2F; }
+    /// <summary>ROLE_SYSTEM_PROGRESSBAR(48)。</summary>
+    static int RoleProgressBar() { return 0x30; }
+    /// <summary>ROLE_SYSTEM_SLIDER(51)。</summary>
+    static int RoleSlider() { return 0x33; }
+    /// <summary>ROLE_SYSTEM_SPINBUTTON(52)。</summary>
+    static int RoleSpinButton() { return 0x34; }
+    /// <summary>ROLE_SYSTEM_PAGETABLIST(60)。</summary>
+    static int RolePageTabList() { return 0x3C; }
+    /// <summary>ROLE_SYSTEM_SPLITBUTTON(62)。</summary>
+    static int RoleSplitButton() { return 0x3E; }
+
+    /// <summary>角色码 -> 可读名称;未知角色返回 "role:N"。</summary>
+    static string RoleName(int role) {
+        if (role == 0x1) { return "titlebar"; }
+        if (role == 0x2) { return "menubar"; }
+        if (role == 0x3) { return "scrollbar"; }
+        if (role == 0x4) { return "grip"; }
+        if (role == 0x5) { return "sound"; }
+        if (role == 0x6) { return "cursor"; }
+        if (role == 0x7) { return "caret"; }
+        if (role == 0x8) { return "alert"; }
+        if (role == 0x9) { return "window"; }
+        if (role == 0xA) { return "client"; }
+        if (role == 0xB) { return "menupopup"; }
+        if (role == 0xC) { return "menuitem"; }
+        if (role == 0xD) { return "tooltip"; }
+        if (role == 0xE) { return "application"; }
+        if (role == 0xF) { return "document"; }
+        if (role == 0x10) { return "pane"; }
+        if (role == 0x11) { return "chart"; }
+        if (role == 0x12) { return "dialog"; }
+        if (role == 0x13) { return "border"; }
+        if (role == 0x14) { return "grouping"; }
+        if (role == 0x15) { return "separator"; }
+        if (role == 0x16) { return "toolbar"; }
+        if (role == 0x17) { return "statusbar"; }
+        if (role == 0x18) { return "table"; }
+        if (role == 0x19) { return "columnheader"; }
+        if (role == 0x1A) { return "rowheader"; }
+        if (role == 0x1B) { return "column"; }
+        if (role == 0x1C) { return "row"; }
+        if (role == 0x1D) { return "cell"; }
+        if (role == 0x1E) { return "link"; }
+        if (role == 0x1F) { return "helpballoon"; }
+        if (role == 0x20) { return "character"; }
+        if (role == 0x21) { return "list"; }
+        if (role == 0x22) { return "listitem"; }
+        if (role == 0x23) { return "outline"; }
+        if (role == 0x24) { return "outlineitem"; }
+        if (role == 0x25) { return "pagetab"; }
+        if (role == 0x26) { return "propertypage"; }
+        if (role == 0x27) { return "indicator"; }
+        if (role == 0x28) { return "graphic"; }
+        if (role == 0x29) { return "statictext"; }
+        if (role == 0x2A) { return "text"; }
+        if (role == 0x2B) { return "pushbutton"; }
+        if (role == 0x2C) { return "checkbutton"; }
+        if (role == 0x2D) { return "radiobutton"; }
+        if (role == 0x2E) { return "combobox"; }
+        if (role == 0x2F) { return "droplist"; }
+        if (role == 0x30) { return "progressbar"; }
+        if (role == 0x31) { return "dial"; }
+        if (role == 0x32) { return "hotkeyfield"; }
+        if (role == 0x33) { return "slider"; }
+        if (role == 0x34) { return "spinbutton"; }
+        if (role == 0x35) { return "diagram"; }
+        if (role == 0x36) { return "animation"; }
+        if (role == 0x37) { return "equation"; }
+        if (role == 0x38) { return "buttondropdown"; }
+        if (role == 0x39) { return "buttonmenu"; }
+        if (role == 0x3A) { return "buttondropdowngrid"; }
+        if (role == 0x3B) { return "whitespace"; }
+        if (role == 0x3C) { return "pagetablist"; }
+        if (role == 0x3D) { return "clock"; }
+        if (role == 0x3E) { return "splitbutton"; }
+        if (role == 0x3F) { return "ipaddress"; }
+        if (role == 0x40) { return "outlinebutton"; }
+        return "role:" + Convert.ToString(role);
+    }
+
+    // ---- 状态常量 ----
+
+    /// <summary>STATE_SYSTEM_UNAVAILABLE(1)。</summary>
+    static int StateUnavailable() { return 0x1; }
+    /// <summary>STATE_SYSTEM_SELECTED(2)。</summary>
+    static int StateSelected() { return 0x2; }
+    /// <summary>STATE_SYSTEM_FOCUSED(4)。</summary>
+    static int StateFocused() { return 0x4; }
+    /// <summary>STATE_SYSTEM_PRESSED(8)。</summary>
+    static int StatePressed() { return 0x8; }
+    /// <summary>STATE_SYSTEM_CHECKED(16)。</summary>
+    static int StateChecked() { return 0x10; }
+    /// <summary>STATE_SYSTEM_READONLY(64)。</summary>
+    static int StateReadOnly() { return 0x40; }
+    /// <summary>STATE_SYSTEM_EXPANDED(512)。</summary>
+    static int StateExpanded() { return 0x200; }
+    /// <summary>STATE_SYSTEM_COLLAPSED(1024)。</summary>
+    static int StateCollapsed() { return 0x400; }
+    /// <summary>STATE_SYSTEM_BUSY(2048)。</summary>
+    static int StateBusy() { return 0x800; }
+    /// <summary>STATE_SYSTEM_INVISIBLE(32768)。</summary>
+    static int StateInvisible() { return 0x8000; }
+    /// <summary>STATE_SYSTEM_OFFSCREEN(65536)。</summary>
+    static int StateOffscreen() { return 0x10000; }
+    /// <summary>STATE_SYSTEM_FOCUSABLE(1048576)。</summary>
+    static int StateFocusable() { return 0x100000; }
+    /// <summary>STATE_SYSTEM_SELECTABLE(2097152)。</summary>
+    static int StateSelectable() { return 0x200000; }
+}

@@ -1,0 +1,209 @@
+using System;
+
+namespace System.Security.Cryptography;
+
+/// <summary>HOTP (RFC 4226) and TOTP (RFC 6238) one-time passwords.</summary>
+class Otp {
+    static int SHA1 = 1;
+    static int SHA256 = 2;
+    static int SHA512 = 3;
+    static int MAX_VERIFICATION_WINDOW = 1000;
+
+    static int digestLen(int algorithm) {
+        if (algorithm == SHA1) { return 20; }
+        if (algorithm == SHA512) { return 64; }
+        return 32;
+    }
+
+    static int blockLen(int algorithm) {
+        if (algorithm == SHA512) { return 128; }
+        return 64;
+    }
+
+    static byte[] hash(int algorithm, string buf, int length) {
+        if (algorithm == SHA1) { return Sha1.Hash(buf, length); }
+        if (algorithm == SHA512) { return Sha512.Hash(buf, length); }
+        return Sha256.Hash(buf, length);
+    }
+
+    static byte[] hmac(int algorithm, string key, int keyLen, string message, int messageLen) {
+        int digestLength = digestLen(algorithm);
+        int blockLength = blockLen(algorithm);
+        byte[] normalizedKey = new byte[blockLength];
+        int i = 0;
+        if (keyLen > blockLength) {
+            byte[] keyHash = hash(algorithm, key, keyLen);
+            while (i < digestLength) {
+                normalizedKey[i] = keyHash[i] & 255;
+                i = i + 1;
+            }
+        } else {
+            while (i < keyLen) {
+                normalizedKey[i] = key[i] & 255;
+                i = i + 1;
+            }
+        }
+
+        byte[] inner = new byte[blockLength + messageLen];
+        i = 0;
+        while (i < blockLength) {
+            inner[i] = (normalizedKey[i] ^ 0x36) & 255;
+            i = i + 1;
+        }
+        i = 0;
+        while (i < messageLen) {
+            inner[blockLength + i] = message[i] & 255;
+            i = i + 1;
+        }
+        byte[] innerHash = hash(algorithm, inner, blockLength + messageLen);
+
+        byte[] outer = new byte[blockLength + digestLength];
+        i = 0;
+        while (i < blockLength) {
+            outer[i] = (normalizedKey[i] ^ 0x5c) & 255;
+            i = i + 1;
+        }
+        i = 0;
+        while (i < digestLength) {
+            outer[blockLength + i] = innerHash[i] & 255;
+            i = i + 1;
+        }
+        return hash(algorithm, outer, blockLength + digestLength);
+    }
+
+    static int modulus(int digits) {
+        int power = 1;
+        int i = 0;
+        while (i < digits) {
+            power = power * 10;
+            i = i + 1;
+        }
+        return power;
+    }
+
+    static string decimalCode(int number, int digits) {
+        string result = Convert.ToString(number);
+        while (result.Length < digits) { result = "0" + result; }
+        return result;
+    }
+
+    static void validate(int digits, int algorithm) {
+        if (digits < 6 || digits > 8) {
+            throw new ArgumentException("OTP digits must be between 6 and 8");
+        }
+        if (algorithm != SHA1 && algorithm != SHA256 && algorithm != SHA512) {
+            throw new ArgumentException("unsupported OTP hash algorithm");
+        }
+    }
+
+    static void validateKey(string key, int keyLen) {
+        if (key == null) { throw new ArgumentException("OTP key must not be null"); }
+        if (keyLen < 0 || keyLen > key.Length) {
+            throw new ArgumentException("OTP key length must be between 0 and key.Length");
+        }
+    }
+
+    static void validateCode(string code, int digits) {
+        if (code == null) { throw new ArgumentException("OTP code must not be null"); }
+        if (code.Length != digits) {
+            throw new ArgumentException("OTP code length must match digits");
+        }
+        int i = 0;
+        while (i < code.Length) {
+            if (code[i] < 48 || code[i] > 57) {
+                throw new ArgumentException("OTP code must contain only decimal digits");
+            }
+            i = i + 1;
+        }
+    }
+
+    static void validateWindow(int window, string name) {
+        if (window < 0 || window > MAX_VERIFICATION_WINDOW) {
+            throw new ArgumentException(name + " must be between 0 and 1000");
+        }
+    }
+
+    /// <summary>Generates an HOTP code for an explicit 64-bit counter.
+    /// <paramref name="digits"/> must be between 6 and 8.</summary>
+    static string Hotp(string key, int keyLen, long counter, int digits, int algorithm) {
+        validateKey(key, keyLen);
+        validate(digits, algorithm);
+        byte[] movingFactor = new byte[8];
+        int i = 0;
+        while (i < 8) {
+            movingFactor[7 - i] = Bits.Shr64(counter, i * 8) & 255;
+            i = i + 1;
+        }
+        byte[] digest = hmac(algorithm, key, keyLen, movingFactor, 8);
+        int offset = digest[digestLen(algorithm) - 1] & 15;
+        int binary = ((digest[offset] & 127) << 24)
+            | ((digest[offset + 1] & 255) << 16)
+            | ((digest[offset + 2] & 255) << 8)
+            | (digest[offset + 3] & 255);
+        return decimalCode(binary % modulus(digits), digits);
+    }
+
+    /// <summary>Generates a TOTP code at an explicit Unix time and period.</summary>
+    static string Totp(string key, int keyLen, long unixTime, int period, int digits, int algorithm) {
+        validateKey(key, keyLen);
+        if (period <= 0) { throw new ArgumentException("TOTP period must be positive"); }
+        return Hotp(key, keyLen, unixTime / period, digits, algorithm);
+    }
+
+    static bool fixedTimeEquals(string expected, string supplied) {
+        int difference = expected.Length ^ supplied.Length;
+        int i = 0;
+        while (i < expected.Length) {
+            int actual = 0;
+            if (i < supplied.Length) { actual = supplied[i] & 255; }
+            difference = difference | ((expected[i] & 255) ^ actual);
+            i = i + 1;
+        }
+        return difference == 0;
+    }
+
+    /// <summary>Verifies HOTP in constant time across the current counter and
+    /// <paramref name="lookAhead"/> subsequent counters.</summary>
+    static bool VerifyHotp(string key, int keyLen, long counter, int digits, int algorithm,
+        string code, int lookAhead) {
+        validateKey(key, keyLen);
+        validate(digits, algorithm);
+        validateCode(code, digits);
+        validateWindow(lookAhead, "HOTP look-ahead");
+        if (counter > 9223372036854775807 - lookAhead) {
+            throw new ArgumentException("HOTP counter and look-ahead overflow");
+        }
+        bool matched = false;
+        int drift = 0;
+        while (drift <= lookAhead) {
+            bool equal = fixedTimeEquals(Hotp(key, keyLen, counter + drift, digits, algorithm), code);
+            matched = matched | equal;
+            drift = drift + 1;
+        }
+        return matched;
+    }
+
+    /// <summary>Verifies TOTP in constant time across the symmetric drift window.
+    /// A window of one checks the previous, current, and next periods.</summary>
+    static bool VerifyTotp(string key, int keyLen, long unixTime, int period, int digits,
+        int algorithm, string code, int window) {
+        validateKey(key, keyLen);
+        validate(digits, algorithm);
+        validateCode(code, digits);
+        if (period <= 0) { throw new ArgumentException("TOTP period must be positive"); }
+        validateWindow(window, "TOTP window");
+        bool matched = false;
+        int drift = 0 - window;
+        long counter = unixTime / period;
+        if (counter < -9223372036854775807 - 1 + window
+            || counter > 9223372036854775807 - window) {
+            throw new ArgumentException("TOTP counter and window overflow");
+        }
+        while (drift <= window) {
+            bool equal = fixedTimeEquals(Hotp(key, keyLen, counter + drift, digits, algorithm), code);
+            matched = matched | equal;
+            drift = drift + 1;
+        }
+        return matched;
+    }
+}

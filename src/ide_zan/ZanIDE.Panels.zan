@@ -112,10 +112,10 @@ partial class ZanIDE {
     }
 
     /// Index of the open tab whose file name matches `base`, or -1.
-    static int FindTabByBase(List<string> tabPaths, string bn) {
+    static int FindTabByBase(List<TabRecord> tabs, string bn) {
         int i = 0;
-        while (i < tabPaths.Count) {
-            if (ZanIDE.BaseName(tabPaths[i]) == bn) { return i; }
+        while (i < tabs.Count) {
+            if (ZanIDE.BaseName(tabs[i].path) == bn) { return i; }
             i = i + 1;
         }
         return -1;
@@ -126,9 +126,8 @@ partial class ZanIDE {
     // ================================================================
 
     /// Scans the log for compiler/linker diagnostics of the form
-    /// `...<file>.zan:<line>[:col]: ... message`, filling parallel lists.
-    static void ParseErrorList(List<string> log, List<string> outPath,
-            List<string> outLine, List<string> outMsg) {
+    /// `...<file>.zan:<line>[:col]: ... message`.
+    static void ParseErrorList(List<string> log, List<DiagnosticRecord> records) {
         int i = 0;
         while (i < log.Count) {
             string ln = log[i];
@@ -152,9 +151,7 @@ partial class ZanIDE {
                     int me = ZanIDE.StrFind(ln, "error");
                     if (me < 0) { me = ZanIDE.StrFind(ln, "warning"); }
                     if (me >= 0) { msg = ln.Substring(me, ln.Length - me); }
-                    outPath.Add(path);
-                    outLine.Add(num);
-                    outMsg.Add(msg);
+                    records.Add(new DiagnosticRecord(path, num, msg));
                 }
             }
             i = i + 1;
@@ -255,8 +252,7 @@ partial class ZanIDE {
         editor.LoadText(text);
         int a = active.Get();
         if (a >= 0 && a < bodies.Count) { bodies[a] = text; }
-        editor.SetCompilerDiagnostics(
-            new List<int>(), new List<string>());
+        editor.SetCompilerDiagnostics(new List<Diagnostic>());
         log.Add("> Added " + line);
     }
 
@@ -347,12 +343,9 @@ partial class ZanIDE {
     static string AiModelsRespPath() { return ZanIDE.CacheDir() + "/ai_models.json"; }
     static string AiModelsDonePath() { return ZanIDE.CacheDir() + "/ai_models_done.txt"; }
 
-    /// Loads the AI provider profiles into the parallel lists and returns the
-    /// active index. Falls back to a single profile synthesized from the
-    /// legacy ai.cfg / environment settings when ai_profiles.json is missing.
-    static int AiProfilesLoad(List<string> names, List<string> bases,
-            List<string> keys, List<string> models, List<string> lists,
-            List<string> limits) {
+    /// Loads AI provider profiles and returns the active index. Falls back to a
+    /// single profile synthesized from legacy ai.cfg / environment settings.
+    static int AiProfilesLoad(List<AiProfile> profiles) {
         int active = 0;
         if (File.Exists(ZanIDE.AiProfilesPath())) {
             JsonValue v = JsonValue.ParseLenient(File.ReadAllText(ZanIDE.AiProfilesPath()));
@@ -363,62 +356,55 @@ partial class ZanIDE {
                     int i = 0;
                     while (i < ps.Count()) {
                         JsonValue p = ps.At(i);
-                        names.Add(p.Str("name", "AI " + Convert.ToString(i + 1)));
-                        bases.Add(p.Str("base", ""));
-                        keys.Add(p.Str("key", ""));
-                        models.Add(p.Str("model", ""));
-                        string ml = "";
+                        string modelList = "";
                         JsonValue ms = p.Get("models");
                         if (ms != null && ms.IsArray()) {
                             int j = 0;
                             while (j < ms.Count()) {
                                 string mid = ms.At(j).AsString("");
                                 if (mid != "") {
-                                    if (ml != "") { ml = ml + ";"; }
-                                    ml = ml + mid;
+                                    if (modelList != "") { modelList = modelList + ";"; }
+                                    modelList = modelList + mid;
                                 }
                                 j = j + 1;
                             }
                         }
-                        lists.Add(ml);
+                        string limitMap = "{}";
                         JsonValue lim = p.Get("limits");
-                        if (lim != null && lim.IsObject()) {
-                            limits.Add(lim.ToJson());
-                        } else {
-                            limits.Add("{}");
-                        }
+                        if (lim != null && lim.IsObject()) { limitMap = lim.ToJson(); }
+                        profiles.Add(AiProfile.Create(
+                            p.Str("name", "AI " + Convert.ToString(i + 1)),
+                            p.Str("base", ""), p.Str("key", ""),
+                            p.Str("model", ""), modelList, limitMap));
                         i = i + 1;
                     }
                 }
             }
         }
-        if (names.Count == 0) {
-            names.Add(ZanIDE.T("Default", "默认"));
-            bases.Add(ZanIDE.AiSetting("base", "OPENAI_BASE_URL", "https://api.openai.com/v1"));
-            keys.Add(ZanIDE.AiSetting("key", "OPENAI_API_KEY", ""));
-            models.Add(ZanIDE.AiSetting("model", "OPENAI_MODEL", "gpt-4o-mini"));
-            lists.Add("");
-            limits.Add("{}");
+        if (profiles.Count == 0) {
+            profiles.Add(AiProfile.Create(ZanIDE.T("Default", "默认"),
+                ZanIDE.AiSetting("base", "OPENAI_BASE_URL", "https://api.openai.com/v1"),
+                ZanIDE.AiSetting("key", "OPENAI_API_KEY", ""),
+                ZanIDE.AiSetting("model", "OPENAI_MODEL", "gpt-4o-mini"), "", "{}"));
             active = 0;
         }
-        if (active < 0 || active >= names.Count) { active = 0; }
+        if (active < 0 || active >= profiles.Count) { active = 0; }
         return active;
     }
 
-    static void AiProfilesSave(int active, List<string> names, List<string> bases,
-            List<string> keys, List<string> models, List<string> lists,
-            List<string> limits) {
+    static void AiProfilesSave(int active, List<AiProfile> profiles) {
         StringBuilder sb = new StringBuilder();
         sb.Append("{\"active\": " + Convert.ToString(active) + ", \"profiles\": [");
         int i = 0;
-        while (i < names.Count) {
+        while (i < profiles.Count) {
+            AiProfile profile = profiles[i];
             if (i > 0) { sb.Append(", "); }
-            sb.Append("{\"name\": \"" + ZanIDE.JsonEsc(names[i]) + "\"");
-            sb.Append(", \"base\": \"" + ZanIDE.JsonEsc(bases[i]) + "\"");
-            sb.Append(", \"key\": \"" + ZanIDE.JsonEsc(keys[i]) + "\"");
-            sb.Append(", \"model\": \"" + ZanIDE.JsonEsc(models[i]) + "\"");
+            sb.Append("{\"name\": \"" + ZanIDE.JsonEsc(profile.name) + "\"");
+            sb.Append(", \"base\": \"" + ZanIDE.JsonEsc(profile.baseUrl) + "\"");
+            sb.Append(", \"key\": \"" + ZanIDE.JsonEsc(profile.key) + "\"");
+            sb.Append(", \"model\": \"" + ZanIDE.JsonEsc(profile.model) + "\"");
             sb.Append(", \"models\": [");
-            List<string> ms = ZanIDE.SplitList(lists[i]);
+            List<string> ms = ZanIDE.SplitList(profile.models);
             int j = 0;
             while (j < ms.Count) {
                 if (j > 0) { sb.Append(", "); }
@@ -426,9 +412,9 @@ partial class ZanIDE {
                 j = j + 1;
             }
             sb.Append("]");
-            string lim = "{}";
-            if (i < limits.Count && limits[i] != "") { lim = limits[i]; }
-            sb.Append(", \"limits\": " + lim);
+            string limitMap = profile.limits;
+            if (limitMap == "") { limitMap = "{}"; }
+            sb.Append(", \"limits\": " + limitMap);
             sb.Append("}");
             i = i + 1;
         }
@@ -613,11 +599,11 @@ partial class ZanIDE {
     /// success or a user-facing error message.
     /// The content of the last ``` fenced code block in the newest assistant
     /// reply, or "" when there is none.
-    static string AiLastCode(List<string> roles, List<string> texts) {
-        int i = roles.Count - 1;
+    static string AiLastCode(List<AiChatMsg> msgs) {
+        int i = msgs.Count - 1;
         while (i >= 0) {
-            if (roles[i] == "assistant") {
-                string s = texts[i];
+            if (msgs[i].role == "assistant") {
+                string s = msgs[i].text;
                 int a = ZanIDE.IndexOfStr(s, "```");
                 if (a < 0) { return ""; }
                 int ls = a + 3;
@@ -634,7 +620,7 @@ partial class ZanIDE {
         return "";
     }
 
-    static string AiLaunch(List<string> roles, List<string> texts,
+    static string AiLaunch(List<AiChatMsg> msgs,
             string ctxName, string ctxCode, string projRoot,
             string baseUrl, string key, string model) {
         if (key == "") {
@@ -659,17 +645,17 @@ partial class ZanIDE {
         // Fold the oldest turns into a digest once the transcript passes the
         // budget, so a long agent session keeps working instead of growing
         // until it overflows the model's context window.
-        AiMessages msgs = AiAgent.BuildContext(roles, texts);
+        AiMessages msgs2 = AiAgent.BuildContext(msgs);
         int i = 0;
-        while (i < msgs.roles.Count) {
+        while (i < msgs2.msgs.Count) {
             // Tool results go back as user turns: every OpenAI-compatible
             // endpoint accepts that, including local models with no notion of
             // a tool role.
-            string role = msgs.roles[i];
+            string role = msgs2.msgs[i].role;
             if (role == "tool") { role = "user"; }
             if (role == "user" || role == "assistant") {
                 body.Append(",{\"role\":\"" + role + "\",\"content\":\""
-                    + ZanIDE.JsonEsc(msgs.texts[i]) + "\"}");
+                    + ZanIDE.JsonEsc(msgs2.msgs[i].text) + "\"}");
             }
             i = i + 1;
         }
@@ -1005,8 +991,7 @@ partial class ZanIDE {
         if (ide == null || !ide.gitList.HasSelection()) { return; }
         string gp = ide.root + "/" + ZanIDE.GitPathOf(ide.gitList.Selected());
         if (!File.Exists(gp)) { return; }
-        ZanIDE.OpenPath(ide.tabNames, ide.tabBodies, ide.tabPaths,
-                        ide.activeTab, gp, Path.GetFileName(gp));
+        ZanIDE.OpenPath(ide.tabs, ide.activeTab, gp, Path.GetFileName(gp));
         ide.lastActive = 0 - 1;
     }
 
@@ -1022,8 +1007,7 @@ partial class ZanIDE {
         if (ide == null || !ide.explorerTv.HasSelection()) { return; }
         TreeNode node = ide.explorerTv.Selected();
         if (node.isDir || node.path == "") { return; }
-        ZanIDE.OpenPath(ide.tabNames, ide.tabBodies, ide.tabPaths,
-                        ide.activeTab, node.path, node.label);
+        ZanIDE.OpenPath(ide.tabs, ide.activeTab, node.path, node.label);
         ide.log.Add("> Opened " + node.path + ".");
     }
 
@@ -1067,21 +1051,18 @@ partial class ZanIDE {
         TreeNode en = ide.stdlibTv.Selected();
         if (en.isDir || en.path == "") { return; }
         if (ZanIDE.StartsWith(en.path, "@ex:")) {
-            int di = ZanIDE.FindTabByPath(ide.tabPaths, "@docs");
+            int di = ZanIDE.FindTabByPath(ide.tabs, "@docs");
             if (di >= 0) {
                 ide.activeTab.Set(di);
             } else {
-                ide.tabNames.Add(ZanIDE.T("Components", "组件中心"));
-                ide.tabBodies.Add("");
-                ide.tabPaths.Add("@docs");
-                ide.activeTab.Set(ide.tabNames.Count - 1);
+                ide.tabs.Add(TabRecord.Create(ZanIDE.T("Components", "组件中心"), "", "@docs"));
+                ide.activeTab.Set(ide.tabs.Count - 1);
             }
             ide.lastActive = 0 - 1;
             ide.log.Add("> Opened the GUI component center.");
             return;
         }
-        ZanIDE.OpenPath(ide.tabNames, ide.tabBodies, ide.tabPaths,
-                        ide.activeTab, en.path, en.label);
+        ZanIDE.OpenPath(ide.tabs, ide.activeTab, en.path, en.label);
         ide.log.Add("> Opened " + en.path + ".");
     }
 
@@ -1134,8 +1115,7 @@ partial class ZanIDE {
         if (ide == null || !ide.examplesTv.HasSelection()) { return; }
         TreeNode n = ide.examplesTv.Selected();
         if (n.isDir || n.path == "" || ZanIDE.StartsWith(n.path, "@")) { return; }
-        ZanIDE.OpenPath(ide.tabNames, ide.tabBodies, ide.tabPaths,
-                        ide.activeTab, n.path, n.label);
+        ZanIDE.OpenPath(ide.tabs, ide.activeTab, n.path, n.label);
         ide.log.Add("> Opened " + n.path + ".");
     }
 
@@ -1178,14 +1158,14 @@ partial class ZanIDE {
     /// The frame loop polls BuildDone() and, on success, opens the debug
     /// session -- so pressing F5 never freezes the window during compilation.
     static string DebugBuildBegin(
-        List<string> tabPaths,
+        List<TabRecord> tabs,
         SignalInt activeTab,
         string root,
         List<string> log
     ) {
         int a = activeTab.Get();
-        if (a < 0 || a >= tabPaths.Count) { return ""; }
-        string p = tabPaths[a];
+        if (a < 0 || a >= tabs.Count) { return ""; }
+        string p = tabs[a].path;
         p = ZanIDE.RibbonRunTarget(p, root);
         if (p == "") {
             log.Add(ZanIDE.T("> [Debug] Open a source file first.", "> [调试] 请先打开源文件。"));
@@ -1477,37 +1457,17 @@ partial class ZanIDE {
         return s.Substring(0, e);
     }
 
-    static void LogVarsToConsole(List<string> log, List<string> vars, int execLine) {
+    static void LogVarsToConsole(List<string> log, List<DbgVar> vars, int execLine) {
         log.Add("> --- Line " + Convert.ToString(execLine + 1) + " ---");
         int vi = 0;
         while (vi < vars.Count) {
-            string entry = vars[vi];
-            string vn = ZanIDE.GetTabField(entry, 0);
-            string vt = ZanIDE.GetTabField(entry, 1);
-            string vv = ZanIDE.GetTabField(entry, 2);
+            DbgVar entry = vars[vi];
+            string vn = entry.name;
+            string vt = entry.type;
+            string vv = entry.val;
             log.Add(">   " + vn + " : " + vt + " = " + vv);
             vi = vi + 1;
         }
-    }
-
-    static string GetTabField(string s, int fieldIdx) {
-        int fi = 0;
-        int start = 0;
-        int i = 0;
-        while (i < s.Length) {
-            if (s.Substring(i, 1) == "\t") {
-                if (fi == fieldIdx) {
-                    return s.Substring(start, i - start);
-                }
-                fi = fi + 1;
-                start = i + 1;
-            }
-            i = i + 1;
-        }
-        if (fi == fieldIdx) {
-            return s.Substring(start, s.Length - start);
-        }
-        return "";
     }
 
     // ================================================================
@@ -1668,11 +1628,8 @@ partial class ZanIDE {
     // Example Code Library
     // ================================================================
 
-    static void OpenNewTab(List<string> tabNames, List<string> tabBodies,
-            List<string> tabPaths, SignalInt activeTab, string name, string code) {
-        tabNames.Add(name);
-        tabBodies.Add(code);
-        tabPaths.Add("");
-        activeTab.Set(tabNames.Count - 1);
+    static void OpenNewTab(List<TabRecord> tabs, SignalInt activeTab, string name, string code) {
+        tabs.Add(TabRecord.Create(name, code, ""));
+        activeTab.Set(tabs.Count - 1);
     }
 }

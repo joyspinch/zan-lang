@@ -84,6 +84,8 @@ class Python {
     static nint addr_listGetItem;
     static nint addr_listNew;
     static nint addr_listSetItem;
+    static nint addr_getItem;
+    static nint addr_setItem;
     static nint addr_dictSize;
     static nint addr_dictNext;
     static nint addr_dictNew;
@@ -95,8 +97,7 @@ class Python {
     // PyCFunction_New stores the PyMethodDef *pointer* (it does not copy),
     // so every def and its name buffer must outlive the callable. Cache them
     // here and release them all in Finalize.
-    static List<nint> regDefs;
-    static List<nint> regNames;
+    static List<PyRegisteredDef> registeredDefs;
 
     /// <summary>True when a usable CPython DLL can be loaded.</summary>
     static bool IsAvailable() {
@@ -150,13 +151,12 @@ class Python {
             PyVoidFn f = (PyVoidFn)Python.addr_finalize;
             f();
         }
-        if (Python.regDefs != null) {
-            for (int i = 0; i < Python.regDefs.Count; i = i + 1) {
-                NativeMemory.Free(Python.regDefs[i]);
-                NativeMemory.Free(Python.regNames[i]);
+        if (Python.registeredDefs != null) {
+            for (int i = 0; i < Python.registeredDefs.Count; i = i + 1) {
+                NativeMemory.Free(Python.registeredDefs[i].def);
+                NativeMemory.Free(Python.registeredDefs[i].name);
             }
-            Python.regDefs.Clear();
-            Python.regNames.Clear();
+            Python.registeredDefs.Clear();
         }
         Python.initialized = false;
         Python.FreeModule();
@@ -319,12 +319,10 @@ class Python {
             return false;
         }
         // Keep defs/nameBuf alive: the callable references them until freed.
-        if (Python.regDefs == null) {
-            Python.regDefs = new List<nint>();
-            Python.regNames = new List<nint>();
+        if (Python.registeredDefs == null) {
+            Python.registeredDefs = new List<PyRegisteredDef>();
         }
-        Python.regDefs.Add(defs);
-        Python.regNames.Add(nameBuf);
+        Python.registeredDefs.Add(new PyRegisteredDef(defs, nameBuf));
 
         PySetAttrFn setAttr = (PySetAttrFn)Python.addr_setAttrString;
         PyNintStrFn imp = (PyNintStrFn)Python.addr_importModule;
@@ -604,6 +602,8 @@ class Python {
         Python.addr_listGetItem = Interop.Symbol(Python.mod, "PyList_GetItem");
         Python.addr_listNew = Interop.Symbol(Python.mod, "PyList_New");
         Python.addr_listSetItem = Interop.Symbol(Python.mod, "PyList_SetItem");
+        Python.addr_getItem = Interop.Symbol(Python.mod, "PyObject_GetItem");
+        Python.addr_setItem = Interop.Symbol(Python.mod, "PyObject_SetItem");
         Python.addr_dictSize = Interop.Symbol(Python.mod, "PyDict_Size");
         Python.addr_dictNext = Interop.Symbol(Python.mod, "PyDict_Next");
         Python.addr_dictNew = Interop.Symbol(Python.mod, "PyDict_New");
@@ -649,6 +649,8 @@ class Python {
         Python.addr_listGetItem = 0;
         Python.addr_listNew = 0;
         Python.addr_listSetItem = 0;
+        Python.addr_getItem = 0;
+        Python.addr_setItem = 0;
         Python.addr_dictSize = 0;
         Python.addr_dictNext = 0;
         Python.addr_dictNew = 0;
@@ -667,6 +669,16 @@ class Python {
             PyVoid1Fn f = (PyVoid1Fn)Python.addr_incRef;
             f(obj);
         }
+    }
+}
+
+class PyRegisteredDef {
+    nint def;
+    nint name;
+
+    PyRegisteredDef(nint def, nint name) {
+        this.def = def;
+        this.name = name;
     }
 }
 
@@ -751,6 +763,142 @@ class PyObject {
         }
         Python.IncRef(item);                    // owned by the wrapper
         return PyObject.Wrap(item);
+    }
+
+    /// <summary>Writes an index of a list: <c>obj.SetIndex(2, v)</c>.</summary>
+    void SetIndex(long index, PyObject val) {
+        PyListSizeFn sz = (PyListSizeFn)Python.addr_listSize;
+        if (sz(this.handle) < 0) {
+            PyVoidFn printErr = (PyVoidFn)Python.addr_errPrint;
+            printErr();
+            throw new InvalidOperationException("Python SetIndex():目标不是列表");
+        }
+        PyListSetFn sl = (PyListSetFn)Python.addr_listSetItem;
+        Python.IncRef(val.handle);              // PyList_SetItem steals the reference
+        int rc = sl(this.handle, index, val.handle);
+        if (rc != 0) {
+            PyVoidFn printErr = (PyVoidFn)Python.addr_errPrint;
+            printErr();
+            throw new InvalidOperationException("Python SetIndex():索引写入失败");
+        }
+    }
+
+    /// <summary>Reads an item with a Python key (dict, sequence): <c>obj.GetItem("k")</c>.</summary>
+    PyObject GetItem(string key) {
+        PyObject k = Python.FromStr(key);
+        PyNintPairFn f = (PyNintPairFn)Python.addr_getItem;
+        nint h = f(this.handle, k.handle);       // new reference
+        if (h == 0) {
+            PyVoidFn printErr = (PyVoidFn)Python.addr_errPrint;
+            printErr();
+            throw new InvalidOperationException("Python GetItem():键不存在");
+        }
+        return PyObject.Wrap(h);
+    }
+
+    /// <summary>Writes an item with a Python key (dict, sequence): <c>obj.SetItem("k", v)</c>.</summary>
+    void SetItem(string key, PyObject val) {
+        PyObject k = Python.FromStr(key);
+        PyNint3RetFn f = (PyNint3RetFn)Python.addr_setItem;
+        int rc = f(this.handle, k.handle, val.handle);
+        if (rc != 0) {
+            PyVoidFn printErr = (PyVoidFn)Python.addr_errPrint;
+            printErr();
+            throw new InvalidOperationException("Python SetItem():键写入失败");
+        }
+    }
+
+    /// <summary>
+    /// Operator overload: <c>fn(a, b)</c> calls the Python callable. Enabled
+    /// by the compiler's op_call lowering; the scalar overloads marshal
+    /// string/double/long/bool arguments automatically, the PyObject
+    /// overload takes an already-wrapped value, and the params overload
+    /// covers multiple PyObject arguments.
+    /// </summary>
+    static PyObject op_call(PyObject self, string a) {
+        return self.Call1(Python.FromStr(a));
+    }
+
+    static PyObject op_call(PyObject self, double a) {
+        return self.Call1(Python.FromDouble(a));
+    }
+
+    static PyObject op_call(PyObject self, long a) {
+        return self.Call1(Python.FromLong(a));
+    }
+
+    static PyObject op_call(PyObject self, bool a) {
+        return self.Call1(Python.FromBool(a));
+    }
+
+    static PyObject op_call(PyObject self, PyObject a) {
+        return self.Call1(a);
+    }
+
+    static PyObject op_call(PyObject self, params double[] args) {
+        List<PyObject> py = new List<PyObject>();
+        for (int i = 0; i < args.Count; i = i + 1) {
+            py.Add(Python.FromDouble(args[i]));
+        }
+        return self.Call(py);
+    }
+
+    static PyObject op_call(PyObject self, params string[] args) {
+        List<PyObject> py = new List<PyObject>();
+        for (int i = 0; i < args.Count; i = i + 1) {
+            py.Add(Python.FromStr(args[i]));
+        }
+        return self.Call(py);
+    }
+
+    static PyObject op_call(PyObject self, params long[] args) {
+        List<PyObject> py = new List<PyObject>();
+        for (int i = 0; i < args.Count; i = i + 1) {
+            py.Add(Python.FromLong(args[i]));
+        }
+        return self.Call(py);
+    }
+
+    static PyObject op_call(PyObject self, params bool[] args) {
+        List<PyObject> py = new List<PyObject>();
+        for (int i = 0; i < args.Count; i = i + 1) {
+            py.Add(Python.FromBool(args[i]));
+        }
+        return self.Call(py);
+    }
+
+    static PyObject op_call(PyObject self, params PyObject[] args) {
+        return self.Call(args);
+    }
+
+    /// <summary>Operator overload: <c>list[2]</c> reads an index, like <see cref="At"/>.</summary>
+    static PyObject op_index(PyObject self, long index) {
+        return self.At(index);
+    }
+
+    /// <summary>Operator overload: <c>dict["k"]</c> reads an item, like <see cref="GetItem"/>.</summary>
+    static PyObject op_index(PyObject self, string key) {
+        return self.GetItem(key);
+    }
+
+    /// <summary>Operator overload: <c>list[2] = v</c> writes an index, like <see cref="SetIndex"/>.</summary>
+    static void op_index_set(PyObject self, long index, PyObject val) {
+        self.SetIndex(index, val);
+    }
+
+    /// <summary>Operator overload: <c>list[2] = "s"</c> marshals the string value.</summary>
+    static void op_index_set(PyObject self, long index, string val) {
+        self.SetIndex(index, Python.FromStr(val));
+    }
+
+    /// <summary>Operator overload: <c>dict["k"] = v</c> writes an item, like <see cref="SetItem"/>.</summary>
+    static void op_index_set(PyObject self, string key, PyObject val) {
+        self.SetItem(key, val);
+    }
+
+    /// <summary>Operator overload: <c>dict["k"] = "s"</c> marshals the string value.</summary>
+    static void op_index_set(PyObject self, string key, string val) {
+        self.SetItem(key, Python.FromStr(val));
     }
 
     /// <summary>Calls the object with no arguments.</summary>
@@ -916,6 +1064,8 @@ delegate int PyIntStrFn(string s);
 delegate nint PyNintStrFn(string s);
 delegate nint PyNint1Fn(nint a);
 delegate nint PyNint2Fn(nint a, nint b, nint c);
+delegate nint PyNintPairFn(nint a, nint b);
+delegate int PyNint3RetFn(nint a, nint b, nint c);
 delegate nint PyAttrFn(nint obj, string name);
 delegate void PyVoid1Fn(nint a);
 delegate double PyDoubleFn(nint obj);

@@ -196,28 +196,30 @@ partial class DataTable {
     /// Chip x positions and widths for the group panel, outer-to-inner. Shared
     /// by the strip's painting, its hit tests and the header drop, so all three
     /// agree on the geometry by construction.
-    static void GroupChipLayout(App app, List<DataColumn> cols, DataTableState st,
-                                int x, List<int> outX, List<int> outW) {
+    static List<GroupChipGeometry> GroupChipLayout(App app, List<DataColumn> cols,
+                                                   DataTableState st, int x) {
         Theme t = app.theme;
         int fs = t.fontSizeSmall;
+        List<GroupChipGeometry> chips = new List<GroupChipGeometry>();
         int cx = x + app.Scale(10);
         int i = 0;
         while (i < st.groupCols.Count) {
             int w = Canvas.MeasureText(cols[st.groupCols[i]].title, fs) + app.Scale(38);
-            outX.Add(cx);
-            outW.Add(w);
+            chips.Add(new GroupChipGeometry(cx, w));
             cx = cx + w + app.Scale(8);
             i = i + 1;
         }
+        return chips;
     }
 
     /// Insertion slot (0..count) the pointer addresses: the number of chips whose
     /// midpoint sits left of it.
-    static int GroupDropSlot(App app, List<int> cxs, List<int> cws) {
+    static int GroupDropSlot(App app, List<GroupChipGeometry> chips) {
         int slot = 0;
         int i = 0;
-        while (i < cxs.Count) {
-            if (app.mouseX > cxs[i] + cws[i] / 2) { slot = i + 1; }
+        while (i < chips.Count) {
+            GroupChipGeometry chip = chips[i];
+            if (app.mouseX > chip.x + chip.width / 2) { slot = i + 1; }
             i = i + 1;
         }
         return slot;
@@ -242,9 +244,7 @@ partial class DataTable {
         c.FillRect(x, y + h - 1, viewW, 1, t.divider);
         c.PushClip(x, y, viewW, h);
 
-        List<int> cxs = new List<int>();
-        List<int> cws = new List<int>();
-        DataTable.GroupChipLayout(app, cols, st, x, cxs, cws);
+        List<GroupChipGeometry> chips = DataTable.GroupChipLayout(app, cols, st, x);
         int chipH = h - app.Scale(10);
         int chipY = y + app.Scale(5);
 
@@ -257,8 +257,9 @@ partial class DataTable {
         int i = 0;
         while (i < st.groupCols.Count) {
             int col = st.groupCols[i];
-            int cxp = cxs[i];
-            int cwp = cws[i];
+            GroupChipGeometry chip = chips[i];
+            int cxp = chip.x;
+            int cwp = chip.width;
             bool dragged = st.dragChip == col;
             int fill = t.bgSecondary;
             if (dragged) { fill = t.primary; }
@@ -293,9 +294,12 @@ partial class DataTable {
         }
 
         if (st.dragChip >= 0 || (headerDrag && over)) {
-            int slot = DataTable.GroupDropSlot(app, cxs, cws);
+            int slot = DataTable.GroupDropSlot(app, chips);
             int lineX = x + app.Scale(6);
-            if (slot > 0) { lineX = cxs[slot - 1] + cws[slot - 1] + app.Scale(2); }
+            if (slot > 0) {
+                GroupChipGeometry previous = chips[slot - 1];
+                lineX = previous.x + previous.width + app.Scale(2);
+            }
             c.FillRect(lineX, chipY, app.Scale(2), chipH, t.primary);
         }
         c.PopClip();
@@ -304,7 +308,7 @@ partial class DataTable {
         // render runs, exactly as for the header drag).
         if (st.dragChip >= 0 && app.focus.pressedId < 0) {
             int from = DataTable.GroupDepth(st, st.dragChip);
-            int dst = DataTable.GroupDropSlot(app, cxs, cws);
+            int dst = DataTable.GroupDropSlot(app, chips);
             if (dst > from) { dst = dst - 1; }
             if (from >= 0 && dst != from) {
                 DataTable.MoveGroup(st, st.dragChip, dst);
@@ -334,6 +338,18 @@ partial class DataTable {
                        List<DataColumn> cols, DataSource src, DataTableState st) {
         Canvas c = app.canvas;
         Theme t = app.theme;
+
+        // Server-side sources deliver data between frames (a finished block, a
+        // transaction, a pinned total). Fold it in and recompute so the new
+        // rows appear on this frame's repaint without any user action.
+        if (src.Poll()) {
+            st.dirty = true;
+            app.RequestRedraw();
+        }
+        // Prime the first block: an unknown-total source starts empty, so ask
+        // for the initial block right away or the grid would show nothing
+        // until the user scrolls.
+        if (src.HasMore() && src.RowCount() == 0) { src.RequestBlock(0); }
 
         DataTable.EnsureInit(st, cols, src);
         DataTable.SyncBindings(st);
@@ -455,22 +471,21 @@ partial class DataTable {
         headerH = titleRowH + bandLevels * bandRowH;
         int titleTop = y + bandLevels * bandRowH;
 
-        // Screen x and owning band for every entry of `vorder`, computed once.
+        // Screen x and owning band for every visible column, computed once.
         // Each band is clipped to its own strip, so a scrolled middle column can
         // never paint (or register a hit region) over a frozen one — which makes
         // the drawing order between the bands irrelevant, and keeps all four
         // passes below to a single loop each.
-        List<int> colX = new List<int>();
-        List<int> colBand = new List<int>();
+        List<FrameColumn> frameColumns = new List<FrameColumn>();
         int cxAcc = firstDataX;
         int bpos = 0;
         while (bpos < vorder.Count) {
             if (bpos == nLeft) { cxAcc = bandX - st.scrollX; }
             if (bpos == vorder.Count - nRight) { cxAcc = rightX; }
-            colX.Add(cxAcc);
-            if (bpos < nLeft) { colBand.Add(0); }
-            else if (bpos >= vorder.Count - nRight) { colBand.Add(2); }
-            else { colBand.Add(1); }
+            int ownerBand = 1;
+            if (bpos < nLeft) { ownerBand = 0; }
+            else if (bpos >= vorder.Count - nRight) { ownerBand = 2; }
+            frameColumns.Add(new FrameColumn(vorder[bpos], cxAcc, ownerBand));
             cxAcc = cxAcc + st.dispW[vorder[bpos]];
             bpos = bpos + 1;
         }
@@ -500,9 +515,7 @@ partial class DataTable {
         f.rightX = rightX;
         f.panelY = panelY;
         f.groupPanelH = groupPanelH;
-        f.vorder = vorder;
-        f.colX = colX;
-        f.colBand = colBand;
+        f.columns = frameColumns;
         return f;
     }
 
@@ -535,9 +548,7 @@ partial class DataTable {
         int rightX = f.rightX;
         int panelY = f.panelY;
         int groupPanelH = f.groupPanelH;
-        List<int> vorder = f.vorder;
-        List<int> colX = f.colX;
-        List<int> colBand = f.colBand;
+        List<FrameColumn> frameColumns = f.columns;
         y = f.y;
         viewH = f.viewH;
 
@@ -594,7 +605,7 @@ partial class DataTable {
         int blv = 0;
         while (blv < bandLevels) {
             int by0 = y + blv * bandRowH;
-            List<BandSpan> spans = DataTable.BandRow(st, cols, vorder, blv);
+            List<BandSpan> spans = DataTable.BandRow(st, cols, frameColumns, blv);
             int si = 0;
             while (si < spans.Count) {
                 BandSpan sp = spans[si];
@@ -602,11 +613,12 @@ partial class DataTable {
                 // band boundary is emitted once per strip it touches.
                 int seg = sp.from;
                 while (seg < sp.to) {
-                    int segBand = colBand[seg];
+                    int segBand = frameColumns[seg].band;
                     int segEnd = seg;
-                    while (segEnd < sp.to && colBand[segEnd] == segBand) { segEnd = segEnd + 1; }
-                    int sx0 = colX[seg];
-                    int sx1 = colX[segEnd - 1] + st.dispW[vorder[segEnd - 1]];
+                    while (segEnd < sp.to && frameColumns[segEnd].band == segBand) { segEnd = segEnd + 1; }
+                    int sx0 = frameColumns[seg].x;
+                    FrameColumn lastSegmentColumn = frameColumns[segEnd - 1];
+                    int sx1 = lastSegmentColumn.x + st.dispW[lastSegmentColumn.column];
                     int sbL = DataTable.BandLeft(segBand, firstDataX, bandX, rightX);
                     int sbR = DataTable.BandRight(segBand, firstDataX, bandX, bandW,
                                                   rightX, pinnedW, pinnedRW, clipRight);
@@ -671,20 +683,21 @@ partial class DataTable {
         int hoi = 0;
         int hcl = firstDataX;
         int hBand = -1;
-        while (hoi < vorder.Count) {
-            int i = vorder[hoi];
+        while (hoi < frameColumns.Count) {
+            FrameColumn headerColumn = frameColumns[hoi];
+            int i = headerColumn.column;
             DataColumn col = cols[i];
             int cw = st.dispW[i];
             // Each band gets its own clip strip, entered when the band changes.
             // The middle is clipped between the two frozen bands, so a panned
             // column is cut off at their edges instead of drawing over them.
-            if (colBand[hoi] != hBand) {
+            if (headerColumn.band != hBand) {
                 if (hBand >= 0) { c.PopClip(); }
-                hBand = colBand[hoi];
+                hBand = headerColumn.band;
                 DataTable.PushBandClip(c, hBand, firstDataX, bandX, bandW, rightX,
                                        pinnedW, pinnedRW, titleTop, titleRowH, clipRight);
             }
-            hcl = colX[hoi];
+            hcl = headerColumn.x;
             // Ids are allocated for every column — visible or not — so the id
             // sequence stays identical across frames while panning; otherwise
             // widgets registered after the header (scrollbars) would change id
@@ -696,8 +709,8 @@ partial class DataTable {
             // Clip the hit region to the band as well as the viewport: a middle
             // column scrolled under the frozen band must not stay clickable
             // there, or the user would hit a column they cannot see.
-            int bandL = DataTable.BandLeft(colBand[hoi], firstDataX, bandX, rightX);
-            int bandR = DataTable.BandRight(colBand[hoi], firstDataX, bandX, bandW,
+            int bandL = DataTable.BandLeft(headerColumn.band, firstDataX, bandX, rightX);
+            int bandR = DataTable.BandRight(headerColumn.band, firstDataX, bandX, bandW,
                                             rightX, pinnedW, pinnedRW, clipRight);
             if (hcl + cw <= bandL || hcl >= bandR) {
                 hoi = hoi + 1;
@@ -890,16 +903,14 @@ partial class DataTable {
                 && app.mouseX >= x && app.mouseX < x + viewW
                 && app.mouseY >= panelY && app.mouseY < panelY + groupPanelH;
             if (toPanel) {
-                List<int> gcx = new List<int>();
-                List<int> gcw = new List<int>();
-                DataTable.GroupChipLayout(app, cols, st, x, gcx, gcw);
+                List<GroupChipGeometry> groupChips = DataTable.GroupChipLayout(app, cols, st, x);
                 DataTable.GroupByAt(st, st.dragCol,
-                                    DataTable.GroupDropSlot(app, gcx, gcw));
+                                    DataTable.GroupDropSlot(app, groupChips));
                 st.GroupChanged.Raise();
             } else if (st.dragColMoved) {
                 int beforeCol = -1;
-                if (st.dropVis >= 0 && st.dropVis < vorder.Count) {
-                    beforeCol = vorder[st.dropVis];
+                if (st.dropVis >= 0 && st.dropVis < frameColumns.Count) {
+                    beforeCol = frameColumns[st.dropVis].column;
                 }
                 if (beforeCol != st.dragCol) {
                     DataTable.MoveColumn(st, st.dragCol, beforeCol);
@@ -948,6 +959,14 @@ partial class DataTable {
             st.scrollRow = start;
         }
 
+        // Server-side sources grow on demand: once the user scrolls to the
+        // bottom of the loaded prefix, ask for the next block so the scrollbar
+        // keeps extending as data arrives. RequestNextBlock coalesces, so the
+        // per-frame call is free while a fetch is already in flight.
+        if (!st.paged && src.HasMore() && start >= total - visRows) {
+            src.RequestNextBlock();
+        }
+
         // ---------------- filter row (DevExpress inline quick-filter) ----------------
         // A row of per-column text inputs just below the header. Clicking any
         // cell focuses it; typing applies a real-time Contains filter on that
@@ -964,18 +983,19 @@ partial class DataTable {
 
             int froi = 0;
             int frBand = -1;
-            while (froi < vorder.Count) {
-                int fri = vorder[froi];
+            while (froi < frameColumns.Count) {
+                FrameColumn filterColumn = frameColumns[froi];
+                int fri = filterColumn.column;
                 int fcw = st.dispW[fri];
-                if (colBand[froi] != frBand) {
+                if (filterColumn.band != frBand) {
                     if (frBand >= 0) { c.PopClip(); }
-                    frBand = colBand[froi];
+                    frBand = filterColumn.band;
                     DataTable.PushBandClip(c, frBand, firstDataX, bandX, bandW, rightX,
                                            pinnedW, pinnedRW, fry, filterRowH, clipRight);
                 }
-                int frcl = colX[froi];
-                int frBandL = DataTable.BandLeft(colBand[froi], firstDataX, bandX, rightX);
-                int frBandR = DataTable.BandRight(colBand[froi], firstDataX, bandX, bandW,
+                int frcl = filterColumn.x;
+                int frBandL = DataTable.BandLeft(filterColumn.band, firstDataX, bandX, rightX);
+                int frBandR = DataTable.BandRight(filterColumn.band, firstDataX, bandX, bandW,
                                                   rightX, pinnedW, pinnedRW, clipRight);
                 if (frcl + fcw > frBandL && frcl < frBandR) {
                     int pad2 = t.paddingSmall;
@@ -1123,6 +1143,22 @@ partial class DataTable {
             int rowIdx = st.dispRows[oiRow].row;
             bool rowInRange = hasRange && oiRow >= rgR0 && oiRow <= rgR1;
 
+            // A server-side source may not have this row fetched yet (the user
+            // scrolled into an unfetched block): render a loading placeholder
+            // instead of reading empty cells, and ask for the block. The
+            // request coalesces, so repeated per-row calls cost nothing. The
+            // row gets no hit region and no selection state — it is not real
+            // data yet — and `st.selected[rowIdx]` below would be out of range
+            // for an unfetched row, which is why this branch runs first.
+            if (!src.CellReady(rowIdx, 0)) {
+                src.RequestBlock(rowIdx);
+                c.FillRect(x + 1, ry, viewW - 2, rowH, t.bgSecondary);
+                c.DrawTextCentered(x, ry, viewW, rowH, "...", t.textTertiary, t.fontSizeSmall);
+                c.FillRect(x + 1, ry + rowH - 1, viewW - 2, 1, gridColor);
+                r = r + 1;
+                continue;
+            }
+
             int rowId = app.focus.AllocId();
             app.hitTester.Register(HitRegion.Create(rowId, x, ry, viewW, rowH, 0));
             bool rHover = app.focus.IsHovered(rowId);
@@ -1190,18 +1226,19 @@ partial class DataTable {
 
             int coi = 0;
             int cBand = -1;
-            while (coi < vorder.Count) {
-                int cc = vorder[coi];
+            while (coi < frameColumns.Count) {
+                FrameColumn bodyColumn = frameColumns[coi];
+                int cc = bodyColumn.column;
                 int cw = st.dispW[cc];
-                if (colBand[coi] != cBand) {
+                if (bodyColumn.band != cBand) {
                     if (cBand >= 0) { c.PopClip(); }
-                    cBand = colBand[coi];
+                    cBand = bodyColumn.band;
                     DataTable.PushBandClip(c, cBand, firstDataX, bandX, bandW, rightX,
                                            pinnedW, pinnedRW, ry, rowH, clipRight);
                 }
-                int ccl = colX[coi];
-                int cBandL = DataTable.BandLeft(colBand[coi], firstDataX, bandX, rightX);
-                int cBandR = DataTable.BandRight(colBand[coi], firstDataX, bandX, bandW,
+                int ccl = bodyColumn.x;
+                int cBandL = DataTable.BandLeft(bodyColumn.band, firstDataX, bandX, rightX);
+                int cBandR = DataTable.BandRight(bodyColumn.band, firstDataX, bandX, bandW,
                                                  rightX, pinnedW, pinnedRW, clipRight);
                 if (ccl + cw > cBandL && ccl < cBandR) {
                     // A per-cell style background paints under the range
@@ -1333,13 +1370,14 @@ partial class DataTable {
             // Scanned back-to-front so the frozen bands win: a middle column
             // scrolled underneath one occupies the same x, and the column the
             // user can actually see is the one they meant to hit.
-            int pci = vorder.Count - 1;
+            int pci = frameColumns.Count - 1;
             while (pci >= 0) {
-                int cci = vorder[pci];
-                int colL = colX[pci];
+                FrameColumn pointerColumn = frameColumns[pci];
+                int cci = pointerColumn.column;
+                int colL = pointerColumn.x;
                 int colR = colL + st.dispW[cci];
-                int pbL = DataTable.BandLeft(colBand[pci], firstDataX, bandX, rightX);
-                int pbR = DataTable.BandRight(colBand[pci], firstDataX, bandX, bandW,
+                int pbL = DataTable.BandLeft(pointerColumn.band, firstDataX, bandX, rightX);
+                int pbR = DataTable.BandRight(pointerColumn.band, firstDataX, bandX, bandW,
                                               rightX, pinnedW, pinnedRW, clipRight);
                 if (colL < pbL) { colL = pbL; }
                 if (colR > pbR) { colR = pbR; }
@@ -1540,7 +1578,7 @@ partial class DataTable {
         // cell, or a modal popup.
         if (!st.editing && ek == 4 && st.hitRow >= 0
             && st.filterRowFocusCol < 0 && st.openMenu < 0) {
-            if (DataTable.HandleNavKey(app, cols, src, st, vorder, visRows,
+            if (DataTable.HandleNavKey(app, cols, src, st, frameColumns, visRows,
                                        dataViewW, pinnedW, app.window.EventKeyCode(), emods)) {
                 ek = 0;
                 app.RequestRedraw();
@@ -1692,18 +1730,19 @@ partial class DataTable {
             }
             int soi = 0;
             int sBand = -1;
-            while (soi < vorder.Count) {
-                int sc = vorder[soi];
+            while (soi < frameColumns.Count) {
+                FrameColumn summaryColumn = frameColumns[soi];
+                int sc = summaryColumn.column;
                 int cw = st.dispW[sc];
-                if (colBand[soi] != sBand) {
+                if (summaryColumn.band != sBand) {
                     if (sBand >= 0) { c.PopClip(); }
-                    sBand = colBand[soi];
+                    sBand = summaryColumn.band;
                     DataTable.PushBandClip(c, sBand, firstDataX, bandX, bandW, rightX,
                                            pinnedW, pinnedRW, sumY, summaryH, clipRight);
                 }
-                sx = colX[soi];
-                int sBandL = DataTable.BandLeft(colBand[soi], firstDataX, bandX, rightX);
-                int sBandR = DataTable.BandRight(colBand[soi], firstDataX, bandX, bandW,
+                sx = summaryColumn.x;
+                int sBandL = DataTable.BandLeft(summaryColumn.band, firstDataX, bandX, rightX);
+                int sBandR = DataTable.BandRight(summaryColumn.band, firstDataX, bandX, bandW,
                                                  rightX, pinnedW, pinnedRW, clipRight);
                 if (sx + cw > sBandL && sx < sBandR) {
                     string stxt = "";

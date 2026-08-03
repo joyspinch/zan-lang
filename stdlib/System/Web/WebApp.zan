@@ -44,6 +44,8 @@ class WebApp {
     RateLimiter limiter;
     LockManager locks;
     RankFn rankResolver;
+    AuthFn authResolver;
+    PermissionFn permissionResolver;
     ServerMetrics metrics;
 
     int maxBodyBytes;      // in-memory request body cap (413 above this)
@@ -67,9 +69,11 @@ class WebApp {
         this.hooks = Hooks.Create();
         this.views = null;
         this.sessions = Sessions.Create();
-        this.limiter = RateLimiter.Create(1);
-        this.locks = LockManager.Create();
+        this.limiter = null;
+        this.locks = null;
         this.rankResolver = null;
+        this.authResolver = null;
+        this.permissionResolver = null;
         this.metrics = ServerMetrics.Global();
         this.maxBodyBytes = 2 * 1024 * 1024;      // 2MB default
         this.maxUploadBytes = 512 * 1024 * 1024;  // 512MB streamed-upload default
@@ -85,6 +89,9 @@ class WebApp {
         WebApp app = new WebApp();
         app.host = host;
         app.port = port;
+        string suffix = Convert.ToString(port);
+        app.limiter = RateLimiter.Create("zanweb_rate_" + suffix, 1000);
+        app.locks = LockManager.Create("zanweb_lock_" + suffix);
         return app;
     }
 
@@ -107,6 +114,8 @@ class WebApp {
     WebApp Before(HookFn fn) { this.hooks.Before(fn); return this; }
     WebApp After(AfterFn fn) { this.hooks.After(fn); return this; }
     WebApp RankResolver(RankFn fn) { this.rankResolver = fn; return this; }
+    WebApp AuthResolver(AuthFn fn) { this.authResolver = fn; return this; }
+    WebApp PermissionResolver(PermissionFn fn) { this.permissionResolver = fn; return this; }
 
     /// <summary>Generic route registration used by the compiler-generated
     /// __AttrRoutes.Register. Returns the Route so attribute metadata can be
@@ -220,7 +229,8 @@ class WebApp {
 
             HttpRequest request = HttpRequest.Parse(rawData);
             keepAlive = request.keepAlive;
-            HttpContext ctx = HttpContext.From(request);
+            HttpContext ctx = HttpContext.From(
+                request, Socket.RemoteIp(clientSock));
             Route route = this.router.Match(ctx);
 
             if (route != null && route.streamUpload && request.contentLength > 0) {
@@ -340,14 +350,20 @@ class WebApp {
         string resp = await this.DispatchInner(ctx, route, keepAlive, startMs);
         long elapsedMs = ServerMetrics.MonoMillis() - startMs;
         this.metrics.RecordRequest(ctx.method, ctx.path, ctx.status, elapsedMs);
+        this.hooks.RunAfter(ctx, elapsedMs);
         return resp;
     }
 
     async string DispatchInner(HttpContext ctx, Route route, bool keepAlive, long startMs) {
 
-        // Global rate limit (per second across all routes).
+        string uid = this.AuthUser(ctx);
+        if (uid.Length > 0) { ctx.state.Set("uid", uid); }
+        string principal = uid;
+        if (principal.Length == 0) { principal = ctx.RemoteIp(); }
+        if (principal.Length == 0) { principal = "_unknown_"; }
+
         if (this.globalLimit > 0
-            && !this.limiter.Allow("_global_", this.globalLimit, WebApp.NowSeconds())) {
+            && !this.limiter.Allow("_global_:" + principal, this.globalLimit)) {
             ctx.Status(429, "Too Many Requests").SetHeader("Retry-After", "1");
             ctx.Json("{\"code\":\"429\",\"msg\":\"too many requests\"}");
             return ctx.BuildResponse(keepAlive);
@@ -369,32 +385,33 @@ class WebApp {
             return ctx.BuildResponse(keepAlive);
         }
 
-        // Per-route rate limit. route.Key() is only materialised for routes
-        // that actually declare a limit -- an unlimited route never touches it.
+        string rateKey = route.Key();
+        if (route.rateScope == "uid") {
+            rateKey = rateKey + ":uid:" + uid;
+        } else if (route.rateScope == "ip") {
+            rateKey = rateKey + ":ip:" + ctx.RemoteIp();
+        }
         if (route.rateLimit > 0
-            && !this.limiter.Allow(route.Key(), route.rateLimit, WebApp.NowSeconds())) {
+            && !this.limiter.Allow(rateKey, route.rateLimit)) {
             ctx.Status(429, "Too Many Requests").SetHeader("Retry-After", "1");
             ctx.Json("{\"code\":\"429\",\"msg\":\"route rate limit exceeded\"}");
             return ctx.BuildResponse(keepAlive);
         }
 
-        // Auth guard ([Login]/[Auth]/[Rank]): resolve the principal, enforce
-        // login, then rank/permission. Driven entirely by controller attributes.
-        string uid = "";
-        if (route.needsLogin || route.needsAuth || route.rank > 0) {
-            uid = this.AuthUser(ctx);
+        if (route.needsLogin || route.needsAuth) {
             if (uid.Length == 0) {
                 ctx.Status(401, "Unauthorized");
                 ctx.Json("{\"code\":\"401\",\"msg\":\"authentication required\"}");
                 return ctx.BuildResponse(keepAlive);
             }
-            ctx.state.Set("uid", uid);
-            if (route.needsAuth || route.rank > 0) {
-                int have = this.ResolveRank(uid);
-                ctx.state.Set("rank", Convert.ToString(have));
-                int need = route.rank;
-                if (route.needsAuth && need < 1) { need = 1; }
-                if (have < need) {
+            if (route.needsAuth) {
+                bool allowed = false;
+                if (this.permissionResolver != null) {
+                    allowed = this.permissionResolver(uid, route.action);
+                } else {
+                    allowed = this.ResolveRank(uid) > 0;
+                }
+                if (!allowed) {
                     ctx.Status(403, "Forbidden");
                     ctx.Json("{\"code\":\"403\",\"msg\":\"insufficient permission\"}");
                     return ctx.BuildResponse(keepAlive);
@@ -404,10 +421,11 @@ class WebApp {
 
         // Request lock ([Lock]): one in-flight request per (scope) key. Held for
         // the duration of the handler and released right after it returns.
-        string lockKey = "";
+        LockLease lockLease = null;
         if (route.lockScope.Length > 0) {
-            lockKey = LockManager.KeyFor(route, uid);
-            if (!this.locks.TryAcquire(lockKey)) {
+            lockLease = this.locks.TryAcquire(
+                LockManager.KeyFor(route, principal));
+            if (lockLease == null) {
                 ctx.Status(429, "Too Many Requests").SetHeader("Retry-After", "1");
                 ctx.Json("{\"code\":\"429\",\"msg\":\"request already in progress\"}");
                 return ctx.BuildResponse(keepAlive);
@@ -417,7 +435,7 @@ class WebApp {
         int rIdx = route.idx;
         HttpHandler h = route.handler;
         await h(ctx);
-        if (lockKey.Length > 0) { this.locks.Release(lockKey); }
+        if (lockLease != null) { this.locks.Release(lockLease); }
         if (!ctx.ended) {
             ctx.Status(500, "Internal Server Error");
             ctx.Json("{\"code\":\"500\",\"msg\":\"handler produced no response\"}");
@@ -425,7 +443,6 @@ class WebApp {
 
         long elapsedMs = ServerMetrics.MonoMillis() - startMs;
         this.router.RecordHit(rIdx, elapsedMs);
-        this.hooks.RunAfter(ctx, elapsedMs);
         return ctx.BuildResponse(keepAlive);
     }
 
@@ -441,10 +458,15 @@ class WebApp {
     string AuthUser(HttpContext ctx) {
         string auth = ctx.Header("Authorization");
         if (auth.Length > 7 && auth.Substring(0, 7) == "Bearer ") {
-            return this.sessions.UserOf(auth.Substring(7));
+            string token = auth.Substring(7);
+            if (this.authResolver != null) { return this.authResolver(token); }
+            return this.sessions.UserOf(token);
         }
         string cookie = ctx.Cookie("zsession");
-        if (cookie.Length > 0) { return this.sessions.UserOf(cookie); }
+        if (cookie.Length > 0) {
+            if (this.authResolver != null) { return this.authResolver(cookie); }
+            return this.sessions.UserOf(cookie);
+        }
         return "";
     }
 

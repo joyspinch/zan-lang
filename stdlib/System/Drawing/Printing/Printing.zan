@@ -1,0 +1,229 @@
+using System;
+
+namespace System.Drawing.Printing;
+
+/// <summary>Read-only access to the printers installed for the current user.</summary>
+class PrinterSettings {
+    /// <summary>Enumerates local printers and printer connections.</summary>
+    static List<string> InstalledPrinters() {
+        #if WINDOWS
+        return PrinterSettings.WinInstalledPrinters();
+        #else
+        throw new PlatformNotSupportedException(
+            "System.Drawing.Printing is only supported on Windows");
+        #endif
+    }
+
+    /// <summary>Returns the default printer name, or an empty string when none is configured.</summary>
+    static string DefaultPrinterName() {
+        #if WINDOWS
+        nint charsOut = NativeMemory.Alloc(4);
+        new Span<int>(charsOut, 1)[0] = 0;
+        PrinterSettings.GetDefaultPrinterW(0, charsOut);
+        int chars = new Span<int>(charsOut, 1)[0];
+        if (chars <= 0) {
+            NativeMemory.Free(charsOut);
+            return "";
+        }
+        nint buffer = NativeMemory.Alloc(chars * 2);
+        int ok = PrinterSettings.GetDefaultPrinterW(buffer, charsOut);
+        string name = "";
+        if (ok != 0) { name = Wide.Read(buffer); }
+        NativeMemory.Free(buffer);
+        NativeMemory.Free(charsOut);
+        return name;
+        #else
+        throw new PlatformNotSupportedException(
+            "System.Drawing.Printing is only supported on Windows");
+        #endif
+    }
+
+    #if WINDOWS
+    [DllImport("winspool", EntryPoint = "EnumPrintersW")]
+    static extern int EnumPrintersW(int flags, nint name, int level,
+                                    nint buffer, int bufferBytes,
+                                    nint neededBytes, nint returnedCount);
+
+    [DllImport("winspool", EntryPoint = "GetDefaultPrinterW")]
+    static extern int GetDefaultPrinterW(nint buffer, nint chars);
+
+    static List<string> WinInstalledPrinters() {
+        List<string> printers = new List<string>();
+        nint neededOut = NativeMemory.Alloc(4);
+        nint countOut = NativeMemory.Alloc(4);
+        new Span<int>(neededOut, 1)[0] = 0;
+        new Span<int>(countOut, 1)[0] = 0;
+        // PRINTER_ENUM_LOCAL | PRINTER_ENUM_CONNECTIONS, PRINTER_INFO_4.
+        PrinterSettings.EnumPrintersW(6, 0, 4, 0, 0, neededOut, countOut);
+        int needed = new Span<int>(neededOut, 1)[0];
+        if (needed <= 0) {
+            NativeMemory.Free(countOut);
+            NativeMemory.Free(neededOut);
+            return printers;
+        }
+
+        nint buffer = NativeMemory.Alloc(needed);
+        int ok = PrinterSettings.EnumPrintersW(
+            6, 0, 4, buffer, needed, neededOut, countOut);
+        if (ok != 0) {
+            int count = new Span<int>(countOut, 1)[0];
+            // PRINTER_INFO_4W is 24 bytes on the Win64 target; pPrinterName is
+            // its first pointer.
+            int i = 0;
+            while (i < count) {
+                nint name = new Span<nint>(buffer + i * 24, 1)[0];
+                if (name != 0) { printers.Add(Wide.Read(name)); }
+                i = i + 1;
+            }
+        }
+        NativeMemory.Free(buffer);
+        NativeMemory.Free(countOut);
+        NativeMemory.Free(neededOut);
+        return printers;
+    }
+    #endif
+}
+
+/// <summary>Spooler operations used by the RAW printing state machine.</summary>
+internal interface IRawPrinterBackend {
+    bool Open(string printerName);
+    bool StartDoc(string documentName);
+    bool StartPage();
+    int Write(byte[] data);
+    bool EndPage();
+    bool EndDoc();
+    void Abort();
+    bool Close();
+}
+
+#if WINDOWS
+internal class WinRawPrinterBackend : IRawPrinterBackend {
+    nint handle;
+
+    bool Open(string printerName) {
+        nint printerNameW = Wide.Of(printerName);
+        nint handleOut = NativeMemory.Alloc(8);
+        new Span<nint>(handleOut, 1)[0] = 0;
+        int opened = WinRawPrinterBackend.OpenPrinterW(printerNameW, handleOut, 0);
+        Wide.Free(printerNameW);
+        this.handle = new Span<nint>(handleOut, 1)[0];
+        NativeMemory.Free(handleOut);
+        return opened != 0 && this.handle != 0;
+    }
+
+    bool StartDoc(string documentName) {
+        nint documentNameW = Wide.Of(documentName);
+        nint rawW = Wide.Of("RAW");
+        nint docInfo = NativeMemory.Alloc(24);
+        NativeMemory.Fill(docInfo, 0, 24);
+        Span<nint> info = new Span<nint>(docInfo, 3);
+        info[0] = documentNameW;
+        info[2] = rawW;
+        int job = WinRawPrinterBackend.StartDocPrinterW(this.handle, 1, docInfo);
+        NativeMemory.Free(docInfo);
+        Wide.Free(rawW);
+        Wide.Free(documentNameW);
+        return job != 0;
+    }
+
+    bool StartPage() {
+        return WinRawPrinterBackend.StartPagePrinter(this.handle) != 0;
+    }
+
+    int Write(byte[] data) {
+        nint writtenOut = NativeMemory.Alloc(4);
+        new Span<int>(writtenOut, 1)[0] = 0;
+        int wrote = WinRawPrinterBackend.WritePrinter(
+            this.handle, data, data.Length, writtenOut);
+        int written = new Span<int>(writtenOut, 1)[0];
+        NativeMemory.Free(writtenOut);
+        if (wrote == 0) { return -1; }
+        return written;
+    }
+
+    bool EndPage() {
+        return WinRawPrinterBackend.EndPagePrinter(this.handle) != 0;
+    }
+
+    bool EndDoc() {
+        return WinRawPrinterBackend.EndDocPrinter(this.handle) != 0;
+    }
+
+    void Abort() { WinRawPrinterBackend.AbortPrinter(this.handle); }
+
+    bool Close() {
+        return WinRawPrinterBackend.ClosePrinter(this.handle) != 0;
+    }
+
+    [DllImport("winspool", EntryPoint = "OpenPrinterW")]
+    static extern int OpenPrinterW(nint printerName, nint handle, nint defaults);
+
+    [DllImport("winspool", EntryPoint = "StartDocPrinterW")]
+    static extern int StartDocPrinterW(nint printer, int level, nint docInfo);
+
+    [DllImport("winspool", EntryPoint = "StartPagePrinter")]
+    static extern int StartPagePrinter(nint printer);
+
+    [DllImport("winspool", EntryPoint = "WritePrinter")]
+    static extern int WritePrinter(nint printer, byte[] data, int count,
+                                   nint written);
+
+    [DllImport("winspool", EntryPoint = "EndPagePrinter")]
+    static extern int EndPagePrinter(nint printer);
+
+    [DllImport("winspool", EntryPoint = "EndDocPrinter")]
+    static extern int EndDocPrinter(nint printer);
+
+    [DllImport("winspool", EntryPoint = "AbortPrinter")]
+    static extern int AbortPrinter(nint printer);
+
+    [DllImport("winspool", EntryPoint = "ClosePrinter")]
+    static extern int ClosePrinter(nint printer);
+}
+#endif
+
+/// <summary>Sends an already formatted byte stream directly to a Windows print queue.</summary>
+class RawPrinter {
+    /// <summary>
+    /// Sends one RAW document. The bytes are passed unchanged to the selected
+    /// printer driver. Returns false if any spooler operation fails.
+    /// </summary>
+    static bool Send(string printerName, string documentName, byte[] data) {
+        #if WINDOWS
+        if (printerName == null || printerName.Length == 0) {
+            throw new ArgumentException("printerName must not be empty");
+        }
+        if (documentName == null || documentName.Length == 0) {
+            documentName = "Zan RAW document";
+        }
+        if (data == null) { throw new ArgumentException("data must not be null"); }
+
+        return RawPrinter.SendWithBackend(
+            printerName, documentName, data, new WinRawPrinterBackend());
+        #else
+        throw new PlatformNotSupportedException(
+            "System.Drawing.Printing is only supported on Windows");
+        #endif
+    }
+
+    /// <summary>Runs the RAW spooler protocol against an injected backend.</summary>
+    internal static bool SendWithBackend(string printerName, string documentName,
+                                         byte[] data, IRawPrinterBackend backend) {
+        if (!backend.Open(printerName)) { return false; }
+
+        bool documentStarted = backend.StartDoc(documentName);
+        bool success = documentStarted;
+        if (success) { success = backend.StartPage(); }
+        if (success) { success = backend.Write(data) == data.Length; }
+        if (success) { success = backend.EndPage(); }
+        if (documentStarted) {
+            if (success) {
+                success = backend.EndDoc();
+            } else {
+                backend.Abort();
+            }
+        }
+        if (!backend.Close()) { success = false; }
+        return success;
+    }
+}

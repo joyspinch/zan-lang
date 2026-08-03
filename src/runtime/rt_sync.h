@@ -70,6 +70,20 @@ const char *zan_shared_table_get_string(
     int64_t handle, const char *key, const char *column);
 int64_t zan_shared_table_increment(
     int64_t handle, const char *key, const char *column, int64_t delta);
+int32_t zan_shared_table_expire(
+    int64_t handle, const char *key, int64_t ttl_ms);
+int32_t zan_shared_table_expire_at(
+    int64_t handle, const char *key, int64_t expires_at);
+int64_t zan_shared_table_expires_at(int64_t handle, const char *key);
+int64_t zan_shared_table_purge_expired(int64_t handle, int64_t now_ms);
+int32_t zan_shared_table_rate_allow(
+    int64_t handle, const char *key, int64_t now_ms,
+    int64_t window_ms, int64_t limit);
+int32_t zan_shared_table_lock_acquire(
+    int64_t handle, const char *key, int64_t owner,
+    int64_t now_ms, int64_t lease_ms);
+int32_t zan_shared_table_lock_release(
+    int64_t handle, const char *key, int64_t owner);
 int32_t zan_shared_table_delete(int64_t handle, const char *key);
 int32_t zan_shared_table_exists(int64_t handle, const char *key);
 int64_t zan_shared_table_count(int64_t handle);

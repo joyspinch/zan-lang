@@ -26,5 +26,11 @@ void zan_parser_merge_partials(zan_ast_node_t *unit, zan_arena_t *arena,
                                zan_diag_t *diag);
 void zan_parser_desugar_events(zan_ast_node_t *unit, zan_arena_t *arena,
                                zan_diag_t *diag);
+/* Hoist nested type declarations (e.g. `static class Holder {}` inside a class
+ * body) to the compilation-unit top level, since every later pass only walks
+ * unit->comp_unit.decls. Runs before merge_partials/desugar_events so the
+ * hoisted types participate in those passes. */
+void zan_parser_flatten_nested_types(zan_ast_node_t *unit, zan_arena_t *arena,
+                                     zan_diag_t *diag);
 
 #endif /* ZAN_PARSER_H */

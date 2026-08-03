@@ -85,6 +85,14 @@ build/background_demo.exe
 | `System.IO.Compression.Zip` | PKZIP zip:`Zip.Create(entries, level)` / `Read(bytes)` / `Extract(bytes, entry)`(stored+deflate、目录项、中央目录;`ZipEntry{name,data,isDirectory,method,crc32,compressedSize,uncompressedSize}`) |
 | `System.IO.Compression.Tar` | POSIX ustar tar:`Tar.Create(entries)` / `Read(bytes)`(长路径 prefix 字段;与 GZip 组合即 .tar.gz;`TarEntry{name,data,isDirectory,mode}`) |
 | `System.Automation.Window` | 窗口自动化(winex 对应):枚举/查找/等待(`EnumTopLevel/EnumChildren/FindAll/FindWindow/FindEx/WaitForWindow/WaitForChild/WaitForClose`)、文本(`GetText/SetText`)、菜单(`GetMenu/FindMenuItem/ClickMenu/ClickCommand`)、坐标(`GetRect/GetClientRect/FromPoint/ToScreen/ToClient`)、样式(`GetStyle/HasStyle/ModifyStyle`)、状态(`IsVisible/IsEnabled/IsHung/IsCloaked/Show/Minimize/Maximize/Close/Flash`) |
+| `System.Automation.UiElement` | MSAA 无障碍自动化:从窗口/屏幕坐标取元素、遍历/递归查找、名称/值/描述/角色/状态/矩形/快捷键/默认动作、Invoke/Select/Focus/SetValue；元素持有 COM 引用，调用方用 `Dispose` 释放 |
+| `System.Net.Ping` / `NetworkInterface` | Windows ICMP IPv4 Echo；网卡名称/描述/状态/MAC/IPv4/IPv6 枚举 |
+| `System.Management.Device` | Windows SetupAPI 只读设备枚举：实例 ID、类、友好名、描述、厂商、硬件 ID |
+| `System.Drawing.Printing` | Windows 打印机枚举、默认打印机查询和 RAW 文档发送 |
+| `System.Security.Cryptography.Otp` | RFC 4226 HOTP / RFC 6238 TOTP，SHA-1/256/512、6–8 位与漂移窗口验证 |
+| `System.Security.Cryptography.Jwt` | 严格 Base64Url；HS256/RS256 创建和验证；exp/nbf/iss/aud 校验；拒绝 none、重复键与超限输入 |
+| `System.Net.WebDav` | WebDAV 客户端：PROPFIND 207 解析及 MKCOL/GET/PUT/DELETE/COPY/MOVE |
+| `System.Text.Markdown` | 标题/段落/列表/引用/代码/强调/链接转安全紧凑 HTML，URL 协议白名单 |
 
 ### 示例(只读,安全)
 
@@ -98,6 +106,8 @@ build/background_demo.exe
 - `compression_demo.zan` — gzip 一段文本、构建 zip(文本+5 万字节重复数据+
   目录项)并读回提取、构建 tar 并读回;把 .gz/.zip/.tar 写到程序旁边再删除
   (全程内存,无需外部工具)
+- `automation_demo.zan` — 启动记事本，展示窗口查找/状态/坐标/菜单能力，并
+  遍历 MSAA 无障碍树，打印前几个元素的角色、名称和值，最后关闭进程
 
 ```bash
 build/zanc examples/input/sysinfo_demo.zan --auto-stdlib -o build/sysinfo_demo.exe

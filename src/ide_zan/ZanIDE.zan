@@ -221,10 +221,9 @@ partial class ZanIDE {
         int nowMs = Window.GetTickMs();
         if (nowMs - aiLastSave <= 1000) { return; }
         aiLastSave = nowMs;
-        string curPack = ChatArea.ChatPack(aiRole, aiText, aiReason,
-            aiPlanText, aiPlanDone);
-        if (aiSessions[aiSessCur] == curPack) { return; }
-        aiSessions[aiSessCur] = curPack;
+        string curPack = ChatArea.ChatPack(aiMsgs, aiPlan);
+        if (aiSessions[aiSessCur].pack == curPack) { return; }
+        aiSessions[aiSessCur].pack = curPack;
         SaveAiSessions();
     }
 
@@ -232,20 +231,15 @@ partial class ZanIDE {
         // Fold the live transcript into the current slot first, so the on-disk
         // copy always matches what the user sees.
         if (aiSessCur >= 0 && aiSessCur < aiSessions.Count) {
-            aiSessions[aiSessCur] = ChatArea.ChatPack(aiRole, aiText, aiReason,
-                aiPlanText, aiPlanDone);
+            aiSessions[aiSessCur].pack = ChatArea.ChatPack(aiMsgs, aiPlan);
         }
         // Archive flags travel beside the packs (one 0/1 per session) rather
         // than inside them, so an older database still loads.
-        while (aiSessArch.Count < aiSessions.Count) { aiSessArch.Add(0); }
-        while (aiSessArch.Count > aiSessions.Count) {
-            aiSessArch.RemoveAt(aiSessArch.Count - 1);
-        }
         string archCsv = "";
         int ai = 0;
-        while (ai < aiSessArch.Count) {
+        while (ai < aiSessions.Count) {
             if (ai > 0) { archCsv = archCsv + ","; }
-            archCsv = archCsv + Convert.ToString(aiSessArch[ai]);
+            archCsv = archCsv + Convert.ToString(aiSessions[ai].archived);
             ai = ai + 1;
         }
         SqliteConnection db = null;
@@ -261,7 +255,7 @@ partial class ZanIDE {
             int i = 0;
             while (i < aiSessions.Count) {
                 db.Execute("INSERT INTO sessions (id, pack) VALUES (?, ?)",
-                    DbParams.Create().AddInt(i).Add(aiSessions[i]));
+                    DbParams.Create().AddInt(i).Add(aiSessions[i].pack));
                 i = i + 1;
             }
             db.Execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('cur', ?)",
@@ -301,7 +295,6 @@ partial class ZanIDE {
 
     void LoadAiSessions() {
         aiSessions.Clear();
-        aiSessArch = new List<int>();
         // One-time migration from the pre-SQLite JSON file (ai_sessions.json in
         // the config dir) when the cache database does not exist yet.
         string legacy = ZanIDE.UserConfigDir() + "/ai_sessions.json";
@@ -314,12 +307,16 @@ partial class ZanIDE {
                         int i = 0;
                         while (i < s.Count()) {
                             JsonValue it = s.At(i);
-                            if (it != null) { aiSessions.Add(it.AsString("")); }
+                            if (it != null) {
+                                aiSessions.Add(AiSession.Create(it.AsString(""), 0));
+                            }
                             i = i + 1;
                         }
                     }
                     aiSessCur = v.Int("cur", 0);
-                    if (aiSessions.Count == 0) { aiSessions.Add(""); aiSessCur = 0; }
+                    if (aiSessions.Count == 0) {
+                        aiSessions.Add(AiSession.Create("", 0)); aiSessCur = 0;
+                    }
                     if (aiSessCur < 0 || aiSessCur >= aiSessions.Count) { aiSessCur = 0; }
                     // Persist the migrated data immediately (A35 fixed: calling
                     // the try/catch/finally SaveAiSessions from inside this
@@ -340,36 +337,42 @@ partial class ZanIDE {
                     DbResult rs = db.Query("SELECT id, pack FROM sessions ORDER BY id");
                     int r = 0;
                     while (r < rs.RowCount()) {
-                        aiSessions.Add(rs.GetString(r, 1));
+                        aiSessions.Add(AiSession.Create(rs.GetString(r, 1), 0));
                         r = r + 1;
                     }
                     string curS = db.ExecuteScalar("SELECT value FROM meta WHERE key = 'cur'");
                     int c = ZanIDE.ParseIntSafe(curS);
-                    aiSessArch = ZanIDE.ParseFlagCsv(
+                    List<int> arch = ZanIDE.ParseFlagCsv(
                         db.ExecuteScalar("SELECT value FROM meta WHERE key = 'arch'"));
-                    if (aiSessions.Count == 0) { aiSessions.Add(""); c = 0; }
+                    if (aiSessions.Count == 0) {
+                        aiSessions.Add(AiSession.Create("", 0)); c = 0;
+                    }
                     if (c < 0 || c >= aiSessions.Count) { c = 0; }
+                    int ai = 0;
+                    while (ai < arch.Count && ai < aiSessions.Count) {
+                        aiSessions[ai].archived = arch[ai];
+                        ai = ai + 1;
+                    }
                     aiSessCur = c;
                 }
             } catch (Exception e) {
-                if (aiSessions.Count == 0) { aiSessions.Add(""); aiSessCur = 0; }
+                if (aiSessions.Count == 0) {
+                    aiSessions.Add(AiSession.Create("", 0)); aiSessCur = 0;
+                }
             } finally {
                 if (db != null) { db.Close(); }
             }
         } else {
-            if (aiSessions.Count == 0) { aiSessions.Add(""); aiSessCur = 0; }
+            if (aiSessions.Count == 0) {
+                aiSessions.Add(AiSession.Create("", 0)); aiSessCur = 0;
+            }
         }
         // Restore the active session's transcript into the live lists.
-        aiRole = new List<string>();
-        aiText = new List<string>();
-        aiReason = new List<string>();
-        aiPlanText = new List<string>();
-        aiPlanDone = new List<int>();
+        aiMsgs = new List<AiChatMsg>();
+        aiPlan = new List<AiPlanStep>();
         if (aiSessCur >= 0 && aiSessCur < aiSessions.Count) {
-            ChatArea.ChatUnpack(aiSessions[aiSessCur], aiRole, aiText, aiReason,
-                aiPlanText, aiPlanDone);
+            ChatArea.ChatUnpack(aiSessions[aiSessCur].pack, aiMsgs, aiPlan);
         }
-        while (aiSessArch.Count < aiSessions.Count) { aiSessArch.Add(0); }
         aiCacheKey = "";
         aiCacheSig = "";
     }
@@ -528,34 +531,24 @@ partial class ZanIDE {
         return items;
     }
 
-    /// Built-in official AI provider presets: display name, OpenAI-compatible
-    /// base URL, a sensible default model, and the key/registration portal.
-    static void AiPresetsInto(List<string> names, List<string> bases,
-            List<string> models, List<string> regs) {
-        names.Add("Agnes AI");
-        bases.Add("https://platform.agnes-ai.com/v1");
-        models.Add("");
-        regs.Add("https://platform.agnes-ai.com/");
-        names.Add(ZanIDE.T("Zhipu GLM", "智谱 GLM"));
-        bases.Add("https://open.bigmodel.cn/api/paas/v4");
-        models.Add("glm-4-flash");
-        regs.Add("https://open.bigmodel.cn/");
-        names.Add("Kimi (Moonshot)");
-        bases.Add("https://api.moonshot.cn/v1");
-        models.Add("moonshot-v1-8k");
-        regs.Add("https://platform.moonshot.cn/");
-        names.Add("DeepSeek");
-        bases.Add("https://api.deepseek.com/v1");
-        models.Add("deepseek-chat");
-        regs.Add("https://platform.deepseek.com/");
-        names.Add(ZanIDE.T("Alibaba Qwen", "通义千问 Qwen"));
-        bases.Add("https://dashscope.aliyuncs.com/compatible-mode/v1");
-        models.Add("qwen-plus");
-        regs.Add("https://bailian.console.aliyun.com/");
-        names.Add("OpenAI");
-        bases.Add("https://api.openai.com/v1");
-        models.Add("gpt-4o-mini");
-        regs.Add("https://platform.openai.com/");
+    /// Built-in official AI provider presets.
+    static List<AiPreset> AiPresets() {
+        List<AiPreset> presets = new List<AiPreset>();
+        presets.Add(AiPreset.Create("Agnes AI", "https://platform.agnes-ai.com/v1", "",
+            "https://platform.agnes-ai.com/"));
+        presets.Add(AiPreset.Create(ZanIDE.T("Zhipu GLM", "智谱 GLM"),
+            "https://open.bigmodel.cn/api/paas/v4", "glm-4-flash",
+            "https://open.bigmodel.cn/"));
+        presets.Add(AiPreset.Create("Kimi (Moonshot)", "https://api.moonshot.cn/v1",
+            "moonshot-v1-8k", "https://platform.moonshot.cn/"));
+        presets.Add(AiPreset.Create("DeepSeek", "https://api.deepseek.com/v1",
+            "deepseek-chat", "https://platform.deepseek.com/"));
+        presets.Add(AiPreset.Create(ZanIDE.T("Alibaba Qwen", "通义千问 Qwen"),
+            "https://dashscope.aliyuncs.com/compatible-mode/v1", "qwen-plus",
+            "https://bailian.console.aliyun.com/"));
+        presets.Add(AiPreset.Create("OpenAI", "https://api.openai.com/v1", "gpt-4o-mini",
+            "https://platform.openai.com/"));
+        return presets;
     }
 
     /// Opens `url` in the system browser (detached).
@@ -663,6 +656,10 @@ partial class ZanIDE {
             ZanIDE.T("Build and run configuration, and the project's images, fonts and other assets.",
                 "构建与运行配置，以及工程的图片、字体等素材。")));
         actions.Add(12);
+        design.Add(RibbonItem.Large("download", ZanIDE.T("Packages", "库商城")).SetTip(
+            ZanIDE.T("Browse and install packages for the current project.",
+                "浏览并为当前工程安装库。")));
+        actions.Add(15);
         groups.Add(design);
 
         RibbonGroup shell = RibbonGroup.Create(ZanIDE.T("Application", "应用"));
@@ -691,7 +688,7 @@ partial class ZanIDE {
                     int a = actions[idx];
                     bool on = true;
                     if (a == 4 || a == 6 || a == 7) { on = canRun; }
-                    else if (a == 8 || a == 11 || a == 12) { on = haveProj; }
+                    else if (a == 8 || a == 11 || a == 12 || a == 15) { on = haveProj; }
                     groups[g].items[j].SetEnabled(on);
                 }
                 idx = idx + 1;
@@ -1502,9 +1499,9 @@ partial class ZanIDE {
             // the active tab's extension decides whether the designer or the code
             // editor is shown, rather than a global toggle.
             int actDM = activeTab.Get();
-            if (actDM >= 0 && actDM < tabPaths.Count) {
-                designerMode = ZanIDE.IsFormPath(tabPaths[actDM]) && tabPaths[actDM] != codeViewForm;
-                sceneMode = ZanIDE.IsScenePath(tabPaths[actDM]) && tabPaths[actDM] != codeViewForm;
+            if (actDM >= 0 && actDM < tabs.Count) {
+                designerMode = ZanIDE.IsFormPath(tabs[actDM].path) && tabs[actDM].path != codeViewForm;
+                sceneMode = ZanIDE.IsScenePath(tabs[actDM].path) && tabs[actDM].path != codeViewForm;
             } else {
                 designerMode = false;
                 sceneMode = false;
@@ -1519,13 +1516,13 @@ partial class ZanIDE {
                     // success so F5 never freezes the window during compilation.
                     if (!buildBusy) {
                         this.SaveActiveTab();
-                        string dExe = ZanIDE.DebugBuildBegin(tabPaths, activeTab, root, log);
+                        string dExe = ZanIDE.DebugBuildBegin(tabs, activeTab, root, log);
                         if (dExe != "") {
                             buildBusy = true;
                             buildThenRun = false;
                             dbgBuildPending = true;
                             buildExe = dExe;
-                            buildTargetPath = ZanIDE.PathOf(tabPaths, activeTab);
+                            buildTargetPath = ZanIDE.PathOf(tabs, activeTab);
                             buildLogLen = 0;
                             dock.Focus("output");
                             app.RequestAnimationFrame(80);
@@ -1592,6 +1589,9 @@ partial class ZanIDE {
                     // Escape = close the asset manager
                     assetWin.Close();
                     app.RequestRedraw();
+                } else if (kc == 27 && marketplaceWin != null && marketplaceWin.IsOpen()) {
+                    marketplaceWin.Close();
+                    app.RequestRedraw();
                 } else if (kc == 123 && !designerMode && dbgState == 0) {
                     // F12 = Go to Definition
                     if (lspSess == null && !lspTried) {
@@ -1599,7 +1599,7 @@ partial class ZanIDE {
                         lspSess = LspSession.Start(root);
                         if (lspSess != null) { log.Add("> zan-lsp connected: semantic navigation enabled."); }
                     }
-                    int gl12 = ZanIDE.GoToDefinitionSmart(lspSess, editor, tabNames, tabBodies, tabPaths, activeTab, root, log);
+                    int gl12 = ZanIDE.GoToDefinitionSmart(lspSess, editor, tabs, activeTab, root, log);
                     if (gl12 >= 0) { pendingGotoLine = gl12; pendingGotoCol = 0; lastActive = 0 - 1; }
                     app.RequestRedraw();
                 } else if (kc == 113 && !designerMode && dbgState == 0) {
@@ -1615,19 +1615,19 @@ partial class ZanIDE {
                 } else if (kc == 119 && !designerMode && dbgState == 0) {
                     // F8 / Shift+F8 = walk the Find in Files results, opening
                     // the file when the match is in one that is not open.
-                    if (fifPath.Count == 0) {
+                    if (fifHits.Count == 0) {
                         log.Add(ZanIDE.T("> No search results. Ctrl+Shift+F searches the project.",
                             "> 没有搜索结果。Ctrl+Shift+F 可搜索整个项目。"));
                     } else {
                         if (Modifiers.HasShift(app.window.EventMods())) {
                             fifSel = fifSel - 1;
-                            if (fifSel < 0) { fifSel = fifPath.Count - 1; }
+                            if (fifSel < 0) { fifSel = fifHits.Count - 1; }
                         } else {
                             fifSel = fifSel + 1;
-                            if (fifSel >= fifPath.Count) { fifSel = 0; }
+                            if (fifSel >= fifHits.Count) { fifSel = 0; }
                         }
-                        int hitLine = ZanIDE.GotoSearchHit(fifPath, fifLine, fifSel,
-                            tabNames, tabBodies, tabPaths, activeTab, log);
+                        int hitLine = ZanIDE.GotoSearchHit(fifHits, fifSel,
+                            tabs, activeTab, log);
                         if (hitLine >= 0) {
                             pendingGotoLine = hitLine;
                             pendingGotoCol = 0;
@@ -1641,10 +1641,10 @@ partial class ZanIDE {
                     // design JSON, a .zscene its generated code); on a code
                     // file it opens the .zform paired with it.
                     int actF7 = activeTab.Get();
-                    if (actF7 >= 0 && actF7 < tabPaths.Count
-                            && (ZanIDE.IsFormPath(tabPaths[actF7])
-                                || ZanIDE.IsScenePath(tabPaths[actF7]))) {
-                        string fp7 = tabPaths[actF7];
+                    if (actF7 >= 0 && actF7 < tabs.Count
+                            && (ZanIDE.IsFormPath(tabs[actF7].path)
+                                || ZanIDE.IsScenePath(tabs[actF7].path))) {
+                        string fp7 = tabs[actF7].path;
                         if (codeViewForm == fp7) {
                             codeViewForm = "";
                             log.Add(ZanIDE.T("> Design view.", "> 设计视图。"));
@@ -1654,14 +1654,14 @@ partial class ZanIDE {
                             log.Add(ZanIDE.T("> Code view.", "> 代码视图。"));
                         }
                         lastActive = 0 - 1;
-                    } else if (actF7 >= 0 && actF7 < tabPaths.Count) {
-                        string ap7 = tabPaths[actF7];
+                    } else if (actF7 >= 0 && actF7 < tabs.Count) {
+                        string ap7 = tabs[actF7].path;
                         if (ap7.Length > 4 && ap7.Substring(ap7.Length - 4, 4) == ".zan") {
                             string cand7 = ap7.Substring(0, ap7.Length - 4) + ".zform";
                             if (File.Exists(cand7)) {
-                                int ci7 = ZanIDE.FindTabByPath(tabPaths, cand7);
+                                int ci7 = ZanIDE.FindTabByPath(tabs, cand7);
                                 if (ci7 >= 0) { activeTab.Set(ci7); }
-                                else { ZanIDE.OpenPath(tabNames, tabBodies, tabPaths, activeTab, cand7, Path.GetFileName(cand7)); }
+                                else { ZanIDE.OpenPath(tabs, activeTab, cand7, Path.GetFileName(cand7)); }
                                 loadedFormPath = "";
                                 lastActive = 0 - 1;
                             } else {
@@ -1703,8 +1703,7 @@ partial class ZanIDE {
                     // Ctrl+B = edit the breakpoint condition on the caret line
                     if (!designerMode) {
                         findMode = 4;
-                        bpCondText = ZanIDE.CondFor(bpCondLines, bpCondExprs,
-                            editor.CurLine());
+                        bpCondText = ZanIDE.CondFor(bpConds, editor.CurLine());
                     }
                     app.RequestRedraw();
                 } else if (cc == 5) {
@@ -1717,17 +1716,17 @@ partial class ZanIDE {
                 } else if (cc == 19) {
                     // Ctrl+S = Save (+ hot reload when enabled)
                     int aSv = activeTab.Get();
-                    if (aSv >= 0 && aSv < tabPaths.Count
-                            && ZanIDE.IsFormPath(tabPaths[aSv]) && codeViewForm == tabPaths[aSv]) {
+                    if (aSv >= 0 && aSv < tabs.Count
+                            && ZanIDE.IsFormPath(tabs[aSv].path) && codeViewForm == tabs[aSv].path) {
                         // The .zform code view shows the design JSON, which is
                         // owned by the designer - it is read-only here.
                         log.Add(ZanIDE.T("> The design JSON is read-only here; edit the design, or open Name.zan for logic.", "> 设计 JSON 此处只读；请修改设计，或打开 Name.zan 编写逻辑。"));
-                    } else if (aSv >= 0 && aSv < tabPaths.Count
-                            && ZanIDE.IsScenePath(tabPaths[aSv]) && codeViewForm == tabPaths[aSv]) {
+                    } else if (aSv >= 0 && aSv < tabs.Count
+                            && ZanIDE.IsScenePath(tabs[aSv].path) && codeViewForm == tabs[aSv].path) {
                         // The .zscene code view shows the generated Name.g.zan,
                         // which is rewritten from the design - it is read-only here.
                         log.Add(ZanIDE.T("> Generated scene file is read-only; edit the design, or open Name.zan for logic.", "> 生成的场景文件只读；请修改设计，或打开 Name.zan 编写逻辑。"));
-                    } else if (!designerMode && !sceneMode && aSv >= 0 && aSv < tabPaths.Count && tabPaths[aSv] != "@start") {
+                    } else if (!designerMode && !sceneMode && aSv >= 0 && aSv < tabs.Count && tabs[aSv].path != "@start") {
                         this.SaveActiveTab();
                         if (autoRun) { hotReloadReq = true; }
                         rescan = true;
@@ -1766,7 +1765,7 @@ partial class ZanIDE {
                 // on a single open file; all are disabled on the Start page.
                 int atE = activeTab.Get();
                 string apE = "";
-                if (atE >= 0 && atE < tabPaths.Count) { apE = tabPaths[atE]; }
+                if (atE >= 0 && atE < tabs.Count) { apE = tabs[atE].path; }
                 bool activeIsFile = apE != "" && apE != "@start";
                 bool haveProj = File.Exists(root + "/zan.proj");
                 // Run/Debug/Build follow the active file, or fall back to the
@@ -1813,12 +1812,12 @@ partial class ZanIDE {
                     app.RequestRedraw();
                 } else if (rc == 3) {
                     int aSv3 = activeTab.Get();
-                    if (aSv3 >= 0 && aSv3 < tabPaths.Count
-                            && ZanIDE.IsFormPath(tabPaths[aSv3]) && codeViewForm == tabPaths[aSv3]) {
+                    if (aSv3 >= 0 && aSv3 < tabs.Count
+                            && ZanIDE.IsFormPath(tabs[aSv3].path) && codeViewForm == tabs[aSv3].path) {
                         // The .zform code view shows the design JSON (read-only).
                         log.Add(ZanIDE.T("> The design JSON is read-only here; edit the design, or open Name.zan for logic.", "> 设计 JSON 此处只读；请修改设计，或打开 Name.zan 编写逻辑。"));
-                    } else if (aSv3 >= 0 && aSv3 < tabPaths.Count
-                            && ZanIDE.IsScenePath(tabPaths[aSv3]) && codeViewForm == tabPaths[aSv3]) {
+                    } else if (aSv3 >= 0 && aSv3 < tabs.Count
+                            && ZanIDE.IsScenePath(tabs[aSv3].path) && codeViewForm == tabs[aSv3].path) {
                         // Generated Name.g.zan is read-only in the scene code view.
                         log.Add(ZanIDE.T("> Generated scene file is read-only; edit the design, or open Name.zan for logic.", "> 生成的场景文件只读；请修改设计，或打开 Name.zan 编写逻辑。"));
                     } else {
@@ -1837,7 +1836,7 @@ partial class ZanIDE {
                     } else {
                         int atB = activeTab.Get();
                         string apB = "";
-                        if (atB >= 0 && atB < tabPaths.Count) { apB = tabPaths[atB]; }
+                        if (atB >= 0 && atB < tabs.Count) { apB = tabs[atB].path; }
                         string rpB = ZanIDE.RibbonRunTarget(apB, root);
                         if (rpB == "") {
                             log.Add(ZanIDE.T("> Nothing to run (open and save a source file first).", "> 没有可运行的目标（请先打开并保存源文件）。"));
@@ -1871,13 +1870,13 @@ partial class ZanIDE {
                     if (dbgState == 0) {
                         if (!buildBusy) {
                             this.SaveActiveTab();
-                            string dExe = ZanIDE.DebugBuildBegin(tabPaths, activeTab, root, log);
+                            string dExe = ZanIDE.DebugBuildBegin(tabs, activeTab, root, log);
                             if (dExe != "") {
                                 buildBusy = true;
                                 buildThenRun = false;
                                 dbgBuildPending = true;
                                 buildExe = dExe;
-                                buildTargetPath = ZanIDE.PathOf(tabPaths, activeTab);
+                                buildTargetPath = ZanIDE.PathOf(tabs, activeTab);
                                 buildLogLen = 0;
                                 dock.Focus("output");
                                 app.RequestAnimationFrame(80);
@@ -1919,6 +1918,16 @@ partial class ZanIDE {
                         log.Add("> Open or create a project first to configure it.");
                     }
                     app.RequestRedraw();
+                } else if (rc == 15) {
+                    if (File.Exists(root + "/zan.proj")) {
+                        if (marketplaceWin == null || !marketplaceWin.IsOpen()) {
+                            marketplaceWin = MarketplaceWindow.Open(app, ZanIDE.uiLang);
+                        }
+                    } else {
+                        log.Add(ZanIDE.T("> Open or create a project before installing packages.",
+                            "> 请先打开或创建工程，再安装库。"));
+                    }
+                    app.RequestRedraw();
                 } else if (rc == 13) {
                     if (settingsWindow == null
                         || !settingsWindow.IsOpen()) {
@@ -1928,12 +1937,12 @@ partial class ZanIDE {
                     }
                 } else if (rc == 14) {
                     // Open the Help / documentation browser (a real "@docs" tab).
-                    int di = ZanIDE.FindTabByPath(tabPaths, "@docs");
+                    int di = ZanIDE.FindTabByPath(tabs, "@docs");
                     if (di >= 0) {
                         activeTab.Set(di);
                     } else {
-                        tabNames.Add(ZanIDE.T("Help", "帮助")); tabBodies.Add(""); tabPaths.Add("@docs");
-                        activeTab.Set(tabNames.Count - 1);
+                        tabs.Add(TabRecord.Create(ZanIDE.T("Help", "帮助"), "", "@docs"));
+                        activeTab.Set(tabs.Count - 1);
                     }
                     lastActive = 0 - 1;
                     app.RequestRedraw();
@@ -2039,14 +2048,14 @@ partial class ZanIDE {
                     structSig = newSig;
                     if (designerMode) {
                         string sfn = "Form";
-                        if (stActTab >= 0 && stActTab < tabPaths.Count) {
-                            sfn = ZanIDE.FormBaseName(tabPaths[stActTab]);
+                        if (stActTab >= 0 && stActTab < tabs.Count) {
+                            sfn = ZanIDE.FormBaseName(tabs[stActTab].path);
                         }
                         structTree = ZanIDE.BuildFieldTree(sfn, formDesigner.fields);
                     } else if (sceneMode) {
                         string scn = "Scene";
-                        if (stActTab >= 0 && stActTab < tabPaths.Count) {
-                            scn = ZanIDE.BaseName(tabPaths[stActTab]);
+                        if (stActTab >= 0 && stActTab < tabs.Count) {
+                            scn = ZanIDE.BaseName(tabs[stActTab].path);
                         }
                         structTree = ZanIDE.BuildSceneTree(scn, sceneDesigner);
                     }
@@ -2112,26 +2121,26 @@ partial class ZanIDE {
                 if (act != lastActive) {
                     // Only sync editor text for code tabs; .zform tabs are owned by
                     // the designer and must not be overwritten with editor contents.
-                    if (lastActive >= 0 && lastActive < tabBodies.Count
-                        && !ZanIDE.IsFormPath(tabPaths[lastActive])
-                        && !ZanIDE.IsScenePath(tabPaths[lastActive])) {
-                        tabBodies[lastActive] = editor.GetText();
+                    if (lastActive >= 0 && lastActive < tabs.Count
+                        && !ZanIDE.IsFormPath(tabs[lastActive].path)
+                        && !ZanIDE.IsScenePath(tabs[lastActive].path)) {
+                        tabs[lastActive].body = editor.GetText();
                     }
-                    if (act >= 0 && act < tabBodies.Count
-                        && !ZanIDE.IsFormPath(tabPaths[act])
-                        && !ZanIDE.IsScenePath(tabPaths[act])) {
-                        editor.LoadText(tabBodies[act]);
+                    if (act >= 0 && act < tabs.Count
+                        && !ZanIDE.IsFormPath(tabs[act].path)
+                        && !ZanIDE.IsScenePath(tabs[act].path)) {
+                        editor.LoadText(tabs[act].body);
                         // Feed the other open source files to the editor so it can
                         // resolve cross-file types (e.g. a `Utils` class defined
                         // in another tab) for accurate completion.
                         List<string> projFiles = new List<string>();
                         int pf = 0;
-                        while (pf < tabBodies.Count) {
-                            if (pf != act && pf < tabPaths.Count
-                                && !ZanIDE.IsFormPath(tabPaths[pf])
-                                && !ZanIDE.IsScenePath(tabPaths[pf])
-                                && tabPaths[pf] != "@start") {
-                                projFiles.Add(tabBodies[pf]);
+                        while (pf < tabs.Count) {
+                            if (pf != act && pf < tabs.Count
+                                && !ZanIDE.IsFormPath(tabs[pf].path)
+                                && !ZanIDE.IsScenePath(tabs[pf].path)
+                                && tabs[pf].path != "@start") {
+                                projFiles.Add(tabs[pf].body);
                             }
                             pf = pf + 1;
                         }
@@ -2147,8 +2156,8 @@ partial class ZanIDE {
                 }
 
                 Rect edRect = Rect.Create(ea.x, ea.y + tabH, ea.width, ea.height - tabH);
-                bool activeIsStart = (act >= 0 && act < tabPaths.Count && tabPaths[act] == "@start");
-                bool activeIsDocs = (act >= 0 && act < tabPaths.Count && tabPaths[act] == "@docs");
+                bool activeIsStart = (act >= 0 && act < tabs.Count && tabs[act].path == "@start");
+                bool activeIsDocs = (act >= 0 && act < tabs.Count && tabs[act].path == "@docs");
 
                 if (designerMode) {
                     // The .zform tab hosts the full component-based form designer
@@ -2156,10 +2165,10 @@ partial class ZanIDE {
                     // bindings, JSON drawer. The .zform file stores its design
                     // document; legacy coordinate-based .zform files are converted
                     // on first open.
-                    string fpath = tabPaths[act];
+                    string fpath = tabs[act].path;
                     string fname = ZanIDE.FormBaseName(fpath);
                     if (fpath != loadedFormPath) {
-                        string fbody = tabBodies[act];
+                        string fbody = tabs[act].body;
                         if (ZanIDE.LooksLikeJson(fbody)) {
                             formDesigner.LoadJson(fbody);
                         } else {
@@ -2184,7 +2193,7 @@ partial class ZanIDE {
                     // never touched here - it is only created when missing.
                     string newser = formDesigner.SaveJson();
                     if (newser != formCache) {
-                        tabBodies[act] = newser;
+                        tabs[act].body = newser;
                         if (fpath.Length > 0 && fpath.Substring(0, 1) != "@") {
                             File.WriteAllText(fpath, newser);
                             string cbpS = ZanIDE.CodeBehindPath(fpath);
@@ -2217,9 +2226,9 @@ partial class ZanIDE {
                     // The .zscene tab hosts the free-canvas game scene designer
                     // (stdlib Game.Scene.SceneDesigner). The .zscene file stores
                     // the scene JSON document.
-                    string spath = tabPaths[act];
+                    string spath = tabs[act].path;
                     if (spath != loadedScenePath) {
-                        string sbody = tabBodies[act];
+                        string sbody = tabs[act].body;
                         if (ZanIDE.LooksLikeJson(sbody)) {
                             sceneDesigner.LoadJson(sbody);
                         } else {
@@ -2234,7 +2243,7 @@ partial class ZanIDE {
                     // Persist design changes to the .zscene file.
                     string snewser = sceneDesigner.SaveJson();
                     if (snewser != sceneCache) {
-                        tabBodies[act] = snewser;
+                        tabs[act].body = snewser;
                         if (spath.Length > 0 && spath.Substring(0, 1) != "@") {
                             File.WriteAllText(spath, snewser);
                             // Regenerate the strongly-typed scene file (Name.g.zan)
@@ -2244,8 +2253,8 @@ partial class ZanIDE {
                             string sgenP = ZanIDE.SceneGenFilePath(spath);
                             string sgenNew = ZanIDE.GenSceneFile(sname, sceneDesigner.doc);
                             File.WriteAllText(sgenP, sgenNew);
-                            int sgTab = ZanIDE.FindTabByPath(tabPaths, sgenP);
-                            if (sgTab >= 0) { tabBodies[sgTab] = sgenNew; }
+                            int sgTab = ZanIDE.FindTabByPath(tabs, sgenP);
+                            if (sgTab >= 0) { tabs[sgTab].body = sgenNew; }
                             string scbP = ZanIDE.SceneCodeBehindPath(spath);
                             if (!File.Exists(scbP)) {
                                 File.WriteAllText(scbP, ZanIDE.GenSceneBusinessShell(sname));
@@ -2300,12 +2309,10 @@ partial class ZanIDE {
                         string nurl = startPage.NewsLink(sact - 200);
                         if (nurl != "") {
                             if (nurl == "@docs") {
-                                int di = ZanIDE.FindTabByPath(tabPaths, "@docs");
+                                int di = ZanIDE.FindTabByPath(tabs, "@docs");
                                 if (di < 0) {
-                                    tabNames.Add(ZanIDE.T("Help", "帮助"));
-                                    tabBodies.Add("");
-                                    tabPaths.Add("@docs");
-                                    di = tabPaths.Count - 1;
+                                    tabs.Add(TabRecord.Create(ZanIDE.T("Help", "帮助"), "", "@docs"));
+                                    di = tabs.Count - 1;
                                 }
                                 activeTab.Set(di);
                                 lastActive = 0 - 1;
@@ -2321,25 +2328,23 @@ partial class ZanIDE {
                                 root = newRoot;
                                 haveProject = true;
                                 ZanIDE.WriteLastProject(root);
-                                tabNames = new List<string>();
-                                tabBodies = new List<string>();
-                                tabPaths = new List<string>();
+                                tabs = new List<TabRecord>();
                                 activeTab.Set(0);
                                 lastActive = 0 - 1;
-                                ZanIDE.OpenFirst(tabNames, tabBodies, tabPaths, activeTab, root);
+                                ZanIDE.OpenFirst(tabs, activeTab, root);
                                 rescan = true;
                                 log.Add("> Opened project " + root + ".");
                             }
                             app.RequestRedraw();
                         }
                     }
-                } else if (act >= 0 && act < tabPaths.Count
-                        && ZanIDE.IsScenePath(tabPaths[act]) && codeViewForm == tabPaths[act]) {
+                } else if (act >= 0 && act < tabs.Count
+                        && ZanIDE.IsScenePath(tabs[act].path) && codeViewForm == tabs[act].path) {
                     // Code view of the current .zscene: show the generated,
                     // strongly-typed scene file (Name.g.zan) in place - the
                     // read-only "Designer" half. The scene is edited visually;
                     // game logic lives in the sibling Name.zan tab.
-                    string spC = tabPaths[act];
+                    string spC = tabs[act].path;
                     if (formCodeLoaded != spC) {
                         string sgenC = ZanIDE.SceneGenFilePath(spC);
                         string sTxt = "";
@@ -2354,13 +2359,13 @@ partial class ZanIDE {
                     }
                     ZanIDE.ApplyEditorTheme(formCodeEd, edThemeIdx, edFontPx);
                     formCodeEd.Render(app, edRect);
-                } else if (act >= 0 && act < tabPaths.Count
-                        && ZanIDE.IsFormPath(tabPaths[act]) && codeViewForm == tabPaths[act]) {
+                } else if (act >= 0 && act < tabs.Count
+                        && ZanIDE.IsFormPath(tabs[act].path) && codeViewForm == tabs[act].path) {
                     // Code view of the current .zform: show the design
                     // document's raw JSON in place (read-only) - the window is
                     // edited visually in the designer, and business logic lives
                     // in the paired Name.zan (2-file model, no generated file).
-                    string fpC = tabPaths[act];
+                    string fpC = tabs[act].path;
                     if (formCodeLoaded != fpC) {
                         string codeTxt = "";
                         if (File.Exists(fpC)) {
@@ -2374,7 +2379,7 @@ partial class ZanIDE {
                 } else {
                     // Sync debug vars into editor for hover tooltips
                     if (dbgState == 2) { editor.SetDebugVars(dbgVarInfo); }
-                    else { editor.SetDebugVars(new List<string>()); }
+                    else { editor.SetDebugVars(new List<DbgVar>()); }
                     ZanIDE.ApplyEditorTheme(editor, edThemeIdx, edFontPx);
                     editor.Render(app, edRect);
                     // Publish live editor state to the AI automation driver
@@ -2391,7 +2396,7 @@ partial class ZanIDE {
                             lspSess = LspSession.Start(root);
                             if (lspSess != null) { log.Add("> zan-lsp connected: semantic navigation enabled."); }
                         }
-                        int glc = ZanIDE.GoToDefinitionSmart(lspSess, editor, tabNames, tabBodies, tabPaths, activeTab, root, log);
+                        int glc = ZanIDE.GoToDefinitionSmart(lspSess, editor, tabs, activeTab, root, log);
                         if (glc >= 0) { pendingGotoLine = glc; pendingGotoCol = 0; lastActive = 0 - 1; }
                         app.RequestRedraw();
                     }
@@ -2491,7 +2496,7 @@ partial class ZanIDE {
                                 app.RequestRedraw();
                             } else if (bcc == 13) {
                                 int bLine = editor.CurLine();
-                                ZanIDE.SetCond(bpCondLines, bpCondExprs, bLine, bpCondText);
+                                ZanIDE.SetCond(bpConds, bLine, bpCondText);
                                 if (bpCondText.Length > 0 && !editor.HasBreakpoint(bLine)) {
                                     editor.ToggleBreakpoint(bLine);
                                 }
@@ -2523,8 +2528,7 @@ partial class ZanIDE {
                                     lspSess = LspSession.Start(root);
                                     if (lspSess != null) { log.Add("> zan-lsp connected: semantic rename enabled."); }
                                 }
-                                ZanIDE.RenameSymbolSmart(lspSess, editor, tabNames, tabBodies,
-                                    tabPaths, activeTab, log, renameWord, renameText);
+                                ZanIDE.RenameSymbolSmart(lspSess, editor, tabs, activeTab, log, renameWord, renameText);
                                 findMode = 0;
                                 app.RequestRedraw();
                             } else if (rcc > 31) {
@@ -2543,12 +2547,12 @@ partial class ZanIDE {
                             } else if (qcc == 13) {
                                 if (fifQuery.Length > 0) {
                                     int act6 = activeTab.Get();
-                                    if (act6 >= 0 && act6 < tabBodies.Count) {
-                                        tabBodies[act6] = editor.GetText();
+                                    if (act6 >= 0 && act6 < tabs.Count) {
+                                        tabs[act6].body = editor.GetText();
                                     }
                                     log.Add("> Find in Files: '" + fifQuery + "'");
                                     ZanIDE.FindInFiles(root, fifQuery, false,
-                                        tabPaths, tabBodies, fifPath, fifLine, fifText, log);
+                                        tabs, fifHits, log);
                                     fifSel = 0 - 1;
                                     coLog.Reset();
                                     dock.Focus("output");
@@ -2582,15 +2586,15 @@ partial class ZanIDE {
                                     fifReplFocus = true;
                                 } else if (fifQuery.Length > 0) {
                                     int act7 = activeTab.Get();
-                                    if (act7 >= 0 && act7 < tabBodies.Count) {
-                                        tabBodies[act7] = editor.GetText();
+                                    if (act7 >= 0 && act7 < tabs.Count) {
+                                        tabs[act7].body = editor.GetText();
                                     }
                                     ZanIDE.ReplaceInFiles(root, fifQuery, fifRepl,
-                                        false, tabPaths, tabBodies, log);
+                                        false, tabs, log);
                                     int actR = activeTab.Get();
-                                    if (actR >= 0 && actR < tabBodies.Count) {
+                                    if (actR >= 0 && actR < tabs.Count) {
                                         int keepR = editor.CurLine();
-                                        editor.LoadText(tabBodies[actR]);
+                                        editor.LoadText(tabs[actR].body);
                                         editor.GoToLine(keepR);
                                     }
                                     coLog.Reset();
@@ -2615,33 +2619,32 @@ partial class ZanIDE {
                 // dock panel, so it stays readable next to (or instead of) the
                 // console, and its tab carries the error count.
                 Rect errRect = dock.ContentParked("errors");
-                List<string> ePath = new List<string>();
-                List<string> eLine = new List<string>();
-                List<string> eMsg = new List<string>();
-                ZanIDE.ParseErrorList(log, ePath, eLine, eMsg);
+                List<DiagnosticRecord> errors = new List<DiagnosticRecord>();
+                ZanIDE.ParseErrorList(log, errors);
                 string errTitle = ZanIDE.T("Errors", "错误");
-                if (eLine.Count > 0) {
-                    errTitle = errTitle + " (" + Convert.ToString(eLine.Count) + ")";
+                if (errors.Count > 0) {
+                    errTitle = errTitle + " (" + Convert.ToString(errors.Count) + ")";
                 }
                 if (errTitle != dockErrorsTitle) {
                     dock.SetTitle("errors", errTitle);
                     dockErrorsTitle = errTitle;
                 }
-                OutputPanel.RenderErrorsPanel(app, c, t, errRect, ePath, eLine, eMsg, errorList);
+                OutputPanel.RenderErrorsPanel(app, c, t, errRect, errors, errorList);
                 // Error rows are widgets: the ErrorList component records clicks
                 // during RenderAt; apply them here.
                 if (!coCtxOpen) {
                     int efr = errorList.TakeFix();
                     if (efr >= 0) {
-                        ZanIDE.AddUsing(editor, tabBodies, activeTab,
+                        ZanIDE.AddUsing(editor, tabs, activeTab,
                             errorList.FixNs(efr), log);
                         app.RequestRedraw();
                     }
                     int ejr = errorList.TakeJump();
-                    if (ejr >= 0 && ejr < ePath.Count) {
+                    if (ejr >= 0 && ejr < errors.Count) {
+                        DiagnosticRecord error = errors[ejr];
                         int ejt = ZanIDE.FindTabByBase(
-                            tabPaths, ZanIDE.BaseName(ePath[ejr]));
-                        int ejl = ZanIDE.ParseInt(eLine[ejr]);
+                            tabs, ZanIDE.BaseName(error.path));
+                        int ejl = ZanIDE.ParseInt(error.line);
                         if (ejt >= 0) {
                             activeTab.Set(ejt);
                             lastActive = 0 - 1;
@@ -2765,9 +2768,10 @@ partial class ZanIDE {
                                     if (coCtxRow >= 0 && coCtxRow < coView.Count) {
                                         clip = coView[coCtxRow];
                                     }
-                                } else if (coCtxRow >= 0 && coCtxRow < ePath.Count) {
-                                    clip = ZanIDE.BaseName(ePath[coCtxRow]) + ":"
-                                        + eLine[coCtxRow] + "  " + eMsg[coCtxRow];
+                                } else if (coCtxRow >= 0 && coCtxRow < errors.Count) {
+                                    DiagnosticRecord error = errors[coCtxRow];
+                                    clip = ZanIDE.BaseName(error.path) + ":"
+                                        + error.line + "  " + error.msg;
                                 }
                             } else if (cmHit == base2 + 1) {
                                 if (botTab == 0) {
@@ -2775,9 +2779,10 @@ partial class ZanIDE {
                                     while (ci < coView.Count) { clip = clip + coView[ci] + "\n"; ci = ci + 1; }
                                 } else {
                                     int ci = 0;
-                                    while (ci < ePath.Count) {
-                                        clip = clip + ZanIDE.BaseName(ePath[ci]) + ":" + eLine[ci]
-                                            + "  " + eMsg[ci] + "\n";
+                                    while (ci < errors.Count) {
+                                        DiagnosticRecord error = errors[ci];
+                                        clip = clip + ZanIDE.BaseName(error.path) + ":" + error.line
+                                            + "  " + error.msg + "\n";
                                         ci = ci + 1;
                                     }
                                 }
@@ -2822,35 +2827,36 @@ partial class ZanIDE {
                 if (aiSideW > rp.width - app.Scale(150)) { aiSideW = 0; }
                 if (aiSideW > 0) {
                     List<string> aiTitles = new List<string>();
+                    List<int> aiArch = new List<int>();
                     int sti = 0;
                     while (sti < aiSessions.Count) {
                         string sTtl = "";
                         if (sti == aiSessCur) {
-                            sTtl = ChatArea.FirstUserOf(aiRole, aiText);
+                            sTtl = ChatArea.FirstUserOf(aiMsgs);
                         } else {
-                            sTtl = ChatArea.ChatTitle(aiSessions[sti]);
+                            sTtl = ChatArea.ChatTitle(aiSessions[sti].pack);
                         }
                         if (sTtl == "") {
                             sTtl = ZanIDE.T("New chat ", "新会话 ")
                                 + Convert.ToString(sti + 1);
                         }
                         aiTitles.Add(sTtl);
+                        aiArch.Add(aiSessions[sti].archived);
                         sti = sti + 1;
                     }
-                    while (aiSessArch.Count < aiSessions.Count) { aiSessArch.Add(0); }
                     SessionListAction sAct = aiSessNav.RenderEx(app,
                         rp.x + rPad, rp.y + rPad, aiSideW - rPad * 2,
-                        rp.height - rPad * 2, aiTitles, aiSessCur, aiSessArch);
+                        rp.height - rPad * 2, aiTitles, aiSessCur, aiArch);
                     app.canvas.FillRect(rp.x + aiSideW, rp.y, 1, rp.height, t.divider);
                     if (aiBusy.Get() == 0 && sAct.archived >= 0
-                        && sAct.archived < aiSessArch.Count) {
+                        && sAct.archived < aiSessions.Count) {
                         // Archive keeps the chat (and its whole context) but
                         // folds it out of the list; clicking again restores it.
                         int sArc = sAct.archived;
-                        if (aiSessArch[sArc] == 0) { aiSessArch[sArc] = 1; }
-                        else { aiSessArch[sArc] = 0; }
+                        if (aiSessions[sArc].archived == 0) { aiSessions[sArc].archived = 1; }
+                        else { aiSessions[sArc].archived = 0; }
                         SaveAiSessions();
-                        Layer.Msg(aiSessArch[sArc] == 1
+                        Layer.Msg(aiSessions[sArc].archived == 1
                             ? ZanIDE.T("Chat archived", "会话已归档")
                             : ZanIDE.T("Chat restored", "会话已恢复"), 3);
                         app.RequestRedraw();
@@ -2859,13 +2865,12 @@ partial class ZanIDE {
                         // transcript, thinking, task plan and archive flag. The
                         // last remaining chat is emptied rather than removed,
                         // so the panel always has a session to write into.
-                        aiSessions[aiSessCur] = ChatArea.ChatPack(aiRole, aiText, aiReason, aiPlanText, aiPlanDone);
+                        aiSessions[aiSessCur].pack = ChatArea.ChatPack(aiMsgs, aiPlan);
                         int sDel = sAct.deleted;
                         bool sDelActive = sDel == aiSessCur;
                         int sNewCur = aiSessCur;
                         if (aiSessions.Count > 1) {
                             aiSessions.RemoveAt(sDel);
-                            if (sDel < aiSessArch.Count) { aiSessArch.RemoveAt(sDel); }
                             if (sDel < aiSessCur) { sNewCur = aiSessCur - 1; }
                             else if (sDel == aiSessCur) {
                                 if (sNewCur >= aiSessions.Count) {
@@ -2873,16 +2878,13 @@ partial class ZanIDE {
                                 }
                             }
                         } else {
-                            aiSessions[0] = "";
-                            if (aiSessArch.Count > 0) { aiSessArch[0] = 0; }
+                            aiSessions[0].pack = "";
+                            aiSessions[0].archived = 0;
                             sNewCur = 0;
                         }
-                        aiRole = new List<string>();
-                        aiText = new List<string>();
-                        aiReason = new List<string>();
-                        aiPlanText = new List<string>();
-                        aiPlanDone = new List<int>();
-                        ChatArea.ChatUnpack(aiSessions[sNewCur], aiRole, aiText, aiReason, aiPlanText, aiPlanDone);
+                        aiMsgs = new List<AiChatMsg>();
+                        aiPlan = new List<AiPlanStep>();
+                        ChatArea.ChatUnpack(aiSessions[sNewCur].pack, aiMsgs, aiPlan);
                         aiSessCur = sNewCur;
                         if (sDelActive) { AiResetContextState(); }
                         aiCacheKey = "";
@@ -2894,13 +2896,10 @@ partial class ZanIDE {
                             "会话及其上下文已删除"), 3);
                         app.RequestRedraw();
                     } else if (aiBusy.Get() == 0 && sAct.created) {
-                        aiSessions[aiSessCur] = ChatArea.ChatPack(aiRole, aiText, aiReason, aiPlanText, aiPlanDone);
-                        aiSessions.Add("");
-                        aiRole = new List<string>();
-                        aiText = new List<string>();
-                        aiReason = new List<string>();
-                        aiPlanText = new List<string>();
-                        aiPlanDone = new List<int>();
+                        aiSessions[aiSessCur].pack = ChatArea.ChatPack(aiMsgs, aiPlan);
+                        aiSessions.Add(AiSession.Create("", 0));
+                        aiMsgs = new List<AiChatMsg>();
+                        aiPlan = new List<AiPlanStep>();
                         aiSessCur = aiSessions.Count - 1;
                         AiResetContextState();
                         aiCacheKey = "";
@@ -2911,13 +2910,10 @@ partial class ZanIDE {
                         app.RequestRedraw();
                     } else if (aiBusy.Get() == 0 && sAct.selected >= 0
                         && sAct.selected != aiSessCur) {
-                        aiSessions[aiSessCur] = ChatArea.ChatPack(aiRole, aiText, aiReason, aiPlanText, aiPlanDone);
-                        aiRole = new List<string>();
-                        aiText = new List<string>();
-                        aiReason = new List<string>();
-                        aiPlanText = new List<string>();
-                        aiPlanDone = new List<int>();
-                        ChatArea.ChatUnpack(aiSessions[sAct.selected], aiRole, aiText, aiReason, aiPlanText, aiPlanDone);
+                        aiSessions[aiSessCur].pack = ChatArea.ChatPack(aiMsgs, aiPlan);
+                        aiMsgs = new List<AiChatMsg>();
+                        aiPlan = new List<AiPlanStep>();
+                        ChatArea.ChatUnpack(aiSessions[sAct.selected].pack, aiMsgs, aiPlan);
                         aiSessCur = sAct.selected;
                         aiCacheKey = "";
                         aiCacheSig = "";
@@ -2952,10 +2948,11 @@ partial class ZanIDE {
                     string aiSelSig = "";
                     {
                         int pfi = 0;
-                        while (pfi < aiProfNames.Count) {
-                            aiSelSig = aiSelSig + aiProfNames[pfi] + "~"
-                                + aiProfModels[pfi] + "~" + aiProfLists[pfi]
-                                + "~" + aiProfLimits[pfi] + ";;";
+                        while (pfi < aiProfiles.Count) {
+                            AiProfile profile = aiProfiles[pfi];
+                            aiSelSig = aiSelSig + profile.name + "~"
+                                + profile.model + "~" + profile.models
+                                + "~" + profile.limits + ";;";
                             pfi = pfi + 1;
                         }
                     }
@@ -2964,12 +2961,13 @@ partial class ZanIDE {
                         aiModelOpts = new List<string>();
                         aiModelOptProf = new List<int>();
                         int pi = 0;
-                        while (pi < aiProfNames.Count) {
-                            string pname = aiProfNames[pi];
+                        while (pi < aiProfiles.Count) {
+                            AiProfile profile = aiProfiles[pi];
+                            string pname = profile.name;
                             List<string> pmods = new List<string>();
-                            string defM = aiProfModels[pi];
+                            string defM = profile.model;
                             if (defM != "") { pmods.Add(defM); }
-                            List<string> fetched = ZanIDE.SplitList(aiProfLists[pi]);
+                            List<string> fetched = ZanIDE.SplitList(profile.models);
                             int fmi = 0;
                             while (fmi < fetched.Count) {
                                 bool dup = false;
@@ -2981,7 +2979,7 @@ partial class ZanIDE {
                                 // Models unticked in AI Settings are kept out
                                 // of the picker: a provider lists dozens, a
                                 // session uses two.
-                                bool hidden = ZanIDE.AiLimitInt(aiProfLimits[pi],
+                                bool hidden = ZanIDE.AiLimitInt(profile.limits,
                                     fetched[fmi], "off") == 1;
                                 if (!dup && !hidden) { pmods.Add(fetched[fmi]); }
                                 fmi = fmi + 1;
@@ -3000,7 +2998,7 @@ partial class ZanIDE {
                         int oi = 0;
                         while (oi < aiModelOptProf.Count) {
                             if (aiModelOptProf[oi] == aiProfActive
-                                && aiModelOpts[oi] == aiProfModels[aiProfActive]) {
+                                && aiModelOpts[oi] == aiProfiles[aiProfActive].model) {
                                 pre = oi;
                             }
                             oi = oi + 1;
@@ -3061,17 +3059,17 @@ partial class ZanIDE {
                     int selMi = aiModelSel.Selected();
                     if (selMi >= 0 && selMi < aiModelOptProf.Count) {
                         int chosenProf = aiModelOptProf[selMi];
-                        if (chosenProf >= 0 && chosenProf < aiProfNames.Count) {
+                        if (chosenProf >= 0 && chosenProf < aiProfiles.Count) {
                             aiProfActive = chosenProf;
                         }
                     }
-                    string chatModel = aiProfModels[aiProfActive];
+                    string chatModel = aiProfiles[aiProfActive].model;
                     if (selMi >= 0 && selMi < aiModelOpts.Count) { chatModel = aiModelOpts[selMi]; }
                     // Feed the enabled model's configured context / output limits
                     // to the agent layer, so context compaction, the usage ring
                     // and the request's max_tokens all follow this model. An
                     // unconfigured model uses the default context length.
-                    string aiLimMap = aiProfLimits[aiProfActive];
+                    string aiLimMap = aiProfiles[aiProfActive].limits;
                     int aiCtxTok = ZanIDE.AiLimitInt(aiLimMap, chatModel, "ctx");
                     if (aiCtxTok <= 0) { aiCtxTok = AiAgent.DefaultCtxTokens(); }
                     AiAgent.SetLimits(aiCtxTok,
@@ -3099,11 +3097,10 @@ partial class ZanIDE {
                     // transcript or width changed (rewrapping per frame is slow).
                     int aiTextW = aiChat.width - app.Scale(28);
                     if (aiTextW < app.Scale(20)) { aiTextW = app.Scale(20); }
-                    AiSyncReason();
                     int aiTailLen = 0;
-                    if (aiText.Count > 0) {
-                        aiTailLen = aiText[aiText.Count - 1].Length
-                            + aiReason[aiText.Count - 1].Length;
+                    if (aiMsgs.Count > 0) {
+                        aiTailLen = aiMsgs[aiMsgs.Count - 1].text.Length
+                            + aiMsgs[aiMsgs.Count - 1].reason.Length;
                     }
                     int aiToolSig = aiToolOpen.Count;
                     int aiTsi = 0;
@@ -3118,7 +3115,7 @@ partial class ZanIDE {
                         + ":" + Convert.ToString(aiThinkOpen.Get())
                         + ":" + Convert.ToString(aiToolSig);
                     string aiKeyNow = aiLayoutSig + ":"
-                        + Convert.ToString(aiRole.Count) + ":"
+                        + Convert.ToString(aiMsgs.Count) + ":"
                         + Convert.ToString(aiTailLen);
                     if (aiKeyNow != aiCacheKey) {
                         // Only the streaming (last) turn grows from frame to
@@ -3127,17 +3124,12 @@ partial class ZanIDE {
                         // cheap to stream into as an empty one -- rebuilding
                         // everything each frame is what made long chats crawl.
                         bool aiFull = aiLayoutSig != aiCacheSig
-                            || aiRole.Count < aiCacheTurns + 1
+                            || aiMsgs.Count < aiCacheTurns + 1
                             || aiCacheLines.Count < aiCachePrefix;
-                        int aiStable = aiRole.Count - 1;
+                        int aiStable = aiMsgs.Count - 1;
                         if (aiStable < 0) { aiStable = 0; }
                         if (aiFull) {
-                            aiCacheLines = new List<string>();
-                            aiCacheColors = new List<int>();
-                            aiCacheKinds = new List<int>();
-                            aiCacheMeta = new List<int>();
-        aiCacheOwner = new List<int>();
-                            aiCacheOwner = new List<int>();
+                            aiCacheLines = new List<ChatLine>();
                             aiCacheTurns = 0;
                             aiCachePrefix = 0;
                             aiCacheSig = aiLayoutSig;
@@ -3148,35 +3140,24 @@ partial class ZanIDE {
                             while (aiCacheLines.Count > aiCachePrefix) {
                                 int aiLast = aiCacheLines.Count - 1;
                                 aiCacheLines.RemoveAt(aiLast);
-                                aiCacheColors.RemoveAt(aiLast);
-                                aiCacheKinds.RemoveAt(aiLast);
-                                if (aiCacheMeta.Count > aiLast) {
-                                    aiCacheMeta.RemoveAt(aiLast);
-                                }
-                                if (aiCacheOwner.Count > aiLast) {
-                                    aiCacheOwner.RemoveAt(aiLast);
-                                }
                             }
                         }
                         if (aiCacheTurns < aiStable) {
-                            ChatArea.ChatBuildRange(app, aiRole, aiText,
-                                aiReason, aiCacheTurns, aiStable, aiTextW,
+                            ChatArea.ChatBuildRange(app, aiMsgs,
+                                aiCacheTurns, aiStable, aiTextW,
                                 aiThinkOpen.Get() == 1, aiToolOpen,
-                                aiCacheLines, aiCacheColors, aiCacheKinds,
-                                aiCacheMeta, aiCacheOwner);
+                                aiCacheLines);
                             aiCacheTurns = aiStable;
                             aiCachePrefix = aiCacheLines.Count;
                         }
-                        ChatArea.ChatBuildRange(app, aiRole, aiText, aiReason,
-                            aiStable, aiRole.Count, aiTextW,
+                        ChatArea.ChatBuildRange(app, aiMsgs,
+                            aiStable, aiMsgs.Count, aiTextW,
                             aiThinkOpen.Get() == 1, aiToolOpen,
-                            aiCacheLines, aiCacheColors, aiCacheKinds,
-                            aiCacheMeta, aiCacheOwner);
+                            aiCacheLines);
                         aiCacheKey = aiKeyNow;
                     }
                     int aiMax = ChatArea.RenderChatArea(app, aiChat,
-                        aiCacheLines, aiCacheColors, aiCacheKinds, aiCacheMeta,
-                        aiCacheOwner,
+                        aiCacheLines,
                         aiToolOpen, aiScroll.Get(), aiBusy.Get() == 1,
                         aiChatSel, true, aiThinkOpen);
                     if (aiScroll.Get() > aiMax) { aiScroll.Set(aiMax); }
@@ -3187,16 +3168,16 @@ partial class ZanIDE {
                         && Modifiers.HasCtrl(app.window.EventMods())
                         && aiChatSel.HasSelection()
                         && aiChat.Contains(app.mouseX, app.mouseY)) {
-                        Clipboard.SetText(LogView.SelectionText(aiCacheLines, aiChatSel));
+                        Clipboard.SetText(ChatArea.SelectionText(aiCacheLines, aiChatSel));
                         Layer.Msg(ZanIDE.T("Copied to clipboard", "已复制到剪贴板"), 3);
                         app.RequestRedraw();
                     }
                     // "Insert code" / "Replace file": apply the last AI code
                     // block at the editor cursor, or as the whole file.
-                    string aiCode = ZanIDE.AiLastCode(aiRole, aiText);
-                    bool aiCanApply = aiCode != "" && act >= 0 && act < tabPaths.Count
-                        && !designerMode && tabPaths[act] != ""
-                        && tabPaths[act].Substring(0, 1) != "@";
+                    string aiCode = ZanIDE.AiLastCode(aiMsgs);
+                    bool aiCanApply = aiCode != "" && act >= 0 && act < tabs.Count
+                        && !designerMode && tabs[act].path != ""
+                        && tabs[act].path.Substring(0, 1) != "@";
                     if (aiCanApply) {
                         int abW = app.Scale(110);
                         int abH = aiApplyBtn.AutoHeight(app);
@@ -3205,9 +3186,9 @@ partial class ZanIDE {
                             rBody.y + rBody.height - abH - rPad, abW);
                         if (Ui.Clicked(app, abId)) {
                             editor.InsertBlock(aiCode);
-                            tabBodies[act] = editor.GetText();
+                            tabs[act].body = editor.GetText();
                             log.Add(ZanIDE.T("> Inserted AI code into ", "> 已将 AI 代码插入 ")
-                                + tabPaths[act] + ".");
+                                + tabs[act].path + ".");
                             app.RequestRedraw();
                         }
                         int rbId = aiReplaceBtn.Render(app,
@@ -3215,9 +3196,9 @@ partial class ZanIDE {
                             rBody.y + rBody.height - abH - rPad, abW);
                         if (Ui.Clicked(app, rbId)) {
                             editor.LoadText(aiCode);
-                            tabBodies[act] = aiCode;
+                            tabs[act].body = aiCode;
                             log.Add(ZanIDE.T("> Replaced ", "> 已用 AI 代码替换 ")
-                                + tabPaths[act] + ZanIDE.T(" with AI code.", "。"));
+                                + tabs[act].path + ZanIDE.T(" with AI code.", "。"));
                             app.RequestRedraw();
                         }
                     }
@@ -3277,15 +3258,16 @@ partial class ZanIDE {
                         if (Ui.Clicked(app, rjId)) {
                             string capR = aiPendingCall;
                             aiPendingCall = "";
-                            aiRole.Add("tool");
-                            aiText.Add(AiAgent.Describe(capR) + "\n"
+                            aiMsgs.Add(AiChatMsg.Create("tool",
+                                AiAgent.Describe(capR) + "\n"
                                 + "user declined this action; do not repeat it --"
-                                + " propose an alternative or ask what to do instead.");
-                            string rerr = ZanIDE.AiLaunch(aiRole, aiText, aiRunCtxName,
-                                aiRunCtxCode, root, aiProfBases[aiProfActive],
-                                aiProfKeys[aiProfActive], aiRunModel);
+                                + " propose an alternative or ask what to do instead."));
+                            string rerr = ZanIDE.AiLaunch(aiMsgs, aiRunCtxName,
+                                aiRunCtxCode, root, aiProfiles[aiProfActive].baseUrl,
+                                aiProfiles[aiProfActive].key, aiRunModel);
                             if (rerr != "") {
-                                aiRole.Add("error"); aiText.Add(rerr); aiBusy.Set(0);
+                                aiMsgs.Add(AiChatMsg.Create("error", rerr));
+                                aiBusy.Set(0);
                             } else { aiBusy.Set(1); }
                             aiScroll.Set(0);
                             app.RequestRedraw();
@@ -3308,10 +3290,9 @@ partial class ZanIDE {
                             aiAutoCont = AiAgent.MaxContinues();
                             aiRetry = AiAgent.MaxRetries();
                             aiPendingCall = "";
-                            AiSyncReason();
-                            aiRole.Add("error");
-                            aiText.Add(ZanIDE.T("[stopped] Interrupted by you.",
-                                "[已停止] 任务被你中断。"));
+                            aiMsgs.Add(AiChatMsg.Create("error",
+                                ZanIDE.T("[stopped] Interrupted by you.",
+                                    "[已停止] 任务被你中断。")));
                             aiCacheKey = "";
                             aiCacheSig = "";
                             app.RequestRedraw();
@@ -3334,8 +3315,7 @@ partial class ZanIDE {
                         string q = AiAgent.Trim(aiInput.GetText());
                         aiInput.SetText("");
                         if (q != "") {
-                            aiRole.Add("user");
-                            aiText.Add(q);
+                            aiMsgs.Add(AiChatMsg.Create("user", q));
                             // A fresh question restarts both automatic loops.
                             aiRetry = 0;
                             aiAutoCont = 0;
@@ -3343,20 +3323,19 @@ partial class ZanIDE {
                             // help with the code actually on screen.
                             string aiCtxName = "";
                             string aiCtxCode = "";
-                            if (act >= 0 && act < tabPaths.Count && tabPaths[act] != ""
-                                && tabPaths[act].Substring(0, 1) != "@") {
-                                aiCtxName = Path.GetFileName(tabPaths[act]);
-                                if (ZanIDE.IsFormPath(tabPaths[act])) { aiCtxCode = tabBodies[act]; }
+                            if (act >= 0 && act < tabs.Count && tabs[act].body != ""
+                                && tabs[act].body.Substring(0, 1) != "@") {
+                                aiCtxName = Path.GetFileName(tabs[act].path);
+                                if (ZanIDE.IsFormPath(tabs[act].path)) { aiCtxCode = tabs[act].body; }
                                 else { aiCtxCode = editor.GetText(); }
                             }
                             aiRunModel = chatModel;
                             aiRunCtxName = aiCtxName;
                             aiRunCtxCode = aiCtxCode;
-                            string aerr = ZanIDE.AiLaunch(aiRole, aiText, aiCtxName, aiCtxCode, root,
-                                aiProfBases[aiProfActive], aiProfKeys[aiProfActive], chatModel);
+                            string aerr = ZanIDE.AiLaunch(aiMsgs, aiCtxName, aiCtxCode, root,
+                                aiProfiles[aiProfActive].baseUrl, aiProfiles[aiProfActive].key, chatModel);
                             if (aerr != "") {
-                                aiRole.Add("error");
-                                aiText.Add(aerr);
+                                aiMsgs.Add(AiChatMsg.Create("error", aerr));
                             } else {
                                 aiBusy.Set(1);
                             }
@@ -3603,7 +3582,7 @@ partial class ZanIDE {
                     if (!buildBusy) {
                         int atHr = activeTab.Get();
                         string apHr = "";
-                        if (atHr >= 0 && atHr < tabPaths.Count) { apHr = tabPaths[atHr]; }
+                        if (atHr >= 0 && atHr < tabs.Count) { apHr = tabs[atHr].path; }
                         string rpHr = ZanIDE.RibbonRunTarget(apHr, root);
                         if (rpHr != "") {
                             string bdHr = ZanIDE.EnsureBuildDir(root);
@@ -3678,8 +3657,8 @@ partial class ZanIDE {
                             } else {
                                 log.Add("> [Debug] Build succeeded.");
                                 dbg = ZanIDE.DbgBegin(root, buildTargetPath,
-                                    editor.Breakpoints(),
-                                    ZanIDE.FirstDebugLine(editor), bpCondLines, bpCondExprs, log);
+                                    ZanIDE.MergeBreakpoints(editor.Breakpoints(), bpConds),
+                                    ZanIDE.FirstDebugLine(editor), log);
                                 dbgState = ZanIDE.DbgSync(dbg, editor, log, dbgConsole);
                                 dbgExecLine = ZanIDE.DbgLine(dbg);
                                 dbgVarInfo = ZanIDE.DbgVars(dbg);
@@ -3694,6 +3673,16 @@ partial class ZanIDE {
                                 }
                             }
                         } else if (!File.Exists(buildExe)) {
+                            string missingPackage = ZanIDE.MissingPackage(bout);
+                            if (missingPackage != "") {
+                                marketplaceRetryBuild = true;
+                                if (marketplaceWin == null || !marketplaceWin.IsOpen()) {
+                                    marketplaceWin = MarketplaceWindow.Open(app, ZanIDE.uiLang);
+                                }
+                                marketplaceWin.Locate(missingPackage);
+                                log.Add(ZanIDE.T("> Missing package; opened marketplace: ",
+                                    "> 缺少库，已打开商城：") + missingPackage);
+                            }
                             log.Add(ZanIDE.T("> Build failed; not run.", "> 构建失败，未运行。"));
                         } else if (buildThenRun) {
                             // The program starts in the project root, not in the
@@ -3756,31 +3745,30 @@ partial class ZanIDE {
                                         "> [AI] 正在驱动 UI 自检..."));
                                     app.RequestAnimationFrame(120);
                                 } else {
-                                    aiRole.Add("tool");
-                                    aiText.Add("ui_check\n"
-                                        + AiAgent.BuildResult(bout, false, false));
-                                    string ube = ZanIDE.AiLaunch(aiRole, aiText,
+                                    aiMsgs.Add(AiChatMsg.Create("tool",
+                                        "ui_check\n"
+                                        + AiAgent.BuildResult(bout, false, false)));
+                                    string ube = ZanIDE.AiLaunch(aiMsgs,
                                         aiRunCtxName, aiRunCtxCode, root,
-                                        aiProfBases[aiProfActive],
-                                        aiProfKeys[aiProfActive], aiRunModel);
+                                        aiProfiles[aiProfActive].baseUrl,
+                                        aiProfiles[aiProfActive].key, aiRunModel);
                                     if (ube != "") {
-                                        aiRole.Add("error"); aiText.Add(ube);
+                                        aiMsgs.Add(AiChatMsg.Create("error", ube));
                                         aiBusy.Set(0);
                                     }
                                     aiScroll.Set(0);
                                 }
                             } else {
-                                aiRole.Add("tool");
-                                if (buildThenRun) { aiText.Add("run\n"
-                                    + AiAgent.BuildResult(bout, aiOk, true)); }
-                                else { aiText.Add("build\n"
-                                    + AiAgent.BuildResult(bout, aiOk, false)); }
-                                string aiBe = ZanIDE.AiLaunch(aiRole, aiText,
+                                string tb = "build\n";
+                                if (buildThenRun) { tb = "run\n"; }
+                                aiMsgs.Add(AiChatMsg.Create("tool",
+                                    tb + AiAgent.BuildResult(bout, aiOk, buildThenRun)));
+                                string aiBe = ZanIDE.AiLaunch(aiMsgs,
                                     aiRunCtxName, aiRunCtxCode, root,
-                                    aiProfBases[aiProfActive],
-                                    aiProfKeys[aiProfActive], aiRunModel);
+                                    aiProfiles[aiProfActive].baseUrl,
+                                    aiProfiles[aiProfActive].key, aiRunModel);
                                 if (aiBe != "") {
-                                    aiRole.Add("error"); aiText.Add(aiBe);
+                                    aiMsgs.Add(AiChatMsg.Create("error", aiBe));
                                     aiBusy.Set(0);
                                 }
                                 aiScroll.Set(0);
@@ -3810,15 +3798,15 @@ partial class ZanIDE {
                         if (File.Exists(uidP + "/regions.json")) {
                             rjson = File.ReadAllText(uidP + "/regions.json");
                         }
-                        aiRole.Add("tool");
-                        aiText.Add("ui_check\n"
-                            + AiAgent.UiResult(rlog, rjson, uiTo && !uiDone));
-                        string uce = ZanIDE.AiLaunch(aiRole, aiText,
+                        aiMsgs.Add(AiChatMsg.Create("tool",
+                            "ui_check\n"
+                            + AiAgent.UiResult(rlog, rjson, uiTo && !uiDone)));
+                        string uce = ZanIDE.AiLaunch(aiMsgs,
                             aiRunCtxName, aiRunCtxCode, root,
-                            aiProfBases[aiProfActive],
-                            aiProfKeys[aiProfActive], aiRunModel);
+                            aiProfiles[aiProfActive].baseUrl,
+                            aiProfiles[aiProfActive].key, aiRunModel);
                         if (uce != "") {
-                            aiRole.Add("error"); aiText.Add(uce);
+                            aiMsgs.Add(AiChatMsg.Create("error", uce));
                             aiBusy.Set(0);
                         }
                         aiScroll.Set(0);
@@ -3892,9 +3880,8 @@ partial class ZanIDE {
                         string sraw = AiNet.Text();
                         if (sraw.Length < aiStreamLen) {
                             if (aiStreamMsgIdx >= 0
-                                && aiStreamMsgIdx == aiText.Count - 1) {
-                                aiRole.RemoveAt(aiStreamMsgIdx);
-                                aiText.RemoveAt(aiStreamMsgIdx);
+                                && aiStreamMsgIdx == aiMsgs.Count - 1) {
+                                aiMsgs.RemoveAt(aiStreamMsgIdx);
                             }
                             aiStreamMsgIdx = 0 - 1;
                             aiStreamLen = 0;
@@ -3909,11 +3896,10 @@ partial class ZanIDE {
                             }
                             if (live != "") {
                                 if (aiStreamMsgIdx < 0) {
-                                    aiRole.Add("assistant");
-                                    aiText.Add(live);
-                                    aiStreamMsgIdx = aiText.Count - 1;
-                                } else if (aiStreamMsgIdx < aiText.Count) {
-                                    aiText[aiStreamMsgIdx] = live;
+                                    aiMsgs.Add(AiChatMsg.Create("assistant", live));
+                                    aiStreamMsgIdx = aiMsgs.Count - 1;
+                                } else if (aiStreamMsgIdx < aiMsgs.Count) {
+                                    aiMsgs[aiStreamMsgIdx].text = live;
                                 }
                                 aiScroll.Set(0);
                             }
@@ -3935,16 +3921,14 @@ partial class ZanIDE {
                     if (aiTimedOut) {
                         aiWaitStart = 0;
                         if (aiStreamMsgIdx >= 0
-                            && aiStreamMsgIdx == aiText.Count - 1) {
-                            aiRole.RemoveAt(aiStreamMsgIdx);
-                            aiText.RemoveAt(aiStreamMsgIdx);
+                            && aiStreamMsgIdx == aiMsgs.Count - 1) {
+                            aiMsgs.RemoveAt(aiStreamMsgIdx);
                         }
                         aiStreamMsgIdx = 0 - 1;
                         aiStreamLen = 0;
-                        aiRole.Add("error");
-                        aiText.Add(ZanIDE.T(
+                        aiMsgs.Add(AiChatMsg.Create("error", ZanIDE.T(
                             "[error] AI request timed out - no response received.",
-                            "[错误] AI 请求超时——未收到响应。"));
+                            "[错误] AI 请求超时——未收到响应。")));
                         aiBusy.Set(0);
                         aiScroll.Set(0);
                     } else if (aiMarker) {
@@ -3953,9 +3937,8 @@ partial class ZanIDE {
                         // Drop the live preview bubble; the final turns are added
                         // below from the fully decoded stream.
                         if (aiStreamMsgIdx >= 0
-                            && aiStreamMsgIdx == aiText.Count - 1) {
-                            aiRole.RemoveAt(aiStreamMsgIdx);
-                            aiText.RemoveAt(aiStreamMsgIdx);
+                            && aiStreamMsgIdx == aiMsgs.Count - 1) {
+                            aiMsgs.RemoveAt(aiStreamMsgIdx);
                         }
                         aiStreamMsgIdx = 0 - 1;
                         aiStreamLen = 0;
@@ -3995,10 +3978,10 @@ partial class ZanIDE {
                                 && aiRetry < AiAgent.MaxRetries();
                             if (retryable) {
                                 aiRetry = aiRetry + 1;
-                                string rle = ZanIDE.AiLaunch(aiRole, aiText,
+                                string rle = ZanIDE.AiLaunch(aiMsgs,
                                     aiRunCtxName, aiRunCtxCode, root,
-                                    aiProfBases[aiProfActive],
-                                    aiProfKeys[aiProfActive], aiRunModel);
+                                    aiProfiles[aiProfActive].baseUrl,
+                                    aiProfiles[aiProfActive].key, aiRunModel);
                                 if (rle == "") {
                                     log.Add("> 小赞: " + emsg + " - "
                                         + ZanIDE.T("retrying (", "重试中（")
@@ -4008,14 +3991,14 @@ partial class ZanIDE {
                                     Layer.Msg(ZanIDE.T("Xiao Zan request failed - retrying",
                                         "小赞请求失败——正在重试"), 3);
                                 } else {
-                                    aiRole.Add("error");
-                                    aiText.Add("[error] " + rle);
+                                    aiMsgs.Add(AiChatMsg.Create("error",
+                                        "[error] " + rle));
                                     aiBusy.Set(0);
                                 }
                             } else {
                                 aiRetry = 0;
-                                aiRole.Add("error");
-                                aiText.Add("[error] " + emsg);
+                                aiMsgs.Add(AiChatMsg.Create("error",
+                                    "[error] " + emsg));
                                 aiBusy.Set(0);
                             }
                         } else {
@@ -4027,7 +4010,7 @@ partial class ZanIDE {
                             string reply = fa.content;
                             string call = AiAgent.ToolBlock(reply);
                             bool more = call != ""
-                                && AiAgent.StepsSinceUser(aiRole) < AiAgent.MaxSteps();
+                                && AiAgent.StepsSinceUser(aiMsgs) < AiAgent.MaxSteps();
                             string said = reply;
                             if (call != "") { said = AiAgent.StripToolBlock(reply); }
                             string rz = AiAgent.Trim(fa.reasoning);
@@ -4035,12 +4018,8 @@ partial class ZanIDE {
                             // thinking worth keeping, so save the reasoning
                             // even when there is no visible text.
                             if (said != "" || rz != "") {
-                                aiRole.Add("assistant");
-                                aiText.Add(said);
-                                AiSyncReason();
-                                if (rz != "" && aiReason.Count > 0) {
-                                    aiReason[aiReason.Count - 1] = rz;
-                                }
+                                aiMsgs.Add(AiChatMsg.CreateWithReason(
+                                    "assistant", said, rz));
                             }
                             if (more) {
                                 string tname = AiAgent.ToolName(call);
@@ -4076,23 +4055,21 @@ partial class ZanIDE {
                                             && !AiAgent.AsksUser(said)));
                                 if (cont) {
                                     aiAutoCont = aiAutoCont + 1;
-                                    aiRole.Add("user");
-                                    aiText.Add(AiAgent.ContinuePrompt(limitHit));
-                                    string cle = ZanIDE.AiLaunch(aiRole, aiText,
+                                    aiMsgs.Add(AiChatMsg.Create("user",
+                                        AiAgent.ContinuePrompt(limitHit)));
+                                    string cle = ZanIDE.AiLaunch(aiMsgs,
                                         aiRunCtxName, aiRunCtxCode, root,
-                                        aiProfBases[aiProfActive],
-                                        aiProfKeys[aiProfActive], aiRunModel);
+                                        aiProfiles[aiProfActive].baseUrl,
+                                        aiProfiles[aiProfActive].key, aiRunModel);
                                     if (cle != "") {
-                                        aiRole.Add("error");
-                                        aiText.Add(cle);
+                                        aiMsgs.Add(AiChatMsg.Create("error", cle));
                                         aiBusy.Set(0);
                                     }
                                 } else {
                                     if (limitHit) {
-                                        aiRole.Add("error");
-                                        aiText.Add(ZanIDE.T(
+                                        aiMsgs.Add(AiChatMsg.Create("error", ZanIDE.T(
                                             "Tool limit reached for this question.",
-                                            "本次提问的工具调用次数已达上限。"));
+                                            "本次提问的工具调用次数已达上限。")));
                                     }
                                     aiBusy.Set(0);
                                 }
@@ -4165,7 +4142,7 @@ partial class ZanIDE {
                             lspSess = LspSession.Start(root);
                             if (lspSess != null) { log.Add("> zan-lsp connected: semantic navigation enabled."); }
                         }
-                        int gl = ZanIDE.GoToDefinitionSmart(lspSess, editor, tabNames, tabBodies, tabPaths, activeTab, root, log);
+                        int gl = ZanIDE.GoToDefinitionSmart(lspSess, editor, tabs, activeTab, root, log);
                         if (gl >= 0) { pendingGotoLine = gl; pendingGotoCol = 0; lastActive = 0 - 1; }
                         app.RequestRedraw();
                     } else if (ecmd == "findrefs") {
@@ -4174,7 +4151,7 @@ partial class ZanIDE {
                             lspSess = LspSession.Start(root);
                             if (lspSess != null) { log.Add("> zan-lsp connected: semantic navigation enabled."); }
                         }
-                        ZanIDE.FindReferencesSmart(lspSess, editor, tabNames, tabBodies, tabPaths, activeTab, root, log);
+                        ZanIDE.FindReferencesSmart(lspSess, editor, tabs, activeTab, root, log);
                         app.RequestRedraw();
                     }
                 }
@@ -4292,7 +4269,7 @@ partial class ZanIDE {
                                 bool exReal = exn.path != "" && !ZanIDE.StartsWith(exn.path, "@");
                                 if (chosen == 0) {
                                     if (exReal && !exn.isDir) {
-                                        ZanIDE.OpenPath(tabNames, tabBodies, tabPaths, activeTab, exn.path, exn.label);
+                                        ZanIDE.OpenPath(tabs, activeTab, exn.path, exn.label);
                                         log.Add("> Opened " + exn.path + ".");
                                     }
                                 } else if (chosen == 2) {
@@ -4311,13 +4288,13 @@ partial class ZanIDE {
                             if (chosen == 0) {
                                 this.RequestCloseTab(ctxTarget);
                             } else if (chosen == 1) {
-                                if (ctxTarget >= 0 && ctxTarget < tabPaths.Count) {
-                                    this.RequestCloseOthers(tabPaths[ctxTarget]);
+                                if (ctxTarget >= 0 && ctxTarget < tabs.Count) {
+                                    this.RequestCloseOthers(tabs[ctxTarget].path);
                                 }
                             } else if (chosen == 3) {
-                                if (ctxTarget >= 0 && ctxTarget < tabPaths.Count) {
-                                    Clipboard.SetText(tabPaths[ctxTarget]);
-                                    log.Add("> Copied path: " + tabPaths[ctxTarget]);
+                                if (ctxTarget >= 0 && ctxTarget < tabs.Count) {
+                                    Clipboard.SetText(tabs[ctxTarget].path);
+                                    log.Add("> Copied path: " + tabs[ctxTarget].path);
                                 }
                             }
                         } else if (ctxKind == 4) {
@@ -4326,7 +4303,7 @@ partial class ZanIDE {
                                 bool rtReal = rtrn.path != "" && !ZanIDE.StartsWith(rtrn.path, "@");
                                 if (!rtrn.isDir && rtReal) {
                                     if (chosen == 0) {
-                                        ZanIDE.OpenPath(tabNames, tabBodies, tabPaths, activeTab, rtrn.path, rtrn.label);
+                                        ZanIDE.OpenPath(tabs, activeTab, rtrn.path, rtrn.label);
                                         log.Add("> Opened " + rtrn.path + ".");
                                     } else if (chosen == 1) {
                                         string rtcT = ZanIDE.RunTarget(rtrn.path, root);
@@ -4357,7 +4334,7 @@ partial class ZanIDE {
                                 bool exrReal = exrn.path != "" && !ZanIDE.StartsWith(exrn.path, "@");
                                 if (chosen == 0) {
                                     if (!exrn.isDir && exrReal) {
-                                        ZanIDE.OpenPath(tabNames, tabBodies, tabPaths, activeTab, exrn.path, exrn.label);
+                                        ZanIDE.OpenPath(tabs, activeTab, exrn.path, exrn.label);
                                         log.Add("> Opened " + exrn.path + ".");
                                     }
                                 } else if (chosen == 2) {
@@ -4381,7 +4358,7 @@ partial class ZanIDE {
                 // publish kick-off (started once the window has closed) stays here.
                 if (pubPending && !pubBusy) {
                     pubPending = false;
-                    pubExes = ZanIDE.PublishPlatformsBegin(tabNames, tabPaths, activeTab, root, pubSel, log);
+                    pubExes = ZanIDE.PublishPlatformsBegin(tabs, activeTab, root, pubSel, log);
                     pubBusy = pubExes.Count > 0;
                     pubLogLen = 0;
                     app.RequestRedraw();
@@ -4414,6 +4391,7 @@ partial class ZanIDE {
             this.PumpPublishWindow();
             this.PumpConfigWindow();
             this.PumpAssetWindow();
+            this.PumpMarketplaceWindow();
             this.PumpSettingsWindows();
             this.PumpFilePicker();
             // Whatever those handlers opened (a window opened from a window,
@@ -4519,9 +4497,7 @@ partial class ZanIDE {
         if (haveProject) { tree = ZanIDE.ScanTree(root); }
         rescan = false;
 
-        tabNames = new List<string>();
-        tabBodies = new List<string>();
-        tabPaths = new List<string>();
+        tabs = new List<TabRecord>();
 
         activeTab = SignalInt.Create(0);
         editor = CodeEditor.Create();
@@ -4546,23 +4522,19 @@ partial class ZanIDE {
             // IDE still has to come up on its start page so the user can
             // pick another project.
             try {
-                ZanIDE.OpenFirst(tabNames, tabBodies, tabPaths, activeTab, root);
+                ZanIDE.OpenFirst(tabs, activeTab, root);
             } catch (Exception e) {
-                tabNames.Clear();
-                tabBodies.Clear();
-                tabPaths.Clear();
+                tabs.Clear();
             }
         }
         // Start page is a real tab (path sentinel "@start"), shown first like
         // VS's Start Page. Rendered specially instead of the code editor.
-        tabNames.Insert(0, "Start");
-        tabBodies.Insert(0, "");
-        tabPaths.Insert(0, "@start");
+        tabs.Insert(0, TabRecord.Create("Start", "", "@start"));
         activeTab.Set(0);
 
         // TEMP PROBE: open docs, default section.
-        tabNames.Add("Help"); tabBodies.Add(""); tabPaths.Add("@docs");
-        activeTab.Set(tabNames.Count - 1);
+        tabs.Add(TabRecord.Create("Help", "", "@docs"));
+        activeTab.Set(tabs.Count - 1);
 
         log = new List<string>();
         if (haveProject) {
@@ -4674,9 +4646,7 @@ partial class ZanIDE {
         findText = "";
         replText = "";
         // Find in Files results (project-wide, F8/Shift+F8 walk them).
-        fifPath = new List<string>();
-        fifLine = new List<string>();
-        fifText = new List<string>();
+        fifHits = new List<SearchHit>();
         fifQuery = "";
         fifRepl = "";
         fifReplFocus = false;   // Tab switches the Replace in Files field
@@ -4724,6 +4694,9 @@ partial class ZanIDE {
         cfgWin = null;
         // Asset Manager child window (browse/import/organize assets/ recursively).
         assetWin = null;
+        marketplaceWin = null;
+        marketplaceInstall = null;
+        marketplaceRetryBuild = false;
         edThemeIdx = ZanIDE.ReadEditorTheme();
         edFontPx = ZanIDE.ReadEditorFont();
         defFontPx = app.theme.fontSizeMedium;
@@ -4763,17 +4736,16 @@ partial class ZanIDE {
         dbgExecLine = -1;
         dbg = null;
         dbgConsole = new List<string>();
-        dbgVarInfo = new List<string>();
-        dbgStack = new List<string>();
+        dbgVarInfo = new List<DbgVar>();
+        dbgStack = new List<DbgFrame>();
         dbgPanelTab = SignalInt.Create(0);
-        // Conditional breakpoints: expression per 0-based line (edited via
+        // Conditional breakpoints: one entity per 0-based line (edited via
         // Ctrl+B, passed through DAP setBreakpoints as `condition`).
-        bpCondLines = new List<int>();
-        bpCondExprs = new List<string>();
+        bpConds = new List<DbgBreakpoint>();
         bpCondText = "";
         // Watch expressions, re-evaluated via DAP `evaluate` on every stop.
         dbgWatches = new List<string>();
-        dbgWatchVals = new List<string>();
+        dbgWatchVals = new List<DbgVar>();
         watchText = "";
         // Semantic language server (zan-lsp), started lazily on first
         // navigation request; falls back to text scanning when unavailable.
@@ -4882,11 +4854,10 @@ partial class ZanIDE {
         rtToolFilter = new Input(ZanIDE.T("Filter...", "筛选..."));
         rtExFilter = new Input(ZanIDE.T("Filter...", "筛选..."));
         rtCtxShow = new List<TreeNode>();
-        // Chat transcript: parallel role ("user"/"assistant"/"error") + text.
-        aiRole = new List<string>();
-        aiText = new List<string>();
-        aiPlanText = new List<string>();
-        aiPlanDone = new List<int>();
+        // Chat transcript: real message entities (role + text + reason) and
+        // the task-plan steps (text + done flag).
+        aiMsgs = new List<AiChatMsg>();
+        aiPlan = new List<AiPlanStep>();
         aiPlanCollapsed = false;
         aiScroll = SignalInt.Create(0);
         aiThinkOpen = SignalInt.Create(0);
@@ -4936,30 +4907,35 @@ partial class ZanIDE {
     void AiDispatchTool(string call) {
         string tool = AiAgent.ToolName(call);
         if (tool == "plan") {
-            aiPlanText = new List<string>();
-            aiPlanDone = new List<int>();
-            int nsteps = AiAgent.ParsePlan(call, aiPlanText, aiPlanDone);
-            aiRole.Add("tool");
-            aiText.Add(AiAgent.Describe(call) + "\nplan updated: "
-                + Convert.ToString(nsteps) + " step(s).");
-            string plerr = ZanIDE.AiLaunch(aiRole, aiText, aiRunCtxName,
-                aiRunCtxCode, root, aiProfBases[aiProfActive],
-                aiProfKeys[aiProfActive], aiRunModel);
-            if (plerr != "") { aiRole.Add("error"); aiText.Add(plerr); aiBusy.Set(0); }
+            aiPlan = new List<AiPlanStep>();
+            int nsteps = AiAgent.ParsePlan(call, aiPlan);
+            aiMsgs.Add(AiChatMsg.Create("tool",
+                AiAgent.Describe(call) + "\nplan updated: "
+                + Convert.ToString(nsteps) + " step(s)."));
+            string plerr = ZanIDE.AiLaunch(aiMsgs, aiRunCtxName,
+                aiRunCtxCode, root, aiProfiles[aiProfActive].baseUrl,
+                aiProfiles[aiProfActive].key, aiRunModel);
+            if (plerr != "") {
+                aiMsgs.Add(AiChatMsg.Create("error", plerr));
+                aiBusy.Set(0);
+            }
             return;
         }
         if (tool == "build" || tool == "run" || tool == "ui_check") {
-            string apB = ZanIDE.PathOf(tabPaths, activeTab);
+            string apB = ZanIDE.PathOf(tabs, activeTab);
             string rpB = ZanIDE.RibbonRunTarget(apB, root);
             if (rpB == "") {
-                aiRole.Add("tool");
-                aiText.Add(AiAgent.Describe(call)
+                aiMsgs.Add(AiChatMsg.Create("tool",
+                    AiAgent.Describe(call)
                     + "\nerror: no buildable/run target is selected in the IDE;"
-                    + " open a program file (with a Main) first.");
-                string e2 = ZanIDE.AiLaunch(aiRole, aiText, aiRunCtxName,
-                    aiRunCtxCode, root, aiProfBases[aiProfActive],
-                    aiProfKeys[aiProfActive], aiRunModel);
-                if (e2 != "") { aiRole.Add("error"); aiText.Add(e2); aiBusy.Set(0); }
+                    + " open a program file (with a Main) first."));
+                string e2 = ZanIDE.AiLaunch(aiMsgs, aiRunCtxName,
+                    aiRunCtxCode, root, aiProfiles[aiProfActive].baseUrl,
+                    aiProfiles[aiProfActive].key, aiRunModel);
+                if (e2 != "") {
+                    aiMsgs.Add(AiChatMsg.Create("error", e2));
+                    aiBusy.Set(0);
+                }
                 return;
             }
             if (tool == "ui_check") {
@@ -4994,14 +4970,17 @@ partial class ZanIDE {
             return;
         }
         string result = AiAgent.Run(root, call);
-        aiRole.Add("tool");
-        aiText.Add(AiAgent.Describe(call) + "\n" + result);
+        aiMsgs.Add(AiChatMsg.Create("tool",
+            AiAgent.Describe(call) + "\n" + result));
         // A write may touch a file open in a tab; the disk-change poll picks
         // that up and offers a reload, so the editor and disk stay in sync.
-        string terr = ZanIDE.AiLaunch(aiRole, aiText, aiRunCtxName,
-            aiRunCtxCode, root, aiProfBases[aiProfActive],
-            aiProfKeys[aiProfActive], aiRunModel);
-        if (terr != "") { aiRole.Add("error"); aiText.Add(terr); aiBusy.Set(0); }
+        string terr = ZanIDE.AiLaunch(aiMsgs, aiRunCtxName,
+            aiRunCtxCode, root, aiProfiles[aiProfActive].baseUrl,
+            aiProfiles[aiProfActive].key, aiRunModel);
+        if (terr != "") {
+            aiMsgs.Add(AiChatMsg.Create("error", terr));
+            aiBusy.Set(0);
+        }
     }
 
     /// Clears everything the assistant carries between turns of ONE chat:
@@ -5018,17 +4997,6 @@ partial class ZanIDE {
         aiPendingCall = "";
     }
 
-    /// F: keeps aiReason the same length as aiRole -- padding new turns with ""
-    /// and dropping any trailing entries left over after the live-preview turn
-    /// is removed or a session is switched. Reasoning is only ever set on the
-    /// last (just-added) assistant turn, so padding at the end stays aligned.
-    void AiSyncReason() {
-        while (aiReason.Count < aiRole.Count) { aiReason.Add(""); }
-        while (aiReason.Count > aiRole.Count) {
-            aiReason.RemoveAt(aiReason.Count - 1);
-        }
-    }
-
     /// D: a small ring at the top-right of the AI panel showing how full the
     /// running transcript is against the compaction budget, with a hover
     /// tooltip that breaks down the last reply's token usage.
@@ -5036,7 +5004,7 @@ partial class ZanIDE {
         Theme t = app.theme;
         Canvas c = app.canvas;
         if (r < app.Scale(5)) { return; }
-        int used = AiAgent.ContextChars(aiText);
+        int used = AiAgent.ContextChars(aiMsgs);
         int budget = AiAgent.MaxContextChars();
         int pct = 0;
         if (budget > 0) { pct = used * 100 / budget; }
@@ -5102,7 +5070,7 @@ partial class ZanIDE {
         int lh = Canvas.FontHeight(fs) + app.Scale(7);
         int pad = app.Scale(12);
         int w = app.Scale(330);
-        int used = AiAgent.ContextChars(aiText);
+        int used = AiAgent.ContextChars(aiMsgs);
         int budget = AiAgent.MaxContextChars();
         int pct = 0;
         if (budget > 0) { pct = used * 100 / budget; }
@@ -5237,8 +5205,8 @@ partial class ZanIDE {
     /// turn halfway down the checklist.
     bool AiPlanUnfinished() {
         int i = 0;
-        while (i < aiPlanDone.Count) {
-            if (aiPlanDone[i] == 0) { return true; }
+        while (i < aiPlan.Count) {
+            if (aiPlan[i].done == 0) { return true; }
             i = i + 1;
         }
         return false;
@@ -5249,10 +5217,10 @@ partial class ZanIDE {
     /// session switching and context compaction (it lives in the session
     /// record, not the transcript).
     int AiPlanHeight(App app) {
-        if (aiPlanText.Count == 0) { return 0; }
+        if (aiPlan.Count == 0) { return 0; }
         int hdr = app.Scale(24);
         if (aiPlanCollapsed) { return hdr; }
-        int rows = aiPlanText.Count;
+        int rows = aiPlan.Count;
         if (rows > 8) { rows = 8; }
         return hdr + rows * app.Scale(20) + app.Scale(6);
     }
@@ -5269,14 +5237,14 @@ partial class ZanIDE {
         // header sits on the same surface as the checklist rows.
         int done = 0;
         int di = 0;
-        while (di < aiPlanDone.Count) {
-            if (aiPlanDone[di] != 0) { done = done + 1; }
+        while (di < aiPlan.Count) {
+            if (aiPlan[di].done != 0) { done = done + 1; }
             di = di + 1;
         }
         string caret = "v ";
         if (aiPlanCollapsed) { caret = "> "; }
         string title = caret + ZanIDE.T("Plan", "任务计划") + " "
-            + Convert.ToString(done) + "/" + Convert.ToString(aiPlanText.Count);
+            + Convert.ToString(done) + "/" + Convert.ToString(aiPlan.Count);
         c.DrawText(area.x + pad, area.y + app.Scale(5), title, t.textPrimary,
             Style.Of(app, "label", "small", Style.SNormal())
                 .FontOr(app.theme.fontSizeSmall));
@@ -5292,8 +5260,7 @@ partial class ZanIDE {
             app.RequestRedraw();
         }
         if (clrClicked) {
-            aiPlanText = new List<string>();
-            aiPlanDone = new List<int>();
+            aiPlan = new List<AiPlanStep>();
             app.RequestRedraw();
             return;
         }
@@ -5303,12 +5270,12 @@ partial class ZanIDE {
         int box = app.Scale(12);
         c.PushClip(area.x, area.y + hdr, area.width, area.height - hdr);
         int idx = 0;
-        while (idx < aiPlanText.Count) {
+        while (idx < aiPlan.Count) {
             int ry = area.y + hdr + idx * rowH;
             if (ry + rowH > area.y + area.height) { break; }
             int bx = area.x + pad;
             int by = ry + (rowH - box) / 2;
-            bool dn = idx < aiPlanDone.Count && aiPlanDone[idx] != 0;
+            bool dn = aiPlan[idx].done != 0;
             // The checkbox box comes from the framework's own Checkbox part, so
             // every inline check reads exactly like the real control.
             int level = 0;
@@ -5316,14 +5283,13 @@ partial class ZanIDE {
             Checkbox.PaintBox(app, bx, by, box, level, t.success, t.borderPrimary);
             int col = t.textPrimary;
             if (dn) { col = t.textTertiary; }
-            c.DrawText(bx + box + pad, ry + app.Scale(3), aiPlanText[idx], col,
+            c.DrawText(bx + box + pad, ry + app.Scale(3), aiPlan[idx].text, col,
                 Style.Of(app, "label", "small", Style.SNormal())
                     .FontOr(app.theme.fontSizeSmall));
             Rect rowHit = Rect.Create(area.x, ry, area.width, rowH);
-            if (app.ClickAvailable() && rowHit.Contains(app.mouseX, app.mouseY)
-                && idx < aiPlanDone.Count) {
-                if (aiPlanDone[idx] != 0) { aiPlanDone[idx] = 0; }
-                else { aiPlanDone[idx] = 1; }
+            if (app.ClickAvailable() && rowHit.Contains(app.mouseX, app.mouseY)) {
+                if (aiPlan[idx].done != 0) { aiPlan[idx].done = 0; }
+                else { aiPlan[idx].done = 1; }
                 app.ClaimClick();
                 app.RequestRedraw();
             }
@@ -5336,16 +5302,8 @@ partial class ZanIDE {
     /// in-flight request flags.
     void InitAiState() {
         // ---- AI provider profiles (ai_profiles.json) ----
-        // Parallel lists: profile name / base URL / API key / default model /
-        // `;`-joined fetched model ids. `aiProfActive` is the enabled profile.
-        aiProfNames = new List<string>();
-        aiProfBases = new List<string>();
-        aiProfKeys = new List<string>();
-        aiProfModels = new List<string>();
-        aiProfLists = new List<string>();
-        aiProfLimits = new List<string>();
-        aiProfActive = ZanIDE.AiProfilesLoad(aiProfNames, aiProfBases,
-            aiProfKeys, aiProfModels, aiProfLists, aiProfLimits);
+        aiProfiles = new List<AiProfile>();
+        aiProfActive = ZanIDE.AiProfilesLoad(aiProfiles);
         // The unified AI configuration lives in its own child window
         // (AiSettingsWindow, UiDoc-based like the editor settings).
         aiWindow = null;
@@ -5358,11 +5316,10 @@ partial class ZanIDE {
         aiModelSelSig = "";
         aiCfgBtn = new Button { Text = ZanIDE.T("Config", "配置"), Class = "small" };
         // Chat sessions: switch / new / clear the transcript context. Inactive
-        // sessions are kept serialized in `aiSessions` (\u0002-joined records).
-        aiSessions = new List<string>();
-        aiSessArch = new List<int>();
+        // sessions are kept serialized in `aiSessions` (ChatPack JSON).
+        aiSessions = new List<AiSession>();
         aiSessCur = 0;
-        aiSessions.Add("");
+        aiSessions.Add(AiSession.Create("", 0));
         // Restore sessions persisted on disk so a restart continues the last
         // conversation instead of starting from an empty chat.
         LoadAiSessions();
@@ -5383,16 +5340,11 @@ partial class ZanIDE {
                 ZanIDE.T("Archived", "已归档"));
         // Chat transcript wrapped-line cache (rebuilt only when the transcript,
         // width or theme changes — rewrapping every frame is too slow).
-        aiCacheLines = new List<string>();
-        aiCacheColors = new List<int>();
-        aiCacheKinds = new List<int>();
-        aiCacheMeta = new List<int>();
-        aiCacheOwner = new List<int>();
+        aiCacheLines = new List<ChatLine>();
         aiToolOpen = new List<int>();
         aiCacheKey = "";
         aiCacheSig = "";
         aiChatSel = LogState.Create();
-        aiReason = new List<string>();
         aiTokPrompt = 0;
         aiTokCompletion = 0;
         aiTokTotal = 0;
@@ -5510,32 +5462,26 @@ partial class ZanIDE {
 
     /// Closes the tab at `idx`, falling back to the Start tab if it was the
     /// last one open, and clamping the active index.
-    static void CloseTabAt(List<string> names, List<string> bodies,
-            List<string> paths, SignalInt active, int idx) {
-        if (idx < 0 || idx >= names.Count) { return; }
-        names.RemoveAt(idx);
-        bodies.RemoveAt(idx);
-        paths.RemoveAt(idx);
-        if (names.Count == 0) {
-            names.Add("Start"); bodies.Add(""); paths.Add("@start");
+    static void CloseTabAt(List<TabRecord> tabs, SignalInt active, int idx) {
+        if (idx < 0 || idx >= tabs.Count) { return; }
+        tabs.RemoveAt(idx);
+        if (tabs.Count == 0) {
+            tabs.Add(TabRecord.Create("Start", "", "@start"));
         }
         int a = active.Get();
         if (a > idx) { a = a - 1; }
-        if (a >= names.Count) { a = names.Count - 1; }
+        if (a >= tabs.Count) { a = tabs.Count - 1; }
         if (a < 0) { a = 0; }
         active.Set(a);
     }
 
     /// Closes every tab except the one at `idx`, which becomes active.
-    static void CloseOtherTabs(List<string> names, List<string> bodies,
-            List<string> paths, SignalInt active, int idx) {
-        if (idx < 0 || idx >= names.Count) { return; }
-        int k = names.Count - 1;
+    static void CloseOtherTabs(List<TabRecord> tabs, SignalInt active, int idx) {
+        if (idx < 0 || idx >= tabs.Count) { return; }
+        int k = tabs.Count - 1;
         while (k >= 0) {
             if (k != idx) {
-                names.RemoveAt(k);
-                bodies.RemoveAt(k);
-                paths.RemoveAt(k);
+                tabs.RemoveAt(k);
             }
             k = k - 1;
         }

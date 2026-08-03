@@ -83,10 +83,20 @@
 | 20 | `System.ServiceProcess` | `stdlib/System/ServiceProcess/ServiceProcess.zan` | `win_serviceprocess_smoke` |
 | 21 | `System.Management.TaskScheduler` | `stdlib/System/Management/TaskScheduler.zan` | `win_taskscheduler_smoke` |
 | 12 | `System.Automation.Window` | `stdlib/System/Automation/Window.zan` | `win_automation_smoke` |
+| 13 | `System.Automation.UiElement` | `stdlib/System/Automation/UiElement.zan` | `win_uielement_smoke` |
 | 23 | `System.IO.Compression` | `stdlib/System/IO/Compression/{Deflate,Crc32,GZip,Zip,Tar}.zan` | `win_compression_smoke` |
 | 33 | `System.Guid` | `stdlib/System/Guid.zan` | `guid_*` |
 | 36 | `Stopwatch` | `stdlib/System/Diagnostics/Stopwatch.zan` | `stopwatch_*` |
 | 37 | `System.Globalization.Lunar` | `stdlib/System/Globalization/Lunar.zan` | `lunar_*` |
+| 17 | `System.Windows.Clipboard` | `stdlib/System/Windows/Clipboard/Clipboard.zan` | `clipboard_roundtrip` |
+| 22 | `System.IO.DirectoryWatcher` | `stdlib/System/IO/DirectoryWatcher.zan` | `dir_watcher` |
+| 24~29 | `System.IO` 实用工具 | `stdlib/System/IO/{IniFile,Shortcut,KnownFolders,PathEx,FileInfoEx,MemoryMappedFile}.zan` | `ini_csv_roundtrip` / `shortcut_roundtrip` / `known_folders` / `path_ex` / `fileinfoex_mmap` |
+| 30~32 | `Csv` / `Template` / `TextTable` | `stdlib/System/Text/{Csv,Template,TextTable}.zan` | `ini_csv_roundtrip` / `text_template` |
+| 34+35 | `Pinyin` / `FuzzyMatching` / `Bm25Index` | `stdlib/System/Text/{Pinyin,FuzzyMatching,Bm25Index}.zan` | `tryget_pinyin` / `fuzzy_bm25` |
+| 可选 | `Ping` / `NetworkInterface` | `stdlib/System/Net/{Ping,NetworkInterface}.zan` | `win_ping_network` |
+| 可选 | `System.Drawing.Printing` / `System.Management.Device` | `stdlib/System/Drawing/Printing/Printing.zan` / `stdlib/System/Management/Device.zan` | `win_printing_smoke` / `win_device_smoke` |
+| 可选 | `Otp` / `Jwt` | `stdlib/System/Security/Cryptography/{Otp,Jwt}.zan` | `otp_vectors` / `jwt_hs256` / `jwt_rs256` |
+| 可选 | `System.Net.WebDav` / `System.Text.Markdown` | `stdlib/System/Net/WebDav/WebDavClient.zan` / `stdlib/System/Text/Markdown.zan` | `webdav_parse` / `markdown_parse` |
 
 实现要点（记录在案，供后续条目复用）：
 
@@ -163,16 +173,15 @@
 | 36 | `System.Diagnostics.Stopwatch` + `System.Threading.Timer` | `time\performance.aardio`、`time\timer.aardio` | 高精度计时（QueryPerformanceCounter）、周期定时器 | S |
 | 37 | `System.Globalization.Lunar` | `time\lunar.aardio`、`time\ganzhi.aardio`、`time\festival.aardio` | 农历、干支、节气、节假日（国内业务常用） | M |
 
-### 可选 / 低优先
+### 可选 / 低优先（已完成）
 
-- `icmp\ping.aardio`、`icmp\tracert.aardio` → `System.Net.Ping`（S）。
-- `inet\adapter.aardio`、`sys\networkCards.aardio` → `System.Net.NetworkInterface`（网卡枚举、MAC、IP）（M）。
-- `sys\printer.aardio` → `System.Drawing.Printing`（打印机枚举与打印）（L）。
-- `sys\device.aardio` → 设备管理（SetupAPI 枚举）（L）。
-- `crypt\otp.aardio` → `System.Security.Cryptography.Otp`（TOTP/HOTP）（S）。
-- `crypt\jwt/jws/jwk` → `System.Security.Cryptography.Jwt`（M，Zan 已有 RSA/SHA 基础）。
-- `web\dav\*` → WebDAV 客户端/服务端（L）。
-- `string\markdown\_.aardio` → Markdown 解析（IDE 聊天渲染可复用）（M）。
+- `icmp\ping.aardio` → `System.Net.Ping`；`inet\adapter.aardio` → `System.Net.NetworkInterface`。
+- `sys\printer.aardio` → `System.Drawing.Printing`（枚举、默认打印机、RAW 文档）。
+- `sys\device.aardio` → `System.Management.Device`（SetupAPI 只读枚举）。
+- `crypt\otp.aardio` → `System.Security.Cryptography.Otp`（RFC 4226/6238）。
+- `crypt\jwt/jws/jwk` → `System.Security.Cryptography.Jwt`（HS256/RS256、claims 校验）。
+- `web\dav\*` → `System.Net.WebDav` 客户端（PROPFIND/MKCOL/GET/PUT/DELETE/COPY/MOVE）。
+- `string\markdown\_.aardio` → `System.Text.Markdown`（安全紧凑 HTML 输出）。
 
 ---
 

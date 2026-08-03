@@ -63,13 +63,22 @@ class RedisClient {
     /// <summary>Connects to a Redis server, suspending on the IO reactor until
     /// the (non-blocking) connection is established.</summary>
     static async RedisClient ConnectAsync(string host, int port) {
+        return await RedisClient.ConnectAsync(host, port, 0);
+    }
+
+    static async RedisClient ConnectAsync(string host, int port, int timeoutMs) {
         Socket.Initialize();
         RedisClient c = new RedisClient();
         c.host = host;
         c.port = port;
         c.sock = Socket.CreateTcp();
         Socket.SetNonBlocking(c.sock);
-        await Socket.ConnectAsync(c.sock, host, port);
+        int err = await Socket.ConnectAsync(c.sock, host, port, timeoutMs);
+        if (err != 0) {
+            Socket.Close(c.sock);
+            c.sock = -1;
+            return null;
+        }
         c.connected = true;
         c.incap = 16384;
         c.inbuf = new byte[c.incap + 1];
@@ -135,6 +144,7 @@ class RedisClient {
     async int fillMore() {
         int n = await Socket.RecvIntoAsync(this.sock, this.tmp, this.tmpcap);
         if (n <= 0) {
+            this.Close();
             return 0;
         }
         this.ensureRoom(n);
@@ -230,6 +240,11 @@ class RedisClient {
                 return r;
             }
             string data = await this.readBulk(blen);
+            if (data == null) {
+                r.kind = RedisReply.ERROR;
+                r.str = "connection closed";
+                return r;
+            }
             r.kind = RedisReply.BULK;
             r.str = data;
             r.len = blen;
@@ -253,6 +268,7 @@ class RedisClient {
         }
         r.kind = RedisReply.ERROR;
         r.str = "protocol error: " + line;
+        this.Close();
         return r;
     }
 
@@ -274,14 +290,23 @@ class RedisClient {
             i = i + 1;
         }
         string payload = sb.ToString();
-        int sent = await Socket.SendAsync(this.sock, payload, (int)strlen(payload));
+        int expected = (int)strlen(payload);
+        int sent = await Socket.SendAsync(this.sock, payload, expected);
+        if (sent != expected) { this.Close(); }
         return sent;
     }
 
     /// <summary>Sends a command (argument vector) and awaits its reply.</summary>
     async RedisReply CommandAsync(List<string> args) {
-        int _s = await this.sendArgs(args);
-        RedisReply r = await this.readReply();
+        int sent = await this.sendArgs(args);
+        RedisReply r = new RedisReply();
+        if (!this.connected || sent <= 0) {
+            r.kind = RedisReply.ERROR;
+            r.str = "connection closed";
+            this.lastError = r.str;
+            return r;
+        }
+        r = await this.readReply();
         if (r.IsError()) {
             this.lastError = r.str;
         }

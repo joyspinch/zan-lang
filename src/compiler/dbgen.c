@@ -175,6 +175,12 @@ static zan_istr_t dg_table_of(zan_ast_node_t *unit, zan_istr_t cls) {
     return n.len ? n : cls;
 }
 
+static bool dg_is_table_entity(zan_ast_node_t *unit, zan_istr_t cls) {
+    zan_ast_node_t *decl = dg_find_class(unit, cls);
+    return dg_attr(decl, "Table") != NULL;
+}
+
+
 static bool dg_attr_bool(zan_ast_node_t *attr, const char *key, bool dflt) {
     zan_ast_node_t *v = dg_attr_arg(attr, key);
     if (!v || v->kind != AST_BOOL_LITERAL) return dflt;
@@ -262,6 +268,7 @@ typedef struct {
     zan_diag_t *diag;
     dg_need_t need;
     bool any;
+    bool sync_all;
 } dg_ctx_t;
 
 /* ---- AST node builders ---- */
@@ -974,6 +981,19 @@ static void dg_rewrite_sync(dg_ctx_t *c, zan_ast_node_t *call,
     zan_ast_list_push(&call->call.args, recv, c->arena);
 }
 
+/* `db.SyncStructureAll()` -> `__DbBind.SyncAll(db)`. Every class carrying a
+ * [Table] attribute is included by the generated binder. */
+static void dg_rewrite_sync_all(dg_ctx_t *c, zan_ast_node_t *call) {
+    c->any = true;
+    zan_ast_node_t *callee = call->call.callee;
+    zan_ast_node_t *recv = callee->member.object;
+    callee->member.object = nb_ident(c, call->loc, "__DbBind");
+    callee->member.name = dg_istr(c, "SyncAll", 7);
+    call->call.type_args.count = 0;
+    zan_ast_list_init(&call->call.args);
+    zan_ast_list_push(&call->call.args, recv, c->arena);
+}
+
 static void dg_rewrite_orderby(dg_ctx_t *c, zan_ast_node_t *call,
                                zan_istr_t cls, bool desc) {
     zan_ast_node_t *lambda = call->call.args.items[0];
@@ -1049,6 +1069,13 @@ static void dg_visit_call(dg_ctx_t *c, zan_ast_node_t *e) {
     zan_istr_t cls;
     dg_ck_t rk = CK_NONE;
     bool sync = false;
+    if (e->call.callee && e->call.callee->kind == AST_MEMBER_ACCESS
+        && istr_is(e->call.callee->member.name, "SyncStructureAll")
+        && e->call.type_args.count == 0 && e->call.args.count == 0) {
+        c->sync_all = true;
+        dg_rewrite_sync_all(c, e);
+        return;
+    }
     if (dg_is_root(c, e, &cls, &rk, &sync)) {
         if (sync) dg_rewrite_sync(c, e, cls);
         else dg_rewrite_root(c, e, cls,
@@ -2107,6 +2134,15 @@ void zan_dbgen_run(zan_ast_node_t *unit, zan_arena_t *arena,
 
     if (!c.any || zan_diag_has_errors(diag)) return;
 
+    if (c.sync_all) {
+        for (int i = 0; i < unit->comp_unit.decls.count; i++) {
+            zan_ast_node_t *d = unit->comp_unit.decls.items[i];
+            if (d->kind == AST_CLASS_DECL && dg_is_table_entity(unit, d->type_decl.name)) {
+                dg_need_add(&c.need, d->type_decl.name);
+            }
+        }
+    }
+
     /* Entities first: generating one may pull navigation entities into the
      * worklist, and __DbBind needs an entry for every entity in it. */
     dg_buf_t ents;
@@ -2150,6 +2186,14 @@ void zan_dbgen_run(zan_ast_node_t *unit, zan_arena_t *arena,
             L, S, L, S, L, S, L, S, L, S, L, S, L, S, L, S, L, S, L, S,
             L, S, L, S, L, S, L, S, L, S, L, S, L, S, L, S, L, S, L, S,
             L, S, L, S);
+    }
+    if (c.sync_all) {
+        dg_putf(&out, "    static void SyncAll(IDbExecutor db) {\n");
+        for (int i = 0; i < c.need.count; i++) {
+            zan_istr_t cls = c.need.names[i];
+            dg_putf(&out, "        CF_%.*s(db);\n", (int)cls.len, cls.str);
+        }
+        dg_putf(&out, "    }\n");
     }
     dg_putf(&out,
         "    static string M(int n) {\n"

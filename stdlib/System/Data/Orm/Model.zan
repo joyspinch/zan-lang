@@ -148,7 +148,7 @@ class Model {
             qb.Set(key, val);
             i = i + 1;
         }
-        return db.Execute(qb.BuildInsert());
+        return db.Execute(qb.BuildInsertParams(), qb.InsertParams());
     }
 
     /// <summary>Inserts a row (wrapper).</summary>
@@ -596,18 +596,12 @@ class ModelRow {
 class ModelQuery {
     IDbExecutor db;
     string tableName;
-    string whereClause;
-    string orderByClause;
-    int limitVal;
-    int offsetVal;
+    QueryBuilder qb;
 
     ModelQuery(IDbExecutor db, string tableName) {
         this.db = db;
         this.tableName = tableName;
-        this.whereClause = "";
-        this.orderByClause = "";
-        this.limitVal = -1;
-        this.offsetVal = -1;
+        this.qb = QueryBuilder.From(tableName);
     }
 
     static ModelQuery NewSelect(IDbExecutor db, string tableName) {
@@ -615,60 +609,43 @@ class ModelQuery {
     }
 
     ModelQuery Where(string condition) {
-        if (this.whereClause.Length == 0) {
-            this.whereClause = condition;
-        } else {
-            this.whereClause = this.whereClause + " AND " + condition;
-        }
+        this.qb.Where(condition);
         return this;
     }
 
     ModelQuery WhereEq(string column, string val) {
-        return Where(QueryBuilder.RequireIdent(column) + " = '" + QueryBuilder.EscapeString(val) + "'");
+        this.qb.WhereEq(column, val);
+        return this;
+    }
+
+    ModelQuery WhereEqInt(string column, int val) {
+        this.qb.WhereEqInt(column, val);
+        return this;
     }
 
     ModelQuery OrderBy(string column) {
-        this.orderByClause = QueryBuilder.RequireIdent(column);
+        this.qb.OrderBy(column);
         return this;
     }
 
     ModelQuery OrderByDesc(string column) {
-        this.orderByClause = QueryBuilder.RequireIdent(column) + " DESC";
+        this.qb.OrderByDesc(column);
         return this;
     }
 
     ModelQuery Limit(int count) {
-        this.limitVal = count;
+        this.qb.Limit(count);
         return this;
     }
 
     ModelQuery Offset(int count) {
-        this.offsetVal = count;
+        this.qb.Offset(count);
         return this;
     }
 
     /// <summary>Executes the query and returns a list of ModelRows.</summary>
     List<ModelRow> Execute() {
-        StringBuilder sb = new StringBuilder();
-        sb.Append("SELECT * FROM ");
-        sb.Append(this.tableName);
-        if (this.whereClause.Length > 0) {
-            sb.Append(" WHERE ");
-            sb.Append(this.whereClause);
-        }
-        if (this.orderByClause.Length > 0) {
-            sb.Append(" ORDER BY ");
-            sb.Append(this.orderByClause);
-        }
-        if (this.limitVal >= 0) {
-            sb.Append(" LIMIT ");
-            sb.Append(Convert.ToString(this.limitVal));
-        }
-        if (this.offsetVal >= 0) {
-            sb.Append(" OFFSET ");
-            sb.Append(Convert.ToString(this.offsetVal));
-        }
-        DbResult result = this.db.Query(sb.ToString());
+        DbResult result = this.db.Query(this.qb.BuildSelectParams("*"), this.qb.SelectParams());
         return ModelRow.FromDbResultAll(result);
     }
 
@@ -679,7 +656,7 @@ class ModelQuery {
 
     /// <summary>Returns the first result or an empty row.</summary>
     ModelRow First() {
-        this.limitVal = 1;
+        this.qb.Limit(1);
         List<ModelRow> rows = Execute();
         if (rows.Count > 0) {
             return rows[0];
@@ -689,14 +666,8 @@ class ModelQuery {
 
     /// <summary>Returns the count matching the query.</summary>
     int Count() {
-        StringBuilder sb = new StringBuilder();
-        sb.Append("SELECT COUNT(*) FROM ");
-        sb.Append(this.tableName);
-        if (this.whereClause.Length > 0) {
-            sb.Append(" WHERE ");
-            sb.Append(this.whereClause);
-        }
-        string result = this.db.ExecuteScalar(sb.ToString());
+        string result = this.db.ExecuteScalar(
+            this.qb.BuildSelectParams("COUNT(*)"), this.qb.SelectParams());
         return Convert.ToInt(result);
     }
 }
@@ -739,7 +710,7 @@ class ModelUpdate {
 
     /// <summary>Executes the UPDATE and returns affected row count.</summary>
     int Execute() {
-        return this.db.Execute(this.qb.BuildUpdate());
+        return this.db.Execute(this.qb.BuildUpdateParams(), this.qb.UpdateParams());
     }
 
     int ExecuteAsync() {
@@ -775,7 +746,7 @@ class ModelDelete {
 
     /// <summary>Executes the DELETE and returns affected row count.</summary>
     int Execute() {
-        return this.db.Execute(this.qb.BuildDelete());
+        return this.db.Execute(this.qb.BuildDeleteParams(), this.qb.SelectParams());
     }
 
     int ExecuteAsync() {
@@ -812,9 +783,17 @@ class Migration {
         db.Execute(this.downSql);
     }
 
-    /// <summary>Ensures the migration tracking table exists.</summary>
+    /// <summary>Ensures the migration tracking table exists. SQLite can key on
+    /// TEXT; MySQL/MariaDB forbid TEXT in a key without a length prefix, so they
+    /// use VARCHAR(255).</summary>
     static void EnsureTable(IDbExecutor db) {
-        db.Execute("CREATE TABLE IF NOT EXISTS _migrations (name TEXT PRIMARY KEY, applied_at TEXT)");
+        int p = db.GetProvider();
+        if (p == DbProvider.MySQL || p == DbProvider.MariaDB) {
+            db.Execute("CREATE TABLE IF NOT EXISTS _migrations "
+                + "(name VARCHAR(255) PRIMARY KEY, applied_at VARCHAR(64))");
+        } else {
+            db.Execute("CREATE TABLE IF NOT EXISTS _migrations (name TEXT PRIMARY KEY, applied_at TEXT)");
+        }
     }
 
     /// <summary>Checks if a migration has been applied.</summary>

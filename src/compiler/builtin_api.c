@@ -14,7 +14,7 @@
 static const zan_builtin_member_t members_string[] = {
     { "Length",      'P', "int Length" },
     { "Substring",   'M', "string Substring(int start[, int length])" },
-    { "IndexOf",     'M', "int IndexOf(string needle)" },
+    { "IndexOf",     'M', "int IndexOf(string needle[, int startIndex])" },
     { "LastIndexOf", 'M', "int LastIndexOf(string needle)" },
     { "Contains",    'M', "bool Contains(string needle)" },
     { "StartsWith",  'M', "bool StartsWith(string prefix)" },

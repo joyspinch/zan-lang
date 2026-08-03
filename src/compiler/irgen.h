@@ -360,6 +360,7 @@ struct zan_irgen {
     LLVMValueRef rt_io_pump_timeout;      /* i32 zan_io_pump_timeout(i64 timeout_ms) */
     LLVMTypeRef  rt_io_pump_timeout_type;
     bool         uses_socket_async; /* set when a socket await is lowered */
+    bool         uses_timer_runtime; /* set by Timer API externs */
     bool         uses_sync_runtime; /* set by AtomicInt/SharedTable externs */
     bool         uses_embed_api;    /* set by zan_embed_* extern references */
     /* goto/label support: label blocks keyed by (function, name), created on

@@ -143,6 +143,30 @@ class BigSeriesSource : ChartSource {
     void Roll() { this.off = this.off + 1; }
 }
 
+/// One rendered navigation row: category headers and component entries share
+/// one entity, so the list does not need a sentinel component index.
+class GalleryNavRow {
+    bool header;
+    int compIndex;
+    string text;
+
+    static GalleryNavRow Header(string text) {
+        GalleryNavRow row = new GalleryNavRow();
+        row.header = true;
+        row.compIndex = 0;
+        row.text = text;
+        return row;
+    }
+
+    static GalleryNavRow Component(int compIndex, string text) {
+        GalleryNavRow row = new GalleryNavRow();
+        row.header = false;
+        row.compIndex = compIndex;
+        row.text = text;
+        return row;
+    }
+}
+
 /// One catalog entry: which category it belongs to, its display name, a short
 /// description, and the code snippet shown (and copied) in the detail pane.
 class Comp {
@@ -239,6 +263,20 @@ class ApiRow {
     }
 }
 
+class CodeDisplayLine {
+    string text;
+    int lineNo;
+    List<CodeSpan> spans;
+
+    static CodeDisplayLine Create(string text, int lineNo, List<CodeSpan> spans) {
+        CodeDisplayLine line = new CodeDisplayLine();
+        line.text = text;
+        line.lineNo = lineNo;
+        line.spans = spans;
+        return line;
+    }
+}
+
 /// One demo card on a component page: a titled block with its own description,
 /// a live preview (keyed by previewId), and its own Zan / JSON snippets.
 class Demo {
@@ -262,18 +300,12 @@ class Demo {
     // yet they were recomputed every frame. Memoise them here and only rebuild
     // when one of those inputs changes (window resize, DPI/theme, tab switch).
     // Demo objects are retained in Comp.demos, so the cache survives frames.
-    // Highlight spans are stored flat (segText/segColor across all lines, with
-    // segPerLine giving each line's span count) to avoid nested generics.
+    // Each display line owns its wrapped text, source line number and colored
+    // spans, so rendering cannot desynchronise parallel cache indexes.
     string cacheSig;
     string cacheSrc;
     List<string> cacheDescLines;
-    List<string> cacheCodeLines;
-    List<string> cacheSegText;
-    List<int> cacheSegColor;
-    List<int> cacheSegPerLine;
-    // Real source-line number for each (possibly wrapped) display line, or 0 for
-    // a soft-wrap continuation row so the gutter only numbers real lines.
-    List<int> cacheLineNo;
+    List<CodeDisplayLine> cacheDisplayLines;
     // Gutter width chosen in EnsureCache (from the source line count) so the
     // wrap width and the render pass agree on where text starts.
     int cacheGutterW;
@@ -312,11 +344,7 @@ class Demo {
         }
         cacheSrc = src;
         List<string> srcLines = CodeEditor.SplitLines(src);
-        cacheCodeLines = new List<string>();
-        cacheSegText = new List<string>();
-        cacheSegColor = new List<int>();
-        cacheSegPerLine = new List<int>();
-        cacheLineNo = new List<int>();
+        cacheDisplayLines = new List<CodeDisplayLine>();
 
         int gnW = Canvas.MeasureText(Convert.ToString(srcLines.Count), fs);
         cacheGutterW = gnW + app.Scale(20);
@@ -328,31 +356,29 @@ class Demo {
 
         int ci = 0;
         while (ci < srcLines.Count) {
-            List<string> segT = new List<string>();
-            List<int> segC = new List<int>();
+            List<CodeSpan> spans = new List<CodeSpan>();
             CodeEditor.HighlightSpans(srcLines[ci], t.info, t.success,
-                t.warning, t.textTertiary, t.primary, t.textPrimary, false, segT, segC);
-            WrapCode(fs, maxTextW, ci + 1, segT, segC);
+                t.warning, t.textTertiary, t.primary, t.textPrimary, false, spans);
+            WrapCode(fs, maxTextW, ci + 1, spans);
             ci = ci + 1;
         }
     }
 
     /// Emits one source line as one or more display rows that each fit within
     /// maxW. The first row carries the real line number; wrapped continuation
-    /// rows carry 0. Highlight segments are split at the wrap point, preserving
-    /// colour. Appends to the cache* lists in place.
-    void WrapCode(int fs, int maxW, int lineNo,
-            List<string> segT, List<int> segC) {
+    /// rows carry 0. Highlight spans are split at the wrap point, preserving
+    /// colour, and appended as complete display-line records.
+    void WrapCode(int fs, int maxW, int lineNo, List<CodeSpan> spans) {
         string curText = "";
-        List<string> curSegT = new List<string>();
-        List<int> curSegC = new List<int>();
+        List<CodeSpan> curSpans = new List<CodeSpan>();
         int curW = 0;
         bool first = true;
 
         int gi = 0;
-        while (gi < segT.Count) {
-            string s = segT[gi];
-            int col = segC[gi];
+        while (gi < spans.Count) {
+            CodeSpan span = spans[gi];
+            string s = span.text;
+            int col = span.color;
             int p = 0;
             int slen = s.Length;
             while (p < slen) {
@@ -365,38 +391,28 @@ class Demo {
                 }
                 if (p > start) {
                     string piece = s.Substring(start, p - start);
-                    curSegT.Add(piece);
-                    curSegC.Add(col);
+                    curSpans.Add(CodeSpan.Create(piece, col));
                     curText = curText + piece;
                 }
                 if (p < slen) {
                     // Line is full: flush this display row and start a new one.
-                    Demo.FlushRow(this, curText, curSegT, curSegC, first, lineNo);
+                    FlushRow(curText, curSpans, first, lineNo);
                     first = false;
                     curText = "";
-                    curSegT = new List<string>();
-                    curSegC = new List<int>();
+                    curSpans = new List<CodeSpan>();
                     curW = 0;
                 }
             }
             gi = gi + 1;
         }
         // Always emit the final (or only, possibly empty) row.
-        Demo.FlushRow(this, curText, curSegT, curSegC, first, lineNo);
+        FlushRow(curText, curSpans, first, lineNo);
     }
 
-    static void FlushRow(Demo d, string text, List<string> segT,
-            List<int> segC, bool first, int lineNo) {
-        d.cacheCodeLines.Add(text);
-        int k = 0;
-        while (k < segT.Count) {
-            d.cacheSegText.Add(segT[k]);
-            d.cacheSegColor.Add(segC[k]);
-            k = k + 1;
-        }
-        d.cacheSegPerLine.Add(segT.Count);
-        if (first) { d.cacheLineNo.Add(lineNo); }
-        else { d.cacheLineNo.Add(0); }
+    void FlushRow(string text, List<CodeSpan> spans, bool first, int lineNo) {
+        int displayLineNo = 0;
+        if (first) { displayLineNo = lineNo; }
+        cacheDisplayLines.Add(CodeDisplayLine.Create(text, displayLineNo, spans));
     }
 
 }
@@ -1225,10 +1241,9 @@ class Gallery {
             sw - pad * 2, app.Scale(30));
         string q = Gallery.navSearch.GetText();
 
-        // Build display rows: -1 marks a category header row. When searching we
-        // only keep matching components (and headers that still have children).
-        List<int> rowComp = new List<int>();
-        List<string> rowText = new List<string>();
+        // Build display rows: category headers and component entries are typed
+        // entities, so no sentinel index is needed.
+        List<GalleryNavRow> rows = new List<GalleryNavRow>();
         string lastCat = "";
         int i = 0;
         while (i < Gallery.comps.Count) {
@@ -1238,12 +1253,10 @@ class Gallery {
                 || Gallery.ContainsCI(e.category, q);
             if (match) {
                 if (e.category != lastCat) {
-                    rowComp.Add(0 - 1);
-                    rowText.Add(e.category);
+                    rows.Add(GalleryNavRow.Header(e.category));
                     lastCat = e.category;
                 }
-                rowComp.Add(i);
-                rowText.Add(e.name);
+                rows.Add(GalleryNavRow.Component(i, e.name));
             }
             i = i + 1;
         }
@@ -1252,7 +1265,7 @@ class Gallery {
         int listBottom = area.y + area.height - app.Scale(8);
         int rowH = app.Scale(26);
         int viewH = listBottom - listTop;
-        int contentH = rowComp.Count * rowH;
+        int contentH = rows.Count * rowH;
 
         // The ScrollView owns wheel handling, clipping and the scrollbar; the
         // list just draws every row at its natural position minus the returned
@@ -1265,15 +1278,15 @@ class Gallery {
         int sx = area.x + pad;
         int swid = sw - pad * 2;
         int idx = 0;
-        while (idx < rowComp.Count) {
+        while (idx < rows.Count) {
             int ry = listTop + idx * rowH - dy;
             if (ry + rowH > listTop && ry < listBottom) {
-                int d = rowComp[idx];
-                if (d < 0) {
-                    c.DrawText(sx, ry + app.Scale(8), rowText[idx],
+                GalleryNavRow row = rows[idx];
+                if (row.header) {
+                    c.DrawText(sx, ry + app.Scale(8), row.text,
                         t.textTertiary, t.fontSizeSmall);
                 } else {
-                    bool selRow = d == sel;
+                    bool selRow = row.compIndex == sel;
                     bool hot = !app.PointerCaptured()
                         && app.mouseX >= area.x && app.mouseX < area.x + sw
                         && app.mouseY >= listTop && app.mouseY < listBottom
@@ -1290,9 +1303,9 @@ class Gallery {
                     int tc = t.textPrimary;
                     if (selRow) { tc = t.textInverse; }
                     c.DrawText(sx + app.Scale(8), ry + app.Scale(5),
-                        rowText[idx], tc, t.fontSizeSmall);
+                        row.text, tc, t.fontSizeSmall);
                     if (click && hot) {
-                        Gallery.selected.Set(d);
+                        Gallery.selected.Set(row.compIndex);
                         Gallery.codeScroll.Set(0);
                         Gallery.detailView.ScrollTo(0);
                         Gallery.selHas = false;
@@ -1366,7 +1379,7 @@ class Gallery {
         h = h + app.Scale(10)
             + Gallery.PreviewBoxH(app, d.previewId, d.previewH, cw)
             + app.Scale(12);
-        int panelH = app.Scale(28) + d.cacheCodeLines.Count * lineH
+        int panelH = app.Scale(28) + d.cacheDisplayLines.Count * lineH
             + app.Scale(16);
         h = h + panelH + app.Scale(26);
         return h;
@@ -1664,11 +1677,11 @@ class Gallery {
             int cx, int cy, int cw, int tab) {
         d.EnsureCache(app, t, cw, tab);
         string src = d.cacheSrc;
-        List<string> codeLines = d.cacheCodeLines;
+        List<CodeDisplayLine> displayLines = d.cacheDisplayLines;
         int fs = t.fontSizeSmall;
         int codeLineH = Canvas.FontHeight(fs) + app.Scale(4);
         int hdrH = app.Scale(28);
-        int panelH = hdrH + codeLines.Count * codeLineH + app.Scale(16);
+        int panelH = hdrH + displayLines.Count * codeLineH + app.Scale(16);
         c.FillRoundRect(cx, cy, cw, panelH, app.Scale(6), t.bgSecondary);
         c.DrawRect(cx, cy, cw, panelH, t.borderPrimary, 1);
         c.FillRect(cx, cy + hdrH, cw, 1, t.divider);
@@ -1720,7 +1733,7 @@ class Gallery {
         if (app.window.EventKind() == 3 && cpHot) {
             // Copy the current selection when there is one, else the whole snippet.
             string toCopy = src;
-            if (selMine && Gallery.SelNonEmpty()) { toCopy = Gallery.SelectedText(codeLines); }
+            if (selMine && Gallery.SelNonEmpty()) { toCopy = Gallery.SelectedText(displayLines); }
             Clipboard.SetText(toCopy);
             app.RequestRedraw();
         }
@@ -1728,14 +1741,14 @@ class Gallery {
         // Drag to select text in the code body: press sets the anchor, moving
         // with the button held extends the selection, release finalises it.
         int textTop = codeY0;
-        int textBottom = codeY0 + codeLines.Count * codeLineH;
+        int textBottom = codeY0 + displayLines.Count * codeLineH;
         int ek = app.window.EventKind();
         bool inCode = !app.PointerCaptured()
             && app.mouseX >= cx && app.mouseX < cx + cw
             && app.mouseY >= textTop && app.mouseY < textBottom;
         if (ek == 2 && inCode) {
-            int ll = Gallery.HitLine(codeLines, 0, app.mouseY, codeY0, codeLineH);
-            int cc = Gallery.ColAt(codeLines[ll], fs, app.mouseX - textX);
+            int ll = Gallery.HitLine(displayLines, 0, app.mouseY, codeY0, codeLineH);
+            int cc = Gallery.ColAt(displayLines[ll].text, fs, app.mouseX - textX);
             Gallery.selAL = ll; Gallery.selAC = cc;
             Gallery.selFL = ll; Gallery.selFC = cc;
             Gallery.selDrag = true;
@@ -1743,8 +1756,8 @@ class Gallery {
             selMine = true;
             app.RequestRedraw();
         } else if (ek == 1 && Gallery.selDrag && selMine) {
-            int ll = Gallery.HitLine(codeLines, 0, app.mouseY, codeY0, codeLineH);
-            int cc = Gallery.ColAt(codeLines[ll], fs, app.mouseX - textX);
+            int ll = Gallery.HitLine(displayLines, 0, app.mouseY, codeY0, codeLineH);
+            int cc = Gallery.ColAt(displayLines[ll].text, fs, app.mouseX - textX);
             Gallery.selFL = ll; Gallery.selFC = cc;
             app.RequestRedraw();
         } else if (ek == 3 && Gallery.selDrag && selMine) {
@@ -1764,11 +1777,11 @@ class Gallery {
 
         int codeY = codeY0;
         int ci = 0;
-        int segBase = 0;
-        while (ci < codeLines.Count) {
+        while (ci < displayLines.Count) {
+            CodeDisplayLine displayLine = displayLines[ci];
             // Selection highlight behind this line's text.
             if (showSel && ci >= nl0 && ci <= nl1) {
-                int lineLen = codeLines[ci].Length;
+                int lineLen = displayLine.text.Length;
                 int sc = 0;
                 if (ci == nl0) { sc = nc0; }
                 int ec = lineLen;
@@ -1777,30 +1790,27 @@ class Gallery {
                 if (sc > lineLen) { sc = lineLen; }
                 if (ec > lineLen) { ec = lineLen; }
                 if (ec < sc) { ec = sc; }
-                int hx0 = textX + Canvas.MeasureText(codeLines[ci].Substring(0, sc), fs);
-                int hx1 = textX + Canvas.MeasureText(codeLines[ci].Substring(0, ec), fs);
+                int hx0 = textX + Canvas.MeasureText(displayLine.text.Substring(0, sc), fs);
+                int hx1 = textX + Canvas.MeasureText(displayLine.text.Substring(0, ec), fs);
                 if (hx1 < hx0 + app.Scale(2)) { hx1 = hx0 + app.Scale(4); }
                 c.FillRect(hx0, codeY - app.Scale(1), hx1 - hx0,
                     codeLineH, 0x553B82F6);
             }
-            int lno = d.cacheLineNo[ci];
+            int lno = displayLine.lineNo;
             if (lno > 0) {
                 string lnoS = Convert.ToString(lno);
                 int lnoW = Canvas.MeasureText(lnoS, fs);
                 c.DrawText(cx + gutterW - lnoW - app.Scale(6), codeY,
                     lnoS, t.textTertiary, fs);
             }
-            // Cached highlight spans for this line: [segBase, segBase+n).
-            int n = d.cacheSegPerLine[ci];
             int sx = textX;
             int si = 0;
-            while (si < n) {
-                string seg = d.cacheSegText[segBase + si];
-                c.DrawText(sx, codeY, seg, d.cacheSegColor[segBase + si], fs);
-                sx = sx + Canvas.MeasureText(seg, fs);
+            while (si < displayLine.spans.Count) {
+                CodeSpan span = displayLine.spans[si];
+                c.DrawText(sx, codeY, span.text, span.color, fs);
+                sx = sx + Canvas.MeasureText(span.text, fs);
                 si = si + 1;
             }
-            segBase = segBase + n;
             codeY = codeY + codeLineH;
             ci = ci + 1;
         }
@@ -1825,7 +1835,7 @@ class Gallery {
     }
 
     /// Maps a mouse y to a code line index (clamped to the snippet).
-    static int HitLine(List<string> lines, int scroll, int my,
+    static int HitLine(List<CodeDisplayLine> lines, int scroll, int my,
             int codeY0, int lineH) {
         int hl = scroll + (my - codeY0) / lineH;
         if (hl < 0) { hl = 0; }
@@ -1855,8 +1865,8 @@ class Gallery {
         return Gallery.selAC != Gallery.selFC;
     }
 
-    /// Extracts the selected substring from the split snippet lines.
-    static string SelectedText(List<string> lines) {
+    /// Extracts the selected substring from the cached display lines.
+    static string SelectedText(List<CodeDisplayLine> lines) {
         int sL = Gallery.selAL; int sC = Gallery.selAC;
         int eL = Gallery.selFL; int eC = Gallery.selFC;
         if (sL > eL || (sL == eL && sC > eC)) {
@@ -1866,20 +1876,20 @@ class Gallery {
         if (sL < 0) { sL = 0; }
         if (eL >= lines.Count) { eL = lines.Count - 1; }
         if (sL == eL) {
-            string only = lines[sL];
+            string only = lines[sL].text;
             if (sC < 0) { sC = 0; }
             if (eC > only.Length) { eC = only.Length; }
             return only.Substring(sC, eC - sC);
         }
-        string first = lines[sL];
+        string first = lines[sL].text;
         if (sC < 0) { sC = 0; }
         string res = first.Substring(sC, first.Length - sC);
         int i = sL + 1;
         while (i < eL) {
-            res = res + "\n" + lines[i];
+            res = res + "\n" + lines[i].text;
             i = i + 1;
         }
-        string last = lines[eL];
+        string last = lines[eL].text;
         if (eC > last.Length) { eC = last.Length; }
         res = res + "\n" + last.Substring(0, eC);
         return res;
@@ -1989,6 +1999,9 @@ class Gallery {
             int rows = (n + gcols - 1) / gcols;
             if (rows < 1) { rows = 1; }
             return app.Scale(34) + rows * cell + app.Scale(12);
+        }
+        if (name == "Chart.dashboard" && w < app.Scale(560)) {
+            return app.Scale(834);
         }
         return app.Scale(previewHUnscaled);
     }
@@ -2778,29 +2791,168 @@ class Gallery {
                     ChartSeries.Donut("Firefox", new List<int>{ 7 })
                 });
             ChartView.Keyed(dm, 8121).Render(app, c1X, cY, halfW, cH);
+        } else if (name == "Chart.gauge") {
+            ChartSeries gs = ChartSeries.Gauge(Gallery.T("CPU load", "CPU 负载"), 72);
+            gs.gauge.radius = ChartScalar.Pct(76);
+            gs.gauge.detail.formatter = "{value}%";
+            ChartOption gm = ChartOption.Of(Gallery.T("Standard gauge", "标准仪表盘"), null,
+                new List<ChartSeries>{ gs });
+            ChartView.Keyed(gm, 8130).Render(app, x + app.Scale(14), y + app.Scale(30),
+                w - app.Scale(28), app.Scale(240));
+        } else if (name == "Chart.gaugeHalf") {
+            ChartSeries hs = ChartSeries.Gauge(Gallery.T("Temperature", "温度"), 68);
+            hs.gauge.min = 0;
+            hs.gauge.max = 120;
+            hs.gauge.startAngle = 180;
+            hs.gauge.endAngle = 0;
+            hs.gauge.center = ChartPosition.Of(ChartScalar.Pct(50), ChartScalar.Pct(88));
+            hs.gauge.radius = ChartScalar.Pct(90);
+            hs.gauge.splitNumber = 6;
+            hs.gauge.axisTick.splitNumber = 4;
+            hs.gauge.axisLine.lineStyle.width = 14;
+            hs.gauge.pointer.length = ChartScalar.Pct(72);
+            hs.gauge.pointer.width = 5;
+            hs.gauge.title.offsetCenter = ChartPosition.Of(ChartScalar.Px(0), ChartScalar.Pct(0 - 42));
+            hs.gauge.detail.offsetCenter = ChartPosition.Of(ChartScalar.Px(0), ChartScalar.Pct(0 - 20));
+            hs.gauge.detail.formatter = "{value} °C";
+            hs.gauge.axisLine.colors = new List<GaugeColorStop>{
+                GaugeColorStop.Of(350, Chart.Rgb(115, 192, 222)),
+                GaugeColorStop.Of(600, Chart.Rgb(84, 112, 198)),
+                GaugeColorStop.Of(800, Chart.Rgb(250, 200, 88)),
+                GaugeColorStop.Of(1000, Chart.Rgb(238, 102, 102))
+            };
+            ChartOption hm = ChartOption.Of(Gallery.T("Half gauge", "个性化半圆仪表"), null,
+                new List<ChartSeries>{ hs });
+            ChartView.Keyed(hm, 8132).Render(app, x + app.Scale(14), y + app.Scale(30),
+                w - app.Scale(28), app.Scale(240));
+        } else if (name == "Chart.gaugeMulti") {
+            ChartSeries speed = ChartSeries.Gauge(Gallery.T("Speed", "速度"), 128);
+            speed.gauge.min = 0; speed.gauge.max = 220; speed.gauge.splitNumber = 11;
+            speed.gauge.center = ChartPosition.Of(ChartScalar.Pct(50), ChartScalar.Pct(53));
+            speed.gauge.radius = ChartScalar.Pct(58); speed.gauge.detail.formatter = "{value} km/h";
+            ChartSeries rpm = ChartSeries.Gauge(Gallery.T("RPM", "转速"), 4);
+            rpm.gauge.max = 7; rpm.gauge.endAngle = 45; rpm.gauge.splitNumber = 7;
+            rpm.gauge.center = ChartPosition.Of(ChartScalar.Pct(23), ChartScalar.Pct(67));
+            rpm.gauge.radius = ChartScalar.Pct(31); rpm.gauge.detail.formatter = "{value} x1000 r/min";
+            ChartSeries fuel = ChartSeries.Gauge(Gallery.T("Fuel", "油量"), 1);
+            fuel.gauge.max = 2; fuel.gauge.startAngle = 135; fuel.gauge.endAngle = 45;
+            fuel.gauge.splitNumber = 2; fuel.gauge.center = ChartPosition.Of(ChartScalar.Pct(77), ChartScalar.Pct(62));
+            fuel.gauge.radius = ChartScalar.Pct(29); fuel.gauge.title.show = false; fuel.gauge.detail.show = false;
+            ChartSeries water = ChartSeries.Gauge(Gallery.T("Water", "水温"), 1);
+            water.gauge.max = 2; water.gauge.startAngle = 315; water.gauge.endAngle = 225;
+            water.gauge.splitNumber = 2; water.gauge.center = ChartPosition.Of(ChartScalar.Pct(77), ChartScalar.Pct(62));
+            water.gauge.radius = ChartScalar.Pct(29); water.gauge.axisTick.show = false;
+            water.gauge.title.show = false; water.gauge.detail.show = false;
+            ChartOption mm = ChartOption.Of(Gallery.T("Vehicle cluster", "车辆仪表组"), null,
+                new List<ChartSeries>{ speed, rpm, fuel, water });
+            ChartView.Keyed(mm, 8133).Render(app, x + app.Scale(14), y + app.Scale(30),
+                w - app.Scale(28), app.Scale(240));
+        } else if (name == "Chart.dashboard") {
+            int gap = app.Scale(12);
+            int left = x + app.Scale(14);
+            int top = y + app.Scale(30);
+            int cellW = (w - app.Scale(28) - gap) / 2;
+            int cellH = app.Scale(190);
+            bool narrow = w < app.Scale(560);
+            if (narrow) { cellW = w - app.Scale(28); }
+            int x1 = left + cellW + gap;
+            int y1 = top;
+            int x2 = left;
+            int y2 = top + cellH + gap;
+            int x3 = x1;
+            int y3 = y2;
+            if (narrow) {
+                x1 = left; y1 = top + cellH + gap;
+                x2 = left; y2 = top + (cellH + gap) * 2;
+                x3 = left; y3 = top + (cellH + gap) * 3;
+            }
+
+            ChartOption channels;
+            if (narrow) {
+                ChartSeries attainment = ChartSeries.Gauge(Gallery.T("Revenue target", "营收目标"), 84);
+                attainment.gauge.radius = ChartScalar.Pct(74);
+                attainment.gauge.detail.formatter = "{value}%";
+                channels = ChartOption.Of(Gallery.T("Revenue attainment", "营收达成"), null,
+                    new List<ChartSeries>{ attainment });
+            } else {
+                channels = ChartOption.Of(Gallery.T("Revenue mix", "营收构成"), null,
+                    new List<ChartSeries>{
+                        ChartSeries.Donut(Gallery.T("Subscription", "订阅"), new List<int>{ 46 }),
+                        ChartSeries.Donut(Gallery.T("Usage", "用量"), new List<int>{ 29 }),
+                        ChartSeries.Donut(Gallery.T("Services", "服务"), new List<int>{ 17 }),
+                        ChartSeries.Donut(Gallery.T("Other", "其他"), new List<int>{ 8 })
+                    });
+            }
+            ChartView.Keyed(channels, 8301).Render(app, left, top, cellW, cellH);
+
+            ChartOption health = ChartOption.Of(Gallery.T("Service health", "服务健康度"),
+                new List<string>{ Gallery.T("Latency", "延迟"), Gallery.T("Uptime", "可用性"),
+                                  Gallery.T("Capacity", "容量"), Gallery.T("Errors", "错误"),
+                                  Gallery.T("Security", "安全") },
+                new List<ChartSeries>{
+                    ChartSeries.Polar(Gallery.T("Current", "当前"), new List<int>{ 82, 96, 74, 88, 91 }),
+                    ChartSeries.Polar(Gallery.T("Target", "目标"), new List<int>{ 92, 99, 88, 95, 96 })
+                });
+            health.showLegend = !narrow;
+            ChartView.Keyed(health, 8302).Render(app, x1, y1, cellW, cellH);
+
+            ChartOption funnel;
+            if (narrow) {
+                ChartNode journey = ChartNode.Group(Gallery.T("Journey", "转化"), new List<ChartNode>{
+                    ChartNode.Leaf(Gallery.T("Visits", "访问"), 100),
+                    ChartNode.Leaf(Gallery.T("Trials", "试用"), 63),
+                    ChartNode.Leaf(Gallery.T("Activated", "激活"), 41),
+                    ChartNode.Leaf(Gallery.T("Paid", "付费"), 24)
+                });
+                funnel = ChartOption.Of(Gallery.T("Customer journey", "客户转化"), null,
+                    new List<ChartSeries>{ ChartSeries.OfTree(Gallery.T("Journey", "转化"), ChartType.Treemap, journey) });
+            } else {
+                funnel = ChartOption.Of(Gallery.T("Customer journey", "客户转化"), null,
+                    new List<ChartSeries>{
+                        ChartSeries.Funnel(Gallery.T("Visits", "访问"), new List<int>{ 100 }),
+                        ChartSeries.Funnel(Gallery.T("Trials", "试用"), new List<int>{ 63 }),
+                        ChartSeries.Funnel(Gallery.T("Activated", "激活"), new List<int>{ 41 }),
+                        ChartSeries.Funnel(Gallery.T("Paid", "付费"), new List<int>{ 24 })
+                    });
+            }
+            ChartView.Keyed(funnel, 8303).Render(app, x2, y2, cellW, cellH);
+
+            ChartOption activity = ChartOption.Of(Gallery.T("Traffic intensity", "流量强度"),
+                new List<string>{ "00", "04", "08", "12", "16", "20" },
+                new List<ChartSeries>{
+                    ChartSeries.Of("API", ChartType.Heatmap, new List<int>{ 8, 5, 46, 82, 71, 28 }),
+                    ChartSeries.Of(Gallery.T("Web", "网页"), ChartType.Heatmap, new List<int>{ 3, 2, 38, 68, 89, 44 }),
+                    ChartSeries.Of(Gallery.T("Mobile", "移动"), ChartType.Heatmap, new List<int>{ 2, 1, 30, 74, 92, 51 })
+                });
+            activity.showLegend = !narrow;
+            ChartView.Keyed(activity, 8304).Render(app, x3, y3, cellW, cellH);
         } else if (name == "Chart.radial") {
-            // Gauge + radial-bars, two per row (both are compact by nature).
-            int cY = y + app.Scale(30);
-            int cH = app.Scale(240);
-            int halfW = (w - app.Scale(28) - app.Scale(12)) / 2;
-            int c0X = x + app.Scale(14);
-            int c1X = c0X + halfW + app.Scale(12);
-
-            ChartOption gm = ChartOption.Of(Gallery.T("CPU load", "CPU 负载"), null,
-                new List<ChartSeries>{ ChartSeries.Of("load", ChartType.Gauge, new List<int>{ 72 }) });
-            gm.gaugeMax = 100;
-            ChartView.Keyed(gm, 8130).Render(app, c0X, cY, halfW, cH);
-
             ChartOption rm = ChartOption.Of(Gallery.T("Resource usage", "资源占用"), null,
                 new List<ChartSeries>{
-                    ChartSeries.Of("CPU", ChartType.RadialBars, new List<int>{ 80 }),
-                    ChartSeries.Of("RAM", ChartType.RadialBars, new List<int>{ 55 }),
-                    ChartSeries.Of("Disk", ChartType.RadialBars, new List<int>{ 30 }),
-                    ChartSeries.Of("GPU", ChartType.RadialBars, new List<int>{ 64 }),
-                    ChartSeries.Of("Net", ChartType.RadialBars, new List<int>{ 42 })
+                    ChartSeries.RadialBars("CPU", 80),
+                    ChartSeries.RadialBars("RAM", 55),
+                    ChartSeries.RadialBars("Disk", 30),
+                    ChartSeries.RadialBars("GPU", 64),
+                    ChartSeries.RadialBars("Net", 42)
                 });
             rm.gaugeMax = 100;
-            ChartView.Keyed(rm, 8131).Render(app, c1X, cY, halfW, cH);
+            ChartView.Keyed(rm, 8131).Render(app, x + app.Scale(14), y + app.Scale(30),
+                w - app.Scale(28), app.Scale(240));
+        } else if (name == "Chart.wordcloud") {
+            List<ChartData> words = new List<ChartData>{
+                ChartData.Named(100, "Zan"), ChartData.Named(86, "Compiler"),
+                ChartData.Named(78, "Runtime"), ChartData.Named(70, "GUI"),
+                ChartData.Named(62, "Chart"), ChartData.Named(55, "Async"),
+                ChartData.Named(48, "Native"), ChartData.Named(43, "Types"),
+                ChartData.Named(38, "Canvas"), ChartData.Named(34, "JSON"),
+                ChartData.Named(30, "LSP"), ChartData.Named(27, "Debug"),
+                ChartData.Named(24, "Fast"), ChartData.Named(21, "Safe")
+            };
+            ChartOption wc = ChartOption.Of(Gallery.T("Technology signals", "技术关键词"), null,
+                new List<ChartSeries>{ ChartSeries.WordCloud(Gallery.T("Keywords", "关键词"), words) });
+            wc.showLegend = false;
+            ChartView.Keyed(wc, 8305).Render(
+                app, x + app.Scale(14), y + app.Scale(30), w - app.Scale(28), app.Scale(240));
         } else if (name == "Chart.heatmap") {
             // Two heatmaps side by side: weekly activity per team, and an
             // hourly intensity grid. Both are compact, so half width each.
@@ -2888,14 +3040,13 @@ class Gallery {
             int c1X = c0X + halfW + app.Scale(12);
             // 左：双系列散点 + 线性回归趋势线。趋势线用 OfPoints 造两个
             // 端点，type 改 Line —— DrawScatterCore 对 Line 系列画连线。
-            List<int> xs = new List<int>();
-            List<int> ys = new List<int>();
+            List<ChartPoint> points = new List<ChartPoint>();
             int sx2 = 0; int sy2 = 0; int sxx2 = 0; int sxy2 = 0;
             int xi = 0;
             while (xi < 14) {
                 int xv = 6 + xi * 6;
                 int yv = 10 + xv * 2 / 3 + (xi * 7) % 12;
-                xs.Add(xv); ys.Add(yv);
+                points.Add(ChartPoint.Of(xv, yv));
                 sx2 = sx2 + xv; sy2 = sy2 + yv;
                 sxx2 = sxx2 + xv * xv; sxy2 = sxy2 + xv * yv;
                 xi = xi + 1;
@@ -2904,23 +3055,22 @@ class Gallery {
             int slopeK = 0;
             if (denom != 0) { slopeK = (14 * sxy2 - sx2 * sy2) * 1000 / denom; }
             int interK = (sy2 * 1000 - slopeK * sx2) / 14;
-            List<int> tx = new List<int>();
-            List<int> ty = new List<int>();
-            tx.Add(xs[0]); ty.Add(interK + slopeK * xs[0] / 1000);
-            tx.Add(xs[13]); ty.Add(interK + slopeK * xs[13] / 1000);
-            ChartSeries trend = ChartSeries.OfPoints(Gallery.T("Trend", "趋势线"), tx, ty);
+            List<ChartPoint> trendPoints = new List<ChartPoint>{
+                ChartPoint.Of(points[0].x, interK + slopeK * points[0].x / 1000),
+                ChartPoint.Of(points[13].x, interK + slopeK * points[13].x / 1000)
+            };
+            ChartSeries trend = ChartSeries.OfPoints(Gallery.T("Trend", "趋势线"), trendPoints);
             trend.type = ChartType.Line;
-            List<int> xsB = new List<int>();
-            List<int> ysB = new List<int>();
+            List<ChartPoint> pointsB = new List<ChartPoint>();
             int bi2 = 0;
             while (bi2 < 10) {
-                xsB.Add(8 + bi2 * 8); ysB.Add(30 + (bi2 * 9) % 38);
+                pointsB.Add(ChartPoint.Of(8 + bi2 * 8, 30 + (bi2 * 9) % 38));
                 bi2 = bi2 + 1;
             }
             ChartOption so = ChartOption.Of(Gallery.T("Samples + regression", "样本 + 回归"), null,
                 new List<ChartSeries>{
-                    ChartSeries.OfPoints(Gallery.T("Series A", "系列 A"), xs, ys),
-                    ChartSeries.OfPoints(Gallery.T("Series B", "系列 B"), xsB, ysB),
+                    ChartSeries.OfPoints(Gallery.T("Series A", "系列 A"), points),
+                    ChartSeries.OfPoints(Gallery.T("Series B", "系列 B"), pointsB),
                     trend
                 });
             ChartView.Keyed(so, 8170).Render(app, c0X, cY, halfW, cH);
@@ -2928,17 +3078,16 @@ class Gallery {
             // 右：2000 点大规模散点。数据静态懒构建，走 RenderCached（首帧
             // 光栅化 + 快照，之后每帧一次拷贝），hover 由 ScatterHover 叠加。
             if (Gallery.scatterCloud == null) {
-                List<int> cx2 = new List<int>();
-                List<int> cy2 = new List<int>();
+                List<ChartPoint> cloudPoints = new List<ChartPoint>();
                 int pi = 0;
                 while (pi < 2000) {
                     int pxv = 3 + (pi * 37 + pi * pi * 13) % 90;
                     int pyv = 5 + (pi * 53 + pi * pi * 7) % 72;
-                    cx2.Add(pxv); cy2.Add(pyv);
+                    cloudPoints.Add(ChartPoint.Of(pxv, pyv));
                     pi = pi + 1;
                 }
                 ChartOption co2 = ChartOption.Of(Gallery.T("Cloud 2000 pts", "2000 点点云"), null,
-                    new List<ChartSeries>{ ChartSeries.OfPoints(Gallery.T("Cloud", "点云"), cx2, cy2) });
+                    new List<ChartSeries>{ ChartSeries.OfPoints(Gallery.T("Cloud", "点云"), cloudPoints) });
                 Gallery.scatterCloud = co2;
                 Gallery.scatterCloudSlot = ChartView.AllocCacheSlot();
             }
@@ -2963,6 +3112,7 @@ class Gallery {
                     ChartSeries.StackedArea(Gallery.T("Mobile", "移动端"), new List<int>{ 20, 32, 40, 52, 64, 80, 74, 88 }),
                     ChartSeries.StackedArea("API", new List<int>{ 10, 18, 22, 30, 28, 40, 36, 44 })
                 });
+            am.smooth = true;
             ChartView.Keyed(am, 8151).Render(
                 app, x + app.Scale(14), y + app.Scale(30), w - app.Scale(28), app.Scale(240));
         } else if (name == "Chart.stackedline") {
@@ -2980,10 +3130,11 @@ class Gallery {
             e3.stackName = Gallery.T("Total", "总量");
             ChartSeries e4 = ChartSeries.StackedLine(Gallery.T("Direct access", "直接访问"), new List<int>{ 320, 332, 301, 334, 390, 330, 320 });
             e4.stackName = Gallery.T("Total", "总量");
-            ChartSeries e5 = ChartSeries.StackedLine(Gallery.T("Search engines", "搜索引擎"), new List<int>{ 820, 932, 901, 934, 1290, 1330, 1320 });
+            ChartSeries e5 = ChartSeries.StackedLine(Gallery.T("Search engines", "搜索引擎"), new List<int>{ 830, 932, 901, 934, 1290, 1330, 1320 });
             e5.stackName = Gallery.T("Total", "总量");
             ChartOption sl = ChartOption.Of(Gallery.T("Traffic sources (stacked line)", "访问来源（堆叠折线）"),
                 dlabs, new List<ChartSeries>{ e1, e2, e3, e4, e5 });
+            sl.smooth = true;
             ChartView.Keyed(sl, 8180).Render(
                 app, x + app.Scale(14), y + app.Scale(30), w - app.Scale(28), app.Scale(240));
         } else if (name == "Chart.candle") {
@@ -3069,32 +3220,26 @@ class Gallery {
             int halfW = (w - app.Scale(28) - app.Scale(12)) / 2;
             int c0X = x + app.Scale(14);
             int c1X = c0X + halfW + app.Scale(12);
-            List<string> labs = new List<string>();
-            labs.Add("API"); labs.Add("Web"); labs.Add("DB"); labs.Add("Cache");
-            labs.Add("Auth"); labs.Add("Queue");
             List<BoxItem> bx = new List<BoxItem>();
-            bx.Add(BoxItem.Of(10, 25, 40, 55, 70));
-            bx.Add(BoxItem.Of(20, 35, 45, 60, 85));
-            bx.Add(BoxItem.Of(15, 30, 38, 50, 65));
-            bx.Add(BoxItem.Of(25, 42, 55, 68, 90));
-            bx.Add(BoxItem.Of(12, 28, 42, 58, 75));
-            bx.Add(BoxItem.Of(18, 33, 48, 63, 88));
-            ChartOption bxo = ChartOption.Of(Gallery.T("Latency (ms) by service", "各服务延迟（ms）"), labs,
+            bx.Add(BoxItem.Of("API", 10, 25, 40, 55, 70));
+            bx.Add(BoxItem.Of("Web", 20, 35, 45, 60, 85));
+            bx.Add(BoxItem.Of("DB", 15, 30, 38, 50, 65));
+            bx.Add(BoxItem.Of("Cache", 25, 42, 55, 68, 90));
+            bx.Add(BoxItem.Of("Auth", 12, 28, 42, 58, 75));
+            bx.Add(BoxItem.Of("Queue", 18, 33, 48, 63, 88));
+            ChartOption bxo = ChartOption.Of(Gallery.T("Latency (ms) by service", "各服务延迟（ms）"), null,
                 new List<ChartSeries>{ ChartSeries.OfBoxes(Gallery.T("Latency", "延迟"), bx) });
             ChartView.Keyed(bxo, 8154).Render(app, c0X, cY, halfW, cH);
 
             // A second box set on the right: error-rate distribution.
-            List<string> labs2 = new List<string>();
-            labs2.Add("Login"); labs2.Add("Search"); labs2.Add("Checkout");
-            labs2.Add("Upload"); labs2.Add("Sync");
             List<BoxItem> bx2 = new List<BoxItem>();
-            bx2.Add(BoxItem.Of(2, 6, 9, 15, 24));
-            bx2.Add(BoxItem.Of(1, 4, 7, 12, 19));
-            bx2.Add(BoxItem.Of(3, 8, 14, 22, 35));
-            bx2.Add(BoxItem.Of(2, 5, 10, 18, 28));
-            bx2.Add(BoxItem.Of(1, 3, 6, 9, 14));
-            ChartOption bxo2 = ChartOption.Of(Gallery.T("Error rate (%) by flow", "各流程错误率（%）"), labs2,
-                new List<ChartSeries>{ ChartSeries.OfBoxes(Gallery.T("Errors", "错误率"), bx2) });
+            bx2.Add(BoxItem.Of("Login", 2, 6, 9, 15, 24));
+            bx2.Add(BoxItem.Of("Search", 1, 4, 7, 12, 19));
+            bx2.Add(BoxItem.Of("Checkout", 3, 8, 14, 22, 35));
+            bx2.Add(BoxItem.Of("Upload", 2, 5, 10, 18, 28));
+            bx2.Add(BoxItem.Of("Sync", 1, 3, 6, 9, 14));
+            ChartOption bxo2 = ChartOption.Of(Gallery.T("Error rate (%)", "错误率（%）"), null,
+                new List<ChartSeries>{ ChartSeries.OfBoxes(Gallery.T("Error rate", "错误率"), bx2) });
             ChartView.Keyed(bxo2, 8178).Render(app, c1X, cY, halfW, cH);
         } else if (name == "Chart.error") {
             int cY = y + app.Scale(30);
@@ -3106,14 +3251,14 @@ class Gallery {
             labs.Add("A"); labs.Add("B"); labs.Add("C"); labs.Add("D"); labs.Add("E");
             labs.Add("F"); labs.Add("G"); labs.Add("H");
             List<ErrorItem> es = new List<ErrorItem>();
-            es.Add(ErrorItem.Of(40, 6));
-            es.Add(ErrorItem.Of(55, 8));
-            es.Add(ErrorItem.Of(48, 5));
-            es.Add(ErrorItem.Of(66, 10));
-            es.Add(ErrorItem.Of(60, 7));
-            es.Add(ErrorItem.Of(72, 9));
-            es.Add(ErrorItem.Of(51, 4));
-            es.Add(ErrorItem.Of(63, 6));
+            es.Add(ErrorItem.Of("A", 40, 6));
+            es.Add(ErrorItem.Of("B", 55, 8));
+            es.Add(ErrorItem.Of("C", 48, 5));
+            es.Add(ErrorItem.Of("D", 66, 10));
+            es.Add(ErrorItem.Of("E", 60, 7));
+            es.Add(ErrorItem.Of("F", 72, 9));
+            es.Add(ErrorItem.Of("G", 51, 4));
+            es.Add(ErrorItem.Of("H", 63, 6));
             ChartOption eo = ChartOption.Of(Gallery.T("Measurement", "测量值"), labs,
                 new List<ChartSeries>{ ChartSeries.OfErrors(Gallery.T("Meas", "测量"), es) });
             ChartView.Keyed(eo, 8155).Render(app, c0X, cY, halfW, cH);
@@ -3123,12 +3268,12 @@ class Gallery {
             labs3.Add("P1"); labs3.Add("P2"); labs3.Add("P3"); labs3.Add("P4");
             labs3.Add("P5"); labs3.Add("P6");
             List<ErrorItem> es2 = new List<ErrorItem>();
-            es2.Add(ErrorItem.Of(50, 12));
-            es2.Add(ErrorItem.Of(64, 9));
-            es2.Add(ErrorItem.Of(58, 14));
-            es2.Add(ErrorItem.Of(71, 8));
-            es2.Add(ErrorItem.Of(62, 11));
-            es2.Add(ErrorItem.Of(69, 10));
+            es2.Add(ErrorItem.Of("P1", 50, 12));
+            es2.Add(ErrorItem.Of("P2", 64, 9));
+            es2.Add(ErrorItem.Of("P3", 58, 14));
+            es2.Add(ErrorItem.Of("P4", 71, 8));
+            es2.Add(ErrorItem.Of("P5", 62, 11));
+            es2.Add(ErrorItem.Of("P6", 69, 10));
             ChartOption eo2 = ChartOption.Of(Gallery.T("Noisy trace", "带噪声轨迹"), labs3,
                 new List<ChartSeries>{ ChartSeries.OfErrors(Gallery.T("Noisy", "噪声"), es2) });
             ChartView.Keyed(eo2, 8179).Render(app, c1X, cY, halfW, cH);
@@ -3323,20 +3468,21 @@ class Gallery {
             ChartView.Keyed(o2, 8183).Render(app, c1X, cY, halfW, cH);
         } else if (name == "Chart.dataset") {
             // One dataset, two charts: bar picks two dims, line picks a third.
-            List<string> dims = new List<string>{ "Sales", "Cost", "Profit" };
-            List<List<int>> cols = new List<List<int>>();
-            cols.Add(new List<int>{ 120, 132, 101, 134, 90, 160 });
-            cols.Add(new List<int>{ 80, 95, 70, 88, 60, 105 });
-            cols.Add(new List<int>{ 40, 37, 31, 46, 30, 55 });
+            List<ChartDimension> dimensions = new List<ChartDimension>();
+            dimensions.Add(ChartDimension.Of("Sales", new List<int>{ 120, 132, 101, 134, 90, 160 }));
+            dimensions.Add(ChartDimension.Of("Cost", new List<int>{ 80, 95, 70, 88, 60, 105 }));
+            dimensions.Add(ChartDimension.Of("Profit", new List<int>{ 40, 37, 31, 46, 30, 55 }));
             List<string> cats = new List<string>{ "Jan", "Feb", "Mar", "Apr", "May", "Jun" };
-            ChartDataset ds = ChartDataset.WithCats(dims, cols, cats);
+            ChartDataset ds = ChartDataset.WithCats(dimensions, cats);
 
             int half = (w - app.Scale(42)) / 2;
             ChartView.Keyed(ds.EncodeNamed(Gallery.T("Sales vs Cost", "销售额 vs 成本"), new List<string>{ "Sales", "Cost" }, ChartType.Bar),
                 8165).Render(
                 app, x + app.Scale(14), y + app.Scale(30), half, app.Scale(180));
-            ChartView.Keyed(ds.EncodeNamed(Gallery.T("Profit", "利润"), new List<string>{ "Profit" }, ChartType.Area),
-                8166).Render(
+            ChartOption profit = ds.EncodeNamed(Gallery.T("Profit", "利润"), new List<string>{ "Profit" }, ChartType.Line);
+            int ai = 0;
+            while (ai < profit.series.Count) { profit.series[ai].areaStyle = true; ai = ai + 1; }
+            ChartView.Keyed(profit, 8166).Render(
                 app, x + app.Scale(28) + half, y + app.Scale(30), half, app.Scale(180));
         } else if (name == "Chart.waterfall") {
             // Two waterfalls side by side: a full P&L walk, and a cost build-up.
@@ -3361,7 +3507,7 @@ class Gallery {
                                   Gallery.T("Salaries", "工资"), Gallery.T("Cloud", "云服务"), Gallery.T("Licenses", "授权"),
                                   Gallery.T("Rent", "房租"), Gallery.T("Ads", "广告"), Gallery.T("Tax", "税费"),
                                   Gallery.T("Net", "净额") },
-                new List<ChartSeries>{ ChartSeries.Named(Gallery.T("Flow", "现金流"), ChartType.Waterfall, dta) });
+                new List<ChartSeries>{ ChartSeries.Waterfall(Gallery.T("Flow", "现金流"), dta) });
             wf.showValues = true;
             ChartView.Keyed(wf, 8171).Render(app, c0X, cY, halfW, cH);
 
@@ -3376,7 +3522,7 @@ class Gallery {
             ChartOption wf2 = ChartOption.Of(Gallery.T("Project budget (k$)", "项目预算（k$）"),
                 new List<string>{ Gallery.T("Base", "基础"), Gallery.T("Grant", "拨款"), Gallery.T("Salaries", "工资"),
                                   Gallery.T("Tools", "工具"), Gallery.T("Travel", "差旅"), Gallery.T("Total", "总计") },
-                new List<ChartSeries>{ ChartSeries.Named(Gallery.T("Budget", "预算"), ChartType.Waterfall, dta2) });
+                new List<ChartSeries>{ ChartSeries.Waterfall(Gallery.T("Budget", "预算"), dta2) });
             wf2.showValues = true;
             ChartView.Keyed(wf2, 8184).Render(app, c1X, cY, halfW, cH);
         } else if (name == "Chart.treemap") {
@@ -3408,6 +3554,32 @@ class Gallery {
             ChartOption tm2 = ChartOption.Of(Gallery.T("Disk usage", "磁盘占用"), null,
                 new List<ChartSeries>{ ChartSeries.OfTree(Gallery.T("Disk", "磁盘"), ChartType.Treemap, root2) });
             ChartView.Keyed(tm2, 8185).Render(app, c1X, cY, halfW, cH);
+        } else if (name == "Chart.tree") {
+            int cY = y + app.Scale(30);
+            int cH = app.Scale(240);
+            int halfW = (w - app.Scale(28) - app.Scale(12)) / 2;
+            int c0X = x + app.Scale(14);
+            int c1X = c0X + halfW + app.Scale(12);
+            // ECharts tree example (133_example_tree): layered node-link
+            // diagram with broken orthogonal connectors.
+            ChartNode tRoot = ChartNode.Group(Gallery.T("Root", "根节点"), new List<ChartNode>{
+                ChartNode.Group(Gallery.T("Node 1", "节点1"), new List<ChartNode>{
+                    ChartNode.Leaf("Leaf 1", 4), ChartNode.Leaf("Leaf 2", 4),
+                    ChartNode.Leaf("Leaf 3", 2), ChartNode.Leaf("Leaf 4", 2),
+                    ChartNode.Leaf("Leaf 5", 2), ChartNode.Leaf("Leaf 6", 4) }),
+                ChartNode.Group(Gallery.T("Node 2", "节点2"), new List<ChartNode>{
+                    ChartNode.Leaf("Leaf 7", 4), ChartNode.Leaf("Leaf 8", 4) }),
+                ChartNode.Group(Gallery.T("Node 3", "节点3"), new List<ChartNode>{
+                    ChartNode.Leaf("Leaf 9", 4), ChartNode.Leaf("Leaf 10", 4),
+                    ChartNode.Leaf("Leaf 11", 2), ChartNode.Leaf("Leaf 12", 2) })
+            });
+            ChartOption tr = ChartOption.Of(Gallery.T("Tree (vertical)", "树图（纵向）"), null,
+                new List<ChartSeries>{ ChartSeries.OfTreeOrient(Gallery.T("Tree", "树图"), tRoot, "vertical") });
+            ChartView.Keyed(tr, 8186).Render(app, c0X, cY, halfW, cH);
+
+            ChartOption tr2 = ChartOption.Of(Gallery.T("Tree (horizontal)", "树图（横向）"), null,
+                new List<ChartSeries>{ ChartSeries.OfTreeOrient(Gallery.T("Tree", "树图"), tRoot, "horizontal") });
+            ChartView.Keyed(tr2, 8187).Render(app, c1X, cY, halfW, cH);
         } else if (name == "Chart.sunburst") {
             int cY = y + app.Scale(30);
             int cH = app.Scale(240);
@@ -3421,7 +3593,7 @@ class Gallery {
                     ChartNode.Leaf(Gallery.T("Widgets", "控件"), 30), ChartNode.Leaf("Canvas", 15), ChartNode.Leaf(Gallery.T("Themes", "主题"), 10) })
             });
             ChartOption sb = ChartOption.Of(Gallery.T("Zan codebase", "Zan 代码库"), null,
-                new List<ChartSeries>{ ChartSeries.OfTree(Gallery.T("Code", "代码"), ChartType.Sunburst, sbRoot) });
+                new List<ChartSeries>{ ChartSeries.SunburstTree(Gallery.T("Code", "代码"), sbRoot) });
             ChartView.Keyed(sb, 8173).Render(app, c0X, cY, halfW, cH);
 
             // A second sunburst: company headcount by department.
@@ -3432,7 +3604,7 @@ class Gallery {
                     ChartNode.Leaf(Gallery.T("Sales", "销售"), 50), ChartNode.Leaf(Gallery.T("Ops", "运营"), 25) })
             });
             ChartOption sb2 = ChartOption.Of(Gallery.T("Headcount", "人员规模"), null,
-                new List<ChartSeries>{ ChartSeries.OfTree(Gallery.T("Staff", "员工"), ChartType.Sunburst, sbRoot2) });
+                new List<ChartSeries>{ ChartSeries.SunburstTree(Gallery.T("Staff", "员工"), sbRoot2) });
             ChartView.Keyed(sb2, 8186).Render(app, c1X, cY, halfW, cH);
         } else if (name == "Chart.sankey") {
             int cY = y + app.Scale(30);
@@ -3611,8 +3783,10 @@ class Gallery {
                 new List<string>{ "00", "01", "02", "03", "04", "05", "06", "07" },
                 new List<ChartSeries>{
                     ChartSeries.Line(Gallery.T("Baseline", "基线"), new List<int>{ 22, 24, 23, 26, 25, 28, 27, 30 }),
-                    ChartSeries.OfPoints(Gallery.T("Spikes", "尖峰"), new List<int>{ 0, 1, 2, 3, 4, 5, 6, 7 },
-                        new List<int>{ 22, 24, 44, 26, 25, 50, 27, 30 })
+                    ChartSeries.OfPoints(Gallery.T("Spikes", "尖峰"), new List<ChartPoint>{
+                        ChartPoint.Of(0, 22), ChartPoint.Of(1, 24), ChartPoint.Of(2, 44), ChartPoint.Of(3, 26),
+                        ChartPoint.Of(4, 25), ChartPoint.Of(5, 50), ChartPoint.Of(6, 27), ChartPoint.Of(7, 30)
+                    })
                 });
             ChartView.Keyed(mx, 8197).Render(app, c0X, cY, halfW, cH);
 
@@ -4251,17 +4425,16 @@ class Gallery {
             int fgap = app.Scale(10);
             int ofId = new Button { Text = Gallery.T("Open file...", "打开文件...") }.Render(app, px, py, fbw);
             if (Ui.Clicked(app, ofId)) {
-                List<string> flabels = new List<string>();
-                List<string> fpats = new List<string>();
-                flabels.Add(Gallery.T("Zan source (*.zan)", "Zan 源文件 (*.zan)"));
-                fpats.Add(".zan");
-                flabels.Add(Gallery.T("Text (*.txt;*.md)", "文本 (*.txt;*.md)"));
-                fpats.Add(".txt;.md");
-                flabels.Add(Gallery.T("Data (*.json)", "数据 (*.json)"));
-                fpats.Add(".json");
-                flabels.Add(Gallery.T("All files (*.*)", "所有文件 (*.*)"));
-                fpats.Add("");
-                Gallery.filePicker.BeginOpenFileFilters("", flabels, fpats,
+                List<FileFilter> filters = new List<FileFilter>();
+                filters.Add(FileFilter.Create(
+                    Gallery.T("Zan source (*.zan)", "Zan 源文件 (*.zan)"), ".zan"));
+                filters.Add(FileFilter.Create(
+                    Gallery.T("Text (*.txt;*.md)", "文本 (*.txt;*.md)"), ".txt;.md"));
+                filters.Add(FileFilter.Create(
+                    Gallery.T("Data (*.json)", "数据 (*.json)"), ".json"));
+                filters.Add(FileFilter.Create(
+                    Gallery.T("All files (*.*)", "所有文件 (*.*)"), ""));
+                Gallery.filePicker.BeginOpenFileFilters("", filters,
                     Gallery.T("Open file", "打开文件"));
             }
             int odId = new Button { Text = Gallery.T("Open folder...", "打开文件夹...") }.Render(
@@ -4774,10 +4947,10 @@ class Gallery {
         Gallery.Add(list, "Layout", "FilePicker",
             Gallery.T("An open/save/folder dialog in its own OS window. Begin a session, route its window events in your loop, and read the chosen path from TakeResult(). Route each event to whichever window owns it (by hwnd) so the parent stays responsive while the dialog is open.",
                 "在独立系统窗口中弹出的“打开/保存/选择文件夹”对话框。开启一个会话，在事件循环中转发它的窗口事件，再从 TakeResult() 读取所选路径。按 hwnd 把每个事件分派给对应窗口，这样对话框打开时父窗口仍可正常响应。"),
-            "FilePicker fp = FilePicker.Create();\n// open with several extension filters (label + pattern list):\nList<string> labels = new List<string>{ \"Zan source (*.zan)\", \"Text (*.txt;*.md)\", \"All files (*.*)\" };\nList<string> pats = new List<string>{ \".zan\", \".txt;.md\", \"\" };\nfp.BeginOpenFileFilters(\"\", labels, pats, \"Open file\");\n\n// in the event loop, route by the OWNING window (native hwnd) so the parent\n// keeps responding while the dialog is open -- do NOT gate on fp.IsOpen():\nnint evh = Window.EventHwnd();\nif (fp.OwnsWindow(evh)) {\n    fp.ApplyEvent(evh);\n} else {\n    app.ApplyEvent(evh);\n}\nfp.RenderWindow();\nif (fp.TakeResult() == 1) {\n    string path = fp.SelectedPath();\n}")
+            "FilePicker fp = FilePicker.Create();\n// open with several extension filters:\nList<FileFilter> filters = new List<FileFilter>{\n    FileFilter.Create(\"Zan source (*.zan)\", \".zan\"),\n    FileFilter.Create(\"Text (*.txt;*.md)\", \".txt;.md\"),\n    FileFilter.Create(\"All files (*.*)\", \"\")\n};\nfp.BeginOpenFileFilters(\"\", filters, \"Open file\");\n\n// in the event loop, route by the OWNING window (native hwnd) so the parent\n// keeps responding while the dialog is open -- do NOT gate on fp.IsOpen():\nnint evh = Window.EventHwnd();\nif (fp.OwnsWindow(evh)) {\n    fp.ApplyEvent(evh);\n} else {\n    app.ApplyEvent(evh);\n}\nfp.RenderWindow();\nif (fp.TakeResult() == 1) {\n    string path = fp.SelectedPath();\n}")
             .Json("{\n  \"type\": \"FilePicker\",\n  \"name\": \"picker\",\n  \"mode\": \"open\",\n  \"filters\": [\n    {\n      \"label\": \"Zan (*.zan)\",\n      \"pattern\": \".zan\"\n    },\n    {\n      \"label\": \"All files\",\n      \"pattern\": \"*\"\n    }\n  ]\n}")
             .AddProp("mode", "BeginOpenFile/Filters/Save/Folder", "-", "Which dialog to start.")
-            .AddProp("filters", "List<string>", "-", "Label + pattern lists (e.g. \".txt;.md\").")
+            .AddProp("filters", "List<FileFilter>", "-", "Extension filters (label + pattern).")
             .AddProp("title", "string", "-", "Dialog title.")
             .AddEvent("IsOpen()", "bool", "False once the user confirms or cancels.")
             .AddEvent("SelectedPath()", "string", "The chosen path after it closes.");
@@ -5020,10 +5193,9 @@ class Gallery {
         Gallery.Add(list, "Data Display", "Timeline",
             Gallery.T("Display ordered events with titles and descriptions.",
                 "按顺序展示带标题和描述的事件时间线。"),
-            "List<TimelineItem> items = new List<TimelineItem>{ TimelineItem.Create(\"09:00\", \"Created\", \"Project initialized\"), TimelineItem.Create(\"12:30\", \"Published\", \"Executable generated\") };\nTimeline.Render(app, 40, 60, items);")
+            "List<TimelineItem> items = new List<TimelineItem>{ TimelineItem.Create(\"09:00\", \"Created\", \"Project initialized\"), TimelineItem.Create(\"12:30\", \"Published\", \"Executable generated\") };\nTimeline.Of(items).RenderAt(app, 40, 60, 420);")
             .Json("{\n  \"type\": \"Timeline\",\n  \"name\": \"timeline\",\n  \"items\": [\n    {\n      \"title\": \"Created\",\n      \"time\": \"09:00\"\n    },\n    {\n      \"title\": \"Shipped\",\n      \"time\": \"12:30\"\n    }\n  ]\n}")
-            .AddProp("titles", "List<string>", "-", "Per-event titles.")
-            .AddProp("descs", "List<string>", "-", "Per-event descriptions.");
+            .AddProp("items", "List<TimelineItem>", "-", "Ordered timeline entries.");
         Gallery.Add(list, "Data Display", "ListView",
             Gallery.T("Render a compact vertical list of strings.",
                 "渲染一个紧凑的字符串垂直列表。"),
@@ -5111,10 +5283,9 @@ class Gallery {
         Gallery.Add(list, "Data Display", "Collapse",
             Gallery.T("Display expandable sections controlled by a SignalInt open index.",
                 "展示可折叠的分区，由 SignalInt 的展开索引控制。"),
-            "List<string> heads = new List<string>{ \"General\", \"Advanced\" };\nList<string> content = new List<string>{ \"General settings\", \"Advanced settings\" };\nCollapse c = new Collapse();\nc.AddPanel(\"General\", \"Theme, language and startup\");\nc.AddPanel(\"Advanced\", \"Developer options\");\nc.Active = vm.openPanel;   // two-way\nc.RenderAt(app, 40, 60, 420);")
+            "List<CollapsePanel> panels = new List<CollapsePanel>{\n    CollapsePanel.Create(\"General\", \"Theme, language and startup\"),\n    CollapsePanel.Create(\"Advanced\", \"Developer options\")\n};\nCollapse c = Collapse.Of(panels, vm.openPanel);\nc.RenderAt(app, 40, 60, 420);")
             .Json("{\n  \"type\": \"Collapse\",\n  \"name\": \"collapse\",\n  \"items\": [\n    {\n      \"header\": \"Section 1\",\n      \"open\": true\n    },\n    {\n      \"header\": \"Section 2\",\n      \"open\": false\n    }\n  ]\n}")
-            .AddProp("heads", "List<string>", "-", "Section headers.")
-            .AddProp("content", "List<string>", "-", "Section bodies.")
+            .AddProp("panels", "List<CollapsePanel>", "-", "Section title/body records.")
             .AddProp("open", "SignalInt", "-", "Index of the expanded section.")
             .AddEvent("Change", "HandleClick(...)", "Clicking a header sets the open index.");
         Comp car = Comp.Create("Data Display", "Carousel",
@@ -5131,8 +5302,8 @@ class Gallery {
         car.AddEvent("Change", "HandleClick(...)", "Arrows / dots advance the active slide.");
         list.Add(car);
         Comp ch = Comp.Create("Data Display", "Chart",
-            Gallery.T("ECharts-style declarative charts: one ChartOption carries the title, axes and every series (ChartSeries typed factories like ChartSeries.Line/Bar/StackedLine, or OfCandles/OfBubbles/OfBoxes/OfErrors/OfPoints for the multi-value families), then ChartView.Of(option).Render(app, x, y, w, h) -- or the one-shot ChartOption.Of(title, categories, series) mirrors an ECharts option document exactly. Data can be parsed from JSON (ChartOption.FromJson) so the same chart is code- or data-driven. ChartView plays a grow-in intro, draws gradient/smoothed series and an optional hover crosshair + value tooltip. Beyond the cartesian/pie basics it covers step line, stacked area, stacked line (ECharts stack groups), candlestick (OHLC), bubble, box plot, error bars, polar/radar, funnel/pyramid, rose, waterfall, treemap, sunburst and sankey. Dense series decimate to plot width (ChartBig / candlestick bucketing / bubble striding) to stay fast on huge data.",
-                "ECharts 风格声明式图表：一个 ChartOption 携带标题、坐标轴和全部系列（ChartSeries 类型化工厂，如 Line/Bar/StackedLine，或多值家族的 OfCandles/OfBubbles/OfBoxes/OfErrors/OfPoints），然后 ChartView.Of(option).Render(app, x, y, w, h)——或一次性 ChartOption.Of(title, categories, series) 精确对应 ECharts 选项文档。数据可从 JSON 解析（ChartOption.FromJson），同一图表既可代码驱动也可数据驱动。ChartView 播放生长入场动画、绘制渐变/平滑系列和可选的悬停十字线 + 数值提示。除笛卡尔/饼图基础外，还覆盖阶梯折线、堆积面积、堆积折线（ECharts 堆叠组）、K 线（OHLC）、气泡、箱线、误差棒、极坐标/雷达、漏斗/金字塔、玫瑰、瀑布、矩形式树图、旭日图和桑基图。密集系列按绘图宽度降采样（ChartBig / K 线分桶 / 气泡跨步），大数据量下依旧流畅。"), "");
+            Gallery.T("Declarative charts: one ChartOption carries the title, axes and every series (ChartSeries typed factories like ChartSeries.Line/Bar/StackedLine, or OfCandles/OfBubbles/OfBoxes/OfErrors/OfPoints for the multi-value families), then ChartView.Of(option).Render(app, x, y, w, h). The option model follows familiar chart conventions while retaining Zan-specific APIs. Data can be parsed from JSON (ChartOption.FromJson) so the same chart is code- or data-driven. ChartView plays a grow-in intro, draws gradient/smoothed series and an optional hover crosshair + value tooltip. Beyond the cartesian/pie basics it covers gauge, step line, stacked area, stacked line, candlestick (OHLC), bubble, box plot, error bars, polar/radar, funnel/pyramid, rose, waterfall, treemap, sunburst and sankey. Dense series decimate to plot width to stay fast on huge data.",
+                "声明式图表：一个 ChartOption 携带标题、坐标轴和全部系列（ChartSeries 类型化工厂，如 Line/Bar/StackedLine，或多值家族的 OfCandles/OfBubbles/OfBoxes/OfErrors/OfPoints），然后调用 ChartView.Of(option).Render(app, x, y, w, h)。选项模型采用常见图表约定，同时保留 Zan 自身 API。数据可从 JSON 解析（ChartOption.FromJson），同一图表既可代码驱动也可数据驱动。ChartView 播放生长入场动画、绘制渐变/平滑系列和可选的悬停十字线与数值提示。除笛卡尔/饼图基础外，还覆盖仪表盘、阶梯折线、堆积面积、堆积折线、K 线（OHLC）、气泡、箱线、误差棒、极坐标/雷达、漏斗/金字塔、玫瑰、瀑布、矩形式树图、旭日图和桑基图。密集系列按绘图宽度降采样。"), "");
         ch.AddDemo("Line", Gallery.T("ChartSeries.Line plots one polyline per series over the shared category axis, animating up on first render -- ChartOption.Of(title, cats, series) is the one-shot declarative form.",
                 "ChartSeries.Line 在共享分类轴上为每个系列绘制一条折线，首次渲染时向上生长动画——ChartOption.Of(title, cats, series) 是声明式一次性写法。"), "Chart.line", 300,
             "ChartOption m = ChartOption.Of(\"Monthly revenue\",\n    new List<string>{ \"Jan\", \"Feb\", \"Mar\", \"Apr\", \"May\", \"Jun\",\n                      \"Jul\", \"Aug\", \"Sep\", \"Oct\", \"Nov\", \"Dec\" },\n    new List<ChartSeries>{\n        ChartSeries.Line(\"Revenue\", new List<int>{ 32, 45, 38, 52, 61, 48, 57, 66, 74, 69, 82, 95 }),\n        ChartSeries.Line(\"Cost\", new List<int>{ 18, 22, 20, 26, 30, 28, 25, 31, 36, 33, 39, 44 })\n    });\nChartView.Of(m).Render(app, 40, 40, 480, 200);",
@@ -5156,15 +5327,30 @@ class Gallery {
         ch.AddDemo("Pie & Donut", Gallery.T("Part-of-whole charts are compact, so lay them two-per-row instead of stretching one across the width. ChartSeries.Pie()/Donut() render each single-value series as a slice; the sweep grows in on first render and the donut prints the total in its hole. The two charts use different datasets so the pair reads as two examples, not one repeated.",
                 "占比类图表很紧凑，因此每行放两个而不是把单个拉满整宽。ChartSeries.Pie()/Donut() 把每个单值系列渲染为一个扇区；首次渲染时扇区扫入生长，环图在中心打印总计。两个图表使用不同数据集，读起来是两个示例而非重复。"), "Chart.pie", 300,
             "ChartOption pie = ChartOption.Of(\"Language share\", null,\n    new List<ChartSeries>{\n        ChartSeries.Pie(\"Zan\", new List<int>{ 38 }),\n        ChartSeries.Pie(\"C\", new List<int>{ 22 }),\n        ChartSeries.Pie(\"Rust\", new List<int>{ 16 }),\n        ChartSeries.Pie(\"Go\", new List<int>{ 9 })\n    });\nChartView.Of(pie).Render(app, 40, 40, 236, 200);\nChartOption don = ChartOption.Of(\"Browser share\", null,\n    new List<ChartSeries>{\n        ChartSeries.Donut(\"Chrome\", new List<int>{ 63 }),\n        ChartSeries.Donut(\"Safari\", new List<int>{ 19 }),\n        ChartSeries.Donut(\"Edge\", new List<int>{ 11 }),\n        ChartSeries.Donut(\"Firefox\", new List<int>{ 7 })\n    });\nChartView.Of(don).Render(app, 288, 40, 236, 200);", "{\n  \"type\": \"Chart\",\n  \"name\": \"chart\",\n  \"chartType\": \"pie\",\n  \"title\": \"Language share\",\n  \"labels\": [\n    \"Zan\",\n    \"C\",\n    \"Rust\",\n    \"Go\"\n  ],\n  \"series\": [\n    {\n      \"name\": \"Share\",\n      \"values\": [\n        38,\n        22,\n        16,\n        9\n      ]\n    }\n  ]\n}");
-        ch.AddDemo("Gauge & Radial", Gallery.T("Gauge (half-ring speedometer) and RadialBars (concentric progress rings) are KPI charts -- also two-per-row. o.gaugeMax sets full scale; each ring/needle sweeps in with the intro animation.",
-                "Gauge（半环速度表）和 RadialBars（同心进度环）是 KPI 类图表——同样每行两个。o.gaugeMax 设置满量程；每个环/指针随入场动画扫入。"), "Chart.radial", 300,
-            "ChartOption g = ChartOption.Of(\"CPU load\", null,\n    new List<ChartSeries>{ ChartSeries.Of(\"load\", ChartType.Gauge, new List<int>{ 72 }) });\ng.gaugeMax = 100;\nChartView.Of(g).Render(app, 40, 40, 236, 200);\n\nChartOption r = ChartOption.Of(\"Resource usage\", null,\n    new List<ChartSeries>{\n        ChartSeries.Of(\"CPU\", ChartType.RadialBars, new List<int>{ 80 }),\n        ChartSeries.Of(\"RAM\", ChartType.RadialBars, new List<int>{ 55 }),\n        ChartSeries.Of(\"Disk\", ChartType.RadialBars, new List<int>{ 30 }),\n        ChartSeries.Of(\"GPU\", ChartType.RadialBars, new List<int>{ 64 }),\n        ChartSeries.Of(\"Net\", ChartType.RadialBars, new List<int>{ 42 })\n    });\nr.gaugeMax = 100;\nChartView.Of(r).Render(app, 288, 40, 236, 200);", "{\n  \"type\": \"Chart\",\n  \"name\": \"chart\",\n  \"chartType\": \"radialBars\",\n  \"title\": \"KPIs\",\n  \"labels\": [\n    \"A\",\n    \"B\",\n    \"C\",\n    \"D\"\n  ],\n  \"series\": [\n    {\n      \"name\": \"Share\",\n      \"values\": [\n        40,\n        25,\n        20,\n        15\n      ]\n    }\n  ]\n}");
+        ch.AddDemo("Standard Gauge", Gallery.T("A Gauge series owns its range, arc, layout, ticks, labels, pointer and detail text. Four colour stops divide the axis band, and the pointer animates into place.",
+                "每个 Gauge 系列独立拥有量程、角度、布局、刻度、标签、指针和详情文本。四段颜色停止点划分轴环，指针随入场动画就位。"), "Chart.gauge", 300,
+            "ChartSeries s = ChartSeries.Gauge(\"CPU load\", 72);\ns.gauge.detail.formatter = \"{value}%\";\nChartOption o = ChartOption.Of(\"Standard gauge\", null,\n    new List<ChartSeries>{ s });\nChartView.Of(o).Render(app, 40, 40, 480, 220);", "");
+        ch.AddDemo("Half Gauge", Gallery.T("Gauge geometry uses ECharts startAngle/endAngle and typed px/% values. Nested axisLine, pointer, title and detail entities own their styles.",
+                "仪表盘几何使用 ECharts 的 startAngle/endAngle 与强类型 px/% 值；axisLine、pointer、title、detail 子实体分别拥有自己的样式。"), "Chart.gaugeHalf", 300,
+            "ChartSeries s = ChartSeries.Gauge(\"Temperature\", 68);\ns.gauge.min = 0; s.gauge.max = 120;\ns.gauge.startAngle = 180; s.gauge.endAngle = 0;\ns.gauge.center = ChartPosition.Of(ChartScalar.Pct(50), ChartScalar.Pct(88));\ns.gauge.radius = ChartScalar.Pct(90);\ns.gauge.detail.formatter = \"{value} °C\";", "");
+        ch.AddDemo("Multi Gauge", Gallery.T("Several Gauge series share the same 240 px content frame as the other gauge demos. Their percentage-based centers and radii form a balanced cluster without changing the card size.",
+                "多个 Gauge 系列与其他仪表盘示例共用同一个 240 px 内容画布；基于百分比的中心点和半径组成均衡仪表组，不再改变卡片尺寸。"), "Chart.gaugeMulti", 300,
+            "ChartSeries speed = ChartSeries.Gauge(\"Speed\", 128);\nspeed.gauge.max = 220; speed.gauge.radius = ChartScalar.Pct(58);\nspeed.gauge.center = ChartPosition.Of(ChartScalar.Pct(50), ChartScalar.Pct(53));\nChartSeries rpm = ChartSeries.Gauge(\"RPM\", 4);\nrpm.gauge.max = 7; rpm.gauge.radius = ChartScalar.Pct(31);\nrpm.gauge.center = ChartPosition.Of(ChartScalar.Pct(23), ChartScalar.Pct(67));\nChartOption o = ChartOption.Of(\"Vehicle cluster\", null,\n    new List<ChartSeries>{ speed, rpm });\nChartView.Of(o).Render(app, 40, 40, 480, 240);", "");
+        ch.AddDemo("Operations Dashboard", Gallery.T("A responsive dashboard composes four equally sized views chosen for the question: donut for revenue mix, radar for service balance, funnel for conversion and heatmap for time/channel intensity. It uses a 2x2 grid on wide cards and one column on narrow cards.",
+                "响应式仪表盘按问题选择四种等尺寸视图：环形图看营收构成、雷达图看服务均衡、漏斗图看转化、热力图看时段与渠道强度。宽卡片使用 2×2 网格，窄卡片自动切换为单列。"), "Chart.dashboard", 446,
+            "ChartOption mix = ChartOption.Of(\"Revenue mix\", null,\n    new List<ChartSeries>{\n        ChartSeries.Donut(\"Subscription\", new List<int>{ 46 }),\n        ChartSeries.Donut(\"Usage\", new List<int>{ 29 }),\n        ChartSeries.Donut(\"Services\", new List<int>{ 17 })\n    });\nList<string> metrics = new List<string>{ \"Latency\", \"Uptime\", \"Capacity\", \"Errors\", \"Security\" };\nChartOption health = ChartOption.Of(\"Service health\", metrics,\n    new List<ChartSeries>{\n        ChartSeries.Polar(\"Current\", new List<int>{ 82, 96, 74, 88, 91 }),\n        ChartSeries.Polar(\"Target\", new List<int>{ 92, 99, 88, 95, 96 })\n    });\nChartOption journey = ChartOption.Of(\"Customer journey\", null,\n    new List<ChartSeries>{\n        ChartSeries.Funnel(\"Visits\", new List<int>{ 100 }),\n        ChartSeries.Funnel(\"Trials\", new List<int>{ 63 }),\n        ChartSeries.Funnel(\"Paid\", new List<int>{ 24 })\n    });\nList<string> hours = new List<string>{ \"00\", \"04\", \"08\", \"12\", \"16\", \"20\" };\nChartOption traffic = ChartOption.Of(\"Traffic intensity\", hours,\n    new List<ChartSeries>{\n        ChartSeries.Of(\"API\", ChartType.Heatmap, new List<int>{ 8, 5, 46, 82, 71, 28 }),\n        ChartSeries.Of(\"Web\", ChartType.Heatmap, new List<int>{ 3, 2, 38, 68, 89, 44 })\n    });", "");
+        ch.AddDemo("Radial Bars", Gallery.T("RadialBars renders concentric KPI progress rings. o.gaugeMax remains the shared full scale for this chart family.",
+                "RadialBars 渲染同心 KPI 进度环；该图表家族仍使用 o.gaugeMax 作为共享满量程。"), "Chart.radial", 300,
+            "ChartOption g = ChartOption.Of(\"CPU load\", null,\n    new List<ChartSeries>{ ChartSeries.Gauge(\"load\", 72) });\ng.gaugeMax = 100;\nChartView.Of(g).Render(app, 40, 40, 236, 200);\n\nChartOption r = ChartOption.Of(\"Resource usage\", null,\n    new List<ChartSeries>{\n        ChartSeries.RadialBars(\"CPU\", 80),\n        ChartSeries.RadialBars(\"RAM\", 55),\n        ChartSeries.RadialBars(\"Disk\", 30),\n        ChartSeries.RadialBars(\"GPU\", 64),\n        ChartSeries.RadialBars(\"Net\", 42)\n    });\nr.gaugeMax = 100;\nChartView.Of(r).Render(app, 288, 40, 236, 200);", "{\n  \"type\": \"Chart\",\n  \"name\": \"chart\",\n  \"chartType\": \"radialBars\",\n  \"title\": \"KPIs\",\n  \"labels\": [\n    \"A\",\n    \"B\",\n    \"C\",\n    \"D\"\n  ],\n  \"series\": [\n    {\n      \"name\": \"Share\",\n      \"values\": [\n        40,\n        25,\n        20,\n        15\n      ]\n    }\n  ]\n}");
+        ch.AddDemo("Word cloud", Gallery.T("WordCloud renders named ChartData items as weighted keywords. Larger values receive larger type, and the deterministic spiral layout avoids overlaps while remaining stable between frames.",
+                "字符云把具名 ChartData 实体按权重绘制为关键词。数值越大字号越大，确定性螺旋布局避免重叠，并在帧间保持稳定。"), "Chart.wordcloud", 300,
+            "List<ChartData> words = new List<ChartData>{\n    ChartData.Named(100, \"Zan\"),\n    ChartData.Named(82, \"Compiler\"),\n    ChartData.Named(64, \"Runtime\"),\n    ChartData.Named(48, \"GUI\")\n};\nChartOption m = ChartOption.Of(\"Technology signals\", null,\n    new List<ChartSeries>{ ChartSeries.WordCloud(\"Keywords\", words) });\nm.showLegend = false;\nChartView.Of(m).Render(app, 40, 40, 480, 200);", "");
         ch.AddDemo("Heatmap", Gallery.T("A heatmap maps each series to a row and each value index to a column, colouring every cell by intensity (min->max ramps bgTertiary -> the series colour). Cells fade in with the intro animation. Good for calendars / correlation grids.",
                 "热力图将每个系列映射为一行、每个值索引映射为一列，按强度为每个单元格着色（min->max 从 bgTertiary 渐变到系列颜色）。单元格随入场动画淡入。适合日历 / 相关性矩阵。"), "Chart.heatmap", 300,
             "ChartOption m = ChartOption.Of(\"Weekly activity\",\n    new List<string>{ \"Mon\", \"Tue\", \"Wed\", \"Thu\", \"Fri\", \"Sat\", \"Sun\" },\n    new List<ChartSeries>{\n        ChartSeries.Of(\"Team A\", ChartType.Heatmap, new List<int>{ 12, 35, 50, 28, 64, 18, 8 }),\n        ChartSeries.Of(\"Team B\", ChartType.Heatmap, new List<int>{ 40, 22, 70, 90, 55, 30, 15 })\n    });\nChartView.Of(m).Render(app, 40, 40, 480, 200);", "{\n  \"type\": \"Chart\",\n  \"name\": \"chart\",\n  \"chartType\": \"heatmap\",\n  \"title\": \"Activity\",\n  \"labels\": [\n    \"Q1\",\n    \"Q2\",\n    \"Q3\",\n    \"Q4\"\n  ],\n  \"series\": [\n    {\n      \"name\": \"Cost\",\n      \"values\": [\n        12,\n        28,\n        20,\n        35\n      ]\n    },\n    {\n      \"name\": \"Revenue\",\n      \"values\": [\n        30,\n        48,\n        40,\n        60\n      ]\n    }\n  ]\n}");
-        ch.AddDemo("Scatter", Gallery.T("A scatter series (ChartSeries.OfPoints) carries x/y point arrays rendered on value axes. A Line series in the scatter space draws a connected polyline, so a linear-regression trend line can be fitted over the cloud; the second card is a 2000-point cloud served from the RenderCached snapshot (one pixel copy per frame) with live hover.",
-                "散点系列（ChartSeries.OfPoints）携带 x/y 点数组，在数值轴上渲染。散点空间中的 Line 系列绘制连线折线，因此可在点云上拟合线性回归趋势线；右侧卡片是 2000 点的点云，由 RenderCached 快照提供（每帧一次像素拷贝），并带实时悬停。"), "Chart.scatter", 300,
-            "List<int> xs = new List<int>{ 5, 12, 18, 24, 31, 40, 15, 28, 36, 8 };\nList<int> ys = new List<int>{ 8, 14, 11, 26, 22, 34, 19, 30, 16, 10 };\nChartSeries trend = ChartSeries.OfPoints(\"Trend\", new List<int>{ 5, 40 },\n    new List<int>{ 12, 34 });\ntrend.type = ChartType.Line;   // draws as a line in scatter space\nChartOption m = ChartOption.Of(\"Samples\", null,\n    new List<ChartSeries>{ ChartSeries.OfPoints(\"A\", xs, ys), trend });\nChartView.Of(m).Render(app, 40, 40, 480, 200);", "{\n  \"type\": \"Chart\",\n  \"name\": \"chart\",\n  \"chartType\": \"scatter\",\n  \"title\": \"Samples\",\n  \"series\": [\n    {\n      \"name\": \"A\",\n      \"scatterX\": [\n        5,\n        12,\n        18,\n        24\n      ],\n      \"scatterY\": [\n        8,\n        14,\n        11,\n        26\n      ]\n    }\n  ]\n}");
+        ch.AddDemo("Scatter", Gallery.T("A scatter series (ChartSeries.OfPoints) carries ChartPoint entities rendered on value axes. A Line series in the scatter space draws a connected polyline, so a linear-regression trend line can be fitted over the cloud; the second card is a 2000-point cloud served from the RenderCached snapshot (one pixel copy per frame) with live hover.",
+                "散点系列（ChartSeries.OfPoints）携带 ChartPoint 实体列表，在数值轴上渲染。散点空间中的 Line 系列绘制连线折线，因此可在点云上拟合线性回归趋势线；右侧卡片是 2000 点的点云，由 RenderCached 快照提供（每帧一次像素拷贝），并带实时悬停。"), "Chart.scatter", 300,
+            "List<ChartPoint> points = new List<ChartPoint>{ ChartPoint.Of(5, 8), ChartPoint.Of(12, 14), ChartPoint.Of(18, 11), ChartPoint.Of(24, 26), ChartPoint.Of(31, 22), ChartPoint.Of(40, 34), ChartPoint.Of(15, 19), ChartPoint.Of(28, 30), ChartPoint.Of(36, 16), ChartPoint.Of(8, 10) };\nChartSeries trend = ChartSeries.OfPoints(\"Trend\", new List<ChartPoint>{\n    ChartPoint.Of(5, 12), ChartPoint.Of(40, 34) });\ntrend.type = ChartType.Line;   // draws as a line in scatter space\nChartOption m = ChartOption.Of(\"Samples\", null,\n    new List<ChartSeries>{ ChartSeries.OfPoints(\"A\", points), trend });\nChartView.Of(m).Render(app, 40, 40, 480, 200);", "{\n  \"type\": \"Chart\",\n  \"name\": \"chart\",\n  \"chartType\": \"scatter\",\n  \"title\": \"Samples\",\n  \"series\": [\n    {\n      \"name\": \"A\",\n      \"points\": [\n        { \"x\": 5, \"y\": 8 },\n        { \"x\": 12, \"y\": 14 },\n        { \"x\": 18, \"y\": 11 },\n        { \"x\": 24, \"y\": 26 }\n      ]\n    }\n  ]\n}");
         ch.AddDemo("Calendar heatmap", Gallery.T("A GitHub-style contribution calendar: seven series (Mon..Sun) over 52 weeks fill a 7x52 grid; every series shares one green, so value intensity blends the layered greens of a contribution graph. Dense cells skip their labels automatically. Hover highlights the cell and shows the value.",
                 "GitHub 风格贡献日历：7 个系列（周一..周日）× 52 周填充 7x52 网格；所有系列共享一种绿色，值强度混合出贡献图的层次绿。密集单元格自动省略标签。悬停高亮单元格并显示数值。"), "Chart.heatmap_calendar", 300,
             "List<ChartSeries> csr = new List<ChartSeries>();\ncsr.Add(ChartSeries.Of(\"Mon\", ChartType.Heatmap, weekValues));\ncsr.Add(ChartSeries.Of(\"Tue\", ChartType.Heatmap, weekValues2));\n// ... one series per weekday, 52 values each; all share one green:\ncsr[0].color = Chart.Rgb(56, 164, 88);\nChartOption m = ChartOption.Of(\"Contributions\", new List<string>(), csr);\nChartView.Of(m).Render(app, 40, 40, 480, 220);", "{\n  \"type\": \"Chart\",\n  \"name\": \"chart\",\n  \"chartType\": \"heatmap\",\n  \"title\": \"Contributions\",\n  \"labels\": [],\n  \"series\": [\n    {\n      \"name\": \"Mon\",\n      \"values\": [\n        40,\n        52,\n        61,\n        48,\n        33,\n        20,\n        12,\n        8\n      ]\n    }\n  ]\n}");
@@ -5188,13 +5374,13 @@ class Gallery {
             "List<BoxItem> b = new List<BoxItem>{ BoxItem.Of(10,25,40,55,70), BoxItem.Of(20,35,45,60,85) };\nChartOption m = ChartOption.Of(\"Latency\", labels,\n    new List<ChartSeries>{ ChartSeries.OfBoxes(\"Latency\", b) });\nChartView.Of(m).Render(app, 40, 40, 480, 200);", "{\n  \"type\": \"Chart\",\n  \"name\": \"chart\",\n  \"chartType\": \"box\",\n  \"title\": \"Distribution\",\n  \"boxes\": [\n    {\n      \"min\": 5,\n      \"q1\": 10,\n      \"median\": 15,\n      \"q3\": 20,\n      \"max\": 25\n    }\n  ]\n}");
         ch.AddDemo("Error bars", Gallery.T("Value +/- margin from a List<ErrorItem> (y, err): a line through the points plus vertical caps for the error range.",
                 "由 List<ErrorItem>（y, err）绘制的数值 ± 误差棒：穿过各点的折线外加误差范围的垂直端帽。"), "Chart.error", 300,
-            "List<ErrorItem> e = new List<ErrorItem>{ ErrorItem.Of(40,6), ErrorItem.Of(55,8) };\nChartOption m = ChartOption.Of(\"Measurement\", labels,\n    new List<ChartSeries>{ ChartSeries.OfErrors(\"Meas\", e) });\nChartView.Of(m).Render(app, 40, 40, 480, 200);", "{\n  \"type\": \"Chart\",\n  \"name\": \"chart\",\n  \"chartType\": \"errorBar\",\n  \"title\": \"Measurements\",\n  \"errors\": [\n    {\n      \"value\": 20,\n      \"margin\": 3\n    },\n    {\n      \"value\": 28,\n      \"margin\": 4\n    }\n  ]\n}");
+            "List<ErrorItem> e = new List<ErrorItem>{ ErrorItem.Of(\"A\",40,6), ErrorItem.Of(\"B\",55,8) };\nChartOption m = ChartOption.Of(\"Measurement\", labels,\n    new List<ChartSeries>{ ChartSeries.OfErrors(\"Meas\", e) });\nChartView.Of(m).Render(app, 40, 40, 480, 200);", "{\n  \"type\": \"Chart\",\n  \"name\": \"chart\",\n  \"chartType\": \"errorBar\",\n  \"title\": \"Measurements\",\n  \"errors\": [\n    {\n      \"value\": 20,\n      \"margin\": 3\n    },\n    {\n      \"value\": 28,\n      \"margin\": 4\n    }\n  ]\n}");
         ch.AddDemo("Polar / radar", Gallery.T("ChartSeries.Polar draws each series as a closed polygon over angular category spokes with concentric rings -- a radar/spider chart.",
                 "ChartSeries.Polar 将每个系列绘制为围绕角度分类辐条的闭合多边形，并带同心环——即雷达/蛛网图。"), "Chart.polar", 300,
             "ChartOption m = ChartOption.Of(\"Comparison\", labels,\n    new List<ChartSeries>{\n        ChartSeries.Polar(\"Model X\", mx),\n        ChartSeries.Polar(\"Model Y\", my)\n    });\nChartView.Of(m).Render(app, 40, 40, 480, 200);", "{\n  \"type\": \"Chart\",\n  \"name\": \"chart\",\n  \"chartType\": \"polar\",\n  \"title\": \"Radar\",\n  \"labels\": [\n    \"A\",\n    \"B\",\n    \"C\",\n    \"D\"\n  ],\n  \"series\": [\n    {\n      \"name\": \"Share\",\n      \"values\": [\n        40,\n        25,\n        20,\n        15\n      ]\n    }\n  ]\n}");
         ch.AddDemo("Funnel / pyramid", Gallery.T("Descending stages as centered trapezoids. Each single-value series is a stage (name + value); ChartSeries.Pyramid flips it narrow-at-top.",
                 "逐级递减的居中梯形阶段。每个单值系列是一个阶段（name + value）；ChartSeries.Pyramid 翻转为顶部窄。"), "Chart.funnel", 300,
-            "ChartOption m = ChartOption.Of(\"Conversion\", null,\n    new List<ChartSeries>{\n        ChartSeries.Funnel(\"Visits\", new List<int>{ 1000 }),\n        ChartSeries.Funnel(\"Signups\", new List<int>{ 640 }),\n        ChartSeries.Funnel(\"Trials\", new List<int>{ 380 }),\n        ChartSeries.Funnel(\"Paid\", new List<int>{ 120 })\n    });\nChartView.Of(m).Render(app, 40, 40, 236, 200);\n// same stages, Pyramid type (narrow at top):\nm.series[0].type = ChartType.Pyramid;\nm.series[1].type = ChartType.Pyramid;\nm.series[2].type = ChartType.Pyramid;\nm.series[3].type = ChartType.Pyramid;\nChartView.Of(m).Render(app, 288, 40, 236, 200);", "{\n  \"type\": \"Chart\",\n  \"name\": \"chart\",\n  \"chartType\": \"funnel\",\n  \"title\": \"Conversion\",\n  \"labels\": [\n    \"A\",\n    \"B\",\n    \"C\",\n    \"D\"\n  ],\n  \"series\": [\n    {\n      \"name\": \"Share\",\n      \"values\": [\n        40,\n        25,\n        20,\n        15\n      ]\n    }\n  ]\n}");
+            "ChartOption m = ChartOption.Of(\"Conversion\", null,\n    new List<ChartSeries>{\n        ChartSeries.Funnel(\"Visits\", new List<int>{ 1000 }),\n        ChartSeries.Funnel(\"Signups\", new List<int>{ 640 }),\n        ChartSeries.Funnel(\"Trials\", new List<int>{ 380 }),\n        ChartSeries.Funnel(\"Paid\", new List<int>{ 120 })\n    });\nChartView.Of(m).Render(app, 40, 40, 236, 200);\n// same stages, pyramid (narrow at top) = funnel + sort \"ascending\":\nm.series[0].sort = \"ascending\";\nm.series[1].sort = \"ascending\";\nm.series[2].sort = \"ascending\";\nm.series[3].sort = \"ascending\";\nChartView.Of(m).Render(app, 288, 40, 236, 200);", "{\n  \"type\": \"Chart\",\n  \"name\": \"chart\",\n  \"chartType\": \"funnel\",\n  \"title\": \"Conversion\",\n  \"labels\": [\n    \"A\",\n    \"B\",\n    \"C\",\n    \"D\"\n  ],\n  \"series\": [\n    {\n      \"name\": \"Share\",\n      \"values\": [\n        40,\n        25,\n        20,\n        15\n      ]\n    }\n  ]\n}");
         ch.AddDemo("Rose / nightingale", Gallery.T("ChartSeries.Rose gives every stage an equal angular sector whose radius scales with its value (a Nightingale rose diagram).",
                 "ChartSeries.Rose 给每个阶段相同的角度扇区，半径按值缩放（南丁格尔玫瑰图）。"), "Chart.rose", 300,
             "ChartOption m = ChartOption.Of(\"Daily volume\", null,\n    new List<ChartSeries>{\n        ChartSeries.Rose(\"Mon\", new List<int>{ 45 }),\n        ChartSeries.Rose(\"Tue\", new List<int>{ 72 })\n    });\nChartView.Of(m).Render(app, 40, 40, 480, 200);", "{\n  \"type\": \"Chart\",\n  \"name\": \"chart\",\n  \"chartType\": \"rose\",\n  \"title\": \"Rose\",\n  \"labels\": [\n    \"A\",\n    \"B\",\n    \"C\",\n    \"D\"\n  ],\n  \"series\": [\n    {\n      \"name\": \"Share\",\n      \"values\": [\n        40,\n        25,\n        20,\n        15\n      ]\n    }\n  ]\n}");
@@ -5215,13 +5401,16 @@ class Gallery {
             "ChartOption o = ChartOption.Of(\"Traffic sources\", null,\n    new List<ChartSeries>{\n        ChartSeries.Donut(\"Direct\", new List<int>{ 34 }),\n        ChartSeries.Donut(\"Referral\", new List<int>{ 22 }),\n        ChartSeries.Donut(\"Social\", new List<int>{ 18 }),\n        ChartSeries.Donut(\"Organic\", new List<int>{ 14 }),\n        ChartSeries.Donut(\"Email\", new List<int>{ 8 }),\n        ChartSeries.Donut(\"Ads\", new List<int>{ 4 })\n    });\no.pieLabels = true;\nChartView.Of(o).Render(app, 40, 40, 480, 210);", "{\n  \"type\": \"Chart\",\n  \"name\": \"chart\",\n  \"chartType\": \"pie\",\n  \"title\": \"Labelled pie\",\n  \"labels\": [\n    \"A\",\n    \"B\",\n    \"C\",\n    \"D\"\n  ],\n  \"series\": [\n    {\n      \"name\": \"Share\",\n      \"values\": [\n        40,\n        25,\n        20,\n        15\n      ]\n    }\n  ]\n}");
         ch.AddDemo("Waterfall", Gallery.T("Waterfall columns are deltas hanging from a running total, so rises and falls share one baseline; a data item named \"total\" draws the full running total as a subtotal bar (ECharts waterfall).",
                 "瀑布图柱是挂在累计值上的增量，涨跌共享同一基线；名为 \"total\" 的数据项绘制完整累计值作为小计柱（ECharts 瀑布图）。"), "Chart.waterfall", 300,
-            "List<ChartData> d = new List<ChartData>();\nd.Add(ChartData.Of(100)); d.Add(ChartData.Of(45)); d.Add(ChartData.Of(30));\nd.Add(ChartData.Of(-20)); d.Add(ChartData.Of(-35)); d.Add(ChartData.Of(25));\nd.Add(ChartData.Of(-12)); d.Add(ChartData.Of(-18)); d.Add(ChartData.Of(-9));\nd.Add(ChartData.Named(0, \"total\"));\nChartOption m = ChartOption.Of(\"Cash flow (k$)\", labels,\n    new List<ChartSeries>{ ChartSeries.Named(\"Flow\", ChartType.Waterfall, d) });\nm.showValues = true;\nChartView.Of(m).Render(app, 40, 40, 480, 200);", "{\n  \"type\": \"Chart\",\n  \"name\": \"chart\",\n  \"chartType\": \"waterfall\",\n  \"title\": \"Cash flow\",\n  \"labels\": [\n    \"Q1\",\n    \"Q2\",\n    \"Q3\",\n    \"Q4\"\n  ],\n  \"series\": [\n    {\n      \"name\": \"Flow\",\n      \"values\": [\n        120,\n        80,\n        60,\n        -40\n      ]\n    }\n  ]\n}");
+            "List<ChartData> d = new List<ChartData>();\nd.Add(ChartData.Of(100)); d.Add(ChartData.Of(45)); d.Add(ChartData.Of(30));\nd.Add(ChartData.Of(-20)); d.Add(ChartData.Of(-35)); d.Add(ChartData.Of(25));\nd.Add(ChartData.Of(-12)); d.Add(ChartData.Of(-18)); d.Add(ChartData.Of(-9));\nd.Add(ChartData.Named(0, \"total\"));\nChartOption m = ChartOption.Of(\"Cash flow (k$)\", labels,\n    new List<ChartSeries>{ ChartSeries.Waterfall(\"Flow\", d) });\nm.showValues = true;\nChartView.Of(m).Render(app, 40, 40, 480, 200);", "{\n  \"type\": \"Chart\",\n  \"name\": \"chart\",\n  \"chartType\": \"waterfall\",\n  \"title\": \"Cash flow\",\n  \"labels\": [\n    \"Q1\",\n    \"Q2\",\n    \"Q3\",\n    \"Q4\"\n  ],\n  \"series\": [\n    {\n      \"name\": \"Flow\",\n      \"values\": [\n        120,\n        80,\n        60,\n        -40\n      ]\n    }\n  ]\n}");
         ch.AddDemo("Treemap", Gallery.T("Hierarchical data (ChartNode.Leaf / ChartNode.Group) rendered as nested rectangles; the split alternates direction per depth and group cells recurse when they are big enough.",
                 "分层数据（ChartNode.Leaf / ChartNode.Group）渲染为嵌套矩形；每层深度交替切分方向，组单元格足够大时递归细分。"), "Chart.treemap", 300,
             "ChartNode root = ChartNode.Group(\"Visits\", new List<ChartNode>{\n    ChartNode.Group(\"Web\", new List<ChartNode>{ ChartNode.Leaf(\"Chrome\", 380), ChartNode.Leaf(\"Safari\", 210) }),\n    ChartNode.Group(\"Mobile\", new List<ChartNode>{ ChartNode.Leaf(\"Android\", 340), ChartNode.Leaf(\"iOS\", 290) })\n});\nChartOption m = ChartOption.Of(\"Visitor share\", null,\n    new List<ChartSeries>{ ChartSeries.OfTree(\"Visits\", ChartType.Treemap, root) });\nChartView.Of(m).Render(app, 40, 40, 480, 200);", "{\n  \"type\": \"Chart\",\n  \"name\": \"chart\",\n  \"chartType\": \"treemap\",\n  \"title\": \"Visitor share\",\n  \"labels\": [\n    \"Q1\",\n    \"Q2\",\n    \"Q3\",\n    \"Q4\"\n  ],\n  \"series\": [\n    {\n      \"name\": \"Cost\",\n      \"values\": [\n        12,\n        28,\n        20,\n        35\n      ]\n    },\n    {\n      \"name\": \"Revenue\",\n      \"values\": [\n        30,\n        48,\n        40,\n        60\n      ]\n    }\n  ]\n}");
+        ch.AddDemo("Tree", Gallery.T("ChartSeries.OfTreeOrient renders a layered node-link diagram from ChartNode data — ECharts type 'tree'. orient \"vertical\" stacks the levels downward with the leaves spread across the width; \"horizontal\" lays the levels left-to-right with leaves down the height. Broken orthogonal connectors join each node to its children.",
+                "ChartSeries.OfTreeOrient 用 ChartNode 数据渲染分层节点-连线图——ECharts 的 'tree' 类型。orient 为 \"vertical\" 时层级向下堆叠、叶子沿宽度展开；\"horizontal\" 时层级从左到右、叶子沿高度排列。节点到子节点用正交折线连接。"), "Chart.tree", 300,
+            "ChartNode root = ChartNode.Group(\"Root\", new List<ChartNode>{\n    ChartNode.Group(\"Node 1\", new List<ChartNode>{\n        ChartNode.Leaf(\"Leaf 1\", 4), ChartNode.Leaf(\"Leaf 2\", 4),\n        ChartNode.Leaf(\"Leaf 3\", 2) }),\n    ChartNode.Group(\"Node 2\", new List<ChartNode>{\n        ChartNode.Leaf(\"Leaf 7\", 4), ChartNode.Leaf(\"Leaf 8\", 4) })\n});\n// vertical (levels go down) or \"horizontal\" (levels go right):\nChartOption m = ChartOption.Of(\"Tree\", null,\n    new List<ChartSeries>{ ChartSeries.OfTreeOrient(\"Tree\", root, \"vertical\") });\nChartView.Of(m).Render(app, 40, 40, 480, 200);", "{\n  \"type\": \"Chart\",\n  \"name\": \"chart\",\n  \"chartType\": \"tree\",\n  \"title\": \"Tree\",\n  \"labels\": [\n    \"Q1\",\n    \"Q2\",\n    \"Q3\",\n    \"Q4\"\n  ],\n  \"series\": [\n    {\n      \"name\": \"Cost\",\n      \"values\": [\n        12,\n        28,\n        20,\n        35\n      ]\n    },\n    {\n      \"name\": \"Revenue\",\n      \"values\": [\n        30,\n        48,\n        40,\n        60\n      ]\n    }\n  ]\n}");
         ch.AddDemo("Sunburst", Gallery.T("Hierarchical data as concentric rings (ChartNode.Leaf / ChartNode.Group): each level is a ring, a group's children sweep its arc, and the center labels the root.",
                 "分层数据的同心环展示（ChartNode.Leaf / ChartNode.Group）：每层是一个环，组的子项扫过其弧段，中心标注根节点。"), "Chart.sunburst", 300,
-            "ChartNode root = ChartNode.Group(\"Zan\", new List<ChartNode>{\n    ChartNode.Group(\"Engine\", new List<ChartNode>{ ChartNode.Leaf(\"Runtime\", 40), ChartNode.Leaf(\"Compiler\", 25) }),\n    ChartNode.Group(\"UI\", new List<ChartNode>{ ChartNode.Leaf(\"Widgets\", 30), ChartNode.Leaf(\"Canvas\", 15) })\n});\nChartOption m = ChartOption.Of(\"Zan codebase\", null,\n    new List<ChartSeries>{ ChartSeries.OfTree(\"Code\", ChartType.Sunburst, root) });\nChartView.Of(m).Render(app, 40, 40, 480, 200);", "{\n  \"type\": \"Chart\",\n  \"name\": \"chart\",\n  \"chartType\": \"sunburst\",\n  \"title\": \"Zan codebase\",\n  \"labels\": [\n    \"Q1\",\n    \"Q2\",\n    \"Q3\",\n    \"Q4\"\n  ],\n  \"series\": [\n    {\n      \"name\": \"Cost\",\n      \"values\": [\n        12,\n        28,\n        20,\n        35\n      ]\n    },\n    {\n      \"name\": \"Revenue\",\n      \"values\": [\n        30,\n        48,\n        40,\n        60\n      ]\n    }\n  ]\n}");
+            "ChartNode root = ChartNode.Group(\"Zan\", new List<ChartNode>{\n    ChartNode.Group(\"Engine\", new List<ChartNode>{ ChartNode.Leaf(\"Runtime\", 40), ChartNode.Leaf(\"Compiler\", 25) }),\n    ChartNode.Group(\"UI\", new List<ChartNode>{ ChartNode.Leaf(\"Widgets\", 30), ChartNode.Leaf(\"Canvas\", 15) })\n});\nChartOption m = ChartOption.Of(\"Zan codebase\", null,\n    new List<ChartSeries>{ ChartSeries.SunburstTree(\"Code\", root) });\nChartView.Of(m).Render(app, 40, 40, 480, 200);", "{\n  \"type\": \"Chart\",\n  \"name\": \"chart\",\n  \"chartType\": \"sunburst\",\n  \"title\": \"Zan codebase\",\n  \"labels\": [\n    \"Q1\",\n    \"Q2\",\n    \"Q3\",\n    \"Q4\"\n  ],\n  \"series\": [\n    {\n      \"name\": \"Cost\",\n      \"values\": [\n        12,\n        28,\n        20,\n        35\n      ]\n    },\n    {\n      \"name\": \"Revenue\",\n      \"values\": [\n        30,\n        48,\n        40,\n        60\n      ]\n    }\n  ]\n}");
         ch.AddDemo("Sankey", Gallery.T("Directed flow links (ChartLink.Of(from, to, value)) between layered nodes; nodes are derived from the links, layer from longest-path, and link thickness scales with the flow value.",
                 "分层节点间的有向流链接（ChartLink.Of(from, to, value)）；节点由链接推导，层级按最长路径，链接粗细随流量值缩放。"), "Chart.sankey", 300,
             "List<ChartLink> links = new List<ChartLink>{ ChartLink.Of(\"Coal\", \"Power\", 40), ChartLink.Of(\"Power\", \"Industry\", 45) };\nChartOption m = ChartOption.Of(\"Energy flow (TWh)\", null,\n    new List<ChartSeries>{ ChartSeries.OfLinks(\"Energy\", links) });\nChartView.Of(m).Render(app, 40, 40, 480, 200);", "{\n  \"type\": \"Chart\",\n  \"name\": \"chart\",\n  \"chartType\": \"sankey\",\n  \"title\": \"Energy flow\",\n  \"labels\": [\n    \"Q1\",\n    \"Q2\",\n    \"Q3\",\n    \"Q4\"\n  ],\n  \"series\": [\n    {\n      \"name\": \"Cost\",\n      \"values\": [\n        12,\n        28,\n        20,\n        35\n      ]\n    },\n    {\n      \"name\": \"Revenue\",\n      \"values\": [\n        30,\n        48,\n        40,\n        60\n      ]\n    }\n  ]\n}");
@@ -5239,7 +5428,7 @@ class Gallery {
             "List<ChartData> rd = new List<ChartData>();\nrd.Add(ChartData.Colored(64, Chart.Rgb(229, 115, 115)));\nrd.Add(ChartData.Colored(52, Chart.Rgb(229, 160, 104)));\nrd.Add(ChartData.Colored(61, Chart.Rgb(242, 203, 93)));\nrd.Add(ChartData.Colored(73, Chart.Rgb(119, 200, 116)));\nrd.Add(ChartData.Colored(58, Chart.Rgb(89, 176, 209)));\nrd.Add(ChartData.Colored(68, Chart.Rgb(147, 137, 211)));\nrd.Add(ChartData.Colored(46, Chart.Rgb(205, 132, 175)));\nChartOption m = ChartOption.Of(\"Weekly activity score\", labels,\n    new List<ChartSeries>{ ChartSeries.Named(\"Score\", ChartType.Bar, rd) });\nChartView.Of(m).Render(app, 40, 40, 480, 200);", "{\n  \"type\": \"Chart\",\n  \"name\": \"chart\",\n  \"chartType\": \"bar\",\n  \"title\": \"Rainbow bars\",\n  \"labels\": [\n    \"A\",\n    \"B\",\n    \"C\",\n    \"D\"\n  ],\n  \"series\": [\n    {\n      \"name\": \"Score\",\n      \"values\": [\n        40,\n        25,\n        20,\n        15\n      ]\n    }\n  ]\n}");
         ch.AddDemo("Mixed series", Gallery.T("Series carry their own type, so one option mixes families: a line with a scatter overlay reads as trend + outliers (ECharts mix4), or bars with a moving-average line.",
                 "系列自带类型，一个选项即可混搭图表族：折线叠加散点读作趋势 + 离群点（ECharts mix4），或柱状叠加移动平均线。"), "Chart.mix", 300,
-            "ChartOption m = ChartOption.Of(\"Sensor readings\", labels,\n    new List<ChartSeries>{\n        ChartSeries.Line(\"Baseline\", new List<int>{ 22, 24, 23, 26, 25, 28, 27, 30 }),\n        ChartSeries.OfPoints(\"Spikes\", new List<int>{ 0, 1, 2, 3, 4, 5, 6, 7 },\n            new List<int>{ 22, 24, 44, 26, 25, 50, 27, 30 })\n    });\nChartView.Of(m).Render(app, 40, 40, 480, 200);", "{\n  \"type\": \"Chart\",\n  \"name\": \"chart\",\n  \"chartType\": \"line\",\n  \"title\": \"Mixed series\",\n  \"labels\": [\n    \"Q1\",\n    \"Q2\",\n    \"Q3\",\n    \"Q4\"\n  ],\n  \"series\": [\n    {\n      \"name\": \"Baseline\",\n      \"values\": [\n        22,\n        24,\n        23,\n        26\n      ]\n    },\n    {\n      \"name\": \"Spikes\",\n      \"values\": [\n        22,\n        24,\n        44,\n        26\n      ]\n    }\n  ]\n}");
+            "ChartOption m = ChartOption.Of(\"Sensor readings\", labels,\n    new List<ChartSeries>{\n        ChartSeries.Line(\"Baseline\", new List<int>{ 22, 24, 23, 26, 25, 28, 27, 30 }),\n        ChartSeries.OfPoints(\"Spikes\", new List<ChartPoint>{\n            ChartPoint.Of(0, 22), ChartPoint.Of(1, 24), ChartPoint.Of(2, 44), ChartPoint.Of(3, 26),\n            ChartPoint.Of(4, 25), ChartPoint.Of(5, 50), ChartPoint.Of(6, 27), ChartPoint.Of(7, 30)\n        })\n    });\nChartView.Of(m).Render(app, 40, 40, 480, 200);", "{\n  \"type\": \"Chart\",\n  \"name\": \"chart\",\n  \"chartType\": \"line\",\n  \"title\": \"Mixed series\",\n  \"labels\": [\n    \"Q1\",\n    \"Q2\",\n    \"Q3\",\n    \"Q4\"\n  ],\n  \"series\": [\n    {\n      \"name\": \"Baseline\",\n      \"values\": [\n        22,\n        24,\n        23,\n        26\n      ]\n    },\n    {\n      \"name\": \"Spikes\",\n      \"values\": [\n        22,\n        24,\n        44,\n        26\n      ]\n    }\n  ]\n}");
         ch.AddDemo("Live data", Gallery.T("The data window slides on a wall-clock beat and each paint re-arms app.RequestAnimationFrame, so the series scroll smoothly at ~30fps with no timer thread -- the ECharts dynamicLineBar look: a line with live bars sharing its axis.",
                 "数据窗口按墙钟节拍滑动，每次绘制重新武装 app.RequestAnimationFrame，系列以约 30fps 平滑滚动且无需定时器线程——ECharts dynamicLineBar 观感：折线与实时柱共享同一坐标轴。"), "Chart.dynamic", 300,
             "// Wall-clock phase keeps the motion smooth at any repaint rate; the\n// render path calls app.RequestAnimationFrame(33) to keep frames coming.\nint ph = Window.GetTickMs() / 120;\nList<int> line = new List<int>();\nList<int> bars = new List<int>();\nint i = 0;\nwhile (i < 20) {\n    line.Add(55 + (i * 3) % 25 + ChartView.SinDeg((ph + i * 7) % 360) * 30 / 1000);\n    bars.Add(25 + (i * 5) % 30 + ChartView.SinDeg((ph * 2 + i * 11) % 360) * 20 / 1000);\n    i = i + 1;\n}\nChartOption m = ChartOption.Of(\"Live signal\", labels,\n    new List<ChartSeries>{\n        ChartSeries.Line(\"Trend\", line),\n        ChartSeries.Bar(\"Volume\", bars)\n    });\nm.smooth = true;\nChartView.Of(m).Render(app, 40, 40, 480, 200);\napp.RequestAnimationFrame(33);", "{\n  \"type\": \"Chart\",\n  \"name\": \"chart\",\n  \"chartType\": \"line\",\n  \"title\": \"Live data\",\n  \"labels\": [\n    \"Q1\",\n    \"Q2\",\n    \"Q3\",\n    \"Q4\"\n  ],\n  \"series\": [\n    {\n      \"name\": \"Trend\",\n      \"values\": [\n        30,\n        48,\n        40,\n        60\n      ]\n    },\n    {\n      \"name\": \"Volume\",\n      \"values\": [\n        25,\n        20,\n        35,\n        28\n      ]\n    }\n  ]\n}");
@@ -5248,7 +5437,7 @@ class Gallery {
             "// Static heavy chart -> cache it: first frame rasterizes, then\n// every frame is one pixel copy (slot 0-7, self-invalidates on\n// data/zoom/theme changes).\nChartView.RenderCached(app, m, 0, 40, 40, 460, 150);\nChartView.HeatmapHover(app, 40, 40, 460, 150, m);\n// Live charts -> re-arm the shared animation clock.\napp.RequestAnimationFrame(33);", "{\n  \"type\": \"Chart\",\n  \"name\": \"chart\",\n  \"chartType\": \"heatmap\",\n  \"title\": \"Cached heatmap\",\n  \"labels\": [\n    \"Q1\",\n    \"Q2\",\n    \"Q3\",\n    \"Q4\"\n  ],\n  \"series\": [\n    {\n      \"name\": \"R1\",\n      \"values\": [\n        40,\n        52,\n        61,\n        48\n      ]\n    }\n  ]\n}");
         ch.AddDemo("Dataset + encode", Gallery.T("ECharts-style ChartDataset holds named dimensions column-major once; each chart selects dimensions via EncodeNamed / EncodeBy -- no copying or reshaping. Here one dataset drives a grouped bar and an area chart.",
                 "ECharts 风格 ChartDataset 一次以列主序保存具名维度；每个图表通过 EncodeNamed / EncodeBy 选择维度——无需复制或重塑。这里一个数据集驱动分组柱状图和面积图。"), "Chart.dataset", 300,
-            "ChartDataset ds = ChartDataset.WithCats(dims, cols, cats);\nChartOption a = ds.EncodeNamed(\"Sales vs Cost\", new List<string>{ \"Sales\", \"Cost\" }, ChartType.Bar);\nChartOption b = ds.EncodeNamed(\"Profit\", new List<string>{ \"Profit\" }, ChartType.Area);\nChartView.Of(a).Render(app, 40, 40, 236, 200);\nChartView.Of(b).Render(app, 288, 40, 236, 200);", "{\n  \"type\": \"Chart\",\n  \"name\": \"chart\",\n  \"chartType\": \"bar\",\n  \"title\": \"Dataset-encoded\",\n  \"dataset\": {\n    \"dims\": [\n      \"Product\",\n      \"2023\",\n      \"2024\"\n    ],\n    \"cols\": [\n      [\n        \"A\",\n        \"B\",\n        \"C\"\n      ],\n      [\n        10,\n        20,\n        30\n      ],\n      [\n        15,\n        25,\n        35\n      ]\n    ]\n  },\n  \"encode\": [\n    \"2023\",\n    \"2024\"\n  ]\n}");
+            "ChartDataset ds = ChartDataset.WithCats(dimensions, cats);\nChartOption a = ds.EncodeNamed(\"Sales vs Cost\", new List<string>{ \"Sales\", \"Cost\" }, ChartType.Bar);\nChartOption b = ds.EncodeNamed(\"Profit\", new List<string>{ \"Profit\" }, ChartType.Line);\nb.series[0].areaStyle = true;   // filled line = ECharts line.areaStyle\nChartView.Of(a).Render(app, 40, 40, 236, 200);\nChartView.Of(b).Render(app, 288, 40, 236, 200);", "{\n  \"type\": \"Chart\",\n  \"name\": \"chart\",\n  \"chartType\": \"bar\",\n  \"title\": \"Dataset-encoded\",\n  \"dataset\": {\n    \"dims\": [\n      \"Product\",\n      \"2023\",\n      \"2024\"\n    ],\n    \"cols\": [\n      [\n        \"A\",\n        \"B\",\n        \"C\"\n      ],\n      [\n        10,\n        20,\n        30\n      ],\n      [\n        15,\n        25,\n        35\n      ]\n    ]\n  },\n  \"encode\": [\n    \"2023\",\n    \"2024\"\n  ]\n}");
         ch.AddDemo("Big data (10k)", Gallery.T("A 10,000-point line decimated to plot width by ChartBig: the first frame builds a cached min/max envelope (one column per pixel), every later frame redraws in O(width) regardless of point count. The left card shows a line + gradient area, the right a plain line.",
                 "10,000 点折线由 ChartBig 降采样到绘图宽度：首帧构建缓存 min/max 包络（每像素一列），之后每帧按 O(宽度) 重画，与点数无关。左卡为线 + 渐变面积，右卡为纯折线。"), "Chart.big10k", 300,
             "// Virtual source: a bare List<int>, no per-point objects.\nList<int> pts = Gallery.BigWave(10000, 11, 520, 220);\nBigSeriesSource src = BigSeriesSource.Of(pts, \"wave A\", 0, 0);\n// One ChartState per big chart, kept by the caller.\nChartState st = ChartState.Create();\nChartOption o = ChartOption.Create();\no.animate = false;\no.series = new List<ChartSeries>{ ChartSeries.Area(\"\", new List<int>{ 0 }) };\nChartBig.Render(app, st, src, o, 40, 40, 460, 200, \"10,000 points\");", "");

@@ -152,6 +152,30 @@ add_custom_target(zanrt_io ALL DEPENDS ${ZAN_RT_IO_OBJ})
 add_dependencies(zanc zanrt_io)
 target_compile_definitions(zanc PRIVATE ZAN_RT_IO_OBJ="${ZAN_RT_IO_OBJ}")
 
+# ---- Unified timer runtime (S4b-2: Task.Delay / Timer min-heap) ----
+# irgen emits zan_timer_* calls from every program's inline coroutine driver
+# (and rt_io.c calls them too), so every native-linked program needs this
+# object; zanc injects it unconditionally on native builds (see main.c).
+# Compiled with the same compiler as the reactor so the object matches the
+# ABI of zanc's emitted objects.
+set(ZAN_RT_TIMER_OBJ "${CMAKE_BINARY_DIR}/zanrt_timer${CMAKE_C_OUTPUT_EXTENSION}")
+add_custom_command(
+    OUTPUT ${ZAN_RT_TIMER_OBJ}
+    COMMAND ${ZAN_RT_IO_CC} -std=c11
+            -I ${CMAKE_SOURCE_DIR}/src/runtime -O2
+            -c ${CMAKE_SOURCE_DIR}/src/runtime/rt_timer.c -o ${ZAN_RT_TIMER_OBJ}
+    DEPENDS ${CMAKE_SOURCE_DIR}/src/runtime/rt_timer.c
+            ${CMAKE_SOURCE_DIR}/src/runtime/rt_timer.h
+    COMMENT "Building unified timer runtime object (zanrt_timer)"
+    VERBATIM)
+add_custom_target(zanrt_timer ALL DEPENDS ${ZAN_RT_TIMER_OBJ})
+add_dependencies(zanc zanrt_timer)
+target_compile_definitions(zanc PRIVATE ZAN_RT_TIMER_OBJ="${ZAN_RT_TIMER_OBJ}")
+add_custom_command(TARGET zanc POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${ZAN_RT_TIMER_OBJ} $<TARGET_FILE_DIR:zanc>/zanrt_timer${CMAKE_C_OUTPUT_EXTENSION}
+    VERBATIM)
+
 # Generic embedded-resource read API (src/runtime/zan_embed_api.c). The data
 # table is registered by a generated object (scripts/gen_embed.ps1) when a
 # program embeds resources; the API object itself is injected whenever a
@@ -955,6 +979,17 @@ add_test(NAME diag_a33_instance_method_ident
     "-DEXPECT_REGEX=instance method 'Touch' cannot be used as a value"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_a33_instance_method_ident PROPERTIES TIMEOUT 60)
+
+# An enum member access naming a member that does not exist must be a compile
+# error: irgen used to fold it to the constant 0, hiding stale references.
+add_test(NAME diag_enum_unknown_member
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/enum_unknown_member.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_enum_unknown_member${_exe_ext}
+    "-DEXPECT_REGEX=enum type 'Kind' has no member 'NoSuchMember'"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_enum_unknown_member PROPERTIES TIMEOUT 60)
 
 # ---- Golden compiler regression tests ----
 # Freeze the lexer token stream and parse tree for a set of hermetic (stdlib-free)

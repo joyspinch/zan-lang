@@ -1,14 +1,18 @@
 using System;
+using System.Data.MySql;
 
 namespace System.Data;
 
 /// <summary>
 /// Database provider types understood by the FreeSQL-style ORM.
 ///
-/// The default <see cref="DbConnection"/> reaches every one of these engines
+/// The default <see cref="DbConnection"/> reaches most of these engines
 /// through its ODBC driver (the "对应的驱动"), so a single, dependency-light
 /// connection type serves the whole ORM. Native, higher-performance drivers
-/// are also available as opt-in namespaces:
+/// are also available:
+///   - System.Data.MySql   : native MySQL/MariaDB wire protocol (no ODBC needed;
+///                           used automatically by OpenMySQL since it needs no
+///                           external driver).
 ///   - System.Data.Sqlite  : embedded SQLite via the sqlite3 C library.
 ///   - System.Data.Postgres: PostgreSQL and PG-wire compatible engines (openGauss,
 ///                           KingbaseES/人大金仓, Vastbase, GaussDB, QuestDB) via libpq.
@@ -217,17 +221,24 @@ class DbConnection : IDbConnection {
         return OpenWith(cs, DbProvider.SqlServer);
     }
 
-    /// <summary>Opens MySQL / MariaDB / TiDB / OceanBase.</summary>
-    static DbConnection OpenMySQL(string host, int port, string database,
+    /// <summary>Opens MySQL / MariaDB / TiDB / OceanBase. Prefers the native
+    /// wire-protocol client (System.Data.MySql) -- no ODBC driver installation
+    /// required -- and falls back to the ODBC driver when it is unavailable.</summary>
+    static IDbConnection OpenMySQL(string host, int port, string database,
             string user, string password) {
+        MySqlSyncConnection native = MySqlSyncConnection.OpenParams(
+            host, port, database, user, password);
+        if (native != null && native.IsConnected()) {
+            return native;
+        }
         string cs = "Driver={MySQL ODBC 8.0 Unicode Driver};Server=" + host
             + ";Port=" + Convert.ToString(port) + ";Database=" + database
             + ";User=" + user + ";Password=" + password + ";";
         return OpenWith(cs, DbProvider.MySQL);
     }
 
-    /// <summary>Opens MariaDB (alias of the MySQL ODBC path).</summary>
-    static DbConnection OpenMariaDB(string host, int port, string database,
+    /// <summary>Opens MariaDB (native MySQL protocol by default).</summary>
+    static IDbConnection OpenMariaDB(string host, int port, string database,
             string user, string password) {
         return OpenMySQL(host, port, database, user, password);
     }
@@ -473,6 +484,14 @@ class DbConnection : IDbConnection {
     /// <summary>Executes a scalar query (first column of first row as string).</summary>
     string ExecuteScalar(string sql) {
         DbResult result = Query(sql);
+        if (result.RowCount() > 0) {
+            return result.GetString(0, 0);
+        }
+        return "";
+    }
+
+    string ExecuteScalar(string sql, DbParams prms) {
+        DbResult result = Query(sql, prms);
         if (result.RowCount() > 0) {
             return result.GetString(0, 0);
         }

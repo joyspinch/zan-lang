@@ -373,8 +373,7 @@ partial class ZanIDE {
     /// Loads the project's saved user components (components/*.zcomp) into the
     /// designer's "My Components" palette group.
     static void LoadUserComponents(string root, Designer d) {
-        List<string> names = new List<string>();
-        List<string> jsons = new List<string>();
+        List<UserComponent> comps = new List<UserComponent>();
         string dir = root + "/components";
         if (Directory.Exists(dir)) {
             List<string> files = Directory.GetFiles(dir);
@@ -382,13 +381,13 @@ partial class ZanIDE {
             while (i < files.Count) {
                 string nm = files[i];
                 if (nm.Length > 6 && nm.Substring(nm.Length - 6, 6) == ".zcomp") {
-                    names.Add(nm.Substring(0, nm.Length - 6));
-                    jsons.Add(File.ReadAllText(dir + "/" + nm));
+                    comps.Add(new UserComponent(nm.Substring(0, nm.Length - 6),
+                        File.ReadAllText(dir + "/" + nm)));
                 }
                 i = i + 1;
             }
         }
-        d.SetUserComponents(names, jsons);
+        d.SetUserComponents(comps);
     }
 
     /// Keeps only identifier-safe characters (letters, digits, underscore) of a
@@ -480,26 +479,26 @@ partial class ZanIDE {
     /// Finds the definition of the symbol under the caret across the current
     /// file, other open tabs, then the project's src tree. Switches/opens the
     /// target tab and returns the destination line (-1 when not found).
-    static int GoToDefinition(CodeEditor editor, List<string> tabNames, List<string> tabBodies,
-                              List<string> tabPaths, SignalInt active, string root, List<string> log) {
+    static int GoToDefinition(CodeEditor editor, List<TabRecord> tabs,
+                              SignalInt active, string root, List<string> log) {
         string word = editor.WordAtCaret();
         if (word == "") { log.Add("> Go to Definition: no symbol under caret."); return 0 - 1; }
         int a = active.Get();
-        if (a >= 0 && a < tabBodies.Count) { tabBodies[a] = editor.GetText(); }
-        if (a >= 0 && a < tabBodies.Count) {
-            int ln = ZanIDE.FindDeclLine(tabBodies[a], word);
+        if (a >= 0 && a < tabs.Count) { tabs[a].body = editor.GetText(); }
+        if (a >= 0 && a < tabs.Count) {
+            int ln = ZanIDE.FindDeclLine(tabs[a].body, word);
             if (ln >= 0) {
                 log.Add("> Definition of '" + word + "' at line " + Convert.ToString(ln + 1) + " (this file).");
                 return ln;
             }
         }
         int i = 0;
-        while (i < tabBodies.Count) {
+        while (i < tabs.Count) {
             if (i != a) {
-                int ln = ZanIDE.FindDeclLine(tabBodies[i], word);
+                int ln = ZanIDE.FindDeclLine(tabs[i].body, word);
                 if (ln >= 0) {
                     active.Set(i);
-                    log.Add("> Definition of '" + word + "' in " + tabNames[i]
+                    log.Add("> Definition of '" + word + "' in " + tabs[i].name
                         + " at line " + Convert.ToString(ln + 1) + ".");
                     return ln;
                 }
@@ -519,11 +518,11 @@ partial class ZanIDE {
         int fi = 0;
         while (fi < files.Count) {
             string fp = files[fi];
-            if (tabPaths.IndexOf(fp) < 0) {
+            if (ZanIDE.FindTabByPath(tabs, fp) < 0) {
                 string body = File.ReadAllText(fp);
                 int ln = ZanIDE.FindDeclLine(body, word);
                 if (ln >= 0) {
-                    ZanIDE.OpenPath(tabNames, tabBodies, tabPaths, active, fp, Path.GetFileName(fp));
+                    ZanIDE.OpenPath(tabs, active, fp, Path.GetFileName(fp));
                     log.Add("> Definition of '" + word + "' in " + Path.GetFileName(fp)
                         + " at line " + Convert.ToString(ln + 1) + ".");
                     return ln;
@@ -536,11 +535,11 @@ partial class ZanIDE {
         string nsFile = ZanIDE.FindNamespaceDirFile(ZanIDE.StdlibDir(), word);
         if (nsFile == "") { nsFile = ZanIDE.FindNamespaceDirFile(root + "/src", word); }
         if (nsFile != "") {
-            if (tabPaths.IndexOf(nsFile) < 0) {
-                ZanIDE.OpenPath(tabNames, tabBodies, tabPaths, active, nsFile,
-                    Path.GetFileName(nsFile));
+            int nsTab = ZanIDE.FindTabByPath(tabs, nsFile);
+            if (nsTab < 0) {
+                ZanIDE.OpenPath(tabs, active, nsFile, Path.GetFileName(nsFile));
             } else {
-                active.Set(tabPaths.IndexOf(nsFile));
+                active.Set(nsTab);
             }
             log.Add("> Namespace '" + word + "' -> " + Path.GetFileName(nsFile) + ".");
             return 0;
@@ -568,61 +567,59 @@ partial class ZanIDE {
 
     /// Go to Definition preferring zan-lsp semantic results (compiler
     /// binder/checker accuracy), with the text-scan heuristic as fallback.
-    static int GoToDefinitionSmart(LspSession lsp, CodeEditor editor, List<string> tabNames,
-                                   List<string> tabBodies, List<string> tabPaths,
+    static int GoToDefinitionSmart(LspSession lsp, CodeEditor editor, List<TabRecord> tabs,
                                    SignalInt active, string root, List<string> log) {
         int a = active.Get();
         // The server indexes the project root only; querying it about a file
         // outside that root (a stdlib source, say) costs a round trip that can
         // never answer, so go straight to the text scan there.
-        bool inRoot = a >= 0 && a < tabPaths.Count
-            && ZanIDE.NormPath(tabPaths[a]).StartsWith(ZanIDE.NormPath(root));
-        if (lsp != null && lsp.Alive() && inRoot && tabPaths[a].Length > 0) {
-            tabBodies[a] = editor.GetText();
-            lsp.SyncDoc(tabPaths[a], tabBodies[a]);
-            string hit = lsp.Definition(tabPaths[a], editor.CurLine(), editor.CurCol());
+        bool inRoot = a >= 0 && a < tabs.Count
+            && ZanIDE.NormPath(tabs[a].path).StartsWith(ZanIDE.NormPath(root));
+        if (lsp != null && lsp.Alive() && inRoot && tabs[a].path.Length > 0) {
+            tabs[a].body = editor.GetText();
+            lsp.SyncDoc(tabs[a].path, tabs[a].body);
+            string hit = lsp.Definition(tabs[a].path, editor.CurLine(), editor.CurCol());
             int sep = ZanIDE.IndexOfStr(hit, "\t");
             if (sep > 0) {
                 string defPath = hit.Substring(0, sep);
                 int ln = ZanIDE.ParseInt(hit.Substring(sep + 1, hit.Length - sep - 1));
-                if (ZanIDE.SamePath(defPath, tabPaths[a])) {
+                if (ZanIDE.SamePath(defPath, tabs[a].path)) {
                     log.Add("> Definition at line " + Convert.ToString(ln + 1) + " (this file).");
                     return ln;
                 }
                 int ti = 0;
-                while (ti < tabPaths.Count) {
-                    if (ZanIDE.SamePath(defPath, tabPaths[ti])) {
+                while (ti < tabs.Count) {
+                    if (ZanIDE.SamePath(defPath, tabs[ti].path)) {
                         active.Set(ti);
-                        log.Add("> Definition in " + tabNames[ti] + " at line " + Convert.ToString(ln + 1) + ".");
+                        log.Add("> Definition in " + tabs[ti].name + " at line " + Convert.ToString(ln + 1) + ".");
                         return ln;
                     }
                     ti = ti + 1;
                 }
                 if (File.Exists(defPath)) {
-                    ZanIDE.OpenPath(tabNames, tabBodies, tabPaths, active, defPath, Path.GetFileName(defPath));
+                    ZanIDE.OpenPath(tabs, active, defPath, Path.GetFileName(defPath));
                     log.Add("> Definition in " + Path.GetFileName(defPath) + " at line " + Convert.ToString(ln + 1) + ".");
                     return ln;
                 }
             }
         }
-        return ZanIDE.GoToDefinition(editor, tabNames, tabBodies, tabPaths, active, root, log);
+        return ZanIDE.GoToDefinition(editor, tabs, active, root, log);
     }
 
     /// Find All References preferring zan-lsp semantic results, with the
     /// whole-word text scan as fallback.
-    static void FindReferencesSmart(LspSession lsp, CodeEditor editor, List<string> tabNames,
-                                    List<string> tabBodies, List<string> tabPaths,
+    static void FindReferencesSmart(LspSession lsp, CodeEditor editor, List<TabRecord> tabs,
                                     SignalInt active, string root, List<string> log) {
         int a = active.Get();
         // The server indexes the project root only; querying it about a file
         // outside that root (a stdlib source, say) costs a round trip that can
         // never answer, so go straight to the text scan there.
-        bool inRoot = a >= 0 && a < tabPaths.Count
-            && ZanIDE.NormPath(tabPaths[a]).StartsWith(ZanIDE.NormPath(root));
-        if (lsp != null && lsp.Alive() && inRoot && tabPaths[a].Length > 0) {
-            tabBodies[a] = editor.GetText();
-            lsp.SyncDoc(tabPaths[a], tabBodies[a]);
-            List<string> rows = lsp.References(tabPaths[a], editor.CurLine(), editor.CurCol());
+        bool inRoot = a >= 0 && a < tabs.Count
+            && ZanIDE.NormPath(tabs[a].path).StartsWith(ZanIDE.NormPath(root));
+        if (lsp != null && lsp.Alive() && inRoot && tabs[a].path.Length > 0) {
+            tabs[a].body = editor.GetText();
+            lsp.SyncDoc(tabs[a].path, tabs[a].body);
+            List<string> rows = lsp.References(tabs[a].path, editor.CurLine(), editor.CurCol());
             if (rows.Count > 0) {
                 string word = editor.WordAtCaret();
                 log.Add("> References to '" + word + "' (semantic):");
@@ -640,7 +637,7 @@ partial class ZanIDE {
                 return;
             }
         }
-        ZanIDE.FindReferences(editor, tabNames, tabBodies, tabPaths, active, root, log);
+        ZanIDE.FindReferences(editor, tabs, active, root, log);
     }
 
     /// Counts whole-word occurrences of `word` in `line`.
@@ -679,24 +676,24 @@ partial class ZanIDE {
 
     /// Lists every whole-word reference to the symbol under the caret across
     /// open tabs and the project's src tree, into the output log.
-    static void FindReferences(CodeEditor editor, List<string> tabNames, List<string> tabBodies,
-                               List<string> tabPaths, SignalInt active, string root, List<string> log) {
+    static void FindReferences(CodeEditor editor, List<TabRecord> tabs,
+                               SignalInt active, string root, List<string> log) {
         string word = editor.WordAtCaret();
         if (word == "") { log.Add("> Find All References: no symbol under caret."); return; }
         int a = active.Get();
-        if (a >= 0 && a < tabBodies.Count) { tabBodies[a] = editor.GetText(); }
+        if (a >= 0 && a < tabs.Count) { tabs[a].body = editor.GetText(); }
         log.Add("> References to '" + word + "':");
         int total = 0;
         int i = 0;
-        while (i < tabBodies.Count) {
-            total = total + ZanIDE.CountRefsInFile(tabNames[i], tabBodies[i], word, log);
+        while (i < tabs.Count) {
+            total = total + ZanIDE.CountRefsInFile(tabs[i].name, tabs[i].body, word, log);
             i = i + 1;
         }
         List<string> files = ZanIDE.ListZanFiles(root + "/src");
         int fi = 0;
         while (fi < files.Count) {
             string fp = files[fi];
-            if (tabPaths.IndexOf(fp) < 0) {
+            if (ZanIDE.FindTabByPath(tabs, fp) < 0) {
                 string body = File.ReadAllText(fp);
                 total = total + ZanIDE.CountRefsInFile(Path.GetFileName(fp), body, word, log);
             }
@@ -751,20 +748,14 @@ partial class ZanIDE {
     // Find/Replace in Files (project-wide, including unopened files)
     // ================================================================
 
-    /// Searches every project source file for `needle`, filling parallel result
-    /// lists (`outPath`/`outLine` 0-based/`outText`) and logging one row per
-    /// hit. Open tabs are searched in their buffers so unsaved edits count.
-    /// Returns the number of hits (capped so a one-letter query cannot flood
-    /// the panel).
+    /// Searches every project source file for `needle`, filling `outHits` and
+    /// logging one row per hit. Open tabs are searched in their buffers so
+    /// unsaved edits count. Returns the number of hits (capped so a one-letter
+    /// query cannot flood the panel).
     static int FindInFiles(string root, string needle, bool matchCase,
-                           List<string> tabPaths, List<string> tabBodies,
-                           List<string> outPath, List<string> outLine,
-                           List<string> outText, List<string> log) {
-        while (outPath.Count > 0) {
-            outPath.RemoveAt(outPath.Count - 1);
-            outLine.RemoveAt(outLine.Count - 1);
-            outText.RemoveAt(outText.Count - 1);
-        }
+                           List<TabRecord> tabs, List<SearchHit> outHits,
+                           List<string> log) {
+        outHits.Clear();
         if (needle == "") { return 0; }
         List<string> files = new List<string>();
         ZanIDE.GatherZanFiles(root, files);
@@ -773,10 +764,10 @@ partial class ZanIDE {
         int fi = 0;
         while (fi < files.Count && hits < 2000) {
             string fp = files[fi];
-            int tab = ZanIDE.IndexOfPath(tabPaths, fp);
+            int tab = ZanIDE.FindTabByPath(tabs, fp);
             string text = "";
             if (tab >= 0) {
-                text = tabBodies[tab];
+                text = tabs[tab].body;
             } else if (File.Exists(fp)) {
                 text = File.ReadAllText(fp);
             }
@@ -786,11 +777,10 @@ partial class ZanIDE {
                 int li = 0;
                 while (li < ls.Count && hits < 2000) {
                     if (ZanIDE.LineContains(ls[li], needle, matchCase)) {
-                        outPath.Add(fp);
-                        outLine.Add(Convert.ToString(li));
-                        outText.Add(ZanIDE.TrimLead(ls[li]));
+                        string hitText = ZanIDE.TrimLead(ls[li]);
+                        outHits.Add(SearchHit.Create(fp, li, hitText));
                         log.Add("   " + fp + ":" + Convert.ToString(li + 1)
-                            + ": " + ZanIDE.TrimLead(ls[li]));
+                            + ": " + hitText);
                         hits = hits + 1;
                     }
                     li = li + 1;
@@ -808,8 +798,8 @@ partial class ZanIDE {
     /// Open tabs are changed in their buffers (save to persist); other files
     /// are rewritten on disk. Returns the number of files changed.
     static int ReplaceInFiles(string root, string needle, string repl,
-                              bool matchCase, List<string> tabPaths,
-                              List<string> tabBodies, List<string> log) {
+                              bool matchCase, List<TabRecord> tabs,
+                              List<string> log) {
         if (needle == "" || needle == repl) { return 0; }
         List<string> files = new List<string>();
         ZanIDE.GatherZanFiles(root, files);
@@ -819,10 +809,10 @@ partial class ZanIDE {
         int fi = 0;
         while (fi < files.Count) {
             string fp = files[fi];
-            int tab = ZanIDE.IndexOfPath(tabPaths, fp);
+            int tab = ZanIDE.FindTabByPath(tabs, fp);
             string text = "";
             if (tab >= 0) {
-                text = tabBodies[tab];
+                text = tabs[tab].body;
             } else if (File.Exists(fp)) {
                 text = File.ReadAllText(fp);
             }
@@ -832,7 +822,7 @@ partial class ZanIDE {
                     string nt = ZanIDE.ReplaceAllText(text, needle, repl, matchCase);
                     total = total + n;
                     if (tab >= 0) {
-                        tabBodies[tab] = nt;
+                        tabs[tab].body = nt;
                         bufs = bufs + 1;
                     } else {
                         File.WriteAllText(fp, nt);
@@ -851,25 +841,22 @@ partial class ZanIDE {
 
     /// Opens result `idx` of the last Find in Files run and jumps to its line.
     /// Returns the 0-based line to move the caret to, or -1.
-    static int GotoSearchHit(List<string> resPath, List<string> resLine, int idx,
-                             List<string> tabNames, List<string> tabBodies,
-                             List<string> tabPaths, SignalInt active,
+    static int GotoSearchHit(List<SearchHit> hits, int idx,
+                             List<TabRecord> tabs, SignalInt active,
                              List<string> log) {
-        if (idx < 0 || idx >= resPath.Count) { return 0 - 1; }
-        string fp = resPath[idx];
-        int ln = ZanIDE.ParseInt(resLine[idx]);
-        int tab = ZanIDE.IndexOfPath(tabPaths, fp);
+        if (idx < 0 || idx >= hits.Count) { return 0 - 1; }
+        SearchHit hit = hits[idx];
+        int tab = ZanIDE.FindTabByPath(tabs, hit.path);
         if (tab < 0) {
-            if (!File.Exists(fp)) { return 0 - 1; }
-            ZanIDE.OpenPath(tabNames, tabBodies, tabPaths, active, fp,
-                Path.GetFileName(fp));
-            tab = tabPaths.Count - 1;
+            if (!File.Exists(hit.path)) { return 0 - 1; }
+            ZanIDE.OpenPath(tabs, active, hit.path, Path.GetFileName(hit.path));
+            tab = tabs.Count - 1;
         }
         active.Set(tab);
         log.Add("> Match " + Convert.ToString(idx + 1) + "/"
-            + Convert.ToString(resPath.Count) + ": " + Path.GetFileName(fp)
-            + ":" + Convert.ToString(ln + 1));
-        return ln;
+            + Convert.ToString(hits.Count) + ": " + Path.GetFileName(hit.path)
+            + ":" + Convert.ToString(hit.line + 1));
+        return hit.line;
     }
 
     /// True when `line` contains `needle` (case-insensitively unless asked).
@@ -942,24 +929,21 @@ partial class ZanIDE {
     /// (save to persist); everything else is written immediately. Falls back to
     /// the buffer-only textual rename when no language server is available.
     static int RenameSymbolSmart(LspSession lsp, CodeEditor editor,
-                                 List<string> tabNames, List<string> tabBodies,
-                                 List<string> tabPaths, SignalInt active,
+                                 List<TabRecord> tabs, SignalInt active,
                                  List<string> log, string word, string newName) {
         if (word == "" || newName == "" || word == newName) { return 0; }
         int a = active.Get();
-        if (lsp == null || !lsp.Alive() || a < 0 || a >= tabPaths.Count
-            || tabPaths[a].Length == 0) {
-            return ZanIDE.RenameSymbol(editor, tabNames, tabBodies, tabPaths,
-                active, log, word, newName);
+        if (lsp == null || !lsp.Alive() || a < 0 || a >= tabs.Count
+            || tabs[a].path.Length == 0) {
+            return ZanIDE.RenameSymbol(editor, tabs, active, log, word, newName);
         }
 
-        tabBodies[a] = editor.GetText();
-        lsp.SyncDoc(tabPaths[a], tabBodies[a]);
-        List<string> rows = lsp.Rename(tabPaths[a], editor.CurLine(),
+        tabs[a].body = editor.GetText();
+        lsp.SyncDoc(tabs[a].path, tabs[a].body);
+        List<string> rows = lsp.Rename(tabs[a].path, editor.CurLine(),
             editor.CurCol(), newName);
         if (rows.Count == 0) {
-            return ZanIDE.RenameSymbol(editor, tabNames, tabBodies, tabPaths,
-                active, log, word, newName);
+            return ZanIDE.RenameSymbol(editor, tabs, active, log, word, newName);
         }
 
         // Group the edits by file, keeping the server's ascending order.
@@ -976,10 +960,10 @@ partial class ZanIDE {
         int fi = 0;
         while (fi < files.Count) {
             string fp = files[fi];
-            int tab = ZanIDE.IndexOfPath(tabPaths, fp);
+            int tab = ZanIDE.FindTabByPath(tabs, fp);
             string text = "";
             if (tab >= 0) {
-                text = tabBodies[tab];
+                text = tabs[tab].body;
             } else if (File.Exists(fp)) {
                 text = File.ReadAllText(fp);
             } else {
@@ -989,7 +973,7 @@ partial class ZanIDE {
             string nt = ZanIDE.ApplyRenameEdits(text, rows, fp, word, newName);
             if (nt != text) {
                 if (tab >= 0) {
-                    tabBodies[tab] = nt;
+                    tabs[tab].body = nt;
                     bufs = bufs + 1;
                 } else {
                     File.WriteAllText(fp, nt);
@@ -999,9 +983,9 @@ partial class ZanIDE {
             fi = fi + 1;
         }
 
-        if (a >= 0 && a < tabBodies.Count) {
+        if (a >= 0 && a < tabs.Count) {
             int keepLine = editor.CurLine();
-            editor.LoadText(tabBodies[a]);
+            editor.LoadText(tabs[a].body);
             editor.GoToLine(keepLine);
         }
         log.Add("> Renamed '" + word + "' -> '" + newName + "' (semantic): "
@@ -1069,25 +1053,25 @@ partial class ZanIDE {
     /// Rename Symbol (F2): whole-word, comment/string-aware rename of the
     /// symbol under the caret across every open tab (buffers only; save to
     /// persist). Returns the number of tabs changed.
-    static int RenameSymbol(CodeEditor editor, List<string> tabNames, List<string> tabBodies,
-                            List<string> tabPaths, SignalInt active, List<string> log,
+    static int RenameSymbol(CodeEditor editor, List<TabRecord> tabs,
+                            SignalInt active, List<string> log,
                             string word, string newName) {
         if (word == "" || newName == "" || word == newName) { return 0; }
         int a = active.Get();
-        if (a >= 0 && a < tabBodies.Count) { tabBodies[a] = editor.GetText(); }
+        if (a >= 0 && a < tabs.Count) { tabs[a].body = editor.GetText(); }
         int changed = 0;
         int i = 0;
-        while (i < tabBodies.Count) {
-            string nb = ZanIDE.ReplaceWholeWord(tabBodies[i], word, newName);
-            if (nb != tabBodies[i]) {
-                tabBodies[i] = nb;
+        while (i < tabs.Count) {
+            string nb = ZanIDE.ReplaceWholeWord(tabs[i].body, word, newName);
+            if (nb != tabs[i].body) {
+                tabs[i].body = nb;
                 changed = changed + 1;
             }
             i = i + 1;
         }
-        if (a >= 0 && a < tabBodies.Count) {
+        if (a >= 0 && a < tabs.Count) {
             int keepLine = editor.CurLine();
-            editor.LoadText(tabBodies[a]);
+            editor.LoadText(tabs[a].body);
             editor.GoToLine(keepLine);
         }
         log.Add("> Renamed '" + word + "' -> '" + newName + "' in "
@@ -1639,7 +1623,22 @@ partial class ZanIDE {
         return s;
     }
 
-    static bool TabsLabelsEqual(List<string> a, List<string> b) {
+    static bool TabsLabelsEqual(List<string> labels, List<TabRecord> tabs) {
+        if (labels == null || tabs == null) { return false; }
+        if (labels.Count != tabs.Count) { return false; }
+        int i = 0;
+        while (i < labels.Count) {
+            if (labels[i] != tabs[i].name) { return false; }
+            i = i + 1;
+        }
+        return true;
+    }
+
+    /// True when two plain label lists hold the same strings in the same
+    /// order. Used by retained widgets that cache a Tabs strip built from a
+    /// plain label list (docs section rail, debug panel) and rebuild only
+    /// when the labels actually change.
+    static bool StringListsEqual(List<string> a, List<string> b) {
         if (a == null || b == null) { return false; }
         if (a.Count != b.Count) { return false; }
         int i = 0;
@@ -1651,7 +1650,7 @@ partial class ZanIDE {
     }
 
     /// Keeps the retained editor tab bar in step with the tab model the IDE
-    /// owns (tabNames / activeTab). The bar runs in host mode: close / add /
+    /// owns (tabs / activeTab). The bar runs in host mode: close / add /
     /// right-click are reported back so this class stays the single source of
     /// truth; labels are rebuilt only when the model actually changes.
     void SyncEditorTabs() {
@@ -1661,15 +1660,15 @@ partial class ZanIDE {
             editorTabs.SetHostModel(true);
             editorTabLabels = new List<string>();
         }
-        if (!ZanIDE.TabsLabelsEqual(editorTabLabels, tabNames)) {
+        if (!ZanIDE.TabsLabelsEqual(editorTabLabels, tabs)) {
             Tabs nt = Tabs.Create(Tabs.Card());
             nt.SetShowAdd(true);
             nt.SetHostModel(true);
             List<string> cp = new List<string>();
             int i = 0;
-            while (i < tabNames.Count) {
-                nt.Add(tabNames[i], true);
-                cp.Add(tabNames[i]);
+            while (i < tabs.Count) {
+                nt.Add(tabs[i].name, true);
+                cp.Add(tabs[i].name);
                 i = i + 1;
             }
             editorTabs = nt;

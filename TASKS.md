@@ -3045,7 +3045,44 @@ SQLite 调用本身、`DbParams` 链式调用、`DbResult` 遍历、try+return+f
    「临时形状」说明已删除；IDE 全量编译链接通过。
 
 
+# A40 · aardio 能力迁移余项收口（已完成，2026-08-03）
+
+补齐 `System.Net.Ping`、`NetworkInterface`、`System.Drawing.Printing`、
+`System.Management.Device`、`System.Security.Cryptography.Otp/Jwt`、
+`System.Net.WebDav` 客户端和 `System.Text.Markdown`。同时复核确认主清单 17、22、
+24~32、34~35 已有实现和 conformance，只是完成表未同步，现已补齐文档状态。
+
+安全与 ABI 要点：Ping 直调 IP Helper、不 shell；网卡和设备枚举按 Win64 原生结构布局；
+JWT 拒绝 none、重复 JSON 键、非整数 NumericDate 和超限输入；Markdown 仅允许相对地址、
+HTTP/HTTPS/mailto 并拒绝控制字符；WebDAV 校验 Depth/Destination/请求头。
+
+网络 leakcheck 进一步暴露三元表达式 borrowed 字面量与 owned `Substring()` 分支所有权
+不统一，已在 irgen 的 PHI 分支补 retain 并新增 `ternary_width` 回归，不以手工清空对象规避。
+
+**验证**：上述新增模块、UiElement 与三元表达式回归的 conformance/determinism/
+leakcheck 定向矩阵 **30/30 通过**。
+
+# A39 · `System.Automation.UiElement` MSAA 无障碍自动化（已完成，2026-08-03）
+
+
+
+实现 `stdlib/System/Automation/UiElement.zan`：通过 `oleacc.dll` 与 `IAccessible`
+支持从 HWND/屏幕坐标取元素、`AccessibleChildren` 树遍历、按名称/角色递归查找、
+名称/值/描述/角色/状态/矩形/快捷键/默认动作读取，以及 Invoke/Select/Focus/SetValue。
+标准 Win32 子控件先由 `WindowFromAccessibleObject` 还原 HWND，再取 `OBJID_CLIENT`，
+避免把窗口代理（ROLE_SYSTEM_WINDOW）误当按钮/编辑框本体。
+
+Win64 的 `VARIANT` 实测为 24 字节，IAccessible 的按值 `VARIANT` 参数按 ABI 以指针
+传递；错误拆成两个整数寄存器会把 `VT_I4=3` 当地址解引用并触发 0xC0000005。
+实现统一构造 24 字节 VARIANT 缓冲并把地址交给 vtable 调用。
+
+**验证**：`win_uielement_smoke` 覆盖 FromWindow/FromPoint、Children/FindAll/FindFirst、
+Name/Value/Role/State/Rect、Invoke/Focus/SetValue 与引用释放；conformance、determinism、
+leakcheck **3/3 通过**。`automation_demo.zan` 编译通过并增加无障碍树展示。
+
 # A36 · finally 内 throw + 外层类型不匹配的 catch → 访问违规 0xC0000005（2026-08-02，已修复）
+
+
 
 **发现**：`try { try { throw "inner"; } finally { throw "from finally"; } } catch (Exception e) {...}`
 中，字符串异常不匹配 `catch (Exception e)`，异常从 finally 向外传播时程序崩溃

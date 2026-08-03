@@ -978,21 +978,23 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMValueRef g_tail = LLVMAddGlobal(g->mod, i8ptr, "__zan_co_tail");
         LLVMSetInitializer(g_tail, LLVMConstNull(i8ptr));
         LLVMSetLinkage(g_tail, LLVMInternalLinkage);
-
-        /* Timer list for time-based suspensions (`await Task.Delay(ms)`): a
-         * singly-linked list of {next, deadline_ms, frame, step}. Deadlines use
-         * a monotonic clock so timers registered at different scheduler turns
-         * remain comparable. When the ready queue drains, the reactor is polled
-         * with the time remaining until the earliest deadline, allowing socket
-         * completions and timers to make progress in the same wait. */
         LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
+
+        /* The unified timer runtime owns a dynamic-array min-heap shared by
+         * Task.Delay and public Timer entries. Public clear operations filter by
+         * entry kind, so they cannot remove coroutine delays. */
         LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
-        LLVMTypeRef tnode_fields[] = { i8ptr /*next*/, i64t /*deadline_ms*/, i8ptr /*frame*/, g->co_step_ptr /*step*/ };
-        LLVMTypeRef tnode_ty = LLVMStructCreateNamed(g->ctx, "zan.co.timer");
-        LLVMStructSetBody(tnode_ty, tnode_fields, 4, 0);
-        LLVMValueRef g_timers = LLVMAddGlobal(g->mod, i8ptr, "__zan_co_timers");
-        LLVMSetInitializer(g_timers, LLVMConstNull(i8ptr));
-        LLVMSetLinkage(g_timers, LLVMInternalLinkage);
+        LLVMTypeRef timer_reset_type = LLVMFunctionType(voidt, NULL, 0, 0);
+        LLVMValueRef timer_reset = LLVMAddFunction(g->mod, "zan_timer_runtime_reset", timer_reset_type);
+        LLVMTypeRef timer_hook_type = LLVMFunctionType(voidt,
+            (LLVMTypeRef[]){ g->rt_co_ready_type ? LLVMPointerType(g->rt_co_ready_type, 0) : i8ptr }, 1, 0);
+        LLVMValueRef timer_set_hook = LLVMAddFunction(g->mod, "zan_timer_set_ready_hook", timer_hook_type);
+        LLVMTypeRef timer_delay_type = LLVMFunctionType(voidt,
+            (LLVMTypeRef[]){ i64t, i8ptr, g->co_step_ptr }, 3, 0);
+        LLVMValueRef timer_delay = LLVMAddFunction(g->mod, "zan_timer_delay", timer_delay_type);
+        LLVMTypeRef timer_next_type = LLVMFunctionType(i64t, NULL, 0, 0);
+        LLVMValueRef timer_next = LLVMAddFunction(g->mod, "zan_timer_next_timeout", timer_next_type);
+        LLVMValueRef timer_dispatch = LLVMAddFunction(g->mod, "zan_timer_dispatch_due", timer_next_type);
 
         /* Declare the platform sleep primitive for the *target* OS (not host):
          * Sleep (kernel32) on Windows, poll(NULL,0,ms) on POSIX/Linux. */
@@ -1006,52 +1008,6 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
             fn_sleep = LLVMAddFunction(g->mod, "Sleep", sleep_type);
         else
             fn_poll = LLVMAddFunction(g->mod, "poll", poll_type);
-
-        /* Monotonic millisecond clock used for absolute timer deadlines. */
-        LLVMTypeRef now_type = LLVMFunctionType(i64t, NULL, 0, 0);
-        LLVMValueRef fn_now = LLVMAddFunction(g->mod, "__zan_co_now_ms", now_type);
-        LLVMSetLinkage(fn_now, LLVMInternalLinkage);
-        {
-            LLVMBasicBlockRef bb = LLVMAppendBasicBlockInContext(g->ctx, fn_now, "entry");
-            LLVMPositionBuilderAtEnd(g->builder, bb);
-            if (g->target_is_windows) {
-                LLVMTypeRef tick_type = LLVMFunctionType(i64t, NULL, 0, 0);
-                LLVMValueRef fn_tick = LLVMAddFunction(g->mod, "GetTickCount64", tick_type);
-                LLVMValueRef now = zan_call2(g->builder, tick_type, fn_tick, NULL, 0, "now");
-                LLVMBuildRet(g->builder, now);
-            } else {
-                LLVMTypeRef ts_fields[] = { i64t, i64t };
-                LLVMTypeRef ts_type = LLVMStructCreateNamed(g->ctx, "zan.timespec");
-                LLVMStructSetBody(ts_type, ts_fields, 2, 0);
-                LLVMTypeRef clock_args[] = { i32t, LLVMPointerType(ts_type, 0) };
-                LLVMTypeRef clock_type = LLVMFunctionType(i32t, clock_args, 2, 0);
-                LLVMValueRef fn_clock = LLVMAddFunction(g->mod, "clock_gettime", clock_type);
-                int clock_monotonic = 1;
-                if (strstr(g->target_triple, "apple") || strstr(g->target_triple, "darwin"))
-                    clock_monotonic = 6;
-                else if (strstr(g->target_triple, "freebsd"))
-                    clock_monotonic = 4;
-#if defined(__APPLE__)
-                else if (!g->target_triple[0])
-                    clock_monotonic = 6;
-#elif defined(__FreeBSD__)
-                else if (!g->target_triple[0])
-                    clock_monotonic = 4;
-#endif
-                LLVMValueRef ts = LLVMBuildAlloca(g->builder, ts_type, "ts");
-                zan_call2(g->builder, clock_type, fn_clock,
-                    (LLVMValueRef[]){ LLVMConstInt(i32t, (unsigned)clock_monotonic, 0), ts }, 2, "");
-                LLVMValueRef sec = LLVMBuildLoad2(g->builder, i64t,
-                    LLVMBuildStructGEP2(g->builder, ts_type, ts, 0, "ts.sec.p"), "ts.sec");
-                LLVMValueRef nsec = LLVMBuildLoad2(g->builder, i64t,
-                    LLVMBuildStructGEP2(g->builder, ts_type, ts, 1, "ts.nsec.p"), "ts.nsec");
-                LLVMValueRef sec_ms = zan_mul(g->builder, sec,
-                    LLVMConstInt(i64t, 1000, 0), "sec.ms");
-                LLVMValueRef nsec_ms = zan_sdiv(g->builder, nsec,
-                    LLVMConstInt(i64t, 1000000, 0), "nsec.ms");
-                LLVMBuildRet(g->builder, zan_add(g->builder, sec_ms, nsec_ms, "now"));
-            }
-        }
 
         /* Timer-only fallback for programs that do not link the IO reactor. */
         {
@@ -1081,40 +1037,27 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
             LLVMBuildRet(g->builder, LLVMConstInt(i32t, 0, 0));
         }
 
-        /* void zan_co_sched_init(void): reset the queue to empty. */
+        /* void zan_co_sched_init(void): reset queues and timer heap. */
         {
             LLVMBasicBlockRef bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_sched_init, "entry");
             LLVMPositionBuilderAtEnd(g->builder, bb);
             LLVMBuildStore(g->builder, LLVMConstNull(i8ptr), g_head);
             LLVMBuildStore(g->builder, LLVMConstNull(i8ptr), g_tail);
-            LLVMBuildStore(g->builder, LLVMConstNull(i8ptr), g_timers);
+            zan_call2(g->builder, timer_reset_type, timer_reset, NULL, 0, "");
+            zan_call2(g->builder, timer_hook_type, timer_set_hook,
+                (LLVMValueRef[]){ g->rt_co_ready }, 1, "");
             LLVMBuildRetVoid(g->builder);
         }
 
-        /* void zan_co_delay(i64 ms, i8* frame, step): register a one-shot timer
-         * with an absolute deadline of now+ms, pushed on the front of the timer
-         * list. The caller then performs the CPS suspend (state=k, ret void). */
+        /* void zan_co_delay(i64 ms, i8* frame, step): register in the unified
+         * timer runtime's min-heap. */
         {
             LLVMBasicBlockRef bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_delay, "entry");
             LLVMPositionBuilderAtEnd(g->builder, bb);
-            LLVMValueRef ms    = LLVMGetParam(g->rt_co_delay, 0);
-            LLVMValueRef frame = LLVMGetParam(g->rt_co_delay, 1);
-            LLVMValueRef step  = LLVMGetParam(g->rt_co_delay, 2);
-            LLVMValueRef tn = zan_call2(g->builder, malloc_type, g->fn_malloc,
-                (LLVMValueRef[]){ LLVMSizeOf(tnode_ty) }, 1, "tn");
-            LLVMValueRef old = LLVMBuildLoad2(g->builder, i8ptr, g_timers, "t.head");
-            LLVMBuildStore(g->builder, old, LLVMBuildStructGEP2(g->builder, tnode_ty, tn, 0, "tn.next"));
-            LLVMValueRef now = zan_call2(g->builder, now_type, fn_now, NULL, 0, "now");
-            LLVMValueRef positive = zan_icmp(g->builder, LLVMIntSGT, ms,
-                LLVMConstInt(i64t, 0, 0), "positive");
-            LLVMValueRef delay = LLVMBuildSelect(g->builder, positive, ms,
-                LLVMConstInt(i64t, 0, 0), "delay");
-            LLVMValueRef deadline = zan_add(g->builder, now, delay, "deadline");
-            LLVMBuildStore(g->builder, deadline,
-                LLVMBuildStructGEP2(g->builder, tnode_ty, tn, 1, "tn.deadline"));
-            LLVMBuildStore(g->builder, frame, LLVMBuildStructGEP2(g->builder, tnode_ty, tn, 2, "tn.frame"));
-            LLVMBuildStore(g->builder, step, LLVMBuildStructGEP2(g->builder, tnode_ty, tn, 3, "tn.step"));
-            LLVMBuildStore(g->builder, tn, g_timers);
+            zan_call2(g->builder, timer_delay_type, timer_delay,
+                (LLVMValueRef[]){ LLVMGetParam(g->rt_co_delay, 0),
+                                  LLVMGetParam(g->rt_co_delay, 1),
+                                  LLVMGetParam(g->rt_co_delay, 2) }, 3, "");
             LLVMBuildRetVoid(g->builder);
         }
 
@@ -1175,25 +1118,10 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
             LLVMBasicBlockRef last_bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_sched_run, "last");
             LLVMBasicBlockRef after_bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_sched_run, "after");
             LLVMBasicBlockRef timers_bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_sched_run, "timers");
-            LLVMBasicBlockRef scan_setup = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_sched_run, "scan.setup");
-            LLVMBasicBlockRef scan_cond = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_sched_run, "scan.cond");
-            LLVMBasicBlockRef scan_body = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_sched_run, "scan.body");
-            LLVMBasicBlockRef scan_take = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_sched_run, "scan.take");
-            LLVMBasicBlockRef scan_next = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_sched_run, "scan.next");
-            LLVMBasicBlockRef scan_done = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_sched_run, "scan.done");
-            LLVMBasicBlockRef timer_due = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_sched_run, "timer.due");
             LLVMBasicBlockRef wait_timer = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_sched_run, "timer.wait");
-            LLVMBasicBlockRef unlink_head = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_sched_run, "unlink.head");
-            LLVMBasicBlockRef unlink_mid = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_sched_run, "unlink.mid");
-            LLVMBasicBlockRef after_unlink = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_sched_run, "after.unlink");
             LLVMBasicBlockRef io_bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_sched_run, "io.pump");
             LLVMBasicBlockRef exit_bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_sched_run, "exit");
             LLVMPositionBuilderAtEnd(g->builder, entry_bb);
-            /* scan state (no opt pass runs, so plain allocas are fine) */
-            LLVMValueRef a_best     = LLVMBuildAlloca(g->builder, i8ptr, "a.best");
-            LLVMValueRef a_bestprev = LLVMBuildAlloca(g->builder, i8ptr, "a.bestprev");
-            LLVMValueRef a_cur      = LLVMBuildAlloca(g->builder, i8ptr, "a.cur");
-            LLVMValueRef a_curprev  = LLVMBuildAlloca(g->builder, i8ptr, "a.curprev");
             LLVMBuildBr(g->builder, head_bb);
 
             LLVMPositionBuilderAtEnd(g->builder, head_bb);
@@ -1225,108 +1153,29 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
                 (LLVMValueRef[]){ fr }, 1, "");
             LLVMBuildBr(g->builder, head_bb);
 
-            /* Ready queue empty: find the earliest timer. It stays linked while
-             * the reactor waits, so an IO wake cannot lose the timer. */
             LLVMPositionBuilderAtEnd(g->builder, timers_bb);
-            LLVMValueRef t0 = LLVMBuildLoad2(g->builder, i8ptr, g_timers, "t.head");
-            LLVMValueRef tnull = zan_icmp(g->builder, LLVMIntEQ, t0,
-                LLVMConstNull(i8ptr), "t.empty");
-            LLVMBuildCondBr(g->builder, tnull, io_bb, scan_setup);
-
-            LLVMPositionBuilderAtEnd(g->builder, scan_setup);
-            LLVMBuildStore(g->builder, t0, a_best);
-            LLVMBuildStore(g->builder, LLVMConstNull(i8ptr), a_bestprev);
-            LLVMValueRef t0next = LLVMBuildLoad2(g->builder, i8ptr,
-                LLVMBuildStructGEP2(g->builder, tnode_ty, t0, 0, "t0.next"), "t0.nextv");
-            LLVMBuildStore(g->builder, t0next, a_cur);
-            LLVMBuildStore(g->builder, t0, a_curprev);
-            LLVMBuildBr(g->builder, scan_cond);
-
-            LLVMPositionBuilderAtEnd(g->builder, scan_cond);
-            LLVMValueRef cur_c = LLVMBuildLoad2(g->builder, i8ptr, a_cur, "cur");
-            LLVMValueRef cur_null = zan_icmp(g->builder, LLVMIntEQ, cur_c,
-                LLVMConstNull(i8ptr), "cur.null");
-            LLVMBuildCondBr(g->builder, cur_null, scan_done, scan_body);
-
-            LLVMPositionBuilderAtEnd(g->builder, scan_body);
-            LLVMValueRef cur_b = LLVMBuildLoad2(g->builder, i8ptr, a_cur, "cur.b");
-            LLVMValueRef best_b = LLVMBuildLoad2(g->builder, i8ptr, a_best, "best.b");
-            LLVMValueRef curdue = LLVMBuildLoad2(g->builder, i64t,
-                LLVMBuildStructGEP2(g->builder, tnode_ty, cur_b, 1, "cur.due"), "curdue");
-            LLVMValueRef bestdue = LLVMBuildLoad2(g->builder, i64t,
-                LLVMBuildStructGEP2(g->builder, tnode_ty, best_b, 1, "best.due"), "bestdue");
-            LLVMValueRef lt = zan_icmp(g->builder, LLVMIntULT, curdue, bestdue, "due.lt");
-            LLVMBuildCondBr(g->builder, lt, scan_take, scan_next);
-
-            LLVMPositionBuilderAtEnd(g->builder, scan_take);
-            LLVMValueRef cur_t = LLVMBuildLoad2(g->builder, i8ptr, a_cur, "cur.t");
-            LLVMValueRef curprev_t = LLVMBuildLoad2(g->builder, i8ptr, a_curprev, "curprev.t");
-            LLVMBuildStore(g->builder, cur_t, a_best);
-            LLVMBuildStore(g->builder, curprev_t, a_bestprev);
-            LLVMBuildBr(g->builder, scan_next);
-
-            LLVMPositionBuilderAtEnd(g->builder, scan_next);
-            LLVMValueRef cur_n = LLVMBuildLoad2(g->builder, i8ptr, a_cur, "cur.n");
-            LLVMBuildStore(g->builder, cur_n, a_curprev);
-            LLVMValueRef curnext = LLVMBuildLoad2(g->builder, i8ptr,
-                LLVMBuildStructGEP2(g->builder, tnode_ty, cur_n, 0, "cur.nextp"), "cur.nextv");
-            LLVMBuildStore(g->builder, curnext, a_cur);
-            LLVMBuildBr(g->builder, scan_cond);
-
-            LLVMPositionBuilderAtEnd(g->builder, scan_done);
-            LLVMValueRef best = LLVMBuildLoad2(g->builder, i8ptr, a_best, "best");
-            LLVMValueRef bestprev = LLVMBuildLoad2(g->builder, i8ptr, a_bestprev, "bestprev");
-            LLVMValueRef bestdue_done = LLVMBuildLoad2(g->builder, i64t,
-                LLVMBuildStructGEP2(g->builder, tnode_ty, best, 1, "best.duep"), "best.due");
-            LLVMValueRef now_done = zan_call2(g->builder, now_type, fn_now, NULL, 0, "now");
-            LLVMValueRef due_now = zan_icmp(g->builder, LLVMIntSLE,
-                bestdue_done, now_done, "due.now");
-            LLVMBuildCondBr(g->builder, due_now, timer_due, wait_timer);
+            LLVMValueRef dispatched = zan_call2(g->builder, timer_next_type,
+                timer_dispatch, NULL, 0, "timer.dispatched");
+            LLVMValueRef has_due = zan_icmp(g->builder, LLVMIntSGT, dispatched,
+                LLVMConstInt(i64t, 0, 0), "timer.has_due");
+            LLVMBuildCondBr(g->builder, has_due, head_bb, wait_timer);
 
             LLVMPositionBuilderAtEnd(g->builder, wait_timer);
-            LLVMValueRef remaining = zan_sub(g->builder, bestdue_done, now_done, "remaining");
-            zan_call2(g->builder, g->rt_io_pump_timeout_type,
-                g->rt_io_pump_timeout, (LLVMValueRef[]){ remaining }, 1, "");
-            LLVMBuildBr(g->builder, head_bb);
+            LLVMValueRef timeout = zan_call2(g->builder, timer_next_type,
+                timer_next, NULL, 0, "timer.timeout");
+            LLVMValueRef has_timer = zan_icmp(g->builder, LLVMIntSGE, timeout,
+                LLVMConstInt(i64t, 0, 0), "timer.pending");
+            LLVMBuildBr(g->builder, io_bb);
 
-            LLVMPositionBuilderAtEnd(g->builder, timer_due);
-            LLVMValueRef bestnext = LLVMBuildLoad2(g->builder, i8ptr,
-                LLVMBuildStructGEP2(g->builder, tnode_ty, best, 0, "best.nextp"), "best.nextv");
-            LLVMValueRef bp_null = zan_icmp(g->builder, LLVMIntEQ, bestprev,
-                LLVMConstNull(i8ptr), "bp.null");
-            LLVMBuildCondBr(g->builder, bp_null, unlink_head, unlink_mid);
-
-            LLVMPositionBuilderAtEnd(g->builder, unlink_head);
-            LLVMBuildStore(g->builder, bestnext, g_timers);
-            LLVMBuildBr(g->builder, after_unlink);
-
-            LLVMPositionBuilderAtEnd(g->builder, unlink_mid);
-            LLVMBuildStore(g->builder, bestnext,
-                LLVMBuildStructGEP2(g->builder, tnode_ty, bestprev, 0, "bp.nextp"));
-            LLVMBuildBr(g->builder, after_unlink);
-
-            LLVMPositionBuilderAtEnd(g->builder, after_unlink);
-            LLVMValueRef bframe = LLVMBuildLoad2(g->builder, i8ptr,
-                LLVMBuildStructGEP2(g->builder, tnode_ty, best, 2, "best.framep"), "best.frame");
-            LLVMValueRef bstep = LLVMBuildLoad2(g->builder, g->co_step_ptr,
-                LLVMBuildStructGEP2(g->builder, tnode_ty, best, 3, "best.stepp"), "best.step");
-            zan_call2(g->builder, g->rt_co_ready_type, g->rt_co_ready,
-                (LLVMValueRef[]){ bframe, bstep }, 2, "");
-            zan_call2(g->builder, free_type, g->fn_free,
-                (LLVMValueRef[]){ best }, 1, "");
-            LLVMBuildBr(g->builder, head_bb);
-
-            /* No timers: block for IO indefinitely. The weak fallback returns
-             * zero immediately, while the reactor returns zero only when there
-             * is no pending IO. */
             LLVMPositionBuilderAtEnd(g->builder, io_bb);
-            LLVMTypeRef legacy_pump_type = LLVMFunctionType(i32t, NULL, 0, 0);
-            LLVMValueRef legacy_pump = LLVMGetNamedFunction(g->mod, "zan_io_pump");
-            LLVMValueRef woke = zan_call2(g->builder, legacy_pump_type,
-                legacy_pump, NULL, 0, "woke");
+            LLVMValueRef woke = zan_call2(g->builder,
+                g->rt_io_pump_timeout_type, g->rt_io_pump_timeout,
+                (LLVMValueRef[]){ timeout }, 1, "woke");
             LLVMValueRef more = zan_icmp(g->builder, LLVMIntSGT, woke,
-                LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0), "io.more");
-            LLVMBuildCondBr(g->builder, more, head_bb, exit_bb);
+                LLVMConstInt(i32t, 0, 0), "io.more");
+            LLVMValueRef continue_run = LLVMBuildOr(g->builder, more, has_timer,
+                "sched.more");
+            LLVMBuildCondBr(g->builder, continue_run, head_bb, exit_bb);
 
             LLVMPositionBuilderAtEnd(g->builder, exit_bb);
             LLVMBuildRetVoid(g->builder);

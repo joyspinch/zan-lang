@@ -12,8 +12,7 @@ namespace Gui.Component.CodeEditor;
 /// next line inherits as its starting state.</summary>
 class CeHlLine {
     string src;
-    List<string> toks;
-    List<int> cols;
+    List<CodeSpan> spans;
     bool blockOpen;
 }
 
@@ -95,6 +94,18 @@ class ProjType {
     ProjType(string name, string members) {
         this.name = name;
         this.members = members;
+    }
+}
+
+class ContextMenuItem {
+    string label;
+    string key;
+    int action;
+
+    ContextMenuItem(string label, string key, int action) {
+        this.label = label;
+        this.key = key;
+        this.action = action;
     }
 }
 
@@ -241,8 +252,8 @@ partial class CodeEditor {
     // ---- debugging ----
     List<int> bps;
     int execLine;
-    List<string> dbgVars;   // tab-separated "name\ttype\tvalue" entries for hover tooltip
-    string hoverTip;        // current hover tooltip text
+    List<DbgVar> dbgVars;   // variables for the debug hover tooltip
+    DbgVar hoverTip;        // current hover tooltip entry (null when none)
     int hoverTipX;
     int hoverTipY;
 
@@ -338,8 +349,8 @@ partial class CodeEditor {
         e.fixes = new List<QuickFix>();
         e.bps = new List<int>();
         e.execLine = -1;
-        e.dbgVars = new List<string>();
-        e.hoverTip = "";
+        e.dbgVars = new List<DbgVar>();
+        e.hoverTip = null;
         e.hoverTipX = 0;
         e.hoverTipY = 0;
         e.ctxOpen = false;
@@ -428,7 +439,7 @@ partial class CodeEditor {
         return false;
     }
 
-    void SetDebugVars(List<string> vars) { dbgVars = vars; }
+    void SetDebugVars(List<DbgVar> vars) { dbgVars = vars; }
 
     void GoToLine(int line) {
         if (line < 0) { line = 0; }
@@ -450,15 +461,8 @@ partial class CodeEditor {
     /// Replaces the compiler diagnostics shown as red underlines + tooltips with
     /// the real errors reported by the last Run/Build for this file, and jumps
     /// the caret to the first one so its reason is visible immediately.
-    void SetCompilerDiagnostics(List<int> errLines, List<string> msgs) {
-        compErrors = new List<Diagnostic>();
-        int i = 0;
-        while (i < errLines.Count) {
-            string m = "";
-            if (i < msgs.Count) { m = msgs[i]; }
-            compErrors.Add(new Diagnostic(errLines[i], m));
-            i = i + 1;
-        }
+    void SetCompilerDiagnostics(List<Diagnostic> diagnostics) {
+        compErrors = diagnostics;
         cErrStamp = BufLen();
         diagStaleFrame = 0 - 1;
         if (compErrors.Count > 0) {
@@ -1122,29 +1126,30 @@ partial class CodeEditor {
         return en;
     }
 
-    /// Fills the parallel label / shortcut / action lists for the context menu.
-    /// Action 0 marks a separator row.
-    static void BuildCtxMenu(List<string> labels, List<string> keys, List<int> acts) {
-        labels.Add(CodeEditor.T("Cut", "剪切")); keys.Add("Ctrl+X"); acts.Add(1);
-        labels.Add(CodeEditor.T("Copy", "复制")); keys.Add("Ctrl+C"); acts.Add(2);
-        labels.Add(CodeEditor.T("Paste", "粘贴")); keys.Add("Ctrl+V"); acts.Add(3);
-        labels.Add(CodeEditor.T("Delete", "删除")); keys.Add("Del"); acts.Add(4);
-        labels.Add(""); keys.Add(""); acts.Add(0);
-        labels.Add(CodeEditor.T("Select All", "全选")); keys.Add("Ctrl+A"); acts.Add(5);
-        labels.Add(""); keys.Add(""); acts.Add(0);
-        labels.Add(CodeEditor.T("Toggle Comment", "切换注释")); keys.Add("Ctrl+/"); acts.Add(6);
-        labels.Add(CodeEditor.T("Duplicate Line", "复制当前行")); keys.Add("Ctrl+D"); acts.Add(7);
-        labels.Add(CodeEditor.T("Delete Line", "删除当前行")); keys.Add("Ctrl+L"); acts.Add(8);
-        labels.Add(""); keys.Add(""); acts.Add(0);
-        labels.Add(CodeEditor.T("Add Cursor Above", "在上方添加光标")); keys.Add("Ctrl+Alt+Up"); acts.Add(13);
-        labels.Add(CodeEditor.T("Add Cursor Below", "在下方添加光标")); keys.Add("Ctrl+Alt+Down"); acts.Add(14);
-        labels.Add(""); keys.Add(""); acts.Add(0);
-        labels.Add(""); keys.Add(""); acts.Add(0);
-        labels.Add(CodeEditor.T("Go to Definition", "转到定义")); keys.Add("F12"); acts.Add(11);
-        labels.Add(CodeEditor.T("Find All References", "查找所有引用")); keys.Add("Shift+F12"); acts.Add(12);
-        labels.Add(""); keys.Add(""); acts.Add(0);
-        labels.Add(CodeEditor.T("Find...", "查找...")); keys.Add("Ctrl+F"); acts.Add(9);
-        labels.Add(CodeEditor.T("Go to Line...", "跳转到行...")); keys.Add("Ctrl+G"); acts.Add(10);
+    /// Builds the context menu items. Action 0 marks a separator row.
+    static List<ContextMenuItem> BuildCtxMenu() {
+        List<ContextMenuItem> items = new List<ContextMenuItem>();
+        items.Add(new ContextMenuItem(CodeEditor.T("Cut", "剪切"), "Ctrl+X", 1));
+        items.Add(new ContextMenuItem(CodeEditor.T("Copy", "复制"), "Ctrl+C", 2));
+        items.Add(new ContextMenuItem(CodeEditor.T("Paste", "粘贴"), "Ctrl+V", 3));
+        items.Add(new ContextMenuItem(CodeEditor.T("Delete", "删除"), "Del", 4));
+        items.Add(new ContextMenuItem("", "", 0));
+        items.Add(new ContextMenuItem(CodeEditor.T("Select All", "全选"), "Ctrl+A", 5));
+        items.Add(new ContextMenuItem("", "", 0));
+        items.Add(new ContextMenuItem(CodeEditor.T("Toggle Comment", "切换注释"), "Ctrl+/", 6));
+        items.Add(new ContextMenuItem(CodeEditor.T("Duplicate Line", "复制当前行"), "Ctrl+D", 7));
+        items.Add(new ContextMenuItem(CodeEditor.T("Delete Line", "删除当前行"), "Ctrl+L", 8));
+        items.Add(new ContextMenuItem("", "", 0));
+        items.Add(new ContextMenuItem(CodeEditor.T("Add Cursor Above", "在上方添加光标"), "Ctrl+Alt+Up", 13));
+        items.Add(new ContextMenuItem(CodeEditor.T("Add Cursor Below", "在下方添加光标"), "Ctrl+Alt+Down", 14));
+        items.Add(new ContextMenuItem("", "", 0));
+        items.Add(new ContextMenuItem("", "", 0));
+        items.Add(new ContextMenuItem(CodeEditor.T("Go to Definition", "转到定义"), "F12", 11));
+        items.Add(new ContextMenuItem(CodeEditor.T("Find All References", "查找所有引用"), "Shift+F12", 12));
+        items.Add(new ContextMenuItem("", "", 0));
+        items.Add(new ContextMenuItem(CodeEditor.T("Find...", "查找..."), "Ctrl+F", 9));
+        items.Add(new ContextMenuItem(CodeEditor.T("Go to Line...", "跳转到行..."), "Ctrl+G", 10));
+        return items;
     }
 
     /// Runs a context-menu action by id (see BuildCtxMenu).
@@ -1182,33 +1187,31 @@ partial class CodeEditor {
         int lineH = Canvas.FontHeight(fontSize) + app.Scale(4);
         if (lineH < 1) { lineH = 1; }
 
-        List<string> mLabels = new List<string>();
-        List<string> mKeys = new List<string>();
-        List<int> mActs = new List<int>();
-        CodeEditor.BuildCtxMenu(mLabels, mKeys, mActs);
+        List<ContextMenuItem> menuItems = CodeEditor.BuildCtxMenu();
         // Quick-fix: offer to insert a missing `using` when the caret line uses
         // a stdlib type whose namespace has not been imported.
         string qfNs = QuickFixNs();
         if (qfNs.Length > 0) {
-            mLabels.Insert(0, ""); mKeys.Insert(0, ""); mActs.Insert(0, 0);
-            mLabels.Insert(0, CodeEditor.T("Add using ", "添加 using ") + qfNs + ";"); mKeys.Insert(0, "Ctrl+."); mActs.Insert(0, 20);
+            menuItems.Insert(0, new ContextMenuItem("", "", 0));
+            menuItems.Insert(0, new ContextMenuItem(CodeEditor.T("Add using ", "添加 using ") + qfNs + ";", "Ctrl+.", 20));
         }
         int itemH = lineH;
         int sepH = app.Scale(7);
         int mW = app.Scale(150);
         int wi = 0;
-        while (wi < mLabels.Count) {
-            if (mActs[wi] != 0) {
-                int lw = Canvas.MeasureText(mLabels[wi], fontSize)
-                         + Canvas.MeasureText(mKeys[wi], fontSize) + app.Scale(44);
+        while (wi < menuItems.Count) {
+            ContextMenuItem item = menuItems[wi];
+            if (item.action != 0) {
+                int lw = Canvas.MeasureText(item.label, fontSize)
+                         + Canvas.MeasureText(item.key, fontSize) + app.Scale(44);
                 if (lw > mW) { mW = lw; }
             }
             wi = wi + 1;
         }
         int mH = app.Scale(6);
         int hi = 0;
-        while (hi < mActs.Count) {
-            if (mActs[hi] == 0) { mH = mH + sepH; } else { mH = mH + itemH; }
+        while (hi < menuItems.Count) {
+            if (menuItems[hi].action == 0) { mH = mH + sepH; } else { mH = mH + itemH; }
             hi = hi + 1;
         }
 
@@ -1228,8 +1231,9 @@ partial class CodeEditor {
 
         int ry = mY + app.Scale(3);
         int ri = 0;
-        while (ri < mActs.Count) {
-            if (mActs[ri] == 0) {
+        while (ri < menuItems.Count) {
+            ContextMenuItem item = menuItems[ri];
+            if (item.action == 0) {
                 c.FillRect(mX + app.Scale(6), ry + sepH / 2, mW - app.Scale(12), 1, pal.border);
                 ry = ry + sepH;
             } else {
@@ -1241,9 +1245,9 @@ partial class CodeEditor {
                     tcol = pal.textSel;
                 }
                 int ty = ry + (itemH - Canvas.FontHeight(fontSize)) / 2;
-                c.DrawText(mX + app.Scale(12), ty, mLabels[ri], tcol, fontSize);
-                int kw = Canvas.MeasureText(mKeys[ri], fontSize);
-                c.DrawText(mX + mW - kw - app.Scale(10), ty, mKeys[ri], pal.muted, fontSize);
+                c.DrawText(mX + app.Scale(12), ty, item.label, tcol, fontSize);
+                int kw = Canvas.MeasureText(item.key, fontSize);
+                c.DrawText(mX + mW - kw - app.Scale(10), ty, item.key, pal.muted, fontSize);
                 ry = ry + itemH;
             }
             ri = ri + 1;
@@ -1257,11 +1261,12 @@ partial class CodeEditor {
                 int cy2 = mY + app.Scale(3);
                 int ci = 0;
                 int chosen = 0 - 1;
-                while (ci < mActs.Count) {
+                while (ci < menuItems.Count) {
+                    ContextMenuItem item = menuItems[ci];
                     int rh = itemH;
-                    if (mActs[ci] == 0) { rh = sepH; }
-                    if (mActs[ci] != 0 && app.mouseY >= cy2 && app.mouseY < cy2 + rh) {
-                        chosen = mActs[ci];
+                    if (item.action == 0) { rh = sepH; }
+                    if (item.action != 0 && app.mouseY >= cy2 && app.mouseY < cy2 + rh) {
+                        chosen = item.action;
                     }
                     cy2 = cy2 + rh;
                     ci = ci + 1;

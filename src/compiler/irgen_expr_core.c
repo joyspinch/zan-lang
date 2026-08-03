@@ -777,6 +777,7 @@ static int method_args_score(zan_irgen_t *g, zan_symbol_t *m,
             if (types_concrete_equal(pt, at)) { score += 4; continue; }
             int pf = type_family(pt), af = type_family(at);
             if (pf == FAM_UNKNOWN || af == FAM_UNKNOWN) continue;
+            if (pf == af) { score += 2; continue; }
             /* integer arguments widen to floating parameters */
             if (pf == FAM_FLOAT && af == FAM_INT) continue;
             return -1;
@@ -885,6 +886,69 @@ static zan_symbol_t *resolve_overload_typed(zan_irgen_t *g,
     }
     if (arity_matches > 1 && best && best_score >= 0) return best;
     return resolve_overload(type_sym, name, argc);
+}
+
+/* Overload resolution for operator-style methods whose first declared
+ * parameter is the injected receiver (`static T op_call(T self, ...)`,
+ * `op_index`, `op_index_set`): same as resolve_overload_typed but the
+ * declared parameter list includes `self`, so candidates match on
+ * `params.count == argc + 1` (or the params tail for a variadic) and
+ * arguments are scored starting at declared parameter 1. */
+static zan_symbol_t *resolve_op_overload(zan_irgen_t *g,
+                                        zan_symbol_t *type_sym,
+                                        zan_istr_t name,
+                                        zan_ast_node_t *call,
+                                        local_scope_t *locals) {
+    int argc = (call && call->kind == AST_CALL) ? call->call.args.count : 0;
+    zan_symbol_t *best = NULL;
+    zan_symbol_t *first_variadic = NULL;
+    int best_score = -1;
+    for (int i = 0; i < type_sym->member_count; i++) {
+        zan_symbol_t *m = type_sym->members[i];
+        if (m->kind != SYM_METHOD || !m->decl ||
+            m->decl->kind != AST_METHOD_DECL) continue;
+        if (m->name.len != name.len ||
+            memcmp(m->name.str, name.str, (size_t)name.len) != 0) continue;
+        zan_ast_list_t *ps = &m->decl->method_decl.params;
+        if (ps->count < 1) continue;
+        int variadic = method_is_params_variadic(m);
+        int score = 0;
+        if (variadic) {
+            int fixed = ps->count - 2; /* drop self and the params tail */
+            if (argc < fixed) continue;
+            if (!first_variadic) first_variadic = m;
+            score = method_args_score(g, m, call, NULL, locals, 1);
+            if (score < 0 && fixed > 0) continue;
+            /* method_args_score sees the params array itself. Rank each
+             * expanded tail argument against its element type instead. */
+            score = 0;
+            zan_type_t *pt = zan_binder_resolve_type(g->binder,
+                ps->items[ps->count - 1]->param.type);
+            zan_type_t *et = pt ? pt->element_type : NULL;
+            for (int ai = fixed; ai < argc; ai++) {
+                zan_type_t *at = infer_expr_type(g, call->call.args.items[ai], locals);
+                if (!et || !at) continue;
+                if (types_concrete_equal(et, at)) {
+                    score += 4;
+                    continue;
+                }
+                int ef = type_family(et), af = type_family(at);
+                if (ef == FAM_UNKNOWN || af == FAM_UNKNOWN) continue;
+                if (ef == FAM_FLOAT && af == FAM_INT) continue;
+                score = -1;
+                break;
+            }
+        } else {
+            if (ps->count != argc + 1) continue;
+            score = method_args_score(g, m, call, NULL, locals, 1);
+        }
+        if (score > best_score) {
+            best_score = score;
+            best = m;
+        }
+    }
+    if (best && best_score >= 0) return best;
+    return first_variadic;
 }
 
 static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
@@ -1084,6 +1148,19 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
     }
     case AST_INDEX: {
         zan_type_t *ot = infer_expr_type(g, e->index.object, locals);
+        /* op_index: `<class instance>[i]` has the static type of the
+         * class's op_index method return. */
+        if (ot && (ot->kind == TYPE_CLASS || ot->kind == TYPE_STRUCT) && ot->sym) {
+            zan_istr_t op_istr = {(char *)"op_index", 8};
+            zan_ast_node_t *op_call = zan_ast_new(g->arena, AST_CALL, e->loc);
+            op_call->call.callee = NULL;
+            zan_ast_list_init(&op_call->call.args);
+            zan_ast_list_init(&op_call->call.type_args);
+            zan_ast_list_push(&op_call->call.args, e->index.index, g->arena);
+            zan_symbol_t *op = resolve_op_overload(g, ot->sym,
+                                                   op_istr, op_call, locals);
+            if (op) return op->type;
+        }
         /* dict[key] yields the VALUE type (second type arg), not the key */
         if (ot && ot->name.len == 4 && memcmp(ot->name.str, "Dict", 4) == 0 &&
             ot->type_arg_count == 2)
@@ -1095,6 +1172,17 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
          * chained member access (e.g. Next().field) can find the struct. */
         zan_ast_node_t *callee = e->call.callee;
         if (!callee) return NULL;
+        /* op_call: `<class instance>(args)` has the static type of the
+         * class's op_call method return. */
+        {
+            zan_type_t *ct = infer_expr_type_raw(g, callee, locals);
+            if (ct && (ct->kind == TYPE_CLASS || ct->kind == TYPE_STRUCT) && ct->sym) {
+                zan_istr_t op_istr = {(char *)"op_call", 7};
+                zan_symbol_t *op = resolve_op_overload(g, ct->sym,
+                                                       op_istr, e, locals);
+                if (op) return op->type;
+            }
+        }
         /* Invoking a delegate-typed local or field: the call's type is the
          * delegate's return type. Without this a template call used straight
          * as a receiver (`rowOf(item).Kind()`) had no type and lowered to a

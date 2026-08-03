@@ -69,6 +69,10 @@ class DdzPopup {
 class DdzParticle {
     int x; int y; int vx; int vy; int bornAt; int cr; int cg; int cb;
 }
+class PlayerCard {
+    int card;
+    bool selected;
+}
 
 // combo types: 0 none, 1 single, 2 pair, 3 triple, 4 triple+1, 5 triple+2,
 // 6 straight, 7 pair straight, 8 bomb, 9 rocket
@@ -87,11 +91,10 @@ class DdzGame {
     Rng rng;
 
     // card encoding: value*4 + suit; value 3..15 (15=2), 16*4=small joker, 17*4=big joker
-    List<int> hand0;      // player (bottom)
+    List<PlayerCard> hand0; // player (bottom)
     List<int> hand1;      // right AI
     List<int> hand2;      // left AI
     List<int> bottom;     // 3 landlord cards
-    bool[] sel;           // selection flags parallel to hand0
     int scene;            // 0 menu, 1 bidding, 2 play, 3 over
     int landlord;         // 0/1/2
     int bid;              // 1..3
@@ -227,6 +230,41 @@ class DdzGame {
         }
     }
 
+    void SortPlayerHand() {
+        int i = 1;
+        while (i < this.hand0.Count) {
+            PlayerCard c = this.hand0[i];
+            int j = i - 1;
+            while (j >= 0 && this.hand0[j].card > c.card) { this.hand0[j + 1] = this.hand0[j]; j = j - 1; }
+            this.hand0[j + 1] = c;
+            i = i + 1;
+        }
+    }
+
+    List<int> PlayerCards() {
+        List<int> cards = new List<int>();
+        int i = 0;
+        while (i < this.hand0.Count) { cards.Add(this.hand0[i].card); i = i + 1; }
+        return cards;
+    }
+
+    void ClearPlayerSelection() {
+        int i = 0;
+        while (i < this.hand0.Count) { this.hand0[i].selected = false; i = i + 1; }
+    }
+
+    void RemovePlayerCards(List<int> cards) {
+        int i = 0;
+        while (i < cards.Count) {
+            int j = 0;
+            while (j < this.hand0.Count) {
+                if (this.hand0[j].card == cards[i]) { this.hand0.RemoveAt(j); j = this.hand0.Count; }
+                j = j + 1;
+            }
+            i = i + 1;
+        }
+    }
+
     void StartRound(int now) {
         List<int> deck = new List<int>();
         int v = 3;
@@ -243,22 +281,21 @@ class DdzGame {
             int t = deck[i]; deck[i] = deck[j]; deck[j] = t;
             i = i - 1;
         }
-        this.hand0 = new List<int>();
+        this.hand0 = new List<PlayerCard>();
         this.hand1 = new List<int>();
         this.hand2 = new List<int>();
         this.bottom = new List<int>();
         i = 0;
         while (i < 51) {
-            if (i % 3 == 0) { this.hand0.Add(deck[i]); }
+            if (i % 3 == 0) { PlayerCard pc = new PlayerCard(); pc.card = deck[i]; this.hand0.Add(pc); }
             if (i % 3 == 1) { this.hand1.Add(deck[i]); }
             if (i % 3 == 2) { this.hand2.Add(deck[i]); }
             i = i + 1;
         }
         this.bottom.Add(deck[51]); this.bottom.Add(deck[52]); this.bottom.Add(deck[53]);
-        this.SortHand(this.hand0);
+        this.SortPlayerHand();
         this.SortHand(this.hand1);
         this.SortHand(this.hand2);
-        this.sel = new bool[20];
         this.scene = 1;
         this.bid = 0;
         this.bidBest = 0;
@@ -342,12 +379,16 @@ class DdzGame {
     void BecomeLandlord(int who, int now) {
         this.landlord = who;
         this.bid = this.bidBest;
-        List<int> h = this.hand0;
-        if (who == 1) { h = this.hand1; }
-        if (who == 2) { h = this.hand2; }
         int i = 0;
-        while (i < 3) { h.Add(this.bottom[i]); i = i + 1; }
-        this.SortHand(h);
+        if (who == 0) {
+            while (i < 3) { PlayerCard pc = new PlayerCard(); pc.card = this.bottom[i]; this.hand0.Add(pc); i = i + 1; }
+            this.SortPlayerHand();
+        } else {
+            List<int> h = this.hand1;
+            if (who == 2) { h = this.hand2; }
+            while (i < 3) { h.Add(this.bottom[i]); i = i + 1; }
+            this.SortHand(h);
+        }
         this.scene = 2;
         this.turn = who;
         this.deadline = now + 25000;
@@ -614,7 +655,6 @@ class DdzGame {
         }
         // reluctance to bomb over small stuff
         if (!leading && best != null && (best.type == 8 || best.type == 9)) {
-            List<int> other = this.hand0;
             int oppMin = this.hand0.Count;
             if (this.landlord != 0) {
                 // as farmer, bomb mostly to stop the landlord
@@ -646,13 +686,19 @@ class DdzGame {
     }
 
     void PlayCombo(int who, Combo c, int now) {
-        List<int> h = this.hand0;
-        if (who == 1) { h = this.hand1; }
-        if (who == 2) { h = this.hand2; }
-        this.RemoveCards(h, c.cards);
+        int cardsLeft = 0;
+        if (who == 0) {
+            this.RemovePlayerCards(c.cards);
+            cardsLeft = this.hand0.Count;
+        } else {
+            List<int> h = this.hand1;
+            if (who == 2) { h = this.hand2; }
+            this.RemoveCards(h, c.cards);
+            cardsLeft = h.Count;
+        }
         this.table = c;
         this.lastWho = who;
-        if (who == 0) { this.shown0 = c; this.sel = new bool[20]; }
+        if (who == 0) { this.shown0 = c; }
         if (who == 1) { this.shown1 = c; }
         if (who == 2) { this.shown2 = c; }
         if (c.type == 8) {
@@ -665,19 +711,19 @@ class DdzGame {
             this.Toast("王炸！！倍数 x" + this.mult, now);
             this.Burst(640, 330, 60, now, 255, 90, 90);
         }
-        if (h.Count == 2) {
+        if (cardsLeft == 2) {
             string name = "你只剩";
             if (who == 1) { name = "右家只剩"; }
             if (who == 2) { name = "左家只剩"; }
             this.Toast(name + " 2 张牌！", now);
         }
-        if (h.Count == 1) {
+        if (cardsLeft == 1) {
             string name = "你只剩";
             if (who == 1) { name = "右家只剩"; }
             if (who == 2) { name = "左家只剩"; }
             this.Toast(name + " 1 张牌！！", now);
         }
-        if (h.Count == 0) { this.Finish(who, now); return; }
+        if (cardsLeft == 0) { this.Finish(who, now); return; }
         this.NextTurn(now);
     }
 
@@ -730,7 +776,7 @@ class DdzGame {
         List<int> cs = new List<int>();
         int i = 0;
         while (i < this.hand0.Count) {
-            if (this.sel[i]) { cs.Add(this.hand0[i]); }
+            if (this.hand0[i].selected) { cs.Add(this.hand0[i].card); }
             i = i + 1;
         }
         return cs;
@@ -751,14 +797,14 @@ class DdzGame {
         if (this.turn != 0 || this.scene != 2) { return; }
         bool leading = this.lastWho < 0 || this.lastWho == 0;
         if (leading) { this.Toast("你先出，不能不出", now); return; }
-        this.sel = new bool[20];
+        this.ClearPlayerSelection();
         this.PassTurn(0, now);
     }
 
     bool AnySelected() {
         int i = 0;
         while (i < this.hand0.Count) {
-            if (this.sel[i]) { return true; }
+            if (this.hand0[i].selected) { return true; }
             i = i + 1;
         }
         return false;
@@ -767,7 +813,7 @@ class DdzGame {
     void ClearSelection(int now) {
         if (this.turn != 0 || this.scene != 2) { return; }
         if (!this.AnySelected()) { this.Toast("没有选中的牌", now); return; }
-        this.sel = new bool[20];
+        this.ClearPlayerSelection();
     }
 
     // hand fan geometry: returns x of card i
@@ -813,11 +859,11 @@ class DdzGame {
         while (i >= 0) {
             int x = this.HandX(i, n);
             int y = 578;
-            if (this.sel[i]) { y = y - 36; }
+            if (this.hand0[i].selected) { y = y - 36; }
             int w = 96;
             if (i < n - 1) { w = this.HandX(i + 1, n) - x; }
             if (Draw.PointIn(cx, cy, x, y, w, 130)) {
-                this.sel[i] = !this.sel[i];
+                this.hand0[i].selected = !this.hand0[i].selected;
                 return;
             }
             i = i - 1;
@@ -839,7 +885,7 @@ class DdzGame {
         }
         if (this.scene == 1 && this.bidTurn == 0 && this.demo && now >= this.demoAt) {
             int want = 0;
-            int s = this.HandStrength(this.hand0);
+            int s = this.HandStrength(this.PlayerCards());
             if (s >= 18) { want = 3; }
             this.ApplyBid(0, want, now);
             return;
@@ -869,10 +915,10 @@ class DdzGame {
         if (this.scene == 2 && this.turn == 0 && !this.demo && now >= this.deadline) {
             // countdown expired: auto-play smallest single when leading, else pass
             bool leading = this.lastWho < 0 || this.lastWho == 0;
-            this.sel = new bool[20];
+            this.ClearPlayerSelection();
             if (leading) {
                 List<int> cs = new List<int>();
-                cs.Add(this.hand0[0]);
+                cs.Add(this.hand0[0].card);
                 this.Toast("超时，自动出最小单张", now);
                 this.PlayCombo(0, DdzGame.Classify(cs), now);
             } else {
@@ -885,7 +931,7 @@ class DdzGame {
             bool leading = this.lastWho < 0 || this.lastWho == 0;
             Combo tbl = this.table;
             if (leading) { tbl = Combo.None(); }
-            List<Combo> cands = this.Candidates(this.hand0, tbl);
+            List<Combo> cands = this.Candidates(this.PlayerCards(), tbl);
             if (cands.Count == 0) {
                 if (leading) { return; }
                 this.PassTurn(0, now);
@@ -1071,8 +1117,8 @@ class DdzGame {
             while (i < n) {
                 int x = this.HandX(i, n);
                 int y = 578;
-                if (this.scene == 2 && this.sel[i]) { y = y - 36; }
-                this.DrawCard(x, y, this.hand0[i], this.scene == 2 && this.sel[i]);
+                if (this.scene == 2 && this.hand0[i].selected) { y = y - 36; }
+                this.DrawCard(x, y, this.hand0[i].card, this.scene == 2 && this.hand0[i].selected);
                 i = i + 1;
             }
             if (this.avatarMe != null) {

@@ -132,13 +132,12 @@ partial class ChartView {
                     int a1 = (acc3 + v3) * 360 / total;
                     if (ang >= a0 && ang < a1) {
                         int pct3 = v3 * 100 / total;
-                        List<int> tcols = new List<int>();
-                        List<string> tlines = new List<string>();
-                        tcols.Add(0); tlines.Add(o.title);
-                        tcols.Add(s.color);
-                        tlines.Add(s.name + "  " + Convert.ToString(v3)
-                            + "  (" + Convert.ToString(pct3) + "%)");
-                        ChartView.TooltipCard(app, mx, my, x + w, tcols, tlines);
+                        List<TooltipRow> rows = new List<TooltipRow>();
+                        rows.Add(TooltipRow.Of(0, o.title));
+                        rows.Add(TooltipRow.Of(s.color,
+                            s.name + "  " + Convert.ToString(v3)
+                            + "  (" + Convert.ToString(pct3) + "%)"));
+                        ChartView.TooltipCard(app, mx, my, x + w, rows);
                         break;
                     }
                     acc3 = acc3 + v3;
@@ -147,7 +146,56 @@ partial class ChartView {
             }
         }
     }
-    // ---- gauge (half-ring speedometer; sweep grows with g) ----
+    // ---- gauge (per-series dial; clockwise Canvas angles) ----
+
+    static int GaugeSweep(GaugeOption gauge) {
+        int sweep = gauge.startAngle - gauge.endAngle;
+        while (sweep <= 0) { sweep = sweep + 360; }
+        if (sweep > 360) { sweep = 360; }
+        return sweep;
+    }
+
+    static int GaugeStart(GaugeOption gauge) {
+        int start = 90 - gauge.startAngle;
+        while (start < 0) { start = start + 360; }
+        while (start >= 360) { start = start - 360; }
+        return start;
+    }
+
+    static int GaugeScalar(App app, ChartScalar scalar, int extent) {
+        if (scalar.percent) { return extent * scalar.amount / 100; }
+        return app.Scale(scalar.amount);
+    }
+
+    // FillSector uses 0 degrees at 12 o'clock and increases clockwise. Keep
+    // the gauge's vector geometry in that same coordinate system.
+    static int GaugeX(int angle) { return ChartView.SinDeg(angle); }
+    static int GaugeY(int angle) { return 0 - ChartView.CosDeg(angle); }
+
+    static void GaugeSector(Canvas c, int cx, int cy, int inner, int outer,
+                            int start, int sweep, int color) {
+        if (sweep <= 0 || outer <= inner) { return; }
+        while (start < 0) { start = start + 360; }
+        while (start >= 360) { start = start - 360; }
+        int first = sweep;
+        if (start + first > 360) { first = 360 - start; }
+        if (first > 0) { c.FillSector(cx, cy, inner, outer, start, start + first, color); }
+        int rest = sweep - first;
+        if (rest > 0) { c.FillSector(cx, cy, inner, outer, 0, rest, color); }
+    }
+
+    static int GaugeColor(GaugeOption gauge, int perMille) {
+        int i = 0;
+        while (i < gauge.axisLine.colors.Count) {
+            GaugeColorStop stop = gauge.axisLine.colors[i];
+            if (perMille <= stop.stop) { return stop.color; }
+            i = i + 1;
+        }
+        if (gauge.axisLine.colors.Count > 0) {
+            return gauge.axisLine.colors[gauge.axisLine.colors.Count - 1].color;
+        }
+        return 0;
+    }
 
     static void DrawGauge(App app, int x, int y, int w, int h,
                           ChartOption o, int g) {
@@ -155,70 +203,209 @@ partial class ChartView {
         Theme t = app.theme;
         int pad = t.paddingMedium;
         int top = ChartView.PanelHead(app, x, y, w, h, o.title);
+        int bodyX = x + pad;
+        int bodyY = top;
+        int bodyW = w - pad * 2;
+        int bodyH = y + h - pad - top;
+        int baseSize = bodyW;
+        if (bodyH < baseSize) { baseSize = bodyH; }
+        int si = 0;
+        while (si < o.series.Count) {
+            ChartSeries s = o.series[si];
+            if (!s.hidden && s.type == ChartType.Gauge) {
+                GaugeOption gauge = s.gauge;
+                int min = gauge.min;
+                int max = gauge.max;
+                double rawVal = (double)min;
+                if (s.Count() > 0) { rawVal = s.Number(0); }
+                if (rawVal < (double)min) { rawVal = (double)min; }
+                if (rawVal > (double)max) { rawVal = (double)max; }
+                int val = (int)rawVal;
+                int span = max - min;
+                if (span < 1) { span = 1; }
+                int perMille = (int)((rawVal - (double)min) * 1000.0 / (double)span);
+                int startAngle = ChartView.GaugeStart(gauge);
+                int sweep = ChartView.GaugeSweep(gauge);
+                int cx = bodyX + ChartView.GaugeScalar(app, gauge.center.x, bodyW);
+                int cy = bodyY + ChartView.GaugeScalar(app, gauge.center.y, bodyH);
+                int radius = ChartView.GaugeScalar(app, gauge.radius, baseSize / 2);
+                if (radius < app.Scale(12)) { radius = app.Scale(12); }
+                int axisW = app.Scale(gauge.axisLine.lineStyle.width);
+                if (axisW < 1) { axisW = 1; }
 
-        int val = 0;
-        int color = t.primary;
-        if (o.series.Count > 0) {
-            ChartSeries s0 = o.series[0];
-            if (s0.Count() > 0) { val = s0.Value(0); }
-            if (s0.color != 0) { color = s0.color; }
+                if (gauge.axisLine.show) {
+                    int prev = 0;
+                    int stops = 0;
+                    while (stops < gauge.axisLine.colors.Count) {
+                        GaugeColorStop colorStop = gauge.axisLine.colors[stops];
+                        int stop = colorStop.stop;
+                        int col = colorStop.color;
+                        if (stop < prev) { stop = prev; }
+                        if (stop > 1000) { stop = 1000; }
+                        int segStart = startAngle + sweep * prev / 1000;
+                        int segSweep = sweep * (stop - prev) / 1000;
+                        int grown = sweep * g / 1000;
+                        int rel = segStart - startAngle;
+                        if (rel < grown) {
+                            if (rel + segSweep > grown) { segSweep = grown - rel; }
+                            ChartView.GaugeSector(c, cx, cy, radius - axisW, radius,
+                                segStart, segSweep, col);
+                        }
+                        prev = stop;
+                        stops = stops + 1;
+                    }
+                }
+
+                if ((gauge.axisTick.show || gauge.splitLine.show) && gauge.splitNumber > 0) {
+                    int minor = gauge.axisTick.splitNumber;
+                    if (minor < 1) { minor = 1; }
+                    int totalTicks = gauge.splitNumber * minor;
+                    int ti = 0;
+                    while (ti <= totalTicks) {
+                        bool major = ti % minor == 0;
+                        int len = app.Scale(gauge.axisTick.length);
+                        int thick = app.Scale(gauge.axisTick.lineStyle.width);
+                        int tickColor = gauge.axisTick.lineStyle.color;
+                        bool showTick = gauge.axisTick.show;
+                        if (major) {
+                            len = app.Scale(gauge.splitLine.length);
+                            thick = app.Scale(gauge.splitLine.lineStyle.width);
+                            tickColor = gauge.splitLine.lineStyle.color;
+                            showTick = gauge.splitLine.show;
+                        }
+                        int ang = startAngle + sweep * ti / totalTicks;
+                        int x0 = cx + ChartView.GaugeX(ang) * (radius - axisW) / 1000;
+                        int y0 = cy + ChartView.GaugeY(ang) * (radius - axisW) / 1000;
+                        int x1 = cx + ChartView.GaugeX(ang) * (radius - axisW - len) / 1000;
+                        int y1 = cy + ChartView.GaugeY(ang) * (radius - axisW - len) / 1000;
+                        if (showTick) { c.DrawLine(x0, y0, x1, y1, tickColor, thick); }
+                        ti = ti + 1;
+                    }
+                }
+
+                if (gauge.axisLabel.show && gauge.splitNumber > 0) {
+                    int li = 0;
+                    while (li <= gauge.splitNumber) {
+                        int ang2 = startAngle + sweep * li / gauge.splitNumber;
+                        int lv = min + span * li / gauge.splitNumber;
+                        string ls = Convert.ToString(lv);
+                        int lr = radius - axisW - app.Scale(gauge.splitLine.length + 10);
+                        int labelSize = gauge.axisLabel.textStyle.fontSize;
+                        if (labelSize <= 0) { labelSize = t.fontSizeSmall; }
+                        else { labelSize = app.Scale(labelSize); }
+                        int labelColor = gauge.axisLabel.textStyle.color;
+                        if (labelColor == 0) { labelColor = t.textTertiary; }
+                        int lx = cx + ChartView.GaugeX(ang2) * lr / 1000;
+                        int ly = cy + ChartView.GaugeY(ang2) * lr / 1000;
+                        c.DrawText(lx - Canvas.MeasureText(ls, labelSize) / 2,
+                            ly - Canvas.FontHeight(labelSize) / 2,
+                            ls, labelColor, labelSize);
+                        li = li + 1;
+                    }
+                }
+
+                int valueSweep = sweep * perMille / 1000;
+                valueSweep = valueSweep * g / 1000;
+                int pointerAngle = startAngle + valueSweep;
+                int pointerR = ChartView.GaugeScalar(app, gauge.pointer.length, radius);
+                int px = cx + ChartView.GaugeX(pointerAngle) * pointerR / 1000;
+                int py = cy + ChartView.GaugeY(pointerAngle) * pointerR / 1000;
+                int pointerColor = gauge.pointer.color;
+                if (pointerColor == 0) { pointerColor = s.color; }
+                if (pointerColor == 0) { pointerColor = ChartView.GaugeColor(gauge, perMille); }
+                int halfPointerW = app.Scale(gauge.pointer.width);
+                if (pointerR > 0 && halfPointerW > 0) {
+                    int tail = halfPointerW * 2;
+                    if (halfPointerW * 3 >= pointerR) { tail = halfPointerW; }
+                    int po = 0 - tail;
+                    while (po <= pointerR) {
+                        int shoulder;
+                        if (po < 0) { shoulder = halfPointerW * (po + tail) / tail; }
+                        else { shoulder = halfPointerW * (pointerR - po) / pointerR; }
+                        int sx0 = cx + ChartView.GaugeX(pointerAngle) * po / 1000
+                            - ChartView.GaugeY(pointerAngle) * shoulder / 1000;
+                        int sy0 = cy + ChartView.GaugeY(pointerAngle) * po / 1000
+                            + ChartView.GaugeX(pointerAngle) * shoulder / 1000;
+                        int sx1 = cx + ChartView.GaugeX(pointerAngle) * po / 1000
+                            + ChartView.GaugeY(pointerAngle) * shoulder / 1000;
+                        int sy1 = cy + ChartView.GaugeY(pointerAngle) * po / 1000
+                            - ChartView.GaugeX(pointerAngle) * shoulder / 1000;
+                        c.DrawLine(sx0, sy0, sx1, sy1, pointerColor, 1);
+                        po = po + 1;
+                    }
+                }
+
+                string titleText = s.name;
+                if (s.data.Count > 0 && s.data[0].name.Length > 0) {
+                    titleText = s.data[0].name;
+                }
+                if (gauge.title.show && titleText.Length > 0) {
+                    int titleSize = gauge.title.textStyle.fontSize;
+                    if (titleSize <= 0) { titleSize = t.fontSizeSmall; }
+                    else { titleSize = app.Scale(titleSize); }
+                    int titleColor = gauge.title.textStyle.color;
+                    if (titleColor == 0) { titleColor = t.textSecondary; }
+                    int tx = cx + ChartView.GaugeScalar(app, gauge.title.offsetCenter.x, radius);
+                    int ty = cy + ChartView.GaugeScalar(app, gauge.title.offsetCenter.y, radius);
+                    c.DrawText(tx - Canvas.MeasureText(titleText, titleSize) / 2,
+                        Canvas.CenterTextY(ty - titleSize / 2, titleSize, titleSize),
+                        titleText, titleColor, titleSize);
+                }
+                if (gauge.detail.show) {
+                    string detail = gauge.detail.formatter;
+                    if (detail.Length == 0) { detail = "{value}"; }
+                    string valueText = Convert.ToString(val);
+                    if (gauge.precision > 0 || rawVal != (double)val) {
+                        valueText = Convert.ToString(rawVal);
+                    }
+                    detail = detail.Replace("{value}", valueText);
+                    int detailSize = gauge.detail.textStyle.fontSize;
+                    if (detailSize <= 0) { detailSize = t.fontSizeLarge; }
+                    else { detailSize = app.Scale(detailSize); }
+                    int detailColor = gauge.detail.textStyle.color;
+                    if (detailColor == 0) { detailColor = t.textPrimary; }
+                    int dx = cx + ChartView.GaugeScalar(app, gauge.detail.offsetCenter.x, radius);
+                    int dy = cy + ChartView.GaugeScalar(app, gauge.detail.offsetCenter.y, radius);
+                    c.DrawText(dx - Canvas.MeasureText(detail, detailSize) / 2,
+                        Canvas.CenterTextY(dy - detailSize / 2, detailSize, detailSize),
+                        detail, detailColor, detailSize);
+                }
+            }
+            si = si + 1;
         }
-        int max = o.gaugeMax;
-        if (max <= 0) { max = 100; }
-        if (val < 0) { val = 0; }
-        if (val > max) { val = max; }
-
-        int areaW = w - pad * 2;
-        int areaH = (y + h - pad) - top;
-        int rOuter = areaW / 2;
-        if (rOuter > areaH - app.Scale(16)) { rOuter = areaH - app.Scale(16); }
-        if (rOuter < app.Scale(20)) { rOuter = app.Scale(20); }
-        int cx = x + w / 2;
-        int cy = top + rOuter;
-        int ring = rOuter * 32 / 100;
-        int rInner = rOuter - ring;
-
-        // Track (top semicircle split into left/right halves to avoid 0/360 wrap)
-        c.FillSector(cx, cy, rInner, rOuter, 270, 360, t.bgTertiary);
-        c.FillSector(cx, cy, rInner, rOuter, 0, 90, t.bgTertiary);
-
-        // Value arc, swept clockwise from the left (270 deg) and animated by g.
-        int sweep = 180 * val / max;
-        sweep = sweep * g / 1000;
-        int leftDeg = sweep;
-        if (leftDeg > 90) { leftDeg = 90; }
-        if (leftDeg > 0) {
-            c.FillSector(cx, cy, rInner, rOuter, 270, 270 + leftDeg, color);
-        }
-        if (sweep > 90) {
-            c.FillSector(cx, cy, rInner, rOuter, 0, sweep - 90, color);
-        }
-
-        // Big centred value + 0 / max end labels.
-        string vs = Convert.ToString(val);
-        int tw = Canvas.MeasureText(vs, t.fontSizeLarge);
-        c.DrawText(cx - tw / 2, cy - Canvas.FontHeight(t.fontSizeLarge) - app.Scale(2),
-            vs, t.textPrimary, t.fontSizeLarge);
-        c.DrawText(cx - rOuter, cy + app.Scale(4), "0", t.textTertiary, t.fontSizeSmall);
-        string mxs = Convert.ToString(max);
-        int mw = Canvas.MeasureText(mxs, t.fontSizeSmall);
-        c.DrawText(cx + rOuter - mw, cy + app.Scale(4), mxs, t.textTertiary, t.fontSizeSmall);
 
         if (o.showTooltip) {
             int mx = app.mouseX;
             int my = app.mouseY;
-            int ddx = mx - cx;
-            int ddy = my - cy;
-            int dist = ChartView.ISqrt(ddx * ddx + ddy * ddy);
-            if (ddy <= 0 && dist >= rInner && dist <= rOuter) {
-                string nm = "load";
-                if (o.series.Count > 0 && o.series[0].name.Length > 0) { nm = o.series[0].name; }
-                List<int> tcols = new List<int>();
-                List<string> tlines = new List<string>();
-                tcols.Add(0); tlines.Add(o.title);
-                tcols.Add(color);
-                tlines.Add(nm + "  " + Convert.ToString(val) + " / " + Convert.ToString(max));
-                ChartView.TooltipCard(app, mx, my, x + w, tcols, tlines);
+            int hit = o.series.Count - 1;
+            while (hit >= 0) {
+                ChartSeries hs = o.series[hit];
+                if (!hs.hidden && hs.type == ChartType.Gauge) {
+                    GaugeOption hitGauge = hs.gauge;
+                    int hcx = bodyX + ChartView.GaugeScalar(app, hitGauge.center.x, bodyW);
+                    int hcy = bodyY + ChartView.GaugeScalar(app, hitGauge.center.y, bodyH);
+                    int hr = ChartView.GaugeScalar(app, hitGauge.radius, baseSize / 2);
+                    int ddx = mx - hcx;
+                    int ddy = my - hcy;
+                    if (ChartView.ISqrt(ddx * ddx + ddy * ddy) <= hr) {
+                        double hitRaw = (double)hitGauge.min;
+                        if (hs.Count() > 0) { hitRaw = hs.Number(0); }
+                        string hitValue = Convert.ToString((int)hitRaw);
+                        if (hitGauge.precision > 0 || hitRaw != (double)((int)hitRaw)) {
+                            hitValue = Convert.ToString(hitRaw);
+                        }
+                        List<TooltipRow> rows = new List<TooltipRow>();
+                        rows.Add(TooltipRow.Of(0, o.title));
+                        string hitDetail = hitGauge.detail.formatter;
+                        if (hitDetail.Length == 0) { hitDetail = "{value}"; }
+                        hitDetail = hitDetail.Replace("{value}", hitValue);
+                        rows.Add(TooltipRow.Of(hs.color, hs.name + "  " + hitDetail
+                            + "  [" + Convert.ToString(hitGauge.min) + ", " + Convert.ToString(hitGauge.max) + "]"));
+                        ChartView.TooltipCard(app, mx, my, x + w, rows);
+                        break;
+                    }
+                }
+                hit = hit - 1;
             }
         }
     }
@@ -246,10 +433,13 @@ partial class ChartView {
         int cx = x + pad + areaW / 2;
         int cy = top + areaH / 2;
 
-        int band = rMax * 70 / 100 / n;
-        int gap = band * 22 / 100;
+        int band = rMax * 78 / 100 / n;
+        int gap = app.Scale(3);
+        if (gap > band / 3) { gap = band / 3; }
         int i = 0;
         while (i < n) {
+            ChartSeries ring = o.series[i];
+            if (ring.color == 0) { ring.color = Chart.Palette(t, i); }
             int ringOuter = rMax - i * band;
             int ringInner = ringOuter - band + gap;
             if (ringInner < 0) { ringInner = 0; }
@@ -296,13 +486,12 @@ partial class ChartView {
                 if (dist >= ringInner && dist <= ringOuter) {
                     int v2 = 0;
                     if (o.series[i2].Count() > 0) { v2 = o.series[i2].Value(0); }
-                    List<int> tcols = new List<int>();
-                    List<string> tlines = new List<string>();
-                    tcols.Add(0); tlines.Add(o.title);
-                    tcols.Add(o.series[i2].color);
-                    tlines.Add(o.series[i2].name + "  " + Convert.ToString(v2)
-                        + " / " + Convert.ToString(max));
-                    ChartView.TooltipCard(app, mx, my, x + w, tcols, tlines);
+                    List<TooltipRow> rows = new List<TooltipRow>();
+                    rows.Add(TooltipRow.Of(0, o.title));
+                    rows.Add(TooltipRow.Of(o.series[i2].color,
+                        o.series[i2].name + "  " + Convert.ToString(v2)
+                        + " / " + Convert.ToString(max)));
+                    ChartView.TooltipCard(app, mx, my, x + w, rows);
                     break;
                 }
                 i2 = i2 + 1;
@@ -428,12 +617,10 @@ partial class ChartView {
                 ChartStage st = stages[idx];
                 string nm = st.name;
                 if (nm.Length == 0) { nm = ChartView.StageName(idx); }
-                List<int> tcols = new List<int>();
-                List<string> tlines = new List<string>();
-                tcols.Add(0); tlines.Add(o.title);
-                tcols.Add(st.color);
-                tlines.Add(nm + "  " + Convert.ToString(st.val));
-                ChartView.TooltipCard(app, mx, my, x + w, tcols, tlines);
+                List<TooltipRow> rows = new List<TooltipRow>();
+                rows.Add(TooltipRow.Of(0, o.title));
+                rows.Add(TooltipRow.Of(st.color, nm + "  " + Convert.ToString(st.val)));
+                ChartView.TooltipCard(app, mx, my, x + w, rows);
             }
         }
     }
@@ -501,12 +688,10 @@ partial class ChartView {
                 ChartStage st = stages[idx];
                 string nm = st.name;
                 if (nm.Length == 0) { nm = "Item " + Convert.ToString(idx + 1); }
-                List<int> tcols = new List<int>();
-                List<string> tlines = new List<string>();
-                tcols.Add(0); tlines.Add(o.title);
-                tcols.Add(st.color);
-                tlines.Add(nm + "  " + Convert.ToString(st.val));
-                ChartView.TooltipCard(app, mx, my, x + w, tcols, tlines);
+                List<TooltipRow> rows = new List<TooltipRow>();
+                rows.Add(TooltipRow.Of(0, o.title));
+                rows.Add(TooltipRow.Of(st.color, nm + "  " + Convert.ToString(st.val)));
+                ChartView.TooltipCard(app, mx, my, x + w, rows);
             }
         }
     }

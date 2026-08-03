@@ -512,6 +512,21 @@ static void emit_fluent(rg_buf_t *out, rg_meta *m, const char *title) {
     }
     e = meta_get(m, "Upload");
     if (e && e->val.kind == 1 && e->val.ival) rg_putf(out, ".Upload()");
+    e = meta_get(m, "Rank");
+    if (e && e->val.kind == 0) rg_putf(out, ".Rank(%lld)", e->val.ival);
+    e = meta_get(m, "ApiMax");
+    if (e && e->val.kind == 0 && e->val.ival < 1000) {
+        rg_ent *scope = meta_get(m, "RateBy");
+        if (scope && scope->val.kind == 2
+            && (strcmp(scope->val.sval, "uid") == 0
+                || strcmp(scope->val.sval, "ip") == 0)) {
+            rg_putf(out, ".LimitBy(%lld, \"");
+            rg_put_qstr(out, scope->val.sval);
+            rg_putf(out, "\")");
+        } else {
+            rg_putf(out, ".Limit(%lld)", e->val.ival);
+        }
+    }
 
     /* faithful generic metadata for everything evaluated */
     for (int i = 0; i < m->count; i++) {

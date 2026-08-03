@@ -86,6 +86,16 @@ class Popup {
     int cb;
 }
 
+class TrailPoint {
+    int x;         // world px, fixed point 1/256
+    int y;
+}
+
+class SegmentPoint {
+    int x;         // sampled center, unwrapped world px
+    int y;
+}
+
 // A worm on the torus: the player, a hunter rival, or a snakelet prey.
 // The head position is stored unwrapped (continuous) so the trail stays
 // smooth across seams; all rendering / collision uses wrapped coordinates.
@@ -96,12 +106,9 @@ class Worm {
     int headY;
     int dirX;      // unit * 256
     int dirY;
-    int[] pathX;
-    int[] pathY;
-    int pathN;
-    int[] segX;    // sampled centers (unwrapped px), head first
-    int[] segY;
-    int segN;
+    List<TrailPoint> path;
+    List<SegmentPoint> seg;    // sampled centers (unwrapped px), head first
+
     int length;    // target segment count
     int speed;     // px/s
     int cr;        // body base color
@@ -116,10 +123,8 @@ class Worm {
     static Worm Make(int kind, int cr, int cg, int cb) {
         Worm w = new Worm();
         w.kind = kind;
-        w.pathX = new int[6144];
-        w.pathY = new int[6144];
-        w.segX = new int[400];
-        w.segY = new int[400];
+        w.path = new List<TrailPoint>();
+        w.seg = new List<SegmentPoint>();
         w.cr = cr; w.cg = cg; w.cb = cb;
         w.alive = false;
         return w;
@@ -132,12 +137,13 @@ class Worm {
         this.dirY = dy * 256;
         this.length = len;
         this.speed = spd;
-        this.pathN = 0;
+        this.path = new List<TrailPoint>();
         int i = 260;
         while (i >= 0) {
-            this.pathX[this.pathN] = this.headX - dx * i * 256;
-            this.pathY[this.pathN] = this.headY - dy * i * 256;
-            this.pathN = this.pathN + 1;
+            TrailPoint p = new TrailPoint();
+            p.x = this.headX - dx * i * 256;
+            p.y = this.headY - dy * i * 256;
+            this.path.Add(p);
             i = i - 1;
         }
         this.alive = true;
@@ -167,17 +173,16 @@ class Worm {
     void Advance(int spd, int dt) {
         this.headX = this.headX + this.dirX * spd * dt / 1000;
         this.headY = this.headY + this.dirY * spd * dt / 1000;
-        this.pathX[this.pathN] = this.headX;
-        this.pathY[this.pathN] = this.headY;
-        this.pathN = this.pathN + 1;
-        if (this.pathN >= 6144) {
-            int keep = 3072; int off = this.pathN - keep; int k = 0;
-            while (k < keep) {
-                this.pathX[k] = this.pathX[k + off];
-                this.pathY[k] = this.pathY[k + off];
+        TrailPoint p = new TrailPoint();
+        p.x = this.headX;
+        p.y = this.headY;
+        this.path.Add(p);
+        if (this.path.Count >= 6144) {
+            int keep = 3072; int off = this.path.Count - keep; int k = 0;
+            while (k < off) {
+                this.path.RemoveAt(0);
                 k = k + 1;
             }
-            this.pathN = keep;
         }
         this.Sample();
     }
@@ -194,26 +199,29 @@ class Worm {
         int want = this.length;
         if (want > 390) { want = 390; }
         int spacing = this.Radius() * 180 / 256 + 3;
-        this.segX[0] = this.headX / 256;
-        this.segY[0] = this.headY / 256;
-        this.segN = 1;
+        this.seg = new List<SegmentPoint>();
+        SegmentPoint head = new SegmentPoint();
+        head.x = this.headX / 256;
+        head.y = this.headY / 256;
+        this.seg.Add(head);
         int need = spacing * 256;
         int acc = 0;
-        int i = this.pathN - 1;
+        int i = this.path.Count - 1;
         int cx = this.headX;
         int cy = this.headY;
-        while (i > 0 && this.segN < want) {
-            int nx = this.pathX[i - 1];
-            int ny = this.pathY[i - 1];
+        while (i > 0 && this.seg.Count < want) {
+            int nx = this.path[i - 1].x;
+            int ny = this.path[i - 1].y;
             int dx = nx - cx; int dy = ny - cy;
             int d = Worm.Isq(dx / 4 * (dx / 4) + dy / 4 * (dy / 4)) * 4;
             if (acc + d >= need) {
                 int t = (need - acc) * 64 / (d + 1);
                 int mx = cx + dx * t / 64;
                 int my = cy + dy * t / 64;
-                this.segX[this.segN] = mx / 256;
-                this.segY[this.segN] = my / 256;
-                this.segN = this.segN + 1;
+                SegmentPoint point = new SegmentPoint();
+                point.x = mx / 256;
+                point.y = my / 256;
+                this.seg.Add(point);
                 cx = mx; cy = my;
                 acc = 0;
             } else {
@@ -496,11 +504,11 @@ class SnGame {
 
     void KillFoe(Worm w, int now, bool eaten) {
         int i = 0;
-        while (i < w.segN) {
-            if (i % 2 == 0) { this.DropOrbAt(w.segX[i] + this.rng.Range(-8, 17), w.segY[i] + this.rng.Range(-8, 17), 6 + this.rng.Range(0, 4)); }
+        while (i < w.seg.Count) {
+            if (i % 2 == 0) { this.DropOrbAt(w.seg[i].x + this.rng.Range(-8, 17), w.seg[i].y + this.rng.Range(-8, 17), 6 + this.rng.Range(0, 4)); }
             i = i + 1;
         }
-        this.Burst(w.segX[0], w.segY[0], 14, now, w.cr, w.cg, w.cb);
+        this.Burst(w.seg[0].x, w.seg[0].y, 14, now, w.cr, w.cg, w.cb);
         w.alive = false;
         this.kills = this.kills + 1;
         int gain = w.length * 2;
@@ -508,11 +516,11 @@ class SnGame {
         if (eaten) {
             this.me.length = this.me.length + w.length / 2;
             w.respawnAt = now + 7000;
-            this.AddPop(w.segX[0], w.segY[0], "美餐 +" + gain, now, 255, 235, 130);
+            this.AddPop(w.seg[0].x, w.seg[0].y, "美餐 +" + gain, now, 255, 235, 130);
             this.Toast("吃掉了一条小蛇！", now);
         } else {
             w.respawnAt = now + 5000;
-            this.AddPop(w.segX[0], w.segY[0], "击败 +" + gain, now, 255, 235, 130);
+            this.AddPop(w.seg[0].x, w.seg[0].y, "击败 +" + gain, now, 255, 235, 130);
             this.Toast("漂亮！对手炸成了能量豆", now);
         }
     }
@@ -533,9 +541,9 @@ class SnGame {
     bool HitsBody(Worm w, int hx, int hy, int fromSeg, int rad) {
         if (!w.alive) { return false; }
         int i = fromSeg;
-        while (i < w.segN) {
+        while (i < w.seg.Count) {
             int rr = rad + w.Radius() - 4;
-            if (SnGame.Dist2(SnGame.WrapP(w.segX[i], SnGame.WW()), SnGame.WrapP(w.segY[i], SnGame.WH()), hx, hy) < rr * rr) { return true; }
+            if (SnGame.Dist2(SnGame.WrapP(w.seg[i].x, SnGame.WW()), SnGame.WrapP(w.seg[i].y, SnGame.WH()), hx, hy) < rr * rr) { return true; }
             i = i + 1;
         }
         return false;
@@ -673,8 +681,8 @@ class SnGame {
             if (now >= this.drainAt) {
                 this.drainAt = now + 260;
                 this.me.length = this.me.length - 1;
-                int tx = this.me.segX[this.me.segN - 1];
-                int ty = this.me.segY[this.me.segN - 1];
+                int tx = this.me.seg[this.me.seg.Count - 1].x;
+                int ty = this.me.seg[this.me.seg.Count - 1].y;
                 this.DropOrbAt(tx, ty, 4);
             }
         }
@@ -760,18 +768,18 @@ class SnGame {
         if (!w.alive) { return; }
         int rad = w.Radius();
         bool rainbow = w.kind == 0 && this.feverOn;
-        int i = w.segN - 1;
+        int i = w.seg.Count - 1;
         while (i >= 0) {
-            int sx = this.ScrX(SnGame.WrapP(w.segX[i], SnGame.WW())) + shX;
-            int sy = this.ScrY(SnGame.WrapP(w.segY[i], SnGame.WH())) + shY;
+            int sx = this.ScrX(SnGame.WrapP(w.seg[i].x, SnGame.WW())) + shX;
+            int sy = this.ScrY(SnGame.WrapP(w.seg[i].y, SnGame.WH())) + shY;
             if (this.OnScreen(sx, sy, 40)) {
-                int s = rad - 3 * i / (w.segN + 1);
+                int s = rad - 3 * i / (w.seg.Count + 1);
                 int cr = w.cr; int cg = w.cg; int cb = w.cb;
                 if (rainbow) {
                     int hue = (i * 2 + now / 60) % 6;
                     cr = SnGame.PalR(hue); cg = SnGame.PalG(hue); cb = SnGame.PalB(hue);
                 } else {
-                    int fade = 55 * i / (w.segN + 1);
+                    int fade = 55 * i / (w.seg.Count + 1);
                     cr = cr - cr * fade / 160;
                     cg = cg - cg * fade / 160;
                     cb = cb - cb * fade / 160;
@@ -788,8 +796,8 @@ class SnGame {
             i = i - 1;
         }
         // eyes
-        int hsx = this.ScrX(SnGame.WrapP(w.segX[0], SnGame.WW())) + shX;
-        int hsy = this.ScrY(SnGame.WrapP(w.segY[0], SnGame.WH())) + shY;
+        int hsx = this.ScrX(SnGame.WrapP(w.seg[0].x, SnGame.WW())) + shX;
+        int hsy = this.ScrY(SnGame.WrapP(w.seg[0].y, SnGame.WH())) + shY;
         if (this.OnScreen(hsx, hsy, 60)) {
             int ex = w.dirY * rad / 256 / 2;
             int ey = -w.dirX * rad / 256 / 2;
@@ -925,8 +933,8 @@ class SnGame {
         while (fi < this.foes.Count) {
             Worm w = this.foes[fi];
             if (w.alive) {
-                int dx = SnGame.WrapP(w.segX[0], SnGame.WW()) * mmW / SnGame.WW();
-                int dy = SnGame.WrapP(w.segY[0], SnGame.WH()) * mmH / SnGame.WH();
+                int dx = SnGame.WrapP(w.seg[0].x, SnGame.WW()) * mmW / SnGame.WW();
+                int dy = SnGame.WrapP(w.seg[0].y, SnGame.WH()) * mmH / SnGame.WH();
                 int dr = 2;
                 if (w.kind == 1) { dr = 3; }
                 Draw.FillCircle(this.r, mmX + dx, mmY + dy, dr, w.cr, w.cg, w.cb, 235);

@@ -2052,6 +2052,15 @@ static zan_ast_node_t *parse_member_decl_inner(zan_parser_t *p,
         parser_advance(p);
         mods |= MOD_EVENT;
     }
+
+    /* nested type declaration: `[mods] class|struct|interface|enum Name {...}`
+     * inside a class body. The member modifier parser has already consumed
+     * `static`/`sealed`/... so the remaining token is the type keyword. */
+    if (parser_check(p, TK_CLASS) || parser_check(p, TK_STRUCT) ||
+        parser_check(p, TK_INTERFACE) || parser_check(p, TK_ENUM)) {
+        return parse_type_decl(p, mods);
+    }
+
     zan_loc_t loc = p->current.loc;
 
     /* destructor: ~ClassName() { } */
@@ -2817,6 +2826,47 @@ void zan_parser_merge_partials(zan_ast_node_t *unit, zan_arena_t *arena,
         }
     }
     decls->count = out;
+    (void)diag;
+}
+
+/* Hoist one nested type declaration out of `type_node`'s member list into the
+ * compilation-unit top level, recursing into deeper nesting first so the
+ * whole subtree is lifted. Returns the number of types hoisted. */
+static int hoist_nested_types(zan_ast_node_t *unit, zan_ast_node_t *type_node,
+                              zan_ast_list_t *decls, zan_arena_t *arena) {
+    int hoisted = 0;
+    zan_ast_list_t *members = &type_node->type_decl.members;
+    int m = members->count;
+    int mi = 0;
+    while (mi < m) {
+        zan_ast_node_t *mem = members->items[mi];
+        if (mem->kind == AST_CLASS_DECL || mem->kind == AST_STRUCT_DECL ||
+            mem->kind == AST_INTERFACE_DECL || mem->kind == AST_ENUM_DECL) {
+            hoisted += hoist_nested_types(unit, mem, decls, arena);
+            zan_ast_list_push(decls, mem, arena);
+            hoisted++;
+            /* remove from the member list (order-preserving) */
+            for (int k = mi; k < m - 1; k++) members->items[k] = members->items[k + 1];
+            members->count--;
+            m--;
+        } else {
+            mi++;
+        }
+    }
+    return hoisted;
+}
+
+void zan_parser_flatten_nested_types(zan_ast_node_t *unit, zan_arena_t *arena,
+                                     zan_diag_t *diag) {
+    if (!unit || unit->kind != AST_COMPILATION_UNIT) return;
+    zan_ast_list_t *decls = &unit->comp_unit.decls;
+    int n = decls->count;
+    for (int di = 0; di < n; di++) {
+        zan_ast_node_t *d = decls->items[di];
+        if (d->kind != AST_CLASS_DECL && d->kind != AST_STRUCT_DECL &&
+            d->kind != AST_INTERFACE_DECL && d->kind != AST_ENUM_DECL) continue;
+        hoist_nested_types(unit, d, decls, arena);
+    }
     (void)diag;
 }
 

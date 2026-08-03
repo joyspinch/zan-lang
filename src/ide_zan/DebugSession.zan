@@ -60,8 +60,8 @@ class DebugSession {
     int frameId;
     string curFile;
     string rbuf;
-    List<string> locals;
-    List<string> stack;
+    List<DbgVar> locals;
+    List<DbgFrame> stack;
     List<string> console;
 
     // ---- lifecycle --------------------------------------------------------
@@ -69,7 +69,7 @@ class DebugSession {
     /// Connects to a zan-dap listening on 127.0.0.1:port and runs the DAP
     /// launch handshake. Returns null if the socket cannot be reached.
     static DebugSession Open(int port, string program, string source,
-            List<int> bpLines, List<string> bpConds) {
+            List<DbgBreakpoint> bps) {
         DebugSession d = new DebugSession();
         d.sock = 0 - 1;
         d.seq = 1;
@@ -80,8 +80,8 @@ class DebugSession {
         d.frameId = 0;
         d.curFile = "";
         d.rbuf = "";
-        d.locals = new List<string>();
-        d.stack = new List<string>();
+        d.locals = new List<DbgVar>();
+        d.stack = new List<DbgFrame>();
         d.console = new List<string>();
 
         #if WINDOWS
@@ -113,7 +113,7 @@ class DebugSession {
         d.Request("launch", "{\"program\":\"" + DebugSession.JsonEsc(program)
             + "\",\"stopOnEntry\":false}");
         d.AwaitResponse("launch");
-        d.Request("setBreakpoints", d.BpJson(source, bpLines, bpConds));
+        d.Request("setBreakpoints", d.BpJson(source, bps));
         d.AwaitResponse("setBreakpoints");
         d.Request("configurationDone", "");
         d.AwaitResponse("configurationDone");
@@ -149,15 +149,15 @@ class DebugSession {
         return addr;
     }
 
-    string BpJson(string source, List<int> lines, List<string> conds) {
+    string BpJson(string source, List<DbgBreakpoint> bps) {
         string arr = "";
         int i = 0;
-        while (i < lines.Count) {
+        while (i < bps.Count) {
             if (i > 0) { arr = arr + ","; }
-            arr = arr + "{\"line\":" + Convert.ToString(lines[i]);
-            if (i < conds.Count && conds[i].Length > 0) {
+            arr = arr + "{\"line\":" + Convert.ToString(bps[i].line);
+            if (bps[i].cond.Length > 0) {
                 arr = arr + ",\"condition\":\""
-                    + DebugSession.JsonEsc(conds[i]) + "\"";
+                    + DebugSession.JsonEsc(bps[i].cond) + "\"";
             }
             arr = arr + "}";
             i = i + 1;
@@ -173,8 +173,8 @@ class DebugSession {
     int CurLine() { return this.curLine; }
     int ExitCode() { return this.exitCode; }
     string CurFile() { return this.curFile; }
-    List<string> Locals() { return this.locals; }
-    List<string> Stack() { return this.stack; }
+    List<DbgVar> Locals() { return this.locals; }
+    List<DbgFrame> Stack() { return this.stack; }
     List<string> Console() { return this.console; }
 
     void Continue() { this.Resume("continue"); }
@@ -392,7 +392,7 @@ class DebugSession {
             int line = DebugSession.JsonInt(m, "line", idIdx);
             string name = DebugSession.JsonStr(m, "name", idIdx);
             if (name.Length == 0) { name = "?"; }
-            this.stack.Add(name + " : line " + Convert.ToString(line));
+            this.stack.Add(DbgFrame.Create(name, line));
             if (first) {
                 this.frameId = DebugSession.JsonInt(m, "id", idIdx);
                 this.curLine = line;
@@ -404,9 +404,9 @@ class DebugSession {
         }
     }
 
-    /// Parses the variables body into "name\ttype\tvalue" rows (the format the
-    /// IDE's Variables panel / inline hints consume). Variable fields are
-    /// emitted in the order name, value, type.
+    /// Parses the variables body into DbgVar rows (the format the IDE's
+    /// Variables panel / inline hints consume). Variable fields are emitted
+    /// in the order name, value, type.
     void ParseVariables(string m) {
         if (m.Length == 0) { return; }
         int p = DebugSession.IndexOf(m, "\"variables\":", 0);
@@ -418,7 +418,7 @@ class DebugSession {
             string nm = DebugSession.JsonStr(m, "name", nameIdx);
             string vv = DebugSession.JsonStr(m, "value", nameIdx);
             string vt = DebugSession.JsonStr(m, "type", nameIdx);
-            this.locals.Add(nm + "\t" + vt + "\t" + vv);
+            this.locals.Add(DbgVar.Create(nm, vt, vv));
             int vIdx = DebugSession.IndexOf(m, "\"value\":", nameIdx);
             if (vIdx < 0) { break; }
             p = vIdx + 8;

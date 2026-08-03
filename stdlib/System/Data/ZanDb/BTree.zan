@@ -4,6 +4,30 @@ using System.Text;
 
 namespace System.Data.ZanDb;
 
+/// <summary>One key/value record returned by a range or prefix scan.</summary>
+class KvEntry {
+    string key;
+    string val;
+
+    KvEntry(string key, string val) {
+        this.key = key;
+        this.val = val;
+    }
+}
+
+/// <summary>One decoded leaf record. overflowPage is 0 for inline values.</summary>
+class BLeafEntry {
+    string key;
+    string val;
+    int overflowPage;
+
+    BLeafEntry(string key, string val, int overflowPage) {
+        this.key = key;
+        this.val = val;
+        this.overflowPage = overflowPage;
+    }
+}
+
 /// <summary>
 /// Decoded form of one B+Tree node (leaf or internal). Nodes are encoded
 /// into fixed-size pager pages; mutation happens on the decoded lists and the
@@ -11,16 +35,14 @@ namespace System.Data.ZanDb;
 /// </summary>
 class BNode {
     bool leaf;
-    List<string> keys;
-    List<string> vals;      // leaf only
-    List<int> ovf;          // leaf only: first overflow page id (0 = inline)
-    List<int> children;     // internal only: keys.Count + 1 entries
+    List<BLeafEntry> entries; // leaf only
+    List<string> keys;        // internal only
+    List<int> children;       // internal only: keys.Count + 1 entries
 
     BNode(bool isLeaf) {
         this.leaf = isLeaf;
+        this.entries = new List<BLeafEntry>();
         this.keys = new List<string>();
-        this.vals = new List<string>();
-        this.ovf = new List<int>();
         this.children = new List<int>();
     }
 
@@ -33,11 +55,13 @@ class BNode {
     BNode Copy() {
         BNode c = new BNode(this.leaf);
         int i = 0;
+        while (i < this.entries.Count) {
+            BLeafEntry e = this.entries[i];
+            c.entries.Add(new BLeafEntry(e.key, e.val, e.overflowPage));
+            i = i + 1;
+        }
+        i = 0;
         while (i < this.keys.Count) { c.keys.Add(this.keys[i]); i = i + 1; }
-        i = 0;
-        while (i < this.vals.Count) { c.vals.Add(this.vals[i]); i = i + 1; }
-        i = 0;
-        while (i < this.ovf.Count) { c.ovf.Add(this.ovf[i]); i = i + 1; }
         i = 0;
         while (i < this.children.Count) { c.children.Add(this.children[i]); i = i + 1; }
         return c;
@@ -202,6 +226,16 @@ class BTree {
         if (this.pager.TakeInvalidation()) { this.nodeCache.Clear(); }
     }
 
+    static void InsEntry(List<BLeafEntry> l, int idx, BLeafEntry v) {
+        l.Add(new BLeafEntry("", "", 0));
+        int m = l.Count - 1;
+        while (m > idx) {
+            l[m] = l[m - 1];
+            m = m - 1;
+        }
+        l[idx] = v;
+    }
+
     static void InsStr(List<string> l, int idx, string v) {
         l.Add("");
         int m = l.Count - 1;
@@ -303,9 +337,7 @@ class BTree {
             pg.ReadU64();                       // legacy sibling pointer
             int i = 0;
             while (i < nkeys) {
-                n.keys.Add(pg.ReadString());
-                n.vals.Add(pg.ReadString());
-                n.ovf.Add(0);
+                n.entries.Add(new BLeafEntry(pg.ReadString(), pg.ReadString(), 0));
                 i = i + 1;
             }
             this.nodeCache.Put(pageId, n);
@@ -316,15 +348,13 @@ class BTree {
             pg.ReadU64();                       // reserved (was sibling pointer)
             int i = 0;
             while (i < nkeys) {
-                n.keys.Add(pg.ReadString());
+                string key = pg.ReadString();
                 int flag = pg.ReadU8();
                 if (flag == 0) {
-                    n.vals.Add(pg.ReadString());
-                    n.ovf.Add(0);
+                    n.entries.Add(new BLeafEntry(key, pg.ReadString(), 0));
                 } else {
                     int first = Pager.PageIdOf(pg.ReadU64());
-                    n.vals.Add(ReadChain(first));
-                    n.ovf.Add(first);
+                    n.entries.Add(new BLeafEntry(key, ReadChain(first), first));
                 }
                 i = i + 1;
             }
@@ -348,12 +378,13 @@ class BTree {
         if (n.leaf) {
             size = size + 8;   // reserved
             int i = 0;
-            while (i < n.keys.Count) {
-                size = size + 5 + n.keys[i].Length + 1;   // key + flag
-                if (n.vals[i].Length > BTree.INLINE_MAX) {
-                    size = size + 8;                       // overflow page ref
+            while (i < n.entries.Count) {
+                BLeafEntry e = n.entries[i];
+                size = size + 5 + e.key.Length + 1;   // key + flag
+                if (e.val.Length > BTree.INLINE_MAX) {
+                    size = size + 8;                   // overflow page ref
                 } else {
-                    size = size + 5 + n.vals[i].Length;
+                    size = size + 5 + e.val.Length;
                 }
                 i = i + 1;
             }
@@ -375,9 +406,10 @@ class BTree {
             // Move large values out to overflow chains first (allocating
             // pages may touch the pager, so do it before encoding).
             int i = 0;
-            while (i < n.keys.Count) {
-                if (n.vals[i].Length > BTree.INLINE_MAX && n.ovf[i] == 0) {
-                    n.ovf[i] = WriteChain(n.vals[i]);
+            while (i < n.entries.Count) {
+                BLeafEntry e = n.entries[i];
+                if (e.val.Length > BTree.INLINE_MAX && e.overflowPage == 0) {
+                    e.overflowPage = WriteChain(e.val);
                 }
                 i = i + 1;
             }
@@ -386,17 +418,18 @@ class BTree {
         pg.Clear();
         if (n.leaf) {
             pg.WriteU8(BTree.TYPE_LEAF2);
-            pg.WriteU16(n.keys.Count);
+            pg.WriteU16(n.entries.Count);
             pg.WriteU64(0);
             int i = 0;
-            while (i < n.keys.Count) {
-                pg.WriteString(n.keys[i]);
-                if (n.ovf[i] != 0) {
+            while (i < n.entries.Count) {
+                BLeafEntry e = n.entries[i];
+                pg.WriteString(e.key);
+                if (e.overflowPage != 0) {
                     pg.WriteU8(1);
-                    pg.WriteU64(n.ovf[i]);
+                    pg.WriteU64(e.overflowPage);
                 } else {
                     pg.WriteU8(0);
-                    pg.WriteString(n.vals[i]);
+                    pg.WriteString(e.val);
                 }
                 i = i + 1;
             }
@@ -453,14 +486,13 @@ class BTree {
         return lo;
     }
 
-    /// <summary>Binary search for the first index whose key is >= key
-    /// (n.keys.Count when all keys are smaller).</summary>
+    /// <summary>Binary search for the first leaf entry whose key is >= key.</summary>
     static int LowerBound(BNode n, string key) {
         int lo = 0;
-        int hi = n.keys.Count;
+        int hi = n.entries.Count;
         while (lo < hi) {
             int mid = (lo + hi) / 2;
-            if (BTree.Compare(n.keys[mid], key) < 0) { lo = mid + 1; } else { hi = mid; }
+            if (BTree.Compare(n.entries[mid].key, key) < 0) { lo = mid + 1; } else { hi = mid; }
         }
         return lo;
     }
@@ -468,7 +500,7 @@ class BTree {
     /// <summary>Position of key in a leaf, or -1.</summary>
     static int LeafFind(BNode n, string key) {
         int lb = BTree.LowerBound(n, key);
-        if (lb < n.keys.Count && BTree.Compare(n.keys[lb], key) == 0) { return lb; }
+        if (lb < n.entries.Count && BTree.Compare(n.entries[lb].key, key) == 0) { return lb; }
         return -1;
     }
 
@@ -484,7 +516,7 @@ class BTree {
         }
         int pos = BTree.LeafFind(n, key);
         if (pos < 0) { return false; }
-        outVal.Add(n.vals[pos]);
+        outVal.Add(n.entries[pos].val);
         return true;
     }
 
@@ -513,13 +545,15 @@ class BTree {
 
         BNode n = NodeForWrite(pid);
         int ins = BTree.LowerBound(n, key);
-        if (ins < n.keys.Count && BTree.Compare(n.keys[ins], key) == 0) {
-            if (n.ovf[ins] != 0) { FreeChain(n.ovf[ins]); n.ovf[ins] = 0; }
-            n.vals[ins] = val;
+        if (ins < n.entries.Count && BTree.Compare(n.entries[ins].key, key) == 0) {
+            BLeafEntry existing = n.entries[ins];
+            if (existing.overflowPage != 0) {
+                FreeChain(existing.overflowPage);
+                existing.overflowPage = 0;
+            }
+            existing.val = val;
         } else {
-            BTree.InsStr(n.keys, ins, key);
-            BTree.InsStr(n.vals, ins, val);
-            BTree.InsInt(n.ovf, ins, 0);
+            BTree.InsEntry(n.entries, ins, new BLeafEntry(key, val, 0));
         }
 
         if (BTree.EncodedSize(n) <= BTree.PAGE_SIZE) {
@@ -537,25 +571,21 @@ class BTree {
         // the node maximum, move only that entry to the new right page so the
         // left page stays nearly full -- roughly doubling density for the
         // common append workload.
-        int mid = n.keys.Count / 2;
+        int mid = n.entries.Count / 2;
         if (ins > mid) { mid = ins; }
         BNode right = BNode.Leaf();
         int k = mid;
-        while (k < n.keys.Count) {
-            right.keys.Add(n.keys[k]);
-            right.vals.Add(n.vals[k]);
-            right.ovf.Add(n.ovf[k]);
+        while (k < n.entries.Count) {
+            right.entries.Add(n.entries[k]);
             k = k + 1;
         }
-        while (n.keys.Count > mid) {
-            n.keys.RemoveAt(n.keys.Count - 1);
-            n.vals.RemoveAt(n.vals.Count - 1);
-            n.ovf.RemoveAt(n.ovf.Count - 1);
+        while (n.entries.Count > mid) {
+            n.entries.RemoveAt(n.entries.Count - 1);
         }
         int rightId = this.pager.AllocPage();
         WriteNode(rightId, right);
         int leftId = WriteNodeCow(pid, n);
-        InsertUp(path, pathIdx, path.Count - 1, leftId, right.keys[0], rightId);
+        InsertUp(path, pathIdx, path.Count - 1, leftId, right.entries[0].key, rightId);
     }
 
     /// <summary>Rewrites the path above a copied node so it points at the new
@@ -655,10 +685,9 @@ class BTree {
         BNode n = NodeForWrite(pid);
         int pos = BTree.LeafFind(n, key);
         if (pos < 0) { return false; }
-        if (n.ovf[pos] != 0) { FreeChain(n.ovf[pos]); }
-        n.keys.RemoveAt(pos);
-        n.vals.RemoveAt(pos);
-        n.ovf.RemoveAt(pos);
+        BLeafEntry entry = n.entries[pos];
+        if (entry.overflowPage != 0) { FreeChain(entry.overflowPage); }
+        n.entries.RemoveAt(pos);
         int newLeaf = WriteNodeCow(pid, n);
         if (newLeaf != pid) {
             ReplaceUp(path, pathIdx, path.Count - 1, newLeaf);
@@ -747,26 +776,25 @@ class BTree {
         if (node.leaf) {
             int inRange = 0;
             int i = 0;
-            while (i < node.keys.Count) {
-                if (BTree.InRange(node.keys[i], startKey, endKey, mode)) {
+            while (i < node.entries.Count) {
+                if (BTree.InRange(node.entries[i].key, startKey, endKey, mode)) {
                     inRange = inRange + 1;
                 }
                 i = i + 1;
             }
             if (inRange == 0) { return pageId; }
-            if (inRange == node.keys.Count) {
+            if (inRange == node.entries.Count) {
                 removed[0] = removed[0] + inRange;
                 FreeLeafPage(pageId);
                 return 0;
             }
             BNode n = NodeForWrite(pageId);
-            int j = n.keys.Count - 1;
+            int j = n.entries.Count - 1;
             while (j >= 0) {
-                if (BTree.InRange(n.keys[j], startKey, endKey, mode)) {
-                    if (n.ovf[j] != 0) { FreeChain(n.ovf[j]); }
-                    n.keys.RemoveAt(j);
-                    n.vals.RemoveAt(j);
-                    n.ovf.RemoveAt(j);
+                BLeafEntry entry = n.entries[j];
+                if (BTree.InRange(entry.key, startKey, endKey, mode)) {
+                    if (entry.overflowPage != 0) { FreeChain(entry.overflowPage); }
+                    n.entries.RemoveAt(j);
                     removed[0] = removed[0] + 1;
                 }
                 j = j - 1;
@@ -830,12 +858,10 @@ class BTree {
     // ===== Range scan =====
 
     /// <summary>Collects up to limit entries with startKey &lt;= key &lt;= endKey
-    /// (endKey "" = unbounded) into outKeys/outVals. Walks the tree with a
-    /// cursor stack: under copy-on-write a leaf cannot keep a pointer to its
-    /// sibling, since inserting there would have to rewrite the left
-    /// neighbour too.</summary>
-    int Scan(string startKey, string endKey, int limit,
-            List<string> outKeys, List<string> outVals) {
+    /// (endKey "" = unbounded) into output. Walks the tree with a cursor
+    /// stack: under copy-on-write a leaf cannot keep a pointer to its sibling,
+    /// since inserting there would have to rewrite the left neighbour too.</summary>
+    int Scan(string startKey, string endKey, int limit, List<KvEntry> output) {
         Sync();
         List<int> stackIds = new List<int>();
         List<int> stackIdx = new List<int>();
@@ -851,12 +877,12 @@ class BTree {
         int found = 0;
         int i = BTree.LowerBound(n, startKey);
         while (true) {
-            while (i < n.keys.Count) {
-                if (endKey.Length > 0 && BTree.Compare(n.keys[i], endKey) > 0) {
+            while (i < n.entries.Count) {
+                BLeafEntry entry = n.entries[i];
+                if (endKey.Length > 0 && BTree.Compare(entry.key, endKey) > 0) {
                     return found;
                 }
-                outKeys.Add(n.keys[i]);
-                outVals.Add(n.vals[i]);
+                output.Add(new KvEntry(entry.key, entry.val));
                 found = found + 1;
                 if (limit > 0 && found >= limit) { return found; }
                 i = i + 1;

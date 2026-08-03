@@ -220,6 +220,9 @@ delegate int ComCall5Fn(nint self, nint a, nint b, nint c, nint d, nint e);
 
 delegate int CoInitializeExFn(nint reserved, int flags);
 delegate void CoUninitializeFn();
+delegate int TlsAllocFn();
+delegate nint TlsGetValueFn(int index);
+delegate int TlsSetValueFn(int index, nint data);
 delegate int CoCreateInstanceFn(nint clsid, nint outer, int ctx, nint iid,
                                 nint result);
 delegate void CoTaskMemFreeFn(nint p);
@@ -247,6 +250,34 @@ class Com {
     }
 
     static nint ole;
+    static int comTls = Com.AllocComTls();
+
+    static int AllocComTls() {
+        nint fn = Interop.Entry("kernel32.dll", "TlsAlloc");
+        if (fn == 0) { return 0 - 1; }
+        TlsAllocFn alloc = (TlsAllocFn)fn;
+        return alloc();
+    }
+
+    static int ComTls() { return Com.comTls; }
+
+    static bool ComInitialized() {
+        int tls = Com.ComTls();
+        if (tls < 0) { return false; }
+        nint fn = Interop.Entry("kernel32.dll", "TlsGetValue");
+        if (fn == 0) { return false; }
+        TlsGetValueFn call = (TlsGetValueFn)fn;
+        return call(tls) != 0;
+    }
+
+    static bool SetComInitialized(bool initialized) {
+        int tls = Com.ComTls();
+        if (tls < 0) { return false; }
+        nint fn = Interop.Entry("kernel32.dll", "TlsSetValue");
+        if (fn == 0) { return false; }
+        TlsSetValueFn call = (TlsSetValueFn)fn;
+        return call(tls, initialized ? (nint)1 : (nint)0) != 0;
+    }
 
     static int CoInit(nint reserved, int flags) {
         nint fn = Interop.Symbol(Com.Ole(), "CoInitializeEx");
@@ -289,11 +320,22 @@ class Com {
 
     static bool Ok(int hr) { return hr >= 0; }
 
+    /// Initializes COM once on the calling thread. S_FALSE is success and is
+    /// paired with one Shutdown; a changed apartment mode remains a failure.
     static int Initialize() {
-        return Com.CoInit(0, Com.Apartment());
+        if (Com.ComInitialized()) { return 0; }
+        int hr = Com.CoInit(0, Com.Apartment());
+        if (Com.Ok(hr) && !Com.SetComInitialized(true)) {
+            Com.CoUninit();
+            return Com.Fail();
+        }
+        return hr;
     }
 
+    /// Balances this class's successful Initialize on the calling thread.
     static void Shutdown() {
+        if (!Com.ComInitialized()) { return; }
+        Com.SetComInitialized(false);
         Com.CoUninit();
     }
 

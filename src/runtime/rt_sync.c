@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -34,7 +35,7 @@
 #endif
 
 #define ZAN_TABLE_MAGIC UINT64_C(0x5a414e54424c3031)
-#define ZAN_TABLE_VERSION 1
+#define ZAN_TABLE_VERSION 2
 #define ZAN_TABLE_MAX_COLUMNS 16
 #define ZAN_TABLE_COLUMN_NAME 32
 #define ZAN_TABLE_MAX_KEY 256
@@ -46,7 +47,7 @@
 #define ZAN_SLOT_EMPTY 0
 #define ZAN_SLOT_USED 1
 #define ZAN_SLOT_TOMBSTONE 2
-#define ZAN_SLOT_PREFIX 16
+#define ZAN_SLOT_PREFIX 32
 
 typedef struct {
 #ifdef _WIN32
@@ -71,6 +72,7 @@ typedef struct {
     uint64_t total_size;
     uint64_t capacity;
     uint64_t count;
+    uint64_t expiry_count;
     uint32_t key_size;
     uint32_t row_stride;
     uint32_t column_count;
@@ -328,6 +330,18 @@ static unsigned char *zan_row_at(zan_shared_header *header, uint64_t index) {
            (size_t)index * header->row_stride;
 }
 
+static uint64_t zan_row_slot(zan_shared_header *header, unsigned char *row) {
+    size_t rows_offset = zan_align8(sizeof(*header));
+    return (uint64_t)((row - ((unsigned char *)header + rows_offset)) /
+        header->row_stride);
+}
+
+static uint64_t *zan_expiry_heap(zan_shared_header *header) {
+    size_t rows_offset = zan_align8(sizeof(*header));
+    return (uint64_t *)((unsigned char *)header + rows_offset +
+        (size_t)header->capacity * header->row_stride);
+}
+
 static uint32_t *zan_row_state(unsigned char *row) {
     return (uint32_t *)row;
 }
@@ -355,6 +369,14 @@ static uint32_t *zan_row_lock_word(unsigned char *row) {
 
 static uint64_t *zan_row_hash(unsigned char *row) {
     return (uint64_t *)(row + 8);
+}
+
+static int64_t *zan_row_expires_at(unsigned char *row) {
+    return (int64_t *)(row + 16);
+}
+
+static uint64_t *zan_row_heap_index(unsigned char *row) {
+    return (uint64_t *)(row + 24);
 }
 
 static char *zan_row_key(unsigned char *row) {
@@ -388,6 +410,127 @@ static void zan_row_unlock(unsigned char *row) {
 #else
     __atomic_store_n(zan_row_lock_word(row), 0, __ATOMIC_RELEASE);
 #endif
+}
+
+static void zan_expiry_swap(zan_shared_header *header, uint64_t a, uint64_t b) {
+    uint64_t *heap = zan_expiry_heap(header);
+    uint64_t slot = heap[a];
+    heap[a] = heap[b];
+    heap[b] = slot;
+    *zan_row_heap_index(zan_row_at(header, heap[a])) = a + 1;
+    *zan_row_heap_index(zan_row_at(header, heap[b])) = b + 1;
+}
+
+static void zan_expiry_up(zan_shared_header *header, uint64_t index) {
+    uint64_t *heap = zan_expiry_heap(header);
+    while (index > 0) {
+        uint64_t parent = (index - 1) / 2;
+        int64_t expires = *zan_row_expires_at(zan_row_at(header, heap[index]));
+        int64_t parent_expires = *zan_row_expires_at(zan_row_at(header, heap[parent]));
+        if (expires >= parent_expires) break;
+        zan_expiry_swap(header, index, parent);
+        index = parent;
+    }
+}
+
+static void zan_expiry_down(zan_shared_header *header, uint64_t index) {
+    uint64_t *heap = zan_expiry_heap(header);
+    for (;;) {
+        uint64_t left = index * 2 + 1;
+        if (left >= header->expiry_count) break;
+        uint64_t right = left + 1;
+        uint64_t smallest = left;
+        if (right < header->expiry_count &&
+            *zan_row_expires_at(zan_row_at(header, heap[right])) <
+            *zan_row_expires_at(zan_row_at(header, heap[left]))) {
+            smallest = right;
+        }
+        if (*zan_row_expires_at(zan_row_at(header, heap[index])) <=
+            *zan_row_expires_at(zan_row_at(header, heap[smallest]))) break;
+        zan_expiry_swap(header, index, smallest);
+        index = smallest;
+    }
+}
+
+static void zan_expiry_remove(zan_shared_header *header, unsigned char *row) {
+    uint64_t encoded = *zan_row_heap_index(row);
+    if (encoded == 0 || encoded > header->expiry_count) return;
+    uint64_t index = encoded - 1;
+    uint64_t *heap = zan_expiry_heap(header);
+    uint64_t last = --header->expiry_count;
+    *zan_row_heap_index(row) = 0;
+    *zan_row_expires_at(row) = 0;
+    if (index == last) return;
+    heap[index] = heap[last];
+    *zan_row_heap_index(zan_row_at(header, heap[index])) = index + 1;
+    if (index > 0 &&
+        *zan_row_expires_at(zan_row_at(header, heap[index])) <
+        *zan_row_expires_at(zan_row_at(header, heap[(index - 1) / 2]))) {
+        zan_expiry_up(header, index);
+    } else {
+        zan_expiry_down(header, index);
+    }
+}
+
+static void zan_expiry_set(
+    zan_shared_header *header, uint64_t slot, unsigned char *row, int64_t expires_at) {
+    uint64_t encoded = *zan_row_heap_index(row);
+    *zan_row_expires_at(row) = expires_at;
+    if (expires_at <= 0) {
+        if (encoded != 0) zan_expiry_remove(header, row);
+        return;
+    }
+    if (encoded == 0) {
+        uint64_t index = header->expiry_count++;
+        zan_expiry_heap(header)[index] = slot;
+        *zan_row_heap_index(row) = index + 1;
+        zan_expiry_up(header, index);
+        return;
+    }
+    uint64_t index = encoded - 1;
+    zan_expiry_up(header, index);
+    encoded = *zan_row_heap_index(row);
+    zan_expiry_down(header, encoded - 1);
+}
+
+static int64_t zan_wall_now_ms(void) {
+#ifdef _WIN32
+    FILETIME ft;
+    ULARGE_INTEGER value;
+    GetSystemTimeAsFileTime(&ft);
+    value.LowPart = ft.dwLowDateTime;
+    value.HighPart = ft.dwHighDateTime;
+    return (int64_t)(value.QuadPart / UINT64_C(10000) - UINT64_C(11644473600000));
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+#endif
+}
+
+static void zan_purge_expired_locked(zan_shared_header *header, int64_t now_ms) {
+    uint64_t *heap = zan_expiry_heap(header);
+    while (header->expiry_count > 0) {
+        unsigned char *row = zan_row_at(header, heap[0]);
+        if (*zan_row_expires_at(row) > now_ms) break;
+        zan_row_lock(row);
+        zan_expiry_remove(header, row);
+        memset(row, 0, header->row_stride);
+        zan_publish_state(row, ZAN_SLOT_TOMBSTONE);
+        header->count--;
+        zan_row_unlock(row);
+    }
+}
+
+static void zan_purge_expired(zan_shared_header *header) {
+    if (header->expiry_count == 0) return;
+    uint64_t *heap = zan_expiry_heap(header);
+    unsigned char *row = zan_row_at(header, heap[0]);
+    int64_t now_ms = zan_wall_now_ms();
+    if (*zan_row_expires_at(row) > now_ms) return;
+    zan_struct_lock(header);
+    zan_purge_expired_locked(header, now_ms);
+    zan_struct_unlock(header);
 }
 
 static unsigned char *zan_find_row(
@@ -438,6 +581,7 @@ static unsigned char *zan_find_row(
 
 static unsigned char *zan_row_for(
     zan_shared_header *header, const char *key, int create) {
+    zan_purge_expired(header);
     unsigned char *row = zan_find_row(header, key, 0);
     if (row || !create) return row;
     /* Missing and we may create it: take the structural lock and look again,
@@ -491,6 +635,7 @@ static unsigned char *zan_find_row_hash(
 
 static unsigned char *zan_row_for_hash(
     zan_shared_header *header, uint64_t hash, int create) {
+    zan_purge_expired(header);
     unsigned char *row = zan_find_row_hash(header, hash, 0);
     if (row || !create) return row;
     zan_struct_lock(header);
@@ -806,7 +951,10 @@ int64_t zan_shared_table_create(
 
     size_t rows_offset = zan_align8(sizeof(zan_shared_header));
     if ((size_t)capacity > (SIZE_MAX - rows_offset) / row_stride) return 0;
-    size_t total_size = rows_offset + (size_t)capacity * row_stride;
+    size_t rows_size = (size_t)capacity * row_stride;
+    if ((size_t)capacity > (SIZE_MAX - rows_offset - rows_size) / sizeof(uint64_t)) return 0;
+    size_t total_size = rows_offset + rows_size +
+        (size_t)capacity * sizeof(uint64_t);
 
     zan_shared_table *table = (zan_shared_table *)calloc(1, sizeof(*table));
     if (!table) return 0;
@@ -1268,6 +1416,7 @@ int32_t zan_shared_table_match_at(
 int32_t zan_shared_table_exists_at(int64_t handle, int64_t key_hash) {
     zan_shared_table *table = (zan_shared_table *)(intptr_t)handle;
     if (!table) return 0;
+    zan_purge_expired(table->header);
     return zan_find_row_hash(table->header, (uint64_t)key_hash, 0) != NULL;
 }
 
@@ -1275,10 +1424,12 @@ int32_t zan_shared_table_delete_at(int64_t handle, int64_t key_hash) {
     zan_shared_table *table = (zan_shared_table *)(intptr_t)handle;
     if (!table) return 0;
     zan_struct_lock(table->header);
+    zan_purge_expired_locked(table->header, zan_wall_now_ms());
     unsigned char *row = zan_find_row_hash(
         table->header, (uint64_t)key_hash, 0);
     if (row) {
         zan_row_lock(row);
+        zan_expiry_remove(table->header, row);
         memset(row, 0, table->header->row_stride);
         zan_publish_state(row, ZAN_SLOT_TOMBSTONE);
         table->header->count--;
@@ -1288,13 +1439,167 @@ int32_t zan_shared_table_delete_at(int64_t handle, int64_t key_hash) {
     return row != NULL;
 }
 
+int32_t zan_shared_table_expire(
+    int64_t handle, const char *key, int64_t ttl_ms) {
+    if (ttl_ms < 0) return 0;
+    int64_t now_ms = zan_wall_now_ms();
+    if (ttl_ms > INT64_MAX - now_ms) return 0;
+    return zan_shared_table_expire_at(handle, key, now_ms + ttl_ms);
+}
+
+int32_t zan_shared_table_expire_at(
+    int64_t handle, const char *key, int64_t expires_at_ms) {
+    zan_shared_table *table = (zan_shared_table *)(intptr_t)handle;
+    if (!table || !key || expires_at_ms < 0) return 0;
+    zan_struct_lock(table->header);
+    zan_purge_expired_locked(table->header, zan_wall_now_ms());
+    unsigned char *row = zan_find_row(table->header, key, 0);
+    if (row) {
+        zan_row_lock(row);
+        zan_expiry_set(
+            table->header, zan_row_slot(table->header, row), row, expires_at_ms);
+        zan_row_unlock(row);
+    }
+    zan_struct_unlock(table->header);
+    return row != NULL;
+}
+
+int64_t zan_shared_table_expires_at(int64_t handle, const char *key) {
+    zan_shared_table *table = (zan_shared_table *)(intptr_t)handle;
+    if (!table || !key) return -1;
+    zan_purge_expired(table->header);
+    unsigned char *row = zan_find_row(table->header, key, 0);
+    if (!row) return -1;
+    zan_row_lock(row);
+    int64_t expires_at = *zan_row_expires_at(row);
+    zan_row_unlock(row);
+    return expires_at;
+}
+
+int64_t zan_shared_table_purge_expired(int64_t handle, int64_t now_ms) {
+    zan_shared_table *table = (zan_shared_table *)(intptr_t)handle;
+    if (!table) return 0;
+    if (now_ms < 0) now_ms = zan_wall_now_ms();
+    zan_struct_lock(table->header);
+    uint64_t before = table->header->count;
+    zan_purge_expired_locked(table->header, now_ms);
+    uint64_t removed = before - table->header->count;
+    zan_struct_unlock(table->header);
+    return (int64_t)removed;
+}
+
+int32_t zan_shared_table_rate_allow(
+    int64_t handle, const char *key, int64_t now_ms,
+    int64_t window_ms, int64_t limit) {
+    zan_shared_table *table = (zan_shared_table *)(intptr_t)handle;
+    if (limit <= 0) return 1;
+    if (!table || !key || window_ms <= 0) return 0;
+    if (now_ms < 0) now_ms = zan_wall_now_ms();
+    if (window_ms > INT64_MAX - now_ms) return 0;
+    zan_shared_column *count_column = zan_find_column(
+        table->header, "count", ZAN_TABLE_INT);
+    zan_shared_column *start_column = zan_find_column(
+        table->header, "window_start", ZAN_TABLE_INT);
+    if (!count_column || !start_column) return 0;
+
+    int allowed = 0;
+    zan_struct_lock(table->header);
+    zan_purge_expired_locked(table->header, now_ms);
+    unsigned char *row = zan_find_row(table->header, key, 1);
+    if (row) {
+        zan_row_lock(row);
+        int64_t count = 0;
+        int64_t start = 0;
+        memcpy(&count, row + count_column->offset, sizeof(count));
+        memcpy(&start, row + start_column->offset, sizeof(start));
+        if (start <= 0 || now_ms - start >= window_ms) {
+            count = 1;
+            start = now_ms;
+            zan_expiry_set(
+                table->header, zan_row_slot(table->header, row), row,
+                now_ms + window_ms);
+            allowed = 1;
+        } else if (count < limit) {
+            count++;
+            allowed = 1;
+        }
+        memcpy(row + count_column->offset, &count, sizeof(count));
+        memcpy(row + start_column->offset, &start, sizeof(start));
+        zan_row_unlock(row);
+    }
+    zan_struct_unlock(table->header);
+    return allowed;
+}
+
+int32_t zan_shared_table_lock_acquire(
+    int64_t handle, const char *key, int64_t owner,
+    int64_t now_ms, int64_t lease_ms) {
+    zan_shared_table *table = (zan_shared_table *)(intptr_t)handle;
+    if (!table || !key || owner == 0 || lease_ms <= 0) return 0;
+    if (now_ms < 0) now_ms = zan_wall_now_ms();
+    if (lease_ms > INT64_MAX - now_ms) return 0;
+    zan_shared_column *owner_column = zan_find_column(
+        table->header, "owner", ZAN_TABLE_INT);
+    if (!owner_column) return 0;
+
+    int acquired = 0;
+    zan_struct_lock(table->header);
+    zan_purge_expired_locked(table->header, now_ms);
+    unsigned char *row = zan_find_row(table->header, key, 0);
+    if (!row) {
+        row = zan_find_row(table->header, key, 1);
+        if (row) {
+            zan_row_lock(row);
+            memcpy(row + owner_column->offset, &owner, sizeof(owner));
+            zan_expiry_set(
+                table->header, zan_row_slot(table->header, row), row,
+                now_ms + lease_ms);
+            zan_row_unlock(row);
+            acquired = 1;
+        }
+    }
+    zan_struct_unlock(table->header);
+    return acquired;
+}
+
+int32_t zan_shared_table_lock_release(
+    int64_t handle, const char *key, int64_t owner) {
+    zan_shared_table *table = (zan_shared_table *)(intptr_t)handle;
+    if (!table || !key || owner == 0) return 0;
+    zan_shared_column *owner_column = zan_find_column(
+        table->header, "owner", ZAN_TABLE_INT);
+    if (!owner_column) return 0;
+
+    int released = 0;
+    zan_struct_lock(table->header);
+    zan_purge_expired_locked(table->header, zan_wall_now_ms());
+    unsigned char *row = zan_find_row(table->header, key, 0);
+    if (row) {
+        zan_row_lock(row);
+        int64_t current_owner = 0;
+        memcpy(&current_owner, row + owner_column->offset, sizeof(current_owner));
+        if (current_owner == owner) {
+            zan_expiry_remove(table->header, row);
+            memset(row, 0, table->header->row_stride);
+            zan_publish_state(row, ZAN_SLOT_TOMBSTONE);
+            table->header->count--;
+            released = 1;
+        }
+        zan_row_unlock(row);
+    }
+    zan_struct_unlock(table->header);
+    return released;
+}
+
 int32_t zan_shared_table_delete(int64_t handle, const char *key) {
     zan_shared_table *table = (zan_shared_table *)(intptr_t)handle;
     if (!table) return 0;
     zan_struct_lock(table->header);
+    zan_purge_expired_locked(table->header, zan_wall_now_ms());
     unsigned char *row = zan_find_row(table->header, key, 0);
     if (row) {
         zan_row_lock(row);
+        zan_expiry_remove(table->header, row);
         memset(row, 0, table->header->row_stride);
         zan_publish_state(row, ZAN_SLOT_TOMBSTONE);
         table->header->count--;
@@ -1307,12 +1612,14 @@ int32_t zan_shared_table_delete(int64_t handle, const char *key) {
 int32_t zan_shared_table_exists(int64_t handle, const char *key) {
     zan_shared_table *table = (zan_shared_table *)(intptr_t)handle;
     if (!table) return 0;
+    zan_purge_expired(table->header);
     return zan_find_row(table->header, key, 0) != NULL;
 }
 
 int64_t zan_shared_table_count(int64_t handle) {
     zan_shared_table *table = (zan_shared_table *)(intptr_t)handle;
     if (!table) return 0;
+    zan_purge_expired(table->header);
     return (int64_t)table->header->count;
 }
 
@@ -1330,6 +1637,7 @@ void zan_shared_table_clear(int64_t handle) {
         (unsigned char *)table->header + rows_offset, 0,
         table->mapped_size - rows_offset);
     table->header->count = 0;
+    table->header->expiry_count = 0;
     zan_struct_unlock(table->header);
 }
 

@@ -660,22 +660,21 @@ class Collection {
         if (cursor.Length > 0) { from = Collection.ParseI64(cursor) + 1; }
         // Only the indexed field is read out of each record: building an index
         // never needs the rest of the document.
-        List<string> ks = new List<string>();
-        List<string> vs = new List<string>();
-        this.kv.Scan(DocKey(from), "c:" + this.name + ";", batchSize, ks, vs);
+        List<KvEntry> entries = new List<KvEntry>();
+        this.kv.Scan(DocKey(from), "c:" + this.name + ";", batchSize, entries);
         int kid = KeyIdOf(field);
         int last = from;
         int i = 0;
-        while (i < vs.Count) {
-            int id = Collection.IdOfKey(ks[i]);
-            JsonValue f = FieldOf(vs[i], kid);
+        while (i < entries.Count) {
+            int id = Collection.IdOfKey(entries[i].key);
+            JsonValue f = FieldOf(entries[i].val, kid);
             if (f != null) {
                 this.kv.Put(IdxKey(field, f.AsString(""), id), "");
             }
             if (id > last) { last = id; }
             i = i + 1;
         }
-        bool done = vs.Count < batchSize;
+        bool done = entries.Count < batchSize;
         if (done) { this.kv.Delete(IdxPosKey(field)); }
         else { this.kv.Put(IdxPosKey(field), Convert.ToString(last)); }
         this.kv.Commit();
@@ -709,12 +708,11 @@ class Collection {
         SyncMeta();
         List<JsonValue> docs = new List<JsonValue>();
         if (HasIndex(field) && !this.kv.Contains(IdxPosKey(field))) {
-            List<string> ks = new List<string>();
-            List<string> vs = new List<string>();
-            this.kv.ScanPrefix(IdxPrefix(field, val), 0, ks, vs);
+            List<KvEntry> entries = new List<KvEntry>();
+            this.kv.ScanPrefix(IdxPrefix(field, val), 0, entries);
             int i = 0;
-            while (i < ks.Count) {
-                JsonValue d = FindById(Collection.IdOfKey(ks[i]));
+            while (i < entries.Count) {
+                JsonValue d = FindById(Collection.IdOfKey(entries[i].key));
                 if (d != null) { docs.Add(d); }
                 i = i + 1;
             }
@@ -737,15 +735,14 @@ class Collection {
             this.kv.EndSnapshot();
             return docs;
         }
-        List<string> ks = new List<string>();
-        List<string> vs = new List<string>();
-        this.kv.Scan(DocKey(0), "c:" + this.name + ";", 0, ks, vs);
+        List<KvEntry> entries = new List<KvEntry>();
+        this.kv.Scan(DocKey(0), "c:" + this.name + ";", 0, entries);
         int i = 0;
-        while (i < vs.Count) {
-            JsonValue f = FieldOf(vs[i], kid);
+        while (i < entries.Count) {
+            JsonValue f = FieldOf(entries[i].val, kid);
             if (f != null && f.AsString("") == val) {
-                JsonValue doc = DecodeDoc(vs[i]);
-                doc.Set("_id", JsonValue.NewNum(Collection.IdFromKey(ks[i])));
+                JsonValue doc = DecodeDoc(entries[i].val);
+                doc.Set("_id", JsonValue.NewNum(Collection.IdFromKey(entries[i].key)));
                 docs.Add(doc);
             }
             i = i + 1;
@@ -762,9 +759,8 @@ class Collection {
         int n = 0;
         if (HasIndex(field) && !this.kv.Contains(IdxPosKey(field))) {
             // A ready index answers from its keys alone: no document is read.
-            List<string> ks = new List<string>();
-            List<string> vs = new List<string>();
-            n = this.kv.ScanPrefix(IdxPrefix(field, val), 0, ks, vs);
+            List<KvEntry> entries = new List<KvEntry>();
+            n = this.kv.ScanPrefix(IdxPrefix(field, val), 0, entries);
             this.kv.EndSnapshot();
             return n;
         }
@@ -773,12 +769,11 @@ class Collection {
             this.kv.EndSnapshot();
             return 0;
         }
-        List<string> ks2 = new List<string>();
-        List<string> vs2 = new List<string>();
-        this.kv.Scan(DocKey(0), "c:" + this.name + ";", 0, ks2, vs2);
+        List<KvEntry> entries2 = new List<KvEntry>();
+        this.kv.Scan(DocKey(0), "c:" + this.name + ";", 0, entries2);
         int i = 0;
-        while (i < vs2.Count) {
-            JsonValue f = FieldOf(vs2[i], kid);
+        while (i < entries2.Count) {
+            JsonValue f = FieldOf(entries2[i].val, kid);
             if (f != null && f.AsString("") == val) { n = n + 1; }
             i = i + 1;
         }
@@ -788,9 +783,8 @@ class Collection {
 
     /// <summary>Number of documents (range scan over the namespace).</summary>
     int Count() {
-        List<string> ks = new List<string>();
-        List<string> vs = new List<string>();
-        return this.kv.ScanPrefix("c:" + this.name + ":", 0, ks, vs);
+        List<KvEntry> entries = new List<KvEntry>();
+        return this.kv.ScanPrefix("c:" + this.name + ":", 0, entries);
     }
 
     /// <summary>All documents in id order.</summary>
@@ -807,15 +801,14 @@ class Collection {
         string hi = "";
         if (toId > 0) { hi = DocKey(toId); }
         else { hi = "c:" + this.name + ";"; }   // ';' sorts just after ':'
-        List<string> ks = new List<string>();
-        List<string> vs = new List<string>();
-        this.kv.Scan(lo, hi, limit, ks, vs);
+        List<KvEntry> entries = new List<KvEntry>();
+        this.kv.Scan(lo, hi, limit, entries);
         List<JsonValue> docs = new List<JsonValue>();
         int i = 0;
-        while (i < vs.Count) {
-            if (ks[i].Length > 2 && ks[i].Substring(0, 2) == "c:") {
-                JsonValue doc = DecodeDoc(vs[i]);
-                doc.Set("_id", JsonValue.NewNum(Collection.IdFromKey(ks[i])));
+        while (i < entries.Count) {
+            if (entries[i].key.Length > 2 && entries[i].key.Substring(0, 2) == "c:") {
+                JsonValue doc = DecodeDoc(entries[i].val);
+                doc.Set("_id", JsonValue.NewNum(Collection.IdFromKey(entries[i].key)));
                 docs.Add(doc);
             }
             i = i + 1;

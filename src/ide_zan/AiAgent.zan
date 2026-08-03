@@ -101,12 +101,12 @@ class AiAgent {
 
     /// How many tool calls have already run for the question being answered:
     /// the trailing run of tool results since the last thing the user typed.
-    static int StepsSinceUser(List<string> roles) {
+    static int StepsSinceUser(List<AiChatMsg> msgs) {
         int n = 0;
-        int i = roles.Count - 1;
+        int i = msgs.Count - 1;
         while (i >= 0) {
-            if (roles[i] == "user") { return n; }
-            if (roles[i] == "tool") { n = n + 1; }
+            if (msgs[i].role == "user") { return n; }
+            if (msgs[i].role == "tool") { n = n + 1; }
             i = i - 1;
         }
         return n;
@@ -233,11 +233,11 @@ class AiAgent {
             + " write_file, edit_file, build, run, ui_check.";
     }
 
-    /// Fills `outText` / `outDone` from a `plan` tool call's `items` array,
-    /// replacing whatever they held. Each item is either a short step string
-    /// (optionally prefixed "[x] " / "[ ] " to mark it done) or an object
+    /// Fills `outSteps` from a `plan` tool call's `items` array, replacing
+    /// whatever it held. Each item is either a short step string (optionally
+    /// prefixed "[x] " / "[ ] " to mark it done) or an object
     /// {"t"|"text", "d"|"done"}. Returns the resulting step count.
-    static int ParsePlan(string json, List<string> outText, List<int> outDone) {
+    static int ParsePlan(string json, List<AiPlanStep> outSteps) {
         JsonValue v = JsonValue.ParseLenient(json);
         if (v == null) { return 0; }
         JsonValue items = v.Get("items");
@@ -264,12 +264,13 @@ class AiAgent {
             }
             txt = AiAgent.Trim(txt);
             if (txt != "") {
-                outText.Add(txt);
-                if (done) { outDone.Add(1); } else { outDone.Add(0); }
+                int d = 0;
+                if (done) { d = 1; }
+                outSteps.Add(AiPlanStep.Create(txt, d));
             }
             i = i + 1;
         }
-        return outText.Count;
+        return outSteps.Count;
     }
 
     /// How many times one request is resent by the panel after a transport
@@ -975,10 +976,10 @@ class AiAgent {
     /// Total characters of the running transcript -- the quantity BuildContext
     /// measures against MaxContextChars() to decide when to compact, and what
     /// the context-usage ring shows.
-    static int ContextChars(List<string> texts) {
+    static int ContextChars(List<AiChatMsg> msgs) {
         int acc = 0;
         int i = 0;
-        while (i < texts.Count) { acc = acc + texts[i].Length; i = i + 1; }
+        while (i < msgs.Count) { acc = acc + msgs[i].text.Length; i = i + 1; }
         return acc;
     }
 
@@ -1001,48 +1002,47 @@ class AiAgent {
     /// the user's questions and the assistant's conclusions are kept, while a
     /// tool result collapses to its header plus first result line so the bulky
     /// file/JSON bodies do not survive into every later request.
-    static string DigestTurn(string role, string text) {
-        if (role == "user") {
-            return "USER: " + AiAgent.Cap(AiAgent.FirstLine(text), 300);
+    static string DigestTurn(AiChatMsg m) {
+        if (m.role == "user") {
+            return "USER: " + AiAgent.Cap(AiAgent.FirstLine(m.text), 300);
         }
-        if (role == "assistant") {
-            string t = AiAgent.StripToolBlock(text);
+        if (m.role == "assistant") {
+            string t = AiAgent.StripToolBlock(m.text);
             if (AiAgent.Trim(t) == "") {
-                string call = AiAgent.ToolBlock(text);
+                string call = AiAgent.ToolBlock(m.text);
                 return "ASSISTANT: (called " + AiAgent.Describe(call) + ")";
             }
             return "ASSISTANT: " + AiAgent.Cap(t, 400);
         }
-        if (role == "tool") {
-            string head = AiAgent.FirstLine(text);
+        if (m.role == "tool") {
+            string head = AiAgent.FirstLine(m.text);
             string body = "";
-            if (text.Length > head.Length + 1) {
+            if (m.text.Length > head.Length + 1) {
                 body = AiAgent.FirstLine(
-                    text.Substring(head.Length + 1, text.Length - head.Length - 1));
+                    m.text.Substring(head.Length + 1, m.text.Length - head.Length - 1));
             }
             string line = "TOOL " + head;
             if (body != "") { line = line + " -> " + AiAgent.Cap(body, 200); }
             return line;
         }
-        return AiAgent.Cap(AiAgent.FirstLine(text), 200);
+        return AiAgent.Cap(AiAgent.FirstLine(m.text), 200);
     }
 
     /// Builds the message list actually sent to the model: recent turns kept
     /// whole, and everything older than the budget replaced by a single digest
     /// message. Returns the turns unchanged when the transcript is small.
-    static AiMessages BuildContext(List<string> roles, List<string> texts) {
+    static AiMessages BuildContext(List<AiChatMsg> msgs) {
         AiMessages m = new AiMessages();
-        m.roles = new List<string>();
-        m.texts = new List<string>();
+        m.msgs = new List<AiChatMsg>();
         m.compacted = false;
         m.dropped = 0;
-        int n = roles.Count;
+        int n = msgs.Count;
         int budget = AiAgent.MaxContextChars();
         int acc = 0;
         int keepFrom = n;
         int i = n - 1;
         while (i >= 0) {
-            acc = acc + texts[i].Length;
+            acc = acc + msgs[i].text.Length;
             int kept = n - i;
             if (acc > budget && kept > AiAgent.MinRecentTurns()) { break; }
             keepFrom = i;
@@ -1051,7 +1051,7 @@ class AiAgent {
         if (keepFrom <= 0) {
             int k = 0;
             while (k < n) {
-                m.roles.Add(roles[k]); m.texts.Add(texts[k]); k = k + 1;
+                m.msgs.Add(msgs[k]); k = k + 1;
             }
             return m;
         }
@@ -1060,18 +1060,17 @@ class AiAgent {
             + " conversation so far -- decisions, files touched and findings:]\n");
         int j = 0;
         while (j < keepFrom) {
-            d.Append(AiAgent.DigestTurn(roles[j], texts[j]) + "\n");
+            d.Append(AiAgent.DigestTurn(msgs[j]) + "\n");
             if (d.Length > 6000) {
                 d.Append("... (older turns elided)\n");
                 break;
             }
             j = j + 1;
         }
-        m.roles.Add("user");
-        m.texts.Add(d.ToString());
+        m.msgs.Add(AiChatMsg.Create("user", d.ToString()));
         int r = keepFrom;
         while (r < n) {
-            m.roles.Add(roles[r]); m.texts.Add(texts[r]); r = r + 1;
+            m.msgs.Add(msgs[r]); r = r + 1;
         }
         m.compacted = true;
         m.dropped = keepFrom;
@@ -1081,12 +1080,11 @@ class AiAgent {
     }
 }
 
-/// The message list handed to the endpoint after compaction: `roles`/`texts`
-/// are parallel, `compacted` is true when older turns were folded into a
-/// digest and `dropped` counts how many raw turns that digest replaced.
+/// The message list handed to the endpoint after compaction: one entity per
+/// turn, `compacted` is true when older turns were folded into a digest and
+/// `dropped` counts how many raw turns that digest replaced.
 class AiMessages {
-    List<string> roles;
-    List<string> texts;
+    List<AiChatMsg> msgs;
     bool compacted;
     int dropped;
 }

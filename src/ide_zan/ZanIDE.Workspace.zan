@@ -278,6 +278,7 @@ partial class ZanIDE {
         // Uppercase the name (ASCII only) to compare against Windows device names.
         StringBuilder ub = new StringBuilder();
         i = 0;
+        i = 0;
         while (i < name.Length) {
             string ch = name.Substring(i, 1);
             int code = ch[0] & 255;
@@ -524,19 +525,18 @@ partial class ZanIDE {
         }
     }
 
-    static void OpenFirst(List<string> names, List<string> bodies, List<string> paths, SignalInt active, string root) {
+    static void OpenFirst(List<TabRecord> tabs, SignalInt active, string root) {
         string formP = root + "/src/" + Path.GetFileName(root) + ".zform";
         string main = root + "/src/main.zan";
         string lib = root + "/src/lib.zan";
         if (File.Exists(formP)) {
-            ZanIDE.OpenPath(names, bodies, paths, active, formP, Path.GetFileName(formP));
+            ZanIDE.OpenPath(tabs, active, formP, Path.GetFileName(formP));
         } else if (File.Exists(main)) {
-            ZanIDE.OpenPath(names, bodies, paths, active, main, "main.zan");
+            ZanIDE.OpenPath(tabs, active, main, "main.zan");
         } else if (File.Exists(lib)) {
-            ZanIDE.OpenPath(names, bodies, paths, active, lib, "lib.zan");
+            ZanIDE.OpenPath(tabs, active, lib, "lib.zan");
         } else if (File.Exists(root + "/README.md")) {
-            ZanIDE.OpenPath(names, bodies, paths, active, root + "/README.md",
-                "README.md");
+            ZanIDE.OpenPath(tabs, active, root + "/README.md", "README.md");
         } else {
             // A project without any of the conventional entry files (an older
             // or hand-made layout) must still open: fall back to the first
@@ -546,8 +546,7 @@ partial class ZanIDE {
             string first = ZanIDE.FirstSourceFile(root + "/src");
             if (first == "") { first = ZanIDE.FirstSourceFile(root); }
             if (first != "") {
-                ZanIDE.OpenPath(names, bodies, paths, active, first,
-                    Path.GetFileName(first));
+                ZanIDE.OpenPath(tabs, active, first, Path.GetFileName(first));
             }
         }
     }
@@ -654,9 +653,18 @@ partial class ZanIDE {
 
     // ---- tabs ----
 
-    static void OpenPath(List<string> names, List<string> bodies, List<string> paths,
-                         SignalInt active, string path, string name) {
-        int idx = paths.IndexOf(path);
+    static int FindTabByPath(List<TabRecord> tabs, string path) {
+        int i = 0;
+        while (i < tabs.Count) {
+            if (tabs[i].path == path) { return i; }
+            i = i + 1;
+        }
+        return 0 - 1;
+    }
+
+    static void OpenPath(List<TabRecord> tabs, SignalInt active,
+                         string path, string name) {
+        int idx = ZanIDE.FindTabByPath(tabs, path);
         if (idx >= 0) {
             active.Set(idx);
             return;
@@ -666,17 +674,15 @@ partial class ZanIDE {
         // unhandled read error here used to reach Main and crash the IDE.
         string content = "";
         if (File.Exists(path)) { content = File.ReadAllText(path); }
-        names.Add(name);
-        bodies.Add(content);
-        paths.Add(path);
-        active.Set(names.Count - 1);
+        tabs.Add(TabRecord.Create(name, content, path));
+        active.Set(tabs.Count - 1);
     }
 
-    static void SaveActive(CodeEditor editor, List<string> names, List<string> bodies,
-                           List<string> paths, SignalInt active, string root, List<string> log) {
+    static void SaveActive(CodeEditor editor, List<TabRecord> tabs,
+                           SignalInt active, string root, List<string> log) {
         int a = active.Get();
-        if (a < 0 || a >= names.Count) { return; }
-        string p = paths[a];
+        if (a < 0 || a >= tabs.Count) { return; }
+        string p = tabs[a].path;
         // Virtual tabs (@start / @docs) have no file behind them; saving one
         // used to write a literal "@start" file into the workspace root.
         if (p == "@start" || p == "@docs") { return; }
@@ -687,12 +693,12 @@ partial class ZanIDE {
         // Run / Build / Publish / Debug all save before compiling, which is
         // exactly when that happened.
         if (ZanIDE.IsFormPath(p) || ZanIDE.IsScenePath(p)) { return; }
-        bodies[a] = editor.GetText();
+        tabs[a].body = editor.GetText();
         if (p == "") {
-            p = root + "/" + names[a];
-            paths[a] = p;
+            p = root + "/" + tabs[a].name;
+            tabs[a].path = p;
         }
-        File.WriteAllText(p, bodies[a]);
+        File.WriteAllText(p, tabs[a].body);
         log.Add("> Saved " + p + ".");
     }
 
@@ -1022,8 +1028,7 @@ partial class ZanIDE {
     /// that refer to the active file, and pushes them onto the editor as real
     /// diagnostics (red underline + reason tooltip), jumping to the first error.
     static void ApplyDiagnostics(CodeEditor editor, string activePath, List<string> output, List<string> log) {
-        List<int> dl = new List<int>();
-        List<string> dm = new List<string>();
+        List<Diagnostic> diagnostics = new List<Diagnostic>();
         bool isZan = activePath.Length > 4
             && activePath.Substring(activePath.Length - 4, 4) == ".zan";
         if (isZan) {
@@ -1043,8 +1048,8 @@ partial class ZanIDE {
                                 int lineNo = ZanIDE.ParseLeadInt(lineStr);
                                 if (lineNo > 0) {
                                     string msg = raw.Substring(ep + 8, raw.Length - (ep + 8));
-                                    dl.Add(lineNo - 1);
-                                    dm.Add(ZanIDE.TrimLeadSpaces(msg));
+                                    diagnostics.Add(new Diagnostic(lineNo - 1,
+                                        ZanIDE.TrimLeadSpaces(msg)));
                                 }
                             }
                         }
@@ -1053,9 +1058,9 @@ partial class ZanIDE {
                 oi = oi + 1;
             }
         }
-        editor.SetCompilerDiagnostics(dl, dm);
-        if (dl.Count > 0) {
-            log.Add("> " + Convert.ToString(dl.Count) + " error(s) in this file; jumped to the first.");
+        editor.SetCompilerDiagnostics(diagnostics);
+        if (diagnostics.Count > 0) {
+            log.Add("> " + Convert.ToString(diagnostics.Count) + " error(s) in this file; jumped to the first.");
         }
     }
 
@@ -1189,6 +1194,24 @@ partial class ZanIDE {
         }
         if (root != "" && Directory.Exists(root)) { return root; }
         return ZanIDE.DirOf(exe);
+    }
+
+    static string MissingPackage(List<string> lines) {
+        string marker = "ZANPKG_MISSING namespace=";
+        int i = 0;
+        while (i < lines.Count) {
+            int at = lines[i].IndexOf(marker);
+            if (at >= 0) {
+                string name = lines[i].Substring(at + marker.Length,
+                    lines[i].Length - at - marker.Length);
+                name = ZanIDE.ReplaceAll(name, "/", ".");
+                int end = name.IndexOf(" ");
+                if (end >= 0) { name = name.Substring(0, end); }
+                return name;
+            }
+            i = i + 1;
+        }
+        return "";
     }
 
     /// Starts a DETACHED Run build of `target` and returns the executable it
@@ -1337,13 +1360,13 @@ partial class ZanIDE {
     /// main loop polls both, same pattern as the AI request). Returns the exe
     /// paths the caller must verify once the done-marker appears; an empty
     /// list means nothing was started.
-    static List<string> PublishPlatformsBegin(List<string> names, List<string> paths, SignalInt active, string root, List<int> sel, List<string> log) {
+    static List<string> PublishPlatformsBegin(List<TabRecord> tabs, SignalInt active, string root, List<int> sel, List<string> log) {
         List<string> exes = new List<string>();
         int a = active.Get();
-        if (a < 0 || a >= paths.Count) { log.Add("> Nothing to publish."); return exes; }
+        if (a < 0 || a >= tabs.Count) { log.Add("> Nothing to publish."); return exes; }
         // Publish always targets the whole project (its entry + every project
         // .zan file), not whichever tab happens to be focused.
-        string p = ZanIDE.RibbonRunTarget(paths[a], root);
+        string p = ZanIDE.RibbonRunTarget(tabs[a].path, root);
         if (p == "") { log.Add("> Nothing to publish (save the file first)."); return exes; }
         Directory.CreateDirectory(root + "/publish");
         string bd = ZanIDE.EnsureBuildDir(root);

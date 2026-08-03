@@ -1,0 +1,99 @@
+// SetupAPI device smoke test. Read-only and hardware-independent: validate
+// structural invariants for present/all-class enumeration rather than looking
+// for any particular vendor or device model.
+using System;
+using System.Management;
+
+namespace Conf;
+
+class Prog {
+    static int bad = 0;
+
+    static void Check(bool cond) {
+        if (!cond) { bad = bad + 1; }
+    }
+
+    static void CheckDevice(DeviceInfo d) {
+        Check(d != null);
+        if (d == null) { return; }
+        Check(d.instanceId != null && d.instanceId.Length > 0);
+        Check(d.classGuid != null);
+        Check(d.className != null);
+        Check(d.friendlyName != null);
+        Check(d.description != null);
+        Check(d.manufacturer != null);
+        Check(d.hardwareIds != null);
+        if (d.hardwareIds != null) {
+            int i = 0;
+            while (i < d.hardwareIds.Count) {
+                Check(d.hardwareIds[i] != null && d.hardwareIds[i].Length > 0);
+                i = i + 1;
+            }
+        }
+    }
+
+    static void CheckMultiStringParser() {
+        nint p = NativeMemory.Alloc(32);
+        NativeMemory.Fill(p, 255, 32);
+        Span<ushort> words = new Span<ushort>(p, 16);
+
+        // "AB", "C", followed by the required extra NUL.
+        words[0] = 65;
+        words[1] = 66;
+        words[2] = 0;
+        words[3] = 67;
+        words[4] = 0;
+        words[5] = 0;
+        List<string> valid = Device.ParseMultiString(p, 12);
+        Check(valid.Count == 2);
+        if (valid.Count == 2) {
+            Check(valid[0] == "AB");
+            Check(valid[1] == "C");
+        }
+
+        // The allocation deliberately contains a later NUL outside bytes-used.
+        // An unbounded Wide.Length scan would accept this malformed first value.
+        NativeMemory.Fill(p, 255, 32);
+        words[0] = 88;
+        words[1] = 89;
+        words[4] = 0;
+        Check(Device.ParseMultiString(p, 4).Count == 0);
+
+        // A terminated string without the final list NUL is also malformed.
+        words[0] = 88;
+        words[1] = 0;
+        Check(Device.ParseMultiString(p, 4).Count == 0);
+        Check(Device.ParseMultiString(p, 3).Count == 0);
+        Check(Device.ParseMultiString(p, 0).Count == 0);
+        Check(Device.ParseMultiString((nint)0, 4).Count == 0);
+
+        // Empty REG_MULTI_SZ still requires its double NUL.
+        words[0] = 0;
+        words[1] = 65535;
+        Check(Device.ParseMultiString(p, 2).Count == 0);
+        words[1] = 0;
+        Check(Device.ParseMultiString(p, 4).Count == 0);
+        NativeMemory.Free(p);
+    }
+
+    static void Main() {
+        CheckMultiStringParser();
+        List<DeviceInfo> present = Device.Present();
+        List<DeviceInfo> all = Device.All();
+        Check(present.Count > 0);
+        Check(all.Count > 0);
+
+        int i = 0;
+        while (i < present.Count) {
+            CheckDevice(present[i]);
+            i = i + 1;
+        }
+        i = 0;
+        while (i < all.Count) {
+            CheckDevice(all[i]);
+            i = i + 1;
+        }
+
+        Console.WriteLine("win-device-ok: " + Convert.ToString(bad == 0 ? 1 : 0));
+    }
+}

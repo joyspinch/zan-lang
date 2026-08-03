@@ -3,6 +3,16 @@ using System.IO;
 
 namespace System.Data.ZanDb;
 
+class PendingWalPage {
+    int id;
+    ByteBuffer data;
+
+    PendingWalPage(int id, ByteBuffer data) {
+        this.id = id;
+        this.data = data;
+    }
+}
+
 /// <summary>
 /// Write-ahead log: sequential, CRC-guarded frames appended per transaction,
 /// closed by a commit record and fsynced. SSD-friendly (append-only) and the
@@ -81,8 +91,7 @@ class Wal {
         int applied = 0;
         long off = 0;
         // Pending frames of the transaction currently being scanned.
-        List<int> pendIds = new List<int>();
-        List<ByteBuffer> pendPages = new List<ByteBuffer>();
+        List<PendingWalPage> pending = new List<PendingWalPage>();
         ByteBuffer h = ByteBuffer.Alloc(Wal.HEADER_LEN);
         ByteBuffer payload = ByteBuffer.Alloc(this.pageSize);
 
@@ -101,19 +110,18 @@ class Wal {
                 off = off + plen;
                 if (payload.Crc32(plen) != crc) { break; }
                 ByteBuffer copy = ByteBuffer.FromRaw(payload.Raw(), plen);
-                pendIds.Add(id);
-                pendPages.Add(copy);
+                pending.Add(new PendingWalPage(id, copy));
             } else if (type == Wal.FRAME_COMMIT) {
                 // Whole transaction present: apply it.
                 int i = 0;
-                while (i < pendIds.Count) {
-                    db.WriteAt((long)pendIds[i] * this.pageSize, pendPages[i].Raw(), this.pageSize);
-                    pendPages[i].Free();
+                while (i < pending.Count) {
+                    PendingWalPage page = pending[i];
+                    db.WriteAt((long)page.id * this.pageSize, page.data.Raw(), this.pageSize);
+                    page.data.Free();
                     i = i + 1;
                 }
-                applied = applied + pendIds.Count;
-                pendIds = new List<int>();
-                pendPages = new List<ByteBuffer>();
+                applied = applied + pending.Count;
+                pending = new List<PendingWalPage>();
             } else {
                 break;   // corrupt/unknown frame: stop scanning
             }
@@ -121,8 +129,8 @@ class Wal {
 
         // Drop any uncommitted tail.
         int j = 0;
-        while (j < pendPages.Count) {
-            pendPages[j].Free();
+        while (j < pending.Count) {
+            pending[j].data.Free();
             j = j + 1;
         }
         h.Free();

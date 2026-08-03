@@ -1,6 +1,23 @@
 using System;
 using System.IO;
 
+/// One disk baseline entry: the file path, the text last known to be on disk,
+/// and the file's timestamp at that moment. One entity instead of the old
+/// parallel paths/texts/stamps lists.
+class DocBaselineEntry {
+    string path;
+    string text;
+    long stamp;
+
+    static DocBaselineEntry Create(string path, string text, long stamp) {
+        DocBaselineEntry e = new DocBaselineEntry();
+        e.path = path;
+        e.text = text;
+        e.stamp = stamp;
+        return e;
+    }
+}
+
 /// What the IDE last read from (or wrote to) disk for every open file: the text
 /// that was on disk and the file's timestamp at that moment.
 ///
@@ -11,15 +28,11 @@ using System.IO;
 /// set. Virtual tabs (`@start`, `@docs`) and designer documents are simply never
 /// tracked: `Track` ignores them.
 class DocBaseline {
-    List<string> paths;
-    List<string> texts;
-    List<long> stamps;
+    List<DocBaselineEntry> entries;
 
     static DocBaseline Create() {
         DocBaseline d = new DocBaseline();
-        d.paths = new List<string>();
-        d.texts = new List<string>();
-        d.stamps = new List<long>();
+        d.entries = new List<DocBaselineEntry>();
         return d;
     }
 
@@ -32,24 +45,29 @@ class DocBaseline {
         return true;
     }
 
-    int IndexOf(string path) { return paths.IndexOf(path); }
+    int IndexOf(string path) {
+        int i = 0;
+        while (i < entries.Count) {
+            if (entries[i].path == path) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
 
-    bool Tracked(string path) { return paths.IndexOf(path) >= 0; }
+    bool Tracked(string path) { return this.IndexOf(path) >= 0; }
 
     /// Records `text` as what is on disk for `path`, together with the file's
     /// current timestamp. Called after opening, saving and reloading a file.
     void Note(string path, string text) {
         if (!DocBaseline.IsFileTab(path)) { return; }
         long stamp = FileInfo.GetLastWriteTime(path);
-        int i = paths.IndexOf(path);
+        int i = this.IndexOf(path);
         if (i >= 0) {
-            texts[i] = text;
-            stamps[i] = stamp;
+            entries[i].text = text;
+            entries[i].stamp = stamp;
             return;
         }
-        paths.Add(path);
-        texts.Add(text);
-        stamps.Add(stamp);
+        entries.Add(DocBaselineEntry.Create(path, text, stamp));
     }
 
     /// Baselines `path` only if it is not tracked yet, so a tab opened by any of
@@ -60,18 +78,16 @@ class DocBaseline {
     }
 
     void Forget(string path) {
-        int i = paths.IndexOf(path);
+        int i = this.IndexOf(path);
         if (i < 0) { return; }
-        paths.RemoveAt(i);
-        texts.RemoveAt(i);
-        stamps.RemoveAt(i);
+        entries.RemoveAt(i);
     }
 
     /// The text last known to be on disk ("" when the path is not tracked).
     string TextOf(string path) {
-        int i = paths.IndexOf(path);
+        int i = this.IndexOf(path);
         if (i < 0) { return ""; }
-        return texts[i];
+        return entries[i].text;
     }
 
     /// True when `text` differs from what was last written to / read from disk.
@@ -81,9 +97,9 @@ class DocBaseline {
     /// removes '\r', GetText joins with '\n'), so an untouched CRLF file would
     /// otherwise be reported dirty forever.
     bool IsDirty(string path, string text) {
-        int i = paths.IndexOf(path);
+        int i = this.IndexOf(path);
         if (i < 0) { return false; }
-        return texts[i].Replace("\r", "") != text.Replace("\r", "");
+        return entries[i].text.Replace("\r", "") != text.Replace("\r", "");
     }
 
     /// True when the file's timestamp moved since the baseline was taken, i.e.
@@ -91,20 +107,20 @@ class DocBaseline {
     /// momentarily unreadable) reports false: dropping the buffer on the floor
     /// would be the one unrecoverable answer here.
     bool ChangedOutside(string path) {
-        int i = paths.IndexOf(path);
+        int i = this.IndexOf(path);
         if (i < 0) { return false; }
         long now = FileInfo.GetLastWriteTime(path);
         if (now == 0) { return false; }
-        return now != stamps[i];
+        return now != entries[i].stamp;
     }
 
     /// Accepts the file's current timestamp without touching the text baseline:
     /// used when the user keeps their own edits after an outside change, so the
     /// same change is not reported again on the next poll.
     void AcceptStamp(string path) {
-        int i = paths.IndexOf(path);
+        int i = this.IndexOf(path);
         if (i < 0) { return; }
-        stamps[i] = FileInfo.GetLastWriteTime(path);
+        entries[i].stamp = FileInfo.GetLastWriteTime(path);
     }
 }
 
@@ -131,17 +147,17 @@ partial class ZanIDE {
     /// code tab (a tab body only catches up with the editor on a tab switch),
     /// the stored body for every other tab.
     string TabText(int i) {
-        if (i < 0 || i >= tabBodies.Count) { return ""; }
-        if (i == activeTab.Get() && DocBaseline.IsFileTab(tabPaths[i])) {
+        if (i < 0 || i >= tabs.Count) { return ""; }
+        if (i == activeTab.Get() && DocBaseline.IsFileTab(tabs[i].path.path)) {
             return editor.GetText();
         }
-        return tabBodies[i];
+        return tabs[i].body;
     }
 
     /// True when tab `i` holds edits that are not on disk.
     bool TabDirty(int i) {
-        if (i < 0 || i >= tabPaths.Count) { return false; }
-        return docs.IsDirty(tabPaths[i], this.TabText(i));
+        if (i < 0 || i >= tabs.Count) { return false; }
+        return docs.IsDirty(tabs[i].path, this.TabText(i));
     }
 
     /// Baselines any open file tab that has none yet. Tabs are added from a
@@ -149,8 +165,8 @@ partial class ZanIDE {
     /// doing this once per frame means none of them has to remember to.
     void TrackOpenTabs() {
         int i = 0;
-        while (i < tabPaths.Count) {
-            docs.Track(tabPaths[i], tabBodies[i]);
+        while (i < tabs.Count) {
+            docs.Track(tabs[i].path, tabs[i].body);
             i = i + 1;
         }
     }
@@ -159,11 +175,11 @@ partial class ZanIDE {
     /// not just the active one, so a background tab can be saved from the dialog
     /// that asked about it.
     void SaveTabAt(int i) {
-        if (i < 0 || i >= tabPaths.Count) { return; }
-        string p = tabPaths[i];
+        if (i < 0 || i >= tabs.Count) { return; }
+        string p = tabs[i].path;
         if (!DocBaseline.IsFileTab(p)) { return; }
         string text = this.TabText(i);
-        tabBodies[i] = text;
+        tabs[i].body = text;
         File.WriteAllText(p, text);
         docs.Note(p, text);
         log.Add("> Saved " + p + ".");
@@ -172,37 +188,37 @@ partial class ZanIDE {
     /// Saves the active tab and re-baselines it, so nothing that is already on
     /// disk is ever reported as an unsaved edit or as an outside change.
     void SaveActiveTab() {
-        ZanIDE.SaveActive(editor, tabNames, tabBodies, tabPaths, activeTab, root, log);
+        ZanIDE.SaveActive(editor, tabs, activeTab, root, log);
         int a = activeTab.Get();
-        if (a >= 0 && a < tabPaths.Count) { docs.Note(tabPaths[a], tabBodies[a]); }
+        if (a >= 0 && a < tabs.Count) { docs.Note(tabs[a].path, tabs[a].body); }
     }
 
     /// Replaces tab `i`'s buffer with `text` (what is on disk now) and makes it
     /// the new baseline. The editor is reloaded when the tab is the visible one.
     void AdoptDiskText(int i, string text) {
-        if (i < 0 || i >= tabPaths.Count) { return; }
-        tabBodies[i] = text;
+        if (i < 0 || i >= tabs.Count) { return; }
+        tabs[i].body = text;
         if (i == activeTab.Get()) { editor.LoadText(text); }
-        docs.Note(tabPaths[i], text);
+        docs.Note(tabs[i].path, text);
     }
 
     /// Closes tab `i` outright, dropping its baseline with it.
     void CloseTabNow(int i) {
-        if (i < 0 || i >= tabPaths.Count) { return; }
-        docs.Forget(tabPaths[i]);
-        ZanIDE.CloseTabAt(tabNames, tabBodies, tabPaths, activeTab, i);
+        if (i < 0 || i >= tabs.Count) { return; }
+        docs.Forget(tabs[i].path);
+        ZanIDE.CloseTabAt(tabs, activeTab, i);
         lastActive = 0 - 1;
     }
 
     /// Closes tab `i`, asking what to do with unsaved edits first (Save / Don't
     /// save / Cancel). A clean tab closes straight away.
     void RequestCloseTab(int i) {
-        if (i < 0 || i >= tabPaths.Count) { return; }
+        if (i < 0 || i >= tabs.Count) { return; }
         if (!this.TabDirty(i)) { this.CloseTabNow(i); return; }
         closeAskTab = i;
         closeAsk = LayerState.Choose(
             ZanIDE.T("Unsaved changes", "尚未保存"),
-            ZanIDE.T("Save the changes to ", "是否保存对 ") + tabNames[i]
+            ZanIDE.T("Save the changes to ", "是否保存对 ") + tabs[i].name
                 + ZanIDE.T(" before closing?", " 的修改？"),
             2,
             ZanIDE.T("Save", "保存"),
@@ -216,8 +232,8 @@ partial class ZanIDE {
     /// with unsaved edits one dialog at a time (the answer resumes the run).
     void RequestCloseOthers(string keepPath) {
         int i = 0;
-        while (i < tabPaths.Count) {
-            if (tabPaths[i] != keepPath && this.TabDirty(i)) {
+        while (i < tabs.Count) {
+            if (tabs[i].path != keepPath && this.TabDirty(i)) {
                 closeOthersKeepPath = keepPath;
                 this.RequestCloseTab(i);
                 return;
@@ -225,9 +241,9 @@ partial class ZanIDE {
             i = i + 1;
         }
         closeOthersKeepPath = "";
-        i = tabPaths.Count - 1;
+        i = tabs.Count - 1;
         while (i >= 0) {
-            if (tabPaths[i] != keepPath) { this.CloseTabNow(i); }
+            if (tabs[i].path != keepPath) { this.CloseTabNow(i); }
             i = i - 1;
         }
     }
@@ -245,8 +261,8 @@ partial class ZanIDE {
         if (now - diskPollMs < ZanIDE.DiskPollMs()) { return; }
         diskPollMs = now;
         int i = 0;
-        while (i < tabPaths.Count) {
-            string p = tabPaths[i];
+        while (i < tabs.Count) {
+            string p = tabs[i].path;
             if (docs.ChangedOutside(p)) {
                 string onDisk = File.ReadAllText(p);
                 if (onDisk == docs.TextOf(p)) {
@@ -258,13 +274,13 @@ partial class ZanIDE {
                 } else if (!this.TabDirty(i)) {
                     this.AdoptDiskText(i, onDisk);
                     log.Add("> Reloaded " + p + " (changed on disk).");
-                    Layer.Msg(ZanIDE.T("Reloaded ", "已重新加载：") + tabNames[i], 0);
+                    Layer.Msg(ZanIDE.T("Reloaded ", "已重新加载：") + tabs[i].name, 0);
                     app.RequestRedraw();
                 } else {
                     reloadAskTab = i;
                     reloadAsk = LayerState.Choose(
                         ZanIDE.T("Changed on disk", "文件已被外部修改"),
-                        tabNames[i] + ZanIDE.T(
+                        tabs[i].name + ZanIDE.T(
                             " changed outside the IDE. Reload and lose your unsaved edits?",
                             " 已在 IDE 外被修改。要重新加载并丢弃未保存的修改吗？"),
                         2,
@@ -311,12 +327,12 @@ partial class ZanIDE {
                 reloadAsk.action = 0;
                 reloadAsk.open = false;
                 int target = reloadAskTab;
-                if (a == 1 && target >= 0 && target < tabPaths.Count) {
-                    this.AdoptDiskText(target, File.ReadAllText(tabPaths[target]));
-                } else if (target >= 0 && target < tabPaths.Count) {
+                if (a == 1 && target >= 0 && target < tabs.Count) {
+                    this.AdoptDiskText(target, File.ReadAllText(tabs[target]));
+                } else if (target >= 0 && target < tabs.Count) {
                     // Keeping the edits still acknowledges the change, or the
                     // same question would come back on the next poll.
-                    docs.AcceptStamp(tabPaths[target]);
+                    docs.AcceptStamp(tabs[target]);
                 }
                 app.RequestRedraw();
             }

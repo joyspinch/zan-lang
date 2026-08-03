@@ -13,6 +13,26 @@ class DocsDemoModel {
     int stars;
 }
 
+/// One rendered documentation topic. Display text and section membership stay
+/// together so filtering and detail rendering cannot desynchronise fields.
+class DocsTopic {
+    string category;
+    string title;
+    string body;
+    string code;
+    int section;
+
+    static DocsTopic From(DocEntry entry) {
+        DocsTopic topic = new DocsTopic();
+        topic.category = entry.Cat();
+        topic.title = entry.Title();
+        topic.body = entry.Body();
+        topic.code = entry.Code();
+        topic.section = DocsData.SectionOf(entry.CatEn());
+        return topic;
+    }
+}
+
 /// One line of the topic menu. A row is a topic (`doc` indexes the doc
 /// arrays), a category heading (`doc` = -1) or a section row (`doc` = -2)
 /// that opens its group; `sec` carries the section index of a section row.
@@ -172,23 +192,17 @@ class DocsPage {
         DocsPage.demoTabs = tb;
     }
 
-    /// Fills the parallel documentation lists (category, title, body, code
-    /// example) from DocsData -- the content lives there, one entry per topic
-    /// with both languages side by side, so adding a topic never touches this
-    /// page.
-    static void BuildDocs(List<string> cat, List<string> title, List<string> body,
-                          List<string> code, List<int> sec) {
+    /// Builds the rendered documentation topics from DocsData. The source keeps
+    /// both languages side by side; each topic resolves the active language once.
+    static List<DocsTopic> BuildDocs() {
+        List<DocsTopic> topics = new List<DocsTopic>();
         List<DocEntry> all = DocsData.All();
         int i = 0;
         while (i < all.Count) {
-            DocEntry d = all[i];
-            cat.Add(d.Cat());
-            title.Add(d.Title());
-            body.Add(d.Body());
-            code.Add(d.Code());
-            sec.Add(DocsData.SectionOf(d.CatEn()));
+            topics.Add(DocsTopic.From(all[i]));
             i = i + 1;
         }
+        return topics;
     }
 
     /// Renders the Help / documentation browser: a searchable sidebar of topics
@@ -209,12 +223,7 @@ class DocsPage {
         Input search = DocsSearchHost.Search();
         SignalInt selSig = DocsTopicList.SelSig();
 
-        List<string> dCat = new List<string>();
-        List<string> dTitle = new List<string>();
-        List<string> dBody = new List<string>();
-        List<string> dCode = new List<string>();
-        List<int> dSec = new List<int>();
-        DocsPage.BuildDocs(dCat, dTitle, dBody, dCode, dSec);
+        List<DocsTopic> docs = DocsPage.BuildDocs();
 
         int sw = app.Scale(268);
         int railW = app.Scale(104);
@@ -226,8 +235,10 @@ class DocsPage {
         // opens the groups that have a hit, so a search reaches every section.
         List<int> hit = new List<int>();
         int fi = 0;
-        while (fi < dTitle.Count) {
-            string hay = ZanIDE.ToLowerS(dTitle[fi] + " " + dCat[fi] + " " + dBody[fi]);
+        while (fi < docs.Count) {
+            DocsTopic docTopic = docs[fi];
+            string hay = ZanIDE.ToLowerS(docTopic.title + " "
+                + docTopic.category + " " + docTopic.body);
             if (ZanIDE.ContainsS(hay, query)) { hit.Add(fi); }
             fi = fi + 1;
         }
@@ -239,17 +250,17 @@ class DocsPage {
         if (openSec < 0 || openSec >= DocsData.SectionCount()) { openSec = 0; }
         bool searching = query.Length > 0;
         int selAbs = selSig.Get();
-        bool selOk = hit.IndexOf(selAbs) >= 0 && dSec[selAbs] == openSec;
+        bool selOk = hit.IndexOf(selAbs) >= 0 && docs[selAbs].section == openSec;
         if (!selOk && searching && hit.Count > 0
                 && (selAbs < 0 || hit.IndexOf(selAbs) < 0)) {
-            openSec = dSec[hit[0]];
+            openSec = docs[hit[0]].section;
             sectionSig.Set(openSec);
         }
         if (!selOk) {
             selAbs = 0 - 1;
             int h0 = 0;
             while (h0 < hit.Count) {
-                if (dSec[hit[h0]] == openSec) { selAbs = hit[h0]; break; }
+                if (docs[hit[h0]].section == openSec) { selAbs = hit[h0]; break; }
                 h0 = h0 + 1;
             }
             selSig.Set(selAbs);
@@ -271,13 +282,14 @@ class DocsPage {
         int k = 0;
         while (k < hit.Count) {
             int dix = hit[k];
-            if (dSec[dix] == openSec) {
-                if (dCat[dix] != lastCat) {
-                    topics.Add(DocTopic.Header(dCat[dix]));
-                    lastCat = dCat[dix];
+            DocsTopic docTopic = docs[dix];
+            if (docTopic.section == openSec) {
+                if (docTopic.category != lastCat) {
+                    topics.Add(DocTopic.Header(docTopic.category));
+                    lastCat = docTopic.category;
                 }
                 if (dix == selAbs) { selRow = topics.Count; }
-                topics.Add(DocTopic.Of(dix, dTitle[dix]));
+                topics.Add(DocTopic.Of(dix, docTopic.title));
             }
             k = k + 1;
         }
@@ -292,7 +304,7 @@ class DocsPage {
         DocsCodeBlockHost.copyLabel = ZanIDE.T("Copy", "复制");
         DocsCodeBlockHost.log = log;
         if (selAbs >= 0) {
-            DocsTagHost.text = DocsPage.ToUpperCat(dCat[selAbs]);
+            DocsTagHost.text = DocsPage.ToUpperCat(docs[selAbs].category);
             DocsTagHost.cls = "primary";
         }
 
@@ -316,19 +328,20 @@ class DocsPage {
             // Detail pane: category chip, title, rule, wrapped body, live
             // preview (for widgets) and the copyable code example, stacked in
             // a ScrollColumn so a long article scrolls inside the pane.
+            DocsTopic selected = docs[selAbs];
             int cw = area.width - sw - railW - app.Scale(56);
-            DocsCodeBlockHost.lines = CodeEditor.SplitLines(dCode[selAbs]);
-            DocsCodeBlockHost.copyTitle = dTitle[selAbs];
-            DocsCodeBlockHost.copyText = dCode[selAbs];
+            DocsCodeBlockHost.lines = CodeEditor.SplitLines(selected.code);
+            DocsCodeBlockHost.copyTitle = selected.title;
+            DocsCodeBlockHost.copyText = selected.code;
 
             UiNode det = UiNode.Column().Dock("fill").Pad(24).Gap(10);
             det.Child(UiNode.Of("DocsTagHost").Dock("top").Height(app.Scale(22)));
-            det.Child(UiNode.Label(dTitle[selAbs]).Class("large").Dock("top"));
+            det.Child(UiNode.Label(selected.title).Class("large").Dock("top"));
             det.Child(UiNode.Of("DocsDividerHost").Dock("top").Height(1));
-            det.Child(UiNode.Label(dBody[selAbs]).Class("secondary")
+            det.Child(UiNode.Label(selected.body).Class("secondary")
                 .Str("wrap", "true").Width(cw - app.Scale(60)).Dock("top"));
-            if (dCat[selAbs] == ZanIDE.T("GUI - Widgets", "GUI - 组件")) {
-                DocsPreviewHost.preview = dTitle[selAbs];
+            if (selected.category == ZanIDE.T("GUI - Widgets", "GUI - 组件")) {
+                DocsPreviewHost.preview = selected.title;
                 det.Child(UiNode.Of("DocsPreviewHost").Dock("top"));
             }
             det.Child(UiNode.Of("DocsCodeBlockHost").Dock("top"));
@@ -501,11 +514,10 @@ class DocsPage {
                 app, px, py - app.Scale(24),
                 w - app.Scale(36), app.Scale(104));
         } else if (name == "Collapse") {
-            List<string> heads = new List<string>();
-            heads.Add("General"); heads.Add("Advanced");
-            List<string> content = new List<string>();
-            content.Add("General settings"); content.Add("Advanced settings");
-            Collapse.Of(heads, content, demoInt)
+            List<CollapsePanel> panels = new List<CollapsePanel>();
+            panels.Add(CollapsePanel.Create("General", "General settings"));
+            panels.Add(CollapsePanel.Create("Advanced", "Advanced settings"));
+            Collapse.Of(panels, demoInt)
                 .RenderAt(app, px, py - app.Scale(18), w - app.Scale(36));
         } else if (name == "DataTable") {
             List<DataColumn> cols = new List<DataColumn>();
@@ -630,11 +642,10 @@ class DocsPage {
                 app, px, py - app.Scale(14) + t.heightMedium,
                 cells, widths, true);
         } else if (name == "Timeline") {
-            List<string> titles = new List<string>();
-            titles.Add("Created"); titles.Add("Published");
-            List<string> descs = new List<string>();
-            descs.Add("Project initialized"); descs.Add("Executable generated");
-            Timeline.OfTitles(titles, descs)
+            List<TimelineItem> items = new List<TimelineItem>();
+            items.Add(TimelineItem.Create("", "Created", "Project initialized"));
+            items.Add(TimelineItem.Create("", "Published", "Executable generated"));
+            Timeline.Of(items)
                 .RenderAt(app, px, py - app.Scale(20), w - app.Scale(36));
         } else if (name == "TreeView") {
             List<TreeNode> nodes = new List<TreeNode>();

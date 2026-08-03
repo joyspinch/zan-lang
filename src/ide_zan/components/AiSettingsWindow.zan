@@ -13,13 +13,7 @@ class AiSettingsWindow : ChildWindow {
     bool saved;
     int lang;
 
-    List<string> names;
-    List<string> bases;
-    List<string> keys;
-    List<string> models;
-    List<string> lists;
-    /// Per profile: JSON map `<model id> -> {ctx, out}` (token counts).
-    List<string> limits;
+    List<AiProfile> profiles;
     /// The current profile's fetched models as row entities (model/ctx/out),
     /// the single source the limits table renders and commits from.
     List<ModelLimitRow> modelRows;
@@ -27,10 +21,7 @@ class AiSettingsWindow : ChildWindow {
     int sel;
     int modelSel;
 
-    List<string> preNames;
-    List<string> preBases;
-    List<string> preModels;
-    List<string> preRegs;
+    List<AiPreset> presets;
 
     bool fetchBusy;
 
@@ -78,8 +69,8 @@ class AiSettingsWindow : ChildWindow {
         left.Child(UiNode.Label(AiSettingsWindow.T(lang, "Configurations", "配置列表"))
             .Class("secondary small").Dock("top").Height(20));
         int i = 0;
-        while (i < names.Count) {
-            string label = names[i];
+        while (i < profiles.Count) {
+            string label = profiles[i].name;
             if (i == active) {
                 label = label + AiSettingsWindow.T(lang, "  (enabled)", "（已启用）");
             }
@@ -96,8 +87,8 @@ class AiSettingsWindow : ChildWindow {
         left.Child(UiNode.Label(AiSettingsWindow.T(lang, "Presets", "预设"))
             .Class("secondary small").Dock("top").Height(22));
         int p = 0;
-        while (p < preNames.Count) {
-            left.Child(UiNode.Of("Segment").Index(p).Str("label", preNames[p])
+        while (p < presets.Count) {
+            left.Child(UiNode.Of("Segment").Index(p).Str("label", presets[p].name)
                 .Dock("top").Height(32).Bind("preset"));
             p = p + 1;
         }
@@ -148,7 +139,7 @@ class AiSettingsWindow : ChildWindow {
         // Per-model limits as a table: one entity (ModelLimitRow) per fetched
         // model, columns = model / context length / max output. Clicking the
         // model cell also picks it as the default. The list scrolls.
-        List<string> mopts = ZanIDE.SplitList(lists[SelClamped()]);
+        List<string> mopts = ZanIDE.SplitList(profiles[SelClamped()].models);
         if (mopts.Count > 0) {
             right.Child(UiNode.Label(AiSettingsWindow.T(lang,
                 "Tick the models to offer in the chat picker; set each one's"
@@ -197,7 +188,7 @@ class AiSettingsWindow : ChildWindow {
     }
 
     int SelClamped() {
-        if (sel < 0 || sel >= names.Count) { return 0; }
+        if (sel < 0 || sel >= profiles.Count) { return 0; }
         return sel;
     }
 
@@ -216,11 +207,11 @@ class AiSettingsWindow : ChildWindow {
 
     /// Pushes the selected profile's fields into the bound model (state -> UI).
     void LoadFields() {
-        int i = SelClamped();
-        model.Set("name", JsonValue.NewStr(names[i]));
-        model.Set("base", JsonValue.NewStr(bases[i]));
-        model.Set("key", JsonValue.NewStr(keys[i]));
-        model.Set("model", JsonValue.NewStr(models[i]));
+        AiProfile profile = profiles[SelClamped()];
+        model.Set("name", JsonValue.NewStr(profile.name));
+        model.Set("base", JsonValue.NewStr(profile.baseUrl));
+        model.Set("key", JsonValue.NewStr(profile.key));
+        model.Set("model", JsonValue.NewStr(profile.model));
         this.SeedModelLimits();
         this.SyncModelSel();
     }
@@ -229,16 +220,16 @@ class AiSettingsWindow : ChildWindow {
     /// and seeds its bound inputs (ctx_i / out_i). This is the single source the
     /// limits table renders from and commits back to.
     void SeedModelLimits() {
-        int i = SelClamped();
-        List<string> mopts = ZanIDE.SplitList(lists[i]);
+        AiProfile profile = profiles[SelClamped()];
+        List<string> mopts = ZanIDE.SplitList(profile.models);
         modelRows = new List<ModelLimitRow>();
         int m = 0;
         while (m < mopts.Count) {
-            int cv = ZanIDE.AiLimitInt(limits[i], mopts[m], "ctx");
-            int ov = ZanIDE.AiLimitInt(limits[i], mopts[m], "out");
+            int cv = ZanIDE.AiLimitInt(profile.limits, mopts[m], "ctx");
+            int ov = ZanIDE.AiLimitInt(profile.limits, mopts[m], "out");
             // Visibility is stored inverted ("off") so every model of an
             // already-saved profile stays listed.
-            bool vis = ZanIDE.AiLimitInt(limits[i], mopts[m], "off") == 0;
+            bool vis = ZanIDE.AiLimitInt(profile.limits, mopts[m], "off") == 0;
             modelRows.Add(ModelLimitRow.Of(mopts[m], cv, ov, vis));
             string mi = Convert.ToString(m);
             model.Set("ctx_" + mi, JsonValue.NewStr(ModelLimitRow.Fmt(cv)));
@@ -250,21 +241,21 @@ class AiSettingsWindow : ChildWindow {
 
     /// Reads the table's bound inputs back into the profile's limits map.
     void CommitModelLimits() {
-        int i = SelClamped();
+        AiProfile profile = profiles[SelClamped()];
         int m = 0;
         // A profile with nothing ticked would leave the chat picker empty, so
         // the default model is always kept visible.
-        string keep = models[i];
+        string keep = profile.model;
         while (m < modelRows.Count) {
             string mi = Convert.ToString(m);
-            limits[i] = ZanIDE.AiLimitSet(limits[i], modelRows[m].model, "ctx",
+            profile.limits = ZanIDE.AiLimitSet(profile.limits, modelRows[m].model, "ctx",
                 model.PathGet("ctx_" + mi).AsString(""));
-            limits[i] = ZanIDE.AiLimitSet(limits[i], modelRows[m].model, "out",
+            profile.limits = ZanIDE.AiLimitSet(profile.limits, modelRows[m].model, "out",
                 model.PathGet("out_" + mi).AsString(""));
             bool vis = model.PathGet("show_" + mi).AsBool(true)
                 || modelRows[m].model == keep;
             modelRows[m].visible = vis;
-            limits[i] = ZanIDE.AiLimitSet(limits[i], modelRows[m].model, "off",
+            profile.limits = ZanIDE.AiLimitSet(profile.limits, modelRows[m].model, "off",
                 vis ? "0" : "1");
             m = m + 1;
         }
@@ -273,30 +264,30 @@ class AiSettingsWindow : ChildWindow {
     /// Points the inline model list at the profile's current default model
     /// (or none when it isn't in the fetched list).
     void SyncModelSel() {
-        int i = SelClamped();
-        List<string> mopts = ZanIDE.SplitList(lists[i]);
+        AiProfile profile = profiles[SelClamped()];
+        List<string> mopts = ZanIDE.SplitList(profile.models);
         int idx = 0 - 1;
         int m = 0;
         while (m < mopts.Count) {
-            if (mopts[m] == models[i]) { idx = m; break; }
+            if (mopts[m] == profile.model) { idx = m; break; }
             m = m + 1;
         }
         modelSel = idx;
         model.Set("modelsel", JsonValue.NewNum(Convert.ToString(idx)));
     }
 
-    /// Reads the bound inputs back into the selected profile (UI -> lists).
+    /// Reads the bound inputs back into the selected profile.
     void CommitFields() {
-        int i = SelClamped();
-        names[i] = model.PathGet("name").AsString(names[i]);
-        bases[i] = model.PathGet("base").AsString(bases[i]);
-        keys[i] = model.PathGet("key").AsString(keys[i]);
-        models[i] = model.PathGet("model").AsString(models[i]);
+        AiProfile profile = profiles[SelClamped()];
+        profile.name = model.PathGet("name").AsString(profile.name);
+        profile.baseUrl = model.PathGet("base").AsString(profile.baseUrl);
+        profile.key = model.PathGet("key").AsString(profile.key);
+        profile.model = model.PathGet("model").AsString(profile.model);
         this.CommitModelLimits();
     }
 
     void Persist() {
-        ZanIDE.AiProfilesSave(active, names, bases, keys, models, lists, limits);
+        ZanIDE.AiProfilesSave(active, profiles);
         saved = true;
     }
 
@@ -318,20 +309,10 @@ class AiSettingsWindow : ChildWindow {
         AiSettingsWindow.fetch = false;
         AiSettingsWindow.preAdd = false;
         AiSettingsWindow.reg = false;
-        w.names = new List<string>();
-        w.bases = new List<string>();
-        w.keys = new List<string>();
-        w.models = new List<string>();
-        w.lists = new List<string>();
-        w.limits = new List<string>();
-        w.active = ZanIDE.AiProfilesLoad(w.names, w.bases, w.keys, w.models,
-            w.lists, w.limits);
+        w.profiles = new List<AiProfile>();
+        w.active = ZanIDE.AiProfilesLoad(w.profiles);
         w.sel = w.active;
-        w.preNames = new List<string>();
-        w.preBases = new List<string>();
-        w.preModels = new List<string>();
-        w.preRegs = new List<string>();
-        ZanIDE.AiPresetsInto(w.preNames, w.preBases, w.preModels, w.preRegs);
+        w.presets = ZanIDE.AiPresets();
         w.model = JsonValue.NewObject();
         w.model.Set("sel", JsonValue.NewNum(Convert.ToString(w.sel)));
         w.model.Set("preset", JsonValue.NewNum("0"));
@@ -363,7 +344,7 @@ class AiSettingsWindow : ChildWindow {
 
     int PresetIndex() {
         int p = model.PathGet("preset").AsInt(0);
-        if (p < 0 || p >= preNames.Count) { p = 0; }
+        if (p < 0 || p >= presets.Count) { p = 0; }
         return p;
     }
 
@@ -372,7 +353,7 @@ class AiSettingsWindow : ChildWindow {
         // Selecting another profile in the list: keep edits in memory, then
         // load the newly selected profile into the inputs.
         int nextSel = model.PathGet("sel").AsInt(sel);
-        if (nextSel != sel && nextSel >= 0 && nextSel < names.Count) {
+        if (nextSel != sel && nextSel >= 0 && nextSel < profiles.Count) {
             this.CommitFields();
             sel = nextSel;
             this.LoadFields();
@@ -383,7 +364,7 @@ class AiSettingsWindow : ChildWindow {
         int nextModel = model.PathGet("modelsel").AsInt(modelSel);
         if (nextModel != modelSel) {
             modelSel = nextModel;
-            List<string> mo = ZanIDE.SplitList(lists[SelClamped()]);
+            List<string> mo = ZanIDE.SplitList(profiles[SelClamped()].models);
             if (nextModel >= 0 && nextModel < mo.Count) {
                 model.Set("model", JsonValue.NewStr(mo[nextModel]));
             }
@@ -393,14 +374,10 @@ class AiSettingsWindow : ChildWindow {
         if (AiSettingsWindow.add) {
             AiSettingsWindow.add = false;
             this.CommitFields();
-            names.Add(AiSettingsWindow.T(lang, "AI ", "配置 ")
-                + Convert.ToString(names.Count + 1));
-            bases.Add("https://api.openai.com/v1");
-            keys.Add("");
-            models.Add("");
-            lists.Add("");
-            limits.Add("{}");
-            sel = names.Count - 1;
+            profiles.Add(AiProfile.Create(AiSettingsWindow.T(lang, "AI ", "配置 ")
+                + Convert.ToString(profiles.Count + 1),
+                "https://api.openai.com/v1", "", "", "", "{}"));
+            sel = profiles.Count - 1;
             model.Set("sel", JsonValue.NewNum(Convert.ToString(sel)));
             this.LoadFields();
             this.Persist();
@@ -410,13 +387,10 @@ class AiSettingsWindow : ChildWindow {
             AiSettingsWindow.preAdd = false;
             int p = PresetIndex();
             this.CommitFields();
-            names.Add(preNames[p]);
-            bases.Add(preBases[p]);
-            keys.Add("");
-            models.Add(preModels[p]);
-            lists.Add("");
-            limits.Add("{}");
-            sel = names.Count - 1;
+            AiPreset preset = presets[p];
+            profiles.Add(AiProfile.Create(preset.name, preset.baseUrl, "", preset.model,
+                "", "{}"));
+            sel = profiles.Count - 1;
             model.Set("sel", JsonValue.NewNum(Convert.ToString(sel)));
             this.LoadFields();
             this.Persist();
@@ -427,20 +401,15 @@ class AiSettingsWindow : ChildWindow {
         }
         if (AiSettingsWindow.reg) {
             AiSettingsWindow.reg = false;
-            ZanIDE.OpenExternal(preRegs[PresetIndex()]);
+            ZanIDE.OpenExternal(presets[PresetIndex()].registrationUrl);
         }
         if (AiSettingsWindow.del) {
             AiSettingsWindow.del = false;
-            if (names.Count > 1) {
+            if (profiles.Count > 1) {
                 int i = SelClamped();
-                names.RemoveAt(i);
-                bases.RemoveAt(i);
-                keys.RemoveAt(i);
-                models.RemoveAt(i);
-                lists.RemoveAt(i);
-                limits.RemoveAt(i);
-                if (active >= names.Count) { active = 0; }
-                if (sel >= names.Count) { sel = names.Count - 1; }
+                profiles.RemoveAt(i);
+                if (active >= profiles.Count) { active = 0; }
+                if (sel >= profiles.Count) { sel = profiles.Count - 1; }
                 model.Set("sel", JsonValue.NewNum(Convert.ToString(sel)));
                 this.LoadFields();
                 this.Persist();
@@ -461,7 +430,7 @@ class AiSettingsWindow : ChildWindow {
             this.Persist();
             if (en) {
                 this.SetStatus(AiSettingsWindow.T(lang, "Saved and enabled ", "已保存并启用 ")
-                    + names[SelClamped()]);
+                    + profiles[SelClamped()].name);
             } else {
                 this.SetStatus(AiSettingsWindow.T(lang, "Saved.", "已保存。"));
             }
@@ -470,8 +439,8 @@ class AiSettingsWindow : ChildWindow {
         if (AiSettingsWindow.fetch && !fetchBusy) {
             AiSettingsWindow.fetch = false;
             this.CommitFields();
-            int i = SelClamped();
-            string ferr = ZanIDE.AiFetchModels(bases[i], keys[i]);
+            AiProfile profile = profiles[SelClamped()];
+            string ferr = ZanIDE.AiFetchModels(profile.baseUrl, profile.key);
             if (ferr != "") {
                 this.SetStatus(ferr);
             } else {
@@ -487,12 +456,12 @@ class AiSettingsWindow : ChildWindow {
                 File.Delete(ZanIDE.AiModelsDonePath());
                 fetchBusy = false;
                 string gotModels = ZanIDE.AiReadModels();
-                int i = SelClamped();
+                AiProfile profile = profiles[SelClamped()];
                 if (gotModels != "") {
-                    lists[i] = gotModels;
+                    profile.models = gotModels;
                     List<string> gm = ZanIDE.SplitList(gotModels);
-                    if (models[i] == "") {
-                        models[i] = gm[0];
+                    if (profile.model == "") {
+                        profile.model = gm[0];
                         model.Set("model", JsonValue.NewStr(gm[0]));
                     }
                     this.Persist();

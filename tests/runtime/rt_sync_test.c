@@ -118,7 +118,8 @@ static void test_shared_table(void) {
              (long)getpid(), (long long)time(NULL));
 #endif
     int64_t table = zan_shared_table_create(
-        name, 64, 32, "i:count;f:load;s:32:label;");
+        name, 64, 32,
+        "i:count;i:window_start;i:owner;f:load;s:32:label;");
     CHECK(table != 0, "could not create shared table");
     if (!table) return;
 
@@ -182,6 +183,64 @@ static void test_shared_table(void) {
               "child") == 0,
           "cross-process string update was not visible");
 
+    int64_t expiry_base = INT64_C(4102444800000);
+    CHECK(zan_shared_table_set_int(table, "ttl-a", "count", 1) == 1,
+          "could not create first expiring row");
+    CHECK(zan_shared_table_set_int(table, "ttl-b", "count", 2) == 1,
+          "could not create second expiring row");
+    CHECK(zan_shared_table_expire_at(table, "ttl-a", expiry_base + 2000) == 1,
+          "could not set first expiration");
+    CHECK(zan_shared_table_expire_at(table, "ttl-b", expiry_base + 1000) == 1,
+          "could not set earlier expiration");
+    CHECK(zan_shared_table_expires_at(table, "ttl-a") == expiry_base + 2000,
+          "expiration timestamp was not retained");
+    CHECK(zan_shared_table_purge_expired(table, expiry_base + 999) == 0,
+          "row expired before its deadline");
+    CHECK(zan_shared_table_purge_expired(table, expiry_base + 1000) == 1,
+          "heap did not remove its earliest row");
+    CHECK(zan_shared_table_exists(table, "ttl-b") == 0,
+          "expired row remains visible");
+    CHECK(zan_shared_table_exists(table, "ttl-a") == 1,
+          "later row was removed with heap root");
+    CHECK(zan_shared_table_expire_at(table, "ttl-a", 0) == 1,
+          "persist could not remove row from expiration heap");
+    CHECK(zan_shared_table_purge_expired(table, expiry_base + 3000) == 0,
+          "persisted row was removed");
+    CHECK(zan_shared_table_expires_at(table, "ttl-a") == 0,
+          "persisted row still has an expiration");
+    CHECK(zan_shared_table_set_int(table, "ttl-c", "count", 3) == 1,
+          "expired tombstone slot was not reusable");
+
+    CHECK(zan_shared_table_rate_allow(
+              table, "rate", expiry_base + 10000, 1000, 2) == 1,
+          "rate limiter rejected first request");
+    CHECK(zan_shared_table_rate_allow(
+              table, "rate", expiry_base + 10500, 1000, 2) == 1,
+          "rate limiter rejected request within limit");
+    CHECK(zan_shared_table_rate_allow(
+              table, "rate", expiry_base + 10999, 1000, 2) == 0,
+          "rate limiter allowed request over limit");
+    CHECK(zan_shared_table_rate_allow(
+              table, "rate", expiry_base + 11000, 1000, 2) == 1,
+          "rate limiter did not reset at window boundary");
+
+    CHECK(zan_shared_table_lock_acquire(
+              table, "lease", 11, expiry_base + 20000, 1000) == 1,
+          "lease lock could not be acquired");
+    CHECK(zan_shared_table_lock_acquire(
+              table, "lease", 22, expiry_base + 20500, 1000) == 0,
+          "lease lock admitted a second owner");
+    CHECK(zan_shared_table_lock_release(table, "lease", 22) == 0,
+          "lease lock accepted wrong owner release");
+    CHECK(zan_shared_table_lock_release(table, "lease", 11) == 1,
+          "lease lock rejected owner release");
+    CHECK(zan_shared_table_lock_acquire(
+              table, "lease", 22, expiry_base + 21000, 1000) == 1,
+          "released lease lock could not be reacquired");
+    CHECK(zan_shared_table_lock_acquire(
+              table, "lease", 33, expiry_base + 22000, 1000) == 1,
+          "expired lease lock was not reclaimable");
+
     int64_t second = zan_shared_table_open(name);
     CHECK(second != 0, "could not open second table handle");
     if (second) {
@@ -191,6 +250,14 @@ static void test_shared_table(void) {
     }
     CHECK(zan_shared_table_delete(table, "workers") == 1,
           "could not delete shared row");
+    CHECK(zan_shared_table_delete(table, "ttl-a") == 1,
+          "could not delete persisted ttl row");
+    CHECK(zan_shared_table_delete(table, "ttl-c") == 1,
+          "could not delete replacement ttl row");
+    CHECK(zan_shared_table_exists(table, "rate") == 0,
+          "expired rate-limit row was not reclaimed");
+    CHECK(zan_shared_table_lock_release(table, "lease", 33) == 1,
+          "could not release final lease row");
     CHECK(zan_shared_table_count(table) == 0, "delete did not update count");
     CHECK(zan_shared_table_destroy(table) == 1, "could not destroy shared table");
     CHECK(zan_shared_table_open(name) == 0,

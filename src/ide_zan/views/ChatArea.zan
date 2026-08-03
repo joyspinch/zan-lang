@@ -7,6 +7,31 @@ using Gui.Component;
 /// serialization (ChatPack/ChatUnpack), the wrapped markdown-aware line
 /// cache (ChatBuildLines) and the bottom-anchored transcript renderer.
 class ChatArea {
+    /// One pre-wrapped display row of the chat cache: the text, its colour,
+    /// its display kind (0 normal / 1 code / 2 heading / 3 turn header /
+    /// 4 thinking toggle / 5 foldable toggle), the message index a kind-5 row
+    /// toggles (else -1) and the speaker of the message the row belongs to
+    /// (0 you / 1 Xiao Zan / 2 tool / 3 error, used to tint whole blocks).
+    /// One entity instead of the old parallel lines/colors/kinds/meta/owner
+    /// lists, whose index alignment any edit could silently break.
+    static class ChatLine {
+        string text;
+        int color;
+        int kind;
+        int meta;
+        int owner;
+
+        static ChatLine Create(string text, int color, int kind) {
+            ChatLine ln = new ChatLine();
+            ln.text = text;
+            ln.color = color;
+            ln.kind = kind;
+            ln.meta = 0 - 1;
+            ln.owner = 0 - 1;
+            return ln;
+        }
+    }
+
     /// Greedily wraps `s` to `maxW` pixels, appending the pieces to `outLines`.
     static void WrapInto(string s, int maxW, int fontSize, List<string> outLines) {
         List<string> hard = CodeEditor.SplitLines(s);
@@ -40,31 +65,83 @@ class ChatArea {
         }
     }
 
+    /// Wraps `s` to `maxW` pixels and appends the pieces to `cache` as styled
+    /// display rows (`color`/`kind`). At least one row is always appended (an
+    /// empty piece becomes one empty row), matching the old "add a blank line
+    /// when nothing was emitted" idiom without the index bookkeeping.
+    static void WrapRows(string s, int maxW, int fontSize,
+            List<ChatLine> cache, int color, int kind) {
+        List<string> wrapped = new List<string>();
+        ChatArea.WrapInto(s, maxW, fontSize, wrapped);
+        int wi = 0;
+        while (wi < wrapped.Count) {
+            cache.Add(ChatLine.Create(wrapped[wi], color, kind));
+            wi = wi + 1;
+        }
+    }
+
+    /// Sets `owner` on every row the cache gained since `start`: the speaker
+    /// of the message those rows belong to, used to tint whole blocks.
+    static void OwnRows(List<ChatLine> cache, int start, int owner) {
+        int oi = start;
+        while (oi < cache.Count) {
+            cache[oi].owner = owner;
+            oi = oi + 1;
+        }
+    }
+
+    /// The selected text of `cache`, newline-joined ("" when nothing is
+    /// selected); mirrors LogView.SelectionText for the ChatLine entity.
+    static string SelectionText(List<ChatLine> cache, LogState st) {
+        if (!st.HasSelection()) { return ""; }
+        int r0 = st.selR0; int c0 = st.selC0;
+        int r1 = st.selR1; int c1 = st.selC1;
+        if (r0 > r1 || (r0 == r1 && c0 > c1)) {
+            int tr = r0; r0 = r1; r1 = tr;
+            int tc = c0; c0 = c1; c1 = tc;
+        }
+        string outp = "";
+        int r = r0;
+        while (r <= r1 && r < cache.Count) {
+            string ln = cache[r].text;
+            int s = 0;
+            int e = ln.Length;
+            if (r == r0) { s = c0; }
+            if (r == r1) { e = c1; }
+            if (s < 0) { s = 0; }
+            if (e > ln.Length) { e = ln.Length; }
+            if (s > e) { s = e; }
+            outp = outp + ln.Substring(s, e - s);
+            if (r < r1) { outp = outp + "\n"; }
+            r = r + 1;
+        }
+        return outp;
+    }
+
     /// Serializes a chat transcript for the session switcher (JSON, so any
     /// message content round-trips safely). The per-message reasoning ("z")
     /// rides along so switching sessions keeps each answer's thinking.
-    static string ChatPack(List<string> roles, List<string> texts,
-            List<string> reason, List<string> planText, List<int> planDone) {
+    static string ChatPack(List<AiChatMsg> msgs, List<AiPlanStep> plan) {
         StringBuilder sb = new StringBuilder();
         sb.Append("{\"m\": [");
         int i = 0;
-        while (i < roles.Count) {
+        while (i < msgs.Count) {
             if (i > 0) { sb.Append(", "); }
-            sb.Append("{\"r\": \"" + ZanIDE.JsonEsc(roles[i]) + "\", \"t\": \""
-                + ZanIDE.JsonEsc(texts[i]) + "\"");
-            if (i < reason.Count && reason[i] != "") {
-                sb.Append(", \"z\": \"" + ZanIDE.JsonEsc(reason[i]) + "\"");
+            sb.Append("{\"r\": \"" + ZanIDE.JsonEsc(msgs[i].role)
+                + "\", \"t\": \"" + ZanIDE.JsonEsc(msgs[i].text) + "\"");
+            if (msgs[i].reason != "") {
+                sb.Append(", \"z\": \"" + ZanIDE.JsonEsc(msgs[i].reason) + "\"");
             }
             sb.Append("}");
             i = i + 1;
         }
         sb.Append("], \"plan\": [");
         int p = 0;
-        while (p < planText.Count) {
+        while (p < plan.Count) {
             if (p > 0) { sb.Append(", "); }
             string dv = "false";
-            if (p < planDone.Count && planDone[p] != 0) { dv = "true"; }
-            sb.Append("{\"t\": \"" + ZanIDE.JsonEsc(planText[p]) + "\", \"d\": "
+            if (plan[p].done != 0) { dv = "true"; }
+            sb.Append("{\"t\": \"" + ZanIDE.JsonEsc(plan[p].text) + "\", \"d\": "
                 + dv + "}");
             p = p + 1;
         }
@@ -72,8 +149,8 @@ class ChatArea {
         return sb.ToString();
     }
 
-    static void ChatUnpack(string packed, List<string> roles, List<string> texts,
-            List<string> reason, List<string> planText, List<int> planDone) {
+    static void ChatUnpack(string packed, List<AiChatMsg> msgs,
+            List<AiPlanStep> plan) {
         if (packed == "") { return; }
         JsonValue v = JsonValue.ParseLenient(packed);
         if (v == null) { return; }
@@ -82,9 +159,8 @@ class ChatArea {
             int i = 0;
             while (i < ms.Count()) {
                 JsonValue m = ms.At(i);
-                roles.Add(m.Str("r", "assistant"));
-                texts.Add(m.Str("t", ""));
-                reason.Add(m.Str("z", ""));
+                msgs.Add(AiChatMsg.CreateWithReason(m.Str("r", "assistant"),
+                    m.Str("t", ""), m.Str("z", "")));
                 i = i + 1;
             }
         }
@@ -93,8 +169,9 @@ class ChatArea {
             int j = 0;
             while (j < pl.Count()) {
                 JsonValue p = pl.At(j);
-                planText.Add(p.Str("t", ""));
-                if (p.Bool("d", false)) { planDone.Add(1); } else { planDone.Add(0); }
+                int d = 0;
+                if (p.Bool("d", false)) { d = 1; }
+                plan.Add(AiPlanStep.Create(p.Str("t", ""), d));
                 j = j + 1;
             }
         }
@@ -103,13 +180,13 @@ class ChatArea {
     /// Serializes the whole session list (each session is a ChatPack JSON
     /// string) plus the active index, for disk persistence. Sessions are
     /// JSON-escaped so their own quoting survives nesting.
-    static string ChatPackSessions(List<string> sessions, int cur) {
+    static string ChatPackSessions(List<AiSession> sessions, int cur) {
         StringBuilder sb = new StringBuilder();
         sb.Append("{\"cur\":" + Convert.ToString(cur) + ",\"s\":[");
         int i = 0;
         while (i < sessions.Count) {
             if (i > 0) { sb.Append(","); }
-            sb.Append("\"" + ZanIDE.JsonEsc(sessions[i]) + "\"");
+            sb.Append("\"" + ZanIDE.JsonEsc(sessions[i].pack) + "\"");
             i = i + 1;
         }
         sb.Append("]}");
@@ -118,7 +195,7 @@ class ChatArea {
 
     /// Restores a session list from ChatPackSessions output; returns the
     /// active index (clamped to the restored list).
-    static int ChatUnpackSessions(string packed, List<string> sessions) {
+    static int ChatUnpackSessions(string packed, List<AiSession> sessions) {
         sessions.Clear();
         if (packed == "") { return 0; }
         JsonValue v = JsonValue.ParseLenient(packed);
@@ -130,7 +207,7 @@ class ChatArea {
                 JsonValue it = s.At(i);
                 string p = "";
                 if (it != null) { p = it.AsString(""); }
-                sessions.Add(p);
+                sessions.Add(AiSession.Create(p, 0));
                 i = i + 1;
             }
         }
@@ -149,10 +226,10 @@ class ChatArea {
     }
 
     /// Title of a live transcript: the first thing the user asked, else "".
-    static string FirstUserOf(List<string> roles, List<string> texts) {
+    static string FirstUserOf(List<AiChatMsg> msgs) {
         int i = 0;
-        while (i < roles.Count) {
-            if (roles[i] == "user") { return ChatArea.TitleLine(texts[i]); }
+        while (i < msgs.Count) {
+            if (msgs[i].role == "user") { return ChatArea.TitleLine(msgs[i].text); }
             i = i + 1;
         }
         return "";
@@ -211,12 +288,11 @@ class ChatArea {
         return false;
     }
 
-    static void ChatBuildLines(App app, List<string> roles, List<string> texts,
-            List<string> reason, int textW, bool thinkOpen, List<int> toolOpen,
-            List<string> lines, List<int> colors, List<int> kinds,
-            List<int> meta, List<int> owner) {
-        ChatArea.ChatBuildRange(app, roles, texts, reason, 0, roles.Count,
-            textW, thinkOpen, toolOpen, lines, colors, kinds, meta, owner);
+    static void ChatBuildLines(App app, List<AiChatMsg> msgs,
+            int textW, bool thinkOpen, List<int> toolOpen,
+            List<ChatLine> cache) {
+        ChatArea.ChatBuildRange(app, msgs, 0, msgs.Count,
+            textW, thinkOpen, toolOpen, cache);
     }
 
     /// Speaker code of a transcript role, used to tint whole message blocks:
@@ -232,29 +308,32 @@ class ChatArea {
     /// Splitting the build this way lets the panel keep the wrapped lines of
     /// the settled turns and re-wrap just the turn that is streaming, instead
     /// of re-wrapping a whole long conversation on every frame.
-    static void ChatBuildRange(App app, List<string> roles, List<string> texts,
-            List<string> reason, int from, int to, int textW, bool thinkOpen,
-            List<int> toolOpen, List<string> lines, List<int> colors,
-            List<int> kinds, List<int> meta, List<int> owner) {
+    /// Wraps only the turns in [from, to) and APPENDS them to the cache.
+    /// Splitting the build this way lets the panel keep the wrapped lines of
+    /// the settled turns and re-wrap just the turn that is streaming, instead
+    /// of re-wrapping a whole long conversation on every frame.
+    static void ChatBuildRange(App app, List<AiChatMsg> msgs,
+            int from, int to, int textW, bool thinkOpen,
+            List<int> toolOpen, List<ChatLine> cache) {
         Theme t = app.theme;
         List<int> togPos = new List<int>();
         List<int> togMsg = new List<int>();
         int i = from;
         if (i < 0) { i = 0; }
         int stop = to;
-        if (stop > roles.Count) { stop = roles.Count; }
+        if (stop > msgs.Count) { stop = msgs.Count; }
         while (i < stop) {
             string head = ZanIDE.T("Xiao Zan", "小赞");
             int headCol = t.success;
             int bodyCol = t.textPrimary;
-            if (roles[i] == "user") {
+            if (msgs[i].role == "user") {
                 head = ZanIDE.T("You", "我");
                 headCol = t.primary;
-            } else if (roles[i] == "error") {
+            } else if (msgs[i].role == "error") {
                 head = ZanIDE.T("Error", "错误");
                 headCol = t.error;
                 bodyCol = t.error;
-            } else if (roles[i] == "tool") {
+            } else if (msgs[i].role == "tool") {
                 head = ZanIDE.T("Tool", "工具");
                 headCol = t.textTertiary;
                 bodyCol = t.textTertiary;
@@ -263,8 +342,9 @@ class ChatArea {
             // (its first line, e.g. "list_dir src/"); clicking expands the full
             // result below it. This keeps a long dump from burying the answer
             // while staying inspectable -- like a mainstream AI coding tool.
-            if (roles[i] == "tool") {
-                List<string> tl = CodeEditor.SplitLines(texts[i]);
+            if (msgs[i].role == "tool") {
+                int msgStart = cache.Count;
+                List<string> tl = CodeEditor.SplitLines(msgs[i].text);
                 string summary = "";
                 if (tl.Count > 0) { summary = tl[0]; }
                 bool open = ChatArea.HasInt(toolOpen, i);
@@ -281,54 +361,46 @@ class ChatArea {
                     sline = tmp[0];
                     if (tmp.Count > 1) { sline = sline + " …"; }
                 }
-                if (expandable) { togPos.Add(lines.Count); togMsg.Add(i); }
-                lines.Add(sline);
-                colors.Add(headCol);
-                if (expandable) { kinds.Add(5); } else { kinds.Add(3); }
+                if (expandable) { togPos.Add(cache.Count); togMsg.Add(i); }
+                if (expandable) {
+                    cache.Add(ChatLine.Create(sline, headCol, 5));
+                } else {
+                    cache.Add(ChatLine.Create(sline, headCol, 3));
+                }
                 if (open) {
                     int k = 1;
                     while (k < tl.Count) {
-                        int before = lines.Count;
-                        ChatArea.WrapInto(tl[k], textW, t.fontSizeSmall, lines);
-                        if (lines.Count == before) { lines.Add(""); }
-                        while (colors.Count < lines.Count) { colors.Add(bodyCol); kinds.Add(0); }
+                        ChatArea.WrapRows(tl[k], textW, t.fontSizeSmall,
+                            cache, bodyCol, 0);
                         k = k + 1;
                     }
                 }
-                while (owner.Count < lines.Count) { owner.Add(2); }
+                ChatArea.OwnRows(cache, msgStart, 2);
                 i = i + 1;
                 continue;
             }
-            lines.Add(head);
-            colors.Add(headCol);
-            kinds.Add(3);
+            int msgStart = cache.Count;
+            cache.Add(ChatLine.Create(head, headCol, 3));
             // F: the model's reasoning is shown as its own dim "Thinking"
             // section above the answer, kept separate from the answer text (and
             // out of the transcript sent back to the model).
-            if (roles[i] == "assistant" && i < reason.Count && reason[i] != "") {
+            if (msgs[i].role == "assistant" && msgs[i].reason != "") {
                 // Collapsed by default: only a clickable one-line toggle (kind 4)
                 // shows, so the thinking never buries the answer. Clicking it
                 // (handled in RenderChatArea) expands the full reasoning.
                 if (thinkOpen) {
-                    lines.Add(ZanIDE.T("Thinking (click to hide)",
-                        "思考过程（点击收起）"));
+                    cache.Add(ChatLine.Create(ZanIDE.T("Thinking (click to hide)",
+                        "思考过程（点击收起）"), t.textTertiary, 4));
                 } else {
-                    lines.Add(ZanIDE.T("Thinking (click to show)",
-                        "思考过程（点击展开）"));
+                    cache.Add(ChatLine.Create(ZanIDE.T("Thinking (click to show)",
+                        "思考过程（点击展开）"), t.textTertiary, 4));
                 }
-                colors.Add(t.textTertiary);
-                kinds.Add(4);
                 if (thinkOpen) {
-                    List<string> rsrc = CodeEditor.SplitLines(reason[i]);
+                    List<string> rsrc = CodeEditor.SplitLines(msgs[i].reason);
                     int rk = 0;
                     while (rk < rsrc.Count) {
-                        int rbefore = lines.Count;
-                        ChatArea.WrapInto(ChatArea.MdStrip(rsrc[rk]), textW,
-                            t.fontSizeSmall, lines);
-                        if (lines.Count == rbefore) { lines.Add(""); }
-                        while (colors.Count < lines.Count) {
-                            colors.Add(t.textTertiary); kinds.Add(0);
-                        }
+                        ChatArea.WrapRows(ChatArea.MdStrip(rsrc[rk]), textW,
+                            t.fontSizeSmall, cache, t.textTertiary, 0);
                         rk = rk + 1;
                     }
                 }
@@ -336,7 +408,7 @@ class ChatArea {
             // Markdown-lite: fenced code blocks get a code background and
             // color; headings/bullets/inline `code`/**bold** markers are
             // simplified for readable plain-canvas rendering.
-            List<string> src = CodeEditor.SplitLines(texts[i]);
+            List<string> src = CodeEditor.SplitLines(msgs[i].text);
             bool inCode = false;
             // A long code block (a whole file the model printed, or the half
             // of one a stopped answer left behind) is folded to its first
@@ -345,11 +417,10 @@ class ChatArea {
             // the same per-message toggle list as tool results.
             bool codeOpen = ChatArea.HasInt(toolOpen, i);
             if (codeOpen && ChatArea.HasLongCode(src)) {
-                togPos.Add(lines.Count);
+                togPos.Add(cache.Count);
                 togMsg.Add(i);
-                lines.Add("▼ " + ZanIDE.T("collapse code", "收起代码"));
-                colors.Add(t.textTertiary);
-                kinds.Add(5);
+                cache.Add(ChatLine.Create("▼ " + ZanIDE.T("collapse code", "收起代码"),
+                    t.textTertiary, 5));
             }
             int li = 0;
             while (li < src.Count) {
@@ -368,22 +439,16 @@ class ChatArea {
                         int keep = ChatArea.CodeFoldLines();
                         int ck = li + 1;
                         while (ck < li + 1 + keep) {
-                            int cbefore = lines.Count;
-                            ChatArea.WrapInto(src[ck], textW - app.Scale(8),
-                                t.fontSizeSmall, lines);
-                            if (lines.Count == cbefore) { lines.Add(""); }
-                            while (colors.Count < lines.Count) {
-                                colors.Add(t.info); kinds.Add(1);
-                            }
+                            ChatArea.WrapRows(src[ck], textW - app.Scale(8),
+                                t.fontSizeSmall, cache, t.info, 1);
                             ck = ck + 1;
                         }
-                        togPos.Add(lines.Count);
+                        togPos.Add(cache.Count);
                         togMsg.Add(i);
-                        lines.Add("▶ " + ZanIDE.T("show ", "展开剩余 ")
+                        cache.Add(ChatLine.Create("▶ " + ZanIDE.T("show ", "展开剩余 ")
                             + Convert.ToString(blockLen - keep)
-                            + ZanIDE.T(" more code lines", " 行代码"));
-                        colors.Add(t.textTertiary);
-                        kinds.Add(5);
+                            + ZanIDE.T(" more code lines", " 行代码"),
+                            t.textTertiary, 5));
                         li = endAt + 1;
                         continue;
                     }
@@ -391,10 +456,8 @@ class ChatArea {
                 if (fence) {
                     inCode = !inCode;
                 } else if (inCode) {
-                    int before = lines.Count;
-                    ChatArea.WrapInto(ln, textW - app.Scale(8), t.fontSizeSmall, lines);
-                    if (lines.Count == before) { lines.Add(""); }
-                    while (colors.Count < lines.Count) { colors.Add(t.info); kinds.Add(1); }
+                    ChatArea.WrapRows(ln, textW - app.Scale(8), t.fontSizeSmall,
+                        cache, t.info, 1);
                 } else {
                     string shown = ChatArea.MdStrip(ln);
                     int kind = 0;
@@ -403,17 +466,15 @@ class ChatArea {
                         kind = 2;
                         col = t.textPrimary;
                     }
-                    int before = lines.Count;
-                    ChatArea.WrapInto(shown, textW, t.fontSizeSmall, lines);
-                    if (lines.Count == before) { lines.Add(""); }
-                    while (colors.Count < lines.Count) { colors.Add(col); kinds.Add(kind); }
+                    ChatArea.WrapRows(shown, textW, t.fontSizeSmall,
+                        cache, col, kind);
                 }
                 li = li + 1;
             }
             // owner[row] = which speaker this display row belongs to, so the
             // renderer can paint the whole message as one tinted block.
-            int ownCode = ChatArea.RoleCode(roles[i]);
-            while (owner.Count < lines.Count) { owner.Add(ownCode); }
+            int ownCode = ChatArea.RoleCode(msgs[i].role);
+            ChatArea.OwnRows(cache, msgStart, ownCode);
             // No blank row between turns: the per-turn header (kind 3) with its
             // background band already separates messages, so a trailing blank
             // row would just add wasted vertical space. Messages stack tightly
@@ -421,10 +482,10 @@ class ChatArea {
             i = i + 1;
         }
         // meta[row] = the message index a kind-5 toggle row controls (else -1).
-        while (meta.Count < lines.Count) { meta.Add(0 - 1); }
         int tpi = 0;
         while (tpi < togPos.Count) {
-            if (togPos[tpi] < meta.Count) { meta[togPos[tpi]] = togMsg[tpi]; }
+            int at = togPos[tpi];
+            if (at >= 0 && at < cache.Count) { cache[at].meta = togMsg[tpi]; }
             tpi = tpi + 1;
         }
     }
@@ -464,9 +525,8 @@ class ChatArea {
     /// Draws the (pre-wrapped, cached) chat transcript bottom-anchored inside
     /// `area`; code lines get a code-colored background strip. Returns the
     /// maximum scroll offset.
-    static int RenderChatArea(App app, Rect area, List<string> lines,
-            List<int> colors, List<int> kinds, List<int> meta,
-            List<int> owner, List<int> toolOpen, int scroll, bool busy,
+    static int RenderChatArea(App app, Rect area, List<ChatLine> cache,
+            List<int> toolOpen, int scroll, bool busy,
             LogState sel, bool interactive, SignalInt thinkOpen) {
         Canvas c = app.canvas;
         Theme t = app.theme;
@@ -474,7 +534,7 @@ class ChatArea {
         int rowH = app.Scale(18);
         int extra = 0;
         if (busy) { extra = 1; }
-        if (lines.Count == 0 && !busy) {
+        if (cache.Count == 0 && !busy) {
             c.PushClip(area.x, area.y, area.width, area.height);
             List<string> hint = new List<string>();
             ChatArea.WrapInto(ZanIDE.T(
@@ -492,7 +552,7 @@ class ChatArea {
             c.PopClip();
             return 0;
         }
-        int total = lines.Count + extra;
+        int total = cache.Count + extra;
         int maxRows = (area.height - pad * 2) / rowH;
         if (maxRows < 1) { maxRows = 1; }
         int maxScroll = total - maxRows;
@@ -504,7 +564,7 @@ class ChatArea {
         // Drag-to-select over the wrapped display lines, reusing the LogView
         // selection model (LogState + LogView.ColAt / SelectionText). Wheel
         // scrolling stays with the caller so it keeps its own scroll model.
-        if (interactive && lines.Count > 0) {
+        if (interactive && cache.Count > 0) {
             int hid = app.focus.AllocId();
             app.hitTester.Register(HitRegion.Create(hid, area.x, area.y,
                 area.width, area.height, 1));
@@ -514,17 +574,17 @@ class ChatArea {
             if (kind == 2 && app.window.EventButton() == 0 && over
                 && !app.PointerCaptured()) {
                 int ri = ChatArea.RowAtChat(area, pad, rowH, start,
-                    lines.Count, app.mouseY);
-                if (ri >= 0 && ri < kinds.Count && kinds[ri] == 4) {
+                    cache.Count, app.mouseY);
+                if (ri >= 0 && ri < cache.Count && cache[ri].kind == 4) {
                     // Clicking a "Thinking" toggle row expands/collapses the
                     // reasoning instead of starting a text selection.
                     thinkOpen.Set(1 - thinkOpen.Get());
                     app.RequestRedraw();
-                } else if (ri >= 0 && ri < kinds.Count && kinds[ri] == 5) {
+                } else if (ri >= 0 && ri < cache.Count && cache[ri].kind == 5) {
                     // Clicking a tool summary row expands/collapses that one
                     // tool result (toggles its message index in toolOpen).
                     int mid = 0 - 1;
-                    if (ri < meta.Count) { mid = meta[ri]; }
+                    if (ri < cache.Count) { mid = cache[ri].meta; }
                     if (mid >= 0) {
                         int at = 0 - 1;
                         int z = 0;
@@ -537,7 +597,7 @@ class ChatArea {
                         app.RequestRedraw();
                     }
                 } else {
-                    int cc = LogView.ColAt(lines[ri],
+                    int cc = LogView.ColAt(cache[ri].text,
                         area.x + pad + app.Scale(11),
                         t.fontSizeSmall, app.mouseX);
                     sel.selR0 = ri; sel.selC0 = cc;
@@ -548,8 +608,8 @@ class ChatArea {
             }
             if (kind == 1 && sel.selDrag) {
                 int ri = ChatArea.RowAtChat(area, pad, rowH, start,
-                    lines.Count, app.mouseY);
-                int cc = LogView.ColAt(lines[ri],
+                    cache.Count, app.mouseY);
+                int cc = LogView.ColAt(cache[ri].text,
                     area.x + pad + app.Scale(11),
                     t.fontSizeSmall, app.mouseX);
                 sel.selR1 = ri; sel.selC1 = cc;
@@ -581,9 +641,9 @@ class ChatArea {
         int textW2 = area.width - pad * 2 - barW - app.Scale(8);
         while (idx < total && row < maxRows) {
             int ry = area.y + pad + row * rowH;
-            if (idx < lines.Count) {
+            if (idx < cache.Count) {
                 int who = 1;
-                if (idx < owner.Count) { who = owner[idx]; }
+                if (cache[idx].owner >= 0) { who = cache[idx].owner; }
                 int rail = t.success;
                 int tint = App.ScaleAlpha(t.success, 16);
                 if (who == 0) {
@@ -598,12 +658,12 @@ class ChatArea {
                 }
                 c.FillRect(blockX, ry, area.width - pad * 2, rowH, tint);
                 c.FillRect(blockX, ry, barW, rowH, rail);
-                if (kinds[idx] == 1) {
+                if (cache[idx].kind == 1) {
                     c.FillRect(textX - app.Scale(2), ry,
                         textW2 + app.Scale(4), rowH, codeBg);
                 }
                 if (sr0 >= 0 && idx >= sr0 && idx <= sr1) {
-                    string ln = lines[idx];
+                    string ln = cache[idx].text;
                     int hs = 0;
                     int he = ln.Length;
                     if (idx == sr0) { hs = sc0; }
@@ -619,29 +679,29 @@ class ChatArea {
                     if (hx1 < hx0 + 2) { hx1 = hx0 + 2; }
                     c.FillRect(hx0, ry, hx1 - hx0, rowH, selCol);
                 }
-                if (kinds[idx] == 3) {
+                if (cache[idx].kind == 3) {
                     // Name row of a turn: a solid pill in the speaker's colour
                     // with the name reversed out of it, so the start of every
                     // message is a coloured chip rather than one more line of
                     // text the eye has to parse.
                     int chipH = rowH - app.Scale(2);
-                    int chipTw = Canvas.MeasureText(lines[idx], t.fontSizeSmall);
+                    int chipTw = Canvas.MeasureText(cache[idx].text, t.fontSizeSmall);
                     int chipW = chipTw + app.Scale(14);
                     c.FillRoundRect(textX, ry + app.Scale(1), chipW, chipH,
-                        chipH / 2, colors[idx]);
+                        chipH / 2, cache[idx].color);
                     int chipFh = Canvas.FontHeight(t.fontSizeSmall);
                     app.canvas.DrawText(textX + app.Scale(7),
                         ry + app.Scale(1) + (chipH - chipFh) / 2,
-                        lines[idx], t.bgPrimary,
+                        cache[idx].text, t.bgPrimary,
                         Style.Of(app, "label", "small", Style.SNormal())
                             .FontOr(t.fontSizeSmall));
-                } else if (kinds[idx] == 1) {
-                    app.canvas.DrawText(textX + app.Scale(4), ry, lines[idx],
-                        colors[idx],
+                } else if (cache[idx].kind == 1) {
+                    app.canvas.DrawText(textX + app.Scale(4), ry, cache[idx].text,
+                        cache[idx].color,
                         Style.Of(app, "label", "small", Style.SNormal())
                             .FontOr(app.theme.fontSizeSmall));
                 } else {
-                    app.canvas.DrawText(textX, ry, lines[idx], colors[idx],
+                    app.canvas.DrawText(textX, ry, cache[idx].text, cache[idx].color,
                         Style.Of(app, "label", "small", Style.SNormal())
                             .FontOr(app.theme.fontSizeSmall));
                 }

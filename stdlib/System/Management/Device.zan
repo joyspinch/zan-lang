@@ -1,0 +1,214 @@
+using System;
+
+namespace System.Management;
+
+/// <summary>Read-only information for one Windows Plug and Play device.</summary>
+class DeviceInfo {
+    public string instanceId;
+    public string classGuid;
+    public string className;
+    public string friendlyName;
+    public string description;
+    public string manufacturer;
+    public List<string> hardwareIds;
+}
+
+/// <summary>
+/// Read-only Windows device enumeration through SetupAPI. Present() returns
+/// devices currently present; All() also includes non-present device nodes.
+/// Every query spans all setup classes. Other platforms throw
+/// PlatformNotSupportedException.
+/// </summary>
+class Device {
+    /// <summary>Enumerates currently present devices from all setup classes.</summary>
+    static List<DeviceInfo> Present() {
+        return Device.List(true);
+    }
+
+    /// <summary>Enumerates present and non-present devices from all setup classes.</summary>
+    static List<DeviceInfo> All() {
+        return Device.List(false);
+    }
+
+    /// <summary>Enumerates all setup classes, optionally limiting the result to
+    /// devices currently present.</summary>
+    static List<DeviceInfo> List(bool presentOnly) {
+        #if WINDOWS
+        return Device.WinList(presentOnly);
+        #else
+        throw new PlatformNotSupportedException(
+            "System.Management.Device is not implemented on this platform");
+        #endif
+    }
+
+    // Parses a REG_MULTI_SZ payload without reading beyond bytes. A malformed
+    // value (odd byte count, missing string terminator, or missing final list
+    // terminator) is rejected rather than returning a partial result.
+    static List<string> ParseMultiString(nint payload, int bytes) {
+        List<string> texts = new List<string>();
+        if (payload == 0 || bytes < 2 || bytes % 2 != 0) { return texts; }
+
+        int used = 0;
+        bool hasString = false;
+        while (used <= bytes - 2) {
+            nint start = payload + used;
+            int chars = 0;
+            while (used <= bytes - 2 &&
+                   new Span<ushort>(payload + used, 1)[0] != 0) {
+                chars = chars + 1;
+                used = used + 2;
+            }
+            if (used > bytes - 2) { return new List<string>(); }
+
+            if (chars == 0) {
+                // Non-empty lists arrive here at their extra terminating NUL.
+                // An empty list needs both NULs inside the reported byte count.
+                if (!hasString) {
+                    if (bytes < 4 || used > bytes - 4 ||
+                        new Span<ushort>(payload + used + 2, 1)[0] != 0) {
+                        return new List<string>();
+                    }
+                }
+                return texts;
+            }
+
+            texts.Add(Wide.Read(start));
+            hasString = true;
+            used = used + 2;
+        }
+        return new List<string>();
+    }
+
+    #if WINDOWS
+    [DllImport("setupapi", EntryPoint = "SetupDiGetClassDevsW")]
+    static extern nint SetupDiGetClassDevsW(nint classGuid, nint enumerator,
+                                            nint parent, int flags);
+
+    [DllImport("setupapi", EntryPoint = "SetupDiEnumDeviceInfo")]
+    static extern int SetupDiEnumDeviceInfo(nint devs, int index, nint data);
+
+    [DllImport("setupapi", EntryPoint = "SetupDiGetDeviceInstanceIdW")]
+    static extern int SetupDiGetDeviceInstanceIdW(nint devs, nint data,
+                                                   nint buffer, int chars,
+                                                   nint requiredChars);
+
+    [DllImport("setupapi", EntryPoint = "SetupDiGetDeviceRegistryPropertyW")]
+    static extern int SetupDiGetDeviceRegistryPropertyW(nint devs, nint data,
+                                                         int property,
+                                                         nint textType,
+                                                         nint buffer, int bytes,
+                                                         nint requiredBytes);
+
+    [DllImport("setupapi", EntryPoint = "SetupDiDestroyDeviceInfoList")]
+    static extern int SetupDiDestroyDeviceInfoList(nint devs);
+
+    static List<DeviceInfo> WinList(bool presentOnly) {
+        List<DeviceInfo> list = new List<DeviceInfo>();
+        int flags = 4;   // DIGCF_ALLCLASSES
+        if (presentOnly) { flags = flags | 2; }   // DIGCF_PRESENT
+        nint devs = Device.SetupDiGetClassDevsW(0, 0, 0, flags);
+        if (devs == (nint)(0 - 1)) { return list; }   // INVALID_HANDLE_VALUE
+
+        // SP_DEVINFO_DATA is 32 bytes on Win64: DWORD cbSize, GUID, DWORD
+        // DevInst, four bytes of alignment, ULONG_PTR Reserved.
+        nint data = NativeMemory.Alloc(32);
+        int index = 0;
+        bool done = false;
+        while (!done) {
+            NativeMemory.Fill(data, 0, 32);
+            new Span<int>(data, 1)[0] = 32;
+            if (Device.SetupDiEnumDeviceInfo(devs, index, data) == 0) {
+                done = true;
+            } else {
+                DeviceInfo d = new DeviceInfo();
+                d.instanceId = Device.InstanceId(devs, data);
+                d.classGuid = Device.StringProperty(devs, data, 8);   // SPDRP_CLASSGUID
+                d.className = Device.StringProperty(devs, data, 7);   // SPDRP_CLASS
+                d.friendlyName = Device.StringProperty(devs, data, 12); // SPDRP_FRIENDLYNAME
+                d.description = Device.StringProperty(devs, data, 0); // SPDRP_DEVICEDESC
+                d.manufacturer = Device.StringProperty(devs, data, 11); // SPDRP_MFG
+                d.hardwareIds = Device.MultiStringProperty(devs, data, 1); // SPDRP_HARDWAREID
+                list.Add(d);
+                index = index + 1;
+            }
+        }
+        NativeMemory.Free(data);
+        Device.SetupDiDestroyDeviceInfoList(devs);
+        return list;
+    }
+
+    static string InstanceId(nint devs, nint data) {
+        nint required = NativeMemory.Alloc(4);
+        new Span<int>(required, 1)[0] = 0;
+        Device.SetupDiGetDeviceInstanceIdW(devs, data, 0, 0, required);
+        int chars = new Span<int>(required, 1)[0];
+        if (chars <= 0) {
+            NativeMemory.Free(required);
+            return "";
+        }
+        nint buffer = NativeMemory.Alloc(chars * 2 + 2);
+        int ok = Device.SetupDiGetDeviceInstanceIdW(
+            devs, data, buffer, chars, required);
+        string text = "";
+        if (ok != 0) { text = Wide.Read(buffer); }
+        NativeMemory.Free(buffer);
+        NativeMemory.Free(required);
+        return text;
+    }
+
+    static string StringProperty(nint devs, nint data, int property) {
+        nint buffer = Device.PropertyBuffer(devs, data, property);
+        if (buffer == 0) { return ""; }
+        int type = new Span<int>(buffer, 1)[0];
+        string text = "";
+        if (type == 1 || type == 2) { text = Wide.Read(buffer + 8); }
+        NativeMemory.Free(buffer);
+        return text;
+    }
+
+    static List<string> MultiStringProperty(nint devs, nint data, int property) {
+        List<string> texts = new List<string>();
+        nint buffer = Device.PropertyBuffer(devs, data, property);
+        if (buffer == 0) { return texts; }
+        int type = new Span<int>(buffer, 1)[0];
+        int bytes = new Span<int>(buffer + 4, 1)[0];
+        if (type == 7) {   // REG_MULTI_SZ
+            texts = Device.ParseMultiString(buffer + 8, bytes);
+        }
+        NativeMemory.Free(buffer);
+        return texts;
+    }
+
+    // Returns one allocation containing [type:int, byteCount:int, payload...],
+    // or 0 when the property is absent. SetupAPI reports the exact payload size
+    // through the first zero-buffer call, avoiding fixed-size truncation.
+    static nint PropertyBuffer(nint devs, nint data, int property) {
+        nint required = NativeMemory.Alloc(4);
+        nint type = NativeMemory.Alloc(4);
+        new Span<int>(required, 1)[0] = 0;
+        new Span<int>(type, 1)[0] = 0;
+        Device.SetupDiGetDeviceRegistryPropertyW(
+            devs, data, property, type, 0, 0, required);
+        int bytes = new Span<int>(required, 1)[0];
+        if (bytes <= 0) {
+            NativeMemory.Free(required);
+            NativeMemory.Free(type);
+            return 0;
+        }
+        nint result = NativeMemory.Alloc(bytes + 10);
+        NativeMemory.Fill(result, 0, bytes + 10);
+        int ok = Device.SetupDiGetDeviceRegistryPropertyW(
+            devs, data, property, type, result + 8, bytes, required);
+        if (ok == 0) {
+            NativeMemory.Free(result);
+            result = 0;
+        } else {
+            new Span<int>(result, 1)[0] = new Span<int>(type, 1)[0];
+            new Span<int>(result + 4, 1)[0] = new Span<int>(required, 1)[0];
+        }
+        NativeMemory.Free(required);
+        NativeMemory.Free(type);
+        return result;
+    }
+    #endif
+}

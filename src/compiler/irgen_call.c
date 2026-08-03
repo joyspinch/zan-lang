@@ -84,6 +84,8 @@ static LLVMValueRef emit_method_spec_call(zan_irgen_t *g, int idx,
         (size_t)(total > 0 ? total : 1), sizeof(LLVMValueRef));
     zan_ast_node_t **aexprs = (zan_ast_node_t **)calloc(
         (size_t)(total > 0 ? total : 1), sizeof(zan_ast_node_t *));
+    int *arg_eh_pushed = (int *)calloc(
+        (size_t)(total > 0 ? total : 1), sizeof(int));
     if (this_off) {
         LLVMTypeRef this_ty = LLVMTypeOf(LLVMGetParam(sp->fn, 0));
         LLVMValueRef self;
@@ -97,6 +99,14 @@ static LLVMValueRef emit_method_spec_call(zan_irgen_t *g, int idx,
             self = LLVMBuildBitCast(g->builder, self, this_ty, "self.c");
         call_args[0] = self;
         aexprs[0] = recv_expr;
+        zan_type_t *rt = infer_expr_type(g, recv_expr, locals);
+        if (rt && is_rc_managed_type(rt) && recv_expr &&
+            !expr_is_local_ident(recv_expr, locals) &&
+            expr_yields_owned_rc_value(g, recv_expr, locals) &&
+            LLVMGetTypeKind(LLVMTypeOf(self)) == LLVMPointerTypeKind) {
+            emit_eh_tmp_push(g, self);
+            arg_eh_pushed[0] = 1;
+        }
     }
     for (int j = 0; j < pcount; j++) {
         aexprs[j + this_off] = (arg_base == 1 && j == 0)
@@ -105,15 +115,34 @@ static LLVMValueRef emit_method_spec_call(zan_irgen_t *g, int idx,
             method_param_type(g, sp->msym, j), tps, sp->bind);
         call_args[j + this_off] =
             emit_arg_typed(g, aexprs[j + this_off], pt, locals);
+        zan_ast_node_t *arg = aexprs[j + this_off];
+        zan_type_t *at = infer_expr_type(g, arg, locals);
+        if (at && is_rc_managed_type(at) &&
+            !expr_is_local_ident(arg, locals) &&
+            expr_yields_owned_rc_value(g, arg, locals) &&
+            LLVMGetTypeKind(LLVMTypeOf(call_args[j + this_off])) == LLVMPointerTypeKind) {
+            if (at->kind == TYPE_STRING) {
+                LLVMValueRef slot = emit_entry_alloca(g,
+                    LLVMTypeOf(call_args[j + this_off]), "arg.eh");
+                LLVMBuildStore(g->builder, call_args[j + this_off], slot);
+                emit_eh_tmp_push_slot(g, slot, true);
+            } else {
+                emit_eh_tmp_push(g, call_args[j + this_off]);
+            }
+            arg_eh_pushed[j + this_off] = 1;
+        }
     }
     coerce_args_to_params(g, sp->fn_type, call_args, total);
     const char *cn = (LLVMGetTypeKind(LLVMGetReturnType(sp->fn_type)) ==
                       LLVMVoidTypeKind) ? "" : "gspec";
     LLVMValueRef result = zan_call2(g->builder, sp->fn_type, sp->fn,
                                     call_args, (unsigned)total, cn);
+    for (int j = total - 1; j >= 0; j--)
+        if (arg_eh_pushed[j]) emit_eh_tmp_pop(g);
     for (int j = 0; j < total; j++)
         if (aexprs[j])
             emit_release_owned_call_temp(g, aexprs[j], call_args[j], locals);
+    free(arg_eh_pushed);
     free(aexprs);
     free(call_args);
     return result;
@@ -1156,34 +1185,64 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
             zan_istr_t sm = sc->member.name;
             int is_idx = (sm.len == 7 && memcmp(sm.str, "IndexOf", 7) == 0);
             int is_lidx = (sm.len == 11 && memcmp(sm.str, "LastIndexOf", 11) == 0);
-            if ((is_idx || is_lidx) && expr->call.args.count == 1 &&
+            if (is_idx && (expr->call.args.count == 1 || expr->call.args.count == 2) &&
                 is_string_expr(g, sc->member.object, locals) &&
                 is_string_expr(g, expr->call.args.items[0], locals)) {
                 LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
                 LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
                 LLVMValueRef s = emit_expr(g, sc->member.object, locals);
-                LLVMValueRef sub = emit_expr(g, expr->call.args.items[0], locals);
-                LLVMValueRef res;
-                if (is_idx) {
-                    LLVMTypeRef strstr_type = LLVMFunctionType(i8ptr,
-                        (LLVMTypeRef[]){ i8ptr, i8ptr }, 2, 0);
-                    LLVMValueRef strstr_fn = get_libc_fn(g, "strstr", strstr_type);
-                    LLVMValueRef ss_args[] = { s, sub };
-                    LLVMValueRef hit = zan_call2(g->builder, strstr_type,
-                        strstr_fn, ss_args, 2, "ss");
-                    LLVMValueRef diff = zan_sub(g->builder,
-                        LLVMBuildPtrToInt(g->builder, hit, i64, "hi"),
-                        LLVMBuildPtrToInt(g->builder, s, i64, "si"), "diff");
-                    LLVMValueRef missed = zan_icmp(g->builder, LLVMIntEQ, hit,
-                        LLVMConstPointerNull(i8ptr), "missed");
-                    res = LLVMBuildSelect(g->builder, missed,
-                        LLVMConstInt(i64, (uint64_t)-1, 1), diff, "idx");
-                } else {
-                    LLVMValueRef lif = get_str_last_index_of_fn(g);
-                    LLVMValueRef li_args[] = { s, sub };
-                    res = zan_call2(g->builder, LLVMGlobalGetValueType(lif),
-                        lif, li_args, 2, "lidx");
+                LLVMValueRef search = s;
+                LLVMValueRef start = LLVMConstInt(i64, 0, 0);
+                LLVMValueRef valid_start = LLVMConstInt(LLVMInt1TypeInContext(g->ctx), 1, 0);
+                if (expr->call.args.count == 2) {
+                    start = emit_expr(g, expr->call.args.items[1], locals);
+                    if (LLVMGetTypeKind(LLVMTypeOf(start)) == LLVMIntegerTypeKind &&
+                        LLVMGetIntTypeWidth(LLVMTypeOf(start)) < 64)
+                        start = LLVMBuildSExt(g->builder, start, i64, "idx.start");
+                    LLVMTypeRef strlen_type = LLVMFunctionType(i64, &i8ptr, 1, 0);
+                    LLVMValueRef slen = zan_call2(g->builder, strlen_type,
+                        g->fn_strlen, &s, 1, "idx.slen");
+                    LLVMValueRef nonneg = zan_icmp(g->builder, LLVMIntSGE, start,
+                        LLVMConstInt(i64, 0, 0), "idx.nonneg");
+                    LLVMValueRef within = zan_icmp(g->builder, LLVMIntSLE, start,
+                        slen, "idx.within");
+                    valid_start = zan_and(g->builder, nonneg, within, "idx.valid");
+                    search = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx),
+                        s, &start, 1, "idx.search");
                 }
+                LLVMValueRef sub = emit_expr(g, expr->call.args.items[0], locals);
+                LLVMTypeRef strstr_type = LLVMFunctionType(i8ptr,
+                    (LLVMTypeRef[]){ i8ptr, i8ptr }, 2, 0);
+                LLVMValueRef strstr_fn = get_libc_fn(g, "strstr", strstr_type);
+                LLVMValueRef ss_args[] = { search, sub };
+                LLVMValueRef hit = zan_call2(g->builder, strstr_type,
+                    strstr_fn, ss_args, 2, "ss");
+                LLVMValueRef diff = zan_sub(g->builder,
+                    LLVMBuildPtrToInt(g->builder, hit, i64, "hi"),
+                    LLVMBuildPtrToInt(g->builder, s, i64, "si"), "diff");
+                LLVMValueRef missed = zan_icmp(g->builder, LLVMIntEQ, hit,
+                    LLVMConstPointerNull(i8ptr), "missed");
+                LLVMValueRef invalid_start = zan_icmp(g->builder, LLVMIntEQ,
+                    valid_start, LLVMConstInt(LLVMInt1TypeInContext(g->ctx), 0, 0),
+                    "idx.invalid");
+                LLVMValueRef failed = zan_or(g->builder, missed,
+                    invalid_start, "idx.failed");
+                LLVMValueRef res = LLVMBuildSelect(g->builder, failed,
+                    LLVMConstInt(i64, (uint64_t)-1, 1), diff, "idx");
+                emit_release_owned_call_temp(g, sc->member.object, s, locals);
+                emit_release_owned_call_temp(g, expr->call.args.items[0], sub, locals);
+                return res;
+            }
+            if (is_lidx && expr->call.args.count == 1 &&
+                is_string_expr(g, sc->member.object, locals) &&
+                is_string_expr(g, expr->call.args.items[0], locals)) {
+                LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+                LLVMValueRef s = emit_expr(g, sc->member.object, locals);
+                LLVMValueRef sub = emit_expr(g, expr->call.args.items[0], locals);
+                LLVMValueRef lif = get_str_last_index_of_fn(g);
+                LLVMValueRef li_args[] = { s, sub };
+                LLVMValueRef res = zan_call2(g->builder, LLVMGlobalGetValueType(lif),
+                    lif, li_args, 2, "lidx");
                 emit_release_owned_call_temp(g, sc->member.object, s, locals);
                 emit_release_owned_call_temp(g, expr->call.args.items[0], sub, locals);
                 return res;
@@ -3159,6 +3218,77 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
             }
         }
 
+        /* op_call operator: `obj(args)` on a class/struct instance lowers to
+         * a call of the static `op_call(self, ...)` method, exactly as binary
+         * operators lower to static op_add/op_sub/etc. The receiver may be
+         * any expression of the class type (a local, field, index or a nested
+         * call result), e.g. `py.GetAttr("math").GetAttr("floor")(2.5)`. */
+        {
+            zan_type_t *oc_ty = infer_expr_type(g, expr->call.callee, locals);
+            if (oc_ty && (oc_ty->kind == TYPE_CLASS || oc_ty->kind == TYPE_STRUCT) &&
+                oc_ty->sym) {
+                zan_istr_t op_istr = {(char *)"op_call", 7};
+                zan_symbol_t *op_sym = resolve_op_overload(g, oc_ty->sym,
+                                                           op_istr, expr, locals);
+                if (op_sym) {
+                    pack_params_args(g, expr, op_sym, locals);
+                    for (int fi = irgen_find_function(g, op_sym); fi >= 0; fi = -1) {
+                        if (g->functions[fi].sym == op_sym) {
+                            int argc = expr->call.args.count + 1;
+                            LLVMValueRef *call_args = (LLVMValueRef *)calloc(
+                                (size_t)argc, sizeof(LLVMValueRef));
+                            LLVMValueRef recv_val = emit_expr(g, expr->call.callee, locals);
+                            call_args[0] = recv_val;
+                            /* a struct receiver that arrives by value (a call
+                             * result, a field read, an element) has no address,
+                             * but `self` is passed by pointer: spill it. */
+                            if (LLVMGetTypeKind(LLVMTypeOf(recv_val)) == LLVMStructTypeKind) {
+                                LLVMValueRef rslot = emit_entry_alloca(g,
+                                    LLVMTypeOf(recv_val), "opc.recv");
+                                LLVMBuildStore(g->builder, recv_val, rslot);
+                                call_args[0] = rslot;
+                            }
+                            /* an owned receiver temp must survive a throwing
+                             * callee: keep it on the EH temp stack so a catch
+                             * can release it (longjmp skips the release below) */
+                            int recv_eh_pushed = 0;
+                            if (oc_ty->kind == TYPE_CLASS &&
+                                !expr_is_local_ident(expr->call.callee, locals) &&
+                                expr_yields_owned_rc_value(g, expr->call.callee, locals) &&
+                                LLVMGetTypeKind(LLVMTypeOf(recv_val)) == LLVMPointerTypeKind) {
+                                emit_eh_tmp_push(g, recv_val);
+                                recv_eh_pushed = 1;
+                            }
+                            for (int k = 0; k < expr->call.args.count; k++) {
+                                /* declared parameter k+1: slot 0 is the injected
+                                 * receiver `self` */
+                                call_args[k + 1] = emit_arg_typed(g,
+                                    expr->call.args.items[k],
+                                    method_param_type_at(g, op_sym, k + 1, expr,
+                                        expr->call.callee, locals), locals);
+                            }
+                            LLVMTypeRef mft = g->functions[fi].fn_type;
+                            LLVMValueRef mfn = route_generic_method(g, oc_ty,
+                                op_sym, g->functions[fi].fn, mft, &mft);
+                            const char *cn = (LLVMGetTypeKind(LLVMGetReturnType(mft)) == LLVMVoidTypeKind) ? "" : "opcall";
+                            LLVMValueRef result = emit_dispatch_call(g,
+                                oc_ty->sym, op_sym, mfn, mft, call_args, argc, cn);
+                            result = coerce_generic_result(g, result, op_sym, oc_ty);
+                            if (recv_eh_pushed) emit_eh_tmp_pop(g);
+                            emit_release_owned_call_temp(g, expr->call.callee,
+                                recv_val, locals);
+                            for (int k = 0; k < expr->call.args.count; k++) {
+                                emit_release_owned_call_temp(g, expr->call.args.items[k],
+                                    call_args[k + 1], locals);
+                            }
+                            free(call_args);
+                            return result;
+                        }
+                    }
+                }
+            }
+        }
+
                 /* user-defined method call: obj.Method(args) or Type.StaticMethod(args) */
         if (expr->call.callee && expr->call.callee->kind == AST_MEMBER_ACCESS) {
             zan_ast_node_t *callee = expr->call.callee;
@@ -3235,9 +3365,27 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                             if (g->functions[fi].sym == method_sym) {
                                 int argc = expr->call.args.count;
                                 LLVMValueRef *call_args = (LLVMValueRef *)calloc((size_t)(argc > 0 ? argc : 1), sizeof(LLVMValueRef));
+                                int *arg_eh_pushed = (int *)calloc(
+                                    (size_t)(argc > 0 ? argc : 1), sizeof(int));
                                 for (int k = 0; k < argc; k++) {
-                                    call_args[k] = emit_arg_typed(g, expr->call.args.items[k],
+                                    zan_ast_node_t *arg = expr->call.args.items[k];
+                                    call_args[k] = emit_arg_typed(g, arg,
                                         method_param_type_at(g, method_sym, k, expr, NULL, locals), locals);
+                                    zan_type_t *at = infer_expr_type(g, arg, locals);
+                                    if (at && is_rc_managed_type(at) &&
+                                        !expr_is_local_ident(arg, locals) &&
+                                        expr_yields_owned_rc_value(g, arg, locals) &&
+                                        LLVMGetTypeKind(LLVMTypeOf(call_args[k])) == LLVMPointerTypeKind) {
+                                        if (at->kind == TYPE_STRING) {
+                                            LLVMValueRef slot = emit_entry_alloca(g,
+                                                LLVMTypeOf(call_args[k]), "arg.eh");
+                                            LLVMBuildStore(g->builder, call_args[k], slot);
+                                            emit_eh_tmp_push_slot(g, slot, true);
+                                        } else {
+                                            emit_eh_tmp_push(g, call_args[k]);
+                                        }
+                                        arg_eh_pushed[k] = 1;
+                                    }
                                 }
                                 /* `Box<int>.Create(x)` names the instantiation,
                                  * so call its specialization rather than the
@@ -3271,12 +3419,16 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                                     emit_invalidate_freed_string(g,
                                         expr->call.args.items[0], locals);
                                 }
+                                for (int k = argc - 1; k >= 0; k--) {
+                                    if (arg_eh_pushed[k]) emit_eh_tmp_pop(g);
+                                }
                                 for (int k = 0; k < argc; k++) {
                                     if (!consumes_free_arg || k != 0) {
                                         emit_release_owned_call_temp(g, expr->call.args.items[k],
                                             call_args[k], locals);
                                     }
                                 }
+                                free(arg_eh_pushed);
                                 free(call_args);
                                 return result;
                             }

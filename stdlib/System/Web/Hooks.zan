@@ -1,4 +1,5 @@
 using System;
+using System.Threading;
 
 namespace System.Web;
 
@@ -56,59 +57,35 @@ class Hooks {
 /// wall-clock seconds. Single-threaded event loop => no locking needed.
 /// </summary>
 class RateLimiter {
-    List<string> keys;
-    List<int> counts;
-    List<int> windowStart;
-    int windowSeconds;
+    SharedTable table;
+    int windowMs;
 
     RateLimiter() {
-        this.keys = new List<string>();
-        this.counts = new List<int>();
-        this.windowStart = new List<int>();
-        this.windowSeconds = 1;
+        this.table = null;
+        this.windowMs = 1000;
     }
 
-    static RateLimiter Create(int windowSeconds) {
-        RateLimiter rl = new RateLimiter();
-        if (windowSeconds > 0) { rl.windowSeconds = windowSeconds; }
-        return rl;
+    static RateLimiter Create(string name, int windowMs) {
+        RateLimiter limiter = new RateLimiter();
+        if (windowMs > 0) { limiter.windowMs = windowMs; }
+        SharedTable table = new SharedTable(name, 65536);
+        table.KeySize(192);
+        table.ColumnInt("count");
+        table.ColumnInt("window_start");
+        if (!table.Create()) { table = SharedTable.Open(name); }
+        if (table.IsOpen()) { limiter.table = table; }
+        return limiter;
     }
 
-    /// <summary>Counts one hit on `key`; false when `limit` is exceeded
-    /// inside the current window. limit <= 0 means unlimited.</summary>
-    bool Allow(string key, int limit, int nowSeconds) {
+    bool Allow(string key, int limit) {
         if (limit <= 0) { return true; }
-        int i = this.IndexOf(key);
-        if (i < 0) {
-            this.keys.Add(key);
-            this.counts.Add(1);
-            this.windowStart.Add(nowSeconds);
-            return true;
-        }
-        if (nowSeconds - this.windowStart[i] >= this.windowSeconds) {
-            this.windowStart[i] = nowSeconds;
-            this.counts[i] = 1;
-            return true;
-        }
-        if (this.counts[i] >= limit) { return false; }
-        this.counts[i] = this.counts[i] + 1;
-        return true;
+        if (this.table == null) { return false; }
+        return this.table.RateAllow(key, -1, this.windowMs, limit);
     }
 
-    /// <summary>Current hit count for a key (for /api/status).</summary>
     int CountOf(string key) {
-        int i = this.IndexOf(key);
-        if (i < 0) { return 0; }
-        return this.counts[i];
-    }
-
-    int IndexOf(string key) {
-        int i = 0;
-        while (i < this.keys.Count) {
-            if (this.keys[i] == key) { return i; }
-            i = i + 1;
-        }
-        return -1;
+        if (this.table == null) { return 0; }
+        return (int)this.table.GetInt(key, "count");
     }
 }
 

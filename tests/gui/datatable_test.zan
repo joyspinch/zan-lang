@@ -539,6 +539,49 @@ class Program {
         Console.WriteLine(psrc.CellText(firstData, 1) == "");
         Console.WriteLine(pst.EditRow() == firstData);
 
+        List<DataRow> repeatRows = new List<DataRow>();
+        int repeatIndex = 0;
+        while (repeatIndex < 20000) {
+            string repeatValue = "delta";
+            int repeatKind = repeatIndex % 4;
+            if (repeatKind == 1) { repeatValue = "alpha"; }
+            else if (repeatKind == 2) { repeatValue = "charlie"; }
+            else if (repeatKind == 3) { repeatValue = "bravo"; }
+            repeatRows.Add(Row(repeatValue, "", ""));
+            repeatIndex = repeatIndex + 1;
+        }
+        DataSource repeatSrc = RowListSource.Create(repeatRows);
+        List<string> repeatAll = DataTable.Distinct(repeatSrc, 0);
+        Console.WriteLine(repeatAll.Count);
+        Console.WriteLine(repeatAll[0] + "," + repeatAll[1] + "," + repeatAll[2] + "," + repeatAll[3]);
+        DataTableState repeatState = DataTableState.Create();
+        DataTable.EnsureInit(repeatState, cols, repeatSrc);
+        repeatState.dirty = true;
+        DataTable.Recompute(repeatState, cols, repeatSrc);
+        List<string> repeatFiltered = DataTable.DistinctFiltered(repeatState, repeatSrc, 0);
+        Console.WriteLine(repeatFiltered.Count);
+        Console.WriteLine(repeatFiltered[0] + "," + repeatFiltered[1] + "," + repeatFiltered[2] + "," + repeatFiltered[3]);
+
+        List<DataRow> uniqueRows = new List<DataRow>();
+        int uniqueIndex = 0;
+        while (uniqueIndex < 6000) {
+            uniqueRows.Add(Row("unique-" + Convert.ToString(uniqueIndex), "", ""));
+            uniqueIndex = uniqueIndex + 1;
+        }
+        List<string> uniqueVals = DataTable.Distinct(RowListSource.Create(uniqueRows), 0);
+        Console.WriteLine(uniqueVals.Count);
+        Console.WriteLine(uniqueVals[0] + "," + uniqueVals[uniqueVals.Count - 1]);
+
+        List<DataRow> substringRows = new List<DataRow>();
+        string substringValue = "same";
+        string substringLeft = "[" + substringValue + "]";
+        string substringRight = "{" + substringValue + "}";
+        substringRows.Add(Row(substringLeft.Substring(1, substringValue.Length), "", ""));
+        substringRows.Add(Row(substringRight.Substring(1, substringValue.Length), "", ""));
+        List<string> substringVals = DataTable.Distinct(RowListSource.Create(substringRows), 0);
+        Console.WriteLine(substringVals.Count);
+        Console.WriteLine(substringVals[0] == substringValue);
+
         Program.EditorTests();
         Program.StylerTests();
         Program.FieldTests();
@@ -1589,6 +1632,94 @@ class Program {
         Console.WriteLine(gpst.groupCols[0] == 0 && gpst.groupCols[1] == 1);
         Console.WriteLine(DataTable.GroupDepth(gpst, 1) == 1);
         Console.WriteLine(DataTable.GroupDepth(gpst, 2) == 0 - 1);
+
+        // ---- server-side / infinite source ----
+        // 500 rows behind a 25-row block source with an unknown total: the
+        // grid starts empty, grows block by block, and pins the total the
+        // moment a short block announces the end.
+        List<DataRow> srows = new List<DataRow>();
+        int si2 = 0;
+        while (si2 < 500) {
+            srows.Add(Row("s" + Convert.ToString(si2), Convert.ToString(si2), ""));
+            si2 = si2 + 1;
+        }
+        TestServerSource ss = TestServerSource.CreateWith(srows, 25);
+        Console.WriteLine(ss.RowCount() == 0);            // nothing fetched yet
+        Console.WriteLine(ss.HasMore());                  // unknown total -> more
+        Console.WriteLine(ss.CellReady(0, 0) == false);   // unfetched row
+
+        // first block on demand
+        ss.RequestBlock(0);
+        Console.WriteLine(ss.Poll());                     // folded in
+        Console.WriteLine(ss.RowCount() == 25);
+        Console.WriteLine(ss.CellReady(0, 0));
+        Console.WriteLine(ss.CellText(0, 0) == "s0");
+        Console.WriteLine(ss.CellText(24, 0) == "s24");
+        Console.WriteLine(ss.Poll() == false);            // idle afterwards
+
+        // a request into a partially loaded block fetches the rest of it
+        // (scroll-to-bottom landing mid-block)
+        ss.RequestBlock(30);
+        Console.WriteLine(ss.Poll());
+        Console.WriteLine(ss.RowCount() == 50);
+
+        // already-fetched blocks are not re-fetched
+        int callsBefore = TestServerSource.fetchCalls;
+        ss.RequestBlock(3);
+        Console.WriteLine(ss.Poll() == false);
+        Console.WriteLine(TestServerSource.fetchCalls == callsBefore);
+
+        // scroll-to-bottom pulls the next block until the server says "no more"
+        int guard = 0;
+        while (ss.HasMore() && guard < 1000) {
+            ss.RequestNextBlock();
+            ss.Poll();
+            guard = guard + 1;
+        }
+        Console.WriteLine(ss.RowCount() == 500);          // all rows streamed
+        Console.WriteLine(ss.HasMore() == false);         // short block pinned end
+        Console.WriteLine(ss.CellText(499, 0) == "s499");
+        Console.WriteLine(ss.Poll() == false);            // idle
+
+        // ---- server mode through the grid pipeline ----
+        // ServerControlled skips local sorting and filtering: the grid renders
+        // whatever the server hands out, so a local "sort" or a local filter
+        // rule changes nothing.
+        List<DataColumn> scols = new List<DataColumn>();
+        scols.Add(DataColumn.Create("name", 80));
+        scols.Add(DataColumn.Numeric("val", 80));
+        DataTableState sst = DataTableState.Create();
+        DataTable.EnsureInit(sst, scols, ss);
+        DataTable.SortBy(sst, 1, 1);
+        sst.dirty = true;
+        DataTable.Recompute(sst, scols, ss);
+        Console.WriteLine(sst.order.Count == 500);        // full known total
+        Console.WriteLine(sst.order[0] == 0 && sst.order[499] == 499);
+        sst.filters[1].cmpMode = 1;                       // "> 100" locally
+        sst.filters[1].cmpA = "100";
+        sst.dirty = true;
+        DataTable.Recompute(sst, scols, ss);
+        Console.WriteLine(sst.order.Count == 500);        // filter ignored
+
+        // ---- known-total mode: exact scrollbar from the start ----
+        TestServerSource ks = TestServerSource.CreateWith(srows, 100);
+        ks.SetKnownTotal(500);
+        Console.WriteLine(ks.RowCount() == 500);          // total known up front
+        Console.WriteLine(ks.HasMore());                  // but nothing fetched
+        ks.RequestBlock(0);
+        Console.WriteLine(ks.Poll());
+        Console.WriteLine(ks.RowCount() == 500);          // total unchanged
+        Console.WriteLine(ks.CellReady(99, 0));
+        Console.WriteLine(ks.CellReady(499, 0) == false); // far rows unfetched
+        int kguard = 0;
+        while (ks.HasMore() && kguard < 1000) {
+            ks.RequestNextBlock();
+            ks.Poll();
+            kguard = kguard + 1;
+        }
+        Console.WriteLine(ks.HasMore() == false);
+        Console.WriteLine(ks.CellReady(499, 0));
+        Console.WriteLine(ks.CellText(499, 0) == "s499");
     }
 }
 
@@ -1639,4 +1770,31 @@ class PerRowDetail : DetailProvider {
 /// A provider that asks for a zero-high band, to prove the grid clamps it.
 class ZeroDetail : DetailProvider {
     override int Slots(DataSource src, int row) { return 0; }
+}
+
+/// A ServerDataSource that serves rows from a static in-memory list, counting
+/// fetch calls so the tests can prove block coalescing and cache hits.
+class TestServerSource : ServerDataSource {
+    static List<DataRow> serverRows;
+    static int fetchCalls;
+
+    static TestServerSource CreateWith(List<DataRow> rows, int blockSize) {
+        TestServerSource s = new TestServerSource();
+        s.Setup(blockSize);
+        TestServerSource.serverRows = rows;
+        TestServerSource.fetchCalls = 0;
+        return s;
+    }
+
+    override int FillBlock(int start, int count, List<DataRow> dst) {
+        TestServerSource.fetchCalls = TestServerSource.fetchCalls + 1;
+        int n = 0;
+        int i = start;
+        while (i < TestServerSource.serverRows.Count && n < count) {
+            dst.Add(TestServerSource.serverRows[i]);
+            i = i + 1;
+            n = n + 1;
+        }
+        return n;
+    }
 }

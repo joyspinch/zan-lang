@@ -1,0 +1,104 @@
+using System;
+using System.Data;
+
+namespace System.Data.Redis;
+
+class RedisPool {
+    string host;
+    int port;
+    int connectTimeoutMs;
+    PoolCore<RedisClient> core;
+
+    RedisPool(string host, int port, int maxSize, int connectTimeoutMs) {
+        this.host = host;
+        this.port = port;
+        this.connectTimeoutMs = connectTimeoutMs;
+        this.core = PoolCore<RedisClient>.Create(maxSize);
+    }
+
+    static RedisPool Create(string host, int port, int maxSize) {
+        return new RedisPool(host, port, maxSize, 3000);
+    }
+
+    static RedisPool Create(string host, int port, int maxSize, int connectTimeoutMs) {
+        return new RedisPool(host, port, maxSize, connectTimeoutMs);
+    }
+
+    async RedisClient OpenOne() {
+        RedisClient client = await RedisClient.ConnectAsync(
+            this.host, this.port, this.connectTimeoutMs);
+        if (client == null) { return null; }
+        try {
+            if (!await client.PingAsync()) {
+                client.Close();
+                return null;
+            }
+            return client;
+        } catch {
+            client.Close();
+            return null;
+        }
+    }
+
+    async RedisClient AcquireAsync() {{
+        while (true) {{
+            if (this.core.IsClosed()) {{ return null; }}
+            RedisClient pooled = this.core.TakeIdle();
+            while (pooled != null) {{
+                if (pooled.IsConnected()) {{ return pooled; }}
+                this.core.Drop();
+                pooled = this.core.TakeIdle();
+            }}
+            if (this.core.TryReserve()) {{
+                RedisClient opened = null;
+                try {{
+                    opened = await this.OpenOne();
+                }} catch {{
+                    this.core.UndoReserve();
+                    return null;
+                }}
+                if (opened == null || !opened.IsConnected()) {{
+                    this.core.UndoReserve();
+                    return opened;
+                }}
+                if (this.core.IsClosed()) {{
+                    opened.Close();
+                    this.core.UndoReserve();
+                    return null;
+                }}
+                return opened;
+            }}
+            this.core.EnterWait();
+            await this.core.Waiter().Wait();
+            this.core.LeaveWait();
+        }}
+        return null;
+    }}
+
+    void Release(RedisClient client) {{
+        if (client == null) {{ return; }}
+        if (this.core.IsClosed() || !client.IsConnected()) {{
+            if (client.IsConnected()) {{ client.Close(); }}
+            this.core.Drop();
+            return;
+        }}
+        this.core.Pool(client);
+    }}
+
+    int IdleCount() {{ return this.core.IdleCount(); }}
+    int LiveCount() {{ return this.core.LiveCount(); }}
+    int WaitingCount() { return this.core.WaitingCount(); }
+    int MaxSize() { return this.core.MaxSize(); }
+    bool IsClosed() { return this.core.IsClosed(); }
+
+    void Close() {{
+        this.core.MarkClosed();
+        RedisClient client = this.core.TakeIdle();
+        while (client != null) {{
+            client.Close();
+            this.core.Drop();
+            client = this.core.TakeIdle();
+        }}
+        this.core.WakeAll();
+    }}
+}

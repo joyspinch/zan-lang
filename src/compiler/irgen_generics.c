@@ -289,11 +289,29 @@ static int expr_member_of_owned_temp(zan_irgen_t *g, zan_ast_node_t *e,
 static int expr_yields_owned_rc_value(zan_irgen_t *g, zan_ast_node_t *e,
                                       local_scope_t *locals) {
     if (!e) return 0;
-    if (e->kind == AST_INDEX && expr_index_of_owned_temp(g, e, locals)) return 1;
+    if (e->kind == AST_INDEX) {
+        /* A user-defined op_index lowers to a method call, so an RC-managed
+         * return is owned (+1) exactly like an AST_CALL result. This applies
+         * even when the indexed receiver is a local; treating it as a borrowed
+         * container element leaked every PyObject returned by PyObject.op_index. */
+        zan_type_t *ot = infer_expr_type(g, e->index.object, locals);
+        if (ot && (ot->kind == TYPE_CLASS || ot->kind == TYPE_STRUCT) && ot->sym) {
+            zan_istr_t op_istr = {(char *)"op_index", 8};
+            if (get_method_sym(ot->sym, op_istr)) return 1;
+        }
+        if (expr_index_of_owned_temp(g, e, locals)) return 1;
+    }
     if (e->kind == AST_MEMBER_ACCESS && expr_member_of_owned_temp(g, e, locals))
         return 1;
     if (e->kind == AST_NEW_EXPR || e->kind == AST_CALL ||
         e->kind == AST_QUERY_EXPR) return 1;
+    /* A conditional is owned when either branch yields an owned value. The IR
+     * emitter retains the borrowed branch in that mixed-ownership case so the
+     * PHI has one consistent (+1) contract regardless of the path taken. */
+    if (e->kind == AST_CONDITIONAL) {
+        return expr_yields_owned_rc_value(g, e->conditional.then_expr, locals) ||
+               expr_yields_owned_rc_value(g, e->conditional.else_expr, locals);
+    }
     /* An awaited async call yields a freshly owned (+1) reference: the callee's
      * async `return` always retains the result before completing (see the
      * AST_RETURN_STMT async path), so the awaiter receives +1 and must NOT

@@ -1,0 +1,153 @@
+using System;
+
+namespace System.Net;
+
+/// <summary>Strongly typed result status returned by Ping.</summary>
+enum PingStatus {
+    Success,
+    TimedOut,
+    DestinationUnreachable,
+    PacketTooBig,
+    BadRequest,
+    Error
+}
+
+/// <summary>One ICMP echo result.</summary>
+class PingReply {
+    public PingStatus status;
+    public string address;
+    public int roundtripTime;
+    public int dataSize;
+
+    public bool IsSuccess() { return status == PingStatus.Success; }
+
+    /// <summary>Releases reply-owned text eagerly.</summary>
+    public void Dispose() { address = null; }
+}
+
+/// <summary>
+/// Windows ICMP echo client backed directly by iphlpapi. No command shell or
+/// external ping executable is involved.
+/// </summary>
+class Ping {
+    /// <summary>Sends an IPv4 echo request with a 4 second timeout.</summary>
+    static PingReply Send(string address) {
+        return Ping.Send(address, 4000);
+    }
+
+    /// <summary>Sends an IPv4 echo request and returns its typed reply.</summary>
+    static PingReply Send(string address, int timeoutMs) {
+        #if WINDOWS
+        if (timeoutMs < 0) { timeoutMs = 0; }
+        int destination = Ping.ParseIPv4(address);
+        if (destination == -1 && address != "255.255.255.255") {
+            throw new ArgumentException("Ping address must be an IPv4 address");
+        }
+
+        PingReply result = new PingReply();
+        result.status = PingStatus.Error;
+        result.address = address;
+        result.roundtripTime = 0;
+        result.dataSize = 0;
+
+        nint handle = Ping.IcmpCreateFile();
+        if (handle == (nint)-1 || handle == 0) { return result; }
+
+        string payload = "zan-ping";
+        nint request = NativeMemory.Alloc(payload.Length);
+        NativeMemory.PutString(request, 0, payload, payload.Length);
+        // ICMP_ECHO_REPLY is 40 bytes on x64. Leave room for the returned data
+        // and the API's documented additional 8-byte error payload.
+        int replySize = 40 + payload.Length + 8;
+        nint reply = NativeMemory.Alloc(replySize);
+        int count = Ping.IcmpSendEcho(handle, destination, request,
+            (ushort)payload.Length, 0, reply, replySize, timeoutMs);
+        if (count > 0) {
+            int nativeStatus = new Span<int>(reply + 4, 1)[0];
+            result.status = Ping.MapStatus(nativeStatus);
+            result.roundtripTime = new Span<int>(reply + 8, 1)[0];
+            result.dataSize = (int)new Span<ushort>(reply + 12, 1)[0];
+            result.address = Ping.FormatIPv4(new Span<int>(reply, 1)[0]);
+        }
+        NativeMemory.Free(reply);
+        NativeMemory.Free(request);
+        Ping.IcmpCloseHandle(handle);
+        return result;
+        #else
+        throw new PlatformNotSupportedException(
+            "System.Net.Ping is only supported on Windows");
+        #endif
+    }
+
+    #if WINDOWS
+    [DllImport("iphlpapi", EntryPoint = "IcmpCreateFile")]
+    static extern nint IcmpCreateFile();
+
+    [DllImport("iphlpapi", EntryPoint = "IcmpSendEcho")]
+    static extern int IcmpSendEcho(nint handle, int destination, nint request,
+                                   ushort requestSize, nint options, nint reply,
+                                   int replySize, int timeoutMs);
+
+    [DllImport("iphlpapi", EntryPoint = "IcmpCloseHandle")]
+    static extern int IcmpCloseHandle(nint handle);
+
+    static PingStatus MapStatus(int status) {
+        if (status == 0) { return PingStatus.Success; }
+        if (status == 11010) { return PingStatus.TimedOut; }
+        if (status == 11009) { return PingStatus.PacketTooBig; }
+        if (status == 11004 || status == 11005 || status == 11002
+            || status == 11003) { return PingStatus.DestinationUnreachable; }
+        if (status == 11006 || status == 11007 || status == 11008
+            || status == 11015) { return PingStatus.BadRequest; }
+        return PingStatus.Error;
+    }
+
+    // IPAddr is the four network-order bytes interpreted as a little-endian
+    // DWORD by Windows (127.0.0.1 therefore becomes 0x0100007f).
+    static int ParseIPv4(string text) {
+        int packed = 0;
+        int part = 0;
+        int digits = 0;
+        int octet = 0;
+        int i = 0;
+        while (i <= text.Length) {
+            bool atEnd = i == text.Length;
+            string ch = atEnd ? "." : text.Substring(i, 1);
+            if (ch == ".") {
+                if (digits == 0 || octet > 255 || part > 3) { return -1; }
+                packed = packed | (octet << (part * 8));
+                part = part + 1;
+                octet = 0;
+                digits = 0;
+            } else {
+                if (ch < "0" || ch > "9" || digits >= 3) { return -1; }
+                octet = octet * 10 + Ping.Digit(ch);
+                digits = digits + 1;
+            }
+            i = i + 1;
+        }
+        if (part != 4) { return -1; }
+        return packed;
+    }
+
+    static int Digit(string ch) {
+        if (ch == "1") { return 1; }
+        if (ch == "2") { return 2; }
+        if (ch == "3") { return 3; }
+        if (ch == "4") { return 4; }
+        if (ch == "5") { return 5; }
+        if (ch == "6") { return 6; }
+        if (ch == "7") { return 7; }
+        if (ch == "8") { return 8; }
+        if (ch == "9") { return 9; }
+        return 0;
+    }
+
+    static string FormatIPv4(int packed) {
+        return Convert.ToString(packed & 255) + "."
+            + Convert.ToString((packed >> 8) & 255) + "."
+            + Convert.ToString((packed >> 16) & 255) + "."
+            + Convert.ToString((packed >> 24) & 255);
+    }
+    #endif
+}

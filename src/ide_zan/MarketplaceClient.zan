@@ -1,0 +1,146 @@
+using System;
+using System.IO;
+using System.Net.Http.Client;
+using System.Net.Sockets;
+
+class MarketplaceClient {
+    static string host;
+    static int port;
+    static bool tls;
+    static string path;
+    static string savePath;
+    static int operation;
+    static SseSink sink;
+    static SseSink workerSink;
+
+    static int FindByte(string s, int b, int from) {
+        int i = from;
+        while (i < s.Length) {
+            if ((s[i] & 255) == b) { return i; }
+            i = i + 1;
+        }
+        return 0 - 1;
+    }
+
+    static int ParseInt(string s, int fallback) {
+        int v = 0;
+        int i = 0;
+        bool any = false;
+        while (i < s.Length) {
+            int c = s[i] & 255;
+            if (c < 48 || c > 57) { return fallback; }
+            v = v * 10 + c - 48;
+            any = true;
+            i = i + 1;
+        }
+        if (!any) { return fallback; }
+        return v;
+    }
+
+    static void SetUrl(string url) {
+        string u = url;
+        MarketplaceClient.tls = true;
+        int defaultPort = 443;
+        if (u.Length >= 8 && u.Substring(0, 8) == "https://") {
+            u = u.Substring(8, u.Length - 8);
+        } else if (u.Length >= 7 && u.Substring(0, 7) == "http://") {
+            MarketplaceClient.tls = false;
+            defaultPort = 80;
+            u = u.Substring(7, u.Length - 7);
+        }
+        int slash = FindByte(u, 47, 0);
+        string hostPort = u;
+        MarketplaceClient.path = "/";
+        if (slash >= 0) {
+            hostPort = u.Substring(0, slash);
+            MarketplaceClient.path = u.Substring(slash, u.Length - slash);
+        }
+        MarketplaceClient.host = hostPort;
+        MarketplaceClient.port = defaultPort;
+        int colon = FindByte(hostPort, 58, 0);
+        if (colon >= 0) {
+            MarketplaceClient.host = hostPort.Substring(0, colon);
+            MarketplaceClient.port = ParseInt(hostPort.Substring(colon + 1,
+                hostPort.Length - colon - 1), defaultPort);
+        }
+    }
+
+    static string BaseUrl() {
+        string u = ProcessHost.Env("ZAN_MALL_URL");
+        if (u == "") { return "http://127.0.0.1:8080"; }
+        while (u.Length > 0 && u.Substring(u.Length - 1, 1) == "/") {
+            u = u.Substring(0, u.Length - 1);
+        }
+        return u;
+    }
+
+    static void Worker() {
+        Socket.Initialize();
+        string result = "";
+        try {
+            HttpClient cli;
+            if (MarketplaceClient.tls) {
+                cli = HttpClient.CreateHttps(MarketplaceClient.host,
+                    MarketplaceClient.port);
+            } else {
+                cli = HttpClient.Create(MarketplaceClient.host,
+                    MarketplaceClient.port);
+            }
+            cli.SetTimeout(15000);
+            result = await cli.GetAsync(MarketplaceClient.path);
+            if (MarketplaceClient.operation == 3 && result != "") {
+                File.WriteAllText(MarketplaceClient.savePath, result);
+                result = "saved:" + MarketplaceClient.savePath;
+            }
+        } catch (Exception ex) {
+            MarketplaceClient.workerSink.Publish("err:" + ex.Message);
+            return;
+        }
+        if (result == "") {
+            MarketplaceClient.workerSink.Publish("err:empty response");
+            return;
+        }
+        MarketplaceClient.workerSink.Publish("ok:" + result);
+    }
+
+    static string Start(int op, string suffix, string targetPath) {
+        if (MarketplaceClient.sink != null
+            && MarketplaceClient.sink.Done() == "") {
+            return "request already running";
+        }
+        MarketplaceClient.operation = op;
+        MarketplaceClient.savePath = targetPath;
+        MarketplaceClient.SetUrl(MarketplaceClient.BaseUrl() + suffix);
+        SseSink s = SseSink.ToMemory();
+        MarketplaceClient.sink = s;
+        MarketplaceClient.workerSink = s;
+        if (!Thread.Start(MarketplaceClient.Worker)) {
+            MarketplaceClient.sink = null;
+            return "could not start marketplace request";
+        }
+        return "";
+    }
+
+    static string StartCatalog() {
+        return MarketplaceClient.Start(1, "/api/mall/catalog", "");
+    }
+
+    static string StartProduct(string id) {
+        return MarketplaceClient.Start(2, "/api/mall/product?id=" + id, "");
+    }
+
+    static string StartDownload(string artifactUrl, string targetPath) {
+        string path = artifactUrl;
+        if (path.Length == 0 || path.Substring(0, 1) != "/") { path = "/" + path; }
+        return MarketplaceClient.Start(3, path, targetPath);
+    }
+
+    static string Done() {
+        if (MarketplaceClient.sink == null) { return ""; }
+        return MarketplaceClient.sink.Done();
+    }
+
+    static void Clear() {
+        MarketplaceClient.sink = null;
+    }
+}

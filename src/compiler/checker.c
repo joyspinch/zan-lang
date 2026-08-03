@@ -32,6 +32,24 @@ static void no_runtime_reject(zan_checker_t *c, zan_loc_t loc, const char *what)
                   "%s is not allowed in a [NoRuntime] method", what);
 }
 
+/* Look up a named method (e.g. an operator like "op_call"/"op_index") on a
+ * class/struct symbol, walking the base chain. Used by the checker to type
+ * operator-overloaded call/index expressions. */
+static zan_symbol_t *checker_find_method(zan_symbol_t *type_sym, zan_istr_t name) {
+    while (type_sym) {
+        for (int i = 0; i < type_sym->member_count; i++) {
+            zan_symbol_t *m = type_sym->members[i];
+            if (m && m->kind == SYM_METHOD &&
+                m->name.len == name.len &&
+                memcmp(m->name.str, name.str, (size_t)name.len) == 0)
+                return m;
+        }
+        type_sym = (type_sym->type && type_sym->type->base_type)
+            ? type_sym->type->base_type->sym : NULL;
+    }
+    return NULL;
+}
+
 /* ---- generic constraint checking ---- */
 
 /* True when `arg` is, implements, or derives from `cons`. */
@@ -266,6 +284,19 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
                 ? callee_type->delegate_ret_type
                 : c->binder->type_void;
         }
+        /* op_call operator: `<class instance>(args)` has the op_call method's
+         * declared return type. */
+        if (callee_type && (callee_type->kind == TYPE_CLASS ||
+                            callee_type->kind == TYPE_STRUCT) && callee_type->sym) {
+            zan_istr_t op_name = {(char *)"op_call", 7};
+            zan_symbol_t *op = checker_find_method(callee_type->sym, op_name);
+            if (op && op->decl && op->decl->kind == AST_METHOD_DECL &&
+                op->decl->method_decl.return_type) {
+                return zan_binder_resolve_type(c->binder,
+                    op->decl->method_decl.return_type);
+            }
+            if (op && op->type) return op->type;
+        }
         /* Resolve the callee's return type when the function/method symbol
          * is in scope. Fall back to type_error (NOT void) for unresolved
          * calls so that using a call result in an expression — e.g. the
@@ -294,6 +325,37 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
 
     case AST_MEMBER_ACCESS: {
         zan_type_t *obj_type = zan_checker_check_expr(c, expr->member.object);
+        /* Static enum member access: EnumType.Member must be a declared member.
+         * A miss used to fall through to irgen, which silently folded the
+         * access to the constant 0 (masking stale references, e.g. a removed
+         * enum member). A member access on an enum *value* (`t.ToString()`) is
+         * a compiler-lowered method call resolved in irgen, so it is not
+         * validated here. */
+        if (obj_type && obj_type->kind == TYPE_ENUM && obj_type->sym &&
+            expr->member.object->kind == AST_IDENTIFIER) {
+            zan_symbol_t *os = zan_binder_lookup(c->binder,
+                                                 expr->member.object->ident.name);
+            if (os && os->kind == SYM_ENUM) {
+                int ei;
+                for (ei = 0; ei < obj_type->sym->member_count; ei++) {
+                    zan_symbol_t *m = obj_type->sym->members[ei];
+                    if (m->kind == SYM_ENUM_MEMBER &&
+                        m->name.len == expr->member.name.len &&
+                        memcmp(m->name.str, expr->member.name.str,
+                               (size_t)expr->member.name.len) == 0)
+                        break;
+                }
+                if (ei == obj_type->sym->member_count) {
+                    zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
+                                  "enum type '%.*s' has no member '%.*s'",
+                                  (int)obj_type->sym->name.len,
+                                  obj_type->sym->name.str,
+                                  (int)expr->member.name.len,
+                                  expr->member.name.str);
+                    return c->binder->type_error;
+                }
+            }
+        }
         /* resolve field/method on known struct/class types */
         if (obj_type && obj_type->sym) {
             for (int i = 0; i < obj_type->sym->member_count; i++) {
@@ -310,6 +372,18 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
     case AST_INDEX: {
         zan_type_t *obj = zan_checker_check_expr(c, expr->index.object);
         zan_checker_check_expr(c, expr->index.index);
+        /* op_index operator: `<class instance>[i]` has the op_index method's
+         * declared return type. */
+        if ((obj->kind == TYPE_CLASS || obj->kind == TYPE_STRUCT) && obj->sym) {
+            zan_istr_t op_name = {(char *)"op_index", 8};
+            zan_symbol_t *op = checker_find_method(obj->sym, op_name);
+            if (op && op->decl && op->decl->kind == AST_METHOD_DECL &&
+                op->decl->method_decl.return_type) {
+                return zan_binder_resolve_type(c->binder,
+                    op->decl->method_decl.return_type);
+            }
+            if (op && op->type) return op->type;
+        }
         if (obj->kind == TYPE_ARRAY && obj->element_type) {
             return obj->element_type;
         }
