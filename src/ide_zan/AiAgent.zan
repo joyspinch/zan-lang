@@ -213,14 +213,16 @@ class AiAgent {
                                     v.Str("old", ""), v.Str("new", ""));
         }
         if (tool == "build" || tool == "run" || tool == "ui_check"
-            || tool == "plan") {
+            || tool == "plan" || tool == "ui_tree" || tool == "diff"
+            || tool == "run_errors") {
             // These need the IDE's own state / async machinery, so the panel
             // drives them directly; they never reach here.
             return "error: '" + tool + "' is run by the IDE, not this dispatch.";
         }
         return "error: unknown tool '" + tool + "'. Available: read_file,"
             + " list_dir, grep, repo_map, stdlib_read, stdlib_grep, plan,"
-            + " write_file, edit_file, build, run, ui_check.";
+            + " write_file, edit_file, build, run, ui_check, ui_tree, diff,"
+            + " run_errors.";
     }
 
     /// Fills `outSteps` from a `plan` tool call's `items` array, replacing
@@ -345,13 +347,19 @@ class AiAgent {
         if (tool == "build") { return "build"; }
         if (tool == "run") { return "run"; }
         if (tool == "ui_check") { return "ui_check"; }
+        if (tool == "ui_tree") { return "ui_tree"; }
+        if (tool == "diff") { return "diff"; }
+        if (tool == "run_errors") { return "run_errors"; }
         return tool + " " + v.Str("path", "");
     }
 
     /// Makes a model-supplied UiDriver script safe to run unattended: appends a
     /// hit-region dump and a `quit` when they are missing, so the driven window
     /// always closes (never hanging the check) and geometry is always captured.
-    static string NormalizeUiScript(string script) {
+    ///
+    /// `withTheme` (ui_tree) also appends the skin's style-token dump, which is
+    /// the half that lets the caller judge style rather than only position.
+    static string NormalizeUiScript(string script, bool withTheme) {
         StringBuilder sb = new StringBuilder();
         sb.Append(script);
         if (script.Length == 0 || script.Substring(script.Length - 1, 1) != "\n") {
@@ -359,6 +367,9 @@ class AiAgent {
         }
         if (ZanIDE.IndexOfStr(script, "dump hitregions") < 0) {
             sb.Append("wait 200\ndump hitregions regions.json\n");
+        }
+        if (withTheme && ZanIDE.IndexOfStr(script, "dump theme") < 0) {
+            sb.Append("dump theme theme.json\n");
         }
         if (ZanIDE.IndexOfStr(script, "quit") < 0) {
             sb.Append("wait 200\nquit\n");
@@ -370,13 +381,24 @@ class AiAgent {
     /// assertion/step log first, then the hit-region geometry it dumped, so the
     /// model reasons over real coordinates rather than a screenshot it cannot
     /// see. Either part may be empty when the run produced nothing.
-    static string UiResult(string resultsLog, string regionsJson, bool timedOut) {
+    static string UiResult(string resultsLog, string regionsJson,
+            bool timedOut) {
+        return AiAgent.UiResultOf("ui_check", resultsLog, regionsJson, "",
+            timedOut);
+    }
+
+    /// As UiResult, for a named tool and with the optional style-token dump
+    /// appended (ui_tree). Geometry answers "where is it", the tokens answer
+    /// "what was it supposed to look like" -- a caller needs both to call a
+    /// border extra or a label off-centre.
+    static string UiResultOf(string toolName, string resultsLog,
+            string regionsJson, string themeJson, bool timedOut) {
         StringBuilder sb = new StringBuilder();
         if (timedOut) {
-            sb.Append("ui_check TIMED OUT (the window did not close in time);"
-                + " partial output below.\n");
+            sb.Append(toolName + " TIMED OUT (the window did not close in"
+                + " time); partial output below.\n");
         } else {
-            sb.Append("ui_check finished.\n");
+            sb.Append(toolName + " finished.\n");
         }
         if (resultsLog != "") {
             string rl = resultsLog;
@@ -396,6 +418,14 @@ class AiAgent {
                 rj = rj.Substring(0, 6000) + " ...(truncated)";
             }
             sb.Append("--- hit regions (x,y,w,h per widget) ---\n" + rj + "\n");
+        }
+        if (themeJson != "") {
+            string tj = themeJson;
+            if (tj.Length > 4000) {
+                tj = tj.Substring(0, 4000) + " ...(truncated)";
+            }
+            sb.Append("--- skin style tokens (scale is x1000) ---\n"
+                + tj + "\n");
         }
         return sb.ToString();
     }
@@ -728,6 +758,22 @@ class AiAgent {
             + " <text>`, `log <text>`, `quit`. It auto-dumps regions and quits"
             + " if you omit them. This is how you VERIFY a UI fix: read the"
             + " widget x/y/w/h back and check the real numbers.\n"
+            + "- ui_tree {}: build, launch and send you BOTH the widget"
+            + " geometry (x/y/w/h/type per hit region) AND the active skin's"
+            + " resolved style tokens (text/bg/border colours, radii, border"
+            + " width, font sizes, control heights, paddings, gaps, and the"
+            + " glass/gradient/neu/brutal skin flags). The GUI renders"
+            + " immediate-mode, so there is no retained widget tree to walk:"
+            + " this pairing IS the tree. Use it to judge style, not just"
+            + " position -- e.g. compare a label's rect against the control"
+            + " height and font size to check vertical centring, or against"
+            + " borderWidth to tell a real extra frame from the skin's own.\n"
+            + "- diff {}: the project's uncommitted changes as a unified diff."
+            + " Read this before reviewing or auditing a change instead of"
+            + " re-reading whole files.\n"
+            + "- run_errors {}: the last run's exit code, stderr and crash"
+            + " backtrace, structured. Call it after a run/ui_check that"
+            + " failed rather than guessing why.\n"
             + "Paths are relative to the project root; absolute paths and '..'"
             + " are refused. The IDE runs the tool and sends you the result,"
             + " then you continue. One tool call per reply, at most "

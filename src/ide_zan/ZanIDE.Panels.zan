@@ -844,6 +844,72 @@ partial class ZanIDE {
     // Git panel helpers (right panel "Git" tab)
     // ================================================================
 
+    /// The project's uncommitted changes as a unified diff, for the `diff`
+    /// tool. Runs synchronously: unlike `status` on a huge repository, a diff of
+    /// the working tree is small and quick, and the assistant loop is already
+    /// waiting on the result. Capped so one large refactor cannot flood the
+    /// model's context, and it says so when it truncates.
+    static string AiDiffResult(string root) {
+        List<string> lines = Process.RunCapture("git -C \"" + root
+            + "\" --no-pager diff --stat HEAD");
+        List<string> body = Process.RunCapture("git -C \"" + root
+            + "\" --no-pager diff HEAD");
+        StringBuilder sb = new StringBuilder();
+        if (body.Count == 0 && lines.Count == 0) {
+            return "diff: no output (is this a git repository?).";
+        }
+        bool empty = true;
+        for (int i = 0; i < body.Count; i = i + 1) {
+            if (AiAgent.Trim(body[i]) != "") { empty = false; }
+        }
+        if (empty) {
+            return "diff: the working tree is clean (nothing to review).";
+        }
+        sb.Append("--- changed files ---\n");
+        for (int i = 0; i < lines.Count; i = i + 1) {
+            sb.Append(lines[i] + "\n");
+        }
+        sb.Append("--- unified diff ---\n");
+        int budget = 12000;
+        int used = 0;
+        bool cut = false;
+        for (int i = 0; i < body.Count; i = i + 1) {
+            if (used + body[i].Length > budget) { cut = true; }
+            if (cut) { i = body.Count; } else {
+                sb.Append(body[i] + "\n");
+                used = used + body[i].Length + 1;
+            }
+        }
+        if (cut) {
+            sb.Append("...(diff truncated; read the remaining files directly)\n");
+        }
+        return sb.ToString();
+    }
+
+    /// The last run's captured output for the `run_errors` tool. The IDE already
+    /// tees a console run's combined stdout/stderr into RunLogPath, so a failure
+    /// (an exception, an assert, a crash trace) is on disk and does not have to
+    /// be guessed at from the exit status. Returns the tail, which is where a
+    /// failure lands.
+    static string AiRunErrorsResult() {
+        string lp = ZanIDE.RunLogPath();
+        if (!File.Exists(lp)) {
+            return "run_errors: nothing has been run yet in this session"
+                + " (call run or ui_check first).";
+        }
+        string txt = File.ReadAllText(lp);
+        if (AiAgent.Trim(txt) == "") {
+            return "run_errors: the last run produced no output"
+                + " (it may still be running, or it was a GUI launch whose"
+                + " output is not captured).";
+        }
+        if (txt.Length > 8000) {
+            txt = "...(earlier output omitted)\n"
+                + txt.Substring(txt.Length - 8000, 8000);
+        }
+        return "--- last run output (stdout+stderr, tail) ---\n" + txt;
+    }
+
     static string GitLogPath() { return ZanIDE.CacheDir() + "/git_job.log"; }
     static string GitDonePath() { return ZanIDE.CacheDir() + "/git_job_done.txt"; }
 
