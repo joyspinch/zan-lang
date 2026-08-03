@@ -1,0 +1,347 @@
+using System;
+using System.Threading;
+
+namespace System.Windows;
+
+/// <summary>
+/// Tray icon callback action codes: 1 = left click, 2 = left double-click,
+/// 3 = right click, 4 = middle click. The callback is a plain static method
+/// (delegates cannot capture state); keep per-icon state in static fields,
+/// exactly like Thread.Start workers and Input.Hook callbacks.
+/// </summary>
+delegate void TrayIconCallback(int action);
+
+/// <summary>The hidden host window proc (WINAPI calling convention).</summary>
+delegate nint TrayWndProcFn(nint hwnd, int msg, nint wp, nint lp);
+
+/// <summary>
+/// System tray (notification area) icon with balloon notifications.
+/// Self-contained: it creates its own hidden message window and message
+/// loop on a dedicated thread, so it works from console programs and GUI
+/// programs alike, with no dependency on the Gui framework.
+///
+///   TrayIconCallback cb = Demo.OnTray;      // static method
+///   TrayIcon.Add("myicon.ico", "MyApp", cb);
+///   TrayIcon.ShowBalloon("Done", "Task finished", 1, 3000);
+///   TrayIcon.Remove();
+///
+/// Only one icon per process (the common case). Windows only; other
+/// platforms throw PlatformNotSupportedException.
+/// </summary>
+class TrayIcon {
+    #if WINDOWS
+    [DllImport("user32", EntryPoint = "RegisterClassExW")]
+    static extern ushort WinRegisterClassExW(nint wc);
+
+    [DllImport("user32", EntryPoint = "CreateWindowExW")]
+    static extern nint WinCreateWindowExW(int exStyle, nint cls, nint title,
+                                          int style, int x, int y, int w, int h,
+                                          nint parent, nint menu, nint inst, nint param);
+
+    [DllImport("user32", EntryPoint = "DefWindowProcW")]
+    static extern nint WinDefWindowProcW(nint hwnd, int msg, nint wp, nint lp);
+
+    [DllImport("user32", EntryPoint = "GetMessageW")]
+    static extern int WinGetMessageW(nint msg, nint hwnd, int min, int max);
+
+    [DllImport("user32", EntryPoint = "TranslateMessage")]
+    static extern int WinTranslateMessage(nint msg);
+
+    [DllImport("user32", EntryPoint = "DispatchMessageW")]
+    static extern nint WinDispatchMessageW(nint msg);
+
+    [DllImport("user32", EntryPoint = "DestroyWindow")]
+    static extern int WinDestroyWindow(nint hwnd);
+
+    [DllImport("user32", EntryPoint = "PostThreadMessageW")]
+    static extern int WinPostThreadMessageW(int threadId, int msg, nint wp, nint lp);
+
+    [DllImport("user32", EntryPoint = "LoadImageW")]
+    static extern nint WinLoadImageW(nint inst, nint name, int type, int w, int h,
+                                    int flags);
+
+    [DllImport("user32", EntryPoint = "LoadIconW")]
+    static extern nint WinLoadIconW(nint inst, nint name);
+
+    [DllImport("user32", EntryPoint = "DestroyIcon")]
+    static extern int WinDestroyIcon(nint icon);
+
+    [DllImport("user32", EntryPoint = "RegisterWindowMessageW")]
+    static extern int WinRegisterWindowMessageW(nint name);
+
+    [DllImport("kernel32", EntryPoint = "GetCurrentThreadId")]
+    static extern int WinGetCurrentThreadId();
+
+    [DllImport("shell32", EntryPoint = "Shell_NotifyIconW")]
+    static extern int WinShellNotifyIcon(int msg, nint data);
+
+    static TrayIconCallback userCb;
+    static nint trayHwnd;
+    static int trayThreadId;
+    static nint trayIcon;
+    static int threadFailed;
+    static int taskbarCreatedMsg;
+    static string trayIconPath;
+    static TrayWndProcFn wndProc;
+    #endif
+
+    /// <summary>
+    /// Adds a tray icon. `iconPath` is a .ico file ("" uses the default
+    /// application icon). `tooltip` is the hover text. Returns true once the
+    /// icon is live. Returns false when an icon is already added (remove it
+    /// first) or the native calls failed.
+    /// </summary>
+    static bool Add(string iconPath, string tooltip, TrayIconCallback cb) {
+        #if WINDOWS
+        if (TrayIcon.trayHwnd != 0) { return false; }
+        TrayIcon.userCb = cb;
+        TrayIcon.trayIconPath = iconPath;
+        TrayIcon.threadFailed = 0;
+        Thread.Start(TrayIcon.TrayThreadEntry);
+        int waited = 0;
+        while (TrayIcon.trayHwnd == 0 && TrayIcon.threadFailed == 0 && waited < 3000) {
+            Thread.Sleep(1);
+            waited = waited + 1;
+        }
+        if (TrayIcon.trayHwnd == 0) {
+            TrayIcon.userCb = null;
+            return false;
+        }
+        return true;
+        #else
+        throw new PlatformNotSupportedException(
+            "TrayIcon is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>Removes the tray icon and stops the message loop thread.
+    /// Safe to call when nothing is added.</summary>
+    static void Remove() {
+        #if WINDOWS
+        if (TrayIcon.trayHwnd == 0) { return; }
+        TrayIcon.Notify(2 /*NIM_DELETE*/);
+        TrayIcon.WinPostThreadMessageW(TrayIcon.trayThreadId, 0x0012 /*WM_QUIT*/, 0, 0);
+        while (TrayIcon.trayHwnd != 0) { Thread.Sleep(1); }
+        TrayIcon.userCb = null;
+        #else
+        throw new PlatformNotSupportedException(
+            "TrayIcon is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>Changes the hover tooltip of the live icon.</summary>
+    static bool SetTooltip(string tooltip) {
+        #if WINDOWS
+        if (TrayIcon.trayHwnd == 0) { return false; }
+        nint data = TrayIcon.BuildData(tooltip, "", "", 0, 0);
+        if (data == 0) { return false; }
+        // NIF_TIP only.
+        new Span<int>(data + 20, 1)[0] = 0x0004;
+        int ok = TrayIcon.WinShellNotifyIcon(1 /*NIM_MODIFY*/, data);
+        NativeMemory.Free(data);
+        return ok != 0;
+        #else
+        throw new PlatformNotSupportedException(
+            "TrayIcon is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>
+    /// Shows a balloon notification above the icon. `iconKind`: 0 = none,
+    /// 1 = info, 2 = warning, 3 = error. `timeoutMs` is the display duration
+    /// (Windows ignores values above 30 s on recent versions).
+    /// </summary>
+    static bool ShowBalloon(string title, string text, int iconKind, int timeoutMs) {
+        #if WINDOWS
+        if (TrayIcon.trayHwnd == 0) { return false; }
+        nint data = TrayIcon.BuildData("", title, text, iconKind, timeoutMs);
+        if (data == 0) { return false; }
+        // NIF_INFO.
+        new Span<int>(data + 20, 1)[0] = 0x0010;
+        int ok = TrayIcon.WinShellNotifyIcon(1 /*NIM_MODIFY*/, data);
+        NativeMemory.Free(data);
+        return ok != 0;
+        #else
+        throw new PlatformNotSupportedException(
+            "TrayIcon is not implemented on this platform");
+        #endif
+    }
+
+    #if WINDOWS
+    /// Runs on the tray thread: registers the window class, creates the
+    /// hidden window, adds the icon, then pumps messages until WM_QUIT.
+    static void TrayThreadEntry() {
+        int tid = TrayIcon.WinGetCurrentThreadId();
+        TrayIcon.trayThreadId = tid;
+        TrayIcon.taskbarCreatedMsg = TrayIcon.RegisterTaskbarCreated();
+
+        nint wc = NativeMemory.Alloc(80);
+        TrayIcon.ZeroMem(wc, 80);
+        new Span<int>(wc, 1)[0] = 80;              // cbSize
+        TrayIcon.wndProc = TrayIcon.TrayWndProcImpl;
+        new Span<long>(wc + 8, 1)[0] = (nint)TrayIcon.wndProc;   // lpfnWndProc
+        new Span<long>(wc + 24, 1)[0] = 0;         // hInstance
+        nint cls = Wide.Of("ZanTrayHost");
+        new Span<long>(wc + 64, 1)[0] = cls;       // lpszClassName
+        ushort atom = TrayIcon.WinRegisterClassExW(wc);
+        if (atom == 0) {
+            TrayIcon.threadFailed = 1;
+            Wide.Free(cls);
+            NativeMemory.Free(wc);
+            return;
+        }
+        nint hwnd = TrayIcon.WinCreateWindowExW(0, cls, cls, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+        Wide.Free(cls);
+        NativeMemory.Free(wc);
+        if (hwnd == 0) {
+            TrayIcon.threadFailed = 1;
+            return;
+        }
+        TrayIcon.trayHwnd = hwnd;
+        TrayIcon.LoadIcon();
+        if (!TrayIcon.Notify(0 /*NIM_ADD*/)) {
+            TrayIcon.WinDestroyWindow(hwnd);
+            TrayIcon.trayHwnd = 0;
+            TrayIcon.threadFailed = 1;
+            return;
+        }
+        // Ask for Vista+ behavior (balloon callbacks, etc.).
+        TrayIcon.SetVersion();
+
+        nint msg = NativeMemory.Alloc(64);
+        while (true) {
+            int r = TrayIcon.WinGetMessageW(msg, 0, 0, 0);
+            if (r <= 0) { break; }
+            TrayIcon.WinTranslateMessage(msg);
+            TrayIcon.WinDispatchMessageW(msg);
+        }
+        NativeMemory.Free(msg);
+        TrayIcon.Notify(2 /*NIM_DELETE*/);
+        if (TrayIcon.trayIcon != 0) {
+            TrayIcon.WinDestroyIcon(TrayIcon.trayIcon);
+            TrayIcon.trayIcon = 0;
+        }
+        TrayIcon.WinDestroyWindow(hwnd);
+        TrayIcon.trayHwnd = 0;
+    }
+
+    static int RegisterTaskbarCreated() {
+        nint name = Wide.Of("TaskbarCreated");
+        int msg = TrayIcon.WinRegisterWindowMessageW(name);
+        Wide.Free(name);
+        return msg;
+    }
+
+    /// Loads the icon once: from `trayIconPath` (.ico file) when given,
+    /// otherwise the default application icon. The handle is cached in
+    /// trayIcon and destroyed by the thread teardown.
+    static void LoadIcon() {
+        if (TrayIcon.trayIcon != 0) { return; }
+        nint icon = 0;
+        if (TrayIcon.trayIconPath != "") {
+            nint wpath = Wide.Of(TrayIcon.trayIconPath);
+            // IMAGE_ICON=1, LR_LOADFROMFILE=0x10 | LR_DEFAULTSIZE=0x40.
+            icon = TrayIcon.WinLoadImageW(0, wpath, 1, 0, 0, 0x50);
+            Wide.Free(wpath);
+        }
+        if (icon == 0) {
+            icon = TrayIcon.WinLoadIconW(0, (nint)32512);   // IDI_APPLICATION
+        }
+        TrayIcon.trayIcon = icon;
+    }
+
+    static void SetVersion() {
+        nint data = NativeMemory.Alloc(984);
+        TrayIcon.ZeroMem(data, 984);
+        new Span<int>(data, 1)[0] = 984;
+        new Span<long>(data + 8, 1)[0] = TrayIcon.trayHwnd;
+        new Span<int>(data + 16, 1)[0] = 1;       // uID
+        new Span<int>(data + 816, 1)[0] = 3;      // NOTIFYICON_VERSION_4
+        TrayIcon.WinShellNotifyIcon(4 /*NIM_SETVERSION*/, data);
+        NativeMemory.Free(data);
+    }
+
+    /// Sends a Shell_NotifyIconW message with the current icon state.
+    static bool Notify(int msg) {
+        nint data = TrayIcon.BuildData("", "", "", 0, 0);
+        if (data == 0) { return false; }
+        int ok = TrayIcon.WinShellNotifyIcon(msg, data);
+        NativeMemory.Free(data);
+        return ok != 0;
+    }
+
+    /// Allocates a zeroed NOTIFYICONDATAW (984 bytes, x64 layout) with the
+    /// stable fields filled: cbSize, hWnd, uID, uFlags (NIF_MESSAGE|NIF_ICON
+    /// |NIF_TIP), uCallbackMessage, hIcon, and the balloon fields.
+    static nint BuildData(string tooltip, string title, string text,
+                          int iconKind, int timeoutMs) {
+        nint data = NativeMemory.Alloc(984);
+        TrayIcon.ZeroMem(data, 984);
+        new Span<int>(data, 1)[0] = 984;          // cbSize
+        new Span<long>(data + 8, 1)[0] = TrayIcon.trayHwnd;
+        new Span<int>(data + 16, 1)[0] = 1;       // uID
+        new Span<int>(data + 20, 1)[0] = 0x0007;  // NIF_MESSAGE|NIF_ICON|NIF_TIP
+        new Span<int>(data + 24, 1)[0] = 0x8000;  // uCallbackMessage (WM_APP)
+        nint icon = TrayIcon.trayIcon;
+        if (icon == 0) {
+            icon = TrayIcon.WinLoadIconW(0, (nint)32512);   // IDI_APPLICATION
+            TrayIcon.trayIcon = icon;
+        }
+        new Span<long>(data + 32, 1)[0] = icon;   // hIcon
+        TrayIcon.PutWide(data + 40, tooltip, 128);
+        if (title != "" || text != "") {
+            TrayIcon.PutWide(data + 304, text, 256);    // szInfo
+            TrayIcon.PutWide(data + 824, title, 64);    // szInfoTitle
+            new Span<int>(data + 952, 1)[0] = TrayIcon.BalloonFlags(iconKind);
+            new Span<int>(data + 816, 1)[0] = timeoutMs;  // uTimeout
+        }
+        return data;
+    }
+
+    static int BalloonFlags(int kind) {
+        if (kind <= 0) { return 0; }          // NIIF_NONE
+        if (kind == 1) { return 0x0001; }     // NIIF_INFO
+        if (kind == 2) { return 0x0002; }     // NIIF_WARNING
+        return 0x0003;                        // NIIF_ERROR
+    }
+
+    /// Copies a Zan string into a fixed-size WCHAR field (units incl. NUL).
+    static void PutWide(nint dst, string s, int units) {
+        if (s == "") { return; }
+        nint w = Wide.Of(s);
+        int len = Wide.Length(w);
+        if (len >= units) { len = units - 1; }
+        NativeMemory.Copy(dst, w, len * 2);
+        new Span<ushort>(dst + len * 2, 1)[0] = 0;
+        Wide.Free(w);
+    }
+
+    static void ZeroMem(nint p, int bytes) {
+        int i = 0;
+        while (i < bytes) {
+            new Span<byte>(p + i, 1)[0] = 0;
+            i = i + 1;
+        }
+    }
+
+    /// The window proc of the hidden host window. Only the tray callback
+    /// message and the TaskbarCreated message are interesting.
+    static nint TrayWndProcImpl(nint hwnd, int msg, nint wp, nint lp) {
+        if (msg == 0x8000 /*WM_APP*/ && TrayIcon.userCb != null) {
+            int action = 0;
+            int l = (int)lp;
+            if (l == 0x0201) { action = 1; }          // WM_LBUTTONDOWN
+            if (l == 0x0203) { action = 2; }          // WM_LBUTTONDBLCLK
+            if (l == 0x0204) { action = 3; }          // WM_RBUTTONDOWN
+            if (l == 0x0207) { action = 4; }          // WM_MBUTTONDOWN
+            if (action != 0) { TrayIcon.userCb(action); }
+        }
+        if (msg == TrayIcon.taskbarCreatedMsg && TrayIcon.trayHwnd != 0) {
+            // Explorer restarted: re-add the icon so it survives.
+            TrayIcon.Notify(0 /*NIM_ADD*/);
+            TrayIcon.SetVersion();
+        }
+        return TrayIcon.WinDefWindowProcW(hwnd, msg, wp, lp);
+    }
+    #endif
+}

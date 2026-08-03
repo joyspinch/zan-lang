@@ -39,6 +39,12 @@ class Process {
     static extern int WinGetTickCount();
     [DllImport("kernel32", EntryPoint = "GetCurrentProcessId")]
     static extern int WinGetCurrentProcessId();
+    [DllImport("kernel32", EntryPoint = "WideCharToMultiByte")]
+    static extern int WinWideToMulti(int page, int flags, nint wide, int wideLen,
+                                     nint mb, int mbLen, nint defChar, nint usedDef);
+    [DllImport("kernel32", EntryPoint = "MultiByteToWideChar")]
+    static extern int WinMultiToWide(int page, int flags, nint mb, int mbLen,
+                                     nint wide, int wideLen);
     #else
     // Linux, macOS and other POSIX systems all expose popen/pclose in libc.
     [DllImport("crt", EntryPoint = "popen")]
@@ -50,6 +56,21 @@ class Process {
 
     [DllImport("crt")]
     static extern long fread(string buf, long size, long count, nint fp);
+
+    [DllImport("crt", EntryPoint = "fopen")]
+    static extern nint plat_fopen(string path, string mode);
+
+    [DllImport("crt", EntryPoint = "fseek")]
+    static extern int plat_fseek(nint fp, int offset, int origin);
+
+    [DllImport("crt", EntryPoint = "ftell")]
+    static extern long plat_ftell(nint fp);
+
+    [DllImport("crt", EntryPoint = "fread")]
+    static extern long plat_fread(byte[] buf, long size, long count, nint fp);
+
+    [DllImport("crt", EntryPoint = "fclose")]
+    static extern int plat_fclose(nint fp);
 
     [DllImport("crt")]
     static extern int system(string cmd);
@@ -147,10 +168,68 @@ class Process {
         WinSpawn(full, true);
         List<string> lines = new List<string>();
         if (File.Exists(tmp)) {
-            lines = SplitLines(File.ReadAllText(tmp));
+            lines = SplitLines(Process.WinReadText(tmp));
             File.Delete(tmp);
         }
         return lines;
+    }
+
+    // Reads a capture file, normalising the output encoding to UTF-8:
+    //   - UTF-16LE (BOM FF FE) is converted directly;
+    //   - anything else is converted from the system ANSI code page
+    //     (sc.exe / schtasks.exe on a Chinese system emit GBK).
+    // Console tools pick their encoding by what they are attached to, so
+    // neither assumption alone is safe; the BOM disambiguates.
+    static string WinReadText(string path) {
+        nint fp = plat_fopen(path, "rb");
+        if (fp == 0) { return ""; }
+        plat_fseek(fp, 0, 2);
+        int size = (int)plat_ftell(fp);
+        plat_fseek(fp, 0, 0);
+        byte[] raw = new byte[size];
+        int got = (int)plat_fread(raw, 1, size, fp);
+        plat_fclose(fp);
+        if (got < 2) { return raw.ToStr(0, got); }
+        bool utf16 = raw[0] == 255 && raw[1] == 254;   // BOM FF FE
+        int units = 0;
+        if (utf16) {
+            units = (got - 2) / 2;
+        } else {
+            // ANSI (CP_ACP, typically GBK on a Chinese system): every byte
+            // maps to at most one UTF-16 unit, so got*2+2 is always enough.
+            units = got * 2 + 2;
+        }
+        nint wide = NativeMemory.Alloc(units * 2 + 2);
+        if (utf16) {
+            int k = 0;
+            while (k < units) {
+                new Span<ushort>(wide + k * 2, 1)[0] = (ushort)(raw[2 + k * 2] |
+                    (raw[3 + k * 2] << 8));
+                k = k + 1;
+            }
+            new Span<ushort>(wide + units * 2, 1)[0] = 0;
+        } else {
+            nint mb = NativeMemory.Alloc(got);
+            int k = 0;
+            while (k < got) {
+                new Span<byte>(mb + k, 1)[0] = raw[k];
+                k = k + 1;
+            }
+            // Convert in place: wide holds the UTF-16 result (units was sized
+            // for that), then derive the real length for the UTF-8 pass.
+            int n = Process.WinMultiToWide(0 /*CP_ACP*/, 0, mb, got, wide, units);
+            if (n > 0) { units = n; }
+            new Span<ushort>(wide + units * 2, 1)[0] = 0;
+            NativeMemory.Free(mb);
+        }
+        int need = Process.WinWideToMulti(65001, 0, wide, units, 0, 0, 0, 0);
+        if (need <= 0) { need = 1; }
+        nint utf8 = NativeMemory.Alloc(need + 1);
+        Process.WinWideToMulti(65001, 0, wide, units, utf8, need + 1, 0, 0);
+        string s = NativeMemory.GetString(utf8, 0, need);
+        NativeMemory.Free(utf8);
+        NativeMemory.Free(wide);
+        return s;
     }
     #endif
 

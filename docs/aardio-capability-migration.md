@@ -66,6 +66,39 @@
 
 难度：S = 半天内，M = 1~2 天，L = 3 天以上。
 
+### 进度总览（2026-08 更新）
+
+已完成并带 conformance 测试/示例的条目：
+
+| # | 模块 | 落地位置 | 测试 |
+| --- | --- | --- | --- |
+| 1+2 | `System.Input.Mouse` / `Keyboard` | `stdlib/System/Input/{Mouse,Keyboard}.zan` | `input_*_smoke` |
+| 3 | `System.Input.Hook` | `stdlib/System/Input/Hook.zan` | `input_hook_smoke` |
+| 4 | `System.Input.Hotkey` | `stdlib/System/Input/Hotkey.zan` | `input_hotkey_smoke` |
+| 5~10 | `System.Management` 信息族 | `stdlib/System/Management/{Cpu,Memory,SystemInfo,Storage,Display,Power}.zan` | `sysinfo_smoke` |
+| 11 | `System.Management.Registry` | `stdlib/System/Management/Registry.zan` | `registry_roundtrip` |
+| 14 | `System.Diagnostics.ProcessList` | `stdlib/System/Diagnostics/ProcessList.zan` | `process_list_smoke` |
+| 15+16 | `Privileges` / `ProcessControl` | `stdlib/System/Diagnostics/{Privileges,ProcessControl}.zan` | `process_control_smoke` |
+| 18+19 | `System.Windows.TrayIcon` / `Screen` | `stdlib/System/Windows/{TrayIcon,Screen}.zan` | `win_tray_screen_smoke` |
+| 20 | `System.ServiceProcess` | `stdlib/System/ServiceProcess/ServiceProcess.zan` | `win_serviceprocess_smoke` |
+| 21 | `System.Management.TaskScheduler` | `stdlib/System/Management/TaskScheduler.zan` | `win_taskscheduler_smoke` |
+| 33 | `System.Guid` | `stdlib/System/Guid.zan` | `guid_*` |
+| 36 | `Stopwatch` | `stdlib/System/Diagnostics/Stopwatch.zan` | `stopwatch_*` |
+| 37 | `System.Globalization.Lunar` | `stdlib/System/Globalization/Lunar.zan` | `lunar_*` |
+
+实现要点（记录在案，供后续条目复用）：
+
+- **命令封装策略**：`ServiceProcess` / `TaskScheduler` 走 `sc.exe` / `schtasks.exe`
+  文本输出而非原始 SCM COM 枚举——SCM 的 `EnumServicesStatusExW` 缓冲区布局在
+  64 位系统上版本敏感（实测 301 条里有 215 条指针错位），文本接口稳定且免管理员。
+- **输出编码归一**：`Process.WinCapture` 现在自动识别 UTF-16LE BOM 与 ANSI/GBK
+  （`schtasks` 重定向输出 UTF-16、`sc` 输出 GBK），统一转 UTF-8 再 `SplitLines`。
+  中英文系统字段名都解析（如 `Task To Run:` / `要运行的任务:`）。
+- **TrayIcon 自包含**：自带隐藏宿主窗口 + 独立线程消息循环，不依赖 Gui 框架；
+  任务栏重建（`TaskbarCreated`）后自动重挂图标。
+- **Screen 取色走 BitBlt**：GDI `GetPixel` 在 DWM 合成桌面不可靠，1x1 BitBlt 一致。
+- **非 Windows 分支**：所有模块 `#else` 抛 `PlatformNotSupportedException`。
+
 ### P0 — 用户明确要的：输入模拟 + 系统信息
 
 | # | 目标 Zan 模块 | aardio 来源 | 需覆盖的 API | 依赖 | 难度 |

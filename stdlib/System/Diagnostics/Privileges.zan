@@ -1,0 +1,247 @@
+using System;
+
+namespace System.Diagnostics;
+
+/// <summary>
+/// Current process identity and privilege state, plus UAC elevation launch.
+///
+/// Windows maps to the process token APIs (elevation check, SID lookup,
+/// privilege enablement, "runas" elevation); POSIX maps to the euid/root
+/// check and the numeric uid. APIs with no POSIX equivalent
+/// (RunAs / RunAsWait / EnablePrivilege) throw
+/// PlatformNotSupportedException there instead of silently failing.
+/// </summary>
+class Privileges {
+    #if WINDOWS
+    [DllImport("kernel32", EntryPoint = "GetCurrentProcess")]
+    static extern nint WinGetCurrentProcess();
+
+    [DllImport("kernel32", EntryPoint = "OpenProcessToken")]
+    static extern int WinOpenProcessToken(nint proc, int access, nint token);
+
+    [DllImport("advapi32", EntryPoint = "GetTokenInformation")]
+    static extern int WinGetTokenInformation(nint token, int cls, nint info,
+                                             int infoLen, nint retLen);
+
+    [DllImport("advapi32", EntryPoint = "GetUserNameW")]
+    static extern int WinGetUserNameW(nint buf, nint size);
+
+    [DllImport("advapi32", EntryPoint = "LookupPrivilegeValueW")]
+    static extern int WinLookupPrivilegeValueW(nint system, nint name, nint luid);
+
+    [DllImport("advapi32", EntryPoint = "AdjustTokenPrivileges")]
+    static extern int WinAdjustTokenPrivileges(nint token, int disableAll,
+                                               nint newState, int bufLen,
+                                               nint prev, nint retLen);
+
+    [DllImport("advapi32", EntryPoint = "ConvertSidToStringSidW")]
+    static extern int WinConvertSidToStringSidW(nint sid, nint str);
+
+    [DllImport("advapi32", EntryPoint = "LocalFree")]
+    static extern nint WinLocalFree(nint mem);
+
+    [DllImport("kernel32", EntryPoint = "GetLastError")]
+    static extern int WinGetLastError();
+
+    [DllImport("shell32", EntryPoint = "ShellExecuteExW")]
+    static extern int WinShellExecuteExW(nint sei);
+
+    [DllImport("kernel32", EntryPoint = "WaitForSingleObject")]
+    static extern int WinWaitForSingleObject(nint handle, int ms);
+
+    [DllImport("kernel32", EntryPoint = "GetExitCodeProcess")]
+    static extern int WinGetExitCodeProcess(nint proc, nint code);
+
+    [DllImport("kernel32", EntryPoint = "CloseHandle")]
+    static extern int WinCloseHandle(nint handle);
+
+    // Opens the current process's token with the requested access rights.
+    static nint OpenToken(int access) {
+        nint slot = NativeMemory.Alloc(8);
+        new Span<nint>(slot, 1)[0] = 0;
+        if (Privileges.WinOpenProcessToken(Privileges.WinGetCurrentProcess(),
+                                           access, slot) == 0) {
+            NativeMemory.Free(slot);
+            return 0;
+        }
+        nint h = new Span<nint>(slot, 1)[0];
+        NativeMemory.Free(slot);
+        return h;
+    }
+    #else
+    [DllImport("crt", EntryPoint = "geteuid")]
+    static extern int GetEuid();
+    #endif
+
+    /// <summary>True when the current process runs with an elevated token
+    /// (Windows: the token is elevated; POSIX: euid == 0).</summary>
+    static bool IsAdmin() {
+        #if WINDOWS
+        nint token = Privileges.OpenToken(0x0008 /*TOKEN_QUERY*/);
+        if (token == 0) { return false; }
+        nint info = NativeMemory.Alloc(8);
+        nint ret = NativeMemory.Alloc(4);
+        bool elevated = false;
+        if (Privileges.WinGetTokenInformation(token, 20 /*TokenElevation*/,
+                                              info, 8, ret) != 0) {
+            elevated = new Span<int>(info, 2)[0] != 0;
+        }
+        NativeMemory.Free(info);
+        NativeMemory.Free(ret);
+        Privileges.WinCloseHandle(token);
+        return elevated;
+        #else
+        return Privileges.GetEuid() == 0;
+        #endif
+    }
+
+    /// <summary>The name of the user running this process (Windows account
+    /// name; POSIX: the USER environment variable). "" when unknown.</summary>
+    static string UserName() {
+        #if WINDOWS
+        nint buf = NativeMemory.Alloc(256 * 2 + 2);
+        nint size = NativeMemory.Alloc(4);
+        new Span<int>(size, 1)[0] = 256;
+        string name = "";
+        if (Privileges.WinGetUserNameW(buf, size) != 0) {
+            name = Wide.Read(buf);
+        }
+        NativeMemory.Free(buf);
+        NativeMemory.Free(size);
+        return name;
+        #else
+        return Interop.EnvVar("USER");
+        #endif
+    }
+
+    /// <summary>Stable identifier of the current user: the SID string on
+    /// Windows ("S-1-5-21-..."), the numeric uid on POSIX.</summary>
+    static string UserSid() {
+        #if WINDOWS
+        nint token = Privileges.OpenToken(0x0008 /*TOKEN_QUERY*/);
+        if (token == 0) { return ""; }
+        nint info = NativeMemory.Alloc(256);
+        nint ret = NativeMemory.Alloc(4);
+        string sid = "";
+        if (Privileges.WinGetTokenInformation(token, 1 /*TokenUser*/,
+                                              info, 256, ret) != 0) {
+            // TOKEN_USER: { SID_AND_ATTRIBUTES { PSID Sid; DWORD Attr } }
+            nint psid = new Span<nint>(info, 32)[0];
+            nint str = NativeMemory.Alloc(8);
+            new Span<nint>(str, 1)[0] = 0;
+            if (Privileges.WinConvertSidToStringSidW(psid, str) != 0) {
+                nint pstr = new Span<nint>(str, 1)[0];
+                sid = Wide.Read(pstr);
+                Privileges.WinLocalFree(pstr);
+            }
+            NativeMemory.Free(str);
+        }
+        NativeMemory.Free(info);
+        NativeMemory.Free(ret);
+        Privileges.WinCloseHandle(token);
+        return sid;
+        #else
+        return Convert.ToString(Privileges.GetEuid());
+        #endif
+    }
+
+    /// <summary>Enables a named privilege (e.g. "SeDebugPrivilege") on the
+    /// current process token. True when the privilege was enabled. Windows
+    /// only; POSIX throws PlatformNotSupportedException.</summary>
+    static bool EnablePrivilege(string name) {
+        #if WINDOWS
+        nint token = Privileges.OpenToken(0x0020 /*TOKEN_ADJUST_PRIVILEGES*/);
+        if (token == 0) { return false; }
+        nint wname = Wide.Of(name);
+        nint luid = NativeMemory.Alloc(8);
+        bool ok = false;
+        if (Privileges.WinLookupPrivilegeValueW(0, wname, luid) != 0) {
+            // TOKEN_PRIVILEGES: count@0 (4), pad(4), Luid@8, Attributes@16
+            nint tp = NativeMemory.Alloc(32);
+            new Span<int>(tp, 8)[0] = 1;
+            new Span<long>(tp + 8, 2)[0] = new Span<long>(luid, 1)[0];
+            new Span<int>(tp + 16, 4)[0] = 0x00000002;   // SE_PRIVILEGE_ENABLED
+            int r = Privileges.WinAdjustTokenPrivileges(token, 0, tp, 0, 0, 0);
+            ok = (r != 0) &&
+                 (Privileges.WinGetLastError() == 0 /*ERROR_SUCCESS*/);
+            NativeMemory.Free(tp);
+        }
+        NativeMemory.Free(luid);
+        Wide.Free(wname);
+        Privileges.WinCloseHandle(token);
+        return ok;
+        #else
+        throw new PlatformNotSupportedException(
+            "Privileges.EnablePrivilege is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>Launches `file` elevated through the UAC prompt (Windows).
+    /// True when the launch was accepted by the user. Returns false on POSIX
+    /// (no equivalent exists; use RunAs there).</summary>
+    static bool RunAs(string file, string args) {
+        #if WINDOWS
+        return Privileges.ShellElevated(file, args, false) >= 0;
+        #else
+        return false;
+        #endif
+    }
+
+    /// <summary>Launches `file` elevated and waits for it to exit, returning
+    /// its exit code (-1 when the launch failed or was declined).</summary>
+    static int RunAsWait(string file, string args) {
+        #if WINDOWS
+        return Privileges.ShellElevated(file, args, true);
+        #else
+        return -1;
+        #endif
+    }
+
+    #if WINDOWS
+    // ShellExecuteExW with the runas verb and SEE_MASK_NOCLOSEPROCESS.
+    // `wait` returns the child exit code (blocking); otherwise 0 on success.
+    static int ShellElevated(string file, string args, bool wait) {
+        // SHELLEXECUTEINFOW (x64, 112 bytes): cbSize@0 fMask@4 hwnd@8
+        // verb@16 file@24 params@32 dir@40 nShow@48 hInst@56 idList@64
+        // class@72 hkey@80 hotkey@88 hIcon/hMonitor@96 hProcess@104
+        nint sei = NativeMemory.Alloc(112);
+        Span<long> zero = new Span<long>(sei, 14);
+        int zi = 0;
+        while (zi < 14) { zero[zi] = 0; zi = zi + 1; }
+        new Span<int>(sei, 28)[0] = 112;              // cbSize
+        new Span<int>(sei, 28)[1] = 0x440;            // SEE_MASK_NOCLOSEPROCESS | SEE_MASK_FLAG_NO_UI
+        nint wverb = Wide.Of("runas");
+        nint wfile = Wide.Of(file);
+        nint wargs = Wide.Of(args);
+        nint wdir = Wide.Of("");
+        new Span<nint>(sei + 16, 12)[0] = wverb;
+        new Span<nint>(sei + 24, 11)[0] = wfile;
+        new Span<nint>(sei + 32, 10)[0] = wargs;
+        new Span<nint>(sei + 40, 9)[0] = wdir;
+        new Span<int>(sei + 48, 16)[0] = 1;           // SW_SHOWNORMAL
+        int code = -1;
+        if (Privileges.WinShellExecuteExW(sei) != 0) {
+            nint hProc = new Span<nint>(sei + 104, 1)[0];
+            if (hProc != 0) {
+                if (wait) {
+                    Privileges.WinWaitForSingleObject(hProc, 0x7FFFFFFF);
+                    nint exit = NativeMemory.Alloc(4);
+                    new Span<int>(exit, 1)[0] = 0;
+                    Privileges.WinGetExitCodeProcess(hProc, exit);
+                    code = new Span<int>(exit, 1)[0];
+                    NativeMemory.Free(exit);
+                } else {
+                    code = 0;
+                }
+                Privileges.WinCloseHandle(hProc);
+            }
+        }
+        NativeMemory.Free(sei);
+        Wide.Free(wdir);
+        Wide.Free(wargs);
+        Wide.Free(wfile);
+        Wide.Free(wverb);
+        return code;
+    }
+    #endif
+}

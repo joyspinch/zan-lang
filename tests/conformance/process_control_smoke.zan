@@ -1,0 +1,70 @@
+// ProcessControl / Privileges smoke test: every query must return a sane
+// value without crashing, and self-process control ops must succeed. This
+// never touches other processes, so it is safe to run unprivileged.
+using System;
+using System.Diagnostics;
+
+namespace Conf;
+
+class Prog {
+    static int bad = 0;
+
+    static void Check(bool cond) {
+        if (!cond) { bad = bad + 1; }
+    }
+
+    static string BaseName(string path) {
+        int bs = -1;
+        int fs = -1;
+        int i = 0;
+        while (i < path.Length) {
+            string ch = path.Substring(i, 1);
+            if (ch == "\\") { bs = i; }
+            if (ch == "/") { fs = i; }
+            i = i + 1;
+        }
+        int at = bs;
+        if (fs > at) { at = fs; }
+        if (at < 0) { return path; }
+        return path.Substring(at + 1, path.Length - at - 1);
+    }
+
+    static void Main() {
+        // Privileges: admin flag must not crash; user + sid must be non-empty.
+        Check(Privileges.IsAdmin() == true || Privileges.IsAdmin() == false);
+        Check(Privileges.UserName() != "");
+        Check(Privileges.UserSid() != "");
+
+        // Self-process control.
+        int self = ProcessList.SelfPid();
+        Check(self > 0);
+        Check(ProcessControl.IsRunning(self));
+        int prio = ProcessControl.GetPriority(self);
+        Check(prio >= 0 && prio <= 5);
+        Check(ProcessControl.SetPriority(self, prio));
+        // Exit code of a running process is -1.
+        Check(ProcessControl.GetExitCode(self) == -1);
+
+        // ByName must find the current process by its image name (without the
+        // .exe extension), exercising the ".exe" normalization.
+        ProcessEntry me = ProcessList.ByPid(self);
+        Check(me != null);
+        if (me != null && me.exePath != "") {
+            string baseName = BaseName(me.exePath);
+            if (baseName.Length > 4 &&
+                baseName.Substring(baseName.Length - 4, 4) == ".exe") {
+                baseName = baseName.Substring(0, baseName.Length - 4);
+            }
+            bool found = false;
+            List<ProcessEntry> hits = ProcessList.ByName(baseName);
+            int i = 0;
+            while (i < hits.Count) {
+                if (hits[i].pid == self) { found = true; }
+                i = i + 1;
+            }
+            Check(found);
+        }
+
+        Console.WriteLine("procctl-ok: " + Convert.ToString(bad == 0 ? 1 : 0));
+    }
+}

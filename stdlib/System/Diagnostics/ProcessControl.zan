@@ -1,0 +1,253 @@
+using System;
+using System.IO;
+
+namespace System.Diagnostics;
+
+/// <summary>
+/// Control operations on other processes: suspend/resume, terminate, wait
+/// and priority. Windows uses the Win32 process APIs (NtSuspendProcess for
+/// suspend, TerminateProcess for termination, priority classes); POSIX maps
+/// to kill(2) signals (SIGSTOP/SIGCONT/SIGTERM/SIGKILL) and setpriority(2).
+///
+/// Priorities are a cross-platform 0..5 scale (0 = idle, 1 = below normal,
+/// 2 = normal, 3 = above normal, 4 = high, 5 = realtime). Windows maps to
+/// the priority classes, POSIX to the nice value.
+/// </summary>
+class ProcessControl {
+    #if WINDOWS
+    [DllImport("kernel32", EntryPoint = "OpenProcess")]
+    static extern nint WinOpenProcess(int access, int inherit, int pid);
+
+    [DllImport("kernel32", EntryPoint = "CloseHandle")]
+    static extern int WinCloseHandle(nint handle);
+
+    [DllImport("ntdll", EntryPoint = "NtSuspendProcess")]
+    static extern int WinNtSuspendProcess(nint proc);
+
+    [DllImport("ntdll", EntryPoint = "NtResumeProcess")]
+    static extern int WinNtResumeProcess(nint proc);
+
+    [DllImport("kernel32", EntryPoint = "TerminateProcess")]
+    static extern int WinTerminateProcess(nint proc, int code);
+
+    [DllImport("kernel32", EntryPoint = "WaitForSingleObject")]
+    static extern int WinWaitForSingleObject(nint handle, int ms);
+
+    [DllImport("kernel32", EntryPoint = "GetExitCodeProcess")]
+    static extern int WinGetExitCodeProcess(nint proc, nint code);
+
+    [DllImport("kernel32", EntryPoint = "GetPriorityClass")]
+    static extern int WinGetPriorityClass(nint proc);
+
+    [DllImport("kernel32", EntryPoint = "SetPriorityClass")]
+    static extern int WinSetPriorityClass(nint proc, int cls);
+
+    // Opens a process with the access rights a given operation needs.
+    static nint Open(int pid, int access) {
+        nint h = ProcessControl.WinOpenProcess(access, 0, pid);
+        return h;
+    }
+    #else
+    [DllImport("crt", EntryPoint = "kill")]
+    static extern int KillSignal(int pid, int sig);
+
+    [DllImport("crt", EntryPoint = "getpriority")]
+    static extern int GetPriority(int which, int pid);
+
+    [DllImport("crt", EntryPoint = "setpriority")]
+    static extern int SetPriority(int which, int pid, int value);
+
+    #if LINUX
+    static int SigStop() { return 19; }
+    static int SigCont() { return 18; }
+    #else
+    static int SigStop() { return 17; }
+    static int SigCont() { return 19; }
+    #endif
+    #endif
+
+    /// <summary>Suspends every thread of `pid`. True on success. (POSIX:
+    /// SIGSTOP -- the whole process pauses; resume with Resume.)</summary>
+    static bool Suspend(int pid) {
+        #if WINDOWS
+        nint h = ProcessControl.Open(pid, 0x0800 /*PROCESS_SUSPEND_RESUME*/);
+        if (h == 0) { return false; }
+        int ok = ProcessControl.WinNtSuspendProcess(h);
+        ProcessControl.WinCloseHandle(h);
+        return ok >= 0;
+        #else
+        return ProcessControl.KillSignal(pid, ProcessControl.SigStop()) == 0;
+        #endif
+    }
+
+    /// <summary>Resumes a suspended process. True on success.</summary>
+    static bool Resume(int pid) {
+        #if WINDOWS
+        nint h = ProcessControl.Open(pid, 0x0800 /*PROCESS_SUSPEND_RESUME*/);
+        if (h == 0) { return false; }
+        int ok = ProcessControl.WinNtResumeProcess(h);
+        ProcessControl.WinCloseHandle(h);
+        return ok >= 0;
+        #else
+        return ProcessControl.KillSignal(pid, ProcessControl.SigCont()) == 0;
+        #endif
+    }
+
+    /// <summary>Asks `pid` to exit (SIGTERM on POSIX; TerminateProcess on
+    /// Windows). True when the signal was delivered. The process may still be
+    /// shutting down -- combine with WaitForExit.</summary>
+    static bool Terminate(int pid) {
+        #if WINDOWS
+        nint h = ProcessControl.Open(pid, 0x0001 /*PROCESS_TERMINATE*/);
+        if (h == 0) { return false; }
+        int ok = ProcessControl.WinTerminateProcess(h, 1);
+        ProcessControl.WinCloseHandle(h);
+        return ok != 0;
+        #else
+        return ProcessControl.KillSignal(pid, 15 /*SIGTERM*/) == 0;
+        #endif
+    }
+
+    /// <summary>Forces `pid` to exit immediately (SIGKILL on POSIX). True
+    /// when the signal was delivered.</summary>
+    static bool Kill(int pid) {
+        #if WINDOWS
+        nint h = ProcessControl.Open(pid, 0x0001 /*PROCESS_TERMINATE*/);
+        if (h == 0) { return false; }
+        int ok = ProcessControl.WinTerminateProcess(h, 1);
+        ProcessControl.WinCloseHandle(h);
+        return ok != 0;
+        #else
+        return ProcessControl.KillSignal(pid, 9 /*SIGKILL*/) == 0;
+        #endif
+    }
+
+    /// <summary>True while a process with `pid` exists.</summary>
+    static bool IsRunning(int pid) {
+        #if WINDOWS
+        nint h = ProcessControl.Open(pid, 0x1000 /*PROCESS_QUERY_LIMITED_INFORMATION*/);
+        if (h == 0) { return false; }
+        nint code = NativeMemory.Alloc(4);
+        new Span<int>(code, 1)[0] = 0;
+        ProcessControl.WinGetExitCodeProcess(h, code);
+        bool running = new Span<int>(code, 1)[0] == 259 /*STILL_ACTIVE*/;
+        NativeMemory.Free(code);
+        ProcessControl.WinCloseHandle(h);
+        return running;
+        #else
+        // kill(pid, 0) succeeds while the process exists (EPERM only means
+        // another user owns it, which still counts as "running").
+        return ProcessControl.KillSignal(pid, 0) == 0;
+        #endif
+    }
+
+    /// <summary>Blocks until `pid` exits or `timeoutMs` elapses. True when
+    /// the process exited within the timeout. A timeout of 0 polls once.</summary>
+    static bool WaitForExit(int pid, int timeoutMs) {
+        #if WINDOWS
+        nint h = ProcessControl.Open(pid, 0x00100000 /*SYNCHRONIZE*/);
+        if (h == 0) {
+            // OpenProcess fails for an already-exited pid; treat as exited.
+            return !ProcessControl.IsRunning(pid);
+        }
+        int r = ProcessControl.WinWaitForSingleObject(h, timeoutMs);
+        ProcessControl.WinCloseHandle(h);
+        return r == 0 /*WAIT_OBJECT_0*/;
+        #else
+        int waited = 0;
+        while (ProcessControl.IsRunning(pid)) {
+            if (waited >= timeoutMs) { return false; }
+            Thread.Sleep(10);
+            waited = waited + 10;
+        }
+        return true;
+        #endif
+    }
+
+    /// <summary>Exit code of a finished process, or -1 while it is still
+    /// running (or when the code is unreadable). On POSIX the exit code of a
+    /// non-child process is not exposed by the kernel, so -1 is returned for
+    /// every exited process too -- use WaitForExit + IsRunning instead.</summary>
+    static int GetExitCode(int pid) {
+        #if WINDOWS
+        nint h = ProcessControl.Open(pid, 0x1000 /*PROCESS_QUERY_LIMITED_INFORMATION*/);
+        if (h == 0) { return -1; }
+        nint code = NativeMemory.Alloc(4);
+        new Span<int>(code, 1)[0] = 0;
+        ProcessControl.WinGetExitCodeProcess(h, code);
+        int exit = new Span<int>(code, 1)[0];
+        NativeMemory.Free(code);
+        ProcessControl.WinCloseHandle(h);
+        if (exit == 259 /*STILL_ACTIVE*/) { return -1; }
+        return exit;
+        #else
+        return -1;
+        #endif
+    }
+
+    /// <summary>Priority of `pid` on the 0..5 scale (-1 when unreadable).</summary>
+    static int GetPriority(int pid) {
+        #if WINDOWS
+        nint h = ProcessControl.Open(pid, 0x0400 /*PROCESS_QUERY_INFORMATION*/);
+        if (h == 0) { return -1; }
+        int cls = ProcessControl.WinGetPriorityClass(h);
+        ProcessControl.WinCloseHandle(h);
+        if (cls == 0x40) { return 0; }        // IDLE
+        if (cls == 0x4000) { return 1; }      // BELOW_NORMAL
+        if (cls == 0x20) { return 2; }        // NORMAL
+        if (cls == 0x8000) { return 3; }      // ABOVE_NORMAL
+        if (cls == 0x80) { return 4; }        // HIGH
+        if (cls == 0x100) { return 5; }       // REALTIME
+        return 2;
+        #else
+        int nice = ProcessControl.GetPriority(1 /*PRIO_PROCESS*/, pid);
+        return ProcessControl.NiceToLevel(nice);
+        #endif
+    }
+
+    /// <summary>Sets the priority of `pid` on the 0..5 scale. True on
+    /// success.</summary>
+    static bool SetPriority(int pid, int level) {
+        if (level < 0) { level = 0; }
+        if (level > 5) { level = 5; }
+        #if WINDOWS
+        int cls = 0x20;   // NORMAL
+        if (level == 0) { cls = 0x40; }
+        if (level == 1) { cls = 0x4000; }
+        if (level == 2) { cls = 0x20; }
+        if (level == 3) { cls = 0x8000; }
+        if (level == 4) { cls = 0x80; }
+        if (level == 5) { cls = 0x100; }
+        nint h = ProcessControl.Open(pid, 0x0200 /*PROCESS_SET_INFORMATION*/);
+        if (h == 0) { return false; }
+        int ok = ProcessControl.WinSetPriorityClass(h, cls);
+        ProcessControl.WinCloseHandle(h);
+        return ok != 0;
+        #else
+        int nice = ProcessControl.LevelToNice(level);
+        return ProcessControl.SetPriority(1 /*PRIO_PROCESS*/, pid, nice) == 0;
+        #endif
+    }
+
+    #if !WINDOWS
+    // 0..5 level -> nice value (-20..19).
+    static int LevelToNice(int level) {
+        if (level == 0) { return 19; }
+        if (level == 1) { return 10; }
+        if (level == 2) { return 0; }
+        if (level == 3) { return -5; }
+        if (level == 4) { return -10; }
+        return -20;
+    }
+
+    // nice value -> 0..5 level.
+    static int NiceToLevel(int nice) {
+        if (nice >= 15) { return 0; }
+        if (nice >= 5) { return 1; }
+        if (nice >= -2) { return 2; }
+        if (nice >= -7) { return 3; }
+        if (nice >= -15) { return 4; }
+        return 5;
+    }
+    #endif
+}

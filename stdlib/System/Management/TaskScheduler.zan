@@ -1,0 +1,278 @@
+using System;
+using System.Diagnostics;
+
+namespace System.Management;
+
+/// <summary>
+/// One scheduled task snapshot. `name` is the full task path (e.g.
+/// "\Microsoft\Windows\Defrag\ScheduledDefrag"). `status` is the OS status
+/// text ("Ready", "Running", "Disabled", ...). `command` is the program the
+/// task runs; it is only filled by Get() (the list view omits it).
+/// </summary>
+class TaskInfo {
+    public string name;
+    public string nextRun;
+    public string status;
+    public string command;
+}
+
+/// <summary>
+/// Windows Task Scheduler: enumerate, query, create, delete, run and stop
+/// scheduled tasks. Implemented on top of the built-in schtasks.exe (its
+/// /fo CSV and /fo LIST /v output is stable across versions). Linux/macOS
+/// throw PlatformNotSupportedException (cron integration is a later
+/// milestone).
+///
+/// Creating or deleting tasks requires administrator rights; Run/End only
+/// need access to the specific task. Failures return false (never throw).
+///
+/// Trigger strings follow schtasks /sc values: "ONLOGON" (log on), "ONSTART"
+/// (system start), "ONIDLE", "DAILY", "WEEKLY", "ONCE", "MONTHLY". DAILY,
+/// WEEKLY, ONCE and MONTHLY also take a time "HH:MM" (and optionally a date
+/// "MM/DD/YYYY").
+/// </summary>
+class TaskScheduler {
+    /// <summary>Every scheduled task visible to the current user.</summary>
+    static List<TaskInfo> List() {
+        List<TaskInfo> list = new List<TaskInfo>();
+        #if WINDOWS
+        List<string> lines = Process.RunCapture("schtasks /query /fo CSV");
+        // Header row first ("\"TaskName\",\"Next Run Time\",\"Status\"").
+        int i = 1;
+        while (i < lines.Count) {
+            List<string> f = TaskScheduler.ParseCsv(lines[i]);
+            if (f.Count >= 3) {
+                TaskInfo t = new TaskInfo();
+                t.name = f[0];
+                t.nextRun = f[1];
+                t.status = f[2];
+                t.command = "";
+                list.Add(t);
+            }
+            i = i + 1;
+        }
+        return list;
+        #else
+        throw new PlatformNotSupportedException(
+            "TaskScheduler is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>One task by name; null when it does not exist.</summary>
+    static TaskInfo Get(string name) {
+        #if WINDOWS
+        List<string> lines = Process.RunCapture(
+            "schtasks /query /tn " + TaskScheduler.Quote(name) + " /fo LIST /v");
+        TaskInfo t = new TaskInfo();
+        t.name = name;
+        t.status = "";
+        t.command = "";
+        t.nextRun = "";
+        bool found = false;
+        int i = 0;
+        while (i < lines.Count) {
+            string line = TaskScheduler.Trim(lines[i]);
+            // Failure marker (localized: "ERROR:" / "错误:"). Only trust it
+            // when no field has been seen yet -- task folders can contain
+            // the word in their names.
+            if (!found && (TaskScheduler.StartsWith(line, "ERROR") ||
+                           TaskScheduler.StartsWith(line, "Error") ||
+                           TaskScheduler.StartsWith(line, "错误"))) {
+                return null;
+            }
+            // Fields are localized; match both English and Chinese names.
+            if (TaskScheduler.StartsWith(line, "Task To Run:") ||
+                TaskScheduler.StartsWith(line, "要运行的任务:")) {
+                t.command = TaskScheduler.AfterColon(line);
+                found = true;
+            } else if (TaskScheduler.StartsWith(line, "Status:") ||
+                       TaskScheduler.StartsWith(line, "状态:")) {
+                t.status = TaskScheduler.AfterColon(line);
+            } else if (TaskScheduler.StartsWith(line, "Next Run Time:") ||
+                       TaskScheduler.StartsWith(line, "下次运行时间:")) {
+                t.nextRun = TaskScheduler.AfterColon(line);
+            } else if (TaskScheduler.StartsWith(line, "TaskName:") ||
+                       TaskScheduler.StartsWith(line, "任务名:")) {
+                t.name = TaskScheduler.AfterColon(line);
+                found = true;
+            }
+            i = i + 1;
+        }
+        if (!found) { return null; }
+        return t;
+        #else
+        throw new PlatformNotSupportedException(
+            "TaskScheduler is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>True when a task with this name exists.</summary>
+    static bool Exists(string name) {
+        #if WINDOWS
+        return TaskScheduler.Get(name) != null;
+        #else
+        throw new PlatformNotSupportedException(
+            "TaskScheduler is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>
+    /// Creates a task. `command` is the program (and arguments) to run;
+    /// quote paths containing spaces yourself, e.g.
+    /// "\"C:\\Program Files\\x\\y.exe\" --flag". `trigger` is an schtasks
+    /// /sc value; `time` ("HH:MM") is required for DAILY/WEEKLY/ONCE/MONTHLY
+    /// and ignored otherwise. True on success.
+    /// </summary>
+    static bool Create(string name, string command, string trigger, string time) {
+        #if WINDOWS
+        string cmd = "schtasks /create /tn " + TaskScheduler.Quote(name) +
+            " /tr " + TaskScheduler.Quote(command) +
+            " /sc " + trigger;
+        if (time != "") { cmd = cmd + " /st " + time; }
+        cmd = cmd + " /f";
+        return TaskScheduler.SchtasksOk(cmd);
+        #else
+        throw new PlatformNotSupportedException(
+            "TaskScheduler is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>Deletes a task (admin rights). True on success.</summary>
+    static bool Delete(string name) {
+        #if WINDOWS
+        return TaskScheduler.SchtasksOk(
+            "schtasks /delete /tn " + TaskScheduler.Quote(name) + " /f");
+        #else
+        throw new PlatformNotSupportedException(
+            "TaskScheduler is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>Runs a task immediately. True when the run was accepted.</summary>
+    static bool Run(string name) {
+        #if WINDOWS
+        return TaskScheduler.SchtasksOk(
+            "schtasks /run /tn " + TaskScheduler.Quote(name));
+        #else
+        throw new PlatformNotSupportedException(
+            "TaskScheduler is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>Stops a running task. True when the stop was accepted.</summary>
+    static bool End(string name) {
+        #if WINDOWS
+        return TaskScheduler.SchtasksOk(
+            "schtasks /end /tn " + TaskScheduler.Quote(name));
+        #else
+        throw new PlatformNotSupportedException(
+            "TaskScheduler is not implemented on this platform");
+        #endif
+    }
+
+    #if WINDOWS
+    static bool SchtasksOk(string cmd) {
+        List<string> lines = Process.RunCapture(cmd + " 2>&1");
+        // schtasks prints "SUCCESS: ..." / "INFO: ..." on success and
+        // "ERROR: ..." on failure (localized prefix may vary; check the
+        // marker words that stay ASCII in every language).
+        int i = 0;
+        while (i < lines.Count) {
+            string t = TaskScheduler.Trim(lines[i]);
+            if (TaskScheduler.StartsWith(t, "ERROR") ||
+                TaskScheduler.StartsWith(t, "Error")) {
+                return false;
+            }
+            i = i + 1;
+        }
+        return true;
+    }
+
+    static string Quote(string s) {
+        return "\"" + s + "\"";
+    }
+
+    // Everything after the first colon, trimmed.
+    static string AfterColon(string line) {
+        int idx = TaskScheduler.IndexOf(line, ":", 0);
+        if (idx < 0) { return ""; }
+        return TaskScheduler.Trim(line.Substring(idx + 1, line.Length - idx - 1));
+    }
+
+    // Parses one CSV line: "a","b","c" -> [a, b, c]. Quoted fields may
+    // contain commas; doubled quotes ("") are literal quotes.
+    static List<string> ParseCsv(string line) {
+        List<string> out2 = new List<string>();
+        string cur = "";
+        bool inQ = false;
+        int i = 0;
+        while (i < line.Length) {
+            int ch = line[i] & 255;
+            if (inQ) {
+                if (ch == 34) {          // "
+                    if (i + 1 < line.Length && (line[i + 1] & 255) == 34) {
+                        cur = cur + "\"";
+                        i = i + 2;
+                        continue;
+                    }
+                    inQ = false;
+                } else {
+                    cur = cur + line.Substring(i, 1);
+                }
+            } else {
+                if (ch == 34) { inQ = true; }
+                else if (ch == 44) {     // ,
+                    out2.Add(cur);
+                    cur = "";
+                } else {
+                    cur = cur + line.Substring(i, 1);
+                }
+            }
+            i = i + 1;
+        }
+        out2.Add(cur);
+        return out2;
+    }
+
+    static string FirstNonEmpty(List<string> lines) {
+        int i = 0;
+        while (i < lines.Count) {
+            if (TaskScheduler.Trim(lines[i]).Length > 0) { return lines[i]; }
+            i = i + 1;
+        }
+        return null;
+    }
+
+    static bool StartsWith(string s, string prefix) {
+        if (prefix.Length > s.Length) { return false; }
+        return s.Substring(0, prefix.Length) == prefix;
+    }
+
+    static string Trim(string s) {
+        int a = 0;
+        int b = s.Length;
+        while (a < b) {
+            int ch = s[a] & 255;
+            if (ch != 32 && ch != 9 && ch != 13 && ch != 10) { break; }
+            a = a + 1;
+        }
+        while (b > a) {
+            int ch = s[b - 1] & 255;
+            if (ch != 32 && ch != 9 && ch != 13 && ch != 10) { break; }
+            b = b - 1;
+        }
+        return s.Substring(a, b - a);
+    }
+
+    static int IndexOf(string hay, string needle, int from) {
+        int n = needle.Length;
+        int h = hay.Length;
+        int i = from;
+        while (i + n <= h) {
+            if (hay.Substring(i, n) == needle) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+    #endif
+}

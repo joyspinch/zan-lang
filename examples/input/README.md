@@ -73,10 +73,22 @@ build/background_demo.exe
 | `System.Management.Power` | `GetStatus` → `PowerStatus`(电池状态/电量/续航)、`OnBattery` |
 | `System.Management.Registry` | Windows 注册表:`OpenKey/CreateKey/CloseKey`、DWORD/QWORD/SZ 读写、`EnumKeys/EnumValues`、`DeleteValue/DeleteKey`(递归) |
 | `System.Diagnostics.ProcessList` | 进程枚举:`List/ByName/ByPid`、`MemoryUsage/ExePath/SelfPid`(Windows Toolhelp32 / Linux /proc) |
+| `System.Diagnostics.Privileges` | `IsAdmin/UserName/UserSid`(跨平台)、`EnablePrivilege`(Windows)、`RunAs/RunAsWait`(UAC 提权,Windows) |
+| `System.Diagnostics.ProcessControl` | 进程控制:`Suspend/Resume/Terminate/Kill/IsRunning/WaitForExit/GetExitCode/GetPriority/SetPriority`(Windows + POSIX 信号) |
+| `System.Windows.TrayIcon` | 托盘图标:`Add/Remove/SetTooltip/ShowBalloon`,回调区分左/右/双击(自带隐藏窗口+消息循环,不依赖 Gui) |
+| `System.Windows.Screen` | 屏幕:`ScreenWidth/Height/Dpi`、`GetPixel`(0xAARRGGBB)、`CapturePixels`(BGRA)、`CaptureToBmp/CaptureAllToBmp`(Windows GDI) |
+| `System.ServiceProcess` | Windows 服务:`List/Get/Start/Stop/Restart/Delete/StateName`(sc.exe 封装,输出编码自动归一) |
+| `System.Management.TaskScheduler` | 计划任务:`List/Get/Exists/Create/Delete/Run/End`(schtasks.exe 封装,中英双语字段解析) |
 
 ### 示例(只读,安全)
 
 - `sysinfo_demo.zan` — 打印 CPU/内存/系统/存储/显示器/电源信息
+- `process_control_demo.zan` — 打印权限/身份与自身进程详情、进程列表前几名(只读,
+  不操作其他进程)
+- `tray_screen_demo.zan` — 托盘图标+气泡通知(8 秒后自动移除),全屏截图存 BMP、
+  屏幕取色(截屏后立即删除文件)
+- `service_task_demo.zan` — 打印服务总数/运行数与计划任务总数/就绪数,以及
+  前几个条目详情(只读,不创建/启停任何服务或任务)
 
 ```bash
 build/zanc examples/input/sysinfo_demo.zan --auto-stdlib -o build/sysinfo_demo.exe
@@ -91,4 +103,12 @@ build/sysinfo_demo.exe
 - `tests/conformance/input_background.zan` — 后台模拟:窗口查找/0 句柄容错/桌面窗口 PostMessage 链路(Windows 实测)
 - `tests/conformance/management_smoke.zan` — 信息族结构不变量(Windows 实测)
 - `tests/conformance/process_list_smoke.zan` — 进程枚举与自身详情(Windows 实测)
+- `tests/conformance/process_control_smoke.zan` — 权限查询与自身进程控制不变量
+  (Windows 实测,不触碰其他进程)
+- `tests/conformance/win_tray_screen_smoke.zan` — 托盘图标生命周期 + 屏幕
+  尺寸/捕获/BMP 头不变量(Windows 实测,无人值守可跑)
+- `tests/conformance/win_serviceprocess_smoke.zan` — 服务枚举/查询/状态码
+  不变量(只读,不启停服务)
+- `tests/conformance/win_taskscheduler_smoke.zan` — 计划任务枚举/查询 +
+  创建→查询→删除往返(唯一任务名,测完删除)
 - `tests/conformance/registry_roundtrip.zan` — 注册表读写往返(临时键,测完删除)
