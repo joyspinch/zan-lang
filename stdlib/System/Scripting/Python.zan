@@ -16,13 +16,23 @@ namespace System.Scripting;
 ///
 ///   if (!Python.IsAvailable()) { ... fall back ... }
 ///   Python.Initialize();
+///
+///   // Direct calls with automatic double/string marshalling:
+///   double v = Python.CallD("math.floor", 22.3);
+///   string s = Python.CallS("greet", "Zan");
+///
+///   // Expressions and module-level access:
 ///   Python.Exec("answer = 6 * 7");
+///   PyObject r = Python.Eval("[x * x for x in range(4)]");
+///   List<double> squares = r.ToListDouble();        // [0, 1, 4, 9]
 ///
+///   // Object-style calls with explicit marshalling:
 ///   PyObject math = Python.Import("math");
-///   double v = math.GetAttr("floor").Call1(Python.FromDouble(22.3)).ToDouble();
+///   double f = math.GetAttr("floor").Call1(Python.FromDouble(22.3)).ToDouble();
 ///
-///   PyObject main = Python.GetMain();
-///   string s = main.GetAttr("greet").Call1(Python.FromStr("Zan")).ToStr();
+///   // Containers cross the border both ways:
+///   PyObject pyList = Python.FromListStr(new List<string>{ "a", "b" });
+///   Dictionary<string, PyObject> pyDict = Python.Eval("{'k': 1}").ToDict();
 ///
 /// Callbacks run the other way with <see cref="Python.RegisterFunction"/>:
 /// a static, non-capturing Zan method is wrapped in a PyCFunction and
@@ -67,6 +77,17 @@ class Python {
     static nint addr_errClear;
     static nint addr_cfuncNew;
     static nint addr_setAttrString;
+    static nint addr_incRef;
+    static nint addr_runString;
+    static nint addr_moduleGetDict;
+    static nint addr_listSize;
+    static nint addr_listGetItem;
+    static nint addr_listNew;
+    static nint addr_listSetItem;
+    static nint addr_dictSize;
+    static nint addr_dictNext;
+    static nint addr_dictNew;
+    static nint addr_dictSetItemString;
 
     static bool resolved;
     static bool initialized;
@@ -153,6 +174,34 @@ class Python {
         }
     }
 
+    /// <summary>
+    /// Evaluates a Python expression in the __main__ namespace and returns the
+    /// result (e.g. <c>Python.Eval("[x * x for x in range(4)]")</c>). Uses
+    /// PyRun_String with Py_eval_input; the expression may reference names
+    /// defined by <see cref="Exec"/>.
+    /// </summary>
+    static PyObject Eval(string code) {
+        Python.EnsureReady();
+        PyNintStrFn imp = (PyNintStrFn)Python.addr_importModule;
+        nint mainMod = imp("__main__");
+        if (mainMod == 0) {
+            PyVoidFn printErr = (PyVoidFn)Python.addr_errPrint;
+            printErr();
+            throw new InvalidOperationException("Python Eval 失败:无法访问 __main__");
+        }
+        PyNint1Fn getDict = (PyNint1Fn)Python.addr_moduleGetDict;
+        nint globals = getDict(mainMod);        // borrowed
+        PyRunStringFn run = (PyRunStringFn)Python.addr_runString;
+        nint h = run(code, 258, globals, globals);   // Py_eval_input
+        Python.DecRef(mainMod);
+        if (h == 0) {
+            PyVoidFn printErr = (PyVoidFn)Python.addr_errPrint;
+            printErr();
+            throw new InvalidOperationException("Python 表达式求值失败: " + code);
+        }
+        return PyObject.Wrap(h);
+    }
+
     /// <summary>Imports a Python module (e.g. "math", "os.path").</summary>
     static PyObject Import(string name) {
         Python.EnsureReady();
@@ -169,6 +218,67 @@ class Python {
     /// <summary>The __main__ module (where <see cref="Exec"/> defines names).</summary>
     static PyObject GetMain() {
         return Python.Import("__main__");
+    }
+
+    /// <summary>
+    /// Calls a function with any number of arguments. The name may be dotted
+    /// (<c>"math.floor"</c>, <c>"os.path.join"</c>). The first segment is
+    /// tried as an import (so <c>"math.floor"</c> works without an explicit
+    /// <c>import math</c>); otherwise it is looked up on __main__:
+    /// <c>Python.Call("math.floor", Python.FromDouble(2.5))</c>.
+    /// </summary>
+    static PyObject Call(string name, params PyObject[] args) {
+        List<string> parts = name.Split(".");
+        PyObject obj = Python.TryImport(parts[0]);
+        if (obj.IsNull()) {
+            obj = Python.GetMain().TryGetAttr(parts[0]);
+        }
+        if (obj.IsNull()) {
+            obj = Python.Import("builtins").TryGetAttr(parts[0]);
+        }
+        if (obj.IsNull()) {
+            throw new InvalidOperationException("Python 找不到函数: " + name);
+        }
+        for (int i = 1; i < parts.Count; i = i + 1) {
+            obj = obj.GetAttr(parts[i]);
+        }
+        return obj.Call(args);
+    }
+
+    /// <summary>Imports a module, or a null PyObject when it does not exist.</summary>
+    static PyObject TryImport(string name) {
+        if (!Python.resolved) { return PyObject.Wrap(0); }
+        PyNintStrFn f = (PyNintStrFn)Python.addr_importModule;
+        nint h = f(name);
+        if (h == 0) { Python.ErrClear(); return PyObject.Wrap(0); }
+        return PyObject.Wrap(h);
+    }
+
+    /// <summary>Call + double marshalling: <c>Python.CallD("math.floor", 2.5)</c>.</summary>
+    static double CallD(string name, params double[] args) {
+        List<PyObject> py = new List<PyObject>();
+        for (int i = 0; i < args.Count; i = i + 1) {
+            py.Add(Python.FromDouble(args[i]));
+        }
+        return Python.Call(name, py).ToDouble();
+    }
+
+    /// <summary>Call + string marshalling: <c>Python.CallS("greet", "Zan")</c>.</summary>
+    static string CallS(string name, params string[] args) {
+        List<PyObject> py = new List<PyObject>();
+        for (int i = 0; i < args.Count; i = i + 1) {
+            py.Add(Python.FromStr(args[i]));
+        }
+        return Python.Call(name, py).ToStr();
+    }
+
+    /// <summary>Call + long marshalling: <c>Python.CallL("int", "3.9")</c>.</summary>
+    static long CallL(string name, params long[] args) {
+        List<PyObject> py = new List<PyObject>();
+        for (int i = 0; i < args.Count; i = i + 1) {
+            py.Add(Python.FromLong(args[i]));
+        }
+        return Python.Call(name, py).ToLong();
     }
 
     /// <summary>
@@ -259,6 +369,65 @@ class Python {
         int v = 0;
         if (b) { v = 1; }
         return PyObject.Wrap(f(v));
+    }
+
+    /// <summary>Wraps a list of Python objects as a Python list.</summary>
+    static PyObject FromList(List<PyObject> items) {
+        Python.EnsureReady();
+        int n = items.Count;
+        PyListNewFn nl = (PyListNewFn)Python.addr_listNew;
+        nint lst = nl(n);
+        if (lst == 0) { throw new InvalidOperationException("Python 列表创建失败"); }
+        PyListSetFn sl = (PyListSetFn)Python.addr_listSetItem;
+        PyVoid1Fn inc = (PyVoid1Fn)Python.addr_incRef;
+        for (int i = 0; i < n; i = i + 1) {
+            inc(items[i].handle);               // list steals the reference
+            sl(lst, i, items[i].handle);
+        }
+        return PyObject.Wrap(lst);
+    }
+
+    /// <summary>Wraps a list of doubles as a Python list of floats.</summary>
+    static PyObject FromListDouble(List<double> items) {
+        List<PyObject> py = new List<PyObject>();
+        for (int i = 0; i < items.Count; i = i + 1) {
+            py.Add(Python.FromDouble(items[i]));
+        }
+        return Python.FromList(py);
+    }
+
+    /// <summary>Wraps a list of strings as a Python list of str.</summary>
+    static PyObject FromListStr(List<string> items) {
+        List<PyObject> py = new List<PyObject>();
+        for (int i = 0; i < items.Count; i = i + 1) {
+            py.Add(Python.FromStr(items[i]));
+        }
+        return Python.FromList(py);
+    }
+
+    /// <summary>Wraps a string-keyed map as a Python dict.</summary>
+    static PyObject FromDict(Dictionary<string, PyObject> map) {
+        Python.EnsureReady();
+        PyDictNewFn nd = (PyDictNewFn)Python.addr_dictNew;
+        nint d = nd();
+        if (d == 0) { throw new InvalidOperationException("Python dict 创建失败"); }
+        PyDictSetStrFn sd = (PyDictSetStrFn)Python.addr_dictSetItemString;
+        List<string> keys = map.Keys;
+        for (int i = 0; i < keys.Count; i = i + 1) {
+            string k = keys[i];
+            sd(d, k, map[k].handle);            // SetItemString takes its own
+        }                                        //   reference; nothing stolen
+        return PyObject.Wrap(d);
+    }
+
+    /// <summary>Wraps a string-to-string map as a Python dict.</summary>
+    static PyObject FromDictStr(Dictionary<string, string> map) {
+        Dictionary<string, PyObject> py = new Dictionary<string, PyObject>();
+        List<string> keys = map.Keys;
+        for (int i = 0; i < keys.Count; i = i + 1) {
+            py[keys[i]] = Python.FromStr(map[keys[i]]);
+        }
+        return Python.FromDict(py);
     }
 
     // ---- value marshalling: Python -> Zan ---------------------------------
@@ -428,6 +597,17 @@ class Python {
         Python.addr_errClear = Interop.Symbol(Python.mod, "PyErr_Clear");
         Python.addr_cfuncNew = Interop.Symbol(Python.mod, "PyCFunction_New");
         Python.addr_setAttrString = Interop.Symbol(Python.mod, "PyObject_SetAttrString");
+        Python.addr_incRef = Interop.Symbol(Python.mod, "Py_IncRef");
+        Python.addr_runString = Interop.Symbol(Python.mod, "PyRun_String");
+        Python.addr_moduleGetDict = Interop.Symbol(Python.mod, "PyModule_GetDict");
+        Python.addr_listSize = Interop.Symbol(Python.mod, "PyList_Size");
+        Python.addr_listGetItem = Interop.Symbol(Python.mod, "PyList_GetItem");
+        Python.addr_listNew = Interop.Symbol(Python.mod, "PyList_New");
+        Python.addr_listSetItem = Interop.Symbol(Python.mod, "PyList_SetItem");
+        Python.addr_dictSize = Interop.Symbol(Python.mod, "PyDict_Size");
+        Python.addr_dictNext = Interop.Symbol(Python.mod, "PyDict_Next");
+        Python.addr_dictNew = Interop.Symbol(Python.mod, "PyDict_New");
+        Python.addr_dictSetItemString = Interop.Symbol(Python.mod, "PyDict_SetItemString");
         return Python.addr_init != 0 && Python.addr_runSimple != 0;
     }
 
@@ -462,11 +642,29 @@ class Python {
         Python.addr_errClear = 0;
         Python.addr_cfuncNew = 0;
         Python.addr_setAttrString = 0;
+        Python.addr_incRef = 0;
+        Python.addr_runString = 0;
+        Python.addr_moduleGetDict = 0;
+        Python.addr_listSize = 0;
+        Python.addr_listGetItem = 0;
+        Python.addr_listNew = 0;
+        Python.addr_listSetItem = 0;
+        Python.addr_dictSize = 0;
+        Python.addr_dictNext = 0;
+        Python.addr_dictNew = 0;
+        Python.addr_dictSetItemString = 0;
     }
 
     static void DecRef(nint obj) {
         if (obj != 0) {
             PyVoid1Fn f = (PyVoid1Fn)Python.addr_decRef;
+            f(obj);
+        }
+    }
+
+    static void IncRef(nint obj) {
+        if (obj != 0) {
+            PyVoid1Fn f = (PyVoid1Fn)Python.addr_incRef;
             f(obj);
         }
     }
@@ -511,6 +709,50 @@ class PyObject {
         return PyObject.Wrap(h);
     }
 
+    /// <summary>
+    /// Reads an attribute without throwing; a null PyObject when it is absent
+    /// (the Python error indicator is cleared).
+    /// </summary>
+    PyObject TryGetAttr(string name) {
+        PyAttrFn f = (PyAttrFn)Python.addr_getAttr;
+        nint h = f(this.handle, name);
+        if (h == 0) {
+            Python.ErrClear();
+            return PyObject.Wrap(0);
+        }
+        return PyObject.Wrap(h);
+    }
+
+    /// <summary>Writes an attribute: <c>obj.SetAttr("name", value)</c>.</summary>
+    void SetAttr(string name, PyObject val) {
+        PySetAttrFn f = (PySetAttrFn)Python.addr_setAttrString;
+        int rc = f(this.handle, name, val.handle);
+        if (rc != 0) {
+            PyVoidFn printErr = (PyVoidFn)Python.addr_errPrint;
+            printErr();
+            throw new InvalidOperationException("Python 属性写入失败: " + name);
+        }
+    }
+
+    /// <summary>Reads an index of a sequence (list/tuple): <c>obj.At(2)</c>.</summary>
+    PyObject At(long index) {
+        PyListSizeFn sz = (PyListSizeFn)Python.addr_listSize;
+        if (sz(this.handle) < 0) {
+            PyVoidFn printErr = (PyVoidFn)Python.addr_errPrint;
+            printErr();
+            throw new InvalidOperationException("Python At():目标不是序列");
+        }
+        PyListGetFn g = (PyListGetFn)Python.addr_listGetItem;
+        nint item = g(this.handle, index);      // borrowed
+        if (item == 0) {
+            PyVoidFn printErr = (PyVoidFn)Python.addr_errPrint;
+            printErr();
+            throw new InvalidOperationException("Python At():索引越界");
+        }
+        Python.IncRef(item);                    // owned by the wrapper
+        return PyObject.Wrap(item);
+    }
+
     /// <summary>Calls the object with no arguments.</summary>
     PyObject Call0() {
         return this.CallTuple(0);
@@ -521,6 +763,7 @@ class PyObject {
         PyTupleNewFn n = (PyTupleNewFn)Python.addr_tupleNew;
         PyTupleSetFn s = (PyTupleSetFn)Python.addr_tupleSet;
         nint t = n(1);
+        Python.IncRef(a.handle);                // tuple steals; wrapper keeps its own
         s(t, 0, a.handle);
         return this.CallTuple(t);
     }
@@ -530,6 +773,8 @@ class PyObject {
         PyTupleNewFn n = (PyTupleNewFn)Python.addr_tupleNew;
         PyTupleSetFn s = (PyTupleSetFn)Python.addr_tupleSet;
         nint t = n(2);
+        Python.IncRef(a.handle);
+        Python.IncRef(b.handle);
         s(t, 0, a.handle);
         s(t, 1, b.handle);
         return this.CallTuple(t);
@@ -540,9 +785,29 @@ class PyObject {
         PyTupleNewFn n = (PyTupleNewFn)Python.addr_tupleNew;
         PyTupleSetFn s = (PyTupleSetFn)Python.addr_tupleSet;
         nint t = n(3);
+        Python.IncRef(a.handle);
+        Python.IncRef(b.handle);
+        Python.IncRef(c.handle);
         s(t, 0, a.handle);
         s(t, 1, b.handle);
         s(t, 2, c.handle);
+        return this.CallTuple(t);
+    }
+
+    /// <summary>
+    /// Calls the object with any number of arguments:
+    /// <c>fn.Call(Python.FromDouble(1.0), Python.FromStr("x"))</c> or with a
+    /// pre-built list. Replaces Call0..3; those remain for compatibility.
+    /// </summary>
+    PyObject Call(params PyObject[] args) {
+        int n = args.Count;
+        PyTupleNewFn nt = (PyTupleNewFn)Python.addr_tupleNew;
+        PyTupleSetFn st = (PyTupleSetFn)Python.addr_tupleSet;
+        nint t = nt(n);
+        for (int i = 0; i < n; i = i + 1) {
+            Python.IncRef(args[i].handle);      // tuple steals; wrappers keep theirs
+            st(t, i, args[i].handle);
+        }
         return this.CallTuple(t);
     }
 
@@ -569,6 +834,76 @@ class PyObject {
 
     /// <summary>Reads the object's truth value.</summary>
     bool ToBool() { return Python.ToBool(this); }
+
+    /// <summary>Unwraps a Python list into a list of Python objects.</summary>
+    List<PyObject> ToList() {
+        PyListSizeFn sz = (PyListSizeFn)Python.addr_listSize;
+        long n = sz(this.handle);
+        if (n < 0) {
+            PyVoidFn printErr = (PyVoidFn)Python.addr_errPrint;
+            printErr();
+            throw new InvalidOperationException("Python ToList():目标不是列表");
+        }
+        List<PyObject> outList = new List<PyObject>();
+        PyListGetFn g = (PyListGetFn)Python.addr_listGetItem;
+        for (long i = 0; i < n; i = i + 1) {
+            nint item = g(this.handle, i);      // borrowed
+            Python.IncRef(item);
+            outList.Add(PyObject.Wrap(item));
+        }
+        return outList;
+    }
+
+    /// <summary>Unwraps a Python list into a list of doubles.</summary>
+    List<double> ToListDouble() {
+        List<PyObject> items = this.ToList();
+        List<double> outList = new List<double>();
+        for (int i = 0; i < items.Count; i = i + 1) {
+            outList.Add(items[i].ToDouble());
+        }
+        return outList;
+    }
+
+    /// <summary>Unwraps a Python list into a list of strings (str() each).</summary>
+    List<string> ToListStr() {
+        List<PyObject> items = this.ToList();
+        List<string> outList = new List<string>();
+        for (int i = 0; i < items.Count; i = i + 1) {
+            outList.Add(items[i].ToStr());
+        }
+        return outList;
+    }
+
+    /// <summary>
+    /// Unwraps a Python dict into a string-keyed map of Python objects. Keys
+    /// are read with str() so non-string keys still convert.
+    /// </summary>
+    Dictionary<string, PyObject> ToDict() {
+        PyDictSizeFn sz = (PyDictSizeFn)Python.addr_dictSize;
+        if (sz(this.handle) < 0) {
+            PyVoidFn printErr = (PyVoidFn)Python.addr_errPrint;
+            printErr();
+            throw new InvalidOperationException("Python ToDict():目标不是 dict");
+        }
+        Dictionary<string, PyObject> outMap = new Dictionary<string, PyObject>();
+        nint pos = NativeMemory.Alloc(8);
+        nint keyOut = NativeMemory.Alloc(8);
+        nint valOut = NativeMemory.Alloc(8);
+        new Span<long>(pos, 1)[0] = 0;
+        PyDictNextFn nx = (PyDictNextFn)Python.addr_dictNext;
+        PyStrRetFn u = (PyStrRetFn)Python.addr_unicodeAsUtf8;
+        while (nx(this.handle, pos, keyOut, valOut) != 0) {
+            nint key = new Span<nint>(keyOut, 1)[0];   // borrowed
+            nint val = new Span<nint>(valOut, 1)[0];   // borrowed
+            string ks = u(key);
+            Python.IncRef(val);
+            outMap[ks] = PyObject.Wrap(val);
+        }
+        NativeMemory.Free(pos);
+        NativeMemory.Free(keyOut);
+        NativeMemory.Free(valOut);
+        return outMap;
+    }
 }
 
 // ---- PyCFunction callback shape: PyObject* (*)(PyObject*, PyObject*) ------
@@ -594,3 +929,12 @@ delegate nint PyTupleGetFn(nint t, long i);
 delegate nint PyBoolRetFn(int v);
 delegate nint PyCfuncNewFn(nint def, nint self);
 delegate int PySetAttrFn(nint obj, string name, nint val);
+delegate nint PyRunStringFn(string code, int start, nint globals, nint locals);
+delegate long PyListSizeFn(nint list);
+delegate nint PyListGetFn(nint list, long index);
+delegate nint PyListNewFn(long size);
+delegate int PyListSetFn(nint list, long index, nint v);
+delegate long PyDictSizeFn(nint dict);
+delegate int PyDictNextFn(nint dict, nint pos, nint keyOut, nint valOut);
+delegate nint PyDictNewFn();
+delegate int PyDictSetStrFn(nint dict, string key, nint val);
