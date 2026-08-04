@@ -583,6 +583,67 @@ static void resolve_bases(zan_binder_t *b, zan_ast_node_t *type_node) {
     type_sym->type->bases_resolved = 2;
 }
 
+/* Pass 1.5: copy default interface methods into the implementing types.
+ *
+ * An interface method with a body (`interface I { int G() { return 42; } }`) was
+ * bound as a member of the interface and then dropped: irgen never walks an
+ * AST_INTERFACE_DECL, so no body was emitted and a call through either the
+ * interface or the class returned 0 (or failed with "no member 'G'"). Copying
+ * the declaration into every implementing type that does not provide its own
+ * override makes it an ordinary method of that type, so it is bound, emitted
+ * and dispatched like any other -- and a `this.F()` inside the default body
+ * resolves to the implementing type's F.
+ *
+ * Runs between pass 1 (types registered) and pass 2 (members bound), so the
+ * copies are bound as members of the implementing type. */
+static bool type_declares_method(zan_ast_node_t *type_node, zan_istr_t name) {
+    for (int i = 0; i < type_node->type_decl.members.count; i++) {
+        zan_ast_node_t *m = type_node->type_decl.members.items[i];
+        if (m->kind != AST_METHOD_DECL) continue;
+        if (m->method_decl.name.len == name.len &&
+            memcmp(m->method_decl.name.str, name.str, (size_t)name.len) == 0)
+            return true;
+    }
+    return false;
+}
+
+static void inherit_default_methods(zan_binder_t *b, zan_ast_node_t *type_node,
+                                    zan_ast_node_t *iface_node, int depth) {
+    if (!iface_node || iface_node->kind != AST_INTERFACE_DECL || depth > 8) return;
+    for (int i = 0; i < iface_node->type_decl.members.count; i++) {
+        zan_ast_node_t *m = iface_node->type_decl.members.items[i];
+        if (m->kind != AST_METHOD_DECL || !m->method_decl.body) continue;
+        if ((m->method_decl.modifiers & MOD_STATIC) != 0) continue;
+        if (type_declares_method(type_node, m->method_decl.name)) continue;
+        /* Shallow copy: the body and parameter list are read-only here, but the
+         * node identity must differ per implementing type, since irgen keys a
+         * method's symbol and its emitted function on the declaration node. */
+        zan_ast_node_t *copy = zan_ast_new(b->arena, AST_METHOD_DECL, m->loc);
+        *copy = *m;
+        zan_ast_list_push(&type_node->type_decl.members, copy, b->arena);
+    }
+    /* an interface may itself extend interfaces carrying defaults */
+    for (int bx = 0; bx < iface_node->type_decl.bases.count; bx++) {
+        zan_symbol_t *bs = scope_find(b->current_scope,
+            iface_node->type_decl.bases.items[bx]->type_ref.name);
+        if (bs && bs->kind == SYM_INTERFACE && bs->decl)
+            inherit_default_methods(b, type_node, bs->decl, depth + 1);
+    }
+}
+
+static void bind_default_interface_methods(zan_binder_t *b, zan_ast_list_t *decls) {
+    for (int i = 0; i < decls->count; i++) {
+        zan_ast_node_t *decl = decls->items[i];
+        if (decl->kind != AST_CLASS_DECL && decl->kind != AST_STRUCT_DECL) continue;
+        for (int bx = 0; bx < decl->type_decl.bases.count; bx++) {
+            zan_symbol_t *bs = scope_find(b->current_scope,
+                decl->type_decl.bases.items[bx]->type_ref.name);
+            if (bs && bs->kind == SYM_INTERFACE && bs->decl)
+                inherit_default_methods(b, decl, bs->decl, 0);
+        }
+    }
+}
+
 /* Pass 2: bind member declarations */
 static void bind_members(zan_binder_t *b, zan_ast_node_t *type_node) {
     zan_istr_t type_name = type_node->type_decl.name;
@@ -677,6 +738,10 @@ void zan_binder_bind(zan_binder_t *b, zan_ast_node_t *unit) {
 
     /* pass 1: collect type declarations */
     bind_type_decls(b, &unit->comp_unit.decls);
+
+    /* pass 1.5: give every implementing type a copy of the default interface
+     * methods it does not override, before members are bound */
+    bind_default_interface_methods(b, &unit->comp_unit.decls);
 
     /* pass 2: bind members of each type */
     for (int i = 0; i < unit->comp_unit.decls.count; i++) {

@@ -866,7 +866,7 @@ leakcheck 子集全部通过；生成 IR 不含 `setjmp`/`longjmp`/`__zan_eh_tmp
 |---|---|---|---|
 | A43-A1 | 整数赋给 `double`/`float` 按位重解释（`double b = 1;` 得 `4.94066e-324`），`double` 形参/返回/混合运算 LLVM 校验失败 | 54,57–66 | ✅ 已修（A32-7，0205cc1） |
 | A43-A2 | 默认参数值不填充：`F(1)` 调 `F(int a, int b = 2)` LLVM 校验失败；`new A(1)` 静默不调用构造器，字段留 0 | 19,81–88 | ✅ 已修（见下 A43-A2 详情） |
-| A43-A3 | 接口默认方法（`interface I { int G() { return 42; } }`）经接口变量调用一律返回 0；经类变量调用报 `'C' has no member 'G'`。irgen 从不处理 `AST_INTERFACE_DECL`，默认体从不被发射，`irgen_call.c` 的接口分发对「类未实现该方法」的分支落到 `LLVMConstNull` | 44,51,52,80 | ⬜ 待修 |
+| A43-A3 | 接口默认方法（`interface I { int G() { return 42; } }`）经接口变量调用一律返回 0；经类变量调用报 `'C' has no member 'G'` | 44,51,52,80,100–102 | ✅ 已修（见下 A43-A3 详情） |
 | A43-A4 | `int? v = a?.x;` 运行时崩溃（0xC0000005）；此前是 `PHI node operands are not the same type` | 21,43 | ⬜ 待修 |
 | A43-A5 | `event H E;` + `a.E += P.OnE; a.Fire();` 编译通过、静默不触发（输出只有 `end`） | 28 | ⬜ 待修（A33-2 一并） |
 | A43-A6 | 捕获式 lambda：`(a) => a + k` 报 `use of undeclared identifier 'k'`；捕获字段时诊断还指向 `stdlib/System/Security/Cryptography/Md5.zan`（位置也错） | 22 | ⬜ 待修（A33-2） |
@@ -929,6 +929,24 @@ leakcheck 子集全部通过；生成 IR 不含 `setjmp`/`longjmp`/`__zan_eh_tmp
   206 项，失败仅 `field_decl_initializers`（既有）与 `golden_async_delay_ir`/
   `golden_async_socket_ir` —— 后两者用 HEAD 版 `irgen_emit.c` 重建后同样失败，
   来自工作区里未提交的 stdlib 改动，不是本次修改引入。
+
+### A43-A3 详情（已完成 2026-08-04）
+
+* 根因：带方法体的接口方法只被绑定成**接口的**成员就到此为止 —— irgen 从不遍历
+  `AST_INTERFACE_DECL`，默认体永远不发射；于是经接口变量调用得 0，经类变量调用
+  直接报 `'C' has no member 'G'`。
+* 修复：`binder.c` 新增 pass 1.5（在类型注册之后、成员绑定之前）
+  `bind_default_interface_methods()`：把实现类型没有自己覆盖的默认接口方法**浅拷贝**
+  成该类型的普通方法（节点身份必须独立，irgen 用声明节点做方法符号与函数的键）。
+  之后一切照普通方法走：绑定、发射、分发都不需要特殊分支，默认体里的 `this.F()`
+  自然解析到实现类型的 `F`。接口继承接口的默认方法递归拷贝（深度上限 8）。
+* 实测：经接口变量（44=42）、经类变量（80=42）、默认体调用 `this.F()`（100=5|5，
+  类自己覆盖时取覆盖版 99）、带参数与返回 string（101）、接口继承链（102=6|6）。
+* 正式测试：`tests/conformance/interface_default_methods.zan`。
+* 回归：全量 `ctest`（994 项）失败 100 项，其中 91 项在**未改动 binder 的基线**
+  上同样失败（工作区里未提交的 stdlib 改动删掉了 `X.Create(...)` 工厂，测试仍在调用，
+  例：`'StreamWriter' has no member 'Create'`），另外 9 项 leakcheck 在本次改动的
+  构建上反而全部通过（上一次是并发跑测时的偶发失败）。
 
 ## A43-B 语法缺失（parser 层不接受，按价值排序）
 
