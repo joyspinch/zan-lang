@@ -544,6 +544,11 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                 unsigned bits = LLVMGetIntTypeWidth(init_type);
                 if (bits <= 32) type = g->binder->type_int;
                 else type = g->binder->type_long;
+            } else if (llvm_is_nullable(init_type)) {
+                /* `var v = maybe;` keeps the nullable type, so `v.HasValue`
+                 * still resolves. */
+                zan_type_t *it = infer_expr_type(g, init, locals);
+                type = (it && it->kind == TYPE_NULLABLE) ? it : g->binder->type_int;
             } else {
                 type = g->binder->type_int;
             }
@@ -791,7 +796,10 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             LLVMTypeRef fn_ret = g->current_fn_ret_type;
             LLVMTypeRef val_t = LLVMTypeOf(val);
             if (val_t != fn_ret) {
-                if (LLVMGetTypeKind(fn_ret) == LLVMFloatTypeKind &&
+                if (llvm_is_nullable(fn_ret)) {
+                    /* `return 5;` / `return null;` from a `T?` method. */
+                    val = coerce_int_to(g, val, fn_ret);
+                } else if (LLVMGetTypeKind(fn_ret) == LLVMFloatTypeKind &&
                     LLVMGetTypeKind(val_t) == LLVMDoubleTypeKind) {
                     val = LLVMBuildFPTrunc(g->builder, val, fn_ret, "rettrunc");
                 } else if (LLVMGetTypeKind(fn_ret) == LLVMDoubleTypeKind &&

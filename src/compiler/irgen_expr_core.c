@@ -1168,6 +1168,15 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
         if (is_span_type(ot) && e->member.name.len == 6 &&
             memcmp(e->member.name.str, "Length", 6) == 0)
             return g->binder->type_int;
+        /* `v.HasValue` is a bool and `v.Value` the underlying value. */
+        if (ot && ot->kind == TYPE_NULLABLE) {
+            if (e->member.name.len == 8 &&
+                memcmp(e->member.name.str, "HasValue", 8) == 0)
+                return g->binder->type_bool;
+            if (e->member.name.len == 5 &&
+                memcmp(e->member.name.str, "Value", 5) == 0)
+                return ot->element_type;
+        }
         if (ot && ot->sym) {
             zan_symbol_t *fs = get_field_sym(ot->sym, e->member.name);
             if (fs) {
@@ -1245,6 +1254,10 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
                 zan_type_t *bot = infer_expr_type(g, callee->member.object, locals);
                 if (bot && bot->kind == TYPE_STRING)
                     return zan_binder_make_array_type(g->binder, g->binder->type_byte);
+            }
+            if (mm.len == 17 && memcmp(mm.str, "GetValueOrDefault", 17) == 0) {
+                zan_type_t *nvt = infer_expr_type(g, callee->member.object, locals);
+                if (nvt && nvt->kind == TYPE_NULLABLE) return nvt->element_type;
             }
             if (mm.len == 5 && memcmp(mm.str, "ToStr", 5) == 0) {
                 zan_type_t *bot = infer_expr_type(g, callee->member.object, locals);
@@ -1382,6 +1395,10 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
         case TK_LESS_LESS: case TK_GREATER_GREATER: {
             zan_type_t *lt = infer_expr_type(g, e->binary.left, locals);
             zan_type_t *rt = infer_expr_type(g, e->binary.right, locals);
+            /* An operand's nullability carries into the result: `a + 1` on an
+             * `int?` is an `int?` (null when a is). */
+            if (lt && lt->kind == TYPE_NULLABLE) return lt;
+            if (rt && rt->kind == TYPE_NULLABLE) return rt;
             if ((lt && lt->kind == TYPE_ULONG) || (rt && rt->kind == TYPE_ULONG))
                 return g->binder->type_ulong;
             /* otherwise the result keeps the operand type when both agree

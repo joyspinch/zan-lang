@@ -174,6 +174,24 @@ static LLVMValueRef emit_string_copy_range(zan_irgen_t *g,
 
 static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
         local_scope_t *locals) {
+        /* `v.GetValueOrDefault()` / `v.ToString()` on a nullable value type:
+         * the payload (already zero when null) and the C# text form. */
+        if (expr->call.callee->kind == AST_MEMBER_ACCESS &&
+            expr->call.args.count == 0) {
+            zan_ast_node_t *recv = expr->call.callee->member.object;
+            zan_istr_t mname = expr->call.callee->member.name;
+            zan_type_t *nt = infer_expr_type(g, recv, locals);
+            bool is_gvod = mname.len == 17 &&
+                memcmp(mname.str, "GetValueOrDefault", 17) == 0;
+            bool is_tostr = mname.len == 8 && memcmp(mname.str, "ToString", 8) == 0;
+            if (nt && nt->kind == TYPE_NULLABLE && (is_gvod || is_tostr)) {
+                LLVMValueRef nv = emit_expr(g, recv, locals);
+                if (llvm_is_nullable(LLVMTypeOf(nv)))
+                    return is_gvod ? nullable_get_payload(g, nv)
+                                   : emit_to_cstr(g, nv);
+            }
+        }
+
         /* Task.Spawn(<asyncCall>) — fire-and-forget: run an async call as an
          * independent coroutine WITHOUT awaiting it. Emits the callee's ramp
          * (heap frame) then schedules it on the cooperative driver with no
@@ -350,6 +368,15 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                         (LLVMTypeRef[]){ dbl },
                         1, 0);
                     zan_call2(g->builder, fn_type, g->rt_print_double, &arg, 1, "");
+                } else if (llvm_is_nullable(arg_type)) {
+                    /* a null `T?` prints as an empty line, as in C#. */
+                    LLVMValueRef ns = emit_to_cstr(g, arg);
+                    LLVMTypeRef i8p = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+                    zan_call2(g->builder,
+                        LLVMFunctionType(LLVMVoidTypeInContext(g->ctx),
+                                         (LLVMTypeRef[]){ i8p }, 1, 0),
+                        g->rt_println, &ns, 1, "");
+                    emit_string_release(g, ns);
                 } else if (expr_is_char(g, arg_ast, locals)) {
                     /* char prints as the character (C#), UTF-8 encoded. */
                     LLVMValueRef cs = emit_char_to_cstr(g, arg);
@@ -407,6 +434,12 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                         dbl_arg = LLVMBuildFPExt(g->builder, arg, LLVMDoubleTypeInContext(g->ctx), "ext");
                     LLVMValueRef args[] = { fmt, dbl_arg };
                     zan_call2(g->builder, printf_type, printf_fn, args, 2, "");
+                } else if (llvm_is_nullable(arg_type)) {
+                    LLVMValueRef ns = emit_to_cstr(g, arg);
+                    LLVMValueRef nfmt = LLVMBuildGlobalStringPtr(g->builder, "%s", "wfmt_n");
+                    LLVMValueRef nargs[] = { nfmt, ns };
+                    zan_call2(g->builder, printf_type, printf_fn, nargs, 2, "");
+                    emit_string_release(g, ns);
                 } else if (expr_is_char(g, arg_ast, locals)) {
                     LLVMValueRef cs = emit_char_to_cstr(g, arg);
                     LLVMValueRef cfmt = LLVMBuildGlobalStringPtr(g->builder, "%s", "wfmt_c");

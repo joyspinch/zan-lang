@@ -200,9 +200,10 @@ zan_type_t *zan_binder_subst_named(zan_binder_t *b, zan_type_t *t,
     return nt;
 }
 
-/* Value types have no null representation of their own: a `T?` over one needs a
- * Nullable<T> lowering that irgen does not have yet. Type parameters are left
- * out -- the substituted type is not known here. */
+/* Value types have no null representation of their own, so `T?` over one is a
+ * real wrapper (irgen lowers it to a payload + has-value pair); over a
+ * reference type it is just T. Type parameters are left out -- the substituted
+ * type is not known here. */
 static bool type_is_value_kind(zan_type_t *t) {
     if (!t) return false;
     switch (t->kind) {
@@ -352,17 +353,11 @@ zan_type_t *zan_binder_resolve_type(zan_binder_t *b, zan_ast_node_t *type_ref) {
     /* wrap in nullable if needed */
     if (type_ref->type_ref.is_nullable) {
         /* `T?` over a reference type is just T: the reference already carries
-         * null. Over a value type it would need a `Nullable<T>` representation
-         * (value + has-value flag), which does not exist yet -- the slot was a
-         * plain pointer, so `int? v = 5` stored 5 as an address and any use of
-         * it crashed or failed LLVM verification. Reject it instead of
-         * miscompiling; see TASKS.md A43-A11. */
+         * null. Over a value type it becomes a TYPE_NULLABLE wrapper, which
+         * irgen lowers to `{ payload, i1 }` -- the value plus a has-value flag.
+         * (Mapping it to a bare pointer stored `int? v = 5` as the address 5.) */
         if (!type_ref->type_ref.is_array && resolved && resolved != b->type_error &&
             type_is_value_kind(resolved)) {
-            zan_diag_emit(b->diag, DIAG_ERROR, type_ref->loc,
-                          "nullable value type '%.*s?' is not supported yet; "
-                          "use a sentinel value or a reference type",
-                          name.len, name.str);
             zan_type_t *nullable = make_type(b->arena, TYPE_NULLABLE, name.str, name.len);
             nullable->element_type = resolved;
             resolved = nullable;

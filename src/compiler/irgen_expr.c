@@ -593,6 +593,21 @@ static LLVMValueRef emit_typed_equality(zan_irgen_t *g, zan_type_t *type,
     return zan_icmp(g->builder, LLVMIntEQ, left, right, "eq.raw");
 }
 
+/* Emit the operator itself once both operands are values: everything above it
+ * in emit_expr_binary (operator overloads, strings, pointers) has already had
+ * its chance. Split out so that the lifted nullable forms can reuse the exact
+ * same lowering on the unwrapped payloads. */
+static LLVMValueRef emit_binary_op_values(zan_irgen_t *g, zan_ast_node_t *expr,
+                                          LLVMValueRef left, LLVMValueRef right,
+                                          local_scope_t *locals);
+
+/* `int?` and friends in a binary expression: null propagates through the
+ * arithmetic operators, a comparison with a null operand is false, and `??`
+ * unwraps. */
+static LLVMValueRef emit_nullable_binary(zan_irgen_t *g, zan_ast_node_t *expr,
+                                         LLVMValueRef left, LLVMValueRef right,
+                                         local_scope_t *locals);
+
 static LLVMValueRef emit_expr_binary(zan_irgen_t *g, zan_ast_node_t *expr,
         local_scope_t *locals) {
         /* Short-circuit logical operators must not evaluate the right operand
@@ -692,6 +707,14 @@ static LLVMValueRef emit_expr_binary(zan_irgen_t *g, zan_ast_node_t *expr,
                 }
             }
         }
+
+        /* A nullable operand lifts the operator (below); a string one means
+         * this is a concatenation and is handled further down. */
+        if ((llvm_is_nullable(LLVMTypeOf(left)) ||
+             llvm_is_nullable(LLVMTypeOf(right))) &&
+            !is_string_expr(g, expr->binary.left, locals) &&
+            !is_string_expr(g, expr->binary.right, locals))
+            return emit_nullable_binary(g, expr, left, right, locals);
 
         /* Two structs compare memberwise, like a C# value type without a
          * user-defined operator: LLVM has no icmp for aggregates, so the
@@ -821,6 +844,12 @@ static LLVMValueRef emit_expr_binary(zan_irgen_t *g, zan_ast_node_t *expr,
             return pcmp;
         }
 
+        return emit_binary_op_values(g, expr, left, right, locals);
+}
+
+static LLVMValueRef emit_binary_op_values(zan_irgen_t *g, zan_ast_node_t *expr,
+                                          LLVMValueRef left, LLVMValueRef right,
+                                          local_scope_t *locals) {
         /* reconcile mixed-width integer operands (e.g. i32 int vs i64 length)
          * and convert an integer meeting a float/double one */
         coerce_int_pair(g, &left, &right);
@@ -924,7 +953,94 @@ static LLVMValueRef emit_expr_binary(zan_irgen_t *g, zan_ast_node_t *expr,
         default:
             return LLVMConstInt(LLVMInt64TypeInContext(g->ctx), 0, 0);
         }
-    return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
+}
+
+/* A binary node with the same operands but a different operator, so a lifted
+ * comparison can ask for the payload equality it needs. */
+static zan_ast_node_t *binary_with_op(zan_irgen_t *g, zan_ast_node_t *expr,
+                                      int op) {
+    zan_ast_node_t *n = zan_ast_new(g->arena, AST_BINARY, expr->loc);
+    n->binary.op = op;
+    n->binary.left = expr->binary.left;
+    n->binary.right = expr->binary.right;
+    return n;
+}
+
+static LLVMValueRef emit_nullable_binary(zan_irgen_t *g, zan_ast_node_t *expr,
+                                         LLVMValueRef left, LLVMValueRef right,
+                                         local_scope_t *locals) {
+    LLVMTypeRef i1 = LLVMInt1TypeInContext(g->ctx);
+    LLVMValueRef yes = LLVMConstInt(i1, 1, 0);
+    int op = expr->binary.op;
+    bool left_is_null_lit = expr->binary.left->kind == AST_NULL_LITERAL;
+    bool right_is_null_lit = expr->binary.right->kind == AST_NULL_LITERAL;
+    bool ln = llvm_is_nullable(LLVMTypeOf(left));
+    bool rn = llvm_is_nullable(LLVMTypeOf(right));
+    LLVMValueRef lhas = ln ? nullable_has_value(g, left) : yes;
+    LLVMValueRef rhas = rn ? nullable_has_value(g, right) : yes;
+    LLVMValueRef lval = ln ? nullable_get_payload(g, left) : left;
+    LLVMValueRef rval = rn ? nullable_get_payload(g, right) : right;
+
+    /* `v == null` / `v != null` reads the flag; the payload is irrelevant. */
+    if ((op == TK_EQ_EQ || op == TK_BANG_EQ) &&
+        (left_is_null_lit || right_is_null_lit)) {
+        LLVMValueRef has = left_is_null_lit ? rhas : lhas;
+        return op == TK_EQ_EQ ? LLVMBuildNot(g->builder, has, "nv.isnull") : has;
+    }
+
+    /* `v ?? alt`: the payload when there is one. Both sides were evaluated
+     * eagerly above, exactly as the non-nullable `??` does. */
+    if (op == TK_QUESTION_QUESTION) {
+        if (!ln) return left;
+        if (rn) return LLVMBuildSelect(g->builder, lhas, left, right, "nv.coal");
+        LLVMValueRef alt = coerce_int_to(g, right, LLVMTypeOf(lval));
+        if (LLVMTypeOf(alt) != LLVMTypeOf(lval)) {
+            lval = coerce_int_to(g, lval, LLVMTypeOf(right));
+            alt = right;
+        }
+        if (LLVMTypeOf(alt) != LLVMTypeOf(lval)) return left;
+        return LLVMBuildSelect(g->builder, lhas, lval, alt, "nv.coal");
+    }
+
+    LLVMValueRef both = LLVMBuildAnd(g->builder, lhas, rhas, "nv.both");
+
+    if (op == TK_EQ_EQ || op == TK_BANG_EQ) {
+        /* Two nullables are equal when both hold none, or both hold the same
+         * value -- the C# lifted equality, which (unlike the other operators)
+         * yields a plain bool. */
+        LLVMValueRef eq = emit_binary_op_values(g,
+            binary_with_op(g, expr, TK_EQ_EQ), lval, rval, locals);
+        LLVMValueRef neither = LLVMBuildAnd(g->builder,
+            LLVMBuildNot(g->builder, lhas, "nv.ln"),
+            LLVMBuildNot(g->builder, rhas, "nv.rn"), "nv.neither");
+        LLVMValueRef same = LLVMBuildOr(g->builder, neither,
+            LLVMBuildAnd(g->builder, both, eq, "nv.veq"), "nv.eq");
+        return op == TK_EQ_EQ ? same
+                              : LLVMBuildNot(g->builder, same, "nv.ne");
+    }
+    if (op == TK_LESS || op == TK_LESS_EQ ||
+        op == TK_GREATER || op == TK_GREATER_EQ) {
+        /* An ordering comparison involving a null operand is false. */
+        LLVMValueRef cmp = emit_binary_op_values(g, expr, lval, rval, locals);
+        return LLVMBuildAnd(g->builder, both, cmp, "nv.cmp");
+    }
+
+    /* Arithmetic: the result is null when either operand is. The divisor is
+     * forced to 1 whenever the result is null, so the division-by-zero check
+     * cannot fire on an operation a lifted operator never performs. */
+    if (op == TK_SLASH || op == TK_PERCENT) {
+        LLVMTypeRef rt = LLVMTypeOf(rval);
+        LLVMValueRef one = LLVMGetTypeKind(rt) == LLVMDoubleTypeKind ||
+                           LLVMGetTypeKind(rt) == LLVMFloatTypeKind
+            ? LLVMConstReal(rt, 1.0)
+            : LLVMConstInt(rt, 1, 0);
+        rval = LLVMBuildSelect(g->builder, both, rval, one, "nv.div1");
+    }
+    LLVMValueRef res = emit_binary_op_values(g, expr, lval, rval, locals);
+    LLVMTypeRef nty = nullable_type_of(g, LLVMTypeOf(res));
+    LLVMValueRef some = nullable_some(g, nty, res);
+    if (!some) return res;
+    return LLVMBuildSelect(g->builder, both, some, nullable_none(nty), "nv.lift");
 }
 
 /* Shared lowering for prefix/postfix ++/-- (defined after
@@ -2363,6 +2479,26 @@ static LLVMValueRef emit_expr_string_interp(zan_irgen_t *g, zan_ast_node_t *expr
 
 static LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr,
         local_scope_t *locals) {
+        /* `v.HasValue` / `v.Value` on a nullable value type. `Value` on a null
+         * one is a program error, reported like the other runtime checks
+         * instead of handing back the zeroed payload. */
+        {
+            zan_type_t *nt = infer_expr_type(g, expr->member.object, locals);
+            bool is_has = expr->member.name.len == 8 &&
+                memcmp(expr->member.name.str, "HasValue", 8) == 0;
+            bool is_val = expr->member.name.len == 5 &&
+                memcmp(expr->member.name.str, "Value", 5) == 0;
+            if (nt && nt->kind == TYPE_NULLABLE && (is_has || is_val)) {
+                LLVMValueRef nv = emit_expr(g, expr->member.object, locals);
+                if (llvm_is_nullable(LLVMTypeOf(nv))) {
+                    if (is_has) return nullable_has_value(g, nv);
+                    emit_runtime_check(g,
+                        LLVMBuildNot(g->builder, nullable_has_value(g, nv), "nv.novalue"),
+                        expr->loc, "Nullable object must have a value");
+                    return nullable_get_payload(g, nv);
+                }
+            }
+        }
         /* Guard: a member access whose receiver is a builtin scalar type is
          * only valid for the compiler-lowered string.Length property. Any
          * other name was a typo that the checker rejects; this second line of
@@ -4152,6 +4288,17 @@ static LLVMValueRef emit_expr_cast_expr(zan_irgen_t *g, zan_ast_node_t *expr,
         zan_type_t *tt = resolve_type_ctx(g, expr->cast.type);
         LLVMTypeRef target = tt ? map_type(g, tt) : LLVMInt64TypeInContext(g->ctx);
         LLVMTypeRef src = LLVMTypeOf(val);
+        /* `(int)v` on an `int?` is the explicit unwrapping conversion, and
+         * `(int?)x` the wrapping one. */
+        if (llvm_is_nullable(src) && !llvm_is_nullable(target)) {
+            emit_runtime_check(g,
+                LLVMBuildNot(g->builder, nullable_has_value(g, val), "nv.novalue"),
+                expr->loc, "Nullable object must have a value");
+            val = nullable_get_payload(g, val);
+            src = LLVMTypeOf(val);
+        } else if (llvm_is_nullable(target) && src != target) {
+            return coerce_int_to(g, val, target);
+        }
         /* Unsigned targets keep the 64-bit register form even though they are
          * stored narrow, so their cast semantics are wrap-to-width masks
          * (zero-extend for uint/ushort, sign-extend from 8 bits for sbyte)
@@ -4954,6 +5101,9 @@ static LLVMValueRef emit_arg_typed(zan_irgen_t *g, zan_ast_node_t *arg,
     if (v && ptype && (ptype->kind == TYPE_DOUBLE || ptype->kind == TYPE_FLOAT) &&
         LLVMGetTypeKind(LLVMTypeOf(v)) == LLVMIntegerTypeKind &&
         LLVMGetIntTypeWidth(LLVMTypeOf(v)) > 1)
+        v = coerce_int_to(g, v, map_type(g, ptype));
+    /* `f(5)` / `f(null)` against a `T?` parameter passes the wrapped value. */
+    if (v && ptype && ptype->kind == TYPE_NULLABLE)
         v = coerce_int_to(g, v, map_type(g, ptype));
     return v;
 }

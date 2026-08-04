@@ -1621,6 +1621,79 @@ static zan_type_t *resolve_type_ctx(zan_irgen_t *g, zan_ast_node_t *tref) {
     return t;
 }
 
+/* ---- nullable value types (`int?`, `Point?`) -------------------------------
+ *
+ * A nullable value type lowers to `{ payload, i1 }`: the value itself plus a
+ * has-value flag. The struct is *named* (`zan.nullable.<payload>`) so that the
+ * wrap/unwrap boundaries below can recognise it from the LLVM type alone
+ * without ever mistaking a user struct that happens to have the same shape. */
+#define ZAN_NULLABLE_PREFIX "zan.nullable."
+
+static LLVMValueRef coerce_int_to(zan_irgen_t *g, LLVMValueRef v, LLVMTypeRef target);
+
+static bool llvm_is_nullable(LLVMTypeRef t) {
+    if (!t || LLVMGetTypeKind(t) != LLVMStructTypeKind) return false;
+    const char *n = LLVMGetStructName(t);
+    return n && strncmp(n, ZAN_NULLABLE_PREFIX,
+                        sizeof(ZAN_NULLABLE_PREFIX) - 1) == 0;
+}
+
+static LLVMTypeRef nullable_payload_type(LLVMTypeRef t) {
+    return LLVMStructGetTypeAtIndex(t, 0);
+}
+
+/* The nullable struct for a payload LLVM type, created once per payload. The
+ * payload's own printed name keys the type, so `int?` written in two places is
+ * one LLVM type and the values are interchangeable. */
+static LLVMTypeRef nullable_type_of(zan_irgen_t *g, LLVMTypeRef payload) {
+    char name[256];
+    size_t off = 0;
+    memcpy(name, ZAN_NULLABLE_PREFIX, sizeof(ZAN_NULLABLE_PREFIX) - 1);
+    off = sizeof(ZAN_NULLABLE_PREFIX) - 1;
+    char *pn = LLVMPrintTypeToString(payload);
+    for (const char *p = pn; p && *p && off < sizeof(name) - 1; p++) {
+        char c = (*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
+                 (*p >= '0' && *p <= '9') ? *p : '_';
+        name[off++] = c;
+    }
+    name[off] = 0;
+    if (pn) LLVMDisposeMessage(pn);
+    LLVMTypeRef existing = LLVMGetTypeByName2(g->ctx, name);
+    if (existing) return existing;
+    LLVMTypeRef st = LLVMStructCreateNamed(g->ctx, name);
+    LLVMTypeRef body[2] = { payload, LLVMInt1TypeInContext(g->ctx) };
+    LLVMStructSetBody(st, body, 2, 0);
+    return st;
+}
+
+/* The `null` of a nullable type: a zeroed payload with the flag clear. */
+static LLVMValueRef nullable_none(LLVMTypeRef nty) {
+    return LLVMConstNull(nty);
+}
+
+/* Wrap a payload value, fitting it to the payload slot first (an i64 literal
+ * meeting an `int?` narrows exactly as it would meeting an `int`). Returns NULL
+ * when the value cannot be a payload of this type, so callers can leave the
+ * value alone instead of building invalid IR. */
+static LLVMValueRef nullable_some(zan_irgen_t *g, LLVMTypeRef nty, LLVMValueRef v) {
+    LLVMTypeRef pl = nullable_payload_type(nty);
+    LLVMValueRef fit = coerce_int_to(g, v, pl);
+    if (LLVMTypeOf(fit) != pl) return NULL;
+    LLVMValueRef agg = LLVMBuildInsertValue(g->builder, LLVMGetUndef(nty), fit,
+                                            0, "nv.val");
+    return LLVMBuildInsertValue(g->builder, agg,
+                                LLVMConstInt(LLVMInt1TypeInContext(g->ctx), 1, 0),
+                                1, "nv.some");
+}
+
+static LLVMValueRef nullable_has_value(zan_irgen_t *g, LLVMValueRef v) {
+    return LLVMBuildExtractValue(g->builder, v, 1, "nv.has");
+}
+
+static LLVMValueRef nullable_get_payload(zan_irgen_t *g, LLVMValueRef v) {
+    return LLVMBuildExtractValue(g->builder, v, 0, "nv.get");
+}
+
 static LLVMTypeRef map_type(zan_irgen_t *g, zan_type_t *type) {
     if (!type) return LLVMVoidTypeInContext(g->ctx);
     switch (type->kind) {
@@ -1642,6 +1715,12 @@ static LLVMTypeRef map_type(zan_irgen_t *g, zan_type_t *type) {
     case TYPE_OBJECT: return LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     case TYPE_ENUM:
         return LLVMInt64TypeInContext(g->ctx);
+    case TYPE_NULLABLE:
+        /* Only value types reach here: the binder leaves `T?` over a reference
+         * type as plain T, which already admits null. */
+        if (type->element_type)
+            return nullable_type_of(g, map_type(g, type->element_type));
+        return LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     case TYPE_DELEGATE: {
         /* delegate types map to function pointer types */
         int pc = type->delegate_param_count;

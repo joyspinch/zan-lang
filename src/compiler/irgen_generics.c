@@ -902,6 +902,27 @@ static void coerce_int_pair(zan_irgen_t *g, LLVMValueRef *a, LLVMValueRef *b) {
  * matching-width values, and non-integer targets, pass through unchanged. */
 static LLVMValueRef coerce_int_to(zan_irgen_t *g, LLVMValueRef v, LLVMTypeRef target) {
     LLVMTypeRef vt = LLVMTypeOf(v);
+    /* A payload value meeting a nullable slot is wrapped, and the null literal
+     * (a null pointer) becomes the none value: `int? v = 5;` and `v = null;`
+     * both go through here, as does every argument, return and field store. */
+    if (llvm_is_nullable(target) && vt != target) {
+        if (LLVMGetTypeKind(vt) == LLVMPointerTypeKind)
+            return LLVMIsNull(v) ? nullable_none(target) : v;
+        if (llvm_is_nullable(vt)) {
+            /* One nullable form meeting another: `a + 1` on an `int?` computes
+             * its payload in the i64 register form, so only the payload is
+             * converted -- the has-value flag carries over as it is. */
+            LLVMTypeRef pl = nullable_payload_type(target);
+            LLVMValueRef fit = coerce_int_to(g, nullable_get_payload(g, v), pl);
+            if (LLVMTypeOf(fit) != pl) return v;
+            LLVMValueRef agg = LLVMBuildInsertValue(g->builder,
+                LLVMGetUndef(target), fit, 0, "nv.val");
+            return LLVMBuildInsertValue(g->builder, agg,
+                nullable_has_value(g, v), 1, "nv.fit");
+        }
+        LLVMValueRef wrapped = nullable_some(g, target, v);
+        return wrapped ? wrapped : v;
+    }
     /* `float` slots hold f32 while every literal and arithmetic result is a
      * double, so a value is rounded on the way in and widened on the way out;
      * storing the f64 bits raw wrote a denormal (which printed as 0). */
@@ -959,6 +980,11 @@ static LLVMValueRef zan_store_fit(zan_irgen_t *g, LLVMValueRef val, LLVMValueRef
             target = src;
         }
     }
+    /* A nullable slot takes the wrapped form of whatever arrives, including the
+     * null literal -- which must not be treated as a struct behind a pointer
+     * (the copy below would dereference it). */
+    if (target && llvm_is_nullable(target) && LLVMTypeOf(val) != target)
+        return LLVMBuildStore(g->builder, coerce_int_to(g, val, target), ptr);
     /* A value struct that arrives behind a pointer (`S s = new S();`, a byref
      * receiver) is copied into the slot. Storing the pointer itself writes
      * eight bytes into a slot that is only as wide as the struct, which
@@ -1298,6 +1324,40 @@ static LLVMValueRef emit_to_cstr(zan_irgen_t *g, LLVMValueRef val) {
     LLVMTypeRef vt = LLVMTypeOf(val);
     LLVMTypeKind vtk = LLVMGetTypeKind(vt);
     if (vtk == LLVMPointerTypeKind) return val;
+
+    /* A nullable formats as its value, or as the empty string when it holds
+     * none (C#). The payload is formatted on its own branch so that a none
+     * value never allocates a string it would then have to drop. */
+    if (llvm_is_nullable(vt)) {
+        LLVMTypeRef nv_i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+        LLVMValueRef has = nullable_has_value(g, val);
+        LLVMValueRef payload = nullable_get_payload(g, val);
+        LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder));
+        LLVMBasicBlockRef some_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "nv.str.some");
+        LLVMBasicBlockRef none_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "nv.str.none");
+        LLVMBasicBlockRef end_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "nv.str.end");
+        LLVMBuildCondBr(g->builder, has, some_bb, none_bb);
+
+        LLVMPositionBuilderAtEnd(g->builder, some_bb);
+        LLVMValueRef sv = emit_to_cstr(g, payload);
+        LLVMBasicBlockRef some_end = LLVMGetInsertBlock(g->builder);
+        LLVMBuildBr(g->builder, end_bb);
+
+        LLVMPositionBuilderAtEnd(g->builder, none_bb);
+        LLVMValueRef empty = emit_string_alloc_rc(g,
+            LLVMConstInt(LLVMInt64TypeInContext(g->ctx), 1, 0));
+        LLVMBuildStore(g->builder, LLVMConstInt(LLVMInt8TypeInContext(g->ctx), 0, 0),
+                       empty);
+        LLVMBasicBlockRef none_end = LLVMGetInsertBlock(g->builder);
+        LLVMBuildBr(g->builder, end_bb);
+
+        LLVMPositionBuilderAtEnd(g->builder, end_bb);
+        LLVMValueRef phi = LLVMBuildPhi(g->builder, nv_i8ptr, "nv.str");
+        LLVMValueRef vals[] = { sv, empty };
+        LLVMBasicBlockRef bbs[] = { some_end, none_end };
+        LLVMAddIncoming(phi, vals, bbs, 2);
+        return phi;
+    }
 
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);

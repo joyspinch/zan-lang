@@ -868,7 +868,7 @@ leakcheck 子集全部通过；生成 IR 不含 `setjmp`/`longjmp`/`__zan_eh_tmp
 | A43-A2 | 默认参数值不填充：`F(1)` 调 `F(int a, int b = 2)` LLVM 校验失败；`new A(1)` 静默不调用构造器，字段留 0 | 19,81–88 | ✅ 已修（见下 A43-A2 详情） |
 | A43-A3 | 接口默认方法（`interface I { int G() { return 42; } }`）经接口变量调用一律返回 0；经类变量调用报 `'C' has no member 'G'` | 44,51,52,80,100–102 | ✅ 已修（见下 A43-A3 详情） |
 | A43-A4 | `int? v = a?.x;` 运行时崩溃（0xC0000005）；此前是 `PHI node operands are not the same type` | 21,43,110–145 | ✅ 已修（见下 A43-A4 详情） |
-| A43-A11 | `Nullable<T>`（值类型可空的真实表示：值 + has-value）尚未实现，`int?` 现在报错拒绝而不是误编译 | 130,144 | ⬜ 待做（新登记） |
+| A43-A11 | `Nullable<T>`：值类型可空缺少真实表示（值 + has-value），`int?` 一度只能报错拒绝 | 130,144 | ✅ 已修（见下 A43-A11 详情） |
 | A43-A5 | `event H E;` + `a.E += P.OnE; a.Fire();` 编译通过、静默不触发（输出只有 `end`） | 28 | ⬜ 待修（A33-2 一并） |
 | A43-A6 | 捕获式 lambda：`(a) => a + k` 报 `use of undeclared identifier 'k'`；捕获字段时诊断还指向 `stdlib/System/Security/Cryptography/Md5.zan`（位置也错） | 22 | ⬜ 待修（A33-2） |
 | A43-A7 | 泛型类里的实例泛型方法 `Pool<T>.M<U>()` 运行崩溃（0xC0000005） | 13 | ⬜ 待修（A32-3a） |
@@ -964,9 +964,9 @@ leakcheck 子集全部通过；生成 IR 不含 `setjmp`/`longjmp`/`__zan_eh_tmp
 
 1. `binder.c`：`T?` 在引用类型上**不再包装** —— 引用本身就允许 null，`A?` 就是 `A`，
    类身份不再丢失。
-2. `binder.c`：`T?` 在值类型（含用户 `struct`、`enum`）上直接诊断
+2. `binder.c`：`T?` 在值类型（含用户 `struct`、`enum`）上先直接诊断
    `nullable value type 'int?' is not supported yet`，不再误编译。真实的
-   `Nullable<T>` 表示登记为 A43-A11。
+   `Nullable<T>` 表示登记为 A43-A11，已在下文实现，诊断随之删除。
 3. `parser.c`：`looks_like_var_decl` 之前只认内建类型的 `int?`，`A? a = ...`
    被当成三元表达式（`expected ':', got ';'`）。现在 `IDENT ?` 后跟标识符再跟
    `=` 或 `;` 判为声明，`a ?? b`、`a?.b`、`a?[i]`、`c ? a : b` 仍是表达式。
@@ -975,11 +975,64 @@ leakcheck 子集全部通过；生成 IR 不含 `setjmp`/`longjmp`/`__zan_eh_tmp
 `I? i = new C(); i.F()` → 8（145）、`string? s = null; s ?? "d"`（131、141）、
 三元与 `?.` 未受影响（142、143）、`int?`/`S?` 报诊断（130、144）。
 
-正式测试：`tests/conformance/nullable_reference_types.zan`、
-`tests/diag/nullable_value_type.zan`（CMakeLists 注册）。
+正式测试：`tests/conformance/nullable_reference_types.zan`
+（`tests/diag/nullable_value_type.zan` 在 A43-A11 落地后删除）。
 
 回归：全量 `ctest`（998 项）新增失败在**基线**上逐一复跑同样失败（`X.Create(...)`
 工厂被工作区未提交的改动删掉），其余是并发跑测时的超时，串行复跑通过。
+
+### A43-A11 详情（已完成 2026-08-04）
+
+值类型 `T?` 现在有真实表示：`{ payload, i1 }` —— 值本身加一个 has-value 标志。
+LLVM 侧是**具名** struct `zan.nullable.<payload>`（`irgen.c` 的 `nullable_type_of`），
+名字前缀就是识别依据，形状相同的用户 struct 不会被误判成可空值。
+
+改动落在值的每个进出边界，而不是某一处特判：
+
+1. `binder.c`：值类型 `T?` 不再诊断，包成 `TYPE_NULLABLE`（引用类型仍然不包，
+   `A?` 就是 `A`）。
+2. `irgen.c`：`map_type` 增加 `TYPE_NULLABLE` 分支（此前落到 `default:` 的裸 `i8*`
+   就是 A43-A4 里那些崩溃的根因），并提供包/解包与标志读写的小工具。
+3. `irgen_generics.c`：`coerce_int_to` 是所有存储的共同入口，在这里把
+   payload 包起来、把 `null`（i8* null）变成 none、把另一种 payload 宽度的可空值
+   （`a + 1` 的结果算在 i64 上）转成槽位的形状且保留标志；`zan_store_fit` 对可空槽
+   先转换再存，避免把 `null` 当成"指针后面的 struct"去复制。
+4. `irgen_expr.c`：二元运算的算符部分拆成 `emit_binary_op_values`，可空提升
+   （`emit_nullable_binary`）在解包后复用同一套 lowering —— `==`/`!=` 对 `null`
+   只看标志，两个可空值比较遵循 C#（都为 null 相等），`<`/`>` 等有 null 参与即
+   为 false，算术运算 null 传染，`??` 解包；`/`、`%` 在结果为 null 时把除数换成 1，
+   免得除零检查在一个根本不会执行的运算上报错（C# 的提升运算符不执行该运算）。
+   另外 `v.HasValue`/`v.Value`（null 时按运行时错误报
+   `Nullable object must have a value`）、`(int)v` 显式解包、`(int?)x` 包装、
+   `T?` 形参传值。
+5. `irgen_call.c`：`v.GetValueOrDefault()`、`v.ToString()`，以及
+   `Console.WriteLine/Write` 直接打印可空值（null 打印空串，同 C#）。
+6. `irgen_stmt.c`：`return` 到 `T?` 返回类型，`var v = <可空表达式>` 保留可空类型。
+7. `irgen_expr_core.c`：`infer_expr_type` 认识 `HasValue`/`Value`/
+   `GetValueOrDefault` 和"算术结果继承可空性"。
+
+实测（`_scratch/a11.zan`、`_scratch/a11b.zan`、`_scratch/a11c.zan`）：
+`int? a = 5; a.Value` → 5；`b = null` 时 `b.HasValue` → 0、`b ?? 7` → 7、
+`b == null` 成立；`a + 1` → 6、`b + 1` → null、`b / 0` → null（不再触发除零检查）；
+`int? Half(int)` 返回 `null`/值经 `??` 取出 → -1 / 5；`Console.WriteLine(a)` → `5`，
+null 打印空行，`"a=" + a` → `a=5`、`"f=" + f` → `f=`；`a == g`（都为 5）相等、
+`f == f`（都为 null）相等、`a == f` 不等、`f > 3` 为 false；字段 `int? level`
+默认为 null、可写入可写回 null；`Color?`、`bool?`、`long?`、`double?`、
+`Point?`（`pp.Value.x + pp.Value.y` → 3）都正确；`v.Value` 在 null 上运行时报
+`runtime error: Nullable object must have a value`（退出码 70）。
+
+正式测试：`tests/conformance/nullable_value_types.zan`（+`.out`，conformance 目录
+是 glob 注册，无需改 CMakeLists）。原来的 `diag_nullable_value_type` 测试与
+`tests/diag/nullable_value_type.zan` 一并删除——它断言的正是现在已经支持的写法。
+
+回归：`ctest -R 'conformance|diag' -j 8` → 343 项中 45 项失败，失败全部是
+`'X' has no member 'Create'` 这类工作区里未提交的 stdlib 改动造成的编译错误
+（redis/orm/gui/sdk 等），加上依赖真实桌面窗口的 `win_automation_smoke`；
+`conformance_nullable_reference_types` 与新增的 `conformance_nullable_value_types`
+都通过。
+
+仍缺（登记为 A43-B19）：`int?[]` 这种可空元素数组 parser 不接受
+（`expected variable name`）。
 
 ## A43-B 语法缺失（parser 层不接受，按价值排序）
 
@@ -1003,6 +1056,7 @@ leakcheck 子集全部通过；生成 IR 不含 `setjmp`/`longjmp`/`__zan_eh_tmp
 | A43-B16 | `KeyValuePair<K,V>` | 27 | `undefined type`；字典只能遍历 `Keys` |
 | A43-B17 | LINQ `orderby` / `join` / `let` / `group into` | 14 | 查询语法只支持单 `from...where...select` |
 | A43-B18 | `init` 访问器、`readonly struct` / `ref struct` | 09 | 无对应修饰符 |
+| A43-B19 | 可空元素数组 `int?[]` | a11b | `expected variable name`；`int?` 本身已支持 |
 
 > 已实测可用、别再当缺失：带参构造器与重载、`: this(...)` / `: base(...)`、方法重载、
 > `public/private/protected/internal`、`partial`、`#region/#endregion`、`const`、
