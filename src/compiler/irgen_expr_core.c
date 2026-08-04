@@ -1119,7 +1119,10 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
         if (l) return l->type;
         if (g->current_type_sym) {
             zan_symbol_t *fs = get_field_sym(g->current_type_sym, e->ident.name);
-            if (fs) return fs->type;
+            /* `item` (implicit `this.item`) declared as a class type parameter
+             * has the instantiation's concrete type inside a specialized body,
+             * exactly like the explicit `this.item` spelling. */
+            if (fs) return concretize(g, fs->type);
         }
         return NULL;
     }

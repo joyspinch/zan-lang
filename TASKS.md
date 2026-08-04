@@ -614,7 +614,7 @@ initializer/Add/upsert/indexer/Values/Remove/Clear/扩容。三档测试全部�
 `g->cur_inst = NULL`。async 则由 `emit_user_methods()` 单独按原方法符号建立 ramp/frame/resume，
 无法复用普通 method spec。
 
-### A32-3a 泛型类的实例泛型方法
+### A32-3a 泛型类的实例泛型方法（非 async 部分已完成，见 A43-A7 详情）
 
 1. 把特化 key 扩为 `{method symbol, owner instantiation, method type args}`；mangling 同时编码
    `Pool<OwnerT>` 与 `M<U>`，重载序号只处理真正签名冲突。
@@ -871,7 +871,7 @@ leakcheck 子集全部通过；生成 IR 不含 `setjmp`/`longjmp`/`__zan_eh_tmp
 | A43-A11 | `Nullable<T>`：值类型可空缺少真实表示（值 + has-value），`int?` 一度只能报错拒绝 | 130,144 | ✅ 已修（见下 A43-A11 详情） |
 | A43-A5 | `event H E;` + `a.E += P.OnE; a.Fire();` 编译通过、静默不触发（输出只有 `end`） | 28 | ⬜ 待修（A33-2 一并） |
 | A43-A6 | 捕获式 lambda：`(a) => a + k` 报 `use of undeclared identifier 'k'`；捕获字段时诊断还指向 `stdlib/System/Security/Cryptography/Md5.zan`（位置也错） | 22 | ⬜ 待修（A33-2） |
-| A43-A7 | 泛型类里的实例泛型方法 `Pool<T>.M<U>()` 运行崩溃（0xC0000005） | 13 | ⬜ 待修（A32-3a） |
+| A43-A7 | 泛型类里的实例泛型方法 `Pool<T>.M<U>()` 运行崩溃（0xC0000005） | 13 | ✅ 已修（A32-3a，见下 A43-A7 详情） |
 | A43-A8 | async 泛型方法返回垃圾值（打印 `-1886711216`） | 56 | ⬜ 待修（A32-3b） |
 | A43-A9 | `static A()` 只在首次 `new` 时执行：先读 `A.n` 得 0，`new A()` 后才是 7（C# 首次访问静态成员即触发） | 08,40,95–99 | ✅ 已修（见下 A43-A9 详情） |
 | A43-A10 | `readonly` 只解析不强制：`public readonly int x;` 在类外 `a.x = 6;` 编译通过并改值 | 71,72,90–94 | ✅ 已修（见下 A43-A10 详情） |
@@ -1033,6 +1033,48 @@ null 打印空行，`"a=" + a` → `a=5`、`"f=" + f` → `f=`；`a == g`（都�
 
 仍缺（登记为 A43-B19）：`int?[]` 这种可空元素数组 parser 不接受
 （`expected variable name`）。
+
+### A43-A7 详情（已完成 2026-08-04）
+
+`Pool<T>.M<U>()` 的崩溃不是一个 bug，是「类型参数被抹成裸指针」在四个边界上各漏一次：
+
+1. **方法特化的 ABI**（`irgen_emit.c`）。泛型方法原本只在「值得特化」时才单态化，
+   其余走 erased 模板：`M<int>(7)` 把 7 当指针传进去，返回值又被调用方当指针读回来，
+   于是 `Pool_Wrap$string` 的 IR 里参数和返回全是 `ptr`。现在只要调用点能把每个方法类型
+   参数绑定到具体类型，就一定发一份具体签名的特化，erased 变体只服务绑不出来的调用点。
+2. **特化 key 少了 owner instantiation**（`irgen.h`/`irgen_emit.c`/`irgen_call.c`）。
+   `zan_method_spec` 增加 `owner_inst`，key 变成 `{method symbol, owner instantiation,
+   method type args}`，名字里编码 `Pool$int_Echo$$Box` 这样的双重实例化；
+   `get_or_create_method_spec()` 不再拒绝泛型声明类型的实例方法，body emission 也不再把
+   `g->cur_inst` 清空，参数/返回类型先按 method bind、再按 owner instantiation 替换。
+3. **body 内的 self-call 要路由到同一个缓存**（`irgen_call.c`）。`this.Echo<U>(x)` 里
+   receiver 类型是未绑定的 `Pool<T>`，此前推不出 owner instantiation 就回落到 erased 变体：
+   `Pool$int_Forward$$Box` 直接调 `Pool_Echo$int`，返回的是**借用**的参数值，调用方却按
+   拥有 +1 处理，程序结束时二次释放（0xC0000374 堆损坏）。现在 receiver 落在正在发射的
+   实例化上时用 `g->cur_inst` 补齐 owner。
+4. **`T` 字段的 ARC 与格式化**（`irgen_expr.c`/`irgen_expr_core.c`/`irgen_generics.c`）。
+   `item = x`（隐式 `this.item`）用字段声明类型判断是否 RC 托管，`T` 不是托管类型于是
+   裸存指针：`Pool<Box>.Set(new Box(5))` 后临时对象被释放，字段成悬垂指针（而 `Get()`
+   那侧是 retain 的，收支不平）——改成用 `field_store_type()` 拿实例化后的具体类型。
+   同理 `infer_expr_type` 对裸字段名 `item` 现在也做 `concretize`，`item + "/" + x`
+   才知道 `T=int` 要按整数格式化，而不是拿位模式当字符串跑 `strlen`。
+
+实测（`_scratch/a7c.zan` 等探针）：`Pool<string>` / `Pool<int>` / `Pool<Box>` 三种实例化下的
+`Set/Get`、`Echo<int|string|double|Box>`、`Pair<U>`（`item + "/" + x`）、`PairThis<U>`、
+`Describe<U>`（`this.item.ToString()`）、`Forward<U>`（模板内转发）、`CountOf<U>(U[])`
+全部输出正确，退出码 0；`--check-leaks` 亦为 0。
+
+正式测试：`tests/conformance/generic_class_instance_generic_method.zan`（+`.out`）。
+
+回归：`ctest --test-dir build -R "generic|leakcheck|diag_" -j 8` → 356 项中 43 项失败，
+全部是工作区里未提交的 stdlib 改动导致的编译错误（`'X' has no member 'Create'`、
+ide/stdlib 的 parse error）；所有 `generic_*`、`diag_*` 通过，新增用例在
+conformance/determinism/leakcheck 三档均通过。唯一一个能编过却崩的
+`leakcheck_field_decl_initializers` 已用 HEAD（fd59fcb）的干净 worktree 编译验证
+为既存缺陷，与本次改动无关。
+
+未做：async 泛型方法仍走 `emit_user_methods()` 的单独 CPS 路径（A32-3b / A43-A8），
+`method_is_tp_template()` 对 async 模板仍发诊断。
 
 ## A43-B 语法缺失（parser 层不接受，按价值排序）
 

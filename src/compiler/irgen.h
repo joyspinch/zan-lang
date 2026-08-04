@@ -228,6 +228,7 @@ struct zan_irgen {
     struct zan_method_spec {
         zan_symbol_t   *msym;      /* the generic method symbol */
         zan_symbol_t   *type_sym;  /* declaring class */
+        zan_type_t     *owner_inst; /* declaring class instantiation, or NULL */
         zan_ast_node_t *member;    /* AST_METHOD_DECL */
         zan_type_t    **bind;      /* concrete type per declared type param */
         int             bindc;

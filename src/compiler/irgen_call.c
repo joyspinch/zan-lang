@@ -49,6 +49,7 @@ static int try_method_spec(zan_irgen_t *g, zan_symbol_t *msym,
     /* exact arity only: `params` packing / defaults keep the erased path */
     if (msym->decl->method_decl.params.count !=
         call->call.args.count + recv_params) return -1;
+    zan_type_t *owner_inst = NULL;
     if (!m_static) {
         /* the receiver has to be a reference the call site can hand over as a
          * plain pointer; struct receivers need their storage address, which
@@ -58,12 +59,18 @@ static int try_method_spec(zan_irgen_t *g, zan_symbol_t *msym,
                                                           : NULL);
         if (!rt || rt->kind != TYPE_CLASS) return -1;
         if (!recv_expr && !g->current_this) return -1;
+        /* `Pool<string>.Wrap<int>` specializes per class instantiation too;
+         * inside a generic body the receiver's own instantiation is the one
+         * being emitted (`this.Wrap<int>()`). */
+        if (rt->type_arg_count > 0) owner_inst = rt;
+        else if (g->cur_inst && (!rt->sym || rt->sym == g->cur_inst->sym))
+            owner_inst = g->cur_inst;
     }
     for (int j = 0; j < msym->decl->method_decl.params.count; j++)
         if (msym->decl->method_decl.params.items[j]->param.by_ref) return -1;
     zan_type_t *bind[8] = { NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL };
     infer_method_tp_bindings(g, msym, call, recv_expr, locals, bind);
-    return get_or_create_method_spec(g, msym, bind, tps->count);
+    return get_or_create_method_spec(g, msym, bind, tps->count, owner_inst);
 }
 
 /* Emit a call to a monomorphized generic method: arguments are emitted
@@ -113,6 +120,7 @@ static LLVMValueRef emit_method_spec_call(zan_irgen_t *g, int idx,
             ? recv_expr : call->call.args.items[j - arg_base];
         zan_type_t *pt = subst_method_tp(g,
             method_param_type(g, sp->msym, j), tps, sp->bind);
+        if (sp->owner_inst) pt = subst_type_param_deep(g, pt, sp->owner_inst);
         call_args[j + this_off] =
             emit_arg_typed(g, aexprs[j + this_off], pt, locals);
         zan_ast_node_t *arg = aexprs[j + this_off];

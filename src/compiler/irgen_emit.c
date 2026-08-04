@@ -391,16 +391,14 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
              * nothing to resolve against. */
             if (method_is_tp_template(member)) {
                 bool tpl_async = (member->method_decl.modifiers & MOD_ASYNC) != 0;
-                bool tpl_static = (member->method_decl.modifiers & MOD_STATIC) != 0;
                 /* an instance template monomorphizes too (`this` is prepended
-                 * to the specialized signature), as long as the declaring type
-                 * is not itself generic */
-                if (!tpl_async && (tpl_static || !is_user_generic_sym(type_sym)))
-                    continue;
+                 * to the specialized signature; a generic declaring type adds
+                 * its instantiation to the specialization key) */
+                if (!tpl_async) continue;
                 zan_diag_emit(g->diag, DIAG_ERROR, member->loc,
                     "generic method '%.*s' accesses a member of its type "
-                    "parameter; async generic methods, and instance generic "
-                    "methods of a generic type, cannot be monomorphized today",
+                    "parameter; async generic methods cannot be "
+                    "monomorphized today",
                     (int)member->method_decl.name.len,
                     member->method_decl.name.str);
                 continue;
@@ -1364,29 +1362,14 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
 /* ---- method-level monomorphization (bodies for zan_method_spec) ----
  *
  * A generic method (one declaring its own <T,...>) is normally emitted once
- * with type parameters erased to machine words, which loses type-specific
+ * with type parameters erased to a machine pointer, which loses type-specific
  * semantics: `<`/`==` on a string key compare pointers, double keys compare
- * raw bits, and a replaced ARC value is never released. When a call site can
- * bind every type parameter to a concrete type AND some binding's semantics
- * differ from the erased representation, a specialized copy with a concrete
- * signature is declared here and its body emitted from the pending queue. */
-
-/* Erased codegen is already correct for int-like bindings; only strings,
- * floating types and composite/reference types need a specialized copy. */
-static bool mspec_bind_worthwhile(zan_type_t **bind, int bindc) {
-    for (int i = 0; i < bindc; i++) {
-        if (!bind[i]) return false;
-        switch (bind[i]->kind) {
-        case TYPE_STRING: case TYPE_FLOAT: case TYPE_DOUBLE:
-        case TYPE_CLASS: case TYPE_STRUCT: case TYPE_INTERFACE:
-        case TYPE_ARRAY:
-            return true;
-        default:
-            break;
-        }
-    }
-    return false;
-}
+ * raw bits, a replaced ARC value is never released, and an `int` argument or
+ * a `T`-typed return travels as an address (`M<int>(7)` handed the callee 7 as
+ * a pointer and the caller read the result back as one). Whenever a call site
+ * can bind every type parameter to a concrete type, a specialized copy with a
+ * concrete signature is declared here and its body emitted from the pending
+ * queue; the erased variant only serves calls that cannot bind. */
 
 /* ---- generic methods that reach into their own type parameters -----------
  * `c.Name()` or `c.id` where `c` is declared with one of the method's own type
@@ -1608,8 +1591,19 @@ static bool class_member_uses_tp(zan_ast_node_t *decl, zan_ast_node_t *member) {
     return s.found;
 }
 
+/* Two specializations share a declaring-type instantiation when they were
+ * reached through the same class type arguments (`Pool<string>` vs
+ * `Pool<int>`); a non-generic declaring type has none. */
+static bool mspec_owner_eq(zan_type_t *a, zan_type_t *b) {
+    if (a == b) return true;
+    if (!a || !b || a->sym != b->sym) return false;
+    return type_arglists_equal(a->type_args, a->type_arg_count,
+                               b->type_args, b->type_arg_count);
+}
+
 static int get_or_create_method_spec(zan_irgen_t *g, zan_symbol_t *msym,
-                                     zan_type_t **bind, int bindc) {
+                                     zan_type_t **bind, int bindc,
+                                     zan_type_t *owner_inst) {
     if (!msym || !msym->decl || msym->decl->kind != AST_METHOD_DECL) return -1;
     zan_ast_node_t *member = msym->decl;
     if (!member->method_decl.body) return -1;
@@ -1620,23 +1614,28 @@ static int get_or_create_method_spec(zan_irgen_t *g, zan_symbol_t *msym,
     if (tps->count != bindc || bindc <= 0 || bindc > 8) return -1;
     for (int i = 0; i < bindc; i++)
         if (!bind[i] || !type_is_concrete(bind[i])) return -1;
-    /* a body that reaches into T has no erased fallback to defer to */
-    if (!method_is_tp_template(member) && !mspec_bind_worthwhile(bind, bindc))
-        return -1;
     zan_symbol_t *type_sym = msym->parent;
     if (!type_sym ||
         (type_sym->kind != SYM_CLASS && type_sym->kind != SYM_STRUCT))
         return -1;
     /* An instance generic method specializes the same way a static one does,
-     * with `this` prepended to the signature. A generic *declaring type* would
-     * additionally need the class instantiation folded into the mangled name
-     * and into `this`'s layout, which the erased class variant cannot supply,
-     * so those stay rejected (see the diagnostic in emit_user_methods). */
-    if (!spec_static && is_user_generic_sym(type_sym)) return -1;
+     * with `this` prepended to the signature. When the declaring type is
+     * itself generic the specialization is additionally keyed on the receiver's
+     * instantiation, which supplies the class type parameters to every type
+     * resolved out of the body (A32-3a). */
+    if (!is_user_generic_sym(type_sym)) owner_inst = NULL;
+    else if (!spec_static) {
+        if (!owner_inst || owner_inst->sym != type_sym ||
+            !type_is_concrete(owner_inst))
+            return -1;
+    } else {
+        owner_inst = NULL;
+    }
     int this_off = spec_static ? 0 : 1;
 
     for (int i = 0; i < g->method_spec_count; i++)
         if (g->method_specs[i].msym == msym &&
+            mspec_owner_eq(g->method_specs[i].owner_inst, owner_inst) &&
             type_arglists_equal(g->method_specs[i].bind,
                                 g->method_specs[i].bindc, bind, bindc))
             return i;
@@ -1644,8 +1643,11 @@ static int get_or_create_method_spec(zan_irgen_t *g, zan_symbol_t *msym,
     /* mangled name: Type_Method$$tok1$tok2, uniquified across overloads */
     char fn_name[512];
     {
-        size_t off = (size_t)snprintf(fn_name, sizeof(fn_name), "%.*s_%.*s$",
-            (int)type_sym->name.len, type_sym->name.str,
+        char osuffix[256];
+        osuffix[0] = '\0';
+        if (owner_inst) mangle_inst_suffix(osuffix, sizeof(osuffix), owner_inst);
+        size_t off = (size_t)snprintf(fn_name, sizeof(fn_name), "%.*s%s_%.*s$",
+            (int)type_sym->name.len, type_sym->name.str, osuffix,
             (int)msym->name.len, msym->name.str);
         for (int i = 0; i < bindc; i++) {
             if (off < sizeof(fn_name) - 1) fn_name[off++] = '$';
@@ -1674,6 +1676,7 @@ static int get_or_create_method_spec(zan_irgen_t *g, zan_symbol_t *msym,
         zan_ast_node_t *param = member->method_decl.params.items[k];
         zan_type_t *pt = subst_method_tp(g,
             zan_binder_resolve_type(g->binder, param->param.type), tps, bind);
+        if (owner_inst) pt = subst_type_param_deep(g, pt, owner_inst);
         param_types[k + this_off] = param->param.by_ref
             ? LLVMPointerType(map_type(g, pt), 0)
             : map_type(g, pt);
@@ -1682,6 +1685,7 @@ static int get_or_create_method_spec(zan_irgen_t *g, zan_symbol_t *msym,
         ? subst_method_tp(g, zan_binder_resolve_type(g->binder,
               member->method_decl.return_type), tps, bind)
         : g->binder->type_void;
+    if (owner_inst) ret_type = subst_type_param_deep(g, ret_type, owner_inst);
     LLVMTypeRef fn_type = LLVMFunctionType(map_type(g, ret_type), param_types,
                                            (unsigned)total_params, 0);
     LLVMValueRef fn = LLVMAddFunction(g->mod, fn_name, fn_type);
@@ -1700,6 +1704,7 @@ static int get_or_create_method_spec(zan_irgen_t *g, zan_symbol_t *msym,
     int idx = g->method_spec_count++;
     g->method_specs[idx].msym = msym;
     g->method_specs[idx].type_sym = type_sym;
+    g->method_specs[idx].owner_inst = owner_inst;
     g->method_specs[idx].member = member;
     g->method_specs[idx].bind = bcopy;
     g->method_specs[idx].bindc = bindc;
@@ -1721,7 +1726,7 @@ static void emit_method_spec_body(zan_irgen_t *g, int idx) {
     zan_type_t *saved_inst = g->cur_inst;
     g->cur_mtps = tps;
     g->cur_mbind = sp.bind;
-    g->cur_inst = NULL;
+    g->cur_inst = sp.owner_inst;
 
     LLVMBasicBlockRef saved_bb = LLVMGetInsertBlock(g->builder);
     LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, sp.fn, "entry");

@@ -1636,6 +1636,10 @@ binding_lowered:
                         LLVMValueRef fptr = emit_field_ptr(g, g->current_type_sym, st, this_ptr, fi, "fld");
                         /* type conversion if needed */
                         zan_symbol_t *fsym = get_field_sym(g->current_type_sym, expr->binary.left->ident.name);
+                        /* `item = x` on a field declared `T`: the store has to
+                         * manage the instantiation's concrete type, or the +1
+                         * handed over by the caller is dropped. */
+                        zan_type_t *fst = fsym ? field_store_type(g, fsym, g->cur_inst) : NULL;
                         if (fsym && fsym->type) {
                             LLVMTypeRef target_t = map_type(g, fsym->type);
                             LLVMTypeRef val_t = LLVMTypeOf(right);
@@ -1655,8 +1659,8 @@ binding_lowered:
                                 }
                             }
                         }
-                        if (fsym && fsym->type && is_rc_managed_type(fsym->type)) {
-                            emit_rc_store_field(g, fsym->type, fptr, right, expr->binary.right, locals,
+                        if (fst && is_rc_managed_type(fst)) {
+                            emit_rc_store_field(g, fst, fptr, right, expr->binary.right, locals,
                                                 (fsym->modifiers & MOD_WEAK) ? 1 : 0);
                         } else {
                             zan_store_fit(g, right, fptr);

@@ -1460,6 +1460,19 @@ static LLVMValueRef emit_char_to_cstr(zan_irgen_t *g, LLVMValueRef val) {
  * character, every other type keeps the numeric/string formatting. */
 static LLVMValueRef emit_to_cstr_of(zan_irgen_t *g, LLVMValueRef val,
                                     zan_ast_node_t *ast, local_scope_t *locals) {
+    /* A `T` value read out of a generic instance arrives in the erased pointer
+     * slot, so `item + "x"` with T bound to a value type would otherwise run
+     * strlen over the bit pattern. Recover the concrete representation first. */
+    if (ast && val && LLVMGetTypeKind(LLVMTypeOf(val)) == LLVMPointerTypeKind) {
+        zan_type_t *t = infer_expr_type(g, ast, locals);
+        LLVMTypeRef want = t ? map_type(g, t) : NULL;
+        if (want) {
+            LLVMTypeKind wk = LLVMGetTypeKind(want);
+            if (wk == LLVMIntegerTypeKind || wk == LLVMFloatTypeKind ||
+                wk == LLVMDoubleTypeKind)
+                val = emit_boundary_coerce(g, val, want);
+        }
+    }
     if (ast && LLVMGetTypeKind(LLVMTypeOf(val)) == LLVMIntegerTypeKind &&
         expr_is_char(g, ast, locals)) {
         return emit_char_to_cstr(g, val);

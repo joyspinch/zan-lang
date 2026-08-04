@@ -1600,7 +1600,8 @@ void zan_irgen_destroy(zan_irgen_t *g) {
 static zan_type_t *subst_method_tp(zan_irgen_t *g, zan_type_t *t,
                                    zan_ast_list_t *tps, zan_type_t **bind);
 static int get_or_create_method_spec(zan_irgen_t *g, zan_symbol_t *msym,
-                                     zan_type_t **bind, int bindc);
+                                     zan_type_t **bind, int bindc,
+                                     zan_type_t *owner_inst);
 static void emit_pending_method_specs(zan_irgen_t *g);
 
 /* Resolve a type reference appearing in the body currently being emitted,
