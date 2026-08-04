@@ -388,6 +388,13 @@ partial class CodeEditor {
         int textX = area.x + gutterW + t.paddingSmall;
         codeLens = new List<CodeLensRef>();
         BeginLensFrame(app);
+        // A reference count is annotated on its own row above the declaration,
+        // the way Visual Studio does it, so the rows this frame draws are laid
+        // out first and every line/pixel mapping below reads that layout.
+        BuildRowLayout(area, lineH,
+            Canvas.FontHeight(t.fontSizeSmall) + app.Scale(3));
+        visLines = VisibleRowCount();
+        pageRows = visLines;
         RenderLines(app, area, lineH, fontSize, gutterW, textX, visLines, focused);
         // Counts this frame had no budget left for: finish them on the next one.
         if (LensPending()) { app.RequestRedraw(); }
@@ -408,8 +415,8 @@ partial class CodeEditor {
                             && app.mouseY >= area.y && app.mouseY < area.y + area.height;
             if (overArea) {
                 if (!selActive) {
-                    int rrel = app.mouseY - area.y;
-                    int rclk = scrollLine + rrel / lineH;
+                    int rclk = LineAtY(lineH, app.mouseY);
+                    if (rclk < 0) { rclk = curLine; }
                     if (rclk >= lines.Count) { rclk = lines.Count - 1; }
                     if (rclk < 0) { rclk = 0; }
                     curLine = rclk;
@@ -438,7 +445,7 @@ partial class CodeEditor {
         while (cli < codeLens.Count) {
             CodeLensRef cl = codeLens[cli];
             if (app.mouseX >= cl.x && app.mouseX < cl.x + cl.w
-                && app.mouseY >= cl.y && app.mouseY < cl.y + lineH) {
+                && app.mouseY >= cl.y && app.mouseY < cl.y + lensRowH) {
                 overCodeLens = true;
             }
             cli = cli + 1;
@@ -569,13 +576,13 @@ partial class CodeEditor {
             while (clc < codeLens.Count) {
                 CodeLensRef cl = codeLens[clc];
                 if (app.mouseX >= cl.x && app.mouseX < cl.x + cl.w
-                    && app.mouseY >= cl.y && app.mouseY < cl.y + lineH) {
+                    && app.mouseY >= cl.y && app.mouseY < cl.y + lensRowH) {
                     refPopLines = new List<int>();
                     CollectRefs(cl.name, cl.line, refPopLines);
                     refPopName = cl.name;
                     refPopSel = 0;
                     refPopX = cl.x;
-                    refPopY = cl.y + lineH;
+                    refPopY = cl.y + lensRowH;
                     // This popup can only list lines of this buffer, so it
                     // answers only when every use the lens counted is in it.
                     refPopOpen = refPopLines.Count > 0
@@ -633,11 +640,9 @@ partial class CodeEditor {
             } else {
                 int hit = app.ClickTarget();
                 if (hit == id && app.mouseX < area.x + gutterW) {
-                    int rel = app.mouseY - area.y;
-                    int clicked = scrollLine + rel / lineH;
+                    int clicked = LineAtY(lineH, app.mouseY);
                     if (clicked >= lines.Count) { clicked = lines.Count - 1; }
-                    if (clicked < 0) { clicked = 0; }
-                    ToggleBreakpoint(clicked);
+                    if (clicked >= 0) { ToggleBreakpoint(clicked); }
                     app.RequestRedraw();
                 }
             }
@@ -648,7 +653,7 @@ partial class CodeEditor {
             // Detect word under mouse cursor
             if (app.mouseX >= textX && app.mouseX < area.x + area.width
                 && app.mouseY >= area.y && app.mouseY < area.y + area.height) {
-                int hoverLine = scrollLine + (app.mouseY - area.y) / lineH;
+                int hoverLine = LineAtY(lineH, app.mouseY);
                 if (hoverLine >= 0 && hoverLine < lines.Count) {
                     int hoverCol = CodeEditor.ColFromX(lines[hoverLine], app.mouseX - textX, fontSize);
                     string hWord = CodeEditor.WordAt(lines[hoverLine], hoverCol);
@@ -708,8 +713,7 @@ partial class CodeEditor {
             int utextX = area.x + gutterW + t.paddingSmall;
             if (app.mouseX >= utextX && app.mouseX < area.x + area.width
                 && app.mouseY >= area.y && app.mouseY < area.y + area.height) {
-                int urel = app.mouseY - area.y;
-                int uln = scrollLine + urel / lineH;
+                int uln = LineAtY(lineH, app.mouseY);
                 if (uln >= 0 && uln < lines.Count) {
                     string uls = lines[uln];
                     int ucol = CodeEditor.ColFromX(uls, app.mouseX - utextX, fontSize);
@@ -719,10 +723,10 @@ partial class CodeEditor {
                         while (ua > 0 && CodeEditor.InSet(uidset, uls.Substring(ua - 1, 1))) { ua = ua - 1; }
                         int ub = ucol;
                         while (ub < uls.Length && CodeEditor.InSet(uidset, uls.Substring(ub, 1))) { ub = ub + 1; }
-                        if (ub > ua) {
+                        if (ub > ua && LineTopY(uln) >= 0) {
                             int uxp = utextX + Canvas.MeasureText(uls.Substring(0, ua), fontSize);
                             int uwp = Canvas.MeasureText(uls.Substring(ua, ub - ua), fontSize);
-                            int uyp = area.y + (uln - scrollLine) * lineH
+                            int uyp = LineTopY(uln)
                                 + (lineH + Canvas.FontHeight(fontSize)) / 2 + app.Scale(1);
                             c.FillRect(uxp, uyp, uwp, app.Scale(1), pal.link);
                         }
@@ -859,10 +863,11 @@ partial class CodeEditor {
         // outside the editor's own rectangle into a neighbouring pane.
         c.PushClip(area.x, area.y, area.width, area.height);
         int i = 0;
-        while (i < visLines) {
-            int ln = scrollLine + i;
+        while (i < rowLine.Count) {
+            int ln = rowLine[i];
             if (ln < lines.Count) {
-                int rowY = area.y + i * lineH;
+                int rowY = rowTop[i];
+                int lensY = rowLensY[i];
                 int textY = Canvas.CenterTextY(rowY, lineH, fontSize);
 
                 if (ln == execLine) {
@@ -923,18 +928,30 @@ partial class CodeEditor {
                     c.FillRect(cxp, rowY + app.Scale(2), 1, lineH - app.Scale(4), t.primary);
                 }
 
-                // CodeLens: reference count for a method declaration on this line.
-                string decl = CodeEditor.DeclNameAt(text);
-                if (decl.Length > 0) {
-                    int refs = LensRefCountBudgeted(decl, ln);
-                    if (refs < 0) { decl = ""; }
-                    string clLabel = Convert.ToString(refs) + " references";
-                    if (refs == 1) { clLabel = "1 reference"; }
-                    int clx = sx + app.Scale(24);
-                    int clw = Canvas.MeasureText(clLabel, t.fontSizeSmall);
-                    if (clx + clw < area.x + area.width) {
-                        c.DrawText(clx, textY, clLabel, pal.changeLabel, t.fontSizeSmall);
-                        codeLens.Add(new CodeLensRef(ln, decl, clx, rowY, clw, refs));
+                // CodeLens: the reference count of the member declared here, on
+                // its own row above the declaration and indented with it, as in
+                // Visual Studio. A count still being tallied (no budget left
+                // this frame) leaves the row empty rather than showing a number
+                // it does not have yet.
+                if (lensY >= 0) {
+                    string decl = CodeEditor.DeclNameAt(text);
+                    if (decl.Length > 0) {
+                        int refs = LensRefCountBudgeted(decl, ln);
+                        if (refs >= 0) {
+                            string clLabel = Convert.ToString(refs) + " references";
+                            if (refs == 1) { clLabel = "1 reference"; }
+                            int clx = textX + Canvas.MeasureText(
+                                CodeEditor.LeadWs(text), fontSize);
+                            int clw = Canvas.MeasureText(clLabel, t.fontSizeSmall);
+                            if (clx + clw < area.x + area.width) {
+                                c.DrawText(clx,
+                                    Canvas.CenterTextY(lensY, lensRowH,
+                                        t.fontSizeSmall),
+                                    clLabel, pal.changeLabel, t.fontSizeSmall);
+                                codeLens.Add(new CodeLensRef(ln, decl, clx,
+                                    lensY, clw, refs));
+                            }
+                        }
                     }
                 }
 
@@ -1025,9 +1042,8 @@ partial class CodeEditor {
         EditorPalette pal = EditorPalette.For(t);
         // ---- autocomplete popup (drawn below the cursor, with icons) ----
         if (acActive && focused && acAllItems.Count > 0
-            && curLine >= scrollLine && curLine < scrollLine + visLines) {
-            int prow = curLine - scrollLine;
-            int pRowY = area.y + prow * lineH;
+            && LineTopY(curLine) >= 0) {
+            int pRowY = LineTopY(curLine);
             int px = textX + Canvas.MeasureText(Text.Left(lines[curLine], acStart), fontSize);
             int maxShow = 10;
             int shown = acItems.Count;
@@ -1224,7 +1240,7 @@ partial class CodeEditor {
     void RenderSigHelp(App app, Rect area, int lineH, int textX, int fontSize,
                        bool focused, int visLines) {
         if (acActive || !focused || ctxOpen || refPopOpen) { return; }
-        if (curLine < scrollLine || curLine >= scrollLine + visLines) { return; }
+        if (LineTopY(curLine) < 0) { return; }
         // A declaration is not a call: typing its own parameter list must not
         // pop its own signature up over it.
         if (CodeEditor.SigFromLine(CodeEditor.TrimStr(lines[curLine])).Length > 0) {
@@ -1254,7 +1270,7 @@ partial class CodeEditor {
         int boxH = pad * 2 + fh;
         if (doc.Length > 0) { boxH = boxH + app.Scale(2) + sfh; }
         int px = textX;
-        int rowY = area.y + (curLine - scrollLine) * lineH;
+        int rowY = LineTopY(curLine);
         int py = rowY - boxH - app.Scale(2);
         if (py < area.y) { py = rowY + lineH + app.Scale(2); }
         if (py + boxH > area.y + area.height) { py = area.y; }
@@ -1342,6 +1358,18 @@ partial class CodeEditor {
             i = i + 1;
         }
         return null;
+    }
+
+    /// The leading whitespace of `line`, so an annotation drawn above a line can
+    /// be indented exactly with it.
+    static string LeadWs(string line) {
+        int i = 0;
+        while (i < line.Length) {
+            string ch = line.Substring(i, 1);
+            if (ch != " " && ch != "\t") { break; }
+            i = i + 1;
+        }
+        return line.Substring(0, i);
     }
 
     static string Indent(int n) {

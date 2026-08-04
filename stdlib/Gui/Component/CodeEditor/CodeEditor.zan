@@ -140,6 +140,19 @@ partial class CodeEditor {
     int ensuredCaretLine;
     int lastId;
 
+    // ---- row layout for the frame ----
+    // A CodeLens annotation sits on its own row above the declaration it
+    // decorates (as in Visual Studio), so a screen row is no longer
+    // `scrollLine + y / lineH`: these tables hold the code lines this frame
+    // laid out, in order, with the top y of each one and of its lens row
+    // (-1 when it has none). Everything that maps between a line and a
+    // pixel goes through LineAtY / LineTopY instead of arithmetic.
+    List<int> rowLine;
+    List<int> rowTop;
+    List<int> rowLensY;
+    /// Height of a lens row (0 while none is shown).
+    int lensRowH;
+
     // ---- autocomplete popup state ----
     List<string> acItems;   // current candidate list (filtered by prefix + kind)
     List<string> acAllItems; // candidates before the kind filter is applied
@@ -330,6 +343,10 @@ partial class CodeEditor {
         e.scrollLine = 0;
         e.ensuredCaretLine = -1;
         e.lastId = -1;
+        e.rowLine = new List<int>();
+        e.rowTop = new List<int>();
+        e.rowLensY = new List<int>();
+        e.lensRowH = 0;
         e.acItems = new List<string>();
         e.acAllItems = new List<string>();
         e.acAllKinds = new List<string>();
@@ -920,11 +937,85 @@ partial class CodeEditor {
         }
     }
 
+    /// Lays out this frame's rows: every code line from `scrollLine` that fits
+    /// in `area`, each preceded by a lens row when it declares a member. Called
+    /// once per frame before anything maps a line to a pixel or back.
+    void BuildRowLayout(Rect area, int lineH, int lensH) {
+        rowLine = new List<int>();
+        rowTop = new List<int>();
+        rowLensY = new List<int>();
+        lensRowH = lensH;
+        int y = area.y;
+        int bottom = area.y + area.height;
+        int ln = scrollLine;
+        if (ln < 0) { ln = 0; }
+        while (ln < lines.Count && y + lineH <= bottom) {
+            int ly = 0 - 1;
+            // The lens row is dropped rather than half-drawn at the top or the
+            // bottom edge, so a line is never pushed out of view by its own
+            // annotation.
+            if (lensH > 0 && ln > scrollLine
+                && CodeEditor.DeclNameAt(lines[ln]).Length > 0
+                && y + lensH + lineH <= bottom) {
+                ly = y;
+                y = y + lensH;
+            }
+            rowLine.Add(ln);
+            rowTop.Add(y);
+            rowLensY.Add(ly);
+            y = y + lineH;
+            ln = ln + 1;
+        }
+    }
+
+    /// Code lines this frame laid out (at least 1), the page size for scrolling.
+    int VisibleRowCount() {
+        if (rowLine.Count < 1) { return 1; }
+        return rowLine.Count;
+    }
+
+    /// The line drawn at absolute `yPix`, or -1 when the point is off the laid
+    /// out rows. A lens row answers with the line it annotates, so a click just
+    /// above a declaration lands on it rather than nowhere.
+    int LineAtY(int lineH, int yPix) {
+        int i = 0;
+        while (i < rowLine.Count) {
+            int top = rowTop[i];
+            if (rowLensY[i] >= 0) { top = rowLensY[i]; }
+            if (yPix >= top && yPix < rowTop[i] + lineH) { return rowLine[i]; }
+            i = i + 1;
+        }
+        return 0 - 1;
+    }
+
+    /// Absolute y just under the caret's row as it was drawn this frame, or -1
+    /// when that line is not on screen. A host panel about the caret's line (the
+    /// reference list) hangs from here.
+    int CaretRowBottomY(App app) {
+        int top = LineTopY(curLine);
+        if (top < 0) { return 0 - 1; }
+        return top + Canvas.FontHeight(FontSize(app.theme)) + app.Scale(4);
+    }
+
+    /// Top y of `ln`'s code row this frame, or -1 when it is not laid out.
+    int LineTopY(int ln) {
+        int i = 0;
+        while (i < rowLine.Count) {
+            if (rowLine[i] == ln) { return rowTop[i]; }
+            i = i + 1;
+        }
+        return 0 - 1;
+    }
+
     /// Places the caret from a mouse position (pixels) inside the text area.
     void CaretFromMouse(App app, Rect area, int gutterW, int fontSize) {
         int textX = area.x + gutterW + app.theme.paddingSmall;
-        int rel = app.mouseY - area.y;
-        int clicked = scrollLine + rel / (Canvas.FontHeight(fontSize) + app.Scale(4));
+        int lineH = Canvas.FontHeight(fontSize) + app.Scale(4);
+        int clicked = LineAtY(lineH, app.mouseY);
+        if (clicked < 0) {
+            if (app.mouseY < area.y) { clicked = scrollLine; }
+            else { clicked = scrollLine + VisibleRowCount() - 1; }
+        }
         if (clicked >= lines.Count) { clicked = lines.Count - 1; }
         if (clicked < 0) { clicked = 0; }
         curLine = clicked;

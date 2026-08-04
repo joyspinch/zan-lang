@@ -39,6 +39,12 @@ class RefList {
     /// The hit the last click opened, so it stays marked while its file loads.
     int sel;
     int scroll;
+    /// Where the panel hangs from: the left edge and the bottom of the row whose
+    /// CodeLens (or caret) opened it, in absolute pixels. -1 falls back to the
+    /// top of the editor. Visual Studio pops its reference list on the code it
+    /// belongs to, not into a pane at the far end of the window.
+    int anchorX;
+    int anchorY;
     Button closeBtn;
     Button foldBtn;
     int rowH;
@@ -55,12 +61,21 @@ class RefList {
         r.grpOpen = new List<int>();
         r.sel = 0 - 1;
         r.scroll = 0;
+        r.anchorX = 0 - 1;
+        r.anchorY = 0 - 1;
         r.closeBtn = new Button { Icon = "close", Class = "text tiny",
             Tip = ZanIDE.T("Close (Esc)", "关闭 (Esc)") };
         r.foldBtn = new Button { Text = ZanIDE.T("Collapse All", "全部折叠"),
             Class = "text small" };
         r.rowH = 0; r.headH = 0;
         return r;
+    }
+
+    /// Hangs the panel under the row at absolute (ax, ay). Called every frame
+    /// while the list is open, so it follows the line as the view scrolls.
+    void Anchor(int ax, int ay) {
+        anchorX = ax;
+        anchorY = ay;
     }
 
     bool IsOpen() { return open; }
@@ -184,19 +199,29 @@ class RefList {
         List<int> rowVal = new List<int>();
         BuildRows(rowKind, rowVal);
         int total = rowKind.Count;
-        // Docked across the bottom of the editor, like VS's Find All References
-        // pane: at most two fifths of the height, so the code stays visible.
-        int room = (area.height * 2 / 5 - headH - footH) / rowH;
+        // A popup on the code it was opened from: at most twelve rows, and never
+        // taller than the editor.
+        int room = (area.height - headH - footH) / rowH;
+        if (room > 12) { room = 12; }
         if (room < 3) { room = 3; }
         int shown = total;
         if (shown > room) { shown = room; }
         if (shown < 1) { shown = 1; }
 
-        int w = area.width;
+        int w = app.Scale(560);
+        if (w > area.width - app.Scale(16)) { w = area.width - app.Scale(16); }
         int h = headH + shown * rowH + footH;
         if (h > area.height) { h = area.height; }
-        int x = area.x;
-        int y = area.y + area.height - h;
+        int x = anchorX;
+        if (x < 0) { x = area.x + app.Scale(8); }
+        if (x + w > area.x + area.width) { x = area.x + area.width - w - app.Scale(8); }
+        if (x < area.x) { x = area.x; }
+        // Below the line it annotates, or above it when the bottom of the editor
+        // is too close -- the list must not cover the row it was opened from.
+        int y = anchorY;
+        if (y < 0) { y = area.y + app.Scale(8); }
+        if (y + h > area.y + area.height) { y = anchorY - rowH - h; }
+        if (y + h > area.y + area.height) { y = area.y + area.height - h; }
         if (y < area.y) { y = area.y; }
 
         int maxScroll = total - shown;
@@ -207,8 +232,10 @@ class RefList {
         // Opaque on purpose: Prompt.Surface() goes through FillChrome(), which
         // fades the fill under a glass skin, and code showing through a list of
         // code is unreadable.
-        c.FillRect(x, y, w, app.Scale(2), t.borderPrimary);
-        c.FillRect(x, y + app.Scale(2), w, h - app.Scale(2), t.bgSecondary);
+        c.FillRect(x + 1, y + 1, w, h, t.shadowColor);
+        c.FillRect(x, y, w, h, t.bgSecondary);
+        c.DrawRect(x, y, w, h, t.borderPrimary, 1);
+        c.FillRect(x, y, w, headH, t.bgTertiary);
         // Swallow pointer input over the panel so a click in the list does not
         // also land in the code underneath it.
         app.BlockHitsRect(x, y, w, h);
