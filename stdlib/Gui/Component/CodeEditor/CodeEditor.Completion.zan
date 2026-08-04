@@ -415,6 +415,12 @@ partial class CodeEditor {
     /// (and outside any other declaration of the same name), appending the line
     /// of each one to `outLines` when that list is given.
     int ScanRefs(string name, int declLine, List<int> outLines) {
+        // A member's references are the ones reached through its own type. By
+        // name alone, `WebApp.Create`'s list held every other type's `Create`.
+        string owner = CodeEditor.EnclosingTypeAt(lines, declLine);
+        if (owner.Length > 0) {
+            return CodeEditor.CountMemberRefsIn(lines, name, owner, outLines);
+        }
         int total = 0;
         int li = 0;
         while (li < lines.Count) {
@@ -602,6 +608,89 @@ partial class CodeEditor {
         acFilter = "";
     }
 
+    /// The receiver expression written immediately before the dot at `dotPos`:
+    /// `WebApp` in `WebApp.Create`, `app` in `app.MaxBody`, and the call's own
+    /// receiver in a chain (`items.Where(x).Select` -> `items`, since a call's
+    /// argument list is skipped as a group). Empty when there is none.
+    string ReceiverBefore(string ln, int dotPos) {
+        string idchars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
+        int pos = dotPos;
+        if (pos > 0 && ln.Substring(pos - 1, 1) == ")") {
+            int depth = 1;
+            pos = pos - 1;
+            while (pos > 0 && depth > 0) {
+                pos = pos - 1;
+                string pc = ln.Substring(pos, 1);
+                if (pc == ")") { depth = depth + 1; }
+                else if (pc == "(") { depth = depth - 1; }
+            }
+        }
+        int end = pos;
+        while (pos > 0) {
+            string pc = ln.Substring(pos - 1, 1);
+            if (CodeEditor.InSet(idchars, pc)) { pos = pos - 1; }
+            else { break; }
+        }
+        string word = ln.Substring(pos, end - pos);
+        if (word.Length > 0) { return word; }
+        // Nothing but a dot in front (`.Select` after a chained call broken
+        // across lines): fall back to the segment before that dot.
+        if (pos > 0 && ln.Substring(pos - 1, 1) == ".") {
+            int oEnd = pos - 1;
+            int oStart = oEnd;
+            while (oStart > 0) {
+                string pc = ln.Substring(oStart - 1, 1);
+                if (CodeEditor.InSet(idchars, pc)) { oStart = oStart - 1; }
+                else { break; }
+            }
+            return ln.Substring(oStart, oEnd - oStart);
+        }
+        return "";
+    }
+
+    /// The type that declares the member under the caret, resolved through the
+    /// receiver in front of it: `WebApp` for both `WebApp.Create` and
+    /// `app.MaxBody` where `app` is declared `WebApp`, and the base type when
+    /// the member is inherited. Empty when the symbol is not a member access or
+    /// the receiver cannot be resolved -- callers then fall back to searching by
+    /// name alone. This is what keeps Go to Definition / Find References off a
+    /// same-named member of an unrelated type.
+    string OwnerTypeAtCaret() {
+        if (curLine < 0 || curLine >= lines.Count) { return ""; }
+        string s = lines[curLine];
+        int col = curCol;
+        if (col >= s.Length) { col = s.Length - 1; }
+        if (col < 0) { return ""; }
+        if (!CodeEditor.IsIdentChar(s.Substring(col, 1))) { return ""; }
+        int a = col;
+        while (a > 0 && CodeEditor.IsIdentChar(s.Substring(a - 1, 1))) { a = a - 1; }
+        if (a == 0 || s.Substring(a - 1, 1) != ".") { return ""; }
+        string member = CodeEditor.WordAt(s, col);
+        string recv = ReceiverBefore(s, a - 1);
+        if (recv.Length == 0) { return ""; }
+        string t = CodeEditor.NormalizeStdlibType(recv);
+        if (!CodeEditor.HasSymbolType(t) && !IsProjectType(t)) {
+            // Not a type name, so it is a value: take its declared type.
+            string vt = ResolveVarType(recv);
+            if (vt.Length == 0) { return ""; }
+            t = CodeEditor.NormalizeStdlibType(vt);
+        }
+        string decl = CodeEditor.SymbolDeclaringType(t, member);
+        if (decl.Length > 0) { return decl; }
+        return t;
+    }
+
+    /// The type that declares the member the caret sits ON the declaration of,
+    /// so Find References started from a declaration is scoped to that type too.
+    /// "" when the caret is not on a member declaration.
+    string EnclosingTypeOfCaretDecl() {
+        if (curLine < 0 || curLine >= lines.Count) { return ""; }
+        string w = WordAtCaret();
+        if (w.Length == 0) { return ""; }
+        if (!CodeEditor.IsMemberDeclOf(lines[curLine], w)) { return ""; }
+        return CodeEditor.EnclosingTypeAt(lines, curLine);
+    }
+
     /// Triggered when user types '.'. Looks at the word before the dot and
     /// suggests known members for that type, or the chain return type.
     void DotCompletion() {
@@ -615,42 +704,6 @@ partial class CodeEditor {
             return;
         }
 
-        // Walk backwards through the chain: skip matched parens and identifiers
-        string idchars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
-        int pos = dotPos;
-        // Skip over closing paren groups (for chained calls like .Where(...).Select)
-        if (pos > 0 && ln.Substring(pos - 1, 1) == ")") {
-            int depth = 1;
-            pos = pos - 1;
-            while (pos > 0 && depth > 0) {
-                pos = pos - 1;
-                string pc = ln.Substring(pos, 1);
-                if (pc == ")") { depth = depth + 1; }
-                else if (pc == "(") { depth = depth - 1; }
-            }
-        }
-        // Now get the word (method or variable name) before the paren or dot
-        int end = pos;
-        while (pos > 0) {
-            string pc = ln.Substring(pos - 1, 1);
-            if (CodeEditor.InSet(idchars, pc)) { pos = pos - 1; }
-            else { break; }
-        }
-        string lastWord = ln.Substring(pos, end - pos);
-
-        // Walk further back to find the owner (e.g. "Console" in "Console.Xxx")
-        string owner = lastWord;
-        if (pos > 0 && ln.Substring(pos - 1, 1) == ".") {
-            int ownerEnd = pos - 1;
-            int ownerStart = ownerEnd;
-            while (ownerStart > 0) {
-                string pc = ln.Substring(ownerStart - 1, 1);
-                if (CodeEditor.InSet(idchars, pc)) { ownerStart = ownerStart - 1; }
-                else { break; }
-            }
-            owner = ln.Substring(ownerStart, ownerEnd - ownerStart);
-        }
-
         // Build member list based on identified type
         acStart = curCol;
         acFull = new List<string>();
@@ -661,8 +714,7 @@ partial class CodeEditor {
         // declared type of a local variable -> universal object members. We
         // never dump speculative string/collection/LINQ helpers for a receiver
         // we cannot resolve (that produced bogus `Utils.OrderByDescending`).
-        string recv = lastWord;
-        if (recv.Length == 0) { recv = owner; }
+        string recv = ReceiverBefore(ln, dotPos);
         string norm = CodeEditor.NormalizeStdlibType(recv);
         if (CodeEditor.IsKnownStdlibType(norm)) {
             // The receiver is the type itself, so only its statics are reachable.

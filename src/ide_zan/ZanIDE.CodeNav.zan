@@ -471,6 +471,59 @@ partial class ZanIDE {
         }
     }
 
+    /// Every file on disk the navigation commands search: the project sources,
+    /// then the stdlib (whose sources are browsable here, and where most of what
+    /// a project calls is declared).
+    static List<string> NavSearchFiles(string root) {
+        List<string> files = ZanIDE.ListZanFiles(root + "/src");
+        List<string> std = ZanIDE.ListZanFiles(ZanIDE.StdlibDir());
+        for (int i = 0; i < std.Count; i = i + 1) { files.Add(std[i]); }
+        return files;
+    }
+
+    /// Jumps to where type `owner` declares `member`, searching the open tabs
+    /// first and then the project and stdlib sources. Returns the line, or -1
+    /// when that type has no such member on disk.
+    static int FindMemberDecl(List<TabRecord> tabs, SignalInt active, string root,
+                              string owner, string member, List<string> log) {
+        int a = active.Get();
+        if (a >= 0 && a < tabs.Count) {
+            int ln = CodeEditor.FindMemberDeclLineIn(
+                CodeEditor.SplitLines(tabs[a].body), owner, member);
+            if (ln >= 0) {
+                log.Add("> Definition of '" + owner + "." + member
+                    + "' at line " + Convert.ToString(ln + 1) + " (this file).");
+                return ln;
+            }
+        }
+        for (int i = 0; i < tabs.Count; i = i + 1) {
+            if (i == a) { continue; }
+            int ln = CodeEditor.FindMemberDeclLineIn(
+                CodeEditor.SplitLines(tabs[i].body), owner, member);
+            if (ln >= 0) {
+                active.Set(i);
+                log.Add("> Definition of '" + owner + "." + member + "' in "
+                    + tabs[i].name + " at line " + Convert.ToString(ln + 1) + ".");
+                return ln;
+            }
+        }
+        List<string> files = ZanIDE.NavSearchFiles(root);
+        for (int fi = 0; fi < files.Count; fi = fi + 1) {
+            string fp = files[fi];
+            if (ZanIDE.FindTabByPath(tabs, fp) >= 0) { continue; }
+            int ln = CodeEditor.FindMemberDeclLineIn(
+                CodeEditor.SplitLines(File.ReadAllText(fp)), owner, member);
+            if (ln >= 0) {
+                ZanIDE.OpenPath(tabs, active, fp, Path.GetFileName(fp));
+                log.Add("> Definition of '" + owner + "." + member + "' in "
+                    + Path.GetFileName(fp) + " at line "
+                    + Convert.ToString(ln + 1) + ".");
+                return ln;
+            }
+        }
+        return 0 - 1;
+    }
+
     /// Finds the definition of the symbol under the caret across the current
     /// file, other open tabs, then the project's src tree. Switches/opens the
     /// target tab and returns the destination line (-1 when not found).
@@ -480,6 +533,14 @@ partial class ZanIDE {
         if (word == "") { log.Add("> Go to Definition: no symbol under caret."); return 0 - 1; }
         int a = active.Get();
         if (a >= 0 && a < tabs.Count) { tabs[a].body = editor.GetText(); }
+        // A member access says which type declares the symbol, so the search is
+        // for that type's member rather than for the first same-named thing in
+        // the project (`WebApp.Create` used to land on another type's Create).
+        string owner = editor.OwnerTypeAtCaret();
+        if (owner.Length > 0) {
+            int ml = ZanIDE.FindMemberDecl(tabs, active, root, owner, word, log);
+            if (ml >= 0) { return ml; }
+        }
         if (a >= 0 && a < tabs.Count) {
             int ln = ZanIDE.FindDeclLine(tabs[a].body, word);
             if (ln >= 0) {
@@ -498,14 +559,10 @@ partial class ZanIDE {
                 }
             }
         }
-        List<string> files = ZanIDE.ListZanFiles(root + "/src");
         // Most symbols a project uses are declared in the stdlib, and stdlib
         // sources are browsable/openable here, so search them after the project
         // instead of reporting "not found in project".
-        List<string> stdFiles = ZanIDE.ListZanFiles(ZanIDE.StdlibDir());
-        for (int si = 0; si < stdFiles.Count; si = si + 1) {
-            files.Add(stdFiles[si]);
-        }
+        List<string> files = ZanIDE.NavSearchFiles(root);
         for (int fi = 0; fi < files.Count; fi = fi + 1) {
             string fp = files[fi];
             if (ZanIDE.FindTabByPath(tabs, fp) < 0) {
@@ -642,8 +699,20 @@ partial class ZanIDE {
         return count;
     }
 
-    static int CountRefsInFile(string name, string body, string word, List<string> log) {
+    /// Occurrences of `word` in one file, logged with their line. With `owner`
+    /// given, only the ones that belong to that type count.
+    static int CountRefsInFile(string name, string body, string word,
+                              string owner, List<string> log) {
         List<string> ls = CodeEditor.SplitLines(body);
+        if (owner.Length > 0) {
+            List<int> hits = new List<int>();
+            int n = CodeEditor.CountMemberRefsIn(ls, word, owner, hits);
+            for (int h = 0; h < hits.Count; h = h + 1) {
+                log.Add("   " + name + ":" + Convert.ToString(hits[h] + 1) + ": "
+                    + CodeEditor.LTrim(ls[hits[h]]));
+            }
+            return n;
+        }
         int count = 0;
         for (int i = 0; i < ls.Count; i = i + 1) {
             int occ = ZanIDE.CountWord(ls[i], word);
@@ -663,17 +732,25 @@ partial class ZanIDE {
         if (word == "") { log.Add("> Find All References: no symbol under caret."); return; }
         int a = active.Get();
         if (a >= 0 && a < tabs.Count) { tabs[a].body = editor.GetText(); }
-        log.Add("> References to '" + word + "':");
+        // For a member access, references mean the uses of THAT type's member:
+        // reached through the type, through `this`, or through a variable of it.
+        // By name alone the list was every same-named member in the project.
+        string owner = editor.OwnerTypeAtCaret();
+        if (owner.Length == 0) { owner = editor.EnclosingTypeOfCaretDecl(); }
+        if (owner.Length > 0) { log.Add("> References to '" + owner + "." + word + "':"); }
+        else { log.Add("> References to '" + word + "':"); }
         int total = 0;
         for (int i = 0; i < tabs.Count; i = i + 1) {
-            total = total + ZanIDE.CountRefsInFile(tabs[i].name, tabs[i].body, word, log);
+            total = total + ZanIDE.CountRefsInFile(tabs[i].name, tabs[i].body,
+                word, owner, log);
         }
         List<string> files = ZanIDE.ListZanFiles(root + "/src");
         for (int fi = 0; fi < files.Count; fi = fi + 1) {
             string fp = files[fi];
             if (ZanIDE.FindTabByPath(tabs, fp) < 0) {
                 string body = File.ReadAllText(fp);
-                total = total + ZanIDE.CountRefsInFile(Path.GetFileName(fp), body, word, log);
+                total = total + ZanIDE.CountRefsInFile(Path.GetFileName(fp), body,
+                    word, owner, log);
             }
         }
         log.Add("> " + Convert.ToString(total) + " reference(s) found.");

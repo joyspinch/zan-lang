@@ -84,6 +84,282 @@ partial class CodeEditor {
         return CodeEditor.Has(symTypes, typeName);
     }
 
+    // ---- type-scoped source search -----------------------------------------
+    // Go to Definition and Find References used to search by name alone, so
+    // `WebApp.Create` landed on whichever `Create(` came first in the project
+    // and its reference list held every unrelated `Create` call. These walk the
+    // text with the one thing that distinguishes them: the type a member
+    // belongs to. They take plain lines so the editor can use them on its
+    // buffer and the IDE on files it has not opened.
+
+    /// The type name declared on `line` (`class`, `struct`, `interface`,
+    /// `enum`, with any modifiers in front), or "".
+    static string TypeNameOn(string line) {
+        List<string> kws = new List<string>{
+            "class", "struct", "interface", "enum" };
+        int k = 0;
+        while (k < kws.Count) {
+            string kw = kws[k];
+            int p = CodeEditor.FindWordFrom(line, kw, 0);
+            if (p >= 0) {
+                int q = p + kw.Length;
+                while (q < line.Length && line.Substring(q, 1) == " ") { q = q + 1; }
+                string name = "";
+                while (q < line.Length && CodeEditor.IsIdentChar(line.Substring(q, 1))) {
+                    name = name + line.Substring(q, 1);
+                    q = q + 1;
+                }
+                if (name.Length > 0) { return name; }
+            }
+            k = k + 1;
+        }
+        return "";
+    }
+
+    /// Offset of the first whole-word occurrence of `word` in `s` at or after
+    /// `from`, or -1.
+    static int FindWordFrom(string s, string word, int from) {
+        int at = from;
+        while (true) {
+            int p = CodeEditor.FindFrom(s, word, at);
+            if (p < 0) { return 0 - 1; }
+            at = p + word.Length;
+            bool okL = p == 0 || !CodeEditor.IsIdentChar(s.Substring(p - 1, 1));
+            bool okR = at >= s.Length || !CodeEditor.IsIdentChar(s.Substring(at, 1));
+            if (okL && okR) { return p; }
+        }
+    }
+
+    /// Net brace nesting `line` contributes, ignoring literals and comments.
+    static int BraceDelta(string line) {
+        string s = CodeEditor.StripCode(line);
+        int d = 0;
+        int i = 0;
+        while (i < s.Length) {
+            string ch = s.Substring(i, 1);
+            if (ch == "{") { d = d + 1; }
+            else if (ch == "}") { d = d - 1; }
+            i = i + 1;
+        }
+        return d;
+    }
+
+    /// For every line of `ls`, the name of the type whose body contains it
+    /// ("" outside any type), appended to `outOwners` in line order.
+    static void OwnerPerLine(List<string> ls, List<string> outOwners) {
+        List<string> stack = new List<string>();
+        List<int> depths = new List<int>();
+        int depth = 0;
+        int i = 0;
+        while (i < ls.Count) {
+            string tn = CodeEditor.TypeNameOn(CodeEditor.StripCode(ls[i]));
+            if (tn.Length > 0) { stack.Add(tn); depths.Add(depth); }
+            if (stack.Count > 0) { outOwners.Add(stack[stack.Count - 1]); }
+            else { outOwners.Add(""); }
+            depth = depth + CodeEditor.BraceDelta(ls[i]);
+            while (stack.Count > 0 && depth <= depths[depths.Count - 1]) {
+                stack.RemoveAt(stack.Count - 1);
+                depths.RemoveAt(depths.Count - 1);
+            }
+            i = i + 1;
+        }
+    }
+
+    /// The type whose body contains line `at` of `ls`, or "".
+    static string EnclosingTypeAt(List<string> ls, int at) {
+        if (at < 0 || at >= ls.Count) { return ""; }
+        List<string> owners = new List<string>();
+        CodeEditor.OwnerPerLine(ls, owners);
+        if (at >= owners.Count) { return ""; }
+        return owners[at];
+    }
+
+    /// The identifier ending right before offset `end` in `s` ("" when the
+    /// character there is not part of one).
+    static string IdentBefore(string s, int end) {
+        int a = end;
+        while (a > 0 && CodeEditor.IsIdentChar(s.Substring(a - 1, 1))) { a = a - 1; }
+        if (a >= end) { return ""; }
+        return s.Substring(a, end - a);
+    }
+
+    /// Names in `ls` that hold a value of type `typeName`: a `Type name`
+    /// declaration, or a `name = Type.` / `name = new Type(` assignment. These
+    /// are the receivers through which the type's members are reached in this
+    /// file, which is how `app.MaxBody` is recognised as WebApp's MaxBody.
+    static void CollectTypedVars(List<string> ls, string typeName,
+            List<string> outNames) {
+        int i = 0;
+        while (i < ls.Count) {
+            string s = CodeEditor.StripCode(ls[i]);
+            int at = 0;
+            while (true) {
+                int p = CodeEditor.FindWordFrom(s, typeName, at);
+                if (p < 0) { break; }
+                at = p + typeName.Length;
+                int q = at;
+                // A generic argument list still declares that type.
+                if (q < s.Length && s.Substring(q, 1) == "<") {
+                    int d = 1;
+                    q = q + 1;
+                    while (q < s.Length && d > 0) {
+                        string c = s.Substring(q, 1);
+                        if (c == "<") { d = d + 1; }
+                        else if (c == ">") { d = d - 1; }
+                        q = q + 1;
+                    }
+                }
+                if (q < s.Length && s.Substring(q, 1) == " ") {
+                    while (q < s.Length && s.Substring(q, 1) == " ") { q = q + 1; }
+                    string nm = "";
+                    while (q < s.Length && CodeEditor.IsIdentChar(s.Substring(q, 1))) {
+                        nm = nm + s.Substring(q, 1);
+                        q = q + 1;
+                    }
+                    while (q < s.Length && s.Substring(q, 1) == " ") { q = q + 1; }
+                    string after = "";
+                    if (q < s.Length) { after = s.Substring(q, 1); }
+                    bool decl = after == "=" || after == ";" || after == ","
+                        || after == ")";
+                    if (nm.Length > 0 && decl && !CodeEditor.Has(outNames, nm)) {
+                        outNames.Add(nm);
+                    }
+                }
+                // `name = Type.Something(...)` / `name = new Type(...)`.
+                int eq = p;
+                while (eq > 0 && s.Substring(eq - 1, 1) == " ") { eq = eq - 1; }
+                if (CodeEditor.IdentBefore(s, eq) == "new") { eq = eq - 3; }
+                while (eq > 0 && s.Substring(eq - 1, 1) == " ") { eq = eq - 1; }
+                if (eq > 0 && s.Substring(eq - 1, 1) == "=") {
+                    int lhs = eq - 1;
+                    while (lhs > 0 && s.Substring(lhs - 1, 1) == " ") { lhs = lhs - 1; }
+                    string nm2 = CodeEditor.IdentBefore(s, lhs);
+                    if (nm2.Length > 0 && !CodeEditor.Has(outNames, nm2)) {
+                        outNames.Add(nm2);
+                    }
+                }
+            }
+            i = i + 1;
+        }
+    }
+
+    /// Occurrences of `member` in `ls` that belong to type `owner`: reached
+    /// through the type name, through `this`/`base`, through a variable of that
+    /// type, or written unqualified inside the owner's own body. Declarations of
+    /// the same name are skipped. Lines are appended to `outLines` when given.
+    static int CountMemberRefsIn(List<string> ls, string member, string owner,
+            List<int> outLines) {
+        List<string> recvs = new List<string>();
+        recvs.Add(owner);
+        recvs.Add("this");
+        recvs.Add("base");
+        CodeEditor.CollectTypedVars(ls, owner, recvs);
+        List<string> owners = new List<string>();
+        CodeEditor.OwnerPerLine(ls, owners);
+        int total = 0;
+        int li = 0;
+        while (li < ls.Count) {
+            if (CodeEditor.DeclNameAt(ls[li]) != member) {
+                string s = CodeEditor.StripCode(ls[li]);
+                int from = 0;
+                while (true) {
+                    int p = CodeEditor.FindWordFrom(s, member, from);
+                    if (p < 0) { break; }
+                    from = p + member.Length;
+                    bool ok = false;
+                    if (p > 0 && s.Substring(p - 1, 1) == ".") {
+                        ok = CodeEditor.Has(recvs, CodeEditor.IdentBefore(s, p - 1));
+                    } else if (li < owners.Count) {
+                        ok = owners[li] == owner;
+                    }
+                    if (ok) {
+                        total = total + 1;
+                        if (outLines != null) { outLines.Add(li); }
+                    }
+                }
+            }
+            li = li + 1;
+        }
+        return total;
+    }
+
+    /// Line index where type `owner` declares `member` in `ls`, or -1. Only the
+    /// owner's own body is searched, so a same-named member of another type in
+    /// the same file is never the answer.
+    static int FindMemberDeclLineIn(List<string> ls, string owner, string member) {
+        List<string> owners = new List<string>();
+        CodeEditor.OwnerPerLine(ls, owners);
+        int i = 0;
+        while (i < ls.Count && i < owners.Count) {
+            if (owners[i] == owner && CodeEditor.TypeNameOn(CodeEditor.StripCode(ls[i])).Length == 0) {
+                if (CodeEditor.IsMemberDeclOf(ls[i], member)) { return i; }
+            }
+            i = i + 1;
+        }
+        return 0 - 1;
+    }
+
+    /// True when `line` declares `member`: a method header (`... member(`) or a
+    /// field/property (`Type member;` / `Type member =` / `Type member {`),
+    /// rather than a use of it.
+    static bool IsMemberDeclOf(string line, string member) {
+        string s = CodeEditor.TrimStr(CodeEditor.StripCode(line));
+        if (s.Length == 0) { return false; }
+        if (CodeEditor.TypeNameOn(s).Length > 0) { return false; }
+        int p = CodeEditor.FindWordFrom(s, member, 0);
+        if (p <= 0) { return false; }
+        if (s.Substring(p - 1, 1) != " ") { return false; }
+        string before = CodeEditor.TrimStr(s.Substring(0, p - 1));
+        // A declaration is preceded by its type (and modifiers) only: a use is
+        // preceded by an operator, a dot, or a control keyword.
+        if (before.Length == 0) { return false; }
+        string lastCh = before.Substring(before.Length - 1, 1);
+        if (!CodeEditor.IsIdentChar(lastCh) && lastCh != ">" && lastCh != "]"
+            && lastCh != "?") { return false; }
+        if (CodeEditor.Find(before, "=") >= 0) { return false; }
+        if (CodeEditor.Find(before, "(") >= 0) { return false; }
+        if (CodeEditor.Find(before, ".") >= 0) { return false; }
+        string first = CodeEditor.IdentAt(before, 0);
+        if (CodeEditor.IsControlWord(first)) { return false; }
+        int q = p + member.Length;
+        while (q < s.Length && s.Substring(q, 1) == " ") { q = q + 1; }
+        string after = "";
+        if (q < s.Length) { after = s.Substring(q, 1); }
+        return after == "(" || after == ";" || after == "=" || after == "{"
+            || after == "<";
+    }
+
+    /// The identifier starting at `at` in `s` ("" when none).
+    static string IdentAt(string s, int at) {
+        string o = "";
+        int i = at;
+        while (i < s.Length && CodeEditor.IsIdentChar(s.Substring(i, 1))) {
+            o = o + s.Substring(i, 1);
+            i = i + 1;
+        }
+        return o;
+    }
+
+    /// The type in `typeName`'s base chain that actually declares `member`, or
+    /// "" when the index knows of no such member. `app.ToString()` on a type
+    /// that inherits it must lead to the base that declares it, not to the
+    /// derived type it was called on.
+    static string SymbolDeclaringType(string typeName, string member) {
+        if (!CodeEditor.SymbolIndexLoaded()) { return ""; }
+        string cur = typeName;
+        int depth = 0;
+        while (cur.Length > 0 && depth < 8) {
+            int i = 0;
+            while (i < symOwners.Count) {
+                if (symOwners[i] == cur && symNames[i] == member) { return cur; }
+                i = i + 1;
+            }
+            cur = CodeEditor.SymbolFirstBase(cur);
+            depth = depth + 1;
+        }
+        return "";
+    }
+
     /// Appends the members the compiler really has for `typeName`, following
     /// base types so inherited members show up too.
     static void SymbolMembers(string typeName, List<string> out2) {
