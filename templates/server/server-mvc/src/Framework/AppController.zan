@@ -15,8 +15,8 @@ namespace ZanWeb;
 /// finishes — so no business code, and no DAO, contains Acquire/Release:
 ///
 ///     PostDao dao = new PostDao(await this.Conn());
-///     List&lt;Post&gt; rows = dao.Recent(20, kw);
-///     Post one = dao.ById(id);          // same connection, no second lease
+///     List&lt;Post&gt; rows = await dao.Recent(20, kw);
+///     Post one = await dao.ById(id);    // same connection, no second lease
 ///
 /// One connection per request (not per query) is also what makes transactions
 /// possible at all: a transaction lives on a session, so every statement inside
@@ -24,13 +24,17 @@ namespace ZanWeb;
 ///
 ///     if (!await this.Begin()) { ...unavailable... }
 ///     try {
-///         new PostDao(this.Held()).Insert(p);
-///         new UserDao(this.Held()).BumpPostCount(uid);
-///         this.Commit();
-///     } catch { this.Rollback(); }   // Rollback is safe to call twice
+///         int id = await new PostDao(this.Held()).Insert(p);
+///         int _n = await new UserDao(this.Held()).BumpTokenVersion(uid);
+///         await this.Commit();
+///     } catch { await this.Rollback(); }   // Rollback is safe to call twice
 ///
-/// Override OnDone() (not OnAfter()) for per-request cleanup of your own, so the
-/// connection is always released.
+/// BEGIN / COMMIT / ROLLBACK are statements like any other, so they are awaited
+/// too — on a non-blocking driver they are round trips, and the request's
+/// teardown (OnAfterAsync) therefore runs on the coroutine as well.
+///
+/// Override OnDone() (not OnAfterAsync()) for per-request cleanup of your own, so
+/// the connection is always released.
 /// </summary>
 class AppController : Controller {
     IDbConnection lease;
@@ -75,32 +79,33 @@ class AppController : Controller {
         IDbConnection db = await this.Conn();
         if (db == null) { return false; }
         if (this.inTx) { return true; }
-        db.BeginTransaction();
+        await db.BeginTransactionAsync();
         this.inTx = true;
         return true;
     }
 
     /// <summary>Commits this request's transaction (no-op when none is open).</summary>
-    protected void Commit() {
+    protected async void Commit() {
         if (!this.inTx) { return; }
         this.inTx = false;
-        this.lease.Commit();
+        await this.lease.CommitAsync();
     }
 
     /// <summary>Rolls back this request's transaction (no-op when none is open,
     /// so it is safe in an error path that may run after Commit()).</summary>
-    protected void Rollback() {
+    protected async void Rollback() {
         if (!this.inTx) { return; }
         this.inTx = false;
-        this.lease.Rollback();
+        await this.lease.RollbackAsync();
     }
 
-    /// <summary>Releases the request's connection. An unfinished transaction is
-    /// rolled back first: returning a connection mid-transaction would hand the
-    /// next request a session holding someone else's locks.</summary>
-    virtual void OnAfter() {
+    /// <summary>Releases the request's connection, on the coroutine, so an
+    /// unfinished transaction can be rolled back first: returning a connection
+    /// mid-transaction would hand the next request a session holding someone
+    /// else's locks, and the rollback itself is a round trip.</summary>
+    virtual async void OnAfterAsync() {
         if (this.lease != null) {
-            this.Rollback();
+            await this.Rollback();
             this.Db().Release(this.lease);
             this.lease = null;
         }
@@ -108,6 +113,6 @@ class AppController : Controller {
     }
 
     /// <summary>Per-request cleanup for subclasses. Override this instead of
-    /// OnAfter(), which owns releasing the connection.</summary>
+    /// OnAfterAsync(), which owns releasing the connection.</summary>
     virtual void OnDone() { }
 }

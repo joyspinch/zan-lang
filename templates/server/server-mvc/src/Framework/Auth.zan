@@ -13,17 +13,20 @@ class AuthUser {
     /// <summary>sys_user.status of an account that may log in.</summary>
     static int Active = 1;
 
-    /// <summary>Borrows a connection from the injected pool. The token/rank
-    /// resolvers are synchronous callbacks, so they take an already-idle
-    /// connection instead of parking a coroutine: null means "no capacity", and
-    /// every caller then fails closed (anonymous / rank 0) rather than guessing.
-    /// The RBAC phase removes DB access from the request path entirely -- the
-    /// principal comes from the shared permission cache -- and this bridge with
-    /// it.</summary>
-    static IDbConnection Lease() {
+    /// <summary>Borrows a connection for one authentication lookup. The
+    /// token / rank / permission resolvers run on the request coroutine (their
+    /// delegates are async), so this parks like any other request instead of
+    /// blocking the worker, and it works on drivers that only offer awaited
+    /// calls. null means the database is unreachable and every caller then fails
+    /// closed (anonymous / rank 0) rather than guessing.
+    ///
+    /// It is still one lookup per request: the RBAC phase reads the principal
+    /// from the shared permission tables instead, leaving zero queries on the
+    /// request path.</summary>
+    static async IDbConnection Lease() {
         AppServices s = AppServices.Current();
         if (s == null) { return null; }
-        return s.Db().AcquireSync();
+        return await s.Db().Acquire();
     }
 
     static void Give(IDbConnection db) {
@@ -42,23 +45,23 @@ class AuthUser {
         return material;
     }
 
-    static User ByUsername(string username) {
-        IDbConnection db = AuthUser.Lease();
+    static async User ByUsername(string username) {
+        IDbConnection db = await AuthUser.Lease();
         if (db == null) { return null; }
         try {
-            return new UserDao(db).ByUsername(username);
+            return await new UserDao(db).ByUsername(username);
         } finally {
             AuthUser.Give(db);
         }
     }
 
-    static User ById(string uid) {
+    static async User ById(string uid) {
         int id = AuthUser.ToInt(uid);
         if (id <= 0) { return null; }
-        IDbConnection db = AuthUser.Lease();
+        IDbConnection db = await AuthUser.Lease();
         if (db == null) { return null; }
         try {
-            return new UserDao(db).ById(id);
+            return await new UserDao(db).ById(id);
         } finally {
             AuthUser.Give(db);
         }
@@ -66,8 +69,8 @@ class AuthUser {
 
     /// <summary>Verifies the password and issues a cookie token. "" = rejected;
     /// the caller must not tell the client which of the two reasons applied.</summary>
-    static string Login(string username, string password) {
-        User row = AuthUser.ByUsername(username);
+    static async string Login(string username, string password) {
+        User row = await AuthUser.ByUsername(username);
         if (row == null || row.status != AuthUser.Active) { return ""; }
         string actual = AuthUser.PasswordHash(password, row.passwordSalt);
         if (!AuthToken.Equal(actual, row.passwordHash)) { return ""; }
@@ -79,14 +82,14 @@ class AuthUser {
     /// (unknown, disabled, or the database is out of capacity). A token whose
     /// version differs was issued before a password change / forced logout and is
     /// no longer valid — so the token itself carries no password material.</summary>
-    static int TokenVersion(string uid) {
-        User row = AuthUser.ById(uid);
+    static async int TokenVersion(string uid) {
+        User row = await AuthUser.ById(uid);
         if (row == null || row.status != AuthUser.Active) { return -1; }
         return row.tokenVersion;
     }
 
-    static int Rank(string uid) {
-        User row = AuthUser.ById(uid);
+    static async int Rank(string uid) {
+        User row = await AuthUser.ById(uid);
         if (row == null || row.status != AuthUser.Active) { return 0; }
         if (row.isSuper == 1) { return 9; }
         return 1;
@@ -96,8 +99,9 @@ class AuthUser {
         return Filter.ToInt(s, 0);
     }
 
-    static bool Allow(string uid, string action) {
-        return AuthUser.Rank(uid) >= 9;
+    static async bool Allow(string uid, string action) {
+        int rank = await AuthUser.Rank(uid);
+        return rank >= 9;
     }
 }
 
@@ -173,7 +177,7 @@ class AuthToken {
         return AuthToken.EncodeUrl(packed, packed.Length);
     }
 
-    static string Resolve(string token) {
+    static async string Resolve(string token) {
         if (token.Length < 50 || token.Length > 512) { return ""; }
         List<int> decodedLen = new List<int>(); decodedLen.Add(0);
         byte[] packed = AuthToken.DecodeUrl(token, decodedLen);
@@ -207,7 +211,7 @@ class AuthToken {
         int now = WebApp.NowSeconds();
         if (issued <= 0 || issued > now + 300 || issued + 864000 <= now) { return ""; }
         int carried = Filter.ToInt(plain.Substring(third + 1), -1);
-        int current = AuthUser.TokenVersion(uid);
+        int current = await AuthUser.TokenVersion(uid);
         // Never log the token or the uid: an access log is not a place to leak
         // credential material.
         if (carried < 0 || current < 0 || carried != current) { return ""; }

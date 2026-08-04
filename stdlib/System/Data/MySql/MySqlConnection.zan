@@ -44,7 +44,7 @@ class PreparedStmt {
 ///   DbResult r = await db.QueryAsync("SELECT id, name FROM t");
 ///   db.Close();
 /// </summary>
-class MySqlConnection {
+class MySqlConnection : IDbConnection {
     nint sock;
     bool connected;
     string lastError;
@@ -861,7 +861,7 @@ class MySqlConnection {
         if (!this.connected) {
             this.hadError = true;
             this.lastError = "not connected";
-            return result;
+            this.fail();
         }
         int stmtId = 0;
         int hit = this.stmtCacheFind(sql);
@@ -870,7 +870,7 @@ class MySqlConnection {
         } else {
             List<int> ids = new List<int>();
             bool ok = await this.stmtPrepare(sql, ids);
-            if (!ok) { this.hadError = true; return result; }
+            if (!ok) { this.hadError = true; this.fail(); }
             stmtId = ids[0];
             await this.stmtCacheAdd(sql, stmtId);
         }
@@ -880,7 +880,7 @@ class MySqlConnection {
             this.hadError = true;
             this.lastError = "connection closed";
             this.connected = false;
-            return result;
+            this.fail();
         }
         int b0 = first[0] & 255;
         if (b0 == 255) {
@@ -888,9 +888,10 @@ class MySqlConnection {
             this.lastError = "err " + Convert.ToString(code) + ": "
                 + bytesToStr(first, 9, this.lastLen - 9);
             this.hadError = true;
+            this.lastNumber = code;
             this.stmtCacheRemove(stmtId);
             await this.stmtClose(stmtId);
-            return result;
+            this.fail();
         }
         if (b0 == 0 || b0 == 254) {
             List<int> cur = new List<int>(); cur.Add(1);
@@ -950,12 +951,13 @@ class MySqlConnection {
         return result;
     }
 
-    /// <summary>Runs a parameterized non-query statement; returns affected rows
-    /// (-1 on error).</summary>
+    /// <summary>Runs a parameterized non-query statement; returns affected rows.
+    /// Throws <see cref="DbException"/> when the statement fails, so a failed
+    /// write is never mistaken for "zero rows matched".</summary>
     async int ExecuteParamsAsync(string sql, DbParams prms) {
         DbResult r = await this.QueryParamsAsync(sql, prms);
         if (this.hadError) {
-            return -1;
+            this.fail();
         }
         return this.lastAffected;
     }
@@ -968,6 +970,70 @@ class MySqlConnection {
         }
         return "";
     }
+
+    // ============================================================
+    // IDbConnection / IDbExecutor
+    // ============================================================
+
+    /// <summary>Interface spelling of the parameterized coroutine query, so the
+    /// generated ORM terminals can call one name over every driver.</summary>
+    async DbResult QueryAsync(string sql, DbParams prms) {
+        return await this.QueryParamsAsync(sql, prms);
+    }
+
+    async int ExecuteAsync(string sql, DbParams prms) {
+        return await this.ExecuteParamsAsync(sql, prms);
+    }
+
+    async string ExecuteScalarAsync(string sql, DbParams prms) {
+        return await this.ExecuteScalarParamsAsync(sql, prms);
+    }
+
+    /// <summary>MySQL's transaction control, on the reactor like every other
+    /// statement.</summary>
+    async void BeginTransactionAsync() {
+        int _n = await this.ExecuteAsync("START TRANSACTION");
+    }
+
+    async void CommitAsync() {
+        int _n = await this.ExecuteAsync("COMMIT");
+    }
+
+    async void RollbackAsync() {
+        int _n = await this.ExecuteAsync("ROLLBACK");
+    }
+
+    int GetProvider() {
+        return DbProvider.MySQL;
+    }
+
+    /// <summary>
+    /// The synchronous half of the contract cannot be honoured here: every step
+    /// of this driver is a coroutine suspending on the IO reactor, and there is
+    /// no way to wait for one from a non-coroutine without blocking the worker
+    /// thread the reactor itself runs on -- which would deadlock, not merely
+    /// stall. So it throws instead of pretending, and the message names the fix:
+    /// use the *Async terminal (ToListAsync / ExecuteAffrowsAsync / ...), or
+    /// pool the blocking driver (MySqlConnector) if the call site cannot be a
+    /// coroutine.
+    /// </summary>
+    static DbException Sync() {
+        return new DbException(
+            "MySqlConnection is asynchronous: call the *Async form"
+            + " (QueryAsync / ExecuteAsync / ToListAsync / ExecuteAffrowsAsync)."
+            + " Use MySqlConnector's blocking driver for synchronous call sites.",
+            0, DbProvider.MySQL);
+    }
+
+    DbResult Query(string sql) { throw MySqlConnection.Sync(); }
+    DbResult Query(string sql, DbParams prms) { throw MySqlConnection.Sync(); }
+    int Execute(string sql) { throw MySqlConnection.Sync(); }
+    int Execute(string sql, DbParams prms) { throw MySqlConnection.Sync(); }
+    string ExecuteScalar(string sql) { throw MySqlConnection.Sync(); }
+    string ExecuteScalar(string sql, DbParams prms) { throw MySqlConnection.Sync(); }
+    void BeginTransaction() { throw MySqlConnection.Sync(); }
+    void Commit() { throw MySqlConnection.Sync(); }
+    void Rollback() { throw MySqlConnection.Sync(); }
 
     /// <summary>Last error message recorded on this connection.</summary>
     string GetError() {

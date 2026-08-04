@@ -1,0 +1,444 @@
+using System;
+using System.Data;
+using System.Data.MySql;
+using System.Data.Orm;
+using System.Net.Sockets;
+using System.IO;
+using System.Threading;
+
+// The native MySQL driver must suspend the coroutine, not block the worker, and
+// the SQL the typed ORM sends must be standard SQL. A live server would make
+// that untestable in CI, so this program is BOTH ends: a minimal MySQL 4.1
+// wire-protocol server (handshake, COM_QUERY, COM_STMT_PREPARE/EXECUTE) that
+// answers every statement only after a deliberate delay, and a client driving
+// the compile-time ORM through MySqlAsyncConnector's pool.
+//
+// What it pins down, all of which regressed before:
+//   * a ticker coroutine keeps advancing WHILE a query waits for the server --
+//     a blocking driver freezes it for the whole round trip;
+//   * four queries on a four-connection pool overlap instead of serializing;
+//   * WHERE uses `=`, not Zan's `==` (SQLite tolerates `==`, MySQL rejects it);
+//   * a null string field binds as SQL NULL via the null bitmap.
+
+[Table(Name = "note")]
+class Note {
+    [Column(IsIdentity = true)]
+    int id;
+    [Column(StringLength = 64)]
+    string title;
+    int views;
+}
+
+// ---------------------------------------------------------------- server ----
+
+class Wire {
+    // A byte buffer that grows by appending, so packets are assembled in the
+    // order the protocol lists their fields.
+    byte[] buf;
+    int len;
+
+    Wire() {
+        this.buf = new byte[512];
+        this.len = 0;
+    }
+
+    void Grow(int extra) {
+        if (this.len + extra + 1 <= this.buf.Length) { return; }
+        int size = this.buf.Length * 2;
+        while (size < this.len + extra + 1) { size = size * 2; }
+        byte[] bigger = new byte[size];
+        for (int i = 0; i < this.len; i = i + 1) { bigger[i] = this.buf[i]; }
+        this.buf = bigger;
+    }
+
+    Wire U8(int v) {
+        this.Grow(1);
+        this.buf[this.len] = (byte)(v & 255);
+        this.len = this.len + 1;
+        return this;
+    }
+
+    Wire U16(int v) { return this.U8(v).U8(v >> 8); }
+
+    Wire U32(int v) { return this.U8(v).U8(v >> 8).U8(v >> 16).U8(v >> 24); }
+
+    Wire Zeros(int n) {
+        int i = 0;
+        while (i < n) { this.U8(0); i = i + 1; }
+        return this;
+    }
+
+    Wire Raw(string s) {
+        int i = 0;
+        while (i < s.Length) { this.U8(s[i] & 255); i = i + 1; }
+        return this;
+    }
+
+    /// <summary>NUL-terminated string.</summary>
+    Wire Cstr(string s) { return this.Raw(s).U8(0); }
+
+    /// <summary>Length-encoded string (only the short form is needed here).</summary>
+    Wire Lstr(string s) { return this.U8(s.Length).Raw(s); }
+
+    string Text() { return this.buf.ToStr(0, this.len); }
+}
+
+class FakeMySql {
+    int port;
+    int delayMs;
+    int queries;      // COM_QUERY + COM_STMT_EXECUTE served
+    bool sawNonStandardOp;   // a prepared statement containing `==` or `!=`
+    bool sawNullParam;       // a bound parameter marked NULL in the bitmap
+    TcpListener listener;
+
+    FakeMySql(int port, int delayMs) {
+        this.port = port;
+        this.delayMs = delayMs;
+        this.queries = 0;
+        this.sawNonStandardOp = false;
+        this.sawNullParam = false;
+        this.listener = null;
+    }
+
+    /// <summary>Stops accepting so the process can exit once the test is done.</summary>
+    void Stop() {
+        if (this.listener != null) { this.listener.Stop(); }
+    }
+
+    async void Serve() {
+        this.listener = new TcpListener("127.0.0.1", this.port);
+        this.listener.Start();
+        while (true) {
+            nint client = await this.listener.AcceptAsync();
+            if (client < 0) { return; }
+            Task.Spawn(this.Session(client));
+        }
+    }
+
+    /// <summary>Sends one protocol packet: 3-byte length, sequence id, payload.
+    /// Header and payload go out as raw byte buffers -- a MySQL packet contains
+    /// NUL bytes, so it must never travel through a NUL-terminated string.</summary>
+    async int Send(nint sock, Wire w, int seq) {
+        byte[] hdr = new byte[5];
+        hdr[0] = (byte)(w.len & 255);
+        hdr[1] = (byte)((w.len >> 8) & 255);
+        hdr[2] = (byte)((w.len >> 16) & 255);
+        hdr[3] = (byte)(seq & 255);
+        int a = await Socket.SendAsync(sock, hdr, 4);
+        int b = await Socket.SendAsync(sock, w.buf, w.len);
+        return a + b;
+    }
+
+    /// <summary>Reads one packet into a byte buffer; returns null when the peer
+    /// is gone. The payload length lands in seqOut[1], the sequence id in
+    /// seqOut[0].</summary>
+    async byte[] Recv(nint sock, List<int> seqOut) {
+        byte[] hdr = new byte[5];
+        int got = await this.RecvExact(sock, hdr, 4);
+        if (got < 4) { return null; }
+        int len = (hdr[0]&255) | ((hdr[1]&255)<<8) | ((hdr[2]&255)<<16);
+        seqOut[0] = hdr[3] & 255;
+        seqOut[1] = len;
+        byte[] pay = new byte[len + 1];
+        if (len > 0) {
+            int g2 = await this.RecvExact(sock, pay, len);
+            if (g2 < len) { return null; }
+        }
+        return pay;
+    }
+
+    async int RecvExact(nint sock, byte[] dst, int need) {
+        int have = 0;
+        byte[] tmp = new byte[need + 1];
+        while (have < need) {
+            int n = await Socket.RecvIntoAsync(sock, tmp, need - have);
+            if (n <= 0) { return have; }
+            int i = 0;
+            while (i < n) { dst[have + i] = tmp[i]; i = i + 1; }
+            have = have + n;
+        }
+        return have;
+    }
+
+    async void Session(nint sock) {
+        // Handshake v10: enough of it for the driver's parser -- version,
+        // thread id, 8+12 byte salt, capabilities (PROTOCOL_41 |
+        // SECURE_CONNECTION | PLUGIN_AUTH) and the auth plugin name.
+        Wire hs = new Wire();
+        hs.U8(10).Cstr("8.0.0-zan-fake").U32(1);
+        hs.Raw("ABCDEFGH").U8(0);                       // salt part 1 + filler
+        hs.U16(512 | 32768);                            // capability flags (low)
+        hs.U8(45);                                      // charset
+        hs.U16(2);                                      // status flags
+        hs.U16(8);                                      // capability flags (high)
+        hs.U8(21);                                      // auth-plugin-data length
+        hs.Zeros(10);
+        hs.Raw("IJKLMNOPQRST").U8(0);                   // salt part 2
+        hs.Cstr("mysql_native_password");
+        int _hs = await this.Send(sock, hs, 0);
+
+        List<int> seq = new List<int>(); seq.Add(0); seq.Add(0);
+        byte[] auth = await this.Recv(sock, seq);
+        if (auth == null) { Socket.Close(sock); return; }
+        // Any credentials are accepted: this stub tests the transport, not
+        // authentication.
+        int _ok = await this.Send(sock, FakeMySql.Ok(0), seq[0] + 1);
+
+        while (true) {
+            byte[] cmd = await this.Recv(sock, seq);
+            if (cmd == null) { Socket.Close(sock); return; }
+            int op = cmd[0] & 255;
+            int clen = seq[1];
+            string sql = cmd.ToStr(1, clen - 1);
+            if (op == 1) { Socket.Close(sock); return; }             // COM_QUIT
+            if (op == 3) {                                            // COM_QUERY
+                await this.AnswerText(sock, sql);
+            } else if (op == 22) {                                    // COM_STMT_PREPARE
+                await this.AnswerPrepare(sock, sql);
+            } else if (op == 23) {                                    // COM_STMT_EXECUTE
+                // Byte 10 onwards is the null bitmap; a set bit is SQL NULL.
+                if (clen > 10 && (cmd[10] & 255) != 0) { this.sawNullParam = true; }
+                await this.AnswerExecute(sock);
+            } else if (op == 25) {                                    // COM_STMT_CLOSE
+                // fire and forget, no reply
+            } else {
+                int _e = await this.Send(sock, FakeMySql.Ok(0), 1);
+            }
+        }
+    }
+
+    static Wire Ok(int affected) {
+        Wire w = new Wire();
+        w.U8(0).U8(affected).U8(0).U16(2).U16(0);
+        return w;
+    }
+
+    static Wire Eof() {
+        Wire w = new Wire();
+        w.U8(254).U16(0).U16(2);
+        return w;
+    }
+
+    /// <summary>Column definition packet (protocol 41). `type` is a
+    /// MYSQL_TYPE_*: 3 = LONG, 253 = VAR_STRING.</summary>
+    static Wire Column(string name, int type) {
+        Wire w = new Wire();
+        w.Lstr("def").Lstr("app").Lstr("note").Lstr("note");
+        w.Lstr(name).Lstr(name);
+        w.U8(12);                    // length of the fixed-length fields
+        w.U16(45);                   // charset
+        w.U32(64);                   // column length
+        w.U8(type);
+        w.U16(0);                    // flags (signed)
+        w.U8(0);                     // decimals
+        w.U16(0);                    // filler
+        return w;
+    }
+
+    /// <summary>Text-protocol answer to COM_QUERY. Only what the driver's own
+    /// bookkeeping asks for (`SELECT LAST_INSERT_ID()`, transaction control)
+    /// plus a two-column demo row.</summary>
+    async void AnswerText(nint sock, string sql) {
+        await Task.Delay(this.delayMs);
+        this.queries = this.queries + 1;
+        string head = FakeMySql.Head(sql);
+        if (head != "SELECT") {
+            int _o = await this.Send(sock, FakeMySql.Ok(1), 1);
+            return;
+        }
+        int _c = await this.Send(sock, FakeMySql.Count(1), 1);
+        int _d = await this.Send(sock, FakeMySql.Column("n", 3), 2);
+        int _e = await this.Send(sock, FakeMySql.Eof(), 3);
+        Wire row = new Wire();
+        row.Lstr("7");
+        int _r = await this.Send(sock, row, 4);
+        int _f = await this.Send(sock, FakeMySql.Eof(), 5);
+    }
+
+    static Wire Count(int n) {
+        Wire w = new Wire();
+        w.U8(n);
+        return w;
+    }
+
+    static string Head(string sql) {
+        string t = sql;
+        while (t.Length > 0 && t.Substring(0, 1) == " ") { t = t.Substring(1); }
+        int sp = t.IndexOf(" ");
+        if (sp < 0) { sp = t.Length; }
+        return t.Substring(0, sp).ToUpper();
+    }
+
+    // The statement the driver last prepared, so EXECUTE knows what to answer.
+    string pending;
+
+    async void AnswerPrepare(nint sock, string sql) {
+        this.pending = sql;
+        if (sql.IndexOf("==") >= 0 || sql.IndexOf("!=") >= 0) {
+            this.sawNonStandardOp = true;
+        }
+        bool select = FakeMySql.Head(sql) == "SELECT";
+        int ncols = 0;
+        if (select) { ncols = 3; }
+        Wire ok = new Wire();
+        ok.U8(0).U32(1).U16(ncols).U16(0).U8(0).U16(0);   // stmt id 1, no params
+        int _p = await this.Send(sock, ok, 1);
+        if (ncols > 0) {
+            int _c1 = await this.Send(sock, FakeMySql.Column("id", 3), 2);
+            int _c2 = await this.Send(sock, FakeMySql.Column("title", 253), 3);
+            int _c3 = await this.Send(sock, FakeMySql.Column("views", 3), 4);
+            int _e = await this.Send(sock, FakeMySql.Eof(), 5);
+        }
+    }
+
+    async void AnswerExecute(nint sock) {
+        // THE POINT OF THE TEST: the server answers late. A blocking driver
+        // would hold the worker here; a coroutine driver parks and lets the
+        // ticker run.
+        await Task.Delay(this.delayMs);
+        this.queries = this.queries + 1;
+        if (FakeMySql.Head(this.pending) != "SELECT") {
+            int _o = await this.Send(sock, FakeMySql.Ok(2), 1);
+            return;
+        }
+        int _c = await this.Send(sock, FakeMySql.Count(3), 1);
+        int _c1 = await this.Send(sock, FakeMySql.Column("id", 3), 2);
+        int _c2 = await this.Send(sock, FakeMySql.Column("title", 253), 3);
+        int _c3 = await this.Send(sock, FakeMySql.Column("views", 3), 4);
+        int _e = await this.Send(sock, FakeMySql.Eof(), 5);
+        // Binary row: 0x00 header, null bitmap (2-bit offset), then values.
+        Wire row = new Wire();
+        row.U8(0).U8(0);
+        row.U32(7);
+        row.Lstr("alpha");
+        row.U32(42);
+        int _r = await this.Send(sock, row, 6);
+        int _f = await this.Send(sock, FakeMySql.Eof(), 7);
+    }
+}
+
+// ---------------------------------------------------------------- client ----
+
+class Program {
+    static int ticks;
+    static bool running;
+    static string stage;
+
+    /// <summary>Fails loudly instead of hanging forever.</summary>
+    static async void Watchdog(int ms) {
+        int waited = 0;
+        while (waited < ms) {
+            await Task.Delay(50);
+            waited = waited + 50;
+            if (!Program.running) { return; }
+        }
+        Console.WriteLine("TIMEOUT at stage: " + Program.stage);
+        Program.running = false;
+    }
+
+    /// <summary>Keeps counting while queries are in flight; its progress is the
+    /// evidence that the worker was never blocked.</summary>
+    static async void Ticker() {
+        while (Program.running) {
+            await Task.Delay(20);
+            Program.ticks = Program.ticks + 1;
+        }
+    }
+
+    static string YesNo(bool b) {
+        if (b) { return "yes"; }
+        return "no";
+    }
+
+    static async void Main() {
+        int port = 43306;
+        int delayMs = 200;
+        FakeMySql server = new FakeMySql(port, delayMs);
+        Task.Spawn(server.Serve());
+        await Task.Delay(50);
+
+        Program.running = true;
+        Program.ticks = 0;
+        Program.stage = "connect";
+        Task.Spawn(Program.Ticker());
+        Task.Spawn(Program.Watchdog(10000));
+
+        DbPool pool = MySqlAsyncConnector.Pool("127.0.0.1", port, "app",
+            "root", "secret", 4);
+        IDbConnection db = await pool.AcquireAsync();
+        if (db == null) {
+            Console.WriteLine("FAIL: no connection");
+            return;
+        }
+        Console.WriteLine("connected: " + Program.YesNo(true));
+
+        Program.stage = "select";
+        int before = Program.ticks;
+        List<Note> rows = await db.Select<Note>()
+            .Where(a => a.views > 1)
+            .OrderByDescending(a => a.id)
+            .ToListAsync();
+        int during = Program.ticks - before;
+        string first = "";
+        int views = 0;
+        if (rows.Count > 0) {
+            first = rows[0].title;
+            views = rows[0].views;
+        }
+        Console.WriteLine("select: rows=" + Convert.ToString(rows.Count)
+            + " title=" + first + " views=" + Convert.ToString(views));
+        Console.WriteLine("worker ran during the query: "
+            + Program.YesNo(during > 0));
+
+        Program.stage = "update";
+        int upd = await db.Update<Note>()
+            .Set(a => a.views, 99)
+            .Where(a => a.id == 7)
+            .ExecuteAffrowsAsync();
+        Console.WriteLine("update: affected=" + Convert.ToString(upd));
+
+        // A field left unset must reach the wire as SQL NULL, not crash the
+        // driver on a null string.
+        Program.stage = "insert";
+        Note fresh = new Note();
+        fresh.views = 1;
+        int newId = await db.Insert<Note>(fresh).ExecuteIdentityAsync();
+        Console.WriteLine("insert: identity=" + Convert.ToString(newId));
+
+        // Four concurrent queries on a pool of four connections: a blocking
+        // driver would serialize them into 4 x the server delay.
+        Program.stage = "concurrent";
+        long t0 = ServerMetrics.MonoMillis();
+        List<int> counts = new List<int>();
+        Task.Spawn(Program.Fetch(pool, counts));
+        Task.Spawn(Program.Fetch(pool, counts));
+        Task.Spawn(Program.Fetch(pool, counts));
+        Task.Spawn(Program.Fetch(pool, counts));
+        while (counts.Count < 4 && Program.running) { await Task.Delay(5); }
+        long elapsed = ServerMetrics.MonoMillis() - t0;
+        int fetched = 0;
+        for (int i = 0; i < counts.Count; i = i + 1) { fetched = fetched + counts[i]; }
+        Console.WriteLine("four queries overlapped: "
+            + Program.YesNo(elapsed < 4 * delayMs));
+        Console.WriteLine("rows fetched concurrently: " + Convert.ToString(fetched));
+
+        Console.WriteLine("sql used standard equality: "
+            + Program.YesNo(!server.sawNonStandardOp));
+        Console.WriteLine("null string bound as SQL NULL: "
+            + Program.YesNo(server.sawNullParam));
+
+        Program.running = false;
+        pool.Release(db);
+        pool.Close();
+        server.Stop();
+        Console.WriteLine("OK");
+    }
+
+    static async void Fetch(DbPool pool, List<int> done) {
+        IDbConnection c = await pool.AcquireAsync();
+        if (c == null) { done.Add(-1); return; }
+        List<Note> rows = await c.Select<Note>().ToListAsync();
+        pool.Release(c);
+        done.Add(rows.Count);
+    }
+}

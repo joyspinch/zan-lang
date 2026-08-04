@@ -1035,6 +1035,7 @@ static bool dg_is_root(dg_ctx_t *c, zan_ast_node_t *call, zan_istr_t *cls_out,
     else if (istr_is(m, "Update")) k = CK_UPDATE;
     else if (istr_is(m, "Delete")) k = CK_DELETE;
     else if (istr_is(m, "SyncStructure")) sync = true;
+    else if (istr_is(m, "SyncStructureAsync")) sync = true;
     else return false;
     if (call->call.type_args.count != 1 || call->call.args.count > maxargs)
         return false;
@@ -1407,15 +1408,19 @@ static void dg_rewrite_cols(dg_ctx_t *c, zan_ast_node_t *call, zan_istr_t cls,
     *call = *node;
 }
 
-/* `db.SyncStructure<T>()` -> `__DbBind.CF_T(db)` (CodeFirst DDL). */
+/* `db.SyncStructure<T>()` -> `__DbBind.CF_T(db)` (CodeFirst DDL), and
+ * `db.SyncStructureAsync<T>()` -> `__DbBind.CFA_T(db)` (the same DDL over the
+ * async executor, so a non-blocking driver can create tables at startup). */
 static void dg_rewrite_sync(dg_ctx_t *c, zan_ast_node_t *call,
                             zan_istr_t cls) {
     dg_need_add(&c->need, cls);
     c->any = true;
     zan_ast_node_t *callee = call->call.callee;
+    bool is_async = istr_is(callee->member.name, "SyncStructureAsync");
     zan_ast_node_t *recv = callee->member.object;
     char mname[160];
-    snprintf(mname, sizeof(mname), "CF_%.*s", (int)cls.len, cls.str);
+    snprintf(mname, sizeof(mname), "%s_%.*s", is_async ? "CFA" : "CF",
+             (int)cls.len, cls.str);
     callee->member.object = nb_ident(c, call->loc, "__DbBind");
     callee->member.name = dg_istr(c, mname, strlen(mname));
     call->call.type_args.count = 0;
@@ -1424,13 +1429,16 @@ static void dg_rewrite_sync(dg_ctx_t *c, zan_ast_node_t *call,
 }
 
 /* `db.SyncStructureAll()` -> `__DbBind.SyncAll(db)`. Every class carrying a
- * [Table] attribute is included by the generated binder. */
+ * [Table] attribute is included by the generated binder. The async twin
+ * (`SyncStructureAllAsync()`) maps to `SyncAllAsync`. */
 static void dg_rewrite_sync_all(dg_ctx_t *c, zan_ast_node_t *call) {
     c->any = true;
     zan_ast_node_t *callee = call->call.callee;
+    bool is_async = istr_is(callee->member.name, "SyncStructureAllAsync");
     zan_ast_node_t *recv = callee->member.object;
     callee->member.object = nb_ident(c, call->loc, "__DbBind");
-    callee->member.name = dg_istr(c, "SyncAll", 7);
+    callee->member.name = is_async ? dg_istr(c, "SyncAllAsync", 12)
+                                   : dg_istr(c, "SyncAll", 7);
     call->call.type_args.count = 0;
     zan_ast_list_init(&call->call.args);
     zan_ast_list_push(&call->call.args, recv, c->arena);
@@ -1988,7 +1996,8 @@ static void dg_visit_call(dg_ctx_t *c, zan_ast_node_t *e) {
     dg_ck_t rk = CK_NONE;
     bool sync = false;
     if (e->call.callee && e->call.callee->kind == AST_MEMBER_ACCESS
-        && istr_is(e->call.callee->member.name, "SyncStructureAll")
+        && (istr_is(e->call.callee->member.name, "SyncStructureAll")
+            || istr_is(e->call.callee->member.name, "SyncStructureAllAsync"))
         && e->call.type_args.count == 0 && e->call.args.count == 0) {
         c->sync_all = true;
         dg_rewrite_sync_all(c, e);
@@ -2436,8 +2445,7 @@ static void dg_gen_entity(dg_ctx_t *c, dg_buf_t *out, zan_istr_t cls) {
 
     /* row mapper + terminals */
     dg_putf(out,
-        "    List<%.*s> ToList() {\n"
-        "        DbResult r = this.db.Query(BuildSelect(), this.ps);\n"
+        "    List<%.*s> MapRows(DbResult r) {\n"
         "        List<%.*s> outp = new List<%.*s>();\n"
         "        int row = 0;\n"
         "        while (row < r.RowCount()) {\n"
@@ -2510,29 +2518,60 @@ static void dg_gen_entity(dg_ctx_t *c, dg_buf_t *out, zan_istr_t cls) {
         "        }\n"
         "        return outp;\n"
         "    }\n");
+    /* One row mapper, two terminals: the asynchronous one is what a networked
+     * driver needs to avoid blocking the worker, the synchronous one is what a
+     * non-coroutine call site (a hook, a resolver) can use over an embedded
+     * driver. */
     dg_putf(out,
-        "    List<string> ToListCol(string col) {\n"
+        "    List<%.*s> ToList() {\n"
+        "        return MapRows(this.db.Query(BuildSelect(), this.ps));\n"
+        "    }\n"
+        "    async List<%.*s> ToListAsync() {\n"
+        "        string sql = BuildSelect();\n"
+        "        DbResult r = await this.db.QueryAsync(sql, this.ps);\n"
+        "        return MapRows(r);\n"
+        "    }\n",
+        CL, CS, CL, CS);
+    dg_putf(out,
+        "    string BuildCol(string col) {\n"
         "        StringBuilder sb = new StringBuilder();\n"
         "        sb.Append(\"SELECT \" + col + \" FROM \" + this.tbl + \" t\");\n"
         "        if (this.w.Length > 0) { sb.Append(\" WHERE \" + this.w); }\n"
         "        if (this.gb.Length > 0) { sb.Append(\" GROUP BY \" + this.gb); }\n"
         "        if (this.h.Length > 0) { sb.Append(\" HAVING \" + this.h); }\n"
         "        if (this.ob.Length > 0) { sb.Append(\" ORDER BY \" + this.ob); }\n"
-        "        DbResult r = this.db.Query(sb.ToString(), this.ps);\n"
+        "        return sb.ToString();\n"
+        "    }\n"
+        "    List<string> MapCol(DbResult r) {\n"
         "        List<string> outp = new List<string>();\n"
         "        int row = 0;\n"
         "        while (row < r.RowCount()) { outp.Add(r.GetString(row, 0)); row = row + 1; }\n"
         "        return outp;\n"
+        "    }\n"
+        "    List<string> ToListCol(string col) {\n"
+        "        return MapCol(this.db.Query(BuildCol(col), this.ps));\n"
+        "    }\n"
+        "    async List<string> ToListColAsync(string col) {\n"
+        "        string sql = BuildCol(col);\n"
+        "        DbResult r = await this.db.QueryAsync(sql, this.ps);\n"
+        "        return MapCol(r);\n"
         "    }\n");
     dg_putf(out,
-        "    DbResult ToListDtoR(string cols) {\n"
+        "    string BuildDto(string cols) {\n"
         "        StringBuilder sb = new StringBuilder();\n"
         "        sb.Append(\"SELECT \" + cols + \" FROM \" + this.tbl + \" t\");\n"
         "        if (this.w.Length > 0) { sb.Append(\" WHERE \" + this.w); }\n"
         "        if (this.gb.Length > 0) { sb.Append(\" GROUP BY \" + this.gb); }\n"
         "        if (this.h.Length > 0) { sb.Append(\" HAVING \" + this.h); }\n"
         "        if (this.ob.Length > 0) { sb.Append(\" ORDER BY \" + this.ob); }\n"
-        "        return this.db.Query(sb.ToString(), this.ps);\n"
+        "        return sb.ToString();\n"
+        "    }\n"
+        "    DbResult ToListDtoR(string cols) {\n"
+        "        return this.db.Query(BuildDto(cols), this.ps);\n"
+        "    }\n"
+        "    async DbResult ToListDtoRAsync(string cols) {\n"
+        "        string sql = BuildDto(cols);\n"
+        "        return await this.db.QueryAsync(sql, this.ps);\n"
         "    }\n");
     dg_putf(out,
         "    %.*s First() {\n"
@@ -2543,25 +2582,61 @@ static void dg_gen_entity(dg_ctx_t *c, dg_buf_t *out, zan_istr_t cls) {
         "    }\n"
         "    %.*s FirstOrDefault() { return First(); }\n"
         "    %.*s ToOne() { return First(); }\n"
+        "    async %.*s FirstAsync() {\n"
+        "        this.limN = 1;\n"
+        "        List<%.*s> l = await ToListAsync();\n"
+        "        if (l.Count > 0) { return l[0]; }\n"
+        "        return null;\n"
+        "    }\n"
+        "    async %.*s FirstOrDefaultAsync() { return await FirstAsync(); }\n"
+        "    async %.*s ToOneAsync() { return await FirstAsync(); }\n"
+        "    string BuildCount() {\n"
+        "        StringBuilder sb = new StringBuilder();\n"
+        "        sb.Append(\"SELECT COUNT(*) FROM (SELECT 1 FROM \" + "
+        "this.tbl + \" t\");\n"
+        "        if (this.w.Length > 0) { sb.Append(\" WHERE \" + this.w); }\n"
+        "        sb.Append(\" GROUP BY \" + this.gb);\n"
+        "        if (this.h.Length > 0) { sb.Append(\" HAVING \" + this.h); }\n"
+        "        sb.Append(\")\");\n"
+        "        return sb.ToString();\n"
+        "    }\n"
+        "    async int CountAsync() {\n"
+        "        if (this.gb.Length > 0) {\n"
+        "            string sql = BuildCount();\n"
+        "            DbResult r = await this.db.QueryAsync(sql, this.ps);\n"
+        "            if (r.RowCount() == 0) { return 0; }\n"
+        "            return r.GetInt(0, 0);\n"
+        "        }\n"
+        "        return await AggIAsync(\"COUNT(*)\");\n"
+        "    }\n"
+        "    async bool AnyAsync() {\n"
+        "        int n = await CountAsync();\n"
+        "        return n > 0;\n"
+        "    }\n"
+        "    async DbResult AggRAsync(string expr) {\n"
+        "        string sql = BuildAgg(expr);\n"
+        "        return await this.db.QueryAsync(sql, this.ps);\n"
+        "    }\n"
+        "    async int AggIAsync(string expr) {\n"
+        "        DbResult r = await AggRAsync(expr);\n"
+        "        if (r.RowCount() == 0) { return 0; }\n"
+        "        return r.GetInt(0, 0);\n"
+        "    }\n"
+        "    async double AggDAsync(string expr) {\n"
+        "        DbResult r = await AggRAsync(expr);\n"
+        "        if (r.RowCount() == 0) { return 0.0; }\n"
+        "        return r.GetDouble(0, 0);\n"
+        "    }\n"
         "    int Count() {\n"
         "        if (this.gb.Length > 0) {\n"
-        "            StringBuilder sb = new StringBuilder();\n"
-        "            sb.Append(\"SELECT COUNT(*) FROM (SELECT 1 FROM \" + "
-        "this.tbl + \" t\");\n"
-        "            if (this.w.Length > 0) { sb.Append(\" WHERE \" + "
-        "this.w); }\n"
-        "            sb.Append(\" GROUP BY \" + this.gb);\n"
-        "            if (this.h.Length > 0) { sb.Append(\" HAVING \" + "
-        "this.h); }\n"
-        "            sb.Append(\")\");\n"
-        "            DbResult r = this.db.Query(sb.ToString(), this.ps);\n"
+        "            DbResult r = this.db.Query(BuildCount(), this.ps);\n"
         "            if (r.RowCount() == 0) { return 0; }\n"
         "            return r.GetInt(0, 0);\n"
         "        }\n"
         "        return AggI(\"COUNT(*)\");\n"
         "    }\n"
         "    bool Any() { return Count() > 0; }\n"
-        "    DbResult AggR(string expr) {\n"
+        "    string BuildAgg(string expr) {\n"
         "        StringBuilder sb = new StringBuilder();\n"
         "        sb.Append(\"SELECT \" + expr + \" FROM \" + this.tbl + \" t\");\n"
         "        if (this.w.Length > 0) { sb.Append(\" WHERE \"); "
@@ -2570,7 +2645,10 @@ static void dg_gen_entity(dg_ctx_t *c, dg_buf_t *out, zan_istr_t cls) {
         "sb.Append(this.gb); }\n"
         "        if (this.h.Length > 0) { sb.Append(\" HAVING \"); "
         "sb.Append(this.h); }\n"
-        "        return this.db.Query(sb.ToString(), this.ps);\n"
+        "        return sb.ToString();\n"
+        "    }\n"
+        "    DbResult AggR(string expr) {\n"
+        "        return this.db.Query(BuildAgg(expr), this.ps);\n"
         "    }\n"
         "    int AggI(string expr) {\n"
         "        DbResult r = AggR(expr);\n"
@@ -2583,6 +2661,7 @@ static void dg_gen_entity(dg_ctx_t *c, dg_buf_t *out, zan_istr_t cls) {
         "        return r.GetDouble(0, 0);\n"
         "    }\n"
         "}\n",
+        CL, CS, CL, CS, CL, CS, CL, CS,
         CL, CS, CL, CS, CL, CS, CL, CS);
 }
 
@@ -2687,6 +2766,8 @@ static void dg_gen_insert(dg_ctx_t *c, dg_buf_t *out, zan_istr_t cls,
         "    List<DbValues> dicts;\n"
         "    List<string> only;\n"
         "    List<string> skip;\n"
+        "    string sql;\n"
+        "    DbParams bound;\n"
         "    static __DbI_%.*s Create(IDbExecutor db) {\n"
         "        __DbI_%.*s q = new __DbI_%.*s();\n"
         "        q.db = db;\n"
@@ -2695,6 +2776,8 @@ static void dg_gen_insert(dg_ctx_t *c, dg_buf_t *out, zan_istr_t cls,
         "        q.dicts = new List<DbValues>();\n"
         "        q.only = new List<string>();\n"
         "        q.skip = new List<string>();\n"
+        "        q.sql = \"\";\n"
+        "        q.bound = new DbParams();\n"
         "        return q;\n"
         "    }\n"
         "    static __DbI_%.*s Create(IDbExecutor db, %.*s o) {\n"
@@ -2733,8 +2816,11 @@ static void dg_gen_insert(dg_ctx_t *c, dg_buf_t *out, zan_istr_t cls,
         CL, CS, CL, CS, CL, CS, CL, CS, CL, CS, CL, CS, CL, CS,
         CL, CS);
 
+    /* The statement is built into this.sql / this.bound and executed by a pair
+     * of terminals, so the synchronous and asynchronous forms share every line
+     * of SQL construction. */
     dg_putf(out,
-        "    int ExecuteDicts() {\n"
+        "    int BuildDicts() {\n"
         "        DbParams ps = new DbParams();\n"
         "        DbValues head = this.dicts[0];\n"
         "        StringBuilder sb = new StringBuilder();\n"
@@ -2766,10 +2852,19 @@ static void dg_gen_insert(dg_ctx_t *c, dg_buf_t *out, zan_istr_t cls,
         "            sb.Append(\")\");\n"
         "            i = i + 1;\n"
         "        }\n"
-        "        return this.db.Execute(sb.ToString(), ps);\n"
+        "        this.sql = sb.ToString();\n"
+        "        this.bound = ps;\n"
+        "        return 1;\n"
         "    }\n"
-        "    int ExecuteAffrows() {\n"
-        "        if (this.dicts.Count > 0) { return ExecuteDicts(); }\n"
+        "    int ExecuteDicts() {\n"
+        "        if (BuildDicts() == 0) { return 0; }\n"
+        "        return this.db.Execute(this.sql, this.bound);\n"
+        "    }\n"
+        "    async int ExecuteDictsAsync() {\n"
+        "        if (BuildDicts() == 0) { return 0; }\n"
+        "        return await this.db.ExecuteAsync(this.sql, this.bound);\n"
+        "    }\n"
+        "    int BuildRows() {\n"
         "        if (this.rows.Count == 0) { return 0; }\n"
         "        DbParams ps = new DbParams();\n"
         "        string cols = \"\";\n", CL, CS);
@@ -2815,11 +2910,28 @@ static void dg_gen_insert(dg_ctx_t *c, dg_buf_t *out, zan_istr_t cls,
         "            sb.Append(\")\");\n"
         "            i = i + 1;\n"
         "        }\n"
-        "        return this.db.Execute(sb.ToString(), ps);\n"
+        "        this.sql = sb.ToString();\n"
+        "        this.bound = ps;\n"
+        "        return 1;\n"
+        "    }\n"
+        "    int ExecuteAffrows() {\n"
+        "        if (this.dicts.Count > 0) { return ExecuteDicts(); }\n"
+        "        if (BuildRows() == 0) { return 0; }\n"
+        "        return this.db.Execute(this.sql, this.bound);\n"
+        "    }\n"
+        "    async int ExecuteAffrowsAsync() {\n"
+        "        if (this.dicts.Count > 0) { return await ExecuteDictsAsync(); }\n"
+        "        if (BuildRows() == 0) { return 0; }\n"
+        "        return await this.db.ExecuteAsync(this.sql, this.bound);\n"
         "    }\n"
         "    int ExecuteIdentity() {\n"
         "        if (ExecuteAffrows() == 0) { return 0; }\n"
         "        return __DbBind.LastId(this.db);\n"
+        "    }\n"
+        "    async int ExecuteIdentityAsync() {\n"
+        "        int n = await ExecuteAffrowsAsync();\n"
+        "        if (n == 0) { return 0; }\n"
+        "        return await __DbBind.LastIdAsync(this.db);\n"
         "    }\n"
         "}\n");
 }
@@ -3016,13 +3128,23 @@ static void dg_gen_update(dg_ctx_t *c, dg_buf_t *out, zan_istr_t cls,
     }
 
     dg_putf(out,
-        "    int ExecuteAffrows() {\n"
+        "    string BuildUpdate() {\n"
         "        ApplySource();\n"
-        "        if (this.sets.Length == 0) { return 0; }\n"
-        "        if (this.w.Length == 0) { return 0; }\n"
-        "        string sql = \"UPDATE \" + this.tbl + \" SET \" + this.sets\n"
+        "        if (this.sets.Length == 0) { return \"\"; }\n"
+        "        if (this.w.Length == 0) { return \"\"; }\n"
+        "        return \"UPDATE \" + this.tbl + \" SET \" + this.sets\n"
         "            + \" WHERE \" + this.w;\n"
+        "    }\n"
+        "    int ExecuteAffrows() {\n"
+        "        string sql = BuildUpdate();\n"
+        "        if (sql.Length == 0) { return 0; }\n"
         "        return this.db.Execute(sql, __DbBind.Cat(this.sp, this.wp));\n"
+        "    }\n"
+        "    async int ExecuteAffrowsAsync() {\n"
+        "        string sql = BuildUpdate();\n"
+        "        if (sql.Length == 0) { return 0; }\n"
+        "        DbParams ps = __DbBind.Cat(this.sp, this.wp);\n"
+        "        return await this.db.ExecuteAsync(sql, ps);\n"
         "    }\n"
         "}\n");
 }
@@ -3106,6 +3228,11 @@ static void dg_gen_delete(dg_ctx_t *c, dg_buf_t *out, zan_istr_t cls,
         "        string sql = \"DELETE FROM \" + this.tbl + \" WHERE \" + this.w;\n"
         "        return this.db.Execute(sql, this.ps);\n"
         "    }\n"
+        "    async int ExecuteAffrowsAsync() {\n"
+        "        if (this.w.Length == 0) { return 0; }\n"
+        "        string sql = \"DELETE FROM \" + this.tbl + \" WHERE \" + this.w;\n"
+        "        return await this.db.ExecuteAsync(sql, this.ps);\n"
+        "    }\n"
         "}\n",
         CL, CS, CL, CS, CL, CS, CL, CS, TBL, TBS, CL, CS, CL, CS, CL, CS,
         CL, CS, CL, CS, CL, CS, CL, CS, CL, CS, CL, CS, CL, CS,
@@ -3154,6 +3281,48 @@ static void dg_gen_codefirst(dg_ctx_t *c, dg_buf_t *out, zan_istr_t cls,
             "        if (!__DbBind.Has(have, \"%.*s\")) {\n"
             "            db.Execute(\"ALTER TABLE \" + t + \" ADD COLUMN %.*s \"\n"
             "                + __DbBind.Ty(p, %d, false, false, %d));\n"
+            "        }\n",
+            (int)f->col.len, f->col.str, (int)f->col.len, f->col.str,
+            dg_ty_code(f->kind), f->str_len);
+    }
+    dg_putf(out, "    }\n");
+
+    /* The async twin: same DDL, awaited, so a non-blocking driver (native
+     * MySQL) can create/alter tables without stalling the worker. Kept as a
+     * separate method because the sync one must stay callable from sync code. */
+    dg_putf(out,
+        "    static async void SyncAsync(IDbExecutor db) {\n"
+        "        int p = db.GetProvider();\n"
+        "        string t = \"%.*s\";\n"
+        "        bool exists = await __DbBind.HasTableAsync(db, t);\n"
+        "        if (!exists) {\n"
+        "            string ddl = \"CREATE TABLE \" + t + \" (\";\n",
+        TBL, TBS);
+    first = true;
+    for (int i = 0; i < fs->count; i++) {
+        const dg_field_t *f = &fs->items[i];
+        if (f->kind == DF_NAV) continue;
+        dg_putf(out,
+            "            ddl = ddl + \"%s%.*s \" + __DbBind.Ty(p, %d, %s, %s, %d);\n",
+            first ? "" : ", ", (int)f->col.len, f->col.str,
+            dg_ty_code(f->kind), f->is_pk ? "true" : "false",
+            f->is_ident ? "true" : "false", f->str_len);
+        first = false;
+    }
+    dg_putf(out,
+        "            ddl = ddl + \")\";\n"
+        "            int _c = await db.ExecuteAsync(ddl);\n"
+        "            return;\n"
+        "        }\n"
+        "        List<string> have = await __DbBind.ColsAsync(db, t);\n");
+    for (int i = 0; i < fs->count; i++) {
+        const dg_field_t *f = &fs->items[i];
+        if (f->kind == DF_NAV) continue;
+        dg_putf(out,
+            "        if (!__DbBind.Has(have, \"%.*s\")) {\n"
+            "            string alter = \"ALTER TABLE \" + t + \" ADD COLUMN %.*s \"\n"
+            "                + __DbBind.Ty(p, %d, false, false, %d);\n"
+            "            int _a = await db.ExecuteAsync(alter);\n"
             "        }\n",
             (int)f->col.len, f->col.str, (int)f->col.len, f->col.str,
             dg_ty_code(f->kind), f->str_len);
@@ -3239,16 +3408,25 @@ void zan_dbgen_run(zan_ast_node_t *unit, zan_arena_t *arena,
             "    static __DbD_%.*s D_%.*s(IDbExecutor db) { "
             "return __DbD_%.*s.Create(db); }\n"
             "    static void CF_%.*s(IDbExecutor db) { "
-            "__DbCF_%.*s.Sync(db); }\n",
+            "__DbCF_%.*s.Sync(db); }\n"
+            "    static async void CFA_%.*s(IDbExecutor db) { "
+            "await __DbCF_%.*s.SyncAsync(db); }\n",
             L, S, L, S, L, S, L, S, L, S, L, S, L, S, L, S, L, S, L, S,
             L, S, L, S, L, S, L, S, L, S, L, S, L, S, L, S, L, S, L, S,
-            L, S, L, S);
+            L, S, L, S, L, S, L, S);
     }
     if (c.sync_all) {
         dg_putf(&out, "    static void SyncAll(IDbExecutor db) {\n");
         for (int i = 0; i < c.need.count; i++) {
             zan_istr_t cls = c.need.names[i];
             dg_putf(&out, "        CF_%.*s(db);\n", (int)cls.len, cls.str);
+        }
+        dg_putf(&out, "    }\n");
+        dg_putf(&out, "    static async void SyncAllAsync(IDbExecutor db) {\n");
+        for (int i = 0; i < c.need.count; i++) {
+            zan_istr_t cls = c.need.names[i];
+            dg_putf(&out, "        await CFA_%.*s(db);\n", (int)cls.len,
+                    cls.str);
         }
         dg_putf(&out, "    }\n");
     }
@@ -3293,7 +3471,7 @@ void zan_dbgen_run(zan_ast_node_t *unit, zan_arena_t *arena,
         "            i = i + 1;\n"
         "        }\n"
         "    }\n"
-        "    static int LastId(IDbExecutor db) {\n"
+        "    static string LastIdSql(IDbExecutor db) {\n"
         "        int p = db.GetProvider();\n"
         "        string sql = \"SELECT last_insert_rowid()\";\n"
         "        if (p == DbProvider.MySQL || p == DbProvider.MariaDB) {\n"
@@ -3304,14 +3482,79 @@ void zan_dbgen_run(zan_ast_node_t *unit, zan_arena_t *arena,
         "        } else if (p == DbProvider.SqlServer || p == DbProvider.DM) {\n"
         "            sql = \"SELECT SCOPE_IDENTITY()\";\n"
         "        }\n"
-        "        DbResult r = db.Query(sql);\n"
+        "        return sql;\n"
+        "    }\n"
+        "    static int LastId(IDbExecutor db) {\n"
+        "        DbResult r = db.Query(__DbBind.LastIdSql(db));\n"
         "        if (r.RowCount() == 0) { return 0; }\n"
         "        return r.GetInt(0, 0);\n"
+        "    }\n"
+        "    static async int LastIdAsync(IDbExecutor db) {\n"
+        "        string sql = __DbBind.LastIdSql(db);\n"
+        "        DbResult r = await db.QueryAsync(sql);\n"
+        "        if (r.RowCount() == 0) { return 0; }\n"
+        "        return r.GetInt(0, 0);\n"
+        "    }\n"
+        "    static async bool HasTableAsync(IDbExecutor db, string t) {\n"
+        "        string sql = __DbBind.HasTableSql(db);\n"
+        "        DbResult r = await db.QueryAsync(sql, new DbParams().Add(t));\n"
+        "        if (r.RowCount() == 0) { return false; }\n"
+        "        return r.GetInt(0, 0) > 0;\n"
+        "    }\n"
+        "    static async List<string> ColsAsync(IDbExecutor db, string t) {\n"
+        "        List<string> cols = new List<string>();\n"
+        "        int p = db.GetProvider();\n"
+        "        DbResult r;\n"
+        "        int nameCol = 0;\n"
+        "        if (p == DbProvider.SQLite) {\n"
+        "            string ps = \"PRAGMA table_info(\" + t + \")\";\n"
+        "            r = await db.QueryAsync(ps);\n"
+        "            nameCol = 1;\n"
+        "        } else {\n"
+        "            string cs = \"SELECT column_name FROM"
+        " information_schema.columns WHERE table_name = ?\"\n"
+        "                + __DbBind.OwnScope(p);\n"
+        "            r = await db.QueryAsync(cs, new DbParams().Add(t));\n"
+        "        }\n"
+        "        int i = 0;\n"
+        "        while (i < r.RowCount()) {\n"
+        "            cols.Add(r.GetString(i, nameCol));\n"
+        "            i = i + 1;\n"
+        "        }\n"
+        "        return cols;\n"
+        "    }\n"
+        /* information_schema spans every database on a MySQL server (and every
+         * schema on PostgreSQL/SQL Server), so an unscoped lookup finds a
+         * same-named table in someone else's database and CodeFirst then
+         * "alters" a table that does not exist here. Every catalog probe is
+         * therefore scoped to the connection's own database/schema. */
+        "    static string OwnScope(int p) {\n"
+        "        if (p == DbProvider.MySQL || p == DbProvider.MariaDB) {\n"
+        "            return \" AND table_schema = DATABASE()\";\n"
+        "        }\n"
+        "        if (p == DbProvider.PostgreSQL || p == DbProvider.OpenGauss\n"
+        "                || p == DbProvider.Kingbase) {\n"
+        "            return \" AND table_schema = current_schema()\";\n"
+        "        }\n"
+        "        if (p == DbProvider.SqlServer || p == DbProvider.DM) {\n"
+        "            return \" AND table_schema = SCHEMA_NAME()\";\n"
+        "        }\n"
+        "        return \"\";\n"
+        "    }\n"
+        "    static string HasTableSql(IDbExecutor db) {\n"
+        "        int p = db.GetProvider();\n"
+        "        string sql = \"SELECT COUNT(*) FROM information_schema.tables"
+        " WHERE table_name = ?\" + __DbBind.OwnScope(p);\n"
+        "        if (p == DbProvider.SQLite) {\n"
+        "            sql = \"SELECT COUNT(*) FROM sqlite_master WHERE"
+        " type = 'table' AND name = ?\";\n"
+        "        }\n"
+        "        return sql;\n"
         "    }\n"
         "    static bool HasTable(IDbExecutor db, string t) {\n"
         "        int p = db.GetProvider();\n"
         "        string sql = \"SELECT COUNT(*) FROM information_schema.tables"
-        " WHERE table_name = ?\";\n"
+        " WHERE table_name = ?\" + __DbBind.OwnScope(p);\n"
         "        if (p == DbProvider.SQLite) {\n"
         "            sql = \"SELECT COUNT(*) FROM sqlite_master WHERE"
         " type = 'table' AND name = ?\";\n"
@@ -3330,7 +3573,8 @@ void zan_dbgen_run(zan_ast_node_t *unit, zan_arena_t *arena,
         "            nameCol = 1;\n"
         "        } else {\n"
         "            r = db.Query(\"SELECT column_name FROM"
-        " information_schema.columns WHERE table_name = ?\",\n"
+        " information_schema.columns WHERE table_name = ?\"\n"
+        "                + __DbBind.OwnScope(p),\n"
         "                new DbParams().Add(t));\n"
         "        }\n"
         "        int i = 0;\n"

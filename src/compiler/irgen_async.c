@@ -585,6 +585,7 @@ static bool anf_expr_has_side_effect(zan_ast_node_t *e) {
 }
 
 static zan_ast_node_t *anf_expr(anf_ctx_t *c, zan_ast_node_t *e);
+static void anf_spill_await_receiver(anf_ctx_t *c, zan_ast_node_t *aw);
 
 /* If operand `before` (evaluated first) has side effects and a later operand
  * `after` contains an await, hoisting only the await reorders them. Flag it. */
@@ -605,6 +606,7 @@ static void anf_check_order(anf_ctx_t *c, zan_ast_node_t *before, zan_ast_node_t
 static zan_ast_node_t *anf_hoist_await(anf_ctx_t *c, zan_ast_node_t *aw) {
     /* normalize any nested awaits inside the awaited expression first */
     aw->await_expr.expr = anf_expr(c, aw->await_expr.expr);
+    anf_spill_await_receiver(c, aw);
 
     char buf[32];
     int len = snprintf(buf, sizeof buf, "$aw%d", (*c->counter)++);
@@ -621,6 +623,61 @@ static zan_ast_node_t *anf_hoist_await(anf_ctx_t *c, zan_ast_node_t *aw) {
     zan_ast_node_t *id = zan_ast_new(c->g->arena, AST_IDENTIFIER, aw->loc);
     id->ident.name = name;
     return id;
+}
+
+/* Spill a computed receiver out of an awaited call.
+ *
+ * `await MakeQuery().ToListAsync()` leaves the receiver in an SSA temp and then
+ * enters the awaited call. The temp lives neither in the heap frame nor in a
+ * block that dominates the resume block, so as soon as the call suspends the
+ * receiver is gone and reading `this` inside the callee crashes. Fluent
+ * builders hit this constantly: `db.Select<T>().Where(..).ToListAsync()`.
+ *
+ * Hoisting the receiver into its own named local fixes it, because named locals
+ * are made frame-resident by async_scan and reloaded at every state block.
+ * Evaluation order is unchanged: the receiver already ran before the await.
+ *
+ * A receiver that is just a name (`b.ToListAsync()`, `this.db.QueryAsync()`) is
+ * already a stable location, so it is left alone. */
+static bool anf_receiver_needs_spill(zan_ast_node_t *obj) {
+    if (!obj) return false;
+    switch (obj->kind) {
+    case AST_CALL:
+    case AST_NEW_EXPR:
+    case AST_INDEX:
+    case AST_CONDITIONAL:
+    case AST_CAST_EXPR:
+        return true;
+    case AST_MEMBER_ACCESS:
+        return anf_receiver_needs_spill(obj->member.object);
+    default:
+        return false;
+    }
+}
+
+static void anf_spill_await_receiver(anf_ctx_t *c, zan_ast_node_t *aw) {
+    zan_ast_node_t *call = aw->await_expr.expr;
+    if (!call || call->kind != AST_CALL) return;
+    zan_ast_node_t *callee = call->call.callee;
+    if (!callee || callee->kind != AST_MEMBER_ACCESS) return;
+    zan_ast_node_t *obj = callee->member.object;
+    if (!anf_receiver_needs_spill(obj)) return;
+
+    char buf[32];
+    int len = snprintf(buf, sizeof buf, "$rc%d", (*c->counter)++);
+    char *nm = (char *)zan_arena_alloc(c->g->arena, (size_t)len + 1);
+    memcpy(nm, buf, (size_t)len + 1);
+    zan_istr_t name = { nm, (uint32_t)len };
+
+    zan_ast_node_t *vd = zan_ast_new(c->g->arena, AST_VAR_DECL, obj->loc);
+    vd->var_decl.name = name;
+    vd->var_decl.type = NULL; /* inferred from the receiver expression */
+    vd->var_decl.initializer = obj;
+    zan_ast_list_push(c->out, vd, c->g->arena);
+
+    zan_ast_node_t *id = zan_ast_new(c->g->arena, AST_IDENTIFIER, obj->loc);
+    id->ident.name = name;
+    callee->member.object = id;
 }
 
 /* Recursively lift awaits out of a linearly-evaluated expression, appending
@@ -775,6 +832,7 @@ static void anf_normalize_stmt(zan_irgen_t *g, zan_ast_node_t *st,
             st->var_decl.initializer->kind == AST_AWAIT_EXPR) {
             st->var_decl.initializer->await_expr.expr =
                 anf_expr(&c, st->var_decl.initializer->await_expr.expr);
+            anf_spill_await_receiver(&c, st->var_decl.initializer);
         } else {
             st->var_decl.initializer = anf_expr(&c, st->var_decl.initializer);
         }
@@ -790,6 +848,7 @@ static void anf_normalize_stmt(zan_irgen_t *g, zan_ast_node_t *st,
         if (st->expr_stmt.expr && st->expr_stmt.expr->kind == AST_AWAIT_EXPR) {
             st->expr_stmt.expr->await_expr.expr =
                 anf_expr(&c, st->expr_stmt.expr->await_expr.expr);
+            anf_spill_await_receiver(&c, st->expr_stmt.expr);
         } else {
             st->expr_stmt.expr = anf_expr(&c, st->expr_stmt.expr);
         }

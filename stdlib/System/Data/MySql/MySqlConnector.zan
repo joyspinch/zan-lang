@@ -11,10 +11,9 @@ namespace System.Data.MySql;
 /// The connections it hands back are the synchronous wire-protocol client
 /// (<see cref="DbConnection.OpenMySQL"/>): statements block the worker thread
 /// while the server answers, so the pool gives capacity control and reuse, not
-/// non-blocking IO. Where query concurrency matters, use
-/// <see cref="MySqlPool"/> instead -- it hands back a
-/// <see cref="MySqlConnection"/> whose QueryAsync/ExecuteAsync run on the
-/// reactor -- at the cost of the synchronous ORM chain being unavailable.
+/// non-blocking IO. It exists for call sites that cannot be coroutines.
+/// Prefer <see cref="MySqlAsyncConnector"/>, whose connections suspend on the
+/// reactor, unless you need the synchronous ORM terminals.
 ///
 /// Usage:
 ///   DbPool pool = MySqlConnector.Pool("127.0.0.1", 3306, "app", "root", "", 8);
@@ -48,6 +47,57 @@ class MySqlConnector : IDbConnector {
     async IDbConnection ConnectAsync() {
         return DbConnection.OpenMySQL(this.host, this.port, this.database,
             this.user, this.password);
+    }
+
+    int GetProvider() {
+        return DbProvider.MySQL;
+    }
+}
+
+/// <summary>
+/// <see cref="IDbConnector"/> handing back the coroutine-ized
+/// <see cref="MySqlConnection"/>, so a <see cref="DbPool"/> of MySQL
+/// connections is non-blocking end to end: waiting for a free connection
+/// suspends (the pool), and so does waiting for the server (the driver). With
+/// the blocking driver only the former is true, which caps database concurrency
+/// at the number of workers no matter how large the pool is.
+///
+/// The connections answer only the asynchronous half of
+/// <see cref="IDbExecutor"/>; the synchronous half throws, naming the *Async
+/// terminal to use. So pair this pool with the asynchronous ORM chain:
+///
+///   DbPool pool = MySqlAsyncConnector.Pool("127.0.0.1", 3306, "app", "root", "", 8);
+///   IDbConnection db = await pool.AcquireAsync();
+///   try { List&lt;Post&gt; rows = await db.Select&lt;Post&gt;().ToListAsync(); }
+///   finally { pool.Release(db); }
+/// </summary>
+class MySqlAsyncConnector : IDbConnector {
+    string host;
+    int port;
+    string database;
+    string user;
+    string password;
+
+    MySqlAsyncConnector(string host, int port, string database, string user,
+            string password) {
+        this.host = host;
+        this.port = port;
+        this.database = database;
+        this.user = user;
+        this.password = password;
+    }
+
+    /// <summary>Non-blocking pool over host/port/database/user/password.</summary>
+    static DbPool Pool(string host, int port, string database, string user,
+            string password, int maxSize) {
+        return new DbPool(
+            new MySqlAsyncConnector(host, port, database, user, password),
+            maxSize);
+    }
+
+    async IDbConnection ConnectAsync() {
+        return await MySqlConnection.OpenParamsAsync(this.host, this.port,
+            this.database, this.user, this.password);
     }
 
     int GetProvider() {

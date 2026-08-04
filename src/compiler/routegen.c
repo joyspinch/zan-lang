@@ -631,7 +631,7 @@ void zan_routegen_run(zan_ast_node_t *unit, zan_arena_t *arena,
                 rg_putf(&handlers, "        __c.__SetView(\"%s\");\n", vkey);
                 rg_putf(&handlers, "        if (__c.__Before()) {\n");
                 rg_putf(&handlers, "            %s__c.%s(%s);\n", aw, mname, ctx_param ? "ctx" : "");
-                rg_putf(&handlers, "            __c.__After();\n");
+                rg_putf(&handlers, "            await __c.__AfterAsync();\n");
                 rg_putf(&handlers, "        }\n");
             }
             rg_putf(&handlers, "    }\n");
