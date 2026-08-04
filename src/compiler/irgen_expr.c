@@ -3886,22 +3886,6 @@ static LLVMValueRef emit_expr_conditional(zan_irgen_t *g, zan_ast_node_t *expr,
     return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
 }
 
-/* True when `e` is a call dispatched through an interface to a method the
- * interface declares `async`. Interface dispatch cannot name the callee at
- * compile time, so the frame arrives in a phi over the implementations rather
- * than in a call instruction -- `await` recognises it from the AST instead. */
-static bool is_async_iface_call(zan_irgen_t *g, zan_ast_node_t *e,
-                                local_scope_t *locals) {
-    if (!e || e->kind != AST_CALL || !e->call.callee ||
-        e->call.callee->kind != AST_MEMBER_ACCESS) return false;
-    zan_type_t *ot = infer_expr_type(g, e->call.callee->member.object, locals);
-    if (!ot || ot->kind != TYPE_INTERFACE || !ot->sym) return false;
-    zan_symbol_t *m = resolve_iface_overload(ot->sym, e->call.callee->member.name,
-                                             e->call.args.count);
-    return m && m->decl && m->decl->kind == AST_METHOD_DECL &&
-           (m->decl->method_decl.modifiers & MOD_ASYNC) != 0;
-}
-
 /* An async frame's result slot is 64 bits wide, so `await f()` loads 64 bits no
  * matter what `f` returns. Decode them back into the callee's declared type --
  * the exact inverse of the encoding the completing coroutine applied (see
@@ -4207,26 +4191,17 @@ static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                     sub_resume = LLVMGetNamedFunction(g->mod, rn);
                 }
             }
-            /* Indirect async call: the `<ramp>$resume` symbol cannot be recovered
-             * from the call. Every async ramp stores its own resume fn in the
-             * frame header (ASYNC_FRAME_SELF_STEP), so read it from the returned
-             * task handle instead -- awaiting an async delegate then behaves
-             * exactly like a direct async call. */
-            if (!callee_fn && !sub_resume &&
-                LLVMGetTypeKind(LLVMTypeOf(sub)) == LLVMPointerTypeKind) {
-                LLVMValueRef sub_hdr = LLVMBuildBitCast(g->builder, sub, i8ptr, "sub.hdr");
-                LLVMValueRef ssp = LLVMBuildStructGEP2(g->builder, hdr, sub_hdr,
-                    ASYNC_FRAME_SELF_STEP, "sub.selfstep.p");
-                sub_resume = LLVMBuildLoad2(g->builder, g->co_step_ptr, ssp, "sub.selfstep");
-            }
         }
 
-        /* Interface-dispatched async call: the frame comes out of a phi, so
-         * neither the `<ramp>$resume` symbol nor a called value is available;
-         * take the resume fn out of the frame header as for a delegate. */
+        /* Indirect async call: the `<ramp>$resume` symbol cannot be recovered from
+         * the awaited expression. A delegate invoke merges its closure and bare
+         * shapes in a phi, an interface dispatch has no called value at all, and
+         * a loaded function pointer has no name -- none of them is a call to a
+         * named function. Every async ramp stores its own resume fn in the frame
+         * header (ASYNC_FRAME_SELF_STEP), so read it off the returned task handle;
+         * awaiting through any of them then behaves like a direct async call. */
         if (!sub_resume &&
-            LLVMGetTypeKind(LLVMTypeOf(sub)) == LLVMPointerTypeKind &&
-            is_async_iface_call(g, expr->await_expr.expr, locals)) {
+            LLVMGetTypeKind(LLVMTypeOf(sub)) == LLVMPointerTypeKind) {
             LLVMValueRef sub_hdr = LLVMBuildBitCast(g->builder, sub, i8ptr, "sub.hdr");
             LLVMValueRef ssp = LLVMBuildStructGEP2(g->builder, hdr, sub_hdr,
                 ASYNC_FRAME_SELF_STEP, "sub.selfstep.p");
