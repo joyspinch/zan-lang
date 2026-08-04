@@ -17,7 +17,6 @@ its own: config, DB, cache, controllers, models and views.
 config/app.json         runtime config (host/port/limits/db/cache) — NOT compiled in
 src/main.zan            bootstrap only — routes come from controller attributes
 src/Controller/         request handlers, one directory per module
-  layout.html             the site-wide page wrapper (global {{content}} layout)
   Index/Index.zan         HTML landing page
   Blog/Posts.zan          list / detail / publish (ORM + cache + views)
   Account/Login.zan       GET/POST /admin/login, /admin/logout (own bare layout)
@@ -26,8 +25,6 @@ src/Controller/         request handlers, one directory per module
   Admin/Posts.zan         GET /admin/posts + publish/unpublish
   Api/Auth.zan            POST /api/auth/login, GET /api/auth/me
   User/Users.zan          /users, /user/{id}
-  <Module>/View/*.html    that module's views; a module's own layout.html
-                          overrides the global one for that module only
 src/Dao/<Module>/       every query and write for that module
 src/Model/<Module>/     entities only: table structure, no queries
 src/Framework/          application wiring that belongs to this app
@@ -38,8 +35,19 @@ src/Framework/          application wiring that belongs to this app
   DbContext.zan           per-request connection lease
   Schema.zan              CodeFirst DDL + seed, once at startup
   Auth.zan                token issue/verify against sys_user
+views/                  templates, in the module structure of the controllers
+  layout.html             the site-wide page wrapper (global {{content}} layout)
+  <Module>/*.html         that module's views; a module's own layout.html
+                          overrides the global one for that module only
 wwwroot/                the ONLY web-reachable directory, served at /static
 ```
+
+`views/` and `wwwroot/` sit next to `src/`, not inside it, because both are read
+at run time: a release is a copy of the executable plus `config/`, `views/` and
+`wwwroot/` — `src/` is a build input and never ships. The view keys are
+unchanged by the split: `views/Admin/Users.Index.html` is still
+`Admin.Users.Index`, since `View.LoadRec` derives the key from the directory
+path and the module directories are the same ones the controllers use.
 
 ## Attribute-driven routes
 
@@ -219,9 +227,29 @@ build/app.exe          # cwd = project root, so ./config/app.json and ./wwwroot 
 ```
 
 The working directory matters more than where the binary sits: the server reads
-`config/app.json`, serves `wwwroot/` and opens the SQLite file by RELATIVE path, so
-run it from the project root (or from a deploy directory that has those three
-next to the executable) — never `cd build && ./app.exe`.
+`config/app.json`, loads `views/`, serves `wwwroot/` and opens the SQLite file by
+RELATIVE path, so run it from the project root (or from a deploy directory that
+has those next to the executable) — never `cd build && ./app.exe`.
+
+### Deploying
+
+Only `.zan` code is compiled into the executable. Views, config and assets are
+read at run time, so a deploy directory is four things — and `src/` is not one
+of them:
+
+```
+app.exe                 + the driver DLLs the linker put beside it in build/
+config/app.json
+views/                  every .html, in the module structure it has in the repo
+wwwroot/
+```
+
+Of the DLLs, only the driver for the database in use is needed: `libsqlite3-0.dll`
+for SQLite, `libpq.dll` + `libssl-3-x64.dll` + `libcrypto-3-x64.dll` +
+`libiconv-2.dll` + `libintl-8.dll` for PostgreSQL (MySQL speaks its protocol
+without a client library). `app.db` is not copied — `Schema` creates the tables
+and the seed account on first start. Set `ZAN_AUTH_SECRET` (32+ characters) in
+the environment or sign-in fails with a configuration error.
 
 **Keep generated files out of the source tree.** `-o build/app.exe` exists so the
 executable and the driver DLLs the linker copies beside it land in one throwaway
