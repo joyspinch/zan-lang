@@ -2123,10 +2123,10 @@ int main(int argc, char **argv) {
         }
 #endif
         /* Unified timer runtime (zan_timer_*): irgen emits calls into it from
-         * every program's inline coroutine driver, and rt_io.c calls it too,
-         * so the object is linked unconditionally on native builds (a cross
-         * build has no target-ABI timer object; cross programs that need the
-         * runtime are rejected in the link branches below). */
+         * every program's inline coroutine driver, and rt_io.c calls it too, so
+         * every program needs it. Native builds link the object zanc built for
+         * itself; a cross build links the target-ABI copy shipped in that
+         * target's toolchain directory (see the link branches below). */
         const char *rt_timer_obj = NULL;
 #ifdef ZAN_RT_TIMER_OBJ
         if (!cross_compiling) {
@@ -2135,6 +2135,39 @@ int main(int argc, char **argv) {
             rt_timer_obj = rt_timer_buf;
         }
 #endif
+        if (cross_compiling) {
+            /* The object zanc built for itself is host-ABI, so a cross link
+             * takes the target's own copy from that target's toolchain
+             * directory (scripts/build_{linux,win,macos}_rt.sh build them). */
+            const char *tsub = NULL;
+            if (target.os == ZAN_OS_LINUX) {
+                tsub = (target.arch == ZAN_ARCH_AARCH64) ? "linux-arm64"
+                     : (target.arch == ZAN_ARCH_RISCV64) ? "linux-riscv64"
+                     : "linux-musl";
+            } else if (target.os == ZAN_OS_WINDOWS) {
+                tsub = (target.arch == ZAN_ARCH_AARCH64) ? "win-arm64" : "win-x64";
+            } else if (target.os == ZAN_OS_MACOS) {
+                tsub = (target.arch == ZAN_ARCH_AARCH64) ? "macos/arm64"
+                                                         : "macos/x64";
+            }
+            if (tsub) {
+                snprintf(rt_timer_buf, sizeof(rt_timer_buf),
+                         "%s/%s/zanrt_timer.o", link_exe_dir, tsub);
+                if (!zan_file_exists(rt_timer_buf)) {
+                    fprintf(stderr,
+                            "error: bundled %s timer runtime not found at '%s'; "
+                            "reinstall zan or rebuild with toolchain/%s present "
+                            "(see scripts/build_*_rt.sh)\n",
+                            tsub, rt_timer_buf, tsub);
+                    remove(obj_tmp);
+                    zan_irgen_destroy(&irgen);
+                    zan_arena_free(arena);
+                    free(source);
+                    return 1;
+                }
+                rt_timer_obj = rt_timer_buf;
+            }
+        }
         if (cross_compiling && rt_sync_obj && target.os != ZAN_OS_LINUX
             && target.os != ZAN_OS_MACOS && target.os != ZAN_OS_WINDOWS) {
             fprintf(stderr,
@@ -2655,6 +2688,10 @@ int main(int argc, char **argv) {
             snprintf(cmd, sizeof(cmd),
                      "ld.lld -static%s -o \"%s\" \"%s/crt1.o\" \"%s/crti.o\" \"%s\"",
                      publish_mode ? " -s" : "", obj_path, sys, sys, obj_tmp);
+            if (rt_timer_obj) {
+                size_t cur = strlen(cmd);
+                snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"", rt_timer_obj);
+            }
             if (irgen.uses_socket_async) {
                 size_t cur = strlen(cmd);
                 snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s/zanrt_io.o\"", sys);
@@ -2783,6 +2820,10 @@ int main(int argc, char **argv) {
             }
             { size_t cur = strlen(cmd);
               snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"", obj_tmp); }
+            if (rt_timer_obj) {
+                size_t cur = strlen(cmd);
+                snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"", rt_timer_obj);
+            }
             if (winrt_io[0]) {
                 size_t cur = strlen(cmd);
                 snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"", winrt_io);
@@ -2942,6 +2983,10 @@ int main(int argc, char **argv) {
                      "%s -o \"%s\" \"%s\"",
                      march, publish_mode ? " -dead_strip" : "",
                      obj_path, obj_tmp);
+            if (rt_timer_obj) {
+                size_t cur = strlen(cmd);
+                snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"", rt_timer_obj);
+            }
             if (macrt_io[0]) {
                 size_t cur = strlen(cmd);
                 snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"", macrt_io);

@@ -9,7 +9,7 @@
 #
 #   scripts/build_macos_rt.sh [path-to-zig]
 #
-# Outputs toolchain/macos/{arm64,x64}/zanrt_{io,io_mt,sync}.o. The objects are
+# Outputs toolchain/macos/{arm64,x64}/zanrt_{io,io_mt,sync,timer}.o. The objects are
 # committed (they are our own code; *.o is gitignored, so `git add -f` them).
 # -g0: DWARF in an object that is only ever statically linked is dead weight,
 # and it embeds the build directory, so the bytes differ per machine and CI
@@ -34,5 +34,9 @@ for pair in arm64:aarch64 x64:x86_64; do
         -I "$RT" -O2 -c "$RT/rt_io.c" -o "$out/zanrt_io_mt.o"
     "$ZIG" cc -target "$arch-macos.11.0" -g0 -std=c11 -I "$RT" -O2 \
         -c "$RT/rt_sync.c" -o "$out/zanrt_sync.o"
-    echo "built toolchain/macos/$sub: zanrt_io.o zanrt_io_mt.o zanrt_sync.o"
+    # Every emitted program calls zan_timer_* from its inline coroutine driver,
+    # so a cross-link needs this object unconditionally (see main.c).
+    "$ZIG" cc -target "$arch-macos.11.0" -g0 -std=c11 -I "$RT" -O2 \
+        -c "$RT/rt_timer.c" -o "$out/zanrt_timer.o"
+    echo "built toolchain/macos/$sub: zanrt_io.o zanrt_io_mt.o zanrt_sync.o zanrt_timer.o"
 done

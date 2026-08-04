@@ -1,3 +1,12 @@
+/* clock_gettime is POSIX, not ISO C: a strict -std=c11 build (which is how the
+ * timer object is compiled, natively and for every cross target) hides it
+ * behind this feature macro, so ask for it before any header is pulled in.
+ * Darwin exposes it unconditionally and narrows other APIs when asked for
+ * strict POSIX, so leave it alone there. */
+#if !defined(_WIN32) && !defined(__APPLE__)
+#define _POSIX_C_SOURCE 200809L
+#endif
+
 #include "rt_timer.h"
 
 #include <stdlib.h>

@@ -9,7 +9,7 @@
 #
 #   scripts/build_linux_rt.sh [path-to-zig]
 #
-# Outputs toolchain/{linux-musl,linux-arm64,linux-riscv64}/zanrt_{io,sync}.o.
+# Outputs toolchain/{linux-musl,linux-arm64,linux-riscv64}/zanrt_{io,sync,timer}.o.
 # The objects are committed (they are our own code; *.o is gitignored, so
 # `git add -f` them). -g0 keeps them the size the previously committed ones
 # were: DWARF in an object that is only ever statically linked is dead weight.
@@ -28,5 +28,11 @@ for pair in linux-musl:x86_64 linux-arm64:aarch64 linux-riscv64:riscv64; do
         -I "$RT" -O2 -c "$RT/rt_io.c" -o "$out/zanrt_io.o"
     "$ZIG" cc -target "$arch-linux-musl" -g0 -std=c11 \
         -I "$RT" -O2 -c "$RT/rt_sync.c" -o "$out/zanrt_sync.o"
-    echo "built toolchain/$sub: zanrt_io.o zanrt_sync.o"
+    # Every emitted program calls zan_timer_* from its inline coroutine driver,
+    # so a cross-link needs this object unconditionally (see main.c) -- including
+    # when the output is a .so, hence -fPIC (x86_64 otherwise emits absolute
+    # 32-bit relocations that a shared object cannot take).
+    "$ZIG" cc -target "$arch-linux-musl" -g0 -std=c11 -fPIC \
+        -I "$RT" -O2 -c "$RT/rt_timer.c" -o "$out/zanrt_timer.o"
+    echo "built toolchain/$sub: zanrt_io.o zanrt_sync.o zanrt_timer.o"
 done

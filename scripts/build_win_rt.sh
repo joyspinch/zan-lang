@@ -4,7 +4,7 @@
 #
 # The objects zanc builds for itself are host-arch, so a cross-link needs the
 # target's own copies; they sit next to the bundled mingw runtime, at
-# toolchain/win-<arch>/zanrt_{io,io_mt,sync}.o, and are staged beside zanc by
+# toolchain/win-<arch>/zanrt_{io,io_mt,sync,timer}.o, and are staged beside zanc by
 # CMake (build/win-<arch>/) and by scripts/publish_ide.ps1.
 #
 #   scripts/build_win_rt.sh <win-arm64|win-x64> [cc]
@@ -27,4 +27,7 @@ mkdir -p "$OUT"
 "$CC" -O2 -g0 -DZAN_IO_STACKLESS_ONLY -DZAN_CO_DRIVER -I "$RT" -c "$RT/rt_io.c" \
     -o "$OUT/zanrt_io_mt.o"
 "$CC" -O2 -g0 -std=c11 -I "$RT" -c "$RT/rt_sync.c" -o "$OUT/zanrt_sync.o"
-echo "built toolchain/$SUB: zanrt_io.o zanrt_io_mt.o zanrt_sync.o"
+# Every emitted program calls zan_timer_* from its inline coroutine driver, so a
+# cross-link needs this object unconditionally (see main.c).
+"$CC" -O2 -g0 -std=c11 -I "$RT" -c "$RT/rt_timer.c" -o "$OUT/zanrt_timer.o"
+echo "built toolchain/$SUB: zanrt_io.o zanrt_io_mt.o zanrt_sync.o zanrt_timer.o"

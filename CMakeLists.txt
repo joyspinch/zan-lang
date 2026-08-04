@@ -269,8 +269,9 @@ endif()
 # x86_64 and toolchain/linux-arm64/ for aarch64) next to zanc so that
 # --target linux-musl / linux-x64 / linux-arm64 can static-link ELF binaries
 # without any external toolchain.  Each sysroot contains crt*.o, libc.a, a
-# pre-built zanrt_io.o for socket-async programs, and zanrt_sync.o for
-# atomics/shared-memory programs.
+# pre-built zanrt_io.o for socket-async programs, zanrt_sync.o for
+# atomics/shared-memory programs, and zanrt_timer.o, which every program needs
+# (its inline coroutine driver calls zan_timer_*).
 foreach(_linux_sub linux-musl linux-arm64 linux-riscv64)
     set(_linux_sys "${CMAKE_SOURCE_DIR}/toolchain/${_linux_sub}")
     if(EXISTS "${_linux_sys}/libc.a")
@@ -280,6 +281,7 @@ foreach(_linux_sub linux-musl linux-arm64 linux-riscv64)
                     "${_linux_sys}/crt1.o" "${_linux_sys}/crti.o"
                     "${_linux_sys}/crtn.o" "${_linux_sys}/libc.a"
                     "${_linux_sys}/zanrt_io.o" "${_linux_sys}/zanrt_sync.o"
+                    "${_linux_sys}/zanrt_timer.o"
                     $<TARGET_FILE_DIR:zanc>/${_linux_sub}/
             COMMENT "Copying ${_linux_sub} sysroot for cross-compilation"
             VERBATIM)
