@@ -1,0 +1,156 @@
+using System;
+using System.IO;
+
+namespace System.Web;
+
+/// <summary>
+/// Serves files from a directory on disk (CSS/JS/fonts/images: everything the
+/// views reference but no controller should own).
+///
+/// It is a Before hook rather than a route: assets must be answered before
+/// authentication, rate limiting and the router's pattern matching, and they
+/// must not appear in the route table (nothing to secure, nothing to put in a
+/// menu). Returning false from the hook short-circuits the request with the
+/// response already built.
+///
+/// <code>
+/// StaticFiles.Mount(app, "/static", "public");   // GET /static/css/app.css
+/// </code>
+///
+/// The URL path is resolved against the mounted directory only: a request is
+/// rejected unless every byte is an unreserved file character, so "..", "//",
+/// backslashes, NUL and query-smuggled separators cannot walk out of the root.
+///
+/// Bodies are cached per worker after the first hit (assets are immutable in a
+/// deployment; restart or bump the file name to publish a new one) and served
+/// with a long max-age. Files are read as bytes and written back untouched, so
+/// images and fonts survive the trip.
+/// </summary>
+class StaticFiles {
+    static string prefix = "";
+    static string root = "";
+    static int maxAge = 86400;
+    static StrMap bodies = null;
+    static StrMap types = null;
+
+    /// <summary>Mounts `dir` under `urlPrefix` and registers the hook on the
+    /// app. `urlPrefix` is matched literally ("/static" answers
+    /// "/static/css/app.css"); `dir` is relative to the process working
+    /// directory.</summary>
+    static void Mount(WebApp app, string urlPrefix, string dir) {
+        StaticFiles.prefix = urlPrefix;
+        StaticFiles.root = dir;
+        StaticFiles.bodies = new StrMap();
+        StaticFiles.types = new StrMap();
+        app.Before(StaticFiles.Serve);
+    }
+
+    /// <summary>How long browsers may cache an asset (seconds). Set it to 0
+    /// while developing so an edited file is picked up by a reload -- the
+    /// per-worker body cache still needs a restart.</summary>
+    static void MaxAge(int seconds) {
+        StaticFiles.maxAge = seconds;
+    }
+
+    /// <summary>Before hook: answers asset requests, passes everything else on
+    /// (true = keep going).</summary>
+    static bool Serve(HttpContext ctx) {
+        if (StaticFiles.root.Length == 0) { return true; }
+        if (ctx.method != "GET" && ctx.method != "HEAD") { return true; }
+        string rel = StaticFiles.Relative(ctx.path);
+        if (rel == null) { return true; }
+        if (rel.Length == 0 || !StaticFiles.IsSafe(rel)) {
+            ctx.Status(404, "Not Found").Text("not found");
+            return false;
+        }
+        string body = StaticFiles.bodies.Get(rel);
+        string ctype = StaticFiles.types.Get(rel);
+        if (body.Length == 0) {
+            string full = StaticFiles.root + "/" + rel;
+            if (!File.Exists(full)) {
+                ctx.Status(404, "Not Found").Text("not found");
+                return false;
+            }
+            body = File.ReadAllText(full);
+            ctype = StaticFiles.ContentType(rel);
+            StaticFiles.bodies.Set(rel, body);
+            StaticFiles.types.Set(rel, ctype);
+        }
+        ctx.SetHeader("Cache-Control", "public, max-age="
+            + Convert.ToString(StaticFiles.maxAge));
+        ctx.contentType = ctype;
+        ctx.body = body;
+        if (ctx.method == "HEAD") { ctx.body = ""; }
+        ctx.ended = true;
+        return false;
+    }
+
+    /// <summary>The path below the mount point, or null when the request is not
+    /// for this mount.</summary>
+    static string Relative(string path) {
+        string p = StaticFiles.prefix;
+        int pn = p.Length;
+        if (path.Length <= pn) { return null; }
+        if (path.Substring(0, pn) != p) { return null; }
+        if ((path[pn] & 255) != 47) { return null; }        // '/'
+        return path.Substring(pn + 1);
+    }
+
+    /// <summary>Only unreserved path characters, and no empty or dot-leading
+    /// segment: that rules out "..", absolute paths, backslashes, NUL bytes and
+    /// hidden files in one pass.</summary>
+    static bool IsSafe(string rel) {
+        int n = rel.Length;
+        bool segStart = true;
+        for (int i = 0; i < n; i = i + 1) {
+            int c = rel[i] & 255;
+            if (c == 47) {                                   // '/'
+                if (segStart) { return false; }              // "//" or leading
+                segStart = true;
+                continue;
+            }
+            if (segStart && c == 46) { return false; }       // ".." / dotfile
+            segStart = false;
+            bool ok = (c >= 97 && c <= 122)                  // a-z
+                || (c >= 65 && c <= 90)                      // A-Z
+                || (c >= 48 && c <= 57)                      // 0-9
+                || c == 46 || c == 45 || c == 95;            // . - _
+            if (!ok) { return false; }
+        }
+        return !segStart;
+    }
+
+    static string ContentType(string rel) {
+        string ext = StaticFiles.Extension(rel);
+        if (ext == "css") { return "text/css; charset=utf-8"; }
+        if (ext == "js") { return "application/javascript; charset=utf-8"; }
+        if (ext == "mjs") { return "application/javascript; charset=utf-8"; }
+        if (ext == "json") { return "application/json; charset=utf-8"; }
+        if (ext == "map") { return "application/json; charset=utf-8"; }
+        if (ext == "html") { return "text/html; charset=utf-8"; }
+        if (ext == "txt") { return "text/plain; charset=utf-8"; }
+        if (ext == "svg") { return "image/svg+xml"; }
+        if (ext == "png") { return "image/png"; }
+        if (ext == "jpg") { return "image/jpeg"; }
+        if (ext == "jpeg") { return "image/jpeg"; }
+        if (ext == "gif") { return "image/gif"; }
+        if (ext == "webp") { return "image/webp"; }
+        if (ext == "ico") { return "image/x-icon"; }
+        if (ext == "woff") { return "font/woff"; }
+        if (ext == "woff2") { return "font/woff2"; }
+        if (ext == "ttf") { return "font/ttf"; }
+        return "application/octet-stream";
+    }
+
+    static string Extension(string rel) {
+        int n = rel.Length;
+        int dot = -1;
+        for (int i = n - 1; i >= 0; i = i - 1) {
+            int c = rel[i] & 255;
+            if (c == 47) { break; }                          // '/'
+            if (c == 46) { dot = i; break; }                 // '.'
+        }
+        if (dot < 0 || dot == n - 1) { return ""; }
+        return rel.Substring(dot + 1, n - dot - 1).ToLower();
+    }
+}

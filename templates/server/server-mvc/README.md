@@ -16,19 +16,21 @@ its own: config, DB, cache, controllers, models and views.
 ```
 config/app.json         runtime config (host/port/limits/db/cache) — NOT compiled in
 src/main.zan            bootstrap only — routes come from controller attributes
-src/controller/         request handlers, grouped per resource
-                        (they derive from System.Web.Controller / ApiController)
+src/Controller/         request handlers, one directory per module
   Index/Index.zan         HTML landing page
-  Api/                    status / echo / login / me / gather / upload
-  User/Users.zan          ORM + cache demo (/users, /user/{id})
-  Admin/                  /admin/menu — menu built from [Menu] routes
-src/model/              data access on System.Data.Orm
-  User.zan                example model (auto-creates + seeds its table)
-src/framework/          application wiring that belongs to this app
+  Blog/Posts.zan          list / detail / publish (ORM + cache + views)
+  Api/Auth.zan            POST /api/auth/login, GET /api/auth/me
+  User/Users.zan          /users, /user/{id}
+  <Module>/View/*.html    that module's views, incl. its layout.html
+src/Dao/<Module>/       every query and write for that module
+src/Model/<Module>/     entities only: table structure, no queries
+src/Framework/          application wiring that belongs to this app
   Cfg.zan                 loads config/app.json into the typed Cfg entity
-  Db.zan                  DbConnection bootstrap from [database]
-  Cache.zan               in-memory TTL cache (Redis optional)
-views/                  in-memory HTML templates (next to their controllers)
+  Db.zan                  builds the DB pool + Redis from [database]/[cache]
+  DbContext.zan           per-request connection lease
+  Schema.zan              CodeFirst DDL + seed, once at startup
+  Auth.zan                token issue/verify against sys_user
+public/                 static assets, served at /static (see below)
 ```
 
 ## Attribute-driven routes
@@ -237,6 +239,33 @@ zanc src/main.zan src/**/*.zan --stdlib-path <stdlib> -o app.exe
 Model users = Model.FromTable(Db.Conn(), "users");   // reflect schema
 Console.WriteLine(users.ToDefineCode());               // print model source
 ```
+
+## Static assets
+
+`main.zan` mounts `public/` at `/static` before auth and routing:
+
+```zan
+StaticFiles.Mount(app, "/static", "public");   // GET /static/css/app.css
+```
+
+Bodies are read once per worker and then served from memory with
+`Cache-Control: public, max-age=86400`; a path is rejected unless every segment
+is plain `[A-Za-z0-9._-]`, so `..`, backslashes and dotfiles cannot escape the
+directory. `StaticFiles.MaxAge(0)` while developing.
+
+```
+public/css/app.css          the whole design system (no framework, no build)
+public/js/app.js            htmx glue: CSRF header, error/flash toasts
+public/vendor/htmx.min.js   htmx 1.9.12    -- unpkg.com/htmx.org@1.9.12/dist/htmx.min.js
+public/vendor/alpine.min.js Alpine 3.14.1  -- unpkg.com/alpinejs@3.14.1/dist/cdn.min.js
+```
+
+The two vendor files are committed on purpose: no CDN at runtime, versions
+pinned, works offline. To upgrade, download the new file over the old one and
+update the version in this list. There is no Node toolchain and nothing to
+compile -- `app.css` is hand-written CSS (variables, grid, a 900px breakpoint
+that turns the admin sidebar into a drawer, and tables that become cards under
+720px), so a page needs no build step to look right on phone or desktop.
 
 ## Template syntax (views/*.html)
 
