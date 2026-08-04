@@ -528,6 +528,71 @@ partial class CodeEditor {
         return local + ExternRefCount(owner, name);
     }
 
+    /// LensRefCount() memoised per member name, recounting at most `lensBudget`
+    /// members per frame. Returns the memoised count when the budget is spent
+    /// and -1 when there is not even a stale one, so the caller draws nothing
+    /// rather than a number it has not counted.
+    int LensRefCountBudgeted(string name, int declLine) {
+        int at = 0 - 1;
+        int k = 0;
+        while (k < lensKeys.Count) {
+            if (lensKeys[k] == name) { at = k; break; }
+            k = k + 1;
+        }
+        if (at >= 0 && lensFresh[at] == 1) { return lensVals[at]; }
+        if (lensBudget <= 0) {
+            if (at >= 0) { return lensVals[at]; }
+            lensPending = true;
+            return 0 - 1;
+        }
+        lensBudget = lensBudget - 1;
+        int v = LensRefCount(name, declLine);
+        if (at >= 0) {
+            lensVals[at] = v;
+            lensFresh[at] = 1;
+            return v;
+        }
+        // Browsing a big project must not grow the memo without bound.
+        if (lensKeys.Count >= 512) {
+            lensKeys = new List<string>();
+            lensVals = new List<int>();
+            lensFresh = new List<int>();
+        }
+        lensKeys.Add(name);
+        lensVals.Add(v);
+        lensFresh.Add(1);
+        return v;
+    }
+
+    /// Starts a frame's CodeLens budget and expires the memo when the buffer
+    /// changed. The fingerprint is taken here, once, because TextStamp() walks
+    /// every line and a screenful can hold dozens of declarations.
+    ///
+    /// Recounting waits for the typing to stop: every keystroke invalidates
+    /// every count, and counting even two of them per frame is a whole-buffer
+    /// walk each. Until the buffer has been still for a moment the panel shows
+    /// the counts it last had, which is what they were a keystroke ago.
+    void BeginLensFrame(App app) {
+        lensPending = false;
+        int stamp = TextStamp();
+        if (lensStamp != stamp) {
+            lensStamp = stamp;
+            lensQuietMs = app.nowMs;
+            int i = 0;
+            while (i < lensFresh.Count) { lensFresh[i] = 0; i = i + 1; }
+        }
+        if (app.nowMs - lensQuietMs < 250) {
+            lensBudget = 0;
+            app.RequestRedraw();
+        } else {
+            lensBudget = 2;
+        }
+    }
+
+    /// True when a CodeLens count was left uncounted this frame, so the caller
+    /// asks for another one.
+    bool LensPending() { return lensPending; }
+
     /// Moves the caret to the next call site of `name` after `declLine`
     /// (wrapping around) and selects it. Does nothing when there is none.
     void JumpToNextRef(string name, int declLine) {
