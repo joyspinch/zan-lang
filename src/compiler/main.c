@@ -2015,6 +2015,21 @@ int main(int argc, char **argv) {
             }
         }
 
+        /* A native build off Windows: a [DllImport] on a Windows system library
+         * (kernel32, user32, ...) is a platform-guarded path this OS never
+         * takes, so its functions are stubbed instead of handed to the linker,
+         * which has no import library to resolve them from. The cross paths
+         * above already stubbed theirs, so this only covers the native link. */
+        if (!cross_compiling && target.os != ZAN_OS_WINDOWS) {
+            for (int li = 0; li < irgen.extern_lib_count; li++) {
+                if (!zan_win_system_lib(irgen.extern_libs[li].str,
+                                        (int)irgen.extern_libs[li].len))
+                    continue;
+                zan_irgen_stub_extern_lib(&irgen, irgen.extern_libs[li].str,
+                                          (int)irgen.extern_libs[li].len);
+            }
+        }
+
         /* emit object file */
         char obj_tmp[1024];
         snprintf(obj_tmp, sizeof(obj_tmp), "%s.o", obj_path);

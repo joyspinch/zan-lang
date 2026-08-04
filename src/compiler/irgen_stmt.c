@@ -308,6 +308,19 @@ static int emit_boxed_var_decl(zan_irgen_t *g, zan_ast_node_t *stmt,
 static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *locals) {
     if (!stmt) return;
 
+    /* Unreachable code: the previous statement already terminated this block
+     * (return / throw / break / continue), so anything after it belongs to a
+     * fresh, unreachable block -- appending to the terminated one would build
+     * "terminator in the middle of a basic block". Platform-conditional
+     * sources hit this constantly (`throw new PlatformNotSupportedException();
+     * return info;` on the platform where the body is #if'd out). */
+    LLVMBasicBlockRef cur_bb = LLVMGetInsertBlock(g->builder);
+    if (cur_bb && LLVMGetBasicBlockTerminator(cur_bb)) {
+        LLVMBasicBlockRef dead_bb = LLVMAppendBasicBlockInContext(
+            g->ctx, LLVMGetBasicBlockParent(cur_bb), "dead");
+        LLVMPositionBuilderAtEnd(g->builder, dead_bb);
+    }
+
     /* Attach this statement's source location for DWARF line tables (no-op
      * unless `-g`). Lazily creates the enclosing function's DISubprogram. */
     di_set_loc(g, stmt->loc);

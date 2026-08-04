@@ -73,6 +73,38 @@ class AppController : Controller {
         return this.lease;
     }
 
+    /// <summary>The connection the table accessors run on. `this.User`,
+    /// `this.Post`, ... compile into a typed query over THIS connection, which
+    /// is why the lease is taken in OnBeforeAsync(): an accessor is a plain
+    /// member and cannot await.
+    ///
+    ///     List&lt;Post&gt; rows = await this.Post
+    ///         .Where(a => a.published == 1)
+    ///         .OrderByDescending(a => a.id).Take(20).ToListAsync();
+    ///     User u = await this.User.Read(uid);
+    ///
+    /// No DAO to construct, no Acquire/Release, and the field names are still
+    /// checked at compile time.</summary>
+    IDbConnection __Conn() {
+        return this.lease;
+    }
+
+    /// <summary>Leases this request's connection before the action runs, so the
+    /// table accessors have one. Costs nothing when the database is
+    /// unconfigured (Conn() answers null and actions fall back to 503).</summary>
+    virtual async bool OnBeforeAsync() {
+        IDbConnection _db = await this.Conn();
+        return this.OnBefore();
+    }
+
+    /// <summary>Whether this request has a usable database. False means the pool
+    /// could not hand out a connection (unconfigured or unreachable), which is a
+    /// 503 for the caller rather than an exception. Cheap: the lease was already
+    /// taken in OnBeforeAsync(), so this only looks at it.</summary>
+    protected bool DbReady() {
+        return this.lease != null;
+    }
+
     /// <summary>Opens a transaction on this request's connection. false means the
     /// database is unavailable and nothing was started.</summary>
     protected async bool Begin() {

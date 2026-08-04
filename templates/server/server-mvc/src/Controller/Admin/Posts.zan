@@ -9,8 +9,12 @@ namespace ZanWeb.Admin;
 
 /// <summary>
 /// Content administration at /admin/posts. Unlike the public list this one shows
-/// drafts too (PostDao.AllRecent ignores `published`), because hiding a post from
-/// the admin who has to un-hide it would be a strange kind of privacy.
+/// drafts too (no `published` filter), because hiding a post from the admin who
+/// has to un-hide it would be a strange kind of privacy.
+///
+/// Queries go through the table accessor `this.Post` -- the typed query over
+/// blog_post on this request's connection, so there is no DAO to construct and
+/// no connection to borrow or return.
 ///
 /// Every write invalidates the public list cache before redirecting. Without that
 /// the front page would keep serving the old snapshot for up to the TTL and the
@@ -30,15 +34,18 @@ class Posts : AdminController {
         string kw = this.In("kw");
         d.Set("kw", kw);
 
-        IDbConnection db = await this.Conn();
-        if (db == null) {
+        if (!this.DbReady()) {
             d.Set("dbDown", "1");
             d.Set("count", "0");
             this.View(d);
             return;
         }
 
-        List<Post> rows = await new PostDao(db).AllRecent(50, kw);
+        List<Post> rows = await this.Post
+            .WhereIf(kw.Length > 0, a => a.title.Contains(kw))
+            .OrderByDescending(a => a.id)
+            .Take(50)
+            .ToListAsync();
         List<StrMap> items = d.AddList("posts");
         for (int i = 0; i < rows.Count; i = i + 1) {
             Post p = rows[i];
@@ -69,12 +76,14 @@ class Posts : AdminController {
         int id = this.InInt("id", 0);
         int published = this.InInt("published", 1);
         if (published != 1) { published = 0; }
-        IDbConnection db = await this.Conn();
-        if (db == null || id <= 0) {
+        if (!this.DbReady() || id <= 0) {
             this.Ctx().Redirect("/admin/posts?bad=1");
             return;
         }
-        int changed = await new PostDao(db).SetPublished(id, published);
+        int changed = await this.Post.Update()
+            .Set(a => a.published, published)
+            .Where(a => a.id == id)
+            .ExecuteAffrowsAsync();
         if (changed > 0) {
             CacheContext cache = this.Cache();
             if (cache != null) {

@@ -1,0 +1,135 @@
+// ORM: table accessors. `this.<Entity>` on any object that exposes __Conn() is
+// the typed query over that table on that object's connection, so application
+// code neither constructs a DAO nor borrows/returns a connection:
+//
+//     await this.User.Read(1)
+//     await this.User.Where(a => a.status == 1).ToListAsync()
+//
+// Everything after the accessor is the ordinary typed LINQ chain (field names
+// checked at compile time -- no string column names).
+using System;
+using System.Data;
+using System.Data.Orm;
+using System.Data.Sqlite;
+using System.IO;
+
+[Table(Name = "acc_user")]
+class AccUser {
+    [Column(IsIdentity = true)]
+    int id;
+    [Column(StringLength = 64)]
+    string username;
+    int status;
+}
+
+[Table(Name = "acc_role")]
+class AccRole {
+    [Column(IsIdentity = true)]
+    int id;
+    int uid;
+    [Column(StringLength = 32)]
+    string name;
+}
+
+// A service (not a controller): the only contract an accessor needs is __Conn().
+class Users {
+    IDbConnection conn;
+
+    Users(IDbConnection c) { this.conn = c; }
+
+    IDbConnection __Conn() { return this.conn; }
+
+    async int Add(string name, int status) {
+        AccUser u = new AccUser();
+        u.username = name;
+        u.status = status;
+        return await this.AccUser.Insert(u).ExecuteIdentityAsync();
+    }
+
+    async int Grant(int uid, string role) {
+        AccRole r = new AccRole();
+        r.uid = uid;
+        r.name = role;
+        return await this.AccRole.Insert(r).ExecuteAffrowsAsync();
+    }
+
+    async AccUser Read(int id) {
+        return await this.AccUser.Read(id);
+    }
+
+    async AccUser ByName(string name) {
+        return await this.AccUser.Where(a => a.username == name).FirstAsync();
+    }
+
+    // A second table from inside the same object, on the same connection.
+    async List<AccRole> RolesOf(int uid) {
+        return await this.AccRole
+            .Where(a => a.uid == uid)
+            .OrderBy(a => a.id)
+            .ToListAsync();
+    }
+
+    async List<AccUser> Active(int take) {
+        return await this.AccUser
+            .Where(a => a.status == 1)
+            .OrderByDescending(a => a.id)
+            .Take(take)
+            .ToListAsync();
+    }
+
+    async int Disable(int id) {
+        return await this.AccUser.Update()
+            .Set(a => a.status, 0)
+            .Where(a => a.id == id)
+            .ExecuteAffrowsAsync();
+    }
+
+    async int Revoke(int uid) {
+        return await this.AccRole.Delete()
+            .Where(a => a.uid == uid)
+            .ExecuteAffrowsAsync();
+    }
+
+    async int Total() { return await this.AccUser.CountAsync(); }
+}
+
+class Program {
+    static void Main() {
+        string path = "orm_table_accessor.tmp.db";
+        File.Delete(path);
+        SqliteConnection db = SqliteConnection.Open(path);
+        db.SyncStructure<AccUser>();
+        db.SyncStructure<AccRole>();
+
+        Users svc = new Users(db);
+        int alice = await svc.Add("alice", 1);
+        int bob = await svc.Add("bob", 1);
+        int carol = await svc.Add("carol", 0);
+        Console.WriteLine("ids: " + Convert.ToString(alice)
+            + " " + Convert.ToString(bob) + " " + Convert.ToString(carol));
+        Console.WriteLine("total: " + Convert.ToString(await svc.Total()));
+
+        Console.WriteLine("read: " + (await svc.Read(alice)).username);
+        Console.WriteLine("byname: " + Convert.ToString((await svc.ByName("bob")).id));
+        Console.WriteLine("missing: "
+            + Convert.ToString(await svc.Read(999) == null));
+
+        List<AccUser> active = await svc.Active(10);
+        Console.WriteLine("active: " + Convert.ToString(active.Count)
+            + " first=" + active[0].username);
+
+        Console.WriteLine("grant: " + Convert.ToString(
+            await svc.Grant(alice, "admin") + await svc.Grant(alice, "editor")));
+        List<AccRole> roles = await svc.RolesOf(alice);
+        Console.WriteLine("roles: " + Convert.ToString(roles.Count)
+            + " " + roles[0].name + "," + roles[1].name);
+
+        Console.WriteLine("disable: " + Convert.ToString(await svc.Disable(bob)));
+        Console.WriteLine("active2: " + Convert.ToString((await svc.Active(10)).Count));
+        Console.WriteLine("revoke: " + Convert.ToString(await svc.Revoke(alice)));
+        Console.WriteLine("roles2: " + Convert.ToString((await svc.RolesOf(alice)).Count));
+
+        db.Close();
+        File.Delete(path);
+    }
+}

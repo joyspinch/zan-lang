@@ -13,13 +13,21 @@ namespace ZanWeb.Blog;
 /// <summary>
 /// 极简博客 —— 分层后每层只做一件事：
 ///
-///   控制器（本文件）  取参数、管缓存、渲染视图；不写一行查询
-///   src/dao/PostDao   所有 blog_post 的读写；不管连接生命周期
-///   src/model/Post    实体 = 表结构
+///   控制器（本文件）  取参数、管缓存、渲染视图
+///   src/model/Post    实体 = 表结构，`this.Post` 就是这张表
+///   src/dao/PostDao   只放复杂查询与缓存 key；日常增删改查不需要它
 ///
-/// 连接是请求级的：`await this.Conn()` 第一次借、之后复用、动作结束框架自动归还，
-/// 所以业务代码里没有 Acquire/Release；多表写入用 this.Begin()/Commit()/Rollback()
-/// （同一条连接才能在一个事务里，见 AppController）。
+/// 表访问器：`this.Post` / `this.User` 直接就是对应数据表的类型化查询，字段名有
+/// 编译期检查和自动补全，连接由框架在请求开始时借好、结束时归还——既不用 new Dao，
+/// 也没有 Acquire/Release：
+///
+///     await this.Post.Where(a =&gt; a.published == 1).OrderByDescending(a =&gt; a.id)
+///         .Take(20).ToListAsync()
+///     await this.Post.Read(id)                 // 主键便捷读
+///     await this.Post.Insert(p).ExecuteIdentityAsync()
+///
+/// 多表写入用 this.Begin()/Commit()/Rollback()（同一条连接才能在一个事务里，
+/// 见 AppController）。
 ///
 /// Redis 走 cache-aside：先读共享缓存，未命中查库并回填，写入后删 key。缓存只是
 /// 加速，Redis 挂了就回落查库。
@@ -53,12 +61,16 @@ class Posts : AppController {
         }
 
         if (rows == null) {
-            IDbConnection db = await this.Conn();
-            if (db == null) {
+            if (!this.DbReady()) {
                 this.Fail(503, "2001", "数据库不可用，检查 config/app.json [database]");
                 return;
             }
-            rows = await new PostDao(db).Recent(20, kw);
+            rows = await this.Post
+                .Where(a => a.published == 1)
+                .WhereIf(kw.Length > 0, a => a.title.Contains(kw))
+                .OrderByDescending(a => a.id)
+                .Take(20)
+                .ToListAsync();
             if (cacheable) {
                 await cache.SetTtlAsync(PostDao.ListKey,
                     Json.Serialize<List<Post>>(rows), 60);
@@ -108,12 +120,11 @@ class Posts : AppController {
 
         if (post == null) {
             source = "db";
-            IDbConnection db = await this.Conn();
-            if (db == null) {
+            if (!this.DbReady()) {
                 this.Fail(503, "2001", "数据库不可用");
                 return;
             }
-            post = await new PostDao(db).ById(id);
+            post = await this.Post.Read(id);
             if (post == null) {
                 this.Fail(404, "2004", "文章不存在");
                 return;
@@ -143,8 +154,7 @@ class Posts : AppController {
             return;
         }
 
-        IDbConnection db = await this.Conn();
-        if (db == null) {
+        if (!this.DbReady()) {
             this.Fail(503, "2001", "数据库不可用");
             return;
         }
@@ -152,7 +162,7 @@ class Posts : AppController {
         // 作者取自登录身份，不取表单：客户端传来的 author 可以是任何人。
         string author = "anonymous";
         if (this.IsLogin()) {
-            User me = await new UserDao(db).ById(Filter.ToInt(this.uid, 0));
+            User me = await this.User.Read(Filter.ToInt(this.uid, 0));
             if (me != null) { author = me.username; }
         }
 
@@ -163,7 +173,7 @@ class Posts : AppController {
         p.published = 1;
         p.createdAt = WebApp.NowSeconds();
 
-        int newId = await new PostDao(db).Insert(p);
+        int newId = await this.Post.Insert(p).ExecuteIdentityAsync();
 
         // 写完就让缓存失效，而不是等 TTL 到期，否则列表最长 60 秒看不到新文章。
         await this.Cache().DelAsync(PostDao.ListKey);

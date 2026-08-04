@@ -1103,7 +1103,11 @@ add_custom_command(OUTPUT ${_zanfmt_exe}
             --auto-stdlib -o ${_zanfmt_exe}
     DEPENDS zanc ${CMAKE_SOURCE_DIR}/src/fmt/zanfmt.zan
     COMMENT "Building zanfmt from Zan source")
-add_custom_target(zanfmt ALL DEPENDS ${_zanfmt_exe})
+# The target cannot be called `zanfmt`: on platforms with no executable suffix
+# that is also the name of the file the custom command writes, and Ninja then
+# has two rules generating `zanfmt` ("multiple rules generate zanfmt", which
+# stops generation before any target builds).
+add_custom_target(zanfmt_tool ALL DEPENDS ${_zanfmt_exe})
 
 add_test(NAME tool_zanfmt
   COMMAND ${CMAKE_COMMAND}
@@ -1120,7 +1124,7 @@ add_custom_command(OUTPUT ${_zandoc_exe}
             --auto-stdlib -o ${_zandoc_exe}
     DEPENDS zanc ${CMAKE_SOURCE_DIR}/src/doc/zandoc.zan
     COMMENT "Building zandoc from Zan source")
-add_custom_target(zandoc ALL DEPENDS ${_zandoc_exe})
+add_custom_target(zandoc_tool ALL DEPENDS ${_zandoc_exe})
 
 add_test(NAME tool_zandoc
   COMMAND ${CMAKE_COMMAND}

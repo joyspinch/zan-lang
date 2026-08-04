@@ -1069,6 +1069,147 @@ static void dg_rewrite_root(dg_ctx_t *c, zan_ast_node_t *call, zan_istr_t cls,
     if (extra) zan_ast_list_push(&call->call.args, extra, c->arena);
 }
 
+/* ---- table accessors ---------------------------------------------------
+ * `<obj>.<Entity>` in front of an ORM chain method is sugar for a query
+ * rooted on the object's own connection:
+ *
+ *     await this.User.Where(a => a.username == n).FirstAsync()
+ *     await this.User.Read(id)                  // primary key shortcut
+ *     await this.User.Insert(row).ExecuteAffrowsAsync()
+ *
+ * is exactly `this.__Conn().Select<User>()...`, so a controller / model /
+ * service never constructs a DAO or leases a connection by hand -- it only
+ * has to expose `__Conn()`. Everything after the accessor is the ordinary
+ * typed LINQ chain (compile-time checked field names, no string columns).
+ */
+
+/* Chain heads that may follow an accessor. Anything else is left alone, so a
+ * plain member access that happens to be named like an entity is untouched. */
+static bool dg_acc_select_head(zan_istr_t m) {
+    return istr_is(m, "Where") || istr_is(m, "WhereIf")
+        || istr_is(m, "OrderBy") || istr_is(m, "OrderByDescending")
+        || istr_is(m, "Include") || istr_is(m, "GroupBy")
+        || istr_is(m, "Distinct") || istr_is(m, "Skip") || istr_is(m, "Take")
+        || istr_is(m, "Limit") || istr_is(m, "Page") || istr_is(m, "Count")
+        || istr_is(m, "CountAsync") || istr_is(m, "Any") || istr_is(m, "AnyAsync")
+        || istr_is(m, "First") || istr_is(m, "FirstAsync")
+        || istr_is(m, "FirstOrDefault") || istr_is(m, "FirstOrDefaultAsync")
+        || istr_is(m, "ToOne") || istr_is(m, "ToOneAsync")
+        || istr_is(m, "ToList") || istr_is(m, "ToListAsync")
+        || istr_is(m, "Sum") || istr_is(m, "Avg") || istr_is(m, "Max")
+        || istr_is(m, "Min");
+}
+
+/* `<obj>.<Entity>` where Entity is a [Table] class. */
+static bool dg_is_accessor(dg_ctx_t *c, zan_ast_node_t *e, zan_istr_t *cls) {
+    if (!e || e->kind != AST_MEMBER_ACCESS || !e->member.object) return false;
+    zan_ast_node_t *obj = e->member.object;
+    if (obj->kind != AST_THIS_EXPR && obj->kind != AST_IDENTIFIER &&
+        obj->kind != AST_MEMBER_ACCESS)
+        return false;
+    if (!dg_is_table_entity(c->unit, e->member.name)) return false;
+    *cls = e->member.name;
+    return true;
+}
+
+/* The identity column of an entity ("id" when nothing is marked). */
+static zan_istr_t dg_pk_of(dg_ctx_t *c, zan_istr_t cls) {
+    static dg_fields_t fs;
+    memset(&fs, 0, sizeof(fs));
+    dg_collect_fields(c->unit, dg_find_class(c->unit, cls), &fs, 0);
+    for (int i = 0; i < fs.count; i++)
+        if (fs.items[i].is_ident) return fs.items[i].name;
+    for (int i = 0; i < fs.count; i++)
+        if (istr_is(fs.items[i].name, "id")) return fs.items[i].name;
+    zan_istr_t none = { NULL, 0 };
+    return none;
+}
+
+/* `__DbBind.<P>_<cls>(<acc-object>.__Conn())` */
+static zan_ast_node_t *dg_acc_root(dg_ctx_t *c, zan_ast_node_t *acc,
+                                   zan_istr_t cls, char prefix,
+                                   zan_ast_node_t *extra) {
+    dg_need_add(&c->need, cls);
+    c->any = true;
+    zan_loc_t loc = acc->loc;
+    zan_ast_node_t *conn = nb_call1(
+        c, loc,
+        nb_member(c, loc, acc->member.object, dg_istr(c, "__Conn", 6)), NULL);
+    char mname[160];
+    snprintf(mname, sizeof(mname), "%c_%.*s", prefix, (int)cls.len, cls.str);
+    zan_ast_node_t *root = nb(c, AST_CALL, loc);
+    root->call.callee =
+        nb_member(c, loc, nb_ident(c, loc, "__DbBind"),
+                  dg_istr(c, mname, strlen(mname)));
+    zan_ast_list_init(&root->call.args);
+    zan_ast_list_init(&root->call.type_args);
+    zan_ast_list_push(&root->call.args, conn, c->arena);
+    if (extra) zan_ast_list_push(&root->call.args, extra, c->arena);
+    return root;
+}
+
+static void dg_rewrite_where(dg_ctx_t *c, zan_ast_node_t *call, zan_istr_t cls,
+                             bool select);
+
+/* Rewrites the accessor in front of `call`. Returns true when the whole call
+ * became the chain root (Insert/Update/Delete/Read) and needs no further
+ * chain handling. */
+static bool dg_accessor_rewrite(dg_ctx_t *c, zan_ast_node_t *call) {
+    zan_ast_node_t *callee = call->call.callee;
+    zan_istr_t cls;
+    if (!dg_is_accessor(c, callee->member.object, &cls)) return false;
+    zan_ast_node_t *acc = callee->member.object;
+    zan_istr_t mn = callee->member.name;
+    int nargs = call->call.args.count;
+
+    if (istr_is(mn, "Insert") && nargs <= 1) {
+        zan_ast_node_t *arg = nargs == 1 ? call->call.args.items[0] : NULL;
+        zan_ast_node_t *root = dg_acc_root(c, acc, cls, 'I', arg);
+        *call = *root;
+        return true;
+    }
+    if ((istr_is(mn, "Update") || istr_is(mn, "Delete")) && nargs == 0) {
+        zan_ast_node_t *root =
+            dg_acc_root(c, acc, cls, istr_is(mn, "Update") ? 'U' : 'D', NULL);
+        *call = *root;
+        return true;
+    }
+    /* Read(pk): Where(a => a.<pk> == pk).FirstAsync() */
+    if ((istr_is(mn, "Read") || istr_is(mn, "ReadAsync")) && nargs == 1) {
+        zan_istr_t pk = dg_pk_of(c, cls);
+        if (pk.len == 0) {
+            zan_diag_emit(c->diag, DIAG_ERROR, call->loc,
+                          "Read() needs an identity column on the entity");
+            return true;
+        }
+        zan_loc_t loc = call->loc;
+        zan_ast_node_t *root = dg_acc_root(c, acc, cls, 'Q', NULL);
+        zan_ast_node_t *p = nb(c, AST_PARAM, loc);
+        p->param.name = dg_istr(c, "a", 1);
+        zan_ast_node_t *cmp = nb(c, AST_BINARY, loc);
+        cmp->binary.op = TK_EQ_EQ;
+        cmp->binary.left = nb_member(c, loc, nb_ident(c, loc, "a"), pk);
+        cmp->binary.right = call->call.args.items[0];
+        zan_ast_node_t *lam = nb(c, AST_LAMBDA, loc);
+        zan_ast_list_init(&lam->lambda.params);
+        zan_ast_list_push(&lam->lambda.params, p, c->arena);
+        lam->lambda.body = cmp;
+        zan_ast_node_t *w = nb(c, AST_CALL, loc);
+        w->call.callee = nb_member(c, loc, root, dg_istr(c, "Where", 5));
+        zan_ast_list_init(&w->call.args);
+        zan_ast_list_init(&w->call.type_args);
+        zan_ast_list_push(&w->call.args, lam, c->arena);
+        dg_rewrite_where(c, w, cls, true);
+        call->call.callee = nb_member(c, loc, w, dg_istr(c, "FirstAsync", 10));
+        zan_ast_list_init(&call->call.args);
+        zan_ast_list_init(&call->call.type_args);
+        return true;
+    }
+    if (!dg_acc_select_head(mn)) return false;
+    callee->member.object = dg_acc_root(c, acc, cls, 'Q', NULL);
+    return false;
+}
+
 static const char *dg_bind_method(dg_bk_t k) {
     switch (k) {
     case BK_STR: return "P";
@@ -2006,6 +2147,9 @@ static void dg_visit_call(dg_ctx_t *c, zan_ast_node_t *e) {
     /* Expr<T> target-typed lambda: rewrite before ORM chain handling so the
      * tree lowering applies to any method whose parameter is Expr<T>. */
     if (dg_expr_rewrite_call(c, e)) return;
+    if (e->call.callee && e->call.callee->kind == AST_MEMBER_ACCESS &&
+        dg_accessor_rewrite(c, e))
+        return;
     if (dg_is_root(c, e, &cls, &rk, &sync)) {
         if (sync) dg_rewrite_sync(c, e, cls);
         else dg_rewrite_root(c, e, cls,
