@@ -941,6 +941,19 @@ foreach(_field_init_kind static instance generic)
     PROPERTIES TIMEOUT 60)
 endforeach()
 
+# A readonly field is writable only from a constructor of its declaring type.
+# It used to parse and then be assignable from anywhere.
+foreach(_ro_case method outside)
+  add_test(NAME diag_readonly_assign_${_ro_case}
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/readonly_assign_${_ro_case}.zan
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_readonly_assign_${_ro_case}${_exe_ext}
+      "-DEXPECT_REGEX=cannot assign to readonly field"
+      -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+  set_tests_properties(diag_readonly_assign_${_ro_case} PROPERTIES TIMEOUT 60)
+endforeach()
+
 # Typed-ORM queries must reject literal/column type mismatches at compile
 # time. dbgen used to lower `p.num == "abc"` / `p.name == 123` to a bound
 # parameter of the wrong shape, silently running a type-coerced comparison.

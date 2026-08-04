@@ -1174,6 +1174,7 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
         g->current_this = is_static ? NULL : this_alloca;
         g->current_type_sym = type_sym;
         g->current_fn_body = member->method_decl.body;
+        g->current_fn_is_ctor = member->kind == AST_CONSTRUCTOR_DECL;
         g->current_fn_no_runtime = zan_ast_has_attr(member, "NoRuntime");
 
         if (member->kind == AST_CONSTRUCTOR_DECL) {

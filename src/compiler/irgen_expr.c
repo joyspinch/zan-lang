@@ -1425,9 +1425,31 @@ static LLVMValueRef finish_member_of_temp(zan_irgen_t *g, zan_ast_node_t *expr,
     return fv;
 }
 
+/* `obj.field = v` where the field is declared readonly. The checker enforces
+ * the forms it can resolve without a local scope (`x = v`, `this.x = v`); the
+ * receiver's type is only known here, where locals are typed. A readonly field
+ * is writable from a constructor of its declaring type and nowhere else. */
+static void check_readonly_store(zan_irgen_t *g, zan_ast_node_t *lhs,
+                                 local_scope_t *locals) {
+    if (!lhs || lhs->kind != AST_MEMBER_ACCESS) return;
+    if (lhs->member.object && lhs->member.object->kind == AST_THIS_EXPR) return;
+    zan_type_t *ot = infer_expr_type(g, lhs->member.object, locals);
+    if (!ot || !ot->sym) return;
+    zan_symbol_t *f = get_field_sym(ot->sym, lhs->member.name);
+    if (!f || !f->decl || f->decl->kind != AST_FIELD_DECL) return;
+    if ((f->decl->field_decl.modifiers & MOD_READONLY) == 0) return;
+    if (g->current_fn_is_ctor && g->current_type_sym == ot->sym) return;
+    zan_diag_emit(g->diag, DIAG_ERROR, lhs->loc,
+                  "cannot assign to readonly field '%.*s' outside a "
+                  "constructor of '%.*s'",
+                  (int)lhs->member.name.len, lhs->member.name.str,
+                  (int)ot->sym->name.len, ot->sym->name.str);
+}
+
 static LLVMValueRef emit_expr_assignment(zan_irgen_t *g, zan_ast_node_t *expr,
         local_scope_t *locals) {
         LLVMValueRef right;
+        check_readonly_store(g, expr->binary.left, locals);
         {
             zan_type_t *lt = assign_lhs_type(g, expr->binary.left, locals);
             check_implicit_narrowing(g, lt,

@@ -873,7 +873,7 @@ leakcheck 子集全部通过；生成 IR 不含 `setjmp`/`longjmp`/`__zan_eh_tmp
 | A43-A7 | 泛型类里的实例泛型方法 `Pool<T>.M<U>()` 运行崩溃（0xC0000005） | 13 | ⬜ 待修（A32-3a） |
 | A43-A8 | async 泛型方法返回垃圾值（打印 `-1886711216`） | 56 | ⬜ 待修（A32-3b） |
 | A43-A9 | `static A()` 只在首次 `new` 时执行：先读 `A.n` 得 0，`new A()` 后才是 7（C# 首次访问静态成员即触发） | 08,40 | ⬜ 待修 |
-| A43-A10 | `readonly` 只解析不强制：`public readonly int x;` 在类外 `a.x = 6;` 编译通过并改值 | 71,72 | ⬜ 待修（补诊断） |
+| A43-A10 | `readonly` 只解析不强制：`public readonly int x;` 在类外 `a.x = 6;` 编译通过并改值 | 71,72,90–94 | ✅ 已修（见下 A43-A10 详情） |
 
 ### A43-A2 详情（已完成 2026-08-04）
 
@@ -890,6 +890,25 @@ leakcheck 子集全部通过；生成 IR 不含 `setjmp`/`longjmp`/`__zan_eh_tmp
 * 正式测试：`tests/conformance/default_parameters.zan`。
 * 回归：`ctest -R "default_param|ctor|constructor|overload|params|generic|struct|interface|record|field_decl|int_to"`
   99 项里仅 `field_decl_initializers`（及其 leakcheck）失败，已确认是 A32-1 的既有失败。
+
+### A43-A10 详情（已完成 2026-08-04）
+
+* 根因：`MOD_READONLY` 只在 parser 里存了位，没有任何一处检查写入。
+* 修复点分两层，因为写入目标的类型不总在同一阶段可知：
+  * `checker.c`：新增 `current_type_sym` / `in_ctor` 上下文与 `check_readonly_assignment()`，
+    覆盖 `x = v`、`this.x = v`（checker 没有局部作用域，只能处理这两种形态）；
+  * `irgen_expr.c::check_readonly_store()`：`obj.x = v` 的接收者类型要到 irgen
+    才有（`infer_expr_type` + 局部变量表），并新增 `g->current_fn_is_ctor` 判断
+    「是否在声明该字段的类型的构造器内」。
+  * 复合赋值 `x += 1` 在 parser 阶段就降级成 `AST_ASSIGNMENT`，因此同一处即可覆盖。
+* 规则：readonly 字段只能在**声明它的类型的构造器**里赋值（声明初始化器就降级在构造器内），
+  其他位置一律报 `cannot assign to readonly field 'x' outside a constructor of 'T'`。
+* 正式测试：`tests/conformance/readonly_fields.zan`（构造器赋值、`this.` 赋值、
+  声明初始化器、同类中的可变字段仍可写）+ `tests/diag/readonly_assign_method.zan`、
+  `tests/diag/readonly_assign_outside.zan` 两个编译失败诊断。
+* 回归：`ctest -R "readonly|diag_|default_param|struct|field|record|conformance_class|property"`
+  83 项里只有既有的 `field_decl_initializers` 失败；`scripts/_ide_compile_check.ps1`
+  以 `IDE_COMPILE_EXIT=0` 通过（stdlib/IDE 全量编译无误报）。
 
 ## A43-B 语法缺失（parser 层不接受，按价值排序）
 

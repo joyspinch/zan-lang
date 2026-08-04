@@ -50,6 +50,72 @@ static zan_symbol_t *checker_find_method(zan_symbol_t *type_sym, zan_istr_t name
     return NULL;
 }
 
+/* ---- readonly fields ----------------------------------------------------
+ * `readonly` was parsed and stored but never enforced, so a field advertised as
+ * immutable could be reassigned from anywhere. A readonly field is writable
+ * only from a constructor of the type that declares it (its declaration
+ * initializer is lowered inside that constructor too); everywhere else the
+ * assignment is an error. */
+
+/* The declared field of `type_sym` named `name`, walking the base chain. */
+static zan_symbol_t *checker_find_field(zan_symbol_t *type_sym, zan_istr_t name) {
+    while (type_sym) {
+        for (int i = 0; i < type_sym->member_count; i++) {
+            zan_symbol_t *m = type_sym->members[i];
+            if (m && m->kind == SYM_FIELD &&
+                m->name.len == name.len &&
+                memcmp(m->name.str, name.str, (size_t)name.len) == 0)
+                return m;
+        }
+        type_sym = (type_sym->type && type_sym->type->base_type)
+            ? type_sym->type->base_type->sym : NULL;
+    }
+    return NULL;
+}
+
+static bool field_is_readonly(zan_symbol_t *field) {
+    return field && field->decl && field->decl->kind == AST_FIELD_DECL &&
+           (field->decl->field_decl.modifiers & MOD_READONLY) != 0;
+}
+
+/* The assignment target's field symbol together with the type that declares
+ * it, for `x = ...`, `this.x = ...` and `obj.x = ...`. */
+static zan_symbol_t *assign_target_field(zan_checker_t *c, zan_ast_node_t *lhs,
+                                         zan_symbol_t **owner) {
+    if (!lhs) return NULL;
+    if (lhs->kind == AST_IDENTIFIER) {
+        if (!c->current_type_sym) return NULL;
+        *owner = c->current_type_sym;
+        return checker_find_field(c->current_type_sym, lhs->ident.name);
+    }
+    if (lhs->kind == AST_MEMBER_ACCESS) {
+        zan_symbol_t *ts = NULL;
+        if (lhs->member.object && lhs->member.object->kind == AST_THIS_EXPR) {
+            ts = c->current_type_sym;
+        } else {
+            zan_type_t *ot = zan_checker_check_expr(c, lhs->member.object);
+            ts = ot ? ot->sym : NULL;
+        }
+        if (!ts) return NULL;
+        *owner = ts;
+        return checker_find_field(ts, lhs->member.name);
+    }
+    return NULL;
+}
+
+static void check_readonly_assignment(zan_checker_t *c, zan_ast_node_t *expr) {
+    zan_symbol_t *owner = NULL;
+    zan_symbol_t *field = assign_target_field(c, expr->binary.left, &owner);
+    if (!field_is_readonly(field)) return;
+    if (c->in_ctor && owner == c->current_type_sym) return;
+    zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
+                  "cannot assign to readonly field '%.*s' outside a "
+                  "constructor of '%.*s'",
+                  (int)field->name.len, field->name.str,
+                  (int)(owner ? owner->name.len : 0),
+                  owner ? owner->name.str : "");
+}
+
 /* ---- generic constraint checking ---- */
 
 /* True when `arg` is, implements, or derives from `cons`. */
@@ -438,6 +504,7 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
     case AST_ASSIGNMENT: {
         zan_checker_check_expr(c, expr->binary.left);
         zan_type_t *right = zan_checker_check_expr(c, expr->binary.right);
+        check_readonly_assignment(c, expr);
         return right;
     }
 
@@ -606,6 +673,8 @@ void zan_checker_check_stmt(zan_checker_t *c, zan_ast_node_t *stmt) {
 static void check_method_body(zan_checker_t *c, zan_ast_node_t *method) {
     if (!method->method_decl.body) return;
 
+    bool saved_ctor = c->in_ctor;
+    c->in_ctor = method->kind == AST_CONSTRUCTOR_DECL;
     bool saved_nrt = c->in_no_runtime;
     c->in_no_runtime = zan_ast_has_attr(method, "NoRuntime");
     zan_type_t *saved = c->current_return_type;
@@ -614,6 +683,7 @@ static void check_method_body(zan_checker_t *c, zan_ast_node_t *method) {
     zan_checker_check_stmt(c, method->method_decl.body);
     c->current_return_type = saved;
     c->in_no_runtime = saved_nrt;
+    c->in_ctor = saved_ctor;
 }
 
 void zan_checker_check(zan_checker_t *c, zan_ast_node_t *unit) {
@@ -626,6 +696,7 @@ void zan_checker_check(zan_checker_t *c, zan_ast_node_t *unit) {
             continue;
         }
 
+        c->current_type_sym = zan_binder_lookup(c->binder, decl->type_decl.name);
         for (int j = 0; j < decl->type_decl.members.count; j++) {
             zan_ast_node_t *member = decl->type_decl.members.items[j];
             if (member->kind == AST_METHOD_DECL ||

@@ -15,6 +15,10 @@ struct zan_checker {
     /* inside a [NoRuntime] body: anything needing the managed runtime
      * (allocation, ARC, exceptions, the monitor) is an error there */
     bool in_no_runtime;
+    /* the type whose member body is being checked, and whether that body is a
+     * constructor: a `readonly` field may only be assigned there */
+    zan_symbol_t *current_type_sym;
+    bool in_ctor;
 };
 
 void zan_checker_init(zan_checker_t *c, zan_binder_t *binder,
