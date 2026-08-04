@@ -440,9 +440,68 @@ partial class CodeEditor {
         return total;
     }
 
-    /// Number of call sites of `name` declared on `declLine` (the CodeLens count).
-    int CountRefs(string name, int declLine) {
-        return ScanRefs(name, declLine, null);
+    /// Cross-file call-site counts for the members this buffer declares, keyed
+    /// "Owner.member". Built in one pass over the other project sources -- each
+    /// is split once, for every declaration -- and kept until the host supplies
+    /// the sources again or another file is loaded.
+    void EnsureExternRefs() {
+        if (!extRefDirty) { return; }
+        extRefDirty = false;
+        extRefKeys = new List<string>();
+        extRefVals = new List<int>();
+        List<string> owners = new List<string>();
+        CodeEditor.OwnerPerLine(lines, owners);
+        List<string> dOwner = new List<string>();
+        List<string> dName = new List<string>();
+        int li = 0;
+        while (li < lines.Count) {
+            string dn = CodeEditor.DeclNameAt(lines[li]);
+            if (dn.Length > 0 && li < owners.Count && owners[li].Length > 0) {
+                string key = owners[li] + "." + dn;
+                if (!CodeEditor.Has(extRefKeys, key)) {
+                    extRefKeys.Add(key);
+                    extRefVals.Add(0);
+                    dOwner.Add(owners[li]);
+                    dName.Add(dn);
+                }
+            }
+            li = li + 1;
+        }
+        if (dName.Count == 0) { return; }
+        int f = 0;
+        while (f < projFileSrc.Count) {
+            List<string> fl = CodeEditor.SplitLines(projFileSrc[f]);
+            int d = 0;
+            while (d < dName.Count) {
+                extRefVals[d] = extRefVals[d]
+                    + CodeEditor.CountMemberRefsIn(fl, dName[d], dOwner[d], null);
+                d = d + 1;
+            }
+            f = f + 1;
+        }
+    }
+
+    /// Call sites of `owner.member` outside this buffer (0 when unknown).
+    int ExternRefCount(string owner, string member) {
+        EnsureExternRefs();
+        string key = owner + "." + member;
+        int i = 0;
+        while (i < extRefKeys.Count) {
+            if (extRefKeys[i] == key) { return extRefVals[i]; }
+            i = i + 1;
+        }
+        return 0;
+    }
+
+    /// The count the CodeLens shows: the uses in this buffer plus the ones in
+    /// the project's other files. Counting only the buffer read "0 references"
+    /// for a method whose callers live in another file, which is the normal case
+    /// for anything a project exposes.
+    int LensRefCount(string name, int declLine) {
+        int local = ScanRefs(name, declLine, null);
+        string owner = CodeEditor.EnclosingTypeAt(lines, declLine);
+        if (owner.Length == 0) { return local; }
+        return local + ExternRefCount(owner, name);
     }
 
     /// Moves the caret to the next call site of `name` after `declLine`
@@ -1202,6 +1261,7 @@ partial class CodeEditor {
     void SetProjectFiles(List<string> contents) {
         projFileSrc = contents;
         projScanDirty = true;
+        extRefDirty = true;
     }
 
     /// Runs the deferred cross-file type scan if SetProjectFiles() left it

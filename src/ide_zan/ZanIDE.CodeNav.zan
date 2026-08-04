@@ -467,8 +467,26 @@ partial class ZanIDE {
         }
         List<string> subs = Directory.GetDirectories(dir);
         for (int j = 0; j < subs.Count; j = j + 1) {
-            ZanIDE.CollectZan(dir + "/" + subs[j], outp);
+            // Build output holds generated copies of the sources; searching it
+            // reports every hit twice, in a file the user cannot edit.
+            string sn = subs[j];
+            if (sn.StartsWith(".") || sn == "build" || sn == "bin" || sn == "obj") {
+                continue;
+            }
+            ZanIDE.CollectZan(dir + "/" + sn, outp);
         }
+    }
+
+    /// Column of `word` on line `ln` of `body`, or 0. A jump used to leave the
+    /// caret in the destination line's indentation, so the next command asked
+    /// about whatever word the line started with instead of the symbol.
+    static int ColOfWordAt(string body, int ln, string word) {
+        if (word.Length == 0) { return 0; }
+        List<string> ls = CodeEditor.SplitLines(body);
+        if (ln < 0 || ln >= ls.Count) { return 0; }
+        int p = CodeEditor.FindWordFrom(ls[ln], word, 0);
+        if (p < 0) { return 0; }
+        return p;
     }
 
     /// Every file on disk the navigation commands search: the project sources,
@@ -494,6 +512,53 @@ partial class ZanIDE {
     static void InvalidateNavFiles() {
         ZanIDE.navFiles = null;
         ZanIDE.navFilesRoot = "";
+        ZanIDE.projSrcPaths = null;
+        ZanIDE.projSrcRoot = "";
+    }
+
+    /// The source of every project file plus the other open tabs, with the live
+    /// text of anything open. The editor needs it to count the uses of a member
+    /// that live in files other than the one being edited (its reference counts
+    /// used to see one buffer, so a method called from elsewhere read "0
+    /// references"). Read once per project, kept until the project changes or
+    /// its index is rebuilt.
+    static List<string> ProjectSources(List<TabRecord> tabs, string root,
+                                       int skipTab) {
+        if (ZanIDE.projSrcPaths == null || ZanIDE.projSrcRoot != root) {
+            ZanIDE.projSrcPaths = new List<string>();
+            ZanIDE.projSrcBodies = new List<string>();
+            List<string> all = ZanIDE.ListZanFiles(root);
+            for (int i = 0; i < all.Count; i = i + 1) {
+                if (!all[i].EndsWith(".zan")) { continue; }
+                ZanIDE.projSrcPaths.Add(all[i]);
+                ZanIDE.projSrcBodies.Add(File.ReadAllText(all[i]));
+            }
+            ZanIDE.projSrcRoot = root;
+        }
+        List<string> outp = new List<string>();
+        for (int i = 0; i < ZanIDE.projSrcPaths.Count; i = i + 1) {
+            int t = ZanIDE.FindTabByPath(tabs, ZanIDE.projSrcPaths[i]);
+            if (t == skipTab) { continue; }
+            if (t >= 0) { outp.Add(tabs[t].body); }
+            else { outp.Add(ZanIDE.projSrcBodies[i]); }
+        }
+        for (int j = 0; j < tabs.Count; j = j + 1) {
+            if (j == skipTab) { continue; }
+            if (tabs[j].path.Length == 0 || tabs[j].path == "@start"
+                || tabs[j].path == "@docs") { continue; }
+            if (!tabs[j].path.EndsWith(".zan")) { continue; }
+            if (ZanIDE.HasSamePath(ZanIDE.projSrcPaths, tabs[j].path)) { continue; }
+            outp.Add(tabs[j].body);
+        }
+        return outp;
+    }
+
+    /// True when `paths` holds `p` (path equality, not string equality).
+    static bool HasSamePath(List<string> paths, string p) {
+        for (int i = 0; i < paths.Count; i = i + 1) {
+            if (ZanIDE.SamePath(paths[i], p)) { return true; }
+        }
+        return false;
     }
 
     /// `files` reordered so the ones named after `hint` come first: a type lives
@@ -812,7 +877,9 @@ partial class ZanIDE {
             total = total + ZanIDE.CountRefsInFile(tabs[i].name, tabs[i].body,
                 word, owner, log);
         }
-        List<string> files = ZanIDE.ListZanFiles(root + "/src");
+        // The whole project, not just its src tree: a use in a tool, a test or a
+        // script beside it is a use.
+        List<string> files = ZanIDE.ListZanFiles(root);
         for (int fi = 0; fi < files.Count; fi = fi + 1) {
             string fp = files[fi];
             if (ZanIDE.FindTabByPath(tabs, fp) < 0) {
