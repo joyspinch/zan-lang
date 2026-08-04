@@ -119,6 +119,26 @@ class ServerMetrics {
     long lastCpuMs;
     int ringCap;
 
+    // ---- per-second series (for charts) ----
+    // A fixed ring of one-second buckets addressed by (second % seriesCap): a
+    // chart needs the recent shape of the load, and a ring gives that in
+    // constant memory with no allocation on the request path. The bucket's own
+    // second is stored alongside its counters, so a slot the ring has lapped
+    // reads as "no data" instead of as a stale sample from 5 minutes ago.
+    int seriesCap;
+    long[] sSec;                   // the second this slot holds (-1 = empty)
+    int[] sReq;
+    int[] sErr;
+    long[] sTotalMs;
+    long[] sMaxMs;
+    int[] sQuery;
+    long[] sQueryMs;
+    int[] sCpu;                    // process CPU% at that second (-1 unknown)
+    long[] sRss;                   // resident bytes at that second (-1 unknown)
+    int[] sHist;                   // seriesCap * HIST_BINS latency histogram
+    long seriesLastWall;           // CPU%-per-bucket delta state, kept apart
+    long seriesLastCpu;            // from the snapshot's own delta state
+
     ServerMetrics() {
         this.reqCount = 0;
         this.reqErrors = 0;
@@ -135,6 +155,83 @@ class ServerMetrics {
         this.lastWallMs = this.startMillis;
         this.lastCpuMs = 0;
         this.ringCap = 32;
+
+        this.seriesCap = 300;      // five minutes of one-second buckets
+        this.sSec = new long[this.seriesCap];
+        this.sReq = new int[this.seriesCap];
+        this.sErr = new int[this.seriesCap];
+        this.sTotalMs = new long[this.seriesCap];
+        this.sMaxMs = new long[this.seriesCap];
+        this.sQuery = new int[this.seriesCap];
+        this.sQueryMs = new long[this.seriesCap];
+        this.sCpu = new int[this.seriesCap];
+        this.sRss = new long[this.seriesCap];
+        this.sHist = new int[this.seriesCap * ServerMetrics.HIST_BINS];
+        for (int i = 0; i < this.seriesCap; i = i + 1) { this.sSec[i] = 0 - 1; }
+        this.seriesLastWall = this.startMillis;
+        this.seriesLastCpu = 0;
+    }
+
+    // Latency histogram edges in ms. Fixed buckets are what make a percentile
+    // affordable: one increment per request, no sorting and no sample retention.
+    static const int HIST_BINS = 13;
+    static long HistEdge(int bin) {
+        if (bin == 0) { return 1; }
+        if (bin == 1) { return 2; }
+        if (bin == 2) { return 5; }
+        if (bin == 3) { return 10; }
+        if (bin == 4) { return 20; }
+        if (bin == 5) { return 50; }
+        if (bin == 6) { return 100; }
+        if (bin == 7) { return 200; }
+        if (bin == 8) { return 500; }
+        if (bin == 9) { return 1000; }
+        if (bin == 10) { return 2000; }
+        if (bin == 11) { return 5000; }
+        return 9223372036854775807;
+    }
+
+    static int HistBin(long ms) {
+        int b = 0;
+        while (b < ServerMetrics.HIST_BINS - 1) {
+            if (ms <= ServerMetrics.HistEdge(b)) { return b; }
+            b = b + 1;
+        }
+        return ServerMetrics.HIST_BINS - 1;
+    }
+
+    /// <summary>The bucket for `sec`, cleared and CPU/RSS-sampled if this is the
+    /// first write to it. Sampling here (rather than on a timer) keeps the
+    /// series free of a background coroutine: a second with no traffic has
+    /// nothing worth plotting anyway, and SeriesJson fills those gaps.</summary>
+    int SeriesSlot(long sec) {
+        int idx = (int)(sec % (long)this.seriesCap);
+        if (this.sSec[idx] == sec) { return idx; }
+        this.sSec[idx] = sec;
+        this.sReq[idx] = 0;
+        this.sErr[idx] = 0;
+        this.sTotalMs[idx] = 0;
+        this.sMaxMs[idx] = 0;
+        this.sQuery[idx] = 0;
+        this.sQueryMs[idx] = 0;
+        int hbase = idx * ServerMetrics.HIST_BINS;
+        for (int b = 0; b < ServerMetrics.HIST_BINS; b = b + 1) {
+            this.sHist[hbase + b] = 0;
+        }
+        this.sCpu[idx] = 0 - 1;
+        this.sRss[idx] = ServerMetrics.MemoryRssBytes();
+        long cpuMs = ServerMetrics.CpuMillis();
+        long nowWall = sec * 1000;
+        if (cpuMs >= 0) {
+            long dWall = nowWall - this.seriesLastWall;
+            long dCpu = cpuMs - this.seriesLastCpu;
+            if (dWall > 0 && dCpu >= 0) {
+                this.sCpu[idx] = (int)((dCpu * 100) / dWall);
+            }
+            this.seriesLastWall = nowWall;
+            this.seriesLastCpu = cpuMs;
+        }
+        return idx;
     }
 
     // ---- shared singleton ----
@@ -265,6 +362,15 @@ class ServerMetrics {
         this.reqTotalMs = this.reqTotalMs + ms;
         if (ms > this.reqMaxMs) { this.reqMaxMs = ms; }
         if (status >= 500) { this.reqErrors = this.reqErrors + 1; }
+
+        int idx = this.SeriesSlot(ServerMetrics.MonoMillis() / 1000);
+        this.sReq[idx] = this.sReq[idx] + 1;
+        this.sTotalMs[idx] = this.sTotalMs[idx] + ms;
+        if (ms > this.sMaxMs[idx]) { this.sMaxMs[idx] = ms; }
+        if (status >= 500) { this.sErr[idx] = this.sErr[idx] + 1; }
+        int hb = idx * ServerMetrics.HIST_BINS + ServerMetrics.HistBin(ms);
+        this.sHist[hb] = this.sHist[hb] + 1;
+
         if (ms >= this.slowReqMs) {
             this.slowReqs.Add(new SlowEntry(method + " " + path + " -> " + Convert.ToString(status), ms));
             if (this.slowReqs.Count > this.ringCap) {
@@ -278,6 +384,11 @@ class ServerMetrics {
         this.queryCount = this.queryCount + 1;
         this.queryTotalMs = this.queryTotalMs + ms;
         if (ms > this.queryMaxMs) { this.queryMaxMs = ms; }
+
+        int idx = this.SeriesSlot(ServerMetrics.MonoMillis() / 1000);
+        this.sQuery[idx] = this.sQuery[idx] + 1;
+        this.sQueryMs[idx] = this.sQueryMs[idx] + ms;
+
         if (ms >= this.slowQueryMs) {
             string q = sql;
             if (q.Length > 200) { q = q.Substring(0, 200); }
@@ -308,6 +419,108 @@ class ServerMetrics {
             outp.Add(o);
         }
         return outp;
+    }
+
+    /// <summary>Estimated latency percentile (0-100) for one bucket, read off
+    /// the fixed histogram: the upper edge of the bin the rank falls in, which
+    /// is an upper bound on the true value rather than an interpolation that
+    /// would read more precise than the data is.</summary>
+    long SeriesPercentile(int idx, int pct) {
+        int hbase = idx * ServerMetrics.HIST_BINS;
+        long total = 0;
+        for (int b = 0; b < ServerMetrics.HIST_BINS; b = b + 1) {
+            total = total + this.sHist[hbase + b];
+        }
+        if (total == 0) { return 0; }
+        // Rank rounded UP: the 95th percentile of three samples is the third
+        // one, not the second, and rounding down would report the fast case as
+        // the tail.
+        long want = (total * (long)pct + 99) / 100;
+        if (want < 1) { want = 1; }
+        if (want > total) { want = total; }
+        long seen = 0;
+        for (int b = 0; b < ServerMetrics.HIST_BINS; b = b + 1) {
+            seen = seen + this.sHist[hbase + b];
+            if (seen >= want) {
+                if (b == ServerMetrics.HIST_BINS - 1) { return this.sMaxMs[idx]; }
+                long edge = ServerMetrics.HistEdge(b);
+                // The bin's upper edge can exceed everything actually observed;
+                // reporting a p95 above the maximum would be nonsense on a chart.
+                if (edge > this.sMaxMs[idx]) { return this.sMaxMs[idx]; }
+                return edge;
+            }
+        }
+        return this.sMaxMs[idx];
+    }
+
+    /// <summary>The last `seconds` one-second buckets as JSON, oldest first, for
+    /// plotting. Every second in the window is present: a second with no traffic
+    /// is a real zero on the chart, not a missing point that would stretch the
+    /// line across the gap. CPU/RSS carry the last known sample forward, since a
+    /// process that served nothing still occupies memory.
+    ///
+    /// The series is per PROCESS, like every other counter here: with several
+    /// workers each answers for the requests it served.</summary>
+    string SeriesJson(int seconds) {
+        int want = seconds;
+        if (want <= 0) { want = 60; }
+        if (want > this.seriesCap) { want = this.seriesCap; }
+
+        long now = ServerMetrics.MonoMillis() / 1000;
+        long from = now - (long)want + 1;
+        int lastCpu = 0 - 1;
+        long lastRss = 0 - 1;
+
+        StringBuilder sb = new StringBuilder();
+        sb.Append("{\"step_ms\":1000,\"count\":");
+        sb.Append(Convert.ToString(want));
+        sb.Append(",\"points\":[");
+        for (long sec = from; sec <= now; sec = sec + 1) {
+            if (sec > from) { sb.Append(","); }
+            int idx = (int)(sec % (long)this.seriesCap);
+            bool live = this.sSec[idx] == sec;
+            long req = 0;
+            long err = 0;
+            long avg = 0;
+            long p95 = 0;
+            long max = 0;
+            long q = 0;
+            long qavg = 0;
+            if (live) {
+                req = this.sReq[idx];
+                err = this.sErr[idx];
+                if (this.sReq[idx] > 0) { avg = this.sTotalMs[idx] / this.sReq[idx]; }
+                p95 = this.SeriesPercentile(idx, 95);
+                max = this.sMaxMs[idx];
+                q = this.sQuery[idx];
+                if (this.sQuery[idx] > 0) { qavg = this.sQueryMs[idx] / this.sQuery[idx]; }
+                if (this.sCpu[idx] >= 0) { lastCpu = this.sCpu[idx]; }
+                if (this.sRss[idx] >= 0) { lastRss = this.sRss[idx]; }
+            }
+            sb.Append("{\"t\":");
+            sb.Append(Convert.ToString(sec - now));      // seconds ago, 0 = now
+            sb.Append(",\"req\":");
+            sb.Append(Convert.ToString(req));
+            sb.Append(",\"err\":");
+            sb.Append(Convert.ToString(err));
+            sb.Append(",\"avg_ms\":");
+            sb.Append(Convert.ToString(avg));
+            sb.Append(",\"p95_ms\":");
+            sb.Append(Convert.ToString(p95));
+            sb.Append(",\"max_ms\":");
+            sb.Append(Convert.ToString(max));
+            sb.Append(",\"queries\":");
+            sb.Append(Convert.ToString(q));
+            sb.Append(",\"query_avg_ms\":");
+            sb.Append(Convert.ToString(qavg));
+            sb.Append(",\"cpu_percent\":");
+            sb.Append(Convert.ToString(lastCpu));
+            sb.Append(",\"mem_rss_bytes\":");
+            sb.Append(Convert.ToString(lastRss));
+            sb.Append("}");
+        }
+        sb.Append("]}");
+        return sb.ToString();
     }
 
     /// <summary>Full metrics snapshot as JSON. Recomputes CPU% from the delta

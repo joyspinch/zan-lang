@@ -1,0 +1,75 @@
+// Per-second metric buckets: what a chart needs is the recent shape of the
+// load, so the aggregator keeps a ring of one-second buckets (requests, errors,
+// average and p95 latency, queries) recorded on the request path itself -- no
+// sampling coroutine, constant memory, and every second in the window present so
+// an idle second plots as a real zero instead of a gap.
+using System;
+using System.Diagnostics;
+using System.Json;
+
+class Program {
+    static void Main() {
+        ServerMetrics m = ServerMetrics.Global();
+        m.RecordRequest("GET", "/fast", 200, 3);
+        m.RecordRequest("GET", "/mid", 200, 40);
+        m.RecordRequest("GET", "/slow", 500, 900);
+        m.RecordQuery("select 1", 6);
+        m.RecordQuery("select 2", 8);
+
+        JsonValue s = JsonValue.ParseLenient(m.SeriesJson(5));
+        Console.WriteLine("step " + Convert.ToString(s.Long("step_ms", 0)));
+        Console.WriteLine("count " + Convert.ToString(s.Long("count", 0)));
+
+        JsonValue pts = s.Get("points");
+        Console.WriteLine("points " + Convert.ToString(pts.Count()));
+
+        // Oldest first, and the offsets are seconds ago: the newest point is 0.
+        Console.WriteLine("first t " + Convert.ToString(pts.At(0).Long("t", 1)));
+        Console.WriteLine("last t "
+            + Convert.ToString(pts.At(pts.Count() - 1).Long("t", 1)));
+
+        // Summed over the window rather than read off the newest bucket: the
+        // recordings above may straddle a second boundary, and the totals are
+        // what the window is for.
+        long req = 0;
+        long err = 0;
+        long queries = 0;
+        long max = 0;
+        long p95 = 0;
+        long idleSeconds = 0;
+        for (int i = 0; i < pts.Count(); i = i + 1) {
+            JsonValue p = pts.At(i);
+            req = req + p.Long("req", 0);
+            err = err + p.Long("err", 0);
+            queries = queries + p.Long("queries", 0);
+            if (p.Long("max_ms", 0) > max) { max = p.Long("max_ms", 0); }
+            if (p.Long("p95_ms", 0) > p95) { p95 = p.Long("p95_ms", 0); }
+            // An idle second is a real zero, not a missing point.
+            if (p.Long("req", 0) == 0 && p.Long("avg_ms", -1) == 0) {
+                idleSeconds = idleSeconds + 1;
+            }
+        }
+        Console.WriteLine("req " + Convert.ToString(req)
+            + " err " + Convert.ToString(err)
+            + " queries " + Convert.ToString(queries)
+            + " max " + Convert.ToString(max));
+
+        // The p95 is read off a fixed histogram, so it is an upper bound that
+        // still can never exceed the maximum actually observed.
+        Console.WriteLine("p95 <= max " + Convert.ToString(p95 <= max));
+        Console.WriteLine("idle seconds " + Convert.ToString(idleSeconds >= 3));
+
+        // A window longer than the ring is clamped to what the ring can hold.
+        JsonValue big = JsonValue.ParseLenient(m.SeriesJson(100000));
+        Console.WriteLine("clamped " + Convert.ToString(big.Long("count", 0)));
+
+        // On Linux these come from /proc, which reports no size at all: reading
+        // such a file must drain it rather than trust the reported length.
+        #if LINUX
+        Console.WriteLine("rss>0 " + Convert.ToString(
+            ServerMetrics.MemoryRssBytes() > 0));
+        Console.WriteLine("cpu>=0 " + Convert.ToString(
+            ServerMetrics.CpuMillis() >= 0));
+        #endif
+    }
+}
