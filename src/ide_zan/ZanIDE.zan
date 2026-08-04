@@ -2881,9 +2881,18 @@ partial class ZanIDE {
                 // scrolls inside a 30px slot. The other panels below keep the
                 // one-line row height.
                 int aiInH = app.Scale(76);
+                // Team mode adds a slim cue row above the prompt that names the
+                // member the message is about to go to. Reserving it here (not
+                // painting it over the transcript) is what keeps the strip, the
+                // transcript and the composer from overlapping.
+                int aiCueH = 0;
+                if (aiTeamMode) {
+                    aiCueH = Tag.Height(app, "") + app.Scale(4);
+                }
                 int aiInY = rp.y + rp.height - aiInH - rPad;
+                int aiCueY = aiInY - aiCueH;
                 Rect rBody = Rect.Create(rp.x, rp.y, rp.width,
-                    rp.height - aiInH - rPad * 2);
+                    rp.height - aiInH - aiCueH - rPad * 2);
                 int rInY = rp.y + rp.height - rInH - rPad;
                 int rBtnW = app.Scale(56);
                 int rInW = rp.width - rPad * 3 - rBtnW;
@@ -3013,7 +3022,7 @@ partial class ZanIDE {
                     // always one click away and the panel always says which one
                     // it is in.
                     int aiTeamH = TeamBoard.Height(app, aiTeamMode,
-                        aiTeamOpen.Get() == 1, aiTasks.Count);
+                        aiTeamOpen.Get() == 1, aiTasks.Count, rBody.width);
                     bool aiTeamWas = aiTeamMode;
                     aiTeamMode = TeamBoard.Render(app,
                         Rect.Create(rBody.x, rBody.y + aiHdrH, rBody.width,
@@ -3038,7 +3047,7 @@ partial class ZanIDE {
                             string tail = "";
                             if (curm != "" && !curm.EndsWith(" ")) { tail = " "; }
                             aiInput.SetText(curm + tail + "@"
-                                + AiTeam.DisplayName(TeamBoard.clicked) + " ");
+                                + AiTeam.MentionToken(TeamBoard.clicked) + " ");
                         }
                         app.RequestRedraw();
                     }
@@ -3179,7 +3188,57 @@ partial class ZanIDE {
                         : ZanIDE.T("Auto: off", "自动:关");
                     aiAutoBtn.Class = aiAutoExec ? "primary small" : "small";
                     int aiAutoW = app.Scale(84);
-                    int aiAutoId = aiAutoBtn.Render(app, rp.x + rPad, aiInY, aiAutoW);
+                    // The prompt box is three rows tall and the buttons beside it
+                    // are one, so they are centred on it: top-aligning a 30px
+                    // button against a 76px box is the misalignment the user saw
+                    // along the bottom of the panel.
+                    int aiBtnH = aiAutoBtn.AutoHeight(app);
+                    int aiBtnY = aiInY + (aiInH - aiBtnH) / 2;
+                    // Narrow panel: the toggle gives up its label width before it
+                    // starts pushing the prompt box off the right edge.
+                    if (aiAutoW > rInW - app.Scale(60)) {
+                        aiAutoW = rInW - app.Scale(60);
+                        if (aiAutoW < app.Scale(30)) { aiAutoW = app.Scale(30); }
+                        aiAutoBtn.Text = aiAutoExec ? ZanIDE.T("A:on", "自:开")
+                            : ZanIDE.T("A:off", "自:关");
+                    }
+                    // Team mode: say who Send will address, resolved by the same
+                    // rule the send uses, so "@ someone" can be trusted before
+                    // pressing Enter instead of after.
+                    if (aiTeamMode && aiCueH > 0) {
+                        string cueTxt = aiInput.GetText();
+                        string cueBad = AiTeam.UnknownMention(cueTxt);
+                        string cueName = "";
+                        string cueCls = "";
+                        if (cueBad != "") {
+                            cueName = "@" + cueBad + " ?";
+                            cueCls = "danger";
+                        } else {
+                            string cueId = AiTeam.RouteUserSt(cueTxt, aiMsgs,
+                                aiTeamSt);
+                            cueName = AiTeam.DisplayName(cueId);
+                            cueCls = AiTeam.RoleTagClass(cueId);
+                        }
+                        string cueLab = ZanIDE.T("Sending to", "将发给");
+                        int cueFs = app.theme.fontSizeSmall;
+                        int cueTx = rp.x + rPad;
+                        app.canvas.DrawStyledText(
+                            Style.Of(app, "label", "hint small", Style.SNormal()),
+                            cueTx,
+                            aiCueY + (aiCueH - Canvas.FontHeight(cueFs)) / 2,
+                            cueLab, app.theme.textTertiary, cueFs);
+                        cueTx = cueTx + Canvas.MeasureText(cueLab, cueFs)
+                            + app.Scale(6);
+                        if (cueName != ""
+                            && cueTx + Tag.Width(app, cueName, cueCls)
+                                <= rp.x + rp.width - rPad) {
+                            Tag.Chip(app, cueTx,
+                                aiCueY + (aiCueH - Tag.Height(app, cueCls)) / 2,
+                                cueName, cueCls);
+                        }
+                    }
+                    int aiAutoId = aiAutoBtn.Render(app, rp.x + rPad, aiBtnY,
+                        aiAutoW);
                     // What the toggle actually decides is who gets to run the
                     // action tools, so say that instead of leaving an
                     // unexplained "Auto" in front of the prompt.
@@ -3196,9 +3255,9 @@ partial class ZanIDE {
                         + "开：助手自行修改、构建、运行，并按任务计划持续推进。");
                     if (app.mouseX >= rp.x + rPad
                         && app.mouseX <= rp.x + rPad + aiAutoW
-                        && app.mouseY >= aiInY && app.mouseY <= aiInY + rInH) {
-                        Tooltip.RequestBox(app, rp.x + rPad, aiInY, aiAutoW,
-                            rInH, aiAutoTip, Tooltip.Top(), app.Scale(320));
+                        && app.mouseY >= aiBtnY && app.mouseY <= aiBtnY + aiBtnH) {
+                        Tooltip.RequestBox(app, rp.x + rPad, aiBtnY, aiAutoW,
+                            aiBtnH, aiAutoTip, Tooltip.Top(), app.Scale(320));
                     }
                     if (Ui.Clicked(app, aiAutoId)) {
                         aiAutoExec = !aiAutoExec;
@@ -3210,13 +3269,19 @@ partial class ZanIDE {
                         // something else). Nothing ran while it waited here.
                         string pdesc = ZanIDE.T("Run ", "执行 ")
                             + AiAgent.Describe(aiPendingCall) + " ?";
-                        if (pdesc.Length > 44) { pdesc = pdesc.Substring(0, 44) + "..."; }
-                        app.canvas.DrawText(rp.x + rPad * 2 + aiAutoW, aiInY + app.Scale(8),
-                            pdesc, app.theme.textPrimary, app.theme.fontSizeSmall);
+                        int pdW = rp.width - rPad * 4 - aiAutoW - rBtnW * 2;
+                        if (pdW < app.Scale(40)) { pdW = app.Scale(40); }
+                        pdesc = Ellipsis.Fit(pdesc, pdW, app.theme.fontSizeSmall);
+                        app.canvas.DrawText(rp.x + rPad * 2 + aiAutoW,
+                            aiBtnY + (aiBtnH
+                                - Canvas.FontHeight(app.theme.fontSizeSmall)) / 2,
+                            pdesc, app.theme.textPrimary,
+                            app.theme.fontSizeSmall);
                         int rjId = aiRejectBtn.Render(app,
-                            rp.x + rp.width - rBtnW * 2 - rPad * 2, aiInY, rBtnW);
+                            rp.x + rp.width - rBtnW * 2 - rPad * 2, aiBtnY,
+                            rBtnW);
                         int apId = aiApproveBtn.Render(app,
-                            rp.x + rp.width - rBtnW - rPad, aiInY, rBtnW);
+                            rp.x + rp.width - rBtnW - rPad, aiBtnY, rBtnW);
                         if (Ui.Clicked(app, apId)) {
                             string capC = aiPendingCall;
                             aiPendingCall = "";
@@ -3275,7 +3340,7 @@ partial class ZanIDE {
                     // is going the wrong way can be interrupted.
                     if (aiBusy.Get() != 0) {
                         int stopId = aiStopBtn.Render(app,
-                            rp.x + rPad * 2 + rInW, aiInY, rBtnW);
+                            rp.x + rPad * 2 + rInW, aiBtnY, rBtnW);
                         if (Ui.Clicked(app, stopId)) {
                             ZanIDE.AiCancelRequest();
                             aiBusy.Set(0);
@@ -3293,7 +3358,7 @@ partial class ZanIDE {
                     int sendId = 0 - 1;
                     if (aiBusy.Get() == 0) {
                         sendId = aiSendBtn.Render(app,
-                            rp.x + rPad * 2 + rInW, aiInY, rBtnW);
+                            rp.x + rPad * 2 + rInW, aiBtnY, rBtnW);
                     }
                     bool doSend = sendId >= 0 && Ui.Clicked(app, sendId);
                     // Enter sends, Shift+Enter is a newline. The box handles
@@ -3319,19 +3384,33 @@ partial class ZanIDE {
                     if (doSend && aiBusy.Get() == 0) {
                         string q = AiAgent.Trim(aiInput.GetText());
                         aiInput.SetText("");
+                        // An @name that is nobody on the team is a typo, and
+                        // delivering the message to the default recipient
+                        // instead is how a question reached the wrong member
+                        // silently. Say so and keep the text so it can be fixed.
+                        string badAt = "";
+                        if (aiTeamMode && q != "") {
+                            badAt = AiTeam.UnknownMention(q);
+                        }
+                        if (badAt != "") {
+                            aiInput.SetText(q);
+                            aiMsgs.Add(AiChatMsg.Create("error", ZanIDE.T(
+                                "[error] Nobody on the team is called @" + badAt
+                                    + ". Members: " + AiTeam.NameList() + ".",
+                                "[错误] 团队里没有 @" + badAt + " 这个成员。可用成员："
+                                    + AiTeam.NameList() + "。")));
+                            aiScroll.Set(0);
+                            q = "";
+                        }
                         if (q != "") {
-                            // Team mode: an explicit @name wins, else the member
-                            // that spoke last, else the product manager -- and a
-                            // parked question is answered by whoever asked it, so
-                            // "continue" resumes the stage it stopped in instead
-                            // of restarting the pipeline.
+                            // Team mode: an explicit @name is an address and
+                            // wins; without one a parked question is answered by
+                            // whoever asked it, so "continue" resumes the stage
+                            // it stopped in instead of restarting the pipeline,
+                            // and otherwise the member that spoke last takes it.
                             string tgt = "";
                             if (aiTeamMode) {
-                                if (aiTeamSt.awaitingUser) {
-                                    tgt = AiTeam.ResumeTarget(aiTeamSt);
-                                } else {
-                                    tgt = AiTeam.RouteUser(q, aiMsgs);
-                                }
+                                tgt = AiTeam.RouteUserSt(q, aiMsgs, aiTeamSt);
                                 aiTeamSt.awaitingUser = false;
                                 aiTeamSt.askedBy = "";
                             }

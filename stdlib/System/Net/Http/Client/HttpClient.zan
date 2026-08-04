@@ -626,16 +626,25 @@ class HttpClient {
         string headOnly = head.Substring(0, hb);
         int status = HttpClient.HeadStatus(headOnly);
         bool chunked = HttpClient.HeadIsChunked(headOnly);
+        int bodyLen = HttpClient.HeaderInt(headOnly, "content-length");
         string pending = head.Substring(hb + 4, head.Length - hb - 4);
         head = "";
         headOnly = "";
 
+        // A refused request (401 wrong key, 400 bad model, 404 wrong base URL,
+        // 429 over quota) answers with a short JSON body explaining itself.
+        // That body is the whole diagnosis, so it is kept here and reported in
+        // the outcome marker instead of being streamed into the sink as if it
+        // were an answer.
+        bool failed = status >= 400;
+        string errBody = "";
+        int got = 0;
         bool finished = false;
-        // A stream only counts as done when the peer said so: the [DONE] sentinel
-        // (or, for chunked replies, the terminating zero-size chunk). A 0-byte
-        // read means the connection dropped mid-stream -- the model may have
-        // been cut off before finishing -- so that is a retryable failure, not
-        // a success, and the caller (AiNet.Worker) will retry it.
+        // A stream counts as done when the peer said so: the [DONE] sentinel,
+        // the terminating zero-size chunk, an announced Content-Length that is
+        // fully in, or (below) an ending on an SSE event boundary. A 0-byte
+        // read with none of those means the connection dropped mid-stream --
+        // the model may have been cut off -- which is a retryable failure.
         bool cleanEnd = false;
         string doneScan = "";
         bool sawDone = false;
@@ -657,7 +666,9 @@ class HttpClient {
                             int need = crlf + 2 + size + 2;
                             if (pending.Length >= need) {
                                 string piece = pending.Substring(crlf + 2, size);
-                                sink.Write(piece);
+                                got = got + piece.Length;
+                                if (failed) { errBody = HttpClient.KeepHead(errBody, piece); }
+                                else { sink.Write(piece); }
                                 doneScan = doneScan + piece;
                                 if (doneScan.Length > 64) {
                                     doneScan = doneScan.Substring(doneScan.Length - 64, 64);
@@ -673,7 +684,9 @@ class HttpClient {
                 }
             } else {
                 if (pending.Length > 0) {
-                    sink.Write(pending);
+                    got = got + pending.Length;
+                    if (failed) { errBody = HttpClient.KeepHead(errBody, pending); }
+                    else { sink.Write(pending); }
                     doneScan = doneScan + pending;
                     if (doneScan.Length > 64) {
                         doneScan = doneScan.Substring(doneScan.Length - 64, 64);
@@ -683,6 +696,11 @@ class HttpClient {
                     }
                     pending = "";
                 }
+                // A body whose length the peer announced is complete once that
+                // many bytes arrived -- true for every non-streamed reply,
+                // including an error object -- so waiting for a [DONE] that
+                // will never come is not an incomplete stream.
+                if (bodyLen > 0 && got >= bodyLen) { finished = true; cleanEnd = true; }
             }
             if (sawDone) { finished = true; cleanEnd = true; }
             if (finished) {
@@ -712,20 +730,72 @@ class HttpClient {
             conn.Close();
         }
 
-        if (late) {
+        // A stream that ended on an event boundary (the blank line that closes
+        // an SSE event) delivered whole events: providers that never send the
+        // [DONE] sentinel -- and local OpenAI-compatible servers -- end exactly
+        // like this, and calling that a cut-off connection turned every one of
+        // their replies into a failed, retried request.
+        if (!cleanEnd && status >= 200 && status < 300 && got > 0
+            && HttpClient.EndsWithStr(doneScan, "\n\n")) {
+            cleanEnd = true;
+        }
+
+        // The status decides the outcome first: a refusal is not a transport
+        // problem, and reporting it as one ("connection closed") both hid the
+        // provider's message and made the caller retry a request that can only
+        // fail again.
+        if (status >= 400) {
+            string detail = HttpClient.OneLine(errBody);
+            string marker = "err: HTTP " + Convert.ToString(status);
+            if (detail != "") { marker = marker + ": " + detail; }
+            sink.Finish(marker);
+        } else if (late) {
             sink.Finish("err: timeout");
+        } else if (status == 0) {
+            sink.Finish("err: no response");
         } else if (!cleanEnd) {
             // The peer closed before the terminal chunk: the stream was cut
             // off, so surface it as a retryable failure instead of a success.
             sink.Finish("err: connection closed");
         } else if (status >= 200 && status < 300) {
             sink.Finish("ok");
-        } else if (status == 0) {
-            sink.Finish("err: no response");
         } else {
             sink.Finish("err: HTTP " + Convert.ToString(status));
         }
         return 0;
+    }
+
+    // Appends `piece` to `acc` while `acc` is under 512 bytes: enough of an
+    // error body to name the cause, bounded so a peer that streams megabytes
+    // of it cannot grow the buffer.
+    static string KeepHead(string acc, string piece) {
+        if (acc.Length >= 512) { return acc; }
+        return acc + piece;
+    }
+
+    // True when `s` ends with `suf` (byte compare).
+    static bool EndsWithStr(string s, string suf) {
+        if (s.Length < suf.Length) { return false; }
+        return s.Substring(s.Length - suf.Length, suf.Length) == suf;
+    }
+
+    // Collapses whitespace runs so a JSON error body fits one status line, and
+    // caps the result at 300 bytes.
+    static string OneLine(string s) {
+        StringBuilder sb = new StringBuilder();
+        bool sp = false;
+        for (int i = 0; i < s.Length; i = i + 1) {
+            int ch = s[i] & 255;
+            if (ch == 10 || ch == 13 || ch == 9 || ch == 32) {
+                sp = true;
+            } else {
+                if (sp && sb.Length > 0) { sb.Append(" "); }
+                sp = false;
+                sb.Append(s.Substring(i, 1));
+            }
+            if (sb.Length >= 300) { break; }
+        }
+        return sb.ToString();
     }
 
     // True when the final bytes of `s` equal `suf` (ASCII case-insensitive).

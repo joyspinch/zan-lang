@@ -20,39 +20,75 @@ using System.Net.Http.Client;
 /// scheduler and reactor state a request touches belong to the thread that
 /// drives them.
 class AiNet {
-    static string sHost;
-    static int sPort;
-    static bool sTls;
-    static bool sVerify;
-    static string sPath;
-    static string sKey;
-    static string sBody;
-    static int sTimeout;
+    /// The request the panel is reading. Dropped (null) by a cancel: an
+    /// abandoned worker keeps writing into the sink it captured, which nobody
+    /// reads any more.
+    static AiReq sCur;
 
-    /// The sink of the request in flight. Replaced by every new request and
-    /// dropped (set to null) by a cancel: the worker of an abandoned request
-    /// keeps writing into the sink object it captured, which nobody reads any
-    /// more, so a late chunk or a late error can never land in the answer to
-    /// the next question.
-    static SseSink sSink;
+    /// Bumped by every Start and every Abandon, so a worker can tell whether
+    /// it is still the request the panel cares about before it retries.
+    static int sGen;
 
-    /// The sink the worker thread streams into (captured before the GUI can
-    /// replace `sSink`).
-    static SseSink sWorkerSink;
+    /// Requests handed to a worker that has not claimed one yet, and the lock
+    /// that guards the list. A thread body must not capture (Thread.Start takes
+    /// a non-capturing delegate), so the request travels through this queue
+    /// instead of through shared request fields: every Start pushes exactly one
+    /// request and starts exactly one worker, so each worker claims a distinct
+    /// request object and two overlapping requests cannot end up driving the
+    /// same URL, body, key or sink.
+    static List<AiReq> sPend;
+    #if WINDOWS
+    static nint sLock;
+    #else
+    static string sLock;
+    #endif
 
-    /// The request itself: builds the client from the shared fields and
-    /// streams the response into the worker's sink.
-    static async int RunReq() {
+    static void EnsureQueue() {
+        if (AiNet.sPend == null) {
+            AiNet.sPend = new List<AiReq>();
+            AiNet.sLock = Mutex.Create();
+        }
+    }
+
+    static void Push(AiReq rq) {
+        AiNet.EnsureQueue();
+        Mutex.Lock(AiNet.sLock);
+        AiNet.sPend.Add(rq);
+        Mutex.Unlock(AiNet.sLock);
+    }
+
+    /// Claims one queued request, or null when another worker already took it.
+    static AiReq Take() {
+        AiNet.EnsureQueue();
+        Mutex.Lock(AiNet.sLock);
+        AiReq rq = null;
+        if (AiNet.sPend.Count > 0) {
+            rq = AiNet.sPend[0];
+            AiNet.sPend.RemoveAt(0);
+        }
+        Mutex.Unlock(AiNet.sLock);
+        return rq;
+    }
+
+    /// The worker thread's entry point: claim a request and drive it.
+    static void Worker() {
+        AiReq rq = AiNet.Take();
+        if (rq == null) { return; }
+        AiNet.Drive(rq);
+    }
+
+    /// The request itself: builds the client from its own snapshot and streams
+    /// the response into its own sink.
+    static async int RunReq(AiReq rq) {
         HttpClient cli;
-        if (AiNet.sTls) { cli = HttpClient.CreateHttps(AiNet.sHost, AiNet.sPort); }
-        else { cli = HttpClient.Create(AiNet.sHost, AiNet.sPort); }
-        if (!AiNet.sVerify) { cli.DisableTlsVerify(); }
-        if (AiNet.sKey != "") { cli.SetHeader("Authorization", "Bearer " + AiNet.sKey); }
+        if (rq.tls) { cli = HttpClient.CreateHttps(rq.host, rq.port); }
+        else { cli = HttpClient.Create(rq.host, rq.port); }
+        if (!rq.verify) { cli.DisableTlsVerify(); }
+        if (rq.key != "") { cli.SetHeader("Authorization", "Bearer " + rq.key); }
         cli.SetHeader("Content-Type", "application/json");
         cli.SetHeader("Accept", "text/event-stream");
-        cli.SetTimeout(AiNet.sTimeout);
-        int rr = await cli.PostSseToSinkAsync(AiNet.sPath, AiNet.sBody,
-                                              AiNet.sWorkerSink);
+        cli.SetTimeout(rq.timeout);
+        int rr = await cli.PostSseToSinkAsync(rq.path, rq.body, rq.sink);
         return rr;
     }
 
@@ -67,25 +103,46 @@ class AiNet {
         return a + 2 <= s.Length && s.Substring(a, 2) == "ok";
     }
 
+    /// True when a failed attempt is worth repeating: a dropped connection, a
+    /// timeout, a rate limit or a gateway error. A refusal the provider
+    /// explained (a wrong key, an unknown model, a body it rejected) answers
+    /// the same way every time, so resending it only delays the message the
+    /// user needs to see by the whole backoff.
+    static bool Retryable(string marker) {
+        if (AiNet.Has(marker, "HTTP 5")) { return true; }
+        if (AiNet.Has(marker, "HTTP 429")) { return true; }
+        if (AiNet.Has(marker, "HTTP 408")) { return true; }
+        if (AiNet.Has(marker, "HTTP ")) { return false; }
+        return true;
+    }
+
+    static bool Has(string s, string sub) {
+        if (sub.Length == 0 || s.Length < sub.Length) { return false; }
+        for (int i = 0; i + sub.Length <= s.Length; i = i + 1) {
+            if (s.Substring(i, sub.Length) == sub) { return true; }
+        }
+        return false;
+    }
+
     /// Drives the request to completion on its own OS thread, retrying
     /// transient failures. The thread's coroutine scheduler pumps every
     /// `await` (connect / recv) until the stream ends. Only the final outcome
     /// is published, so the GUI never sees a mid-retry error and a dropped
-    /// connection recovers on its own. Up to 4 attempts (3 retries) with a
+    /// connection recovers on its own. Up to 3 attempts (2 retries) with a
     /// growing backoff.
-    static void Worker() {
+    static void Drive(AiReq rq) {
         Socket.Initialize();
-        SseSink sink = AiNet.sWorkerSink;
+        SseSink sink = rq.sink;
         int attempt = 0;
         string last = "";
-        while (attempt < 4) {
+        while (attempt < 3) {
             last = "";
             // A throw anywhere in the transport (DNS, TLS, a closed socket)
             // must still end as a marker: without this the worker dies
             // silently and the panel waits out its whole backstop before
             // reporting a timeout that was really a connect error.
             try {
-                int _r = await AiNet.RunReq();
+                int _r = await AiNet.RunReq(rq);
             } catch (Exception ex) {
                 last = "err: " + ex.Message;
             }
@@ -94,19 +151,27 @@ class AiNet {
                 sink.Publish("ok");
                 return;
             }
+            if (!AiNet.Retryable(last)) {
+                sink.Publish(last);
+                return;
+            }
             attempt = attempt + 1;
-            // Backoff 1s / 2s / 3s between retries: enough for a dropped
+            // Nobody is reading this sink any more (stopped, or superseded by
+            // the next question): stop instead of spending a backoff and
+            // another provider call on an answer that is already gone.
+            if (rq.gen != AiNet.sGen) { return; }
+            // Backoff 1s / 2s between retries: enough for a dropped
             // connection to recover, short enough to not stall the reply.
-            if (attempt < 4) { Thread.Sleep(1000 * attempt); }
+            if (attempt < 3) { Thread.Sleep(1000 * attempt); }
         }
         string msg = last;
         if (msg == "") { msg = "err: request failed"; }
         sink.Publish(msg);
     }
 
-    /// Parses `baseUrl` (scheme://host[:port][/base]) into the transport
-    /// fields and appends `suffix` (e.g. "/chat/completions") to its path.
-    static void SetUrl(string baseUrl, string suffix) {
+    /// Parses `baseUrl` (scheme://host[:port][/base]) into `rq` and appends
+    /// `suffix` (e.g. "/chat/completions") to its path.
+    static void SetUrl(AiReq rq, string baseUrl, string suffix) {
         string u = baseUrl;
         bool tls = true;
         int defPort = 443;
@@ -134,10 +199,10 @@ class AiNet {
             port = AiNet.ParseInt(hostport.Substring(colon + 1,
                 hostport.Length - colon - 1), defPort);
         }
-        AiNet.sHost = host;
-        AiNet.sPort = port;
-        AiNet.sTls = tls;
-        AiNet.sPath = basePath + suffix;
+        rq.host = host;
+        rq.port = port;
+        rq.tls = tls;
+        rq.path = basePath + suffix;
     }
 
     static int FindByte(string s, int b, int from) {
@@ -166,16 +231,20 @@ class AiNet {
     /// readable error when the thread cannot be started.
     static string Start(string baseUrl, string suffix, string key, string body,
             int timeoutMs, bool verify) {
-        AiNet.SetUrl(baseUrl, suffix);
-        AiNet.sKey = key;
-        AiNet.sBody = body;
-        AiNet.sTimeout = timeoutMs;
-        AiNet.sVerify = verify;
-        SseSink sink = SseSink.ToMemory();
-        AiNet.sSink = sink;
-        AiNet.sWorkerSink = sink;
+        AiReq rq = new AiReq();
+        AiNet.SetUrl(rq, baseUrl, suffix);
+        rq.key = key;
+        rq.body = body;
+        rq.timeout = timeoutMs;
+        rq.verify = verify;
+        rq.sink = SseSink.ToMemory();
+        AiNet.sGen = AiNet.sGen + 1;
+        rq.gen = AiNet.sGen;
+        AiNet.sCur = rq;
+        AiNet.Push(rq);
         if (!Thread.Start(AiNet.Worker)) {
-            AiNet.sSink = null;
+            AiReq _drop = AiNet.Take();
+            AiNet.sCur = null;
             return "could not start the AI request thread.";
         }
         return "";
@@ -184,21 +253,38 @@ class AiNet {
     /// Everything the reply has streamed so far ("" when nothing is in
     /// flight). Safe to call from the GUI thread every frame.
     static string Text() {
-        if (AiNet.sSink == null) { return ""; }
-        return AiNet.sSink.All();
+        if (AiNet.sCur == null) { return ""; }
+        return AiNet.sCur.sink.All();
     }
 
     /// The final outcome of the request in flight ("ok" / "err: ..."), or ""
     /// while it is still streaming.
     static string Done() {
-        if (AiNet.sSink == null) { return ""; }
-        return AiNet.sSink.Done();
+        if (AiNet.sCur == null) { return ""; }
+        return AiNet.sCur.sink.Done();
     }
 
     /// Forgets the request in flight. A worker still running keeps streaming
     /// into the sink it captured; nothing reads it, and it is freed once the
     /// worker returns.
     static void Abandon() {
-        AiNet.sSink = null;
+        AiNet.sCur = null;
+        AiNet.sGen = AiNet.sGen + 1;
     }
+}
+
+/// One AI request: everything the worker thread needs, snapshotted when the
+/// GUI starts it. A request is never edited after it is handed over, so two
+/// requests can overlap without touching each other's URL, body, key or sink.
+class AiReq {
+    string host;
+    int port;
+    bool tls;
+    bool verify;
+    string path;
+    string key;
+    string body;
+    int timeout;
+    SseSink sink;
+    int gen;
 }

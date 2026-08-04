@@ -278,6 +278,15 @@ class AiAgent {
     /// gateway 5xx or a rate limit. The panel retries those on its own instead
     /// of ending the task with an error the user has to restart by hand.
     static bool IsTransient(string msg) {
+        // A refusal the provider spelled out (401 key, 400 body/model, 404 URL,
+        // 413 too large) answers the same way every time. Resending it only
+        // hides the message that tells the user what to fix -- and its text
+        // often contains words like "connection" that would otherwise read as a
+        // transport hiccup here.
+        if (AiAgent.Has(msg, "http 4")
+            && !AiAgent.Has(msg, "http 429") && !AiAgent.Has(msg, "http 408")) {
+            return false;
+        }
         return AiAgent.Has(msg, "timeout") || AiAgent.Has(msg, "timed out")
             || AiAgent.Has(msg, "streamer") || AiAgent.Has(msg, "connect")
             || AiAgent.Has(msg, "connection") || AiAgent.Has(msg, "reset")
@@ -891,56 +900,87 @@ class AiAgent {
                 lineEnd = lineEnd - 1;
             }
             string line = raw.Substring(i, lineEnd - i);
+            // `data:` carries the optional space or not, depending on the
+            // provider; both are the same event.
+            string payload = "";
+            bool isData = false;
             if (line.Length >= 6 && line.Substring(0, 6) == "data: ") {
-                string payload = line.Substring(6, line.Length - 6);
+                payload = line.Substring(6, line.Length - 6);
+                isData = true;
+            } else if (line.Length >= 5 && line.Substring(0, 5) == "data:") {
+                payload = AiAgent.Trim(line.Substring(5, line.Length - 5));
+                isData = true;
+            }
+            if (isData) {
                 if (payload == "[DONE]") {
                     a.done = true;
                 } else {
-                    JsonValue v = JsonValue.ParseLenient(payload);
-                    if (v != null) {
-                        JsonValue err = v.Get("error");
-                        if (err != null && a.error == "") {
-                            a.error = err.Str("message", payload);
-                        }
-                        JsonValue ch = v.Get("choices");
-                        if (ch != null && ch.IsArray() && ch.Count() > 0) {
-                            JsonValue delta = ch.At(0).Get("delta");
-                            if (delta != null) {
-                                c.Append(delta.Str("content", ""));
-                                r.Append(delta.Str("reasoning_content", ""));
-                            }
-                        }
-                        // A usage object (usually the final chunk) carries the
-                        // real token counts for the request.
-                        JsonValue us = v.Get("usage");
-                        if (us != null && us.IsObject()) {
-                            a.promptTokens = us.Int("prompt_tokens", a.promptTokens);
-                            a.completionTokens = us.Int("completion_tokens", a.completionTokens);
-                            a.totalTokens = us.Int("total_tokens", a.totalTokens);
-                            // Prompt tokens served from the provider's cache.
-                            // DeepSeek reports them flat as
-                            // `prompt_cache_hit_tokens`, OpenAI-compatible
-                            // providers nest them under
-                            // `prompt_tokens_details.cached_tokens`; either way
-                            // they are a subset of prompt_tokens, not an extra
-                            // charge, so they are shown as such.
-                            a.cachedTokens = us.Int("prompt_cache_hit_tokens",
-                                a.cachedTokens);
-                            JsonValue pd = us.Get("prompt_tokens_details");
-                            if (pd != null && pd.IsObject()) {
-                                a.cachedTokens = pd.Int("cached_tokens",
-                                    a.cachedTokens);
-                            }
-                        }
-                    }
+                    AiAgent.FoldChunk(a, c, r, JsonValue.ParseLenient(payload),
+                                      payload);
                 }
             }
             if (nl >= n) { break; }
             i = nl + 1;
         }
+        // No event line at all: a provider that answers a stream request with a
+        // plain JSON body (an error object, or a whole non-streamed reply) has
+        // to be understood too, or its explanation is dropped and the panel
+        // reports an empty answer with nothing to act on.
+        string flat = AiAgent.Trim(raw);
+        if (!a.done && a.error == "" && c.Length == 0 && flat.Length > 0
+            && flat.Substring(0, 1) == "{") {
+            AiAgent.FoldChunk(a, c, r, JsonValue.ParseLenient(flat), flat);
+        }
         a.content = c.ToString();
         a.reasoning = r.ToString();
         return a;
+    }
+
+    /// Folds one parsed chunk (a stream event's JSON, or a whole non-streamed
+    /// body) into the answer being assembled. `raw` is the text it came from,
+    /// used as the error message when the provider sent an error object without
+    /// one.
+    static void FoldChunk(SseAnswer a, StringBuilder c, StringBuilder r,
+            JsonValue v, string raw) {
+        if (v == null) { return; }
+        JsonValue err = v.Get("error");
+        if (err != null && a.error == "") {
+            if (err.IsObject()) { a.error = err.Str("message", raw); }
+            else { a.error = err.AsString(raw); }
+        }
+        JsonValue ch = v.Get("choices");
+        if (ch != null && ch.IsArray() && ch.Count() > 0) {
+            JsonValue delta = ch.At(0).Get("delta");
+            if (delta != null) {
+                c.Append(delta.Str("content", ""));
+                r.Append(delta.Str("reasoning_content", ""));
+            } else {
+                // A non-streamed reply carries the whole answer in `message`.
+                JsonValue full = ch.At(0).Get("message");
+                if (full != null) {
+                    c.Append(full.Str("content", ""));
+                    r.Append(full.Str("reasoning_content", ""));
+                }
+            }
+        }
+        // A usage object (usually the final chunk) carries the real token
+        // counts for the request.
+        JsonValue us = v.Get("usage");
+        if (us != null && us.IsObject()) {
+            a.promptTokens = us.Int("prompt_tokens", a.promptTokens);
+            a.completionTokens = us.Int("completion_tokens", a.completionTokens);
+            a.totalTokens = us.Int("total_tokens", a.totalTokens);
+            // Prompt tokens served from the provider's cache. DeepSeek reports
+            // them flat as `prompt_cache_hit_tokens`, OpenAI-compatible
+            // providers nest them under `prompt_tokens_details.cached_tokens`;
+            // either way they are a subset of prompt_tokens, not an extra
+            // charge, so they are shown as such.
+            a.cachedTokens = us.Int("prompt_cache_hit_tokens", a.cachedTokens);
+            JsonValue pd = us.Get("prompt_tokens_details");
+            if (pd != null && pd.IsObject()) {
+                a.cachedTokens = pd.Int("cached_tokens", a.cachedTokens);
+            }
+        }
     }
 
     // --- context compaction --------------------------------------------------

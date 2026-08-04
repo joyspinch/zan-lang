@@ -79,9 +79,10 @@ class ChatSessionsDoc {
 class ChatArea {
     /// One pre-wrapped display row of the chat cache: the text, its colour,
     /// its display kind (0 normal / 1 code / 2 heading / 3 turn header /
-    /// 4 thinking toggle / 5 foldable toggle), the message index a kind-5 row
-    /// toggles (else -1) and the speaker of the message the row belongs to
-    /// (0 you / 1 Xiao Zan / 2 tool / 3 error, used to tint whole blocks).
+    /// 4 thinking toggle / 5 foldable toggle / 6 spacer between turns), the
+    /// message index a kind-5 row toggles (else -1) and the speaker of the
+    /// message the row belongs to (0 you / 1 Xiao Zan / 2 tool / 3 error, used
+    /// to tint whole blocks).
     /// One entity instead of the old parallel lines/colors/kinds/meta/owner
     /// lists, whose index alignment any edit could silently break.
     static class ChatLine {
@@ -485,6 +486,9 @@ class ChatArea {
                     }
                 }
                 ChatArea.OwnRows(cache, msgStart, 2);
+                ChatLine tgap = ChatLine.Create("", t.textTertiary, 6);
+                tgap.owner = 2;
+                cache.Add(tgap);
                 i = i + 1;
                 continue;
             }
@@ -584,10 +588,12 @@ class ChatArea {
             // renderer can paint the whole message as one tinted block.
             int ownCode = ChatArea.RoleCode(msgs[i].role);
             ChatArea.OwnRows(cache, msgStart, ownCode);
-            // No blank row between turns: the per-turn header (kind 3) with its
-            // background band already separates messages, so a trailing blank
-            // row would just add wasted vertical space. Messages stack tightly
-            // like a Devin-style transcript.
+            // One unpainted spacer row closes a turn: with six members talking,
+            // tinted blocks that touch each other read as one wall of text. The
+            // spacer carries no tint and no rail, so the blocks separate.
+            ChatLine gap = ChatLine.Create("", t.textTertiary, 6);
+            gap.owner = ownCode;
+            cache.Add(gap);
             i = i + 1;
         }
         // meta[row] = the message index a kind-5 toggle row controls (else -1).
@@ -633,34 +639,59 @@ class ChatArea {
     static void PaintHeadRow(App app, ChatLine ln, int x, int y, int rowH,
             int rightEdge) {
         int cx = x;
-        // The avatar is sized to the row so the name strip keeps the transcript's
-        // line rhythm instead of pushing turns apart. Size is in CSS px because
-        // Avatar.Diameter scales it itself.
+        // Everything on the name strip is centred on the row with the height the
+        // widgets really have: a chip is theme.heightTiny tall, so laying the
+        // strip out against a shorter guessed row is what pushed the name into
+        // the line below it.
+        int chipH = Tag.Height(app, ln.tagCls);
+        int chipY = y + (rowH - chipH) / 2;
+        if (chipY < y) { chipY = y; }
         Avatar av = ChatArea.HeadAvatar();
         av.Text = ln.ava;
         av.Size = 16;
         av.Class = ln.tagCls;
         int d = av.Diameter(app);
-        av.RenderAt(app, cx, y + app.Scale(1), d);
+        int avY = y + (rowH - d) / 2;
+        if (avY < y) { avY = y; }
+        av.RenderAt(app, cx, avY, d);
         cx = cx + d + app.Scale(5);
         int nameW = Tag.Width(app, ln.text, ln.tagCls);
         if (cx + nameW <= rightEdge) {
-            Tag.Chip(app, cx, y + app.Scale(1), ln.text, ln.tagCls);
+            Tag.Chip(app, cx, chipY, ln.text, ln.tagCls);
             cx = cx + nameW + app.Scale(4);
         }
         if (ln.status != "") {
             int stW = Tag.Width(app, ln.status, "");
             if (cx + stW <= rightEdge) {
-                Tag.Chip(app, cx, y + app.Scale(1), ln.status, "");
+                Tag.Chip(app, cx, chipY, ln.status, "");
                 cx = cx + stW + app.Scale(4);
             }
         }
         if (ln.pct >= 0) {
             string pl = Convert.ToString(ln.pct) + "%";
             if (cx + Tag.Width(app, pl, "primary") <= rightEdge) {
-                Tag.Chip(app, cx, y + app.Scale(1), pl, "primary");
+                Tag.Chip(app, cx, chipY, pl, "primary");
             }
         }
+    }
+
+    /// The transcript's font size, resolved from the same style the rows are
+    /// drawn with so measuring and painting cannot disagree.
+    static int FontPx(App app) {
+        return Style.Of(app, "label", "small", Style.SNormal())
+            .FontOr(app.theme.fontSizeSmall);
+    }
+
+    /// One transcript row's height: a text line plus breathing room, and never
+    /// less than the chips a name row paints. Both halves are why the panel
+    /// looked cramped and misaligned before -- a fixed 18px row is tighter than
+    /// the font's own line box at a large UI scale, and shorter than the Tag it
+    /// had to hold.
+    static int RowH(App app) {
+        int h = Canvas.FontHeight(ChatArea.FontPx(app)) + app.Scale(5);
+        int chip = Tag.Height(app, "") + app.Scale(2);
+        if (h < chip) { h = chip; }
+        return h;
     }
 
     static int RowAtChat(Rect area, int pad, int rowH, int start,
@@ -682,7 +713,10 @@ class ChatArea {
         Canvas c = app.canvas;
         Theme t = app.theme;
         int pad = app.Scale(6);
-        int rowH = app.Scale(18);
+        int rowH = ChatArea.RowH(app);
+        int fontPx = ChatArea.FontPx(app);
+        int textDy = (rowH - Canvas.FontHeight(fontPx)) / 2;
+        if (textDy < 0) { textDy = 0; }
         int extra = 0;
         if (busy) { extra = 1; }
         if (cache.Count == 0 && !busy) {
@@ -803,13 +837,16 @@ class ChatArea {
                     rail = t.error;
                     tint = App.ScaleAlpha(t.error, 30);
                 }
-                c.FillRect(blockX, ry, area.width - pad * 2, rowH, tint);
-                c.FillRect(blockX, ry, barW, rowH, rail);
-                if (cache[idx].kind == 1) {
+                bool spacer = cache[idx].kind == 6;
+                if (!spacer) {
+                    c.FillRect(blockX, ry, area.width - pad * 2, rowH, tint);
+                    c.FillRect(blockX, ry, barW, rowH, rail);
+                }
+                if (!spacer && cache[idx].kind == 1) {
                     c.FillRect(textX - app.Scale(2), ry,
                         textW2 + app.Scale(4), rowH, codeBg);
                 }
-                if (sr0 >= 0 && idx >= sr0 && idx <= sr1) {
+                if (!spacer && sr0 >= 0 && idx >= sr0 && idx <= sr1) {
                     string ln = cache[idx].text;
                     int hs = 0;
                     int he = ln.Length;
@@ -826,7 +863,9 @@ class ChatArea {
                     if (hx1 < hx0 + 2) { hx1 = hx0 + 2; }
                     c.FillRect(hx0, ry, hx1 - hx0, rowH, selCol);
                 }
-                if (cache[idx].kind == 3) {
+                if (spacer) {
+                    // Nothing to paint: the row is the gap between two turns.
+                } else if (cache[idx].kind == 3) {
                     // Name row of a turn, built from the shared widgets rather
                     // than painted here: a round Avatar for the speaker, a Tag
                     // chip for the name, and -- in a team chat -- one more Tag
@@ -836,19 +875,17 @@ class ChatArea {
                     ChatArea.PaintHeadRow(app, cache[idx], textX, ry, rowH,
                         area.x + area.width - pad);
                 } else if (cache[idx].kind == 1) {
-                    app.canvas.DrawText(textX + app.Scale(4), ry, cache[idx].text,
-                        cache[idx].color,
-                        Style.Of(app, "label", "small", Style.SNormal())
-                            .FontOr(app.theme.fontSizeSmall));
+                    app.canvas.DrawText(textX + app.Scale(4), ry + textDy,
+                        cache[idx].text, cache[idx].color, fontPx);
                 } else {
-                    app.canvas.DrawText(textX, ry, cache[idx].text, cache[idx].color,
-                        Style.Of(app, "label", "small", Style.SNormal())
-                            .FontOr(app.theme.fontSizeSmall));
+                    app.canvas.DrawText(textX, ry + textDy, cache[idx].text,
+                        cache[idx].color, fontPx);
                 }
             } else {
                 app.canvas.DrawStyledText(
                     Style.Of(app, "label", "hint small", Style.SNormal()),
-                    area.x + pad, ry, ZanIDE.T("Xiao Zan is thinking...", "小赞思考中..."),
+                    area.x + pad, ry + textDy,
+                    ZanIDE.T("Xiao Zan is thinking...", "小赞思考中..."),
                     app.theme.textPrimary, app.theme.fontSizeMedium);
             }
             idx = idx + 1;

@@ -183,20 +183,39 @@ class AiTeam {
         string low = ZanIDE.ToLowerS(n);
         for (int i = 0; i < rs.Count; i = i + 1) {
             if (low == ZanIDE.ToLowerS(rs[i].en)) { return rs[i].id; }
+            // An @name ends at the first space, so the English titles are also
+            // matched without theirs ("@productmanager"): typing the displayed
+            // "Product Manager" would otherwise resolve nothing and the message
+            // would quietly go to whoever spoke last.
+            if (low == AiTeam.Squash(rs[i].en)) { return rs[i].id; }
             if (low == rs[i].id) { return rs[i].id; }
         }
         // Aliases: the words people use instead of the formal title.
-        if (n == "项目经理" || n == "产品" || low == "pm") { return AiTeam.Pm(); }
-        if (n == "架构" || low == "architect") { return AiTeam.Arch(); }
+        if (n == "项目经理" || n == "产品" || low == "pm"
+            || low == "product") { return AiTeam.Pm(); }
+        if (n == "架构" || low == "architect" || low == "arch") {
+            return AiTeam.Arch();
+        }
         if (n == "开发" || n == "程序员" || low == "dev"
-            || low == "developer") { return AiTeam.Dev(); }
+            || low == "developer" || low == "coder") { return AiTeam.Dev(); }
         if (n == "测试" || low == "qa" || low == "test"
             || low == "tester") { return AiTeam.Qa(); }
-        if (n == "审查" || n == "代码审查" || low == "review"
-            || low == "reviewer") { return AiTeam.Rev(); }
+        if (n == "审查" || n == "代码审查" || n == "评审" || low == "review"
+            || low == "reviewer" || low == "rev") { return AiTeam.Rev(); }
         if (n == "安全" || n == "安全审计" || low == "sec"
-            || low == "security") { return AiTeam.Sec(); }
+            || low == "security" || low == "auditor") { return AiTeam.Sec(); }
         return "";
+    }
+
+    /// A name lowercased with its spaces removed ("Product Manager" ->
+    /// "productmanager").
+    static string Squash(string s) {
+        StringBuilder sb = new StringBuilder();
+        string low = ZanIDE.ToLowerS(s);
+        for (int i = 0; i < low.Length; i = i + 1) {
+            if ((low[i] & 255) != 32) { sb.Append(low.Substring(i, 1)); }
+        }
+        return sb.ToString();
     }
 
     /// The broadcast handle.
@@ -466,6 +485,60 @@ class AiTeam {
         return AiTeam.DefaultRecipient(msgs);
     }
 
+    /// The recipient with the team's state taken into account -- the routing
+    /// the composer shows and the send uses, so what the user is told and what
+    /// happens cannot disagree.
+    ///
+    /// An @name is an address, so it beats everything: a member parked on a
+    /// question used to be handed every following message, which is exactly the
+    /// "@ someone else and the wrong member answers" the user hit. Without an
+    /// @name the parked question is answered by whoever asked it, and otherwise
+    /// the default recipient applies.
+    static string RouteUserSt(string text, List<AiChatMsg> msgs,
+            AiTeamState st) {
+        List<string> ms = AiTeam.ParseMentions(text);
+        if (ms.Count > 0) { return ms[0]; }
+        if (st != null && st.awaitingUser) {
+            string r = AiTeam.ResumeTarget(st);
+            if (r != "") { return r; }
+        }
+        return AiTeam.DefaultRecipient(msgs);
+    }
+
+    /// The @name at the head of `text` that is not a member, or "". A message
+    /// addressed to nobody must not be delivered to somebody else, so the
+    /// composer refuses it instead of falling back to the default recipient.
+    static string UnknownMention(string text) {
+        int i = 0;
+        while (i < text.Length && AiTeam.BreakLen(text, i) > 0) {
+            i = i + AiTeam.BreakLen(text, i);
+        }
+        if (i >= text.Length || (text[i] & 255) != 64) { return ""; }
+        int s = i + 1;
+        int e = s;
+        while (e < text.Length && (text[e] & 255) != 64
+               && AiTeam.BreakLen(text, e) == 0) {
+            e = e + 1;
+        }
+        string name = text.Substring(s, e - s);
+        if (name == "") { return ""; }
+        if (AiTeam.IsEveryone(name)) { return ""; }
+        if (AiTeam.RoleIdOfName(name) != "") { return ""; }
+        return name;
+    }
+
+    /// Every member's name in the user's language, comma-joined: what to offer
+    /// when an @name did not resolve.
+    static string NameList() {
+        List<AiRole> rs = AiTeam.Roles();
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < rs.Count; i = i + 1) {
+            if (i > 0) { sb.Append("、"); }
+            sb.Append(ZanIDE.T(rs[i].en, rs[i].zh));
+        }
+        return sb.ToString();
+    }
+
     // --- tool whitelist ------------------------------------------------------
 
     /// True when `roleId` may call `tool`.
@@ -504,8 +577,9 @@ class AiTeam {
             || tool == "run_errors") { owner = AiTeam.Qa(); }
         if (tool == "diff") { owner = AiTeam.Rev(); }
         return "error: '" + tool + "' is not yours to call as "
-            + AiTeam.DisplayName(roleId) + ". Hand the work to @"
-            + AiTeam.DisplayName(owner) + " with a [handoff] message instead.";
+            + AiTeam.DisplayName(roleId) + ". Do not call it again -- hand the"
+            + " work to @" + AiTeam.MentionToken(owner)
+            + " with a [handoff] message that states what you need done.";
     }
 
     // --- per-member context --------------------------------------------------
@@ -883,12 +957,21 @@ class AiTeam {
         return outp;
     }
 
+    /// The @token that addresses a member: an address ends at the first space,
+    /// so an English title ("Code Reviewer") cannot be one -- the id is used
+    /// there. A Chinese name has no space and is what the user reads.
+    static string MentionToken(string roleId) {
+        AiRole r = AiTeam.RoleOf(roleId);
+        if (r == null) { return roleId; }
+        return ZanIDE.T(r.id, r.zh);
+    }
+
     /// Replaces the half-typed mention at the end of `text` with the member's
-    /// full name plus a space, so the routing parser sees a finished address.
+    /// address plus a space, so the routing parser sees a finished one.
     static string ApplyMention(string text, string roleId) {
         int at = AiTeam.MentionStart(text);
         if (at < 0) { return text; }
-        return text.Substring(0, at) + "@" + AiTeam.DisplayName(roleId) + " ";
+        return text.Substring(0, at) + "@" + AiTeam.MentionToken(roleId) + " ";
     }
 
     // --- presentation helpers (batch 4) --------------------------------------

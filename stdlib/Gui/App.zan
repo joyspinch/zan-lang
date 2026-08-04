@@ -1587,6 +1587,10 @@ class App {
 
     void RequestRedraw() {
         needsRedraw = true;
+        // A repaint asked for by state (not by a bare hover move) can touch any
+        // pixel, so it cancels a damage-clipped frame that a hover move armed
+        // earlier in the same event pass.
+        partialPending = false;
     }
 
     /// Requests a *throttled* repaint for a looping animation: the next frame
@@ -2007,8 +2011,11 @@ class App {
         // the frosted theme feel sluggish, so hover reuses the cached blur +
         // wallpaper snapshot. A held drag (pressedId >= 0) may scroll/select
         // content behind glass, so it still dirties the backdrop.
+        // A keystroke is like a hover move here: it paints the caret and the
+        // edited text on a foreground widget, never behind the glass.
         bool hoverOnly = (kind == 1) && (focus.pressedId < 0);
-        backdropDirty = (kind != 0) && !hoverOnly;
+        bool typed = (kind == 4) || (kind == 5) || (kind == 6);
+        backdropDirty = (kind != 0) && !hoverOnly && !typed;
 
         if (kind == 8) {
             this.StopLoop();
@@ -2045,8 +2052,8 @@ class App {
             int oldHover = focus.hoveredId;
             focus.SetHovered(hitId);
             if (hitId != oldHover) {
+                if (!needsRedraw) { this.NoteHoverDamage(oldHover, hitId); }
                 needsRedraw = true;
-                this.NoteHoverDamage(oldHover, hitId);
             }
             // While a widget is held (e.g. slider/scrollbar drag) keep repainting
             // as the pointer moves so the value tracks the cursor live.
@@ -2186,7 +2193,16 @@ class App {
     bool ApplyEvent(nint evHwnd) {
         bool mine = evHwnd == window.GetHandle();
         int kind = window.EventKind();
-        backdropDirty = mine && kind != 0;
+        // Same frame fast paths as ProcessEvent: a window driven by a
+        // multi-window pump must not pay a full re-blur for every mouse move
+        // and keystroke -- on an IDE-sized surface that is the difference
+        // between a 50ms and a few-ms frame. A hover move and a keystroke both
+        // paint on foreground widgets over the glass, so the blur behind it is
+        // served from cache; a held drag may scroll content behind glass, so it
+        // still dirties the backdrop.
+        bool hoverOnly = (kind == 1) && (focus.pressedId < 0);
+        bool typed = (kind == 4) || (kind == 5) || (kind == 6);
+        backdropDirty = mine && kind != 0 && !hoverOnly && !typed;
 
         // Same contract as ProcessEvent: run the work widgets and background
         // threads marshalled onto the UI thread. A multi-window pump drives its
@@ -2230,7 +2246,14 @@ class App {
             int hitId = hitTester.HitTest(mouseX, mouseY);
             int oldHover = focus.hoveredId;
             focus.SetHovered(hitId);
-            if (hitId != oldHover) { needsRedraw = true; }
+            if (hitId != oldHover) {
+                // Clip the coming frame to the widget left and the widget
+                // entered, but only when the hover is the ONLY reason to
+                // repaint: a repaint already asked for by state can touch any
+                // pixel, and clipping it away would drop that update.
+                if (!needsRedraw) { this.NoteHoverDamage(oldHover, hitId); }
+                needsRedraw = true;
+            }
             if (focus.pressedId >= 0) { needsRedraw = true; }
             // Button held: immediate-mode drag logic (canvas elements, marquee,
             // resize handles) lives in render code, so every move while the
