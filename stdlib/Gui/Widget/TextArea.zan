@@ -43,6 +43,13 @@ class TextArea : Control {
     /// accept its selection, not to move the caret and break the line. Cleared
     /// by every Render, so a missed frame cannot leave the box deaf.
     bool skipKeys;
+    /// The split of `cacheTxt` into lines. Splitting allocates a list and a
+    /// string per line, and the box needs the lines on every frame and on every
+    /// arrow key -- doing that per frame is what made typing into a long prompt
+    /// lag. The cache is keyed on the text, so any edit (from a key, a binding
+    /// or SetText) rebuilds it exactly once.
+    string cacheTxt;
+    List<string> cacheLines;
     /// Fires whenever the text changes (C#-style: `area.Change += h;`).
     UiEvent Change;
 
@@ -57,6 +64,8 @@ class TextArea : Control {
         scrollY = 0;
         wid = WidgetId.Next();
         skipKeys = false;
+        cacheTxt = "";
+        cacheLines = null;
         wiresOwnEvents = true;
         Change = UiEvent.Create();
     }
@@ -121,6 +130,31 @@ class TextArea : Control {
         if (cursorPos < 0) { cursorPos = 0; }
     }
 
+    /// The text as lines, split at most once per edit.
+    List<string> Lines() {
+        string txt = model.Get();
+        if (cacheLines == null || cacheTxt != txt) {
+            cacheLines = CodeEditor.SplitLines(txt);
+            cacheTxt = txt;
+        }
+        return cacheLines;
+    }
+
+    /// The line the byte cursor sits on, walked out of the cached lines instead
+    /// of splitting a fresh copy of the text before the caret.
+    int CaretLine(List<string> lines) {
+        int pos = 0;
+        int i = 0;
+        while (i < lines.Count) {
+            int end = pos + lines[i].Length;
+            if (cursorPos <= end) { return i; }
+            pos = end + 1;
+            i = i + 1;
+        }
+        if (lines.Count == 0) { return 0; }
+        return lines.Count - 1;
+    }
+
     int LineStartAbs(List<string> lines, int line) {
         int s = 0;
         int i = 0;
@@ -174,10 +208,9 @@ class TextArea : Control {
                 if (cursorPos < txt.Length) { cursorPos = Text.NextCharEnd(txt, cursorPos); }
                 app.RequestRedraw();
             } else if (kc == 38 || kc == 40) {
-                List<string> lines = CodeEditor.SplitLines(txt);
-                List<string> pre = CodeEditor.SplitLines(Text.Left(txt, cursorPos));
-                int caretLine = pre.Count - 1;
-                int caretCol = pre[caretLine].Length;
+                List<string> lines = this.Lines();
+                int caretLine = this.CaretLine(lines);
+                int caretCol = cursorPos - this.LineStartAbs(lines, caretLine);
                 int target = caretLine - 1;
                 if (kc == 40) { target = caretLine + 1; }
                 if (target >= 0 && target < lines.Count) {
@@ -187,13 +220,12 @@ class TextArea : Control {
                     app.RequestRedraw();
                 }
             } else if (kc == 36) {
-                List<string> pre = CodeEditor.SplitLines(Text.Left(txt, cursorPos));
-                cursorPos = cursorPos - pre[pre.Count - 1].Length;
+                List<string> lines = this.Lines();
+                cursorPos = this.LineStartAbs(lines, this.CaretLine(lines));
                 app.RequestRedraw();
             } else if (kc == 35) {
-                List<string> lines = CodeEditor.SplitLines(txt);
-                List<string> pre = CodeEditor.SplitLines(Text.Left(txt, cursorPos));
-                int caretLine = pre.Count - 1;
+                List<string> lines = this.Lines();
+                int caretLine = this.CaretLine(lines);
                 cursorPos = this.LineStartAbs(lines, caretLine) + lines[caretLine].Length;
                 app.RequestRedraw();
             } else if (kc == 46) {
@@ -234,13 +266,15 @@ class TextArea : Control {
         int innerH = h - pad * 2;
         int lineH = Canvas.FontHeight(t.fontSizeMedium) + app.Scale(4);
 
-        List<string> lines = CodeEditor.SplitLines(txt);
+        List<string> lines = this.Lines();
         int contentH = lines.Count * lineH;
 
-        // Caret line/column via the split-prefix trick.
-        List<string> pre = CodeEditor.SplitLines(Text.Left(txt, cursorPos));
-        int caretLine = pre.Count - 1;
-        string caretPrefix = pre[caretLine];
+        int caretLine = this.CaretLine(lines);
+        int caretCol = cursorPos - this.LineStartAbs(lines, caretLine);
+        if (caretCol < 0) { caretCol = 0; }
+        if (caretCol > lines[caretLine].Length) {
+            caretCol = lines[caretLine].Length;
+        }
 
         // Keep the caret in view (only while focused / actively editing).
         if (focused) {
@@ -278,7 +312,8 @@ class TextArea : Control {
                 i = i + 1;
             }
             if (focused) {
-                int caretX = innerX + Canvas.MeasureText(caretPrefix, t.fontSizeMedium);
+                int caretX = innerX + Canvas.MeasureText(
+                    lines[caretLine].Substring(0, caretCol), t.fontSizeMedium);
                 int caretY = innerY + caretLine * lineH - scrollY;
                 int fh = Canvas.FontHeight(t.fontSizeMedium);
                 c.FillRect(caretX, caretY, 1, fh, t.primary);
