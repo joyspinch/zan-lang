@@ -4,39 +4,99 @@ using System.Data;
 namespace ZanWeb;
 
 /// <summary>
-/// Database context owned by one worker process. The connection is opened lazily
-/// in the process that first uses it; it is never shared across worker processes
-/// or concurrent request transactions.
+/// Database access for one worker process: a connection POOL plus the lease
+/// protocol every call site follows. main.zan builds the pool from
+/// config/app.json once and injects it here.
+///
+/// A request borrows a connection, runs its statements, and gives it back in a
+/// finally block — the connection belongs to that request (and to its
+/// transaction) for as long as it holds it, and to nobody else:
+///
+///   DbContext ctx = this.Db();
+///   IDbConnection db = await ctx.Acquire();
+///   if (db == null) { ...database unavailable... }
+///   try {
+///       List&lt;Post&gt; rows = db.Select&lt;Post&gt;().OrderByDescending(a =&gt; a.id).ToList();
+///   } finally {
+///       ctx.Release(db);
+///   }
+///
+/// Forgetting Release() leaks the connection: the pool is capped, so a leak
+/// eventually parks every request forever. The finally block is not optional.
 /// </summary>
 class DbContext {
-    IDbConnection connection;
-    bool tried;
+    DbPool pool;
 
-    DbContext() {
-        this.connection = null;
-        this.tried = false;
+    DbContext(DbPool pool) {
+        this.pool = pool;
     }
 
-    static DbContext Create() {
-        return new DbContext();
+    /// <summary>Wraps the pool built by the bootstrap (main.zan).</summary>
+    static DbContext Of(DbPool pool) {
+        return new DbContext(pool);
     }
 
-    IDbConnection Connection() {
-        if (this.connection != null) { return this.connection; }
-        if (this.tried) { return null; }
-        this.tried = true;
-        this.connection = Db.Conn();
-        return this.connection;
+    /// <summary>Borrows a connection for this request; parks the coroutine while
+    /// the pool is saturated. Returns null when the database is unreachable or
+    /// the pool is closed — always pair with Release() in a finally.</summary>
+    async IDbConnection Acquire() {
+        if (this.pool == null) { return null; }
+        IDbConnection db = await this.pool.AcquireAsync();
+        if (db == null || !db.IsConnected()) {
+            this.pool.Release(db);
+            return null;
+        }
+        return db;
     }
 
-    bool Ready() {
-        IDbConnection db = this.Connection();
-        return db != null && db.IsConnected();
+    /// <summary>Borrows an already-idle connection without suspending, for the
+    /// synchronous resolvers that are not coroutines. Returns null when nothing
+    /// is idle, which those call sites must treat as "unavailable" (fail closed)
+    /// rather than as "no data".</summary>
+    IDbConnection AcquireSync() {
+        if (this.pool == null) { return null; }
+        IDbConnection db = this.pool.TryAcquire();
+        if (db == null) { return null; }
+        if (!db.IsConnected()) {
+            this.pool.Release(db);
+            return null;
+        }
+        return db;
     }
 
-    void SyncIdentitySchema() {
-        IDbConnection db = this.Connection();
-        if (db == null || !db.IsConnected()) { return; }
-        db.SyncStructureAll();
+    /// <summary>Returns a connection to the pool. Safe with null, so it can sit
+    /// in a finally block unconditionally.</summary>
+    void Release(IDbConnection db) {
+        if (this.pool == null || db == null) { return; }
+        this.pool.Release(db);
+    }
+
+    /// <summary>Opens and parks <paramref name="count"/> connections at startup
+    /// (before the server accepts anything), so the first request does not pay
+    /// the connect cost and AcquireSync() finds a live connection. Returns the
+    /// number now idle: 0 means the database is unreachable.</summary>
+    async int Warmup(int count) {
+        if (this.pool == null) { return 0; }
+        return await this.pool.WarmupAsync(count);
+    }
+
+    /// <summary>Idle / live / waiting counters, for a health or metrics endpoint.</summary>
+    int IdleCount() {
+        if (this.pool == null) { return 0; }
+        return this.pool.IdleCount();
+    }
+
+    int LiveCount() {
+        if (this.pool == null) { return 0; }
+        return this.pool.LiveCount();
+    }
+
+    int WaitingCount() {
+        if (this.pool == null) { return 0; }
+        return this.pool.WaitingCount();
+    }
+
+    void Close() {
+        if (this.pool != null) { this.pool.Close(); }
     }
 }

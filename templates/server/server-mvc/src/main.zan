@@ -1,4 +1,5 @@
 using System;
+using System.Data;
 using ZanWeb;
 using System.Web;
 
@@ -17,7 +18,50 @@ class Program {
     static void Main() {
         Cfg.Load("config/app.json");
 
-        WebApp app = WebApp.Create(Cfg.Server.host, Cfg.Server.port);
+        // ---- assemble + inject dependencies ----
+        // Every worker is its own process re-running Main, so each builds its
+        // OWN pools here; nothing is inherited or shared across workers. Pools,
+        // not single connections: inside one worker each request is a coroutine,
+        // and a shared connection would serialize the worker and interleave two
+        // requests' transactions on one session. Handlers get them through
+        // AppServices (this.Db() / this.Cache()) and never open anything.
+        DbPool pool = Db.OpenPool();
+        DbContext db = DbContext.Of(pool);
+        CacheContext cache = CacheContext.Of(Db.OpenRedis());
+        AppServices services = new AppServices(db, cache);
+        AppServices.Use(services);
+
+        // Open a couple of connections before the first request pays for them
+        // (and so the synchronous auth resolvers find one idle). idle == 0 means
+        // the database is down: the server still starts and says so.
+        int idle = await db.Warmup(2);
+        Console.WriteLine("[db] " + Cfg.Db.driver + " pool size="
+            + Convert.ToString(Cfg.Db.poolSize) + " idle=" + Convert.ToString(idle));
+        if (Cfg.Cache.driver == "redis") {
+            bool up = await cache.Warmup();
+            if (up) {
+                Console.WriteLine("[cache] redis "
+                    + Cfg.Cache.redisHost + ":" + Convert.ToString(Cfg.Cache.redisPort)
+                    + " (shared across workers)");
+            } else {
+                Console.WriteLine("[cache] redis unreachable -- reads miss,"
+                    + " writes are dropped, handlers fall back to the database");
+            }
+        } else {
+            Console.WriteLine("[cache] worker-local memory"
+                + " -- correct only while [worker].count is 1");
+        }
+
+        // Schema + seed data run HERE, once, before the server accepts anything.
+        // CodeFirst DDL in a request path costs a catalog round trip per hit and
+        // lets two requests race on the same CREATE/ALTER.
+        bool ready = await Schema.Ensure(db);
+        if (!ready) {
+            Console.WriteLine("[db] schema not applied (database unreachable)"
+                + " -- check config/app.json [database]");
+        }
+
+        WebApp app = new WebApp(Cfg.Server.host, Cfg.Server.port);
         app.MaxBody(Cfg.Server.maxBodyMB * 1024 * 1024);
         app.GlobalLimit(Cfg.Server.globalLimitPerSec);
         WebHost.Use(app);
@@ -56,7 +100,7 @@ class Program {
     // ---- hooks ----
 
     static bool AccessLog(HttpContext ctx) {
-        //Console.WriteLine("[req] " + ctx.method + " " + ctx.path);
+        Console.WriteLine("[req] " + ctx.method + " " + ctx.path);
         return true;   // false would short-circuit the request
     }
 

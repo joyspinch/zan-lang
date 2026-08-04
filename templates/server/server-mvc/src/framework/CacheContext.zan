@@ -3,53 +3,59 @@ using System.Data.Redis;
 
 namespace ZanWeb;
 
+/// <summary>
+/// Cache with an injected Redis pool. main.zan builds the pool from
+/// [cache] in config/app.json (or passes null) and injects it here.
+///
+/// WHERE THE DATA LIVES IS PART OF THE METHOD NAME — that distinction is the
+/// whole point of this class:
+///
+///   GetAsync / SetAsync / SetTtlAsync / DelAsync   the SHARED cache (Redis).
+///       Visible to every worker process and to every other machine talking to
+///       the same Redis. Use these for anything a second worker must see:
+///       sessions, permissions, rate counters, cached query results.
+///
+///   LocalGet / LocalSet / LocalSetTtl / LocalDel   this worker's own memory.
+///       A plain in-process map: fast, no IO, and invisible to every other
+///       worker. Only for values that may differ per worker (a short-lived
+///       memo of something immutable, a per-process counter).
+///
+/// When [cache].driver is not "redis" there is no shared cache, and the async
+/// methods fall back to this worker's memory — correct only with worker.count=1
+/// (the default), which is why the fallback is announced at startup instead of
+/// being silent. When Redis IS configured but unreachable, a read reports a
+/// MISS and a write is dropped: the caller then goes to the database, which is
+/// slower but right, instead of reading another worker's private memory.
+/// </summary>
 class CacheContext {
     StrMap store;
     StrMap expiry;
     RedisPool redis;
 
-    CacheContext() {
-        this.store = StrMap.Create();
-        this.expiry = StrMap.Create();
-        this.redis = null;
-        if (Cfg.Cache.driver == "redis") {
-            this.redis = RedisPool.Create(Cfg.Cache.redisHost,
-                Cfg.Cache.redisPort, Cfg.Cache.poolSize,
-                Cfg.Cache.connectTimeoutMs);
-        }
+    /// <summary>redis == null means worker-local memory only.</summary>
+    CacheContext(RedisPool redis) {
+        this.store = new StrMap();
+        this.expiry = new StrMap();
+        this.redis = redis;
     }
 
-    static CacheContext Create() {
-        return new CacheContext();
+    /// <summary>Wraps an injected Redis pool (null = worker-local only).</summary>
+    static CacheContext Of(RedisPool redis) {
+        return new CacheContext(redis);
     }
 
-    static int Digit(string ch) {
-        string digits = "0123456789";
-        int i = 0;
-        while (i < 10) {
-            if (digits.Substring(i, 1) == ch) { return i; }
-            i = i + 1;
-        }
-        return 0 - 1;
+    /// <summary>True when a shared (cross-worker) cache is configured.</summary>
+    bool Shared() {
+        return this.redis != null;
     }
 
-    static int ToInt(string text) {
-        int result = 0;
-        int i = 0;
-        while (i < text.Length) {
-            int digit = CacheContext.Digit(text.Substring(i, 1));
-            if (digit < 0) { break; }
-            result = result * 10 + digit;
-            i = i + 1;
-        }
-        return result;
-    }
+    // ---- worker-local memory (never leaves this process) ----
 
     bool Alive(string key) {
         if (!this.store.Has(key)) { return false; }
         string expires = this.expiry.GetOr(key, "0");
         if (expires == "0") { return true; }
-        if (WebApp.NowSeconds() >= CacheContext.ToInt(expires)) {
+        if (WebApp.NowSeconds() >= Filter.ToInt(expires, 0)) {
             this.store.Set(key, "");
             this.expiry.Set(key, "0");
             return false;
@@ -57,39 +63,43 @@ class CacheContext {
         return true;
     }
 
-    bool Has(string key) {
+    bool LocalHas(string key) {
         return this.Alive(key);
     }
 
-    string Get(string key) {
+    string LocalGet(string key) {
         if (!this.Alive(key)) { return ""; }
         return this.store.Get(key);
     }
 
-    string GetOr(string key, string fallback) {
+    string LocalGetOr(string key, string fallback) {
         if (!this.Alive(key)) { return fallback; }
         return this.store.Get(key);
     }
 
-    void Set(string key, string text) {
+    void LocalSet(string key, string text) {
         this.store.Set(key, text);
         this.expiry.Set(key, "0");
     }
 
-    void SetTtl(string key, string text, int seconds) {
+    void LocalSetTtl(string key, string text, int seconds) {
         this.store.Set(key, text);
         this.expiry.Set(key, Convert.ToString(WebApp.NowSeconds() + seconds));
     }
 
-    void Del(string key) {
+    void LocalDel(string key) {
         this.store.Set(key, "");
         this.expiry.Set(key, "0");
     }
 
+    // ---- shared cache (Redis; every worker sees the same value) ----
+
+    /// <summary>Reads the shared cache. "" means MISS — also when Redis is
+    /// unreachable, so the caller falls through to its source of truth.</summary>
     async string GetAsync(string key) {
-        if (this.redis == null) { return this.Get(key); }
+        if (this.redis == null) { return this.LocalGet(key); }
         RedisClient client = await this.redis.AcquireAsync();
-        if (client == null) { return this.Get(key); }
+        if (client == null) { return ""; }
         try {
             return await client.GetAsync(key);
         } finally {
@@ -98,9 +108,9 @@ class CacheContext {
     }
 
     async void SetAsync(string key, string text) {
-        if (this.redis == null) { this.Set(key, text); return; }
+        if (this.redis == null) { this.LocalSet(key, text); return; }
         RedisClient client = await this.redis.AcquireAsync();
-        if (client == null) { this.Set(key, text); return; }
+        if (client == null) { return; }
         try {
             bool _ok = await client.SetAsync(key, text);
         } finally {
@@ -109,9 +119,9 @@ class CacheContext {
     }
 
     async void SetTtlAsync(string key, string text, int seconds) {
-        if (this.redis == null) { this.SetTtl(key, text, seconds); return; }
+        if (this.redis == null) { this.LocalSetTtl(key, text, seconds); return; }
         RedisClient client = await this.redis.AcquireAsync();
-        if (client == null) { this.SetTtl(key, text, seconds); return; }
+        if (client == null) { return; }
         try {
             bool _ok = await client.SetAsync(key, text);
             int _expires = await client.ExpireAsync(key, seconds);
@@ -121,14 +131,24 @@ class CacheContext {
     }
 
     async void DelAsync(string key) {
-        if (this.redis == null) { this.Del(key); return; }
+        if (this.redis == null) { this.LocalDel(key); return; }
         RedisClient client = await this.redis.AcquireAsync();
-        if (client == null) { this.Del(key); return; }
+        if (client == null) { return; }
         try {
             int _deleted = await client.DelAsync(key);
         } finally {
             this.redis.Release(client);
         }
+    }
+
+    /// <summary>Opens and parks one connection so the first request does not pay
+    /// the connect cost, and reports whether Redis actually answered.</summary>
+    async bool Warmup() {
+        if (this.redis == null) { return false; }
+        RedisClient client = await this.redis.AcquireAsync();
+        if (client == null) { return false; }
+        this.redis.Release(client);
+        return true;
     }
 
     void Close() {

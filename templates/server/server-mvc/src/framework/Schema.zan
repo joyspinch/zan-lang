@@ -1,0 +1,75 @@
+using System;
+using System.Data;
+using System.Data.Orm;
+using System.Security.Cryptography;
+using System.Web;
+
+namespace ZanWeb;
+
+/// <summary>
+/// Schema and seed data, applied ONCE at startup by main.zan — never from a
+/// request. CodeFirst (SyncStructure) reads the database catalog and issues
+/// DDL; doing that per request costs a round trip on every hit and lets two
+/// requests race on the same CREATE/ALTER. Entities are listed here explicitly
+/// so the set of tables this app owns is one readable list.
+/// </summary>
+class Schema {
+    /// <summary>Creates/updates every table and seeds the first admin. Returns
+    /// false when the database is unreachable: the server still starts, and
+    /// handlers report the outage instead of the process dying at boot.</summary>
+    static async bool Ensure(DbContext ctx) {
+        IDbConnection db = await ctx.Acquire();
+        if (db == null) { return false; }
+        try {
+            db.SyncStructure<AuthUserEnt>();
+            db.SyncStructure<User>();
+            db.SyncStructure<Post>();
+            Schema.SeedAdmin(db);
+            Schema.SeedPosts(db);
+            return true;
+        } finally {
+            ctx.Release(db);
+        }
+    }
+
+    static void SeedAdmin(IDbConnection db) {
+        if (db.Select<AuthUserEnt>().Count() > 0) { return; }
+        string salt = Hex.Encode(RandomNumberGenerator.GetBytes(16), 16);
+        AuthUserEnt admin = new AuthUserEnt();
+        admin.username = "admin";
+        admin.passwordSalt = salt;
+        admin.passwordHash = AuthUser.PasswordHash("admin1234", salt);
+        admin.role = "admin";
+        admin.status = "active";
+        db.Insert<AuthUserEnt>(admin).ExecuteAffrows();
+    }
+
+    static void SeedPosts(IDbConnection db) {
+        if (db.Select<Post>().Count() > 0) { return; }
+        List<Post> seed = new List<Post> {
+            Schema.PostOf("连接是借来的，不是共享的",
+                "每个请求从连接池借一条连接，用完在 finally 里归还。"
+                + "worker 之间不共享连接，同一个 worker 内的协程也不共享，"
+                + "所以事务不会互相串台。", "admin"),
+            Schema.PostOf("查询用类型化 ORM",
+                "db.Select<Post>().Where(a => a.published == 1)"
+                + ".OrderByDescending(a => a.id).ToList() —— 列名和类型都在编译期检查，"
+                + "值一律参数绑定，拼不出注入。", "admin"),
+            Schema.PostOf("缓存要说清楚存在哪",
+                "GetAsync/SetAsync 走 Redis，所有 worker 都看得见；"
+                + "LocalGet/LocalSet 只在本进程内存里，别的 worker 看不到。"
+                + "名字里就写明白，省得同步写内存、异步读 Redis。", "admin")
+        };
+        db.Insert<Post>(seed).ExecuteAffrows();
+    }
+
+    static Post PostOf(string title, string body, string author) {
+        Post p = new Post();
+        p.title = title;
+        p.body = body;
+        p.author = author;
+        p.published = 1;
+        p.createdAt = WebApp.NowSeconds();
+        return p;
+    }
+}

@@ -1,47 +1,53 @@
 using System;
 using System.Data;
+using System.Data.MySql;
+using System.Data.Postgres;
+using System.Data.Redis;
 using System.Data.Sqlite;
 
 namespace ZanWeb;
 
 /// <summary>
-/// Database bootstrap driven by the [database] section of config/app.json.
-/// The connection is opened lazily on first use and cached; if the configured
-/// database is unreachable the server keeps running and handlers can surface a
-/// friendly error instead of crashing at startup. Switch engines by editing the
-/// config file -- no recompile.
+/// Database / Redis bootstrap driven by the [database] and [cache] sections of
+/// config/app.json. main.zan calls OpenPool() / OpenRedis() ONCE per worker
+/// process and injects the pools into DbContext / CacheContext — consumers never
+/// open connections themselves.
+///
+/// Both are POOLS, not single connections: workers are separate processes (each
+/// re-runs Main), and inside one worker every request is a coroutine, so a
+/// shared connection would serialize the whole worker and interleave two
+/// requests' transactions on one session. A pool opens its connections lazily on
+/// first use, hands one out per request, and parks a coroutine (never the
+/// thread) when every connection is checked out.
+///
+/// Nothing here fails startup: when the database or Redis is unreachable the
+/// server still serves, and handlers surface a friendly error.
 /// </summary>
 class Db {
-    static IDbConnection conn;
-    static bool tried = false;
-
-    /// <summary>Returns the shared connection, opening it on first use. May
-    /// return null when no database is configured or reachable.</summary>
-    static IDbConnection Conn() {
-        if (conn != null) { return conn; }
-        if (tried) { return conn; }
-        tried = true;
+    /// <summary>The connection pool for the configured engine, sized by
+    /// [database].poolSize. Connections open on first acquire, so calling this
+    /// in the master process opens nothing.</summary>
+    static DbPool OpenPool() {
         string driver = Cfg.Db.driver;
+        int size = Cfg.Db.poolSize;
+        if (size < 1) { size = 1; }
         if (driver == "mysql" || driver == "mariadb") {
-            conn = DbConnection.OpenMySQL(
-                Cfg.Db.host, Cfg.Db.port, Cfg.Db.name, Cfg.Db.user, Cfg.Db.password);
-        } else if (driver == "postgres" || driver == "postgresql") {
-            conn = DbConnection.OpenPostgreSQL(
-                Cfg.Db.host, Cfg.Db.port, Cfg.Db.name, Cfg.Db.user, Cfg.Db.password);
-        } else {
-            conn = SqliteConnection.Open(Cfg.Db.sqlitePath);
+            return MySqlConnector.Pool(Cfg.Db.host, Cfg.Db.port, Cfg.Db.name,
+                Cfg.Db.user, Cfg.Db.password, size);
         }
-        if (conn != null && conn.IsConnected()) {
-            Console.WriteLine("[db] connected (" + driver + ")");
-        } else {
-            Console.WriteLine("[db] not connected (" + driver
-                + ") -- check config/app.json [database]");
+        if (driver == "postgres" || driver == "postgresql") {
+            return PgConnector.Pool(Cfg.Db.host, Cfg.Db.port, Cfg.Db.name,
+                Cfg.Db.user, Cfg.Db.password, size);
         }
-        return conn;
+        return SqliteConnector.Pool(Cfg.Db.sqlitePath, size);
     }
 
-    static bool Ready() {
-        IDbConnection db = Db.Conn();
-        return db != null && db.IsConnected();
+    /// <summary>Builds the Redis pool from config, or null when [cache].driver
+    /// is not "redis" (worker-local memory cache only). The pool is injected
+    /// into CacheContext.</summary>
+    static RedisPool OpenRedis() {
+        if (Cfg.Cache.driver != "redis") { return null; }
+        return new RedisPool(Cfg.Cache.redisHost,
+            Cfg.Cache.redisPort, Cfg.Cache.poolSize, Cfg.Cache.connectTimeoutMs);
     }
 }

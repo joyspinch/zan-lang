@@ -1,0 +1,191 @@
+using System;
+using System.Data;
+using System.Json;
+using System.Web;
+using ZanWeb;
+
+namespace ZanWeb.Blog;
+
+/// <summary>
+/// 极简博客 —— DB 和 Redis 的标准用法就在这三个动作里。
+///
+/// DB：从注入的连接池借一条连接，用类型化 ORM 查询，finally 归还。
+///     IDbConnection db = await ctx.Acquire();
+///     try { db.Select&lt;Post&gt;()... } finally { ctx.Release(db); }
+///
+/// Redis：cache-aside。先读共享缓存（GetAsync），未命中再查库并回填
+///     （SetTtlAsync）；写入后删掉受影响的 key（DelAsync），下一次读自然刷新。
+///     缓存只是加速，拿不到就回落查库，不会因为 Redis 挂了而报错。
+///
+/// 路由 -&gt; 代码路径：/blog 由 src/controller/Blog/Posts.zan 的 Index 处理，
+/// 视图是同目录下的 View/Posts.Index.html（视图 key = 模块.控制器.动作）。
+/// </summary>
+[Route("[controller]/[action]")]
+[Custom(Authorization = CustomAuthorization.None)]
+[Description("博客")]
+class Posts : AppController {
+    static string ListKey = "blog:list";
+
+    static string PostKey(int id) {
+        return "blog:post:" + Convert.ToString(id);
+    }
+
+    [HttpGet]
+    [Route("/blog")]
+    [Description("文章列表")]
+    async void Index() {
+        string kw = this.In("kw");
+        CacheContext cache = this.Cache();
+        DbContext ctx = this.Db();
+
+        // 带搜索词的结果不进缓存：key 会随用户输入无限膨胀。
+        bool cacheable = kw.Length == 0;
+        List<Post> rows = null;
+        string source = "db";
+
+        if (cacheable) {
+            string cached = await cache.GetAsync(Posts.ListKey);
+            if (cached.Length > 0) {
+                rows = Json.Deserialize<List<Post>>(cached);
+                source = "cache";
+            }
+        }
+
+        if (rows == null) {
+            IDbConnection db = await ctx.Acquire();
+            if (db == null) {
+                this.Fail(503, "2001", "数据库不可用，检查 config/app.json [database]");
+                return;
+            }
+            try {
+                rows = db.Select<Post>()
+                    .Where(a => a.published == 1)
+                    .WhereIf(kw.Length > 0, a => a.title.Contains(kw))
+                    .OrderByDescending(a => a.id)
+                    .Take(20)
+                    .ToList();
+            } finally {
+                ctx.Release(db);
+            }
+            if (cacheable) {
+                await cache.SetTtlAsync(Posts.ListKey,
+                    Json.Serialize<List<Post>>(rows), 60);
+            }
+        }
+
+        ViewData d = new ViewData();
+        d.Set("title", "极简博客");
+        d.Set("kw", kw);
+        d.Set("source", source);
+        d.Set("count", Convert.ToString(rows.Count));
+        d.Set("pool", "idle=" + Convert.ToString(ctx.IdleCount())
+            + " live=" + Convert.ToString(ctx.LiveCount())
+            + " waiting=" + Convert.ToString(ctx.WaitingCount()));
+        d.Set("cacheKind", Posts.CacheKind(cache));
+        List<StrMap> items = d.AddList("posts");
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            Post p = rows[i];
+            StrMap row = new StrMap();
+            row.Set("id", Convert.ToString(p.id));
+            row.Set("title", p.title);
+            row.Set("author", p.author);
+            row.Set("createdAt", Posts.Stamp(p.createdAt));
+            items.Add(row);
+        }
+        this.View(d);
+    }
+
+    [HttpGet]
+    [Route("/blog/{id}")]
+    [Description("文章详情")]
+    async void Show() {
+        int id = Filter.ToInt(this.Param("id"), 0);
+        if (id <= 0) {
+            this.Fail(404, "2004", "文章不存在");
+            return;
+        }
+        CacheContext cache = this.Cache();
+        DbContext ctx = this.Db();
+        string key = Posts.PostKey(id);
+        string source = "cache";
+
+        Post post = null;
+        string cached = await cache.GetAsync(key);
+        if (cached.Length > 0) { post = Json.Deserialize<Post>(cached); }
+
+        if (post == null) {
+            source = "db";
+            IDbConnection db = await ctx.Acquire();
+            if (db == null) {
+                this.Fail(503, "2001", "数据库不可用");
+                return;
+            }
+            try {
+                post = db.Select<Post>().Where(a => a.id == id).ToOne();
+            } finally {
+                ctx.Release(db);
+            }
+            if (post == null) {
+                this.Fail(404, "2004", "文章不存在");
+                return;
+            }
+            await cache.SetTtlAsync(key, Json.Serialize<Post>(post), 60);
+        }
+
+        ViewData d = new ViewData();
+        d.Set("title", post.title);
+        d.Set("body", post.body);
+        d.Set("author", post.author);
+        d.Set("createdAt", Posts.Stamp(post.createdAt));
+        d.Set("source", source);
+        d.Set("cacheKind", Posts.CacheKind(cache));
+        this.View(d);
+    }
+
+    [HttpPost]
+    [Route("/blog/create")]
+    [Description("发布文章")]
+    async void Create() {
+        string title = this.InText("title");
+        string body = this.InText("body");
+        string author = this.InText("author");
+        if (title.Length == 0 || body.Length == 0) {
+            this.Fail(400, "1001", "标题和正文都不能为空");
+            return;
+        }
+        if (author.Length == 0) { author = "anonymous"; }
+
+        Post p = new Post();
+        p.title = title;
+        p.body = body;
+        p.author = author;
+        p.published = 1;
+        p.createdAt = WebApp.NowSeconds();
+
+        DbContext ctx = this.Db();
+        IDbConnection db = await ctx.Acquire();
+        if (db == null) {
+            this.Fail(503, "2001", "数据库不可用");
+            return;
+        }
+        int newId = 0;
+        try {
+            newId = db.Insert<Post>(p).ExecuteIdentity();
+        } finally {
+            ctx.Release(db);
+        }
+
+        // 写完就让缓存失效，而不是等 TTL 到期，否则列表最长 60 秒看不到新文章。
+        await this.Cache().DelAsync(Posts.ListKey);
+        this.Ctx().Redirect("/blog/" + Convert.ToString(newId));
+    }
+
+    static string CacheKind(CacheContext cache) {
+        if (cache.Shared()) { return "redis (跨 worker 共享)"; }
+        return "memory (仅本 worker)";
+    }
+
+    static string Stamp(long seconds) {
+        return DateTime.FromUnixSeconds(seconds).ToString();
+    }
+}

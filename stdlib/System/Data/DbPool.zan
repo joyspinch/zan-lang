@@ -90,6 +90,48 @@ class DbPool {
         this.core.Pool(c);
     }}
 
+    /// <summary>Checks out an already-idle connection without suspending, or
+    /// returns null when none is parked. For synchronous call sites (a hook or
+    /// resolver that is not a coroutine) over drivers whose IO is synchronous
+    /// anyway; it never opens a connection, because opening is a coroutine, so
+    /// warm the pool with <see cref="WarmupAsync"/> at startup and treat null as
+    /// "capacity exhausted". Release it exactly like an acquired one.</summary>
+    IDbConnection TryAcquire() {
+        if (this.core.IsClosed()) {
+            return null;
+        }
+        IDbConnection pooled = this.core.TakeIdle();
+        while (pooled != null) {
+            if (pooled.IsConnected()) {
+                return pooled;
+            }
+            this.core.Drop();
+            pooled = this.core.TakeIdle();
+        }
+        return null;
+    }
+
+    /// <summary>Opens up to <paramref name="count"/> connections (capped by
+    /// maxSize) and parks them, so the first requests -- and every
+    /// <see cref="TryAcquire"/> caller -- find a live connection. Returns the
+    /// number now idle, 0 when the database is unreachable.</summary>
+    async int WarmupAsync(int count) {
+        int want = count;
+        if (want > this.core.MaxSize()) { want = this.core.MaxSize(); }
+        List<IDbConnection> opened = new List<IDbConnection>();
+        int i = 0;
+        while (i < want) {
+            IDbConnection c = await this.AcquireAsync();
+            if (c == null) { break; }
+            opened.Add(c);
+            i = i + 1;
+        }
+        for (int j = 0; j < opened.Count; j = j + 1) {
+            this.Release(opened[j]);
+        }
+        return this.core.IdleCount();
+    }
+
     /// <summary>Number of idle (pooled, ready-to-use) connections.</summary>
     int IdleCount() {{
         return this.core.IdleCount();
