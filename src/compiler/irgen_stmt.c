@@ -630,6 +630,16 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         int arc_own = (type && is_rc_managed_type(type) &&
                        LLVMGetTypeKind(llvm_type) == LLVMPointerTypeKind);
         if (arc_own) zan_store_fit(g, LLVMConstNull(llvm_type), alloca);
+        /* An `object` local decides ownership per stored value at runtime (see
+         * the object-local comment in irgen_generics.c). Its flag lives with the
+         * slot, which is only registered as a local further down, so track it
+         * on a stand-in until then. */
+        local_var_t obj_slot;
+        memset(&obj_slot, 0, sizeof(obj_slot));
+        obj_slot.alloca = alloca;
+        obj_slot.type = type;
+        int obj_own = local_is_dyn_obj(g, &obj_slot);
+        if (obj_own) zan_store_fit(g, LLVMConstNull(llvm_type), alloca);
 
         if (stmt->var_decl.initializer) {
             check_value_type_mismatch(g, type,
@@ -645,6 +655,10 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                     : emit_expr(g, stmt->var_decl.initializer, locals);
             if (arc_own) {
                 emit_rc_capture_local(g, type, alloca, init_val, stmt->var_decl.initializer, locals);
+            } else if (obj_own) {
+                emit_obj_local_store(g, &obj_slot, init_val,
+                    infer_expr_type(g, stmt->var_decl.initializer, locals),
+                    stmt->var_decl.initializer, locals);
             } else {
                 init_val = coerce_int_to(g, init_val, llvm_type);
                 zan_store_fit(g, init_val, alloca);
@@ -669,6 +683,8 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
 
         local_add(locals, stmt->var_decl.name, alloca, type);
         if (arc_own) arc_own_local(g, locals);
+        if (obj_own)
+            locals->vars[locals->count - 1].obj_rc_flag = obj_slot.obj_rc_flag;
         /* A local initialized with a freshly-built dict owns the dict's
          * rc-managed keys/values and releases them at scope exit. */
         if (type &&

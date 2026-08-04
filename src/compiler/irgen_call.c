@@ -158,11 +158,12 @@ static LLVMValueRef emit_method_spec_call(zan_irgen_t *g, int idx,
             !expr_is_local_ident(arg, locals) &&
             expr_yields_owned_rc_value(g, arg, locals) &&
             LLVMGetTypeKind(LLVMTypeOf(call_args[j + this_off])) == LLVMPointerTypeKind) {
-            if (at->kind == TYPE_STRING) {
+            int ehk = eh_slot_kind_of(at);
+            if (ehk != ZAN_EH_SLOT_OBJ) {
                 LLVMValueRef slot = emit_entry_alloca(g,
                     LLVMTypeOf(call_args[j + this_off]), "arg.eh");
                 LLVMBuildStore(g->builder, call_args[j + this_off], slot);
-                emit_eh_tmp_push_slot(g, slot, true);
+                emit_eh_tmp_push_slot(g, slot, ehk);
             } else {
                 emit_eh_tmp_push(g, call_args[j + this_off]);
             }
@@ -3453,11 +3454,12 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                                         !expr_is_local_ident(arg, locals) &&
                                         expr_yields_owned_rc_value(g, arg, locals) &&
                                         LLVMGetTypeKind(LLVMTypeOf(call_args[k])) == LLVMPointerTypeKind) {
-                                        if (at->kind == TYPE_STRING) {
+                                        int ehk = eh_slot_kind_of(at);
+                                        if (ehk != ZAN_EH_SLOT_OBJ) {
                                             LLVMValueRef slot = emit_entry_alloca(g,
                                                 LLVMTypeOf(call_args[k]), "arg.eh");
                                             LLVMBuildStore(g->builder, call_args[k], slot);
-                                            emit_eh_tmp_push_slot(g, slot, true);
+                                            emit_eh_tmp_push_slot(g, slot, ehk);
                                         } else {
                                             emit_eh_tmp_push(g, call_args[k]);
                                         }

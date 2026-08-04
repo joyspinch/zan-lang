@@ -574,7 +574,7 @@ static void emit_leak_report_support(zan_irgen_t *g) {
 }
 
 /* defined in later-included parts of this translation unit */
-static void emit_eh_tmp_push_slot(zan_irgen_t *g, LLVMValueRef slot, bool is_string);
+static void emit_eh_tmp_push_slot(zan_irgen_t *g, LLVMValueRef slot, int kind);
 static void emit_eh_tmp_pop(zan_irgen_t *g);
 static void emit_eh_tmp_drop(zan_irgen_t *g, LLVMValueRef obj);
 
@@ -587,6 +587,16 @@ static int local_slot_owns_rc(local_var_t *v) {
      * into that cell rather than being an alloca instruction. */
     if (v->box_cell) return 1;
     return LLVMGetTypeKind(LLVMGetAllocatedType(v->alloca)) == LLVMPointerTypeKind;
+}
+
+/* True when a local is an `object` whose ownership is tracked at runtime (see
+ * the object-local comment below). An async body's locals live in the heap
+ * frame, which the stack-allocated flag would not survive, so one is only
+ * tracked there if a flag already exists. */
+static int local_is_dyn_obj(zan_irgen_t *g, local_var_t *v) {
+    if (!v || !v->type || v->type->kind != TYPE_OBJECT) return 0;
+    if (v->box_cell || g->current_async_frame) return v->obj_rc_flag != NULL;
+    return LLVMGetTypeKind(local_slot_type(g, v)) == LLVMPointerTypeKind;
 }
 
 /* True when scope exit must release the reference in the local's slot. A boxed
@@ -616,7 +626,7 @@ static void arc_own_local(zan_irgen_t *g, local_scope_t *locals) {
     local_var_t *v = &locals->vars[locals->count - 1];
     v->arc_owned = 1;
     if (v->eh_slot || g->current_async_frame || !local_owns_arc(v)) return;
-    emit_eh_tmp_push_slot(g, v->alloca, v->type->kind == TYPE_STRING);
+    emit_eh_tmp_push_slot(g, v->alloca, eh_slot_kind_of(v->type));
     v->eh_slot = 1;
 }
 
@@ -645,7 +655,9 @@ static void emit_release_owned_locals_except(zan_irgen_t *g, local_scope_t *loca
     for (int i = 0; i < locals->count; i++) {
         pop_eh_slot(g, &locals->vars[i]);
         if (keep && &locals->vars[i] == keep) continue;
-        if (locals->vars[i].box_cell) {
+        if (locals->vars[i].obj_rc_flag) {
+            emit_release_obj_local(g, &locals->vars[i]);
+        } else if (locals->vars[i].box_cell) {
             release_boxed_local(g, &locals->vars[i]);
         } else if (local_owns_arc(&locals->vars[i])) {
             LLVMValueRef cur = LLVMBuildLoad2(g->builder, i8ptr,
@@ -670,7 +682,9 @@ static void emit_release_owned_locals_range(zan_irgen_t *g, local_scope_t *local
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     for (int i = locals->count - 1; i >= start; i--) {
         pop_eh_slot(g, &locals->vars[i]);
-        if (locals->vars[i].box_cell) {
+        if (locals->vars[i].obj_rc_flag) {
+            emit_release_obj_local(g, &locals->vars[i]);
+        } else if (locals->vars[i].box_cell) {
             release_boxed_local(g, &locals->vars[i]);
         } else if (local_owns_arc(&locals->vars[i])) {
             LLVMValueRef cur = LLVMBuildLoad2(g->builder, i8ptr,
@@ -750,7 +764,9 @@ static void emit_release_owned_locals_from(zan_irgen_t *g, local_scope_t *locals
         LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder)) != NULL;
     for (int i = locals->count - 1; i >= start; i--) {
         if (!terminated) pop_eh_slot(g, &locals->vars[i]);
-        if (!terminated && locals->vars[i].box_cell) {
+        if (!terminated && locals->vars[i].obj_rc_flag) {
+            emit_release_obj_local(g, &locals->vars[i]);
+        } else if (!terminated && locals->vars[i].box_cell) {
             release_boxed_local(g, &locals->vars[i]);
         } else if (!terminated && local_owns_arc(&locals->vars[i])) {
             LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
@@ -769,6 +785,78 @@ static void emit_release_owned_locals_from(zan_irgen_t *g, local_scope_t *locals
         locals->vars[i].arc_owned = 0;
     }
     locals->count = start;
+}
+
+/* ---- `object` locals ------------------------------------------------------
+ * An object-typed slot is pointer-wide and untyped: `object o = new Dog()`
+ * stores a heap reference, `object o = "hi"` a string literal in static
+ * storage, `object o = 5` the integer itself. Releasing on the static type
+ * would therefore either leak the first or corrupt the others, so an object
+ * local carries an i1 flag saying whether its current occupant is an owned
+ * heap reference. Only a value whose static type is an ARC-managed class sets
+ * it, and only a set flag releases -- an unrecognised occupant is left alone.
+ *
+ * A local that never receives a managed value has no flag and costs nothing. */
+static LLVMValueRef obj_rc_flag_slot(zan_irgen_t *g, local_var_t *v) {
+    if (!v->obj_rc_flag) {
+        LLVMTypeRef i1 = LLVMInt1TypeInContext(g->ctx);
+        LLVMValueRef here = LLVMGetInsertBlock(g->builder);
+        v->obj_rc_flag = emit_entry_alloca(g, i1, "obj.owns");
+        LLVMPositionBuilderAtEnd(g->builder, here);
+        LLVMBuildStore(g->builder, LLVMConstInt(i1, 0, 0), v->obj_rc_flag);
+    }
+    return v->obj_rc_flag;
+}
+
+/* Release the occupant of an object local when it owns one. */
+static void emit_release_obj_local(zan_irgen_t *g, local_var_t *v) {
+    if (!v || !v->obj_rc_flag) return;
+    LLVMTypeRef i1 = LLVMInt1TypeInContext(g->ctx);
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder));
+    LLVMValueRef owns = LLVMBuildLoad2(g->builder, i1, v->obj_rc_flag, "obj.own");
+    LLVMBasicBlockRef rel = LLVMAppendBasicBlockInContext(g->ctx, fn, "obj.rel");
+    LLVMBasicBlockRef cont = LLVMAppendBasicBlockInContext(g->ctx, fn, "obj.cont");
+    LLVMBuildCondBr(g->builder, owns, rel, cont);
+    LLVMPositionBuilderAtEnd(g->builder, rel);
+    LLVMValueRef cur = LLVMBuildLoad2(g->builder, i8ptr, v->alloca, "obj.cur");
+    emit_arc_release_typed(g, NULL, cur);
+    LLVMBuildStore(g->builder, LLVMConstInt(i1, 0, 0), v->obj_rc_flag);
+    LLVMBuildStore(g->builder, LLVMConstNull(i8ptr), v->alloca);
+    LLVMBuildBr(g->builder, cont);
+    LLVMPositionBuilderAtEnd(g->builder, cont);
+}
+
+/* True when a value of static type `t` stored into an object slot is a heap
+ * reference the slot can own. Strings and delegates have their own release
+ * functions and are left borrowed rather than tracked with a second flag. */
+static int obj_slot_owns_value(zan_type_t *t) {
+    return t && is_arc_managed_type(t);
+}
+
+/* Store `v` (from `rhs`, static type `vtype`) into an object local, keeping the
+ * ownership flag in step: release what the slot owned, take a reference to the
+ * new occupant when it is a heap object the expression does not already hand
+ * over, and record whether the slot now owns anything. */
+static void emit_obj_local_store(zan_irgen_t *g, local_var_t *v, LLVMValueRef val,
+                                 zan_type_t *vtype, zan_ast_node_t *rhs,
+                                 local_scope_t *locals) {
+    LLVMTypeRef i1 = LLVMInt1TypeInContext(g->ctx);
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    int owns = obj_slot_owns_value(vtype);
+    if (owns || v->obj_rc_flag) obj_rc_flag_slot(g, v);
+    emit_release_obj_local(g, v);
+    if (owns) {
+        if (LLVMGetTypeKind(LLVMTypeOf(val)) == LLVMPointerTypeKind &&
+            LLVMTypeOf(val) != i8ptr)
+            val = LLVMBuildBitCast(g->builder, val, i8ptr, "obj.bc");
+        if (!expr_yields_owned_rc_value(g, rhs, locals))
+            emit_arc_retain(g, val);
+    }
+    zan_store_fit(g, val, v->alloca);
+    if (v->obj_rc_flag)
+        LLVMBuildStore(g->builder, LLVMConstInt(i1, owns ? 1 : 0, 0),
+                       v->obj_rc_flag);
 }
 
 /* Capture value `v` (from `rhs`) into an owning reference slot `slot_alloca`:

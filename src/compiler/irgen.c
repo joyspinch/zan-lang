@@ -2216,6 +2216,13 @@ typedef struct {
     /* 1 when this binding owns a reference to the cell (the declaring scope);
      * a lambda body's binding borrows the cell its closure record holds. */
     int          box_owned;
+    /* An `object` slot holds whatever the language puts in a pointer-wide slot:
+     * a heap class reference, a string literal in static storage, or an
+     * unboxed scalar. Its static type therefore cannot decide ownership, so an
+     * i1 slot records whether the *current* occupant is an owned heap
+     * reference; the next store and scope exit release it only when set. NULL
+     * for every other local. */
+    LLVMValueRef obj_rc_flag;
 } local_var_t;
 
 /* A function's locals live in a single flat scope. The backing array grows
@@ -2276,6 +2283,7 @@ static void local_add(local_scope_t *scope, zan_istr_t name, LLVMValueRef alloca
     scope->vars[scope->count].arr_len_slot = NULL;
     scope->vars[scope->count].box_cell = NULL;
     scope->vars[scope->count].box_owned = 0;
+    scope->vars[scope->count].obj_rc_flag = NULL;
     scope->count++;
     /* Record the variable for the debugger (no-op unless building with -g). The
      * emit context supplies the compiler state; local_add itself is g-free. */
@@ -2365,11 +2373,15 @@ static void emit_list_release_elems(zan_irgen_t *g, zan_type_t *elem_type, LLVMV
 static void emit_dict_release_elems(zan_irgen_t *g, zan_type_t *dict_type, LLVMValueRef col);
 static void emit_array_release_elems(zan_irgen_t *g, zan_type_t *elem_type,
                                      LLVMValueRef arr, LLVMValueRef len);
+static void emit_release_obj_local(zan_irgen_t *g, local_var_t *v);
+static LLVMValueRef zan_store_fit(zan_irgen_t *g, LLVMValueRef val, LLVMValueRef ptr);
 
 /* Release all RC-managed local variables in scope (for throw/exception cleanup) */
 static void release_all_arc_locals(zan_irgen_t *g, local_scope_t *locals) {
     for (int i = 0; i < locals->count; i++) {
-        if (is_rc_managed_type(locals->vars[i].type)) {
+        if (locals->vars[i].obj_rc_flag) {
+            emit_release_obj_local(g, &locals->vars[i]);
+        } else if (is_rc_managed_type(locals->vars[i].type)) {
             LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
             LLVMValueRef val = LLVMBuildLoad2(g->builder, i8ptr,
                 locals->vars[i].alloca, "arc_cleanup");
@@ -2545,6 +2557,21 @@ static LLVMValueRef emit_alloc_rc_collection(zan_irgen_t *g, zan_ast_node_t *exp
                             LLVMConstInt(i64, (unsigned long long)site_idx, 0),
                             site_name };
     return zan_call2(g->builder, alloc_fn_type, g->rt_alloc, args, 3, "coll");
+}
+
+/* Unwind-stack entry flavours (see emit_eh_tmp_push_slot): a throw releases
+ * what a registered variable slot holds, and the release differs by type --
+ * strings carry their own header, a delegate may be a bare function pointer
+ * that must not be released at all. */
+#define ZAN_EH_SLOT_OBJ 0
+#define ZAN_EH_SLOT_STR 1
+#define ZAN_EH_SLOT_DLG 2
+
+static int eh_slot_kind_of(zan_type_t *t) {
+    if (!t) return ZAN_EH_SLOT_OBJ;
+    if (t->kind == TYPE_STRING) return ZAN_EH_SLOT_STR;
+    if (t->kind == TYPE_DELEGATE) return ZAN_EH_SLOT_DLG;
+    return ZAN_EH_SLOT_OBJ;
 }
 
 /* ---- irgen translation-unit parts (order matters) ---------------------

@@ -1638,7 +1638,11 @@ static LLVMValueRef emit_expr_assignment(zan_irgen_t *g, zan_ast_node_t *expr,
 binding_lowered:
         if (expr->binary.left->kind == AST_IDENTIFIER) {
             local_var_t *local = local_find(locals, expr->binary.left->ident.name);
-            if (local && local_slot_owns_rc(local)) {
+            if (local && local_is_dyn_obj(g, local)) {
+                emit_obj_local_store(g, local, right,
+                    infer_expr_type(g, expr->binary.right, locals),
+                    expr->binary.right, locals);
+            } else if (local && local_slot_owns_rc(local)) {
                 /* ARC: release the previous occupant and retain the new one. */
                 emit_rc_capture_local(g, local->type, local->alloca, right, expr->binary.right, locals);
             } else if (local) {
