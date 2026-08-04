@@ -1,0 +1,110 @@
+// A43-A8 / A32-3b: an async generic method monomorphizes like any other
+// generic method. Its ramp, heap frame, resume state machine and cleanup are
+// built per specialization, so parameters, frame-resident locals and the
+// awaited result all use the concrete bound type -- an `int` result is an int,
+// not the reinterpreted bits of the frame pointer.
+using System;
+
+class Node {
+    public string name;
+    public Node(string n) { this.name = n; }
+    public string Show() { return "Node(" + name + ")"; }
+}
+
+class Svc {
+    public string tag;
+    public Svc(string t) { this.tag = t; }
+
+    // completes without suspending: the ramp's result must still be typed
+    public async U Echo<U>(U x) { return x; }
+
+    // a U-typed local lives in the frame across the suspension
+    public async U Hold<U>(U x) {
+        U keep = x;
+        await Task.Delay(1);
+        return keep;
+    }
+
+    // reaches into its own type parameter: a pure template, so this method
+    // exists only as specializations
+    public async string Render<U>(U c) {
+        await Task.Delay(1);
+        return tag + ":" + c.Show();
+    }
+
+    // an async generic awaiting another async generic
+    public async U Forward<U>(U x) { return await Hold<U>(x); }
+
+    // exception raised and caught inside the specialized frame
+    public async string Caught<U>(U x) {
+        try {
+            await Task.Delay(1);
+            throw new Exception("bad " + x);
+        } catch (Exception e) {
+            return "caught " + e.Message;
+        }
+    }
+
+    // exception that leaves the frame and re-throws in the awaiter
+    public async int Thrown<U>(U x) {
+        await Task.Delay(1);
+        throw new Exception("from " + x);
+    }
+}
+
+class Program {
+    static long cancelH;
+    static int marks;
+
+    static async U Id<U>(U v) { return v; }
+
+    static async int Count<U>(U[] xs) {
+        await Task.Delay(1);
+        return xs.Length;
+    }
+
+    // cancelled while suspended: the statement after the await must not run
+    static async int Slow<U>(U x) {
+        await Task.Delay(1);
+        Task.Cancel(Program.cancelH);
+        await Task.Delay(1);
+        Program.marks = Program.marks + 1;
+        return 1;
+    }
+
+    static async void Main() {
+        Svc s = new Svc("s1");
+        Console.WriteLine(await s.Echo<int>(42));
+        Console.WriteLine(await s.Echo<string>("hi"));
+        Console.WriteLine(await s.Echo<double>(1.5));
+        Node n = await s.Echo<Node>(new Node("a"));
+        Console.WriteLine(n.Show());
+
+        Console.WriteLine(await s.Hold<int>(7));
+        Console.WriteLine(await s.Hold<string>("kept"));
+        Node held = await s.Hold<Node>(new Node("b"));
+        Console.WriteLine(held.Show());
+
+        Console.WriteLine(await s.Render<Node>(new Node("c")));
+        Console.WriteLine(await s.Forward<string>("fw"));
+        Console.WriteLine(await s.Forward<int>(3));
+
+        Console.WriteLine(await s.Caught<string>("z"));
+        try {
+            Console.WriteLine(await s.Thrown<int>(9));
+        } catch (Exception e) {
+            Console.WriteLine("main " + e.Message);
+        }
+
+        Console.WriteLine(await Id<int>(8));
+        Console.WriteLine(await Program.Id<string>("q"));
+
+        int[] arr = new int[3];
+        Console.WriteLine(await Count<int>(arr));
+
+        Program.cancelH = Task.Spawn(Program.Slow<int>(5));
+        await Task.Delay(40);
+        Console.WriteLine("marks=" + Convert.ToString(Program.marks));
+        Console.WriteLine("done");
+    }
+}

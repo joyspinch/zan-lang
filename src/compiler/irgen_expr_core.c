@@ -1293,10 +1293,13 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
             /* bare call: current class method, else global function */
             if (g->current_type_sym) {
                 zan_symbol_t *m = get_method_sym(g->current_type_sym, callee->ident.name);
-                if (m) return m->type;
+                /* an unqualified call to a sibling generic method binds its
+                 * type parameters here too (`await Id<int>(8)` is an int) */
+                if (m) return method_ret_type_at(g, m, e, NULL, locals);
             }
             zan_symbol_t *gf = zan_binder_lookup(g->binder, callee->ident.name);
-            if (gf && gf->kind == SYM_METHOD) return gf->type;
+            if (gf && gf->kind == SYM_METHOD)
+                return method_ret_type_at(g, gf, e, NULL, locals);
             return NULL;
         }
         if (callee->kind == AST_MEMBER_ACCESS) {
@@ -1367,7 +1370,13 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
                      * receiver's type argument: Acc<Node>.Get() is a Node, so
                      * `a.Get().tag` finds Node's fields instead of treating an
                      * erased result as a number */
-                    zan_type_t *mt = subst_type_param_deep(g, m->type, rt);
+                    /* a method declaring its own <U> returns the type bound at
+                     * this call site: `s.Echo<int>(42)` is an int, whether it
+                     * is awaited or not. Class type args are substituted after,
+                     * so `p.Get<U>()` on a Pool<string> still yields string. */
+                    zan_type_t *mt = method_ret_type_at(g, m, e, obj, locals);
+                    if (!mt) mt = m->type;
+                    mt = subst_type_param_deep(g, mt, rt);
                     if (mt && mt->kind == TYPE_TYPE_PARAM) mt = concretize(g, mt);
                     return mt;
                 }

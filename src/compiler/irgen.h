@@ -234,6 +234,11 @@ struct zan_irgen {
         int             bindc;
         LLVMValueRef    fn;
         LLVMTypeRef     fn_type;
+        /* an async specialization is a ramp/resume/frame triple (A32-3b):
+         * `fn` is the ramp and `async_ir` the method_body_work_t carrying its
+         * frame layout, kept until the body is emitted from the queue. */
+        bool            is_async;
+        void           *async_ir;
     } *method_specs;
     int method_spec_count;
     int method_spec_cap;

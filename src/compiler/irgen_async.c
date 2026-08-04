@@ -1060,8 +1060,10 @@ static void async_scan_stmt(async_scan_t *s, zan_ast_node_t *st) {
          * here with the same inference the emitter uses. Skipping inferred
          * declarations left them stack-only, so their value was garbage after
          * any suspension. */
+        /* resolved in the specialization's context, so a `T`/`U` local in a
+         * monomorphized async body gets its concrete frame slot */
         zan_type_t *t = st->var_decl.type
-            ? zan_binder_resolve_type(s->g->binder, st->var_decl.type)
+            ? resolve_type_ctx(s->g, st->var_decl.type)
             : NULL;
         if ((!t || t->kind == TYPE_ERROR) && st->var_decl.initializer)
             t = infer_expr_type(s->g, st->var_decl.initializer, s->scope);
@@ -1105,7 +1107,7 @@ static void async_scan_stmt(async_scan_t *s, zan_ast_node_t *st) {
          * iteration reloads them from the live list. */
         int fe_id = s->foreach_next++;
         zan_type_t *et = st->foreach_stmt.var_type
-            ? zan_binder_resolve_type(s->g->binder, st->foreach_stmt.var_type)
+            ? resolve_type_ctx(s->g, st->foreach_stmt.var_type)
             : NULL;
         if (!et || et->kind == TYPE_ERROR)
             et = container_elem_type(
@@ -1140,7 +1142,7 @@ static void async_scan_stmt(async_scan_t *s, zan_ast_node_t *st) {
                     LLVMPointerType(LLVMInt8TypeInContext(s->g->ctx), 0));
                 if (cc->catch_clause.type)
                     async_scan_note_type(s, cc->catch_clause.var_name,
-                        zan_binder_resolve_type(s->g->binder, cc->catch_clause.type));
+                        resolve_type_ctx(s->g, cc->catch_clause.type));
             }
             async_scan_stmt(s, cc->catch_clause.body);
         }

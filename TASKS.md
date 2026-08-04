@@ -626,7 +626,7 @@ initializer/Add/upsert/indexer/Values/Remove/Clear/扩容。三档测试全部�
 4. 只有调用点确实无法得到具体类型参数时才发源码级诊断，不允许回落到会 abort/产坏 IR 的
    erased template。
 
-### A32-3b async 泛型方法
+### A32-3b async 泛型方法（已完成 2026-08-04，见 A43-A8 详情）
 
 1. 从 `emit_user_methods()` 提取可复用的 async-specialization emitter，输入完整 substitution
    context，输出一组 ramp/frame/resume/cleanup，而不是复制第二套 CPS lowering。
@@ -872,7 +872,7 @@ leakcheck 子集全部通过；生成 IR 不含 `setjmp`/`longjmp`/`__zan_eh_tmp
 | A43-A5 | `event H E;` + `a.E += P.OnE; a.Fire();` 编译通过、静默不触发（输出只有 `end`） | 28 | ⬜ 待修（A33-2 一并） |
 | A43-A6 | 捕获式 lambda：`(a) => a + k` 报 `use of undeclared identifier 'k'`；捕获字段时诊断还指向 `stdlib/System/Security/Cryptography/Md5.zan`（位置也错） | 22 | ⬜ 待修（A33-2） |
 | A43-A7 | 泛型类里的实例泛型方法 `Pool<T>.M<U>()` 运行崩溃（0xC0000005） | 13 | ✅ 已修（A32-3a，见下 A43-A7 详情） |
-| A43-A8 | async 泛型方法返回垃圾值（打印 `-1886711216`） | 56 | ⬜ 待修（A32-3b） |
+| A43-A8 | async 泛型方法返回垃圾值（打印 `-1886711216`） | 56 | ✅ 已修（A32-3b，见下 A43-A8 详情） |
 | A43-A9 | `static A()` 只在首次 `new` 时执行：先读 `A.n` 得 0，`new A()` 后才是 7（C# 首次访问静态成员即触发） | 08,40,95–99 | ✅ 已修（见下 A43-A9 详情） |
 | A43-A10 | `readonly` 只解析不强制：`public readonly int x;` 在类外 `a.x = 6;` 编译通过并改值 | 71,72,90–94 | ✅ 已修（见下 A43-A10 详情） |
 
@@ -1073,8 +1073,49 @@ conformance/determinism/leakcheck 三档均通过。唯一一个能编过却崩�
 `leakcheck_field_decl_initializers` 已用 HEAD（fd59fcb）的干净 worktree 编译验证
 为既存缺陷，与本次改动无关。
 
-未做：async 泛型方法仍走 `emit_user_methods()` 的单独 CPS 路径（A32-3b / A43-A8），
-`method_is_tp_template()` 对 async 模板仍发诊断。
+### A43-A8 详情（已完成 2026-08-04，A32-3b）
+
+async 泛型方法此前根本没有特化：`emit_user_methods()` 只按原方法符号发一份 erased 的
+ramp/frame/resume，`get_or_create_method_spec()` 直接 `return -1`，模板型 async 泛型方法
+还专门发一条「cannot be monomorphized today」诊断。于是 `await P.Id<int>(1)` 拿到的是
+把 frame 指针位模式当 `int` 读出来的垃圾值。
+
+1. **可复用的 async emitter**（`irgen_emit.c`）。原来内联在 Pass A/Pass B 里的两段代码
+   抽成 `declare_async_method()`（ANF 归一化 + async scan + frame 布局 + ramp/resume 声明）
+   与 `emit_async_method_ir()`（ramp 体、resume 状态机、cleanup），二者都只吃一个
+   `method_body_work_t`；Pass A/B 与方法特化共用同一份 lowering，没有第二套 CPS。
+2. **async method spec**（`irgen.h`/`irgen_emit.c`）。`zan_method_spec` 增加
+   `is_async` + `async_ir`（ramp、resume、frame type、await/local/handler 布局），
+   key 仍是 `{method symbol, owner instantiation, method type args}`，名字随之变成
+   `Pool$string_Wrap$$int` / `…$resume` / `…$cleanup` / `…$frame`，不同特化不会共用 frame。
+   声明与 body 发射都在绑定生效（`cur_mtps`/`cur_mbind`/`cur_inst`）的上下文里进行，
+   所以参数槽、返回、跨 await 的局部、异常与取消路径全部是替换后的具体类型和 ARC 规则；
+   调用点仍然返回统一的 task handle（ramp 返回 `i8*`），await/spawn 协议不变。
+3. **async scan 也要按上下文解析**（`irgen_async.c`）。`T x = …` / `foreach (T e …)` /
+   `catch (E e)` 之前用 `zan_binder_resolve_type()` 解析声明类型，特化体里 `U tail = x;`
+   于是拿到指针宽度的 frame 槽，`Pool<string>.Wrap<int>` 一挂起就崩；改用
+   `resolve_type_ctx()`。
+4. **await 结果的静态类型**（`irgen_expr_core.c`）。`s.Echo<int>(42)` 与不加限定的
+   `Id<int>(8)` 这两条推断路径只替换了类的类型实参、没有替换方法自己的，
+   `Console.WriteLine(await s.Echo<int>(42))` 因此按指针重载打印 → 0xC0000005。
+   两处改为经 `method_ret_type_at()` 绑定方法类型参数后再套 owner 实例化。
+
+删除的拒绝分支：`method_is_tp_template()` 对 async 模板的
+「async generic methods cannot be monomorphized today」诊断（模板现在与非 async 模板
+一样，只以特化形式存在）。
+
+正式测试：`tests/conformance/async_generic_method.zan`、
+`tests/conformance/generic_class_async_generic_method.zan`（各含 `.out`），覆盖
+值/引用/`double` 参数、T 成员访问的模板方法、跨 await 的 U/T 局部、模板转发、
+async generic 调 async generic、frame 内 catch、异常穿出到 awaiter、
+`Task.Spawn` + `Task.Cancel`、两种 owner instantiation（`Pool<string>` / `Pool<int>` /
+`Pool<Item>`）与 ARC；conformance/determinism/leakcheck 三档均通过。
+
+回归：`ctest -R 'generic|async|await|coroutine' -j 8` → 144 项中仅 `golden_async_delay_ir`、
+`golden_async_socket_ir` 失败，二者是过期的黄金 IR 期望（期望 `%zan.co.timer` /
+`@__zan_co_timers`，而定时器早已移进 runtime，编译器源码里已无此符号），与本次改动无关。
+`ctest -R 'conformance_|leakcheck_' -j 8` 的其余失败仍是工作区未提交的 stdlib 改动导致的
+编译错误（`Convert.ToString`、`SemaphoreSlim.Create` 等已被删除的成员）。
 
 ## A43-B 语法缺失（parser 层不接受，按价值排序）
 
