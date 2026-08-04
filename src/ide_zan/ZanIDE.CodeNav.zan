@@ -474,11 +474,66 @@ partial class ZanIDE {
     /// Every file on disk the navigation commands search: the project sources,
     /// then the stdlib (whose sources are browsable here, and where most of what
     /// a project calls is declared).
+    ///
+    /// Walking the stdlib means walking a thousand-odd files, which made every
+    /// unresolved jump crawl: the list is built once per project and reused
+    /// until the project changes or its index is rebuilt (save / build).
     static List<string> NavSearchFiles(string root) {
+        if (ZanIDE.navFiles != null && ZanIDE.navFilesRoot == root) {
+            return ZanIDE.navFiles;
+        }
         List<string> files = ZanIDE.ListZanFiles(root + "/src");
         List<string> std = ZanIDE.ListZanFiles(ZanIDE.StdlibDir());
         for (int i = 0; i < std.Count; i = i + 1) { files.Add(std[i]); }
+        ZanIDE.navFiles = files;
+        ZanIDE.navFilesRoot = root;
         return files;
+    }
+
+    /// Forgets the cached search list, so a file added since is found.
+    static void InvalidateNavFiles() {
+        ZanIDE.navFiles = null;
+        ZanIDE.navFilesRoot = "";
+    }
+
+    /// `files` reordered so the ones named after `hint` come first: a type lives
+    /// in the file named after it far more often than not, so the search reads
+    /// one file instead of the whole stdlib before it answers.
+    static List<string> NameFirst(List<string> files, string hint) {
+        if (hint.Length == 0) { return files; }
+        List<string> head = new List<string>();
+        List<string> tail = new List<string>();
+        for (int i = 0; i < files.Count; i = i + 1) {
+            string b = Path.GetFileName(files[i]);
+            int dot = ZanIDE.IndexOfStr(b, ".");
+            if (dot > 0) { b = b.Substring(0, dot); }
+            if (b == hint) { head.Add(files[i]); } else { tail.Add(files[i]); }
+        }
+        for (int j = 0; j < tail.Count; j = j + 1) { head.Add(tail[j]); }
+        return head;
+    }
+
+    /// Where type `owner` declares `member`, as "file:line" for the log, or "".
+    /// Nothing is opened and no tab is switched: this only names the place.
+    static string FindMemberDeclFile(List<TabRecord> tabs, string root,
+                                     string owner, string member) {
+        for (int i = 0; i < tabs.Count; i = i + 1) {
+            int ln = CodeEditor.FindMemberDeclLineIn(
+                CodeEditor.SplitLines(tabs[i].body), owner, member);
+            if (ln >= 0) {
+                return tabs[i].name + ":" + Convert.ToString(ln + 1);
+            }
+        }
+        List<string> files = ZanIDE.NameFirst(ZanIDE.NavSearchFiles(root), owner);
+        for (int fi = 0; fi < files.Count; fi = fi + 1) {
+            if (ZanIDE.FindTabByPath(tabs, files[fi]) >= 0) { continue; }
+            int ln = CodeEditor.FindMemberDeclLineIn(
+                CodeEditor.SplitLines(File.ReadAllText(files[fi])), owner, member);
+            if (ln >= 0) {
+                return Path.GetFileName(files[fi]) + ":" + Convert.ToString(ln + 1);
+            }
+        }
+        return "";
     }
 
     /// Jumps to where type `owner` declares `member`, searching the open tabs
@@ -507,7 +562,7 @@ partial class ZanIDE {
                 return ln;
             }
         }
-        List<string> files = ZanIDE.NavSearchFiles(root);
+        List<string> files = ZanIDE.NameFirst(ZanIDE.NavSearchFiles(root), owner);
         for (int fi = 0; fi < files.Count; fi = fi + 1) {
             string fp = files[fi];
             if (ZanIDE.FindTabByPath(tabs, fp) >= 0) { continue; }
@@ -562,7 +617,7 @@ partial class ZanIDE {
         // Most symbols a project uses are declared in the stdlib, and stdlib
         // sources are browsable/openable here, so search them after the project
         // instead of reporting "not found in project".
-        List<string> files = ZanIDE.NavSearchFiles(root);
+        List<string> files = ZanIDE.NameFirst(ZanIDE.NavSearchFiles(root), word);
         for (int fi = 0; fi < files.Count; fi = fi + 1) {
             string fp = files[fi];
             if (ZanIDE.FindTabByPath(tabs, fp) < 0) {
@@ -752,6 +807,13 @@ partial class ZanIDE {
                 total = total + ZanIDE.CountRefsInFile(Path.GetFileName(fp), body,
                     word, owner, log);
             }
+        }
+        // Where it is declared, so the answer is never a bare zero for a member
+        // that plainly exists: an owner whose uses all live outside the project
+        // (a stdlib type used by one call site, say) still shows its own home.
+        if (owner.Length > 0) {
+            string dp = ZanIDE.FindMemberDeclFile(tabs, root, owner, word);
+            if (dp != "") { log.Add("   " + dp + "  (declaration)"); }
         }
         log.Add("> " + Convert.ToString(total) + " reference(s) found.");
     }
