@@ -3220,21 +3220,6 @@ partial class ZanIDE {
                         if (!aiTeamMode) { aiRunAgent = ""; }
                         app.RequestRedraw();
                     }
-                    // Clicking a member in the strip addresses them: complete
-                    // the composer's trailing mention, or start one.
-                    if (aiTeamMode && TeamBoard.clicked != "") {
-                        string curm = aiInput.GetText();
-                        if (AiTeam.MentionStart(curm) >= 0) {
-                            aiInput.SetText(
-                                AiTeam.ApplyMention(curm, TeamBoard.clicked));
-                        } else {
-                            string tail = "";
-                            if (curm != "" && !curm.EndsWith(" ")) { tail = " "; }
-                            aiInput.SetText(curm + tail + "@"
-                                + AiTeam.MentionToken(TeamBoard.clicked) + " ");
-                        }
-                        app.RequestRedraw();
-                    }
                     int aiPlanH = AiPlanHeight(app);
                     if (aiPlanH > 0) {
                         AiRenderPlan(app,
@@ -3386,26 +3371,27 @@ partial class ZanIDE {
                         aiAutoBtn.Text = aiAutoExec ? ZanIDE.T("A:on", "自:开")
                             : ZanIDE.T("A:off", "自:关");
                     }
-                    // Team mode: say who Send will address, resolved by the same
-                    // rule the send uses, so "@ someone" can be trusted before
-                    // pressing Enter instead of after.
+                    // Team mode: say who Send will address, and let that be
+                    // picked. The recipient is state (aiSendTo), not text in the
+                    // prompt, so the box holds only what the user wrote and
+                    // exactly one member is addressed. Empty = let the context
+                    // decide, shown as the member it currently resolves to.
                     if (aiTeamMode && aiCueH > 0) {
-                        string cueTxt = aiInput.GetText();
-                        string cueBad = AiTeam.UnknownMention(cueTxt);
-                        string cueName = "";
-                        string cueCls = "";
-                        if (cueBad != "") {
-                            cueName = "@" + cueBad + " ?";
-                            cueCls = "danger";
-                        } else {
-                            string cueId = AiTeam.RouteUserSt(cueTxt, aiMsgs,
+                        string cueId = aiSendTo;
+                        bool cueAuto = cueId == "";
+                        if (cueAuto) {
+                            cueId = AiTeam.RouteUserSt(aiInput.GetText(), aiMsgs,
                                 aiTeamSt);
-                            cueName = AiTeam.DisplayName(cueId);
-                            cueCls = AiTeam.RoleTagClass(cueId);
+                        }
+                        string cueName = AiTeam.DisplayName(cueId);
+                        string cueCls = AiTeam.RoleTagClass(cueId);
+                        if (cueAuto) {
+                            cueName = cueName + ZanIDE.T(" (auto)", "（自动）");
                         }
                         string cueLab = ZanIDE.T("Sending to", "将发给");
                         int cueFs = app.theme.fontSizeSmall;
-                        int cueTx = rp.x + rPad;
+                        int cueX = rp.x + rPad;
+                        int cueTx = cueX;
                         app.canvas.DrawStyledText(
                             Style.Of(app, "label", "hint small", Style.SNormal()),
                             cueTx,
@@ -3413,12 +3399,53 @@ partial class ZanIDE {
                             cueLab, app.theme.textTertiary, cueFs);
                         cueTx = cueTx + Canvas.MeasureText(cueLab, cueFs)
                             + app.Scale(6);
+                        int cueChipW = 0;
                         if (cueName != ""
                             && cueTx + Tag.Width(app, cueName, cueCls)
                                 <= rp.x + rp.width - rPad) {
+                            cueChipW = Tag.Width(app, cueName, cueCls);
                             Tag.Chip(app, cueTx,
                                 aiCueY + (aiCueH - Tag.Height(app, cueCls)) / 2,
                                 cueName, cueCls);
+                        }
+                        // The caret says the row opens, and the whole row (label
+                        // + chip + caret) is the hit target: a 10px glyph is not
+                        // something to have to aim at.
+                        int cueCarX = cueTx + cueChipW + app.Scale(3);
+                        app.canvas.DrawText(cueCarX,
+                            aiCueY + (aiCueH - Canvas.FontHeight(cueFs)) / 2,
+                            "▾", app.theme.textTertiary, cueFs);
+                        int cueW = cueCarX + Canvas.MeasureText("▾", cueFs) - cueX;
+                        int cueHid = app.focus.AllocId();
+                        app.hitTester.Register(HitRegion.Create(cueHid, cueX,
+                            aiCueY, cueW, aiCueH, 1));
+                        if (Ui.Clicked(app, cueHid)) {
+                            aiCueOpen = !aiCueOpen;
+                            app.RequestRedraw();
+                        }
+                        if (aiCueOpen) {
+                            List<string> cueOpts = new List<string>();
+                            List<string> cueIds = new List<string>();
+                            cueOpts.Add(ZanIDE.T("Auto (by context)", "自动（按上下文）"));
+                            cueIds.Add("");
+                            List<AiRole> cueRs = AiTeam.Roles();
+                            for (int cri = 0; cri < cueRs.Count; cri = cri + 1) {
+                                cueOpts.Add(AiTeam.DisplayName(cueRs[cri].id));
+                                cueIds.Add(cueRs[cri].id);
+                            }
+                            // Anchored at the row: the menu is taller than the
+                            // space below it, so ContextMenu's clamp lifts it
+                            // over the transcript instead of off-screen.
+                            int cuePick = ContextMenu.Render(app, cueX,
+                                aiCueY + aiCueH, cueOpts);
+                            if (cuePick >= 0 && cuePick < cueIds.Count) {
+                                aiSendTo = cueIds[cuePick];
+                                aiCueOpen = false;
+                                app.RequestRedraw();
+                            } else if (cuePick == 0 - 2) {
+                                aiCueOpen = false;
+                                app.RequestRedraw();
+                            }
                         }
                     }
                     int aiAutoId = aiAutoBtn.Render(app, rp.x + rPad, aiBtnY,
@@ -3495,65 +3522,11 @@ partial class ZanIDE {
                     int aiInpX = rp.x + rPad * 2 + aiAutoW;
                     int aiInpW = rInW - aiAutoW - rPad;
                     if (aiInpW < app.Scale(40)) { aiInpW = app.Scale(40); }
-                    // @-mention picker: while the composer's tail is an
-                    // unfinished mention, float the member list above it. The
-                    // list owns Up / Down / Enter / Tab / Esc, so the member is
-                    // chosen with the keyboard alone -- which means deciding
-                    // that BEFORE the box renders, because the box would
-                    // otherwise take the same keys as caret moves and newlines.
-                    bool aiMentioning = false;
-                    string aiMentionPick = "";
-                    List<AiRole> aiMentionHits = new List<AiRole>();
-                    if (aiTeamMode && aiBusy.Get() == 0
-                        && app.focus.IsFocused(aiInput.Id())) {
-                        string aiMq = aiInput.GetText();
-                        int aiMqAt = AiTeam.MentionStart(aiMq);
-                        if (aiMqAt >= 0 && aiMq != aiMentHidden) {
-                            string frag = aiMq.Substring(aiMqAt + 1);
-                            aiMentionHits = AiTeam.MentionMatches(frag);
-                            aiMentioning = aiMentionHits.Count > 0;
-                        }
-                        if (aiMqAt < 0) { aiMentHidden = ""; }
-                    }
-                    if (aiMentioning) {
-                        if (aiMentSel >= aiMentionHits.Count) {
-                            aiMentSel = aiMentionHits.Count - 1;
-                        }
-                        if (aiMentSel < 0) { aiMentSel = 0; }
-                        int aiMentKind = app.EventKind();
-                        int aiMentKey = app.window.EventKeyCode();
-                        if (aiMentKind == 4 && (aiMentKey == 38
-                            || aiMentKey == 40 || aiMentKey == 27)) {
-                            aiInput.SkipKeysOnce();
-                            if (aiMentKey == 38) { aiMentSel = aiMentSel - 1; }
-                            if (aiMentKey == 40) { aiMentSel = aiMentSel + 1; }
-                            if (aiMentSel < 0) {
-                                aiMentSel = aiMentionHits.Count - 1;
-                            }
-                            if (aiMentSel >= aiMentionHits.Count) {
-                                aiMentSel = 0;
-                            }
-                            if (aiMentKey == 27) {
-                                aiMentHidden = aiInput.GetText();
-                                aiMentioning = false;
-                            }
-                            app.RequestRedraw();
-                        } else if (aiMentKind == 6 && (aiMentKey == 13
-                            || aiMentKey == 9)) {
-                            // Enter / Tab accept the highlighted member: the
-                            // box must not also insert the newline or the tab.
-                            aiInput.SkipKeysOnce();
-                            aiMentionPick = aiMentionHits[aiMentSel].id;
-                        }
-                    } else if (aiMentionHits.Count == 0) {
-                        aiMentSel = 0;
-                    }
+                    // No mention picker: an @name is typed like any other word
+                    // and the cue row above the box already says who Send will
+                    // reach, so a popup that eats Up / Down / Enter / Tab / Esc
+                    // buys nothing.
                     int aiInpId = aiInput.Render(app, aiInpX, aiInY, aiInpW, aiInH);
-                    if (aiMentioning) {
-                        string aiClickPick = TeamBoard.MentionRows(app,
-                            aiInpX, aiInY, aiInpW, aiMentionHits, aiMentSel);
-                        if (aiClickPick != "") { aiMentionPick = aiClickPick; }
-                    }
                     // While a request (or an auto-continued tool loop) is in
                     // flight, Send becomes Stop: it abandons the streaming
                     // child and clears the continuation budget, so a task that
@@ -3583,20 +3556,12 @@ partial class ZanIDE {
                     bool doSend = sendId >= 0 && Ui.Clicked(app, sendId);
                     // Enter sends, Shift+Enter is a newline. The box handles
                     // the key itself (it is a real multi-line editor), so the
-                    // newline it just inserted is trimmed back off below. While
-                    // the mention list is up it already took this Enter.
-                    if (!doSend && !aiMentioning && app.EventKind() == 6
+                    // newline it just inserted is trimmed back off below.
+                    if (!doSend && app.EventKind() == 6
                         && app.window.EventKeyCode() == 13
                         && !Modifiers.HasShift(app.window.EventMods())
                         && app.focus.IsFocused(aiInpId)) {
                         doSend = true;
-                    }
-                    if (aiMentionPick != "") {
-                        aiInput.SetText(AiTeam.ApplyMention(
-                            aiInput.GetText(), aiMentionPick));
-                        aiMentSel = 0;
-                        aiMentHidden = "";
-                        app.RequestRedraw();
                     }
                     if (doSend && aiBusy.Get() == 0) {
                         string q = AiAgent.Trim(aiInput.GetText());
@@ -3620,14 +3585,16 @@ partial class ZanIDE {
                             q = "";
                         }
                         if (q != "") {
-                            // Team mode: an explicit @name is an address and
-                            // wins; without one a parked question is answered by
-                            // whoever asked it, so "continue" resumes the stage
-                            // it stopped in instead of restarting the pipeline,
-                            // and otherwise the member that spoke last takes it.
+                            // Team mode: the member picked in the cue row is the
+                            // address and wins; on "auto" a parked question is
+                            // answered by whoever asked it, so "continue"
+                            // resumes the stage it stopped in instead of
+                            // restarting the pipeline, and otherwise the member
+                            // that spoke last takes it.
                             string tgt = "";
                             if (aiTeamMode) {
-                                tgt = AiTeam.RouteUserSt(q, aiMsgs, aiTeamSt);
+                                if (aiSendTo != "") { tgt = aiSendTo; }
+                                else { tgt = AiTeam.RouteUserSt(q, aiMsgs, aiTeamSt); }
                                 aiTeamSt.awaitingUser = false;
                                 aiTeamSt.askedBy = "";
                             }
@@ -5746,10 +5713,10 @@ partial class ZanIDE {
         // the user flips the switch; the state is a live object either way so
         // the pipeline code never has to null-check it.
         aiTeamMode = false;
+        aiSendTo = "";
+        aiCueOpen = false;
         aiRunAgent = "";
         aiHandoffs = 0;
-        aiMentSel = 0;
-        aiMentHidden = "";
         aiTeamSt = AiTeamState.Create();
         aiTasks = new List<AiTask>();
         aiTeamOpen = SignalInt.Create(0);

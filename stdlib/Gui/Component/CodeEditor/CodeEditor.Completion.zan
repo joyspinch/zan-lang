@@ -328,10 +328,73 @@ partial class CodeEditor {
         return CodeEditor.Find(ctrl, " " + w + " ") >= 0;
     }
 
-    /// If `line` is a method/function declaration, returns the method name;
-    /// otherwise returns "". Heuristic: an identifier followed by a parameter
-    /// list whose matching ')' is followed by the body's '{', and that is not a
-    /// control statement.
+    /// The identifier declared right before `at` in `trimmed` (the position of
+    /// the '(' or '{' that follows it), or "" when there is none or nothing
+    /// precedes it -- a declaration always has a type or a modifier in front of
+    /// the name, which is what separates it from a call or a bare block.
+    static string DeclIdentBefore(string trimmed, int at) {
+        string idset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
+        int e = at;
+        while (e > 0) {
+            string ch = trimmed.Substring(e - 1, 1);
+            if (CodeEditor.InSet(idset, ch)) { e = e - 1; }
+            else { break; }
+        }
+        string name = trimmed.Substring(e, at - e);
+        if (name.Length == 0 || e == 0) { return ""; }
+        if (CodeEditor.IsControlWord(name)) { return ""; }
+        return name;
+    }
+
+    /// The property `line` declares (`public int page { get; set; } = 1;`), or ""
+    /// when it declares none. The accessors are what tell a property from a type
+    /// declaration or a plain block: the head before the '{' carries no '(' (that
+    /// is a method or a control statement), no '=' (an assignment) and no '['
+    /// (an indexer), and the braces hold a get / set.
+    static string PropNameAt(string trimmed) {
+        int bo = CodeEditor.Find(trimmed, "{");
+        if (bo <= 0) { return ""; }
+        string head = trimmed.Substring(0, bo);
+        if (CodeEditor.Find(head, "(") >= 0) { return ""; }
+        if (CodeEditor.Find(head, "=") >= 0) { return ""; }
+        if (CodeEditor.Find(head, "[") >= 0) { return ""; }
+        if (CodeEditor.Find(head, ":") >= 0) { return ""; }
+        string body = trimmed.Substring(bo + 1, trimmed.Length - bo - 1);
+        if (CodeEditor.Find(body, "get") < 0
+            && CodeEditor.Find(body, "set") < 0) {
+            return "";
+        }
+        int he = bo;
+        while (he > 0) {
+            string ch = trimmed.Substring(he - 1, 1);
+            if (ch != " " && ch != "\t") { break; }
+            he = he - 1;
+        }
+        string name = CodeEditor.DeclIdentBefore(trimmed, he);
+        if (name.Length == 0) { return ""; }
+        string before = CodeEditor.TrimStr(
+            trimmed.Substring(0, he - name.Length));
+        if (before.Length == 0) { return ""; }
+        // What precedes the name has to end a type or a modifier. `} else {`
+        // ends in a brace, and its body can hold a "set" ("settings.Save()"),
+        // which is how a block got counted as a property.
+        string tail = before.Substring(before.Length - 1, 1);
+        string idset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
+        if (!CodeEditor.InSet(idset, tail) && tail != ">" && tail != "]"
+            && tail != "?") {
+            return "";
+        }
+        // `class A { get; }` is not a property, and a type name is already
+        // reported by the outline rather than by a reference count.
+        string types = " class struct interface enum namespace ";
+        if (CodeEditor.Find(types, " " + before + " ") >= 0) { return ""; }
+        return name;
+    }
+
+    /// If `line` declares a member, returns its name; otherwise returns "".
+    /// A method is an identifier followed by a parameter list whose matching ')'
+    /// is followed by the body's '{' and that is not a control statement; a
+    /// property is an identifier followed by get / set accessors.
     static string DeclNameAt(string line) {
         string trimmed = CodeEditor.TrimStr(line);
         if (trimmed.Length == 0) { return ""; }
@@ -339,6 +402,11 @@ partial class CodeEditor {
         // The body itself may close on the same line -- a one-line accessor like
         // `WebApp Views(string d) { views = d; return this; }` is a declaration
         // as much as one whose brace ends the line.
+        // A property is decided first: its initialiser can hold the line's only
+        // parentheses (`{ get; set; } = new List<T>();`), which the method path
+        // would then try to read as a parameter list.
+        string prop = CodeEditor.PropNameAt(trimmed);
+        if (prop.Length > 0) { return prop; }
         int paren = CodeEditor.Find(trimmed, "(");
         if (paren <= 0) { return ""; }
         int depth = 0;
@@ -364,19 +432,7 @@ partial class CodeEditor {
         // Reject obvious non-decls: an assignment before the parameter list.
         string dhead = trimmed.Substring(0, paren);
         if (CodeEditor.Find(dhead, "=") >= 0) { return ""; }
-        string idset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
-        int e = paren;
-        while (e > 0) {
-            string ch = trimmed.Substring(e - 1, 1);
-            if (CodeEditor.InSet(idset, ch)) { e = e - 1; }
-            else { break; }
-        }
-        string name = trimmed.Substring(e, paren - e);
-        if (name.Length == 0) { return ""; }
-        // A declaration has a return type / modifier before the name.
-        if (e == 0) { return ""; }
-        if (CodeEditor.IsControlWord(name)) { return ""; }
-        return name;
+        return CodeEditor.DeclIdentBefore(trimmed, paren);
     }
 
     /// `line` with comment and string/char literal text blanked out (same
