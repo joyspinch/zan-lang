@@ -1144,16 +1144,18 @@ static bool dg_expr_compatible(dg_ctx_t *c, const dg_fields_t *fs,
                                zan_ast_node_t *e, zan_istr_t pname);
 
 static void dg_rewrite_where(dg_ctx_t *c, zan_ast_node_t *call,
-                             zan_istr_t cls) {
+                             zan_istr_t cls, bool expr_ok) {
     /* Expr path: simple predicates (comparisons / logic / string methods)
      * lower to an Expr<cls> tree and let stdlib ExprSql build the SQL in
      * pure Zan. Complex shapes (IN, aggregates, Between, ...) fall back to
-     * the SQL-fragment path below. */
+     * the SQL-fragment path below, as does every chain but Select: only the
+     * query class carries a Where(Expr<cls>) overload. */
     dg_fields_t fields;
     memset(&fields, 0, sizeof(fields));
     dg_collect_fields(c->unit, dg_find_class(c->unit, cls), &fields, 0);
     zan_ast_node_t *lambda = call->call.args.items[0];
-    if (lambda->kind == AST_LAMBDA && lambda->lambda.params.count == 1) {
+    if (expr_ok && lambda->kind == AST_LAMBDA &&
+        lambda->lambda.params.count == 1) {
         zan_istr_t pname = lambda->lambda.params.items[0]->param.name;
         if (dg_expr_compatible(c, &fields, lambda->lambda.body, pname)) {
             zan_ast_node_t *tree =
@@ -2049,7 +2051,7 @@ static void dg_visit_call(dg_ctx_t *c, zan_ast_node_t *e) {
     }
     if (e->call.args.count != 1 || e->call.args.items[0]->kind != AST_LAMBDA)
         return;
-    if (is_where) dg_rewrite_where(c, e, entity);
+    if (is_where) dg_rewrite_where(c, e, entity, ck == CK_SELECT);
     else if (is_inc && ck == CK_SELECT) dg_rewrite_include(c, e, entity);
     else if ((is_ob || is_obd) && ck == CK_SELECT)
         dg_rewrite_orderby(c, e, entity, is_obd);
