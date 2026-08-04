@@ -1,0 +1,419 @@
+using System;
+using System.Json;
+using System.Text;
+
+namespace System.Web;
+
+/// <summary>
+/// Aborts an action with a uniform API answer. `Need("title", "标题")` throws this
+/// when the parameter is absent, which is how a required parameter can read as
+/// one expression in the middle of an action:
+///
+///     string title = this.Need("title", "标题");
+///
+/// The generated trampoline catches it and writes {"code":..,"msg":..} with the
+/// carried status, so no action has to describe the same 400 twice.
+/// </summary>
+class ApiError : Exception {
+    int status;      // HTTP status to answer with
+    string code;     // business code ("0003" = missing/invalid parameter)
+
+    ApiError(int status, string code, string message) {
+        Message = message;
+        this.status = status;
+        this.code = code;
+    }
+
+    int Status() { return this.status; }
+    string Code() { return this.code; }
+
+    /// <summary>The standard reason phrase for a status code. The status line is
+    /// ASCII by protocol, so a localized message belongs in the JSON body and
+    /// never in the status text.</summary>
+    static string Reason(int status) {
+        if (status == 400) { return "Bad Request"; }
+        if (status == 401) { return "Unauthorized"; }
+        if (status == 403) { return "Forbidden"; }
+        if (status == 404) { return "Not Found"; }
+        if (status == 405) { return "Method Not Allowed"; }
+        if (status == 409) { return "Conflict"; }
+        if (status == 413) { return "Payload Too Large"; }
+        if (status == 422) { return "Unprocessable Entity"; }
+        if (status == 429) { return "Too Many Requests"; }
+        if (status == 500) { return "Internal Server Error"; }
+        if (status == 503) { return "Service Unavailable"; }
+        if (status < 400) { return "OK"; }
+        return "Error";
+    }
+}
+
+/// <summary>
+/// One documented request parameter. The compiler fills these in from the
+/// `In*`/`Need*`/`Param` calls in the action body -- the code that reads a
+/// parameter is the declaration of that parameter, so there is no second place
+/// to keep in sync and no way for the docs to drift from the handler.
+/// </summary>
+class ApiParam {
+    string name;
+    string type;      // "string" | "int" | "long" | "number" | "bool"
+    bool required;
+    string def;       // literal default as written in the source ("" when none)
+    string desc;      // label passed to Need(), or "" for In()
+    string source;     // "path" | "query" (query covers form/query/body fields)
+
+    ApiParam(string name, string type, bool required, string def, string desc,
+             string source) {
+        this.name = name;
+        this.type = type;
+        this.required = required;
+        this.def = def;
+        this.desc = desc;
+        this.source = source;
+    }
+
+    string Name() { return this.name; }
+    string Type() { return this.type; }
+    bool Required() { return this.required; }
+    string Default() { return this.def; }
+    string Desc() { return this.desc; }
+    string Source() { return this.source; }
+
+    /// <summary>OpenAPI JSON type for this parameter.</summary>
+    string JsonType() {
+        if (this.type == "int" || this.type == "long") { return "integer"; }
+        if (this.type == "number") { return "number"; }
+        if (this.type == "bool") { return "boolean"; }
+        return "string";
+    }
+}
+
+/// <summary>
+/// The framework's built-in API reference: an OpenAPI 3 document plus an offline
+/// UI, both generated from the routes the compiler already registered. Mount it
+/// once and every attribute-routed action appears with its verb, path, title,
+/// auth requirements and parameters:
+///
+///     ApiDocs.Mount(app);            // GET /api/docs and /api/docs.json
+///
+/// Nothing here is configured by hand. Titles come from [Description], the auth
+/// badges from the same [Custom(Authorization=...)] the dispatcher enforces, and
+/// the parameters from the action body -- so a documented endpoint cannot
+/// disagree with the endpoint that runs.
+/// </summary>
+class ApiDocs {
+    /// Document title shown in the UI and the OpenAPI info block.
+    static string title = "API";
+
+    /// <summary>Names the documented service (defaults to "API").</summary>
+    static void Title(string name) { ApiDocs.title = name; }
+
+    /// <summary>Registers GET &lt;path&gt; (UI) and &lt;path&gt;.json (OpenAPI).
+    /// Both are public: they describe the surface, not the data.</summary>
+    static void Mount(WebApp app, string path) {
+        string p = path;
+        if (p.Length == 0) { p = "/api/docs"; }
+        app.Map("GET", p + ".json", ApiDocs.Spec).Named("ApiDocs.Spec")
+            .Title("API 文档 (OpenAPI)");
+        app.Map("GET", p, ApiDocs.Page).Named("ApiDocs.Page")
+            .Title("API 文档");
+    }
+
+    static void Mount(WebApp app) { ApiDocs.Mount(app, "/api/docs"); }
+
+    static async void Spec(HttpContext ctx) {
+        ctx.SetHeader("Cache-Control", "no-store");
+        ctx.Json(ApiDocs.SpecJson(WebHost.Current()));
+    }
+
+    /// <summary>A JSON string literal, quotes included.</summary>
+    static string Q(string s) { return "\"" + Encoding.JsonEscape(s) + "\""; }
+
+    static async void Page(HttpContext ctx) {
+        ctx.Html(ApiDocs.Html());
+    }
+
+    /// <summary>The OpenAPI 3.0 document for every registered route.</summary>
+    static string SpecJson(WebApp host) {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("{\"openapi\":\"3.0.3\",\"info\":{\"title\":");
+        sb.Append(ApiDocs.Q(ApiDocs.title));
+        sb.Append(",\"version\":\"1.0.0\"},\"paths\":{");
+
+        List<Route> routes = null;
+        if (host != null) { routes = host.router.All(); }
+        if (routes == null) { routes = new List<Route>(); }
+
+        // Group by path: OpenAPI keys paths, then methods inside them.
+        List<string> seen = new List<string>();
+        bool firstPath = true;
+        for (int i = 0; i < routes.Count; i++) {
+            string pt = routes[i].pattern;
+            bool done = false;
+            for (int j = 0; j < seen.Count; j++) {
+                if (seen[j] == pt) { done = true; }
+            }
+            if (done) { continue; }
+            seen.Add(pt);
+
+            if (!firstPath) { sb.Append(","); }
+            firstPath = false;
+            sb.Append(ApiDocs.Q(ApiDocs.OpenApiPath(pt)));
+            sb.Append(":{");
+            bool firstOp = true;
+            for (int k = 0; k < routes.Count; k++) {
+                Route rt = routes[k];
+                if (rt.pattern != pt) { continue; }
+                if (!firstOp) { sb.Append(","); }
+                firstOp = false;
+                ApiDocs.Operation(sb, rt);
+            }
+            sb.Append("}");
+        }
+        sb.Append("}}");
+        return sb.ToString();
+    }
+
+    /// <summary>"/user/{id}" is already OpenAPI's own syntax; this keeps the
+    /// conversion in one place in case the router's syntax ever diverges.</summary>
+    static string OpenApiPath(string pattern) { return pattern; }
+
+    static void Operation(StringBuilder sb, Route rt) {
+        sb.Append(ApiDocs.Q(rt.method.ToLower()));
+        sb.Append(":{\"summary\":");
+        string sum = rt.title;
+        if (sum.Length == 0) { sum = rt.action; }
+        sb.Append(ApiDocs.Q(sum));
+        sb.Append(",\"operationId\":");
+        sb.Append(ApiDocs.Q(rt.action));
+        sb.Append(",\"tags\":[");
+        sb.Append(ApiDocs.Q(ApiDocs.Tag(rt)));
+        sb.Append("]");
+
+        // Auth requirements are the dispatcher's, not a hand-written note.
+        sb.Append(",\"x-login\":");
+        sb.Append(rt.needsLogin ? "true" : "false");
+        sb.Append(",\"x-auth\":");
+        sb.Append(rt.needsAuth ? "true" : "false");
+        sb.Append(",\"x-rank\":");
+        sb.Append(Convert.ToString(rt.rank));
+        sb.Append(",\"x-menu\":");
+        sb.Append(rt.inMenu ? "true" : "false");
+
+        List<ApiParam> ps = rt.docParams;
+        sb.Append(",\"parameters\":[");
+        bool bodyForm = rt.method != "GET" && rt.method != "HEAD";
+        bool first = true;
+        for (int i = 0; i < ps.Count; i++) {
+            ApiParam p = ps[i];
+            // In a write request the non-path parameters are the form body, and
+            // OpenAPI wants those under requestBody rather than parameters.
+            if (bodyForm && p.Source() != "path") { continue; }
+            if (!first) { sb.Append(","); }
+            first = false;
+            ApiDocs.ParamJson(sb, p);
+        }
+        sb.Append("]");
+
+        if (bodyForm) {
+            bool anyBody = false;
+            for (int i = 0; i < ps.Count; i++) {
+                if (ps[i].Source() != "path") { anyBody = true; }
+            }
+            if (anyBody) {
+                sb.Append(",\"requestBody\":{\"content\":");
+                sb.Append("{\"application/x-www-form-urlencoded\":{\"schema\":");
+                sb.Append("{\"type\":\"object\",\"properties\":{");
+                bool f2 = true;
+                for (int i = 0; i < ps.Count; i++) {
+                    ApiParam p = ps[i];
+                    if (p.Source() == "path") { continue; }
+                    if (!f2) { sb.Append(","); }
+                    f2 = false;
+                    sb.Append(ApiDocs.Q(p.Name()));
+                    sb.Append(":{\"type\":");
+                    sb.Append(ApiDocs.Q(p.JsonType()));
+                    if (p.Desc().Length > 0) {
+                        sb.Append(",\"description\":");
+                        sb.Append(ApiDocs.Q(p.Desc()));
+                    }
+                    if (p.Default().Length > 0) {
+                        sb.Append(",\"default\":");
+                        sb.Append(ApiDocs.Q(p.Default()));
+                    }
+                    sb.Append("}");
+                }
+                sb.Append("},\"required\":[");
+                bool f3 = true;
+                for (int i = 0; i < ps.Count; i++) {
+                    ApiParam p = ps[i];
+                    if (p.Source() == "path" || !p.Required()) { continue; }
+                    if (!f3) { sb.Append(","); }
+                    f3 = false;
+                    sb.Append(ApiDocs.Q(p.Name()));
+                }
+                sb.Append("]}}}}");
+            }
+        }
+
+        sb.Append(",\"responses\":{\"200\":{\"description\":\"ok\"}}}");
+    }
+
+    static void ParamJson(StringBuilder sb, ApiParam p) {
+        sb.Append("{\"name\":");
+        sb.Append(ApiDocs.Q(p.Name()));
+        sb.Append(",\"in\":");
+        sb.Append(ApiDocs.Q(p.Source()));
+        sb.Append(",\"required\":");
+        sb.Append(p.Required() ? "true" : "false");
+        if (p.Desc().Length > 0) {
+            sb.Append(",\"description\":");
+            sb.Append(ApiDocs.Q(p.Desc()));
+        }
+        sb.Append(",\"schema\":{\"type\":");
+        sb.Append(ApiDocs.Q(p.JsonType()));
+        if (p.Default().Length > 0) {
+            sb.Append(",\"default\":");
+            sb.Append(ApiDocs.Q(p.Default()));
+        }
+        sb.Append("}}");
+        return;
+    }
+
+    /// <summary>Tag = the controller half of "Controller.Action", falling back to
+    /// the first path segment, so the UI groups endpoints the way the code is
+    /// organised.</summary>
+    static string Tag(Route rt) {
+        string a = rt.action;
+        int dot = a.IndexOf(".");
+        if (dot > 0) { return a.Substring(0, dot); }
+        List<string> segs = Router.SplitPath(rt.pattern);
+        if (segs.Count > 0) { return segs[0]; }
+        return "api";
+    }
+
+    /// <summary>The offline UI: one page, no CDN, no bundler. It fetches the
+    /// spec next door and renders it, because a docs page that needs the network
+    /// is useless exactly where docs matter (an air-gapped deployment).</summary>
+    static string Html() {
+        return ApiDocs.Shell();
+    }
+
+    static string Shell() {
+        return "<!doctype html>\n<html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
+            + "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+            + "<title>API 文档</title>\n<style>" + ApiDocs.Css() + "</style></head>\n"
+            + "<body><header><div class=\"wrap\"><h1>API 文档</h1>"
+            + "<p class=\"sub\">由路由属性与动作参数自动生成 · "
+            + "<a href=\"docs.json\">OpenAPI JSON</a></p>"
+            + "<input id=\"q\" type=\"search\" placeholder=\"搜索路径、标题或参数\" "
+            + "autocomplete=\"off\"></div></header>\n"
+            + "<main class=\"wrap\" id=\"out\">加载中…</main>\n"
+            + "<script>" + ApiDocs.Js() + "</script></body></html>\n";
+    }
+
+    static string Css() {
+        return ":root{--bg:#f5f5f7;--card:#fff;--ink:#1d1d1f;--dim:#6e6e73;"
+            + "--line:rgba(0,0,0,.08);--accent:#0071e3}"
+            + "@media (prefers-color-scheme:dark){:root{--bg:#000;--card:#1c1c1e;"
+            + "--ink:#f5f5f7;--dim:#98989d;--line:rgba(255,255,255,.12);"
+            + "--accent:#0a84ff}}"
+            + "*{box-sizing:border-box}body{margin:0;background:var(--bg);"
+            + "color:var(--ink);font:15px/1.55 -apple-system,BlinkMacSystemFont,"
+            + "'SF Pro Text','Helvetica Neue','PingFang SC','Microsoft YaHei',sans-serif}"
+            + ".wrap{max-width:960px;margin:0 auto;padding:0 24px}"
+            + "header{backdrop-filter:saturate(180%) blur(20px);"
+            + "background:color-mix(in srgb,var(--bg) 80%,transparent);"
+            + "border-bottom:1px solid var(--line);position:sticky;top:0;z-index:9;"
+            + "padding:28px 0 18px}"
+            + "h1{margin:0;font-size:28px;letter-spacing:-.02em}"
+            + ".sub{margin:6px 0 14px;color:var(--dim);font-size:13px}"
+            + ".sub a{color:var(--accent);text-decoration:none}"
+            + "#q{width:100%;padding:10px 14px;border-radius:12px;"
+            + "border:1px solid var(--line);background:var(--card);color:var(--ink);"
+            + "font-size:14px;outline:none}"
+            + "#q:focus{border-color:var(--accent)}"
+            + "main{padding-bottom:64px}"
+            + "h2{font-size:13px;text-transform:uppercase;letter-spacing:.08em;"
+            + "color:var(--dim);margin:34px 0 10px}"
+            + ".op{background:var(--card);border:1px solid var(--line);"
+            + "border-radius:14px;margin:8px 0;overflow:hidden}"
+            + ".op>summary{cursor:pointer;padding:13px 16px;display:flex;gap:10px;"
+            + "align-items:center;list-style:none}"
+            + ".op>summary::-webkit-details-marker{display:none}"
+            + ".m{font:600 11px/1 ui-monospace,SFMono-Regular,Menlo,monospace;"
+            + "padding:5px 8px;border-radius:7px;color:#fff;letter-spacing:.04em}"
+            + ".GET{background:#34c759}.POST{background:#0071e3}"
+            + ".PUT{background:#ff9500}.PATCH{background:#af52de}"
+            + ".DELETE{background:#ff3b30}.HEAD{background:#8e8e93}"
+            + ".OPTIONS{background:#8e8e93}"
+            + ".p{font:13px/1 ui-monospace,SFMono-Regular,Menlo,monospace;flex:1;"
+            + "overflow:hidden;text-overflow:ellipsis;white-space:nowrap}"
+            + ".t{color:var(--dim);font-size:13px}"
+            + ".badge{font-size:11px;padding:3px 7px;border-radius:6px;"
+            + "border:1px solid var(--line);color:var(--dim)}"
+            + ".body{padding:0 16px 16px;border-top:1px solid var(--line)}"
+            + "table{width:100%;border-collapse:collapse;margin-top:12px;font-size:13px}"
+            + "th{text-align:left;color:var(--dim);font-weight:500;padding:6px 8px;"
+            + "border-bottom:1px solid var(--line)}"
+            + "td{padding:7px 8px;border-bottom:1px solid var(--line);"
+            + "vertical-align:top}"
+            + "code{font:12px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace;"
+            + "background:color-mix(in srgb,var(--ink) 7%,transparent);"
+            + "padding:2px 5px;border-radius:5px}"
+            + ".req{color:#ff3b30}.none{color:var(--dim);padding:12px 0;font-size:13px}";
+    }
+
+    static string Js() {
+        return "const esc=s=>String(s??'').replace(/[&<>\"]/g,"
+            + "c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;'}[c]));\n"
+            + "let ops=[];\n"
+            + "function collect(spec){const out=[];"
+            + "for(const [path,item] of Object.entries(spec.paths||{})){"
+            + "for(const [m,op] of Object.entries(item)){"
+            + "const ps=(op.parameters||[]).map(p=>({name:p.name,"
+            + "where:p.in,required:!!p.required,desc:p.description||'',"
+            + "type:(p.schema||{}).type||'string',def:(p.schema||{}).default}));"
+            + "const rb=((((op.requestBody||{}).content||{})"
+            + "['application/x-www-form-urlencoded']||{}).schema)||null;"
+            + "if(rb){const req=rb.required||[];"
+            + "for(const [n,s] of Object.entries(rb.properties||{}))"
+            + "ps.push({name:n,where:'form',required:req.includes(n),"
+            + "desc:s.description||'',type:s.type||'string',def:s.default});}"
+            + "out.push({method:m.toUpperCase(),path,tag:(op.tags||['api'])[0],"
+            + "summary:op.summary||'',login:op['x-login'],auth:op['x-auth'],"
+            + "rank:op['x-rank']||0,menu:op['x-menu'],params:ps});}}"
+            + "out.sort((a,b)=>a.tag.localeCompare(b.tag)||a.path.localeCompare(b.path));"
+            + "return out;}\n"
+            + "function params(ps){if(!ps.length)return"
+            + "'<p class=\"none\">无参数</p>';"
+            + "return '<table><tr><th>参数</th><th>位置</th><th>类型</th>"
+            + "<th>必填</th><th>默认</th><th>说明</th></tr>'+ps.map(p=>"
+            + "'<tr><td><code>'+esc(p.name)+'</code></td><td>'+esc(p.where)+"
+            + "'</td><td>'+esc(p.type)+'</td><td>'+(p.required?"
+            + "'<span class=\"req\">是</span>':'否')+'</td><td>'+"
+            + "(p.def!==undefined&&p.def!==''?'<code>'+esc(p.def)+'</code>':'—')+"
+            + "'</td><td>'+esc(p.desc)+'</td></tr>').join('')+'</table>';}\n"
+            + "function render(list){const out=document.getElementById('out');"
+            + "if(!list.length){out.innerHTML='<p class=\"none\">没有匹配的接口</p>';return;}"
+            + "let html='',tag=null;"
+            + "for(const o of list){if(o.tag!==tag){tag=o.tag;"
+            + "html+='<h2>'+esc(tag)+'</h2>';}"
+            + "const badges=(o.auth?'<span class=\"badge\">鉴权</span>':"
+            + "(o.login?'<span class=\"badge\">登录</span>':''))+"
+            + "(o.rank?'<span class=\"badge\">rank≥'+o.rank+'</span>':'')+"
+            + "(o.menu?'<span class=\"badge\">菜单</span>':'');"
+            + "html+='<details class=\"op\"><summary><span class=\"m '+o.method+'\">'"
+            + "+o.method+'</span><span class=\"p\">'+esc(o.path)+'</span>'+"
+            + "'<span class=\"t\">'+esc(o.summary)+'</span>'+badges+'</summary>'+"
+            + "'<div class=\"body\">'+params(o.params)+'</div></details>';}"
+            + "out.innerHTML=html;}\n"
+            + "function filter(){const q=document.getElementById('q').value"
+            + ".trim().toLowerCase();"
+            + "render(!q?ops:ops.filter(o=>(o.path+' '+o.summary+' '+o.tag+' '+"
+            + "o.params.map(p=>p.name).join(' ')).toLowerCase().includes(q)));}\n"
+            + "document.getElementById('q').addEventListener('input',filter);\n"
+            + "fetch('docs.json').then(r=>r.json()).then(s=>{ops=collect(s);"
+            + "render(ops);}).catch(e=>{document.getElementById('out')"
+            + ".textContent='加载失败: '+e;});\n";
+    }
+}

@@ -486,6 +486,274 @@ static void build_path(const char *cls_tpl, const char *m_tpl,
     out[oi] = 0;
 }
 
+/* ---- request parameter discovery -------------------------------------------
+ * The code that reads a parameter is its declaration. `this.In("kw")`,
+ * `this.InInt("page", 1)` and `this.Need("title", "标题")` are scanned out of the
+ * action body and emitted as route metadata, so /api/docs describes exactly what
+ * the handler consumes -- there is no second place to declare a parameter and
+ * therefore no way for the two to disagree.
+ */
+
+typedef struct {
+    char name[64];
+    const char *type;   /* string | int | long | number | bool */
+    bool required;
+    char def[64];       /* literal default as written, "" when none */
+    char desc[128];     /* label passed to Need(), "" for In() */
+    const char *where;  /* path | query */
+} rg_param;
+
+typedef struct {
+    rg_param items[64];
+    int count;
+} rg_params;
+
+/* Reader name -> (type, required, whether arg 1 is a default or a label). */
+typedef struct {
+    const char *fn;
+    const char *type;
+    bool required;
+    bool has_default;   /* second arg is a default value */
+    bool has_label;     /* second arg is a human label */
+    const char *where;
+} rg_reader;
+
+static const rg_reader rg_readers[] = {
+    { "In",        "string", false, false, false, "query" },
+    { "InText",    "string", false, false, false, "query" },
+    { "InRaw",     "string", false, false, false, "query" },
+    { "InInt",     "int",    false, true,  false, "query" },
+    { "InLong",    "long",   false, true,  false, "query" },
+    { "InDouble",  "number", false, true,  false, "query" },
+    { "InBool",    "bool",   false, true,  false, "query" },
+    { "HasIn",     "bool",   false, false, false, "query" },
+    { "Need",      "string", true,  false, true,  "query" },
+    { "NeedText",  "string", true,  false, true,  "query" },
+    { "NeedInt",   "int",    true,  false, true,  "query" },
+    { "NeedLong",  "long",   true,  false, true,  "query" },
+    { "Param",     "string", true,  false, false, "path"  },
+    { NULL, NULL, false, false, false, NULL },
+};
+
+static const rg_reader *rg_reader_for(zan_istr_t m) {
+    for (int i = 0; rg_readers[i].fn; i++)
+        if (istr_is(m, rg_readers[i].fn)) return &rg_readers[i];
+    return NULL;
+}
+
+/* The receiver must be the controller itself or its HttpContext: any object can
+ * have a method called In(), and documenting those would be noise. */
+static bool rg_is_input_receiver(zan_ast_node_t *obj) {
+    if (!obj) return false;
+    if (obj->kind == AST_THIS_EXPR) return true;
+    if (obj->kind == AST_IDENTIFIER)
+        return istr_is(obj->ident.name, "ctx") || istr_is(obj->ident.name, "c");
+    /* this.Ctx().In(...) */
+    if (obj->kind == AST_CALL && obj->call.callee &&
+        obj->call.callee->kind == AST_MEMBER_ACCESS &&
+        istr_is(obj->call.callee->member.name, "Ctx"))
+        return true;
+    return false;
+}
+
+/* Render a literal argument as it was written; "" when it is not a literal
+ * (a computed default is real code, not documentation). */
+static void rg_literal(zan_ast_node_t *e, char *out, size_t cap) {
+    out[0] = 0;
+    if (!e) return;
+    bool neg = false;
+    if (e->kind == AST_UNARY && e->unary.operand) {
+        /* only a leading minus is meaningful here */
+        neg = true;
+        e = e->unary.operand;
+    }
+    if (e->kind == AST_INT_LITERAL) {
+        snprintf(out, cap, "%s%lld", neg ? "-" : "", (long long)e->int_val);
+    } else if (e->kind == AST_FLOAT_LITERAL) {
+        snprintf(out, cap, "%s%g", neg ? "-" : "", e->float_val);
+    } else if (e->kind == AST_BOOL_LITERAL) {
+        snprintf(out, cap, "%s", e->bool_val ? "true" : "false");
+    } else if (e->kind == AST_STRING_LITERAL) {
+        istr_to(out, cap, e->str_val);
+    }
+}
+
+static void rg_params_add(rg_params *ps, const rg_reader *rd,
+                          zan_ast_node_t *call) {
+    if (ps->count >= (int)(sizeof(ps->items) / sizeof(ps->items[0]))) return;
+    if (call->call.args.count < 1) return;
+    zan_ast_node_t *a0 = call->call.args.items[0];
+    if (a0->kind != AST_STRING_LITERAL) return;   /* dynamic name: not documentable */
+
+    char nm[64]; istr_to(nm, sizeof(nm), a0->str_val);
+    if (!nm[0]) return;
+
+    /* Same parameter read twice (once with a default, once required) keeps the
+     * stronger statement rather than appearing twice. */
+    for (int i = 0; i < ps->count; i++) {
+        if (strcmp(ps->items[i].name, nm) != 0) continue;
+        rg_param *p = &ps->items[i];
+        if (rd->required) p->required = true;
+        if (rd->has_label && call->call.args.count >= 2 && !p->desc[0])
+            rg_literal(call->call.args.items[1], p->desc, sizeof(p->desc));
+        if (rd->has_default && call->call.args.count >= 2 && !p->def[0])
+            rg_literal(call->call.args.items[1], p->def, sizeof(p->def));
+        if (strcmp(p->type, "string") == 0) p->type = rd->type;
+        return;
+    }
+
+    rg_param *p = &ps->items[ps->count++];
+    memset(p, 0, sizeof(*p));
+    snprintf(p->name, sizeof(p->name), "%s", nm);
+    p->type = rd->type;
+    p->required = rd->required;
+    p->where = rd->where;
+    if (call->call.args.count >= 2) {
+        if (rd->has_default) rg_literal(call->call.args.items[1], p->def, sizeof(p->def));
+        if (rd->has_label) rg_literal(call->call.args.items[1], p->desc, sizeof(p->desc));
+    }
+}
+
+static void rg_scan(zan_ast_node_t *n, rg_params *ps);
+
+static void rg_scan_list(zan_ast_list_t *l, rg_params *ps) {
+    for (int i = 0; i < l->count; i++) rg_scan(l->items[i], ps);
+}
+
+static void rg_scan(zan_ast_node_t *n, rg_params *ps) {
+    if (!n) return;
+    switch (n->kind) {
+    case AST_CALL: {
+        zan_ast_node_t *callee = n->call.callee;
+        if (callee && callee->kind == AST_MEMBER_ACCESS &&
+            rg_is_input_receiver(callee->member.object)) {
+            const rg_reader *rd = rg_reader_for(callee->member.name);
+            if (rd) rg_params_add(ps, rd, n);
+        }
+        rg_scan(callee, ps);
+        rg_scan_list(&n->call.args, ps);
+        break;
+    }
+    case AST_BLOCK: rg_scan_list(&n->block.stmts, ps); break;
+    case AST_VAR_DECL: rg_scan(n->var_decl.initializer, ps); break;
+    case AST_EXPR_STMT: rg_scan(n->expr_stmt.expr, ps); break;
+    case AST_RETURN_STMT: rg_scan(n->ret.value, ps); break;
+    case AST_IF_STMT:
+        rg_scan(n->if_stmt.cond, ps);
+        rg_scan(n->if_stmt.then_body, ps);
+        rg_scan(n->if_stmt.else_body, ps);
+        break;
+    case AST_WHILE_STMT:
+    case AST_DO_WHILE_STMT:
+        rg_scan(n->while_stmt.cond, ps);
+        rg_scan(n->while_stmt.body, ps);
+        break;
+    case AST_FOR_STMT:
+        rg_scan(n->for_stmt.init, ps);
+        rg_scan(n->for_stmt.cond, ps);
+        rg_scan(n->for_stmt.step, ps);
+        rg_scan(n->for_stmt.body, ps);
+        break;
+    case AST_FOREACH_STMT:
+        rg_scan(n->foreach_stmt.collection, ps);
+        rg_scan(n->foreach_stmt.body, ps);
+        break;
+    case AST_THROW_STMT: rg_scan(n->throw_stmt.value, ps); break;
+    case AST_TRY_STMT:
+        rg_scan(n->try_stmt.try_body, ps);
+        for (int i = 0; i < n->try_stmt.catches.count; i++)
+            rg_scan(n->try_stmt.catches.items[i]->catch_clause.body, ps);
+        rg_scan(n->try_stmt.finally_body, ps);
+        break;
+    case AST_SWITCH_STMT:
+        rg_scan(n->switch_stmt.expr, ps);
+        for (int i = 0; i < n->switch_stmt.cases.count; i++)
+            rg_scan(n->switch_stmt.cases.items[i]->switch_case.body, ps);
+        break;
+    case AST_LOCK_STMT:
+        rg_scan(n->lock_stmt.expr, ps);
+        rg_scan(n->lock_stmt.body, ps);
+        break;
+    case AST_BINARY:
+    case AST_ASSIGNMENT:
+        rg_scan(n->binary.left, ps);
+        rg_scan(n->binary.right, ps);
+        break;
+    case AST_UNARY:
+    case AST_POSTFIX_UNARY: rg_scan(n->unary.operand, ps); break;
+    case AST_MEMBER_ACCESS: rg_scan(n->member.object, ps); break;
+    case AST_INDEX:
+        rg_scan(n->index.object, ps);
+        rg_scan(n->index.index, ps);
+        break;
+    case AST_NEW_EXPR: rg_scan_list(&n->new_expr.args, ps); break;
+    case AST_CAST_EXPR: rg_scan(n->cast.expr, ps); break;
+    case AST_CONDITIONAL:
+        rg_scan(n->conditional.cond, ps);
+        rg_scan(n->conditional.then_expr, ps);
+        rg_scan(n->conditional.else_expr, ps);
+        break;
+    case AST_LAMBDA: rg_scan(n->lambda.body, ps); break;
+    case AST_AWAIT_EXPR: rg_scan(n->await_expr.expr, ps); break;
+    case AST_STRING_INTERP: rg_scan_list(&n->string_interp.parts, ps); break;
+    case AST_REF_ARG: rg_scan(n->ref_arg.expr, ps); break;
+    default: break;
+    }
+}
+
+/* Path segments of the route are parameters too, even when the action reads them
+ * through something the scan cannot see. */
+static void rg_params_from_path(rg_params *ps, const char *path) {
+    for (const char *p = path; *p; p++) {
+        if (*p != '{') continue;
+        const char *e = strchr(p, '}');
+        if (!e) return;
+        char nm[64];
+        size_t n = (size_t)(e - p - 1);
+        if (n >= sizeof(nm)) n = sizeof(nm) - 1;
+        memcpy(nm, p + 1, n);
+        nm[n] = 0;
+        /* "{id:int}" -> id */
+        char *colon = strchr(nm, ':');
+        const char *ty = "string";
+        if (colon) {
+            *colon = 0;
+            if (strcmp(colon + 1, "int") == 0) ty = "int";
+            else if (strcmp(colon + 1, "long") == 0) ty = "long";
+        }
+        bool seen = false;
+        for (int i = 0; i < ps->count; i++) {
+            if (strcmp(ps->items[i].name, nm) == 0) {
+                ps->items[i].where = "path";
+                ps->items[i].required = true;
+                seen = true;
+            }
+        }
+        if (!seen && ps->count < (int)(sizeof(ps->items) / sizeof(ps->items[0]))) {
+            rg_param *q = &ps->items[ps->count++];
+            memset(q, 0, sizeof(*q));
+            snprintf(q->name, sizeof(q->name), "%s", nm);
+            q->type = ty;
+            q->required = true;
+            q->where = "path";
+        }
+        p = e;
+    }
+}
+
+static void rg_emit_params(rg_buf_t *out, rg_params *ps) {
+    for (int i = 0; i < ps->count; i++) {
+        rg_param *p = &ps->items[i];
+        rg_putf(out, "\n            .Param(\"");
+        rg_put_qstr(out, p->name);
+        rg_putf(out, "\", \"%s\", %s, \"", p->type, p->required ? "true" : "false");
+        rg_put_qstr(out, p->def);
+        rg_putf(out, "\", \"");
+        rg_put_qstr(out, p->desc);
+        rg_putf(out, "\", \"%s\")", p->where);
+    }
+}
+
 /* ---- fluent metadata emission ---- */
 
 static void emit_fluent(rg_buf_t *out, rg_meta *m, const char *title) {
@@ -620,8 +888,13 @@ void zan_routegen_run(zan_ast_node_t *unit, zan_arena_t *arena,
             const char *aw = is_async ? "await " : "";
             rg_putf(&handlers, "    static async void %s(HttpContext ctx) {\n", hname);
             if (is_static) {
-                rg_putf(&handlers, "        %s%s.%s(%s);\n", aw, cname, mname,
+                rg_putf(&handlers, "        try {\n");
+                rg_putf(&handlers, "            %s%s.%s(%s);\n", aw, cname, mname,
                         ctx_param ? "ctx" : "");
+                rg_putf(&handlers, "        } catch (ApiError __e) {\n");
+                rg_putf(&handlers, "            ctx.Status(__e.Status(), ApiError.Reason(__e.Status()));\n");
+                rg_putf(&handlers, "            ctx.Api(__e.Code(), __e.Message, \"null\");\n");
+                rg_putf(&handlers, "        }\n");
             } else {
                 rg_putf(&handlers, "        %s __c = new %s();\n", cname, cname);
                 rg_putf(&handlers, "        __c.__Bind(ctx);\n");
@@ -629,8 +902,17 @@ void zan_routegen_run(zan_ast_node_t *unit, zan_arena_t *arena,
                 if (cmod[0]) snprintf(vkey, sizeof(vkey), "%s.%s.%s", cmod, cdisp, mname);
                 else snprintf(vkey, sizeof(vkey), "%s.%s", cdisp, mname);
                 rg_putf(&handlers, "        __c.__SetView(\"%s\");\n", vkey);
+                /* A required parameter aborts by throwing ApiError; catching it
+                 * here is what lets `this.Need("title", "标题")` read as one
+                 * expression instead of a guard clause in every action. Teardown
+                 * still runs, so the request connection is released either way. */
                 rg_putf(&handlers, "        if (await __c.__BeforeAsync()) {\n");
-                rg_putf(&handlers, "            %s__c.%s(%s);\n", aw, mname, ctx_param ? "ctx" : "");
+                rg_putf(&handlers, "            try {\n");
+                rg_putf(&handlers, "                %s__c.%s(%s);\n", aw, mname, ctx_param ? "ctx" : "");
+                rg_putf(&handlers, "            } catch (ApiError __e) {\n");
+                rg_putf(&handlers, "                ctx.Status(__e.Status(), ApiError.Reason(__e.Status()));\n");
+                rg_putf(&handlers, "                ctx.Api(__e.Code(), __e.Message, \"null\");\n");
+                rg_putf(&handlers, "            }\n");
                 rg_putf(&handlers, "            await __c.__AfterAsync();\n");
                 rg_putf(&handlers, "        }\n");
             }
@@ -643,6 +925,10 @@ void zan_routegen_run(zan_ast_node_t *unit, zan_arena_t *arena,
             rg_put_qstr(&reg, cname); rg_putf(&reg, "."); rg_put_qstr(&reg, mname);
             rg_putf(&reg, "\")");
             emit_fluent(&reg, &meta, title);
+            rg_params params_doc; params_doc.count = 0;
+            rg_scan(m->method_decl.body, &params_doc);
+            rg_params_from_path(&params_doc, path);
+            rg_emit_params(&reg, &params_doc);
             rg_putf(&reg, ";\n");
             nroutes++;
         }
