@@ -2208,6 +2208,14 @@ typedef struct {
      * exception thrown below this frame releases it (A8-12). Scope exit pops
      * the entry along with the release it emits. */
     int eh_slot;
+    /* A33-2b: for a local a lambda assigns to, the heap cell holding its value
+     * (closure-record shaped, see the boxed-local comment in irgen_expr.c).
+     * `alloca` then points *into* that cell, so the enclosing method and every
+     * closure read and write the one variable. NULL for an ordinary local. */
+    LLVMValueRef box_cell;
+    /* 1 when this binding owns a reference to the cell (the declaring scope);
+     * a lambda body's binding borrows the cell its closure record holds. */
+    int          box_owned;
 } local_var_t;
 
 /* A function's locals live in a single flat scope. The backing array grows
@@ -2266,6 +2274,8 @@ static void local_add(local_scope_t *scope, zan_istr_t name, LLVMValueRef alloca
     scope->vars[scope->count].eh_slot = 0;
     scope->vars[scope->count].arr_len = NULL;
     scope->vars[scope->count].arr_len_slot = NULL;
+    scope->vars[scope->count].box_cell = NULL;
+    scope->vars[scope->count].box_owned = 0;
     scope->count++;
     /* Record the variable for the debugger (no-op unless building with -g). The
      * emit context supplies the compiler state; local_add itself is g-free. */

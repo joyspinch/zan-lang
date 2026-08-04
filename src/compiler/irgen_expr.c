@@ -1638,7 +1638,7 @@ static LLVMValueRef emit_expr_assignment(zan_irgen_t *g, zan_ast_node_t *expr,
 binding_lowered:
         if (expr->binary.left->kind == AST_IDENTIFIER) {
             local_var_t *local = local_find(locals, expr->binary.left->ident.name);
-            if (local && local_owns_arc(local)) {
+            if (local && local_slot_owns_rc(local)) {
                 /* ARC: release the previous occupant and retain the new one. */
                 emit_rc_capture_local(g, local->type, local->alloca, right, expr->binary.right, locals);
             } else if (local) {
@@ -4744,9 +4744,14 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
 
 typedef struct {
     zan_istr_t   name;   /* captured local's name; empty for the receiver */
-    LLVMValueRef slot;   /* the enclosing alloca, NULL for the receiver */
+    LLVMValueRef slot;   /* the enclosing alloca, NULL for the receiver;
+                          * for a boxed capture, the heap cell instead */
     zan_type_t  *type;
     LLVMTypeRef  llvm;
+    /* 1 when the enclosing local is boxed (A33-2b): the record holds a
+     * reference to its cell, not a copy of its value, so writes on either
+     * side are writes to the one variable. */
+    int          boxed;
 } lambda_capture_t;
 
 typedef struct {
@@ -4758,6 +4763,11 @@ typedef struct {
     zan_istr_t       shadow[ZAN_MAX_CAPTURES * 4];
     int              shadow_count;
     int              overflow;
+    /* write scan (A33-2b): instead of collecting captures, report whether a
+     * lambda somewhere below assigns to `want_write`. */
+    zan_istr_t       want_write;
+    int              lam_depth;
+    int              found_write;
 } capture_scan_t;
 
 static int istr_eq_c(zan_istr_t a, zan_istr_t b) {
@@ -4812,9 +4822,27 @@ static void cap_use(capture_scan_t *cs, zan_istr_t name) {
     if (cs->count >= ZAN_MAX_CAPTURES) { cs->overflow = 1; return; }
     lambda_capture_t *c = &cs->caps[cs->count++];
     c->name = name;
-    c->slot = lv->alloca;
     c->type = lv->type;
-    c->llvm = local_slot_type(cs->g, lv);
+    c->boxed = lv->box_cell ? 1 : 0;
+    if (c->boxed) {
+        c->slot = lv->box_cell;
+        c->llvm = LLVMPointerType(LLVMInt8TypeInContext(cs->g->ctx), 0);
+    } else {
+        c->slot = lv->alloca;
+        c->llvm = local_slot_type(cs->g, lv);
+    }
+}
+
+/* Does this node assign to `name`? Assignment, `++`/`--` and passing it as
+ * `ref`/`out` all write the variable. */
+static int node_writes_ident(zan_ast_node_t *n, zan_istr_t name) {
+    zan_ast_node_t *t = NULL;
+    if (n->kind == AST_ASSIGNMENT) t = n->binary.left;
+    else if ((n->kind == AST_UNARY || n->kind == AST_POSTFIX_UNARY) &&
+             (n->unary.op == TK_PLUS_PLUS || n->unary.op == TK_MINUS_MINUS))
+        t = n->unary.operand;
+    else if (n->kind == AST_REF_ARG) t = n->ref_arg.expr;
+    return t && t->kind == AST_IDENTIFIER && istr_eq_c(t->ident.name, name);
 }
 
 static void cap_scan(capture_scan_t *cs, zan_ast_node_t *n);
@@ -4825,6 +4853,13 @@ static void cap_scan_list(capture_scan_t *cs, zan_ast_list_t *l) {
 
 static void cap_scan(capture_scan_t *cs, zan_ast_node_t *n) {
     if (!n) return;
+    if (cs->want_write.len) {
+        if (cs->found_write) return;
+        if (cs->lam_depth > 0 && node_writes_ident(n, cs->want_write)) {
+            cs->found_write = 1;
+            return;
+        }
+    }
     switch (n->kind) {
     case AST_IDENTIFIER:      cap_use(cs, n->ident.name); return;
     case AST_THIS_EXPR:
@@ -4857,7 +4892,9 @@ static void cap_scan(capture_scan_t *cs, zan_ast_node_t *n) {
         /* a nested lambda's own parameters shadow the enclosing names */
         for (int i = 0; i < n->lambda.params.count; i++)
             cap_shadow(cs, n->lambda.params.items[i]->param.name);
+        cs->lam_depth++;
         cap_scan(cs, n->lambda.body);
+        cs->lam_depth--;
         return;
     case AST_BLOCK:           cap_scan_list(cs, &n->block.stmts); return;
     case AST_VAR_DECL:        cap_scan(cs, n->var_decl.initializer);
@@ -4936,11 +4973,14 @@ static LLVMValueRef build_closure_dtor(zan_irgen_t *g, const char *lname,
         emit_arc_release_typed(g, NULL, LLVMBuildLoad2(b, i8ptr, p, "tgv"));
     }
     for (int i = 0; i < capc; i++) {
-        if (!is_rc_managed_type(caps[i].type)) continue;
+        if (!caps[i].boxed && !is_rc_managed_type(caps[i].type)) continue;
         LLVMValueRef p = LLVMBuildStructGEP2(g->builder, rec_ty, rec,
             (unsigned)(ZAN_CLOSURE_HDR_FIELDS + i), "cp");
         LLVMValueRef v = LLVMBuildLoad2(g->builder, caps[i].llvm, p, "cv");
-        emit_rc_release_for_type(g, caps[i].type, v);
+        /* a boxed capture is a reference to the variable's cell, so this
+         * closure drops its reference to the cell, not to a value */
+        if (caps[i].boxed) emit_closure_record_release(g, v);
+        else emit_rc_release_for_type(g, caps[i].type, v);
     }
     if (has_this) {
         LLVMValueRef p = LLVMBuildStructGEP2(g->builder, rec_ty, rec,
@@ -4997,6 +5037,14 @@ static LLVMValueRef emit_closure_record(zan_irgen_t *g, zan_loc_t loc,
     LLVMBuildStore(g->builder, target ? target : LLVMConstNull(i8ptr),
         LLVMBuildStructGEP2(g->builder, rec_ty, rec, 2, "clo.tgp"));
     for (int i = 0; i < capc; i++) {
+        if (caps[i].boxed) {
+            LLVMValueRef cell = caps[i].slot;
+            emit_arc_retain(g, cell);
+            LLVMBuildStore(g->builder, cell,
+                LLVMBuildStructGEP2(g->builder, rec_ty, rec,
+                                    (unsigned)(ZAN_CLOSURE_HDR_FIELDS + i), "cap.bp"));
+            continue;
+        }
         LLVMValueRef v = LLVMBuildLoad2(g->builder, caps[i].llvm, caps[i].slot, "cap.v");
         emit_rc_retain_for_type(g, caps[i].type, v);
         LLVMBuildStore(g->builder, v,
@@ -5015,6 +5063,89 @@ static LLVMValueRef emit_closure_record(zan_irgen_t *g, zan_loc_t loc,
         LLVMBuildPtrToInt(g->builder, rec, i64, "clo.i"),
         LLVMConstInt(i64, ZAN_CLOSURE_TAG, 0), "clo.tag");
     return LLVMBuildIntToPtr(g->builder, tagged, i8ptr, "clo.v");
+}
+
+/* ---- boxed locals (A33-2b) ------------------------------------------------
+ * C# captures variables, not values: a lambda that writes an enclosing local
+ * writes *that* local, and the enclosing method sees it. Such a local is
+ * therefore moved off the stack into a heap cell with the closure-record shape
+ * { fn = null, dtor, target = null, value }, and its storage slot becomes a
+ * pointer into that cell. Both sides then load and store the same memory, and
+ * the cell's lifetime is the ordinary closure lifetime: the declaring scope
+ * holds one reference, every closure capturing the variable holds another, and
+ * the last one out frees it -- so the variable also outlives the frame when the
+ * lambda does.
+ *
+ * Only locals a lambda actually assigns to are boxed; a read-only capture stays
+ * a copy, which is cheaper and observationally identical. */
+#define ZAN_BOX_VALUE_FIELD ZAN_CLOSURE_HDR_FIELDS
+
+static LLVMTypeRef box_cell_type(zan_irgen_t *g, LLVMTypeRef payload) {
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMTypeRef fields[ZAN_BOX_VALUE_FIELD + 1] = { i8ptr, i8ptr, i8ptr, payload };
+    return LLVMStructTypeInContext(g->ctx, fields, ZAN_BOX_VALUE_FIELD + 1, 0);
+}
+
+/* Does a lambda in the body being compiled assign to `name`? */
+static int local_is_lambda_written(zan_irgen_t *g, local_scope_t *locals,
+                                   zan_istr_t name) {
+    if (!g->current_fn_body || !name.len) return 0;
+    capture_scan_t cs;
+    memset(&cs, 0, sizeof(cs));
+    cs.g = g;
+    cs.outer = locals;
+    cs.want_write = name;
+    cap_scan(&cs, g->current_fn_body);
+    return cs.found_write;
+}
+
+/* Allocate the cell for a boxed local and return it; `init` (may be null) is
+ * its initial value. */
+static LLVMValueRef emit_box_cell(zan_irgen_t *g, zan_loc_t loc,
+                                  LLVMTypeRef payload, zan_type_t *vtype,
+                                  LLVMValueRef init) {
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMTypeRef rec_ty = box_cell_type(g, payload);
+    static int box_id = 0;
+    char bname[64];
+    snprintf(bname, sizeof(bname), "box_%d", box_id++);
+    lambda_capture_t val = { .name = (zan_istr_t){ NULL, 0 }, .slot = NULL,
+                             .type = vtype, .llvm = payload, .boxed = 0 };
+    LLVMValueRef dtor = build_closure_dtor(g, bname, rec_ty, &val, 1, 0);
+    int site_idx = reserve_closure_site(g);
+    LLVMValueRef site_name = LLVMConstNull(i8ptr);
+    if (g->check_leaks) {
+        char site_buf[600];
+        snprintf(site_buf, sizeof(site_buf), "%s:%u:%u [captured local]",
+                 leak_site_file(g, loc), loc.line, loc.col);
+        site_name = LLVMBuildGlobalStringPtr(g->builder, site_buf, "site");
+    }
+    LLVMValueRef alloc_args[3] = {
+        LLVMBuildPtrToInt(g->builder, LLVMSizeOf(rec_ty), i64, "box.size"),
+        LLVMConstInt(i64, (unsigned long long)site_idx, 0), site_name };
+    LLVMValueRef cell = zan_call2(g->builder,
+        LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i64, i64, i8ptr }, 3, 0),
+        g->rt_alloc, alloc_args, 3, "box");
+    LLVMBuildStore(g->builder, LLVMConstNull(i8ptr),
+        LLVMBuildStructGEP2(g->builder, rec_ty, cell, 0, "box.fnp"));
+    LLVMBuildStore(g->builder,
+        LLVMBuildBitCast(g->builder, dtor, i8ptr, "box.dt"),
+        LLVMBuildStructGEP2(g->builder, rec_ty, cell, 1, "box.dtp"));
+    LLVMBuildStore(g->builder, LLVMConstNull(i8ptr),
+        LLVMBuildStructGEP2(g->builder, rec_ty, cell, 2, "box.tgp"));
+    LLVMValueRef vp = LLVMBuildStructGEP2(g->builder, rec_ty, cell,
+                                          ZAN_BOX_VALUE_FIELD, "box.vp");
+    LLVMBuildStore(g->builder, init ? init : LLVMConstNull(payload), vp);
+    return cell;
+}
+
+/* The storage slot of a boxed local: a pointer to the value inside its cell,
+ * used exactly like an alloca by every read and write of the variable. */
+static LLVMValueRef box_value_ptr(zan_irgen_t *g, LLVMValueRef cell,
+                                  LLVMTypeRef payload) {
+    return LLVMBuildStructGEP2(g->builder, box_cell_type(g, payload), cell,
+                               ZAN_BOX_VALUE_FIELD, "box.v");
 }
 
 /* `obj.M` / bare `M` naming an instance method: bind the receiver into a
@@ -5177,6 +5308,10 @@ static LLVMValueRef emit_lambda_typed(zan_irgen_t *g, zan_ast_node_t *expr,
     zan_type_t *saved_fn_zan_ret = g->current_fn_zan_ret_type;
     LLVMValueRef saved_this = g->current_this;
     LLVMValueRef saved_async_frame = g->current_async_frame;
+    zan_ast_node_t *saved_fn_body = g->current_fn_body;
+    /* the lambda body is the body being compiled: a local declared in it is
+     * boxed when a nested lambda writes it, exactly like a method's */
+    g->current_fn_body = expr->lambda.body;
     g->current_fn = lambda_fn;
     g->current_fn_ret_type = ret_type;
     g->current_fn_zan_ret_type = rett;
@@ -5200,6 +5335,22 @@ static LLVMValueRef emit_lambda_typed(zan_irgen_t *g, zan_ast_node_t *expr,
             LLVMValueRef p = LLVMBuildStructGEP2(g->builder, rec_ty, rec,
                 (unsigned)(ZAN_CLOSURE_HDR_FIELDS + i), "cap.p");
             LLVMValueRef v = LLVMBuildLoad2(g->builder, cs.caps[i].llvm, p, "cap");
+            if (cs.caps[i].boxed) {
+                /* the record holds the variable's cell: bind the body's local
+                 * to the value inside it, so writes here are writes there */
+                LLVMTypeRef payload = map_type(g, cs.caps[i].type);
+                local_add(&lambda_locals, cs.caps[i].name,
+                          box_value_ptr(g, v, payload), cs.caps[i].type);
+                /* borrowed: the closure record owns this reference to the
+                 * cell, so a nested lambda can share it but the body's scope
+                 * exit must not release it */
+                lambda_locals.vars[lambda_locals.count - 1].box_cell = v;
+                /* an rc-managed variable is owned by the cell wherever it is
+                 * written, so a write here swaps the reference too */
+                if (is_rc_managed_type(cs.caps[i].type))
+                    lambda_locals.vars[lambda_locals.count - 1].arc_owned = 1;
+                continue;
+            }
             LLVMValueRef alloc = LLVMBuildAlloca(g->builder, cs.caps[i].llvm, "cap.slot");
             LLVMBuildStore(g->builder, v, alloc);
             local_add(&lambda_locals, cs.caps[i].name, alloc, cs.caps[i].type);
@@ -5265,6 +5416,7 @@ static LLVMValueRef emit_lambda_typed(zan_irgen_t *g, zan_ast_node_t *expr,
     g->throw_catch_base = saved_throw_cb;
     g->current_this = saved_this;
     g->current_async_frame = saved_async_frame;
+    g->current_fn_body = saved_fn_body;
     g->lambda_depth--;
     LLVMPositionBuilderAtEnd(g->builder, saved_bb);
     free(param_types);

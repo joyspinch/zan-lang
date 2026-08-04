@@ -578,11 +578,30 @@ static void emit_eh_tmp_push_slot(zan_irgen_t *g, LLVMValueRef slot, bool is_str
 static void emit_eh_tmp_pop(zan_irgen_t *g);
 static void emit_eh_tmp_drop(zan_irgen_t *g, LLVMValueRef obj);
 
-/* True when a local owns a class heap reference held as a pointer (excludes
- * borrowed params, stack-struct classes and non-class types). */
-static int local_owns_arc(local_var_t *v) {
+/* True when a local's slot holds an owning class heap reference (excludes
+ * borrowed params, stack-struct classes and non-class types), so assigning to
+ * it must release the previous occupant and retain the new one. */
+static int local_slot_owns_rc(local_var_t *v) {
     if (!v || v->arc_owned != 1 || !v->type || !is_rc_managed_type(v->type)) return 0;
+    /* A boxed local (A33-2b) keeps its value in a heap cell; `alloca` points
+     * into that cell rather than being an alloca instruction. */
+    if (v->box_cell) return 1;
     return LLVMGetTypeKind(LLVMGetAllocatedType(v->alloca)) == LLVMPointerTypeKind;
+}
+
+/* True when scope exit must release the reference in the local's slot. A boxed
+ * local is released as a whole cell instead (its destructor releases the value
+ * inside), so releasing the slot here as well would double-release. */
+static int local_owns_arc(local_var_t *v) {
+    return local_slot_owns_rc(v) && !v->box_cell;
+}
+
+/* Boxed locals are released as a whole cell: the last reference out (this
+ * scope or a closure still holding the variable) runs the cell's destructor,
+ * which releases an rc-managed value inside it. */
+static void emit_closure_record_release(zan_irgen_t *g, LLVMValueRef rec);
+static void release_boxed_local(zan_irgen_t *g, local_var_t *v) {
+    if (v && v->box_cell && v->box_owned) emit_closure_record_release(g, v->box_cell);
 }
 
 /* Register the most recently declared local's slot with the unwinder and mark
@@ -626,7 +645,9 @@ static void emit_release_owned_locals_except(zan_irgen_t *g, local_scope_t *loca
     for (int i = 0; i < locals->count; i++) {
         pop_eh_slot(g, &locals->vars[i]);
         if (keep && &locals->vars[i] == keep) continue;
-        if (local_owns_arc(&locals->vars[i])) {
+        if (locals->vars[i].box_cell) {
+            release_boxed_local(g, &locals->vars[i]);
+        } else if (local_owns_arc(&locals->vars[i])) {
             LLVMValueRef cur = LLVMBuildLoad2(g->builder, i8ptr,
                                               locals->vars[i].alloca, "arc.rel");
             emit_rc_release_for_type(g, locals->vars[i].type, cur);
@@ -649,7 +670,9 @@ static void emit_release_owned_locals_range(zan_irgen_t *g, local_scope_t *local
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     for (int i = locals->count - 1; i >= start; i--) {
         pop_eh_slot(g, &locals->vars[i]);
-        if (local_owns_arc(&locals->vars[i])) {
+        if (locals->vars[i].box_cell) {
+            release_boxed_local(g, &locals->vars[i]);
+        } else if (local_owns_arc(&locals->vars[i])) {
             LLVMValueRef cur = LLVMBuildLoad2(g->builder, i8ptr,
                                               locals->vars[i].alloca, "arc.rel");
             emit_rc_release_for_type(g, locals->vars[i].type, cur);
@@ -727,7 +750,9 @@ static void emit_release_owned_locals_from(zan_irgen_t *g, local_scope_t *locals
         LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder)) != NULL;
     for (int i = locals->count - 1; i >= start; i--) {
         if (!terminated) pop_eh_slot(g, &locals->vars[i]);
-        if (!terminated && local_owns_arc(&locals->vars[i])) {
+        if (!terminated && locals->vars[i].box_cell) {
+            release_boxed_local(g, &locals->vars[i]);
+        } else if (!terminated && local_owns_arc(&locals->vars[i])) {
             LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
             LLVMValueRef cur = LLVMBuildLoad2(g->builder, i8ptr,
                                               locals->vars[i].alloca, "arc.rel");

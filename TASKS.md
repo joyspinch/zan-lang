@@ -773,8 +773,7 @@ leakcheck 子集全部通过；生成 IR 不含 `setjmp`/`longjmp`/`__zan_eh_tmp
    测试：`tests/diag/lambda_capture_this.zan` / `lambda_capture_local.zan` /
    `instance_method_group.zan` / `instance_method_ident.zan`（`diag_a33_*`），`ctest -R diag_` 19/19。
 2. [x] **A33-2 委托带 receiver/env（能力项，2026-08-04 已实现）**：见下「A33-2 详情」。
-3. [ ] **A33-2b 被写入的捕获局部按引用捕获**：目前捕获是按值拷贝，C# 是按引用；
-   把在 lambda 里被赋值的捕获局部提升成堆上 display 类，外层与闭包共享同一份存储。
+3. [x] **A33-2b 被写入的捕获局部按引用捕获**（2026-08-04 已实现）：见下「A33-2b 详情」。
 4. [ ] **A33-3 GUI 事件绑定改成实例方法/闭包（依赖 A33-2）**：`lv.OnSelect(this.Open)`
    取代目前的静态 handler + 轮询取值。
 
@@ -816,9 +815,26 @@ leakcheck 子集全部通过；生成 IR 不含 `setjmp`/`longjmp`/`__zan_eh_tmp
 相关项（conformance/determinism/leakcheck 三档）全通过；其余失败仍是工作区未提交的
 stdlib 改动导致的 `'DbParams' has no member 'Create'` 这类编译错误，与本次无关。
 
-仍缺（登记为 A33-2b）：捕获是**按值**的，C# 是按引用——lambda 里改写被捕获的局部
-（`int n = 0; () => { n = n + 1; }`）改不到外层变量。需要把被写入的捕获局部提升成堆上
-display 类。
+### A33-2b 详情（已完成 2026-08-04）
+
+捕获的是**变量**而不是值：lambda 里写被捕获的局部，写的就是那个局部，外层随后读到新值。
+
+* 落点：被 lambda 赋值的局部不再放在栈帧里，而是搬进一个**堆单元**，形状与闭包记录
+  相同（`{ fn = null, dtor, target = null, value }`，`irgen_expr.c` 的 boxed-locals 注释
+  是完整说明），它的存储槽变成指向单元内 `value` 的指针，于是外层与闭包的读写都落在
+  同一块内存上。`irgen_stmt.c::emit_boxed_var_decl` 负责声明，`irgen_expr.c` 的
+  `emit_box_cell` / `box_value_ptr` / `local_is_lambda_written` 是实现。
+* 生命周期就是闭包的生命周期：声明作用域持一个引用，每个捕获它的闭包各持一个，最后
+  一个出门的跑单元的 dtor（`irgen_arc.c::emit_closure_record_release`，从
+  `emit_closure_release` 里拆出来复用），因此闭包活得比栈帧长时变量也跟着活。
+  `irgen_generics.c` 把作用域退出拆成 `local_slot_owns_rc`（赋值时换引用）与
+  `local_owns_arc`（退出时释放槽），boxed 局部只按整单元释放，避免双重释放。
+* 只装箱**确实被写**的局部（`node_writes_ident` 认赋值、`++`/`--`、`ref`/`out`）；
+  只读捕获仍是按值拷贝，更便宜且不可区分。async 局部本来就在协程帧里、天然共享，跳过。
+* 正式测试：`tests/conformance/closure_mutable_capture.zan`（+`.out`）覆盖 lambda 写、
+  外层写同一变量、两个闭包共享一个变量、循环里驱动闭包、只读捕获读到共享新值、
+  变量活得比声明它的栈帧长；conformance/determinism/leakcheck 三档全过
+  （`ctest -R closure` 6/6）。
 
 ---
 

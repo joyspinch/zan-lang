@@ -259,6 +259,52 @@ static void emit_eh_propagate_tail(zan_irgen_t *g) {
     LLVMBuildUnreachable(g->builder);
 }
 
+/* A33-2b: declare a local that a lambda assigns to. Its storage is a heap cell
+ * shared with every closure that captures it (see the boxed-local comment in
+ * irgen_expr.c), so both sides read and write the one variable. Returns 0 for
+ * an ordinary local, which the general path below then handles.
+ *
+ * Scalars and rc-managed references only; an async local already lives in the
+ * coroutine frame, which every resumption shares. */
+static int emit_boxed_var_decl(zan_irgen_t *g, zan_ast_node_t *stmt,
+                               local_scope_t *locals) {
+    if (g->current_async_frame || !g->current_fn_body) return 0;
+    zan_type_t *type = stmt->var_decl.type
+        ? resolve_type_ctx(g, stmt->var_decl.type)
+        : (stmt->var_decl.initializer
+               ? infer_expr_type(g, stmt->var_decl.initializer, locals)
+               : NULL);
+    if (!type) return 0;
+    LLVMTypeRef payload = map_type(g, type);
+    LLVMTypeKind k = LLVMGetTypeKind(payload);
+    int rc = is_rc_managed_type(type) && k == LLVMPointerTypeKind;
+    if (!rc && k != LLVMIntegerTypeKind && k != LLVMFloatTypeKind &&
+        k != LLVMDoubleTypeKind) return 0;
+    if (!local_is_lambda_written(g, locals, stmt->var_decl.name)) return 0;
+
+    /* the cell is born holding a null payload, so its destructor is safe even
+     * if the initializer throws, and the first capture releases nothing */
+    LLVMValueRef cell = emit_box_cell(g, stmt->loc, payload, type, NULL);
+    LLVMValueRef slot = box_value_ptr(g, cell, payload);
+    local_add(locals, stmt->var_decl.name, slot, type);
+    locals->vars[locals->count - 1].box_cell = cell;
+    locals->vars[locals->count - 1].box_owned = 1;
+    if (rc) locals->vars[locals->count - 1].arc_owned = 1;
+    if (stmt->var_decl.initializer) {
+        LLVMValueRef init =
+            (type->kind == TYPE_DELEGATE &&
+             stmt->var_decl.initializer->kind == AST_LAMBDA)
+                ? emit_lambda_typed(g, stmt->var_decl.initializer, type, locals)
+                : emit_expr(g, stmt->var_decl.initializer, locals);
+        if (rc)
+            emit_rc_capture_local(g, type, slot, init,
+                                  stmt->var_decl.initializer, locals);
+        else
+            zan_store_fit(g, init, slot);
+    }
+    return 1;
+}
+
 static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *locals) {
     if (!stmt) return;
 
@@ -303,6 +349,9 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                            infer_expr_type(g, stmt->var_decl.initializer, locals),
                            stmt->var_decl.initializer, "initializer");
         }
+        /* A33-2b: a local a lambda assigns to is one variable shared with the
+         * closure, so it is declared in a heap cell instead of the frame. */
+        if (emit_boxed_var_decl(g, stmt, locals)) return;
         /* In an async $resume body, named scalar locals were pre-allocated in
          * the entry block and their storage lives in the heap frame (so they
          * survive suspensions). Reuse that slot instead of a fresh alloca:

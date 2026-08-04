@@ -173,6 +173,24 @@ static void emit_closure_retain(zan_irgen_t *g, LLVMValueRef v) {
     LLVMPositionBuilderAtEnd(g->builder, done);
 }
 
+/* Drop one reference to an (untagged) closure-shaped record through the
+ * destructor it carries: it releases what the record owns when the count
+ * reaches zero, then frees the record. Boxed locals (A33-2b) use the same
+ * shape and therefore the same release. */
+static void emit_closure_record_release(zan_irgen_t *g, LLVMValueRef rec) {
+    if (g->current_fn_no_runtime) return;
+    if (!rec || LLVMGetTypeKind(LLVMTypeOf(rec)) != LLVMPointerTypeKind) return;
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    if (LLVMTypeOf(rec) != i8ptr)
+        rec = LLVMBuildBitCast(g->builder, rec, i8ptr, "clo.rec8");
+    LLVMTypeRef hdr = closure_header_type(g);
+    LLVMValueRef dp = LLVMBuildStructGEP2(g->builder, hdr, rec, 1, "clo.dtorp");
+    LLVMValueRef dtor = LLVMBuildLoad2(g->builder, i8ptr, dp, "clo.dtor");
+    zan_call2(g->builder,
+        LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), &i8ptr, 1, 0),
+        dtor, &rec, 1, "");
+}
+
 static void emit_closure_release(zan_irgen_t *g, LLVMValueRef v) {
     if (g->current_fn_no_runtime) return;
     if (!v || LLVMGetTypeKind(LLVMTypeOf(v)) != LLVMPointerTypeKind) return;
@@ -181,14 +199,7 @@ static void emit_closure_release(zan_irgen_t *g, LLVMValueRef v) {
     LLVMBasicBlockRef done = LLVMAppendBasicBlockInContext(g->ctx, fn, "clo.rl.end");
     LLVMBuildCondBr(g->builder, emit_closure_is_tagged(g, v), doit, done);
     LLVMPositionBuilderAtEnd(g->builder, doit);
-    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
-    LLVMValueRef rec = emit_closure_untag(g, v);
-    LLVMTypeRef hdr = closure_header_type(g);
-    LLVMValueRef dp = LLVMBuildStructGEP2(g->builder, hdr, rec, 1, "clo.dtorp");
-    LLVMValueRef dtor = LLVMBuildLoad2(g->builder, i8ptr, dp, "clo.dtor");
-    zan_call2(g->builder,
-        LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), &i8ptr, 1, 0),
-        dtor, &rec, 1, "");
+    emit_closure_record_release(g, emit_closure_untag(g, v));
     LLVMBuildBr(g->builder, done);
     LLVMPositionBuilderAtEnd(g->builder, done);
 }
