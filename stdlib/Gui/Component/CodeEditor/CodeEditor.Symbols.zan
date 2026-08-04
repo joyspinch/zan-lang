@@ -18,6 +18,7 @@ partial class CodeEditor {
     static List<string> symNames;    // member name
     static List<string> symKinds;    // M method, P property, F field, C ctor, E event
     static List<string> symSigs;     // display signature
+    static List<string> symStatics;  // "1" when the member is static
     static List<string> symTypes;    // every type name in the index
     static List<string> symBases;    // base list of symTypes[i], comma-separated
 
@@ -32,6 +33,7 @@ partial class CodeEditor {
         symNames = new List<string>();
         symKinds = new List<string>();
         symSigs = new List<string>();
+        symStatics = new List<string>();
         symTypes = new List<string>();
         symBases = new List<string>();
     }
@@ -62,10 +64,15 @@ partial class CodeEditor {
                     if (f.Count > 4) { symBases.Add(f[4]); } else { symBases.Add(""); }
                 }
             } else if (f[0] == "M" && f.Count >= 6) {
+                // An extern (DllImport) declaration is an FFI binding, not API
+                // to offer: WebApp's crt `time`/`fopen`/`fwrite`/`fclose` are
+                // members of the type and looked like WebApp's own methods.
+                if (f.Count > 6 && CodeEditor.Find(f[6], "x") >= 0) { continue; }
                 symOwners.Add(f[1]);
                 symNames.Add(f[2]);
                 symKinds.Add(f[3]);
                 symSigs.Add(f[5]);
+                symStatics.Add(f[4]);
             }
         }
         return symTypes.Count > 0;
@@ -80,6 +87,15 @@ partial class CodeEditor {
     /// Appends the members the compiler really has for `typeName`, following
     /// base types so inherited members show up too.
     static void SymbolMembers(string typeName, List<string> out2) {
+        CodeEditor.SymbolMembersIn(typeName, out2, 0 - 1);
+    }
+
+    /// The members of `typeName` in one access context: `wantStatic` 1 lists
+    /// only the static ones (the receiver is the type itself: `WebApp.`), 0 only
+    /// the instance ones (the receiver is a value: `app.`), -1 both. Mixing the
+    /// two is what put a type's whole instance state behind `TypeName.`.
+    static void SymbolMembersIn(string typeName, List<string> out2,
+            int wantStatic) {
         if (!CodeEditor.SymbolIndexLoaded()) { return; }
         string cur = typeName;
         int depth = 0;
@@ -87,7 +103,14 @@ partial class CodeEditor {
             int i = 0;
             while (i < symOwners.Count) {
                 if (symOwners[i] == cur && symKinds[i] != "C") {
-                    if (!CodeEditor.Has(out2, symNames[i])) { out2.Add(symNames[i]); }
+                    bool want = wantStatic < 0;
+                    if (!want && i < symStatics.Count) {
+                        bool st = symStatics[i] == "1";
+                        want = st == (wantStatic == 1);
+                    }
+                    if (want && !CodeEditor.Has(out2, symNames[i])) {
+                        out2.Add(symNames[i]);
+                    }
                 }
                 i = i + 1;
             }

@@ -68,6 +68,16 @@ static void method_sig(const zan_ast_node_t *m, char *buf, int cap) {
     if (n < cap - 1) { buf[n++] = ')'; buf[n] = 0; }
 }
 
+/* True for a bodyless extern / [DllImport] declaration: an FFI binding (crt
+ * fopen, a libpq entry point) that happens to be declared inside a class, so
+ * completion offered it as one of the type's own methods. Same test irgen uses
+ * to emit them as plain external declarations. */
+static int is_extern_decl(const zan_ast_node_t *m) {
+    return m->kind == AST_METHOD_DECL && !m->method_decl.body &&
+           (m->method_decl.extern_lib.str != NULL ||
+            (m->method_decl.modifiers & MOD_EXTERN) != 0);
+}
+
 static const char *type_kind_name(zan_ast_kind_t k) {
     switch (k) {
     case AST_CLASS_DECL:     return "class";
@@ -110,10 +120,10 @@ static void emit_type(FILE *f, zan_ast_node_t *d) {
         case AST_METHOD_DECL:
             is_static = (m->method_decl.modifiers & MOD_STATIC) ? 1 : 0;
             method_sig(m, sig, (int)sizeof(sig));
-            fprintf(f, "M\t%.*s\t%.*s\tM\t%d\t%s\n",
+            fprintf(f, "M\t%.*s\t%.*s\tM\t%d\t%s\t%s\n",
                     (int)name.len, name.str,
                     (int)m->method_decl.name.len, m->method_decl.name.str,
-                    is_static, sig);
+                    is_static, sig, is_extern_decl(m) ? "x" : "");
             break;
         case AST_CONSTRUCTOR_DECL:
             method_sig(m, sig, (int)sizeof(sig));
