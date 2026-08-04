@@ -854,6 +854,74 @@ leakcheck 子集全部通过；生成 IR 不含 `setjmp`/`longjmp`/`__zan_eh_tmp
 
 ---
 
+# A43 · 相对 C# 的能力差距登记表（2026-08-04 实测，逐条待办）
+
+口径：每条都是在本机 `zanc` 上真编译真运行的结果（探针留在 `_scratch/p/`，编号即
+文件前缀），不以「源码里有 token/AST」当作可用。ARC 而非 GC、`yield` 急切物化、
+无 NRT 流分析属于设计取舍，不在此表。
+
+## A43-A 语义/代码生成缺陷（编译通过但结果错或崩溃，优先级最高）
+
+| # | 现象 | 探针 | 状态 |
+|---|---|---|---|
+| A43-A1 | 整数赋给 `double`/`float` 按位重解释（`double b = 1;` 得 `4.94066e-324`），`double` 形参/返回/混合运算 LLVM 校验失败 | 54,57–66 | ✅ 已修（A32-7，0205cc1） |
+| A43-A2 | 默认参数值不填充：`F(1)` 调 `F(int a, int b = 2)` LLVM 校验失败；`new A(1)` 静默不调用构造器，字段留 0 | 19,81–88 | ✅ 已修（见下 A43-A2 详情） |
+| A43-A3 | 接口默认方法（`interface I { int G() { return 42; } }`）经接口变量调用一律返回 0；经类变量调用报 `'C' has no member 'G'`。irgen 从不处理 `AST_INTERFACE_DECL`，默认体从不被发射，`irgen_call.c` 的接口分发对「类未实现该方法」的分支落到 `LLVMConstNull` | 44,51,52,80 | ⬜ 待修 |
+| A43-A4 | `int? v = a?.x;` 运行时崩溃（0xC0000005）；此前是 `PHI node operands are not the same type` | 21,43 | ⬜ 待修 |
+| A43-A5 | `event H E;` + `a.E += P.OnE; a.Fire();` 编译通过、静默不触发（输出只有 `end`） | 28 | ⬜ 待修（A33-2 一并） |
+| A43-A6 | 捕获式 lambda：`(a) => a + k` 报 `use of undeclared identifier 'k'`；捕获字段时诊断还指向 `stdlib/System/Security/Cryptography/Md5.zan`（位置也错） | 22 | ⬜ 待修（A33-2） |
+| A43-A7 | 泛型类里的实例泛型方法 `Pool<T>.M<U>()` 运行崩溃（0xC0000005） | 13 | ⬜ 待修（A32-3a） |
+| A43-A8 | async 泛型方法返回垃圾值（打印 `-1886711216`） | 56 | ⬜ 待修（A32-3b） |
+| A43-A9 | `static A()` 只在首次 `new` 时执行：先读 `A.n` 得 0，`new A()` 后才是 7（C# 首次访问静态成员即触发） | 08,40 | ⬜ 待修 |
+| A43-A10 | `readonly` 只解析不强制：`public readonly int x;` 在类外 `a.x = 6;` 编译通过并改值 | 71,72 | ⬜ 待修（补诊断） |
+
+### A43-A2 详情（已完成 2026-08-04）
+
+* 根因：调用点从不补齐缺省实参。方法调用直接把源实参数交给 `zan_call2`（参数个数
+  与被调用者不符）；构造器更糟——`find_ctor()` 只按 `param_count == argc` 精确匹配，
+  少一个实参就一个都不匹配，于是**根本不调用构造器**，对象字段停在 0。
+* 修复点：`irgen_builtins.c::fill_default_args()`（在 `pack_params_args` 之前，于
+  `irgen_call.c` 的 5 个方法调用路径调用）；`irgen_expr_core.c::fill_ctor_default_args()`
+  + `irgen_expr.c`（`new T(...)`）、`irgen_emit.c`（`: base(...)` / `: this(...)`）、
+  `irgen_stmt.c`（struct/class 局部变量的 `new`）三处回退。缺省表达式在调用点求值，
+  与 C# 语义一致；重写幂等。
+* 实测：静态/实例/多缺省/`double` 缺省/`this.M()` 与裸 `M()`/构造器/`: base` 链/
+  `: this` 链/struct 构造器全部正确（探针 81–88）。
+* 正式测试：`tests/conformance/default_parameters.zan`。
+* 回归：`ctest -R "default_param|ctor|constructor|overload|params|generic|struct|interface|record|field_decl|int_to"`
+  99 项里仅 `field_decl_initializers`（及其 leakcheck）失败，已确认是 A32-1 的既有失败。
+
+## A43-B 语法缺失（parser 层不接受，按价值排序）
+
+| # | C# 语法 | 探针 | 现状 |
+|---|---|---|---|
+| A43-B1 | `Func<...>` / `Action<...>` | 26,39 | `undefined type`；只能自定义 `delegate` |
+| A43-B2 | `using (res) { }` 确定性释放 | 03 | `using` 只做命名空间导入 |
+| A43-B3 | 元组 `(int, string)` 与解构 | 01 | `expected type`；多返回值靠 `out`/`ref` |
+| A43-B4 | 命名实参 `F(b: 2)` | 17 | `expected ')' , got ':'` |
+| A43-B5 | 模式变量 `is T x` / `case T x:` / `when` 子句 / `is not null` | 23,34,35,45 | 全部 parse 失败 |
+| A43-B6 | switch 表达式 `x switch { ... }` | 16 | `expected ';', got 'switch'` |
+| A43-B7 | 扩展方法 `this int v` 形参 | 15 | `expected ')' , got 'IDENT'` |
+| A43-B8 | 交错数组 `int[][]`、多维数组 `int[,]` | 24,25 | `expected variable name` |
+| A43-B9 | 索引器 `public int this[int i]` | 37 | `expected member name` |
+| A43-B10 | 插值格式串 `{v:D4}` | 50 | `expected ')' , got ':'` |
+| A43-B11 | 局部函数 | 05 | 无 AST 节点 |
+| A43-B12 | `implicit` / `explicit operator` | 06 | `undefined type 'implicit'` |
+| A43-B13 | 泛型变体 `interface I<out T>` | 07 | `expected '>', got 'out'` |
+| A43-B14 | `checked` / `unchecked` | 02 | 无关键字 |
+| A43-B15 | `Task` / `Task<T>` 类型名与 API | 12,31,32 | `undefined type 'Task'`（`async` 本体可用） |
+| A43-B16 | `KeyValuePair<K,V>` | 27 | `undefined type`；字典只能遍历 `Keys` |
+| A43-B17 | LINQ `orderby` / `join` / `let` / `group into` | 14 | 查询语法只支持单 `from...where...select` |
+| A43-B18 | `init` 访问器、`readonly struct` / `ref struct` | 09 | 无对应修饰符 |
+
+> 已实测可用、别再当缺失：带参构造器与重载、`: this(...)` / `: base(...)`、方法重载、
+> `public/private/protected/internal`、`partial`、`#region/#endregion`、`const`、
+> `static readonly`（读侧）、属性 get/set、泛型类/方法/具名约束、interface、delegate、
+> 无捕获 lambda、运算符重载、try/catch/finally、非泛型 `async/await`、`yield return`、
+> `enum`、`virtual/override/abstract/base`、`params`、`record`、基础字符串插值、
+> `nameof`、原始字符串、`lock`、`goto`、`switch` 语句、List/Dictionary、
+> `new int[]{...}`、集合与对象初始化器、`??`。
+
 # 已撤回的结论（早期草稿中的错误，勿再引用）
 
 1. ~~"无符号/窄类型只是语法别名，IR 层全塌成 i64，语义是假的"~~ ——

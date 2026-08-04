@@ -1190,6 +1190,18 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
                 zan_ast_list_t *init_args = &member->method_decl.base_args;
                 struct zan_ctor_entry *target = find_ctor(
                     g, target_sym, init_args, locals, this_init ? member : NULL);
+                zan_ast_list_t init_args_filled;
+                if (!target &&
+                    fill_ctor_default_args(g, target_sym, init_args,
+                                           &init_args_filled)) {
+                    struct zan_ctor_entry *dt = find_ctor(
+                        g, target_sym, &init_args_filled, locals,
+                        this_init ? member : NULL);
+                    if (dt) {
+                        target = dt;
+                        init_args = &init_args_filled;
+                    }
+                }
                 LLVMValueRef target_fn = target ? target->fn : NULL;
                 LLVMTypeRef target_fn_type = target ? target->fn_type : NULL;
                 if (target && g->cur_inst && target_sym == type_sym) {

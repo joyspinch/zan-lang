@@ -675,6 +675,40 @@ static struct zan_ctor_entry *find_ctor(zan_irgen_t *g, zan_symbol_t *type_sym,
     return locals ? best : first;
 }
 
+/* A constructor call that leaves trailing defaulted parameters out
+ * (`A(int x, int y = 5)` invoked as `new A(1)`) matches no entry on arity, so
+ * without this the object was left with its fields at zero and no constructor
+ * ran at all. Extend the argument list with the declared default expressions --
+ * the call site is where C# evaluates them -- and report whether a constructor
+ * of the resulting arity exists. */
+static bool fill_ctor_default_args(zan_irgen_t *g, zan_symbol_t *type_sym,
+                                   const zan_ast_list_t *args,
+                                   zan_ast_list_t *out) {
+    int argc = args ? args->count : 0;
+    for (int i = 0; i < g->ctor_count; i++) {
+        struct zan_ctor_entry *entry = &g->ctors[i];
+        if (entry->type_sym != type_sym || entry->param_count <= argc ||
+            !entry->decl) continue;
+        zan_ast_list_t *ps = &entry->decl->method_decl.params;
+        bool defaulted = true;
+        for (int k = argc; k < ps->count; k++) {
+            zan_ast_node_t *p = ps->items[k];
+            if (!p || p->kind != AST_PARAM || !p->param.default_val) {
+                defaulted = false;
+                break;
+            }
+        }
+        if (!defaulted) continue;
+        zan_ast_list_init(out);
+        for (int k = 0; k < argc; k++)
+            zan_ast_list_push(out, args->items[k], g->arena);
+        for (int k = argc; k < ps->count; k++)
+            zan_ast_list_push(out, ps->items[k]->param.default_val, g->arena);
+        return true;
+    }
+    return false;
+}
+
 /* Type family of an expression, recognising the comparison/logical/arithmetic
  * shapes infer_expr_type leaves untyped (a lambda body like `u.age >= 18` or
  * `x * 2` still ranks against a delegate's declared return type). */

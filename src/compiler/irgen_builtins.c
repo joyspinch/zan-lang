@@ -2129,6 +2129,31 @@ static LLVMValueRef emit_null_cond(zan_irgen_t *g, zan_ast_node_t *expr,
  * (or an explicit `new List<T>{...}`) as the sole trailing argument passes it
  * through unpacked. The call node is mutated in place; the rewrite is
  * idempotent so re-emission (e.g. per generic instantiation) is safe. */
+/* Default parameter values: `F(int a, int b = 2)` invoked as `F(1)` has the
+ * declared default expression appended at the call site, which is where C#
+ * evaluates it. Without this the call was emitted with fewer arguments than the
+ * callee declares and failed LLVM verification ("Incorrect number of arguments
+ * passed"). The call node is mutated in place, and the rewrite is idempotent:
+ * once the argument list is full there is nothing left to append. A trailing
+ * `params` tail and operator methods (whose declared list carries an injected
+ * receiver) are left to pack_params_args. */
+static void fill_default_args(zan_irgen_t *g, zan_ast_node_t *call,
+                              zan_symbol_t *method_sym) {
+    if (!call || call->kind != AST_CALL) return;
+    if (!method_sym || !method_sym->decl) return;
+    if (method_sym->decl->kind != AST_METHOD_DECL &&
+        method_sym->decl->kind != AST_CONSTRUCTOR_DECL) return;
+    if (method_is_params_variadic(method_sym)) return;
+    if (method_sym->name.len > 3 &&
+        memcmp(method_sym->name.str, "op_", 3) == 0) return;
+    zan_ast_list_t *ps = &method_sym->decl->method_decl.params;
+    for (int i = call->call.args.count; i < ps->count; i++) {
+        zan_ast_node_t *p = ps->items[i];
+        if (!p || p->kind != AST_PARAM || !p->param.default_val) return;
+        zan_ast_list_push(&call->call.args, p->param.default_val, g->arena);
+    }
+}
+
 static void pack_params_args(zan_irgen_t *g, zan_ast_node_t *call,
                              zan_symbol_t *method_sym, local_scope_t *locals) {
     if (!method_sym || !method_sym->decl ||

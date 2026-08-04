@@ -3434,6 +3434,18 @@ static LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                     ctor_arg_list.count = init_start;
                     struct zan_ctor_entry *ctor = find_ctor(
                         g, sym, &ctor_arg_list, locals, NULL);
+                    if (!ctor) {
+                        zan_ast_list_t filled;
+                        if (fill_ctor_default_args(g, sym, &ctor_arg_list,
+                                                   &filled)) {
+                            struct zan_ctor_entry *dc = find_ctor(
+                                g, sym, &filled, locals, NULL);
+                            if (dc) {
+                                ctor = dc;
+                                ctor_arg_list = filled;
+                            }
+                        }
+                    }
                     LLVMValueRef ctor_fn = NULL;
                     LLVMTypeRef ctor_ft = NULL;
                     if (ctor && new_inst && new_inst->type_arg_count > 0)
@@ -3471,13 +3483,13 @@ static LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                             if (new_inst && new_inst->type_arg_count > 0)
                                 pt = subst_delegate_sig(g, pt, new_inst);
                             call_args[k + 1] = emit_arg_typed(
-                                g, expr->new_expr.args.items[k], pt, locals);
+                                g, ctor_arg_list.items[k], pt, locals);
                         }
                         coerce_args_to_params(g, ctor_ft, call_args, argc);
                         zan_call2(g->builder, ctor_ft, ctor_fn, call_args, (unsigned)argc, "");
                         if (obj_eh_pushed) emit_eh_tmp_pop(g);
                         for (int k = 0; k < ctor_arg_list.count; k++) {
-                            emit_release_owned_call_temp(g, expr->new_expr.args.items[k],
+                            emit_release_owned_call_temp(g, ctor_arg_list.items[k],
                                 call_args[k + 1], locals);
                         }
                         free(call_args);
