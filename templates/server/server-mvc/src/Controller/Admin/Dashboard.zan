@@ -1,0 +1,93 @@
+using System;
+using System.Data;
+using System.Json;
+using System.Web;
+using ZanWeb;
+using ZanWeb.Dao.Sys;
+using ZanWeb.Dao.Blog;
+
+namespace ZanWeb.Admin;
+
+/// <summary>
+/// The admin dashboard at /admin. It reads the numbers the framework already
+/// keeps — WebApp.MetricsJson() is the same snapshot /admin/metrics/index serves —
+/// instead of counting anything itself, so the page and the API can never
+/// disagree.
+///
+/// The cards refresh in place: htmx re-requests this very page every 10s and
+/// swaps only #cards out of the response (hx-select), so there is no second
+/// fragment endpoint to keep in step with the page.
+/// </summary>
+[Route("admin/[controller]/[action]")]
+[Description("仪表盘")]
+class Dashboard : AdminController {
+    [HttpGet]
+    [Route("/admin")]
+    [Description("仪表盘")]
+    async void Index() {
+        ViewData d = await this.Layout("dashboard", "仪表盘");
+        if (d == null) { return; }
+
+        JsonValue m = JsonValue.ParseLenient(WebHost.Current().MetricsJson());
+        JsonValue req = m.Get("requests");
+        JsonValue q = m.Get("queries");
+        if (req == null) { req = JsonValue.NewObject(); }
+        if (q == null) { q = JsonValue.NewObject(); }
+
+        d.Set("requests", Convert.ToString(req.Long("count", 0)));
+        d.Set("errors", Convert.ToString(req.Long("errors", 0)));
+        d.Set("avgMs", Convert.ToString(req.Long("avg_ms", 0)) + " ms");
+        d.Set("maxMs", Convert.ToString(req.Long("max_ms", 0)) + " ms");
+        d.Set("queries", Convert.ToString(q.Long("count", 0)));
+        d.Set("queryAvgMs", Convert.ToString(q.Long("avg_ms", 0)) + " ms");
+        d.Set("uptime", AdminController.Uptime(m.Long("uptime_ms", 0)));
+        d.Set("cpu", AdminController.Percent(m.Long("cpu_percent", -1)));
+        d.Set("mem", AdminController.Bytes(m.Long("mem_rss_bytes", -1)));
+        d.Set("pid", Convert.ToString(m.Long("pid", 0)));
+        d.Set("worker", Convert.ToString(m.Long("worker_id", 0)));
+        d.Set("slowMs", Convert.ToString(req.Long("slow_threshold_ms", 0)) + " ms");
+
+        List<StrMap> slow = d.AddList("slow");
+        JsonValue rows = m.Get("slow_requests");
+        if (rows != null) {
+            for (int i = rows.Count() - 1; i >= 0; i = i - 1) {
+                JsonValue e = rows.At(i);
+                StrMap row = new StrMap();
+                row.Set("req", e.Str("req", ""));
+                row.Set("ms", Convert.ToString(e.Long("ms", 0)));
+                slow.Add(row);
+            }
+        }
+        // {{#if}} reads variables, not lists, so the empty state gets its own flag.
+        d.Set("slowCount", Convert.ToString(slow.Count));
+        if (slow.Count == 0) { d.Set("noSlow", "1"); }
+
+        d.Set("cacheKind", Dashboard.CacheKind(this.Cache()));
+        d.Set("pool", "n/a");
+        DbContext db = this.Db();
+        if (db != null) {
+            d.Set("pool", "idle=" + Convert.ToString(db.IdleCount())
+                + " live=" + Convert.ToString(db.LiveCount())
+                + " waiting=" + Convert.ToString(db.WaitingCount()));
+        }
+
+        // Business counters need the database; an unavailable one is reported as
+        // such rather than rendered as a zero the operator would trust.
+        d.Set("users", "n/a");
+        d.Set("posts", "n/a");
+        d.Set("published", "n/a");
+        IDbConnection conn = await this.Conn();
+        if (conn != null) {
+            d.Set("users", Convert.ToString(await new UserDao(conn).Count()));
+            d.Set("posts", Convert.ToString(await new PostDao(conn).CountAll()));
+            d.Set("published", Convert.ToString(await new PostDao(conn).CountPublished()));
+        }
+        this.View(d);
+    }
+
+    static string CacheKind(CacheContext cache) {
+        if (cache == null) { return "n/a"; }
+        if (cache.Shared()) { return "redis（跨 worker 共享）"; }
+        return "memory（仅本 worker）";
+    }
+}

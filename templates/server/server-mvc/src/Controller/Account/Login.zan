@@ -1,0 +1,84 @@
+using System;
+using System.Web;
+using ZanWeb;
+
+namespace ZanWeb.Account;
+
+/// <summary>
+/// The admin sign-in screen. It issues the SAME cookie as POST /api/auth/login
+/// (AuthUser.Login -> AuthToken.Issue), so a browser session and an API token are
+/// one mechanism and not two: nothing here knows how a password is hashed or how
+/// a token is signed.
+///
+/// It lives in its own module so it gets its own chrome: Account/View/layout.html
+/// is a bare centred card rather than the admin shell — a sidebar on a page you
+/// cannot use yet is noise. Both actions answer at /admin/login (GET renders,
+/// POST verifies) and a failed attempt re-renders the GET view, so the reason is
+/// on the page the user is already looking at.
+/// </summary>
+[Route("[controller]/[action]")]
+[Custom(Authorization = CustomAuthorization.None)]
+[Description("登录")]
+class Login : Controller {
+    static string Tpl = "Account.Login.Index";
+
+    [HttpGet]
+    [Route("/admin/login")]
+    [Description("登录")]
+    void Index() {
+        if (this.IsLogin()) {
+            this.Ctx().Redirect("/admin");
+            return;
+        }
+        this.ViewOf(Login.Tpl, Login.Page("", this.In("user")));
+    }
+
+    [HttpPost]
+    [Route("/admin/login")]
+    [Description("登录提交")]
+    async void Submit() {
+        string user = this.In("user");
+        string pass = this.In("pass");
+        if (user.Length == 0 || pass.Length == 0) {
+            this.ViewOf(Login.Tpl, Login.Page("请输入账号和密码", user));
+            return;
+        }
+        if (user.Length > 32 || pass.Length > 64) {
+            this.ViewOf(Login.Tpl, Login.Page("账号或密码超出长度限制", ""));
+            return;
+        }
+        // "" covers both "no such account" and "wrong password" on purpose: the
+        // page must not tell an attacker which of the two it was.
+        string token = await AuthUser.Login(user, pass);
+        if (token.Length == 0) {
+            if (!AuthToken.Ready()) {
+                this.ViewOf(Login.Tpl,
+                    Login.Page("服务端未配置 ZAN_AUTH_SECRET（至少 32 字符），无法签发会话", user));
+                return;
+            }
+            this.ViewOf(Login.Tpl, Login.Page("账号或密码不正确", user));
+            return;
+        }
+        this.Ctx().SetCookie("zsession", token, 864000);
+        this.Ctx().Redirect("/admin");
+    }
+
+    [HttpGet]
+    [Route("/admin/logout")]
+    [Description("退出登录")]
+    void Out() {
+        // Expiring the cookie is enough for this browser; UserDao.BumpTokenVersion
+        // is the bigger hammer that invalidates every token already issued.
+        this.Ctx().SetCookie("zsession", "", 0);
+        this.Ctx().Redirect("/admin/login");
+    }
+
+    static ViewData Page(string error, string user) {
+        ViewData d = new ViewData();
+        d.Set("title", "登录 · {{NAME}}");
+        d.Set("brand", "{{NAME}}");
+        d.Set("error", error);
+        d.Set("user", user);
+        return d;
+    }
+}

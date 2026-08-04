@@ -17,20 +17,28 @@ its own: config, DB, cache, controllers, models and views.
 config/app.json         runtime config (host/port/limits/db/cache) — NOT compiled in
 src/main.zan            bootstrap only — routes come from controller attributes
 src/Controller/         request handlers, one directory per module
+  layout.html             the site-wide page wrapper (global {{content}} layout)
   Index/Index.zan         HTML landing page
   Blog/Posts.zan          list / detail / publish (ORM + cache + views)
+  Account/Login.zan       GET/POST /admin/login, /admin/logout (own bare layout)
+  Admin/Dashboard.zan     GET /admin — metrics dashboard
+  Admin/Users.zan         GET /admin/users + enable/disable, force logout
+  Admin/Posts.zan         GET /admin/posts + publish/unpublish
   Api/Auth.zan            POST /api/auth/login, GET /api/auth/me
   User/Users.zan          /users, /user/{id}
-  <Module>/View/*.html    that module's views, incl. its layout.html
+  <Module>/View/*.html    that module's views; a module's own layout.html
+                          overrides the global one for that module only
 src/Dao/<Module>/       every query and write for that module
 src/Model/<Module>/     entities only: table structure, no queries
 src/Framework/          application wiring that belongs to this app
+  AppController.zan       request-scoped connection + transactions
+  AdminController.zan     admin base: anonymous -> redirect to /admin/login
   Cfg.zan                 loads config/app.json into the typed Cfg entity
   Db.zan                  builds the DB pool + Redis from [database]/[cache]
   DbContext.zan           per-request connection lease
   Schema.zan              CodeFirst DDL + seed, once at startup
   Auth.zan                token issue/verify against sys_user
-public/                 static assets, served at /static (see below)
+wwwroot/                the ONLY web-reachable directory, served at /static
 ```
 
 ## Attribute-driven routes
@@ -202,16 +210,43 @@ The request lifecycle and database queries are instrumented into the shared
 
 ## Run
 
-Build & run from the IDE (output streams into the terminal panel), or:
+Build & run from the IDE (output streams into the terminal panel), or from a
+shell — **build into `build/`, run from the project root**:
 
 ```
-zanc src/main.zan src/**/*.zan --stdlib-path <stdlib> -o app.exe
-./app.exe        # reads ./config/app.json, http://127.0.0.1:8080
+zanc src/main.zan src/**/*.zan --auto-stdlib -o build/app.exe
+build/app.exe          # cwd = project root, so ./config/app.json and ./wwwroot resolve
 ```
+
+The working directory matters more than where the binary sits: the server reads
+`config/app.json`, serves `wwwroot/` and opens the SQLite file by RELATIVE path, so
+run it from the project root (or from a deploy directory that has those three
+next to the executable) — never `cd build && ./app.exe`.
+
+**Keep generated files out of the source tree.** `-o build/app.exe` exists so the
+executable and the driver DLLs the linker copies beside it land in one throwaway
+directory. Everything the running app produces is likewise disposable and
+git-ignored, but it does land in the working directory:
+
+| Path | What | Keep? |
+|---|---|---|
+| `build/` | compiler output: `app.exe` + driver DLLs | no — delete freely |
+| `publish/<platform>/` | the IDE's Publish output | no |
+| `app.db` | SQLite database (`database.sqlitePath`) | it *is* your data in dev |
+| `uploads/` | streamed upload target | runtime state |
+| `*.log`, `*.err` | whatever you redirected stdout/stderr to | no |
+
+Point `database.sqlitePath` at a directory of your own (e.g. `var/app.db`, created
+beforehand) if you would rather not have the database file in the project root.
 
 ## Endpoints
 
-- `GET /` — HTML page from the in-memory template cache
+- `GET /` — HTML landing page from the in-memory template cache
+- `GET /blog`, `GET /blog/{id}`, `POST /blog/create` — server-rendered blog (author = signed-in account)
+- `GET /admin/login`, `POST /admin/login`, `GET /admin/logout` — admin sign-in (seed: `admin` / `admin1234`)
+- `GET /admin` — admin dashboard (uptime, requests, CPU/RSS, slow requests, pool/cache)
+- `GET /admin/users`, `POST /admin/users/status`, `POST /admin/users/logout` — account administration
+- `GET /admin/posts`, `POST /admin/posts/state` — content administration (drafts included)
 - `GET /users` — ORM + cache demo (503 until a database is configured)
 - `GET /user/{id}` — route parameter demo (JSON envelope)
 - `GET /api/status` — request statistics
@@ -242,11 +277,18 @@ Console.WriteLine(users.ToDefineCode());               // print model source
 
 ## Static assets
 
-`main.zan` mounts `public/` at `/static` before auth and routing:
+`main.zan` mounts `wwwroot/` at `/static` before auth and routing:
 
 ```zan
-StaticFiles.Mount(app, "/static", "public");   // GET /static/css/app.css
+StaticFiles.Mount(app, "/static", "wwwroot");   // GET /static/css/app.css
 ```
+
+**`wwwroot/` is the whole public surface.** One mounted directory, nothing else:
+`src/`, `config/app.json`, `app.db` and every log sit outside it, so no path
+trick reaches them even if a check were wrong — the files simply are not under
+the served root. A file becomes downloadable by being moved into `wwwroot/`,
+which makes "is this public?" a question about the directory rather than about
+the path parser.
 
 Bodies are read once per worker and then served from memory with
 `Cache-Control: public, max-age=86400`; a path is rejected unless every segment
@@ -254,10 +296,10 @@ is plain `[A-Za-z0-9._-]`, so `..`, backslashes and dotfiles cannot escape the
 directory. `StaticFiles.MaxAge(0)` while developing.
 
 ```
-public/css/app.css          the whole design system (no framework, no build)
-public/js/app.js            htmx glue: CSRF header, error/flash toasts
-public/vendor/htmx.min.js   htmx 1.9.12    -- unpkg.com/htmx.org@1.9.12/dist/htmx.min.js
-public/vendor/alpine.min.js Alpine 3.14.1  -- unpkg.com/alpinejs@3.14.1/dist/cdn.min.js
+wwwroot/css/app.css          the whole design system (no framework, no build)
+wwwroot/js/app.js            htmx glue: CSRF header, error/flash toasts
+wwwroot/vendor/htmx.min.js   htmx 1.9.12    -- unpkg.com/htmx.org@1.9.12/dist/htmx.min.js
+wwwroot/vendor/alpine.min.js Alpine 3.14.1  -- unpkg.com/alpinejs@3.14.1/dist/cdn.min.js
 ```
 
 The two vendor files are committed on purpose: no CDN at runtime, versions

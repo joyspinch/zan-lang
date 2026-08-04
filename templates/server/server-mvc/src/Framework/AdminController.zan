@@ -1,0 +1,114 @@
+using System;
+using System.Web;
+using ZanWeb.Model.Sys;
+
+namespace ZanWeb;
+
+/// <summary>
+/// Base class for the HTML admin screens. It exists because a browser and an API
+/// client need different answers to "you are not allowed": the JSON routes carry
+/// [Custom(Authorization = CustomAuthorization.ApiAuth)] and get a 401/403, while
+/// a person who opens /admin should land on the sign-in form. So these pages take
+/// no framework auth attribute and gate themselves here instead.
+///
+/// The gate is two-stage because the two checks cost different things. OnBefore is
+/// synchronous, so it can only look at the identity the framework already resolved
+/// from the cookie — no session, redirect, done, no query. The rank check needs the
+/// database, so it happens in Layout(), which every action awaits anyway: Layout
+/// returns null when the account is not an administrator and the action returns.
+/// Forgetting the check is awkward by construction, since the ViewData you need is
+/// the same object that carries the verdict.
+/// </summary>
+class AdminController : AppController {
+    virtual bool OnBefore() {
+        if (this.IsLogin()) { return true; }
+        this.Ctx().Redirect("/admin/login");
+        return false;
+    }
+
+    /// <summary>The signed-in administrator, or null when this account is not one.
+    /// The write actions call it directly because they render no page and so have
+    /// no ViewData to carry a verdict; a logged-in non-admin must not get through
+    /// on a POST just because it never loaded the page first.</summary>
+    protected async User Admin() {
+        User me = await AuthUser.ById(this.uid);
+        if (me == null || me.status != 1 || me.isSuper != 1) { return null; }
+        return me;
+    }
+
+    /// <summary>Common shell data for an admin page, or null when this account may
+    /// not see it (the response is already written in that case).</summary>
+    protected async ViewData Layout(string active, string heading) {
+        User me = await this.Admin();
+        if (me == null) {
+            this.Ctx().Status(403, "Forbidden").Html("<h1>403</h1><p>该账号没有管理后台权限。"
+                + "<a href=\"/admin/logout\">换个账号</a></p>");
+            return null;
+        }
+
+        ViewData d = new ViewData();
+        d.Set("title", heading + " · {{NAME}} 管理后台");
+        d.Set("brand", "{{NAME}}");
+        d.Set("heading", heading);
+        d.Set("account", me.username);
+        d.Set("navDashboard", AdminController.Nav(active, "dashboard"));
+        d.Set("navPosts", AdminController.Nav(active, "posts"));
+        d.Set("navUsers", AdminController.Nav(active, "users"));
+        return d;
+    }
+
+    /// <summary>Turns the ?ok / ?bad marker a redirect left behind into a message.
+    /// The outcome travels in the URL so the write itself stays a POST that a
+    /// reload cannot repeat.</summary>
+    protected void Flash(ViewData d, string ok, string bad) {
+        if (this.In("ok").Length > 0) {
+            d.Set("flashKind", "ok");
+            d.Set("flash", ok);
+            return;
+        }
+        if (this.In("bad").Length > 0) {
+            d.Set("flashKind", "bad");
+            d.Set("flash", bad);
+        }
+    }
+
+    static string Nav(string active, string item) {
+        if (active == item) { return "active"; }
+        return "";
+    }
+
+    static string Uptime(long ms) {
+        long total = ms / 1000;
+        long days = total / 86400;
+        string clock = AdminController.Pad2((total % 86400) / 3600) + ":"
+            + AdminController.Pad2((total % 3600) / 60) + ":"
+            + AdminController.Pad2(total % 60);
+        if (days > 0) { return Convert.ToString(days) + "d " + clock; }
+        return clock;
+    }
+
+    /// <summary>Bytes for humans. A negative value means the platform could not
+    /// report the metric, and says so instead of showing a plausible 0.</summary>
+    static string Bytes(long v) {
+        if (v < 0) { return "n/a"; }
+        if (v < 1024) { return Convert.ToString(v) + " B"; }
+        if (v < 1048576) { return Convert.ToString(v / 1024) + " KB"; }
+        return Convert.ToString(v / 1048576) + "."
+            + Convert.ToString((v * 10 / 1048576) % 10) + " MB";
+    }
+
+    static string Percent(long v) {
+        if (v < 0) { return "n/a"; }
+        return Convert.ToString(v) + "%";
+    }
+
+    static string Stamp(long seconds) {
+        if (seconds <= 0) { return "-"; }
+        return DateTime.FromUnixSeconds(seconds).ToString();
+    }
+
+    static string Pad2(long v) {
+        if (v < 10) { return "0" + Convert.ToString(v); }
+        return Convert.ToString(v);
+    }
+}

@@ -1,0 +1,109 @@
+using System;
+using System.Data;
+using System.Web;
+using ZanWeb;
+using ZanWeb.Model.Blog;
+using ZanWeb.Dao.Blog;
+
+namespace ZanWeb.Admin;
+
+/// <summary>
+/// Content administration at /admin/posts. Unlike the public list this one shows
+/// drafts too (PostDao.AllRecent ignores `published`), because hiding a post from
+/// the admin who has to un-hide it would be a strange kind of privacy.
+///
+/// Every write invalidates the public list cache before redirecting. Without that
+/// the front page would keep serving the old snapshot for up to the TTL and the
+/// admin would reasonably conclude the button is broken.
+/// </summary>
+[Route("admin/[controller]/[action]")]
+[Description("文章管理")]
+class Posts : AdminController {
+    [HttpGet]
+    [Route("/admin/posts")]
+    [Description("文章列表")]
+    async void Index() {
+        ViewData d = await this.Layout("posts", "文章管理");
+        if (d == null) { return; }
+        this.Flash(d, "操作已生效，前台列表缓存已失效。", "操作未生效：文章不存在或数据库不可用。");
+
+        string kw = this.In("kw");
+        d.Set("kw", kw);
+
+        IDbConnection db = await this.Conn();
+        if (db == null) {
+            d.Set("dbDown", "1");
+            d.Set("count", "0");
+            this.View(d);
+            return;
+        }
+
+        List<Post> rows = await new PostDao(db).AllRecent(50, kw);
+        List<StrMap> items = d.AddList("posts");
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            Post p = rows[i];
+            StrMap row = new StrMap();
+            row.Set("id", Convert.ToString(p.id));
+            row.Set("title", p.title);
+            row.Set("author", p.author);
+            row.Set("createdAt", AdminController.Stamp(p.createdAt));
+            row.Set("stateText", Posts.StateText(p.published));
+            row.Set("stateClass", Posts.StateClass(p.published));
+            row.Set("nextState", Posts.NextState(p.published));
+            row.Set("toggleText", Posts.ToggleText(p.published));
+            items.Add(row);
+        }
+        d.Set("count", Convert.ToString(rows.Count));
+        if (rows.Count == 0) { d.Set("empty", "1"); }
+        this.View(d);
+    }
+
+    [HttpPost]
+    [Route("/admin/posts/state")]
+    [Description("上线/下线文章")]
+    async void State() {
+        if (await this.Admin() == null) {
+            this.Ctx().Status(403, "Forbidden").Text("forbidden");
+            return;
+        }
+        int id = this.InInt("id", 0);
+        int published = this.InInt("published", 1);
+        if (published != 1) { published = 0; }
+        IDbConnection db = await this.Conn();
+        if (db == null || id <= 0) {
+            this.Ctx().Redirect("/admin/posts?bad=1");
+            return;
+        }
+        int changed = await new PostDao(db).SetPublished(id, published);
+        if (changed > 0) {
+            CacheContext cache = this.Cache();
+            if (cache != null) {
+                await cache.DelAsync(PostDao.ListKey);
+                await cache.DelAsync(PostDao.PostKey(id));
+            }
+            this.Ctx().Redirect("/admin/posts?ok=1");
+            return;
+        }
+        this.Ctx().Redirect("/admin/posts?bad=1");
+    }
+
+    static string StateText(int published) {
+        if (published == 1) { return "已发布"; }
+        return "草稿";
+    }
+
+    static string StateClass(int published) {
+        if (published == 1) { return "ok"; }
+        return "";
+    }
+
+    static string NextState(int published) {
+        if (published == 1) { return "0"; }
+        return "1";
+    }
+
+    static string ToggleText(int published) {
+        if (published == 1) { return "下线"; }
+        return "发布";
+    }
+}
