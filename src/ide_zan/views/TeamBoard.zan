@@ -1,0 +1,259 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+/// The assistant panel's team strip: the team-mode switch, who is working right
+/// now, and -- expanded -- the roster, the pipeline position and the task board.
+///
+/// Everything here is assembled from the shared widgets (Switch, Avatar, Tag,
+/// Steps, Progress, Button) rather than painted by hand, so the strip picks up
+/// the active skin's colours, radii and paddings for free and cannot drift away
+/// from the rest of the IDE the way a bespoke chat header does.
+///
+/// Collapsed is the default on purpose: the reader wants "who / what beat / how
+/// far", and the prose, tool output and full board are one click away.
+class TeamBoard {
+    static Switch modeSw;
+    static Button openBtn;
+    static Avatar ava;
+    static Steps steps;
+    static SignalInt stage;
+    static Progress bar;
+
+    static int ChipH(App app) { return app.theme.heightTiny; }
+
+    /// Row 1 has to clear the switch, whose natural height comes from the skin.
+    static int HeadRowH(App app) {
+        Switch sw = TeamBoard.ModeSwitch();
+        sw.MeasureTree(app);
+        int h = sw.prefH;
+        if (h < TeamBoard.RowH(app)) { h = TeamBoard.RowH(app); }
+        return h;
+    }
+
+    static int RowH(App app) { return app.Scale(26); }
+    static int StepsH(App app) { return app.Scale(46); }
+
+    static Switch ModeSwitch() {
+        if (TeamBoard.modeSw == null) {
+            TeamBoard.modeSw = Switch.Bind(SignalBool.Create(false));
+            TeamBoard.modeSw.Class = "small";
+        }
+        return TeamBoard.modeSw;
+    }
+
+    static Button OpenButton() {
+        if (TeamBoard.openBtn == null) {
+            TeamBoard.openBtn = new Button { Text = "", Class = "small text" };
+        }
+        return TeamBoard.openBtn;
+    }
+
+    static Avatar Ava() {
+        if (TeamBoard.ava == null) { TeamBoard.ava = new Avatar(); }
+        return TeamBoard.ava;
+    }
+
+    static Progress Bar() {
+        if (TeamBoard.bar == null) { TeamBoard.bar = new Progress(0, 1); }
+        return TeamBoard.bar;
+    }
+
+    /// The pipeline strip. Labels are the short forms because the assistant
+    /// panel is narrow and six full role names never fit.
+    static Steps Pipeline() {
+        if (TeamBoard.steps == null) {
+            TeamBoard.stage = SignalInt.Create(0);
+            List<string> labels = new List<string>();
+            labels.Add(ZanIDE.T("PM", "产品"));
+            labels.Add(ZanIDE.T("Arch", "架构"));
+            labels.Add(ZanIDE.T("Dev", "开发"));
+            labels.Add(ZanIDE.T("QA", "测试"));
+            labels.Add(ZanIDE.T("Rev", "审查"));
+            labels.Add(ZanIDE.T("Sec", "安全"));
+            TeamBoard.steps = Steps.Of(labels, TeamBoard.stage);
+            TeamBoard.steps.Class = "small";
+        }
+        return TeamBoard.steps;
+    }
+
+    /// How tall the strip is for the current mode. One row when the team is off
+    /// (just the switch), one row plus the board when it is on and open.
+    static int Height(App app, bool teamOn, bool open, int taskCount) {
+        int h = TeamBoard.HeadRowH(app) + app.Scale(4);
+        if (!teamOn || !open) { return h; }
+        h = h + TeamBoard.StepsH(app);
+        h = h + AiTeam.Roles().Count * TeamBoard.RowH(app);
+        int shown = taskCount;
+        if (shown > 4) { shown = 4; }
+        h = h + shown * TeamBoard.RowH(app);
+        return h + app.Scale(6);
+    }
+
+    /// What the active member is doing, as a short chip label.
+    static string StatusOf(AiTeamState st, bool busy) {
+        if (st.awaitingUser) { return ZanIDE.T("waiting for you", "等你确认"); }
+        if (busy) { return ZanIDE.T("working", "工作中"); }
+        return ZanIDE.T("idle", "待命");
+    }
+
+    static string StatusClass(AiTeamState st, bool busy) {
+        if (st.awaitingUser) { return "warning"; }
+        if (busy) { return "primary"; }
+        return "";
+    }
+
+    /// Paints one "avatar + name tag + state tag" line, the shape every member
+    /// row and the collapsed summary share.
+    static void MemberRow(App app, int x, int y, int rightEdge, string roleId,
+            string state, string stateCls, int pct) {
+        TeamBoard.MemberRowH(app, x, y, rightEdge, roleId, state, stateCls,
+            pct, TeamBoard.RowH(app));
+    }
+
+    static void MemberRowH(App app, int x, int y, int rightEdge, string roleId,
+            string state, string stateCls, int pct, int rowH) {
+        string cls = AiTeam.RoleTagClass(roleId);
+        string name = AiTeam.DisplayName(roleId);
+        Avatar av = TeamBoard.Ava();
+        av.Text = ChatArea.Initial(name);
+        av.Size = 18;
+        av.Class = cls;
+        int d = av.Diameter(app);
+        int cy = y + (rowH - d) / 2;
+        av.RenderAt(app, x, cy, d);
+        int cx = x + d + app.Scale(6);
+        int chipY = y + (rowH - TeamBoard.ChipH(app)) / 2;
+        int nw = Tag.Width(app, name, cls);
+        if (cx + nw > rightEdge) { return; }
+        Tag.Chip(app, cx, chipY, name, cls);
+        cx = cx + nw + app.Scale(4);
+        if (state != "") {
+            int sw2 = Tag.Width(app, state, stateCls);
+            if (cx + sw2 <= rightEdge) {
+                Tag.Chip(app, cx, chipY, state, stateCls);
+                cx = cx + sw2 + app.Scale(4);
+            }
+        }
+        if (pct >= 0) {
+            string pl = Convert.ToString(pct) + "%";
+            if (cx + Tag.Width(app, pl, "primary") <= rightEdge) {
+                Tag.Chip(app, cx, chipY, pl, "primary");
+            }
+        }
+    }
+
+    /// Renders the strip and returns the team-mode flag after the user's click,
+    /// so the caller stays the single owner of that state.
+    static bool Render(App app, Rect area, bool teamOn, bool busy,
+            AiTeamState st, List<AiTask> tasks, SignalInt open) {
+        int pad = app.Scale(6);
+        int rowH = TeamBoard.RowH(app);
+        int headH = TeamBoard.HeadRowH(app);
+        int x = area.x + pad;
+        int right = area.x + area.width - pad;
+        int y = area.y + app.Scale(2);
+
+        // Row 1: the switch owns the mode, and its label says what it does.
+        Switch sw = TeamBoard.ModeSwitch();
+        sw.SetOn(teamOn);
+        sw.MeasureTree(app);
+        int swW = sw.prefW;
+        sw.Render(app, x, y + (headH - sw.prefH) / 2);
+        int cx = x + swW + app.Scale(6);
+        string lab = ZanIDE.T("Team", "团队");
+        int labY = y + (headH - Canvas.FontHeight(app.theme.fontSizeSmall)) / 2;
+        app.canvas.DrawStyledText(
+            Style.Of(app, "label", "small", Style.SNormal()),
+            cx, labY, lab, app.theme.textSecondary, app.theme.fontSizeSmall);
+        cx = cx + Canvas.MeasureText(lab, app.theme.fontSizeSmall) + app.Scale(8);
+        bool nowOn = sw.IsOn();
+
+        if (!nowOn) {
+            // Off: the panel is the single assistant, and the strip says so
+            // rather than pretending a team is standing by.
+            app.canvas.DrawStyledText(
+                Style.Of(app, "label", "hint small", Style.SNormal()),
+                cx, labY, ZanIDE.T("single assistant", "单人小赞"),
+                app.theme.textTertiary, app.theme.fontSizeSmall);
+            return nowOn;
+        }
+
+        // On, collapsed: who is working, on which beat, how far along.
+        int caretW = app.Scale(22);
+        bool isOpen = open.Get() == 1;
+        Button ob = TeamBoard.OpenButton();
+        if (isOpen) { ob.Text = "▼"; } else { ob.Text = "▶"; }
+        int obId = ob.RenderIn(app, right - caretW, y + app.Scale(2),
+            caretW, headH - app.Scale(4));
+        if (Ui.Clicked(app, obId)) {
+            open.Set(1 - open.Get());
+            app.RequestRedraw();
+        }
+        int pct = 0 - 1;
+        int at = AiTeam.IndexOfTask(tasks, st.activeTask);
+        if (at >= 0) { pct = tasks[at].progress; }
+        TeamBoard.MemberRowH(app, cx, y, right - caretW - app.Scale(4),
+            st.activeAgent, TeamBoard.StatusOf(st, busy),
+            TeamBoard.StatusClass(st, busy), pct, headH);
+        y = y + headH + app.Scale(4);
+        if (!isOpen) { return nowOn; }
+
+        // Expanded: where the pipeline stands, then everybody, then the board.
+        Steps ps = TeamBoard.Pipeline();
+        TeamBoard.stage.Set(AiTeam.StageOf(st.activeAgent));
+        ps.ErrorIndex = 0 - 1;
+        ps.RenderAt(app, x, y, right - x);
+        y = y + TeamBoard.StepsH(app);
+
+        List<AiRole> rs = AiTeam.Roles();
+        for (int i = 0; i < rs.Count; i = i + 1) {
+            string state = "";
+            string scls = "";
+            if (rs[i].id == st.activeAgent) {
+                state = TeamBoard.StatusOf(st, busy);
+                scls = TeamBoard.StatusClass(st, busy);
+            } else if (st.awaitingUser && rs[i].id == st.askedBy) {
+                state = ZanIDE.T("asked you", "等你确认");
+                scls = "warning";
+            }
+            TeamBoard.MemberRow(app, x, y, right, rs[i].id, state, scls,
+                0 - 1);
+            y = y + rowH;
+        }
+
+        // The board: the four most recent tasks, newest first, each with the
+        // owner's tag and a real Progress bar.
+        int shown = 0;
+        int ti = tasks.Count - 1;
+        while (ti >= 0 && shown < 4) {
+            AiTask tk = tasks[ti];
+            string ocls = AiTeam.RoleTagClass(tk.owner);
+            int ow = Tag.Width(app, AiTeam.DisplayName(tk.owner), ocls);
+            int chipY = y + (rowH - TeamBoard.ChipH(app)) / 2;
+            Tag.Chip(app, x, chipY, AiTeam.DisplayName(tk.owner), ocls);
+            int tx = x + ow + app.Scale(5);
+            string stl = AiTeam.TaskStateName(tk.state);
+            int sw3 = Tag.Width(app, stl, AiTeam.TaskStateClass(tk.state));
+            Tag.Chip(app, tx, chipY, stl, AiTeam.TaskStateClass(tk.state));
+            tx = tx + sw3 + app.Scale(5);
+            int barW = app.Scale(46);
+            int titleW = right - barW - app.Scale(6) - tx;
+            if (titleW > app.Scale(20)) {
+                app.canvas.DrawStyledText(
+                    Style.Of(app, "label", "small", Style.SNormal()),
+                    tx, y + (rowH - Canvas.FontHeight(app.theme.fontSizeSmall)) / 2,
+                    Ellipsis.Fit(tk.title, titleW, app.theme.fontSizeSmall),
+                    app.theme.textPrimary, app.theme.fontSizeSmall);
+            }
+            Progress pb = TeamBoard.Bar();
+            pb.SetPercent(tk.progress);
+            pb.RenderInside(app, Rect.Create(right - barW,
+                y + (rowH - app.Scale(8)) / 2, barW, app.Scale(8)));
+            y = y + rowH;
+            shown = shown + 1;
+            ti = ti - 1;
+        }
+        return nowOn;
+    }
+}

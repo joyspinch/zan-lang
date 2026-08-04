@@ -844,6 +844,158 @@ class AiTeam {
             + "3) 未解决的问题。只输出摘要，保留任务号与验收标准，不要丢状态。";
     }
 
+    // --- presentation helpers (batch 4) --------------------------------------
+
+    /// The Tag/Avatar class that colours a member everywhere it appears, so the
+    /// roster, the task board and the transcript agree on who is who.
+    static string RoleTagClass(string id) {
+        if (id == AiTeam.Pm()) { return "primary"; }
+        if (id == AiTeam.Arch()) { return "info"; }
+        if (id == AiTeam.Dev()) { return "success"; }
+        if (id == AiTeam.Qa()) { return "warning"; }
+        if (id == AiTeam.Rev()) { return "info"; }
+        if (id == AiTeam.Sec()) { return "danger"; }
+        return "";
+    }
+
+    /// A protocol beat as a short chip label: the reader only needs the beat and
+    /// the percentage, the prose behind it stays foldable.
+    static string KindLabel(string kind) {
+        if (kind == AiTeam.KindAssign()) { return ZanIDE.T("assigned", "派单"); }
+        if (kind == AiTeam.KindAck()) { return ZanIDE.T("acked", "收到"); }
+        if (kind == AiTeam.KindProgress()) { return ZanIDE.T("progress", "进度"); }
+        if (kind == AiTeam.KindHandoff()) { return ZanIDE.T("handoff", "交接"); }
+        if (kind == AiTeam.KindQuestion()) { return ZanIDE.T("question", "待确认"); }
+        if (kind == AiTeam.KindReport()) { return ZanIDE.T("report", "汇报"); }
+        if (kind == AiTeam.KindBlock()) { return ZanIDE.T("defect", "问题"); }
+        return "";
+    }
+
+    // --- task board (batch 4) ------------------------------------------------
+
+    static int TaskTodo() { return 0; }
+    static int TaskAcked() { return 1; }
+    static int TaskDoing() { return 2; }
+    static int TaskBlocked() { return 3; }
+    static int TaskReview() { return 4; }
+    static int TaskDone() { return 5; }
+
+    /// The board state a protocol beat implies for the task it names.
+    static int TaskStateOf(string kind, int cur) {
+        if (kind == AiTeam.KindAck()) { return AiTeam.TaskAcked(); }
+        if (kind == AiTeam.KindProgress()) { return AiTeam.TaskDoing(); }
+        if (kind == AiTeam.KindBlock()) { return AiTeam.TaskBlocked(); }
+        if (kind == AiTeam.KindHandoff()) { return AiTeam.TaskReview(); }
+        if (kind == AiTeam.KindReport()) { return AiTeam.TaskDone(); }
+        if (kind == AiTeam.KindAssign()) { return AiTeam.TaskTodo(); }
+        return cur;
+    }
+
+    static string TaskStateName(int st) {
+        if (st == AiTeam.TaskAcked()) { return ZanIDE.T("acked", "已认领"); }
+        if (st == AiTeam.TaskDoing()) { return ZanIDE.T("doing", "进行中"); }
+        if (st == AiTeam.TaskBlocked()) { return ZanIDE.T("blocked", "待修复"); }
+        if (st == AiTeam.TaskReview()) { return ZanIDE.T("handed off", "已交接"); }
+        if (st == AiTeam.TaskDone()) { return ZanIDE.T("done", "已完成"); }
+        return ZanIDE.T("todo", "待办");
+    }
+
+    /// The Tag class that colours a board state, so the board reads at a glance
+    /// without anybody drawing a status dot by hand.
+    static string TaskStateClass(int st) {
+        if (st == AiTeam.TaskBlocked()) { return "danger"; }
+        if (st == AiTeam.TaskDone()) { return "success"; }
+        if (st == AiTeam.TaskDoing()) { return "primary"; }
+        if (st == AiTeam.TaskReview()) { return "warning"; }
+        return "";
+    }
+
+    static int IndexOfTask(List<AiTask> tasks, string id) {
+        for (int i = 0; i < tasks.Count; i = i + 1) {
+            if (tasks[i].id == id) { return i; }
+        }
+        return 0 - 1;
+    }
+
+    /// Folds one envelope into the board. A task appears the first time anybody
+    /// names it and then only moves forward in progress, so a member reporting
+    /// "40%" after another said "80%" cannot make the board walk backwards.
+    static void ApplyToTasks(List<AiTask> tasks, string owner,
+            AiEnvelope env) {
+        if (env.taskId == "") { return; }
+        int at = AiTeam.IndexOfTask(tasks, env.taskId);
+        if (at < 0) {
+            AiTask t = AiTask.Create(env.taskId,
+                AiTeam.TaskTitleOf(env.body), owner);
+            tasks.Add(t);
+            at = tasks.Count - 1;
+        }
+        AiTask cur = tasks[at];
+        cur.owner = owner;
+        cur.state = AiTeam.TaskStateOf(env.kind, cur.state);
+        if (env.progress > cur.progress) { cur.progress = env.progress; }
+        if (cur.state == AiTeam.TaskDone()) { cur.progress = 100; }
+        if (cur.title == "") { cur.title = AiTeam.TaskTitleOf(env.body); }
+    }
+
+    /// The board shows one line per task, so the title is the envelope body's
+    /// first line trimmed to something that fits a narrow panel.
+    static string TaskTitleOf(string body) {
+        string t = AiAgent.Trim(body);
+        int nl = t.IndexOf("\n");
+        if (nl >= 0) { t = t.Substring(0, nl); }
+        if (t.Length > 60) { t = t.Substring(0, 60); }
+        return AiAgent.Trim(t);
+    }
+
+    /// Where the pipeline stands, for the Steps strip: the index of `id` in the
+    /// pm -> arch -> dev -> qa -> rev -> sec order.
+    static int StageOf(string id) {
+        List<AiRole> rs = AiTeam.Roles();
+        for (int i = 0; i < rs.Count; i = i + 1) {
+            if (rs[i].id == id) { return i; }
+        }
+        return 0;
+    }
+
+    // --- pipeline driving (batch 4) ------------------------------------------
+
+    /// How many automatic handoffs one user turn may trigger. The pipeline is
+    /// six members long, so a full pass plus a round of fixes fits; past that
+    /// the members are volleying and the user should see it.
+    static int MaxHandoffs() { return 12; }
+
+    /// The comma-separated recipient list stored on a message.
+    static string JoinIds(List<string> ids) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < ids.Count; i = i + 1) {
+            if (i > 0) { sb.Append(","); }
+            sb.Append(ids[i]);
+        }
+        return sb.ToString();
+    }
+
+    /// The turn handed to the member being woken by a handoff. It carries only
+    /// the previous member's conclusion (the envelope body), never its context:
+    /// the point of separate contexts is that the next member re-derives the
+    /// work from the artefacts, so it can actually catch what the last one got
+    /// wrong.
+    static string HandoffPrompt(string from, string to, AiEnvelope env) {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("[assign] @" + AiTeam.DisplayName(to) + "，来自 @"
+            + AiTeam.DisplayName(from));
+        if (env.taskId != "") { sb.Append("，任务 " + env.taskId); }
+        sb.Append("。\n");
+        if (env.kind == AiTeam.KindBlock()) {
+            sb.Append("上一环节发现问题，需要你修复：\n");
+        }
+        string body = AiAgent.Trim(env.body);
+        if (body != "") { sb.Append(body + "\n"); }
+        sb.Append("先回一条 [ack] 认领，再开始你自己的职责；"
+            + "完成后按协议 @ 下一环节。");
+        return sb.ToString();
+    }
+
     // --- team state persistence (batch 2) ------------------------------------
 
     /// Serialises the resume state into the compact form stored alongside the

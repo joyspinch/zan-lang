@@ -30,9 +30,42 @@ class ChatPlanStepDoc {
     bool d;
 }
 
+class ChatTaskDoc {
+    string id;
+    string ti;
+    string o;
+    int st;
+    int pg;
+}
+
 class ChatPackDoc {
     List<ChatMsgDoc> m;
     List<ChatPlanStepDoc> plan;
+    // Team mode, the pipeline's parked position and the board. Persisted so a
+    // restart mid-pipeline resumes with the member that was working (or the one
+    // waiting on an answer) instead of quietly restarting from the top and
+    // losing the task. Absent in a single-assistant archive -> 0 / "" / null,
+    // which restores as "team off", exactly the old behaviour.
+    int tm;
+    string ts;
+    List<ChatTaskDoc> tk;
+}
+
+/// Mutable holder for the team half of a session archive, so ChatUnpack can
+/// hand back more than the transcript without eight call sites growing three
+/// out-parameters each.
+class ChatTeamSave {
+    int on;
+    AiTeamState st;
+    List<AiTask> tasks;
+
+    static ChatTeamSave Create() {
+        ChatTeamSave s = new ChatTeamSave();
+        s.on = 0;
+        s.st = AiTeamState.Create();
+        s.tasks = new List<AiTask>();
+        return s;
+    }
 }
 
 class ChatSessionsDoc {
@@ -57,6 +90,15 @@ class ChatArea {
         int kind;
         int meta;
         int owner;
+        // Componentized name-row extras. A head row (kind 3) is drawn as a real
+        // Avatar + Tag chip instead of a hand-painted pill, so these carry what
+        // those components need: the avatar's initial, the role Tag class, an
+        // optional status label (ack/doing/handed off...) and a progress % (-1
+        // when the beat carried none). Empty / -1 on the single assistant.
+        string ava;
+        string tagCls;
+        string status;
+        int pct;
 
         static ChatLine Create(string text, int color, int kind) {
             ChatLine ln = new ChatLine();
@@ -65,8 +107,20 @@ class ChatArea {
             ln.kind = kind;
             ln.meta = 0 - 1;
             ln.owner = 0 - 1;
+            ln.ava = "";
+            ln.tagCls = "";
+            ln.status = "";
+            ln.pct = 0 - 1;
             return ln;
         }
+    }
+
+    /// The first visible character of a speaker name, for the round Avatar. A
+    /// CJK name keeps its first glyph; a latin name is upper-cased.
+    static string Initial(string name) {
+        if (name == "") { return "?"; }
+        string ch = Text.Left(name, 1);
+        return ch.ToUpper();
     }
 
     /// Greedily wraps `s` to `maxW` pixels, appending the pieces to `outLines`.
@@ -151,7 +205,24 @@ class ChatArea {
     /// message content round-trips safely). The per-message reasoning ("z")
     /// rides along so switching sessions keeps each answer's thinking.
     static string ChatPack(List<AiChatMsg> msgs, List<AiPlanStep> plan) {
+        return ChatArea.ChatPack(msgs, plan, ChatTeamSave.Create());
+    }
+
+    static string ChatPack(List<AiChatMsg> msgs, List<AiPlanStep> plan,
+            ChatTeamSave team) {
         ChatPackDoc o = new ChatPackDoc();
+        o.tm = team.on;
+        o.ts = AiTeam.PackState(team.st);
+        o.tk = new List<ChatTaskDoc>();
+        for (int q = 0; q < team.tasks.Count; q = q + 1) {
+            ChatTaskDoc td = new ChatTaskDoc();
+            td.id = team.tasks[q].id;
+            td.ti = team.tasks[q].title;
+            td.o = team.tasks[q].owner;
+            td.st = team.tasks[q].state;
+            td.pg = team.tasks[q].progress;
+            o.tk.Add(td);
+        }
         o.m = new List<ChatMsgDoc>();
         for (int i = 0; i < msgs.Count; i = i + 1) {
             ChatMsgDoc m = new ChatMsgDoc();
@@ -177,9 +248,25 @@ class ChatArea {
 
     static void ChatUnpack(string packed, List<AiChatMsg> msgs,
             List<AiPlanStep> plan) {
+        ChatArea.ChatUnpack(packed, msgs, plan, ChatTeamSave.Create());
+    }
+
+    static void ChatUnpack(string packed, List<AiChatMsg> msgs,
+            List<AiPlanStep> plan, ChatTeamSave team) {
         if (packed == "") { return; }
         ChatPackDoc v = Json.Deserialize<ChatPackDoc>(packed);
         if (v == null || v.m == null) { return; }
+        team.on = v.tm;
+        team.st = AiTeam.UnpackState(v.ts);
+        team.tasks = new List<AiTask>();
+        if (v.tk != null) {
+            for (int q = 0; q < v.tk.Count; q = q + 1) {
+                AiTask tk = AiTask.Create(v.tk[q].id, v.tk[q].ti, v.tk[q].o);
+                tk.state = v.tk[q].st;
+                tk.progress = v.tk[q].pg;
+                team.tasks.Add(tk);
+            }
+        }
         for (int i = 0; i < v.m.Count; i = i + 1) {
             AiChatMsg m = AiChatMsg.CreateWithReason(v.m[i].r, v.m[i].t,
                 v.m[i].z);
@@ -327,17 +414,35 @@ class ChatArea {
             string head = ZanIDE.T("Xiao Zan", "小赞");
             int headCol = t.success;
             int bodyCol = t.textPrimary;
+            string headCls = "success";
             if (msgs[i].role == "user") {
                 head = ZanIDE.T("You", "我");
                 headCol = t.primary;
+                headCls = "primary";
             } else if (msgs[i].role == "error") {
                 head = ZanIDE.T("Error", "错误");
                 headCol = t.error;
                 bodyCol = t.error;
+                headCls = "danger";
             } else if (msgs[i].role == "tool") {
                 head = ZanIDE.T("Tool", "工具");
                 headCol = t.textTertiary;
                 bodyCol = t.textTertiary;
+                headCls = "";
+            }
+            // In a team chat the speaker is a named member, not "Xiao Zan", and
+            // the beat it carried is what the reader actually wants at a glance:
+            // who is working and how far along. The detail stays foldable below.
+            string headStatus = "";
+            int headPct = 0 - 1;
+            if (msgs[i].agent != "" && AiTeam.RoleOf(msgs[i].agent) != null) {
+                head = AiTeam.DisplayName(msgs[i].agent);
+                headCol = AiTeam.RoleOf(msgs[i].agent).tint;
+                headCls = AiTeam.RoleTagClass(msgs[i].agent);
+                if (msgs[i].kind != "") {
+                    headStatus = AiTeam.KindLabel(msgs[i].kind);
+                }
+                if (msgs[i].progress > 0) { headPct = msgs[i].progress; }
             }
             // A tool call/result is collapsed to ONE clickable summary line
             // (its first line, e.g. "list_dir src/"); clicking expands the full
@@ -379,7 +484,12 @@ class ChatArea {
                 continue;
             }
             int msgStart = cache.Count;
-            cache.Add(ChatLine.Create(head, headCol, 3));
+            ChatLine hln = ChatLine.Create(head, headCol, 3);
+            hln.ava = ChatArea.Initial(head);
+            hln.tagCls = headCls;
+            hln.status = headStatus;
+            hln.pct = headPct;
+            cache.Add(hln);
             // F: the model's reasoning is shown as its own dim "Thinking"
             // section above the answer, kept separate from the answer text (and
             // out of the transcript sent back to the model).
@@ -504,6 +614,48 @@ class ChatArea {
 
     /// The display-line index under `mouseY` for a bottom-anchored transcript
     /// whose first visible line is `start`.
+    /// One name row, assembled from Avatar + Tag. Reused instances: a head row
+    /// is drawn for every visible turn, and allocating a control per row per
+    /// frame is exactly the kind of churn that made long transcripts crawl.
+    static Avatar headAva;
+    static Avatar HeadAvatar() {
+        if (ChatArea.headAva == null) {
+            ChatArea.headAva = new Avatar();
+        }
+        return ChatArea.headAva;
+    }
+
+    static void PaintHeadRow(App app, ChatLine ln, int x, int y, int rowH,
+            int rightEdge) {
+        int cx = x;
+        // The avatar is sized to the row so the name strip keeps the transcript's
+        // line rhythm instead of pushing turns apart. Size is in CSS px because
+        // Avatar.Diameter scales it itself.
+        Avatar av = ChatArea.HeadAvatar();
+        av.Text = ln.ava;
+        av.Size = 16;
+        av.Class = ln.tagCls;
+        int d = av.Diameter(app);
+        av.RenderAt(app, cx, y + app.Scale(1), d);
+        cx = cx + d + app.Scale(5);
+        if (cx + Tag.Width(app, ln.text, ln.tagCls) <= rightEdge) {
+            Tag.Chip(app, cx, y + app.Scale(1), ln.text, ln.tagCls);
+            cx = cx + Tag.Width(app, ln.text, ln.tagCls) + app.Scale(4);
+        }
+        if (ln.status != "") {
+            if (cx + Tag.Width(app, ln.status, "") <= rightEdge) {
+                Tag.Chip(app, cx, y + app.Scale(1), ln.status, "");
+                cx = cx + Tag.Width(app, ln.status, "") + app.Scale(4);
+            }
+        }
+        if (ln.pct >= 0) {
+            string pl = Convert.ToString(ln.pct) + "%";
+            if (cx + Tag.Width(app, pl, "primary") <= rightEdge) {
+                Tag.Chip(app, cx, y + app.Scale(1), pl, "primary");
+            }
+        }
+    }
+
     static int RowAtChat(Rect area, int pad, int rowH, int start,
             int count, int mouseY) {
         int rel = (mouseY - (area.y + pad)) / rowH;
@@ -668,21 +820,14 @@ class ChatArea {
                     c.FillRect(hx0, ry, hx1 - hx0, rowH, selCol);
                 }
                 if (cache[idx].kind == 3) {
-                    // Name row of a turn: a solid pill in the speaker's colour
-                    // with the name reversed out of it, so the start of every
-                    // message is a coloured chip rather than one more line of
-                    // text the eye has to parse.
-                    int chipH = rowH - app.Scale(2);
-                    int chipTw = Canvas.MeasureText(cache[idx].text, t.fontSizeSmall);
-                    int chipW = chipTw + app.Scale(14);
-                    c.FillRoundRect(textX, ry + app.Scale(1), chipW, chipH,
-                        chipH / 2, cache[idx].color);
-                    int chipFh = Canvas.FontHeight(t.fontSizeSmall);
-                    app.canvas.DrawText(textX + app.Scale(7),
-                        ry + app.Scale(1) + (chipH - chipFh) / 2,
-                        cache[idx].text, t.bgPrimary,
-                        Style.Of(app, "label", "small", Style.SNormal())
-                            .FontOr(t.fontSizeSmall));
+                    // Name row of a turn, built from the shared widgets rather
+                    // than painted here: a round Avatar for the speaker, a Tag
+                    // chip for the name, and -- in a team chat -- one more Tag
+                    // for the beat and one for the percentage. Hand-rolling this
+                    // pill is what made the assistant's chrome drift away from
+                    // every other list row in the IDE.
+                    ChatArea.PaintHeadRow(app, cache[idx], textX, ry, rowH,
+                        area.x + area.width - pad);
                 } else if (cache[idx].kind == 1) {
                     app.canvas.DrawText(textX + app.Scale(4), ry, cache[idx].text,
                         cache[idx].color,

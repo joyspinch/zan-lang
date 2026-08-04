@@ -239,7 +239,7 @@ partial class ZanIDE {
         int nowMs = Window.GetTickMs();
         if (nowMs - aiLastSave <= 1000) { return; }
         aiLastSave = nowMs;
-        string curPack = ChatArea.ChatPack(aiMsgs, aiPlan);
+        string curPack = AiPackCur();
         if (aiSessions[aiSessCur].pack == curPack) { return; }
         aiSessions[aiSessCur].pack = curPack;
         SaveAiSessions();
@@ -249,7 +249,7 @@ partial class ZanIDE {
         // Fold the live transcript into the current slot first, so the on-disk
         // copy always matches what the user sees.
         if (aiSessCur >= 0 && aiSessCur < aiSessions.Count) {
-            aiSessions[aiSessCur].pack = ChatArea.ChatPack(aiMsgs, aiPlan);
+            aiSessions[aiSessCur].pack = AiPackCur();
         }
         // Archive flags travel beside the packs (one 0/1 per session) rather
         // than inside them, so an older database still loads.
@@ -377,7 +377,7 @@ partial class ZanIDE {
         aiMsgs = new List<AiChatMsg>();
         aiPlan = new List<AiPlanStep>();
         if (aiSessCur >= 0 && aiSessCur < aiSessions.Count) {
-            ChatArea.ChatUnpack(aiSessions[aiSessCur].pack, aiMsgs, aiPlan);
+            AiRestoreSession(aiSessions[aiSessCur].pack);
         }
         aiCacheKey = "";
         aiCacheSig = "";
@@ -2814,7 +2814,7 @@ partial class ZanIDE {
                         // transcript, thinking, task plan and archive flag. The
                         // last remaining chat is emptied rather than removed,
                         // so the panel always has a session to write into.
-                        aiSessions[aiSessCur].pack = ChatArea.ChatPack(aiMsgs, aiPlan);
+                        aiSessions[aiSessCur].pack = AiPackCur();
                         int sDel = sAct.deleted;
                         bool sDelActive = sDel == aiSessCur;
                         int sNewCur = aiSessCur;
@@ -2833,7 +2833,7 @@ partial class ZanIDE {
                         }
                         aiMsgs = new List<AiChatMsg>();
                         aiPlan = new List<AiPlanStep>();
-                        ChatArea.ChatUnpack(aiSessions[sNewCur].pack, aiMsgs, aiPlan);
+                        AiRestoreSession(aiSessions[sNewCur].pack);
                         aiSessCur = sNewCur;
                         if (sDelActive) { AiResetContextState(); }
                         aiCacheKey = "";
@@ -2845,7 +2845,7 @@ partial class ZanIDE {
                             "会话及其上下文已删除"), 3);
                         app.RequestRedraw();
                     } else if (aiBusy.Get() == 0 && sAct.created) {
-                        aiSessions[aiSessCur].pack = ChatArea.ChatPack(aiMsgs, aiPlan);
+                        aiSessions[aiSessCur].pack = AiPackCur();
                         aiSessions.Add(AiSession.Create("", 0));
                         aiMsgs = new List<AiChatMsg>();
                         aiPlan = new List<AiPlanStep>();
@@ -2859,10 +2859,10 @@ partial class ZanIDE {
                         app.RequestRedraw();
                     } else if (aiBusy.Get() == 0 && sAct.selected >= 0
                         && sAct.selected != aiSessCur) {
-                        aiSessions[aiSessCur].pack = ChatArea.ChatPack(aiMsgs, aiPlan);
+                        aiSessions[aiSessCur].pack = AiPackCur();
                         aiMsgs = new List<AiChatMsg>();
                         aiPlan = new List<AiPlanStep>();
-                        ChatArea.ChatUnpack(aiSessions[sAct.selected].pack, aiMsgs, aiPlan);
+                        AiRestoreSession(aiSessions[sAct.selected].pack);
                         aiSessCur = sAct.selected;
                         aiCacheKey = "";
                         aiCacheSig = "";
@@ -3009,13 +3009,34 @@ partial class ZanIDE {
                     if (aiCtxTok <= 0) { aiCtxTok = AiAgent.DefaultCtxTokens(); }
                     AiAgent.SetLimits(aiCtxTok,
                         ZanIDE.AiLimitInt(aiLimMap, chatModel, "out"));
+                    // The team strip owns the single/team switch, so the mode is
+                    // always one click away and the panel always says which one
+                    // it is in.
+                    int aiTeamH = TeamBoard.Height(app, aiTeamMode,
+                        aiTeamOpen.Get() == 1, aiTasks.Count);
+                    bool aiTeamWas = aiTeamMode;
+                    aiTeamMode = TeamBoard.Render(app,
+                        Rect.Create(rBody.x, rBody.y + aiHdrH, rBody.width,
+                            aiTeamH),
+                        aiTeamMode, aiBusy.Get() == 1, aiTeamSt, aiTasks,
+                        aiTeamOpen);
+                    if (aiTeamMode != aiTeamWas) {
+                        // Switching modes changes who every name row belongs to,
+                        // so the wrapped transcript has to be rebuilt.
+                        aiCacheKey = "";
+                        if (!aiTeamMode) { aiRunAgent = ""; }
+                        app.RequestRedraw();
+                    }
                     int aiPlanH = AiPlanHeight(app);
                     if (aiPlanH > 0) {
-                        AiRenderPlan(app, Rect.Create(rBody.x, rBody.y + aiHdrH,
+                        AiRenderPlan(app,
+                            Rect.Create(rBody.x, rBody.y + aiHdrH + aiTeamH,
                             rBody.width, aiPlanH));
                     }
-                    Rect aiChat = Rect.Create(rBody.x, rBody.y + aiHdrH + aiPlanH,
-                        rBody.width, rBody.height - aiHdrH - aiPlanH);
+                    Rect aiChat = Rect.Create(rBody.x,
+                        rBody.y + aiHdrH + aiTeamH + aiPlanH,
+                        rBody.width,
+                        rBody.height - aiHdrH - aiTeamH - aiPlanH);
                     // Wheel-scroll the transcript (lines up from the bottom).
                     bool ownsAiWheel = app.CaptureWheel(aiChat.x, aiChat.y, aiChat.width, aiChat.height);
                     if (ownsAiWheel) {
@@ -3196,7 +3217,7 @@ partial class ZanIDE {
                                 AiAgent.Describe(capR) + "\n"
                                 + "user declined this action; do not repeat it --"
                                 + " propose an alternative or ask what to do instead."));
-                            string rerr = ZanIDE.AiLaunch(aiMsgs, aiRunCtxName,
+                            string rerr = ZanIDE.AiLaunchAs(aiRunAgent, aiMsgs, aiRunCtxName,
                                 aiRunCtxCode, root, aiProfiles[aiProfActive].baseUrl,
                                 aiProfiles[aiProfActive].key, aiRunModel);
                             if (rerr != "") {
@@ -3249,10 +3270,30 @@ partial class ZanIDE {
                         string q = AiAgent.Trim(aiInput.GetText());
                         aiInput.SetText("");
                         if (q != "") {
-                            aiMsgs.Add(AiChatMsg.Create("user", q));
-                            // A fresh question restarts both automatic loops.
+                            // Team mode: an explicit @name wins, else the member
+                            // that spoke last, else the product manager -- and a
+                            // parked question is answered by whoever asked it, so
+                            // "continue" resumes the stage it stopped in instead
+                            // of restarting the pipeline.
+                            string tgt = "";
+                            if (aiTeamMode) {
+                                if (aiTeamSt.awaitingUser) {
+                                    tgt = AiTeam.ResumeTarget(aiTeamSt);
+                                } else {
+                                    tgt = AiTeam.RouteUser(q, aiMsgs);
+                                }
+                                aiTeamSt.awaitingUser = false;
+                                aiTeamSt.askedBy = "";
+                            }
+                            aiRunAgent = tgt;
+                            AiChatMsg umsg = AiChatMsg.Create("user", q);
+                            umsg.to = tgt;
+                            aiMsgs.Add(umsg);
+                            // A fresh question restarts every automatic loop,
+                            // including the handoff chain's budget.
                             aiRetry = 0;
                             aiAutoCont = 0;
+                            aiHandoffs = 0;
                             // Attach the active file as context so the AI can
                             // help with the code actually on screen.
                             string aiCtxName = "";
@@ -3266,7 +3307,8 @@ partial class ZanIDE {
                             aiRunModel = chatModel;
                             aiRunCtxName = aiCtxName;
                             aiRunCtxCode = aiCtxCode;
-                            string aerr = ZanIDE.AiLaunch(aiMsgs, aiCtxName, aiCtxCode, root,
+                            string aerr = ZanIDE.AiLaunchAs(aiRunAgent, aiMsgs,
+                                aiCtxName, aiCtxCode, root,
                                 aiProfiles[aiProfActive].baseUrl, aiProfiles[aiProfActive].key, chatModel);
                             if (aerr != "") {
                                 aiMsgs.Add(AiChatMsg.Create("error", aerr));
@@ -3680,7 +3722,7 @@ partial class ZanIDE {
                                     aiMsgs.Add(AiChatMsg.Create("tool",
                                         aiUiTool + "\n"
                                         + AiAgent.BuildResult(bout, false, false)));
-                                    string ube = ZanIDE.AiLaunch(aiMsgs,
+                                    string ube = ZanIDE.AiLaunchAs(aiRunAgent, aiMsgs,
                                         aiRunCtxName, aiRunCtxCode, root,
                                         aiProfiles[aiProfActive].baseUrl,
                                         aiProfiles[aiProfActive].key, aiRunModel);
@@ -3695,7 +3737,7 @@ partial class ZanIDE {
                                 if (buildThenRun) { tb = "run\n"; }
                                 aiMsgs.Add(AiChatMsg.Create("tool",
                                     tb + AiAgent.BuildResult(bout, aiOk, buildThenRun)));
-                                string aiBe = ZanIDE.AiLaunch(aiMsgs,
+                                string aiBe = ZanIDE.AiLaunchAs(aiRunAgent, aiMsgs,
                                     aiRunCtxName, aiRunCtxCode, root,
                                     aiProfiles[aiProfActive].baseUrl,
                                     aiProfiles[aiProfActive].key, aiRunModel);
@@ -3738,7 +3780,7 @@ partial class ZanIDE {
                             aiUiTool + "\n"
                             + AiAgent.UiResultOf(aiUiTool, rlog, rjson, tjson,
                                 uiTo && !uiDone)));
-                        string uce = ZanIDE.AiLaunch(aiMsgs,
+                        string uce = ZanIDE.AiLaunchAs(aiRunAgent, aiMsgs,
                             aiRunCtxName, aiRunCtxCode, root,
                             aiProfiles[aiProfActive].baseUrl,
                             aiProfiles[aiProfActive].key, aiRunModel);
@@ -3911,7 +3953,7 @@ partial class ZanIDE {
                                 && aiRetry < AiAgent.MaxRetries();
                             if (retryable) {
                                 aiRetry = aiRetry + 1;
-                                string rle = ZanIDE.AiLaunch(aiMsgs,
+                                string rle = ZanIDE.AiLaunchAs(aiRunAgent, aiMsgs,
                                     aiRunCtxName, aiRunCtxCode, root,
                                     aiProfiles[aiProfActive].baseUrl,
                                     aiProfiles[aiProfActive].key, aiRunModel);
@@ -3951,8 +3993,22 @@ partial class ZanIDE {
                             // thinking worth keeping, so save the reasoning
                             // even when there is no visible text.
                             if (said != "" || rz != "") {
-                                aiMsgs.Add(AiChatMsg.CreateWithReason(
-                                    "assistant", said, rz));
+                                AiChatMsg amsg = AiChatMsg.CreateWithReason(
+                                    "assistant", said, rz);
+                                if (aiTeamMode) {
+                                    // Record the beat on the message itself, so
+                                    // the transcript (and the reload of it) can
+                                    // show progress and ownership without
+                                    // re-parsing the prose.
+                                    AiEnvelope env = AiTeam.ParseEnvelope(said);
+                                    AiTeam.ApplyToTasks(aiTasks, aiRunAgent, env);
+                                    amsg.agent = aiRunAgent;
+                                    amsg.kind = env.kind;
+                                    amsg.taskId = env.taskId;
+                                    amsg.progress = env.progress;
+                                    amsg.to = AiTeam.JoinIds(env.to);
+                                }
+                                aiMsgs.Add(amsg);
                             }
                             if (more) {
                                 string tname = AiAgent.ToolName(call);
@@ -3990,7 +4046,7 @@ partial class ZanIDE {
                                     aiAutoCont = aiAutoCont + 1;
                                     aiMsgs.Add(AiChatMsg.Create("user",
                                         AiAgent.ContinuePrompt(limitHit)));
-                                    string cle = ZanIDE.AiLaunch(aiMsgs,
+                                    string cle = ZanIDE.AiLaunchAs(aiRunAgent, aiMsgs,
                                         aiRunCtxName, aiRunCtxCode, root,
                                         aiProfiles[aiProfActive].baseUrl,
                                         aiProfiles[aiProfActive].key, aiRunModel);
@@ -4004,7 +4060,7 @@ partial class ZanIDE {
                                             "Tool limit reached for this question.",
                                             "本次提问的工具调用次数已达上限。")));
                                     }
-                                    aiBusy.Set(0);
+                                    AiTeamTurnEnd(said);
                                 }
                             }
                         }
@@ -4820,6 +4876,81 @@ partial class ZanIDE {
         aiPlanClearBtn = new Button { Text = ZanIDE.T("Clear plan", "清空计划"), Class = "small" };
     }
 
+    /// The active session's archive: transcript, plan and -- so a restart lands
+    /// back in the same pipeline stage -- the team mode, state and board.
+    string AiPackCur() {
+        ChatTeamSave sv = ChatTeamSave.Create();
+        if (aiTeamMode) { sv.on = 1; }
+        sv.st = aiTeamSt;
+        sv.tasks = aiTasks;
+        return ChatArea.ChatPack(aiMsgs, aiPlan, sv);
+    }
+
+    /// Loads a session archive into the live lists, including the team half. A
+    /// single-assistant archive restores as team-off, so opening an old chat
+    /// never silently switches the panel into team mode.
+    void AiRestoreSession(string pack) {
+        ChatTeamSave sv = ChatTeamSave.Create();
+        ChatArea.ChatUnpack(pack, aiMsgs, aiPlan, sv);
+        aiTeamMode = sv.on == 1;
+        aiTeamSt = sv.st;
+        aiTasks = sv.tasks;
+        aiRunAgent = "";
+        aiHandoffs = 0;
+    }
+
+    /// Ends the member's turn. Outside team mode this is just "go idle".
+    ///
+    /// In team mode the reply's protocol beat decides what happens next: a
+    /// [question] parks the pipeline for the user (nobody guesses on the user's
+    /// behalf), a [handoff]/[block] wakes the next member with a directive
+    /// naming the task, and anything else means the same member still owns the
+    /// work. The chain is bounded by MaxHandoffs() so a pair of members cannot
+    /// volley a task back and forth forever without the user seeing it.
+    void AiTeamTurnEnd(string said) {
+        if (!aiTeamMode) { aiBusy.Set(0); return; }
+        AiEnvelope env = AiTeam.ParseEnvelope(said);
+        string from = aiRunAgent;
+        if (from == "") { from = AiTeam.Pm(); }
+        aiTeamSt = AiTeam.Advance(aiTeamSt, from, env);
+        if (aiTeamSt.awaitingUser) {
+            // Waiting on the user is a real stop: the panel shows who asked.
+            aiBusy.Set(0);
+            return;
+        }
+        string nxt = aiTeamSt.activeAgent;
+        if (nxt == "" || nxt == from) { aiBusy.Set(0); return; }
+        if (aiHandoffs >= AiTeam.MaxHandoffs()) {
+            aiMsgs.Add(AiChatMsg.Create("error", ZanIDE.T(
+                "Handoff limit reached; the team stopped so you can look.",
+                "交接次数已达上限，团队已暂停，请你介入查看。")));
+            aiBusy.Set(0);
+            return;
+        }
+        aiHandoffs = aiHandoffs + 1;
+        aiRunAgent = nxt;
+        aiRetry = 0;
+        aiAutoCont = 0;
+        AiChatMsg hmsg = AiChatMsg.Create("user",
+            AiTeam.HandoffPrompt(from, nxt, env));
+        hmsg.to = nxt;
+        hmsg.kind = AiTeam.KindAssign();
+        hmsg.taskId = aiTeamSt.activeTask;
+        aiMsgs.Add(hmsg);
+        string herr = ZanIDE.AiLaunchAs(aiRunAgent, aiMsgs,
+            aiRunCtxName, aiRunCtxCode, root,
+            aiProfiles[aiProfActive].baseUrl,
+            aiProfiles[aiProfActive].key, aiRunModel);
+        if (herr != "") {
+            aiMsgs.Add(AiChatMsg.Create("error", herr));
+            aiBusy.Set(0);
+        } else {
+            aiBusy.Set(1);
+        }
+        aiScroll.Set(0);
+        app.RequestRedraw();
+    }
+
     /// Runs one assistant tool call inside the open project and continues the
     /// loop. File tools (`write_file` / `edit_file`, and the read tools) run
     /// here and their result is handed straight back to the model. `build` /
@@ -4828,13 +4959,32 @@ partial class ZanIDE {
     /// compiler output back. A launch error stops the loop.
     void AiDispatchTool(string call) {
         string tool = AiAgent.ToolName(call);
+        // The whitelist is enforced where the tool actually runs. Asking a
+        // member in its prompt not to touch a tool is not a boundary; refusing
+        // the call is, and naming the owner turns the refusal into a handoff
+        // instead of another blocked attempt.
+        if (aiTeamMode && aiRunAgent != ""
+            && !AiTeam.AllowsTool(aiRunAgent, tool)) {
+            aiMsgs.Add(AiChatMsg.Create("tool",
+                AiAgent.Describe(call) + "\n"
+                + AiTeam.DenyTool(aiRunAgent, tool)));
+            string gerr = ZanIDE.AiLaunchAs(aiRunAgent, aiMsgs,
+                aiRunCtxName, aiRunCtxCode, root,
+                aiProfiles[aiProfActive].baseUrl,
+                aiProfiles[aiProfActive].key, aiRunModel);
+            if (gerr != "") {
+                aiMsgs.Add(AiChatMsg.Create("error", gerr));
+                aiBusy.Set(0);
+            }
+            return;
+        }
         if (tool == "plan") {
             aiPlan = new List<AiPlanStep>();
             int nsteps = AiAgent.ParsePlan(call, aiPlan);
             aiMsgs.Add(AiChatMsg.Create("tool",
                 AiAgent.Describe(call) + "\nplan updated: "
                 + Convert.ToString(nsteps) + " step(s)."));
-            string plerr = ZanIDE.AiLaunch(aiMsgs, aiRunCtxName,
+            string plerr = ZanIDE.AiLaunchAs(aiRunAgent, aiMsgs, aiRunCtxName,
                 aiRunCtxCode, root, aiProfiles[aiProfActive].baseUrl,
                 aiProfiles[aiProfActive].key, aiRunModel);
             if (plerr != "") {
@@ -4852,7 +5002,7 @@ partial class ZanIDE {
             }
             aiMsgs.Add(AiChatMsg.Create("tool",
                 AiAgent.Describe(call) + "\n" + body));
-            string derr = ZanIDE.AiLaunch(aiMsgs, aiRunCtxName,
+            string derr = ZanIDE.AiLaunchAs(aiRunAgent, aiMsgs, aiRunCtxName,
                 aiRunCtxCode, root, aiProfiles[aiProfActive].baseUrl,
                 aiProfiles[aiProfActive].key, aiRunModel);
             if (derr != "") {
@@ -4870,7 +5020,7 @@ partial class ZanIDE {
                     AiAgent.Describe(call)
                     + "\nerror: no buildable/run target is selected in the IDE;"
                     + " open a program file (with a Main) first."));
-                string e2 = ZanIDE.AiLaunch(aiMsgs, aiRunCtxName,
+                string e2 = ZanIDE.AiLaunchAs(aiRunAgent, aiMsgs, aiRunCtxName,
                     aiRunCtxCode, root, aiProfiles[aiProfActive].baseUrl,
                     aiProfiles[aiProfActive].key, aiRunModel);
                 if (e2 != "") {
@@ -4920,7 +5070,7 @@ partial class ZanIDE {
             AiAgent.Describe(call) + "\n" + result));
         // A write may touch a file open in a tab; the disk-change poll picks
         // that up and offers a reload, so the editor and disk stay in sync.
-        string terr = ZanIDE.AiLaunch(aiMsgs, aiRunCtxName,
+        string terr = ZanIDE.AiLaunchAs(aiRunAgent, aiMsgs, aiRunCtxName,
             aiRunCtxCode, root, aiProfiles[aiProfActive].baseUrl,
             aiProfiles[aiProfActive].key, aiRunModel);
         if (terr != "") {
@@ -5258,6 +5408,15 @@ partial class ZanIDE {
         aiSessions = new List<AiSession>();
         aiSessCur = 0;
         aiSessions.Add(AiSession.Create("", 0));
+        // Team runtime. Default off so the panel is the single assistant until
+        // the user flips the switch; the state is a live object either way so
+        // the pipeline code never has to null-check it.
+        aiTeamMode = false;
+        aiRunAgent = "";
+        aiHandoffs = 0;
+        aiTeamSt = AiTeamState.Create();
+        aiTasks = new List<AiTask>();
+        aiTeamOpen = SignalInt.Create(0);
         // Restore sessions persisted on disk so a restart continues the last
         // conversation instead of starting from an empty chat.
         LoadAiSessions();
