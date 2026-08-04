@@ -230,7 +230,39 @@ partial class ZanIDE {
     /// session's ChatPack JSON, plus a meta row holding the active index.
     /// Saved on every session change and (throttled) whenever the transcript
     /// grows.
-    static string AiSessionsDbPath() { return ZanIDE.CacheDir() + "/ai_sessions.db"; }
+    ///
+    /// It is the chat list of the open project. Chats are project work -- they cite
+    /// its files and carry its context -- so each project keeps its own list,
+    /// and two IDEs on two projects no longer write over one shared database
+    /// (the whole list is rewritten on every save, so the loser lost its chats).
+    /// With no project open the list is the install-wide one, which is also
+    /// where every pre-project-scoped chat still lives.
+    string AiSessionsDbPath() {
+        if (!haveProject || root == "") { return ZanIDE.SharedSessionsDbPath(); }
+        return ZanIDE.CacheDir() + "/sessions/" + ZanIDE.PathKey(root) + ".db";
+    }
+
+    static string SharedSessionsDbPath() {
+        return ZanIDE.CacheDir() + "/ai_sessions.db";
+    }
+
+    /// A stable, file-name-safe key for a path: its leaf plus a hash of the
+    /// whole thing, so two projects with the same folder name stay apart.
+    static string PathKey(string path) {
+        string leaf = ZanIDE.SanitizeName(Path.GetFileName(path));
+        if (leaf == "") { leaf = "project"; }
+        long h = 2166136261;
+        for (int i = 0; i < path.Length; i = i + 1) {
+            int b = path[i];
+            // Windows paths differ only in case and separator: fold both so the
+            // same project does not get two lists.
+            if (b >= 65 && b <= 90) { b = b + 32; }
+            if (b == 92) { b = 47; }
+            h = (h ^ b) * 16777619;
+            h = h & 0xFFFFFFFF;
+        }
+        return leaf + "_" + Convert.ToString(h);
+    }
 
     /// Writes the transcript back at most once a second (and only when it
     /// actually changed). Called once per frame from the main loop.
@@ -261,7 +293,9 @@ partial class ZanIDE {
         SqliteConnection db = null;
         try {
             ZanIDE.EnsureCacheDir();
-            db = SqliteConnection.Open(ZanIDE.AiSessionsDbPath());
+            string dbp = this.AiSessionsDbPath();
+            Directory.CreateDirectoryRecursive(ZanIDE.DirOf(dbp));
+            db = SqliteConnection.Open(dbp);
             if (db == null || !db.IsConnected()) { return; }
             db.Execute("CREATE TABLE IF NOT EXISTS sessions ("
                 + "id INTEGER PRIMARY KEY, pack TEXT NOT NULL)");
@@ -276,6 +310,15 @@ partial class ZanIDE {
                 DbParams.Create().Add(Convert.ToString(aiSessCur)));
             db.Execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('arch', ?)",
                 DbParams.Create().Add(archCsv));
+            // Names the user typed travel beside the packs too, so a database
+            // written by an older build (no titles row) still loads.
+            AiTitlesDoc td = new AiTitlesDoc();
+            td.t = new List<string>();
+            for (int ti2 = 0; ti2 < aiSessions.Count; ti2 = ti2 + 1) {
+                td.t.Add(aiSessions[ti2].title);
+            }
+            db.Execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('titles', ?)",
+                DbParams.Create().Add(Json.Serialize<AiTitlesDoc>(td)));
         } catch (Exception e) {
             // Never let a storage failure crash the IDE's main loop.
             int skip = 0;
@@ -307,10 +350,25 @@ partial class ZanIDE {
 
     void LoadAiSessions() {
         aiSessions.Clear();
+        aiSessDbPath = this.AiSessionsDbPath();
+        // A project opening for the first time since chats became per-project
+        // inherits the install-wide list, then owns its copy: the shared file is
+        // renamed so the next project starts clean instead of a second copy.
+        if (haveProject && !File.Exists(aiSessDbPath)
+            && File.Exists(ZanIDE.SharedSessionsDbPath())) {
+            try {
+                Directory.CreateDirectoryRecursive(ZanIDE.DirOf(aiSessDbPath));
+                File.Copy(ZanIDE.SharedSessionsDbPath(), aiSessDbPath);
+                File.Move(ZanIDE.SharedSessionsDbPath(),
+                    ZanIDE.CacheDir() + "/ai_sessions.pre-project.db");
+            } catch (Exception e) {
+                int skip2 = 0;
+            }
+        }
         // One-time migration from the pre-SQLite JSON file (ai_sessions.json in
         // the config dir) when the cache database does not exist yet.
         string legacy = ZanIDE.UserConfigDir() + "/ai_sessions.json";
-        if (!File.Exists(ZanIDE.AiSessionsDbPath()) && File.Exists(legacy)) {
+        if (!File.Exists(aiSessDbPath) && File.Exists(legacy)) {
             try {
                 JsonValue v = JsonValue.ParseLenient(File.ReadAllText(legacy));
                 if (v != null) {
@@ -339,10 +397,10 @@ partial class ZanIDE {
                 int skip = 0;
             }
         }
-        if (File.Exists(ZanIDE.AiSessionsDbPath())) {
+        if (File.Exists(aiSessDbPath)) {
             SqliteConnection db = null;
             try {
-                db = SqliteConnection.Open(ZanIDE.AiSessionsDbPath());
+                db = SqliteConnection.Open(aiSessDbPath);
                 if (db != null && db.IsConnected()) {
                     DbResult rs = db.Query("SELECT id, pack FROM sessions ORDER BY id");
                     for (int r = 0; r < rs.RowCount(); r = r + 1) {
@@ -358,6 +416,17 @@ partial class ZanIDE {
                     if (c < 0 || c >= aiSessions.Count) { c = 0; }
                     for (int ai = 0; ai < arch.Count && ai < aiSessions.Count; ai = ai + 1) {
                         aiSessions[ai].archived = arch[ai];
+                    }
+                    string tj = db.ExecuteScalar(
+                        "SELECT value FROM meta WHERE key = 'titles'");
+                    if (tj != "") {
+                        AiTitlesDoc td = Json.Deserialize<AiTitlesDoc>(tj);
+                        if (td != null && td.t != null) {
+                            for (int tk = 0; tk < td.t.Count
+                                && tk < aiSessions.Count; tk = tk + 1) {
+                                aiSessions[tk].title = td.t[tk];
+                            }
+                        }
                     }
                     aiSessCur = c;
                 }
@@ -381,6 +450,18 @@ partial class ZanIDE {
         }
         aiCacheKey = "";
         aiCacheSig = "";
+        aiToolOpen = new List<int>();
+        if (aiSessNav != null) { aiSessNav.CancelRename(); }
+    }
+
+    /// Moves the chat panel onto the project that just became the open one:
+    /// the chats of the one before are written back to their own database
+    /// first, so nothing of either project ends up in the other's list.
+    void AdoptProjectChats() {
+        string want = this.AiSessionsDbPath();
+        if (want == aiSessDbPath) { return; }
+        SaveAiSessions();
+        LoadAiSessions();
     }
 
     // ---- Recently opened projects (start page MRU, newest first) ----
@@ -2285,6 +2366,7 @@ partial class ZanIDE {
                                 haveProject = true;
                                 ZanIDE.WriteLastProject(root);
                                 this.AdoptSymbolIndex();
+                                this.AdoptProjectChats();
                                 tabs = new List<TabRecord>();
                                 activeTab.Set(0);
                                 lastActive = 0 - 1;
@@ -2781,11 +2863,15 @@ partial class ZanIDE {
                     List<string> aiTitles = new List<string>();
                     List<int> aiArch = new List<int>();
                     for (int sti = 0; sti < aiSessions.Count; sti = sti + 1) {
-                        string sTtl = "";
-                        if (sti == aiSessCur) {
-                            sTtl = ChatArea.FirstUserOf(aiMsgs);
-                        } else {
-                            sTtl = ChatArea.ChatTitle(aiSessions[sti].pack);
+                        // A name the user typed wins over the first message,
+                        // which is only this panel's guess at the subject.
+                        string sTtl = aiSessions[sti].title;
+                        if (sTtl == "") {
+                            if (sti == aiSessCur) {
+                                sTtl = ChatArea.FirstUserOf(aiMsgs);
+                            } else {
+                                sTtl = ChatArea.ChatTitle(aiSessions[sti].pack);
+                            }
                         }
                         if (sTtl == "") {
                             sTtl = ZanIDE.T("New chat ", "新会话 ")
@@ -2841,9 +2927,19 @@ partial class ZanIDE {
                         aiCacheSig = "";
                         aiToolOpen = new List<int>();
                         aiScroll.Set(0);
+                        // Rows shifted under the list: a rename left open would
+                        // land on whichever chat took that index.
+                        aiSessNav.CancelRename();
                         SaveAiSessions();
                         Layer.Msg(ZanIDE.T("Chat and its context deleted",
                             "会话及其上下文已删除"), 3);
+                        app.RequestRedraw();
+                    } else if (sAct.renamed >= 0
+                        && sAct.renamed < aiSessions.Count) {
+                        // An empty name hands the row back to the derived one.
+                        aiSessions[sAct.renamed].title =
+                            CodeEditor.TrimStr(sAct.title);
+                        SaveAiSessions();
                         app.RequestRedraw();
                     } else if (aiBusy.Get() == 0 && sAct.created) {
                         aiSessions[aiSessCur].pack = AiPackCur();
@@ -4634,6 +4730,9 @@ partial class ZanIDE {
         // the real ones (stdlib included) and an index left pointing at the
         // wrong sources is replaced rather than trusted.
         this.AdoptSymbolIndex();
+        // The chat list belongs to the project too, and the constructor loaded
+        // it before this restore knew which project that is.
+        this.AdoptProjectChats();
         tree = new List<TreeNode>();
         if (haveProject) { tree = ZanIDE.ScanTree(root); }
         rescan = false;
@@ -5593,7 +5692,9 @@ partial class ZanIDE {
                     "归档 / 恢复此会话（保留内容，仅从列表折叠）"),
                 ZanIDE.T("Delete this chat and its whole context",
                     "删除此会话及其全部上下文"),
-                ZanIDE.T("Archived", "已归档"));
+                ZanIDE.T("Archived", "已归档"))
+            .RenameLabel(ZanIDE.T("Rename this chat (Enter keeps, Esc cancels)",
+                "重命名此会话（回车保存，Esc 取消）"));
         // Chat transcript wrapped-line cache (rebuilt only when the transcript,
         // width or theme changes — rewrapping every frame is too slow).
         aiCacheLines = new List<ChatLine>();
