@@ -33,7 +33,8 @@ class Schema {
     }
 
     static void SeedAdmin(IDbConnection db) {
-        if (db.Select<AuthUserEnt>().Count() > 0) { return; }
+        UserDao users = new UserDao(db);
+        if (users.CountAccounts() > 0) { return; }
         string salt = Hex.Encode(RandomNumberGenerator.GetBytes(16), 16);
         AuthUserEnt admin = new AuthUserEnt();
         admin.username = "admin";
@@ -41,26 +42,29 @@ class Schema {
         admin.passwordHash = AuthUser.PasswordHash("admin1234", salt);
         admin.role = "admin";
         admin.status = "active";
-        db.Insert<AuthUserEnt>(admin).ExecuteAffrows();
+        int _id = users.InsertAccount(admin);
     }
 
     static void SeedPosts(IDbConnection db) {
-        if (db.Select<Post>().Count() > 0) { return; }
+        PostDao posts = new PostDao(db);
+        if (posts.CountPublished() > 0) { return; }
         List<Post> seed = new List<Post> {
-            Schema.PostOf("连接是借来的，不是共享的",
-                "每个请求从连接池借一条连接，用完在 finally 里归还。"
-                + "worker 之间不共享连接，同一个 worker 内的协程也不共享，"
-                + "所以事务不会互相串台。", "admin"),
-            Schema.PostOf("查询用类型化 ORM",
-                "db.Select<Post>().Where(a => a.published == 1)"
-                + ".OrderByDescending(a => a.id).ToList() —— 列名和类型都在编译期检查，"
-                + "值一律参数绑定，拼不出注入。", "admin"),
+            Schema.PostOf("连接是请求级的",
+                "一个请求借一条连接（this.Conn()），请求内所有查询复用它，"
+                + "动作结束框架自动归还，所以业务代码里没有 Acquire/Release。"
+                + "worker 之间、协程之间都不共享连接，事务不会互相串台。", "admin"),
+            Schema.PostOf("查询只写在 Dao 里",
+                "Controller 取参数管缓存渲染视图，Dao 负责读写"
+                + "（new PostDao(await this.Conn()).Recent(20, kw)），Model 就是表结构。"
+                + "类型化 ORM 让列名和类型在编译期检查，值一律参数绑定。", "admin"),
             Schema.PostOf("缓存要说清楚存在哪",
                 "GetAsync/SetAsync 走 Redis，所有 worker 都看得见；"
                 + "LocalGet/LocalSet 只在本进程内存里，别的 worker 看不到。"
                 + "名字里就写明白，省得同步写内存、异步读 Redis。", "admin")
         };
-        db.Insert<Post>(seed).ExecuteAffrows();
+        for (int i = 0; i < seed.Count; i = i + 1) {
+            int _id = posts.Insert(seed[i]);
+        }
     }
 
     static Post PostOf(string title, string body, string author) {

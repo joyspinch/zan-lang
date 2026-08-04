@@ -1,0 +1,113 @@
+using System;
+using System.Data;
+using System.Web;
+
+namespace ZanWeb;
+
+/// <summary>
+/// Controller base with injected database and cache access. Dependencies are
+/// assembled in main.zan and installed via AppServices.Use(...); actions reach
+/// them through this.Conn() / this.Cache() instead of static service lookup.
+///
+/// THE CONNECTION IS REQUEST-SCOPED. Conn() borrows one connection from the pool
+/// the first time an action asks for it, every later call in the same request
+/// gets that same connection, and OnAfter() gives it back when the action
+/// finishes — so no business code, and no DAO, contains Acquire/Release:
+///
+///     PostDao dao = new PostDao(await this.Conn());
+///     List&lt;Post&gt; rows = dao.Recent(20, kw);
+///     Post one = dao.ById(id);          // same connection, no second lease
+///
+/// One connection per request (not per query) is also what makes transactions
+/// possible at all: a transaction lives on a session, so every statement inside
+/// it must run on the same connection.
+///
+///     if (!await this.Begin()) { ...unavailable... }
+///     try {
+///         new PostDao(this.Held()).Insert(p);
+///         new UserDao(this.Held()).BumpPostCount(uid);
+///         this.Commit();
+///     } catch { this.Rollback(); }   // Rollback is safe to call twice
+///
+/// Override OnDone() (not OnAfter()) for per-request cleanup of your own, so the
+/// connection is always released.
+/// </summary>
+class AppController : Controller {
+    IDbConnection lease;
+    bool inTx;
+
+    /// <summary>The injected database context (null before AppServices.Use).</summary>
+    protected DbContext Db() {
+        AppServices s = AppServices.Current();
+        if (s == null) { return null; }
+        return s.Db();
+    }
+
+    /// <summary>The injected cache context (null before AppServices.Use).</summary>
+    protected CacheContext Cache() {
+        AppServices s = AppServices.Current();
+        if (s == null) { return null; }
+        return s.Cache();
+    }
+
+    /// <summary>This request's connection: borrowed on first call, reused
+    /// afterwards, released automatically when the action returns. null means the
+    /// database is unavailable — handlers should answer 503 rather than pretend
+    /// the result set was empty.</summary>
+    protected async IDbConnection Conn() {
+        if (this.lease != null) { return this.lease; }
+        DbContext ctx = this.Db();
+        if (ctx == null) { return null; }
+        this.lease = await ctx.Acquire();
+        return this.lease;
+    }
+
+    /// <summary>The connection already borrowed by this request, without
+    /// awaiting. Only valid after Conn() or Begin() succeeded (handy inside a
+    /// transaction block, where the lease is guaranteed).</summary>
+    protected IDbConnection Held() {
+        return this.lease;
+    }
+
+    /// <summary>Opens a transaction on this request's connection. false means the
+    /// database is unavailable and nothing was started.</summary>
+    protected async bool Begin() {
+        IDbConnection db = await this.Conn();
+        if (db == null) { return false; }
+        if (this.inTx) { return true; }
+        db.BeginTransaction();
+        this.inTx = true;
+        return true;
+    }
+
+    /// <summary>Commits this request's transaction (no-op when none is open).</summary>
+    protected void Commit() {
+        if (!this.inTx) { return; }
+        this.inTx = false;
+        this.lease.Commit();
+    }
+
+    /// <summary>Rolls back this request's transaction (no-op when none is open,
+    /// so it is safe in an error path that may run after Commit()).</summary>
+    protected void Rollback() {
+        if (!this.inTx) { return; }
+        this.inTx = false;
+        this.lease.Rollback();
+    }
+
+    /// <summary>Releases the request's connection. An unfinished transaction is
+    /// rolled back first: returning a connection mid-transaction would hand the
+    /// next request a session holding someone else's locks.</summary>
+    virtual void OnAfter() {
+        if (this.lease != null) {
+            this.Rollback();
+            this.Db().Release(this.lease);
+            this.lease = null;
+        }
+        this.OnDone();
+    }
+
+    /// <summary>Per-request cleanup for subclasses. Override this instead of
+    /// OnAfter(), which owns releasing the connection.</summary>
+    virtual void OnDone() { }
+}

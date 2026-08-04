@@ -7,18 +7,21 @@ using ZanWeb;
 namespace ZanWeb.Blog;
 
 /// <summary>
-/// 极简博客 —— DB 和 Redis 的标准用法就在这三个动作里。
+/// 极简博客 —— 分层后每层只做一件事：
 ///
-/// DB：从注入的连接池借一条连接，用类型化 ORM 查询，finally 归还。
-///     IDbConnection db = await ctx.Acquire();
-///     try { db.Select&lt;Post&gt;()... } finally { ctx.Release(db); }
+///   控制器（本文件）  取参数、管缓存、渲染视图；不写一行查询
+///   src/dao/PostDao   所有 blog_post 的读写；不管连接生命周期
+///   src/model/Post    实体 = 表结构
 ///
-/// Redis：cache-aside。先读共享缓存（GetAsync），未命中再查库并回填
-///     （SetTtlAsync）；写入后删掉受影响的 key（DelAsync），下一次读自然刷新。
-///     缓存只是加速，拿不到就回落查库，不会因为 Redis 挂了而报错。
+/// 连接是请求级的：`await this.Conn()` 第一次借、之后复用、动作结束框架自动归还，
+/// 所以业务代码里没有 Acquire/Release；多表写入用 this.Begin()/Commit()/Rollback()
+/// （同一条连接才能在一个事务里，见 AppController）。
 ///
-/// 路由 -&gt; 代码路径：/blog 由 src/controller/Blog/Posts.zan 的 Index 处理，
-/// 视图是同目录下的 View/Posts.Index.html（视图 key = 模块.控制器.动作）。
+/// Redis 走 cache-aside：先读共享缓存，未命中查库并回填，写入后删 key。缓存只是
+/// 加速，Redis 挂了就回落查库。
+///
+/// 路由 -&gt; 代码路径：/blog 由 src/controller/Blog/Posts.zan 的 Index 处理，视图是
+/// 同目录 View/Posts.Index.html（视图 key = 模块.控制器.动作）。
 /// </summary>
 [Route("[controller]/[action]")]
 [Custom(Authorization = CustomAuthorization.None)]
@@ -36,7 +39,6 @@ class Posts : AppController {
     async void Index() {
         string kw = this.In("kw");
         CacheContext cache = this.Cache();
-        DbContext ctx = this.Db();
 
         // 带搜索词的结果不进缓存：key 会随用户输入无限膨胀。
         bool cacheable = kw.Length == 0;
@@ -52,21 +54,12 @@ class Posts : AppController {
         }
 
         if (rows == null) {
-            IDbConnection db = await ctx.Acquire();
+            IDbConnection db = await this.Conn();
             if (db == null) {
                 this.Fail(503, "2001", "数据库不可用，检查 config/app.json [database]");
                 return;
             }
-            try {
-                rows = db.Select<Post>()
-                    .Where(a => a.published == 1)
-                    .WhereIf(kw.Length > 0, a => a.title.Contains(kw))
-                    .OrderByDescending(a => a.id)
-                    .Take(20)
-                    .ToList();
-            } finally {
-                ctx.Release(db);
-            }
+            rows = new PostDao(db).Recent(20, kw);
             if (cacheable) {
                 await cache.SetTtlAsync(Posts.ListKey,
                     Json.Serialize<List<Post>>(rows), 60);
@@ -78,6 +71,7 @@ class Posts : AppController {
         d.Set("kw", kw);
         d.Set("source", source);
         d.Set("count", Convert.ToString(rows.Count));
+        DbContext ctx = this.Db();
         d.Set("pool", "idle=" + Convert.ToString(ctx.IdleCount())
             + " live=" + Convert.ToString(ctx.LiveCount())
             + " waiting=" + Convert.ToString(ctx.WaitingCount()));
@@ -105,7 +99,6 @@ class Posts : AppController {
             return;
         }
         CacheContext cache = this.Cache();
-        DbContext ctx = this.Db();
         string key = Posts.PostKey(id);
         string source = "cache";
 
@@ -115,16 +108,12 @@ class Posts : AppController {
 
         if (post == null) {
             source = "db";
-            IDbConnection db = await ctx.Acquire();
+            IDbConnection db = await this.Conn();
             if (db == null) {
                 this.Fail(503, "2001", "数据库不可用");
                 return;
             }
-            try {
-                post = db.Select<Post>().Where(a => a.id == id).ToOne();
-            } finally {
-                ctx.Release(db);
-            }
+            post = new PostDao(db).ById(id);
             if (post == null) {
                 this.Fail(404, "2004", "文章不存在");
                 return;
@@ -162,18 +151,12 @@ class Posts : AppController {
         p.published = 1;
         p.createdAt = WebApp.NowSeconds();
 
-        DbContext ctx = this.Db();
-        IDbConnection db = await ctx.Acquire();
+        IDbConnection db = await this.Conn();
         if (db == null) {
             this.Fail(503, "2001", "数据库不可用");
             return;
         }
-        int newId = 0;
-        try {
-            newId = db.Insert<Post>(p).ExecuteIdentity();
-        } finally {
-            ctx.Release(db);
-        }
+        int newId = new PostDao(db).Insert(p);
 
         // 写完就让缓存失效，而不是等 TTL 到期，否则列表最长 60 秒看不到新文章。
         await this.Cache().DelAsync(Posts.ListKey);
