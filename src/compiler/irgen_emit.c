@@ -183,6 +183,23 @@ static void emit_main_method(zan_irgen_t *g, zan_ast_node_t *method, zan_symbol_
                 }
             }
         }
+        /* ...then run each `static T()` type initializer, in declaration
+         * order, so a static field it assigns is already set before any user
+         * code (Main or a method reached from it) can observe it. C# triggers
+         * these lazily on first use of the type; running them all at entry is
+         * the same observable order for a single-file program and avoids a
+         * per-type guard on every static access. */
+        for (int di = 0; di < unit->comp_unit.decls.count; di++) {
+            zan_ast_node_t *d = unit->comp_unit.decls.items[di];
+            if (d->kind != AST_CLASS_DECL && d->kind != AST_STRUCT_DECL) continue;
+            char cctor_name[512];
+            snprintf(cctor_name, sizeof(cctor_name), "%.*s_cctor",
+                     (int)d->type_decl.name.len, d->type_decl.name.str);
+            LLVMValueRef cctor = LLVMGetNamedFunction(g->mod, cctor_name);
+            if (!cctor) continue;
+            zan_call2(g->builder, LLVMGlobalGetValueType(cctor), cctor,
+                      NULL, 0, "");
+        }
         g->current_type_sym = saved_type;
         g->current_this = saved_this;
     }
@@ -356,6 +373,17 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
             zan_ast_node_t *member = decl->type_decl.members.items[j];
             bool is_ctor = (member->kind == AST_CONSTRUCTOR_DECL);
             if (member->kind != AST_METHOD_DECL && !is_ctor) continue;
+            /* `static T()` is a type initializer, not a constructor: it takes
+             * no `this`, is never selected by `new T(...)`, and runs once at
+             * program entry (emit_main_method calls T_cctor). It used to be
+             * registered as a zero-argument constructor, so its body ran only
+             * when the type was first instantiated -- a program that merely
+             * read a static field saw the uninitialized value. */
+            bool is_type_init = is_ctor &&
+                (member->method_decl.modifiers & MOD_STATIC) != 0;
+            /* A generic type's initializer is emitted once, off the erased
+             * declaration, not per instantiation. */
+            if (is_type_init && cur_variant) continue;
             /* A generic method that reaches into its own type parameters is a
              * template: it exists only as monomorphized copies, emitted from
              * the call sites (emit_method_spec_body). Emitting an erased
@@ -502,7 +530,8 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
              * async Main's body at the root would lower every `await
              * Task.Delay` to a bare sleep that never runs the ready queue, so
              * coroutines spawned with Task.Spawn would starve. */
-            bool is_static = !is_ctor && (member->method_decl.modifiers & MOD_STATIC) != 0;
+            bool is_static = (!is_ctor || is_type_init) &&
+                (member->method_decl.modifiers & MOD_STATIC) != 0;
             if (is_static && member->method_decl.name.len == 4 &&
                 memcmp(member->method_decl.name.str, "Main", 4) == 0 &&
                 !(member->method_decl.modifiers & MOD_ASYNC)) continue;
@@ -511,7 +540,10 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
              * plus a per-instantiation suffix (e.g. HashSet_Add$string) for a
              * specialized variant so it does not collide with the erased one. */
             char fn_name[512];
-            if (is_ctor) {
+            if (is_type_init) {
+                snprintf(fn_name, sizeof(fn_name), "%.*s_cctor",
+                         (int)decl->type_decl.name.len, decl->type_decl.name.str);
+            } else if (is_ctor) {
                 snprintf(fn_name, sizeof(fn_name), "%.*s_ctor%s",
                          (int)decl->type_decl.name.len, decl->type_decl.name.str,
                          vsuffix);
@@ -689,7 +721,9 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
              * erased variant registers in the ordinary tables; a specialized
              * variant registers in the generic tables keyed by (sym, args) so a
              * concrete call site can route to it. */
-            if (is_ctor) {
+            if (is_type_init) {
+                /* callable only from program entry; not in any dispatch table */
+            } else if (is_ctor) {
                 if (cur_variant) {
                     add_generic_ctor(g, type_sym, member,
                                      cur_variant->type_args,
@@ -1177,7 +1211,9 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
         g->current_fn_is_ctor = member->kind == AST_CONSTRUCTOR_DECL;
         g->current_fn_no_runtime = zan_ast_has_attr(member, "NoRuntime");
 
-        if (member->kind == AST_CONSTRUCTOR_DECL) {
+        /* `is_static` on a constructor means `static T()`: no `this`, so no
+         * base/this chaining and no instance field initializers. */
+        if (member->kind == AST_CONSTRUCTOR_DECL && !is_static) {
             bool this_init = member->method_decl.has_this_init;
             bool initializer_target_called = false;
             zan_symbol_t *target_sym = NULL;

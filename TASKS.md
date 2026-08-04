@@ -872,7 +872,7 @@ leakcheck 子集全部通过；生成 IR 不含 `setjmp`/`longjmp`/`__zan_eh_tmp
 | A43-A6 | 捕获式 lambda：`(a) => a + k` 报 `use of undeclared identifier 'k'`；捕获字段时诊断还指向 `stdlib/System/Security/Cryptography/Md5.zan`（位置也错） | 22 | ⬜ 待修（A33-2） |
 | A43-A7 | 泛型类里的实例泛型方法 `Pool<T>.M<U>()` 运行崩溃（0xC0000005） | 13 | ⬜ 待修（A32-3a） |
 | A43-A8 | async 泛型方法返回垃圾值（打印 `-1886711216`） | 56 | ⬜ 待修（A32-3b） |
-| A43-A9 | `static A()` 只在首次 `new` 时执行：先读 `A.n` 得 0，`new A()` 后才是 7（C# 首次访问静态成员即触发） | 08,40 | ⬜ 待修 |
+| A43-A9 | `static A()` 只在首次 `new` 时执行：先读 `A.n` 得 0，`new A()` 后才是 7（C# 首次访问静态成员即触发） | 08,40,95–99 | ✅ 已修（见下 A43-A9 详情） |
 | A43-A10 | `readonly` 只解析不强制：`public readonly int x;` 在类外 `a.x = 6;` 编译通过并改值 | 71,72,90–94 | ✅ 已修（见下 A43-A10 详情） |
 
 ### A43-A2 详情（已完成 2026-08-04）
@@ -909,6 +909,26 @@ leakcheck 子集全部通过；生成 IR 不含 `setjmp`/`longjmp`/`__zan_eh_tmp
 * 回归：`ctest -R "readonly|diag_|default_param|struct|field|record|conformance_class|property"`
   83 项里只有既有的 `field_decl_initializers` 失败；`scripts/_ide_compile_check.ps1`
   以 `IDE_COMPILE_EXIT=0` 通过（stdlib/IDE 全量编译无误报）。
+
+### A43-A9 详情（已完成 2026-08-04）
+
+* 根因：`irgen_emit.c` 的 `is_static = !is_ctor && ...`，即**构造器一律当实例构造器**。
+  `static A() { }` 于是被注册成 A 的零参构造器，只有 `new A()` 才会跑它；
+  只读静态字段的程序看到的是未初始化值。
+* 修复：识别带 `static` 的构造器为类型初始化器 —— 发射为无 `this` 的 `T_cctor`、
+  不进 ctor 表（`new A()` 不会选中它）、不做 base/this 链与实例字段初始化器，
+  并在 `emit_main_method` 的静态字段初始化器之后按声明顺序逐个调用。
+* 与 C# 的差异（有意）：C# 是首次使用该类型时惰性触发；这里在程序入口一次性跑完，
+  单程序的可观察顺序相同，且省掉每个静态访问点的 guard 判断。泛型类型只按擦除声明
+  发射一次，不随实例化重复。
+* 实测：先读静态字段即为 7（08、40）、静态字段初始化器先于静态构造器（96：`m = n*2` → 6）、
+  只有静态构造器的类仍可 `new`（97）、静态构造器与实例构造器共存（98）、
+  `static readonly` 在静态构造器里赋值合法（99）。
+* 正式测试：`tests/conformance/static_constructor.zan`。
+* 回归：`ctest -R "static|cctor|readonly|default_param|ctor|field|record|struct|generic|async"`
+  206 项，失败仅 `field_decl_initializers`（既有）与 `golden_async_delay_ir`/
+  `golden_async_socket_ir` —— 后两者用 HEAD 版 `irgen_emit.c` 重建后同样失败，
+  来自工作区里未提交的 stdlib 改动，不是本次修改引入。
 
 ## A43-B 语法缺失（parser 层不接受，按价值排序）
 
