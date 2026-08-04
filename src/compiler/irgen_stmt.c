@@ -784,6 +784,13 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                 } else if (LLVMGetTypeKind(fn_ret) == LLVMDoubleTypeKind &&
                            LLVMGetTypeKind(val_t) == LLVMFloatTypeKind) {
                     val = LLVMBuildFPExt(g->builder, val, fn_ret, "retext");
+                } else if ((LLVMGetTypeKind(fn_ret) == LLVMDoubleTypeKind ||
+                            LLVMGetTypeKind(fn_ret) == LLVMFloatTypeKind) &&
+                           LLVMGetTypeKind(val_t) == LLVMIntegerTypeKind &&
+                           LLVMGetIntTypeWidth(val_t) > 1) {
+                    /* `return 2;` from a `double` method converts, as in C#;
+                     * returning the integer bit pattern failed verification. */
+                    val = LLVMBuildSIToFP(g->builder, val, fn_ret, "retsitofp");
                 } else if (LLVMGetTypeKind(fn_ret) == LLVMIntegerTypeKind &&
                            LLVMGetTypeKind(val_t) == LLVMIntegerTypeKind) {
                     unsigned fn_bits = LLVMGetIntTypeWidth(fn_ret);

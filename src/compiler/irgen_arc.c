@@ -174,6 +174,15 @@ static void emit_collection_slot_store(zan_irgen_t *g, zan_type_t *elem_type,
     LLVMValueRef stored = value;
     LLVMTypeKind slot_kind = LLVMGetTypeKind(slot_ty);
     LLVMTypeKind value_kind = LLVMGetTypeKind(LLVMTypeOf(stored));
+    /* An integer landing in a `double` element is converted before it is
+     * reinterpreted into the i64 slot: `List<double> l; l.Add(1);` used to store
+     * the integer bit pattern, and the reader (which bitcasts the slot back to
+     * double) saw a denormal. */
+    if (elem_kind == LLVMDoubleTypeKind && value_kind == LLVMIntegerTypeKind &&
+        LLVMGetIntTypeWidth(LLVMTypeOf(stored)) > 1) {
+        stored = LLVMBuildSIToFP(g->builder, stored, elem_llvm, "slot.sitofp");
+        value_kind = LLVMGetTypeKind(LLVMTypeOf(stored));
+    }
     if (value_kind == LLVMStructTypeKind) {
         store_struct_in_slot(g, stored, slot_ptr, rhs);
     } else {

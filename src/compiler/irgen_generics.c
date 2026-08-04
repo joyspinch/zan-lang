@@ -869,6 +869,25 @@ static void coerce_int_pair(zan_irgen_t *g, LLVMValueRef *a, LLVMValueRef *b) {
         *b = LLVMBuildFPExt(g->builder, *b, ta, "fpair.ext");
         return;
     }
+    /* `d * 2` computes in floating point, as in C#: the integer side is
+     * converted. Without this the two operands had different LLVM types and the
+     * binary operator failed verification ("Both operands to a binary operator
+     * are not of the same type"). i1 stays out of it -- a bool is not a number
+     * here. */
+    if ((LLVMGetTypeKind(ta) == LLVMDoubleTypeKind ||
+         LLVMGetTypeKind(ta) == LLVMFloatTypeKind) &&
+        LLVMGetTypeKind(tb) == LLVMIntegerTypeKind &&
+        LLVMGetIntTypeWidth(tb) > 1) {
+        *b = LLVMBuildSIToFP(g->builder, *b, ta, "fpair.sitofp");
+        return;
+    }
+    if ((LLVMGetTypeKind(tb) == LLVMDoubleTypeKind ||
+         LLVMGetTypeKind(tb) == LLVMFloatTypeKind) &&
+        LLVMGetTypeKind(ta) == LLVMIntegerTypeKind &&
+        LLVMGetIntTypeWidth(ta) > 1) {
+        *a = LLVMBuildSIToFP(g->builder, *a, tb, "fpair.sitofp");
+        return;
+    }
     if (LLVMGetTypeKind(ta) != LLVMIntegerTypeKind ||
         LLVMGetTypeKind(tb) != LLVMIntegerTypeKind) return;
     unsigned wa = LLVMGetIntTypeWidth(ta), wb = LLVMGetIntTypeWidth(tb);
@@ -892,6 +911,16 @@ static LLVMValueRef coerce_int_to(zan_irgen_t *g, LLVMValueRef v, LLVMTypeRef ta
     if (LLVMGetTypeKind(target) == LLVMDoubleTypeKind &&
         LLVMGetTypeKind(vt) == LLVMFloatTypeKind)
         return LLVMBuildFPExt(g->builder, v, target, "fit.fpext");
+    /* An integer meeting a floating-point slot is converted, not reinterpreted:
+     * `double d = 1;`, `a.v = 3;` and `sum = sum + 1` used to store the integer
+     * bit pattern into the slot, which read back as a denormal (1 printed as
+     * 4.94066e-324) and compared unequal to 1.0. i1 is excluded -- a bool never
+     * belongs in a float slot, and taking it here would hide that mistake. */
+    if ((LLVMGetTypeKind(target) == LLVMDoubleTypeKind ||
+         LLVMGetTypeKind(target) == LLVMFloatTypeKind) &&
+        LLVMGetTypeKind(vt) == LLVMIntegerTypeKind &&
+        LLVMGetIntTypeWidth(vt) > 1)
+        return LLVMBuildSIToFP(g->builder, v, target, "fit.sitofp");
     if (LLVMGetTypeKind(vt) != LLVMIntegerTypeKind ||
         LLVMGetTypeKind(target) != LLVMIntegerTypeKind) return v;
     unsigned wv = LLVMGetIntTypeWidth(vt), wt = LLVMGetIntTypeWidth(target);
@@ -920,11 +949,13 @@ static LLVMValueRef zan_store_fit(zan_irgen_t *g, LLVMValueRef val, LLVMValueRef
             if (LLVMIsAConstantInt(idx))
                 target = LLVMStructGetTypeAtIndex(
                     src, (unsigned)LLVMConstIntGetZExtValue(idx));
-        } else if (src && LLVMGetTypeKind(src) == LLVMFloatTypeKind) {
-            /* An array element GEP walks the element type, so a `float[]` slot
-             * is recoverable here. Only the f32 case is taken: a raw byte view
-             * (Span, string buffers) is an i8 GEP too, and narrowing the value
-             * to its element type there would truncate. */
+        } else if (src && (LLVMGetTypeKind(src) == LLVMFloatTypeKind ||
+                           LLVMGetTypeKind(src) == LLVMDoubleTypeKind)) {
+            /* An array element GEP walks the element type, so a `float[]` /
+             * `double[]` slot is recoverable here. Only the floating-point cases
+             * are taken: a raw byte view (Span, string buffers) is an i8 GEP
+             * too, and narrowing the value to its element type there would
+             * truncate. */
             target = src;
         }
     }

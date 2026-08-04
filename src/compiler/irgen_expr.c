@@ -821,12 +821,19 @@ static LLVMValueRef emit_expr_binary(zan_irgen_t *g, zan_ast_node_t *expr,
             return pcmp;
         }
 
+        /* reconcile mixed-width integer operands (e.g. i32 int vs i64 length)
+         * and convert an integer meeting a float/double one */
+        coerce_int_pair(g, &left, &right);
+
+        /* Decided after the operands are reconciled, and from both of them:
+         * `2 * d` is floating-point arithmetic even though its left operand
+         * arrived as an integer -- selecting `mul` there emitted an integer
+         * operator on doubles. */
         LLVMTypeRef left_type = LLVMTypeOf(left);
         bool is_float = (LLVMGetTypeKind(left_type) == LLVMDoubleTypeKind ||
-                         LLVMGetTypeKind(left_type) == LLVMFloatTypeKind);
-
-        /* reconcile mixed-width integer operands (e.g. i32 int vs i64 length) */
-        coerce_int_pair(g, &left, &right);
+                         LLVMGetTypeKind(left_type) == LLVMFloatTypeKind ||
+                         LLVMGetTypeKind(LLVMTypeOf(right)) == LLVMDoubleTypeKind ||
+                         LLVMGetTypeKind(LLVMTypeOf(right)) == LLVMFloatTypeKind);
 
         /* ulong operands select unsigned division/remainder/shift/compare */
         bool is_unsigned = !is_float &&
@@ -4906,7 +4913,15 @@ static LLVMValueRef emit_arg_typed(zan_irgen_t *g, zan_ast_node_t *arg,
             return emit_lambda_typed(g, arg, ptype, locals);
         check_delegate_async_match(g, arg, ptype, locals);
     }
-    return emit_expr(g, arg, locals);
+    LLVMValueRef v = emit_expr(g, arg, locals);
+    /* An integer meeting a float/double parameter is converted, not passed as
+     * its bit pattern: `D(2)` against `double D(double)` used to fail LLVM
+     * verification at the call site. */
+    if (v && ptype && (ptype->kind == TYPE_DOUBLE || ptype->kind == TYPE_FLOAT) &&
+        LLVMGetTypeKind(LLVMTypeOf(v)) == LLVMIntegerTypeKind &&
+        LLVMGetIntTypeWidth(LLVMTypeOf(v)) > 1)
+        v = coerce_int_to(g, v, map_type(g, ptype));
+    return v;
 }
 
 /* `ref x` / `out x` / `out T x` argument: pass the address of the local's

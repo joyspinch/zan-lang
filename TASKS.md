@@ -713,6 +713,30 @@ leakcheck 子集全部通过；生成 IR 不含 `setjmp`/`longjmp`/`__zan_eh_tmp
 4. 最终外部门：取得证书与公证凭据后，对 x64/arm64 GUI 发布包各完成一次签名、公证、staple，
    并在干净 macOS 环境启动。此前 A32-6 状态保持「自动化完成，发布验收 blocked」。
 
+## A32-7 · 整数→浮点隐式转换（S，已完成 2026-08-04）
+
+`double`/`float`/`decimal` 目标遇到整数源时不做转换，直接把整数位模式落进槽位或参数，
+是**静默错值**而不是报错：`double b = 1;` 打印 `4.94066e-324`、`b == 1.0` 为 false；
+`D(2)`（`double` 形参）、`return 2;`（`double` 返回）、`2 * d` 直接 LLVM 校验失败。
+
+* 根因与修复点（各处都是「整数值遇到浮点目标」缺一次 `sitofp`）：
+  * `irgen_generics.c::coerce_int_to()`——局部变量声明初始化、字段存储等所有 `zan_store_fit` 路径；
+  * `irgen_generics.c::coerce_int_pair()`——混合运算两侧统一到浮点；
+  * `irgen_expr.c` 二元运算：`is_float` 改为在 `coerce_int_pair()` **之后**按两侧判定，
+    否则 `2 * d` 会选整数 `mul`；
+  * `irgen_expr.c::emit_arg_typed()`——实参遇到 `double`/`float` 形参；
+  * `irgen_stmt.c` `AST_RETURN_STMT` 返回值转换；
+  * `irgen_arc.c::emit_collection_slot_store()`——`List<double>`/`Dictionary<K,double>` 元素槽
+    （槽物理上是 i64，转换后再 bitcast，与读侧一致）；
+  * `irgen_generics.c::zan_store_fit()`——数组元素 GEP 的 `double[]` 目标类型此前无法还原。
+* 实测（`_scratch/p/54..66`）：局部/字段/形参/返回值/`d*2`/`2*d`/`d+1`/`float`/`decimal`/
+  `double[]`/`List<double>`/`Dictionary<string,double>` 全部得到正确值。
+* 正式测试：`tests/conformance/int_to_double.zan`（新增，通过）。
+* 回归：`ctest -R "double|float|numeric|list|dict|arith|int_to"` 47/47 通过；
+  全量 conformance 剩 9 项失败（`builtin_shadowing`、`field_decl_initializers`、
+  `firebird_wire`、`orm_*`、`sqlserver_tds`），已用 HEAD 版本 `zanc` 复跑确认为既有失败，
+  与本次改动无关。
+
 ## 依赖与提交顺序
 
 | 顺序 | 里程碑 | 依赖 | 可并行项 |
