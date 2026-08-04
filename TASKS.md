@@ -867,7 +867,8 @@ leakcheck 子集全部通过；生成 IR 不含 `setjmp`/`longjmp`/`__zan_eh_tmp
 | A43-A1 | 整数赋给 `double`/`float` 按位重解释（`double b = 1;` 得 `4.94066e-324`），`double` 形参/返回/混合运算 LLVM 校验失败 | 54,57–66 | ✅ 已修（A32-7，0205cc1） |
 | A43-A2 | 默认参数值不填充：`F(1)` 调 `F(int a, int b = 2)` LLVM 校验失败；`new A(1)` 静默不调用构造器，字段留 0 | 19,81–88 | ✅ 已修（见下 A43-A2 详情） |
 | A43-A3 | 接口默认方法（`interface I { int G() { return 42; } }`）经接口变量调用一律返回 0；经类变量调用报 `'C' has no member 'G'` | 44,51,52,80,100–102 | ✅ 已修（见下 A43-A3 详情） |
-| A43-A4 | `int? v = a?.x;` 运行时崩溃（0xC0000005）；此前是 `PHI node operands are not the same type` | 21,43 | ⬜ 待修 |
+| A43-A4 | `int? v = a?.x;` 运行时崩溃（0xC0000005）；此前是 `PHI node operands are not the same type` | 21,43,110–145 | ✅ 已修（见下 A43-A4 详情） |
+| A43-A11 | `Nullable<T>`（值类型可空的真实表示：值 + has-value）尚未实现，`int?` 现在报错拒绝而不是误编译 | 130,144 | ⬜ 待做（新登记） |
 | A43-A5 | `event H E;` + `a.E += P.OnE; a.Fire();` 编译通过、静默不触发（输出只有 `end`） | 28 | ⬜ 待修（A33-2 一并） |
 | A43-A6 | 捕获式 lambda：`(a) => a + k` 报 `use of undeclared identifier 'k'`；捕获字段时诊断还指向 `stdlib/System/Security/Cryptography/Md5.zan`（位置也错） | 22 | ⬜ 待修（A33-2） |
 | A43-A7 | 泛型类里的实例泛型方法 `Pool<T>.M<U>()` 运行崩溃（0xC0000005） | 13 | ⬜ 待修（A32-3a） |
@@ -947,6 +948,38 @@ leakcheck 子集全部通过；生成 IR 不含 `setjmp`/`longjmp`/`__zan_eh_tmp
   上同样失败（工作区里未提交的 stdlib 改动删掉了 `X.Create(...)` 工厂，测试仍在调用，
   例：`'StreamWriter' has no member 'Create'`），另外 9 项 leakcheck 在本次改动的
   构建上反而全部通过（上一次是并发跑测时的偶发失败）。
+
+### A43-A4 详情（已完成 2026-08-04）
+
+崩溃的不是 `?.`，是 **`T?` 的表示**。`TYPE_NULLABLE` 在 `map_type` 里落到 `default:`
+→ 裸 `i8*`，于是：
+
+* 值类型：`int? v = 5;` 把 5 当地址存进指针槽，任何使用都崩（`Convert.ToString(v)`
+  当字符串解引用 5）或 LLVM 校验失败（`v + 1`）。顺带 `int? v = 0;` 与 `null`
+  无法区分。
+* 引用类型：`A? a = new A(); a.x` 读的是无类型指针上的字段 → 0，`I? i` 上的调用
+  分发不到任何函数（**静默错值**，比崩溃更危险）。
+
+修复分三处：
+
+1. `binder.c`：`T?` 在引用类型上**不再包装** —— 引用本身就允许 null，`A?` 就是 `A`，
+   类身份不再丢失。
+2. `binder.c`：`T?` 在值类型（含用户 `struct`、`enum`）上直接诊断
+   `nullable value type 'int?' is not supported yet`，不再误编译。真实的
+   `Nullable<T>` 表示登记为 A43-A11。
+3. `parser.c`：`looks_like_var_decl` 之前只认内建类型的 `int?`，`A? a = ...`
+   被当成三元表达式（`expected ':', got ';'`）。现在 `IDENT ?` 后跟标识符再跟
+   `=` 或 `;` 判为声明，`a ?? b`、`a?.b`、`a?[i]`、`c ? a : b` 仍是表达式。
+
+实测：`A? a = new A(); a.x` → 2、`A? b = null; b == null` → 成立（140）、
+`I? i = new C(); i.F()` → 8（145）、`string? s = null; s ?? "d"`（131、141）、
+三元与 `?.` 未受影响（142、143）、`int?`/`S?` 报诊断（130、144）。
+
+正式测试：`tests/conformance/nullable_reference_types.zan`、
+`tests/diag/nullable_value_type.zan`（CMakeLists 注册）。
+
+回归：全量 `ctest`（998 项）新增失败在**基线**上逐一复跑同样失败（`X.Create(...)`
+工厂被工作区未提交的改动删掉），其余是并发跑测时的超时，串行复跑通过。
 
 ## A43-B 语法缺失（parser 层不接受，按价值排序）
 

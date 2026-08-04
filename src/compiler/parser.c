@@ -1281,6 +1281,36 @@ static bool looks_like_var_decl(zan_parser_t *p) {
             #undef ZAN_IDCONT
             return false;
         }
+        /* `Ident? name` declares a nullable-typed variable, while `c ? a : b`
+         * is a conditional expression. Only a name followed by `=` or `;`
+         * after the `?` makes this a declaration -- a conditional's second
+         * operand is followed by `:`. */
+        if (peek.kind == TK_QUESTION) {
+            const char *s = p->lex->source;
+            size_t q = p->lex->pos, n = p->lex->source_len;
+            #define ZAN_NQ_WS(ch) ((ch)==' '||(ch)=='\t'||(ch)=='\r'||(ch)=='\n')
+            #define ZAN_NQ_IDSTART(ch) (((ch)>='a'&&(ch)<='z')||((ch)>='A'&&(ch)<='Z')||(ch)=='_')
+            #define ZAN_NQ_IDCONT(ch) (ZAN_NQ_IDSTART(ch)||((ch)>='0'&&(ch)<='9'))
+            bool is_decl = false;
+            while (q < n && ZAN_NQ_WS(s[q])) q++;
+            if (q < n && s[q] == '?') {
+                q++;
+                /* `a ?? b`, `a?.b`, `a?[i]` are all expressions */
+                if (q < n && s[q] != '?' && s[q] != '.' && s[q] != '[') {
+                    while (q < n && ZAN_NQ_WS(s[q])) q++;
+                    if (q < n && ZAN_NQ_IDSTART(s[q])) {
+                        while (q < n && ZAN_NQ_IDCONT(s[q])) q++;
+                        while (q < n && ZAN_NQ_WS(s[q])) q++;
+                        is_decl = q < n && (s[q] == ';' ||
+                            (s[q] == '=' && (q + 1 >= n || s[q + 1] != '=')));
+                    }
+                }
+            }
+            #undef ZAN_NQ_WS
+            #undef ZAN_NQ_IDSTART
+            #undef ZAN_NQ_IDCONT
+            return is_decl;
+        }
         /* `Ident[] name` (array-typed decl) vs `arr[i]` (index expression):
          * only a declaration when the brackets are empty. Scan the raw source
          * after the current identifier for a `[` immediately followed by `]`. */

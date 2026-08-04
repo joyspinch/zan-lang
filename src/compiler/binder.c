@@ -200,6 +200,23 @@ zan_type_t *zan_binder_subst_named(zan_binder_t *b, zan_type_t *t,
     return nt;
 }
 
+/* Value types have no null representation of their own: a `T?` over one needs a
+ * Nullable<T> lowering that irgen does not have yet. Type parameters are left
+ * out -- the substituted type is not known here. */
+static bool type_is_value_kind(zan_type_t *t) {
+    if (!t) return false;
+    switch (t->kind) {
+    case TYPE_BOOL: case TYPE_BYTE: case TYPE_SBYTE:
+    case TYPE_SHORT: case TYPE_USHORT: case TYPE_INT: case TYPE_UINT:
+    case TYPE_LONG: case TYPE_ULONG: case TYPE_NINT:
+    case TYPE_FLOAT: case TYPE_DOUBLE:
+    case TYPE_CHAR: case TYPE_ENUM: case TYPE_STRUCT:
+        return true;
+    default:
+        return false;
+    }
+}
+
 zan_type_t *zan_binder_resolve_type(zan_binder_t *b, zan_ast_node_t *type_ref) {
     if (!type_ref || type_ref->kind != AST_TYPE_REF) {
         return b->type_error;
@@ -334,9 +351,27 @@ zan_type_t *zan_binder_resolve_type(zan_binder_t *b, zan_ast_node_t *type_ref) {
     }
     /* wrap in nullable if needed */
     if (type_ref->type_ref.is_nullable) {
-        zan_type_t *nullable = make_type(b->arena, TYPE_NULLABLE, name.str, name.len);
-        nullable->element_type = resolved;
-        resolved = nullable;
+        /* `T?` over a reference type is just T: the reference already carries
+         * null. Over a value type it would need a `Nullable<T>` representation
+         * (value + has-value flag), which does not exist yet -- the slot was a
+         * plain pointer, so `int? v = 5` stored 5 as an address and any use of
+         * it crashed or failed LLVM verification. Reject it instead of
+         * miscompiling; see TASKS.md A43-A11. */
+        if (!type_ref->type_ref.is_array && resolved && resolved != b->type_error &&
+            type_is_value_kind(resolved)) {
+            zan_diag_emit(b->diag, DIAG_ERROR, type_ref->loc,
+                          "nullable value type '%.*s?' is not supported yet; "
+                          "use a sentinel value or a reference type",
+                          name.len, name.str);
+            zan_type_t *nullable = make_type(b->arena, TYPE_NULLABLE, name.str, name.len);
+            nullable->element_type = resolved;
+            resolved = nullable;
+        }
+        /* Reference types are left unwrapped: `A?` is A, which already admits
+         * null. Wrapping lost the class identity -- TYPE_NULLABLE maps to a
+         * bare i8*, so `A? a = new A(); a.x` read a field off an untyped
+         * pointer and produced 0, and a call through `I? i` dispatched
+         * nowhere. */
     }
     if (b->binding_done && resolved && resolved != b->type_error) {
         type_ref->rt_type = resolved;

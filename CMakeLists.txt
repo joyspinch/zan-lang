@@ -954,6 +954,17 @@ foreach(_ro_case method outside)
   set_tests_properties(diag_readonly_assign_${_ro_case} PROPERTIES TIMEOUT 60)
 endforeach()
 
+# `int?` has no Nullable<T> lowering yet: it used to compile to a bare pointer
+# holding the value, so any use of it crashed or failed LLVM verification.
+add_test(NAME diag_nullable_value_type
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/nullable_value_type.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_nullable_value_type${_exe_ext}
+    "-DEXPECT_REGEX=nullable value type"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_nullable_value_type PROPERTIES TIMEOUT 60)
+
 # Typed-ORM queries must reject literal/column type mismatches at compile
 # time. dbgen used to lower `p.num == "abc"` / `p.name == 123` to a bound
 # parameter of the wrong shape, silently running a type-coerced comparison.
