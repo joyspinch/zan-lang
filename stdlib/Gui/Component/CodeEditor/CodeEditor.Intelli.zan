@@ -97,6 +97,107 @@ partial class CodeEditor {
         return "";
     }
 
+    /// Signature of `name` for the parameter-info tip, memoised against the
+    /// buffer fingerprint: parsing walks this buffer and every project source,
+    /// which must not happen once per frame while the caret sits in a call.
+    string SigHelpFor(string name) {
+        int stamp = TextStamp();
+        if (sigMemoName == name && sigMemoStamp == stamp) { return sigMemoText; }
+        string sig = RealSigFor(name);
+        if (sig.Length == 0) { sig = CodeEditor.DescSig(name); }
+        sigMemoName = name;
+        sigMemoStamp = stamp;
+        sigMemoText = sig;
+        return sig;
+    }
+
+    /// The call the caret is inside on its own line: the callee's name, or ""
+    /// when the caret is not between a `(` and its `)`. `outArg` receives the
+    /// zero-based index of the argument being typed.
+    ///
+    /// One line only, scanned right to left from the caret -- enough for the
+    /// overwhelming majority of calls and bounded work per frame. Strings and
+    /// char literals are skipped, so a `"("` in an argument does not open a call.
+    string CallAtCaret(List<int> outArg) {
+        if (curLine < 0 || curLine >= lines.Count) { return ""; }
+        string ln = lines[curLine];
+        int end = curCol;
+        if (end > ln.Length) { end = ln.Length; }
+        // Which spans of the line are inside a literal: scanned once forwards,
+        // because quoting is only decidable left to right.
+        List<int> lit = new List<int>();
+        bool inStr = false;
+        string q = "";
+        int i = 0;
+        while (i < end) {
+            string ch = ln.Substring(i, 1);
+            if (inStr) {
+                lit.Add(1);
+                if (ch == "\\") {
+                    i = i + 1;
+                    if (i < end) { lit.Add(1); }
+                } else if (ch == q) { inStr = false; }
+            } else if (ch == "\"" || ch == "'") {
+                inStr = true; q = ch; lit.Add(1);
+            } else {
+                lit.Add(0);
+            }
+            i = i + 1;
+        }
+        while (lit.Count < end) { lit.Add(0); }
+        int depth = 0;
+        int args = 0;
+        int at = end - 1;
+        while (at >= 0) {
+            if (at < lit.Count && lit[at] == 1) { at = at - 1; continue; }
+            string ch = ln.Substring(at, 1);
+            if (ch == ")") { depth = depth + 1; }
+            else if (ch == "(") {
+                if (depth == 0) { break; }
+                depth = depth - 1;
+            } else if (ch == "," && depth == 0) { args = args + 1; }
+            at = at - 1;
+        }
+        if (at < 0) { return ""; }
+        string idset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
+        int e2 = at;
+        while (e2 > 0 && CodeEditor.InSet(idset, ln.Substring(e2 - 1, 1))) {
+            e2 = e2 - 1;
+        }
+        string name = ln.Substring(e2, at - e2);
+        if (name.Length == 0 || CodeEditor.IsControlWord(name)) { return ""; }
+        outArg.Add(args);
+        return name;
+    }
+
+    /// Start and length of parameter `idx` inside `sig`'s parameter list, as
+    /// (start, len) appended to `out2`; nothing when there is no such parameter.
+    /// Nested generics and lambdas keep their commas: only depth-0 ones split.
+    static void ParamSpan(string sig, int idx, List<int> out2) {
+        int open = CodeEditor.Find(sig, "(");
+        if (open < 0) { return; }
+        int depth = 0;
+        int start = open + 1;
+        int n = 0;
+        int i = open;
+        while (i < sig.Length) {
+            string ch = sig.Substring(i, 1);
+            if (ch == "(" || ch == "<" || ch == "[") { depth = depth + 1; }
+            else if (ch == ")" || ch == ">" || ch == "]") {
+                depth = depth - 1;
+                if (depth == 0) {
+                    if (n == idx && i > start) { out2.Add(start); out2.Add(i - start); }
+                    return;
+                }
+            } else if (ch == "," && depth == 1) {
+                if (n == idx) { out2.Add(start); out2.Add(i - start); return; }
+                n = n + 1;
+                start = i + 1;
+            }
+            i = i + 1;
+        }
+    }
+
     /// One-line signature for a member: the compiler's symbol index when it
     /// has one (so the strip shows the real declaration, overloads and all),
     /// otherwise the curated list below.

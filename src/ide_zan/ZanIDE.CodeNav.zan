@@ -776,38 +776,6 @@ partial class ZanIDE {
         return ZanIDE.GoToDefinition(editor, tabs, active, root, log);
     }
 
-    /// Find All References preferring zan-lsp semantic results, with the
-    /// whole-word text scan as fallback.
-    static void FindReferencesSmart(LspSession lsp, CodeEditor editor, List<TabRecord> tabs,
-                                    SignalInt active, string root, List<string> log) {
-        int a = active.Get();
-        // The server indexes the project root only; querying it about a file
-        // outside that root (a stdlib source, say) costs a round trip that can
-        // never answer, so go straight to the text scan there.
-        bool inRoot = a >= 0 && a < tabs.Count
-            && ZanIDE.NormPath(tabs[a].path).StartsWith(ZanIDE.NormPath(root));
-        if (lsp != null && lsp.Alive() && inRoot && tabs[a].path.Length > 0) {
-            tabs[a].body = editor.GetText();
-            lsp.SyncDoc(tabs[a].path, tabs[a].body);
-            List<string> rows = lsp.References(tabs[a].path, editor.CurLine(), editor.CurCol());
-            if (rows.Count > 0) {
-                string word = editor.WordAtCaret();
-                log.Add("> References to '" + word + "' (semantic):");
-                for (int i = 0; i < rows.Count; i = i + 1) {
-                    int sep = ZanIDE.IndexOfStr(rows[i], "\t");
-                    if (sep > 0) {
-                        string rp = rows[i].Substring(0, sep);
-                        int ln = ZanIDE.ParseInt(rows[i].Substring(sep + 1, rows[i].Length - sep - 1));
-                        log.Add("   " + Path.GetFileName(rp) + ":" + Convert.ToString(ln + 1));
-                    }
-                }
-                log.Add("> " + Convert.ToString(rows.Count) + " reference(s) found.");
-                return;
-            }
-        }
-        ZanIDE.FindReferences(editor, tabs, active, root, log);
-    }
-
     /// Counts whole-word occurrences of `word` in `line`.
     static int CountWord(string line, string word) {
         int wl = word.Length;
@@ -827,75 +795,96 @@ partial class ZanIDE {
         return count;
     }
 
-    /// Occurrences of `word` in one file, logged with their line. With `owner`
-    /// given, only the ones that belong to that type count.
-    static int CountRefsInFile(string name, string body, string word,
-                              string owner, List<string> log) {
-        List<string> ls = CodeEditor.SplitLines(body);
-        if (owner.Length > 0) {
-            List<int> hits = new List<int>();
-            int n = CodeEditor.CountMemberRefsIn(ls, word, owner, hits);
-            for (int h = 0; h < hits.Count; h = h + 1) {
-                log.Add("   " + name + ":" + Convert.ToString(hits[h] + 1) + ": "
-                    + CodeEditor.LTrim(ls[hits[h]]));
-            }
-            return n;
-        }
-        int count = 0;
-        for (int i = 0; i < ls.Count; i = i + 1) {
-            int occ = ZanIDE.CountWord(ls[i], word);
-            if (occ > 0) {
-                count = count + occ;
-                log.Add("   " + name + ":" + Convert.ToString(i + 1) + ": " + CodeEditor.LTrim(ls[i]));
-            }
-        }
-        return count;
-    }
-
-    /// Lists every whole-word reference to the symbol under the caret across
-    /// open tabs and the project's src tree, into the output log.
-    static void FindReferences(CodeEditor editor, List<TabRecord> tabs,
-                               SignalInt active, string root, List<string> log) {
+    /// Every use of the symbol under the caret as clickable hits, for the
+    /// reference list: zan-lsp's semantic answer when the server is up, else a
+    /// whole-word text scan of the open tabs and the project's files. Paths are
+    /// absolute, so a hit opens the file it lives in.
+    static List<SearchHit> CollectReferences(LspSession lsp, CodeEditor editor,
+                                            List<TabRecord> tabs,
+                                            SignalInt active, string root) {
+        List<SearchHit> hits = new List<SearchHit>();
         string word = editor.WordAtCaret();
-        if (word == "") { log.Add("> Find All References: no symbol under caret."); return; }
+        if (word.Length == 0) { return hits; }
         int a = active.Get();
         if (a >= 0 && a < tabs.Count) { tabs[a].body = editor.GetText(); }
-        // For a member access, references mean the uses of THAT type's member:
-        // reached through the type, through `this`, or through a variable of it.
-        // By name alone the list was every same-named member in the project.
+        // The server indexes the project root only: querying it about a file
+        // outside that root (a stdlib source, say) costs a round trip that can
+        // never answer, so go straight to the text scan there.
+        bool inRoot = a >= 0 && a < tabs.Count
+            && ZanIDE.NormPath(tabs[a].path).StartsWith(ZanIDE.NormPath(root));
+        if (lsp != null && lsp.Alive() && inRoot && tabs[a].path.Length > 0) {
+            lsp.SyncDoc(tabs[a].path, tabs[a].body);
+            List<string> rows = lsp.References(
+                tabs[a].path, editor.CurLine(), editor.CurCol());
+            // One file is read once even when it holds twenty of the hits.
+            string cachePath = "";
+            List<string> cacheLines = new List<string>();
+            for (int i = 0; i < rows.Count; i = i + 1) {
+                int sep = ZanIDE.IndexOfStr(rows[i], "\t");
+                if (sep <= 0) { continue; }
+                string rp = rows[i].Substring(0, sep);
+                int ln = ZanIDE.ParseInt(
+                    rows[i].Substring(sep + 1, rows[i].Length - sep - 1));
+                if (rp != cachePath) {
+                    cachePath = rp;
+                    cacheLines = ZanIDE.SourceLines(tabs, rp);
+                }
+                string prev = "";
+                if (ln >= 0 && ln < cacheLines.Count) {
+                    prev = CodeEditor.LTrim(cacheLines[ln]);
+                }
+                hits.Add(SearchHit.Create(rp, ln, prev));
+            }
+            if (hits.Count > 0) { return hits; }
+        }
+        // For a member access the references are the uses of THAT type's member,
+        // not of every same-named member in the project.
         string owner = editor.OwnerTypeAtCaret();
         if (owner.Length == 0) { owner = editor.EnclosingTypeOfCaretDecl(); }
         if (owner.Length > 0 && CodeEditor.SymbolTypeLacksMember(owner, word)) {
-            log.Add("> Find All References: '" + word + "' is not a member of '"
-                + owner + "'.");
-            return;
+            return hits;
         }
-        if (owner.Length > 0) { log.Add("> References to '" + owner + "." + word + "':"); }
-        else { log.Add("> References to '" + word + "':"); }
-        int total = 0;
         for (int i = 0; i < tabs.Count; i = i + 1) {
-            total = total + ZanIDE.CountRefsInFile(tabs[i].name, tabs[i].body,
-                word, owner, log);
+            if (!tabs[i].path.EndsWith(".zan")) { continue; }
+            ZanIDE.CollectRefsInFile(tabs[i].path, tabs[i].body, word, owner, hits);
         }
-        // The whole project, not just its src tree: a use in a tool, a test or a
-        // script beside it is a use.
         List<string> files = ZanIDE.ListZanFiles(root);
         for (int fi = 0; fi < files.Count; fi = fi + 1) {
             string fp = files[fi];
-            if (ZanIDE.FindTabByPath(tabs, fp) < 0) {
-                string body = File.ReadAllText(fp);
-                total = total + ZanIDE.CountRefsInFile(Path.GetFileName(fp), body,
-                    word, owner, log);
+            if (ZanIDE.FindTabByPath(tabs, fp) >= 0) { continue; }
+            if (!File.Exists(fp)) { continue; }
+            ZanIDE.CollectRefsInFile(fp, File.ReadAllText(fp), word, owner, hits);
+        }
+        return hits;
+    }
+
+    /// The uses of `word` in one file as hits, with the source line as their
+    /// preview. `owner` restricts them to that type's member. The list is capped
+    /// so a name like `Create` cannot build a 50k-row panel.
+    static void CollectRefsInFile(string path, string body, string word,
+                                  string owner, List<SearchHit> hits) {
+        List<string> ls = CodeEditor.SplitLines(body);
+        List<int> lns = new List<int>();
+        if (owner.Length > 0) {
+            CodeEditor.CountMemberRefsIn(ls, word, owner, lns);
+        } else {
+            for (int i = 0; i < ls.Count; i = i + 1) {
+                if (ZanIDE.CountWord(ls[i], word) > 0) { lns.Add(i); }
             }
         }
-        // Where it is declared, so the answer is never a bare zero for a member
-        // that plainly exists: an owner whose uses all live outside the project
-        // (a stdlib type used by one call site, say) still shows its own home.
-        if (owner.Length > 0) {
-            string dp = ZanIDE.FindMemberDeclFile(tabs, root, owner, word);
-            if (dp != "") { log.Add("   " + dp + "  (declaration)"); }
+        for (int h = 0; h < lns.Count; h = h + 1) {
+            if (hits.Count >= 2000) { return; }
+            hits.Add(SearchHit.Create(path, lns[h], CodeEditor.LTrim(ls[lns[h]])));
         }
-        log.Add("> " + Convert.ToString(total) + " reference(s) found.");
+    }
+
+    /// The lines of `path`, from the open tab when it is open (so an unsaved
+    /// edit previews correctly) and from disk otherwise. Empty when it is gone.
+    static List<string> SourceLines(List<TabRecord> tabs, string path) {
+        int t = ZanIDE.FindTabByPath(tabs, path);
+        if (t >= 0) { return CodeEditor.SplitLines(tabs[t].body); }
+        if (!File.Exists(path)) { return new List<string>(); }
+        return CodeEditor.SplitLines(File.ReadAllText(path));
     }
 
     /// Replaces whole-word occurrences of `word` with `newName`, skipping

@@ -322,6 +322,11 @@ partial class CodeEditor {
         // Claim Tab while focused so the App does not step keyboard focus away;
         // the editor uses Tab/Shift+Tab for indentation instead.
         if (focused) { app.tabHoldId = id; }
+        // This component reads mouseX/mouseY directly instead of going through
+        // the hit tester, so it has to honour a capturing overlay itself: with
+        // the find bar (or a menu / floating window) over the text, a click in
+        // it must not also move the caret, and nothing may hover-pop under it.
+        bool ptrFree = !app.PointerCaptured();
 
         int fontSize = FontSize(t);
         int lineH = Canvas.FontHeight(fontSize) + app.Scale(4);
@@ -390,9 +395,12 @@ partial class CodeEditor {
         // ---- autocomplete popup (drawn below the cursor, with icons) ----
         RenderAcPopup(app, area, lineH, textX, fontSize, focused, visLines);
 
+        // ---- parameter info for the call the caret is inside ----
+        RenderSigHelp(app, area, lineH, textX, fontSize, focused, visLines);
+
         // ---- right-click context menu ----
         // Open on right mouse button (button 1) pressed inside the text area.
-        if (app.EventKind() == 2 && app.window.EventButton() == 1) {
+        if (app.EventKind() == 2 && app.window.EventButton() == 1 && ptrFree) {
             bool overArea = app.mouseX >= area.x + gutterW && app.mouseX < area.x + area.width
                             && app.mouseY >= area.y && app.mouseY < area.y + area.height;
             if (overArea) {
@@ -433,7 +441,8 @@ partial class CodeEditor {
             cli = cli + 1;
         }
         // Reference-list popup: click an entry to jump, click outside to dismiss.
-        if (refPopOpen && app.EventKind() == 2 && app.window.EventButton() == 0) {
+        if (refPopOpen && app.EventKind() == 2 && app.window.EventButton() == 0
+            && ptrFree) {
             bool insidePop = app.mouseX >= refPopGX && app.mouseX < refPopGX + refPopGW
                 && app.mouseY >= refPopGY && app.mouseY < refPopGY + refPopGH;
             if (insidePop) {
@@ -452,7 +461,7 @@ partial class CodeEditor {
         // Click on the diagnostics/scroll strip (right edge): jump to that line.
         int diagStripW = app.Scale(14);
         int diagStripX = area.x + area.width - diagStripW;
-        if (app.EventKind() == 2 && app.window.EventButton() == 0
+        if (app.EventKind() == 2 && app.window.EventButton() == 0 && ptrFree
             && !ctxOpen && !overPopup && !overFilter && !overCodeLens
             && app.mouseX >= diagStripX && app.mouseX < area.x + area.width
             && app.mouseY >= area.y && app.mouseY < area.y + area.height) {
@@ -482,7 +491,7 @@ partial class CodeEditor {
             app.RequestRedraw();
             return id;
         }
-        if (app.EventKind() == 2 && app.window.EventButton() == 0
+        if (app.EventKind() == 2 && app.window.EventButton() == 0 && ptrFree
             && !ctxOpen && !overPopup && !overFilter && !overCodeLens) {
             bool overText = app.mouseX >= area.x + gutterW && app.mouseX < diagStripX
                             && app.mouseY >= area.y && app.mouseY < area.y + area.height;
@@ -540,14 +549,15 @@ partial class CodeEditor {
         }
 
         // ---- hover: redraw so the symbol tooltip tracks the pointer ----
-        if (app.EventKind() == 1 && !mouseSelecting && !acActive) {
+        if (app.EventKind() == 1 && !mouseSelecting && !acActive && ptrFree) {
             if (app.mouseX >= area.x && app.mouseX < area.x + area.width
                 && app.mouseY >= area.y && app.mouseY < area.y + area.height) {
                 app.RequestRedraw();
             }
         }
 
-        if (app.EventKind() == 3 && app.window.EventButton() == 0 && !ctxOpen) {
+        if (app.EventKind() == 3 && app.window.EventButton() == 0 && !ctxOpen
+            && ptrFree) {
             mouseSelecting = false;
             barDragging = false;
             // CodeLens click: open an expandable list of all references.
@@ -563,11 +573,13 @@ partial class CodeEditor {
                     refPopSel = 0;
                     refPopX = cl.x;
                     refPopY = cl.y + lineH;
-                    refPopOpen = refPopLines.Count > 0;
+                    // This popup can only list lines of this buffer, so it
+                    // answers only when every use the lens counted is in it.
+                    refPopOpen = refPopLines.Count > 0
+                        && refPopLines.Count >= cl.count;
                     if (!refPopOpen) {
-                        // Nothing to list in this file: the uses are in others,
-                        // so put the caret on the declaration and let the host
-                        // list them project-wide.
+                        // Uses live in other files too: put the caret on the
+                        // declaration and let the host list them project-wide.
                         int nameCol = CodeEditor.FindWordFrom(lines[cl.line], cl.name, 0);
                         if (nameCol < 0) { nameCol = 0; }
                         GoToLineCol(cl.line, nameCol);
@@ -629,7 +641,7 @@ partial class CodeEditor {
         }
 
         // ---- Debug hover tooltip ----
-        if (execLine >= 0 && dbgVars.Count > 0) {
+        if (execLine >= 0 && dbgVars.Count > 0 && ptrFree) {
             // Detect word under mouse cursor
             if (app.mouseX >= textX && app.mouseX < area.x + area.width
                 && app.mouseY >= area.y && app.mouseY < area.y + area.height) {
@@ -688,7 +700,8 @@ partial class CodeEditor {
         }
 
         // ---- Ctrl+hover: underline the identifier as a clickable link ----
-        if (!acActive && !ctxOpen && Modifiers.HasCtrl(app.window.EventMods())) {
+        if (!acActive && !ctxOpen && ptrFree
+            && Modifiers.HasCtrl(app.window.EventMods())) {
             int utextX = area.x + gutterW + t.paddingSmall;
             if (app.mouseX >= utextX && app.mouseX < area.x + area.width
                 && app.mouseY >= area.y && app.mouseY < area.y + area.height) {
@@ -716,7 +729,7 @@ partial class CodeEditor {
         }
 
         // ---- symbol hover tooltip (method/property signature + docs) ----
-        if (!acActive && !ctxOpen && execLine < 0) {
+        if (!acActive && !ctxOpen && execLine < 0 && ptrFree) {
             string hw = WordAtMouse(app, area, gutterW, fontSize);
             if (hw.Length > 0) {
                 string hsig = RealSigFor(hw);
@@ -918,7 +931,7 @@ partial class CodeEditor {
                     int clw = Canvas.MeasureText(clLabel, t.fontSizeSmall);
                     if (clx + clw < area.x + area.width) {
                         c.DrawText(clx, textY, clLabel, pal.changeLabel, t.fontSizeSmall);
-                        codeLens.Add(new CodeLensRef(ln, decl, clx, rowY, clw));
+                        codeLens.Add(new CodeLensRef(ln, decl, clx, rowY, clw, refs));
                     }
                 }
 
@@ -1041,6 +1054,14 @@ partial class CodeEditor {
             c.FillRoundRect(px + 2, popY2 + 2, popW2, popH2, app.Scale(4), pal.shadowSoft);
             // Draw popup background
             c.SurfaceRoundRect(px, popY2, popW2, popH2, app.Scale(4), pal.popupBg, pal.border, 1);
+            // What the caret has typed of the word being completed: it is drawn
+            // in the accent colour inside each item, the way VS emboldens the
+            // matched characters, so the list shows why an item is in it.
+            string typed = "";
+            if (acStart >= 0 && curCol > acStart
+                && curCol <= lines[curLine].Length) {
+                typed = lines[curLine].Substring(acStart, curCol - acStart);
+            }
             int r2 = 0;
             while (r2 < shown) {
                 int idx = first2 + r2;
@@ -1067,7 +1088,21 @@ partial class CodeEditor {
                     else { iconColor = pal.iconDefault; iconLetter = "W"; }
                     c.FillRoundRect(px + app.Scale(3), ity, app.Scale(16), app.Scale(16), app.Scale(3), iconColor);
                     c.DrawText(px + app.Scale(6), ity + app.Scale(1), iconLetter, pal.iconGlyph, t.fontSizeSmall);
-                    c.DrawText(px + iconW, ity, acItems[idx], tcol, fontSize);
+                    string item2 = acItems[idx];
+                    int mlen = 0;
+                    if (typed.Length > 0 && typed.Length <= item2.Length
+                        && CodeEditor.StartsWithI(item2, typed)) {
+                        mlen = typed.Length;
+                    }
+                    if (mlen > 0 && idx != acSel) {
+                        string mpart = item2.Substring(0, mlen);
+                        c.DrawText(px + iconW, ity, mpart, pal.accent, fontSize);
+                        c.DrawText(px + iconW + Canvas.MeasureText(mpart, fontSize),
+                            ity, item2.Substring(mlen, item2.Length - mlen),
+                            tcol, fontSize);
+                    } else {
+                        c.DrawText(px + iconW, ity, item2, tcol, fontSize);
+                    }
                 }
                 r2 = r2 + 1;
             }
@@ -1173,6 +1208,83 @@ partial class CodeEditor {
                     wl = wl + 1;
                 }
             }
+        }
+    }
+
+    /// Parameter info (VS's "signature help"): while the caret sits inside a
+    /// call's argument list, the callee's signature is drawn above the line with
+    /// the parameter being typed picked out, and its one-line documentation
+    /// under it.
+    ///
+    /// It yields to the completion popup -- both want the space under the caret
+    /// and the list is what the keyboard is driving then -- and costs one
+    /// right-to-left scan of the caret's line plus a memoised signature lookup.
+    void RenderSigHelp(App app, Rect area, int lineH, int textX, int fontSize,
+                       bool focused, int visLines) {
+        if (acActive || !focused || ctxOpen || refPopOpen) { return; }
+        if (curLine < scrollLine || curLine >= scrollLine + visLines) { return; }
+        // A declaration is not a call: typing its own parameter list must not
+        // pop its own signature up over it.
+        if (CodeEditor.SigFromLine(CodeEditor.TrimStr(lines[curLine])).Length > 0) {
+            return;
+        }
+        List<int> argOut = new List<int>();
+        string callee = CallAtCaret(argOut);
+        if (callee.Length == 0 || argOut.Count == 0) { return; }
+        string sig = SigHelpFor(callee);
+        if (sig.Length == 0) { return; }
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        EditorPalette pal = EditorPalette.For(t);
+        string doc = CodeEditor.DescDoc(callee);
+        int pad = app.Scale(8);
+        int fh = Canvas.FontHeight(fontSize);
+        int sfh = Canvas.FontHeight(t.fontSizeSmall);
+        int sigW = Canvas.MeasureText(sig, fontSize);
+        int boxW = sigW + pad * 2;
+        int docW = 0;
+        if (doc.Length > 0) {
+            docW = Canvas.MeasureText(doc, t.fontSizeSmall) + pad * 2;
+            if (docW > boxW) { boxW = docW; }
+        }
+        int maxW = area.width - app.Scale(8);
+        if (boxW > maxW) { boxW = maxW; }
+        int boxH = pad * 2 + fh;
+        if (doc.Length > 0) { boxH = boxH + app.Scale(2) + sfh; }
+        int px = textX;
+        int rowY = area.y + (curLine - scrollLine) * lineH;
+        int py = rowY - boxH - app.Scale(2);
+        if (py < area.y) { py = rowY + lineH + app.Scale(2); }
+        if (py + boxH > area.y + area.height) { py = area.y; }
+        if (px + boxW > area.x + area.width) {
+            px = area.x + area.width - boxW - app.Scale(4);
+        }
+        if (px < area.x) { px = area.x + app.Scale(2); }
+        c.FillRoundRect(px + 2, py + 2, boxW, boxH, app.Scale(4), pal.shadowSoft);
+        c.SurfaceRoundRect(px, py, boxW, boxH, app.Scale(4), pal.popupBg,
+            pal.border, 1);
+        // The active parameter in the accent colour, the rest of the signature
+        // in the muted signature colour, so a long argument list stays readable.
+        List<int> span = new List<int>();
+        CodeEditor.ParamSpan(sig, argOut[0], span);
+        int ty = py + pad;
+        if (span.Count == 2 && span[0] + span[1] <= sig.Length) {
+            string head = sig.Substring(0, span[0]);
+            string mid = sig.Substring(span[0], span[1]);
+            string tail = sig.Substring(span[0] + span[1],
+                sig.Length - span[0] - span[1]);
+            int cx = px + pad;
+            c.DrawText(cx, ty, head, pal.signature, fontSize);
+            cx = cx + Canvas.MeasureText(head, fontSize);
+            c.DrawText(cx, ty, mid, pal.accent, fontSize);
+            cx = cx + Canvas.MeasureText(mid, fontSize);
+            c.DrawText(cx, ty, tail, pal.signature, fontSize);
+        } else {
+            c.DrawText(px + pad, ty, sig, pal.signature, fontSize);
+        }
+        if (doc.Length > 0) {
+            c.DrawText(px + pad, ty + fh + app.Scale(2), doc, pal.muted,
+                t.fontSizeSmall);
         }
     }
 

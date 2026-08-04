@@ -75,13 +75,18 @@ class CodeLensRef {
     int x;
     int y;
     int w;
+    /// What the lens says: the uses in this buffer plus the ones in the rest of
+    /// the project. A click compares it with what this buffer can list, and asks
+    /// the host for the full list when they differ.
+    int count;
 
-    CodeLensRef(int line, string name, int x, int y, int w) {
+    CodeLensRef(int line, string name, int x, int y, int w, int count) {
         this.line = line;
         this.name = name;
         this.x = x;
         this.y = y;
         this.w = w;
+        this.count = count;
     }
 }
 
@@ -246,6 +251,13 @@ partial class CodeEditor {
     List<string> extRefKeys;
     List<int> extRefVals;
     bool extRefDirty;
+    // Signature help memo: the callee whose parameter list is on screen, the
+    // signature parsed for it and the TextStamp() it was parsed at. Parsing
+    // walks the buffer and the project sources, so it must not run per frame
+    // while the caret merely sits inside a call.
+    string sigMemoName;
+    string sigMemoText;
+    int sigMemoStamp;
     // Per-line syntax-highlight cache, aligned to `lines` by index and validated
     // by source text, so scrolling/idling re-tokenises nothing. hlThemeSig
     // invalidates the whole cache when the palette (theme/overrides) changes.
@@ -353,6 +365,9 @@ partial class CodeEditor {
         e.extRefKeys = new List<string>();
         e.extRefVals = new List<int>();
         e.extRefDirty = false;
+        e.sigMemoName = "";
+        e.sigMemoText = "";
+        e.sigMemoStamp = 0 - 1;
         e.hlCache = new List<CeHlLine>();
         e.hlThemeSig = 0;
         e.fixes = new List<QuickFix>();
@@ -411,6 +426,20 @@ partial class CodeEditor {
 
     int CurLine() { return curLine; }
     int CurCol() { return curCol; }
+
+    /// Text of line `i` ("" out of range). Lets a host (the find bar) walk the
+    /// buffer without materialising the whole document every keystroke.
+    string LineAt(int i) {
+        if (i < 0 || i >= lines.Count) { return ""; }
+        return lines[i];
+    }
+
+    /// The focus id this editor rendered with last frame, so a host can hand
+    /// the keyboard back to it when an overlay of its own closes.
+    int LastWidgetId() { return lastId; }
+
+    /// True while a selection is active.
+    bool HasSelection() { return selActive; }
 
     /// First visible line. A host with several buffers stores this with the
     /// caret to put a buffer back the way it was left.
@@ -785,6 +814,30 @@ partial class CodeEditor {
     }
 
     void ClearSelection() { selActive = false; }
+
+    /// Selects from (aLine, aCol) to (bLine, bCol) and leaves the caret at the
+    /// end, exactly as a drag-selection would: a search hit handed back by the
+    /// find bar is then highlighted and scrolled into view like any selection.
+    void SelectRange(int aLine, int aCol, int bLine, int bCol) {
+        if (lines.Count == 0) { return; }
+        if (aLine < 0) { aLine = 0; }
+        if (aLine >= lines.Count) { aLine = lines.Count - 1; }
+        if (bLine < 0) { bLine = 0; }
+        if (bLine >= lines.Count) { bLine = lines.Count - 1; }
+        if (aCol < 0) { aCol = 0; }
+        if (aCol > lines[aLine].Length) { aCol = lines[aLine].Length; }
+        if (bCol < 0) { bCol = 0; }
+        if (bCol > lines[bLine].Length) { bCol = lines[bLine].Length; }
+        selAnchorLine = aLine;
+        selAnchorCol = aCol;
+        curLine = bLine;
+        curCol = bCol;
+        selActive = aLine != bLine || aCol != bCol;
+        ClearExtraCarets();
+        // Force the caret-in-view pass to run even when the hit is on the line
+        // the caret already sat on.
+        ensuredCaretLine = 0 - 1;
+    }
 
     /// Selects the identifier under the caret (double-click). If the caret sits
     /// at a word's right edge (on the following separator) the preceding word is

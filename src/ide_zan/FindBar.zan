@@ -1,0 +1,574 @@
+using System;
+using System.Text.RegularExpressions;
+using Gui;
+using Gui.Widget;
+using Gui.Component.CodeEditor;
+
+/// One occurrence of the find bar's query in the buffer: a single-line range.
+class FindHit {
+    int line;
+    int col;
+    int len;
+
+    static FindHit Create(int line, int col, int len) {
+        FindHit h = new FindHit();
+        h.line = line;
+        h.col = col;
+        h.len = len;
+        return h;
+    }
+}
+
+/// Visual-Studio-style Find / Replace bar for the code editor.
+///
+/// The old bar drew its text with Prompt.Field -- a painted rectangle with no
+/// identity, no focus and no hit region -- so it could not be clicked into and
+/// only worked while the shell happened to route keystrokes to it (and Replace
+/// worked not at all). This one is built from the framework's own retained
+/// `Input` widgets: the framework resolves clicks, caret, selection and IME for
+/// them, and a click anywhere in the bar cannot fall through to the editor
+/// because the whole panel registers as a hit blocker.
+///
+///     Ctrl+F   opens it on the query row (seeded with the selection)
+///     Ctrl+R   opens it with the replace row expanded
+///     v / ^    collapses / expands the replace row
+///     Aa ab .* toggle match case, whole word, regular expression
+///     Enter    next match (Shift+Enter previous), Escape closes
+///
+/// Cost control: the match set is computed once per (query, options, buffer)
+/// combination and reused for the counter, the navigation and Replace All, so
+/// typing does not rescan the document per frame. A scan stops at `maxHits`
+/// occurrences, and a document longer than `liveLimit` lines is only scanned
+/// when the user actually asks (Enter / a button), never per keystroke. An
+/// invalid regular expression is reported in the bar (Regex.Validate, no
+/// throw) and simply matches nothing.
+class FindBar {
+    Input queryIn;
+    Input replIn;
+    Button expandBtn;
+    Button caseBtn;
+    Button wordBtn;
+    Button regexBtn;
+    Button prevBtn;
+    Button nextBtn;
+    Button replBtn;
+    Button replAllBtn;
+    Button closeBtn;
+
+    /// Replace row shown (Ctrl+R / the chevron).
+    bool expanded;
+    bool matchCase;
+    bool wholeWord;
+    bool useRegex;
+    /// Why the pattern cannot be used ("" when it is fine).
+    string err;
+    /// Cached match set and the (query, options, buffer) it was built for.
+    List<FindHit> hits;
+    string cacheQuery;
+    int cacheOpts;
+    int cacheStamp;
+    bool cacheValid;
+    /// Index into `hits` of the occurrence the editor is showing, or -1.
+    int sel;
+    /// True until the frame that hands the keyboard to the query field.
+    bool focusPending;
+    /// Set for one frame when the bar wants the host to close it.
+    bool closeReq;
+    /// Largest match set collected in one scan.
+    int maxHits;
+    /// Documents longer than this are not scanned on every keystroke.
+    int liveLimit;
+
+    static FindBar Create() {
+        FindBar f = new FindBar();
+        f.queryIn = new Input(ZanIDE.T("Find", "查找"));
+        f.replIn = new Input(ZanIDE.T("Replace with", "替换为"));
+        f.expandBtn = new Button { Icon = "chevron-down", Class = "text tiny" };
+        f.caseBtn = new Button { Text = "Aa", Class = "text tiny",
+            Tip = ZanIDE.T("Match case", "区分大小写") };
+        f.wordBtn = new Button { Text = "ab", Class = "text tiny",
+            Tip = ZanIDE.T("Match whole word", "全字匹配") };
+        f.regexBtn = new Button { Text = ".*", Class = "text tiny",
+            Tip = ZanIDE.T("Use regular expressions", "使用正则表达式") };
+        f.prevBtn = new Button { Icon = "arrow-up", Class = "text tiny",
+            Tip = ZanIDE.T("Previous match (Shift+Enter)", "上一个匹配 (Shift+Enter)") };
+        f.nextBtn = new Button { Icon = "arrow-down", Class = "text tiny",
+            Tip = ZanIDE.T("Next match (Enter)", "下一个匹配 (Enter)") };
+        f.replBtn = new Button { Text = ZanIDE.T("Replace", "替换"), Class = "small" };
+        f.replAllBtn = new Button { Text = ZanIDE.T("All", "全部"), Class = "small" };
+        f.closeBtn = new Button { Icon = "close", Class = "text tiny",
+            Tip = ZanIDE.T("Close (Esc)", "关闭 (Esc)") };
+        f.expanded = false;
+        f.matchCase = false;
+        f.wholeWord = false;
+        f.useRegex = false;
+        f.err = "";
+        f.hits = new List<FindHit>();
+        f.cacheQuery = "";
+        f.cacheOpts = 0 - 1;
+        f.cacheStamp = 0 - 1;
+        f.cacheValid = false;
+        f.sel = 0 - 1;
+        f.focusPending = false;
+        f.closeReq = false;
+        f.maxHits = 5000;
+        f.liveLimit = 20000;
+        return f;
+    }
+
+    /// Opens (or re-focuses) the bar. `seed` replaces the query when it is not
+    /// empty -- the editor's selection or the word at the caret, as in VS.
+    void Open(bool replace, string seed) {
+        if (replace) { expanded = true; }
+        if (seed.Length > 0) { queryIn.SetText(seed); }
+        focusPending = true;
+        closeReq = false;
+        cacheValid = false;
+    }
+
+    /// True for the frame the bar asked to be dismissed (the X button).
+    bool CloseRequested() { return closeReq; }
+    void ClearCloseRequest() { closeReq = false; }
+
+    string Query() { return queryIn.GetText(); }
+
+    int OptBits() {
+        int b = 0;
+        if (matchCase) { b = b + 1; }
+        if (wholeWord) { b = b + 2; }
+        if (useRegex) { b = b + 4; }
+        return b;
+    }
+
+    /// ASCII case fold. Search is byte-based, so folding only the 26 Latin
+    /// letters leaves every multi-byte sequence untouched (and comparable).
+    static string LowerAscii(string s) {
+        string up = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        string lo = "abcdefghijklmnopqrstuvwxyz";
+        string o = "";
+        int i = 0;
+        while (i < s.Length) {
+            string ch = s.Substring(i, 1);
+            int p = up.IndexOf(ch);
+            if (p >= 0) { o = o + lo.Substring(p, 1); }
+            else { o = o + ch; }
+            i = i + 1;
+        }
+        return o;
+    }
+
+    /// True when [col, col+len) in `s` is not glued to an identifier character
+    /// on either side (the "match whole word" rule).
+    static bool WordEdges(string s, int col, int len) {
+        if (col > 0 && CodeEditor.IsIdentChar(s.Substring(col - 1, 1))) {
+            return false;
+        }
+        int end = col + len;
+        if (end < s.Length && CodeEditor.IsIdentChar(s.Substring(end, 1))) {
+            return false;
+        }
+        return true;
+    }
+
+    /// Rebuilds `hits` when the query, the options or the buffer changed.
+    /// `onDemand` is true when the user asked for a search (Enter / a button):
+    /// only then is a very large document scanned, so plain typing in a huge
+    /// file never costs a full pass per keystroke.
+    void EnsureHits(CodeEditor ed, bool onDemand) {
+        string q = queryIn.GetText();
+        int opts = OptBits();
+        int stamp = ed.TextStamp();
+        if (cacheValid && cacheQuery == q && cacheOpts == opts
+            && cacheStamp == stamp) {
+            return;
+        }
+        if (q.Length == 0) {
+            hits = new List<FindHit>();
+            sel = 0 - 1;
+            err = "";
+            cacheQuery = q;
+            cacheOpts = opts;
+            cacheStamp = stamp;
+            cacheValid = true;
+            return;
+        }
+        if (!onDemand && ed.LineCount() > liveLimit) {
+            // Leave the previous result in place; the counter shows it is stale
+            // by simply not changing until the user presses Enter.
+            return;
+        }
+        hits = new List<FindHit>();
+        err = "";
+        if (useRegex) {
+            string why = Regex.Validate(q);
+            if (why.Length > 0) {
+                err = why;
+                sel = 0 - 1;
+                cacheQuery = q;
+                cacheOpts = opts;
+                cacheStamp = stamp;
+                cacheValid = true;
+                return;
+            }
+            ScanRegex(ed, q);
+        } else {
+            ScanPlain(ed, q);
+        }
+        cacheQuery = q;
+        cacheOpts = opts;
+        cacheStamp = stamp;
+        cacheValid = true;
+        if (sel >= hits.Count) { sel = hits.Count - 1; }
+    }
+
+    void ScanPlain(CodeEditor ed, string q) {
+        string needle = q;
+        if (!matchCase) { needle = FindBar.LowerAscii(q); }
+        int n = ed.LineCount();
+        int ln = 0;
+        while (ln < n && hits.Count < maxHits) {
+            string raw = ed.LineAt(ln);
+            string hay = raw;
+            if (!matchCase) { hay = FindBar.LowerAscii(raw); }
+            int at = 0;
+            while (at <= hay.Length - needle.Length) {
+                int p = CodeEditor.FindFrom(hay, needle, at);
+                if (p < 0) { break; }
+                if (!wholeWord || FindBar.WordEdges(raw, p, needle.Length)) {
+                    hits.Add(FindHit.Create(ln, p, needle.Length));
+                    if (hits.Count >= maxHits) { break; }
+                }
+                at = p + 1;
+            }
+            ln = ln + 1;
+        }
+    }
+
+    void ScanRegex(CodeEditor ed, string q) {
+        // Compiled once for the whole scan; the pattern was validated above so
+        // this cannot throw.
+        Regex re = Regex.CompileOptions(q, !matchCase);
+        int n = ed.LineCount();
+        int ln = 0;
+        while (ln < n && hits.Count < maxHits) {
+            string raw = ed.LineAt(ln);
+            int at = 0;
+            while (at <= raw.Length) {
+                Match m = re.FindFrom(raw, at);
+                if (!m.Success()) { break; }
+                int mi = m.Index();
+                int mlen = m.Length();
+                if (mlen > 0 && (!wholeWord || FindBar.WordEdges(raw, mi, mlen))) {
+                    hits.Add(FindHit.Create(ln, mi, mlen));
+                    if (hits.Count >= maxHits) { break; }
+                }
+                // An empty match would spin here forever: always advance.
+                if (mlen == 0) { at = mi + 1; } else { at = mi + mlen; }
+            }
+            ln = ln + 1;
+        }
+        re = null;
+    }
+
+    /// Index of the first hit at or after (line, col), or -1.
+    int IndexAtOrAfter(int line, int col) {
+        int i = 0;
+        while (i < hits.Count) {
+            FindHit h = hits[i];
+            if (h.line > line || (h.line == line && h.col >= col)) { return i; }
+            i = i + 1;
+        }
+        return 0 - 1;
+    }
+
+    void ShowHit(CodeEditor ed, int idx) {
+        if (idx < 0 || idx >= hits.Count) { return; }
+        sel = idx;
+        FindHit h = hits[idx];
+        ed.SelectRange(h.line, h.col, h.line, h.col + h.len);
+    }
+
+    /// Moves to the next (`dir` = 1) or previous (`dir` = -1) occurrence,
+    /// wrapping at the ends like VS does.
+    void Step(CodeEditor ed, int dir) {
+        EnsureHits(ed, true);
+        if (hits.Count == 0) { return; }
+        int idx = sel;
+        if (idx < 0) {
+            idx = IndexAtOrAfter(ed.CurLine(), ed.CurCol());
+            if (idx < 0) { idx = 0; }
+            if (dir < 0) { idx = idx - 1; }
+        } else {
+            idx = idx + dir;
+        }
+        if (idx < 0) { idx = hits.Count - 1; }
+        if (idx >= hits.Count) { idx = 0; }
+        ShowHit(ed, idx);
+    }
+
+    /// The text `hits[idx]` is replaced with: the replace field as typed, or
+    /// with `$1`-style group references expanded in regular-expression mode.
+    string ReplacementFor(CodeEditor ed, int idx) {
+        string rep = replIn.GetText();
+        if (!useRegex) { return rep; }
+        string q = queryIn.GetText();
+        if (q.Length == 0 || Regex.Validate(q).Length > 0) { return rep; }
+        FindHit h = hits[idx];
+        Regex re = Regex.CompileOptions(q, !matchCase);
+        Match m = re.FindFrom(ed.LineAt(h.line), h.col);
+        re = null;
+        if (!m.Success() || m.Index() != h.col) { return rep; }
+        return Regex.Expand(rep, m);
+    }
+
+    /// Replaces the shown occurrence (or the next one when none is shown) and
+    /// moves to the following one, as VS's Replace button does.
+    void ReplaceOne(CodeEditor ed) {
+        EnsureHits(ed, true);
+        if (hits.Count == 0) { return; }
+        if (sel < 0 || sel >= hits.Count) {
+            Step(ed, 1);
+            return;
+        }
+        FindHit h = hits[sel];
+        string rep = ReplacementFor(ed, sel);
+        ed.SelectRange(h.line, h.col, h.line, h.col + h.len);
+        // InsertBlock drops the selection first and snapshots undo, so one
+        // Replace is one Ctrl+Z.
+        ed.InsertBlock(rep);
+        cacheValid = false;
+        int keepLine = h.line;
+        int keepCol = h.col + rep.Length;
+        EnsureHits(ed, true);
+        int nxt = IndexAtOrAfter(keepLine, keepCol);
+        if (nxt < 0) { nxt = 0; }
+        sel = 0 - 1;
+        if (hits.Count > 0) { ShowHit(ed, nxt); }
+    }
+
+    /// Replaces every occurrence in one edit (one undo step, one reload) rather
+    /// than driving the editor once per hit -- a 2000-hit Replace All is a
+    /// single pass over the lines instead of 2000 snapshots of the document.
+    int ReplaceAll(CodeEditor ed) {
+        EnsureHits(ed, true);
+        if (hits.Count == 0) { return 0; }
+        int done = 0;
+        List<string> outLines = new List<string>();
+        int n = ed.LineCount();
+        int hi = 0;
+        int ln = 0;
+        while (ln < n) {
+            string raw = ed.LineAt(ln);
+            // The hits of this line, in order: rebuild the line around them.
+            string built = "";
+            int at = 0;
+            while (hi < hits.Count && hits[hi].line == ln) {
+                FindHit h = hits[hi];
+                if (h.col >= at && h.col + h.len <= raw.Length) {
+                    built = built + raw.Substring(at, h.col - at)
+                        + ReplacementFor(ed, hi);
+                    at = h.col + h.len;
+                    done = done + 1;
+                }
+                hi = hi + 1;
+            }
+            if (at == 0) { outLines.Add(raw); }
+            else { outLines.Add(built + raw.Substring(at, raw.Length - at)); }
+            ln = ln + 1;
+        }
+        if (done == 0) { return 0; }
+        int keep = ed.CurLine();
+        int keepScroll = ed.ScrollLine();
+        ed.SaveUndo();
+        ed.LoadText(string.Join("\n", outLines));
+        ed.GoToLine(keep);
+        ed.SetScrollLine(keepScroll);
+        cacheValid = false;
+        sel = 0 - 1;
+        return done;
+    }
+
+    /// "3/17", "No results", or the reason the pattern is unusable.
+    string StatusText() {
+        if (queryIn.GetText().Length == 0) { return ""; }
+        if (err.Length > 0) { return ZanIDE.T("bad pattern", "正则无效"); }
+        if (hits.Count == 0) { return ZanIDE.T("No results", "无结果"); }
+        string total = Convert.ToString(hits.Count);
+        if (hits.Count >= maxHits) { total = total + "+"; }
+        if (sel < 0) { return total; }
+        return Convert.ToString(sel + 1) + "/" + total;
+    }
+
+    /// Height the bar needs right now (one row, or two when expanded).
+    int Height(App app) {
+        int h = app.Scale(38);
+        if (expanded) { h = h + app.Scale(30); }
+        // The reason a pattern is rejected gets its own line inside the panel,
+        // so it can never be painted over the code below it.
+        if (err.Length > 0) { h = h + app.Scale(16); }
+        return h;
+    }
+
+    /// Draws the bar in the top-right corner of `edRect` and runs every
+    /// interaction in it. Returns the height it used.
+    int Render(App app, Rect edRect, CodeEditor ed) {
+        Theme t = app.theme;
+        int pad = app.Scale(6);
+        int rowH = app.Scale(24);
+        int w = app.Scale(430);
+        if (w > edRect.width - app.Scale(16)) { w = edRect.width - app.Scale(16); }
+        int h = Height(app);
+        int x = edRect.x + edRect.width - w - app.Scale(10);
+        if (x < edRect.x) { x = edRect.x; }
+        int y = edRect.y + app.Scale(4);
+
+        Prompt.Surface(app, x, y, w, h, "");
+        // Registered before the bar's own widgets so it swallows clicks meant
+        // for the editor underneath while its buttons stay live (the hit tester
+        // is last-registered-wins).
+        app.BlockHitsRect(x, y, w, h);
+
+        int btn = app.Scale(22);
+        int gap = app.Scale(2);
+        int rowY = y + pad;
+
+        // Chevron: collapse / expand the replace row.
+        expandBtn.Icon = "chevron-down";
+        if (expanded) { expandBtn.Icon = "chevron-up"; }
+        int exId = expandBtn.Render(app, x + app.Scale(3), rowY, btn);
+
+        // Right-hand cluster: close, next, prev, counter.
+        int rx = x + w - pad - btn;
+        int clId = closeBtn.Render(app, rx, rowY, btn);
+        rx = rx - btn - gap;
+        int nxId = nextBtn.Render(app, rx, rowY, btn);
+        rx = rx - btn - gap;
+        int pvId = prevBtn.Render(app, rx, rowY, btn);
+
+        string status = StatusText();
+        int statusW = 0;
+        if (status.Length > 0) {
+            statusW = Canvas.MeasureText(status, t.fontSizeSmall) + app.Scale(8);
+        }
+        int statusX = rx - statusW;
+
+        // Option toggles sit just left of the counter, as in VS.
+        int ox = statusX - app.Scale(4) - btn;
+        int reId = regexBtn.Render(app, ox, rowY, btn);
+        ox = ox - btn - gap;
+        int woId = wordBtn.Render(app, ox, rowY, btn);
+        ox = ox - btn - gap;
+        int caId = caseBtn.Render(app, ox, rowY, btn);
+
+        int fieldX = x + app.Scale(3) + btn + app.Scale(2);
+        int fieldW = ox - app.Scale(4) - fieldX;
+        if (fieldW < app.Scale(60)) { fieldW = app.Scale(60); }
+        int qId = queryIn.Render(app, fieldX, rowY, fieldW, rowH);
+
+        if (status.Length > 0) {
+            int scol = t.textTertiary;
+            if (err.Length > 0 || hits.Count == 0) { scol = t.error; }
+            app.canvas.DrawText(statusX + app.Scale(4),
+                Canvas.CenterTextY(rowY, rowH, t.fontSizeSmall),
+                status, scol, t.fontSizeSmall);
+        }
+
+        int rId = 0 - 1;
+        int rOneId = 0 - 1;
+        int rAllId = 0 - 1;
+        if (expanded) {
+            int row2Y = rowY + rowH + app.Scale(4);
+            int repW = app.Scale(120);
+            int rfW = fieldW - repW - app.Scale(6);
+            if (rfW < app.Scale(60)) { rfW = app.Scale(60); }
+            rId = replIn.Render(app, fieldX, row2Y, rfW, rowH);
+            int bx = fieldX + rfW + app.Scale(6);
+            int oneW = app.Scale(66);
+            rOneId = replBtn.Render(app, bx, row2Y, oneW);
+            rAllId = replAllBtn.Render(app, bx + oneW + app.Scale(4), row2Y,
+                app.Scale(48));
+        }
+
+        // Opening the bar hands it the keyboard, so the first keystroke lands
+        // in the query field instead of in the document.
+        if (focusPending) {
+            app.focus.SetFocused(qId);
+            focusPending = false;
+            app.RequestRedraw();
+        }
+
+        bool qFocused = app.focus.IsFocused(qId);
+        bool rFocused = expanded && app.focus.IsFocused(rId);
+
+        // Keep the counter honest while typing (cheap: cached per buffer stamp).
+        EnsureHits(ed, false);
+
+        // ---- keyboard: Enter / Shift+Enter walk the matches ----
+        if (app.EventKind() == 6 && (qFocused || rFocused)) {
+            int cc = app.window.EventKeyCode();
+            if (cc == 13) {
+                if (rFocused) { ReplaceOne(ed); }
+                else if (Modifiers.HasShift(app.window.EventMods())) { Step(ed, 0 - 1); }
+                else { Step(ed, 1); }
+                app.RequestRedraw();
+            }
+        }
+
+        // ---- buttons ----
+        if (Ui.Clicked(app, exId)) {
+            expanded = !expanded;
+            app.RequestRedraw();
+        }
+        if (Ui.Clicked(app, clId)) {
+            closeReq = true;
+            app.RequestRedraw();
+        }
+        if (Ui.Clicked(app, nxId)) { Step(ed, 1); app.RequestRedraw(); }
+        if (Ui.Clicked(app, pvId)) { Step(ed, 0 - 1); app.RequestRedraw(); }
+        if (Ui.Clicked(app, caId)) {
+            matchCase = !matchCase;
+            cacheValid = false;
+            sel = 0 - 1;
+            app.RequestRedraw();
+        }
+        if (Ui.Clicked(app, woId)) {
+            wholeWord = !wholeWord;
+            cacheValid = false;
+            sel = 0 - 1;
+            app.RequestRedraw();
+        }
+        if (Ui.Clicked(app, reId)) {
+            useRegex = !useRegex;
+            cacheValid = false;
+            sel = 0 - 1;
+            app.RequestRedraw();
+        }
+        if (expanded && Ui.Clicked(app, rOneId)) {
+            ReplaceOne(ed);
+            app.RequestRedraw();
+        }
+        if (expanded && Ui.Clicked(app, rAllId)) {
+            ReplaceAll(ed);
+            app.RequestRedraw();
+        }
+
+        // An active option reads as pressed (the skin's `button:checked`).
+        caseBtn.Class = FindBar.ToggleClass(matchCase);
+        wordBtn.Class = FindBar.ToggleClass(wholeWord);
+        regexBtn.Class = FindBar.ToggleClass(useRegex);
+
+        if (err.Length > 0) {
+            app.canvas.DrawText(fieldX, y + h - app.Scale(15),
+                Ellipsis.Fit(ZanIDE.T("Pattern: ", "正则: ") + err,
+                    w - app.Scale(20), t.fontSizeSmall),
+                t.error, t.fontSizeSmall);
+        }
+        return h;
+    }
+
+    /// Class string that makes a toggle button look pressed while it is on.
+    static string ToggleClass(bool on) {
+        if (on) { return "primary tiny"; }
+        return "text tiny";
+    }
+}

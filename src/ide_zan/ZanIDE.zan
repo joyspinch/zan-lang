@@ -465,6 +465,48 @@ partial class ZanIDE {
         if (aiSessNav != null) { aiSessNav.CancelRename(); }
     }
 
+    /// Collects the uses of the symbol under the caret and opens the reference
+    /// list on them. The count also goes to the output log, so the answer is
+    /// still on record after the list is dismissed.
+    void ShowReferences() {
+        string word = editor.WordAtCaret();
+        if (word.Length == 0) {
+            log.Add(ZanIDE.T("> Find All References: no symbol under caret.",
+                "> 查找所有引用：光标处没有符号。"));
+            return;
+        }
+        List<SearchHit> found = ZanIDE.CollectReferences(
+            lspSess, editor, tabs, activeTab, root);
+        log.Add("> " + Convert.ToString(found.Count) + " reference(s) to '"
+            + word + "'.");
+        if (found.Count == 0) { return; }
+        refList.Show(word, found, root);
+    }
+
+    /// Opens the reference-list row `idx`, switching to (or opening) its file.
+    void GotoReference(int idx) {
+        if (idx < 0 || idx >= refList.Count()) { return; }
+        this.RememberTabView();
+        int hitLine = ZanIDE.GotoSearchHit(refList.Hits(), idx, tabs, activeTab, log);
+        if (hitLine >= 0) {
+            pendingGotoLine = hitLine;
+            pendingGotoCol = 0;
+            lastActive = 0 - 1;
+        }
+    }
+
+    /// What Ctrl+F should prefill the query with: the selection when it is a
+    /// single line of text, otherwise the word at the caret, like Visual Studio.
+    /// "" leaves whatever the bar already holds.
+    string FindSeed() {
+        if (editor.HasSelection()) {
+            string sel = editor.GetSelectedText();
+            if (sel.Length > 0 && sel.IndexOf("\n") < 0) { return sel; }
+            return "";
+        }
+        return editor.WordAtCaret();
+    }
+
     /// Records where the active tab is being read, so a jump that leaves it can
     /// put the caret and the viewport back on return.
     void RememberTabView() {
@@ -1663,9 +1705,16 @@ partial class ZanIDE {
                     dbgState = 0; dbgExecLine = -1; editor.SetExecLine(-1);
                     log.Add("> [Debug] Stopped.");
                     app.RequestRedraw();
+                } else if (kc == 27 && refList.IsOpen()) {
+                    // Escape = close the reference list (before the find bar:
+                    // it is the thing that opened last).
+                    refList.Close();
+                    app.RequestRedraw();
                 } else if (kc == 27 && findMode > 0) {
-                    // Escape = close find/replace/goto
+                    // Escape = close find/replace/goto, and hand the keyboard
+                    // back to the editor the bar took it from.
                     findMode = 0;
+                    app.focus.SetFocused(editor.LastWidgetId());
                     app.RequestRedraw();
                 } else if (kc == 27 && pubWin != null && pubWin.IsOpen()) {
                     // Escape = close publish window
@@ -1765,7 +1814,8 @@ partial class ZanIDE {
                         findMode = 6;
                         fifQuery = "";
                     } else {
-                        findMode = 1;
+                        if (findMode != 2) { findMode = 1; }
+                        findBar.Open(false, this.FindSeed());
                     }
                     app.RequestRedraw();
                 } else if (cc == 7) {
@@ -1781,6 +1831,7 @@ partial class ZanIDE {
                         fifRepl = "";
                     } else {
                         findMode = 2;
+                        findBar.Open(true, this.FindSeed());
                     }
                     app.RequestRedraw();
                 } else if (cc == 2) {
@@ -2493,10 +2544,33 @@ partial class ZanIDE {
                     }
                 }
 
-                // ---- Find / Replace / GoToLine overlay ----
-                if (findMode > 0 && !designerMode && !sceneMode && !activeIsStart && !activeIsDocs) {
+                // ---- reference list ("N references" / Shift+F12) ----
+                if (refList.IsOpen() && !designerMode && !sceneMode
+                        && !activeIsStart && !activeIsDocs) {
+                    int refPick = refList.Render(app, edRect);
+                    if (refPick >= 0) { this.GotoReference(refPick); }
+                } else if (refList.IsOpen()) {
+                    // The list belongs to the code view; a designer or start tab
+                    // is not where its rows point.
+                    refList.Close();
+                }
+
+                // ---- Find / Replace bar (Ctrl+F, Ctrl+R) ----
+                if ((findMode == 1 || findMode == 2) && !designerMode && !sceneMode
+                        && !activeIsStart && !activeIsDocs) {
+                    findBar.Render(app, edRect, editor);
+                    if (findBar.CloseRequested()) {
+                        findBar.ClearCloseRequest();
+                        findMode = 0;
+                        app.focus.SetFocused(editor.LastWidgetId());
+                        app.RequestRedraw();
+                    }
+                }
+
+                // ---- GoToLine / breakpoint / rename / in-files overlay ----
+                if (findMode > 2 && !designerMode && !sceneMode && !activeIsStart && !activeIsDocs) {
                     int fpH = app.Scale(36);
-                    if (findMode == 2 || findMode == 7) { fpH = app.Scale(68); }
+                    if (findMode == 7) { fpH = app.Scale(68); }
                     int fpW = app.Scale(360);
                     int fpX = edRect.x + edRect.width - fpW - app.Scale(8);
                     int fpY = edRect.y + app.Scale(4);
@@ -2505,46 +2579,7 @@ partial class ZanIDE {
                     int inpY = fpY + app.Scale(8);
                     int inpW = fpW - app.Scale(100);
                     int inpH = app.Scale(22);
-                    if (findMode == 1) {
-                        Prompt.Caption(app, fpX, fpY, ZanIDE.T("Find (Ctrl+F)", "查找 (Ctrl+F)"));
-                        Prompt.Field(app, inpX, inpY, inpW, findText);
-                        // Find/Next buttons (framework Button components).
-                        int btnX = inpX + inpW + app.Scale(6);
-                        int fbId = findBtn.Render(app, btnX, inpY, app.Scale(36));
-                        int btn2X = btnX + app.Scale(42);
-                        int nbId = findNextBtn.Render(app, btn2X, inpY, app.Scale(36));
-                        // Handle key input into find box
-                        if (kind == 6) {
-                            int fcc = app.window.EventKeyCode();
-                            if (fcc == 8 && findText.Length > 0) {
-                                findText = findText.Substring(0, findText.Length - 1);
-                                app.RequestRedraw();
-                            } else if (fcc == 13) {
-                                findMatch = ZanIDE.FindInEditor(editor, findText, findMatch);
-                                app.RequestRedraw();
-                            } else if (fcc > 31) {
-                                findText = findText + Text.CharStr(fcc);
-                                app.RequestRedraw();
-                            }
-                        }
-                        // Click Find/Next buttons
-                        if (Ui.Clicked(app, fbId)) {
-                            findMatch = ZanIDE.FindInEditor(editor, findText, -1);
-                            app.RequestRedraw();
-                        }
-                        if (Ui.Clicked(app, nbId)) {
-                            findMatch = ZanIDE.FindInEditor(editor, findText, findMatch);
-                            app.RequestRedraw();
-                        }
-                    } else if (findMode == 2) {
-                        Prompt.Caption(app, fpX, fpY, ZanIDE.T("Replace (Ctrl+R)", "替换 (Ctrl+R)"));
-                        Prompt.Field(app, inpX, inpY, inpW, findText);
-                        int row2Y = inpY + inpH + app.Scale(6);
-                        Prompt.Field(app, inpX, row2Y, inpW, replText);
-                        int rbX = inpX + inpW + app.Scale(6);
-                        replBtn.Render(app, rbX, inpY, app.Scale(70));
-                        replAllBtn.Render(app, rbX, row2Y, app.Scale(70));
-                    } else if (findMode == 3) {
+                    if (findMode == 3) {
                         Prompt.Caption(app, fpX, fpY, ZanIDE.T("Go to Line (Ctrl+G)", "跳转到行 (Ctrl+G)"));
                         Prompt.Field(app, inpX, inpY, inpW, gotoText);
                         int gbX = inpX + inpW + app.Scale(6);
@@ -4434,7 +4469,11 @@ partial class ZanIDE {
                 if (!designerMode && !activeIsStart && !activeIsDocs) {
                     editor.RenderCtxMenu(app);
                     string ecmd = editor.TakeCommand();
-                    if (ecmd == "find") { findMode = 1; app.RequestRedraw(); }
+                    if (ecmd == "find") {
+                        findMode = 1;
+                        findBar.Open(false, this.FindSeed());
+                        app.RequestRedraw();
+                    }
                     else if (ecmd == "gotoline") { findMode = 3; gotoText = ""; app.RequestRedraw(); }
                     else if (ecmd == "gotodef") {
                         if (lspSess == null && !lspTried) {
@@ -4453,7 +4492,7 @@ partial class ZanIDE {
                             lspSess = LspSession.Start(root);
                             if (lspSess != null) { log.Add("> zan-lsp connected: semantic navigation enabled."); }
                         }
-                        ZanIDE.FindReferencesSmart(lspSess, editor, tabs, activeTab, root, log);
+                        this.ShowReferences();
                         app.RequestRedraw();
                     }
                 }
@@ -4818,10 +4857,6 @@ partial class ZanIDE {
         tabs.Insert(0, TabRecord.Create("Start", "", "@start"));
         activeTab.Set(0);
 
-        // TEMP PROBE: open docs, default section.
-        tabs.Add(TabRecord.Create("Help", "", "@docs"));
-        activeTab.Set(tabs.Count - 1);
-
         log = new List<string>();
         if (haveProject) {
             log.Add("> " + IdeVersion.Product() + " ready. Workspace: " + root);
@@ -4929,8 +4964,6 @@ partial class ZanIDE {
         // ---- Find/Replace & GoToLine state ----
         findMode = 0;    // 0=hidden, 1=find, 2=replace, 3=gotoLine, 4=bpCondition, 5=rename,
                              // 6=find in files, 7=replace in files
-        findText = "";
-        replText = "";
         // Find in Files results (project-wide, F8/Shift+F8 walk them).
         fifHits = new List<SearchHit>();
         fifQuery = "";
@@ -4940,14 +4973,12 @@ partial class ZanIDE {
         gotoText = "";
         renameText = "";
         renameWord = "";
-        findMatch = -1;   // line of current match
-        // Persistent framework Button instances for the find/replace/goto bar so
-        // it renders through the themed, glass-aware component (not hand-drawn
-        // hex) and matches every skin. Text is set per frame by mode.
-        findBtn = new Button { Text = ZanIDE.T("Find", "查找"), Class = "primary small" };
-        findNextBtn = new Button { Text = ZanIDE.T("Next", "下一个"), Class = "small" };
-        replBtn = new Button { Text = ZanIDE.T("Replace", "替换"), Class = "primary small" };
-        replAllBtn = new Button { Text = ZanIDE.T("Repl All", "全部替换"), Class = "small" };
+        // The Find/Replace bar is a retained component: its query and replace
+        // fields are framework Inputs, so a click lands in them and the caret,
+        // selection and IME state survive between frames. The remaining prompts
+        // (goto line, rename, find in files) still use the painted fields.
+        findBar = FindBar.Create();
+        refList = RefList.Create();
         gotoBtn = new Button { Text = ZanIDE.T("Go", "跳转"), Class = "primary small" };
         startPage = new StartPage();
     }
