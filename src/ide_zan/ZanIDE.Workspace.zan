@@ -1242,6 +1242,38 @@ partial class ZanIDE {
         return CodeEditor.LoadSymbolIndex(ZanIDE.SymbolIndexPath(root));
     }
 
+    /// Adopts the symbol index of the project that just became the open one.
+    ///
+    /// Member completion answers from this index, and only from it for anything
+    /// outside its small built-in tables. Startup did this, but opening or
+    /// creating a project afterwards did not: the index of the *previous*
+    /// project stayed loaded (or none was), so every receiver fell through to
+    /// the four universal members and `app.` / `WebApp.` looked like completion
+    /// was dead. Loading whatever is on disk is instant; the refresh behind it
+    /// lands through the main loop's index poll.
+    void AdoptSymbolIndex() {
+        CodeEditor.ClearSymbolIndex();
+        symbolIdxStamp = 0;
+        if (!haveProject) { return; }
+        string idxP = ZanIDE.SymbolIndexPath(root);
+        if (ZanIDE.LoadSymbolIndexFor(root) && File.Exists(idxP)) {
+            symbolIdxStamp = FileInfo.GetLastWriteTime(idxP);
+        }
+        this.RefreshSymbolIndex(true);
+    }
+
+    /// Regenerates the index in the background. The compiler writes it from the
+    /// code as it was when it ran, so a type reached through a `using` added
+    /// since is invisible to completion until it runs again -- saving is that
+    /// moment, throttled so a burst of saves is a single run.
+    void RefreshSymbolIndex(bool force) {
+        if (!haveProject) { return; }
+        int now = Window.GetTickMs();
+        if (!force && symbolEmitMs != 0 && now - symbolEmitMs < 15000) { return; }
+        symbolEmitMs = now;
+        ZanIDE.EmitSymbolsDetach(root, ZanIDE.ProjectEntryPath(root));
+    }
+
     /// Runs `cmd` detached, teeing its output into BuildLogPath and dropping
     /// BuildDonePath on completion. The main loop polls both to stream compiler
     /// output and, once done, apply diagnostics + launch the built program.

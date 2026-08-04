@@ -116,7 +116,8 @@ class TeamBoard {
         if (!TeamBoard.Compact(app, width)) {
             h = h + TeamBoard.StepsH(app);
         }
-        h = h + AiTeam.Roles().Count * TeamBoard.RowH(app);
+        h = h + TeamBoard.RosterRows(app, width - app.Scale(12))
+            * TeamBoard.RowH(app);
         int shown = taskCount;
         if (shown > 4) { shown = 4; }
         h = h + shown * TeamBoard.RowH(app);
@@ -136,14 +137,8 @@ class TeamBoard {
         return "";
     }
 
-    /// Paints one "avatar + name tag + state tag" line, the shape every member
-    /// row and the collapsed summary share.
-    static void MemberRow(App app, int x, int y, int rightEdge, string roleId,
-            string state, string stateCls, int pct) {
-        TeamBoard.MemberRowH(app, x, y, rightEdge, roleId, state, stateCls,
-            pct, TeamBoard.RowH(app));
-    }
-
+    /// Paints one "avatar + name tag + state tag" line, the shape the collapsed
+    /// summary and the mention picker share.
     static void MemberRowH(App app, int x, int y, int rightEdge, string roleId,
             string state, string stateCls, int pct, int rowH) {
         // The whole row is a hit target: clicking a member addresses them, so
@@ -184,6 +179,85 @@ class TeamBoard {
                     pl, "primary");
             }
         }
+    }
+
+    /// The width the roster gives a member: its name chip, which is what the
+    /// wrap decision is made on. A state chip rides behind the name when there
+    /// is room for it, so the number of rows depends on the roster alone and the
+    /// strip's height cannot change under a member as its state changes.
+    static int NameChipW(App app, string roleId) {
+        return Tag.Width(app, AiTeam.DisplayName(roleId),
+            AiTeam.RoleTagClass(roleId));
+    }
+
+    /// How many rows the roster needs to flow every member across `innerW`.
+    /// Mirrors the layout in Roster() exactly, so the reserved height is the
+    /// height actually painted.
+    static int RosterRows(App app, int innerW) {
+        List<AiRole> rs = AiTeam.Roles();
+        int gap = app.Scale(6);
+        int rows = 1;
+        int cx = 0;
+        for (int i = 0; i < rs.Count; i = i + 1) {
+            int w = TeamBoard.NameChipW(app, rs[i].id);
+            if (cx > 0 && cx + w > innerW) {
+                rows = rows + 1;
+                cx = 0;
+            }
+            cx = cx + w + gap;
+        }
+        return rows;
+    }
+
+    /// The roster, flowed left to right and wrapped: six members side by side
+    /// instead of six stacked rows, because the assistant panel is short and the
+    /// transcript is what the height is wanted for. Each chip is still the whole
+    /// hit target, so clicking a member addresses them. Returns the y below the
+    /// last row.
+    static int Roster(App app, int x, int y, int right, AiTeamState st,
+            bool busy) {
+        int rowH = TeamBoard.RowH(app);
+        int gap = app.Scale(6);
+        List<AiRole> rs = AiTeam.Roles();
+        int cx = x;
+        int cy = y;
+        for (int i = 0; i < rs.Count; i = i + 1) {
+            string id = rs[i].id;
+            string cls = AiTeam.RoleTagClass(id);
+            string name = AiTeam.DisplayName(id);
+            int w = TeamBoard.NameChipW(app, id);
+            if (cx > x && cx + w > right) {
+                cx = x;
+                cy = cy + rowH;
+            }
+            string state = "";
+            string scls = "";
+            if (id == st.activeAgent) {
+                state = TeamBoard.StatusOf(st, busy);
+                scls = TeamBoard.StatusClass(st, busy);
+            } else if (st.awaitingUser && id == st.askedBy) {
+                state = ZanIDE.T("asked you", "等你确认");
+                scls = "warning";
+            }
+            int hid = app.focus.AllocId();
+            app.hitTester.Register(HitRegion.Create(hid, cx, cy, w, rowH, 1));
+            if (Ui.Clicked(app, hid)) {
+                TeamBoard.clicked = id;
+                app.RequestRedraw();
+            }
+            Tag.Chip(app, cx, TeamBoard.ChipY(app, cy, rowH, cls), name, cls);
+            cx = cx + w;
+            if (state != "") {
+                int sw2 = Tag.Width(app, state, scls);
+                if (cx + app.Scale(3) + sw2 <= right) {
+                    Tag.Chip(app, cx + app.Scale(3),
+                        TeamBoard.ChipY(app, cy, rowH, scls), state, scls);
+                    cx = cx + app.Scale(3) + sw2;
+                }
+            }
+            cx = cx + gap;
+        }
+        return cy + rowH;
     }
 
     /// The @-mention picker, floated just above the composer. Returns the id
@@ -294,21 +368,7 @@ class TeamBoard {
             y = y + TeamBoard.StepsH(app);
         }
 
-        List<AiRole> rs = AiTeam.Roles();
-        for (int i = 0; i < rs.Count; i = i + 1) {
-            string state = "";
-            string scls = "";
-            if (rs[i].id == st.activeAgent) {
-                state = TeamBoard.StatusOf(st, busy);
-                scls = TeamBoard.StatusClass(st, busy);
-            } else if (st.awaitingUser && rs[i].id == st.askedBy) {
-                state = ZanIDE.T("asked you", "等你确认");
-                scls = "warning";
-            }
-            TeamBoard.MemberRow(app, x, y, right, rs[i].id, state, scls,
-                0 - 1);
-            y = y + rowH;
-        }
+        y = TeamBoard.Roster(app, x, y, right, st, busy);
 
         // The board: the four most recent tasks, newest first, each with the
         // owner's tag and a real Progress bar.
