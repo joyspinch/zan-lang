@@ -286,6 +286,20 @@ static int expr_index_of_owned_temp(zan_irgen_t *g, zan_ast_node_t *e,
 static int expr_member_of_owned_temp(zan_irgen_t *g, zan_ast_node_t *e,
                                      local_scope_t *locals);
 
+/* An expression that materializes a delegate value on the spot: a lambda, or
+ * an instance method group (`obj.M` not called). Both may allocate a closure
+ * record, so the value is freshly owned. */
+static int expr_yields_delegate_value(zan_irgen_t *g, zan_ast_node_t *e,
+                                      local_scope_t *locals) {
+    if (!e) return 0;
+    if (e->kind == AST_LAMBDA) return 1;
+    if (e->kind != AST_MEMBER_ACCESS) return 0;
+    zan_symbol_t *cls = expr_class_sym(g, e->member.object, locals);
+    zan_symbol_t *ms = cls ? get_method_sym(cls, e->member.name) : NULL;
+    return ms && ms->decl && ms->decl->kind == AST_METHOD_DECL &&
+           (ms->decl->method_decl.modifiers & MOD_STATIC) == 0;
+}
+
 static int expr_yields_owned_rc_value(zan_irgen_t *g, zan_ast_node_t *e,
                                       local_scope_t *locals) {
     if (!e) return 0;
@@ -305,6 +319,11 @@ static int expr_yields_owned_rc_value(zan_irgen_t *g, zan_ast_node_t *e,
         return 1;
     if (e->kind == AST_NEW_EXPR || e->kind == AST_CALL ||
         e->kind == AST_QUERY_EXPR) return 1;
+    /* A capturing lambda, and an instance method group used as a value, each
+     * allocate a fresh closure record (+1): whoever receives it owns that
+     * count and must not retain again. Non-capturing lambdas and static
+     * method groups are bare function pointers, where retain is a no-op. */
+    if (expr_yields_delegate_value(g, e, locals)) return 1;
     /* A conditional is owned when either branch yields an owned value. The IR
      * emitter retains the borrowed branch in that mixed-ownership case so the
      * PHI has one consistent (+1) contract regardless of the path taken. */
@@ -409,6 +428,14 @@ static void emit_release_owned_call_temp(zan_irgen_t *g, zan_ast_node_t *arg,
     if (!arg || !locals || !val) return;
     if (LLVMGetTypeKind(LLVMTypeOf(val)) != LLVMPointerTypeKind) return;
     if (expr_is_local_ident(arg, locals)) return;
+    /* A delegate argument written in place -- `Apply((a) => a * k, 5)`,
+     * `Sub(s.OnE)` -- is a temporary the call site owns. Its static type is
+     * only known from the parameter, so release it by shape: the closure
+     * release tests the tag and ignores a bare function pointer. */
+    if (expr_yields_delegate_value(g, arg, locals)) {
+        emit_closure_release(g, val);
+        return;
+    }
     zan_type_t *t = infer_expr_type(g, arg, locals);
     if (!t || !is_rc_managed_type(t)) return;
     if (!expr_yields_owned_rc_value(g, arg, locals)) return;
@@ -458,8 +485,8 @@ static LLVMValueRef emit_delegate_call(zan_irgen_t *g,
     }
     const char *name =
         LLVMGetTypeKind(ret) == LLVMVoidTypeKind ? "" : "dlgcall";
-    LLVMValueRef result = zan_call2(
-        g->builder, fn_type, fn_ptr, call_args, (unsigned)argc, name);
+    LLVMValueRef result = emit_delegate_invoke(
+        g, fn_ptr, fn_type, ret, call_args, argc, name);
     for (int k = 0; k < argc; k++) {
         emit_release_owned_call_temp(
             g, call->call.args.items[k], call_args[k], locals);

@@ -433,7 +433,7 @@ HTTP 解析、编码转换、路径处理这类纯逻辑，上移到 Zan。
 | **4** | **A2-3 / A2-4**（变参、signext/callconv）→ **B5-5 / B5-6**（X11 / SDL / Cocoa） | A2 只剩这两项，是 B5 后端的入口 |
 | **5** | **A3** bindgen + **A6** 编译器 API → **B6** 工具链 Zan 化 | 仍在 C 的约 230KB（LSP/DAP/json/rpc）的出口 |
 | **6** | **A32-4** await 同步完成 fast path → **A32-5** LLVM 真 EH（单独里程碑，最高风险） | A8 补偿层的终局替代 |
-| **7** | **B3-2 剩余**（`ZanIDE.Main` 3745 行等）、**B1-2 / C9**（Game 文档）、**B5-2 剩余**（macOS WebView 桩）、**B7-2 收尾**、**A4-2 剩余**（detach 钩子）、**C2 剩余**（四份文档）、**A15-5**（switch 重写）、**A34-2 / A34-3**（库消费侧）、**A33-2 / A33-3**（委托带 receiver） | 收尾与能力落地后的配套 |
+| **7** | **B3-2 剩余**（`ZanIDE.Main` 3745 行等）、**B1-2 / C9**（Game 文档）、**B5-2 剩余**（macOS WebView 桩）、**B7-2 收尾**、**A4-2 剩余**（detach 钩子）、**C2 剩余**（四份文档）、**A15-5**（switch 重写）、**A34-2 / A34-3**（库消费侧）、**A33-2b / A33-3**（捕获按引用、GUI 事件绑定） | 收尾与能力落地后的配套 |
 | **8** | **A32-6** macOS 实机 + 签名公证发布门（外部阻塞：无 Mac / 凭据） | 发布验收 |
 
 **节奏**：每补完一项能力，立刻用它改掉对应的那批 stdlib，拿真实场景验收，
@@ -772,17 +772,53 @@ leakcheck 子集全部通过；生成 IR 不含 `setjmp`/`longjmp`/`__zan_eh_tmp
    四个探针（`_scratch/a33*.zan`）从静默崩溃变为编译错误。
    测试：`tests/diag/lambda_capture_this.zan` / `lambda_capture_local.zan` /
    `instance_method_group.zan` / `instance_method_ident.zan`（`diag_a33_*`），`ctest -R diag_` 19/19。
-2. [ ] **A33-2 委托带 receiver/env（能力项）**：委托值改成「裸函数指针 或 闭包记录」两态，
-   闭包记录持 `fn + env`，调用点按低位标记分派；实例方法组的 env 就是 receiver，
-   捕获 lambda 的 env 是按值捕获的记录（引用类型按 ARC retain）。
-   需要一并处理：委托指针传入 C runtime 的路径（排序比较器等）、`Dispatcher.Post`、
-   async 委托、以及闭包记录本身的释放。
-3. [ ] **A33-3 GUI 事件绑定改成实例方法/闭包（依赖 A33-2）**：`lv.OnSelect(this.Open)`
+2. [x] **A33-2 委托带 receiver/env（能力项，2026-08-04 已实现）**：见下「A33-2 详情」。
+3. [ ] **A33-2b 被写入的捕获局部按引用捕获**：目前捕获是按值拷贝，C# 是按引用；
+   把在 lambda 里被赋值的捕获局部提升成堆上 display 类，外层与闭包共享同一份存储。
+4. [ ] **A33-3 GUI 事件绑定改成实例方法/闭包（依赖 A33-2）**：`lv.OnSelect(this.Open)`
    取代目前的静态 handler + 轮询取值。
 
-**当前替代形状（已与用户说明，A33-2 之前有效）**：数据取值用不捕获 lambda
-（`new ListColumn<T>("Name", i => i.name)` 已实测可用），事件绑定用静态方法或
-把行做成自带状态的 Control 子类（虚方法分派不受此缺陷影响）。
+### A33-2 详情（已完成 2026-08-04，同时关掉 A43-A5 / A43-A6）
+
+委托值现在是一个指针的两种形态，靠**最低位**区分（`irgen_arc.c` 顶部有完整说明）：
+
+- 偶数 —— 裸函数指针：静态方法、不捕获 lambda。仍可直接交给 C 回调，零开销。
+- 奇数 —— 指向堆上闭包记录的带标记指针，记录形状
+  `{ ptr fn, ptr dtor, ptr target, <按值捕获的值...>, [ptr this] }`，用对象分配器分配
+  （自带 rc 头），调用形式 `fn(record, args...)`。`target` 是实例方法组绑定的接收者，
+  lambda 为 null。
+
+落点：
+
+1. `irgen_arc.c`：`emit_closure_retain/release`（先测标记位，裸指针是 no-op；
+   归零时调记录里的 dtor）、`emit_delegate_invoke`（调用点按标记位分派，两条路 phi 汇合）、
+   `emit_delegate_equals`（C# 的「同函数 + 同 target」语义）、`is_rc_managed_type` 纳入
+   `TYPE_DELEGATE`，类析构释放委托字段。
+2. `irgen_expr.c`：捕获式 lambda 生成闭包记录与 `__zan_clo_dtor_*`（捕获值按 ARC retain，
+   `this` 也是一个捕获槽）；实例方法组 `obj.M` / 裸 `M` 绑定 receiver，走
+   **每方法唯一**的 thunk `__zan_mg_<fn>`（同一方法在不同点取值必须得到同一函数指针，
+   否则 `E -= obj.M` 找不到当初订阅的那个）；`==`/`!=` 走 `emit_delegate_equals`;
+   运算符重载调用点释放临时委托实参（`E += obj.M` 的记录由处理器列表接管）。
+3. `irgen.c`：`reserve_closure_site` 给每个闭包一个独立的泄漏站点，报告不再把
+   所有闭包挤到同一个源位置上。
+4. `parser.c`：事件降级出的 `__Event_D` 增加 `static void op_call(self, ...)`，于是
+   `E(v)` 就是 C# 的触发写法（无订阅者时是空操作，即手写的 `E?.Invoke(...)`）。
+
+实测（`_scratch/clo1..clo5.zan`、`ev1/ev2.zan`，均 `--check-leaks` 无泄漏）：捕获局部、
+捕获字符串、捕获 `this`（`c.Adder()` 返回的闭包读 `Base`）、不捕获 lambda 仍是裸指针、
+委托字段赋值/改写、把 lambda 当实参传、`E += 实例方法/静态方法/捕获 lambda`、`E(v)` 触发、
+`E -= 实例方法/静态方法` 正确摘除。
+
+正式测试：`tests/conformance/delegate_closures.zan`、`event_receiver_handlers.zan`（+`.out`）。
+`diag_a33_*` 四个诊断测试与 `tests/diag/lambda_capture_{this,local}.zan`、
+`instance_method_{group,ident}.zan` 一并删除——它们断言的正是现在已经支持的写法。
+回归 `ctest -R 'delegate|event|lambda|closure|leakcheck' -E 'zgm|gui|webview|selfhost'`：
+相关项（conformance/determinism/leakcheck 三档）全通过；其余失败仍是工作区未提交的
+stdlib 改动导致的 `'DbParams' has no member 'Create'` 这类编译错误，与本次无关。
+
+仍缺（登记为 A33-2b）：捕获是**按值**的，C# 是按引用——lambda 里改写被捕获的局部
+（`int n = 0; () => { n = n + 1; }`）改不到外层变量。需要把被写入的捕获局部提升成堆上
+display 类。
 
 ---
 
@@ -869,8 +905,8 @@ leakcheck 子集全部通过；生成 IR 不含 `setjmp`/`longjmp`/`__zan_eh_tmp
 | A43-A3 | 接口默认方法（`interface I { int G() { return 42; } }`）经接口变量调用一律返回 0；经类变量调用报 `'C' has no member 'G'` | 44,51,52,80,100–102 | ✅ 已修（见下 A43-A3 详情） |
 | A43-A4 | `int? v = a?.x;` 运行时崩溃（0xC0000005）；此前是 `PHI node operands are not the same type` | 21,43,110–145 | ✅ 已修（见下 A43-A4 详情） |
 | A43-A11 | `Nullable<T>`：值类型可空缺少真实表示（值 + has-value），`int?` 一度只能报错拒绝 | 130,144 | ✅ 已修（见下 A43-A11 详情） |
-| A43-A5 | `event H E;` + `a.E += P.OnE; a.Fire();` 编译通过、静默不触发（输出只有 `end`） | 28 | ⬜ 待修（A33-2 一并） |
-| A43-A6 | 捕获式 lambda：`(a) => a + k` 报 `use of undeclared identifier 'k'`；捕获字段时诊断还指向 `stdlib/System/Security/Cryptography/Md5.zan`（位置也错） | 22 | ⬜ 待修（A33-2） |
+| A43-A5 | `event H E;` + `a.E += P.OnE; a.Fire();` 编译通过、静默不触发（输出只有 `end`） | 28 | ✅ 已修（见下 A33-2 详情） |
+| A43-A6 | 捕获式 lambda：`(a) => a + k` 报 `use of undeclared identifier 'k'`；捕获字段时诊断还指向 `stdlib/System/Security/Cryptography/Md5.zan`（位置也错） | 22 | ✅ 已修（见下 A33-2 详情） |
 | A43-A7 | 泛型类里的实例泛型方法 `Pool<T>.M<U>()` 运行崩溃（0xC0000005） | 13 | ✅ 已修（A32-3a，见下 A43-A7 详情） |
 | A43-A8 | async 泛型方法返回垃圾值（打印 `-1886711216`） | 56 | ✅ 已修（A32-3b，见下 A43-A8 详情） |
 | A43-A9 | `static A()` 只在首次 `new` 时执行：先读 `A.n` 得 0，`new A()` 后才是 7（C# 首次访问静态成员即触发） | 08,40,95–99 | ✅ 已修（见下 A43-A9 详情） |

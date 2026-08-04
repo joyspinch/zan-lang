@@ -65,10 +65,191 @@ static void emit_string_release(zan_irgen_t *g, LLVMValueRef v) {
         g->rt_str_release, &v, 1, "");
 }
 
+/* ---- delegate closures (A33-2) -------------------------------------------
+ * A delegate value is one pointer with two shapes, told apart by bit 0:
+ *   even -- a bare function pointer: a static method or a non-capturing
+ *           lambda, so it can still be handed to C as a plain callback;
+ *   odd  -- a tagged pointer to a heap closure record
+ *           { ptr fn, ptr dtor, ptr target, <captured values> }, allocated with
+ *           the object allocator (so it carries an rc header) and invoked as
+ *           fn(record, args...). `target` is the bound receiver of an instance
+ *           method group and null for a lambda; it gives `==` (and therefore
+ *           `event -= obj.Handler`) C#'s target+method identity.
+ * Retain/release therefore test the tag at run time: on a bare function
+ * pointer both are no-ops, on a closure they drive the record's refcount and,
+ * at zero, its dtor (which releases the captured rc values). */
+#define ZAN_CLOSURE_TAG 1
+
+static LLVMValueRef emit_closure_is_tagged(zan_irgen_t *g, LLVMValueRef v) {
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+    LLVMValueRef iv = LLVMBuildPtrToInt(g->builder, v, i64, "clo.iv");
+    LLVMValueRef bit = zan_and(g->builder, iv,
+        LLVMConstInt(i64, ZAN_CLOSURE_TAG, 0), "clo.bit");
+    return zan_icmp(g->builder, LLVMIntNE, bit, LLVMConstInt(i64, 0, 0), "clo.is");
+}
+
+static LLVMValueRef emit_closure_untag(zan_irgen_t *g, LLVMValueRef v) {
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMValueRef iv = LLVMBuildPtrToInt(g->builder, v, i64, "clo.iv");
+    LLVMValueRef cl = zan_and(g->builder, iv,
+        LLVMConstInt(i64, ~(uint64_t)ZAN_CLOSURE_TAG, 0), "clo.clr");
+    return LLVMBuildIntToPtr(g->builder, cl, i8ptr, "clo.rec");
+}
+
+/* { ptr fn, ptr dtor, ptr target }: the prefix every closure record starts
+ * with; captured values follow it. */
+#define ZAN_CLOSURE_HDR_FIELDS 3
+static LLVMTypeRef closure_header_type(zan_irgen_t *g) {
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMTypeRef fields[ZAN_CLOSURE_HDR_FIELDS] = { i8ptr, i8ptr, i8ptr };
+    return LLVMStructTypeInContext(g->ctx, fields, ZAN_CLOSURE_HDR_FIELDS, 0);
+}
+
+/* Delegate equality, as C# defines it: the same function and the same bound
+ * receiver. Bare function pointers compare directly; two closure records are
+ * equal when they wrap the same method-group target. Separately created
+ * capturing lambdas have a null target and so stay distinct, matching C#. */
+static LLVMValueRef emit_delegate_equals(zan_irgen_t *g, LLVMValueRef a,
+                                         LLVMValueRef b) {
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+    LLVMTypeRef i1 = LLVMInt1TypeInContext(g->ctx);
+    LLVMValueRef ai = LLVMBuildPtrToInt(g->builder, a, i64, "deq.ai");
+    LLVMValueRef bi = LLVMBuildPtrToInt(g->builder, b, i64, "deq.bi");
+    LLVMValueRef same = zan_icmp(g->builder, LLVMIntEQ, ai, bi, "deq.same");
+    LLVMValueRef both = LLVMBuildAnd(g->builder,
+        emit_closure_is_tagged(g, a), emit_closure_is_tagged(g, b), "deq.both");
+    LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder));
+    LLVMBasicBlockRef cmp_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "deq.cmp");
+    LLVMBasicBlockRef end_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "deq.end");
+    LLVMValueRef go = LLVMBuildAnd(g->builder, both,
+        LLVMBuildNot(g->builder, same, "deq.nsame"), "deq.go");
+    LLVMBasicBlockRef entry_bb = LLVMGetInsertBlock(g->builder);
+    LLVMBuildCondBr(g->builder, go, cmp_bb, end_bb);
+
+    LLVMPositionBuilderAtEnd(g->builder, cmp_bb);
+    LLVMTypeRef hdr = closure_header_type(g);
+    LLVMValueRef ra = emit_closure_untag(g, a), rb = emit_closure_untag(g, b);
+    LLVMValueRef fa = LLVMBuildLoad2(g->builder, i8ptr,
+        LLVMBuildStructGEP2(g->builder, hdr, ra, 0, "deq.fap"), "deq.fa");
+    LLVMValueRef fb = LLVMBuildLoad2(g->builder, i8ptr,
+        LLVMBuildStructGEP2(g->builder, hdr, rb, 0, "deq.fbp"), "deq.fb");
+    LLVMValueRef ta = LLVMBuildLoad2(g->builder, i8ptr,
+        LLVMBuildStructGEP2(g->builder, hdr, ra, 2, "deq.tap"), "deq.ta");
+    LLVMValueRef tb = LLVMBuildLoad2(g->builder, i8ptr,
+        LLVMBuildStructGEP2(g->builder, hdr, rb, 2, "deq.tbp"), "deq.tb");
+    LLVMValueRef tai = LLVMBuildPtrToInt(g->builder, ta, i64, "deq.tai");
+    LLVMValueRef eq = LLVMBuildAnd(g->builder,
+        zan_icmp(g->builder, LLVMIntEQ,
+                 LLVMBuildPtrToInt(g->builder, fa, i64, "deq.fai"),
+                 LLVMBuildPtrToInt(g->builder, fb, i64, "deq.fbi"), "deq.feq"),
+        LLVMBuildAnd(g->builder,
+            zan_icmp(g->builder, LLVMIntEQ, tai,
+                     LLVMBuildPtrToInt(g->builder, tb, i64, "deq.tbi"), "deq.teq"),
+            zan_icmp(g->builder, LLVMIntNE, tai, LLVMConstInt(i64, 0, 0),
+                     "deq.tnn"), "deq.tok"), "deq.eq");
+    LLVMBuildBr(g->builder, end_bb);
+    LLVMBasicBlockRef cmp_end = LLVMGetInsertBlock(g->builder);
+
+    LLVMPositionBuilderAtEnd(g->builder, end_bb);
+    LLVMValueRef phi = LLVMBuildPhi(g->builder, i1, "deq");
+    LLVMValueRef vals[2] = { same, eq };
+    LLVMBasicBlockRef blks[2] = { entry_bb, cmp_end };
+    LLVMAddIncoming(phi, vals, blks, 2);
+    return phi;
+}
+
+static void emit_closure_retain(zan_irgen_t *g, LLVMValueRef v) {
+    if (g->current_fn_no_runtime) return;
+    if (!v || LLVMGetTypeKind(LLVMTypeOf(v)) != LLVMPointerTypeKind) return;
+    LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder));
+    LLVMBasicBlockRef doit = LLVMAppendBasicBlockInContext(g->ctx, fn, "clo.rt");
+    LLVMBasicBlockRef done = LLVMAppendBasicBlockInContext(g->ctx, fn, "clo.rt.end");
+    LLVMBuildCondBr(g->builder, emit_closure_is_tagged(g, v), doit, done);
+    LLVMPositionBuilderAtEnd(g->builder, doit);
+    emit_arc_retain(g, emit_closure_untag(g, v));
+    LLVMBuildBr(g->builder, done);
+    LLVMPositionBuilderAtEnd(g->builder, done);
+}
+
+static void emit_closure_release(zan_irgen_t *g, LLVMValueRef v) {
+    if (g->current_fn_no_runtime) return;
+    if (!v || LLVMGetTypeKind(LLVMTypeOf(v)) != LLVMPointerTypeKind) return;
+    LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder));
+    LLVMBasicBlockRef doit = LLVMAppendBasicBlockInContext(g->ctx, fn, "clo.rl");
+    LLVMBasicBlockRef done = LLVMAppendBasicBlockInContext(g->ctx, fn, "clo.rl.end");
+    LLVMBuildCondBr(g->builder, emit_closure_is_tagged(g, v), doit, done);
+    LLVMPositionBuilderAtEnd(g->builder, doit);
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMValueRef rec = emit_closure_untag(g, v);
+    LLVMTypeRef hdr = closure_header_type(g);
+    LLVMValueRef dp = LLVMBuildStructGEP2(g->builder, hdr, rec, 1, "clo.dtorp");
+    LLVMValueRef dtor = LLVMBuildLoad2(g->builder, i8ptr, dp, "clo.dtor");
+    zan_call2(g->builder,
+        LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), &i8ptr, 1, 0),
+        dtor, &rec, 1, "");
+    LLVMBuildBr(g->builder, done);
+    LLVMPositionBuilderAtEnd(g->builder, done);
+}
+
+/* Invoke a delegate value: a bare function pointer is called directly, a
+ * closure through the record's function with the record as leading argument.
+ * Both shapes are possible in the same value, so the tag test is emitted at
+ * every call site. */
+static LLVMValueRef emit_delegate_invoke(zan_irgen_t *g, LLVMValueRef dv,
+                                         LLVMTypeRef fn_type, LLVMTypeRef ret,
+                                         LLVMValueRef *args, int argc,
+                                         const char *name) {
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    bool is_void = LLVMGetTypeKind(ret) == LLVMVoidTypeKind;
+    LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder));
+    LLVMBasicBlockRef clo_bb  = LLVMAppendBasicBlockInContext(g->ctx, fn, "dlg.clo");
+    LLVMBasicBlockRef bare_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "dlg.bare");
+    LLVMBasicBlockRef join_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "dlg.join");
+    LLVMBuildCondBr(g->builder, emit_closure_is_tagged(g, dv), clo_bb, bare_bb);
+
+    LLVMPositionBuilderAtEnd(g->builder, clo_bb);
+    LLVMValueRef rec = emit_closure_untag(g, dv);
+    LLVMValueRef cfnp = LLVMBuildStructGEP2(g->builder, closure_header_type(g),
+                                            rec, 0, "dlg.fnp");
+    LLVMValueRef cfn = LLVMBuildLoad2(g->builder, i8ptr, cfnp, "dlg.fn");
+    unsigned nparams = LLVMCountParamTypes(fn_type);
+    LLVMTypeRef *ptypes = (LLVMTypeRef *)calloc((size_t)nparams + 1, sizeof(LLVMTypeRef));
+    ptypes[0] = i8ptr;
+    if (nparams) LLVMGetParamTypes(fn_type, ptypes + 1);
+    LLVMTypeRef clo_fn_type = LLVMFunctionType(ret, ptypes, nparams + 1, 0);
+    free(ptypes);
+    LLVMValueRef *cargs = (LLVMValueRef *)calloc((size_t)argc + 1, sizeof(LLVMValueRef));
+    cargs[0] = rec;
+    for (int i = 0; i < argc; i++) cargs[i + 1] = args[i];
+    LLVMValueRef rclo = zan_call2(g->builder, clo_fn_type, cfn, cargs,
+                                  (unsigned)argc + 1, is_void ? "" : "dlg.rc");
+    free(cargs);
+    LLVMBasicBlockRef clo_end = LLVMGetInsertBlock(g->builder);
+    LLVMBuildBr(g->builder, join_bb);
+
+    LLVMPositionBuilderAtEnd(g->builder, bare_bb);
+    LLVMValueRef rbare = zan_call2(g->builder, fn_type, dv, args,
+                                   (unsigned)argc, is_void ? "" : "dlg.rb");
+    LLVMBasicBlockRef bare_end = LLVMGetInsertBlock(g->builder);
+    LLVMBuildBr(g->builder, join_bb);
+
+    LLVMPositionBuilderAtEnd(g->builder, join_bb);
+    if (is_void) return NULL;
+    LLVMValueRef phi = LLVMBuildPhi(g->builder, ret, name && *name ? name : "dlg.r");
+    LLVMValueRef vals[2] = { rclo, rbare };
+    LLVMBasicBlockRef blks[2] = { clo_end, bare_end };
+    LLVMAddIncoming(phi, vals, blks, 2);
+    return phi;
+}
+
 static void emit_rc_retain_for_type(zan_irgen_t *g, zan_type_t *type, LLVMValueRef v) {
     if (!type) return;
     if (type->kind == TYPE_STRING) {
         emit_string_retain(g, v);
+    } else if (type->kind == TYPE_DELEGATE) {
+        emit_closure_retain(g, v);
     } else if (is_arc_managed_type(type)) {
         emit_arc_retain(g, v);
     }
@@ -78,6 +259,8 @@ static void emit_rc_release_for_type(zan_irgen_t *g, zan_type_t *type, LLVMValue
     if (!type) return;
     if (type->kind == TYPE_STRING) {
         emit_string_release(g, v);
+    } else if (type->kind == TYPE_DELEGATE) {
+        emit_closure_release(g, v);
     } else if (is_arc_managed_type(type)) {
         emit_arc_release_typed(g, type, v);
     }
@@ -486,6 +669,15 @@ static void build_class_release_body(zan_irgen_t *g, zan_symbol_t *sym,
             LLVMValueRef fp = LLVMBuildStructGEP2(b, structT, self, (unsigned)idx, "fp");
             LLVMValueRef s = LLVMBuildLoad2(b, i8ptr, fp, "fs");
             emit_string_release(g, s);
+        } else if (ft->kind == TYPE_DELEGATE) {
+            /* A delegate field may hold a closure record (captured values or
+             * a bound receiver); on a bare function pointer the release is a
+             * no-op. The tag test splits the block, which the remaining field
+             * releases tolerate: `self` dominates every successor. */
+            LLVMValueRef fp = LLVMBuildStructGEP2(g->builder, structT, self,
+                                                  (unsigned)idx, "fp");
+            LLVMValueRef dv = LLVMBuildLoad2(g->builder, i8ptr, fp, "fd");
+            emit_closure_release(g, dv);
         } else if (is_arc_managed_type(ft)) {
             /* User class instances and the refcounted collections List/
              * StringBuilder: release via the recorded site destructor (which

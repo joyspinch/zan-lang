@@ -23,6 +23,11 @@
  *   int   Crc32(nint p, int len)              hardware-independent CRC32 (IEEE)
  */
 
+/* Binds a receiver to an instance method group (defined with the closure
+ * machinery further down); used by the two method-group value sites above it. */
+static LLVMValueRef emit_method_group_closure(zan_irgen_t *g, zan_symbol_t *msym,
+                                              LLVMValueRef recv, zan_loc_t loc);
+
 /* i8* pointer to (base + off); base/off are i64 values. */
 static LLVMValueRef nm_addr(zan_irgen_t *g, LLVMValueRef base, LLVMValueRef off) {
     LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
@@ -405,19 +410,26 @@ static LLVMValueRef emit_expr_identifier(zan_irgen_t *g, zan_ast_node_t *expr,
                     LLVMBuildLoad2(g->builder, ft, gv, "sfld"), fsym->type);
             }
         }
-        /* method reference as delegate value: MethodName used as a value
-         * (not called) → return the function pointer. Only static methods are
-         * usable this way: an instance method needs a receiver, which the
-         * delegate representation cannot carry yet (A33), so invoking it would
-         * crash. Reject instead of emitting the pointer. */
+        /* method reference as delegate value: MethodName used as a value (not
+         * called). A static method is the bare function pointer; an instance
+         * method binds the current receiver into a closure (A33-2). */
         if (g->current_type_sym) {
             zan_symbol_t *method_sym = get_method_sym(g->current_type_sym, expr->ident.name);
             if (method_sym) {
                 if (method_sym->decl && method_sym->decl->kind == AST_METHOD_DECL &&
                     (method_sym->decl->method_decl.modifiers & MOD_STATIC) == 0) {
+                    LLVMValueRef self = g->current_this
+                        ? LLVMBuildLoad2(g->builder,
+                              LLVMGetAllocatedType(g->current_this),
+                              g->current_this, "this")
+                        : NULL;
+                    LLVMValueRef clo = self
+                        ? emit_method_group_closure(g, method_sym, self, expr->loc)
+                        : NULL;
+                    if (clo) return clo;
                     zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
-                        "instance method '%.*s' cannot be used as a value: "
-                        "delegates cannot capture a receiver yet",
+                        "instance method '%.*s' cannot be used as a value here: "
+                        "no receiver is in scope",
                         (int)expr->ident.name.len, expr->ident.name.str);
                     return LLVMConstNull(
                         LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0));
@@ -699,8 +711,18 @@ static LLVMValueRef emit_expr_binary(zan_irgen_t *g, zan_ast_node_t *expr,
                             if (g->functions[fi].sym == op_sym) {
                                 LLVMValueRef args[] = { left, right };
                                 const char *cn = (LLVMGetTypeKind(LLVMGetReturnType(g->functions[fi].fn_type)) == LLVMVoidTypeKind) ? "" : "opcall";
-                                return zan_call2(g->builder, g->functions[fi].fn_type,
+                                LLVMValueRef opres = zan_call2(g->builder,
+                                    g->functions[fi].fn_type,
                                     g->functions[fi].fn, args, 2, cn);
+                                /* A delegate written in place -- `E += obj.OnX`,
+                                 * `E += (v) => ...` -- is a closure this call
+                                 * site owns; op_add stores its own reference
+                                 * (the handler list retains), so drop ours.
+                                 * Other operand shapes keep their existing
+                                 * ownership contract. */
+                                if (expr_yields_delegate_value(g, expr->binary.right, locals))
+                                    emit_closure_release(g, right);
+                                return opres;
                             }
                         }
                     }
@@ -749,6 +771,19 @@ static LLVMValueRef emit_expr_binary(zan_irgen_t *g, zan_ast_node_t *expr,
         bool both_ptr =
             LLVMGetTypeKind(LLVMTypeOf(left)) == LLVMPointerTypeKind &&
             LLVMGetTypeKind(LLVMTypeOf(right)) == LLVMPointerTypeKind;
+
+        /* Two delegates compare by function + bound target, as in C#, so
+         * `event -= obj.Handler` finds the handler it subscribed. */
+        if ((expr->binary.op == TK_EQ_EQ || expr->binary.op == TK_BANG_EQ) &&
+            both_ptr) {
+            zan_type_t *lt = infer_expr_type(g, expr->binary.left, locals);
+            zan_type_t *rt = infer_expr_type(g, expr->binary.right, locals);
+            if (lt && rt && lt->kind == TYPE_DELEGATE && rt->kind == TYPE_DELEGATE) {
+                LLVMValueRef eq = emit_delegate_equals(g, left, right);
+                return expr->binary.op == TK_BANG_EQ
+                    ? LLVMBuildNot(g->builder, eq, "dneq") : eq;
+            }
+        }
         bool str_operand = is_string_expr(g, expr->binary.left, locals) ||
                            is_string_expr(g, expr->binary.right, locals);
 
@@ -2869,20 +2904,22 @@ static LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr
                 }
             }
         }
-        /* instance method group used as a value — `Act a = this.Touch;` or
-         * `Act a = obj.Touch;`. The delegate representation has no receiver
-         * slot, so invoking it would call the method with a garbage/absent
-         * `this` and crash (A33). Static method groups were handled above.
-         * Reject instead of silently lowering to 0. */
+        /* instance method group used as a value -- `Act a = this.Touch;` or
+         * `Act a = obj.Touch;`: the receiver is bound into a closure record
+         * (A33-2). Static method groups were handled above. */
         {
             zan_symbol_t *cls = expr_class_sym(g, expr->member.object, locals);
             if (cls) {
                 zan_symbol_t *ms = get_method_sym(cls, expr->member.name);
                 if (ms && ms->decl && ms->decl->kind == AST_METHOD_DECL &&
                     (ms->decl->method_decl.modifiers & MOD_STATIC) == 0) {
+                    LLVMValueRef recv = emit_expr(g, expr->member.object, locals);
+                    LLVMValueRef clo = recv
+                        ? emit_method_group_closure(g, ms, recv, expr->loc)
+                        : NULL;
+                    if (clo) return clo;
                     zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
-                        "instance method group '%.*s' cannot be used as a value: "
-                        "delegates cannot capture a receiver yet",
+                        "instance method group '%.*s' cannot be used as a value",
                         (int)expr->member.name.len, expr->member.name.str);
                     return LLVMConstNull(
                         LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0));
@@ -4696,9 +4733,362 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
     }
 }
 
+/* ---- lambda captures (A33-2) ---------------------------------------------
+ * A lambda that mentions an enclosing local or `this` is lowered to a closure:
+ * the mentioned values are copied into a heap record at the point the lambda
+ * value is created (by value, rc values retained) and the lambda body reads
+ * them from that record. Capture is by value, so a later write to the
+ * enclosing local is not observed by the lambda -- and, symmetrically, the
+ * lambda cannot dangle once the enclosing frame is gone. */
+#define ZAN_MAX_CAPTURES 32
+
+typedef struct {
+    zan_istr_t   name;   /* captured local's name; empty for the receiver */
+    LLVMValueRef slot;   /* the enclosing alloca, NULL for the receiver */
+    zan_type_t  *type;
+    LLVMTypeRef  llvm;
+} lambda_capture_t;
+
+typedef struct {
+    zan_irgen_t     *g;
+    local_scope_t   *outer;
+    lambda_capture_t caps[ZAN_MAX_CAPTURES];
+    int              count;
+    int              needs_this;
+    zan_istr_t       shadow[ZAN_MAX_CAPTURES * 4];
+    int              shadow_count;
+    int              overflow;
+} capture_scan_t;
+
+static int istr_eq_c(zan_istr_t a, zan_istr_t b) {
+    return a.len == b.len && a.len > 0 &&
+           memcmp(a.str, b.str, (size_t)a.len) == 0;
+}
+
+static void cap_shadow(capture_scan_t *cs, zan_istr_t name) {
+    if (!name.len) return;
+    for (int i = 0; i < cs->shadow_count; i++)
+        if (istr_eq_c(cs->shadow[i], name)) return;
+    if (cs->shadow_count >= (int)(sizeof(cs->shadow) / sizeof(cs->shadow[0]))) {
+        cs->overflow = 1;
+        return;
+    }
+    cs->shadow[cs->shadow_count++] = name;
+}
+
+static int cap_is_shadowed(capture_scan_t *cs, zan_istr_t name) {
+    for (int i = 0; i < cs->shadow_count; i++)
+        if (istr_eq_c(cs->shadow[i], name)) return 1;
+    return 0;
+}
+
+/* Instance member of the enclosing type referred to by a bare name: using one
+ * inside a lambda is an implicit `this.` and therefore captures the receiver. */
+static int name_is_instance_member(zan_irgen_t *g, zan_istr_t name) {
+    zan_symbol_t *ts = g->current_type_sym;
+    if (!ts) return 0;
+    for (zan_symbol_t *s = ts; s; s = (s->type && s->type->base_type)
+                                        ? s->type->base_type->sym : NULL) {
+        for (int i = 0; i < s->member_count; i++) {
+            zan_symbol_t *m = s->members[i];
+            if (!m || !istr_eq_c(m->name, name)) continue;
+            if (m->kind != SYM_FIELD && m->kind != SYM_PROPERTY &&
+                m->kind != SYM_METHOD) continue;
+            return (m->modifiers & MOD_STATIC) ? 0 : 1;
+        }
+    }
+    return 0;
+}
+
+static void cap_use(capture_scan_t *cs, zan_istr_t name) {
+    if (!name.len || cap_is_shadowed(cs, name)) return;
+    for (int i = 0; i < cs->count; i++)
+        if (istr_eq_c(cs->caps[i].name, name)) return;
+    local_var_t *lv = cs->outer ? local_find(cs->outer, name) : NULL;
+    if (!lv) {
+        if (name_is_instance_member(cs->g, name)) cs->needs_this = 1;
+        return;
+    }
+    if (cs->count >= ZAN_MAX_CAPTURES) { cs->overflow = 1; return; }
+    lambda_capture_t *c = &cs->caps[cs->count++];
+    c->name = name;
+    c->slot = lv->alloca;
+    c->type = lv->type;
+    c->llvm = local_slot_type(cs->g, lv);
+}
+
+static void cap_scan(capture_scan_t *cs, zan_ast_node_t *n);
+
+static void cap_scan_list(capture_scan_t *cs, zan_ast_list_t *l) {
+    for (int i = 0; l && i < l->count; i++) cap_scan(cs, l->items[i]);
+}
+
+static void cap_scan(capture_scan_t *cs, zan_ast_node_t *n) {
+    if (!n) return;
+    switch (n->kind) {
+    case AST_IDENTIFIER:      cap_use(cs, n->ident.name); return;
+    case AST_THIS_EXPR:
+    case AST_BASE_EXPR:       cs->needs_this = 1; return;
+    case AST_BINARY:
+    case AST_ASSIGNMENT:      cap_scan(cs, n->binary.left);
+                              cap_scan(cs, n->binary.right); return;
+    case AST_UNARY:
+    case AST_POSTFIX_UNARY:   cap_scan(cs, n->unary.operand); return;
+    case AST_CALL:            cap_scan(cs, n->call.callee);
+                              cap_scan_list(cs, &n->call.args); return;
+    case AST_MEMBER_ACCESS:   cap_scan(cs, n->member.object); return;
+    case AST_INDEX:           cap_scan(cs, n->index.object);
+                              cap_scan(cs, n->index.index); return;
+    case AST_CONDITIONAL:     cap_scan(cs, n->conditional.cond);
+                              cap_scan(cs, n->conditional.then_expr);
+                              cap_scan(cs, n->conditional.else_expr); return;
+    case AST_NEW_EXPR:        cap_scan_list(cs, &n->new_expr.args); return;
+    case AST_CAST_EXPR:       cap_scan(cs, n->cast.expr); return;
+    case AST_IS_EXPR:
+    case AST_AS_EXPR:         cap_scan(cs, n->type_test.expr); return;
+    case AST_AWAIT_EXPR:      cap_scan(cs, n->await_expr.expr); return;
+    case AST_REF_ARG:         cap_scan(cs, n->ref_arg.expr); return;
+    case AST_STRING_INTERP:   cap_scan_list(cs, &n->string_interp.parts); return;
+    case AST_QUERY_EXPR:      cap_scan(cs, n->query.source);
+                              cap_shadow(cs, n->query.var);
+                              cap_scan_list(cs, &n->query.wheres);
+                              cap_scan(cs, n->query.select); return;
+    case AST_LAMBDA:
+        /* a nested lambda's own parameters shadow the enclosing names */
+        for (int i = 0; i < n->lambda.params.count; i++)
+            cap_shadow(cs, n->lambda.params.items[i]->param.name);
+        cap_scan(cs, n->lambda.body);
+        return;
+    case AST_BLOCK:           cap_scan_list(cs, &n->block.stmts); return;
+    case AST_VAR_DECL:        cap_scan(cs, n->var_decl.initializer);
+                              cap_shadow(cs, n->var_decl.name); return;
+    case AST_EXPR_STMT:       cap_scan(cs, n->expr_stmt.expr); return;
+    case AST_RETURN_STMT:     cap_scan(cs, n->ret.value); return;
+    case AST_IF_STMT:         cap_scan(cs, n->if_stmt.cond);
+                              cap_scan(cs, n->if_stmt.then_body);
+                              cap_scan(cs, n->if_stmt.else_body); return;
+    case AST_WHILE_STMT:
+    case AST_DO_WHILE_STMT:   cap_scan(cs, n->while_stmt.cond);
+                              cap_scan(cs, n->while_stmt.body); return;
+    case AST_FOR_STMT:        cap_scan(cs, n->for_stmt.init);
+                              cap_scan(cs, n->for_stmt.cond);
+                              cap_scan(cs, n->for_stmt.step);
+                              cap_scan(cs, n->for_stmt.body); return;
+    case AST_FOREACH_STMT:    cap_scan(cs, n->foreach_stmt.collection);
+                              cap_shadow(cs, n->foreach_stmt.var_name);
+                              cap_scan(cs, n->foreach_stmt.body); return;
+    case AST_THROW_STMT:      cap_scan(cs, n->throw_stmt.value); return;
+    case AST_TRY_STMT:        cap_scan(cs, n->try_stmt.try_body);
+                              cap_scan_list(cs, &n->try_stmt.catches);
+                              cap_scan(cs, n->try_stmt.finally_body); return;
+    case AST_CATCH_CLAUSE:    cap_shadow(cs, n->catch_clause.var_name);
+                              cap_scan(cs, n->catch_clause.body); return;
+    case AST_SWITCH_STMT:     cap_scan(cs, n->switch_stmt.expr);
+                              cap_scan_list(cs, &n->switch_stmt.cases); return;
+    case AST_SWITCH_CASE:     cap_scan(cs, n->switch_case.pattern);
+                              cap_scan(cs, n->switch_case.body); return;
+    case AST_LOCK_STMT:       cap_scan(cs, n->lock_stmt.expr);
+                              cap_scan(cs, n->lock_stmt.body); return;
+    case AST_YIELD_STMT:      cap_scan(cs, n->yield_stmt.value); return;
+    default: return;
+    }
+}
+
+/* void __zan_clo_dtor_N(i8* rec): on the release that drops the last
+ * reference, release the rc-managed captures, then hand the record to the
+ * ordinary rc decrement (which frees it). */
+static LLVMValueRef build_closure_dtor(zan_irgen_t *g, const char *lname,
+                                       LLVMTypeRef rec_ty,
+                                       lambda_capture_t *caps, int capc,
+                                       int has_this) {
+    LLVMContextRef c = g->ctx;
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(c);
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(c), 0);
+    char name[160];
+    snprintf(name, sizeof(name), "__zan_clo_dtor_%s", lname);
+    /* method-group records reuse one dtor per method (see the stable name
+     * built there); lambda names are already unique */
+    LLVMValueRef existing = LLVMGetNamedFunction(g->mod, name);
+    if (existing) return existing;
+    LLVMValueRef fn = LLVMAddFunction(g->mod,
+        name, LLVMFunctionType(LLVMVoidTypeInContext(c), &i8ptr, 1, 0));
+    LLVMSetLinkage(fn, LLVMInternalLinkage);
+
+    LLVMBuilderRef saved = g->builder;
+    LLVMBuilderRef b = LLVMCreateBuilderInContext(c);
+    g->builder = b;
+    LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(c, fn, "entry");
+    LLVMBasicBlockRef drop  = LLVMAppendBasicBlockInContext(c, fn, "drop");
+    LLVMBasicBlockRef dec   = LLVMAppendBasicBlockInContext(c, fn, "dec");
+    LLVMValueRef rec = LLVMGetParam(fn, 0);
+    LLVMPositionBuilderAtEnd(b, entry);
+    LLVMValueRef neg16 = LLVMConstInt(i64, (unsigned long long)-16, 1);
+    LLVMValueRef rcp = LLVMBuildGEP2(b, LLVMInt8TypeInContext(c), rec, &neg16, 1, "rcp");
+    LLVMValueRef rcip = LLVMBuildBitCast(b, rcp, LLVMPointerType(i64, 0), "rcip");
+    LLVMValueRef rc = LLVMBuildLoad2(b, i64, rcip, "rc");
+    LLVMBuildCondBr(b, zan_icmp(b, LLVMIntEQ, rc, LLVMConstInt(i64, 1, 0), "is1"),
+                    drop, dec);
+    LLVMPositionBuilderAtEnd(b, drop);
+    /* the bound receiver of a method group (null for a lambda; the release is
+     * null-tolerant) */
+    {
+        LLVMValueRef p = LLVMBuildStructGEP2(b, rec_ty, rec, 2, "tgp");
+        emit_arc_release_typed(g, NULL, LLVMBuildLoad2(b, i8ptr, p, "tgv"));
+    }
+    for (int i = 0; i < capc; i++) {
+        if (!is_rc_managed_type(caps[i].type)) continue;
+        LLVMValueRef p = LLVMBuildStructGEP2(g->builder, rec_ty, rec,
+            (unsigned)(ZAN_CLOSURE_HDR_FIELDS + i), "cp");
+        LLVMValueRef v = LLVMBuildLoad2(g->builder, caps[i].llvm, p, "cv");
+        emit_rc_release_for_type(g, caps[i].type, v);
+    }
+    if (has_this) {
+        LLVMValueRef p = LLVMBuildStructGEP2(g->builder, rec_ty, rec,
+            (unsigned)(ZAN_CLOSURE_HDR_FIELDS + capc), "tp");
+        LLVMValueRef v = LLVMBuildLoad2(g->builder, i8ptr, p, "tv");
+        emit_arc_release_typed(g, NULL, v);
+    }
+    LLVMBuildBr(g->builder, dec);
+    LLVMPositionBuilderAtEnd(g->builder, dec);
+    zan_call2(g->builder, LLVMFunctionType(LLVMVoidTypeInContext(c), &i8ptr, 1, 0),
+              g->rt_release, &rec, 1, "");
+    LLVMBuildRetVoid(g->builder);
+    LLVMDisposeBuilder(b);
+    g->builder = saved;
+    return fn;
+}
+
+/* Allocate and populate a closure record in the current frame and return the
+ * tagged delegate value. `caps` are read from their enclosing slots, `self`
+ * (when the record has a receiver field) is already loaded. */
+static LLVMValueRef emit_closure_record(zan_irgen_t *g, zan_loc_t loc,
+                                        const char *lname, LLVMTypeRef rec_ty,
+                                        LLVMValueRef fn_ptr, LLVMValueRef target,
+                                        lambda_capture_t *caps, int capc,
+                                        int has_this, LLVMValueRef self) {
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMValueRef dtor = build_closure_dtor(g, lname, rec_ty, caps, capc, has_this);
+    int site_idx = reserve_closure_site(g);
+    LLVMValueRef site_name = LLVMConstNull(i8ptr);
+    if (g->check_leaks) {
+        char site_buf[600];
+        snprintf(site_buf, sizeof(site_buf), "%s:%u:%u [closure]",
+                 leak_site_file(g, loc), loc.line, loc.col);
+        site_name = LLVMBuildGlobalStringPtr(g->builder, site_buf, "site");
+    }
+    LLVMValueRef alloc_args[3] = {
+        LLVMBuildPtrToInt(g->builder, LLVMSizeOf(rec_ty), i64, "clo.size"),
+        LLVMConstInt(i64, (unsigned long long)site_idx, 0), site_name };
+    LLVMValueRef rec = zan_call2(g->builder,
+        LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i64, i64, i8ptr }, 3, 0),
+        g->rt_alloc, alloc_args, 3, "clo");
+    LLVMBuildStore(g->builder,
+        LLVMBuildBitCast(g->builder, fn_ptr, i8ptr, "clo.fn"),
+        LLVMBuildStructGEP2(g->builder, rec_ty, rec, 0, "clo.fnp"));
+    LLVMBuildStore(g->builder,
+        LLVMBuildBitCast(g->builder, dtor, i8ptr, "clo.dt"),
+        LLVMBuildStructGEP2(g->builder, rec_ty, rec, 1, "clo.dtp"));
+    if (target) {
+        if (LLVMTypeOf(target) != i8ptr)
+            target = LLVMBuildBitCast(g->builder, target, i8ptr, "clo.tg8");
+        emit_arc_retain(g, target);
+    }
+    LLVMBuildStore(g->builder, target ? target : LLVMConstNull(i8ptr),
+        LLVMBuildStructGEP2(g->builder, rec_ty, rec, 2, "clo.tgp"));
+    for (int i = 0; i < capc; i++) {
+        LLVMValueRef v = LLVMBuildLoad2(g->builder, caps[i].llvm, caps[i].slot, "cap.v");
+        emit_rc_retain_for_type(g, caps[i].type, v);
+        LLVMBuildStore(g->builder, v,
+            LLVMBuildStructGEP2(g->builder, rec_ty, rec,
+                                (unsigned)(ZAN_CLOSURE_HDR_FIELDS + i), "cap.sp"));
+    }
+    if (has_this && self) {
+        if (LLVMTypeOf(self) != i8ptr)
+            self = LLVMBuildBitCast(g->builder, self, i8ptr, "cap.self8");
+        emit_arc_retain(g, self);
+        LLVMBuildStore(g->builder, self,
+            LLVMBuildStructGEP2(g->builder, rec_ty, rec,
+                                (unsigned)(ZAN_CLOSURE_HDR_FIELDS + capc), "cap.selfp"));
+    }
+    LLVMValueRef tagged = LLVMBuildOr(g->builder,
+        LLVMBuildPtrToInt(g->builder, rec, i64, "clo.i"),
+        LLVMConstInt(i64, ZAN_CLOSURE_TAG, 0), "clo.tag");
+    return LLVMBuildIntToPtr(g->builder, tagged, i8ptr, "clo.v");
+}
+
+/* `obj.M` / bare `M` naming an instance method: bind the receiver into a
+ * closure whose function is a thunk that re-supplies it, so the delegate is
+ * callable through the ordinary (receiver-less) delegate signature. */
+static LLVMValueRef emit_method_group_closure(zan_irgen_t *g, zan_symbol_t *msym,
+                                              LLVMValueRef recv, zan_loc_t loc) {
+    int fi = irgen_find_function(g, msym);
+    if (fi < 0 || !recv) return NULL;
+    LLVMValueRef target = g->functions[fi].fn;
+    LLVMTypeRef target_ty = g->functions[fi].fn_type;
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    unsigned np = LLVMCountParamTypes(target_ty);
+    if (np < 1) return NULL;   /* no receiver parameter: not an instance method */
+    LLVMTypeRef *tp = (LLVMTypeRef *)calloc((size_t)np, sizeof(LLVMTypeRef));
+    LLVMGetParamTypes(target_ty, tp);
+    LLVMTypeRef ret = LLVMGetReturnType(target_ty);
+
+    /* One thunk per method, not per use site: delegate equality compares the
+     * function pointer, so `E -= obj.M` must produce the same function as the
+     * `E += obj.M` that subscribed it. */
+    char lname[128];
+    snprintf(lname, sizeof(lname), "mg_%s", LLVMGetValueName(target));
+
+    /* record: { fn, dtor, target } -- the bound receiver is the target */
+    LLVMTypeRef fields[ZAN_CLOSURE_HDR_FIELDS] = { i8ptr, i8ptr, i8ptr };
+    char rname[128];
+    snprintf(rname, sizeof(rname), "%s$clo", lname);
+    LLVMTypeRef rec_ty = LLVMStructCreateNamed(g->ctx, rname);
+    LLVMStructSetBody(rec_ty, fields, ZAN_CLOSURE_HDR_FIELDS, 0);
+
+    LLVMTypeRef *thunk_params = (LLVMTypeRef *)calloc((size_t)np, sizeof(LLVMTypeRef));
+    thunk_params[0] = i8ptr;
+    for (unsigned i = 1; i < np; i++) thunk_params[i] = tp[i];
+    LLVMTypeRef thunk_ty = LLVMFunctionType(ret, thunk_params, np, 0);
+    char tname[160];
+    snprintf(tname, sizeof(tname), "__zan_%s", lname);
+    LLVMValueRef thunk = LLVMGetNamedFunction(g->mod, tname);
+    int thunk_is_new = thunk == NULL;
+    if (thunk_is_new) {
+        thunk = LLVMAddFunction(g->mod, tname, thunk_ty);
+        LLVMSetLinkage(thunk, LLVMInternalLinkage);
+    }
+
+    LLVMBasicBlockRef saved_bb = LLVMGetInsertBlock(g->builder);
+    if (!thunk_is_new) {
+        free(thunk_params);
+        free(tp);
+        return emit_closure_record(g, loc, lname, rec_ty, thunk, recv,
+                                   NULL, 0, 0, NULL);
+    }
+    LLVMPositionBuilderAtEnd(g->builder,
+        LLVMAppendBasicBlockInContext(g->ctx, thunk, "entry"));
+    LLVMValueRef rec = LLVMGetParam(thunk, 0);
+    LLVMValueRef sp = LLVMBuildStructGEP2(g->builder, rec_ty, rec, 2, "mg.selfp");
+    LLVMValueRef self = LLVMBuildLoad2(g->builder, i8ptr, sp, "mg.self");
+    LLVMValueRef *cargs = (LLVMValueRef *)calloc((size_t)np, sizeof(LLVMValueRef));
+    cargs[0] = LLVMTypeOf(self) == tp[0]
+        ? self : LLVMBuildBitCast(g->builder, self, tp[0], "mg.self.c");
+    for (unsigned i = 1; i < np; i++) cargs[i] = LLVMGetParam(thunk, i);
+    LLVMValueRef r = zan_call2(g->builder, target_ty, target, cargs, np,
+        LLVMGetTypeKind(ret) == LLVMVoidTypeKind ? "" : "mg.r");
+    if (LLVMGetTypeKind(ret) == LLVMVoidTypeKind) LLVMBuildRetVoid(g->builder);
+    else LLVMBuildRet(g->builder, r);
+    free(cargs);
+    free(thunk_params);
+    free(tp);
+    LLVMPositionBuilderAtEnd(g->builder, saved_bb);
+
+    return emit_closure_record(g, loc, lname, rec_ty, thunk, recv, NULL, 0, 0, NULL);
+}
+
 static LLVMValueRef emit_lambda_typed(zan_irgen_t *g, zan_ast_node_t *expr,
                                       zan_type_t *expected, local_scope_t *locals) {
-    (void)locals; /* lambdas are non-capturing */
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
     int pc = expr->lambda.params.count;
     bool exp_delegate = expected && expected->kind == TYPE_DELEGATE;
@@ -4723,21 +5113,65 @@ static LLVMValueRef emit_lambda_typed(zan_irgen_t *g, zan_ast_node_t *expr,
     LLVMTypeRef ret_type = rett ? map_type(g, rett) : i64;
     bool ret_void = rett && rett->kind == TYPE_VOID;
     if (ret_void) ret_type = LLVMVoidTypeInContext(g->ctx);
-    LLVMTypeRef fn_type = LLVMFunctionType(ret_type, param_types, (unsigned)pc, 0);
+
+    /* Which enclosing locals (and receiver) does the body mention? Those are
+     * copied into a closure record and the body reads them from there. */
+    capture_scan_t cs;
+    memset(&cs, 0, sizeof(cs));
+    cs.g = g;
+    cs.outer = locals;
+    for (int k = 0; k < pc; k++)
+        cap_shadow(&cs, expr->lambda.params.items[k]->param.name);
+    cap_scan(&cs, expr->lambda.body);
+    if (cs.needs_this && !g->current_this) cs.needs_this = 0;
+    if (cs.overflow) {
+        zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+            "lambda captures too many variables (limit %d)", ZAN_MAX_CAPTURES);
+        cs.count = 0;
+        cs.needs_this = 0;
+    }
+    int capc = cs.count;
+    int has_this = cs.needs_this ? 1 : 0;
+    bool is_closure = (capc + has_this) > 0;
+
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    /* A closure's function takes the record as a hidden leading parameter. */
+    LLVMTypeRef *all_params = (LLVMTypeRef *)calloc((size_t)pc + 2, sizeof(LLVMTypeRef));
+    unsigned apc = 0;
+    if (is_closure) all_params[apc++] = i8ptr;
+    for (int k = 0; k < pc; k++) all_params[apc++] = param_types[k];
+    LLVMTypeRef fn_type = LLVMFunctionType(ret_type, all_params, apc, 0);
+    free(all_params);
 
     char lname[64];
     static int lambda_id = 0;
     snprintf(lname, sizeof(lname), "lambda_%d", lambda_id++);
     LLVMValueRef lambda_fn = LLVMAddFunction(g->mod, lname, fn_type);
 
+    /* { ptr fn, ptr dtor, ptr target, <captures>, [ptr this] }; a lambda has no
+     * bound target, so that slot stays null (see the closure record layout). */
+    LLVMTypeRef rec_ty = NULL;
+    if (is_closure) {
+        LLVMTypeRef fields[ZAN_CLOSURE_HDR_FIELDS + ZAN_MAX_CAPTURES + 1];
+        for (int i = 0; i < ZAN_CLOSURE_HDR_FIELDS; i++) fields[i] = i8ptr;
+        for (int i = 0; i < capc; i++)
+            fields[ZAN_CLOSURE_HDR_FIELDS + i] = cs.caps[i].llvm;
+        if (has_this) fields[ZAN_CLOSURE_HDR_FIELDS + capc] = i8ptr;
+        char rname[80];
+        snprintf(rname, sizeof(rname), "%s$clo", lname);
+        rec_ty = LLVMStructCreateNamed(g->ctx, rname);
+        LLVMStructSetBody(rec_ty, fields,
+                          (unsigned)(ZAN_CLOSURE_HDR_FIELDS + capc + has_this), 0);
+    }
+
     LLVMBasicBlockRef saved_bb = LLVMGetInsertBlock(g->builder);
     LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, lambda_fn, "entry");
     LLVMPositionBuilderAtEnd(g->builder, entry);
 
     /* The body must emit into the lambda's own function: control-flow blocks
-     * append to current_fn and `return` coerces to current_fn_ret. Lambdas are
-     * non-capturing (no `this`/enclosing locals), so clear the instance/async
-     * context while keeping the enclosing type for static member access. */
+     * append to current_fn and `return` coerces to current_fn_ret. The
+     * instance/async context of the enclosing method does not carry over; a
+     * captured receiver is rebound below from the closure record. */
     LLVMValueRef saved_fn = g->current_fn;
     LLVMTypeRef saved_fn_ret = g->current_fn_ret_type;
     zan_type_t *saved_fn_zan_ret = g->current_fn_zan_ret_type;
@@ -4758,11 +5192,32 @@ static LLVMValueRef emit_lambda_typed(zan_irgen_t *g, zan_ast_node_t *expr,
 
     local_scope_t lambda_locals;
     local_scope_init(&lambda_locals, g->arena);
+    /* Captures come first: they are plain locals inside the body, loaded once
+     * from the record so the body needs no further closure awareness. */
+    if (is_closure) {
+        LLVMValueRef rec = LLVMGetParam(lambda_fn, 0);
+        for (int i = 0; i < capc; i++) {
+            LLVMValueRef p = LLVMBuildStructGEP2(g->builder, rec_ty, rec,
+                (unsigned)(ZAN_CLOSURE_HDR_FIELDS + i), "cap.p");
+            LLVMValueRef v = LLVMBuildLoad2(g->builder, cs.caps[i].llvm, p, "cap");
+            LLVMValueRef alloc = LLVMBuildAlloca(g->builder, cs.caps[i].llvm, "cap.slot");
+            LLVMBuildStore(g->builder, v, alloc);
+            local_add(&lambda_locals, cs.caps[i].name, alloc, cs.caps[i].type);
+        }
+        if (has_this) {
+            LLVMValueRef p = LLVMBuildStructGEP2(g->builder, rec_ty, rec,
+                (unsigned)(ZAN_CLOSURE_HDR_FIELDS + capc), "cap.thisp");
+            LLVMValueRef v = LLVMBuildLoad2(g->builder, i8ptr, p, "cap.this");
+            LLVMValueRef alloc = LLVMBuildAlloca(g->builder, i8ptr, "this.slot");
+            LLVMBuildStore(g->builder, v, alloc);
+            g->current_this = alloc;
+        }
+    }
     for (int k = 0; k < pc; k++) {
         zan_ast_node_t *param = expr->lambda.params.items[k];
         LLVMTypeRef lt = param_types[k];
         LLVMValueRef alloc = LLVMBuildAlloca(g->builder, lt, "lp");
-        zan_store_fit(g, LLVMGetParam(lambda_fn, (unsigned)k), alloc);
+        zan_store_fit(g, LLVMGetParam(lambda_fn, (unsigned)(is_closure ? k + 1 : k)), alloc);
         local_add(&lambda_locals, param->param.name, alloc,
                   ptypes[k] ? ptypes[k] : g->binder->type_int);
     }
@@ -4814,7 +5269,14 @@ static LLVMValueRef emit_lambda_typed(zan_irgen_t *g, zan_ast_node_t *expr,
     LLVMPositionBuilderAtEnd(g->builder, saved_bb);
     free(param_types);
     free(ptypes);
-    return lambda_fn;
+    if (!is_closure) return lambda_fn;
+
+    LLVMValueRef self = has_this
+        ? LLVMBuildLoad2(g->builder, LLVMGetAllocatedType(saved_this),
+                         saved_this, "cap.self")
+        : NULL;
+    return emit_closure_record(g, expr->loc, lname, rec_ty, lambda_fn, NULL,
+                               cs.caps, capc, has_this, self);
 }
 
 static zan_type_t *method_param_type(zan_irgen_t *g, zan_symbol_t *msym, int idx) {

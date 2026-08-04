@@ -358,6 +358,24 @@ static int reserve_arc_site(zan_irgen_t *g, zan_symbol_t *sym,
     return site_idx;
 }
 
+/* A closure record carries its own destructor in the record, so its site index
+ * exists only for leak accounting -- and there it must be unique per lambda,
+ * otherwise every closure in the program reports under one source location. */
+static int reserve_closure_site(zan_irgen_t *g) {
+    if (g->leak_site_count >= ZAN_MAX_LEAK_SITES) {
+        fprintf(stderr,
+            "zanc: too many distinct ARC destructor shapes (maximum %d)\n",
+            ZAN_MAX_LEAK_SITES);
+        exit(1);
+    }
+    int site_idx = g->leak_site_count++;
+    if (g->site_syms) g->site_syms[site_idx] = NULL;
+    if (g->site_inst) g->site_inst[site_idx] = NULL;
+    if (g->site_coll) g->site_coll[site_idx] = 0;
+    if (g->site_coll_elem) g->site_coll_elem[site_idx] = NULL;
+    return site_idx;
+}
+
 /* String RC header magic and sentinel refcount.
  * The second header word doubles as a guard for tolerant retain/release. */
 #define ZAN_STRING_MAGIC UINT64_C(0x5a414e5354524d47) /* ZANSTRMG */
@@ -2320,7 +2338,10 @@ static int is_arc_managed_type(zan_type_t *t) {
 }
 
 static int is_rc_managed_type(zan_type_t *t) {
-    return t && (t->kind == TYPE_STRING || is_arc_managed_type(t));
+    /* A delegate is rc-managed in the closure shape only; the retain/release
+     * helpers test the tag bit, so a bare function pointer costs nothing. */
+    return t && (t->kind == TYPE_STRING || t->kind == TYPE_DELEGATE ||
+                 is_arc_managed_type(t));
 }
 
 static void emit_rc_release_for_type(zan_irgen_t *g, zan_type_t *type, LLVMValueRef v);

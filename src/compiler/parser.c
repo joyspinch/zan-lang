@@ -2724,12 +2724,16 @@ static void gen_event_holder(zan_ast_node_t *unit, zan_ast_node_t *ddecl,
         "    void Invoke(",
         hname, dname, hname, hname, dname, hname, hname, dname,
         hname, hname, dname);
+    /* remembered so `op_call` (raising the event as `E(...)`) can forward the
+     * same parameter list to Invoke */
+    int invoke_params_at = n;
     for (int i = 0; i < ddecl->method_decl.params.count; i++) {
         zan_ast_node_t *pp = ddecl->method_decl.params.items[i];
         if (i > 0) zsrc_append(src, (int)sizeof(src), &n, ", ");
         n += tref_write(src + n, (int)sizeof(src) - n, pp->param.type);
         zsrc_append(src, (int)sizeof(src), &n, " a%d", i);
     }
+    int invoke_params_end = n;
     zsrc_append(src, (int)sizeof(src), &n,
         ") {\n"
         "        int i = 0;\n"
@@ -2744,6 +2748,23 @@ static void gen_event_holder(zan_ast_node_t *unit, zan_ast_node_t *ddecl,
         ");\n"
         "            i = i + 1;\n"
         "        }\n"
+        "    }\n");
+
+    /* `E(args)` raises the event, as in C#. The holder is null until the first
+     * subscription, and a call with no subscribers simply does nothing (the
+     * `E?.Invoke(...)` shape C# code writes by hand). */
+    char params[2048];
+    snprintf(params, sizeof(params), "%.*s",
+             invoke_params_end - invoke_params_at, src + invoke_params_at);
+    zsrc_append(src, (int)sizeof(src), &n,
+        "    static void op_call(%s self%s%s) {\n"
+        "        if (self == null) { return; }\n"
+        "        self.Invoke(",
+        hname, ddecl->method_decl.params.count ? ", " : "", params);
+    for (int i = 0; i < ddecl->method_decl.params.count; i++)
+        zsrc_append(src, (int)sizeof(src), &n, "%sa%d", i > 0 ? ", " : "", i);
+    zsrc_append(src, (int)sizeof(src), &n,
+        ");\n"
         "    }\n"
         "}\n");
 
