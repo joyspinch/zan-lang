@@ -531,6 +531,17 @@ static int type_family(zan_type_t *t) {
     }
 }
 
+/* True when `s` is string and `b` a byte buffer (byte[]/sbyte[]/char[]). Both
+ * are the same pointer to a NUL-terminated payload at runtime, and the stdlib
+ * relies on it: wire data is built in a byte[] and read back through string
+ * parameters. */
+static bool str_and_byte_buffer(zan_type_t *s, zan_type_t *b) {
+    if (!s || !b || s->kind != TYPE_STRING || b->kind != TYPE_ARRAY) return false;
+    zan_type_t *e = b->element_type;
+    return e && (e->kind == TYPE_BYTE || e->kind == TYPE_SBYTE ||
+                 e->kind == TYPE_CHAR);
+}
+
 /* Type of an expression-bodied lambda read against a delegate signature: its
  * parameters take the delegate's types, so `i => Wrap(i.name)` types as what
  * Wrap returns. NULL when the body is a block or nothing resolves. */
@@ -676,6 +687,8 @@ static struct zan_ctor_entry *find_ctor(zan_irgen_t *g, zan_symbol_t *type_sym,
                 }
                 if (pf == FAM_FLOAT && af == FAM_INT)
                     continue;
+                if (str_and_byte_buffer(pt, at) || str_and_byte_buffer(at, pt))
+                    continue;
                 compatible = false;
                 break;
             }
@@ -686,6 +699,15 @@ static struct zan_ctor_entry *find_ctor(zan_irgen_t *g, zan_symbol_t *type_sym,
         }
     }
     return locals ? best : first;
+}
+
+/* Whether the type declares any constructor at all: a class that does, but
+ * whose constructors all reject the arguments at a `new`, is a call site error
+ * rather than a silent skip. */
+static bool type_has_ctor(zan_irgen_t *g, zan_symbol_t *type_sym) {
+    for (int i = 0; i < g->ctor_count; i++)
+        if (g->ctors[i].type_sym == type_sym) return true;
+    return false;
 }
 
 /* A constructor call that leaves trailing defaulted parameters out

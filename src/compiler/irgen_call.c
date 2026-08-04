@@ -1079,13 +1079,17 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
             /* Convert.ToInt / Convert.ToInt32 / Convert.ToInt64(x) */
             if (callee->member.object->kind == AST_IDENTIFIER) {
                 zan_istr_t obj_name = callee->member.object->ident.name;
-                if (obj_name.len == 7 && memcmp(obj_name.str, "Convert", 7) == 0 &&
-                    !zan_type_defines(g, "Convert", "ToInt32") &&
-                    !zan_type_defines(g, "Convert", "ToInt64") &&
-                    !zan_type_defines(g, "Convert", "ToInt")) {
+                /* A program of its own may define some of Convert: each
+                 * lowering steps aside only for the method that program
+                 * declares, so defining ToInt32 does not take ToString with
+                 * it (which left every stdlib Convert.ToString unresolved). */
+                if (obj_name.len == 7 && memcmp(obj_name.str, "Convert", 7) == 0) {
                     if (((method_name.len == 7 && memcmp(method_name.str, "ToInt32", 7) == 0) ||
                          (method_name.len == 7 && memcmp(method_name.str, "ToInt64", 7) == 0) ||
                          (method_name.len == 5 && memcmp(method_name.str, "ToInt", 5) == 0)) &&
+                        !zan_type_defines(g, "Convert", "ToInt32") &&
+                        !zan_type_defines(g, "Convert", "ToInt64") &&
+                        !zan_type_defines(g, "Convert", "ToInt") &&
                         expr->call.args.count == 1) {
                         LLVMValueRef arg = emit_expr(g, expr->call.args.items[0], locals);
                         LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
@@ -1119,6 +1123,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                         return parsed;
                     }
                     if (method_name.len == 8 && memcmp(method_name.str, "ToString", 8) == 0 &&
+                        !zan_type_defines(g, "Convert", "ToString") &&
                         expr->call.args.count == 1) {
                         LLVMValueRef arg = emit_expr(g, expr->call.args.items[0], locals);
                         LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);

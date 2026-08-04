@@ -3693,6 +3693,20 @@ static LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                         }
                         free(call_args);
                     } else {
+                        /* Arguments were supplied but no constructor accepts
+                         * them: the object used to be built with its fields at
+                         * their initializers and no constructor run at all, so
+                         * it came back half-formed. `new C()` keeps falling
+                         * back to the field initializers, which is how a class
+                         * with only a parameterised constructor is built from
+                         * an object initializer. */
+                        if (sym->type->kind == TYPE_CLASS &&
+                            ctor_arg_list.count > 0 && type_has_ctor(g, sym))
+                            zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+                                "no constructor of '%.*s' accepts %d argument%s",
+                                (int)sym->name.len, sym->name.str,
+                                ctor_arg_list.count,
+                                ctor_arg_list.count == 1 ? "" : "s");
                         int fields_eh_pushed = 0;
                         if (sym->type->kind == TYPE_CLASS) {
                             emit_eh_tmp_push(g, alloca);
