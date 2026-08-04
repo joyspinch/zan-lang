@@ -3009,6 +3009,10 @@ partial class ZanIDE {
                     }
                     string chatModel = aiProfiles[aiProfActive].model;
                     if (selMi >= 0 && selMi < aiModelOpts.Count) { chatModel = aiModelOpts[selMi]; }
+                    // Which model each member runs on, taken from the provider
+                    // in effect: reading it here means switching provider (or
+                    // saving the settings dialog) moves the whole team with it.
+                    AiTeam.SetModels(aiProfiles[aiProfActive].roles);
                     // Feed the enabled model's configured context / output limits
                     // to the agent layer, so context compaction, the usage ring
                     // and the request's max_tokens all follow this model. An
@@ -3311,28 +3315,64 @@ partial class ZanIDE {
                     int aiInpX = rp.x + rPad * 2 + aiAutoW;
                     int aiInpW = rInW - aiAutoW - rPad;
                     if (aiInpW < app.Scale(40)) { aiInpW = app.Scale(40); }
-                    int aiInpId = aiInput.Render(app, aiInpX, aiInY, aiInpW, aiInH);
                     // @-mention picker: while the composer's tail is an
-                    // unfinished mention, float the member list above it. A
-                    // click (below) or Enter completes the token instead of
-                    // sending, so addressing a member never means typing the
-                    // whole name.
+                    // unfinished mention, float the member list above it. The
+                    // list owns Up / Down / Enter / Tab / Esc, so the member is
+                    // chosen with the keyboard alone -- which means deciding
+                    // that BEFORE the box renders, because the box would
+                    // otherwise take the same keys as caret moves and newlines.
                     bool aiMentioning = false;
                     string aiMentionPick = "";
                     List<AiRole> aiMentionHits = new List<AiRole>();
                     if (aiTeamMode && aiBusy.Get() == 0
-                        && app.focus.IsFocused(aiInpId)) {
+                        && app.focus.IsFocused(aiInput.Id())) {
                         string aiMq = aiInput.GetText();
                         int aiMqAt = AiTeam.MentionStart(aiMq);
-                        if (aiMqAt >= 0) {
+                        if (aiMqAt >= 0 && aiMq != aiMentHidden) {
                             string frag = aiMq.Substring(aiMqAt + 1);
                             aiMentionHits = AiTeam.MentionMatches(frag);
-                            if (aiMentionHits.Count > 0) {
-                                aiMentioning = true;
-                                aiMentionPick = TeamBoard.MentionRows(app,
-                                    aiInpX, aiInY, aiInpW, aiMentionHits);
-                            }
+                            aiMentioning = aiMentionHits.Count > 0;
                         }
+                        if (aiMqAt < 0) { aiMentHidden = ""; }
+                    }
+                    if (aiMentioning) {
+                        if (aiMentSel >= aiMentionHits.Count) {
+                            aiMentSel = aiMentionHits.Count - 1;
+                        }
+                        if (aiMentSel < 0) { aiMentSel = 0; }
+                        int aiMentKind = app.EventKind();
+                        int aiMentKey = app.window.EventKeyCode();
+                        if (aiMentKind == 4 && (aiMentKey == 38
+                            || aiMentKey == 40 || aiMentKey == 27)) {
+                            aiInput.SkipKeysOnce();
+                            if (aiMentKey == 38) { aiMentSel = aiMentSel - 1; }
+                            if (aiMentKey == 40) { aiMentSel = aiMentSel + 1; }
+                            if (aiMentSel < 0) {
+                                aiMentSel = aiMentionHits.Count - 1;
+                            }
+                            if (aiMentSel >= aiMentionHits.Count) {
+                                aiMentSel = 0;
+                            }
+                            if (aiMentKey == 27) {
+                                aiMentHidden = aiInput.GetText();
+                                aiMentioning = false;
+                            }
+                            app.RequestRedraw();
+                        } else if (aiMentKind == 6 && (aiMentKey == 13
+                            || aiMentKey == 9)) {
+                            // Enter / Tab accept the highlighted member: the
+                            // box must not also insert the newline or the tab.
+                            aiInput.SkipKeysOnce();
+                            aiMentionPick = aiMentionHits[aiMentSel].id;
+                        }
+                    } else if (aiMentionHits.Count == 0) {
+                        aiMentSel = 0;
+                    }
+                    int aiInpId = aiInput.Render(app, aiInpX, aiInY, aiInpW, aiInH);
+                    if (aiMentioning) {
+                        string aiClickPick = TeamBoard.MentionRows(app,
+                            aiInpX, aiInY, aiInpW, aiMentionHits, aiMentSel);
+                        if (aiClickPick != "") { aiMentionPick = aiClickPick; }
                     }
                     // While a request (or an auto-continued tool loop) is in
                     // flight, Send becomes Stop: it abandons the streaming
@@ -3363,22 +3403,19 @@ partial class ZanIDE {
                     bool doSend = sendId >= 0 && Ui.Clicked(app, sendId);
                     // Enter sends, Shift+Enter is a newline. The box handles
                     // the key itself (it is a real multi-line editor), so the
-                    // newline it just inserted is trimmed back off below.
-                    if (!doSend && app.EventKind() == 6
+                    // newline it just inserted is trimmed back off below. While
+                    // the mention list is up it already took this Enter.
+                    if (!doSend && !aiMentioning && app.EventKind() == 6
                         && app.window.EventKeyCode() == 13
                         && !Modifiers.HasShift(app.window.EventMods())
                         && app.focus.IsFocused(aiInpId)) {
-                        if (aiMentioning) {
-                            // The picker owns Enter/Tab: complete the mention
-                            // with the first match rather than sending.
-                            if (aiMentionHits.Count > 0) {
-                                aiMentionPick = aiMentionHits[0].id;
-                            }
-                        } else { doSend = true; }
+                        doSend = true;
                     }
                     if (aiMentionPick != "") {
                         aiInput.SetText(AiTeam.ApplyMention(
                             aiInput.GetText(), aiMentionPick));
+                        aiMentSel = 0;
+                        aiMentHidden = "";
                         app.RequestRedraw();
                     }
                     if (doSend && aiBusy.Get() == 0) {
@@ -5543,6 +5580,8 @@ partial class ZanIDE {
         aiTeamMode = false;
         aiRunAgent = "";
         aiHandoffs = 0;
+        aiMentSel = 0;
+        aiMentHidden = "";
         aiTeamSt = AiTeamState.Create();
         aiTasks = new List<AiTask>();
         aiTeamOpen = SignalInt.Create(0);

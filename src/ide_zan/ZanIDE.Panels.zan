@@ -351,7 +351,10 @@ partial class ZanIDE {
 
     // ---- AI provider profiles (ai_profiles.json) ----
     // {"active": 0, "profiles": [{"name", "base", "key", "model",
-    //   "models": [], "limits": {"<model id>": {"ctx": 128000, "out": 4096}}}]}
+    //   "models": [], "limits": {"<model id>": {"ctx": 128000, "out": 4096}},
+    //   "roles": {"<role id>": "<model id>"}}]}
+    // `roles` maps a team member to the model it runs on under this provider;
+    // an absent member falls back to "model".
     // `limits` holds each model's configured context length and maximum output
     // length (both in tokens); a missing / zero entry means "use the default".
     static string AiProfilesPath() { return ZanIDE.UserConfigDir() + "/ai_profiles.json"; }
@@ -384,10 +387,15 @@ partial class ZanIDE {
                         string limitMap = "{}";
                         JsonValue lim = p.Get("limits");
                         if (lim != null && lim.IsObject()) { limitMap = lim.ToJson(); }
-                        profiles.Add(AiProfile.Create(
+                        string roleMap = "{}";
+                        JsonValue rls = p.Get("roles");
+                        if (rls != null && rls.IsObject()) { roleMap = rls.ToJson(); }
+                        AiProfile loaded = AiProfile.Create(
                             p.Str("name", "AI " + Convert.ToString(i + 1)),
                             p.Str("base", ""), p.Str("key", ""),
-                            p.Str("model", ""), modelList, limitMap));
+                            p.Str("model", ""), modelList, limitMap);
+                        loaded.roles = roleMap;
+                        profiles.Add(loaded);
                     }
                 }
             }
@@ -423,6 +431,11 @@ partial class ZanIDE {
             JsonValue lm = JsonValue.ParseLenient(limitMap);
             if (lm == null) { lm = JsonValue.NewObject(); }
             o.Put("limits", lm);
+            string roleMap = profile.roles;
+            if (roleMap == "") { roleMap = "{}"; }
+            JsonValue rm = JsonValue.ParseLenient(roleMap);
+            if (rm == null) { rm = JsonValue.NewObject(); }
+            o.Put("roles", rm);
             arr.Append(o);
         }
         JsonValue root = JsonValue.NewObject();
@@ -480,6 +493,25 @@ partial class ZanIDE {
         }
         int n = ZanIDE.ParseIntSafe(val);
         mo.Set(field, JsonValue.NewNum(Convert.ToString(n)));
+        return v.ToJson();
+    }
+
+    /// The model a team member runs on under this provider ("" when it has
+    /// none configured and should use the provider's default model).
+    static string AiRoleModel(string mapJson, string roleId) {
+        if (mapJson == "" || roleId == "") { return ""; }
+        JsonValue v = JsonValue.ParseLenient(mapJson);
+        if (v == null || !v.IsObject()) { return ""; }
+        return v.Str(roleId, "");
+    }
+
+    /// Returns `mapJson` with `roleId` bound to `model` (blank clears it, so a
+    /// member can be put back on the provider's default).
+    static string AiRoleModelSet(string mapJson, string roleId, string model) {
+        if (roleId == "") { return mapJson; }
+        JsonValue v = JsonValue.ParseLenient(mapJson);
+        if (v == null || !v.IsObject()) { v = JsonValue.NewObject(); }
+        v.Set(roleId, JsonValue.NewStr(model));
         return v.ToJson();
     }
 
@@ -608,6 +640,14 @@ partial class ZanIDE {
                 "未配置 API 密钥。请在小赞面板的“配置”中为启用的配置填写密钥。");
         }
         if (baseUrl == "") { baseUrl = "https://api.openai.com/v1"; }
+        // A team member runs on its own model when the enabled provider has one
+        // configured for it: the reviewer can be a strong reasoner while the
+        // scribe work stays on a cheap fast model. Every launch resolves it
+        // again, so an automatic handoff switches models with the speaker.
+        if (agent != "") {
+            string roleModel = AiTeam.ModelOf(agent);
+            if (roleModel != "") { model = roleModel; }
+        }
         if (model == "") { model = "gpt-4o-mini"; }
         // stream_options.include_usage: OpenAI-compatible endpoints only put
         // the token counts in the final chunk of a stream when asked, and the
