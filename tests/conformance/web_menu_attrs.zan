@@ -1,0 +1,101 @@
+// The admin menu is derived from the same attributes that secure the routes:
+// [Custom(IsMenu = true, MenuGroup = ..., Rank = ...)] decides membership,
+// section and order, and MenuBuilder.ForUser hides an entry the installed
+// permission resolver would refuse — so a visible entry cannot lead to a 403.
+using System;
+using System.Web;
+
+[Route("admin/[controller]/[action]")]
+[Custom(Authorization = CustomAuthorization.ApiAuth, IsMenu = true,
+        MenuGroup = "内容", Rank = 20)]
+class MenuPostsController : Controller {
+    [HttpGet]
+    [Description("文章")]
+    void Index() { this.Ok("null"); }
+
+    // A write action shares the controller's attributes but must not become a
+    // link the browser cannot follow.
+    [HttpPost]
+    [Description("发布文章")]
+    void Publish() { this.Ok("null"); }
+
+    // Opting one action out of the menu while it keeps the auth gate.
+    [HttpGet]
+    [Custom(Authorization = CustomAuthorization.ApiAuth, IsMenu = false)]
+    [Description("文章详情")]
+    void Read() { this.Ok("null"); }
+}
+
+[Route("admin/[controller]/[action]")]
+[Custom(Authorization = CustomAuthorization.ApiAuth, IsMenu = true,
+        MenuGroup = "系统", Rank = 10, Icon = "mdi:account")]
+class MenuUsersController : Controller {
+    [HttpGet]
+    [Description("账号")]
+    void Index() { this.Ok("null"); }
+}
+
+// No MenuGroup: the group falls back to the controller's module, and Rank 5
+// puts that section above the two below it.
+[Route("[controller]/[action]")]
+[Custom(IsMenu = true, Rank = 5)]
+class MenuHomeController : Controller {
+    [HttpGet]
+    [Description("首页")]
+    void Index() { this.Ok("null"); }
+}
+
+class Program {
+    // Only uid "7" is an administrator; uid "9" is a signed-in nobody.
+    static async bool Allow(string uid, string action) {
+        return uid == "7";
+    }
+
+    static async void Dump(WebApp app, string uid, string active) {
+        List<MenuNode> nodes = await MenuBuilder.ForUser(app, uid, active);
+        string who = uid;
+        if (who.Length == 0) { who = "anonymous"; }
+        Console.WriteLine(who + " " + Convert.ToString(nodes.Count));
+        for (int i = 0; i < nodes.Count; i = i + 1) {
+            MenuNode n = nodes[i];
+            string icon = n.Icon();
+            if (icon.Length == 0) { icon = "-"; }
+            string group = n.Group();
+            if (group.Length == 0) { group = "-"; }
+            Console.WriteLine("  " + group + " | " + n.Title() + " | " + n.Path()
+                + " | rank=" + Convert.ToString(n.Rank()) + " | icon=" + icon
+                + " | active=" + Convert.ToString(n.Active()));
+        }
+    }
+
+    static void Main() {
+        WebApp app = new WebApp("127.0.0.1", 0);
+        WebHost.Use(app);
+        app.PermissionResolver(Program.Allow);
+        __AttrRoutes.Register(app);
+
+        await Program.Dump(app, "7", "/admin/menuposts/index");
+        await Program.Dump(app, "9", "");
+        await Program.Dump(app, "", "");
+
+        // A deeper path still highlights the entry that serves it.
+        Console.WriteLine("nested " + Convert.ToString(
+            MenuBuilder.Matches("/admin/posts", "/admin/posts/edit/7")));
+        Console.WriteLine("sibling " + Convert.ToString(
+            MenuBuilder.Matches("/admin/posts", "/admin/users")));
+        Console.WriteLine("wild " + Convert.ToString(
+            MenuBuilder.Matches("/admin/post/{id}", "/admin/post/12")));
+
+        // The sidebar itself: a group header row opens each section, so the view
+        // engine renders the whole menu from one flat {{#each}} and the active
+        // entry carries the class.
+        ViewData d = new ViewData();
+        List<MenuNode> nodes = await MenuBuilder.ForUser(app, "7",
+            "/admin/menuposts/index");
+        MenuBuilder.Fill(d.AddList("menu"), nodes);
+        Console.WriteLine(View.RenderStr(
+            "{{#each menu}}{{#if group}}[{{group}}]{{/if}}"
+            + "{{#if path}}<a class=\"{{active}}\" href=\"{{path}}\">{{title}}</a>{{/if}}"
+            + "{{/each}}", d, null));
+    }
+}

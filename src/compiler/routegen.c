@@ -756,7 +756,8 @@ static void rg_emit_params(rg_buf_t *out, rg_params *ps) {
 
 /* ---- fluent metadata emission ---- */
 
-static void emit_fluent(rg_buf_t *out, rg_meta *m, const char *title) {
+static void emit_fluent(rg_buf_t *out, rg_meta *m, const char *title,
+                        const char *module) {
     if (title && title[0]) { rg_putf(out, ".Title(\""); rg_put_qstr(out, title); rg_putf(out, "\")"); }
 
     rg_ent *e;
@@ -767,9 +768,21 @@ static void emit_fluent(rg_buf_t *out, rg_meta *m, const char *title) {
         else if (strcmp(e->val.sval, "Auth") == 0) rg_putf(out, ".Login()");
         else if (strcmp(e->val.sval, "ApiAuth") == 0) rg_putf(out, ".Auth()");
     }
-    /* IsMenu -> surface in admin menu (boolean flag on the route) */
+    /* IsMenu -> surface in admin menu (boolean flag on the route). The sidebar
+     * section comes from MenuGroup, defaulting to the controller's module, so a
+     * menu entry needs no second declaration anywhere. */
     e = meta_get(m, "IsMenu");
-    if (e && e->val.kind == 1 && e->val.ival) rg_putf(out, ".Menu()");
+    if (e && e->val.kind == 1 && e->val.ival) {
+        rg_putf(out, ".Menu()");
+        rg_ent *g = meta_get(m, "MenuGroup");
+        const char *grp = (g && g->val.kind == 2 && g->val.sval[0])
+                              ? g->val.sval : module;
+        if (grp && grp[0]) {
+            rg_putf(out, ".Group(\"");
+            rg_put_qstr(out, grp);
+            rg_putf(out, "\")");
+        }
+    }
     /* optional route-only conventions (not part of the user attribute class):
      * Lock -> per-request lock scope, Upload -> stream body to disk.  Rank /
      * ApiMax / Component / Icon / ContentType are menu/response metadata and
@@ -924,7 +937,7 @@ void zan_routegen_run(zan_ast_node_t *unit, zan_arena_t *arena,
             rg_putf(&reg, "\", __AttrRoutes.%s)\n            .Named(\"", hname);
             rg_put_qstr(&reg, cname); rg_putf(&reg, "."); rg_put_qstr(&reg, mname);
             rg_putf(&reg, "\")");
-            emit_fluent(&reg, &meta, title);
+            emit_fluent(&reg, &meta, title, cmod);
             rg_params params_doc; params_doc.count = 0;
             rg_scan(m->method_decl.body, &params_doc);
             rg_params_from_path(&params_doc, path);
