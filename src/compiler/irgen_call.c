@@ -14,6 +14,35 @@ static bool ident_names_own_field(zan_irgen_t *g, zan_ast_node_t *e) {
     return get_field_index(g->current_type_sym, e->ident.name) >= 0;
 }
 
+/* Walks the receiver chain of an unclaimed call and reports the first
+ * `Type.Method(...)` link naming a class that has no such method. A chained
+ * call hides the broken link from the per-call checks: the outer call resolves
+ * nothing, so it never emits its receiver and the missing method went
+ * unreported. */
+static void diagnose_unresolved_static_chain(zan_irgen_t *g,
+                                             zan_ast_node_t *recv) {
+    while (recv && recv->kind == AST_CALL) {
+        zan_ast_node_t *callee = recv->call.callee;
+        if (!callee || callee->kind != AST_MEMBER_ACCESS) return;
+        zan_ast_node_t *obj = callee->member.object;
+        if (obj->kind == AST_IDENTIFIER && !ident_names_own_field(g, obj)) {
+            zan_symbol_t *ts = zan_binder_lookup(g->binder, obj->ident.name);
+            if (ts && (ts->kind == SYM_CLASS || ts->kind == SYM_STRUCT) &&
+                !get_method_sym(ts, callee->member.name)) {
+                zan_diag_emit(g->diag, DIAG_ERROR, recv->loc,
+                    "unresolved call '%.*s.%.*s': type '%.*s' has no method "
+                    "'%.*s'",
+                    (int)obj->ident.name.len, obj->ident.name.str,
+                    (int)callee->member.name.len, callee->member.name.str,
+                    (int)obj->ident.name.len, obj->ident.name.str,
+                    (int)callee->member.name.len, callee->member.name.str);
+                return;
+            }
+        }
+        recv = obj;
+    }
+}
+
 /* True when the call's receiver names a class compiled from source (user or
  * stdlib) that defines the called method. Builtin lowerings that duplicate a
  * stdlib class (File.*) step aside so the source implementation — with its
@@ -4016,6 +4045,15 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                     bt ? bt->display : brecv, (int)bmn.len, bmn.str);
             }
         }
+
+        /* Nothing claimed this call, so it lowers to the constant below. When
+         * the receiver is itself a chained call, the checks above cannot see
+         * it: `Type.Gone().More()` leaves the receiver unemitted, so the
+         * unresolved `Type.Gone` was never reported and the chain crashed at
+         * runtime on the constant used as a pointer. Report the head of the
+         * chain instead. */
+        if (expr->call.callee && expr->call.callee->kind == AST_MEMBER_ACCESS)
+            diagnose_unresolved_static_chain(g, expr->call.callee->member.object);
 
         /* generic function call — fallback */
         return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);

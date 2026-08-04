@@ -282,6 +282,19 @@ static void check_value_type_mismatch(zan_irgen_t *g, zan_type_t *dst, zan_type_
 
 static zan_type_t *infer_expr_type(zan_irgen_t *g, zan_ast_node_t *e, local_scope_t *locals);
 
+/* The declared type of a field, read through a receiver of type `owner`: a
+ * field declared List<T> on Box<Square> reads back as List<Square>, so its
+ * elements are loaded with the real element type instead of the erased T. */
+static zan_type_t *field_type_through(zan_irgen_t *g, zan_symbol_t *fsym,
+                                     zan_type_t *owner) {
+    if (!fsym) return NULL;
+    zan_type_t *ft = fsym->type;
+    if (!owner) return ft;
+    ft = subst_type_param_deep(g, ft, owner);
+    if (ft && ft->kind == TYPE_TYPE_PARAM) ft = concretize(g, ft);
+    return ft;
+}
+
 static zan_type_t *member_access_field_type(zan_irgen_t *g, local_scope_t *locals, zan_ast_node_t *member) {
     if (!member || member->kind != AST_MEMBER_ACCESS) return NULL;
     zan_ast_node_t *obj = member->member.object;
@@ -289,7 +302,7 @@ static zan_type_t *member_access_field_type(zan_irgen_t *g, local_scope_t *local
         local_var_t *l = local_find(locals, obj->ident.name);
         if (l && l->type && l->type->sym) {
             zan_symbol_t *fsym = get_field_sym(l->type->sym, member->member.name);
-            if (fsym) return fsym->type;
+            if (fsym) return field_type_through(g, fsym, l->type);
         }
         /* ClassName.StaticField: obj names a class (not a shadowing local) and
          * member is one of its static fields. */
@@ -306,7 +319,7 @@ static zan_type_t *member_access_field_type(zan_irgen_t *g, local_scope_t *local
             zan_symbol_t *ofsym = get_field_sym(g->current_type_sym, obj->ident.name);
             if (ofsym && ofsym->type && ofsym->type->sym) {
                 zan_symbol_t *fsym = get_field_sym(ofsym->type->sym, member->member.name);
-                if (fsym) return fsym->type;
+                if (fsym) return field_type_through(g, fsym, ofsym->type);
             }
         }
     }
@@ -325,7 +338,7 @@ static zan_type_t *member_access_field_type(zan_irgen_t *g, local_scope_t *local
         zan_type_t *ot = infer_expr_type(g, obj, locals);
         if (ot && ot->sym) {
             zan_symbol_t *fsym = get_field_sym(ot->sym, member->member.name);
-            if (fsym) return fsym->type;
+            if (fsym) return field_type_through(g, fsym, ot);
         }
     }
     return NULL;

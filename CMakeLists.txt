@@ -1001,6 +1001,18 @@ add_test(NAME diag_scalar_member_access
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_scalar_member_access PROPERTIES TIMEOUT 60)
 
+# An unresolved static factory at the head of a method chain must be a compile
+# error: the unclaimed outer call never emitted its receiver, so the missing
+# method went unreported and the chain crashed at runtime.
+add_test(NAME diag_unresolved_static_chain
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/unresolved_static_chain.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_unresolved_static_chain${_exe_ext}
+    "-DEXPECT_REGEX=unresolved call 'Fluent.Create'"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_unresolved_static_chain PROPERTIES TIMEOUT 60)
+
 # ---- Golden compiler regression tests ----
 # Freeze the lexer token stream and parse tree for a set of hermetic (stdlib-free)
 # .zan inputs so any lexer/parser/AST regression is caught in CI on every
