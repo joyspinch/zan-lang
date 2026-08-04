@@ -10,6 +10,9 @@ using ZanWeb.Dao.Sys;
 namespace ZanWeb;
 
 class AuthUser {
+    /// <summary>sys_user.status of an account that may log in.</summary>
+    static int Active = 1;
+
     /// <summary>Borrows a connection from the injected pool. The token/rank
     /// resolvers are synchronous callbacks, so they take an already-idle
     /// connection instead of parking a coroutine: null means "no capacity", and
@@ -39,48 +42,53 @@ class AuthUser {
         return material;
     }
 
-    static AuthUserEnt ByUsername(string username) {
+    static User ByUsername(string username) {
         IDbConnection db = AuthUser.Lease();
         if (db == null) { return null; }
         try {
-            return new UserDao(db).AccountByName(username);
+            return new UserDao(db).ByUsername(username);
         } finally {
             AuthUser.Give(db);
         }
     }
 
-    static AuthUserEnt ById(string uid) {
+    static User ById(string uid) {
         int id = AuthUser.ToInt(uid);
         if (id <= 0) { return null; }
         IDbConnection db = AuthUser.Lease();
         if (db == null) { return null; }
         try {
-            return new UserDao(db).AccountById(id);
+            return new UserDao(db).ById(id);
         } finally {
             AuthUser.Give(db);
         }
     }
 
+    /// <summary>Verifies the password and issues a cookie token. "" = rejected;
+    /// the caller must not tell the client which of the two reasons applied.</summary>
     static string Login(string username, string password) {
-        AuthUserEnt row = AuthUser.ByUsername(username);
-        if (row == null || row.status != "active") { return ""; }
+        User row = AuthUser.ByUsername(username);
+        if (row == null || row.status != AuthUser.Active) { return ""; }
         string actual = AuthUser.PasswordHash(password, row.passwordSalt);
         if (!AuthToken.Equal(actual, row.passwordHash)) { return ""; }
-        return AuthToken.Issue(Convert.ToString(row.id), row.passwordHash, WebApp.NowSeconds());
+        return AuthToken.Issue(Convert.ToString(row.id), row.tokenVersion,
+            WebApp.NowSeconds());
     }
 
-    static string PasswordPart(string uid) {
-        AuthUserEnt row = AuthUser.ById(uid);
-        if (row == null || row.status != "active") { return ""; }
-        string hash = row.passwordHash;
-        if (hash.Length < 16) { return ""; }
-        return hash.Substring(0, 16);
+    /// <summary>The account's current token version, or -1 when it cannot log in
+    /// (unknown, disabled, or the database is out of capacity). A token whose
+    /// version differs was issued before a password change / forced logout and is
+    /// no longer valid — so the token itself carries no password material.</summary>
+    static int TokenVersion(string uid) {
+        User row = AuthUser.ById(uid);
+        if (row == null || row.status != AuthUser.Active) { return -1; }
+        return row.tokenVersion;
     }
 
     static int Rank(string uid) {
-        AuthUserEnt row = AuthUser.ById(uid);
-        if (row == null) { return 0; }
-        if (row.role == "admin") { return 9; }
+        User row = AuthUser.ById(uid);
+        if (row == null || row.status != AuthUser.Active) { return 0; }
+        if (row.isSuper == 1) { return 9; }
         return 1;
     }
 
@@ -141,10 +149,14 @@ class AuthToken {
         return Sha256.Hash(secret, secret.Length);
     }
 
-    static string Issue(string uid, string passwordHash, int now) {
-        if (!AuthToken.Ready() || passwordHash.Length < 16) { return ""; }
-        string plain = "1\t" + uid + "\t" + Convert.ToString(now) + "\t"
-            + passwordHash.Substring(0, 16);
+    /// <summary>Builds the cookie: version marker, uid, issue time and the
+    /// account's tokenVersion, encrypted and authenticated with AES-GCM. No
+    /// password material goes in, so the cookie cannot leak credentials and a
+    /// forced logout is one integer bump.</summary>
+    static string Issue(string uid, int tokenVersion, int now) {
+        if (!AuthToken.Ready()) { return ""; }
+        string plain = "2\t" + uid + "\t" + Convert.ToString(now) + "\t"
+            + Convert.ToString(tokenVersion);
         byte[] key = AuthToken.Key();
         byte[] iv = RandomNumberGenerator.GetBytes(12);
         byte[] tag = new byte[16];
@@ -187,20 +199,18 @@ class AuthToken {
         int first = plain.IndexOf("\t");
         int second = plain.IndexOf("\t", first + 1);
         int third = plain.IndexOf("\t", second + 1);
-        if (first != 1 || plain.Substring(0, first) != "1"
+        if (first != 1 || plain.Substring(0, first) != "2"
             || second <= first + 1 || third <= second + 1
             || plain.IndexOf("\t", third + 1) >= 0) { return ""; }
         string uid = plain.Substring(first + 1, second - first - 1);
         int issued = Filter.ToInt(plain.Substring(second + 1, third - second - 1), 0);
         int now = WebApp.NowSeconds();
         if (issued <= 0 || issued > now + 300 || issued + 864000 <= now) { return ""; }
-        string passwordPart = plain.Substring(third + 1);
-        string currentPart = AuthUser.PasswordPart(uid);
-        // Never log the token, the uid or anything derived from the password:
-        // an access log is not a place to leak credential material.
-        if (currentPart.Length == 0 || !AuthToken.Equal(passwordPart, currentPart)) {
-            return "";
-        }
+        int carried = Filter.ToInt(plain.Substring(third + 1), -1);
+        int current = AuthUser.TokenVersion(uid);
+        // Never log the token or the uid: an access log is not a place to leak
+        // credential material.
+        if (carried < 0 || current < 0 || carried != current) { return ""; }
         return uid;
     }
 }

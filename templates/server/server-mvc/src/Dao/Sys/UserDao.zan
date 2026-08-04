@@ -1,13 +1,14 @@
 using System;
 using System.Data;
 using System.Data.Orm;
+using ZanWeb.Model.Sys;
 
 namespace ZanWeb.Dao.Sys;
 
 /// <summary>
-/// Reads and writes of the user tables. AuthUserEnt is the account used for
-/// login today; User (sys_user) is the int-typed identity the RBAC phase builds
-/// on. Both live here so no controller or resolver builds its own query.
+/// Every read and write of sys_user. Login, token resolution and the admin
+/// screens all come through here, so the account table has exactly one gateway.
+/// A DAO is constructed with the caller's connection and owns no lifecycle.
 /// </summary>
 class UserDao {
     IDbConnection db;
@@ -16,35 +17,52 @@ class UserDao {
         this.db = db;
     }
 
-    // ---- accounts (login) ----
-
-    AuthUserEnt AccountByName(string username) {
-        return this.db.Select<AuthUserEnt>()
-            .Where(a => a.username == username)
-            .First();
-    }
-
-    AuthUserEnt AccountById(int id) {
-        return this.db.Select<AuthUserEnt>()
-            .Where(a => a.id == id)
-            .First();
-    }
-
-    int CountAccounts() {
-        return this.db.Select<AuthUserEnt>().Count();
-    }
-
-    int InsertAccount(AuthUserEnt account) {
-        return this.db.Insert<AuthUserEnt>(account).ExecuteIdentity();
-    }
-
-    // ---- identities (sys_user) ----
-
-    List<User> All() {
-        return this.db.Select<User>().OrderBy(a => a.id).ToList();
+    User ByUsername(string username) {
+        return this.db.Select<User>().Where(a => a.username == username).First();
     }
 
     User ById(int id) {
-        return this.db.Select<User>().Where(a => a.id == id).ToOne();
+        return this.db.Select<User>().Where(a => a.id == id).First();
+    }
+
+    /// <summary>Accounts as the API may expose them: no password material. See
+    /// UserBrief.</summary>
+    List<UserBrief> AllBrief() {
+        List<User> rows = this.db.Select<User>().OrderBy(a => a.id).ToList();
+        List<UserBrief> brief = new List<UserBrief>();
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            brief.Add(UserDao.Brief(rows[i]));
+        }
+        return brief;
+    }
+
+    static UserBrief Brief(User row) {
+        UserBrief b = new UserBrief();
+        b.id = row.id;
+        b.username = row.username;
+        b.nickname = row.nickname;
+        b.departmentId = row.departmentId;
+        b.status = row.status;
+        b.isSuper = row.isSuper;
+        return b;
+    }
+
+    int Count() {
+        return this.db.Select<User>().Count();
+    }
+
+    int Insert(User user) {
+        return this.db.Insert<User>(user).ExecuteIdentity();
+    }
+
+    /// <summary>Invalidates every token issued for this account so far. Call it
+    /// after a password change or to force a logout.</summary>
+    int BumpTokenVersion(int id) {
+        User row = this.ById(id);
+        if (row == null) { return 0; }
+        return this.db.Update<User>()
+            .Set(a => a.tokenVersion, row.tokenVersion + 1)
+            .Where(a => a.id == id)
+            .ExecuteAffrows();
     }
 }
