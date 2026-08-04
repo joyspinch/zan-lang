@@ -275,7 +275,7 @@ static void fg_ctor(fg_buf_t *b, zan_json_value_t *o, int ft, const char *wt) {
         fg_esc_cstr(b, fg_obj_str(o, "placeholder"));
         fg_putf(b, "\")");
     } else if (strcmp(wt, "TextArea") == 0) {
-        fg_putf(b, "TextArea.Create(\"");
+        fg_putf(b, "new TextArea(\"");
         fg_esc_cstr(b, fg_obj_str(o, "placeholder"));
         fg_putf(b, "\")");
     } else if (strcmp(wt, "Button") == 0) {
@@ -287,19 +287,19 @@ static void fg_ctor(fg_buf_t *b, zan_json_value_t *o, int ft, const char *wt) {
         fg_esc_cstr(b, cap);
         fg_putf(b, "\")");
     } else if (strcmp(wt, "Switch") == 0) {
-        fg_putf(b, "Switch.Create()");
+        fg_putf(b, "new Switch()");
     } else if (strcmp(wt, "Radio") == 0) {
-        fg_putf(b, "new Radio(SignalInt.Create(0), 0, \"");
+        fg_putf(b, "new Radio(new SignalInt(0), 0, \"");
         fg_esc_cstr(b, cap);
         fg_putf(b, "\")");
     } else if (strcmp(wt, "Slider") == 0) {
-        fg_putf(b, "new Slider(0, 100, SignalInt.Create(0))");
+        fg_putf(b, "new Slider(0, 100, new SignalInt(0))");
     } else if (strcmp(wt, "SelectBox") == 0) {
         fg_putf(b, "SelectBox.FromOptions(new List<string>(), \"\")");
     } else if (strcmp(wt, "Progress") == 0) {
         fg_putf(b, "new Progress(50, 1)");
     } else if (strcmp(wt, "Rate") == 0) {
-        fg_putf(b, "new Rate(SignalInt.Create(0), 5)");
+        fg_putf(b, "new Rate(new SignalInt(0), 5)");
     } else if (strcmp(wt, "Panel") == 0) {
         fg_putf(b, "new Panel(\"");
         fg_esc_cstr(b, fg_obj_str(o, "name"));

@@ -2200,7 +2200,7 @@ static void dg_gen_entity(dg_ctx_t *c, dg_buf_t *out, zan_istr_t cls) {
         "        q.tbl = \"%.*s\";\n"
         "        q.on = true;\n"
         "        q.w = \"\";\n"
-        "        q.ps = DbParams.Create();\n"
+        "        q.ps = new DbParams();\n"
         "        q.ob = \"\";\n"
         "        q.gb = \"\";\n"
         "        q.h = \"\";\n"
@@ -2733,7 +2733,7 @@ static void dg_gen_insert(dg_ctx_t *c, dg_buf_t *out, zan_istr_t cls,
 
     dg_putf(out,
         "    int ExecuteDicts() {\n"
-        "        DbParams ps = DbParams.Create();\n"
+        "        DbParams ps = new DbParams();\n"
         "        DbValues head = this.dicts[0];\n"
         "        StringBuilder sb = new StringBuilder();\n"
         "        sb.Append(\"INSERT INTO \");\n"
@@ -2769,7 +2769,7 @@ static void dg_gen_insert(dg_ctx_t *c, dg_buf_t *out, zan_istr_t cls,
         "    int ExecuteAffrows() {\n"
         "        if (this.dicts.Count > 0) { return ExecuteDicts(); }\n"
         "        if (this.rows.Count == 0) { return 0; }\n"
-        "        DbParams ps = DbParams.Create();\n"
+        "        DbParams ps = new DbParams();\n"
         "        string cols = \"\";\n", CL, CS);
     for (int i = 0; i < fs->count; i++) {
         const dg_field_t *f = &fs->items[i];
@@ -2852,9 +2852,9 @@ static void dg_gen_update(dg_ctx_t *c, dg_buf_t *out, zan_istr_t cls,
         "        q.only = new List<string>();\n"
         "        q.skip = new List<string>();\n"
         "        q.sets = \"\";\n"
-        "        q.sp = DbParams.Create();\n"
+        "        q.sp = new DbParams();\n"
         "        q.w = \"\";\n"
-        "        q.wp = DbParams.Create();\n"
+        "        q.wp = new DbParams();\n"
         "        q.on = true;\n"
         "        return q;\n"
         "    }\n"
@@ -3044,7 +3044,7 @@ static void dg_gen_delete(dg_ctx_t *c, dg_buf_t *out, zan_istr_t cls,
         "        q.db = db;\n"
         "        q.tbl = \"%.*s\";\n"
         "        q.w = \"\";\n"
-        "        q.ps = DbParams.Create();\n"
+        "        q.ps = new DbParams();\n"
         "        q.on = true;\n"
         "        return q;\n"
         "    }\n"
@@ -3215,6 +3215,9 @@ void zan_dbgen_run(zan_ast_node_t *unit, zan_arena_t *arena,
 
     dg_buf_t out;
     memset(&out, 0, sizeof(out));
+    /* The generated query classes spell the lambda slot type `Expr<T>`, which
+     * lives in System.Linq; the program itself need not import it. */
+    dg_putf(&out, "using System.Linq;\nusing System.Data.Orm;\n");
     dg_putf(&out, "class __DbBind {\n");
     for (int i = 0; i < c.need.count; i++) {
         zan_istr_t cls = c.need.names[i];
@@ -3271,7 +3274,7 @@ void zan_dbgen_run(zan_ast_node_t *unit, zan_arena_t *arena,
          * `t.` the WHERE builder emits is dropped there. */
         "    static string Unalias(string f) { return f.Replace(\"t.\", \"\"); }\n"
         "    static DbParams Cat(DbParams a, DbParams b) {\n"
-        "        DbParams r = DbParams.Create();\n"
+        "        DbParams r = new DbParams();\n"
         "        __DbBind.CopyInto(a, r);\n"
         "        __DbBind.CopyInto(b, r);\n"
         "        return r;\n"
@@ -3311,7 +3314,7 @@ void zan_dbgen_run(zan_ast_node_t *unit, zan_arena_t *arena,
         "            sql = \"SELECT COUNT(*) FROM sqlite_master WHERE"
         " type = 'table' AND name = ?\";\n"
         "        }\n"
-        "        DbResult r = db.Query(sql, DbParams.Create().Add(t));\n"
+        "        DbResult r = db.Query(sql, new DbParams().Add(t));\n"
         "        if (r.RowCount() == 0) { return false; }\n"
         "        return r.GetInt(0, 0) > 0;\n"
         "    }\n"
@@ -3326,7 +3329,7 @@ void zan_dbgen_run(zan_ast_node_t *unit, zan_arena_t *arena,
         "        } else {\n"
         "            r = db.Query(\"SELECT column_name FROM"
         " information_schema.columns WHERE table_name = ?\",\n"
-        "                DbParams.Create().Add(t));\n"
+        "                new DbParams().Add(t));\n"
         "        }\n"
         "        int i = 0;\n"
         "        while (i < r.RowCount()) {\n"
@@ -3386,6 +3389,9 @@ void zan_dbgen_run(zan_ast_node_t *unit, zan_arena_t *arena,
     zan_parser_init(&gp, &lex, arena, diag);
     zan_ast_node_t *gu = zan_parser_parse(&gp);
     if (!gu) return;
+    for (int i = 0; i < gu->comp_unit.usings.count; i++)
+        zan_ast_list_push(&unit->comp_unit.usings,
+                          gu->comp_unit.usings.items[i], arena);
     for (int i = 0; i < gu->comp_unit.decls.count; i++)
         zan_ast_list_push(&unit->comp_unit.decls, gu->comp_unit.decls.items[i],
                           arena);
