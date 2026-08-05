@@ -36,6 +36,9 @@ class TextArea : Control {
     Binding<string> data;
     string hint;
     int cursorPos;
+    /// 选区的固定端（字节偏移），-1 表示无选区。光标是活动端，
+    /// 因此 Shift+方向键、拖动和 Ctrl+A 都只移动 `cursorPos`。
+    int selAnchor;
     int scrollY;
     int wid;
     /// 由本帧拥有键盘的属主设置一帧——
@@ -61,6 +64,7 @@ class TextArea : Control {
         model = sig;
         hint = hintText;
         cursorPos = 0;
+        selAnchor = -1;
         scrollY = 0;
         wid = WidgetId.Next();
         skipKeys = false;
@@ -95,6 +99,7 @@ class TextArea : Control {
     void SetText(string v) {
         model.Set(v);
         cursorPos = v.Length;
+        selAnchor = -1;
         PushBinding();
     }
 
@@ -124,6 +129,27 @@ class TextArea : Control {
         string txt = model.Get();
         if (cursorPos > txt.Length) { cursorPos = txt.Length; }
         if (cursorPos < 0) { cursorPos = 0; }
+        if (selAnchor > txt.Length) { selAnchor = txt.Length; }
+    }
+
+    bool HasSel() { return selAnchor >= 0 && selAnchor != cursorPos; }
+    int SelStart() { if (selAnchor >= 0 && selAnchor < cursorPos) { return selAnchor; } return cursorPos; }
+    int SelEnd() { if (selAnchor > cursorPos) { return selAnchor; } return cursorPos; }
+
+    string SelText() {
+        if (!HasSel()) { return ""; }
+        return model.Get().Substring(SelStart(), SelEnd() - SelStart());
+    }
+
+    /// 删除选中的范围，并把光标收拢到其起点。
+    void DeleteSel() {
+        if (!HasSel()) { return; }
+        string txt = model.Get();
+        int s = SelStart();
+        int e = SelEnd();
+        model.Set(txt.Substring(0, s) + txt.Substring(e, txt.Length - e));
+        cursorPos = s;
+        selAnchor = -1;
     }
 
     /// 文本按行返回，每次编辑最多拆分一次。
@@ -165,7 +191,11 @@ class TextArea : Control {
         if (kind == 6) {
             int code = app.window.EventKeyCode();
             if (code == 8) {
-                if (cursorPos > 0) {
+                if (HasSel()) {
+                    DeleteSel();
+                    Edited();
+                    app.RequestRedraw();
+                } else if (cursorPos > 0) {
                     int start = Text.PrevCharStart(txt, cursorPos);
                     model.Set(Text.DeleteBefore(txt, cursorPos));
                     cursorPos = start;
@@ -173,11 +203,13 @@ class TextArea : Control {
                     app.RequestRedraw();
                 }
             } else if (code == 13) {
+                if (HasSel()) { DeleteSel(); txt = model.Get(); }
                 model.Set(Text.InsertAt(txt, cursorPos, "\n"));
                 cursorPos = cursorPos + 1;
                 Edited();
                 app.RequestRedraw();
             } else if (code == 9) {
+                if (HasSel()) { DeleteSel(); txt = model.Get(); }
                 model.Set(Text.InsertAt(txt, cursorPos, "  "));
                 cursorPos = cursorPos + 2;
                 Edited();
@@ -185,6 +217,7 @@ class TextArea : Control {
             } else {
                 string ch = Text.CharStr(code);
                 if (ch.Length > 0) {
+                    if (HasSel()) { DeleteSel(); txt = model.Get(); }
                     model.Set(Text.InsertAt(txt, cursorPos, ch));
                     cursorPos = cursorPos + ch.Length;
                     Edited();
@@ -193,41 +226,96 @@ class TextArea : Control {
             }
         } else if (kind == 4) {
             int kc = app.window.EventKeyCode();
-            if (kc == 37) {
-                if (cursorPos > 0) { cursorPos = Text.PrevCharStart(txt, cursorPos); }
+            int mods = app.window.EventMods();
+            bool shift = Modifiers.HasShift(mods);
+            bool ctrl = Modifiers.HasCtrl(mods);
+            if (ctrl && kc == 65) {
+                // Ctrl+A：全选。
+                selAnchor = 0;
+                cursorPos = txt.Length;
                 app.RequestRedraw();
-            } else if (kc == 39) {
-                if (cursorPos < txt.Length) { cursorPos = Text.NextCharEnd(txt, cursorPos); }
-                app.RequestRedraw();
-            } else if (kc == 38 || kc == 40) {
-                List<string> lines = this.Lines();
-                int caretLine = this.CaretLine(lines);
-                int caretCol = cursorPos - this.LineStartAbs(lines, caretLine);
-                int target = caretLine - 1;
-                if (kc == 40) { target = caretLine + 1; }
-                if (target >= 0 && target < lines.Count) {
-                    int col = caretCol;
-                    if (col > lines[target].Length) { col = lines[target].Length; }
-                    cursorPos = this.LineStartAbs(lines, target) + col;
+            } else if (ctrl && kc == 67) {
+                // Ctrl+C：复制选区（无选区时复制全文）。
+                if (HasSel()) { Clipboard.SetText(SelText()); }
+                else { Clipboard.SetText(txt); }
+            } else if (ctrl && kc == 88) {
+                // Ctrl+X：剪切。
+                if (HasSel()) {
+                    Clipboard.SetText(SelText());
+                    DeleteSel();
+                    Edited();
                     app.RequestRedraw();
                 }
-            } else if (kc == 36) {
-                List<string> lines = this.Lines();
-                cursorPos = this.LineStartAbs(lines, this.CaretLine(lines));
-                app.RequestRedraw();
-            } else if (kc == 35) {
-                List<string> lines = this.Lines();
-                int caretLine = this.CaretLine(lines);
-                cursorPos = this.LineStartAbs(lines, caretLine) + lines[caretLine].Length;
-                app.RequestRedraw();
+            } else if (ctrl && kc == 86) {
+                // Ctrl+V：粘贴并覆盖选区（多行文本整段插入）。
+                string clip = Clipboard.GetText();
+                if (clip.Length > 0) {
+                    if (HasSel()) { DeleteSel(); txt = model.Get(); }
+                    model.Set(Text.InsertAt(txt, cursorPos, clip));
+                    cursorPos = cursorPos + clip.Length;
+                    selAnchor = -1;
+                    Edited();
+                    app.RequestRedraw();
+                }
+            } else if (kc == 37 || kc == 39 || kc == 38 || kc == 40
+                       || kc == 36 || kc == 35) {
+                // 导航键：Shift 从光标处扩展选区，普通移动收起选区。
+                if (shift) {
+                    if (selAnchor < 0) { selAnchor = cursorPos; }
+                } else {
+                    selAnchor = -1;
+                }
+                if (kc == 37) {
+                    if (cursorPos > 0) { cursorPos = Text.PrevCharStart(txt, cursorPos); }
+                    app.RequestRedraw();
+                } else if (kc == 39) {
+                    if (cursorPos < txt.Length) { cursorPos = Text.NextCharEnd(txt, cursorPos); }
+                    app.RequestRedraw();
+                } else if (kc == 38 || kc == 40) {
+                    List<string> lines = this.Lines();
+                    int caretLine = this.CaretLine(lines);
+                    int caretCol = cursorPos - this.LineStartAbs(lines, caretLine);
+                    int target = caretLine - 1;
+                    if (kc == 40) { target = caretLine + 1; }
+                    if (target >= 0 && target < lines.Count) {
+                        int col = caretCol;
+                        if (col > lines[target].Length) { col = lines[target].Length; }
+                        cursorPos = this.LineStartAbs(lines, target) + col;
+                        app.RequestRedraw();
+                    }
+                } else if (kc == 36) {
+                    List<string> lines = this.Lines();
+                    cursorPos = this.LineStartAbs(lines, this.CaretLine(lines));
+                    app.RequestRedraw();
+                } else if (kc == 35) {
+                    List<string> lines = this.Lines();
+                    int caretLine = this.CaretLine(lines);
+                    cursorPos = this.LineStartAbs(lines, caretLine) + lines[caretLine].Length;
+                    app.RequestRedraw();
+                }
             } else if (kc == 46) {
-                if (cursorPos < txt.Length) {
+                if (HasSel()) {
+                    DeleteSel();
+                    Edited();
+                    app.RequestRedraw();
+                } else if (cursorPos < txt.Length) {
                     model.Set(Text.RemoveAt(txt, cursorPos));
                     Edited();
                     app.RequestRedraw();
                 }
             }
         }
+    }
+
+    /// 鸠标位置对应的字节偏移（行高/滚动位置均取当前帧）。
+    int PosFromMouse(App app, List<string> lines, int innerX, int innerY,
+                     int lineH, int fs) {
+        int line = (app.mouseY - innerY + scrollY) / lineH;
+        if (line < 0) { line = 0; }
+        if (line >= lines.Count) { line = lines.Count - 1; }
+        if (line < 0) { return 0; }
+        int col = CodeEditor.ColFromX(lines[line], app.mouseX - innerX, fs);
+        return this.LineStartAbs(lines, line) + col;
     }
 
     int Render(App app, int x, int y, int w, int h) {
@@ -295,6 +383,32 @@ class TextArea : Control {
         if (txt == "" && !focused) {
             c.DrawText(innerX, innerY, hint, t.textTertiary, t.fontSizeMedium);
         } else {
+            int fs = t.fontSizeMedium;
+            if (focused && HasSel()) {
+                // 选区高亮画在文本下面，每行取它与选区的交集；
+                // 含换行的行尾多画一个空格宽，使跳行可见。
+                int selS = SelStart();
+                int selE = SelEnd();
+                int selColor = App.LerpColor(t.bgPrimary, t.primary, 96);
+                int nlW = Canvas.MeasureText(" ", fs);
+                int lineStart = 0;
+                for (int i = 0; i < lines.Count; i = i + 1) {
+                    int lineEnd = lineStart + lines[i].Length;
+                    int s = selS;
+                    int e = selE;
+                    if (s < lineStart) { s = lineStart; }
+                    if (e > lineEnd) { e = lineEnd; }
+                    if (s <= e && selE > lineStart && selS <= lineEnd) {
+                        int ly = innerY + i * lineH - scrollY;
+                        int x0 = Canvas.MeasureText(lines[i].Substring(0, s - lineStart), fs);
+                        int x1 = Canvas.MeasureText(lines[i].Substring(0, e - lineStart), fs);
+                        int selW = x1 - x0;
+                        if (selE > lineEnd) { selW = selW + nlW; }
+                        c.FillRect(innerX + x0, ly, selW, Canvas.FontHeight(fs), selColor);
+                    }
+                    lineStart = lineEnd + 1;
+                }
+            }
             for (int i = 0; i < lines.Count; i = i + 1) {
                 int ly = innerY + i * lineH - scrollY;
                 if (ly + lineH > innerY && ly < innerY + innerH) {
@@ -336,19 +450,34 @@ class TextArea : Control {
 
         app.hitTester.Register(new HitRegion(id, x, y, w, h, 1));
 
+        // 鼠标选择：按下锚定选区并放置光标，按住拖动移动活动端。
+        if (Ui.PressedDown(app, id)) {
+            cursorPos = this.PosFromMouse(app, lines, innerX, innerY, lineH,
+                                          t.fontSizeMedium);
+            if (!Modifiers.HasShift(app.window.EventMods()) || selAnchor < 0) {
+                selAnchor = cursorPos;
+            }
+            this.ClampCursor();
+            app.RequestRedraw();
+        } else if (focused && app.focus.IsPressed(id) && app.EventKind() == 1) {
+            int drag = this.PosFromMouse(app, lines, innerX, innerY, lineH,
+                                         t.fontSizeMedium);
+            if (drag != cursorPos) {
+                cursorPos = drag;
+                this.ClampCursor();
+                app.RequestRedraw();
+            }
+        }
         // 单消费者点击：当此区域是框架解析出的点击
         // 目标时放置光标。
         if (Ui.Clicked(app, id)) {
-            int relY = app.mouseY - innerY + scrollY;
-            int line = relY / lineH;
-            if (line < 0) { line = 0; }
-            if (line >= lines.Count) { line = lines.Count - 1; }
-            int relX = app.mouseX - innerX;
-            int col = CodeEditor.ColFromX(lines[line], relX, t.fontSizeMedium);
-            cursorPos = this.LineStartAbs(lines, line) + col;
+            cursorPos = this.PosFromMouse(app, lines, innerX, innerY, lineH,
+                                          t.fontSizeMedium);
+            if (selAnchor == cursorPos) { selAnchor = -1; }
             this.ClampCursor();
             app.RequestRedraw();
         }
+        if (!focused && selAnchor >= 0) { selAnchor = -1; }
 
         On.Fire(app, id);
         return id;

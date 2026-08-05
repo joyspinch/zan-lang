@@ -14,6 +14,52 @@ delegate void TrayIconCallback(int action);
 /// <summary>隐藏宿主窗口的窗口过程 (window proc)（WINAPI 调用约定）。</summary>
 delegate nint TrayWndProcFn(nint hwnd, int msg, nint wp, nint lp);
 
+/// <summary>托盘菜单选中回调：参数是被选项的 `id`。与
+/// TrayIconCallback 一样必须是普通静态方法。</summary>
+delegate void TrayMenuCallback(int id);
+
+/// <summary>
+/// 托盘右键菜单的一项。`id` 是选中时传给回调的编号，
+/// 必须大于 0（0 是“未选择”）；分隔线用 `TrayMenuItem.Separator()`。
+///
+///   List&lt;TrayMenuItem&gt; m = new List&lt;TrayMenuItem&gt;();
+///   m.Add(new TrayMenuItem(1, "显示主窗口"));
+///   m.Add(TrayMenuItem.Separator());
+///   m.Add(new TrayMenuItem(2, "退出"));
+///   TrayIcon.SetMenu(m, Demo.OnTrayMenu);
+/// </summary>
+class TrayMenuItem {
+    int id;
+    string text;
+    /// 置灰（不可选），仍然显示。
+    bool disabled;
+    /// 左侧勾选标记，用于“开机启动”这类开关项。
+    bool checkMark;
+    /// 分隔线无文本也不可选中。
+    bool separator;
+
+    TrayMenuItem(int itemId, string label) {
+        id = itemId;
+        text = label;
+        disabled = false;
+        checkMark = false;
+        separator = false;
+    }
+
+    /// <summary>一条分隔线。</summary>
+    static TrayMenuItem Separator() {
+        TrayMenuItem it = new TrayMenuItem(0, "");
+        it.separator = true;
+        return it;
+    }
+
+    /// <summary>置灰此项（链式）。</summary>
+    TrayMenuItem Disabled() { disabled = true; return this; }
+
+    /// <summary>勾选此项（链式）。</summary>
+    TrayMenuItem Check(bool on) { checkMark = on; return this; }
+}
+
 /// <summary>
 /// 系统托盘（通知区域）图标，支持气泡通知。
 /// 完全自包含：自行创建隐藏消息窗口和消息
@@ -23,6 +69,7 @@ delegate nint TrayWndProcFn(nint hwnd, int msg, nint wp, nint lp);
 ///   TrayIconCallback cb = Demo.OnTray;      // 静态方法
 ///   TrayIcon.Add("myicon.ico", "MyApp", cb);
 ///   TrayIcon.ShowBalloon("Done", "Task finished", 1, 3000);
+///   TrayIcon.SetMenu(items, Demo.OnTrayMenu);   // 右键菜单
 ///   TrayIcon.Remove();
 ///
 /// 每个进程仅一个图标（常见情形）。仅 Windows 支持；其他
@@ -63,6 +110,28 @@ class TrayIcon {
     [DllImport("user32", EntryPoint = "LoadIconW")]
     static extern nint WinLoadIconW(nint inst, nint name);
 
+    [DllImport("user32", EntryPoint = "CreatePopupMenu")]
+    static extern nint WinCreatePopupMenu();
+
+    [DllImport("user32", EntryPoint = "AppendMenuW")]
+    static extern int WinAppendMenuW(nint menu, int flags, nint id, nint item);
+
+    [DllImport("user32", EntryPoint = "DestroyMenu")]
+    static extern int WinDestroyMenu(nint menu);
+
+    [DllImport("user32", EntryPoint = "TrackPopupMenuEx")]
+    static extern int WinTrackPopupMenuEx(nint menu, int flags, int x, int y,
+                                          nint hwnd, nint parms);
+
+    [DllImport("user32", EntryPoint = "SetForegroundWindow")]
+    static extern int WinSetForegroundWindow(nint hwnd);
+
+    [DllImport("user32", EntryPoint = "GetCursorPos")]
+    static extern int WinGetCursorPos(nint pt);
+
+    [DllImport("user32", EntryPoint = "PostMessageW")]
+    static extern int WinPostMessageW(nint hwnd, int msg, nint wp, nint lp);
+
     [DllImport("user32", EntryPoint = "DestroyIcon")]
     static extern int WinDestroyIcon(nint icon);
 
@@ -83,6 +152,10 @@ class TrayIcon {
     static int taskbarCreatedMsg;
     static string trayIconPath;
     static TrayWndProcFn wndProc;
+    /// 右键菜单模型。菜单在每次弹出时从这份列表重建，
+    /// 因此调用方可以随时改完后重新 SetMenu（例如切换勾选）。
+    static List<TrayMenuItem> menuItems;
+    static TrayMenuCallback menuCb;
     #endif
 
     /// <summary>
@@ -121,6 +194,8 @@ class TrayIcon {
         TrayIcon.WinPostThreadMessageW(TrayIcon.trayThreadId, 0x0012 /*WM_QUIT*/, 0, 0);
         while (TrayIcon.trayHwnd != 0) { Thread.Sleep(1); }
         TrayIcon.userCb = null;
+        TrayIcon.menuItems = null;
+        TrayIcon.menuCb = null;
         #else
         throw new PlatformNotSupportedException(
             "TrayIcon is not implemented on this platform");
@@ -165,7 +240,74 @@ class TrayIcon {
         #endif
     }
 
+    /// <summary>
+    /// 设置右键托盘菜单。右键（或菜单键）点击图标时在
+    /// 托盘线程上弹出菜单，选中后以选项 `id` 调用 `cb`（回调
+    /// 在托盘线程上执行，要动 UI 请投递到自己的窗口）。弹出时
+    /// 每次重建菜单，因此只需改完列表再调一次就能切换勾选/置灰。
+    /// 传 null 或空列表等于 ClearMenu()。
+    /// </summary>
+    static void SetMenu(List<TrayMenuItem> items, TrayMenuCallback cb) {
+        #if WINDOWS
+        TrayIcon.menuItems = items;
+        TrayIcon.menuCb = cb;
+        #else
+        throw new PlatformNotSupportedException(
+            "TrayIcon is not implemented on this platform");
+        #endif
+    }
+
+    /// <summary>移除右键菜单，右键回到只通知 TrayIconCallback。</summary>
+    static void ClearMenu() {
+        #if WINDOWS
+        TrayIcon.menuItems = null;
+        TrayIcon.menuCb = null;
+        #else
+        throw new PlatformNotSupportedException(
+            "TrayIcon is not implemented on this platform");
+        #endif
+    }
+
     #if WINDOWS
+    /// 在鼠标处弹出右键菜单并同步等待选择。必须在托盘
+    /// 线程（拥有隐藏窗口的那个）上调用。先 SetForegroundWindow
+    /// 再 TrackPopupMenuEx，否则菜单不能失焦关闭（经典 Win32 坑）。
+    static void ShowMenu() {
+        List<TrayMenuItem> items = TrayIcon.menuItems;
+        if (items == null || items.Count == 0) { return; }
+        nint menu = TrayIcon.WinCreatePopupMenu();
+        if (menu == 0) { return; }
+        for (int i = 0; i < items.Count; i = i + 1) {
+            TrayMenuItem it = items[i];
+            if (it == null) { continue; }
+            if (it.separator) {
+                TrayIcon.WinAppendMenuW(menu, 0x0800 /*MF_SEPARATOR*/, 0, 0);
+                continue;
+            }
+            int flags = 0;                            // MF_STRING
+            if (it.disabled) { flags = flags | 0x0003; }   // MF_GRAYED|MF_DISABLED
+            if (it.checkMark) { flags = flags | 0x0008; }  // MF_CHECKED
+            nint label = Wide.Of(it.text);
+            TrayIcon.WinAppendMenuW(menu, flags, (nint)it.id, label);
+            Wide.Free(label);
+        }
+        nint pt = NativeMemory.Alloc(8);
+        TrayIcon.ZeroMem(pt, 8);
+        TrayIcon.WinGetCursorPos(pt);
+        Span<int> xy = new Span<int>(pt, 2);
+        int px = xy[0];
+        int py = xy[1];
+        NativeMemory.Free(pt);
+        TrayIcon.WinSetForegroundWindow(TrayIcon.trayHwnd);
+        // TPM_RETURNCMD|TPM_RIGHTBUTTON|TPM_NONOTIFY
+        int cmd = TrayIcon.WinTrackPopupMenuEx(menu, 0x0100 | 0x0002 | 0x0080,
+                                              px, py, TrayIcon.trayHwnd, 0);
+        TrayIcon.WinDestroyMenu(menu);
+        // 菜单关闭后需要一条空消息，否则下一次弹出可能不响应。
+        TrayIcon.WinPostMessageW(TrayIcon.trayHwnd, 0 /*WM_NULL*/, 0, 0);
+        if (cmd > 0 && TrayIcon.menuCb != null) { TrayIcon.menuCb(cmd); }
+    }
+
     /// 在托盘线程上运行：注册窗口类，创建
     /// 隐藏窗口，添加图标，然后泵送消息直到 WM_QUIT。
     static void TrayThreadEntry() {
@@ -249,9 +391,9 @@ class TrayIcon {
     }
 
     static void SetVersion() {
-        nint data = NativeMemory.Alloc(984);
-        TrayIcon.ZeroMem(data, 984);
-        new Span<int>(data, 1)[0] = 984;
+        nint data = NativeMemory.Alloc(976);
+        TrayIcon.ZeroMem(data, 976);
+        new Span<int>(data, 1)[0] = 976;
         new Span<long>(data + 8, 1)[0] = TrayIcon.trayHwnd;
         new Span<int>(data + 16, 1)[0] = 1;       // uID
         new Span<int>(data + 816, 1)[0] = 3;      // NOTIFYICON_VERSION_4
@@ -273,9 +415,9 @@ class TrayIcon {
     /// |NIF_TIP）、uCallbackMessage、hIcon 以及气泡字段。
     static nint BuildData(string tooltip, string title, string text,
                           int iconKind, int timeoutMs) {
-        nint data = NativeMemory.Alloc(984);
-        TrayIcon.ZeroMem(data, 984);
-        new Span<int>(data, 1)[0] = 984;          // cbSize
+        nint data = NativeMemory.Alloc(976);
+        TrayIcon.ZeroMem(data, 976);
+        new Span<int>(data, 1)[0] = 976;          // cbSize
         new Span<long>(data + 8, 1)[0] = TrayIcon.trayHwnd;
         new Span<int>(data + 16, 1)[0] = 1;       // uID
         new Span<int>(data + 20, 1)[0] = 0x0007;  // NIF_MESSAGE|NIF_ICON|NIF_TIP
@@ -289,8 +431,8 @@ class TrayIcon {
         TrayIcon.PutWide(data + 40, tooltip, 128);
         if (title != "" || text != "") {
             TrayIcon.PutWide(data + 304, text, 256);    // szInfo
-            TrayIcon.PutWide(data + 824, title, 64);    // szInfoTitle
-            new Span<int>(data + 952, 1)[0] = TrayIcon.BalloonFlags(iconKind);
+            TrayIcon.PutWide(data + 820, title, 64);    // szInfoTitle
+            new Span<int>(data + 948, 1)[0] = TrayIcon.BalloonFlags(iconKind);
             new Span<int>(data + 816, 1)[0] = timeoutMs;  // uTimeout
         }
         return data;
@@ -323,14 +465,21 @@ class TrayIcon {
     /// 隐藏宿主窗口的窗口过程 (window proc)。只有托盘回调
     /// 消息和 TaskbarCreated 消息值得关注。
     static nint TrayWndProcImpl(nint hwnd, int msg, nint wp, nint lp) {
-        if (msg == 0x8000 /*WM_APP*/ && TrayIcon.userCb != null) {
-            int action = 0;
+        if (msg == 0x8000 /*WM_APP*/) {
             int l = (int)lp;
-            if (l == 0x0201) { action = 1; }          // WM_LBUTTONDOWN
-            if (l == 0x0203) { action = 2; }          // WM_LBUTTONDBLCLK
-            if (l == 0x0204) { action = 3; }          // WM_RBUTTONDOWN
-            if (l == 0x0207) { action = 4; }          // WM_MBUTTONDOWN
-            if (action != 0) { TrayIcon.userCb(action); }
+            if (TrayIcon.userCb != null) {
+                int action = 0;
+                if (l == 0x0201) { action = 1; }      // WM_LBUTTONDOWN
+                if (l == 0x0203) { action = 2; }      // WM_LBUTTONDBLCLK
+                if (l == 0x0204) { action = 3; }      // WM_RBUTTONDOWN
+                if (l == 0x0207) { action = 4; }      // WM_MBUTTONDOWN
+                if (action != 0) { TrayIcon.userCb(action); }
+            }
+            // 右键抬起 / 菜单键：弹出托盘菜单。用抬起而不是按下，
+            // 与系统托盘图标一致。
+            if (l == 0x0205 /*WM_RBUTTONUP*/ || l == 0x007B /*WM_CONTEXTMENU*/) {
+                TrayIcon.ShowMenu();
+            }
         }
         if (msg == TrayIcon.taskbarCreatedMsg && TrayIcon.trayHwnd != 0) {
             // Explorer 已重启：重新添加图标，使图标得以保留。
