@@ -73,8 +73,10 @@ partial class ZanIDE {
         string nameZh = ZanIDE.ManifestField(m, "name.zh", nameEn);
         string descEn = ZanIDE.ManifestField(m, "desc", "");
         string descZh = ZanIDE.ManifestField(m, "desc.zh", descEn);
+        string catEn = ZanIDE.ManifestField(m, "category", "Other");
+        string catZh = ZanIDE.ManifestField(m, "category.zh", catEn);
         Tpl t = Tpl.Make(
-            ZanIDE.ManifestField(m, "category", "Other"),
+            ZanIDE.T(catEn, catZh),
             ZanIDE.T(nameEn, nameZh),
             ZanIDE.ManifestField(m, "icon", "file"),
             ZanIDE.ManifestField(m, "kind", "copy"),
@@ -84,6 +86,24 @@ partial class ZanIDE {
         t.ptarget = ZanIDE.ManifestField(m, "target", "exe");
         t.pentry = ZanIDE.ManifestField(m, "entry", "src/main.zan");
         t.order = ZanIDE.ParseInt(ZanIDE.ManifestField(m, "order", "1000"));
+        // `size=1280x720` is the design size; `sizeable=1` marks the template as
+        // creatable at any device size (the wizard then shows the size row and
+        // the host rewrites the .zform canvas), `shape=round` a watch face.
+        string size = ZanIDE.ManifestField(m, "size", "");
+        if (size != "") {
+            List<string> wh = size.Split("x");
+            if (wh.Count == 2) {
+                t.defW = ZanIDE.ParseIntSafe(wh[0]);
+                t.defH = ZanIDE.ParseIntSafe(wh[1]);
+            }
+        }
+        t.sizeable = ZanIDE.ManifestField(m, "sizeable", "0") == "1";
+        t.round = ZanIDE.ManifestField(m, "shape", "") == "round";
+        t.sketch = ZanIDE.ManifestField(m, "sketch", "");
+        string prev = ZanIDE.ManifestField(m, "preview", "");
+        if (prev != "" && File.Exists(dir + "/" + prev)) {
+            t.preview = dir + "/" + prev;
+        }
         ts.Add(t);
     }
 
@@ -105,7 +125,9 @@ partial class ZanIDE {
     static List<WizardTemplate> WizTemplates(List<Tpl> ts) {
         List<WizardTemplate> outp = new List<WizardTemplate>();
         foreach (Tpl t in ts) {
-            outp.Add(new WizardTemplate(t.cat, t.name, t.icon, t.desc));
+            outp.Add(new WizardTemplate(t.cat, t.name, t.icon, t.desc)
+                .Shape(t.sizeable, t.defW, t.defH, t.round)
+                .Look(t.preview, t.sketch));
         }
         return outp;
     }
@@ -267,6 +289,49 @@ partial class ZanIDE {
         string reserved = " CON PRN AUX NUL COM1 COM2 COM3 COM4 COM5 COM6 COM7 COM8 COM9 LPT1 LPT2 LPT3 LPT4 LPT5 LPT6 LPT7 LPT8 LPT9 ";
         if (ZanIDE.Has(reserved, " " + upper + " ")) { return false; }
         return true;
+    }
+
+    /// Scaffolds a new project and, for a `sizeable` template, retargets its
+    /// design canvas to the size picked in the wizard (0 = keep the template's
+    /// own size). Device size is a parameter of one template, so "phone" and
+    /// "desktop" are the same scaffold at a different canvas.
+    static string CreateProjectT(Tpl tpl, string parent, string name, string platforms,
+                                 int devW, int devH, List<string> log) {
+        string dir = ZanIDE.CreateProjectT(tpl, parent, name, platforms, log);
+        if (dir == "") { return dir; }
+        if (tpl.sizeable && devW >= 40 && devH >= 40) {
+            ZanIDE.RetargetForms(dir + "/src", devW, devH, log);
+        }
+        return dir;
+    }
+
+    /// Rewrites the design size of every .zform under `srcDir` and keeps the
+    /// absolutely-placed controls inside the new canvas (a 1280x720 layout
+    /// pasted onto a 390x844 phone would otherwise leave controls off-screen).
+    static void RetargetForms(string srcDir, int devW, int devH, List<string> log) {
+        if (!Directory.Exists(srcDir)) { return; }
+        List<string> files = Directory.GetFiles(srcDir);
+        for (int i = 0; i < files.Count; i = i + 1) {
+            string fp = srcDir + "/" + files[i];
+            if (!ZanIDE.IsFormPath(fp)) { continue; }
+            FormDoc d = Json.Deserialize<FormDoc>(File.ReadAllText(fp));
+            if (d == null || d.fields == null) { continue; }
+            if (d.winW == devW && d.winH == devH) { continue; }
+            int margin = 16;
+            for (int k = 0; k < d.fields.Count; k = k + 1) {
+                FormFieldDoc f = d.fields[k];
+                if (f.fw > devW - 2 * margin) { f.fw = devW - 2 * margin; }
+                if (f.fx + f.fw > devW - margin) { f.fx = devW - margin - f.fw; }
+                if (f.fx < margin) { f.fx = margin; }
+                if (f.fy + f.fh > devH - margin) { f.fy = devH - margin - f.fh; }
+                if (f.fy < margin) { f.fy = margin; }
+            }
+            d.winW = devW;
+            d.winH = devH;
+            File.WriteAllText(fp, Json.Serialize<FormDoc>(d));
+            log.Add("> Design canvas set to " + Convert.ToString(devW) + "x"
+                + Convert.ToString(devH) + ": " + fp);
+        }
     }
 
     /// Scaffolds a new project from a template descriptor; returns its directory.

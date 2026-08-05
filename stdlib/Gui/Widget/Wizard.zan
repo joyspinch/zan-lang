@@ -19,18 +19,58 @@ class WizardItem {
 }
 
 /// 分类项目向导的模板条目：一个 WizardItem 加上其所属的
-/// 分类列。
+/// 分类列，以及向导右侧预览所需的形态信息。
+///
+/// 尺寸不再是分类里的独立模板：产出设计窗口的模板把
+/// `sizeable` 置为 true，向导据此显示设备尺寸行，宿主用所选
+/// 尺寸创建项目——手机 / 平板 / 手表只是同一个模板的目标尺寸。
 class WizardTemplate {
     string cat;
     string name;
     string icon;
     string desc;
+    /// 该模板产出一个可按设备尺寸创建的设计窗口。
+    bool sizeable;
+    /// 默认设计尺寸（sizeable 时用于预览与创建）。
+    int defW;
+    int defH;
+    /// 圆形设计区（智能手表表盘）。
+    bool round;
+    /// 真实截图的绝对路径，为空时按 `sketch` 画线框。
+    string preview;
+    /// 线框骨架：逗号分隔的记号，见 Wizard.RenderSketch
+    /// （titlebar / toolbar / ribbon / tabs / sidebar / statusbar /
+    /// form / chart / gauges / alarms / list / console / webview /
+    /// server / library）。
+    string sketch;
 
     WizardTemplate(string c, string n, string ic, string d) {
         cat = c;
         name = n;
         icon = ic;
         desc = d;
+        sizeable = false;
+        defW = 0;
+        defH = 0;
+        round = false;
+        preview = "";
+        sketch = "";
+    }
+
+    /// 链式配置形态信息，让宿主只描述它从清单里读到的内容。
+    WizardTemplate Shape(bool canSize, int w, int h, bool isRound) {
+        sizeable = canSize;
+        defW = w;
+        defH = h;
+        round = isRound;
+        return this;
+    }
+
+    /// 预览来源：真实截图路径（可为空）与线框记号。
+    WizardTemplate Look(string previewPath, string sketchSpec) {
+        preview = previewPath;
+        sketch = sketchSpec;
+        return this;
     }
 }
 
@@ -172,6 +212,256 @@ class Wizard {
         return Wizard.TW("Band", "手环");
     }
 
+    /// `sketch` 记号列表里是否含有 `token`。
+    static bool SketchHas(string sketch, string token) {
+        if (sketch == "") { return false; }
+        List<string> parts = sketch.Split(",");
+        for (int i = 0; i < parts.Count; i = i + 1) {
+            if (parts[i].Trim() == token) { return true; }
+        }
+        return false;
+    }
+
+    /// 右侧预览面板：所选模板在目标尺寸下的样子。有真实截图
+    /// （模板目录里的 `preview` 图片）就按比例贴图，否则按模板
+    /// 声明的 `sketch` 骨架画线框——两者都在正确宽高比的设备
+    /// 外框里，因此"创建出来是什么样"在创建之前就能看到。
+    static void RenderPreview(App app, int x, int y, int w, int h,
+                              WizardTemplate tpl, int devW, int devH) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        c.FillRoundRect(x, y, w, h, t.borderRadiusMedium, t.bgSecondary);
+        c.DrawRoundRect(x, y, w, h, t.borderRadiusMedium, t.borderSecondary, 1);
+        int pad = t.paddingMedium;
+        c.DrawText(x + pad, y + pad, Wizard.TW("Preview", "预览"),
+                   t.textSecondary, t.fontSizeSmall);
+        if (tpl == null) { return; }
+
+        int top = y + pad + app.Scale(22);
+        int capH = app.Scale(38);
+        int aw = w - 2 * pad;
+        int ah = h - (top - y) - capH - pad;
+        if (aw < app.Scale(40) || ah < app.Scale(40)) { return; }
+
+        // 设备外框：按目标宽高比内接于可用区域，使手机竖屏和
+        // 桌面横屏一眼就能区分。未声明尺寸的模板（控制台 /
+        // 服务端 / 类库）用 16:10 的中性比例。
+        int rw = devW;
+        int rh = devH;
+        if (rw <= 0 || rh <= 0) { rw = 16; rh = 10; }
+        int dw = aw;
+        int dh = dw * rh / rw;
+        if (dh > ah) {
+            dh = ah;
+            dw = dh * rw / rh;
+        }
+        int dx = x + (w - dw) / 2;
+        int dy = top + (ah - dh) / 2;
+
+        if (tpl.round) {
+            int r = dw / 2;
+            if (dh / 2 < r) { r = dh / 2; }
+            int cxx = dx + dw / 2;
+            int cyy = dy + dh / 2;
+            c.FillCircle(cxx, cyy, r, t.bgPrimary);
+            c.DrawCircle(cxx, cyy, r, t.borderPrimary, 2);
+            c.PushClip(cxx - r, cyy - r, 2 * r, 2 * r);
+            Wizard.RenderSketch(app, cxx - r, cyy - r, 2 * r, 2 * r, tpl);
+            c.PopClip();
+        } else {
+            c.FillRoundRect(dx, dy, dw, dh, t.borderRadiusSmall, t.bgPrimary);
+            c.DrawRoundRect(dx, dy, dw, dh, t.borderRadiusSmall, t.borderPrimary, 1);
+            c.PushClip(dx, dy, dw, dh);
+            if (tpl.preview != "" && Canvas.ImageWidth(tpl.preview) > 0) {
+                c.BlitImage(tpl.preview, dx, dy, dw, dh, 0, 0, 0, 0);
+            } else {
+                Wizard.RenderSketch(app, dx, dy, dw, dh, tpl);
+            }
+            c.PopClip();
+        }
+
+        // 标题下方一行说明：目标尺寸（或"自由布局"）。
+        string cap = Wizard.TW("Free layout", "自由布局");
+        if (devW > 0 && devH > 0) {
+            cap = Convert.ToString(devW) + " x " + Convert.ToString(devH);
+        }
+        int capW = Canvas.MeasureText(cap, t.fontSizeSmall);
+        c.DrawText(x + (w - capW) / 2, y + h - capH + app.Scale(10), cap,
+                   t.textTertiary, t.fontSizeSmall);
+    }
+
+    /// 在 (x,y,w,h) 内按 `tpl.sketch` 的记号画出模板骨架的线框：
+    /// 每个记号占据它在真实窗口里的位置（标题栏在上、状态栏在
+    /// 下、侧栏在左），内容记号填充剩下的区域。
+    static void RenderSketch(App app, int x, int y, int w, int h,
+                             WizardTemplate tpl) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        string sk = tpl.sketch;
+        int line = t.borderPrimary;
+        int fill = t.bgTertiary;
+        int accent = t.primary;
+        int unit = h / 14;
+        if (unit < 3) { unit = 3; }
+
+        int cx = x;
+        int cy = y;
+        int cw = w;
+        int chh = h;
+
+        if (Wizard.SketchHas(sk, "titlebar")) {
+            c.FillRect(cx, cy, cw, unit * 2, fill);
+            c.FillCircle(cx + unit, cy + unit, unit / 3, accent);
+            cy = cy + unit * 2;
+            chh = chh - unit * 2;
+        }
+        if (Wizard.SketchHas(sk, "ribbon")) {
+            c.FillRect(cx, cy, cw, unit * 3, fill);
+            for (int rb = 0; rb < 4; rb = rb + 1) {
+                c.FillRect(cx + unit + rb * unit * 2, cy + unit, unit, unit, line);
+            }
+            cy = cy + unit * 3;
+            chh = chh - unit * 3;
+        }
+        if (Wizard.SketchHas(sk, "toolbar")) {
+            c.FillRect(cx, cy, cw, unit * 2, fill);
+            for (int tb = 0; tb < 5; tb = tb + 1) {
+                c.FillRect(cx + unit + tb * unit * 2, cy + unit / 2, unit, unit, line);
+            }
+            cy = cy + unit * 2;
+            chh = chh - unit * 2;
+        }
+        if (Wizard.SketchHas(sk, "tabs")) {
+            for (int tt = 0; tt < 3; tt = tt + 1) {
+                int col = fill;
+                if (tt == 0) { col = accent; }
+                c.FillRect(cx + unit + tt * unit * 4, cy, unit * 3, unit + unit / 2, col);
+            }
+            cy = cy + unit * 2;
+            chh = chh - unit * 2;
+        }
+        if (Wizard.SketchHas(sk, "statusbar")) {
+            int sbH = unit + unit / 2;
+            c.FillRect(cx, cy + chh - sbH, cw, sbH, fill);
+            chh = chh - sbH - unit / 2;
+        }
+        if (Wizard.SketchHas(sk, "alarms")) {
+            c.FillRect(cx, cy, cw, unit * 2, t.error);
+            cy = cy + unit * 2 + unit / 2;
+            chh = chh - unit * 2 - unit / 2;
+        }
+        if (Wizard.SketchHas(sk, "sidebar")) {
+            int sw = cw / 4;
+            c.FillRect(cx, cy, sw, chh, fill);
+            for (int sb = 0; sb < 4; sb = sb + 1) {
+                c.FillRect(cx + unit / 2, cy + unit + sb * unit * 2, sw - unit, unit, line);
+            }
+            cx = cx + sw + unit;
+            cw = cw - sw - unit;
+        }
+
+        // ---- 内容区 ----
+        if (Wizard.SketchHas(sk, "console")) {
+            c.FillRect(cx, cy, cw, chh, 0xFF10151C);
+            for (int cl = 0; cl < 5; cl = cl + 1) {
+                int lw2 = cw / 2 + (cl % 3) * cw / 8;
+                c.FillRect(cx + unit, cy + unit + cl * unit * 2, lw2, unit / 2 + 1,
+                           0xFF6FCF7F);
+            }
+        } else if (Wizard.SketchHas(sk, "webview")) {
+            c.FillRect(cx, cy, cw, unit * 2, fill);
+            c.FillRect(cx + unit, cy + unit / 2, cw - unit * 2, unit, t.bgPrimary);
+            c.FillRect(cx, cy + unit * 3, cw, chh - unit * 3, t.bgSecondary);
+        } else if (Wizard.SketchHas(sk, "chart") || Wizard.SketchHas(sk, "gauges")) {
+            int half = chh / 2;
+            if (Wizard.SketchHas(sk, "chart")) {
+                c.DrawRect(cx, cy, cw, half - unit, line, 1);
+                List<int> xs = new List<int>();
+                List<int> ys = new List<int>();
+                for (int pt = 0; pt < 7; pt = pt + 1) {
+                    xs.Add(cx + unit + pt * (cw - unit * 2) / 6);
+                    int amp = half - unit * 3;
+                    if (amp < unit) { amp = unit; }
+                    int off = amp * (pt % 3) / 2;
+                    ys.Add(cy + half - unit * 2 - off);
+                }
+                c.DrawPolyline(xs, ys, accent, 2);
+            }
+            if (Wizard.SketchHas(sk, "gauges")) {
+                int gr = half / 3;
+                if (gr < unit) { gr = unit; }
+                for (int gi2 = 0; gi2 < 3; gi2 = gi2 + 1) {
+                    int gcx = cx + gr + unit + gi2 * (gr * 2 + unit * 2);
+                    int gcy = cy + chh - gr - unit;
+                    c.DrawCircle(gcx, gcy, gr, line, 2);
+                    c.DrawLine(gcx, gcy, gcx + gr / 2, gcy - gr / 2, accent, 2);
+                }
+            }
+        } else if (Wizard.SketchHas(sk, "list")) {
+            for (int li = 0; li < 6; li = li + 1) {
+                int rowY = cy + unit + li * unit * 2;
+                if (rowY + unit > cy + chh) { break; }
+                c.FillRect(cx, rowY, cw, unit + unit / 3, fill);
+            }
+        } else if (Wizard.SketchHas(sk, "server")) {
+            int bw2 = (cw - unit * 2) / 3;
+            for (int sv = 0; sv < 3; sv = sv + 1) {
+                int bx2 = cx + sv * (bw2 + unit);
+                if (bx2 + bw2 > cx + cw) { break; }
+                c.DrawRect(bx2, cy + chh / 3, bw2, unit * 3, line, 1);
+                if (sv > 0) {
+                    c.DrawLine(bx2 - unit, cy + chh / 3 + unit, bx2, cy + chh / 3 + unit,
+                               accent, 2);
+                }
+            }
+        } else if (Wizard.SketchHas(sk, "library")) {
+            for (int lb = 0; lb < 3; lb = lb + 1) {
+                c.DrawRect(cx + lb * unit, cy + chh / 3 + lb * unit, cw / 2, unit * 2,
+                           line, 1);
+            }
+        } else if (Wizard.SketchHas(sk, "form")) {
+            for (int fr = 0; fr < 4; fr = fr + 1) {
+                int rowY = cy + unit + fr * unit * 3;
+                if (rowY + unit * 2 > cy + chh) { break; }
+                c.FillRect(cx, rowY, cw / 3, unit, fill);
+                c.DrawRect(cx, rowY + unit + unit / 2, cw - unit, unit + unit / 2, line, 1);
+            }
+            int okW = cw / 3;
+            c.FillRect(cx, cy + chh - unit * 2, okW, unit + unit / 2, accent);
+        } else if (Wizard.SketchHas(sk, "cards")) {
+            int cwid = (cw - unit) / 2;
+            for (int cd = 0; cd < 4; cd = cd + 1) {
+                int col2 = cd % 2;
+                int row2 = cd / 2;
+                int cyy = cy + row2 * (chh / 2);
+                if (cyy + chh / 2 - unit > cy + chh) { break; }
+                c.DrawRect(cx + col2 * (cwid + unit), cyy, cwid, chh / 2 - unit, line, 1);
+            }
+        }
+    }
+
+    /// 从自定义宽/高输入里解析前导数字（输入是自由文本，
+    /// 单位或空格都无所谓），无数字时返回 0。
+    static int ParseDim(string s) {
+        string digits = "0123456789";
+        int n = 0;
+        bool any = false;
+        for (int i = 0; i < s.Length; i = i + 1) {
+            string ch = s.Substring(i, 1);
+            int d = 0 - 1;
+            for (int k = 0; k < 10; k = k + 1) {
+                if (digits.Substring(k, 1) == ch) { d = k; }
+            }
+            if (d >= 0) {
+                n = n * 10 + d;
+                any = true;
+            } else if (any) {
+                break;
+            }
+        }
+        return n;
+    }
+
     /// 分类项目向导（分类 + 模板列 + 目标标签）。
     static Wizard Categorized(string title, List<string> catNames, SignalInt catSel,
                               List<WizardTemplate> tpls, SignalInt tplSel,
@@ -191,13 +481,30 @@ class Wizard {
         return w;
     }
 
+    /// 带设备尺寸选择的分类项目向导：选中的模板声明
+    /// `sizeable` 时，描述下方出现尺寸预设行与自定义宽高，
+    /// 右侧预览按所选尺寸的比例绘制。
+    static Wizard Categorized(string title, List<string> catNames, SignalInt catSel,
+                              List<WizardTemplate> tpls, SignalInt tplSel,
+                              Input nameInput, Input locInput,
+                              List<WizardTarget> targets, List<string> groupNames,
+                              SignalInt sizeSel, Input sizeW, Input sizeH) {
+        Wizard w = Wizard.Categorized(title, catNames, catSel, tpls, tplSel,
+                                      nameInput, locInput, targets, groupNames);
+        w.iSizeSel = sizeSel;
+        w.iSizeW = sizeW;
+        w.iSizeH = sizeH;
+        return w;
+    }
+
     /// 本帧将向导绘制到其窗口中，并返回动作码
     /// （0 无、1 创建、2 取消/关闭、3 浏览）。所有状态都保存在
     /// 实例上；宿主对返回码作出响应。
     int Show(App app) {
         if (iCategorized) {
             return Wizard.RenderCategorized(app, iTitle, iCatNames, iCatSel, iTpls,
-                iTplSel, iName, iLoc, iTargets, iGroups);
+                iTplSel, iName, iLoc, iTargets, iGroups,
+                iSizeSel, iSizeW, iSizeH);
         }
         return Wizard.Render(app, iTitle, iItems, iSel, iName, iLoc, iShowLoc,
                              iSizeSel, iSizeW, iSizeH);
@@ -378,6 +685,15 @@ class Wizard {
     static int RenderCategorized(App app, string title, List<string> catNames, SignalInt catSel,
                                  List<WizardTemplate> tpls, SignalInt tplSel, Input nameInput, Input locInput,
                                  List<WizardTarget> targets, List<string> groupNames) {
+        return Wizard.RenderCategorized(app, title, catNames, catSel, tpls, tplSel,
+                                        nameInput, locInput, targets, groupNames,
+                                        null, null, null);
+    }
+
+    static int RenderCategorized(App app, string title, List<string> catNames, SignalInt catSel,
+                                 List<WizardTemplate> tpls, SignalInt tplSel, Input nameInput, Input locInput,
+                                 List<WizardTarget> targets, List<string> groupNames,
+                                 SignalInt sizeSel, Input sizeW, Input sizeH) {
         Canvas c = app.canvas;
         Theme t = app.theme;
         int W = c.Width();
@@ -484,9 +800,20 @@ class Wizard {
             app.hitTester.Register(new HitRegion(id, tplX, rowY, tplW, rowH, 0));
         }
 
+        WizardTemplate selTpl = null;
+        if (tplSelV >= 0 && tplSelV < tpls.Count) { selTpl = tpls[tplSelV]; }
+
+        // ---- 预览列（最右）----
+        // 属于表单列之前先算，因为它从表单列里切走宽度；
+        // 窗口窄到放不下两列时预览自行让位。
+        int prevW = app.Scale(300);
+        int availRight = W - pad - (tplX + tplW + pad);
+        if (availRight < app.Scale(640)) { prevW = 0; }
+
         // ---- 右列：名称 / 位置 / 描述 ----
         int fx = tplX + tplW + pad;
         int fw = W - pad - fx;
+        if (prevW > 0) { fw = fw - prevW - pad; }
         int fy = contentY;
         c.DrawText(fx, fy, Wizard.TW("Name", "名称"), t.textSecondary, t.fontSizeSmall);
         nameInput.Render(app, fx, fy + app.Scale(20), fw, t.heightMedium);
@@ -502,8 +829,70 @@ class Wizard {
             if (Ui.Clicked(app, browseId)) { result = 3; }
         }
         ny = ny + app.Scale(20) + t.heightMedium + app.Scale(16);
-        if (tplSelV >= 0 && tplSelV < tpls.Count) {
-            c.DrawText(fx, ny, tpls[tplSelV].desc, t.textTertiary, t.fontSizeSmall);
+        if (selTpl != null) {
+            c.DrawText(fx, ny, selTpl.desc, t.textTertiary, t.fontSizeSmall);
+        }
+
+        // ---- 设备尺寸（仅针对产出设计窗口的模板）----
+        // 尺寸是同一个模板的一个参数，而不是分类里十几个长得
+        // 一样的条目；预览列同步按所选尺寸的比例绘制。
+        int devW = 0;
+        int devH = 0;
+        if (selTpl != null) {
+            devW = selTpl.defW;
+            devH = selTpl.defH;
+        }
+        bool wantSize = selTpl != null && selTpl.sizeable && sizeSel != null;
+        if (wantSize) {
+            int sy = ny + app.Scale(30);
+            c.DrawText(fx, sy, Wizard.TW("Device size", "设备尺寸"),
+                       t.textSecondary, t.fontSizeSmall);
+            List<int> szW = Wizard.SizePresetW();
+            List<int> szH = Wizard.SizePresetH();
+            int nSz = szW.Count;
+            int perRow = 4;
+            int gap2 = app.Scale(6);
+            int btnW = (fw - (perRow - 1) * gap2) / perRow;
+            int rowH2 = t.heightSmall + app.Scale(6);
+            int by2 = sy + app.Scale(20);
+            int curv = sizeSel.Get();
+            for (int k = 0; k < nSz; k = k + 1) {
+                int col = k % perRow;
+                int rowi = k / perRow;
+                string cls = "small";
+                if (k == curv) { cls = "primary small"; }
+                int bid = new Button { Text = Wizard.SizePresetName(k), Class = cls }
+                    .Render(app, fx + col * (btnW + gap2), by2 + rowi * rowH2, btnW);
+                if (Ui.Clicked(app, bid)) {
+                    sizeSel.Set(k);
+                    if (sizeW != null) { sizeW.SetText(Convert.ToString(szW[k])); }
+                    if (sizeH != null) { sizeH.SetText(Convert.ToString(szH[k])); }
+                    app.RequestRedraw();
+                }
+            }
+            int cy2 = by2 + ((nSz + perRow - 1) / perRow) * rowH2 + app.Scale(4);
+            if (sizeW != null && sizeH != null) {
+                string custom = Wizard.TW("Custom", "自定义");
+                c.DrawText(fx, cy2 + app.Scale(6), custom, t.textSecondary, t.fontSizeSmall);
+                int lw = Canvas.MeasureText(custom, t.fontSizeSmall) + app.Scale(10);
+                int inW2 = app.Scale(72);
+                sizeW.Render(app, fx + lw, cy2, inW2, t.heightSmall);
+                c.DrawText(fx + lw + inW2 + app.Scale(5), cy2 + app.Scale(6), "x",
+                           t.textSecondary, t.fontSizeSmall);
+                sizeH.Render(app, fx + lw + inW2 + app.Scale(16), cy2, inW2, t.heightSmall);
+                int cw = Wizard.ParseDim(sizeW.GetText());
+                int chh = Wizard.ParseDim(sizeH.GetText());
+                if (cw > 0 && chh > 0) { devW = cw; devH = chh; }
+            } else if (curv >= 0 && curv < nSz) {
+                devW = szW[curv];
+                devH = szH[curv];
+            }
+            ny = cy2 + t.heightSmall;
+        }
+
+        if (prevW > 0) {
+            Wizard.RenderPreview(app, W - pad - prevW, contentY, prevW, listH,
+                                 selTpl, devW, devH);
         }
 
         // ---- 目标平台：每个 OS 一列（组），架构
