@@ -1154,3 +1154,36 @@ add_test(NAME tool_zandoc
     -DEXPECTED_HTML=${CMAKE_SOURCE_DIR}/tests/doc/sample.html
     -DOUTFILE=${CMAKE_BINARY_DIR}/zandoc_out.md
     -P ${CMAKE_SOURCE_DIR}/tests/run_zandoc.cmake)
+
+# ---- Test tiers -------------------------------------------------------------
+# The suite is over a thousand tests because every conformance program is also
+# built for determinism and leak checking; running all of it for a one-line
+# change is minutes of waiting for nothing. Each test therefore carries a tier
+# label so a run can be scoped to the work at hand:
+#
+#   ctest -L smoke      compiler gates only: goldens, diagnostics, ABI,
+#                       runtimes, tools, GUI cases -- seconds, run it always
+#   ctest -L standard   smoke + every conformance program + library emission
+#                       -- the pre-commit gate
+#   ctest -L full       everything, including the determinism and leakcheck
+#                       twins and self-hosting -- release / CI
+#
+# Labels are derived from the test names so new tests are classified the moment
+# they are added, without touching the add_test() calls above.
+get_property(_all_tests DIRECTORY PROPERTY TESTS)
+foreach(_t ${_all_tests})
+  set(_labels "full")
+  if(_t MATCHES "^(golden_|diag_|abi_|runtime_|tool_)" OR _t MATCHES "^conformance_gui_")
+    list(APPEND _labels "standard" "smoke")
+  elseif(_t MATCHES "^(conformance_|emit_lib_|dap_)")
+    list(APPEND _labels "standard")
+  endif()
+  set_property(TEST ${_t} APPEND PROPERTY LABELS ${_labels})
+  # Cases that drive the real desktop (tray icon, screen capture, UI
+  # automation, mouse/keyboard, clipboard) contend for one machine-wide
+  # resource, so they pass alone and fail at random under -j. One shared lock
+  # serializes them against each other without serializing the suite.
+  if(_t MATCHES "(win_tray|win_screen|win_automation|win_device|input_mouse|input_keyboard|input_background|clipboard)")
+    set_property(TEST ${_t} APPEND PROPERTY RESOURCE_LOCK desktop)
+  endif()
+endforeach()

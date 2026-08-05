@@ -1,0 +1,153 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+namespace Gui.Hmi;
+
+/// <summary>
+/// 设备状态面板：一屏看完一条线上所有设备的卡片墙。它是
+/// 控件树里的容器，自己按可用宽度把 DeviceCard 排成卡片网格
+/// （列数随宽度自适应），因此窗口拉宽只是每行多放几张卡，
+/// 不用重新设计画面。
+///
+///   EquipPanel wall = new EquipPanel();
+///   DeviceCard p1 = wall.AddDevice("1# 泵");
+///   p1.Row("电流", currentTag);
+///   wall.Set("1# 泵", 1);             // 停机 / 运行 / 报警 / 故障 / 离线
+///
+/// 序列化 / 设计器把设备名写成 `options` 里的一条文本，卡片
+/// 上的数值行由业务代码按位号追加——I/O 是代码，不是布局。
+/// </summary>
+class EquipPanel : Control {
+    List<string> names;
+    List<DeviceCard> cards;
+    /// 单张卡片的最小宽度（逻辑 px），决定自适应列数。
+    int cardW;
+    int cardH;
+    int gapPx;
+    /// 缩放后的单元尺寸（Arrange 拿不到 App，故在测量时算好）。
+    int cellW;
+    int cellH;
+    int cellGap;
+
+    EquipPanel() {
+        this.InitControl("equipPanel", 5);
+        names = new List<string>();
+        cards = new List<DeviceCard>();
+        cardW = 240;
+        cardH = 132;
+        gapPx = 12;
+        cellW = 240;
+        cellH = 132;
+        cellGap = 12;
+    }
+
+    int Count() { return cards.Count; }
+
+    /// 追加一台设备，返回它的卡片以便挂数值行和点击处理。
+    /// （不叫 Add：那是 Control 添加子控件的名字。）
+    DeviceCard AddDevice(string name) {
+        DeviceCard c = new DeviceCard(name);
+        names.Add(name);
+        cards.Add(c);
+        this.Add(c);
+        return c;
+    }
+
+    DeviceCard At(int i) {
+        if (i < 0 || i >= cards.Count) { return null; }
+        return cards[i];
+    }
+
+    /// 按设备名取卡片；名称不存在时返回 null。
+    DeviceCard Of(string name) {
+        for (int i = 0; i < names.Count; i = i + 1) {
+            if (names[i] == name) { return cards[i]; }
+        }
+        return null;
+    }
+
+    /// 按设备名写状态（0 停机 / 1 运行 / 2 报警 / 3 故障 / 4 离线）。
+    /// 名称未知时是空操作，因此扫描回来的多余位号不会崩画面。
+    void Set(string name, int state) {
+        DeviceCard c = this.Of(name);
+        if (c != null) { c.Set(state); }
+    }
+
+    /// 卡片尺寸（逻辑 px）；宽度是最小值，实际会拉伸填满整行。
+    EquipPanel CardSize(int w, int h) {
+        if (w > 0) { cardW = w; }
+        if (h > 0) { cardH = h; }
+        return this;
+    }
+
+    /// 按序列化文本重建设备清单：`"1# 泵|2# 泵|风机"`。
+    void SetItemsText(string spec) {
+        List<string> parts = spec.Split("|");
+        for (int i = 0; i < parts.Count; i = i + 1) {
+            if (parts[i] == "") { continue; }
+            this.AddDevice(parts[i]);
+        }
+    }
+
+    // ---- 设计器 / 序列化模型 --------------------------------------
+
+    override string Kind() { return "EquipPanel"; }
+
+    override List<PropSpec> Props() {
+        List<PropSpec> ps = new List<PropSpec>();
+        PropSpec w = PropSpec.Int("cardW", "Card width");
+        w.num = cardW;
+        ps.Add(w);
+        PropSpec h = PropSpec.Int("cardH", "Card height");
+        h.num = cardH;
+        ps.Add(h);
+        return ps;
+    }
+
+    // ---- 保留式钩子（Control） ---------------------------------------
+
+    override void OnMeasure(App app) {
+        cellW = app.Scale(cardW);
+        cellH = app.Scale(cardH);
+        cellGap = app.Scale(gapPx);
+        if (prefSet) { return; }
+        prefW = cellW;
+        prefH = cellH;
+    }
+
+    /// 卡片网格：按最小卡宽算出列数，再把剩余宽度均分给
+    /// 每列，行高固定，超出高度的卡片仍被排布（宿主可滚动）。
+    override void Arrange(int px, int py, int pw, int ph) {
+        if (pw < 0) { pw = 0; }
+        if (ph < 0) { ph = 0; }
+        bx = px;
+        by = py;
+        bw = pw;
+        bh = ph;
+        if (cards.Count == 0) { return; }
+        int minW = cellW;
+        if (minW < 1) { minW = 1; }
+        int gap = cellGap;
+        int cols = (pw + gap) / (minW + gap);
+        if (cols < 1) { cols = 1; }
+        if (cols > cards.Count) { cols = cards.Count; }
+        int w = (pw - gap * (cols - 1)) / cols;
+        if (w < 1) { w = 1; }
+        int h = cellH;
+        if (h < 1) { h = 1; }
+        for (int i = 0; i < cards.Count; i = i + 1) {
+            int col = i % cols;
+            int row = i / cols;
+            cards[i].Arrange(px + col * (w + gap), py + row * (h + gap), w, h);
+        }
+    }
+
+    override void OnPaint(App app) {
+        if (cards.Count != 0) { return; }
+        // 空面板在设计器里也要看得见，否则是一块看不出边界的空白。
+        Theme t = app.theme;
+        app.canvas.DrawRoundRect(bx, by, bw, bh, t.borderRadiusMedium,
+                                 t.borderPrimary, 1);
+    }
+}

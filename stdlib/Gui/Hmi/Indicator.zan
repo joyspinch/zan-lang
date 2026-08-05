@@ -1,0 +1,212 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+namespace Gui.Hmi;
+
+/// <summary>
+/// 指示灯（LED）：一个发光圆点加标题，上位机画面里表示
+/// 运行 / 停止 / 故障 / 通信状态。状态用整数，因此可以直接
+/// 绑定到位号：0 灭、1 绿（正常）、2 黄（警告）、3 红（故障）、
+/// 4 蓝（信息）。
+///
+///   Led run = new Led("RUN");
+///   run.state = tag.Value();          // 绑定位号
+///   run.SetBlink(true);               // 故障闪烁
+/// </summary>
+class Led : Control {
+    string caption;
+    SignalInt state;
+    /// 报警态（2/3）闪烁。
+    bool blink;
+    /// 圆点直径（逻辑 px，0 = 按字号自动）。
+    int dotSize;
+
+    void InitLed(string text, SignalInt st) {
+        this.InitControl("led", 0);
+        caption = text;
+        state = st;
+        blink = false;
+        dotSize = 0;
+    }
+
+    Led(string text, SignalInt st) { InitLed(text, st); }
+    Led(string text) { InitLed(text, new SignalInt(0)); }
+
+    int State() { return state.Get(); }
+    void Set(int st) { state.Set(st); }
+    void SetBlink(bool on) { blink = on; }
+    void SetCaption(string s) { caption = s; }
+    SignalInt Value() { return state; }
+
+    override string Kind() { return "Led"; }
+
+    override List<PropSpec> Props() {
+        List<PropSpec> ps = new List<PropSpec>();
+        PropSpec cap = PropSpec.Text("label", "Caption");
+        cap.str = caption;
+        ps.Add(cap);
+        PropSpec st = PropSpec.Int("state", "State");
+        st.snum = state;
+        ps.Add(st);
+        PropSpec bl = PropSpec.Bool("blink", "Blink on alarm");
+        bl.flag = blink;
+        ps.Add(bl);
+        return ps;
+    }
+
+    /// 状态色：灭为边框灰，1 绿 2 黄 3 红 4 蓝。
+    static int ColorOf(Theme t, int st) {
+        if (st == 1) { return t.success; }
+        if (st == 2) { return t.warning; }
+        if (st == 3) { return t.error; }
+        if (st == 4) { return t.info; }
+        return t.borderSecondary;
+    }
+
+    override void OnMeasure(App app) {
+        Theme t = app.theme;
+        int d = this.Dot(app);
+        prefH = t.heightSmall;
+        prefW = d + app.Scale(6) + Canvas.MeasureText(caption, t.fontSizeSmall);
+    }
+
+    int Dot(App app) {
+        if (dotSize > 0) { return app.Scale(dotSize); }
+        return app.Scale(12);
+    }
+
+    override void OnPaint(App app) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int st = state.Get();
+        int d = this.Dot(app);
+        int cx = bx + d / 2;
+        int cy = by + bh / 2;
+        int col = Led.ColorOf(t, st);
+        bool lit = st != 0;
+        if (lit && blink && (st == 2 || st == 3)) {
+            // 半秒周期闪烁：亮半拍、暗半拍。用 App 的动画时钟，
+            // 因此不需要宿主自己驱动定时器。
+            if ((app.nowMs / 500) % 2 == 1) { lit = false; }
+            app.RequestRedraw();
+        }
+        if (lit) {
+            c.FillRadial(cx, cy, d, col, 90);
+            c.FillCircle(cx, cy, d / 2, col);
+        } else {
+            c.FillCircle(cx, cy, d / 2, App.Darken(col, 55));
+        }
+        c.DrawCircle(cx, cy, d / 2, App.Darken(col, 30), 1);
+        if (caption != "") {
+            int fs = t.fontSizeSmall;
+            c.DrawText(bx + d + app.Scale(6),
+                       cy - Canvas.FontHeight(fs) / 2,
+                       caption, t.textPrimary, fs);
+        }
+    }
+}
+
+/// <summary>
+/// 数显表（digital readout）：大字号数值 + 单位 + 标题，超限时
+/// 数值转报警色。这是上位机画面上用得最多的一个件。
+///
+///   Digital pv = new Digital("TIC101 PV", tag);
+/// </summary>
+class Digital : Control {
+    string caption;
+    IoTag tag;
+    /// 无位号时的自持值（原始计数）与刻度。
+    SignalInt raw;
+    int scale;
+    string unit;
+
+    void InitDigital(string text, IoTag t, SignalInt v, int sc, string u) {
+        this.InitControl("digital", 0);
+        caption = text;
+        tag = t;
+        raw = v;
+        scale = sc;
+        if (scale < 1) { scale = 1; }
+        unit = u;
+    }
+
+    Digital(string text, IoTag t) {
+        InitDigital(text, t, t.Value(), t.Scale(), t.Unit());
+    }
+
+    Digital(string text, SignalInt v, int sc, string u) {
+        InitDigital(text, null, v, sc, u);
+    }
+
+    Digital(string text) {
+        InitDigital(text, null, new SignalInt(0), 1, "");
+    }
+
+    SignalInt Value() { return raw; }
+    void Bind(IoTag t) {
+        tag = t;
+        raw = t.Value();
+        scale = t.Scale();
+        unit = t.Unit();
+    }
+
+    override string Kind() { return "Digital"; }
+
+    override List<PropSpec> Props() {
+        List<PropSpec> ps = new List<PropSpec>();
+        PropSpec cap = PropSpec.Text("label", "Caption");
+        cap.str = caption;
+        ps.Add(cap);
+        PropSpec un = PropSpec.Text("unit", "Unit");
+        un.str = unit;
+        ps.Add(un);
+        PropSpec sc = PropSpec.Int("scale", "Scale");
+        sc.num = scale;
+        ps.Add(sc);
+        PropSpec v = PropSpec.Int("value", "Value");
+        v.snum = raw;
+        ps.Add(v);
+        return ps;
+    }
+
+    override void OnMeasure(App app) {
+        prefW = app.Scale(150);
+        prefH = app.Scale(72);
+    }
+
+    override void OnPaint(App app) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int rad = t.borderRadiusMedium;
+        c.FillRoundRect(bx, by, bw, bh, rad, App.Darken(t.bgTertiary, 25));
+        c.DrawRoundRect(bx, by, bw, bh, rad, t.borderPrimary, 1);
+        int pad = app.Scale(8);
+        int fsCap = t.fontSizeSmall;
+        if (caption != "") {
+            c.DrawText(bx + pad, by + pad, caption, t.textSecondary, fsCap);
+        }
+        int alarm = 0;
+        bool good = true;
+        if (tag != null) {
+            alarm = tag.Alarm();
+            good = tag.IsGood();
+        }
+        int col = t.textPrimary;
+        if (alarm == 1) { col = t.info; }
+        if (alarm == 2) { col = t.error; }
+        if (!good) { col = t.textDisabled; }
+        string txt = IoTag.Format(raw.Get(), scale);
+        if (!good) { txt = "----"; }
+        int fsVal = t.fontSizeHuge;
+        int vy = by + bh - pad - Canvas.FontHeight(fsVal);
+        c.DrawText(bx + pad, vy, txt, col, fsVal);
+        if (unit != "") {
+            int vw = Canvas.MeasureText(txt, fsVal);
+            c.DrawText(bx + pad + vw + app.Scale(6),
+                       vy + Canvas.FontHeight(fsVal) - Canvas.FontHeight(fsCap)
+                           - app.Scale(2),
+                       unit, t.textTertiary, fsCap);
+        }
+    }
+}

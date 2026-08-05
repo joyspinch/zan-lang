@@ -1,0 +1,396 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+namespace Gui.Hmi;
+
+/// <summary>
+/// 圆盘仪表（dial gauge）：270° 刻度弧 + 指针 + 数字读数。
+/// 弧段按位号的报警限自动着色：低报段蓝、正常段绿、高报段红，
+/// 因此不必额外配置颜色区间。
+///
+///   Gauge g = new Gauge("PT101", tag);
+/// </summary>
+class Gauge : Control {
+    string caption;
+    IoTag tag;
+    SignalInt raw;
+    int scale;
+    string unit;
+    int rawMin;
+    int rawMax;
+    int loLimit;
+    int hiLimit;
+    /// 刻度弧的起止角（度，0 为 3 点方向，顺时针为正）。
+    int startDeg;
+    int sweepDeg;
+
+    void InitGauge(string text, IoTag t, SignalInt v, int sc, string u,
+                   int lo, int hi) {
+        this.InitControl("gauge", 0);
+        caption = text;
+        tag = t;
+        raw = v;
+        scale = sc;
+        if (scale < 1) { scale = 1; }
+        unit = u;
+        rawMin = lo;
+        rawMax = hi;
+        if (rawMax <= rawMin) { rawMax = rawMin + 1; }
+        loLimit = 0;
+        hiLimit = 0;
+        startDeg = 135;
+        sweepDeg = 270;
+    }
+
+    Gauge(string text, IoTag t) {
+        InitGauge(text, t, t.Value(), t.Scale(), t.Unit(), t.Min(), t.Max());
+        loLimit = t.Min();
+        hiLimit = t.Max();
+    }
+
+    Gauge(string text, SignalInt v, int lo, int hi) {
+        InitGauge(text, null, v, 1, "", lo, hi);
+    }
+
+    Gauge(string text) {
+        InitGauge(text, null, new SignalInt(0), 1, "", 0, 100);
+    }
+
+    SignalInt Value() { return raw; }
+
+    void Bind(IoTag t) {
+        tag = t;
+        raw = t.Value();
+        scale = t.Scale();
+        unit = t.Unit();
+        rawMin = t.Min();
+        rawMax = t.Max();
+    }
+
+    Gauge Range(int lo, int hi) {
+        rawMin = lo;
+        rawMax = hi;
+        if (rawMax <= rawMin) { rawMax = rawMin + 1; }
+        return this;
+    }
+
+    /// 报警限对应的弧段着色（相等则整弧为正常色）。
+    Gauge Limits(int lo, int hi) {
+        loLimit = lo;
+        hiLimit = hi;
+        return this;
+    }
+
+    override string Kind() { return "Gauge"; }
+
+    override List<PropSpec> Props() {
+        List<PropSpec> ps = new List<PropSpec>();
+        PropSpec cap = PropSpec.Text("label", "Caption");
+        cap.str = caption;
+        ps.Add(cap);
+        PropSpec un = PropSpec.Text("unit", "Unit");
+        un.str = unit;
+        ps.Add(un);
+        PropSpec lo = PropSpec.Int("min", "Min");
+        lo.num = rawMin;
+        ps.Add(lo);
+        PropSpec hi = PropSpec.Int("max", "Max");
+        hi.num = rawMax;
+        ps.Add(hi);
+        PropSpec v = PropSpec.Int("value", "Value");
+        v.snum = raw;
+        ps.Add(v);
+        return ps;
+    }
+
+    override void OnMeasure(App app) {
+        prefW = app.Scale(160);
+        prefH = app.Scale(160);
+    }
+
+    /// 原始值在刻度弧上的角度。
+    int AngleOf(int v) {
+        int span = rawMax - rawMin;
+        if (span <= 0) { return startDeg; }
+        int p = (v - rawMin) * sweepDeg / span;
+        if (p < 0) { p = 0; }
+        if (p > sweepDeg) { p = sweepDeg; }
+        return startDeg + p;
+    }
+
+    override void OnPaint(App app) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int d = bw;
+        if (bh < d) { d = bh; }
+        int cx = bx + bw / 2;
+        int cy = by + d / 2 + app.Scale(2);
+        int rOut = d / 2 - app.Scale(4);
+        int rIn = rOut - app.Scale(10);
+        if (rIn < app.Scale(6)) { rIn = app.Scale(6); }
+
+        c.FillSector(cx, cy, rIn, rOut, startDeg, startDeg + sweepDeg,
+                     App.Darken(t.bgTertiary, 15));
+        if (loLimit != hiLimit) {
+            int aLo = this.AngleOf(loLimit);
+            int aHi = this.AngleOf(hiLimit);
+            c.FillSector(cx, cy, rIn, rOut, startDeg, aLo, t.info);
+            c.FillSector(cx, cy, rIn, rOut, aLo, aHi, t.success);
+            c.FillSector(cx, cy, rIn, rOut, aHi, startDeg + sweepDeg, t.error);
+        } else {
+            c.FillSector(cx, cy, rIn, rOut, startDeg, startDeg + sweepDeg,
+                         t.success);
+        }
+
+        // 主刻度：11 条，覆盖整个量程。
+        for (int i = 0; i <= 10; i = i + 1) {
+            int a = startDeg + sweepDeg * i / 10;
+            c.DrawArc(cx, cy, rIn - app.Scale(4), rIn, a, a + 1,
+                      t.textTertiary, 1);
+        }
+
+        int v = raw.Get();
+        int ang = this.AngleOf(v);
+        int nr = rIn - app.Scale(6);
+        int nx = cx + Gauge.CosDeg(ang) * nr / 1000;
+        int ny = cy + Gauge.SinDeg(ang) * nr / 1000;
+        int needle = t.textPrimary;
+        if (tag != null) {
+            int al = tag.Alarm();
+            if (al == 1) { needle = t.info; }
+            if (al == 2) { needle = t.error; }
+            if (!tag.IsGood()) { needle = t.textDisabled; }
+        }
+        c.DrawLine(cx, cy, nx, ny, needle, app.Scale(2));
+        c.FillCircle(cx, cy, app.Scale(4), needle);
+
+        int fs = t.fontSizeLarge;
+        string txt = IoTag.Format(v, scale);
+        if (unit != "") { txt = txt + " " + unit; }
+        c.DrawTextCentered(bx, cy + rIn / 2, bw, Canvas.FontHeight(fs),
+                           txt, t.textPrimary, fs);
+        if (caption != "") {
+            int fc = t.fontSizeSmall;
+            c.DrawTextCentered(bx, by + bh - Canvas.FontHeight(fc), bw,
+                               Canvas.FontHeight(fc), caption,
+                               t.textSecondary, fc);
+        }
+    }
+
+    /// 定点三角函数（返回值放大 1000 倍），避免为了画一根指针
+    /// 引入浮点数学依赖。
+    static int CosDeg(int deg) { return Gauge.SinDeg(deg + 90); }
+
+    static int SinDeg(int deg) {
+        int a = deg % 360;
+        if (a < 0) { a = a + 360; }
+        if (a <= 90) { return Gauge.SinQ(a); }
+        if (a <= 180) { return Gauge.SinQ(180 - a); }
+        if (a <= 270) { return 0 - Gauge.SinQ(a - 180); }
+        return 0 - Gauge.SinQ(360 - a);
+    }
+
+    /// 0..90 度的 sin*1000，10 度一档线性插值（画表盘足够）。
+    static int SinQ(int deg) {
+        List<int> tbl = new List<int>{ 0, 174, 342, 500, 643, 766, 866, 940,
+                                       985, 1000 };
+        int i = deg / 10;
+        if (i >= 9) { return 1000; }
+        int f = deg - i * 10;
+        return tbl[i] + (tbl[i + 1] - tbl[i]) * f / 10;
+    }
+}
+
+/// <summary>
+/// 棒图 / 量程条（bargraph）：竖向或横向的填充条，带量程刻度和
+/// 报警限标线，超限时条体转报警色。
+/// </summary>
+class Bargraph : Control {
+    string caption;
+    IoTag tag;
+    SignalInt raw;
+    int scale;
+    string unit;
+    int rawMin;
+    int rawMax;
+    int loLimit;
+    int hiLimit;
+    /// 0 竖向（自下而上），1 横向（自左向右）。
+    int orient;
+
+    void InitBar(string text, IoTag t, SignalInt v, int sc, string u,
+                 int lo, int hi) {
+        this.InitControl("bargraph", 0);
+        caption = text;
+        tag = t;
+        raw = v;
+        scale = sc;
+        if (scale < 1) { scale = 1; }
+        unit = u;
+        rawMin = lo;
+        rawMax = hi;
+        if (rawMax <= rawMin) { rawMax = rawMin + 1; }
+        loLimit = 0;
+        hiLimit = 0;
+        orient = 0;
+    }
+
+    Bargraph(string text, IoTag t) {
+        InitBar(text, t, t.Value(), t.Scale(), t.Unit(), t.Min(), t.Max());
+    }
+
+    Bargraph(string text, SignalInt v, int lo, int hi) {
+        InitBar(text, null, v, 1, "", lo, hi);
+    }
+
+    Bargraph(string text) {
+        InitBar(text, null, new SignalInt(0), 1, "", 0, 100);
+    }
+
+    static int Vertical() { return 0; }
+    static int Horizontal() { return 1; }
+
+    SignalInt Value() { return raw; }
+    Bargraph Orient(int o) { orient = o; return this; }
+    Bargraph Range(int lo, int hi) {
+        rawMin = lo;
+        rawMax = hi;
+        if (rawMax <= rawMin) { rawMax = rawMin + 1; }
+        return this;
+    }
+    Bargraph Limits(int lo, int hi) { loLimit = lo; hiLimit = hi; return this; }
+
+    void Bind(IoTag t) {
+        tag = t;
+        raw = t.Value();
+        scale = t.Scale();
+        unit = t.Unit();
+        rawMin = t.Min();
+        rawMax = t.Max();
+    }
+
+    override string Kind() { return "Bargraph"; }
+
+    override List<PropSpec> Props() {
+        List<PropSpec> ps = new List<PropSpec>();
+        PropSpec cap = PropSpec.Text("label", "Caption");
+        cap.str = caption;
+        ps.Add(cap);
+        PropSpec lo = PropSpec.Int("min", "Min");
+        lo.num = rawMin;
+        ps.Add(lo);
+        PropSpec hi = PropSpec.Int("max", "Max");
+        hi.num = rawMax;
+        ps.Add(hi);
+        PropSpec v = PropSpec.Int("value", "Value");
+        v.snum = raw;
+        ps.Add(v);
+        List<string> os = new List<string>{ "vertical", "horizontal" };
+        PropSpec orp = PropSpec.Enum("orient", "Orientation", os);
+        orp.num = orient;
+        ps.Add(orp);
+        return ps;
+    }
+
+    override void OnMeasure(App app) {
+        if (orient == 1) {
+            prefW = app.Scale(220);
+            prefH = app.Scale(40);
+        } else {
+            prefW = app.Scale(64);
+            prefH = app.Scale(180);
+        }
+    }
+
+    int Fraction() {
+        int span = rawMax - rawMin;
+        if (span <= 0) { return 0; }
+        int p = (raw.Get() - rawMin) * 1000 / span;
+        if (p < 0) { p = 0; }
+        if (p > 1000) { p = 1000; }
+        return p;
+    }
+
+    override void OnPaint(App app) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int fs = t.fontSizeSmall;
+        int rad = t.borderRadiusSmall;
+        int alarm = 0;
+        if (tag != null) { alarm = tag.Alarm(); }
+        int fill = t.success;
+        if (alarm == 1) { fill = t.info; }
+        if (alarm == 2) { fill = t.error; }
+
+        int capH = 0;
+        if (caption != "") { capH = Canvas.FontHeight(fs) + app.Scale(4); }
+        int valH = Canvas.FontHeight(fs) + app.Scale(4);
+        if (caption != "") {
+            c.DrawText(bx, by, caption, t.textSecondary, fs);
+        }
+        string txt = IoTag.Format(raw.Get(), scale);
+        if (unit != "") { txt = txt + " " + unit; }
+
+        int p = this.Fraction();
+        if (orient == 1) {
+            int trackY = by + capH;
+            int trackH = bh - capH - valH;
+            if (trackH < app.Scale(8)) { trackH = app.Scale(8); }
+            c.FillRoundRect(bx, trackY, bw, trackH, rad,
+                            App.Darken(t.bgTertiary, 15));
+            int fw = bw * p / 1000;
+            c.FillRoundRect(bx, trackY, fw, trackH, rad, fill);
+            c.DrawRoundRect(bx, trackY, bw, trackH, rad, t.borderPrimary, 1);
+            this.PaintLimitsH(app, bx, trackY, bw, trackH);
+            c.DrawText(bx, trackY + trackH + app.Scale(2), txt,
+                       t.textPrimary, fs);
+        } else {
+            int trackY = by + capH;
+            int trackH = bh - capH - valH;
+            if (trackH < app.Scale(8)) { trackH = app.Scale(8); }
+            int trackW = bw / 3;
+            if (trackW < app.Scale(12)) { trackW = app.Scale(12); }
+            int tx = bx;
+            c.FillRoundRect(tx, trackY, trackW, trackH, rad,
+                            App.Darken(t.bgTertiary, 15));
+            int fh = trackH * p / 1000;
+            c.FillRoundRect(tx, trackY + trackH - fh, trackW, fh, rad, fill);
+            c.DrawRoundRect(tx, trackY, trackW, trackH, rad,
+                            t.borderPrimary, 1);
+            this.PaintLimitsV(app, tx, trackY, trackW, trackH);
+            c.DrawText(tx + trackW + app.Scale(6),
+                       trackY + trackH / 2 - Canvas.FontHeight(fs) / 2,
+                       txt, t.textPrimary, fs);
+        }
+    }
+
+    int PosOf(int v, int len) {
+        int span = rawMax - rawMin;
+        if (span <= 0) { return 0; }
+        int p = (v - rawMin) * len / span;
+        if (p < 0) { p = 0; }
+        if (p > len) { p = len; }
+        return p;
+    }
+
+    void PaintLimitsV(App app, int x, int y, int w, int h) {
+        if (loLimit == hiLimit) { return; }
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int lo = this.PosOf(loLimit, h);
+        int hi = this.PosOf(hiLimit, h);
+        c.DrawLine(x, y + h - lo, x + w, y + h - lo, t.info, 1);
+        c.DrawLine(x, y + h - hi, x + w, y + h - hi, t.error, 1);
+    }
+
+    void PaintLimitsH(App app, int x, int y, int w, int h) {
+        if (loLimit == hiLimit) { return; }
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int lo = this.PosOf(loLimit, w);
+        int hi = this.PosOf(hiLimit, w);
+        c.DrawLine(x + lo, y, x + lo, y + h, t.info, 1);
+        c.DrawLine(x + hi, y, x + hi, y + h, t.error, 1);
+    }
+}

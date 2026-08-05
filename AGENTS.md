@@ -50,13 +50,18 @@ short, enforceable summary.
 7. **Every task ends clean.** Run `git status` before finishing; there should
    be no stray untracked files. Review `git diff --stat` and commit only what
    the task requires. Never `git add .` / `git add -A` blindly.
-8. **Never run the full test suite for a compiler change.** Run only the subset
-   the change can affect (a generics/ARC change: `ctest --test-dir build -R
-   "generic|leakcheck_generic"`). The heavyweight cases (`gui_*`, `zgm_*`,
-   `selfhost_*`) are a release gate, not a per-change one: every test artifact
-   is keyed on the compiler binary, so relinking `zanc` invalidates all ~591 of
-   them and a cold full run costs ~25 minutes with nothing to show for it. Run
-   the whole suite before a release, not after each edit.
+8. **Pick a test tier; never run all 1035 tests for a small change.** The suite
+   is labelled in three tiers (`scripts\test.ps1 <tier>`, or `ctest -L <tier>`):
+   `smoke` (75 tests, ~5 s — goldens, diagnostics, ABI, runtimes, tools, GUI:
+   run it on every edit), `standard` (399 — smoke plus every conformance
+   program and library emission: the pre-commit gate, ~1 min), `full` (1035 —
+   plus the determinism/leakcheck twins and self-hosting: release gate only,
+   tens of minutes). Narrow further with `-Match`/`-R` when a change is local
+   (a generics/ARC change: `-R "generic|leakcheck_generic"`). Every test
+   artifact is keyed on the compiler binary, so relinking `zanc` invalidates
+   all of them — and **nothing else may build while tests run**: the cases
+   share `build\zanc.exe` and the stdlib stamp, so a concurrent
+   `build_gallery`/`build_ide` makes unrelated cases fail en masse.
 9. **Never create branches.** Do NOT create local or remote branches; commit
    directly to `main` and push. Delete any stray branch you find after making
    sure its commits are merged into `main`.

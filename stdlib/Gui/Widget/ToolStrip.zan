@@ -1,0 +1,189 @@
+using System;
+using Gui;
+
+namespace Gui.Widget;
+
+/// 工具条项被点击时的回调，带项的索引。
+delegate void ToolItemCallback(int index);
+
+/// <summary>
+/// 窗口工具条：一行停靠的图标 / 文字按钮，位于带底部细
+/// 分隔线的主题表面上——菜单栏下面那条工具栏，以及上位机
+/// 画面顶部的操作条。
+///
+/// 各项是 Button，因此主题、样式表和事件与其它控件一致；
+/// 工具条只负责表面、内边距和左右分组：
+///
+///   ToolStrip bar = new ToolStrip();
+///   int save = bar.Add("Save", "save");
+///   bar.AddSeparator();
+///   int help = bar.AddRight("Help", "info");
+///   bar.ItemAt(save).Click += () => { ... };
+///
+/// 序列化 / 设计器把每项写成 `options` 里的一条文本：
+/// `"标题:图标"`，前缀 `>` 表示靠右，`-` 表示分隔条。
+/// </summary>
+class ToolStrip : Control {
+    List<Button> items;
+    /// 带索引的项点击回调（OnItemClick）。
+    List<ToolItemCallback> itemCbs;
+    /// 不关心是哪一项的项点击处理（设计器 ItemClick 事件）。
+    UiEvent ItemClick;
+    int tintBg;          // 0 = 主题表面，否则为纯色着色
+    /// 只显示图标（不画标题），紧凑的图标工具条。
+    bool iconOnly;
+
+    ToolStrip() {
+        this.InitControl("toolStrip", 1);
+        items = new List<Button>();
+        itemCbs = new List<ToolItemCallback>();
+        ItemClick = new UiEvent();
+        tintBg = 0;
+        iconOnly = false;
+    }
+
+    override List<string> Events() {
+        List<string> e = Control.CommonEvents();
+        e.Add("ItemClick");
+        return e;
+    }
+
+    override void BindEvent(string evt, Action a) {
+        if (evt == "ItemClick") { ItemClick.Add(a); return; }
+        On.AddByName(evt, a);
+    }
+
+    /// 任何一项被点击时回调，参数为项的索引。
+    void OnItemClick(ToolItemCallback cb) { itemCbs.Add(cb); }
+
+    /// 向已注册的处理器发布一次项点击。
+    void FireItem(int index) {
+        for (int i = 0; i < itemCbs.Count; i = i + 1) {
+            ToolItemCallback cb = itemCbs[i];
+            cb(index);
+        }
+        ItemClick.Raise();
+    }
+
+    override string Kind() { return "ToolStrip"; }
+
+    override List<PropSpec> Props() {
+        List<PropSpec> ps = new List<PropSpec>();
+        PropSpec io = PropSpec.Bool("iconOnly", "Icons only");
+        io.flag = iconOnly;
+        ps.Add(io);
+        PropSpec tint = PropSpec.Color("tint", "Tint");
+        tint.num = tintBg;
+        ps.Add(tint);
+        PropSpec cls = PropSpec.Text("class", "Classes");
+        cls.str = Class;
+        ps.Add(cls);
+        return ps;
+    }
+
+    int Count() { return items.Count; }
+
+    Button ItemAt(int i) {
+        if (i < 0 || i >= items.Count) { return null; }
+        return items[i];
+    }
+
+    Button NewItem(string text, string icon) {
+        string caption = text;
+        if (iconOnly && icon != "") { caption = ""; }
+        Button b = new Button { Text = caption, Icon = icon,
+                               Class = "text small" };
+        items.Add(b);
+        Add(b);
+        int idx = items.Count - 1;
+        b.Click += () => { this.FireItem(idx); };
+        return b;
+    }
+
+    /// 追加一个左对齐项；返回其索引供后续访问。
+    int Add(string text, string icon) {
+        Button b = NewItem(text, icon);
+        b.DockLeft();
+        return items.Count - 1;
+    }
+
+    int Add(string text) { return this.Add(text, ""); }
+
+    /// 追加一个右对齐项（右侧分组按添加顺序从右往左排）。
+    int AddRight(string text, string icon) {
+        Button b = NewItem(text, icon);
+        b.DockRight();
+        return items.Count - 1;
+    }
+
+    int AddRight(string text) { return this.AddRight(text, ""); }
+
+    /// 竖直分隔条：一个禁用的窄项，用来分组按钮。
+    int AddSeparator() {
+        Button b = new Button { Text = "", Class = "text small disabled" };
+        b.Prefer(1, 0);
+        items.Add(b);
+        Add(b);
+        b.DockLeft();
+        return items.Count - 1;
+    }
+
+    /// 按序列化文本重建全部项：每条 `"标题:图标"`，
+    /// 前缀 `>` 靠右，`-` 为分隔条。设计器与 .zform 走这条路径。
+    void SetItemsText(string spec) {
+        List<string> parts = spec.Split("|");
+        for (int i = 0; i < parts.Count; i = i + 1) {
+            string it = parts[i];
+            if (it == "") { continue; }
+            if (it == "-") { this.AddSeparator(); continue; }
+            bool right = false;
+            if (it.Substring(0, 1) == ">") {
+                right = true;
+                it = it.Substring(1, it.Length - 1);
+            }
+            string text = it;
+            string icon = "";
+            List<string> kv = it.Split(":");
+            if (kv.Count == 2) { text = kv[0]; icon = kv[1]; }
+            if (right) { this.AddRight(text, icon); }
+            else { this.Add(text, icon); }
+        }
+    }
+
+    void SetIconOnly(bool on) { iconOnly = on; }
+
+    /// 纯色背景着色，替换默认表面（0 恢复默认）。
+    void SetTint(int bg) { tintBg = bg; }
+
+    override void OnMeasure(App app) {
+        Theme t = app.theme;
+        padL = app.Scale(6);
+        padR = app.Scale(6);
+        padT = app.Scale(3);
+        padB = app.Scale(3);
+        gap = app.Scale(4);
+        prefH = app.Scale(34);
+        if (tintBg != 0) {
+            this.Bg(tintBg);
+        } else {
+            this.Gradient(t.bgSecondary, App.Darken(t.bgSecondary, 40));
+        }
+    }
+
+    override void OnPaint(App app) {
+        // 底部细分隔线；表面填充由基础 CSS 样式层完成
+        // （styleBg 在 OnMeasure 中设置）。
+        int h = Style.Of(app, "divider", "", Style.SNormal()).HeightOr(1);
+        int col = Style.Of(app, "divider", "", Style.SNormal())
+            .BgOr(app.theme.divider);
+        app.canvas.FillRect(bx, by + bh - h, bw, h, col);
+    }
+
+    /// 渲染到显式矩形（供自管布局的宿主使用）；作为
+    /// 控件树里的停靠子控件时无需此方法。
+    void RenderAt(App app, int x, int y, int w, int h) {
+        MeasureTree(app);
+        Arrange(x, y, w, h);
+        RenderTree(app);
+    }
+}

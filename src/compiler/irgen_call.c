@@ -5,13 +5,22 @@
  * irgen_expr.c; not compiled standalone.
  */
 
-/* True when the identifier names an instance field of the class being
- * compiled, i.e. it reads as `this.<name>`. Such a field shadows a type of the
- * same name wherever a receiver is resolved. */
+/* True when the identifier names a field of the class being compiled -- an
+ * instance field (it reads as `this.<name>`) or a static one. Such a field
+ * shadows a type of the same name wherever a receiver is resolved. Statics
+ * count too, and in a static method they are the only fields in reach: a
+ * designed form holds its controls in statics, so a control named after a
+ * widget class (`static DataTable DataGrid;`) used to resolve to the type and
+ * the call was emitted against the wrong (instance) signature -- invalid IR
+ * rather than a diagnostic. */
 static bool ident_names_own_field(zan_irgen_t *g, zan_ast_node_t *e) {
     if (!e || e->kind != AST_IDENTIFIER) return false;
-    if (!g->current_this || !g->current_type_sym) return false;
-    return get_field_index(g->current_type_sym, e->ident.name) >= 0;
+    if (!g->current_type_sym) return false;
+    if (g->current_this &&
+        get_field_index(g->current_type_sym, e->ident.name) >= 0)
+        return true;
+    zan_symbol_t *fs = get_field_sym(g->current_type_sym, e->ident.name);
+    return fs && fs->kind == SYM_FIELD && (fs->modifiers & MOD_STATIC) != 0;
 }
 
 /* Walks the receiver chain of an unclaimed call and reports the first

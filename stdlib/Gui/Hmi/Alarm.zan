@@ -1,0 +1,351 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+namespace Gui.Hmi;
+
+/// <summary>
+/// 一条报警记录：发生时间、位号、描述、优先级和确认状态。
+/// 优先级 0 提示 / 1 警告 / 2 故障，决定颜色与排序。
+/// </summary>
+class AlarmItem {
+    string stamp;
+    string point;
+    string message;
+    int priority;
+    bool acked;
+    /// 报警是否仍然成立（复归后仍留在列表里，直到被确认）。
+    bool active;
+
+    AlarmItem(string tagName, string text, int prio) {
+        stamp = DateTime.Now().ToTimeString();
+        point = tagName;
+        message = text;
+        priority = prio;
+        acked = false;
+        active = true;
+    }
+
+    string Stamp() { return stamp; }
+    string Point() { return point; }
+    string Message() { return message; }
+    int Priority() { return priority; }
+    bool IsAcked() { return acked; }
+    bool IsActive() { return active; }
+    void Ack() { acked = true; }
+    void Clear() { active = false; }
+
+    /// 优先级颜色：2 故障红、1 警告黄、其它信息蓝。
+    static int ColorOf(Theme t, int prio) {
+        if (prio >= 2) { return t.error; }
+        if (prio == 1) { return t.warning; }
+        return t.info;
+    }
+
+    static string LevelOf(int prio) {
+        if (prio >= 2) { return "FAULT"; }
+        if (prio == 1) { return "WARN"; }
+        return "INFO";
+    }
+}
+
+/// <summary>
+/// 报警缓冲区：画面上的报警栏和报警列表共享同一个实例，
+/// 因此"确认"在两处同时生效。
+///
+///   AlarmBuffer al = new AlarmBuffer();
+///   al.Raise("PT101", "压力高高", 2);
+///   al.Scan(io);              // 按位号限值自动产生 / 复归
+/// </summary>
+class AlarmBuffer {
+    List<AlarmItem> items;
+    int limit;
+
+    AlarmBuffer() {
+        items = new List<AlarmItem>();
+        limit = 500;
+    }
+
+    int Count() { return items.Count; }
+    AlarmItem At(int i) { return items[i]; }
+
+    /// 未确认的报警条数（报警栏据此闪烁）。
+    int UnackedCount() {
+        int n = 0;
+        for (int i = 0; i < items.Count; i = i + 1) {
+            if (!items[i].IsAcked()) { n = n + 1; }
+        }
+        return n;
+    }
+
+    /// 最新一条未确认报警，没有则返回 null。
+    AlarmItem Newest() {
+        for (int i = items.Count - 1; i >= 0; i = i - 1) {
+            if (!items[i].IsAcked()) { return items[i]; }
+        }
+        return null;
+    }
+
+    AlarmItem Raise(string tagName, string text, int prio) {
+        AlarmItem a = new AlarmItem(tagName, text, prio);
+        items.Add(a);
+        while (items.Count > limit) { items.RemoveAt(0); }
+        return a;
+    }
+
+    void AckAll() {
+        for (int i = 0; i < items.Count; i = i + 1) { items[i].Ack(); }
+    }
+
+    /// 移除已确认且已复归的记录。
+    void Purge() {
+        List<AlarmItem> keep = new List<AlarmItem>();
+        for (int i = 0; i < items.Count; i = i + 1) {
+            AlarmItem a = items[i];
+            if (!a.IsAcked() || a.IsActive()) { keep.Add(a); }
+        }
+        items = keep;
+    }
+
+    /// 扫描位号表：越限的位号若还没有在册的活动报警就产生一条，
+    /// 回到限内则把对应记录置为已复归。这样画面只需周期调用一次，
+    /// 不必在每个采集点手写报警逻辑。
+    void Scan(TagTable io) {
+        for (int i = 0; i < io.Count(); i = i + 1) {
+            IoTag t = io.At(i);
+            int al = t.Alarm();
+            AlarmItem cur = this.ActiveOf(t.Name());
+            if (al == 0) {
+                if (cur != null) { cur.Clear(); }
+                continue;
+            }
+            if (cur != null) { continue; }
+            string what = "低报 " + t.TextWithUnit();
+            if (al == 2) { what = "高报 " + t.TextWithUnit(); }
+            this.Raise(t.Name(), what, 2);
+        }
+    }
+
+    /// 该位号仍然成立的报警记录，没有则 null。
+    AlarmItem ActiveOf(string tagName) {
+        for (int i = items.Count - 1; i >= 0; i = i - 1) {
+            if (items[i].Point() == tagName && items[i].IsActive()) {
+                return items[i];
+            }
+        }
+        return null;
+    }
+}
+
+/// <summary>
+/// 报警横幅（alarm banner）：窗口顶部/底部的一条，显示最新未确认
+/// 报警并带"确认"按钮，未确认时按优先级闪烁。
+/// </summary>
+class AlarmBanner : Control {
+    AlarmBuffer buffer;
+    int wid;
+    int ackId;
+    /// 报警被确认时触发。
+    UiEvent Ack;
+
+    /// 自带缓冲区（设计器 / 表单编译路径用），之后可用 Bind()
+    /// 换成与报警列表共享的同一个缓冲区。
+    AlarmBanner() : this(new AlarmBuffer()) { }
+
+    /// 换绑缓冲区（与 AlarmList 共享同一份报警）。
+    void Bind(AlarmBuffer buf) { buffer = buf; }
+
+    AlarmBuffer Buffer() { return buffer; }
+
+    AlarmBanner(AlarmBuffer buf) {
+        this.InitControl("alarmBanner", 1);
+        buffer = buf;
+        wid = WidgetId.Next();
+        ackId = WidgetId.Next();
+        wiresOwnEvents = true;
+        Ack = new UiEvent();
+        prefH = 0;
+    }
+
+    override string Kind() { return "AlarmBanner"; }
+
+    override List<string> Events() {
+        List<string> e = Control.CommonEvents();
+        e.Add("Ack");
+        return e;
+    }
+
+    override void BindEvent(string evt, Action a) {
+        if (evt == "Ack") { Ack.Add(a); return; }
+        On.AddByName(evt, a);
+    }
+
+    override void OnMeasure(App app) {
+        prefH = app.theme.heightMedium;
+        prefW = 0;
+    }
+
+    override void OnPaint(App app) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int fs = t.fontSizeMedium;
+        AlarmItem a = buffer.Newest();
+        if (a == null) {
+            c.FillRect(bx, by, bw, bh, t.bgSecondary);
+            c.DrawText(bx + app.Scale(10),
+                       by + bh / 2 - Canvas.FontHeight(fs) / 2,
+                       "无未确认报警", t.textTertiary, fs);
+            return;
+        }
+        int col = AlarmItem.ColorOf(t, a.Priority());
+        // 未确认报警闪烁：故障级 400ms，其它 800ms。
+        int period = 800;
+        if (a.Priority() >= 2) { period = 400; }
+        int bg = col;
+        if ((app.nowMs / period) % 2 == 1) { bg = App.Darken(col, 35); }
+        app.RequestRedraw();
+        c.FillRect(bx, by, bw, bh, bg);
+        string txt = a.Stamp() + "  " + AlarmItem.LevelOf(a.Priority())
+                     + "  " + a.Point() + "  " + a.Message();
+        c.DrawText(bx + app.Scale(10), by + bh / 2 - Canvas.FontHeight(fs) / 2,
+                   txt, t.textInverse, fs);
+
+        int n = buffer.UnackedCount();
+        string btn = "确认 (" + Convert.ToString(n) + ")";
+        int fsS = t.fontSizeSmall;
+        int bwid = Canvas.MeasureText(btn, fsS) + app.Scale(20);
+        int bxx = bx + bw - bwid - app.Scale(8);
+        int byy = by + (bh - t.heightSmall) / 2;
+        int hv = Ui.HoverLevel(app, ackId);
+        c.FillRoundRect(bxx, byy, bwid, t.heightSmall, t.borderRadiusSmall,
+                        App.Lighten(bg, 20 + hv / 20));
+        c.DrawRoundRect(bxx, byy, bwid, t.heightSmall, t.borderRadiusSmall,
+                        t.textInverse, 1);
+        c.DrawTextCentered(bxx, byy, bwid, t.heightSmall, btn,
+                           t.textInverse, fsS);
+        app.hitTester.Register(new HitRegion(ackId, bxx, byy, bwid,
+                                            t.heightSmall, 0));
+        if (Ui.Clicked(app, ackId)) {
+            buffer.AckAll();
+            Ack.Raise();
+            app.RequestRedraw();
+        }
+        app.hitTester.Register(new HitRegion(wid, bx, by, bw, bh, 0));
+        On.Fire(app, wid);
+    }
+}
+
+/// <summary>
+/// 报警列表（alarm list）：时间 / 级别 / 位号 / 描述 / 状态五列，
+/// 未确认行以优先级色底显示，点击行选中。
+/// </summary>
+class AlarmList : Control {
+    AlarmBuffer buffer;
+    int wid;
+    /// 行命中区的连续 id 块（缓冲上限即最大行数）。
+    int rowBaseId;
+    int selected;
+    /// 选中行变化时触发。
+    UiEvent RowClick;
+
+    /// 自带缓冲区（设计器 / 表单编译路径用）。
+    AlarmList() : this(new AlarmBuffer()) { }
+
+    /// 换绑缓冲区（与 AlarmBanner 共享同一份报警）。
+    void Bind(AlarmBuffer buf) { buffer = buf; }
+
+    AlarmBuffer Buffer() { return buffer; }
+
+    AlarmList(AlarmBuffer buf) {
+        this.InitControl("alarmList", 5);
+        buffer = buf;
+        wid = WidgetId.Next();
+        rowBaseId = WidgetId.Block(256);
+        selected = -1;
+        wiresOwnEvents = true;
+        RowClick = new UiEvent();
+    }
+
+    int Selected() { return selected; }
+    AlarmItem SelectedItem() {
+        if (selected < 0 || selected >= buffer.Count()) { return null; }
+        return buffer.At(selected);
+    }
+
+    override string Kind() { return "AlarmList"; }
+
+    override List<string> Events() {
+        List<string> e = Control.CommonEvents();
+        e.Add("RowClick");
+        return e;
+    }
+
+    override void BindEvent(string evt, Action a) {
+        if (evt == "RowClick") { RowClick.Add(a); return; }
+        On.AddByName(evt, a);
+    }
+
+    override void OnMeasure(App app) {
+        prefW = app.Scale(480);
+        prefH = app.Scale(200);
+    }
+
+    override void OnPaint(App app) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int fs = t.fontSizeSmall;
+        int rowH = t.heightSmall;
+        c.FillRect(bx, by, bw, bh, t.bgSecondary);
+        c.DrawRect(bx, by, bw, bh, t.borderPrimary, 1);
+
+        int c0 = bx + app.Scale(8);
+        int c1 = c0 + app.Scale(76);
+        int c2 = c1 + app.Scale(60);
+        int c3 = c2 + app.Scale(110);
+        int c4 = bx + bw - app.Scale(70);
+        c.FillRect(bx, by, bw, rowH, t.bgTertiary);
+        c.DrawText(c0, by + rowH / 2 - Canvas.FontHeight(fs) / 2, "时间",
+                   t.textSecondary, fs);
+        c.DrawText(c1, by + rowH / 2 - Canvas.FontHeight(fs) / 2, "级别",
+                   t.textSecondary, fs);
+        c.DrawText(c2, by + rowH / 2 - Canvas.FontHeight(fs) / 2, "位号",
+                   t.textSecondary, fs);
+        c.DrawText(c3, by + rowH / 2 - Canvas.FontHeight(fs) / 2, "描述",
+                   t.textSecondary, fs);
+        c.DrawText(c4, by + rowH / 2 - Canvas.FontHeight(fs) / 2, "状态",
+                   t.textSecondary, fs);
+
+        c.PushClip(bx, by + rowH, bw, bh - rowH);
+        int y = by + rowH;
+        // 最新的排在最上面：现场值班看的是刚发生的那条。
+        for (int k = buffer.Count() - 1; k >= 0; k = k - 1) {
+            if (y >= by + bh) { break; }
+            AlarmItem a = buffer.At(k);
+            int col = AlarmItem.ColorOf(t, a.Priority());
+            int bg = t.bgSecondary;
+            if (!a.IsAcked()) { bg = App.LerpColor(t.bgSecondary, col, 28); }
+            if (k == selected) { bg = App.LerpColor(bg, t.primary, 22); }
+            c.FillRect(bx, y, bw, rowH, bg);
+            c.DrawLine(bx, y + rowH - 1, bx + bw, y + rowH - 1, t.divider, 1);
+            int ty = y + rowH / 2 - Canvas.FontHeight(fs) / 2;
+            c.DrawText(c0, ty, a.Stamp(), t.textSecondary, fs);
+            c.DrawText(c1, ty, AlarmItem.LevelOf(a.Priority()), col, fs);
+            c.DrawText(c2, ty, a.Point(), t.textPrimary, fs);
+            c.DrawText(c3, ty, a.Message(), t.textPrimary, fs);
+            string st = "已复归";
+            if (a.IsActive()) { st = "活动"; }
+            if (!a.IsAcked()) { st = st + "*"; }
+            c.DrawText(c4, ty, st, t.textSecondary, fs);
+            int rowId = rowBaseId + (k % 256);
+            app.hitTester.Register(new HitRegion(rowId, bx, y, bw, rowH, 0));
+            if (Ui.Clicked(app, rowId)) {
+                selected = k;
+                RowClick.Raise();
+                app.RequestRedraw();
+            }
+            y = y + rowH;
+        }
+        c.PopClip();
+        On.Fire(app, wid);
+    }
+}

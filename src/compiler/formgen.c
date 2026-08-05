@@ -61,6 +61,9 @@ static void fg_putf(fg_buf_t *b, const char *fmt, ...) {
     b->buf[b->len] = '\0';
 }
 
+/* Highest built-in design type (mirrors FormField.MaxType). */
+#define FG_MAX_TYPE 71
+
 /* ---- design type table (mirrors FormField.TypeKey / TypeName) ---- */
 
 static const char *fg_kind_of(int ft) {
@@ -122,6 +125,20 @@ static const char *fg_kind_of(int ft) {
     case 55: return "contextmenu";
     case 56: return "layer";
     case 57: return "timer";
+    case 58: return "toolbar";
+    case 59: return "statusbar";
+    case 60: return "split";
+    case 61: return "dockpanel";
+    case 62: return "led";
+    case 63: return "digital";
+    case 64: return "gauge";
+    case 65: return "bargraph";
+    case 66: return "trend";
+    case 67: return "alarmbanner";
+    case 68: return "alarmlist";
+    case 69: return "numpad";
+    case 70: return "devicecard";
+    case 71: return "equippanel";
     default:  return "input";
     }
 }
@@ -132,7 +149,7 @@ static int fg_ftype_of(zan_json_value_t *o) {
     if (k && k->type == ZAN_JSON_STRING && k->string_val.str) {
         const char *s = k->string_val.str;
         size_t n = k->string_val.len;
-        for (int ft = 0; ft <= 57; ft++) {
+        for (int ft = 0; ft <= FG_MAX_TYPE; ft++) {
             const char *kk = fg_kind_of(ft);
             if (strlen(kk) == n && memcmp(kk, s, n) == 0) return ft;
         }
@@ -158,7 +175,20 @@ static const char *fg_widget_type(int ft) {
     if (ft == 9) return "Slider";
     if (ft == 29) return "Progress";
     if (ft == 49) return "Button";
-    if (ft == 18 || ft == 45 || ft == 36) return "Panel";
+    if (ft == 18 || ft == 45 || ft == 36 || ft == 61) return "Panel";
+    if (ft == 58) return "ToolStrip";
+    if (ft == 59) return "StatusBar";
+    if (ft == 60) return "SplitPanel";
+    if (ft == 62) return "Led";
+    if (ft == 63) return "Digital";
+    if (ft == 64) return "Gauge";
+    if (ft == 65) return "Bargraph";
+    if (ft == 66) return "Trend";
+    if (ft == 67) return "AlarmBanner";
+    if (ft == 68) return "AlarmList";
+    if (ft == 69) return "NumPad";
+    if (ft == 70) return "DeviceCard";
+    if (ft == 71) return "EquipPanel";
     return "Label";
 }
 
@@ -175,12 +205,47 @@ static int fg_pref_h(int ft) {
     if (ft == 15) return 30;
     if (ft == 5 || ft == 7 || ft == 4 || ft == 8) return 26;
     if (ft == 49) return 36;
+    if (ft == 58) return 34;
+    if (ft == 59) return 24;
+    if (ft == 60 || ft == 61) return 240;
+    if (ft == 62) return 26;
+    if (ft == 63) return 72;
+    if (ft == 64) return 160;
+    if (ft == 65) return 180;
+    if (ft == 66) return 200;
+    if (ft == 67) return 32;
+    if (ft == 68) return 200;
+    if (ft == 69) return 260;
+    if (ft == 70) return 140;
+    if (ft == 71) return 300;
     return 32;
 }
 
 /* Container types nest children (mirrors FormField.IsContainerOf). */
 static bool fg_is_container(int ft) {
-    return ft == 18 || ft == 36;
+    return ft == 18 || ft == 36 || ft == 60 || ft == 61;
+}
+
+/* Dock edge a shell bar takes when the design does not name one: a tool strip
+ * spans the top, a status bar the bottom, a dock panel fills what is left.
+ * 0 keeps the free-canvas absolute placement. */
+static int fg_default_dock(int ft) {
+    if (ft == 58) return 1;
+    if (ft == 59) return 2;
+    if (ft == 61) return 5;
+    return 0;
+}
+
+/* Option `i` of a field as a NUL-terminated string, or `def`. Split panels
+ * keep their orientation/size in the generic options list so no extra schema
+ * keys are needed: options[0] = "vertical"|"horizontal", options[1] = size. */
+static const char *fg_option_at(zan_json_value_t *o, int i, const char *def) {
+    zan_json_value_t *opts = zan_json_get(o, "options");
+    if (!opts || opts->type != ZAN_JSON_ARRAY || i >= opts->array_val.count)
+        return def;
+    zan_json_value_t *it = opts->array_val.items[i];
+    if (!it || it->type != ZAN_JSON_STRING || !it->string_val.str) return def;
+    return it->string_val.str;
 }
 
 /* ---- string helpers ---- */
@@ -304,6 +369,30 @@ static void fg_ctor(fg_buf_t *b, zan_json_value_t *o, int ft, const char *wt) {
         fg_putf(b, "new Panel(\"");
         fg_esc_cstr(b, fg_obj_str(o, "name"));
         fg_putf(b, "\")");
+    } else if (strcmp(wt, "ToolStrip") == 0) {
+        fg_putf(b, "new ToolStrip()");
+    } else if (strcmp(wt, "StatusBar") == 0) {
+        fg_putf(b, "new StatusBar()");
+    } else if (strcmp(wt, "SplitPanel") == 0) {
+        const char *orient = fg_option_at(o, 0, "vertical");
+        int size = atoi(fg_option_at(o, 1, "240"));
+        if (size <= 0) size = 240;
+        fg_putf(b, "new SplitPanel(SplitPanel.%s(), %d)",
+                strcmp(orient, "horizontal") == 0 ? "Horizontal" : "Vertical",
+                size);
+    } else if (strcmp(wt, "Led") == 0 || strcmp(wt, "Digital") == 0
+               || strcmp(wt, "Gauge") == 0 || strcmp(wt, "Bargraph") == 0
+               || strcmp(wt, "Trend") == 0 || strcmp(wt, "DeviceCard") == 0) {
+        /* Industrial widgets all take the caption alone and are bound to a
+         * process tag by the code-behind, which is where the I/O lives. */
+        fg_putf(b, "new %s(\"", wt);
+        fg_esc_cstr(b, cap);
+        fg_putf(b, "\")");
+    } else if (strcmp(wt, "EquipPanel") == 0) {
+        fg_putf(b, "new EquipPanel()");
+    } else if (strcmp(wt, "AlarmBanner") == 0 || strcmp(wt, "AlarmList") == 0
+               || strcmp(wt, "NumPad") == 0) {
+        fg_putf(b, "new %s()", wt);
     } else {
         fg_putf(b, "new Label(\"");
         fg_esc_cstr(b, cap);
@@ -328,6 +417,43 @@ static void fg_field_setup(fg_buf_t *b, zan_json_value_t *o, int ft,
             fg_putf(b, "\");\n");
         }
         free(opts);
+    }
+    /* Tool strip items are "caption:icon" texts, `>` prefixed for the right
+     * group and "-" for a separator (same spec the designer previews). */
+    if (strcmp(wt, "ToolStrip") == 0) {
+        char *opts = fg_join_opts(o);
+        if (opts && opts[0]) {
+            fg_putf(b, "        %s.SetItemsText(\"", vn);
+            fg_esc_cstr(b, opts);
+            fg_putf(b, "\");\n");
+        }
+        free(opts);
+    }
+    /* Equipment panel items are device names, one card each. */
+    if (strcmp(wt, "EquipPanel") == 0) {
+        char *opts = fg_join_opts(o);
+        if (opts && opts[0]) {
+            fg_putf(b, "        %s.SetItemsText(\"", vn);
+            fg_esc_cstr(b, opts);
+            fg_putf(b, "\");\n");
+        }
+        free(opts);
+    }
+    /* Status bar items: `>` prefix puts an item in the right-hand group. */
+    if (strcmp(wt, "StatusBar") == 0) {
+        zan_json_value_t *opts = zan_json_get(o, "options");
+        if (opts && opts->type == ZAN_JSON_ARRAY) {
+            for (int i = 0; i < opts->array_val.count; i++) {
+                zan_json_value_t *it = opts->array_val.items[i];
+                if (!it || it->type != ZAN_JSON_STRING || !it->string_val.str
+                    || !it->string_val.str[0]) continue;
+                const char *s = it->string_val.str;
+                bool right = s[0] == '>';
+                fg_putf(b, "        %s.Add%s(\"", vn, right ? "Right" : "Left");
+                fg_esc_cstr(b, right ? s + 1 : s);
+                fg_putf(b, "\");\n");
+            }
+        }
     }
     (void)ft;
 }
@@ -440,11 +566,24 @@ static int fg_emit_field(fg_buf_t *decls, fg_buf_t *body, fg_buf_t *wire,
          * display like the theme metrics and the stylesheet lengths already
          * are, so a design keeps its proportions (and stays inside its
          * winShape silhouette, which the runtime scales too) at 125/150/200%. */
-        fg_putf(body, "        %s.Dock(Dock.Manual());\n", vn);
-        fg_putf(body, "        %s.Place(%d * __dp / 100, %d * __dp / 100);\n",
-                vn, fx, fy);
-        fg_putf(body, "        %s.Prefer(%d * __dp / 100, %d * __dp / 100);\n",
-                vn, fw, fh);
+        int dk = fg_obj_num(o, "dock", fg_default_dock(ft));
+        if (dk == 1 || dk == 2) {
+            fg_putf(body, "        %s.Dock(Dock.%s());\n",
+                    vn, dk == 1 ? "Top" : "Bottom");
+            fg_putf(body, "        %s.Prefer(0, %d * __dp / 100);\n", vn, fh);
+        } else if (dk == 3 || dk == 4) {
+            fg_putf(body, "        %s.Dock(Dock.%s());\n",
+                    vn, dk == 3 ? "Left" : "Right");
+            fg_putf(body, "        %s.Prefer(%d * __dp / 100, 0);\n", vn, fw);
+        } else if (dk == 5) {
+            fg_putf(body, "        %s.Dock(Dock.Fill());\n", vn);
+        } else {
+            fg_putf(body, "        %s.Dock(Dock.Manual());\n", vn);
+            fg_putf(body, "        %s.Place(%d * __dp / 100, %d * __dp / 100);\n",
+                    vn, fx, fy);
+            fg_putf(body, "        %s.Prefer(%d * __dp / 100, %d * __dp / 100);\n",
+                    vn, fw, fh);
+        }
         if (fg_is_container(ft)) {
             fg_putf(body, "        %s.Pad(0);\n", vn);
         }
@@ -463,10 +602,21 @@ static int fg_emit_field(fg_buf_t *decls, fg_buf_t *body, fg_buf_t *wire,
 
     zan_json_value_t *kids = zan_json_get(o, "kids");
     if (fg_is_container(ft) && kids && kids->type == ZAN_JSON_ARRAY) {
-        for (int i = 0; i < kids->array_val.count; i++)
-            next = fg_emit_field(decls, body, wire, valid,
-                                 kids->array_val.items[i],
-                                 vn, next, used, freeMode);
+        for (int i = 0; i < kids->array_val.count; i++) {
+            zan_json_value_t *kid = kids->array_val.items[i];
+            char host[160];
+            /* A split panel owns two panes instead of one content box: a kid
+             * goes into the pane its `childTab` names. */
+            if (ft == 60) {
+                snprintf(host, sizeof(host), "%s.%s()", vn,
+                         fg_obj_num(kid, "childTab", 0) == 1 ? "Second"
+                                                            : "First");
+            } else {
+                snprintf(host, sizeof(host), "%s", vn);
+            }
+            next = fg_emit_field(decls, body, wire, valid, kid,
+                                 host, next, used, freeMode);
+        }
     }
     return next;
 }
@@ -597,7 +747,8 @@ char *zan_formgen_translate(const char *json, size_t json_len,
     /* ---- assemble the synthetic partial class ---- */
     fg_putf(&out, "using System;\n");
     fg_putf(&out, "using Gui;\n");
-    fg_putf(&out, "using Gui.Widget;\n\n");
+    fg_putf(&out, "using Gui.Widget;\n");
+    fg_putf(&out, "using Gui.Hmi;\n\n");
     fg_putf(&out, "// <auto-generated> Window layout compiled from %s.\n",
             file_name ? file_name : "<design>");
     fg_putf(&out, "// Regenerated from the visual design on every build - do not edit.\n");

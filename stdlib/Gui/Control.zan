@@ -1131,12 +1131,36 @@ class Control {
     }
 }
 
+/// 窗口上的一个周期任务（Form.Every 登记）。工控画面、
+/// 监控看板这类“定时重扫”的屏幕靠它驱动，不必自己
+/// 写事件循环。
+class FormTask {
+    int periodMs;
+    /// 下次到期的时刻（App 的动画时钟）。
+    int dueMs;
+    Action work;
+
+    FormTask(int ms, Action a) {
+        periodMs = ms;
+        if (periodMs < 1) { periodMs = 1; }
+        work = a;
+        dueMs = 0;
+    }
+
+    int Period() { return periodMs; }
+    int Due() { return dueMs; }
+    void Schedule(int atMs) { dueMs = atMs; }
+    void Fire() { work(); }
+}
+
 /// 保留模式 UI 的根：窗口本身作为一个组件。拥有 App
 /// 并驱动帧循环，每帧在标题栏装饰之下
 /// 布局并渲染整棵树。
 class Form : Control {
     App app;
     string title;
+    /// 周期任务（见 Every），在事件循环中按期触发。
+    List<FormTask> tasks;
     /// 设计出的 `on<Event>` 绑定的 Name -> Action 表（与
     /// UiDoc/HandlerRegistry 契约相同）：.zform 存储处理器名，
     /// 业务文件用 On() 注册 Action，生成的
@@ -1151,6 +1175,7 @@ class Form : Control {
         this.title = title;
         this.app = new App(title, width, height);
         this.handlers = new HandlerRegistry();
+        this.tasks = new List<FormTask>();
     }
 
     static Form CreateDark(string title, int width, int height) {
@@ -1161,6 +1186,39 @@ class Form : Control {
 
     App GetApp() {
         return app;
+    }
+
+    // ---- 周期任务 ----
+
+    /// 每 `ms` 毫秒跑一次 `a`，由事件循环驱动（采集、报警
+    /// 扫描、趋势取点都用它）。任务跑完就请求重绘，因此
+    /// 它改的信号会在下一帧体现。
+    FormTask Every(int ms, Action a) {
+        FormTask t = new FormTask(ms, a);
+        t.Schedule(app.nowMs + t.Period());
+        tasks.Add(t);
+        return t;
+    }
+
+    /// 到期的周期任务全部跑一遍，并把下一个到期时刻告知
+    /// 事件循环（以便在无输入时也能醒过来）。手写循环可
+    /// 直接调用它。
+    void PumpTasks() {
+        if (tasks.Count == 0) { return; }
+        int now = app.nowMs;
+        int soonest = 0 - 1;
+        for (int i = 0; i < tasks.Count; i = i + 1) {
+            FormTask t = tasks[i];
+            if (now >= t.Due()) {
+                t.Fire();
+                t.Schedule(now + t.Period());
+                app.RequestRedraw();
+            }
+            int wait = t.Due() - now;
+            if (wait < 0) { wait = 0; }
+            if (soonest < 0 || wait < soonest) { soonest = wait; }
+        }
+        if (soonest >= 0) { app.RequestAnimationFrame(soonest); }
     }
 
     // ---- 动态控件通道 ----
@@ -1232,6 +1290,7 @@ class Form : Control {
             if (!app.ProcessEvent()) {
                 break;
             }
+            this.PumpTasks();
             if (!app.needsRedraw) {
                 continue;
             }

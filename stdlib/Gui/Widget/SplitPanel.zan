@@ -1,0 +1,188 @@
+using System;
+using Gui;
+
+namespace Gui.Widget;
+
+/// <summary>
+/// 保留式两栏容器，中间是可拖拽的分隔条——IDE / 上位机
+/// 外壳的基本骨架（导航树 | 编辑区，画面 | 报警列表）。
+///
+/// 与立即模式的 <see cref="Split"/> 不同，它是控件树里的一个
+/// 节点：两个窗格是它的子控件，宿主（或窗口设计器）往
+/// `First()` / `Second()` 里添加内容即可，分栏尺寸由控件自己
+/// 跨帧持有：
+///
+///   SplitPanel sp = new SplitPanel(SplitPanel.Vertical(), 240);
+///   sp.First().Add(nav);
+///   sp.Second().Add(editor);
+///   root.Add(sp);
+///
+/// 拖动分隔条改变第一个窗格的尺寸（垂直分隔条改宽度，
+/// 水平分隔条改高度），受 MinSizes() 限制。
+/// </summary>
+class SplitPanel : Control {
+    /// 0 = 垂直分隔条（左 | 右），1 = 水平分隔条（上 | 下）。
+    int orient;
+    /// 第一个窗格的尺寸（px，未缩放的逻辑像素由调用方决定），
+    /// 是信号以便别处绑定/持久化。
+    SignalInt firstSize;
+    int minFirst;
+    int minSecond;
+    Panel firstPane;
+    Panel secondPane;
+    int wid;
+    /// 分隔条上一次的命中矩形，供 OnPaint 之后的拖拽处理使用。
+    int handleX;
+    int handleY;
+    int handleW;
+    int handleH;
+
+    static int Vertical() { return 0; }
+    static int Horizontal() { return 1; }
+
+    void InitSplitPanel(int o, int size) {
+        this.InitControl("split", 5);
+        orient = o;
+        firstSize = new SignalInt(size);
+        minFirst = 60;
+        minSecond = 60;
+        wid = WidgetId.Next();
+        handleX = 0;
+        handleY = 0;
+        handleW = 0;
+        handleH = 0;
+        firstPane = SplitPanel.NewPane("first");
+        secondPane = SplitPanel.NewPane("second");
+        this.Add(firstPane);
+        this.Add(secondPane);
+    }
+
+    /// 透明窗格：没有自己的表面，子控件按停靠布局排布，
+    /// 因此设计器放进去的绝对定位控件和停靠控件都能工作。
+    static Panel NewPane(string name) {
+        Panel p = Panel.Column();
+        p.name = name;
+        p.layout = 0;
+        p.Pad(0);
+        return p;
+    }
+
+    SplitPanel(int o, int size) { InitSplitPanel(o, size); }
+    SplitPanel(int o) { InitSplitPanel(o, 240); }
+    SplitPanel() { InitSplitPanel(0, 240); }
+
+    Panel First() { return firstPane; }
+    Panel Second() { return secondPane; }
+
+    int Size() { return firstSize.Get(); }
+    void SetSize(int px) { firstSize.Set(px); }
+
+    /// 拖拽下限：两个窗格各自允许的最小尺寸（px）。
+    SplitPanel MinSizes(int first, int second) {
+        minFirst = first;
+        minSecond = second;
+        return this;
+    }
+
+    SplitPanel Orient(int o) {
+        orient = o;
+        return this;
+    }
+
+    // ---- 设计器 / 序列化模型 --------------------------------------
+
+    override string Kind() { return "SplitPanel"; }
+
+    override List<PropSpec> Props() {
+        List<PropSpec> ps = new List<PropSpec>();
+        PropSpec o = PropSpec.Enum("orient", "Orientation", new List<string>());
+        o.Option("vertical"); o.Option("horizontal");
+        o.num = orient;
+        ps.Add(o);
+        PropSpec sz = PropSpec.Int("size", "First pane");
+        sz.snum = firstSize;
+        ps.Add(sz);
+        PropSpec mf = PropSpec.Int("minFirst", "Min first");
+        mf.num = minFirst;
+        ps.Add(mf);
+        PropSpec ms = PropSpec.Int("minSecond", "Min second");
+        ms.num = minSecond;
+        ps.Add(ms);
+        return ps;
+    }
+
+    // ---- 保留式钩子（Control） ---------------------------------------
+
+    override void OnMeasure(App app) {
+        if (prefSet) { return; }
+        prefW = 0;
+        prefH = 0;
+    }
+
+    /// 两个窗格按当前分栏尺寸排布，分隔条占中间的
+    /// 一条（其宽度按 DPI 缩放，命中区再向两侧放宽）。
+    override void Arrange(int px, int py, int pw, int ph) {
+        if (pw < 0) { pw = 0; }
+        if (ph < 0) { ph = 0; }
+        bx = px;
+        by = py;
+        bw = pw;
+        bh = ph;
+        int bar = SplitPanel.BarSize();
+        if (orient == 1) {
+            int fh = this.Clamp(firstSize.Get(), ph, bar);
+            firstPane.Arrange(px, py, pw, fh);
+            secondPane.Arrange(px, py + fh + bar, pw, ph - fh - bar);
+            handleX = px;
+            handleY = py + fh;
+            handleW = pw;
+            handleH = bar;
+        } else {
+            int fw = this.Clamp(firstSize.Get(), pw, bar);
+            firstPane.Arrange(px, py, fw, ph);
+            secondPane.Arrange(px + fw + bar, py, pw - fw - bar, ph);
+            handleX = px + fw;
+            handleY = py;
+            handleW = bar;
+            handleH = ph;
+        }
+    }
+
+    /// 逻辑像素的分隔条厚度。静态而非主题值，
+    /// 因为 Arrange 拿不到 App（布局在测量之后进行）。
+    static int BarSize() { return 5; }
+
+    /// 把请求的分栏尺寸夹到两个窗格的最小值之间。
+    int Clamp(int want, int total, int bar) {
+        int maxFirst = total - minSecond - bar;
+        if (maxFirst < minFirst) { maxFirst = minFirst; }
+        if (want < minFirst) { want = minFirst; }
+        if (want > maxFirst) { want = maxFirst; }
+        if (want < 0) { want = 0; }
+        if (want > total) { want = total; }
+        return want;
+    }
+
+    override void OnPaint(App app) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int id = wid;
+        bool hot = app.focus.IsHovered(id) || app.focus.IsPressed(id);
+        int col = t.divider;
+        if (hot) { col = t.primary; }
+        c.FillRect(handleX, handleY, handleW, handleH, col);
+        app.hitTester.Register(new HitRegion(id, handleX, handleY,
+                                            handleW, handleH, 4));
+        if (app.focus.IsPressed(id)) {
+            int nv = app.mouseX - bx;
+            if (orient == 1) { nv = app.mouseY - by; }
+            int total = bw;
+            if (orient == 1) { total = bh; }
+            nv = this.Clamp(nv, total, SplitPanel.BarSize());
+            if (nv != firstSize.Get()) {
+                firstSize.Set(nv);
+                app.RequestRedraw();
+            }
+        }
+    }
+}

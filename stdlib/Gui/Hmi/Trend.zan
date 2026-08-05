@@ -1,0 +1,230 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+namespace Gui.Hmi;
+
+/// <summary>
+/// 一条趋势曲线：环形采样缓冲 + 颜色 + 位号。缓冲写满后自动
+/// 覆盖最旧的点，因此长时间运行不增长内存。
+/// </summary>
+class TrendPen {
+    string title;
+    IoTag tag;
+    SignalInt raw;
+    int color;
+    List<int> samples;
+    int capacity;
+    /// 下一个写入位置（环形缓冲）。
+    int head;
+    int filled;
+
+    TrendPen(string name, IoTag t, int col, int cap) {
+        title = name;
+        tag = t;
+        raw = t.Value();
+        color = col;
+        capacity = cap;
+        if (capacity < 8) { capacity = 8; }
+        samples = new List<int>();
+        head = 0;
+        filled = 0;
+    }
+
+    string Title() { return title; }
+    int Color() { return color; }
+    int Count() { return filled; }
+    IoTag Point() { return tag; }
+
+    /// 采一个点（一般由画面的周期定时器统一调用）。
+    void Sample() {
+        this.Push(raw.Get());
+    }
+
+    void Push(int v) {
+        if (samples.Count < capacity) {
+            samples.Add(v);
+            filled = samples.Count;
+            head = samples.Count % capacity;
+            return;
+        }
+        samples[head] = v;
+        head = (head + 1) % capacity;
+        filled = capacity;
+    }
+
+    /// 第 i 个点（0 = 最旧），按环形缓冲展开。
+    int At(int i) {
+        if (filled < capacity) { return samples[i]; }
+        return samples[(head + i) % capacity];
+    }
+}
+
+/// <summary>
+/// 实时趋势图（rolling trend）：多笔曲线共享时间轴与量程，
+/// 新点从右侧进入、旧点左移，是上位机最常用的历史观察件。
+///
+///   Trend tr = new Trend("Reactor");
+///   tr.Add("PV", pvTag, theme.success);
+///   tr.Add("SV", svTag, theme.info);
+///   // 周期定时器里：
+///   tr.Sample();
+/// </summary>
+class Trend : Control {
+    string caption;
+    List<TrendPen> pens;
+    int rawMin;
+    int rawMax;
+    int scale;
+    /// 采样点容量 = 时间窗宽度（点数）。
+    int window;
+    bool showGrid;
+
+    Trend(string text, int lo, int hi, int sc, int win) {
+        this.InitControl("trend", 0);
+        caption = text;
+        pens = new List<TrendPen>();
+        rawMin = lo;
+        rawMax = hi;
+        if (rawMax <= rawMin) { rawMax = rawMin + 1; }
+        scale = sc;
+        if (scale < 1) { scale = 1; }
+        window = win;
+        if (window < 8) { window = 8; }
+        showGrid = true;
+    }
+
+    Trend(string text) : this(text, 0, 100, 1, 120) { }
+
+    int PenCount() { return pens.Count; }
+    TrendPen PenAt(int i) { return pens[i]; }
+    void SetGrid(bool on) { showGrid = on; }
+
+    Trend Range(int lo, int hi) {
+        rawMin = lo;
+        rawMax = hi;
+        if (rawMax <= rawMin) { rawMax = rawMin + 1; }
+        return this;
+    }
+
+    /// 加一笔曲线。第一次加入时若量程还是默认值，则跟随位号量程。
+    TrendPen Add(string title, IoTag t, int color) {
+        if (pens.Count == 0 && rawMin == 0 && rawMax == 100) {
+            rawMin = t.Min();
+            rawMax = t.Max();
+            scale = t.Scale();
+        }
+        TrendPen p = new TrendPen(title, t, color, window);
+        pens.Add(p);
+        return p;
+    }
+
+    /// 所有曲线同时采一个点。
+    void Sample() {
+        for (int i = 0; i < pens.Count; i = i + 1) { pens[i].Sample(); }
+    }
+
+    override string Kind() { return "Trend"; }
+
+    override List<PropSpec> Props() {
+        List<PropSpec> ps = new List<PropSpec>();
+        PropSpec cap = PropSpec.Text("label", "Caption");
+        cap.str = caption;
+        ps.Add(cap);
+        PropSpec lo = PropSpec.Int("min", "Min");
+        lo.num = rawMin;
+        ps.Add(lo);
+        PropSpec hi = PropSpec.Int("max", "Max");
+        hi.num = rawMax;
+        ps.Add(hi);
+        PropSpec win = PropSpec.Int("window", "Window (samples)");
+        win.num = window;
+        ps.Add(win);
+        PropSpec gr = PropSpec.Bool("grid", "Grid");
+        gr.flag = showGrid;
+        ps.Add(gr);
+        return ps;
+    }
+
+    override void OnMeasure(App app) {
+        prefW = app.Scale(360);
+        prefH = app.Scale(200);
+    }
+
+    override void OnPaint(App app) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int fs = t.fontSizeSmall;
+        int rad = t.borderRadiusMedium;
+        c.FillRoundRect(bx, by, bw, bh, rad, App.Darken(t.bgTertiary, 20));
+        c.DrawRoundRect(bx, by, bw, bh, rad, t.borderPrimary, 1);
+
+        int pad = app.Scale(8);
+        int axisW = app.Scale(44);
+        int capH = 0;
+        if (caption != "") {
+            c.DrawText(bx + pad, by + pad, caption, t.textSecondary, fs);
+            capH = Canvas.FontHeight(fs) + app.Scale(4);
+        }
+        int legendH = 0;
+        if (pens.Count > 0) { legendH = Canvas.FontHeight(fs) + app.Scale(6); }
+        int px = bx + pad + axisW;
+        int py = by + pad + capH;
+        int pw = bw - pad * 2 - axisW;
+        int ph = bh - pad * 2 - capH - legendH;
+        if (pw < app.Scale(20) || ph < app.Scale(20)) { return; }
+
+        if (showGrid) {
+            for (int i = 0; i <= 4; i = i + 1) {
+                int gy = py + ph * i / 4;
+                c.DrawLine(px, gy, px + pw, gy, t.divider, 1);
+                int v = rawMax - (rawMax - rawMin) * i / 4;
+                c.DrawText(bx + pad, gy - Canvas.FontHeight(fs) / 2,
+                           IoTag.Format(v, scale), t.textTertiary, fs);
+            }
+            for (int j = 1; j < 6; j = j + 1) {
+                int gx = px + pw * j / 6;
+                c.DrawLine(gx, py, gx, py + ph, t.divider, 1);
+            }
+        }
+
+        c.PushClip(px, py, pw, ph);
+        for (int p = 0; p < pens.Count; p = p + 1) {
+            TrendPen pen = pens[p];
+            int n = pen.Count();
+            if (n < 2) { continue; }
+            List<int> xs = new List<int>();
+            List<int> ys = new List<int>();
+            for (int i = 0; i < n; i = i + 1) {
+                xs.Add(px + pw * i / (window - 1));
+                ys.Add(py + ph - this.PlotY(pen.At(i), ph));
+            }
+            c.DrawPolyline(xs, ys, pen.Color(), app.Scale(2));
+        }
+        c.PopClip();
+        c.DrawRect(px, py, pw, ph, t.borderSecondary, 1);
+
+        int lx = px;
+        int ly = by + bh - pad - Canvas.FontHeight(fs);
+        for (int p = 0; p < pens.Count; p = p + 1) {
+            TrendPen pen = pens[p];
+            int sw = app.Scale(10);
+            c.FillRect(lx, ly + Canvas.FontHeight(fs) / 2 - 1, sw, 2,
+                       pen.Color());
+            c.DrawText(lx + sw + app.Scale(4), ly, pen.Title(),
+                       t.textSecondary, fs);
+            lx = lx + sw + app.Scale(8)
+                 + Canvas.MeasureText(pen.Title(), fs) + app.Scale(10);
+        }
+    }
+
+    /// 原始值在绘图区内的高度（自底向上的像素数）。
+    int PlotY(int v, int ph) {
+        int span = rawMax - rawMin;
+        if (span <= 0) { return 0; }
+        int y = (v - rawMin) * ph / span;
+        if (y < 0) { y = 0; }
+        if (y > ph) { y = ph; }
+        return y;
+    }
+}

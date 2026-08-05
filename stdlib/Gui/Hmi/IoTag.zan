@@ -1,0 +1,202 @@
+using System;
+using Gui;
+
+namespace Gui.Hmi;
+
+/// <summary>
+/// 一个过程位号（tag / point）：上位机画面上所有数显、仪表、
+/// 指示灯、棒图和趋势都绑定到位号，而不是各自持有一份值，
+/// 因此一次采集刷新即可让整幅画面同步。
+///
+/// 值用定点整数表示：`raw` 是原始整数，`scale` 是每单位的
+/// 计数（1 = 整数，10 = 一位小数，100 = 两位小数）。工控
+/// 现场的量程和限值本来就是定点的，避免浮点显示抖动。
+///
+///   TagTable io = new TagTable();
+///   IoTag t = io.Add("TIC101.PV", "\u00b0C", 10);   // 一位小数
+///   t.Range(0, 3000);                             // 0.0 .. 300.0
+///   t.Limits(500, 2500);                          // 低报 / 高报
+///   t.SetRaw(1234);                               // 123.4 \u00b0C
+/// </summary>
+class IoTag {
+    string tagName;
+    string unit;
+    /// 每工程单位的计数（1 / 10 / 100 ...）。
+    int scale;
+    SignalInt raw;
+    int rawMin;
+    int rawMax;
+    /// 低 / 高报警限（原始计数）。相等表示不判限。
+    int loLimit;
+    int hiLimit;
+    /// 最近一次写入是否被认为有效（通信中断时置 false，
+    /// 显示端据此画出坏值样式）。
+    bool good;
+
+    IoTag(string name, string engUnit, int scaleCounts) {
+        tagName = name;
+        unit = engUnit;
+        scale = scaleCounts;
+        if (scale < 1) { scale = 1; }
+        raw = new SignalInt(0);
+        rawMin = 0;
+        rawMax = 100 * scale;
+        loLimit = 0;
+        hiLimit = 0;
+        good = true;
+    }
+
+    /// 无量纲整数位号（无单位、无小数）。
+    IoTag(string name) : this(name, "", 1) { }
+
+    string Name() { return tagName; }
+    string Unit() { return unit; }
+    int Scale() { return scale; }
+    SignalInt Value() { return raw; }
+    int Raw() { return raw.Get(); }
+    bool IsGood() { return good; }
+    int Min() { return rawMin; }
+    int Max() { return rawMax; }
+
+    IoTag Range(int lo, int hi) {
+        rawMin = lo;
+        rawMax = hi;
+        if (rawMax <= rawMin) { rawMax = rawMin + 1; }
+        return this;
+    }
+
+    IoTag Limits(int lo, int hi) {
+        loLimit = lo;
+        hiLimit = hi;
+        return this;
+    }
+
+    void SetRaw(int v) {
+        raw.Set(v);
+        good = true;
+    }
+
+    /// 通信中断 / 坏值：保留最后一次的数值但标记为不可信。
+    void SetBad() { good = false; }
+
+    /// 0 正常，1 低报，2 高报（未设限值时恒为 0）。
+    int Alarm() {
+        if (loLimit == hiLimit) { return 0; }
+        int v = raw.Get();
+        if (v <= loLimit) { return 1; }
+        if (v >= hiLimit) { return 2; }
+        return 0;
+    }
+
+    /// 量程内的百分比（0..100），用于棒图 / 仪表指针。
+    int Percent() {
+        int span = rawMax - rawMin;
+        if (span <= 0) { return 0; }
+        int p = (raw.Get() - rawMin) * 100 / span;
+        if (p < 0) { p = 0; }
+        if (p > 100) { p = 100; }
+        return p;
+    }
+
+    /// 带小数点的工程值文本（不含单位）。
+    string Text() {
+        return IoTag.Format(raw.Get(), scale);
+    }
+
+    string TextWithUnit() {
+        if (unit == "") { return this.Text(); }
+        return this.Text() + " " + unit;
+    }
+
+    /// 定点整数按 `scale` 格式化：scale=10 时 1234 -> "123.4"。
+    static string Format(int v, int scale) {
+        if (scale <= 1) { return Convert.ToString(v); }
+        bool neg = v < 0;
+        if (neg) { v = 0 - v; }
+        int whole = v / scale;
+        int frac = v - whole * scale;
+        string fs = Convert.ToString(frac);
+        int digits = IoTag.Digits(scale);
+        while (fs.Length < digits) { fs = "0" + fs; }
+        string s = Convert.ToString(whole) + "." + fs;
+        if (neg) { s = "-" + s; }
+        return s;
+    }
+
+    /// scale 对应的小数位数（10 -> 1，100 -> 2）。
+    static int Digits(int scale) {
+        int d = 0;
+        int s = scale;
+        while (s > 1) { s = s / 10; d = d + 1; }
+        return d;
+    }
+}
+
+/// <summary>
+/// 画面的位号表：按名字建立/查找位号，并统一驱动周期刷新。
+/// 采集侧（Modbus / OPC / 串口线程）只管往位号里写值，
+/// 显示侧只管读，两边通过信号解耦。
+///
+///   TagTable io = new TagTable();
+///   io.Add("PT101.PV", "kPa", 10).Range(0, 10000).Limits(500, 9000);
+///   // 采集回调里：
+///   io.Set("PT101.PV", 4321);
+/// </summary>
+class TagTable {
+    List<IoTag> tags;
+    /// 采集周期（毫秒），供宿主的定时器使用。
+    int periodMs;
+
+    TagTable() {
+        tags = new List<IoTag>();
+        periodMs = 500;
+    }
+
+    int Count() { return tags.Count; }
+    IoTag At(int i) { return tags[i]; }
+    int Period() { return periodMs; }
+    void SetPeriod(int ms) { if (ms > 0) { periodMs = ms; } }
+
+    IoTag Add(string name, string unit, int scale) {
+        IoTag t = new IoTag(name, unit, scale);
+        tags.Add(t);
+        return t;
+    }
+
+    IoTag Add(string name) { return this.Add(name, "", 1); }
+
+    /// 按名查找位号，没有则返回 null（调用方不要假定非空）。
+    IoTag Of(string name) {
+        for (int i = 0; i < tags.Count; i = i + 1) {
+            if (tags[i].Name() == name) { return tags[i]; }
+        }
+        return null;
+    }
+
+    /// 按名查找，不存在时按默认量程即时建立——数据驱动的
+    /// 画面加载时不必先声明全部位号。
+    IoTag Ensure(string name) {
+        IoTag t = this.Of(name);
+        if (t != null) { return t; }
+        return this.Add(name);
+    }
+
+    void Set(string name, int rawValue) {
+        IoTag t = this.Of(name);
+        if (t != null) { t.SetRaw(rawValue); }
+    }
+
+    void SetBad(string name) {
+        IoTag t = this.Of(name);
+        if (t != null) { t.SetBad(); }
+    }
+
+    /// 处于报警状态的位号数量（低报 + 高报）。
+    int AlarmCount() {
+        int n = 0;
+        for (int i = 0; i < tags.Count; i = i + 1) {
+            if (tags[i].Alarm() != 0) { n = n + 1; }
+        }
+        return n;
+    }
+}
