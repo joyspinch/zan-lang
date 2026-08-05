@@ -1038,6 +1038,18 @@ foreach(_member_read_case class_member_read class_member_read_inherited)
   set_tests_properties(diag_${_member_read_case} PROPERTIES TIMEOUT 60)
 endforeach()
 
+# Assigning through a name nothing declares (`app.field = v` left behind when a
+# static factory became a constructor) dropped the store without a diagnostic,
+# while the same name read in a value position was already an error.
+add_test(NAME diag_undeclared_member_target
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/undeclared_member_target.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_undeclared_member_target${_exe_ext}
+    "-DEXPECT_REGEX=undeclared identifier"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_undeclared_member_target PROPERTIES TIMEOUT 60)
+
 # An unresolved static factory at the head of a method chain must be a compile
 # error: the unclaimed outer call never emitted its receiver, so the missing
 # method went unreported and the chain crashed at runtime.

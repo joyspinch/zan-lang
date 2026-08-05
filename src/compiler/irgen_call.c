@@ -3844,7 +3844,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
 
             /* try current class methods first */
             if (g->current_type_sym) {
-                zan_symbol_t *method_sym = resolve_overload(g->current_type_sym, fn_name, expr->call.args.count);
+                zan_symbol_t *method_sym = resolve_overload_typed(
+            g, g->current_type_sym, fn_name, expr, locals);
                     if (method_sym) fill_default_args(g, expr, method_sym);
                     if (method_sym) pack_params_args(g, expr, method_sym, locals);
                 if (method_sym) {

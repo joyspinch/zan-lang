@@ -17,6 +17,7 @@
 | [testing.md](testing.md) | 提交前：选哪个测试层级、哪些测试互斥、怎么加回归 |
 | [agent-workflow.md](agent-workflow.md) | 完整闭环：需求 → 拆解 → 计划 → 实施 → 自检 → 回归 → 交付 → 沉淀 |
 | [knowledge-graph.md](knowledge-graph.md) | IDE 内置知识库/知识图谱的数据模型、面板设计、清理规则 |
+| [stability.md](stability.md) | 防闪退：异常边界在哪、已知闪退根因、稳定性规约、发布前门禁 |
 | [diagnostics-reporting.md](diagnostics-reporting.md) | 帮助与反馈面板：错误采集、脱敏、上报协议（服务端后做） |
 | [gaps.md](gaps.md) | 小助手要能独立做出项目，还缺什么（现状 → 缺口 → 落地形式） |
 
@@ -27,7 +28,9 @@
    `tests/diag` 或 `tests/conformance` 回归。绕过去的写法会在标准库里留下一堆无法解释
    的怪代码，也让下一个人重复踩坑。
 2. **一切临时产物进 `_scratch/`，构建只进 `build/`，测试只进 `tests/`。** 仓库根目录保持干净。
-3. **验证到位再说完成。** "能编过"不等于"能跑"，"能跑"不等于"界面对"。分层验证见
+3. **不许闪退。** 局部错误只能变成一条错误记录 + 一个可继续的状态；捕获之后必须记账，
+   不能降级成 `0`/空值。见 [stability.md](stability.md)。
+4. **验证到位再说完成。** "能编过"不等于"能跑"，"能跑"不等于"界面对"。分层验证见
    [testing.md](testing.md)。
 
 ## 这份知识库自己怎么维护

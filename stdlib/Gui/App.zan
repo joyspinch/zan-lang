@@ -25,6 +25,9 @@ class AnimSlot {
     }
 }
 
+/// 一帧的绘制体（参见 App.RunLoop / App.SafeFrame）。
+delegate void FrameBody();
+
 class App {
     Window window;
     Canvas canvas;
@@ -33,6 +36,10 @@ class App {
     HitTester hitTester;
     bool isRunning;
     bool needsRedraw;
+    /// 被 SafeFrame/PumpSafe 捕下的帧异常计数与最后一条消息：
+    /// 界面可以把它当状态显示（“本次运行有 N 个错误”）。
+    int frameErrors;
+    string lastFrameError;
     int frameCount;
     int mouseX;
     int mouseY;
@@ -300,8 +307,10 @@ class App {
         this.theme = Theme.Light();
         this.focus = new FocusManager();
         this.hitTester = new HitTester();
-        app.isRunning = true;
+        this.isRunning = true;
         this.needsRedraw = true;
+        this.frameErrors = 0;
+        this.lastFrameError = "";
         this.frameCount = 0;
         this.mouseX = 0;
         this.mouseY = 0;
@@ -1371,15 +1380,64 @@ class App {
     /// 一次调用便捷方法；要绘制自己的内容，请直接驱动
     /// BeginFrame / RenderChrome / PresentFrame 循环。
     void Run(string title) {
+        this.RunLoop(() => { this.RenderChrome(title); });
+    }
+
+    /// <summary>受保护的标准事件循环：每一轮的事件分发与
+    /// 绘制都包在异常保护里，一帧里抛出的异常只丢掉这一帧（并记入
+    /// UiErrorLog），而不是结束进程。<paramref name="body"/> 只负责画
+    /// 内容：BeginFrame/PresentFrame 由循环完成。</summary>
+    void RunLoop(FrameBody body) {
         Show();
         while (isRunning) {
-            if (!ProcessEvent()) { break; }
+            if (!this.PumpSafe()) { break; }
             if (!needsRedraw) { continue; }
-            BeginFrame();
-            RenderChrome(title);
-            PresentFrame();
+            this.SafeFrame(body);
         }
     }
+
+    /// <summary>ProcessEvent 的受保护版本：事件处理（回调、
+    /// 命令、绑定）里抛出的异常不再终止进程。
+    /// 返回 false 只表示窗口要求退出。</summary>
+    bool PumpSafe() {
+        try {
+            return ProcessEvent();
+        } catch (Exception ex) {
+            this.NoteFrameError("event", ex.Message);
+            return isRunning;
+        }
+    }
+
+    /// <summary>在异常保护下画一帧（BeginFrame → body →
+    /// PresentFrame）。返回 false 表示这一帧失败并已记录；
+    /// 写自己循环的应用可以直接用它换掉裸的
+    /// BeginFrame/PresentFrame 对。</summary>
+    bool SafeFrame(FrameBody body) {
+        try {
+            BeginFrame();
+            body();
+            PresentFrame();
+            return true;
+        } catch (Exception ex) {
+            this.NoteFrameError("frame", ex.Message);
+            // 这一帧残缺：丢掉那个脏区裁剪，下一帧全重绘。
+            this.CancelPartialFrame();
+            this.RequestRedraw();
+            return false;
+        }
+    }
+
+    /// <summary>记录一条被捕获的界面异常。</summary>
+    void NoteFrameError(string origin, string message) {
+        lastFrameError = origin + ": " + message;
+        frameErrors = UiErrorLog.Record(origin, message);
+    }
+
+    /// <summary>本次运行被捕获的界面异常数。</summary>
+    int FrameErrorCount() { return frameErrors; }
+
+    /// <summary>最后一条被捕获的界面异常（没有则为空串）。</summary>
+    string LastFrameError() { return lastFrameError; }
 
     /// 自定义标题栏占用的高度；内容应从其下方开始。
     /// 边框隐藏时为 0（见 SetChromeVisible）。

@@ -987,19 +987,32 @@ static zan_symbol_t *resolve_overload_typed(zan_irgen_t *g,
     zan_symbol_t *best = NULL;
     int best_score = -1;
     int arity_matches = 0;
-    for (int i = 0; i < type_sym->member_count; i++) {
-        zan_symbol_t *m = type_sym->members[i];
-        if (m->kind != SYM_METHOD || !m->decl ||
-            m->decl->kind != AST_METHOD_DECL) continue;
-        if (m->name.len != name.len ||
-            memcmp(m->name.str, name.str, name.len) != 0) continue;
-        if (m->decl->method_decl.params.count != argc) continue;
-        arity_matches++;
-        int score = method_args_score(g, m, call, NULL, locals, 0);
-        if (score > best_score) {
-            best_score = score;
-            best = m;
+    /* Candidates come from the whole inheritance chain: a same-named,
+     * same-arity method on the derived class does not hide the inherited
+     * overloads, so `Add(child)` in a class that also declares
+     * `Add(string)` still reaches `Control.Add(Control)` instead of
+     * picking the string one and recursing into itself. Derived
+     * candidates are visited first, so an override still wins its tie
+     * against the base declaration it replaces. */
+    zan_symbol_t *cls = type_sym;
+    while (cls) {
+        for (int i = 0; i < cls->member_count; i++) {
+            zan_symbol_t *m = cls->members[i];
+            if (m->kind != SYM_METHOD || !m->decl ||
+                m->decl->kind != AST_METHOD_DECL) continue;
+            if (m->name.len != name.len ||
+                memcmp(m->name.str, name.str, name.len) != 0) continue;
+            if (m->decl->method_decl.params.count != argc) continue;
+            arity_matches++;
+            int score = method_args_score(g, m, call, NULL, locals, 0);
+            if (score > best_score) {
+                best_score = score;
+                best = m;
+            }
         }
+        zan_symbol_t *base = (cls->type && cls->type->base_type)
+            ? cls->type->base_type->sym : NULL;
+        cls = (base && base != cls) ? base : NULL;
     }
     if (arity_matches > 1 && best && best_score >= 0) return best;
     return resolve_overload(type_sym, name, argc);
@@ -1392,7 +1405,13 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
         if (callee->kind == AST_IDENTIFIER) {
             /* bare call: current class method, else global function */
             if (g->current_type_sym) {
-                zan_symbol_t *m = get_method_sym(g->current_type_sym, callee->ident.name);
+                /* Resolve the overload this call site actually reaches (arity,
+              * argument types, inherited candidates) instead of the first
+              * method with that name: a sibling overload's return type made
+              * a discarded rc result look unowned, and it leaked. */
+            zan_symbol_t *m = resolve_overload_typed(g, g->current_type_sym,
+                                                     callee->ident.name, e, locals);
+            if (!m) m = get_method_sym(g->current_type_sym, callee->ident.name);
                 /* an unqualified call to a sibling generic method binds its
                  * type parameters here too (`await Id<int>(8)` is an int) */
                 if (m) return method_ret_type_at(g, m, e, NULL, locals);

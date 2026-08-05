@@ -643,6 +643,14 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         int arc_own = (type && is_rc_managed_type(type) &&
                        LLVMGetTypeKind(llvm_type) == LLVMPointerTypeKind);
         if (arc_own) zan_store_fit(g, LLVMConstNull(llvm_type), alloca);
+        /* A declared-but-unassigned string has no null form in the language:
+         * every read of it (`s == ""`, `s.Length`, printing it) dereferenced
+         * a null pointer and took the process down. It starts empty instead,
+         * which is what every other unassigned type does (0 / false). */
+        if (type && type->kind == TYPE_STRING && !stmt->var_decl.initializer) {
+            zan_istr_t empty = { (char *)"", 0 };
+            zan_store_fit(g, emit_string_literal_rc(g, empty), alloca);
+        }
         /* An `object` local decides ownership per stored value at runtime (see
          * the object-local comment in irgen_generics.c). Its flag lives with the
          * slot, which is only registered as a local further down, so track it

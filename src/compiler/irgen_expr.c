@@ -2265,6 +2265,23 @@ binding_lowered:
                             (int)an.len, an.str);
                     }
                 }
+                /* `name.field = v` where `name` is not a local, not a member
+                 * of the enclosing type and not a name the binder knows: no
+                 * store was emitted and, unlike the same name in a value
+                 * position, nothing was reported. A static factory converted
+                 * into a constructor left `app.isRunning = true` behind and
+                 * the window flag was never set, so every GUI program built
+                 * from the library exited before its first frame. */
+                if (!stored && !acls && obj_expr->kind == AST_IDENTIFIER &&
+                    !local_find(locals, obj_expr->ident.name) &&
+                    !zan_binder_lookup(g->binder, obj_expr->ident.name) &&
+                    !(g->current_type_sym &&
+                      (get_field_sym(g->current_type_sym, obj_expr->ident.name) ||
+                       get_method_sym(g->current_type_sym, obj_expr->ident.name)))) {
+                    zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+                        "use of undeclared identifier '%.*s'",
+                        (int)obj_expr->ident.name.len, obj_expr->ident.name.str);
+                }
             }
         }
         return right;
