@@ -925,6 +925,45 @@ static zan_symbol_t *find_extension_method(zan_irgen_t *g, zan_type_t *recv_ty,
     return first;
 }
 
+/* ---- SharedTable column widths ------------------------------------------
+ * A shared table's schema is fixed when the mapping is created: rt_sync
+ * reserves the declared width per row, so a width past its ceiling is not a
+ * request the runtime can satisfy -- Create() answers false and the program
+ * carries on with its shared state quietly missing (the MVC template declared
+ * an 8KB action list against a 4KB ceiling and lost its permission cache at
+ * startup, leaving only a log line behind). A constant width is therefore
+ * judged where it is written. The ceilings mirror ZAN_TABLE_MAX_* in
+ * src/runtime/rt_sync.c. */
+#define IRGEN_SHARED_MAX_STRING 65536
+#define IRGEN_SHARED_MAX_KEY 256
+
+static void check_shared_table_width(zan_irgen_t *g, zan_symbol_t *type_sym,
+                                     zan_istr_t name, zan_ast_node_t *call) {
+    if (!type_sym || !call || call->kind != AST_CALL) return;
+    if (type_sym->name.len != 11 ||
+        memcmp(type_sym->name.str, "SharedTable", 11) != 0) return;
+
+    long long limit;
+    int idx;
+    const char *what;
+    if (name.len == 12 && memcmp(name.str, "ColumnString", 12) == 0) {
+        limit = IRGEN_SHARED_MAX_STRING; idx = 1; what = "string column";
+    } else if (name.len == 7 && memcmp(name.str, "KeySize", 7) == 0) {
+        limit = IRGEN_SHARED_MAX_KEY; idx = 0; what = "key";
+    } else {
+        return;
+    }
+    if (call->call.args.count <= idx) return;
+    zan_ast_node_t *arg = call->call.args.items[idx];
+    if (!arg || arg->kind != AST_INT_LITERAL) return;
+    if (arg->int_val > 0 && arg->int_val <= limit) return;
+
+    zan_diag_emit(g->diag, DIAG_ERROR, arg->loc,
+                  "shared table %s width %lld is out of range: a width must be "
+                  "between 1 and %lld bytes",
+                  what, (long long)arg->int_val, limit);
+}
+
 /* Argument-type-aware overload resolution for direct method calls
  * (Type.Method(args) and recv.Method(args)): among same-named, same-arity
  * candidates pick the best-scoring one (see method_args_score); ties keep
@@ -936,6 +975,7 @@ static zan_symbol_t *resolve_overload_typed(zan_irgen_t *g,
                                             zan_ast_node_t *call,
                                             local_scope_t *locals) {
     int argc = (call && call->kind == AST_CALL) ? call->call.args.count : 0;
+    check_shared_table_width(g, type_sym, name, call);
     zan_symbol_t *best = NULL;
     int best_score = -1;
     int arity_matches = 0;

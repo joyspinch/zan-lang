@@ -896,6 +896,15 @@ add_test(NAME diag_property_call
 set_tests_properties(diag_property_call PROPERTIES
   WILL_FAIL TRUE TIMEOUT 60)
 
+# A shared table column wider than the runtime's ceiling is refused where it is
+# declared: at run time Create() would merely answer false and the program would
+# carry on without the table.
+add_test(NAME diag_shared_table_column_width
+  COMMAND zanc ${CMAKE_SOURCE_DIR}/tests/diag/shared_table_column_width.zan
+    -o ${CMAKE_BINARY_DIR}/diag_shared_table_column_width${_exe_ext})
+set_tests_properties(diag_shared_table_column_width PROPERTIES
+  WILL_FAIL TRUE TIMEOUT 60)
+
 # A [NoRuntime] method may not use anything that calls into the managed
 # runtime; allocation is the headline case.
 add_test(NAME diag_no_runtime_alloc

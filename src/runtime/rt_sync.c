@@ -38,6 +38,9 @@
 #define ZAN_TABLE_VERSION 2
 #define ZAN_TABLE_MAX_COLUMNS 16
 #define ZAN_TABLE_COLUMN_NAME 32
+/* Schema ceilings. The checker rejects a constant width past these where it
+ * is declared (checker.c: CHECKER_SHARED_MAX_*), so raising one here means
+ * raising it there. */
 #define ZAN_TABLE_MAX_KEY 256
 #define ZAN_TABLE_MAX_STRING 65536
 #define ZAN_TABLE_MAX_CAPACITY (UINT64_C(1) << 20)
