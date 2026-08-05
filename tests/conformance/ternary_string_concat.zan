@@ -1,0 +1,40 @@
+// A ternary that yields a string must not be released by the surrounding
+// string-concat cleanup. Both branches here are borrowed (a literal and a
+// parameter), so the concat result must copy them without touching their
+// reference counts. Misclassifying the ternary as an owned temporary
+// over-releases the borrowed string; once the freed block is recycled the
+// caller's still-live copy reads garbage (the heap corruption that crashed
+// the RA2 example's repeated Vfs lookups).
+//
+// `s` must be heap-allocated (built by a concat, not a literal) so that the
+// over-release actually frees a real refcounted block; a literal would be
+// static and survive a stray release. Reclaiming that exact block with a
+// same-sized string then makes the corruption observable and deterministic.
+using System;
+namespace P;
+class Program {
+    // When b is false the ternary picks the borrowed parameter `src`. Exactly
+    // two operands, so this lowers to the pairwise concat (not the n-way chain
+    // flattener) -- the path whose cleanup must not release the ternary PHI.
+    static string Pick(string src, bool b) {
+        return "[pre" + (b ? "lit" : src);
+    }
+
+    static void Main() {
+        // Heap string, refcount 1, owned by Main (16 payload bytes).
+        string s = "ABCDEFGH" + "IJKLMNOP";
+        string r = Program.Pick(s, false);
+        Console.WriteLine(r);
+
+        // On a buggy build Pick over-released `s` (freed it). A same-sized
+        // heap allocation reclaims that block, overwriting `s`'s bytes. On a
+        // correct build `s` is untouched and this lands elsewhere.
+        string squatter = "QQQQQQQQ" + "QQQQQQQQ";
+        Console.WriteLine(squatter);
+
+        Console.WriteLine(s);            // over-release => QQQQQQQQ... / crash
+        Console.WriteLine(Convert.ToString(s.Length));
+        Console.WriteLine(Program.Pick(s, true));
+        Console.WriteLine(s);
+    }
+}

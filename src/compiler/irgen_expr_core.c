@@ -415,6 +415,14 @@ static bool is_string_expr(zan_irgen_t *g, zan_ast_node_t *e, local_scope_t *loc
             et = container_elem_type(ot);
         return et && et->kind == TYPE_STRING;
     }
+    case AST_CONDITIONAL:
+        /* A conditional whose branches are strings yields a borrowed string PHI.
+         * Recognising it stops the string-concat cleanup from releasing the PHI
+         * (an over-release of a borrowed/static reference that corrupts the heap
+         * once the freed slot is reused). Ownership, when a branch is owned, is
+         * decided separately by expr_yields_owned_rc_value. */
+        return is_string_expr(g, e->conditional.then_expr, locals) &&
+               is_string_expr(g, e->conditional.else_expr, locals);
     case AST_BINARY:
         if (e->binary.op == TK_PLUS)
             return is_string_expr(g, e->binary.left, locals) ||
