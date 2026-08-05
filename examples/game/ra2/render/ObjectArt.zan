@@ -7,8 +7,9 @@ using Ra2.Game;
 namespace Ra2.Render;
 
 /// <summary>Converts object art -- an SHP frame plus a palette -- to the RGBA
-/// textures the renderer blits. The palette is unit.pal in a full install,
-/// which shares its layout with the snow palette this stripped install has.</summary>
+/// textures the renderer blits. Units use the temperate unit palette when the
+/// install carries it (unit.pal and unitsno.pal share its 256-slot layout and
+/// serve as fallbacks); buildings use the theater palette.</summary>
 class ObjectArt {
     Vfs vfs;
     AssetDb db;
@@ -29,10 +30,13 @@ class ObjectArt {
         a.shpNames = new List<string>();
         a.shpFrames = new List<int>();
         a.shpCache = new List<Texture>();
-        // unit.pal is absent from this stripped install; unitsno.pal (the
-        // snow-theater unit palette) is what the merged art is keyed to.
-        a.unitPal = db.PaletteNamed("unitsno.pal");
+        // Unit palettes, best fit first: unittem.pal is the temperate unit
+        // palette the merged art expects; unit.pal and unitsno.pal share the
+        // same 256-slot layout, so either works as a fallback when the
+        // install is stripped.
+        a.unitPal = db.PaletteNamed("unittem.pal");
         if (a.unitPal == null) { a.unitPal = db.PaletteNamed("unit.pal"); }
+        if (a.unitPal == null) { a.unitPal = db.PaletteNamed("unitsno.pal"); }
         // Buildings use the temperate theater palette. Using the unit palette
         // made every structure render with wrong colours -- the yard's olive
         // green came out as bright white.
@@ -48,7 +52,14 @@ class ObjectArt {
     /// finished structure appears once progress passes all of them.</summary>
     Texture StructureTexture(int side, int buildId, StructureCatalog catalog,
                              int progress, int buildTime) {
-        StructureType t = catalog.TypeFor(side, buildId);
+        return this.StructureTextureOf(catalog.TypeFor(side, buildId),
+                                       progress, buildTime);
+    }
+
+    /// <summary>The archetype-driven form of StructureTexture: the renderer
+    /// resolves the type itself (civ buildings live in the civ catalog), so
+    /// it hands the type in directly.</summary>
+    Texture StructureTextureOf(StructureType t, int progress, int buildTime) {
         if (t == null) { return null; }
         int frame = 0;
         if (buildTime > 0 && progress < buildTime) {
@@ -157,30 +168,21 @@ class ObjectArt {
 /// order, plus a selection ring and the placeholder unit sprite. Pure drawing:
 /// where an object sits comes from World, how it looks from ObjectArt.</summary>
 class ObjectRenderer {
-    /// <summary>The placeholder unit glyph: a diamond of the unit's own colour
-    /// with a darker outline, drawn once into a shared texture. Infantry are
-    /// small, the tank reads as a heavy block, and the two side colours plus
-    /// the dog's brown keep friend and foe apart on the terrain.</summary>
-    static int PlaceholderSize(int unitId) {
-        if (unitId == 3) { return 36; }   // tank
-        if (unitId == 1) { return 18; }   // dog
-        return 24;
-    }
-
-    static Texture Placeholder(int side, int unitId) {
-        int w = ObjectRenderer.PlaceholderSize(unitId);
+    /// <summary>The placeholder glyph for objects whose SHP the install does
+    /// not carry: a diamond of the owner's colour with a darker outline.
+    /// Specialists (engineers, spies) draw small, regular soldiers at the
+    /// default size, and structures without art as neutral blocks; the two
+    /// side colours keep friend and foe apart on the terrain.</summary>
+    static Texture Placeholder(int side, UnitType u) {
+        int w = 24;
+        if (u != null && u.Role() != UnitRole.None()) { w = 18; }
         int h = w;
         Texture tex = Texture.Create(w, h);
         int r = 46;
         int g = 128;
         int b = 214;
         if (side == Side2.Soviet()) { r = 224; g = 52; b = 48; }
-        if (unitId == 1) { r = 150; g = 120; b = 70; }          // dog
-        if (unitId == 2) { r = 46; g = 214; b = 214; }          // rocket/flak
-        if (unitId == 3) {
-            if (side == Side2.Soviet()) { r = 170; g = 40; b = 36; }
-            else { r = 40; g = 96; b = 170; }
-        }
+        else if (side == Side2.Neutral()) { r = 128; g = 128; b = 136; }
         for (int y = 0; y < h; y = y + 1) {
             for (int x = 0; x < w; x = x + 1) {
                 bool outline = ((x + y) & 3) < 2;
@@ -325,16 +327,19 @@ class ObjectRenderer {
         }
 
         Texture tex = null;
+        UnitType u = null;
         if (o.Kind() == ObjKind.Structure()) {
-            StructureType t = world.Catalog().TypeFor(o.Side(), o.BuildId());
-            tex = art.StructureTexture(o.Side(), o.BuildId(),
-                                       world.Catalog(), o.BuiltTicks(),
-                                       t.BuildTime());
+            // TypeOf routes civilian structures to the civ catalog; a plain
+            // side lookup would miss them and drop the sprite.
+            StructureType t = world.TypeOf(o);
+            if (t != null) {
+                tex = art.StructureTextureOf(t, o.BuiltTicks(), t.BuildTime());
+            }
         } else {
-            // Units draw their real sprite when the install has the art (the
-            // dog, spy, sniper), otherwise the side-coloured placeholder.
-            tex = art.UnitTexture(o.UnitType(), o.HasRoute(), o.AnimFrame(),
-                                  o.Facing());
+            // Units draw their real sprite when the install has the art,
+            // otherwise the side-coloured placeholder.
+            u = o.UnitType();
+            tex = art.UnitTexture(u, o.HasRoute(), o.AnimFrame(), o.Facing());
         }
         if (tex != null) {
             // The sprite's box is drawn around the cell apex; the building's
@@ -343,7 +348,7 @@ class ObjectRenderer {
             canvas.Blit(tex, wx + (0 - tex.Width() / 2),
                         wy + (0 - tex.Height()));
         } else {
-            Texture ph = ObjectRenderer.Placeholder(o.Side(), o.UnitId());
+            Texture ph = ObjectRenderer.Placeholder(o.Side(), u);
             int pw = ph.Width();
             canvas.Blit(ph, wx - pw / 2, wy - pw);
             ph.Close();

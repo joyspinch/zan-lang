@@ -4,10 +4,13 @@ using Ra2.Formats;
 
 namespace Ra2.Game;
 
-/// <summary>The sides, mirroring the shell's selection.</summary>
+/// <summary>The sides, mirroring the shell's selection. Neutral (2) owns the
+/// map's civilian structures: they can be captured by engineers but never act,
+/// and nobody needs them destroyed to win.</summary>
 class Side2 {
     static int Allied() { return 0; }
     static int Soviet() { return 1; }
+    static int Neutral() { return 2; }
     static int Count() { return 2; }
 }
 
@@ -50,6 +53,12 @@ class WorldObject {
     // animation instead of the finished structure.
     int builtTicks;
 
+    // Special-weapon state: a chrono beam leaves the target frozen for a few
+    // ticks; Ivan sticks a timed bomb on whatever he reaches.
+    int frozen;        // ticks the object stays frozen, 0 = free
+    int bombTimer;     // ticks until the planted bomb detonates, -1 = none
+    bool civ;          // a map civilian structure (lives in the civ catalog)
+
     static WorldObject CreateStructure(int side, int buildId, int x, int y,
                                        int hp) {
         WorldObject o = new WorldObject();
@@ -69,6 +78,9 @@ class WorldObject {
         o.prodQueue = new List<int>();
         o.prodLeft = new List<int>();
         o.builtTicks = 0;
+        o.frozen = 0;
+        o.bombTimer = -1;
+        o.civ = false;
         return o;
     }
 
@@ -95,6 +107,9 @@ class WorldObject {
         o.facing = 0;
         o.maX = -1;
         o.maY = -1;
+        o.frozen = 0;
+        o.bombTimer = -1;
+        o.civ = false;
         return o;
     }
 
@@ -118,7 +133,29 @@ class WorldObject {
     void SetReload(int ticks) { this.reload = ticks; }
     void TakeDamage(int dmg) { this.hp = this.hp - dmg; if (this.hp < 0) { this.hp = 0; } }
     bool IsDead() { return this.hp <= 0; }
-    void StopAttack() { this.target = -1; this.reload = 0; }
+    /// <summary>Drops the attack order. The route dies with it: a soldier
+    /// whose target just fell keeps walking to the death cell otherwise --
+    /// tgt gone, route still set -- instead of re-engaging what is around
+    /// him.</summary>
+    void StopAttack() {
+        this.target = -1;
+        this.reload = 0;
+        this.pathX = null;
+        this.pathY = null;
+        this.pathAt = 0;
+    }
+
+    /// <summary>Flips the object's owner -- a captured building or a
+    /// mind-controlled soldier. The archetype stays the same; only the side
+    /// changes.</summary>
+    void SetSide(int side) { this.side = side; }
+
+    int Frozen() { return this.frozen; }
+    void SetFrozen(int ticks) { this.frozen = ticks; }
+    int BombTimer() { return this.bombTimer; }
+    void SetBombTimer(int ticks) { this.bombTimer = ticks; }
+    bool IsCiv() { return this.civ; }
+    void SetCiv(bool on) { this.civ = on; }
 
     // ---- production ------------------------------------------------------
 
@@ -139,6 +176,15 @@ class WorldObject {
     void PopProd() {
         this.prodQueue.RemoveAt(0);
         this.prodLeft.RemoveAt(0);
+    }
+
+    /// <summary>Clears the whole queue. A captured building must not finish
+    /// its old owner's queue: the ids reference the captor's enemy roster, so
+    /// a Soviet war factory's SHK would otherwise spawn as an Allied sniper.</summary>
+    void ClearProduction() {
+        if (this.prodQueue == null) { return; }
+        this.prodQueue = new List<int>();
+        this.prodLeft = new List<int>();
     }
 
     // ---- construction -----------------------------------------------------
@@ -264,89 +310,131 @@ class ObjKind {
     static int Unit() { return 1; }
 }
 
-/// <summary>One unit archetype: how hard it hits, from how far, how often, and
-/// what it costs to train. The numbers are the standard RA2 values -- a
-/// rifleman's GI deals 15 damage up to 4 cells away every 15 ticks, which
-/// matches the game's balance closely enough for a demo.</summary>
+/// <summary>One unit archetype: the numbers a placed soldier fights with.
+/// Everything is built from the Rules (the RULES.INI values), so damage lands
+/// through the weapon's warhead against the target's armour instead of as a
+/// flat number. Damage()/Range()/Cooldown() expose the primary weapon for the
+/// info panel and old call sites; combat itself reads the weapons
+/// directly.</summary>
 class UnitType {
+    string reg;        // E1, DOG, ...
     string label;
-    int damage;
-    int range;       // cells, max manhattan distance
-    int cooldown;    // ticks between shots
-    int cost;        // credits to train
-    int buildTime;   // ticks the production queue spends on it
-    int hp;          // full health
-    bool amphibious; // can move over water
-    string shpName;  // SHP art file, or "" for the placeholder diamond
+    int cost;          // credits to train
+    int buildTime;     // ticks the production queue spends on it
+    int hp;            // full health
+    bool amphibious;   // can move over water (kept for the interface; unused)
+    string shpName;    // SHP art file
+    int armor;         // ArmorClass the warhead verses are applied against
+    Weapon primary;    // null = unarmed (engineer, spy)
+    Weapon secondary;  // picked per shot when its verse beats the primary's
+    int steps;         // cells covered per tick
+    int role;          // UnitRole: engineer captures, spy infiltrates
+    bool mindImmune;   // dogs and Tanya shrug off mind control
+    // Tech tree: prereq slots resolved to build ids of this side's catalog.
+    // Every slot needs one living built building from its list.
+    List<List<int>> prereqs;
 
-    static UnitType Create(string label, int damage, int range, int cooldown,
-                           int cost, int buildTime, int hp, bool amphibious,
-                           string shpName) {
+    static UnitType Create(string reg, string label, int cost, int buildTime,
+                           int hp, string shpName, int armor, Weapon primary,
+                           Weapon secondary, int steps, int role,
+                           bool mindImmune) {
         UnitType t = new UnitType();
+        t.reg = reg;
         t.label = label;
-        t.damage = damage;
-        t.range = range;
-        t.cooldown = cooldown;
         t.cost = cost;
         t.buildTime = buildTime;
         t.hp = hp;
-        t.amphibious = amphibious;
+        t.amphibious = false;
         t.shpName = shpName;
+        t.armor = armor;
+        t.primary = primary;
+        t.secondary = secondary;
+        t.steps = steps;
+        t.role = role;
+        t.mindImmune = mindImmune;
+        t.prereqs = new List<List<int>>();
         return t;
     }
 
+    string Reg() { return this.reg; }
     string Label() { return this.label; }
-    int Damage() { return this.damage; }
-    int Range() { return this.range; }
-    int Cooldown() { return this.cooldown; }
     int Cost() { return this.cost; }
     int BuildTime() { return this.buildTime; }
     int Hp() { return this.hp; }
     bool Amphibious() { return this.amphibious; }
     string ShpName() { return this.shpName; }
+    int ArmorClass() { return this.armor; }
+    Weapon Primary() { return this.primary; }
+    Weapon Secondary() { return this.secondary; }
+    int Steps() { return this.steps; }
+    int Role() { return this.role; }
+    bool MindImmune() { return this.mindImmune; }
+    List<List<int>> Prereqs() { return this.prereqs; }
+    void SetPrereqs(List<List<int>> prereqs) { this.prereqs = prereqs; }
+
+    /// <summary>Primary-weapon damage for the info panel; 0 for the unarmed
+    /// specialists.</summary>
+    int Damage() {
+        if (this.primary == null) { return 0; }
+        return this.primary.Damage();
+    }
+
+    /// <summary>Primary-weapon range; engineers and spies work at arm's
+    /// length (one cell) on the building they capture or infiltrate.</summary>
+    int Range() {
+        if (this.primary != null) { return this.primary.Range(); }
+        if (this.role != UnitRole.None()) { return 1; }
+        return 0;
+    }
+
+    int Cooldown() {
+        if (this.primary == null) { return 10; }
+        return this.primary.Rof();
+    }
 }
 
-/// <summary>The units a side can train, in menu order. Both sides get four:
-/// three infantry (barracks) and one tank (war factory), all of which the
-/// placeholder renderer draws today -- the stripped install carries no
-/// infantry SHP.</summary>
+/// <summary>The units a side can train, in menu order, built from the Rules.
+/// The Allied roster runs on foot (the install carries no Allied vehicle
+/// art): GI, attack dog, engineer, sniper, spy, chrono legionnaire and Tanya.
+/// The Soviets field the conscript, dog, engineer, tesla trooper, flak
+/// trooper, crazy Ivan, desolator, Yuri and the terror drone out of the war
+/// factory.</summary>
 class UnitCatalog {
     List<UnitType> allied;
     List<UnitType> soviet;
+    Rules rules;
 
+    /// <summary>The catalog from the transcribed RA2 defaults -- what the
+    /// tests and installs without a rules file run against.</summary>
     static UnitCatalog Create() {
+        return UnitCatalog.CreateWith(Rules.Default());
+    }
+
+    static UnitCatalog CreateWith(Rules rules) {
         UnitCatalog c = new UnitCatalog();
-        c.allied = new List<UnitType>();
-        c.soviet = new List<UnitType>();
-        UnitCatalog.FillAllied(c.allied);
-        UnitCatalog.FillSoviet(c.soviet);
+        c.rules = rules;
+        c.allied = UnitCatalog.BuildSide(rules, Side2.Allied());
+        c.soviet = UnitCatalog.BuildSide(rules, Side2.Soviet());
         return c;
     }
 
-    static void FillAllied(List<UnitType> l) {
-        // The stripped install carries no E1/GI art, so the "generic infantry"
-        // slot reuses the civilian sprite -- a proper humanoid SHP with the
-        // full walk cycle, far better than a self-drawn diamond.
-        l.Add(UnitType.Create("美国大兵", 15, 4, 15, 100, 30, 125, false, "CIV1.SHP"));
-        l.Add(UnitType.Create("警犬", 30, 1, 10, 200, 20, 100, false, "DOG.SHP"));
-        l.Add(UnitType.Create("间谍", 10, 3, 25, 800, 80, 90, false, "SPY.SHP"));
-        // No tank SHP in this install, so the tank slot reuses the flak-truck
-        // sprite -- a proper armoured vehicle with a walk cycle.
-        l.Add(UnitType.Create("灰熊坦克", 60, 4, 25, 700, 70, 400, false, "FLAKT.SHP"));
-        // The amphibious transport also borrows the vehicle sprite.
-        l.Add(UnitType.Create("气垫船", 40, 2, 30, 500, 60, 400, true, "FLAKT.SHP"));
-        // The engineer: fragile, unarmed, but a fast cheap scout with real art.
-        l.Add(UnitType.Create("工程师", 0, 0, 60, 400, 50, 80, false, "ENGINEER.SHP"));
+    static List<UnitType> BuildSide(Rules rules, int side) {
+        List<UnitType> l = new List<UnitType>();
+        List<UnitDef> defs = rules.UnitsForSide(side);
+        List<BuildingDef> bdefs = rules.BuildingsForSide(side);
+        for (int i = 0; i < defs.Count; i = i + 1) {
+            UnitDef d = defs[i];
+            UnitType t = UnitType.Create(d.Reg(), d.Label(), d.Cost(),
+                Rules.UnitBuildTicks(d.Cost()), d.Hp(), d.Shp(), d.Armor(),
+                d.Primary(), d.Secondary(), d.Steps(), d.Role(),
+                d.MindImmune());
+            t.SetPrereqs(Rules.ResolvePrereqs(rules, d.Prereq(), bdefs));
+            l.Add(t);
+        }
+        return l;
     }
 
-    static void FillSoviet(List<UnitType> l) {
-        l.Add(UnitType.Create("动员兵", 15, 4, 20, 100, 30, 125, false, "CIV1.SHP"));
-        l.Add(UnitType.Create("警犬", 30, 1, 10, 200, 20, 100, false, "DOG.SHP"));
-        l.Add(UnitType.Create("狙击手", 75, 7, 60, 900, 90, 90, false, "SNIPE.SHP"));
-        l.Add(UnitType.Create("犀牛坦克", 65, 4, 25, 800, 70, 450, false, "FLAKT.SHP"));
-        l.Add(UnitType.Create("气垫船", 40, 2, 30, 500, 60, 400, true, "FLAKT.SHP"));
-        l.Add(UnitType.Create("工程师", 0, 0, 60, 400, 50, 80, false, "ENGINEER.SHP"));
-    }
+    Rules Rules() { return this.rules; }
 
     /// <summary>A side's units, in build order.</summary>
     List<UnitType> ListFor(int side) {
@@ -361,62 +449,51 @@ class UnitCatalog {
     }
 }
 
-/// <summary>One building archetype: the fields a placed structure needs.
-/// The installed game's RULES.INI is stripped of its Foundation values, so the
-/// footprints and costs are the standard RA2 values written out here rather
-/// than read from the file. Health is left to the caller (a just-built
-/// structure starts at full).</summary>
+/// <summary>One building archetype: the fields a placed structure needs,
+/// built from the Rules. Its gun (defence buildings only) is a real weapon
+/// with a warhead, so a pillbox's Vulcan chews infantry but struggles against
+/// anything plated. Health is left to the caller (a just-built structure
+/// starts at full).</summary>
 class StructureType {
+    string reg;          // GACNST, NAPOWR, ...
     string shpName;      // image file, e.g. "GACNST.SHP"
     int footprintW;      // footprint in cells
     int footprintH;
     int hp;              // full health
     int cost;
     string label;
-    int buildTime;       // ticks of construction animation before completion
+    int buildTime;       // ticks of construction before completion
     int power;           // power supplied when built (plants)
     int drain;           // power consumed while operating
+    int armor;           // ArmorClass the warhead verses hit
+    Weapon weapon;       // auto-attack gun, or null
+    bool powered;        // needs a healthy power grid to work (defences)
+    bool refinery;       // trickles credits every tick
     List<int> produces;  // unit ids this building can train, or null
-    // Auto-attack weapon (defence buildings: pillboxes, SAM sites). A damage
-    // of 0 means the building has no weapon.
-    int dmg;
-    int range;
-    int cooldown;
+    List<List<int>> prereqs;   // tech slots, see UnitType
 
-    static StructureType Create(string shpName, int fw, int fh, int hp,
-                                int cost, string label, int buildTime,
-                                int power, int drain, List<int> produces) {
+    static StructureType Create(BuildingDef d) {
         StructureType t = new StructureType();
-        t.shpName = shpName;
-        t.footprintW = fw;
-        t.footprintH = fh;
-        t.hp = hp;
-        t.cost = cost;
-        t.label = label;
-        t.buildTime = buildTime;
-        t.power = power;
-        t.drain = drain;
-        t.produces = produces;
-        t.dmg = 0;
-        t.range = 0;
-        t.cooldown = 0;
+        t.reg = d.Reg();
+        t.shpName = d.Shp();
+        t.footprintW = d.FootprintW();
+        t.footprintH = d.FootprintH();
+        t.hp = d.Hp();
+        t.cost = d.Cost();
+        t.label = d.Label();
+        t.buildTime = Rules.BuildingBuildTicks(d.Cost());
+        t.power = d.Power();
+        t.drain = d.Drain();
+        t.armor = d.Armor();
+        t.weapon = d.Weapon();
+        t.powered = d.Powered();
+        t.refinery = d.IsRefinery();
+        t.produces = null;
+        t.prereqs = new List<List<int>>();
         return t;
     }
 
-    /// <summary>A building with an auto-attack weapon (defence building). It
-    /// fires at the nearest enemy within range every `cooldown` ticks.</summary>
-    static StructureType CreateWeapon(string shpName, int fw, int fh, int hp,
-                                      int cost, string label, int buildTime,
-                                      int power, int drain, int dmg, int range,
-                                      int cooldown) {
-        StructureType t = StructureType.Create(shpName, fw, fh, hp, cost,
-            label, buildTime, power, drain, null);
-        t.dmg = dmg;
-        t.range = range;
-        t.cooldown = cooldown;
-        return t;
-    }
-
+    string Reg() { return this.reg; }
     string ShpName() { return this.shpName; }
     int FootprintW() { return this.footprintW; }
     int FootprintH() { return this.footprintH; }
@@ -426,69 +503,92 @@ class StructureType {
     int BuildTime() { return this.buildTime; }
     int Power() { return this.power; }
     int Drain() { return this.drain; }
-    int Damage() { return this.dmg; }
-    int Range() { return this.range; }
-    int Cooldown() { return this.cooldown; }
-    bool HasWeapon() { return this.dmg > 0; }
+    int ArmorClass() { return this.armor; }
+    Weapon Weapon() { return this.weapon; }
+    bool Powered() { return this.powered; }
+    bool IsRefinery() { return this.refinery; }
+    bool HasWeapon() { return this.weapon != null; }
+    List<List<int>> Prereqs() { return this.prereqs; }
+    void SetPrereqs(List<List<int>> prereqs) { this.prereqs = prereqs; }
+    void SetProduces(List<int> produces) { this.produces = produces; }
+
+    int Damage() {
+        if (this.weapon == null) { return 0; }
+        return this.weapon.Damage();
+    }
+    int Range() {
+        if (this.weapon == null) { return 0; }
+        return this.weapon.Range();
+    }
+    int Cooldown() {
+        if (this.weapon == null) { return 0; }
+        return this.weapon.Rof();
+    }
+
     /// <summary>The unit ids this building trains, or null when it is not a
     /// production structure (yard, power, refinery, lab).</summary>
     List<int> Produces() { return this.produces; }
 }
 
-/// <summary>The structures a side can build, in menu order. Allied and Soviet
-/// each get six, all of whose SHP art is present in the stripped install (the
-/// construction yard, power, barracks, ore refinery, war factory, battle lab
-/// or service depot).</summary>
+/// <summary>The structures a side can build, in menu order, built from the
+/// Rules. The Allied base runs without a war factory (the install carries no
+/// Allied vehicle art): yard, power, refinery, barracks, tech centre,
+/// airfield-as-radar, pillbox and wall. The Soviets get the full ladder up
+/// to the war factory's terror drones, plus the laser turret, tesla coil and
+/// flak cannon. The neutral list holds the maps' civilian structures.</summary>
 class StructureCatalog {
     List<StructureType> allied;
     List<StructureType> soviet;
+    List<StructureType> civ;
+    Rules rules;
 
+    /// <summary>The catalog from the transcribed RA2 defaults -- what the
+    /// tests and installs without a rules file run against.</summary>
     static StructureCatalog Create() {
+        return StructureCatalog.CreateWith(Rules.Default());
+    }
+
+    static StructureCatalog CreateWith(Rules rules) {
         StructureCatalog c = new StructureCatalog();
-        c.allied = new List<StructureType>();
-        c.soviet = new List<StructureType>();
-        StructureCatalog.FillAllied(c.allied);
-        StructureCatalog.FillSoviet(c.soviet);
+        c.rules = rules;
+        c.allied = StructureCatalog.BuildSide(rules, Side2.Allied());
+        c.soviet = StructureCatalog.BuildSide(rules, Side2.Soviet());
+        c.civ = StructureCatalog.BuildCiv(rules);
         return c;
     }
 
-    static void FillAllied(List<StructureType> l) {
-        List<int> none = null;
-        List<int> inf = new List<int>();
-        inf.Add(0); inf.Add(1); inf.Add(2); inf.Add(5);   // soldiers, dog, spy, engineer
-        List<int> armor = new List<int>();
-        armor.Add(3); armor.Add(4);   // tank + amphibious transport
-        l.Add(StructureType.Create("GACNST.SHP", 4, 3, 1200, 2000, "建造厂", 60, 0, 50, none));
-        l.Add(StructureType.Create("GAPOWR.SHP", 2, 2, 600, 500, "电厂", 50, 200, 0, none));
-        l.Add(StructureType.Create("GAREFN.SHP", 4, 3, 1000, 2000, "矿石精炼厂", 60, 0, 40, none));
-        l.Add(StructureType.Create("GAPILE.SHP", 2, 2, 600, 500, "兵营", 50, 0, 30, inf));
-        l.Add(StructureType.Create("GAWEAP.SHP", 3, 2, 900, 2000, "战争工厂", 60, 0, 30, armor));
-        l.Add(StructureType.Create("GATECH.SHP", 3, 2, 1000, 2000, "科技中心", 70, 0, 100, none));
-        // Defence: a pillbox that auto-fires at nearby enemies, and a wall
-        // that blocks ground units (also cheap line filler).
-        l.Add(StructureType.CreateWeapon("GAPILL.SHP", 1, 1, 300, 300, "碉堡", 40, 0, 10, 25, 5, 25));
-        l.Add(StructureType.Create("GAWALL.SHP", 1, 1, 100, 100, "围墙", 20, 0, 0, none));
-        l.Add(StructureType.Create("GADEPT.SHP", 4, 3, 1000, 800, "维修厂", 60, 0, 30, none));
+    static List<StructureType> BuildSide(Rules rules, int side) {
+        List<StructureType> l = new List<StructureType>();
+        List<BuildingDef> defs = rules.BuildingsForSide(side);
+        List<UnitDef> udefs = rules.UnitsForSide(side);
+        for (int i = 0; i < defs.Count; i = i + 1) {
+            BuildingDef d = defs[i];
+            StructureType t = StructureType.Create(d);
+            t.SetPrereqs(Rules.ResolvePrereqs(rules, d.Prereq(), defs));
+            // This building trains every unit whose producer is its regkey.
+            List<int> produces = null;
+            for (int u = 0; u < udefs.Count; u = u + 1) {
+                if (udefs[u].Producer() == d.Reg()) {
+                    if (produces == null) { produces = new List<int>(); }
+                    produces.Add(u);
+                }
+            }
+            t.SetProduces(produces);
+            l.Add(t);
+        }
+        return l;
     }
 
-    static void FillSoviet(List<StructureType> l) {
-        List<int> none = null;
-        List<int> inf = new List<int>();
-        inf.Add(0); inf.Add(1); inf.Add(2); inf.Add(5);
-        List<int> armor = new List<int>();
-        armor.Add(3); armor.Add(4);
-        l.Add(StructureType.Create("NACNST.SHP", 4, 3, 1200, 2000, "建造厂", 60, 0, 50, none));
-        l.Add(StructureType.Create("NAPOWR.SHP", 2, 2, 500, 300, "磁能反应堆", 50, 150, 0, none));
-        l.Add(StructureType.Create("NAREFN.SHP", 4, 3, 1000, 2000, "矿石精炼厂", 60, 0, 40, none));
-        l.Add(StructureType.Create("NAHAND.SHP", 2, 2, 500, 500, "兵营", 50, 0, 30, inf));
-        l.Add(StructureType.Create("NAWEAP.SHP", 3, 2, 900, 2000, "战争工厂", 60, 0, 30, armor));
-        l.Add(StructureType.Create("NATECH.SHP", 3, 2, 1000, 2000, "科技中心", 70, 0, 100, none));
-        // Defence: an SAM site (no aircraft here, so it doubles as a light
-        // anti-ground turret), a wall, and the service depot.
-        l.Add(StructureType.CreateWeapon("NASAM.SHP", 1, 1, 300, 400, "防空导弹", 40, 0, 15, 20, 6, 30));
-        l.Add(StructureType.Create("NAWALL.SHP", 1, 1, 100, 100, "围墙", 20, 0, 0, none));
-        l.Add(StructureType.Create("NADEPT.SHP", 4, 3, 1000, 800, "维修厂", 60, 0, 30, none));
+    static List<StructureType> BuildCiv(Rules rules) {
+        List<StructureType> l = new List<StructureType>();
+        List<BuildingDef> defs = rules.Civs();
+        for (int i = 0; i < defs.Count; i = i + 1) {
+            l.Add(StructureType.Create(defs[i]));
+        }
+        return l;
     }
+
+    Rules Rules() { return this.rules; }
 
     /// <summary>A side's structures, in build order.</summary>
     List<StructureType> ListFor(int side) {
@@ -502,6 +602,23 @@ class StructureCatalog {
         List<StructureType> l = this.ListFor(side);
         if (buildId < 0 || buildId >= l.Count) { return null; }
         return l[buildId];
+    }
+
+    int CivCount() { return this.civ.Count; }
+
+    /// <summary>A neutral civilian structure's type by its id in the civ
+    /// list, or null when the id is out of range.</summary>
+    StructureType CivType(int civId) {
+        if (civId < 0 || civId >= this.civ.Count) { return null; }
+        return this.civ[civId];
+    }
+
+    /// <summary>The civ-list id a civilian regkey names, or -1.</summary>
+    int CivIdOf(string reg) {
+        for (int i = 0; i < this.civ.Count; i = i + 1) {
+            if (this.civ[i].Reg() == reg) { return i; }
+        }
+        return -1;
     }
 }
 
@@ -530,6 +647,17 @@ class World {
     // render layer.
     List<int> effects;
 
+    // Money-affecting events the world itself cannot apply (it owns no
+    // credits): triples of (kind, side, amount). Kind 1 grants credits --
+    // a spy's heist or a captured oil derrick's signing bonus. The game
+    // controller drains the list every tick.
+    List<int> events;
+
+    // Per-side power blackouts in ticks remaining: a spy in a power plant
+    // shuts the grid down, which takes powered defences offline and halves
+    // production exactly like a low-power state.
+    List<int> blackout;
+
     static World Create(IsoMap iso, StructureCatalog catalog, UnitCatalog units) {
         World w = new World();
         w.iso = iso;
@@ -542,6 +670,10 @@ class World {
         w.selection = new List<int>();
         w.worldTick = 0;
         w.effects = new List<int>();
+        w.events = new List<int>();
+        w.blackout = new List<int>();
+        w.blackout.Add(0);
+        w.blackout.Add(0);
         w.occupancy = new int[w.width * w.height];
         for (int i = 0; i < w.occupancy.Length; i = i + 1) {
             w.occupancy[i] = 0;
@@ -556,6 +688,88 @@ class World {
     int SelectedIndex() { return this.selectedIndex; }
     StructureCatalog Catalog() { return this.catalog; }
     UnitCatalog Units() { return this.units; }
+    Rules Rules() { return this.units.Rules(); }
+
+    /// <summary>The archetype of a placed structure, routing civilian
+    /// structures to the civ catalog where they live.</summary>
+    StructureType TypeOf(WorldObject o) {
+        if (o.IsCiv()) { return this.catalog.CivType(o.BuildId()); }
+        return this.catalog.TypeFor(o.Side(), o.BuildId());
+    }
+
+    // ---- events ---------------------------------------------------------
+
+    /// <summary>Queues a credit grant for a side (kind 1). The controller
+    /// applies it to the right wallet when it drains the queue.</summary>
+    void AddMoneyEvent(int side, int amount) {
+        this.events.Add(1);
+        this.events.Add(side);
+        this.events.Add(amount);
+    }
+
+    /// <summary>Queues a spy theft (kind 2): side steals half the credits of
+    /// fromSide. The controller holds both wallets, so it settles the books
+    /// when it drains the queue.</summary>
+    void AddStealEvent(int side, int fromSide) {
+        this.events.Add(2);
+        this.events.Add(side);
+        this.events.Add(fromSide);
+    }
+
+    int EventCount() { return this.events.Count / 3; }
+    int EventKindAt(int i) { return this.events[i * 3]; }
+    int EventSideAt(int i) { return this.events[i * 3 + 1]; }
+    int EventAmountAt(int i) { return this.events[i * 3 + 2]; }
+    void ClearEvents() { this.events = new List<int>(); }
+
+    // ---- power state ------------------------------------------------------
+
+    /// <summary>True while a side's grid is blacked out by spy sabotage.</summary>
+    bool SideBlackout(int side) {
+        if (side < 0 || side >= this.blackout.Count) { return false; }
+        return this.blackout[side] > 0;
+    }
+
+    void SetBlackout(int side, int ticks) {
+        if (side >= 0 && side < this.blackout.Count) {
+            this.blackout[side] = ticks;
+        }
+    }
+
+    /// <summary>True when a side runs short of power: the balance is negative
+    /// or the grid is blacked out. Powers the production penalty and takes
+    /// powered defences offline.</summary>
+    bool SideLowPower(int side) {
+        return this.PowerBalance(side) < 0 || this.SideBlackout(side);
+    }
+
+    // ---- tech tree ----------------------------------------------------------
+
+    /// <summary>True when a side owns, built and alive, at least one building
+    /// from every prereq slot. This is the sidebar's gate: a unit or building
+    /// only becomes purchasable once its tech stands.</summary>
+    bool SatisfiesPrereqs(int side, List<List<int>> prereqs) {
+        for (int i = 0; i < prereqs.Count; i = i + 1) {
+            List<int> slot = prereqs[i];
+            bool any = false;
+            for (int j = 0; j < slot.Count; j = j + 1) {
+                if (this.SideHasBuiltStructure(side, slot[j])) { any = true; break; }
+            }
+            if (!any) { return false; }
+        }
+        return true;
+    }
+
+    bool SideHasBuiltStructure(int side, int buildId) {
+        for (int i = 0; i < this.objects.Count; i = i + 1) {
+            WorldObject o = this.objects[i];
+            if (o.Side() != side || o.Kind() != ObjKind.Structure()
+             || o.IsDead() || o.BuildId() != buildId || o.IsCiv()) { continue; }
+            StructureType t = this.catalog.TypeFor(side, buildId);
+            if (t != null && o.BuiltTicks() >= t.BuildTime()) { return true; }
+        }
+        return false;
+    }
 
     // ---- occupancy -----------------------------------------------------
 
@@ -596,6 +810,22 @@ class World {
         if (t == null) { return -1; }
         if (!this.CanPlace(t, x, y)) { return -1; }
         WorldObject o = WorldObject.CreateStructure(side, buildId, x, y, t.Hp());
+        return this.AddObject(o);
+    }
+
+    /// <summary>Places a neutral civilian structure (from the map's
+    /// [Structures] section) at full or partial health. Returns the new
+    /// object's index, or -1 when the id is unknown or the footprint does
+    /// not fit.</summary>
+    int PlaceCivStructure(int civId, int x, int y, int hp) {
+        StructureType t = this.catalog.CivType(civId);
+        if (t == null) { return -1; }
+        if (!this.CanPlace(t, x, y)) { return -1; }
+        int startHp = hp;
+        if (startHp <= 0 || startHp > t.Hp()) { startHp = t.Hp(); }
+        WorldObject o = WorldObject.CreateStructure(Side2.Neutral(), civId,
+                                                    x, y, startHp);
+        o.SetCiv(true);
         return this.AddObject(o);
     }
 
@@ -676,7 +906,7 @@ class World {
         this.objects.Add(o);
         // A structure's footprint is its whole footprint; a unit is one cell.
         if (o.Kind() == ObjKind.Structure()) {
-            StructureType t = this.catalog.TypeFor(o.Side(), o.BuildId());
+            StructureType t = this.TypeOf(o);
             for (int dy = 0; dy < t.FootprintH(); dy = dy + 1) {
                 for (int dx = 0; dx < t.FootprintW(); dx = dx + 1) {
                     this.occupancy[this.CellSlot(o.X() + dx, o.Y() + dy)]
@@ -694,7 +924,7 @@ class World {
         if (structIdx < 0 || structIdx >= this.objects.Count) { return false; }
         WorldObject o = this.objects[structIdx];
         if (o.Kind() != ObjKind.Structure()) { return false; }
-        StructureType t = this.catalog.TypeFor(o.Side(), o.BuildId());
+        StructureType t = this.TypeOf(o);
         List<int> prod = t.Produces();
         if (prod == null) { return false; }
         bool can = false;
@@ -712,19 +942,26 @@ class World {
     /// (the ring one cell out from it) to outCell, or leaves outCell empty
     /// when every neighbour is taken. A finished unit spawns here.</summary>
     void FindSpawnCell(WorldObject o, List<int> outCell) {
-        StructureType t = this.catalog.TypeFor(o.Side(), o.BuildId());
-        int x0 = o.X() - 1;
-        int y0 = o.Y() - 1;
-        int x1 = o.X() + t.FootprintW();
-        int y1 = o.Y() + t.FootprintH();
-        for (int y = y0; y <= y1; y = y + 1) {
-            for (int x = x0; x <= x1; x = x + 1) {
-                if (x >= o.X() && x < o.X() + t.FootprintW()
-                 && y >= o.Y() && y < o.Y() + t.FootprintH()) { continue; }
-                if (this.Passable(x, y)) {
-                    outCell.Add(x);
-                    outCell.Add(y);
-                    return;
+        StructureType t = this.TypeOf(o);
+        // The ring one cell out first, then peel outward: a densely built
+        // base walls the ring in with new construction, and a producer that
+        // cannot deliver its finished unit locks its queue forever -- the
+        // whole training line stalls behind one boxed-in barracks.
+        for (int r = 1; r <= 4; r = r + 1) {
+            int x0 = o.X() - r;
+            int y0 = o.Y() - r;
+            int x1 = o.X() + t.FootprintW() - 1 + r;
+            int y1 = o.Y() + t.FootprintH() - 1 + r;
+            for (int y = y0; y <= y1; y = y + 1) {
+                for (int x = x0; x <= x1; x = x + 1) {
+                    // Only this radius's annulus: the inner square was
+                    // already scanned on a tighter ring.
+                    if (x > x0 && x < x1 && y > y0 && y < y1) { continue; }
+                    if (this.Passable(x, y)) {
+                        outCell.Add(x);
+                        outCell.Add(y);
+                        return;
+                    }
                 }
             }
         }
@@ -747,6 +984,25 @@ class World {
         return this.occupancy[this.CellSlot(x, y)] == 0;
     }
 
+    /// <summary>Passability for route planning: fellow soldiers are not
+    /// walls. A column plans around terrain and buildings, and the walkers
+    /// queue at step time instead. Treating the army itself as impassable
+    /// locks a massed force inside its own base -- every route out of a
+    /// crowded camp fails the search, so an attack order moves nobody.
+    /// Structures keep blocking: a route through a wall is a lie.</summary>
+    bool PassableForRoute(int x, int y, bool amphibious) {
+        if (!this.InBounds(x, y)) { return false; }
+        IsoTile t = this.iso.At(x, y);
+        if (t == null) { return false; }
+        if (!this.IsGround(t) && !this.IsBridge(t)) {
+            if (!(amphibious && this.IsWater(t))) { return false; }
+        }
+        int occ = this.occupancy[this.CellSlot(x, y)];
+        if (occ == 0) { return true; }
+        WorldObject o = this.objects[occ - 1];
+        return o.Kind() != ObjKind.Structure() && !o.IsDead();
+    }
+
     /// <summary>Objects overlapping a cell, with the structure's footprint
     /// expanded so a click on any of its cells selects it. Appends to outIds.</summary>
     void ObjectsAt(int x, int y, List<int> outIds) {
@@ -757,7 +1013,7 @@ class World {
         for (int i = 0; i < this.objects.Count; i = i + 1) {
             WorldObject o = this.objects[i];
             if (o.Kind() != ObjKind.Structure()) { continue; }
-            StructureType t = this.catalog.TypeFor(o.Side(), o.BuildId());
+            StructureType t = this.TypeOf(o);
             for (int dy = 0; dy < t.FootprintH(); dy = dy + 1) {
                 for (int dx = 0; dx < t.FootprintW(); dx = dx + 1) {
                     if (o.X() + dx == x && o.Y() + dy == y) { outIds.Add(i); }
@@ -848,28 +1104,79 @@ class World {
     }
 
     /// <summary>The index of the living object of `side`'s opponent nearest to
-    /// (x,y), or -1 when the opponent has nothing left on the map.</summary>
+    /// (x,y), or -1 when the opponent has nothing left on the map. Neutral
+    /// civilian structures are invisible here: nobody shoots at them on his
+    /// own, they are only touched by an explicit order (an engineer's
+    /// capture).</summary>
     int NearestEnemy(int side, int x, int y) {
         int best = -1;
         int bestD = -1;
         for (int i = 0; i < this.objects.Count; i = i + 1) {
             WorldObject o = this.objects[i];
-            if (o.Side() == side || o.IsDead()) { continue; }
+            if (o.Side() == side || o.Side() == Side2.Neutral()
+             || o.IsDead()) { continue; }
             int d = this.Distance(x, y, o.X(), o.Y());
             if (bestD < 0 || d < bestD) { bestD = d; best = i; }
         }
         return best;
     }
 
+    /// <summary>The nearest enemy a walker can actually reach: a
+    /// breadth-first sweep over route-passable ground that stops the moment
+    /// it bumps an enemy footprint. Units whose orders point at a building
+    /// that is walled off or perched behind uncrossable terrain chew on this
+    /// fallback instead of standing idle for the rest of the war.</summary>
+    int NearestReachableEnemy(int sx, int sy, int side, bool amphibious) {
+        int cells = this.width * this.height;
+        byte[] seen = new byte[cells];
+        List<int> qx = new List<int>();
+        List<int> qy = new List<int>();
+        int startSlot = this.CellSlot(sx, sy);
+        if (startSlot < 0) { return -1; }
+        seen[startSlot] = 1;
+        qx.Add(sx);
+        qy.Add(sy);
+        int head = 0;
+        while (head < qx.Count) {
+            int cx = qx[head];
+            int cy = qy[head];
+            head = head + 1;
+            for (int d = 0; d < 4; d = d + 1) {
+                int nx = cx;
+                int ny = cy;
+                if (d == 0) { nx = cx + 1; }
+                else if (d == 1) { nx = cx - 1; }
+                else if (d == 2) { ny = cy + 1; }
+                else { ny = cy - 1; }
+                int slot = this.CellSlot(nx, ny);
+                if (slot < 0 || seen[slot] != 0) { continue; }
+                seen[slot] = 1;
+                int occ = this.occupancy[slot];
+                if (occ != 0) {
+                    WorldObject e = this.objects[occ - 1];
+                    if (!e.IsDead() && e.Side() != side
+                     && e.Side() != Side2.Neutral()) {
+                        return occ - 1;
+                    }
+                }
+                if (!this.PassableForRoute(nx, ny, amphibious)) { continue; }
+                qx.Add(nx);
+                qy.Add(ny);
+            }
+        }
+        return -1;
+    }
+
     /// <summary>Nearest enemy within `radius` cells, or -1. Used by the
     /// move-attack scan so a unit only stops for hostiles close enough to
-    /// matter.</summary>
+    /// matter. Skips neutrals like NearestEnemy.</summary>
     int NearestEnemyIn(int x, int y, int side, int radius) {
         int best = -1;
         int bestD = -1;
         for (int i = 0; i < this.objects.Count; i = i + 1) {
             WorldObject o = this.objects[i];
-            if (o.Side() == side || o.IsDead()) { continue; }
+            if (o.Side() == side || o.Side() == Side2.Neutral()
+             || o.IsDead()) { continue; }
             int d = this.Distance(x, y, o.X(), o.Y());
             if (d <= radius && (bestD < 0 || d < bestD)) { bestD = d; best = i; }
         }
@@ -901,7 +1208,7 @@ class World {
                 continue;
             }
             // A building only contributes once it has finished constructing.
-            StructureType t = this.catalog.TypeFor(side, o.BuildId());
+            StructureType t = this.TypeOf(o);
             if (t == null) { continue; }
             if (o.BuiltTicks() < t.BuildTime()) { continue; }
             supply = supply + t.Power();
@@ -914,31 +1221,77 @@ class World {
     /// around the side's existing buildings and falling back to a whole-map
     /// scan. The AI builds by expansion, so its base grows rather than
     /// sprouting buildings all over the map.</summary>
+    /// <summary>True when the footprint at (x,y) keeps a one-cell corridor
+    /// from every standing building -- no cardinally adjacent neighbour.
+    /// Bases grow with streets between the houses, the way the real AI
+    /// builds: every defence stays approachable and no unit locks itself
+    /// inside its own yard. A solid block of construction buries its inner
+    /// towers where no attacker can ever reach them, and a defence that
+    /// cannot die makes a war that cannot end.</summary>
+    bool Spaced(StructureType t, int x, int y) {
+        int fw = t.FootprintW();
+        int fh = t.FootprintH();
+        for (int i = 0; i < this.objects.Count; i = i + 1) {
+            WorldObject o = this.objects[i];
+            if (o.Kind() != ObjKind.Structure() || o.IsDead()) { continue; }
+            StructureType ot = this.TypeOf(o);
+            int ox = o.X();
+            int oy = o.Y();
+            int ow = ot.FootprintW();
+            int oh = ot.FootprintH();
+            // Cardinal adjacency: the horizontal gap is at most nil while the
+            // rows overlap, or the vertical gap is at most nil while the
+            // columns overlap. Diagonally touching corners still leave a
+            // walkable way around, so those are allowed.
+            if (x <= ox + ow && ox <= x + fw && y < oy + oh && oy < y + fh) {
+                return false;
+            }
+            if (y <= oy + oh && oy <= y + fh && x < ox + ow && ox < x + fw) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     bool AiPlaceSpot(int side, StructureType t, List<int> outXy) {
+        // Anchors around every own building, wide enough for the corridor:
+        // a spaced fit is taken on sight; the first tight fit is remembered
+        // as a fallback for maps too cramped for streets.
+        int fbX = 0 - 1;
+        int fbY = 0 - 1;
         for (int i = 0; i < this.objects.Count; i = i + 1) {
             WorldObject o = this.objects[i];
             if (o.Side() != side || o.Kind() != ObjKind.Structure()) { continue; }
-            StructureType ot = this.catalog.TypeFor(o.Side(), o.BuildId());
-            for (int dy = 0 - ot.FootprintH(); dy <= ot.FootprintH() + 1; dy = dy + 1) {
-                for (int dx = 0 - ot.FootprintW(); dx <= ot.FootprintW() + 1; dx = dx + 1) {
+            StructureType ot = this.TypeOf(o);
+            for (int dy = 0 - t.FootprintH() - 1; dy <= ot.FootprintH() + 1; dy = dy + 1) {
+                for (int dx = 0 - t.FootprintW() - 1; dx <= ot.FootprintW() + 1; dx = dx + 1) {
                     int ax = o.X() + dx;
                     int ay = o.Y() + dy;
-                    if (this.FlatFit(t, ax, ay)) {
+                    if (!this.FlatFit(t, ax, ay)) { continue; }
+                    if (this.Spaced(t, ax, ay)) {
                         outXy.Add(ax);
                         outXy.Add(ay);
                         return true;
                     }
+                    if (fbX < 0) { fbX = ax; fbY = ay; }
                 }
             }
         }
         for (int y = 0; y < this.height; y = y + 1) {
             for (int x = 0; x < this.width; x = x + 1) {
-                if (this.FlatFit(t, x, y)) {
+                if (!this.FlatFit(t, x, y)) { continue; }
+                if (this.Spaced(t, x, y)) {
                     outXy.Add(x);
                     outXy.Add(y);
                     return true;
                 }
+                if (fbX < 0) { fbX = x; fbY = y; }
             }
+        }
+        if (fbX >= 0) {
+            outXy.Add(fbX);
+            outXy.Add(fbY);
+            return true;
         }
         return false;
     }
@@ -1215,7 +1568,7 @@ class World {
         if (o == null) { return ""; }
         StringBuilder sb = new StringBuilder();
         if (o.Kind() == ObjKind.Structure()) {
-            StructureType t = this.catalog.TypeFor(o.Side(), o.BuildId());
+            StructureType t = this.TypeOf(o);
             if (t == null) { return ""; }
             sb.Append(t.Label());
             sb.Append("  血量 " + Convert.ToString(o.Hp()) + "/"
@@ -1245,7 +1598,8 @@ class World {
             }
             if (u.Amphibious()) { sb.Append("  两栖"); }
         }
-        if (o.Side() == Side2.Soviet()) { sb.Append("  [苏联]"); }
+        if (o.Side() == Side2.Neutral()) { sb.Append("  [中立]"); }
+        else if (o.Side() == Side2.Soviet()) { sb.Append("  [苏联]"); }
         else { sb.Append("  [盟军]"); }
         return sb.ToString();
     }
@@ -1300,6 +1654,16 @@ class World {
 
     // ---- movement --------------------------------------------------------
 
+    /// <summary>The side of the selection's lead object -- the only side an
+    /// order may command. A selection that mixes in enemies (shift-clicked
+    /// for inspection) still moves only the commander's own units.</summary>
+    int SelectionCommanderSide() {
+        if (this.selection.Count == 0) { return -1; }
+        int p = this.selection[0];
+        if (p < 0 || p >= this.objects.Count) { return -1; }
+        return this.objects[p].Side();
+    }
+
     /// <summary>Orders every selected unit to move to a cell. The path is found
     /// over passable cells only, so it walks around buildings; a unit inside a
     /// structure's footprint cannot be reached and the order is ignored.
@@ -1307,11 +1671,13 @@ class World {
     bool OrderMove(int x, int y) {
         bool any = false;
         int count = 0;
+        int commander = this.SelectionCommanderSide();
         for (int s = 0; s < this.selection.Count; s = s + 1) {
             int idx = this.selection[s];
             if (idx < 0 || idx >= this.objects.Count) { continue; }
             WorldObject sel = this.objects[idx];
             if (sel.Kind() != ObjKind.Unit()) { continue; }
+            if (sel.Side() != commander) { continue; }   // never steer a foe
             // Spread a group out: each unit after the first targets a cell
             // a few steps away so they do not all pile onto one tile.
             int tx = x;
@@ -1343,11 +1709,13 @@ class World {
     bool OrderMoveAttack(int x, int y) {
         bool any = false;
         int count = 0;
+        int commander = this.SelectionCommanderSide();
         for (int s = 0; s < this.selection.Count; s = s + 1) {
             int idx = this.selection[s];
             if (idx < 0 || idx >= this.objects.Count) { continue; }
             WorldObject sel = this.objects[idx];
             if (sel.Kind() != ObjKind.Unit()) { continue; }
+            if (sel.Side() != commander) { continue; }   // never steer a foe
             int tx = x;
             int ty = y;
             if (count > 0) {
@@ -1370,18 +1738,40 @@ class World {
         }
         return any;
     }
-    /// <summary>Steps the world one tick: every unit with a target fires when
-    /// in range, then every unit moves one cell along its route, then each
-    /// production structure advances its queue. Returns the triple (moved,
-    /// fired, produced) as [moved, fired, produced], so a test can see combat,
-    /// movement and production working side by side.</summary>
+    /// <summary>Steps the world one tick: specials thaw and bombs count down,
+    /// every unit with a target fires through its warhead when in range,
+    /// defence buildings shoot on their own, units walk their speed class and
+    /// production structures advance their queues. Returns the triple (moved,
+    /// fired, produced) as [moved, fired, produced], so a test can see
+    /// combat, movement and production working side by side.</summary>
     List<int> Tick() {
         int moved = 0;
         int fired = 0;
         this.worldTick = this.worldTick + 1;
+        // Blackouts count down even when everything else stands still.
+        for (int s = 0; s < this.blackout.Count; s = s + 1) {
+            if (this.blackout[s] > 0) { this.blackout[s] = this.blackout[s] - 1; }
+        }
+        // Frozen objects thaw; Ivan's bombs count down and detonate.
+        for (int i = 0; i < this.objects.Count; i = i + 1) {
+            WorldObject o = this.objects[i];
+            if (o.Frozen() > 0) { o.SetFrozen(o.Frozen() - 1); }
+            if (o.BombTimer() >= 0) {
+                int bt = o.BombTimer();
+                if (bt == 0) {
+                    o.TakeDamage(this.Rules().BombDamage());
+                    this.SpawnExplosion(o.X(), o.Y());
+                    o.SetBombTimer(-1);
+                } else {
+                    o.SetBombTimer(bt - 1);
+                }
+            }
+        }
         for (int i = 0; i < this.objects.Count; i = i + 1) {
             WorldObject o = this.objects[i];
             if (o.Kind() != ObjKind.Unit()) { continue; }
+            // A chrono-frozen soldier neither shoots nor walks.
+            if (o.Frozen() > 0) { continue; }
             // Move-attack: while walking toward the order's destination, the
             // unit keeps an eye out for enemies within its range plus a small
             // reach; the first one it spots becomes the target and it stands
@@ -1394,7 +1784,33 @@ class World {
                 }
                 if (!o.HasRoute()) { o.ClearMoveAttack(); }
             }
+            // A spent move-attack: the route is gone (spent on arrival, or
+            // cancelled by StopAttack) and nothing is targeted, so the flag
+            // is stale. Clear it, or the guard stance below never fires --
+            // the unit would idle with an order it can no longer follow.
+            if (o.MoveAttacking() && !o.HasRoute() && this.Target(o) == null) {
+                o.ClearMoveAttack();
+            }
             WorldObject t = this.Target(o);
+            // A mind-control bolt or an engineer's capture can flip a target
+            // to the shooter's side between ticks; drop such stale orders.
+            if (t != null && t.Side() == o.Side()) { o.StopAttack(); t = null; }
+            // Guard stance: an idle soldier with a gun watches the ground
+            // around it and engages anything hostile that strays close, so a
+            // garrisoned base defends itself while the player looks
+            // elsewhere. The response radius is wider than the weapon's reach
+            // -- the soldier spots an intruder, walks to meet him and opens
+            // up once in range. Units with orders -- a route or a
+            // move-attack -- keep their focus instead.
+            if (t == null && !o.MoveAttacking() && !o.HasRoute()
+             && o.UnitType().Primary() != null) {
+                int e = this.NearestEnemyIn(o.X(), o.Y(), o.Side(),
+                                            o.UnitType().Range() + 4);
+                if (e >= 0) {
+                    this.AttackObject(i, this.objects[e]);
+                    t = this.objects[e];
+                }
+            }
             if (t != null) {
                 if (this.InRange(o, t)) {
                     // Stand and fire: the unit stops walking while it has a
@@ -1404,10 +1820,7 @@ class World {
                     // lands when the counter reaches zero.
                     int r = o.Reload();
                     if (r <= 0) {
-                        t.TakeDamage(o.UnitType().Damage());
-                        o.SetReload(o.UnitType().Cooldown());
-                        this.SpawnFlash(o.X(), o.Y());
-                        fired = fired + 1;
+                        if (this.FireUnit(o, t)) { fired = fired + 1; }
                     } else {
                         o.SetReload(r - 1);
                     }
@@ -1420,10 +1833,23 @@ class World {
                     o.SetReload(0);
                     List<int> px = new List<int>();
                     List<int> py = new List<int>();
-                    if (!this.HasRoute(o)
-                     && this.FindPathTo(o.X(), o.Y(), t, px, py,
-                                        o.Amphibious())) {
-                        o.SetRoute(px, py);
+                    if (!this.HasRoute(o)) {
+                        if (this.FindPathTo(o.X(), o.Y(), t, px, py,
+                                            o.Amphibious())) {
+                            o.SetRoute(px, py);
+                        } else if ((this.worldTick + i) % 25 == 0) {
+                            // The ordered target cannot be reached -- a
+                            // building sealed in by other structures has no
+                            // free cell to stand on. Hunt the nearest enemy
+                            // the unit CAN walk to instead of idling out the
+                            // war. Throttled so a stuck army re-scans in
+                            // staggered turns, not all on one tick.
+                            int alt = this.NearestReachableEnemy(
+                                o.X(), o.Y(), o.Side(), o.Amphibious());
+                            if (alt >= 0 && alt != o.TargetIndex()) {
+                                this.AttackObject(i, this.objects[alt]);
+                            }
+                        }
                     }
                 }
             } else {
@@ -1431,17 +1857,23 @@ class World {
                 o.SetReload(0);
             }
         }
-        // Defence buildings: a pillbox or SAM site with a weapon fires at the
-        // nearest enemy within range on its own. Uses the building's reload
-        // counter like a unit's.
+        // Defence buildings fire at the nearest enemy within range on their
+        // own, using the building's reload counter like a unit's. Powered
+        // defences (tesla coils, laser turrets, flak cannons) go offline on a
+        // low-power grid or a blackout; the pillbox has no such weakness.
         for (int i = 0; i < this.objects.Count; i = i + 1) {
             WorldObject b = this.objects[i];
             if (b.Kind() != ObjKind.Structure()) { continue; }
-            StructureType bt = this.catalog.TypeFor(b.Side(), b.BuildId());
+            StructureType bt = this.TypeOf(b);
             if (bt == null || !bt.HasWeapon()) { continue; }
             if (b.BuiltTicks() < bt.BuildTime()) { continue; }   // not built yet
+            if (bt.Powered() && this.SideLowPower(b.Side())) {
+                b.SetReload(0);
+                continue;
+            }
             // Keep a live target, or reacquire the nearest enemy in range.
             WorldObject tgt = this.Target(b);
+            if (tgt != null && tgt.Side() == b.Side()) { b.StopAttack(); tgt = null; }
             if (tgt == null) {
                 int e = this.NearestEnemyIn(b.X(), b.Y(), b.Side(), bt.Range());
                 if (e >= 0) { b.SetTarget(e); tgt = this.objects[e]; }
@@ -1449,7 +1881,7 @@ class World {
             if (tgt == null) { b.SetReload(0); continue; }
             int rr = b.Reload();
             if (rr <= 0) {
-                tgt.TakeDamage(bt.Damage());
+                this.ApplyShot(b, bt.Weapon(), tgt);
                 b.SetReload(bt.Cooldown());
                 this.SpawnFlash(b.X(), b.Y());
                 fired = fired + 1;
@@ -1457,25 +1889,27 @@ class World {
                 b.SetReload(rr - 1);
             }
         }
+        // Movement: a unit covers its speed class in cells per tick -- foot
+        // soldiers one, fast movers like dogs and terror drones two. Each
+        // step still needs a free cell, so a blocked unit waits.
         for (int i = 0; i < this.objects.Count; i = i + 1) {
             WorldObject o = this.objects[i];
             if (o.Kind() != ObjKind.Unit()) { continue; }
-            if (o.HasRoute()) {
+            if (o.Frozen() > 0 || !o.HasRoute()) { continue; }
+            int steps = o.UnitType().Steps();
+            while (steps > 0 && o.HasRoute()) {
                 int nx = o.StepCellX();
                 int ny = o.StepCellY();
-                if (nx >= 0) {
-                    if (this.occupancy[this.CellSlot(nx, ny)] == 0) {
-                        int oldX = o.X();
-                        int oldY = o.Y();
-                        this.occupancy[this.CellSlot(oldX, oldY)] = 0;
-                        o.Advance();
-                        o.AdvanceAnim();
-                        o.SetFacing(WorldObject.FacingOf(o.X() - oldX,
-                                                         o.Y() - oldY));
-                        this.occupancy[this.CellSlot(o.X(), o.Y())] = i + 1;
-                        moved = moved + 1;
-                    }
-                }
+                if (nx < 0 || this.occupancy[this.CellSlot(nx, ny)] != 0) { break; }
+                int oldX = o.X();
+                int oldY = o.Y();
+                this.occupancy[this.CellSlot(oldX, oldY)] = 0;
+                o.Advance();
+                o.AdvanceAnim();
+                o.SetFacing(WorldObject.FacingOf(o.X() - oldX, o.Y() - oldY));
+                this.occupancy[this.CellSlot(o.X(), o.Y())] = i + 1;
+                moved = moved + 1;
+                steps = steps - 1;
             }
         }
         // Production: every structure with a queue counts its head down and,
@@ -1484,9 +1918,9 @@ class World {
         // being lost, so a boxed-in factory still delivers eventually. Every
         // structure also advances its own construction progress.
         int produced = 0;
-        // A side running a power deficit produces at half speed.
-        bool playerLow = this.PowerBalance(Side2.Allied()) < 0;
-        bool sovietLow = this.PowerBalance(Side2.Soviet()) < 0;
+        // A side short of power (or blacked out) produces at half speed.
+        bool playerLow = this.SideLowPower(Side2.Allied());
+        bool sovietLow = this.SideLowPower(Side2.Soviet());
         for (int i = 0; i < this.objects.Count; i = i + 1) {
             WorldObject o = this.objects[i];
             if (o.Kind() != ObjKind.Structure()) { continue; }
@@ -1516,6 +1950,131 @@ class World {
         return result;
     }
 
+    // ---- combat resolution ---------------------------------------------------
+
+    /// <summary>The armour class a shot hits: the unit's for soldiers, the
+    /// building's for structures. The warhead's verse for this class scales
+    /// the damage.</summary>
+    int ArmorOf(WorldObject t) {
+        if (t.Kind() == ObjKind.Unit()) { return t.UnitType().ArmorClass(); }
+        StructureType st = this.TypeOf(t);
+        if (st == null) { return ArmorClass.Wood(); }
+        return st.ArmorClass();
+    }
+
+    /// <summary>The gun a unit fires at this target: the secondary when its
+    /// warhead hurts the target's armour more than the primary's (a tesla
+    /// trooper's assault bolt against buildings, Tanya's sapper charge),
+    /// otherwise the primary.</summary>
+    Weapon PickWeapon(UnitType u, WorldObject t) {
+        Weapon p = u.Primary();
+        Weapon s = u.Secondary();
+        if (p == null) { return s; }
+        if (s == null) { return p; }
+        int armor = this.ArmorOf(t);
+        if (s.Warhead().Verse(armor) > p.Warhead().Verse(armor)) { return s; }
+        return p;
+    }
+
+    /// <summary>A unit lets fly at a target it is in range of. Specialists
+    /// act instead of shooting: an engineer captures the building he stands
+    /// beside, a spy infiltrates it. Returns true when a shot (or an action)
+    /// landed, for the fired counter.</summary>
+    bool FireUnit(WorldObject o, WorldObject t) {
+        UnitType u = o.UnitType();
+        if (u.Role() == UnitRole.Engineer()) {
+            if (t.Kind() != ObjKind.Structure() || t.Side() == o.Side()) {
+                o.SetReload(20);
+                return false;
+            }
+            this.EngineerCapture(o, t);
+            return true;
+        }
+        if (u.Role() == UnitRole.Spy()) {
+            if (t.Kind() != ObjKind.Structure() || t.Side() == o.Side()) {
+                o.SetReload(20);
+                return false;
+            }
+            this.SpyInfiltrate(o, t);
+            return true;
+        }
+        Weapon w = this.PickWeapon(u, t);
+        if (w == null) { o.SetReload(20); return false; }
+        this.ApplyShot(o, w, t);
+        o.SetReload(w.Rof());
+        this.SpawnFlash(o.X(), o.Y());
+        return true;
+    }
+
+    /// <summary>Lands one shot: the warhead's verse against the target's
+    /// armour scales the damage, then the special effects land -- a dog's
+    /// bite kills infantry outright, a chrono beam freezes, Yuri's pulse
+    /// converts, Ivan sticks a bomb.</summary>
+    void ApplyShot(WorldObject shooter, Weapon w, WorldObject t) {
+        Warhead wh = w.Warhead();
+        int armor = this.ArmorOf(t);
+        int dmg = w.Damage() * wh.Verse(armor) / 100;
+        if (wh.KillsInfantry() && t.Kind() == ObjKind.Unit()) {
+            dmg = t.Hp();   // dogs take infantry down regardless of health
+        }
+        t.TakeDamage(dmg);
+        if (t.IsDead()) { return; }
+        if (wh.Freeze() && t.Kind() == ObjKind.Unit()) {
+            t.SetFrozen(this.Rules().FreezeTicks());
+        }
+        if (wh.MindControl() && t.Kind() == ObjKind.Unit()
+         && !t.UnitType().MindImmune() && t.Side() != shooter.Side()) {
+            t.SetSide(shooter.Side());
+            t.StopAttack();
+        }
+        if (wh.PlantsBomb() && t.BombTimer() < 0) {
+            t.SetBombTimer(this.Rules().BombDelay());
+        }
+        // Retaliation: a soldier who takes a hit turns on whoever dealt it.
+        // Explicit orders are kept -- only a unit without a target reacts --
+        // and a mind-flip lands first, so a converted soldier never turns on
+        // his new master.
+        if (t.Kind() == ObjKind.Unit() && t.TargetIndex() < 0
+         && t.UnitType().Primary() != null && shooter.Side() != t.Side()) {
+            int sIdx = this.IndexOfObject(shooter);
+            if (sIdx >= 0) { t.SetTarget(sIdx); }
+        }
+    }
+
+    /// <summary>An engineer takes the building he reached: it flips to his
+    /// side with everything it has (a captured derrick keeps trickling
+    /// credits for its new owner). Grabbing a neutral oil derrick also pays
+    /// the capture bonus. The engineer is spent on the job.</summary>
+    void EngineerCapture(WorldObject o, WorldObject t) {
+        bool wasNeutral = t.Side() == Side2.Neutral();
+        StructureType tt = this.TypeOf(t);
+        // The invader's production is not inherited: its queue references the
+        // old owner's roster ids.
+        t.ClearProduction();
+        t.SetSide(o.Side());
+        if (wasNeutral && tt != null && tt.IsRefinery()) {
+            this.AddMoneyEvent(o.Side(), this.Rules().OilCapture());
+        }
+        this.SpawnFlash(t.X(), t.Y());
+        o.TakeDamage(o.Hp());
+    }
+
+    /// <summary>A spy slips into an enemy building: a refinery pays out half
+    /// its owner's credits (the controller settles the books when it drains
+    /// the event queue), a power plant blacks the grid out. The spy is spent
+    /// on the job.</summary>
+    void SpyInfiltrate(WorldObject o, WorldObject t) {
+        StructureType tt = this.TypeOf(t);
+        int enemy = t.Side();
+        if (tt != null && tt.IsRefinery()) {
+            this.AddStealEvent(o.Side(), enemy);
+        } else if (tt != null && tt.Power() > 0) {
+            this.SetBlackout(enemy, this.Rules().BlackoutTicks());
+        }
+        this.SpawnFlash(t.X(), t.Y());
+        o.TakeDamage(o.Hp());
+    }
+
     /// <summary>True when a unit can shoot a target: both are alive and the
     /// target is within the unit's range in cells. A building's distance is
     /// measured to its nearest footprint cell, so a unit firing from beside
@@ -1529,7 +2088,7 @@ class World {
         if (t.Kind() != ObjKind.Structure()) {
             return this.Distance(x, y, t.X(), t.Y());
         }
-        StructureType ft = this.catalog.TypeFor(t.Side(), t.BuildId());
+        StructureType ft = this.TypeOf(t);
         int best = -1;
         for (int dy = 0; dy < ft.FootprintH(); dy = dy + 1) {
             for (int dx = 0; dx < ft.FootprintW(); dx = dx + 1) {
@@ -1559,7 +2118,7 @@ class World {
             this.SpawnExplosion(o.X(), o.Y());
             // Free the unit's cell or the structure's whole footprint.
             if (o.Kind() == ObjKind.Structure()) {
-                StructureType t = this.catalog.TypeFor(o.Side(), o.BuildId());
+                StructureType t = this.TypeOf(o);
                 for (int dy = 0; dy < t.FootprintH(); dy = dy + 1) {
                     for (int dx = 0; dx < t.FootprintW(); dx = dx + 1) {
                         this.occupancy[this.CellSlot(o.X() + dx, o.Y() + dy)] = 0;
@@ -1600,6 +2159,15 @@ class World {
                 else if (tj > i) { other.SetTarget(tj - 1); }
             }
             this.objects.RemoveAt(i);
+            // The grid stores index+1, and every object behind the removed
+            // one slid up a slot: rewrite those entries or the next click
+            // dereferences a stale index -- an off-by-one occupant, or a
+            // segfault when the last object was the one removed.
+            for (int c = 0; c < this.occupancy.Length; c = c + 1) {
+                if (this.occupancy[c] > i + 1) {
+                    this.occupancy[c] = this.occupancy[c] - 1;
+                }
+            }
         }
     }
 
@@ -1634,7 +2202,7 @@ class World {
         List<int> gx = new List<int>();
         List<int> gy = new List<int>();
         if (target.Kind() == ObjKind.Structure()) {
-            StructureType t = this.catalog.TypeFor(target.Side(), target.BuildId());
+            StructureType t = this.TypeOf(target);
             for (int dy = 0; dy < t.FootprintH(); dy = dy + 1) {
                 for (int dx = 0; dx < t.FootprintW(); dx = dx + 1) {
                     gx.Add(target.X() + dx);
@@ -1728,7 +2296,7 @@ class World {
             return slot;
         }
         if (seen[slot] != 0) { return -1; }
-        if (!this.PassableFor(nx, ny, amphibious)) { return -1; }
+        if (!this.PassableForRoute(nx, ny, amphibious)) { return -1; }
         seen[slot] = 1;
         prev[slot] = fromSlot;
         qx.Add(nx);

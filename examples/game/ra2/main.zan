@@ -117,10 +117,11 @@ class Ra2App {
     static int ScaleX(int viewX, int num, int den) { return viewX * num / den; }
     static int ScaleY(int viewY, int num, int den) { return viewY * num / den; }
 
-    /// <summary>The in-game right sidebar: the build menu (nine buildings,
-    /// three columns of three), the player's and enemy's credits, and -- when a
-    /// production structure is selected -- the units it can train. The armed
-    /// build is highlighted so a click on the map knows where it will land.</summary>
+    /// <summary>The in-game right sidebar: the build menu (every building the
+    /// side's roster carries, three per row), the player's and enemy's
+    /// credits, and -- when a production structure is selected -- the units it
+    /// can train. The armed build is highlighted so a click on the map knows
+    /// where it will land; entries whose tech is missing stay dark.</summary>
     static void DrawSidebar(SdlRenderer r, GameController game, ObjectArt art,
                             int mouseX, int mouseY) {
         int w = 296;
@@ -131,17 +132,24 @@ class Ra2App {
         int armed = game.BuildingId();
         StructureCatalog catalog = game.World().Catalog();
         int side = game.Side();
-        Ui.Panel(r, x + 8, y - 4, w - 16, 3 * bh + 40, 22, 26, 36, 200);
+        int n = catalog.CountFor(side);
+        int rows = (n + 2) / 3;
+        Ui.Panel(r, x + 8, y - 4, w - 16, rows * (bh + 5) + 35, 22, 26, 36, 200);
         Text.Draw(r, "建造", x + 22, y + 4, 2, 236, 208, 120, 255);
         int i = 0;
-        for (; i < 9; i = i + 1) {
+        for (; i < n; i = i + 1) {
             int bx = x + 14 + (i % 3) * (bw + 8);
             int by = y + 30 + (i / 3) * (bh + 5);
             int kind = 0;
             if (i == armed) { kind = 2; }
+            bool unlocked = game.BuildUnlocked(i);
             // The building's own finished art as a small icon above its label,
             // so the menu reads as real RA2 buildings rather than text rows.
-            Texture icon = art.StructureTexture(side, i, catalog, 1, 1);
+            // Locked entries hide the icon: no tech, no picture.
+            Texture icon = null;
+            if (unlocked) {
+                icon = art.StructureTexture(side, i, catalog, 1, 1);
+            }
             int labelY = by + bh - 22;
             if (icon != null) {
                 int iw = icon.Width();
@@ -163,14 +171,17 @@ class Ra2App {
             // and the label separately.
             Ra2App.ButtonFrame(r, mouseX, mouseY, bx, by, bw, bh, kind);
             Text.DrawCentered(r, StructureLabel(catalog, side, i),
-                              bx + bw / 2, labelY, 1, 236, 236, 236, 255);
+                              bx + bw / 2, labelY, 1,
+                              unlocked ? 236 : 96, unlocked ? 236 : 102,
+                              unlocked ? 236 : 112, 255);
         }
         string powerText = "电力 " + Convert.ToString(game.Power());
         if (game.LowPower()) { powerText = "电力 不足!"; }
+        int infoY = y + 30 + rows * (bh + 5) + 6;
         Text.Draw(r, "资金 " + Convert.ToString(game.Money())
                   + "   敌方 " + Convert.ToString(game.AiMoney()),
-                  x + 22, y + 32 + 3 * bh + 8, 2, 170, 178, 192, 255);
-        Text.Draw(r, powerText, x + 22, y + 32 + 3 * bh + 30, 2,
+                  x + 22, infoY, 2, 170, 178, 192, 255);
+        Text.Draw(r, powerText, x + 22, infoY + 22, 2,
                   game.LowPower() ? 232 : 170,
                   game.LowPower() ? 92 : 178,
                   game.LowPower() ? 92 : 192, 255);
@@ -212,16 +223,20 @@ class Ra2App {
 
     /// <summary>The production panel sits below the build menu: the selected
     /// structure's trainable units, each with its cost, and a progress bar for
-    /// what its queue is already building.</summary>
-    static int ProdPanelY() {
+    /// what its queue is already building. Its top follows the build menu's
+    /// row count, which differs per side.</summary>
+    static int ProdPanelY(GameController game) {
+        int rows = (game.World().Catalog().CountFor(game.Side()) + 2) / 3;
         int y = 16;
-        int bh = 58;
-        return y + 32 + 3 * bh + 8 + 56;
+        int bh = 54;
+        return y + 30 + rows * (bh + 5) + 6 + 50;
     }
     static int ProdBtnW() { return 130; }
     static int ProdBtnH() { return 42; }
     static int ProdBtnX(int i) { return Ra2App.ViewW() - 296 + 18 + (i % 2) * (Ra2App.ProdBtnW() + 8); }
-    static int ProdBtnY(int i) { return Ra2App.ProdPanelY() + 26 + (i / 2) * (Ra2App.ProdBtnH() + 8); }
+    static int ProdBtnY(GameController game, int i) {
+        return Ra2App.ProdPanelY(game) + 26 + (i / 2) * (Ra2App.ProdBtnH() + 8);
+    }
 
     /// <summary>How many units the selected structure can train, or 0 when
     /// nothing producing is selected.</summary>
@@ -246,7 +261,8 @@ class Ra2App {
     static int HitProduction(GameController game, int mx, int my) {
         int n = Ra2App.ProdCount(game);
         for (int i = 0; i < n; i = i + 1) {
-            if (Draw.PointIn(mx, my, Ra2App.ProdBtnX(i), Ra2App.ProdBtnY(i),
+            if (Draw.PointIn(mx, my, Ra2App.ProdBtnX(i),
+                             Ra2App.ProdBtnY(game, i),
                              Ra2App.ProdBtnW(), Ra2App.ProdBtnH())) {
                 return Ra2App.ProdUnitAt(game, i);
             }
@@ -259,7 +275,7 @@ class Ra2App {
         int n = Ra2App.ProdCount(game);
         if (n == 0) { return; }
         int x = Ra2App.ViewW() - 296;
-        int y = Ra2App.ProdPanelY();
+        int y = Ra2App.ProdPanelY(game);
         Ui.Panel(r, x + 8, y - 8, 280,
                  ((n + 1) / 2) * (Ra2App.ProdBtnH() + 8) + 24, 22, 26, 36, 190);
         Text.Draw(r, "训练", x + 22, y + 2, 2, 236, 208, 120, 255);
@@ -267,11 +283,13 @@ class Ra2App {
         for (int i = 0; i < n; i = i + 1) {
             int id = Ra2App.ProdUnitAt(game, i);
             int bx = Ra2App.ProdBtnX(i);
-            int by = Ra2App.ProdBtnY(i);
+            int by = Ra2App.ProdBtnY(game, i);
             UnitType u = game.World().Units().TypeFor(sel.Side(), id);
             string label = u.Label() + "  " + Convert.ToString(u.Cost());
             int kind = 0;
             if (u.Cost() > game.Money()) { kind = 1; }
+            // Locked by the tech tree: dimmed label prefix reads the gate.
+            if (!game.UnitUnlocked(id)) { label = "?" + label; }
             Ui.Button(r, mouseX, mouseY, bx, by, Ra2App.ProdBtnW(),
                       Ra2App.ProdBtnH(), label, 2, kind);
             // The first queued unit's progress, drawn as a thin bar over the
@@ -607,10 +625,16 @@ class Ra2App {
         int dragStartY = 0;
         bool dragging = false;
 
+        // Real-time clock: the world advances fifteen logic ticks a second
+        // (RA2's own logic frame rate, so the Rules' ROF values read directly
+        // as ticks). Milliseconds accumulate between frames; each full 66ms
+        // chunk spends one tick.
+        int lastMs = -1;
+        int accMs = 0;
+
         while (host.Running()) {
             bool clicked = false;
             bool rightClicked = false;
-            bool tickNow = false;
             while (SdlEvent.Poll()) {
                 int ty = SdlEvent.Type();
                 host.OnWindowEvent(ty);
@@ -698,7 +722,7 @@ class Ra2App {
                         if (sc == 81) { cam.MoveBy(0, panStep); dirty = true; }
                         if (sc == 87 || sc == 46) { cam.ZoomBy(1); dirty = true; }
                         if (sc == 86 || sc == 45) { cam.ZoomBy(-1); dirty = true; }
-                        if (sc == 32 && game != null) { tickNow = true; }  // space
+                        if (sc == 32 && game != null) { game.StepOnce(); dirty = true; }  // space
                         if (sc == 19 && game != null) {                    // P
                             game.TogglePause();
                         }
@@ -767,8 +791,13 @@ class Ra2App {
                     // the playable diamond on most shipped maps, which would
                     // strand the base on void terrain. The unit stays selected
                     // so its click orders a move immediately.
-                    world = World.Create(map.Terrain(), StructureCatalog.Create(),
-                                         UnitCatalog.Create());
+                    // The catalogs come from the Rules: the transcribed RA2
+                    // defaults, with the install's own RULES.INI layered on
+                    // top when the data dir carries one.
+                    Rules rules = Rules.Load(db.Rules());
+                    world = World.Create(map.Terrain(),
+                                         StructureCatalog.CreateWith(rules),
+                                         UnitCatalog.CreateWith(rules));
                     objArt = ObjectArt.Create(vfs, db);
                     int side = shell.SideIndex();
                     List<int> start = new List<int>();
@@ -793,6 +822,25 @@ class Ra2App {
                         world.PlaceBase(1 - side, eStart[0], eStart[1]);
                     } else {
                         world.PlaceEnemyBase(1 - side);
+                    }
+                    // Neutral civilian structures from the map's [Structures]:
+                    // oil derricks, hospitals and city props an engineer can
+                    // take for his side. House-owned entries are skipped --
+                    // the skirmish bases come from the waypoints, not the
+                    // map's scripted layout. Regs the Rules' civ catalog does
+                    // not know have no stats and no art, so they stay out.
+                    int civCount = map.StructureCount();
+                    for (int ci = 0; ci < civCount; ci = ci + 1) {
+                        List<string> f = new List<string>();
+                        if (!map.StructureEntry(ci, f)) { continue; }
+                        if (f[0] != "Neutral") { continue; }
+                        int civId = world.Catalog().CivIdOf(f[1]);
+                        if (civId < 0) { continue; }
+                        StructureType ct = world.Catalog().CivType(civId);
+                        int chp = Convert.ToInt32(f[2]);
+                        int hp = ct.Hp() * chp / 256;
+                        world.PlaceCivStructure(civId, Convert.ToInt32(f[3]),
+                                                Convert.ToInt32(f[4]), hp);
                     }
                     game = GameController.Create(world, side);
                     terrain.SetWorld(world, objArt, side);
@@ -825,11 +873,25 @@ class Ra2App {
                         + " obj=" + Convert.ToString(world.ObjectCount()));
                 }
 
-                // Units only move when the player steps the tick, so one click
-                // or keypress at a time is visible on the terrain.
-                if (tickNow && game != null) {
-                    game.Tick();
-                    dirty = true;
+                // Real time: each full 66ms chunk that accumulated since the
+                // last frame spends one logic tick, up to a small burst cap so
+                // a lagging frame never fast-forwards the battle. While paused
+                // or after the result is decided the clock just re-anchors.
+                int nowMs = Sdl.Ticks();
+                if (game != null && !game.Paused() && game.Result() == 0) {
+                    if (lastMs >= 0) { accMs = accMs + (nowMs - lastMs); }
+                    lastMs = nowMs;
+                    int steps = 0;
+                    while (accMs >= 66 && steps < 4) {
+                        game.Tick();
+                        accMs = accMs - 66;
+                        steps = steps + 1;
+                        dirty = true;
+                    }
+                    if (accMs > 66 * 4) { accMs = 0; }
+                } else {
+                    lastMs = nowMs;
+                    accMs = 0;
                 }
 
                 // Clicks become world commands (place, select, move) before the
@@ -846,8 +908,11 @@ class Ra2App {
                         } else {
                         int bx = (mouseX - (Ra2App.ViewW() - 282)) / 90;
                         int by = (mouseY - 46) / 59;
-                        if (by >= 0 && by < 3 && bx >= 0 && bx < 3) {
-                            game.OnClickBuild(by * 3 + bx);
+                        int rows = (game.World().Catalog().CountFor(game.Side()) + 2) / 3;
+                        int bid = by * 3 + bx;
+                        if (by >= 0 && by < rows && bx >= 0 && bx < 3
+                         && bid < game.World().Catalog().CountFor(game.Side())) {
+                            game.OnClickBuild(bid);
                         }
                         }
                     } else if (cam != null) {

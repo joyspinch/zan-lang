@@ -1,0 +1,934 @@
+using System;
+using System.Collections.Generic;
+using Ra2.Formats;
+
+namespace Ra2.Game;
+
+/// <summary>The eleven armour classes a warhead can be strong or weak
+/// against, in the order RA2's Verses= lists them. Every warhead carries one
+/// percentage per class; a shot multiplies its damage by the target's
+/// percentage before it lands. The values are the game's own, so a flak-jacket
+/// conscript really shrugs off rifle fire less than a bare-skinned GI and a
+/// hollow-point sniper round barely scratches a tank but deletes infantry.</summary>
+class ArmorClass {
+    static int None() { return 0; }        // unarmoured infantry
+    static int Flak() { return 1; }        // flak jackets
+    static int Plate() { return 2; }       // heavy infantry plating
+    static int Light() { return 3; }       // light vehicles
+    static int Medium() { return 4; }
+    static int Heavy() { return 5; }
+    static int Wood() { return 6; }        // weak structures
+    static int Steel() { return 7; }
+    static int Concrete() { return 8; }
+    static int Special1() { return 9; }    // terror drones and friends
+    static int Special2() { return 10; }
+    static int Count() { return 11; }
+
+    /// <summary>The armour class an INI Armour= value names, or None when the
+    /// name is unknown.</summary>
+    static int Parse(string name) {
+        string n = name.ToLower().Trim();
+        if (n == "flak") { return ArmorClass.Flak(); }
+        if (n == "plate") { return ArmorClass.Plate(); }
+        if (n == "light") { return ArmorClass.Light(); }
+        if (n == "medium") { return ArmorClass.Medium(); }
+        if (n == "heavy") { return ArmorClass.Heavy(); }
+        if (n == "wood") { return ArmorClass.Wood(); }
+        if (n == "steel") { return ArmorClass.Steel(); }
+        if (n == "concrete") { return ArmorClass.Concrete(); }
+        if (n == "special_1") { return ArmorClass.Special1(); }
+        if (n == "special_2") { return ArmorClass.Special2(); }
+        return ArmorClass.None();
+    }
+}
+
+/// <summary>How a weapon's damage lands: one multiplier per armour class plus
+/// the special behaviours RA2 builds out of warheads -- dogs instakill
+/// infantry, chrono beams freeze, Yuri's pulse converts, Ivan plants a bomb.
+/// CellSpread 0 hits the target alone; anything wider splashes (unused by the
+/// ground warheads that matter here except the desolator's eruption).</summary>
+class Warhead {
+    string name;
+    List<int> verse;      // 11 percentages, indexed by ArmorClass
+    int spread;           // splash radius in cells, 0 = single target
+    bool killsInfantry;   // an infantry hit dies regardless of the damage
+    bool mindControl;     // converts a living unit to the shooter's side
+    bool freeze;          // the hit unit stands frozen for a while
+    bool plantsBomb;      // sticks a timed bomb on the target
+
+    static Warhead Create(string name, string verses) {
+        Warhead w = new Warhead();
+        w.name = name;
+        w.verse = Rules.ParsePercents(verses);
+        w.spread = 0;
+        w.killsInfantry = false;
+        w.mindControl = false;
+        w.freeze = false;
+        w.plantsBomb = false;
+        return w;
+    }
+
+    string Name() { return this.name; }
+    int Spread() { return this.spread; }
+    bool KillsInfantry() { return this.killsInfantry; }
+    bool MindControl() { return this.mindControl; }
+    bool Freeze() { return this.freeze; }
+    bool PlantsBomb() { return this.plantsBomb; }
+    void SetSpread(int cells) { this.spread = cells; }
+    void SetKillsInfantry(bool on) { this.killsInfantry = on; }
+    void SetMindControl(bool on) { this.mindControl = on; }
+    void SetFreeze(bool on) { this.freeze = on; }
+    void SetPlantsBomb(bool on) { this.plantsBomb = on; }
+
+    /// <summary>The damage percentage against an armour class, 0-200.</summary>
+    int Verse(int armor) {
+        if (armor < 0 || armor >= this.verse.Count) { return 100; }
+        return this.verse[armor];
+    }
+
+    void SetVerse(int armor, int percent) {
+        if (armor >= 0 && armor < this.verse.Count) {
+            this.verse[armor] = percent;
+        }
+    }
+}
+
+/// <summary>A named gun: how hard it hits, how often, from how far away, and
+/// through which warhead. ROF is kept in ticks (the game runs at fifteen
+/// ticks a second, RA2's logic frame rate, so the INI's frame counts carry
+/// over unchanged).</summary>
+class Weapon {
+    string name;
+    int damage;
+    int rof;       // ticks between shots
+    int range;     // cells (manhattan)
+    Warhead warhead;
+
+    static Weapon Create(string name, int damage, int rof, int range,
+                         Warhead warhead) {
+        Weapon w = new Weapon();
+        w.name = name;
+        w.damage = damage;
+        w.rof = rof;
+        w.range = range;
+        w.warhead = warhead;
+        return w;
+    }
+
+    string Name() { return this.name; }
+    int Damage() { return this.damage; }
+    int Rof() { return this.rof; }
+    int Range() { return this.range; }
+    Warhead Warhead() { return this.warhead; }
+    void SetDamage(int dmg) { this.damage = dmg; }
+    void SetRof(int rof) { this.rof = rof; }
+    void SetRange(int range) { this.range = range; }
+    void SetWarhead(Warhead w) { this.warhead = w; }
+}
+
+/// <summary>What a soldier (or drone) is, straight out of RULES.INI: cost and
+/// health, the guns he carries, who trains him and which buildings must stand
+/// first. Prereq tokens are the [General] alias names (POWER, FACTORY,
+/// BARRACKS, RADAR, TECH, PROC) or a concrete building regkey; the catalog
+/// resolves them to build ids per side.</summary>
+class UnitDef {
+    string reg;        // E1, DOG, ...
+    string label;      // the Chinese sidebar name
+    int cost;
+    int hp;
+    int speed;         // RA2 speed class: 4 foot, 8 fast foot, 10 drone
+    int armor;         // ArmorClass
+    Weapon primary;    // null = unarmed (engineer, spy)
+    Weapon secondary;  // picked per shot when its verse beats the primary's
+    string producer;   // building regkey that trains this unit
+    List<string> prereq;
+    int sideMask;      // 1 allied, 2 soviet, 3 both
+    int role;          // UnitRole
+    bool mindImmune;   // dogs and Tanya shrug off mind control
+    string shp;
+
+    static UnitDef Create(string reg, string label, int cost, int hp,
+                          int speed, int armor, Weapon primary,
+                          string producer, int sideMask, string shp) {
+        UnitDef d = new UnitDef();
+        d.reg = reg;
+        d.label = label;
+        d.cost = cost;
+        d.hp = hp;
+        d.speed = speed;
+        d.armor = armor;
+        d.primary = primary;
+        d.secondary = null;
+        d.producer = producer;
+        d.prereq = new List<string>();
+        d.sideMask = sideMask;
+        d.role = UnitRole.None();
+        d.mindImmune = false;
+        d.shp = shp;
+        return d;
+    }
+
+    string Reg() { return this.reg; }
+    string Label() { return this.label; }
+    int Cost() { return this.cost; }
+    int Hp() { return this.hp; }
+    int Speed() { return this.speed; }
+    int Armor() { return this.armor; }
+    Weapon Primary() { return this.primary; }
+    Weapon Secondary() { return this.secondary; }
+    string Producer() { return this.producer; }
+    List<string> Prereq() { return this.prereq; }
+    int SideMask() { return this.sideMask; }
+    int Role() { return this.role; }
+    bool MindImmune() { return this.mindImmune; }
+    string Shp() { return this.shp; }
+    void SetSecondary(Weapon w) { this.secondary = w; }
+    void SetRole(int role) { this.role = role; }
+    void SetMindImmune(bool on) { this.mindImmune = on; }
+    void AddPrereq(string token) { this.prereq.Add(token); }
+    void SetCost(int cost) { this.cost = cost; }
+    void SetHp(int hp) { this.hp = hp; }
+    void SetSpeed(int speed) { this.speed = speed; }
+    void SetArmor(int armor) { this.armor = armor; }
+    void SetShp(string shp) { this.shp = shp; }
+    void SetPrimary(Weapon w) { this.primary = w; }
+
+    /// <summary>Cells the unit covers per tick. RA2's speed classes map to
+    /// foot soldiers at one cell and fast movers (dogs, terror drones) at
+    /// two.</summary>
+    int Steps() {
+        int s = this.speed / 4;
+        if (s < 1) { s = 1; }
+        return s;
+    }
+}
+
+/// <summary>Special behaviours a unit can carry in place of a gun.</summary>
+class UnitRole {
+    static int None() { return 0; }
+    static int Engineer() { return 1; }   // captures the building he reaches
+    static int Spy() { return 2; }        // infiltrates: steals or blackouts
+}
+
+/// <summary>What a building is: footprint, health, cost, its power ledger
+/// entry, its gun if it has one, and the tech it needs before the sidebar
+/// offers it. Refineries (and captured oil derricks) are the economy: they
+/// trickle credits every tick, replacing any passive income.</summary>
+class BuildingDef {
+    string reg;        // GACNST, NAPOWR, ...
+    string label;
+    string shp;
+    int fw;
+    int fh;
+    int hp;
+    int cost;
+    int power;         // supplied when built (plants)
+    int drain;         // consumed while operating
+    int armor;         // ArmorClass
+    Weapon weapon;     // null = no gun
+    bool powered;      // needs a positive power balance to work (defences)
+    bool refinery;     // trickles credits
+    int sideMask;      // 1 allied, 2 soviet, 4 neutral civilian
+    List<string> prereq;
+
+    static BuildingDef Create(string reg, string label, string shp, int fw,
+                              int fh, int hp, int cost, int power, int drain,
+                              int armor, int sideMask) {
+        BuildingDef d = new BuildingDef();
+        d.reg = reg;
+        d.label = label;
+        d.shp = shp;
+        d.fw = fw;
+        d.fh = fh;
+        d.hp = hp;
+        d.cost = cost;
+        d.power = power;
+        d.drain = drain;
+        d.armor = armor;
+        d.weapon = null;
+        d.powered = false;
+        d.refinery = false;
+        d.sideMask = sideMask;
+        d.prereq = new List<string>();
+        return d;
+    }
+
+    string Reg() { return this.reg; }
+    string Label() { return this.label; }
+    string Shp() { return this.shp; }
+    int FootprintW() { return this.fw; }
+    int FootprintH() { return this.fh; }
+    int Hp() { return this.hp; }
+    int Cost() { return this.cost; }
+    int Power() { return this.power; }
+    int Drain() { return this.drain; }
+    int Armor() { return this.armor; }
+    Weapon Weapon() { return this.weapon; }
+    bool Powered() { return this.powered; }
+    bool IsRefinery() { return this.refinery; }
+    int SideMask() { return this.sideMask; }
+    List<string> Prereq() { return this.prereq; }
+    void SetWeapon(Weapon w) { this.weapon = w; }
+    void SetPowered(bool on) { this.powered = on; }
+    void SetRefinery(bool on) { this.refinery = on; }
+    void AddPrereq(string token) { this.prereq.Add(token); }
+    void SetCost(int cost) { this.cost = cost; }
+    void SetHp(int hp) { this.hp = hp; }
+    void SetPower(int power) { this.power = power; }
+    void SetDrain(int drain) { this.drain = drain; }
+}
+
+/// <summary>The whole ruleset: every warhead, weapon, soldier and building of
+/// the ground war, the tech-tree aliases, the AI's build lists and the economy
+/// constants. The defaults are the real RA2 numbers transcribed, so a game
+/// without an install (the tests) plays with exactly the balance the shipped
+/// RULES.INI describes; with an install, Load() re-reads that very file and
+/// overrides whatever it still defines.</summary>
+class Rules {
+    List<Warhead> warheads;
+    List<Weapon> weapons;
+    List<UnitDef> units;
+    List<BuildingDef> buildings;   // both sides interleaved, menu order per side
+    List<BuildingDef> civs;        // neutral structures from the map
+
+    // Tech-tree aliases, the [General] Prerequisite* lists.
+    List<string> preqPower;
+    List<string> preqFactory;
+    List<string> preqBarracks;
+    List<string> preqRadar;
+    List<string> preqTech;
+    List<string> preqProc;
+
+    // The [AI] build lists.
+    List<string> aiConst;
+    List<string> aiPower;
+    List<string> aiRefinery;
+    List<string> aiBarracks;
+    List<string> aiWeapons;
+    List<string> aiTech;
+    List<string> aiRadar;
+    List<string> aiDefense;
+
+    // Economy.
+    int startMoney;
+    int refineryIncome;   // credits per built refinery per tick
+    int oilIncome;        // credits per captured oil derrick per tick
+    int oilCapture;       // one-shot bonus for grabbing an oil derrick
+    int bombDamage;       // Ivan's bomb
+    int bombDelay;        // ticks before Ivan's bomb goes off
+    int blackoutTicks;    // spy-infiltrated power plant downtime
+    int freezeTicks;      // chrono-beam freeze duration
+
+    static Rules Create() {
+        Rules r = new Rules();
+        r.warheads = new List<Warhead>();
+        r.weapons = new List<Weapon>();
+        r.units = new List<UnitDef>();
+        r.buildings = new List<BuildingDef>();
+        r.civs = new List<BuildingDef>();
+        return r;
+    }
+
+    // ---- lookups -----------------------------------------------------------
+
+    List<Warhead> Warheads() { return this.warheads; }
+    List<Weapon> Weapons() { return this.weapons; }
+    List<UnitDef> Units() { return this.units; }
+    List<BuildingDef> Buildings() { return this.buildings; }
+    List<BuildingDef> Civs() { return this.civs; }
+    List<string> PreqPower() { return this.preqPower; }
+    List<string> PreqFactory() { return this.preqFactory; }
+    List<string> PreqBarracks() { return this.preqBarracks; }
+    List<string> PreqRadar() { return this.preqRadar; }
+    List<string> PreqTech() { return this.preqTech; }
+    List<string> PreqProc() { return this.preqProc; }
+    List<string> AiConst() { return this.aiConst; }
+    List<string> AiPower() { return this.aiPower; }
+    List<string> AiRefinery() { return this.aiRefinery; }
+    List<string> AiBarracks() { return this.aiBarracks; }
+    List<string> AiWeapons() { return this.aiWeapons; }
+    List<string> AiTech() { return this.aiTech; }
+    List<string> AiRadar() { return this.aiRadar; }
+    List<string> AiDefense() { return this.aiDefense; }
+    int StartMoney() { return this.startMoney; }
+    int RefineryIncome() { return this.refineryIncome; }
+    int OilIncome() { return this.oilIncome; }
+    int OilCapture() { return this.oilCapture; }
+    int BombDamage() { return this.bombDamage; }
+    int BombDelay() { return this.bombDelay; }
+    int BlackoutTicks() { return this.blackoutTicks; }
+    int FreezeTicks() { return this.freezeTicks; }
+
+    Warhead WarheadNamed(string name) {
+        for (int i = 0; i < this.warheads.Count; i = i + 1) {
+            if (this.warheads[i].Name() == name) { return this.warheads[i]; }
+        }
+        return null;
+    }
+
+    Weapon WeaponNamed(string name) {
+        for (int i = 0; i < this.weapons.Count; i = i + 1) {
+            if (this.weapons[i].Name() == name) { return this.weapons[i]; }
+        }
+        return null;
+    }
+
+    UnitDef UnitNamed(string reg) {
+        for (int i = 0; i < this.units.Count; i = i + 1) {
+            if (this.units[i].Reg() == reg) { return this.units[i]; }
+        }
+        return null;
+    }
+
+    BuildingDef BuildingNamed(string reg) {
+        for (int i = 0; i < this.buildings.Count; i = i + 1) {
+            if (this.buildings[i].Reg() == reg) { return this.buildings[i]; }
+        }
+        return null;
+    }
+
+    BuildingDef CivNamed(string reg) {
+        for (int i = 0; i < this.civs.Count; i = i + 1) {
+            if (this.civs[i].Reg() == reg) { return this.civs[i]; }
+        }
+        return null;
+    }
+
+    /// <summary>The units a side fields, in sidebar order.</summary>
+    List<UnitDef> UnitsForSide(int side) {
+        int bit = side == 0 ? 1 : 2;
+        List<UnitDef> outList = new List<UnitDef>();
+        for (int i = 0; i < this.units.Count; i = i + 1) {
+            UnitDef d = this.units[i];
+            if ((d.SideMask() & bit) != 0) { outList.Add(d); }
+        }
+        return outList;
+    }
+
+    /// <summary>The buildable structures a side has, in sidebar order.</summary>
+    List<BuildingDef> BuildingsForSide(int side) {
+        int bit = side == 0 ? 1 : 2;
+        List<BuildingDef> outList = new List<BuildingDef>();
+        for (int i = 0; i < this.buildings.Count; i = i + 1) {
+            BuildingDef d = this.buildings[i];
+            if ((d.SideMask() & bit) != 0) { outList.Add(d); }
+        }
+        return outList;
+    }
+
+    /// <summary>Resolves a prereq token list (aliases like RADAR or concrete
+    /// regkeys) to build-id slots against a side's building list: one slot
+    /// per token, each slot holding the build ids of any building the token
+    /// accepts. Empty slots (the token names nothing the side can build) are
+    /// dropped -- they could never be satisfied.</summary>
+    static List<List<int>> ResolvePrereqs(Rules rules, List<string> tokens,
+                                          List<BuildingDef> bdefs) {
+        List<List<int>> slots = new List<List<int>>();
+        for (int i = 0; i < tokens.Count; i = i + 1) {
+            List<string> regs = rules.ResolveToken(tokens[i]);
+            List<int> slot = new List<int>();
+            for (int j = 0; j < regs.Count; j = j + 1) {
+                for (int b = 0; b < bdefs.Count; b = b + 1) {
+                    if (bdefs[b].Reg() == regs[j]) { slot.Add(b); }
+                }
+            }
+            if (slot.Count > 0) { slots.Add(slot); }
+        }
+        return slots;
+    }
+
+    /// <summary>Resolves one prereq token (an alias like RADAR or a concrete
+    /// regkey like GATECH) to the regkeys it stands for.</summary>
+    List<string> ResolveToken(string token) {
+        if (token == "POWER") { return this.preqPower; }
+        if (token == "FACTORY") { return this.preqFactory; }
+        if (token == "BARRACKS") { return this.preqBarracks; }
+        if (token == "RADAR") { return this.preqRadar; }
+        if (token == "TECH") { return this.preqTech; }
+        if (token == "PROC") { return this.preqProc; }
+        List<string> one = new List<string>();
+        one.Add(token);
+        return one;
+    }
+
+    // ---- pacing ------------------------------------------------------------
+
+    /// <summary>Production ticks a unit spends in the queue, proportional to
+    /// its price the way RA2's build speed is: a 200-credit GI takes 150
+    /// ticks, ten seconds at the game's fifteen ticks a second.</summary>
+    static int UnitBuildTicks(int cost) { return cost * 3 / 4; }
+
+    /// <summary>Construction ticks before a placed building finishes. A 3000
+    /// credit yard takes thirty seconds; cheap walls finish almost at once.
+    /// Low power halves the effective rate at the world level.</summary>
+    static int BuildingBuildTicks(int cost) {
+        int t = cost / 10;
+        if (t < 10) { t = 10; }
+        return t;
+    }
+
+    // ---- the defaults: RULES.INI transcribed -------------------------------
+
+    /// <summary>The full ruleset with the shipped RA2 values. Tests run
+    /// against this alone, so the balance is locked even where no install
+    /// exists; the real game then layers its own RULES.INI on top.</summary>
+    static Rules Default() {
+        Rules r = Rules.Create();
+
+        // -- warheads: the eleven-verse tables --------------------------------
+        r.warheads.Add(Warhead.Create("SA",
+            "100,80,70,50,25,25,75,50,25,100,100"));
+        r.warheads.Add(Warhead.Create("SSA",
+            "100,100,70,60,40,40,75,50,25,100,100"));
+        r.warheads.Add(Warhead.Create("HollowPoint",
+            "200,100,100,1,1,1,1,1,1,1,100"));
+        r.warheads.Add(Warhead.Create("Shock",
+            "100,100,100,85,100,100,50,50,50,200,100"));
+        r.warheads.Add(Warhead.Create("ElectricAssault",
+            "0,0,0,0,0,0,100,100,100,50,100"));
+        r.warheads.Add(Warhead.Create("AP",
+            "25,25,25,75,100,100,65,45,60,60,100"));
+        r.warheads.Add(Warhead.Create("FlakGuyWH",
+            "150,100,50,60,10,10,70,30,20,100,100"));
+        Warhead flak = Warhead.Create("FlakWH",
+            "100,100,50,60,10,10,70,30,20,100,100");
+        flak.SetSpread(1);
+        r.warheads.Add(flak);
+        Warhead psi = Warhead.Create("PsiPulse",
+            "100,100,100,0,0,0,0,0,0,0,0");
+        psi.SetSpread(3);
+        r.warheads.Add(psi);
+        Warhead ctrl = Warhead.Create("Controller",
+            "100,100,100,100,100,100,0,0,0,100,100");
+        ctrl.SetMindControl(true);
+        r.warheads.Add(ctrl);
+        Warhead chrono = Warhead.Create("ChronoBeam",
+            "100,100,100,100,100,100,100,100,100,100,100");
+        chrono.SetFreeze(true);
+        r.warheads.Add(chrono);
+        r.warheads.Add(Warhead.Create("Parasite",
+            "100,100,100,100,100,100,0,0,0,0,0"));
+        Warhead dog = Warhead.Create("ParasiteDog",
+            "100,100,100,0,0,0,0,0,0,0,0");
+        dog.SetKillsInfantry(true);
+        r.warheads.Add(dog);
+        r.warheads.Add(Warhead.Create("RadBeamWarhead",
+            "100,100,100,20,15,10,0,0,0,100,100"));
+        Warhead erupt = Warhead.Create("RadEruptionWarhead",
+            "100,100,100,20,15,10,0,0,0,100,100");
+        erupt.SetSpread(10);
+        r.warheads.Add(erupt);
+        r.warheads.Add(Warhead.Create("HE",
+            "100,90,80,70,35,35,75,40,20,80,100"));
+        Warhead bomb = Warhead.Create("IvanBombWH",
+            "100,100,100,100,100,100,100,100,100,100,100");
+        bomb.SetPlantsBomb(true);
+        r.warheads.Add(bomb);
+        r.warheads.Add(Warhead.Create("SapperWH",
+            "0,0,0,0,0,0,100,100,100,0,0"));
+
+        // -- weapons: damage, ROF ticks, range cells, warhead ----------------
+        r.weapons.Add(Weapon.Create("M60", 15, 20, 4, r.WarheadNamed("SA")));
+        r.weapons.Add(Weapon.Create("M1Carbine", 15, 25, 4,
+            r.WarheadNamed("SA")));
+        r.weapons.Add(Weapon.Create("BadTeeth", 30, 30, 2,
+            r.WarheadNamed("ParasiteDog")));
+        r.weapons.Add(Weapon.Create("AWP", 125, 150, 14,
+            r.WarheadNamed("HollowPoint")));
+        r.weapons.Add(Weapon.Create("ElectricBolt", 50, 60, 3,
+            r.WarheadNamed("Shock")));
+        r.weapons.Add(Weapon.Create("AssaultBolt", 10, 25, 2,
+            r.WarheadNamed("ElectricAssault")));
+        r.weapons.Add(Weapon.Create("FlakGuyGun", 20, 20, 5,
+            r.WarheadNamed("FlakGuyWH")));
+        r.weapons.Add(Weapon.Create("MindControl", 10, 200, 7,
+            r.WarheadNamed("Controller")));
+        r.weapons.Add(Weapon.Create("PsiWave", 250, 50, 1,
+            r.WarheadNamed("PsiPulse")));
+        r.weapons.Add(Weapon.Create("NeutronRifle", 8, 120, 5,
+            r.WarheadNamed("ChronoBeam")));
+        r.weapons.Add(Weapon.Create("DoublePistols", 125, 10, 6,
+            r.WarheadNamed("HollowPoint")));
+        r.weapons.Add(Weapon.Create("Sapper", 200, 45, 1,
+            r.WarheadNamed("SapperWH")));
+        r.weapons.Add(Weapon.Create("IvanBomber", 400, 50, 2,
+            r.WarheadNamed("IvanBombWH")));
+        r.weapons.Add(Weapon.Create("RadBeamWeapon", 125, 50, 6,
+            r.WarheadNamed("RadBeamWarhead")));
+        r.weapons.Add(Weapon.Create("RadEruptionWeapon", 1, 60, 4,
+            r.WarheadNamed("RadEruptionWarhead")));
+        r.weapons.Add(Weapon.Create("DroneJump", 50, 60, 2,
+            r.WarheadNamed("Parasite")));
+        r.weapons.Add(Weapon.Create("Vulcan2", 50, 26, 6,
+            r.WarheadNamed("SA")));
+        r.weapons.Add(Weapon.Create("CoilBolt", 200, 80, 7,
+            r.WarheadNamed("Shock")));
+        r.weapons.Add(Weapon.Create("FlakWeapon", 40, 20, 12,
+            r.WarheadNamed("FlakWH")));
+
+        // -- the roster -------------------------------------------------------
+        // Order matters: each side's menu ids come from filtering this list,
+        // so both sides open on their rifleman (E1/E2) before the shared dog
+        // and engineer slot in at 1 and 2. The stripped install carries no
+        // vehicle art, so the Allied war runs entirely on foot.
+        r.units.Add(UnitDef.Create("E1", "美国大兵", 200, 125, 4,
+            ArmorClass.None(), r.WeaponNamed("M60"), "GAPILE", 1, "GI.SHP"));
+        r.units.Add(UnitDef.Create("E2", "动员兵", 100, 125, 4,
+            ArmorClass.Flak(), r.WeaponNamed("M1Carbine"), "NAHAND", 2,
+            "CONS.SHP"));
+        UnitDef dogA = UnitDef.Create("ADOG", "警犬", 200, 100, 8,
+            ArmorClass.None(), r.WeaponNamed("BadTeeth"), "GAPILE", 3,
+            "DOG.SHP");
+        dogA.SetMindImmune(true);
+        r.units.Add(dogA);
+        UnitDef eng = UnitDef.Create("ENGINEER", "工程师", 500, 75, 4,
+            ArmorClass.None(), null, "GAPILE", 3, "ENGINEER.SHP");
+        eng.SetRole(UnitRole.Engineer());
+        r.units.Add(eng);
+        UnitDef snipe = UnitDef.Create("SNIPE", "狙击手", 600, 125, 4,
+            ArmorClass.Flak(), r.WeaponNamed("AWP"), "GAPILE", 1, "SNIPE.SHP");
+        snipe.AddPrereq("RADAR");
+        r.units.Add(snipe);
+        UnitDef spy = UnitDef.Create("SPY", "间谍", 1000, 100, 4,
+            ArmorClass.Flak(), null, "GAPILE", 1, "SPY.SHP");
+        spy.SetRole(UnitRole.Spy());
+        spy.AddPrereq("TECH");
+        r.units.Add(spy);
+        UnitDef cleg = UnitDef.Create("CLEG", "超时空军团兵", 1500, 125, 5,
+            ArmorClass.None(), r.WeaponNamed("NeutronRifle"), "GAPILE", 1,
+            "CLEG.SHP");
+        cleg.AddPrereq("TECH");
+        r.units.Add(cleg);
+        UnitDef tanya = UnitDef.Create("TANYA", "谭雅", 1000, 125, 5,
+            ArmorClass.Flak(), r.WeaponNamed("DoublePistols"), "GAPILE", 1,
+            "TANY.SHP");
+        tanya.SetSecondary(r.WeaponNamed("Sapper"));
+        tanya.SetMindImmune(true);
+        tanya.AddPrereq("TECH");
+        r.units.Add(tanya);
+
+        // Soviet infantry, plus the terror drone the war factory turns out.
+        UnitDef shk = UnitDef.Create("SHK", "磁暴步兵", 500, 130, 4,
+            ArmorClass.Plate(), r.WeaponNamed("ElectricBolt"), "NAHAND", 2,
+            "SHK.SHP");
+        shk.SetSecondary(r.WeaponNamed("AssaultBolt"));
+        r.units.Add(shk);
+        UnitDef flakt = UnitDef.Create("FLAKT", "防空步兵", 300, 100, 4,
+            ArmorClass.Flak(), r.WeaponNamed("FlakGuyGun"), "NAHAND", 2,
+            "FLAKT.SHP");
+        flakt.AddPrereq("RADAR");
+        r.units.Add(flakt);
+        UnitDef ivan = UnitDef.Create("IVAN", "疯狂伊文", 600, 125, 4,
+            ArmorClass.None(), r.WeaponNamed("IvanBomber"), "NAHAND", 2,
+            "IVAN.SHP");
+        ivan.AddPrereq("RADAR");
+        r.units.Add(ivan);
+        UnitDef deso = UnitDef.Create("DESO", "辐射工兵", 600, 150, 4,
+            ArmorClass.Plate(), r.WeaponNamed("RadBeamWeapon"), "NAHAND", 2,
+            "DESO.SHP");
+        deso.SetSecondary(r.WeaponNamed("RadEruptionWeapon"));
+        deso.AddPrereq("RADAR");
+        r.units.Add(deso);
+        UnitDef yuri = UnitDef.Create("YURI", "尤里", 1200, 100, 4,
+            ArmorClass.None(), r.WeaponNamed("MindControl"), "NAHAND", 2,
+            "YURI.SHP");
+        yuri.SetSecondary(r.WeaponNamed("PsiWave"));
+        yuri.AddPrereq("TECH");
+        r.units.Add(yuri);
+        r.units.Add(UnitDef.Create("DRON", "恐怖机器人", 500, 100, 10,
+            ArmorClass.Special1(), r.WeaponNamed("DroneJump"), "NAWEAP", 2,
+            "DRON.SHP"));
+
+        // -- the structures, interleaved so each side filters to menu order ---
+        BuildingDef gacnst = BuildingDef.Create("GACNST", "建造厂",
+            "GACNST.SHP", 4, 3, 1000, 3000, 0, 50,
+            ArmorClass.Concrete(), 1);
+        r.buildings.Add(gacnst);
+        BuildingDef nacnst = BuildingDef.Create("NACNST", "建造厂",
+            "NACNST.SHP", 4, 3, 1000, 3000, 0, 50,
+            ArmorClass.Concrete(), 2);
+        r.buildings.Add(nacnst);
+        r.buildings.Add(BuildingDef.Create("GAPOWR", "电厂",
+            "GAPOWR.SHP", 2, 2, 750, 800, 200, 0, ArmorClass.Wood(), 1));
+        BuildingDef napowr = BuildingDef.Create("NAPOWR", "磁能反应堆",
+            "NAPOWR.SHP", 3, 2, 750, 600, 150, 0, ArmorClass.Wood(), 2);
+        r.buildings.Add(napowr);
+        BuildingDef garefn = BuildingDef.Create("GAREFN", "矿石精炼厂",
+            "GAREFN.SHP", 4, 3, 1000, 2000, 0, 50, ArmorClass.Wood(), 1);
+        garefn.SetRefinery(true);
+        garefn.AddPrereq("POWER");
+        r.buildings.Add(garefn);
+        BuildingDef narefn = BuildingDef.Create("NAREFN", "矿石精炼厂",
+            "NAREFN.SHP", 4, 3, 1000, 2000, 0, 50, ArmorClass.Wood(), 2);
+        narefn.SetRefinery(true);
+        narefn.AddPrereq("POWER");
+        r.buildings.Add(narefn);
+        BuildingDef gapile = BuildingDef.Create("GAPILE", "兵营",
+            "GAPILE.SHP", 2, 2, 500, 500, 0, 10, ArmorClass.Wood(), 1);
+        gapile.AddPrereq("POWER");
+        r.buildings.Add(gapile);
+        BuildingDef nahand = BuildingDef.Create("NAHAND", "兵营",
+            "NAHAND.SHP", 2, 2, 500, 500, 0, 10, ArmorClass.Wood(), 2);
+        nahand.AddPrereq("POWER");
+        r.buildings.Add(nahand);
+        BuildingDef naweap = BuildingDef.Create("NAWEAP", "战争工厂",
+            "NAWEAP.SHP", 3, 2, 1000, 2000, 0, 25, ArmorClass.Wood(), 2);
+        naweap.AddPrereq("PROC");
+        naweap.AddPrereq("BARRACKS");
+        r.buildings.Add(naweap);
+        BuildingDef gatech = BuildingDef.Create("GATECH", "科技中心",
+            "GATECH.SHP", 3, 2, 500, 2000, 0, 100, ArmorClass.Wood(), 1);
+        gatech.AddPrereq("BARRACKS");
+        gatech.AddPrereq("RADAR");
+        r.buildings.Add(gatech);
+        BuildingDef natech = BuildingDef.Create("NATECH", "科技中心",
+            "NATECH.SHP", 3, 2, 500, 2000, 0, 100, ArmorClass.Wood(), 2);
+        natech.AddPrereq("BARRACKS");
+        natech.AddPrereq("RADAR");
+        r.buildings.Add(natech);
+        BuildingDef gaairc = BuildingDef.Create("GAAIRC", "空指部",
+            "GAAIRC.SHP", 2, 2, 600, 1000, 0, 50, ArmorClass.Wood(), 1);
+        gaairc.AddPrereq("PROC");
+        r.buildings.Add(gaairc);
+        BuildingDef naradr = BuildingDef.Create("NARADR", "雷达",
+            "NARADR.SHP", 2, 2, 1000, 1000, 0, 50, ArmorClass.Wood(), 2);
+        naradr.AddPrereq("PROC");
+        r.buildings.Add(naradr);
+        BuildingDef gapill = BuildingDef.Create("GAPILL", "机枪碉堡",
+            "GAPILL.SHP", 1, 1, 400, 500, 0, 0, ArmorClass.Steel(), 1);
+        gapill.SetWeapon(r.WeaponNamed("Vulcan2"));
+        gapill.AddPrereq("BARRACKS");
+        r.buildings.Add(gapill);
+        BuildingDef nalasr = BuildingDef.Create("NALASR", "哨戒炮",
+            "NALASR.SHP", 1, 1, 400, 500, 0, 25, ArmorClass.Steel(), 2);
+        nalasr.SetWeapon(r.WeaponNamed("Vulcan2"));
+        nalasr.SetPowered(true);
+        nalasr.AddPrereq("BARRACKS");
+        r.buildings.Add(nalasr);
+        BuildingDef tesla = BuildingDef.Create("TESLA", "磁暴线圈",
+            "NATSLA.SHP", 1, 1, 600, 1500, 0, 75, ArmorClass.Steel(), 2);
+        tesla.SetWeapon(r.WeaponNamed("CoilBolt"));
+        tesla.SetPowered(true);
+        tesla.AddPrereq("RADAR");
+        r.buildings.Add(tesla);
+        BuildingDef naflak = BuildingDef.Create("NAFLAK", "高射炮",
+            "NAFLAK.SHP", 1, 1, 900, 1000, 0, 50, ArmorClass.Steel(), 2);
+        naflak.SetWeapon(r.WeaponNamed("FlakWeapon"));
+        naflak.SetPowered(true);
+        naflak.AddPrereq("BARRACKS");
+        r.buildings.Add(naflak);
+        r.buildings.Add(BuildingDef.Create("GAWALL", "围墙",
+            "GAWALL.SHP", 1, 1, 300, 100, 0, 0, ArmorClass.Concrete(), 1));
+        r.buildings.Add(BuildingDef.Create("NAWALL", "围墙",
+            "NAWALL.SHP", 1, 1, 300, 100, 0, 0, ArmorClass.Concrete(), 2));
+
+        // -- neutral civilian structures the maps carry -----------------------
+        BuildingDef oil = BuildingDef.Create("CAOILD", "油井",
+            "CAOILD.SHP", 2, 2, 1000, 0, 0, 0, ArmorClass.Steel(), 4);
+        oil.SetRefinery(true);
+        r.civs.Add(oil);
+        r.civs.Add(BuildingDef.Create("CAHOSP", "医院",
+            "CAHOSP.SHP", 2, 2, 800, 0, 0, 0, ArmorClass.Concrete(), 4));
+        r.civs.Add(BuildingDef.Create("CABHUT", "小木屋",
+            "CABHUT.SHP", 1, 1, 2000, 0, 0, 0, ArmorClass.Wood(), 4));
+        r.civs.Add(BuildingDef.Create("CAGAS01", "加油站",
+            "CAGAS01.SHP", 1, 1, 600, 0, 0, 0, ArmorClass.Wood(), 4));
+        r.civs.Add(BuildingDef.Create("CAMIAM01", "公寓",
+            "CAMIAM01.SHP", 2, 2, 800, 0, 0, 0, ArmorClass.Wood(), 4));
+        r.civs.Add(BuildingDef.Create("CANWY24", "写字楼",
+            "CANWY24.SHP", 2, 2, 800, 0, 0, 0, ArmorClass.Steel(), 4));
+        r.civs.Add(BuildingDef.Create("GASPOT", "了望塔",
+            "GASPOT.SHP", 1, 1, 400, 0, 0, 0, ArmorClass.Wood(), 4));
+
+        // -- tech-tree aliases, the shipped [General] values ------------------
+        r.preqPower = Rules.Csv("GAPOWR,NAPOWR");
+        r.preqFactory = Rules.Csv("GAWEAP,NAWEAP");
+        r.preqBarracks = Rules.Csv("NAHAND,GAPILE");
+        r.preqRadar = Rules.Csv("GAAIRC,NARADR");
+        r.preqTech = Rules.Csv("GATECH,NATECH");
+        r.preqProc = Rules.Csv("GAREFN,NAREFN");
+
+        // -- the AI's build lists, the shipped [AI] values --------------------
+        r.aiConst = Rules.Csv("GACNST,NACNST");
+        r.aiPower = Rules.Csv("NAPOWR,GAPOWR");
+        r.aiRefinery = Rules.Csv("NAREFN,GAREFN");
+        r.aiBarracks = Rules.Csv("NAHAND,GAPILE");
+        r.aiWeapons = Rules.Csv("GAWEAP,NAWEAP");
+        r.aiTech = Rules.Csv("NATECH,GATECH");
+        r.aiRadar = Rules.Csv("GAAIRC,NARADR");
+        r.aiDefense = Rules.Csv("TESLA,NALASR,NAFLAK,GAPILL");
+
+        // -- economy -----------------------------------------------------------
+        r.startMoney = 10000;
+        r.refineryIncome = 3;
+        r.oilIncome = 1;
+        r.oilCapture = 1000;
+        r.bombDamage = 400;
+        r.bombDelay = 300;
+        r.blackoutTicks = 300;
+        r.freezeTicks = 90;
+        return r;
+    }
+
+    // ---- reading the player's RULES.INI --------------------------------------
+
+    /// <summary>The ruleset for a real game: the transcribed defaults, then
+    /// whatever the install's own RULES.INI still defines layered on top. A
+    /// null or empty document leaves the defaults untouched, which keeps the
+    /// tests -- and machines without an install -- on the exact shipped
+    /// balance.</summary>
+    static Rules Load(IniDocument ini) {
+        Rules r = Rules.Default();
+        if (ini == null || ini.Count() == 0) { return r; }
+        r.ApplyIni(ini);
+        return r;
+    }
+
+    void ApplyIni(IniDocument ini) {
+        // Warheads first: weapons relink against them below.
+        for (int i = 0; i < this.warheads.Count; i = i + 1) {
+            Warhead w = this.warheads[i];
+            IniSection s = ini.Section(w.Name());
+            if (s == null) { continue; }
+            string verses = s.Get("Verses");
+            if (verses.Length > 0) {
+                List<int> v = Rules.ParsePercents(verses);
+                for (int a = 0; a < v.Count && a < ArmorClass.Count();
+                     a = a + 1) {
+                    w.SetVerse(a, v[a]);
+                }
+            }
+            if (s.Contains("CellSpread")) {
+                w.SetSpread(s.GetIntOr("CellSpread", w.Spread()));
+            }
+        }
+        for (int i = 0; i < this.weapons.Count; i = i + 1) {
+            Weapon w = this.weapons[i];
+            IniSection s = ini.Section(w.Name());
+            if (s == null) { continue; }
+            if (s.Contains("Damage")) { w.SetDamage(s.GetIntOr("Damage", w.Damage())); }
+            if (s.Contains("ROF")) { w.SetRof(s.GetIntOr("ROF", w.Rof())); }
+            string range = s.Get("Range");
+            if (range.Length > 0) { w.SetRange(Rules.ParseRange(range)); }
+            string wh = s.Get("Warhead");
+            if (wh.Length > 0 && this.WarheadNamed(wh) != null) {
+                w.SetWarhead(this.WarheadNamed(wh));
+            }
+        }
+        for (int i = 0; i < this.units.Count; i = i + 1) {
+            UnitDef d = this.units[i];
+            IniSection s = ini.Section(d.Reg());
+            if (s == null) { continue; }
+            if (s.Contains("Cost")) { d.SetCost(s.GetIntOr("Cost", d.Cost())); }
+            if (s.Contains("Strength")) { d.SetHp(s.GetIntOr("Strength", d.Hp())); }
+            if (s.Contains("Speed")) { d.SetSpeed(s.GetIntOr("Speed", d.Speed())); }
+            string armor = s.Get("Armor");
+            if (armor.Length > 0) { d.SetArmor(ArmorClass.Parse(armor)); }
+            string image = s.Get("Image");
+            if (image.Length > 0) { d.SetShp(image + ".SHP"); }
+            string primary = s.Get("Primary");
+            if (primary.Length > 0 && this.WeaponNamed(primary) != null) {
+                d.SetPrimary(this.WeaponNamed(primary));
+            }
+            string secondary = s.Get("Secondary");
+            if (secondary.Length > 0 && this.WeaponNamed(secondary) != null) {
+                d.SetSecondary(this.WeaponNamed(secondary));
+            }
+        }
+        for (int i = 0; i < this.buildings.Count; i = i + 1) {
+            BuildingDef d = this.buildings[i];
+            IniSection s = ini.Section(d.Reg());
+            if (s == null) { continue; }
+            if (s.Contains("Cost")) { d.SetCost(s.GetIntOr("Cost", d.Cost())); }
+            if (s.Contains("Strength")) { d.SetHp(s.GetIntOr("Strength", d.Hp())); }
+            if (s.Contains("Power")) { d.SetPower(s.GetIntOr("Power", d.Power())); }
+            if (s.Contains("Drain")) { d.SetDrain(s.GetIntOr("Drain", d.Drain())); }
+        }
+        IniSection general = ini.Section("General");
+        if (general != null) {
+            this.preqPower = Rules.CsvOr(general, "PrerequisitePower",
+                                         this.preqPower);
+            this.preqFactory = Rules.CsvOr(general, "PrerequisiteFactory",
+                                           this.preqFactory);
+            this.preqBarracks = Rules.CsvOr(general, "PrerequisiteBarracks",
+                                            this.preqBarracks);
+            this.preqRadar = Rules.CsvOr(general, "PrerequisiteRadar",
+                                         this.preqRadar);
+            this.preqTech = Rules.CsvOr(general, "PrerequisiteTech",
+                                        this.preqTech);
+            this.preqProc = Rules.CsvOr(general, "PrerequisiteProc",
+                                        this.preqProc);
+        }
+        IniSection ai = ini.Section("AI");
+        if (ai != null) {
+            this.aiConst = Rules.CsvOr(ai, "BuildConst", this.aiConst);
+            this.aiPower = Rules.CsvOr(ai, "BuildPower", this.aiPower);
+            this.aiRefinery = Rules.CsvOr(ai, "BuildRefinery", this.aiRefinery);
+            this.aiBarracks = Rules.CsvOr(ai, "BuildBarracks", this.aiBarracks);
+            this.aiWeapons = Rules.CsvOr(ai, "BuildWeapons", this.aiWeapons);
+            this.aiTech = Rules.CsvOr(ai, "BuildTech", this.aiTech);
+            this.aiRadar = Rules.CsvOr(ai, "BuildRadar", this.aiRadar);
+            this.aiDefense = Rules.CsvOr(ai, "BuildDefense", this.aiDefense);
+        }
+    }
+
+    // ---- small string helpers ------------------------------------------------
+
+    /// <summary>"a,b, c" into ["a","b","c"], dropping blanks.</summary>
+    static List<string> Csv(string s) {
+        List<string> parts = new List<string>();
+        int start = 0;
+        for (int i = 0; i <= s.Length; i = i + 1) {
+            if (i == s.Length || s.Substring(i, 1) == ",") {
+                if (i > start) {
+                    string part = s.Substring(start, i - start).Trim();
+                    if (part.Length > 0) { parts.Add(part); }
+                }
+                start = i + 1;
+            }
+        }
+        return parts;
+    }
+
+    static List<string> CsvOr(IniSection s, string key, List<string> fallback) {
+        string raw = s.Get(key);
+        if (raw.Length == 0) { return fallback; }
+        return Rules.Csv(raw);
+    }
+
+    /// <summary>"100%,80%,..." into [100,80,...]; a bare number works too.</summary>
+    static List<int> ParsePercents(string s) {
+        List<int> parts = new List<int>();
+        int start = 0;
+        for (int i = 0; i <= s.Length; i = i + 1) {
+            if (i == s.Length || s.Substring(i, 1) == ",") {
+                if (i > start) {
+                    string part = s.Substring(start, i - start).Trim();
+                    if (part.Length > 0) {
+                        if (part.Substring(part.Length - 1, 1) == "%") {
+                            part = part.Substring(0, part.Length - 1);
+                        }
+                        parts.Add(Convert.ToInt32(part));
+                    }
+                }
+                start = i + 1;
+            }
+        }
+        return parts;
+    }
+
+    /// <summary>RA2 ranges are fractional ("5.5"); the grid wants whole
+    /// cells, rounded up so a gunner keeps his published reach.</summary>
+    static int ParseRange(string s) {
+        string t = s.Trim();
+        int dot = -1;
+        for (int i = 0; i < t.Length; i = i + 1) {
+            if (t.Substring(i, 1) == ".") { dot = i; break; }
+        }
+        if (dot < 0) { return Convert.ToInt32(t); }
+        int whole = Convert.ToInt32(t.Substring(0, dot));
+        string frac = t.Substring(dot + 1, t.Length - dot - 1).Trim();
+        if (frac.Length > 0 && frac != "0") { whole = whole + 1; }
+        return whole;
+    }
+}
