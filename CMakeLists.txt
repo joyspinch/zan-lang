@@ -1023,6 +1023,21 @@ add_test(NAME diag_scalar_member_access
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_scalar_member_access PROPERTIES TIMEOUT 60)
 
+# Reading `obj.name` where the class (or its base chain) declares no such
+# member must be a compile error: irgen used to fold the read to the constant
+# 0, so a renamed or deleted field kept compiling and produced a wrong number
+# or a null-pointer crash at runtime. Only the assignment side was diagnosed.
+foreach(_member_read_case class_member_read class_member_read_inherited)
+  add_test(NAME diag_${_member_read_case}
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/${_member_read_case}.zan
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_${_member_read_case}${_exe_ext}
+      "-DEXPECT_REGEX=has no member"
+      -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+  set_tests_properties(diag_${_member_read_case} PROPERTIES TIMEOUT 60)
+endforeach()
+
 # An unresolved static factory at the head of a method chain must be a compile
 # error: the unclaimed outer call never emitted its receiver, so the missing
 # method went unreported and the chain crashed at runtime.

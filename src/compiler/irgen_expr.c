@@ -28,6 +28,23 @@
 static LLVMValueRef emit_method_group_closure(zan_irgen_t *g, zan_symbol_t *msym,
                                               LLVMValueRef recv, zan_loc_t loc);
 
+/* Whether `cls` or one of its base classes declares a member named `name`,
+ * of any kind (field, method, property, event, constant). */
+static int type_declares_member(zan_symbol_t *cls, zan_istr_t name) {
+    while (cls) {
+        for (int i = 0; i < cls->member_count; i++) {
+            zan_symbol_t *m = cls->members[i];
+            if (m && m->name.len == name.len &&
+                memcmp(m->name.str, name.str, (size_t)name.len) == 0)
+                return 1;
+        }
+        zan_symbol_t *base = (cls->type && cls->type->base_type)
+            ? cls->type->base_type->sym : NULL;
+        cls = (base && base != cls) ? base : NULL;
+    }
+    return 0;
+}
+
 /* i8* pointer to (base + off); base/off are i64 values. */
 static LLVMValueRef nm_addr(zan_irgen_t *g, LLVMValueRef base, LLVMValueRef off) {
     LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
@@ -2241,22 +2258,7 @@ binding_lowered:
                 }
                 if (acls && (acls->kind == SYM_CLASS || acls->kind == SYM_STRUCT)) {
                     zan_istr_t an = expr->binary.left->member.name;
-                    int afound = 0;
-                    zan_symbol_t *acur = acls;
-                    while (acur && !afound) {
-                        for (int ami = 0; ami < acur->member_count; ami++) {
-                            zan_symbol_t *am = acur->members[ami];
-                            if (am && am->name.len == an.len &&
-                                memcmp(am->name.str, an.str, an.len) == 0) {
-                                afound = 1;
-                                break;
-                            }
-                        }
-                        zan_symbol_t *abase = (acur->type && acur->type->base_type)
-                            ? acur->type->base_type->sym : NULL;
-                        acur = (abase && abase != acur) ? abase : NULL;
-                    }
-                    if (!afound) {
+                    if (!type_declares_member(acls, an)) {
                         zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
                             "'%.*s' has no member '%.*s'",
                             (int)acls->name.len, acls->name.str,
@@ -2928,6 +2930,28 @@ static LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr
                     return LLVMConstNull(
                         LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0));
                 }
+            }
+        }
+        /* Robustness: reading `obj.name` where obj's class (or its base chain)
+         * declares no such member fell through to the constant 0 below -- a
+         * renamed or removed field then read as a wrong number, or crashed the
+         * program when the zero was used as a pointer. The assignment form is
+         * already diagnosed; the read is diagnosed the same way. */
+        {
+            zan_symbol_t *rcls = expr_class_sym(g, expr->member.object, locals);
+            if (!rcls && expr->member.object->kind == AST_IDENTIFIER &&
+                !local_find(locals, expr->member.object->ident.name)) {
+                zan_symbol_t *ts = zan_binder_lookup(g->binder,
+                                                     expr->member.object->ident.name);
+                if (ts && (ts->kind == SYM_CLASS || ts->kind == SYM_STRUCT))
+                    rcls = ts;
+            }
+            if (rcls && (rcls->kind == SYM_CLASS || rcls->kind == SYM_STRUCT) &&
+                !type_declares_member(rcls, expr->member.name)) {
+                zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+                    "'%.*s' has no member '%.*s'",
+                    (int)rcls->name.len, rcls->name.str,
+                    (int)expr->member.name.len, expr->member.name.str);
             }
         }
         return LLVMConstInt(LLVMInt64TypeInContext(g->ctx), 0, 0);
