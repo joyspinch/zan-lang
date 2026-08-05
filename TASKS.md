@@ -1193,6 +1193,25 @@ async generic 调 async generic、frame 内 catch、异常穿出到 awaiter、
 | A43-B18 | `init` 访问器、`readonly struct` / `ref struct` | 09 | 无对应修饰符 |
 | A43-B19 | 可空元素数组 `int?[]` | a11b | `expected variable name`；`int?` 本身已支持 |
 
+## A43-C1 类型化查询不能跨语句组装（dbgen，已记录未修）
+
+`this.Post.Where(a => ...).OrderByDescending(a => a.id).ToListAsync()` 只在
+**一整条链**里成立：dbgen 降级时消化整条链，查询对象本身不是可传递的值。探针
+（`_scratch/`，已删）：
+
+```zan
+var sel = db.Select<PItem>().Where(x => x.status == 1);
+sel = sel.OrderByDescending(x => x.id);   // error: 'string' has no member 'OrderByDescending'
+```
+
+写成生成类型名 `__DbQ_PItem sel = ...` 同样报 `'__DbQ_PItem' has no member
+'OrderByDescending'`——lambda 形态的 `OrderBy/Where` 只在链内识别；`var` 还把查询
+推断成了 `string`（第二个缺陷）。
+
+后果：列表页「按哪一列排序」只能每个排序键一个分支（模板 `Admin/Posts.Index`
+就是这个形状），字段一多会膨胀。**不要在 Zan 侧绕**；配置驱动 CRUD（按配置排序
+任意列）之前先修：查询对象要成为可命名、可赋值、可跨语句追加的一等值。
+
 > 已实测可用、别再当缺失：带参构造器与重载、`: this(...)` / `: base(...)`、方法重载、
 > `public/private/protected/internal`、`partial`、`#region/#endregion`、`const`、
 > `static readonly`（读侧）、属性 get/set、泛型类/方法/具名约束、interface、delegate、

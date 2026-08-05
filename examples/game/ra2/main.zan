@@ -21,6 +21,57 @@ class Ra2App {
     [DllImport("crt")]
     static extern void memset(string p, int v, int n);
 
+    // Writes a 24-bit BMP of the SDL backbuffer at the renderer's actual
+    // output size, so the shell screens -- which draw straight to the renderer
+    // rather than the CPU canvas -- can be captured. Used by the self-test to
+    // emit regression screenshots of the menu, setup and game screens.
+    static void DumpScreen(string path, SdlRenderer r) {
+        int packed = r.OutputSize();
+        int w = packed & 0xFFFF;
+        int h = (packed >> 16) & 0xFFFF;
+        if (w <= 0 || h <= 0) { return; }
+        byte[] rgba = new byte[w * h * 4];
+        if (!r.ReadPixels(rgba, w, h)) { return; }
+        int rowBytes = w * 3;
+        int pad = (4 - (rowBytes % 4)) % 4;
+        int imageBytes = (rowBytes + pad) * h;
+        byte[] bmp = new byte[54 + imageBytes];
+        bmp[0] = (byte)0x42;
+        bmp[1] = (byte)0x4D;
+        Ra2App.PutU32(bmp, 2, 54 + imageBytes);
+        Ra2App.PutU32(bmp, 10, 54);
+        Ra2App.PutU32(bmp, 14, 40);
+        Ra2App.PutI32(bmp, 18, w);
+        Ra2App.PutI32(bmp, 22, h);
+        bmp[26] = (byte)1;
+        bmp[28] = (byte)24;
+        for (int y = 0; y < h; y = y + 1) {
+            int dstRow = 54 + y * (rowBytes + pad);
+            int srcRow = (h - 1 - y) * w * 4;
+            for (int x = 0; x < w; x = x + 1) {
+                int o = srcRow + x * 4;
+                bmp[dstRow + x * 3] = rgba[o + 2];
+                bmp[dstRow + x * 3 + 1] = rgba[o + 1];
+                bmp[dstRow + x * 3 + 2] = rgba[o];
+            }
+        }
+        File.WriteAllBytes(path, bmp);
+    }
+
+    static void PutU32(byte[] b, int at, int v) {
+        b[at] = (byte)(v & 0xFF);
+        b[at + 1] = (byte)((v >> 8) & 0xFF);
+        b[at + 2] = (byte)((v >> 16) & 0xFF);
+        b[at + 3] = (byte)((v >> 24) & 0xFF);
+    }
+
+    static void PutI32(byte[] b, int at, int v) {
+        b[at] = (byte)(v & 0xFF);
+        b[at + 1] = (byte)((v >> 8) & 0xFF);
+        b[at + 2] = (byte)((v >> 16) & 0xFF);
+        b[at + 3] = (byte)((v >> 24) & 0xFF);
+    }
+
     static int ViewW() { return 1280; }
     static int ViewH() { return 720; }
 
@@ -57,6 +108,411 @@ class Ra2App {
 
     static int PreviewW() { return 396; }
     static int PreviewH() { return 212; }
+    static int MiniW() { return 220; }
+    static int MiniH() { return 140; }
+
+    // The camera is an integer zoom (1:2, 1:1, 2:1); the terrain is drawn
+    // into a full-res canvas and the view then scales the span to the window,
+    // so a mouse coordinate needs the inverse to land on the terrain pixel.
+    static int ScaleX(int viewX, int num, int den) { return viewX * num / den; }
+    static int ScaleY(int viewY, int num, int den) { return viewY * num / den; }
+
+    /// <summary>The in-game right sidebar: the build menu (nine buildings,
+    /// three columns of three), the player's and enemy's credits, and -- when a
+    /// production structure is selected -- the units it can train. The armed
+    /// build is highlighted so a click on the map knows where it will land.</summary>
+    static void DrawSidebar(SdlRenderer r, GameController game, ObjectArt art,
+                            int mouseX, int mouseY) {
+        int w = 296;
+        int x = Ra2App.ViewW() - w;
+        int y = 16;
+        int bh = 54;
+        int bw = 82;
+        int armed = game.BuildingId();
+        StructureCatalog catalog = game.World().Catalog();
+        int side = game.Side();
+        Ui.Panel(r, x + 8, y - 4, w - 16, 3 * bh + 40, 22, 26, 36, 200);
+        Text.Draw(r, "建造", x + 22, y + 4, 2, 236, 208, 120, 255);
+        int i = 0;
+        for (; i < 9; i = i + 1) {
+            int bx = x + 14 + (i % 3) * (bw + 8);
+            int by = y + 30 + (i / 3) * (bh + 5);
+            int kind = 0;
+            if (i == armed) { kind = 2; }
+            // The building's own finished art as a small icon above its label,
+            // so the menu reads as real RA2 buildings rather than text rows.
+            Texture icon = art.StructureTexture(side, i, catalog, 1, 1);
+            int labelY = by + bh - 22;
+            if (icon != null) {
+                int iw = icon.Width();
+                int ih = icon.Height();
+                int maxW = bw - 20;
+                int maxH = bh - 32;
+                int sc = 1;
+                int cw = iw;
+                int ch = ih;
+                while ((cw > maxW || ch > maxH) && sc < 8) {
+                    sc = sc + 1;
+                    cw = iw / sc;
+                    ch = ih / sc;
+                }
+                r.DrawTexture(icon, bx + (bw - cw) / 2, by + 4, cw, ch);
+                labelY = by + bh - 20;
+            }
+            // Ui.Button would redraw over the icon, so draw the button frame
+            // and the label separately.
+            Ra2App.ButtonFrame(r, mouseX, mouseY, bx, by, bw, bh, kind);
+            Text.DrawCentered(r, StructureLabel(catalog, side, i),
+                              bx + bw / 2, labelY, 1, 236, 236, 236, 255);
+        }
+        string powerText = "电力 " + Convert.ToString(game.Power());
+        if (game.LowPower()) { powerText = "电力 不足!"; }
+        Text.Draw(r, "资金 " + Convert.ToString(game.Money())
+                  + "   敌方 " + Convert.ToString(game.AiMoney()),
+                  x + 22, y + 32 + 3 * bh + 8, 2, 170, 178, 192, 255);
+        Text.Draw(r, powerText, x + 22, y + 32 + 3 * bh + 30, 2,
+                  game.LowPower() ? 232 : 170,
+                  game.LowPower() ? 92 : 178,
+                  game.LowPower() ? 92 : 192, 255);
+        Ra2App.DrawProduction(r, game, mouseX, mouseY);
+    }
+
+    /// <summary>The button's chrome without its label, so a caller can put an
+    /// icon inside and draw the text where it fits. kind: 0 normal, 1 accent,
+    /// 2 selected.</summary>
+    static void ButtonFrame(SdlRenderer r, int mx, int my, int x, int y,
+                            int w, int h, int kind) {
+        bool hov = Draw.PointIn(mx, my, x, y, w, h);
+        int mr = 58; int mg = 64; int mb = 80;
+        int dr = 30; int dg = 34; int db = 46;
+        if (kind == 1) {
+            mr = 52; mg = 138; mb = 92; dr = 30; dg = 96; db = 62;
+            if (hov) { mr = 64; mg = 162; mb = 108; }
+        } else if (kind == 2) {
+            mr = 224; mg = 176; mb = 66; dr = 196; dg = 146; db = 40;
+        } else if (hov) {
+            mr = 74; mg = 82; mb = 102; dr = 42; dg = 48; db = 62;
+        }
+        int rad = 12;
+        if (hov) {
+            int gr = 120; int gg = 180; int gb = 240;
+            if (kind == 1) { gr = 120; gg = 230; gb = 170; }
+            if (kind == 2) { gr = 250; gg = 210; gb = 110; }
+            Draw.RoundRectFill(r, x - 5, y - 5, w + 10, h + 10, rad + 5, gr, gg, gb, 55);
+        }
+        Draw.RoundRectFill(r, x - 2, y - 2, w + 4, h + 4, rad + 2, 8, 10, 16, 240);
+        Draw.RoundRectFill(r, x, y, w, h, rad, mr, mg, mb, 255);
+        Draw.RoundRectFill(r, x + 2, y + h / 2, w - 4, h / 2 - 3, rad, dr, dg, db, 150);
+        Draw.RoundRectFill(r, x + 3, y + 3, w - 6, h / 2 - 3, rad, 255, 255, 255, 38);
+    }
+
+    static bool InSidebar(int mx) {
+        return mx >= Ra2App.ViewW() - 296 && mx < Ra2App.ViewW() - 8;
+    }
+
+    /// <summary>The production panel sits below the build menu: the selected
+    /// structure's trainable units, each with its cost, and a progress bar for
+    /// what its queue is already building.</summary>
+    static int ProdPanelY() {
+        int y = 16;
+        int bh = 58;
+        return y + 32 + 3 * bh + 8 + 56;
+    }
+    static int ProdBtnW() { return 130; }
+    static int ProdBtnH() { return 42; }
+    static int ProdBtnX(int i) { return Ra2App.ViewW() - 296 + 18 + (i % 2) * (Ra2App.ProdBtnW() + 8); }
+    static int ProdBtnY(int i) { return Ra2App.ProdPanelY() + 26 + (i / 2) * (Ra2App.ProdBtnH() + 8); }
+
+    /// <summary>How many units the selected structure can train, or 0 when
+    /// nothing producing is selected.</summary>
+    static int ProdCount(GameController game) {
+        WorldObject sel = game.World().Selected();
+        if (sel == null || sel.Kind() != ObjKind.Structure()) { return 0; }
+        if (sel.Side() != game.Side()) { return 0; }   // enemy buildings hide
+        StructureType t = game.World().Catalog().TypeFor(sel.Side(), sel.BuildId());
+        List<int> prod = t.Produces();
+        if (prod == null) { return 0; }
+        return prod.Count;
+    }
+
+    static int ProdUnitAt(GameController game, int i) {
+        WorldObject sel = game.World().Selected();
+        StructureType t = game.World().Catalog().TypeFor(sel.Side(), sel.BuildId());
+        return t.Produces()[i];
+    }
+
+    /// <summary>The unit id under the cursor in the production panel, or -1
+    /// when nothing produces is selected or the cursor is elsewhere.</summary>
+    static int HitProduction(GameController game, int mx, int my) {
+        int n = Ra2App.ProdCount(game);
+        for (int i = 0; i < n; i = i + 1) {
+            if (Draw.PointIn(mx, my, Ra2App.ProdBtnX(i), Ra2App.ProdBtnY(i),
+                             Ra2App.ProdBtnW(), Ra2App.ProdBtnH())) {
+                return Ra2App.ProdUnitAt(game, i);
+            }
+        }
+        return -1;
+    }
+
+    static void DrawProduction(SdlRenderer r, GameController game,
+                               int mouseX, int mouseY) {
+        int n = Ra2App.ProdCount(game);
+        if (n == 0) { return; }
+        int x = Ra2App.ViewW() - 296;
+        int y = Ra2App.ProdPanelY();
+        Ui.Panel(r, x + 8, y - 8, 280,
+                 ((n + 1) / 2) * (Ra2App.ProdBtnH() + 8) + 24, 22, 26, 36, 190);
+        Text.Draw(r, "训练", x + 22, y + 2, 2, 236, 208, 120, 255);
+        WorldObject sel = game.World().ObjectAt(game.World().SelectedIndex());
+        for (int i = 0; i < n; i = i + 1) {
+            int id = Ra2App.ProdUnitAt(game, i);
+            int bx = Ra2App.ProdBtnX(i);
+            int by = Ra2App.ProdBtnY(i);
+            UnitType u = game.World().Units().TypeFor(sel.Side(), id);
+            string label = u.Label() + "  " + Convert.ToString(u.Cost());
+            int kind = 0;
+            if (u.Cost() > game.Money()) { kind = 1; }
+            Ui.Button(r, mouseX, mouseY, bx, by, Ra2App.ProdBtnW(),
+                      Ra2App.ProdBtnH(), label, 2, kind);
+            // The first queued unit's progress, drawn as a thin bar over the
+            // button so the player sees training ticking.
+            if (i == 0 && sel.ProdCount() > 0) {
+                int total = u.BuildTime();
+                int left = sel.ProdLeftAt(0);
+                int fill = 0;
+                if (total > 0) { fill = (total - left) * (Ra2App.ProdBtnW() - 8) / total; }
+                Draw.RoundRectFill(r, bx + 4, by + Ra2App.ProdBtnH() - 7,
+                                   fill, 4, 2, 120, 200, 120, 200);
+            }
+        }
+    }
+
+    /// <summary>Draws the build placement ghost: the armed structure's
+    /// footprint outlined at the cell under the cursor, green when the spot is
+    /// free and red when blocked, so the player sees where a click will land
+    /// before committing.</summary>
+    static void DrawGhost(Texture canvas, GameController game, int mouseX,
+                          int mouseY, int originX, int originY, Camera cam) {
+        int buildId = game.BuildingId();
+        if (buildId < 0) { return; }
+        StructureType t = game.World().Catalog().TypeFor(game.Side(), buildId);
+        if (t == null) { return; }
+        int wx = cam.X() + Ra2App.ScaleX(mouseX, cam.ZoomNum(), cam.ZoomDen());
+        int wy = cam.Y() + Ra2App.ScaleY(mouseY, cam.ZoomNum(), cam.ZoomDen());
+        List<int> xy = new List<int>();
+        xy.Add(0);
+        xy.Add(0);
+        IsoProjection.CellAt(wx + originX, wy + originY, xy);
+        int cx = xy[0];
+        int cy = xy[1];
+        bool ok = game.World().CanPlaceBuilding(game.Side(), buildId, cx, cy);
+        int r = ok ? 80 : 232;
+        int g = ok ? 200 : 60;
+        int b = ok ? 80 : 60;
+        int a = 110;
+        for (int dy = 0; dy < t.FootprintH(); dy = dy + 1) {
+            for (int dx = 0; dx < t.FootprintW(); dx = dx + 1) {
+                int scx = IsoProjection.ScreenX(cx + dx, cy + dy) - originX - cam.X();
+                int scy = IsoProjection.ScreenY(cx + dx, cy + dy, 0) - originY - cam.Y();
+                Ra2App.FillDiamond(canvas, scx, scy, r, g, b, a);
+            }
+        }
+    }
+
+    /// <summary>Fills the isometric diamond of one cell on the CPU canvas.</summary>
+    static void FillDiamond(Texture canvas, int cx, int cy, int r, int g,
+                            int b, int a) {
+        int hw = IsoProjection.HalfW();
+        int hh = IsoProjection.HalfH();
+        for (int y = 0; y < IsoProjection.TileH(); y = y + 1) {
+            int half = hw - (y < hh ? y : IsoProjection.TileH() - 1 - y)
+                       * hw / hh;
+            for (int x = hw - half; x < hw + half; x = x + 1) {
+                int px = cx + x;
+                int py = cy + y;
+                if (px >= 0 && py >= 0 && px < canvas.Width()
+                 && py < canvas.Height()) {
+                    canvas.SetPixel(py * canvas.Width() + px, r, g, b, a);
+                }
+            }
+        }
+    }
+
+    /// <summary>Shows what the selected object is: name, health and its
+    /// combat or power stats, drawn under the top HUD panel. When several
+    /// units are selected, shows the group size instead of one name.</summary>
+    static void DrawSelectionInfo(SdlRenderer r, GameController game) {
+        int n = game.World().SelectionCount();
+        if (n <= 0) { return; }
+        if (n > 1) {
+            Ui.Panel(r, 12, 96, 560, 40, 18, 22, 32, 200);
+            Text.Draw(r, "已选 " + Convert.ToString(n) + " 个单位",
+                      28, 108, 2, 236, 236, 236, 255);
+            return;
+        }
+        string info = game.SelectedInfo();
+        if (info == null || info.Length == 0) { return; }
+        Ui.Panel(r, 12, 96, 560, 40, 18, 22, 32, 200);
+        Text.Draw(r, info, 28, 108, 2, 236, 236, 236, 255);
+    }
+
+    /// <summary>A centred pause banner while the game clock is stopped.</summary>
+    static void DrawPaused(SdlRenderer r, GameController game, int viewW,
+                           int viewH) {
+        if (!game.Paused()) { return; }
+        Draw.RoundRectFill(r, 0, 0, viewW, viewH, 0, 4, 6, 12, 90);
+        Text.DrawCenteredShadow(r, "已暂停  (按 P 继续)", viewW / 2,
+                                viewH / 2 - 40, 6, 236, 208, 120, 3);
+    }
+
+    /// <summary>A small hint under the cursor when move-attack is armed, so the
+    /// player knows the next click is an attack-move rather than a select.</summary>
+    static void DrawMoveAttackHint(SdlRenderer r, GameController game, int mx,
+                                   int my) {
+        if (!game.MoveAttackArmed()) { return; }
+        int w = 120;
+        int h = 24;
+        int x = mx + 16;
+        int y = my + 16;
+        if (x + w > Ra2App.ViewW()) { x = mx - w - 16; }
+        if (y + h > Ra2App.ViewH()) { y = my - h - 16; }
+        Draw.RoundRectFill(r, x, y, w, h, 6, 200, 60, 60, 220);
+        Text.DrawCentered(r, "移动攻击", x + w / 2, y + 5, 2,
+                          255, 255, 255, 255);
+    }
+
+    /// <summary>The in-game minimap: terrain backdrop, a frame showing the
+    /// current view, and dots for every object -- green for the player's,
+    /// red for the enemy's. Drawn into the sidebar's lower corner.</summary>
+    static void DrawMinimap(SdlRenderer r, SdlTexture minimap, World world,
+                            GameController game, Camera cam,
+                            MapRenderer terrain, int mx, int my,
+                            bool clicked) {
+        if (minimap == null) { return; }
+        int x = Ra2App.ViewW() - 296 + 8;
+        int y = Ra2App.ViewH() - Ra2App.MiniH() - 30;
+        r.DrawTexture(minimap, x, y, Ra2App.MiniW(), Ra2App.MiniH());
+        // A hairline frame.
+        r.SetColor(150, 158, 172, 255);
+        r.DrawRect(x, y, Ra2App.MiniW(), Ra2App.MiniH());
+
+        // The visible region as a rectangle on the minimap.
+        int vx = cam.X() * Ra2App.MiniW() / terrain.WorldWidth();
+        int vy = cam.Y() * Ra2App.MiniH() / terrain.WorldHeight();
+        int vw = cam.SpanW() * Ra2App.MiniW() / terrain.WorldWidth();
+        int vh = cam.SpanH() * Ra2App.MiniH() / terrain.WorldHeight();
+        if (vw < 4) { vw = 4; }
+        if (vh < 4) { vh = 4; }
+        r.SetColor(236, 208, 120, 255);
+        r.DrawRect(x + vx, y + vy, vw, vh);
+
+        // Object dots: each object projects to one minimap pixel.
+        for (int i = 0; i < world.ObjectCount(); i = i + 1) {
+            WorldObject o = world.ObjectAt(i);
+            if (o.IsDead()) { continue; }
+            int wx = IsoProjection.ScreenX(o.X(), o.Y()) - terrain.OriginX();
+            int wy = IsoProjection.ScreenY(o.X(), o.Y(), 0) - terrain.OriginY();
+            int px = x + wx * Ra2App.MiniW() / terrain.WorldWidth();
+            int py = y + wy * Ra2App.MiniH() / terrain.WorldHeight();
+            if (px < x || py < y || px >= x + Ra2App.MiniW()
+             || py >= y + Ra2App.MiniH()) { continue; }
+            bool mine = o.Side() == game.Side();
+            r.SetColor(mine ? 120 : 232, mine ? 200 : 60, 60, 255);
+            r.FillRect(px, py, 3, 3);
+        }
+
+        // Click jumps the camera to the clicked point.
+        if (clicked && Draw.PointIn(mx, my, x, y, Ra2App.MiniW(), Ra2App.MiniH())) {
+            int cwx = (mx - x) * terrain.WorldWidth() / Ra2App.MiniW();
+            int cwy = (my - y) * terrain.WorldHeight() / Ra2App.MiniH();
+            cam.MoveTo(cwx - cam.SpanW() / 2, cwy - cam.SpanH() / 2);
+        }
+    }
+
+    /// <summary>Converts two view coordinates to cells and box-selects all own
+    /// units inside, or shift-adds the units to the existing selection.</summary>
+    static void BoxSelect(GameController game, MapRenderer terrain, Camera cam,
+                          int x0, int y0, int x1, int y1, bool add) {
+        if (game == null || terrain == null || cam == null) { return; }
+        List<int> a = new List<int>();
+        List<int> b = new List<int>();
+        a.Add(0); a.Add(0); b.Add(0); b.Add(0);
+        Ra2App.ViewToCell(terrain, cam, x0, y0, a);
+        Ra2App.ViewToCell(terrain, cam, x1, y1, b);
+        if (add) {
+            // Shift-drag: select units in the box without clearing the rest.
+            World w = game.World();
+            int loX = a[0] < b[0] ? a[0] : b[0];
+            int hiX = a[0] > b[0] ? a[0] : b[0];
+            int loY = a[1] < b[1] ? a[1] : b[1];
+            int hiY = a[1] > b[1] ? a[1] : b[1];
+            for (int i = 0; i < w.ObjectCount(); i = i + 1) {
+                WorldObject o = w.ObjectAt(i);
+                if (o.Side() != game.Side() || o.Kind() != ObjKind.Unit()) { continue; }
+                if (o.X() >= loX && o.X() <= hiX && o.Y() >= loY && o.Y() <= hiY) {
+                    w.AddToSelection(o.X(), o.Y());
+                }
+            }
+        } else {
+            game.World().SelectBox(a[0], a[1], b[0], b[1], game.Side());
+        }
+    }
+
+    /// <summary>Shift-click: add whatever is under the cursor to the current
+    /// selection.</summary>
+    static void ClickAdd(GameController game, MapRenderer terrain, Camera cam,
+                         int mx, int my) {
+        if (game == null || terrain == null || cam == null) { return; }
+        List<int> c = new List<int>();
+        c.Add(0); c.Add(0);
+        Ra2App.ViewToCell(terrain, cam, mx, my, c);
+        game.World().AddToSelection(c[0], c[1]);
+    }
+
+    /// <summary>Screen (view) coordinates to a cell.</summary>
+    static void ViewToCell(MapRenderer terrain, Camera cam, int mx, int my,
+                           List<int> outCell) {
+        int wx = cam.X() + Ra2App.ScaleX(mx, cam.ZoomNum(), cam.ZoomDen());
+        int wy = cam.Y() + Ra2App.ScaleY(my, cam.ZoomNum(), cam.ZoomDen());
+        IsoProjection.CellAt(wx + terrain.OriginX(), wy + terrain.OriginY(),
+                             outCell);
+    }
+
+    /// <summary>Draws the selection rectangle while a left-drag is in progress.</summary>
+    static void DrawBox(SdlRenderer r, int x0, int y0, int x1, int y1) {
+        int loX = x0 < x1 ? x0 : x1;
+        int hiX = x0 > x1 ? x0 : x1;
+        int loY = y0 < y1 ? y0 : y1;
+        int hiY = y0 > y1 ? y0 : y1;
+        r.SetColor(120, 200, 120, 40);
+        r.FillRect(loX, loY, hiX - loX, hiY - loY);
+        r.SetColor(180, 236, 180, 255);
+        r.DrawRect(loX, loY, hiX - loX, hiY - loY);
+    }
+
+    /// <summary>End-of-game overlay: who won, and a hint that Esc leaves.</summary>
+    static void DrawResult(SdlRenderer r, int result, int viewW, int viewH) {
+        if (result == 0) { return; }
+        Draw.RoundRectFill(r, 0, 0, viewW, viewH, 0, 4, 6, 12, 180);
+        string title = "战败";
+        int tc = 232;
+        if (result == 1) { title = "胜利"; tc = 120; }
+        if (result == 3) { title = "僵持"; tc = 170; }
+        int pw = 420;
+        int ph = 220;
+        int px = viewW / 2 - pw / 2;
+        int py = viewH / 2 - ph / 2;
+        Ui.Panel(r, px, py, pw, ph, 22, 26, 36, 240);
+        Text.DrawCenteredShadow(r, title, viewW / 2, py + 50, 6, tc, 236, 208, 3);
+        Text.DrawCentered(r, "按 Esc 返回", viewW / 2, py + 150, 3,
+                          170, 178, 192, 255);
+    }
+
+    static string StructureLabel(StructureCatalog catalog, int side, int buildId) {
+        StructureType t = catalog.TypeFor(side, buildId);
+        if (t == null) { return ""; }
+        return t.Label();
+    }
 
     /// <summary>A thumbnail of a map's terrain, or null when it will not open.
     /// The theater is loaded and dropped here: a preview touches every tile
@@ -77,6 +533,21 @@ class Ra2App {
         tex.Update(canvas.Pixels(), canvas.Width() * 4);
         canvas.Close();
         th.Close();
+        return tex;
+    }
+
+    /// <summary>Builds the in-game minimap backdrop: a small version of the
+    /// terrain, rendered once when a game loads. The object dots and view
+    /// frame are drawn over it every frame.</summary>
+    static SdlTexture BuildMinimap(SdlRenderer r, MapRenderer terrain) {
+        Texture canvas = Texture.Create(Ra2App.MiniW(), Ra2App.MiniH());
+        Ra2App.memset(canvas.Pixels(), 0, canvas.ByteLength());
+        terrain.RenderPreview(canvas);
+        SdlTexture tex = SdlTexture.CreateRgba32(r, canvas.Width(),
+            canvas.Height(), true);
+        tex.SetBlendMode(1);
+        tex.Update(canvas.Pixels(), canvas.Width() * 4);
+        canvas.Close();
         return tex;
     }
 
@@ -109,6 +580,10 @@ class Ra2App {
         Camera cam = null;
         Texture canvas = null;
         SdlTexture screen = null;
+        World world = null;
+        ObjectArt objArt = null;
+        GameController game = null;
+        SdlTexture minimap = null;
         int loadedIndex = -1;
         bool dirty = false;
         int drawn = 0;
@@ -125,8 +600,17 @@ class Ra2App {
         bool selfTest = Ra2App.SelfTestArmed();
         int frames = 0;
 
+        // Box-select state: the cell where a left-drag began and whether a
+        // drag is in progress. A drag wider than a few pixels selects the
+        // rectangle; a click is handled as a normal SelectAt.
+        int dragStartX = 0;
+        int dragStartY = 0;
+        bool dragging = false;
+
         while (host.Running()) {
             bool clicked = false;
+            bool rightClicked = false;
+            bool tickNow = false;
             while (SdlEvent.Poll()) {
                 int ty = SdlEvent.Type();
                 host.OnWindowEvent(ty);
@@ -134,13 +618,64 @@ class Ra2App {
                 if (ty == SdlEventType.MouseMotion()) {
                     mouseX = host.MouseX();
                     mouseY = host.MouseY();
+                    // The build ghost follows the cursor, so a move while a
+                    // build is armed must recomposite the canvas. So does a
+                    // box-select drag, to show the live selection rectangle.
+                    if (shell.CurrentScene() == 2 && game != null
+                     && (game.BuildingId() >= 0 || dragging)) {
+                        dirty = true;
+                    }
                 }
                 if (ty == SdlEventType.MouseButtonDown()) {
+                    mouseX = host.MouseX();
+                    mouseY = host.MouseY();
                     if (SdlEvent.MouseButton() == SdlMouseButton.Left()) {
-                        mouseX = host.MouseX();
-                        mouseY = host.MouseY();
+                        if (shell.CurrentScene() == 2 && game != null
+                         && !Ra2App.InSidebar(mouseX)) {
+                            // Start a potential box drag; on release, if the
+                            // mouse barely moved it is a click-select.
+                            dragging = true;
+                            dragStartX = mouseX;
+                            dragStartY = mouseY;
+                        } else {
+                            clicked = true;
+                        }
+                    }
+                    if (SdlEvent.MouseButton() == SdlMouseButton.Right()) {
+                        rightClicked = true;
+                        dragging = false;
+                    }
+                }
+                if (ty == SdlEventType.MouseButtonUp()
+                 && SdlEvent.MouseButton() == SdlMouseButton.Left()
+                 && dragging) {
+                    dragging = false;
+                    mouseX = host.MouseX();
+                    mouseY = host.MouseY();
+                    // A drag of a few pixels is a box select; otherwise it is
+                    // a plain click.
+                    int dx = mouseX - dragStartX;
+                    if (dx < 0) { dx = 0 - dx; }
+                    int dy = mouseY - dragStartY;
+                    if (dy < 0) { dy = 0 - dy; }
+                    bool shiftNow = SdlScancode.IsDown(225)      // LSHIFT
+                                 || SdlScancode.IsDown(229);     // RSHIFT
+                    if (dx > 6 || dy > 6) {
+                        Ra2App.BoxSelect(game, terrain, cam, dragStartX,
+                                         dragStartY, mouseX, mouseY, shiftNow);
+                    } else if (shiftNow) {
+                        // Shift-click: add to the selection.
+                        Ra2App.ClickAdd(game, terrain, cam, mouseX, mouseY);
+                    } else {
                         clicked = true;
                     }
+                }
+                if (ty == SdlEventType.MouseWheel()
+                 && shell.CurrentScene() == 2 && cam != null) {
+                    // Wheel scroll zooms, anchored to the view centre.
+                    double dy = SdlEvent.MouseDeltaY();
+                    if (dy > 0.5) { cam.ZoomBy(1); dirty = true; }
+                    if (dy < -0.5) { cam.ZoomBy(-1); dirty = true; }
                 }
                 if (ty == SdlEventType.KeyDown()) {
                     int sc = SdlEvent.Scancode();
@@ -163,8 +698,35 @@ class Ra2App {
                         if (sc == 81) { cam.MoveBy(0, panStep); dirty = true; }
                         if (sc == 87 || sc == 46) { cam.ZoomBy(1); dirty = true; }
                         if (sc == 86 || sc == 45) { cam.ZoomBy(-1); dirty = true; }
+                        if (sc == 32 && game != null) { tickNow = true; }  // space
+                        if (sc == 19 && game != null) {                    // P
+                            game.TogglePause();
+                        }
+                        if (sc == 4 && game != null) {                     // A
+                            game.ToggleMoveAttack();
+                        }
+                        // Squads: Ctrl+1..0 saves the current selection,
+                        // plain 1..0 recalls it.
+                        int num = -1;
+                        if (sc >= 30 && sc <= 39) { num = sc - 30; }        // 1..9,0
+                        if (num >= 0 && game != null) {
+                            bool ctrlNow = SdlScancode.IsDown(224)          // LCTRL
+                                        || SdlScancode.IsDown(228);         // RCTRL
+                            if (ctrlNow) { game.SaveSquad(num); }
+                            else { game.RecallSquad(num); }
+                        }
                     }
                 }
+            }
+
+            // Edge panning: hold the cursor against a screen edge to scroll
+            // the view that way, except over the sidebar.
+            if (shell.CurrentScene() == 2 && cam != null
+             && !Ra2App.InSidebar(mouseX)) {
+                int edge = 12;
+                if (mouseY < edge) { cam.MoveBy(0, 0 - panStep); dirty = true; }
+                if (mouseY > Ra2App.ViewH() - edge) { cam.MoveBy(0, panStep); dirty = true; }
+                if (mouseX < edge) { cam.MoveBy(0 - panStep, 0); dirty = true; }
             }
 
             host.Begin(16, 20, 16);
@@ -193,38 +755,163 @@ class Ra2App {
                         screen.Close();
                         canvas.Close();
                         theater.Close();
+                        objArt.Close();
+                        if (minimap != null) { minimap.Close(); }
                     }
                     map = db.MapNamed(maps[shell.MapIndex()]);
                     theater = Theater.Load(vfs, db, map.Theater());
                     terrain = MapRenderer.Create(map.Terrain(), theater);
+                    // A fresh game: an empty world over the map's terrain, the
+                    // player's side, and the starter base. The bases sit on the
+                    // map's own waypoints -- the old hardcoded (1,2) is outside
+                    // the playable diamond on most shipped maps, which would
+                    // strand the base on void terrain. The unit stays selected
+                    // so its click orders a move immediately.
+                    world = World.Create(map.Terrain(), StructureCatalog.Create(),
+                                         UnitCatalog.Create());
+                    objArt = ObjectArt.Create(vfs, db);
+                    int side = shell.SideIndex();
+                    List<int> start = new List<int>();
+                    int sx = 1;
+                    int sy = 2;
+                    if (map.StartCell(0, start) && start.Count >= 2) {
+                        sx = start[0];
+                        sy = start[1];
+                    }
+                    int yardIdx = world.PlaceBase(side, sx, sy);
+                    if (yardIdx < 0) { yardIdx = world.PlaceBase(side, 1, 2); }
+                    int scout = world.SpawnNear(yardIdx, 0);
+                    if (scout >= 0) {
+                        WorldObject s = world.ObjectAt(scout);
+                        world.SelectAt(s.X(), s.Y());
+                    }
+                    // The opponent opens on the map's second start, so the two
+                    // bases face each other across the terrain; maps without a
+                    // second waypoint fall back to the far corner.
+                    List<int> eStart = new List<int>();
+                    if (map.StartCell(1, eStart) && eStart.Count >= 2) {
+                        world.PlaceBase(1 - side, eStart[0], eStart[1]);
+                    } else {
+                        world.PlaceEnemyBase(1 - side);
+                    }
+                    game = GameController.Create(world, side);
+                    terrain.SetWorld(world, objArt, side);
                     cam = Camera.Create(Ra2App.ViewW(), Ra2App.ViewH(),
                                         terrain.WorldWidth(), terrain.WorldHeight());
+                    // Start the camera on the player's own base, not the map
+                    // centre -- a 6000px-wide map centred on open ground looks
+                    // like a dead fixed view. The yard's cell projects to a
+                    // world pixel; centre on it.
+                    {
+                        int yardX = IsoProjection.ScreenX(sx, sy) - terrain.OriginX();
+                        int yardY = IsoProjection.ScreenY(sx, sy, 0) - terrain.OriginY();
+                        cam.MoveTo(yardX - cam.SpanW() / 2,
+                                   yardY - cam.SpanH() / 2);
+                    }
                     canvas = Texture.Create(Ra2App.ViewW(), Ra2App.ViewH());
                     screen = SdlTexture.CreateRgba32(host.Renderer(),
                         Ra2App.ViewW(), Ra2App.ViewH(), true);
                     screen.SetBlendMode(1);
+                    if (minimap != null) { minimap.Close(); }
+                    minimap = Ra2App.BuildMinimap(host.Renderer(), terrain);
                     loadedIndex = shell.MapIndex();
                     dirty = true;
                     Console.WriteLine("loaded " + maps[loadedIndex]
                         + " " + map.Theater()
                         + " cells=" + Convert.ToString(terrain.CellCount())
                         + " world=" + Convert.ToString(terrain.WorldWidth())
-                        + "x" + Convert.ToString(terrain.WorldHeight()));
+                        + "x" + Convert.ToString(terrain.WorldHeight())
+                        + " side=" + Side.NameOf(side)
+                        + " obj=" + Convert.ToString(world.ObjectCount()));
                 }
+
+                // Units only move when the player steps the tick, so one click
+                // or keypress at a time is visible on the terrain.
+                if (tickNow && game != null) {
+                    game.Tick();
+                    dirty = true;
+                }
+
+                // Clicks become world commands (place, select, move) before the
+                // frame is drawn, so the response is immediate. Once a side
+                // has won, input freezes -- only Esc remains.
+                if (clicked && game != null && game.Result() == 0) {
+                    // Build menu entries live on the right sidebar; clicks there
+                    // arm a build (or, on the production panel, queue a unit).
+                    // Everything else maps to a cell.
+                    if (Ra2App.InSidebar(mouseX)) {
+                        int pid = Ra2App.HitProduction(game, mouseX, mouseY);
+                        if (pid >= 0) {
+                            game.OnClickUnit(pid);
+                        } else {
+                        int bx = (mouseX - (Ra2App.ViewW() - 282)) / 90;
+                        int by = (mouseY - 46) / 59;
+                        if (by >= 0 && by < 3 && bx >= 0 && bx < 3) {
+                            game.OnClickBuild(by * 3 + bx);
+                        }
+                        }
+                    } else if (cam != null) {
+                        int wx = cam.X() + Ra2App.ScaleX(mouseX, cam.ZoomNum(), cam.ZoomDen());
+                        int wy = cam.Y() + Ra2App.ScaleY(mouseY, cam.ZoomNum(), cam.ZoomDen());
+                        List<int> xy = new List<int>();
+                        xy.Add(0);
+                        xy.Add(0);
+                        IsoProjection.CellAt(wx + terrain.OriginX(),
+                                             wy + terrain.OriginY(), xy);
+                        game.OnClickCell(xy[0], xy[1]);
+                    }
+                    dirty = true;
+                }
+                if (rightClicked && game != null && cam != null
+                 && game.Result() == 0) {
+                    int wx = cam.X() + Ra2App.ScaleX(mouseX, cam.ZoomNum(), cam.ZoomDen());
+                    int wy = cam.Y() + Ra2App.ScaleY(mouseY, cam.ZoomNum(), cam.ZoomDen());
+                    List<int> xy = new List<int>();
+                    xy.Add(0);
+                    xy.Add(0);
+                    IsoProjection.CellAt(wx + terrain.OriginX(), wy + terrain.OriginY(), xy);
+                    game.OnRightClick(xy[0], xy[1]);
+                    dirty = true;
+                }
+                if (game != null && game.NeedsRedraw()) { dirty = true; }
 
                 // Terrain is static, so the canvas is only recomposited when
                 // the camera actually moved.
                 if (dirty) {
                     Ra2App.memset(canvas.Pixels(), 0, canvas.ByteLength());
                     drawn = terrain.RenderInto(canvas, cam.X(), cam.Y());
+                    if (game != null) {
+                        Ra2App.DrawGhost(canvas, game, mouseX, mouseY,
+                                         terrain.OriginX(), terrain.OriginY(),
+                                         cam);
+                    }
                     screen.Update(canvas.Pixels(), canvas.Width() * 4);
                     dirty = false;
                 }
                 host.Renderer().DrawTexture(screen, 0, 0,
                     Ra2App.ViewW(), Ra2App.ViewH());
+                if (game != null) {
+                    Ra2App.DrawSidebar(host.Renderer(), game, objArt,
+                                       mouseX, mouseY);
+                    Ra2App.DrawMinimap(host.Renderer(), minimap, world, game,
+                                       cam, terrain, mouseX, mouseY, clicked);
+                    if (dragging) {
+                        Ra2App.DrawBox(host.Renderer(), dragStartX, dragStartY,
+                                       mouseX, mouseY);
+                    }
+                }
                 Screens.DrawHud(host.Renderer(), maps[loadedIndex],
                     Side.NameOf(shell.SideIndex()), terrain.CellCount(), drawn,
                     Ra2App.ViewW(), Ra2App.ViewH());
+                if (game != null) {
+                    Ra2App.DrawSelectionInfo(host.Renderer(), game);
+                    Ra2App.DrawResult(host.Renderer(), game.Result(),
+                        Ra2App.ViewW(), Ra2App.ViewH());
+                    Ra2App.DrawPaused(host.Renderer(), game,
+                        Ra2App.ViewW(), Ra2App.ViewH());
+                    Ra2App.DrawMoveAttackHint(host.Renderer(), game, mouseX,
+                                              mouseY);
+                }
             }
 
             host.End();
@@ -233,16 +920,47 @@ class Ra2App {
             // menu, setup, then a rendered frame of the first map.
             frames = frames + 1;
             if (selfTest) {
-                if (frames == 2) { shell.OpenSkirmish(); }
+                // The readback lags the presented frame by one, so the menu
+                // dump lands two frames after the menu was first drawn.
+                if (frames == 3) {
+                    Ra2App.DumpScreen("build/ra2_shot_menu.bmp", host.Renderer());
+                }
+                if (frames == 4) { shell.OpenSkirmish(); }
                 // Linger on setup so a preview is actually built, then step
                 // the selection once so the rebuild path runs too.
-                if (frames == 4) { shell.SelectMap(1); }
-                if (frames == 6) { shell.StartGame(); }
-                if (frames == 10) {
+                if (frames == 6) { shell.SelectMap(1); }
+                if (frames == 7) {
+                    Ra2App.DumpScreen("build/ra2_shot_skirmish.bmp", host.Renderer());
+                }
+                if (frames == 8) { shell.StartGame(); }
+                // Once the game is running, arm the second build (a power
+                // plant), place it at (12,12), then fast-forward a few hundred
+                // ticks so the enemy AI builds, trains and starts attacking.
+                // The printed state proves the skirmish is actually running.
+                if (frames == 10 && game != null) { game.OnClickBuild(1); }
+                if (frames == 11 && game != null) { game.OnClickCell(12, 12); }
+                if (frames == 12) {
+                    int stepped = 0;
+                    while (stepped < 200 && game != null && game.Result() == 0) {
+                        game.Tick();
+                        stepped = stepped + 1;
+                    }
+                    Ra2App.DumpScreen("build/ra2_shot_game_ui.bmp", host.Renderer());
+                    int objCount = world == null ? -1 : world.ObjectCount();
+                    int money = game == null ? -1 : game.Money();
+                    int aiMoney = game == null ? -1 : game.AiMoney();
+                    int sel = game == null ? -1 : game.World().SelectedIndex();
+                    int result = game == null ? -1 : game.Result();
                     Console.WriteLine("selftest scene=" + Convert.ToString(shell.CurrentScene())
                         + " drawn=" + Convert.ToString(drawn)
                         + " previewBuilt=" + Convert.ToString(previewIndex >= 0)
-                        + " map=" + maps[shell.MapIndex()]);
+                        + " map=" + maps[shell.MapIndex()]
+                        + " obj=" + Convert.ToString(objCount)
+                        + " money=" + Convert.ToString(money)
+                        + " aiMoney=" + Convert.ToString(aiMoney)
+                        + " sel=" + Convert.ToString(sel)
+                        + " result=" + Convert.ToString(result)
+                        + " stepped=" + Convert.ToString(stepped));
                     host.Quit();
                 }
             }
@@ -252,6 +970,8 @@ class Ra2App {
             screen.Close();
             canvas.Close();
             theater.Close();
+            objArt.Close();
+            if (minimap != null) { minimap.Close(); }
         }
         if (preview != null) { preview.Close(); }
         art.Close();

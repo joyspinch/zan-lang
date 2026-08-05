@@ -24,15 +24,15 @@ class MqttQos {
 }
 
 /// <summary>
-/// MQTT v3.1.1 client.
+/// MQTT v3.1.1 客户端。
 ///
-/// Coroutine-friendly: every network operation is an <c>async</c> method that
-/// awaits the underlying non-blocking socket via <see cref="TcpClient"/>, so an
-/// MQTT client used inside a coroutine suspends on the IO reactor (yielding the
-/// worker to other coroutines) instead of blocking the OS thread while it waits
-/// for a broker reply or an incoming PUBLISH.
+/// 对协程友好：每个网络操作都是 <c>async</c> 方法，
+/// 通过 <see cref="TcpClient"/> await 底层非阻塞套接字，因此
+/// 协程内使用的 MQTT 客户端会在 IO reactor 上挂起（将 worker
+/// 让给其他协程），而不会在等待 broker 应答或传入 PUBLISH 时
+/// 阻塞操作系统线程。
 ///
-/// Usage:
+/// 用法：
 ///   MqttClient c = await MqttClient.ConnectAsync("broker", 1883, "client-1");
 ///   int s = await c.SubscribeAsync("sensors/temp", MqttQos.AtLeastOnce);
 ///   int p = await c.PublishAsync("sensors/temp", "21.5", MqttQos.AtLeastOnce);
@@ -60,20 +60,20 @@ class MqttClient {
         this.keepAlive = 60;
     }
 
-    // ---- framing helpers ----
+    // ---- 帧解析辅助 ----
     //
-    // A single Socket recv returns whatever bytes are currently available, which
-    // may be fewer than a whole MQTT packet (TCP is a byte stream). These helpers
-    // await the reactor and re-read until an exact count / a full packet has been
-    // assembled, so control-packet parsing and payload extraction stay aligned
-    // regardless of how the broker's writes are segmented.
+    // 单次 Socket recv 只返回当前可用的字节，
+    // 可能不足一个完整 MQTT 报文（TCP 是字节流）。这些辅助函数
+    // 会在 reactor 上等待并重读，直到读够精确字节数 / 组装出完整报文，
+    // 使控制报文解析与负载提取
+    // 无论 broker 如何分段写入都能保持对齐。
 
-    // These read via Socket.Recv (which returns the actual byte count) rather
-    // than TcpClient.RecvAsync (which returns a NUL-terminated string): MQTT
-    // packets contain NUL bytes, so a string length can't be trusted to report
-    // how many bytes arrived. We still suspend on the reactor via ReadReady.
+    // 它们通过 Socket.Recv 读取（返回实际字节数），
+    // 而非 TcpClient.RecvAsync（返回 NUL 结尾的字符串）：MQTT
+    // 报文包含 NUL 字节，因此不能依赖字符串长度来报告
+    // 实际到达的字节数。我们仍通过 ReadReady 在 reactor 上挂起。
 
-    /// <summary>Reads exactly one byte, or -1 if the peer closed.</summary>
+    /// <summary>精确读取一个字节，对端关闭时返回 -1。</summary>
     async int ReadByteAsync() {
         nint sock = this.conn.GetSocket();
         byte[] b = new byte[2];
@@ -91,8 +91,8 @@ class MqttClient {
         return -1;
     }
 
-    /// <summary>Reads exactly <paramref name="need"/> bytes, suspending on the IO
-    /// reactor across as many recvs as it takes.</summary>
+    /// <summary>在 IO reactor 上挂起，精确读取 <paramref name="need"/> 字节，
+    /// 直到所需的多次 recv 全部完成。</summary>
     async byte[] ReadBytesAsync(int need) {
         byte[] buf = new byte[need + 1];
         byte[] tmp = new byte[need + 1];
@@ -115,7 +115,7 @@ class MqttClient {
         return buf;
     }
 
-    /// <summary>Decodes the MQTT "remaining length" varint (1-4 bytes).</summary>
+    /// <summary>解码 MQTT "remaining length" varint（1-4 字节）。</summary>
     async int ReadRemainingLenAsync() {
         int multiplier = 1;
         int acc = 0;
@@ -131,8 +131,8 @@ class MqttClient {
         return acc;
     }
 
-    /// <summary>Reads and discards one whole control packet (e.g. SUBACK / PUBACK),
-    /// returning its packet type so the stream stays framed.</summary>
+    /// <summary>读取并丢弃一个完整控制报文（如 SUBACK / PUBACK），
+    /// 返回其报文类型以保持流帧同步。</summary>
     async int DrainPacketAsync() {
         int b0 = await ReadByteAsync();
         if (b0 < 0) {
@@ -145,8 +145,8 @@ class MqttClient {
         return (b0 >> 4) & 15;
     }
 
-    /// <summary>Connects to the broker and performs the MQTT CONNECT/CONNACK
-    /// handshake, suspending on the IO reactor for each network step.</summary>
+    /// <summary>连接 broker 并执行 MQTT CONNECT/CONNACK
+    /// 握手，每个网络步骤都在 IO reactor 上挂起。</summary>
     static async MqttClient ConnectAsync(string host, int port, string clientId) {
         MqttClient mqtt = new MqttClient();
         mqtt.host = host;
@@ -158,8 +158,8 @@ class MqttClient {
         byte[] packet = mqtt.BuildConnectPacket();
         int sent = await mqtt.conn.SendBytesAsync(packet, mqtt.CalcConnectLen());
 
-        // CONNACK: fixed header (2 bytes) + variable header (2 bytes); byte 2 of
-        // the body is the connect return code (0 = accepted).
+        // CONNACK：固定头（2 字节）+ 可变头（2 字节）；
+        // body 的第 2 字节为连接返回码（0 = 已接受）。
         int b0 = await mqtt.ReadByteAsync();
         int remainLen = await mqtt.ReadRemainingLenAsync();
         byte[] body = await mqtt.ReadBytesAsync(remainLen);
@@ -173,8 +173,8 @@ class MqttClient {
         return mqtt;
     }
 
-    /// <summary>Publishes a message, suspending on the IO reactor. For QoS 1 it
-    /// also awaits the PUBACK. Returns the number of bytes sent.</summary>
+    /// <summary>发布消息，在 IO reactor 上挂起。QoS 1 时
+    /// 还会等待 PUBACK。返回已发送的字节数。</summary>
     async int PublishAsync(string topic, string message, int qos) {
         int topicLen = (int)strlen(topic);
         int msgLen = (int)strlen(message);
@@ -232,8 +232,8 @@ class MqttClient {
         return sent;
     }
 
-    /// <summary>Subscribes to a topic and awaits the SUBACK, suspending on the
-    /// IO reactor. Returns the number of bytes sent.</summary>
+    /// <summary>订阅主题并等待 SUBACK，在 IO
+    /// reactor 上挂起。返回已发送的字节数。</summary>
     async int SubscribeAsync(string topic, int qos) {
         int topicLen = (int)strlen(topic);
         int pid = this.nextPacketId;
@@ -271,8 +271,8 @@ class MqttClient {
         return sent;
     }
 
-    /// <summary>Unsubscribes from a topic and awaits the UNSUBACK, suspending on
-    /// the IO reactor. Returns the number of bytes sent.</summary>
+    /// <summary>取消订阅主题并等待 UNSUBACK，在
+    /// IO reactor 上挂起。返回已发送的字节数。</summary>
     async int UnsubscribeAsync(string topic) {
         int topicLen = (int)strlen(topic);
         int pid = this.nextPacketId;
@@ -307,9 +307,9 @@ class MqttClient {
         return sent;
     }
 
-    /// <summary>Awaits the next inbound PUBLISH and returns its payload,
-    /// suspending on the IO reactor until data arrives. Responds to broker
-    /// PINGREQ transparently and keeps waiting for a real message.</summary>
+    /// <summary>等待下一个传入的 PUBLISH 并返回其负载，
+    /// 在 IO reactor 上挂起直到数据到达。对 broker 的
+    /// PINGREQ 透明响应，并继续等待真正的消息。</summary>
     async string ReceiveAsync() {
         int byte0 = await ReadByteAsync();
         if (byte0 < 0) {
@@ -322,7 +322,7 @@ class MqttClient {
         int packetType = (byte0 >> 4) & 15;
 
         if (packetType == MqttPacketType.PUBLISH) {
-            // body: topic length (2) + topic + [packet id (2) if qos>0] + payload
+            // 请求体：主题长度（2）+ 主题 + [qos>0 时的报文 id（2）] + 负载
             int topicLen = ((body[0] & 255) << 8) + (body[1] & 255);
             int offset = 2 + topicLen;
 
@@ -344,8 +344,8 @@ class MqttClient {
         return body.ToStr(0, remainLen);
     }
 
-    /// <summary>Sends a PINGREQ keep-alive, suspending on the IO reactor.
-    /// Returns the number of bytes sent.</summary>
+    /// <summary>发送 PINGREQ 保活，在 IO reactor 上挂起。
+    /// 返回已发送的字节数。</summary>
     async int PingAsync() {
         byte[] packet = new byte[2];
         packet[0] = (byte)(MqttPacketType.PINGREQ << 4);
@@ -354,8 +354,8 @@ class MqttClient {
         return sent;
     }
 
-    /// <summary>Sends DISCONNECT and closes the connection, suspending on the IO
-    /// reactor for the send. Returns the number of bytes sent.</summary>
+    /// <summary>发送 DISCONNECT 并关闭连接，在 IO
+    /// reactor 上等待发送完成。返回已发送的字节数。</summary>
     async int DisconnectAsync() {
         byte[] packet = new byte[2];
         packet[0] = (byte)(MqttPacketType.DISCONNECT << 4);

@@ -1,0 +1,387 @@
+using System;
+using System.Data;
+using System.Data.Orm;
+using System.Security.Cryptography;
+using System.Web;
+using ZanWeb;
+using ZanWeb.Model.Sys;
+using ZanWeb.Dao.Sys;
+
+namespace ZanWeb.Admin.System;
+
+/// <summary>
+/// Account administration at /admin/system/users: search, create, edit, delete, reset
+/// password, assign roles, enable/disable and force a logout.
+///
+/// The list is a projection built here, never the entity: no password hash and
+/// no salt is put into a row, so a template accident cannot leak credential
+/// material.
+///
+/// Disabling an account and forcing a logout are deliberately different
+/// buttons: status = 0 stops future logins, while bumping tokenVersion
+/// invalidates the tokens already in browsers. Disabling does both, because a
+/// ban that leaves open sessions alive is not a ban.
+/// </summary>
+[Route("admin/system/users/[action]")]
+[Custom(Authorization = CustomAuthorization.Grant)]
+[Description("账号管理")]
+class Users : AdminController {
+    [HttpGet]
+    [Route("/admin/system/users")]
+    [Custom(IsMenu = true, Icon = "mdi:account")]
+    [Description("账号管理")]
+    async void Index() {
+        ViewData d = await this.Layout("账号管理");
+        if (!this.DbReady()) { d.Set("dbDown", "1"); this.Page(d); return; }
+
+        ListQuery q = this.Paged("id", 20);
+        string kw = q.Kw();
+        int status = this.InInt("status", -1);
+        d.Set("status", Convert.ToString(status));
+        if (status == 1) { d.Set("statusOn", "selected"); }
+        if (status == 0) { d.Set("statusOff", "selected"); }
+
+        int total = await this.User
+            .WhereIf(kw.Length > 0, a => a.username.Contains(kw))
+            .WhereIf(status >= 0, a => a.status == status)
+            .CountAsync();
+        List<User> rows = await this.User
+            .WhereIf(kw.Length > 0, a => a.username.Contains(kw))
+            .WhereIf(status >= 0, a => a.status == status)
+            .OrderByDescending(a => a.id)
+            .Skip(q.Skip()).Take(q.Limit()).ToListAsync();
+
+        List<Department> depts = await this.Department.ToListAsync();
+        List<Role> roles = await this.Role.ToListAsync();
+        List<UserRole> links = await this.UserRole.ToListAsync();
+
+        List<StrMap> items = d.AddList("rows");
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            User u = rows[i];
+            StrMap row = new StrMap();
+            row.Set("id", Convert.ToString(u.id));
+            row.Set("username", u.username);
+            row.Set("nickname", Fmt.Dash(u.nickname));
+            row.Set("email", Fmt.Dash(u.email));
+            row.Set("mobile", Fmt.Dash(u.mobile));
+            row.Set("dept", Users.DeptName(depts, u.departmentId));
+            row.Set("roles", Users.RoleNames(roles, links, u.id));
+            row.Set("statusText", Users.StatusText(u.status));
+            row.Set("statusClass", Users.StatusClass(u.status));
+            row.Set("nextStatus", Users.NextStatus(u.status));
+            row.Set("toggleText", Users.ToggleText(u.status));
+            row.Set("createdAt", Fmt.Day(u.createdAt));
+            if (u.isSuper == 1) { row.Set("super", "1"); }
+            items.Add(row);
+        }
+        this.Pager(d, q, total);
+        this.Page(d);
+    }
+
+    /// <summary>The create/edit dialog. It is a fragment, not a page: the list
+    /// stays where it is and the dialog opens over it.</summary>
+    [HttpGet]
+    [Description("账号表单")]
+    async void Form() {
+        int id = this.InInt("id", 0);
+        int deptId = 0;
+        ViewData d = new ViewData();
+        d.Set("id", Convert.ToString(id));
+        d.Set("dialogTitle", "新增账号");
+        d.Set("new", "1");
+        d.Set("status1", "selected");
+        if (id > 0) {
+            User u = await this.User.Where(a => a.id == id).FirstAsync();
+            if (u == null) { this.Fail(404, "0404", "账号不存在"); }
+            d.Set("dialogTitle", "编辑账号");
+            d.Set("username", u.username);
+            d.Set("nickname", u.nickname);
+            d.Set("email", u.email);
+            d.Set("mobile", u.mobile);
+            d.Set("edit", "1");
+            d.Set("new", "");
+            d.Set("status1", "");
+            if (u.status == 1) { d.Set("status1", "selected"); }
+            else { d.Set("status0", "selected"); }
+            deptId = u.departmentId;
+        }
+        List<Department> depts = await this.Department
+            .OrderBy(a => a.sortOrder).ToListAsync();
+        List<StrMap> opts = d.AddList("depts");
+        for (int i = 0; i < depts.Count; i = i + 1) {
+            StrMap o = new StrMap();
+            o.Set("id", Convert.ToString(depts[i].id));
+            o.Set("name", depts[i].name);
+            if (depts[i].id == deptId) { o.Set("selected", "selected"); }
+            opts.Add(o);
+        }
+        this.Dialog(d);
+    }
+
+    [HttpPost]
+    [Description("保存账号")]
+    async void Save() {
+        int id = this.InInt("id", 0);
+        string username = this.Need("username", "账号");
+        string nickname = this.In("nickname");
+        string email = this.In("email");
+        string mobile = this.In("mobile");
+        int departmentId = this.InInt("departmentId", 0);
+        int status = this.InInt("status", 1);
+        string password = this.In("password");
+        if (status != 1) { status = 0; }
+
+        User clash = await this.User.Where(a => a.username == username).FirstAsync();
+        if (clash != null && clash.id != id) {
+            this.Fail(400, "0004", "账号 " + username + " 已存在");
+        }
+
+        if (id > 0) {
+            int n = await this.User.Update()
+                .Set(a => a.username, username)
+                .Set(a => a.nickname, nickname)
+                .Set(a => a.email, email)
+                .Set(a => a.mobile, mobile)
+                .Set(a => a.departmentId, departmentId)
+                .Set(a => a.status, status)
+                .Set(a => a.updatedAt, WebApp.NowSeconds())
+                .Where(a => a.id == id)
+                .ExecuteAffrowsAsync();
+            // A disabled account must lose the sessions it already has,
+            // otherwise the ban only applies to the next login.
+            if (status == 0) { await this.Revoke(id); }
+            AuthUser.Forget(Convert.ToString(id));
+            await this.Note("编辑账号", "#" + Convert.ToString(id)
+                + " " + username, n > 0, "");
+            this.Saved("账号已保存");
+            return;
+        }
+
+        if (password.Length < 8) {
+            this.Fail(400, "0004", "新账号必须设置至少 8 位的初始密码");
+        }
+        string salt = Hex.Encode(RandomNumberGenerator.GetBytes(16), 16);
+        User u = new User();
+        u.username = username;
+        u.nickname = nickname;
+        u.email = email;
+        u.mobile = mobile;
+        u.departmentId = departmentId;
+        u.passwordSalt = salt;
+        u.passwordHash = AuthUser.PasswordHash(password, salt);
+        u.status = status;
+        u.isSuper = 0;
+        u.tokenVersion = 1;
+        u.createdAt = WebApp.NowSeconds();
+        u.updatedAt = u.createdAt;
+        int newId = await this.User.Insert(u).ExecuteIdentityAsync();
+        await this.Note("新增账号",
+            "#" + Convert.ToString(newId) + " " + username, newId > 0, "");
+        this.Saved("账号已创建");
+    }
+
+    [HttpPost]
+    [Description("删除账号")]
+    async void Delete() {
+        int id = this.InInt("id", 0);
+        User u = await this.User.Where(a => a.id == id).FirstAsync();
+        if (u == null) { this.Fail(404, "0404", "账号不存在"); }
+        if (u.isSuper == 1) {
+            this.Fail(400, "0004", "超级管理员账号不能删除");
+        }
+        User me = await this.Admin();
+        if (me != null && me.id == id) {
+            this.Fail(400, "0004", "不能删除当前登录的账号");
+        }
+        int n = await this.User.Delete().Where(a => a.id == id)
+            .ExecuteAffrowsAsync();
+        int _r = await this.UserRole.Delete().Where(a => a.userId == id)
+            .ExecuteAffrowsAsync();
+        AuthUser.Forget(Convert.ToString(id));
+        await this.Note("删除账号",
+            "#" + Convert.ToString(id) + " " + u.username, n > 0, "");
+        this.Saved("账号已删除");
+    }
+
+    [HttpPost]
+    [Description("启用或禁用账号")]
+    async void Status() {
+        int id = this.InInt("id", 0);
+        int status = this.InInt("status", 1);
+        if (status != 1) { status = 0; }
+        User u = await this.User.Where(a => a.id == id).FirstAsync();
+        if (u == null) { this.Fail(404, "0404", "账号不存在"); }
+        if (u.isSuper == 1 && status == 0) {
+            this.Fail(400, "0004", "超级管理员账号不能禁用");
+        }
+        int n = await this.User.Update()
+            .Set(a => a.status, status)
+            .Set(a => a.updatedAt, WebApp.NowSeconds())
+            .Where(a => a.id == id)
+            .ExecuteAffrowsAsync();
+        if (status == 0) { await this.Revoke(id); }
+        AuthUser.Forget(Convert.ToString(id));
+        await this.Note("启用或禁用账号",
+            "#" + Convert.ToString(id) + " " + u.username, n > 0,
+            Users.StatusText(status));
+        if (status == 1) { this.Saved("账号已启用"); return; }
+        this.Saved("账号已禁用，其登录状态同时失效");
+    }
+
+    [HttpPost]
+    [Description("强制下线")]
+    async void Kick() {
+        int id = this.InInt("id", 0);
+        User u = await this.User.Where(a => a.id == id).FirstAsync();
+        if (u == null) { this.Fail(404, "0404", "账号不存在"); }
+        await this.Revoke(id);
+        await this.Note("强制下线",
+            "#" + Convert.ToString(id) + " " + u.username, true, "");
+        this.Saved("该账号的登录状态已全部失效");
+    }
+
+    /// <summary>The reset-password dialog. It never shows anything about the
+    /// current password: there is nothing readable to show.</summary>
+    [HttpGet]
+    [Description("重置密码表单")]
+    async void PasswordForm() {
+        int id = this.InInt("id", 0);
+        User u = await this.User.Where(a => a.id == id).FirstAsync();
+        if (u == null) { this.Fail(404, "0404", "账号不存在"); }
+        ViewData d = new ViewData();
+        d.Set("id", Convert.ToString(id));
+        d.Set("username", u.username);
+        this.Dialog(d);
+    }
+
+    [HttpPost]
+    [Description("重置密码")]
+    async void Password() {
+        int id = this.InInt("id", 0);
+        string password = this.Need("password", "新密码");
+        if (password.Length < 8) {
+            this.Fail(400, "0004", "密码至少 8 位");
+        }
+        User u = await this.User.Where(a => a.id == id).FirstAsync();
+        if (u == null) { this.Fail(404, "0404", "账号不存在"); }
+        string salt = Hex.Encode(RandomNumberGenerator.GetBytes(16), 16);
+        string hash = AuthUser.PasswordHash(password, salt);
+        int n = await this.User.Update()
+            .Set(a => a.passwordSalt, salt)
+            .Set(a => a.passwordHash, hash)
+            .Set(a => a.tokenVersion, u.tokenVersion + 1)
+            .Set(a => a.updatedAt, WebApp.NowSeconds())
+            .Where(a => a.id == id)
+            .ExecuteAffrowsAsync();
+        await this.Note("重置密码",
+            "#" + Convert.ToString(id) + " " + u.username, n > 0, "");
+        this.Saved("密码已重置，该账号需要重新登录");
+    }
+
+    /// <summary>The role-assignment dialog: every role, with the ones this
+    /// account already holds ticked.</summary>
+    [HttpGet]
+    [Description("分配角色")]
+    async void Roles() {
+        int id = this.InInt("id", 0);
+        User u = await this.User.Where(a => a.id == id).FirstAsync();
+        if (u == null) { this.Fail(404, "0404", "账号不存在"); }
+        ViewData d = new ViewData();
+        d.Set("id", Convert.ToString(id));
+        d.Set("username", u.username);
+        List<Role> roles = await this.Role.OrderBy(a => a.rank).ToListAsync();
+        List<UserRole> mine = await this.UserRole
+            .Where(a => a.userId == id).ToListAsync();
+        List<StrMap> rows = d.AddList("roles");
+        for (int i = 0; i < roles.Count; i = i + 1) {
+            Role r = roles[i];
+            StrMap row = new StrMap();
+            row.Set("id", Convert.ToString(r.id));
+            row.Set("name", r.name);
+            row.Set("code", r.code);
+            row.Set("description", r.description);
+            for (int j = 0; j < mine.Count; j = j + 1) {
+                if (mine[j].roleId == r.id) { row.Set("checked", "checked"); }
+            }
+            rows.Add(row);
+        }
+        this.Dialog(d);
+    }
+
+    [HttpPost]
+    [Description("保存角色分配")]
+    async void RolesSave() {
+        int id = this.InInt("id", 0);
+        User u = await this.User.Where(a => a.id == id).FirstAsync();
+        if (u == null) { this.Fail(404, "0404", "账号不存在"); }
+        string picked = this.In("roleIds");
+        int _cleared = await this.UserRole.Delete().Where(a => a.userId == id)
+            .ExecuteAffrowsAsync();
+        List<Role> roles = await this.Role.ToListAsync();
+        int granted = 0;
+        for (int i = 0; i < roles.Count; i = i + 1) {
+            if (!AuthUser.Holds(picked, Convert.ToString(roles[i].id))) { continue; }
+            UserRole link = new UserRole();
+            link.userId = id;
+            link.roleId = roles[i].id;
+            int _n = await this.UserRole.Insert(link).ExecuteIdentityAsync();
+            granted = granted + 1;
+        }
+        AuthUser.Forget(Convert.ToString(id));
+        await this.Note("分配角色",
+            "#" + Convert.ToString(id) + " " + u.username, true,
+            Convert.ToString(granted) + " 个角色");
+        this.Saved("角色已保存");
+    }
+
+    /// <summary>Invalidates every token issued for this account so far.</summary>
+    async void Revoke(int id) {
+        User u = await this.User.Where(a => a.id == id).FirstAsync();
+        if (u == null) { return; }
+        int _n = await this.User.Update()
+            .Set(a => a.tokenVersion, u.tokenVersion + 1)
+            .Where(a => a.id == id)
+            .ExecuteAffrowsAsync();
+    }
+
+    static string DeptName(List<Department> depts, int id) {
+        for (int i = 0; i < depts.Count; i = i + 1) {
+            if (depts[i].id == id) { return depts[i].name; }
+        }
+        return "—";
+    }
+
+    static string RoleNames(List<Role> roles, List<UserRole> links, int userId) {
+        string names = "";
+        for (int i = 0; i < links.Count; i = i + 1) {
+            if (links[i].userId != userId) { continue; }
+            for (int j = 0; j < roles.Count; j = j + 1) {
+                if (roles[j].id != links[i].roleId) { continue; }
+                if (names.Length > 0) { names = names + "、"; }
+                names = names + roles[j].name;
+            }
+        }
+        if (names.Length == 0) { return "—"; }
+        return names;
+    }
+
+    static string StatusText(int status) {
+        if (status == 1) { return "启用"; }
+        return "禁用";
+    }
+
+    static string StatusClass(int status) {
+        if (status == 1) { return "ok"; }
+        return "off";
+    }
+
+    static string NextStatus(int status) {
+        if (status == 1) { return "0"; }
+        return "1";
+    }
+
+    static string ToggleText(int status) {
+        if (status == 1) { return "禁用"; }
+        return "启用";
+    }
+}

@@ -1,0 +1,221 @@
+using System;
+using System.Net.Sockets;
+using System.Net.Tls;
+using System.Text;
+using System.Web;
+
+namespace ZanWeb;
+
+/// <summary>
+/// The SMTP client behind the verification mails, configured from the site
+/// settings (mail.host / port / ssl / user / pass / from / fromName).
+///
+/// Two shapes of connection are supported and both are ordinary awaits on the
+/// reactor, so sending a mail never blocks the worker: a direct TLS session
+/// (port 465) and a plain session upgraded with STARTTLS (587/25). AUTH LOGIN
+/// is used when a user name is configured; the transcript is otherwise the
+/// minimum a server needs -- EHLO, MAIL FROM, RCPT TO, DATA.
+///
+/// Failures come back as a message meant for the operator of the admin screen
+/// ("connect failed", "535 auth failed"), never as a thrown error, because the
+/// caller is always an HTTP handler answering a form.
+/// </summary>
+class MailResult {
+    bool ok;
+    string message;
+
+    MailResult() {
+        this.ok = false;
+        this.message = "";
+    }
+
+    static MailResult Fail(string message) {
+        MailResult r = new MailResult();
+        r.message = message;
+        return r;
+    }
+
+    static MailResult Good() {
+        MailResult r = new MailResult();
+        r.ok = true;
+        r.message = "已发送";
+        return r;
+    }
+
+    bool Ok() { return this.ok; }
+    string Message() { return this.message; }
+}
+
+/// <summary>One SMTP session, either plaintext or over TLS.</summary>
+class MailSession {
+    TcpClient tcp;
+    TlsStream tls;
+    string buffer;
+
+    MailSession() {
+        this.tcp = null;
+        this.tls = null;
+        this.buffer = "";
+    }
+
+    async int Write(string line) {
+        if (this.tls != null) { return await this.tls.SendStringAsync(line); }
+        return await this.tcp.SendAsync(line);
+    }
+
+    /// <summary>Reads one reply. A multi-line reply ("250-SIZE" ...) ends at
+    /// the line whose fourth character is a space, which is the only way the
+    /// protocol marks the last one.</summary>
+    async string Read() {
+        int guard = 0;
+        while (guard < 64) {
+            guard = guard + 1;
+            int nl = this.buffer.IndexOf("\n");
+            while (nl >= 0) {
+                string line = this.buffer.Substring(0, nl);
+                if (line.Length > 0 && line.Substring(line.Length - 1) == "\r") {
+                    line = line.Substring(0, line.Length - 1);
+                }
+                this.buffer = this.buffer.Substring(nl + 1);
+                if (line.Length < 4 || line.Substring(3, 1) == " ") { return line; }
+                nl = this.buffer.IndexOf("\n");
+            }
+            string chunk = "";
+            if (this.tls != null) { chunk = await this.tls.RecvAsync(4096); }
+            else { chunk = await this.tcp.RecvAsync(4096); }
+            if (chunk == null || chunk.Length == 0) { return ""; }
+            this.buffer = this.buffer + chunk;
+        }
+        return "";
+    }
+
+    async string Say(string line) {
+        int _n = await this.Write(line + "\r\n");
+        return await this.Read();
+    }
+
+    void Close() {
+        if (this.tls != null) { this.tls.Close(); }
+        if (this.tcp != null) { this.tcp.Close(); }
+    }
+}
+
+class Mailer {
+    /// <summary>True when a host and a sender are configured; the register and
+    /// reset flows check this before offering a verification code.</summary>
+    static async bool Ready() {
+        string host = await Settings.Get(SettingKeys.MailHost, "");
+        string from = await Mailer.From();
+        return host.Length > 0 && from.Length > 0;
+    }
+
+    static async string From() {
+        string from = await Settings.Get(SettingKeys.MailFrom, "");
+        if (from.Length > 0) { return from; }
+        return await Settings.Get(SettingKeys.MailUser, "");
+    }
+
+    /// <summary>Sends one plain-text mail. The body is UTF-8 and base64 encoded
+    /// so subjects and content in Chinese survive every relay.</summary>
+    static async MailResult Send(string to, string subject, string body) {
+        string host = await Settings.Get(SettingKeys.MailHost, "");
+        string from = await Mailer.From();
+        if (host.Length == 0 || from.Length == 0) {
+            return MailResult.Fail("邮件服务未配置");
+        }
+        int port = Convert.ToInt32(await Settings.Get(SettingKeys.MailPort, "465"));
+        bool secure = await Settings.On(SettingKeys.MailSsl, true);
+        string user = await Settings.Get(SettingKeys.MailUser, "");
+        string pass = await Settings.Get(SettingKeys.MailPass, "");
+        string fromName = await Settings.Get(SettingKeys.MailFromName, "");
+
+        TcpClient tcp = await TcpClient.ConnectAsync(host, port, 8000);
+        if (tcp == null) { return MailResult.Fail("无法连接 " + host + ":" + Convert.ToString(port)); }
+
+        MailSession s = new MailSession();
+        s.tcp = tcp;
+        // Port 465 speaks TLS from the first byte; 587/25 negotiate it with
+        // STARTTLS after the greeting.
+        bool direct = secure && port == 465;
+        if (direct) {
+            TlsContext ctx = TlsContext.CreateClient();
+            if (ctx == null) { s.Close(); return MailResult.Fail("TLS 初始化失败"); }
+            TlsStream stream = await TlsStream.ConnectAsync(ctx, tcp.GetSocket(), host);
+            if (stream == null) { s.Close(); return MailResult.Fail("TLS 握手失败"); }
+            s.tls = stream;
+        }
+
+        MailResult r = await Mailer.Talk(s, host, from, fromName, user, pass,
+            to, subject, body, secure && !direct);
+        s.Close();
+        return r;
+    }
+
+    static async MailResult Talk(MailSession s, string host, string from,
+                                 string fromName, string user, string pass,
+                                 string to, string subject, string body,
+                                 bool startTls) {
+        string hello = await s.Read();
+        if (!Mailer.Is(hello, "220")) { return MailResult.Fail(Mailer.Why(hello, "服务器未就绪")); }
+
+        string ehlo = await s.Say("EHLO zanweb");
+        if (!Mailer.Is(ehlo, "250")) { return MailResult.Fail(Mailer.Why(ehlo, "EHLO 被拒绝")); }
+
+        if (startTls) {
+            string up = await s.Say("STARTTLS");
+            if (!Mailer.Is(up, "220")) { return MailResult.Fail(Mailer.Why(up, "STARTTLS 被拒绝")); }
+            TlsContext ctx = TlsContext.CreateClient();
+            if (ctx == null) { return MailResult.Fail("TLS 初始化失败"); }
+            TlsStream stream = await TlsStream.ConnectAsync(ctx, s.tcp.GetSocket(), host);
+            if (stream == null) { return MailResult.Fail("TLS 握手失败"); }
+            s.tls = stream;
+            string again = await s.Say("EHLO zanweb");
+            if (!Mailer.Is(again, "250")) { return MailResult.Fail(Mailer.Why(again, "EHLO 被拒绝")); }
+        }
+
+        if (user.Length > 0) {
+            string auth = await s.Say("AUTH LOGIN");
+            if (!Mailer.Is(auth, "334")) { return MailResult.Fail(Mailer.Why(auth, "服务器不支持 AUTH LOGIN")); }
+            string u = await s.Say(Encoding.Base64Encode(user));
+            if (!Mailer.Is(u, "334")) { return MailResult.Fail(Mailer.Why(u, "账号被拒绝")); }
+            string p = await s.Say(Encoding.Base64Encode(pass));
+            if (!Mailer.Is(p, "235")) { return MailResult.Fail(Mailer.Why(p, "认证失败")); }
+        }
+
+        string mf = await s.Say("MAIL FROM:<" + from + ">");
+        if (!Mailer.Is(mf, "250")) { return MailResult.Fail(Mailer.Why(mf, "发件地址被拒绝")); }
+        string rc = await s.Say("RCPT TO:<" + to + ">");
+        if (!Mailer.Is(rc, "250") && !Mailer.Is(rc, "251")) {
+            return MailResult.Fail(Mailer.Why(rc, "收件地址被拒绝"));
+        }
+        string data = await s.Say("DATA");
+        if (!Mailer.Is(data, "354")) { return MailResult.Fail(Mailer.Why(data, "服务器拒绝接收正文")); }
+
+        string sender = from;
+        if (fromName.Length > 0) {
+            sender = "=?UTF-8?B?" + Encoding.Base64Encode(fromName) + "?= <" + from + ">";
+        }
+        string mail = "From: " + sender + "\r\n"
+            + "To: <" + to + ">\r\n"
+            + "Subject: =?UTF-8?B?" + Encoding.Base64Encode(subject) + "?=\r\n"
+            + "MIME-Version: 1.0\r\n"
+            + "Content-Type: text/plain; charset=UTF-8\r\n"
+            + "Content-Transfer-Encoding: base64\r\n"
+            + "\r\n"
+            + Encoding.Base64Encode(body) + "\r\n";
+        int _n = await s.Write(mail);
+        string done = await s.Say(".");
+        if (!Mailer.Is(done, "250")) { return MailResult.Fail(Mailer.Why(done, "投递失败")); }
+        string _bye = await s.Say("QUIT");
+        return MailResult.Good();
+    }
+
+    static bool Is(string reply, string code) {
+        return reply.Length >= 3 && reply.Substring(0, 3) == code;
+    }
+
+    static string Why(string reply, string fallback) {
+        if (reply.Length == 0) { return fallback; }
+        return fallback + "：" + reply;
+    }
+}

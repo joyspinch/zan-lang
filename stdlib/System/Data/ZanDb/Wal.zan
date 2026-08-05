@@ -14,18 +14,18 @@ class PendingWalPage {
 }
 
 /// <summary>
-/// Write-ahead log: sequential, CRC-guarded frames appended per transaction,
-/// closed by a commit record and fsynced. SSD-friendly (append-only) and the
-/// sole durability point of a commit: page frames of transactions that lack a
-/// valid commit record are ignored during recovery, giving atomic all-or-
-/// nothing commits.
+/// 预写日志（WAL）：按事务追加的顺序帧，带 CRC 保护，
+/// 以提交记录收尾并 fsync。对 SSD 友好（仅追加），是
+/// 提交的唯一持久化点：缺少
+/// 有效提交记录的事务页帧在恢复时被忽略，从而保证原子性——
+/// 要么全部提交，要么全不提交。
 ///
-/// Frame layout (little-endian):
-///   u32 type      1 = page frame, 2 = commit record
+/// 帧布局（小端）：
+///   u32 type      1 = 页帧，2 = 提交记录
 ///   u64 pageId    (frames) / commitId (commit records)
 ///   u32 payloadLen
-///   u32 crc32     of the payload
-///   payload       payloadLen bytes (page image; commit records have none)
+///   u32 crc32     载荷的 CRC32
+///   payload       载荷，payloadLen 字节（页镜像；提交记录没有）
 /// </summary>
 class Wal {
     static int FRAME_PAGE = 1;
@@ -51,10 +51,10 @@ class Wal {
 
     bool IsOpen() { return this.file.IsOpen(); }
 
-    /// <summary>Current WAL file size in bytes.</summary>
+    /// <summary>当前 WAL 文件大小（字节）。</summary>
     long Size() { return this.file.Size(); }
 
-    /// <summary>Appends one page image; not yet durable (see AppendCommit).</summary>
+    /// <summary>追加一页镜像；此时尚未持久化（见 AppendCommit）。</summary>
     bool AppendFrame(int pageId, ByteBuffer page) {
         ByteBuffer h = ByteBuffer.Alloc(Wal.HEADER_LEN);
         h.WriteU32(Wal.FRAME_PAGE);
@@ -67,7 +67,7 @@ class Wal {
         return this.file.Append(page.Raw(), this.pageSize) >= 0;
     }
 
-    /// <summary>Appends a commit record and fsyncs: the durability point.</summary>
+    /// <summary>追加提交记录并 fsync：这是持久化点。</summary>
     bool AppendCommit(long commitId) {
         ByteBuffer h = ByteBuffer.Alloc(Wal.HEADER_LEN);
         h.WriteU32(Wal.FRAME_COMMIT);
@@ -80,17 +80,17 @@ class Wal {
         return this.file.Sync();
     }
 
-    /// <summary>Replays committed transactions into the main database file.
-    /// Uncommitted trailing frames (torn writes, crash mid-transaction) are
-    /// discarded. Idempotent: replaying already-checkpointed frames simply
-    /// rewrites identical page images. Resets the WAL afterwards.</summary>
+    /// <summary>将已提交事务重放到主数据库文件。
+    /// 未提交的尾部帧（撕裂写入、事务中途崩溃）会被
+    /// 丢弃。幂等：重放已检查点的帧只是
+    /// 重写相同的页镜像。之后重置 WAL。</summary>
     int Recover(PageFile db) {
         long size = this.file.Size();
         if (size <= 0) { return 0; }
 
         int applied = 0;
         long off = 0;
-        // Pending frames of the transaction currently being scanned.
+        // 当前正在扫描的事务的待处理帧。
         List<PendingWalPage> pending = new List<PendingWalPage>();
         ByteBuffer h = ByteBuffer.Alloc(Wal.HEADER_LEN);
         ByteBuffer payload = ByteBuffer.Alloc(this.pageSize);
@@ -112,7 +112,7 @@ class Wal {
                 ByteBuffer copy = ByteBuffer.FromRaw(payload.Raw(), plen);
                 pending.Add(new PendingWalPage(id, copy));
             } else if (type == Wal.FRAME_COMMIT) {
-                // Whole transaction present: apply it.
+                // 整个事务完整：应用它。
                 for (int i = 0; i < pending.Count; i = i + 1) {
                     PendingWalPage page = pending[i];
                     db.WriteAt((long)page.id * this.pageSize, page.data.Raw(), this.pageSize);
@@ -121,11 +121,11 @@ class Wal {
                 applied = applied + pending.Count;
                 pending = new List<PendingWalPage>();
             } else {
-                break;   // corrupt/unknown frame: stop scanning
+                break;   // 损坏/未知帧：停止扫描
             }
         }
 
-        // Drop any uncommitted tail.
+        // 丢弃未提交的尾部。
         for (int j = 0; j < pending.Count; j = j + 1) {
             pending[j].data.Free();
         }
@@ -137,7 +137,7 @@ class Wal {
         return applied;
     }
 
-    /// <summary>Truncates the WAL (after a successful main-file checkpoint).</summary>
+    /// <summary>截断 WAL（主文件检查点成功后调用）。</summary>
     void Reset() {
         this.file.Close();
         File.Delete(this.path);

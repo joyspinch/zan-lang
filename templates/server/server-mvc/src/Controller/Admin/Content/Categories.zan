@@ -1,0 +1,142 @@
+using System;
+using System.Data;
+using System.Data.Orm;
+using System.Web;
+using ZanWeb;
+using ZanWeb.Model.Blog;
+
+namespace ZanWeb.Admin.Content;
+
+/// <summary>Blog sections at /admin/content/categories. The slug is what the public
+/// URLs carry, so it is unique and renaming the display name never breaks a
+/// link.</summary>
+[Route("admin/content/categories/[action]")]
+[Custom(Authorization = CustomAuthorization.Grant)]
+[Description("分类管理")]
+class Categories : AdminController {
+    [HttpGet]
+    [Route("/admin/content/categories")]
+    [Custom(IsMenu = true, Icon = "mdi:tag")]
+    [Description("分类管理")]
+    async void Index() {
+        ViewData d = await this.Layout("分类管理");
+        if (!this.DbReady()) { d.Set("dbDown", "1"); this.Page(d); return; }
+
+        List<Category> rows = await this.Category.OrderBy(a => a.sortOrder).ToListAsync();
+        List<Post> posts = await this.Post.ToListAsync();
+        List<StrMap> items = d.AddList("rows");
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            Category c = rows[i];
+            StrMap row = new StrMap();
+            row.Set("id", Convert.ToString(c.id));
+            row.Set("name", c.name);
+            row.Set("slug", c.slug);
+            row.Set("description", Fmt.Dash(c.description));
+            row.Set("sortOrder", Convert.ToString(c.sortOrder));
+            row.Set("posts", Convert.ToString(Categories.CountIn(posts, c.id)));
+            row.Set("statusText", Categories.StatusText(c.status));
+            row.Set("statusClass", Categories.StatusClass(c.status));
+            items.Add(row);
+        }
+        d.Set("total", Convert.ToString(rows.Count));
+        if (rows.Count == 0) { d.Set("empty", "1"); }
+        this.Page(d);
+    }
+
+    [HttpGet]
+    [Description("分类表单")]
+    async void Form() {
+        int id = this.InInt("id", 0);
+        ViewData d = new ViewData();
+        d.Set("id", Convert.ToString(id));
+        d.Set("dialogTitle", "新增分类");
+        d.Set("sortOrder", "1");
+        d.Set("status1", "selected");
+        if (id > 0) {
+            Category c = await this.Category.Read(id);
+            if (c == null) { this.Fail(404, "0404", "分类不存在"); }
+            d.Set("dialogTitle", "编辑分类");
+            d.Set("name", c.name);
+            d.Set("slug", c.slug);
+            d.Set("description", c.description);
+            d.Set("sortOrder", Convert.ToString(c.sortOrder));
+            d.Set("status1", "");
+            if (c.status == 1) { d.Set("status1", "selected"); }
+            else { d.Set("status0", "selected"); }
+        }
+        this.Dialog(d);
+    }
+
+    [HttpPost]
+    [Description("保存分类")]
+    async void Save() {
+        int id = this.InInt("id", 0);
+        string name = this.Need("name", "分类名称");
+        string slug = this.Need("slug", "分类标识");
+        string description = this.In("description");
+        int sortOrder = this.InInt("sortOrder", 1);
+        int status = this.InInt("status", 1);
+        if (status != 1) { status = 0; }
+        Category clash = await this.Category.Where(a => a.slug == slug).FirstAsync();
+        if (clash != null && clash.id != id) {
+            this.Fail(400, "0004", "分类标识 " + slug + " 已存在");
+        }
+        if (id > 0) {
+            int n = await this.Category.Update()
+                .Set(a => a.name, name)
+                .Set(a => a.slug, slug)
+                .Set(a => a.description, description)
+                .Set(a => a.sortOrder, sortOrder)
+                .Set(a => a.status, status)
+                .Where(a => a.id == id)
+                .ExecuteAffrowsAsync();
+            await this.Note("编辑分类", name, n > 0, "");
+            this.Saved("分类已保存");
+            return;
+        }
+        Category c = new Category();
+        c.name = name;
+        c.slug = slug;
+        c.description = description;
+        c.sortOrder = sortOrder;
+        c.status = status;
+        c.createdAt = WebApp.NowSeconds();
+        int newId = await this.Category.Insert(c).ExecuteIdentityAsync();
+        await this.Note("新增分类", name, newId > 0, "");
+        this.Saved("分类已创建");
+    }
+
+    [HttpPost]
+    [Description("删除分类")]
+    async void Delete() {
+        int id = this.InInt("id", 0);
+        Category c = await this.Category.Read(id);
+        if (c == null) { this.Fail(404, "0404", "分类不存在"); }
+        int used = await this.Post.Where(a => a.categoryId == id).CountAsync();
+        if (used > 0) {
+            this.Fail(400, "0004", "该分类下还有 " + Convert.ToString(used) + " 篇文章");
+        }
+        int n = await this.Category.Delete().Where(a => a.id == id)
+            .ExecuteAffrowsAsync();
+        await this.Note("删除分类", c.name, n > 0, "");
+        this.Saved("分类已删除");
+    }
+
+    static int CountIn(List<Post> posts, int categoryId) {
+        int n = 0;
+        for (int i = 0; i < posts.Count; i = i + 1) {
+            if (posts[i].categoryId == categoryId) { n = n + 1; }
+        }
+        return n;
+    }
+
+    static string StatusText(int status) {
+        if (status == 1) { return "显示"; }
+        return "隐藏";
+    }
+
+    static string StatusClass(int status) {
+        if (status == 1) { return "ok"; }
+        return "off";
+    }
+}

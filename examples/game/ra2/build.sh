@@ -5,7 +5,9 @@
 set -e
 root="$(cd "$(dirname "$0")/../../.." && pwd)"
 cd "$root"
-build/zanc examples/game/ra2/main.zan \
+zanc=build/zanc
+[ -x "$zanc" ] || zanc=build/zanc.exe
+"$zanc" examples/game/ra2/main.zan \
   examples/game/ra2/formats/*.zan \
   examples/game/ra2/assets/*.zan \
   examples/game/ra2/render/*.zan \

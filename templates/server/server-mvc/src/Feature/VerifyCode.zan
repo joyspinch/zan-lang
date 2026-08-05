@@ -1,0 +1,75 @@
+using System;
+using System.Security.Cryptography;
+using System.Web;
+
+namespace ZanWeb;
+
+/// <summary>
+/// The six-digit codes mailed by the sign-up and password-reset flows.
+///
+/// A code lives in the cache under "code:&lt;purpose&gt;:&lt;address&gt;", so it
+/// expires by itself and is visible to every worker when Redis is configured.
+/// A second entry ("...:sent") is the resend throttle: one mail per minute per
+/// address, which is what stops the form from being used as a mail cannon.
+///
+/// Verification is one-shot -- the entry is dropped as soon as it matches, so a
+/// code cannot be replayed.
+/// </summary>
+class VerifyCode {
+    static int TtlSeconds = 600;
+    static int ResendSeconds = 60;
+
+    static string Key(string purpose, string address) {
+        return "code:" + purpose + ":" + address.ToLower();
+    }
+
+    static CacheContext Cache() {
+        AppServices s = AppServices.Current();
+        if (s == null) { return null; }
+        return s.Cache();
+    }
+
+    /// <summary>True when the last mail to this address is younger than the
+    /// resend window.</summary>
+    static async bool TooSoon(string purpose, string address) {
+        CacheContext c = VerifyCode.Cache();
+        if (c == null) { return false; }
+        string hit = await c.GetAsync(VerifyCode.Key(purpose, address) + ":sent");
+        return hit.Length > 0;
+    }
+
+    /// <summary>Issues a code and remembers it for ten minutes.</summary>
+    static async string Issue(string purpose, string address) {
+        string code = VerifyCode.Digits(6);
+        CacheContext c = VerifyCode.Cache();
+        if (c == null) { return code; }
+        await c.SetTtlAsync(VerifyCode.Key(purpose, address), code, VerifyCode.TtlSeconds);
+        await c.SetTtlAsync(VerifyCode.Key(purpose, address) + ":sent", "1",
+            VerifyCode.ResendSeconds);
+        return code;
+    }
+
+    /// <summary>Checks a code and consumes it. False when it is wrong, expired
+    /// or already used.</summary>
+    static async bool Accept(string purpose, string address, string code) {
+        if (code.Length == 0) { return false; }
+        CacheContext c = VerifyCode.Cache();
+        if (c == null) { return false; }
+        string key = VerifyCode.Key(purpose, address);
+        string want = await c.GetAsync(key);
+        if (want.Length == 0 || want != code) { return false; }
+        await c.DelAsync(key);
+        return true;
+    }
+
+    static string Digits(int n) {
+        byte[] raw = RandomNumberGenerator.GetBytes(n);
+        string digits = "";
+        for (int i = 0; i < n; i = i + 1) {
+            int v = (int)raw[i];
+            if (v < 0) { v = 0 - v; }
+            digits = digits + Convert.ToString(v % 10);
+        }
+        return digits;
+    }
+}

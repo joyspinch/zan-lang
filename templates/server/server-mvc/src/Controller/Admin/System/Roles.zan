@@ -1,0 +1,258 @@
+using System;
+using System.Data;
+using System.Data.Orm;
+using System.Web;
+using ZanWeb;
+using ZanWeb.Model.Sys;
+
+namespace ZanWeb.Admin.System;
+
+/// <summary>
+/// Roles at /admin/system/roles, and the screen that decides what each one may do.
+///
+/// A role is the only thing that carries rights: accounts get roles, roles get
+/// route actions, and the dispatcher asks that graph on every request. So the
+/// grant dialog is the route table with checkboxes -- the rights it offers are
+/// the actions that exist, which means a new screen is grantable as soon as it
+/// compiles and a deleted one disappears from the list on its own.
+/// </summary>
+[Route("admin/system/roles/[action]")]
+[Custom(Authorization = CustomAuthorization.Grant)]
+[Description("角色管理")]
+class Roles : AdminController {
+    [HttpGet]
+    [Route("/admin/system/roles")]
+    [Custom(IsMenu = true, Icon = "mdi:shield-account")]
+    [Description("角色管理")]
+    async void Index() {
+        ViewData d = await this.Layout("角色管理");
+        if (!this.DbReady()) { d.Set("dbDown", "1"); this.Page(d); return; }
+
+        ListQuery q = this.Paged("rank", 20);
+        string kw = q.Kw();
+        int total = await this.Role
+            .WhereIf(kw.Length > 0, a => a.name.Contains(kw)).CountAsync();
+        List<Role> rows = await this.Role
+            .WhereIf(kw.Length > 0, a => a.name.Contains(kw))
+            .OrderBy(a => a.rank).Skip(q.Skip()).Take(q.Limit()).ToListAsync();
+        List<StrMap> items = d.AddList("rows");
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            Role r = rows[i];
+            StrMap row = new StrMap();
+            row.Set("id", Convert.ToString(r.id));
+            row.Set("name", r.name);
+            row.Set("code", r.code);
+            row.Set("rank", Convert.ToString(r.rank));
+            row.Set("description", Fmt.Dash(r.description));
+            int perms = await this.RoleGrant.Where(a => a.roleId == r.id).CountAsync();
+            int users = await this.UserRole.Where(a => a.roleId == r.id).CountAsync();
+            row.Set("perms", Convert.ToString(perms));
+            row.Set("users", Convert.ToString(users));
+            row.Set("statusText", Roles.StatusText(r.status));
+            row.Set("statusClass", Roles.StatusClass(r.status));
+            items.Add(row);
+        }
+        this.Pager(d, q, total);
+        this.Page(d);
+    }
+
+    [HttpGet]
+    [Description("角色表单")]
+    async void Form() {
+        int id = this.InInt("id", 0);
+        ViewData d = new ViewData();
+        d.Set("id", Convert.ToString(id));
+        d.Set("dialogTitle", "新增角色");
+        d.Set("rank", "10");
+        d.Set("status1", "selected");
+        if (id > 0) {
+            Role r = await this.Find(id);
+            d.Set("dialogTitle", "编辑角色");
+            d.Set("name", r.name);
+            d.Set("code", r.code);
+            d.Set("rank", Convert.ToString(r.rank));
+            d.Set("description", r.description);
+            d.Set("status1", "");
+            if (r.status == 1) { d.Set("status1", "selected"); }
+            else { d.Set("status0", "selected"); }
+        }
+        this.Dialog(d);
+    }
+
+    [HttpPost]
+    [Description("保存角色")]
+    async void Save() {
+        int id = this.InInt("id", 0);
+        string name = this.Need("name", "角色名称");
+        string code = this.Need("code", "角色标识");
+        int rank = this.InInt("rank", 10);
+        int status = this.InInt("status", 1);
+        string description = this.In("description");
+        if (status != 1) { status = 0; }
+
+        Role clash = await this.Role.Where(a => a.code == code).FirstAsync();
+        if (clash != null && clash.id != id) {
+            this.Fail(400, Codes.Conflict, "角色标识 " + code + " 已存在");
+        }
+        if (id > 0) {
+            int n = await this.Role.Update()
+                .Set(a => a.name, name)
+                .Set(a => a.code, code)
+                .Set(a => a.rank, rank)
+                .Set(a => a.status, status)
+                .Set(a => a.description, description)
+                .Set(a => a.updatedAt, WebApp.NowSeconds())
+                .Where(a => a.id == id)
+                .ExecuteAffrowsAsync();
+            await AuthUser.RolesChanged(this.Held());
+            await this.Note("编辑角色", code, n > 0, "");
+            this.Saved("角色已保存");
+            return;
+        }
+        Role r = new Role();
+        r.name = name;
+        r.code = code;
+        r.rank = rank;
+        r.status = status;
+        r.description = description;
+        r.createdAt = WebApp.NowSeconds();
+        r.updatedAt = r.createdAt;
+        int newId = await this.Role.Insert(r).ExecuteIdentityAsync();
+        await this.Note("新增角色", code, newId > 0, "");
+        this.Saved("角色已创建");
+    }
+
+    [HttpPost]
+    [Description("删除角色")]
+    async void Delete() {
+        int id = this.InInt("id", 0);
+        Role r = await this.Find(id);
+        int held = await this.UserRole.Where(a => a.roleId == id).CountAsync();
+        if (held > 0) {
+            this.Fail(400, Codes.Conflict, "还有 " + Convert.ToString(held)
+                + " 个账号在使用该角色，请先解除分配");
+        }
+        int n = await this.Role.Delete().Where(a => a.id == id).ExecuteAffrowsAsync();
+        int _g = await this.RoleGrant.Delete().Where(a => a.roleId == id)
+            .ExecuteAffrowsAsync();
+        await AuthUser.RolesChanged(this.Held());
+        await this.Note("删除角色", r.code, n > 0, "");
+        this.Saved("角色已删除");
+    }
+
+    /// <summary>The grant dialog: every protected action in the route table,
+    /// grouped by the screen it belongs to, with the ones this role holds
+    /// ticked.</summary>
+    [HttpGet]
+    [Description("角色授权")]
+    async void Grant() {
+        int id = this.InInt("id", 0);
+        Role r = await this.Find(id);
+        ViewData d = new ViewData();
+        d.Set("id", Convert.ToString(id));
+        d.Set("name", r.name);
+        List<RoleGrant> held = await this.RoleGrant
+            .Where(a => a.roleId == id).ToListAsync();
+        string has = ",";
+        for (int i = 0; i < held.Count; i = i + 1) { has = has + held[i].action + ","; }
+
+        List<StrMap> rows = d.AddList("perms");
+        List<Route> routes = Roles.Grantable();
+        string group = "";
+        for (int i = 0; i < routes.Count; i = i + 1) {
+            Route route = routes[i];
+            string owner = Roles.Owner(route.action);
+            if (owner != group) {
+                group = owner;
+                StrMap head = new StrMap();
+                head.Set("group", group);
+                rows.Add(head);
+            }
+            StrMap row = new StrMap();
+            row.Set("id", route.action);
+            row.Set("name", Fmt.Text(route.title, route.action));
+            row.Set("code", route.method + " " + route.pattern);
+            if (has.Contains("," + route.action + ",")) { row.Set("checked", "checked"); }
+            rows.Add(row);
+        }
+        this.Dialog(d);
+    }
+
+    [HttpPost]
+    [Description("保存角色授权")]
+    async void GrantSave() {
+        int id = this.InInt("id", 0);
+        Role r = await this.Find(id);
+        string picked = this.In("permIds");
+        int _cleared = await this.RoleGrant.Delete()
+            .Where(a => a.roleId == id).ExecuteAffrowsAsync();
+
+        // Only actions that exist can be granted: the form is a list of route
+        // actions, so anything else in the submission is a forged field.
+        long now = WebApp.NowSeconds();
+        List<Route> routes = Roles.Grantable();
+        int granted = 0;
+        for (int i = 0; i < routes.Count; i = i + 1) {
+            string action = routes[i].action;
+            if (!AuthUser.Holds(picked, action)) { continue; }
+            RoleGrant g = new RoleGrant();
+            g.roleId = id;
+            g.action = action;
+            g.createdAt = now;
+            int _n = await this.RoleGrant.Insert(g).ExecuteIdentityAsync();
+            granted = granted + 1;
+        }
+        await AuthUser.RolesChanged(this.Held());
+        await this.Note("角色授权", r.code, true,
+            Convert.ToString(granted) + " 项权限");
+        this.Saved("授权已保存");
+    }
+
+    async Role Find(int id) {
+        Role r = await this.Role.Read(id);
+        if (r == null) { this.Fail(404, Codes.NotFound, "角色不存在"); }
+        return r;
+    }
+
+    /// <summary>The rights that exist: every protected action in the route
+    /// table, each listed once (a route registered for two methods is one
+    /// right), ordered by the screen that owns it.</summary>
+    static List<Route> Grantable() {
+        List<Route> all = WebHost.Current().router.All();
+        List<Route> outp = new List<Route>();
+        string seen = ",";
+        for (int i = 0; i < all.Count; i = i + 1) {
+            Route r = all[i];
+            if (!r.needsAuth || r.action.Length == 0) { continue; }
+            if (seen.Contains("," + r.action + ",")) { continue; }
+            seen = seen + r.action + ",";
+            Roles.InsertSorted(outp, r);
+        }
+        return outp;
+    }
+
+    static void InsertSorted(List<Route> list, Route r) {
+        int i = list.Count;
+        while (i > 0 && String.CompareOrdinal(list[i - 1].action, r.action) > 0) {
+            i = i - 1;
+        }
+        list.Insert(i, r);
+    }
+
+    /// <summary>The screen an action belongs to: "Users.Save" -> "Users".</summary>
+    static string Owner(string action) {
+        int dot = action.IndexOf(".");
+        if (dot <= 0) { return action; }
+        return action.Substring(0, dot);
+    }
+
+    static string StatusText(int status) {
+        if (status == 1) { return "启用"; }
+        return "停用";
+    }
+
+    static string StatusClass(int status) {
+        if (status == 1) { return "ok"; }
+        return "off";
+    }
+}

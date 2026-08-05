@@ -1725,13 +1725,21 @@ int main(int argc, char **argv) {
     phase("parse");
 
     if (!zan_diag_has_errors(diag)) {
+        zan_compile_trace("flatten nested types");
         zan_parser_flatten_nested_types(ast, arena, diag);
+        zan_compile_trace("merge partials");
         zan_parser_merge_partials(ast, arena, diag);
+        zan_compile_trace("desugar events");
         zan_parser_desugar_events(ast, arena, diag);
+        zan_compile_trace("nsresolve");
         zan_nsresolve_run(ast, arena, diag);
+        zan_compile_trace("jsongen");
         zan_jsongen_run(ast, arena, diag);
+        zan_compile_trace("dbgen");
         zan_dbgen_run(ast, arena, diag);
+        zan_compile_trace("routegen");
         zan_routegen_run(ast, arena, diag);
+        zan_compile_trace("resolve done");
     }
 
     /* --emit-symbols: the IDE and the language server read this index instead
@@ -1767,6 +1775,7 @@ int main(int argc, char **argv) {
     /* ---- bind ---- */
     zan_binder_t binder;
     zan_binder_init(&binder, arena, diag);
+    zan_compile_trace("bind");
     zan_binder_bind(&binder, ast);
 
     phase("bind");
@@ -1774,6 +1783,7 @@ int main(int argc, char **argv) {
     /* ---- type check ---- */
     zan_checker_t checker;
     zan_checker_init(&checker, &binder, arena, diag);
+    zan_compile_trace("check");
     zan_checker_check(&checker, ast);
 
     if (do_dump_ast) {

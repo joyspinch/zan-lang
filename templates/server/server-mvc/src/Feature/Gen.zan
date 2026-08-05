@@ -1,0 +1,479 @@
+using System;
+using System.Data;
+using System.Data.Orm;
+using System.Text;
+using System.Web;
+using ZanWeb.Model.Sys;
+
+namespace ZanWeb;
+
+/// <summary>
+/// The table designer's engine: it turns a saved design (GenTable + GenColumn)
+/// into DDL for the connected engine, and into readable .zan sources.
+///
+/// Two products from one design, because they answer different needs. The DDL
+/// plus the generic screens in Admin.Data make a designed table manageable the
+/// moment it is saved -- no rebuild, which is the whole point of designing a
+/// table from a running admin. The generated sources are for the table that
+/// outgrows a generic screen: they are ordinary controllers and views, checked
+/// by the compiler like the hand-written ones, and free to be edited afterwards.
+///
+/// Identifiers never come from the request. Everything that reaches SQL as a
+/// name is checked by Safe() first and everything that reaches SQL as a value
+/// is bound as a parameter, so a designed screen cannot be talked into naming
+/// a column or a table of the caller's choosing.
+/// </summary>
+class Gen {
+    /// <summary>True for a name that may be written into SQL: lower-case
+    /// letters, digits and underscore, starting with a letter.</summary>
+    static bool Safe(string name) {
+        if (name == null) { return false; }
+        int n = name.Length;
+        if (n == 0 || n > 64) { return false; }
+        for (int i = 0; i < n; i = i + 1) {
+            string ch = name.Substring(i, 1);
+            bool lower = ch >= "a" && ch <= "z";
+            bool digit = ch >= "0" && ch <= "9";
+            if (i == 0 && !lower) { return false; }
+            if (!lower && !digit && ch != "_") { return false; }
+        }
+        return true;
+    }
+
+    /// <summary>Physical type for a designed kind on the connected engine.</summary>
+    static string SqlType(string kind, int size, int provider) {
+        bool sqlite = provider == DbProvider.SQLite;
+        if (kind == "int" || kind == "bool") {
+            if (sqlite) { return "INTEGER"; }
+            return "INT";
+        }
+        if (kind == "long" || kind == "datetime") {
+            if (sqlite) { return "INTEGER"; }
+            return "BIGINT";
+        }
+        if (kind == "decimal") {
+            if (sqlite) { return "REAL"; }
+            return "DECIMAL(18,4)";
+        }
+        if (kind == "text") { return "TEXT"; }
+        int n = size;
+        if (n <= 0) { n = 255; }
+        if (sqlite) { return "TEXT"; }
+        return "VARCHAR(" + Convert.ToString(n) + ")";
+    }
+
+    /// <summary>One column's DDL fragment.</summary>
+    static string ColumnSql(GenColumn c, int provider) {
+        string sql = c.name + " " + Gen.SqlType(c.kind, c.size, provider);
+        if (c.nullable != 1) { sql = sql + " NOT NULL"; }
+        if (c.defValue.Length > 0 && Gen.Literal(c).Length > 0) {
+            sql = sql + " DEFAULT " + Gen.Literal(c);
+        }
+        return sql;
+    }
+
+    /// <summary>The default value as a literal, or "" when it cannot be used as
+    /// one. Text defaults are quoted with the quote doubled, numbers are only
+    /// accepted when they really are numbers.</summary>
+    static string Literal(GenColumn c) {
+        string v = c.defValue;
+        if (v.Length == 0) { return ""; }
+        if (c.kind == "int" || c.kind == "long" || c.kind == "bool"
+            || c.kind == "decimal" || c.kind == "datetime") {
+            for (int i = 0; i < v.Length; i = i + 1) {
+                string ch = v.Substring(i, 1);
+                bool digit = ch >= "0" && ch <= "9";
+                if (!digit && ch != "-" && ch != ".") { return ""; }
+            }
+            return v;
+        }
+        return "'" + v.Replace("'", "''") + "'";
+    }
+
+    /// <summary>CREATE TABLE for a design. Every table gets an identity `id`,
+    /// which the screens and the generated code rely on for row identity.</summary>
+    static string CreateSql(GenTable t, List<GenColumn> cols, int provider) {
+        string idCol = "id INTEGER PRIMARY KEY AUTOINCREMENT";
+        if (provider != DbProvider.SQLite) {
+            idCol = "id INT NOT NULL AUTO_INCREMENT PRIMARY KEY";
+        }
+        string sql = "CREATE TABLE " + t.tableName + " (" + idCol;
+        for (int i = 0; i < cols.Count; i = i + 1) {
+            if (cols[i].name == "id") { continue; }
+            sql = sql + ", " + Gen.ColumnSql(cols[i], provider);
+        }
+        return sql + ")";
+    }
+
+    /// <summary>The column names the physical table already has.</summary>
+    static async List<string> Existing(IDbConnection db, string table) {
+        List<string> names = new List<string>();
+        int provider = db.GetProvider();
+        string sql = "SELECT * FROM " + table + " WHERE 1 = 0";
+        if (provider == DbProvider.SQLite) {
+            sql = "PRAGMA table_info(" + table + ")";
+        }
+        DbResult r = await db.QueryAsync(sql);
+        if (r == null) { return names; }
+        if (provider == DbProvider.SQLite) {
+            for (int i = 0; i < r.RowCount(); i = i + 1) {
+                names.Add(r.GetByName(i, "name"));
+            }
+            return names;
+        }
+        for (int i = 0; i < r.ColumnCount(); i = i + 1) {
+            names.Add(r.GetColumnName(i));
+        }
+        return names;
+    }
+
+    /// <summary>Creates the table, or adds the columns the design has and the
+    /// table does not. Columns are never dropped or retyped here: that destroys
+    /// data, and an operator who wants it should say so in SQL.</summary>
+    static async int Migrate(IDbConnection db, GenTable t, List<GenColumn> cols) {
+        int provider = db.GetProvider();
+        List<string> have = new List<string>();
+        bool exists = true;
+        try {
+            have = await Gen.Existing(db, t.tableName);
+        } catch {
+            exists = false;
+        }
+        if (!exists || have.Count == 0) {
+            int _c = await db.ExecuteAsync(Gen.CreateSql(t, cols, provider));
+            return cols.Count;
+        }
+        int added = 0;
+        for (int i = 0; i < cols.Count; i = i + 1) {
+            GenColumn c = cols[i];
+            if (c.name == "id") { continue; }
+            bool found = false;
+            for (int j = 0; j < have.Count; j = j + 1) {
+                if (have[j] == c.name) { found = true; }
+            }
+            if (found) { continue; }
+            int _a = await db.ExecuteAsync("ALTER TABLE " + t.tableName
+                + " ADD COLUMN " + Gen.ColumnSql(c, provider));
+            added = added + 1;
+        }
+        return added;
+    }
+
+    // ---- source generation --------------------------------------------------
+
+    /// <summary>The Zan type a designed kind maps to.</summary>
+    static string ZanType(string kind) {
+        if (kind == "int" || kind == "bool") { return "int"; }
+        if (kind == "long" || kind == "datetime") { return "long"; }
+        if (kind == "decimal") { return "double"; }
+        return "string";
+    }
+
+    /// <summary>The entity source for a design.</summary>
+    static string ModelSource(GenTable t, List<GenColumn> cols) {
+        StringBuilder b = new StringBuilder();
+        b.Append("using System.Data.Orm;\n\nnamespace ZanWeb.Model.Gen;\n\n");
+        b.Append("/// <summary>" + t.title + "。由表设计器生成，可直接修改。</summary>\n");
+        b.Append("[Table(Name = \"" + t.tableName + "\")]\n");
+        b.Append("class " + t.entityName + " {\n");
+        b.Append("    [Column(IsIdentity = true)]\n    int id;\n");
+        for (int i = 0; i < cols.Count; i = i + 1) {
+            GenColumn c = cols[i];
+            if (c.name == "id") { continue; }
+            b.Append("\n");
+            if (c.label.Length > 0) {
+                b.Append("    /// <summary>" + c.label + "</summary>\n");
+            }
+            if (c.kind == "string") {
+                b.Append("    [Column(StringLength = "
+                    + Convert.ToString(Gen.Size(c)) + ")]\n");
+            }
+            b.Append("    " + Gen.ZanType(c.kind) + " " + c.name + ";\n");
+        }
+        b.Append("}\n");
+        return b.ToString();
+    }
+
+    static int Size(GenColumn c) {
+        if (c.size > 0) { return c.size; }
+        return 255;
+    }
+
+    /// <summary>The admin controller source for a design: list, dialog form,
+    /// save and delete. Authorization is the class attribute and nothing else:
+    /// the generated actions become route actions like every other screen's, so
+    /// they are grantable the moment the module is compiled in.
+    ///
+    /// The class is named after the entity ("ShopItem") and lives in
+    /// Controller/Admin so the directory matches the /admin URL and the route,
+    /// file, class and view all read the same token. The entity type would then
+    /// shadow the class name, so every reference to it is written in full
+    /// (ZanWeb.Model.Gen.ShopItem); `this.ShopItem` stays the compiler-provided
+    /// table accessor, which is a member and does not clash.</summary>
+    /// <summary>The URL a generated module is served at, below /admin: its
+    /// section and its table ("content/shoporder"). The sidebar reads the same
+    /// URL, so there is no group to declare anywhere.</summary>
+    static string Route(GenTable t) {
+        string sec = t.section;
+        if (!Gen.Safe(sec)) { sec = "content"; }
+        return sec + "/" + t.tableName.Replace("_", "");
+    }
+
+    static string ControllerSource(GenTable t, List<GenColumn> cols) {
+        string cls = t.entityName;
+        string mdl = "ZanWeb.Model.Gen." + t.entityName;
+        string route = Gen.Route(t);
+        StringBuilder b = new StringBuilder();
+        b.Append("using System;\nusing System.Data;\nusing System.Data.Orm;\n");
+        b.Append("using System.Web;\nusing ZanWeb;\n\n");
+        b.Append("namespace ZanWeb.Admin;\n\n");
+        b.Append("/// <summary>" + t.title
+            + " 管理。由表设计器生成，可直接修改。</summary>\n");
+        b.Append("[Route(\"admin/" + route + "/[action]\")]\n");
+        b.Append("[Custom(Authorization = CustomAuthorization.Grant)]\n");
+        b.Append("[Description(\"" + t.title + "\")]\n");
+        b.Append("class " + cls + " : AdminController {\n");
+
+        b.Append("    [HttpGet]\n    [Route(\"/admin/" + route + "\")]\n");
+        b.Append("    [Custom(IsMenu = true)]\n");
+        b.Append("    [Description(\"" + t.title + "列表\")]\n");
+        b.Append("    async void Index() {\n");
+        b.Append("        ViewData d = await this.Layout(\"" + t.title + "\");\n");
+        b.Append("        if (!this.DbReady()) { d.Set(\"dbDown\", \"1\"); this.Page(d); return; }\n");
+        b.Append("        ListQuery q = this.Paged(\"id\", 20);\n");
+        b.Append("        int total = await this." + cls + ".CountAsync();\n");
+        b.Append("        List<" + mdl + "> rows = await this." + cls + "\n");
+        b.Append("            .OrderByDescending(a => a.id)\n");
+        b.Append("            .Skip(q.Skip()).Take(q.Limit()).ToListAsync();\n");
+        b.Append("        List<StrMap> list = d.AddList(\"rows\");\n");
+        b.Append("        for (int i = 0; i < rows.Count; i = i + 1) {\n");
+        b.Append("            " + mdl + " e = rows[i];\n");
+        b.Append("            StrMap row = new StrMap();\n");
+        b.Append("            row.Set(\"id\", Convert.ToString(e.id));\n");
+        for (int i = 0; i < cols.Count; i = i + 1) {
+            GenColumn c = cols[i];
+            if (c.name == "id" || c.inList != 1) { continue; }
+            if (Gen.ZanType(c.kind) == "string") {
+                b.Append("            row.Set(\"" + c.name + "\", e." + c.name + ");\n");
+            } else {
+                b.Append("            row.Set(\"" + c.name
+                    + "\", Convert.ToString(e." + c.name + "));\n");
+            }
+        }
+        b.Append("            list.Add(row);\n        }\n");
+        b.Append("        this.Pager(d, q, total);\n        this.Page(d);\n    }\n\n");
+
+        b.Append("    [HttpGet]\n    [Description(\"" + t.title + "表单\")]\n");
+        b.Append("    async void Form() {\n");
+        b.Append("        int id = this.InInt(\"id\", 0);\n");
+        b.Append("        ViewData d = new ViewData();\n");
+        b.Append("        d.Set(\"id\", Convert.ToString(id));\n");
+        b.Append("        d.Set(\"dialogTitle\", \"新增" + t.title + "\");\n");
+        b.Append("        if (id > 0) {\n");
+        b.Append("            " + mdl + " e = await this." + cls + ".Read(id);\n");
+        b.Append("            if (e == null) { this.Fail(404, \"0404\", \"记录不存在\"); }\n");
+        b.Append("            d.Set(\"dialogTitle\", \"编辑" + t.title + "\");\n");
+        for (int i = 0; i < cols.Count; i = i + 1) {
+            GenColumn c = cols[i];
+            if (c.name == "id" || c.inEdit != 1) { continue; }
+            if (Gen.ZanType(c.kind) == "string") {
+                b.Append("            d.Set(\"" + c.name + "\", e." + c.name + ");\n");
+            } else {
+                b.Append("            d.Set(\"" + c.name
+                    + "\", Convert.ToString(e." + c.name + "));\n");
+            }
+        }
+        b.Append("        }\n        this.Dialog(d);\n    }\n\n");
+
+        b.Append("    [HttpPost]\n    [Description(\"保存" + t.title + "\")]\n");
+        b.Append("    async void Save() {\n");
+        b.Append("        int id = this.InInt(\"id\", 0);\n");
+        b.Append("        " + mdl + " e = new " + mdl + "();\n");
+        b.Append("        if (id > 0) {\n");
+        b.Append("            " + mdl + " cur = await this." + cls + ".Read(id);\n");
+        b.Append("            if (cur == null) { this.Fail(404, \"0404\", \"记录不存在\"); }\n");
+        b.Append("            e = cur;\n        }\n");
+        for (int i = 0; i < cols.Count; i = i + 1) {
+            GenColumn c = cols[i];
+            if (c.name == "id" || (c.inCreate != 1 && c.inEdit != 1)) { continue; }
+            string zt = Gen.ZanType(c.kind);
+            if (zt == "string") {
+                if (c.required == 1) {
+                    b.Append("        e." + c.name + " = this.Need(\"" + c.name
+                        + "\", \"" + Gen.LabelOf(c) + "\");\n");
+                } else {
+                    b.Append("        e." + c.name + " = this.In(\"" + c.name + "\");\n");
+                }
+            } else if (zt == "int") {
+                b.Append("        e." + c.name + " = this.InInt(\"" + c.name + "\", 0);\n");
+            } else if (zt == "long") {
+                b.Append("        e." + c.name + " = this.InLong(\"" + c.name + "\", 0);\n");
+            } else {
+                b.Append("        e." + c.name + " = this.InDouble(\"" + c.name + "\", 0.0);\n");
+            }
+        }
+        b.Append("        if (id > 0) {\n");
+        b.Append("            int n = await this." + cls + ".Update()\n");
+        for (int i = 0; i < cols.Count; i = i + 1) {
+            GenColumn c = cols[i];
+            if (c.name == "id" || c.inEdit != 1) { continue; }
+            b.Append("                .Set(a => a." + c.name + ", e." + c.name + ")\n");
+        }
+        b.Append("                .Where(a => a.id == id).ExecuteAffrowsAsync();\n");
+        b.Append("            await this.Note(\"编辑" + t.title
+            + "\", Convert.ToString(id), n > 0, \"\");\n");
+        b.Append("            this.Saved(\"已保存\");\n            return;\n        }\n");
+        b.Append("        int newId = await this." + cls
+            + ".Insert(e).ExecuteIdentityAsync();\n");
+        b.Append("        await this.Note(\"新增" + t.title
+            + "\", Convert.ToString(newId), newId > 0, \"\");\n");
+        b.Append("        this.Saved(\"已创建\");\n    }\n\n");
+
+        b.Append("    [HttpPost]\n    [Description(\"删除" + t.title + "\")]\n");
+        b.Append("    async void Delete() {\n");
+        b.Append("        int id = this.InInt(\"id\", 0);\n");
+        b.Append("        int n = await this." + cls
+            + ".Delete().Where(a => a.id == id).ExecuteAffrowsAsync();\n");
+        b.Append("        await this.Note(\"删除" + t.title
+            + "\", Convert.ToString(id), n > 0, \"\");\n");
+        b.Append("        this.Saved(\"已删除\");\n    }\n}\n");
+        return b.ToString();
+    }
+
+    static string LabelOf(GenColumn c) {
+        if (c.label.Length > 0) { return c.label; }
+        return c.name;
+    }
+
+    /// <summary>The list view for a generated controller.</summary>
+    static string ListViewSource(GenTable t, List<GenColumn> cols) {
+        string route = Gen.Route(t);
+        StringBuilder b = new StringBuilder();
+        b.Append("<div class=\"card\">\n  <div class=\"toolbar\">\n");
+        b.Append("    <b>" + t.title + "</b>\n    <span class=\"sp\"></span>\n");
+        b.Append("    <a class=\"btn sm primary\" href=\"/admin/" + route
+            + "/form\" data-dialog>新增</a>\n  </div>\n");
+        b.Append("  <table class=\"table\">\n    <thead><tr>");
+        b.Append("<th style=\"width:70px\">ID</th>");
+        for (int i = 0; i < cols.Count; i = i + 1) {
+            if (cols[i].inList != 1 || cols[i].name == "id") { continue; }
+            b.Append("<th>" + Gen.LabelOf(cols[i]) + "</th>");
+        }
+        b.Append("<th class=\"ops\">操作</th></tr></thead>\n    <tbody>\n");
+        b.Append("      {{#each rows}}\n      <tr><td class=\"mono\">{{id}}</td>");
+        for (int i = 0; i < cols.Count; i = i + 1) {
+            if (cols[i].inList != 1 || cols[i].name == "id") { continue; }
+            b.Append("<td>{{" + cols[i].name + "}}</td>");
+        }
+        b.Append("<td class=\"ops\">");
+        b.Append("<a href=\"/admin/" + route + "/form?id={{id}}\" data-dialog>编辑</a>");
+        b.Append("<a href=\"#\" data-post=\"/admin/" + route
+            + "/delete\" data-args=\"id={{id}}\" data-confirm=\"确定删除吗？\">删除</a>");
+        b.Append("</td></tr>\n      {{/each}}\n    </tbody>\n  </table>\n");
+        b.Append("  {{#if empty}}<div class=\"empty\">还没有数据</div>{{/if}}\n");
+        b.Append("</div>\n");
+        return b.ToString();
+    }
+
+    /// <summary>The dialog form for a generated controller.</summary>
+    static string FormViewSource(GenTable t, List<GenColumn> cols) {
+        string route = Gen.Route(t);
+        StringBuilder b = new StringBuilder();
+        b.Append("<form data-submit action=\"/admin/" + route + "/save\">\n");
+        b.Append("  <input type=\"hidden\" name=\"id\" value=\"{{id}}\">\n");
+        b.Append("  <div class=\"form\">\n");
+        for (int i = 0; i < cols.Count; i = i + 1) {
+            GenColumn c = cols[i];
+            if (c.name == "id" || (c.inCreate != 1 && c.inEdit != 1)) { continue; }
+            b.Append("    <label>" + Gen.LabelOf(c) + "</label>\n");
+            if (c.widget == "select") {
+                // A dropdown whose choices come from a dictionary type or from
+                // another table (relTable/relValue/relLabel), described here as
+                // data-* so the option source stays declarative. The current
+                // value is kept as one option so a save round-trips even before
+                // the choices are loaded.
+                string src = "";
+                if (c.dictType.Length > 0) {
+                    src = " data-dict=\"" + c.dictType + "\"";
+                } else if (c.relTable.Length > 0) {
+                    src = " data-rel-table=\"" + c.relTable + "\""
+                        + " data-rel-value=\"" + c.relValue + "\""
+                        + " data-rel-label=\"" + c.relLabel + "\"";
+                }
+                b.Append("    <select class=\"input\" name=\"" + c.name + "\""
+                    + src + "><option value=\"{{" + c.name + "}}\">{{" + c.name
+                    + "}}</option></select>\n");
+            } else if (c.widget == "textarea" || c.kind == "text") {
+                b.Append("    <textarea class=\"input\" name=\"" + c.name
+                    + "\" rows=\"3\">{{" + c.name + "}}</textarea>\n");
+            } else if (c.widget == "switch" || c.kind == "bool") {
+                b.Append("    <select class=\"input\" name=\"" + c.name
+                    + "\"><option value=\"1\">是</option><option value=\"0\">否</option></select>\n");
+            } else if (c.widget == "number" || Gen.ZanType(c.kind) != "string") {
+                b.Append("    <input class=\"input\" type=\"number\" name=\"" + c.name
+                    + "\" value=\"{{" + c.name + "}}\">\n");
+            } else {
+                b.Append("    <input class=\"input\" name=\"" + c.name
+                    + "\" value=\"{{" + c.name + "}}\">\n");
+            }
+        }
+        b.Append("  </div>\n</form>\n");
+        return b.ToString();
+    }
+
+    /// <summary>The data-access gateway for a design, mirroring the hand-written
+    /// DAOs (one connection-bound object, every read and write of the table in
+    /// one place). The class is {Entity}Dao, so the entity name is free to be
+    /// used unqualified here, unlike in the controller.</summary>
+    static string DaoSource(GenTable t, List<GenColumn> cols) {
+        string ent = t.entityName;
+        StringBuilder b = new StringBuilder();
+        b.Append("using System;\nusing System.Data;\nusing System.Data.Orm;\n");
+        b.Append("using ZanWeb.Model.Gen;\n\n");
+        b.Append("namespace ZanWeb.Dao.Gen;\n\n");
+        b.Append("/// <summary>" + t.title
+            + " 的数据网关。由表设计器生成，可直接修改。</summary>\n");
+        b.Append("class " + ent + "Dao {\n");
+        b.Append("    IDbConnection db;\n\n");
+        b.Append("    " + ent + "Dao(IDbConnection db) {\n");
+        b.Append("        this.db = db;\n    }\n\n");
+
+        b.Append("    async " + ent + " ById(int id) {\n");
+        b.Append("        return await this.db.Select<" + ent
+            + ">().Where(a => a.id == id).FirstAsync();\n    }\n\n");
+
+        b.Append("    async List<" + ent + "> All() {\n");
+        b.Append("        return await this.db.Select<" + ent
+            + ">().OrderByDescending(a => a.id).ToListAsync();\n    }\n\n");
+
+        b.Append("    async int Count() {\n");
+        b.Append("        return await this.db.Select<" + ent
+            + ">().CountAsync();\n    }\n\n");
+
+        b.Append("    async int Insert(" + ent + " e) {\n");
+        b.Append("        return await this.db.Insert<" + ent
+            + ">(e).ExecuteIdentityAsync();\n    }\n\n");
+
+        b.Append("    async int Update(" + ent + " e) {\n");
+        string sets = "";
+        for (int i = 0; i < cols.Count; i = i + 1) {
+            GenColumn c = cols[i];
+            if (c.name == "id") { continue; }
+            sets = sets + "            .Set(a => a." + c.name + ", e." + c.name
+                + ")\n";
+        }
+        if (sets.Length == 0) {
+            b.Append("        return 0;\n    }\n\n");
+        } else {
+            b.Append("        return await this.db.Update<" + ent + ">()\n");
+            b.Append(sets);
+            b.Append("            .Where(a => a.id == e.id).ExecuteAffrowsAsync();\n");
+            b.Append("    }\n\n");
+        }
+
+        b.Append("    async int Delete(int id) {\n");
+        b.Append("        return await this.db.Delete<" + ent
+            + ">().Where(a => a.id == id).ExecuteAffrowsAsync();\n    }\n}\n");
+        return b.ToString();
+    }
+}

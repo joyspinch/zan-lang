@@ -1,0 +1,640 @@
+using System;
+using System.Collections.Generic;
+using Ra2.Formats;
+using Ra2.Game;
+
+// Regression tests for the world/object logic: footprints, occupancy,
+// selection and pathfinding. The map is a synthetic 20x20 grid of clear cells
+// plus one raised cell; no game data is read.
+class ObjTest {
+
+    // An 11-byte IsoMapPack5 record for a cell.
+    static void PutCell(byte[] buf, int at, int x, int y, int tile, int level) {
+        buf[at] = (byte)(x & 0xFF);
+        buf[at + 1] = (byte)((x >> 8) & 0xFF);
+        buf[at + 2] = (byte)(y & 0xFF);
+        buf[at + 3] = (byte)((y >> 8) & 0xFF);
+        buf[at + 4] = (byte)(tile & 0xFF);
+        buf[at + 5] = (byte)((tile >> 8) & 0xFF);
+        buf[at + 6] = (byte)0;
+        buf[at + 7] = (byte)0;
+        buf[at + 8] = (byte)0;          // subTile
+        buf[at + 9] = (byte)(level & 0xFF);
+        buf[at + 10] = (byte)0;         // iceGrowth
+    }
+
+    // A 20x20 grid: every cell level 0 tile 1, so the whole area is passable
+    // except where structures stand. Cell (15,15) is raised to level 8 -- a
+    // real cliff height -- to test cliff blocking.
+    static IsoMap BuildMap() {
+        int n = 20 * 20;
+        byte[] buf = new byte[n * 11 + 1];
+        int i = 0;
+        for (int y = 0; y < 20; y = y + 1) {
+            for (int x = 0; x < 20; x = x + 1) {
+                int level = 0;
+                if (x == 15 && y == 15) { level = 8; }
+                ObjTest.PutCell(buf, i * 11, x, y, 1, level);
+                i = i + 1;
+            }
+        }
+        return IsoMap.Parse(buf, n * 11, 20, 20);
+    }
+
+    static string Pos(WorldObject o) {
+        return Convert.ToString(o.X()) + "," + Convert.ToString(o.Y());
+    }
+
+    // World.Tick returns [moved, fired, produced]; these peel it apart.
+    static int Moved(List<int> r) { return r[0]; }
+    static int Fired(List<int> r) { return r[1]; }
+    static int Produced(List<int> r) { return r[2]; }
+
+    // The index of a living object, or -1. Combat shifts indices around, so
+    // look-ups after a long battle have to search rather than trust a stored
+    // index.
+    static int FindObject(World w, int side, int kind, int buildId) {
+        for (int i = 0; i < w.ObjectCount(); i = i + 1) {
+            WorldObject o = w.ObjectAt(i);
+            if (o.Side() == side && o.Kind() == kind
+             && o.BuildId() == buildId && !o.IsDead()) { return i; }
+        }
+        return -1;
+    }
+    static string Hp(World w, int idx) {
+        if (idx < 0 || idx >= w.ObjectCount()) { return "gone"; }
+        return Convert.ToString(w.ObjectAt(idx).Hp());
+    }
+
+    static void Main() {
+        IsoMap iso = ObjTest.BuildMap();
+        World w = World.Create(iso, StructureCatalog.Create(), UnitCatalog.Create());
+        Console.WriteLine("grid=" + Convert.ToString(w.Width()) + "x"
+            + Convert.ToString(w.Height()));
+
+        // Place two structures whose footprints do not overlap.
+        // GACNST (4x3) at (2,2): cells (2,2)-(5,4).
+        int c0 = w.PlaceStructure(Side2.Allied(), 0, 2, 2);
+        Console.WriteLine("place_cnst=" + Convert.ToString(c0));
+        // GAPOWR (2x2) at (8,6): cells (8,6)-(9,7).
+        int c1 = w.PlaceStructure(Side2.Allied(), 1, 8, 6);
+        Console.WriteLine("place_powr=" + Convert.ToString(c1));
+
+        // Overlap and out-of-bounds are refused.
+        Console.WriteLine("overlap=" + Convert.ToString(w.PlaceStructure(Side2.Allied(), 0, 2, 2)));
+        Console.WriteLine("oob=" + Convert.ToString(w.PlaceStructure(Side2.Allied(), 0, 18, 2)));
+        Console.WriteLine("count=" + Convert.ToString(w.ObjectCount()));
+
+        // Units cannot spawn inside a footprint.
+        Console.WriteLine("unit_free=" + Convert.ToString(w.SpawnUnit(Side2.Allied(), 0, 0, 0)));
+        Console.WriteLine("unit_in_footprint=" + Convert.ToString(w.SpawnUnit(Side2.Allied(), 0, 3, 3)));
+        Console.WriteLine("unit_taken=" + Convert.ToString(w.SpawnUnit(Side2.Allied(), 0, 0, 0)));
+        Console.WriteLine("count2=" + Convert.ToString(w.ObjectCount()));
+
+        // Selection: a click on any footprint cell finds the structure; a
+        // click on a unit's cell finds the unit; one selection at a time.
+        Console.WriteLine("sel_footprint=" + Convert.ToString(w.SelectAt(3, 3)));
+        Console.WriteLine("sel_unit=" + Convert.ToString(w.SelectAt(0, 0)));
+        Console.WriteLine("sel_footprint2=" + Convert.ToString(w.SelectAt(8, 6)));
+        WorldObject sel = w.Selected();
+        Console.WriteLine("selected=" + (sel == null ? "none" : ObjTest.Pos(sel))
+            + " isSel=" + Convert.ToString(sel == null ? false : sel.IsSelected()));
+        Console.WriteLine("prev_deselected=" + Convert.ToString(w.ObjectAt(2).IsSelected() == false));
+
+        // The info panel strings: selecting a structure names it with health
+        // and power, selecting a unit names it with combat stats.
+        w.SelectAt(3, 3);
+        Console.WriteLine("info_struct=" + w.SelectedInfo());
+        w.SelectAt(0, 0);
+        Console.WriteLine("info_unit=" + w.SelectedInfo());
+        w.ClearSelection();
+        Console.WriteLine("info_none=" + w.SelectedInfo());
+
+        // Re-select the unit, then prove a structure cannot be ordered to
+        // move even when its cell is under the cursor.
+        w.SelectAt(0, 0);
+        Console.WriteLine("sel_unit2=" + Convert.ToString(w.SelectedIndex()));
+        w.SelectAt(3, 3);
+        Console.WriteLine("move_structure=" + Convert.ToString(w.OrderMove(9, 9)));
+
+        // Simple column move: (0,0) to (0,5) is unobstructed.
+        w.SelectAt(0, 0);
+        Console.WriteLine("move_col=" + Convert.ToString(w.OrderMove(0, 5)));
+        int moved = ObjTest.Moved(w.Tick());
+        Console.WriteLine("tick1=" + Convert.ToString(moved) + " at=" + ObjTest.Pos(w.ObjectAt(2)));
+        moved = ObjTest.Moved(w.Tick());
+        Console.WriteLine("tick2=" + Convert.ToString(moved) + " at=" + ObjTest.Pos(w.ObjectAt(2)));
+        moved = ObjTest.Moved(w.Tick());
+        Console.WriteLine("tick3=" + Convert.ToString(moved) + " at=" + ObjTest.Pos(w.ObjectAt(2)));
+        moved = ObjTest.Moved(w.Tick());
+        Console.WriteLine("tick4=" + Convert.ToString(moved) + " at=" + ObjTest.Pos(w.ObjectAt(2)));
+        moved = ObjTest.Moved(w.Tick());
+        Console.WriteLine("tick5=" + Convert.ToString(moved) + " at=" + ObjTest.Pos(w.ObjectAt(2)));
+        moved = ObjTest.Moved(w.Tick());
+        Console.WriteLine("tick6=" + Convert.ToString(moved) + " at=" + ObjTest.Pos(w.ObjectAt(2)));
+
+        // Pathfinding around a blocker: a 2x2 structure across row 0 at
+        // x=4..5 forces a detour down and back up. A fresh unit at (0,0) must
+        // reach (9,0) without ever stepping on the occupied cells -- the
+        // direct row-0 route is blocked, so the shortest path drops to y=2.
+        int blocker = w.PlaceStructure(Side2.Soviet(), 1, 4, 0);
+        Console.WriteLine("blocker=" + Convert.ToString(blocker));
+        int runner = w.SpawnUnit(Side2.Allied(), 0, 0, 0);
+        Console.WriteLine("runner=" + Convert.ToString(runner));
+        w.SelectAt(0, 0);
+        Console.WriteLine("move_around=" + Convert.ToString(w.OrderMove(9, 0)));
+        WorldObject runnerObj = w.ObjectAt(runner);
+        Console.WriteLine("route=" + runnerObj.RouteString());
+        int steps = 0;
+        bool crossed = false;
+        while (true) {
+            int m = ObjTest.Moved(w.Tick());
+            if (m == 0) { break; }
+            steps = steps + 1;
+            int ux = w.ObjectAt(runner).X();
+            int uy = w.ObjectAt(runner).Y();
+            if ((ux == 4 || ux == 5) && (uy == 0 || uy == 1)) { crossed = true; }
+        }
+        Console.WriteLine("arrive=" + ObjTest.Pos(w.ObjectAt(runner)) + " steps="
+            + Convert.ToString(steps) + " crossed=" + Convert.ToString(crossed));
+
+        // Raised ground and structure cells are not passable, so moves there
+        // are refused.
+        Console.WriteLine("move_cliff=" + Convert.ToString(w.OrderMove(15, 15)));
+        Console.WriteLine("move_building=" + Convert.ToString(w.OrderMove(3, 3)));
+
+        // A unit that is not selected cannot be ordered.
+        w.ClearSelection();
+        Console.WriteLine("move_unselected=" + Convert.ToString(w.OrderMove(0, 0)));
+
+        // ---- combat: in-range fire -------------------------------
+        // An enemy rifleman three cells from an allied rifleman: the attack
+        // order arms the target, and the first tick lands a shot because the
+        // reload starts at 0.
+        int att = w.SpawnUnit(Side2.Allied(), 0, 10, 10);
+        int foe = w.SpawnUnit(Side2.Soviet(), 0, 13, 10);
+        w.SelectAt(10, 10);
+        Console.WriteLine("combat_noenemy=" + Convert.ToString(w.OrderAttack(5, 5)));
+        Console.WriteLine("combat_attack=" + Convert.ToString(w.OrderAttack(13, 10)));
+
+        List<int> tr = w.Tick();
+        int totalShots = 0;
+        if (ObjTest.Fired(tr) > 0) { totalShots = totalShots + 1; }
+        Console.WriteLine("combat_tick1=" + Convert.ToString(ObjTest.Moved(tr)) + "/"
+            + Convert.ToString(ObjTest.Fired(tr))
+            + " hp=" + ObjTest.Hp(w, foe));
+
+        // The cooldown is 15 ticks, so the next shot is 15 quiet ticks later.
+        int quiet = 0;
+        while (true) {
+            tr = w.Tick();
+            if (ObjTest.Fired(tr) > 0) {
+                totalShots = totalShots + 1;
+                break;
+            }
+            quiet = quiet + 1;
+        }
+        Console.WriteLine("combat_quiet=" + Convert.ToString(quiet)
+            + " hp=" + ObjTest.Hp(w, foe));
+
+        // Keep firing until the target dies: 7 shots of 15 clear 100 HP. The
+        // world removes the corpse and frees its cell.
+        int guard = 0;
+        while (guard < 200) {
+            guard = guard + 1;
+            if (ObjTest.Hp(w, foe) == "gone") { break; }
+            tr = w.Tick();
+            if (ObjTest.Fired(tr) > 0) { totalShots = totalShots + 1; }
+        }
+        Console.WriteLine("combat_kills=" + Convert.ToString(totalShots)
+            + " count=" + Convert.ToString(w.ObjectCount())
+            + " cell_free=" + Convert.ToString(w.Passable(13, 10))
+            + " attacker_live=" + Convert.ToString(w.ObjectAt(att).Hp() > 0));
+
+        // ---- combat: walk into range ------------------------------
+        // A fresh attacker far from a fresh enemy walks toward it before any
+        // shot lands; once in range it stands and fires.
+        int wAtt = w.SpawnUnit(Side2.Allied(), 0, 0, 0);
+        int wFoe = w.SpawnUnit(Side2.Soviet(), 0, 19, 0);
+        w.ClearSelection();
+        w.SelectAt(0, 0);
+        Console.WriteLine("walk_order=" + Convert.ToString(w.OrderAttack(19, 0)));
+        int walkMoved = 0;
+        int walkFired = 0;
+        int walkGuard = 0;
+        while (walkGuard < 40) {
+            tr = w.Tick();
+            if (ObjTest.Moved(tr) > 0) { walkMoved = walkMoved + 1; }
+            if (ObjTest.Fired(tr) > 0) { walkFired = walkFired + 1; }
+            walkGuard = walkGuard + 1;
+            if (ObjTest.Hp(w, wFoe) == "gone") { break; }
+        }
+        Console.WriteLine("walk_moved=" + Convert.ToString(walkMoved)
+            + " fired=" + Convert.ToString(walkFired)
+            + " hp=" + ObjTest.Hp(w, wFoe)
+            + " at=" + ObjTest.Pos(w.ObjectAt(wAtt)));
+
+        // ---- combat: right-click resolution ------------------------
+        // A right-click on an enemy in range attacks and drops the move route
+        // so the unit stands to fire; on empty ground it is a move.
+        int rAtt = w.SpawnUnit(Side2.Allied(), 0, 11, 11);
+        int rFoe = w.SpawnUnit(Side2.Soviet(), 0, 14, 11);
+        w.ClearSelection();
+        w.SelectAt(11, 11);
+        Console.WriteLine("right_empty=" + Convert.ToString(w.OrderMove(1, 1)));
+        Console.WriteLine("right_mover_route="
+            + Convert.ToString(w.ObjectAt(rAtt).HasRoute()));
+        w.SelectAt(11, 11);
+        Console.WriteLine("right_noenemy=" + Convert.ToString(w.OrderAttack(1, 1)));
+        Console.WriteLine("right_attack=" + Convert.ToString(w.OrderAttack(14, 11)));
+        Console.WriteLine("right_route_dropped="
+            + Convert.ToString(w.ObjectAt(rAtt).HasRoute() == false));
+
+        // ---- production ------------------------------------------------
+        // A barracks trains what it is asked to: the queue ticks down and the
+        // finished unit walks out onto a free neighbour. Two queued infantry
+        // come out one after the other, and the yard cannot train anything.
+        {
+            IsoMap iso2 = ObjTest.BuildMap();
+            World w2 = World.Create(iso2, StructureCatalog.Create(),
+                                    UnitCatalog.Create());
+            int yard2 = w2.PlaceStructure(Side2.Allied(), 0, 8, 8);   // 建造厂
+            int bar = w2.PlaceStructure(Side2.Allied(), 3, 3, 3);     // 兵营
+            Console.WriteLine("prod_yard=" + Convert.ToString(yard2));
+            Console.WriteLine("prod_barracks=" + Convert.ToString(bar));
+            Console.WriteLine("prod_queue_gi=" + Convert.ToString(w2.QueueUnit(bar, 0)));
+            Console.WriteLine("prod_queue_tank=" + Convert.ToString(w2.QueueUnit(bar, 3)));
+            Console.WriteLine("prod_queue_yard=" + Convert.ToString(w2.QueueUnit(yard2, 0)));
+            w2.QueueUnit(bar, 0);
+            Console.WriteLine("prod_queue_count=" + Convert.ToString(w2.ObjectAt(bar).ProdCount()));
+
+            int made1 = 0;
+            int made2 = 0;
+            int guard = 0;
+            while (guard < 120 && made2 == 0) {
+                guard = guard + 1;
+                List<int> tr = w2.Tick();
+                if (ObjTest.Produced(tr) > 0) {
+                    if (made1 == 0) { made1 = guard; }
+                    else { made2 = guard; }
+                }
+            }
+            Console.WriteLine("prod_done1=" + Convert.ToString(made1));
+            Console.WriteLine("prod_done2=" + Convert.ToString(made2));
+            Console.WriteLine("prod_queue_left=" + Convert.ToString(w2.ObjectAt(bar).ProdCount()));
+            Console.WriteLine("prod_objects=" + Convert.ToString(w2.ObjectCount()));
+            List<WorldObject> spawned = new List<WorldObject>();
+            for (int i = 0; i < w2.ObjectCount(); i = i + 1) {
+                WorldObject o = w2.ObjectAt(i);
+                if (o.Kind() == ObjKind.Unit()) { spawned.Add(o); }
+            }
+            Console.WriteLine("prod_units=" + Convert.ToString(spawned.Count));
+            Console.WriteLine("prod_unit1=" + ObjTest.Pos(spawned[0]));
+            Console.WriteLine("prod_unit2=" + ObjTest.Pos(spawned[1]));
+            Console.WriteLine("prod_unit_hp=" + Convert.ToString(spawned[0].Hp()));
+        }
+
+        // ---- enemy base & win/lose --------------------------------------
+        // The opponent's starter base goes in at the far corner, and a game
+        // controller running the AI builds, trains and attacks. The result
+        // flips as soon as one side's structures are all gone.
+        {
+            IsoMap iso3 = ObjTest.BuildMap();
+            World w3 = World.Create(iso3, StructureCatalog.Create(),
+                                    UnitCatalog.Create());
+            w3.PlaceStructure(Side2.Allied(), 0, 1, 2);          // player yard
+            int pBar = w3.PlaceStructure(Side2.Allied(), 3, 6, 2); // player barracks
+            int enemyPlaced = w3.PlaceEnemyBase(Side2.Soviet());
+            Console.WriteLine("ai_enemy_base=" + Convert.ToString(enemyPlaced));
+            Console.WriteLine("ai_enemy_alive=" + Convert.ToString(
+                w3.SideEliminated(Side2.Soviet()) == false));
+            Console.WriteLine("ai_yard_queue=" + Convert.ToString(w3.QueueUnit(0, 0)));
+
+            // The player queues a unit through the game controller, exactly as
+            // a click on the production panel would: select the barracks, then
+            // order a GI. The cost comes off the player's credits.
+            GameController gc = GameController.Create(w3, Side2.Allied());
+            gc.OnClickCell(6, 2);
+            Console.WriteLine("ui_sel=" + Convert.ToString(gc.World().SelectedIndex()));
+            int moneyBefore = gc.Money();
+            gc.OnClickUnit(0);
+            Console.WriteLine("ui_money_spent=" + Convert.ToString(moneyBefore - gc.Money()));
+            Console.WriteLine("ui_queue=" + Convert.ToString(w3.ObjectAt(pBar).ProdCount()));
+            gc.OnClickUnit(99);
+            Console.WriteLine("ui_queue_invalid=" + Convert.ToString(w3.ObjectAt(pBar).ProdCount()));
+
+            // Step the skirmish. The AI builds a barracks, trains infantry and
+            // sends them at the player's buildings; the player's own queue
+            // also finishes. Everything here is deterministic, so the golden
+            // file locks the exact outcome.
+            int guard2 = 0;
+            while (guard2 < 500 && gc.Result() == 0) {
+                guard2 = guard2 + 1;
+                gc.Tick();
+            }
+            Console.WriteLine("ai_ticked=" + Convert.ToString(guard2));
+            Console.WriteLine("ai_objects=" + Convert.ToString(w3.ObjectCount()));
+            Console.WriteLine("ai_money=" + Convert.ToString(gc.AiMoney()));
+            Console.WriteLine("ai_result=" + Convert.ToString(gc.Result()));
+            int yardIdx = ObjTest.FindObject(w3, Side2.Allied(),
+                                             ObjKind.Structure(), 0);
+            int barIdx = ObjTest.FindObject(w3, Side2.Allied(),
+                                            ObjKind.Structure(), 3);
+            Console.WriteLine("ai_yard_hp=" + Convert.ToString(yardIdx < 0
+                ? -1 : w3.ObjectAt(yardIdx).Hp()));
+            Console.WriteLine("ai_barracks_hp=" + Convert.ToString(barIdx < 0
+                ? -1 : w3.ObjectAt(barIdx).Hp()));
+        }
+
+        // ---- decisive win / loss ----------------------------------------
+        {
+            IsoMap iso4 = ObjTest.BuildMap();
+            World w4 = World.Create(iso4, StructureCatalog.Create(),
+                                    UnitCatalog.Create());
+            w4.PlaceStructure(Side2.Allied(), 0, 1, 2);
+            w4.PlaceEnemyBase(Side2.Soviet());
+            for (int i = 0; i < w4.ObjectCount(); i = i + 1) {
+                WorldObject o = w4.ObjectAt(i);
+                if (o.Side() == Side2.Soviet() && o.Kind() == ObjKind.Structure()) {
+                    o.TakeDamage(99999);
+                }
+            }
+            w4.Tick();
+            Console.WriteLine("win_elim=" + Convert.ToString(w4.SideEliminated(Side2.Soviet())));
+            GameController gc2 = GameController.Create(w4, Side2.Allied());
+            gc2.Tick();
+            Console.WriteLine("win_result=" + Convert.ToString(gc2.Result()));
+
+            IsoMap iso5 = ObjTest.BuildMap();
+            World w5 = World.Create(iso5, StructureCatalog.Create(),
+                                    UnitCatalog.Create());
+            w5.PlaceStructure(Side2.Allied(), 0, 1, 2);
+            w5.PlaceEnemyBase(Side2.Soviet());
+            for (int i = 0; i < w5.ObjectCount(); i = i + 1) {
+                WorldObject o = w5.ObjectAt(i);
+                if (o.Side() == Side2.Allied() && o.Kind() == ObjKind.Structure()) {
+                    o.TakeDamage(99999);
+                }
+            }
+            w5.Tick();
+            GameController gc3 = GameController.Create(w5, Side2.Allied());
+            gc3.Tick();
+            Console.WriteLine("lose_result=" + Convert.ToString(gc3.Result()));
+        }
+
+        // ---- combat effects ---------------------------------------------
+        // A shot spawns a muzzle flash; a kill spawns an explosion; both
+        // expire after a few ticks.
+        {
+            IsoMap iso6 = ObjTest.BuildMap();
+            World w6 = World.Create(iso6, StructureCatalog.Create(),
+                                    UnitCatalog.Create());
+            int att6 = w6.SpawnUnit(Side2.Allied(), 0, 10, 10);
+            int foe6 = w6.SpawnUnit(Side2.Soviet(), 0, 13, 10);
+            w6.SelectAt(10, 10);
+            w6.OrderAttack(13, 10);
+            w6.Tick();   // first shot
+            Console.WriteLine("fx_after_shot=" + Convert.ToString(w6.EffectCount()));
+            Console.WriteLine("fx_shot_kind=" + Convert.ToString(w6.EffectKind(0)));
+
+            // Keep firing until the foe dies; the death adds an explosion.
+            int fxGuard = 0;
+            while (fxGuard < 300) {
+                fxGuard = fxGuard + 1;
+                if (ObjTest.Hp(w6, foe6) == "gone") { break; }
+                w6.Tick();
+            }
+            Console.WriteLine("fx_dead=" + Convert.ToString(ObjTest.Hp(w6, foe6)));
+            Console.WriteLine("fx_count_at_death=" + Convert.ToString(w6.EffectCount()));
+
+            // Age every effect out; the list drains to zero.
+            int drain = 0;
+            while (w6.EffectCount() > 0 && drain < 40) {
+                drain = drain + 1;
+                w6.Tick();
+            }
+            Console.WriteLine("fx_drained=" + Convert.ToString(w6.EffectCount()));
+        }
+
+        // ---- pause ------------------------------------------------------
+        // Pausing stops the clock: no movement, no income, no result changes.
+        {
+            IsoMap iso7 = ObjTest.BuildMap();
+            World w7 = World.Create(iso7, StructureCatalog.Create(),
+                                    UnitCatalog.Create());
+            w7.PlaceStructure(Side2.Allied(), 0, 1, 2);
+            w7.PlaceEnemyBase(Side2.Soviet());
+            GameController gc7 = GameController.Create(w7, Side2.Allied());
+            int scout7 = w7.SpawnUnit(Side2.Allied(), 0, 5, 5);
+            w7.SelectAt(5, 5);
+            w7.OrderMove(0, 0);
+            gc7.TogglePause();
+            int before = gc7.TickCount();
+            int moneyBefore7 = gc7.Money();
+            gc7.Tick();
+            gc7.Tick();
+            Console.WriteLine("pause_ticks=" + Convert.ToString(gc7.TickCount() - before));
+            Console.WriteLine("pause_money=" + Convert.ToString(gc7.Money() - moneyBefore7));
+            Console.WriteLine("pause_moved=" + Convert.ToString(w7.ObjectAt(scout7).X()));
+            gc7.TogglePause();
+            gc7.Tick();
+            Console.WriteLine("resume_ticks=" + Convert.ToString(gc7.TickCount() - before));
+            Console.WriteLine("resume_moved=" + Convert.ToString(w7.ObjectAt(scout7).X()));
+        }
+
+        // ---- faction control ---------------------------------------------
+        // The controller only commands its own side: selecting an enemy unit
+        // shows it but a right-click must not move it, and production cannot
+        // be started from an enemy building.
+        {
+            IsoMap iso8 = ObjTest.BuildMap();
+            World w8 = World.Create(iso8, StructureCatalog.Create(),
+                                    UnitCatalog.Create());
+            int enemyUnit = w8.SpawnUnit(Side2.Soviet(), 0, 12, 12);
+            w8.PlaceStructure(Side2.Allied(), 0, 1, 2);
+            int enemyBar = w8.PlaceStructure(Side2.Soviet(), 3, 14, 14);
+            GameController gc8 = GameController.Create(w8, Side2.Allied());
+            gc8.OnClickCell(12, 12);   // select the enemy unit
+            Console.WriteLine("ctl_sel_side=" + Convert.ToString(w8.SelectedSide()));
+            Console.WriteLine("ctl_sel_enemy=" + Convert.ToString(
+                w8.SelectedSide() == Side2.Soviet()));
+            int ex = w8.ObjectAt(enemyUnit).X();
+            gc8.OnRightClick(5, 5);    // should not move the enemy unit
+            Console.WriteLine("ctl_enemy_moved=" + Convert.ToString(
+                w8.ObjectAt(enemyUnit).X() == ex));
+            // Selecting an enemy building shows no production panel.
+            gc8.OnClickCell(14, 14);
+            Console.WriteLine("ctl_sel_building=" + Convert.ToString(
+                w8.SelectedSide() == Side2.Soviet()));
+            int money8 = gc8.Money();
+            gc8.OnClickUnit(0);        // queue on the enemy barracks
+            Console.WriteLine("ctl_spent=" + Convert.ToString(gc8.Money() - money8));
+            Console.WriteLine("ctl_enemy_queue=" + Convert.ToString(
+                w8.ObjectAt(enemyBar).ProdCount()));
+        }
+
+        // ---- multi-select -----------------------------------------------
+        // Box-selecting three own units selects all three; Shift-click adds a
+        // fourth; a move order routes them all; removing a dead one keeps the
+        // selection list coherent.
+        {
+            IsoMap iso9 = ObjTest.BuildMap();
+            World w9 = World.Create(iso9, StructureCatalog.Create(),
+                                    UnitCatalog.Create());
+            int u0 = w9.SpawnUnit(Side2.Allied(), 0, 2, 2);
+            int u1 = w9.SpawnUnit(Side2.Allied(), 0, 3, 2);
+            int u2 = w9.SpawnUnit(Side2.Allied(), 0, 2, 3);
+            int u3 = w9.SpawnUnit(Side2.Soviet(), 0, 4, 4);   // enemy, excluded
+            Console.WriteLine("ms_box=" + Convert.ToString(w9.SelectBox(1, 1, 4, 4, Side2.Allied())));
+            Console.WriteLine("ms_count=" + Convert.ToString(w9.SelectionCount()));
+            Console.WriteLine("ms_primary=" + Convert.ToString(w9.SelectedIndex()));
+            Console.WriteLine("ms_sel0=" + Convert.ToString(w9.IsSelectedIdx(u0)));
+            Console.WriteLine("ms_sel1=" + Convert.ToString(w9.IsSelectedIdx(u1)));
+            Console.WriteLine("ms_sel2=" + Convert.ToString(w9.IsSelectedIdx(u2)));
+            Console.WriteLine("ms_enemy_sel=" + Convert.ToString(w9.IsSelectedIdx(u3)));
+
+            // Batch move: all three selected units accept a route to (10,10).
+            Console.WriteLine("ms_move=" + Convert.ToString(w9.OrderMove(10, 10)));
+            Console.WriteLine("ms_routes=" + Convert.ToString(
+                w9.ObjectAt(u0).HasRoute() && w9.ObjectAt(u1).HasRoute()
+                && w9.ObjectAt(u2).HasRoute()));
+
+            // Shift-click adds the enemy unit's cell -- but AddToSelection
+            // adds whatever is under it, including the enemy; verify it grows.
+            w9.ClearSelection();
+            w9.SelectAt(2, 2);
+            w9.AddToSelection(3, 2);
+            Console.WriteLine("ms_shift_count=" + Convert.ToString(w9.SelectionCount()));
+
+            // Kill one selected unit; RemoveDead keeps the remaining selected
+            // index valid.
+            w9.SelectBox(1, 1, 4, 4, Side2.Allied());
+            w9.ObjectAt(u1).TakeDamage(99999);
+            w9.Tick();
+            Console.WriteLine("ms_after_death=" + Convert.ToString(w9.SelectionCount()));
+            Console.WriteLine("ms_sel_alive=" + Convert.ToString(
+                w9.SelectedIndex() >= 0));
+        }
+
+        // ---- move-attack ------------------------------------------------
+        // A selected unit ordered to move-attack walks toward the destination;
+        // when an enemy crosses its path it stops and engages instead.
+        {
+            IsoMap isoA = ObjTest.BuildMap();
+            World wA = World.Create(isoA, StructureCatalog.Create(),
+                                    UnitCatalog.Create());
+            int att = wA.SpawnUnit(Side2.Allied(), 0, 2, 2);
+            int foe = wA.SpawnUnit(Side2.Soviet(), 0, 2, 8);   // on the route
+            wA.SelectAt(2, 2);
+            Console.WriteLine("ma_order=" + Convert.ToString(wA.OrderMoveAttack(2, 14)));
+            Console.WriteLine("ma_armed=" + Convert.ToString(wA.ObjectAt(att).MoveAttacking()));
+            Console.WriteLine("ma_route=" + Convert.ToString(wA.ObjectAt(att).HasRoute()));
+
+            // Walk toward the enemy; the move-attack scan spots it in range and
+            // the unit stops to fire instead of walking past.
+            int maGuard = 0;
+            bool stopped = false;
+            while (maGuard < 40) {
+                maGuard = maGuard + 1;
+                List<int> tr = wA.Tick();
+                if (wA.ObjectAt(att).TargetIndex() >= 0
+                 && !wA.ObjectAt(att).HasRoute()) {
+                    stopped = true;
+                    break;
+                }
+                if (ObjTest.Hp(wA, foe) == "gone") { break; }
+            }
+            Console.WriteLine("ma_stopped=" + Convert.ToString(stopped));
+            Console.WriteLine("ma_hit=" + Convert.ToString(ObjTest.Hp(wA, foe) != "gone"));
+        }
+
+        // ---- squads ------------------------------------------------------
+        // Ctrl+number saves the selection; the number key recalls it, skipping
+        // any member that has since died.
+        {
+            IsoMap isoB = ObjTest.BuildMap();
+            World wB = World.Create(isoB, StructureCatalog.Create(),
+                                    UnitCatalog.Create());
+            int b0 = wB.SpawnUnit(Side2.Allied(), 0, 2, 2);
+            int b1 = wB.SpawnUnit(Side2.Allied(), 0, 3, 2);
+            int b2 = wB.SpawnUnit(Side2.Allied(), 0, 2, 3);
+            GameController gB = GameController.Create(wB, Side2.Allied());
+            wB.SelectBox(1, 1, 4, 4, Side2.Allied());
+            Console.WriteLine("sq_save_sel=" + Convert.ToString(wB.SelectionCount()));
+            gB.SaveSquad(1);
+            wB.ClearSelection();
+            Console.WriteLine("sq_cleared=" + Convert.ToString(wB.SelectionCount()));
+            int recalled = gB.RecallSquad(1);
+            Console.WriteLine("sq_recall=" + Convert.ToString(recalled));
+            Console.WriteLine("sq_recall_sel=" + Convert.ToString(wB.SelectionCount()));
+
+            // Kill one member; recall skips it.
+            wB.ObjectAt(b1).TakeDamage(99999);
+            wB.Tick();
+            wB.ClearSelection();
+            int recalled2 = gB.RecallSquad(1);
+            Console.WriteLine("sq_after_death=" + Convert.ToString(recalled2));
+            // After recall the two survivors are selected (their references
+            // re-resolve); adding them again must be a no-op.
+            Console.WriteLine("sq_alive_sel=" + Convert.ToString(
+                wB.AddSelectionByObject(wB.ObjectAt(b0)) == false
+                && wB.AddSelectionByObject(wB.ObjectAt(b2)) == false));
+            Console.WriteLine("sq_count=" + Convert.ToString(wB.SelectionCount()));
+        }
+
+        // ---- defence buildings ------------------------------------------
+        // A pillbox (buildId 6) auto-fires at an enemy within range once it
+        // finishes constructing; walls block ground movement.
+        {
+            IsoMap isoC = ObjTest.BuildMap();
+            World wC = World.Create(isoC, StructureCatalog.Create(),
+                                    UnitCatalog.Create());
+            int pill = wC.PlaceStructure(Side2.Allied(), 6, 8, 8);   // 碉堡
+            Console.WriteLine("def_pill=" + Convert.ToString(pill));
+            // Construct the pillbox fully.
+            int defGuard = 0;
+            StructureType pt = wC.Catalog().TypeFor(Side2.Allied(), 6);
+            while (wC.ObjectAt(pill).BuiltTicks() < pt.BuildTime() && defGuard < 200) {
+                defGuard = defGuard + 1;
+                wC.Tick();
+            }
+            Console.WriteLine("def_built=" + Convert.ToString(
+                wC.ObjectAt(pill).BuiltTicks() >= pt.BuildTime()));
+            // Put an enemy within range; the pillbox should fire on its own.
+            int foeC = wC.SpawnUnit(Side2.Soviet(), 0, 10, 8);
+            int defShots = 0;
+            int defGuard2 = 0;
+            while (defGuard2 < 60) {
+                defGuard2 = defGuard2 + 1;
+                List<int> tr = wC.Tick();
+                if (ObjTest.Fired(tr) > 0) {
+                    defShots = defShots + 1;
+                    break;
+                }
+            }
+            Console.WriteLine("def_fired=" + Convert.ToString(defShots > 0));
+            Console.WriteLine("def_damaged=" + Convert.ToString(
+                ObjTest.Hp(wC, foeC) != "125"));
+
+            // A wall (buildId 7) is a 1x1 building that blocks movement.
+            int wall = wC.PlaceStructure(Side2.Allied(), 7, 4, 4);
+            Console.WriteLine("def_wall=" + Convert.ToString(wall));
+            Console.WriteLine("def_wall_block=" + Convert.ToString(
+                !wC.Passable(4, 4)));
+        }
+
+        // ---- engineer unit ----------------------------------------------
+        // Unit id 5 is the engineer, trained from the barracks, with real art.
+        {
+            IsoMap isoD = ObjTest.BuildMap();
+            World wD = World.Create(isoD, StructureCatalog.Create(),
+                                    UnitCatalog.Create());
+            int eng = wD.SpawnUnit(Side2.Allied(), 5, 2, 2);
+            Console.WriteLine("eng_spawn=" + Convert.ToString(eng));
+            Console.WriteLine("eng_unarmed=" + Convert.ToString(
+                wD.ObjectAt(eng).UnitType().Damage() == 0));
+            Console.WriteLine("eng_art=" + Convert.ToString(
+                wD.ObjectAt(eng).UnitType().ShpName() == "ENGINEER.SHP"));
+        }
+    }
+}

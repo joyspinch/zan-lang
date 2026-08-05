@@ -1,0 +1,450 @@
+using System;
+using System.Data;
+using System.Data.Orm;
+using System.IO;
+using System.Web;
+using ZanWeb;
+using ZanWeb.Model.Sys;
+
+namespace ZanWeb.Admin.Dev;
+
+/// <summary>
+/// The table designer at /admin/dev/coder: design a table (its columns, and the part
+/// each column plays in a management screen), create it in the database, and --
+/// when the generic screen is not enough -- write out the .zan sources for a
+/// dedicated one.
+///
+/// A design is usable in three steps, and each is a separate button because each
+/// has a different cost: saving the design touches nothing outside sys_gen_*,
+/// migrating issues DDL, and generating writes files that only take effect after
+/// a rebuild. Nothing is dropped or retyped automatically: the designer adds.
+/// </summary>
+[Route("admin/dev/coder/[action]")]
+[Custom(Authorization = CustomAuthorization.Grant)]
+[Description("代码生成")]
+class Coder : AdminController {
+    [HttpGet]
+    [Route("/admin/dev/coder")]
+    [Custom(IsMenu = true, Icon = "mdi:table-cog")]
+    [Description("表设计与生成")]
+    async void Index() {
+        ViewData d = await this.Layout("表设计与生成");
+        if (!this.DbReady()) { d.Set("dbDown", "1"); this.Page(d); return; }
+
+        List<GenTable> rows = await this.GenTable.OrderBy(a => a.id).ToListAsync();
+        List<StrMap> list = d.AddList("tables");
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            GenTable t = rows[i];
+            int cols = await this.GenColumn.Where(a => a.tableId == t.id).CountAsync();
+            StrMap row = new StrMap();
+            row.Set("id", Convert.ToString(t.id));
+            row.Set("tableName", t.tableName);
+            row.Set("entityName", t.entityName);
+            row.Set("title", t.title);
+            row.Set("section", t.section);
+            row.Set("columns", Convert.ToString(cols));
+            row.Set("stateText", "未建表");
+            row.Set("stateClass", "off");
+            if (t.migrated == 1) { row.Set("stateText", "已建表"); row.Set("stateClass", "ok"); }
+            if (t.apiEnabled == 1) { row.Set("api", "1"); }
+            list.Add(row);
+        }
+        if (rows.Count == 0) { d.Set("empty", "1"); }
+        this.Page(d);
+    }
+
+    [HttpGet]
+    [Description("表信息表单")]
+    async void TableForm() {
+        int id = this.InInt("id", 0);
+        ViewData d = new ViewData();
+        d.Set("id", Convert.ToString(id));
+        d.Set("dialogTitle", "新建数据表");
+        d.Set("section", "content");
+        d.Set("apiChecked", "checked");
+        if (id > 0) {
+            GenTable t = await this.GenTable.Read(id);
+            if (t == null) { this.Fail(404, "0404", "设计不存在"); }
+            d.Set("dialogTitle", "编辑表信息");
+            d.Set("tableName", t.tableName);
+            d.Set("entityName", t.entityName);
+            d.Set("title", t.title);
+            d.Set("section", t.section);
+            d.Set("apiChecked", "");
+            if (t.apiEnabled == 1) { d.Set("apiChecked", "checked"); }
+        }
+        this.Dialog(d);
+    }
+
+    [HttpPost]
+    [Description("保存表信息")]
+    async void TableSave() {
+        int id = this.InInt("id", 0);
+        string tableName = this.Need("tableName", "表名");
+        string title = this.Need("title", "名称");
+        if (!Gen.Safe(tableName)) {
+            this.Fail(400, "0004", "表名只能用小写字母、数字和下划线，且以字母开头");
+        }
+        string entityName = this.In("entityName");
+        if (entityName.Length == 0) { entityName = Coder.Pascal(tableName); }
+        // A URL segment, not a label: the sidebar section follows from it.
+        string section = this.In("section");
+        if (!Gen.Safe(section)) { section = "content"; }
+        int api = 0;
+        if (this.In("apiEnabled") == "1") { api = 1; }
+
+        GenTable clash = await this.GenTable
+            .Where(a => a.tableName == tableName).FirstAsync();
+        if (clash != null && clash.id != id) {
+            this.Fail(400, "0004", "表 " + tableName + " 已经设计过了");
+        }
+        if (id > 0) {
+            int n = await this.GenTable.Update()
+                .Set(a => a.tableName, tableName)
+                .Set(a => a.entityName, entityName)
+                .Set(a => a.title, title)
+                .Set(a => a.section, section)
+                .Set(a => a.apiEnabled, api)
+                .Set(a => a.updatedAt, WebApp.NowSeconds())
+                .Where(a => a.id == id).ExecuteAffrowsAsync();
+            await this.Note("编辑表设计", tableName, n > 0, "");
+            this.Saved("表信息已保存");
+            return;
+        }
+        GenTable t = new GenTable();
+        t.tableName = tableName;
+        t.entityName = entityName;
+        t.title = title;
+        t.section = section;
+        t.orderColumn = "id";
+        t.orderDesc = 1;
+        t.apiEnabled = api;
+        t.migrated = 0;
+        t.createdAt = WebApp.NowSeconds();
+        t.updatedAt = t.createdAt;
+        int newId = await this.GenTable.Insert(t).ExecuteIdentityAsync();
+        await this.Note("新建表设计", tableName, newId > 0, "");
+        this.Saved("表已创建，去添加字段");
+    }
+
+    [HttpPost]
+    [Description("删除表设计")]
+    async void TableDelete() {
+        int id = this.InInt("id", 0);
+        GenTable t = await this.GenTable.Read(id);
+        if (t == null) { this.Fail(404, "0404", "设计不存在"); }
+        int n = await this.GenTable.Delete().Where(a => a.id == id)
+            .ExecuteAffrowsAsync();
+        int _c = await this.GenColumn.Delete().Where(a => a.tableId == id)
+            .ExecuteAffrowsAsync();
+        await this.Note("删除表设计", t.tableName, n > 0,
+            "物理表保留");
+        this.Saved("设计已删除，数据库中的表保留");
+    }
+
+    [HttpGet]
+    [Route("/admin/dev/coder/design")]
+    [Description("字段设计")]
+    async void Design() {
+        ViewData d = await this.Layout("字段设计");
+        int id = this.InInt("id", 0);
+        GenTable t = await this.GenTable.Read(id);
+        if (t == null) { this.Fail(404, "0404", "设计不存在"); }
+        d.Set("id", Convert.ToString(t.id));
+        d.Set("tableName", t.tableName);
+        d.Set("entityName", t.entityName);
+        d.Set("tableTitle", t.title);
+        if (t.migrated == 1) { d.Set("migrated", "1"); }
+
+        List<GenColumn> cols = await this.GenColumn
+            .Where(a => a.tableId == id).OrderBy(a => a.sortOrder).ToListAsync();
+        List<StrMap> list = d.AddList("columns");
+        for (int i = 0; i < cols.Count; i = i + 1) {
+            GenColumn c = cols[i];
+            StrMap row = new StrMap();
+            row.Set("id", Convert.ToString(c.id));
+            row.Set("name", c.name);
+            row.Set("label", c.label);
+            row.Set("kind", c.kind);
+            row.Set("widget", c.widget);
+            row.Set("sortOrder", Convert.ToString(c.sortOrder));
+            row.Set("inList", Coder.Tick(c.inList));
+            row.Set("inFilter", Coder.Tick(c.inFilter));
+            row.Set("inCreate", Coder.Tick(c.inCreate));
+            row.Set("inEdit", Coder.Tick(c.inEdit));
+            row.Set("required", Coder.Tick(c.required));
+            row.Set("rel", Coder.Rel(c));
+            list.Add(row);
+        }
+        if (cols.Count == 0) { d.Set("empty", "1"); }
+        this.Page(d);
+    }
+
+    [HttpGet]
+    [Description("字段表单")]
+    async void ColumnForm() {
+        int id = this.InInt("id", 0);
+        int tableId = this.InInt("tableId", 0);
+        ViewData d = new ViewData();
+        d.Set("id", Convert.ToString(id));
+        d.Set("tableId", Convert.ToString(tableId));
+        d.Set("dialogTitle", "新增字段");
+        d.Set("size", "255");
+        d.Set("sortOrder", "10");
+        d.Set("inListChecked", "checked");
+        d.Set("inCreateChecked", "checked");
+        d.Set("inEditChecked", "checked");
+        if (id > 0) {
+            GenColumn c = await this.GenColumn.Read(id);
+            if (c == null) { this.Fail(404, "0404", "字段不存在"); }
+            d.Set("dialogTitle", "编辑字段");
+            d.Set("tableId", Convert.ToString(c.tableId));
+            d.Set("name", c.name);
+            d.Set("label", c.label);
+            d.Set("kindValue", c.kind);
+            d.Set("widgetValue", c.widget);
+            d.Set("size", Convert.ToString(c.size));
+            d.Set("defValue", c.defValue);
+            d.Set("dictType", c.dictType);
+            d.Set("relTable", c.relTable);
+            d.Set("relValue", c.relValue);
+            d.Set("relLabel", c.relLabel);
+            d.Set("sortOrder", Convert.ToString(c.sortOrder));
+            d.Set("inListChecked", Coder.Checked(c.inList));
+            d.Set("inFilterChecked", Coder.Checked(c.inFilter));
+            d.Set("inCreateChecked", Coder.Checked(c.inCreate));
+            d.Set("inEditChecked", Coder.Checked(c.inEdit));
+            d.Set("requiredChecked", Coder.Checked(c.required));
+            d.Set("nullableChecked", Coder.Checked(c.nullable));
+        }
+
+        // The relation picker offers the tables this admin knows about, so a
+        // foreign key is chosen rather than typed.
+        List<GenTable> tables = await this.GenTable.OrderBy(a => a.id).ToListAsync();
+        List<StrMap> opts = d.AddList("tables");
+        for (int i = 0; i < tables.Count; i = i + 1) {
+            StrMap row = new StrMap();
+            row.Set("tableName", tables[i].tableName);
+            row.Set("title", tables[i].title);
+            opts.Add(row);
+        }
+        this.Dialog(d);
+    }
+
+    [HttpPost]
+    [Description("保存字段")]
+    async void ColumnSave() {
+        int id = this.InInt("id", 0);
+        int tableId = this.InInt("tableId", 0);
+        string name = this.Need("name", "字段名");
+        if (!Gen.Safe(name) || name == "id") {
+            this.Fail(400, "0004", "字段名只能用小写字母、数字和下划线，且不能是 id");
+        }
+        string kind = this.In("kind");
+        if (kind.Length == 0) { kind = "string"; }
+        GenColumn clash = await this.GenColumn
+            .Where(a => a.tableId == tableId).Where(a => a.name == name).FirstAsync();
+        if (clash != null && clash.id != id) {
+            this.Fail(400, "0004", "字段 " + name + " 已存在");
+        }
+        string relTable = this.In("relTable");
+        if (relTable.Length > 0 && !Gen.Safe(relTable)) {
+            this.Fail(400, "0004", "关联表名不合法");
+        }
+        string relValue = this.In("relValue");
+        string relLabel = this.In("relLabel");
+        if (relTable.Length > 0) {
+            if (relValue.Length == 0) { relValue = "id"; }
+            if (relLabel.Length == 0) { relLabel = "name"; }
+            if (!Gen.Safe(relValue) || !Gen.Safe(relLabel)) {
+                this.Fail(400, "0004", "关联字段名不合法");
+            }
+        }
+
+        GenColumn c = new GenColumn();
+        if (id > 0) {
+            GenColumn cur = await this.GenColumn.Read(id);
+            if (cur == null) { this.Fail(404, "0404", "字段不存在"); }
+            c = cur;
+        }
+        c.tableId = tableId;
+        c.name = name;
+        c.kind = kind;
+        c.size = this.InInt("size", 255);
+        c.defValue = this.In("defValue");
+        c.label = this.In("label");
+        c.widget = this.In("widget");
+        if (c.widget.Length == 0) { c.widget = "text"; }
+        c.dictType = this.In("dictType");
+        c.relTable = relTable;
+        c.relValue = relValue;
+        c.relLabel = relLabel;
+        c.sortOrder = this.InInt("sortOrder", 10);
+        c.nullable = Coder.Flag(this.In("nullable"));
+        c.inList = Coder.Flag(this.In("inList"));
+        c.inFilter = Coder.Flag(this.In("inFilter"));
+        c.inCreate = Coder.Flag(this.In("inCreate"));
+        c.inEdit = Coder.Flag(this.In("inEdit"));
+        c.required = Coder.Flag(this.In("required"));
+
+        if (id > 0) {
+            int n = await this.GenColumn.Update()
+                .Set(a => a.name, c.name)
+                .Set(a => a.kind, c.kind)
+                .Set(a => a.size, c.size)
+                .Set(a => a.defValue, c.defValue)
+                .Set(a => a.label, c.label)
+                .Set(a => a.widget, c.widget)
+                .Set(a => a.dictType, c.dictType)
+                .Set(a => a.relTable, c.relTable)
+                .Set(a => a.relValue, c.relValue)
+                .Set(a => a.relLabel, c.relLabel)
+                .Set(a => a.sortOrder, c.sortOrder)
+                .Set(a => a.nullable, c.nullable)
+                .Set(a => a.inList, c.inList)
+                .Set(a => a.inFilter, c.inFilter)
+                .Set(a => a.inCreate, c.inCreate)
+                .Set(a => a.inEdit, c.inEdit)
+                .Set(a => a.required, c.required)
+                .Where(a => a.id == id).ExecuteAffrowsAsync();
+            await this.Note("编辑字段", name, n > 0, "");
+            this.Saved("字段已保存");
+            return;
+        }
+        int newId = await this.GenColumn.Insert(c).ExecuteIdentityAsync();
+        await this.Note("新增字段", name, newId > 0, "");
+        this.Saved("字段已添加");
+    }
+
+    [HttpPost]
+    [Description("删除字段")]
+    async void ColumnDelete() {
+        int id = this.InInt("id", 0);
+        GenColumn c = await this.GenColumn.Read(id);
+        if (c == null) { this.Fail(404, "0404", "字段不存在"); }
+        int n = await this.GenColumn.Delete().Where(a => a.id == id)
+            .ExecuteAffrowsAsync();
+        await this.Note("删除字段", c.name, n > 0,
+            "数据库中的列保留");
+        this.Saved("字段已从设计中移除，数据库中的列保留");
+    }
+
+    /// <summary>Applies the design to the database: creates the table, or adds
+    /// the columns it is missing.</summary>
+    [HttpPost]
+    [Description("同步到数据库")]
+    async void Migrate() {
+        int id = this.InInt("id", 0);
+        GenTable t = await this.GenTable.Read(id);
+        if (t == null) { this.Fail(404, "0404", "设计不存在"); }
+        List<GenColumn> cols = await this.GenColumn
+            .Where(a => a.tableId == id).OrderBy(a => a.sortOrder).ToListAsync();
+        if (cols.Count == 0) { this.Fail(400, "0004", "先添加字段"); }
+        IDbConnection db = await this.Conn();
+        if (db == null) { this.Fail(503, "2001", "数据库不可用"); }
+
+        int changed = await Gen.Migrate(db, t, cols);
+        int _u = await this.GenTable.Update()
+            .Set(a => a.migrated, 1)
+            .Set(a => a.updatedAt, WebApp.NowSeconds())
+            .Where(a => a.id == id).ExecuteAffrowsAsync();
+        await this.Note("同步表结构", t.tableName, true,
+            Convert.ToString(changed) + " 列");
+        this.Saved("已同步到数据库，可以在「数据管理」里维护数据了");
+    }
+
+    /// <summary>Writes the generated sources. They take effect after a rebuild,
+    /// which the message says plainly rather than implying a running change.</summary>
+    [HttpPost]
+    [Description("生成代码")]
+    async void Build() {
+        int id = this.InInt("id", 0);
+        GenTable t = await this.GenTable.Read(id);
+        if (t == null) { this.Fail(404, "0404", "设计不存在"); }
+        List<GenColumn> cols = await this.GenColumn
+            .Where(a => a.tableId == id).OrderBy(a => a.sortOrder).ToListAsync();
+        if (cols.Count == 0) { this.Fail(400, "0004", "先添加字段"); }
+
+        // The server runs from build/, while the sources it would be rebuilt
+        // from are one level up. `gen.root` says where that is for deployments
+        // laid out differently.
+        string root = await Settings.Get(SettingKeys.GenRoot, "..");
+        Directory.CreateDirectory(root + "/src/Model/Gen");
+        Directory.CreateDirectory(root + "/src/Controller/Admin");
+        Directory.CreateDirectory(root + "/src/Dao/Gen");
+        Directory.CreateDirectory(root + "/views/Admin");
+        // Directory = URL prefix, and file = class = route segment = view key,
+        // so a generated table reads the same everywhere a hand-written one
+        // does. The entity is "ShopItem": controller Admin/ShopItem.zan at
+        // /admin/shopitem, DAO Dao/Gen/ShopItemDao.zan, views Admin/ShopItem.*.
+        string modelPath = root + "/src/Model/Gen/" + t.entityName + ".zan";
+        string ctlPath = root + "/src/Controller/Admin/" + t.entityName + ".zan";
+        string daoPath = root + "/src/Dao/Gen/" + t.entityName + "Dao.zan";
+        string listPath = root + "/views/Admin/" + t.entityName + ".Index.html";
+        string formPath = root + "/views/Admin/" + t.entityName + ".Form.html";
+        File.WriteAllText(modelPath, Gen.ModelSource(t, cols));
+        File.WriteAllText(ctlPath, Gen.ControllerSource(t, cols));
+        File.WriteAllText(daoPath, Gen.DaoSource(t, cols));
+        File.WriteAllText(listPath, Gen.ListViewSource(t, cols));
+        File.WriteAllText(formPath, Gen.FormViewSource(t, cols));
+
+        int _u = await this.GenTable.Update()
+            .Set(a => a.generatedAt, WebApp.NowSeconds())
+            .Where(a => a.id == id).ExecuteAffrowsAsync();
+        await this.Note("生成代码", t.tableName, true, ctlPath);
+        this.Saved("已生成 5 个文件（模型/控制器/Dao/列表/表单），重新编译后生效");
+    }
+
+    /// <summary>Shows the sources this design would produce, before writing
+    /// them.</summary>
+    [HttpGet]
+    [Description("预览生成代码")]
+    async void Preview() {
+        int id = this.InInt("id", 0);
+        GenTable t = await this.GenTable.Read(id);
+        if (t == null) { this.Fail(404, "0404", "设计不存在"); }
+        List<GenColumn> cols = await this.GenColumn
+            .Where(a => a.tableId == id).OrderBy(a => a.sortOrder).ToListAsync();
+        ViewData d = new ViewData();
+        d.Set("dialogTitle", t.tableName + " 生成预览");
+        d.Set("model", Gen.ModelSource(t, cols));
+        d.Set("controller", Gen.ControllerSource(t, cols));
+        d.Set("dao", Gen.DaoSource(t, cols));
+        d.Set("list", Gen.ListViewSource(t, cols));
+        d.Set("form", Gen.FormViewSource(t, cols));
+        this.Dialog(d);
+    }
+
+    static int Flag(string v) {
+        if (v == "1" || v == "on") { return 1; }
+        return 0;
+    }
+
+    static string Checked(int v) {
+        if (v == 1) { return "checked"; }
+        return "";
+    }
+
+    static string Tick(int v) {
+        if (v == 1) { return "✓"; }
+        return "";
+    }
+
+    static string Rel(GenColumn c) {
+        if (c.relTable.Length == 0) { return ""; }
+        return c.relTable + "." + c.relLabel;
+    }
+
+    /// <summary>"shop_order" -&gt; "ShopOrder".</summary>
+    static string Pascal(string snake) {
+        string outName = "";
+        bool up = true;
+        for (int i = 0; i < snake.Length; i = i + 1) {
+            string ch = snake.Substring(i, 1);
+            if (ch == "_") { up = true; continue; }
+            if (up) { outName = outName + ch.ToUpper(); up = false; }
+            else { outName = outName + ch; }
+        }
+        return outName;
+    }
+}

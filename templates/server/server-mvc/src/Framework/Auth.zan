@@ -14,11 +14,11 @@ class AuthUser {
     static int Active = 1;
 
     /// <summary>Borrows a connection for one authentication lookup. The
-    /// token / rank / permission resolvers run on the request coroutine (their
+    /// token / permission resolvers run on the request coroutine (their
     /// delegates are async), so this parks like any other request instead of
     /// blocking the worker, and it works on drivers that only offer awaited
     /// calls. null means the database is unreachable and every caller then fails
-    /// closed (anonymous / rank 0) rather than guessing.
+    /// closed (anonymous, nothing granted) rather than guessing.
     ///
     /// It is still one lookup per request: the RBAC phase reads the principal
     /// from the shared permission tables instead, leaving zero queries on the
@@ -88,25 +88,138 @@ class AuthUser {
         return row.tokenVersion;
     }
 
-    static async int Rank(string uid) {
-        User row = await AuthUser.ById(uid);
-        if (row == null || row.status != AuthUser.Active) { return 0; }
-        if (row.isSuper == 1) { return 9; }
-        return 1;
-    }
-
     static int ToInt(string s) {
         return Filter.ToInt(s, 0);
     }
 
+    // ---- authorization ------------------------------------------------------
+    // A user holds roles (sys_user_role, plus the roles of their department),
+    // a role holds route actions (sys_role_grant), and a route action is what
+    // the dispatcher and the menu both ask about. That is the whole model: no
+    // permission directory, no code to keep in step with the routes, and one
+    // question -- "may this uid run this action?" -- answered in one place for
+    // both the gateway and the sidebar, so a visible link can never 403.
+    //
+    // Both halves live in shared memory (PermTable), so a page that asks once
+    // per menu entry costs no query and every worker process reads the same
+    // rows. The database is only consulted when an account is not in the table
+    // yet; a write drops it there and then.
+
+    /// <summary>Drops one account's roles, so its next request rereads
+    /// them.</summary>
+    static void Forget(string uid) { PermTable.Forget(uid); }
+
+    /// <summary>Drops every account: used after a change that can affect many at
+    /// once (a department's roles, a reassignment).</summary>
+    static void ForgetAll() { PermTable.ForgetAll(); }
+
+    /// <summary>Republishes what every role may run and drops every cached
+    /// account: for a change to a role, its grants or its status.</summary>
+    static async void RolesChanged(IDbConnection db) {
+        await PermTable.LoadRoles(db);
+        PermTable.ForgetAll();
+    }
+
+    /// <summary>The PermissionResolver the dispatcher and the menu both go
+    /// through: whether this account may run that route action. The bootstrap
+    /// account bypasses the lookup, which is how the first role gets granted
+    /// at all.</summary>
     static async bool Allow(string uid, string action) {
-        int rank = await AuthUser.Rank(uid);
-        return rank >= 9;
+        if (action.Length == 0) { return false; }
+        string roleIds = await AuthUser.RolesOf(uid);
+        if (roleIds == "*") { return true; }
+        if (roleIds.Length == 0) { return false; }
+        return PermTable.RolesAllow(roleIds, action);
+    }
+
+    /// <summary>This account's roles as ",3,7," ("*" for the bootstrap account,
+    /// "" when it is unknown, disabled or the database is unreachable -- an
+    /// unresolvable account holds no rights). Read from shared memory; filled in
+    /// from the database on the first request that misses.</summary>
+    static async string RolesOf(string uid) {
+        int id = AuthUser.ToInt(uid);
+        if (id <= 0) { return ""; }
+
+        string hit = PermTable.UserRoles(uid);
+        if (hit.Length > 0) { return hit; }
+
+        IDbConnection db = await AuthUser.Lease();
+        if (db == null) { return ""; }
+        try {
+            User me = await db.Select<User>().Where(a => a.id == id).FirstAsync();
+            if (me == null || me.status != AuthUser.Active) { return ""; }
+            if (me.isSuper == 1) {
+                PermTable.SetUser(uid, true, "");
+                return "*";
+            }
+            string joined = await AuthUser.RoleIds(db, me);
+            PermTable.SetUser(uid, false, joined);
+            return joined;
+        } finally {
+            AuthUser.Give(db);
+        }
+    }
+
+    /// <summary>The enabled roles this account holds -- its own and its
+    /// department's, so a new hire inherits the department's rights without a
+    /// second assignment -- as ",3,7,".</summary>
+    static async string RoleIds(IDbConnection db, User me) {
+        List<int> roleIds = new List<int>();
+        List<UserRole> mine = await db.Select<UserRole>()
+            .Where(a => a.userId == me.id).ToListAsync();
+        for (int i = 0; i < mine.Count; i = i + 1) {
+            AuthUser.AddId(roleIds, mine[i].roleId);
+        }
+        int dept = me.departmentId;
+        if (dept > 0) {
+            List<DepartmentRole> byDept = await db.Select<DepartmentRole>()
+                .Where(a => a.departmentId == dept).ToListAsync();
+            for (int i = 0; i < byDept.Count; i = i + 1) {
+                AuthUser.AddId(roleIds, byDept[i].roleId);
+            }
+        }
+        if (roleIds.Count == 0) { return ""; }
+
+        StringBuilder outp = new StringBuilder();
+        outp.Append(",");
+        List<Role> roles = await db.Select<Role>().ToListAsync();
+        for (int i = 0; i < roles.Count; i = i + 1) {
+            Role r = roles[i];
+            if (r.status != 1 || !AuthUser.HasId(roleIds, r.id)) { continue; }
+            outp.Append(Convert.ToString(r.id));
+            outp.Append(",");
+        }
+        string joined = outp.ToString();
+        if (joined == ",") { return ""; }
+        return joined;
+    }
+
+    static void AddId(List<int> list, int id) {
+        if (id <= 0 || AuthUser.HasId(list, id)) { return; }
+        list.Add(id);
+    }
+
+    static bool HasId(List<int> list, int id) {
+        for (int i = 0; i < list.Count; i = i + 1) {
+            if (list[i] == id) { return true; }
+        }
+        return false;
+    }
+
+    /// <summary>Whether a comma-joined list holds the whole item `needle`. The
+    /// commas are part of the comparison, so "Users.List" never matches
+    /// "Users.ListAll". Used to read checkbox sets off a form.</summary>
+    static bool Holds(string haystack, string needle) {
+        if (needle.Length == 0) { return false; }
+        return ("," + haystack + ",").Contains("," + needle + ",");
     }
 }
 
 class AuthToken {
-    static string Secret() { return ProcessHost.Env("ZAN_AUTH_SECRET"); }
+    /// <summary>The cookie key: [auth].secret in config/app.json, overridden by
+    /// the ZAN_AUTH_SECRET environment variable when that is set (so a
+    /// deployment can keep the secret out of the file).</summary>
+    static string Secret() { return Cfg.Auth.secret; }
 
     static bool Ready() { return AuthToken.Secret().Length >= 32; }
 

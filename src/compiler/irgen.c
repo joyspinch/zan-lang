@@ -13,6 +13,9 @@
 #include "builtin_api.h"
 #include "arena.h"
 #include "diag.h"
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
 
 /* ---- width-tolerant integer builders -------------------------------------
  * Zan's `int` lowers to i32 while lengths, counts, handles and every runtime

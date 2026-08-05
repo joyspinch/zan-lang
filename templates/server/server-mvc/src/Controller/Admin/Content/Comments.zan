@@ -1,0 +1,113 @@
+using System;
+using System.Data;
+using System.Data.Orm;
+using System.Web;
+using ZanWeb;
+using ZanWeb.Model.Blog;
+
+namespace ZanWeb.Admin.Content;
+
+/// <summary>
+/// Comment moderation at /admin/content/comments. A reader's comment is stored with
+/// status 0 and shows on the site only once it is approved here, so an open
+/// form cannot publish anything by itself.
+/// </summary>
+[Route("admin/content/comments/[action]")]
+[Custom(Authorization = CustomAuthorization.Grant)]
+[Description("评论管理")]
+class Comments : AdminController {
+    [HttpGet]
+    [Route("/admin/content/comments")]
+    [Custom(IsMenu = true, Icon = "mdi:comment-multiple")]
+    [Description("评论管理")]
+    async void Index() {
+        ViewData d = await this.Layout("评论管理");
+        if (!this.DbReady()) { d.Set("dbDown", "1"); this.Page(d); return; }
+
+        ListQuery q = this.Paged("id", 20);
+        int status = this.InInt("status", -1);
+        if (status == 0) { d.Set("statusPending", "selected"); }
+        if (status == 1) { d.Set("statusOk", "selected"); }
+        if (status == 2) { d.Set("statusNo", "selected"); }
+
+        int total = await this.Comment
+            .WhereIf(status >= 0, a => a.status == status).CountAsync();
+        List<Comment> rows = await this.Comment
+            .WhereIf(status >= 0, a => a.status == status)
+            .OrderByDescending(a => a.id)
+            .Skip(q.Skip()).Take(q.Limit()).ToListAsync();
+        List<Post> posts = await this.Post.ToListAsync();
+
+        List<StrMap> items = d.AddList("rows");
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            Comment c = rows[i];
+            StrMap row = new StrMap();
+            row.Set("id", Convert.ToString(c.id));
+            row.Set("author", Fmt.Dash(c.author));
+            row.Set("content", c.content);
+            row.Set("post", Comments.PostTitle(posts, c.postId));
+            row.Set("postId", Convert.ToString(c.postId));
+            row.Set("ip", Fmt.Dash(c.ip));
+            row.Set("createdAt", Fmt.Stamp(c.createdAt));
+            row.Set("statusText", Comments.StatusText(c.status));
+            row.Set("statusClass", Comments.StatusClass(c.status));
+            if (c.status != 1) { row.Set("canApprove", "1"); }
+            if (c.status != 2) { row.Set("canReject", "1"); }
+            items.Add(row);
+        }
+        int pending = await this.Comment.Where(a => a.status == 0).CountAsync();
+        d.Set("pending", Convert.ToString(pending));
+        this.Pager(d, q, total);
+        this.Page(d);
+    }
+
+    [HttpPost]
+    [Description("审核评论")]
+    async void Review() {
+        int id = this.InInt("id", 0);
+        int status = this.InInt("status", 1);
+        if (status != 1 && status != 2) { status = 0; }
+        Comment c = await this.Comment.Read(id);
+        if (c == null) { this.Fail(404, "0404", "评论不存在"); }
+        int n = await this.Comment.Update()
+            .Set(a => a.status, status)
+            .Where(a => a.id == id)
+            .ExecuteAffrowsAsync();
+        await this.Note("审核评论",
+            "#" + Convert.ToString(id), n > 0, Comments.StatusText(status));
+        if (status == 1) { this.Saved("评论已通过，前台可见"); return; }
+        this.Saved("评论已驳回");
+    }
+
+    [HttpPost]
+    [Description("删除评论")]
+    async void Delete() {
+        int id = this.InInt("id", 0);
+        Comment c = await this.Comment.Read(id);
+        if (c == null) { this.Fail(404, "0404", "评论不存在"); }
+        int n = await this.Comment.Delete().Where(a => a.id == id)
+            .ExecuteAffrowsAsync();
+        await this.Note("删除评论",
+            "#" + Convert.ToString(id), n > 0, "");
+        this.Saved("评论已删除");
+    }
+
+    static string PostTitle(List<Post> posts, int id) {
+        for (int i = 0; i < posts.Count; i = i + 1) {
+            if (posts[i].id == id) { return posts[i].title; }
+        }
+        return "—";
+    }
+
+    static string StatusText(int status) {
+        if (status == 1) { return "已通过"; }
+        if (status == 2) { return "已驳回"; }
+        return "待审核";
+    }
+
+    static string StatusClass(int status) {
+        if (status == 1) { return "ok"; }
+        if (status == 2) { return "bad"; }
+        return "warn";
+    }
+}

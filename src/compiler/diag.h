@@ -55,4 +55,10 @@ const zan_diag_entry_t *zan_diag_entry_at(const zan_diag_t *diag, int index);
  * on any diag; leaves the struct itself intact. */
 void zan_diag_free_buffers(zan_diag_t *diag);
 
+/* Progress trace, printed to stderr only when ZANC_TRACE is set in the
+ * environment. Declared here rather than in irgen.h because the front end is
+ * also compiled into zan-lsp without LLVM, and the long phases need a trace
+ * too: the last line printed is the phase that never came back. */
+void zan_compile_trace(const char *fmt, ...);
+
 #endif /* ZAN_DIAG_H */

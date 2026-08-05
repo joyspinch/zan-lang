@@ -1,0 +1,227 @@
+using System;
+using System.Data;
+using System.Data.Orm;
+using System.Web;
+using ZanWeb;
+using ZanWeb.Model.Sys;
+
+namespace ZanWeb.Admin.System;
+
+/// <summary>
+/// Dictionaries at /admin/system/dicts: the small enumerations (statuses, kinds,
+/// levels) that the rest of the system labels values with. Types on the left,
+/// the selected type's items on the right, both on one screen because editing
+/// one without seeing the other is pointless.
+/// </summary>
+[Route("admin/system/dicts/[action]")]
+[Custom(Authorization = CustomAuthorization.Grant)]
+[Description("数据字典")]
+class Dicts : AdminController {
+    [HttpGet]
+    [Route("/admin/system/dicts")]
+    [Custom(IsMenu = true, Icon = "mdi:book-open")]
+    [Description("数据字典")]
+    async void Index() {
+        ViewData d = await this.Layout("数据字典");
+        if (!this.DbReady()) { d.Set("dbDown", "1"); this.Page(d); return; }
+
+        List<DictType> types = await this.DictType.OrderBy(a => a.code).ToListAsync();
+        string current = this.In("type");
+        if (current.Length == 0 && types.Count > 0) { current = types[0].code; }
+        d.Set("type", current);
+
+        List<StrMap> left = d.AddList("types");
+        for (int i = 0; i < types.Count; i = i + 1) {
+            DictType t = types[i];
+            StrMap row = new StrMap();
+            row.Set("id", Convert.ToString(t.id));
+            row.Set("code", t.code);
+            row.Set("name", t.name);
+            row.Set("statusText", Dicts.StatusText(t.status));
+            row.Set("statusClass", Dicts.StatusClass(t.status));
+            if (t.code == current) { row.Set("active", "active"); }
+            left.Add(row);
+        }
+
+        List<DictItem> items = await this.DictItem
+            .Where(a => a.typeCode == current)
+            .OrderBy(a => a.sortOrder).ToListAsync();
+        List<StrMap> right = d.AddList("items");
+        for (int i = 0; i < items.Count; i = i + 1) {
+            DictItem it = items[i];
+            StrMap row = new StrMap();
+            row.Set("id", Convert.ToString(it.id));
+            row.Set("label", it.label);
+            row.Set("value", it.value);
+            row.Set("sortOrder", Convert.ToString(it.sortOrder));
+            row.Set("statusText", Dicts.StatusText(it.status));
+            row.Set("statusClass", Dicts.StatusClass(it.status));
+            right.Add(row);
+        }
+        if (types.Count == 0) { d.Set("emptyTypes", "1"); }
+        if (items.Count == 0) { d.Set("emptyItems", "1"); }
+        this.Page(d);
+    }
+
+    [HttpGet]
+    [Description("字典类型表单")]
+    async void TypeForm() {
+        int id = this.InInt("id", 0);
+        ViewData d = new ViewData();
+        d.Set("id", Convert.ToString(id));
+        d.Set("dialogTitle", "新增字典类型");
+        d.Set("status1", "selected");
+        if (id > 0) {
+            DictType t = await this.DictType.Read(id);
+            if (t == null) { this.Fail(404, "0404", "字典类型不存在"); }
+            d.Set("dialogTitle", "编辑字典类型");
+            d.Set("code", t.code);
+            d.Set("name", t.name);
+            d.Set("description", t.description);
+            d.Set("status1", "");
+            if (t.status == 1) { d.Set("status1", "selected"); }
+            else { d.Set("status0", "selected"); }
+        }
+        this.Dialog(d);
+    }
+
+    [HttpPost]
+    [Description("保存字典类型")]
+    async void TypeSave() {
+        int id = this.InInt("id", 0);
+        string code = this.Need("code", "类型标识");
+        string name = this.Need("name", "类型名称");
+        string description = this.In("description");
+        int status = this.InInt("status", 1);
+        if (status != 1) { status = 0; }
+        DictType clash = await this.DictType.Where(a => a.code == code).FirstAsync();
+        if (clash != null && clash.id != id) {
+            this.Fail(400, "0004", "类型标识 " + code + " 已存在");
+        }
+        if (id > 0) {
+            int n = await this.DictType.Update()
+                .Set(a => a.code, code)
+                .Set(a => a.name, name)
+                .Set(a => a.description, description)
+                .Set(a => a.status, status)
+                .Set(a => a.updatedAt, WebApp.NowSeconds())
+                .Where(a => a.id == id)
+                .ExecuteAffrowsAsync();
+            await this.Note("编辑字典类型", code, n > 0, "");
+            this.Saved("字典类型已保存");
+            return;
+        }
+        DictType t = new DictType();
+        t.code = code;
+        t.name = name;
+        t.description = description;
+        t.status = status;
+        t.createdAt = WebApp.NowSeconds();
+        t.updatedAt = t.createdAt;
+        int newId = await this.DictType.Insert(t).ExecuteIdentityAsync();
+        await this.Note("新增字典类型", code, newId > 0, "");
+        this.Saved("字典类型已创建");
+    }
+
+    [HttpPost]
+    [Description("删除字典类型")]
+    async void TypeDelete() {
+        int id = this.InInt("id", 0);
+        DictType t = await this.DictType.Read(id);
+        if (t == null) { this.Fail(404, "0404", "字典类型不存在"); }
+        string code = t.code;
+        int n = await this.DictType.Delete().Where(a => a.id == id)
+            .ExecuteAffrowsAsync();
+        int _i = await this.DictItem.Delete().Where(a => a.typeCode == code)
+            .ExecuteAffrowsAsync();
+        await this.Note("删除字典类型", code, n > 0, "");
+        this.Saved("字典类型及其条目已删除");
+    }
+
+    [HttpGet]
+    [Description("字典条目表单")]
+    async void ItemForm() {
+        int id = this.InInt("id", 0);
+        ViewData d = new ViewData();
+        d.Set("id", Convert.ToString(id));
+        d.Set("typeCode", this.In("type"));
+        d.Set("dialogTitle", "新增字典条目");
+        d.Set("sortOrder", "1");
+        d.Set("status1", "selected");
+        if (id > 0) {
+            DictItem it = await this.DictItem.Read(id);
+            if (it == null) { this.Fail(404, "0404", "字典条目不存在"); }
+            d.Set("dialogTitle", "编辑字典条目");
+            d.Set("typeCode", it.typeCode);
+            d.Set("label", it.label);
+            d.Set("value", it.value);
+            d.Set("sortOrder", Convert.ToString(it.sortOrder));
+            d.Set("status1", "");
+            if (it.status == 1) { d.Set("status1", "selected"); }
+            else { d.Set("status0", "selected"); }
+        }
+        this.Dialog(d);
+    }
+
+    [HttpPost]
+    [Description("保存字典条目")]
+    async void ItemSave() {
+        int id = this.InInt("id", 0);
+        string typeCode = this.Need("typeCode", "所属类型");
+        string label = this.Need("label", "显示名");
+        string value = this.Need("value", "值");
+        int sortOrder = this.InInt("sortOrder", 1);
+        int status = this.InInt("status", 1);
+        if (status != 1) { status = 0; }
+        if (id > 0) {
+            int n = await this.DictItem.Update()
+                .Set(a => a.typeCode, typeCode)
+                .Set(a => a.label, label)
+                .Set(a => a.value, value)
+                .Set(a => a.sortOrder, sortOrder)
+                .Set(a => a.status, status)
+                .Set(a => a.updatedAt, WebApp.NowSeconds())
+                .Where(a => a.id == id)
+                .ExecuteAffrowsAsync();
+            await this.Note("编辑字典条目", typeCode + "/" + value,
+                n > 0, "");
+            this.Saved("字典条目已保存");
+            return;
+        }
+        DictItem it = new DictItem();
+        it.typeCode = typeCode;
+        it.label = label;
+        it.value = value;
+        it.sortOrder = sortOrder;
+        it.status = status;
+        it.createdAt = WebApp.NowSeconds();
+        it.updatedAt = it.createdAt;
+        int newId = await this.DictItem.Insert(it).ExecuteIdentityAsync();
+        await this.Note("新增字典条目", typeCode + "/" + value,
+            newId > 0, "");
+        this.Saved("字典条目已创建");
+    }
+
+    [HttpPost]
+    [Description("删除字典条目")]
+    async void ItemDelete() {
+        int id = this.InInt("id", 0);
+        DictItem it = await this.DictItem.Read(id);
+        if (it == null) { this.Fail(404, "0404", "字典条目不存在"); }
+        int n = await this.DictItem.Delete().Where(a => a.id == id)
+            .ExecuteAffrowsAsync();
+        await this.Note("删除字典条目",
+            it.typeCode + "/" + it.value, n > 0, "");
+        this.Saved("字典条目已删除");
+    }
+
+    static string StatusText(int status) {
+        if (status == 1) { return "启用"; }
+        return "停用";
+    }
+
+    static string StatusClass(int status) {
+        if (status == 1) { return "ok"; }
+        return "off";
+    }
+}

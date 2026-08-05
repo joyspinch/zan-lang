@@ -152,3 +152,20 @@ void zan_diag_emit(zan_diag_t *diag, zan_diag_level_t level, zan_loc_t loc,
 bool zan_diag_has_errors(zan_diag_t *diag) {
     return diag->error_count > 0;
 }
+
+/* The long phases run for as long as they run and print nothing until they
+ * are done, so a build that appears to hang gives no clue which phase or
+ * method body it is inside. Setting ZANC_TRACE turns on a line per phase /
+ * emitted method body; the last line printed is the one that never came
+ * back. */
+void zan_compile_trace(const char *fmt, ...) {
+    static int on = -1;
+    if (on < 0) on = getenv("ZANC_TRACE") ? 1 : 0;
+    if (!on) return;
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    fputc('\n', stderr);
+    fflush(stderr);
+}

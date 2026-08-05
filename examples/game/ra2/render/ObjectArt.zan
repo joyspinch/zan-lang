@@ -1,0 +1,407 @@
+using System;
+using System.Collections.Generic;
+using Ra2.Assets;
+using Ra2.Formats;
+using Ra2.Game;
+
+namespace Ra2.Render;
+
+/// <summary>Converts object art -- an SHP frame plus a palette -- to the RGBA
+/// textures the renderer blits. The palette is unit.pal in a full install,
+/// which shares its layout with the snow palette this stripped install has.</summary>
+class ObjectArt {
+    Vfs vfs;
+    AssetDb db;
+    Palette unitPal;
+    Palette theaterPal;
+
+    // SHP name + frame -> decoded texture. Frame 0 of a building's SHP is the
+    // complete structure; the later frames are the construction animation. A
+    // missing name is cached as null, which is distinct from "not looked up".
+    List<string> shpNames;
+    List<int> shpFrames;
+    List<Texture> shpCache;
+
+    static ObjectArt Create(Vfs vfs, AssetDb db) {
+        ObjectArt a = new ObjectArt();
+        a.vfs = vfs;
+        a.db = db;
+        a.shpNames = new List<string>();
+        a.shpFrames = new List<int>();
+        a.shpCache = new List<Texture>();
+        // unit.pal is absent from this stripped install; unitsno.pal (the
+        // snow-theater unit palette) is what the merged art is keyed to.
+        a.unitPal = db.PaletteNamed("unitsno.pal");
+        if (a.unitPal == null) { a.unitPal = db.PaletteNamed("unit.pal"); }
+        // Buildings use the temperate theater palette. Using the unit palette
+        // made every structure render with wrong colours -- the yard's olive
+        // green came out as bright white.
+        a.theaterPal = db.PaletteNamed("isotem.pal");
+        if (a.theaterPal == null) { a.theaterPal = db.PaletteNamed("isosno.pal"); }
+        return a;
+    }
+
+    /// <summary>The texture for a structure at a construction progress. The
+    /// building SHP carries the built form in frame 0 and the construction
+    /// skeleton in the later frames, so a partially built structure shows the
+    /// appropriate stage: the last frame is the earliest construction and the
+    /// finished structure appears once progress passes all of them.</summary>
+    Texture StructureTexture(int side, int buildId, StructureCatalog catalog,
+                             int progress, int buildTime) {
+        StructureType t = catalog.TypeFor(side, buildId);
+        if (t == null) { return null; }
+        int frame = 0;
+        if (buildTime > 0 && progress < buildTime) {
+            // Map [0, buildTime) onto the construction frames. Frame 0 is the
+            // finished building, frames 1..n-1 are progressively earlier
+            // construction, so a just-placed building shows the last frame and
+            // works up toward completion.
+            int n = this.ShapeFrameCount(t.ShpName());
+            if (n > 1) {
+                int stage = progress * (n - 1) / buildTime;
+                frame = n - 1 - stage;
+                if (frame < 0) { frame = 0; }
+                if (frame >= n) { frame = n - 1; }
+            }
+        }
+        return this.ShapeTextureFrame(t.ShpName(), frame, this.theaterPal);
+    }
+
+    /// <summary>A unit's art. The stripped install carries a few unit sprites
+    /// (dog, spy, sniper); units whose SHP name is empty get a side-coloured
+    /// placeholder drawn by the renderer instead.
+    ///
+    /// The TS/RA2 unit SHP layout is fixed: frames 0-7 are the eight facing
+    /// directions of the still pose, 8-13 the south-facing idle animation, and
+    /// 14+ the eight facing directions' walk cycles in blocks of six (S, SW,
+    /// W, NW, N, NE, E, SE). Walking cycles the block of the unit's facing;
+    /// idle cycles the south-facing idle frames.</summary>
+    Texture UnitTexture(UnitType ut, bool moving, int animFrame, int facing) {
+        if (ut == null) { return null; }
+        string name = ut.ShpName();
+        if (name == null || name.Length == 0) { return null; }
+        int frame = 0;
+        if (moving) {
+            frame = 14 + facing * 6 + (animFrame % 6);
+        } else {
+            frame = 8 + (animFrame % 6);
+        }
+        // Guard: a shape with fewer than 20 frames is not a unit sprite; fall
+        // back to frame 0 rather than reading past the end.
+        int count = this.ShapeFrameCount(name);
+        if (frame >= count) { frame = 0; }
+        return this.ShapeTextureFrame(name, frame, this.unitPal);
+    }
+
+    /// <summary>How many frames a shape carries, 0 when absent. Drives the
+    /// construction animation mapping.</summary>
+    int ShapeFrameCount(string shpName) {
+        int i = this.IndexOfName(this.shpNames, shpName);
+        if (i >= 0) { return this.shpFrames[i]; }
+        int n = 0;
+        List<int> len = new List<int>();
+        len.Add(0);
+        byte[] raw = this.vfs.Read(shpName, len);
+        if (len[0] > 0) {
+            ShpImage shp = ShpImage.Parse(raw, len[0]);
+            n = shp.FrameCount();
+        }
+        this.shpNames.Add(shpName);
+        this.shpFrames.Add(n);
+        this.shpCache.Add(null);
+        return n;
+    }
+
+    Texture ShapeTextureFrame(string shpName, int frame, Palette pal) {
+        for (int i = 0; i < this.shpNames.Count; i = i + 1) {
+            if (this.shpNames[i] == shpName && this.shpFrames[i] == frame) {
+                return this.shpCache[i];
+            }
+        }
+        Texture tex = null;
+        if (pal != null) {
+            List<int> len = new List<int>();
+            len.Add(0);
+            byte[] raw = this.vfs.Read(shpName, len);
+            if (len[0] > 0) {
+                ShpImage shp = ShpImage.Parse(raw, len[0]);
+                ShpFrame f = shp.FrameAt(frame);
+                if (f != null && !f.IsEmpty()) {
+                    byte[] idx = shp.DecodeFrame(frame);
+                    tex = Texture.FromIndexed(idx, f.Width(), f.Height(), pal);
+                }
+            }
+        }
+        this.shpNames.Add(shpName);
+        this.shpFrames.Add(frame);
+        this.shpCache.Add(tex);
+        return tex;
+    }
+
+    int IndexOfName(List<string> names, string name) {
+        for (int i = 0; i < names.Count; i = i + 1) {
+            if (names[i] == name) { return i; }
+        }
+        return -1;
+    }
+
+    void Close() {
+        for (int i = 0; i < this.shpCache.Count; i = i + 1) {
+            if (this.shpCache[i] != null) { this.shpCache[i].Close(); }
+        }
+        this.shpCache = new List<Texture>();
+    }
+}
+
+/// <summary>Draws the world's objects into a terrain canvas in painter's
+/// order, plus a selection ring and the placeholder unit sprite. Pure drawing:
+/// where an object sits comes from World, how it looks from ObjectArt.</summary>
+class ObjectRenderer {
+    /// <summary>The placeholder unit glyph: a diamond of the unit's own colour
+    /// with a darker outline, drawn once into a shared texture. Infantry are
+    /// small, the tank reads as a heavy block, and the two side colours plus
+    /// the dog's brown keep friend and foe apart on the terrain.</summary>
+    static int PlaceholderSize(int unitId) {
+        if (unitId == 3) { return 36; }   // tank
+        if (unitId == 1) { return 18; }   // dog
+        return 24;
+    }
+
+    static Texture Placeholder(int side, int unitId) {
+        int w = ObjectRenderer.PlaceholderSize(unitId);
+        int h = w;
+        Texture tex = Texture.Create(w, h);
+        int r = 46;
+        int g = 128;
+        int b = 214;
+        if (side == Side2.Soviet()) { r = 224; g = 52; b = 48; }
+        if (unitId == 1) { r = 150; g = 120; b = 70; }          // dog
+        if (unitId == 2) { r = 46; g = 214; b = 214; }          // rocket/flak
+        if (unitId == 3) {
+            if (side == Side2.Soviet()) { r = 170; g = 40; b = 36; }
+            else { r = 40; g = 96; b = 170; }
+        }
+        for (int y = 0; y < h; y = y + 1) {
+            for (int x = 0; x < w; x = x + 1) {
+                bool outline = ((x + y) & 3) < 2;
+                if (!outline) { continue; }
+                tex.SetPixel(y * w + x, r, g, b, 255);
+            }
+        }
+        return tex;
+    }
+
+    /// <summary>Draws every object into the canvas. Returns the number drawn,
+    /// mirroring MapRenderer.RenderInto's contract for the caller to report.</summary>
+    static int Render(World world, ObjectArt art, Texture canvas, int camX,
+                      int camY, int originX, int originY, int playerSide) {
+        int drawn = 0;
+        List<WorldObject> vis = new List<WorldObject>();
+        for (int i = 0; i < world.ObjectCount(); i = i + 1) {
+            vis.Add(world.ObjectAt(i));
+        }
+        ObjectRenderer.SortByDepth(vis);
+        for (int i = 0; i < vis.Count; i = i + 1) {
+            if (ObjectRenderer.DrawOne(world, art, vis[i], canvas, camX, camY,
+                                       originX, originY, playerSide)) {
+                drawn = drawn + 1;
+            }
+        }
+        // Combat effects (muzzle flashes, explosions) draw on top so a shot or
+        // kill is visible over the sprites involved.
+        ObjectRenderer.DrawEffects(world, canvas, camX, camY, originX, originY);
+        return drawn;
+    }
+
+    /// <summary>Draws live combat effects: flashes are bright dots, explosions
+    /// are expanding rings whose size and fade track the remaining life.</summary>
+    static void DrawEffects(World world, Texture canvas, int camX, int camY,
+                            int originX, int originY) {
+        for (int i = 0; i < world.EffectCount(); i = i + 1) {
+            int kind = world.EffectKind(i);
+            int x = world.EffectX(i);
+            int y = world.EffectY(i);
+            int life = world.EffectLife(i);
+            int wx = IsoProjection.ScreenX(x, y) - originX - camX;
+            int wy = IsoProjection.ScreenY(x, y, 0) - originY - camY;
+            if (wx < -64 || wy < -64 || wx > canvas.Width() + 64
+             || wy > canvas.Height() + 64) { continue; }
+            if (kind == 0) {
+                // Muzzle flash: a bright yellow dot at the cell apex.
+                ObjectRenderer.DrawDot(canvas, wx, wy, 2, 255, 236, 120, 220);
+            } else {
+                // Explosion: a ring whose radius grows as life fades, plus a
+                // hot core in the first few ticks.
+                int radius = 18 - life * 2;
+                if (radius < 2) { radius = 2; }
+                int alpha = 120 + life * 8;
+                if (alpha > 240) { alpha = 240; }
+                ObjectRenderer.DrawRing2(canvas, wx, wy, radius,
+                                         232, 120 + life * 6, 40, alpha);
+                if (life > 8) {
+                    ObjectRenderer.DrawDot(canvas, wx, wy, 4, 255, 200, 60, 200);
+                }
+            }
+        }
+    }
+
+    /// <summary>Fills a filled disc of radius r centred at (cx,cy).</summary>
+    static void DrawDot(Texture canvas, int cx, int cy, int r, int cr, int cg,
+                        int cb, int ca) {
+        for (int dy = 0 - r; dy <= r; dy = dy + 1) {
+            int half = ObjectRenderer.Isqrt(r * r - dy * dy);
+            for (int dx = 0 - half; dx <= half; dx = dx + 1) {
+                int px = cx + dx;
+                int py = cy + dy;
+                if (px >= 0 && py >= 0 && px < canvas.Width()
+                 && py < canvas.Height()) {
+                    canvas.SetPixel(py * canvas.Width() + px, cr, cg, cb, ca);
+                }
+            }
+        }
+    }
+
+    /// <summary>Integer square root.</summary>
+    static int Isqrt(int n) {
+        if (n <= 0) { return 0; }
+        int x = n;
+        int y = (x + 1) / 2;
+        while (y < x) {
+            x = y;
+            y = (x + n / x) / 2;
+        }
+        return x;
+    }
+
+    /// <summary>Draws a diamond ring of radius r (matching the tile shape)
+    /// centred at (cx,cy), in the four cardinal points.</summary>
+    static void DrawRing2(Texture canvas, int cx, int cy, int r, int cr, int cg,
+                          int cb, int ca) {
+        for (int i = 0; i <= r; i = i + 1) {
+            ObjectRenderer.SetPx(canvas, cx + i, cy + (r - i) / 2, cr, cg, cb, ca);
+            ObjectRenderer.SetPx(canvas, cx - i, cy + (r - i) / 2, cr, cg, cb, ca);
+            ObjectRenderer.SetPx(canvas, cx + i, cy - (r - i) / 2, cr, cg, cb, ca);
+            ObjectRenderer.SetPx(canvas, cx - i, cy - (r - i) / 2, cr, cg, cb, ca);
+        }
+    }
+
+    static void SetPx(Texture canvas, int x, int y, int cr, int cg, int cb,
+                      int ca) {
+        if (x >= 0 && y >= 0 && x < canvas.Width() && y < canvas.Height()) {
+            canvas.SetPixel(y * canvas.Width() + x, cr, cg, cb, ca);
+        }
+    }
+
+    /// <summary>Sorts objects back-to-front by x+y so a nearer object covers
+    /// the ones behind it, matching the terrain's painter order.</summary>
+    static void SortByDepth(List<WorldObject> objs) {
+        int n = objs.Count;
+        // Selection sort; object counts are tens, not thousands.
+        for (int i = 0; i < n - 1; i = i + 1) {
+            int best = i;
+            for (int j = i + 1; j < n; j = j + 1) {
+                if (ObjectRenderer.Depth(objs[j]) < ObjectRenderer.Depth(objs[best])) {
+                    best = j;
+                }
+            }
+            if (best != i) {
+                WorldObject tmp = objs[i];
+                objs[i] = objs[best];
+                objs[best] = tmp;
+            }
+        }
+    }
+
+    static int Depth(WorldObject o) { return o.X() + o.Y(); }
+
+    static bool DrawOne(World world, ObjectArt art, WorldObject o, Texture canvas,
+                        int camX, int camY, int originX, int originY,
+                        int playerSide) {
+        int wx = IsoProjection.ScreenX(o.X(), o.Y()) - originX - camX;
+        int wy = IsoProjection.ScreenY(o.X(), o.Y(), 0) - originY - camY;
+        if (wx > canvas.Width() + 128 || wx < -128
+         || wy > canvas.Height() + 128 || wy < -128) {
+            return false;
+        }
+
+        Texture tex = null;
+        if (o.Kind() == ObjKind.Structure()) {
+            StructureType t = world.Catalog().TypeFor(o.Side(), o.BuildId());
+            tex = art.StructureTexture(o.Side(), o.BuildId(),
+                                       world.Catalog(), o.BuiltTicks(),
+                                       t.BuildTime());
+        } else {
+            // Units draw their real sprite when the install has the art (the
+            // dog, spy, sniper), otherwise the side-coloured placeholder.
+            tex = art.UnitTexture(o.UnitType(), o.HasRoute(), o.AnimFrame(),
+                                  o.Facing());
+        }
+        if (tex != null) {
+            // The sprite's box is drawn around the cell apex; the building's
+            // visual ground is the bottom of the sprite, which the frame's y
+            // places below the apex.
+            canvas.Blit(tex, wx + (0 - tex.Width() / 2),
+                        wy + (0 - tex.Height()));
+        } else {
+            Texture ph = ObjectRenderer.Placeholder(o.Side(), o.UnitId());
+            int pw = ph.Width();
+            canvas.Blit(ph, wx - pw / 2, wy - pw);
+            ph.Close();
+        }
+
+        if (o.IsSelected()) {
+            // Own units get a green ring, enemy units a red one, so the
+            // player can tell at a glance whose selection this is.
+            if (o.Side() == playerSide) {
+                ObjectRenderer.DrawRing(canvas, wx, wy, 30, 255, 80);
+            } else {
+                ObjectRenderer.DrawRing(canvas, wx, wy, 232, 60, 60);
+            }
+        }
+        // A health bar above every damaged thing: a dark backing strip and a
+        // fill that shrinks as hit points fall. The fill goes green, then
+        // yellow, then red as health drops, so danger reads at a glance.
+        // Full-health objects get no bar, so the terrain stays clean until a
+        // fight breaks out.
+        if (o.Hp() < o.MaxHp() && o.MaxHp() > 0) {
+            int bw = 30;
+            int bx = wx - bw / 2;
+            int by = wy - 34;
+            canvas.SetPixel((by + 1) * canvas.Width() + (bx - 1), 0, 0, 0, 160);
+            canvas.SetPixel((by + 1) * canvas.Width() + (bx + bw), 0, 0, 0, 160);
+            int fill = bw * o.Hp() / o.MaxHp();
+            for (int i = 0; i <= bw + 1; i = i + 1) {
+                canvas.SetPixel(by * canvas.Width() + (bx - 1 + i), 0, 0, 0, 160);
+                canvas.SetPixel((by + 2) * canvas.Width() + (bx - 1 + i), 0, 0, 0, 160);
+            }
+            int hr = 62;
+            int hg = 224;
+            int hb = 74;
+            if (fill < bw / 2) { hr = 232; hg = 60; hb = 60; }
+            else if (fill < bw * 3 / 4) { hr = 236; hg = 200; hb = 60; }
+            for (int i = 0; i < fill; i = i + 1) {
+                canvas.SetPixel((by + 1) * canvas.Width() + (bx + i), hr, hg, hb, 255);
+            }
+            if (fill < bw) {
+                canvas.SetPixel((by + 1) * canvas.Width() + (bx + fill), 160, 0, 0, 255);
+            }
+        }
+        return true;
+    }
+
+    /// <summary>A diamond outline around a unit or building's anchor, so the
+    /// selection is visible against any ground. Four edges closing at the four
+    /// apexes, matching the isometric tile shape.</summary>
+    static void DrawRing(Texture canvas, int cx, int cy, int cr, int cg,
+                         int cb) {
+        int a = 255;
+        // Top -> right, right -> bottom, bottom -> left, left -> top. Each edge
+        // runs r steps from one apex to the next.
+        for (int i = 0; i <= 15; i = i + 1) {
+            canvas.SetPixel((cy - 15 + i) * canvas.Width() + (cx + i), cr, cg, cb, a);
+            canvas.SetPixel((cy + i) * canvas.Width() + (cx + 15 - i), cr, cg, cb, a);
+            canvas.SetPixel((cy + 15 - i) * canvas.Width() + (cx - i), cr, cg, cb, a);
+            canvas.SetPixel((cy - i) * canvas.Width() + (cx - 15 + i), cr, cg, cb, a);
+        }
+    }
+}

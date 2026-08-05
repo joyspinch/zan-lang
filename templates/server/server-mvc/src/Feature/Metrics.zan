@@ -1,0 +1,332 @@
+using System;
+using System.Data;
+using System.Data.Sqlite;
+using System.Diagnostics;
+using System.Text;
+using System.Threading;
+using System.Web;
+
+namespace ZanWeb;
+
+/// <summary>One minute of traffic for one route: how often it was called, how
+/// long it took, how badly it went, and -- for a stream -- how much was pushed
+/// over it. This is the row the history screen reads and the shape kept in
+/// memory between flushes.</summary>
+class MetricMinute {
+    long minute;     // epoch seconds truncated to the minute
+    string route;    // route action ("Users.Save"), or "METHOD /path" for a
+                     // request no attribute route claimed
+    long calls;
+    long errors;
+    long totalMs;
+    long maxMs;
+    /// Frames/messages pushed over a long-lived connection (SSE/WebSocket) --
+    /// how a stream is measured, since its duration is not a latency.
+    long frames;
+    long bytes;
+}
+
+/// <summary>One persisted server error, for the backend error screen.</summary>
+class MetricError {
+    long id;
+    long ts;
+    string origin;
+    string detail;
+}
+
+/// <summary>
+/// The history behind the live monitor: per-minute, per-route counters and the
+/// errors, kept in memory and written to their own database.
+///
+/// Why a second database: this is write-heavy operational data with a retention
+/// policy of its own, and it must never contend with -- or be rolled back
+/// alongside -- an application transaction. It is SQLite in WAL mode whatever
+/// the application runs on, so the writer never blocks a reader.
+///
+/// Why buckets: a request costs an add to a minute bucket, never a write. The
+/// buckets are flushed by one background coroutine on an interval
+/// ([metrics].flushSeconds, ten minutes by default) or once enough of them have
+/// piled up ([metrics].flushRows), and the in-memory list is capped so a
+/// database that is down cannot grow the process without bound.
+/// </summary>
+class MetricsStore {
+    static List<MetricMinute> buckets = new List<MetricMinute>();
+    static List<MetricError> errors = new List<MetricError>();
+    /// Hard ceiling on unflushed state: at one bucket per route per minute this
+    /// is hours of traffic, and dropping the oldest beats growing forever.
+    static int MaxBuckets = 8192;
+    static int MaxErrors = 4096;
+    static DbPool pool = null;
+    static bool ready = false;
+    static bool flushing = false;
+    static long lastSweep = 0;
+
+    /// <summary>Opens metrics.db, creates the two tables, and starts the
+    /// flusher. Called once per worker from main; a failure here leaves the
+    /// server running without history rather than not running.</summary>
+    static async bool Start() {
+        if (!Cfg.Metrics.enabled) { return false; }
+        MetricsStore.pool = SqliteConnector.Pool(Cfg.Metrics.path, 1);
+        IDbConnection db = await MetricsStore.Lease();
+        if (db == null) { return false; }
+        try {
+            // WAL: the flusher writes while the history screen reads.
+            int _w = await db.ExecuteAsync("PRAGMA journal_mode=WAL");
+            int _s = await db.ExecuteAsync("PRAGMA synchronous=NORMAL");
+            int _a = await db.ExecuteAsync(
+                "CREATE TABLE IF NOT EXISTS metrics_minute ("
+                + "minute INTEGER NOT NULL, route TEXT NOT NULL, "
+                + "calls INTEGER NOT NULL, errors INTEGER NOT NULL, "
+                + "total_ms INTEGER NOT NULL, max_ms INTEGER NOT NULL, "
+                + "frames INTEGER NOT NULL, bytes INTEGER NOT NULL, "
+                + "PRIMARY KEY (minute, route))");
+            int _b = await db.ExecuteAsync(
+                "CREATE TABLE IF NOT EXISTS metrics_error ("
+                + "id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, "
+                + "origin TEXT NOT NULL, detail TEXT NOT NULL)");
+            int _i = await db.ExecuteAsync(
+                "CREATE INDEX IF NOT EXISTS ix_metrics_error_ts "
+                + "ON metrics_error (ts)");
+        } finally {
+            MetricsStore.Give(db);
+        }
+        MetricsStore.ready = true;
+        return true;
+    }
+
+    static async IDbConnection Lease() {
+        if (MetricsStore.pool == null) { return null; }
+        IDbConnection db = await MetricsStore.pool.AcquireAsync();
+        if (db == null || !db.IsConnected()) {
+            MetricsStore.pool.Release(db);
+            return null;
+        }
+        return db;
+    }
+
+    static void Give(IDbConnection db) {
+        if (MetricsStore.pool == null || db == null) { return; }
+        MetricsStore.pool.Release(db);
+    }
+
+    /// <summary>The minute a timestamp belongs to.</summary>
+    static long Minute(long sec) { return sec - (sec % 60); }
+
+    /// <summary>Starts the flusher on the first thing worth flushing. It is
+    /// started here rather than at startup because a coroutine only runs once
+    /// the server is pumping its event loop: spawned from Start() it would sit
+    /// unscheduled (and hold up the boot) instead of ticking.</summary>
+    static void Arm() {
+        if (MetricsStore.flushing || !MetricsStore.ready) { return; }
+        MetricsStore.flushing = true;
+        Task.Spawn(MetricsStore.Loop());
+    }
+
+    /// <summary>The bucket for this minute and route, created if this is the
+    /// first thing that happened to it.</summary>
+    static MetricMinute Bucket(string route) {
+        MetricsStore.Arm();
+        long m = MetricsStore.Minute((long)WebApp.NowSeconds());
+        int n = MetricsStore.buckets.Count;
+        // The current minute's buckets are at the end: a backwards scan finds
+        // one in a handful of steps and never walks the history.
+        for (int i = n - 1; i >= 0; i = i - 1) {
+            MetricMinute b = MetricsStore.buckets[i];
+            if (b.minute != m) { break; }
+            if (b.route == route) { return b; }
+        }
+        MetricMinute b2 = new MetricMinute();
+        b2.minute = m;
+        b2.route = route;
+        MetricsStore.buckets.Add(b2);
+        while (MetricsStore.buckets.Count > MetricsStore.MaxBuckets) {
+            MetricsStore.buckets.RemoveAt(0);
+        }
+        return b2;
+    }
+
+    /// <summary>One finished request. `ms` is the whole pipeline; a hijacked
+    /// connection (SSE/WebSocket) does not come through here -- see Pushed.</summary>
+    static void Record(string route, int status, long ms) {
+        if (!Cfg.Metrics.enabled) { return; }
+        MetricMinute b = MetricsStore.Bucket(route);
+        b.calls = b.calls + 1;
+        b.totalMs = b.totalMs + ms;
+        if (ms > b.maxMs) { b.maxMs = ms; }
+        if (status >= 500) { b.errors = b.errors + 1; }
+    }
+
+    /// <summary>What a long-lived connection is measured by: frames and bytes
+    /// pushed, never elapsed time.</summary>
+    static void Pushed(string route, long frames, long bytes) {
+        if (!Cfg.Metrics.enabled) { return; }
+        MetricMinute b = MetricsStore.Bucket(route);
+        b.frames = b.frames + frames;
+        b.bytes = b.bytes + bytes;
+    }
+
+    /// <summary>Queues one error for the error screen. The detail is already
+    /// redacted by the caller.</summary>
+    static void Failed(long ts, string origin, string detail) {
+        if (!Cfg.Metrics.enabled) { return; }
+        MetricError e = new MetricError();
+        e.ts = ts;
+        e.origin = origin;
+        e.detail = detail;
+        MetricsStore.errors.Add(e);
+        while (MetricsStore.errors.Count > MetricsStore.MaxErrors) {
+            MetricsStore.errors.RemoveAt(0);
+        }
+    }
+
+    /// <summary>The flusher. One coroutine per worker, awake once a second only
+    /// to look at a counter.</summary>
+    static async void Loop() {
+        int waited = 0;
+        while (true) {
+            await Task.Delay(1000);
+            waited = waited + 1;
+            bool due = waited >= Cfg.Metrics.flushSeconds;
+            bool full = MetricsStore.buckets.Count >= Cfg.Metrics.flushRows
+                || MetricsStore.errors.Count >= Cfg.Metrics.flushRows;
+            if (!due && !full) { continue; }
+            waited = 0;
+            await MetricsStore.Flush();
+        }
+    }
+
+    /// <summary>Writes everything buffered in one transaction and clears it.
+    /// The current minute is written too -- a worker that dies should not lose
+    /// the minute it was in -- and re-flushing it later adds to the row that is
+    /// already there.</summary>
+    static async int Flush() {
+        if (!MetricsStore.ready) { return 0; }
+        if (MetricsStore.buckets.Count == 0 && MetricsStore.errors.Count == 0) {
+            return 0;
+        }
+        List<MetricMinute> mine = MetricsStore.buckets;
+        List<MetricError> errs = MetricsStore.errors;
+        MetricsStore.buckets = new List<MetricMinute>();
+        MetricsStore.errors = new List<MetricError>();
+
+        IDbConnection db = await MetricsStore.Lease();
+        if (db == null) { return 0; }
+        int written = 0;
+        try {
+            await db.BeginTransactionAsync();
+            for (int i = 0; i < mine.Count; i = i + 1) {
+                MetricMinute b = mine[i];
+                DbParams p = new DbParams().Add(b.route);
+                int _n = await db.ExecuteAsync(
+                    "INSERT INTO metrics_minute "
+                    + "(minute, route, calls, errors, total_ms, max_ms, frames, bytes) "
+                    + "VALUES (" + Convert.ToString(b.minute) + ", ?, "
+                    + Convert.ToString(b.calls) + ", "
+                    + Convert.ToString(b.errors) + ", "
+                    + Convert.ToString(b.totalMs) + ", "
+                    + Convert.ToString(b.maxMs) + ", "
+                    + Convert.ToString(b.frames) + ", "
+                    + Convert.ToString(b.bytes) + ") "
+                    + "ON CONFLICT (minute, route) DO UPDATE SET "
+                    + "calls = calls + excluded.calls, "
+                    + "errors = errors + excluded.errors, "
+                    + "total_ms = total_ms + excluded.total_ms, "
+                    + "max_ms = max(max_ms, excluded.max_ms), "
+                    + "frames = frames + excluded.frames, "
+                    + "bytes = bytes + excluded.bytes", p);
+                written = written + 1;
+            }
+            for (int j = 0; j < errs.Count; j = j + 1) {
+                MetricError e = errs[j];
+                DbParams p2 = new DbParams().Add(e.origin).Add(e.detail);
+                int _m = await db.ExecuteAsync(
+                    "INSERT INTO metrics_error (ts, origin, detail) VALUES ("
+                    + Convert.ToString(e.ts) + ", ?, ?)", p2);
+                written = written + 1;
+            }
+            await db.CommitAsync();
+            await MetricsStore.Sweep(db);
+        } catch (Exception ex) {
+            await db.RollbackAsync();
+            // Losing history is not worth failing a request over, and the
+            // error sink itself must not recurse into the error sink.
+            Console.WriteLine("[metrics] flush failed: " + ex.Message);
+        } finally {
+            MetricsStore.Give(db);
+        }
+        return written;
+    }
+
+    /// <summary>Drops anything past the retention window, at most once an
+    /// hour.</summary>
+    static async void Sweep(IDbConnection db) {
+        long now = (long)WebApp.NowSeconds();
+        if (now - MetricsStore.lastSweep < 3600) { return; }
+        MetricsStore.lastSweep = now;
+        long cut = now - (long)Cfg.Metrics.keepDays * 86400;
+        int _a = await db.ExecuteAsync("DELETE FROM metrics_minute WHERE minute < "
+            + Convert.ToString(cut));
+        int _b = await db.ExecuteAsync("DELETE FROM metrics_error WHERE ts < "
+            + Convert.ToString(cut));
+    }
+
+    /// <summary>History for the screen: one row per minute per route in the
+    /// window, newest first. `limit` is clamped by the caller's own ceiling.</summary>
+    static async List<MetricMinute> History(long from, long to, string route,
+                                            int limit) {
+        List<MetricMinute> outp = new List<MetricMinute>();
+        if (!MetricsStore.ready) { return outp; }
+        IDbConnection db = await MetricsStore.Lease();
+        if (db == null) { return outp; }
+        try {
+            string sql = "SELECT minute, route, calls, errors, total_ms, max_ms, "
+                + "frames, bytes FROM metrics_minute WHERE minute >= "
+                + Convert.ToString(from) + " AND minute <= " + Convert.ToString(to);
+            DbParams p = new DbParams();
+            if (route.Length > 0) { sql = sql + " AND route = ?"; p.Add(route); }
+            sql = sql + " ORDER BY minute DESC, calls DESC LIMIT "
+                + Convert.ToString(limit);
+            DbResult r = await db.QueryAsync(sql, p);
+            for (int i = 0; i < r.RowCount(); i = i + 1) {
+                MetricMinute b = new MetricMinute();
+                b.minute = Convert.ToInt64(r.GetString(i, 0));
+                b.route = r.GetString(i, 1);
+                b.calls = Convert.ToInt64(r.GetString(i, 2));
+                b.errors = Convert.ToInt64(r.GetString(i, 3));
+                b.totalMs = Convert.ToInt64(r.GetString(i, 4));
+                b.maxMs = Convert.ToInt64(r.GetString(i, 5));
+                b.frames = Convert.ToInt64(r.GetString(i, 6));
+                b.bytes = Convert.ToInt64(r.GetString(i, 7));
+                outp.Add(b);
+            }
+        } finally {
+            MetricsStore.Give(db);
+        }
+        return outp;
+    }
+
+    /// <summary>Persisted errors, newest first.</summary>
+    static async List<MetricError> Errors(long from, long to, int limit) {
+        List<MetricError> outp = new List<MetricError>();
+        if (!MetricsStore.ready) { return outp; }
+        IDbConnection db = await MetricsStore.Lease();
+        if (db == null) { return outp; }
+        try {
+            DbResult r = await db.QueryAsync(
+                "SELECT id, ts, origin, detail FROM metrics_error WHERE ts >= "
+                + Convert.ToString(from) + " AND ts <= " + Convert.ToString(to)
+                + " ORDER BY id DESC LIMIT " + Convert.ToString(limit));
+            for (int i = 0; i < r.RowCount(); i = i + 1) {
+                MetricError e = new MetricError();
+                e.id = Convert.ToInt64(r.GetString(i, 0));
+                e.ts = Convert.ToInt64(r.GetString(i, 1));
+                e.origin = r.GetString(i, 2);
+                e.detail = r.GetString(i, 3);
+                outp.Add(e);
+            }
+        } finally {
+            MetricsStore.Give(db);
+        }
+        return outp;
+    }
+}

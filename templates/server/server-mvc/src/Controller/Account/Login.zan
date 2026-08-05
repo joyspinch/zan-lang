@@ -1,6 +1,9 @@
 using System;
+using System.Data;
+using System.Data.Orm;
 using System.Web;
 using ZanWeb;
+using ZanWeb.Model.Sys;
 
 namespace ZanWeb.Account;
 
@@ -25,42 +28,83 @@ class Login : Controller {
     [HttpGet]
     [Route("/admin/login")]
     [Description("登录")]
-    void Index() {
+    async void Index() {
         if (this.IsLogin()) {
-            this.Ctx().Redirect("/admin");
+            this.Ctx().Redirect(Routes.Admin);
             return;
         }
-        this.ViewOf(Login.Tpl, Login.Page("", this.In("user")));
+        string site = await Settings.Get(SettingKeys.SiteTitle, "ZanWeb");
+        this.ViewOf(Login.Tpl, await Login.Form(site, "", this.In("user"),
+            "/admin/login", "管理后台", true, false));
     }
 
     [HttpPost]
     [Route("/admin/login")]
     [Description("登录提交")]
     async void Submit() {
+        await this.Attempt("/admin/login", "管理后台", true, false, "/admin");
+    }
+
+    /// <summary>The public sign-in, same mechanism and card as the admin one but
+    /// its own chrome and destination: an ordinary member lands back on the site
+    /// (/), not in an admin they may hold no rights in.</summary>
+    [HttpGet]
+    [Route("/login")]
+    [Description("登录")]
+    async void Front() {
+        if (this.IsLogin()) {
+            this.Ctx().Redirect(Routes.Home);
+            return;
+        }
+        string site = await Settings.Get(SettingKeys.SiteTitle, "ZanWeb");
+        this.ViewOf(Login.Tpl, await Login.Form(site, "", this.In("user"),
+            "/login", "登录", false, true));
+    }
+
+    [HttpPost]
+    [Route("/login")]
+    [Description("登录提交")]
+    async void FrontSubmit() {
+        await this.Attempt("/login", "登录", false, true, "/");
+    }
+
+    /// <summary>One sign-in path for both cards. `action`/`heading`/`demo`/`home`
+    /// only shape the re-rendered form; `redirectTo` is where a success goes.
+    /// A failed attempt re-renders the same card so the reason is on the page the
+    /// user is already looking at.</summary>
+    async void Attempt(string action, string heading, bool demo, bool home,
+                       string redirectTo) {
+        string site = await Settings.Get(SettingKeys.SiteTitle, "ZanWeb");
         string user = this.In("user");
         string pass = this.In("pass");
         if (user.Length == 0 || pass.Length == 0) {
-            this.ViewOf(Login.Tpl, Login.Page("请输入账号和密码", user));
+            this.ViewOf(Login.Tpl, await Login.Form(site, "请输入账号和密码",
+                user, action, heading, demo, home));
             return;
         }
         if (user.Length > 32 || pass.Length > 64) {
-            this.ViewOf(Login.Tpl, Login.Page("账号或密码超出长度限制", ""));
+            this.ViewOf(Login.Tpl, await Login.Form(site, "账号或密码超出长度限制",
+                "", action, heading, demo, home));
             return;
         }
         // "" covers both "no such account" and "wrong password" on purpose: the
         // page must not tell an attacker which of the two it was.
         string token = await AuthUser.Login(user, pass);
         if (token.Length == 0) {
+            await Login.Record(this.Ctx(), user, false, "账号或密码不正确");
             if (!AuthToken.Ready()) {
-                this.ViewOf(Login.Tpl,
-                    Login.Page("服务端未配置 ZAN_AUTH_SECRET（至少 32 字符），无法签发会话", user));
+                this.ViewOf(Login.Tpl, await Login.Form(site,
+                    "服务端未配置会话密钥：请在 config/app.json 的 [auth].secret（或环境变量 ZAN_AUTH_SECRET）填入至少 32 字符",
+                    user, action, heading, demo, home));
                 return;
             }
-            this.ViewOf(Login.Tpl, Login.Page("账号或密码不正确", user));
+            this.ViewOf(Login.Tpl, await Login.Form(site, "账号或密码不正确",
+                user, action, heading, demo, home));
             return;
         }
+        await Login.Record(this.Ctx(), user, true, "");
         this.Ctx().SetCookie("zsession", token, 864000);
-        this.Ctx().Redirect("/admin");
+        this.Ctx().Redirect(redirectTo);
     }
 
     [HttpGet]
@@ -70,15 +114,64 @@ class Login : Controller {
         // Expiring the cookie is enough for this browser; UserDao.BumpTokenVersion
         // is the bigger hammer that invalidates every token already issued.
         this.Ctx().SetCookie("zsession", "", 0);
-        this.Ctx().Redirect("/admin/login");
+        this.Ctx().Redirect(Routes.Login);
     }
 
-    static ViewData Page(string error, string user) {
+    /// <summary>Every attempt lands in sys_login_log, refusals included: a
+    /// password-guessing run is only visible if the failures are kept.</summary>
+    static async void Record(HttpContext ctx, string user, bool ok, string message) {
+        IDbConnection db = await AuthUser.Lease();
+        if (db == null) { return; }
+        try {
+            LoginLog row = new LoginLog();
+            row.userId = 0;
+            row.username = user;
+            row.ip = ctx.RemoteIp();
+            row.agent = ctx.Header("User-Agent");
+            row.ok = 0;
+            if (ok) { row.ok = 1; }
+            row.message = message;
+            row.createdAt = WebApp.NowSeconds();
+            int _id = await db.Insert<LoginLog>(row).ExecuteIdentityAsync();
+        } finally {
+            AuthUser.Give(db);
+        }
+    }
+
+    static ViewData Page(string site, string error, string user) {
         ViewData d = new ViewData();
-        d.Set("title", "登录 · {{NAME}}");
-        d.Set("brand", "{{NAME}}");
+        d.Set("title", "登录 · " + site);
+        d.Set("brand", site);
         d.Set("error", error);
         d.Set("user", user);
+        return d;
+    }
+
+    /// <summary>Adds the sign-up / recovery links the site settings allow.
+    /// A flow that is switched off leaves no link to a page that would only
+    /// redirect back here.</summary>
+    static async ViewData PageWithLinks(string site, string error, string user) {
+        ViewData d = Login.Page(site, error, user);
+        bool reg = await Settings.On(SettingKeys.RegisterEnabled, false);
+        bool reset = await Settings.On(SettingKeys.ResetEnabled, true);
+        if (reg) { d.Set("canRegister", "1"); }
+        if (reset) { d.Set("canReset", "1"); }
+        if (reg || reset) { d.Set("authLinks", "1"); }
+        return d;
+    }
+
+    /// <summary>The sign-up/recovery links plus what tells the two cards apart:
+    /// where the form posts (`action`), its heading, whether to print the
+    /// bootstrap-account hint (`demo`, admin card only) and whether to offer a
+    /// way back to the public site (`home`, public card only).</summary>
+    static async ViewData Form(string site, string error, string user,
+                               string action, string heading, bool demo,
+                               bool home) {
+        ViewData d = await Login.PageWithLinks(site, error, user);
+        d.Set("action", action);
+        d.Set("heading", heading);
+        if (demo) { d.Set("demo", "1"); }
+        if (home) { d.Set("home", "1"); }
         return d;
     }
 }

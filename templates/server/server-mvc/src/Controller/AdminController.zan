@@ -1,0 +1,190 @@
+using System;
+using System.Data;
+using System.Text;
+using System.Data.Orm;
+using System.Web;
+using ZanWeb.Model.Sys;
+
+namespace ZanWeb;
+
+/// <summary>
+/// Base class for the HTML admin screens. It holds the admin SHELL and nothing
+/// else: who the page belongs to, the chrome around it, and how a screen is
+/// rendered. Authorization is not here -- every admin route carries
+/// [Custom(Authorization = CustomAuthorization.Grant)] and the dispatcher
+/// refuses the request before this class is reached, answering a navigation
+/// with the sign-in page and a script with 401/403 (see WebApp.LoginPath). So
+/// there is no Guard() to forget to call and no page that checks a different
+/// right than the menu did.
+///
+/// Every screen is the same three lines:
+///
+///     ViewData d = await this.Layout("账号管理");
+///     ...fill d...
+///     this.Page(d);                     // whole page, or just the panel
+///
+/// Page() is what makes the shell a workspace rather than a set of documents:
+/// the sidebar opens screens as tabs, so a screen is requested twice in two
+/// different shapes -- as a full document when the URL is opened directly, and
+/// as a bare panel when a tab loads it. The action does not know which; it fills
+/// one ViewData and Page() picks the wrapping from the request.
+///
+/// Writes answer JSON ({"code","msg"}) rather than a redirect, because they are
+/// submitted from a dialog that stays open on failure and closes on success.
+/// </summary>
+class AdminController : AppController {
+    /// <summary>The account this request belongs to; resolved once by
+    /// Admin().</summary>
+    protected User who;
+
+    /// <summary>This screen's heading, remembered so the tab strip can be told
+    /// what to label the tab it just loaded.</summary>
+    protected string headingText;
+
+    /// <summary>True when the browser is asking for a panel rather than a
+    /// document (a tab load or an in-place refresh).</summary>
+    protected bool IsFragment() {
+        return this.Ctx().Header("X-Fragment").Length > 0;
+    }
+
+    /// <summary>The signed-in account. The dispatcher has already established
+    /// that there is one; it can still fail to load if the row was disabled
+    /// between the token check and now, and the caller then aborts.</summary>
+    protected async User Admin() {
+        if (this.who != null) { return this.who; }
+        User me = await AuthUser.ById(this.uid);
+        if (me == null || me.status != AuthUser.Active) {
+            this.Fail(403, "0403", "该账号无法登录管理后台");
+        }
+        this.who = me;
+        return me;
+    }
+
+    /// <summary>The shell data every admin page starts from: titles, the signed
+    /// in account, and the sidebar.</summary>
+    protected async ViewData Layout(string heading) {
+        User me = await this.Admin();
+
+        ViewData d = new ViewData();
+        string site = await Settings.Get(SettingKeys.SiteTitle, "{{NAME}}");
+        d.Set("title", heading + " · " + site + " 管理后台");
+        d.Set("brand", site);
+        d.Set("heading", heading);
+        this.headingText = heading;
+        d.Set("account", me.username);
+        string shown = Fmt.Text(me.nickname, me.username);
+        d.Set("accountName", shown);
+        d.Set("accountMail", Fmt.Text(me.email, ""));
+        d.Set("accountInitial", Fmt.FirstChar(shown));
+        d.Set("tabPath", this.Ctx().path);
+        d.Set("tabTitle", heading);
+        if (me.isSuper == 1) { d.Set("isSuper", "1"); }
+
+        // The sidebar is the route table, cut down to what this account may
+        // open by the very resolver the dispatcher uses: adding a screen means
+        // adding one attribute, a screen this account cannot open is not
+        // offered, and an offered screen cannot answer 403.
+        List<MenuNode> nodes = await MenuBuilder.ForUser(
+            WebHost.Current(), this.uid, this.Ctx().path);
+        await this.AddDesigned(nodes);
+        MenuBuilder.Sort(nodes);
+        MenuBuilder.Fill(d.AddList("menu"), nodes);
+        return d;
+    }
+
+    /// <summary>Adds an entry per designed table. These are rows, not routes --
+    /// the one generic screen at /admin/monitor/data serves all of them -- so they are
+    /// the one part of the sidebar the route table cannot supply. They are not
+    /// a second permission model either: the right they need is the right that
+    /// screen needs, asked of the same resolver.</summary>
+    protected async void AddDesigned(List<MenuNode> nodes) {
+        if (!await AuthUser.Allow(this.uid, Routes.DataIndex)) { return; }
+        IDbConnection db = await this.Conn();
+        if (db == null) { return; }
+        List<GenTable> tables = await db.Select<GenTable>()
+            .Where(a => a.migrated == 1).ToListAsync();
+        for (int i = 0; i < tables.Count; i = i + 1) {
+            GenTable t = tables[i];
+            // Once a table has generated its own module, that module owns the
+            // menu entry and the generic data screen drops out of the list.
+            if (t.generatedAt > 0) { continue; }
+            MenuNode n = new MenuNode();
+            n.title = t.title;
+            n.path = Routes.Data + "?t=" + t.tableName;
+            n.group = MenuBuilder.GroupOf(Routes.Data);
+            n.groupOrder = MenuBuilder.OrderOf(Routes.Data);
+            n.icon = "mdi:table";
+            // After the routed pages of that section, in design order.
+            n.order = Routes.Data + "~" + Convert.ToString(i);
+            n.active = this.Ctx().path == Routes.Data;
+            nodes.Add(n);
+        }
+    }
+
+    /// <summary>Renders the screen: the whole document when the URL was opened
+    /// directly, only the panel when a tab is loading it.</summary>
+    protected void Page(ViewData d) {
+        if (this.IsFragment()) {
+            this.Ctx().SetHeader("X-Tab-Title", Encoding.UrlEncode(this.headingText));
+            this.Fragment(d);
+            return;
+        }
+        this.View(d);
+    }
+
+    /// <summary>Renders a dialog body (a form) -- always a fragment.</summary>
+    protected void Dialog(ViewData d) {
+        this.Fragment(d);
+    }
+
+    /// <summary>The answer to a successful write: the message the toast shows,
+    /// and no payload. The screen reloads its own panel afterwards.</summary>
+    protected void Saved(string msg) {
+        this.Ctx().Api("0000", msg, "null");
+    }
+
+    /// <summary>Records a write in sys_operation_log. Reads are not logged:
+    /// they are the bulk of the traffic and none of the accountability. The
+    /// logged action is the route's own action ("Users.Save") -- the same name
+    /// the grant rows and the docs use -- so a write is never filed under a
+    /// hand-typed tag that drifts from the route it came from.</summary>
+    protected async void Note(string title, string target,
+                              bool ok, string message) {
+        IDbConnection db = await this.Conn();
+        if (db == null) { return; }
+        OperationLog row = new OperationLog();
+        row.userId = 0;
+        row.username = "";
+        if (this.who != null) {
+            row.userId = this.who.id;
+            row.username = this.who.username;
+        }
+        row.action = this.Ctx().routeAction;
+        row.title = title;
+        row.method = this.Ctx().method;
+        row.path = this.Ctx().path;
+        row.target = target;
+        row.ip = this.Ctx().RemoteIp();
+        row.ok = 0;
+        if (ok) { row.ok = 1; }
+        row.message = message;
+        row.createdAt = WebApp.NowSeconds();
+        int _id = await db.Insert<OperationLog>(row).ExecuteIdentityAsync();
+    }
+
+    /// <summary>Writes the paging footer values a list template expects:
+    /// total / page / pages / limit plus the previous and next page numbers
+    /// (empty when there is no such page, so the template can hide the
+    /// link).</summary>
+    protected void Pager(ViewData d, ListQuery q, int total) {
+        int pages = q.Pages(total);
+        d.Set("total", Convert.ToString(total));
+        d.Set("page", Convert.ToString(q.Page()));
+        d.Set("pages", Convert.ToString(pages));
+        d.Set("limit", Convert.ToString(q.Limit()));
+        d.Set("kw", q.Kw());
+        if (q.Page() > 1) { d.Set("prev", Convert.ToString(q.Page() - 1)); }
+        if (q.Page() < pages) { d.Set("next", Convert.ToString(q.Page() + 1)); }
+        if (total == 0) { d.Set("empty", "1"); }
+    }
+}

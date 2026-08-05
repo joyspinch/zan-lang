@@ -3,13 +3,13 @@ using System.IO;
 
 namespace System.Data.ZanDb;
 
-/// <summary>Small open-addressing set of page ids: "was this page allocated by
-/// the transaction that is currently running?" is asked for every node the
-/// writer touches, so it must not be a linear scan.</summary>
+/// <summary>小型开放寻址页 id 集合：写入者触及的每个节点都要
+/// 回答“该页是否由当前运行中的事务分配？”这个问题，
+/// 因此不能是线性扫描。</summary>
 class PageIdSet {
     int slots;
     int count;
-    List<int> keys;   // pageId + 1, 0 = empty
+    List<int> keys;   // pageId + 1，0 表示空
 
     PageIdSet() {
         this.slots = 256;
@@ -65,20 +65,20 @@ class PageIdSet {
 }
 
 /// <summary>
-/// Fixed-capacity LRU cache mapping page id -> ByteBuffer. Open-addressing
-/// hash table with an intrusive doubly-linked LRU list. Pages written by the
-/// running transaction are pinned (never evicted) until it commits.
+/// 固定容量的 LRU 缓存，映射 page id -> ByteBuffer。开放寻址
+/// 哈希表，带侵入式双向链表维护 LRU 顺序。
+/// 运行中事务写入的页会被钉住（不驱逐），直到提交。
 /// </summary>
 class PageCache {
-    int capacity;      // max resident pages
-    int slots;         // hash slots (power of two, > capacity)
-    List<int> keys;    // pageId + 1; 0 = empty, -1 = tombstone
+    int capacity;      // 常驻页数上限
+    int slots;         // 哈希槽位数（2 的幂，> capacity）
+    List<int> keys;    // pageId + 1；0 为空，-1 为墓碑
     List<ByteBuffer> vals;
     List<bool> pinned;
-    List<int> lruPrev; // slot index links, -1 = none
+    List<int> lruPrev; // 槽位索引链接，-1 表示无
     List<int> lruNext;
-    int lruHead;       // most recently used slot
-    int lruTail;       // least recently used slot
+    int lruHead;       // 最近使用的槽位
+    int lruTail;       // 最久未使用的槽位
     int count;
 
     PageCache(int cap) {
@@ -160,13 +160,13 @@ class PageCache {
         if (slot >= 0) { this.pinned[slot] = p; }
     }
 
-    /// <summary>Unpins everything (called when a transaction ends).</summary>
+    /// <summary>解除全部钉住（事务结束时调用）。</summary>
     void UnpinAll() {
         for (int i = 0; i < this.slots; i = i + 1) { this.pinned[i] = false; }
     }
 
-    /// <summary>Drops one page (its id is about to be reused for different
-    /// content, so a stale copy must not survive).</summary>
+    /// <summary>丢弃一页（其 id 即将用于不同
+    /// 内容，旧的副本不能残留）。</summary>
     void Remove(int pageId) {
         int slot = FindSlot(pageId);
         if (slot < 0) { return; }
@@ -178,8 +178,8 @@ class PageCache {
         this.count = this.count - 1;
     }
 
-    /// <summary>Drops every page (another process committed, so cached page
-    /// contents may belong to a version that no longer exists).</summary>
+    /// <summary>丢弃所有页（另一进程已提交，缓存的页
+    /// 内容可能属于已不存在的版本）。</summary>
     void Clear() {
         for (int i = 0; i < this.slots; i = i + 1) {
             if (this.keys[i] > 0) {
@@ -244,8 +244,8 @@ class PageCache {
         }
     }
 
-    /// <summary>Inserts a page taking ownership of buf; evicts the LRU
-    /// unpinned page when full.</summary>
+    /// <summary>插入一页并接管 buf 的所有权；满了时驱逐 LRU
+    /// 中未钉住的页。</summary>
     void Put(int pageId, ByteBuffer buf, bool pin) {
         if (this.count >= this.capacity) {
             int ev = EvictableSlot();
@@ -268,20 +268,20 @@ class PageCache {
 }
 
 /// <summary>
-/// Page manager with single-writer / multi-reader MVCC (the LMDB model).
+/// 页管理器，单写者/多读者 MVCC（LMDB 模型）。
 ///
-/// Pages 0 and 1 are meta pages written alternately; each carries a
-/// transaction id, the B+Tree root, the free-list head, the page count and a
-/// CRC. Opening the database picks the valid meta page with the highest
-/// transaction id, which makes a commit atomic without a redo log: a crash
-/// either leaves the new meta page complete (new version) or not (previous
-/// version, untouched because pages are never modified in place).
+/// 第 0 页和第 1 页是交替写入的 meta 页；每页包含
+/// 事务 id、B+Tree 根、空闲链表头、页数及
+/// CRC。打开数据库时选择事务 id 最高且有效的 meta 页，
+/// 从而无需 redo log 即可原子提交：崩溃时
+/// 新 meta 页要么完整（新版本），要么不完整（旧版本，
+/// 因页面从不原地修改而保持原样）。
 ///
-/// A write transaction never overwrites a live page: <see cref="PageForWrite"/>
-/// copies it to a freshly allocated page and hands the old one to the
-/// free-list stamped with the committing transaction id. A page can be reused
-/// only once no reader still looks at a snapshot older than the transaction
-/// that freed it, which is what <see cref="DbRegistry"/> tracks.
+/// 写事务从不覆盖在用页：<see cref="PageForWrite"/>
+/// 会将其复制到新分配的页，旧页交给
+/// 带提交事务 id 标记的空闲链表。页只有在
+/// 没有任何读者仍查看比释放它的事务更旧的快照时，
+/// 才能复用——这正是 <see cref="DbRegistry"/> 所跟踪的。
 ///
 ///   pager.BeginWrite();
 ///   int np = pager.PageForWrite(oldPage);   // copy-on-write
@@ -291,16 +291,16 @@ class PageCache {
 /// </summary>
 class Pager {
     static int PAGE_SIZE = 4096;
-    static int MAGIC = 859980122;        // "ZDB3" little-endian; ZDB2 spelled
-                                         // ids as twelve decimal digits
-    static int META_FIELDS = 48;         // bytes covered by the meta CRC
-    static int FREE_PER_PAGE = 255;      // (id, txn) pairs in one free-list page
+    static int MAGIC = 859980122;        // "ZDB3" 小端；ZDB2 把
+                                         // id 写成十二位十进制数
+    static int META_FIELDS = 48;         // meta CRC 覆盖的字节数
+    static int FREE_PER_PAGE = 255;      // 单个空闲链表页中的 (id, txn) 对数
 
-    // Page numbers are 32-bit (the file format spells them as u64, so the
-    // format itself allows more): 2^31 pages x 4 KiB is an 8 TiB database, and
-    // keeping them `int` keeps every index, list and cache key one word. A file
-    // that claims a larger id is corrupt or written by a future format, so it
-    // is rejected here rather than silently truncated.
+    // 页号是 32 位（文件格式按 u64 存储，
+    // 格式本身允许更大）：2^31 页 × 4 KiB 即 8 TiB 的数据库，
+    // 用 `int` 保存可使每个索引、列表和缓存键只占一个字。
+    // 声称更大 id 的文件要么损坏、要么由未来格式写入，
+    // 因此在这里直接拒绝，而不是静默截断。
     static int PageIdOf(long stored) {
         if (stored < 0 || stored > 2147483647) { return 0; }
         return (int)stored;
@@ -311,26 +311,26 @@ class Pager {
     DbRegistry registry;
     string lastError;
 
-    long txnid;         // snapshot this handle is looking at
+    long txnid;         // 该句柄正在查看的快照
     int rootId;
     int freeHead;
-    int pageCount;      // total pages in the file (>= 2)
+    int pageCount;      // 文件中的页总数（>= 2）
 
-    PageIdSet fresh;    // pages allocated by the running write transaction
-    List<int> freshIds; // same, in allocation order (the commit write set)
-    List<int> freeIds;  // free-list: page ids...
-    List<long> freeTxns; // ...and the transaction that freed each of them
-    List<int> reusable; // free pages no reader can see any more
-    List<int> pendingFree;   // freed by the running transaction
-    List<int> freeChain;     // pages holding the persisted free list
+    PageIdSet fresh;    // 当前运行中写事务分配的页
+    List<int> freshIds; // 同上，按分配顺序排列（提交写入集）
+    List<int> freeIds;  // 空闲链表：页 id……
+    List<long> freeTxns; // ……以及释放各页的事务
+    List<int> reusable; // 已无读者可见的空闲页
+    List<int> pendingFree;   // 由当前运行中的事务释放
+    List<int> freeChain;     // 承载已持久化空闲链表的页
 
     int writeDepth;
     int readDepth;
-    int pageWrites;     // pages written to disk since this handle opened
+    int pageWrites;     // 自该句柄打开以来写入磁盘的页数
     int syncEvery;
     int commitsSinceSync;
     bool freeLoaded;
-    bool cacheDirty;    // caches were invalidated: BTree must reload its root
+    bool cacheDirty;    // 缓存已失效：BTree 必须重新加载根节点
 
     Pager() {
         this.lastError = "";
@@ -354,7 +354,7 @@ class Pager {
         this.freeChain = new List<int>();
     }
 
-    /// <summary>Opens (creating if missing) a database file.</summary>
+    /// <summary>打开数据库文件（不存在则创建）。</summary>
     static Pager Open(string path, int cacheCapacity) {
         Pager p = new Pager();
         p.file = PageFile.Open(path);
@@ -407,28 +407,28 @@ class Pager {
 
     void SetRoot(int id) { this.rootId = id; }
 
-    /// <summary>Number of pages on the free-list plus those already reusable
-    /// (space that will be reused before the file grows).</summary>
+    /// <summary>空闲链表上的页数加上已可复用的页数
+    /// （文件增长前即可复用的空间）。</summary>
     int FreePages() { return this.freeIds.Count + this.reusable.Count; }
 
-    /// <summary>Pages written to disk since this handle was opened, meta pages
-    /// included: divide by the pages a workload actually changed to get its
-    /// write amplification.</summary>
+    /// <summary>自该句柄打开以来写入磁盘的页数（含 meta 页）：
+    /// 用它除以工作负载实际修改的页数，可得到
+    /// 写放大倍数。</summary>
     int PageWrites() { return this.pageWrites; }
 
-    /// <summary>Oldest snapshot still being read by any process; freed pages
-    /// newer than this cannot be reused yet. 0 = nobody is reading.</summary>
+    /// <summary>仍被任意进程读取的最旧快照；比它更新的已释放页
+    /// 还不能再复用。0 = 无人读取。</summary>
     long OldestReader() { return this.registry.OldestSnapshot(); }
 
-    /// <summary>fsync cadence for the data pages of a commit: 1 = full
-    /// durability (default), N = fsync data every N commits. The meta page is
-    /// always written last, so a lower cadence trades "the last N commits may
-    /// be lost" for throughput -- never a corrupt database.</summary>
+    /// <summary>提交时数据页的 fsync 频率：1 = 完全
+    /// 持久性（默认），N = 每 N 次提交 fsync 一次数据。meta 页
+    /// 总是最后写入，因此更低的频率是用“最近 N 次提交可能
+    /// 丢失”换取吞吐量——但绝不会损坏数据库。</summary>
     void SetSyncEvery(int n) {
         if (n >= 1) { this.syncEvery = n; }
     }
 
-    // ===== meta pages =====
+    // ===== meta 页 =====
 
     void WriteMeta(long newTxn) {
         ByteBuffer h = ByteBuffer.Alloc(Pager.PAGE_SIZE);
@@ -451,8 +451,8 @@ class Pager {
         h.Free();
     }
 
-    /// <summary>Reads one meta page; returns its transaction id, or 0 when the
-    /// page is absent, foreign or CRC-broken (a torn commit).</summary>
+    /// <summary>读取一个 meta 页；返回其事务 id，若页
+    /// 不存在、非本库或 CRC 损坏（撕裂的提交）则返回 0。</summary>
     long ReadMetaSlot(int slot, ByteBuffer h) {
         int n = this.file.ReadAt((long)slot * Pager.PAGE_SIZE, h, Pager.PAGE_SIZE);
         if (n < Pager.PAGE_SIZE) { return 0; }
@@ -466,7 +466,7 @@ class Pager {
         return txn;
     }
 
-    /// <summary>Adopts the newest valid meta page as this handle's snapshot.</summary>
+    /// <summary>将最新且有效的 meta 页采纳为该句柄的快照。</summary>
     void LoadMeta() {
         ByteBuffer a = ByteBuffer.Alloc(Pager.PAGE_SIZE);
         ByteBuffer b = ByteBuffer.Alloc(Pager.PAGE_SIZE);
@@ -495,12 +495,12 @@ class Pager {
         this.freeChain = new List<int>();
     }
 
-    /// <summary>Whether another process may have committed since this handle
-    /// last read the meta page. Transaction ids are handed out from the shared
-    /// registry, so they are unique across the database: a published id equal
-    /// to ours means our snapshot *is* the newest version. The number of live
-    /// processes says nothing here -- a process that committed and exited
-    /// leaves its version behind for this one to adopt.</summary>
+    /// <summary>自该句柄上次读取 meta 页以来，另一进程
+    /// 是否可能已提交。事务 id 由共享的
+    /// registry 分配，在整库内唯一：若已发布 id 等于
+    /// 我们的 id，说明我们的快照就是最新版本。存活进程数
+    /// 在此说明不了什么——已提交后退出的进程
+    /// 会把其版本留给本进程采纳。</summary>
     bool MaybeStale() {
         if (!this.registry.IsShared()) { return false; }
         long published = this.registry.CommittedTxn();
@@ -508,9 +508,9 @@ class Pager {
         return published != this.txnid;
     }
 
-    /// <summary>Re-reads the meta page when another process has committed, and
-    /// drops the cached pages of the version we were looking at. Returns true
-    /// when the snapshot moved.</summary>
+    /// <summary>当另一进程已提交时重新读取 meta 页，并
+    /// 丢弃旧版本的缓存页。若快照移动了
+    /// 则返回 true。</summary>
     bool Refresh() {
         if (!MaybeStale()) { return false; }
         long before = this.txnid;
@@ -521,15 +521,15 @@ class Pager {
         return true;
     }
 
-    /// <summary>Whether cached decoded state (B+Tree nodes) must be dropped
-    /// because the snapshot moved. Clears the flag.</summary>
+    /// <summary>缓存中的已解码状态（B+Tree 节点）是否需要丢弃，
+    /// 因为快照已移动。并清除该标志。</summary>
     bool TakeInvalidation() {
         bool v = this.cacheDirty;
         this.cacheDirty = false;
         return v;
     }
 
-    // ===== free list =====
+    // ===== 空闲链表 =====
 
     void LoadFreeList() {
         if (this.freeLoaded) { return; }
@@ -547,7 +547,7 @@ class Pager {
                 this.freeIds.Add(Pager.PageIdOf(pg.ReadU64()));
                 this.freeTxns.Add(pg.ReadU64());
             }
-            // The list pages themselves are rewritten on every commit.
+            // 链表页本身在每次提交时都会被重写。
             this.freeChain.Add(pid);
             pid = next;
         }
@@ -555,8 +555,8 @@ class Pager {
         this.freeLoaded = true;
     }
 
-    /// <summary>Moves free pages that no live reader can reach into the
-    /// reusable pool.</summary>
+    /// <summary>将无存活读者可达的空闲页移入
+    /// 可复用池。</summary>
     void ReclaimFree() {
         LoadFreeList();
         long oldest = this.registry.OldestSnapshot();
@@ -575,9 +575,9 @@ class Pager {
         this.freeTxns = keepTxns;
     }
 
-    /// <summary>Writes the free list as a fresh page chain and returns its
-    /// head (0 when empty). Called inside Commit, after the new transaction id
-    /// is known.</summary>
+    /// <summary>将空闲链表写为全新的页链并返回其
+    /// 头（空时为 0）。在 Commit 内、新事务 id
+    /// 确定后调用。</summary>
     int PersistFreeList(long newTxn) {
         int total = this.freeIds.Count;
         this.freeChain = new List<int>();
@@ -604,12 +604,12 @@ class Pager {
         return head;
     }
 
-    // ===== transactions =====
+    // ===== 事务 =====
 
-    /// <summary>Registers the snapshot this handle reads, so a writer in
-    /// another process cannot recycle the pages under it. Cheap: one
-    /// shared-memory store, and nothing at all when the database is open in a
-    /// single process.</summary>
+    /// <summary>注册该句柄读取的快照，防止另一进程的写入者
+    /// 回收其下的页。开销很小：
+    /// 仅一个共享内存存储；数据库在单进程内打开时，
+    /// 什么都不做。</summary>
     void BeginRead() {
         this.readDepth = this.readDepth + 1;
         if (this.readDepth > 1 || this.writeDepth > 0) { return; }
@@ -625,8 +625,8 @@ class Pager {
         }
     }
 
-    /// <summary>Takes the single writer slot (blocking) and starts a write
-    /// transaction on the newest committed snapshot. Nestable.</summary>
+    /// <summary>占用唯一的写者槽位（阻塞）并在最新已提交快照上
+    /// 开始写事务。可嵌套。</summary>
     bool BeginWrite() {
         this.writeDepth = this.writeDepth + 1;
         if (this.writeDepth > 1) { return true; }
@@ -635,8 +635,8 @@ class Pager {
             this.lastError = "cannot acquire the writer lock";
             return false;
         }
-        // Adopt another process's commit before building on it; when nothing
-        // moved, the cached pages and free list stay valid.
+        // 在之上构建前，先采纳其他进程的提交；若
+        // 没有变动，缓存页和空闲链表依然有效。
         if (MaybeStale()) {
             LoadMeta();
             this.cache.Clear();
@@ -646,19 +646,19 @@ class Pager {
         this.freshIds = new List<int>();
         this.pendingFree = new List<int>();
         ReclaimFree();
-        // A writer is also a reader of the snapshot it builds on.
+        // 写入者同时也是其构建所基于快照的读者。
         this.registry.PublishSnapshot(this.txnid);
         return true;
     }
 
     bool InWrite() { return this.writeDepth > 0; }
 
-    /// <summary>True when the page belongs to the running write transaction
-    /// (so it may be modified in place).</summary>
+    /// <summary>当页属于当前运行中的写事务时为 true
+    /// （因此可原地修改）。</summary>
     bool IsFresh(int pageId) { return this.fresh.Has(pageId); }
 
-    /// <summary>Allocates a page: a reusable free page if there is one,
-    /// otherwise the file grows. The page is pinned until commit.</summary>
+    /// <summary>分配一页：有可复用的空闲页就复用，
+    /// 否则文件增长。该页在提交前保持钉住。</summary>
     int AllocPage() {
         int id = 0;
         if (this.reusable.Count > 0) {
@@ -678,15 +678,15 @@ class Pager {
         return id;
     }
 
-    /// <summary>Copy-on-write: returns a page id that may be modified. Pages
-    /// of the committed snapshot are copied to a new page and the old one is
-    /// queued for the free list; pages created by this transaction are
-    /// returned unchanged.</summary>
+    /// <summary>写时复制：返回一个可修改的页 id。
+    /// 已提交快照的页会复制到新页，旧页
+    /// 进入空闲链表队列；本事务创建的页
+    /// 原样返回。</summary>
     int PageForWrite(int pageId) {
         if (pageId == 0) { return AllocPage(); }
         if (this.fresh.Has(pageId)) { return pageId; }
         int nid = AllocPage();
-        // The new page is pinned, so reading the old one cannot evict it.
+        // 新页已钉住，因此读取旧页不会把它驱逐。
         ByteBuffer src = GetPage(pageId);
         ByteBuffer dst = GetPage(nid);
         dst.Clear();
@@ -696,9 +696,9 @@ class Pager {
         return nid;
     }
 
-    /// <summary>Queues a page for reuse once no reader can see it any more.
-    /// Pages created by the running transaction are recycled immediately --
-    /// nobody has ever seen them.</summary>
+    /// <summary>将页排队，待无读者可见时复用。
+    /// 当前事务创建的页立即回收——
+    /// 从没有人见过它们。</summary>
     void FreeLater(int pageId) {
         if (pageId == 0) { return; }
         if (this.fresh.Has(pageId)) {
@@ -708,9 +708,9 @@ class Pager {
         this.pendingFree.Add(pageId);
     }
 
-    /// <summary>Returns the page buffer (cached; read from the file on a
-    /// miss). The buffer stays owned by the pager and is only writable when
-    /// the page belongs to the running transaction.</summary>
+    /// <summary>返回页缓冲区（带缓存；未命中时从文件读取）。
+    /// 缓冲区归 pager 所有，只有当
+    /// 页属于当前运行中的事务时才可写。</summary>
     ByteBuffer GetPage(int pageId) {
         if (this.cache.Has(pageId)) {
             return this.cache.Get(pageId);
@@ -724,13 +724,13 @@ class Pager {
         return buf;
     }
 
-    /// <summary>Kept for API compatibility: with copy-on-write every modified
-    /// page is a freshly allocated one, so there is nothing to mark.</summary>
+    /// <summary>为兼容 API 而保留：写时复制下，每个被修改的
+    /// 页都是新分配的，因此无需标记。</summary>
     void MarkDirty(int pageId) { }
 
-    /// <summary>Publishes the transaction: data pages first (fsync), then the
-    /// meta page (fsync). A crash before the meta write leaves the previous
-    /// version intact, so a commit is all-or-nothing without a redo log.</summary>
+    /// <summary>发布事务：先数据页（fsync），再
+    /// meta 页（fsync）。meta 写入前崩溃会保留旧版本
+    /// 完好无损，因此无需 redo log 即可实现提交的原子性。</summary>
     bool Commit() {
         if (this.writeDepth > 1) {
             this.writeDepth = this.writeDepth - 1;
@@ -738,22 +738,22 @@ class Pager {
         }
         if (this.writeDepth == 0) { return true; }
 
-        // Transaction ids come from the whole database, not from this handle:
-        // two processes that start from the same snapshot must not both call
-        // their commit "n + 1", or neither would ever notice that the other
-        // moved the database on (and one lineage would silently overwrite the
-        // other's meta page). The writer lock is held here, so max + 1 is
-        // unique and monotonic across processes.
+        // 事务 id 来自整个数据库，而非本句柄：
+        // 从同一快照开始的两个进程不能都把
+        // 自己的提交称为“n + 1”，否则双方都不会察觉对方
+        // 已推进数据库（且一个分支会静默覆盖
+        // 另一方的 meta 页）。此处持有写者锁，因此 max + 1
+        // 跨进程唯一且单调递增。
         long newTxn = this.txnid + 1;
         long published = this.registry.CommittedTxn();
         if (published >= newTxn) { newTxn = published + 1; }
 
-        // The pages holding the previous free list are rewritten below.
+        // 承载上一空闲链表的页将在下方重写。
         for (int c = 0; c < this.freeChain.Count; c = c + 1) {
             this.pendingFree.Add(this.freeChain[c]);
         }
 
-        // Pages freed by this transaction become reusable for later ones.
+        // 本事务释放的页可供后续事务复用。
         int i = 0;
         for (; i < this.pendingFree.Count; i = i + 1) {
             this.freeIds.Add(this.pendingFree[i]);
@@ -762,8 +762,8 @@ class Pager {
         this.pendingFree = new List<int>();
         this.freeHead = PersistFreeList(newTxn);
 
-        // Write every page this transaction created. They are all new pages,
-        // so no live data is overwritten and the order does not matter.
+        // 写入本事务创建的每一页。它们都是新页，
+        // 不会覆盖在用数据，顺序无关紧要。
         i = 0;
         while (i < this.freshIds.Count) {
             int pid = this.freshIds[i];
@@ -798,9 +798,9 @@ class Pager {
         return true;
     }
 
-    /// <summary>Discards everything the transaction wrote: nothing durable was
-    /// touched, so it is enough to drop the new pages and the meta page keeps
-    /// pointing at the previous version.</summary>
+    /// <summary>丢弃事务写入的一切：未写入任何
+    /// 持久化内容，因此只需丢弃新页，meta 页仍
+    /// 指向旧版本。</summary>
     void Rollback() {
         if (this.writeDepth == 0) { return; }
         for (int i = 0; i < this.freshIds.Count; i = i + 1) {
@@ -817,7 +817,7 @@ class Pager {
         this.registry.UnlockWrite();
     }
 
-    /// <summary>Forces everything written so far to stable storage.</summary>
+    /// <summary>将迄今写入的所有内容强制刷入稳定存储。</summary>
     void Checkpoint() {
         this.file.Sync();
         this.commitsSinceSync = 0;

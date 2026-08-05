@@ -4,33 +4,33 @@ using System.Threading;
 namespace System.Data;
 
 /// <summary>
-/// The bookkeeping every driver connection pool shares: the free list, the
-/// live/waiting counters, the wakeup gate and the closed flag. A driver pool
-/// keeps only its endpoint parameters and its own way of opening a connection
-/// (usually a coroutine), and delegates the rest here.
+/// 所有驱动连接池共享的簿记数据：空闲列表、
+/// 存活/等待计数器、唤醒闸门和关闭标志。驱动连接池
+/// 只保留端点参数和自身的建连方式
+/// （通常为协程），其余都委托到这里。
 ///
-/// The core never touches a connection itself -- it neither probes liveness nor
-/// closes anything -- so it works for any connection type, including the
-/// interface-typed <see cref="DbPool"/>. The driver pool decides whether a
-/// connection coming off the free list is still usable and reports the verdict
-/// back with <see cref="Pool"/> or <see cref="Drop"/>.
+/// 核心本身从不直接接触连接——既不做活性探测，也
+/// 不关闭任何连接——因此适用于任意连接类型，包括
+/// 接口类型 <see cref="DbPool"/>。驱动连接池负责判断
+/// 从空闲列表取出的连接是否仍可用，并报告结论
+/// ——通过 <see cref="Pool"/> 或 <see cref="Drop"/>。
 ///
-/// Pools rely on the cooperative single-thread-per-scheduler model: the free
-/// list is only touched between await points, so no lock is required. Parking
-/// stays in the driver pool -- <c>EnterWait</c>,
-/// <c>await core.Waiter().Wait()</c>, <c>LeaveWait</c> -- so the coroutine that
-/// suspends is the one the caller awaited.
+/// 连接池依赖每调度器单线程的协作模型：空闲
+/// 列表只在 await 点之间被访问，因此无需加锁。停泊
+/// 逻辑留在驱动连接池中——<c>EnterWait</c>、
+/// <c>await core.Waiter().Wait()</c>、<c>LeaveWait</c>——因此挂起的协程
+/// 正是调用方所等待的那个协程。
 /// </summary>
 class PoolCore<T> {
     int maxSize;
     List<T> idle;
-    int liveCount;      // total opened connections (idle + checked out)
-    int waiting;        // coroutines currently parked waiting for a connection
-    Gate gate;          // event-driven wakeup for waiters (replaces poll)
+    int liveCount;      // 已打开的连接总数（空闲 + 借出）
+    int waiting;        // 当前停泊等待连接的协程数
+    Gate gate;          // 面向等待者的事件驱动唤醒（取代轮询）
     bool closed;
 
-    /// <summary>Creates a core capped at <paramref name="maxSize"/> live
-    /// connections (at least one).</summary>
+    /// <summary>创建核心，存活连接数上限为 <paramref name="maxSize"/>
+    /// （至少一个）。</summary>
     PoolCore(int maxSize) {
         if (maxSize < 1) {
             maxSize = 1;
@@ -43,10 +43,10 @@ class PoolCore<T> {
         this.closed = false;
     }
 
-    /// <summary>Takes the most recently returned connection off the free list,
-    /// or null when it is empty. The caller checks whether it is still usable
-    /// and calls <see cref="Drop"/> for the ones that have died while parked
-    /// (server restart, idle timeout).</summary>
+    /// <summary>从空闲列表取出最近归还的连接，
+    /// 列表为空时返回 null。调用方检查其是否仍可用，
+    /// 对停泊期间已失效的连接调用 <see cref="Drop"/>
+    /// （服务器重启、空闲超时）。</summary>
     T TakeIdle() {
         if (this.idle.Count == 0) {
             return null;
@@ -57,7 +57,7 @@ class PoolCore<T> {
         return c;
     }
 
-    /// <summary>Parks a usable connection on the free list and wakes a waiter.</summary>
+    /// <summary>将可用连接放入空闲列表并唤醒一个等待者。</summary>
     void Pool(T c) {
         this.idle.Add(c);
         if (this.waiting > 0) {
@@ -65,9 +65,9 @@ class PoolCore<T> {
         }
     }
 
-    /// <summary>Accounts for a connection that left the pool for good (closed,
-    /// broken, or evicted): its slot is freed and a waiter may open a fresh
-    /// connection in its place.</summary>
+    /// <summary>登记一条永久离开连接池的连接（关闭、
+    /// 损坏或被驱逐）：释放其槽位，等待者可新建
+    /// 连接顶替它。</summary>
     void Drop() {
         if (this.liveCount > 0) {
             this.liveCount = this.liveCount - 1;
@@ -77,9 +77,9 @@ class PoolCore<T> {
         }
     }
 
-    /// <summary>Reserves a slot for a connection about to be opened. Reserving
-    /// before the open completes stops concurrent acquirers from both deciding
-    /// there is room and overshooting the cap.</summary>
+    /// <summary>为即将打开的连接预留槽位。预先
+    /// 预留可防止并发获取者同时判定
+    /// 有空位而超出上限。</summary>
     bool TryReserve() {
         if (this.liveCount < this.maxSize) {
             this.liveCount = this.liveCount + 1;
@@ -88,61 +88,61 @@ class PoolCore<T> {
         return false;
     }
 
-    /// <summary>Gives back a slot whose open failed, and lets a waiter retry.</summary>
+    /// <summary>归还因打开失败而空出的槽位，并让等待者重试。</summary>
     void UndoReserve() {
         this.Drop();
     }
 
-    /// <summary>The gate a saturated pool parks its acquirers on. Its counting
-    /// semantics plus the caller's recheck loop guarantee no lost wakeup.</summary>
+    /// <summary>连接池饱和时停泊获取者的闸门。其计数
+    /// 语义加上调用方的复查循环，可保证不丢失唤醒。</summary>
     Gate Waiter() {
         return this.gate;
     }
 
-    /// <summary>Registers the calling coroutine as parked, before it awaits the
-    /// gate, so a releaser knows it has to signal.</summary>
+    /// <summary>在协程 await 闸门之前，将其登记为停泊状态，
+    /// 这样释放者就知道必须发信号唤醒。</summary>
     void EnterWait() {
         this.waiting = this.waiting + 1;
     }
 
-    /// <summary>Unregisters a coroutine woken from the gate.</summary>
+    /// <summary>注销从闸门唤醒的协程。</summary>
     void LeaveWait() {
         this.waiting = this.waiting - 1;
     }
 
-    /// <summary>Number of idle (pooled, ready-to-use) connections.</summary>
+    /// <summary>空闲（已入池、立即可用）连接数。</summary>
     int IdleCount() {
         return this.idle.Count;
     }
 
-    /// <summary>Total live connections (idle + checked out).</summary>
+    /// <summary>存活连接总数（空闲 + 借出）。</summary>
     int LiveCount() {
         return this.liveCount;
     }
 
-    /// <summary>Coroutines currently parked waiting for a connection.</summary>
+    /// <summary>当前停泊等待连接的协程数。</summary>
     int WaitingCount() {
         return this.waiting;
     }
 
-    /// <summary>Maximum number of concurrently live connections.</summary>
+    /// <summary>最大并发存活连接数。</summary>
     int MaxSize() {
         return this.maxSize;
     }
 
-    /// <summary>True once the pool has been closed.</summary>
+    /// <summary>连接池关闭后为 true。</summary>
     bool IsClosed() {
         return this.closed;
     }
 
-    /// <summary>Marks the pool closed: acquirers return null and released
-    /// connections are dropped instead of pooled.</summary>
+    /// <summary>标记连接池已关闭：获取者返回 null，归还的
+    /// 连接将被销毁而不入池。</summary>
     void MarkClosed() {
         this.closed = true;
     }
 
-    /// <summary>Wakes every parked waiter; each rechecks the closed pool and
-    /// returns null.</summary>
+    /// <summary>唤醒所有停泊的等待者；每个都会重新检查已关闭的池并
+    /// 返回 null。</summary>
     void WakeAll() {
         int n = this.waiting;
         for (int k = 0; k < n; k = k + 1) {

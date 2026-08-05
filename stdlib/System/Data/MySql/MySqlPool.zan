@@ -5,21 +5,21 @@ using System.Threading;
 namespace System.Data.MySql;
 
 /// <summary>
-/// Coroutine-aware connection pool for <see cref="MySqlConnection"/>.
+/// 面向 <see cref="MySqlConnection"/> 的协程感知连接池。
 ///
-/// Connections are opened lazily up to <c>maxSize</c> and reused across
-/// coroutines. When every connection is checked out and the cap is reached,
-/// <see cref="AcquireAsync"/> suspends the calling coroutine on an
-/// event-driven <see cref="Gate"/> (no polling, no timer) instead of blocking
-/// the worker thread, and is resumed the moment a connection is returned with
-/// <see cref="Release"/>. Because both opening a connection
-/// and running queries are already coroutine-ized on the IO reactor, the whole
-/// acquire/query/release cycle stays non-blocking.
+/// 连接按需懒打开，最多 <c>maxSize</c> 条，并在协程间
+/// 复用。当所有连接都被借出且达到上限时，
+/// <see cref="AcquireAsync"/> 会让调用协程挂起在事件驱动的
+/// <see cref="Gate"/> 上（无轮询、无定时器），而非阻塞
+/// 工作线程；一旦有连接通过 <see cref="Release"/>
+/// 归还，它便立即恢复。由于打开连接
+/// 与执行查询都已协程化于 IO reactor 上，
+/// 整个 获取/查询/释放 周期保持非阻塞。
 ///
-/// The pool relies on the cooperative single-thread-per-scheduler model: the
-/// free-list is only touched between await points, so no lock is required.
+/// 连接池依赖协作式「每调度器单线程」模型：
+/// 空闲列表只在 await 之间被访问，因此无需加锁。
 ///
-/// Usage:
+/// 用法：
 ///   MySqlPool pool = new MySqlPool("127.0.0.1", 3306, "test", "root", "secret", 8);
 ///   MySqlConnection db = await pool.AcquireAsync();
 ///   DbResult r = await db.QueryAsync("SELECT 1");
@@ -50,9 +50,9 @@ class MySqlPool {
                                                      this.password);
     }
 
-    /// <summary>Checks out a connection: reuses an idle one, opens a new one if
-    /// under the cap, otherwise suspends the coroutine until one is released.
-    /// Returns null once the pool has been closed.</summary>
+    /// <summary>借出一个连接：复用空闲的，未达上限则新建，
+    /// 否则挂起协程直到有连接被释放。
+    /// 连接池关闭后返回 null。</summary>
     async MySqlConnection AcquireAsync() {{
         while (true) {{
             if (this.core.IsClosed()) {{
@@ -60,8 +60,8 @@ class MySqlPool {
             }}
             MySqlConnection pooled = this.core.TakeIdle();
             while (pooled != null) {{
-                // A connection can rot while parked (server restart, idle
-                // timeout): evict it and free its slot for a waiter.
+                // 连接在停放期间可能已失效（服务器重启、空闲
+                // 超时等）：将其逐出，把槽位让给等待者。
                 if (pooled.IsConnected()) {{
                     return pooled;
                 }}
@@ -75,7 +75,7 @@ class MySqlPool {
                 }}
                 return opened;
             }}
-            // Pool saturated: park until a connection is released.
+            // 连接池已满：挂起等待，直到有连接被释放。
             this.core.EnterWait();
             await this.core.Waiter().Wait();
             this.core.LeaveWait();
@@ -83,8 +83,8 @@ class MySqlPool {
         return null;
     }}
 
-    /// <summary>Returns a connection to the pool. A broken or post-Close()
-    /// connection is closed and dropped instead of being pooled.</summary>
+    /// <summary>将连接归还连接池。损坏的或 Close() 之后的
+    /// 连接会被关闭丢弃，不再入池。</summary>
     void Release(MySqlConnection c) {{
         if (c == null) {{
             return;
@@ -99,18 +99,18 @@ class MySqlPool {
         this.core.Pool(c);
     }}
 
-    /// <summary>Number of idle (pooled, ready-to-use) connections.</summary>
+    /// <summary>空闲（已入池、可直接使用）连接数。</summary>
     int IdleCount() {{
         return this.core.IdleCount();
     }}
 
-    /// <summary>Total live connections (idle + checked out).</summary>
+    /// <summary>活跃连接总数（空闲 + 已借出）。</summary>
     int LiveCount() {{
         return this.core.LiveCount();
     }}
 
-    /// <summary>Closes all idle connections and marks the pool closed. Connections
-    /// still checked out are closed when they are released.</summary>
+    /// <summary>关闭所有空闲连接并将连接池标记为已关闭。
+    /// 仍被借出的连接在归还时关闭。</summary>
     void Close() {{
         this.core.MarkClosed();
         MySqlConnection c = this.core.TakeIdle();

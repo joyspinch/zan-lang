@@ -3,35 +3,35 @@ using System;
 namespace System.Diagnostics;
 
 /// <summary>
-/// Process/daemon supervision as a standard-library capability. This is the
-/// portable, dependency-free core behind "workerman-style" servers: identify
-/// the running process, locate its own executable, detach as a Unix daemon, and
-/// launch worker copies of itself that share a listening port via SO_REUSEPORT.
+/// 以标准库能力形式提供的进程/守护进程管理。这是
+/// “workerman 风格”服务端背后可移植、无依赖的核心：识别
+/// 正在运行的进程、定位自身可执行文件、以 Unix 守护进程方式分离，并
+/// 通过 SO_REUSEPORT 共享监听端口，启动自身的 worker 副本。
 ///
-/// It deliberately owns ONLY the process/OS plumbing. Binding, SO_REUSEPORT and
-/// the accept loop live in the socket/server layer; a server framework wires the
-/// two together (see the server templates' Server.Run). Restart-on-crash is left
-/// to an external supervisor (systemd `Restart=always`, Docker
-/// `restart: unless-stopped`, Kubernetes) -- the standard way to keep
-/// horizontally scaled services alive -- rather than reimplemented here.
+/// 它刻意只负责进程/操作系统层面的机制。绑定、SO_REUSEPORT 与
+/// accept 循环位于 socket/server 层；由服务端框架把两者
+/// 组合起来（参见服务端模板的 Server.Run）。崩溃重启交由
+/// 外部监督程序处理（systemd `Restart=always`、Docker
+/// `restart: unless-stopped`、Kubernetes）——这是保持
+/// 横向扩展服务存活的常规做法，而非在此重新实现。
 ///
-/// PLATFORM SUPPORT:
-///   - Pid / Env / SelfExe / WorkerId / IsWorker: all platforms.
-///   - Daemonize (setsid detach): Linux only; a no-op that returns false
-///     elsewhere so callers keep running in the foreground.
-///   - SpawnWorkers (SO_REUSEPORT multi-process): Linux/macOS. Windows has no
-///     SO_REUSEPORT connection load-balancing, so SpawnWorkers is a no-op there
-///     and MultiProcessSupported() returns false; callers should run a single
-///     process (managed instead by IIS/NSSM/a Windows service if needed).
+/// 平台支持：
+///   - Pid / Env / SelfExe / WorkerId / IsWorker：所有平台。
+///   - Daemonize（setsid 分离）：仅 Linux；其他平台为 no-op，返回 false，
+///     调用方继续在前台运行。
+///   - SpawnWorkers（SO_REUSEPORT 多进程）：Linux/macOS。Windows 没有
+///     SO_REUSEPORT 连接负载均衡，因此 SpawnWorkers 在 Windows 上是 no-op，
+///     MultiProcessSupported() 返回 false；调用方应运行单进程
+///     （必要时改用 IIS/NSSM/Windows 服务托管）。
 /// </summary>
 class ProcessHost {
-    // libc entry points. These MUST carry [DllImport("crt")]: a bare `extern`
-    // without it is not recognised as a native import, so the compiler lowers
-    // the call to a constant 0 instead of emitting a real libc call. That is
-    // invisible on Windows (which uses the kernel32 imports below) but breaks
-    // the POSIX paths -- getpid() returned 0 and readlink()/getenv() returned
-    // 0/null, so SelfExe() was empty and worker role detection failed, leaving
-    // multi-process servers unable to spawn or start their workers.
+    // libc 入口点。这些必须带有 [DllImport("crt")]：裸 `extern`
+    // 不会被识别为原生导入，编译器会
+    // 将其降低为常量 0，而不是发出真正的 libc 调用。这在
+    // Windows 上不可见（Windows 使用下面的 kernel32 导入），但会破坏
+    // POSIX 路径——getpid() 返回 0，readlink()/getenv() 返回
+    // 0/null，导致 SelfExe() 为空、worker 角色检测失败，
+    // 使多进程服务器无法生成或启动 worker。
     [DllImport("crt")]
     static extern string getenv(string name);
 
@@ -52,7 +52,7 @@ class ProcessHost {
     static extern int getpid();
     #endif
 
-    /// <summary>PID of the current process.</summary>
+    /// <summary>当前进程的 PID。</summary>
     static int Pid() {
         #if WINDOWS
         return GetCurrentProcessId();
@@ -61,13 +61,13 @@ class ProcessHost {
         #endif
     }
 
-    /// <summary>Reads an environment variable, returning "" when unset (instead
-    /// of a null pointer) so call sites can compare against "" safely.</summary>
+    /// <summary>读取环境变量，未设置时返回 ""（而不是
+    /// 空指针），以便调用处能安全地与 "" 比较。</summary>
     static string Env(string name) {
         #if WINDOWS
-        // Read the live Win32 environment block. CRT getenv sees a snapshot
-        // taken at CRT startup and misses variables a parent process set via
-        // SetEnvironmentVariable just before CreateProcess.
+        // 读取实时的 Win32 环境块。CRT 的 getenv 获取的是快照，
+        // 该快照在 CRT 启动时截取，会漏掉父进程在 CreateProcess 前通过
+        // SetEnvironmentVariable 设置的变量。
         byte[] buf = new byte[4097];
         int n = GetEnvironmentVariableA(name, buf, 4096);
         if (n <= 0 || n > 4096) { return ""; }
@@ -79,9 +79,9 @@ class ProcessHost {
         #endif
     }
 
-    /// <summary>Best-effort absolute path of the running executable, used to
-    /// re-launch worker copies of ourselves. Returns "" when it cannot be
-    /// determined (macOS/others), in which case callers run single-process.</summary>
+    /// <summary>尽力获取正在运行的可执行文件的绝对路径，用于
+    /// 重新启动自身的 worker 副本。无法确定时返回 ""
+    /// （macOS/其他平台），此时调用方按单进程运行。</summary>
     static string SelfExe() {
         byte[] buf = new byte[4097];
         #if WINDOWS
@@ -95,22 +95,22 @@ class ProcessHost {
         return buf.ToStr(0, n);
     }
 
-    /// <summary>Worker index for this process: 0 for the master, N for a spawned
-    /// worker (via the ZAN_WORKER_ID env var set by SpawnWorkers).</summary>
+    /// <summary>本进程的 worker 索引：master 为 0，被派生的 worker 为 N
+    /// （通过 SpawnWorkers 设置的 ZAN_WORKER_ID 环境变量）。</summary>
     static int WorkerId() {
         string v = ProcessHost.Env("ZAN_WORKER_ID");
         if (v == "") { return 0; }
         return Convert.ToInt32(v);
     }
 
-    /// <summary>True when this process was launched as a worker by SpawnWorkers
-    /// (i.e. ZAN_WORKER_ID is set), false for the master/standalone process.</summary>
+    /// <summary>本进程由 SpawnWorkers 作为 worker 启动时返回 true
+    /// （即设置了 ZAN_WORKER_ID）；master/独立进程返回 false。</summary>
     static bool IsWorker() {
         return ProcessHost.Env("ZAN_WORKER_ID") != "";
     }
 
-    /// <summary>Whether SO_REUSEPORT multi-process workers are supported on this
-    /// platform (Linux/macOS yes, Windows no).</summary>
+    /// <summary>当前平台是否支持 SO_REUSEPORT 多进程 worker
+    /// （Linux/macOS 支持，Windows 不支持）。</summary>
     static bool MultiProcessSupported() {
         #if WINDOWS
         return false;
@@ -120,11 +120,11 @@ class ProcessHost {
     }
 
     /// <summary>
-    /// Detaches into a background daemon on Linux (double via setsid). Returns
-    /// TRUE in the ORIGINAL foreground process, which should then exit; the
-    /// detached child re-runs the program with ZAN_DAEMON=1 set so this call
-    /// becomes a no-op the second time. On non-Linux, or if the executable path
-    /// cannot be found, returns FALSE and the caller keeps running normally.
+    /// 在 Linux 上通过 setsid 分离为后台守护进程。
+    /// 在原始前台进程中返回 TRUE，随后应退出；
+    /// 分离出的子进程带 ZAN_DAEMON=1 重新运行程序，使此调用
+    /// 第二次成为 no-op。在非 Linux 平台，或可执行文件路径
+    /// 无法找到时，返回 FALSE，调用方继续正常运行。
     /// </summary>
     static bool Daemonize() {
         #if LINUX
@@ -140,12 +140,12 @@ class ProcessHost {
     }
 
     /// <summary>
-    /// Launches (count-1) additional worker processes that re-run this same
-    /// executable with ZAN_WORKER_ID=1..count-1. Combined with a listener bound
-    /// using SO_REUSEPORT, the OS kernel then load-balances incoming connections
-    /// across the master (worker 0) and every spawned worker. Returns the number
-    /// of workers actually spawned (0 when unsupported, count<=1, or the
-    /// executable path is unknown -- caller then runs single-process).
+    /// 额外启动 (count-1) 个 worker 进程，重新运行当前
+    /// 可执行文件并设置 ZAN_WORKER_ID=1..count-1。配合用 SO_REUSEPORT
+    /// 绑定的监听器，操作系统内核会将入站连接
+    /// 在 master（worker 0）与每个派生的 worker 之间负载均衡。返回实际
+    /// 派生的 worker 数量（不支持、count<=1 或可执行文件路径未知时为 0，
+    /// 此时调用方按单进程运行）。
     /// </summary>
     static int SpawnWorkers(int count) {
         if (count <= 1) { return 0; }

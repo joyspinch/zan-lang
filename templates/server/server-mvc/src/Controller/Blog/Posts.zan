@@ -1,102 +1,115 @@
-using System;
+﻿using System;
 using System.Data;
-using System.Json;
+using System.Data.Orm;
+using System.Text;
 using System.Web;
 using ZanWeb;
 using ZanWeb.Model.Blog;
 using ZanWeb.Dao.Blog;
-using ZanWeb.Model.Sys;
-using ZanWeb.Dao.Sys;
 
 namespace ZanWeb.Blog;
 
 /// <summary>
-/// 极简博客 —— 分层后每层只做一件事：
+/// The public blog: an article feed at /blog, one article at /blog/{id}.
 ///
-///   控制器（本文件）  取参数、管缓存、渲染视图
-///   src/model/Post    实体 = 表结构，`this.Post` 就是这张表
-///   src/dao/PostDao   只放复杂查询与缓存 key；日常增删改查不需要它
-///
-/// 表访问器：`this.Post` / `this.User` 直接就是对应数据表的类型化查询，字段名有
-/// 编译期检查和自动补全，连接由框架在请求开始时借好、结束时归还——既不用 new Dao，
-/// 也没有 Acquire/Release：
-///
-///     await this.Post.Where(a =&gt; a.published == 1).OrderByDescending(a =&gt; a.id)
-///         .Take(20).ToListAsync()
-///     await this.Post.Read(id)                 // 主键便捷读
-///     await this.Post.Insert(p).ExecuteIdentityAsync()
-///
-/// 多表写入用 this.Begin()/Commit()/Rollback()（同一条连接才能在一个事务里，
-/// 见 AppController）。
-///
-/// Redis 走 cache-aside：先读共享缓存，未命中查库并回填，写入后删 key。缓存只是
-/// 加速，Redis 挂了就回落查库。
-///
-/// 路由 -&gt; 代码路径：/blog 由 src/controller/Blog/Posts.zan 的 Index 处理，视图是
-/// views/Blog/Posts.Index.html（视图 key = 模块.控制器.动作）。
+/// Only published articles are visible here, and nothing on these pages can
+/// write to the site except a comment -- which is stored unpublished and waits
+/// for an editor. Writing articles is an admin screen, not a form on a public
+/// page.
 /// </summary>
 [Route("[controller]/[action]")]
 [Custom(Authorization = CustomAuthorization.None)]
 [Description("博客")]
 class Posts : AppController {
+    static int PageSize = 8;
 
     [HttpGet]
     [Route("/blog")]
     [Description("文章列表")]
     async void Index() {
+        if (!this.DbReady()) {
+            this.Fail(503, "2001", "服务暂时不可用，请稍后再试");
+        }
         string kw = this.In("kw");
-        CacheContext cache = this.Cache();
+        string slug = this.In("cat");
+        int page = this.InInt("page", 1);
+        if (page < 1) { page = 1; }
 
-        // 带搜索词的结果不进缓存：key 会随用户输入无限膨胀。
-        bool cacheable = kw.Length == 0;
-        List<Post> rows = null;
-        string source = "db";
-
-        if (cacheable) {
-            string cached = await cache.GetAsync(PostDao.ListKey);
-            if (cached.Length > 0) {
-                rows = Json.Deserialize<List<Post>>(cached);
-                source = "cache";
+        List<Category> cats = await this.Category
+            .Where(a => a.status == 1).OrderBy(a => a.sortOrder).ToListAsync();
+        int categoryId = 0;
+        string categoryName = "";
+        for (int i = 0; i < cats.Count; i = i + 1) {
+            if (cats[i].slug == slug) {
+                categoryId = cats[i].id;
+                categoryName = cats[i].name;
             }
         }
 
-        if (rows == null) {
-            if (!this.DbReady()) {
-                this.Fail(503, "2001", "数据库不可用，检查 config/app.json [database]");
-                return;
-            }
-            rows = await this.Post
-                .Where(a => a.published == 1)
-                .WhereIf(kw.Length > 0, a => a.title.Contains(kw))
-                .OrderByDescending(a => a.id)
-                .Take(20)
-                .ToListAsync();
-            if (cacheable) {
-                await cache.SetTtlAsync(PostDao.ListKey,
-                    Json.Serialize<List<Post>>(rows), 60);
-            }
-        }
+        int total = await this.Post
+            .Where(a => a.published == 1)
+            .WhereIf(kw.Length > 0, a => a.title.Contains(kw))
+            .WhereIf(categoryId > 0, a => a.categoryId == categoryId)
+            .CountAsync();
+        List<Post> rows = await this.Post
+            .Where(a => a.published == 1)
+            .WhereIf(kw.Length > 0, a => a.title.Contains(kw))
+            .WhereIf(categoryId > 0, a => a.categoryId == categoryId)
+            .OrderByDescending(a => a.top)
+            .OrderByDescending(a => a.id)
+            .Skip((page - 1) * Posts.PageSize).Take(Posts.PageSize)
+            .ToListAsync();
 
         ViewData d = new ViewData();
-        d.Set("title", "极简博客");
+        await Settings.Apply(d);
+        string heading = "博客";
+        if (categoryName.Length > 0) { heading = categoryName; }
+        d.Set("title", heading);
+        d.Set("heading", heading);
         d.Set("navBlog", "page");
         d.Set("kw", kw);
-        d.Set("source", source);
-        d.Set("count", Convert.ToString(rows.Count));
-        DbContext ctx = this.Db();
-        d.Set("pool", "idle=" + Convert.ToString(ctx.IdleCount())
-            + " live=" + Convert.ToString(ctx.LiveCount())
-            + " waiting=" + Convert.ToString(ctx.WaitingCount()));
-        d.Set("cacheKind", Posts.CacheKind(cache));
+        d.Set("cat", slug);
+        d.Set("total", Convert.ToString(total));
+
         List<StrMap> items = d.AddList("posts");
         for (int i = 0; i < rows.Count; i = i + 1) {
             Post p = rows[i];
             StrMap row = new StrMap();
             row.Set("id", Convert.ToString(p.id));
             row.Set("title", p.title);
-            row.Set("author", p.author);
-            row.Set("createdAt", Posts.Stamp(p.createdAt));
+            row.Set("summary", Posts.Summary(p));
+            row.Set("author", Posts.Author(p));
+            row.Set("category", Posts.CategoryName(cats, p.categoryId));
+            row.Set("createdAt", Posts.Day(p.createdAt));
+            row.Set("minutes", Convert.ToString(Prose.Minutes(p.body)));
+            if (p.cover.Length > 0) { row.Set("cover", p.cover); }
+            if (p.top == 1) { row.Set("top", "1"); }
             items.Add(row);
+        }
+        if (rows.Count == 0) { d.Set("empty", "1"); }
+
+        List<StrMap> nav = d.AddList("categories");
+        StrMap all = new StrMap();
+        all.Set("name", "全部");
+        all.Set("slug", "");
+        if (slug.Length == 0) { all.Set("active", "active"); }
+        nav.Add(all);
+        for (int i = 0; i < cats.Count; i = i + 1) {
+            StrMap c = new StrMap();
+            c.Set("name", cats[i].name);
+            c.Set("slug", cats[i].slug);
+            if (cats[i].slug == slug) { c.Set("active", "active"); }
+            nav.Add(c);
+        }
+
+        int pages = (total + Posts.PageSize - 1) / Posts.PageSize;
+        d.Set("page", Convert.ToString(page));
+        d.Set("pages", Convert.ToString(pages));
+        if (page > 1) {
+            d.Set("prev", Posts.PageLink(kw, slug, page - 1));
+        }
+        if (page < pages) {
+            d.Set("next", Posts.PageLink(kw, slug, page + 1));
         }
         this.View(d);
     }
@@ -106,84 +119,152 @@ class Posts : AppController {
     [Description("文章详情")]
     async void Show() {
         int id = this.InInt("id", 0);
-        if (id <= 0) {
+        if (id <= 0 || !this.DbReady()) {
             this.Fail(404, "2004", "文章不存在");
-            return;
         }
-        CacheContext cache = this.Cache();
-        string key = PostDao.PostKey(id);
-        string source = "cache";
-
-        Post post = null;
-        string cached = await cache.GetAsync(key);
-        if (cached.Length > 0) { post = Json.Deserialize<Post>(cached); }
-
-        if (post == null) {
-            source = "db";
-            if (!this.DbReady()) {
-                this.Fail(503, "2001", "数据库不可用");
-                return;
-            }
-            post = await this.Post.Read(id);
-            if (post == null) {
-                this.Fail(404, "2004", "文章不存在");
-                return;
-            }
-            await cache.SetTtlAsync(key, Json.Serialize<Post>(post), 60);
+        Post post = await this.Post.Read(id);
+        if (post == null || post.published != 1) {
+            this.Fail(404, "2004", "文章不存在");
         }
+        int _v = await this.Post.Update()
+            .Set(a => a.views, post.views + 1)
+            .Where(a => a.id == id)
+            .ExecuteAffrowsAsync();
 
+        List<Category> cats = await this.Category.ToListAsync();
         ViewData d = new ViewData();
+        await Settings.Apply(d);
         d.Set("title", post.title);
         d.Set("navBlog", "page");
-        d.Set("body", post.body);
-        d.Set("author", post.author);
-        d.Set("createdAt", Posts.Stamp(post.createdAt));
-        d.Set("source", source);
-        d.Set("cacheKind", Posts.CacheKind(cache));
+        d.Set("id", Convert.ToString(id));
+        d.Set("heading", post.title);
+        d.Set("author", Posts.Author(post));
+        d.Set("category", Posts.CategoryName(cats, post.categoryId));
+        d.Set("createdAt", Posts.Day(post.createdAt));
+        d.Set("minutes", Convert.ToString(Prose.Minutes(post.body)));
+        d.Set("views", Convert.ToString(post.views + 1));
+        if (post.cover.Length > 0) { d.Set("cover", post.cover); }
+
+        List<StrMap> paras = d.AddList("paragraphs");
+        List<string> lines = Prose.Paragraphs(post.body);
+        for (int i = 0; i < lines.Count; i = i + 1) {
+            StrMap row = new StrMap();
+            row.Set("text", lines[i]);
+            paras.Add(row);
+        }
+
+        List<StrMap> tags = d.AddList("tags");
+        List<string> labels = Prose.Tags(post.tags);
+        for (int i = 0; i < labels.Count; i = i + 1) {
+            StrMap row = new StrMap();
+            row.Set("name", labels[i]);
+            tags.Add(row);
+        }
+        if (labels.Count > 0) { d.Set("hasTags", "1"); }
+
+        Post prev = await this.Post
+            .Where(a => a.published == 1).Where(a => a.id < id)
+            .OrderByDescending(a => a.id).FirstAsync();
+        Post next = await this.Post
+            .Where(a => a.published == 1).Where(a => a.id > id)
+            .OrderBy(a => a.id).FirstAsync();
+        if (prev != null) {
+            d.Set("prevId", Convert.ToString(prev.id));
+            d.Set("prevTitle", prev.title);
+        }
+        if (next != null) {
+            d.Set("nextId", Convert.ToString(next.id));
+            d.Set("nextTitle", next.title);
+        }
+
+        List<Comment> comments = await this.Comment
+            .Where(a => a.postId == id).Where(a => a.status == 1)
+            .OrderBy(a => a.id).ToListAsync();
+        List<StrMap> crows = d.AddList("comments");
+        for (int i = 0; i < comments.Count; i = i + 1) {
+            StrMap row = new StrMap();
+            row.Set("author", Posts.Nickname(comments[i].author));
+            row.Set("content", comments[i].content);
+            row.Set("createdAt", Posts.Day(comments[i].createdAt));
+            crows.Add(row);
+        }
+        d.Set("commentCount", Convert.ToString(comments.Count));
+        if (comments.Count == 0) { d.Set("noComments", "1"); }
+        // With comments switched off the form goes away but the approved ones
+        // stay readable: closing a discussion is not deleting it.
+        if (await Settings.On(SettingKeys.CommentEnabled, true)) { d.Set("canComment", "1"); }
         this.View(d);
     }
 
+    /// <summary>Takes a reader's comment. It is stored unpublished: an open
+    /// form that could publish straight to the site is a spam target.</summary>
     [HttpPost]
-    [Route("/blog/create")]
-    [Description("发布文章")]
-    async void Create() {
-        // Need* 是必填读取：缺参数就以统一的 {"code":"0003"} 结束请求，不用每个动作
-        // 再写一遍判空。参数名、类型、必填与这里的中文标签同时进入 /api/docs。
-        string title = this.NeedText("title", "标题");
-        string body = this.NeedText("body", "正文");
-
+    [Route("/blog/{id}/comment")]
+    [Description("发表评论")]
+    async void Reply() {
+        int id = this.InInt("id", 0);
+        string author = this.In("author");
+        string content = this.NeedText("content", "评论内容");
         if (!this.DbReady()) {
-            this.Fail(503, "2001", "数据库不可用");
-            return;
+            this.Fail(503, "2001", "服务暂时不可用，请稍后再试");
         }
-
-        // 作者取自登录身份，不取表单：客户端传来的 author 可以是任何人。
-        string author = "anonymous";
-        if (this.IsLogin()) {
-            User me = await this.User.Read(Filter.ToInt(this.uid, 0));
-            if (me != null) { author = me.username; }
+        if (!await Settings.On(SettingKeys.CommentEnabled, true)) {
+            this.Fail(403, "2003", "本站已关闭评论");
         }
-
-        Post p = new Post();
-        p.title = title;
-        p.body = body;
-        p.author = author;
-        p.published = 1;
-        p.createdAt = WebApp.NowSeconds();
-
-        int newId = await this.Post.Insert(p).ExecuteIdentityAsync();
-
-        // 写完就让缓存失效，而不是等 TTL 到期，否则列表最长 60 秒看不到新文章。
-        await this.Cache().DelAsync(PostDao.ListKey);
-        this.Ctx().Redirect("/blog/" + Convert.ToString(newId));
+        Post post = await this.Post.Read(id);
+        if (post == null || post.published != 1) {
+            this.Fail(404, "2004", "文章不存在");
+        }
+        if (author.Length == 0) { author = "访客"; }
+        Comment c = new Comment();
+        c.postId = id;
+        c.author = author;
+        c.email = this.In("email");
+        c.content = content;
+        // Review on: the comment waits for an editor. Review off: it is public
+        // as soon as it is written.
+        c.status = 0;
+        if (!await Settings.On(SettingKeys.CommentReview, true)) { c.status = 1; }
+        c.ip = this.Ctx().RemoteIp();
+        c.createdAt = WebApp.NowSeconds();
+        int _n = await this.Comment.Insert(c).ExecuteIdentityAsync();
+        this.Ctx().Redirect("/blog/" + Convert.ToString(id) + "?commented=1");
     }
 
-    static string CacheKind(CacheContext cache) {
-        if (cache.Shared()) { return "redis (跨 worker 共享)"; }
-        return "memory (仅本 worker)";
+    static string PageLink(string kw, string slug, int page) {
+        string q = "/blog?page=" + Convert.ToString(page);
+        if (kw.Length > 0) { q = q + "&kw=" + Encoding.UrlEncode(kw); }
+        if (slug.Length > 0) { q = q + "&cat=" + Encoding.UrlEncode(slug); }
+        return q;
     }
 
-    static string Stamp(long seconds) {
-        return DateTime.FromUnixSeconds(seconds).ToString();
+    static string Summary(Post p) {
+        if (p.summary.Length > 0) { return p.summary; }
+        return Prose.Excerpt(p.body, 120);
+    }
+
+    static string Author(Post p) {
+        if (p.author.Length > 0) { return p.author; }
+        return "编辑部";
+    }
+
+    static string Nickname(string author) {
+        if (author.Length > 0) { return author; }
+        return "访客";
+    }
+
+    static string CategoryName(List<Category> cats, int id) {
+        for (int i = 0; i < cats.Count; i = i + 1) {
+            if (cats[i].id == id) { return cats[i].name; }
+        }
+        return "未分类";
+    }
+
+    static string Day(long seconds) {
+        if (seconds <= 0) { return ""; }
+        string s = DateTime.FromUnixSeconds(seconds).ToString();
+        int sp = s.IndexOf(" ");
+        if (sp > 0) { return s.Substring(0, sp); }
+        return s;
     }
 }

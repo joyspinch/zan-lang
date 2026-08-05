@@ -4,7 +4,7 @@ using System.Text;
 
 namespace System.Data.ZanDb;
 
-/// <summary>One key/value record returned by a range or prefix scan.</summary>
+/// <summary>范围或前缀扫描返回的一条键/值记录。</summary>
 class KvEntry {
     string key;
     string val;
@@ -15,7 +15,7 @@ class KvEntry {
     }
 }
 
-/// <summary>One decoded leaf record. overflowPage is 0 for inline values.</summary>
+/// <summary>一条已解码的叶子记录。内联值（inline value）的 overflowPage 为 0。</summary>
 class BLeafEntry {
     string key;
     string val;
@@ -29,15 +29,15 @@ class BLeafEntry {
 }
 
 /// <summary>
-/// Decoded form of one B+Tree node (leaf or internal). Nodes are encoded
-/// into fixed-size pager pages; mutation happens on the decoded lists and the
-/// node is re-encoded, splitting when it no longer fits a page.
+/// 单个 B+Tree 节点（叶子或内部）的解码形式。节点被编码为
+/// 固定大小的 pager 页；修改作用于解码后的列表，然后
+/// 重新编码节点，放不下时分裂。
 /// </summary>
 class BNode {
     bool leaf;
-    List<BLeafEntry> entries; // leaf only
-    List<string> keys;        // internal only
-    List<int> children;       // internal only: keys.Count + 1 entries
+    List<BLeafEntry> entries; // 仅叶子
+    List<string> keys;        // 仅内部节点
+    List<int> children;       // 仅内部节点：keys.Count + 1 项
 
     BNode(bool isLeaf) {
         this.leaf = isLeaf;
@@ -49,9 +49,9 @@ class BNode {
     static BNode Leaf() { return new BNode(true); }
     static BNode Internal() { return new BNode(false); }
 
-    /// <summary>Independent copy. A node decoded from a committed page is
-    /// shared with the node cache and with concurrent readers of that
-    /// snapshot, so a writer mutates a copy and stores it in a new page.</summary>
+    /// <summary>独立副本。从已提交页面解码出的节点
+    /// 会与节点缓存以及该快照的并发读者共享，
+    /// 因此写入方修改副本并存放到新页面。</summary>
     BNode Copy() {
         BNode c = new BNode(this.leaf);
         int i = 0;
@@ -68,17 +68,17 @@ class BNode {
 }
 
 /// <summary>
-/// Fixed-capacity cache of decoded nodes keyed by page id, so hot lookups
-/// skip re-decoding a page into keys/values on every visit. Entries describe
-/// immutable page contents: a page that is copied, freed or reused is dropped
-/// from the cache, and the whole cache is dropped when the snapshot moves.
+/// 以页面 id 为键的固定容量解码节点缓存，热门查找
+/// 不必每次访问都重新把页面解码成键/值。条目描述的是
+/// 不可变的页面内容：被复制、释放或复用的页面会从
+/// 缓存中移除，快照推进时整个缓存也会清空。
 /// </summary>
 class NodeCache {
-    int slots;          // power of two
+    int slots;          // 2 的幂
     int capacity;
     int count;
-    int dead;           // tombstones
-    List<int> ids;      // pageId + 1; 0 = empty, -1 = tombstone
+    int dead;           // 墓碑标记
+    List<int> ids;      // pageId + 1；0 表示空，-1 表示墓碑
     List<BNode> nodes;
 
     NodeCache(int cap) {
@@ -102,14 +102,14 @@ class NodeCache {
         if (h < 0) { h = -h & mask; }
         while (true) {
             int k = this.ids[h];
-            if (k == 0) { return -(h + 1); }        // free slot, encoded
+            if (k == 0) { return -(h + 1); }        // 空闲槽位（已编码）
             if (k == pageId + 1) { return h; }
             h = (h + 1) & mask;
         }
         return 0;
     }
 
-    /// <summary>Cached node or null.</summary>
+    /// <summary>缓存的节点，没有则返回 null。</summary>
     BNode Get(int pageId) {
         int s = FindSlot(pageId);
         if (s < 0) { return null; }
@@ -129,8 +129,8 @@ class NodeCache {
         this.count = this.count + 1;
     }
 
-    /// <summary>Forgets one page: its id is about to hold different content
-    /// (copy-on-write or free-list reuse), so a stale decode must not survive.</summary>
+    /// <summary>忘记某个页面：它的 id 即将存放不同的内容
+    /// （写时复制或 free-list 复用），过期的解码结果不能继续存在。</summary>
     void Remove(int pageId) {
         int s = FindSlot(pageId);
         if (s < 0) { return; }
@@ -152,31 +152,31 @@ class NodeCache {
 }
 
 /// <summary>
-/// Copy-on-write disk B+Tree over a <see cref="Pager"/>: sorted string keys,
-/// string values, cursor-based range scans.
+/// 基于 <see cref="Pager"/> 的写时复制磁盘 B+Tree：字符串键有序，
+/// 值为字符串，支持基于游标的范围扫描。
 ///
-/// No page is ever modified in place once it is part of a committed snapshot:
-/// an update copies the leaf to a new page and rewrites the path up to the
-/// root, which the pager then publishes in the meta page. That is what makes
-/// a reader safe without any lock -- the pages it walks cannot change under
-/// it -- and what makes a commit atomic without a redo log.
+/// 页面一旦属于已提交快照就绝不就地修改：
+/// 更新时把叶子复制到新页面，并重写直至根节点的路径，
+/// 随后 pager 在 meta 页中发布新根。这正是
+/// 读者无需加锁也安全的原因——它遍历的页面不会在脚下改变——
+/// 也正是不需要 redo log 提交也原子的原因。
 ///
-/// Because a page's parent is rewritten anyway, leaves carry no sibling
-/// pointer (it could not be maintained under copy-on-write without touching
-/// the left neighbour); range scans keep an explicit cursor stack instead.
+/// 因为页面的父节点反正会被重写，叶子不带兄弟指针
+/// （写时复制下不修改左邻节点就没法维护它）；
+/// 范围扫描改用显式的游标栈。
 ///
-/// Values larger than INLINE_MAX live in chained overflow pages, so value
-/// size is unbounded; keys must fit a node.
+/// 大于 INLINE_MAX 的值存放在链式 overflow 页面中，因此值的
+/// 大小没有上限；键必须能放进一个节点。
 /// </summary>
 class BTree {
     static int PAGE_SIZE = 4096;
-    static int MATCH_RANGE = 0;    // startKey <= key <= endKey ("" = to end)
-    static int MATCH_PREFIX = 1;   // key starts with startKey
-    static int TYPE_LEAF = 1;      // legacy: plain key/val strings
+    static int MATCH_RANGE = 0;    // startKey <= key <= endKey（"" = 直到末尾）
+    static int MATCH_PREFIX = 1;   // 键以 startKey 开头
+    static int TYPE_LEAF = 1;      // 旧版：普通 key/val 字符串
     static int TYPE_INTERNAL = 2;
-    static int TYPE_LEAF2 = 3;     // per-entry flag: inline or overflow ref
-    static int INLINE_MAX = 1024;  // values above this go to overflow pages
-    static int OVF_CHUNK = 4000;   // payload bytes per overflow page
+    static int TYPE_LEAF2 = 3;     // 逐条目标志：内联或 overflow 引用
+    static int INLINE_MAX = 1024;  // 超过该大小的值写入 overflow 页面
+    static int OVF_CHUNK = 4000;   // 每个 overflow 页面的负载字节数
 
     Pager pager;
     string lastError;
@@ -186,8 +186,8 @@ class BTree {
         this.lastError = "";
     }
 
-    /// <summary>Opens the tree stored in the pager, creating an empty root on
-    /// a fresh database.</summary>
+    /// <summary>打开 pager 中存储的树；新数据库会创建空根节点
+    /// 。</summary>
     static BTree Open(Pager pager) {
         BTree t = new BTree();
         t.pager = pager;
@@ -213,8 +213,8 @@ class BTree {
 
     int RootId() { return this.pager.RootId(); }
 
-    /// <summary>Drops decoded nodes when the pager adopted another process's
-    /// commit: page ids may now hold different content.</summary>
+    /// <summary>当 pager 采纳了另一进程的提交时丢弃已解码的节点：
+    /// 页面 id 现在可能存放了不同的内容。</summary>
     void Sync() {
         if (this.pager.TakeInvalidation()) { this.nodeCache.Clear(); }
     }
@@ -262,9 +262,9 @@ class BTree {
         return la - lb;
     }
 
-    // ===== Node encode/decode =====
+    // ===== 节点编码/解码 =====
 
-    /// <summary>Reads a whole overflow chain back into one string.</summary>
+    /// <summary>将整条 overflow 链读回为一个字符串。</summary>
     string ReadChain(int firstPage) {
         StringBuilder sb = new StringBuilder();
         int pid = firstPage;
@@ -278,13 +278,13 @@ class BTree {
         return sb.ToString();
     }
 
-    /// <summary>Writes val into a chain of freshly allocated overflow pages;
-    /// returns the first page id.</summary>
+    /// <summary>把 val 写入一串新分配的 overflow 页面，
+    /// 返回第一个页面的 id。</summary>
     int WriteChain(string val) {
         int total = val.Length;
         int nchunks = (total + BTree.OVF_CHUNK - 1) / BTree.OVF_CHUNK;
         if (nchunks == 0) { nchunks = 1; }
-        // Build back-to-front so each page knows its successor.
+        // 从后往前构建，使每个页面都知道它的后继。
         List<int> ids = new List<int>();
         int i = 0;
         for (; i < nchunks; i = i + 1) { ids.Add(this.pager.AllocPage()); }
@@ -303,8 +303,8 @@ class BTree {
         return ids[0];
     }
 
-    /// <summary>Hands an overflow chain to the free list. The pages stay
-    /// readable until no snapshot references them.</summary>
+    /// <summary>把一条 overflow 链交给 free list。这些页面在
+    /// 没有快照引用前仍保持可读。</summary>
     void FreeChain(int firstPage) {
         int pid = firstPage;
         while (pid != 0) {
@@ -325,7 +325,7 @@ class BTree {
         int nkeys = pg.ReadU16();
         if (type == BTree.TYPE_LEAF) {
             BNode n = BNode.Leaf();
-            pg.ReadU64();                       // legacy sibling pointer
+            pg.ReadU64();                       // 旧版兄弟指针
             for (int i = 0; i < nkeys; i = i + 1) {
                 n.entries.Add(new BLeafEntry(pg.ReadString(), pg.ReadString(), 0));
             }
@@ -334,7 +334,7 @@ class BTree {
         }
         if (type == BTree.TYPE_LEAF2) {
             BNode n = BNode.Leaf();
-            pg.ReadU64();                       // reserved (was sibling pointer)
+            pg.ReadU64();                       // 保留（原为兄弟指针）
             for (int i = 0; i < nkeys; i = i + 1) {
                 string key = pg.ReadString();
                 int flag = pg.ReadU8();
@@ -359,14 +359,14 @@ class BTree {
     }
 
     static int EncodedSize(BNode n) {
-        int size = 3;   // type + nkeys
+        int size = 3;   // 类型 + 键数
         if (n.leaf) {
-            size = size + 8;   // reserved
+            size = size + 8;   // 保留字段
             for (int i = 0; i < n.entries.Count; i = i + 1) {
                 BLeafEntry e = n.entries[i];
-                size = size + 5 + e.key.Length + 1;   // key + flag
+                size = size + 5 + e.key.Length + 1;   // 键 + 标志
                 if (e.val.Length > BTree.INLINE_MAX) {
-                    size = size + 8;                   // overflow page ref
+                    size = size + 8;                   // overflow 页面引用
                 } else {
                     size = size + 5 + e.val.Length;
                 }
@@ -380,12 +380,12 @@ class BTree {
         return size;
     }
 
-    /// <summary>Encodes a node into a page that belongs to the running
-    /// transaction.</summary>
+    /// <summary>把节点编码进属于当前事务的页面
+    /// 。</summary>
     void WriteNode(int pageId, BNode n) {
         if (n.leaf) {
-            // Move large values out to overflow chains first (allocating
-            // pages may touch the pager, so do it before encoding).
+            // 先把大值移入 overflow 链（分配页面
+            // 会接触 pager，所以要在编码前做）。
             for (int i = 0; i < n.entries.Count; i = i + 1) {
                 BLeafEntry e = n.entries[i];
                 if (e.val.Length > BTree.INLINE_MAX && e.overflowPage == 0) {
@@ -423,9 +423,9 @@ class BTree {
         this.nodeCache.Put(pageId, n);
     }
 
-    /// <summary>Stores a modified node: in place when the page was created by
-    /// this transaction, otherwise in a new page whose id is returned while the
-    /// old page goes to the free list (copy-on-write).</summary>
+    /// <summary>存储修改后的节点：页面由当前事务创建时原地写入，
+    /// 否则写入新页面并返回其 id，
+    /// 旧页面进入 free list（写时复制）。</summary>
     int WriteNodeCow(int oldPageId, BNode n) {
         if (this.pager.IsFresh(oldPageId)) {
             WriteNode(oldPageId, n);
@@ -438,19 +438,19 @@ class BTree {
         return nid;
     }
 
-    /// <summary>Returns the node to mutate: the cached one when the page
-    /// belongs to this transaction (nobody else can see it), a copy
-    /// otherwise.</summary>
+    /// <summary>返回要修改的节点：当页面属于当前事务时返回缓存的节点
+    /// （没有别人能看到它），否则返回
+    /// 副本。</summary>
     BNode NodeForWrite(int pageId) {
         BNode n = ReadNode(pageId);
         if (this.pager.IsFresh(pageId)) { return n; }
         return n.Copy();
     }
 
-    // ===== Search =====
+    // ===== 查找 =====
 
-    /// <summary>Index of the child to descend into for key: binary search
-    /// for the first separator strictly greater than key.</summary>
+    /// <summary>给定 key 要下钻到的子节点索引：二分查找
+    /// 第一个严格大于 key 的分隔键。</summary>
     static int ChildIndex(BNode n, string key) {
         int lo = 0;
         int hi = n.keys.Count;
@@ -461,7 +461,7 @@ class BTree {
         return lo;
     }
 
-    /// <summary>Binary search for the first leaf entry whose key is >= key.</summary>
+    /// <summary>二分查找第一个键 >= key 的叶子条目。</summary>
     static int LowerBound(BNode n, string key) {
         int lo = 0;
         int hi = n.entries.Count;
@@ -472,15 +472,15 @@ class BTree {
         return lo;
     }
 
-    /// <summary>Position of key in a leaf, or -1.</summary>
+    /// <summary>key 在叶子中的位置，未找到返回 -1。</summary>
     static int LeafFind(BNode n, string key) {
         int lb = BTree.LowerBound(n, key);
         if (lb < n.entries.Count && BTree.Compare(n.entries[lb].key, key) == 0) { return lb; }
         return -1;
     }
 
-    /// <summary>Looks up a key. Returns true and stores the value in outVal
-    /// (single-element list) when found.</summary>
+    /// <summary>查找键。找到时返回 true 并把值存入 outVal
+    /// （单元素列表）。</summary>
     bool Get(string key, List<string> outVal) {
         Sync();
         int pid = RootId();
@@ -500,14 +500,14 @@ class BTree {
         return Get(key, tmp);
     }
 
-    // ===== Insert =====
+    // ===== 插入 =====
 
-    /// <summary>Inserts or replaces key -> val inside the running write
-    /// transaction (durable once the pager commits).</summary>
+    /// <summary>在当前进行中的写入事务里插入或替换 key -> val
+    /// （pager 提交后即持久化）。</summary>
     void Put(string key, string val) {
         Sync();
-        List<int> path = new List<int>();       // page ids root..parent of leaf
-        List<int> pathIdx = new List<int>();    // child index taken at each internal
+        List<int> path = new List<int>();       // 从根到叶子父节点的页面 id 序列
+        List<int> pathIdx = new List<int>();    // 在每个内部节点选取的子节点索引
         int pid = RootId();
         BNode probe = ReadNode(pid);
         while (!probe.leaf) {
@@ -539,13 +539,13 @@ class BTree {
             return;
         }
 
-        // Split the leaf. Normally left/right each keep half. But for
-        // monotonically increasing keys (auto-increment ids, timestamps) a
-        // 50/50 split leaves every full leaf permanently ~half empty, since all
-        // later inserts land in the right sibling. When the key just written is
-        // the node maximum, move only that entry to the new right page so the
-        // left page stays nearly full -- roughly doubling density for the
-        // common append workload.
+        // 分裂叶子节点。通常左右各保留一半，但对于
+        // 单调递增的键（自增 id、时间戳），
+        // 50/50 分裂会让每个满叶子永久空一半，因为之后
+        // 的插入都落在右兄弟上。当刚写入的键正好是
+        // 节点最大值时，只把该条目移到新的右页面，
+        // 让左页面几乎保持满——对常见的追加负载，
+        // 密度大约翻倍。
         int mid = n.entries.Count / 2;
         if (ins > mid) { mid = ins; }
         BNode right = BNode.Leaf();
@@ -563,8 +563,8 @@ class BTree {
         InsertUp(path, pathIdx, path.Count - 1, leftId, right.entries[0].key, rightId);
     }
 
-    /// <summary>Rewrites the path above a copied node so it points at the new
-    /// page, up to the root (which the pager republishes).</summary>
+    /// <summary>重写被复制节点之上的路径，让它指向新页面，
+    /// 直到根节点（pager 会重新发布根）。</summary>
     void ReplaceUp(List<int> path, List<int> pathIdx, int level, int newChildId) {
         int child = newChildId;
         int lv = level;
@@ -574,15 +574,15 @@ class BTree {
             BNode p = NodeForWrite(ppid);
             p.children[ci] = child;
             int np = WriteNodeCow(ppid, p);
-            if (np == ppid) { return; }      // page already belonged to this txn
+            if (np == ppid) { return; }      // 页面已属于当前事务
             child = np;
             lv = lv - 1;
         }
         this.pager.SetRoot(child);
     }
 
-    /// <summary>Propagates a split upward: the (possibly copied) left child,
-    /// a separator key and the new right child.</summary>
+    /// <summary>向上传播分裂：把（可能被复制的）左子节点、
+    /// 分隔键和新的右子节点插入父节点。</summary>
     void InsertUp(List<int> path, List<int> pathIdx, int level,
             int leftId, string sep, int rightId) {
         int curLeft = leftId;
@@ -601,7 +601,7 @@ class BTree {
                 if (np != ppid) { ReplaceUp(path, pathIdx, lv - 1, np); }
                 return;
             }
-            // Split internal: middle key moves up.
+            // 分裂内部节点：中间键上移。
             int mid = n.keys.Count / 2;
             string upKey = n.keys[mid];
             BNode right = BNode.Internal();
@@ -628,7 +628,7 @@ class BTree {
             curRight = newRightId;
             lv = lv - 1;
         }
-        // Root split: grow the tree by one level.
+        // 根节点分裂：树增加一层。
         BNode newRoot = BNode.Internal();
         newRoot.children.Add(curLeft);
         newRoot.keys.Add(curSep);
@@ -638,10 +638,10 @@ class BTree {
         this.pager.SetRoot(newRootId);
     }
 
-    // ===== Delete =====
+    // ===== 删除 =====
 
-    /// <summary>Removes a key. Returns true when it existed. Empty leaves are
-    /// left in place and reclaimed by future compaction (no merge yet).</summary>
+    /// <summary>删除一个键，存在时返回 true。空叶子节点
+    /// 留在原位，由以后压缩回收（暂无合并）。</summary>
     bool Delete(string key) {
         Sync();
         List<int> path = new List<int>();
@@ -670,11 +670,11 @@ class BTree {
         return true;
     }
 
-    // ===== Range delete =====
+    // ===== 范围删除 =====
 
-    /// <summary>Frees a leaf page and the overflow chains it references,
-    /// without decoding values: dropping a batch must not pay for reading the
-    /// data it throws away.</summary>
+    /// <summary>释放一个叶子页面及其引用的 overflow 链，
+    /// 不解码其中的值：批量删除不应为读取
+    /// 即将丢弃的数据付出代价。</summary>
     void FreeLeafPage(int pageId) {
         ByteBuffer pg = this.pager.GetPage(pageId);
         pg.SeekRead(0);
@@ -695,21 +695,21 @@ class BTree {
         this.pager.FreeLater(pageId);
     }
 
-    /// <summary>Deletes every key with startKey &lt;= key &lt;= endKey
-    /// (endKey "" = to the end) and returns how many were removed.
+    /// <summary>删除满足 startKey &lt;= key &lt;= endKey 的所有键
+    /// （endKey 为 "" 表示直到末尾），返回删除的数量。
     ///
-    /// This is the batch path: a leaf entirely inside the range is handed to
-    /// the free list as a whole page -- not decoded, not rewritten -- and each
-    /// parent on the way is rewritten once, so dropping a batch costs about
-    /// one page write per tree level plus the two boundary leaves, instead of
-    /// one path rewrite per key. Keys of one batch must therefore share a
-    /// prefix (for example "kw:&lt;planId&gt;:") so the batch is one range.</summary>
+    /// 这是批量路径：完全落在范围内的叶子页会整页交给
+    /// free list——不解码、不重写——沿途每个
+    /// 父节点只重写一次，所以删除一批的开销约为
+    /// 每层一次页面写入加两个边界叶子，而不是
+    /// 每个键重写一次路径。因此同一批的键必须共享一个
+    /// 前缀（例如 "kw:&lt;planId&gt;:"），使整批成为单个范围。</summary>
     int DeleteRange(string startKey, string endKey) {
         return DeleteMatching(startKey, endKey, BTree.MATCH_RANGE);
     }
 
-    /// <summary>Deletes every key starting with prefix -- "drop this batch" --
-    /// and returns how many were removed.</summary>
+    /// <summary>删除所有以 prefix 开头的键——“丢弃这一批”——
+    /// 并返回被删除的键数量。</summary>
     int DeletePrefix(string prefix) {
         return DeleteMatching(prefix, prefix, BTree.MATCH_PREFIX);
     }
@@ -740,9 +740,9 @@ class BTree {
         return BTree.Compare(key, endKey) <= 0;
     }
 
-    /// <summary>Removes a range inside one subtree. Returns the (possibly
-    /// copied) page id, or 0 when the whole subtree fell inside the range and
-    /// its pages went to the free list.</summary>
+    /// <summary>删除一个子树内的区间。返回（可能是
+    /// 复制后的）页 id；若整个子树都落在区间内则返回 0，且
+    /// 其页面进入了空闲列表。</summary>
     int PruneNode(int pageId, string startKey, string endKey, int mode,
             List<int> removed) {
         BNode node = ReadNode(pageId);
@@ -776,8 +776,8 @@ class BTree {
         int lo = BTree.ChildIndex(node, startKey);
         int hi = node.children.Count - 1;
         if (mode == BTree.MATCH_PREFIX) {
-            // Separators are keys, so a child may hold the prefix as long as
-            // the separator that opens it still starts with (or is below) it.
+            // 分隔符也是键，因此只要
+            // 打开它的分隔符仍以该前缀开头（或小于它），子节点就能持有该前缀。
             hi = lo;
             while (hi + 1 < node.children.Count
                     && BTree.InRange(node.keys[hi], startKey, endKey, mode)) {
@@ -800,9 +800,9 @@ class BTree {
         }
         if (!changed) { return pageId; }
 
-        // Rebuild the node keeping the children that survived. keys[i] is the
-        // lower bound of children[i], so a surviving child keeps the separator
-        // that precedes it -- everything between two survivors is gone.
+        // 重建节点，只保留存活的子节点。keys[i] 是
+        // children[i] 的下界，因此存活的子节点保留其前面的
+        // 分隔符——两个存活子节点之间的内容已全部删除。
         BNode n = NodeForWrite(pageId);
         List<int> keptChildren = new List<int>();
         List<string> keptKeys = new List<string>();
@@ -824,12 +824,12 @@ class BTree {
         return WriteNodeCow(pageId, n);
     }
 
-    // ===== Range scan =====
+    // ===== 区间扫描 =====
 
-    /// <summary>Collects up to limit entries with startKey &lt;= key &lt;= endKey
-    /// (endKey "" = unbounded) into output. Walks the tree with a cursor
-    /// stack: under copy-on-write a leaf cannot keep a pointer to its sibling,
-    /// since inserting there would have to rewrite the left neighbour too.</summary>
+    /// <summary>收集最多 limit 条满足 startKey &lt;= key &lt;= endKey 的条目
+    /// （endKey "" 表示无上限）写入 output。用游标栈遍历树：
+    /// 在写时复制下，叶子节点无法保留指向兄弟节点的指针，
+    /// 因为在那里插入就必须同时重写左侧邻居。</summary>
     int Scan(string startKey, string endKey, int limit, List<KvEntry> output) {
         Sync();
         List<int> stackIds = new List<int>();
@@ -856,8 +856,8 @@ class BTree {
                 if (limit > 0 && found >= limit) { return found; }
                 i = i + 1;
             }
-            // Next leaf: climb until a parent has another child, then descend
-            // its leftmost path.
+            // 下一个叶子：向上爬直到某个父节点还有另一个子节点，然后沿
+            // 其最左路径下行。
             bool advanced = false;
             while (stackIds.Count > 0) {
                 int lv = stackIds.Count - 1;
@@ -885,8 +885,8 @@ class BTree {
         return found;
     }
 
-    /// <summary>Total number of keys. Walks the tree but only reads the entry
-    /// count out of each leaf header, so values are never decoded.</summary>
+    /// <summary>键的总数。遍历整棵树，但只读取每个叶子头部的
+    /// 条目计数，因此值永远不会被解码。</summary>
     int Count() {
         Sync();
         return CountNode(RootId());

@@ -5,14 +5,14 @@ using System.Threading;
 namespace System.Data.ZanDb;
 
 /// <summary>
-/// Random-access page-granular file used by the ZanDB storage engine.
+/// ZanDB 存储引擎使用的随机访问、页粒度的文件。
 ///
-/// All reads and writes are positional (pread/pwrite on POSIX, seek+read on
-/// the file descriptor on Windows): they do not depend on a shared file
-/// position, so several database handles -- and several processes -- can work
-/// on the same file without stepping on each other's offsets. The stdio
-/// FILE* is only used to create/open the file portably; no buffered stdio
-/// read/write is ever issued, so fd-level IO and fsync see everything.
+/// 所有读写都是定位式的（POSIX 上为 pread/pwrite，Windows 上为
+/// 文件描述符上的 seek+read）：它们不依赖共享的文件
+/// 位置，因此多个数据库句柄——以及多个进程——可以在同一文件上
+/// 工作而不互相踩踏偏移量。stdio
+/// FILE* 仅用于可移植地创建/打开文件；从不发出缓冲的 stdio
+/// 读写，因此 fd 级别的 IO 和 fsync 能看到一切。
 ///
 ///   PageFile f = PageFile.Open("data.zdb");
 ///   ByteBuffer page = ByteBuffer.Alloc(4096);
@@ -22,8 +22,8 @@ namespace System.Data.ZanDb;
 ///   f.Close();
 /// </summary>
 class PageFile {
-    /// <summary>How long <see cref="LockExclusive"/> waits for the current
-    /// holder before it reports failure.</summary>
+    /// <summary><see cref="LockExclusive"/> 在报告失败前等待当前持有者
+    /// 多久。</summary>
     static int LOCK_TIMEOUT_MS = 60000;
 
     nint fp;
@@ -53,9 +53,9 @@ class PageFile {
     [DllImport("crt", EntryPoint = "_write")]
     static extern int WriteFd(int fd, nint buf, int count);
 
-    // _locking() locks a byte range starting at the current file position;
-    // mode 1 (_LK_LOCK) blocks (retrying for ~10s), 2 (_LK_NBLCK) fails fast,
-    // 0 (_LK_UNLCK) releases.
+    // _locking() 从当前文件位置开始锁定一个字节范围；
+    // 模式 1（_LK_LOCK）阻塞（约重试 10 秒），2（_LK_NBLCK）快速失败，
+    // 0（_LK_UNLCK）释放锁。
     [DllImport("crt", EntryPoint = "_locking")]
     static extern int LockFd(int fd, int mode, int length);
     #else
@@ -86,7 +86,7 @@ class PageFile {
         this.lastError = "";
     }
 
-    /// <summary>Opens (or creates) a file for random read/write access.</summary>
+    /// <summary>为随机读写打开（或创建）一个文件。</summary>
     static PageFile Open(string path) {
         PageFile f = new PageFile();
         f.path = path;
@@ -106,8 +106,8 @@ class PageFile {
 
     string GetError() { return this.lastError; }
 
-    /// <summary>Reads count bytes at offset into buf (cleared first).
-    /// Returns the number of bytes actually read.</summary>
+    /// <summary>从 offset 处读取 count 字节到 buf（先清空 buf）。
+    /// 返回实际读取的字节数。</summary>
     int ReadAt(long offset, ByteBuffer buf, int count) {
         if (this.fp == 0) { return -1; }
         buf.Clear();
@@ -118,7 +118,7 @@ class PageFile {
         return n;
     }
 
-    /// <summary>Positional read into a raw block.</summary>
+    /// <summary>定位读取到原始块中。</summary>
     int ReadRaw(long offset, nint raw, int count) {
         if (this.fp == 0) { return -1; }
         #if WINDOWS
@@ -132,8 +132,8 @@ class PageFile {
         #endif
     }
 
-    /// <summary>Writes count bytes from a raw block at offset.
-    /// Returns bytes written.</summary>
+    /// <summary>从原始块向 offset 处写入 count 字节。
+    /// 返回写入的字节数。</summary>
     int WriteAt(long offset, nint raw, int count) {
         if (this.fp == 0) { return -1; }
         #if WINDOWS
@@ -147,8 +147,8 @@ class PageFile {
         #endif
     }
 
-    /// <summary>Appends count bytes at end of file; returns the offset the
-    /// data landed at, or -1 on error.</summary>
+    /// <summary>在文件末尾追加 count 字节；返回数据落盘的偏移量，
+    /// 出错时返回 -1。</summary>
     long Append(nint raw, int count) {
         if (this.fp == 0) { return -1; }
         long end = Size();
@@ -157,33 +157,33 @@ class PageFile {
         return end;
     }
 
-    /// <summary>Current file size in bytes.</summary>
+    /// <summary>当前文件大小（字节）。</summary>
     long Size() {
         if (this.fp == 0) { return -1; }
         return SeekFd(this.fd, 0, 2);
     }
 
-    /// <summary>Buffered-write flush; positional IO is unbuffered, so this is
-    /// only kept for API compatibility.</summary>
+    /// <summary>缓冲写入的 flush；定位 IO 无缓冲，因此该方法
+    /// 仅为 API 兼容而保留。</summary>
     void Flush() { }
 
-    /// <summary>Forces written data to stable storage. Returns true on
-    /// success.</summary>
+    /// <summary>将写入的数据强制落盘到稳定存储。成功时返回 true
+    /// 成功。</summary>
     bool Sync() {
         if (this.fp == 0) { return false; }
         return SyncFd(this.fd) == 0;
     }
 
-    /// <summary>Takes an exclusive whole-file lock, waiting for the current
-    /// holder. The lock is released by the operating system if the process
-    /// dies, so a crashed writer cannot wedge the database.</summary>
+    /// <summary>获取整个文件的独占锁，等待当前
+    /// 持有者释放。若进程
+    /// 退出，锁由操作系统释放，因此崩溃的写入者不会卡死数据库。</summary>
     bool LockExclusive() {
         if (this.fp == 0) { return false; }
         #if WINDOWS
         if (SeekFd(this.fd, 0, 0) < 0) { return false; }
-        // _LK_NBLCK in a spin loop rather than _LK_LOCK: _LK_LOCK sleeps a
-        // whole second between its own retries, so a writer that commits in
-        // milliseconds would hand the lock to a waiter only once per second.
+        // 用 _LK_NBLCK 自旋而非 _LK_LOCK：_LK_LOCK 会在
+        // 每次重试之间睡一整秒，因此毫秒级提交的写入者
+        // 每秒只能把锁交给等待者一次。
         for (int waited = 0; waited < PageFile.LOCK_TIMEOUT_MS; waited = waited + 1) {
             if (LockFd(this.fd, 2, 1) == 0) { return true; }
             Thread.Sleep(1);

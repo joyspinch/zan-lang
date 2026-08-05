@@ -1,0 +1,150 @@
+using System;
+using System.Json;
+using System.Web;
+using ZanWeb;
+
+namespace ZanWeb.Admin.Dev;
+
+/// One agent as the panel needs it.
+class AiAgentDoc {
+    string code;
+    string name;
+    string hint;
+    string icon;
+    bool apply;
+}
+
+/// Whether a key is configured, and the agents to offer.
+class AiStateDoc {
+    bool ready;
+    List<AiAgentDoc> agents;
+}
+
+/// A model's answer.
+class AiTextDoc {
+    string text;
+}
+
+/// The model ids a provider offers.
+class AiModelsDoc {
+    List<string> models;
+}
+
+/// <summary>
+/// The docked assistant's endpoints. It answers what the panel needs: is the
+/// assistant configured and which agents exist (state), what does the model say
+/// to a conversation (chat), which models a provider offers (models), and -- only
+/// after the operator confirms -- run a table the assistant proposed (apply).
+///
+/// The key never leaves the server. /admin/dev/ai/state reports only whether one is
+/// set, so an unconfigured assistant sends the operator to the settings screen
+/// instead of opening a chat that could not answer. apply is the single place an
+/// answer touches the database, and it is guarded and needs an explicit confirm.
+/// </summary>
+[Route("admin/dev/ai/[action]")]
+[Custom(Authorization = CustomAuthorization.Grant)]
+[Description("AI 助手")]
+class Assistant : AdminController {
+    [HttpGet]
+    [Description("助手状态")]
+    async void State() {
+        if (await this.Admin() == null) { this.Fail(401, "1001", "未登录"); }
+        AiStateDoc doc = new AiStateDoc();
+        doc.ready = await Ai.Ready();
+        doc.agents = new List<AiAgentDoc>();
+        List<AiAgent> agents = Ai.Agents();
+        for (int i = 0; i < agents.Count; i = i + 1) {
+            AiAgent a = agents[i];
+            AiAgentDoc d = new AiAgentDoc();
+            d.code = a.code;
+            d.name = a.name;
+            d.hint = a.hint;
+            d.icon = a.icon;
+            d.apply = a.apply;
+            doc.agents.Add(d);
+        }
+        this.Ok(Json.Serialize<AiStateDoc>(doc));
+    }
+
+    [HttpPost]
+    [Description("与助手对话")]
+    async void Chat() {
+        if (await this.Admin() == null) { this.Fail(401, "1001", "未登录"); }
+        string question = this.Need("q", "内容");
+        string agent = this.In("agent");
+        // The browser keeps the thread and sends it back so the assistant has the
+        // context of the conversation, not just the last line.
+        string history = this.In("history");
+        if (history.Length == 0) { history = "[]"; }
+        AiReply r = await Ai.AskConv(agent, history, question);
+        if (!r.ok) { this.Fail(400, "0005", r.text); }
+        this.Ok(Assistant.TextDoc(r.text));
+    }
+
+    /// <summary>The same conversation, streamed: the panel shows the answer as
+    /// it is written instead of waiting for the whole completion. The reply is a
+    /// text/event-stream of `delta` events and one terminal `done` (or `error`),
+    /// so the browser needs no polling and the server holds one connection.
+    /// A stream is not timed by the metrics -- it is counted by the frames it
+    /// pushed (see WebApp.Dispatch).</summary>
+    [HttpPost]
+    [Description("与助手对话（流式）")]
+    async void Stream() {
+        if (await this.Admin() == null) { this.Fail(401, "1001", "未登录"); }
+        string question = this.Need("q", "内容");
+        string agent = this.In("agent");
+        string history = this.In("history");
+        if (history.Length == 0) { history = "[]"; }
+
+        HttpContext ctx = this.Ctx();
+        if (!await ctx.SseOpen()) { return; }
+        AiReply r = await Ai.StreamConv(ctx, agent, history, question);
+        if (!r.ok) {
+            bool _e = await ctx.SseSend("error", Assistant.TextDoc(r.text));
+            return;
+        }
+        bool _d = await ctx.SseSend("done", Assistant.TextDoc(r.text));
+    }
+
+    /// <summary>The models a provider offers, so the operator picks one instead
+    /// of typing the exact id. The base URL and key come from the settings form
+    /// as typed (the key falls back to the stored one), and the key is used only
+    /// to make this one server-side call -- it is never returned.</summary>
+    [HttpPost]
+    [Description("获取模型列表")]
+    async void Models() {
+        string baseUrl = this.In("baseUrl");
+        if (baseUrl.Length == 0) { baseUrl = await Settings.Get(SettingKeys.AiBaseUrl, ""); }
+        string key = this.In("apiKey");
+        if (key.Length == 0 || key == "-") { key = await Settings.Get(SettingKeys.AiApiKey, ""); }
+        if (baseUrl.Length == 0) { this.Fail(400, "0004", "请先填写接口地址"); }
+        AiModelsDoc doc = new AiModelsDoc();
+        doc.models = await Ai.Models(baseUrl, key);
+        this.Ok(Json.Serialize<AiModelsDoc>(doc));
+    }
+
+    /// <summary>Runs a CREATE TABLE the assistant proposed. It is reached only
+    /// with the migrate permission and only when the operator has confirmed, and
+    /// Ai.ApplySchema still rejects anything that is not a single CREATE.</summary>
+    [HttpPost]
+    [Description("确认执行建表")]
+    async void Apply() {
+        string sql = this.Need("sql", "建表语句");
+        if (this.In("confirm") != "1") {
+            this.Fail(400, "0004", "需要确认后才能执行");
+        }
+        AiReply r = await Ai.ApplySchema(sql);
+        await this.Note("AI 建表", "", r.ok, r.text);
+        if (!r.ok) { this.Fail(400, "0005", r.text); }
+        this.Ok(Assistant.TextDoc(r.text));
+    }
+
+    /// <summary>{"text": ...} through the JSON writer, so an answer carrying
+    /// quotes or newlines is escaped by the same code as every other response
+    /// instead of by hand at each call site.</summary>
+    static string TextDoc(string text) {
+        AiTextDoc d = new AiTextDoc();
+        d.text = text;
+        return Json.Serialize<AiTextDoc>(d);
+    }
+}

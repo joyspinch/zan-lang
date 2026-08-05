@@ -11,7 +11,7 @@
 #if defined(_WIN32)
 #define ZAN_SDL_API __declspec(dllexport)
 #else
-#define ZAN_SDL_API __attribute__((visibility("default")))
+#define ZAN_SDL_API __attribute__((visibility("默认")))
 #endif
 
 typedef int32_t zan_i32;
@@ -193,6 +193,47 @@ ZAN_SDL_API zan_i32 zan_sdl_present(zan_iptr renderer) {
     return renderer ? zan_bool(SDL_RenderPresent((SDL_Renderer *)zan_ptr(renderer))) : 0;
 }
 
+/* Read the renderer's pixels back 到 a caller-supplied RGBA 缓冲区. Writes
+ * 宽度*高度*4 bytes. 返回 1 on 成功, 0 on failure. */
+ZAN_SDL_API zan_i32 zan_sdl_read_pixels(zan_iptr renderer, zan_iptr out_rgba, zan_i32 width, zan_i32 height) {
+    if (!renderer || !out_rgba || width <= 0 || height <= 0) return 0;
+    SDL_Surface *surface = SDL_RenderReadPixels((SDL_Renderer *)zan_ptr(renderer), NULL);
+    if (!surface) return 0;
+    if (surface->format != SDL_PIXELFORMAT_RGBA32) {
+        SDL_Surface *conv = SDL_ConvertSurface(surface, SDL_PIXELFORMAT_RGBA32);
+        SDL_DestroySurface(surface);
+        if (!conv) return 0;
+        surface = conv;
+    }
+    int cw = surface->w, ch = surface->h;
+    int n = width * height;
+    if (cw != width || ch != height) {
+        SDL_DestroySurface(surface);
+        return 0;
+    }
+    if (surface->pitch == width * 4) {
+        memcpy((void *)(intptr_t)out_rgba, surface->pixels, (size_t)n * 4);
+    } else {
+        const unsigned char *src = (const unsigned char *)surface->pixels;
+        unsigned char *dst = (unsigned char *)(intptr_t)out_rgba;
+        for (int y = 0; y < height; y++) {
+            memcpy(dst + (size_t)y * width * 4, src + (size_t)y * surface->pitch,
+                   (size_t)width * 4);
+        }
+    }
+    SDL_DestroySurface(surface);
+    return 1;
+}
+
+/* Current 渲染 target / backbuffer 尺寸 in pixels, packed as (h<<16)|w.
+ * 0 when the renderer is unusable. */
+ZAN_SDL_API zan_i32 zan_sdl_render_output_size(zan_iptr renderer) {
+    if (!renderer) return 0;
+    int w = 0, h = 0;
+    if (!SDL_GetRenderOutputSize((SDL_Renderer *)zan_ptr(renderer), &w, &h)) return 0;
+    return ((h & 0xFFFF) << 16) | (w & 0xFFFF);
+}
+
 ZAN_SDL_API zan_i32 zan_sdl_draw_point(zan_iptr renderer, zan_i32 x, zan_i32 y) {
     return renderer
         ? zan_bool(SDL_RenderPoint((SDL_Renderer *)zan_ptr(renderer), (float)x, (float)y))
@@ -347,12 +388,12 @@ ZAN_SDL_API zan_i32 zan_sdl_render_texture(
         &dst));
 }
 
-/* ---- 2D render backend extensions (render targets, blend, clip) ----
+/* ---- 2D 渲染 backend extensions (渲染 targets, blend, clip) ----
  * These thin wrappers expose the SDL_Renderer features a GPU-accelerated GUI
- * canvas needs: offscreen render targets (for downsample blur), source-region
- * texture draws (atlas/scaled blit), scissor clipping and blend modes. They
- * work on every SDL_Renderer backend (D3D11/D3D12/Metal/Vulkan/OpenGL) with no
- * custom shaders, so the cross-platform GPU path is active today. */
+ * 画布 needs: offscreen 渲染 targets (for downsample blur), source-region
+ * texture 绘制 (atlas/scaled blit), scissor clipping and blend modes. They
+ * work on every SDL_Renderer backend (D3D11/D3D12/Metal/Vulkan/OpenGL) 带有 no
+ * custom shaders, so the cross-platform GPU 路径 is active today. */
 
 static SDL_BlendMode zan_blend_mode(zan_i64 mode) {
     if (mode == 0) return SDL_BLENDMODE_NONE;
@@ -520,23 +561,23 @@ ZAN_SDL_API zan_i32 zan_sdl_key_down(zan_i32 scancode) {
 /* ===================================================================
  * SDL_GPU sprite-batch renderer.
  *
- * Higher-level Game.Core/Game.Render code binds these through
+ * Higher-level Game.Core/Game.Render code binds these 通过
  * [DllImport("zan_sdl3")]. The frame model is:
- *   ctx = zan_gpu_create(window)
+ *   ctx = zan_gpu_create(窗口)
  *   loop:
  *     zan_gpu_begin(ctx, clear rgba)
  *     zan_gpu_draw(ctx, tex, dst rect, uv rect, tint rgba)  // batched
  *     zan_gpu_end(ctx)                                       // upload+submit
  *
- * Draws are accumulated on the CPU and flushed in one render pass, grouped
- * into runs of the same texture to minimize state changes. Vertex positions
+ * Draws are accumulated on the CPU and flushed in one 渲染 pass, grouped
+ * 到 runs of 相同的 texture to minimize state changes. Vertex positions
  * are in framebuffer pixels; the shader maps them to NDC via the drawable
- * size pushed as a vertex uniform.
+ * 尺寸 pushed as a vertex uniform.
  *
- * Shaders are provided as Metal Shading Language, so the GPU path is active
+ * Shaders are provided as Metal Shading Language, so the GPU 路径 is active
  * on the Metal backend today. SPIR-V (Vulkan/Linux) and DXIL (D3D12/Windows)
- * variants can be added to enable those backends; until then zan_gpu_create
- * returns 0 on non-Metal drivers and callers fall back to the 2D renderer.
+ * variants 可以是 added to enable those backends; until then zan_gpu_create
+ * 返回 0 on non-Metal drivers and callers fall back to the 2D renderer.
  * =================================================================== */
 
 static const char *ZAN_GPU_VS_MSL =
@@ -563,7 +604,7 @@ static const char *ZAN_GPU_FS_MSL =
 
 typedef struct { float x, y, u, v, r, g, b, a; } ZanGpuVertex;
 typedef struct { SDL_GPUTexture *tex; int first; int count; } ZanGpuDraw;
-/* A loaded texture carries its pixel size so draws can specify source
+/* A loaded texture carries its pixel 尺寸 so 绘制 can specify source
  * rectangles in pixels (atlas-friendly) and the bridge derives UVs. */
 typedef struct { SDL_GPUTexture *tex; int w, h; } ZanGpuTex;
 
@@ -582,8 +623,8 @@ typedef struct {
     SDL_GPUTexture *swap;            /* per-frame swapchain image */
     Uint32 fb_w, fb_h;
     float cr, cg, cb, ca;
-    /* Offscreen mode: render into a fixed target and read pixels back on the
-     * CPU. Enables headless GPU verification with no window/display server. */
+    /* Offscreen 模式: 渲染 到 a fixed target and 读取 pixels back on the
+     * CPU. Enables headless GPU verification 带有 no 窗口/display server. */
     int offscreen;
     SDL_GPUTexture *offtex;
     SDL_GPUTransferBuffer *readbuf;
@@ -602,7 +643,7 @@ static SDL_GPUShader *zan_gpu_shader(
     return SDL_CreateGPUShader(dev, &ci);
 }
 
-/* Build the sprite pipeline for the given color target format (swapchain
+/* Build the sprite pipeline 用于 given 颜色 target format (swapchain
  * format for windowed contexts, R8G8B8A8 for offscreen). */
 static SDL_GPUGraphicsPipeline *zan_gpu_make_pipeline(
     SDL_GPUDevice *dev, SDL_GPUTextureFormat fmt) {
@@ -687,7 +728,7 @@ ZAN_SDL_API zan_iptr zan_gpu_create(zan_iptr window) {
     return zan_handle(ctx);
 }
 
-/* Windowless GPU context that renders into a WxH target read back on the CPU;
+/* Windowless GPU context that 渲染 到 a WxH target 读取 back on the CPU;
  * for headless verification and offscreen composition. */
 ZAN_SDL_API zan_iptr zan_gpu_create_offscreen(zan_i32 width, zan_i32 height) {
     if (width <= 0 || height <= 0) return 0;
@@ -717,7 +758,7 @@ ZAN_SDL_API zan_iptr zan_gpu_create_offscreen(zan_i32 width, zan_i32 height) {
     return zan_handle(ctx);
 }
 
-/* Read one pixel from the last offscreen frame, packed as 0xRRGGBBAA. */
+/* Read one pixel 从 the 最后一个 offscreen frame, packed as 0xRRGGBBAA. */
 ZAN_SDL_API zan_i32 zan_gpu_read_pixel(zan_iptr handle, zan_i32 x, zan_i32 y) {
     ZanGpuCtx *ctx = (ZanGpuCtx *)zan_ptr(handle);
     if (!ctx || !ctx->offscreen || !ctx->cpu) return 0;
@@ -741,7 +782,7 @@ ZAN_SDL_API void zan_gpu_destroy(zan_iptr handle) {
     SDL_free(ctx->cpu); SDL_free(ctx->verts); SDL_free(ctx->draws); SDL_free(ctx);
 }
 
-/* Create a sampler texture from tightly packed RGBA32 pixels. */
+/* Create a sampler texture 从 tightly packed RGBA32 pixels. */
 static SDL_GPUTexture *zan_gpu_make_texture(
     ZanGpuCtx *ctx, int width, int height, const void *pixels) {
     if (!ctx || !pixels || width <= 0 || height <= 0) return NULL;
@@ -795,7 +836,7 @@ ZAN_SDL_API zan_iptr zan_gpu_load_texture(zan_iptr handle, zan_i32 width, zan_i3
                         (int)width, (int)height);
 }
 
-/* Solid white WxH texture; tint it via zan_gpu_draw color to get any color. */
+/* Solid white WxH texture; tint it via zan_gpu_draw 颜色 to 获取 any 颜色. */
 ZAN_SDL_API zan_iptr zan_gpu_solid_texture(zan_iptr handle, zan_i32 width, zan_i32 height) {
     ZanGpuCtx *ctx = (ZanGpuCtx *)zan_ptr(handle);
     if (!ctx || width <= 0 || height <= 0) return 0;
@@ -807,7 +848,7 @@ ZAN_SDL_API zan_iptr zan_gpu_solid_texture(zan_iptr handle, zan_i32 width, zan_i
     return zan_gpu_wrap(tex, (int)width, (int)height);
 }
 
-/* Load a BMP file as an RGBA sampler texture. */
+/* Load a BMP 文件 as an RGBA sampler texture. */
 ZAN_SDL_API zan_iptr zan_gpu_load_bmp(zan_iptr handle, const char *path) {
     ZanGpuCtx *ctx = (ZanGpuCtx *)zan_ptr(handle);
     if (!ctx || !path) return 0;
@@ -898,7 +939,7 @@ static void zan_gpu_push_vertex(
 }
 
 /* Draw texture region (sx,sy,sw,sh in source pixels; sw<=0 means whole
- * texture) into the destination rect (dx,dy,dw,dh in framebuffer pixels),
+ * texture) 到 the destination rect (dx,dy,dw,dh in framebuffer pixels),
  * multiplied by the r,g,b,a tint (0-255). */
 ZAN_SDL_API void zan_gpu_draw(
     zan_iptr handle, zan_iptr texture, zan_i32 dx, zan_i32 dy, zan_i32 dw,
@@ -958,7 +999,7 @@ ZAN_SDL_API void zan_gpu_end(zan_iptr handle) {
             ctx->vbuf = SDL_CreateGPUBuffer(ctx->device, &bci);
         }
         Uint32 bytes = (Uint32)(ctx->vcount * (int)sizeof(ZanGpuVertex));
-        /* Reuse the staging buffer across frames; only grow it when a frame
+        /* Reuse the staging 缓冲区 跨越 frames; 仅 grow it when a frame
          * needs more room. Creating/releasing one per frame churned GPU driver
          * allocations for every game. */
         if (bytes > ctx->upbuf_cap) {

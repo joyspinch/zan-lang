@@ -3,54 +3,54 @@ using System;
 namespace System.Scripting;
 
 /// <summary>
-/// In-process CPython embedding for Zan.
+/// Zan 的进程内 CPython 嵌入。
 ///
-/// The runtime DLL is located and every entry point is resolved at run time
-/// through <see cref="Interop"/> (LoadLibrary/GetProcAddress), so programs
-/// that never touch <c>System.Scripting</c> do not link against Python and a
-/// machine without Python simply reports <see cref="Python.IsAvailable"/>
-/// == false instead of failing to load. This mirrors how the stdlib treats
-/// SDL3 and other optional native dependencies.
+/// 运行时定位 runtime DLL，并通过 <see cref="Interop"/>
+/// （LoadLibrary/GetProcAddress）在运行期解析所有入口点，因此
+/// 从未用到 <c>System.Scripting</c> 的程序不会链接 Python；
+/// 没有 Python 的机器只会得到 <see cref="Python.IsAvailable"/>
+/// == false，而不是加载失败。这与 stdlib 对待
+/// SDL3 等其他可选原生依赖的方式一致。
 ///
 ///   using System.Scripting;
 ///
 ///   if (!Python.IsAvailable()) { ... fall back ... }
 ///   Python.Initialize();
 ///
-///   // Direct calls with automatic double/string marshalling:
+///   // 直接调用，自动封送 double/string：
 ///   double v = Python.CallD("math.floor", 22.3);
 ///   string s = Python.CallS("greet", "Zan");
 ///
-///   // Expressions and module-level access:
+///   // 表达式与模块级访问：
 ///   Python.Exec("answer = 6 * 7");
 ///   PyObject r = Python.Eval("[x * x for x in range(4)]");
 ///   List<double> squares = r.ToListDouble();        // [0, 1, 4, 9]
 ///
-///   // Object-style calls with explicit marshalling:
+///   // 对象式调用，显式封送：
 ///   PyObject math = Python.Import("math");
 ///   double f = math.GetAttr("floor").Call1(Python.FromDouble(22.3)).ToDouble();
 ///
-///   // Containers cross the border both ways:
+///   // 容器可双向跨边界：
 ///   PyObject pyList = Python.FromListStr(new List<string>{ "a", "b" });
 ///   Dictionary<string, PyObject> pyDict = Python.Eval("{'k': 1}").ToDict();
 ///
-/// Callbacks run the other way with <see cref="Python.RegisterFunction"/>:
-/// a static, non-capturing Zan method is wrapped in a PyCFunction and
-/// published on the __main__ module, so Python code can invoke Zan code.
+/// 回调反向运行，通过 <see cref="Python.RegisterFunction"/>：
+/// 静态、非捕获的 Zan 方法被包装为 PyCFunction，
+/// 并发布到 __main__ 模块，使 Python 代码可以调用 Zan 代码。
 ///
-/// Reference counting: a <see cref="PyObject"/> owns a strong reference
-/// (Py_INCREF) to its PyObject* and releases it (Py_DECREF) in its
-/// finalizer, so ARC reclaims Python objects exactly when the last Zan
-/// reference disappears. Borrowed references (e.g. tuple items from
-/// <see cref="Python.GetArg"/>) are read directly and never wrapped.
+/// 引用计数：<see cref="PyObject"/> 持有其 PyObject* 的强引用
+/// （Py_INCREF），并在 finalizer 中释放（Py_DECREF），
+/// 因此 ARC 恰好在最后一个 Zan
+/// 引用消失时回收 Python 对象。借用引用（如来自
+/// <see cref="Python.GetArg"/> 的元组项）直接读取，从不包装。
 ///
-/// Threading: the GIL is held for the duration of every call made through
-/// this module. Calling into Python from a non-initializing thread is safe
-/// as long as the interpreter has been initialized once. For heavy use,
-/// release the GIL around long-running Zan computation (planned).
+/// 线程：每次经本模块的调用期间都持有 GIL。
+/// 只要解释器已初始化过一次，从非初始化线程调用 Python 就是安全的。
+/// 重度使用时，计划在长时间运行的 Zan 计算
+/// 期间释放 GIL（规划中）。
 /// </summary>
 class Python {
-    // ---- resolved symbol addresses (0 until Initialize) -------------------
+    // ---- 已解析的符号地址（Initialize 前为 0）--------------------
     static nint mod;
     static nint addr_init;
     static nint addr_isInit;
@@ -94,17 +94,17 @@ class Python {
     static bool resolved;
     static bool initialized;
 
-    // PyCFunction_New stores the PyMethodDef *pointer* (it does not copy),
-    // so every def and its name buffer must outlive the callable. Cache them
-    // here and release them all in Finalize.
+    // PyCFunction_New 存储的是 PyMethodDef *指针*（不会复制），
+    // 所以每个 def 及其名称缓冲区必须比 callable 活得更久。把它们
+    // 缓存在这里，并在 Finalize 中统一释放。
     static List<PyRegisteredDef> registeredDefs;
 
-    /// <summary>True when a usable CPython DLL can be loaded.</summary>
+    /// <summary>可加载可用的 CPython DLL 时为 true。</summary>
     static bool IsAvailable() {
         return Python.TryResolve();
     }
 
-    /// <summary>True after <see cref="Initialize"/> has run.</summary>
+    /// <summary><see cref="Initialize"/> 运行过后为 true。</summary>
     static bool IsInitialized() {
         if (!Python.resolved) { return false; }
         PyIntFn f = (PyIntFn)Python.addr_isInit;
@@ -112,8 +112,8 @@ class Python {
     }
 
     /// <summary>
-    /// Loads the newest available CPython (python3xx.dll) and initializes the
-    /// interpreter. Idempotent. Throws when no Python runtime is present.
+    /// 加载可用的最新 CPython（python3xx.dll）并初始化
+    /// 解释器。幂等。没有 Python 运行时则抛出异常。
     /// </summary>
     static void Initialize() {
         if (Python.initialized) { return; }
@@ -127,9 +127,9 @@ class Python {
     }
 
     /// <summary>
-    /// Loads a specific CPython DLL (e.g. "C:/Python311/python311.dll") and
-    /// initializes the interpreter. Call instead of <see cref="Initialize"/>
-    /// when Python is not on the PATH.
+    /// 加载指定的 CPython DLL（如 "C:/Python311/python311.dll"）并
+    /// 初始化解释器。当 Python 不在 PATH 中时，请调用它而不是
+    /// <see cref="Initialize"/>。
     /// </summary>
     static void LoadPath(string dllPath) {
         Python.FreeModule();
@@ -145,7 +145,7 @@ class Python {
         Python.initialized = true;
     }
 
-    /// <summary>Shuts the interpreter down (releases the runtime DLL).</summary>
+    /// <summary>关闭解释器（释放 runtime DLL）。</summary>
     static void Finalize() {
         if (Python.resolved && Python.addr_finalize != 0) {
             PyVoidFn f = (PyVoidFn)Python.addr_finalize;
@@ -162,7 +162,7 @@ class Python {
         Python.FreeModule();
     }
 
-    /// <summary>Executes Python code in the __main__ module's namespace.</summary>
+    /// <summary>在 __main__ 模块的命名空间中执行 Python 代码。</summary>
     static void Exec(string code) {
         Python.EnsureReady();
         PyIntStrFn f = (PyIntStrFn)Python.addr_runSimple;
@@ -175,10 +175,10 @@ class Python {
     }
 
     /// <summary>
-    /// Evaluates a Python expression in the __main__ namespace and returns the
-    /// result (e.g. <c>Python.Eval("[x * x for x in range(4)]")</c>). Uses
-    /// PyRun_String with Py_eval_input; the expression may reference names
-    /// defined by <see cref="Exec"/>.
+    /// 在 __main__ 命名空间中求值 Python 表达式并返回
+    /// 结果（如 <c>Python.Eval("[x * x for x in range(4)]")</c>）。使用
+    /// PyRun_String 与 Py_eval_input；表达式可引用
+    /// <see cref="Exec"/> 定义的名称。
     /// </summary>
     static PyObject Eval(string code) {
         Python.EnsureReady();
@@ -190,7 +190,7 @@ class Python {
             throw new InvalidOperationException("Python Eval 失败:无法访问 __main__");
         }
         PyNint1Fn getDict = (PyNint1Fn)Python.addr_moduleGetDict;
-        nint globals = getDict(mainMod);        // borrowed
+        nint globals = getDict(mainMod);        // 借用引用
         PyRunStringFn run = (PyRunStringFn)Python.addr_runString;
         nint h = run(code, 258, globals, globals);   // Py_eval_input
         Python.DecRef(mainMod);
@@ -202,7 +202,7 @@ class Python {
         return PyObject.Wrap(h);
     }
 
-    /// <summary>Imports a Python module (e.g. "math", "os.path").</summary>
+    /// <summary>导入 Python 模块（如 "math"、"os.path"）。</summary>
     static PyObject Import(string name) {
         Python.EnsureReady();
         PyNintStrFn f = (PyNintStrFn)Python.addr_importModule;
@@ -215,17 +215,17 @@ class Python {
         return PyObject.Wrap(h);
     }
 
-    /// <summary>The __main__ module (where <see cref="Exec"/> defines names).</summary>
+    /// <summary>__main__ 模块（<see cref="Exec"/> 在其中定义名称）。</summary>
     static PyObject GetMain() {
         return Python.Import("__main__");
     }
 
     /// <summary>
-    /// Calls a function with any number of arguments. The name may be dotted
-    /// (<c>"math.floor"</c>, <c>"os.path.join"</c>). The first segment is
-    /// tried as an import (so <c>"math.floor"</c> works without an explicit
-    /// <c>import math</c>); otherwise it is looked up on __main__:
-    /// <c>Python.Call("math.floor", Python.FromDouble(2.5))</c>.
+    /// 以任意数量的参数调用函数。名称可以是点分形式
+    /// （<c>"math.floor"</c>、<c>"os.path.join"</c>）。第一段会
+    /// 尝试作为 import（因此 <c>"math.floor"</c> 无需显式
+    /// <c>import math</c>）；否则在 __main__ 上查找：
+    /// <c>Python.Call("math.floor", Python.FromDouble(2.5))</c>。
     /// </summary>
     static PyObject Call(string name, params PyObject[] args) {
         List<string> parts = name.Split(".");
@@ -245,7 +245,7 @@ class Python {
         return obj.Call(args);
     }
 
-    /// <summary>Imports a module, or a null PyObject when it does not exist.</summary>
+    /// <summary>导入模块，不存在时返回 null PyObject。</summary>
     static PyObject TryImport(string name) {
         if (!Python.resolved) { return PyObject.Wrap(0); }
         PyNintStrFn f = (PyNintStrFn)Python.addr_importModule;
@@ -254,7 +254,7 @@ class Python {
         return PyObject.Wrap(h);
     }
 
-    /// <summary>Call + double marshalling: <c>Python.CallD("math.floor", 2.5)</c>.</summary>
+    /// <summary>Call + double 封送：<c>Python.CallD("math.floor", 2.5)</c>。</summary>
     static double CallD(string name, params double[] args) {
         List<PyObject> py = new List<PyObject>();
         for (int i = 0; i < args.Count; i = i + 1) {
@@ -263,7 +263,7 @@ class Python {
         return Python.Call(name, py).ToDouble();
     }
 
-    /// <summary>Call + string marshalling: <c>Python.CallS("greet", "Zan")</c>.</summary>
+    /// <summary>Call + string 封送：<c>Python.CallS("greet", "Zan")</c>。</summary>
     static string CallS(string name, params string[] args) {
         List<PyObject> py = new List<PyObject>();
         for (int i = 0; i < args.Count; i = i + 1) {
@@ -272,7 +272,7 @@ class Python {
         return Python.Call(name, py).ToStr();
     }
 
-    /// <summary>Call + long marshalling: <c>Python.CallL("int", "3.9")</c>.</summary>
+    /// <summary>Call + long 封送：<c>Python.CallL("int", "3.9")</c>。</summary>
     static long CallL(string name, params long[] args) {
         List<PyObject> py = new List<PyObject>();
         for (int i = 0; i < args.Count; i = i + 1) {
@@ -282,17 +282,17 @@ class Python {
     }
 
     /// <summary>
-    /// Publishes a static Zan method on the __main__ module so Python code can
-    /// call it. The method must have the PyCFunction shape:
+    /// 在 __main__ 模块上发布静态 Zan 方法，让 Python 代码可以调用它。
+    /// 该方法必须是 PyCFunction 形式：
     ///
     ///   static nint MyFn(nint self, nint args) {
     ///       double a = Python.GetArgDouble(args, 0);
     ///       return Python.ReturnDouble(a * 2);
     ///   }
     ///
-    /// and must not capture state (Zan delegates are non-capturing), exactly
-    /// like Input.Hook and Thread.Start callbacks. Returns false when the
-    /// Python interpreter is not ready.
+    /// 且不能捕获状态（Zan 委托为非捕获型），
+    /// 与 Input.Hook、Thread.Start 回调一致。
+    /// Python 解释器未就绪时返回 false。
     /// </summary>
     static bool RegisterFunction(string name, PyCFunction fn) {
         if (!Python.resolved) { return false; }
@@ -303,22 +303,22 @@ class Python {
 
         Span<nint> d0 = new Span<nint>(defs, 4);
         d0[0] = nameBuf;                        // ml_name
-        d0[1] = (nint)fn;                       // ml_meth (delegate -> fn ptr)
+        d0[1] = (nint)fn;                       // ml_meth（delegate -> fn ptr）
         new Span<int>(defs + 16, 1)[0] = 1;     // ml_flags = METH_VARARGS
         d0[3] = 0;                              // ml_doc = NULL
         Span<nint> d1 = new Span<nint>(defs + 32, 4);
-        d1[0] = 0; d1[1] = 0;                   // NULL sentinel entry
+        d1[0] = 0; d1[1] = 0;                   // NULL 哨兵条目
         new Span<int>(defs + 48, 1)[0] = 0;
         d1[3] = 0;
 
         PyCfuncNewFn make = (PyCfuncNewFn)Python.addr_cfuncNew;
-        nint func = make(defs, 0);              // keeps a pointer to `defs`
+        nint func = make(defs, 0);              // 持有指向 `defs` 的指针
         if (func == 0) {
             NativeMemory.Free(defs);
             NativeMemory.Free(nameBuf);
             return false;
         }
-        // Keep defs/nameBuf alive: the callable references them until freed.
+        // 保持 defs/nameBuf 存活：callable 在释放前一直引用它们。
         if (Python.registeredDefs == null) {
             Python.registeredDefs = new List<PyRegisteredDef>();
         }
@@ -332,35 +332,35 @@ class Python {
             return false;
         }
         int rc = setAttr(mainMod, name, func);
-        Python.DecRef(func);                    // set holds its own reference
+        Python.DecRef(func);                    // set 持有自己的引用
         Python.DecRef(mainMod);
         return rc == 0;
     }
 
-    // ---- value marshalling: Zan -> Python ---------------------------------
+    // ---- 值封送：Zan -> Python ---------------------------------
 
-    /// <summary>Wraps a double as a Python float.</summary>
+    /// <summary>将 double 包装为 Python float。</summary>
     static PyObject FromDouble(double v) {
         Python.EnsureReady();
         PyDoubleRetFn f = (PyDoubleRetFn)Python.addr_floatFromDouble;
         return PyObject.Wrap(f(v));
     }
 
-    /// <summary>Wraps a 64-bit integer as a Python int.</summary>
+    /// <summary>将 64 位整数包装为 Python int。</summary>
     static PyObject FromLong(long v) {
         Python.EnsureReady();
         PyLongRetFn f = (PyLongRetFn)Python.addr_longFromLong;
         return PyObject.Wrap(f(v));
     }
 
-    /// <summary>Wraps a string as a Python str (UTF-8).</summary>
+    /// <summary>将字符串包装为 Python str（UTF-8）。</summary>
     static PyObject FromStr(string s) {
         Python.EnsureReady();
         PyNintStrFn f = (PyNintStrFn)Python.addr_unicodeFromString;
         return PyObject.Wrap(f(s));
     }
 
-    /// <summary>Wraps a bool as a Python bool.</summary>
+    /// <summary>将 bool 包装为 Python bool。</summary>
     static PyObject FromBool(bool b) {
         Python.EnsureReady();
         PyBoolRetFn f = (PyBoolRetFn)Python.addr_boolFromLong;
@@ -369,7 +369,7 @@ class Python {
         return PyObject.Wrap(f(v));
     }
 
-    /// <summary>Wraps a list of Python objects as a Python list.</summary>
+    /// <summary>将 PyObject 列表包装为 Python list。</summary>
     static PyObject FromList(List<PyObject> items) {
         Python.EnsureReady();
         int n = items.Count;
@@ -379,13 +379,13 @@ class Python {
         PyListSetFn sl = (PyListSetFn)Python.addr_listSetItem;
         PyVoid1Fn inc = (PyVoid1Fn)Python.addr_incRef;
         for (int i = 0; i < n; i = i + 1) {
-            inc(items[i].handle);               // list steals the reference
+            inc(items[i].handle);               // list 会夺走引用
             sl(lst, i, items[i].handle);
         }
         return PyObject.Wrap(lst);
     }
 
-    /// <summary>Wraps a list of doubles as a Python list of floats.</summary>
+    /// <summary>将 double 列表包装为 Python float 列表。</summary>
     static PyObject FromListDouble(List<double> items) {
         List<PyObject> py = new List<PyObject>();
         for (int i = 0; i < items.Count; i = i + 1) {
@@ -394,7 +394,7 @@ class Python {
         return Python.FromList(py);
     }
 
-    /// <summary>Wraps a list of strings as a Python list of str.</summary>
+    /// <summary>将字符串列表包装为 Python str 列表。</summary>
     static PyObject FromListStr(List<string> items) {
         List<PyObject> py = new List<PyObject>();
         for (int i = 0; i < items.Count; i = i + 1) {
@@ -403,7 +403,7 @@ class Python {
         return Python.FromList(py);
     }
 
-    /// <summary>Wraps a string-keyed map as a Python dict.</summary>
+    /// <summary>将字符串键映射包装为 Python dict。</summary>
     static PyObject FromDict(Dictionary<string, PyObject> map) {
         Python.EnsureReady();
         PyDictNewFn nd = (PyDictNewFn)Python.addr_dictNew;
@@ -413,12 +413,12 @@ class Python {
         List<string> keys = map.Keys;
         for (int i = 0; i < keys.Count; i = i + 1) {
             string k = keys[i];
-            sd(d, k, map[k].handle);            // SetItemString takes its own
-        }                                        //   reference; nothing stolen
+            sd(d, k, map[k].handle);            // SetItemString 会自己持有
+        }                                        //   引用；不会偷走引用
         return PyObject.Wrap(d);
     }
 
-    /// <summary>Wraps a string-to-string map as a Python dict.</summary>
+    /// <summary>将字符串到字符串的映射包装为 Python dict。</summary>
     static PyObject FromDictStr(Dictionary<string, string> map) {
         Dictionary<string, PyObject> py = new Dictionary<string, PyObject>();
         List<string> keys = map.Keys;
@@ -428,23 +428,23 @@ class Python {
         return Python.FromDict(py);
     }
 
-    // ---- value marshalling: Python -> Zan ---------------------------------
+    // ---- 值封送：Python -> Zan ---------------------------------
 
-    /// <summary>Reads a Python object as a double.</summary>
+    /// <summary>将 Python 对象读为 double。</summary>
     static double ToDouble(PyObject o) {
         Python.EnsureReady();
         PyDoubleFn f = (PyDoubleFn)Python.addr_floatAsDouble;
         return f(o.handle);
     }
 
-    /// <summary>Reads a Python object as a 64-bit integer.</summary>
+    /// <summary>将 Python 对象读为 64 位整数。</summary>
     static long ToLong(PyObject o) {
         Python.EnsureReady();
         PyLongFn f = (PyLongFn)Python.addr_longAsLong;
         return f(o.handle);
     }
 
-    /// <summary>Reads a Python object as a string (UTF-8, via str()).</summary>
+    /// <summary>将 Python 对象读为字符串（UTF-8，经 str()）。</summary>
     static string ToStr(PyObject o) {
         Python.EnsureReady();
         PyNint1Fn s = (PyNint1Fn)Python.addr_objStr;
@@ -456,44 +456,44 @@ class Python {
         return text;
     }
 
-    /// <summary>Reads a Python object's truth value.</summary>
+    /// <summary>读取 Python 对象的真值。</summary>
     static bool ToBool(PyObject o) {
         Python.EnsureReady();
         PyNint1Fn t = (PyNint1Fn)Python.addr_objIsTrue;
         return t(o.handle) != 0;
     }
 
-    /// <summary>True when the Python error indicator is set.</summary>
+    /// <summary>Python 错误指示器已设置时为 true。</summary>
     static bool ErrOccurred() {
         if (!Python.resolved) { return false; }
         PyIntFn f = (PyIntFn)Python.addr_errOccurred;
         return f() != 0;
     }
 
-    /// <summary>Clears the Python error indicator.</summary>
+    /// <summary>清除 Python 错误指示器。</summary>
     static void ErrClear() {
         if (!Python.resolved) { return; }
         PyVoidFn f = (PyVoidFn)Python.addr_errClear;
         f();
     }
 
-    // ---- helpers for PyCFunction callbacks (Python -> Zan) ----------------
+    // ---- PyCFunction 回调辅助（Python -> Zan）----------------
 
-    /// <summary>Reads argument `index` of the args tuple as a double.</summary>
+    /// <summary>将 args 元组的第 `index` 个参数读为 double。</summary>
     static double GetArgDouble(nint args, long index) {
         PyTupleGetFn g = (PyTupleGetFn)Python.addr_tupleGet;
         PyDoubleFn d = (PyDoubleFn)Python.addr_floatAsDouble;
-        return d(g(args, index));               // borrowed reference
+        return d(g(args, index));               // 借用引用
     }
 
-    /// <summary>Reads argument `index` of the args tuple as a long.</summary>
+    /// <summary>将 args 元组的第 `index` 个参数读为 long。</summary>
     static long GetArgLong(nint args, long index) {
         PyTupleGetFn g = (PyTupleGetFn)Python.addr_tupleGet;
         PyLongFn l = (PyLongFn)Python.addr_longAsLong;
         return l(g(args, index));
     }
 
-    /// <summary>Reads argument `index` of the args tuple as a string.</summary>
+    /// <summary>将 args 元组的第 `index` 个参数读为字符串。</summary>
     static string GetArgStr(nint args, long index) {
         PyTupleGetFn g = (PyTupleGetFn)Python.addr_tupleGet;
         PyNint1Fn s = (PyNint1Fn)Python.addr_objStr;
@@ -505,25 +505,25 @@ class Python {
         return text;
     }
 
-    /// <summary>Builds the return value of a callback: a new float.</summary>
+    /// <summary>构造回调的返回值：新的 float。</summary>
     static nint ReturnDouble(double v) {
         PyDoubleRetFn f = (PyDoubleRetFn)Python.addr_floatFromDouble;
         return f(v);
     }
 
-    /// <summary>Builds the return value of a callback: a new int.</summary>
+    /// <summary>构造回调的返回值：新的 int。</summary>
     static nint ReturnLong(long v) {
         PyLongRetFn f = (PyLongRetFn)Python.addr_longFromLong;
         return f(v);
     }
 
-    /// <summary>Builds the return value of a callback: a new string.</summary>
+    /// <summary>构造回调的返回值：新的字符串。</summary>
     static nint ReturnStr(string s) {
         PyNintStrFn f = (PyNintStrFn)Python.addr_unicodeFromString;
         return f(s);
     }
 
-    /// <summary>Builds the return value of a callback: a new bool.</summary>
+    /// <summary>构造回调的返回值：新的 bool。</summary>
     static nint ReturnBool(bool b) {
         PyBoolRetFn f = (PyBoolRetFn)Python.addr_boolFromLong;
         int v = 0;
@@ -531,13 +531,13 @@ class Python {
         return f(v);
     }
 
-    /// <summary>Builds the return value of a callback: None.</summary>
+    /// <summary>构造回调的返回值：None。</summary>
     static nint ReturnNone() {
-        // Returning NULL with no error set yields Python None.
+        // 未设置错误时返回 NULL 即得到 Python None。
         return 0;
     }
 
-    // ---- internals --------------------------------------------------------
+    // ---- 内部实现 --------------------------------------------------------
 
     static void EnsureReady() {
         if (!Python.resolved) { Python.Initialize(); }
@@ -546,8 +546,8 @@ class Python {
     static bool TryResolve() {
         if (Python.resolved) { return true; }
         if (Python.mod == 0) {
-            // Newest first; python3.dll is the stable ABI forwarder but its
-            // symbol set is limited, so try the versioned DLLs first.
+            // 按新旧排序；python3.dll 是稳定的 ABI 转发器，但其
+            // 符号集有限，所以先尝试带版本号的 DLL。
             string[] cands = new string[] {
                 "python313.dll", "python312.dll", "python311.dll",
                 "python310.dll", "python39.dll", "python38.dll",
@@ -683,23 +683,23 @@ class PyRegisteredDef {
 }
 
 /// <summary>
-/// A strong reference to a Python object. The underlying PyObject* is
-/// released (Py_DECREF) when this wrapper is reclaimed by ARC.
+/// 对 Python 对象的强引用。底层 PyObject* 会在
+/// 该包装被 ARC 回收时释放（Py_DECREF）。
 /// </summary>
 class PyObject {
     nint handle;
 
-    /// <summary>Wraps an owned reference (never a borrowed one).</summary>
+    /// <summary>包装一个自有引用（绝不会是借用引用）。</summary>
     static PyObject Wrap(nint h) {
         PyObject o = new PyObject();
         o.handle = h;
         return o;
     }
 
-    /// <summary>The raw PyObject*; 0 means null (Python None is not null).</summary>
+    /// <summary>原始 PyObject*；0 表示 null（Python None 不是 null）。</summary>
     nint Raw() { return this.handle; }
 
-    /// <summary>True when this object is the Python null pointer (rare).</summary>
+    /// <summary>该对象是 Python 空指针时为 true（罕见）。</summary>
     bool IsNull() { return this.handle == 0; }
 
     ~PyObject() {
@@ -709,7 +709,7 @@ class PyObject {
         }
     }
 
-    /// <summary>Reads an attribute (e.g. "floor" on the math module).</summary>
+    /// <summary>读取属性（如 math 模块上的 "floor"）。</summary>
     PyObject GetAttr(string name) {
         PyAttrFn f = (PyAttrFn)Python.addr_getAttr;
         nint h = f(this.handle, name);
@@ -722,8 +722,8 @@ class PyObject {
     }
 
     /// <summary>
-    /// Reads an attribute without throwing; a null PyObject when it is absent
-    /// (the Python error indicator is cleared).
+    /// 不抛异常地读取属性；属性不存在时返回 null PyObject
+    /// （Python 错误指示器会被清除）。
     /// </summary>
     PyObject TryGetAttr(string name) {
         PyAttrFn f = (PyAttrFn)Python.addr_getAttr;
@@ -735,7 +735,7 @@ class PyObject {
         return PyObject.Wrap(h);
     }
 
-    /// <summary>Writes an attribute: <c>obj.SetAttr("name", value)</c>.</summary>
+    /// <summary>写入属性：<c>obj.SetAttr("name", value)</c>。</summary>
     void SetAttr(string name, PyObject val) {
         PySetAttrFn f = (PySetAttrFn)Python.addr_setAttrString;
         int rc = f(this.handle, name, val.handle);
@@ -746,7 +746,7 @@ class PyObject {
         }
     }
 
-    /// <summary>Reads an index of a sequence (list/tuple): <c>obj.At(2)</c>.</summary>
+    /// <summary>读取序列（list/tuple）的下标：<c>obj.At(2)</c>。</summary>
     PyObject At(long index) {
         PyListSizeFn sz = (PyListSizeFn)Python.addr_listSize;
         if (sz(this.handle) < 0) {
@@ -755,17 +755,17 @@ class PyObject {
             throw new InvalidOperationException("Python At():目标不是序列");
         }
         PyListGetFn g = (PyListGetFn)Python.addr_listGetItem;
-        nint item = g(this.handle, index);      // borrowed
+        nint item = g(this.handle, index);      // 借用引用
         if (item == 0) {
             PyVoidFn printErr = (PyVoidFn)Python.addr_errPrint;
             printErr();
             throw new InvalidOperationException("Python At():索引越界");
         }
-        Python.IncRef(item);                    // owned by the wrapper
+        Python.IncRef(item);                    // 由包装持有
         return PyObject.Wrap(item);
     }
 
-    /// <summary>Writes an index of a list: <c>obj.SetIndex(2, v)</c>.</summary>
+    /// <summary>写入 list 的下标：<c>obj.SetIndex(2, v)</c>。</summary>
     void SetIndex(long index, PyObject val) {
         PyListSizeFn sz = (PyListSizeFn)Python.addr_listSize;
         if (sz(this.handle) < 0) {
@@ -774,7 +774,7 @@ class PyObject {
             throw new InvalidOperationException("Python SetIndex():目标不是列表");
         }
         PyListSetFn sl = (PyListSetFn)Python.addr_listSetItem;
-        Python.IncRef(val.handle);              // PyList_SetItem steals the reference
+        Python.IncRef(val.handle);              // PyList_SetItem 会夺走引用
         int rc = sl(this.handle, index, val.handle);
         if (rc != 0) {
             PyVoidFn printErr = (PyVoidFn)Python.addr_errPrint;
@@ -783,11 +783,11 @@ class PyObject {
         }
     }
 
-    /// <summary>Reads an item with a Python key (dict, sequence): <c>obj.GetItem("k")</c>.</summary>
+    /// <summary>用 Python 键读取元素（dict、sequence）：<c>obj.GetItem("k")</c>。</summary>
     PyObject GetItem(string key) {
         PyObject k = Python.FromStr(key);
         PyNintPairFn f = (PyNintPairFn)Python.addr_getItem;
-        nint h = f(this.handle, k.handle);       // new reference
+        nint h = f(this.handle, k.handle);       // 新引用
         if (h == 0) {
             PyVoidFn printErr = (PyVoidFn)Python.addr_errPrint;
             printErr();
@@ -796,7 +796,7 @@ class PyObject {
         return PyObject.Wrap(h);
     }
 
-    /// <summary>Writes an item with a Python key (dict, sequence): <c>obj.SetItem("k", v)</c>.</summary>
+    /// <summary>用 Python 键写入元素（dict、sequence）：<c>obj.SetItem("k", v)</c>。</summary>
     void SetItem(string key, PyObject val) {
         PyObject k = Python.FromStr(key);
         PyNint3RetFn f = (PyNint3RetFn)Python.addr_setItem;
@@ -809,11 +809,11 @@ class PyObject {
     }
 
     /// <summary>
-    /// Operator overload: <c>fn(a, b)</c> calls the Python callable. Enabled
-    /// by the compiler's op_call lowering; the scalar overloads marshal
-    /// string/double/long/bool arguments automatically, the PyObject
-    /// overload takes an already-wrapped value, and the params overload
-    /// covers multiple PyObject arguments.
+    /// 运算符重载：<c>fn(a, b)</c> 调用 Python callable。由编译器
+    /// 的 op_call 降级启用；标量重载自动封送
+    /// string/double/long/bool 参数，PyObject 重载接收
+    /// 已包装的值，params 重载则
+    /// 覆盖多个 PyObject 参数。
     /// </summary>
     static PyObject op_call(PyObject self, string a) {
         return self.Call1(Python.FromStr(a));
@@ -871,52 +871,52 @@ class PyObject {
         return self.Call(args);
     }
 
-    /// <summary>Operator overload: <c>list[2]</c> reads an index, like <see cref="At"/>.</summary>
+    /// <summary>运算符重载：<c>list[2]</c> 读取下标，同 <see cref="At"/>。</summary>
     static PyObject op_index(PyObject self, long index) {
         return self.At(index);
     }
 
-    /// <summary>Operator overload: <c>dict["k"]</c> reads an item, like <see cref="GetItem"/>.</summary>
+    /// <summary>运算符重载：<c>dict["k"]</c> 读取元素，同 <see cref="GetItem"/>。</summary>
     static PyObject op_index(PyObject self, string key) {
         return self.GetItem(key);
     }
 
-    /// <summary>Operator overload: <c>list[2] = v</c> writes an index, like <see cref="SetIndex"/>.</summary>
+    /// <summary>运算符重载：<c>list[2] = v</c> 写入下标，同 <see cref="SetIndex"/>。</summary>
     static void op_index_set(PyObject self, long index, PyObject val) {
         self.SetIndex(index, val);
     }
 
-    /// <summary>Operator overload: <c>list[2] = "s"</c> marshals the string value.</summary>
+    /// <summary>运算符重载：<c>list[2] = "s"</c> 封送字符串值。</summary>
     static void op_index_set(PyObject self, long index, string val) {
         self.SetIndex(index, Python.FromStr(val));
     }
 
-    /// <summary>Operator overload: <c>dict["k"] = v</c> writes an item, like <see cref="SetItem"/>.</summary>
+    /// <summary>运算符重载：<c>dict["k"] = v</c> 写入元素，同 <see cref="SetItem"/>。</summary>
     static void op_index_set(PyObject self, string key, PyObject val) {
         self.SetItem(key, val);
     }
 
-    /// <summary>Operator overload: <c>dict["k"] = "s"</c> marshals the string value.</summary>
+    /// <summary>运算符重载：<c>dict["k"] = "s"</c> 封送字符串值。</summary>
     static void op_index_set(PyObject self, string key, string val) {
         self.SetItem(key, Python.FromStr(val));
     }
 
-    /// <summary>Calls the object with no arguments.</summary>
+    /// <summary>不带参数调用对象。</summary>
     PyObject Call0() {
         return this.CallTuple(0);
     }
 
-    /// <summary>Calls the object with one argument.</summary>
+    /// <summary>带一个参数调用对象。</summary>
     PyObject Call1(PyObject a) {
         PyTupleNewFn n = (PyTupleNewFn)Python.addr_tupleNew;
         PyTupleSetFn s = (PyTupleSetFn)Python.addr_tupleSet;
         nint t = n(1);
-        Python.IncRef(a.handle);                // tuple steals; wrapper keeps its own
+        Python.IncRef(a.handle);                // tuple 会夺走引用；包装保留自己的
         s(t, 0, a.handle);
         return this.CallTuple(t);
     }
 
-    /// <summary>Calls the object with two arguments.</summary>
+    /// <summary>带两个参数调用对象。</summary>
     PyObject Call2(PyObject a, PyObject b) {
         PyTupleNewFn n = (PyTupleNewFn)Python.addr_tupleNew;
         PyTupleSetFn s = (PyTupleSetFn)Python.addr_tupleSet;
@@ -928,7 +928,7 @@ class PyObject {
         return this.CallTuple(t);
     }
 
-    /// <summary>Calls the object with three arguments.</summary>
+    /// <summary>带三个参数调用对象。</summary>
     PyObject Call3(PyObject a, PyObject b, PyObject c) {
         PyTupleNewFn n = (PyTupleNewFn)Python.addr_tupleNew;
         PyTupleSetFn s = (PyTupleSetFn)Python.addr_tupleSet;
@@ -943,9 +943,9 @@ class PyObject {
     }
 
     /// <summary>
-    /// Calls the object with any number of arguments:
-    /// <c>fn.Call(Python.FromDouble(1.0), Python.FromStr("x"))</c> or with a
-    /// pre-built list. Replaces Call0..3; those remain for compatibility.
+    /// 以任意数量的参数调用对象：
+    /// <c>fn.Call(Python.FromDouble(1.0), Python.FromStr("x"))</c> 或传入
+    /// 预构建的列表。取代 Call0..3；它们为兼容性保留。
     /// </summary>
     PyObject Call(params PyObject[] args) {
         int n = args.Count;
@@ -953,7 +953,7 @@ class PyObject {
         PyTupleSetFn st = (PyTupleSetFn)Python.addr_tupleSet;
         nint t = nt(n);
         for (int i = 0; i < n; i = i + 1) {
-            Python.IncRef(args[i].handle);      // tuple steals; wrappers keep theirs
+            Python.IncRef(args[i].handle);      // tuple 会夺走引用；包装保留自己的
             st(t, i, args[i].handle);
         }
         return this.CallTuple(t);
@@ -962,7 +962,7 @@ class PyObject {
     PyObject CallTuple(nint tuple) {
         PyNint2Fn f = (PyNint2Fn)Python.addr_call;
         nint h = f(this.handle, tuple, 0);
-        Python.DecRef(tuple);                    // tuple owned by us
+        Python.DecRef(tuple);                    // tuple 由我们持有
         if (h == 0) {
             PyVoidFn printErr = (PyVoidFn)Python.addr_errPrint;
             printErr();
@@ -971,19 +971,19 @@ class PyObject {
         return PyObject.Wrap(h);
     }
 
-    /// <summary>Reads the object as a double.</summary>
+    /// <summary>将对象读为 double。</summary>
     double ToDouble() { return Python.ToDouble(this); }
 
-    /// <summary>Reads the object as a 64-bit integer.</summary>
+    /// <summary>将对象读为 64 位整数。</summary>
     long ToLong() { return Python.ToLong(this); }
 
-    /// <summary>Reads the object as a string (str(obj)).</summary>
+    /// <summary>将对象读为字符串（str(obj)）。</summary>
     string ToStr() { return Python.ToStr(this); }
 
-    /// <summary>Reads the object's truth value.</summary>
+    /// <summary>读取对象的真值。</summary>
     bool ToBool() { return Python.ToBool(this); }
 
-    /// <summary>Unwraps a Python list into a list of Python objects.</summary>
+    /// <summary>将 Python list 拆为 PyObject 列表。</summary>
     List<PyObject> ToList() {
         PyListSizeFn sz = (PyListSizeFn)Python.addr_listSize;
         long n = sz(this.handle);
@@ -995,14 +995,14 @@ class PyObject {
         List<PyObject> outList = new List<PyObject>();
         PyListGetFn g = (PyListGetFn)Python.addr_listGetItem;
         for (long i = 0; i < n; i = i + 1) {
-            nint item = g(this.handle, i);      // borrowed
+            nint item = g(this.handle, i);      // 借用引用
             Python.IncRef(item);
             outList.Add(PyObject.Wrap(item));
         }
         return outList;
     }
 
-    /// <summary>Unwraps a Python list into a list of doubles.</summary>
+    /// <summary>将 Python list 拆为 double 列表。</summary>
     List<double> ToListDouble() {
         List<PyObject> items = this.ToList();
         List<double> outList = new List<double>();
@@ -1012,7 +1012,7 @@ class PyObject {
         return outList;
     }
 
-    /// <summary>Unwraps a Python list into a list of strings (str() each).</summary>
+    /// <summary>将 Python list 拆为字符串列表（逐个 str()）。</summary>
     List<string> ToListStr() {
         List<PyObject> items = this.ToList();
         List<string> outList = new List<string>();
@@ -1023,8 +1023,8 @@ class PyObject {
     }
 
     /// <summary>
-    /// Unwraps a Python dict into a string-keyed map of Python objects. Keys
-    /// are read with str() so non-string keys still convert.
+    /// 将 Python dict 拆为以字符串为键的 PyObject 映射。键
+    /// 通过 str() 读取，因此非字符串键也能转换。
     /// </summary>
     Dictionary<string, PyObject> ToDict() {
         PyDictSizeFn sz = (PyDictSizeFn)Python.addr_dictSize;
@@ -1041,8 +1041,8 @@ class PyObject {
         PyDictNextFn nx = (PyDictNextFn)Python.addr_dictNext;
         PyStrRetFn u = (PyStrRetFn)Python.addr_unicodeAsUtf8;
         while (nx(this.handle, pos, keyOut, valOut) != 0) {
-            nint key = new Span<nint>(keyOut, 1)[0];   // borrowed
-            nint val = new Span<nint>(valOut, 1)[0];   // borrowed
+            nint key = new Span<nint>(keyOut, 1)[0];   // 借用引用
+            nint val = new Span<nint>(valOut, 1)[0];   // 借用引用
             string ks = u(key);
             Python.IncRef(val);
             outMap[ks] = PyObject.Wrap(val);
@@ -1054,10 +1054,10 @@ class PyObject {
     }
 }
 
-// ---- PyCFunction callback shape: PyObject* (*)(PyObject*, PyObject*) ------
+// ---- PyCFunction 回调形式：PyObject* (*)(PyObject*, PyObject*) ------
 delegate nint PyCFunction(nint self, nint args);
 
-// ---- internal call shapes for resolved entry points -----------------------
+// ---- 已解析入口点的内部调用形式 -----------------------
 delegate void PyVoidFn();
 delegate int PyIntFn();
 delegate int PyIntStrFn(string s);

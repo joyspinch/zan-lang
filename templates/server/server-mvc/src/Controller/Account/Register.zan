@@ -1,0 +1,243 @@
+using System;
+using System.Data;
+using System.Data.Orm;
+using System.Security.Cryptography;
+using System.Web;
+using ZanWeb;
+using ZanWeb.Model.Sys;
+
+namespace ZanWeb.Account;
+
+/// <summary>
+/// Self sign-up and password recovery, both switched on or off from the site
+/// settings (auth.register.enabled, auth.register.verify, auth.reset.enabled).
+/// A disabled flow answers 404-ish by redirecting to the sign-in page instead
+/// of rendering a form nobody is allowed to submit.
+///
+/// When verification is on, the address must prove itself with a code from
+/// VerifyCode before an account is created or a password is replaced. A new
+/// account gets no role at all: what it may do is granted in the admin, so
+/// opening sign-up cannot by itself hand anyone a permission.
+/// </summary>
+[Route("[controller]/[action]")]
+[Custom(Authorization = CustomAuthorization.None)]
+[Description("注册与找回密码")]
+class Register : Controller {
+    static string RegTpl = "Account.Register.Index";
+    static string ResetTpl = "Account.Register.Forgot";
+
+    [HttpGet]
+    [Route("/register")]
+    [Description("注册")]
+    async void Index() {
+        if (!await Settings.On(SettingKeys.RegisterEnabled, false)) {
+            this.Ctx().Redirect(Routes.SignIn);
+            return;
+        }
+        this.ViewOf(Register.RegTpl, await Register.Page("注册", "", "", this.In("user"), this.In("email")));
+    }
+
+    [HttpPost]
+    [Route("/register")]
+    [Description("提交注册")]
+    async void Submit() {
+        if (!await Settings.On(SettingKeys.RegisterEnabled, false)) {
+            this.Ctx().Redirect(Routes.SignIn);
+            return;
+        }
+        string user = this.In("user");
+        string email = this.In("email");
+        string pass = this.In("pass");
+        string code = this.In("code");
+
+        if (user.Length < 3 || user.Length > 32) {
+            await this.Back("账号需要 3 到 32 个字符", user, email);
+            return;
+        }
+        if (!Register.LooksLikeMail(email)) {
+            await this.Back("请填写正确的邮箱地址", user, email);
+            return;
+        }
+        if (pass.Length < 8) {
+            await this.Back("密码至少 8 位", user, email);
+            return;
+        }
+        if (await Settings.On(SettingKeys.RegisterVerify, true)) {
+            if (!await VerifyCode.Accept("register", email, code)) {
+                await this.Back("验证码不正确或已过期", user, email);
+                return;
+            }
+        }
+
+        IDbConnection db = await AuthUser.Lease();
+        if (db == null) { await this.Back("数据库不可用，请稍后再试", user, email); return; }
+        try {
+            int clash = await db.Select<User>().Where(a => a.username == user).CountAsync();
+            if (clash > 0) { await this.Back("账号已被使用", user, email); return; }
+            int mailClash = await db.Select<User>().Where(a => a.email == email).CountAsync();
+            if (mailClash > 0) { await this.Back("该邮箱已注册", user, email); return; }
+
+            string salt = Hex.Encode(RandomNumberGenerator.GetBytes(16), 16);
+            User u = new User();
+            u.username = user;
+            u.nickname = user;
+            u.email = email;
+            u.mobile = "";
+            u.departmentId = 0;
+            u.passwordSalt = salt;
+            u.passwordHash = AuthUser.PasswordHash(pass, salt);
+            u.status = 1;
+            u.isSuper = 0;
+            u.tokenVersion = 1;
+            u.createdAt = WebApp.NowSeconds();
+            u.updatedAt = u.createdAt;
+            int _id = await db.Insert<User>(u).ExecuteIdentityAsync();
+        } finally {
+            AuthUser.Give(db);
+        }
+
+        string token = await AuthUser.Login(user, pass);
+        if (token.Length > 0) {
+            this.Ctx().SetCookie("zsession", token, 864000);
+            this.Ctx().Redirect(Routes.Home);
+            return;
+        }
+        this.Ctx().Redirect(Routes.SignIn);
+    }
+
+    [HttpPost]
+    [Route("/register/code")]
+    [Description("发送注册验证码")]
+    async void Code() {
+        if (!await Settings.On(SettingKeys.RegisterEnabled, false)) {
+            this.Fail(403, "0403", "注册未开放");
+        }
+        await this.SendCode("register", this.In("email"), "注册验证码");
+    }
+
+    [HttpGet]
+    [Route("/forgot")]
+    [Description("找回密码")]
+    async void Forgot() {
+        if (!await Settings.On(SettingKeys.ResetEnabled, true)) {
+            this.Ctx().Redirect(Routes.SignIn);
+            return;
+        }
+        this.ViewOf(Register.ResetTpl, await Register.Page("找回密码", "", "", "", this.In("email")));
+    }
+
+    [HttpPost]
+    [Route("/forgot")]
+    [Description("重设密码")]
+    async void ForgotSubmit() {
+        if (!await Settings.On(SettingKeys.ResetEnabled, true)) {
+            this.Ctx().Redirect(Routes.SignIn);
+            return;
+        }
+        string email = this.In("email");
+        string pass = this.In("pass");
+        string code = this.In("code");
+        if (pass.Length < 8) {
+            this.ViewOf(Register.ResetTpl, await Register.Page("找回密码", "新密码至少 8 位", "", "", email));
+            return;
+        }
+        if (!await VerifyCode.Accept("reset", email, code)) {
+            this.ViewOf(Register.ResetTpl,
+                await Register.Page("找回密码", "验证码不正确或已过期", "", "", email));
+            return;
+        }
+
+        IDbConnection db = await AuthUser.Lease();
+        if (db == null) {
+            this.ViewOf(Register.ResetTpl,
+                await Register.Page("找回密码", "数据库不可用，请稍后再试", "", "", email));
+            return;
+        }
+        bool done = false;
+        try {
+            User u = await db.Select<User>().Where(a => a.email == email).FirstAsync();
+            if (u != null) {
+                string salt = Hex.Encode(RandomNumberGenerator.GetBytes(16), 16);
+                int id = u.id;
+                int version = u.tokenVersion + 1;
+                // Replacing a password must also end the sessions opened with
+                // the old one, otherwise a recovered account stays shared.
+                int n = await db.Update<User>()
+                    .Set(a => a.passwordSalt, salt)
+                    .Set(a => a.passwordHash, AuthUser.PasswordHash(pass, salt))
+                    .Set(a => a.tokenVersion, version)
+                    .Set(a => a.updatedAt, WebApp.NowSeconds())
+                    .Where(a => a.id == id)
+                    .ExecuteAffrowsAsync();
+                done = n > 0;
+            }
+        } finally {
+            AuthUser.Give(db);
+        }
+        if (!done) {
+            this.ViewOf(Register.ResetTpl,
+                await Register.Page("找回密码", "该邮箱没有对应的账号", "", "", email));
+            return;
+        }
+        this.ViewOf(Register.ResetTpl,
+            await Register.Page("找回密码", "", "密码已重设，请用新密码登录", "", ""));
+    }
+
+    [HttpPost]
+    [Route("/forgot/code")]
+    [Description("发送找回密码验证码")]
+    async void ForgotCode() {
+        if (!await Settings.On(SettingKeys.ResetEnabled, true)) {
+            this.Fail(403, "0403", "找回密码未开放");
+        }
+        await this.SendCode("reset", this.In("email"), "重设密码验证码");
+    }
+
+    /// <summary>Mails a code for one of the two purposes. Whether the address
+    /// belongs to an account is never revealed: the answer is the same either
+    /// way, so the form cannot be used to enumerate registered mails.</summary>
+    async void SendCode(string purpose, string email, string subject) {
+        if (!Register.LooksLikeMail(email)) {
+            this.Fail(400, "0004", "请填写正确的邮箱地址");
+        }
+        if (!await Mailer.Ready()) {
+            this.Fail(400, "0004", "站点尚未配置邮件服务");
+        }
+        if (await VerifyCode.TooSoon(purpose, email)) {
+            this.Fail(429, "0429", "验证码已发送，请稍后再试");
+        }
+        string code = await VerifyCode.Issue(purpose, email);
+        string site = await Settings.Get(SettingKeys.SiteTitle, "ZanWeb");
+        MailResult r = await Mailer.Send(email, site + " " + subject,
+            "你的验证码是 " + code + "，10 分钟内有效。\n\n如果这不是你本人的操作，忽略这封邮件即可。");
+        if (!r.ok) {
+            this.Fail(502, "0502", r.Message());
+        }
+        this.Ok("验证码已发送");
+    }
+
+    async void Back(string error, string user, string email) {
+        this.ViewOf(Register.RegTpl, await Register.Page("注册", error, "", user, email));
+    }
+
+    static bool LooksLikeMail(string s) {
+        int at = s.IndexOf("@");
+        return at > 0 && s.IndexOf(".", at) > at + 1 && s.Length < 128;
+    }
+
+    static async ViewData Page(string what, string error, string done,
+                               string user, string email) {
+        string site = await Settings.Get(SettingKeys.SiteTitle, "ZanWeb");
+        ViewData d = new ViewData();
+        d.Set("title", what + " · " + site);
+        d.Set("brand", site);
+        d.Set("error", error);
+        d.Set("done", done);
+        d.Set("user", user);
+        d.Set("email", email);
+        if (await Settings.On(SettingKeys.RegisterVerify, true)) { d.Set("needCode", "1"); }
+        if (await Settings.On(SettingKeys.RegisterEnabled, false)) { d.Set("canRegister", "1"); }
+        if (await Settings.On(SettingKeys.ResetEnabled, true)) { d.Set("canReset", "1"); }
+        return d;
+    }
+}

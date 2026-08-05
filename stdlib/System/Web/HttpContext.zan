@@ -1,7 +1,8 @@
-using System;
-using System.Text;
-using System.Net.Sockets;
 using System.Json;
+using System.Net.Sockets;
+using System.Text;
+using System.Diagnostics;
+using System;
 
 namespace System.Web;
 
@@ -28,7 +29,13 @@ class HttpContext {
     StrMap routeParams;
     StrMap query;
     StrMap form;
-    StrMap state;      // per-request scratch space for hooks (e.g. auth uid)
+    // What dispatch worked out about this request, as fields rather than a
+    // scratch map: a typo in a map key is a silent empty string, a typo in a
+    // field name does not compile.
+    string uid;          // signed-in principal ("" when anonymous)
+    string routeAction;  // the matched route's action ("Users.Save")
+    string uploadPath;   // spooled multipart body ("" when none)
+    long uploadSize;
 
     int status;
     string statusText;
@@ -36,6 +43,23 @@ class HttpContext {
     string body;
     List<string> headers;
     bool ended;        // a hook or handler already produced the response
+
+    // ---- streaming (Server-Sent Events) ----
+    // The connection itself, handed over by the server before the handler runs.
+    // A handler that calls SseOpen() takes it over: it writes the response
+    // itself, for as long as the subscriber stays, and the server stops
+    // treating the socket as a request/response exchange.
+    TcpClient conn;
+    bool hijacked;
+    // Sticky: set once the connection is taken over (SSE/upgrade) and never
+    // cleared, unlike `hijacked` which the stream loop resets on disconnect.
+    // The metrics guards read THIS so a closed stream stays excluded from
+    // request / route latency even after `hijacked` has gone back to false.
+    bool wasHijacked;
+    // What a stream is measured by instead of a duration: how much was pushed
+    // over it. Frames and bytes, counted as they go out.
+    long frames;
+    long framesBytes;
 
     HttpContext(HttpRequest req, string remoteIp) {
         this.request = req;
@@ -45,13 +69,21 @@ class HttpContext {
         this.routeParams = new StrMap();
         this.query = new StrMap();
         this.form = new StrMap();
-        this.state = new StrMap();
+        this.uid = "";
+        this.routeAction = "";
+        this.uploadPath = "";
+        this.uploadSize = 0;
         this.status = 200;
         this.statusText = "OK";
         this.contentType = "text/html; charset=utf-8";
         this.body = "";
         this.headers = null;
         this.ended = false;
+        this.conn = null;
+        this.hijacked = false;
+        this.wasHijacked = false;
+        this.frames = 0;
+        this.framesBytes = 0;
         HttpContext.ParsePairs(req.queryString, this.query);
         if (req.method == "POST" || req.method == "PUT" || req.method == "PATCH") {
             if (HttpContext.StartsWith(req.contentType, "application/x-www-form-urlencoded")) {
@@ -190,6 +222,24 @@ class HttpContext {
         this.ended = true;
     }
 
+    /// <summary>Answers with a file the browser saves rather than renders. The
+    /// name is sanitised here (quotes, newlines and path separators dropped) so
+    /// a caller cannot inject a header line through it.</summary>
+    void Download(string fileName, string mime, string body) {
+        StringBuilder safe = new StringBuilder();
+        for (int i = 0; i < fileName.Length; i = i + 1) {
+            int c = fileName[i] & 255;
+            if (c < 32 || c == 34 || c == 47 || c == 92 || c == 59) { continue; }
+            safe.Append(fileName.Substring(i, 1));
+        }
+        string name = safe.ToString();
+        if (name.Length == 0) { name = "export.txt"; }
+        this.SetHeader("Content-Disposition", "attachment; filename=\"" + name + "\"");
+        this.contentType = mime;
+        this.body = body;
+        this.ended = true;
+    }
+
     /// <summary>Uniform API envelope: {"code":...,"msg":...,"data":...}.
     /// data must already be a JSON value (object/array/string literal); it is
     /// parsed back into the tree so the envelope is built by the JSON writer,
@@ -214,6 +264,89 @@ class HttpContext {
     }
 
     /// <summary>Serializes the response into a raw HTTP/1.1 message.</summary>
+    // ---- server-sent events -------------------------------------------------
+    // A metrics dashboard that polls asks the same question a few times a
+    // minute and gets "nothing changed" almost every time; an event stream
+    // costs one connection and speaks only when there is something to say.
+    // These four calls are the whole server side of it -- no framework, no
+    // second port, and the handler stays an ordinary route.
+
+    /// <summary>Attaches the live connection. Called by the server; a handler
+    /// never needs it.</summary>
+    void __Attach(TcpClient client) { this.conn = client; }
+
+    /// <summary>Whether this request took the connection over.</summary>
+    bool Hijacked() { return this.hijacked; }
+
+    /// <summary>Whether this connection was EVER hijacked (SSE/upgrade). Stays
+    /// true after the stream ends, so latency metrics stay excluded.</summary>
+    bool MetricsExcluded() { return this.wasHijacked; }
+
+    /// <summary>Frames pushed over this connection (SSE events, keep-alives),
+    /// and their total size: the traffic measure that replaces latency for a
+    /// connection that is meant to stay open.</summary>
+    long Frames() { return this.frames; }
+    long FrameBytes() { return this.framesBytes; }
+
+    /// <summary>Answers the `text/event-stream` handshake and takes the
+    /// connection over. Everything after this is written by the handler with
+    /// SseSend / SsePing; the loop it runs ends when the subscriber goes away
+    /// (a send fails). false = no connection to stream on.</summary>
+    async bool SseOpen() {
+        if (this.conn == null) { return false; }
+        string head = "HTTP/1.1 200 OK\r\n"
+            + "Content-Type: text/event-stream; charset=utf-8\r\n"
+            + "Cache-Control: no-cache, no-transform\r\n"
+            + "Connection: keep-alive\r\n"
+            + "X-Accel-Buffering: no\r\n\r\n";
+        int n = await this.conn.SendAsync(head);
+        if (n <= 0) { return false; }
+        this.hijacked = true;
+        this.wasHijacked = true;
+        this.ended = true;
+        // The open-stream gauge: this connection now occupies a coroutine until
+        // the subscriber leaves. The dispatcher closes it out with the frame
+        // totals when the handler returns.
+        ServerMetrics.Global().StreamOpened();
+        return true;
+    }
+
+    /// <summary>Pushes one event. `name` "" sends the default "message" event.
+    /// Each newline in `data` becomes its own data: line, as the wire format
+    /// requires. false = the subscriber is gone; stop the loop.</summary>
+    async bool SseSend(string name, string data) {
+        if (!this.hijacked || this.conn == null) { return false; }
+        StringBuilder sb = new StringBuilder();
+        if (name.Length > 0) { sb.Append("event: "); sb.Append(name); sb.Append("\n"); }
+        int start = 0;
+        for (int i = 0; i <= data.Length; i = i + 1) {
+            if (i == data.Length || (data[i] & 255) == 10) {
+                sb.Append("data: ");
+                sb.Append(data.Substring(start, i - start));
+                sb.Append("\n");
+                start = i + 1;
+            }
+        }
+        sb.Append("\n");
+        string frame = sb.ToString();
+        int n = await this.conn.SendAsync(frame);
+        if (n <= 0) { this.hijacked = false; return false; }
+        this.frames = this.frames + 1;
+        this.framesBytes = this.framesBytes + frame.Length;
+        return true;
+    }
+
+    /// <summary>Comment line, used as a keep-alive so idle proxies do not drop
+    /// the stream.</summary>
+    async bool SsePing() {
+        if (!this.hijacked || this.conn == null) { return false; }
+        int n = await this.conn.SendAsync(": ping\n\n");
+        if (n <= 0) { this.hijacked = false; return false; }
+        this.frames = this.frames + 1;
+        this.framesBytes = this.framesBytes + 8;
+        return true;
+    }
+
     string BuildResponse(bool keepAlive) {
         StringBuilder sb = new StringBuilder();
         sb.Append("HTTP/1.1 ");
@@ -295,6 +428,16 @@ class HttpContext {
             if (eq > i) {
                 string k = Encoding.UrlDecode(s.Substring(i, eq - i));
                 string v = Encoding.UrlDecode(s.Substring(eq + 1, e - eq - 1));
+                // A browser posts a checkbox group as the same field repeated
+                // under the "name[]" convention. That is one value to the
+                // action that reads it -- a comma separated list, the shape the
+                // readers already take -- so the ticked boxes arrive as
+                // In("permIds") rather than as a name nothing asks for.
+                if (k.Length > 2 && k.Substring(k.Length - 2, 2) == "[]") {
+                    k = k.Substring(0, k.Length - 2);
+                    string prev = into.GetOr(k, "");
+                    if (prev.Length > 0) { v = prev + "," + v; }
+                }
                 into.Set(k, v);
             }
             i = e + 1;
@@ -302,25 +445,68 @@ class HttpContext {
     }
 }
 
-/// <summary>Tiny JSON string escaper for building responses safely.</summary>
-class JsonStr {
-    static string Escape(string s) {
-        StringBuilder sb = new StringBuilder();
-        int n = s.Length;
-        int start = 0;
-        for (int i = 0; i < n; i = i + 1) {
-            int c = s[i] & 255;
-            if (c == 34 || c == 92 || c == 10 || c == 13 || c == 9) {
-                if (i > start) { sb.Append(s.Substring(start, i - start)); }
-                if (c == 34) { sb.Append("\\\""); }      // '"'
-                else if (c == 92) { sb.Append("\\\\"); }  // '\'
-                else if (c == 10) { sb.Append("\\n"); }   // '\n'
-                else if (c == 13) { sb.Append("\\r"); }   // '\r'
-                else { sb.Append("\\t"); }                // '\t'
-                start = i + 1;
+/// <summary>
+/// Ordered string-to-string map on parallel lists. Small and predictable:
+/// route params / query / form / headers per request stay tiny, so linear
+/// lookup beats a hash table while keeping zero extra allocations.
+///
+/// The backing lists are created on the first Set: most requests never touch
+/// their route params, query, form or state map, and an empty map that costs
+/// nothing keeps the per-request allocation count down.
+/// </summary>
+class StrMap {
+    List<string> keys;
+    List<string> vals;
+
+    StrMap() {
+        this.keys = null;
+        this.vals = null;
+    }
+
+    int Count() {
+        if (this.keys == null) { return 0; }
+        return this.keys.Count;
+    }
+
+    string KeyAt(int i) { return this.keys[i]; }
+
+    string ValAt(int i) { return this.vals[i]; }
+
+    void Set(string key, string val) {
+        if (this.keys == null) {
+            this.keys = new List<string>();
+            this.vals = new List<string>();
+        }
+        for (int i = 0; i < this.keys.Count; i = i + 1) {
+            if (this.keys[i] == key) {
+                this.vals[i] = val;
+                return;
             }
         }
-        if (n > start) { sb.Append(s.Substring(start, n - start)); }
-        return sb.ToString();
+        this.keys.Add(key);
+        this.vals.Add(val);
+    }
+
+    bool Has(string key) {
+        if (this.keys == null) { return false; }
+        for (int i = 0; i < this.keys.Count; i = i + 1) {
+            if (this.keys[i] == key) { return true; }
+        }
+        return false;
+    }
+
+    string Get(string key) { return this.GetOr(key, ""); }
+
+    string GetOr(string key, string def) {
+        if (this.keys == null) { return def; }
+        for (int i = 0; i < this.keys.Count; i = i + 1) {
+            if (this.keys[i] == key) { return this.vals[i]; }
+        }
+        return def;
+    }
+
+    void Clear() {
+        this.keys = null;
+        this.vals = null;
     }
 }

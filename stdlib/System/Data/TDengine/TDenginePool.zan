@@ -5,16 +5,16 @@ using System.Threading;
 namespace System.Data.TDengine;
 
 /// <summary>
-/// Coroutine-aware connection pool for <see cref="TDengineConnection"/>.
+/// 为 <see cref="TDengineConnection"/> 设计的协程感知连接池。
 ///
-/// Same contract as <see cref="DbPool"/> -- lazy growth up to <c>maxSize</c>,
-/// <see cref="Gate"/>-driven waiting rather than polling, eviction of dead
-/// connections -- but typed, so the coroutine query API (<c>QueryAsync</c>,
-/// <c>ExecuteAsync</c>) stays reachable. Opening and every statement run on the
-/// IO reactor, so the pool size is what bounds concurrency against
-/// taosAdapter, not the number of worker threads.
+/// 契约与 <see cref="DbPool"/> 相同——惰性增长到 <c>maxSize</c>，
+/// 等待由 <see cref="Gate"/> 驱动而非轮询，逐出失效连接——
+/// 但它是类型化的，协程查询 API（<c>QueryAsync</c>、
+/// <c>ExecuteAsync</c>）仍可用。打开连接和每条语句都运行在
+/// IO reactor 上，因此限制并发的是池的大小，
+/// 而不是 worker 线程数。
 ///
-/// Usage:
+/// 用法：
 ///   TDenginePool pool = new TDenginePool("127.0.0.1", 6041, "root", "taosdata", "", "power", 8);
 ///   TDengineConnection db = await pool.AcquireAsync();
 ///   DbResult r = await db.QueryAsync("SELECT * FROM meters LIMIT 10");
@@ -26,7 +26,7 @@ class TDenginePool {
     int port;
     string user;
     string password;
-    string token;       // "" = use user/password
+    string token;       // "" 表示使用用户名/密码
     string database;
     PoolCore<TDengineConnection> core;
 
@@ -55,9 +55,9 @@ class TDenginePool {
                                                   this.password, this.database);
     }
 
-    /// <summary>Checks out a connection: reuses an idle one, opens a new one if
-    /// under the cap, otherwise suspends the coroutine until one is released.
-    /// Returns null once the pool has been closed.</summary>
+    /// <summary>借出一个连接：复用空闲连接，未达上限则新建，
+    /// 否则挂起协程，直到有连接被归还。
+    /// 池已关闭后返回 null。</summary>
     async TDengineConnection AcquireAsync() {{
         while (true) {{
             if (this.core.IsClosed()) {{
@@ -65,8 +65,8 @@ class TDenginePool {
             }}
             TDengineConnection pooled = this.core.TakeIdle();
             while (pooled != null) {{
-                // A connection can rot while parked (server restart, idle
-                // timeout): evict it and free its slot for a waiter.
+                // 连接在停放期间可能失效（服务器重启、空闲超时），
+                // 将其逐出，把位置让给等待者。
                 if (pooled.IsConnected()) {{
                     return pooled;
                 }}
@@ -80,7 +80,7 @@ class TDenginePool {
                 }}
                 return opened;
             }}
-            // Pool saturated: park until a connection is released.
+            // 连接池已满：挂起等待连接被归还。
             this.core.EnterWait();
             await this.core.Waiter().Wait();
             this.core.LeaveWait();
@@ -88,8 +88,8 @@ class TDenginePool {
         return null;
     }}
 
-    /// <summary>Returns a connection to the pool. A broken or post-Close()
-    /// connection is closed and dropped instead of being pooled.</summary>
+    /// <summary>将连接归还给池。已损坏或 Close() 之后的
+    /// 连接会被直接关闭丢弃，不再入池。</summary>
     void Release(TDengineConnection c) {{
         if (c == null) {{
             return;
@@ -104,28 +104,28 @@ class TDenginePool {
         this.core.Pool(c);
     }}
 
-    /// <summary>Number of idle (pooled, ready-to-use) connections.</summary>
+    /// <summary>空闲（已入池、可用）连接数。</summary>
     int IdleCount() {{
         return this.core.IdleCount();
     }}
 
-    /// <summary>Total live connections (idle + checked out).</summary>
+    /// <summary>存活连接总数（空闲 + 已借出）。</summary>
     int LiveCount() {{
         return this.core.LiveCount();
     }}
 
-    /// <summary>Coroutines currently parked waiting for a connection.</summary>
+    /// <summary>当前挂起等待连接的协程数。</summary>
     int WaitingCount() {
         return this.core.WaitingCount();
     }
 
-    /// <summary>Maximum number of concurrently live connections.</summary>
+    /// <summary>并发存活连接数的上限。</summary>
     int MaxSize() {
         return this.core.MaxSize();
     }
 
-    /// <summary>Closes all idle connections and marks the pool closed. Connections
-    /// still checked out are closed when they are released.</summary>
+    /// <summary>关闭所有空闲连接并将池标记为已关闭。
+    /// 仍借出的连接会在归还时被关闭。</summary>
     void Close() {{
         this.core.MarkClosed();
         TDengineConnection c = this.core.TakeIdle();

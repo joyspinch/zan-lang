@@ -1,5 +1,6 @@
 using System;
 using System.Data;
+using System.Diagnostics;
 using ZanWeb;
 using System.Web;
 
@@ -67,7 +68,19 @@ class Program {
         WebHost.Use(app);
         app.AuthResolver(AuthToken.Resolve);
         app.PermissionResolver(AuthUser.Allow);
-        app.RankResolver(AuthUser.Rank);
+        // The sidebar is the route table read through the URLs: an action marked
+        // [Custom(IsMenu = true)] appears, its text is its [Description] and its
+        // section is its URL. These four lines are the only place a URL segment
+        // gets a Chinese name, and their order is the order of the sections --
+        // no controller declares a group, a parent or a rank.
+        MenuBuilder.Section("monitor", "概览");
+        MenuBuilder.Section("system", "系统");
+        MenuBuilder.Section("content", "内容");
+        MenuBuilder.Section("dev", "开发");
+        // A navigation that needs a session it does not have lands on the
+        // sign-in form; a script gets 401 JSON. One setting, decided in the
+        // dispatcher, so no controller carries its own "are you logged in".
+        app.LoginPath(Routes.Login);
         // Views are read from disk once, here, and rendered from memory after.
         // They keep the module layout of the controllers (views/Admin/... for
         // src/Controller/Admin/...), so the view keys are unchanged — but they
@@ -95,6 +108,21 @@ class Program {
         }
         Program.slowMs = Cfg.Log.slowMs;
         app.After(Program.Metrics);
+        // Errors always persist -- to the log file and, so the backend screen
+        // can query them, to metrics.db. The console echo is a debug
+        // convenience, off in production and toggleable at runtime.
+        ServerMetrics.Global()
+            .ErrorLog(Cfg.Log.errorLog, Cfg.Log.debug)
+            .OnError(MetricsStore.Failed);
+
+        // Per-minute, per-route history in its own database, written by one
+        // background coroutine every [metrics].flushSeconds (or sooner once
+        // [metrics].flushRows have piled up) -- never per request.
+        bool hist = await MetricsStore.Start();
+        if (hist) {
+            Console.WriteLine("[metrics] history " + Cfg.Metrics.path
+                + " flush=" + Convert.ToString(Cfg.Metrics.flushSeconds) + "s");
+        }
 
         // ---- routes ----
         // Routes are generated at COMPILE TIME from the [Route]/[Http*]/[Custom]/
@@ -103,16 +131,34 @@ class Program {
         // defaults with method-level overrides, expands [controller]/[action]
         // tokens, and synthesizes __AttrRoutes.Register(app) below. Add a
         // controller/action + attributes and rebuild -- no route table, no
-        // generated file to maintain, no external tool. Custom auth ranks plug
-        // in via app.RankResolver(...).
+        // generated file to maintain, no external tool.
         __AttrRoutes.Register(app);
 
+        // Rights follow the routes: the route table IS the list of rights, so a
+        // new controller (or a module the code generator writes) is grantable
+        // the moment it compiles. All this does is fill the two built-in roles
+        // in on a fresh database, which needs the registered routes.
+        if (ready) {
+            await Schema.SyncRoleGrants(app);
+            // Authorization then moves to shared memory: every worker process
+            // reads the same "role -> actions" rows, so the question the
+            // dispatcher and the sidebar ask on every request costs no query.
+            if (!PermTable.Open()) {
+                Console.WriteLine("[rbac] shared memory unavailable");
+            }
+            IDbConnection rbac = await AppServices.Current().Db().Acquire();
+            if (rbac != null) {
+                await PermTable.LoadRoles(rbac);
+                AppServices.Current().Db().Release(rbac);
+            }
+        }
+
         // The API reference is generated from those same attributes plus the
-        // parameters each action reads (this.In / this.Need), served offline at
-        // /api/docs with the OpenAPI document next to it at /api/docs.json.
-        // Nothing to write, nothing to regenerate: add an action and it appears.
+        // parameters each action reads (this.In / this.Need). The document is
+        // served at /api/docs.json; the reference people read is the admin
+        // screen at /admin/system/docs, so no second UI is mounted here.
         ApiDocs.Title(Cfg.Server.name);
-        ApiDocs.Mount(app);
+        ApiDocs.MountSpec(app, "/api/docs");
 
         // Single process, or N workers per config. Use
         // WebServer.RunCommand(app, Cfg.Worker.count) instead to get the
@@ -128,9 +174,26 @@ class Program {
     }
 
     static void Metrics(HttpContext ctx, int elapsedMs) {
+        // A stream is measured by what it pushed; timing it would file every
+        // open dashboard as a multi-minute request.
+        if (ctx.MetricsExcluded()) {
+            MetricsStore.Pushed(Program.RouteKey(ctx), ctx.Frames(),
+                ctx.FrameBytes());
+            return;
+        }
+        MetricsStore.Record(Program.RouteKey(ctx), ctx.status, (long)elapsedMs);
         if (elapsedMs > Program.slowMs) {
             Console.WriteLine("[slow] " + ctx.method + " " + ctx.path + " "
                 + Convert.ToString(elapsedMs) + "ms");
         }
+    }
+
+    /// <summary>What the history files a request under: the route's own action
+    /// ("Users.Save"), the same name the grants and the docs use. A request no
+    /// route claimed (a 404, an asset) is filed by method and path so it is
+    /// still visible.</summary>
+    static string RouteKey(HttpContext ctx) {
+        if (ctx.routeAction.Length > 0) { return ctx.routeAction; }
+        return ctx.method + " " + ctx.path;
     }
 }

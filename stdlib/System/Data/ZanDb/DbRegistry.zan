@@ -5,20 +5,20 @@ using System.Threading;
 namespace System.Data.ZanDb;
 
 /// <summary>
-/// Cross-process coordination for one database file, in three parts:
+/// 单个数据库文件的跨进程协调，分三部分：
 ///
-///   * a writer mutex -- an exclusive lock on a side file ("<db>-lock").
-///     The operating system drops it when the holder dies, so a crashed
-///     writer never wedges the database (a shared-memory mutex would);
-///   * the last committed transaction id, published in shared memory, so a
-///     reader can tell in ~100 ns whether its cached pages are still current
-///     instead of re-reading the meta page from disk on every lookup;
-///   * a reader table: each process publishes the oldest snapshot it is
-///     currently reading, so the writer knows which freed pages are still
-///     visible to somebody and must not be reused yet (MVCC).
+///   * 写入互斥锁——对侧文件（"<db>-lock"）的独占锁。
+///     持有者死亡时操作系统会自动释放，因此崩溃的
+///     写入者绝不会卡死数据库（共享内存互斥锁则会）；
+///   * 最后提交的事务 id，发布在共享内存中，因此
+///     读取者可在约 100 纳秒内判断其缓存的页面是否仍然有效，
+///     而不必在每次查找时重新从磁盘读取 meta 页；
+///   * 读取者表：每个进程发布其当前正在读取的
+///     最旧快照，这样写入者就知道哪些已释放的页仍对
+///     某些进程可见、尚不能复用（MVCC）。
 ///
-/// Everything is addressed by hash (SharedTable's ByHash API), so no keys are
-/// formatted and no strings are allocated on the hot path.
+/// 所有内容都通过哈希寻址（SharedTable 的 ByHash API），因此
+/// 热路径上不会格式化键，也不会分配字符串。
 /// </summary>
 class DbRegistry {
     static int MAX_READERS = 512;
@@ -26,7 +26,7 @@ class DbRegistry {
     SharedTable table;
     string dbName;
     PageFile lockFile;
-    int slot;              // this process's reader slot, -1 = none
+    int slot;              // 本进程的读取者槽位，-1 表示没有
     long slotHash;
     long wtxnHash;
     long slotsHash;
@@ -57,9 +57,9 @@ class DbRegistry {
         this.locked = false;
     }
 
-    /// <summary>Derives a shared-memory name from the database path (the file
-    /// name, so all processes opening the same database meet in the same
-    /// registry).</summary>
+    /// <summary>从数据库路径派生共享内存名称（只取文件名，
+    /// 这样打开同一数据库的所有进程都会在同一个
+    /// 注册表中相遇）。</summary>
     static string NameOf(string path) {
         string s = path;
         int i = s.Length - 1;
@@ -71,8 +71,8 @@ class DbRegistry {
         return "zandb:" + s;
     }
 
-    /// <summary>Attaches to (creating on first use) the registry of a
-    /// database file.</summary>
+    /// <summary>附加到（首次使用时创建）某个
+    /// 数据库文件的注册表。</summary>
     static DbRegistry Attach(string path) {
         DbRegistry r = new DbRegistry();
         r.dbName = DbRegistry.NameOf(path);
@@ -87,7 +87,7 @@ class DbRegistry {
             if (fresh.Create()) {
                 t = fresh;
             } else {
-                // Another process created it between Open and Create.
+                // 另一个进程在 Open 和 Create 之间创建了它。
                 t = SharedTable.Open(r.dbName);
             }
         }
@@ -104,15 +104,15 @@ class DbRegistry {
 
     bool IsShared() { return this.table.IsOpen(); }
 
-    /// <summary>Number of processes that currently have the database open.
-    /// A single-process database can skip snapshot publication entirely.</summary>
+    /// <summary>当前打开该数据库的进程数。</summary>
+    /// 单进程数据库可以完全跳过快照发布。</summary>
     int Processes() {
         if (!this.table.IsOpen()) { return 1; }
         return (int)this.table.GetIntAt(this.procsHash, "pid");
     }
 
-    /// <summary>Last committed transaction id as published by the writer
-    /// (0 when nothing has been committed since the registry appeared).</summary>
+    /// <summary>写入者发布的最后已提交事务 id
+    /// （注册表出现后未提交过任何内容时为 0）。</summary>
     long CommittedTxn() {
         if (!this.table.IsOpen()) { return 0; }
         return this.table.GetIntAt(this.wtxnHash, "txn");
@@ -123,9 +123,9 @@ class DbRegistry {
         this.table.SetIntAt(this.wtxnHash, "txn", txnid);
     }
 
-    // ===== writer mutex =====
+    // ===== 写入互斥锁 =====
 
-    /// <summary>Blocks until this process owns the single writer slot.</summary>
+    /// <summary>阻塞直到本进程获得唯一的写入者槽位。</summary>
     bool LockWrite() {
         if (this.locked) { return true; }
         if (!this.lockFile.IsOpen()) { return true; }
@@ -140,7 +140,7 @@ class DbRegistry {
         this.locked = false;
     }
 
-    // ===== reader table =====
+    // ===== 读取者表 =====
 
     long HashOfSlot(int index) {
         return SharedTable.Hash(this.dbName + "#r" + Convert.ToString(index));
@@ -159,8 +159,8 @@ class DbRegistry {
         #endif
     }
 
-    /// <summary>Claims a reader slot for this process, reusing the slot of a
-    /// process that has since died. Called once per database handle.</summary>
+    /// <summary>为本进程认领一个读取者槽位，复用
+    /// 已死亡进程的槽位。每个数据库句柄调用一次。</summary>
     void ClaimSlot() {
         if (this.slot >= 0 || !this.table.IsOpen()) { return; }
         long used = this.table.GetIntAt(this.slotsHash, "txn");
@@ -184,16 +184,16 @@ class DbRegistry {
         this.table.SetIntAt(this.slotHash, "pid", this.pid);
     }
 
-    /// <summary>Publishes the snapshot this process is reading (0 = idle).
-    /// One shared-memory store, no lock.</summary>
+    /// <summary>发布本进程正在读取的快照（0 表示空闲）。
+    /// 单个共享内存存储，无需加锁。</summary>
     void PublishSnapshot(long txnid) {
         if (this.slot < 0) { return; }
         this.table.SetIntAt(this.slotHash, "txn", txnid);
     }
 
-    /// <summary>Oldest snapshot any live process is reading, or 0 when nobody
-    /// is reading. Pages freed by a transaction newer than this must stay
-    /// untouched; everything older can be reused.</summary>
+    /// <summary>当前存活的进程正在读取的最旧快照；若没有进程
+    /// 在读取则返回 0。比它更新的事务释放的页面必须保持
+    /// 不动；更旧的页面则可复用。</summary>
     long OldestSnapshot() {
         if (!this.table.IsOpen()) { return 0; }
         long used = this.table.GetIntAt(this.slotsHash, "txn");

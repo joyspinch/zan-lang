@@ -7,89 +7,106 @@ using ZanWeb;
 namespace ZanWeb.Admin;
 
 /// <summary>
-/// The admin dashboard at /admin. It reads the numbers the framework already
-/// keeps — WebApp.MetricsJson() is the same snapshot /admin/metrics/index serves —
-/// instead of counting anything itself, so the page and the API can never
-/// disagree.
-///
-/// The cards refresh in place: htmx re-requests this very page every 10s and
-/// swaps only #cards out of the response (hx-select), so there is no second
-/// fragment endpoint to keep in step with the page.
+/// The dashboard at /admin: what the system holds and how it is behaving right
+/// now. The live numbers come from the same snapshot the monitor streams, so
+/// the two screens cannot disagree, and they arrive over the metrics event
+/// stream instead of a timed reload.
 /// </summary>
 [Route("admin/[controller]/[action]")]
+[Custom(Authorization = CustomAuthorization.Login)]
 [Description("仪表盘")]
 class Dashboard : AdminController {
     /// The sidebar entry is this attribute -- see AdminController.Layout, which
-    /// asks MenuBuilder for the entries this account may reach. Nothing lists
-    /// the navigation a second time.
+    /// asks MenuBuilder for the entries this account may reach. Nothing lists the
+    /// navigation a second time.
     [HttpGet]
     [Route("/admin")]
-    [Custom(IsMenu = true, MenuGroup = "概览", Rank = 10, Icon = "mdi:gauge")]
+    [Custom(IsMenu = true, Icon = "mdi:gauge")]
     [Description("仪表盘")]
     async void Index() {
         ViewData d = await this.Layout("仪表盘");
-        if (d == null) { return; }
 
         JsonValue m = JsonValue.ParseLenient(WebHost.Current().MetricsJson());
         JsonValue req = m.Get("requests");
-        JsonValue q = m.Get("queries");
         if (req == null) { req = JsonValue.NewObject(); }
-        if (q == null) { q = JsonValue.NewObject(); }
 
         d.Set("requests", Convert.ToString(req.Long("count", 0)));
         d.Set("errors", Convert.ToString(req.Long("errors", 0)));
-        d.Set("avgMs", Convert.ToString(req.Long("avg_ms", 0)) + " ms");
-        d.Set("maxMs", Convert.ToString(req.Long("max_ms", 0)) + " ms");
-        d.Set("queries", Convert.ToString(q.Long("count", 0)));
-        d.Set("queryAvgMs", Convert.ToString(q.Long("avg_ms", 0)) + " ms");
-        d.Set("uptime", AdminController.Uptime(m.Long("uptime_ms", 0)));
-        d.Set("cpu", AdminController.Percent(m.Long("cpu_percent", -1)));
-        d.Set("mem", AdminController.Bytes(m.Long("mem_rss_bytes", -1)));
-        d.Set("pid", Convert.ToString(m.Long("pid", 0)));
-        d.Set("worker", Convert.ToString(m.Long("worker_id", 0)));
-        d.Set("slowMs", Convert.ToString(req.Long("slow_threshold_ms", 0)) + " ms");
+        d.Set("avgMs", Convert.ToString(req.Long("avg_ms", 0)));
+        d.Set("uptime", Fmt.Uptime(m.Long("uptime_ms", 0)));
 
-        List<StrMap> slow = d.AddList("slow");
-        JsonValue rows = m.Get("slow_requests");
-        if (rows != null) {
-            for (int i = rows.Count() - 1; i >= 0; i = i - 1) {
-                JsonValue e = rows.At(i);
-                StrMap row = new StrMap();
-                row.Set("req", e.Str("req", ""));
-                row.Set("ms", Convert.ToString(e.Long("ms", 0)));
-                slow.Add(row);
-            }
-        }
-        // {{#if}} reads variables, not lists, so the empty state gets its own flag.
-        d.Set("slowCount", Convert.ToString(slow.Count));
-        if (slow.Count == 0) { d.Set("noSlow", "1"); }
-
-        d.Set("cacheKind", Dashboard.CacheKind(this.Cache()));
-        d.Set("pool", "n/a");
-        DbContext db = this.Db();
-        if (db != null) {
-            d.Set("pool", "idle=" + Convert.ToString(db.IdleCount())
-                + " live=" + Convert.ToString(db.LiveCount())
-                + " waiting=" + Convert.ToString(db.WaitingCount()));
-        }
-
-        // Business counters need the database; an unavailable one is reported as
-        // such rather than rendered as a zero the operator would trust.
-        d.Set("users", "n/a");
-        d.Set("posts", "n/a");
-        d.Set("published", "n/a");
+        d.Set("users", "—");
+        d.Set("posts", "—");
+        d.Set("published", "—");
+        d.Set("drafts", "—");
+        d.Set("comments", "—");
+        d.Set("pending", "—");
         if (this.DbReady()) {
-            d.Set("users", Convert.ToString(await this.User.CountAsync()));
-            d.Set("posts", Convert.ToString(await this.Post.CountAsync()));
-            d.Set("published", Convert.ToString(
-                await this.Post.Where(a => a.published == 1).CountAsync()));
+            int users = await this.User.CountAsync();
+            int posts = await this.Post.CountAsync();
+            int published = await this.Post.Where(a => a.published == 1).CountAsync();
+            int comments = await this.Comment.CountAsync();
+            int pending = await this.Comment.Where(a => a.status == 0).CountAsync();
+            d.Set("users", Convert.ToString(users));
+            d.Set("posts", Convert.ToString(posts));
+            d.Set("published", Convert.ToString(published));
+            d.Set("drafts", Convert.ToString(posts - published));
+            d.Set("comments", Convert.ToString(comments));
+            d.Set("pending", Convert.ToString(pending));
+
+            List<ZanWeb.Model.Blog.Post> recent = await this.Post
+                .OrderByDescending(a => a.id).Take(8).ToListAsync();
+            List<StrMap> rows = d.AddList("recent");
+            for (int i = 0; i < recent.Count; i = i + 1) {
+                ZanWeb.Model.Blog.Post p = recent[i];
+                StrMap row = new StrMap();
+                row.Set("id", Convert.ToString(p.id));
+                row.Set("title", p.title);
+                row.Set("author", Fmt.Dash(p.author));
+                row.Set("createdAt", Fmt.Day(p.createdAt));
+                row.Set("stateText", Dashboard.StateText(p.published));
+                row.Set("stateClass", Dashboard.StateClass(p.published));
+                rows.Add(row);
+            }
+            if (recent.Count == 0) { d.Set("noRecent", "1"); }
+
+            List<ZanWeb.Model.Sys.LoginLog> logins = await this.LoginLog
+                .OrderByDescending(a => a.id).Take(8).ToListAsync();
+            List<StrMap> lrows = d.AddList("logins");
+            for (int i = 0; i < logins.Count; i = i + 1) {
+                ZanWeb.Model.Sys.LoginLog l = logins[i];
+                StrMap row = new StrMap();
+                row.Set("username", Fmt.Dash(l.username));
+                row.Set("ip", Fmt.Dash(l.ip));
+                row.Set("createdAt", Fmt.Stamp(l.createdAt));
+                row.Set("okText", Dashboard.OkText(l.ok));
+                row.Set("okClass", Dashboard.OkClass(l.ok));
+                lrows.Add(row);
+            }
+            if (logins.Count == 0) { d.Set("noLogins", "1"); }
+        } else {
+            d.Set("dbDown", "1");
         }
-        this.View(d);
+        this.Page(d);
     }
 
-    static string CacheKind(CacheContext cache) {
-        if (cache == null) { return "n/a"; }
-        if (cache.Shared()) { return "redis（跨 worker 共享）"; }
-        return "memory（仅本 worker）";
+    static string StateText(int published) {
+        if (published == 1) { return "已发布"; }
+        return "草稿";
+    }
+
+    static string StateClass(int published) {
+        if (published == 1) { return "ok"; }
+        return "off";
+    }
+
+    static string OkText(int ok) {
+        if (ok == 1) { return "成功"; }
+        return "失败";
+    }
+
+    static string OkClass(int ok) {
+        if (ok == 1) { return "ok"; }
+        return "bad";
     }
 }

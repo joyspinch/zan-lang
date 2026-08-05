@@ -4,29 +4,29 @@ using System.Threading;
 namespace System.Data;
 
 /// <summary>
-/// Driver-agnostic, coroutine-aware connection pool.
+/// 与驱动无关、支持协程的连接池。
 ///
-/// Connections are opened lazily through an <see cref="IDbConnector"/> up to
-/// <c>maxSize</c> and reused across coroutines. When every connection is
-/// checked out and the cap is reached, <see cref="AcquireAsync"/> suspends the
-/// calling coroutine on an event-driven <see cref="Gate"/> (no polling, no
-/// timer) instead of blocking the worker thread, and is resumed the moment a
-/// connection comes back through <see cref="Release"/>. A connection that has
-/// died is evicted rather than pooled, freeing its slot for a waiter.
+/// 连接通过 <see cref="IDbConnector"/> 惰性打开，最多
+/// <c>maxSize</c> 个，并在协程间复用。当所有连接
+/// 都被借出且达到上限时，<see cref="AcquireAsync"/> 会挂起
+/// 调用协程，等待基于事件的 <see cref="Gate"/>（无轮询、无
+/// 定时器），而不是阻塞工作线程；一旦有连接
+/// 通过 <see cref="Release"/> 归还便立即恢复。已失效的连接
+/// 会被逐出而非回收，把名额让给等待者。
 ///
-/// The pool relies on the cooperative single-thread-per-scheduler model: the
-/// free-list is only touched between await points, so no lock is required.
+/// 连接池依赖每个调度器单线程的协作模型：
+/// 空闲列表只在 await 之间访问，因此无需加锁。
 ///
-/// Usage:
+/// 用法：
 ///   DbPool pool = SqliteConnector.Pool("app.sqlite3", 8);
 ///   IDbConnection db = await pool.AcquireAsync();
 ///   DbResult r = db.Query("SELECT * FROM users");
 ///   pool.Release(db);
 ///   pool.Close();
 ///
-/// Drivers whose queries are themselves coroutines (MySQL, PostgreSQL) also
-/// ship a typed pool -- <c>MySqlPool</c>, <c>PgPool</c> -- returning the
-/// concrete connection so <c>QueryAsync</c> stays reachable.
+/// 查询本身即为协程的驱动（MySQL、PostgreSQL）还提供
+/// 类型化连接池——<c>MySqlPool</c>、<c>PgPool</c>——返回
+/// 具体连接类型，使 <c>QueryAsync</c> 仍可调用。
 /// </summary>
 class DbPool {
     IDbConnector connector;
@@ -41,9 +41,9 @@ class DbPool {
         return await this.connector.ConnectAsync();
     }
 
-    /// <summary>Checks out a connection: reuses an idle one, opens a new one if
-    /// under the cap, otherwise suspends the coroutine until one is released.
-    /// Returns null once the pool has been closed.</summary>
+    /// <summary>借出一个连接：复用空闲连接，未达上限时新建，
+    /// 否则挂起协程直到有连接被释放。
+    /// 连接池关闭后返回 null。</summary>
     async IDbConnection AcquireAsync() {{
         while (true) {{
             if (this.core.IsClosed()) {{
@@ -51,8 +51,8 @@ class DbPool {
             }}
             IDbConnection pooled = this.core.TakeIdle();
             while (pooled != null) {{
-                // A connection can rot while parked (server restart, idle
-                // timeout): evict it and free its slot for a waiter.
+                // 连接停放期间可能失效（服务重启、空闲
+                // 超时）：将其逐出，把名额让给等待者。
                 if (pooled.IsConnected()) {{
                     return pooled;
                 }}
@@ -66,7 +66,7 @@ class DbPool {
                 }}
                 return opened;
             }}
-            // Pool saturated: park until a connection is released.
+            // 连接池已满：挂起等待，直到有连接释放。
             this.core.EnterWait();
             await this.core.Waiter().Wait();
             this.core.LeaveWait();
@@ -74,8 +74,8 @@ class DbPool {
         return null;
     }}
 
-    /// <summary>Returns a connection to the pool. A broken or post-Close()
-    /// connection is closed and dropped instead of being pooled.</summary>
+    /// <summary>将连接归还连接池。已损坏或 Close() 之后
+    /// 的连接会被关闭丢弃，不再入池。</summary>
     void Release(IDbConnection c) {{
         if (c == null) {{
             return;
@@ -90,12 +90,12 @@ class DbPool {
         this.core.Pool(c);
     }}
 
-    /// <summary>Checks out an already-idle connection without suspending, or
-    /// returns null when none is parked. For synchronous call sites (a hook or
-    /// resolver that is not a coroutine) over drivers whose IO is synchronous
-    /// anyway; it never opens a connection, because opening is a coroutine, so
-    /// warm the pool with <see cref="WarmupAsync"/> at startup and treat null as
-    /// "capacity exhausted". Release it exactly like an acquired one.</summary>
+    /// <summary>借出已空闲的连接而不挂起；没有空闲连接时
+    /// 返回 null。适用于同步调用点（非协程的钩子或
+    /// 解析器），且驱动 IO 本身是同步的；它从不新建连接，因为
+    /// 打开连接是协程操作，所以应在启动时用
+    /// <see cref="WarmupAsync"/> 预热连接池，并把 null 视为
+    /// "容量已耗尽"。归还方式与借出的连接相同。</summary>
     IDbConnection TryAcquire() {
         if (this.core.IsClosed()) {
             return null;
@@ -111,10 +111,10 @@ class DbPool {
         return null;
     }
 
-    /// <summary>Opens up to <paramref name="count"/> connections (capped by
-    /// maxSize) and parks them, so the first requests -- and every
-    /// <see cref="TryAcquire"/> caller -- find a live connection. Returns the
-    /// number now idle, 0 when the database is unreachable.</summary>
+    /// <summary>最多打开 <paramref name="count"/> 个连接（上限为
+    /// maxSize）并停放，使首批请求——以及每次
+    /// <see cref="TryAcquire"/> 的调用方——都能拿到活跃连接。返回
+    /// 当前空闲的数量；数据库不可达时返回 0。</summary>
     async int WarmupAsync(int count) {
         int want = count;
         if (want > this.core.MaxSize()) { want = this.core.MaxSize(); }
@@ -132,38 +132,38 @@ class DbPool {
         return this.core.IdleCount();
     }
 
-    /// <summary>Number of idle (pooled, ready-to-use) connections.</summary>
+    /// <summary>空闲（已入池、可即用）连接数。</summary>
     int IdleCount() {{
         return this.core.IdleCount();
     }}
 
-    /// <summary>Total live connections (idle + checked out).</summary>
+    /// <summary>活跃连接总数（空闲 + 已借出）。</summary>
     int LiveCount() {{
         return this.core.LiveCount();
     }}
 
-    /// <summary>Coroutines currently parked waiting for a connection.</summary>
+    /// <summary>当前挂起等待连接的协程数。</summary>
     int WaitingCount() {
         return this.core.WaitingCount();
     }
 
-    /// <summary>Maximum number of concurrently live connections.</summary>
+    /// <summary>并发活跃连接的最大数量。</summary>
     int MaxSize() {
         return this.core.MaxSize();
     }
 
-    /// <summary>True once <see cref="Close"/> has run.</summary>
+    /// <summary><see cref="Close"/> 调用过后为 true。</summary>
     bool IsClosed() {
         return this.core.IsClosed();
     }
 
-    /// <summary>The <see cref="DbProvider"/> id served by this pool.</summary>
+    /// <summary>此连接池服务的 <see cref="DbProvider"/> id。</summary>
     int GetProvider() {
         return this.connector.GetProvider();
     }
 
-    /// <summary>Closes all idle connections and marks the pool closed. Connections
-    /// still checked out are closed when they are released.</summary>
+    /// <summary>关闭所有空闲连接并将连接池标记为已关闭。仍
+    /// 被借出的连接会在归还时关闭。</summary>
     void Close() {{
         this.core.MarkClosed();
         IDbConnection c = this.core.TakeIdle();

@@ -3,52 +3,52 @@ using System;
 namespace System.Threading;
 
 /// <summary>
-/// A hand-off queue between OS threads -- the equivalent of C#'s
-/// <c>BlockingCollection</c> / <c>Channel</c>.
+/// 操作系统线程之间的交接队列——相当于 C# 的
+/// <c>BlockingCollection</c> / <c>Channel</c>。
 ///
 /// <code>
 /// BlockingQueue&lt;string&gt; q = new BlockingQueue&lt;string&gt;(null, 0);
 /// Thread.Start(() =&gt; { q.Enqueue("row"); q.Complete(); });
-/// string row = q.Dequeue();          // parks until an item or completion
+/// string row = q.Dequeue();          // 阻塞直到有数据或队列结束
 /// while (row != null) { ...; row = q.Dequeue(); }
 /// </code>
 ///
-/// <see cref="Channel"/> is a coroutine primitive: it hands values between
-/// tasks driven by ONE thread's scheduler and would spin (or miss a wake-up)
-/// across real threads. This queue is the cross-thread one: the item list is
-/// guarded by a mutex, and a consumer with nothing to take parks on an OS
-/// semaphore until a producer posts. `Dequeue` returns null once the queue is
-/// completed and drained, so a consumer loop ends on its own -- `empty` is
-/// the sentinel the queue hands back then, supplied at Create because a
-/// generic value type has no null.
+/// <see cref="Channel"/> 是协程原语：用于在任务之间传递值，
+/// 这些任务由单一线程的调度器驱动；跨真实线程时会自旋（或错过唤醒）
+/// 。本队列是跨线程版本：条目列表
+/// 受互斥锁保护，消费方无数据可取时挂起在操作系统
+/// 信号量上，直到生产方投递。队列完成并取空后，`Dequeue` 返回 null，
+/// 消费循环自行结束——`empty` 就是
+/// 队列当时交回的哨兵值，在 Create 时提供，因为
+/// 泛型值类型没有 null。
 ///
-/// A producer that fails can shut the queue down with
-/// <see cref="CompleteWithFault"/> instead of a plain <see cref="Complete"/>:
-/// consumers drain whatever is left, then see the message in
-/// <see cref="GetFault"/> instead of a clean EOF. <see cref="Cancel"/> is the
-/// abort path: it discards everything still queued, wakes every parked
-/// consumer and producer, and marks the queue so <see cref="IsCanceled"/>
-/// reports true.
+/// 失败的生产方可以用
+/// <see cref="CompleteWithFault"/> 代替普通的 <see cref="Complete"/>：
+/// 消费者先取走剩余数据，然后通过
+/// <see cref="GetFault"/> 看到错误信息而不是干净的 EOF。<see cref="Cancel"/> 是
+/// 中止路径：丢弃所有仍排队的条目，唤醒所有挂起的
+/// 消费者和生产方，并标记队列，使 <see cref="IsCanceled"/>
+/// 返回 true。
 /// </summary>
 class BlockingQueue<T> {
     List<T> items;
-    /// Index of the next item to hand out; the list is compacted lazily so a
-    /// long-lived queue does not shift every element on each take.
+    /// 下一个待取出条目的索引；列表惰性压缩，避免
+    /// 长生命周期队列每次取出都搬移所有元素。
     int head;
-    /// Set by Complete: no more items will arrive, so parked consumers are
-    /// released with null instead of waiting forever.
+    /// 由 Complete 设置：不再会有条目到达，挂起的消费者
+    /// 以 null 被唤醒，而不是永远等待。
     bool closed;
     int waiters;
-    /// Items the queue may hold before producers are made to wait; 0 means
-    /// unbounded.
+    /// 队列在让生产方等待前可容纳的条目数；0 表示
+    /// 无上限。
     int capacity;
-    /// Producers parked on `slots` because the queue is full.
+    /// 因队列已满而挂起在 `slots` 上的生产方。
     int posters;
-    /// Handed back by a take that has nothing to give.
+    /// 在无条目可取时由 take 交回给调用方。
     T empty;
-    /// Failure message from CompleteWithFault; "" means no fault.
+    /// 来自 CompleteWithFault 的失败信息；"" 表示无故障。
     string fault;
-    /// Set by Cancel: the queue was aborted, pending items were dropped.
+    /// 由 Cancel 设置：队列被中止，待处理条目已丢弃。
     bool canceled;
 
     #if WINDOWS
@@ -71,11 +71,11 @@ class BlockingQueue<T> {
         this.canceled = false;
     }
 
-    /// <summary>A queue that holds at most `capacity` items: once it is full a
-    /// producer parks in Enqueue until a consumer takes one, so a fast
-    /// producer cannot outrun its consumer and grow the queue without bound.
-    /// A capacity of 0 is unbounded. `empty` is the sentinel Dequeue hands
-    /// back once the queue is completed and drained.</summary>
+    /// <summary>最多容纳 `capacity` 个条目的队列：一旦满，
+    /// 生产方在 Enqueue 中挂起，直到消费者取走一个，因此快的
+    /// 生产方不会超过消费方，队列不会无限增长。
+    /// 容量 0 表示无上限。`empty` 是队列完成并取空后
+    /// 由 Dequeue 交回的哨兵值。</summary>
     BlockingQueue(T empty, int capacity) {
         this.head = 0;
         this.closed = false;
@@ -93,8 +93,8 @@ class BlockingQueue<T> {
         this.slots = Semaphore.Create(0, 1048576);
     }
 
-    /// <summary>Posts one item and wakes a parked consumer, parking the caller
-    /// while a bounded queue is full. False once the queue is completed.</summary>
+    /// <summary>投递一个条目并唤醒挂起的消费者；有界队列满时
+    /// 挂起调用方。队列结束后返回 false。</summary>
     bool Enqueue(T item) {
         while (true) {
             Mutex.Lock(this.lockHandle);
@@ -107,7 +107,7 @@ class BlockingQueue<T> {
                 this.posters = this.posters + 1;
                 Mutex.Unlock(this.lockHandle);
                 Semaphore.Wait(this.slots);
-                // Woken by a take or by Complete: re-check under the lock.
+                // 被 take 或 Complete 唤醒：在锁内重新检查。
                 continue;
             }
             this.items.Add(item);
@@ -119,8 +119,8 @@ class BlockingQueue<T> {
         }
     }
 
-    /// <summary>Takes the next item, or the `empty` sentinel when the queue
-    /// has nothing right now.</summary>
+    /// <summary>取出下一个条目；若队列当前
+    /// 没有数据，则返回 `empty` 哨兵。</summary>
     T TryDequeue() {
         Mutex.Lock(this.lockHandle);
         T v = this.TakeLocked();
@@ -131,10 +131,10 @@ class BlockingQueue<T> {
         return v;
     }
 
-    /// <summary>Takes the next item, waiting at most `timeoutMs` for one.
-    /// Returns the `empty` sentinel both when the wait runs out and when the
-    /// queue is completed and drained; <see cref="IsCompleted"/> tells the two
-    /// apart. A negative timeout waits forever.</summary>
+    /// <summary>取出下一个条目，最多等待 `timeoutMs` 毫秒。
+    /// 等待超时或队列
+    /// 完成并取空时也返回 `empty` 哨兵；<see cref="IsCompleted"/> 可区分二者
+    /// 。负超时表示无限等待。</summary>
     T DequeueFor(int timeoutMs) {
         while (true) {
             Mutex.Lock(this.lockHandle);
@@ -153,9 +153,9 @@ class BlockingQueue<T> {
             this.waiters = this.waiters + 1;
             Mutex.Unlock(this.lockHandle);
             if (Semaphore.WaitFor(this.sem, timeoutMs)) { continue; }
-            // Timed out: withdraw the registration unless a producer has
-            // already paired it with a post, in which case loop once more and
-            // pick the item up.
+            // 已超时：撤回注册，除非生产方
+            // 已将其与一次投递配对；这种情况下再循环一次
+            // 把条目取走。
             Mutex.Lock(this.lockHandle);
             bool parked = this.waiters > 0;
             if (parked) { this.waiters = this.waiters - 1; }
@@ -165,9 +165,9 @@ class BlockingQueue<T> {
         }
     }
 
-    /// <summary>Takes the next item, parking the calling thread until one is
-    /// posted. Returns the `empty` sentinel once the queue is completed and
-    /// drained.</summary>
+    /// <summary>取出下一个条目，挂起调用线程直到有数据
+    /// 投递。队列完成并取空后返回 `empty` 哨兵
+    /// 。</summary>
     T Dequeue() {
         while (true) {
             Mutex.Lock(this.lockHandle);
@@ -186,20 +186,20 @@ class BlockingQueue<T> {
             this.waiters = this.waiters + 1;
             Mutex.Unlock(this.lockHandle);
             Semaphore.Wait(this.sem);
-            // Woken for an item or for completion: loop and re-read under the
-            // lock, which is also what makes a spurious wake harmless.
+            // 为条目或完成而唤醒：在锁下循环重新读取，
+            // 这也使得虚假唤醒无害。
         }
     }
 
-    /// <summary>Ends the queue: no further items are accepted and every
-    /// parked consumer is released.</summary>
+    /// <summary>结束队列：不再接受新条目，所有
+    /// 挂起的消费者都会被唤醒。</summary>
     void Complete() {
         this.CompleteWithFault("");
     }
 
-    /// <summary>Ends the queue with a failure. Consumers drain what is left,
-    /// then see the message via <see cref="GetFault"/> instead of a clean
-    /// EOF; Enqueue refuses new items from here on.</summary>
+    /// <summary>以失败结束队列。消费者先取走剩余条目，
+    /// 然后通过 <see cref="GetFault"/> 获取错误信息，而非干净的
+    /// EOF；此后 Enqueue 拒绝新条目。</summary>
     void CompleteWithFault(string message) {
         Mutex.Lock(this.lockHandle);
         this.closed = true;
@@ -212,23 +212,23 @@ class BlockingQueue<T> {
         for (int i = 0; i < wake; i = i + 1) {
             Semaphore.Release(this.sem);
         }
-        // A producer parked on a full queue must come back and see `closed`
-        // instead of waiting for room that will never be taken.
+        // 因队列满而挂起的生产方必须回来检查 `closed`，
+        // 而不是等待永远不会被取走的空位。
         for (int j = 0; j < free; j = j + 1) {
             Semaphore.Release(this.slots);
         }
     }
 
-    /// <summary>Aborts the queue: drops every item still waiting, wakes all
-    /// parked consumers and producers, and marks the queue cancelled so
-    /// <see cref="IsCanceled"/> reports true. Consumers see the empty sentinel
-    /// (the queue is closed and drained); Enqueue returns false.</summary>
+    /// <summary>中止队列：丢弃所有仍在等待的条目，唤醒所有
+    /// 挂起的消费者和生产方，并将队列标记为已取消，使
+    /// <see cref="IsCanceled"/> 返回 true。消费者看到的是空哨兵
+    /// （队列已关闭并取空）；Enqueue 返回 false。</summary>
     void Cancel() {
         Mutex.Lock(this.lockHandle);
         this.canceled = true;
         this.closed = true;
         this.fault = "";
-        this.head = this.items.Count;   // discard everything queued
+        this.head = this.items.Count;   // 丢弃所有排队条目
         int wake = this.waiters;
         this.waiters = 0;
         int free = this.posters;
@@ -242,8 +242,8 @@ class BlockingQueue<T> {
         }
     }
 
-    /// <summary>True after <see cref="Cancel"/>: the queue was aborted rather
-    /// than completed.</summary>
+    /// <summary>在 <see cref="Cancel"/> 之后为 true：队列是被中止
+    /// 而非正常完成。</summary>
     bool IsCanceled() {
         Mutex.Lock(this.lockHandle);
         bool v = this.canceled;
@@ -251,8 +251,8 @@ class BlockingQueue<T> {
         return v;
     }
 
-    /// <summary>The failure message from <see cref="CompleteWithFault"/>, or
-    /// "" when the queue ended cleanly or was cancelled.</summary>
+    /// <summary>来自 <see cref="CompleteWithFault"/> 的失败信息，或
+    /// 队列正常结束或被取消时为 ""。</summary>
     string GetFault() {
         Mutex.Lock(this.lockHandle);
         string v = this.fault;
@@ -267,7 +267,7 @@ class BlockingQueue<T> {
         return v;
     }
 
-    /// <summary>Items waiting to be taken.</summary>
+    /// <summary>等待被取出的条目数。</summary>
     int Count() {
         Mutex.Lock(this.lockHandle);
         int v = this.items.Count - this.head;
@@ -281,8 +281,8 @@ class BlockingQueue<T> {
         Mutex.Destroy(this.lockHandle);
     }
 
-    /// Pops one item; the caller holds the lock. Compacts once the consumed
-    /// prefix is the bigger half, which keeps both ends O(1) amortized.
+    /// 弹出一个条目；调用方持有锁。当已消费前缀
+    /// 超过一半时压缩，保证两端均摊 O(1)。
     T TakeLocked() {
         if (this.head >= this.items.Count) { return this.empty; }
         T v = this.items[this.head];

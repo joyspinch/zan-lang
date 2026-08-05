@@ -5,15 +5,15 @@ using System.Threading;
 namespace System.Data.SqlServer;
 
 /// <summary>
-/// Coroutine-aware connection pool for <see cref="SqlServerConnection"/>.
+/// 适用于 <see cref="SqlServerConnection"/> 的协程感知连接池。
 ///
-/// Same contract as <see cref="DbPool"/> -- lazy growth up to <c>maxSize</c>,
-/// <see cref="Gate"/>-driven waiting rather than polling, eviction of dead
-/// connections -- but typed, so the coroutine query API (<c>QueryAsync</c>,
-/// <c>ExecuteAsync</c>) stays reachable. A TDS login costs several round trips,
-/// which is the reason to keep sessions rather than open one per statement.
+/// 与 <see cref="DbPool"/> 契约相同——惰性增长至 <c>maxSize</c>，
+/// 用 <see cref="Gate"/> 驱动等待而非轮询，驱逐失效的
+/// 连接——但保留类型，因此协程查询 API（<c>QueryAsync</c>、
+/// <c>ExecuteAsync</c>）仍然可用。一次 TDS 登录需要多轮往返，
+/// 因此应复用会话，而非每条语句都新建一个。
 ///
-/// Usage:
+/// 用法：
 ///   SqlServerPool pool = new SqlServerPool("127.0.0.1", 1433, "master", "sa", "secret", 8);
 ///   SqlServerConnection db = await pool.AcquireAsync();
 ///   DbResult r = await db.QueryAsync("SELECT TOP 10 * FROM sys.objects");
@@ -44,9 +44,9 @@ class SqlServerPool {
                                                    this.password);
     }
 
-    /// <summary>Checks out a connection: reuses an idle one, opens a new one if
-    /// under the cap, otherwise suspends the coroutine until one is released.
-    /// Returns null once the pool has been closed.</summary>
+    /// <summary>借出一条连接：复用空闲连接，未达到上限则新建，
+    /// 否则挂起协程直到有连接被释放。
+    /// 连接池关闭后返回 null。</summary>
     async SqlServerConnection AcquireAsync() {{
         while (true) {{
             if (this.core.IsClosed()) {{
@@ -54,8 +54,8 @@ class SqlServerPool {
             }}
             SqlServerConnection pooled = this.core.TakeIdle();
             while (pooled != null) {{
-                // A connection can rot while parked (server restart, idle
-                // timeout): evict it and free its slot for a waiter.
+                // 连接在池中闲置时可能已失效（服务器重启、空闲超时），
+                // 此时应将其驱逐，把名额让给等待者。
                 if (pooled.IsConnected()) {{
                     return pooled;
                 }}
@@ -69,7 +69,7 @@ class SqlServerPool {
                 }}
                 return opened;
             }}
-            // Pool saturated: park until a connection is released.
+            // 连接池已满：挂起等待直到有连接被释放。
             this.core.EnterWait();
             await this.core.Waiter().Wait();
             this.core.LeaveWait();
@@ -77,8 +77,8 @@ class SqlServerPool {
         return null;
     }}
 
-    /// <summary>Returns a connection to the pool. A broken or post-Close()
-    /// connection is closed and dropped instead of being pooled.</summary>
+    /// <summary>将连接归还连接池。已损坏或 Close() 之后的
+    /// 连接将被关闭并丢弃，而不会入池。</summary>
     void Release(SqlServerConnection c) {{
         if (c == null) {{
             return;
@@ -93,28 +93,28 @@ class SqlServerPool {
         this.core.Pool(c);
     }}
 
-    /// <summary>Number of idle (pooled, ready-to-use) connections.</summary>
+    /// <summary>空闲（已入池、可直接使用）连接数。</summary>
     int IdleCount() {{
         return this.core.IdleCount();
     }}
 
-    /// <summary>Total live connections (idle + checked out).</summary>
+    /// <summary>活跃连接总数（空闲 + 已借出）。</summary>
     int LiveCount() {{
         return this.core.LiveCount();
     }}
 
-    /// <summary>Coroutines currently parked waiting for a connection.</summary>
+    /// <summary>当前挂起等待连接的协程数。</summary>
     int WaitingCount() {
         return this.core.WaitingCount();
     }
 
-    /// <summary>Maximum number of concurrently live connections.</summary>
+    /// <summary>并发活跃连接数上限。</summary>
     int MaxSize() {
         return this.core.MaxSize();
     }
 
-    /// <summary>Closes all idle connections and marks the pool closed. Connections
-    /// still checked out are closed when they are released.</summary>
+    /// <summary>关闭所有空闲连接并将连接池标记为已关闭。
+    /// 仍被借出的连接在归还时关闭。</summary>
     void Close() {{
         this.core.MarkClosed();
         SqlServerConnection c = this.core.TakeIdle();

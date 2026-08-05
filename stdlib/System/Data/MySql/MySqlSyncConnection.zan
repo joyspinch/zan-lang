@@ -6,23 +6,23 @@ using System.Security.Cryptography;
 namespace System.Data.MySql;
 
 /// <summary>
-/// Synchronous, native MySQL / MariaDB client that speaks the MySQL wire
-/// protocol over blocking sockets -- no ODBC driver, no libmariadb, no native
-/// database DLL. This is the driver <see cref="DbConnection.OpenMySQL"/> uses by
-/// default, so the ORM (Model / QueryBuilder / Migration) works against MySQL
-/// out of the box on machines that only have the MySQL server, not its ODBC
-/// driver.
+/// 同步的原生 MySQL / MariaDB 客户端，直接实现 MySQL wire
+/// 协议（阻塞套接字），无需 ODBC 驱动、libmariadb 或原生
+/// 数据库 DLL。<see cref="DbConnection.OpenMySQL"/> 默认使用此驱动，
+/// 因此 ORM（Model / QueryBuilder / Migration）在只装有
+/// MySQL server（而无 ODBC 驱动）的机器上即可开箱即用，
+/// 无需任何额外原生驱动。
 ///
-/// Authentication implements <c>caching_sha2_password</c> fast-auth (the MySQL
-/// 8.x default) plus full auth (RSA-OAEP with the server's public key) for a
-/// cold credential cache, and <c>mysql_native_password</c> auth-switch -- all
-/// in pure Zan (Sha256/Sha1/Rsa from System.Security.Cryptography).
+/// 认证实现了 <c>caching_sha2_password</c> 快速认证（MySQL
+/// 8.x 的默认方式），并提供完整认证（使用服务器公钥的 RSA-OAEP）以应对
+/// 凭据缓存冷启动的情况，以及 <c>mysql_native_password</c> 认证切换——全部
+/// 用纯 Zan 实现（System.Security.Cryptography 中的 Sha256/Sha1/Rsa）。
 ///
-/// Parameterized statements use COM_STMT_PREPARE / COM_STMT_EXECUTE, so values
-/// travel out-of-band in the binary protocol and injection through values is
-/// impossible.
+/// 参数化语句使用 COM_STMT_PREPARE / COM_STMT_EXECUTE，值
+/// 通过二进制协议带外传输，因此通过值进行注入
+/// 是不可能的。
 ///
-/// Usage (through the standard factories is preferred):
+/// 用法（推荐使用标准工厂）：
 ///   IDbConnection db = DbConnection.OpenMySQL("127.0.0.1", 3306,
 ///       "app", "root", "secret");
 ///   db.Execute("CREATE TABLE t (id BIGINT PRIMARY KEY, name VARCHAR(64))");
@@ -33,12 +33,12 @@ class MySqlSyncConnection : IDbConnection {
     nint sock;
     bool connected;
     string lastError;
-    int lastNumber;             // the server's own error number, 0 when none
-    int lastLen;                // payload length of the most recently read packet
-    int lastSeq;                // sequence id of the most recently read packet
-    int lastAffected;           // affected rows / row count of the last statement
-    bool hadError;              // whether the last statement returned an ERR packet
-    List<PreparedStmt> stmtCache;  // prepared-statement cache (SQL -> server id)
+    int lastNumber;             // 服务器返回的错误码，无错误时为 0
+    int lastLen;                // 最近读取的数据包的有效载荷长度
+    int lastSeq;                // 最近读取的数据包的序号
+    int lastAffected;           // 上一条语句影响的行数
+    bool hadError;              // 上一条语句是否返回了 ERR 数据包
+    List<PreparedStmt> stmtCache;  // 预编译语句缓存（SQL -> 服务器 id）
 
     MySqlSyncConnection() {
         this.sock = -1;
@@ -52,12 +52,12 @@ class MySqlSyncConnection : IDbConnection {
     }
 
     // ============================================================
-    // Byte / packet helpers (synchronous)
+    // 字节 / 数据包辅助函数（同步）
     // ============================================================
 
-    /// <summary>Reads exactly <paramref name="need"/> bytes into
-    /// <paramref name="dst"/> at <paramref name="off"/>. Returns bytes actually
-    /// read (&lt; need on peer close).</summary>
+    /// <summary>将 <paramref name="need"/> 字节读入
+    /// <paramref name="dst"/> 的 <paramref name="off"/> 偏移处。返回实际
+    /// 读到的字节数（对端关闭时 &lt; need）。</summary>
     int recvExact(byte[] dst, int off, int need) {
         int got = 0;
         while (got < need) {
@@ -70,8 +70,8 @@ class MySqlSyncConnection : IDbConnection {
         return got;
     }
 
-    /// <summary>Reads one protocol packet, returning its payload with the
-    /// length in <c>lastLen</c>. Null on close.</summary>
+    /// <summary>读取一个协议数据包，返回其有效载荷，
+    /// 长度记录在 <c>lastLen</c>；连接关闭时返回 null。</summary>
     byte[] readPacket() {
         byte[] hdr = new byte[5];
         int got = this.recvExact(hdr, 0, 4);
@@ -87,7 +87,7 @@ class MySqlSyncConnection : IDbConnection {
         return pay;
     }
 
-    /// <summary>Writes one protocol packet (4-byte header + payload).</summary>
+    /// <summary>写入一个协议数据包（4 字节包头 + 有效载荷）。</summary>
     int writePacket(string payload, int len, int seq) {
         byte[] buf = new byte[len + 5];
         buf[0]=(byte)(len&255); buf[1]=(byte)((len>>8)&255); buf[2]=(byte)((len>>16)&255); buf[3]=(byte)(seq&255);
@@ -95,8 +95,8 @@ class MySqlSyncConnection : IDbConnection {
         return Socket.Send(this.sock, buf, len + 4);
     }
 
-    /// <summary>Copies <paramref name="len"/> bytes from a buffer into a new
-    /// Zan string.</summary>
+    /// <summary>将缓冲区中的 <paramref name="len"/> 字节复制到新的
+    /// Zan 字符串。</summary>
     static string bytesToStr(string buf, int off, int len) {
         if (len <= 0) { return ""; }
         byte[] t = new byte[len + 1];
@@ -104,8 +104,8 @@ class MySqlSyncConnection : IDbConnection {
         return t.ToStr(0, len);
     }
 
-    /// <summary>Decodes a length-encoded integer at cursor <c>cur[0]</c>,
-    /// advancing it. Returns -1 for the NULL marker (0xFB).</summary>
+    /// <summary>在游标 <c>cur[0]</c> 处解码长度编码整数，
+    /// 并推进游标；NULL 标记（0xFB）返回 -1。</summary>
     static long readLenenc(string buf, List<int> cur) {
         int p = cur[0];
         int b0 = buf[p] & 255;
@@ -120,8 +120,8 @@ class MySqlSyncConnection : IDbConnection {
         cur[0] = p + 1; return -1;
     }
 
-    /// <summary>Decodes a length-encoded string at cursor <c>cur[0]</c>.
-    /// NULL (0xFB) yields "".</summary>
+    /// <summary>在游标 <c>cur[0]</c> 处解码长度编码字符串。
+    /// NULL（0xFB）返回空字符串。
     static string readLenencStr(string buf, List<int> cur) {
         int b0 = buf[cur[0]] & 255;
         if (b0 == 251) { cur[0] = cur[0] + 1; return ""; }
@@ -136,11 +136,11 @@ class MySqlSyncConnection : IDbConnection {
     }
 
     // ============================================================
-    // Authentication (pure logic shared with the async client)
+    // 认证（与异步客户端共享的纯逻辑）
     // ============================================================
 
-    /// <summary>caching_sha2_password fast-auth scramble:
-    /// SHA256(pw) XOR SHA256( SHA256(SHA256(pw)) . nonce ). 32 bytes.</summary>
+    /// <summary>caching_sha2_password 快速认证混淆：
+    /// SHA256(pw) XOR SHA256( SHA256(SHA256(pw)) . nonce )，32 字节。</summary>
     static byte[] scramble41(string pw, string nonce20) {
         byte[] a = Sha256.Hash(pw, pw.Length);
         byte[] b = Sha256.Hash(a, 32);
@@ -156,8 +156,8 @@ class MySqlSyncConnection : IDbConnection {
         return tok;
     }
 
-    /// <summary>mysql_native_password scramble:
-    /// SHA1(pw) XOR SHA1( nonce . SHA1(SHA1(pw)) ). 20 bytes.</summary>
+    /// <summary>mysql_native_password 混淆：
+    /// SHA1(pw) XOR SHA1( nonce . SHA1(SHA1(pw)) )，20 字节。</summary>
     static byte[] scrambleNative(string pw, string nonce20) {
         byte[] a = Sha1.Hash(pw, pw.Length);
         byte[] b = Sha1.Hash(a, 20);
@@ -255,12 +255,12 @@ class MySqlSyncConnection : IDbConnection {
     }
 
     // ============================================================
-    // Connect (synchronous handshake + auth)
+    // 连接（同步握手 + 认证）
     // ============================================================
 
-    /// <summary>Opens a native MySQL/MariaDB connection using the wire protocol
-    /// over a blocking socket. Null on failure; <see cref="GetError"/> carries
-    /// the reason.</summary>
+    /// <summary>使用 wire 协议在阻塞套接字上打开原生 MySQL/MariaDB 连接。
+    /// 失败时返回 null；<see cref="GetError"/> 携带
+    /// 失败原因。</summary>
     static MySqlSyncConnection OpenParams(string host, int port,
             string database, string user, string password) {
         Socket.Initialize();
@@ -279,7 +279,7 @@ class MySqlSyncConnection : IDbConnection {
         int cr = Socket.Connect(this.sock, host, port);
         if (cr != 0) { this.lastError = "connect failed: " + Convert.ToString(cr); return false; }
 
-        // --- read + parse handshake (packet seq 0) ---
+        // --- 读取并解析握手包（数据包序号 0） ---
         byte[] hs = this.readPacket();
         if (hs == null) { this.lastError = "no handshake from server"; return false; }
         int proto = hs[0] & 255;
@@ -290,14 +290,14 @@ class MySqlSyncConnection : IDbConnection {
             return false;
         }
         int p = 1;
-        while ((hs[p] & 255) != 0) { p = p + 1; }   // server version (NUL-terminated)
+        while ((hs[p] & 255) != 0) { p = p + 1; }   // 服务器版本（NUL 结尾）
         p = p + 1;
-        p = p + 4;                                    // thread id
+        p = p + 4;                                    // 线程 id
         byte[] nonce = new byte[21];
         int i = 0;
         for (; i < 8; i = i + 1) { nonce[i] = (byte)(hs[p+i] & 255); }
         p = p + 8;
-        p = p + 1;                                    // filler
+        p = p + 1;                                    // 填充
         int capLow = (hs[p]&255)|((hs[p+1]&255)<<8);
         p = p + 2;
         int charset = hs[p] & 255; p = p + 1;
@@ -305,8 +305,8 @@ class MySqlSyncConnection : IDbConnection {
         p = p + 2;
         int caps = capLow | (capHigh << 16);
         int capPluginAuth = (caps & 524288) != 0 ? 1 : 0;
-        p = p + 1;                                    // filler (1 byte)
-        p = p + 10;                                   // filler (10 bytes)
+        p = p + 1;                                    // 填充（1 字节）
+        p = p + 10;                                   // 填充（10 字节）
         int authLen = 0;
         if (capPluginAuth != 0) {
             authLen = hs[p] & 255;
@@ -319,7 +319,7 @@ class MySqlSyncConnection : IDbConnection {
         i = 0;
         while (i < part2) { nonce[8 + i] = (byte)(hs[p+i] & 255); i = i + 1; }
         p = p + part2;
-        if ((caps & 512) != 0) { p = p + 1; }         // SECURE_CONNECTION: skip filler
+        if ((caps & 512) != 0) { p = p + 1; }         // SECURE_CONNECTION：跳过填充
         string plugin = "mysql_native_password";
         if (capPluginAuth != 0) {
             int pluginEnd = p;
@@ -328,11 +328,11 @@ class MySqlSyncConnection : IDbConnection {
             }
             if (pluginEnd > p) { plugin = bytesToStr(hs, p, pluginEnd - p); }
         }
-        // --- build + send handshake response (seq 1) ---
-        // CLIENT_FOUND_ROWS (2) makes UPDATE/DELETE report the number of
-        // MATCHED rows (like SQLite), not only the rows whose value actually
-        // changed -- so `points=points-0` still counts as a hit and the ORM's
-        // affected-rows checks behave identically across engines.
+        // --- 构造并发送握手响应（序号 1） ---
+        // CLIENT_FOUND_ROWS (2) 使 UPDATE/DELETE 报告匹配的行数（类似 SQLite），
+        // 而不只是实际发生变更的行——
+        // 所以 `points=points-0` 仍算命中，ORM 的
+        // 受影响行数检查在各引擎间保持一致。
         int caps2 = 1 | 2 | 4 | 512 | 8192 | 32768 | 524288;
         bool hasDb = db.Length > 0;
         if (hasDb) { caps2 = caps2 | 8; }
@@ -364,7 +364,7 @@ class MySqlSyncConnection : IDbConnection {
         i = 0; while (i < plugin.Length) { resp[q+i] = (byte)(plugin[i] & 255); i = i + 1; } q = q + plugin.Length;
         resp[q] = (byte)(0); q=q+1;
         this.writePacket(resp, respLen, 1);
-        // --- auth result ---
+        // --- 认证结果 ---
         while (true) {
             byte[] r = this.readPacket();
             if (r == null) { this.lastError = "connection closed during auth"; return false; }
@@ -440,7 +440,7 @@ class MySqlSyncConnection : IDbConnection {
     }
 
     // ============================================================
-    // Text query (COM_QUERY)
+    // 文本查询（COM_QUERY）
     // ============================================================
 
     int comQuery(string sql) {
@@ -525,7 +525,7 @@ class MySqlSyncConnection : IDbConnection {
     }
 
     // ============================================================
-    // Prepared statements (COM_STMT_PREPARE / COM_STMT_EXECUTE)
+    // 预编译语句（COM_STMT_PREPARE / COM_STMT_EXECUTE）
     // ============================================================
 
     static int writeLenenc(string buf, int pos, int v) {
@@ -888,16 +888,16 @@ class MySqlSyncConnection : IDbConnection {
         return DbProvider.MySQL;
     }
 
-    /// <summary>Last error message recorded on this connection.</summary>
+    /// <summary>此连接上记录的最后一条错误消息。</summary>
     string GetError() {
         return this.lastError;
     }
 
-    /// <summary>Starts a transaction on this session.</summary>
-    // ===== Coroutine twins =====
-    // This driver's IO is synchronous, so these forward. They exist so callers
-    // (and the generated ORM terminals) can use one asynchronous chain over
-    // every driver and get real non-blocking IO where the driver has it.
+    /// <summary>在当前会话上开启事务。</summary>
+    // ===== 协程孪生方法 =====
+    // 该驱动的 IO 是同步的，所以这里仅转发。提供这些方法是为了让调用方
+    // （以及生成的 ORM 终端）能对所有驱动统一使用异步调用链，
+    // 在驱动支持的情况下获得真正的非阻塞 IO。
     async DbResult QueryAsync(string sql) { return this.Query(sql); }
     async DbResult QueryAsync(string sql, DbParams prms) { return this.Query(sql, prms); }
     async int ExecuteAsync(string sql) { return this.Execute(sql); }
@@ -910,10 +910,10 @@ class MySqlSyncConnection : IDbConnection {
 
     void BeginTransaction() { this.Execute("START TRANSACTION"); }
 
-    /// <summary>Commits the current transaction.</summary>
+    /// <summary>提交当前事务。</summary>
     void Commit() { this.Execute("COMMIT"); }
 
-    /// <summary>Rolls back the current transaction.</summary>
+    /// <summary>回滚当前事务。</summary>
     void Rollback() { this.Execute("ROLLBACK"); }
 
     bool IsConnected() {

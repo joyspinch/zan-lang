@@ -1,10 +1,11 @@
-using System;
-using System.IO;
-using System.Net;
-using System.Net.Sockets;
-using System.Net.Http;
 using System.Diagnostics;
+using System.IO;
 using System.Json;
+using System.Net.Http;
+using System.Net.Sockets;
+using System.Net;
+using System.Threading;
+using System;
 
 namespace System.Web;
 
@@ -57,7 +58,6 @@ class WebApp {
     Sessions sessions;
     RateLimiter limiter;
     LockManager locks;
-    RankFn rankResolver;
     AuthFn authResolver;
     PermissionFn permissionResolver;
     ServerMetrics metrics;
@@ -66,6 +66,7 @@ class WebApp {
     int maxUploadBytes;    // streaming upload cap for .Upload() routes
     string uploadDir;      // where streamed uploads land
     int uploadSeq;
+    string loginPath;      // where a browser is sent when a page needs a session
     int globalLimit;       // requests/sec across all routes (0 = unlimited)
     int totalRequests;
     int activeConnections;
@@ -83,7 +84,6 @@ class WebApp {
         this.hooks = new Hooks();
         this.views = null;
         this.sessions = new Sessions();
-        this.rankResolver = null;
         this.authResolver = null;
         this.permissionResolver = null;
         this.metrics = ServerMetrics.Global();
@@ -91,6 +91,7 @@ class WebApp {
         this.maxUploadBytes = 512 * 1024 * 1024;  // 512MB streamed-upload default
         this.uploadDir = "uploads";
         this.uploadSeq = 0;
+        this.loginPath = "";
         this.globalLimit = 0;
         this.totalRequests = 0;
         this.activeConnections = 0;
@@ -109,6 +110,10 @@ class WebApp {
     WebApp MaxUpload(int bytes) { this.maxUploadBytes = bytes; return this; }
     WebApp UploadDir(string dir) { this.uploadDir = dir; return this; }
     WebApp GlobalLimit(int perSecond) { this.globalLimit = perSecond; return this; }
+    /// <summary>The sign-in page a navigation is sent to when the route needs a
+    /// session it does not have. Unset (the default) answers every refusal with
+    /// the JSON body, which is what an API-only server wants.</summary>
+    WebApp LoginPath(string path) { this.loginPath = path; return this; }
     WebApp ReusePort(bool on) { this.reusePort = on; return this; }
     /// <summary>Initialise cross-process route stats. Call after all routes are
     /// registered and before starting the server or running workers. Safe to
@@ -118,7 +123,6 @@ class WebApp {
     void InitStats(string name) { this.router.InitStats(name); }
     WebApp Before(HookFn fn) { this.hooks.Before(fn); return this; }
     WebApp After(AfterFn fn) { this.hooks.After(fn); return this; }
-    WebApp RankResolver(RankFn fn) { this.rankResolver = fn; return this; }
     WebApp AuthResolver(AuthFn fn) { this.authResolver = fn; return this; }
     WebApp PermissionResolver(PermissionFn fn) { this.permissionResolver = fn; return this; }
 
@@ -139,7 +143,25 @@ class WebApp {
         return this.views.RenderPage(name, data);
     }
 
+    /// <summary>Renders a template WITHOUT its layout. This is what an
+    /// in-page update answers with: the browser already has the shell, so
+    /// sending it again would replace the page instead of the panel.</summary>
+    string RenderFragment(string name, ViewData data) {
+        if (this.views == null) { return ""; }
+        return this.views.Render(name, data);
+    }
+
     static int NowSeconds() { return time(0); }
+
+    /// <summary>Trims a message before it reaches the error log so one runaway
+    /// exception cannot bloat the log or the in-memory ring. Kept conservative:
+    /// the log never carries request bodies, headers or credentials, only the
+    /// handler's own exception text.</summary>
+    static string Redact(string s) {
+        if (s == null) { return ""; }
+        if (s.Length > 500) { return s.Substring(0, 500); }
+        return s;
+    }
 
     /// <summary>The start-up screen for this app: the listener, then every
     /// service that is actually switched on (routes, views, sessions, uploads,
@@ -236,6 +258,9 @@ class WebApp {
             keepAlive = request.keepAlive;
             HttpContext ctx = new HttpContext(
                 request, Socket.RemoteIp(clientSock));
+            // Hand the connection to the context: a handler may take it over
+            // (ctx.SseOpen()) and keep writing to it after the pipeline returns.
+            ctx.__Attach(client);
             Route route = this.router.Match(ctx);
 
             if (route != null && route.streamUpload && request.contentLength > 0) {
@@ -253,8 +278,8 @@ class WebApp {
                         "Bad Request", "upload failed"));
                     break;
                 }
-                ctx.state.Set("upload_path", tmp);
-                ctx.state.Set("upload_size", Convert.ToString(request.contentLength));
+                ctx.uploadPath = tmp;
+                ctx.uploadSize = request.contentLength;
                 request.body = "";
             } else {
                 // In-memory body: reject oversized bodies BEFORE buffering them.
@@ -292,6 +317,9 @@ class WebApp {
 
             Worker.BumpStat();
             string responseData = await this.Dispatch(ctx, route, keepAlive);
+            // A stream handler already wrote its own response and has now
+            // finished; there is nothing left to send and nothing to reuse.
+            if (ctx.Hijacked()) { keepAlive = false; break; }
             int _sent = await client.SendAsync(responseData);
             Worker.BumpSent();
             if (!keepAlive) { break; }
@@ -352,9 +380,26 @@ class WebApp {
     async string Dispatch(HttpContext ctx, Route route, bool keepAlive) {
         long startMs = ServerMetrics.MonoMillis();
         this.totalRequests = this.totalRequests + 1;
-        string resp = await this.DispatchInner(ctx, route, keepAlive, startMs);
+        this.metrics.Entered();
+        string resp = "";
+        try {
+            resp = await this.DispatchInner(ctx, route, keepAlive, startMs);
+        } finally {
+            this.metrics.Left();
+        }
         long elapsedMs = ServerMetrics.MonoMillis() - startMs;
-        this.metrics.RecordRequest(ctx.method, ctx.path, ctx.status, elapsedMs);
+        // A stream is counted by what it pushed, not by how long it was held:
+        // it has ended by the time it returns here, so it is closed with its
+        // frame and byte totals.
+        if (ctx.MetricsExcluded()) {
+            this.metrics.StreamClosed(ctx.Frames(), ctx.FrameBytes());
+        }
+        // A hijacked connection (SSE, upgrade) lives for as long as the client
+        // keeps it open, so its duration is not a latency sample: recording it
+        // would report every open dashboard as a multi-minute slow request.
+        if (!ctx.MetricsExcluded()) {
+            this.metrics.RecordRequest(ctx.method, ctx.path, ctx.status, elapsedMs);
+        }
         this.hooks.RunAfter(ctx, elapsedMs);
         return resp;
     }
@@ -362,7 +407,7 @@ class WebApp {
     async string DispatchInner(HttpContext ctx, Route route, bool keepAlive, long startMs) {
 
         string uid = await this.AuthUser(ctx);
-        if (uid.Length > 0) { ctx.state.Set("uid", uid); }
+        ctx.uid = uid;
         string principal = uid;
         if (principal.Length == 0) { principal = ctx.RemoteIp(); }
         if (principal.Length == 0) { principal = "_unknown_"; }
@@ -390,6 +435,11 @@ class WebApp {
             return ctx.BuildResponse(keepAlive);
         }
 
+        // The action is what the route is called everywhere else -- the grant
+        // rows, the audit log, the docs -- so the handler reads it off the
+        // context instead of repeating the name as a literal.
+        ctx.routeAction = route.action;
+
         string rateKey = route.Key();
         if (route.rateScope == "uid") {
             rateKey = rateKey + ":uid:" + uid;
@@ -403,8 +453,20 @@ class WebApp {
             return ctx.BuildResponse(keepAlive);
         }
 
+        // Refusing a request and refusing a navigation are the same decision
+        // with two shapes: a script caller needs the status and the code, a
+        // person typing a URL needs the sign-in form. Answering a navigation
+        // with the JSON body leaves the browser showing {"code":"401"}, and
+        // answering a background request with the form hands the caller a 200
+        // that reads like success -- so the shape is picked here, once, rather
+        // than in every controller.
         if (route.needsLogin || route.needsAuth) {
             if (uid.Length == 0) {
+                if (this.WantsPage(ctx)) {
+                    ctx.Redirect(this.loginPath + "?next="
+                        + Encoding.UrlEncode(ctx.path));
+                    return ctx.BuildResponse(keepAlive);
+                }
                 ctx.Status(401, "Unauthorized");
                 ctx.Json(WebApp.ErrorJson("401", "authentication required"));
                 return ctx.BuildResponse(keepAlive);
@@ -433,34 +495,69 @@ class WebApp {
 
         int rIdx = route.idx;
         HttpHandler h = route.handler;
-        await h(ctx);
+        // ApiError is the controlled abort every guard throws (Fail/Need/...):
+        // it carries the answer, so it becomes that answer rather than a 500.
+        // The generated trampoline catches it first for attribute routes; this
+        // is what covers a hand-mapped one. Anything else would unwind past
+        // here and take the whole process down with no trace, so it is
+        // contained: record the failure (persisted to the error log) and answer
+        // 500, so one bad request never kills the server.
+        try {
+            await h(ctx);
+        } catch (ApiError ae) {
+            if (!ctx.ended) {
+                ctx.Status(ae.Status(), ApiError.Reason(ae.Status()));
+                ctx.Api(ae.Code(), ae.Message, "null");
+            }
+        } catch (Exception e) {
+            this.metrics.RecordError((long)WebApp.NowSeconds(),
+                ctx.method + " " + ctx.path, WebApp.Redact(e.Message));
+            if (!ctx.ended) {
+                ctx.Status(500, "Internal Server Error");
+                ctx.Json(WebApp.ErrorJson("500", "internal server error"));
+            }
+        }
         if (lockLease != null) { this.locks.Release(lockLease); }
         if (!ctx.ended) {
             ctx.Status(500, "Internal Server Error");
             ctx.Json(WebApp.ErrorJson("500", "handler produced no response"));
         }
 
-        long elapsedMs = ServerMetrics.MonoMillis() - startMs;
-        this.router.RecordHit(rIdx, elapsedMs);
+        // A hijacked connection (SSE, upgrade) is held open for as long as the
+        // client keeps it, so its duration is not a per-route latency sample:
+        // recording it would report every open event stream as a multi-minute
+        // slow request and skew the route's average. Mirrors the guard around
+        // ServerMetrics.RecordRequest in Dispatch.
+        if (!ctx.MetricsExcluded()) {
+            long elapsedMs = ServerMetrics.MonoMillis() - startMs;
+            this.router.RecordHit(rIdx, elapsedMs);
+        }
         return ctx.BuildResponse(keepAlive);
     }
 
+    /// <summary>Whether this request is a browser navigation that should be sent
+    /// to the sign-in page rather than answered with a JSON refusal: a GET that
+    /// did not come from script (htmx / XHR / fetch asking for JSON), with a
+    /// sign-in page configured.</summary>
+    bool WantsPage(HttpContext ctx) {
+        if (this.loginPath.Length == 0) { return false; }
+        if (ctx.method != "GET") { return false; }
+        if (ctx.Header("HX-Request").Length > 0) { return false; }
+        if (ctx.Header("X-Requested-With").Length > 0) { return false; }
+        if (ctx.Header("X-Fragment").Length > 0) { return false; }
+        return !ctx.Header("Accept").Contains("application/json");
+    }
+
     /// <summary>Whether `uid` may run `action`: the installed PermissionResolver,
-    /// or "any ranked principal" when none is set. The dispatcher's 403 and the
-    /// menu builder both go through here, so a hidden entry and a refused request
-    /// are one decision rather than two that can disagree.</summary>
+    /// or "any authenticated principal" when none is set. The dispatcher's 403
+    /// and the menu builder both go through here, so a hidden entry and a
+    /// refused request are one decision rather than two that can disagree.
+    /// </summary>
     async bool Allow(string uid, string action) {
         if (this.permissionResolver != null) {
             return await this.permissionResolver(uid, action);
         }
-        return await this.ResolveRank(uid) > 0;
-    }
-
-    /// <summary>Permission rank of a principal: the installed RankResolver, or
-    /// the built-in DefaultAuth policy (uid "1" = admin) when none is set.</summary>
-    async int ResolveRank(string uid) {
-        if (this.rankResolver != null) { return await this.rankResolver(uid); }
-        return DefaultAuth.Rank(uid);
+        return uid.Length > 0;
     }
 
     /// <summary>Resolves the current user from Authorization: Bearer or the
@@ -536,3 +633,169 @@ class WebApp {
     }
 }
 
+/// <summary>
+/// Global accessor for the running WebApp instance so static controller actions
+/// can reach shared services (views, sessions, request stats) without threading
+/// the app through every call. Set once at startup by main. Named WebHost (not
+/// App) so it does not collide with Gui.App.
+/// </summary>
+class WebHost {
+    static WebApp instance;
+
+    static void Use(WebApp app) { WebHost.instance = app; }
+    static WebApp Current() { return WebHost.instance; }
+}
+
+/// <summary>Lifecycle hook: return false to short-circuit the request
+/// (the hook must have written a response into ctx first).</summary>
+delegate bool HookFn(HttpContext ctx);
+
+/// <summary>Post-request hook (logging, metrics); cannot short-circuit.</summary>
+delegate void AfterFn(HttpContext ctx, int elapsedMs);
+
+/// <summary>
+/// Explicit, typed replacement for runtime `include`-style plugin hooks:
+/// hooks are registered once at startup and run in registration order.
+/// Everything is compile-time checked -- no reflection, no string dispatch.
+/// </summary>
+class Hooks {
+    List<HookFn> before;
+    List<AfterFn> after;
+
+    Hooks() {
+        this.before = new List<HookFn>();
+        this.after = new List<AfterFn>();
+    }
+
+    void Before(HookFn fn) { this.before.Add(fn); }
+    void After(AfterFn fn) { this.after.Add(fn); }
+
+    /// <summary>Runs before-hooks in order; false = request short-circuited.</summary>
+    bool RunBefore(HttpContext ctx) {
+        for (int i = 0; i < this.before.Count; i = i + 1) {
+            HookFn fn = this.before[i];
+            if (!fn(ctx)) { return false; }
+        }
+        return true;
+    }
+
+    void RunAfter(HttpContext ctx, long elapsedMs) {
+        for (int i = 0; i < this.after.Count; i = i + 1) {
+            AfterFn fn = this.after[i];
+            fn(ctx, elapsedMs);
+        }
+    }
+}
+
+/// <summary>
+/// Fixed-window rate limiter, the in-process analogue of a swoole_table
+/// counter: one slot per key (route / ip / token), counting requests in the
+/// current window and resetting when the window rolls over. Windows are
+/// wall-clock seconds. Single-threaded event loop => no locking needed.
+/// </summary>
+class RateLimiter {
+    SharedTable table;
+    int windowMs;
+
+    RateLimiter(string name, int windowMs) {
+        if (windowMs > 0) { this.windowMs = windowMs; }
+        SharedTable table = new SharedTable(name, 65536);
+        table.KeySize(192);
+        table.ColumnInt("count");
+        table.ColumnInt("window_start");
+        if (!table.Create()) { table = SharedTable.Open(name); }
+        if (table.IsOpen()) { this.table = table; }
+    }
+
+    bool Allow(string key, int limit) {
+        if (limit <= 0) { return true; }
+        if (this.table == null) { return false; }
+        return this.table.RateAllow(key, -1, this.windowMs, limit);
+    }
+
+    int CountOf(string key) {
+        if (this.table == null) { return 0; }
+        return (int)this.table.GetInt(key, "count");
+    }
+}
+
+/// <summary>
+/// Minimal in-memory session/auth store: token -> user id. A before-hook
+/// checks `route.needsAuth` against this store; swap the storage for Redis
+/// or a database without touching the hook contract.
+/// </summary>
+class Sessions {
+    StrMap tokens;   // token -> uid
+
+    Sessions() { this.tokens = new StrMap(); }
+
+    string Issue(string uid, int nowSeconds) {
+        string token = "t" + Convert.ToString(nowSeconds) + "x" + uid
+            + Convert.ToString(this.tokens.Count());
+        this.tokens.Set(token, uid);
+        return token;
+    }
+
+    /// <summary>Returns the uid for a bearer token / cookie, or "".</summary>
+    string UserOf(string token) { return this.tokens.Get(token); }
+}
+
+/// <summary>
+/// Boots a <see cref="WebApp"/>: one process running the coroutine event loop,
+/// or a master supervising `count` worker processes (System.Net.Worker), which
+/// is where the listener handoff, respawn-on-crash and the
+/// start/stop/restart/reload/status commands come from.
+///
+/// Single process is the development default -- every connection already runs
+/// in its own coroutine, so it serves thousands of concurrent connections and
+/// logs stream straight into the terminal. With count > 1 the same binary runs
+/// as master and workers; each worker gets connections from the kernel
+/// (SO_REUSEPORT on Linux/macOS) or from the master over a duplicate-socket
+/// channel (Windows).
+/// </summary>
+class WebServer {
+    /// <summary>Runs the app in the foreground: single process when count is 1,
+    /// otherwise a master plus `count` workers. daemon detaches on Linux.</summary>
+    static async int Run(WebApp app, int count, bool daemon) {
+        if (count <= 1) {
+            if (daemon && ProcessHost.Daemonize()) {
+                Console.WriteLine("[server] daemonized; parent process exiting.");
+                return 0;
+            }
+            app.InitStats(WebServer.StatsName(app));
+            int r = await app.Start();
+            return r;
+        }
+        WebServer.Prepare(app, count, daemon);
+        await Worker.RunAll();
+        return 0;
+    }
+
+    /// <summary>Same as <see cref="Run"/>, but the process also answers the
+    /// command line: `start`, `start -d`, `stop`, `restart`, `reload`,
+    /// `status`. Use this from Main when the app is deployed as a service.</summary>
+    static async int RunCommand(WebApp app, int count) {
+        int procs = count;
+        if (procs < 1) { procs = 1; }
+        WebServer.Prepare(app, procs, false);
+        await Worker.RunCommand();
+        return 0;
+    }
+
+    // Shared setup for the multi-process paths: the stats table must exist in
+    // every process (the master creates it, workers open the same memory), and
+    // the pipeline is plugged into the worker as a raw-connection handler so
+    // routing/hooks/uploads run exactly as they do single-process.
+    static void Prepare(WebApp app, int count, bool daemon) {
+        app.InitStats(WebServer.StatsName(app));
+        WebApp.SetActive(app);
+        Worker w = new Worker("http", app.Host(), app.Port());
+        w.SetCount(count);
+        w.onRawConnection = WebApp.ServeSock;
+        if (daemon) { Worker.SetDaemonize(true); }
+    }
+
+    static string StatsName(WebApp app) {
+        return "zanroute_" + Convert.ToString(app.Port());
+    }
+}

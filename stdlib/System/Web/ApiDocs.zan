@@ -117,11 +117,21 @@ class ApiDocs {
         // The page carries its own menu entry, so mounting the docs is the whole
         // installation: an admin sidebar built from MenuBuilder picks it up.
         app.Map("GET", p, ApiDocs.Page).Named("ApiDocs.Page")
-            .Title("API 文档").Menu().Group("系统").Rank(45)
+            .Title("API 文档").Menu()
             .Meta("Icon", "mdi:book-open-variant");
     }
 
     static void Mount(WebApp app) { ApiDocs.Mount(app, "/api/docs"); }
+
+    /// <summary>Registers only GET &lt;path&gt;.json, for applications that
+    /// render the reference themselves (an admin screen, a docs site) and want
+    /// the machine-readable document without a second UI in the menu.</summary>
+    static void MountSpec(WebApp app, string path) {
+        string p = path;
+        if (p.Length == 0) { p = "/api/docs"; }
+        app.Map("GET", p + ".json", ApiDocs.Spec).Named("ApiDocs.Spec")
+            .Title("API 文档 (OpenAPI)");
+    }
 
     static async void Spec(HttpContext ctx) {
         ctx.SetHeader("Cache-Control", "no-store");
@@ -196,9 +206,7 @@ class ApiDocs {
         sb.Append(",\"x-login\":");
         sb.Append(rt.needsLogin ? "true" : "false");
         sb.Append(",\"x-auth\":");
-        sb.Append(rt.needsAuth ? "true" : "false");
-        sb.Append(",\"x-rank\":");
-        sb.Append(Convert.ToString(rt.rank));
+        sb.Append(rt.needsLogin ? "true" : "false");
         sb.Append(",\"x-menu\":");
         sb.Append(rt.inMenu ? "true" : "false");
 
@@ -258,7 +266,73 @@ class ApiDocs {
             }
         }
 
-        sb.Append(",\"responses\":{\"200\":{\"description\":\"ok\"}}}");
+        ApiDocs.Responses(sb, rt);
+        sb.Append("}");
+    }
+
+    /// <summary>What the endpoint answers with, per status.
+    ///
+    /// The shapes are the framework's own and therefore knowable: an HTML page,
+    /// the {"code","msg","data"} envelope every JSON action writes, or an event
+    /// stream. Emitting them here means /api/docs.json describes the response as
+    /// precisely as it describes the request, instead of the bare "200 ok" a
+    /// generator produces when nobody tells it anything.</summary>
+    static void Responses(StringBuilder sb, Route rt) {
+        bool stream = rt.pattern.IndexOf("/stream") >= 0;
+        bool json = rt.method != "GET" && rt.method != "HEAD";
+        if (rt.pattern.Length >= 5 && rt.pattern.Substring(0, 5) == "/api/") { json = true; }
+
+        sb.Append(",\"responses\":{\"200\":{\"description\":");
+        if (stream) {
+            sb.Append("\"事件流已建立，服务端持续推送\",\"content\":");
+            sb.Append("{\"text/event-stream\":{\"schema\":{\"type\":\"string\"},");
+            sb.Append("\"example\":\"event: metrics\\ndata: {\\\"requests\\\":");
+            sb.Append("{\\\"count\\\":128}}\\n\\n\"}}}");
+        } else if (json) {
+            sb.Append("\"成功\",\"content\":{\"application/json\":{\"schema\":");
+            ApiDocs.EnvelopeSchema(sb);
+            sb.Append(",\"example\":{\"code\":\"0000\",\"msg\":\"ok\",\"data\":null}}}}");
+        } else {
+            sb.Append("\"页面\",\"content\":{\"text/html\":{\"schema\":");
+            sb.Append("{\"type\":\"string\"}}}}");
+        }
+
+        if (json || stream) {
+            ApiDocs.ErrorResponse(sb, "400", "参数不合法", "0004", "参数不合法");
+        }
+        if (rt.needsLogin || rt.needsAuth) {
+            ApiDocs.ErrorResponse(sb, "401", "未登录或登录已过期", "0001", "登录已过期，请重新登录");
+        }
+        if (rt.needsLogin || rt.needsAuth) {
+            ApiDocs.ErrorResponse(sb, "403", "没有该操作的权限", "0403", "没有执行该操作的权限");
+        }
+        if (json) {
+            ApiDocs.ErrorResponse(sb, "404", "对象不存在", "0404", "对象不存在");
+        }
+        sb.Append("}");
+    }
+
+    static void EnvelopeSchema(StringBuilder sb) {
+        sb.Append("{\"type\":\"object\",\"required\":[\"code\",\"msg\"],");
+        sb.Append("\"properties\":{\"code\":{\"type\":\"string\",");
+        sb.Append("\"description\":\"0000 表示成功，其余为错误码\"},");
+        sb.Append("\"msg\":{\"type\":\"string\",\"description\":\"提示文案\"},");
+        sb.Append("\"data\":{\"description\":\"业务数据，可为 null\"}}}");
+    }
+
+    static void ErrorResponse(StringBuilder sb, string status, string desc,
+                              string code, string msg) {
+        sb.Append(",");
+        sb.Append(ApiDocs.Q(status));
+        sb.Append(":{\"description\":");
+        sb.Append(ApiDocs.Q(desc));
+        sb.Append(",\"content\":{\"application/json\":{\"schema\":");
+        ApiDocs.EnvelopeSchema(sb);
+        sb.Append(",\"example\":{\"code\":");
+        sb.Append(ApiDocs.Q(code));
+        sb.Append(",\"msg\":");
+        sb.Append(ApiDocs.Q(msg));
+        sb.Append("}}}}");
     }
 
     static void ParamJson(StringBuilder sb, ApiParam p) {
@@ -384,7 +458,7 @@ class ApiDocs {
             + "desc:s.description||'',type:s.type||'string',def:s.default});}"
             + "out.push({method:m.toUpperCase(),path,tag:(op.tags||['api'])[0],"
             + "summary:op.summary||'',login:op['x-login'],auth:op['x-auth'],"
-            + "rank:op['x-rank']||0,menu:op['x-menu'],params:ps});}}"
+            + "menu:op['x-menu'],params:ps});}}"
             + "out.sort((a,b)=>a.tag.localeCompare(b.tag)||a.path.localeCompare(b.path));"
             + "return out;}\n"
             + "function params(ps){if(!ps.length)return"
@@ -403,7 +477,6 @@ class ApiDocs {
             + "html+='<h2>'+esc(tag)+'</h2>';}"
             + "const badges=(o.auth?'<span class=\"badge\">鉴权</span>':"
             + "(o.login?'<span class=\"badge\">登录</span>':''))+"
-            + "(o.rank?'<span class=\"badge\">rank≥'+o.rank+'</span>':'')+"
             + "(o.menu?'<span class=\"badge\">菜单</span>':'');"
             + "html+='<details class=\"op\"><summary><span class=\"m '+o.method+'\">'"
             + "+o.method+'</span><span class=\"p\">'+esc(o.path)+'</span>'+"

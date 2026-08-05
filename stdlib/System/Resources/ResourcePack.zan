@@ -4,8 +4,8 @@ using System.Security.Cryptography;
 
 namespace System.Resources;
 
-/// <summary>One queued pack entry: its name, its raw byte payload and the
-/// payload length. One entity instead of parallel name/data/len lists.</summary>
+/// <summary>一个已入队的 pack 条目：名称、原始字节负载与
+/// 负载长度。用一个实体代替并行的 name/data/len 列表。</summary>
 class ResourceEntry {
     string name;
     string data;
@@ -18,25 +18,25 @@ class ResourceEntry {
     }
 }
 
-/// <summary>Encrypted resource pack (.zrp) writer.
+/// <summary>加密资源包（.zrp）写入器。
 ///
-/// Layout (private format, nothing legible without the master key):
-///   [0..3]   magic (4 opaque bytes, not ASCII)
-///   [4]      version, obfuscated
-///   [5..20]  packId — 16 random bytes, unique per pack
-///   [21..32] index IV (12)
-///   [33..48] index GCM tag (16)
-///   [49..52] index ciphertext length (BE32)
-///   [53..56] signature length (BE32, 0 = unsigned)
-///   [...]    index ciphertext, then RSA signature, then entry payloads
+/// 布局（私有格式，没有主密钥则完全不可读）：
+///   [0..3]   magic（4 个不透明字节，非 ASCII）
+///   [4]      version（混淆后的版本号）
+///   [5..20]  packId —— 16 个随机字节，每个 pack 唯一
+///   [21..32] index 的 IV（12 字节）
+///   [33..48] index 的 GCM tag（16 字节）
+///   [49..52] index 密文长度（BE32）
+///   [53..56] 签名长度（BE32，0 表示无签名）
+///   [...]    index 密文，然后是 RSA 签名，最后是各条目负载
 ///
-/// The index (entry table) is AES-256-GCM encrypted with a key derived via
-/// HKDF from the master key and packId, and signed (RSASSA-PKCS1-v1_5 /
-/// SHA-256) so a repacked or entry-swapped file is rejected even by an
-/// attacker who recovered the master key but not the private signing key.
-/// Entry names are stored only as truncated SHA-256 hashes; each entry is
-/// encrypted with its own HKDF-derived key, so one broken entry key reveals
-/// nothing about the others or the master key.</summary>
+/// index（条目表）由主密钥与 packId 经 HKDF 派生的密钥做 AES-256-GCM 加密，
+/// 再签名（RSASSA-PKCS1-v1_5 / SHA-256），
+/// 因此即使攻击者拿到主密钥、却拿不到私钥，
+/// 重打包或调换条目的文件也会被拒绝。
+/// 条目名只存截断的 SHA-256 哈希；每个条目
+/// 用各自 HKDF 派生的密钥加密，因此一个条目密钥泄露
+/// 不会波及其他条目或主密钥。</summary>
 class ResourcePackWriter {
     [DllImport("crt")] static extern nint fopen(string path, string mode);
     [DllImport("crt")] static extern long fwrite(string buf, long size, long count, nint fp);
@@ -48,16 +48,16 @@ class ResourcePackWriter {
         this.entries = new List<ResourceEntry>();
     }
 
-    /// <summary>Queues one entry. <paramref name="data"/> is raw bytes with an
-    /// explicit length (Zan strings are byte buffers).</summary>
+    /// <summary>入队一个条目。<paramref name="data"/> 是原始字节，
+    /// 长度显式传入（Zan 字符串就是字节缓冲区）。</summary>
     void Add(string name, string data, int len) {
         this.entries.Add(new ResourceEntry(name, data, len));
     }
 
-    /// <summary>Writes the pack. <paramref name="masterKey"/> is 32 bytes.
-    /// <paramref name="nHex"/>/<paramref name="dHex"/> are the RSA modulus and
-    /// private exponent (hex) for index signing; pass null to skip signing.
-    /// Returns true on success.</summary>
+    /// <summary>写入 pack。<paramref name="masterKey"/> 为 32 字节。
+    /// <paramref name="nHex"/>/<paramref name="dHex"/> 是 RSA 模数与
+    /// 私钥指数（十六进制），用于 index 签名；传 null 可跳过签名。
+    /// 成功返回 true。</summary>
     bool Write(string path, string masterKey, string nHex, string dHex) {
         int count = this.entries.Count;
         int sigLen = 0;
@@ -76,7 +76,7 @@ class ResourcePackWriter {
         int idxLen = 4 + 61 * count;
         int dataStart = 57 + idxLen + sigLen;
 
-        // Build the plaintext index while laying out payload offsets.
+        // 在规划负载偏移的同时构建明文 index。
         byte[] idx = new byte[idxLen + 1];
         ResourcePack.storeBE32(idx, 0, count);
         List<byte[]> ivs = new List<byte[]>();
@@ -92,14 +92,14 @@ class ResourcePackWriter {
             for (; j < 16; j = j + 1) { idx[rec + j] = nh[j]; }
             ResourcePack.storeBE64(idx, rec + 16, off);
             ResourcePack.storeBE64(idx, rec + 24, this.entries[i].len);
-            idx[rec + 32] = 0;  // flags (bit0 reserved for compression)
+            idx[rec + 32] = 0;  // 标志位（bit0 保留给压缩）
             j = 0;
             while (j < 12) { idx[rec + 33 + j] = iv[j]; j = j + 1; }
-            // tag written after encryption below
+            // tag 在下方加密后写入
             off = off + this.entries[i].len;
         }
 
-        // Encrypt each payload with its own derived key.
+        // 用各自派生的密钥加密每个负载。
         List<byte[]> cts = new List<byte[]>();
         i = 0;
         while (i < count) {
@@ -113,7 +113,7 @@ class ResourcePackWriter {
             i = i + 1;
         }
 
-        // Sign the plaintext index, then encrypt it.
+        // 先对明文 index 签名，再加密。
         byte[] sig = null;
         if (sigLen > 0) {
             sig = Rsa.SignPkcs1Sha256(idx, idxLen, nBuf, sigLen, dBuf, sigLen);
@@ -146,15 +146,15 @@ class ResourcePackWriter {
     }
 }
 
-/// <summary>One parsed index record: the entry's name hash, its payload offset
-/// and size, and its per-entry IV and GCM tag. One entity instead of five
-/// index-aligned parallel lists.</summary>
+/// <summary>一条已解析的 index 记录：条目名哈希、负载偏移
+/// 与大小，以及每条目 IV 和 GCM tag。用一个实体代替五个
+/// 按 index 对齐的并行列表。</summary>
 class PackIndexEntry {
-    byte[] hash;   // 16-byte truncated SHA-256 of the name
-    int off;       // payload offset within the file
-    int size;      // payload byte length
-    byte[] iv;     // per-entry AES-GCM IV
-    byte[] tag;    // per-entry AES-GCM tag
+    byte[] hash;   // 名称的 16 字节截断 SHA-256
+    int off;       // 文件内的负载偏移
+    int size;      // 负载字节长度
+    byte[] iv;     // 每条目 AES-GCM IV
+    byte[] tag;    // 每条目 AES-GCM tag
 
     PackIndexEntry(byte[] hash, int off, int size, byte[] iv, byte[] tag) {
         this.hash = hash;
@@ -165,10 +165,10 @@ class PackIndexEntry {
     }
 }
 
-/// <summary>Encrypted resource pack reader. See ResourcePackWriter for the
-/// format. Open() verifies the index signature and authenticity before any
-/// entry is served; Read() re-derives the per-entry key and rejects tampered
-/// payloads via the GCM tag.</summary>
+/// <summary>加密资源包读取器。格式见 ResourcePackWriter。
+/// Open() 在提供条目前先校验 index 签名与真实性；
+/// Read() 会重新派生每条目密钥，并通过 GCM tag 拒绝
+/// 被篡改的负载。</summary>
 class ResourcePack {
     string path;
     string masterKey;
@@ -176,10 +176,10 @@ class ResourcePack {
     int count;
     List<PackIndexEntry> index;
 
-    // ---- shared helpers (also used by the writer) ----
+    // ---- 共享辅助（writer 同样使用）----
 
     static void writeMagic(byte[] hdr) {
-        // opaque non-ASCII magic + obfuscated version byte
+        // 不透明的非 ASCII magic + 混淆后的版本字节
         hdr[0] = 199; hdr[1] = 17; hdr[2] = 158; hdr[3] = 66;
         hdr[4] = (byte)(1 ^ 165);
     }
@@ -214,8 +214,8 @@ class ResourcePack {
         return v;
     }
 
-    /// <summary>Truncated SHA-256 of an entry name (16 bytes). Only this hash
-    /// is stored in the pack, so entry names cannot be listed from the file.</summary>
+    /// <summary>条目名的截断 SHA-256（16 字节）。pack 中只存
+    /// 这个哈希，因此无法从文件列出条目名。</summary>
     static byte[] nameHash(string name) {
         byte[] h = Sha256.Hash(name, name.Length);
         byte[] t = new byte[17];
@@ -234,18 +234,18 @@ class ResourcePack {
         return Hkdf.Derive(packId, 16, masterKey, 32, info, 20, 32);
     }
 
-    /// <summary>Reassembles a key from two XOR shares so the real key never
-    /// appears as one literal in the binary.</summary>
+    /// <summary>由两份 XOR 分片重组密钥，使真实密钥永不
+    /// 以单一字面量出现在二进制中。</summary>
     static byte[] MixKey(string a, string b, int len) {
         byte[] k = new byte[len + 1];
         for (int i = 0; i < len; i = i + 1) { k[i] = (byte)((a[i] & 255) ^ (b[i] & 255)); }
         return k;
     }
 
-    /// <summary>Opens a pack and authenticates its index. <paramref name="nHex"/>
-    /// and <paramref name="eHex"/> are the RSA public modulus/exponent (hex)
-    /// used to verify the index signature; pass null to accept unsigned packs.
-    /// <paramref name="err"/>[0]: 0 ok, 1 io/magic, 2 auth failure, 3 bad signature.</summary>
+    /// <summary>打开 pack 并认证其 index。<paramref name="nHex"/>
+    /// 与 <paramref name="eHex"/> 是 RSA 公钥模数/指数（十六进制），
+    /// 用于校验 index 签名；传 null 则接受未签名的 pack。
+    /// <paramref name="err"/>[0]：0 正常，1 IO/magic 错误，2 认证失败，3 签名错误。</summary>
     static ResourcePack Open(string path, string masterKey, string nHex, string eHex, List<int> err) {
         err[0] = 1;
         int fsz = File.GetSize(path);
@@ -335,10 +335,10 @@ class ResourcePack {
         return this.index[i].size;
     }
 
-    /// <summary>Decrypts one entry on demand (only that entry is read from
-    /// disk). Returns the plaintext and sets <paramref name="outLen"/>[0], or
-    /// returns null (outLen -1) if the name is unknown or the data fails
-    /// authentication.</summary>
+    /// <summary>按需解密一个条目（只从磁盘读取该条目）。
+    /// 返回明文并设置 <paramref name="outLen"/>[0]；
+    /// 若名称未知或数据认证失败，
+    /// 则返回 null（outLen 为 -1）。</summary>
     byte[] Read(string name, List<int> outLen) {
         outLen[0] = -1;
         int i = this.find(name);

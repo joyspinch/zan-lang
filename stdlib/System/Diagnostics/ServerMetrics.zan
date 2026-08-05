@@ -4,6 +4,11 @@ using System.Json;
 
 namespace System.Diagnostics;
 
+/// <summary>Sink for a caught server error: the application persists it (the
+/// backend error screen reads what this wrote). The detail is already
+/// redacted.</summary>
+delegate void ErrorSink(long ts, string origin, string detail);
+
 /// <summary>
 /// Runtime observability for long-running servers, as a standard-library
 /// capability. It combines two things:
@@ -40,6 +45,69 @@ class SlowEntry {
     }
 }
 
+/// <summary>One recorded server-side error: when it happened (epoch seconds),
+/// where ("METHOD path"), and the message. Kept so an operator can see recent
+/// failures in the backend even when the console is off.</summary>
+class ErrEntry {
+    long ts;
+    string origin;
+    string detail;
+
+    ErrEntry(long ts, string origin, string detail) {
+        this.ts = ts;
+        this.origin = origin;
+        this.detail = detail;
+    }
+}
+
+class ServerErrorDoc {
+    long ts;
+    string origin;
+    string detail;
+}
+
+/// <summary>One aggregate row of the slow-SQL leaderboard, keyed by the
+/// NORMALIZED ("net") statement so that the same query with different literal
+/// arguments -- `in (1,2,3)` and `in (1,2,3,4,5)` -- counts as one entry.</summary>
+class SqlAgg {
+    string sql;      // normalized statement
+    long count;      // times executed
+    long totalMs;    // summed elapsed ms across executions
+    long maxMs;      // slowest single execution
+
+    SqlAgg(string sql) {
+        this.sql = sql;
+        this.count = 0;
+        this.totalMs = 0;
+        this.maxMs = 0;
+    }
+}
+
+/// <summary>One aggregate row of the request leaderboard, keyed by the endpoint
+/// ("METHOD /path" with numeric path segments folded to :id) so that every hit
+/// of the same interface -- /admin/users/1 and /admin/users/2 -- counts as one
+/// entry with its own count / average / maximum, instead of a flat list of
+/// individual samples dominated by long-lived connections.</summary>
+class ReqAgg {
+    string req;      // "METHOD /normalized/path"
+    long count;      // times served
+    long totalMs;    // summed elapsed ms
+    long maxMs;      // slowest single hit
+    long errors;     // 5xx responses
+    long failed;     // 4xx and 5xx: everything the caller did not get served
+    long rejected;   // 429: refused by a rate limit, not by the handler
+
+    ReqAgg(string req) {
+        this.req = req;
+        this.count = 0;
+        this.totalMs = 0;
+        this.maxMs = 0;
+        this.errors = 0;
+        this.failed = 0;
+        this.rejected = 0;
+    }
+}
+
 // ---- metrics-snapshot entities -------------------------------------------
 // SnapshotJson is declared as classes and serialized with Json.Serialize<T>;
 // the JSON keys match the documented /admin/stats shape exactly.
@@ -47,6 +115,8 @@ class SlowEntry {
 class ServerMetricsRequestDoc {
     long count;
     long errors;
+    long failed;
+    long rejected;
     long avg_ms;
     long max_ms;
     long slow_threshold_ms;
@@ -71,6 +141,40 @@ class ServerSlowQueryDoc {
     long ms;
 }
 
+/// <summary>One leaderboard row: a normalized statement ranked by total time
+/// spent in it, with the count and per-call average/maximum, so an operator can
+/// see WHICH query shape is costing the most, not just the last slow sample.</summary>
+class ServerTopSqlDoc {
+    string sql;
+    long count;
+    long total_ms;
+    long avg_ms;
+    long max_ms;
+}
+
+/// <summary>One request-leaderboard row: an endpoint ranked by total time
+/// served across all its hits, with count and per-hit average/maximum.</summary>
+class ServerTopReqDoc {
+    string req;
+    long count;
+    long total_ms;
+    long avg_ms;
+    long max_ms;
+    long errors;
+    long failed;
+    long rejected;
+}
+
+/// Load in flight right now: requests being served, the highest that has been,
+/// and the long-lived connections (SSE/WebSocket) currently held open.
+class ServerMetricsLoadDoc {
+    long concurrent;
+    long peak;
+    long streams;
+    long stream_frames;
+    long stream_bytes;
+}
+
 class ServerMetricsDoc {
     long uptime_ms;
     long pid;
@@ -80,8 +184,11 @@ class ServerMetricsDoc {
     long mem_rss_bytes;
     ServerMetricsRequestDoc requests;
     ServerMetricsQueryDoc queries;
+    ServerMetricsLoadDoc load;
     List<ServerSlowRequestDoc> slow_requests;
     List<ServerSlowQueryDoc> slow_queries;
+    List<ServerTopSqlDoc> top_sql;
+    List<ServerTopReqDoc> top_requests;
 }
 
 class ServerMetrics {
@@ -99,9 +206,23 @@ class ServerMetrics {
     static extern int gettimeofday(string tv, int tz);
     #endif
 
+    // Append-only error log sink. The C runtime's buffered file IO is enough:
+    // errors are rare, so each is flushed on close for crash durability rather
+    // than batched. Strings are byte-indexed, so fwrite(line, 1, Length) writes
+    // multibyte (UTF-8) messages intact.
+    [DllImport("crt")]
+    static extern nint fopen(string path, string mode);
+    [DllImport("crt")]
+    static extern long fwrite(string buf, long size, long count, nint fp);
+    [DllImport("crt")]
+    static extern int fclose(nint fp);
+
     // Aggregated request metrics.
     int reqCount;
     int reqErrors;
+    int reqFailed;    // 4xx + 5xx
+    int reqRejected;  // 429: a refusal is not a success, and hiding it makes a
+                      // throttled server look idle
     long reqTotalMs;
     long reqMaxMs;
     int slowReqMs;                 // slow-request threshold (ms)
@@ -113,6 +234,17 @@ class ServerMetrics {
     long queryMaxMs;
     int slowQueryMs;               // slow-query threshold (ms)
     List<SlowEntry> slowQueries;   // truncated SQL + elapsed ms
+    List<SqlAgg> sqlAgg;           // per-normalized-statement leaderboard
+    int sqlAggCap;                 // distinct statement shapes kept
+    List<ReqAgg> reqAgg;           // per-endpoint request leaderboard
+    int reqAggCap;                 // distinct endpoints kept
+
+    // ---- error log ----
+    List<ErrEntry> errors;         // most-recent-first ring for the backend view
+    int errCap;                    // entries kept in memory
+    long errTotal;                 // errors seen since start
+    string errLogPath;             // append-only sink ("" disables the file)
+    bool errDebug;                 // also echo to stdout (debug mode only)
 
     long startMillis;
     long lastWallMs;               // for CPU% delta sampling
@@ -139,9 +271,25 @@ class ServerMetrics {
     long seriesLastWall;           // CPU%-per-bucket delta state, kept apart
     long seriesLastCpu;            // from the snapshot's own delta state
 
+    // Concurrency, which a per-request average cannot show: how many requests
+    // are in flight at once, the worst it has been, and how many long-lived
+    // connections are being held (a stream occupies a coroutine for minutes,
+    // so it is capacity even while it is idle).
+    long concurrent;
+    long concurrentPeak;
+    long streams;
+    long streamFrames;
+    long streamBytes;
+
+    // Where a caught error goes besides the ring and the log file: the
+    // application sets this to persist it (see MetricsStore).
+    ErrorSink errSink;
+
     ServerMetrics() {
         this.reqCount = 0;
         this.reqErrors = 0;
+        this.reqFailed = 0;
+        this.reqRejected = 0;
         this.reqTotalMs = 0;
         this.reqMaxMs = 0;
         this.slowReqMs = 500;
@@ -151,6 +299,15 @@ class ServerMetrics {
         this.queryMaxMs = 0;
         this.slowQueryMs = 200;
         this.slowQueries = new List<SlowEntry>();
+        this.sqlAgg = new List<SqlAgg>();
+        this.sqlAggCap = 200;
+        this.reqAgg = new List<ReqAgg>();
+        this.reqAggCap = 200;
+        this.errors = new List<ErrEntry>();
+        this.errCap = 100;
+        this.errTotal = 0;
+        this.errLogPath = "logs/error.log";
+        this.errDebug = false;
         this.startMillis = ServerMetrics.MonoMillis();
         this.lastWallMs = this.startMillis;
         this.lastCpuMs = 0;
@@ -170,6 +327,35 @@ class ServerMetrics {
         for (int i = 0; i < this.seriesCap; i = i + 1) { this.sSec[i] = 0 - 1; }
         this.seriesLastWall = this.startMillis;
         this.seriesLastCpu = 0;
+        this.concurrent = 0;
+        this.concurrentPeak = 0;
+        this.streams = 0;
+        this.streamFrames = 0;
+        this.streamBytes = 0;
+        this.errSink = null;
+    }
+
+    /// <summary>A request started. Paired with Left() in the dispatcher, so the
+    /// counter is exact rather than sampled.</summary>
+    void Entered() {
+        this.concurrent = this.concurrent + 1;
+        if (this.concurrent > this.concurrentPeak) {
+            this.concurrentPeak = this.concurrent;
+        }
+    }
+
+    void Left() {
+        if (this.concurrent > 0) { this.concurrent = this.concurrent - 1; }
+    }
+
+    /// <summary>A long-lived connection opened / closed, and what it pushed
+    /// while it was open. Frames and bytes, never a duration.</summary>
+    void StreamOpened() { this.streams = this.streams + 1; }
+
+    void StreamClosed(long frames, long bytes) {
+        if (this.streams > 0) { this.streams = this.streams - 1; }
+        this.streamFrames = this.streamFrames + frames;
+        this.streamBytes = this.streamBytes + bytes;
     }
 
     // Latency histogram edges in ms. Fixed buckets are what make a percentile
@@ -248,6 +434,75 @@ class ServerMetrics {
 
     ServerMetrics SlowRequestMs(int ms) { this.slowReqMs = ms; return this; }
     ServerMetrics SlowQueryMs(int ms) { this.slowQueryMs = ms; return this; }
+
+    // ---- error log ----
+
+    /// <summary>Where errors are appended and whether they also echo to the
+    /// console. The log always persists; the console is a debug convenience the
+    /// operator can turn off. Empty path disables the file sink.</summary>
+    ServerMetrics ErrorLog(string path, bool debugConsole) {
+        this.errLogPath = path;
+        this.errDebug = debugConsole;
+        if (path.Length > 0) {
+            int cut = 0 - 1;
+            for (int i = 0; i < path.Length; i = i + 1) {
+                string ch = path.Substring(i, 1);
+                if (ch == "/" || ch == "\\") { cut = i; }
+            }
+            if (cut > 0) { Directory.CreateDirectory(path.Substring(0, cut)); }
+        }
+        return this;
+    }
+    ServerMetrics DebugConsole(bool on) { this.errDebug = on; return this; }
+    bool DebugConsoleOn() { return this.errDebug; }
+
+    // Append one line to the log file, flushing on close so a record survives
+    // even if the process dies right after. Errors are rare, so this is not on
+    // any hot path; the request path never touches disk.
+    void AppendErrLine(string line) {
+        if (this.errLogPath.Length == 0) { return; }
+        nint fp = fopen(this.errLogPath, "ab");
+        if (fp == 0) { return; }
+        long _w = fwrite(line, 1, line.Length, fp);
+        int _c = fclose(fp);
+    }
+
+    /// <summary>Records one server-side error: kept in a bounded in-memory ring
+    /// for the backend view and appended to the log file. `ts` is epoch seconds
+    /// from the caller so this class needs no clock of its own. The detail must
+    /// already be redacted by the caller -- no keys/tokens/passwords.</summary>
+    void RecordError(long ts, string origin, string detail) {
+        this.errTotal = this.errTotal + 1;
+        if (this.errSink != null) { this.errSink(ts, origin, detail); }
+        this.errors.Add(new ErrEntry(ts, origin, detail));
+        while (this.errors.Count > this.errCap) { this.errors.RemoveAt(0); }
+        this.AppendErrLine("[" + Convert.ToString(ts) + "] " + origin
+            + " | " + detail + "\n");
+        if (this.errDebug) {
+            Console.WriteLine("[error] " + origin + " | " + detail);
+        }
+    }
+
+    /// <summary>Where errors are persisted, set once at startup. Kept as a
+    /// delegate so this class stays free of a database.</summary>
+    ServerMetrics OnError(ErrorSink fn) { this.errSink = fn; return this; }
+
+    long ErrorTotal() { return this.errTotal; }
+
+    /// <summary>Recent errors, most-recent first, for a backend log screen.</summary>
+    List<ServerErrorDoc> RecentErrors(int limit) {
+        List<ServerErrorDoc> outp = new List<ServerErrorDoc>();
+        int n = this.errors.Count;
+        for (int i = n - 1; i >= 0 && outp.Count < limit; i = i - 1) {
+            ErrEntry e = this.errors[i];
+            ServerErrorDoc d = new ServerErrorDoc();
+            d.ts = e.ts;
+            d.origin = e.origin;
+            d.detail = e.detail;
+            outp.Add(d);
+        }
+        return outp;
+    }
 
     // ---- OS probes ----
 
@@ -362,6 +617,8 @@ class ServerMetrics {
         this.reqTotalMs = this.reqTotalMs + ms;
         if (ms > this.reqMaxMs) { this.reqMaxMs = ms; }
         if (status >= 500) { this.reqErrors = this.reqErrors + 1; }
+        if (status >= 400) { this.reqFailed = this.reqFailed + 1; }
+        if (status == 429) { this.reqRejected = this.reqRejected + 1; }
 
         int idx = this.SeriesSlot(ServerMetrics.MonoMillis() / 1000);
         this.sReq[idx] = this.sReq[idx] + 1;
@@ -371,12 +628,74 @@ class ServerMetrics {
         int hb = idx * ServerMetrics.HIST_BINS + ServerMetrics.HistBin(ms);
         this.sHist[hb] = this.sHist[hb] + 1;
 
+        // Aggregate by endpoint ("METHOD /path" with ids folded) so the monitor
+        // ranks interfaces by cost instead of listing raw samples.
+        this.RecordReqAgg(ServerMetrics.NormalizePath(method, path), ms, status);
+
         if (ms >= this.slowReqMs) {
             this.slowReqs.Add(new SlowEntry(method + " " + path + " -> " + Convert.ToString(status), ms));
             if (this.slowReqs.Count > this.ringCap) {
                 this.slowReqs.RemoveAt(0);
             }
         }
+    }
+
+    /// <summary>Folds one request into the per-endpoint aggregate that backs the
+    /// request leaderboard. Bounded to `reqAggCap` distinct endpoints.</summary>
+    void RecordReqAgg(string key, long ms, int status) {
+        ReqAgg a = null;
+        for (int k = 0; k < this.reqAgg.Count; k = k + 1) {
+            if (this.reqAgg[k].req == key) { a = this.reqAgg[k]; break; }
+        }
+        if (a == null) {
+            if (this.reqAgg.Count >= this.reqAggCap) { return; }
+            a = new ReqAgg(key);
+            this.reqAgg.Add(a);
+        }
+        a.count = a.count + 1;
+        a.totalMs = a.totalMs + ms;
+        if (ms > a.maxMs) { a.maxMs = ms; }
+        if (status >= 500) { a.errors = a.errors + 1; }
+        if (status >= 400) { a.failed = a.failed + 1; }
+        if (status == 429) { a.rejected = a.rejected + 1; }
+    }
+
+    /// <summary>True when s is non-empty and every character is a digit; such a
+    /// path segment is a record id and is folded to :id for grouping.</summary>
+    static bool IsAllDigits(string s) {
+        if (s.Length == 0) { return false; }
+        for (int i = 0; i < s.Length; i = i + 1) {
+            if (!ServerMetrics.IsDigit(s.Substring(i, 1))) { return false; }
+        }
+        return true;
+    }
+
+    /// <summary>Endpoint key for aggregation: drops the query string and folds
+    /// numeric path segments to :id, so /admin/users/1 and /admin/users/2 map to
+    /// the same "GET /admin/users/:id".</summary>
+    static string NormalizePath(string method, string path) {
+        string p = path;
+        for (int i = 0; i < p.Length; i = i + 1) {
+            if (p.Substring(i, 1) == "?") { p = p.Substring(0, i); break; }
+        }
+        List<string> parts = new List<string>();
+        StringBuilder cur = new StringBuilder();
+        int n = p.Length;
+        for (int i = 0; i <= n; i = i + 1) {
+            if (i == n || p.Substring(i, 1) == "/") {
+                parts.Add(cur.ToString());
+                cur = new StringBuilder();
+            } else {
+                cur.Append(p.Substring(i, 1));
+            }
+        }
+        StringBuilder outp = new StringBuilder();
+        for (int i = 0; i < parts.Count; i = i + 1) {
+            if (i > 0) { outp.Append("/"); }
+            if (ServerMetrics.IsAllDigits(parts[i])) { outp.Append(":id"); }
+            else { outp.Append(parts[i]); }
+        }
+        return method + " " + outp.ToString();
     }
 
     /// <summary>Records one completed database query.</summary>
@@ -389,14 +708,179 @@ class ServerMetrics {
         this.sQuery[idx] = this.sQuery[idx] + 1;
         this.sQueryMs[idx] = this.sQueryMs[idx] + ms;
 
+        // Normalize once: literal values and variable-length IN lists collapse
+        // to placeholders, so every execution of the same query SHAPE lands on
+        // the same leaderboard row regardless of its arguments.
+        string norm = ServerMetrics.NormalizeSql(sql);
+        if (norm.Length > 200) { norm = norm.Substring(0, 200); }
+        this.RecordSqlAgg(norm, ms);
+
         if (ms >= this.slowQueryMs) {
-            string q = sql;
-            if (q.Length > 200) { q = q.Substring(0, 200); }
-            this.slowQueries.Add(new SlowEntry(q, ms));
+            this.slowQueries.Add(new SlowEntry(norm, ms));
             if (this.slowQueries.Count > this.ringCap) {
                 this.slowQueries.RemoveAt(0);
             }
         }
+    }
+
+    /// <summary>Folds one execution into the per-shape aggregate that backs the
+    /// slow-SQL leaderboard. Bounded to `sqlAggCap` distinct shapes: once full,
+    /// a never-before-seen shape is dropped rather than growing without limit --
+    /// a monitor should not become a memory leak under a query it cannot fold.</summary>
+    void RecordSqlAgg(string norm, long ms) {
+        SqlAgg a = null;
+        for (int k = 0; k < this.sqlAgg.Count; k = k + 1) {
+            if (this.sqlAgg[k].sql == norm) { a = this.sqlAgg[k]; break; }
+        }
+        if (a == null) {
+            if (this.sqlAgg.Count >= this.sqlAggCap) { return; }
+            a = new SqlAgg(norm);
+            this.sqlAgg.Add(a);
+        }
+        a.count = a.count + 1;
+        a.totalMs = a.totalMs + ms;
+        if (ms > a.maxMs) { a.maxMs = ms; }
+    }
+
+    static bool IsDigit(string c) {
+        return c == "0" || c == "1" || c == "2" || c == "3" || c == "4"
+            || c == "5" || c == "6" || c == "7" || c == "8" || c == "9";
+    }
+
+    /// <summary>Reduces a statement to its "net" form: single-quoted string
+    /// literals and numeric literals become `?`, runs of whitespace collapse to
+    /// one space, and a comma-separated run of two or more placeholders collapses
+    /// to a single `?` -- so `WHERE id IN (1,2,3)` and `WHERE id IN (1,2,3,4,5)`
+    /// normalize to the identical `WHERE id IN (?)`.</summary>
+    static string NormalizeSql(string sql) {
+        StringBuilder sb = new StringBuilder();
+        int n = sql.Length;
+        int i = 0;
+        bool lastSpace = false;
+        while (i < n) {
+            string c = sql.Substring(i, 1);
+            if (c == "'") {
+                i = i + 1;
+                while (i < n) {
+                    string d = sql.Substring(i, 1);
+                    if (d == "'") {
+                        if (i + 1 < n && sql.Substring(i + 1, 1) == "'") {
+                            i = i + 2; continue;
+                        }
+                        i = i + 1; break;
+                    }
+                    i = i + 1;
+                }
+                sb.Append("?"); lastSpace = false; continue;
+            }
+            if (ServerMetrics.IsDigit(c)) {
+                while (i < n) {
+                    string d = sql.Substring(i, 1);
+                    if (ServerMetrics.IsDigit(d) || d == "." || d == "e"
+                        || d == "E" || d == "x" || d == "X") { i = i + 1; }
+                    else { break; }
+                }
+                sb.Append("?"); lastSpace = false; continue;
+            }
+            if (c == " " || c == "\t" || c == "\n" || c == "\r") {
+                if (!lastSpace) { sb.Append(" "); lastSpace = true; }
+                i = i + 1; continue;
+            }
+            sb.Append(c); lastSpace = false; i = i + 1;
+        }
+        return ServerMetrics.CollapsePlaceholders(sb.ToString()).Trim();
+    }
+
+    /// <summary>Collapses a comma-separated run of two or more `?` into one `?`.
+    /// A lone placeholder (e.g. `name = ?`) is left untouched so unrelated
+    /// columns do not get merged; only genuine value lists shrink.</summary>
+    static string CollapsePlaceholders(string s) {
+        StringBuilder sb = new StringBuilder();
+        int n = s.Length;
+        int i = 0;
+        while (i < n) {
+            if (s.Substring(i, 1) == "?") {
+                int j = i;
+                int cnt = 0;
+                bool more = true;
+                while (more) {
+                    if (j < n && s.Substring(j, 1) == "?") {
+                        cnt = cnt + 1; j = j + 1;
+                        while (j < n && s.Substring(j, 1) == " ") { j = j + 1; }
+                        if (j < n && s.Substring(j, 1) == ",") {
+                            j = j + 1;
+                            while (j < n && s.Substring(j, 1) == " ") { j = j + 1; }
+                        } else {
+                            more = false;
+                        }
+                    } else {
+                        more = false;
+                    }
+                }
+                sb.Append("?");
+                if (cnt >= 2) { i = j; } else { i = i + 1; }
+                continue;
+            }
+            sb.Append(s.Substring(i, 1)); i = i + 1;
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>The leaderboard: up to `limit` normalized statements ranked by
+    /// total time spent, most expensive first. A selection scan rather than a
+    /// sort -- the shape set is small and bounded, and `limit` is tiny.</summary>
+    List<ServerTopSqlDoc> TopSqlDocs(int limit) {
+        List<ServerTopSqlDoc> outp = new List<ServerTopSqlDoc>();
+        List<SqlAgg> pool = new List<SqlAgg>();
+        for (int k = 0; k < this.sqlAgg.Count; k = k + 1) { pool.Add(this.sqlAgg[k]); }
+        while (outp.Count < limit && pool.Count > 0) {
+            int best = 0;
+            for (int k = 1; k < pool.Count; k = k + 1) {
+                if (pool[k].totalMs > pool[best].totalMs) { best = k; }
+            }
+            SqlAgg a = pool[best];
+            ServerTopSqlDoc d = new ServerTopSqlDoc();
+            d.sql = a.sql;
+            d.count = a.count;
+            d.total_ms = a.totalMs;
+            d.max_ms = a.maxMs;
+            d.avg_ms = 0;
+            if (a.count > 0) { d.avg_ms = a.totalMs / a.count; }
+            outp.Add(d);
+            pool.RemoveAt(best);
+        }
+        return outp;
+    }
+
+    /// <summary>The request leaderboard: endpoints ranked by total time served,
+    /// highest first, capped at `limit` rows. Selection-sort over a copied pool
+    /// (the list is tiny and this avoids mutating the live aggregates).</summary>
+    List<ServerTopReqDoc> TopReqDocs(int limit) {
+        List<ServerTopReqDoc> outp = new List<ServerTopReqDoc>();
+        List<ReqAgg> pool = new List<ReqAgg>();
+        for (int k = 0; k < this.reqAgg.Count; k = k + 1) {
+            pool.Add(this.reqAgg[k]);
+        }
+        while (outp.Count < limit && pool.Count > 0) {
+            int best = 0;
+            for (int k = 1; k < pool.Count; k = k + 1) {
+                if (pool[k].totalMs > pool[best].totalMs) { best = k; }
+            }
+            ReqAgg a = pool[best];
+            ServerTopReqDoc d = new ServerTopReqDoc();
+            d.req = a.req;
+            d.count = a.count;
+            d.total_ms = a.totalMs;
+            d.max_ms = a.maxMs;
+            d.errors = a.errors;
+            d.failed = a.failed;
+            d.rejected = a.rejected;
+            d.avg_ms = 0;
+            if (a.count > 0) { d.avg_ms = a.totalMs / a.count; }
+            outp.Add(d);
+            pool.RemoveAt(best);
+        }
+        return outp;
     }
 
     List<ServerSlowRequestDoc> SlowReqDocs() {
@@ -548,6 +1032,8 @@ class ServerMetrics {
         ServerMetricsRequestDoc requests = new ServerMetricsRequestDoc();
         requests.count = this.reqCount;
         requests.errors = this.reqErrors;
+        requests.failed = this.reqFailed;
+        requests.rejected = this.reqRejected;
         requests.avg_ms = reqAvg;
         requests.max_ms = this.reqMaxMs;
         requests.slow_threshold_ms = this.slowReqMs;
@@ -560,6 +1046,13 @@ class ServerMetrics {
         queries.slow_threshold_ms = this.slowQueryMs;
         queries.slow_count = this.slowQueries.Count;
 
+        ServerMetricsLoadDoc load = new ServerMetricsLoadDoc();
+        load.concurrent = this.concurrent;
+        load.peak = this.concurrentPeak;
+        load.streams = this.streams;
+        load.stream_frames = this.streamFrames;
+        load.stream_bytes = this.streamBytes;
+
         ServerMetricsDoc o = new ServerMetricsDoc();
         o.uptime_ms = uptime;
         o.pid = ProcessHost.Pid();
@@ -569,8 +1062,11 @@ class ServerMetrics {
         o.mem_rss_bytes = ServerMetrics.MemoryRssBytes();
         o.requests = requests;
         o.queries = queries;
+        o.load = load;
         o.slow_requests = this.SlowReqDocs();
         o.slow_queries = this.SlowQueryDocs();
+        o.top_sql = this.TopSqlDocs(20);
+        o.top_requests = this.TopReqDocs(20);
         return Json.Serialize<ServerMetricsDoc>(o);
     }
 }

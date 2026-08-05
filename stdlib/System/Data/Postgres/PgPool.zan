@@ -5,16 +5,16 @@ using System.Threading;
 namespace System.Data.Postgres;
 
 /// <summary>
-/// Coroutine-aware connection pool for <see cref="PgConnection"/>.
+/// 面向 <see cref="PgConnection"/> 的协程化连接池。
 ///
-/// Same contract as <see cref="DbPool"/> -- lazy growth up to <c>maxSize</c>,
-/// event-driven <see cref="Gate"/> waiting instead of polling, eviction of dead
-/// connections -- but typed, so the coroutine query API (<c>QueryAsync</c>,
-/// <c>ExecuteAsync</c>, <c>QueryParamsAsync</c>) stays reachable. Connections
-/// are opened with the non-blocking libpq handshake, so neither growing the
-/// pool nor querying blocks the worker thread.
+/// 契约与 <see cref="DbPool"/> 相同——惰性增长至 <c>maxSize</c>，
+/// 用事件驱动 <see cref="Gate"/> 等待而非轮询，驱逐失效
+/// 连接——但它是类型化的，协程查询 API（<c>QueryAsync</c>、
+/// <c>ExecuteAsync</c>、<c>QueryParamsAsync</c>）仍然可用。连接
+/// 使用非阻塞 libpq 握手建立，因此无论扩容
+/// 连接池还是查询都不会阻塞工作线程。
 ///
-/// Usage:
+/// 用法：
 ///   PgPool pool = new PgPool("127.0.0.1", 5432, "app", "postgres", "secret", 8);
 ///   PgConnection db = await pool.AcquireAsync();
 ///   DbResult r = await db.QueryAsync("SELECT 1");
@@ -41,9 +41,9 @@ class PgPool {
         return await PgConnection.OpenAsync(this.conninfo);
     }
 
-    /// <summary>Checks out a connection: reuses an idle one, opens a new one if
-    /// under the cap, otherwise suspends the coroutine until one is released.
-    /// Returns null once the pool has been closed.</summary>
+    /// <summary>借出连接：优先复用空闲连接，
+    /// 未达上限则新建，否则挂起协程直到有连接被归还。
+    /// 连接池关闭后返回 null。</summary>
     async PgConnection AcquireAsync() {{
         while (true) {{
             if (this.core.IsClosed()) {{
@@ -51,8 +51,8 @@ class PgPool {
             }}
             PgConnection pooled = this.core.TakeIdle();
             while (pooled != null) {{
-                // A connection can rot while parked (server restart, idle
-                // timeout): evict it and free its slot for a waiter.
+                // 连接在停泊期间可能失效（服务器重启、空闲
+                // 超时）：将其驱逐，为等待者腾出槽位。
                 if (pooled.IsConnected()) {{
                     return pooled;
                 }}
@@ -66,7 +66,7 @@ class PgPool {
                 }}
                 return opened;
             }}
-            // Pool saturated: park until a connection is released.
+            // 连接池已满：停泊直到有连接被归还。
             this.core.EnterWait();
             await this.core.Waiter().Wait();
             this.core.LeaveWait();
@@ -74,8 +74,8 @@ class PgPool {
         return null;
     }}
 
-    /// <summary>Returns a connection to the pool. A broken or post-Close()
-    /// connection is closed and dropped instead of being pooled.</summary>
+    /// <summary>将连接归还连接池。已损坏或 Close() 之后的
+    /// 连接会被关闭销毁而不入池。</summary>
     void Release(PgConnection c) {{
         if (c == null) {{
             return;
@@ -90,23 +90,23 @@ class PgPool {
         this.core.Pool(c);
     }}
 
-    /// <summary>Number of idle (pooled, ready-to-use) connections.</summary>
+    /// <summary>空闲（已入池、立即可用）连接数。</summary>
     int IdleCount() {{
         return this.core.IdleCount();
     }}
 
-    /// <summary>Total live connections (idle + checked out).</summary>
+    /// <summary>存活连接总数（空闲 + 借出）。</summary>
     int LiveCount() {{
         return this.core.LiveCount();
     }}
 
-    /// <summary>Coroutines currently parked waiting for a connection.</summary>
+    /// <summary>当前停泊等待连接的协程数。</summary>
     int WaitingCount() {
         return this.core.WaitingCount();
     }
 
-    /// <summary>Closes all idle connections and marks the pool closed. Connections
-    /// still checked out are closed when they are released.</summary>
+    /// <summary>关闭所有空闲连接并标记连接池已关闭。仍
+    /// 被借出的连接在归还时关闭。</summary>
     void Close() {{
         this.core.MarkClosed();
         PgConnection c = this.core.TakeIdle();

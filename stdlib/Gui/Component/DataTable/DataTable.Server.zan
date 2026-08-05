@@ -4,52 +4,52 @@ using Gui;
 namespace Gui.Component.DataTable;
 
 /// <summary>
-/// Server-side / infinite / viewport data source: the grid pulls rows in
-/// fixed-size blocks from an underlying service and caches only what it has
-/// fetched, with an unknown total count that grows as the user scrolls.
+/// 服务端/无限/视口数据源：网格以
+/// 固定大小的块从底层服务拉取行，只缓存已获取的数据，
+/// 总数未知，随用户滚动而增长。
 ///
-/// Subclass it and implement FillBlock — the actual fetch. Two delivery modes:
-///   - synchronous (default): FillBlock runs on the UI thread when the grid
-///     requests a block. Right for fast local sources (a file, a computed
-///     view, an in-process query): the grid's per-frame Poll() folds the
-///     freshly filled block in, so a visible block costs at most one frame.
-///   - asynchronous: override FetchBlock to launch your own background fetch
-///     (a Thread worker, an async I/O call) and call FinishBlock(rows, count)
-///     from wherever the result lands (e.g. an App.Post'd handler). Poll()
-///     only folds the block in once FinishBlock ran, so the UI thread never
-///     waits on the remote. RequestBlock stays coalesced while a fetch is in
-///     flight, so a slow server cannot queue unbounded work.
+/// 继承它并实现 FillBlock——实际的数据获取。两种交付模式：
+///   - 同步（默认）：网格请求块时 FillBlock 在 UI 线程运行。
+///     适合快速本地源（文件、计算视图、进程内查询）：
+///     网格每帧的 Poll() 会
+///     把刚填充的块并入，因此可见块最多延迟一帧。
+///   - 异步：重写 FetchBlock 启动自己的后台获取
+///     （Thread 工作线程、异步 I/O 调用），并在结果返回处
+///     （例如 App.Post 的处理器）调用 FinishBlock(rows, count)。
+///     Poll() 只在 FinishBlock 执行后才并入数据块，UI 线程从不
+///     等待远端。获取进行中时 RequestBlock 保持合并，
+///     慢服务器无法堆积无界的工作。
 ///
-/// Row indices are server-ordered: ServerControlled() returns true, so the
-/// grid skips local sort/filter and renders the exact sequence the source
-/// provides. Grouping and aggregation still run locally, over the loaded
-/// prefix (an inherent property of a partial dataset, not a bug).
+/// 行索引由服务器排序：ServerControlled() 返回 true，
+/// 网格跳过本地排序/过滤，按源提供的顺序原样渲染
+/// 。分组和聚合仍在本地运行，作用于已加载的
+/// 前缀（这是部分数据集的固有属性，不是 bug）。
 ///
-/// Total-count modes:
-///   - unknown (default): RowCount() reports the fetched prefix and HasMore()
-///     stays true until a short block (fewer than blockSize rows) announces
-///     the end — or SetKnownTotal pins it explicitly.
-///   - known: SetKnownTotal(n) right after Create gives the grid an exact
-///     scrollbar from the start; blocks stream in behind it on demand.
+/// 总数模式：
+///   - 未知（默认）：RowCount() 报告已获取前缀，HasMore() 保持 true，
+///     直到一个短块（少于 blockSize 行）宣告
+///     结束——或由 SetKnownTotal 显式固定。
+///   - 已知：Create 后立即 SetKnownTotal(n) 让网格从一开始就有精确的
+///     滚动条；数据块按需在其后流入。
 /// </summary>
 class ServerDataSource : DataSource {
-    int blockSize;           // rows per fetched block (default 100)
-    List<DataRow> cache;     // fetched rows, index-aligned (0..RowCount)
-    int knownTotal;          // total rows the server declares, -1 = unknown
-    bool loading;            // a fetch is in flight (coalesces RequestBlock)
-    int fetchStart;          // first row of the in-flight fetch
-    bool blockDone;          // the in-flight fetch has produced its result
-    List<DataRow> blockRows; // result buffer for the in-flight fetch
-    int blockCount;          // rows the fetch produced (short = end of data)
+    int blockSize;           // 每个获取块的行数（默认 100）
+    List<DataRow> cache;     // 已获取的行，按索引对齐（0..RowCount）
+    int knownTotal;          // 服务器声明的总行数，-1 = 未知
+    bool loading;            // 获取进行中（合并 RequestBlock）
+    int fetchStart;          // 进行中获取的首行
+    bool blockDone;          // 进行中的获取已产生结果
+    List<DataRow> blockRows; // 进行中获取的结果缓冲区
+    int blockCount;          // 获取产生的行数（短块 = 数据结束）
 
-    /// Create a server source with the given block size. Call SetKnownTotal
-    /// afterwards to pin the total row count; leave it unknown to grow.
+    /// 以给定块大小创建服务端数据源。
+    /// 之后调用 SetKnownTotal 固定总行数；不调用则保持未知并持续增长。
     ServerDataSource(int blockSize) {
         this.Setup(blockSize);
     }
 
-    /// Initialise the source. Subclasses that build their own instances (a
-    /// static factory like RowListSource.Create) call this before use.
+    /// 初始化数据源。自行构建实例的子类（如
+    /// RowListSource.Create 之类的静态工厂）在使用前调用它。
     void Setup(int blockSize) {
         this.blockSize = blockSize;
         if (this.blockSize < 1) { this.blockSize = 1; }
@@ -62,31 +62,31 @@ class ServerDataSource : DataSource {
         this.blockCount = 0;
     }
 
-    /// Pin the total row count. Pass -1 to go back to unknown/growing mode.
-    /// The source can call this any time — e.g. once a count query returns —
-    /// and the grid picks it up on the next Poll().
+    /// 固定总行数。传 -1 回到未知/增长模式。
+    /// 数据源可随时调用——例如计数查询返回后——
+    /// 网格会在下一次 Poll() 时获取。
     void SetKnownTotal(int total) {
         this.knownTotal = total;
     }
 
-    /// Current known row count: the declared total when the server announced
-    /// one, otherwise the fetched prefix (so the grid grows as data arrives).
+    /// 当前已知行数：服务器已声明时为其总数，
+    /// 否则为已获取前缀（网格随数据到达而增长）。
     override int RowCount() {
         if (this.knownTotal >= 0) { return this.knownTotal; }
         return this.cache.Count;
     }
 
-    /// The server owns the order: the grid must not re-sort or filter locally.
+    /// 顺序由服务器掌控：网格不得在本地重新排序或过滤。
     override bool ServerControlled() { return true; }
 
-    /// Only fetched rows are readable; everything else renders as a loading
-    /// placeholder and triggers a block request.
+    /// 只有已获取的行可读；其余渲染为加载
+    /// 占位符并触发数据块请求。
     override bool CellReady(int row, int col) {
         return row >= 0 && row < this.cache.Count;
     }
 
-    /// The source is exhausted once the total is known and fetched, or a
-    /// short block marked the end (unknown mode).
+    /// 总数已知且已全部获取，或出现短块
+    /// 宣告结束时（未知模式），数据源即已耗尽。
     override bool HasMore() {
         if (this.knownTotal >= 0) { return this.cache.Count < this.knownTotal; }
         return true;
@@ -97,18 +97,18 @@ class ServerDataSource : DataSource {
         if (row < 0) { return; }
         if (!this.HasMore()) { return; }
         int start = (row / this.blockSize) * this.blockSize;
-        // The block is already fully fetched — nothing to do. A request past
-        // a ragged cache edge (scroll-to-bottom landing mid-block) still
-        // fetches the rest of that block.
+        // 该块已完全获取——无需操作。请求落在
+        // 参差的缓存边界上（滚动到底落在块中间）仍会
+        // 获取该块的剩余部分。
         if (start + this.blockSize <= this.cache.Count) { return; }
         this.StartFetch(start);
     }
 
-    /// Fetch the next block after the loaded prefix. The grid calls this when
-    /// the user scrolls to the bottom: it covers the ragged-edge case (the
-    /// prefix ends mid-block, so the next fetch completes that block) and the
-    /// block-aligned case (the prefix ends exactly on a boundary, so the next
-    /// fetch starts a fresh block).
+    /// 获取已加载前缀之后的下一块。网格在
+    /// 用户滚动到底部时调用：它覆盖参差边界的情况（
+    /// 前缀在块中间结束，下一次获取补全该块）以及
+    /// 块对齐的情况（前缀正好在边界结束，下一次
+    /// 获取从新块开始）。
     override void RequestNextBlock() {
         if (this.loading) { return; }
         if (!this.HasMore()) { return; }
@@ -127,10 +127,10 @@ class ServerDataSource : DataSource {
         this.FetchBlock(start, this.blockSize);
     }
 
-    /// Fold a completed fetch into the cache. Called by the grid each frame;
-    /// does nothing until FetchBlock finished (synchronously) or FinishBlock
-    /// was called (async). Returns true when anything changed, so the grid
-    /// marks itself dirty and redraws with the new rows.
+    /// 将完成的获取并入缓存。网格每帧调用；
+    /// 在 FetchBlock 完成（同步）或调用 FinishBlock（异步）之前不做事。
+    /// 有变化时返回 true，网格
+    /// 据此标记自身为脏并用新行重绘。
     override bool Poll() {
         if (!this.loading) { return false; }
         if (!this.blockDone) { return false; }
@@ -141,7 +141,7 @@ class ServerDataSource : DataSource {
             for (int i = 0; i < n; i = i + 1) { this.cache.Add(this.blockRows[i]); }
         }
         if (this.knownTotal < 0 && n < this.blockSize) {
-            // A short block is the server saying "that was the last one".
+            // 短块表示服务器在说“这是最后一块”。
             this.knownTotal = this.cache.Count;
         }
         this.blockRows = new List<DataRow>();
@@ -149,30 +149,30 @@ class ServerDataSource : DataSource {
         return true;
     }
 
-    /// Start fetching rows [start, start+count) into the block buffer. The
-    /// default runs FillBlock synchronously on the calling (UI) thread, which
-    /// is right for fast local sources. Override for true async delivery and
-    /// call FinishBlock from the completion path.
+    /// 开始将行 [start, start+count) 取入块缓冲区。
+    /// 默认在调用方（UI）线程上同步运行 FillBlock，
+    /// 适合快速本地源。重写以真正异步交付，
+    /// 并在完成路径中调用 FinishBlock。
     virtual void FetchBlock(int start, int count) {
         int n = this.FillBlock(start, count, this.blockRows);
         this.FinishBlock(this.blockRows, n);
     }
 
-    /// Store the result of an in-flight fetch. Poll() folds it into the cache
-    /// on the next frame.
+    /// 保存进行中获取的结果。Poll() 在下一帧
+    /// 将其并入缓存。
     void FinishBlock(List<DataRow> rows, int count) {
         this.blockRows = rows;
         this.blockCount = count;
         this.blockDone = true;
     }
 
-    /// Fetch up to `count` rows starting at `start`, appending one DataRow
-    /// per row to `dst`. Return the number appended; fewer than `count` means
-    /// the server has no more rows (the total is then pinned). Synchronous
-    /// sources implement this and nothing else.
+    /// 从 `start` 开始取最多 `count` 行，每行追加一个 DataRow
+    /// 到 `dst`。返回追加的数量；少于 `count` 表示
+    /// 服务器没有更多行了（此时固定总数）。同步
+    /// 数据源只需实现这一个方法。
     virtual int FillBlock(int start, int count, List<DataRow> dst) { return 0; }
 
-    // ---- cell reads over the cache ----
+    // ---- 基于缓存的单元格读取 ----
     override string CellText(int row, int col) {
         if (row < 0 || row >= this.cache.Count) { return ""; }
         return this.cache[row].At(col);

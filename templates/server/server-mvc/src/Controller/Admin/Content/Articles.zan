@@ -1,0 +1,291 @@
+﻿using System;
+using System.Data;
+using System.Data.Orm;
+using System.Web;
+using ZanWeb;
+using ZanWeb.Model.Blog;
+
+namespace ZanWeb.Admin.Content;
+
+/// <summary>
+/// Articles at /admin/content/posts: the editorial side of the blog. Unlike the public
+/// list this one keeps drafts -- hiding an article from the person who has to
+/// publish it would be a strange kind of privacy.
+///
+/// Every write drops the public list cache, so a change is on the site
+/// immediately rather than when a TTL happens to expire.
+/// </summary>
+[Route("admin/content/posts/[action]")]
+[Custom(Authorization = CustomAuthorization.Grant)]
+[Description("文章管理")]
+class Articles : AdminController {
+    [HttpGet]
+    [Route("/admin/content/posts")]
+    [Custom(IsMenu = true, Icon = "mdi:file-document")]
+    [Description("文章管理")]
+    async void Index() {
+        ViewData d = await this.Layout("文章管理");
+        if (!this.DbReady()) { d.Set("dbDown", "1"); this.Page(d); return; }
+
+        ListQuery q = this.Paged("id", 20);
+        string kw = q.Kw();
+        int state = this.InInt("state", -1);
+        int categoryId = this.InInt("categoryId", 0);
+        if (state == 1) { d.Set("state1", "selected"); }
+        if (state == 0) { d.Set("state0", "selected"); }
+
+        int total = await this.Post
+            .WhereIf(kw.Length > 0, a => a.title.Contains(kw))
+            .WhereIf(state >= 0, a => a.published == state)
+            .WhereIf(categoryId > 0, a => a.categoryId == categoryId)
+            .CountAsync();
+        List<Post> rows = await this.Post
+            .WhereIf(kw.Length > 0, a => a.title.Contains(kw))
+            .WhereIf(state >= 0, a => a.published == state)
+            .WhereIf(categoryId > 0, a => a.categoryId == categoryId)
+            .OrderByDescending(a => a.id)
+            .Skip(q.Skip()).Take(q.Limit()).ToListAsync();
+        List<Category> cats = await this.Category.OrderBy(a => a.sortOrder).ToListAsync();
+
+        List<StrMap> items = d.AddList("rows");
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            Post p = rows[i];
+            StrMap row = new StrMap();
+            row.Set("id", Convert.ToString(p.id));
+            row.Set("title", p.title);
+            row.Set("category", Articles.CategoryName(cats, p.categoryId));
+            row.Set("author", Fmt.Dash(p.author));
+            row.Set("tags", Fmt.Dash(p.tags));
+            row.Set("views", Convert.ToString(p.views));
+            row.Set("createdAt", Fmt.Day(p.createdAt));
+            row.Set("stateText", Articles.StateText(p.published));
+            row.Set("stateClass", Articles.StateClass(p.published));
+            row.Set("nextState", Articles.NextState(p.published));
+            row.Set("toggleText", Articles.ToggleText(p.published));
+            row.Set("topText", Articles.TopText(p.top));
+            row.Set("nextTop", Articles.NextTop(p.top));
+            if (p.top == 1) { row.Set("pinned", "1"); }
+            items.Add(row);
+        }
+
+        List<StrMap> opts = d.AddList("categories");
+        for (int i = 0; i < cats.Count; i = i + 1) {
+            StrMap o = new StrMap();
+            o.Set("id", Convert.ToString(cats[i].id));
+            o.Set("name", cats[i].name);
+            if (cats[i].id == categoryId) { o.Set("selected", "selected"); }
+            opts.Add(o);
+        }
+        this.Pager(d, q, total);
+        this.Page(d);
+    }
+
+    [HttpGet]
+    [Description("文章表单")]
+    async void Form() {
+        int id = this.InInt("id", 0);
+        int categoryId = 0;
+        ViewData d = new ViewData();
+        d.Set("id", Convert.ToString(id));
+        d.Set("dialogTitle", "写文章");
+        d.Set("state1", "selected");
+        if (id > 0) {
+            Post p = await this.Post.Read(id);
+            if (p == null) { this.Fail(404, "0404", "文章不存在"); }
+            d.Set("dialogTitle", "编辑文章");
+            d.Set("title", p.title);
+            d.Set("summary", p.summary);
+            d.Set("body", p.body);
+            d.Set("tags", p.tags);
+            d.Set("cover", p.cover);
+            d.Set("author", p.author);
+            categoryId = p.categoryId;
+            d.Set("state1", "");
+            if (p.published == 1) { d.Set("state1", "selected"); }
+            else { d.Set("state0", "selected"); }
+            if (p.top == 1) { d.Set("topChecked", "checked"); }
+        } else {
+            User me = await this.Admin();
+            if (me != null) { d.Set("author", me.username); }
+        }
+        List<Category> cats = await this.Category.OrderBy(a => a.sortOrder).ToListAsync();
+        List<StrMap> opts = d.AddList("categories");
+        for (int i = 0; i < cats.Count; i = i + 1) {
+            StrMap o = new StrMap();
+            o.Set("id", Convert.ToString(cats[i].id));
+            o.Set("name", cats[i].name);
+            if (cats[i].id == categoryId) { o.Set("selected", "selected"); }
+            opts.Add(o);
+        }
+        this.Dialog(d);
+    }
+
+    [HttpPost]
+    [Description("保存文章")]
+    async void Save() {
+        int id = this.InInt("id", 0);
+        string title = this.Need("title", "标题");
+        string body = this.NeedText("body", "正文");
+        string summary = this.InText("summary");
+        string tags = this.In("tags");
+        string cover = this.In("cover");
+        string author = this.In("author");
+        int categoryId = this.InInt("categoryId", 0);
+        int published = this.InInt("published", 1);
+        int top = this.InInt("top", 0);
+        if (published != 1) { published = 0; }
+        if (top != 1) { top = 0; }
+        if (summary.Length == 0) { summary = Prose.Excerpt(body, 120); }
+
+        if (id > 0) {
+            int n = await this.Post.Update()
+                .Set(a => a.title, title)
+                .Set(a => a.summary, summary)
+                .Set(a => a.body, body)
+                .Set(a => a.tags, tags)
+                .Set(a => a.cover, cover)
+                .Set(a => a.author, author)
+                .Set(a => a.categoryId, categoryId)
+                .Set(a => a.published, published)
+                .Set(a => a.top, top)
+                .Set(a => a.updatedAt, WebApp.NowSeconds())
+                .Where(a => a.id == id)
+                .ExecuteAffrowsAsync();
+            await this.Bust();
+            await this.Note("编辑文章", title, n > 0, "");
+            this.Saved("文章已保存");
+            return;
+        }
+        Post p = new Post();
+        p.title = title;
+        p.summary = summary;
+        p.body = body;
+        p.tags = tags;
+        p.cover = cover;
+        p.author = author;
+        p.categoryId = categoryId;
+        p.published = published;
+        p.top = top;
+        p.views = 0;
+        p.createdAt = WebApp.NowSeconds();
+        p.updatedAt = p.createdAt;
+        int newId = await this.Post.Insert(p).ExecuteIdentityAsync();
+        await this.Bust();
+        await this.Note("新增文章", title, newId > 0, "");
+        this.Saved("文章已保存");
+    }
+
+    [HttpPost]
+    [Description("发布或下架文章")]
+    async void Publish() {
+        int id = this.InInt("id", 0);
+        int published = this.InInt("published", 1);
+        if (published != 1) { published = 0; }
+        Post p = await this.Post.Read(id);
+        if (p == null) { this.Fail(404, "0404", "文章不存在"); }
+        int n = await this.Post.Update()
+            .Set(a => a.published, published)
+            .Set(a => a.updatedAt, WebApp.NowSeconds())
+            .Where(a => a.id == id)
+            .ExecuteAffrowsAsync();
+        await this.Bust();
+        await this.Note("发布或下架文章", p.title, n > 0,
+            Articles.StateText(published));
+        if (published == 1) { this.Saved("文章已发布"); return; }
+        this.Saved("文章已下架");
+    }
+
+    [HttpPost]
+    [Description("置顶文章")]
+    async void Top() {
+        int id = this.InInt("id", 0);
+        int top = this.InInt("top", 1);
+        if (top != 1) { top = 0; }
+        Post p = await this.Post.Read(id);
+        if (p == null) { this.Fail(404, "0404", "文章不存在"); }
+        int n = await this.Post.Update()
+            .Set(a => a.top, top)
+            .Where(a => a.id == id)
+            .ExecuteAffrowsAsync();
+        await this.Bust();
+        await this.Note("置顶文章", p.title, n > 0, "");
+        if (top == 1) { this.Saved("文章已置顶"); return; }
+        this.Saved("已取消置顶");
+    }
+
+    [HttpPost]
+    [Description("删除文章")]
+    async void Delete() {
+        string ids = this.In("ids");
+        int id = this.InInt("id", 0);
+        int removed = 0;
+        if (ids.Length > 0) {
+            List<Post> all = await this.Post.ToListAsync();
+            for (int i = 0; i < all.Count; i = i + 1) {
+                int pid = all[i].id;
+                if (!AuthUser.Holds(ids, Convert.ToString(pid))) { continue; }
+                int _n = await this.Post.Delete().Where(a => a.id == pid)
+                    .ExecuteAffrowsAsync();
+                int _c = await this.Comment.Delete().Where(a => a.postId == pid)
+                    .ExecuteAffrowsAsync();
+                removed = removed + 1;
+            }
+        } else {
+            Post p = await this.Post.Read(id);
+            if (p == null) { this.Fail(404, "0404", "文章不存在"); }
+            removed = await this.Post.Delete().Where(a => a.id == id)
+                .ExecuteAffrowsAsync();
+            int _c = await this.Comment.Delete().Where(a => a.postId == id)
+                .ExecuteAffrowsAsync();
+        }
+        await this.Bust();
+        await this.Note("删除文章", "", removed > 0,
+            Convert.ToString(removed) + " 篇");
+        this.Saved("已删除 " + Convert.ToString(removed) + " 篇文章");
+    }
+
+    /// <summary>Drops the cached public list so the site shows the change
+    /// now.</summary>
+    async void Bust() {
+        CacheContext cache = this.Cache();
+        if (cache == null) { return; }
+        await cache.DelAsync("blog:list");
+    }
+
+    static string CategoryName(List<Category> cats, int id) {
+        for (int i = 0; i < cats.Count; i = i + 1) {
+            if (cats[i].id == id) { return cats[i].name; }
+        }
+        return "—";
+    }
+
+    static string StateText(int published) {
+        if (published == 1) { return "已发布"; }
+        return "草稿";
+    }
+
+    static string StateClass(int published) {
+        if (published == 1) { return "ok"; }
+        return "off";
+    }
+
+    static string NextState(int published) {
+        if (published == 1) { return "0"; }
+        return "1";
+    }
+
+    static string ToggleText(int published) {
+        if (published == 1) { return "下架"; }
+        return "发布";
+    }
+
+    static string TopText(int top) {
+        if (top == 1) { return "取消置顶"; }
+        return "置顶";
+    }
+
+    static string NextTop(int top) {
+        if (top == 1) { return "0"; }
+        return "1";
+    }
+}

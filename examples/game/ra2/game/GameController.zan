@@ -1,0 +1,370 @@
+using System;
+using System.Collections.Generic;
+using Ra2.Formats;
+
+namespace Ra2.Game;
+
+/// <summary>The interactive game: it owns the world and answers input. It is
+/// kept pure state -- the window, camera and drawing live in the app layer --
+/// so a test can drive a whole game here without a window.</summary>
+class GameController {
+    World world;
+    int side;
+    int money;
+    int building;        // buildId armed for placement, or -1
+    bool moveAttack;     // A key armed: next map click is a move-attack order
+    int aiMoney;         // the opponent's credits
+    int tick;            // ticks since the game started
+    int result;          // 0 playing, 1 player won, 2 player lost, 3 stalemate
+    int structureCount;  // living structures on the last tick (for stalemate)
+    int countUnchanged;  // ticks with an unchanged structure count
+    bool paused;
+    bool dirty;
+    // Squads: up to 10 numbered groups of selected units (Ctrl+number to save,
+    // number to recall). Stored as object references so a unit that dies is
+    // simply skipped on recall.
+    List<List<WorldObject>> squads;
+
+    // Both sides get a small passive income so a game is winnable without ore
+    // harvesters; the AI's is a bit faster so it keeps rebuilding.
+    static int IncomePeriod() { return 60; }
+    static int PlayerIncome() { return 100; }
+    static int AiIncome() { return 100; }
+
+    static GameController Create(World world, int side) {
+        GameController g = new GameController();
+        g.world = world;
+        g.side = side;
+        g.money = 10000;
+        g.aiMoney = 10000;
+        g.tick = 0;
+        g.result = 0;
+        g.structureCount = -1;
+        g.countUnchanged = 0;
+        g.paused = false;
+        g.building = -1;
+        g.moveAttack = false;
+        g.squads = new List<List<WorldObject>>();
+        int sq = 0;
+        while (sq < 10) { g.squads.Add(new List<WorldObject>()); sq = sq + 1; }
+        g.dirty = true;
+        return g;
+    }
+
+    World World() { return this.world; }
+    int Side() { return this.side; }
+    int Money() { return this.money; }
+    int AiMoney() { return this.aiMoney; }
+    int TickCount() { return this.tick; }
+    /// <summary>0 while the game is on, 1 when the player destroyed the enemy
+    /// base, 2 when the enemy destroyed the player's.</summary>
+    int Result() { return this.result; }
+    bool NeedsRedraw() { return this.dirty; }
+    void ClearRedraw() { this.dirty = false; }
+    int BuildingId() { return this.building; }
+    int Power() { return this.world.PowerBalance(this.side); }
+    bool LowPower() { return this.Power() < 0; }
+    string SelectedInfo() { return this.world.SelectedInfo(); }
+    bool Paused() { return this.paused; }
+
+    /// <summary>Toggles the game clock. While paused, ticks do not advance, so
+    /// neither the AI nor production nor combat moves; the player can still
+    /// scroll the camera.</summary>
+    void TogglePause() {
+        this.paused = !this.paused;
+        this.dirty = true;
+    }
+
+    /// <summary>Stores the current selection into squad slot `slot` (0-9),
+    /// keyed by Ctrl+number.</summary>
+    void SaveSquad(int slot) {
+        if (slot < 0 || slot >= this.squads.Count) { return; }
+        List<WorldObject> fresh = this.world.SelectedObjects();
+        this.squads[slot] = fresh;
+    }
+
+    /// <summary>Recalls squad `slot` (0-9): selects its living units, skipping
+    /// any that were destroyed since the group was saved. Returns how many
+    /// were selected.</summary>
+    int RecallSquad(int slot) {
+        if (slot < 0 || slot >= this.squads.Count) { return 0; }
+        List<WorldObject> sq = this.squads[slot];
+        this.world.ClearSelection();
+        int n = 0;
+        for (int i = 0; i < sq.Count; i = i + 1) {
+            if (this.world.AddSelectionByObject(sq[i])) { n = n + 1; }
+        }
+        this.dirty = true;
+        return n;
+    }
+
+    /// <summary>Steps the game one tick: the AI plans first, then the world
+    /// moves, fights and produces, then the win/lose condition is checked.
+    /// Returns how many units moved.</summary>
+    int Tick() {
+        if (this.paused) { return 0; }
+        this.tick = this.tick + 1;
+        if (this.tick % GameController.IncomePeriod() == 0) {
+            this.money = this.money + GameController.PlayerIncome();
+            this.aiMoney = this.aiMoney + GameController.AiIncome();
+        }
+        this.UpdateAi();
+        List<int> r = this.world.Tick();
+        int moved = r[0];
+        if (moved > 0 || r[1] > 0 || r[2] > 0) { this.dirty = true; }
+        this.CheckResult();
+        return moved;
+    }
+
+    // ---- player commands ---------------------------------------------------
+
+    /// <summary>Left click on the map: place the armed build if there is one,
+    /// issue a move-attack order if A is armed, otherwise select whatever
+    /// occupies the cell.</summary>
+    void OnClickCell(int x, int y) {
+        if (this.building >= 0) {
+            this.Place(x, y);
+            return;
+        }
+        if (this.moveAttack) {
+            this.moveAttack = false;
+            this.world.OrderMoveAttack(x, y);
+            this.dirty = true;
+            return;
+        }
+        this.world.SelectAt(x, y);
+        this.dirty = true;
+    }
+
+    /// <summary>Arms or disarms the move-attack mode (the A key).</summary>
+    void ToggleMoveAttack() {
+        this.moveAttack = !this.moveAttack;
+        this.building = -1;   // mutually exclusive with build placement
+        this.dirty = true;
+    }
+
+    bool MoveAttackArmed() { return this.moveAttack; }
+
+    /// <summary>Left click on a build-menu entry: arm it for placement. A
+    /// click on a different entry while one is armed swaps it.</summary>
+    void OnClickBuild(int buildId) {
+        if (this.building == buildId) { this.building = -1; }   // toggle off
+        else { this.building = buildId; }
+        this.moveAttack = false;
+        this.dirty = true;
+    }
+
+    /// <summary>Left click on a production-menu entry: queue the unit for the
+    /// selected production structure and deduct its cost. Picking a unit
+    /// cancels any armed build, so a misclick does not half-build something.</summary>
+    void OnClickUnit(int unitId) {
+        this.building = -1;
+        WorldObject sel = this.world.Selected();
+        if (sel == null || sel.Kind() != ObjKind.Structure()) { return; }
+        if (sel.Side() != this.side) { return; }   // cannot train from enemy
+        int idx = this.world.SelectedIndex();
+        StructureType t = this.world.Catalog().TypeFor(sel.Side(), sel.BuildId());
+        List<int> prod = t.Produces();
+        if (prod == null) { return; }
+        bool can = false;
+        for (int i = 0; i < prod.Count; i = i + 1) {
+            if (prod[i] == unitId) { can = true; }
+        }
+        if (!can) { return; }
+        UnitType u = this.world.Units().TypeFor(sel.Side(), unitId);
+        if (u == null) { return; }
+        if (this.money < u.Cost()) { return; }
+        if (!this.world.QueueUnit(idx, unitId)) { return; }
+        this.money = this.money - u.Cost();
+        this.dirty = true;
+    }
+
+    /// <summary>Right click: cancel a pending build, order the selected unit
+    /// to attack an enemy under the cell when there is one, else move. Only
+    /// the player's own units can be commanded -- an enemy selection is
+    /// informational and cannot be moved or fired.</summary>
+    void OnRightClick(int x, int y) {
+        if (this.building >= 0) { this.building = -1; }
+        else if (this.world.SelectedSide() == this.side) {
+            if (!this.world.OrderAttack(x, y)) { this.world.OrderMove(x, y); }
+        }
+        this.dirty = true;
+    }
+
+    /// <summary>Places the armed build at a cell. Deducts the cost, or clears
+    /// the arm when the spot is taken or the credits are short.</summary>
+    bool Place(int x, int y) {
+        StructureCatalog catalog = this.world.Catalog();
+        int buildId = this.building;
+        if (buildId < 0) { return false; }
+        StructureType t = catalog.TypeFor(this.side, buildId);
+        if (t == null) { return false; }
+        if (this.money < t.Cost()) { this.building = -1; return false; }
+        if (this.world.PlaceStructure(this.side, buildId, x, y) < 0) {
+            this.building = -1;
+            return false;
+        }
+        this.money = this.money - t.Cost();
+        this.building = -1;
+        this.dirty = true;
+        return true;
+    }
+
+    // ---- opponent AI -------------------------------------------------------
+
+    /// <summary>Runs the enemy's turn: expand the base, train a thin army,
+    /// and send every unit at the nearest player object. The AI is honest --
+    /// it follows the same placement, production and combat rules as the
+    /// player, just driven by a fixed build order.</summary>
+    void UpdateAi() {
+        int aiSide = 1 - this.side;
+        if (this.result != 0) { return; }
+
+        // Build: power first, then a barracks, then a war factory, then a
+        // couple of defence buildings to make the base harder to rush.
+        if (this.tick % 45 == 0) {
+            if (!this.HasStructure(aiSide, 1)) {
+                if (this.AiBuyStructure(aiSide, 1)) { /* power */ }
+            } else if (!this.HasStructure(aiSide, 3)) {
+                if (this.AiBuyStructure(aiSide, 3)) { /* barracks */ }
+            } else if (!this.HasStructure(aiSide, 4) && this.AiArmySize(aiSide) >= 4) {
+                if (this.AiBuyStructure(aiSide, 4)) { /* war factory */ }
+            } else if (!this.HasStructure(aiSide, 6) && this.AiArmySize(aiSide) >= 2) {
+                if (this.AiBuyStructure(aiSide, 6)) { /* pillbox / SAM */ }
+            }
+        }
+
+        // Train: keep a thin army rolling out of the barracks. Once a war
+        // factory exists, throw in an amphibious transport every so often so
+        // water-divided maps can be crossed and won instead of stalling.
+        if (this.tick % 30 == 0 && this.AiArmySize(aiSide) < 6) {
+            int barracks = this.FindStructure(aiSide, 3);
+            if (barracks >= 0) {
+                WorldObject b = this.world.ObjectAt(barracks);
+                UnitType u = this.world.Units().TypeFor(aiSide, 0);
+                if (u != null && b.ProdCount() == 0 && this.aiMoney >= u.Cost()) {
+                    if (this.world.QueueUnit(barracks, 0)) {
+                        this.aiMoney = this.aiMoney - u.Cost();
+                    }
+                }
+            }
+        }
+        if (this.tick % 90 == 0 && this.HasStructure(aiSide, 4)
+         && this.AiAmphibiousCount(aiSide) < 2) {
+            int factory = this.FindStructure(aiSide, 4);
+            if (factory >= 0) {
+                WorldObject f = this.world.ObjectAt(factory);
+                UnitType h = this.world.Units().TypeFor(aiSide, 4);
+                if (h != null && f.ProdCount() == 0 && this.aiMoney >= h.Cost()) {
+                    if (this.world.QueueUnit(factory, 4)) {
+                        this.aiMoney = this.aiMoney - h.Cost();
+                    }
+                }
+            }
+        }
+
+        // Attack: every unit without a live target acquires the nearest
+        // player object. The world's chase logic then walks it into range.
+        for (int i = 0; i < this.world.ObjectCount(); i = i + 1) {
+            WorldObject o = this.world.ObjectAt(i);
+            if (o.Side() != aiSide || o.Kind() != ObjKind.Unit()) { continue; }
+            if (this.world.Target(o) != null) { continue; }
+            int enemy = this.world.NearestEnemy(aiSide, o.X(), o.Y());
+            if (enemy >= 0) {
+                this.world.AttackObject(i, this.world.ObjectAt(enemy));
+            }
+        }
+    }
+
+    /// <summary>Pays for and places a structure for the AI. Returns true when
+    /// the credits sufficed and a spot was found.</summary>
+    bool AiBuyStructure(int side, int buildId) {
+        StructureType t = this.world.Catalog().TypeFor(side, buildId);
+        if (t == null) { return false; }
+        if (this.aiMoney < t.Cost()) { return false; }
+        List<int> xy = new List<int>();
+        if (!this.world.AiPlaceSpot(side, t, xy)) { return false; }
+        if (this.world.PlaceStructure(side, buildId, xy[0], xy[1]) < 0) {
+            return false;
+        }
+        this.aiMoney = this.aiMoney - t.Cost();
+        return true;
+    }
+
+    int FindStructure(int side, int buildId) {
+        for (int i = 0; i < this.world.ObjectCount(); i = i + 1) {
+            WorldObject o = this.world.ObjectAt(i);
+            if (o.Side() == side && o.Kind() == ObjKind.Structure()
+             && o.BuildId() == buildId && !o.IsDead()) { return i; }
+        }
+        return -1;
+    }
+
+    bool HasStructure(int side, int buildId) {
+        return this.FindStructure(side, buildId) >= 0;
+    }
+
+    int AiArmySize(int side) {
+        int n = 0;
+        for (int i = 0; i < this.world.ObjectCount(); i = i + 1) {
+            WorldObject o = this.world.ObjectAt(i);
+            if (o.Side() == side && o.Kind() == ObjKind.Unit() && !o.IsDead()) {
+                n = n + 1;
+            }
+        }
+        return n;
+    }
+
+    int AiAmphibiousCount(int side) {
+        int n = 0;
+        for (int i = 0; i < this.world.ObjectCount(); i = i + 1) {
+            WorldObject o = this.world.ObjectAt(i);
+            if (o.Side() == side && o.Kind() == ObjKind.Unit()
+             && o.Amphibious() && !o.IsDead()) {
+                n = n + 1;
+            }
+        }
+        return n;
+    }
+
+    /// <summary>Sets the result when either side's base is gone: the player
+    /// wins by destroying every enemy structure, and vice versa.</summary>
+    void CheckResult() {
+        if (this.result != 0) { return; }
+        if (this.world.SideEliminated(1 - this.side)) { this.result = 1; return; }
+        if (this.world.SideEliminated(this.side)) { this.result = 2; return; }
+        // Stalemate: on maps where a water divide separates the two bases
+        // with no bridge a ground army can cross, neither side can reach the
+        // other's structures. Track whether the total structure count moves;
+        // when it has been frozen for a long stretch with both sides still
+        // alive, call it a draw instead of letting the game run forever.
+        int n = this.LivingStructures();
+        if (n == this.structureCount) {
+            this.countUnchanged = this.countUnchanged + 1;
+        } else {
+            this.structureCount = n;
+            this.countUnchanged = 0;
+        }
+        if (this.countUnchanged > 2000 && this.LivingUnits() > 0) {
+            this.result = 3;
+        }
+    }
+
+    int LivingStructures() {
+        int n = 0;
+        for (int i = 0; i < this.world.ObjectCount(); i = i + 1) {
+            WorldObject o = this.world.ObjectAt(i);
+            if (o.Kind() == ObjKind.Structure() && !o.IsDead()) { n = n + 1; }
+        }
+        return n;
+    }
+
+    int LivingUnits() {
+        int n = 0;
+        for (int i = 0; i < this.world.ObjectCount(); i = i + 1) {
+            WorldObject o = this.world.ObjectAt(i);
+            if (o.Kind() == ObjKind.Unit() && !o.IsDead()) { n = n + 1; }
+        }
+        return n;
+    }
+}

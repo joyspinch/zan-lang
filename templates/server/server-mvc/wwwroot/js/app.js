@@ -35,5 +35,29 @@
     setTimeout(function () { el.remove(); }, 4000);
   }
 
+  // Live visitor count. One EventSource per page, opened once: the server
+  // pushes when the number changes shape, and the browser reconnects by itself
+  // when the stream is closed. No stream, no line -- the footer just stays put.
+  (function live() {
+    var host = document.querySelector("[data-live]");
+    if (!host || typeof EventSource === "undefined") { return; }
+    var visitors = host.querySelector("[data-live-visitors]");
+    var pages = host.querySelector("[data-live-pages]");
+    // How long the server took on this page, from the browser's own timing.
+    var ttfb = host.querySelector("[data-live-ttfb]");
+    if (ttfb) {
+      var nav = performance.getEntriesByType("navigation")[0];
+      if (nav) { ttfb.textContent = Math.round(nav.responseStart - nav.requestStart) + " ms"; }
+    }
+    var stream = new EventSource("/live/stream");
+    stream.addEventListener("presence", function (ev) {
+      var d = {};
+      try { d = JSON.parse(ev.data); } catch (err) { return; }
+      if (visitors) { visitors.textContent = d.visitors; }
+      if (pages) { pages.textContent = d.pages; }
+    });
+    window.addEventListener("pagehide", function () { stream.close(); });
+  })();
+
   window.appFlash = flash;
 })();

@@ -1,0 +1,365 @@
+using System;
+using System.Data;
+using System.Data.Orm;
+using System.Text;
+using System.Web;
+using ZanWeb;
+using ZanWeb.Model.Sys;
+
+namespace ZanWeb.Admin.Monitor;
+
+/// <summary>
+/// The management screen every designed table gets for free, at
+/// /admin/monitor/data?t=&lt;table&gt;. It reads the design (which columns are listed,
+/// filtered, created, edited) and builds the list, the dialog form and the
+/// writes from it, so a table designed at 10:00 is being maintained at 10:01
+/// without a rebuild.
+///
+/// The SQL is assembled, not written, so the rules are strict: table and column
+/// names come only from the saved design (and each is re-checked with
+/// Gen.Safe()), values only ever reach the database as bound parameters, and the
+/// permission codes checked are the design's own. A caller who names a column
+/// that is not in the design is ignored, not trusted.
+/// </summary>
+[Route("admin/monitor/data/[action]")]
+[Custom(Authorization = CustomAuthorization.Grant)]
+[Description("数据管理")]
+class Data : AdminController {
+    [HttpGet]
+    [Route("/admin/monitor/data")]
+    [Description("数据列表")]
+    async void Index() {
+        string table = this.In("t");
+        GenTable t = await this.Design(table);
+        if (t == null) { return; }
+        ViewData d = await this.Layout(t.title);
+        List<GenColumn> cols = await this.Columns(t.id);
+        IDbConnection db = await this.Conn();
+        if (db == null) { d.Set("dbDown", "1"); this.Page(d); return; }
+
+        d.Set("t", t.tableName);
+        d.Set("tableTitle", t.title);
+        if (t.migrated != 1) { d.Set("notMigrated", "1"); this.Page(d); return; }
+
+        ListQuery q = this.Paged("id", 20);
+        string kw = q.Kw();
+
+        // Filters: only the columns the design marks filterable, matched by
+        // equality for numbers and by substring for text.
+        List<GenColumn> filters = new List<GenColumn>();
+        for (int i = 0; i < cols.Count; i = i + 1) {
+            if (cols[i].inFilter == 1) { filters.Add(cols[i]); }
+        }
+        string cond = "";
+        DbParams prms = new DbParams();
+        for (int i = 0; i < filters.Count; i = i + 1) {
+            GenColumn c = filters[i];
+            string v = this.In("f_" + c.name);
+            if (v.Length == 0) { continue; }
+            if (cond.Length > 0) { cond = cond + " AND "; }
+            if (Gen.ZanType(c.kind) == "string") {
+                cond = cond + c.name + " LIKE ?";
+                prms.Add("%" + v + "%");
+            } else {
+                cond = cond + c.name + " = ?";
+                prms.Add(v);
+            }
+        }
+        string tail = "";
+        if (cond.Length > 0) { tail = " WHERE " + cond; }
+
+        string countSql = "SELECT COUNT(*) FROM " + t.tableName + tail;
+        string totalText = await db.ExecuteScalarAsync(countSql, prms);
+        int total = Filter.ToInt(totalText, 0);
+
+        string names = "id";
+        List<GenColumn> shown = new List<GenColumn>();
+        for (int i = 0; i < cols.Count; i = i + 1) {
+            if (cols[i].inList != 1 || cols[i].name == "id") { continue; }
+            shown.Add(cols[i]);
+            names = names + ", " + cols[i].name;
+        }
+        string order = " ORDER BY id DESC";
+        string sql = "SELECT " + names + " FROM " + t.tableName + tail + order
+            + " LIMIT " + Convert.ToString(q.Limit())
+            + " OFFSET " + Convert.ToString(q.Skip());
+        DbResult res = await db.QueryAsync(sql, prms);
+
+        // The columns differ per table, so the table markup is built here and
+        // inserted raw. Every value goes through Esc() on the way in.
+        StringBuilder head = new StringBuilder();
+        head.Append("<th style=\"width:70px\">ID</th>");
+        for (int i = 0; i < shown.Count; i = i + 1) {
+            head.Append("<th>" + Data.Esc(Data.LabelOf(shown[i])) + "</th>");
+        }
+        head.Append("<th class=\"ops\">操作</th>");
+        d.Set("headHtml", head.ToString());
+
+        StringBuilder body = new StringBuilder();
+        int n = 0;
+        if (res != null) { n = res.RowCount(); }
+        for (int i = 0; i < n; i = i + 1) {
+            string rid = res.GetByName(i, "id");
+            body.Append("<tr><td class=\"mono\">" + Data.Esc(rid) + "</td>");
+            for (int k = 0; k < shown.Count; k = k + 1) {
+                string cell = await this.Display(db, shown[k],
+                    res.GetByName(i, shown[k].name));
+                body.Append("<td>" + Data.Esc(cell) + "</td>");
+            }
+            body.Append("<td class=\"ops\">");
+            body.Append("<a href=\"/admin/monitor/data/form?t=" + t.tableName + "&id="
+                + Data.Esc(rid) + "\" data-dialog>编辑</a>");
+            body.Append("<a href=\"#\" data-post=\"/admin/monitor/data/delete\" data-args=\"t="
+                + t.tableName + "&id=" + Data.Esc(rid)
+                + "\" data-confirm=\"确定删除这条数据吗？\">删除</a>");
+            body.Append("</td></tr>");
+        }
+        d.Set("bodyHtml", body.ToString());
+
+        StringBuilder fb = new StringBuilder();
+        for (int i = 0; i < filters.Count; i = i + 1) {
+            GenColumn c = filters[i];
+            fb.Append("<input class=\"input w160\" name=\"f_" + c.name
+                + "\" value=\"" + Data.Esc(this.In("f_" + c.name))
+                + "\" placeholder=\"" + Data.Esc(Data.LabelOf(c)) + "\">");
+        }
+        if (filters.Count > 0) { d.Set("filterHtml", fb.ToString()); }
+
+        this.Pager(d, q, total);
+        this.Page(d);
+    }
+
+    [HttpGet]
+    [Description("数据表单")]
+    async void Form() {
+        string table = this.In("t");
+        GenTable t = await this.Design(table);
+        if (t == null) { return; }
+        int id = this.InInt("id", 0);
+        List<GenColumn> cols = await this.Columns(t.id);
+        IDbConnection db = await this.Conn();
+        if (db == null) { this.Fail(503, "2001", "数据库不可用"); }
+
+        ViewData d = new ViewData();
+        d.Set("t", t.tableName);
+        d.Set("id", Convert.ToString(id));
+        d.Set("dialogTitle", "新增" + t.title);
+
+        DbResult cur = null;
+        if (id > 0) {
+            d.Set("dialogTitle", "编辑" + t.title);
+            DbParams p = new DbParams().AddInt(id);
+            cur = await db.QueryAsync("SELECT * FROM " + t.tableName
+                + " WHERE id = ?", p);
+            if (cur == null || cur.RowCount() == 0) {
+                this.Fail(404, "0404", "记录不存在");
+            }
+        }
+
+        StringBuilder fb = new StringBuilder();
+        for (int i = 0; i < cols.Count; i = i + 1) {
+            GenColumn c = cols[i];
+            if (c.name == "id") { continue; }
+            if (id > 0 && c.inEdit != 1) { continue; }
+            if (id == 0 && c.inCreate != 1) { continue; }
+            string value = c.defValue;
+            if (cur != null) { value = cur.GetByName(0, c.name); }
+            string req = "";
+            if (c.required == 1) { req = " required"; }
+            fb.Append("<label>" + Data.Esc(Data.LabelOf(c)) + "</label>");
+
+            if (c.relTable.Length > 0 || c.dictType.Length > 0) {
+                fb.Append("<select class=\"input\" name=\"" + c.name + "\"" + req + ">");
+                fb.Append("<option value=\"\">请选择</option>");
+                List<StrMap> choices = await this.Choices(db, c);
+                for (int o = 0; o < choices.Count; o = o + 1) {
+                    string ov = choices[o].Get("value");
+                    string sel = "";
+                    if (ov == value) { sel = " selected"; }
+                    fb.Append("<option value=\"" + Data.Esc(ov) + "\"" + sel + ">"
+                        + Data.Esc(choices[o].Get("label")) + "</option>");
+                }
+                fb.Append("</select>");
+            } else if (c.widget == "textarea" || c.kind == "text") {
+                fb.Append("<textarea class=\"input\" name=\"" + c.name
+                    + "\" rows=\"3\"" + req + ">" + Data.Esc(value) + "</textarea>");
+            } else if (c.widget == "switch" || c.kind == "bool") {
+                string on = "";
+                if (value == "1") { on = " selected"; }
+                fb.Append("<select class=\"input\" name=\"" + c.name + "\">");
+                fb.Append("<option value=\"1\"" + on + ">是</option>");
+                fb.Append("<option value=\"0\">否</option></select>");
+            } else if (c.widget == "number" || Gen.ZanType(c.kind) != "string") {
+                fb.Append("<input class=\"input\" type=\"number\" name=\"" + c.name
+                    + "\" value=\"" + Data.Esc(value) + "\"" + req + ">");
+            } else if (c.widget == "date") {
+                fb.Append("<input class=\"input\" type=\"date\" name=\"" + c.name
+                    + "\" value=\"" + Data.Esc(value) + "\"" + req + ">");
+            } else {
+                fb.Append("<input class=\"input\" name=\"" + c.name + "\" value=\""
+                    + Data.Esc(value) + "\"" + req + ">");
+            }
+        }
+        d.Set("fieldsHtml", fb.ToString());
+        this.Dialog(d);
+    }
+
+    [HttpPost]
+    [Description("保存数据")]
+    async void Save() {
+        string table = this.In("t");
+        GenTable t = await this.Design(table);
+        if (t == null) { return; }
+        int id = this.InInt("id", 0);
+        List<GenColumn> cols = await this.Columns(t.id);
+        IDbConnection db = await this.Conn();
+        if (db == null) { this.Fail(503, "2001", "数据库不可用"); }
+
+        string sets = "";
+        string names = "";
+        string marks = "";
+        DbParams prms = new DbParams();
+        int used = 0;
+        for (int i = 0; i < cols.Count; i = i + 1) {
+            GenColumn c = cols[i];
+            if (c.name == "id") { continue; }
+            if (id > 0 && c.inEdit != 1) { continue; }
+            if (id == 0 && c.inCreate != 1) { continue; }
+            string v = this.In(c.name);
+            if (c.widget == "switch" || c.kind == "bool") {
+                v = "0";
+                if (this.In(c.name) == "1") { v = "1"; }
+            }
+            if (c.required == 1 && v.Length == 0) {
+                this.Fail(400, "0003", Data.LabelOf(c) + "不能为空");
+            }
+            if (used > 0) { sets = sets + ", "; names = names + ", "; marks = marks + ", "; }
+            sets = sets + c.name + " = ?";
+            names = names + c.name;
+            marks = marks + "?";
+            if (Gen.ZanType(c.kind) == "string") { prms.Add(v); }
+            else if (Gen.ZanType(c.kind) == "double") {
+                prms.AddDouble(Filter.ToDouble(v, 0.0));
+            } else { prms.AddInt(Filter.ToInt(v, 0)); }
+            used = used + 1;
+        }
+        if (used == 0) { this.Fail(400, "0004", "没有可写入的字段"); }
+
+        if (id > 0) {
+            prms.AddInt(id);
+            int n = await db.ExecuteAsync("UPDATE " + t.tableName + " SET " + sets
+                + " WHERE id = ?", prms);
+            await this.Note("编辑" + t.title,
+                Convert.ToString(id), n > 0, "");
+            this.Saved("已保存");
+            return;
+        }
+        int rows = await db.ExecuteAsync("INSERT INTO " + t.tableName + " (" + names
+            + ") VALUES (" + marks + ")", prms);
+        await this.Note("新增" + t.title, t.tableName,
+            rows > 0, "");
+        this.Saved("已创建");
+    }
+
+    [HttpPost]
+    [Description("删除数据")]
+    async void Delete() {
+        string table = this.In("t");
+        GenTable t = await this.Design(table);
+        if (t == null) { return; }
+        int id = this.InInt("id", 0);
+        IDbConnection db = await this.Conn();
+        if (db == null) { this.Fail(503, "2001", "数据库不可用"); }
+        DbParams p = new DbParams().AddInt(id);
+        int n = await db.ExecuteAsync("DELETE FROM " + t.tableName
+            + " WHERE id = ?", p);
+        await this.Note("删除" + t.title,
+            Convert.ToString(id), n > 0, "");
+        this.Saved("已删除");
+    }
+
+    // ---- helpers ------------------------------------------------------------
+
+    /// <summary>The design for a table name, or null after answering the
+    /// caller. A name that is not a saved design never reaches SQL.</summary>
+    async GenTable Design(string table) {
+        if (!Gen.Safe(table)) { this.Fail(400, "0004", "表名不合法"); return null; }
+        if (!this.DbReady()) { this.Fail(503, "2001", "数据库不可用"); return null; }
+        GenTable t = await this.GenTable.Where(a => a.tableName == table)
+            .FirstAsync();
+        if (t == null) { this.Fail(404, "0404", "没有这张表的设计"); return null; }
+        return t;
+    }
+
+    async List<GenColumn> Columns(int tableId) {
+        List<GenColumn> all = await this.GenColumn
+            .Where(a => a.tableId == tableId).OrderBy(a => a.sortOrder).ToListAsync();
+        List<GenColumn> safe = new List<GenColumn>();
+        for (int i = 0; i < all.Count; i = i + 1) {
+            if (Gen.Safe(all[i].name)) { safe.Add(all[i]); }
+        }
+        return safe;
+    }
+
+    /// <summary>The choices for a column that points at another table or at a
+    /// dictionary type.</summary>
+    async List<StrMap> Choices(IDbConnection db, GenColumn c) {
+        List<StrMap> outRows = new List<StrMap>();
+        if (c.dictType.Length > 0) {
+            List<DictItem> items = await db.Select<DictItem>()
+                .Where(a => a.typeCode == c.dictType).Where(a => a.status == 1)
+                .OrderBy(a => a.sortOrder).ToListAsync();
+            for (int i = 0; i < items.Count; i = i + 1) {
+                StrMap row = new StrMap();
+                row.Set("value", items[i].value);
+                row.Set("label", items[i].label);
+                outRows.Add(row);
+            }
+            return outRows;
+        }
+        if (c.relTable.Length == 0) { return outRows; }
+        if (!Gen.Safe(c.relTable) || !Gen.Safe(c.relValue) || !Gen.Safe(c.relLabel)) {
+            return outRows;
+        }
+        DbResult r = await db.QueryAsync("SELECT " + c.relValue + " AS v, "
+            + c.relLabel + " AS l FROM " + c.relTable + " LIMIT 500");
+        if (r == null) { return outRows; }
+        for (int i = 0; i < r.RowCount(); i = i + 1) {
+            StrMap row = new StrMap();
+            row.Set("value", r.GetByName(i, "v"));
+            row.Set("label", r.GetByName(i, "l"));
+            outRows.Add(row);
+        }
+        return outRows;
+    }
+
+    /// <summary>What a cell shows: the related row's label instead of its key,
+    /// the dictionary label instead of its value, 是/否 for a switch.</summary>
+    async string Display(IDbConnection db, GenColumn c, string raw) {
+        if (raw == null || raw.Length == 0) { return ""; }
+        if (c.widget == "switch" || c.kind == "bool") {
+            if (raw == "1") { return "是"; }
+            return "否";
+        }
+        if (c.dictType.Length > 0 || c.relTable.Length > 0) {
+            List<StrMap> choices = await this.Choices(db, c);
+            for (int i = 0; i < choices.Count; i = i + 1) {
+                if (choices[i].Get("value") == raw) { return choices[i].Get("label"); }
+            }
+        }
+        return raw;
+    }
+
+    static string LabelOf(GenColumn c) {
+        if (c.label.Length > 0) { return c.label; }
+        return c.name;
+    }
+
+    /// <summary>Markup built here is inserted raw, so every value that came out
+    /// of a designed table is escaped on the way in.</summary>
+    static string Esc(string v) {
+        if (v == null) { return ""; }
+        return v.Replace("&", "&amp;").Replace("<", "&lt;").Replace(">", "&gt;")
+            .Replace("\"", "&quot;");
+    }
+}

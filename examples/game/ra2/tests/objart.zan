@@ -1,0 +1,243 @@
+// Object art: SHP frame 0 + palette -> RGBA texture, through ObjectArt's
+// cache, plus the renderer's placeholder and selection ring.
+//
+// Clean-room: no game data. A synthetic 1-frame SHP with known pixel indices
+// and a hand-built palette let the test check that DecodeFrame and
+// Texture.FromIndexed produced the expected colours, that a missing shape is
+// cached as null rather than re-read, and that the placeholder glyph and
+// selection ring land on the canvas.
+using System;
+using System.Collections.Generic;
+using System.IO;
+using Ra2.Assets;
+using Ra2.Formats;
+using Ra2.Game;
+using Ra2.Render;
+
+namespace T;
+
+class Program {
+
+    // ---- synthetic buffers ----------------------------------------------
+
+    static void PutU16(string buf, int at, int v) {
+        buf[at] = (byte)(v & 0xFF);
+        buf[at + 1] = (byte)((v >> 8) & 0xFF);
+    }
+
+    static void PutU32(string buf, int at, int v) {
+        buf[at] = (byte)(v & 0xFF);
+        buf[at + 1] = (byte)((v >> 8) & 0xFF);
+        buf[at + 2] = (byte)((v >> 16) & 0xFF);
+        buf[at + 3] = (byte)((v >> 24) & 0xFF);
+    }
+
+    // A one-frame format-1 (uncompressed) SHP, 4x2. Pixel (x,y) holds
+    // index (x*2+y) -- indices 0..7 -- so (0,0) is index 0 (transparency) and
+    // every other colour can be verified independently.
+    static string BuildShp(List<int> outLen) {
+        int w = 4;
+        int h = 2;
+        int offset = 2 + 8 + 32;             // zero + size + 1 frame header
+        int total = offset + w * h;
+        byte[] buf = new byte[total + 1];
+        Program.PutU16(buf, 2, w);
+        Program.PutU16(buf, 4, h);
+        Program.PutU16(buf, 6, 1);            // frameCount
+        Program.PutU16(buf, 8, 0);            // x
+        Program.PutU16(buf, 10, 0);           // y
+        Program.PutU16(buf, 12, w);
+        Program.PutU16(buf, 14, h);
+        Program.PutU32(buf, 16, 1);           // format 1 = raw bytes
+        Program.PutU32(buf, 20, 0);           // unknown
+        Program.PutU32(buf, 24, 0);           // zero
+        Program.PutU32(buf, 28, offset);
+        for (int i = 0; i < w * h; i = i + 1) {
+            buf[offset + i] = (byte)i;
+        }
+        outLen.Add(total);
+        return buf;
+    }
+
+    // A 256-entry palette. Entry n gets R=n, G=n*2, B=255-n, each 6-bit. A
+    // mid-range index then proves the 6->8-bit expansion is applied and a
+    // distinct pixel (0,1)=2 names its entry from the colour.
+    static string BuildPal(List<int> outLen) {
+        byte[] buf = new byte[768 + 1];
+        for (int n = 0; n < 256; n = n + 1) {
+            buf[n * 3] = (byte)n;
+            buf[n * 3 + 1] = (byte)(n * 2 & 0x3F);
+            buf[n * 3 + 2] = (byte)((255 - n) & 0x3F);
+        }
+        outLen.Add(768);
+        return buf;
+    }
+
+    // Byte-at-a-time so embedded NULs survive, as in maprender.zan.
+    static void WriteBytes(string path, string data, int len) {
+        FileStream fs = FileStream.OpenWrite(path);
+        for (int i = 0; i < len; i = i + 1) {
+            fs.WriteByte(data[i] & 0xFF);
+        }
+        fs.Close();
+    }
+
+    static void Main() {
+        string dir = "build/ra2_test_objart_data";
+        Directory.CreateDirectory(dir);
+
+        List<int> slen = new List<int>();
+        string shp = Program.BuildShp(slen);
+        Program.WriteBytes(dir + "/GACNST.SHP", shp, slen[0]);
+        List<int> plen = new List<int>();
+        Program.WriteBytes(dir + "/unitsno.pal", Program.BuildPal(plen), plen[0]);
+        // Buildings use the theater palette; provide it so the structure art
+        // decodes (with the same synthetic colours as the unit palette here).
+        Program.WriteBytes(dir + "/isotem.pal", Program.BuildPal(plen), plen[0]);
+
+        Vfs vfs = Vfs.Create();
+        vfs.MountDirectory(dir);
+        AssetDb db = AssetDb.Load(vfs);
+
+        // ObjectArt prefers unitsno.pal, falling back to unit.pal; only the
+        // first is present, so that is what gets used.
+        ObjectArt art = ObjectArt.Create(vfs, db);
+        StructureCatalog catalog = StructureCatalog.Create();
+
+        // Frame 0 decodes to a 4x2 texture. Pixel (0,1) carries index 4,
+        // whose palette entry is R=4 G=8 B=251 (6-bit) -> expanded to 8-bit.
+        // A structure that is fully built (progress >= build time) shows frame
+        // 0; one that just started (progress 0) maps to the last construction
+        // frame -- but the synthetic shape has only one frame, so both resolve
+        // to frame 0.
+        Texture tex = art.StructureTexture(Side2.Allied(), 0, catalog, 0, 60);
+        Console.WriteLine("tex=" + Convert.ToString(tex == null ? -1 : tex.Width())
+            + "x" + Convert.ToString(tex == null ? -1 : tex.Height()));
+        Console.WriteLine("alpha0=" + Convert.ToString((tex.PixelAt(0, 0) >> 24) & 0xFF));
+        int p2 = tex.PixelAt(0, 1);
+        Console.WriteLine("pix2_r=" + Convert.ToString((p2 >> 16) & 0xFF));
+        Console.WriteLine("pix2_g=" + Convert.ToString((p2 >> 8) & 0xFF));
+        Console.WriteLine("pix2_b=" + Convert.ToString(p2 & 0xFF));
+
+        // The texture is cached: a second lookup is the same object and the
+        // file was read once.
+        Console.WriteLine("cached=" + Convert.ToString(
+            art.StructureTexture(Side2.Allied(), 0, catalog, 60, 60) == tex));
+
+        // An absent SHP is cached as null and stays null.
+        Console.WriteLine("missing=" + Convert.ToString(
+            art.StructureTexture(Side2.Soviet(), 1, catalog, 0, 50) == null));
+
+        // Units draw from the placeholder when their archetype has no art,
+        // and the real sprite when it does (the dog).
+        UnitCatalog ucat = UnitCatalog.Create();
+        Console.WriteLine("unit_art=" + Convert.ToString(
+            art.UnitTexture(ucat.TypeFor(Side2.Allied(), 0), false, 0, 0) == null));
+        Console.WriteLine("dog_art=" + Convert.ToString(
+            art.UnitTexture(ucat.TypeFor(Side2.Allied(), 1), false, 0, 0) == null));
+
+        // Renderer: a unit on a clear canvas and a structure, selected, so the
+        // ring must appear. The unit is in front (larger x+y), so it paints
+        // last and the structure's ring is still under it.
+        IsoMap iso = Program.BuildIso();
+        World w = World.Create(iso, catalog, UnitCatalog.Create());
+        w.PlaceStructure(Side2.Allied(), 0, 2, 2);
+        int unit = w.SpawnUnit(Side2.Allied(), 0, 6, 4);
+        w.SelectAt(6, 4);
+        Console.WriteLine("sel=" + Convert.ToString(w.SelectedIndex()));
+        Console.WriteLine("unit=" + Convert.ToString(unit));
+
+        List<int> b = new List<int>();
+        MapRenderer.Bounds(iso, b);
+        int ox = b[0];
+        int oy = b[1];
+
+        // A canvas covering the whole projected world. The unit (6,4) is at
+        // screen (60,150) and the structure (2,2) at (0,60), so in canvas
+        // coordinates they sit at (60-ox, 150-oy) and (0-ox, 60-oy). A full-map
+        // canvas keeps every probe inside and its size is the world bounds.
+        Texture canvas = Texture.Create(b[2], b[3]);
+        int drawn = ObjectRenderer.Render(w, art, canvas, 0, 0, ox, oy,
+                                          Side2.Allied());
+        Console.WriteLine("drawn=" + Convert.ToString(drawn));
+
+        // The unit placeholder: a 24x24 glyph blit at (wx-12, wy-24) from the
+        // unit's apex (60-ox, 150-oy). Its top-left corner (618,111) is an
+        // outline pixel -- opaque -- and no ring reaches row 111.
+        Console.WriteLine("place_alpha=" + Convert.ToString(Program.At(canvas, 60 - ox - 12, 150 - oy - 24)));
+
+        // The structure sprite: the 4x2 frame blits at (wx-2, wy-2). Pixel
+        // (0,1) is index 4 (R8=16), opaque. That names the sprite, not the ring.
+        Console.WriteLine("str_alpha=" + Convert.ToString(Program.At(canvas, 0 - ox - 2, 60 - oy - 2 + 1)));
+        Console.WriteLine("str_red=" + Convert.ToString(Program.Channel(canvas, 0 - ox - 2, 60 - oy - 2 + 1, 16)));
+
+        // The unit's ring was drawn (the scan above), so deselect it and select
+        // the structure instead; its ring must appear around (0-ox, 60-oy).
+        w.ClearSelection();
+        w.SelectAt(3, 3);
+        Console.WriteLine("sel2=" + Convert.ToString(w.SelectedIndex()));
+        ObjectRenderer.Render(w, art, canvas, 0, 0, ox, oy, Side2.Allied());
+
+        // Ring bottom vertex (0-ox, 60-oy+15) is inside neither sprite nor
+        // placeholder; its green channel must read 255.
+        Console.WriteLine("ring_red=" + Convert.ToString(Program.Channel(canvas, 0 - ox, 60 - oy + 15, 16)));
+        Console.WriteLine("ring_green=" + Convert.ToString(Program.Channel(canvas, 0 - ox, 60 - oy + 15, 8)));
+
+        // An enemy unit's selection ring is red, not green, so the player can
+        // tell an enemy selection from an own one at a glance.
+        int enemyUnit = w.SpawnUnit(Side2.Soviet(), 0, 15, 15);
+        w.ClearSelection();
+        w.SelectAt(15, 15);
+        ObjectRenderer.Render(w, art, canvas, 0, 0, ox, oy, Side2.Allied());
+        // The enemy unit is at screen (0,450) in cell space; its ring bottom
+        // vertex at (0-ox, 450-oy+15) reads red.
+        int esx = IsoProjection.ScreenX(15, 15) - ox;
+        int esy = IsoProjection.ScreenY(15, 15, 0) - oy;
+        Console.WriteLine("ering_red=" + Convert.ToString(Program.Channel(canvas, esx, esy + 15, 16)));
+        Console.WriteLine("ering_green=" + Convert.ToString(Program.Channel(canvas, esx, esy + 15, 8)));
+
+        // A corner of the canvas far from every object stays clear.
+        Console.WriteLine("clear=" + Convert.ToString(Program.At(canvas, 60, 60)));
+
+        canvas.Close();
+        tex.Close();
+        art.Close();
+        File.Delete(dir + "/GACNST.SHP");
+        File.Delete(dir + "/unitsno.pal");
+        File.Delete(dir + "/isotem.pal");
+        Directory.Delete(dir);
+    }
+
+    static int At(Texture t, int x, int y) {
+        return (t.PixelAt(x, y) >> 24) & 0xFF;
+    }
+
+    // One RGB channel of a pixel: 16 = R, 8 = G, 0 = B.
+    static int Channel(Texture t, int x, int y, int shift) {
+        return (t.PixelAt(x, y) >> shift) & 0xFF;
+    }
+
+    // A 20x20 flat map, no game data. Level 0, tile 1 everywhere.
+    static IsoMap BuildIso() {
+        int n = 20 * 20;
+        byte[] buf = new byte[n * 11 + 1];
+        int i = 0;
+        for (int y = 0; y < 20; y = y + 1) {
+            for (int x = 0; x < 20; x = x + 1) {
+                buf[i * 11] = (byte)(x & 0xFF);
+                buf[i * 11 + 1] = (byte)((x >> 8) & 0xFF);
+                buf[i * 11 + 2] = (byte)(y & 0xFF);
+                buf[i * 11 + 3] = (byte)((y >> 8) & 0xFF);
+                buf[i * 11 + 4] = (byte)1;
+                buf[i * 11 + 5] = (byte)0;
+                buf[i * 11 + 6] = (byte)0;
+                buf[i * 11 + 7] = (byte)0;
+                buf[i * 11 + 8] = (byte)0;
+                buf[i * 11 + 9] = (byte)0;
+                buf[i * 11 + 10] = (byte)0;
+                i = i + 1;
+            }
+        }
+        return IsoMap.Parse(buf, n * 11, 20, 20);
+    }
+}

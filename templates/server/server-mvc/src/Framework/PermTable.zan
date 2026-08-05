@@ -1,0 +1,153 @@
+using System;
+using System.Data;
+using System.Data.Orm;
+using System.Threading;
+using System.Web;
+using ZanWeb.Model.Sys;
+
+namespace ZanWeb;
+
+/// <summary>
+/// The authorization tables in shared memory: "what may this role run" and
+/// "which roles does this account hold". Both are derived data -- the database
+/// still owns sys_role_grant / sys_user_role / sys_department_role -- but the
+/// request path reads them out of shared memory, so answering "may this uid run
+/// Users.Save?" costs no query and no per-worker duplication: every worker
+/// process attaches to the same rows.
+///
+///   roles:  key "3"  -> acts ",Users.Index,Users.Save,"   (membership test)
+///   users:  key "42" -> super 0|1, roles ",3,7,"          (expires, reloaded)
+///
+/// Roles are loaded whole on boot and rewritten when an operator changes a
+/// grant, because there are few of them and every request needs them. Accounts
+/// are filled in on first use with a short lease, because there can be millions
+/// and only the ones signing in matter.
+/// </summary>
+class PermTable {
+    /// Shared-memory names. Distinct per application so two servers on one
+    /// machine do not read each other's authorization.
+    static string RoleTable = "zanweb_role_acts";
+    static string UserTable = "zanweb_user_roles";
+
+    /// How long an account's role set stays in shared memory before it is read
+    /// from the database again. A revocation is pushed immediately (Forget), so
+    /// this only bounds a change made by another process.
+    static long UserLeaseMs = 300000;
+
+    static SharedTable roles = null;
+    static SharedTable users = null;
+
+    /// <summary>Creates (or attaches to) both tables. Called once from main
+    /// before the server starts; false means shared memory is unavailable and
+    /// authorization falls back to querying the database.</summary>
+    static bool Open() {
+        SharedTable r = new SharedTable(PermTable.RoleTable, 256);
+        r.KeySize(16);
+        r.ColumnString("acts", 8192);
+        if (!r.Create()) { r = SharedTable.Open(PermTable.RoleTable); }
+        if (r == null || !r.IsOpen()) { return false; }
+
+        SharedTable u = new SharedTable(PermTable.UserTable, 8192);
+        u.KeySize(24);
+        u.ColumnInt("super");
+        u.ColumnString("roles", 192);
+        if (!u.Create()) { u = SharedTable.Open(PermTable.UserTable); }
+        if (u == null || !u.IsOpen()) { return false; }
+
+        PermTable.roles = r;
+        PermTable.users = u;
+        return true;
+    }
+
+    static bool Ready() {
+        return PermTable.roles != null && PermTable.users != null;
+    }
+
+    /// <summary>Rewrites every role's action set from the database. Run on boot
+    /// and after an operator changes a role's grants: a role is edited rarely
+    /// and read on every request, so it is pushed rather than expired.</summary>
+    static async void LoadRoles(IDbConnection db) {
+        if (!PermTable.Ready()) { return; }
+        List<Role> rows = await db.Select<Role>().ToListAsync();
+        List<RoleGrant> grants = await db.Select<RoleGrant>().ToListAsync();
+        PermTable.roles.Clear();
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            Role r = rows[i];
+            if (r.status != 1) { continue; }
+            StringBuilder acts = new StringBuilder();
+            acts.Append(",");
+            for (int j = 0; j < grants.Count; j = j + 1) {
+                if (grants[j].roleId != r.id) { continue; }
+                if (grants[j].action.Length == 0) { continue; }
+                acts.Append(grants[j].action);
+                acts.Append(",");
+            }
+            bool _ok = PermTable.roles.SetString(Convert.ToString(r.id), "acts",
+                acts.ToString());
+        }
+    }
+
+    /// <summary>Whether one of `roleIds` (",3,7,") grants `action`. Reads the
+    /// role rows straight out of shared memory.</summary>
+    static bool RolesAllow(string roleIds, string action) {
+        if (!PermTable.Ready()) { return false; }
+        string needle = "," + action + ",";
+        List<string> ids = PermTable.Split(roleIds);
+        for (int i = 0; i < ids.Count; i = i + 1) {
+            string acts = PermTable.roles.GetString(ids[i], "acts");
+            if (acts.Length > 0 && acts.Contains(needle)) { return true; }
+        }
+        return false;
+    }
+
+    /// <summary>This account's roles as ",3,7,", or "" when it is not in shared
+    /// memory yet (or its lease ran out) and must be read from the database.
+    /// "*" means the bootstrap account, which bypasses the role tables.</summary>
+    static string UserRoles(string uid) {
+        if (!PermTable.Ready()) { return ""; }
+        if (!PermTable.users.Exists(uid)) { return ""; }
+        if (PermTable.users.GetInt(uid, "super") == 1) { return "*"; }
+        return PermTable.users.GetString(uid, "roles");
+    }
+
+    /// <summary>Publishes an account's roles for every worker, with a lease so a
+    /// change nobody announced still lands eventually.</summary>
+    static void SetUser(string uid, bool isSuper, string roleIds) {
+        if (!PermTable.Ready()) { return; }
+        bool _s = PermTable.users.SetInt(uid, "super", isSuper ? 1 : 0);
+        bool _r = PermTable.users.SetString(uid, "roles", roleIds);
+        bool _e = PermTable.users.Expire(uid, PermTable.UserLeaseMs);
+    }
+
+    /// <summary>Drops one account, so the next request rereads its roles. Used
+    /// after assigning roles, disabling an account or changing its
+    /// department.</summary>
+    static void Forget(string uid) {
+        if (!PermTable.Ready()) { return; }
+        bool _d = PermTable.users.Delete(uid);
+    }
+
+    /// <summary>Drops every account: for a change that can affect many at once
+    /// (a role's grants, a department's roles, a deleted role).</summary>
+    static void ForgetAll() {
+        if (!PermTable.Ready()) { return; }
+        PermTable.users.Clear();
+    }
+
+    /// <summary>The non-empty parts of ",3,7," -- the stored form of an id
+    /// set.</summary>
+    static List<string> Split(string joined) {
+        List<string> outp = new List<string>();
+        StringBuilder cur = new StringBuilder();
+        for (int i = 0; i <= joined.Length; i = i + 1) {
+            if (i == joined.Length || joined.Substring(i, 1) == ",") {
+                string one = cur.ToString();
+                if (one.Length > 0) { outp.Add(one); }
+                cur = new StringBuilder();
+            } else {
+                cur.Append(joined.Substring(i, 1));
+            }
+        }
+        return outp;
+    }
+}

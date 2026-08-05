@@ -1,3 +1,4 @@
+using System.Text;
 using System;
 
 namespace System.Web;
@@ -30,7 +31,7 @@ class Controller {
     /// <summary>Bind the request context (called by the generated trampoline).</summary>
     void __Bind(HttpContext c) {
         this.ctx = c;
-        this.uid = c.state.Get("uid");
+        this.uid = c.uid;
     }
 
     /// <summary>Runs before the action; return false to short-circuit.
@@ -126,10 +127,26 @@ class Controller {
         return v;
     }
 
-    /// <summary>Aborts the action with the uniform API answer. The generated
-    /// trampoline turns this into the response, so a guard is one line.</summary>
-    void Abort(int status, string code, string msg) {
-        throw new ApiError(status, code, msg);
+    /// <summary>True when this request came from script rather than from a
+    /// navigation -- htmx sends `HX-Request`, fetch/XHR ask for JSON. It matters
+    /// for "you are not signed in": a navigation should land on the sign-in
+    /// form, but redirecting a background request hands the caller the form's
+    /// HTML with a 200, which reads like the write succeeded.</summary>
+    bool WantsJson() {
+        if (this.ctx.Header("HX-Request").Length > 0) { return true; }
+        if (this.ctx.Header("X-Requested-With").Length > 0) { return true; }
+        string accept = this.ctx.Header("Accept");
+        return accept.Contains("application/json");
+    }
+
+    // ---- list screens -------------------------------------------------------
+
+    /// <summary>The list parameters of this request -- page, limit, order, dir,
+    /// kw -- with the page size clamped to `defLimit`..200. One call replaces the
+    /// five reads every list action would otherwise repeat, and the compiler
+    /// documents all five in /api/docs from this one call site.</summary>
+    ListQuery Paged(string defOrder, int defLimit) {
+        return ListQuery.From(this.ctx, defOrder, defLimit, 200);
     }
 
     // ---- uniform responses ----
@@ -137,12 +154,14 @@ class Controller {
     /// already be a JSON value.</summary>
     void Ok(string data) { this.ctx.Api("0000", "ok", data); }
 
-    /// <summary>{"code":..,"msg":..,"data":null} with the matching status. The
-    /// status line carries the standard ASCII reason phrase; the (possibly
-    /// localized) message goes in the body, where it belongs.</summary>
+    /// <summary>Ends the action with {"code":..,"msg":..,"data":null} and the
+    /// matching status. It throws: the generated trampoline (and WebApp for a
+    /// hand-mapped route) turns the exception into that response, so a guard is
+    /// one line and no action carries `...; return;` error tails. The status
+    /// line keeps the standard ASCII reason phrase; the localized message goes
+    /// in the body, where it belongs.</summary>
     void Fail(int status, string code, string msg) {
-        this.ctx.Status(status, ApiError.Reason(status));
-        this.ctx.Api(code, msg, "null");
+        throw new ApiError(status, code, msg);
     }
 
     void Json(string json) { this.ctx.Json(json); }
@@ -161,8 +180,129 @@ class Controller {
         this.ctx.Html(WebHost.Current().RenderPage(this.__viewKey, data));
     }
 
+    /// <summary>Render this action's template WITHOUT the layout: the answer to
+    /// an in-page request, where the browser already has the shell and only the
+    /// panel is being replaced.</summary>
+    void Fragment(ViewData data) {
+        this.ctx.Html(WebHost.Current().RenderFragment(this.__viewKey, data));
+    }
+
+    /// <summary>Render an explicitly named template, layout and all.</summary>
+    void FragmentOf(string name, ViewData data) {
+        this.ctx.Html(WebHost.Current().RenderFragment(name, data));
+    }
+
     /// <summary>Render an explicitly named template instead of the convention one.</summary>
     void ViewOf(string name, ViewData data) {
         this.ctx.Html(WebHost.Current().RenderPage(name, data));
+    }
+}
+
+/// <summary>
+/// The read half of a list screen, taken straight from the request: page, limit,
+/// order, dir, kw. Every list in an application answers the same five parameters
+/// with the same names, so this is one class rather than a convention each
+/// controller re-implements slightly differently.
+///
+/// The bounds are the server's, not the client's: `page` is at least 1 and
+/// `limit` is clamped to [1, max], so `?limit=1000000` cannot turn a list into a
+/// table scan. `order` is a bare sort key the caller chooses from -- the query
+/// itself is still typed, because the controller maps the key to an
+/// OrderBy(a => a.column) that the compiler checks.
+/// </summary>
+class ListQuery {
+    int page;
+    int limit;
+    /// Sort key as asked for, already defaulted; the controller decides which
+    /// keys exist.
+    string order;
+    /// True for descending -- `?dir=asc` is the only way to get ascending.
+    bool desc;
+    /// Search text, trimmed; "" when the caller did not search.
+    string kw;
+
+    ListQuery() {
+        this.page = 1;
+        this.limit = 20;
+        this.order = "";
+        this.desc = true;
+        this.kw = "";
+    }
+
+    int Page() { return this.page; }
+    int Limit() { return this.limit; }
+    string Order() { return this.order; }
+    bool Desc() { return this.desc; }
+    string Kw() { return this.kw; }
+
+    /// <summary>Rows to skip for this page, for Skip(q.Skip()).</summary>
+    int Skip() { return (this.page - 1) * this.limit; }
+
+    /// <summary>Number of pages `total` rows make at this limit (at least 1, so
+    /// an empty list still reads as "第 1 / 1 页").</summary>
+    int Pages(int total) {
+        if (total <= 0) { return 1; }
+        return (total + this.limit - 1) / this.limit;
+    }
+
+    /// <summary>The query string that reproduces this listing minus the page, so
+    /// a pager only has to append `&amp;page=N`.</summary>
+    string QueryString() {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("limit=");
+        sb.Append(Convert.ToString(this.limit));
+        if (this.order.Length > 0) {
+            sb.Append("&order=");
+            sb.Append(Encoding.UrlEncode(this.order));
+            if (this.desc) { sb.Append("&dir=desc"); } else { sb.Append("&dir=asc"); }
+        }
+        if (this.kw.Length > 0) {
+            sb.Append("&kw=");
+            sb.Append(Encoding.UrlEncode(this.kw));
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>Reads the five parameters off the request. `defOrder` is the sort
+    /// key used when the caller names none, `defLimit` the page size, `maxLimit`
+    /// the largest page size this endpoint will serve.</summary>
+    static ListQuery From(HttpContext ctx, string defOrder, int defLimit,
+                          int maxLimit) {
+        ListQuery q = new ListQuery();
+        q.page = ctx.InInt("page", 1);
+        if (q.page < 1) { q.page = 1; }
+        q.limit = ctx.InInt("limit", defLimit);
+        if (q.limit < 1) { q.limit = defLimit; }
+        if (q.limit > maxLimit) { q.limit = maxLimit; }
+        q.order = ctx.In("order");
+        if (q.order.Length == 0) { q.order = defOrder; }
+        q.desc = ctx.In("dir") != "asc";
+        q.kw = ctx.InText("kw").Trim();
+        return q;
+    }
+}
+
+/// <summary>
+/// The write half: the response shape every list endpoint returns, so a client
+/// (or the CRUD pages) can render any list without knowing which one it is:
+/// {"items":[...],"total":N,"page":P,"limit":L,"pages":K}. `items` is already
+/// serialized JSON -- the rows are typed models, and serializing them is the
+/// caller's business.
+/// </summary>
+class Listing {
+    static string Json(string itemsJson, int total, ListQuery q) {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("{\"items\":");
+        if (itemsJson.Length == 0) { sb.Append("[]"); } else { sb.Append(itemsJson); }
+        sb.Append(",\"total\":");
+        sb.Append(Convert.ToString(total));
+        sb.Append(",\"page\":");
+        sb.Append(Convert.ToString(q.Page()));
+        sb.Append(",\"limit\":");
+        sb.Append(Convert.ToString(q.Limit()));
+        sb.Append(",\"pages\":");
+        sb.Append(Convert.ToString(q.Pages(total)));
+        sb.Append("}");
+        return sb.ToString();
     }
 }

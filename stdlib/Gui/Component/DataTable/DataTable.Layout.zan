@@ -4,43 +4,43 @@ using Gui;
 
 namespace Gui.Component.DataTable;
 
-/// Layout persistence for DataTable: the view state a user builds up by hand —
-/// column widths, order, visibility, freezing, sort keys, grouping, per-column
-/// aggregates and the full filter stack — serialised to JSON and read back.
+/// DataTable 布局持久化：用户手工调整出的视图状态——
+/// 列宽、顺序、可见性、冻结、排序键、分组、逐列
+/// 聚合及完整筛选栈——序列化为 JSON 并读回。
 ///
-///   string s = DataTable.SaveLayout(st, cols);   // e.g. into a settings file
-///   DataTable.LoadLayout(st, cols, s);           // next launch
+///   string s = DataTable.SaveLayout(st, cols);   // 例如存入设置文件
+///   DataTable.LoadLayout(st, cols, s);           // 下次启动时
 ///
-/// Columns are keyed by `DataColumn.Field` name, never by position, so a layout
-/// keeps its meaning after columns are inserted, moved or renamed. A column the
-/// layout doesn't mention keeps its declared defaults; a name in the layout that
-/// no longer exists is skipped. That makes `LoadLayout` safe to point at a stale
-/// file — it degrades to a partial restore instead of discarding the layout or
-/// mis-assigning one column's width to another.
+/// 列以 `DataColumn.Field` 名称为键，绝不按位置，
+/// 插入、移动或重命名列后布局依然有效。
+/// 布局未提到的列保持声明默认值；布局中
+/// 不存在的名称被跳过。这让 `LoadLayout` 面对过期文件也安全——
+/// 退化为部分恢复，而非丢弃布局或
+/// 把某列宽度错赋给另一列。
 ///
-/// Unnamed columns (`field == ""`) cannot be addressed and are skipped by both
-/// directions: naming a column with `DataColumn.Field` is what opts it in.
+/// 未命名列（`field == ""`）无法寻址，保存和加载
+/// 都会被跳过：用 `DataColumn.Field` 命名即表示参与。
 partial class DataTable {
-    /// Layout format version, written as `ver`. Bumped when the shape changes so
-    /// a future reader can migrate rather than mis-parse; `LoadLayout` refuses a
-    /// version it doesn't know.
+    /// 布局格式版本，写入 `ver`。结构变化时递增，
+    /// 使未来读取方能迁移而非误解析；`LoadLayout` 拒绝
+    /// 不认识的版本。
     static int LayoutVersion() { return 1; }
 
-    // ---------- save ----------
+    // ---------- 保存 ----------
 
-    /// Serialise `st`'s view state to a JSON string. Only state a *user* changes
-    /// is written: scroll offset, selection, in-flight edits and drag state are
-    /// deliberately left out, since restoring them would fight the next session.
+    /// 把 `st` 的视图状态序列化为 JSON 字符串。只写入*用户*修改的状态：
+    /// 滚动偏移、选区、进行中的编辑和拖拽状态
+    /// 刻意排除，恢复它们会与下次会话冲突。
     static string SaveLayout(DataTableState st, List<DataColumn> cols) {
         JsonValue root = JsonValue.NewObject();
         root.Put("ver", JsonValue.NewNum(Convert.ToString(DataTable.LayoutVersion())));
 
-        // ---- per-column state, keyed by field name ----
+        // ---- 逐列状态，按字段名作键 ----
         JsonValue arr = JsonValue.NewArray();
         for (int i = 0; i < cols.Count; i = i + 1) {
             string f = cols[i].field;
-            // An unnamed column can't be matched on load, so writing it would
-            // only add noise the reader must skip anyway.
+            // 未命名列加载时无法匹配，写入只会
+            // 增加读取方不得不跳过的噪音。
             if (f.Length > 0) {
                 JsonValue c = JsonValue.NewObject();
                 c.Put("field", JsonValue.NewStr(f));
@@ -68,7 +68,7 @@ partial class DataTable {
         }
         root.Put("cols", arr);
 
-        // ---- column order, as field names in display sequence ----
+        // ---- 列顺序，按显示序列的字段名 ----
         JsonValue ord = JsonValue.NewArray();
         for (int o = 0; o < st.colOrder.Count; o = o + 1) {
             int ci = st.colOrder[o];
@@ -78,7 +78,7 @@ partial class DataTable {
         }
         root.Put("order", ord);
 
-        // ---- sort keys, outer to inner ----
+        // ---- 排序键，由外层到内层 ----
         JsonValue sk = JsonValue.NewArray();
         for (int s = 0; s < st.sortKeys.Count; s = s + 1) {
             int sc = st.sortKeys[s].col;
@@ -91,7 +91,7 @@ partial class DataTable {
         }
         root.Put("sort", sk);
 
-        // ---- grouping columns, outer to inner ----
+        // ---- 分组列，由外层到内层 ----
         JsonValue gr = JsonValue.NewArray();
         for (int g = 0; g < st.groupCols.Count; g = g + 1) {
             int gc = st.groupCols[g];
@@ -101,25 +101,25 @@ partial class DataTable {
         }
         root.Put("group", gr);
 
-        // ---- collapsed header bands (already keyed by their own path) ----
+        // ---- 折叠的表头 band（已按其路径作键）----
         JsonValue bc = JsonValue.NewArray();
         for (int b = 0; b < st.bandCollapsed.Count; b = b + 1) {
             bc.Append(JsonValue.NewStr(st.bandCollapsed[b]));
         }
         root.Put("bands", bc);
 
-        // ---- expanded master-detail rows, by source row index ----
-        // Row indices only mean anything against the same data, so this restores
-        // usefully for a stable table and harmlessly (an unrelated row opens) for
-        // one whose rows have shifted — the panel itself is always redrawn from
-        // the current data.
+        // ---- 展开的主从详情行，按源行索引 ----
+        // 行索引只对相同数据有意义，因此对稳定表格
+        // 能正确恢复；对行已移动的表格则无害（可能展开无关行）——
+        // 面板本身总是根据
+        // 当前数据重绘。
         JsonValue ex = JsonValue.NewArray();
         for (int e2 = 0; e2 < st.expandedRows.Count; e2 = e2 + 1) {
             ex.Append(JsonValue.NewNum(Convert.ToString(st.expandedRows[e2])));
         }
         root.Put("expanded", ex);
 
-        // ---- table-level toggles ----
+        // ---- 表级开关 ----
         JsonValue v = JsonValue.NewObject();
         v.Put("rowNum", JsonValue.NewBool(st.showRowNum));
         v.Put("select", JsonValue.NewBool(st.showSelect));
@@ -133,8 +133,8 @@ partial class DataTable {
         return root.ToJson();
     }
 
-    /// Serialise one column's filter, or null when it carries no active stage —
-    /// an unfiltered column contributes nothing to the layout.
+    /// 序列化某列的筛选器；没有活动阶段时返回 null——
+    /// 未筛选的列不向布局贡献内容。
     static JsonValue FilterToJson(ColFilter f) {
         if (!f.Active()) { return null; }
         JsonValue o = JsonValue.NewObject();
@@ -173,27 +173,27 @@ partial class DataTable {
         return o;
     }
 
-    // ---------- load ----------
+    // ---------- 加载 ----------
 
-    /// Restore a layout written by `SaveLayout`. Returns false — leaving `st`
-    /// untouched — when the text isn't a usable layout of a known version, so a
-    /// corrupt or foreign settings file can't half-apply.
+    /// 恢复 `SaveLayout` 写入的布局。文本不是已知版本的可用布局时
+    /// 返回 false 且不动 `st`，
+    /// 防止损坏或外来的设置文件被部分应用。
     ///
-    /// Safe to call before the grid's first frame: the index-aligned per-column
-    /// lists are grown to fit `cols` first.
+    /// 可在网格首帧前安全调用：与索引对齐的逐列
+    /// 列表会先扩展以匹配 `cols`。
     static bool LoadLayout(DataTableState st, List<DataColumn> cols, string text) {
         if (text.Length == 0) { return false; }
         JsonValue root = JsonValue.ParseLenient(text);
         if (root == null) { return false; }
         if (!root.IsObject()) { return false; }
         int ver = root.Int("ver", 0);
-        // Refuse a version this build doesn't understand rather than guess at a
-        // shape that may have moved fields around.
+        // 拒绝本版本不认识的版本号，而不是猜测
+        // 可能已移动字段的结构。
         if (ver != DataTable.LayoutVersion()) { return false; }
 
-        // The per-column lists are index-aligned with `cols`; make sure they are
-        // long enough before writing through a column index, so a layout loaded
-        // before the first frame can't run off the end.
+        // 逐列列表与 `cols` 索引对齐；先确保它们
+        // 足够长再按下标写入，使首帧前加载的布局
+        // 不会越界。
         DataTable.EnsureLayoutSlots(st, cols);
 
         DataTable.LoadColumnState(st, cols, root);
@@ -204,13 +204,13 @@ partial class DataTable {
         DataTable.LoadExpandedRows(st, root);
         DataTable.LoadViewToggles(st, root);
 
-        // Restoring a layout invalidates the derived view (order, groups,
-        // aggregates, conditional-format ranges); the next Recompute rebuilds it.
+        // 恢复布局使派生视图（顺序、分组、
+        // 聚合、条件格式范围）失效；下次 Recompute 重建。
         st.dirty = true;
         return true;
     }
 
-    /// per-column state: width / hidden / freeze / aggregate / filter row / filter.
+    /// 逐列状态：宽度 / 隐藏 / 冻结 / 聚合 / 筛选行 / 筛选器。
     static void LoadColumnState(DataTableState st, List<DataColumn> cols, JsonValue root) {
         JsonValue arr = root.Get("cols");
         if (arr != null && arr.IsArray()) {
@@ -218,12 +218,12 @@ partial class DataTable {
                 JsonValue c = arr.At(i);
                 if (c.IsObject()) {
                     int ci = DataTable.Col(cols, c.Str("field", ""));
-                    // A column named in the layout but absent from this table
-                    // (renamed, or dropped in a later version) is skipped.
+                    // 布局中提到但当前表没有的列
+                    // （已重命名或在新版本中移除）会被跳过。
                     if (ci >= 0) {
                         int w = c.Int("w", 0);
-                        // Guard against a zero/negative width in a hand-edited
-                        // file collapsing the column to nothing.
+                        // 防止手工编辑的文件中出现
+                        // 零或负宽度把列压没。
                         if (w > 0) { st.colWidths[ci] = w; }
                         st.colHidden[ci] = c.Bool("hidden", false);
                         int fz = c.Int("freeze", 0);
@@ -242,9 +242,9 @@ partial class DataTable {
         }
     }
 
-    /// column order: listed columns first, in the saved sequence, then any
-    /// column the layout didn't mention (one added since it was written) in its
-    /// declared position, so no column goes missing.
+    /// 列顺序：布局列出的列按保存序列在前，
+    /// 布局未提到的列（写入后新增的）按声明位置
+    /// 在后，确保不丢列。
     static void LoadColumnOrder(DataTableState st, List<DataColumn> cols, JsonValue root) {
         JsonValue ord = root.Get("order");
         if (ord != null && ord.IsArray() && ord.Count() > 0) {
@@ -260,7 +260,7 @@ partial class DataTable {
         }
     }
 
-    /// sort keys, with sortCol/sortDir mirroring the primary key for back-compat.
+    /// 排序键，sortCol/sortDir 镜像主键以兼容旧版。
     static void LoadSortKeys(DataTableState st, List<DataColumn> cols, JsonValue root) {
         st.sortKeys.Clear();
         st.sortCol = -1;
@@ -278,19 +278,19 @@ partial class DataTable {
                 }
             }
         }
-        // sortCol/sortDir mirror the primary key for back-compat (see
-        // DataTableState), so keep them consistent with the list just built.
+        // sortCol/sortDir 镜像主键以兼容旧版（见
+        // DataTableState），因此要与刚构建的列表保持一致。
         if (st.sortKeys.Count > 0) {
             st.sortCol = st.sortKeys[0].col;
             st.sortDir = st.sortKeys[0].dir;
         }
     }
 
-    /// grouping columns; collapse state starts fresh (keys on group values).
+    /// 分组列；折叠状态从零开始（键基于组值）。
     static void LoadGrouping(DataTableState st, List<DataColumn> cols, JsonValue root) {
         st.groupCols.Clear();
-        // Collapse state keys on group *values*, which mean nothing until the
-        // groups are rebuilt, so it starts fresh: every group opens.
+        // 折叠状态以组*值*为键，而组值在
+        // 重建前没有意义，因此从零开始：所有组展开。
         st.collapsedKeys.Clear();
         JsonValue gr = root.Get("group");
         if (gr != null && gr.IsArray()) {
@@ -301,10 +301,10 @@ partial class DataTable {
         }
     }
 
-    /// collapsed header bands; the hidden columns are re-derived next frame.
+    /// 折叠的表头 band；隐藏列在下一帧重新推导。
     static void LoadCollapsedBands(DataTableState st, JsonValue root) {
         st.bandCollapsed.Clear();
-        // Which columns a collapsed band hid is re-derived on the next frame.
+        // 折叠 band 隐藏了哪些列在下一帧重新推导。
         st.bandAutoHidden.Clear();
         JsonValue bc = root.Get("bands");
         if (bc != null && bc.IsArray()) {
@@ -315,10 +315,10 @@ partial class DataTable {
         }
     }
 
-    /// expanded master-detail rows (each still vetted via CanExpand on flatten).
+    /// 展开的主从详情行（扁平化时仍逐个经 CanExpand 审核）。
     static void LoadExpandedRows(DataTableState st, JsonValue root) {
-        // A row still gets vetted through CanExpand on flattening, so a stale
-        // index can't force a band the provider would refuse.
+        // 行在扁平化时仍经 CanExpand 审核，过期的
+        // 索引无法强行展开 provider 拒绝的 band。
         st.expandedRows.Clear();
         JsonValue ex = root.Get("expanded");
         if (ex != null && ex.IsArray()) {
@@ -329,7 +329,7 @@ partial class DataTable {
         }
     }
 
-    /// table-level display toggles.
+    /// 表级显示开关。
     static void LoadViewToggles(DataTableState st, JsonValue root) {
         JsonValue v = root.Get("view");
         if (v != null && v.IsObject()) {
@@ -343,8 +343,8 @@ partial class DataTable {
         }
     }
 
-    /// Restore one column's filter from its saved object. The caller resets the
-    /// filter first, so only the stages the layout carries are set.
+    /// 从保存的对象恢复某列的筛选器。调用方先重置
+    /// 筛选器，因此只设置布局携带的阶段。
     static void FilterFromJson(ColFilter f, JsonValue o) {
         JsonValue h = o.Get("hidden");
         if (h != null && h.IsArray()) {
@@ -373,9 +373,9 @@ partial class DataTable {
         f.topN = o.Int("topN", 10);
     }
 
-    /// Grow the index-aligned per-column lists to cover every column, so
-    /// LoadLayout can write through a column index even when it runs before the
-    /// grid's own first-frame init. Mirrors the tail of EnsureInit.
+    /// 扩展与索引对齐的逐列列表以覆盖所有列，
+    /// 使 LoadLayout 即使在网格自身首帧初始化之前
+    /// 也能按下标写入。与 EnsureInit 的尾部一致。
     static void EnsureLayoutSlots(DataTableState st, List<DataColumn> cols) {
         int i = st.colWidths.Count;
         while (i < cols.Count) { st.colWidths.Add(cols[i].width); i = i + 1; }

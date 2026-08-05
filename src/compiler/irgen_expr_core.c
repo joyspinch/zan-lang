@@ -1097,11 +1097,28 @@ static zan_type_t *infer_expr_type_uncached(zan_irgen_t *g, zan_ast_node_t *e,
     return subst_type_param_deep(g, t, g->cur_inst);
 }
 
+/* Depth of the inference recursion, so a cycle in it stops with a diagnostic
+ * naming the expression instead of spinning the whole compiler silently. */
+static int g_infer_depth;
+static bool g_infer_bailed;
+
 static zan_type_t *infer_expr_type(zan_irgen_t *g, zan_ast_node_t *e,
                                    local_scope_t *locals) {
     infer_cache_slot_t *slot = infer_cache_slot(g, e, locals);
     if (slot && slot->node == e) return slot->type;
+    if (g_infer_depth >= ZAN_MAX_INFER_DEPTH) {
+        if (!g_infer_bailed) {
+            g_infer_bailed = true;
+            zan_diag_emit(g->diag, DIAG_ERROR, e->loc,
+                          "expression is nested too deeply to type "
+                          "(inference recursed %d levels); split it into "
+                          "statements", ZAN_MAX_INFER_DEPTH);
+        }
+        return NULL;
+    }
+    g_infer_depth++;
     zan_type_t *t = infer_expr_type_uncached(g, e, locals);
+    g_infer_depth--;
     /* The nested inference may have moved the context on (a query registers its
      * range variable), which drops the table -- re-check before publishing. */
     slot = infer_cache_slot(g, e, locals);

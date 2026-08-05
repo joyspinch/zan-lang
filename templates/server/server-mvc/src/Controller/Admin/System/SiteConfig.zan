@@ -1,0 +1,142 @@
+using System;
+using System.Data;
+using System.Data.Orm;
+using System.Web;
+using ZanWeb;
+using ZanWeb.Model.Sys;
+
+namespace ZanWeb.Admin.System;
+
+/// <summary>
+/// Site settings at /admin/system/settings: the title, keywords, description, ICP
+/// filing number and the rest of what a public site has to state about itself.
+///
+/// The form is generated from the rows themselves -- each carries its own
+/// label, group, kind and order -- so adding a setting is one seed row and no
+/// change to this screen or its template.
+/// </summary>
+[Route("admin/system/settings/[action]")]
+[Custom(Authorization = CustomAuthorization.Grant)]
+[Description("站点设置")]
+class SiteConfig : AdminController {
+    [HttpGet]
+    [Route("/admin/system/settings")]
+    [Custom(IsMenu = true, Icon = "mdi:cog")]
+    [Description("站点设置")]
+    async void Index() {
+        ViewData d = await this.Layout("站点设置");
+        if (!this.DbReady()) { d.Set("dbDown", "1"); this.Page(d); return; }
+
+        List<SiteSetting> rows = await this.SiteSetting
+            .OrderBy(a => a.sortOrder).ToListAsync();
+        // One pane per group, all rendered and switched client-side: the form
+        // posts as a whole, so moving between tabs must not lose edits.
+        List<StrMap> tabs = d.AddList("tabs");
+        List<StrMap> fields = d.AddList("fields");
+        string group = "";
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            SiteSetting s = rows[i];
+            if (s.groupName != group) {
+                group = s.groupName;
+                StrMap tab = new StrMap();
+                tab.Set("group", group);
+                if (tabs.Count == 0) { tab.Set("on", "on"); }
+                tabs.Add(tab);
+                StrMap head = new StrMap();
+                head.Set("group", group);
+                if (fields.Count == 0) { head.Set("open", "open"); }
+                fields.Add(head);
+            }
+            StrMap f = new StrMap();
+            f.Set("name", s.name);
+            f.Set("label", s.label);
+            f.Set("value", s.value);
+            f.Set("tip", s.tip);
+            f.Set("group", "");
+            if (s.kind == "textarea") { f.Set("area", "1"); }
+            else if (s.kind == "switch") {
+                f.Set("bool", "1");
+                if (s.value != "0") { f.Set("on", "1"); }
+            }
+            else if (s.kind == "password") {
+                // A stored secret is never written back into the page. The
+                // field starts empty and an empty field means "leave it".
+                f.Set("secret", "1");
+                f.Set("value", "");
+                if (s.value.Length > 0) { f.Set("tip", "已配置，留空表示不修改，填 - 表示清除"); }
+            }
+            else { f.Set("line", "1"); }
+            fields.Add(f);
+        }
+        // The official services offered as one-click presets, each with the
+        // page where a key is obtained.
+        List<StrMap> vendors = d.AddList("vendors");
+        List<AiVendor> vs = Ai.Vendors();
+        for (int i = 0; i < vs.Count; i = i + 1) {
+            StrMap v = new StrMap();
+            v.Set("code", vs[i].code);
+            v.Set("name", vs[i].name);
+            v.Set("baseUrl", vs[i].baseUrl);
+            v.Set("model", vs[i].model);
+            v.Set("signup", vs[i].signup);
+            vendors.Add(v);
+        }
+        if (await Ai.Ready()) { d.Set("aiReady", "1"); }
+
+        string mailHost = await Settings.Get(SettingKeys.MailHost, "");
+        if (mailHost.Length > 0) { d.Set("mailReady", "1"); }
+        if (rows.Count == 0) { d.Set("empty", "1"); }
+        this.Page(d);
+    }
+
+    [HttpPost]
+    [Description("保存站点设置")]
+    async void Save() {
+        List<SiteSetting> rows = await this.SiteSetting.ToListAsync();
+        int changed = 0;
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            SiteSetting s = rows[i];
+            if (!this.HasIn(s.name)) { continue; }
+            string value = this.In(s.name);
+            // A checkbox posts nothing when it is off, so switches ride on a
+            // hidden companion field and are read as 1/0 from it.
+            if (s.kind == "switch") {
+                value = "0";
+                if (this.In("sw." + s.name) == "1") { value = "1"; }
+            }
+            // An empty secret field means the stored one stays; a single "-"
+            // is how an operator removes a stored secret.
+            if (s.kind == "password") {
+                if (value.Length == 0) { continue; }
+                if (value == "-") { value = ""; }
+            }
+            if (value == s.value) { continue; }
+            int id = s.id;
+            int _n = await this.SiteSetting.Update()
+                .Set(a => a.value, value)
+                .Set(a => a.updatedAt, WebApp.NowSeconds())
+                .Where(a => a.id == id)
+                .ExecuteAffrowsAsync();
+            changed = changed + 1;
+        }
+        Settings.Forget();
+        await this.Note("保存站点设置", "", true,
+            Convert.ToString(changed) + " 项");
+        this.Saved("站点设置已保存");
+    }
+
+    /// <summary>Sends one mail to the address the operator typed, so the SMTP
+    /// settings can be proven before a user ever waits on a code.</summary>
+    [HttpPost]
+    [Description("发送测试邮件")]
+    async void MailTest() {
+        string to = this.In("to");
+        if (to.IndexOf("@") <= 0) { this.Fail(400, "0004", "请填写收件邮箱"); }
+        string site = await Settings.Get(SettingKeys.SiteTitle, "ZanWeb");
+        MailResult r = await Mailer.Send(to, site + " 邮件配置测试",
+            "这是一封测试邮件，收到它说明 SMTP 配置可用。");
+        await this.Note("发送测试邮件", to, r.ok, r.Message());
+        if (!r.ok) { this.Fail(502, "0502", r.Message()); }
+        this.Ok("测试邮件已发送");
+    }
+}

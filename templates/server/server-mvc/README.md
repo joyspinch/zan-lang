@@ -21,8 +21,8 @@ src/Controller/         request handlers, one directory per module
   Blog/Posts.zan          list / detail / publish (ORM + cache + views)
   Account/Login.zan       GET/POST /admin/login, /admin/logout (own bare layout)
   Admin/Dashboard.zan     GET /admin — metrics dashboard
-  Admin/Users.zan         GET /admin/users + enable/disable, force logout
-  Admin/Posts.zan         GET /admin/posts + publish/unpublish
+  Admin/Users.zan         GET /admin/system/users + enable/disable, force logout
+  Admin/Posts.zan         GET /admin/content/posts + publish/unpublish
   Api/Auth.zan            POST /api/auth/login, GET /api/auth/me
   User/Users.zan          /users, /user/{id}
 src/Dao/<Module>/       every query and write for that module
@@ -291,8 +291,9 @@ Of the DLLs, only the driver for the database in use is needed: `libsqlite3-0.dl
 for SQLite, `libpq.dll` + `libssl-3-x64.dll` + `libcrypto-3-x64.dll` +
 `libiconv-2.dll` + `libintl-8.dll` for PostgreSQL (MySQL speaks its protocol
 without a client library). `app.db` is not copied — `Schema` creates the tables
-and the seed account on first start. Set `ZAN_AUTH_SECRET` (32+ characters) in
-the environment or sign-in fails with a configuration error.
+and the seed account on first start. Set the session key — `[auth].secret` in `config/app.json`, or the
+`ZAN_AUTH_SECRET` environment variable which overrides it — to 32+ characters,
+or sign-in fails with a configuration error.
 
 **Keep generated files out of the source tree.** `-o build/app.exe` exists so the
 executable and the driver DLLs the linker copies beside it land in one throwaway
@@ -316,8 +317,8 @@ beforehand) if you would rather not have the database file in the project root.
 - `GET /blog`, `GET /blog/{id}`, `POST /blog/create` — server-rendered blog (author = signed-in account)
 - `GET /admin/login`, `POST /admin/login`, `GET /admin/logout` — admin sign-in (seed: `admin` / `admin1234`)
 - `GET /admin` — admin dashboard (uptime, requests, CPU/RSS, slow requests, pool/cache)
-- `GET /admin/users`, `POST /admin/users/status`, `POST /admin/users/logout` — account administration
-- `GET /admin/posts`, `POST /admin/posts/state` — content administration (drafts included)
+- `GET /admin/system/users`, `POST /admin/system/users/status`, `POST /admin/system/users/logout` — account administration
+- `GET /admin/content/posts`, `POST /admin/content/posts/state` — content administration (drafts included)
 - `GET /users` — ORM + cache demo (503 until a database is configured)
 - `GET /user/{id}` — route parameter demo (JSON envelope)
 - `GET /api/status` — request statistics

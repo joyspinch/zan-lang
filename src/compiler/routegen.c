@@ -419,14 +419,36 @@ static void controller_display(zan_ast_node_t *cls, char *out, size_t cap) {
     istr_to(out, cap, n);
 }
 
-/* module = last segment of the controller's namespace ("" if global). It
- * mirrors the module directory so view keys match View.zan's path-derived
- * keys and duplicate controllers get distinct keys. */
+/* module = the controller's namespace below the application root, i.e. every
+ * segment after the first ("ZanWeb.Admin.System" -> "Admin.System"; "" when the
+ * controller sits in the root namespace or none).
+ *
+ * It is the source directory below src/Controller spelled with dots, which is
+ * exactly how View.zan keys a template by its path below views/ -- so
+ * src/Controller/Admin/System/Users.zan renders views/Admin/System/Users.*.html
+ * with no mapping to maintain, and two controllers of the same name in
+ * different modules keep distinct keys. */
 static void controller_module(zan_ast_node_t *cls, char *out, size_t cap) {
     char ns[256]; istr_to(ns, sizeof(ns), cls->ns_name);
-    const char *last = ns;
-    for (char *q = ns; *q; q++) if (*q == '.') last = q + 1;
-    snprintf(out, cap, "%s", last);
+    const char *rest = strchr(ns, '.');
+    snprintf(out, cap, "%s", rest ? rest + 1 : "");
+}
+
+/* The controller half of a route action name: its source name, or its
+ * module-qualified source name when another controller in the program shares
+ * that name. */
+static void controller_action_name(zan_ast_node_t *unit, zan_ast_node_t *cls,
+                                   const char *disp, const char *mod,
+                                   char *out, size_t cap) {
+    int seen = 0;
+    for (int i = 0; i < unit->comp_unit.decls.count; i++) {
+        zan_ast_node_t *o = unit->comp_unit.decls.items[i];
+        if (o->kind != AST_CLASS_DECL || !is_controller(o)) continue;
+        char od[128]; controller_display(o, od, sizeof(od));
+        if (strcmp(od, disp) == 0) seen++;
+    }
+    if (seen > 1 && mod[0]) snprintf(out, cap, "%s.%s", mod, disp);
+    else snprintf(out, cap, "%s", disp);
 }
 
 /* controller token = original class name minus trailing "Controller", lowercased */
@@ -614,6 +636,48 @@ static void rg_params_add(rg_params *ps, const rg_reader *rd,
     }
 }
 
+/* `this.Paged(defOrder, defLimit)` reads the five parameters every list screen
+ * shares (Controller.Paged -> ListQuery.From). The reads happen inside the
+ * framework, so documenting them means expanding the one call site here --
+ * otherwise /api/docs would describe a list endpoint as taking nothing. */
+static void rg_params_add_paged(rg_params *ps, zan_ast_node_t *call) {
+    static const struct { const char *name, *type, *desc; } listed[] = {
+        { "page",  "int",    "页码，从 1 开始" },
+        { "limit", "int",    "每页条数" },
+        { "order", "string", "排序字段" },
+        { "dir",   "string", "排序方向：desc 或 asc" },
+        { "kw",    "string", "搜索关键词" },
+    };
+    char def_order[64] = "", def_limit[64] = "";
+    if (call->call.args.count >= 1)
+        rg_literal(call->call.args.items[0], def_order, sizeof(def_order));
+    if (call->call.args.count >= 2)
+        rg_literal(call->call.args.items[1], def_limit, sizeof(def_limit));
+
+    for (int i = 0; i < (int)(sizeof(listed) / sizeof(listed[0])); i++) {
+        if (ps->count >= (int)(sizeof(ps->items) / sizeof(ps->items[0]))) return;
+        bool seen = false;
+        for (int j = 0; j < ps->count; j++)
+            if (strcmp(ps->items[j].name, listed[i].name) == 0) seen = true;
+        if (seen) continue;   /* an explicit read of the same name wins */
+        rg_param *p = &ps->items[ps->count++];
+        memset(p, 0, sizeof(*p));
+        snprintf(p->name, sizeof(p->name), "%s", listed[i].name);
+        p->type = listed[i].type;
+        p->required = false;
+        p->where = "query";
+        snprintf(p->desc, sizeof(p->desc), "%s", listed[i].desc);
+        if (strcmp(listed[i].name, "page") == 0)
+            snprintf(p->def, sizeof(p->def), "1");
+        else if (strcmp(listed[i].name, "limit") == 0)
+            snprintf(p->def, sizeof(p->def), "%s", def_limit);
+        else if (strcmp(listed[i].name, "order") == 0)
+            snprintf(p->def, sizeof(p->def), "%s", def_order);
+        else if (strcmp(listed[i].name, "dir") == 0)
+            snprintf(p->def, sizeof(p->def), "desc");
+    }
+}
+
 static void rg_scan(zan_ast_node_t *n, rg_params *ps);
 
 static void rg_scan_list(zan_ast_list_t *l, rg_params *ps) {
@@ -629,6 +693,8 @@ static void rg_scan(zan_ast_node_t *n, rg_params *ps) {
             rg_is_input_receiver(callee->member.object)) {
             const rg_reader *rd = rg_reader_for(callee->member.name);
             if (rd) rg_params_add(ps, rd, n);
+            else if (istr_is(callee->member.name, "Paged"))
+                rg_params_add_paged(ps, n);
         }
         rg_scan(callee, ps);
         rg_scan_list(&n->call.args, ps);
@@ -756,45 +822,38 @@ static void rg_emit_params(rg_buf_t *out, rg_params *ps) {
 
 /* ---- fluent metadata emission ---- */
 
-static void emit_fluent(rg_buf_t *out, rg_meta *m, const char *title,
-                        const char *module) {
+static void emit_fluent(rg_buf_t *out, rg_meta *m, const char *title) {
     if (title && title[0]) { rg_putf(out, ".Title(\""); rg_put_qstr(out, title); rg_putf(out, "\")"); }
 
     rg_ent *e;
-    /* Authorization enum -> login/auth enforcement */
+    /* Authorization enum -> what the dispatcher demands before the action runs.
+     * None and Auth demand nothing (the session is resolved for every request
+     * either way, so an Auth page can greet whoever is signed in); Login
+     * demands a session and nothing more; Grant -- ApiAuth for a token client
+     * -- demands a session AND the right to this route's action, which is the
+     * one thing a role is granted. Declaring Grant is therefore the whole of
+     * securing a screen. */
     e = meta_get(m, "Authorization");
     if (e && e->val.kind == 3) {
         if (strcmp(e->val.sval, "Login") == 0) rg_putf(out, ".Login()");
-        else if (strcmp(e->val.sval, "Auth") == 0) rg_putf(out, ".Login()");
+        else if (strcmp(e->val.sval, "Grant") == 0) rg_putf(out, ".Auth()");
         else if (strcmp(e->val.sval, "ApiAuth") == 0) rg_putf(out, ".Auth()");
     }
-    /* IsMenu -> surface in admin menu (boolean flag on the route). The sidebar
-     * section comes from MenuGroup, defaulting to the controller's module, so a
-     * menu entry needs no second declaration anywhere. */
+    /* IsMenu -> surface in admin menu (boolean flag on the route). Its text is
+     * the action's [Description] and its place in the sidebar is its URL, so the
+     * flag is the whole declaration -- there is no group or rank to emit. */
     e = meta_get(m, "IsMenu");
-    if (e && e->val.kind == 1 && e->val.ival) {
-        rg_putf(out, ".Menu()");
-        rg_ent *g = meta_get(m, "MenuGroup");
-        const char *grp = (g && g->val.kind == 2 && g->val.sval[0])
-                              ? g->val.sval : module;
-        if (grp && grp[0]) {
-            rg_putf(out, ".Group(\"");
-            rg_put_qstr(out, grp);
-            rg_putf(out, "\")");
-        }
-    }
+    if (e && e->val.kind == 1 && e->val.ival) rg_putf(out, ".Menu()");
     /* optional route-only conventions (not part of the user attribute class):
-     * Lock -> per-request lock scope, Upload -> stream body to disk.  Rank /
-     * ApiMax / Component / Icon / ContentType are menu/response metadata and
-     * are carried faithfully via .Meta(...) below, NOT turned into auth gates. */
+     * Lock -> per-request lock scope, Upload -> stream body to disk.  ApiMax /
+     * Component / Icon / ContentType are menu/response metadata and are carried
+     * faithfully via .Meta(...) below, NOT turned into auth gates. */
     e = meta_get(m, "Lock");
     if (e && e->val.kind == 2 && e->val.sval[0]) {
         rg_putf(out, ".Lock(\""); rg_put_qstr(out, e->val.sval); rg_putf(out, "\")");
     }
     e = meta_get(m, "Upload");
     if (e && e->val.kind == 1 && e->val.ival) rg_putf(out, ".Upload()");
-    e = meta_get(m, "Rank");
-    if (e && e->val.kind == 0) rg_putf(out, ".Rank(%lld)", e->val.ival);
     e = meta_get(m, "ApiMax");
     if (e && e->val.kind == 0 && e->val.ival < 1000) {
         rg_ent *scope = meta_get(m, "RateBy");
@@ -829,6 +888,12 @@ void zan_routegen_run(zan_ast_node_t *unit, zan_arena_t *arena,
     rg_buf_t reg; memset(&reg, 0, sizeof(reg));
     int nroutes = 0;
 
+    /* A route action is named "<Controller>.<Action>" ("Users.Save"): that name
+     * is what the audit log records and what a role is granted, so it has to
+     * read like the screen it opens and stay stable when the class is renamed
+     * internally. Two controllers of the same name in different modules would
+     * collide, so those -- and only those -- carry their module
+     * ("Api.Index.Index" vs "Index.Index.Index"). */
     for (int i = 0; i < unit->comp_unit.decls.count; i++) {
         zan_ast_node_t *cls = unit->comp_unit.decls.items[i];
         if (cls->kind != AST_CLASS_DECL) continue;
@@ -838,6 +903,8 @@ void zan_routegen_run(zan_ast_node_t *unit, zan_arena_t *arena,
         char ctrltok[128]; controller_token(cls, ctrltok, sizeof(ctrltok));
         char cmod[128]; controller_module(cls, cmod, sizeof(cmod));
         char cdisp[128]; controller_display(cls, cdisp, sizeof(cdisp));
+        char cact[256]; controller_action_name(unit, cls, cdisp, cmod,
+                                              cact, sizeof(cact));
         char cls_tpl[256]; class_route_template(cls, cls_tpl, sizeof(cls_tpl));
         char cls_desc[256]; decl_description(cls, cls_desc, sizeof(cls_desc));
         bool api_controller = class_has_attr(cls, "ApiController");
@@ -935,9 +1002,9 @@ void zan_routegen_run(zan_ast_node_t *unit, zan_arena_t *arena,
             rg_putf(&reg, "        app.Map(\"%s\", \"", verb);
             rg_put_qstr(&reg, path);
             rg_putf(&reg, "\", __AttrRoutes.%s)\n            .Named(\"", hname);
-            rg_put_qstr(&reg, cname); rg_putf(&reg, "."); rg_put_qstr(&reg, mname);
+            rg_put_qstr(&reg, cact); rg_putf(&reg, "."); rg_put_qstr(&reg, mname);
             rg_putf(&reg, "\")");
-            emit_fluent(&reg, &meta, title, cmod);
+            emit_fluent(&reg, &meta, title);
             rg_params params_doc; params_doc.count = 0;
             rg_scan(m->method_decl.body, &params_doc);
             rg_params_from_path(&params_doc, path);

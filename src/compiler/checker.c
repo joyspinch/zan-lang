@@ -235,6 +235,88 @@ static zan_type_t *promote_numeric(zan_binder_t *b, zan_type_t *a, zan_type_t *b
     return b->type_int;
 }
 
+/* The member-access rules, taking the object's type as an argument instead of
+ * inferring it. A call on a chain (`app.Map(..).Named(..).Auth()`) needs the
+ * receiver's type twice -- once to decide whether it is a builtin scalar, once
+ * to resolve the member -- and computing it twice made every link double the
+ * work below it, so a fluent chain cost 2^links and a generated route table
+ * never finished checking at all. */
+static zan_type_t *check_member_access(zan_checker_t *c, zan_ast_node_t *expr,
+                                       zan_type_t *obj_type);
+
+/* How many arguments `m` accepts: [min..max], min counting the parameters
+ * without a default. Returns false when the count cannot be decided here --
+ * a variadic `params T[]` tail, or an extension method, whose receiver is a
+ * parameter of the declaration but not an argument of the call. */
+static bool method_arity(zan_symbol_t *m, int *min, int *max) {
+    if (!m->decl || m->decl->kind != AST_METHOD_DECL) return false;
+    zan_ast_list_t *ps = &m->decl->method_decl.params;
+    int lo = 0;
+    for (int i = 0; i < ps->count; i++) {
+        zan_ast_node_t *p = ps->items[i];
+        if (!p || p->kind != AST_PARAM) return false;
+        if (p->param.is_params || p->param.is_this) return false;
+        if (!p->param.default_val) lo++;
+    }
+    *min = lo;
+    *max = ps->count;
+    return true;
+}
+
+/* Reject a call that passes the wrong number of arguments. Without this the
+ * mismatch survived every source-level phase and only turned up as an LLVM
+ * verifier failure ("Incorrect number of arguments passed to called
+ * function"), which names a mangled symbol and no source line. Only method
+ * calls on a known type are judged, and only when the count fits no declared
+ * overload, so anything the checker cannot see (builtin scalar methods,
+ * delegates, compiler-lowered members) is left alone. */
+static void check_call_arity(zan_checker_t *c, zan_ast_node_t *call,
+                             zan_type_t *recv) {
+    zan_ast_node_t *callee = call->call.callee;
+    if (!callee || callee->kind != AST_MEMBER_ACCESS) return;
+    if (!recv || !recv->sym) return;
+    zan_istr_t name = callee->member.name;
+    int argc = call->call.args.count;
+    zan_compile_trace("arity? %.*s.%.*s argc=%d members=%d",
+                    (int)recv->sym->name.len, recv->sym->name.str,
+                    (int)name.len, name.str, argc, recv->sym->member_count);
+    int candidates = 0, want_min = 0, want_max = 0;
+    for (zan_symbol_t *s = recv->sym; s;
+         s = (s->type && s->type->base_type) ? s->type->base_type->sym : NULL) {
+        for (int i = 0; i < s->member_count; i++) {
+            zan_symbol_t *m = s->members[i];
+            int lo, hi;
+            if (!m || m->kind != SYM_METHOD || m->name.len != name.len ||
+                memcmp(m->name.str, name.str, (size_t)name.len) != 0)
+                continue;
+            if (!method_arity(m, &lo, &hi)) return;
+            if (argc >= lo && argc <= hi) return;
+            if (!candidates) { want_min = lo; want_max = hi; }
+            candidates++;
+        }
+    }
+    if (!candidates) return;
+    if (candidates > 1) {
+        zan_diag_emit(c->diag, DIAG_ERROR, call->loc,
+                      "no overload of '%.*s.%.*s' takes %d argument%s",
+                      (int)recv->sym->name.len, recv->sym->name.str,
+                      (int)name.len, name.str, argc, argc == 1 ? "" : "s");
+        return;
+    }
+    if (want_min == want_max) {
+        zan_diag_emit(c->diag, DIAG_ERROR, call->loc,
+                      "'%.*s.%.*s' takes %d argument%s, but %d given",
+                      (int)recv->sym->name.len, recv->sym->name.str,
+                      (int)name.len, name.str, want_min,
+                      want_min == 1 ? "" : "s", argc);
+        return;
+    }
+    zan_diag_emit(c->diag, DIAG_ERROR, call->loc,
+                  "'%.*s.%.*s' takes %d to %d arguments, but %d given",
+                  (int)recv->sym->name.len, recv->sym->name.str,
+                  (int)name.len, name.str, want_min, want_max, argc);
+}
+
 zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
     if (!expr) return c->binder->type_error;
 
@@ -364,16 +446,19 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
          * therefore skipped here — a bare (non-call) member access on a scalar
          * is still rejected in the AST_MEMBER_ACCESS case. */
         zan_type_t *callee_type;
-        if (expr->call.callee && expr->call.callee->kind == AST_MEMBER_ACCESS &&
-            type_is_scalar_primitive(
-                zan_checker_check_expr(c, expr->call.callee->member.object))) {
-            callee_type = c->binder->type_error;
+        zan_type_t *recv = NULL;
+        if (expr->call.callee && expr->call.callee->kind == AST_MEMBER_ACCESS) {
+            recv = zan_checker_check_expr(c, expr->call.callee->member.object);
+            callee_type = type_is_scalar_primitive(recv)
+                ? c->binder->type_error
+                : check_member_access(c, expr->call.callee, recv);
         } else {
             callee_type = zan_checker_check_expr(c, expr->call.callee);
         }
         for (int i = 0; i < expr->call.args.count; i++) {
             zan_checker_check_expr(c, expr->call.args.items[i]);
         }
+        check_call_arity(c, expr, recv);
         if (callee_type && callee_type->kind == TYPE_DELEGATE) {
             return callee_type->delegate_ret_type
                 ? callee_type->delegate_ret_type
@@ -418,67 +503,9 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
         return c->binder->type_string;
     }
 
-    case AST_MEMBER_ACCESS: {
-        zan_type_t *obj_type = zan_checker_check_expr(c, expr->member.object);
-        /* Static enum member access: EnumType.Member must be a declared member.
-         * A miss used to fall through to irgen, which silently folded the
-         * access to the constant 0 (masking stale references, e.g. a removed
-         * enum member). A member access on an enum *value* (`t.ToString()`) is
-         * a compiler-lowered method call resolved in irgen, so it is not
-         * validated here. */
-        if (obj_type && obj_type->kind == TYPE_ENUM && obj_type->sym &&
-            expr->member.object->kind == AST_IDENTIFIER) {
-            zan_symbol_t *os = zan_binder_lookup(c->binder,
-                                                 expr->member.object->ident.name);
-            if (os && os->kind == SYM_ENUM) {
-                int ei;
-                for (ei = 0; ei < obj_type->sym->member_count; ei++) {
-                    zan_symbol_t *m = obj_type->sym->members[ei];
-                    if (m->kind == SYM_ENUM_MEMBER &&
-                        m->name.len == expr->member.name.len &&
-                        memcmp(m->name.str, expr->member.name.str,
-                               (size_t)expr->member.name.len) == 0)
-                        break;
-                }
-                if (ei == obj_type->sym->member_count) {
-                    zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
-                                  "enum type '%.*s' has no member '%.*s'",
-                                  (int)obj_type->sym->name.len,
-                                  obj_type->sym->name.str,
-                                  (int)expr->member.name.len,
-                                  expr->member.name.str);
-                    return c->binder->type_error;
-                }
-            }
-        }
-        /* resolve field/method on known struct/class types */
-        if (obj_type && obj_type->sym) {
-            for (int i = 0; i < obj_type->sym->member_count; i++) {
-                zan_symbol_t *m = obj_type->sym->members[i];
-                if (m->name.len == expr->member.name.len &&
-                    memcmp(m->name.str, expr->member.name.str, m->name.len) == 0) {
-                    return m->type ? m->type : c->binder->type_error;
-                }
-            }
-        }
-        /* Builtin scalar types (string, int, ...) declare no fields; the only
-         * member they carry is the string.Length property (lowered by irgen).
-         * Anything else is a typo: it used to fall through to irgen, which
-         * silently lowered it to the constant 0 — a crash at runtime when the
-         * zero was used as a pointer (e.g. `tabs[i].path.path`). */
-        if (obj_type && type_is_scalar_primitive(obj_type)) {
-            if (obj_type->kind == TYPE_STRING && expr->member.name.len == 6 &&
-                memcmp(expr->member.name.str, "Length", 6) == 0) {
-                return c->binder->type_int;
-            }
-            zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
-                          "type '%.*s' has no member '%.*s'",
-                          (int)obj_type->name.len, obj_type->name.str,
-                          (int)expr->member.name.len, expr->member.name.str);
-            return c->binder->type_error;
-        }
-        return c->binder->type_error;
-    }
+    case AST_MEMBER_ACCESS:
+        return check_member_access(c, expr,
+                                   zan_checker_check_expr(c, expr->member.object));
 
     case AST_INDEX: {
         zan_type_t *obj = zan_checker_check_expr(c, expr->index.object);
@@ -544,6 +571,14 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
         return c->binder->type_error; /* lambda type resolved in M2 */
 
     case AST_THIS_EXPR:
+        /* `this` is the type whose body is being checked. Typing it here is
+         * what lets a call on it be validated (arity, and the member rules
+         * above); the member itself is still resolved in M2. */
+        if (c->current_type_sym && c->current_type_sym->type) {
+            return c->current_type_sym->type;
+        }
+        return c->binder->type_error;
+
     case AST_BASE_EXPR:
         return c->binder->type_error; /* resolved in M2 */
 
@@ -670,6 +705,71 @@ void zan_checker_check_stmt(zan_checker_t *c, zan_ast_node_t *stmt) {
 
 /* ---- check entire compilation unit ---- */
 
+
+/* See the forward declaration above: the receiver's type is computed by the
+ * caller so a fluent chain is checked once per link, not once per subchain. */
+static zan_type_t *check_member_access(zan_checker_t *c, zan_ast_node_t *expr,
+                                       zan_type_t *obj_type) {
+    /* Static enum member access: EnumType.Member must be a declared member.
+     * A miss used to fall through to irgen, which silently folded the
+     * access to the constant 0 (masking stale references, e.g. a removed
+     * enum member). A member access on an enum *value* (`t.ToString()`) is
+     * a compiler-lowered method call resolved in irgen, so it is not
+     * validated here. */
+    if (obj_type && obj_type->kind == TYPE_ENUM && obj_type->sym &&
+        expr->member.object->kind == AST_IDENTIFIER) {
+        zan_symbol_t *os = zan_binder_lookup(c->binder,
+                                             expr->member.object->ident.name);
+        if (os && os->kind == SYM_ENUM) {
+            int ei;
+            for (ei = 0; ei < obj_type->sym->member_count; ei++) {
+                zan_symbol_t *m = obj_type->sym->members[ei];
+                if (m->kind == SYM_ENUM_MEMBER &&
+                    m->name.len == expr->member.name.len &&
+                    memcmp(m->name.str, expr->member.name.str,
+                           (size_t)expr->member.name.len) == 0)
+                    break;
+            }
+            if (ei == obj_type->sym->member_count) {
+                zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
+                              "enum type '%.*s' has no member '%.*s'",
+                              (int)obj_type->sym->name.len,
+                              obj_type->sym->name.str,
+                              (int)expr->member.name.len,
+                              expr->member.name.str);
+                return c->binder->type_error;
+            }
+        }
+    }
+    /* resolve field/method on known struct/class types */
+    if (obj_type && obj_type->sym) {
+        for (int i = 0; i < obj_type->sym->member_count; i++) {
+            zan_symbol_t *m = obj_type->sym->members[i];
+            if (m->name.len == expr->member.name.len &&
+                memcmp(m->name.str, expr->member.name.str, m->name.len) == 0) {
+                return m->type ? m->type : c->binder->type_error;
+            }
+        }
+    }
+    /* Builtin scalar types (string, int, ...) declare no fields; the only
+     * member they carry is the string.Length property (lowered by irgen).
+     * Anything else is a typo: it used to fall through to irgen, which
+     * silently lowered it to the constant 0 — a crash at runtime when the
+     * zero was used as a pointer (e.g. `tabs[i].path.path`). */
+    if (obj_type && type_is_scalar_primitive(obj_type)) {
+        if (obj_type->kind == TYPE_STRING && expr->member.name.len == 6 &&
+            memcmp(expr->member.name.str, "Length", 6) == 0) {
+            return c->binder->type_int;
+        }
+        zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
+                      "type '%.*s' has no member '%.*s'",
+                      (int)obj_type->name.len, obj_type->name.str,
+                      (int)expr->member.name.len, expr->member.name.str);
+        return c->binder->type_error;
+    }
+    return c->binder->type_error;
+}
+
 static void check_method_body(zan_checker_t *c, zan_ast_node_t *method) {
     if (!method->method_decl.body) return;
 
@@ -702,6 +802,11 @@ void zan_checker_check(zan_checker_t *c, zan_ast_node_t *unit) {
             if (member->kind == AST_METHOD_DECL ||
                 member->kind == AST_CONSTRUCTOR_DECL ||
                 member->kind == AST_DESTRUCTOR_DECL) {
+                zan_compile_trace("check %.*s.%.*s",
+                                (int)decl->type_decl.name.len,
+                                decl->type_decl.name.str,
+                                (int)member->method_decl.name.len,
+                                member->method_decl.name.str);
                 check_method_body(c, member);
             }
         }

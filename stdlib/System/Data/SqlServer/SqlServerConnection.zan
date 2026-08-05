@@ -5,19 +5,19 @@ using System.Net.Sockets;
 namespace System.Data.SqlServer;
 
 /// <summary>
-/// Native, coroutine-ized SQL Server client speaking TDS 7.4 on the wire --
-/// no ODBC driver, no SNI, no native DLL. PRELOGIN, LOGIN7, SQL batches and
-/// sp_executesql RPCs are built by <see cref="TdsMessage"/> and every network
-/// step suspends on the IO reactor (<c>Socket.ConnectAsync</c> /
-/// <c>Socket.SendAsync</c> / <c>Socket.RecvOv</c>), so a query never blocks the
-/// worker thread and many connections progress on one thread.
+/// 原生、协程化的 SQL Server 客户端，线协议为 TDS 7.4——
+/// 无需 ODBC 驱动、SNI、原生 DLL。PRELOGIN、LOGIN7、SQL 批处理及
+/// sp_executesql RPC 都由 <see cref="TdsMessage"/> 构建，每步网络
+/// 操作都在 IO reactor 上挂起（<c>Socket.ConnectAsync</c> /
+/// <c>Socket.SendAsync</c> / <c>Socket.RecvOv</c>），因此查询从不阻塞
+/// 工作线程，多个连接可在单线程上并行推进。
 ///
-/// The login packet is sent in the clear: TDS scrambles the password field but
-/// that is obfuscation, not encryption, so a server with "force encryption" on
-/// will reject the login (its PRELOGIN answers ENCRYPT_REQ, which shows up as a
-/// connection error rather than a silent downgrade).
+/// 登录包以明文发送：TDS 会对密码字段做加扰，但
+/// 那只是混淆而非加密，因此开启了 “force encryption” 的服务器
+/// 会拒绝登录（其 PRELOGIN 应答 ENCRYPT_REQ，表现为
+/// 连接错误而非静默降级）。
 ///
-/// Usage:
+/// 用法：
 ///   SqlServerConnection db = await SqlServerConnection.OpenAsync(
 ///       "127.0.0.1", 1433, "master", "sa", "secret");
 ///   DbResult r = await db.QueryAsync("SELECT id, name FROM t WHERE id > ?",
@@ -28,7 +28,7 @@ class SqlServerConnection {
     nint sock;
     bool connected;
     string lastError;
-    int lastNumber;             // the server's own error number, 0 when none
+    int lastNumber;             // 服务器自身的错误号，无则为 0
     int lastAffected;
     string serverVersion;
     string database;
@@ -49,11 +49,11 @@ class SqlServerConnection {
     }
 
     // ============================================================
-    // Packet IO
+    // 报文 IO
     // ============================================================
 
-    /// <summary>Reads exactly <paramref name="need"/> bytes, suspending between
-    /// partial reads. Returns what it managed to read.</summary>
+    /// <summary>恰好读取 <paramref name="need"/> 字节，部分读取之间
+    /// 会挂起。返回实际读到的字节数。</summary>
     async int recvExact(byte[] dst, int off, int need) {
         int got = 0;
         byte[] tmp = new byte[need + 1];
@@ -70,8 +70,8 @@ class SqlServerConnection {
         return got;
     }
 
-    /// <summary>Sends a message, splitting it over as many packets as the
-    /// negotiated packet size needs; only the last one carries the EOM bit.</summary>
+    /// <summary>发送一条消息，按协商的包大小拆分成
+    /// 所需数量的包；只有最后一个包带 EOM 位。</summary>
     async bool sendMessage(int type, TdsBytes payload) {
         int max = this.packetSize - TdsPacket.HEADER_LEN;
         int off = 0;
@@ -100,9 +100,9 @@ class SqlServerConnection {
         return true;
     }
 
-    /// <summary>Reads one whole response message: packets are concatenated until
-    /// the server marks end of message, because a token can straddle the
-    /// boundary between two of them.</summary>
+    /// <summary>读取一整条响应消息：不断拼接数据包，直到
+    /// 服务器标记消息结束，因为令牌可能跨越
+    /// 两个数据包的边界。</summary>
     async TdsBytes recvMessage() {
         TdsBuf body = new TdsBuf();
         bool more = true;
@@ -137,10 +137,10 @@ class SqlServerConnection {
     }
 
     // ============================================================
-    // Connect and login
+    // 连接与登录
     // ============================================================
 
-    /// <summary>Opens a connection and logs in with SQL Server authentication.</summary>
+    /// <summary>打开连接并使用 SQL Server 认证方式登录。</summary>
     static async SqlServerConnection OpenAsync(string host, int port,
             string database, string user, string password) {
         Socket.Initialize();
@@ -168,9 +168,9 @@ class SqlServerConnection {
             return false;
         }
 
-        // PRELOGIN. Declaring ENCRYPT_NOT_SUP keeps the exchange in the clear;
-        // a server that requires TLS answers ENCRYPT_REQ and is refused here
-        // instead of failing later with an opaque login error.
+        // PRELOGIN。声明 ENCRYPT_NOT_SUP 可使交换保持明文；
+        // 要求 TLS 的服务器会应答 ENCRYPT_REQ，并在这一步被拒绝，
+        // 而不是稍后报出晦涩的登录错误。
         TdsBytes preloginMsg = TdsMessage.Prelogin(2);
         bool sent = await this.sendMessage(TdsPacket.PRELOGIN, preloginMsg);
         preloginMsg.Release();
@@ -206,7 +206,7 @@ class SqlServerConnection {
     }
 
     // ============================================================
-    // Statements
+    // 语句
     // ============================================================
 
     async TdsResponse roundTrip(int type, TdsBytes payload) {
@@ -238,10 +238,10 @@ class SqlServerConnection {
         return resp;
     }
 
-    /// <summary>Runs a statement batch and returns its result set. Throws
-    /// <see cref="DbException"/> when the server rejects the batch, so an empty
-    /// result always means "no rows"; <see cref="GetError"/> still carries the
-    /// message for a caller that prefers to inspect it.</summary>
+    /// <summary>运行语句批处理并返回结果集。当服务器拒绝批处理时抛出
+    /// <see cref="DbException"/>。因此空
+    /// 结果总表示“无行”；<see cref="GetError"/> 仍会携带
+    /// 错误消息，供偏好自行检查的调用方查看。</summary>
     async DbResult QueryAsync(string sql) {
         TdsResponse resp = await this.roundTrip(TdsPacket.SQLBATCH,
                                                 TdsMessage.SqlBatch(sql));
@@ -249,9 +249,9 @@ class SqlServerConnection {
         return resp.Rows();
     }
 
-    /// <summary>Runs a parameterized query through sp_executesql. Placeholders
-    /// are `?`, rewritten to the @P1.. names the server expects; values travel
-    /// out of band, so nothing is escaped into the statement text.</summary>
+    /// <summary>通过 sp_executesql 运行参数化查询。占位符
+    /// 为 `?`，会被改写为服务器期望的 @P1.. 名称；值
+    /// 带外传输，因此无需向语句文本中做任何转义。</summary>
     async DbResult QueryAsync(string sql, DbParams prms) {
         string text = SqlServerConnection.Renumber(sql, prms.Count());
         if (text.Length == 0 && sql.Length > 0) {
@@ -264,8 +264,8 @@ class SqlServerConnection {
         return resp.Rows();
     }
 
-    /// <summary>Runs a statement and returns the affected row count. Throws
-    /// <see cref="DbException"/> when the server rejects it.</summary>
+    /// <summary>执行一条语句并返回受影响的行数。服务器拒绝时抛出
+    /// <see cref="DbException"/>。</summary>
     async int ExecuteAsync(string sql) {
         TdsResponse resp = await this.roundTrip(TdsPacket.SQLBATCH,
                                                 TdsMessage.SqlBatch(sql));
@@ -273,7 +273,7 @@ class SqlServerConnection {
         return resp.Affected();
     }
 
-    /// <summary>Parameterized statement.</summary>
+    /// <summary>带参数的语句。</summary>
     async int ExecuteAsync(string sql, DbParams prms) {
         string text = SqlServerConnection.Renumber(sql, prms.Count());
         if (text.Length == 0 && sql.Length > 0) {
@@ -286,8 +286,8 @@ class SqlServerConnection {
         return resp.Affected();
     }
 
-    /// <summary>Raises the recorded failure, so the server's own message
-    /// reaches the caller instead of an empty result.</summary>
+    /// <summary>抛出已记录的错误，使服务器自身的消息
+    /// 能到达调用方，而不是返回空结果。</summary>
     void fail() {
         string why = this.lastError;
         if (why.Length == 0) {
@@ -296,21 +296,21 @@ class SqlServerConnection {
         throw new DbException(why, this.lastNumber, DbProvider.SqlServer);
     }
 
-    /// <summary>First column of the first row, or "" when there are no rows.</summary>
+    /// <summary>第一行第一列的值，无行时返回 ""。</summary>
     async string ExecuteScalarAsync(string sql) {
         DbResult r = await this.QueryAsync(sql);
         if (r.RowCount() == 0) { return ""; }
         return r.GetString(0, 0);
     }
 
-    /// <summary>Rewrites `?` placeholders to @P1, @P2 ... leaving anything
-    /// inside string literals, quoted identifiers or brackets alone. Returns ""
-    /// when the count does not match.</summary>
+    /// <summary>将 `?` 占位符重写为 @P1、@P2 ……，
+    /// 字符串字面量、带引号的标识符或括号内的内容原样保留。数量不匹配时返回 ""
+    /// 。</summary>
     static string Renumber(string sql, int count) {
         StringBuilder outp = new StringBuilder();
         int i = 0;
         int n = 0;
-        int quote = 0;              // 0 none, 1 ', 2 ", 3 [
+        int quote = 0;              // 0 无，1 '，2 ", 3 [
         while (i < sql.Length) {
             string ch = sql.Substring(i, 1);
             if (quote == 0) {
@@ -339,19 +339,19 @@ class SqlServerConnection {
     }
 
     // ============================================================
-    // State
+    // 状态
     // ============================================================
 
-    /// <summary>Rows affected by the last statement.</summary>
+    /// <summary>上一条语句影响的行数。</summary>
     int AffectedRows() { return this.lastAffected; }
 
-    /// <summary>Description of the last failure, or "".</summary>
+    /// <summary>上一次失败的错误描述，无则为 ""。</summary>
     string GetError() { return this.lastError; }
 
-    /// <summary>Server version reported by LOGINACK, e.g. "16.0.1000".</summary>
+    /// <summary>LOGINACK 报告的服务器版本，如 "16.0.1000"。</summary>
     string ServerVersion() { return this.serverVersion; }
 
-    /// <summary>Database the session is bound to.</summary>
+    /// <summary>会话所绑定的数据库。</summary>
     string Database() { return this.database; }
 
     bool IsConnected() { return this.connected; }

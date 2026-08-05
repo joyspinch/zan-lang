@@ -20,6 +20,12 @@ typedef struct {
     int          frame_index;
 } zan_async_slot_t;
 
+/* Depth at which expression inference is treated as non-terminating. Inference
+ * re-enters itself through member access and overload scoring, so a cycle or a
+ * pathological nesting used to spin the compiler with no output at all; past
+ * this it reports where it gave up instead. Real code nests far below it. */
+#define ZAN_MAX_INFER_DEPTH 256
+
 /* Nesting depth of catch bodies a single function body may be inside. */
 #define ZAN_MAX_CATCH_DEPTH 16
 

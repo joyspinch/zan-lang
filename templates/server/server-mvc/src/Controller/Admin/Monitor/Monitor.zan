@@ -1,0 +1,277 @@
+﻿using System;
+using System.Json;
+using System.Text;
+using System.Web;
+using ZanWeb;
+
+namespace ZanWeb.Admin.Monitor;
+
+/// <summary>
+/// Server monitoring at /admin/monitor: throughput, errors, latency, queries,
+/// CPU and memory as charts.
+///
+/// The page subscribes to /admin/monitor/stream ONCE and the server pushes a
+/// snapshot every couple of seconds (Server-Sent Events). Polling would mean a
+/// full request -- routing, auth resolution, a log line -- per tick per open
+/// tab, to answer "has anything changed"; a stream costs one connection and
+/// sends only when there is something to send. A comment line goes out between
+/// snapshots so an idle proxy does not decide the connection is dead.
+/// </summary>
+[Route("admin/monitor/[action]")]
+[Custom(Authorization = CustomAuthorization.Grant)]
+[Description("运行监控")]
+class Monitor : AdminController {
+    /// <summary>How long a stream lives before the browser is asked to
+    /// reconnect. Bounded on purpose: a tab left open overnight should not hold
+    /// a coroutine forever, and EventSource reconnects on its own.</summary>
+    static int StreamSeconds = 1800;
+
+    [HttpGet]
+    [Route("/admin/monitor")]
+    [Custom(IsMenu = true, Icon = "mdi:chart-line")]
+    [Description("运行监控")]
+    async void Index() {
+        ViewData d = await this.Layout("运行监控");
+        JsonValue m = JsonValue.ParseLenient(WebHost.Current().MetricsJson());
+        JsonValue req = m.Get("requests");
+        if (req == null) { req = JsonValue.NewObject(); }
+        d.Set("pid", Convert.ToString(m.Long("pid", 0)));
+        d.Set("worker", Convert.ToString(m.Long("worker_id", 0)));
+        d.Set("uptime", Fmt.Uptime(m.Long("uptime_ms", 0)));
+        d.Set("slowMs", Convert.ToString(req.Long("slow_threshold_ms", 0)));
+        this.Page(d);
+    }
+
+    /// <summary>The live snapshot stream. Not a menu entry: the monitor page is
+    /// its user interface.</summary>
+    [HttpGet]
+    [Description("运行指标事件流")]
+    async void Stream() {
+        HttpContext ctx = this.Ctx();
+        if (!await ctx.SseOpen()) { return; }
+
+        WebApp app = WebHost.Current();
+        // The first frame carries the recent history so the charts are drawn
+        // full rather than filling up over the next two minutes.
+        if (!await ctx.SseSend("series", app.MetricsSeriesJson(120))) { return; }
+
+        int elapsed = 0;
+        int sinceSeries = 0;
+        while (elapsed < Monitor.StreamSeconds) {
+            await Task.Delay(2000);
+            elapsed = elapsed + 2;
+            sinceSeries = sinceSeries + 2;
+            if (!await ctx.SseSend("metrics", app.MetricsJson())) { return; }
+            if (sinceSeries >= 10) {
+                sinceSeries = 0;
+                if (!await ctx.SseSend("series", app.MetricsSeriesJson(120))) {
+                    return;
+                }
+            }
+        }
+    }
+
+    /// <summary>The same snapshot as one request, for tooling that is not a
+    /// browser.</summary>
+    [HttpGet]
+    [Description("运行指标快照")]
+    async void Snapshot() {
+        this.Json(WebHost.Current().MetricsJson());
+    }
+
+    [HttpGet]
+    [Description("运行指标时序")]
+    async void Series() {
+        this.Json(WebHost.Current().MetricsSeriesJson(this.InInt("sec", 120)));
+    }
+
+    /// <summary>The history the live stream cannot show: per-minute, per-route
+    /// counters from metrics.db, which outlive the worker and the in-memory
+    /// ring.</summary>
+    [HttpGet]
+    [Route("/admin/monitor/history")]
+    [Custom(IsMenu = true, Icon = "mdi:chart-timeline-variant")]
+    [Description("历史统计")]
+    async void History() {
+        ViewData d = await this.Layout("历史统计");
+        int hours = Monitor.Hours(this.InInt("h", 6));
+        string route = this.In("route");
+        long to = (long)WebApp.NowSeconds();
+        long from = to - (long)hours * 3600;
+
+        // The window is flushed first, so "the last hour" includes the minute
+        // that is still being filled instead of stopping ten minutes short.
+        int _w = await MetricsStore.Flush();
+        List<MetricMinute> rows = await MetricsStore.History(from, to, route,
+            Monitor.MaxRows);
+        List<StrMap> items = d.AddList("rows");
+        long calls = 0;
+        long errors = 0;
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            MetricMinute b = rows[i];
+            calls = calls + b.calls;
+            errors = errors + b.errors;
+            StrMap r = new StrMap();
+            r.Set("minute", Fmt.Stamp(b.minute));
+            r.Set("route", b.route);
+            r.Set("calls", Convert.ToString(b.calls));
+            r.Set("errors", Convert.ToString(b.errors));
+            r.Set("avgMs", Convert.ToString(Monitor.Avg(b.totalMs, b.calls)));
+            r.Set("maxMs", Convert.ToString(b.maxMs));
+            r.Set("frames", Convert.ToString(b.frames));
+            r.Set("bytes", Fmt.Bytes(b.bytes));
+            items.Add(r);
+        }
+        d.Set("hours", Convert.ToString(hours));
+        d.Set("route", route);
+        d.Set("calls", Convert.ToString(calls));
+        d.Set("errors", Convert.ToString(errors));
+        d.Set("shown", Convert.ToString(rows.Count));
+        if (rows.Count == 0) { d.Set("empty", "1"); }
+        if (rows.Count >= Monitor.MaxRows) { d.Set("capped", "1"); }
+        this.Page(d);
+    }
+
+    /// <summary>The same window as a file. Bounded by the same row cap as the
+    /// screen, so an export cannot be used to pull the whole database in one
+    /// request.</summary>
+    [HttpGet]
+    [Description("导出历史统计")]
+    async void Export() {
+        int hours = Monitor.Hours(this.InInt("h", 6));
+        string route = this.In("route");
+        long to = (long)WebApp.NowSeconds();
+        long from = to - (long)hours * 3600;
+        int _w = await MetricsStore.Flush();
+        List<MetricMinute> rows = await MetricsStore.History(from, to, route,
+            Monitor.MaxRows);
+
+        if (this.In("format") == "json") {
+            MetricsExportDoc doc = new MetricsExportDoc();
+            doc.from = from;
+            doc.to = to;
+            doc.rows = new List<MetricsRowDoc>();
+            for (int i = 0; i < rows.Count; i = i + 1) {
+                MetricMinute b = rows[i];
+                MetricsRowDoc o = new MetricsRowDoc();
+                o.minute = b.minute;
+                o.route = b.route;
+                o.calls = b.calls;
+                o.errors = b.errors;
+                o.avg_ms = Monitor.Avg(b.totalMs, b.calls);
+                o.max_ms = b.maxMs;
+                o.frames = b.frames;
+                o.bytes = b.bytes;
+                doc.rows.Add(o);
+            }
+            this.Ctx().Download("metrics.json", "application/json",
+                Json.Serialize<MetricsExportDoc>(doc));
+            return;
+        }
+
+        StringBuilder sb = new StringBuilder();
+        sb.Append("minute,route,calls,errors,avg_ms,max_ms,frames,bytes\n");
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            MetricMinute b = rows[i];
+            sb.Append(Convert.ToString(b.minute));
+            sb.Append(",");
+            sb.Append(Monitor.Cell(b.route));
+            sb.Append(",");
+            sb.Append(Convert.ToString(b.calls));
+            sb.Append(",");
+            sb.Append(Convert.ToString(b.errors));
+            sb.Append(",");
+            sb.Append(Convert.ToString(Monitor.Avg(b.totalMs, b.calls)));
+            sb.Append(",");
+            sb.Append(Convert.ToString(b.maxMs));
+            sb.Append(",");
+            sb.Append(Convert.ToString(b.frames));
+            sb.Append(",");
+            sb.Append(Convert.ToString(b.bytes));
+            sb.Append("\n");
+        }
+        this.Ctx().Download("metrics.csv", "text/csv; charset=utf-8",
+            sb.ToString());
+    }
+
+    /// <summary>Every error the server caught, as persisted by the sink the
+    /// dispatcher feeds. Details are redacted before they are stored, so this
+    /// screen shows no keys, tokens or passwords.</summary>
+    [HttpGet]
+    [Route("/admin/monitor/errors")]
+    [Custom(IsMenu = true, Icon = "mdi:alert-circle-outline")]
+    [Description("错误日志")]
+    async void Errors() {
+        ViewData d = await this.Layout("错误日志");
+        int hours = Monitor.Hours(this.InInt("h", 24));
+        long to = (long)WebApp.NowSeconds();
+        long from = to - (long)hours * 3600;
+        int _w = await MetricsStore.Flush();
+        List<MetricError> rows = await MetricsStore.Errors(from, to,
+            Monitor.MaxRows);
+        List<StrMap> items = d.AddList("rows");
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            MetricError e = rows[i];
+            StrMap r = new StrMap();
+            r.Set("id", Convert.ToString(e.id));
+            r.Set("ts", Fmt.Stamp(e.ts));
+            r.Set("origin", e.origin);
+            r.Set("detail", e.detail);
+            items.Add(r);
+        }
+        d.Set("hours", Convert.ToString(hours));
+        d.Set("shown", Convert.ToString(rows.Count));
+        if (rows.Count == 0) { d.Set("empty", "1"); }
+        this.Page(d);
+    }
+
+    /// <summary>The largest window and page an export or screen may ask for.
+    /// A query string is not allowed to decide how much of the database one
+    /// request reads.</summary>
+    static int MaxRows = 5000;
+    static int MaxHours = 720;
+
+    static int Hours(int h) {
+        if (h < 1) { return 1; }
+        if (h > Monitor.MaxHours) { return Monitor.MaxHours; }
+        return h;
+    }
+
+    static long Avg(long totalMs, long calls) {
+        if (calls <= 0) { return 0; }
+        return totalMs / calls;
+    }
+
+    /// <summary>A CSV cell: quoted, with embedded quotes doubled, so a route
+    /// name can never break the column layout.</summary>
+    static string Cell(string v) {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("\"");
+        for (int i = 0; i < v.Length; i = i + 1) {
+            string ch = v.Substring(i, 1);
+            if ((v[i] & 255) == 34) { sb.Append("\""); }
+            sb.Append(ch);
+        }
+        sb.Append("\"");
+        return sb.ToString();
+    }
+}
+
+/// <summary>What an export answers with: the window and its rows, serialized by
+/// the JSON writer rather than assembled as text.</summary>
+class MetricsRowDoc {
+    long minute;
+    string route;
+    long calls;
+    long errors;
+    long avg_ms;
+    long max_ms;
+    long frames;
+    long bytes;
+}
+
+class MetricsExportDoc {
+    long from;
+    long to;
+    List<MetricsRowDoc> rows;
+}

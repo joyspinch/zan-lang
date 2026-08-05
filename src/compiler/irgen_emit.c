@@ -1194,6 +1194,11 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
     for (int w = 0; w < work_count; w++) {
         zan_ast_node_t *member = work[w].member;
         zan_symbol_t *type_sym = work[w].type_sym;
+        zan_compile_trace("emit %.*s.%.*s",
+                        type_sym ? (int)type_sym->name.len : 1,
+                        type_sym ? type_sym->name.str : "?",
+                        (int)member->method_decl.name.len,
+                        member->method_decl.name.str);
         LLVMValueRef fn = work[w].fn;
         LLVMTypeRef *param_types = work[w].param_types;
         int param_count = work[w].param_count;
