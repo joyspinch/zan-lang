@@ -713,12 +713,6 @@ partial class ZanIDE {
         items.Add(NewsItem.Create(
             ZanIDE.T("Browse the built-in examples (right panel)", "浏览内置示例（右侧“示例”页签）"),
             ZanIDE.T("Sample", "示例"), "primary", "@docs"));
-        items.Add(NewsItem.Create(
-            ZanIDE.T("zan-lang on GitHub: source, issues and releases", "GitHub 仓库 zan-lang：源码与发布"),
-            ZanIDE.T("Open source", "开源"), "warning", "https://github.com/joyspinch/zan-lang"));
-        items.Add(NewsItem.Create(
-            ZanIDE.T("Report a problem or request a feature", "提交问题或功能建议"),
-            ZanIDE.T("Feedback", "反馈"), "info", "https://github.com/joyspinch/zan-lang/issues"));
         return items;
     }
 
@@ -903,6 +897,14 @@ partial class ZanIDE {
         dock.SetTip("structure", ZanIDE.T(
             "Types and members of the active file; the component tree in the designer.",
             "当前文件的类型与成员；设计器中为组件树。"));
+        dock.SetTitle("toolbox", ZanIDE.T("TOOLBOX", "工具箱"));
+        dock.SetIcon("toolbox", "layout");
+        dock.SetTip("toolbox", ZanIDE.T("The active designer's component palette.",
+            "当前设计器的组件面板。"));
+        dock.SetTitle("props", ZanIDE.T("PROPERTIES", "属性"));
+        dock.SetIcon("props", "settings");
+        dock.SetTip("props", ZanIDE.T("The active designer's property inspector.",
+            "当前设计器的属性面板。"));
         dock.SetTitle("stdlib", ZanIDE.T("STDLIB", "标准库"));
         dock.SetIcon("stdlib", "code");
         dock.SetTip("stdlib", ZanIDE.T("Browse the standard library by namespace.",
@@ -1131,7 +1133,15 @@ partial class ZanIDE {
     /// live together under <BaseDir>/toolchain, and zanc finds its linker next to
     /// itself in that same folder.
     static string ToolchainDir() { return ZanIDE.BaseDir() + "/toolchain"; }
-    static string StdlibDir() { return ZanIDE.BaseDir() + "/stdlib"; }
+    /// 已发布的安装目录里 stdlib 就在 exe 旁边；从构建树跑（build\ZanIDE.exe）
+    /// 时它在上一层。找不到就退回默认路径，让 zanc 自己报错。
+    static string StdlibDir() {
+        string a = ZanIDE.BaseDir() + "/stdlib";
+        if (Directory.Exists(a)) { return a; }
+        string b = ZanIDE.BaseDir() + "/../stdlib";
+        if (Directory.Exists(b)) { return b; }
+        return a;
+    }
 
     /// The IDE's own stylesheet (page layout): shipped next to the executable,
     /// or read from the source tree when running from a dev build. Empty when
@@ -2381,6 +2391,10 @@ partial class ZanIDE {
                             formDesigner.SetBindVars(new List<string>());
                         }
                     }
+                    // 先画宿主 dock 里的组件/属性面板：设计器据此知道
+                    // 左右两栏归宿主管，本体这一帧只排功能区 + 画布。
+                    formDesigner.RenderHostPanels(app, dock.ContentParked("toolbox"),
+                        dock.ContentParked("props"));
                     formDesigner.Render(app, edRect.x, edRect.y, edRect.width, edRect.height);
                     // Persist design changes to the .zform file - the single
                     // source of truth (zanc projects typed fields + Main from
@@ -2434,6 +2448,10 @@ partial class ZanIDE {
                         sceneCache = sceneDesigner.SaveJson();
                     }
                     SceneDesigner.assetsDir = ZanIDE.AssetsDir(root);
+                    // 先画宿主 dock 里的组件/属性面板：设计器据此知道
+                    // 左右两栏归宿主管，本体这一帧只排功能区 + 画布。
+                    sceneDesigner.RenderHostPanels(app, dock.ContentParked("toolbox"),
+                        dock.ContentParked("props"));
                     sceneDesigner.Render(app, edRect.x, edRect.y, edRect.width, edRect.height);
                     // Persist design changes to the .zscene file.
                     string snewser = sceneDesigner.SaveJson();
@@ -4040,17 +4058,17 @@ partial class ZanIDE {
                                 }
                             }
                         } else if (!File.Exists(buildExe)) {
+                            // 构建失败只报错：把「错误」面板顶到前面，
+                            // 绝不擅自弹别的窗口（缺库只给一行提示）。
                             string missingPackage = ZanIDE.MissingPackage(bout);
                             if (missingPackage != "") {
-                                marketplaceRetryBuild = true;
-                                if (marketplaceWin == null || !marketplaceWin.IsOpen()) {
-                                    marketplaceWin = MarketplaceWindow.Open(app, ZanIDE.uiLang);
-                                }
-                                marketplaceWin.Locate(missingPackage);
-                                log.Add(ZanIDE.T("> Missing package; opened extensions: ",
-                                    "> 缺少库，已打开扩展：") + missingPackage);
+                                log.Add(ZanIDE.T("> Missing package: ",
+                                    "> 缺少库：") + missingPackage
+                                    + ZanIDE.T(" (install it from Extensions)",
+                                        "（可到「扩展」里安装）"));
                             }
                             log.Add(ZanIDE.T("> Build failed; not run.", "> 构建失败，未运行。"));
+                            dock.Focus("errors");
                         } else if (buildThenRun) {
                             // The program starts in the project root, not in the
                             // IDE's own directory, so its relative paths (an
@@ -5193,12 +5211,16 @@ partial class ZanIDE {
         dock.Register("explorer", "", DockSide.Left(), true, true);
         dock.Register("structure", "", DockSide.Left(), true, true);
         dock.Register("stdlib", "", DockSide.Left(), true, true);
+        // 设计器的组件面板和属性面板是 IDE 自己的 dock 面板，
+        // 不再占用设计器画布两侧的位置：设计器里只剩功能区 + 画布。
+        dock.Register("toolbox", "", DockSide.Left(), true, false);
         dock.RegisterFixed("editor", "Editor");
         // The assistant column and the bottom band each start as one tab group.
         dock.Register("ai", "", DockSide.Right(), true, true);
         dock.Register("tools", "", DockSide.Right(), true, false);
         dock.Register("examples", "", DockSide.Right(), true, false);
         dock.Register("git", "", DockSide.Right(), true, false);
+        dock.Register("props", "", DockSide.Right(), true, false);
         dock.Register("output", "", DockSide.Bottom(), true, true);
         dock.Register("errors", "", DockSide.Bottom(), true, false);
         dock.Register("help", "", DockSide.Bottom(), true, false);

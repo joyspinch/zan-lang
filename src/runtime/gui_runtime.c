@@ -712,7 +712,8 @@ static void zan_blur_rect_core(i32 surface_id, i32 x, i32 y, i32 w, i32 h, i32 r
                 int rC = clamp_i((int)((px >> 16) & 0xFF) + nz, 0, 255);
                 int gC = clamp_i((int)((px >> 8) & 0xFF) + nz, 0, 255);
                 int bC = clamp_i((int)(px & 0xFF) + nz, 0, 255);
-                if (cr <= 0 || zan_round_in(i, j, rw, rh, cr, cmask))
+                if ((cr <= 0 || zan_round_in(i, j, rw, rh, cr, cmask))
+                    && !clipped_out(s, x0 + i, y0 + j))
                     row[i] = 0xFF000000u | ((u32)rC << 16) | ((u32)gC << 8) | (u32)bC;
             }
         }
@@ -750,7 +751,8 @@ static void zan_blur_rect_core(i32 surface_id, i32 x, i32 y, i32 w, i32 h, i32 r
                 rC = clamp_i(rC + nz, 0, 255);
                 gC = clamp_i(gC + nz, 0, 255);
                 bC = clamp_i(bC + nz, 0, 255);
-                if (cr <= 0 || zan_round_in(i, j, rw, rh, cr, cmask))
+                if ((cr <= 0 || zan_round_in(i, j, rw, rh, cr, cmask))
+                    && !clipped_out(s, x0 + i, y0 + j))
                     row[i] = 0xFF000000u | ((u32)rC << 16) | ((u32)gC << 8) | (u32)bC;
             }
         }
@@ -816,7 +818,8 @@ static void zan_blur_cached_core(
             u32 *row = s->pixels + (y0 + j) * s->stride + x0;
             u32 *src = c->pixels + (size_t)j * rw;
             for (int i = 0; i < rw; i++)
-                if (cr <= 0 || zan_round_in(i, j, rw, rh, cr, cmask))
+                if ((cr <= 0 || zan_round_in(i, j, rw, rh, cr, cmask))
+                    && !clipped_out(s, x0 + i, y0 + j))
                     row[i] = src[i];
         }
         return;

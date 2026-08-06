@@ -253,6 +253,62 @@ class Ribbon {
 
     /// 分组命令条带本体，标签式和无标签式功能区共用。
     /// `rows` 是一列里堆叠多少个小命令。
+    /// 一组小命令的列宽：组内最宽的标签说了算，这样每列的
+    /// 图标和文字都对齐，长标签也不会被邻列压住。
+    static int SmallColW(App app, RibbonGroup grp) {
+        Theme t = app.theme;
+        int smallW = app.Scale(72);
+        for (int m = 0; m < grp.items.Count; m = m + 1) {
+            RibbonItem mi = grp.items[m];
+            if (mi.tile || !mi.small) { continue; }
+            int mw = Canvas.MeasureText(mi.label, t.fontSizeSmall)
+                + t.iconSizeSmall + app.Scale(22);
+            if (mi.menu) { mw = mw + app.Scale(10); }
+            if (mw > smallW) { smallW = mw; }
+        }
+        return smallW;
+    }
+
+    /// 条带排完所有分组需要多宽（和 Band 里的列游标算法一致，
+    /// 只量不画）。宿主给的宽度不够时据此收缩排布。
+    static int BandWidth(App app, List<RibbonGroup> groups, int bh, int rows) {
+        Theme t = app.theme;
+        if (rows < 1) { rows = 1; }
+        int titleH = app.Scale(16);
+        int contentH = bh - titleH - t.paddingSmall * 2;
+        int rowH = contentH / rows;
+        int tileW = rowH;
+        int cx = t.paddingSmall;
+        for (int g = 0; g < groups.Count; g = g + 1) {
+            RibbonGroup grp = groups[g];
+            int smallW = Ribbon.SmallColW(app, grp);
+            int sIdx = 0;
+            int curKind = 0 - 1;
+            int curW = 0;
+            for (int j = 0; j < grp.items.Count; j = j + 1) {
+                RibbonItem it = grp.items[j];
+                int kind = 0;
+                if (it.tile) { kind = 2; }
+                else if (it.small) { kind = 1; }
+                if (kind != curKind && sIdx % rows != 0) { cx = cx + curW; sIdx = 0; }
+                curKind = kind;
+                if (kind == 0) {
+                    if (sIdx % rows != 0) { cx = cx + curW; sIdx = 0; }
+                    cx = cx + app.Scale(64);
+                } else {
+                    int colW = smallW;
+                    if (kind == 2) { colW = tileW; }
+                    curW = colW;
+                    sIdx = sIdx + 1;
+                    if (sIdx % rows == 0) { cx = cx + colW; }
+                }
+            }
+            if (sIdx % rows != 0) { cx = cx + curW; }
+            cx = cx + t.paddingSmall * 2 + 1;
+        }
+        return cx + t.paddingSmall;
+    }
+
     static int Band(App app, int x, int by, int w, int bh, List<RibbonGroup> groups,
                     int firstId, int rows) {
         Canvas c = app.canvas;
@@ -260,6 +316,20 @@ class Ribbon {
         if (rows < 1) { rows = 1; }
         c.FillRect(x, by, w, bh, t.bgSecondary);
         c.FillRect(x, by + bh - 1, w, 1, t.divider);
+
+        // 宿主给的宽度放不下时先把带文字的命令收成纯图标格
+        // （标签退到提示气泡里），再不够就裁掉——命令绝不
+        // 画到条带外面去。
+        if (Ribbon.BandWidth(app, groups, bh, rows) > w) {
+            for (int cg = 0; cg < groups.Count; cg = cg + 1) {
+                RibbonGroup cgrp = groups[cg];
+                for (int ci = 0; ci < cgrp.items.Count; ci = ci + 1) {
+                    RibbonItem cit = cgrp.items[ci];
+                    if (cit.small && !cit.tile) { cit.tile = true; }
+                }
+            }
+        }
+        c.PushClip(x, by, w, bh);
 
         int titleH = app.Scale(16);
         int contentTop = by + t.paddingSmall;
@@ -286,15 +356,7 @@ class Ribbon {
             // 一组里的小命令用同一个列宽（组内最宽的
             // 标签决定），这样每列的图标和文字都对齐，
             // 长标签也不会被邻列压住。
-            int smallW = app.Scale(72);
-            for (int m = 0; m < grp.items.Count; m = m + 1) {
-                RibbonItem mi = grp.items[m];
-                if (mi.tile || !mi.small) { continue; }
-                int mw = Canvas.MeasureText(mi.label, t.fontSizeSmall)
-                    + t.iconSizeSmall + app.Scale(22);
-                if (mi.menu) { mw = mw + app.Scale(10); }
-                if (mw > smallW) { smallW = mw; }
-            }
+            int smallW = Ribbon.SmallColW(app, grp);
             for (int j = 0; j < grp.items.Count; j = j + 1) {
                 RibbonItem it = grp.items[j];
                 int id = firstId + baseIdx + j;
@@ -336,6 +398,7 @@ class Ribbon {
 
             baseIdx = baseIdx + grp.items.Count;
         }
+        c.PopClip();
         return clicked;
     }
 

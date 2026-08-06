@@ -29,7 +29,8 @@ short, enforceable summary.
 
 > Note: the old C IDE (`src/ide/`) was removed. The IDE is now `src/ide_zan/`;
 > its analysis/debug backends live in `src/lsp/` and `src/dap/`.
-
+## ZanIDE
+ZanIDE禁止任何自绘必须全部用标准库组件来完成
 ## Hard rules — DO NOT break these
 
 1. **Keep the repo root clean.** Only long-lived, version-controlled entries

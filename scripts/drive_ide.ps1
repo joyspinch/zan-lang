@@ -8,7 +8,8 @@ param(
   [int]$WallOp = 80,
   [string]$Win = "Zan IDE",
   [string]$Keys = "",
-  [string]$CtrlClicks = ""
+  [string]$CtrlClicks = "",
+  [string]$Drags = ""          # "x1,y1,x2,y2;..." press, move in steps, release
 )
 
 if ($Restart) {
@@ -48,6 +49,7 @@ public class WS2{
    return true;
  }
  public static void Wheel(int x,int y,int steps){ SetCursorPos(x,y); System.Threading.Thread.Sleep(120); int i=0; while(i<System.Math.Abs(steps)){ uint d=(uint)(steps>0?120:-120); mouse_event(0x0800,0,0,d,IntPtr.Zero); System.Threading.Thread.Sleep(80); i++; } }
+ public static void Drag(int x1,int y1,int x2,int y2){ SetCursorPos(x1,y1); System.Threading.Thread.Sleep(250); mouse_event(0x0002,0,0,0,IntPtr.Zero); System.Threading.Thread.Sleep(150); int steps=12; for(int i=1;i<=steps;i++){ SetCursorPos(x1+(x2-x1)*i/steps, y1+(y2-y1)*i/steps); System.Threading.Thread.Sleep(60);} System.Threading.Thread.Sleep(150); mouse_event(0x0004,0,0,0,IntPtr.Zero); }
  public static void Click(int x,int y){ SetCursorPos(x,y); System.Threading.Thread.Sleep(200); mouse_event(0x0002,0,0,0,IntPtr.Zero); System.Threading.Thread.Sleep(80); mouse_event(0x0004,0,0,0,IntPtr.Zero); }
 }
 "@
@@ -90,6 +92,16 @@ if ($Clicks -ne "") {
     Start-Sleep -Milliseconds 1200
     $n = $n + 1
     Shot("_c$n")
+  }
+}
+if ($Drags -ne "") {
+  foreach ($d in $Drags.Split(";")) {
+    if ($d -eq "") { continue }
+    $q = $d.Split(",")
+    [WS2]::Drag($r0.L + [int]$q[0], $r0.T + [int]$q[1], $r0.L + [int]$q[2], $r0.T + [int]$q[3])
+    Start-Sleep -Milliseconds 1200
+    $n = $n + 1
+    Shot("_d$n")
   }
 }
 if ($CtrlClicks -ne "") {

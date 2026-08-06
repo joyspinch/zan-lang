@@ -30,6 +30,12 @@ class DockPanel {
     bool hidden;
     /// 面板上次停靠的边——Show() 将其放回的地方。
     int home;
+    /// 关闭时所在分组的 key、在该分组里的标签序号，以及该分组
+    /// 在同侧分组中的序号——Show() 据此把面板放回原来的位置，
+    /// 而不是简单地并到该侧最后一个分组的末尾。
+    int homeKey;
+    int homeAt;
+    int homeSideIdx;
     Rect body;
 
     DockPanel(string id, string title, bool closable) {
@@ -41,6 +47,9 @@ class DockPanel {
         this.headerless = false;
         this.hidden = false;
         this.home = DockSide.Left();
+        this.homeKey = 0;
+        this.homeAt = 0;
+        this.homeSideIdx = 0;
         this.body = new Rect(0, 0, 0, 0);
     }
 }
@@ -412,11 +421,51 @@ class DockHost {
         DockPanel p = this.Find(id);
         if (p == null) { return; }
         if (p.hidden) { return; }
+        this.NoteHome(p);
         p.hidden = true;
         p.body = new Rect(0, 0, 0, 0);
         this.Detach(id);
         lastClosed = id;
         changed = true;
+    }
+
+    /// 记住面板当前所在的分组、标签序号和该分组在同侧的序号，
+    /// 供 Show() 原位恢复。
+    void NoteHome(DockPanel p) {
+        int gi = this.GroupOf(p.id);
+        if (gi < 0) { return; }
+        DockGroup g = groups[gi];
+        p.home = g.side;
+        p.homeKey = g.key;
+        p.homeAt = this.IndexIn(g, p.id);
+        p.homeSideIdx = this.SideIndexOf(gi);
+    }
+
+    /// 分组在同侧分组中的序号（0 = 该侧第一个）。
+    int SideIndexOf(int gi) {
+        int n = 0;
+        for (int i = 0; i < gi; i = i + 1) {
+            if (groups[i].side == groups[gi].side) { n = n + 1; }
+        }
+        return n;
+    }
+
+    /// 同侧第 `at` 个分组在 groups 列表中的插入位置。
+    int InsertPosFor(int side, int at) {
+        int n = 0;
+        for (int i = 0; i < groups.Count; i = i + 1) {
+            if (groups[i].side != side) { continue; }
+            if (n == at) { return i; }
+            n = n + 1;
+        }
+        return groups.Count;
+    }
+
+    int GroupWithKey(int key) {
+        for (int i = 0; i < groups.Count; i = i + 1) {
+            if (groups[i].key == key) { return i; }
+        }
+        return 0 - 1;
     }
 
     void Detach(string id) {
@@ -466,11 +515,29 @@ class DockHost {
         if (this.IsHidden(id)) { this.Show(id); } else { this.Close(id); }
     }
 
-    /// 将已关闭的面板重新停靠回它原来的侧边。
+    /// 把已关闭的面板放回关闭前的位置：原分组还在就插回原来的
+    /// 标签序号，原分组已经空掉被移除就在同侧原来的位置重建它。
     void Show(string id) {
         DockPanel p = this.Find(id);
         if (p == null) { return; }
-        this.ShowOn(id, p.home);
+        if (!p.hidden) { this.Focus(id); return; }
+        if (this.GroupOf(id) >= 0) { this.ShowOn(id, p.home); return; }
+        int gi = this.GroupWithKey(p.homeKey);
+        if (gi < 0) {
+            DockGroup ng = new DockGroup(p.home, 100);
+            int at = this.InsertPosFor(p.home, p.homeSideIdx);
+            groups.Insert(at, ng);
+            gi = this.GroupWithKey(ng.key);
+        }
+        DockGroup g = groups[gi];
+        int slot = p.homeAt;
+        if (slot < 0) { slot = 0; }
+        if (slot > g.ids.Count) { slot = g.ids.Count; }
+        g.ids.Insert(slot, id);
+        p.hidden = false;
+        p.home = g.side;
+        g.active = this.IndexIn(g, id);
+        changed = true;
     }
 
     int IndexIn(DockGroup g, string id) {
@@ -895,6 +962,14 @@ class DockHost {
             gs[n - 1].extent = last;
         }
 
+        // 分隔条拖动只在相邻两组之间挪高度，其余组一律不动。
+        // 必须等整轮布局跑完再写回：循环中途改 gs[i + 1].extent
+        // 会让本帧后面的组按新值排布，末组再把差额吃掉，
+        // 结果就是拖第一条分隔线时第三组也跟着变。
+        int rsAt = 0 - 1;
+        int rsA1 = 0;
+        int rsA2 = 0;
+
         int pos = r.y;
         if (!vertical) { pos = r.x; }
         i = 0;
@@ -919,21 +994,27 @@ class DockHost {
                 int nv = -1;
                 if (vertical) { nv = this.Handle(app, r.x, pos, r.width, hs, false); }
                 else { nv = this.Handle(app, pos, r.y, hs, r.height, true); }
-                if (nv >= 0) {
+                if (nv >= 0 && rsAt < 0) {
                     int start = g.bounds.y;
                     if (!vertical) { start = g.bounds.x; }
                     int delta = nv - start - ext;
                     int a1 = ext + delta;
                     int a2 = gs[i + 1].extent - delta;
                     if (a1 >= minG && a2 >= minG) {
-                        g.extent = a1;
-                        gs[i + 1].extent = a2;
-                        pendingResize = true;
+                        rsAt = i;
+                        rsA1 = a1;
+                        rsA2 = a2;
                     }
                 }
                 pos = pos + hs;
             }
             i = i + 1;
+        }
+
+        if (rsAt >= 0) {
+            gs[rsAt].extent = rsA1;
+            gs[rsAt + 1].extent = rsA2;
+            pendingResize = true;
         }
     }
 
@@ -1026,6 +1107,9 @@ class DockHost {
             c.DrawText(tabX + padX, textY, p.title, textColor, fontSize);
             if (isActive) { c.FillRect(tabX, b.y + hh - 2, tabW, 2, t.primary); }
 
+            // 标签整体先注册，关闭按钮后注册：命中测试取最后注册的
+            // 区域，关闭按钮才不会被标签吞掉。
+            this.RegisterClipped(app, tabId, tabX, b.y, tabW, hh, b.x, b.width);
             if (p.closable) {
                 int cbx = tabX + padX + labelW + gap;
                 int cby = b.y + (hh - closeBox) / 2;
@@ -1038,7 +1122,6 @@ class DockHost {
                 c.DrawGlyphIn("close", cbx, cby, closeBox, closeBox, closeBox - 3, closeColor);
                 this.RegisterClipped(app, closeId, cbx - 2, cby - 2, closeBox + 4, closeBox + 4, b.x, b.width);
             }
-            this.RegisterClipped(app, tabId, tabX, b.y, tabW, hh, b.x, b.width);
 
             // 在标签上按下并移动会开始停靠拖拽；从未移动的按下
             // 保持为普通点击（选择），在松开时处理。
