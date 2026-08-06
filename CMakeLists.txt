@@ -921,6 +921,20 @@ add_test(NAME conformance_ide_diagstore
     -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_ide_diagstore${_exe_ext}
     -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
+# ---- Designer: free-layout magnetic snapping geometry ----
+# Snapping is pure integer geometry (candidate lines from the canvas and the
+# siblings x the moving box's start/centre/end anchors, within a tolerance), so
+# every alignment case is pinned here -- including that a drag outside the
+# tolerance is left exactly where the pointer put it and draws no guide.
+add_test(NAME conformance_ide_snap
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/ide/snap_test.zan
+    -DZANC_ARGS=--auto-stdlib
+    -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/ide/snap_test.out
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_ide_snap${_exe_ext}
+    -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+
 # ---- Runtime diagnostics: parser must not hang/OOM on malformed input ----
 add_test(NAME diag_no_runaway
   COMMAND zanc ${CMAKE_SOURCE_DIR}/tests/diag/bad_member.zan --dump-ast)
