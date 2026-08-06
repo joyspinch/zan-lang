@@ -1,0 +1,120 @@
+using System;
+using System.Security.Cryptography;
+
+/* RSA-OAEP and AES-CBC input validation: oversized messages must be rejected
+ * (return null / -1) rather than corrupt memory or produce invalid ciphertext,
+ * and AES-CBC must reject ciphertexts whose length is not a multiple of 16 or
+ * whose PKCS#7 padding is inconsistent (every padding byte, not just the last).
+ *
+ * The 2048-bit test key is shared with jwt_rs256.zan. */
+class Program {
+    static int failures = 0;
+
+    static void Check(bool cond, string name) {
+        if (cond) {
+            Console.WriteLine("ok " + name);
+        } else {
+            Console.WriteLine("FAIL " + name);
+            failures = failures + 1;
+        }
+    }
+
+    static string PublicPem() {
+        return "-----BEGIN PUBLIC KEY-----\n"
+            + "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAnyxKES8cfS5jSFZ5+Uvw\n"
+            + "Wu8uWbcTNal7lIlQ0H2q6JDbrQKZZBqgOe9jH8yNxVEW8b23ZrfoT0Q521LFIGw5\n"
+            + "KvoqB5U0U1pNQpH7GJ6a4fkpQJfnoe+MN/ihxBTgCGVUZdUbv1TM/KShhQ3z8InZ\n"
+            + "rHn0dODTTWUk6lqpNuH4tVm9MFhnnLN4np49o36zTBx/tjS1AVRw+quEJsT0SsFz\n"
+            + "ZWiKR50LD7jHTdCu3JfrsR1uWk6TippGhfUl2huy8oeLWpAXHp3yl1UGKJEt6ks1\n"
+            + "P2hdZq4pqvhojxe1e8gyF3P2Hx3IHQpD5rNGrGJHIkMTTQHpvayhPv5pRHbGKNZq\n"
+            + "iwIDAQAB\n"
+            + "-----END PUBLIC KEY-----\n";
+    }
+
+    static void Main() {
+        RsaKey publicKey = RsaKey.FromPublicPem(PublicPem());
+        Check(publicKey != null, "pubkey parse");
+        Check(publicKey.ModulusLength() == 256, "modulus 256");
+
+        string n = publicKey.modulus.ToStr(0, publicKey.modulusLength);
+        string e = publicKey.publicExponent.ToStr(0, publicKey.publicExponentLength);
+
+        // OAEP round-trip with SHA-1 (hl=20): max msg = 256 - 40 - 2 = 214 bytes.
+        // Use a 32-byte message and verify the ciphertext length is k.
+        byte[] seed = RandomNumberGenerator.GetBytes(20);
+        byte[] msgB = new byte[32];
+        int i = 0;
+        while (i < 32) { msgB[i] = (byte)(65 + i); i = i + 1; }
+        string msg = msgB.ToStr(0, 32);
+        byte[] ct = Rsa.EncryptOaep(msg, 32, n, 256, e, publicKey.publicExponentLength, 1, seed);
+        Check(ct != null, "oaep encrypt 32B");
+        Check(ct != null && ct.Length == 256, "oaep ct len k");
+
+        // Oversized message for SHA-256 (hl=32): max = 256 - 64 - 2 = 190.
+        // 250 bytes must be REJECTED (return null), not produce invalid memory.
+        byte[] big = new byte[250];
+        i = 0; while (i < 250) { big[i] = (byte)(65 + (i % 26)); i = i + 1; }
+        string bigMsg = big.ToStr(0, 250);
+        byte[] seed32 = RandomNumberGenerator.GetBytes(32);
+        byte[] bad = Rsa.EncryptOaep(bigMsg, 250, n, 256, e, publicKey.publicExponentLength, 0, seed32);
+        Check(bad == null, "oaep rejects oversized");
+
+        // A message exactly at the SHA-256 maximum (190) must succeed.
+        byte[] maxMsg = new byte[190];
+        i = 0; while (i < 190) { maxMsg[i] = (byte)(48 + (i % 10)); i = i + 1; }
+        string maxStr = maxMsg.ToStr(0, 190);
+        byte[] seed32b = RandomNumberGenerator.GetBytes(32);
+        byte[] maxCt = Rsa.EncryptOaep(maxStr, 190, n, 256, e, publicKey.publicExponentLength, 0, seed32b);
+        Check(maxCt != null && maxCt.Length == 256, "oaep max msg ok");
+        // 191 bytes must be rejected.
+        byte[] over = new byte[191];
+        i = 0; while (i < 191) { over[i] = (byte)(48 + (i % 10)); i = i + 1; }
+        byte[] seed32c = RandomNumberGenerator.GetBytes(32);
+        byte[] overCt = Rsa.EncryptOaep(over.ToStr(0, 191), 191, n, 256, e, publicKey.publicExponentLength, 0, seed32c);
+        Check(overCt == null, "oaep rejects 191B");
+
+        // ---- AES-CBC ----
+        byte[] key = Hex.Decode("000102030405060708090a0b0c0d0e0f");
+        byte[] iv = Hex.Decode("101112131415161718191a1b1c1d1e1f");
+        string pt = "AAAAAAAAAAAAAAAA";  // 16 bytes -> one pad block (0x10 x16)
+        List<int> encLen = new List<int>(); encLen.Add(0);
+        byte[] cct = Aes.EncryptCbc(key, 16, iv, pt, pt.Length, encLen);
+        Check(encLen[0] == 32, "cbc enc len 32");
+        List<int> decLen = new List<int>(); decLen.Add(0);
+        byte[] back = Aes.DecryptCbc(key, 16, iv, cct, encLen[0], decLen);
+        Check(decLen[0] == 16, "cbc dec len 16");
+        Check(back.ToStr(0, decLen[0]) == pt, "cbc roundtrip");
+
+        // Bad key length must be rejected (not 16/24/32).
+        byte[] badKey = Hex.Decode("0001020304050607");  // 8 bytes
+        List<int> ek = new List<int>(); ek.Add(0);
+        byte[] badKeyCt = Aes.EncryptCbc(badKey, 8, iv, pt, pt.Length, ek);
+        Check(badKeyCt == null, "cbc rejects bad key len");
+
+        // Non-block-aligned ciphertext (20 bytes) must be rejected.
+        byte[] shortCt = new byte[20];
+        i = 0; while (i < 20) { shortCt[i] = cct[i]; i = i + 1; }
+        List<int> dl2 = new List<int>(); dl2.Add(0);
+        byte[] b2 = Aes.DecryptCbc(key, 16, iv, shortCt, 20, dl2);
+        Check(dl2[0] == -1, "cbc rejects non-block len");
+        Check(b2 == null, "cbc non-block null");
+
+        // Tampered ciphertext: corrupt block 1 so the decrypted padding bytes
+        // are garbage. Valid PKCS#7 requires ALL pad bytes to equal padVal;
+        // trusting only the last byte would accept this as "32 bytes".
+        byte[] tampered = new byte[encLen[0]];
+        i = 0; while (i < encLen[0]) { tampered[i] = cct[i]; i = i + 1; }
+        tampered[16] = (tampered[16] & 255) ^ 0xFF;
+        List<int> dl3 = new List<int>(); dl3.Add(0);
+        byte[] b3 = Aes.DecryptCbc(key, 16, iv, tampered, encLen[0], dl3);
+        Check(dl3[0] == -1, "cbc rejects bad padding");
+        Check(b3 == null, "cbc bad padding null");
+
+        // An empty ciphertext must be rejected (no padding block at all).
+        List<int> dl4 = new List<int>(); dl4.Add(0);
+        byte[] b4 = Aes.DecryptCbc(key, 16, iv, "", 0, dl4);
+        Check(dl4[0] == -1, "cbc rejects empty ct");
+
+        Console.WriteLine("failures=" + Convert.ToString(failures));
+    }
+}

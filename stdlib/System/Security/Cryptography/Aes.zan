@@ -180,8 +180,10 @@ class Aes {
     }
 
     /// <summary>AES-CBC 加密，PKCS#7 填充。返回密文；
-    /// <paramref name="outLen"/>[0] 接收其长度。</summary>
+    /// <paramref name="outLen"/>[0] 接收其长度。keyLen 必须是
+    /// 16/24/32（否则返回 null）。</summary>
     static byte[] EncryptCbc(string key, int keyLen, string iv, string data, int len, List<int> outLen) {
+        if (keyLen != 16 && keyLen != 24 && keyLen != 32) { outLen[0] = -1; return null; }
         List<int> nr = new List<int>(); nr.Add(0);
         byte[] rk = expandKey(key, keyLen, nr);
         int padVal = 16 - (len % 16);
@@ -207,8 +209,14 @@ class Aes {
     }
 
     /// <summary>AES-CBC 解密，去除 PKCS#7 填充。返回明文；
-    /// <paramref name="outLen"/>[0] 接收其长度。</summary>
+    /// <paramref name="outLen"/>[0] 接收其长度（密文长度非 16 整数倍、
+    /// 或 PKCS#7 填充不一致时为 -1，并返回 null）。填充校验要求
+    /// 最后 padVal 字节全部等于 padVal，而非仅看最后一个字节。</summary>
     static byte[] DecryptCbc(string key, int keyLen, string iv, string data, int len, List<int> outLen) {
+        if (keyLen != 16 && keyLen != 24 && keyLen != 32) { outLen[0] = -1; return null; }
+        // CBC 密文必须是 16 字节的整数倍；空输入也不合法（至少要有一个
+        // 完整的填充块）。
+        if (len <= 0 || (len % 16) != 0) { outLen[0] = -1; return null; }
         List<int> nr = new List<int>(); nr.Add(0);
         byte[] rk = expandKey(key, keyLen, nr);
         byte[] outb = new byte[len];
@@ -226,12 +234,26 @@ class Aes {
             j = 0; while (j < 16) { prev[j] = cipher[j]&255; j = j + 1; }
             off = off + 16;
         }
-        int plen = len;
-        if (len > 0) {
-            int padVal = outb[len-1]&255;
-            if (padVal >= 1 && padVal <= 16) { plen = len - padVal; }
+        // PKCS#7 校验：padVal 在 1..16，且最后 padVal 字节必须全部等于
+        // padVal。常数时间遍历整个最后块：对落在填充范围内的位置比较
+        // padVal，范围外的位置比较 0（不贡献失配），从而不泄露 padVal。
+        int padVal = outb[len-1] & 255;
+        int bad = 0;
+        if (padVal < 1 || padVal > 16) { bad = 1; }
+        int k = 0;
+        while (k < 16) {
+            int pos = len - 16 + k;
+            int inPad = 0;
+            if (k >= 16 - padVal) { inPad = 1; }
+            // 仅填充字节参与比较：inPad==1 时 expect=padVal，否则 expect=实际值（恒等，不报错）。
+            int expect = padVal;
+            int actual = outb[pos] & 255;
+            if (inPad == 0) { expect = actual; }
+            bad = bad | (actual ^ expect);
+            k = k + 1;
         }
-        outLen[0] = plen;
+        if (bad != 0) { outLen[0] = -1; return null; }
+        outLen[0] = len - padVal;
         return outb;
     }
 

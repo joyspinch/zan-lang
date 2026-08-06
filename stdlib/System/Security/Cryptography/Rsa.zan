@@ -45,9 +45,16 @@ class Rsa {
     }
 
     /// <summary>RSA-OAEP 加密（RFC 8017 §7.1.1）。<paramref name="seed"/> 必须
-    /// 提供 hLen 个全新随机字节。label 为空。返回 k 字节密文。</summary>
+    /// 提供 hLen 个全新随机字节。label 为空。返回 k 字节密文；
+    /// 若消息对 k 而言过长（mLen &gt; k - 2*hLen - 2）或 k 过小
+    /// （k &lt; 2*hLen + 2），返回 null，绝不写入越界。</summary>
     static byte[] EncryptOaep(string msg, int mLen, string n, int k, string e, int eLen, int algo, string seed) {
         int hl = hLen(algo);
+        // RFC 8017 §7.1.1 步骤 1 的长度约束：k >= 2*hLen + 2，且
+        // mLen <= k - 2*hLen - 2。否则 dbLen/psEnd 会变负导致越界写。
+        if (k < 2 * hl + 2) { return null; }
+        if (mLen < 0 || mLen > k - 2 * hl - 2) { return null; }
+        if (eLen <= 0 || n == null) { return null; }
         byte[] lHash = hashOf(algo, "", 0);
         int dbLen = k - hl - 1;
         byte[] db = new byte[dbLen];
@@ -74,10 +81,13 @@ class Rsa {
         return ModExp(em, k, n, k, e, eLen);
     }
 
-    /// <summary>RSA-OAEP 解密。返回恢复出的消息；
-    /// <paramref name="outLen"/>[0] 接收其长度（填充错误时为 -1）。</summary>
+    /// <summary>RSA-OAEP 解密（RFC 8017 §7.1.2）。返回恢复出的消息；
+    /// <paramref name="outLen"/>[0] 接收其长度，编码结构非法（Y!=0、
+    /// lHash 不符、缺 0x01 分隔符、k 过小）时为 -1。所有失败路径走
+    /// 同一条返回，不因错误位置不同而泄露 padding oracle。</summary>
     static byte[] DecryptOaep(string cph, string n, int k, string d, int dLen, int algo, List<int> outLen) {
         int hl = hLen(algo);
+        if (k < 2 * hl + 2) { outLen[0] = -1; return null; }
         byte[] em = ModExp(cph, k, n, k, d, dLen);
         int dbLen = k - hl - 1;
         byte[] maskedSeed = new byte[hl];
@@ -92,16 +102,24 @@ class Rsa {
         byte[] db = new byte[dbLen];
         i = 0; while (i < dbLen) { db[i] = (maskedDb[i] & 255) ^ (dbMask[i] & 255); i = i + 1; }
 
-        // 跳过 lHash（hl 字节），再跳过零字节直到 0x01
+        // 完整校验编码结构（RFC 8017 §7.1.2 步骤 3.g）：Y==0、lHash 相等、
+        // PS 全零后紧跟 0x01。先用常数时间比较校验 Y 与 lHash，再扫描 PS。
+        // PS 必须全零，第一个非零字节必须是 0x01 分隔符，其后即消息。
+        byte[] lHash = hashOf(algo, "", 0);
+        int diff = (em[0] & 255);
+        i = 0;
+        while (i < hl) { diff = diff | ((db[i] & 255) ^ (lHash[i] & 255)); i = i + 1; }
+        // 跳过零字节（PS），定位 0x01 分隔符。
         int p = hl;
         while (p < dbLen && (db[p] & 255) == 0) { p = p + 1; }
-        int mlen = -1;
-        byte[] outb = new byte[dbLen];
-        if (p < dbLen && (db[p] & 255) == 1) {
-            p = p + 1;
-            mlen = dbLen - p;
-             for (int j = 0; j < mlen; j = j + 1) { outb[j] = db[p + j] & 255; }
+        if (p >= dbLen || (db[p] & 255) != 1 || diff != 0) {
+            outLen[0] = -1;
+            return null;
         }
+        p = p + 1;
+        int mlen = dbLen - p;
+        byte[] outb = new byte[dbLen];
+        for (int j = 0; j < mlen; j = j + 1) { outb[j] = db[p + j] & 255; }
         outLen[0] = mlen;
         return outb;
     }
