@@ -37,6 +37,9 @@
 #if !defined(_WIN32) && !defined(O_NOFOLLOW)
 #define O_NOFOLLOW 0
 #endif
+#if !defined(_WIN32) && !defined(O_CLOEXEC)
+#define O_CLOEXEC 0
+#endif
 
 #define ZAN_TABLE_MAGIC UINT64_C(0x5a414e54424c3031)
 #define ZAN_TABLE_VERSION 2
@@ -1820,6 +1823,25 @@ long long zan_file_attributes(const char *path) {
 #endif
 }
 
+#ifndef _WIN32
+/* POSIX: resolve `path` to a descriptor once, then operate on the fd. This
+ * closes the TOCTOU window between stat()-ing a path and chmod/utimens-ing
+ * it (a swapped path now acts on the file actually opened), and O_NOFOLLOW
+ * refuses to reach a target through a symlink (a symlink chain is ELOOP).
+ * O_RDONLY opens files and directories on every POSIX; O_PATH (Linux) is the
+ * fallback for read-protected targets where O_RDONLY would fail EACCES.
+ * Returns the fd, or -1 with errno set on failure. */
+static int zan_posix_open_nofollow(const char *path) {
+    int fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+#if defined(O_PATH)
+    if (fd < 0 && errno == EACCES) {
+        fd = open(path, O_PATH | O_NOFOLLOW | O_CLOEXEC);
+    }
+#endif
+    return fd;
+}
+#endif
+
 /* Marks the file read-only (`on`) or writable. Returns 1 on success. */
 long long zan_file_set_readonly(const char *path, int on) {
     if (!path || !path[0]) return 0;
@@ -1830,12 +1852,16 @@ long long zan_file_set_readonly(const char *path, int on) {
     else    a &= ~(DWORD)FILE_ATTRIBUTE_READONLY;
     return SetFileAttributesA(path, a) ? 1 : 0;
 #else
+    int fd = zan_posix_open_nofollow(path);
+    if (fd < 0) return 0;   /* missing, ELOOP symlink, EACCES, ... */
     struct stat st;
-    if (stat(path, &st) != 0) return 0;
+    if (fstat(fd, &st) != 0) { close(fd); return 0; }
     mode_t m = st.st_mode;
     if (on) m &= ~(mode_t)(S_IWUSR | S_IWGRP | S_IWOTH);
     else    m |= S_IWUSR;
-    return chmod(path, m) == 0 ? 1 : 0;
+    int ok = fchmod(fd, m) == 0 ? 1 : 0;
+    close(fd);
+    return ok;
 #endif
 }
 
@@ -1864,16 +1890,20 @@ long long zan_file_set_time(const char *path, int which, long long unix_sec) {
     CloseHandle(h);
     return ok ? 1 : 0;
 #else
+    if (which == 1) return 0;   /* creation time: not settable on POSIX */
+    int fd = zan_posix_open_nofollow(path);
+    if (fd < 0) return 0;
     struct stat st;
-    if (stat(path, &st) != 0) return 0;
+    if (fstat(fd, &st) != 0) { close(fd); return 0; }
     struct timespec times[2];
     /* atime, mtime */
     times[0].tv_sec = (which == 2) ? unix_sec : st.st_atime;
     times[0].tv_nsec = 0;
     times[1].tv_sec = (which == 0) ? unix_sec : st.st_mtime;
     times[1].tv_nsec = 0;
-    if (which == 1) return 0;   /* creation time: not settable on POSIX */
-    return utimensat(AT_FDCWD, path, times, 0) == 0 ? 1 : 0;
+    int ok = futimens(fd, times) == 0 ? 1 : 0;
+    close(fd);
+    return ok;
 #endif
 }
 

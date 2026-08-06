@@ -18,6 +18,7 @@
 typedef HANDLE thread_t;
 #else
 #include <pthread.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -336,6 +337,74 @@ static void test_file_handle(void) {
     remove(path);
 }
 
+/* B2: the POSIX path APIs must not follow symlinks or leave a TOCTOU window.
+ * set_readonly / set_time used to stat() a path and then chmod()/utimensat()
+ * it by name, so a symlink at the path was followed and the real target was
+ * mutated. The fix resolves the path to a descriptor once with O_NOFOLLOW and
+ * operates on the fd: acting on a symlink must fail and leave the target's
+ * permissions and timestamps untouched. POSIX-only (Windows uses handles). */
+#ifndef _WIN32
+static void test_file_no_follow_symlink(void) {
+    char dir[192], target[192], link[192];
+    snprintf(dir, sizeof(dir), "/tmp/rt_sync_b2_%ld_%lld",
+             (long)getpid(), (long long)time(NULL));
+    snprintf(target, sizeof(target), "%s/target", dir);
+    snprintf(link, sizeof(link), "%s/link", dir);
+    if (mkdir(dir, 0700) != 0) {
+        CHECK(0, "could not create scratch dir %s", dir);
+        return;
+    }
+    FILE *f = fopen(target, "w");
+    int ready = 0;
+    if (f) {
+        fputs("b2", f);
+        fclose(f);
+        ready = 1;
+    }
+    if (!ready || symlink(target, link) != 0) {
+        CHECK(0, "could not create B2 scratch files in %s", dir);
+        remove(target);
+        remove(link);
+        rmdir(dir);
+        return;
+    }
+
+    struct stat st_before, st_after;
+    CHECK(stat(target, &st_before) == 0, "could not stat target before");
+    mode_t mode_before = st_before.st_mode & 07777;
+    time_t mtime_before = st_before.st_mtime;
+
+    /* Acting on the symlink must fail and leave the real target untouched. */
+    CHECK(zan_file_set_readonly(link, 1) == 0,
+          "set_readonly followed a symlink");
+    CHECK(zan_file_set_time(link, 0, (long long)(mtime_before + 3600)) == 0,
+          "set_time followed a symlink");
+    CHECK(stat(target, &st_after) == 0, "could not stat target after");
+    CHECK((st_after.st_mode & 07777) == mode_before,
+          "symlink set_readonly changed the target's permissions");
+    CHECK(st_after.st_mtime == mtime_before,
+          "symlink set_time changed the target's mtime");
+
+    /* The direct path must still work (the fix cannot break normal use). */
+    CHECK(zan_file_set_readonly(target, 1) == 1,
+          "set_readonly failed on the real file");
+    CHECK(stat(target, &st_after) == 0, "could not restat target");
+    CHECK((st_after.st_mode & (S_IWUSR | S_IWGRP | S_IWOTH)) == 0,
+          "set_readonly did not clear write bits on the real file");
+    CHECK(zan_file_set_readonly(target, 0) == 1,
+          "set_readonly(false) failed on the real file");
+    CHECK(zan_file_set_time(target, 0, (long long)(mtime_before + 3600)) == 1,
+          "set_time failed on the real file");
+    CHECK(stat(target, &st_after) == 0, "could not restat target (time)");
+    CHECK(st_after.st_mtime == mtime_before + 3600,
+          "set_time did not update the real file's mtime");
+
+    remove(link);
+    remove(target);
+    rmdir(dir);
+}
+#endif
+
 int main(int argc, char **argv) {
     if (argc == 3 && strcmp(argv[1], "--shared-child") == 0) {
         return shared_table_child(argv[2]);
@@ -344,6 +413,9 @@ int main(int argc, char **argv) {
     test_atomic_int();
     test_shared_table();
     test_file_handle();
+#ifndef _WIN32
+    test_file_no_follow_symlink();
+#endif
     printf("%d checks, %d failures\n", checks, failures);
     return failures == 0 ? 0 : 1;
 }
