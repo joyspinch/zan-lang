@@ -1,0 +1,291 @@
+using System;
+using System.Json;
+using Gui;
+
+namespace Gui.Component.Chart;
+
+// ---- 地图（ECharts type 'map'；区域多边形 + 洞/多部件） ----
+
+/// 已变换到屏幕坐标的一条环（外环或洞），带 bbox 与质心。
+class MapPolygon {
+    int region;       // 所属区域下标
+    bool hole;        // 洞环（回填背景挖空）
+    List<ChartMapPoint> points;
+    int minX; int minY; int maxX; int maxY;   // 变换后 bbox（命中加速）
+    int cx; int cy;       // 环质心（外环用作标签锚点）
+
+    static MapPolygon Of(int region, bool hole, List<ChartMapPoint> points) {
+        MapPolygon p = new MapPolygon();
+        p.region = region; p.hole = hole; p.points = points;
+        int n = points.Count;
+        int sx = 0; int sy = 0;
+        p.minX = points[0].x; p.maxX = points[0].x;
+        p.minY = points[0].y; p.maxY = points[0].y;
+        for (int i = 0; i < n; i = i + 1) {
+            ChartMapPoint pt = points[i];
+            if (pt.x < p.minX) { p.minX = pt.x; }
+            if (pt.x > p.maxX) { p.maxX = pt.x; }
+            if (pt.y < p.minY) { p.minY = pt.y; }
+            if (pt.y > p.maxY) { p.maxY = pt.y; }
+            sx = sx + pt.x; sy = sy + pt.y;
+        }
+        p.cx = sx / n; p.cy = sy / n;
+        return p;
+    }
+}
+
+/// 地图布局：全局数据边界等比 fit 到绘图区（居中），输出变换
+/// 后的环、缩放（千分比像素/单位）与变换原点。纯几何，不碰
+/// Canvas，命中走 bbox + 整数 point-in-polygon。
+class MapLayout {
+    List<MapPolygon> polys;
+    int regionCount;  // 区域数（RegionAt 用）
+    int scale;        // 千分比像素/单位
+    int minX; int minY; int maxX; int maxY;  // 数据范围
+    int offX; int offY;   // 变换原点（居中后）
+
+    static MapLayout Of(List<ChartMapRegion> regions, int x, int y, int w, int h, int pad) {
+        MapLayout l = new MapLayout();
+        l.polys = new List<MapPolygon>();
+        l.regionCount = regions.Count;
+        int pw = w - pad * 2;
+        int ph = h - pad * 2;
+        if (pw < 1) { pw = 1; }
+        if (ph < 1) { ph = 1; }
+
+        // 全局数据边界（所有环的所有点；<3 点的退化环忽略）。
+        bool any = false;
+        int mnX = 0; int mnY = 0; int mxX = 0; int mxY = 0;
+        for (int r = 0; r < regions.Count; r = r + 1) {
+            List<ChartMapRing> rings = regions[r].rings;
+            for (int k = 0; k < rings.Count; k = k + 1) {
+                List<ChartMapPoint> ps = rings[k].points;
+                if (ps.Count < 3) { continue; }
+                for (int i = 0; i < ps.Count; i = i + 1) {
+                    int px = ps[i].x; int py = ps[i].y;
+                    if (!any) { mnX = px; mxX = px; mnY = py; mxY = py; any = true; }
+                    else {
+                        if (px < mnX) { mnX = px; }
+                        if (px > mxX) { mxX = px; }
+                        if (py < mnY) { mnY = py; }
+                        if (py > mxY) { mxY = py; }
+                    }
+                }
+            }
+        }
+        if (!any) { l.scale = 0; return l; }
+        l.minX = mnX; l.minY = mnY; l.maxX = mxX; l.maxY = mxY;
+
+        int bw = mxX - mnX;
+        int bh = mxY - mnY;
+        if (bw < 1) { bw = 1; }
+        if (bh < 1) { bh = 1; }
+        int sc = pw * 1000 / bw;
+        int scH = ph * 1000 / bh;
+        if (scH < sc) { sc = scH; }
+        if (sc < 1) { sc = 1; }
+        l.scale = sc;
+
+        // 变换后实际像素宽高，居中偏移。
+        int ow = bw * sc / 1000;
+        int oh = bh * sc / 1000;
+        int ox = x + pad + (pw - ow) / 2;
+        int oy = y + pad + (ph - oh) / 2;
+        l.offX = ox; l.offY = oy;
+
+        for (int r = 0; r < regions.Count; r = r + 1) {
+            List<ChartMapRing> rings = regions[r].rings;
+            for (int k = 0; k < rings.Count; k = k + 1) {
+                List<ChartMapPoint> ps = rings[k].points;
+                if (ps.Count < 3) { continue; }
+                List<ChartMapPoint> tr = new List<ChartMapPoint>();
+                for (int i = 0; i < ps.Count; i = i + 1) {
+                    int sx = ox + (ps[i].x - mnX) * sc / 1000;
+                    int sy = oy + (ps[i].y - mnY) * sc / 1000;
+                    tr.Add(ChartMapPoint.Of(sx, sy));
+                }
+                l.polys.Add(MapPolygon.Of(r, rings[k].hole, tr));
+            }
+        }
+        return l;
+    }
+
+    // 命中：返回包含 (px,py) 的区域下标（在任一外环内且不在
+    // 任何洞内），否则 -1。
+    static int RegionAt(MapLayout l, int px, int py) {
+        for (int r = 0; r < l.regionCount; r = r + 1) {
+            bool hit = false;
+            for (int i = 0; i < l.polys.Count; i = i + 1) {
+                MapPolygon p = l.polys[i];
+                if (p.region != r || p.hole) { continue; }
+                if (px < p.minX || px > p.maxX || py < p.minY || py > p.maxY) { continue; }
+                if (Chart.PointInPoly(p.points, px, py)) { hit = true; break; }
+            }
+            if (!hit) { continue; }
+            for (int i = 0; i < l.polys.Count; i = i + 1) {
+                MapPolygon p = l.polys[i];
+                if (p.region != r || !p.hole) { continue; }
+                if (px < p.minX || px > p.maxX || py < p.minY || py > p.maxY) { continue; }
+                if (Chart.PointInPoly(p.points, px, py)) { hit = false; break; }
+            }
+            if (hit) { return r; }
+        }
+        return 0 - 1;
+    }
+}
+
+partial class ChartView {
+
+    // 连续色域：浅蓝 → 深蓝，value 归一化到 [vMin, vMax]。
+    static int MapRamp(int value, int vMin, int vMax) {
+        int lo = Chart.Rgb(188, 212, 235);
+        int hi = Chart.Rgb(42, 66, 140);
+        if (vMax <= vMin) { return hi; }
+        int f = (value - vMin) * 1000 / (vMax - vMin);
+        if (f < 0) { f = 0; }
+        if (f > 1000) { f = 1000; }
+        int r = 188 + (42 - 188) * f / 1000;
+        int g = 212 + (66 - 212) * f / 1000;
+        int b = 235 + (140 - 235) * f / 1000;
+        return Chart.Rgb(r, g, b);
+    }
+
+    // 向下取整除法（负分母也稳定），扫描线求交用。
+    static int Floordiv(int a, int b) {
+        int q = a / b;
+        if (a % b != 0 && (a < 0) != (b < 0)) { q = q - 1; }
+        return q;
+    }
+
+    // 扫描线填充任意多边形（even-odd），逐行生成 span 用 FillRect
+    // 绘制。行 y 半开穿越（与 PointInPoly 同侧判定），交点取在
+    // 像素中心线 y+0.5（2 倍定点）。
+    static void FillPolygon(Canvas c, List<ChartMapPoint> poly, int color) {
+        int n = poly.Count;
+        if (n < 3) { return; }
+        int minY = poly[0].y;
+        int maxY = poly[0].y;
+        for (int i = 1; i < n; i = i + 1) {
+            if (poly[i].y < minY) { minY = poly[i].y; }
+            if (poly[i].y > maxY) { maxY = poly[i].y; }
+        }
+        List<int> xs = new List<int>();
+        for (int y = minY; y <= maxY; y = y + 1) {
+            xs.Clear();
+            int j = n - 1;
+            for (int i = 0; i < n; i = i + 1) {
+                ChartMapPoint pi = poly[i];
+                ChartMapPoint pj = poly[j];
+                if ((pi.y > y) != (pj.y > y)) {
+                    int num = (2 * y + 1 - 2 * pj.y) * (pi.x - pj.x);
+                    int den = 2 * (pi.y - pj.y);
+                    xs.Add(pj.x + ChartView.Floordiv(num, den));
+                }
+                j = i;
+            }
+            // 交点排序（插入排序，量级通常 < 8）。
+            for (int a = 1; a < xs.Count; a = a + 1) {
+                int v = xs[a];
+                int b = a - 1;
+                while (b >= 0 && xs[b] > v) { xs[b + 1] = xs[b]; b = b - 1; }
+                xs[b + 1] = v;
+            }
+            // 成对 span：[xs[0], xs[1]] [xs[2], xs[3]] …。
+            for (int e = 0; e + 1 < xs.Count; e = e + 2) {
+                int x0 = xs[e];
+                int x1 = xs[e + 1];
+                if (x1 >= x0) { c.FillRect(x0, y, x1 - x0 + 1, 1, color); }
+            }
+        }
+    }
+
+    // 闭合多边形轮廓（DrawPolyline 首尾相接）。
+    static void PolyOutline(Canvas c, List<ChartMapPoint> poly, int color) {
+        int n = poly.Count;
+        if (n < 2) { return; }
+        List<int> px = new List<int>();
+        List<int> py = new List<int>();
+        for (int i = 0; i <= n; i = i + 1) {
+            ChartMapPoint p = poly[i % n];
+            px.Add(p.x);
+            py.Add(p.y);
+        }
+        c.DrawPolyline(px, py, color, 1);
+    }
+
+    static void DrawMap(App app, int x, int y, int w, int h, ChartOption o, int g) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int pad = t.paddingMedium;
+        int top = ChartView.PanelHead(app, x, y, w, h, o.title);
+        ChartSeries lead = ChartView.LeadSeries(o);
+        if (lead == null || lead.regions.Count < 1) { return; }
+
+        MapLayout layout = MapLayout.Of(lead.regions, x, top, w, y + h - top, pad);
+        int n = layout.polys.Count;
+        if (n < 1) { return; }
+
+        // 值域 → 连续色域；显式区域色优先。
+        int vMin = 0;
+        int vMax = 0;
+        for (int r = 0; r < lead.regions.Count; r = r + 1) {
+            int v = lead.regions[r].value;
+            if (r == 0) { vMin = v; vMax = v; }
+            else {
+                if (v < vMin) { vMin = v; }
+                if (v > vMax) { vMax = v; }
+            }
+        }
+
+        // 动画：透明度淡入。
+        int alpha = 60 + 195 * g / 1000;
+        if (alpha > 255) { alpha = 255; }
+
+        // 第一遍：所有外环。
+        for (int i = 0; i < n; i = i + 1) {
+            MapPolygon p = layout.polys[i];
+            if (p.hole) { continue; }
+            int col = lead.regions[p.region].color;
+            if (col == 0) { col = ChartView.MapRamp(lead.regions[p.region].value, vMin, vMax); }
+            ChartView.FillPolygon(c, p.points, Chart.WithAlpha(col, alpha));
+        }
+        // 第二遍：洞环回填背景（挖空）。
+        int bg = t.bgPrimary;
+        for (int i = 0; i < n; i = i + 1) {
+            MapPolygon p = layout.polys[i];
+            if (!p.hole) { continue; }
+            ChartView.FillPolygon(c, p.points, bg);
+        }
+        // 描边 + 中心标签（标签只放在外环质心）。
+        for (int i = 0; i < n; i = i + 1) {
+            MapPolygon p = layout.polys[i];
+            int col = lead.regions[p.region].color;
+            if (col == 0) { col = ChartView.MapRamp(lead.regions[p.region].value, vMin, vMax); }
+            ChartView.PolyOutline(c, p.points, col);
+            if (!p.hole) {
+                string nm = lead.regions[p.region].name;
+                if (nm.Length > 0) {
+                    int fs = t.fontSizeSmall;
+                    int tw = Canvas.MeasureText(nm, fs);
+                    c.DrawText(p.cx - tw / 2, p.cy - Canvas.FontHeight(fs) / 2,
+                        nm, t.textSecondary, fs);
+                }
+            }
+        }
+
+        if (o.showTooltip) {
+            int mx = app.mouseX;
+            int my = app.mouseY;
+            int r = MapLayout.RegionAt(layout, mx, my);
+            if (r >= 0) {
+                ChartMapRegion mr = lead.regions[r];
+                int col = mr.color;
+                if (col == 0) { col = ChartView.MapRamp(mr.value, vMin, vMax); }
+                List<TooltipRow> rows = new List<TooltipRow>{
+                    TooltipRow.Of(0, o.title),
+                    TooltipRow.Of(col, mr.name + "  " + Convert.ToString(mr.value)) };
+                ChartView.TooltipCard(app, mx, my, x + w, rows);
+            }
+        }
+    }
+}
