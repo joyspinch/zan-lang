@@ -257,6 +257,13 @@ class HttpServer {
             //    都是最终值；只有请求体可能仍在传输中。然后
             //    继续读取，直到请求体声明的字节数全部到齐。
             HttpRequest request = HttpRequest.Parse(buffer);
+            // 定界失败（Content-Length 溢出/重复不一致、非数字、
+            // Transfer-Encoding 未实现等）→ 拒绝，不切分正文：
+            // 剩余字节可能是走私的伪装请求，绝不能进入下轮。
+            if (request.parseStatus != 0) {
+                reject = request.parseStatus;
+                break;
+            }
             int bodyLen = request.contentLength;
             if (bodyLen < 0) { bodyLen = 0; }
             int need = headerEnd + bodyLen;
@@ -315,6 +322,18 @@ class HttpServer {
                 "request exceeds limit");
             tooLarge = tooLarge.SetKeepAlive(false);
             int _s = await client.SendAsync(tooLarge.Build());
+        } else if (reject == 400) {
+            // 定界冲突/畸形长度：请求走私拒绝。必须关闭连接——
+            // 缓冲区里可能还有伪装成下一条请求的剩余正文。
+            HttpResponse bad = HttpResponse.WithStatus(400, "Bad Request",
+                "malformed request framing");
+            bad = bad.SetKeepAlive(false);
+            int _b = await client.SendAsync(bad.Build());
+        } else if (reject == 501) {
+            HttpResponse nai = HttpResponse.WithStatus(501, "Not Implemented",
+                "Transfer-Encoding is not supported");
+            nai = nai.SetKeepAlive(false);
+            int _n = await client.SendAsync(nai.Build());
         }
 
         HttpDeadline.Disarm(watch);

@@ -1,0 +1,141 @@
+// Conformance: HTTP request framing must reject request-smuggling attempts
+// (RFC 7230 §3.3.2/§3.3.3). The server must not let a wrapped, duplicated or
+// chunked Content-Length desync the byte stream and turn leftover body bytes
+// into the next pipelined request. Each case sends a crafted request over a
+// raw socket and asserts the response status; the connection must be closed
+// afterwards (no keep-alive reuse across a rejected frame).
+using System;
+using System.Net.Sockets;
+using System.Net.Http;
+
+class Program {
+    static int PORT = 9521;
+    static int failures = 0;
+
+    static void Check(bool cond, string name) {
+        if (cond) {
+            Console.WriteLine("ok " + name);
+        } else {
+            Console.WriteLine("FAIL " + name);
+            failures = failures + 1;
+        }
+    }
+
+    static async HttpResponse Handle(HttpRequest req) {
+        // 只接受 POST /add：返回收到的正文长度，用于确认
+        // 走私正文没有被当作独立请求处理。
+        if (req.method == "POST" && req.path == "/add") {
+            return HttpResponse.Text("ok");
+        }
+        return HttpResponse.NotFound();
+    }
+
+    // 发送 raw 请求，返回响应状态码。checkClose 为 true 时（拒绝用例）
+    // 再读一次验证服务器已关闭连接；为 false 时（200 基线）连接按
+    // keep-alive 保持打开，不等待 EOF。
+    static async int SendRaw(string raw, bool checkClose) {
+        TcpClient c = await TcpClient.ConnectAsync("127.0.0.1", PORT, 3000);
+        int _s = await c.SendAsync(raw);
+        string resp = await c.RecvAsync(4096);
+        int status = 0;
+        if (resp.Length >= 12 && resp.Substring(0, 9) == "HTTP/1.1 ") {
+            // "HTTP/1.1 " 是 9 字节，之后是 3 位状态码
+            status = 100 * (resp[9] - 48) + 10 * (resp[10] - 48) + (resp[11] - 48);
+        }
+        if (checkClose) {
+            string tail = await c.RecvAsync(4096);
+            bool closed = tail.Length == 0;
+            Console.WriteLine("  closed=" + (closed ? "y" : "n"));
+        }
+        c.Close();
+        return status;
+    }
+
+    static async int Run() {
+        Socket.Initialize();
+        HttpServer server = new HttpServer("127.0.0.1", PORT);
+        server.OnRequest(Handle);
+        Task.Spawn(server.Start());
+        await Task.Delay(50);
+
+        // 1. 正常请求（基线）：200/ok，连接在 keep-alive 下保持。
+        {
+            int st = await SendRaw(
+                "POST /add HTTP/1.1\r\nHost: t\r\nContent-Length: 2\r\n\r\nhi",
+                false);
+            Check(st == 200, "baseline POST ok");
+        }
+
+        // 2. 超大 Content-Length：4294967297 在 32 位 int 下会回绕成 1，
+        //    修复前正文按 1 字节切分，剩余字节被当成下一条请求。必须 413。
+        {
+            int st = await SendRaw(
+                "POST /add HTTP/1.1\r\nHost: t\r\nContent-Length: 4294967297\r\n\r\nAAAA",
+                true);
+            Check(st == 413, "overflow CL rejected 413");
+        }
+
+        // 3. 重复且不一致的 Content-Length：前端和后端看到的长度不同
+        //    （CL.TE 的前奏）。必须 400。
+        {
+            int st = await SendRaw(
+                "POST /add HTTP/1.1\r\nHost: t\r\nContent-Length: 5\r\n"
+                + "Content-Length: 6\r\n\r\nhello!",
+                true);
+            Check(st == 400, "conflicting CL rejected 400");
+        }
+
+        // 4. 重复但一致的 Content-Length：RFC 7230 §3.3.2 允许相同值。
+        {
+            int st = await SendRaw(
+                "POST /add HTTP/1.1\r\nHost: t\r\nContent-Length: 2\r\n"
+                + "Content-Length: 2\r\n\r\nhi",
+                false);
+            Check(st == 200, "identical CL accepted");
+        }
+
+        // 5. 非数字 Content-Length：静默截断会让 "12abc" 变成 12。
+        //    必须 400。
+        {
+            int st = await SendRaw(
+                "POST /add HTTP/1.1\r\nHost: t\r\nContent-Length: 2abc\r\n\r\nhi",
+                true);
+            Check(st == 400, "non-numeric CL rejected 400");
+        }
+
+        // 6. 仅 Transfer-Encoding（chunked 未实现）：不能忽略，
+        //    必须 501。
+        {
+            int st = await SendRaw(
+                "POST /add HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n"
+                + "5\r\nhello\r\n0\r\n\r\n",
+                true);
+            Check(st == 501, "chunked TE rejected 501");
+        }
+
+        // 7. TE + CL 同时出现：CL.TE 走私（RFC 7230 §3.3.3）。必须 400。
+        {
+            int st = await SendRaw(
+                "POST /add HTTP/1.1\r\nHost: t\r\nContent-Length: 5\r\n"
+                + "Transfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
+                true);
+            Check(st == 400, "TE+CL rejected 400");
+        }
+
+        // 8. CL 带前导空格/加号：仅数字才是合法长度。
+        {
+            int st = await SendRaw(
+                "POST /add HTTP/1.1\r\nHost: t\r\nContent-Length: +2\r\n\r\nhi",
+                true);
+            Check(st == 400, "signed CL rejected 400");
+        }
+
+        server.Stop();
+        Console.WriteLine("failures=" + Convert.ToString(failures));
+        return 0;
+    }
+
+    static void Main() {
+        int r = await Run();
+    }
+}

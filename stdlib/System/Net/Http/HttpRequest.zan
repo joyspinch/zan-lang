@@ -18,6 +18,11 @@ class HttpRequest {
     string contentType;
     int contentLength;
     bool keepAlive;
+    // 请求定界/头部解析失败的原因（HTTP 状态码；0 = 正常）。
+    // 服务器在信任 contentLength 切分正文之前必须检查它——
+    // 回绕的 Content-Length、重复且不一致的 Content-Length、
+    // 未实现的 Transfer-Encoding 都是请求走私的入口。
+    int parseStatus;
 
     HttpRequest() {
         this.method = "";
@@ -30,6 +35,7 @@ class HttpRequest {
         this.contentType = "";
         this.contentLength = 0;
         this.keepAlive = true;
+        this.parseStatus = 0;
     }
 
     /// <summary>把原始 HTTP 请求字符串解析为 HttpRequest。
@@ -90,6 +96,14 @@ class HttpRequest {
         int pos = lineEnd + 1;
         int headersStart = pos;
         int headersStop = pos;
+        // 定界状态：Content-Length 用 64 位累加并检查溢出，
+        // 重复出现必须一致，Transfer-Encoding 绝不静默忽略
+        //（见各分支）——这三者是请求走私（RFC 7230 §3.3.2/§3.3.3）
+        // 的入口，一旦发现立即置 parseStatus，服务器据此拒绝。
+        long clAcc = 0;
+        bool clSeen = false;
+        long firstCl = 0;
+        bool teSeen = false;
         while (pos < len) {
             int hEnd = pos;
             while (hEnd < len && (raw[hEnd] & 255) != 10) {
@@ -120,20 +134,63 @@ class HttpRequest {
                 } else if (RegionIs(raw, pos, colonPos, "content-type")) {
                     req.contentType = raw.Substring(vStart, lineStop - vStart);
                 } else if (RegionIs(raw, pos, colonPos, "content-length")) {
-                    int cl = 0;
+                    // 用 64 位累加：32 位 int 下 `4294967297` 会回绕成 1，
+                    // 剩下的正文就被当成下一条流水线请求（经典走私）。
+                    // 任何非数字字符、或超出 int 上限的值都置 413/400，
+                    // 绝不静默截断。
+                    clAcc = 0;
+                    bool bad = false;
                     int di = vStart;
                     while (di < lineStop) {
                         int d = raw[di] & 255;
-                        if (d < 48 || d > 57) { break; }
-                        cl = cl * 10 + (d - 48);
+                        if (d < 48 || d > 57) { bad = true; break; }
+                        clAcc = clAcc * 10 + (d - 48);
+                        if (clAcc > 2147483647) { bad = true; break; }
                         di = di + 1;
                     }
-                    req.contentLength = cl;
+                    if (bad) {
+                        // 非数字 = 畸形头部；溢出 = 超限。区分以便给
+                        // 更精确的状态码，但两者都禁止继续信任该值。
+                        bool overflow = true;
+                        int ci = vStart;
+                        while (ci < lineStop) {
+                            int dd = raw[ci] & 255;
+                            if (dd < 48 || dd > 57) { overflow = false; break; }
+                            ci = ci + 1;
+                        }
+                        if (overflow) {
+                            req.parseStatus = 413;
+                        } else {
+                            req.parseStatus = 400;
+                        }
+                    } else if (clSeen) {
+                        // 第二个 Content-Length：与第一个不一致即走私
+                        //（RFC 7230 §3.3.2）。相同值按合法处理。
+                        if (firstCl != clAcc) { req.parseStatus = 400; }
+                    } else {
+                        clSeen = true;
+                        firstCl = clAcc;
+                        req.contentLength = (int)clAcc;
+                    }
+                } else if (RegionIs(raw, pos, colonPos, "transfer-encoding")) {
+                    // 服务器不实现 chunked 解码，绝不能忽略
+                    // Transfer-Encoding——否则按 Content-Length（或无）
+                    // 切分正文，而真实正文是分块编码，剩余 chunk 就被
+                    // 当成下一条请求。RFC 7230 §3.3.3：TE 与 CL 同时
+                    // 出现 → 400（冲突）；单独 TE（chunked）→ 501。
+                    // 顺序无关，循环结束后统一裁决。
+                    teSeen = true;
                 } else if (RegionIs(raw, pos, colonPos, "connection")) {
                     req.keepAlive = !RegionIs(raw, vStart, lineStop, "close");
                 }
             }
             pos = hEnd + 1;
+        }
+        // Transfer-Encoding 与 Content-Length 的共存裁决
+        //（RFC 7230 §3.3.3）：两者同时出现是走私特征 → 400；
+        // 只有 TE（chunked，未实现）→ 501。
+        if (teSeen && req.parseStatus == 0) {
+            req.parseStatus = clSeen ? 400 : 501;
         }
         if (headersStop > headersStart) {
             req.rawHeaders = raw.Substring(headersStart, headersStop - headersStart);

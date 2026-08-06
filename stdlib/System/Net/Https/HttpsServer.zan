@@ -97,25 +97,31 @@ class HttpsServer {
 
         bool keepAlive = true;
         string buffer = "";
-        bool overflow = false;
+        int reject = 0;
 
         while (keepAlive) {
             int headerEnd = HttpServer.FindHeaderEnd(buffer);
             while (headerEnd < 0) {
-                if (buffer.Length > this.maxRequestBytes) { overflow = true; break; }
+                if (buffer.Length > this.maxRequestBytes) { reject = 413; break; }
                 string chunk = await stream.RecvAsync(65536);
                 if (chunk.Length == 0) { keepAlive = false; break; }
                 buffer = buffer + chunk;
                 headerEnd = HttpServer.FindHeaderEnd(buffer);
             }
-            if (overflow) { break; }
+            if (reject != 0) { break; }
             if (!keepAlive) { break; }
 
             HttpRequest request = HttpRequest.Parse(buffer);
+            // 定界失败（Content-Length 溢出/重复不一致、非数字、
+            // Transfer-Encoding 未实现等）→ 拒绝，不切分正文。
+            if (request.parseStatus != 0) {
+                reject = request.parseStatus;
+                break;
+            }
             int bodyLen = request.contentLength;
             if (bodyLen < 0) { bodyLen = 0; }
             int need = headerEnd + bodyLen;
-            if (need > this.maxRequestBytes) { overflow = true; break; }
+            if (need > this.maxRequestBytes) { reject = 413; break; }
             while (buffer.Length < need) {
                 string chunk = await stream.RecvAsync(65536);
                 if (chunk.Length == 0) { keepAlive = false; break; }
@@ -146,11 +152,24 @@ class HttpsServer {
             }
         }
 
-        if (overflow) {
+        if (reject == 413) {
             HttpResponse tooLarge = HttpResponse.WithStatus(413, "Payload Too Large", "request exceeds limit");
             tooLarge = tooLarge.SetKeepAlive(false);
             string data = tooLarge.Build();
             int _s = await stream.SendAsync(data, data.Length);
+        } else if (reject == 400) {
+            // 定界冲突/畸形长度：请求走私拒绝，必须关闭连接。
+            HttpResponse bad = HttpResponse.WithStatus(400, "Bad Request",
+                "malformed request framing");
+            bad = bad.SetKeepAlive(false);
+            string data = bad.Build();
+            int _b = await stream.SendAsync(data, data.Length);
+        } else if (reject == 501) {
+            HttpResponse nai = HttpResponse.WithStatus(501, "Not Implemented",
+                "Transfer-Encoding is not supported");
+            nai = nai.SetKeepAlive(false);
+            string data = nai.Build();
+            int _n = await stream.SendAsync(data, data.Length);
         }
 
         stream.Close();
