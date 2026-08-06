@@ -1236,15 +1236,25 @@ set_target_properties(dap_integration_test PROPERTIES
 if(WIN32)
     target_compile_definitions(dap_integration_test PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif()
+# The debug target is compiled with `zanc -g` at build time (same custom
+# command pattern as zanfmt) so the harness runs directly as the ctest
+# command and can propagate its skip code.
+set(_dap_dbg ${CMAKE_BINARY_DIR}/dbgtarget${_exe_ext})
+add_custom_command(OUTPUT ${_dap_dbg}
+    COMMAND $<TARGET_FILE:zanc> ${CMAKE_SOURCE_DIR}/tests/dap/dbgtarget.zan
+            -g --auto-stdlib -o ${_dap_dbg}
+    DEPENDS zanc ${CMAKE_SOURCE_DIR}/tests/dap/dbgtarget.zan)
+# The target cannot be called `dbgtarget`: on platforms with no executable
+# suffix that collides with the custom command's output file (see the zanfmt
+# comment above).
+add_custom_target(dap_debug_target ALL DEPENDS ${_dap_dbg})
+# The harness FAILS unless a real gdb debug session happens; environments
+# without gdb must opt out via ZAN_ALLOW_SKIP_DAP=1, which exits 77. CTest
+# then reports the run as "skipped" (not "passed") via SKIP_RETURN_CODE.
 add_test(NAME dap_integration
-  COMMAND ${CMAKE_COMMAND}
-    -DZANC=$<TARGET_FILE:zanc>
-    -DDAP=$<TARGET_FILE:zan-dap>
-    -DHARNESS=$<TARGET_FILE:dap_integration_test>
-    -DSRC=${CMAKE_SOURCE_DIR}/tests/dap/dbgtarget.zan
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/dbgtarget${_exe_ext}
-    -DZANC_ARGS=--auto-stdlib
-    -P ${CMAKE_SOURCE_DIR}/tests/run_dap.cmake)
+  COMMAND dap_integration_test $<TARGET_FILE:zan-dap> ${_dap_dbg}
+                              ${CMAKE_SOURCE_DIR}/tests/dap/dbgtarget.zan)
+set_tests_properties(dap_integration PROPERTIES SKIP_RETURN_CODE 77)
 
 # ---- LSP integration test (real zan-lsp over stdio; A5 UTF-16 positions) ----
 add_executable(lsp_integration_test

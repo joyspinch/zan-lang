@@ -9,8 +9,10 @@
  *
  * Usage: dap_integration_test <zan-dap> <target-exe> <source-file>
  *
- * If no usable gdb is found on the machine the test prints SKIP and exits 0,
- * so environments without a debugger do not fail the suite.
+ * A missing debugger FAILS the test: a machine or CI job without gdb must
+ * opt out explicitly with ZAN_ALLOW_SKIP_DAP=1, which exits 77 (CTest
+ * SKIP_RETURN_CODE) so the run shows as "skipped", not "passed". This keeps
+ * a broken adapter or an absent gdb from silently green-lighting the suite.
  * ==================================================================== */
 #include <stdio.h>
 #include <stdlib.h>
@@ -190,6 +192,25 @@ static bool wait_event(child_t *c, const char *name, char *out, int cap) {
     return false;
 }
 
+/* Wait for a "stopped" event, but treat any end-of-session event
+ * ("terminated"/"exited", which the adapter emits when the inferior runs to
+ * completion without a stop) as the absence of a stop. The adapter stays
+ * alive waiting for more requests after that, so a plain wait_event would
+ * block forever in the gdb-less case. Returns true only on a real stop. */
+static bool wait_stopped_or_ended(child_t *c, char *out, int cap) {
+    for (int i = 0; i < 200; i++) {
+        if (!dap_recv(c, out, cap)) return false;
+        if (strstr(out, "\"type\":\"event\"") &&
+            strstr(out, "\"event\":\"stopped\""))
+            return true;
+        if (strstr(out, "\"type\":\"event\"") &&
+            (strstr(out, "\"event\":\"terminated\"") ||
+             strstr(out, "\"event\":\"exited\"")))
+            return false;
+    }
+    return false;
+}
+
 /* Wait for the response to command name; copy it to out. */
 static bool wait_response(child_t *c, const char *command, char *out, int cap) {
     for (int i = 0; i < 200; i++) {
@@ -289,12 +310,21 @@ int main(int argc, char **argv) {
     dap_send(&c, body);
     (void)wait_response(&c, "configurationDone", msg, sizeof(msg));
 
-    /* Either we stop at a breakpoint (gdb present) or the program exits
-     * (no gdb) — detect a gdb-less environment and SKIP gracefully. */
-    if (!wait_event(&c, "stopped", msg, sizeof(msg))) {
-        printf("SKIP: no stopped event (gdb unavailable?) — skipping DAP integration\n");
+    /* Either we stop at a breakpoint (gdb present) or the session ends
+     * without ever stopping (no gdb / broken adapter). An end without a stop
+     * FAILS the test by default; ZAN_ALLOW_SKIP_DAP=1 is the explicit
+     * opt-out for environments that cannot provide gdb, reported as
+     * "skipped" (exit 77) not "passed". */
+    if (!wait_stopped_or_ended(&c, msg, sizeof(msg))) {
         child_close(&c);
-        return 0;
+        const char *optout = getenv("ZAN_ALLOW_SKIP_DAP");
+        if (optout && strcmp(optout, "1") == 0) {
+            printf("SKIP: no stopped event (gdb unavailable) — opt-out via ZAN_ALLOW_SKIP_DAP=1\n");
+            return 77;
+        }
+        fprintf(stderr, "FAIL: no stopped event — is gdb installed and usable?\n"
+                        "      (set ZAN_ALLOW_SKIP_DAP=1 to skip this test)\n");
+        return 1;
     }
     check(strstr(msg, "\"reason\":\"breakpoint\"") != NULL, "stopped reason=breakpoint");
     check(verified, "breakpoint verified");
