@@ -110,7 +110,7 @@ partial class ChartView {
         // dataZoom 窗口状态与渲染器读取的一致。
         int zwid = 300000 + slot;
         ResolvedChart resolved = ResolvedChart.Resolve(o, app.theme, app, zwid);
-        int fp = ChartView.CacheFingerprint(app, o, resolved);
+        int fp = ChartView.CacheFingerprint(app, o, resolved, x, y, w, h);
         if (app.StateGet(Chart.CacheKey(slot), 0) == fp
             && c.RestoreRect(x, y, w, h, slot)) {
             return true;
@@ -129,15 +129,31 @@ partial class ChartView {
     /// regions/marks/gauge/radarMax）。任何会改变
     /// 像素的因素都使缓存快照失效；悬停位置刻意不
     /// 不（悬停层在缓存命中后绘制于其上）。
-    static int CacheFingerprint(App app, ChartOption o, ResolvedChart resolved) {
+    static int CacheFingerprint(App app, ChartOption o, ResolvedChart resolved,
+                                int x, int y, int w, int h) {
         int zoomLo = 0;
         int zoomHi = 0;
         if (o.zoom) {
             zoomLo = app.StateGet(Chart.ZoomLoKey(resolved.wid), o.zoomStart * 10);
             zoomHi = app.StateGet(Chart.ZoomHiKey(resolved.wid), o.zoomEnd * 10);
         }
-        return ChartView.FingerprintCore(
+        int fp = ChartView.FingerprintCore(
             app.ThemeMenuIndex() * 7919 + app.bgThemeGen, zoomLo, zoomHi, o, resolved);
+        // 视口：快照槽位绑定像素矩形；控件移动 / 缩放而
+        // 复用旧快照会画出错位像素，因此矩形进入指纹。
+        fp = (fp * 31 + x * 7 + y * 13 + w * 17 + h * 19) % 2000000000;
+        return fp;
+    }
+
+    /// 把字符串内容折叠进指纹。Zan 没有 char 值类型，但
+    /// s[i] 给出字符编码（UTF-8 字节）；逐字节折叠使长度相同、
+    /// 内容不同的标签/名称折叠出不同值，避免陈旧缓存。
+    /// 空串返回 h 原值。
+    static int FoldStr(int h, string s, int seed) {
+        for (int i = 0; i < s.Length; i = i + 1) {
+            h = (h * 31 + (s[i] & 255) + i * 5 + seed) % 2000000000;
+        }
+        return h;
     }
 
     /// 指纹的纯核心。主题代（themeGen）与 dataZoom 状态
@@ -152,27 +168,70 @@ partial class ChartView {
         h = (h * 31 + o.zoomStart + o.zoomEnd + o.backgroundColor) % 2000000000;
         h = (h * 31 + o.donutPct + (o.pieRings ? 1 : 0) + (o.pieLabels ? 1 : 0)
             + o.gaugeMax) % 2000000000;
+        // 改变布局/像素的 option 开关与边距。
+        h = (h * 31 + (o.showLegend ? 1 : 0) + (o.showGrid ? 1 : 0)
+            + (o.showValues ? 1 : 0) + (o.smooth ? 1 : 0)) % 2000000000;
+        h = (h * 31 + (o.gradient ? 1 : 0) + (o.rounded ? 1 : 0)
+            + o.markLine + o.markLo + o.markHi) % 2000000000;
+        h = ChartView.FoldStr(h, o.markLabel, 1);
+        h = ChartView.FoldStr(h, o.title, 2);
+        h = (h * 31 + o.gridLeft + o.gridRight + o.gridTop + o.gridBottom) % 2000000000;
         for (int ri = 0; ri < o.radarMax.Count; ri = ri + 1) {
             h = (h * 31 + o.radarMax[ri]) % 2000000000;
+        }
+        // 轴配置：类型/范围/翻转/刻度/网格/标题 + 分类标签
+        // （标签直接决定绘制文字，长度哈希与系列名约定一致）。
+        for (int ai = 0; ai < o.xAxes.Count; ai = ai + 1) {
+            ChartAxis ax = o.xAxes[ai];
+            h = (h * 31 + ax.type + ax.min + ax.max + ax.ticks) % 2000000000;
+            h = (h * 31 + (ax.reversed ? 1 : 0) + (ax.showGrid ? 1 : 0)) % 2000000000;
+            h = ChartView.FoldStr(h, ax.title, 3);
+            for (int cj = 0; cj < ax.categories.Count; cj = cj + 1) {
+                h = ChartView.FoldStr(h, ax.categories[cj], cj * 31);
+            }
+        }
+        for (int ai = 0; ai < o.yAxes.Count; ai = ai + 1) {
+            ChartAxis ay = o.yAxes[ai];
+            h = (h * 31 + ay.type + ay.min + ay.max + ay.ticks) % 2000000000;
+            h = (h * 31 + (ay.reversed ? 1 : 0) + (ay.showGrid ? 1 : 0)) % 2000000000;
+            h = ChartView.FoldStr(h, ay.title, 4);
         }
         h = (h * 31 + o.series.Count) % 2000000000;
         for (int s = 0; s < o.series.Count; s = s + 1) {
             ChartSeries cs = o.series[s];
             ResolvedSeries rs = resolved.series[s];
-            h = (h * 31 + cs.type + cs.axisIndex + cs.name.Length * 3) % 2000000000;
-            h = (h * 31 + cs.stack + cs.stackName.Length + cs.innerPct + cs.custom.Length) % 2000000000;
+            h = (h * 31 + cs.type + cs.axisIndex) % 2000000000;
+            h = ChartView.FoldStr(h, cs.name, 5);
+            h = (h * 31 + cs.stack + cs.innerPct) % 2000000000;
+            h = ChartView.FoldStr(h, cs.stackName, 6);
+            h = ChartView.FoldStr(h, cs.custom, 7);
             h = (h * 31 + rs.color + rs.lineColor + rs.lineWidth + rs.areaColor) % 2000000000;
             h = (h * 31 + rs.labelColor + rs.labelFontSize) % 2000000000;
-            h = (h * 31 + cs.itemStyle.normal.borderColor + cs.itemStyle.normal.borderWidth
-                + cs.itemStyle.normal.lineStyle.type.Length) % 2000000000;
+            h = (h * 31 + cs.itemStyle.normal.borderColor
+                + cs.itemStyle.normal.borderWidth) % 2000000000;
+            h = ChartView.FoldStr(h, cs.itemStyle.normal.lineStyle.type, 8);
+            // 逐系列绘制开关：平滑覆盖 / 面积填充 / 阶梯 /
+            // 漏斗排序 / 玫瑰 / 水平柱 / 树方向。
+            h = (h * 31 + cs.smooth + (cs.areaStyle ? 1 : 0)) % 2000000000;
+            h = ChartView.FoldStr(h, cs.step, 9);
+            h = ChartView.FoldStr(h, cs.sort, 10);
+            h = ChartView.FoldStr(h, cs.roseType, 11);
+            h = (h * 31 + (cs.hbar ? 1 : 0)) % 2000000000;
+            h = ChartView.FoldStr(h, cs.treeOrient, 12);
             if (cs.labelShow) { h = (h * 31 + 13) % 2000000000; }
             if (rs.hidden) { h = (h * 31 + 7) % 2000000000; }
             for (int v = 0; v < cs.Count(); v = v + 1) {
                 h = (h * 31 + cs.Value(v)) % 2000000000;
             }
+            for (int di = 0; di < cs.data.Count; di = di + 1) {
+                if (cs.data[di].color != 0) {
+                    h = (h * 31 + cs.data[di].color) % 2000000000;
+                }
+            }
             for (int li = 0; li < cs.links.Count; li = li + 1) {
-                h = (h * 31 + cs.links[li].from.Length + cs.links[li].to.Length
-                    + cs.links[li].val) % 2000000000;
+                h = ChartView.FoldStr(h, cs.links[li].from, 13);
+                h = ChartView.FoldStr(h, cs.links[li].to, 14);
+                h = (h * 31 + cs.links[li].val) % 2000000000;
             }
             for (int pi = 0; pi < cs.points.Count; pi = pi + 1) {
                 h = (h * 31 + cs.points[pi].x + cs.points[pi].y) % 2000000000;
@@ -185,25 +244,31 @@ partial class ChartView {
                 h = (h * 31 + cs.bubbles[bi].x + cs.bubbles[bi].y + cs.bubbles[bi].weight) % 2000000000;
             }
             for (int xi = 0; xi < cs.boxes.Count; xi = xi + 1) {
-                h = (h * 31 + cs.boxes[xi].label.Length + cs.boxes[xi].lo
-                    + cs.boxes[xi].q1 + cs.boxes[xi].med + cs.boxes[xi].q3 + cs.boxes[xi].hi) % 2000000000;
+                h = ChartView.FoldStr(h, cs.boxes[xi].label, 15);
+                h = (h * 31 + cs.boxes[xi].lo + cs.boxes[xi].q1
+                    + cs.boxes[xi].med + cs.boxes[xi].q3 + cs.boxes[xi].hi) % 2000000000;
             }
             for (int ei = 0; ei < cs.errors.Count; ei = ei + 1) {
-                h = (h * 31 + cs.errors[ei].label.Length + cs.errors[ei].y + cs.errors[ei].err) % 2000000000;
+                h = ChartView.FoldStr(h, cs.errors[ei].label, 16);
+                h = (h * 31 + cs.errors[ei].y + cs.errors[ei].err) % 2000000000;
             }
             for (int ti = 0; ti < cs.tree.Count; ti = ti + 1) {
-                h = (h * 31 + cs.tree[ti].name.Length + cs.tree[ti].Total()) % 2000000000;
+                h = ChartView.FoldStr(h, cs.tree[ti].name, 17);
+                h = (h * 31 + cs.tree[ti].Total()) % 2000000000;
             }
             for (int vi = 0; vi < cs.events.Count; vi = vi + 1) {
-                h = (h * 31 + cs.events[vi].name.Length + cs.events[vi].start
-                    + cs.events[vi].end + cs.events[vi].value) % 2000000000;
+                h = ChartView.FoldStr(h, cs.events[vi].name, 18);
+                h = (h * 31 + cs.events[vi].start + cs.events[vi].end
+                    + cs.events[vi].value) % 2000000000;
             }
             for (int gi = 0; gi < cs.regions.Count; gi = gi + 1) {
-                h = (h * 31 + cs.regions[gi].name.Length + cs.regions[gi].value
+                h = ChartView.FoldStr(h, cs.regions[gi].name, 19);
+                h = (h * 31 + cs.regions[gi].value
                     + cs.regions[gi].rings.Count) % 2000000000;
             }
             for (int mi = 0; mi < cs.marks.Count; mi = mi + 1) {
-                h = (h * 31 + cs.marks[mi].kind.Length + cs.marks[mi].dataIndex
+                h = ChartView.FoldStr(h, cs.marks[mi].kind, 20);
+                h = (h * 31 + cs.marks[mi].dataIndex
                     + cs.marks[mi].xValue + cs.marks[mi].yValue) % 2000000000;
             }
             h = (h * 31 + cs.gauge.min + cs.gauge.max + cs.gauge.precision
