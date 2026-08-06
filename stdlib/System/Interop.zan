@@ -17,6 +17,7 @@ namespace System;
 /// 无需 C shim：先探测，缺失时回退即可。
 /// </summary>
 class Interop {
+#if WINDOWS
     [DllImport("kernel32", EntryPoint = "LoadLibraryA")]
     static extern nint WinLoad(string name);
 
@@ -26,20 +27,80 @@ class Interop {
     [DllImport("kernel32", EntryPoint = "FreeLibrary")]
     static extern int WinUnload(nint mod);
 
+    [DllImport("kernel32", EntryPoint = "GetLastError")]
+    static extern int WinLastError();
+#else
+    [DllImport("crt", EntryPoint = "dlopen")]
+    static extern nint PosixLoad(string name, int flags);
+
+    [DllImport("crt", EntryPoint = "dlsym")]
+    static extern nint PosixSymbol(nint mod, string name);
+
+    [DllImport("crt", EntryPoint = "dlclose")]
+    static extern int PosixUnload(nint mod);
+
+    [DllImport("crt", EntryPoint = "dlerror")]
+    static extern string PosixError();
+
+    /// RTLD_NOW | RTLD_LOCAL 的整数值：Linux/musl 上 RTLD_LOCAL 为 0
+    /// （RTLD_NOW=2），Darwin 上 RTLD_LOCAL=4（RTLD_NOW=2），所以
+    /// 不能只写一次硬编码常量。
+    static int RtldNowLocal() {
+        #if LINUX
+        return 2;
+        #else
+        return 6;
+        #endif
+    }
+#endif
+
+    static string lastError = "";
+
+    /// 上次失败加载的原生加载器错误文本（dlerror / Win32 错误码）；
+    /// 没有失败时为空字符串。
+    static string LastError() {
+        return Interop.lastError;
+    }
+
     /// 按名称或路径加载共享库；不存在时返回 0。
     static nint Load(string name) {
-        return Interop.WinLoad(name);
+        #if WINDOWS
+        nint m = Interop.WinLoad(name);
+        Interop.lastError = "";
+        if (m == 0) {
+            Interop.lastError = "win32 error " +
+                                Convert.ToString(Interop.WinLastError());
+        }
+        return m;
+        #else
+        // dlerror() 是线程局部的，且会被后续任何 dl* 调用清空，
+        // 所以必须在失败的检查点立即读走。
+        nint m = Interop.PosixLoad(name, Interop.RtldNowLocal());
+        Interop.lastError = "";
+        if (m == 0) { Interop.lastError = Interop.PosixError(); }
+        return m;
+        #endif
     }
 
     /// 导出入口点的地址；库中没有时返回 0
     /// （一种以 ABI 兼容方式探测新运行时特性的做法）。
     static nint Symbol(nint mod, string name) {
         if (mod == 0) { return 0; }
+        #if WINDOWS
         return Interop.WinSymbol(mod, name);
+        #else
+        return Interop.PosixSymbol(mod, name);
+        #endif
     }
 
     static void Unload(nint mod) {
-        if (mod != 0) { Interop.WinUnload(mod); }
+        if (mod != 0) {
+            #if WINDOWS
+            Interop.WinUnload(mod);
+            #else
+            Interop.PosixUnload(mod);
+            #endif
+        }
     }
 
     /// 一步加载 `name` 并解析 `entry`；任一失败返回 0。

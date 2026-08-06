@@ -1,0 +1,54 @@
+// System.Interop dynamic-library loading smoke test. The loader must work on
+// every OS (LoadLibraryA on Windows, dlopen/dlsym/dlclose on POSIX), return 0
+// for a missing library or symbol, and surface a non-empty last-error text
+// after a failed load. Candidate library/symbol names differ per platform, so
+// each branch picks its own but the golden output is identical everywhere.
+using System;
+
+namespace Conf;
+
+class T {
+    static int HasSym(nint mod, string[] names) {
+        for (int i = 0; i < names.Length; i = i + 1) {
+            if (Interop.Symbol(mod, names[i]) != 0) { return 1; }
+        }
+        return 0;
+    }
+
+    static void Main() {
+        int bad = 0;
+#if WINDOWS
+        string[] libs = new string[] { "kernel32.dll", "user32.dll" };
+        string[] syms = new string[] { "Sleep", "GetProcAddress" };
+        string missing = "zan_no_such_lib_zzz.dll";
+#else
+        // POSIX: every libc implements these names (glibc libc.so.6, musl
+        // libc.so, Darwin libSystem.B.dylib).
+        string[] libs = new string[] { "libc.so.6", "libc.so", "libSystem.B.dylib" };
+        string[] syms = new string[] { "puts", "printf" };
+        string missing = "zan_no_such_lib_zzz.so";
+#endif
+
+        // At least one candidate library must load.
+        nint mod = 0;
+        for (int i = 0; i < libs.Length; i = i + 1) {
+            mod = Interop.Load(libs[i]);
+            if (mod != 0) { break; }
+        }
+        if (mod == 0) { bad = bad + 1; }
+
+        // A real symbol resolves to a non-zero address; a missing symbol is 0.
+        if (HasSym(mod, syms) == 0) { bad = bad + 1; }
+        if (Interop.Symbol(mod, "zan_no_such_symbol_zzz") != 0) { bad = bad + 1; }
+
+        // A missing library is a 0 handle and LastError is non-empty.
+        if (Interop.Load(missing) != 0) { bad = bad + 1; }
+        if (Interop.LastError() == "") { bad = bad + 1; }
+
+        // Symbol on a null handle is 0, Unload on a null handle is a no-op.
+        if (Interop.Symbol(0, "puts") != 0) { bad = bad + 1; }
+        Interop.Unload(0);
+        Interop.Unload(mod);
+        Console.WriteLine("interop-dl-ok: " + (bad == 0 ? 1 : 0));
+    }
+}
