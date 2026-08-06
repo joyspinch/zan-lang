@@ -30,10 +30,102 @@ class DebugPanel {
     static Tabs panelTabs;
     static List<string> panelLbls;
     static List<Button> toolbarBtns;
+    /// The grids and the watch expression field. Rows, headers, striping,
+    /// scrolling, the empty state and text editing all belong to the widgets;
+    /// this file only binds the debugger's lists to them.
+    static ListView<DbgVar> varsList;
+    static ListView<DbgVar> watchList;
+    static ListView<DbgFrame> stackList;
+    static Input watchIn;
+    static Label lineLbl;
+    static Label inlineLbl;
+    /// What the user did in the Watch tab this frame, picked up by the shell:
+    /// an expression to add, and the row to drop.
+    static string watchAdd;
+    static int watchDrop;
+
+    /// A Name / Type / Value grid over the debugger's variable rows.
+    static ListView<DbgVar> VarGrid() {
+        List<ListColumn<DbgVar>> cols = new List<ListColumn<DbgVar>>();
+        cols.Add(new ListColumn<DbgVar>(ZanIDE.T("Name", "名称"), 2, v => v.name));
+        cols.Add(new ListColumn<DbgVar>(ZanIDE.T("Type", "类型"), 2, v => v.type));
+        cols.Add(new ListColumn<DbgVar>(ZanIDE.T("Value", "值"), 3, v => v.val));
+        return new ListView<DbgVar>(cols);
+    }
+
+    static ListView<DbgVar> VarsList() {
+        if (DebugPanel.varsList == null) {
+            DebugPanel.varsList = DebugPanel.VarGrid();
+            DebugPanel.varsList.EmptyText(ZanIDE.T("(no variables in scope)",
+                "（作用域内没有变量）"));
+        }
+        return DebugPanel.varsList;
+    }
+
+    static ListView<DbgVar> WatchList() {
+        if (DebugPanel.watchList == null) {
+            DebugPanel.watchList = DebugPanel.VarGrid();
+            DebugPanel.watchList.EmptyText(ZanIDE.T("No watches yet.",
+                "还没有监视表达式。"));
+            DebugPanel.watchList.OnSelect(DebugPanel.WatchRowPicked);
+        }
+        return DebugPanel.watchList;
+    }
+
+    static ListView<DbgFrame> StackList() {
+        if (DebugPanel.stackList == null) {
+            List<ListColumn<DbgFrame>> cols = new List<ListColumn<DbgFrame>>();
+            cols.Add(new ListColumn<DbgFrame>(ZanIDE.T("Call Stack", "调用栈"),
+                f => f.name + " : line " + Convert.ToString(f.line)));
+            DebugPanel.stackList = new ListView<DbgFrame>(cols);
+        }
+        return DebugPanel.stackList;
+    }
+
+    static Input WatchInput() {
+        if (DebugPanel.watchIn == null) {
+            DebugPanel.watchIn = new Input(ZanIDE.T(
+                "Type an expression and press Enter; click a row to remove it",
+                "输入表达式后回车添加；点击行删除"));
+            DebugPanel.watchIn.Submit.Add(DebugPanel.WatchSubmitted);
+        }
+        return DebugPanel.watchIn;
+    }
+
+    /// Enter in the expression field: the shell adds it and re-evaluates.
+    static void WatchSubmitted() {
+        Input box = DebugPanel.WatchInput();
+        if (box.GetText().Length == 0) { return; }
+        DebugPanel.watchAdd = box.GetText();
+        box.SetText("");
+    }
+
+    /// A watch row is clicked to drop that expression, so the selection is
+    /// only ever a gesture and is cleared right away.
+    static void WatchRowPicked() {
+        ListView<DbgVar> rows = DebugPanel.WatchList();
+        if (!rows.HasSelection()) { return; }
+        DebugPanel.watchDrop = rows.SelectedIndex();
+        rows.ClearSelection();
+    }
+
+    /// The expression the user submitted since the last call, or "".
+    static string TakeWatchAdd() {
+        string s = DebugPanel.watchAdd;
+        DebugPanel.watchAdd = "";
+        return s;
+    }
+
+    /// The watch row the user clicked since the last call, or -1.
+    static int TakeWatchDrop() {
+        int i = DebugPanel.watchDrop;
+        DebugPanel.watchDrop = 0 - 1;
+        return i;
+    }
 
     static void RenderDebugBottom(App app, Canvas c, Theme t, Rect orr, SignalInt panelTab,
             List<string> console, List<DbgVar> vars, List<DbgVar> watchRows,
-            string watchInput, List<DbgFrame> stack, List<string> log,
+            List<DbgFrame> stack, List<string> log,
             LogState dbgLog) {
         int tab = panelTab.Get();
         int tabH = t.heightMedium;
@@ -68,7 +160,7 @@ class DebugPanel {
             DebugPanel.RenderVarsTab(app, c, t, orr.x, contentY, orr.width, contentH, vars);
         } else if (tab == 2) {
             DebugPanel.RenderWatchTab(app, c, t, orr.x, contentY, orr.width, contentH,
-                watchRows, watchInput);
+                watchRows);
         } else if (tab == 3) {
             DebugPanel.RenderStackTab(app, c, t, orr.x, contentY, orr.width, contentH, stack);
         }
@@ -76,67 +168,29 @@ class DebugPanel {
 
     static void RenderVarsTab(App app, Canvas c, Theme t,
             int x, int y, int w, int h, List<DbgVar> vars) {
-        // Name/Type/Value grid rendered through the framework Table widget.
-        int rowH = t.heightMedium;
-        List<int> widths = new List<int>{ app.Scale(120), app.Scale(100) };
-        int valW = w - app.Scale(220);
-        if (valW < app.Scale(80)) { valW = app.Scale(80); }
-        widths.Add(valW);
-        List<string> cols = new List<string>{
-            ZanIDE.T("Name", "名称"), ZanIDE.T("Type", "类型"),
-            ZanIDE.T("Value", "值") };
-        Table.RenderHeader(app, x, y, cols, widths);
-        int cy = y + rowH;
-        for (int ri = 0; ri < vars.Count && cy + rowH <= y + h; ri = ri + 1) {
-            DbgVar entry = vars[ri];
-            List<string> cells = new List<string>{ entry.name, entry.type, entry.val };
-            Table.RenderRow(app, x, cy, cells, widths, ri % 2 == 1);
-            cy = cy + rowH;
-        }
-        if (vars.Count == 0) {
-            app.canvas.DrawText(x + app.Scale(4), y + rowH + app.Scale(8), ZanIDE.T("(no variables in scope)", "（作用域内没有变量）"), app.theme.textDisabled,
-                Style.Of(app, "label", "small", Style.SNormal())
-                    .FontOr(app.theme.fontSizeSmall));
-        }
+        ListView<DbgVar> grid = DebugPanel.VarsList();
+        grid.Bind(vars);
+        grid.RenderInside(app, new Rect(x, y, w, h));
     }
 
-    /// Watch tab: an expression input row on top (Enter adds, click a row
-    /// removes), then the evaluated expressions in the Variables grid.
+    /// Watch tab: an expression field on top (Enter adds, click a row removes),
+    /// then the evaluated expressions in the same grid as Variables.
     static void RenderWatchTab(App app, Canvas c, Theme t,
-            int x, int y, int w, int h, List<DbgVar> rows, string inputText) {
-        int inpH = app.Scale(26);
-        ZanIDE.ShellField(app, x + app.Scale(4), y + app.Scale(3),
-            w - app.Scale(8), app.Scale(20));
-        string shown = inputText;
-        int shownCol = t.textPrimary;
-        if (shown.Length == 0) {
-            shown = ZanIDE.T("Type an expression and press Enter; click a row to remove it",
-                "输入表达式后回车添加；点击行删除");
-            shownCol = t.textDisabled;
-        }
-        app.canvas.DrawText(x + app.Scale(8), y + app.Scale(6), shown, shownCol,
-            Style.Of(app, "label", "small", Style.SNormal())
-                .FontOr(app.theme.fontSizeSmall));
-        DebugPanel.RenderVarsTab(app, c, t, x, y + inpH, w, h - inpH, rows);
+            int x, int y, int w, int h, List<DbgVar> rows) {
+        int inpH = t.heightMedium;
+        DebugPanel.WatchInput().Render(app, x + app.Scale(4), y + app.Scale(3),
+            w - app.Scale(8), inpH);
+        ListView<DbgVar> grid = DebugPanel.WatchList();
+        grid.Bind(rows);
+        int top = y + inpH + app.Scale(6);
+        grid.RenderInside(app, new Rect(x, top, w, y + h - top));
     }
 
     static void RenderStackTab(App app, Canvas c, Theme t,
             int x, int y, int w, int h, List<DbgFrame> stack) {
-        // Single-column frame list through the framework Table widget; the
-        // current (top) frame is the highlighted stripe.
-        int rowH = t.heightMedium;
-        List<int> widths = new List<int>();
-        widths.Add(w);
-        List<string> cols = new List<string>();
-        cols.Add(ZanIDE.T("Call Stack", "调用栈"));
-        Table.RenderHeader(app, x, y, cols, widths);
-        int cy = y + rowH;
-        for (int ri = 0; ri < stack.Count && cy + rowH <= y + h; ri = ri + 1) {
-            List<string> cells = new List<string>();
-            cells.Add(stack[ri].name + " : line " + Convert.ToString(stack[ri].line));
-            Table.RenderRow(app, x, cy, cells, widths, ri == 0);
-            cy = cy + rowH;
-        }
+        ListView<DbgFrame> grid = DebugPanel.StackList();
+        grid.Bind(stack);
+        grid.RenderInside(app, new Rect(x, y, w, h));
     }
 
     static void RenderInlineVars(App app, Canvas c, Theme t, Rect edRect,
@@ -161,9 +215,13 @@ class DebugPanel {
         int tx = edRect.x + edRect.width - tw - app.Scale(8);
         int ty = edRect.y + app.Scale(4);
         Prompt.Surface(app, tx, ty, tw, th, "");
-        app.canvas.DrawText(tx + app.Scale(8), ty + app.Scale(4), inlineText, EditorPalette.For(t).str,
-            Style.Of(app, "label", "small", Style.SNormal())
-                .FontOr(app.theme.fontSizeSmall));
+        if (DebugPanel.inlineLbl == null) {
+            DebugPanel.inlineLbl = new Label("");
+            DebugPanel.inlineLbl.Class = "small string";
+        }
+        DebugPanel.inlineLbl.Text = inlineText;
+        DebugPanel.inlineLbl.RenderAt(app, tx + app.Scale(8), ty + app.Scale(4),
+            tw - app.Scale(16));
     }
 
     /// The stepping toolbar's buttons as data (icon, label, class, action id),
@@ -214,12 +272,14 @@ class DebugPanel {
             bx = bx + btnW + gap;
         }
         bx = bx + gap;
-        string lineInfo = ZanIDE.T("Line: ", "行：") + Convert.ToString(execLine + 1);
-        int lineY = Canvas.CenterTextY(y, h, t.fontSizeSmall);
-        app.canvas.DrawStyledText(
-            Style.Of(app, "label", "secondary small", Style.SNormal()),
-            bx, lineY, lineInfo,
-            app.theme.textPrimary, app.theme.fontSizeMedium);
+        if (DebugPanel.lineLbl == null) {
+            DebugPanel.lineLbl = new Label("");
+            DebugPanel.lineLbl.Class = "secondary small";
+        }
+        DebugPanel.lineLbl.Text = ZanIDE.T("Line: ", "行：")
+            + Convert.ToString(execLine + 1);
+        DebugPanel.lineLbl.RenderAt(app, bx,
+            Canvas.CenterTextY(y, h, t.fontSizeSmall));
         return 0 - 1;
     }
 }
