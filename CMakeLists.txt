@@ -1246,6 +1246,24 @@ add_test(NAME dap_integration
     -DZANC_ARGS=--auto-stdlib
     -P ${CMAKE_SOURCE_DIR}/tests/run_dap.cmake)
 
+# ---- LSP integration test (real zan-lsp over stdio; A5 UTF-16 positions) ----
+add_executable(lsp_integration_test
+    tests/lsp/lsp_integration_test.c
+    src/common/json.c
+)
+target_include_directories(lsp_integration_test PRIVATE ${CMAKE_SOURCE_DIR})
+set_target_properties(lsp_integration_test PROPERTIES
+    C_STANDARD 11
+    C_STANDARD_REQUIRED YES
+)
+if(WIN32)
+    target_compile_definitions(lsp_integration_test PRIVATE _CRT_SECURE_NO_WARNINGS)
+else()
+    target_link_libraries(lsp_integration_test PRIVATE m)
+endif()
+add_test(NAME lsp_integration_utf16
+  COMMAND lsp_integration_test $<TARGET_FILE:zan-lsp>)
+
 # ---- zanfmt (code formatter, written in Zan) ----
 set(_zanfmt_exe ${CMAKE_BINARY_DIR}/zanfmt${_exe_ext})
 add_custom_command(OUTPUT ${_zanfmt_exe}

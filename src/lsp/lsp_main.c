@@ -184,8 +184,58 @@ static void lsp_remove_doc(lsp_server_t *s, const char *uri) {
 
 /* ============================ text helpers =========================== */
 
-/* Convert an LSP (line, character) position (both 0-based, UTF-16 units
- * approximated as bytes) to a byte offset into `text`. */
+/* UTF-8 sequence starting at byte c: its byte length and how many UTF-16 code
+ * units the LSP spec assigns it (1 for BMP code points, 2 for a surrogate
+ * pair, i.e. 4-byte UTF-8). Invalid / standalone bytes are treated as 1 unit. */
+static void utf8_seq_info(unsigned char c, int *bytes, int *utf16_units) {
+    if (c < 0x80)                 { *bytes = 1; *utf16_units = 1; }
+    else if ((c & 0xE0) == 0xC0)  { *bytes = 2; *utf16_units = 1; }
+    else if ((c & 0xF0) == 0xE0)  { *bytes = 3; *utf16_units = 1; }
+    else if ((c & 0xF8) == 0xF0)  { *bytes = 4; *utf16_units = 2; }
+    else                          { *bytes = 1; *utf16_units = 1; }
+}
+
+/* UTF-16 code units in the half-open byte range [start, end). */
+static int utf16_units_range(const char *start, const char *end) {
+    int units = 0;
+    while (start < end) {
+        int bytes, cu;
+        utf8_seq_info((unsigned char)*start, &bytes, &cu);
+        if (start + bytes > end) break; /* range cuts a sequence: stop */
+        units += cu;
+        start += bytes;
+    }
+    return units;
+}
+
+/* Convert the compiler's 1-based byte column on the given 0-based line into a
+ * 0-based UTF-16 character position (the lexer counts bytes, so a diagnostic
+ * after non-ASCII text would otherwise be emitted with a wrong column). */
+static int byte_col_to_utf16_char(const char *text, int line0, int byte_col1) {
+    const char *ls = text;
+    int ln = 0;
+    while (ln < line0 && *ls) {
+        if (*ls == '\n') ln++;
+        ls++;
+    }
+    if (byte_col1 <= 1) return 0;
+    /* walk the line for byte_col1-1 bytes (clamped to the line end / a split
+     * multi-byte sequence), then count the UTF-16 units of that prefix */
+    const char *line_start = ls;
+    int want = byte_col1 - 1;
+    int have = 0;
+    while (*ls && *ls != '\n' && have < want) {
+        int bytes, cu;
+        utf8_seq_info((unsigned char)*ls, &bytes, &cu);
+        if (have + bytes > want) break;
+        have += bytes;
+        ls += bytes;
+    }
+    return utf16_units_range(line_start, ls);
+}
+
+/* Convert an LSP (line, character) position (both 0-based; character in UTF-16
+ * code units per the LSP spec) to a byte offset into `text`. */
 static size_t pos_to_offset(const char *text, int line, int character) {
     size_t off = 0;
     int cur_line = 0;
@@ -193,8 +243,16 @@ static size_t pos_to_offset(const char *text, int line, int character) {
         if (text[off] == '\n') cur_line++;
         off++;
     }
-    for (int i = 0; i < character && text[off] && text[off] != '\n'; i++)
-        off++;
+    /* advance `character` UTF-16 units along this line; a character that falls
+     * inside a surrogate pair clamps to the code point's start */
+    int units = 0;
+    while (text[off] && text[off] != '\n' && units < character) {
+        int bytes, cu;
+        utf8_seq_info((unsigned char)text[off], &bytes, &cu);
+        if (units + cu > character) break;
+        units += cu;
+        off += (size_t)bytes;
+    }
     return off;
 }
 
@@ -228,14 +286,25 @@ static void prefix_before(const char *text, size_t offset, char *out, size_t cap
     out[n] = '\0';
 }
 
-/* Convert a global byte offset into a (line, character) pair (both 0-based).
+/* Convert a global byte offset into a (line, character) pair (both 0-based,
+ * character in UTF-16 code units).
  * The intellisense engine reports symbol locations as a byte offset in its
  * `col` field, so we derive accurate LSP positions from the document text. */
 static void offset_to_linecol(const char *text, int offset, int *line, int *character) {
-    int ln = 0, col = 0;
-    for (int i = 0; i < offset && text[i]; i++) {
-        if (text[i] == '\n') { ln++; col = 0; }
-        else col++;
+    int ln = 0, col = 0, i = 0;
+    while (i < offset && text[i]) {
+        unsigned char c = (unsigned char)text[i];
+        if (c == '\n') { ln++; col = 0; i++; continue; }
+        int bytes, cu;
+        utf8_seq_info(c, &bytes, &cu);
+        if (i + bytes > offset) {
+            /* offset cuts inside a multi-byte sequence: report the character
+             * containing the offset (its full unit weight). */
+            col += cu;
+            break;
+        }
+        col += cu;
+        i += bytes;
     }
     *line = ln;
     *character = col;
@@ -474,7 +543,10 @@ static void publish_diagnostics(lsp_server_t *s, const char *uri, const char *te
     for (int i = 0; i < count; i++) {
         const zan_diag_entry_t *e = zan_diag_entry_at(diag, i);
         int line = (int)e->loc.line > 0 ? (int)e->loc.line - 1 : 0;
-        int col  = (int)e->loc.col  > 0 ? (int)e->loc.col  - 1 : 0;
+        /* e->loc.col is the lexer's 1-based byte column; LSP wants UTF-16
+         * units, so convert (a diagnostic on a line with non-ASCII text before
+         * it would otherwise land on the wrong character). */
+        int col  = byte_col_to_utf16_char(text, line, (int)e->loc.col);
 
         json_value *d = json_new_obj();
         json_value *range = json_new_obj();
