@@ -1,0 +1,88 @@
+// ByteBuffer reads must never go past the end of the buffer: fixed-width
+// reads, varints and length-prefixed strings throw when the remaining bytes
+// are insufficient (the old code read raw heap garbage), SeekRead clamps to
+// [0, length], and a varint whose continuation bits never end is rejected
+// instead of looping forever.
+using System;
+using System.IO;
+
+delegate void Op();
+
+class Program {
+    static int bad;
+
+    static void Check(bool ok, string label) {
+        if (!ok) { Console.WriteLine("FAIL " + label); bad = bad + 1; }
+    }
+
+    static bool Throws(Op f) {
+        try { f(); return false; } catch (InvalidOperationException e) { return true; }
+    }
+
+    static ByteBuffer BufOf(byte[] arr) {
+        nint raw = NativeMemory.Alloc(arr.Length);
+        for (int i = 0; i < arr.Length; i = i + 1) {
+            new Span<byte>(raw + i, 1)[0] = arr[i];
+        }
+        ByteBuffer b = ByteBuffer.FromRaw(raw, arr.Length);
+        NativeMemory.Free(raw);
+        return b;
+    }
+
+    static void Main() {
+        // Normal round-trip still works.
+        ByteBuffer b = ByteBuffer.Alloc(8);
+        b.WriteU8(1).WriteU16(2).WriteU32(3).WriteU64(4);
+        b.WriteVarInt(300).WriteString("hi");
+        b.SeekRead(0);
+        Check(b.ReadU8() == 1, "rt u8");
+        Check(b.ReadU16() == 2, "rt u16");
+        Check(b.ReadU32() == 3, "rt u32");
+        Check(b.ReadU64() == 4, "rt u64");
+        Check(b.ReadVarInt() == 300, "rt varint");
+        Check(b.ReadString() == "hi", "rt string");
+        Check(b.Remaining() == 0, "rt exhausted");
+        b.Free();
+
+        // SeekRead clamps instead of allowing reads past the end.
+        ByteBuffer c = ByteBuffer.FromStr("abc");
+        c.SeekRead(1000);
+        Check(c.Remaining() == 0, "clamp upper");
+        Check(Throws(() => c.ReadU8()), "clamp read throws");
+        c.SeekRead(-5);
+        Check(c.ReadU8() == 97, "clamp lower");   // 'a'
+        c.Free();
+
+        // Truncated fixed-width reads throw instead of reading garbage.
+        ByteBuffer t1 = ByteBuffer.FromStr("ab");     // 2 bytes
+        t1.ReadU16();                                  // consumes all
+        Check(Throws(() => t1.ReadU8()), "u8 past end");
+        ByteBuffer t2 = ByteBuffer.FromStr("abcd");    // 4 bytes
+        t2.ReadU32();
+        Check(Throws(() => t2.ReadU32()), "u32 past end");
+        ByteBuffer t3 = ByteBuffer.FromStr("a");       // 1 byte
+        Check(Throws(() => t3.ReadU64()), "u64 past end");
+        t3.Free(); t2.Free(); t1.Free();
+
+        // Varint: continuation bits that never end must not loop forever.
+        ByteBuffer v = BufOf(new byte[] { 128, 128, 128, 128, 128 });
+        Check(Throws(() => v.ReadVarInt()), "varint never ends");
+        v.Free();
+
+        // Length-prefixed string with a huge prefix throws.
+        ByteBuffer s = BufOf(new byte[] { 128, 128, 128, 128, 8, 120 });
+        Check(Throws(() => s.ReadString()), "string huge prefix");
+        s.Free();
+
+        // CanRead reflects the remaining bytes.
+        ByteBuffer r = ByteBuffer.FromStr("wxyz");
+        Check(r.CanRead(4), "canread exact");
+        Check(!r.CanRead(5), "canread over");
+        Check(!r.CanRead(-1), "canread negative");
+        r.ReadU16();
+        Check(r.CanRead(2), "canread after read");
+        r.Free();
+
+        Console.WriteLine("bytebuffer-bounds-ok: " + Convert.ToString(bad == 0 ? 1 : 0));
+    }
+}

@@ -87,8 +87,10 @@ class ByteBuffer {
     /// <summary>供 FFI 调用的原始底层地址（Free/扩容前有效）。</summary>
     nint Raw() { return this.data; }
 
-    /// <summary>移动读游标。</summary>
+    /// <summary>移动读游标（越界时钳制到 [0, length]）。</summary>
     ByteBuffer SeekRead(int pos) {
+        if (pos < 0) { pos = 0; }
+        if (pos > this.length) { pos = this.length; }
         this.rpos = pos;
         return this;
     }
@@ -209,7 +211,17 @@ class ByteBuffer {
 
     // ===== 读取方法（小端序） =====
 
+    /// <summary>从当前读位置起还能读取 n 字节时为真
+    /// （读取前先用它判断，防止越过缓冲区末尾）。</summary>
+    bool CanRead(int n) {
+        if (n < 0) { return false; }
+        return n <= this.length - this.rpos;
+    }
+
     int ReadU8() {
+        if (!this.CanRead(1)) {
+            throw new InvalidOperationException("ByteBuffer: read past end");
+        }
         Span<byte> sp = new Span<byte>(this.data, this.capacity);
         int v = sp[this.rpos] & 255;
         this.rpos = this.rpos + 1;
@@ -217,6 +229,9 @@ class ByteBuffer {
     }
 
     int ReadU16() {
+        if (!this.CanRead(2)) {
+            throw new InvalidOperationException("ByteBuffer: read past end");
+        }
         Span<byte> sp = new Span<byte>(this.data, this.capacity);
         int v = (sp[this.rpos] & 255) | ((sp[this.rpos + 1] & 255) << 8);
         this.rpos = this.rpos + 2;
@@ -224,6 +239,9 @@ class ByteBuffer {
     }
 
     long ReadU32() {
+        if (!this.CanRead(4)) {
+            throw new InvalidOperationException("ByteBuffer: read past end");
+        }
         Span<byte> sp = new Span<byte>(this.data, this.capacity);
         long v = ((long)(sp[this.rpos] & 255)) | ((long)(sp[this.rpos + 1] & 255) << 8)
                | ((long)(sp[this.rpos + 2] & 255) << 16) | ((long)(sp[this.rpos + 3] & 255) << 24);
@@ -232,6 +250,9 @@ class ByteBuffer {
     }
 
     long ReadU64() {
+        if (!this.CanRead(8)) {
+            throw new InvalidOperationException("ByteBuffer: read past end");
+        }
         Span<byte> sp = new Span<byte>(this.data, this.capacity);
         long v = ((long)(sp[this.rpos] & 255)) | ((long)(sp[this.rpos + 1] & 255) << 8)
                | ((long)(sp[this.rpos + 2] & 255) << 16) | ((long)(sp[this.rpos + 3] & 255) << 24)
@@ -244,18 +265,28 @@ class ByteBuffer {
     long ReadVarInt() {
         long result = 0;
         int shift = 0;
-        int b = ReadU8();
-        while ((b & 128) != 0) {
+        int b = 0;
+        while (true) {
+            if (!this.CanRead(1)) {
+                throw new InvalidOperationException("ByteBuffer: truncated varint");
+            }
+            b = this.ReadU8();
             result = result + ((long)(b & 127) << shift);
+            if ((b & 128) == 0) { break; }
             shift = shift + 7;
-            b = ReadU8();
+            if (shift > 63) {
+                throw new InvalidOperationException("ByteBuffer: varint too long");
+            }
         }
-        return result + ((long)(b & 127) << shift);
+        return result;
     }
 
     /// <summary>将 count 字节读入新分配的原始块
     /// （调用方用 NativeMemory.Free 释放，或包装进 ByteBuffer）。</summary>
     nint ReadBytes(int count) {
+        if (count < 0 || !this.CanRead(count)) {
+            throw new InvalidOperationException("ByteBuffer: read past end");
+        }
         nint buf = NativeMemory.Alloc(count + 1);
         NativeMemory.Copy(buf, this.data + this.rpos, count);
         this.rpos = this.rpos + count;
@@ -266,7 +297,10 @@ class ByteBuffer {
     string ReadString() {
         // 长度前缀受其来源缓冲区大小限制，而该缓冲区是
         // 由 `int` 指定大小的内存块。
-        int n = (int)ReadVarInt();
+        int n = (int)this.ReadVarInt();
+        if (n < 0 || !this.CanRead(n)) {
+            throw new InvalidOperationException("ByteBuffer: read past end");
+        }
         string s = NativeMemory.GetString(this.data, this.rpos, n);
         this.rpos = this.rpos + n;
         return s;
