@@ -1,0 +1,282 @@
+using System;
+using System.Json;
+using Gui;
+
+namespace Gui.Component.Chart;
+
+// ---- 特殊图表布局：Venn / Event River ----
+//
+// 这些类只吃 (模型, 目标矩形) 并输出整数坐标/角度/边界框/命中区，
+// 不接触 App/Canvas，因此 conformance 测试可以直接断言几何。
+// 所有运算都是确定性的整数/定点运算：无随机数、无系统时间。
+
+/// 韦恩图的一个集合圆（布局输出）。
+class VennCircle {
+    string name;   // 集合名，"" = 由渲染器回退
+    int value;
+    int cx;
+    int cy;
+    int r;
+
+    static VennCircle Of(string name, int value, int cx, int cy, int r) {
+        VennCircle v = new VennCircle();
+        v.name = name;
+        v.value = value;
+        v.cx = cx;
+        v.cy = cy;
+        v.r = r;
+        return v;
+    }
+}
+
+/// 两圆韦恩图布局：data[0]=A、data[1]=B、data[2]=A∩B（缺失按 0）。
+/// hidden 数据项按 0 处理（不进布局）。半径按面积比例
+/// （r ∝ sqrt(v)）由 rMax 缩放；圆心距按重叠比例 vI/vMin
+/// 从相离 (rA+rB+gap) 线性压向包含，全部确定性整数运算。
+/// 输出两圆圆心/半径、圆心距、重叠千分比、包含标志和
+/// 三个标签锚点（A-only / B-only / 交集中心）。
+class VennLayout {
+    VennCircle a;
+    VennCircle b;
+    int d;           // 圆心距
+    int overlap;     // vI/vMin 千分比，0..1000
+    bool contained;  // overlap >= 1000：小圆含于大圆
+    int gap;
+    int ax;          // A-only 标签锚点
+    int ay;
+    int bx;          // B-only 标签锚点
+    int by;
+    int ix;          // 交集标签锚点
+    int iy;
+
+    static VennLayout Of(List<ChartData> data, int rMax, int gap, int cx0, int cy0) {
+        VennLayout l = new VennLayout();
+        l.gap = gap;
+        if (rMax < 1) { rMax = 1; }
+        int vA = 0;
+        int vB = 0;
+        int vI = 0;
+        string nA = "";
+        string nB = "";
+        string nI = "";
+        if (data.Count > 0) { vA = VennLayout.Val(data[0]); nA = data[0].name; }
+        if (data.Count > 1) { vB = VennLayout.Val(data[1]); nB = data[1].name; }
+        if (data.Count > 2) { vI = VennLayout.Val(data[2]); nI = data[2].name; }
+
+        int vMax = vA;
+        if (vB > vMax) { vMax = vB; }
+        if (vI > vMax) { vMax = vI; }
+        int rA = VennLayout.Rad(vA, vMax, rMax);
+        int rB = VennLayout.Rad(vB, vMax, rMax);
+
+        // 重叠比例：vI 相对较小集合的千分比。
+        int vMin = vA;
+        if (vB < vMin) { vMin = vB; }
+        int overlap = 0;
+        if (vI > 0 && vMin > 0) {
+            if (vI >= vMin) { overlap = 1000; } else { overlap = vI * 1000 / vMin; }
+        }
+        bool contained = overlap >= 1000;
+
+        // 圆心距：相离 / 部分重叠 / 包含三种形态。
+        int d = 0;
+        if (rA >= 1 || rB >= 1) {
+            int dr = rA - rB;
+            if (dr < 0) { dr = 0 - dr; }
+            if (overlap == 0) {
+                d = rA + rB + gap;                    // 相离
+            } else if (contained) {
+                d = dr * 3 / 4;                       // 包含：两心贴近
+                if (d < 1) { d = 1; }
+            } else {
+                d = (rA + rB) * (1000 - overlap) / 1000;
+                if (d < dr) { d = dr; }               // 钳制：不许完全吞入
+                if (d < 1) { d = 1; }
+            }
+        }
+        l.a = VennCircle.Of(nA, vA, cx0 - d / 2, cy0, rA);
+        l.b = VennCircle.Of(nB, vB, cx0 + (d - d / 2), cy0, rB);
+        l.d = d;
+        l.overlap = overlap;
+        l.contained = contained;
+
+        // 标签锚点：A-only 在 A 远离 B 的一侧，B-only 对称，
+        // 交集在两圆心中点。
+        if (d == 0) {
+            l.ax = cx0 - rA / 2;
+            l.ay = cy0 - rA / 2;
+            l.bx = cx0 + rB / 2;
+            l.by = cy0 + rB / 2;
+            l.ix = cx0;
+            l.iy = cy0;
+        } else {
+            l.ax = l.a.cx - rA * 3 / 4;
+            l.ay = cy0;
+            l.bx = l.b.cx + rB * 3 / 4;
+            l.by = cy0;
+            l.ix = (l.a.cx + l.b.cx) / 2;
+            l.iy = cy0;
+        }
+        return l;
+    }
+
+    static int Val(ChartData d) {
+        if (d.hidden) { return 0; }
+        return d.val;
+    }
+
+    // 半径按面积比例缩放：r = rMax * sqrt(v / vMax)。
+    static int Rad(int v, int vMax, int rMax) {
+        if (v <= 0 || vMax <= 0) { return 0; }
+        return rMax * ChartView.ISqrt(v * 10000 / vMax) / 100;
+    }
+}
+
+/// Event River 的一条带（布局输出；绝对像素矩形）。
+class EventBand {
+    string name;
+    int start;
+    int end;
+    int value;
+    int x0;
+    int x1;
+    int y;
+    int h;
+    int row;
+
+    static EventBand Of(string name, int start, int end, int value,
+                        int x0, int x1, int y, int h, int row) {
+        EventBand b = new EventBand();
+        b.name = name;
+        b.start = start;
+        b.end = end;
+        b.value = value;
+        b.x0 = x0;
+        b.x1 = x1;
+        b.y = y;
+        b.h = h;
+        b.row = row;
+        return b;
+    }
+}
+
+/// Event River 布局：统一时间范围 [t0, t1] 线性映射到水平轴；
+/// 事件按 (start, end, 原序) 稳定排序后做区间着色（贪心放入
+/// 第一条空闲行，行数最优），每条带高度 ∝ value，行围绕
+/// 中线上下对称堆叠。输出绝对像素 band 矩形，不接触 App/Canvas。
+class EventRiverLayout {
+    int t0;
+    int t1;
+    int span;
+    int rowCount;
+    List<EventBand> bands;
+
+    static EventRiverLayout Of(List<ChartEvent> events,
+                               int x, int y, int w, int h, int pad) {
+        EventRiverLayout l = new EventRiverLayout();
+        l.bands = new List<EventBand>();
+        int n = events.Count;
+        l.t0 = 0;
+        l.t1 = 0;
+        l.span = 1;
+        l.rowCount = 0;
+        if (n < 1) { return l; }
+
+        // 时间范围（start <= end，容错交换）。
+        int t0 = events[0].start;
+        int t1 = events[0].end;
+        if (t0 > t1) { int sw = t0; t0 = t1; t1 = sw; }
+        for (int i = 1; i < n; i = i + 1) {
+            int s = events[i].start;
+            int e = events[i].end;
+            if (s > e) { int sw = s; s = e; e = sw; }
+            if (s < t0) { t0 = s; }
+            if (e > t1) { t1 = e; }
+        }
+        int span = t1 - t0;
+        if (span < 1) { span = 1; }
+        l.t0 = t0;
+        l.t1 = t1;
+        l.span = span;
+
+        int plotW = w - pad * 2;
+        if (plotW < 4) { plotW = 4; }
+        int plotH = h - pad * 2;
+        if (plotH < 4) { plotH = 4; }
+        int plotX = x + pad;
+        int plotY = y + pad;
+
+        // 稳定排序：插入排序按 (start, end, 原序)。
+        List<int> idx = new List<int>();
+        for (int i = 0; i < n; i = i + 1) { idx.Add(i); }
+        for (int i = 1; i < n; i = i + 1) {
+            int k = idx[i];
+            int j = i - 1;
+            while (j >= 0 && EventRiverLayout.Less(events, k, idx[j])) {
+                idx[j + 1] = idx[j];
+                j = j - 1;
+            }
+            idx[j + 1] = k;
+        }
+
+        // 区间着色：rowEnd[k] = 第 k 行最后事件结束时间；
+        // 每个事件放进第一条 end <= start 的行（无则新行）。
+        List<int> rowEnd = new List<int>();
+        List<int> rowOf = new List<int>();
+        for (int p = 0; p < n; p = p + 1) {
+            int e = idx[p];
+            int es = events[e].start;
+            int ee = events[e].end;
+            if (es > ee) { int sw = es; es = ee; ee = sw; }
+            int rr = 0;
+            while (rr < rowEnd.Count && rowEnd[rr] > es) { rr = rr + 1; }
+            if (rr == rowEnd.Count) { rowEnd.Add(ee); } else { rowEnd[rr] = ee; }
+            rowOf.Add(rr);
+        }
+        int rowCount = rowEnd.Count;
+        if (rowCount < 1) { rowCount = 1; }
+        l.rowCount = rowCount;
+
+        int vMax = 1;
+        for (int i = 0; i < n; i = i + 1) {
+            if (events[i].value > vMax) { vMax = events[i].value; }
+        }
+        int rowH = plotH * 2 / 3 / rowCount;
+        if (rowH < 2) { rowH = 2; }
+        int cy = plotY + plotH / 2;
+        for (int p = 0; p < n; p = p + 1) {
+            int e = idx[p];
+            int es = events[e].start;
+            int ee = events[e].end;
+            if (es > ee) { int sw = es; es = ee; ee = sw; }
+            int x0 = plotX + (es - t0) * plotW / span;
+            int x1 = plotX + (ee - t0) * plotW / span;
+            if (x1 <= x0) { x1 = x0 + 1; }
+            int v = events[e].value;
+            if (v < 0) { v = 0; }
+            int bh = 0;
+            if (v > 0) {
+                bh = rowH * v / vMax;
+                if (bh < 2) { bh = 2; }
+            }
+            int row = rowOf[p];
+            // 行中心围绕 cy 对称：(row*2 - rowCount + 1) * rowH / 2。
+            int yc = cy + (row * 2 - rowCount + 1) * rowH / 2;
+            int by = yc - bh / 2;
+            l.bands.Add(EventBand.Of(events[e].name, es, ee, v,
+                x0, x1, by, bh, row));
+        }
+        return l;
+    }
+
+    // 排序键比较：start 升序 → end 升序 → 原序（稳定）。
+    static bool Less(List<ChartEvent> evs, int i, int j) {
+        int as2 = evs[i].start;
+        int bs = evs[j].start;
+        if (as2 != bs) { return as2 < bs; }
+        int ae = evs[i].end;
+        int be = evs[j].end;
+        if (ae != be) { return ae < be; }
+        return i < j;
+    }
+}

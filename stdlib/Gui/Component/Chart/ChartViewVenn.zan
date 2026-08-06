@@ -1,0 +1,114 @@
+using System;
+using System.Json;
+using Gui;
+
+namespace Gui.Component.Chart;
+
+partial class ChartView {
+    // ---- 韦恩图（ECharts custom kind 'venn'；两圆 + 交集） ----
+
+    static void DrawVenn(App app, int x, int y, int w, int h,
+                         ChartOption o, int g) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int pad = t.paddingMedium;
+        int top = ChartView.PanelHead(app, x, y, w, h, o.title);
+        ChartSeries lead = ChartView.LeadSeries(o);
+        if (lead == null || lead.data.Count < 1) { return; }
+
+        int areaW = w - pad * 2;
+        int areaH = (y + h - pad) - top;
+        int rMax = areaW / 3;
+        if (areaH / 3 < rMax) { rMax = areaH / 3; }
+        if (rMax < app.Scale(20)) { rMax = app.Scale(20); }
+        int gap = rMax / 8;
+        if (gap < app.Scale(2)) { gap = app.Scale(2); }
+        int cx0 = x + pad + areaW / 2;
+        int cy0 = top + areaH / 2;
+
+        // 动画：整个图形按 g 从中心等比放大。
+        VennLayout layout = VennLayout.Of(lead.data, rMax * g / 1000, gap, cx0, cy0);
+        VennCircle A = layout.a;
+        VennCircle B = layout.b;
+        if (A.r < 1 && B.r < 1) { return; }
+
+        int colA = Chart.Palette(t, 0);
+        int colB = Chart.Palette(t, 1);
+        if (lead.data.Count > 0 && lead.data[0].color != 0) { colA = lead.data[0].color; }
+        if (lead.data.Count > 1 && lead.data[1].color != 0) { colB = lead.data[1].color; }
+
+        // 半透明叠加：交集区自然混出第三色。先 B 后 A。
+        if (B.r >= 1) { c.FillCircle(B.cx, B.cy, B.r, Chart.WithAlpha(colB, 150)); }
+        if (A.r >= 1) { c.FillCircle(A.cx, A.cy, A.r, Chart.WithAlpha(colA, 150)); }
+        if (B.r >= 1) { ChartView.RingOutline(c, B.cx, B.cy, B.r, colB); }
+        if (A.r >= 1) { ChartView.RingOutline(c, A.cx, A.cy, A.r, colA); }
+
+        // 标签：A-only / B-only 名称 + 值；交集（重叠 > 0 时）同名。
+        int iVal = 0;
+        if (lead.data.Count > 2) { iVal = lead.data[2].val; }
+        int fs = t.fontSizeSmall;
+        int fh = Canvas.FontHeight(fs);
+        if (A.r >= 1) {
+            ChartView.VennLabel(c, layout.ax, layout.ay, fh, fs,
+                ChartView.VennName(lead, 0, "A"), A.value, t.textPrimary);
+        }
+        if (B.r >= 1) {
+            ChartView.VennLabel(c, layout.bx, layout.by, fh, fs,
+                ChartView.VennName(lead, 1, "B"), B.value, t.textPrimary);
+        }
+        if (layout.overlap > 0) {
+            ChartView.VennLabel(c, layout.ix, layout.iy, fh, fs,
+                ChartView.VennName(lead, 2, "A∩B"), iVal, t.textPrimary);
+        }
+
+        if (o.showTooltip) {
+            int mx = app.mouseX;
+            int my = app.mouseY;
+            bool inA = ChartView.InCircle(mx, my, A);
+            bool inB = ChartView.InCircle(mx, my, B);
+            List<TooltipRow> rows = new List<TooltipRow>();
+            if (inA && inB) {
+                int iVal = 0;
+                if (lead.data.Count > 2) { iVal = lead.data[2].val; }
+                int iCol = Chart.Palette(t, 2);
+                if (lead.data.Count > 2 && lead.data[2].color != 0) { iCol = lead.data[2].color; }
+                rows.Add(TooltipRow.Of(0, o.title));
+                rows.Add(TooltipRow.Of(iCol,
+                    ChartView.VennName(lead, 2, "A∩B") + "  " + Convert.ToString(iVal)));
+            } else if (inA) {
+                rows.Add(TooltipRow.Of(0, o.title));
+                rows.Add(TooltipRow.Of(colA,
+                    ChartView.VennName(lead, 0, "A") + "  " + Convert.ToString(A.value)));
+            } else if (inB) {
+                rows.Add(TooltipRow.Of(0, o.title));
+                rows.Add(TooltipRow.Of(colB,
+                    ChartView.VennName(lead, 1, "B") + "  " + Convert.ToString(B.value)));
+            }
+            if (rows.Count > 0) {
+                ChartView.TooltipCard(app, mx, my, x + w, rows);
+            }
+        }
+    }
+
+    // 集合名：data 项 name，缺失时用回退名。
+    static string VennName(ChartSeries s, int i, string fallback) {
+        if (s.data.Count > i && s.data[i].name.Length > 0) { return s.data[i].name; }
+        return fallback;
+    }
+
+    // 锚点标签：名称 + 值两行，围绕锚点居中。
+    static void VennLabel(Canvas c, int ax, int ay, int fh, int fs,
+                          string name, int value, int color) {
+        string lbl = name;
+        if (value > 0) { lbl = name + "  " + Convert.ToString(value); }
+        int tw = Canvas.MeasureText(lbl, fs);
+        c.DrawText(ax - tw / 2, ay - fh / 2, lbl, color, fs);
+    }
+
+    static bool InCircle(int mx, int my, VennCircle v) {
+        if (v.r < 1) { return false; }
+        int dx = mx - v.cx;
+        int dy = my - v.cy;
+        return dx * dx + dy * dy <= v.r * v.r;
+    }
+}
