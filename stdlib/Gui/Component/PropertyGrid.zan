@@ -1,0 +1,273 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+namespace Gui.Component;
+
+/// 属性表：把一组 PropSpec 画成可编辑的属性行，值直接读写 spec 绑定
+/// 的字段 / signal。行的标签、编辑器、滚动、裁剪都由控件自己完成，
+/// 宿主只提供 spec 列表：
+///
+///     grid.Bind("Field:" + sel.fname, this.FieldSpecs(sel));
+///     grid.RenderInside(app, new Rect(x, y, w, h));
+///
+/// 编辑器按 PropSpec.kind 选：0/4 文本 Input，1 整数 Input，2 Switch，
+/// 3 SelectBox，5 分组标题（PropSpec.Section，只有文字没有编辑器）。
+class PropertyGrid : Control {
+    List<PropSpec> data;
+    /// 每行一个编辑器（按行索引对齐，未用到的槽为 null）。
+    List<Input> texts;
+    List<SignalString> textSigs;
+    List<Switch> flags;
+    List<SignalBool> flagSigs;
+    List<SelectBox> picks;
+    List<SignalInt> pickSigs;
+    /// 上一帧的值：用来判断这一帧是外部改了模型还是用户改了编辑器。
+    List<string> shadow;
+    /// 当前绑定对象的标识，变化时重建编辑器。
+    string key;
+    SignalInt scroll;
+    /// 没有属性时显示的文本（"" 不画）。
+    string Empty;
+    /// 某一行被用户改动后触发（读 ChangedKey 得知是哪一个）。
+    UiEvent Change;
+    int hitRow;
+
+    PropertyGrid() {
+        this.InitControl("props", 5);
+        data = new List<PropSpec>();
+        texts = new List<Input>();
+        textSigs = new List<SignalString>();
+        flags = new List<Switch>();
+        flagSigs = new List<SignalBool>();
+        picks = new List<SelectBox>();
+        pickSigs = new List<SignalInt>();
+        shadow = new List<string>();
+        key = "";
+        scroll = new SignalInt(0);
+        Empty = "";
+        hitRow = 0 - 1;
+        wiresOwnEvents = true;
+        Change = new UiEvent();
+    }
+
+    override string Kind() { return "PropertyGrid"; }
+
+    PropertyGrid OnChange(Action a) {
+        Change.Add(a);
+        return this;
+    }
+
+    /// 最近被用户改动的行号 / 属性键。
+    int ChangedRow() { return hitRow; }
+    string ChangedKey() {
+        if (hitRow < 0 || hitRow >= data.Count) { return ""; }
+        return data[hitRow].key;
+    }
+
+    /// 绑定一组属性。`k` 标识当前对象（如 "Field:btn0"）：它变化时
+    /// 才重建编辑器，否则沿用现有的，输入焦点和光标不会每帧丢失。
+    void Bind(string k, List<PropSpec> specs) {
+        if (k == key && specs.Count == data.Count) {
+            data = specs;
+            return;
+        }
+        key = k;
+        data = specs;
+        this.Rebuild();
+    }
+
+    void Rebuild() {
+        texts = new List<Input>();
+        textSigs = new List<SignalString>();
+        flags = new List<Switch>();
+        flagSigs = new List<SignalBool>();
+        picks = new List<SelectBox>();
+        pickSigs = new List<SignalInt>();
+        shadow = new List<string>();
+        for (int i = 0; i < data.Count; i = i + 1) {
+            PropSpec p = data[i];
+            string cur = p.Read();
+            shadow.Add(cur);
+            SignalString ts = new SignalString("");
+            SignalBool fs = new SignalBool(false);
+            SignalInt ps = new SignalInt(0);
+            Input inp = null;
+            Switch sw = null;
+            SelectBox sb = null;
+            if (p.kind == 5) {
+                // 分组标题：没有编辑器。
+            } else if (p.kind == 2) {
+                fs = new SignalBool(PropSpec.IsOn(cur));
+                sw = Switch.Bind(fs);
+            } else if (p.kind == 3) {
+                ps = new SignalInt(this.IndexOfValue(p, cur));
+                sb = SelectBox.Bind(p.options, ps, "");
+            } else {
+                ts = new SignalString(cur);
+                inp = Input.Bind(ts, "");
+            }
+            texts.Add(inp);
+            textSigs.Add(ts);
+            flags.Add(sw);
+            flagSigs.Add(fs);
+            picks.Add(sb);
+            pickSigs.Add(ps);
+        }
+        hitRow = 0 - 1;
+    }
+
+    /// 枚举值（可能存的是序号，也可能是选项文本）对应的选项下标。
+    int IndexOfValue(PropSpec p, string val) {
+        for (int i = 0; i < p.options.Count; i = i + 1) {
+            if (p.options[i] == val) { return i; }
+        }
+        if (PropertyGrid.IsNumber(val)) {
+            int n = Convert.ToInt32(val);
+            if (n >= 0 && n < p.options.Count) { return n; }
+        }
+        return 0;
+    }
+
+    /// 枚举行当前选择在模型里的字符串形式：绑定到 int 的存序号，
+    /// 绑定到字符串的存选项文本。
+    string PickValue(PropSpec p, int idx) {
+        if (p.num != null || p.snum != null) { return Convert.ToString(idx); }
+        if (idx >= 0 && idx < p.options.Count) { return p.options[idx]; }
+        return "";
+    }
+
+    static bool IsNumber(string s) {
+        if (s == "") { return false; }
+        string digits = "0123456789";
+        for (int i = 0; i < s.Length; i = i + 1) {
+            string ch = s.Substring(i, 1);
+            bool ok = i == 0 && ch == "-" && s.Length > 1;
+            for (int d = 0; d < digits.Length; d = d + 1) {
+                if (digits.Substring(d, 1) == ch) { ok = true; }
+            }
+            if (!ok) { return false; }
+        }
+        return true;
+    }
+
+    /// 编辑器当前值的字符串形式（与 PropSpec.Read 同一种表示）。
+    string Editor(int i) {
+        PropSpec p = data[i];
+        if (p.kind == 2) { return PropSpec.Flag(flagSigs[i].Get()); }
+        if (p.kind == 3) { return this.PickValue(p, pickSigs[i].Get()); }
+        return textSigs[i].Get();
+    }
+
+    /// 把模型值灌回编辑器（外部改了属性时）。
+    void Load(int i, string val) {
+        PropSpec p = data[i];
+        if (p.kind == 2) { flagSigs[i].Set(PropSpec.IsOn(val)); return; }
+        if (p.kind == 3) { pickSigs[i].Set(this.IndexOfValue(p, val)); return; }
+        textSigs[i].Set(val);
+    }
+
+    /// 一行的双向同步：外部改动优先灌回编辑器，否则把编辑器的新值
+    /// 写进模型并广播 Change。整数行在输入合法前不写。
+    void Sync(int i) {
+        PropSpec p = data[i];
+        if (p.kind == 5 || !p.IsBound()) { return; }
+        string cur = p.Read();
+        if (cur != shadow[i]) {
+            this.Load(i, cur);
+            shadow[i] = cur;
+            return;
+        }
+        string ui = this.Editor(i);
+        if (ui == cur) { return; }
+        if (p.kind == 1 && !PropertyGrid.IsNumber(ui)) { return; }
+        p.Write(ui);
+        shadow[i] = p.Read();
+        hitRow = i;
+        Change.Post();
+    }
+
+    int RowHeight(App app) { return app.Scale(30); }
+
+    /// 全部行的高度（宿主据此在自己的滚动区里给出槽位）。
+    int ContentHeight(App app) {
+        return data.Count * this.RowHeight(app);
+    }
+
+    override void OnMeasure(App app) {
+        prefH = this.ContentHeight(app);
+    }
+
+    override void OnPaint(App app) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int fs = t.fontSizeSmall;
+        if (data.Count == 0) {
+            if (Empty != "") {
+                c.DrawText(bx, by + t.paddingSmall, Ellipsis.Fit(Empty, bw, fs),
+                    t.textTertiary, fs);
+            }
+            return;
+        }
+        int rowH = this.RowHeight(app);
+        int contentH = this.ContentHeight(app);
+        Scrollbar.HandleWheel(app, bx, by, bw, bh, contentH, scroll);
+        int maxOff = contentH - bh;
+        if (maxOff < 0) { maxOff = 0; }
+        if (scroll.Get() > maxOff) { scroll.Set(maxOff); }
+        if (scroll.Get() < 0) { scroll.Set(0); }
+        bool overflow = contentH > bh;
+        int barW = app.Scale(6);
+        int rowW = bw;
+        if (overflow) { rowW = bw - barW; }
+        int labelW = app.Scale(92);
+        if (labelW > rowW * 2 / 5) { labelW = rowW * 2 / 5; }
+        int y = by - scroll.Get();
+
+        c.PushClip(bx, by, bw, bh);
+        for (int i = 0; i < data.Count; i = i + 1) {
+            bool onscreen = y + rowH > by && y < by + bh;
+            if (onscreen) {
+                PropSpec p = data[i];
+                if (p.kind == 5) {
+                    c.DrawText(bx, Canvas.CenterTextY(y, rowH, fs),
+                        Ellipsis.Fit(p.label, rowW, fs), t.textTertiary, fs);
+                } else {
+                    c.DrawText(bx, Canvas.CenterTextY(y, rowH, fs),
+                        Ellipsis.Fit(p.label, labelW - t.gapSmall, fs),
+                        t.textSecondary, fs);
+                    int ex = bx + labelW;
+                    int ew = rowW - labelW;
+                    int eh = app.Scale(24);
+                    int ey = y + (rowH - eh) / 2;
+                    if (p.kind == 2) {
+                        flags[i].Render(app, ex, ey);
+                    } else if (p.kind == 3) {
+                        picks[i].Render(app, ex, ey, ew);
+                    } else {
+                        texts[i].Render(app, ex, ey, ew, eh);
+                    }
+                    this.Sync(i);
+                }
+            }
+            y = y + rowH;
+        }
+        c.PopClip();
+
+        if (overflow) {
+            Scrollbar.RenderVerticalScroll(app, bx + bw - barW, by, bh, bh,
+                contentH, scroll);
+        }
+    }
+
+    override List<string> Events() {
+        List<string> e = Control.CommonEvents();
+        e.Add("Change");
+        return e;
+    }
+
+    override void BindEvent(string evt, Action a) {
+        if (evt == "Change") { Change.Add(a); return; }
+        On.AddByName(evt, a);
+    }
+}

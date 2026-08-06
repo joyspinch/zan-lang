@@ -75,15 +75,12 @@ partial class Designer {
         }
     }
 
+    /// 选区变化时重置选项 / 事件编辑器（普通属性行直接
+    /// 绑定字段，不需要手动同步）。
     void SyncEditors(FormField f) {
         if (f == selPrev) { return; }
         selPrev = f;
-        labelSig.Set(f.label);
-        nameSig.Set(f.fname);
-        phSig.Set(f.placeholder);
-        bindSig.Set(f.bindPath);
-        bindPropSig.Set(f.bindProp);
-        customSig.Set(f.customKind);
+        inspKeySeq = inspKeySeq + 1;
         optSig.Set("");
         List<string> evs = f.Events();
         if (evs.Count > 0) { evtEditing = evs[0]; } else { evtEditing = ""; }
@@ -104,21 +101,91 @@ partial class Designer {
         return "On" + id + ev;
     }
 
-    /// 选中组件的属性选项卡（不含事件——它们在
-    /// 事件选项卡）。返回最后一行之后的 y，供主体滚动。
-    int RenderFieldProps(App app, Canvas c, Theme t, FormField f, int ix, int iy, int iw) {
-        int fs = t.fontSizeSmall;
-        iy = LabeledInput(app, c, t, Designer.T("Label", "标签"), labelInput, ix, iy, iw);
-        f.label = labelSig.Get();
-        iy = LabeledInput(app, c, t, Designer.T("Name", "名称"), nameInput, ix, iy, iw);
-        f.fname = nameSig.Get();
-        f.name = f.fname;
-        iy = LabeledInput(app, c, t, Designer.T("Placeholder", "占位文本"), phInput, ix, iy, iw);
-        f.placeholder = phSig.Get();
+    /// 选中组件的属性列表：只声明要编辑哪些字段，
+    /// 行的标签 / 编辑器 / 滚动全由 PropertyGrid 完成。
+    List<PropSpec> FieldSpecs(FormField f) {
+        List<PropSpec> ps = new List<PropSpec>();
+        PropSpec lbl = PropSpec.Text("label", Designer.T("Label", "标签"));
+        lbl.str = f.label;
+        ps.Add(lbl);
+        PropSpec nm = PropSpec.Text("name", Designer.T("Name", "名称"));
+        nm.str = f.fname;
+        ps.Add(nm);
+        PropSpec ph = PropSpec.Text("placeholder", Designer.T("Placeholder", "占位文本"));
+        ph.str = f.placeholder;
+        ps.Add(ph);
         string bindLbl = Designer.T("Bind path", "绑定路径");
         if (f.ftype == 23 || f.ftype == 41) { bindLbl = Designer.T("Data source", "数据源"); }
-        iy = LabeledInput(app, c, t, bindLbl, bindInput, ix, iy, iw);
-        f.bindPath = bindSig.Get();
+        PropSpec bd = PropSpec.Text("bind", bindLbl);
+        bd.str = f.bindPath;
+        ps.Add(bd);
+        PropSpec bpr = PropSpec.Text("bindProp", Designer.T("Bind prop", "绑定属性"));
+        bpr.str = f.bindProp;
+        ps.Add(bpr);
+        if (f.ftype == 100) {
+            PropSpec ck = PropSpec.Text("component", Designer.T("Component", "组件"));
+            ck.str = f.customKind;
+            ps.Add(ck);
+        }
+        PropSpec req = PropSpec.Bool("required", Designer.T("Required", "必填"));
+        req.flag = f.required;
+        ps.Add(req);
+        if (f.ftype == 15 || f.ftype == 16) {
+            PropSpec wr = PropSpec.Bool("wrap", Designer.T("Wrap text", "自动换行"));
+            wr.flag = f.wrap;
+            ps.Add(wr);
+        }
+        if (layoutMode == 1) {
+            // 停靠边：选了某一边，画布上就自动吸附到所在层
+            // （窗口或父容器）的那条边并铺满，只有厚度还能拉；
+            // 「自由」才是纯绝对定位。
+            List<string> dockOpts = new List<string>{
+                Designer.T("Free", "自由"), Designer.T("Top", "上"),
+                Designer.T("Bottom", "下"), Designer.T("Left", "左"),
+                Designer.T("Right", "右"), Designer.T("Fill", "填充") };
+            PropSpec dk = PropSpec.Enum("dock", Designer.T("Dock", "停靠"), dockOpts);
+            dk.num = f.dockSide;
+            ps.Add(dk);
+            // 自由画布：设计空间的绝对位置 / 尺寸。
+            PropSpec px = PropSpec.Int("x", "X");
+            px.num = f.fx;
+            ps.Add(px);
+            PropSpec py = PropSpec.Int("y", "Y");
+            py.num = f.fy;
+            ps.Add(py);
+            PropSpec pw = PropSpec.Int("w", Designer.T("Width", "宽度"));
+            pw.num = f.fw;
+            ps.Add(pw);
+            PropSpec phh = PropSpec.Int("h", Designer.T("Height", "高度"));
+            phh.num = f.fh;
+            ps.Add(phh);
+        } else {
+            // 24 列网格上的字段宽度。
+            PropSpec sp = PropSpec.Int("span", Designer.T("Span / 24", "跨度 / 24"));
+            sp.num = f.span;
+            ps.Add(sp);
+        }
+        if (f.ftype == 7) {
+            PropSpec don = PropSpec.Bool("defOn", Designer.T("Default on", "默认开启"));
+            don.flag = f.defOn;
+            ps.Add(don);
+        }
+        return ps;
+    }
+
+    /// 选中组件的属性选项卡（不含事件——它们在事件选项卡）。
+    /// 属性行交给 PropertyGrid，这里只处理绑定选择器、选项表
+    /// 这些语义动作。返回最后一行之后的 y，供主体滚动。
+    int RenderFieldProps(App app, Canvas c, Theme t, FormField f, int ix, int iy, int iw) {
+        int fs = t.fontSizeSmall;
+        propGrid.Bind("fld" + Convert.ToString(inspKeySeq), this.FieldSpecs(f));
+        int gh = propGrid.ContentHeight(app);
+        propGrid.RenderInside(app, new Rect(ix, iy, iw, gh));
+        iy = iy + gh;
+        f.name = f.fname;
+        if (f.span < 1) { f.span = 1; }
+        if (f.span > 24) { f.span = 24; }
+
         // 双向绑定选择器：从配对的代码文件扫描出的变量。
         if (bindVars.Count > 0) {
             string pickLbl = Designer.T("Pick from code ▾", "从代码选择 ▾");
@@ -137,8 +204,6 @@ partial class Designer {
                         ix + app.Scale(84), iy, iw - app.Scale(84));
                     if (Ui.Clicked(app, bvId)) {
                         f.bindPath = bindVars[bvi];
-                        bindSig.Set(f.bindPath);
-                        bindInput.SetText(f.bindPath);
                         bindPickOpen = false;
                         msg = Designer.T("bound to ", "已绑定 ") + f.bindPath;
                         app.RequestRedraw();
@@ -147,76 +212,15 @@ partial class Designer {
                 }
             }
         }
-        iy = LabeledInput(app, c, t, Designer.T("Bind prop", "绑定属性"), bindPropInput, ix, iy, iw);
-        f.bindProp = bindPropSig.Get();
-        if (f.ftype == 100) {
-            iy = LabeledInput(app, c, t, Designer.T("Component", "组件"), customInput, ix, iy, iw);
-            f.customKind = customSig.Get();
-        }
-
-        f.required = ToggleRow(app, c, t, Designer.T("Required", "必填"), f.required, ix, iy, iw);
-        iy = iy + app.Scale(34);
-        if (f.ftype == 15 || f.ftype == 16) {
-            f.wrap = ToggleRow(app, c, t, Designer.T("Wrap text", "自动换行"), f.wrap, ix, iy, iw);
-            iy = iy + app.Scale(34);
-        }
-
-        if (layoutMode == 1) {
-            // 停靠边：选了某一边，画布上就自动吸附到所在层
-            // （窗口或父容器）的那条边并铺满，只有厚度还能拉；
-            // 「自由」才是纯绝对定位。
-            List<string> dockOpts = new List<string>{
-                Designer.T("Free", "自由"), Designer.T("Top", "上"),
-                Designer.T("Bottom", "下"), Designer.T("Left", "左"),
-                Designer.T("Right", "右"), Designer.T("Fill", "填充") };
-            f.dockSide = SegRow(app, c, t, Designer.T("Dock", "停靠"), dockOpts,
-                f.dockSide, ix, iy, iw);
-            iy = iy + app.Scale(54);
-            // 自由画布布局：设计空间的绝对位置/尺寸优先，
-            // 覆盖 24 列宽设置。
-            f.fx = IntRow(app, c, t, Designer.T("X", "X"), f.fx, 20, ix, iy, iw);
-            iy = iy + app.Scale(36);
-            f.fy = IntRow(app, c, t, Designer.T("Y", "Y"), f.fy, 20, ix, iy, iw);
-            iy = iy + app.Scale(36);
-            f.fw = IntRow(app, c, t, Designer.T("Width", "宽度"), f.fw, 20, ix, iy, iw);
-            iy = iy + app.Scale(36);
-            f.fh = IntRow(app, c, t, Designer.T("Height", "高度"), f.fh, 20, ix, iy, iw);
-            iy = iy + app.Scale(36);
-        } else {
-            // 24 列网格上的字段宽度：快速预设外加精确跨度。
-            List<string> spanOpts = new List<string>{
-                "1/1", "1/2", "1/3", "1/4" };
-            int spanSel = 0;
-            if (f.span == 12) { spanSel = 1; }
-            else if (f.span == 8) { spanSel = 2; }
-            else if (f.span == 6) { spanSel = 3; }
-            int newSel = SegRow(app, c, t, Designer.T("Field width", "字段宽度"), spanOpts, spanSel, ix, iy, iw);
-            if (newSel != spanSel) {
-                if (newSel == 1) { f.span = 12; }
-                else if (newSel == 2) { f.span = 8; }
-                else if (newSel == 3) { f.span = 6; }
-                else { f.span = 24; }
-            }
-            iy = iy + app.Scale(54);
-            f.span = IntRow(app, c, t, Designer.T("Span / 24", "跨度 / 24"), f.span, 1, ix, iy, iw);
-            if (f.span < 1) { f.span = 1; }
-            if (f.span > 24) { f.span = 24; }
-            iy = iy + app.Scale(36);
-        }
-
-        if (f.ftype == 7) {
-            f.defOn = ToggleRow(app, c, t, Designer.T("Default on", "默认开启"), f.defOn, ix, iy, iw);
-            iy = iy + app.Scale(34);
-        }
 
         if (f.UsesOptions()) {
             bool table = (f.ftype == 23 || f.ftype == 41);
             iy = iy + app.Scale(6);
-            if (table) {
-                c.DrawText(ix, iy, Designer.T("COLUMNS (title · field)", "列（标题 · 字段）"), t.textTertiary, fs);
-            } else {
-                c.DrawText(ix, iy, Designer.T("OPTIONS", "选项"), t.textTertiary, fs);
-            }
+            string head = Designer.T("OPTIONS", "选项");
+            if (table) { head = Designer.T("COLUMNS (title · field)", "列（标题 · 字段）"); }
+            Label hl = new Label(head);
+            hl.Class = "tertiary small";
+            hl.RenderInside(app, new Rect(ix, iy, iw, app.Scale(18)));
             iy = iy + app.Scale(20);
             for (int oi = 0; oi < f.OptionCount(); oi = oi + 1) {
                 string disp = f.OptionAt(oi);
@@ -225,8 +229,9 @@ partial class Designer {
                     string cfd = Designer.ColField(f.OptionAt(oi));
                     if (cfd != "") { disp = disp + "  ·  " + cfd; }
                 }
-                c.DrawText(ix, iy + app.Scale(7),
-                    Convert.ToString(oi + 1) + ".  " + disp, t.textSecondary, fs);
+                Label ol = new Label(Convert.ToString(oi + 1) + ".  " + disp);
+                ol.Class = "secondary small";
+                ol.RenderInside(app, new Rect(ix, iy, iw - app.Scale(32), app.Scale(28)));
                 int rmId = SmallIconBtn(app, "close", 5, ix + iw - app.Scale(28), iy, app.Scale(28));
                 if (Ui.Clicked(app, rmId)) {
                     RemoveOptionFixup(f, oi);
@@ -294,14 +299,105 @@ partial class Designer {
         return -1;
     }
 
-    /// 根 Window 的属性选项卡：窗口装饰（标题/尺寸/标志）以及
+    /// 根 Window 的属性列表：窗口装饰（标题 / 尺寸 / 标志）以及
     /// 应用于其内带标签输入行的共享布局默认值。
-    int RenderWindowProps(App app, Canvas c, Theme t, int ix, int iy, int iw) {
-        int fs = t.fontSizeSmall;
-        c.DrawText(ix, iy, Designer.T("WINDOW", "窗口"), t.textTertiary, fs);
-        iy = iy + app.Scale(20);
+    List<PropSpec> WindowSpecs() {
+        List<PropSpec> ps = new List<PropSpec>();
+        ps.Add(PropSpec.Section(Designer.T("WINDOW", "窗口")));
+        PropSpec ti = PropSpec.Text("title", Designer.T("Title", "标题"));
+        ti.sstr = winTitleSig;
+        ps.Add(ti);
+        PropSpec ww = PropSpec.Int("width", Designer.T("Width", "宽度"));
+        ww.num = winW;
+        ps.Add(ww);
+        PropSpec wh = PropSpec.Int("height", Designer.T("Height", "高度"));
+        wh.num = winH;
+        ps.Add(wh);
+        PropSpec rz = PropSpec.Bool("resizable", Designer.T("Resizable", "可调整大小"));
+        rz.flag = winResizable;
+        ps.Add(rz);
+        PropSpec tw = PropSpec.Bool("tool", Designer.T("Tool window", "工具窗口"));
+        tw.flag = winTool;
+        ps.Add(tw);
+        PropSpec ct = PropSpec.Bool("center", Designer.T("Center on show", "显示时居中"));
+        ct.flag = winCenter;
+        ps.Add(ct);
+        if (!winCenter) {
+            PropSpec pxs = PropSpec.Int("posX", Designer.T("Position X", "位置 X"));
+            pxs.num = winPosX;
+            ps.Add(pxs);
+            PropSpec pys = PropSpec.Int("posY", Designer.T("Position Y", "位置 Y"));
+            pys.num = winPosY;
+            ps.Add(pys);
+        }
+        PropSpec gl = PropSpec.Bool("glass", Designer.T("Frosted glass", "毛玻璃效果"));
+        gl.flag = winGlass;
+        ps.Add(gl);
+        // 窗口轮廓：异形窗口按像素 alpha 合成，设计画布预览形状，
+        // 自定义形状（winShape == 3）是以 JSON 编写的区域并集，
+        // 只能在 JSON 抽屉里编辑。
+        List<string> shapeOpts = new List<string>{
+            Designer.T("Rect", "矩形"),
+            Designer.T("Rounded", "圆角"),
+            Designer.T("Ellipse", "圆形"),
+            Designer.T("Custom", "自定义") };
+        PropSpec sh = PropSpec.Enum("shape", Designer.T("Window shape", "窗口形状"), shapeOpts);
+        sh.num = winShape;
+        ps.Add(sh);
+        if (winShape == 1) {
+            PropSpec rr = PropSpec.Int("radius", Designer.T("Corner radius", "圆角半径"));
+            rr.num = winShapeRadius;
+            ps.Add(rr);
+        }
+        PropSpec ch = PropSpec.Bool("chrome", Designer.T("Title bar", "标题栏"));
+        ch.flag = winChrome;
+        ps.Add(ch);
+        PropSpec op = PropSpec.Int("opacity", Designer.T("Opacity (10-100)", "不透明度（10-100）"));
+        op.num = winOpacity;
+        ps.Add(op);
 
-        iy = LabeledInput(app, c, t, Designer.T("Title", "标题"), winTitleInput, ix, iy, iw);
+        ps.Add(PropSpec.Section(Designer.T("LAYOUT", "布局")));
+        List<string> posOpts = new List<string>{
+            Designer.T("Left", "左"), Designer.T("Right", "右"), Designer.T("Top", "上") };
+        PropSpec lp = PropSpec.Enum("labelPos", Designer.T("Label position", "标签位置"), posOpts);
+        lp.num = labelPos;
+        ps.Add(lp);
+        List<string> szOpts = new List<string>{
+            Designer.T("Large", "大"), Designer.T("Default", "默认"), Designer.T("Small", "小") };
+        PropSpec sz = PropSpec.Enum("size", Designer.T("Control size", "控件大小"), szOpts);
+        sz.num = formSize;
+        ps.Add(sz);
+        PropSpec lw = PropSpec.Int("labelWidth", Designer.T("Label width", "标签宽度"));
+        lw.num = labelWidth;
+        ps.Add(lw);
+        PropSpec st = PropSpec.Bool("hideStar", Designer.T("Hide required star", "隐藏必填星号"));
+        st.flag = hideStar;
+        ps.Add(st);
+        return ps;
+    }
+
+    /// 根 Window 的属性选项卡：属性行交给 PropertyGrid，
+    /// 这里只留「保存为组件」和自定义形状的只读提示。
+    int RenderWindowProps(App app, Canvas c, Theme t, int ix, int iy, int iw) {
+        if (sel != selPrev) { selPrev = sel; inspKeySeq = inspKeySeq + 1; }
+        propGrid.Bind("win" + Convert.ToString(inspKeySeq), this.WindowSpecs());
+        int gh = propGrid.ContentHeight(app);
+        propGrid.RenderInside(app, new Rect(ix, iy, iw, gh));
+        iy = iy + gh;
+        // 每种尺寸保留自己的自由画布布局（断点矩形），所以宽高
+        // 经由 ApplyDesignSize 处理，而不是仅仅调整窗口大小。
+        ApplyDesignSize(winW, winH);
+
+        if (winShape == 3) {
+            Label sl = new Label(Designer.T("Union of regions (JSON)", "区域并集（JSON）"));
+            sl.Class = "secondary small";
+            sl.RenderInside(app, new Rect(ix, iy, iw, app.Scale(18)));
+            iy = iy + app.Scale(18);
+            Label sv = new Label(winShapeSpec);
+            sv.Class = "tertiary small";
+            sv.RenderInside(app, new Rect(ix, iy, iw, app.Scale(20)));
+            iy = iy + app.Scale(22);
+        }
 
         // 把整个设计窗口保存为可复用的项目组件；
         // 宿主 IDE 会持久化它，之后它会出现在"我的组件"下。
@@ -310,72 +406,6 @@ partial class Designer {
             saveCompRequested = true;
             msg = Designer.T("saving as component…", "正在保存为组件…");
         }
-        iy = iy + app.Scale(36);
-
-        int newWinW = IntRow(app, c, t, Designer.T("Width", "宽度"), winW, 20, ix, iy, iw);
-        iy = iy + app.Scale(36);
-        int newWinH = IntRow(app, c, t, Designer.T("Height", "高度"), winH, 20, ix, iy, iw);
-        iy = iy + app.Scale(36);
-        // 经由 ApplyDesignSize 处理，使每种尺寸保留自己的自由画布
-        // 布局（断点矩形），而不是仅仅调整窗口大小。
-        ApplyDesignSize(newWinW, newWinH);
-
-        winResizable = ToggleRow(app, c, t, Designer.T("Resizable", "可调整大小"), winResizable, ix, iy, iw);
-        iy = iy + app.Scale(34);
-        winTool = ToggleRow(app, c, t, Designer.T("Tool window", "工具窗口"), winTool, ix, iy, iw);
-        iy = iy + app.Scale(34);
-        winCenter = ToggleRow(app, c, t, Designer.T("Center on show", "显示时居中"), winCenter, ix, iy, iw);
-        iy = iy + app.Scale(34);
-        if (!winCenter) {
-            winPosX = IntRow(app, c, t, Designer.T("Position X", "位置 X"), winPosX, 20, ix, iy, iw);
-            iy = iy + app.Scale(36);
-            winPosY = IntRow(app, c, t, Designer.T("Position Y", "位置 Y"), winPosY, 20, ix, iy, iw);
-            iy = iy + app.Scale(36);
-        }
-        winGlass = ToggleRow(app, c, t, Designer.T("Frosted glass", "毛玻璃效果"), winGlass, ix, iy, iw);
-        iy = iy + app.Scale(34);
-
-        // 窗口轮廓：异形窗口按像素 alpha 合成，
-        // 设计画布预览形状，运行中的窗口则是
-        // 真正半透明的轮廓（CleanMyMac 风格卡片等）。自定义
-        // 形状（winShape == 3）是以 JSON 编写的区域并集；
-        // 检查器以只读方式显示它（请在 JSON 抽屉中编辑）。
-        List<string> shapeOpts = new List<string>{
-            Designer.T("Rect", "矩形"),
-            Designer.T("Rounded", "圆角"),
-            Designer.T("Ellipse", "圆形"),
-            Designer.T("Custom", "自定义") };
-        winShape = SegRow(app, c, t, Designer.T("Window shape", "窗口形状"), shapeOpts, winShape, ix, iy, iw);
-        iy = iy + app.Scale(54);
-        if (winShape == 1) {
-            winShapeRadius = IntRow(app, c, t, Designer.T("Corner radius", "圆角半径"), winShapeRadius, 4, ix, iy, iw);
-            iy = iy + app.Scale(36);
-        } else if (winShape == 3) {
-            c.DrawText(ix, iy, Designer.T("Union of regions (JSON)", "区域并集（JSON）"), t.textSecondary, fs);
-            iy = iy + app.Scale(18);
-            c.DrawText(ix, iy, Ellipsis.Fit(winShapeSpec, iw, fs), t.textTertiary, fs);
-            iy = iy + app.Scale(20);
-        }
-        winChrome = ToggleRow(app, c, t, Designer.T("Title bar", "标题栏"), winChrome, ix, iy, iw);
-        iy = iy + app.Scale(34);
-        winOpacity = IntRow(app, c, t, Designer.T("Opacity (10-100)", "不透明度（10-100）"), winOpacity, 5, ix, iy, iw);
-        iy = iy + app.Scale(36);
-
-        c.DrawText(ix, iy, Designer.T("LAYOUT", "布局"), t.textTertiary, fs);
-        iy = iy + app.Scale(20);
-        List<string> posOpts = new List<string>{
-            Designer.T("Left", "左"), Designer.T("Right", "右"), Designer.T("Top", "上") };
-        labelPos = SegRow(app, c, t, Designer.T("Label position", "标签位置"), posOpts, labelPos, ix, iy, iw);
-        iy = iy + app.Scale(54);
-        List<string> szOpts = new List<string>{
-            Designer.T("Large", "大"), Designer.T("Default", "默认"), Designer.T("Small", "小") };
-        formSize = SegRow(app, c, t, Designer.T("Control size", "控件大小"), szOpts, formSize, ix, iy, iw);
-        iy = iy + app.Scale(54);
-        labelWidth = IntRow(app, c, t, Designer.T("Label width", "标签宽度"), labelWidth, 8, ix, iy, iw);
-        iy = iy + app.Scale(36);
-        bool showStar = !hideStar;
-        showStar = ToggleRow(app, c, t, Designer.T("Required star", "必填星号"), showStar, ix, iy, iw);
-        hideStar = !showStar;
         iy = iy + app.Scale(40);
         return iy;
     }
@@ -544,65 +574,6 @@ partial class Designer {
             if (hay.Substring(i, needle.Length) == needle) { return true; }
         }
         return false;
-    }
-
-    // --- 检查器行辅助方法 ----
-
-    int LabeledInput(App app, Canvas c, Theme t, string label, Input inp, int ix, int iy, int iw) {
-        int fs = t.fontSizeSmall;
-        c.DrawText(ix, iy + app.Scale(7), label, t.textSecondary, fs);
-        int lw = app.Scale(84);
-        inp.Render(app, ix + lw, iy, iw - lw, app.Scale(28));
-        return iy + app.Scale(36);
-    }
-
-    bool ToggleRow(App app, Canvas c, Theme t, string label, bool val, int ix, int iy, int iw) {
-        int fs = t.fontSizeSmall;
-        c.DrawText(ix, iy + app.Scale(7), label, t.textSecondary, fs);
-        string disp = Designer.T("Off", "关");
-        int ty = 0;
-        if (val) { disp = Designer.T("On", "开"); ty = 3; }
-        int id = SmallBtn(app, disp, ty, ix + iw - app.Scale(54), iy, app.Scale(54));
-        bool nv = val;
-        if (Ui.Clicked(app, id)) { nv = !val; }
-        return nv;
-    }
-
-    int IntRow(App app, Canvas c, Theme t, string label, int val, int step, int ix, int iy, int iw) {
-        int fs = t.fontSizeSmall;
-        int bw = app.Scale(28);
-        int valW = app.Scale(40);
-        c.DrawText(ix, iy + app.Scale(7), label, t.textSecondary, fs);
-        int pX = ix + iw - bw;
-        int vX = pX - valW;
-        int mX = vX - bw;
-        int mId = SmallIconBtn(app, "minus", 0, mX, iy, bw);
-        c.DrawTextCentered(vX, iy, valW, app.Scale(28), Convert.ToString(val), t.textPrimary, fs);
-        int pId = SmallIconBtn(app, "plus", 0, pX, iy, bw);
-        int nv = val;
-        if (Ui.Clicked(app, mId)) { nv = val - step; }
-        if (Ui.Clicked(app, pId)) { nv = val + step; }
-        if (nv < 0) { nv = 0; }
-        return nv;
-    }
-
-    int SegRow(App app, Canvas c, Theme t, string title, List<string> opts, int cur, int ix, int iy, int iw) {
-        int fs = t.fontSizeSmall;
-        c.DrawText(ix, iy, title, t.textSecondary, fs);
-        int segY = iy + app.Scale(18);
-        int n = opts.Count;
-        int gapx = app.Scale(4);
-        int segW = (iw - (n - 1) * gapx) / n;
-        int gx = ix;
-        int res = cur;
-        for (int i = 0; i < n; i = i + 1) {
-            int ty = 0;
-            if (i == cur) { ty = 1; }
-            int id = SmallBtn(app, opts[i], ty, gx, segY, segW);
-            if (Ui.Clicked(app, id)) { res = i; }
-            gx = gx + segW + gapx;
-        }
-        return res;
     }
 
     // --- 状态栏 ----
