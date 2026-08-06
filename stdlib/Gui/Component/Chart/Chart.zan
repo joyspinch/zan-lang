@@ -7,6 +7,8 @@ namespace Gui.Component.Chart;
 /// 内部持有者：计算出的绘图矩形加上解析后的数值轴
 /// 范围（左轴 + 可选右轴），使每个渲染器以相同方式
 /// 映射数值 -> 像素。leftMin/leftMax 始终有效；rightMin/rightMax 仅在有右轴时有效。
+/// leftLog/rightLog 为对数轴（仅正值）；isTime 为时间 X 轴
+/// （整数天数，标签由 Chart.TimeLabel 生成）。
 class ChartFrame {
     int plotX;
     int plotY;
@@ -17,19 +19,58 @@ class ChartFrame {
     int rightMin;
     int rightMax;
     bool hasRight;
-    bool reversed;
+    bool reversed;       // 左轴翻转
+    bool rightReversed;  // 右轴翻转（独立于左轴）
+    bool leftLog;        // 左轴对数刻度
+    bool rightLog;       // 右轴对数刻度
+    bool isTime;         // X 轴时间刻度
+    int timeMin;
+    int timeMax;
 
     // 左轴（axisIndex 0）或右轴（1）上数值对应的像素 Y，
-    // 遵循轴构建器预设的翻转标志。
+    // 遵循各轴预设的翻转标志。
     int YOf(int v, int axisIndex) {
         int lo = this.leftMin;
         int hi = this.leftMax;
-        if (axisIndex == 1) { lo = this.rightMin; hi = this.rightMax; }
+        bool rev = this.reversed;
+        if (axisIndex == 1) { lo = this.rightMin; hi = this.rightMax; rev = this.rightReversed; }
         int span = hi - lo;
         if (span == 0) { span = 1; }
         int d = (v - lo) * this.plotH / span;
-        if (this.reversed) { return this.plotY + d; }
+        if (rev) { return this.plotY + d; }
         return this.plotY + this.plotH - d;
+    }
+
+    // 对数 Y 映射：仅正值（v < 1 钳制到 1），log10 线性化后
+    // 按轴范围映射。低于/高于范围钳制在绘图区内。
+    int YOfLog(int v, int axisIndex) {
+        if (v < 1) { v = 1; }
+        int lo = this.leftMin;
+        int hi = this.leftMax;
+        bool rev = this.reversed;
+        if (axisIndex == 1) { lo = this.rightMin; hi = this.rightMax; rev = this.rightReversed; }
+        if (lo < 1) { lo = 1; }
+        if (hi < lo + 1) { hi = lo + 1; }
+        int llo = Chart.Log10(lo);
+        int lhi = Chart.Log10(hi);
+        if (lhi <= llo) { lhi = llo + 1; }
+        int d = (Chart.Log10(v) - llo) * this.plotH / (lhi - llo);
+        if (d < 0) { d = 0; }
+        if (d > this.plotH) { d = this.plotH; }
+        if (rev) { return this.plotY + d; }
+        return this.plotY + this.plotH - d;
+    }
+
+    // 时间 X 映射：整数时间值 → 像素 x，钳制在绘图区内。
+    int XOfTime(int t) {
+        int lo = this.timeMin;
+        int hi = this.timeMax;
+        int span = hi - lo;
+        if (span == 0) { span = 1; }
+        int d = (t - lo) * this.plotW / span;
+        if (d < 0) { d = 0; }
+        if (d > this.plotW) { d = this.plotW; }
+        return this.plotX + d;
     }
 }
 
@@ -256,6 +297,97 @@ class Chart {
             j = i;
         }
         return inside;
+    }
+
+    // ---- 轴类型：Time / Log ----
+
+    // 10 的整数对数（floor log10），仅正值（v < 1 → 0）。
+    static int Log10(int v) {
+        if (v < 1) { return 0; }
+        int e = 0;
+        int p = 1;
+        while (p * 10 <= v) { p = p * 10; e = e + 1; }
+        return e;
+    }
+
+    // 对数轴刻度：lo/hi 边界 + 中间的 10 的幂（去重）。
+    static List<int> LogTicks(int lo, int hi) {
+        if (hi < lo) { int tmp = lo; lo = hi; hi = tmp; }
+        if (lo < 1) { lo = 1; }
+        if (hi < lo) { hi = lo; }
+        List<int> ts = new List<int>();
+        ts.Add(lo);
+        int p = 1;
+        while (p * 10 <= hi) {
+            p = p * 10;
+            if (p > lo) { ts.Add(p); }
+        }
+        if (ts[ts.Count - 1] != hi) { ts.Add(hi); }
+        return ts;
+    }
+
+    // 从整数天数生成确定性短日期 "YYYY-MM-DD"（非闰年，纯表驱动，
+    // 无系统时间依赖）。t = 0 是 1970-01-01。
+    static string TimeLabel(int t) {
+        if (t < 0) { t = 0; }
+        int year = 1970 + t / 365;
+        int doy = t % 365;
+        List<int> md = new List<int>{31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+        int month = 0;
+        while (month < 11 && doy >= md[month]) {
+            doy = doy - md[month];
+            month = month + 1;
+        }
+        string mm = Convert.ToString(month + 1);
+        if (mm.Length < 2) { mm = "0" + mm; }
+        string dd = Convert.ToString(doy + 1);
+        if (dd.Length < 2) { dd = "0" + dd; }
+        return Convert.ToString(year) + "-" + mm + "-" + dd;
+    }
+
+    // 时间轴刻度：从 {1,2,5}×10^n 阶梯选步长，使
+    // (t1-t0)/step ≤ maxTicks-1；生成 t0 起等距点，
+    // 末点不落在网格上则补 t1。
+    static List<int> TimeTicks(int t0, int t1, int maxTicks) {
+        if (t1 < t0) { int tmp = t0; t0 = t1; t1 = tmp; }
+        if (maxTicks < 2) { maxTicks = 2; }
+        int span = t1 - t0;
+        int step = 1;
+        while (true) {
+            if (span / step + 1 <= maxTicks) { break; }
+            int mag = 1;
+            while (step >= mag * 10) { mag = mag * 10; }
+            int unit = step / mag;
+            if (unit == 1) { step = 2 * mag; }
+            else if (unit == 2) { step = 5 * mag; }
+            else { step = 10 * mag; }
+        }
+        List<int> ts = new List<int>();
+        for (int t = t0; t <= t1; t = t + step) { ts.Add(t); }
+        if (ts[ts.Count - 1] != t1) { ts.Add(t1); }
+        return ts;
+    }
+
+    // 固定小数位数的确定性格式化（四舍五入，无浮点打印依赖）。
+    static string FormatFixed(double v, int precision) {
+        if (precision < 0) { precision = 0; }
+        if (precision > 4) { precision = 4; }
+        int scale = 1;
+        for (int i = 0; i < precision; i = i + 1) { scale = scale * 10; }
+        bool neg = false;
+        double av = v;
+        if (av < 0) { neg = true; av = 0 - av; }
+        int scaled = (int)(av * (double)scale + 0.5);
+        int ip = scaled / scale;
+        string s = Convert.ToString(ip);
+        if (precision > 0) {
+            int frac = scaled % scale;
+            string fs = Convert.ToString(frac);
+            while (fs.Length < precision) { fs = "0" + fs; }
+            s = s + "." + fs;
+        }
+        if (neg) { s = "-" + s; }
+        return s;
     }
 
     // ---- 共享框架 ----
@@ -706,6 +838,27 @@ class Chart {
             rightHi = Chart.AxisHi(y1.max, rData, rightLo);
         }
 
+        // 对数轴：仅正值，钳制下界到 ≥1（log10 对 ≤0 无定义）。
+        bool leftLog = y0.type == ChartAxisType.Log;
+        if (leftLog) {
+            if (leftLo < 1) { leftLo = 1; }
+            if (leftHi < leftLo + 1) { leftHi = leftLo + 1; }
+        }
+        bool rightLog = hasRight && y1.type == ChartAxisType.Log;
+        if (rightLog) {
+            if (rightLo < 1) { rightLo = 1; }
+            if (rightHi < rightLo + 1) { rightHi = rightLo + 1; }
+        }
+        // 时间 X 轴：整数天数范围（Auto → 0..n-1）。
+        bool isTime = x0.type == ChartAxisType.Time;
+        int tMin = x0.min;
+        int tMax = x0.max;
+        if (tMin == ChartOption.Auto()) { tMin = 0; }
+        if (tMax == ChartOption.Auto()) {
+            tMax = labels.Count - 1;
+            if (tMax < tMin + 1) { tMax = tMin + 1; }
+        }
+
         int leftGut = Chart.TickLabelW(leftLo, leftHi, ticks, fs) + app.Scale(12);
         int rightGut = pad;
         if (hasRight) { rightGut = Chart.TickLabelW(rightLo, rightHi, ticks, fs) + app.Scale(12); }
@@ -738,41 +891,87 @@ class Chart {
         f.rightMax = rightHi;
         f.hasRight = hasRight;
         f.reversed = y0.reversed;
+        f.rightReversed = y1.reversed;
+        f.leftLog = leftLog;
+        f.rightLog = rightLog;
+        f.isTime = isTime;
+        f.timeMin = tMin;
+        f.timeMax = tMax;
 
-        // 网格线 + 左右数值标签
+        // 网格线 + 左右数值标签（对数轴用 10 的幂刻度）
         bool grid = o.showGrid && y0.showGrid;
-        int leftSpan = leftHi - leftLo;
-        int rightSpan = rightHi - rightLo;
-        for (int k = 0; k <= ticks; k = k + 1) {
-            int lv = leftLo + leftSpan * k / ticks;
-            int gy = f.YOf(lv, 0);
-            if (grid) { c.FillRect(plotX, gy, plotW, 1, t.divider); }
-            string ls = Convert.ToString(lv);
-            int lw = Canvas.MeasureText(ls, fs);
-            c.DrawText(plotX - app.Scale(6) - lw, gy - fh / 2, ls, t.textTertiary, fs);
-            if (hasRight) {
-                int rv = rightLo + rightSpan * k / ticks;
-                c.DrawText(plotRight + app.Scale(6), gy - fh / 2, Convert.ToString(rv), t.textTertiary, fs);
+        if (leftLog) {
+            List<int> lts = Chart.LogTicks(leftLo, leftHi);
+            for (int li = 0; li < lts.Count; li = li + 1) {
+                int lv = lts[li];
+                int gy = f.YOfLog(lv, 0);
+                if (grid) { c.FillRect(plotX, gy, plotW, 1, t.divider); }
+                string ls = Convert.ToString(lv);
+                int lw = Canvas.MeasureText(ls, fs);
+                c.DrawText(plotX - app.Scale(6) - lw, gy - fh / 2, ls, t.textTertiary, fs);
+            }
+        } else {
+            int leftSpan = leftHi - leftLo;
+            for (int k = 0; k <= ticks; k = k + 1) {
+                int lv = leftLo + leftSpan * k / ticks;
+                int gy = f.YOf(lv, 0);
+                if (grid) { c.FillRect(plotX, gy, plotW, 1, t.divider); }
+                string ls = Convert.ToString(lv);
+                int lw = Canvas.MeasureText(ls, fs);
+                c.DrawText(plotX - app.Scale(6) - lw, gy - fh / 2, ls, t.textTertiary, fs);
+            }
+        }
+        if (hasRight) {
+            if (rightLog) {
+                List<int> rts = Chart.LogTicks(rightLo, rightHi);
+                for (int ri = 0; ri < rts.Count; ri = ri + 1) {
+                    int rv = rts[ri];
+                    int gy = f.YOfLog(rv, 1);
+                    c.DrawText(plotRight + app.Scale(6), gy - fh / 2,
+                        Convert.ToString(rv), t.textTertiary, fs);
+                }
+            } else {
+                int rightSpan = rightHi - rightLo;
+                for (int k = 0; k <= ticks; k = k + 1) {
+                    int rv = rightLo + rightSpan * k / ticks;
+                    int gy = f.YOf(rv, 1);
+                    c.DrawText(plotRight + app.Scale(6), gy - fh / 2,
+                        Convert.ToString(rv), t.textTertiary, fs);
+                }
             }
         }
         c.FillRect(plotX, plotY, 1, plotH, t.borderSecondary);
         c.FillRect(plotX, plotY + plotH, plotW, 1, t.borderSecondary);
         if (hasRight) { c.FillRect(plotX + plotW, plotY, 1, plotH, t.borderSecondary); }
 
-        // x 分类标签
+        // x 分类标签（时间轴用 TimeLabel 日期刻度）
         int n = labels.Count;
         if (n > 0) {
-            int step = plotW / n;
-            int labelGap = app.Scale(6);
-            int labelRight = plotX - labelGap;
-            for (int ci = 0; ci < n; ci = ci + 1) {
-                int cxs = plotX + ci * step;
-                int labelW = Canvas.MeasureText(labels[ci], fs);
-                int labelLeft = cxs + (step - labelW) / 2;
-                if (labelLeft < cxs) { labelLeft = cxs; }
-                if (labelLeft >= labelRight + labelGap && labelLeft + labelW <= plotX + plotW) {
-                    c.DrawTextCentered(cxs, plotBot + app.Scale(4), step, fh + app.Scale(4), labels[ci], t.textTertiary, fs);
-                    labelRight = labelLeft + labelW;
+            if (isTime) {
+                List<int> tts = Chart.TimeTicks(tMin, tMax, 6);
+                for (int ti = 0; ti < tts.Count; ti = ti + 1) {
+                    int tx = f.XOfTime(tts[ti]);
+                    string ls = Chart.TimeLabel(tts[ti]);
+                    int lw = Canvas.MeasureText(ls, fs);
+                    int lx = tx - lw / 2;
+                    if (lx < plotX) { lx = plotX; }
+                    if (lx + lw <= plotX + plotW) {
+                        c.DrawText(lx, plotBot + app.Scale(4), ls, t.textTertiary, fs);
+                    }
+                }
+            } else {
+                int step = plotW / n;
+                int labelGap = app.Scale(6);
+                int labelRight = plotX - labelGap;
+                for (int ci = 0; ci < n; ci = ci + 1) {
+                    int cxs = plotX + ci * step;
+                    int labelW = Canvas.MeasureText(labels[ci], fs);
+                    int labelLeft = cxs + (step - labelW) / 2;
+                    if (labelLeft < cxs) { labelLeft = cxs; }
+                    if (labelLeft >= labelRight + labelGap && labelLeft + labelW <= plotX + plotW) {
+                        c.DrawTextCentered(cxs, plotBot + app.Scale(4), step, fh + app.Scale(4), labels[ci], t.textTertiary, fs);
+                        labelRight = labelLeft + labelW;
+                    }
                 }
             }
         }
