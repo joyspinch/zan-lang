@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.Json;
 using Gui;
 using Gui.Widget;
+using Gui.Component;
 using Gui.Designer;
 using Game.Scene;
 
@@ -309,11 +310,9 @@ partial class ZanIDE {
     /// absolutely-placed controls inside the new canvas (a 1280x720 layout
     /// pasted onto a 390x844 phone would otherwise leave controls off-screen).
     static void RetargetForms(string srcDir, int devW, int devH, List<string> log) {
-        if (!Directory.Exists(srcDir)) { return; }
-        List<string> files = Directory.GetFiles(srcDir);
+        List<string> files = DirectoryTree.Flat(srcDir, PathFilter.Only(".zform"));
         for (int i = 0; i < files.Count; i = i + 1) {
-            string fp = srcDir + "/" + files[i];
-            if (!ZanIDE.IsFormPath(fp)) { continue; }
+            string fp = files[i];
             FormDoc d = Json.Deserialize<FormDoc>(File.ReadAllText(fp));
             if (d == null || d.fields == null) { continue; }
             if (d.winW == devW && d.winH == devH) { continue; }
@@ -437,11 +436,11 @@ partial class ZanIDE {
     /// source of truth: zanc compiles it directly, so there is no generated
     /// layout file to keep in sync. Scenes follow the same two-file model.
     static void SyncFormCodeBehinds(string srcDir) {
-        if (!Directory.Exists(srcDir)) { return; }
-        List<string> files = Directory.GetFiles(srcDir);
+        List<string> files = DirectoryTree.Flat(srcDir,
+            PathFilter.Only(".zform .zscene"));
         int i = 0;
         while (i < files.Count) {
-            string fp = srcDir + "/" + files[i];
+            string fp = files[i];
             i = i + 1;
             if (ZanIDE.IsFormPath(fp)) {
                 string fbase = ZanIDE.FormBaseName(fp);
@@ -643,12 +642,9 @@ partial class ZanIDE {
 
     /// The first `.zan` file directly inside `dir` ("" when there is none).
     static string FirstSourceFile(string dir) {
-        if (!Directory.Exists(dir)) { return ""; }
-        List<string> fs = Directory.GetFiles(dir);
-        for (int i = 0; i < fs.Count; i = i + 1) {
-            if (ZanIDE.EndsWith(fs[i], ".zan")) { return dir + "/" + fs[i]; }
-        }
-        return "";
+        List<string> fs = DirectoryTree.Flat(dir, PathFilter.Only(".zan"));
+        if (fs.Count == 0) { return ""; }
+        return fs[0];
     }
 
     // ---- template bodies ----
@@ -733,25 +729,12 @@ partial class ZanIDE {
     }
 
     static void ScanInto(List<TreeNode> nodes, string dirPath, string dirName, int depth, bool expanded) {
-        TreeNode d = TreeNode.Dir(dirName, depth, expanded);
-        d.path = dirPath;
-        nodes.Add(d);
-        List<string> subs = Directory.GetDirectories(dirPath);
-        for (int i = 0; i < subs.Count; i = i + 1) {
-            // `.build` holds intermediate compile artifacts (.ll/.o/.zanrun);
-            // it is noise in the explorer, so keep it out of the tree.
-            if (subs[i] != ".build") {
-                ZanIDE.ScanInto(nodes, dirPath + "/" + subs[i], subs[i], depth + 1, false);
-            }
-        }
-        List<string> files = Directory.GetFiles(dirPath);
-        for (int j = 0; j < files.Count; j = j + 1) {
-            if (!ZanIDE.EndsWith(files[j], ".proj")) {
-                TreeNode f = TreeNode.File(files[j], depth + 1);
-                f.path = dirPath + "/" + files[j];
-                nodes.Add(f);
-            }
-        }
+        // `.build` holds intermediate compile artifacts (.ll/.o/.zanrun) and
+        // .proj is the manifest the explorer edits through its own UI; both are
+        // noise in the tree. Other dot-entries stay visible.
+        FileTree.Into(nodes, dirPath, dirName, depth, expanded,
+            PathFilter.Any().Hide(".proj").Skip(".build").Dots(false, false),
+            true, false);
     }
 
     /// True when `s` ends with `suffix` (used to hide project manifests from
@@ -990,13 +973,10 @@ partial class ZanIDE {
         for (int up = 0; up < 4; up = up + 1) {
             List<string> cand = new List<string>();
             ZanIDE.ListZanFilesIn(at, cand);
-            List<string> subs = Directory.GetDirectories(at);
+            List<string> subs = DirectoryTree.SubDirs(at,
+                PathFilter.Any().Skip("build dist bin obj publish"));
             for (int s = 0; s < subs.Count; s = s + 1) {
-                string sn = subs[s];
-                if (sn.Substring(0, 1) != "." && sn != "build" && sn != "dist"
-                    && sn != "bin" && sn != "obj" && sn != "publish") {
-                    ZanIDE.ListZanFilesIn(at + "/" + sn, cand);
-                }
+                ZanIDE.ListZanFilesIn(subs[s], cand);
             }
             for (int i = 0; i < cand.Count; i = i + 1) {
                 string f = cand[i];
@@ -1015,14 +995,7 @@ partial class ZanIDE {
 
     /// Full paths of the .zan files directly inside `dir` (no recursion).
     static void ListZanFilesIn(string dir, List<string> outp) {
-        if (!Directory.Exists(dir)) { return; }
-        List<string> files = Directory.GetFiles(dir);
-        for (int i = 0; i < files.Count; i = i + 1) {
-            string nm = files[i];
-            if (ZanIDE.IsZanFile(nm) && nm.Substring(0, 1) != ".") {
-                outp.Add(dir + "/" + nm);
-            }
-        }
+        DirectoryTree.FlatInto(outp, dir, PathFilter.Only(".zan").Dots(true, true));
     }
 
     /// True when `path` declares `namespace ns;`.
@@ -1296,12 +1269,15 @@ partial class ZanIDE {
         for (int i = 0; i < lines.Count; i = i + 1) {
             int at = lines[i].IndexOf(marker);
             if (at >= 0) {
-                string name = lines[i].Substring(at + marker.Length,
+                string ns = lines[i].Substring(at + marker.Length,
                     lines[i].Length - at - marker.Length);
-                name = ZanIDE.ReplaceAll(name, "/", ".");
-                int end = name.IndexOf(" ");
-                if (end >= 0) { name = name.Substring(0, end); }
-                return name;
+                int end = ns.IndexOf(" ");
+                if (end >= 0) { ns = ns.Substring(0, end); }
+                ns = ns.Trim();
+                // 标准库自带的命名空间（Gui、Gui/Widget、Game/Scene…）不是
+                // 缺失的扩展：这种是编译参数/代码的问题，别当成要装扩展。
+                if (Directory.Exists(ZanIDE.StdlibDir() + "/" + ns)) { continue; }
+                return ZanIDE.ReplaceAll(ns, "/", ".");
             }
         }
         return "";
@@ -1777,12 +1753,10 @@ partial class ZanIDE {
     /// Lists bundled static resources (everything in assets/ except the app icon).
     static List<string> ListResources(string root) {
         List<string> outp = new List<string>();
-        string ad = ZanIDE.AssetsDir(root);
-        if (!Directory.Exists(ad)) { return outp; }
-        List<string> files = Directory.GetFiles(ad);
+        List<string> files = DirectoryTree.Names(ZanIDE.AssetsDir(root),
+            PathFilter.Any().Dots(false, false));
         for (int i = 0; i < files.Count; i = i + 1) {
-            string nm = Path.GetFileName(files[i]);
-            if (nm != "app.ico") { outp.Add(nm); }
+            if (files[i] != "app.ico") { outp.Add(files[i]); }
         }
         return outp;
     }

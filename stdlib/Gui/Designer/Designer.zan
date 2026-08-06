@@ -54,20 +54,24 @@ partial class Designer {
     string msg;
     int inspTab;      // 0 = 字段，1 = 表单
     bool preview;
+    // 宿主（IDE）把组件面板和属性面板挂在自己的 dock 里时置位：
+    // 设计器本体只留功能区 + 画布，不再自己开左右两栏。
+    bool hostPanels;
     int seq;          // 生成字段名的递增计数器
 
     // 面板添加新组件时放入的容器：当前选中
     // 的容器，或选中子级的父容器；null 表示
     // 顶层表单。点击 Card / Tabs 后即可把组件放入其中。
     FormField activeContainer;
-    bool rowClicked;  // 当某行消费了 mousedown 时置位，这样背景
-                      // 点击才能取消选中
-    int paletteScroll; // 组件面板的纵向滚动偏移
-    int palClipTop;    // 面板主体可见的顶部/底部（用于裁剪）
-    int palClipBot;
-    int formScroll;    // 表单预览的纵向滚动偏移
-    int formClipTop;   // 表单主体可见的顶部/底部（用于裁剪）
-    int formClipBot;
+    // 组件工具箱（TreeView 控件 + 与其绑定的节点表）。
+    // palKind / palCustom 与 palNodes 一一对应：行 -> 组件类型。
+    TreeView palTv;
+    List<TreeNode> palNodes;
+    List<int> palKind;
+    List<string> palCustom;
+    bool palBuilt;      // 节点表是否已构建
+    string palBuiltQ;   // 上次构建节点时的过滤串
+    int palBuiltUser;   // 上次构建节点时的用户组件数量
 
     // 工具箱中被折叠起来的分组标题（Visual Studio 风格的
     // 可折叠分组），按标题记住，跨帧保留。
@@ -262,10 +266,7 @@ partial class Designer {
         this.preview = false;
         this.seq = 0;
         this.activeContainer = null;
-        this.rowClicked = false;
-        this.paletteScroll = 0;
         this.palFolded = new List<string>();
-        this.formScroll = 0;
         this.layoutMode = 0;
         this.winZoom = 0;
         this.freeDragging = false;
@@ -371,7 +372,8 @@ partial class Designer {
     }
 
     void ScrollPaletteToEnd() {
-        paletteScroll = 1000000000;
+        this.EnsurePalette();
+        palTv.ScrollToEnd();
     }
 
     /// 可选的示例内容，让新建的设计器不是空表单——
@@ -639,6 +641,61 @@ partial class Designer {
 
     void ClearExtraSel() { freeExtra = new List<FormField>(); }
 
+    /// 把多选里其余成员的宽/高设成主选中项的（0=等宽，1=等高），
+    /// 和场景设计器的「尺寸」组同义。
+    void SizeSelGroup(int mode) {
+        if (sel == null) { return; }
+        for (int i = 0; i < freeExtra.Count; i = i + 1) {
+            FormField f = freeExtra[i];
+            if (mode == 0) { f.fw = sel.fw; } else { f.fh = sel.fh; }
+        }
+        msg = Designer.T("sized", "已统一尺寸");
+    }
+
+    /// 把选中项移到同级的最前/最后（1=置顶，0=置底）。
+    void SelToEdge(int top) {
+        if (sel == null) { return; }
+        FormField pc = ParentContainerOf(sel);
+        List<FormField> list = fields;
+        if (pc != null) { list = pc.kids; }
+        int idx = IndexIn(list, sel);
+        if (idx < 0) { return; }
+        int to = 0;
+        if (top == 0) { to = list.Count - 1; }
+        if (to == idx) { return; }
+        list = ListMove(list, idx, to);
+        if (pc == null) { fields = list; } else { pc.kids = list; }
+    }
+
+    /// 复制选中项，副本偏移一点并成为新的选中项。
+    void DuplicateSel() {
+        if (sel == null) { return; }
+        FormField nf = sel.Clone();
+        nf.fx = sel.fx + 16;
+        nf.fy = sel.fy + 16;
+        nf.fname = FormField.TypeKey(nf.ftype) + Convert.ToString(seq);
+        nf.name = nf.fname;
+        seq = seq + 1;
+        FormField pc = ParentContainerOf(sel);
+        if (pc == null) { fields.Add(nf); } else { pc.kids.Add(nf); }
+        ClearExtraSel();
+        sel = nf;
+        msg = Designer.T("duplicated", "已复制");
+    }
+
+    /// 锁定/解锁整个多选：以主选中项的状态取反，其余成员跟随，
+    /// 这样一组组件的锁定状态始终一致。
+    void ToggleLockSel() {
+        if (sel == null) { return; }
+        bool on = !sel.locked;
+        sel.locked = on;
+        for (int i = 0; i < freeExtra.Count; i = i + 1) {
+            freeExtra[i].locked = on;
+        }
+        if (on) { msg = Designer.T("locked", "已锁定"); }
+        else { msg = Designer.T("unlocked", "已解锁"); }
+    }
+
     /// 删除整个多选：先删附加项，再删主选中项。
     void DeleteSelGroup() {
         List<FormField> extra = freeExtra;
@@ -686,24 +743,63 @@ partial class Designer {
         WidgetId.SetSeq(savedSeq);
     }
 
+    /// 宿主把组件面板和属性面板画进自己的 dock 面板里。调用
+    /// 它就等于告诉设计器「左右两栏归我管」，设计器自己那份
+    /// 不再排版。id 基值和 Render 分开，避免两趟互相错位。
+    void RenderHostPanels(App app, Rect toolRect, Rect propRect) {
+        hostPanels = true;
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int savedSeq = WidgetId.SeqValue();
+        WidgetId.SetSeq(840000);
+        RenderPalette(app, c, t, toolRect.x, toolRect.y, toolRect.width, toolRect.height);
+        WidgetId.SetSeq(860000);
+        RenderInspector(app, c, t, propRect.x, propRect.y, propRect.width, propRect.height);
+        WidgetId.SetSeq(savedSeq);
+    }
+
     void RenderPinned(App app, int x, int y, int w, int h) {
         Canvas c = app.canvas;
         Theme t = app.theme;
         int statusH = app.Scale(20);
         int top = y + app.Scale(6);
-        int bodyY = top;
         int bot = y + h - statusH - app.Scale(6);
 
-        int palX = x + app.Scale(12);
+        // 三栏宽度跟着宿主面板走：宿主窄了先按比例压缩面板和
+        // 检查器，压不动就收起来，绝不把内容画到面板外。
+        int pad = app.Scale(12);
+        // 功能区横跨整个设计器（不只是画布那一栏），
+        // 这样命令有地方排，也不会挤到画布上。
+        int barH = this.RibbonH(app);
+        int bodyY = top + barH + app.Scale(6);
+        int palX = x + pad;
+        int avail = w - pad * 5;
+        if (avail < app.Scale(80)) { avail = app.Scale(80); }
         int palW = app.Scale(176);
         int inspW = app.Scale(288);
-        int canX = palX + palW + app.Scale(12);
-        // The 画布 fills the whole middle column (通栏) between the palette
-        // 以及检查器。
-        int canW = w - palW - inspW - app.Scale(60);
-        if (canW < app.Scale(240)) { canW = app.Scale(240); }
-        int inspX = canX + canW + app.Scale(12);
+        if (hostPanels) { palW = 0; inspW = 0; avail = w - pad * 2; }
+        int minCan = app.Scale(220);
+        if (palW + inspW + minCan > avail) {
+            int side = avail - minCan;
+            if (side < 0) { side = 0; }
+            int sum = palW + inspW;
+            palW = side * palW / sum;
+            inspW = side - palW;
+            if (palW < app.Scale(130)) { inspW = inspW + palW; palW = 0; }
+            if (inspW < app.Scale(190)) { palW = palW + inspW; inspW = 0; }
+            if (palW > 0 && palW < app.Scale(130)) { palW = 0; }
+        }
+        int canW = avail - palW - inspW;
+        if (canW < app.Scale(80)) { canW = app.Scale(80); }
+        int canX = palX + pad;
+        if (palW > 0) { canX = palX + palW + pad; }
+        if (hostPanels) { canX = palX; }
+        int inspX = canX + canW + pad;
         int bodyH = bot - bodyY;
+
+        // 设计器整体裁剪在宿主给的矩形内。
+        c.PushClip(x, y, w, h);
+        RenderRibbon(app, c, t, palX, top, w - pad * 2);
 
         int ek = app.EventKind();
         // 拖拽进行中跟踪指针；实际放置由
@@ -733,8 +829,9 @@ partial class Designer {
             RenderForm(app, c, t, canX, bodyY, canW, bodyH - trayH - app.Scale(8));
             RenderTray(app, c, t, canX, bodyY + bodyH - trayH, canW, trayH);
         }
-        RenderPalette(app, c, t, palX, bodyY, palW, bodyH);
-        RenderInspector(app, c, t, inspX, bodyY, inspW, bodyH);
+        if (palW > 0) { RenderPalette(app, c, t, palX, bodyY, palW, bodyH); }
+        if (inspW > 0) { RenderInspector(app, c, t, inspX, bodyY, inspW, bodyH); }
+        if (hostPanels) { inspX = palX + avail; }
         RenderStatus(app, c, t, palX, bot + app.Scale(4), inspX + inspW - palX);
 
         // 在表单外结束的拖拽直接取消。
@@ -777,6 +874,7 @@ partial class Designer {
                 t.fontSizeSmall, t.textInverse);
             c.DrawText(gx + icoW + app.Scale(4), gy + app.Scale(6), gl, t.textInverse, t.fontSizeSmall);
         }
+        c.PopClip();
     }
 
     // --- 工具栏 -------------------------------------------------------------
@@ -799,87 +897,178 @@ partial class Designer {
         if (taH < app.Scale(80)) { taH = app.Scale(80); }
         jsonArea.Render(app, ix, iy, iw, taH);
         int by = iy + taH + app.Scale(8);
-        int applyId = new Button { Text = Designer.T("Apply", "应用"), Class = "primary" }.Render(app, ix, by, app.Scale(80));
+        int applyId = SmallBtn(app, Designer.T("Apply", "应用"), 1, ix, by,
+            app.Scale(80));
         if (Ui.Clicked(app, applyId)) {
             LoadJson(jsonSig.Get());
             msg = Designer.T("loaded ", "已从 JSON 加载 ") + Convert.ToString(fields.Count) + Designer.T(" components from JSON", " 个组件");
         }
-        int dumpId = new Button { Text = Designer.T("Regenerate", "重新生成") }.Render(app, ix + app.Scale(88), by, app.Scale(104));
+        int dumpId = SmallBtn(app, Designer.T("Regenerate", "重新生成"), 0,
+            ix + app.Scale(88), by, app.Scale(104));
         if (Ui.Clicked(app, dumpId)) {
             jsonArea.SetText(SaveJson());
             msg = Designer.T("regenerated JSON from the current design", "已根据当前设计重新生成 JSON");
         }
-        int closeId = new Button { Text = Designer.T("Close", "关闭") }.Render(app, ix + iw - app.Scale(70), by, app.Scale(70));
+        int closeId = SmallBtn(app, Designer.T("Close", "关闭"), 0,
+            ix + iw - app.Scale(70), by, app.Scale(70));
         if (Ui.Clicked(app, closeId)) { jsonOpen = false; }
     }
 
     // --- 字段面板 -------------------------------------------------------
 
+    /// 组件工具箱：一棵 TreeView（分组是目录，组件是叶子），
+    /// 行的绘制、滚动、过滤、折叠全部由控件自己完成，这里
+    /// 只负责喂数据和处理「选中 = 添加 / 按下 = 开始拖拽」。
     void RenderPalette(App app, Canvas c, Theme t, int px, int py, int pw, int ph) {
-        int fs = t.fontSizeSmall;
-        c.FillRoundRect(px, py, pw, ph, app.Scale(6), t.bgSecondary);
-        c.DrawRoundRect(px, py, pw, ph, app.Scale(6), t.borderPrimary, 1);
+        this.EnsurePalette();
+        palTv.RenderInside(app, new Rect(px, py, pw, ph));
+    }
 
-        // 过滤/搜索框，固定在面板顶部。
-        int fpad = app.Scale(8);
-        filterInput.Render(app, px + fpad, py + app.Scale(7), pw - fpad * 2, app.Scale(28));
+    void EnsurePalette() {
+        if (palTv == null) {
+            palNodes = new List<TreeNode>();
+            palKind = new List<int>();
+            palCustom = new List<string>();
+            palTv = new TreeView();
+            palTv.WithFilter(filterInput);
+            palTv.Empty = Designer.T("No components match.", "没有匹配的组件。");
+            palTv.OnSelect(() => { this.PalActivate(); });
+            palTv.OnPress(() => { this.PalPress(); });
+            palTv.OnExpand(() => { this.PalFoldNote(false); });
+            palTv.OnCollapse(() => { this.PalFoldNote(true); });
+            palBuilt = false;
+            palBuiltQ = "";
+            palBuiltUser = 0 - 1;
+        }
         string q = filterSig.Get();
-        int headH = app.Scale(42);
-        int bodyY = py + headH;
-        int bodyH = ph - headH;
-
-        // 面板内部滚动：指针位于主体上方时占用滚轮
-        // （否则整个页面会滚动），并限制偏移量。
-        int contentH = PaletteContentH(app, q);
-        int maxScroll = contentH - bodyH;
-        if (maxScroll < 0) { maxScroll = 0; }
-        if (InRect(app.mouseX, app.mouseY, px, bodyY, pw, bodyH)) {
-            bool ownsWheel = app.CaptureWheel(px, bodyY, pw, bodyH);
-            if (ownsWheel) {
-                int delta = app.window.EventKeyCode();
-                paletteScroll = paletteScroll - delta * app.Scale(40) / 120;
-                app.RequestRedraw();
-            }
+        if (!palBuilt || q != palBuiltQ || userComps.Count != palBuiltUser) {
+            this.BuildPalette(q);
+            palBuilt = true;
+            palBuiltQ = q;
+            palBuiltUser = userComps.Count;
+            palTv.Bind(palNodes);
         }
-        if (paletteScroll < 0) { paletteScroll = 0; }
-        if (paletteScroll > maxScroll) { paletteScroll = maxScroll; }
+    }
 
-        c.PushClip(px + 1, bodyY, pw - 2, bodyH);
-        palClipTop = bodyY;
-        palClipBot = bodyY + bodyH;
-        int ix = px + app.Scale(8);
-        int iw = pw - app.Scale(16);
-        if (maxScroll > 0) { iw = iw - app.Scale(6); }
-        int iy = bodyY + app.Scale(8) - paletteScroll;
-
+    /// 重建工具箱节点。过滤串非空时是一层扁平的匹配结果，
+    /// 否则是按类别分组的两层树。
+    void BuildPalette(string q) {
+        palNodes = new List<TreeNode>();
+        palKind = new List<int>();
+        palCustom = new List<string>();
         if (q != "") {
-            iy = PaletteFiltered(app, c, t, q, ix, iy, iw);
-        } else {
-            if (PalVisible(app, iy, app.Scale(14))) {
-                c.DrawText(ix, iy, Designer.T("COMPONENTS", "组件"), t.textTertiary, fs);
+            for (int ft = 0; ft <= FormField.MaxType(); ft = ft + 1) {
+                if (this.MatchesFilter(ft, q)) {
+                    this.PalLeaf(FormField.TypeName(ft), FieldIcon(ft), ft, "", 0);
+                }
             }
-            iy = iy + app.Scale(20);
-            iy = PaletteGroup(app, c, t, Designer.T("Basic", "基础"), 0, 8, ix, iy, iw);
-            iy = PaletteGroup(app, c, t, Designer.T("Advanced", "高级"), 8, 15, ix, iy, iw);
-            iy = PaletteGroup(app, c, t, Designer.T("Layout", "布局"), 15, 18, ix, iy, iw);
-            iy = PaletteGroup(app, c, t, Designer.T("Display", "展示"), 18, 28, ix, iy, iw);
-            iy = PaletteGroup(app, c, t, Designer.T("Feedback", "反馈"), 28, 34, ix, iy, iw);
-            iy = PaletteGroup(app, c, t, Designer.T("Navigation", "导航"), 34, 40, ix, iy, iw);
-            iy = PaletteGroup(app, c, t, Designer.T("Display+", "展示+"), 40, 47, ix, iy, iw);
-            iy = PaletteGroup(app, c, t, Designer.T("Feedback+", "反馈+"), 47, 53, ix, iy, iw);
-            iy = PaletteGroup(app, c, t, Designer.T("More", "更多"), 53, 55, ix, iy, iw);
-            iy = PaletteGroup(app, c, t, Designer.T("Non-visual", "功能组件"), 55, 58, ix, iy, iw);
-            iy = PaletteGroup(app, c, t, Designer.T("Shell", "窗口外壳"), 58, 62, ix, iy, iw);
-            iy = PaletteGroup(app, c, t, Designer.T("Industrial", "工控"), 62, 72, ix, iy, iw);
-            iy = CustomPaletteGroup(app, c, t, ix, iy, iw);
-            iy = UserPaletteGroup(app, c, t, ix, iy, iw);
+            for (int k = 0; k < userComps.Count; k = k + 1) {
+                if (Designer.Contains(userComps[k].name, q)) {
+                    this.PalLeaf(userComps[k].name, "layout", 200,
+                        userComps[k].name, 0);
+                }
+            }
+            return;
         }
-        c.PopClip();
+        this.PalGroup(Designer.T("Basic", "基础"), 0, 8);
+        this.PalGroup(Designer.T("Advanced", "高级"), 8, 15);
+        this.PalGroup(Designer.T("Layout", "布局"), 15, 18);
+        this.PalGroup(Designer.T("Display", "展示"), 18, 28);
+        this.PalGroup(Designer.T("Feedback", "反馈"), 28, 34);
+        this.PalGroup(Designer.T("Navigation", "导航"), 34, 40);
+        this.PalGroup(Designer.T("Display+", "展示+"), 40, 47);
+        this.PalGroup(Designer.T("Feedback+", "反馈+"), 47, 53);
+        this.PalGroup(Designer.T("More", "更多"), 53, 55);
+        this.PalGroup(Designer.T("Non-visual", "功能组件"), 55, 58);
+        this.PalGroup(Designer.T("Shell", "窗口外壳"), 58, 62);
+        this.PalGroup(Designer.T("Industrial", "工控"), 62, 72);
+        if (userComps.Count > 0) {
+            this.PalDir(Designer.T("My Components", "我的组件"));
+            for (int k = 0; k < userComps.Count; k = k + 1) {
+                this.PalLeaf(userComps[k].name, "layout", 200,
+                    userComps[k].name, 1);
+            }
+        }
+    }
 
-        if (maxScroll > 0) {
-            Scrollbar.RenderVertical(app, px + pw - app.Scale(7), bodyY,
-                bodyH, contentH, paletteScroll);
+    void PalGroup(string title, int lo, int hi) {
+        this.PalDir(title);
+        for (int ft = lo; ft < hi; ft = ft + 1) {
+            this.PalLeaf(FormField.TypeName(ft), FieldIcon(ft), ft, "", 1);
         }
+    }
+
+    void PalDir(string title) {
+        palNodes.Add(TreeNode.Dir(title, 0, !this.PalFolded(title)));
+        palKind.Add(0 - 1);
+        palCustom.Add("");
+    }
+
+    void PalLeaf(string label, string icon, int kind, string custom, int depth) {
+        palNodes.Add(TreeNode.FileIcon(label, depth, icon));
+        palKind.Add(kind);
+        palCustom.Add(custom);
+    }
+
+    /// 事件涉及的行是组件叶子时返回其下标，否则返回 -1。
+    int PalLeafRow() {
+        int row = palTv.ContextRow();
+        if (preview) { return 0 - 1; }
+        if (row < 0 || row >= palKind.Count) { return 0 - 1; }
+        if (palNodes[row].isDir) { return 0 - 1; }
+        return row;
+    }
+
+    int UserCompIndex(string name) {
+        for (int k = 0; k < userComps.Count; k = k + 1) {
+            if (userComps[k].name == name) { return k; }
+        }
+        return 0 - 1;
+    }
+
+    /// 单击工具箱里的组件即添加一个；随后清掉选中，
+    /// 这样连点同一行可以连续添加。
+    void PalActivate() {
+        int row = this.PalLeafRow();
+        if (row < 0) { return; }
+        int kind = palKind[row];
+        string custom = palCustom[row];
+        palTv.ClearSelection();
+        if (kind == 200) {
+            int k = this.UserCompIndex(custom);
+            if (k >= 0) { AddUserComponent(k); }
+        } else if (custom != "") {
+            AddCustomField(custom);
+        } else {
+            AddField(kind);
+        }
+    }
+
+    /// 在组件行上按下即开始一次拖拽，拖到画布上放开即添加。
+    void PalPress() {
+        int row = this.PalLeafRow();
+        if (row < 0) { return; }
+        dragging = true;
+        dragFromPalette = true;
+        dragMoved = false;
+        dragKind = palKind[row];
+        dragCustomKind = "";
+        dragUserComp = 0 - 1;
+        if (dragKind == 200) {
+            dragUserComp = this.UserCompIndex(palCustom[row]);
+        } else if (palCustom[row] != "") {
+            dragCustomKind = palCustom[row];
+        }
+        dragMouseX = palTv.ContextX();
+        dragMouseY = palTv.ContextY();
+    }
+
+    /// 记住分组的折叠状态，重建节点后仍然保留。
+    void PalFoldNote(bool folded) {
+        int row = palTv.ContextRow();
+        if (row < 0 || row >= palNodes.Count) { return; }
+        string title = palNodes[row].label;
+        if (this.PalFolded(title) != folded) { this.PalToggleFold(title); }
     }
 
     /// 当字段类型的 key 或显示名包含过滤关键字时为 true。
@@ -888,78 +1077,6 @@ partial class Designer {
         return Designer.Contains(FormField.TypeKey(ft), q)
             || Designer.Contains(FormField.TypeName(ft), q);
     }
-
-    /// 过滤框非空时显示的扁平搜索结果：所有名称匹配的内置
-    /// 组件，排成与分组一致的单列命名行。
-    int PaletteFiltered(App app, Canvas c, Theme t, string q, int ix, int iy, int iw) {
-        int fs = t.fontSizeSmall;
-        List<int> hits = new List<int>();
-        for (int ft = 0; ft <= FormField.MaxType(); ft = ft + 1) {
-            if (MatchesFilter(ft, q)) { hits.Add(ft); }
-        }
-        if (PalVisible(app, iy, app.Scale(14))) {
-            c.DrawText(ix, iy, Designer.T("MATCHES (", "匹配 (") + Convert.ToString(hits.Count) + ")", t.textTertiary, fs);
-        }
-        iy = iy + app.Scale(20);
-        if (hits.Count == 0) {
-            if (PalVisible(app, iy, app.Scale(16))) {
-                c.DrawText(ix, iy, Designer.T("No components match.", "没有匹配的组件。"), t.textSecondary, fs);
-            }
-            return iy + app.Scale(24);
-        }
-        for (int hi = 0; hi < hits.Count; hi = hi + 1) {
-            int fft = hits[hi];
-            iy = this.PaletteRow(app, c, t, fft, "", FormField.TypeName(fft),
-                FieldIcon(fft), ix, iy, iw);
-        }
-        return iy + app.Scale(8);
-    }
-
-    /// 所有面板组的总像素高度，与 RenderPalette / PaletteGroup
-    /// 的布局一致，以便正确限制滚动。
-    int PaletteContentH(App app, string q) {
-        if (q != "") {
-            int m = 0;
-            for (int ft = 0; ft <= FormField.MaxType(); ft = ft + 1) {
-                if (MatchesFilter(ft, q)) { m = m + 1; }
-            }
-            int fh = app.Scale(8) + app.Scale(20);
-            if (m > 0) { fh = fh + m * this.PalRowStep(app) + app.Scale(8); }
-            else { fh = fh + app.Scale(24); }
-            return fh + app.Scale(8);
-        }
-        int h = app.Scale(8) + app.Scale(20);
-        h = h + PaletteGroupH(app, Designer.T("Basic", "基础"), 8);
-        h = h + PaletteGroupH(app, Designer.T("Advanced", "高级"), 7);
-        h = h + PaletteGroupH(app, Designer.T("Layout", "布局"), 3);
-        h = h + PaletteGroupH(app, Designer.T("Display", "展示"), 10);
-        h = h + PaletteGroupH(app, Designer.T("Feedback", "反馈"), 6);
-        h = h + PaletteGroupH(app, Designer.T("Navigation", "导航"), 6);
-        h = h + PaletteGroupH(app, Designer.T("Display+", "展示+"), 7);
-        h = h + PaletteGroupH(app, Designer.T("Feedback+", "反馈+"), 6);
-        h = h + PaletteGroupH(app, Designer.T("More", "更多"), 2);
-        h = h + PaletteGroupH(app, Designer.T("Non-visual", "功能组件"), 3);
-        h = h + PaletteGroupH(app, Designer.T("Shell", "窗口外壳"), 4);
-        h = h + PaletteGroupH(app, Designer.T("Industrial", "工控"), 10);
-        int nc = CustomComponents.Kinds().Count;
-        if (nc > 0) {
-            h = h + PaletteGroupH(app, Designer.T("Custom", "自定义"), nc);
-        }
-        if (userComps.Count > 0) {
-            h = h + PaletteGroupH(app, Designer.T("My Components", "我的组件"),
-                userComps.Count);
-        }
-        return h + app.Scale(8);
-    }
-
-    /// 工具箱行的尺寸：Visual Studio 风格的单列窄行，行内是
-    /// 「小图标 + 名称」，没有按钮边框，只有悬停时才铺一层
-    /// 底色。名称直接可读，不用悬停等 tooltip。
-    int PalRowH(App app) { return app.Scale(22); }
-
-    int PalRowStep(App app) { return this.PalRowH(app); }
-
-    int PalHeadH(App app) { return app.Scale(20); }
 
     /// 已折叠的分组标题。折叠状态按标题记住，跨帧保留。
     bool PalFolded(string title) {
@@ -987,203 +1104,8 @@ partial class Designer {
         return outl;
     }
 
-    /// 分组标题行：一个折叠箭头 + 标题，点击整行折叠/展开。
-    /// 返回标题行之后的 y。
-    int PaletteHeader(App app, Canvas c, Theme t, string title,
-            int ix, int iy, int iw) {
-        int hh = this.PalHeadH(app);
-        if (PalVisible(app, iy, hh)) {
-            bool hov = !dragging
-                && InRect(app.mouseX, app.mouseY, ix, iy, iw, hh);
-            if (hov) {
-                c.FillRoundRect(ix, iy, iw, hh, t.borderRadiusSmall, t.bgHover);
-                app.RequestRedraw();
-            }
-            string arrow = "chevron-down";
-            if (this.PalFolded(title)) { arrow = "chevron-right"; }
-            c.DrawGlyphIn(arrow, ix, iy, app.Scale(14), hh,
-                t.fontSizeSmall, t.textTertiary);
-            c.DrawText(ix + app.Scale(16),
-                iy + (hh - Canvas.FontHeight(t.fontSizeSmall)) / 2,
-                title, t.textSecondary, t.fontSizeSmall);
-            if (!preview && hov && app.EventKind() == 3 && !dragMoved) {
-                this.PalToggleFold(title);
-                app.RequestRedraw();
-            }
-        }
-        return iy + hh;
-    }
-
-    /// 一个工具箱行（图标 + 名称）。`custom` 为空时按内置类型
-    /// `ft` 处理，否则按自定义组件种类处理。返回行之后的 y。
-    int PaletteRow(App app, Canvas c, Theme t, int ft, string custom,
-            string label, string icon, int ix, int iy, int iw) {
-        int rowH = this.PalRowH(app);
-        if (!PalVisible(app, iy, rowH)) { return iy + this.PalRowStep(app); }
-        int ek = app.EventKind();
-        bool over = InRect(app.mouseX, app.mouseY, ix, iy, iw, rowH);
-        bool hov = !dragging && over;
-        if (hov) {
-            c.FillRoundRect(ix, iy, iw, rowH, t.borderRadiusSmall, t.bgHover);
-            app.RequestRedraw();
-        }
-        c.DrawGlyphIn(icon, ix + app.Scale(2), iy, app.Scale(16), rowH,
-            t.fontSizeSmall, t.textSecondary);
-        c.DrawText(ix + app.Scale(20),
-            iy + (rowH - Canvas.FontHeight(t.fontSizeSmall)) / 2,
-            label, t.textPrimary, t.fontSizeSmall);
-        if (!preview && ek == 2 && !dragging && over) {
-            dragging = true;
-            dragFromPalette = true;
-            dragMoved = false;
-            dragKind = ft;
-            dragCustomKind = custom;
-            dragMouseX = app.mouseX;
-            dragMouseY = app.mouseY;
-        }
-        // 在行上按下再原地松开即为一次点击：直接添加，
-        // 不必拖到画布上（与拖拽共用同一次按下）。
-        if (!preview && ek == 3 && over && !dragMoved) {
-            if (custom == "") { AddField(ft); } else { AddCustomField(custom); }
-        }
-        if (custom == "" && hov) {
-            hoverFt = ft;
-            hoverX = ix + iw + app.Scale(10);
-            hoverY = iy;
-        }
-        return iy + this.PalRowStep(app);
-    }
-
-    int PaletteGroupH(App app, string title, int count) {
-        int h = this.PalHeadH(app);
-        if (this.PalFolded(title)) { return h + app.Scale(2); }
-        return h + count * this.PalRowStep(app) + app.Scale(8);
-    }
-
-    /// 为字段类型 [lo, hi) 渲染一个可折叠分组：标题行 + 每个
-    /// 类型一行「图标 + 名称」。悬停某行会触发 tooltip；按下即可
-    /// 开始拖拽，拖到表单上可添加该字段。返回分组之后的 y。
-    int PaletteGroup(App app, Canvas c, Theme t, string title, int lo, int hi,
-            int ix, int iy, int iw) {
-        iy = this.PaletteHeader(app, c, t, title, ix, iy, iw);
-        if (this.PalFolded(title)) { return iy + app.Scale(2); }
-        for (int ft = lo; ft < hi; ft = ft + 1) {
-            iy = this.PaletteRow(app, c, t, ft, "", FormField.TypeName(ft),
-                FieldIcon(ft), ix, iy, iw);
-        }
-        return iy + app.Scale(8);
-    }
-
-    /// 构建时发现的项目自定义组件（CustomComponents）的面板组。
-    /// 每个组件一个瓦片（使用其声明的图标）；
-    /// 点击添加，拖拽可放到表单上。项目未定义
-    /// 自定义组件时为空，默认不显示。
-    int CustomPaletteGroup(App app, Canvas c, Theme t, int ix, int iy, int iw) {
-        List<string> kinds = CustomComponents.Kinds();
-        if (kinds.Count == 0) { return iy; }
-        string title = Designer.T("Custom", "自定义");
-        iy = this.PaletteHeader(app, c, t, title, ix, iy, iw);
-        if (this.PalFolded(title)) { return iy + app.Scale(2); }
-        for (int k = 0; k < kinds.Count; k = k + 1) {
-            string icon = CustomComponents.IconOf(kinds[k]);
-            if (icon == "") { icon = "puzzle"; }
-            iy = this.PaletteRow(app, c, t, 100, kinds[k], kinds[k], icon,
-                ix, iy, iw);
-        }
-        return iy + app.Scale(8);
-    }
-
-    /// 项目已保存的用户组件（保存为可复用组件的窗口）的面板组。
-    /// 每个组件一个命名行；点击添加，
-    /// 拖拽可像内置组件一样放到表单上。
-    int UserPaletteGroup(App app, Canvas c, Theme t, int ix, int iy, int iw) {
-        if (userComps.Count == 0) { return iy; }
-        string title = Designer.T("My Components", "我的组件");
-        iy = this.PaletteHeader(app, c, t, title, ix, iy, iw);
-        if (this.PalFolded(title)) { return iy + app.Scale(2); }
-        int rowH = this.PalRowH(app);
-        int ek = app.EventKind();
-        for (int k = 0; k < userComps.Count; k = k + 1) {
-            if (PalVisible(app, iy, rowH)) {
-                bool over = InRect(app.mouseX, app.mouseY, ix, iy, iw, rowH);
-                if (!dragging && over) {
-                    c.FillRoundRect(ix, iy, iw, rowH, t.borderRadiusSmall,
-                        t.bgHover);
-                    app.RequestRedraw();
-                }
-                c.DrawGlyphIn("layout", ix + app.Scale(2), iy, app.Scale(16),
-                    rowH, t.fontSizeSmall, t.textSecondary);
-                c.DrawText(ix + app.Scale(20),
-                    iy + (rowH - Canvas.FontHeight(t.fontSizeSmall)) / 2,
-                    userComps[k].name, t.textPrimary, t.fontSizeSmall);
-                if (!preview && ek == 2 && !dragging && over) {
-                    dragging = true;
-                    dragFromPalette = true;
-                    dragMoved = false;
-                    dragKind = 200;
-                    dragUserComp = k;
-                    dragMouseX = app.mouseX;
-                    dragMouseY = app.mouseY;
-                }
-                if (!preview && ek == 3 && over && !dragMoved) {
-                    AddUserComponent(k);
-                }
-            }
-            iy = iy + this.PalRowStep(app);
-        }
-        return iy + app.Scale(8);
-    }
-
     bool InRect(int mx, int my, int x, int y, int w, int h) {
         return mx >= x && mx <= x + w && my >= y && my <= y + h;
-    }
-
-    /// 当给定高度的面板元素完全位于面板主体内时为 true。
-    /// 这里的画布裁剪本身不包含子控件，
-    /// 所以会跨越边缘的瓦片被剔除而非绘制。
-    bool PalVisible(App app, int yy, int h) {
-        return yy >= palClipTop && yy + h <= palClipBot;
-    }
-
-    /// 当给定高度的表单元素完全位于表单主体内时为 true。
-    /// 与面板一样，跨越边缘的行被剔除。
-    bool FormVisible(int yy, int h) {
-        return yy >= formClipTop && yy + h <= formClipBot;
-    }
-
-    /// 表单预览的总像素高度（表头 + 所有行 + 提交栏），
-    /// 与 RenderForm 的布局一致，以便限制滚动偏移。
-    int FormContentH(App app) {
-        int pad = app.Scale(14);
-        int h = pad + app.Scale(24) + app.Scale(10);
-        List<int> visIdx = new List<int>();
-        for (int vf = 0; vf < fields.Count; vf = vf + 1) {
-            if (!fields[vf].IsNonVisual()) { visIdx.Add(vf); }
-        }
-        int n = visIdx.Count;
-        int i = 0;
-        while (i < n) {
-            int cols = 0;
-            int rowEnd = i;
-            while (rowEnd < n) {
-                int sp = ClampSpan(fields[visIdx[rowEnd]].span);
-                if (rowEnd > i && cols + sp > 24) { break; }
-                cols = cols + sp;
-                rowEnd = rowEnd + 1;
-                if (cols >= 24) { break; }
-            }
-            int rowH = 0;
-            int k = i;
-            while (k < rowEnd) {
-                int hk = FieldHeight(app, fields[visIdx[k]]);
-                if (labelPos == 2 && !fields[visIdx[k]].IsDisplay()) { hk = hk + app.Scale(18); }
-                if (hk > rowH) { rowH = hk; }
-                k = k + 1;
-            }
-            h = h + rowH + app.Scale(6);
-            i = rowEnd;
-        }
-        return h + pad;
     }
 
     /// WinForms 风格组件托盘：表单上的每个非可视组件

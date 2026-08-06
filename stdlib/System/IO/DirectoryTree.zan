@@ -1,0 +1,187 @@
+using System;
+
+namespace System.IO;
+
+/// <summary>
+/// 目录遍历的过滤条件：保留哪些后缀、隐藏哪些后缀、跳过哪些子目录。
+/// 后缀表和目录表都是空格分隔的字符串，因此调用点一行写完：
+///
+///     PathFilter src = PathFilter.Only(".zan .zform .zscene")
+///         .Skip("publish build bin obj dist tools");
+/// </summary>
+class PathFilter {
+    /// 只保留这些后缀（"" 表示全部文件）。
+    string exts;
+    /// 即使命中 exts 也要隐藏的后缀（如资源管理器里的 ".proj"）。
+    string hideExts;
+    /// 不进入的子目录名。
+    string skipDirs;
+    /// 跳过以 "." 开头的目录 / 文件。
+    bool skipDotDirs;
+    bool skipDotFiles;
+
+    PathFilter() {
+        exts = "";
+        hideExts = "";
+        skipDirs = "";
+        skipDotDirs = true;
+        skipDotFiles = false;
+    }
+
+    /// 全部文件。
+    static PathFilter Any() { return new PathFilter(); }
+
+    /// 只要这些后缀的文件。
+    static PathFilter Only(string suffixes) {
+        PathFilter f = new PathFilter();
+        f.exts = suffixes;
+        return f;
+    }
+
+    PathFilter Hide(string suffixes) { hideExts = suffixes; return this; }
+    PathFilter Skip(string dirs) { skipDirs = dirs; return this; }
+
+    /// 是否跳过点开头的目录 / 文件（默认跳目录、留文件）。
+    PathFilter Dots(bool dirs, bool files) {
+        skipDotDirs = dirs;
+        skipDotFiles = files;
+        return this;
+    }
+
+    bool KeepFile(string name) {
+        if (skipDotFiles && PathFilter.Dotted(name)) { return false; }
+        if (hideExts != "" && PathFilter.AnySuffix(hideExts, name)) { return false; }
+        if (exts == "") { return true; }
+        return PathFilter.AnySuffix(exts, name);
+    }
+
+    bool EnterDir(string name) {
+        if (skipDotDirs && PathFilter.Dotted(name)) { return false; }
+        return !PathFilter.AnyWord(skipDirs, name);
+    }
+
+    static bool Dotted(string name) {
+        return name.Length > 0 && name.Substring(0, 1) == ".";
+    }
+
+    /// 空格分隔的表里有一项是 `name` 的结尾时为 true。
+    static bool AnySuffix(string list, string name) {
+        List<string> parts = PathFilter.Words(list);
+        for (int i = 0; i < parts.Count; i = i + 1) {
+            if (DirectoryTree.EndsWith(name, parts[i])) { return true; }
+        }
+        return false;
+    }
+
+    /// 空格分隔的表里有一项等于 `name` 时为 true。
+    static bool AnyWord(string list, string name) {
+        List<string> parts = PathFilter.Words(list);
+        for (int i = 0; i < parts.Count; i = i + 1) {
+            if (parts[i] == name) { return true; }
+        }
+        return false;
+    }
+
+    static List<string> Words(string list) {
+        List<string> res = new List<string>();
+        string cur = "";
+        for (int i = 0; i <= list.Length; i = i + 1) {
+            string ch = " ";
+            if (i < list.Length) { ch = list.Substring(i, 1); }
+            if (ch == " ") {
+                if (cur != "") { res.Add(cur); }
+                cur = "";
+            } else {
+                cur = cur + ch;
+            }
+        }
+        return res;
+    }
+}
+
+/// <summary>
+/// 目录遍历的唯一实现：递归收集匹配的文件路径。Directory 只给出单层的
+/// 名字列表，所以每个调用点以前都要自己写一遍「递归 + 后缀判断 + 跳过
+/// build/bin/. 开头目录」；改成：
+///
+///     List&lt;string&gt; sources = DirectoryTree.Files(root,
+///         PathFilter.Only(".zan").Skip("build bin obj"));
+///
+/// 返回的都是可直接打开的完整路径（以 "/" 连接）。
+/// </summary>
+class DirectoryTree {
+    /// `s` 以 `suffix` 结尾时为 true。
+    static bool EndsWith(string s, string suffix) {
+        int sl = s.Length;
+        int fl = suffix.Length;
+        if (fl > sl) { return false; }
+        return s.Substring(sl - fl, fl) == suffix;
+    }
+
+    /// 递归收集匹配的文件完整路径（不含目录）。
+    static void FilesInto(List<string> outp, string dirPath, PathFilter f) {
+        if (!Directory.Exists(dirPath)) { return; }
+        List<string> files = Directory.GetFiles(dirPath);
+        for (int j = 0; j < files.Count; j = j + 1) {
+            if (f.KeepFile(files[j])) { outp.Add(dirPath + "/" + files[j]); }
+        }
+        List<string> subs = DirectoryTree.SubDirs(dirPath, f);
+        for (int i = 0; i < subs.Count; i = i + 1) {
+            DirectoryTree.FilesInto(outp, subs[i], f);
+        }
+    }
+
+    static List<string> Files(string dirPath, PathFilter f) {
+        List<string> outp = new List<string>();
+        DirectoryTree.FilesInto(outp, dirPath, f);
+        return outp;
+    }
+
+    /// 单层文件的完整路径（不递归）。
+    static void FlatInto(List<string> outp, string dirPath, PathFilter f) {
+        if (!Directory.Exists(dirPath)) { return; }
+        List<string> files = Directory.GetFiles(dirPath);
+        for (int i = 0; i < files.Count; i = i + 1) {
+            if (f.KeepFile(files[i])) { outp.Add(dirPath + "/" + files[i]); }
+        }
+    }
+
+    static List<string> Flat(string dirPath, PathFilter f) {
+        List<string> outp = new List<string>();
+        DirectoryTree.FlatInto(outp, dirPath, f);
+        return outp;
+    }
+
+    /// 单层文件名（不递归），按过滤条件筛选。
+    static List<string> Names(string dirPath, PathFilter f) {
+        List<string> res = new List<string>();
+        if (!Directory.Exists(dirPath)) { return res; }
+        List<string> files = Directory.GetFiles(dirPath);
+        for (int i = 0; i < files.Count; i = i + 1) {
+            if (f.KeepFile(files[i])) { res.Add(files[i]); }
+        }
+        return res;
+    }
+
+    /// 可进入的子目录完整路径（不递归）。
+    static List<string> SubDirs(string dirPath, PathFilter f) {
+        List<string> res = new List<string>();
+        if (!Directory.Exists(dirPath)) { return res; }
+        List<string> subs = Directory.GetDirectories(dirPath);
+        for (int i = 0; i < subs.Count; i = i + 1) {
+            if (f.EnterDir(subs[i])) { res.Add(dirPath + "/" + subs[i]); }
+        }
+        return res;
+    }
+
+    /// 子目录名（不递归），按过滤条件筛选。
+    static List<string> SubNames(string dirPath, PathFilter f) {
+        List<string> res = new List<string>();
+        if (!Directory.Exists(dirPath)) { return res; }
+        List<string> subs = Directory.GetDirectories(dirPath);
+        for (int i = 0; i < subs.Count; i = i + 1) {
+            if (f.EnterDir(subs[i])) { res.Add(subs[i]); }
+        }
+        return res;
+    }
+}

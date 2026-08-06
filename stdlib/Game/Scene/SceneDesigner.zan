@@ -1,6 +1,8 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using Gui;
+using Gui.Component;
 
 namespace Game.Scene;
 
@@ -28,6 +30,9 @@ class SceneDesigner {
     SceneDoc doc;
     SceneElement sel;
     SceneElement lastSel;
+    // 宿主（IDE）把元素面板和属性面板挂在自己的 dock 里时置位：
+    // 设计器本体只留功能区 + 画布。
+    bool hostPanels;
 
     bool dragging;
     bool resizing;
@@ -559,23 +564,63 @@ class SceneDesigner {
         WidgetId.SetSeq(savedSeq);
     }
 
+    /// 宿主（IDE）把元素面板和属性面板画进自己的 dock 面板里，
+    /// 设计器本体就只剩功能区 + 画布。id 基值和 Render 分开，
+    /// 免得两趟互相错位。
+    void RenderHostPanels(App app, Rect toolRect, Rect propRect) {
+        this.hostPanels = true;
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int savedSeq = WidgetId.SeqValue();
+        WidgetId.SetSeq(880000);
+        this.RenderPalette(app, c, t, toolRect.x, toolRect.y,
+            toolRect.width, toolRect.height);
+        WidgetId.SetSeq(1200000);
+        this.RenderInspector(app, c, t, propRect.x, propRect.y,
+            propRect.width, propRect.height);
+        WidgetId.SetSeq(savedSeq);
+    }
+
     void RenderPinned(App app, int x, int y, int w, int h) {
         Canvas c = app.canvas;
         Theme t = app.theme;
 
         int pad = app.Scale(10);
-        int palW = app.Scale(172);
-        int inspW = app.Scale(276);
         int statusH = app.Scale(22);
         int top = y + pad;
         int bot = y + h - statusH - pad;
         int bodyH = bot - top;
 
+        // 三栏宽度跟着宿主面板走：宿主窄了先按比例压缩两侧，
+        // 压不动就把面板/检查器收起来，绝不把内容画到面板外。
+        int avail = w - pad * 4;
+        if (avail < app.Scale(80)) { avail = app.Scale(80); }
+        int palW = app.Scale(172);
+        int inspW = app.Scale(276);
+        if (this.hostPanels) { palW = 0; inspW = 0; avail = w - pad * 2; }
+        int minCan = app.Scale(200);
+        if (palW + inspW + minCan > avail) {
+            int side = avail - minCan;
+            if (side < 0) { side = 0; }
+            int sum = palW + inspW;
+            palW = side * palW / sum;
+            inspW = side - palW;
+            if (palW < app.Scale(120)) { inspW = inspW + palW; palW = 0; }
+            if (inspW < app.Scale(180)) { palW = palW + inspW; inspW = 0; }
+            if (palW > 0 && palW < app.Scale(120)) { palW = 0; }
+        }
+        int canW = avail - palW - inspW;
+        if (canW < app.Scale(80)) { canW = app.Scale(80); }
+
         int palX = x + pad;
-        int canX = palX + palW + pad;
-        int canW = w - palW - inspW - pad * 4;
-        if (canW < app.Scale(220)) { canW = app.Scale(220); }
+        int canX = palX + pad;
+        if (palW > 0) { canX = palX + palW + pad; }
+        if (this.hostPanels) { canX = palX; }
         int inspX = canX + canW + pad;
+        if (this.hostPanels) { inspX = palX + avail; }
+
+        // 设计器整体裁剪在宿主给的矩形内。
+        c.PushClip(x, y, w, h);
 
         // 选中项变化时同步检查器输入。
         if (this.sel != this.lastSel) {
@@ -588,9 +633,11 @@ class SceneDesigner {
             this.lastSel = this.sel;
         }
 
-        this.RenderPalette(app, c, t, palX, top, palW, bodyH);
+        if (palW > 0) { this.RenderPalette(app, c, t, palX, top, palW, bodyH); }
         this.RenderCanvas(app, c, t, canX, top, canW, bodyH);
-        this.RenderInspector(app, c, t, inspX, top, inspW, bodyH);
+        if (inspW > 0) {
+            this.RenderInspector(app, c, t, inspX, top, inspW, bodyH);
+        }
         this.RenderStatus(app, c, t, palX, bot + app.Scale(2), inspX + inspW - palX);
 
         // 面板拖拽幽灵：跟随光标的浮动芯片，直到
@@ -614,6 +661,8 @@ class SceneDesigner {
             }
             app.RequestRedraw();
         }
+
+        c.PopClip();
 
         this.RenderContextMenu(app, c, t);
         this.RenderResPicker(app, c, t, x, y, w, h);
@@ -650,14 +699,8 @@ class SceneDesigner {
     // 一个即可填充图片/背景输入框（仍可手动输入路径）。
     void RenderResPicker(App app, Canvas c, Theme t, int x, int y, int w, int h) {
         if (this.resPick == 0) { return; }
-        List<string> files = new List<string>();
-        if (SceneDesigner.assetsDir.Length > 0 && Directory.Exists(SceneDesigner.assetsDir)) {
-            List<string> all = Directory.GetFiles(SceneDesigner.assetsDir);
-            for (int fi = 0; fi < all.Count; fi = fi + 1) {
-                string nm = Path.GetFileName(all[fi]);
-                if (SceneDesigner.IsImageFile(nm)) { files.Add(nm); }
-            }
-        }
+        List<string> files = DirectoryTree.Names(SceneDesigner.assetsDir,
+            PathFilter.Only(".png .jpg .jpeg .bmp .gif .webp"));
         int mW = app.Scale(300);
         int rowH = app.theme.heightLarge;
         int rows = files.Count + 1;
@@ -732,44 +775,30 @@ class SceneDesigner {
         List<int> grp = new List<int>();
         List<int> idx = new List<int>();
 
-        // --- 排版（对齐）---
+        // --- 排版：对齐、等宽等高、层次合成一组图标格
+        //     （和 .zform 设计器同一组、同顺序、同图标）---
         RibbonGroup ga = new RibbonGroup(SceneDesigner.T("Align", "排版"));
-        List<string> aIcons = new List<string>{ "align-left", "align-right",
-            "align-top", "align-bottom", "align-center", "align-middle" };
+        List<string> aIcons = new List<string>{
+            "align-left", "align-center", "align-right",
+            "align-top", "align-middle", "align-bottom",
+            "layout", "sort",
+            "chevron-up", "chevron-down", "arrow-up", "arrow-down" };
         List<string> aLabels = new List<string>{
-            SceneDesigner.T("Left", "左对齐"), SceneDesigner.T("Right", "右对齐"),
-            SceneDesigner.T("Top", "顶对齐"), SceneDesigner.T("Bottom", "底对齐"),
-            SceneDesigner.T("Centre", "水平居中"), SceneDesigner.T("Middle", "垂直居中") };
+            SceneDesigner.T("Left", "左对齐"), SceneDesigner.T("Centre", "水平居中"),
+            SceneDesigner.T("Right", "右对齐"), SceneDesigner.T("Top", "顶对齐"),
+            SceneDesigner.T("Middle", "垂直居中"), SceneDesigner.T("Bottom", "底对齐"),
+            SceneDesigner.T("Same W", "等宽"), SceneDesigner.T("Same H", "等高"),
+            SceneDesigner.T("Forward", "上一层"), SceneDesigner.T("Back", "下一层"),
+            SceneDesigner.T("Front", "置顶"), SceneDesigner.T("Send back", "置底") };
+        // 每格映射回原来的分派：0 对齐（AlignSel op），1 等宽等高，3 层次。
+        List<int> aGrp = new List<int>{ 0, 0, 0, 0, 0, 0, 1, 1, 3, 3, 3, 3 };
+        List<int> aIdx = new List<int>{ 0, 4, 1, 2, 5, 3, 0, 1, 0, 1, 2, 3 };
         for (int a = 0; a < aIcons.Count; a = a + 1) {
-            RibbonItem it = RibbonItem.Small(aIcons[a], aLabels[a]);
+            RibbonItem it = RibbonItem.Tile(aIcons[a], aLabels[a]);
             it.SetEnabled(hasSel);
-            this.AddBarItem(groups, grp, idx, ga, it, 0, a);
+            this.AddBarItem(groups, grp, idx, ga, it, aGrp[a], aIdx[a]);
         }
         groups.Add(ga);
-
-        // --- 尺寸 ---
-        RibbonGroup gs = new RibbonGroup(SceneDesigner.T("Size", "尺寸"));
-        RibbonItem sw = RibbonItem.Small("layout", SceneDesigner.T("Same W", "等宽"));
-        sw.SetEnabled(hasSel);
-        this.AddBarItem(groups, grp, idx, gs, sw, 1, 0);
-        RibbonItem sh = RibbonItem.Small("layout", SceneDesigner.T("Same H", "等高"));
-        sh.SetEnabled(hasSel);
-        this.AddBarItem(groups, grp, idx, gs, sh, 1, 1);
-        groups.Add(gs);
-
-        // --- 层次 ---
-        RibbonGroup gz = new RibbonGroup(SceneDesigner.T("Order", "层次"));
-        List<string> zIcons = new List<string>{ "chevron-up", "chevron-down",
-            "arrow-up", "arrow-down" };
-        List<string> zLabels = new List<string>{
-            SceneDesigner.T("Forward", "上一层"), SceneDesigner.T("Back", "下一层"),
-            SceneDesigner.T("Front", "置顶"), SceneDesigner.T("Bottom", "置底") };
-        for (int z = 0; z < zIcons.Count; z = z + 1) {
-            RibbonItem it = RibbonItem.Small(zIcons[z], zLabels[z]);
-            it.SetEnabled(hasSel);
-            this.AddBarItem(groups, grp, idx, gz, it, 3, z);
-        }
-        groups.Add(gz);
 
         // --- 编辑 ---
         RibbonGroup ge = new RibbonGroup(SceneDesigner.T("Edit", "编辑"));
@@ -779,9 +808,10 @@ class SceneDesigner {
         RibbonItem del = RibbonItem.Small("trash", SceneDesigner.T("Delete", "删除"));
         del.SetEnabled(hasSel);
         this.AddBarItem(groups, grp, idx, ge, del, 2, 1);
-        string lockLabel = SceneDesigner.T("Lock", "锁定");
-        if (hasSel && this.sel.Locked()) { lockLabel = SceneDesigner.T("Unlock", "解锁"); }
-        RibbonItem lk = RibbonItem.Small("pin", lockLabel);
+        RibbonItem lk = RibbonItem.Toggle("lock", SceneDesigner.T("Lock", "锁定"),
+            hasSel && this.sel.Locked());
+        lk.SetTip(SceneDesigner.T("Locked elements cannot be moved or resized",
+            "锁定后不能拖动、不能改大小"));
         lk.SetEnabled(hasSel);
         this.AddBarItem(groups, grp, idx, ge, lk, 2, 2);
         groups.Add(ge);
@@ -1135,26 +1165,36 @@ class SceneDesigner {
         int psMilli = psNumW;
         if (psNumH < psMilli) { psMilli = psNumH; }
         if (psMilli < 1) { psMilli = 1; }
-        // zoom = 0 表示适应视口；否则按设计像素的显示比例，
-        // 再乘 DPI 缩放，使 100% 就是一个设计像素一个物理像素
-        // 的逻辑尺寸（与自由窗口设计器同一套换算）。
-        if (this.zoom > 0) { psMilli = this.zoom * app.dpiScale / 100; }
+        // 「适应」只算一次：算完就固化成一个缩放值，之后画布
+        // 尺寸只由设计尺寸和缩放决定，不再跟着宿主窗口变大变小。
+        if (this.zoom <= 0) {
+            this.zoom = psMilli * 100 / app.dpiScale;
+            if (this.zoom < 100) { this.zoom = 100; }
+        }
+        psMilli = this.zoom * app.dpiScale / 100;
         if (psMilli < 1) { psMilli = 1; }
         int cw = dw * psMilli / 1000;
         int ch = dh * psMilli / 1000;
 
-        // 放大到超出视口时才允许平移，并限制在
-        // 半个视口的余量内，免得把画布拖没了。
-        int panMaxX = (cw - inW) / 2 + inW / 2;
-        int panMaxY = ch - inH + inH / 2;
+        // 平移钳制：画布永远有一块留在视口里（画布和视口里
+        // 较小的那个的一半），所以抓手怎么拖都拖不飞。
+        int keepX = cw;
+        if (inW < keepX) { keepX = inW; }
+        keepX = keepX / 2;
+        int keepY = ch;
+        if (inH < keepY) { keepY = inH; }
+        keepY = keepY / 2;
+        int panMaxX = (inW + cw) / 2 - keepX;
         if (panMaxX < 0) { panMaxX = 0; }
-        if (panMaxY < 0) { panMaxY = 0; }
-        if (cw <= inW) { this.panX = 0; }
-        if (ch <= inH) { this.panY = 0; }
         if (this.panX > panMaxX) { this.panX = panMaxX; }
         if (this.panX < 0 - panMaxX) { this.panX = 0 - panMaxX; }
+        // 纵向不是居中而是顶对齐（oy = inY - panY），上下界不对称。
+        int panMinY = keepY - inH;
+        int panMaxY = ch - keepY;
+        if (panMaxY < 0) { panMaxY = 0; }
+        if (panMinY > 0) { panMinY = 0; }
         if (this.panY > panMaxY) { this.panY = panMaxY; }
-        if (this.panY < 0 - panMaxY) { this.panY = 0 - panMaxY; }
+        if (this.panY < panMinY) { this.panY = panMinY; }
 
         int ox = inX + (inW - cw) / 2 - this.panX;
         // 将场景锚定到视口顶部（紧贴
@@ -1199,6 +1239,9 @@ class SceneDesigner {
             bgG = bgG + (112 - bgG) * 45 / 100;
             bgB = bgB + (122 - bgB) * 45 / 100;
         }
+        // 画布可能比视口大（放大或平移后），一律裁剪到视口，
+        // 否则背景和网格会画到设计器面板外面去。
+        c.PushClip(inX, inY, inW, inH);
         c.FillRect(ox, oy, cw, ch, SceneDesigner.PackColor(bgR, bgG, bgB, 255));
         c.DrawRect(ox, oy, cw, ch, t.borderSecondary, 1);
         if (this.doc.Background().Length > 0) {
@@ -1235,6 +1278,7 @@ class SceneDesigner {
         // （左键留给选择和框选）；开了抓手开关时左键也拖。
         bool handHere = this.hand
             && SceneDesigner.InRect(app.mouseX, app.mouseY, inX, inY, inW, inH);
+        if (this.hand) { this.dragging = false; this.resizing = false; this.marquee = false; }
         if (handHere) { Window.SetCursor(1); }
         if (ek == 2 && (app.window.EventButton() == 2
                 || (handHere && app.window.EventButton() == 0))
@@ -1248,6 +1292,11 @@ class SceneDesigner {
         if (this.panning && ek == 1) {
             this.panX = this.panOX - (app.mouseX - this.panSX);
             this.panY = this.panOY - (app.mouseY - this.panSY);
+            // 拖动中同样钳制，否则这一帧画布会先飞出去再弹回来。
+            if (this.panX > panMaxX) { this.panX = panMaxX; }
+            if (this.panX < 0 - panMaxX) { this.panX = 0 - panMaxX; }
+            if (this.panY > panMaxY) { this.panY = panMaxY; }
+            if (this.panY < panMinY) { this.panY = panMinY; }
             ox = inX + (inW - cw) / 2 - this.panX;
             oy = inY - this.panY;
             app.RequestRedraw();
@@ -1332,6 +1381,7 @@ class SceneDesigner {
             }
         }
         c.PopClip();
+        c.PopClip();
 
         // 面板拖拽的放置：在画布上释放时，以光标为中心
         // 添加元素（居中），并转换为设计空间坐标。
@@ -1382,7 +1432,8 @@ class SceneDesigner {
         }
 
         // 指针交互：按下选中并开始拖拽/缩放（最上层优先）。
-        if (!this.ctxOpen && ek == 2 && app.window.EventButton() == 0
+        // 抓手模式下这些全部让位——左键只平移画布。
+        if (!this.hand && !this.ctxOpen && ek == 2 && app.window.EventButton() == 0
                 && SceneDesigner.InRect(app.mouseX, app.mouseY, ox, oy, cw, ch)) {
             // 当前选中项的缩放手柄优先（开始缩放）。
             bool started = false;
