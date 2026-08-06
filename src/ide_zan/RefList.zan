@@ -14,61 +14,92 @@ using Gui.Component.CodeEditor;
 /// the file it points at -- and holds `SearchHit`s (path, line, source line), so
 /// it lists a use in this file and one three files away the same way.
 ///
-/// Rows are grouped per file with a count, the way Visual Studio's reference
-/// list groups them:
+/// Rows are a TreeView: a folder row per file with its hit count, the hits
+/// under it, the way Visual Studio's reference list groups them. Folding,
+/// hover, selection, scrolling and the scrollbar belong to the control; this
+/// class only builds the nodes and says which hit a row stands for:
 ///
 ///     click a hit      go to that use, opening its file when it is not open
 ///     click a file     fold / unfold that file's hits
-///     wheel            scroll
 ///     Escape / X       close
 ///
 /// The list is a snapshot: it is built once when it is opened (semantically by
 /// zan-lsp when that is up, else by the text scan) and never rescans while it is
-/// on screen, so an open list costs one pass over the rows it draws.
+/// on screen.
 class RefList {
     bool open;
     string word;
     List<SearchHit> hits;
-    /// One entry per file, in the order the hits arrived: its label (the path
-    /// without the project root), the index of its first hit, how many it has,
-    /// and 1 while it is unfolded.
-    List<string> grpPath;
-    List<int> grpFirst;
-    List<int> grpCount;
-    List<int> grpOpen;
-    /// The hit the last click opened, so it stays marked while its file loads.
-    int sel;
-    int scroll;
+    /// The tree rows, and the hit each one stands for (-1 on a file row).
+    List<TreeNode> nodes;
+    List<int> rowHit;
+    TreeView tree;
     /// Where the panel hangs from: the left edge and the bottom of the row whose
     /// CodeLens (or caret) opened it, in absolute pixels. -1 falls back to the
     /// top of the editor. Visual Studio pops its reference list on the code it
     /// belongs to, not into a pane at the far end of the window.
     int anchorX;
     int anchorY;
+    Panel shell;
+    Label headLbl;
     Button closeBtn;
     Button foldBtn;
-    int rowH;
-    int headH;
+    /// The hit a row activated this frame, read (and cleared) by Render.
+    int picked;
+    /// The list the tree's handlers talk to: a handler is a plain Action, and
+    /// only one reference list is on screen at a time.
+    static RefList current;
 
     static RefList Create() {
         RefList r = new RefList();
         r.open = false;
         r.word = "";
         r.hits = new List<SearchHit>();
-        r.grpPath = new List<string>();
-        r.grpFirst = new List<int>();
-        r.grpCount = new List<int>();
-        r.grpOpen = new List<int>();
-        r.sel = 0 - 1;
-        r.scroll = 0;
+        r.nodes = new List<TreeNode>();
+        r.rowHit = new List<int>();
         r.anchorX = 0 - 1;
         r.anchorY = 0 - 1;
+        r.picked = 0 - 1;
         r.closeBtn = new Button { Icon = "close", Class = "text tiny",
             Tip = ZanIDE.T("Close (Esc)", "关闭 (Esc)") };
         r.foldBtn = new Button { Text = ZanIDE.T("Collapse All", "全部折叠"),
             Class = "text small" };
-        r.rowH = 0; r.headH = 0;
+        r.tree = new TreeView();
+        r.tree.Class = "reflist";
+        r.tree.Bind(r.nodes);
+        r.tree.OnSelect(RefList.RowPicked);
+
+        r.headLbl = new Label("");
+        r.headLbl.Class = "secondary small";
+        r.headLbl.dock = 5;
+        Panel head = Panel.Row();
+        head.Class = "reflist-head";
+        head.dock = 1;
+        r.closeBtn.dock = 4;
+        head.Add(r.headLbl);
+        head.Add(r.closeBtn);
+
+        Panel foot = Panel.Row();
+        foot.Class = "reflist-foot";
+        foot.dock = 2;
+        foot.With(r.foldBtn);
+
+        r.tree.dock = 5;
+        r.shell = new Panel("refList");
+        r.shell.Class = "reflist";
+        r.shell.Add(head);
+        r.shell.Add(foot);
+        r.shell.Add(r.tree);
+        RefList.current = r;
         return r;
+    }
+
+    /// A row was clicked: a file row folds (the tree does that itself), a hit
+    /// row is the use to open.
+    static void RowPicked() {
+        RefList r = RefList.current;
+        int row = r.tree.SelectedIndex();
+        if (row >= 0 && row < r.rowHit.Count) { r.picked = r.rowHit[row]; }
     }
 
     /// Hangs the panel under the row at absolute (ax, ay). Called every frame
@@ -89,12 +120,7 @@ class RefList {
     /// than leaving an empty panel on screen.
     void Show(string symbol, List<SearchHit> found, string root) {
         word = symbol;
-        sel = 0 - 1;
-        scroll = 0;
-        grpPath = new List<string>();
-        grpFirst = new List<int>();
-        grpCount = new List<int>();
-        grpOpen = new List<int>();
+        picked = 0 - 1;
         // A file's hits are kept together even when the source of the list
         // (zan-lsp) interleaves them: files keep the order they first appear in.
         List<string> order = new List<string>();
@@ -104,19 +130,26 @@ class RefList {
             }
         }
         hits = new List<SearchHit>();
+        nodes = new List<TreeNode>();
+        rowHit = new List<int>();
         for (int g = 0; g < order.Count; g = g + 1) {
-            grpPath.Add(RefList.Label(order[g], root));
-            grpFirst.Add(hits.Count);
-            grpOpen.Add(1);
-            int n = 0;
+            List<SearchHit> mine = new List<SearchHit>();
             for (int k = 0; k < found.Count; k = k + 1) {
-                if (found[k].path == order[g]) {
-                    hits.Add(found[k]);
-                    n = n + 1;
-                }
+                if (found[k].path == order[g]) { mine.Add(found[k]); }
             }
-            grpCount.Add(n);
+            nodes.Add(TreeNode.Dir(RefList.Label(order[g], root) + " ("
+                + Convert.ToString(mine.Count) + ")", 0, true));
+            rowHit.Add(0 - 1);
+            for (int k = 0; k < mine.Count; k = k + 1) {
+                SearchHit hit = mine[k];
+                nodes.Add(TreeNode.FileIcon(Convert.ToString(hit.line + 1)
+                    + "  " + hit.text, 1, "code"));
+                rowHit.Add(hits.Count);
+                hits.Add(hit);
+            }
         }
+        tree.Bind(nodes);
+        tree.ClearSelection();
         open = hits.Count > 0;
     }
 
@@ -137,64 +170,57 @@ class RefList {
         return path;
     }
 
-    /// Rows on screen: a file header per group plus the hits of the unfolded
-    /// ones. `kind` is 0 for a header and 1 for a hit; `val` is the group index
-    /// or the hit index.
-    void BuildRows(List<int> kind, List<int> val) {
-        for (int g = 0; g < grpPath.Count; g = g + 1) {
-            kind.Add(0);
-            val.Add(g);
-            if (grpOpen[g] == 1) {
-                for (int k = 0; k < grpCount[g]; k = k + 1) {
-                    kind.Add(1);
-                    val.Add(grpFirst[g] + k);
-                }
-            }
-        }
-    }
-
     /// Folds (or unfolds) every file.
-    void SetAllFolded(int state) {
-        for (int g = 0; g < grpOpen.Count; g = g + 1) {
-            grpOpen[g] = state;
+    void SetAllFolded(bool folded) {
+        for (int g = 0; g < nodes.Count; g = g + 1) {
+            if (nodes[g].isDir) { nodes[g].expanded = !folded; }
         }
+        tree.Refresh();
     }
 
     /// True while at least one file is unfolded.
     bool AnyUnfolded() {
-        for (int g = 0; g < grpOpen.Count; g = g + 1) {
-            if (grpOpen[g] == 1) { return true; }
+        for (int g = 0; g < nodes.Count; g = g + 1) {
+            if (nodes[g].isDir && nodes[g].expanded) { return true; }
         }
         return false;
     }
 
-    /// Draws the panel and returns the hit the user activated this frame, or -1.
-    /// Nothing is drawn (and -1 is returned) while the list is closed.
+    /// Rows the tree draws right now: the file rows plus the hits of the
+    /// unfolded ones. Only the panel height needs it.
+    int VisibleRows() {
+        int n = 0;
+        bool skip = false;
+        for (int g = 0; g < nodes.Count; g = g + 1) {
+            if (nodes[g].isDir) {
+                skip = !nodes[g].expanded;
+                n = n + 1;
+            } else if (!skip) {
+                n = n + 1;
+            }
+        }
+        return n;
+    }
+
+    /// Renders the panel and returns the hit the user activated this frame, or
+    /// -1. Nothing is drawn (and -1 is returned) while the list is closed.
     int Render(App app, Rect area) {
         if (!open) { return 0 - 1; }
-        Canvas c = app.canvas;
-        Theme t = app.theme;
-        int fs = t.fontSizeSmall;
-        rowH = Canvas.FontHeight(fs) + app.Scale(6);
-        headH = Canvas.FontHeight(fs) + app.Scale(10);
-        int footH = rowH + app.Scale(4);
+        int rowH = Canvas.FontHeight(app.theme.fontSizeSmall) + app.Scale(6);
+        int chromeH = app.Scale(64);
 
-        List<int> rowKind = new List<int>();
-        List<int> rowVal = new List<int>();
-        BuildRows(rowKind, rowVal);
-        int total = rowKind.Count;
         // A popup on the code it was opened from: at most twelve rows, and never
         // taller than the editor.
-        int room = (area.height - headH - footH) / rowH;
+        int room = (area.height - chromeH) / rowH;
         if (room > 12) { room = 12; }
         if (room < 3) { room = 3; }
-        int shown = total;
+        int shown = this.VisibleRows();
         if (shown > room) { shown = room; }
         if (shown < 1) { shown = 1; }
 
         int w = app.Scale(560);
         if (w > area.width - app.Scale(16)) { w = area.width - app.Scale(16); }
-        int h = headH + shown * rowH + footH;
+        int h = chromeH + shown * rowH;
         if (h > area.height) { h = area.height; }
         int x = anchorX;
         if (x < 0) { x = area.x + app.Scale(8); }
@@ -208,36 +234,9 @@ class RefList {
         if (y + h > area.y + area.height) { y = area.y + area.height - h; }
         if (y < area.y) { y = area.y; }
 
-        int maxScroll = total - shown;
-        if (maxScroll < 0) { maxScroll = 0; }
-        if (scroll > maxScroll) { scroll = maxScroll; }
-        if (scroll < 0) { scroll = 0; }
-
-        // Opaque on purpose: Prompt.Surface() goes through FillChrome(), which
-        // fades the fill under a glass skin, and code showing through a list of
-        // code is unreadable.
-        c.FillRect(x + 1, y + 1, w, h, t.shadowColor);
-        c.FillRect(x, y, w, h, t.bgSecondary);
-        c.DrawRect(x, y, w, h, t.borderPrimary, 1);
-        c.FillRect(x, y, w, headH, t.bgTertiary);
         // Swallow pointer input over the panel so a click in the list does not
         // also land in the code underneath it.
         app.BlockHitsRect(x, y, w, h);
-
-        string head = Convert.ToString(hits.Count) + " "
-            + ZanIDE.T("references to", "处引用") + " '" + word + "'";
-        if (hits.Count == 1) {
-            head = ZanIDE.T("1 reference to", "1 处引用") + " '" + word + "'";
-        }
-        c.DrawText(x + app.Scale(8), y + app.Scale(5),
-            Ellipsis.Fit(head, w - app.Scale(46), fs), t.textSecondary, fs);
-        int clId = closeBtn.Render(app, x + w - app.Scale(26), y + app.Scale(3),
-            app.Scale(22));
-
-        int pad = app.Scale(8);
-        int picked = 0 - 1;
-        int toggleGrp = 0 - 1;
-        bool click = app.EventKind() == 3 && app.window.EventButton() == 0;
         // A press anywhere else dismisses the list, the way any popup goes away
         // when the work moves on. Checked on the press, before the click reaches
         // the code, so the same gesture that closes it still places the caret.
@@ -250,88 +249,28 @@ class RefList {
                 return 0 - 1;
             }
         }
-        for (int i = 0; i < shown; i = i + 1) {
-            int r = scroll + i;
-            if (r >= total) { break; }
-            int ry = y + headH + i * rowH;
-            bool hovered = app.mouseX >= x && app.mouseX < x + w
-                && app.mouseY >= ry && app.mouseY < ry + rowH;
-            if (rowKind[r] == 1 && rowVal[r] == sel) {
-                c.FillRect(x + app.Scale(2), ry, w - app.Scale(4), rowH, t.bgActive);
-            } else if (hovered) {
-                c.FillRect(x + app.Scale(2), ry, w - app.Scale(4), rowH, t.bgHover);
-            }
-            if (rowKind[r] == 0) {
-                int g = rowVal[r];
-                string chev = "v";
-                if (grpOpen[g] == 0) { chev = ">"; }
-                c.DrawText(x + pad, ry + app.Scale(3), chev, t.textTertiary, fs);
-                string label = grpPath[g] + " ("
-                    + Convert.ToString(grpCount[g]) + ")";
-                c.DrawText(x + pad + app.Scale(14), ry + app.Scale(3),
-                    Ellipsis.Fit(label, w - pad * 2 - app.Scale(14), fs),
-                    t.textPrimary, fs);
-                if (click && hovered) { toggleGrp = g; }
-            } else {
-                int hi = rowVal[r];
-                SearchHit hit = hits[hi];
-                string ln = Convert.ToString(hit.line + 1);
-                int lnW = Canvas.MeasureText(ln, fs);
-                c.DrawText(x + pad + app.Scale(22), ry + app.Scale(3), ln,
-                    t.textTertiary, fs);
-                int px = x + pad + app.Scale(22) + lnW + app.Scale(8);
-                int pw = x + w - pad - px;
-                if (pw > app.Scale(20)) {
-                    c.DrawText(px, ry + app.Scale(3),
-                        Ellipsis.Fit(hit.text, pw, fs), t.textPrimary, fs);
-                }
-                if (click && hovered) { sel = hi; picked = hi; }
-            }
-        }
 
-        // Scrollbar: only when the list is longer than the window.
-        if (total > shown) {
-            int trackH = shown * rowH;
-            int barH = trackH * shown / total;
-            if (barH < app.Scale(12)) { barH = app.Scale(12); }
-            int barY = y + headH + trackH * scroll / total;
-            c.FillRect(x + w - app.Scale(5), barY, app.Scale(3), barH,
-                t.borderPrimary);
-        }
-
-        bool unfolded = AnyUnfolded();
+        bool unfolded = this.AnyUnfolded();
         if (unfolded) { foldBtn.Text = ZanIDE.T("Collapse All", "全部折叠"); }
         else { foldBtn.Text = ZanIDE.T("Expand All", "全部展开"); }
-        int foldId = foldBtn.Render(app, x + pad, y + h - footH,
-            app.Scale(110));
-
-        if (app.CaptureWheel(x, y, w, h)) {
-            int delta = app.window.EventKeyCode();
-            int step = delta / 120;
-            if (step == 0) {
-                if (delta > 0) { step = 1; }
-                else if (delta < 0) { step = 0 - 1; }
-            }
-            scroll = scroll - step * 3;
-            if (scroll > maxScroll) { scroll = maxScroll; }
-            if (scroll < 0) { scroll = 0; }
-            app.RequestRedraw();
+        string head = Convert.ToString(hits.Count) + " "
+            + ZanIDE.T("references to", "处引用") + " '" + word + "'";
+        if (hits.Count == 1) {
+            head = ZanIDE.T("1 reference to", "1 处引用") + " '" + word + "'";
         }
+        headLbl.Text = head;
 
-        if (Ui.Clicked(app, clId)) {
+        RefList.current = this;
+        picked = 0 - 1;
+        shell.RenderInside(app, new Rect(x, y, w, h));
+
+        if (closeBtn.WasClicked()) {
             open = false;
             app.RequestRedraw();
             return 0 - 1;
         }
-        if (Ui.Clicked(app, foldId)) {
-            if (unfolded) { SetAllFolded(0); } else { SetAllFolded(1); }
-            scroll = 0;
-            app.RequestRedraw();
-            return 0 - 1;
-        }
-        if (toggleGrp >= 0) {
-            if (grpOpen[toggleGrp] == 1) { grpOpen[toggleGrp] = 0; }
-            else { grpOpen[toggleGrp] = 1; }
+        if (foldBtn.WasClicked()) {
+            this.SetAllFolded(unfolded);
             app.RequestRedraw();
             return 0 - 1;
         }
