@@ -1,0 +1,49 @@
+// Conformance: Thread.CurrentId() must return a per-thread id, not the
+// process id. The POSIX branch previously returned getpid(), which is the
+// same value on every thread -- so Gui.Reactive.Dispatcher (which compares
+// Thread.CurrentId() against the UI thread's) would misjudge a background
+// thread as the UI thread and run GUI work unsynchronized. This test spawns
+// several threads, has each record its CurrentId(), and asserts they are all
+// distinct and differ from the main thread's id.
+using System;
+using System.Threading;
+
+namespace Conf;
+
+class Prog {
+    static int[] ids;          // worker i stores its CurrentId() in ids[i]
+    static AtomicInt next;     // next slot to fill (order not guaranteed)
+    static int mainId;
+
+    static void Work() {
+        int i = (int)Prog.next.Add(1) - 1;
+        Prog.ids[i] = Thread.CurrentId();
+    }
+
+    static void Main() {
+        Prog.mainId = Thread.CurrentId();
+        int n = 4;
+        Prog.ids = new int[n];
+        Prog.next = new AtomicInt(0);
+
+        for (int i = 0; i < n; i = i + 1) {
+            Thread.Start(Prog.Work);
+        }
+
+        // Wait until all workers have recorded their id.
+        while (Prog.next.Load() < n) {
+            Thread.Sleep(1);
+        }
+
+        int bad = 0;
+        if (Prog.mainId == 0) { bad = bad + 1; }          // main id is nonzero
+        for (int i = 0; i < n; i = i + 1) {
+            if (Prog.ids[i] == 0) { bad = bad + 1; }      // every worker wrote
+            if (Prog.ids[i] == Prog.mainId) { bad = bad + 1; }  // distinct from main
+            for (int j = i + 1; j < n; j = j + 1) {
+                if (Prog.ids[i] == Prog.ids[j]) { bad = bad + 1; }  // distinct from each other
+            }
+        }
+        Console.WriteLine("thread-ids: " + Convert.ToString(bad == 0 ? 1 : 0));
+    }
+}

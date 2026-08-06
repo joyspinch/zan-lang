@@ -11,6 +11,12 @@ extern "C" {
  * function pointer). Returns 1 on success, 0 on failure. */
 int32_t zan_thread_start(void *body);
 
+/* Return a process-unique numeric id for the calling thread. On Windows this
+ * is GetCurrentThreadId(); on Linux it is the TID (gettid, not the PID shared
+ * by every thread); on macOS pthread_threadid_np; elsewhere a stable hash of
+ * pthread_self(). Thread.CurrentId() in the stdlib is built on this. */
+int64_t zan_thread_current_id(void);
+
 /* Drop the calling thread's per-thread runtime state (currently its
  * exception-handling block). Threads started by zan_thread_start do this
  * themselves; a foreign callback thread that ran Zan code must call it, or it

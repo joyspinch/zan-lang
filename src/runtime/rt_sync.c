@@ -30,6 +30,10 @@
 #include <unistd.h>
 #endif
 
+#if defined(__linux__) && !defined(__GLIBC_PREREQ)
+#include <features.h>
+#endif
+
 #if !defined(_WIN32) && !defined(O_NOFOLLOW)
 #define O_NOFOLLOW 0
 #endif
@@ -718,6 +722,40 @@ int32_t zan_thread_start(void *body) {
     return 1;
 }
 #endif
+
+#if defined(__linux__)
+/* glibc >= 2.30 exposes gettid(); older libcs need the syscall directly.
+ * The TID is the per-thread id -- getpid() returns the same PID for every
+ * thread, which is exactly the confusion Thread.CurrentId() must avoid. */
+#if defined(__GLIBC__) && (__GLIBC_PREREQ(2, 30))
+#define zan_tid() gettid()
+#else
+#include <sys/syscall.h>
+#define zan_tid() ((long)syscall(SYS_gettid))
+#endif
+#elif defined(__APPLE__)
+#include <pthread.h>
+#endif
+
+int64_t zan_thread_current_id(void) {
+#ifdef _WIN32
+    return (int64_t)GetCurrentThreadId();
+#elif defined(__linux__)
+    return (int64_t)zan_tid();
+#elif defined(__APPLE__)
+    /* pthread_self() is a pointer and varies run to run; pthread_threadid_np
+     * yields a stable per-thread numeric id. */
+    uint64_t tid = 0;
+    if (pthread_threadid_np(NULL, &tid) != 0) return 0;
+    return (int64_t)tid;
+#else
+    /* Other POSIX: hash the pthread_t (typically a pointer) into a stable
+     * number. Address-space layout randomization makes the raw pointer vary
+     * between runs, so fold it to a 32-bit id. */
+    uintptr_t self = (uintptr_t)pthread_self();
+    return (int64_t)((self >> 16) ^ (self & 0xffffffffu));
+#endif
+}
 
 /* ---- lock-statement monitor ---------------------------------------------
  * Backs the `lock (obj) { ... }` statement. C# gives every object its own
