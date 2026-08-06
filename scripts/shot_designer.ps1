@@ -1,4 +1,5 @@
 param(
+    [string]$Extra = "",
     [string]$Out = "d:\project\zan-lang\build\shot_designer_custom.png",
     [int]$PaletteX = 1200,
     [int]$PaletteY = 700,
@@ -8,7 +9,9 @@ param(
 $exe = "d:\project\zan-lang\build\gallery_test.exe"
 Get-Process gallery_test -ErrorAction SilentlyContinue | Stop-Process -Force
 Start-Sleep -Milliseconds 300
-Start-Process $exe -ArgumentList @("Designer","custom","liquidglass")
+$args1 = @("Designer","custom","liquidglass")
+if ($Extra -ne "") { $args1 += $Extra }
+Start-Process $exe -ArgumentList $args1
 Start-Sleep -Milliseconds 1600
 
 Add-Type @"

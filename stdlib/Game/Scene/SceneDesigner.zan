@@ -48,6 +48,14 @@ class SceneDesigner {
     int mqSX;            // 框选起点（屏幕空间）
     int mqSY;
     bool showTags;       // 在元素上绘制种类/名称徽标
+    int zoom;            // 画布缩放千分比；0 = 适应视口
+    int panX;            // 画布平移（屏幕像素，右为正）
+    int panY;
+    bool panning;        // 正在用抓手拖动画布
+    int panSX;           // 抓手按下位置与按下时的平移量
+    int panSY;
+    int panOX;
+    int panOY;
     List<string> palFolded;  // 折叠起来的面板分组标题
     int palScroll;           // 面板内部滚动偏移（像素）
     List<string> undoStack;  // 文档 JSON 快照（撤销历史）
@@ -106,6 +114,14 @@ class SceneDesigner {
         this.palMoved = false;
         this.dragDx = 0;
         this.dragDy = 0;
+        this.zoom = 0;
+        this.panX = 0;
+        this.panY = 0;
+        this.panning = false;
+        this.panSX = 0;
+        this.panSY = 0;
+        this.panOX = 0;
+        this.panOY = 0;
         this.palFolded = new List<string>();
         this.palScroll = 0;
         this.guideX = 0 - 1;
@@ -757,9 +773,32 @@ class SceneDesigner {
         bx = this.RibbonGroup(app, c, t, bx, y, h,
             SceneDesigner.T("Layer", "层级"), gZ, 3);
 
+        string zl = SceneDesigner.T("Fit", "适应");
+        if (this.zoom > 0) { zl = SceneDoc.IntStr(this.zoom / 10) + "%"; }
+        List<string> gView = new List<string>{
+            SceneDesigner.T("Zoom -", "缩小"),
+            SceneDesigner.T("Zoom +", "放大"),
+            "100%",
+            zl };
+        bx = this.RibbonGroup(app, c, t, bx, y, h,
+            SceneDesigner.T("View", "视图"), gView, 4);
+
         // 分派被点击组记录的点击。
         if (this.barClickGroup == 0) { this.AlignSel(this.barClickIndex); app.RequestRedraw(); }
         else if (this.barClickGroup == 1) { this.AlignSel(6 + this.barClickIndex); app.RequestRedraw(); }
+        else if (this.barClickGroup == 4) {
+            int z = this.zoom;
+            if (z == 0) { z = 1000; }
+            if (this.barClickIndex == 0) { z = z * 10 / 11; }
+            else if (this.barClickIndex == 1) { z = z * 11 / 10; }
+            else if (this.barClickIndex == 2) { z = 1000; }
+            else { z = 0; }
+            if (z > 0 && z < 100) { z = 100; }
+            if (z > 4000) { z = 4000; }
+            this.zoom = z;
+            if (z == 0) { this.panX = 0; this.panY = 0; }
+            app.RequestRedraw();
+        }
         else if (this.barClickGroup >= 2) {
             if (this.sel == null) {
                 this.msg = SceneDesigner.T("select an element first", "请先选中一个元素");
@@ -1075,12 +1114,57 @@ class SceneDesigner {
         int psMilli = psNumW;
         if (psNumH < psMilli) { psMilli = psNumH; }
         if (psMilli < 1) { psMilli = 1; }
+        // zoom = 0 表示适应视口；否则按设计像素的显示比例，
+        // 再乘 DPI 缩放，使 100% 就是一个设计像素一个物理像素
+        // 的逻辑尺寸（与自由窗口设计器同一套换算）。
+        if (this.zoom > 0) { psMilli = this.zoom * app.dpiScale / 100; }
+        if (psMilli < 1) { psMilli = 1; }
         int cw = dw * psMilli / 1000;
         int ch = dh * psMilli / 1000;
-        int ox = inX + (inW - cw) / 2;
+
+        // 放大到超出视口时才允许平移，并限制在
+        // 半个视口的余量内，免得把画布拖没了。
+        int panMaxX = (cw - inW) / 2 + inW / 2;
+        int panMaxY = ch - inH + inH / 2;
+        if (panMaxX < 0) { panMaxX = 0; }
+        if (panMaxY < 0) { panMaxY = 0; }
+        if (cw <= inW) { this.panX = 0; }
+        if (ch <= inH) { this.panY = 0; }
+        if (this.panX > panMaxX) { this.panX = panMaxX; }
+        if (this.panX < 0 - panMaxX) { this.panX = 0 - panMaxX; }
+        if (this.panY > panMaxY) { this.panY = panMaxY; }
+        if (this.panY < 0 - panMaxY) { this.panY = 0 - panMaxY; }
+
+        int ox = inX + (inW - cw) / 2 - this.panX;
         // 将场景锚定到视口顶部（紧贴
         // 工具栏下方）而非居中，避免上方留出空白带。
-        int oy = inY;
+        int oy = inY - this.panY;
+
+        // 滚轮：Ctrl 无级缩放（以视口为中心），
+        // 否则滚轮上下平移、Shift+滚轮左右平移。
+        if (SceneDesigner.InRect(app.mouseX, app.mouseY, inX, inY, inW, inH)
+                && app.CaptureWheel(inX, inY, inW, inH)) {
+            int wdelta = app.window.EventKeyCode();
+            int mods = app.window.EventMods();
+            if (Modifiers.HasCtrl(mods)) {
+                int z = this.zoom;
+                if (z == 0) { z = psMilli * 100 / app.dpiScale; }
+                if (wdelta > 0) { z = z * 11 / 10; } else { z = z * 10 / 11; }
+                if (z < 100) { z = 100; }
+                if (z > 4000) { z = 4000; }
+                this.zoom = z;
+            } else {
+                int step = app.Scale(60);
+                if (Modifiers.HasShift(mods)) {
+                    if (wdelta > 0) { this.panX = this.panX - step; }
+                    else if (wdelta < 0) { this.panX = this.panX + step; }
+                } else {
+                    if (wdelta > 0) { this.panY = this.panY - step; }
+                    else if (wdelta < 0) { this.panY = this.panY + step; }
+                }
+            }
+            app.RequestRedraw();
+        }
 
         // 设计画布背景（清除色）+ 可选背景参考图。
         // 设计视图中，很暗的清除色会被提亮到中灰色，
@@ -1125,6 +1209,26 @@ class SceneDesigner {
 
         int ek = app.EventKind();
         if (app.PointerCaptured()) { ek = 0; }
+
+        // 抓手：中键在视口任意处按下即抓住画布拖动
+        // （左键留给选择和框选）。
+        if (ek == 2 && app.window.EventButton() == 2
+                && SceneDesigner.InRect(app.mouseX, app.mouseY, inX, inY, inW, inH)) {
+            this.panning = true;
+            this.panSX = app.mouseX;
+            this.panSY = app.mouseY;
+            this.panOX = this.panX;
+            this.panOY = this.panY;
+        }
+        if (this.panning && ek == 1) {
+            this.panX = this.panOX - (app.mouseX - this.panSX);
+            this.panY = this.panOY - (app.mouseY - this.panSY);
+            ox = inX + (inW - cw) / 2 - this.panX;
+            oy = inY - this.panY;
+            app.RequestRedraw();
+        }
+        if (this.panning && ek == 3) { this.panning = false; }
+        if (this.panning) { Window.SetCursor(1); }
 
         // 元素从后到前绘制（z 小者先），命中测试从前往后。
         List<SceneElement> ordered = this.OrderedByZ();
