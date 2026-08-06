@@ -814,6 +814,11 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
   target_link_libraries(zan_gui_runtime_test PRIVATE zan_gui)
   add_test(NAME runtime_gui COMMAND zan_gui_runtime_test)
 
+  # A4: surface dimension validation -- rejects non-positive / oversize dims.
+  add_executable(zan_gui_surface_dims_test tests/runtime/gui_surface_dims_test.c)
+  target_link_libraries(zan_gui_surface_dims_test PRIVATE zan_gui)
+  add_test(NAME runtime_gui_surface_dims COMMAND zan_gui_surface_dims_test)
+
   if(UNIX AND NOT APPLE AND NOT ZAN_GUI_SDL)
     find_program(XVFB_RUN_EXECUTABLE xvfb-run)
     if(XVFB_RUN_EXECUTABLE)

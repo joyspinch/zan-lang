@@ -199,6 +199,13 @@ static inline int aa_coverage(double cov) {
 
 EXPORT i32 zan_gui_create_surface(i32 width, i32 height) {
     zan__crash_install(); /* idempotent; ensures GUI processes log hard crashes */
+    /* Reject non-positive or absurdly large dimensions before multiplying:
+     * width*height in int overflows past ~46341^2, and no legitimate surface
+     * exceeds 16384 on a side. 16384^2 pixels * 4 bytes = 1 GB, the ceiling a
+     * fullscreen 16K panel would need. */
+    if (width <= 0 || height <= 0 || width > 16384 || height > 16384) return -1;
+    int64_t px = (int64_t)width * (int64_t)height;
+    if (px <= 0 || px > 16384LL * 16384LL) return -1;
     /* Reuse a slot freed by destroy_surface so repeated resize/maximize cycles
      * (each destroy+create) don't leak the fixed 64-slot table. */
     int id = -1;
@@ -210,6 +217,7 @@ EXPORT i32 zan_gui_create_surface(i32 width, i32 height) {
         id = g_surface_count++;
     }
     zan_surface_t *s = (zan_surface_t *)calloc(1, sizeof(zan_surface_t));
+    if (!s) return -1;
     s->width = (int)width;
     s->height = (int)height;
     s->stride = (int)width;
@@ -217,7 +225,8 @@ EXPORT i32 zan_gui_create_surface(i32 width, i32 height) {
     /* malloc (not calloc): every frame starts with zan_gui_clear covering the
      * whole surface, so zero-init is wasted work — and on large windows the
      * per-resize zeroing of ~32MB was a noticeable hitch during drag-resize. */
-    s->pixels = (u32 *)malloc((size_t)(width * height) * sizeof(u32));
+    s->pixels = (u32 *)malloc((size_t)px * sizeof(u32));
+    if (!s->pixels) { free(s); return -1; }
     g_surfaces[id] = s;
     return (i64)id;
 }

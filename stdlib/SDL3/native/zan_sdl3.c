@@ -730,8 +730,11 @@ ZAN_SDL_API zan_iptr zan_gpu_create(zan_iptr window) {
 
 /* Windowless GPU context that 渲染 到 a WxH target 读取 back on the CPU;
  * for headless verification and offscreen composition. */
+ZAN_SDL_API void zan_gpu_destroy(zan_iptr handle); /* defined below; used by the cpu-allocation failure path */
 ZAN_SDL_API zan_iptr zan_gpu_create_offscreen(zan_i32 width, zan_i32 height) {
-    if (width <= 0 || height <= 0) return 0;
+    /* Same ceiling as the GUI runtime's surfaces: 16384^2 px * 4 bytes = 1 GB
+     * and the off_w*off_h*4 size below overflows 32-bit past ~46341^2. */
+    if (width <= 0 || height <= 0 || width > 16384 || height > 16384) return 0;
     SDL_GPUDevice *dev = SDL_CreateGPUDevice(SDL_GPU_SHADERFORMAT_MSL, false, NULL);
     if (!dev) return 0;
     SDL_GPUGraphicsPipeline *pipe =
@@ -752,9 +755,11 @@ ZAN_SDL_API zan_iptr zan_gpu_create_offscreen(zan_i32 width, zan_i32 height) {
     ctx->offtex = SDL_CreateGPUTexture(dev, &tci);
     SDL_GPUTransferBufferCreateInfo dn;
     memset(&dn, 0, sizeof(dn));
-    dn.usage = SDL_GPU_TRANSFERBUFFERUSAGE_DOWNLOAD; dn.size = ctx->off_w * ctx->off_h * 4;
+    dn.usage = SDL_GPU_TRANSFERBUFFERUSAGE_DOWNLOAD;
+    dn.size = (Uint64)width * (Uint64)height * 4;
     ctx->readbuf = SDL_CreateGPUTransferBuffer(dev, &dn);
-    ctx->cpu = (unsigned char *)SDL_calloc(1, ctx->off_w * ctx->off_h * 4);
+    ctx->cpu = (unsigned char *)SDL_calloc(1, dn.size);
+    if (!ctx->cpu) { zan_gpu_destroy(zan_handle(ctx)); return 0; }
     return zan_handle(ctx);
 }
 
@@ -796,12 +801,24 @@ static SDL_GPUTexture *zan_gpu_make_texture(
     SDL_GPUTexture *tex = SDL_CreateGPUTexture(ctx->device, &tci);
     if (!tex) return NULL;
 
-    Uint32 bytes = (Uint32)(width * height * 4);
+    Uint64 bytes64 = (Uint64)width * (Uint64)height * 4;
+    if (bytes64 > (Uint64)0x7FFFFFFF) {
+        /* 2 GB upload is beyond the Uint32 size field below; reject. */
+        SDL_ReleaseGPUTexture(ctx->device, tex);
+        return NULL;
+    }
+    Uint32 bytes = (Uint32)bytes64;
     SDL_GPUTransferBufferCreateInfo up;
     memset(&up, 0, sizeof(up));
     up.usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD; up.size = bytes;
     SDL_GPUTransferBuffer *tb = SDL_CreateGPUTransferBuffer(ctx->device, &up);
+    if (!tb) { SDL_ReleaseGPUTexture(ctx->device, tex); return NULL; }
     void *map = SDL_MapGPUTransferBuffer(ctx->device, tb, false);
+    if (!map) {
+        SDL_ReleaseGPUTransferBuffer(ctx->device, tb);
+        SDL_ReleaseGPUTexture(ctx->device, tex);
+        return NULL;
+    }
     memcpy(map, pixels, bytes);
     SDL_UnmapGPUTransferBuffer(ctx->device, tb);
 
@@ -839,9 +856,10 @@ ZAN_SDL_API zan_iptr zan_gpu_load_texture(zan_iptr handle, zan_i32 width, zan_i3
 /* Solid white WxH texture; tint it via zan_gpu_draw 颜色 to 获取 any 颜色. */
 ZAN_SDL_API zan_iptr zan_gpu_solid_texture(zan_iptr handle, zan_i32 width, zan_i32 height) {
     ZanGpuCtx *ctx = (ZanGpuCtx *)zan_ptr(handle);
-    if (!ctx || width <= 0 || height <= 0) return 0;
-    size_t bytes = (size_t)(width * height * 4);
+    if (!ctx || width <= 0 || height <= 0 || width > 16384 || height > 16384) return 0;
+    size_t bytes = (size_t)((Uint64)width * (Uint64)height * 4);
     unsigned char *px = (unsigned char *)SDL_malloc(bytes);
+    if (!px) return 0;
     memset(px, 0xFF, bytes);
     SDL_GPUTexture *tex = zan_gpu_make_texture(ctx, (int)width, (int)height, px);
     SDL_free(px);
@@ -863,6 +881,7 @@ ZAN_SDL_API zan_iptr zan_gpu_load_bmp(zan_iptr handle, const char *path) {
         tex = zan_gpu_make_texture(ctx, rgba->w, rgba->h, rgba->pixels);
     } else {
         unsigned char *packed = (unsigned char *)SDL_malloc((size_t)rgba->w * rgba->h * 4);
+        if (!packed) { SDL_DestroySurface(rgba); return 0; }
         for (int y = 0; y < rgba->h; y++)
             memcpy(packed + (size_t)y * rgba->w * 4,
                    (unsigned char *)rgba->pixels + (size_t)y * rgba->pitch,
