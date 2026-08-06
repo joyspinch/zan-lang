@@ -1,0 +1,357 @@
+using System;
+using System.Json;
+using Gui;
+
+namespace Gui.Component.Chart;
+
+// ---- 关系图表布局：Chord / Force ----
+//
+// 与 ChartLayoutSpecial 相同约定：只吃 (模型, 目标几何) 并输出整数
+// 角度/坐标/命中区，不接触 App/Canvas。全部确定性整数/定点运算。
+
+/// 弦图的一个节点弧（布局输出；角度为度，0=12 点钟方向，顺时针）。
+class ChordNodeArc {
+    string name;
+    int weight;   // 入 + 出
+    int a0;       // 起始角（含）
+    int a1;       // 结束角（开）
+
+    static ChordNodeArc Of(string name, int weight, int a0, int a1) {
+        ChordNodeArc n = new ChordNodeArc();
+        n.name = name;
+        n.weight = weight;
+        n.a0 = a0;
+        n.a1 = a1;
+        return n;
+    }
+}
+
+/// 弦图的一条 ribbon（布局输出）：源/目标节点子弧的中心角。
+class ChordRibbon {
+    int from;       // 节点下标
+    int to;
+    int val;
+    int srcAngle;   // 源节点上该 link 的子弧中心角
+    int dstAngle;   // 目标节点上该 link 的子弧中心角
+
+    static ChordRibbon Of(int from, int to, int val, int srcAngle, int dstAngle) {
+        ChordRibbon r = new ChordRibbon();
+        r.from = from;
+        r.to = to;
+        r.val = val;
+        r.srcAngle = srcAngle;
+        r.dstAngle = dstAngle;
+        return r;
+    }
+}
+
+/// 弦图布局：节点 = links 的 from/to 首现序；节点权重 = 入 + 出；
+/// 圆周 360° 先扣除每节点稳定 gap，再按权重以最大余数法分整数弧；
+/// 每个节点内 incident links（按 link 原序）再分子弧，ribbon
+/// 连接源/目标子弧中心。输出节点弧 + ribbon 角度。
+class ChordLayout {
+    List<ChordNodeArc> nodes;
+    List<ChordRibbon> ribbons;
+    int gap;        // 每节点稳定间隙（度）
+    int arcTotal;   // 所有节点弧总度数（= 360 - n*gap）
+
+    static ChordLayout Of(List<ChartLink> links) {
+        ChordLayout l = new ChordLayout();
+        l.ribbons = new List<ChordRibbon>();
+        l.nodes = new List<ChordNodeArc>();
+        int n = links.Count;
+        if (n < 1) { l.gap = 2; l.arcTotal = 360; return l; }
+
+        // 节点首现序 + 权重。
+        for (int li = 0; li < n; li = li + 1) {
+            ChartLink lk = links[li];
+            if (ChordLayout.NodeIndex(l.nodes, lk.from) < 0) {
+                l.nodes.Add(ChordNodeArc.Of(lk.from, 0, 0, 0));
+            }
+            if (ChordLayout.NodeIndex(l.nodes, lk.to) < 0) {
+                l.nodes.Add(ChordNodeArc.Of(lk.to, 0, 0, 0));
+            }
+        }
+        int nn = l.nodes.Count;
+        for (int li = 0; li < n; li = li + 1) {
+            ChartLink lk = links[li];
+            int fi = ChordLayout.NodeIndex(l.nodes, lk.from);
+            int ti = ChordLayout.NodeIndex(l.nodes, lk.to);
+            l.nodes[fi].weight = l.nodes[fi].weight + lk.val;
+            l.nodes[ti].weight = l.nodes[ti].weight + lk.val;
+        }
+
+        // 稳定间隙 + 总弧长。
+        int gap = 2;
+        int arcTotal = 360 - nn * gap;
+        if (arcTotal < 180) { gap = 0; arcTotal = 360; }
+        l.gap = gap;
+        l.arcTotal = arcTotal;
+
+        // 节点弧：最大余数法分整数弧。
+        int totalW = 0;
+        for (int i = 0; i < nn; i = i + 1) { totalW = totalW + l.nodes[i].weight; }
+        if (totalW < 1) { totalW = 1; }
+        List<int> arcSz = new List<int>();
+        int rem = arcTotal;
+        for (int i = 0; i < nn; i = i + 1) {
+            int sz = arcTotal * l.nodes[i].weight / totalW;
+            arcSz.Add(sz);
+            rem = rem - sz;
+        }
+        int rr = 0;
+        while (rr < rem && nn > 0) { arcSz[rr % nn] = arcSz[rr % nn] + 1; rr = rr + 1; }
+        int ang = gap / 2;
+        for (int i = 0; i < nn; i = i + 1) {
+            l.nodes[i].a0 = ang;
+            l.nodes[i].a1 = ang + arcSz[i];
+            ang = ang + arcSz[i] + gap;
+        }
+
+        // 每节点 incident links（link 原序）→ 子弧中心角。
+        List<List<int>> inc = new List<List<int>>();
+        for (int i = 0; i < nn; i = i + 1) { inc.Add(new List<int>()); }
+        for (int li = 0; li < n; li = li + 1) {
+            ChartLink lk = links[li];
+            int fi = ChordLayout.NodeIndex(l.nodes, lk.from);
+            int ti = ChordLayout.NodeIndex(l.nodes, lk.to);
+            inc[fi].Add(li);
+            inc[ti].Add(li);
+        }
+        // subC[i][pos] = 节点 i 第 pos 个 incident link 的子弧中心角。
+        List<List<int>> subC = new List<List<int>>();
+        for (int i = 0; i < nn; i = i + 1) {
+            List<int> ctrs = new List<int>();
+            int subArc = l.nodes[i].a1 - l.nodes[i].a0;
+            int wsum = l.nodes[i].weight;
+            if (wsum < 1) { wsum = 1; }
+            List<int> sizes = new List<int>();
+            int srem = subArc;
+            for (int p = 0; p < inc[i].Count; p = p + 1) {
+                int sz = subArc * links[inc[i][p]].val / wsum;
+                sizes.Add(sz);
+                srem = srem - sz;
+            }
+            int sr = 0;
+            while (sr < srem && sizes.Count > 0) {
+                sizes[sr % sizes.Count] = sizes[sr % sizes.Count] + 1;
+                sr = sr + 1;
+            }
+            int cum = l.nodes[i].a0;
+            for (int p = 0; p < inc[i].Count; p = p + 1) {
+                ctrs.Add(cum + sizes[p] / 2);
+                cum = cum + sizes[p];
+            }
+            subC.Add(ctrs);
+        }
+
+        for (int li = 0; li < n; li = li + 1) {
+            ChartLink lk = links[li];
+            int fi = ChordLayout.NodeIndex(l.nodes, lk.from);
+            int ti = ChordLayout.NodeIndex(l.nodes, lk.to);
+            int sPos = ChordLayout.Pos(inc[fi], li);
+            int dPos = ChordLayout.Pos(inc[ti], li);
+            int sA = 0;
+            if (sPos >= 0 && sPos < subC[fi].Count) { sA = subC[fi][sPos]; }
+            int dA = 0;
+            if (dPos >= 0 && dPos < subC[ti].Count) { dA = subC[ti][dPos]; }
+            l.ribbons.Add(ChordRibbon.Of(fi, ti, lk.val, sA, dA));
+        }
+        return l;
+    }
+
+    static int NodeIndex(List<ChordNodeArc> nodes, string name) {
+        for (int i = 0; i < nodes.Count; i = i + 1) {
+            if (nodes[i].name == name) { return i; }
+        }
+        return 0 - 1;
+    }
+
+    static int Pos(List<int> list, int v) {
+        for (int i = 0; i < list.Count; i = i + 1) {
+            if (list[i] == v) { return i; }
+        }
+        return 0 - 1;
+    }
+}
+
+/// 力导向图的一个节点（布局输出；整数像素坐标）。
+class ForceNode {
+    string name;
+    int x;
+    int y;
+    int weight;   // 入 + 出
+
+    static ForceNode Of(string name, int x, int y, int weight) {
+        ForceNode nd = new ForceNode();
+        nd.name = name;
+        nd.x = x;
+        nd.y = y;
+        nd.weight = weight;
+        return nd;
+    }
+}
+
+/// 力导向图的一条边（布局输出；去重后的无向对）。
+class ForceEdge {
+    int a;        // 节点下标
+    int b;
+    int val;      // 该对 link 值之和
+
+    static ForceEdge Of(int a, int b, int val) {
+        ForceEdge e = new ForceEdge();
+        e.a = a;
+        e.b = b;
+        e.val = val;
+        return e;
+    }
+}
+
+/// 力导向布局：节点 = links 首现序；边 = 无向对（自环丢弃、
+/// 重复边求和）。初始位置为圆周（无随机）；固定轮数的整数
+/// 定点弹簧模拟（近距离斥力 + 边吸引 + 中心引力 + 边界钳制）。
+/// 节点数 > 60 时降迭代。相同输入 → 相同输出。
+class ForceLayout {
+    List<ForceNode> nodes;
+    List<ForceEdge> edges;
+    int iterations;   // 实际执行轮数
+
+    static ForceLayout Of(List<ChartLink> links, int cx, int cy, int r, int w, int h) {
+        ForceLayout l = new ForceLayout();
+        l.edges = new List<ForceEdge>();
+        l.nodes = new List<ForceNode>();
+        int n = links.Count;
+        if (n < 1) { l.iterations = 0; return l; }
+
+        // 节点首现序 + 权重。
+        for (int li = 0; li < n; li = li + 1) {
+            ChartLink lk = links[li];
+            if (ForceLayout.NodeIndex(l.nodes, lk.from) < 0) {
+                l.nodes.Add(ForceNode.Of(lk.from, 0, 0, 0));
+            }
+            if (ForceLayout.NodeIndex(l.nodes, lk.to) < 0) {
+                l.nodes.Add(ForceNode.Of(lk.to, 0, 0, 0));
+            }
+        }
+        int nn = l.nodes.Count;
+        for (int li = 0; li < n; li = li + 1) {
+            ChartLink lk = links[li];
+            int fi = ForceLayout.NodeIndex(l.nodes, lk.from);
+            int ti = ForceLayout.NodeIndex(l.nodes, lk.to);
+            l.nodes[fi].weight = l.nodes[fi].weight + lk.val;
+            l.nodes[ti].weight = l.nodes[ti].weight + lk.val;
+        }
+
+        // 边：自环丢弃；同一无向对累加值。
+        for (int li = 0; li < n; li = li + 1) {
+            ChartLink lk = links[li];
+            int fi = ForceLayout.NodeIndex(l.nodes, lk.from);
+            int ti = ForceLayout.NodeIndex(l.nodes, lk.to);
+            if (fi == ti) { continue; }
+            int a = fi;
+            int b = ti;
+            if (b < a) { int sw = a; a = b; b = sw; }
+            int ei = ForceLayout.EdgeIndex(l.edges, a, b);
+            if (ei < 0) { l.edges.Add(ForceEdge.Of(a, b, lk.val)); }
+            else { l.edges[ei].val = l.edges[ei].val + lk.val; }
+        }
+
+        // 初始位置：圆周。
+        int R = r;
+        if (R < 1) { R = 1; }
+        for (int i = 0; i < nn; i = i + 1) {
+            int ang = i * 360 / nn;
+            l.nodes[i].x = cx + R * ChartView.CosDeg(ang) / 1000;
+            l.nodes[i].y = cy + R * ChartView.SinDeg(ang) / 1000;
+        }
+
+        if (nn < 2) {
+            l.nodes[0].x = cx;
+            l.nodes[0].y = cy;
+            l.iterations = 0;
+            return l;
+        }
+
+        // 固定轮数的弹簧模拟（整数定点，每轮施加后钳制）。
+        int iters = 60;
+        if (nn > 60) { iters = 30; }
+        l.iterations = iters;
+        int k = R;
+        if (k < 8) { k = 8; }
+        int rest = R / 2;
+        if (rest < 1) { rest = 1; }
+        int maxDisp = R * 4;
+        if (maxDisp < 8) { maxDisp = 8; }
+        for (int it = 0; it < iters; it = it + 1) {
+            for (int i = 0; i < nn; i = i + 1) {
+                int xi = l.nodes[i].x;
+                int yi = l.nodes[i].y;
+                int dx = 0;
+                int dy = 0;
+                // 斥力：近距离成对推开（方向归一化，量级 ∝ (k-d)）。
+                for (int j = 0; j < nn; j = j + 1) {
+                    if (j == i) { continue; }
+                    int dijx = l.nodes[j].x - xi;
+                    int dijy = l.nodes[j].y - yi;
+                    if (dijx == 0 && dijy == 0) { dijx = 1; dijy = 0; }
+                    int d2 = dijx * dijx + dijy * dijy;
+                    int d = ChartView.ISqrt(d2);
+                    if (d < 8) { d = 8; }
+                    if (d < k) {
+                        int fr = (k - d) * 4 / 10;
+                        dx = dx - dijx * fr / d;
+                        dy = dy - dijy * fr / d;
+                    }
+                }
+                // 边吸引：拉向对方（拉伸时吸引，压缩时推开；
+                // 方向归一化，量级 ∝ (d-rest)）。
+                for (int ei = 0; ei < l.edges.Count; ei = ei + 1) {
+                    ForceEdge e = l.edges[ei];
+                    int j = 0 - 1;
+                    if (e.a == i) { j = e.b; }
+                    if (e.b == i) { j = e.a; }
+                    if (j < 0) { continue; }
+                    int dijx = l.nodes[j].x - xi;
+                    int dijy = l.nodes[j].y - yi;
+                    if (dijx == 0 && dijy == 0) { dijx = 1; dijy = 0; }
+                    int d2 = dijx * dijx + dijy * dijy;
+                    int d = ChartView.ISqrt(d2);
+                    if (d < 8) { d = 8; }
+                    int fa = (d - rest) * 2 / 10;
+                    dx = dx + dijx * fa / d;
+                    dy = dy + dijy * fa / d;
+                }
+                if (dx > maxDisp) { dx = maxDisp; }
+                if (dx < 0 - maxDisp) { dx = 0 - maxDisp; }
+                if (dy > maxDisp) { dy = maxDisp; }
+                if (dy < 0 - maxDisp) { dy = 0 - maxDisp; }
+                int nx = xi + dx * 3 / 8;
+                int ny = yi + dy * 3 / 8;
+                // 中心引力 + 边界钳制。
+                nx = nx + (cx - nx) / 32;
+                ny = ny + (cy - ny) / 32;
+                if (nx < 0) { nx = 0; }
+                if (nx > w) { nx = w; }
+                if (ny < 0) { ny = 0; }
+                if (ny > h) { ny = h; }
+                l.nodes[i].x = nx;
+                l.nodes[i].y = ny;
+            }
+        }
+        return l;
+    }
+
+    static int NodeIndex(List<ForceNode> nodes, string name) {
+        for (int i = 0; i < nodes.Count; i = i + 1) {
+            if (nodes[i].name == name) { return i; }
+        }
+        return 0 - 1;
+    }
+
+    static int EdgeIndex(List<ForceEdge> edges, int a, int b) {
+        for (int i = 0; i < edges.Count; i = i + 1) {
+            if (edges[i].a == a && edges[i].b == b) { return i; }
+        }
+        return 0 - 1;
+    }
+}

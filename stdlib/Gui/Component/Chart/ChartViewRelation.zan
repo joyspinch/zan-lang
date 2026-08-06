@@ -1,0 +1,211 @@
+using System;
+using System.Json;
+using Gui;
+
+namespace Gui.Component.Chart;
+
+partial class ChartView {
+    // ---- 弦图（ECharts type 'chord'；外环节点弧 + 连接 ribbon） ----
+
+    static void DrawChord(App app, int x, int y, int w, int h,
+                          ChartOption o, int g) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int pad = t.paddingMedium;
+        int top = ChartView.PanelHead(app, x, y, w, h, o.title);
+        ChartSeries lead = ChartView.LeadSeries(o);
+        if (lead == null || lead.links.Count < 1) { return; }
+
+        int areaW = w - pad * 2;
+        int areaH = (y + h - pad) - top;
+        int r = areaW / 2;
+        if (areaH / 2 < r) { r = areaH / 2; }
+        if (r < app.Scale(20)) { r = app.Scale(20); }
+        int cx = x + pad + areaW / 2;
+        int cy = top + areaH / 2;
+
+        ChordLayout layout = ChordLayout.Of(lead.links);
+        int nn = layout.nodes.Count;
+        if (nn < 1) { return; }
+        int nr = layout.ribbons.Count;
+
+        // ribbon 最粗值（按最大 link 值）。
+        int maxVal = 1;
+        for (int i = 0; i < nr; i = i + 1) {
+            if (layout.ribbons[i].val > maxVal) { maxVal = layout.ribbons[i].val; }
+        }
+        int ribbonR = r * 88 / 100;
+        // 先画 ribbon（弧会盖住其端部）：源/目标节点色的半透明带。
+        for (int i = 0; i < nr; i = i + 1) {
+            ChordRibbon rb = layout.ribbons[i];
+            int col = Chart.Palette(t, rb.from);
+            int x1 = cx + ChartView.CosDeg(rb.srcAngle) * ribbonR / 1000;
+            int y1 = cy + ChartView.SinDeg(rb.srcAngle) * ribbonR / 1000;
+            int x2 = cx + ChartView.CosDeg(rb.dstAngle) * ribbonR / 1000;
+            int y2 = cy + ChartView.SinDeg(rb.dstAngle) * ribbonR / 1000;
+            int th = app.Scale(2) + app.Scale(6) * rb.val / maxVal;
+            c.DrawLine(x1, y1, x2, y2, Chart.WithAlpha(col, 150), th);
+        }
+
+        // 节点弧：外环上按权重分的扇区，随 g 扫入。
+        int rInner = r * 78 / 100;
+        int sweepMax = 360 * g / 1000;
+        for (int i = 0; i < nn; i = i + 1) {
+            ChordNodeArc na = layout.nodes[i];
+            int a0 = na.a0;
+            int a1 = na.a1;
+            if (a1 > a0 + sweepMax) { a1 = a0 + sweepMax; }
+            if (a1 > a0) {
+                c.FillSector(cx, cy, rInner, r, a0, a1, Chart.Palette(t, i));
+            }
+            // 节点名：弧中点外侧。
+            string nm = na.name;
+            int mid = (na.a0 + na.a1) / 2;
+            int lr = r + app.Scale(12);
+            int lx = cx + ChartView.CosDeg(mid) * lr / 1000;
+            int ly = cy + ChartView.SinDeg(mid) * lr / 1000;
+            int tw = Canvas.MeasureText(nm, t.fontSizeSmall);
+            c.DrawText(lx - tw / 2, Canvas.CenterTextYAt(ly, t.fontSizeSmall),
+                nm, t.textSecondary, t.fontSizeSmall);
+        }
+
+        if (o.showTooltip) {
+            int mx = app.mouseX;
+            int my = app.mouseY;
+            int ddx = mx - cx;
+            int ddy = my - cy;
+            int dist = ChartView.ISqrt(ddx * ddx + ddy * ddy);
+            // 节点命中优先：外环带内且角度落在该弧。
+            if (dist >= rInner && dist <= r + app.Scale(4)) {
+                int ang = ChartView.AngleOf(ddx, ddy);
+                for (int i = 0; i < nn; i = i + 1) {
+                    ChordNodeArc na = layout.nodes[i];
+                    if (ChartView.InSweep(ang, na.a0, na.a1)) {
+                        List<TooltipRow> rows = new List<TooltipRow>{
+                            TooltipRow.Of(0, o.title),
+                            TooltipRow.Of(Chart.Palette(t, i),
+                                na.name + "  " + Convert.ToString(na.weight)) };
+                        ChartView.TooltipCard(app, mx, my, x + w, rows);
+                        return;
+                    }
+                }
+            }
+            // ribbon 命中：到线段的距离小于半带宽。
+            for (int i = 0; i < nr; i = i + 1) {
+                ChordRibbon rb = layout.ribbons[i];
+                int x1 = cx + ChartView.CosDeg(rb.srcAngle) * ribbonR / 1000;
+                int y1 = cy + ChartView.SinDeg(rb.srcAngle) * ribbonR / 1000;
+                int x2 = cx + ChartView.CosDeg(rb.dstAngle) * ribbonR / 1000;
+                int y2 = cy + ChartView.SinDeg(rb.dstAngle) * ribbonR / 1000;
+                int th = app.Scale(2) + app.Scale(6) * rb.val / maxVal;
+                int hitR = app.Scale(4) + th / 2;
+                if (ChartView.DistToSeg(mx, my, x1, y1, x2, y2) <= hitR) {
+                    string fn = layout.nodes[rb.from].name;
+                    string tn = layout.nodes[rb.to].name;
+                    List<TooltipRow> rows = new List<TooltipRow>{
+                        TooltipRow.Of(0, o.title),
+                        TooltipRow.Of(Chart.Palette(t, rb.from),
+                            fn + " → " + tn + "  " + Convert.ToString(rb.val)) };
+                    ChartView.TooltipCard(app, mx, my, x + w, rows);
+                    return;
+                }
+            }
+        }
+    }
+
+    // 角度（FillSector 约定，0 = 12 点）是否落在 [a0,a1)（含跨 0 回绕）。
+    static bool InSweep(int ang, int a0, int a1) {
+        if (a1 > a0) { return ang >= a0 && ang < a1; }
+        return ang >= a0 || ang < a1;
+    }
+
+    // ---- 力导向图（ECharts type 'force'；边 + 节点 + 标签） ----
+
+    static void DrawForce(App app, int x, int y, int w, int h,
+                          ChartOption o, int g) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int pad = t.paddingMedium;
+        int top = ChartView.PanelHead(app, x, y, w, h, o.title);
+        ChartSeries lead = ChartView.LeadSeries(o);
+        if (lead == null || lead.links.Count < 1) { return; }
+
+        int areaW = w - pad * 2;
+        int areaH = (y + h - pad) - top;
+        int r = areaW * 2 / 5;
+        if (areaH * 2 / 5 < r) { r = areaH * 2 / 5; }
+        if (r < app.Scale(10)) { r = app.Scale(10); }
+        int cx = x + pad + areaW / 2;
+        int cy = top + areaH / 2;
+
+        ForceLayout layout = ForceLayout.Of(lead.links, cx, cy, r, areaW, areaH);
+        int nn = layout.nodes.Count;
+        if (nn < 1) { return; }
+
+        int maxVal = 1;
+        for (int i = 0; i < layout.edges.Count; i = i + 1) {
+            if (layout.edges[i].val > maxVal) { maxVal = layout.edges[i].val; }
+        }
+        // 悬停节点（若有）：相邻边高亮。
+        int hoverNode = 0 - 1;
+        if (o.showTooltip) {
+            int mx = app.mouseX;
+            int my = app.mouseY;
+            int best = 0 - 1;
+            int bestD = 0;
+            for (int i = 0; i < nn; i = i + 1) {
+                int ddx = mx - layout.nodes[i].x;
+                int ddy = my - layout.nodes[i].y;
+                int d2 = ddx * ddx + ddy * ddy;
+                int rad = app.Scale(6);
+                if (d2 <= rad * rad) {
+                    if (best < 0 || d2 < bestD) { best = i; bestD = d2; }
+                }
+            }
+            hoverNode = best;
+        }
+
+        // 边：先画普通边，再盖悬停高亮。
+        int alpha = 120 * g / 1000;
+        for (int i = 0; i < layout.edges.Count; i = i + 1) {
+            ForceEdge e = layout.edges[i];
+            int col = Chart.Palette(t, e.a);
+            int w2 = 1 + app.Scale(2) * e.val / maxVal;
+            c.DrawLine(layout.nodes[e.a].x, layout.nodes[e.a].y,
+                layout.nodes[e.b].x, layout.nodes[e.b].y,
+                Chart.WithAlpha(col, alpha), w2);
+        }
+        if (hoverNode >= 0) {
+            for (int i = 0; i < layout.edges.Count; i = i + 1) {
+                ForceEdge e = layout.edges[i];
+                if (e.a != hoverNode && e.b != hoverNode) { continue; }
+                int col = Chart.Palette(t, e.a);
+                c.DrawLine(layout.nodes[e.a].x, layout.nodes[e.a].y,
+                    layout.nodes[e.b].x, layout.nodes[e.b].y,
+                    col, app.Scale(3));
+            }
+        }
+
+        // 节点 + 标签。
+        int nodeR = app.Scale(5);
+        for (int i = 0; i < nn; i = i + 1) {
+            ForceNode nd = layout.nodes[i];
+            int col = Chart.Palette(t, i);
+            c.FillCircle(nd.x, nd.y, nodeR, col);
+            ChartView.RingOutline(c, nd.x, nd.y, nodeR, 4294967295);
+            string nm = nd.name;
+            int tw = Canvas.MeasureText(nm, t.fontSizeSmall);
+            c.DrawText(nd.x - tw / 2, nd.y + nodeR + app.Scale(3),
+                nm, t.textSecondary, t.fontSizeSmall);
+        }
+
+        if (hoverNode >= 0) {
+            ForceNode nd = layout.nodes[hoverNode];
+            List<TooltipRow> rows = new List<TooltipRow>{
+                TooltipRow.Of(0, o.title),
+                TooltipRow.Of(Chart.Palette(t, hoverNode),
+                    nd.name + "  " + Convert.ToString(nd.weight)) };
+            ChartView.TooltipCard(app, app.mouseX, app.mouseY, x + w, rows);
+        }
+    }
+}
