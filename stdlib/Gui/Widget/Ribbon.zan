@@ -229,6 +229,35 @@ class Ribbon {
         // ---- 条带 ----
         int by = y + stripH;
         int bh = Ribbon.HeightTabbed(app) - stripH;
+        return Ribbon.Band(app, x, by, w, bh, groups, firstId, 3);
+    }
+
+    /// 无标签页的分组条带：命令按命名组排列、组间竖线分隔，
+    /// 小命令每列堆叠 `rows` 个。给只有一屏命令、不值得
+    /// 分页的宿主用（设计器工具条就是这种）。返回本帧
+    /// 点击命令的全局索引（跨组按顺序计数），无则 -1。
+    static int HeightGroups(App app) { return app.Scale(76); }
+
+    static int RenderGroups(App app, int x, int y, int w, List<RibbonGroup> groups) {
+        int total = 0;
+        for (int gi = 0; gi < groups.Count; gi = gi + 1) {
+            total = total + groups[gi].items.Count;
+        }
+        if (total <= 0) { return 0 - 1; }
+        int firstId = app.focus.AllocId();
+        int ii = 1;
+        while (ii < total) { app.focus.AllocId(); ii = ii + 1; }
+        return Ribbon.Band(app, x, y, w, Ribbon.HeightGroups(app), groups,
+            firstId, 2);
+    }
+
+    /// 分组命令条带本体，标签式和无标签式功能区共用。
+    /// `rows` 是一列里堆叠多少个小命令。
+    static int Band(App app, int x, int by, int w, int bh, List<RibbonGroup> groups,
+                    int firstId, int rows) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        if (rows < 1) { rows = 1; }
         c.FillRect(x, by, w, bh, t.bgSecondary);
         c.FillRect(x, by + bh - 1, w, 1, t.divider);
 
@@ -245,33 +274,46 @@ class Ribbon {
             RibbonGroup grp = groups[g];
             int groupStartX = cx;
 
-            // 小命令每列堆叠 3 个；大命令独占整列。
+            // 三种排布共用一套列游标：小命令是 rows 行的
+            // 标签行列，图标格是 rows 行的方钮列（一列可以
+            // 排好几个），大命令独占整列。换种排布时先把
+            // 没排满的那一列收掉，免得两种宽度叠在一起。
             int sIdx = 0;
+            int curKind = 0 - 1;
+            int curW = 0;
+            int rowH = contentH / rows;
+            int tileW = rowH;
             for (int j = 0; j < grp.items.Count; j = j + 1) {
                 RibbonItem it = grp.items[j];
                 int id = firstId + baseIdx + j;
-                if (it.small) {
-                    int colW = app.Scale(104);
-                    int rowH = contentH / 3;
-                    int rx = cx;
-                    int ry = contentTop + (sIdx % 3) * rowH;
-                    // 内缩，使相邻按钮不共边。
-                    Ribbon.PaintItem(app, id, it, rx, ry + gap / 2,
-                        colW - gap, rowH - gap, true);
-                    if (Ribbon.ItemClicked(app, id, it)) { clicked = baseIdx + j; }
-                    sIdx = sIdx + 1;
-                    if (sIdx % 3 == 0) { cx = cx + colW; }
-                } else {
-                    // 先清空未满的小命令列
-                    if (sIdx % 3 != 0) { cx = cx + app.Scale(104); sIdx = 0; }
+                int kind = 0;
+                if (it.tile) { kind = 2; }
+                else if (it.small) { kind = 1; }
+                if (kind != curKind && sIdx % rows != 0) {
+                    cx = cx + curW;
+                    sIdx = 0;
+                }
+                curKind = kind;
+                if (kind == 0) {
+                    if (sIdx % rows != 0) { cx = cx + curW; sIdx = 0; }
                     int lw = app.Scale(64);
                     Ribbon.PaintItem(app, id, it, cx, contentTop + gap / 2,
                         lw - gap, contentH - gap, false);
                     if (Ribbon.ItemClicked(app, id, it)) { clicked = baseIdx + j; }
                     cx = cx + lw;
+                } else {
+                    int colW = app.Scale(104);
+                    if (kind == 2) { colW = tileW; }
+                    curW = colW;
+                    int ry = contentTop + (sIdx % rows) * rowH;
+                    Ribbon.PaintItem(app, id, it, cx, ry + gap / 2,
+                        colW - gap, rowH - gap, true);
+                    if (Ribbon.ItemClicked(app, id, it)) { clicked = baseIdx + j; }
+                    sIdx = sIdx + 1;
+                    if (sIdx % rows == 0) { cx = cx + colW; }
                 }
             }
-            if (sIdx % 3 != 0) { cx = cx + app.Scale(104); }
+            if (sIdx % rows != 0) { cx = cx + curW; }
 
             // 组标题 + 尾部分隔线
             c.DrawTextCentered(groupStartX, by + bh - titleH - t.paddingTiny,
@@ -310,13 +352,26 @@ class Ribbon {
         }
         if (!it.enabled) { color = t.textDisabled; }
 
-        if (small) {
+        if (it.tile) {
+            int isz = t.iconSizeSmall;
+            int aw = 0;
+            if (it.menu) { aw = app.Scale(8); }
+            c.DrawGlyphIn(it.icon, x, y + (h - isz) / 2, w - aw, isz, isz, color);
+            if (it.menu) {
+                c.DrawGlyphIn("chevron-down", x + w - aw, y + (h - isz) / 2, aw,
+                    isz / 2, isz / 2, color);
+            }
+        } else if (small) {
             int isz = t.iconSizeSmall;
             int iy = y + (h - isz) / 2;
             c.DrawGlyphIn(it.icon, x + app.Scale(4), iy, isz, isz, isz, color);
             int tx = x + app.Scale(4) + isz + t.gapSmall;
             int ty = Canvas.CenterTextY(y, h, t.fontSizeSmall);
             c.DrawText(tx, ty, it.label, color, t.fontSizeSmall);
+            if (it.menu) {
+                c.DrawGlyphIn("chevron-down", x + w - app.Scale(10), iy, app.Scale(8),
+                    isz / 2, isz / 2, color);
+            }
         } else {
             int isz = t.iconSizeLarge;
             int labelH = Canvas.FontHeight(t.fontSizeSmall);
@@ -325,6 +380,10 @@ class Ribbon {
             c.DrawGlyphIn(it.icon, x, iy, w, isz, isz, color);
             c.DrawTextCentered(x, iy + isz + t.paddingTiny, w, labelH, it.label,
                 color, t.fontSizeSmall);
+            if (it.menu) {
+                c.DrawGlyphIn("chevron-down", x, iy + blockH + t.paddingTiny, w,
+                    isz / 2, isz / 2, color);
+            }
         }
         if (it.enabled) {
             app.hitTester.Register(new HitRegion(id, x, y, w, h, 0));
@@ -354,6 +413,13 @@ class RibbonItem {
     string icon;
     string label;
     bool small;
+    /// 纯图标小方钮，按 Office 的图标格铺排（一列堆叠多个，
+    /// 标签只出现在提示里）。用于同一族的一批命令，
+    /// 例如六个对齐方式。
+    bool tile;
+    /// 画一个下拉箭头（拆分按钮）：宿主自己在点击后弹菜单，
+    /// 功能区只负责表达"这个命令还有下一级"。
+    bool menu;
     bool enabled;
     /// 开关在 `on` 时点亮绘制（强调色填充 + 强调色图标），使一排
     /// 看起来像一排开关而非一排命令。
@@ -367,6 +433,8 @@ class RibbonItem {
         r.icon = icon;
         r.label = label;
         r.small = false;
+        r.tile = false;
+        r.menu = false;
         r.enabled = true;
         r.toggle = false;
         r.on = false;
@@ -388,6 +456,16 @@ class RibbonItem {
         r.on = on;
         return r;
     }
+
+    /// 纯图标方钮。`label` 只用于提示。
+    static RibbonItem Tile(string icon, string label) {
+        RibbonItem r = RibbonItem.Large(icon, label);
+        r.small = true;
+        r.tile = true;
+        return r;
+    }
+
+    RibbonItem SetMenu() { menu = true; return this; }
 
     RibbonItem Disable() { enabled = false; return this; }
 
