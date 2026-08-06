@@ -96,6 +96,9 @@ class Socket {
     [DllImport("ws2_32")]
     static extern nint gethostbyname(string name);
 
+    [DllImport("ws2_32", EntryPoint = "WSAGetLastError")]
+    static extern int WinLastError();
+
     // Winsock 接收完整 SOCKET 句柄，因此这些只是直接转发。
     static int SysClose(nint s) { return closesocket(s); }
     static int SysShutdown(nint s, int how) { return shutdown(s, how); }
@@ -167,6 +170,16 @@ class Socket {
     [DllImport("crt")]
     static extern int fcntl(int fd, int cmd, int arg);
 
+    // POSIX errno：glibc/musl 导出 __errno_location()，Darwin 导出 __error()，
+    // 都返回 int*。
+    #if LINUX
+    [DllImport("crt", EntryPoint = "__errno_location")]
+    static extern nint NativeErrnoLocation();
+    #elif MACOS
+    [DllImport("crt", EntryPoint = "__error")]
+    static extern nint NativeErrnoLocation();
+    #endif
+
     // POSIX fd 是 32 位 int：在此一次性截断句柄。
     static int SysClose(nint s) { return closesocket((int)s); }
     static int SysShutdown(nint s, int how) { return shutdown((int)s, how); }
@@ -212,12 +225,16 @@ class Socket {
 
     /// <summary>创建 TCP 套接字。</summary>
     static nint CreateTcp() {
-        return socket(2, 1, 6);
+        nint s = socket(2, 1, 6);
+        if (s < 0) { Socket.CaptureLastError(); }
+        return s;
     }
 
     /// <summary>创建 UDP 套接字。</summary>
     static nint CreateUdp() {
-        return socket(2, 2, 17);
+        nint s = socket(2, 2, 17);
+        if (s < 0) { Socket.CaptureLastError(); }
+        return s;
     }
 
     /// <summary>关闭套接字。</summary>
@@ -244,17 +261,20 @@ class Socket {
 
     /// <summary>将套接字设为非阻塞模式。</summary>
     static int SetNonBlocking(nint sock) {
+        int rc;
         #if WINDOWS
         byte[] argp = new byte[4];
         argp[0] = 1;
-        return ioctlsocket(sock, -2147195266, argp);
+        rc = ioctlsocket(sock, -2147195266, argp);
         #elif LINUX
         int flags = fcntl((int)sock, 3, 0);
-        return fcntl((int)sock, 4, flags | 2048);
+        rc = fcntl((int)sock, 4, flags | 2048);
         #elif MACOS
         int flags = fcntl((int)sock, 3, 0);
-        return fcntl((int)sock, 4, flags | 4);
+        rc = fcntl((int)sock, 4, flags | 4);
         #endif
+        if (rc != 0) { Socket.CaptureLastError(); }
+        return rc;
     }
 
     /// <summary>在套接字上设置 SO_REUSEADDR。</summary>
@@ -343,12 +363,16 @@ class Socket {
     /// <summary>将套接字绑定到地址和端口。</summary>
     static int Bind(nint sock, string ip, int port) {
         byte[] addr = BuildSockAddr(ip, port);
-        return SysBind(sock, addr, 16);
+        int rc = SysBind(sock, addr, 16);
+        if (rc != 0) { Socket.CaptureLastError(); }
+        return rc;
     }
 
     /// <summary>开始监听连接。</summary>
     static int Listen(nint sock, int backlog) {
-        return SysListen(sock, backlog);
+        int rc = SysListen(sock, backlog);
+        if (rc != 0) { Socket.CaptureLastError(); }
+        return rc;
     }
 
     /// <summary>同步接受连接。</summary>
@@ -356,7 +380,9 @@ class Socket {
         byte[] clientAddr = new byte[16];
         byte[] addrLen = new byte[4];
         addrLen[0] = 16;
-        return SysAccept(sock, clientAddr, addrLen);
+        nint client = SysAccept(sock, clientAddr, addrLen);
+        if (client < 0) { Socket.CaptureLastError(); }
+        return client;
     }
 
     /// <summary>在 IO reactor 上挂起，直到有入站连接
@@ -385,7 +411,9 @@ class Socket {
     /// <summary>同步连接到远程地址。</summary>
     static int Connect(nint sock, string ip, int port) {
         byte[] addr = BuildSockAddr(ip, port);
-        return SysConnect(sock, addr, 16);
+        int rc = SysConnect(sock, addr, 16);
+        if (rc != 0) { Socket.CaptureLastError(); }
+        return rc;
     }
 
     /// <summary>发起非阻塞连接，然后在 IO reactor 上挂起
@@ -703,6 +731,39 @@ class Socket {
 
     static string RemoteIp(nint sock) {
         return NativePeerIp(sock);
+    }
+
+    /// <summary>最近一次失败的套接字系统调用的平台错误码：
+    /// Windows 的 WSAGetLastError，POSIX 的 errno。供失败路径
+    /// 构造诊断信息——之前 CreateTcp/Bind/Listen 的失败
+    /// 被静默吞掉，调用方只知道操作失败了。</summary>
+    static int LastSocketError() {
+        return Socket.lastError;
+    }
+
+    // WSAGetLastError / errno 是线程局部的，且会被任何后续
+    // FFI 调用覆盖——哪怕是一次成功的 closesocket 也会清零。
+    // 失败路径往往在读取错误码之前还要关闭 fd 清理资源，因此
+    // 错误码必须在失败检查点（上述调用返回失败时）立即捕获，
+    // 而不是事后查询。LastSocketError() 返回的就是这个缓存。
+    static int lastError;
+
+    static void CaptureLastError() {
+        #if WINDOWS
+        Socket.lastError = WinLastError();
+        #elif LINUX
+        nint slot = NativeErrnoLocation();
+        byte[] x = new byte[4];
+        PlatMemCopyIn(x, slot, 4);
+        Socket.lastError = (x[0] & 255) + ((x[1] & 255) << 8)
+            + ((x[2] & 255) << 16) + ((x[3] & 255) << 24);
+        #elif MACOS
+        nint slot = NativeErrnoLocation();
+        byte[] x = new byte[4];
+        PlatMemCopyIn(x, slot, 4);
+        Socket.lastError = (x[0] & 255) + ((x[1] & 255) << 8)
+            + ((x[2] & 255) << 16) + ((x[3] & 255) << 24);
+        #endif
     }
 
     static long Ipv4ToLong(string ip) {
