@@ -373,6 +373,11 @@ json_value *json_parse(const char *text) {
     j.ok = true;
     json_value *v = jp_value(&j);
     if (!j.ok) { json_free(v); return NULL; }
+    /* A well-formed document is exactly one value; reject anything trailing
+     * other than whitespace, so a malformed `{"a":1} garbage` from an LSP/DAP
+     * peer isn't silently accepted (and the garbage dropped). */
+    jp_skip_ws(&j);
+    if (j.p != j.end) { json_free(v); return NULL; }
     return v;
 }
 

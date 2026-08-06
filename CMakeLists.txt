@@ -545,6 +545,21 @@ if(NOT WIN32)
 endif()
 add_test(NAME unit_json_oom COMMAND zan_json_oom_test)
 
+# ---- json trailing-data rejection test (A2) ----
+add_executable(zan_json_trailing_test
+    tests/unit/json_trailing_test.c
+    src/common/json.c
+)
+target_include_directories(zan_json_trailing_test PRIVATE ${CMAKE_SOURCE_DIR})
+set_target_properties(zan_json_trailing_test PROPERTIES
+    C_STANDARD 11
+    C_STANDARD_REQUIRED YES
+)
+if(NOT WIN32)
+    target_link_libraries(zan_json_trailing_test PRIVATE m)
+endif()
+add_test(NAME unit_json_trailing COMMAND zan_json_trailing_test)
+
 # ---- Conformance suite: compile each program, run it, diff stdout vs golden ----
 if(WIN32)
   set(_exe_ext ".exe")
