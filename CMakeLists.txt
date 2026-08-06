@@ -560,6 +560,18 @@ if(NOT WIN32)
 endif()
 add_test(NAME unit_json_trailing COMMAND zan_json_trailing_test)
 
+# ---- RPC framing test (A3) ----
+add_executable(zan_rpc_framing_test
+    tests/unit/rpc_framing_test.c
+    src/common/rpc.c
+)
+target_include_directories(zan_rpc_framing_test PRIVATE ${CMAKE_SOURCE_DIR})
+set_target_properties(zan_rpc_framing_test PROPERTIES
+    C_STANDARD 11
+    C_STANDARD_REQUIRED YES
+)
+add_test(NAME unit_rpc_framing COMMAND zan_rpc_framing_test)
+
 # ---- Conformance suite: compile each program, run it, diff stdout vs golden ----
 if(WIN32)
   set(_exe_ext ".exe")

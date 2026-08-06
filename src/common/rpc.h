@@ -37,8 +37,13 @@ typedef bool (*rpc_writer_fn)(void *ctx, const char *buf, int n);
 /* Read one Content-Length framed message via `reader`. `max_len` caps the
  * accepted Content-Length (<= 0 means no limit). Returns a freshly malloc'd
  * NUL-terminated JSON body (caller frees), or NULL on EOF / malformed header /
- * oversize payload. */
+ * oversize payload / truncated body. */
 char *rpc_read_message_cb(rpc_reader_fn reader, void *ctx, long max_len);
+
+/* Default size cap applied by rpc_read_message (the FILE wrapper): 64 MB. A
+ * single LSP/DAP message is never legitimately this large; the cap stops one
+ * bad Content-Length header from forcing a multi-GB allocation. */
+#define RPC_MAX_MESSAGE (64L * 1024 * 1024)
 
 /* Write `payload` framed with a Content-Length header via `writer`.
  * Returns true on success. */

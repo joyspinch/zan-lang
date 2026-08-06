@@ -3,17 +3,44 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <errno.h>
+#include <limits.h>
 #include <stdbool.h>
 
 #include "host_oom.h"
 
+/* Default cap for the stdio path: a single LSP/DAP message may be large (a big
+ * publishDiagnostics or a loaded-sources response) but never multi-GB. Capping
+ * at 64MB stops a malicious/buggy peer from forcing a huge allocation with one
+ * `Content-Length: 9999999999` header. The callback API still honours an
+ * explicit max_len (<= 0 means no limit) for callers that want their own cap. */
+#define RPC_MAX_MESSAGE (64L * 1024 * 1024)
+
+/* Parse the value of a "Content-Length:" header line (everything after the
+ * colon). Returns the length on success, or -1 on any malformation: no digits,
+ * trailing junk, out of long range, or negative. */
+static long parse_content_length(const char *s) {
+    errno = 0;
+    char *end = NULL;
+    long v = strtol(s, &end, 10);
+    if (end == s) return -1;                 /* no digits */
+    /* allow trailing spaces/tabs but nothing else */
+    while (*end == ' ' || *end == '\t') end++;
+    if (*end != '\0') return -1;             /* trailing junk */
+    if (errno == ERANGE) return -1;
+    if (v < 0) return -1;
+    return v;
+}
+
 char *rpc_read_message_cb(rpc_reader_fn reader, void *ctx, long max_len) {
     char line[512];
     long content_length = -1;
+    bool have_content_length = false;
 
     /* read headers until a blank line */
     for (;;) {
         int len = 0;
+        bool overflow = false;
         for (;;) {
             char c;
             int r = reader(ctx, &c, 1);
@@ -21,7 +48,14 @@ char *rpc_read_message_cb(rpc_reader_fn reader, void *ctx, long max_len) {
                 if (len == 0) return NULL; /* EOF before any header byte */
                 break;                     /* EOF mid-line: process what we have */
             }
-            if (len < (int)sizeof(line) - 1) line[len++] = c;
+            if (len < (int)sizeof(line) - 1) {
+                line[len++] = c;
+            } else if (c != '\n') {
+                /* header line longer than the buffer: a legitimate LSP/DAP
+                 * header is never this long; treat as protocol error rather
+                 * than silently truncating (which could mis-parse the length). */
+                overflow = true;
+            }
             if (c == '\n') break;
         }
 
@@ -29,6 +63,8 @@ char *rpc_read_message_cb(rpc_reader_fn reader, void *ctx, long max_len) {
         while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r'))
             len--;
         line[len] = '\0';
+
+        if (overflow) return NULL;
 
         if (len == 0) break; /* end of headers */
 
@@ -40,11 +76,14 @@ char *rpc_read_message_cb(rpc_reader_fn reader, void *ctx, long max_len) {
             if (tolower((unsigned char)line[i]) != prefix[i]) { match = false; break; }
         }
         if (match) {
-            content_length = strtol(line + plen, NULL, 10);
+            long v = parse_content_length(line + plen);
+            if (v < 0) return NULL;          /* malformed Content-Length */
+            content_length = v;
+            have_content_length = true;
         }
     }
 
-    if (content_length < 0) return NULL;
+    if (!have_content_length || content_length < 0) return NULL;
     if (max_len > 0 && content_length > max_len) return NULL;
 
     char *body = (char *)malloc((size_t)content_length + 1);
@@ -57,7 +96,10 @@ char *rpc_read_message_cb(rpc_reader_fn reader, void *ctx, long max_len) {
         got += r;
     }
     body[got] = '\0';
-    if (got != content_length && got == 0) {
+    /* A short read is a truncated message, not a complete one: a peer that
+     * sent fewer bytes than it declared (or hit EOF mid-body) must not be
+     * handed upstream as if the full body arrived. */
+    if (got != content_length) {
         free(body);
         return NULL;
     }
@@ -84,7 +126,7 @@ static bool file_writer(void *ctx, const char *buf, int n) {
 }
 
 char *rpc_read_message(FILE *in) {
-    return rpc_read_message_cb(file_reader, in, 0);
+    return rpc_read_message_cb(file_reader, in, RPC_MAX_MESSAGE);
 }
 
 void rpc_write_message(FILE *out, const char *payload) {
