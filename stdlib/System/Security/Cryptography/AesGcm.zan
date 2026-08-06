@@ -126,8 +126,11 @@ class AesGcm {
         return ct;
     }
 
-    /// <summary>AES-GCM 解密，使用 96 位 IV。返回明文并设置
-    /// <paramref name="ok"/>[0]：tag 校验通过则为 -1（true），否则为 0。</summary>
+    /// <summary>AES-GCM 解密，使用 96 位 IV。校验通过时返回明文
+    /// 并将 <paramref name="ok"/>[0] 置 -1（true）；tag/aad/密文被篡改时
+    /// 返回 null 并将 <paramref name="ok"/>[0] 置 0。**调用方绝不能
+    /// 在 ok != -1 时使用任何返回值**——认证失败不产出明文是 GCM 的
+    /// 核心安全性质，API 本身保证这一点，而非依赖调用方检查。</summary>
     static byte[] Decrypt(string key, int keyLen, string iv, string aad, int aadLen, string ct, int ctLen, string tag, List<int> ok) {
         byte[] zero = new byte[16];
         byte[] Hb = Aes.EncryptBlockEcb(key, keyLen, zero);
@@ -137,6 +140,8 @@ class AesGcm {
         int i = 0; for (; i < 12; i = i + 1) { j0[i] = iv[i] & 255; }
         j0[15] = 1;
 
+        // 先算期望 tag，再做常数时间比较；认证未通过绝不解密出明文，
+        // 也绝不把明文交还给调用方。tag 比较用 diff |= 累积，常数时间。
         List<long> S = ghash(H, aad, aadLen, ct, ctLen);
         byte[] sb = new byte[16];
         store64(sb, 0, S[0]); store64(sb, 8, S[1]);
@@ -148,13 +153,18 @@ class AesGcm {
             diff = diff | (t ^ (tag[i] & 255));
             i = i + 1;
         }
+        if (diff != 0) {
+            ok[0] = 0;
+            return null;
+        }
+
         byte[] pt = new byte[ctLen];
         byte[] ctr = new byte[16];
         i = 0; while (i < 16) { ctr[i] = j0[i] & 255; i = i + 1; }
         inc32(ctr);
         gctr(key, keyLen, ctr, ct, ctLen, pt);
 
-        if (diff == 0) { ok[0] = -1; } else { ok[0] = 0; }
+        ok[0] = -1;
         return pt;
     }
 }

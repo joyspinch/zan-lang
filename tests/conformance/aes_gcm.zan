@@ -1,0 +1,141 @@
+using System;
+using System.Security.Cryptography;
+
+/* AES-GCM known-answer (NIST GCM test vectors) plus authentication-failure
+ * cases. A successful Decrypt must return the plaintext; a tampered tag,
+ * ciphertext, or AAD must NOT return unauthenticated plaintext. */
+class Program {
+    static int failures = 0;
+
+    static void Check(bool cond, string name) {
+        if (cond) {
+            Console.WriteLine("ok " + name);
+        } else {
+            Console.WriteLine("FAIL " + name);
+            failures = failures + 1;
+        }
+    }
+
+    // Run a single NIST GCM test vector (96-bit IV form). keyHex/ivHex/ptHex/aadHex
+    // are hex strings; expected ct/tag are hex strings.
+    static void Kat(string keyHex, string ivHex, string aadHex, string ptHex,
+                    string expCtHex, string expTagHex) {
+        int kl = keyHex.Length / 2;
+        string key = Hex.Decode(keyHex).ToStr(0, kl);
+        string iv = Hex.Decode(ivHex).ToStr(0, 12);
+        int aadLen = aadHex.Length / 2;
+        string aad = "";
+        if (aadLen > 0) { aad = Hex.Decode(aadHex).ToStr(0, aadLen); }
+        int ptLen = ptHex.Length / 2;
+        string pt = "";
+        if (ptLen > 0) { pt = Hex.Decode(ptHex).ToStr(0, ptLen); }
+
+        byte[] tag = new byte[17];
+        byte[] ct = AesGcm.Encrypt(key, kl, iv, aad, aadLen, pt, ptLen, tag);
+        Check(Hex.Encode(ct, ptLen) == expCtHex, "kat ct " + expCtHex.Substring(0, 4));
+        Check(Hex.Encode(tag, 16) == expTagHex, "kat tag " + expTagHex.Substring(0, 4));
+
+        // Round-trip decrypt with the correct tag must succeed and return pt.
+        string tagS = tag.ToStr(0, 16);
+        List<int> ok = new List<int>(); ok.Add(0);
+        byte[] back = AesGcm.Decrypt(key, kl, iv, aad, aadLen, ct, ptLen, tagS, ok);
+        Check(ok[0] == -1, "kat dec ok");
+        Check(back != null, "kat dec non-null");
+        if (back != null) {
+            Check(Hex.Encode(back, ptLen) == ptHex, "kat dec pt");
+        }
+    }
+
+    // Tamper a single byte of a buffer (string) and return the modified string.
+    static string FlipByte(string s, int idx) {
+        byte[] b = new byte[s.Length];
+        int i = 0;
+        while (i < s.Length) { b[i] = s[i] & 255; i = i + 1; }
+        b[idx] = (b[idx] & 255) ^ 1;
+        return b.ToStr(0, s.Length);
+    }
+
+    // Encrypt then attempt to decrypt with a tampered component. The result must
+    // be null (authentication failed) — never unauthenticated plaintext.
+    static void TamperCase(string name, string keyHex, string ivHex,
+                           string aadHex, string ptHex, int flip) {
+        int kl = keyHex.Length / 2;
+        string key = Hex.Decode(keyHex).ToStr(0, kl);
+        string iv = Hex.Decode(ivHex).ToStr(0, 12);
+        int aadLen = aadHex.Length / 2;
+        string aad = "";
+        if (aadLen > 0) { aad = Hex.Decode(aadHex).ToStr(0, aadLen); }
+        int ptLen = ptHex.Length / 2;
+        string pt = "";
+        if (ptLen > 0) { pt = Hex.Decode(ptHex).ToStr(0, ptLen); }
+
+        byte[] tag = new byte[17];
+        byte[] ct = AesGcm.Encrypt(key, kl, iv, aad, aadLen, pt, ptLen, tag);
+        string ctS = ct.ToStr(0, ptLen);
+        string tagS = tag.ToStr(0, 16);
+
+        if (flip == 0) { tagS = FlipByte(tagS, 0); }       // tampered tag
+        else if (flip == 1) {
+            if (ptLen > 0) { ctS = FlipByte(ctS, 0); }     // tampered ciphertext
+        } else if (flip == 2) {
+            if (aadLen > 0) { aad = FlipByte(aad, 0); }    // tampered AAD
+        }
+
+        List<int> ok = new List<int>(); ok.Add(0);
+        byte[] back = AesGcm.Decrypt(key, kl, iv, aad, aadLen, ctS, ptLen, tagS, ok);
+        Check(ok[0] == 0, name + " ok flag");
+        Check(back == null, name + " null on fail");
+    }
+
+    static void Main() {
+        // NIST GCM test case 1 (empty plaintext, no AAD).
+        Kat("00000000000000000000000000000000",
+            "000000000000000000000000",
+            "",
+            "",
+            "",
+            "58e2fccefa7e3061367f1d57a4e7455a");
+        // NIST GCM test case 2 (4-byte plaintext, no AAD).
+        Kat("00000000000000000000000000000000",
+            "000000000000000000000000",
+            "",
+            "00000000",
+            "0388dace",
+            "a6896c355d1c29709b9d0c4902237f1b");
+        // NIST GCM test case 3 (no AAD, 46-byte pt).
+        Kat("feffe9928665731c6d6a8f9467308308",
+            "cafebabefacedbaddecaf888",
+            "",
+            "d9313225f88406e5a55909c5aff5269a86a7a9531534f7da2e4c303d8a318a721c3c0c95956809532fcf0e2449d6",
+            "42831ec2217774244b7221b784d0d49ce3aa212f2c02a4e035c17e2329aca12e21d514b25466931c7d8f6a5aacf4",
+            "b71094e16f3b3f46489039596653bfac");
+        // NIST GCM test case 4 (with AAD, 46-byte pt).
+        Kat("feffe9928665731c6d6a8f9467308308",
+            "cafebabefacedbaddecaf888",
+            "feedfacedeadbeeffeedfacedeadbeefabaddad2",
+            "d9313225f88406e5a55909c5aff5269a86a7a9531534f7da2e4c303d8a318a721c3c0c95956809532fcf0e2449d6",
+            "42831ec2217774244b7221b784d0d49ce3aa212f2c02a4e035c17e2329aca12e21d514b25466931c7d8f6a5aacf4",
+            "04dfb4193679c04fb8e4c9d0b0ec1658");
+
+        // 256-bit key KAT (NIST test case 15).
+        Kat("0000000000000000000000000000000000000000000000000000000000000000",
+            "000000000000000000000000",
+            "",
+            "00000000000000000000000000000000",
+            "cea7403d4d606b6e074ec5d3baf39d18",
+            "d0d1c8a799996bf0265b98b5d48ab919");
+
+        // Authentication failure: a tampered tag, ciphertext, or AAD must NOT
+        // produce unauthenticated plaintext.
+        TamperCase("badtag", "feffe9928665731c6d6a8f9467308308",
+                   "cafebabefacedbaddecaf888", "", "00000000", 0);
+        TamperCase("badct", "feffe9928665731c6d6a8f9467308308",
+                   "cafebabefacedbaddecaf888", "", "00000000", 1);
+        TamperCase("badaad", "feffe9928665731c6d6a8f9467308308",
+                   "cafebabefacedbaddecaf888",
+                   "feedfacedeadbeeffeedfacedeadbeefabaddad2",
+                   "d9313225f88406e5a55909c5aff5269a", 2);
+
+        Console.WriteLine("failures=" + Convert.ToString(failures));
+    }
+}
