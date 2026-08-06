@@ -935,6 +935,14 @@ add_test(NAME conformance_ide_snap
     -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_ide_snap${_exe_ext}
     -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
+# ---- Policy: components own their drawing, examples only use them ----
+# A gauge drawn a second time inside a demo drifts from the component the moment
+# the component is fixed -- so the arc/sector primitives a dial is made of are
+# banned outside stdlib (games excepted; they render their own scene).
+add_test(NAME policy_no_widget_drawing
+  COMMAND ${CMAKE_COMMAND} -DROOT=${CMAKE_SOURCE_DIR}
+    -P ${CMAKE_SOURCE_DIR}/tests/run_no_widget_drawing.cmake)
+
 # ---- Runtime diagnostics: parser must not hang/OOM on malformed input ----
 add_test(NAME diag_no_runaway
   COMMAND zanc ${CMAKE_SOURCE_DIR}/tests/diag/bad_member.zan --dump-ast)
@@ -1242,7 +1250,7 @@ add_test(NAME tool_zandoc
 get_property(_all_tests DIRECTORY PROPERTY TESTS)
 foreach(_t ${_all_tests})
   set(_labels "full")
-  if(_t MATCHES "^(golden_|diag_|abi_|runtime_|tool_)" OR _t MATCHES "^conformance_gui_")
+  if(_t MATCHES "^(golden_|diag_|abi_|runtime_|tool_|policy_)" OR _t MATCHES "^conformance_gui_")
     list(APPEND _labels "standard" "smoke")
   elseif(_t MATCHES "^(conformance_|emit_lib_|dap_)")
     list(APPEND _labels "standard")

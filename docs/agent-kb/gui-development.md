@@ -88,6 +88,25 @@ canvas.DrawImage(path, x, y);                              // 原尺寸
 - 周期回调里只更新数据 + `RequestRedraw()`，绘制仍在帧里做。
 - 报警/趋势的数据量要有上限（环形缓冲），否则长时间运行内存持续增长。
 
+## 铁律：控件自己负责绘制，使用处只配置
+
+**禁止在使用处自绘控件元素。** 示例、gallery、模板只能：实例化组件 → 配置属性 →
+喂数据 → 摆位置。仪表的圆弧、趋势的折线、柱状的条、LED 的灯珠，一律画在
+`stdlib/Gui/Hmi/*` 或 `stdlib/Gui/Component/Chart/*` 里面。
+
+为什么不是风格问题：同一个控件存在两份绘制，组件修好之后示例还在按旧的错的画法
+显示，于是「组件是对的，demo 是错的」——gallery 的仪表演示就是这么歪的。
+
+- 守门测试 `policy_no_widget_drawing`（smoke 层）扫 `examples/` 与 `templates/`，
+  出现 `FillSector/DrawSector/FillArc/DrawArc/FillPie/DrawPie` 直接失败并打印行号。
+  这些原语除了表盘/圆环/饼图没别的用处，所以是很准的信号。
+- 游戏例外（`examples/game/`）：游戏本来就自己渲染整个场景，不是在冒充控件。
+- 示例画自己的外壳（面板、标题、表格行这些 `FillRect`/`DrawText`）是允许的——
+  界限是「有没有在重画一个已经存在的控件」。
+- 审过一遍的结论（2026-08）：`examples/`、`templates/` 里没有 HMI/图表自绘，
+  gallery 的仪表演示全是 `ChartSeries.Gauge(...)` 配置。所以仪表画错要去
+  `stdlib/Gui/Component/Chart/ChartViewPie.zan` 的 `DrawGauge` 查，别改 demo。
+
 ## 设计器窗体（`.zform`）的数据流
 
 ```text
