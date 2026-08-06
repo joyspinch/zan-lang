@@ -1,0 +1,167 @@
+using System;
+using Gui;
+
+namespace Gui.Component.Chart;
+
+/// 单个源系列的只读绘制快照。保留 source 引用，使渲染器
+/// 无需复制数据，同时把继承值和交互状态隔离在当前帧。
+class ResolvedSeries {
+    ChartSeries source;
+    int color;
+    int lineColor;
+    int lineWidth;
+    int areaColor;
+    int labelColor;
+    int labelFontSize;
+    bool hidden;
+    int wid;
+    bool animate;
+
+    static ResolvedSeries Of(ChartSeries source, Theme theme, int index,
+                             int wid, bool animate, bool hidden) {
+        ResolvedSeries r = new ResolvedSeries();
+        r.source = source;
+        r.color = source.color;
+        if (r.color == 0) { r.color = source.itemStyle.normal.color; }
+        if (r.color == 0) { r.color = Chart.Palette(theme, index); }
+        r.lineColor = source.itemStyle.normal.lineStyle.color;
+        if (r.lineColor == 0) { r.lineColor = r.color; }
+        r.lineWidth = source.itemStyle.normal.lineStyle.width;
+        if (r.lineWidth <= 0) { r.lineWidth = 2; }
+        r.areaColor = source.itemStyle.normal.areaStyle.color;
+        if (r.areaColor == 0) { r.areaColor = r.color; }
+        r.labelColor = source.label.color;
+        if (r.labelColor == 0) { r.labelColor = theme.textSecondary; }
+        r.labelFontSize = source.label.fontSize;
+        if (r.labelFontSize <= 0) { r.labelFontSize = theme.fontSizeSmall; }
+        r.hidden = hidden;
+        r.wid = wid;
+        r.animate = animate;
+        return r;
+    }
+
+    int DataColor(int index) {
+        if (index >= 0 && index < this.source.data.Count
+            && this.source.data[index].color != 0) {
+            return this.source.data[index].color;
+        }
+        return this.color;
+    }
+
+    ChartSeries Materialize() {
+        ChartSeries src = this.source;
+        ChartSeries s = ChartSeries.Of(src.name, src.type, new List<int>());
+        s.axisIndex = src.axisIndex; s.stack = src.stack; s.stackName = src.stackName;
+        s.color = this.color; s.hidden = this.hidden; s.smooth = src.smooth;
+        s.areaStyle = src.areaStyle; s.step = src.step; s.sort = src.sort;
+        s.roseType = src.roseType; s.innerPct = src.innerPct; s.hbar = src.hbar;
+        s.treeOrient = src.treeOrient; s.custom = src.custom;
+        s.itemStyle = src.itemStyle; s.label = src.label; s.labelShow = src.labelShow;
+        s.data = src.data; s.candles = src.candles; s.bubbles = src.bubbles;
+        s.boxes = src.boxes; s.errors = src.errors; s.points = src.points;
+        s.tree = src.tree; s.links = src.links; s.gauge = src.gauge;
+        s.regions = src.regions; s.events = src.events; s.marks = src.marks;
+        ChartItemStyle style = ChartItemStyle.Create();
+        style.normal.color = src.itemStyle.normal.color;
+        style.normal.borderColor = src.itemStyle.normal.borderColor;
+        style.normal.borderWidth = src.itemStyle.normal.borderWidth;
+        style.normal.lineStyle.color = this.lineColor;
+        style.normal.lineStyle.width = this.lineWidth;
+        style.normal.lineStyle.type = src.itemStyle.normal.lineStyle.type;
+        style.normal.lineStyle.shadowColor = src.itemStyle.normal.lineStyle.shadowColor;
+        style.normal.lineStyle.shadowBlur = src.itemStyle.normal.lineStyle.shadowBlur;
+        style.normal.areaStyle.color = this.areaColor;
+        style.normal.areaStyle.type = src.itemStyle.normal.areaStyle.type;
+        style.emphasis = src.itemStyle.emphasis;
+        s.itemStyle = style;
+        ChartTextStyle label = ChartTextStyle.Create();
+        label.color = this.labelColor; label.fontSize = this.labelFontSize;
+        label.fontStyle = src.label.fontStyle; label.fontWeight = src.label.fontWeight;
+        label.fontFamily = src.label.fontFamily; label.shadowColor = src.label.shadowColor;
+        label.shadowBlur = src.label.shadowBlur; s.label = label;
+        return s;
+    }
+}
+
+/// ChartOption 的只读、逐帧规范化结果。
+class ResolvedChart {
+    ChartOption source;
+    List<ResolvedSeries> series;
+    int wid;
+    bool animate;
+    int windowStart;   // dataZoom 窗口（类别索引，含端点）；
+    int windowEnd;     //   无 zoom 时 = 全范围 [0, n-1]
+
+    static ResolvedChart Resolve(ChartOption source, Theme theme, App app, int wid) {
+        ResolvedChart outp = new ResolvedChart();
+        outp.source = source;
+        outp.series = new List<ResolvedSeries>();
+        outp.wid = wid;
+        outp.animate = source.animate;
+        // dataZoom 窗口在解析期锁定一次，使指纹读取的窗口
+        // 与渲染器读取的一致。无 zoom（或 n < 2）时
+        // 是干净的全范围，不触发任何 App 状态读写。
+        outp.windowStart = 0;
+        outp.windowEnd = 0 - 1;
+        int n = source.XCategories().Count;
+        if (n < 1) { n = 1; }
+        if (source.zoom && app != null && wid != 0 && n > 1) {
+            outp.windowStart = Chart.ZoomI0(app, source, wid, n);
+            outp.windowEnd = Chart.ZoomI1(app, source, wid, n);
+            if (outp.windowEnd < outp.windowStart) { outp.windowEnd = outp.windowStart; }
+        } else {
+            outp.windowStart = 0;
+            outp.windowEnd = n - 1;
+        }
+        for (int i = 0; i < source.series.Count; i = i + 1) {
+            ChartSeries s = source.series[i];
+            bool hidden = s.hidden;
+            if (app != null && wid != 0) {
+                hidden = app.StateGet(Chart.LegendKey(wid, i), hidden ? 1 : 0) == 1;
+            }
+            outp.series.Add(ResolvedSeries.Of(s, theme, i, wid, source.animate, hidden));
+        }
+        return outp;
+    }
+
+    ResolvedSeries For(ChartSeries source) {
+        for (int i = 0; i < this.series.Count; i = i + 1) {
+            if (this.series[i].source == source) { return this.series[i]; }
+        }
+        return null;
+    }
+
+    List<ChartSeries> MaterializeSeries() {
+        List<ChartSeries> outp = new List<ChartSeries>();
+        for (int i = 0; i < this.series.Count; i = i + 1) {
+            outp.Add(this.series[i].Materialize());
+        }
+        return outp;
+    }
+
+    /// 创建渲染器使用的帧内 option。数据集合继续共享，可能被旧
+    /// 渲染器修改的 option/series 外壳则复制并与源模型隔离。
+    ChartOption DrawOption(int wid, bool animate) {
+        ChartOption o = ChartOption.Create();
+        ChartOption s = this.source;
+        o.title = s.title;
+        o.xAxes = new List<ChartAxis>();
+        for (int xi = 0; xi < s.xAxes.Count; xi = xi + 1) { o.xAxes.Add(s.xAxes[xi]); }
+        o.yAxes = new List<ChartAxis>();
+        for (int yi = 0; yi < s.yAxes.Count; yi = yi + 1) { o.yAxes.Add(s.yAxes[yi]); }
+        o.series = this.MaterializeSeries(); o.defaultType = s.defaultType;
+        o.showLegend = s.showLegend; o.showTooltip = s.showTooltip;
+        o.showGrid = s.showGrid; o.showValues = s.showValues;
+        o.animate = animate; o.smooth = s.smooth; o.gradient = s.gradient;
+        o.rounded = s.rounded; o.animMs = s.animMs; o.donutPct = s.donutPct;
+        o.gaugeMax = s.gaugeMax; o.pieLabels = s.pieLabels; o.pieRings = s.pieRings;
+        o.radarMax = s.radarMax; o.zoom = s.zoom; o.markLine = s.markLine;
+        o.markPoint = s.markPoint; o.markLabel = s.markLabel; o.markLo = s.markLo;
+        o.markHi = s.markHi; o.gridLeft = s.gridLeft; o.gridRight = s.gridRight;
+        o.gridTop = s.gridTop; o.gridBottom = s.gridBottom;
+        o.zoomStart = s.zoomStart; o.zoomEnd = s.zoomEnd;
+        o.windowStart = this.windowStart; o.windowEnd = this.windowEnd;
+        o.backgroundColor = s.backgroundColor; o.iwid = wid;
+        return o;
+    }
+}

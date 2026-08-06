@@ -89,6 +89,7 @@ class ChartData {
     bool numberSet;
     string name;    // "" = 继承系列名称
     int color;      // 0 = 继承系列颜色
+    bool hidden;    // 饼图扇区隐藏（不进 total/角度/tooltip）
 
     static ChartData Of(int v) {
         ChartData d = new ChartData();
@@ -97,6 +98,7 @@ class ChartData {
         d.numberSet = true;
         d.name = "";
         d.color = 0;
+        d.hidden = false;
         return d;
     }
 
@@ -267,6 +269,83 @@ class ChartPoint {
 
     static ChartPoint Of(int x, int y) {
         return new ChartPoint { x = x, y = y };
+    }
+}
+
+/// 地图多边形的一个顶点（已规范化为整数）。
+class ChartMapPoint {
+    int x;
+    int y;
+
+    static ChartMapPoint Of(int x, int y) { return new ChartMapPoint { x = x, y = y }; }
+}
+
+/// 地图区域的一条环：外环勾出区域轮廓，hole=true 的环是其中的洞。
+/// 多部件区域用多条外环表达。
+class ChartMapRing {
+    List<ChartMapPoint> points;
+    bool hole;
+
+    static ChartMapRing Of(List<ChartMapPoint> points, bool hole) {
+        return new ChartMapRing { points = points, hole = hole };
+    }
+}
+
+/// 地图区域：名称、值（驱动连续色域）、可选颜色和多条环
+/// （单环=单部件；多外环=多部件；hole=true 的环减去面积）。
+class ChartMapRegion {
+    string name;
+    int value;
+    int color;   // 0 = 由 value 映射到连续色域
+    List<ChartMapRing> rings;
+
+    static ChartMapRegion Of(string name, int value, List<ChartMapRing> rings) {
+        ChartMapRegion r = new ChartMapRegion();
+        r.name = name; r.value = value; r.color = 0; r.rings = rings;
+        return r;
+    }
+    static ChartMapRegion Colored(string name, int value, int color, List<ChartMapRing> rings) {
+        ChartMapRegion r = ChartMapRegion.Of(name, value, rings);
+        r.color = color;
+        return r;
+    }
+}
+
+/// Event River 的一个事件：名称、时间区间 [start, end]、值
+/// （驱动带宽）、可选颜色。普通标量 data 兼容转换为等距事件。
+class ChartEvent {
+    string name;
+    int start;
+    int end;
+    int value;
+    int color;   // 0 = 继承系列颜色
+
+    static ChartEvent Of(string name, int start, int end, int value) {
+        ChartEvent e = new ChartEvent();
+        e.name = name; e.start = start; e.end = end; e.value = value; e.color = 0;
+        return e;
+    }
+}
+
+/// 标记点（ECharts markPoint.data）：在线/柱系列上标注极值或显式点。
+/// kind = "max" | "min" | "point"；dataIndex 命中系列内的数据点；
+/// xValue/yValue 用于显式坐标（dataIndex < 0 时）。
+class ChartMarkPoint {
+    string kind;
+    int dataIndex;
+    int xValue;
+    int yValue;
+    string label;
+    int color;   // 0 = 继承系列颜色
+
+    static ChartMarkPoint Max() {
+        return new ChartMarkPoint { kind = "max", dataIndex = 0 - 1, xValue = 0, yValue = 0, label = "", color = 0 };
+    }
+    static ChartMarkPoint Min() {
+        return new ChartMarkPoint { kind = "min", dataIndex = 0 - 1, xValue = 0, yValue = 0, label = "", color = 0 };
+    }
+    static ChartMarkPoint Point(int xValue, int yValue, string label) {
+        return new ChartMarkPoint { kind = "point", dataIndex = 0 - 1, xValue = xValue, yValue = yValue, label = label, color = 0 };
     }
 }
 
@@ -539,7 +618,10 @@ class ChartSeries {
     List<ErrorItem> errors;    // 误差条种类
     List<ChartPoint> points;    // 散点图种类
     List<ChartNode> tree;      // Treemap / Sunburst（层级根列表）
-    List<ChartLink> links;     // Sankey 种类
+    List<ChartLink> links;     // Sankey / Chord / Force 种类
+    List<ChartMapRegion> regions;  // Map 种类
+    List<ChartEvent> events;       // Event River 种类
+    List<ChartMarkPoint> marks;    // markPoint.data（线/柱系列）
 
     GaugeOption gauge;
 
@@ -574,6 +656,9 @@ class ChartSeries {
         s.points = new List<ChartPoint>();
         s.tree = new List<ChartNode>();
         s.links = new List<ChartLink>();
+        s.regions = new List<ChartMapRegion>();
+        s.events = new List<ChartEvent>();
+        s.marks = new List<ChartMarkPoint>();
         s.gauge = GaugeOption.Create();
         return s;
     }
@@ -763,6 +848,26 @@ class ChartSeries {
         return s;
     }
 
+    /// 地图系列：从调用方提供的多部件区域构建。渲染器
+    /// 不硬编码世界地图，polygon 由调用方决定（确定性
+    /// 样例见 gallery）。
+    static ChartSeries OfRegions(string name, List<ChartMapRegion> regions) {
+        ChartSeries s = ChartSeries.Of(name, ChartType.Map, new List<int>());
+        s.regions = regions;
+        return s;
+    }
+
+    /// Event River 系列：从显式事件构建。
+    static ChartSeries OfEvents(string name, List<ChartEvent> events) {
+        ChartSeries s = ChartSeries.Of(name, ChartType.EventRiver, new List<int>());
+        s.events = events;
+        return s;
+    }
+
+    /// 给线/柱系列追加一个 markPoint。option.markPoint=true 时
+    /// 渲染器也会自动推导 max/min；显式 marks 优先展示。
+    ChartSeries MarkPoint(ChartMarkPoint m) { this.marks.Add(m); return this; }
+
     /// 仪表盘的几何与范围。百分比相对图表主体。
     ChartSeries GaugeRange(int min, int max) { this.gauge.min = min; this.gauge.max = max; return this; }
     ChartSeries GaugeArc(int startAngle, int endAngle) {
@@ -918,6 +1023,8 @@ class ChartOption {
     int gridBottom;
     int zoomStart;    // dataZoom 初始窗口，百分比 0..100
     int zoomEnd;      // dataZoom 初始窗口，百分比 0..100
+    int windowStart;  // 渲染器实际使用的窗口（类别索引，含端点）
+    int windowEnd;    // 由 ResolvedChart 从 app 状态解析；-1 = 未窗口化
     int backgroundColor; // 0 = 跟随主题，不主动填充背景
     int iwid;         // 交互键（由 ChartView.Render 每帧设置）；0 = 无
 
@@ -957,6 +1064,8 @@ class ChartOption {
         o.gridBottom = 0 - 1;
         o.zoomStart = 0;
         o.zoomEnd = 100;
+        o.windowStart = 0;
+        o.windowEnd = 0 - 1;
         o.backgroundColor = 0;
         o.iwid = 0;
         return o;
@@ -1339,10 +1448,207 @@ class ChartOption {
         if (hi != null && hi.IsObject() && hi.Has("yAxis")) { o.markHi = hi.Int("yAxis", o.markHi); }
     }
 
+    // ---- 专用数据列表解析（ECharts series.data 的多种形状） ----
+    // 这些专用列表此前完全未从 JSON 填充：一个 candlestick/
+    // boxplot/scatter-points 系列虽能设对 type/custom，但专用列表
+    // 留空，渲染器拿不到数据。
+
+    static int StackIdFor(string name) {
+        // ECharts stack 是字符串分组；ChartSeries.stack 是整数 id。
+        // 用名称字符和分配稳定正 id（0 仍表示"无堆叠"）。
+        if (name.Length == 0) { return 1; }
+        int h = 0;
+        for (int i = 0; i < name.Length; i = i + 1) {
+            h = (h * 31 + name[i]) % 1000000000;
+            if (h < 0) { h = 0 - h; }
+        }
+        if (h == 0) { h = 1; }
+        return h + 1;
+    }
+
+    static void ParseLinks(JsonValue v, List<ChartLink> into) {
+        if (v == null || !v.IsArray()) { return; }
+        for (int i = 0; i < v.Count(); i = i + 1) {
+            JsonValue lk = v.At(i);
+            if (!lk.IsObject()) { continue; }
+            string from = lk.Str("source", lk.Str("from", ""));
+            string to = lk.Str("target", lk.Str("to", ""));
+            if (from.Length == 0 || to.Length == 0) { continue; }
+            int val = lk.Int("value", lk.Int("val", 1));
+            if (val < 0) { val = 0; }
+            into.Add(ChartLink.Of(from, to, val));
+        }
+    }
+
+    static void ParseCandles(JsonValue v, List<Candle> into) {
+        if (v == null || !v.IsArray()) { return; }
+        for (int i = 0; i < v.Count(); i = i + 1) {
+            JsonValue it = v.At(i);
+            if (it.IsArray() && it.Count() >= 4) {
+                into.Add(Candle.Of(it.At(0).AsInt(0), it.At(1).AsInt(0),
+                    it.At(2).AsInt(0), it.At(3).AsInt(0)));
+            } else if (it.IsObject()) {
+                into.Add(Candle.Of(it.Int("open", 0), it.Int("high", 0),
+                    it.Int("low", 0), it.Int("close", 0)));
+            }
+        }
+    }
+
+    static void ParseBubbles(JsonValue v, List<Bubble> into) {
+        if (v == null || !v.IsArray()) { return; }
+        for (int i = 0; i < v.Count(); i = i + 1) {
+            JsonValue it = v.At(i);
+            if (it.IsArray() && it.Count() >= 3) {
+                into.Add(Bubble.Of(it.At(0).AsInt(0), it.At(1).AsInt(0), it.At(2).AsInt(1)));
+            } else if (it.IsObject()) {
+                into.Add(Bubble.Of(it.Int("x", 0), it.Int("y", 0), it.Int("value", it.Int("weight", 1))));
+            }
+        }
+    }
+
+    static void ParseBoxes(JsonValue v, List<BoxItem> into) {
+        if (v == null || !v.IsArray()) { return; }
+        for (int i = 0; i < v.Count(); i = i + 1) {
+            JsonValue it = v.At(i);
+            if (it.IsArray() && it.Count() >= 5) {
+                into.Add(BoxItem.Of("", it.At(0).AsInt(0), it.At(1).AsInt(0),
+                    it.At(2).AsInt(0), it.At(3).AsInt(0), it.At(4).AsInt(0)));
+            } else if (it.IsObject()) {
+                string nm = it.Str("name", "");
+                JsonValue vs = it.Get("value");
+                if (vs != null && vs.IsArray() && vs.Count() >= 5) {
+                    into.Add(BoxItem.Of(nm, vs.At(0).AsInt(0), vs.At(1).AsInt(0),
+                        vs.At(2).AsInt(0), vs.At(3).AsInt(0), vs.At(4).AsInt(0)));
+                }
+            }
+        }
+    }
+
+    static void ParseErrors(JsonValue v, List<ErrorItem> into) {
+        if (v == null || !v.IsArray()) { return; }
+        for (int i = 0; i < v.Count(); i = i + 1) {
+            JsonValue it = v.At(i);
+            if (it.IsObject()) {
+                int y = it.Int("value", 0);
+                int err = it.Int("err", 0);
+                if (err < 0) { err = 0 - err; }
+                into.Add(ErrorItem.Of(it.Str("name", ""), y, err));
+            }
+        }
+    }
+
+    static void ParsePoints(JsonValue v, List<ChartPoint> into) {
+        if (v == null || !v.IsArray()) { return; }
+        for (int i = 0; i < v.Count(); i = i + 1) {
+            JsonValue it = v.At(i);
+            if (it.IsArray() && it.Count() >= 2) {
+                into.Add(ChartPoint.Of(it.At(0).AsInt(0), it.At(1).AsInt(0)));
+            } else if (it.IsObject()) {
+                into.Add(ChartPoint.Of(it.Int("x", 0), it.Int("y", 0)));
+            }
+        }
+    }
+
+    static void ParseEvents(JsonValue v, List<ChartEvent> into) {
+        if (v == null || !v.IsArray()) { return; }
+        for (int i = 0; i < v.Count(); i = i + 1) {
+            JsonValue it = v.At(i);
+            if (!it.IsObject()) { continue; }
+            string nm = it.Str("name", "");
+            int st = it.Int("start", 0);
+            int en = it.Int("end", st);
+            if (en < st) { int t = st; st = en; en = t; }
+            int val = it.Int("value", 1);
+            if (val < 0) { val = 0; }
+            ChartEvent e = ChartEvent.Of(nm, st, en, val);
+            if (it.Has("color")) { e.color = ChartOption.ParseColor(it.Get("color"), 0); }
+            into.Add(e);
+        }
+    }
+
+    static List<ChartMapPoint> ParseMapPoints(JsonValue arr) {
+        List<ChartMapPoint> pts = new List<ChartMapPoint>();
+        if (arr == null || !arr.IsArray()) { return pts; }
+        for (int i = 0; i < arr.Count(); i = i + 1) {
+            JsonValue p = arr.At(i);
+            if (p.IsArray() && p.Count() >= 2) {
+                pts.Add(ChartMapPoint.Of(p.At(0).AsInt(0), p.At(1).AsInt(0)));
+            } else if (p.IsObject()) {
+                pts.Add(ChartMapPoint.Of(p.Int("x", 0), p.Int("y", 0)));
+            }
+        }
+        return pts;
+    }
+
+    static void ParseRegions(JsonValue v, List<ChartMapRegion> into) {
+        if (v == null || !v.IsArray()) { return; }
+        for (int i = 0; i < v.Count(); i = i + 1) {
+            JsonValue it = v.At(i);
+            if (!it.IsObject()) { continue; }
+            string nm = it.Str("name", "");
+            int val = it.Int("value", 0);
+            int col = 0;
+            if (it.Has("color")) { col = ChartOption.ParseColor(it.Get("color"), 0); }
+            List<ChartMapRing> rings = new List<ChartMapRing>();
+            JsonValue rg = it.Get("rings");
+            if (rg == null || !rg.IsArray()) {
+                // 单环快捷形式：直接 region.geoCoord 坐标数组
+                JsonValue single = it.Get("points");
+                List<ChartMapPoint> pts = ChartOption.ParseMapPoints(single);
+                if (pts.Count >= 3) { rings.Add(ChartMapRing.Of(pts, false)); }
+            } else {
+                for (int r = 0; r < rg.Count(); r = r + 1) {
+                    JsonValue ring = rg.At(r);
+                    if (!ring.IsObject()) { continue; }
+                    List<ChartMapPoint> pts = ChartOption.ParseMapPoints(ring.Get("points"));
+                    if (pts.Count < 3) { continue; }
+                    bool hole = ring.Bool("hole", false);
+                    rings.Add(ChartMapRing.Of(pts, hole));
+                }
+            }
+            if (rings.Count == 0) { continue; }
+            if (col == 0) {
+                into.Add(ChartMapRegion.Of(nm, val, rings));
+            } else {
+                into.Add(ChartMapRegion.Colored(nm, val, col, rings));
+            }
+        }
+    }
+
+    static void ParseMarks(JsonValue v, List<ChartMarkPoint> into) {
+        if (v == null || !v.IsObject()) { return; }
+        JsonValue data = v.Get("data");
+        if (data == null || !data.IsArray()) { return; }
+        for (int i = 0; i < data.Count(); i = i + 1) {
+            JsonValue it = data.At(i);
+            if (!it.IsObject()) { continue; }
+            string kind = it.Str("type", it.Str("kind", ""));
+            ChartMarkPoint m;
+            if (kind == "max") { m = ChartMarkPoint.Max(); }
+            else if (kind == "min") { m = ChartMarkPoint.Min(); }
+            else {
+                m = ChartMarkPoint.Point(it.Int("xAxis", it.Int("xValue", 0)),
+                    it.Int("yAxis", it.Int("yValue", 0)), it.Str("name", ""));
+                if (it.Has("dataIndex")) { m.dataIndex = it.Int("dataIndex", 0 - 1); }
+            }
+            if (it.Has("color")) { m.color = ChartOption.ParseColor(it.Get("color"), 0); }
+            if (it.Has("label")) { m.label = it.Str("label", it.Str("name", "")); }
+            into.Add(m);
+        }
+    }
+
     static ChartOption FromJsonValue(JsonValue v) {
         ChartOption o = ChartOption.Create();
         if (v == null) { return o; }
-        o.title = v.Str("title", "");
+        JsonValue tj = v.Get("title");
+        if (tj != null && tj.IsObject()) {
+            o.title = tj.Str("text", "");
+            string sub = tj.Str("subtext", "");
+            if (sub.Length > 0 && o.title.Length > 0) { o.title = o.title + " - " + sub; }
+            else if (sub.Length > 0) { o.title = sub; }
+        } else {
+            o.title = v.Str("title", "");
+        }
         if (v.Has("backgroundColor")) { o.backgroundColor = ChartOption.ParseColor(v.Get("backgroundColor"), o.backgroundColor); }
         ChartOption.ParseGrid(v.Get("grid"), o);
         ChartOption.ParseDataZoom(v.Get("dataZoom"), o);
@@ -1352,9 +1658,26 @@ class ChartOption {
         JsonValue tp = v.Get("tooltip");
         if (tp != null && tp.IsObject()) { o.showTooltip = tp.Bool("show", o.showTooltip); }
         if (v.Has("markLine")) { o.markLine = v.Int("markLine", o.markLine); }
-        o.markPoint = v.Bool("markPoint", o.markPoint);
+        // markPoint 同时支持旧 bool 形式和 ECharts 对象 {data:[...]}。
+        // 对象形式的数据项解析推迟到系列构建之后（见本函数末尾），
+        // 以便挂接到第一个 line/bar 系列。
+        JsonValue mpj = v.Get("markPoint");
+        if (mpj != null && mpj.IsObject()) { o.markPoint = true; }
+        else { o.markPoint = v.Bool("markPoint", o.markPoint); }
         o.markLabel = v.Str("markLabel", o.markLabel);
         ChartOption.ParseMarkArea(v.Get("markArea"), o);
+
+        // radar.indicator[].max -> radarMax（每轴独立满刻度）。
+        JsonValue rj = v.Get("radar");
+        if (rj != null && rj.IsObject()) {
+            JsonValue ind = rj.Get("indicator");
+            if (ind != null && ind.IsArray()) {
+                for (int ri = 0; ri < ind.Count(); ri = ri + 1) {
+                    JsonValue ax = ind.At(ri);
+                    o.radarMax.Add(ax.Int("max", 0));
+                }
+            }
+        }
 
         ChartOption.ParseAxis(v.Get("xAxis"), o.xAxes, true);
         ChartOption.ParseAxis(v.Get("yAxis"), o.yAxes, false);
@@ -1369,7 +1692,14 @@ class ChartOption {
                 cs.custom = ChartKinds.CustomOf(sty);
                 cs.color = s.Int("color", 0);
                 cs.axisIndex = s.Int("yAxisIndex", s.Int("axisIndex", 0));
-                cs.stack = s.Int("stack", 0);
+                // stack 同时接受整数（旧形式）和字符串（ECharts stackName 分组）。
+                JsonValue stk = s.Get("stack");
+                if (stk != null && stk.IsString()) {
+                    cs.stackName = stk.AsString("");
+                    cs.stack = ChartOption.StackIdFor(cs.stackName);
+                } else {
+                    cs.stack = s.Int("stack", 0);
+                }
                 cs.areaStyle = s.Bool("areaStyle", cs.areaStyle);
                 cs.step = s.Str("step", cs.step);
                 cs.sort = s.Str("sort", cs.sort);
@@ -1380,6 +1710,26 @@ class ChartOption {
                 cs.custom = s.Str("custom", cs.custom);
                 ChartOption.ParseSeriesStyle(s, cs);
                 if (cs.type == ChartType.Gauge) { ChartOption.ParseGauge(s, cs.gauge); }
+                // pie radius:[inner,outer] -> innerPct（内/外半径百分比）。
+                JsonValue rad = s.Get("radius");
+                if (rad != null && rad.IsArray() && rad.Count() >= 2) {
+                    int innerPx = rad.At(0).AsInt(0);
+                    int outerPx = rad.At(1).AsInt(0);
+                    if (outerPx > 0 && innerPx >= 0 && innerPx <= outerPx) {
+                        cs.innerPct = innerPx * 100 / outerPx;
+                    }
+                }
+                // 专用数据列表：links（Sankey/Chord/Force）、candle、bubble、
+                // box、error、scatter points、event、map regions、markPoint.data。
+                ChartOption.ParseLinks(s.Get("links"), cs.links);
+                ChartOption.ParseCandles(s.Get("candles"), cs.candles);
+                ChartOption.ParseBubbles(s.Get("bubbles"), cs.bubbles);
+                ChartOption.ParseBoxes(s.Get("boxes"), cs.boxes);
+                ChartOption.ParseErrors(s.Get("errors"), cs.errors);
+                ChartOption.ParsePoints(s.Get("points"), cs.points);
+                ChartOption.ParseEvents(s.Get("events"), cs.events);
+                ChartOption.ParseRegions(s.Get("regions"), cs.regions);
+                ChartOption.ParseMarks(s.Get("markPoint"), cs.marks);
                 JsonValue da = s.Get("data");
                 if (da != null && da.IsArray()) {
                     for (int j = 0; j < da.Count(); j = j + 1) {
@@ -1387,6 +1737,7 @@ class ChartOption {
                         if (it.IsObject()) {
                             ChartData item = ChartData.NamedNumber(it.Double("value", 0.0), it.Str("name", ""));
                             item.color = it.Int("color", 0);
+                            item.hidden = it.Bool("hidden", item.hidden);
                             cs.data.Add(item);
                         } else if (it.IsNumber()) {
                             cs.data.Add(ChartData.Numeric(it.AsDouble(0.0)));
@@ -1403,6 +1754,20 @@ class ChartOption {
                     }
                 }
                 o.series.Add(cs);
+            }
+        }
+
+        // option 级 markPoint.data 挂到第一个 line/bar 系列（ECharts
+        // 全局 markPoint 语义）。bool 形式仅置位标志，渲染器自动推导
+        // max/min；对象形式的显式数据项优先于自动推导。
+        JsonValue mpOpt = v.Get("markPoint");
+        if (mpOpt != null && mpOpt.IsObject()) {
+            for (int mi = 0; mi < o.series.Count; mi = mi + 1) {
+                ChartSeries ms = o.series[mi];
+                if (ms.type == ChartType.Line || ms.type == ChartType.Bar) {
+                    ChartOption.ParseMarks(mpOpt, ms.marks);
+                    break;
+                }
             }
         }
 

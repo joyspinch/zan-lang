@@ -13,7 +13,10 @@ namespace Gui.Component.Chart;
 /// 只是共享同一坐标系的不同类型系列。
 partial class ChartView {
     ChartOption option;
+    ChartOption sourceOption;
     ChartController controller;
+    ResolvedChart resolved;
+    bool staticFrame;
     // 每个图表稳定的动画键。默认为新 WidgetId，但
     // 即时模式/虚拟化列表中的调用方（控件 id 顺序随
     // 行滚动进出而变动）应通过 Keyed() 传入自有稳定键，
@@ -36,6 +39,8 @@ partial class ChartView {
     static ChartView Of(ChartOption o) {
         ChartView v = new ChartView();
         v.option = o;
+        v.sourceOption = o;
+        v.staticFrame = false;
         v.wid = WidgetId.Next();
         return v;
     }
@@ -45,6 +50,8 @@ partial class ChartView {
         ChartView v = new ChartView();
         v.option = o;
         v.controller = null;
+        v.sourceOption = o;
+        v.staticFrame = false;
         v.wid = key;
         return v;
     }
@@ -53,8 +60,9 @@ partial class ChartView {
     static ChartView Bind(ChartController controller) {
         ChartView v = new ChartView();
         v.controller = controller;
-        if (controller != null) { v.option = controller.Option(); }
-        else { v.option = ChartOption.Create(); }
+        if (controller != null) { v.option = controller.Option(); v.sourceOption = v.option; }
+        else { v.option = ChartOption.Create(); v.sourceOption = v.option; }
+        v.staticFrame = false;
         v.wid = WidgetId.Next();
         return v;
     }
@@ -101,42 +109,109 @@ partial class ChartView {
         // 由槽位推导的稳定交互 id，使指纹读取的
         // dataZoom 窗口状态与渲染器读取的一致。
         int zwid = 300000 + slot;
-        o.iwid = zwid;
-        int fp = ChartView.CacheFingerprint(app, o);
+        ResolvedChart resolved = ResolvedChart.Resolve(o, app.theme, app, zwid);
+        int fp = ChartView.CacheFingerprint(app, o, resolved);
         if (app.StateGet(Chart.CacheKey(slot), 0) == fp
             && c.RestoreRect(x, y, w, h, slot)) {
             return true;
         }
-        bool anim = o.animate;
-        o.animate = false;               // 快照始终是最终形态
-        ChartView.Keyed(o, zwid).Render(app, x, y, w, h);
-        o.animate = anim;
+        ChartView view = ChartView.Keyed(o, zwid);
+        view.staticFrame = true;          // 快照始终是最终形态
+        view.Render(app, x, y, w, h);
         c.SnapshotRect(x, y, w, h, slot);
         app.StateSet(Chart.CacheKey(slot), fp);
         return false;
     }
 
     /// RenderCached 的数据指纹：系列值 + 类型/轴/隐藏、
-    /// dataZoom 窗口和当前主题。任何会改变
+    /// dataZoom 窗口、当前主题，以及全部专用数据
+    /// （links/tree/points/candles/bubbles/boxes/errors/events/
+    /// regions/marks/gauge/radarMax）。任何会改变
     /// 像素的因素都使缓存快照失效；悬停位置刻意不
     /// 不（悬停层在缓存命中后绘制于其上）。
-    static int CacheFingerprint(App app, ChartOption o) {
-        int h = app.ThemeMenuIndex() * 7919;
+    static int CacheFingerprint(App app, ChartOption o, ResolvedChart resolved) {
+        int zoomLo = 0;
+        int zoomHi = 0;
+        if (o.zoom) {
+            zoomLo = app.StateGet(Chart.ZoomLoKey(resolved.wid), o.zoomStart * 10);
+            zoomHi = app.StateGet(Chart.ZoomHiKey(resolved.wid), o.zoomEnd * 10);
+        }
+        return ChartView.FingerprintCore(
+            app.ThemeMenuIndex() * 7919 + app.bgThemeGen, zoomLo, zoomHi, o, resolved);
+    }
+
+    /// 指纹的纯核心。主题代（themeGen）与 dataZoom 状态
+    /// （zoomLo/zoomHi）作为整数注入，使 conformance 测试
+    /// 无需 App 即可验证数据/可见性/主题/缩放变化都会改变指纹；
+    /// CacheFingerprint 从 App 读取这两个状态，语义与旧版完全一致。
+    static int FingerprintCore(int themeGen, int zoomLo, int zoomHi,
+                               ChartOption o, ResolvedChart resolved) {
+        int h = themeGen;
+        h = (h * 31 + resolved.wid) % 2000000000;
+        if (resolved.animate) { h = (h * 31 + 17) % 2000000000; }
         h = (h * 31 + o.zoomStart + o.zoomEnd + o.backgroundColor) % 2000000000;
+        h = (h * 31 + o.donutPct + (o.pieRings ? 1 : 0) + (o.pieLabels ? 1 : 0)
+            + o.gaugeMax) % 2000000000;
+        for (int ri = 0; ri < o.radarMax.Count; ri = ri + 1) {
+            h = (h * 31 + o.radarMax[ri]) % 2000000000;
+        }
         h = (h * 31 + o.series.Count) % 2000000000;
         for (int s = 0; s < o.series.Count; s = s + 1) {
             ChartSeries cs = o.series[s];
+            ResolvedSeries rs = resolved.series[s];
             h = (h * 31 + cs.type + cs.axisIndex + cs.name.Length * 3) % 2000000000;
-            h = (h * 31 + cs.itemStyle.normal.color) % 2000000000;
+            h = (h * 31 + cs.stack + cs.stackName.Length + cs.innerPct + cs.custom.Length) % 2000000000;
+            h = (h * 31 + rs.color + rs.lineColor + rs.lineWidth + rs.areaColor) % 2000000000;
+            h = (h * 31 + rs.labelColor + rs.labelFontSize) % 2000000000;
+            h = (h * 31 + cs.itemStyle.normal.borderColor + cs.itemStyle.normal.borderWidth
+                + cs.itemStyle.normal.lineStyle.type.Length) % 2000000000;
             if (cs.labelShow) { h = (h * 31 + 13) % 2000000000; }
-            if (cs.hidden) { h = (h * 31 + 7) % 2000000000; }
+            if (rs.hidden) { h = (h * 31 + 7) % 2000000000; }
             for (int v = 0; v < cs.Count(); v = v + 1) {
                 h = (h * 31 + cs.Value(v)) % 2000000000;
             }
+            for (int li = 0; li < cs.links.Count; li = li + 1) {
+                h = (h * 31 + cs.links[li].from.Length + cs.links[li].to.Length
+                    + cs.links[li].val) % 2000000000;
+            }
+            for (int pi = 0; pi < cs.points.Count; pi = pi + 1) {
+                h = (h * 31 + cs.points[pi].x + cs.points[pi].y) % 2000000000;
+            }
+            for (int ci = 0; ci < cs.candles.Count; ci = ci + 1) {
+                h = (h * 31 + cs.candles[ci].open + cs.candles[ci].high
+                    + cs.candles[ci].low + cs.candles[ci].close) % 2000000000;
+            }
+            for (int bi = 0; bi < cs.bubbles.Count; bi = bi + 1) {
+                h = (h * 31 + cs.bubbles[bi].x + cs.bubbles[bi].y + cs.bubbles[bi].weight) % 2000000000;
+            }
+            for (int xi = 0; xi < cs.boxes.Count; xi = xi + 1) {
+                h = (h * 31 + cs.boxes[xi].label.Length + cs.boxes[xi].lo
+                    + cs.boxes[xi].q1 + cs.boxes[xi].med + cs.boxes[xi].q3 + cs.boxes[xi].hi) % 2000000000;
+            }
+            for (int ei = 0; ei < cs.errors.Count; ei = ei + 1) {
+                h = (h * 31 + cs.errors[ei].label.Length + cs.errors[ei].y + cs.errors[ei].err) % 2000000000;
+            }
+            for (int ti = 0; ti < cs.tree.Count; ti = ti + 1) {
+                h = (h * 31 + cs.tree[ti].name.Length + cs.tree[ti].Total()) % 2000000000;
+            }
+            for (int vi = 0; vi < cs.events.Count; vi = vi + 1) {
+                h = (h * 31 + cs.events[vi].name.Length + cs.events[vi].start
+                    + cs.events[vi].end + cs.events[vi].value) % 2000000000;
+            }
+            for (int gi = 0; gi < cs.regions.Count; gi = gi + 1) {
+                h = (h * 31 + cs.regions[gi].name.Length + cs.regions[gi].value
+                    + cs.regions[gi].rings.Count) % 2000000000;
+            }
+            for (int mi = 0; mi < cs.marks.Count; mi = mi + 1) {
+                h = (h * 31 + cs.marks[mi].kind.Length + cs.marks[mi].dataIndex
+                    + cs.marks[mi].xValue + cs.marks[mi].yValue) % 2000000000;
+            }
+            h = (h * 31 + cs.gauge.min + cs.gauge.max + cs.gauge.precision
+                + cs.gauge.splitNumber + cs.gauge.innerRadius.amount) % 2000000000;
         }
         if (o.zoom) {
-            h = (h * 31 + app.StateGet(Chart.ZoomLoKey(o.iwid), 0)) % 2000000000;
-            h = (h * 31 + app.StateGet(Chart.ZoomHiKey(o.iwid), 1000)) % 2000000000;
+            h = (h * 31 + zoomLo) % 2000000000;
+            h = (h * 31 + zoomHi) % 2000000000;
         }
         return h;
     }
@@ -159,6 +234,80 @@ partial class ChartView {
             if (!o.series[i].hidden) { return o.series[i].type; }
         }
         return ChartType.Line;
+    }
+
+    /// 渲染器分发键：每个 ChartType 和 custom kind 都映射到
+    /// 一个显式渲染器；没有未知类型回退为折线图。
+    /// 未知/空 kind 返回 "empty"（渲染明确的空状态）。
+    /// 这是 chart_kinds_complete 测试的确定性锚点。
+    static string DispatchKind(ChartOption o) {
+        // 无系列或全部隐藏：没有可绘制的数据，画明确的空状态
+        // （而不是回退为折线图）。
+        bool anyVisible = false;
+        for (int i = 0; i < o.series.Count; i = i + 1) {
+            if (!o.series[i].hidden) { anyVisible = true; }
+        }
+        if (!anyVisible) { return "empty"; }
+        ChartType t = ChartView.LeadType(o);
+        ChartSeries leadS = ChartView.LeadSeries(o);
+        if (t == ChartType.Pie) {
+            if (leadS != null && leadS.roseType.Length > 0) { return "rose"; }
+            return "pie";
+        }
+        if (t == ChartType.Gauge) { return "gauge"; }
+        if (t == ChartType.Heatmap) { return "heatmap"; }
+        if (t == ChartType.WordCloud) { return "wordCloud"; }
+        if (t == ChartType.Radar) { return "radar"; }
+        if (t == ChartType.Funnel) { return "funnel"; }
+        if (t == ChartType.Treemap) { return "treemap"; }
+        if (t == ChartType.Tree) { return "tree"; }
+        if (t == ChartType.K) { return "k"; }
+        if (t == ChartType.Chord) { return "chord"; }
+        if (t == ChartType.Force) { return "force"; }
+        if (t == ChartType.Map) { return "map"; }
+        if (t == ChartType.EventRiver) { return "eventRiver"; }
+        if (t == ChartType.Custom) {
+            string ck = "";
+            if (leadS != null) { ck = leadS.custom; }
+            if (ck == "sankey") { return "sankey"; }
+            if (ck == "box") { return "box"; }
+            if (ck == "error") { return "error"; }
+            if (ck == "waterfall") { return "waterfall"; }
+            if (ck == "sunburst") { return "sunburst"; }
+            if (ck == "radialBars") { return "radialBars"; }
+            if (ck == "venn") { return "venn"; }
+            return "empty";
+        }
+        if (t == ChartType.Bar) {
+            bool stacked = (leadS != null && leadS.stack != 0);
+            bool hbar = (leadS != null && leadS.hbar);
+            if (stacked && hbar) { return "barStackedHbar"; }
+            if (stacked) { return "barStacked"; }
+            if (hbar) { return "hbar"; }
+            return "bar";
+        }
+        if (t == ChartType.Scatter) {
+            if (leadS != null && leadS.bubbles.Count > 0) { return "bubbles"; }
+            return "scatter";
+        }
+        // 折线族：堆叠的引导序列渲染累计填充带，其余绘制折线。
+        if (leadS != null && leadS.stack != 0) { return "stackedArea"; }
+        return "lines";
+    }
+
+    /// 未知 / 空 kind 的明确空状态：不绘制错误的图表。
+    static void DrawEmptyState(App app, int x, int y, int w, int h, ChartOption o) {
+        Theme t = app.theme;
+        app.canvas.SurfaceRoundRect(x, y, w, h, t.borderRadiusMedium, t.bgPrimary, t.borderPrimary, 1);
+        if (o.title.Length > 0) {
+            app.canvas.DrawText(x + t.paddingMedium, y + t.paddingMedium,
+                o.title, t.textPrimary, t.fontSizeLarge);
+        }
+        string msg = "(no data)";
+        int mw = Canvas.MeasureText(msg, t.fontSizeSmall);
+        app.canvas.DrawText(x + w / 2 - mw / 2,
+            Canvas.CenterTextYAt(y + h / 2, t.fontSizeSmall),
+            msg, t.textTertiary, t.fontSizeSmall);
     }
 
     /// 任一序列为面积线时返回 true（对应 ECharts line.areaStyle.show）。
@@ -191,105 +340,101 @@ partial class ChartView {
     }
 
     void Render(App app, int x, int y, int w, int h) {
-        if (this.controller != null) { this.option = this.controller.Option(); }
+        if (this.controller != null) { this.sourceOption = this.controller.Option(); }
         Theme t = app.theme;
-        if (option.backgroundColor != 0) {
-            app.canvas.FillRect(x, y, w, h, option.backgroundColor);
-        }
-        // 从调色板解析自动（0）序列颜色，使省略颜色的 JSON/model 数据
-        // 每个序列仍呈现不同色相。
-        for (int i = 0; i < option.series.Count; i = i + 1) {
-            if (option.series[i].color == 0 && option.series[i].itemStyle.normal.color != 0) {
-                option.series[i].color = option.series[i].itemStyle.normal.color;
-            }
-            if (option.series[i].color == 0) {
-                option.series[i].color = Chart.Palette(t, i);
-            }
+        this.resolved = ResolvedChart.Resolve(this.sourceOption, t, app, wid);
+        bool animate = this.resolved.animate;
+        if (this.staticFrame) { animate = false; }
+        if (this.sourceOption.backgroundColor != 0) {
+            app.canvas.FillRect(x, y, w, h, this.sourceOption.backgroundColor);
         }
 
         int g = 1000;
-        if (option.animate) { g = app.AnimIntro(5000000 + wid, option.animMs); }
+        if (animate) { g = app.AnimIntro(5000000 + wid, this.sourceOption.animMs); }
 
-        // 发布稳定的交互键，使 DrawPanel 能挂接
-        // 交互式图例（点击色块显示/隐藏该序列）。
-        option.iwid = wid;
+        // Renderers receive a frame-local option containing normalized series.
+        ChartOption drawOption = this.resolved.DrawOption(wid, animate);
+        option = drawOption;
 
         // 把每种图表裁剪到自己的矩形，防止绘图线、柱条、
         // 轴标签和图例溢出到相邻控件。
         app.canvas.PushClip(x, y, w, h);
-        ChartType lead = ChartView.LeadType(option);
+        this.DispatchRender(app, x, y, w, h, g);
+        app.canvas.PopClip();
+    }
+
+    /// 显式分发：每个 kind 都有一个明确的分支。没有未知
+    /// kind 回退为折线图；未知/空 kind 绘制明确空状态。
+    void DispatchRender(App app, int x, int y, int w, int h, int g) {
+        ChartOption option = this.option;
+        string kind = ChartView.DispatchKind(option);
         ChartSeries leadS = ChartView.LeadSeries(option);
-        if (lead == ChartType.Pie) {
+        if (kind == "pie") {
             int inner = 0;
             if (leadS != null) { inner = leadS.innerPct; }
-            if (leadS != null && leadS.roseType.Length > 0) {
-                ChartView.DrawRose(app, x, y, w, h, option, g);
-            } else {
-                ChartView.DrawPie(app, x, y, w, h, option, inner, option.pieLabels, g);
-            }
-        } else if (lead == ChartType.Gauge) {
+            ChartView.DrawPie(app, x, y, w, h, option, inner, option.pieLabels, g);
+        } else if (kind == "rose") {
+            ChartView.DrawRose(app, x, y, w, h, option, g);
+        } else if (kind == "gauge") {
             ChartView.DrawGauge(app, x, y, w, h, option, g);
-        } else if (lead == ChartType.Heatmap) {
+        } else if (kind == "heatmap") {
             ChartView.DrawHeatmap(app, x, y, w, h, option, g);
-        } else if (lead == ChartType.WordCloud) {
+        } else if (kind == "wordCloud") {
             ChartView.DrawWordCloud(app, x, y, w, h, option, g);
-        } else if (lead == ChartType.Radar) {
+        } else if (kind == "radar") {
             ChartView.DrawPolar(app, x, y, w, h, option, g);
-        } else if (lead == ChartType.Funnel) {
+        } else if (kind == "funnel") {
             bool pyramid = false;
             if (leadS != null && leadS.sort == "ascending") { pyramid = true; }
             ChartView.DrawFunnel(app, x, y, w, h, option, g, pyramid);
-        } else if (lead == ChartType.Treemap) {
+        } else if (kind == "treemap") {
             ChartView.DrawTreemap(app, x, y, w, h, option, g);
-        } else if (lead == ChartType.Tree) {
+        } else if (kind == "tree") {
             ChartView.DrawTree(app, x, y, w, h, option, g);
-        } else if (lead == ChartType.K) {
+        } else if (kind == "k") {
             ChartView.DrawCandles(app, x, y, w, h, option, g);
-        } else if (lead == ChartType.Custom) {
-            string ck = "";
-            if (leadS != null) { ck = leadS.custom; }
-            if (ck == "sankey") {
-                ChartView.DrawSankey(app, x, y, w, h, option, g);
-            } else if (ck == "box") {
-                ChartView.DrawBox(app, x, y, w, h, option, g);
-            } else if (ck == "error") {
-                ChartView.DrawError(app, x, y, w, h, option, g);
-            } else if (ck == "waterfall") {
-                ChartView.DrawWaterfall(app, x, y, w, h, option, g);
-            } else if (ck == "sunburst") {
-                ChartView.DrawSunburst(app, x, y, w, h, option, g);
-            } else if (ck == "radialBars") {
-                ChartView.DrawRadialBars(app, x, y, w, h, option, g);
-            } else {
-                ChartView.DrawLines(app, x, y, w, h, option, g);
-            }
-        } else if (lead == ChartType.Bar) {
-            bool stacked = false;
-            bool hbar = false;
-            if (leadS != null) {
-                stacked = (leadS.stack != 0);
-                hbar = leadS.hbar;
-            }
+        } else if (kind == "chord") {
+            // 阶段四实现
+            ChartView.DrawEmptyState(app, x, y, w, h, option);
+        } else if (kind == "force") {
+            // 阶段四实现
+            ChartView.DrawEmptyState(app, x, y, w, h, option);
+        } else if (kind == "map") {
+            // 阶段五实现
+            ChartView.DrawEmptyState(app, x, y, w, h, option);
+        } else if (kind == "eventRiver") {
+            // 阶段三实现
+            ChartView.DrawEmptyState(app, x, y, w, h, option);
+        } else if (kind == "sankey") {
+            ChartView.DrawSankey(app, x, y, w, h, option, g);
+        } else if (kind == "box") {
+            ChartView.DrawBox(app, x, y, w, h, option, g);
+        } else if (kind == "error") {
+            ChartView.DrawError(app, x, y, w, h, option, g);
+        } else if (kind == "waterfall") {
+            ChartView.DrawWaterfall(app, x, y, w, h, option, g);
+        } else if (kind == "sunburst") {
+            ChartView.DrawSunburst(app, x, y, w, h, option, g);
+        } else if (kind == "radialBars") {
+            ChartView.DrawRadialBars(app, x, y, w, h, option, g);
+        } else if (kind == "venn") {
+            // 阶段三实现
+            ChartView.DrawEmptyState(app, x, y, w, h, option);
+        } else if (kind == "bar" || kind == "hbar"
+                   || kind == "barStacked" || kind == "barStackedHbar") {
+            bool stacked = kind == "barStacked" || kind == "barStackedHbar";
+            bool hbar = kind == "hbar" || kind == "barStackedHbar";
             ChartView.DrawBars(app, x, y, w, h, option, g, stacked, hbar);
-        } else if (lead == ChartType.Scatter) {
-            bool bubbles = false;
-            if (leadS != null) { bubbles = (leadS.bubbles.Count > 0); }
-            if (bubbles) {
-                ChartView.DrawBubbles(app, x, y, w, h, option, g);
-            } else {
-                ChartView.DrawScatter(app, x, y, w, h, option, g);
-            }
+        } else if (kind == "scatter") {
+            ChartView.DrawScatter(app, x, y, w, h, option, g);
+        } else if (kind == "bubbles") {
+            ChartView.DrawBubbles(app, x, y, w, h, option, g);
+        } else if (kind == "stackedArea") {
+            ChartView.DrawStackedArea(app, x, y, w, h, option, g);
+        } else if (kind == "lines") {
+            ChartView.DrawLines(app, x, y, w, h, option, g);
         } else {
-            // 折线族。堆叠的引导序列渲染累计填充带
-            // （ECharts line + stack）；其余绘制普通折线。
-            bool stacked = false;
-            if (leadS != null) { stacked = (leadS.stack != 0); }
-            if (stacked) {
-                ChartView.DrawStackedArea(app, x, y, w, h, option, g);
-            } else {
-                ChartView.DrawLines(app, x, y, w, h, option, g);
-            }
+            ChartView.DrawEmptyState(app, x, y, w, h, option);
         }
-        app.canvas.PopClip();
     }
 }
