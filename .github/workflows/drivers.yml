@@ -38,7 +38,7 @@ on:
       - 'scripts/stage_*'
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   SDL3_VERSION: '3.4.10'
@@ -56,7 +56,7 @@ jobs:
           - { target: linux-arm64, runner: ubuntu-24.04-arm }
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install build deps
         run: |
@@ -92,6 +92,7 @@ jobs:
           set -eux
           curl -fsSL -o sdl.tar.gz \
             "https://github.com/libsdl-org/SDL/releases/download/release-${SDL3_VERSION}/SDL3-${SDL3_VERSION}.tar.gz"
+          sh scripts/verify_dep.sh sdl.tar.gz
           tar xzf sdl.tar.gz
           cmake -S "SDL3-${SDL3_VERSION}" -B sdlbuild -G Ninja \
             -DCMAKE_BUILD_TYPE=Release -DSDL_SHARED=ON -DSDL_STATIC=OFF \
@@ -116,7 +117,9 @@ jobs:
       - name: Stage SQLite driver
         run: |
           set -eux
-          curl -fsSL -o sq.zip "$SQLITE_URL" && unzip -q sq.zip
+          curl -fsSL -o sq.zip "$SQLITE_URL"
+          sh scripts/verify_dep.sh sq.zip
+          unzip -q sq.zip
           DEST="stdlib/System/Data/Sqlite/drivers/${{ matrix.target }}"
           mkdir -p "$DEST/static"
           cc -O2 -fPIC -shared -Wl,-soname,libsqlite3.so \
@@ -129,7 +132,7 @@ jobs:
       - name: Stage PostgreSQL (libpq) driver
         run: bash scripts/stage_libpq_linux.sh "${{ matrix.target }}"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: drivers-${{ matrix.target }}
           path: |
@@ -146,6 +149,13 @@ jobs:
           - { target: macos-arm64, runner: macos-14 }
           - { target: macos-x64,   runner: macos-13 }
     runs-on: ${{ matrix.runner }}
+    # Only this job needs to write back the refreshed GUI dylibs to main.
+    # Elevate just here (top-level is contents: read) and gate the auto-push
+    # behind the protected "auto-commit" environment: give that environment a
+    # required reviewer in the repo settings to add manual approval.
+    environment: auto-commit
+    permissions:
+      contents: write
     # Intel runners can sit queued for the full 24h job limit, which used to
     # hold the whole run (and its artifacts) hostage. The GUI driver for x64 is
     # cross-built on the arm64 runner below, so this job only carries the
@@ -153,7 +163,7 @@ jobs:
     timeout-minutes: ${{ matrix.target == 'macos-x64' && 45 || 60 }}
     continue-on-error: ${{ matrix.target == 'macos-x64' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install deps
         run: brew install sdl3 libpq sqlite pkg-config
@@ -181,7 +191,9 @@ jobs:
       - name: Stage SQLite driver
         run: |
           set -eux
-          curl -fsSL -o sq.zip "$SQLITE_URL" && unzip -q sq.zip
+          curl -fsSL -o sq.zip "$SQLITE_URL"
+          sh scripts/verify_dep.sh sq.zip
+          unzip -q sq.zip
           DEST="stdlib/System/Data/Sqlite/drivers/${{ matrix.target }}"
           mkdir -p "$DEST/static"
           xcrun clang -O2 -fPIC -dynamiclib -install_name @rpath/libsqlite3.dylib \
@@ -235,7 +247,7 @@ jobs:
           printf 'libzan_gui.dylib\n' > "$DEST/zan_gui.bundle"
           file "$DEST/libzan_gui.dylib"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: matrix.target == 'macos-arm64'
         with:
           name: gui-macos-x64
@@ -264,7 +276,7 @@ jobs:
           git pull --rebase --autostash origin main
           git push origin HEAD:main
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: drivers-${{ matrix.target }}
           path: |
@@ -285,13 +297,18 @@ jobs:
     # win-arm64 SDL3 packaging is not yet reliably available in MSYS2; keep the
     # job best-effort so it never blocks the other targets.
     continue-on-error: ${{ matrix.target == 'win-arm64' }}
+    # This job commits the refreshed cross-link runtime objects to main; see
+    # the macos job for the environment/approval note.
+    environment: auto-commit
+    permissions:
+      contents: write
     defaults:
       run:
         shell: msys2 {0}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - uses: msys2/setup-msys2@v2
+      - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
         with:
           msystem: ${{ matrix.msystem }}
           update: true
@@ -327,6 +344,7 @@ jobs:
           # matching arch has to travel with the program.
           curl -fsSL -o wv2.zip \
             "https://www.nuget.org/api/v2/package/Microsoft.Web.WebView2/1.0.2903.40"
+          sh scripts/verify_dep.sh wv2.zip
           mkdir -p wv2 && unzip -qo wv2.zip -d wv2
           WVARCH=$([ "${{ matrix.target }}" = win-arm64 ] && echo arm64 || echo x64)
           cp "wv2/build/native/$WVARCH/WebView2Loader.dll" "$DEST/WebView2Loader.dll"
@@ -346,7 +364,7 @@ jobs:
               || true
           done
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: winrt-${{ matrix.target }}
           path: |
@@ -421,7 +439,7 @@ jobs:
           { echo libpq.dll; ls "$GDEST" | grep -viE '^(libpq\.dll|pq\.bundle)$' | sort || true; } > "$GDEST/pq.bundle"
           ls -la "$SDEST" "$QDEST" "$GDEST"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: drivers-${{ matrix.target }}
           path: |
@@ -434,11 +452,14 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/')
     needs: [linux, macos, windows]
     runs-on: ubuntu-latest
+    # Publishes a GitHub Release: the one job that legitimately writes.
+    permissions:
+      contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with: { path: dist }
       - name: Zip per-target bundles
         run: cd dist && for d in drivers-*; do zip -r "../$d.zip" "$d"; done
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           files: '*.zip'
