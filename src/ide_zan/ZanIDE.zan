@@ -5309,6 +5309,16 @@ partial class ZanIDE {
         // "Replace file" swaps the whole active file for the last AI code block.
         aiReplaceBtn = new Button { Text = ZanIDE.T("Replace file", "替换整文件"), Class = "small" };
         aiPlanClearBtn = new Button { Text = ZanIDE.T("Clear plan", "清空计划"), Class = "small" };
+        aiPlanList = new ListView<AiPlanStep>(PlanRow.Of);
+        aiPlanList.Class = "plan flat";
+        aiPlanBound = null;
+        aiPlanTitle = new Label("");
+        aiPlanTitle.Class = "small";
+        aiPlanRule = new Divider();
+        aiCtxRing = new Progress(0, 3).Ring();
+        aiCtxRing.Class = "ctxring";
+        aiUsageCard = new UsageCard(ZanIDE.T("Context window", "上下文窗口"),
+            ZanIDE.T("This session", "本次会话"));
     }
 
     /// The active session's archive: transcript, plan and -- so a restart lands
@@ -5535,40 +5545,22 @@ partial class ZanIDE {
     /// running transcript is against the compaction budget, with a hover
     /// tooltip that breaks down the last reply's token usage.
     void AiRenderContextRing(App app, int cx, int cy, int r) {
-        Theme t = app.theme;
-        Canvas c = app.canvas;
         if (r < app.Scale(5)) { return; }
         int used = AiAgent.ContextChars(aiMsgs);
         int budget = AiAgent.MaxContextChars();
         int pct = 0;
         if (budget > 0) { pct = used * 100 / budget; }
-        double frac = (double)pct / 100.0;
-        if (frac > 1.0) { frac = 1.0; }
-        int col = t.success;
-        if (pct >= 75) { col = t.warning; }
-        if (pct >= 100) { col = t.warningPressed; }
-        int thick = app.Scale(3);
-        c.DrawCircle(cx, cy, r, t.divider, thick);
-        // Foreground arc from 12 o'clock, clockwise, covering `frac` of a turn.
-        int segs = (int)(frac * 48.0);
-        if (segs < 1 && pct > 0) { segs = 1; }
-        int px = cx;
-        int py = cy - r;
-        for (int s = 1; s <= segs; s = s + 1) {
-            double a = 0.0 - IconVector.Pi() / 2.0
-                + 2.0 * IconVector.Pi() * (double)s / 48.0;
-            int nx = cx + (int)(Math.Cos(a) * (double)r);
-            int ny = cy + (int)(Math.Sin(a) * (double)r);
-            c.DrawLine(px, py, nx, ny, col, thick);
-            px = nx; py = ny;
-        }
-        int fs = t.fontSizeSmall;
-        string lbl = Convert.ToString(pct) + "%";
-        int lw = Canvas.MeasureText(lbl, fs);
-        c.DrawText(cx - lw / 2, cy - fs / 2 - app.Scale(1), lbl,
-            t.textSecondary, fs);
+        if (pct > 100) { pct = 100; }
+        // The arc, the track and the "%" label are the Progress control's own
+        // ring; only the number and the severity are decided here.
+        int tone = 3;
+        if (pct >= 75) { tone = 4; }
+        if (pct >= 100) { tone = 5; }
+        aiCtxRing.ptype = tone;
+        aiCtxRing.SetPercent(pct);
+        aiCtxRing.RenderInside(app, new Rect(cx - r, cy - r, r * 2, r * 2));
         // Hover (or click, to pin it) opens the usage card. It is a laid-out
-        // table rather than a line of tooltip text, and it is drawn after the
+        // card rather than a line of tooltip text, and it is drawn after the
         // rest of the panel so nothing paints over it.
         aiUsageOver = app.mouseX >= cx - r && app.mouseX <= cx + r
             && app.mouseY >= cy - r && app.mouseY <= cy + r;
@@ -5580,104 +5572,48 @@ partial class ZanIDE {
         }
     }
 
-    /// One `label  value` line of the usage card, value right-aligned so the
-    /// numbers form a column.
-    void AiUsageRow(App app, int x, int y, int w, string label, string val,
-            int labelCol, int valueCol) {
-        Canvas c = app.canvas;
-        int fs = app.theme.fontSizeSmall;
-        c.DrawText(x, y, label, labelCol, fs);
-        int vw = Canvas.MeasureText(val, fs);
-        c.DrawText(x + w - vw, y, val, valueCol, fs);
-    }
-
     /// The context / usage card: what the running transcript costs against the
     /// compaction budget, and the request and token totals for this IDE
-    /// session, broken out per line so the numbers are readable at a glance.
+    /// session. Only the numbers are assembled here -- the card lays out its
+    /// own rows, wraps its own note and paints its own surface.
     void AiRenderUsageCard(App app) {
         if (!aiUsageOver && !aiUsagePinned) { return; }
-        Theme t = app.theme;
         Canvas c = app.canvas;
-        int fs = t.fontSizeMedium;
-        int lh = Canvas.FontHeight(fs) + app.Scale(7);
-        int pad = app.Scale(12);
-        int w = app.Scale(330);
         int used = AiAgent.ContextChars(aiMsgs);
         int budget = AiAgent.MaxContextChars();
         int pct = 0;
         if (budget > 0) { pct = used * 100 / budget; }
-        bool haveLast = aiTokTotal > 0 || aiTokPrompt > 0;
-        // Rows actually drawn: heading + 4 context lines, heading + 6 usage
-        // lines, plus the two-line compaction note and the last-reply line
-        // when they apply. Counted exactly so the card is never cut short.
-        int rows = 12;
-        if (AiAgent.Compactions() > 0) { rows = rows + 2; }
-        if (haveLast) { rows = rows + 1; }
-        int h = pad * 2 + lh * rows + app.Scale(12);
-        int x = aiUsageX - w / 2;
-        int y = aiUsageY;
-        int margin = app.Scale(4);
-        if (x + w > c.Width() - margin) { x = c.Width() - margin - w; }
-        if (x < margin) { x = margin; }
-        if (y + h > c.Height() - margin) { y = c.Height() - margin - h; }
-        c.FillRoundRect(x + 1, y + 3, w, h, t.borderRadiusSmall, t.shadowColor);
-        c.SurfaceRoundRect(x, y, w, h, t.borderRadiusSmall, t.tooltipBg,
-            t.tooltipBorder, 1);
-        int lx = x + pad;
-        int lw = w - pad * 2;
-        int ly = y + pad;
-        int head = t.onScrim;
-        int muted = t.tooltipTextMuted;
-        c.DrawText(lx, ly, ZanIDE.T("Context window", "上下文窗口"), head, fs);
-        ly = ly + lh;
-        AiUsageRow(app, lx, ly, lw, ZanIDE.T("Used", "已使用"),
-            Convert.ToString(used) + " " + ZanIDE.T("chars", "字符"),
-            muted, head);
-        ly = ly + lh;
+        int comp = AiAgent.Compactions();
+        List<UsageStat> ctx = new List<UsageStat>();
+        ctx.Add(UsageStat.Of(ZanIDE.T("Used", "已使用"),
+            Convert.ToString(used) + " " + ZanIDE.T("chars", "字符")));
         // The budget is measured in CHARACTERS (the transcript is not
         // tokenized locally); the model's configured limit is in tokens, so
         // both are shown with the ~4 chars/token conversion that derives one
         // from the other.
-        AiUsageRow(app, lx, ly, lw, ZanIDE.T("Budget", "上限"),
+        ctx.Add(UsageStat.Of(ZanIDE.T("Budget", "上限"),
             Convert.ToString(budget) + " " + ZanIDE.T("chars", "字符")
-            + " ≈ " + Convert.ToString(budget / 4) + " token",
-            muted, head);
-        ly = ly + lh;
-        AiUsageRow(app, lx, ly, lw, ZanIDE.T("Filled", "占用"),
-            Convert.ToString(pct) + "%", muted, head);
-        ly = ly + lh;
+            + " ≈ " + Convert.ToString(budget / 4) + " token"));
+        ctx.Add(UsageStat.Of(ZanIDE.T("Filled", "占用"),
+            Convert.ToString(pct) + "%"));
         // Compaction is why the window never fills up: past the budget the
         // oldest turns are replaced by a digest before the request is sent,
         // while the transcript on screen keeps every turn.
-        int comp = AiAgent.Compactions();
-        AiUsageRow(app, lx, ly, lw, ZanIDE.T("Compacted", "已压缩"),
+        ctx.Add(UsageStat.Flag(ZanIDE.T("Compacted", "已压缩"),
             comp == 0
                 ? ZanIDE.T("never", "未发生")
                 : Convert.ToString(comp) + " "
                     + ZanIDE.T("requests", "次请求"),
-            muted, comp > 0 ? t.warning : head);
-        ly = ly + lh;
+            comp > 0));
+        string note = "";
         if (comp > 0) {
-            c.DrawText(lx, ly, ZanIDE.T("Older turns are sent as a digest",
-                "较早的对话以摘要形式发送"), muted, fs);
-            ly = ly + lh;
-            c.DrawText(lx, ly, ZanIDE.T("(last fold: ", "（上次折叠 ")
+            note = ZanIDE.T("Older turns are sent as a digest",
+                    "较早的对话以摘要形式发送")
+                + ZanIDE.T(" (last fold: ", "（上次折叠 ")
                 + Convert.ToString(AiAgent.LastDropped())
                 + ZanIDE.T(" turns; the chat above keeps them all).",
-                    " 条；上方对话仍完整保留）。"), muted, fs);
-            ly = ly + lh;
+                    " 条；上方对话仍完整保留）。");
         }
-        c.DrawLine(lx, ly + lh / 3, lx + lw, ly + lh / 3, t.tooltipBorder, 1);
-        ly = ly + app.Scale(8);
-        c.DrawText(lx, ly, ZanIDE.T("This session", "本次会话"), head, fs);
-        ly = ly + lh;
-        AiUsageRow(app, lx, ly, lw, ZanIDE.T("Requests", "请求次数"),
-            Convert.ToString(ZanIDE.aiStatReqs), muted, head);
-        ly = ly + lh;
-        AiUsageRow(app, lx, ly, lw, ZanIDE.T("Failed", "失败次数"),
-            Convert.ToString(ZanIDE.aiStatFails), muted,
-            ZanIDE.aiStatFails > 0 ? t.warning : head);
-        ly = ly + lh;
         // Token counts only exist for replies whose provider reported usage;
         // say so rather than showing a zero that looks like a real number.
         string inTok = ZanIDE.T("no data", "无数据");
@@ -5695,24 +5631,31 @@ partial class ZanIDE {
                         / ZanIDE.aiStatPrompt) + "%)";
             }
         }
-        AiUsageRow(app, lx, ly, lw, ZanIDE.T("Input tokens", "输入 token"),
-            inTok, muted, head);
-        ly = ly + lh;
-        AiUsageRow(app, lx, ly, lw, ZanIDE.T("Output tokens", "输出 token"),
-            outTok, muted, head);
-        ly = ly + lh;
-        AiUsageRow(app, lx, ly, lw, ZanIDE.T("Cached input", "缓存命中"),
-            cacheTok, muted, head);
-        ly = ly + lh;
-        AiUsageRow(app, lx, ly, lw, ZanIDE.T("Total tokens", "合计 token"),
-            totTok, muted, head);
-        ly = ly + lh;
+        List<UsageStat> ses = new List<UsageStat>();
+        ses.Add(UsageStat.Of(ZanIDE.T("Requests", "请求次数"),
+            Convert.ToString(ZanIDE.aiStatReqs)));
+        ses.Add(UsageStat.Flag(ZanIDE.T("Failed", "失败次数"),
+            Convert.ToString(ZanIDE.aiStatFails), ZanIDE.aiStatFails > 0));
+        ses.Add(UsageStat.Of(ZanIDE.T("Input tokens", "输入 token"), inTok));
+        ses.Add(UsageStat.Of(ZanIDE.T("Output tokens", "输出 token"), outTok));
+        ses.Add(UsageStat.Of(ZanIDE.T("Cached input", "缓存命中"), cacheTok));
+        ses.Add(UsageStat.Of(ZanIDE.T("Total tokens", "合计 token"), totTok));
         if (aiTokTotal > 0 || aiTokPrompt > 0) {
-            AiUsageRow(app, lx, ly, lw, ZanIDE.T("Last reply", "上次回复"),
+            ses.Add(UsageStat.Of(ZanIDE.T("Last reply", "上次回复"),
                 Convert.ToString(aiTokPrompt) + " + "
                 + Convert.ToString(aiTokCompletion) + " = "
-                + Convert.ToString(aiTokTotal), muted, head);
+                + Convert.ToString(aiTokTotal)));
         }
+        aiUsageCard.Update(ctx, ses, note);
+        int w = app.Scale(330);
+        int h = aiUsageCard.Height(app);
+        int x = aiUsageX - w / 2;
+        int y = aiUsageY;
+        int margin = app.Scale(4);
+        if (x + w > c.Width() - margin) { x = c.Width() - margin - w; }
+        if (x < margin) { x = margin; }
+        if (y + h > c.Height() - margin) { y = c.Height() - margin - h; }
+        aiUsageCard.RenderAt(app, x, y, w);
     }
 
     /// How a dropped file is written into the prompt: project-relative when it
@@ -5757,8 +5700,9 @@ partial class ZanIDE {
     }
 
     /// Draws the task-plan checklist into `area`: a header (progress count +
-    /// collapse + Clear) and one clickable checkbox row per step. Clicking a
-    /// row toggles its done state; clicking the header collapses the panel.
+    /// collapse + Clear) and the steps as a bound list. Each row is a real
+    /// Checkbox that toggles its own step, so no row rectangles, checkbox
+    /// drawing or click routing live here.
     void AiRenderPlan(App app, Rect area) {
         int runH = this.AiRenderRunStrip(app, area);
         if (runH > 0) {
@@ -5766,8 +5710,6 @@ partial class ZanIDE {
                 area.height - runH);
         }
         if (aiPlan.Count == 0) { return; }
-        Theme t = app.theme;
-        Canvas c = app.canvas;
         int pad = app.Scale(6);
         int hdr = app.Scale(24);
         // No surface fill: the panel (dock) behind already painted it, and this
@@ -5778,12 +5720,11 @@ partial class ZanIDE {
         }
         string caret = "v ";
         if (aiPlanCollapsed) { caret = "> "; }
-        string title = caret + ZanIDE.T("Plan", "任务计划") + " "
-            + Convert.ToString(done) + "/" + Convert.ToString(aiPlan.Count);
-        c.DrawText(area.x + pad, area.y + app.Scale(5), title, t.textPrimary,
-            Style.Of(app, "label", "small", Style.SNormal())
-                .FontOr(app.theme.fontSizeSmall));
         int btnW = app.Scale(72);
+        aiPlanTitle.Text = caret + ZanIDE.T("Plan", "任务计划") + " "
+            + Convert.ToString(done) + "/" + Convert.ToString(aiPlan.Count);
+        aiPlanTitle.RenderAt(app, area.x + pad, area.y + app.Scale(4),
+            area.width - btnW - pad * 3);
         int clrId = aiPlanClearBtn.Render(app,
             area.x + area.width - btnW - pad, area.y + app.Scale(2), btnW);
         bool clrClicked = Ui.Clicked(app, clrId);
@@ -5799,36 +5740,15 @@ partial class ZanIDE {
             app.RequestRedraw();
             return;
         }
-        c.FillRect(area.x, area.y + area.height - 1, area.width, 1, t.divider);
+        aiPlanRule.RenderAt(app, area.x, area.y + area.height - app.Scale(4),
+            area.width);
         if (aiPlanCollapsed) { return; }
-        int rowH = app.Scale(20);
-        int box = app.Scale(12);
-        c.PushClip(area.x, area.y + hdr, area.width, area.height - hdr);
-        for (int idx = 0; idx < aiPlan.Count; idx = idx + 1) {
-            int ry = area.y + hdr + idx * rowH;
-            if (ry + rowH > area.y + area.height) { break; }
-            int bx = area.x + pad;
-            int by = ry + (rowH - box) / 2;
-            bool dn = aiPlan[idx].done != 0;
-            // The checkbox box comes from the framework's own Checkbox part, so
-            // every inline check reads exactly like the real control.
-            int level = 0;
-            if (dn) { level = 1000; }
-            Checkbox.PaintBox(app, bx, by, box, level, t.success, t.borderPrimary);
-            int col = t.textPrimary;
-            if (dn) { col = t.textTertiary; }
-            c.DrawText(bx + box + pad, ry + app.Scale(3), aiPlan[idx].text, col,
-                Style.Of(app, "label", "small", Style.SNormal())
-                    .FontOr(app.theme.fontSizeSmall));
-            Rect rowHit = new Rect(area.x, ry, area.width, rowH);
-            if (app.ClickAvailable() && rowHit.Contains(app.mouseX, app.mouseY)) {
-                if (aiPlan[idx].done != 0) { aiPlan[idx].done = 0; }
-                else { aiPlan[idx].done = 1; }
-                app.ClaimClick();
-                app.RequestRedraw();
-            }
+        if (aiPlanBound != aiPlan) {
+            aiPlanList.Bind(aiPlan);
+            aiPlanBound = aiPlan;
         }
-        c.PopClip();
+        aiPlanList.RenderInside(app, new Rect(area.x + pad, area.y + hdr,
+            area.width - pad * 2, area.height - hdr - app.Scale(4)));
     }
 
     /// AI assistant: provider profiles, chat sessions, transcript cache and the
