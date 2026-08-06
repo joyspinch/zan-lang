@@ -369,6 +369,18 @@ header-only 库 / C 回调 / 结构体字段偏移，全部对应 A2 / A3 / A4�
 `ae75d50`，`ZANPKG1` 封包魔数与包管理器无关、保留）；`src/selfhost/` 自举编译器
 分支属 A6 的"终局自举"路线，独立推进。
 
+* **B6-SH1 🚧 `selfhost_fixed_point` 在 HEAD 已红（2026-08-07 实测，非 B3 引入）**：
+  gen1 → g2.ll 失败，根因是自举编译器没实现 `ref` 参数，而 `dbgen.zan`
+  （自举编译器自己的源文件）自 `e01975ee` 起用了 `ref int outKind`
+  （`AggCall` 1 个签名 + 2 处调用）。探针：
+  `build/zanc src/selfhost/*.zan -o gen1 && gen1 g2.ll src/selfhost/*.zan` → 报
+  "undefined identifier 'ref'"（dbgen.zan:581/592）；另有一个独立的 stdlib 编译缺口
+  "type 'Stopwatch' has no member 'Start'"（Stopwatch.zan:35，`Start` 未被 gen1
+  binder 解析）。修法：自举编译器补 `ref`（parser/binder/checker/irgen，C host 参考
+  c28d1f61），并核实 Stopwatch.Start 的成员解析。自举代码量小（1 签名 2 调用点），
+  但 `ref` 是跨阶段特性，单列任务；在修好前 full 档 `ctest -R selfhost` 允许红
+  （smoke/standard 档不含 fixed_point）。
+
 ## B7 runtime 边界复核
 
 〔2026-07-29 实测〕`rt_io.c` **77KB**、`rt_sync.c` 49KB、`rt_sched.c` 10KB /

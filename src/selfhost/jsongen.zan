@@ -15,7 +15,9 @@ namespace Zan;
 // runtime type info is needed. Mapping is lenient: missing keys keep field
 // defaults, scalar mismatches coerce through the JsonValue As* helpers, a
 // single object binds into List<T> as one element, extra keys are ignored,
-// and JsonValue-typed fields pass their subtree through untouched.
+// and JsonValue-typed fields pass their subtree through untouched. Field
+// types outside the supported set are a compile error unless the field is
+// annotated [JsonIgnore] (fail closed — never silently drop a field).
 class Jsongen {
     Node unit;
     Diags diags;
@@ -267,8 +269,9 @@ class Jsongen {
             string tname = "?";
             if (m.type != null && m.type.kind == AK.TypeRef()) { tname = m.type.sval; }
             if (fk == Jsongen.FkSkip()) {
-                // unsupported field type: skipped (the C host warns; the
-                // selfhost Diags sink has no warning severity)
+                // unsupported field type: only reachable here for fields
+                // explicitly exempted with [JsonIgnore] — ValidateFields has
+                // already errored on anything unannotated.
                 continue;
             }
             if (fk == Jsongen.FkClass()) { NeedAdd(tname); }
@@ -356,6 +359,54 @@ class Jsongen {
         return r == 1;
     }
 
+    // ---- fail-closed field validation ----
+
+    // Walk every field of every class reachable from a Json call and reject
+    // unsupported field types unless the field is explicitly exempted with
+    // [JsonIgnore]. Without this gate a mapper would be generated that looks
+    // successful but silently drops fields (the old behaviour was to skip them
+    // with no diagnostic at all). Class-typed fields are added to needNames so
+    // the walk reaches transitively referenced classes too.
+    void ValidateClass(string cls) {
+        Node decl = FindDecl(cls, AK.ClassDecl());
+        if (decl == null) { return; }
+        ValidateFields(decl, 0);
+    }
+
+    void ValidateFields(Node cls, int depth) {
+        if (depth > 16 || cls == null) { return; }
+        // base class fields first (C#-style ordering), like GenFields
+        if (cls.sval2 != "") {
+            Node bdecl = FindDecl(cls.sval2, AK.ClassDecl());
+            if (bdecl != null) { ValidateFields(bdecl, depth + 1); }
+        }
+        int i = 0;
+        while (i < cls.kids.Count) {
+            Node m = cls.kids[i];
+            i = i + 1;
+            if (m.kind != AK.FieldDecl()) { continue; }
+            if (HasMod(m.mods, MOD.Static())) { continue; }
+            if (HasMod(m.mods, MOD.JsonIgnore())) { continue; }
+            string f = m.sval;
+            elemName = "";
+            elemKind = 0;
+            int fk = Classify(m.type);
+            string tname = "?";
+            if (m.type != null && m.type.kind == AK.TypeRef()) {
+                tname = m.type.sval;
+                if (m.type.ival == 1) { tname = tname + "[]"; }
+            }
+            if (fk == Jsongen.FkSkip()) {
+                diags.Error("Json mapper for '" + cls.sval + "': field '" + f
+                    + "' has unsupported type '" + tname
+                    + "'; annotate it with [JsonIgnore] to skip", m.line, m.col);
+                continue;
+            }
+            if (fk == Jsongen.FkClass()) { NeedAdd(tname); }
+            if (fk == Jsongen.FkList() && elemKind == Jsongen.FkClass()) { NeedAdd(elemName); }
+        }
+    }
+
     string GenClass(int idx) {
         string cls = needNames[idx];
         Node decl = FindDecl(cls, AK.ClassDecl());
@@ -439,6 +490,17 @@ class Jsongen {
             }
         }
         if (!any || diags.HasErrors()) { return; }
+
+        // Fail closed: validate every reachable class's fields before
+        // generating any mapper code. Unsupported fields must be annotated
+        // [JsonIgnore]; anything else aborts compilation rather than emitting
+        // a serializer that silently omits the field.
+        int vi = 0;
+        while (vi < needNames.Count) {
+            ValidateClass(needNames[vi]);
+            vi = vi + 1;
+        }
+        if (diags.HasErrors()) { return; }
 
         string src = "class __JsonBind {\n";
         src = src + "    static JsonValue T_Str(string s) { if (s == null) { return JsonValue.NewNull(); } return JsonValue.NewStr(s); }\n";

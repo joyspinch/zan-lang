@@ -2,12 +2,14 @@ using System;
 using System.Collections;
 namespace Zan;
 
-// One diagnostic message with source position.
+// One diagnostic message with source position. `warn` selects the severity
+// (true = warning, false = error); warnings never gate compilation.
 class Diag {
     public string msg;
     public int line;
     public int col;
-    public Diag(string m, int ln, int c) { msg = m; line = ln; col = c; }
+    public bool warn;
+    public Diag(string m, int ln, int c, bool w) { msg = m; line = ln; col = c; warn = w; }
 }
 
 // Diagnostic sink shared across compiler phases.
@@ -16,9 +18,17 @@ class Diags {
     List<string> files;
     List<int> fileStarts;
     public Diags() { items = new List<Diag>(); files = null; fileStarts = null; }
-    public void Error(string m, int line, int col) { items.Add(new Diag(m, line, col)); }
+    public void Error(string m, int line, int col) { items.Add(new Diag(m, line, col, false)); }
+    public void Warning(string m, int line, int col) { items.Add(new Diag(m, line, col, true)); }
     public int Count() { return items.Count; }
-    public bool HasErrors() { return items.Count > 0; }
+    public bool HasErrors() {
+        int i = 0;
+        while (i < items.Count) {
+            if (!items[i].warn) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
 
     // Registers the source files that were concatenated into the translation
     // unit: `names[i]` starts at 1-based global line `starts[i]`. Lets Report
@@ -40,12 +50,13 @@ class Diags {
         return r;
     }
 
-    // Render each diagnostic as "file:line:col: error: msg" followed by the
-    // offending source line in a gutter and a caret, matching the C host
-    // shape. Prints only entries at index >= start so a phase can flush just
-    // its own.
+    // Render each diagnostic as "file:line:col: error/warning: msg" followed by
+    // the offending source line in a gutter and a caret, matching the C host
+    // shape (warnings yellow, errors red). Prints only entries at index >=
+    // start so a phase can flush just its own.
     public void Report(string src, int start) {
         string red = Esc() + "[31m";
+        string yel = Esc() + "[33m";
         string rst = Esc() + "[0m";
         int j = start;
         while (j < items.Count) {
@@ -62,23 +73,34 @@ class Diags {
                 shown = e.line - fileStarts[fi] + 1;
                 loc = files[fi] + ":";
             }
-            Console.WriteLine(loc + shown + ":" + e.col + ": " + red + "error" + rst + ": " + e.msg);
+            if (e.warn) {
+                Console.WriteLine(loc + shown + ":" + e.col + ": " + yel + "warning" + rst + ": " + e.msg);
+            } else {
+                Console.WriteLine(loc + shown + ":" + e.col + ": " + red + "error" + rst + ": " + e.msg);
+            }
             string ln = LineOf(src, e.line);
             if (ln.Length > 0) {
                 Console.WriteLine(PadLeft("" + shown, 5) + " | " + ln);
                 string car = "";
                 int k2 = 1;
                 while (k2 < e.col) { car = car + " "; k2 = k2 + 1; }
-                Console.WriteLine("      | " + car + red + "^" + rst);
+                Console.WriteLine("      | " + car + (e.warn ? yel : red) + "^" + rst);
             }
             j = j + 1;
         }
     }
 
-    // Prints the closing "N error(s), 0 warning(s)" summary line.
+    // Prints the closing "N error(s), M warning(s)" summary line.
     public void Summary() {
+        int errs = 0;
+        int warns = 0;
+        int i = 0;
+        while (i < items.Count) {
+            if (items[i].warn) { warns = warns + 1; } else { errs = errs + 1; }
+            i = i + 1;
+        }
         Console.WriteLine("");
-        Console.WriteLine("" + items.Count + " error(s), 0 warning(s)");
+        Console.WriteLine("" + errs + " error(s), " + warns + " warning(s)");
     }
 
     // Extract the 1-based source line (without its trailing newline / CR).

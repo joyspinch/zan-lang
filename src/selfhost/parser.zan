@@ -13,18 +13,21 @@ class Parser {
     public int lastErrPos;
     public bool attrDll;      // last ParseAttrs saw [DllImport]
     public string attrEntry;  // DllImport EntryPoint override ("" if none)
+    public bool attrJsonIgnore; // last ParseAttrs saw [JsonIgnore]
 
-    public Parser(List<Token> t, Diags d) { toks = t; pos = 0; diags = d; lastErrPos = -1; attrDll = false; attrEntry = ""; }
+    public Parser(List<Token> t, Diags d) { toks = t; pos = 0; diags = d; lastErrPos = -1; attrDll = false; attrEntry = ""; attrJsonIgnore = false; }
 
     bool HasModBit(int mods, int bit) { return (mods / bit) - ((mods / bit) / 2) * 2 == 1; }
 
     // Attributes: [DllImport("lib")] / [DllImport("lib", EntryPoint="n")] /
-    // [StructLayout(...)] / [Group(...)] ... DllImport marks the following
-    // method as an extern C-ABI import (the library is linked by the build);
-    // all other attributes are skipped.
+    // [StructLayout(...)] / [Group(...)] / [JsonIgnore] ... DllImport marks
+    // the following method as an extern C-ABI import (the library is linked
+    // by the build); JsonIgnore exempts a field from compile-time Json
+    // mapping; all other attributes are skipped.
     void ParseAttrs() {
         attrDll = false;
         attrEntry = "";
+        attrJsonIgnore = false;
         while (At(TK.LBracket())) {
             Next(); // [
             if (At(TK.Ident()) && Cur().text == "DllImport") {
@@ -41,6 +44,13 @@ class Parser {
                             while (!At(TK.RParen()) && !At(TK.Comma()) && !At(TK.Eof())) { Next(); }
                         }
                     }
+                    Expect(TK.RParen());
+                }
+            } else if (At(TK.Ident()) && Cur().text == "JsonIgnore") {
+                attrJsonIgnore = true;
+                Next();
+                if (Eat(TK.LParen())) {
+                    while (!At(TK.RParen()) && !At(TK.Eof())) { Next(); }
                     Expect(TK.RParen());
                 }
             } else {
@@ -788,6 +798,7 @@ class Parser {
         bool wantExtern = attrDll;
         string entry = attrEntry;
         int mods = ParseMods();
+        if (attrJsonIgnore) { mods = mods + MOD.JsonIgnore(); }
         // `event` is contextual: a field modifier only when introducing an
         // event field (`event D E;`), so identifiers named `event` still work.
         if (At(TK.Ident()) && Cur().text == "event" && K1() == TK.Ident()) { Next(); mods = mods + MOD.Event(); }
@@ -829,6 +840,9 @@ class Parser {
         Node member = new Node(AK.FieldDecl());
         member.mods = mods;
         member.type = type;
+        // Stamp the member name's position so jsongen's unsupported-field
+        // diagnostics point at the offending field (defaults to 0:0).
+        member.line = Cur().line; member.col = Cur().col;
         if (HasModBit(mods, MOD.Weak())) { type.mods = type.mods + MOD.Weak(); }
         if (At(TK.Ident())) { member.sval = Next().text; }
         // operator overload:  T operator <sym> ( ... ) { ... }

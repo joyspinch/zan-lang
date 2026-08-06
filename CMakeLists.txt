@@ -748,10 +748,29 @@ add_test(NAME selfhost_gen1
     -DGEN1=${CMAKE_BINARY_DIR}/selfhost_gen1${_exe_ext}
     -DOUTLL=${CMAKE_BINARY_DIR}/selfhost_gen1.ll
     -DCLANG=${SELFHOST_CLANG}
-    -DBADPROG=${CMAKE_SOURCE_DIR}/tests/diag/bad_member.zan
+    -DBADPROG=${CMAKE_SOURCE_DIR}/tests/selfhost/bad_unknown_type.zan
     -DBADLL=${CMAKE_BINARY_DIR}/selfhost_bad.ll
     -P ${CMAKE_SOURCE_DIR}/tests/run_selfhost.cmake)
 set_tests_properties(selfhost_gen1 PROPERTIES TIMEOUT 600)
+
+# ---- Self-hosting: jsongen must fail closed on unsupported field types ----
+# The ok program maps a class whose int[] field is [JsonIgnore]-annotated
+# (compiles, runs, serializes without the field); the bad program leaves the
+# same field unannotated and must be rejected with a compile error and no IR.
+# One gen1 build serves both directions (PROG + BADPROG in one invocation).
+add_test(NAME selfhost_json_ignore
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSELFHOST_DIR=${CMAKE_SOURCE_DIR}/src/selfhost
+    -DPROG=${CMAKE_SOURCE_DIR}/tests/selfhost/json_ignore_ok.zan
+    -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/selfhost/json_ignore_ok.out
+    -DGEN1=${CMAKE_BINARY_DIR}/selfhost_jsongen1${_exe_ext}
+    -DOUTLL=${CMAKE_BINARY_DIR}/selfhost_json_ok.ll
+    -DCLANG=${SELFHOST_CLANG}
+    -DBADPROG=${CMAKE_SOURCE_DIR}/tests/selfhost/json_ignore_bad.zan
+    -DBADLL=${CMAKE_BINARY_DIR}/selfhost_json_bad.ll
+    -P ${CMAKE_SOURCE_DIR}/tests/run_selfhost.cmake)
+set_tests_properties(selfhost_json_ignore PROPERTIES TIMEOUT 600)
 
 # ---- Self-hosting fixed point: full gen0->gen1->gen2->gen3 closure, asserting
 #      g2.ll == g3.ll byte-for-byte. Requires clang to link the emitted IR, so
