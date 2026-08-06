@@ -893,6 +893,34 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
     ENVIRONMENT "ZAN_LIB_PATH=$<TARGET_FILE_DIR:zan_gui>;LD_LIBRARY_PATH=$<TARGET_FILE_DIR:zan_gui>;DYLD_LIBRARY_PATH=$<TARGET_FILE_DIR:zan_gui>")
 endif()
 
+# ---- IDE: assistant task state machine ----
+# The twelve-phase delivery run (understand -> ... -> knowledge), its bounded
+# retries, the diagnose-and-reverify loop and the checkpoint round-trip are pure
+# computation, so the whole lifecycle is verified headlessly -- including that a
+# restored checkpoint resumes at the phase that failed instead of restarting.
+add_test(NAME conformance_ide_airun
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/ide/airun_test.zan
+    "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/src/ide_zan/AiRun.zan;--auto-stdlib"
+    -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/ide/airun_test.out
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_ide_airun${_exe_ext}
+    -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+
+# ---- IDE: Help & Feedback local diagnostics store ----
+# Parsing compiler diagnostic lines, de-dup counting, redaction (absolute paths,
+# secrets, connection strings, e-mail), the JSONL round-trip and "no events in
+# the payload unless the user consents to logs" are all pure computation, so the
+# aggregation layer is verified headlessly with no window.
+add_test(NAME conformance_ide_diagstore
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/ide/diagstore_test.zan
+    "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/src/ide_zan/DiagStore.zan;--auto-stdlib"
+    -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/ide/diagstore_test.out
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_ide_diagstore${_exe_ext}
+    -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+
 # ---- Runtime diagnostics: parser must not hang/OOM on malformed input ----
 add_test(NAME diag_no_runaway
   COMMAND zanc ${CMAKE_SOURCE_DIR}/tests/diag/bad_member.zan --dump-ast)

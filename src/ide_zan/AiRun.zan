@@ -1,0 +1,777 @@
+using System;
+
+/// 小助手一次交付的阶段。
+///
+/// 顺序是固定的十二拍，而不是模型自己想到哪算哪：需求理解 → 事实检索 →
+/// 方案拆解 → 用户确认 → 实施 → 编译 → 分层测试 → 运行/UI 验证 →
+/// 根因定位 → 回归 → 交付 → 知识沉淀。固定顺序才让「跑到哪了」「哪一拍
+/// 失败」「从哪一拍续跑」有唯一答案，重启 IDE 之后也能接上。
+///
+/// `Diagnose` 不是链条上的第八拍，而是一个回环：编译/测试/验证任一拍失败时
+/// 进入它，修完回到失败的那一拍重跑（`AiRun.resumeAt`），这就是「发现问题
+/// → 定位根因 → 修复 → 重新验证」的闭环。
+class AiPhase {
+    static int Understand() { return 0; }
+    static int Index() { return 1; }
+    static int Plan() { return 2; }
+    static int Confirm() { return 3; }
+    static int Implement() { return 4; }
+    static int Build() { return 5; }
+    static int Test() { return 6; }
+    static int Verify() { return 7; }
+    static int Diagnose() { return 8; }
+    static int Regress() { return 9; }
+    static int Deliver() { return 10; }
+    static int Knowledge() { return 11; }
+    static int Count() { return 12; }
+
+    /// 稳定的机器标识（写进检查点，永不本地化）。
+    static string Id(int phase) {
+        if (phase == 0) { return "understand"; }
+        if (phase == 1) { return "index"; }
+        if (phase == 2) { return "plan"; }
+        if (phase == 3) { return "confirm"; }
+        if (phase == 4) { return "implement"; }
+        if (phase == 5) { return "build"; }
+        if (phase == 6) { return "test"; }
+        if (phase == 7) { return "verify"; }
+        if (phase == 8) { return "diagnose"; }
+        if (phase == 9) { return "regress"; }
+        if (phase == 10) { return "deliver"; }
+        if (phase == 11) { return "knowledge"; }
+        return "unknown";
+    }
+
+    static int FromId(string id) {
+        for (int i = 0; i < AiPhase.Count(); i = i + 1) {
+            if (AiPhase.Id(i) == id) { return i; }
+        }
+        return -1;
+    }
+
+    static string Zh(int phase) {
+        if (phase == 0) { return "需求理解"; }
+        if (phase == 1) { return "事实检索"; }
+        if (phase == 2) { return "方案拆解"; }
+        if (phase == 3) { return "用户确认"; }
+        if (phase == 4) { return "代码实施"; }
+        if (phase == 5) { return "编译"; }
+        if (phase == 6) { return "分层测试"; }
+        if (phase == 7) { return "运行验证"; }
+        if (phase == 8) { return "根因定位"; }
+        if (phase == 9) { return "回归验证"; }
+        if (phase == 10) { return "交付"; }
+        if (phase == 11) { return "知识沉淀"; }
+        return "未知";
+    }
+
+    static string En(int phase) {
+        if (phase == 0) { return "Understand"; }
+        if (phase == 1) { return "Index"; }
+        if (phase == 2) { return "Plan"; }
+        if (phase == 3) { return "Confirm"; }
+        if (phase == 4) { return "Implement"; }
+        if (phase == 5) { return "Build"; }
+        if (phase == 6) { return "Test"; }
+        if (phase == 7) { return "Verify"; }
+        if (phase == 8) { return "Diagnose"; }
+        if (phase == 9) { return "Regress"; }
+        if (phase == 10) { return "Deliver"; }
+        if (phase == 11) { return "Knowledge"; }
+        return "Unknown";
+    }
+
+    /// 只能由用户推进的阶段：确认方案不允许小助手自己代答。
+    static bool NeedsUser(int phase) { return phase == AiPhase.Confirm(); }
+
+    /// 失败要走根因回环（而不是直接问用户）的阶段。
+    static bool Verifying(int phase) {
+        return phase == AiPhase.Build() || phase == AiPhase.Test()
+            || phase == AiPhase.Verify() || phase == AiPhase.Regress();
+    }
+}
+
+/// 一步/一次任务的状态。`Blocked` 与 `Failed` 分开：前者等外部输入（用户确认、
+/// 缺凭据），重试毫无意义；后者是可以再跑一次的失败。
+class AiRunStatus {
+    static int Pending() { return 0; }
+    static int Running() { return 1; }
+    static int Done() { return 2; }
+    static int Failed() { return 3; }
+    static int Skipped() { return 4; }
+    static int Blocked() { return 5; }
+
+    static string Id(int st) {
+        if (st == 0) { return "pending"; }
+        if (st == 1) { return "running"; }
+        if (st == 2) { return "done"; }
+        if (st == 3) { return "failed"; }
+        if (st == 4) { return "skipped"; }
+        if (st == 5) { return "blocked"; }
+        return "unknown";
+    }
+
+    static string Mark(int st) {
+        if (st == 1) { return "…"; }
+        if (st == 2) { return "✓"; }
+        if (st == 3) { return "✗"; }
+        if (st == 4) { return "»"; }
+        if (st == 5) { return "?"; }
+        return "·";
+    }
+}
+
+/// 下一步该干什么——状态机唯一的对外决策出口。面板和自动跑批都只问这一个
+/// 问题，不各自复制一套 if。
+class AiNext {
+    static int Continue() { return 0; }
+    static int Retry() { return 1; }
+    static int Diagnose() { return 2; }
+    static int AskUser() { return 3; }
+    static int Finished() { return 4; }
+    static int Abort() { return 5; }
+
+    static string Id(int act) {
+        if (act == 0) { return "continue"; }
+        if (act == 1) { return "retry"; }
+        if (act == 2) { return "diagnose"; }
+        if (act == 3) { return "ask-user"; }
+        if (act == 4) { return "finished"; }
+        if (act == 5) { return "abort"; }
+        return "unknown";
+    }
+}
+
+/// 故障分类：决定「能不能自动再来一次」。把编译失败和缺 API Key 当成同一种
+/// 错误，是自动重试变成死循环的根源。
+class AiFault {
+    static int None() { return 0; }
+    static int Compile() { return 1; }
+    static int Test() { return 2; }
+    static int Runtime() { return 3; }
+    static int Ui() { return 4; }
+    static int Io() { return 5; }
+    static int Network() { return 6; }
+    static int Config() { return 7; }
+    static int Cancelled() { return 8; }
+    static int Internal() { return 9; }
+
+    static string Id(int cls) {
+        if (cls == 0) { return "none"; }
+        if (cls == 1) { return "compile"; }
+        if (cls == 2) { return "test"; }
+        if (cls == 3) { return "runtime"; }
+        if (cls == 4) { return "ui"; }
+        if (cls == 5) { return "io"; }
+        if (cls == 6) { return "network"; }
+        if (cls == 7) { return "config"; }
+        if (cls == 8) { return "cancelled"; }
+        if (cls == 9) { return "internal"; }
+        return "unknown";
+    }
+
+    static string Zh(int cls) {
+        if (cls == 0) { return "无"; }
+        if (cls == 1) { return "编译错误"; }
+        if (cls == 2) { return "测试失败"; }
+        if (cls == 3) { return "运行异常"; }
+        if (cls == 4) { return "界面验证失败"; }
+        if (cls == 5) { return "文件/IO 错误"; }
+        if (cls == 6) { return "网络错误"; }
+        if (cls == 7) { return "配置缺失"; }
+        if (cls == 8) { return "已取消"; }
+        if (cls == 9) { return "内部错误"; }
+        return "未知错误";
+    }
+
+    /// 自动重试是否有意义。配置缺失要人补、取消是人的决定，重试只会刷屏。
+    static bool Retryable(int cls) {
+        return cls == AiFault.Network() || cls == AiFault.Io()
+            || cls == AiFault.Internal();
+    }
+
+    /// 走「定位根因再重验」回环的故障（代码问题，不是环境问题）。
+    static bool Repairable(int cls) {
+        return cls == AiFault.Compile() || cls == AiFault.Test()
+            || cls == AiFault.Runtime() || cls == AiFault.Ui();
+    }
+
+    /// 子串包含。自带一份而不是调 `ZanIDE.IndexOfStr`，是为了让整个状态机能在
+    /// 没有 IDE、没有窗口的测试里单独编译运行。
+    static bool Has(string hay, string needle) {
+        int n = needle.Length;
+        if (n == 0) { return true; }
+        for (int i = 0; i + n <= hay.Length; i = i + 1) {
+            if (hay.Substring(i, n) == needle) { return true; }
+        }
+        return false;
+    }
+
+    /// ASCII 小写化（运行时没有可靠的字符码助手）。
+    static string Lower(string s) {
+        string up = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        string lo = "abcdefghijklmnopqrstuvwxyz";
+        string o = "";
+        for (int i = 0; i < s.Length; i = i + 1) {
+            string ch = s.Substring(i, 1);
+            bool hit = false;
+            for (int k = 0; k < 26 && !hit; k = k + 1) {
+                if (up.Substring(k, 1) == ch) {
+                    o = o + lo.Substring(k, 1);
+                    hit = true;
+                }
+            }
+            if (!hit) { o = o + ch; }
+        }
+        return o;
+    }
+
+    /// 从错误文本粗分类。宁可落到 `Internal` 也不要猜成 `Config`：分错成不可
+    /// 重试会让本来能自愈的一步停下来等人。
+    static int Classify(string message) {
+        if (message == "") { return AiFault.None(); }
+        string m = AiFault.Lower(message);
+        if (AiFault.Has(m, "cancel") || AiFault.Has(m, "aborted")
+            || AiFault.Has(m, "已取消")) {
+            return AiFault.Cancelled();
+        }
+        if (AiFault.Has(m, "api key") || AiFault.Has(m, "unauthorized")
+            || AiFault.Has(m, "401") || AiFault.Has(m, "not configured")
+            || AiFault.Has(m, "未配置")) {
+            return AiFault.Config();
+        }
+        if (AiFault.Has(m, "timed out") || AiFault.Has(m, "timeout")
+            || AiFault.Has(m, "connection") || AiFault.Has(m, "socket")
+            || AiFault.Has(m, "dns") || AiFault.Has(m, "http 5")) {
+            return AiFault.Network();
+        }
+        if (AiFault.Has(m, "error:") || AiFault.Has(m, "compile")
+            || AiFault.Has(m, "expected ") || AiFault.Has(m, "undeclared")
+            || AiFault.Has(m, "编译")) {
+            return AiFault.Compile();
+        }
+        if (AiFault.Has(m, "tests failed") || AiFault.Has(m, "test failed")
+            || AiFault.Has(m, "assert") || AiFault.Has(m, "mismatch")) {
+            return AiFault.Test();
+        }
+        if (AiFault.Has(m, "0xc0000005") || AiFault.Has(m, "segmentation")
+            || AiFault.Has(m, "exception") || AiFault.Has(m, "crash")
+            || AiFault.Has(m, "闪退")) {
+            return AiFault.Runtime();
+        }
+        if (AiFault.Has(m, "no such file") || AiFault.Has(m, "not found")
+            || AiFault.Has(m, "access is denied") || AiFault.Has(m, "denied")) {
+            return AiFault.Io();
+        }
+        if (AiFault.Has(m, "region") || AiFault.Has(m, "hit-test")
+            || AiFault.Has(m, "ui_check")) {
+            return AiFault.Ui();
+        }
+        return AiFault.Internal();
+    }
+}
+
+/// 一拍的执行记录。命令、退出码、诊断、产物都留在这里，交付时的「证据」就是
+/// 这些字段拼出来的，而不是模型复述一遍自己干了什么。
+class AiRunStep {
+    int phase;
+    int status;
+    /// 这一拍实际做了什么（一行摘要）。
+    string title;
+    /// 可重现命令（`scripts\test.ps1 standard` 等），为空表示不是命令步骤。
+    string command;
+    int exitCode;
+    int startedMs;
+    int endedMs;
+    int retries;
+    int fault;
+    string error;
+    List<string> diagnostics;
+    List<string> artifacts;
+
+    static AiRunStep Create(int phase) {
+        AiRunStep s = new AiRunStep();
+        s.phase = phase;
+        s.status = AiRunStatus.Pending();
+        s.title = "";
+        s.command = "";
+        s.exitCode = 0;
+        s.startedMs = 0;
+        s.endedMs = 0;
+        s.retries = 0;
+        s.fault = AiFault.None();
+        s.error = "";
+        s.diagnostics = new List<string>();
+        s.artifacts = new List<string>();
+        return s;
+    }
+
+    void Begin(int nowMs, string title) {
+        this.status = AiRunStatus.Running();
+        this.startedMs = nowMs;
+        this.endedMs = 0;
+        this.fault = AiFault.None();
+        this.error = "";
+        if (title != "") { this.title = title; }
+    }
+
+    void Finish(int nowMs) {
+        this.status = AiRunStatus.Done();
+        this.endedMs = nowMs;
+    }
+
+    void Fail(int nowMs, int fault, string error) {
+        this.endedMs = nowMs;
+        this.fault = fault;
+        this.error = error;
+        if (fault == AiFault.Config() || fault == AiFault.Cancelled()) {
+            this.status = AiRunStatus.Blocked();
+        } else {
+            this.status = AiRunStatus.Failed();
+        }
+    }
+
+    int DurationMs() {
+        if (this.startedMs == 0) { return 0; }
+        if (this.endedMs == 0) { return 0; }
+        return this.endedMs - this.startedMs;
+    }
+
+    string Label() {
+        if (this.title != "") { return this.title; }
+        return AiPhase.Zh(this.phase);
+    }
+}
+
+/// 一次交付的完整状态机：十二拍 + 根因回环 + 可落盘的检查点。
+///
+/// 状态机只管「现在在哪、下一步该做什么、证据在哪」，不碰模型、不碰 UI，
+/// 所有时间都由调用方以毫秒传入 —— 这样它能在无窗口的测试里整段跑完。
+class AiRun {
+    /// 同一拍自动重试的上限。
+    static int MaxRetries() { return 2; }
+    /// 同一个需求里「定位根因 → 重验」的回环上限，超了就交给用户，不无限修。
+    static int MaxRepairs() { return 3; }
+
+    string taskId;
+    /// 需求原文的一行摘要。
+    string title;
+    int createdMs;
+    int updatedMs;
+    /// 当前拍。
+    int phase;
+    /// 整体状态（Running / Done / Failed / Blocked）。
+    int status;
+    List<AiRunStep> steps;
+    /// 根因回环修完要回到哪一拍重跑；-1 表示不在回环里。
+    int resumeAt;
+    int repairs;
+    int fault;
+    string lastError;
+    List<string> changedFiles;
+
+    static AiRun Begin(string taskId, string title, int nowMs) {
+        AiRun r = new AiRun();
+        r.taskId = taskId;
+        r.title = title;
+        r.createdMs = nowMs;
+        r.updatedMs = nowMs;
+        r.phase = AiPhase.Understand();
+        r.status = AiRunStatus.Running();
+        r.steps = new List<AiRunStep>();
+        for (int i = 0; i < AiPhase.Count(); i = i + 1) {
+            r.steps.Add(AiRunStep.Create(i));
+        }
+        r.resumeAt = -1;
+        r.repairs = 0;
+        r.fault = AiFault.None();
+        r.lastError = "";
+        r.changedFiles = new List<string>();
+        return r;
+    }
+
+    AiRunStep At(int phase) {
+        if (phase < 0 || phase >= this.steps.Count) { return null; }
+        return this.steps[phase];
+    }
+
+    AiRunStep Current() { return this.At(this.phase); }
+
+    // --- 推进 -----------------------------------------------------------------
+
+    /// 开始某一拍。回到已完成的拍（回归重跑）会把它重新置为 running。
+    void Enter(int phase, int nowMs, string title) {
+        if (phase < 0 || phase >= AiPhase.Count()) { return; }
+        this.phase = phase;
+        this.updatedMs = nowMs;
+        this.status = AiRunStatus.Running();
+        this.At(phase).Begin(nowMs, title);
+    }
+
+    /// 当前拍成功；十二拍走完则整个任务完成。
+    void Pass(int nowMs, string note) {
+        AiRunStep s = this.Current();
+        if (note != "") { s.title = note; }
+        // 通过之后不能还挂着上一次的错误：否则交付证据里一个 ✓ 的拍旁边写着
+        // 一条失败原因，读起来像是把失败当成功报了。
+        s.error = "";
+        s.fault = AiFault.None();
+        s.Finish(nowMs);
+        this.updatedMs = nowMs;
+        this.fault = AiFault.None();
+        this.lastError = "";
+        if (this.phase == AiPhase.Knowledge()) {
+            this.status = AiRunStatus.Done();
+        }
+    }
+
+    /// 当前拍失败。分类由错误文本推出（调用方已知分类时用另一个重载）。
+    void Fail(int nowMs, string error) {
+        this.Fail(nowMs, AiFault.Classify(error), error);
+    }
+
+    void Fail(int nowMs, int fault, string error) {
+        AiRunStep s = this.Current();
+        s.Fail(nowMs, fault, error);
+        this.updatedMs = nowMs;
+        this.fault = fault;
+        this.lastError = error;
+        this.status = s.status;
+    }
+
+    void FailCommand(int nowMs, string command, int exitCode, string error) {
+        AiRunStep s = this.Current();
+        s.command = command;
+        s.exitCode = exitCode;
+        this.Fail(nowMs, error);
+    }
+
+    /// 跳过一拍（例如纯文档改动不需要 UI 验证）。理由必填，否则交付时无法解释
+    /// 为什么少验了一层。
+    void Skip(int nowMs, string why) {
+        AiRunStep s = this.Current();
+        s.status = AiRunStatus.Skipped();
+        s.endedMs = nowMs;
+        s.error = why;
+        this.updatedMs = nowMs;
+    }
+
+    /// 状态机的唯一决策点。
+    int NextAction() {
+        if (this.status == AiRunStatus.Done()) { return AiNext.Finished(); }
+        AiRunStep s = this.Current();
+        if (s == null) { return AiNext.Abort(); }
+        if (s.status == AiRunStatus.Blocked()) { return AiNext.AskUser(); }
+        if (s.status == AiRunStatus.Failed()) {
+            if (AiFault.Retryable(s.fault) && s.retries < AiRun.MaxRetries()) {
+                return AiNext.Retry();
+            }
+            if (AiFault.Repairable(s.fault)
+                && this.repairs < AiRun.MaxRepairs()
+                && this.phase != AiPhase.Diagnose()) {
+                return AiNext.Diagnose();
+            }
+            return AiNext.AskUser();
+        }
+        if (s.status == AiRunStatus.Running()
+            && AiPhase.NeedsUser(this.phase)) {
+            return AiNext.AskUser();
+        }
+        return AiNext.Continue();
+    }
+
+    /// 重跑当前拍（同一拍，retries+1）。达到上限返回 false，绝不静默无限重试。
+    bool Retry(int nowMs) {
+        AiRunStep s = this.Current();
+        if (s == null) { return false; }
+        // 等外部输入的一拍重试毫无意义：凭据没补上、用户没答，跑一百次还是同一
+        // 个结果，只会把面板刷满。
+        if (s.status == AiRunStatus.Blocked()) { return false; }
+        if (s.retries >= AiRun.MaxRetries()) { return false; }
+        s.retries = s.retries + 1;
+        this.Enter(this.phase, nowMs, s.title);
+        return true;
+    }
+
+    /// 进入根因回环：记住失败的那一拍，修完由 `ResumeAfterRepair` 回去重验。
+    bool EnterRepair(int nowMs) {
+        if (this.repairs >= AiRun.MaxRepairs()) { return false; }
+        this.repairs = this.repairs + 1;
+        this.resumeAt = this.phase;
+        this.Enter(AiPhase.Diagnose(), nowMs, "定位 " + AiPhase.Zh(this.resumeAt)
+            + " 失败的根因");
+        return true;
+    }
+
+    /// 根因修完，回到失败的那一拍重跑（不是往后跳过它）。
+    int ResumeAfterRepair(int nowMs) {
+        int back = this.resumeAt;
+        if (back < 0) { back = AiPhase.Build(); }
+        this.resumeAt = -1;
+        AiRunStep s = this.At(back);
+        s.retries = s.retries + 1;
+        this.Enter(back, nowMs, s.title);
+        return back;
+    }
+
+    /// 直接跳到某一拍。中间没跑过的拍被标成「跳过」并写下理由，而不是悄悄留在
+    /// pending 假装还会做 —— 交付证据里少验了哪一层必须看得见。
+    void GotoPhase(int phase, int nowMs, string title, string skipWhy) {
+        if (phase < 0 || phase >= AiPhase.Count()) { return; }
+        if (phase <= this.phase) {
+            this.Enter(phase, nowMs, title);
+            return;
+        }
+        for (int p = this.phase; p < phase; p = p + 1) {
+            AiRunStep s = this.At(p);
+            if (s.status == AiRunStatus.Done()
+                || s.status == AiRunStatus.Skipped()) {
+                continue;
+            }
+            if (s.status == AiRunStatus.Running()) {
+                this.phase = p;
+                this.Pass(nowMs, "");
+            } else {
+                this.phase = p;
+                this.Skip(nowMs, skipWhy);
+            }
+        }
+        this.Enter(phase, nowMs, title);
+    }
+
+    /// 当前拍等外部输入（用户确认、缺凭据、要人决定）。不是失败，所以不重试。
+    void Block(int nowMs, string why) {
+        AiRunStep s = this.Current();
+        s.status = AiRunStatus.Blocked();
+        s.endedMs = nowMs;
+        s.error = why;
+        this.updatedMs = nowMs;
+        this.lastError = why;
+        this.status = AiRunStatus.Blocked();
+    }
+
+    /// 前进到下一拍。已在最后一拍则返回 false。
+    bool Advance(int nowMs) {
+        if (this.phase >= AiPhase.Knowledge()) { return false; }
+        this.Enter(this.phase + 1, nowMs, "");
+        return true;
+    }
+
+    // --- 记录 -----------------------------------------------------------------
+
+    void NoteCommand(string command, int exitCode) {
+        AiRunStep s = this.Current();
+        s.command = command;
+        s.exitCode = exitCode;
+    }
+
+    void NoteDiagnostic(string line) {
+        if (line == "") { return; }
+        this.Current().diagnostics.Add(line);
+    }
+
+    void NoteArtifact(string path) {
+        if (path == "") { return; }
+        this.Current().artifacts.Add(path);
+    }
+
+    /// 记一个被改动的文件（去重）——交付摘要和「改了什么」都靠它。
+    void NoteChangedFile(string path) {
+        if (path == "") { return; }
+        for (int i = 0; i < this.changedFiles.Count; i = i + 1) {
+            if (this.changedFiles[i] == path) { return; }
+        }
+        this.changedFiles.Add(path);
+    }
+
+    // --- 查询 -----------------------------------------------------------------
+
+    int DoneCount() {
+        int n = 0;
+        for (int i = 0; i < this.steps.Count; i = i + 1) {
+            int st = this.steps[i].status;
+            if (st == AiRunStatus.Done() || st == AiRunStatus.Skipped()) {
+                n = n + 1;
+            }
+        }
+        return n;
+    }
+
+    int Progress() {
+        return this.DoneCount() * 100 / AiPhase.Count();
+    }
+
+    bool Finished() { return this.status == AiRunStatus.Done(); }
+
+    /// 面板标题栏那一行：进度、当前拍、状态、重试/回环次数。
+    string Summary() {
+        string head = this.taskId + " " + Convert.ToString(this.DoneCount())
+            + "/" + Convert.ToString(AiPhase.Count()) + " "
+            + AiPhase.Zh(this.phase) + " " + AiRunStatus.Id(this.Current().status);
+        if (this.fault != AiFault.None()) {
+            head = head + " [" + AiFault.Zh(this.fault) + "]";
+        }
+        if (this.repairs > 0) {
+            head = head + " 回环x" + Convert.ToString(this.repairs);
+        }
+        return head;
+    }
+
+    /// 交付证据：每一拍的命令、退出码和产物。没有它，「已验证」只是说法。
+    List<string> Evidence() {
+        List<string> outp = new List<string>();
+        for (int i = 0; i < this.steps.Count; i = i + 1) {
+            AiRunStep s = this.steps[i];
+            if (s.status == AiRunStatus.Pending()) { continue; }
+            string line = AiRunStatus.Mark(s.status) + " " + AiPhase.Zh(i);
+            if (s.command != "") {
+                line = line + ": " + s.command + " -> "
+                    + Convert.ToString(s.exitCode);
+            } else if (s.title != "") {
+                line = line + ": " + s.title;
+            }
+            if (s.retries > 0) {
+                line = line + " (重试" + Convert.ToString(s.retries) + ")";
+            }
+            if (s.error != "") { line = line + " — " + s.error; }
+            for (int a = 0; a < s.artifacts.Count; a = a + 1) {
+                line = line + " [" + s.artifacts[a] + "]";
+            }
+            outp.Add(line);
+        }
+        return outp;
+    }
+
+    // --- 检查点 ---------------------------------------------------------------
+
+    /// 序列化为检查点 JSON。IDE 崩了、被关了、任务被停了，都能从这里续跑，而
+    /// 不是从需求理解重新开始。
+    string ToJson() {
+        AiRunDoc d = new AiRunDoc();
+        d.id = this.taskId;
+        d.ti = this.title;
+        d.cr = this.createdMs;
+        d.up = this.updatedMs;
+        d.ph = AiPhase.Id(this.phase);
+        d.st = this.status;
+        d.ra = this.resumeAt;
+        d.rp = this.repairs;
+        d.fl = this.fault;
+        d.er = this.lastError;
+        d.cf = new List<string>();
+        for (int c = 0; c < this.changedFiles.Count; c = c + 1) {
+            d.cf.Add(this.changedFiles[c]);
+        }
+        d.sp = new List<AiRunStepDoc>();
+        for (int i = 0; i < this.steps.Count; i = i + 1) {
+            AiRunStep s = this.steps[i];
+            AiRunStepDoc sd = new AiRunStepDoc();
+            sd.ph = AiPhase.Id(s.phase);
+            sd.st = s.status;
+            sd.ti = s.title;
+            sd.cm = s.command;
+            sd.ec = s.exitCode;
+            sd.s0 = s.startedMs;
+            sd.s1 = s.endedMs;
+            sd.rt = s.retries;
+            sd.fl = s.fault;
+            sd.er = s.error;
+            sd.dg = new List<string>();
+            for (int g = 0; g < s.diagnostics.Count; g = g + 1) {
+                sd.dg.Add(s.diagnostics[g]);
+            }
+            sd.ar = new List<string>();
+            for (int t = 0; t < s.artifacts.Count; t = t + 1) {
+                sd.ar.Add(s.artifacts[t]);
+            }
+            d.sp.Add(sd);
+        }
+        return Json.Serialize<AiRunDoc>(d);
+    }
+
+    /// 读回检查点。空串或坏 JSON 得到 null（调用方开新任务），不抛。
+    static AiRun FromJson(string packed) {
+        if (packed == "") { return null; }
+        AiRunDoc d = null;
+        try {
+            d = Json.Deserialize<AiRunDoc>(packed);
+        } catch (Exception ex) {
+            return null;
+        }
+        if (d == null || d.id == null || d.id == "") { return null; }
+        AiRun r = AiRun.Begin(d.id, d.ti, d.cr);
+        r.updatedMs = d.up;
+        int ph = AiPhase.FromId(d.ph);
+        if (ph < 0) { ph = AiPhase.Understand(); }
+        r.phase = ph;
+        r.status = d.st;
+        r.resumeAt = d.ra;
+        r.repairs = d.rp;
+        r.fault = d.fl;
+        r.lastError = d.er;
+        if (d.cf != null) {
+            for (int c = 0; c < d.cf.Count; c = c + 1) {
+                r.changedFiles.Add(d.cf[c]);
+            }
+        }
+        if (d.sp == null) { return r; }
+        for (int i = 0; i < d.sp.Count; i = i + 1) {
+            AiRunStepDoc sd = d.sp[i];
+            int sp = AiPhase.FromId(sd.ph);
+            if (sp < 0) { continue; }
+            AiRunStep s = r.At(sp);
+            s.status = sd.st;
+            s.title = sd.ti;
+            s.command = sd.cm;
+            s.exitCode = sd.ec;
+            s.startedMs = sd.s0;
+            s.endedMs = sd.s1;
+            s.retries = sd.rt;
+            s.fault = sd.fl;
+            s.error = sd.er;
+            if (sd.dg != null) {
+                for (int g = 0; g < sd.dg.Count; g = g + 1) {
+                    s.diagnostics.Add(sd.dg[g]);
+                }
+            }
+            if (sd.ar != null) {
+                for (int t = 0; t < sd.ar.Count; t = t + 1) {
+                    s.artifacts.Add(sd.ar[t]);
+                }
+            }
+        }
+        return r;
+    }
+}
+
+/// 检查点里的一拍。字段名短是因为它每秒都可能被写盘。
+class AiRunStepDoc {
+    string ph;
+    int st;
+    string ti;
+    string cm;
+    int ec;
+    int s0;
+    int s1;
+    int rt;
+    int fl;
+    string er;
+    List<string> dg;
+    List<string> ar;
+}
+
+/// 一次交付的检查点文档。
+class AiRunDoc {
+    string id;
+    string ti;
+    int cr;
+    int up;
+    string ph;
+    int st;
+    int ra;
+    int rp;
+    int fl;
+    string er;
+    List<string> cf;
+    List<AiRunStepDoc> sp;
+}

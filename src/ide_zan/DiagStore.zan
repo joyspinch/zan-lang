@@ -1,0 +1,675 @@
+using System;
+using System.IO;
+using System.Json;
+
+/// 一条本地诊断事件：编译器诊断、程序崩溃、IDE 自身异常、构建失败、LSP/DAP 断连
+/// 都归一到这一个结构，「帮助与反馈」面板只读它。
+class DiagEvent {
+    /// compiler / runtime / ide / build / lsp
+    string kind;
+    /// error / warning / crash
+    string severity;
+    int ts;
+    /// 诊断码或退出码（"exit=1"），没有就空串。
+    string code;
+    string message;
+    /// 有就带（项目相对路径，绝对路径在入库时就被裁掉）。
+    string file;
+    int line;
+    int col;
+    /// 上下若干行原始输出：`code generation failed` 这种没细节的错误，只有连着
+    /// 上文诊断才有意义。
+    List<string> context;
+    /// 同一个 key 重复了多少次（去重计数，不是刷屏）。
+    int count;
+
+    static DiagEvent Create(string kind, string severity, string message,
+                            int ts) {
+        DiagEvent e = new DiagEvent();
+        e.kind = kind;
+        e.severity = severity;
+        e.ts = ts;
+        e.code = "";
+        e.message = message;
+        e.file = "";
+        e.line = 0;
+        e.col = 0;
+        e.context = new List<string>();
+        e.count = 1;
+        return e;
+    }
+
+    /// 去重键：同一处、同一条消息只留一条带计数。
+    string Key() {
+        return this.kind + "|" + this.code + "|" + this.file + "|"
+            + Convert.ToString(this.line) + "|" + this.message;
+    }
+
+    /// 列表里显示的一行。
+    string Line() {
+        string s = "[" + this.kind + "] ";
+        if (this.file != "") {
+            s = s + this.file;
+            if (this.line > 0) { s = s + ":" + Convert.ToString(this.line); }
+            s = s + " ";
+        }
+        if (this.code != "") { s = s + this.code + " "; }
+        s = s + this.message;
+        if (this.count > 1) { s = s + " (x" + Convert.ToString(this.count) + ")"; }
+        return s;
+    }
+}
+
+/// 本地诊断聚合：收集、去重、落盘、脱敏、导出。
+///
+/// 三条硬规矩，来自「帮助与反馈」的隐私红线：
+///
+///  1. **默认什么都不外发**。这里只写本地文件、只生成可粘贴的文本；上传是面板里
+///     用户主动按下、并看过 payload 之后的事。
+///  2. **入库即脱敏**。绝对路径、密钥形态、连接串、邮箱在 `Add` 里就被裁掉，
+///     而不是等到上传前才补救 —— 那时它早就落在磁盘上了。
+///  3. **记录能力自己出问题不能拖垮 IDE**。落盘失败只丢这一条记录（内存里还
+///     在），绝不向上抛。
+class DiagStore {
+    /// 内存与磁盘各保留多少条（滚动上限）。
+    static int Cap() { return 500; }
+
+    static List<DiagEvent> events;
+    /// 事件文件所在目录（IDE 传入 `<cache>/diagnostics`）；空串表示只留内存。
+    static string dir = "";
+
+    static void Init() {
+        if (DiagStore.events == null) {
+            DiagStore.events = new List<DiagEvent>();
+        }
+    }
+
+    /// 绑定目录并读回已有事件（面板一打开就有历史，而不是从这次启动算起）。
+    static void Open(string d) {
+        DiagStore.Init();
+        DiagStore.dir = d;
+        DiagStore.events.Clear();
+        if (d == "") { return; }
+        try {
+            string p = DiagStore.LogPath();
+            if (!File.Exists(p)) { return; }
+            List<string> lines = DiagStore.SplitLines(File.ReadAllText(p));
+            int from = 0;
+            if (lines.Count > DiagStore.Cap()) {
+                from = lines.Count - DiagStore.Cap();
+            }
+            for (int i = from; i < lines.Count; i = i + 1) {
+                DiagEvent e = DiagStore.Parse(lines[i]);
+                if (e == null) { continue; }
+                // 去重计数是靠「再追加一条更新后的记录」持久化的，所以读回时
+                // 同一个 key 取最大的计数，而不是变成好几条。
+                int at = DiagStore.Find(e.Key());
+                if (at >= 0) {
+                    if (e.count > DiagStore.events[at].count) {
+                        DiagStore.events[at].count = e.count;
+                    }
+                    if (e.ts > DiagStore.events[at].ts) {
+                        DiagStore.events[at].ts = e.ts;
+                    }
+                } else {
+                    DiagStore.events.Add(e);
+                }
+            }
+        } catch (Exception ex) {
+            // 读不出来就当没有历史：面板照常可用。
+            DiagStore.events.Clear();
+        }
+    }
+
+    /// 已有事件里 key 相同的那一条的下标，没有则 -1。
+    static int Find(string key) {
+        DiagStore.Init();
+        for (int i = 0; i < DiagStore.events.Count; i = i + 1) {
+            if (DiagStore.events[i].Key() == key) { return i; }
+        }
+        return 0 - 1;
+    }
+
+    static string LogPath() {
+        if (DiagStore.dir == "") { return ""; }
+        return DiagStore.dir + "/events.jsonl";
+    }
+
+    static int Count() {
+        DiagStore.Init();
+        return DiagStore.events.Count;
+    }
+
+    static List<DiagEvent> All() {
+        DiagStore.Init();
+        return DiagStore.events;
+    }
+
+    static void Clear() {
+        DiagStore.Init();
+        DiagStore.events.Clear();
+        try {
+            string p = DiagStore.LogPath();
+            if (p != "" && File.Exists(p)) { File.Delete(p); }
+        } catch (Exception ex) {
+            int ignore = 0;
+        }
+    }
+
+    /// 收一条事件。已经有一模一样的就只加计数（并把最新时间写进去），否则入库
+    /// 并追加到磁盘。返回的是它在列表里的下标。
+    static int Add(DiagEvent e) {
+        DiagStore.Init();
+        e.message = DiagStore.Redact(e.message);
+        e.file = DiagStore.Redact(e.file);
+        for (int i = 0; i < e.context.Count; i = i + 1) {
+            e.context[i] = DiagStore.Redact(e.context[i]);
+        }
+        int at = DiagStore.Find(e.Key());
+        if (at >= 0) {
+            DiagStore.events[at].count = DiagStore.events[at].count + 1;
+            DiagStore.events[at].ts = e.ts;
+            // 计数也要落盘，否则重启后「这个错误出现过 40 次」变回 1 次，
+            // 判断严重程度的依据就丢了。
+            DiagStore.Append(DiagStore.events[at]);
+            return at;
+        }
+        DiagStore.events.Add(e);
+        while (DiagStore.events.Count > DiagStore.Cap()) {
+            DiagStore.events.RemoveAt(0);
+        }
+        DiagStore.Append(e);
+        return DiagStore.events.Count - 1;
+    }
+
+    /// 追加一行 JSONL。写不进去只影响下次启动能看到多少历史，不能影响这次运行。
+    static void Append(DiagEvent e) {
+        string p = DiagStore.LogPath();
+        if (p == "") { return; }
+        try {
+            Directory.CreateDirectoryRecursive(DiagStore.dir);
+            File.AppendAllText(p, DiagStore.Pack(e) + "\n");
+        } catch (Exception ex) {
+            int ignore = 0;
+        }
+    }
+
+    // ---- 各来源的入口 --------------------------------------------------------
+
+    /// 编译器/构建输出里的诊断行：`path:line:col: error: message`（列可省）。
+    /// 认不出格式但含 error 的行也收，只是没有位置 —— 宁可少结构化，不可丢。
+    static int IngestBuildLog(List<string> lines, int ts) {
+        int added = 0;
+        if (lines == null) { return 0; }
+        for (int i = 0; i < lines.Count; i = i + 1) {
+            string raw = lines[i];
+            string low = DiagStore.Lower(raw);
+            bool isErr = DiagStore.Has(low, "error");
+            bool isWarn = DiagStore.Has(low, "warning");
+            if (!isErr && !isWarn) { continue; }
+            string sev = "warning";
+            if (isErr) { sev = "error"; }
+            DiagEvent e = DiagStore.ParseDiagLine(raw, sev, ts);
+            // 上文两行作为上下文：无细节错误只有连着它们才能读懂。
+            for (int k = i - 2; k < i; k = k + 1) {
+                if (k >= 0) { e.context.Add(lines[k]); }
+            }
+            DiagStore.Add(e);
+            added = added + 1;
+        }
+        return added;
+    }
+
+    static DiagEvent ParseDiagLine(string raw, string sev, int ts) {
+        DiagEvent e = DiagEvent.Create("compiler", sev, raw, ts);
+        // 从右往左找 `:` 分出 file:line:col，Windows 盘符里的 `:` 不会被误当分隔。
+        int c1 = DiagStore.IndexAfterDrive(raw);
+        int p1 = 0 - 1;
+        int p2 = 0 - 1;
+        for (int i = c1; i < raw.Length; i = i + 1) {
+            if (raw.Substring(i, 1) != ":") { continue; }
+            if (p1 < 0) { p1 = i; continue; }
+            p2 = i;
+            break;
+        }
+        if (p1 > 0 && p2 > p1) {
+            string f = raw.Substring(0, p1);
+            string ln = raw.Substring(p1 + 1, p2 - p1 - 1);
+            int lnum = DiagStore.ToInt(ln);
+            if (lnum > 0) {
+                e.file = f;
+                e.line = lnum;
+                string rest = raw.Substring(p2 + 1, raw.Length - p2 - 1);
+                int p3 = 0 - 1;
+                for (int i = 0; i < rest.Length; i = i + 1) {
+                    if (rest.Substring(i, 1) == ":") { p3 = i; break; }
+                }
+                if (p3 > 0) {
+                    int cnum = DiagStore.ToInt(rest.Substring(0, p3));
+                    if (cnum > 0) {
+                        e.col = cnum;
+                        rest = rest.Substring(p3 + 1, rest.Length - p3 - 1);
+                    }
+                }
+                e.message = DiagStore.TrimS(rest);
+            }
+        }
+        e.message = DiagStore.StripSeverity(e.message);
+        return e;
+    }
+
+    /// 去掉消息开头的 `error:` / `warning:` / `note:`：等级已经在 severity 里，
+    /// 留着只会让同一条错误在列表里读起来像重复了两遍。
+    static string StripSeverity(string msg) {
+        string low = DiagStore.Lower(msg);
+        List<string> tags = new List<string>();
+        tags.Add("error:");
+        tags.Add("warning:");
+        tags.Add("note:");
+        for (int i = 0; i < tags.Count; i = i + 1) {
+            string t = tags[i];
+            if (low.Length >= t.Length && low.Substring(0, t.Length) == t) {
+                return DiagStore.TrimS(
+                    msg.Substring(t.Length, msg.Length - t.Length));
+            }
+        }
+        return msg;
+    }
+
+    /// 界面层记下的异常（`Gui.UiErrorLog` 的内存环）。已经在那边落过盘，这里做的
+    /// 是把它并进同一个面板列表，用户不必翻两个地方。
+    static int IngestUiErrors(List<string> lines, int ts) {
+        int added = 0;
+        if (lines == null) { return 0; }
+        for (int i = 0; i < lines.Count; i = i + 1) {
+            DiagEvent e = DiagEvent.Create("ide", "error", lines[i], ts);
+            DiagStore.Add(e);
+            added = added + 1;
+        }
+        return added;
+    }
+
+    /// 程序退出码 / 崩溃。
+    static void IngestRun(string target, int exitCode, string tail, int ts) {
+        string sev = "error";
+        if (exitCode == 0) { return; }
+        // Windows 的 0xC0000005 一类被当作崩溃，而不是普通的非零退出。
+        if (exitCode < 0) { sev = "crash"; }
+        DiagEvent e = DiagEvent.Create("runtime", sev,
+            target + " exit=" + Convert.ToString(exitCode), ts);
+        e.code = "exit=" + Convert.ToString(exitCode);
+        if (tail != "") { e.context.Add(tail); }
+        DiagStore.Add(e);
+    }
+
+    // ---- 脱敏 ---------------------------------------------------------------
+
+    /// 入库前的脱敏：绝对路径只留最后两段，密钥/令牌/口令/连接串的值换成 ***，
+    /// 邮箱换成 ***@***。宁可裁多一点 —— 泄一次密钥的代价远大于少一行上下文。
+    static string Redact(string s) {
+        if (s == "") { return ""; }
+        string o = DiagStore.RedactPaths(s);
+        o = DiagStore.RedactKeyed(o, "password");
+        o = DiagStore.RedactKeyed(o, "passwd");
+        o = DiagStore.RedactKeyed(o, "pwd");
+        o = DiagStore.RedactKeyed(o, "token");
+        o = DiagStore.RedactKeyed(o, "api_key");
+        o = DiagStore.RedactKeyed(o, "apikey");
+        o = DiagStore.RedactKeyed(o, "secret");
+        o = DiagStore.RedactBearer(o);
+        o = DiagStore.RedactMails(o);
+        return o;
+    }
+
+    /// `key=value` / `key: value` 里的 value 换成 ***（大小写不敏感）。
+    static string RedactKeyed(string s, string key) {
+        string low = DiagStore.Lower(s);
+        string o = "";
+        int i = 0;
+        while (i < s.Length) {
+            bool hit = false;
+            if (i + key.Length <= s.Length
+                && low.Substring(i, key.Length) == key) {
+                int j = i + key.Length;
+                while (j < s.Length && s.Substring(j, 1) == " ") { j = j + 1; }
+                if (j < s.Length && (s.Substring(j, 1) == "="
+                    || s.Substring(j, 1) == ":")) {
+                    j = j + 1;
+                    while (j < s.Length && s.Substring(j, 1) == " ") {
+                        j = j + 1;
+                    }
+                    int e = j;
+                    while (e < s.Length) {
+                        string ch = s.Substring(e, 1);
+                        if (ch == ";" || ch == " " || ch == "\"" || ch == ",") {
+                            break;
+                        }
+                        e = e + 1;
+                    }
+                    o = o + s.Substring(i, j - i) + "***";
+                    i = e;
+                    hit = true;
+                }
+            }
+            if (!hit) {
+                o = o + s.Substring(i, 1);
+                i = i + 1;
+            }
+        }
+        return o;
+    }
+
+    static string RedactBearer(string s) {
+        string low = DiagStore.Lower(s);
+        string tag = "bearer ";
+        string o = "";
+        int i = 0;
+        while (i < s.Length) {
+            if (i + tag.Length <= s.Length
+                && low.Substring(i, tag.Length) == tag) {
+                int e = i + tag.Length;
+                while (e < s.Length && s.Substring(e, 1) != " ") { e = e + 1; }
+                o = o + s.Substring(i, tag.Length) + "***";
+                i = e;
+            } else {
+                o = o + s.Substring(i, 1);
+                i = i + 1;
+            }
+        }
+        return o;
+    }
+
+    /// 邮箱整体换掉（本地部分也可能是真名）。
+    static string RedactMails(string s) {
+        string o = "";
+        int i = 0;
+        int tokenStart = 0;
+        while (i <= s.Length) {
+            bool end = i == s.Length;
+            string ch = "";
+            if (!end) { ch = s.Substring(i, 1); }
+            bool sep = end || ch == " " || ch == "," || ch == ";" || ch == "\""
+                || ch == "(" || ch == ")";
+            if (!sep) {
+                i = i + 1;
+                continue;
+            }
+            string tok = s.Substring(tokenStart, i - tokenStart);
+            if (DiagStore.LooksMail(tok)) { tok = "***@***"; }
+            o = o + tok;
+            if (!end) { o = o + ch; }
+            i = i + 1;
+            tokenStart = i;
+        }
+        return o;
+    }
+
+    static bool LooksMail(string tok) {
+        int at = 0 - 1;
+        for (int i = 0; i < tok.Length; i = i + 1) {
+            if (tok.Substring(i, 1) == "@") {
+                if (at >= 0) { return false; }
+                at = i;
+            }
+        }
+        if (at <= 0 || at == tok.Length - 1) { return false; }
+        string dom = tok.Substring(at + 1, tok.Length - at - 1);
+        return DiagStore.Has(dom, ".");
+    }
+
+    /// 绝对路径压成 `.../<父目录>/<文件名>`：定位问题够用，又不暴露用户的目录
+    /// 结构和名字。
+    static string RedactPaths(string s) {
+        string o = "";
+        int i = 0;
+        int tokenStart = 0;
+        while (i <= s.Length) {
+            bool end = i == s.Length;
+            string ch = "";
+            if (!end) { ch = s.Substring(i, 1); }
+            bool sep = end || ch == " " || ch == "\"" || ch == "," || ch == ";"
+                || ch == "(" || ch == ")";
+            if (!sep) {
+                i = i + 1;
+                continue;
+            }
+            string tok = s.Substring(tokenStart, i - tokenStart);
+            if (DiagStore.IsAbsPath(tok)) { tok = DiagStore.TailPath(tok); }
+            o = o + tok;
+            if (!end) { o = o + ch; }
+            i = i + 1;
+            tokenStart = i;
+        }
+        return o;
+    }
+
+    static bool IsAbsPath(string tok) {
+        if (tok.Length < 4) { return false; }
+        if (tok.Substring(0, 1) == "/") { return true; }
+        if (tok.Substring(1, 1) == ":"
+            && (tok.Substring(2, 1) == "\\" || tok.Substring(2, 1) == "/")) {
+            return true;
+        }
+        return false;
+    }
+
+    /// 路径末两段，前面加省略号。分隔符统一成 `/`。
+    static string TailPath(string tok) {
+        List<string> parts = new List<string>();
+        string cur = "";
+        for (int i = 0; i < tok.Length; i = i + 1) {
+            string ch = tok.Substring(i, 1);
+            if (ch == "/" || ch == "\\") {
+                if (cur != "") { parts.Add(cur); }
+                cur = "";
+            } else {
+                cur = cur + ch;
+            }
+        }
+        if (cur != "") { parts.Add(cur); }
+        if (parts.Count == 0) { return ".../"; }
+        string tail = parts[parts.Count - 1];
+        if (parts.Count >= 2) {
+            tail = parts[parts.Count - 2] + "/" + tail;
+        }
+        return ".../" + tail;
+    }
+
+    // ---- 导出 / 上报 payload ------------------------------------------------
+
+    /// 可直接粘到 issue、群里、或交给小助手分析的报告。没有服务端也能用 —— 这是
+    /// 上报默认关闭时的完整替代路径。
+    static string Report(string note, string env, int limit) {
+        DiagStore.Init();
+        string s = "# Zan IDE 诊断报告\n\n";
+        if (env != "") { s = s + "环境：" + env + "\n\n"; }
+        if (note != "") {
+            s = s + "## 用户描述\n\n" + DiagStore.Redact(note) + "\n\n";
+        }
+        s = s + "## 事件（" + Convert.ToString(DiagStore.events.Count)
+            + " 条，按时间倒序）\n\n";
+        int shown = 0;
+        for (int i = DiagStore.events.Count - 1; i >= 0; i = i - 1) {
+            if (limit > 0 && shown >= limit) { break; }
+            DiagEvent e = DiagStore.events[i];
+            s = s + "- " + e.severity + " " + e.Line() + "\n";
+            for (int k = 0; k < e.context.Count; k = k + 1) {
+                s = s + "  > " + e.context[k] + "\n";
+            }
+            shown = shown + 1;
+        }
+        if (shown == 0) { s = s + "（没有记录到错误）\n"; }
+        return s;
+    }
+
+    /// 上报用的 payload（协议见 docs/agent-kb/diagnostics-reporting.md）。
+    /// 生成它不等于发送：面板会先把它整段显示给用户看。
+    static string PayloadJson(string note, string env, bool consentLogs) {
+        DiagStore.Init();
+        DiagReportDoc d = new DiagReportDoc();
+        d.client = env;
+        d.user_note = DiagStore.Redact(note);
+        d.consent_logs = consentLogs;
+        d.events = new List<DiagEventDoc>();
+        if (consentLogs) {
+            for (int i = 0; i < DiagStore.events.Count; i = i + 1) {
+                d.events.Add(DiagStore.ToDoc(DiagStore.events[i]));
+            }
+        }
+        return Json.Serialize<DiagReportDoc>(d);
+    }
+
+    // ---- JSONL ---------------------------------------------------------------
+
+    static DiagEventDoc ToDoc(DiagEvent e) {
+        DiagEventDoc d = new DiagEventDoc();
+        d.k = e.kind;
+        d.s = e.severity;
+        d.ts = e.ts;
+        d.c = e.code;
+        d.m = e.message;
+        d.f = e.file;
+        d.l = e.line;
+        d.co = e.col;
+        d.n = e.count;
+        d.cx = new List<string>();
+        for (int i = 0; i < e.context.Count; i = i + 1) {
+            d.cx.Add(e.context[i]);
+        }
+        return d;
+    }
+
+    static string Pack(DiagEvent e) {
+        return Json.Serialize<DiagEventDoc>(DiagStore.ToDoc(e));
+    }
+
+    static DiagEvent Parse(string line) {
+        if (line == "") { return null; }
+        DiagEventDoc d = null;
+        try {
+            d = Json.Deserialize<DiagEventDoc>(line);
+        } catch (Exception ex) {
+            return null;
+        }
+        if (d == null || d.m == null) { return null; }
+        DiagEvent e = DiagEvent.Create(d.k, d.s, d.m, d.ts);
+        e.code = d.c;
+        e.file = d.f;
+        e.line = d.l;
+        e.col = d.co;
+        e.count = d.n;
+        if (e.count < 1) { e.count = 1; }
+        if (d.cx != null) {
+            for (int i = 0; i < d.cx.Count; i = i + 1) {
+                e.context.Add(d.cx[i]);
+            }
+        }
+        return e;
+    }
+
+    // ---- 小工具（不依赖 IDE，便于无窗口测试） --------------------------------
+
+    static bool Has(string hay, string needle) {
+        int n = needle.Length;
+        if (n == 0) { return true; }
+        for (int i = 0; i + n <= hay.Length; i = i + 1) {
+            if (hay.Substring(i, n) == needle) { return true; }
+        }
+        return false;
+    }
+
+    static string Lower(string s) {
+        string up = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        string lo = "abcdefghijklmnopqrstuvwxyz";
+        string o = "";
+        for (int i = 0; i < s.Length; i = i + 1) {
+            string ch = s.Substring(i, 1);
+            bool hit = false;
+            for (int k = 0; k < 26 && !hit; k = k + 1) {
+                if (up.Substring(k, 1) == ch) {
+                    o = o + lo.Substring(k, 1);
+                    hit = true;
+                }
+            }
+            if (!hit) { o = o + ch; }
+        }
+        return o;
+    }
+
+    static string TrimS(string s) {
+        int a = 0;
+        int b = s.Length;
+        while (a < b && (s.Substring(a, 1) == " " || s.Substring(a, 1) == "\t")) {
+            a = a + 1;
+        }
+        while (b > a) {
+            string ch = s.Substring(b - 1, 1);
+            if (ch != " " && ch != "\t" && ch != "\r") { break; }
+            b = b - 1;
+        }
+        return s.Substring(a, b - a);
+    }
+
+    static int ToInt(string s) {
+        if (s == "") { return 0; }
+        int v = 0;
+        for (int i = 0; i < s.Length; i = i + 1) {
+            string ch = s.Substring(i, 1);
+            int d = 0 - 1;
+            string digits = "0123456789";
+            for (int k = 0; k < 10; k = k + 1) {
+                if (digits.Substring(k, 1) == ch) { d = k; }
+            }
+            if (d < 0) { return 0; }
+            v = v * 10 + d;
+        }
+        return v;
+    }
+
+    /// 跳过 `C:` 这样的盘符，免得它的冒号被当成 file:line 的分隔符。
+    static int IndexAfterDrive(string s) {
+        if (s.Length > 2 && s.Substring(1, 1) == ":"
+            && (s.Substring(2, 1) == "\\" || s.Substring(2, 1) == "/")) {
+            return 2;
+        }
+        return 0;
+    }
+
+    static List<string> SplitLines(string s) {
+        List<string> outp = new List<string>();
+        string cur = "";
+        for (int i = 0; i < s.Length; i = i + 1) {
+            string ch = s.Substring(i, 1);
+            if (ch == "\n") {
+                outp.Add(cur);
+                cur = "";
+            } else if (ch != "\r") {
+                cur = cur + ch;
+            }
+        }
+        if (cur != "") { outp.Add(cur); }
+        return outp;
+    }
+}
+
+/// 磁盘上的一条事件（JSONL 一行）。
+class DiagEventDoc {
+    string k;
+    string s;
+    int ts;
+    string c;
+    string m;
+    string f;
+    int l;
+    int co;
+    int n;
+    List<string> cx;
+}
+
+/// 上报 payload。
+class DiagReportDoc {
+    string client;
+    string user_note;
+    bool consent_logs;
+    List<DiagEventDoc> events;
+}

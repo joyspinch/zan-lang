@@ -1,0 +1,249 @@
+using System;
+using System.IO;
+using Gui;
+using Gui.Widget;
+
+/// 「帮助与反馈」面板（客户端部分）。
+///
+/// 它做三件事，而且**只**做这三件事：
+///
+///  1. 把散在各处的错误并到一个列表里 —— 编译器诊断（错误面板的数据源）、界面层
+///     异常（`Gui.UiErrorLog` 的内存环，同时已落 `zan_ui_errors.log`）、程序的
+///     非零退出与崩溃。
+///  2. 一键复制 / 导出成一份可粘贴的报告：**没有服务端也能完整跑通**这条路径，
+///     用户自己贴到 issue 或交给小助手分析。
+///  3. 上报开关默认关闭，且按下之前先把整段 payload 显示出来给用户看。端点没配
+///     就只提供导出，绝不偷偷选一个默认服务器发出去。
+///
+/// 入库即脱敏（绝对路径、密钥、连接串、邮箱）在 `DiagStore.Redact` 里，不是在上传
+/// 前才补 —— 那时它已经写在用户磁盘上了。
+partial class ZanIDE {
+    LogState helpLog;
+    Button helpCopyBtn;
+    Button helpExportBtn;
+    Button helpClearBtn;
+    Button helpReportBtn;
+    Button helpConsentBtn;
+    TextArea helpNote;
+    /// 上报时是否带日志（默认带，但上报本身默认关）。
+    bool helpConsentLogs;
+    /// 上报端点；空串 = 未配置 = 只能导出。
+    string helpEndpoint;
+    /// 已经并进 DiagStore 的 UiErrorLog 条数与编译输出行数，避免重复吞。
+    int helpUiSeen;
+    int helpLogSeen;
+    /// 最近一次导出的文件路径（面板上显示，方便用户去找）。
+    string helpLastExport;
+    /// payload 预览是否展开。
+    bool helpPreview;
+
+    void InitHelpPanel() {
+        helpLog = new LogState();
+        helpCopyBtn = new Button { Text = ZanIDE.T("Copy", "复制"), Class = "small" };
+        helpExportBtn = new Button {
+            Text = ZanIDE.T("Export", "导出"), Class = "small" };
+        helpClearBtn = new Button {
+            Text = ZanIDE.T("Clear", "清空"), Class = "small" };
+        helpReportBtn = new Button {
+            Text = ZanIDE.T("Report", "上报"), Class = "small" };
+        helpConsentBtn = new Button {
+            Text = ZanIDE.T("Logs: on", "带日志:开"), Class = "small" };
+        helpNote = new TextArea(ZanIDE.T(
+            "What were you doing? Steps to reproduce (optional)",
+            "你在做什么？复现步骤（可选）"));
+        helpConsentLogs = true;
+        helpEndpoint = "";
+        helpUiSeen = 0;
+        helpLogSeen = 0;
+        helpLastExport = "";
+        helpPreview = false;
+        DiagStore.Open(ZanIDE.CacheDir() + "/diagnostics");
+    }
+
+    /// 报告里的环境行。不含用户名与项目绝对路径。
+    static string HelpEnv(App app) {
+        string s = "ZanIDE/" + IdeVersion.Number();
+        if (IdeVersion.Commit() != "") {
+            s = s + " (" + IdeVersion.Commit() + ")";
+        }
+        // 显示缩放写成百分比：一大类布局/字号问题只在非 100% 下出现，没它
+        // 就无法复现。
+        s = s + " scale=" + Convert.ToString(app.Scale(100)) + "%";
+        return s;
+    }
+
+    /// 把新出现的错误并进 DiagStore。每帧调用，只处理增量。
+    void HelpIngest() {
+        int now = Window.GetTickMs();
+        // 界面层异常：内存环里比上次多出来的部分。
+        List<string> ring = UiErrorLog.Recent();
+        if (ring.Count > helpUiSeen) {
+            List<string> fresh = new List<string>();
+            for (int i = helpUiSeen; i < ring.Count; i = i + 1) {
+                fresh.Add(ring[i]);
+            }
+            DiagStore.IngestUiErrors(fresh, now);
+            helpUiSeen = ring.Count;
+        } else if (ring.Count < helpUiSeen) {
+            // 环被清过：重新对齐，不要把整环再吞一遍。
+            helpUiSeen = ring.Count;
+        }
+        // 编译 / 运行输出：新增的行里挑诊断。
+        if (log.Count > helpLogSeen) {
+            List<string> fresh = new List<string>();
+            for (int i = helpLogSeen; i < log.Count; i = i + 1) {
+                fresh.Add(log[i]);
+            }
+            DiagStore.IngestBuildLog(fresh, now);
+            helpLogSeen = log.Count;
+        } else if (log.Count < helpLogSeen) {
+            helpLogSeen = log.Count;
+        }
+    }
+
+    /// 面板列表的行与配色（错误红、崩溃红、警告黄）。
+    List<string> HelpRows(App app, List<int> colors) {
+        Theme t = app.theme;
+        List<string> rows = new List<string>();
+        List<DiagEvent> all = DiagStore.All();
+        for (int i = all.Count - 1; i >= 0; i = i - 1) {
+            DiagEvent e = all[i];
+            rows.Add(e.Line());
+            int col = t.textSecondary;
+            if (e.severity == "warning") { col = t.warning; }
+            if (e.severity == "error" || e.severity == "crash") {
+                col = t.error;
+            }
+            colors.Add(col);
+            for (int k = 0; k < e.context.Count; k = k + 1) {
+                rows.Add("    " + e.context[k]);
+                colors.Add(t.textTertiary);
+            }
+        }
+        return rows;
+    }
+
+    void RenderHelpPanel(App app, Rect area) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        if (area.width <= 0 || area.height <= 0) { return; }
+        this.HelpIngest();
+        int pad = app.Scale(6);
+        int btnW = app.Scale(58);
+        int rowY = area.y + pad;
+        int bh = t.heightSmall;
+        // ---- 第一行：说明 + 动作 ----
+        string head = ZanIDE.T("Local diagnostics · nothing is uploaded",
+            "本地诊断 · 默认不外发");
+        head = head + " · " + Convert.ToString(DiagStore.Count());
+        c.DrawText(area.x + pad, rowY + app.Scale(3), head, t.textSecondary,
+            Style.Of(app, "label", "small", Style.SNormal())
+                .FontOr(t.fontSizeSmall));
+        int bx = area.x + area.width - pad - btnW;
+        int clearId = helpClearBtn.Render(app, bx, rowY, btnW);
+        bx = bx - pad - btnW;
+        int exportId = helpExportBtn.Render(app, bx, rowY, btnW);
+        bx = bx - pad - btnW;
+        int copyId = helpCopyBtn.Render(app, bx, rowY, btnW);
+        bx = bx - pad - btnW;
+        helpConsentBtn.Text = helpConsentLogs
+            ? ZanIDE.T("Logs: on", "带日志:开")
+            : ZanIDE.T("Logs: off", "带日志:关");
+        int consentId = helpConsentBtn.Render(app, bx, rowY, btnW);
+        bx = bx - pad - btnW;
+        int reportId = helpReportBtn.Render(app, bx, rowY, btnW);
+        rowY = rowY + bh + pad;
+        // ---- 第二行：用户描述 ----
+        int noteH = app.Scale(40);
+        helpNote.Render(app, area.x + pad, rowY, area.width - pad * 2, noteH);
+        rowY = rowY + noteH + pad;
+        // ---- 上报状态 / 上次导出 ----
+        string stat = "";
+        if (helpEndpoint == "") {
+            stat = ZanIDE.T("No server configured - Report exports to a file.",
+                "未配置服务端 —— 上报将改为导出到文件。");
+        } else {
+            stat = ZanIDE.T("Report shows the payload first; you send it.",
+                "上报前会先显示完整内容，由你确认发送。");
+        }
+        if (helpLastExport != "") {
+            stat = stat + "  " + ZanIDE.T("Saved: ", "已保存：") + helpLastExport;
+        }
+        c.DrawText(area.x + pad, rowY, stat, t.textTertiary,
+            Style.Of(app, "label", "small", Style.SNormal())
+                .FontOr(t.fontSizeSmall));
+        rowY = rowY + app.Scale(16);
+        // ---- 列表 ----
+        int listH = area.y + area.height - rowY - pad;
+        if (listH > app.Scale(20)) {
+            List<int> colors = new List<int>();
+            List<string> rows = this.HelpRows(app, colors);
+            if (helpPreview) {
+                rows = DiagStore.SplitLines(DiagStore.PayloadJson(
+                    helpNote.GetText(), ZanIDE.HelpEnv(app), helpConsentLogs));
+                colors = new List<int>();
+                for (int i = 0; i < rows.Count; i = i + 1) {
+                    colors.Add(t.textPrimary);
+                }
+            }
+            LogView.Render(app, area.x + pad, rowY, area.width - pad * 2, listH,
+                rows, colors, helpLog,
+                ZanIDE.T("No errors recorded.", "还没有记录到错误。"), true);
+            LogView.HandleInput(app, area.x + pad, rowY,
+                area.width - pad * 2, listH, rows, helpLog);
+        }
+        // ---- 动作 ----
+        if (Ui.Clicked(app, consentId)) {
+            helpConsentLogs = !helpConsentLogs;
+            app.RequestRedraw();
+        }
+        if (Ui.Clicked(app, copyId)) {
+            Clipboard.SetText(DiagStore.Report(helpNote.GetText(),
+                ZanIDE.HelpEnv(app), 0));
+            Layer.Msg(ZanIDE.T("Diagnostic report copied.", "诊断报告已复制。"), 2);
+            app.RequestRedraw();
+        }
+        if (Ui.Clicked(app, exportId)) {
+            this.HelpExport(app);
+            app.RequestRedraw();
+        }
+        if (Ui.Clicked(app, clearId)) {
+            DiagStore.Clear();
+            helpUiSeen = UiErrorLog.Recent().Count;
+            helpLogSeen = log.Count;
+            helpLog.Reset();
+            helpPreview = false;
+            app.RequestRedraw();
+        }
+        if (Ui.Clicked(app, reportId)) {
+            if (helpEndpoint == "") {
+                // 没有服务端时「上报」不是死按钮，也不偷偷选一个默认地址：它就是
+                // 导出，并说清楚为什么。
+                this.HelpExport(app);
+                Layer.Msg(ZanIDE.T(
+                    "No server yet - exported the report instead.",
+                    "尚无服务端 —— 已改为导出报告。"), 3);
+            } else {
+                helpPreview = !helpPreview;
+                helpLog.Reset();
+            }
+            app.RequestRedraw();
+        }
+    }
+
+    /// 导出一份 Markdown 报告到缓存目录。写盘失败要说出来，不能装作成功。
+    void HelpExport(App app) {
+        string dir = ZanIDE.CacheDir() + "/diagnostics";
+        string p = dir + "/report-" + Convert.ToString(Window.GetTickMs()) + ".md";
+        try {
+            Directory.CreateDirectoryRecursive(dir);
+            File.WriteAllText(p, DiagStore.Report(helpNote.GetText(),
+                ZanIDE.HelpEnv(app), 0));
+            helpLastExport = p;
+            Layer.Msg(ZanIDE.T("Report exported.", "报告已导出。"), 2);
+        } catch (Exception ex) {
+            helpLastExport = "";
+            Layer.Msg(ZanIDE.T("Export failed: ", "导出失败：") + ex.Message, 4);
+        }
+    }
+}

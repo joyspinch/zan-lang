@@ -1,0 +1,295 @@
+using System;
+using System.IO;
+using System.Json;
+using Gui;
+using Gui.Widget;
+
+/// 把小助手的对话循环接到十二拍状态机（`AiRun`）上。
+///
+/// 循环本身不变：模型回一个工具块，IDE 执行、把结果喂回去、再问一次。这里只在
+/// 每个真实动作发生的地方记一笔「现在是哪一拍、成了还是失败了、命令和产物是
+/// 什么」，于是三件以前做不到的事成立了：
+///
+///  * 面板顶上能显示「跑到哪了」，而不是只有一个转圈的忙碌指示；
+///  * 编译/运行失败自动走「定位根因 → 回到失败那一拍重验」的回环，重试有上限，
+///    不会闷头刷同一个错；
+///  * 检查点落盘（每个项目一份），IDE 被关掉或崩掉之后能接着上次那一拍继续，
+///    而不是从需求理解重新开始。
+partial class ZanIDE {
+    /// 当前项目正在跑的那次交付；null 表示还没开始过。
+    AiRun aiRun;
+    /// 本次 IDE 会话里的任务编号来源（检查点里带的 id 会覆盖它）。
+    int aiRunSeq;
+
+    /// 每个项目一份检查点，和 AI 会话库放在同一个缓存目录下。
+    string AiRunCheckpointPath() {
+        if (!haveProject || root == "") {
+            return ZanIDE.CacheDir() + "/ai_run.json";
+        }
+        return ZanIDE.CacheDir() + "/runs/" + ZanIDE.PathKey(root) + ".json";
+    }
+
+    /// 写检查点。写盘失败绝不能反过来打断正在跑的任务 —— 记录能力自己出问题，
+    /// 顶多是丢了续跑点。
+    void AiRunSave() {
+        if (aiRun == null) { return; }
+        try {
+            string p = this.AiRunCheckpointPath();
+            Directory.CreateDirectoryRecursive(Path.GetDirectoryName(p));
+            File.WriteAllText(p, aiRun.ToJson());
+        } catch (Exception ex) {
+            UiErrorLog.Record("ai-run-save", ex.Message);
+        }
+    }
+
+    /// 打开项目时读回检查点，让「继续」接着上次那一拍跑。读不出来就当没有。
+    void AiRunLoad() {
+        aiRun = null;
+        try {
+            string p = this.AiRunCheckpointPath();
+            if (!File.Exists(p)) { return; }
+            aiRun = AiRun.FromJson(File.ReadAllText(p));
+        } catch (Exception ex) {
+            UiErrorLog.Record("ai-run-load", ex.Message);
+            aiRun = null;
+        }
+        if (aiRun != null && aiRun.Finished()) { aiRun = null; }
+    }
+
+    /// 需求原文压成一行标题。
+    static string AiRunTitle(string prompt) {
+        string one = "";
+        for (int i = 0; i < prompt.Length; i = i + 1) {
+            string ch = prompt.Substring(i, 1);
+            if (ch == "\n" || ch == "\r") { break; }
+            one = one + ch;
+        }
+        if (one.Length > 48) { one = one.Substring(0, 48) + "..."; }
+        return one;
+    }
+
+    /// 用户发来一句话。新需求开一次新的交付；停在「用户确认」那一拍的老交付则
+    /// 被这句话推进（这就是那一拍在等的东西）。
+    void AiRunUserTurn(string prompt) {
+        int now = Window.GetTickMs();
+        if (aiRun == null || aiRun.Finished()) {
+            aiRunSeq = aiRunSeq + 1;
+            aiRun = AiRun.Begin("T" + Convert.ToString(aiRunSeq),
+                ZanIDE.AiRunTitle(prompt), now);
+            aiRun.Enter(AiPhase.Understand(), now, ZanIDE.AiRunTitle(prompt));
+        } else if (aiRun.NextAction() == AiNext.AskUser()) {
+            if (aiRun.phase == AiPhase.Confirm()) {
+                aiRun.Pass(now, ZanIDE.T("confirmed by user", "已获用户确认"));
+            } else {
+                // 用户回答了一个被卡住的拍：重开这一拍，让它带着新信息再跑。
+                aiRun.Enter(aiRun.phase, now, "");
+            }
+        }
+        this.AiRunSave();
+    }
+
+    /// 一次工具调用落到哪一拍。读工具是「事实检索」，写是「实施」，build 是
+    /// 「编译」，run / ui_check 是「运行验证」。
+    static int AiRunPhaseOfTool(string tool) {
+        if (tool == "plan") { return AiPhase.Plan(); }
+        if (tool == "write_file" || tool == "edit_file") {
+            return AiPhase.Implement();
+        }
+        if (tool == "build") { return AiPhase.Build(); }
+        if (tool == "run" || tool == "ui_check" || tool == "ui_tree") {
+            return AiPhase.Verify();
+        }
+        if (tool == "read_file" || tool == "list_dir" || tool == "grep"
+            || tool == "repo_map" || tool == "diff" || tool == "run_errors") {
+            return AiPhase.Index();
+        }
+        return 0 - 1;
+    }
+
+    /// 在工具真正执行之前推进状态机。
+    void AiRunTool(string tool, string call) {
+        if (aiRun == null) { return; }
+        int phase = ZanIDE.AiRunPhaseOfTool(tool);
+        if (phase < 0) { return; }
+        int now = Window.GetTickMs();
+        if (phase == AiPhase.Index()) {
+            // 读代码可以发生在任何时候（包括修 bug 的时候），只有还没走到实施
+            // 之前才把它算作「事实检索」这一拍。
+            if (aiRun.phase < AiPhase.Index()) {
+                aiRun.GotoPhase(AiPhase.Index(), now,
+                    ZanIDE.T("reading the code", "读代码建立事实"), "");
+            } else if (aiRun.phase == AiPhase.Index()) {
+                aiRun.NoteCommand(tool, 0);
+            }
+            return;
+        }
+        if (phase == AiPhase.Plan()) {
+            aiRun.GotoPhase(AiPhase.Plan(), now,
+                ZanIDE.T("task breakdown", "任务拆解"), "");
+            aiRun.Pass(now, "");
+            // 自动执行关着时，改动前必须由用户批准 —— 那就是「用户确认」这一拍，
+            // 而且它只能由用户推进。
+            aiRun.Enter(AiPhase.Confirm(), now, "");
+            if (aiAutoExec) {
+                aiRun.Pass(now, ZanIDE.T("auto-execute on", "自动执行已开启"));
+            } else {
+                aiRun.Block(now, ZanIDE.T("waiting for your approval",
+                    "等待你批准改动"));
+            }
+            this.AiRunSave();
+            return;
+        }
+        if (phase == AiPhase.Implement()) {
+            aiRun.GotoPhase(AiPhase.Implement(), now,
+                ZanIDE.T("editing code", "改代码"), "");
+            JsonValue v = JsonValue.ParseLenient(call);
+            if (v != null) {
+                string p = v.Str("path", "");
+                if (p != "") { aiRun.NoteChangedFile(p); }
+            }
+            this.AiRunSave();
+            return;
+        }
+        // 编译 / 运行验证：结果由构建完成的轮询回填（AiRunBuildDone）。
+        aiRun.GotoPhase(phase, now, tool,
+            ZanIDE.T("not run for this change", "本次改动未执行此步"));
+        aiRun.NoteCommand(tool, 0);
+        this.AiRunSave();
+    }
+
+    /// 构建（以及构建后运行 / UI 自检）的结果回填到当前拍，失败则按故障分类决定
+    /// 重试、走根因回环，还是交给用户。
+    void AiRunBuildDone(bool ok, string tool, List<string> outLines) {
+        if (aiRun == null) { return; }
+        int now = Window.GetTickMs();
+        if (ok) {
+            aiRun.NoteCommand(tool, 0);
+            if (buildExe != "") { aiRun.NoteArtifact(buildExe); }
+            aiRun.Pass(now, tool + ZanIDE.T(" ok", " 通过"));
+        } else {
+            aiRun.FailCommand(now, tool, 1, ZanIDE.AiRunFirstError(outLines));
+            for (int i = 0; i < outLines.Count && i < 8; i = i + 1) {
+                aiRun.NoteDiagnostic(outLines[i]);
+            }
+            this.AiRunApplyPolicy(now);
+        }
+        this.AiRunSave();
+    }
+
+    /// 编译输出里第一条真正的错误行（没有就退回最后一行，绝不返回空串装作
+    /// 「不知道为什么失败」）。
+    static string AiRunFirstError(List<string> lines) {
+        if (lines == null || lines.Count == 0) { return "build failed"; }
+        for (int i = 0; i < lines.Count; i = i + 1) {
+            if (AiFault.Has(AiFault.Lower(lines[i]), "error")) {
+                return lines[i];
+            }
+        }
+        return lines[lines.Count - 1];
+    }
+
+    /// 失败之后照状态机的决策走：可重试的重试，代码问题进根因回环，其余交给
+    /// 用户 —— 决策只有 `AiRun.NextAction()` 一处，面板不另写一套。
+    void AiRunApplyPolicy(int now) {
+        if (aiRun == null) { return; }
+        int act = aiRun.NextAction();
+        if (act == AiNext.Retry()) {
+            aiRun.Retry(now);
+        } else if (act == AiNext.Diagnose()) {
+            aiRun.EnterRepair(now);
+        }
+    }
+
+    /// 一轮回答结束（没有工具要跑了）。模型在问用户就停在这一拍等人，否则算这
+    /// 一次交付的摘要已经给出；知识沉淀没做就仍然留在未完成，不假装 12/12。
+    void AiRunTurnEnd(string said) {
+        if (aiRun == null) { return; }
+        int now = Window.GetTickMs();
+        if (AiAgent.AsksUser(said)) {
+            aiRun.Block(now, ZanIDE.T("the assistant is asking you something",
+                "小助手在等你回答"));
+            this.AiRunSave();
+            return;
+        }
+        if (aiRun.phase == AiPhase.Diagnose()) {
+            // 根因这一拍说完就该回去重验，而不是就此结束。
+            aiRun.Pass(now, "");
+            aiRun.ResumeAfterRepair(now);
+            this.AiRunSave();
+            return;
+        }
+        if (aiRun.phase < AiPhase.Deliver() && !this.AiPlanUnfinished()) {
+            aiRun.GotoPhase(AiPhase.Deliver(), now,
+                ZanIDE.T("delivery summary", "交付摘要"),
+                ZanIDE.T("not run for this change", "本次改动未执行此步"));
+            aiRun.Pass(now, "");
+        }
+        this.AiRunSave();
+    }
+
+    /// 用户按了「停止」：这一次交付被中断，状态留在原地等下一句话，绝不悄悄标成
+    /// 完成。
+    void AiRunStopped() {
+        if (aiRun == null) { return; }
+        aiRun.Block(Window.GetTickMs(),
+            ZanIDE.T("stopped by you", "被你中断"));
+        this.AiRunSave();
+    }
+
+    // ---- 面板上那一行 --------------------------------------------------------
+
+    /// 状态条的高度（没有任务时为 0）。
+    int AiRunStripH(App app) {
+        if (aiRun == null) { return 0; }
+        return app.Scale(22);
+    }
+
+    /// 画「跑到哪了」那一行：十二个小方块 + 当前拍 + 故障分类 + 下一步动作。
+    /// 用的是主题色和 `app.Scale()`，任何显示比例下都按逻辑像素放大。
+    int AiRenderRunStrip(App app, Rect area) {
+        int h = this.AiRunStripH(app);
+        if (h == 0) { return 0; }
+        Theme t = app.theme;
+        Canvas c = app.canvas;
+        int pad = app.Scale(6);
+        int box = app.Scale(6);
+        int gap = app.Scale(2);
+        int y = area.y + (h - box) / 2;
+        int x = area.x + pad;
+        for (int i = 0; i < AiPhase.Count(); i = i + 1) {
+            int st = aiRun.At(i).status;
+            int col = t.borderPrimary;
+            if (st == AiRunStatus.Done()) { col = t.success; }
+            if (st == AiRunStatus.Running()) { col = t.primary; }
+            if (st == AiRunStatus.Failed()) { col = t.error; }
+            if (st == AiRunStatus.Blocked()) { col = t.warning; }
+            if (st == AiRunStatus.Skipped()) { col = t.textTertiary; }
+            c.FillRect(x, y, box, box, col);
+            x = x + box + gap;
+        }
+        int act = aiRun.NextAction();
+        string label = aiRun.taskId + " "
+            + ZanIDE.T(AiPhase.En(aiRun.phase), AiPhase.Zh(aiRun.phase));
+        label = label + " · " + Convert.ToString(aiRun.DoneCount()) + "/"
+            + Convert.ToString(AiPhase.Count());
+        if (aiRun.fault != AiFault.None()) {
+            label = label + " · " + AiFault.Zh(aiRun.fault);
+        }
+        if (act == AiNext.AskUser()) {
+            label = label + " · " + ZanIDE.T("waiting for you", "等你");
+        } else if (act == AiNext.Diagnose()) {
+            label = label + " · " + ZanIDE.T("root-causing", "定位根因");
+        } else if (act == AiNext.Retry()) {
+            label = label + " · " + ZanIDE.T("retrying", "重试");
+        } else if (act == AiNext.Finished()) {
+            label = label + " · " + ZanIDE.T("done", "完成");
+        }
+        int col2 = t.textSecondary;
+        if (aiRun.fault != AiFault.None()) { col2 = t.error; }
+        c.DrawText(x + pad, area.y + app.Scale(4), label, col2,
+            Style.Of(app, "label", "small", Style.SNormal())
+                .FontOr(app.theme.fontSizeSmall));
+        c.FillRect(area.x, area.y + h - 1, area.width, 1, t.divider);
+        return h;
+    }
+}

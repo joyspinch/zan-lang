@@ -1,0 +1,119 @@
+using System;
+
+/// 小助手任务状态机的回归测试：十二拍推进、失败分类、有限重试、根因回环回到
+/// 失败的那一拍、以及检查点的往返（重启 IDE 后能续跑）。
+class Program {
+    static void Line(string s) { Console.WriteLine(s); }
+
+    static void Main() {
+        AiRun r = AiRun.Begin("T-1", "给设计器加磁吸", 1000);
+        Line("phase=" + AiPhase.Id(r.phase) + " next="
+            + AiNext.Id(r.NextAction()) + " progress="
+            + Convert.ToString(r.Progress()));
+
+        // 需求理解 -> 事实检索 -> 方案拆解
+        r.Enter(AiPhase.Understand(), 1000, "读懂需求");
+        r.Pass(1100, "");
+        r.Advance(1100);
+        r.Pass(1200, "");
+        r.Advance(1200);
+        r.Pass(1300, "");
+
+        // 用户确认这一拍永远等人，哪怕它已经 running
+        r.Advance(1300);
+        Line("confirm next=" + AiNext.Id(r.NextAction()));
+        r.Pass(1400, "用户已确认");
+
+        // 实施 -> 编译失败：可修复，走根因回环而不是问用户
+        r.Advance(1400);
+        r.NoteChangedFile("src/ide_zan/views/Designer.zan");
+        r.NoteChangedFile("src/ide_zan/views/Designer.zan");
+        r.Pass(1500, "");
+        r.Advance(1500);
+        r.FailCommand(1600, "scripts\\build_ide.ps1", 1,
+            "Designer.zan:12: error: undeclared identifier 'snapx'");
+        Line("build fault=" + AiFault.Id(r.fault) + " status="
+            + AiRunStatus.Id(r.Current().status) + " next="
+            + AiNext.Id(r.NextAction()));
+
+        r.EnterRepair(1650);
+        Line("repair phase=" + AiPhase.Id(r.phase) + " resumeAt="
+            + AiPhase.Id(r.resumeAt) + " repairs="
+            + Convert.ToString(r.repairs));
+        r.Pass(1700, "字段名写错");
+        int back = r.ResumeAfterRepair(1700);
+        Line("resumed=" + AiPhase.Id(back) + " retries="
+            + Convert.ToString(r.Current().retries));
+
+        r.NoteCommand("scripts\\build_ide.ps1", 0);
+        r.NoteArtifact("build/ZanIDE.exe");
+        r.Pass(1800, "IDE 构建通过");
+
+        // 测试拍：网络故障是可重试的，不进回环
+        r.Advance(1800);
+        r.Fail(1900, "connection reset while fetching model list");
+        Line("net fault=" + AiFault.Id(r.fault) + " next="
+            + AiNext.Id(r.NextAction()));
+        Line("retry1=" + Convert.ToString(r.Retry(1950)));
+        r.Fail(2000, "connection reset while fetching model list");
+        Line("retry2=" + Convert.ToString(r.Retry(2050)));
+        r.Fail(2100, "connection reset while fetching model list");
+        Line("retry3=" + Convert.ToString(r.Retry(2150)) + " next="
+            + AiNext.Id(r.NextAction()));
+
+        r.NoteCommand("scripts\\test.ps1 standard", 0);
+        r.NoteDiagnostic("405 tests, 0 failed");
+        r.Pass(2200, "standard 全绿");
+
+        // 缺配置是 blocked，不是 failed：重试没有意义，必须问用户
+        r.Advance(2200);
+        r.Fail(2300, "AI provider api key not configured");
+        Line("cfg status=" + AiRunStatus.Id(r.Current().status) + " next="
+            + AiNext.Id(r.NextAction()));
+
+        // 检查点往返
+        string pack = r.ToJson();
+        AiRun back2 = AiRun.FromJson(pack);
+        Line("restored phase=" + AiPhase.Id(back2.phase) + " done="
+            + Convert.ToString(back2.DoneCount()) + " repairs="
+            + Convert.ToString(back2.repairs) + " files="
+            + Convert.ToString(back2.changedFiles.Count) + " next="
+            + AiNext.Id(back2.NextAction()));
+        AiRunStep bstep = back2.At(AiPhase.Build());
+        Line("restored build cmd=" + bstep.command + " art="
+            + Convert.ToString(bstep.artifacts.Count) + " retries="
+            + Convert.ToString(bstep.retries));
+        Line("bad-json=" + Convert.ToString(AiRun.FromJson("{oops") == null)
+            + " empty=" + Convert.ToString(AiRun.FromJson("") == null));
+
+        // 用户补上凭据后继续，跳过 UI 验证并走完剩下的拍
+        back2.Enter(AiPhase.Verify(), 2400, "");
+        back2.Skip(2450, "纯逻辑改动，无 UI 变更");
+        back2.Enter(AiPhase.Regress(), 2500, "");
+        back2.Pass(2550, "新增回归测试通过");
+        back2.Enter(AiPhase.Deliver(), 2600, "");
+        back2.Pass(2650, "");
+        back2.Enter(AiPhase.Knowledge(), 2700, "");
+        back2.Pass(2750, "");
+        Line("finished=" + Convert.ToString(back2.Finished()) + " next="
+            + AiNext.Id(back2.NextAction()) + " progress="
+            + Convert.ToString(back2.Progress()));
+
+        // GotoPhase 跳过中间的拍要留下痕迹，Block 不能被当成可重试的失败
+        AiRun r2 = AiRun.Begin("T-2", "只改文档", 3000);
+        r2.Enter(AiPhase.Understand(), 3000, "");
+        r2.GotoPhase(AiPhase.Deliver(), 3100, "写交付摘要", "文档改动，无需此步");
+        Line("goto phase=" + AiPhase.Id(r2.phase) + " done="
+            + Convert.ToString(r2.DoneCount()) + " test="
+            + AiRunStatus.Id(r2.At(AiPhase.Test()).status) + " why="
+            + r2.At(AiPhase.Test()).error);
+        r2.Block(3200, "等你确认要不要一起改 README");
+        Line("blocked next=" + AiNext.Id(r2.NextAction()) + " retry="
+            + Convert.ToString(r2.Retry(3250)));
+
+        List<string> ev = back2.Evidence();
+        Line("evidence=" + Convert.ToString(ev.Count));
+        for (int i = 0; i < ev.Count; i = i + 1) { Line("  " + ev[i]); }
+        Line(back2.Summary());
+    }
+}

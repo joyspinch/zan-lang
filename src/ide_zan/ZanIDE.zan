@@ -378,6 +378,9 @@ partial class ZanIDE {
     void LoadAiSessions() {
         aiSessions.Clear();
         aiSessDbPath = this.AiSessionsDbPath();
+        // 同一时机读回这个项目的交付检查点，「继续」才能接上上次那一拍，而不是
+        // 从需求理解重来。
+        this.AiRunLoad();
         // A project opening for the first time since chats became per-project
         // inherits the install-wide list, then owns its copy: the shared file is
         // renamed so the next project starts clean instead of a second copy.
@@ -909,6 +912,11 @@ partial class ZanIDE {
         dock.SetIcon("errors", "warning");
         dock.SetTip("errors", ZanIDE.T("Compiler errors and warnings; click one to jump to it.",
             "编译错误与警告，点击可跳转。"));
+        dock.SetTitle("help", ZanIDE.T("Help & Feedback", "帮助与反馈"));
+        dock.SetIcon("help", "bug");
+        dock.SetTip("help", ZanIDE.T(
+            "Locally collected IDE / compiler / runtime errors; copy or export a report.",
+            "本地聚合的 IDE / 编译器 / 运行时错误，可复制或导出报告。"));
     }
 
     /// The stable action id behind ribbon position `pos` (see BuildRibbonGroups).
@@ -1481,6 +1489,7 @@ partial class ZanIDE {
         InitDesignerState();
         InitPanelsAndDock(cfg);
         InitGitPanel();
+        InitHelpPanel();
         InitAiState();
         InitRunState(cfg);
         InitSidebarState();
@@ -2770,6 +2779,10 @@ partial class ZanIDE {
                 // ---- Errors panel: the diagnostics of the last build. Its own
                 // dock panel, so it stays readable next to (or instead of) the
                 // console, and its tab carries the error count.
+                // 「帮助与反馈」：本地聚合的错误 + 复制/导出。它和错误面板并列
+                // 在底部，但收的是全部来源（含界面层异常与程序崩溃），不只是
+                // 这一次编译的诊断。
+                this.RenderHelpPanel(app, dock.ContentParked("help"));
                 Rect errRect = dock.ContentParked("errors");
                 List<DiagnosticRecord> errors = new List<DiagnosticRecord>();
                 ZanIDE.ParseErrorList(log, errors);
@@ -3571,6 +3584,7 @@ partial class ZanIDE {
                             rp.x + rPad * 2 + rInW, aiBtnY, rBtnW);
                         if (Ui.Clicked(app, stopId)) {
                             ZanIDE.AiCancelRequest();
+                            this.AiRunStopped();
                             aiBusy.Set(0);
                             aiAutoCont = AiAgent.MaxContinues();
                             aiRetry = AiAgent.MaxRetries();
@@ -3637,6 +3651,9 @@ partial class ZanIDE {
                             AiChatMsg umsg = AiChatMsg.Create("user", q);
                             umsg.to = tgt;
                             aiMsgs.Add(umsg);
+                            // 这句话推进十二拍状态机：新需求开一次交付，停在
+                            // 「用户确认」那一拍的老交付被它放行。
+                            this.AiRunUserTurn(q);
                             // A fresh question restarts every automatic loop,
                             // including the handoff chain's budget.
                             aiRetry = 0;
@@ -4048,6 +4065,13 @@ partial class ZanIDE {
                         if (aiBuildForAi) {
                             aiBuildForAi = false;
                             bool aiOk = File.Exists(buildExe);
+                            // 编译/运行的真实结果回填到当前那一拍：失败按故障
+                            // 分类决定重试、进根因回环还是交给用户，不靠循环
+                            // 自己猜。
+                            string aiPhTool = "build";
+                            if (aiUiPending) { aiPhTool = aiUiTool; }
+                            else if (buildThenRun) { aiPhTool = "run"; }
+                            this.AiRunBuildDone(aiOk, aiPhTool, bout);
                             if (aiUiPending) {
                                 // ui_check: on a good build, launch the target
                                 // under the UiDriver script and let the ui poll
@@ -4408,6 +4432,7 @@ partial class ZanIDE {
                                             "Tool limit reached for this question.",
                                             "本次提问的工具调用次数已达上限。")));
                                     }
+                                    this.AiRunTurnEnd(said);
                                     AiTeamTurnEnd(said);
                                 }
                             }
@@ -5139,6 +5164,7 @@ partial class ZanIDE {
         dock.Register("git", "", DockSide.Right(), true, false);
         dock.Register("output", "", DockSide.Bottom(), true, true);
         dock.Register("errors", "", DockSide.Bottom(), true, false);
+        dock.Register("help", "", DockSide.Bottom(), true, false);
         ZanIDE.ApplyPanelLabels(dock);
         dock.SetWeight("explorer", 40);
         dock.SetWeight("structure", 32);
@@ -5309,6 +5335,9 @@ partial class ZanIDE {
     /// compiler output back. A launch error stops the loop.
     void AiDispatchTool(string call) {
         string tool = AiAgent.ToolName(call);
+        // 工具执行前先推进状态机：读=事实检索，写=实施，build=编译,
+        // run/ui_check=运行验证。结果由构建完成的轮询回填。
+        this.AiRunTool(tool, call);
         // The whitelist is enforced where the tool actually runs. Asking a
         // member in its prompt not to touch a tool is not a boundary; refusing
         // the call is, and naming the owner turns the refusal into a handoff
@@ -5659,18 +5688,25 @@ partial class ZanIDE {
     /// session switching and context compaction (it lives in the session
     /// record, not the transcript).
     int AiPlanHeight(App app) {
-        if (aiPlan.Count == 0) { return 0; }
+        int runH = this.AiRunStripH(app);
+        if (aiPlan.Count == 0) { return runH; }
         int hdr = app.Scale(24);
-        if (aiPlanCollapsed) { return hdr; }
+        if (aiPlanCollapsed) { return runH + hdr; }
         int rows = aiPlan.Count;
         if (rows > 8) { rows = 8; }
-        return hdr + rows * app.Scale(20) + app.Scale(6);
+        return runH + hdr + rows * app.Scale(20) + app.Scale(6);
     }
 
     /// Draws the task-plan checklist into `area`: a header (progress count +
     /// collapse + Clear) and one clickable checkbox row per step. Clicking a
     /// row toggles its done state; clicking the header collapses the panel.
     void AiRenderPlan(App app, Rect area) {
+        int runH = this.AiRenderRunStrip(app, area);
+        if (runH > 0) {
+            area = new Rect(area.x, area.y + runH, area.width,
+                area.height - runH);
+        }
+        if (aiPlan.Count == 0) { return; }
         Theme t = app.theme;
         Canvas c = app.canvas;
         int pad = app.Scale(6);
