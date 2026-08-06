@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <ctype.h>
 #include <math.h>
+#include <limits.h>
 
 #include "host_oom.h"
 /* ============================ construction ============================ */
@@ -75,13 +76,27 @@ void json_obj_set(json_value *obj, const char *key, json_value *val) {
         }
     }
     if (obj->as.obj.count >= obj->as.obj.cap) {
+        /* Grow keys and vals independently. If one realloc fails we must not
+         * touch the still-valid original of the other: realloc returns NULL
+         * and leaves the old block intact, so only commit a pointer once its
+         * realloc succeeded. This avoids the dangling-pointer + leaked-val
+         * bug where freeing the failed-side buffer corrupted the surviving
+         * side and left the object half-grown. */
+        if (obj->as.obj.cap > INT_MAX / 2) { json_free(val); return; }
         int nc = obj->as.obj.cap ? obj->as.obj.cap * 2 : 8;
         char **nk = (char **)realloc(obj->as.obj.keys, sizeof(char *) * (size_t)nc);
-        json_value **nv = (json_value **)realloc(obj->as.obj.vals,
-                                                 sizeof(json_value *) * (size_t)nc);
-        if (!nk || !nv) { free(nk); free(nv); return; }
-        obj->as.obj.keys = nk;
-        obj->as.obj.vals = nv;
+        if (nk) obj->as.obj.keys = nk;
+        json_value **nv = NULL;
+        if (nk) {
+            nv = (json_value **)realloc(obj->as.obj.vals, sizeof(json_value *) * (size_t)nc);
+            if (nv) obj->as.obj.vals = nv;
+        }
+        if (!nk || !nv) {
+            /* val was never stored, so we own it and must free it to avoid a
+             * leak. The object itself stays consistent at its old capacity. */
+            json_free(val);
+            return;
+        }
         obj->as.obj.cap = nc;
     }
     obj->as.obj.keys[obj->as.obj.count] = strdup_key(key);

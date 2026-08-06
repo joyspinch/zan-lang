@@ -525,6 +525,26 @@ endif()
 add_test(NAME runtime_sync COMMAND zanrt_sync_test)
 add_dependencies(zanc zanrt_sync_test)
 
+# ---- json OOM recovery test (A1) ----
+# json.c is built with -DZAN_ALLOC_INJECT so its abort-on-OOM policy is replaced
+# by NULL-return and the Nth allocation can be forced to fail; the test then
+# verifies json_obj_set/json_free stay consistent and leak-free across a failed
+# mid-grow realloc (the dangling keys-pointer / leaked-val scenario).
+add_executable(zan_json_oom_test
+    tests/unit/json_oom_test.c
+    src/common/json.c
+)
+target_include_directories(zan_json_oom_test PRIVATE ${CMAKE_SOURCE_DIR})
+target_compile_definitions(zan_json_oom_test PRIVATE ZAN_ALLOC_INJECT)
+set_target_properties(zan_json_oom_test PROPERTIES
+    C_STANDARD 11
+    C_STANDARD_REQUIRED YES
+)
+if(NOT WIN32)
+    target_link_libraries(zan_json_oom_test PRIVATE m)
+endif()
+add_test(NAME unit_json_oom COMMAND zan_json_oom_test)
+
 # ---- Conformance suite: compile each program, run it, diff stdout vs golden ----
 if(WIN32)
   set(_exe_ext ".exe")
