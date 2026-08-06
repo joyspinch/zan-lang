@@ -1,0 +1,1020 @@
+using System;
+using Gui;
+using Gui.Widget;
+using Gui.Component.Chart;
+
+// Zan Charts — a standalone chart gallery.
+//
+// Same skeleton as gui_gallery: a scrollable, grouped navigation on the left
+// and a large live preview on the right. Every demo is one declarative
+// ChartOption rendered through ChartView — the example never draws chart
+// primitives itself, it only composes the component API (ECharts style:
+// option < series < data item).
+//
+// First argument deep-links to a demo by its English or Chinese name:
+//   charts_test.exe "Nested rings"
+
+/// One navigation entry: category key plus the bilingual demo name.
+class ChartsDemo {
+    string cat;
+    string en;
+    string zh;
+}
+
+/// One rendered navigation row: category headers and demo entries share one
+/// entity, so the list needs no sentinel demo index.
+class ChartsNavRow {
+    bool header;
+    int demoIndex;
+    string text;
+
+    static ChartsNavRow Header(string text) {
+        ChartsNavRow row = new ChartsNavRow();
+        row.header = true;
+        row.demoIndex = 0 - 1;
+        row.text = text;
+        return row;
+    }
+
+    static ChartsNavRow Entry(int demoIndex, string text) {
+        ChartsNavRow row = new ChartsNavRow();
+        row.header = false;
+        row.demoIndex = demoIndex;
+        row.text = text;
+        return row;
+    }
+}
+
+/// Virtual source for the ChartBig large-data demo: a single series read
+/// straight from a raw List<int> — no per-point ChartData objects, so a 100k
+/// point series costs one int list. With ring > 0 the reads wrap around an
+/// ever-advancing offset, so the rolling demo scrolls the window with zero
+/// data copying: Roll() just bumps the offset.
+class ChartsWaveSource : ChartSource {
+    List<int> data;
+    string sname;
+    int scolor;
+    int ring;      // visible window length (0 = show the whole series)
+    int off;       // ring offset, advanced by Roll()
+
+    static ChartsWaveSource Of(List<int> data, string name, int color, int ring) {
+        ChartsWaveSource s = new ChartsWaveSource();
+        s.data = data;
+        s.sname = name;
+        s.scolor = color;
+        s.ring = ring;
+        s.off = 0;
+        return s;
+    }
+
+    override int SeriesCount() { return 1; }
+    override string SeriesName(int s) { return this.sname; }
+    override int SeriesColor(int s) { return this.scolor; }
+    override int PointCount(int s) {
+        if (this.ring > 0) { return this.ring; }
+        return this.data.Count;
+    }
+    override int ValueAt(int s, int i) {
+        int n = this.data.Count;
+        if (n < 1) { return 0; }
+        if (this.ring > 0) { return this.data[(i + this.off) % n]; }
+        if (i < 0 || i >= n) { return 0; }
+        return this.data[i];
+    }
+
+    void Roll() { this.off = this.off + 1; }
+}
+
+class Charts {
+    static App app;
+    static SignalInt lang;
+    static SignalInt selected;
+    static ScrollView navView;
+    static int lastMotionMs;
+    static List<ChartsDemo> demos;
+
+    // Static heavy datasets, built once and reused across frames.
+    static ChartOption heat;
+    static int heatSlot;
+    static ChartState bigStaticState;
+    static ChartsWaveSource bigStaticSrc;
+    static ChartState bigRingState;
+    static ChartsWaveSource bigRingSrc;
+
+    static void Main() {
+        App app = App.CreateDark("Zan Charts", 1160, 760);
+        Charts.app = app;
+        Charts.lang = new SignalInt(0);
+        Charts.selected = new SignalInt(0);
+        Charts.navView = new ScrollView();
+        Charts.BuildCatalog();
+
+        // Deep-link: first argument selects a demo by en/zh name or category.
+        if (Environment.ArgCount() > 0) {
+            string want = Environment.ArgAt(0);
+            for (int i = 0; i < Charts.demos.Count; i = i + 1) {
+                ChartsDemo d = Charts.demos[i];
+                if (want == d.en || want == d.zh || want == d.cat) {
+                    Charts.selected.Set(i);
+                    break;
+                }
+            }
+        }
+
+        app.Show();
+        // Same drawing code the loop below runs, registered so the framework
+        // can paint a frame from inside the window procedure (the system modal
+        // resize loop never returns to this loop while an edge is dragged).
+        app.SetFrameBody(() => {
+            WidgetId.ResetFrame();
+            Charts.Render(app);
+            app.RenderChrome("Zan Charts");
+        });
+        // Freeze the id baseline after all retained ids exist, so the
+        // per-frame ResetFrame() below never reissues one of them.
+        WidgetId.Mark();
+
+        while (app.isRunning) {
+            // Poll while a redraw is pending (capped at ~60fps); idle-wait to
+            // the earliest animation deadline when one is armed; otherwise
+            // block on the next OS event.
+            int r;
+            if (app.needsRedraw) {
+                int since = Window.GetTickMs() - app.lastPresentMs;
+                if (app.lastPresentMs > 0 && since < 16) {
+                    Window.SleepMs(16 - since);
+                }
+                r = app.window.PollEvent();
+            } else if (app.animNextMs >= 0 || app.fxNextMs >= 0) {
+                r = 1;
+                bool waiting = true;
+                while (waiting) {
+                    int now = Window.GetTickMs();
+                    int deadline = app.animNextMs;
+                    if (deadline < 0
+                        || (app.fxNextMs >= 0 && app.fxNextMs < deadline)) {
+                        deadline = app.fxNextMs;
+                    }
+                    if (deadline < 0) { waiting = false; }
+                    else if (now >= deadline) {
+                        bool fxOnly = app.animNextMs < 0 || now < app.animNextMs;
+                        if (!(fxOnly && app.FxPresent())) {
+                            app.RequestRedraw();
+                            waiting = false;
+                        }
+                    } else {
+                        // Single kernel wait until input or the deadline.
+                        r = app.window.WaitEventTimeout(deadline - now);
+                        if (r != 1) { waiting = false; }
+                    }
+                }
+            } else {
+                r = app.window.WaitEvent();
+            }
+            if (r < 0) { break; }
+            app.DrainPosts();
+
+            nint evh = Window.EventHwnd();
+            int kind = app.window.EventKind();
+            if (kind == 8) { break; }
+
+            // Chart tooltips follow the pointer, so input events paint; pure
+            // pointer motion is throttled to ~30fps so hovering a busy chart
+            // can't peg the CPU.
+            bool inputEv = kind == 2 || kind == 3 || kind == 13
+                || kind == 4 || kind == 6;
+            bool doFrame = true;
+            if (!app.needsRedraw && !inputEv) {
+                if (kind != 1) {
+                    doFrame = false;
+                } else {
+                    int nowMotion = Window.GetTickMs();
+                    if (nowMotion - Charts.lastMotionMs < 33) {
+                        doFrame = false;
+                    } else {
+                        Charts.lastMotionMs = nowMotion;
+                    }
+                }
+            }
+            app.ApplyEvent(evh);
+            if (doFrame) {
+                app.BeginFrame();
+                WidgetId.ResetFrame();
+                Charts.Render(app);
+                app.RenderChrome("Zan Charts");
+                app.PresentFrame();
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Catalog
+    // ------------------------------------------------------------------
+
+    static void Add(string cat, string en, string zh) {
+        ChartsDemo d = new ChartsDemo();
+        d.cat = cat;
+        d.en = en;
+        d.zh = zh;
+        Charts.demos.Add(d);
+    }
+
+    static void BuildCatalog() {
+        Charts.demos = new List<ChartsDemo>();
+        Charts.Add("line", "Basic line", "基础折线图");
+        Charts.Add("line", "Smooth + peaks", "平滑折线与峰值");
+        Charts.Add("line", "Stacked area", "堆叠面积图");
+        Charts.Add("line", "Step line", "阶梯折线");
+        Charts.Add("bar", "Grouped bars", "分组柱状图");
+        Charts.Add("bar", "Stacked bars", "堆叠柱状图");
+        Charts.Add("bar", "Horizontal bars", "水平柱状图");
+        Charts.Add("bar", "Waterfall", "瀑布图");
+        Charts.Add("pie", "Pie + labels", "饼图与标签");
+        Charts.Add("pie", "Donut", "环形图");
+        Charts.Add("pie", "Rose", "玫瑰图");
+        Charts.Add("pie", "Nested rings", "嵌套环饼图");
+        Charts.Add("radar", "Radar", "雷达图");
+        Charts.Add("scatter", "Scatter", "散点图");
+        Charts.Add("scatter", "Bubble", "气泡图");
+        Charts.Add("finance", "K-line + zoom", "K 线与缩放");
+        Charts.Add("gauge", "Gauge + rings", "仪表盘与圆环");
+        Charts.Add("funnel", "Funnel & pyramid", "漏斗与金字塔");
+        Charts.Add("hier", "Treemap", "矩形树图");
+        Charts.Add("hier", "Sunburst", "旭日图");
+        Charts.Add("hier", "Tree", "树图");
+        Charts.Add("graph", "Sankey", "桑基图");
+        Charts.Add("graph", "Chord", "和弦图");
+        Charts.Add("graph", "Force graph", "力导向图");
+        Charts.Add("graph", "Event river", "事件河流");
+        Charts.Add("graph", "Venn", "韦恩图");
+        Charts.Add("more", "Word cloud", "词云");
+        Charts.Add("more", "Heatmap", "热力图");
+        Charts.Add("more", "Box & error", "箱线与误差");
+        Charts.Add("more", "Big data", "大数据");
+    }
+
+    static string T(string en, string zh) {
+        if (Charts.lang.Get() == 1) { return zh; }
+        return en;
+    }
+
+    static string NameOf(ChartsDemo d) { return Charts.T(d.en, d.zh); }
+
+    static string CatLabel(string cat) {
+        if (cat == "line") { return Charts.T("Line", "折线"); }
+        if (cat == "bar") { return Charts.T("Bar", "柱状"); }
+        if (cat == "pie") { return Charts.T("Pie", "饼图"); }
+        if (cat == "radar") { return Charts.T("Radar", "雷达"); }
+        if (cat == "scatter") { return Charts.T("Scatter", "散点"); }
+        if (cat == "finance") { return Charts.T("Finance", "金融"); }
+        if (cat == "gauge") { return Charts.T("Gauge", "仪表"); }
+        if (cat == "funnel") { return Charts.T("Funnel", "漏斗"); }
+        if (cat == "hier") { return Charts.T("Hierarchy", "层级"); }
+        if (cat == "graph") { return Charts.T("Relations", "关系"); }
+        return Charts.T("More", "更多");
+    }
+
+    /// Stable per-demo interaction / animation keys (legend toggles, zoom
+    /// window and the intro animation all persist on them across frames).
+    static int KeyOf(int demo, int sub) { return 700100 + demo * 16 + sub; }
+
+    // ------------------------------------------------------------------
+    // Layout
+    // ------------------------------------------------------------------
+
+    static void Render(App app) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int top = app.titlebarH;
+        int w = c.Width();
+        int h = c.Height();
+        app.RenderBackground(0, top, w, h - top, 0);
+
+        int sw = app.Scale(212);
+        Rect area = new Rect(0, top, w, h - top);
+        Charts.RenderNav(app, c, t, area, sw);
+        Charts.RenderPreview(app, c, t, area, sw);
+    }
+
+    /// Left navigation: category headers interleaved with clickable demo
+    /// rows, wheel-scrollable, with the active row highlighted.
+    static void RenderNav(App app, Canvas c, Theme t, Rect area, int sw) {
+        c.FillRect(area.x, area.y, sw, area.height, t.bgSecondary);
+        c.FillRect(area.x + sw - 1, area.y, 1, area.height, t.divider);
+
+        int pad = app.Scale(14);
+        c.DrawText(area.x + pad, area.y + app.Scale(20),
+            "CHARTS", t.textTertiary, t.fontSizeSmall);
+
+        // EN / 中 language toggle, right-aligned in the header row.
+        int lgW = app.Scale(34);
+        int lgH = app.Scale(20);
+        int lgY = area.y + app.Scale(15);
+        int enX = area.x + sw - pad - lgW * 2 - app.Scale(2);
+        int zhX = area.x + sw - pad - lgW;
+        int curLang = Charts.lang.Get();
+        Charts.RenderLangChip(app, c, t, enX, lgY, lgW, lgH, "EN", curLang == 0);
+        Charts.RenderLangChip(app, c, t, zhX, lgY, lgW, lgH, "中", curLang == 1);
+        if (app.window.EventKind() == 3) {
+            if (app.mouseX >= enX && app.mouseX < enX + lgW
+                    && app.mouseY >= lgY && app.mouseY < lgY + lgH) {
+                Charts.lang.Set(0); app.RequestRedraw();
+            } else if (app.mouseX >= zhX && app.mouseX < zhX + lgW
+                    && app.mouseY >= lgY && app.mouseY < lgY + lgH) {
+                Charts.lang.Set(1); app.RequestRedraw();
+            }
+        }
+
+        List<ChartsNavRow> rows = new List<ChartsNavRow>();
+        string lastCat = "";
+        for (int i = 0; i < Charts.demos.Count; i = i + 1) {
+            ChartsDemo d = Charts.demos[i];
+            if (d.cat != lastCat) {
+                rows.Add(ChartsNavRow.Header(Charts.CatLabel(d.cat)));
+                lastCat = d.cat;
+            }
+            rows.Add(ChartsNavRow.Entry(i, Charts.NameOf(d)));
+        }
+
+        int listTop = area.y + app.Scale(52);
+        int listBottom = area.y + area.height - app.Scale(8);
+        int rowH = app.Scale(26);
+        int viewH = listBottom - listTop;
+        int contentH = rows.Count * rowH;
+
+        // The ScrollView owns wheel handling, clipping and the scrollbar; the
+        // list draws every row at its natural position minus the returned
+        // offset and lets the container clip whatever falls outside.
+        Rect view = new Rect(area.x, listTop, sw, viewH);
+        int dy = Charts.navView.Begin(app, view, contentH);
+
+        int sel = Charts.selected.Get();
+        bool click = app.window.EventKind() == 3;
+        int sx = area.x + pad;
+        int swid = sw - pad * 2;
+        for (int idx = 0; idx < rows.Count; idx = idx + 1) {
+            int ry = listTop + idx * rowH - dy;
+            if (ry + rowH > listTop && ry < listBottom) {
+                ChartsNavRow row = rows[idx];
+                if (row.header) {
+                    c.DrawText(sx, ry + app.Scale(8), row.text,
+                        t.textTertiary, t.fontSizeSmall);
+                } else {
+                    bool selRow = row.demoIndex == sel;
+                    bool hot = !app.PointerCaptured()
+                        && app.mouseX >= area.x && app.mouseX < area.x + sw
+                        && app.mouseY >= listTop && app.mouseY < listBottom
+                        && app.mouseY >= ry && app.mouseY < ry + rowH;
+                    if (selRow) {
+                        c.FillRoundRect(sx - app.Scale(4), ry,
+                            swid + app.Scale(8), rowH - app.Scale(2),
+                            app.Scale(4), t.primary);
+                    } else if (hot) {
+                        c.FillRoundRect(sx - app.Scale(4), ry,
+                            swid + app.Scale(8), rowH - app.Scale(2),
+                            app.Scale(4), t.bgHover);
+                    }
+                    int tc = t.textPrimary;
+                    if (selRow) { tc = t.textInverse; }
+                    c.DrawText(sx + app.Scale(8), ry + app.Scale(5),
+                        row.text, tc, t.fontSizeSmall);
+                    if (click && hot && !selRow) {
+                        Charts.selected.Set(row.demoIndex);
+                        app.RequestRedraw();
+                    }
+                }
+            }
+        }
+
+        Charts.navView.End(app, view);
+    }
+
+    /// One cell of the EN / 中 language toggle.
+    static void RenderLangChip(App app, Canvas c, Theme t, int x, int y,
+                                int w, int h, string label, bool active) {
+        int bg = t.bgTertiary;
+        int fg = t.textSecondary;
+        if (active) { bg = t.primary; fg = t.textInverse; }
+        c.FillRoundRect(x, y, w, h, app.Scale(4), bg);
+        int tw = Canvas.MeasureText(label, t.fontSizeSmall);
+        c.DrawText(x + (w - tw) / 2, y + app.Scale(3), label, fg, t.fontSizeSmall);
+    }
+
+    /// Right pane: breadcrumb header plus the selected demo filling the rest.
+    static void RenderPreview(App app, Canvas c, Theme t, Rect area, int sw) {
+        int x = area.x + sw;
+        int w = area.width - sw;
+        int pad = app.Scale(14);
+        int sel = Charts.selected.Get();
+        if (sel < 0 || sel >= Charts.demos.Count) { sel = 0; }
+        ChartsDemo d = Charts.demos[sel];
+        c.DrawText(x + pad, area.y + app.Scale(14),
+            Charts.CatLabel(d.cat) + "  /  " + Charts.NameOf(d),
+            t.textSecondary, t.fontSizeSmall);
+        int top = area.y + app.Scale(40);
+        Charts.RenderDemo(app, sel, x + pad, top,
+            w - pad * 2, area.y + area.height - pad - top);
+    }
+
+    // ------------------------------------------------------------------
+    // Demo dispatch
+    // ------------------------------------------------------------------
+
+    static void RenderDemo(App app, int idx, int x, int y, int w, int h) {
+        if (idx == 0) { Charts.DemoLine(app, x, y, w, h); }
+        else if (idx == 1) { Charts.DemoLinePeaks(app, x, y, w, h); }
+        else if (idx == 2) { Charts.DemoStackedArea(app, x, y, w, h); }
+        else if (idx == 3) { Charts.DemoStepLine(app, x, y, w, h); }
+        else if (idx == 4) { Charts.DemoBars(app, x, y, w, h); }
+        else if (idx == 5) { Charts.DemoBarsStacked(app, x, y, w, h); }
+        else if (idx == 6) { Charts.DemoBarsH(app, x, y, w, h); }
+        else if (idx == 7) { Charts.DemoWaterfall(app, x, y, w, h); }
+        else if (idx == 8) { Charts.DemoPie(app, x, y, w, h); }
+        else if (idx == 9) { Charts.DemoDonut(app, x, y, w, h); }
+        else if (idx == 10) { Charts.DemoRose(app, x, y, w, h); }
+        else if (idx == 11) { Charts.DemoRings(app, x, y, w, h); }
+        else if (idx == 12) { Charts.DemoRadar(app, x, y, w, h); }
+        else if (idx == 13) { Charts.DemoScatter(app, x, y, w, h); }
+        else if (idx == 14) { Charts.DemoBubble(app, x, y, w, h); }
+        else if (idx == 15) { Charts.DemoK(app, x, y, w, h); }
+        else if (idx == 16) { Charts.DemoGauge(app, x, y, w, h); }
+        else if (idx == 17) { Charts.DemoFunnel(app, x, y, w, h); }
+        else if (idx == 18) { Charts.DemoTreemap(app, x, y, w, h); }
+        else if (idx == 19) { Charts.DemoSunburst(app, x, y, w, h); }
+        else if (idx == 20) { Charts.DemoTree(app, x, y, w, h); }
+        else if (idx == 21) { Charts.DemoSankey(app, x, y, w, h); }
+        else if (idx == 22) { Charts.DemoChord(app, x, y, w, h); }
+        else if (idx == 23) { Charts.DemoForce(app, x, y, w, h); }
+        else if (idx == 24) { Charts.DemoEventRiver(app, x, y, w, h); }
+        else if (idx == 25) { Charts.DemoVenn(app, x, y, w, h); }
+        else if (idx == 26) { Charts.DemoWordCloud(app, x, y, w, h); }
+        else if (idx == 27) { Charts.DemoHeatmap(app, x, y, w, h); }
+        else if (idx == 28) { Charts.DemoBoxError(app, x, y, w, h); }
+        else { Charts.DemoBig(app, x, y, w, h); }
+    }
+
+    // ------------------------------------------------------------------
+    // Line family
+    // ------------------------------------------------------------------
+
+    static List<string> WeekCats() {
+        return new List<string>{ Charts.T("Mon", "周一"), Charts.T("Tue", "周二"),
+            Charts.T("Wed", "周三"), Charts.T("Thu", "周四"), Charts.T("Fri", "周五"),
+            Charts.T("Sat", "周六"), Charts.T("Sun", "周日") };
+    }
+
+    static void DemoLine(App app, int x, int y, int w, int h) {
+        ChartOption o = ChartOption.Of(Charts.T("Weekly traffic", "每周流量"),
+            Charts.WeekCats(), new List<ChartSeries>{
+                ChartSeries.Line(Charts.T("Visits", "访问"),
+                    new List<int>{ 820, 932, 901, 934, 1290, 1330, 1320 }),
+                ChartSeries.Line(Charts.T("Signups", "注册"),
+                    new List<int>{ 320, 332, 301, 334, 390, 330, 320 })
+            });
+        ChartView.Keyed(o, Charts.KeyOf(0, 0)).Render(app, x, y, w, h);
+    }
+
+    /// Smooth lines plus markPoint: an ECharts-style pin marks each line's
+    /// maximum (and minimum when the series goes negative).
+    static void DemoLinePeaks(App app, int x, int y, int w, int h) {
+        ChartOption o = ChartOption.Of(Charts.T("Temperature (smooth)", "气温（平滑）"),
+            Charts.WeekCats(), new List<ChartSeries>{
+                ChartSeries.Line(Charts.T("Day", "白天"),
+                    new List<int>{ 11, 14, 18, 15, 12, 9, 13 }),
+                ChartSeries.Line(Charts.T("Night", "夜间"),
+                    new List<int>{ 2, 4, 6, 3, 1, 0 - 2, 3 })
+            });
+        o.smooth = true;
+        o.markPoint = true;
+        ChartView.Keyed(o, Charts.KeyOf(1, 0)).Render(app, x, y, w, h);
+    }
+
+    static void DemoStackedArea(App app, int x, int y, int w, int h) {
+        ChartOption o = ChartOption.Of(Charts.T("Energy mix (TWh)", "能源结构（TWh）"),
+            Charts.WeekCats(), new List<ChartSeries>{
+                ChartSeries.StackedArea(Charts.T("Coal", "煤电"),
+                    new List<int>{ 120, 132, 101, 134, 90, 230, 210 }),
+                ChartSeries.StackedArea(Charts.T("Gas", "燃气"),
+                    new List<int>{ 220, 182, 191, 234, 290, 330, 310 }),
+                ChartSeries.StackedArea(Charts.T("Renewable", "可再生"),
+                    new List<int>{ 150, 232, 201, 154, 190, 330, 410 })
+            });
+        o.smooth = true;
+        ChartView.Keyed(o, Charts.KeyOf(2, 0)).Render(app, x, y, w, h);
+    }
+
+    static void DemoStepLine(App app, int x, int y, int w, int h) {
+        ChartOption o = ChartOption.Of(Charts.T("Service state", "服务状态"),
+            Charts.WeekCats(), new List<ChartSeries>{
+                ChartSeries.StepLine(Charts.T("Replicas", "副本数"),
+                    new List<int>{ 2, 2, 4, 4, 6, 3, 3 })
+            });
+        ChartView.Keyed(o, Charts.KeyOf(3, 0)).Render(app, x, y, w, h);
+    }
+
+    // ------------------------------------------------------------------
+    // Bar family
+    // ------------------------------------------------------------------
+
+    /// Grouped bars with a horizontal markLine threshold.
+    static void DemoBars(App app, int x, int y, int w, int h) {
+        ChartOption o = ChartOption.Of(Charts.T("Quarterly sales", "季度销售"),
+            new List<string>{ "Q1", "Q2", "Q3", "Q4" }, new List<ChartSeries>{
+                ChartSeries.Bar(Charts.T("East", "东区"),
+                    new List<int>{ 180, 230, 210, 260 }),
+                ChartSeries.Bar(Charts.T("West", "西区"),
+                    new List<int>{ 150, 190, 240, 220 }),
+                ChartSeries.Bar(Charts.T("North", "北区"),
+                    new List<int>{ 120, 160, 140, 190 })
+            });
+        o.markLine = 200;
+        o.markLabel = Charts.T("Target", "目标");
+        ChartView.Keyed(o, Charts.KeyOf(4, 0)).Render(app, x, y, w, h);
+    }
+
+    static void DemoBarsStacked(App app, int x, int y, int w, int h) {
+        ChartOption o = ChartOption.Of(Charts.T("Ad spend by channel", "分渠道广告支出"),
+            Charts.WeekCats(), new List<ChartSeries>{
+                ChartSeries.StackedBar(Charts.T("Search", "搜索"),
+                    new List<int>{ 320, 302, 301, 334, 390, 330, 320 }),
+                ChartSeries.StackedBar(Charts.T("Video", "视频"),
+                    new List<int>{ 120, 132, 101, 134, 90, 230, 210 }),
+                ChartSeries.StackedBar(Charts.T("Social", "社交"),
+                    new List<int>{ 220, 182, 191, 234, 290, 330, 310 })
+            });
+        ChartView.Keyed(o, Charts.KeyOf(5, 0)).Render(app, x, y, w, h);
+    }
+
+    static void DemoBarsH(App app, int x, int y, int w, int h) {
+        ChartOption o = ChartOption.Of(Charts.T("World population (M)", "世界人口（百万）"),
+            new List<string>{ "Brazil", "Indonesia", "USA", "India", "China" },
+            new List<ChartSeries>{
+                ChartSeries.HBar("2024",
+                    new List<int>{ 216, 277, 340, 1428, 1412 })
+            });
+        ChartView.Keyed(o, Charts.KeyOf(6, 0)).Render(app, x, y, w, h);
+    }
+
+    static void DemoWaterfall(App app, int x, int y, int w, int h) {
+        List<ChartData> dta = new List<ChartData>();
+        dta.Add(ChartData.Of(100));
+        dta.Add(ChartData.Of(45));
+        dta.Add(ChartData.Of(30));
+        dta.Add(ChartData.Of(0 - 20));
+        dta.Add(ChartData.Of(0 - 35));
+        dta.Add(ChartData.Of(25));
+        dta.Add(ChartData.Of(0 - 12));
+        dta.Add(ChartData.Named(0, "total"));
+        ChartOption o = ChartOption.Of(Charts.T("Cash flow (k$)", "现金流（k$）"),
+            new List<string>{ Charts.T("Open", "期初"), Charts.T("Sales", "销售"),
+                Charts.T("Funding", "融资"), Charts.T("Salaries", "工资"),
+                Charts.T("Cloud", "云服务"), Charts.T("Licenses", "授权"),
+                Charts.T("Ads", "广告"), Charts.T("Net", "净额") },
+            new List<ChartSeries>{ ChartSeries.Waterfall(Charts.T("Flow", "现金流"), dta) });
+        o.showValues = true;
+        ChartView.Keyed(o, Charts.KeyOf(7, 0)).Render(app, x, y, w, h);
+    }
+
+    // ------------------------------------------------------------------
+    // Pie family
+    // ------------------------------------------------------------------
+
+    static List<ChartSeries> BrowserShare() {
+        return new List<ChartSeries>{
+            ChartSeries.Named("Chrome", ChartType.Pie, new List<ChartData>{
+                ChartData.Named(380, "Chrome") }),
+            ChartSeries.Named("Safari", ChartType.Pie, new List<ChartData>{
+                ChartData.Named(210, "Safari") }),
+            ChartSeries.Named("Firefox", ChartType.Pie, new List<ChartData>{
+                ChartData.Named(130, "Firefox") }),
+            ChartSeries.Named("Edge", ChartType.Pie, new List<ChartData>{
+                ChartData.Named(60, "Edge") }),
+            ChartSeries.Named(Charts.T("Others", "其他"), ChartType.Pie, new List<ChartData>{
+                ChartData.Named(40, Charts.T("Others", "其他")) })
+        };
+    }
+
+    static void DemoPie(App app, int x, int y, int w, int h) {
+        ChartOption o = ChartOption.Of(Charts.T("Browser share", "浏览器份额"), null,
+            Charts.BrowserShare());
+        o.pieLabels = true;
+        ChartView.Keyed(o, Charts.KeyOf(8, 0)).Render(app, x, y, w, h);
+    }
+
+    static void DemoDonut(App app, int x, int y, int w, int h) {
+        ChartOption o = ChartOption.Of(Charts.T("Browser share (donut)", "浏览器份额（环形）"),
+            null, Charts.BrowserShare());
+        o.pieLabels = true;
+        ChartView.Keyed(o, Charts.KeyOf(9, 0)).Render(app, x, y, w, h);
+    }
+
+    static void DemoRose(App app, int x, int y, int w, int h) {
+        ChartOption o = ChartOption.Of(Charts.T("Daily volume", "每日成交量"), null,
+            new List<ChartSeries>{
+                ChartSeries.Rose(Charts.T("Mon", "周一"), new List<int>{ 45 }),
+                ChartSeries.Rose(Charts.T("Tue", "周二"), new List<int>{ 72 }),
+                ChartSeries.Rose(Charts.T("Wed", "周三"), new List<int>{ 30 }),
+                ChartSeries.Rose(Charts.T("Thu", "周四"), new List<int>{ 58 }),
+                ChartSeries.Rose(Charts.T("Fri", "周五"), new List<int>{ 25 }),
+                ChartSeries.Rose(Charts.T("Sat", "周六"), new List<int>{ 88 }),
+                ChartSeries.Rose(Charts.T("Sun", "周日"), new List<int>{ 66 })
+            });
+        ChartView.Keyed(o, Charts.KeyOf(10, 0)).Render(app, x, y, w, h);
+    }
+
+    /// Nested ring pie: one Pie series per ring, outer to inner.
+    static void DemoRings(App app, int x, int y, int w, int h) {
+        ChartSeries outer = ChartSeries.Named(Charts.T("Region", "区域"), ChartType.Pie,
+            new List<ChartData>{
+                ChartData.Named(435, Charts.T("East", "东区")),
+                ChartData.Named(310, Charts.T("West", "西区")),
+                ChartData.Named(235, Charts.T("North", "北区")) });
+        ChartSeries mid = ChartSeries.Named(Charts.T("Channel", "渠道"), ChartType.Pie,
+            new List<ChartData>{
+                ChartData.Named(235, Charts.T("Online", "线上")),
+                ChartData.Named(200, Charts.T("Retail", "门店")),
+                ChartData.Named(190, Charts.T("Partner", "渠道商")),
+                ChartData.Named(350, Charts.T("Direct", "直销")) });
+        ChartSeries inner = ChartSeries.Named(Charts.T("Product", "产品"), ChartType.Pie,
+            new List<ChartData>{
+                ChartData.Named(335, Charts.T("Hardware", "硬件")),
+                ChartData.Named(310, Charts.T("Software", "软件")),
+                ChartData.Named(330, Charts.T("Service", "服务")) });
+        ChartOption o = ChartOption.OfRings(Charts.T("Sales breakdown", "销售构成"),
+            new List<ChartSeries>{ outer, mid, inner });
+        ChartView.Keyed(o, Charts.KeyOf(11, 0)).Render(app, x, y, w, h);
+    }
+
+    // ------------------------------------------------------------------
+    // Radar / scatter
+    // ------------------------------------------------------------------
+
+    /// Radar with per-axis full scale (radarMax) and area fill.
+    static void DemoRadar(App app, int x, int y, int w, int h) {
+        ChartOption o = ChartOption.Of(Charts.T("Team abilities", "团队能力"),
+            new List<string>{ Charts.T("Sales", "销售"), Charts.T("Marketing", "市场"),
+                Charts.T("Dev", "研发"), Charts.T("Support", "支持"),
+                Charts.T("Ops", "运维") },
+            new List<ChartSeries>{
+                ChartSeries.Polar(Charts.T("Team A", "A 队"),
+                    new List<int>{ 82, 60, 95, 74, 42 }),
+                ChartSeries.Polar(Charts.T("Team B", "B 队"),
+                    new List<int>{ 55, 72, 68, 90, 58 })
+            });
+        o.RadarMax(new List<int>{ 100, 80, 120, 100, 60 });
+        ChartView.Keyed(o, Charts.KeyOf(12, 0)).Render(app, x, y, w, h);
+    }
+
+    static void DemoScatter(App app, int x, int y, int w, int h) {
+        List<ChartPoint> pa = new List<ChartPoint>();
+        List<ChartPoint> pb = new List<ChartPoint>();
+        for (int i = 0; i < 40; i = i + 1) {
+            int ax = (i * 37 + 11) % 100;
+            int ay = (ax * 6 + (i * 23) % 40 + 15) % 110;
+            pa.Add(ChartPoint.Of(ax, ay));
+            int bx = (i * 53 + 29) % 100;
+            int by = (bx * 3 + (i * 31) % 50 + 40) % 120;
+            pb.Add(ChartPoint.Of(bx, by));
+        }
+        ChartOption o = ChartOption.Of(Charts.T("Height vs weight", "身高与体重"), null,
+            new List<ChartSeries>{
+                ChartSeries.OfPoints(Charts.T("Group A", "A 组"), pa),
+                ChartSeries.OfPoints(Charts.T("Group B", "B 组"), pb)
+            });
+        ChartView.Keyed(o, Charts.KeyOf(13, 0)).Render(app, x, y, w, h);
+    }
+
+    static void DemoBubble(App app, int x, int y, int w, int h) {
+        List<Bubble> bs = new List<Bubble>();
+        for (int i = 0; i < 30; i = i + 1) {
+            int bx = (i * 41 + 7) % 95 + 3;
+            int by = (i * 67 + 13) % 90 + 5;
+            int bw = (i * 29) % 80 + 8;
+            bs.Add(Bubble.Of(bx, by, bw));
+        }
+        ChartOption o = ChartOption.Of(Charts.T("Market segments", "市场细分"), null,
+            new List<ChartSeries>{ ChartSeries.OfBubbles(Charts.T("Segments", "细分"), bs) });
+        ChartView.Keyed(o, Charts.KeyOf(14, 0)).Render(app, x, y, w, h);
+    }
+
+    // ------------------------------------------------------------------
+    // Finance / gauge / funnel
+    // ------------------------------------------------------------------
+
+    /// Candlesticks with a MA-5 overlay and a dataZoom range slider: drag the
+    /// handles (or the band) at the bottom to window the 120 bars.
+    static void DemoK(App app, int x, int y, int w, int h) {
+        List<Candle> cs = new List<Candle>();
+        int price = 100;
+        for (int i = 0; i < 120; i = i + 1) {
+            int drift = ChartView.SinDeg((i * 13) % 360) * 6 / 1000
+                      + ((i * 7) % 9) - 4;
+            int open = price;
+            int close = price + drift;
+            if (close < 20) { close = 20; }
+            int hi2 = open;
+            if (close > hi2) { hi2 = close; }
+            hi2 = hi2 + (i * 5) % 4;
+            int lo2 = open;
+            if (close < lo2) { lo2 = close; }
+            lo2 = lo2 - (i * 3) % 4;
+            cs.Add(Candle.Of(open, hi2, lo2, close));
+            price = close;
+        }
+        // MA-5 overlay: a plain Line series aligned to the candle index.
+        List<int> ma = new List<int>();
+        for (int j = 0; j < cs.Count; j = j + 1) {
+            int sum = 0;
+            int cnt = 0;
+            int k = j;
+            while (k >= 0 && cnt < 5) { sum = sum + cs[k].close; cnt = cnt + 1; k = k - 1; }
+            ma.Add(sum / cnt);
+        }
+        ChartOption o = ChartOption.Of(Charts.T("Daily price", "日线行情"), null,
+            new List<ChartSeries>{
+                ChartSeries.OfCandles("K", cs),
+                ChartSeries.Line("MA5", ma)
+            });
+        o.zoom = true;
+        ChartView.Keyed(o, Charts.KeyOf(15, 0)).Render(app, x, y, w, h);
+    }
+
+    static void DemoGauge(App app, int x, int y, int w, int h) {
+        int halfW = (w - app.Scale(12)) / 2;
+        ChartOption gm = ChartOption.Of(Charts.T("Standard gauge", "标准仪表盘"), null,
+            new List<ChartSeries>{ ChartSeries.Gauge(Charts.T("Speed", "转速"), 72) });
+        ChartView.Keyed(gm, Charts.KeyOf(16, 0)).Render(app, x, y, halfW, h);
+        ChartOption rg = ChartOption.Of(Charts.T("Usage rings", "占用圆环"), null,
+            new List<ChartSeries>{
+                ChartSeries.RadialBars("CPU", 80),
+                ChartSeries.RadialBars("RAM", 55),
+                ChartSeries.RadialBars("Disk", 30)
+            });
+        ChartView.Keyed(rg, Charts.KeyOf(16, 1)).Render(app, x + halfW + app.Scale(12), y, halfW, h);
+    }
+
+    static void DemoFunnel(App app, int x, int y, int w, int h) {
+        int halfW = (w - app.Scale(12)) / 2;
+        ChartOption fm = ChartOption.Of(Charts.T("Conversion", "转化漏斗"), null,
+            new List<ChartSeries>{
+                ChartSeries.Funnel(Charts.T("Visits", "访问"), new List<int>{ 100000 }),
+                ChartSeries.Funnel(Charts.T("Signups", "注册"), new List<int>{ 64000 }),
+                ChartSeries.Funnel(Charts.T("Trials", "试用"), new List<int>{ 38000 }),
+                ChartSeries.Funnel(Charts.T("Activated", "激活"), new List<int>{ 21000 }),
+                ChartSeries.Funnel(Charts.T("Paid", "付费"), new List<int>{ 12000 })
+            });
+        ChartView.Keyed(fm, Charts.KeyOf(17, 0)).Render(app, x, y, halfW, h);
+        ChartOption fmp = ChartOption.Of(Charts.T("Build-up", "金字塔"), null,
+            new List<ChartSeries>{
+                ChartSeries.Pyramid(Charts.T("Visits", "访问"), new List<int>{ 100000 }),
+                ChartSeries.Pyramid(Charts.T("Signups", "注册"), new List<int>{ 64000 }),
+                ChartSeries.Pyramid(Charts.T("Trials", "试用"), new List<int>{ 38000 }),
+                ChartSeries.Pyramid(Charts.T("Activated", "激活"), new List<int>{ 21000 }),
+                ChartSeries.Pyramid(Charts.T("Paid", "付费"), new List<int>{ 12000 })
+            });
+        ChartView.Keyed(fmp, Charts.KeyOf(17, 1)).Render(app, x + halfW + app.Scale(12), y, halfW, h);
+    }
+
+    // ------------------------------------------------------------------
+    // Hierarchy
+    // ------------------------------------------------------------------
+
+    static ChartNode DiskRoot() {
+        return ChartNode.Group(Charts.T("Disk", "磁盘"), new List<ChartNode>{
+            ChartNode.Group("src", new List<ChartNode>{
+                ChartNode.Leaf("compiler", 42), ChartNode.Leaf("runtime", 35),
+                ChartNode.Leaf("lsp", 18), ChartNode.Leaf("dap", 12) }),
+            ChartNode.Group("stdlib", new List<ChartNode>{
+                ChartNode.Leaf("Gui", 30), ChartNode.Leaf("System", 22),
+                ChartNode.Leaf("Data", 14) }),
+            ChartNode.Group("build", new List<ChartNode>{
+                ChartNode.Leaf("obj", 55), ChartNode.Leaf("cache", 25) }),
+            ChartNode.Leaf("assets", 16)
+        });
+    }
+
+    static void DemoTreemap(App app, int x, int y, int w, int h) {
+        ChartOption o = ChartOption.Of(Charts.T("Disk usage (MB)", "磁盘占用（MB）"), null,
+            new List<ChartSeries>{ ChartSeries.OfTree(Charts.T("Disk", "磁盘"),
+                ChartType.Treemap, Charts.DiskRoot()) });
+        ChartView.Keyed(o, Charts.KeyOf(18, 0)).Render(app, x, y, w, h);
+    }
+
+    static void DemoSunburst(App app, int x, int y, int w, int h) {
+        ChartOption o = ChartOption.Of(Charts.T("Codebase share", "代码占比"), null,
+            new List<ChartSeries>{ ChartSeries.SunburstTree(Charts.T("Code", "代码"),
+                Charts.DiskRoot()) });
+        ChartView.Keyed(o, Charts.KeyOf(19, 0)).Render(app, x, y, w, h);
+    }
+
+    static void DemoTree(App app, int x, int y, int w, int h) {
+        ChartNode root = ChartNode.Group("Zan", new List<ChartNode>{
+            ChartNode.Group(Charts.T("Toolchain", "工具链"), new List<ChartNode>{
+                ChartNode.Leaf("zanc", 40), ChartNode.Leaf("zan-lsp", 25),
+                ChartNode.Leaf("zan-dap", 15) }),
+            ChartNode.Group(Charts.T("Runtime", "运行时"), new List<ChartNode>{
+                ChartNode.Leaf("ARC", 18), ChartNode.Leaf(Charts.T("Scheduler", "调度器"), 22),
+                ChartNode.Leaf("IO", 16) }),
+            ChartNode.Group("Gui", new List<ChartNode>{
+                ChartNode.Leaf(Charts.T("Widgets", "控件"), 30),
+                ChartNode.Leaf("Canvas", 20) })
+        });
+        ChartOption o = ChartOption.Of(Charts.T("Project tree", "项目树"), null,
+            new List<ChartSeries>{ ChartSeries.OfTreeOrient(Charts.T("Tree", "树图"),
+                root, "horizontal") });
+        ChartView.Keyed(o, Charts.KeyOf(20, 0)).Render(app, x, y, w, h);
+    }
+
+    // ------------------------------------------------------------------
+    // Relations (chord / force / event river / venn) + sankey
+    // ------------------------------------------------------------------
+
+    static void DemoSankey(App app, int x, int y, int w, int h) {
+        ChartOption o = ChartOption.Of(Charts.T("Energy flow (TWh)", "能源流向（TWh）"), null,
+            new List<ChartSeries>{
+                ChartSeries.OfLinks(Charts.T("Energy", "能源"), new List<ChartLink>{
+                    ChartLink.Of(Charts.T("Coal", "煤炭"), Charts.T("Power", "电力"), 40),
+                    ChartLink.Of(Charts.T("Gas", "燃气"), Charts.T("Power", "电力"), 35),
+                    ChartLink.Of(Charts.T("Solar", "太阳能"), Charts.T("Power", "电力"), 25),
+                    ChartLink.Of(Charts.T("Power", "电力"), Charts.T("Residential", "居民用电"), 30),
+                    ChartLink.Of(Charts.T("Power", "电力"), Charts.T("Industry", "工业用电"), 45),
+                    ChartLink.Of(Charts.T("Power", "电力"), Charts.T("Grid loss", "线损"), 25)
+                })
+            });
+        ChartView.Keyed(o, Charts.KeyOf(21, 0)).Render(app, x, y, w, h);
+    }
+
+    static List<ChartLink> TeamLinks() {
+        return new List<ChartLink>{
+            ChartLink.Of("Alice", "Bob", 12),
+            ChartLink.Of("Alice", "Carol", 8),
+            ChartLink.Of("Bob", "Dave", 6),
+            ChartLink.Of("Carol", "Dave", 9),
+            ChartLink.Of("Carol", "Eve", 5),
+            ChartLink.Of("Dave", "Frank", 7),
+            ChartLink.Of("Eve", "Frank", 4),
+            ChartLink.Of("Frank", "Alice", 10),
+            ChartLink.Of("Bob", "Eve", 3)
+        };
+    }
+
+    /// Chord: nodes take circle arcs proportional to their link weight;
+    /// ribbons between arcs show pairwise flow.
+    static void DemoChord(App app, int x, int y, int w, int h) {
+        ChartOption o = ChartOption.Of(Charts.T("Collaboration", "协作关系"), null,
+            new List<ChartSeries>{ ChartSeries.Chord(Charts.T("Team", "团队"),
+                Charts.TeamLinks()) });
+        ChartView.Keyed(o, Charts.KeyOf(22, 0)).Render(app, x, y, w, h);
+    }
+
+    /// Force-directed graph: nodes are deduced from the links, layout is a
+    /// deterministic spring relaxation replayed by the intro animation.
+    static void DemoForce(App app, int x, int y, int w, int h) {
+        ChartOption o = ChartOption.Of(Charts.T("Social graph", "社交网络"), null,
+            new List<ChartSeries>{ ChartSeries.Force(Charts.T("People", "成员"),
+                Charts.TeamLinks()) });
+        ChartView.Keyed(o, Charts.KeyOf(23, 0)).Render(app, x, y, w, h);
+    }
+
+    static void DemoEventRiver(App app, int x, int y, int w, int h) {
+        List<int> va = new List<int>();
+        List<int> vb = new List<int>();
+        List<int> vc = new List<int>();
+        for (int i = 0; i < 24; i = i + 1) {
+            // SinDeg 返回千分定点（1000 = 1.0），振幅必须 /1000 还原。
+            va.Add(30 + ChartView.SinDeg((i * 15) % 360) * 22 / 1000 + (i * 7) % 12);
+            vb.Add(24 + ChartView.SinDeg((i * 15 + 120) % 360) * 16 / 1000 + (i * 5) % 10);
+            vc.Add(18 + ChartView.SinDeg((i * 15 + 240) % 360) * 12 / 1000 + (i * 3) % 8);
+        }
+        ChartOption o = ChartOption.Of(Charts.T("Release events", "发布事件流"),
+            null, new List<ChartSeries>{
+                ChartSeries.Of(Charts.T("Frontend", "前端"), ChartType.EventRiver, va),
+                ChartSeries.Of(Charts.T("Backend", "后端"), ChartType.EventRiver, vb),
+                ChartSeries.Of(Charts.T("Infra", "基础设施"), ChartType.EventRiver, vc)
+            });
+        ChartView.Keyed(o, Charts.KeyOf(24, 0)).Render(app, x, y, w, h);
+    }
+
+    /// Venn: data items are [A, B, A∩B]; circle area is proportional to value.
+    static void DemoVenn(App app, int x, int y, int w, int h) {
+        ChartOption o = ChartOption.Of(Charts.T("Language overlap", "语言重合度"), null,
+            new List<ChartSeries>{ ChartSeries.Venn("venn", new List<ChartData>{
+                ChartData.Named(148, "Zan"),
+                ChartData.Named(96, "C"),
+                ChartData.Named(42, "Zan ∩ C")
+            }) });
+        ChartView.Keyed(o, Charts.KeyOf(25, 0)).Render(app, x, y, w, h);
+    }
+
+    // ------------------------------------------------------------------
+    // More: word cloud / heatmap / box & error / big data
+    // ------------------------------------------------------------------
+
+    static void DemoWordCloud(App app, int x, int y, int w, int h) {
+        List<ChartData> words = new List<ChartData>{
+            ChartData.Named(96, "compiler"), ChartData.Named(82, "runtime"),
+            ChartData.Named(70, "Canvas"), ChartData.Named(64, "scheduler"),
+            ChartData.Named(58, "ARC"), ChartData.Named(52, "stdlib"),
+            ChartData.Named(46, "LSP"), ChartData.Named(42, "DAP"),
+            ChartData.Named(38, "LLVM"), ChartData.Named(34, "GUI"),
+            ChartData.Named(30, "chart"), ChartData.Named(28, "widget"),
+            ChartData.Named(24, "tooltip"), ChartData.Named(22, "legend"),
+            ChartData.Named(20, "sankey"), ChartData.Named(18, "radar"),
+            ChartData.Named(16, "gauge"), ChartData.Named(14, "funnel")
+        };
+        ChartOption o = ChartOption.Of(Charts.T("Project keywords", "项目关键词"), null,
+            new List<ChartSeries>{ ChartSeries.WordCloud(Charts.T("Keywords", "关键词"), words) });
+        ChartView.Keyed(o, Charts.KeyOf(26, 0)).Render(app, x, y, w, h);
+    }
+
+    /// Static 24x12 heatmap served from the snapshot cache: the first frame
+    /// rasterizes it, every later frame is one pixel copy (plus hover).
+    static void DemoHeatmap(App app, int x, int y, int w, int h) {
+        if (Charts.heat == null) {
+            List<ChartSeries> rows = new List<ChartSeries>();
+            for (int r = 0; r < 12; r = r + 1) {
+                List<int> cells = new List<int>();
+                for (int col = 0; col < 24; col = col + 1) {
+                    int wv = ChartView.SinDeg((r * 30 + col * 15) % 360);
+                    cells.Add(40 + wv * 30 / 1000 + (r * col) % 25);
+                }
+                rows.Add(ChartSeries.Of("R" + Convert.ToString(r + 1),
+                    ChartType.Heatmap, cells));
+            }
+            ChartOption hm = ChartOption.Of(Charts.T("Hourly load", "分时负载"), null, rows);
+            hm.animate = false;
+            Charts.heat = hm;
+            Charts.heatSlot = ChartView.AllocCacheSlot();
+        }
+        ChartView.RenderCached(app, Charts.heat, Charts.heatSlot, x, y, w, h);
+        ChartView.HeatmapHover(app, x, y, w, h, Charts.heat);
+    }
+
+    static void DemoBoxError(App app, int x, int y, int w, int h) {
+        int halfW = (w - app.Scale(12)) / 2;
+        List<BoxItem> bx = new List<BoxItem>{
+            BoxItem.Of("API", 80, 120, 150, 190, 260),
+            BoxItem.Of("Web", 60, 100, 135, 170, 240),
+            BoxItem.Of("DB", 40, 90, 110, 160, 300),
+            BoxItem.Of("Cache", 20, 40, 55, 80, 120)
+        };
+        ChartOption bo = ChartOption.Of(Charts.T("Latency (ms)", "延迟（毫秒）"), null,
+            new List<ChartSeries>{ ChartSeries.OfBoxes(Charts.T("Latency", "延迟"), bx) });
+        ChartView.Keyed(bo, Charts.KeyOf(28, 0)).Render(app, x, y, halfW, h);
+
+        List<ErrorItem> es = new List<ErrorItem>{
+            ErrorItem.Of("S1", 74, 8), ErrorItem.Of("S2", 82, 12),
+            ErrorItem.Of("S3", 66, 6), ErrorItem.Of("S4", 91, 15),
+            ErrorItem.Of("S5", 78, 10)
+        };
+        ChartOption er = ChartOption.Of(Charts.T("Accuracy (%)", "精度（%）"), null,
+            new List<ChartSeries>{ ChartSeries.OfErrors(Charts.T("Meas", "测量"), es) });
+        ChartView.Keyed(er, Charts.KeyOf(28, 1)).Render(app, x + halfW + app.Scale(12), y, halfW, h);
+    }
+
+    /// ChartBig path: a static 100k-point series and a rolling 20k ring
+    /// window, both reduced to a per-pixel min/max envelope — per-frame cost
+    /// stays O(width) once the envelope is cached.
+    static void DemoBig(App app, int x, int y, int w, int h) {
+        int halfH = (h - app.Scale(12)) / 2;
+        if (Charts.bigStaticSrc == null) {
+            Charts.bigStaticSrc = ChartsWaveSource.Of(
+                Charts.BigWave(100000, 53, 520, 230),
+                Charts.T("telemetry", "遥测"), 0, 0);
+            Charts.bigStaticState = new ChartState();
+            Charts.bigRingSrc = ChartsWaveSource.Of(
+                Charts.BigWave(20000, 71, 520, 220),
+                Charts.T("live", "实时"), 0, 8000);
+            Charts.bigRingState = new ChartState();
+        }
+        ChartOption o1 = ChartOption.Create();
+        o1.animate = false;
+        o1.series = new List<ChartSeries>{ ChartSeries.Area("", new List<int>{ 0 }) };
+        ChartBig.Render(app, Charts.bigStaticState, Charts.bigStaticSrc, o1,
+            x, y, w, halfH, Charts.T("100,000 points", "100,000 点"));
+
+        // Rolling window: advance the ring one step and invalidate the
+        // envelope so the next frame rebuilds it over the shifted data.
+        Charts.bigRingSrc.Roll();
+        Charts.bigRingState.Invalidate();
+        ChartOption o2 = ChartOption.Create();
+        o2.animate = false;
+        o2.series = new List<ChartSeries>{ ChartSeries.Area("", new List<int>{ 0 }) };
+        ChartBig.Render(app, Charts.bigRingState, Charts.bigRingSrc, o2,
+            x, y + halfH + app.Scale(12), w, halfH,
+            Charts.T("Rolling window (20k)", "滚动窗口（2 万点）"));
+        app.RequestAnimationFrame(33);
+    }
+
+    /// Synthesise a pseudo-random waveform for the ChartBig demo: two
+    /// interleaved sines plus a sawtooth, integer-only.
+    static List<int> BigWave(int n, int seed, int amp, int baseV) {
+        List<int> pts = new List<int>();
+        for (int i = 0; i < n; i = i + 1) {
+            int wv = ChartView.SinDeg((i * 5 + seed * 3) % 360) * amp / 1000
+                   + ChartView.SinDeg((i * 17 + seed) % 360) * amp / 2000;
+            pts.Add(baseV + wv + (i * 7 + seed) % 40);
+        }
+        return pts;
+    }
+}

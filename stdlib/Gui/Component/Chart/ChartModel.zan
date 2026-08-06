@@ -40,7 +40,7 @@ class ChartKinds {
     /// "sankey"、"waterfall"、"sunburst"、"radialBars"）；原生类型为 ""。
     static string CustomOf(string s) {
         if (s == "box" || s == "error" || s == "sankey" || s == "waterfall"
-            || s == "sunburst" || s == "radialBars") { return s; }
+            || s == "sunburst" || s == "radialBars" || s == "venn") { return s; }
         return "";
     }
 
@@ -528,7 +528,10 @@ class ChartSeries {
     bool hbar;       // 柱状图布局：水平绘制（ECharts 交换 value-x/category-y）
     string treeOrient; // ECharts tree.orient："" = 垂直 | "horizontal"
     string custom;   // ChartType.Custom 的扩展渲染器："box" | "error" |
-                     //   "sankey" | "waterfall" | "sunburst" | "radialBars" | ""
+                     //   "sankey" | "waterfall" | "sunburst" | "radialBars" | "venn" | ""
+    ChartItemStyle itemStyle; // ECharts series.itemStyle：normal / emphasis
+    ChartTextStyle label;     // ECharts series.label 的静态样式
+    bool labelShow;           // series.label.show；渲染器可选择显示数据值
     List<ChartData> data;
     List<Candle> candles;      // 蜡烛图种类
     List<Bubble> bubbles;      // 气泡图种类
@@ -559,6 +562,9 @@ class ChartSeries {
         s.hbar = false;
         s.treeOrient = "";
         s.custom = "";
+        s.itemStyle = ChartItemStyle.Create();
+        s.label = ChartTextStyle.Create();
+        s.labelShow = false;
         s.data = new List<ChartData>();
         for (int i = 0; i < values.Count; i = i + 1) { s.data.Add(ChartData.Of(values[i])); }
         s.candles = new List<Candle>();
@@ -707,6 +713,27 @@ class ChartSeries {
         ChartSeries s = ChartSeries.Of(name, ChartType.Custom, new List<int>());
         s.custom = "sankey";
         s.links = links;
+        return s;
+    }
+
+    /// 和弦图系列：节点从 links 的 from/to 推导。
+    static ChartSeries Chord(string name, List<ChartLink> links) {
+        ChartSeries s = ChartSeries.Of(name, ChartType.Chord, new List<int>());
+        s.links = links;
+        return s;
+    }
+
+    /// 力导向图系列：节点从 links 的 from/to 推导。
+    static ChartSeries Force(string name, List<ChartLink> links) {
+        ChartSeries s = ChartSeries.Of(name, ChartType.Force, new List<int>());
+        s.links = links;
+        return s;
+    }
+
+    /// 韦恩图系列：data 项依次为 [A, B, A∩B]（名称 + 值）。
+    static ChartSeries Venn(string name, List<ChartData> data) {
+        ChartSeries s = ChartSeries.Named(name, ChartType.Custom, data);
+        s.custom = "venn";
         return s;
     }
 
@@ -877,8 +904,11 @@ class ChartOption {
     int donutPct;     // 环形内半径占外半径的百分比
     int gaugeMax;     // Gauge / 径向条形图的满刻度值（默认 100）
     bool pieLabels;   // 在饼/环扇区上绘制百分比标签
+    bool pieRings;    // 多系列嵌套环饼图
+    List<int> radarMax; // 雷达每轴满刻度（空 = 从数据推导）
     bool zoom;        // 在直角坐标系图表下方显示 dataZoom 范围滑块
     int markLine;     // 左轴上的水平阈值线（Auto = 无）
+    bool markPoint;   // 折线系列的最大值标记
     string markLabel; // 显示在 markLine 处的标签
     int markLo;       // 阴影 markArea 带 [markLo, markHi]（Auto = 无）
     int markHi;
@@ -886,6 +916,9 @@ class ChartOption {
     int gridRight;
     int gridTop;
     int gridBottom;
+    int zoomStart;    // dataZoom 初始窗口，百分比 0..100
+    int zoomEnd;      // dataZoom 初始窗口，百分比 0..100
+    int backgroundColor; // 0 = 跟随主题，不主动填充背景
     int iwid;         // 交互键（由 ChartView.Render 每帧设置）；0 = 无
 
     /// 哨兵值，表示"此边界从数据推导"。
@@ -910,8 +943,11 @@ class ChartOption {
         o.donutPct = 55;
         o.gaugeMax = 100;
         o.pieLabels = false;
+        o.pieRings = false;
+        o.radarMax = new List<int>();
         o.zoom = false;
         o.markLine = ChartOption.Auto();
+        o.markPoint = false;
         o.markLabel = "";
         o.markLo = ChartOption.Auto();
         o.markHi = ChartOption.Auto();
@@ -919,6 +955,9 @@ class ChartOption {
         o.gridRight = 0 - 1;
         o.gridTop = 0 - 1;
         o.gridBottom = 0 - 1;
+        o.zoomStart = 0;
+        o.zoomEnd = 100;
+        o.backgroundColor = 0;
         o.iwid = 0;
         return o;
     }
@@ -944,6 +983,14 @@ class ChartOption {
         List<ChartSeries> ss = new List<ChartSeries>();
         ss.Add(s);
         return ChartOption.Of(ss);
+    }
+
+    /// 多系列嵌套环饼图：每个 Pie 系列绘制为一层环。
+    static ChartOption OfRings(string title, List<ChartSeries> series) {
+        ChartOption o = ChartOption.Of(series);
+        o.title = title;
+        o.pieRings = true;
+        return o;
     }
 
     // ---- 声明式工厂：一次调用构建默认类型 + 轴 ----
@@ -995,6 +1042,31 @@ class ChartOption {
 
     ChartOption X(ChartAxis ax) { this.xAxes.Add(ax); return this; }
     ChartOption Y(ChartAxis ax) { this.yAxes.Add(ax); return this; }
+
+    ChartOption RadarMax(List<int> maxs) {
+        this.radarMax = maxs;
+        return this;
+    }
+
+    /// 设置 dataZoom 的初始窗口（百分比，自动钳制到 0..100）。
+    ChartOption DataZoom(int start, int end) {
+        if (start < 0) { start = 0; }
+        if (start > 100) { start = 100; }
+        if (end < 0) { end = 0; }
+        if (end > 100) { end = 100; }
+        if (end < start) { int t = start; start = end; end = t; }
+        this.zoom = true;
+        this.zoomStart = start;
+        this.zoomEnd = end;
+        return this;
+    }
+
+    /// 覆盖绘图区边距，等价于 ECharts grid.left/right/top/bottom。
+    ChartOption Grid(int left, int right, int top, int bottom) {
+        this.gridLeft = left; this.gridRight = right;
+        this.gridTop = top; this.gridBottom = bottom;
+        return this;
+    }
 
     // ---- 解析视图（渲染器使用；视为只读）----
 
@@ -1179,15 +1251,110 @@ class ChartOption {
         }
     }
 
+    static void ParseItemStateStyle(JsonValue v, ChartItemStateStyle style) {
+        if (v == null || !v.IsObject()) { return; }
+        if (v.Has("color")) { style.color = ChartOption.ParseColor(v.Get("color"), style.color); }
+        if (v.Has("borderColor")) { style.borderColor = ChartOption.ParseColor(v.Get("borderColor"), style.borderColor); }
+        style.borderWidth = v.Int("borderWidth", style.borderWidth);
+        ChartOption.ParseLineStyle(v.Get("lineStyle"), style.lineStyle);
+        JsonValue area = v.Get("areaStyle");
+        if (area != null && area.IsObject()) {
+            if (area.Has("color")) { style.areaStyle.color = ChartOption.ParseColor(area.Get("color"), style.areaStyle.color); }
+            style.areaStyle.type = area.Str("type", style.areaStyle.type);
+        } else if (area != null && area.IsString()) {
+            style.areaStyle.color = ChartOption.ParseColor(area, style.areaStyle.color);
+        }
+    }
+
+    static void ParseItemStyle(JsonValue v, ChartItemStyle style) {
+        if (v == null || !v.IsObject()) { return; }
+        // ECharts accepts the compact form {color: ...} as well as
+        // {normal: {...}, emphasis: {...}}.
+        ChartOption.ParseItemStateStyle(v, style.normal);
+        ChartOption.ParseItemStateStyle(v.Get("normal"), style.normal);
+        ChartOption.ParseItemStateStyle(v.Get("emphasis"), style.emphasis);
+    }
+
+    static void ParseSeriesStyle(JsonValue v, ChartSeries s) {
+        if (v == null || !v.IsObject()) { return; }
+        ChartOption.ParseItemStyle(v.Get("itemStyle"), s.itemStyle);
+        ChartOption.ParseLineStyle(v.Get("lineStyle"), s.itemStyle.normal.lineStyle);
+        JsonValue area = v.Get("areaStyle");
+        if (area != null && area.IsObject()) {
+            s.areaStyle = area.Bool("show", true);
+            if (area.Has("color")) {
+                s.itemStyle.normal.areaStyle.color = ChartOption.ParseColor(
+                    area.Get("color"), s.itemStyle.normal.areaStyle.color);
+            }
+            s.itemStyle.normal.areaStyle.type = area.Str("type", s.itemStyle.normal.areaStyle.type);
+        } else if (area != null && area.IsBool()) {
+            s.areaStyle = area.AsBool(false);
+        }
+        JsonValue label = v.Get("label");
+        if (label != null && label.IsObject()) {
+            s.labelShow = label.Bool("show", s.labelShow);
+            ChartOption.ParseTextStyle(label, s.label);
+        }
+        if (v.Has("show")) { s.labelShow = v.Bool("show", s.labelShow); }
+        if (v.Has("color")) { s.color = ChartOption.ParseColor(v.Get("color"), s.color); }
+    }
+
+    static void ParseGrid(JsonValue v, ChartOption o) {
+        if (v == null || !v.IsObject()) { return; }
+        o.gridLeft = v.Int("left", o.gridLeft);
+        o.gridRight = v.Int("right", o.gridRight);
+        o.gridTop = v.Int("top", o.gridTop);
+        o.gridBottom = v.Int("bottom", o.gridBottom);
+    }
+
+    static void ParseDataZoom(JsonValue v, ChartOption o) {
+        if (v == null) { return; }
+        JsonValue z = v;
+        if (v.IsArray()) {
+            if (v.Count() < 1) { return; }
+            z = v.At(0);
+        }
+        if (z == null || !z.IsObject()) { return; }
+        o.zoom = z.Bool("show", true);
+        o.zoomStart = z.Int("start", o.zoomStart);
+        o.zoomEnd = z.Int("end", o.zoomEnd);
+        if (o.zoomStart < 0) { o.zoomStart = 0; }
+        if (o.zoomStart > 100) { o.zoomStart = 100; }
+        if (o.zoomEnd < 0) { o.zoomEnd = 0; }
+        if (o.zoomEnd > 100) { o.zoomEnd = 100; }
+        if (o.zoomEnd < o.zoomStart) {
+            int t = o.zoomStart; o.zoomStart = o.zoomEnd; o.zoomEnd = t;
+        }
+    }
+
+    static void ParseMarkArea(JsonValue v, ChartOption o) {
+        if (v == null || !v.IsObject()) { return; }
+        JsonValue data = v.Get("data");
+        if (data == null || !data.IsArray() || data.Count() < 1) { return; }
+        JsonValue pair = data.At(0);
+        if (pair == null || !pair.IsArray() || pair.Count() < 2) { return; }
+        JsonValue lo = pair.At(0);
+        JsonValue hi = pair.At(1);
+        if (lo != null && lo.IsObject() && lo.Has("yAxis")) { o.markLo = lo.Int("yAxis", o.markLo); }
+        if (hi != null && hi.IsObject() && hi.Has("yAxis")) { o.markHi = hi.Int("yAxis", o.markHi); }
+    }
+
     static ChartOption FromJsonValue(JsonValue v) {
         ChartOption o = ChartOption.Create();
         if (v == null) { return o; }
         o.title = v.Str("title", "");
+        if (v.Has("backgroundColor")) { o.backgroundColor = ChartOption.ParseColor(v.Get("backgroundColor"), o.backgroundColor); }
+        ChartOption.ParseGrid(v.Get("grid"), o);
+        ChartOption.ParseDataZoom(v.Get("dataZoom"), o);
 
         JsonValue lg = v.Get("legend");
         if (lg != null && lg.IsObject()) { o.showLegend = lg.Bool("show", o.showLegend); }
         JsonValue tp = v.Get("tooltip");
         if (tp != null && tp.IsObject()) { o.showTooltip = tp.Bool("show", o.showTooltip); }
+        if (v.Has("markLine")) { o.markLine = v.Int("markLine", o.markLine); }
+        o.markPoint = v.Bool("markPoint", o.markPoint);
+        o.markLabel = v.Str("markLabel", o.markLabel);
+        ChartOption.ParseMarkArea(v.Get("markArea"), o);
 
         ChartOption.ParseAxis(v.Get("xAxis"), o.xAxes, true);
         ChartOption.ParseAxis(v.Get("yAxis"), o.yAxes, false);
@@ -1211,6 +1378,7 @@ class ChartOption {
                 cs.hbar = s.Bool("hbar", cs.hbar);
                 cs.treeOrient = s.Str("orient", cs.treeOrient);
                 cs.custom = s.Str("custom", cs.custom);
+                ChartOption.ParseSeriesStyle(s, cs);
                 if (cs.type == ChartType.Gauge) { ChartOption.ParseGauge(s, cs.gauge); }
                 JsonValue da = s.Get("data");
                 if (da != null && da.IsArray()) {
