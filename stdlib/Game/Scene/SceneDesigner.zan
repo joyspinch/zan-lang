@@ -48,6 +48,8 @@ class SceneDesigner {
     int mqSX;            // 框选起点（屏幕空间）
     int mqSY;
     bool showTags;       // 在元素上绘制种类/名称徽标
+    List<string> palFolded;  // 折叠起来的面板分组标题
+    int palScroll;           // 面板内部滚动偏移（像素）
     List<string> undoStack;  // 文档 JSON 快照（撤销历史）
     List<string> redoStack;
     string clipJson;     // 复制的元素（单元素场景 JSON）
@@ -104,6 +106,8 @@ class SceneDesigner {
         this.palMoved = false;
         this.dragDx = 0;
         this.dragDy = 0;
+        this.palFolded = new List<string>();
+        this.palScroll = 0;
         this.guideX = 0 - 1;
         this.guideY = 0 - 1;
         this.inpIdName = 0 - 1;
@@ -843,84 +847,201 @@ class SceneDesigner {
 
     // --- 面板（添加元素） ---------------------------------------------
 
-    // 将面板的一个分区渲染为两列芯片网格。
-    // 点击立即在画布中心添加元素；按住并拖拽
-    // 则将其放到指定位置。返回分区后的 y 坐标。
-    int PaletteSection(App app, Canvas c, Theme t, int x, int y, int w,
-            string title, List<string> kinds) {
-        app.canvas.DrawStyledText(
-            Style.Of(app, "label", "hint small", Style.SNormal()),
-            x, y, title,
-            app.theme.textPrimary, app.theme.fontSizeMedium);
-        int iy = y + app.Scale(18);
-        int bw = (w - app.Scale(6)) / 2;
-        int bh = app.Scale(26);
+    /// 每个元素种类的工具箱图标。图标字体里没有专门的
+    /// 游戏控件字形，所以按"这东西长什么样/干什么"就近取。
+    static string KindIcon(string kind) {
+        if (kind == "label" || kind == "text") { return "font"; }
+        if (kind == "arttext") { return "star"; }
+        if (kind == "button") { return "select-all"; }
+        if (kind == "imagebox" || kind == "sprite") { return "image"; }
+        if (kind == "animbox" || kind == "anim") { return "play"; }
+        if (kind == "textbox") { return "edit"; }
+        if (kind == "input") { return "edit"; }
+        if (kind == "progressbar") { return "sort"; }
+        if (kind == "slider") { return "sort"; }
+        if (kind == "scrollbar") { return "more"; }
+        if (SceneDesigner.IsSlotKind(kind)) { return "grid"; }
+        if (kind == "avatarbox") { return "user"; }
+        if (kind == "checkbox") { return "check"; }
+        if (kind == "tabbox") { return "layout"; }
+        if (kind == "container") { return "folder"; }
+        if (kind == "minimap") { return "globe"; }
+        if (kind == "combobox") { return "chevron-down"; }
+        if (kind == "listbox") { return "table"; }
+        if (kind == "rect") { return "stop"; }
+        if (kind == "circle") { return "sun"; }
+        return "file";
+    }
+
+    int PalHeadH(App app) { return app.Scale(22); }
+    int PalRowH(App app) { return app.Scale(22); }
+    int PalRowStep(App app) { return app.Scale(24); }
+
+    bool PalFolded(string title) {
+        for (int i = 0; i < this.palFolded.Count; i = i + 1) {
+            if (this.palFolded[i] == title) { return true; }
+        }
+        return false;
+    }
+
+    void PalToggleFold(string title) {
+        List<string> keep = new List<string>();
+        bool found = false;
+        for (int i = 0; i < this.palFolded.Count; i = i + 1) {
+            if (this.palFolded[i] == title) { found = true; }
+            else { keep.Add(this.palFolded[i]); }
+        }
+        if (!found) { keep.Add(title); }
+        this.palFolded = keep;
+    }
+
+    /// 分组标题行：折叠箭头 + 标题，点整行折叠/展开。
+    int PaletteHeader(App app, Canvas c, Theme t, string title,
+            int ix, int iy, int iw) {
+        int hh = this.PalHeadH(app);
+        bool hov = this.palDrag.Length == 0
+            && SceneDesigner.InRect(app.mouseX, app.mouseY, ix, iy, iw, hh);
+        if (hov) {
+            c.FillRoundRect(ix, iy, iw, hh, t.borderRadiusSmall, t.bgHover);
+            app.RequestRedraw();
+        }
+        string arrow = "chevron-down";
+        if (this.PalFolded(title)) { arrow = "chevron-right"; }
+        c.DrawGlyphIn(arrow, ix, iy, app.Scale(14), hh, t.fontSizeSmall,
+            t.textTertiary);
+        c.DrawText(ix + app.Scale(16),
+            iy + (hh - Canvas.FontHeight(t.fontSizeSmall)) / 2,
+            title, t.textSecondary, t.fontSizeSmall);
+        if (hov && app.EventKind() == 3 && !this.palMoved) {
+            this.PalToggleFold(title);
+            app.RequestRedraw();
+        }
+        return iy + hh;
+    }
+
+    /// 一行元素种类（小图标 + 名称，无边框，悬停底色）。
+    /// 点击在画布中心添加，按住拖到画布可指定位置。
+    int PaletteRow(App app, Canvas c, Theme t, string kind,
+            int ix, int iy, int iw) {
+        int rowH = this.PalRowH(app);
         int ek = app.EventKind();
         if (app.PointerCaptured()) { ek = 0; }
+        bool over = SceneDesigner.InRect(app.mouseX, app.mouseY, ix, iy, iw, rowH);
+        bool hov = this.palDrag.Length == 0 && over;
+        if (hov) {
+            c.FillRoundRect(ix, iy, iw, rowH, t.borderRadiusSmall, t.bgHover);
+            app.RequestRedraw();
+        }
+        c.DrawGlyphIn(SceneDesigner.KindIcon(kind), ix + app.Scale(2), iy,
+            app.Scale(16), rowH, t.fontSizeSmall, t.textSecondary);
+        c.DrawText(ix + app.Scale(20),
+            iy + (rowH - Canvas.FontHeight(t.fontSizeSmall)) / 2,
+            SceneDesigner.KindLabel(kind), t.textPrimary, t.fontSizeSmall);
+        if (ek == 2 && over) {
+            this.palDrag = kind;
+            this.palMoved = false;
+            this.msg = SceneDesigner.T("click to add at centre, or drag onto the canvas",
+                "单击添加到画布中心，或拖到画布指定位置");
+            app.RequestRedraw();
+        }
+        // 原地按下再松开就是一次点击：直接加到画布中心，
+        // 和拖拽共用同一次按下。
+        if (ek == 3 && over && !this.palMoved && this.palDrag == kind) {
+            this.AddElement(kind);
+            this.palDrag = "";
+            app.RequestRedraw();
+        }
+        return iy + this.PalRowStep(app);
+    }
+
+    /// 一个可折叠分组，返回其后的 y。
+    int PaletteSection(App app, Canvas c, Theme t, int x, int y, int w,
+            string title, List<string> kinds) {
+        int iy = this.PaletteHeader(app, c, t, title, x, y, w);
+        if (this.PalFolded(title)) { return iy + app.Scale(2); }
         for (int k = 0; k < kinds.Count; k = k + 1) {
-            int col = k % 2;
-            int bx = x + col * (bw + app.Scale(6));
-            int chipId = new Button { Text = SceneDesigner.KindLabel(kinds[k]) }.Render(app, bx, iy, bw);
-            if (Ui.Clicked(app, chipId)) {
-                // 单击：在画布中心添加，无需拖拽。
-                this.AddElement(kinds[k]);
-                this.palDrag = "";
-                this.palMoved = false;
-                app.RequestRedraw();
-            } else if (ek == 2 && SceneDesigner.InRect(app.mouseX, app.mouseY, bx, iy, bw, bh)) {
-                this.palDrag = kinds[k];
-                this.palMoved = false;
-                this.msg = SceneDesigner.T("click to add at centre, or drag onto the canvas",
-                    "单击添加到画布中心，或拖到画布指定位置");
-                app.RequestRedraw();
-            }
-            if (col == 1 || k == kinds.Count - 1) { iy = iy + bh + app.Scale(4); }
+            iy = this.PaletteRow(app, c, t, kinds[k], x, iy, w);
         }
         return iy + app.Scale(6);
     }
 
+    int PaletteSectionH(App app, string title, int count) {
+        int h = this.PalHeadH(app);
+        if (this.PalFolded(title)) { return h + app.Scale(2); }
+        return h + count * this.PalRowStep(app) + app.Scale(6);
+    }
+
     void RenderPalette(App app, Canvas c, Theme t, int x, int y, int w, int h) {
         app.FillChrome(x, y, w, h, t.borderRadiusLarge, t.bgSecondary);
-        app.canvas.DrawRect(x, y, w, h,
-            app.theme.borderPrimary, 1);
+        app.canvas.DrawRect(x, y, w, h, app.theme.borderPrimary, 1);
         int ix = x + app.Scale(8);
         int iw = w - app.Scale(16);
-        int iy = y + app.Scale(10);
 
-        iy = this.PaletteSection(app, c, t, ix, iy, iw,
-            SceneDesigner.T("CONTROLS", "控件"), SceneDesigner.ControlKinds());
-        iy = this.PaletteSection(app, c, t, ix, iy, iw,
-            SceneDesigner.T("COMPONENTS", "组件"), SceneDesigner.ComponentKinds());
+        string ctlTitle = SceneDesigner.T("CONTROLS", "控件");
+        string cmpTitle = SceneDesigner.T("COMPONENTS", "组件");
+        string canTitle = SceneDesigner.T("CANVAS", "画布");
+        int canH = this.PalHeadH(app) + app.Scale(2) * 2 + app.Scale(30) * 2;
+        int contentH = this.PaletteSectionH(app, ctlTitle,
+                SceneDesigner.ControlKinds().Count)
+            + this.PaletteSectionH(app, cmpTitle,
+                SceneDesigner.ComponentKinds().Count)
+            + canH + app.Scale(16);
 
-        app.canvas.DrawStyledText(
-            Style.Of(app, "label", "hint small", Style.SNormal()),
-            ix, iy, SceneDesigner.T("CANVAS", "画布"),
-            app.theme.textPrimary, app.theme.fontSizeMedium);
-        iy = iy + app.Scale(18);
-        int bh = app.Scale(26);
-        int bw = (iw - app.Scale(6)) / 2;
-        string gl = SceneDesigner.T("Grid: off", "网格:关");
-        if (this.showGrid) { gl = SceneDesigner.T("Grid: on", "网格:开"); }
-        int gid = new Button { Text = gl }.Render(app, ix, iy, bw);
-        if (Ui.Clicked(app, gid)) { this.showGrid = !this.showGrid; app.RequestRedraw(); }
-        string sl = SceneDesigner.T("Snap: off", "吸附:关");
-        if (this.snap) { sl = SceneDesigner.T("Snap: on", "吸附:开"); }
-        int sid = new Button { Text = sl }.Render(app, ix + bw + app.Scale(6), iy, bw);
-        if (Ui.Clicked(app, sid)) { this.snap = !this.snap; app.RequestRedraw(); }
-        iy = iy + bh + app.Scale(4);
-        string tl = SceneDesigner.T("Tags: off", "标签:关");
-        if (this.showTags) { tl = SceneDesigner.T("Tags: on", "标签:开"); }
-        int tid = new Button { Text = tl }.Render(app, ix, iy, bw);
-        if (Ui.Clicked(app, tid)) { this.showTags = !this.showTags; app.RequestRedraw(); }
-        // 网格尺寸循环 4 -> 8 -> 16 -> 32（每格设计像素）。
-        string gsl = SceneDesigner.T("Grid ", "网格 ") + SceneDoc.IntStr(this.grid) + "px";
-        int gsid = new Button { Text = gsl }.Render(app, ix + bw + app.Scale(6), iy, bw);
-        if (Ui.Clicked(app, gsid)) {
-            if (this.grid == 4) { this.grid = 8; }
-            else if (this.grid == 8) { this.grid = 16; }
-            else if (this.grid == 16) { this.grid = 32; }
-            else { this.grid = 4; }
+        // 面板内部滚动：指针在面板上时占用滚轮，
+        // 否则整页跟着滚。
+        int maxScroll = contentH - h;
+        if (maxScroll < 0) { maxScroll = 0; }
+        if (SceneDesigner.InRect(app.mouseX, app.mouseY, x, y, w, h)
+                && app.CaptureWheel(x, y, w, h)) {
+            int delta = app.window.EventKeyCode();
+            this.palScroll = this.palScroll - delta * app.Scale(40) / 120;
             app.RequestRedraw();
+        }
+        if (this.palScroll > maxScroll) { this.palScroll = maxScroll; }
+        if (this.palScroll < 0) { this.palScroll = 0; }
+
+        c.PushClip(x + 1, y + 1, w - 2, h - 2);
+        int iy = y + app.Scale(10) - this.palScroll;
+        iy = this.PaletteSection(app, c, t, ix, iy, iw, ctlTitle,
+            SceneDesigner.ControlKinds());
+        iy = this.PaletteSection(app, c, t, ix, iy, iw, cmpTitle,
+            SceneDesigner.ComponentKinds());
+
+        // 画布开关留在面板底部：它们不是可拖拽的元素，
+        // 所以还是按钮，不做成工具箱行。
+        iy = this.PaletteHeader(app, c, t, canTitle, ix, iy, iw);
+        if (!this.PalFolded(canTitle)) {
+            int bh = app.Scale(26);
+            int bw = (iw - app.Scale(6)) / 2;
+            string gl = SceneDesigner.T("Grid: off", "网格:关");
+            if (this.showGrid) { gl = SceneDesigner.T("Grid: on", "网格:开"); }
+            int gid = new Button { Text = gl }.Render(app, ix, iy, bw);
+            if (Ui.Clicked(app, gid)) { this.showGrid = !this.showGrid; app.RequestRedraw(); }
+            string sl = SceneDesigner.T("Snap: off", "吸附:关");
+            if (this.snap) { sl = SceneDesigner.T("Snap: on", "吸附:开"); }
+            int sid = new Button { Text = sl }.Render(app, ix + bw + app.Scale(6), iy, bw);
+            if (Ui.Clicked(app, sid)) { this.snap = !this.snap; app.RequestRedraw(); }
+            iy = iy + bh + app.Scale(4);
+            string tl = SceneDesigner.T("Tags: off", "标签:关");
+            if (this.showTags) { tl = SceneDesigner.T("Tags: on", "标签:开"); }
+            int tid = new Button { Text = tl }.Render(app, ix, iy, bw);
+            if (Ui.Clicked(app, tid)) { this.showTags = !this.showTags; app.RequestRedraw(); }
+            // 网格尺寸循环 4 -> 8 -> 16 -> 32（每格设计像素）。
+            string gsl = SceneDesigner.T("Grid ", "网格 ") + SceneDoc.IntStr(this.grid) + "px";
+            int gsid = new Button { Text = gsl }.Render(app, ix + bw + app.Scale(6), iy, bw);
+            if (Ui.Clicked(app, gsid)) {
+                if (this.grid == 4) { this.grid = 8; }
+                else if (this.grid == 8) { this.grid = 16; }
+                else if (this.grid == 16) { this.grid = 32; }
+                else { this.grid = 4; }
+                app.RequestRedraw();
+            }
+        }
+        c.PopClip();
+
+        if (maxScroll > 0) {
+            Scrollbar.RenderVertical(app, x + w - app.Scale(7), y + 1,
+                h - 2, contentH, this.palScroll);
         }
     }
 
