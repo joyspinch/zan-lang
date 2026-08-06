@@ -264,6 +264,78 @@ static void test_shared_table(void) {
           "destroyed shared table can still be opened");
 }
 
+/* B1: file handles must be unforgeable. A handle is no longer a raw FILE*
+ * pointer but a (generation, index) ticket into a table, so a fabricated
+ * integer, a wrong-generation value, or a double close must fail cleanly
+ * instead of being dereferenced (a use-after-free / garbage-pointer crash
+ * before the fix). */
+static void test_file_handle(void) {
+    char path[160];
+#ifdef _WIN32
+    snprintf(path, sizeof(path), "rt_sync_fh_%lu_%lld.tmp",
+             (unsigned long)GetCurrentProcessId(), (long long)time(NULL));
+#else
+    snprintf(path, sizeof(path), "rt_sync_fh_%ld_%lld.tmp",
+             (long)getpid(), (long long)time(NULL));
+#endif
+
+    long long h = zan_file_open(path, "w+b");
+    CHECK(h != 0, "could not open scratch file");
+    if (!h) return;
+
+    const char *msg = "handle-table";
+    const long long n = (long long)strlen(msg);
+    char buf[32];
+    memset(buf, 0, sizeof(buf));
+
+    CHECK(zan_file_write(h, (long long)(intptr_t)msg, n) == n,
+          "could not write to open handle");
+    CHECK(zan_file_seek(h, 0, 0) == 0, "could not rewind handle");
+    CHECK(zan_file_read(h, (long long)(intptr_t)buf, n) == n,
+          "could not read back from handle");
+    CHECK(memcmp(buf, msg, (size_t)n) == 0, "read-back data mismatch");
+    CHECK(zan_file_tell(h) == n, "tell after read is wrong");
+    CHECK(zan_file_flush(h) == 1, "flush failed on open handle");
+
+    /* Forged handles must be rejected, never dereferenced. */
+    CHECK(zan_file_read(12345, (long long)(intptr_t)buf, 4) == 0,
+          "forged handle accepted by read");
+    CHECK(zan_file_write(12345, (long long)(intptr_t)msg, 4) == 0,
+          "forged handle accepted by write");
+    CHECK(zan_file_seek(12345, 0, 0) == -1, "forged handle accepted by seek");
+    CHECK(zan_file_tell(12345) == -1, "forged handle accepted by tell");
+    CHECK(zan_file_flush(12345) == -1, "forged handle accepted by flush");
+    CHECK(zan_file_close(12345) == 0, "forged handle accepted by close");
+    CHECK(zan_file_read(0, (long long)(intptr_t)buf, 4) == 0,
+          "zero handle accepted by read");
+
+    /* A live index carrying the wrong generation must not match either. */
+    CHECK(zan_file_read(h ^ (1LL << 32), (long long)(intptr_t)buf, 4) == 0,
+          "wrong-generation handle accepted by read");
+    CHECK(zan_file_close(h ^ (1LL << 32)) == 0,
+          "wrong-generation handle accepted by close");
+
+    /* Close once succeeds; the same handle again must be detected as stale. */
+    CHECK(zan_file_close(h) == 1, "first close failed");
+    CHECK(zan_file_close(h) == 0, "double close not detected");
+    CHECK(zan_file_read(h, (long long)(intptr_t)buf, 4) == 0,
+          "use-after-close handle accepted by read");
+
+    /* The slot is reusable, and the stale handle stays dead while the new one
+     * works (generation was bumped, so the stale ticket no longer matches). */
+    long long h2 = zan_file_open(path, "rb");
+    CHECK(h2 != 0, "could not reopen scratch file");
+    if (h2) {
+        CHECK(zan_file_close(h) == 0, "stale handle closed the reopened file");
+        CHECK(zan_file_read(h2, (long long)(intptr_t)buf, 4) == 4,
+              "reopened handle unusable after stale-handle close attempt");
+        CHECK(zan_file_close(h2) == 1, "could not close reopened file");
+        CHECK(zan_file_close(h2) == 0, "double close of reopened file accepted");
+    }
+
+    remove(path);
+}
+
 int main(int argc, char **argv) {
     if (argc == 3 && strcmp(argv[1], "--shared-child") == 0) {
         return shared_table_child(argv[2]);
@@ -271,6 +343,7 @@ int main(int argc, char **argv) {
 
     test_atomic_int();
     test_shared_table();
+    test_file_handle();
     printf("%d checks, %d failures\n", checks, failures);
     return failures == 0 ? 0 : 1;
 }

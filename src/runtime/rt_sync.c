@@ -1878,35 +1878,135 @@ long long zan_file_set_time(const char *path, int which, long long unix_sec) {
 }
 
 /* ---- file handles (System.IO.FileStream) ---------------------------------
- * FILE*-based stream IO with 64-bit offsets, exposed as an opaque handle so
- * zan code never spells FILE* (its size and the width of fseek's offset both
- * vary by platform). A handle is 0 when the open failed; every other call
- * treats 0 as a no-op so a failed open cannot corrupt memory.
+ * FILE*-based stream IO with 64-bit offsets, exposed as an opaque 64-bit
+ * handle so zan code never spells FILE* (its size and the width of fseek's
+ * offset both vary by platform). Handles are unforgeable: a handle is
+ * (gen << 32) | index into a fixed table of { FILE*, gen, open } slots, and
+ * every operation first checks the index range, the generation and the open
+ * flag under a mutex. A fabricated integer, a stale handle from a closed
+ * slot, or a double close no longer reaches fread/fclose on a bogus FILE*.
+ * A handle is 0 when the open failed; every other call treats 0 (and every
+ * other invalid handle) as a no-op so a failed open cannot corrupt memory.
+ * Table access is serialized; the captured FILE* is used outside the lock so
+ * blocking I/O never holds it.
  */
+
+#define ZAN_FH_CAP 1024
+typedef struct {
+    FILE *fp;
+    uint32_t gen;   /* bumped on every close; stale handles stop matching */
+    int open;
+} zan_fh_slot;
+static zan_fh_slot g_fh_table[ZAN_FH_CAP];
+static int g_fh_ready = 0;
+
+static void zan_fh_ensure(void) {
+    if (g_fh_ready) return;
+    int i = 0;
+    while (i < ZAN_FH_CAP) {
+        g_fh_table[i].fp = NULL;
+        g_fh_table[i].gen = 1;   /* gen 0 would make slot 0's handle read 0 */
+        g_fh_table[i].open = 0;
+        i = i + 1;
+    }
+    g_fh_ready = 1;
+}
+
+#ifdef _WIN32
+/* Same lazy-init discipline as the dispatch queue above: INIT_ONCE runs the
+ * critical-section constructor exactly once, so two threads opening files for
+ * the first time cannot race the table's first use. */
+static CRITICAL_SECTION g_fh_cs;
+static INIT_ONCE g_fh_once = INIT_ONCE_STATIC_INIT;
+
+static BOOL CALLBACK zan_fh_cs_init(PINIT_ONCE once, PVOID param, PVOID *ctx) {
+    (void)once; (void)param; (void)ctx;
+    InitializeCriticalSection(&g_fh_cs);
+    return TRUE;
+}
+
+static void zan_fh_lock(void) {
+    InitOnceExecuteOnce(&g_fh_once, zan_fh_cs_init, NULL, NULL);
+    EnterCriticalSection(&g_fh_cs);
+}
+static void zan_fh_unlock(void) { LeaveCriticalSection(&g_fh_cs); }
+#else
+static pthread_mutex_t g_fh_mx = PTHREAD_MUTEX_INITIALIZER;
+static void zan_fh_lock(void) { pthread_mutex_lock(&g_fh_mx); }
+static void zan_fh_unlock(void) { pthread_mutex_unlock(&g_fh_mx); }
+#endif
+
+/* Resolve `handle` to the table slot of a live open file, or -1 when the
+ * handle is forged: index out of range, wrong generation, or a closed slot.
+ * Call under the table lock. */
+static long zan_fh_index(long long handle) {
+    unsigned long long h = (unsigned long long)handle;
+    uint32_t idx = (uint32_t)(h & 0xFFFFFFFFULL);
+    uint32_t gen = (uint32_t)(h >> 32);
+    if (idx >= ZAN_FH_CAP) return -1;
+    zan_fh_slot *s = &g_fh_table[idx];
+    if (!s->open || s->fp == NULL || s->gen != gen) return -1;
+    return (long)idx;
+}
 
 /* `mode` is a stdio mode string ("rb", "wb", "r+b", "ab", ...). */
 long long zan_file_open(const char *path, const char *mode) {
     if (!path || !path[0] || !mode || !mode[0]) return 0;
     FILE *f = fopen(path, mode);
-    return (long long)(intptr_t)f;
+    if (!f) return 0;
+    zan_fh_lock();
+    zan_fh_ensure();
+    long long handle = 0;
+    int i = 0;
+    while (i < ZAN_FH_CAP) {
+        zan_fh_slot *s = &g_fh_table[i];
+        if (!s->open) {
+            if (s->gen == 0) { s->gen = 1; }   /* keep slot 0's handle nonzero */
+            s->fp = f;
+            s->open = 1;
+            /* build in unsigned to avoid signed-shift UB when gen's high bit
+             * is set (a long long is bit-preserving on the Zan side) */
+            handle = (long long)(((unsigned long long)s->gen << 32)
+                                 | (unsigned long long)(uint32_t)i);
+            break;
+        }
+        i = i + 1;
+    }
+    zan_fh_unlock();
+    if (handle == 0) { fclose(f); return 0; }  /* table full: fail gracefully */
+    return handle;
 }
 
 long long zan_file_read(long long handle, long long buf, long long count) {
-    FILE *f = (FILE *)(intptr_t)handle;
-    if (!f || !buf || count <= 0) return 0;
+    if (!buf || count <= 0) return 0;
+    zan_fh_lock();
+    zan_fh_ensure();
+    long idx = zan_fh_index(handle);
+    FILE *f = idx >= 0 ? g_fh_table[idx].fp : NULL;
+    zan_fh_unlock();
+    if (!f) return 0;
     return (long long)fread((void *)(intptr_t)buf, 1, (size_t)count, f);
 }
 
 long long zan_file_write(long long handle, long long buf, long long count) {
-    FILE *f = (FILE *)(intptr_t)handle;
-    if (!f || !buf || count <= 0) return 0;
+    if (!buf || count <= 0) return 0;
+    zan_fh_lock();
+    zan_fh_ensure();
+    long idx = zan_fh_index(handle);
+    FILE *f = idx >= 0 ? g_fh_table[idx].fp : NULL;
+    zan_fh_unlock();
+    if (!f) return 0;
     return (long long)fwrite((const void *)(intptr_t)buf, 1, (size_t)count, f);
 }
 
 /* `origin`: 0 = begin, 1 = current, 2 = end. Returns the new absolute
  * position, or -1 on failure. */
 long long zan_file_seek(long long handle, long long offset, int origin) {
-    FILE *f = (FILE *)(intptr_t)handle;
+    zan_fh_lock();
+    zan_fh_ensure();
+    long idx = zan_fh_index(handle);
+    FILE *f = idx >= 0 ? g_fh_table[idx].fp : NULL;
+    zan_fh_unlock();
     if (!f) return -1;
     int whence = origin == 1 ? SEEK_CUR : (origin == 2 ? SEEK_END : SEEK_SET);
 #ifdef _WIN32
@@ -1919,7 +2019,11 @@ long long zan_file_seek(long long handle, long long offset, int origin) {
 }
 
 long long zan_file_tell(long long handle) {
-    FILE *f = (FILE *)(intptr_t)handle;
+    zan_fh_lock();
+    zan_fh_ensure();
+    long idx = zan_fh_index(handle);
+    FILE *f = idx >= 0 ? g_fh_table[idx].fp : NULL;
+    zan_fh_unlock();
     if (!f) return -1;
 #ifdef _WIN32
     return (long long)_ftelli64(f);
@@ -1929,20 +2033,40 @@ long long zan_file_tell(long long handle) {
 }
 
 long long zan_file_flush(long long handle) {
-    FILE *f = (FILE *)(intptr_t)handle;
+    zan_fh_lock();
+    zan_fh_ensure();
+    long idx = zan_fh_index(handle);
+    FILE *f = idx >= 0 ? g_fh_table[idx].fp : NULL;
+    zan_fh_unlock();
     if (!f) return -1;
     return fflush(f) == 0 ? 1 : 0;
 }
 
 long long zan_file_close(long long handle) {
-    FILE *f = (FILE *)(intptr_t)handle;
-    if (!f) return 0;
+    zan_fh_lock();
+    zan_fh_ensure();
+    long idx = zan_fh_index(handle);
+    FILE *f = NULL;
+    if (idx >= 0) {
+        zan_fh_slot *s = &g_fh_table[idx];
+        s->open = 0;
+        f = s->fp;
+        s->fp = NULL;
+        s->gen = s->gen + 1;   /* invalidate every outstanding copy of the handle */
+        if (s->gen == 0) { s->gen = 1; }
+    }
+    zan_fh_unlock();
+    if (!f) return 0;   /* unknown or already-closed handle */
     return fclose(f) == 0 ? 1 : 0;
 }
 
 /* 1 once a read hit end-of-file on this handle. */
 long long zan_file_eof(long long handle) {
-    FILE *f = (FILE *)(intptr_t)handle;
+    zan_fh_lock();
+    zan_fh_ensure();
+    long idx = zan_fh_index(handle);
+    FILE *f = idx >= 0 ? g_fh_table[idx].fp : NULL;
+    zan_fh_unlock();
     if (!f) return 1;
     return feof(f) ? 1 : 0;
 }
