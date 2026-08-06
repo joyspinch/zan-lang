@@ -1,0 +1,855 @@
+using System;
+using System.Net;
+using System.Net.Sockets;
+using System.Net.Tls;
+using System.Threading;
+
+namespace System.Net.Http.Proxy;
+
+/// <summary>
+/// 转发链路的一端：明文套接字或 TLS 流。两种传输的收发
+/// 接口在此统一，转发逻辑因此只写一遍，而不是每处都判断
+/// http/https。
+///
+/// <see cref="RecvAsync"/> 返回本次真正到达的字节（对端关闭
+/// 时为空串），<see cref="SendAllAsync"/> 循环直到整段写出，
+/// 因此调用方永远不必自己处理部分写。
+/// </summary>
+class FwdChannel {
+    nint sock;
+    TlsStream tls;
+    TlsContext ctx;
+    bool closed;
+
+    FwdChannel(nint sock, TlsStream tls, TlsContext ctx) {
+        this.sock = sock;
+        this.tls = tls;
+        this.ctx = ctx;
+        this.closed = false;
+    }
+
+    /// <summary>明文 TCP 链路。</summary>
+    static FwdChannel OfSocket(nint sock) {
+        return new FwdChannel(sock, null, null);
+    }
+
+    /// <summary>TLS 链路；`ctx` 由本链路持有，关闭时释放。</summary>
+    static FwdChannel OfTls(nint sock, TlsStream tls, TlsContext ctx) {
+        return new FwdChannel(sock, tls, ctx);
+    }
+
+    /// <summary>本次到达的字节，最多 `max`；对端关闭或出错时为空串。</summary>
+    async string RecvAsync(int max) {
+        if (this.closed) { return ""; }
+        if (this.tls != null) {
+            return await this.tls.RecvAsync(max);
+        }
+        return await Socket.RecvAsync(this.sock, max);
+    }
+
+    /// <summary>写出整段 `data`；成功返回写出的字节数，
+    /// 对端提前关闭时返回已写出的部分长度。</summary>
+    async int SendAllAsync(string data) {
+        int total = data.Length;
+        if (total == 0) { return 0; }
+        if (this.closed) { return 0; }
+        int sent = 0;
+        while (sent < total) {
+            string rest = data.Substring(sent, total - sent);
+            int n;
+            if (this.tls != null) {
+                n = await this.tls.SendAsync(rest, rest.Length);
+            } else {
+                n = await Socket.SendAsync(this.sock, rest, rest.Length);
+            }
+            if (n <= 0) { return sent; }
+            sent = sent + n;
+        }
+        return sent;
+    }
+
+    /// <summary>关闭链路（幂等）。TLS 链路同时释放流与上下文。</summary>
+    void Close() {
+        if (this.closed) { return; }
+        this.closed = true;
+        if (this.tls != null) {
+            this.tls.Close();
+            this.tls = null;
+        }
+        if (this.sock >= 0) {
+            Socket.Close(this.sock);
+            this.sock = -1;
+        }
+        if (this.ctx != null) {
+            this.ctx.Free();
+            this.ctx = null;
+        }
+    }
+
+    bool IsClosed() {
+        return this.closed;
+    }
+}
+
+/// <summary>
+/// 带前瞻缓冲的链路读取器。转发要按行/按定长切出协议帧
+/// （请求头块、分块长度行），又不能吞掉属于下一帧的字节，
+/// 因此多读到的部分留在缓冲里，由 <see cref="TakeBuffered"/>
+/// 交给下一段直接转发——这是"边收边转"不丢字节的关键。
+/// </summary>
+class FwdReader {
+    FwdChannel ch;
+    string buf;
+    bool eof;
+    int chunkBytes;
+
+    FwdReader(FwdChannel ch, int chunkBytes) {
+        this.ch = ch;
+        this.buf = "";
+        this.eof = false;
+        this.chunkBytes = chunkBytes;
+    }
+
+    /// <summary>再读一批到缓冲；对端关闭时返回 false。</summary>
+    async bool FillAsync() {
+        if (this.eof) { return false; }
+        string c = await this.ch.RecvAsync(this.chunkBytes);
+        if (c.Length == 0) {
+            this.eof = true;
+            return false;
+        }
+        this.buf = this.buf + c;
+        return true;
+    }
+
+    /// <summary>读到请求/响应头块结束（含空行），最多 `cap` 字节；
+    /// 未见结束空行就断开或超过上限时返回空串。多读的正文字节
+    /// 留在缓冲中。</summary>
+    async string ReadHeadAsync(int cap) {
+        int scan = 0;
+        while (true) {
+            int idx = HttpForwarder.IndexOf(this.buf, "\r\n\r\n", scan);
+            if (idx >= 0) {
+                string head = this.buf.Substring(0, idx + 4);
+                this.buf = this.buf.Substring(idx + 4, this.buf.Length - idx - 4);
+                return head;
+            }
+            if (this.buf.Length >= cap) { return ""; }
+            scan = this.buf.Length - 3;
+            if (scan < 0) { scan = 0; }
+            bool more = await this.FillAsync();
+            if (!more) { return ""; }
+        }
+        return "";
+    }
+
+    /// <summary>读到行尾（含 CRLF），最多 `cap` 字节；行不完整就
+    /// 断开时返回空串。分块编码的长度行/尾部用它。</summary>
+    async string ReadLineAsync(int cap) {
+        int scan = 0;
+        while (true) {
+            int idx = HttpForwarder.IndexOf(this.buf, "\r\n", scan);
+            if (idx >= 0) {
+                string line = this.buf.Substring(0, idx + 2);
+                this.buf = this.buf.Substring(idx + 2, this.buf.Length - idx - 2);
+                return line;
+            }
+            if (this.buf.Length >= cap) { return ""; }
+            scan = this.buf.Length - 1;
+            if (scan < 0) { scan = 0; }
+            bool more = await this.FillAsync();
+            if (!more) { return ""; }
+        }
+        return "";
+    }
+
+    /// <summary>取出当前已缓冲的字节（可能为空），最多 `max` 个；
+    /// 缓冲为空时先读一批。对端关闭且无缓冲时返回空串。</summary>
+    async string ReadSomeAsync(int max) {
+        if (this.buf.Length == 0) {
+            bool more = await this.FillAsync();
+            if (!more) { return ""; }
+        }
+        int n = this.buf.Length;
+        if (n > max) { n = max; }
+        string piece = this.buf.Substring(0, n);
+        this.buf = this.buf.Substring(n, this.buf.Length - n);
+        return piece;
+    }
+
+    /// <summary>取走并清空缓冲（不再读取）。</summary>
+    string TakeBuffered() {
+        string b = this.buf;
+        this.buf = "";
+        return b;
+    }
+
+    bool AtEof() {
+        return this.eof && this.buf.Length == 0;
+    }
+}
+
+/// <summary>
+/// 流式 HTTP 反向代理/转发器。
+///
+/// 与"用 HttpClient 请求上游、拿到完整 HttpResponse 再回给
+/// 下游"的写法不同，这里全程只用套接字原语按块搬运：上游
+/// 响应头一到就立刻写给下游，之后每收到一块正文就立刻转出，
+/// 任何时刻都不缓冲整个响应。因此流式聊天（SSE /
+/// <c>text/event-stream</c>、逐 token 的分块响应）在下游是
+/// 实时可见的，CONNECT 与 101 Upgrade（WebSocket）则退化为
+/// 双向裸字节隧道。
+///
+/// 用法：
+///   HttpForwarder f = new HttpForwarder("127.0.0.1", 8787,
+///                                       "https://api.openai.com");
+///   f.SetTimeout(600000);          // 长连接的流式响应要给足时间
+///   await f.Start();
+///
+/// 逐跳（hop-by-hop）头部按 RFC 7230 6.1 剥离，Host 改写为上游
+/// 主机，并追加 X-Forwarded-For。上游连接按请求建立、请求结束
+/// 即关闭（<c>Connection: close</c>）：流式转发的价值在首字节
+/// 延迟，而不是连接复用，这样也不需要在两侧维护 keep-alive
+/// 帧状态。
+/// </summary>
+class HttpForwarder {
+    string listenHost;
+    int listenPort;
+    string upHost;
+    int upPort;
+    bool upTls;
+    bool verifyTls;
+    bool allowConnect;
+    int timeoutMs;
+    int maxHeadBytes;
+    int chunkBytes;
+    int maxConnections;
+    int active;
+    bool running;
+    TcpListener listener;
+
+    /// <summary>
+    /// `upstream` 可写为 <c>https://host[:port]</c>、
+    /// <c>http://host[:port]</c> 或 <c>host:port</c>（无协议时按
+    /// 明文 http，缺端口时 https 用 443、http 用 80）。
+    /// </summary>
+    HttpForwarder(string listenHost, int listenPort, string upstream) {
+        this.listenHost = listenHost;
+        this.listenPort = listenPort;
+        this.upTls = false;
+        this.upHost = "";
+        this.upPort = 80;
+        this.verifyTls = true;
+        this.allowConnect = true;
+        this.timeoutMs = 300000;
+        this.maxHeadBytes = 65536;
+        this.chunkBytes = 65536;
+        this.maxConnections = 4096;
+        this.active = 0;
+        this.running = false;
+        this.listener = null;
+        this.ParseUpstream(upstream);
+    }
+
+    void ParseUpstream(string upstream) {
+        string rest = upstream;
+        if (HttpForwarder.StartsWith(rest, "https://")) {
+            this.upTls = true;
+            this.upPort = 443;
+            rest = rest.Substring(8, rest.Length - 8);
+        } else if (HttpForwarder.StartsWith(rest, "http://")) {
+            this.upTls = false;
+            this.upPort = 80;
+            rest = rest.Substring(7, rest.Length - 7);
+        }
+        int slash = HttpForwarder.IndexOf(rest, "/", 0);
+        if (slash >= 0) { rest = rest.Substring(0, slash); }
+        int colon = HttpForwarder.LastIndexOf(rest, ":");
+        if (colon > 0) {
+            string p = rest.Substring(colon + 1, rest.Length - colon - 1);
+            int v = HttpForwarder.ParseInt(p);
+            if (v > 0) {
+                this.upPort = v;
+                rest = rest.Substring(0, colon);
+            }
+        }
+        this.upHost = rest;
+    }
+
+    /// <summary>空闲超时（毫秒）：两个方向都这么久没有字节
+    /// 才判定链路失效。流式响应之间的静默间隔可能很长，
+    /// 因此默认 5 分钟。</summary>
+    HttpForwarder SetTimeout(int ms) {
+        this.timeoutMs = ms;
+        return this;
+    }
+
+    /// <summary>单次搬运的块大小（字节）。</summary>
+    HttpForwarder SetChunkBytes(int bytes) {
+        this.chunkBytes = bytes;
+        return this;
+    }
+
+    /// <summary>请求/响应头块的上限（字节）。</summary>
+    HttpForwarder SetMaxHeadBytes(int bytes) {
+        this.maxHeadBytes = bytes;
+        return this;
+    }
+
+    /// <summary>最大并发连接数。</summary>
+    HttpForwarder SetMaxConnections(int max) {
+        this.maxConnections = max;
+        return this;
+    }
+
+    /// <summary>不校验上游证书（自签名上游/抓包调试用）。</summary>
+    HttpForwarder DisableTlsVerify() {
+        this.verifyTls = false;
+        return this;
+    }
+
+    /// <summary>禁用 CONNECT 隧道（默认允许，指向配置的上游）。</summary>
+    HttpForwarder DenyConnect() {
+        this.allowConnect = false;
+        return this;
+    }
+
+    /// <summary>上游是否为 https。</summary>
+    bool UpstreamTls() {
+        return this.upTls;
+    }
+
+    /// <summary>停止 accept 循环（已建立的连接自然收尾）。</summary>
+    void Stop() {
+        this.running = false;
+        if (this.listener != null) {
+            this.listener.Stop();
+        }
+    }
+
+    /// <summary>
+    /// 启动 accept 循环。每个下游连接在独立协程里转发，因此
+    /// 一路慢速流式响应不会挡住其他连接。运行期间不返回。
+    /// </summary>
+    async void Start() {
+        Socket.Initialize();
+        this.listener = new TcpListener(this.listenHost, this.listenPort);
+        this.listener.Start();
+        this.running = true;
+        while (this.running) {
+            nint client = await this.listener.AcceptAsync();
+            if (client < 0) { break; }
+            Socket.SetNoDelay(client);
+            if (this.active >= this.maxConnections) {
+                Task.Spawn(HttpForwarder.RejectBusy(client));
+            } else {
+                this.active = this.active + 1;
+                Task.Spawn(this.Serve(client));
+            }
+        }
+    }
+
+    static async void RejectBusy(nint clientSock) {
+        FwdChannel ch = FwdChannel.OfSocket(clientSock);
+        int _n = await ch.SendAllAsync(
+            "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 11\r\n"
+            + "Connection: close\r\n\r\nforwarder busy");
+        ch.Close();
+    }
+
+    async void Serve(nint clientSock) {
+        await this.ServeOnce(clientSock);
+        this.active = this.active - 1;
+    }
+
+    /// <summary>转发一个下游连接：读请求头 → 连上游 → 边收边转
+    /// 请求体 → 上游响应头即刻回传 → 边收边转响应体。</summary>
+    async void ServeOnce(nint clientSock) {
+        FwdChannel client = FwdChannel.OfSocket(clientSock);
+        FwdReader creader = new FwdReader(client, this.chunkBytes);
+        string head = await creader.ReadHeadAsync(this.maxHeadBytes);
+        if (head.Length == 0) {
+            client.Close();
+            return;
+        }
+        string method = HttpForwarder.MethodOf(head);
+        if (method == "CONNECT") {
+            if (!this.allowConnect) {
+                int _d = await client.SendAllAsync(
+                    "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n"
+                    + "Connection: close\r\n\r\n");
+                client.Close();
+                return;
+            }
+            await this.ServeConnect(client, creader);
+            return;
+        }
+
+        FwdChannel up = await this.ConnectUpstream();
+        if (up == null) {
+            int _b = await client.SendAllAsync(
+                "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 15\r\n"
+                + "Connection: close\r\n\r\nupstream failed");
+            client.Close();
+            return;
+        }
+
+        string peer = Socket.RemoteIp(clientSock);
+        string upHead = this.RewriteRequestHead(head, peer);
+        int sent = await up.SendAllAsync(upHead);
+        if (sent < upHead.Length) {
+            up.Close();
+            client.Close();
+            return;
+        }
+
+        // 请求体：Content-Length 精确搬运，chunked 逐块搬运，
+        // 都不等整体到齐（上传大文件/流式请求同样是流式的）。
+        await HttpForwarder.PumpBody(creader, up, head, true, this.chunkBytes);
+
+        FwdReader ureader = new FwdReader(up, this.chunkBytes);
+        string rhead = await ureader.ReadHeadAsync(this.maxHeadBytes);
+        if (rhead.Length == 0) {
+            int _g = await client.SendAllAsync(
+                "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 17\r\n"
+                + "Connection: close\r\n\r\nno upstream reply");
+            up.Close();
+            client.Close();
+            return;
+        }
+        // 响应头立刻回传：下游据此开始渲染（SSE 客户端要拿到
+        // Content-Type: text/event-stream 才会进入事件循环）。
+        string downHead = HttpForwarder.RewriteResponseHead(rhead);
+        int hs = await client.SendAllAsync(downHead);
+        if (hs < downHead.Length) {
+            up.Close();
+            client.Close();
+            return;
+        }
+
+        int status = HttpForwarder.StatusOf(rhead);
+        if (status == 101) {
+            // 协议已切换（WebSocket）：之后是双向裸字节。
+            await HttpForwarder.Tunnel(client, creader, up, ureader,
+                                       this.chunkBytes);
+            return;
+        }
+        await HttpForwarder.PumpBody(ureader, client, rhead, false,
+                                     this.chunkBytes);
+        up.Close();
+        client.Close();
+    }
+
+    /// <summary>CONNECT：连上游后回 200，然后双向裸字节对拷
+    /// （TLS 直通，转发器不解密）。</summary>
+    async void ServeConnect(FwdChannel client, FwdReader creader) {
+        nint sock = Socket.CreateTcp();
+        Socket.SetNonBlocking(sock);
+        int rc = await Socket.ConnectAsync(sock, this.upHost, this.upPort,
+                                           this.timeoutMs);
+        if (rc != 0) {
+            Socket.Close(sock);
+            int _b = await client.SendAllAsync(
+                "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n"
+                + "Connection: close\r\n\r\n");
+            client.Close();
+            return;
+        }
+        Socket.SetNoDelay(sock);
+        FwdChannel up = FwdChannel.OfSocket(sock);
+        int _o = await client.SendAllAsync(
+            "HTTP/1.1 200 Connection Established\r\n\r\n");
+        FwdReader ureader = new FwdReader(up, this.chunkBytes);
+        await HttpForwarder.Tunnel(client, creader, up, ureader,
+                                   this.chunkBytes);
+    }
+
+    /// <summary>建立上游连接（必要时完成 TLS 握手）。</summary>
+    async FwdChannel ConnectUpstream() {
+        nint sock = Socket.CreateTcp();
+        Socket.SetNonBlocking(sock);
+        int rc = await Socket.ConnectAsync(sock, this.upHost, this.upPort,
+                                           this.timeoutMs);
+        if (rc != 0) {
+            Socket.Close(sock);
+            return null;
+        }
+        Socket.SetNoDelay(sock);
+        if (!this.upTls) {
+            return FwdChannel.OfSocket(sock);
+        }
+        TlsContext ctx = TlsContext.CreateClient();
+        if (ctx == null) {
+            Socket.Close(sock);
+            return null;
+        }
+        if (!this.verifyTls) { ctx.DisableVerify(); }
+        TlsStream stream = await TlsStream.ConnectAsync(ctx, sock, this.upHost);
+        if (stream == null) {
+            Socket.Close(sock);
+            ctx.Free();
+            return null;
+        }
+        return FwdChannel.OfTls(sock, stream, ctx);
+    }
+
+    /// <summary>改写请求头：Host 指向上游、剥离逐跳头部、
+    /// 追加 X-Forwarded-For，并要求上游按请求关闭连接。</summary>
+    string RewriteRequestHead(string head, string peer) {
+        List<string> lines = HttpForwarder.HeadLines(head);
+        string outHead = "";
+        string hostValue = this.upHost;
+        if ((this.upTls && this.upPort != 443)
+            || (!this.upTls && this.upPort != 80)) {
+            hostValue = this.upHost + ":" + Convert.ToString(this.upPort);
+        }
+        string fwd = "";
+        for (int i = 0; i < lines.Count; i = i + 1) {
+            string line = lines[i];
+            if (i == 0) { outHead = outHead + line + "\r\n"; continue; }
+            string name = HttpForwarder.LowerName(line);
+            if (name == "host") { continue; }
+            if (HttpForwarder.IsHopByHop(name)) { continue; }
+            if (name == "x-forwarded-for") {
+                fwd = HttpForwarder.HeaderValueOfLine(line);
+                continue;
+            }
+            outHead = outHead + line + "\r\n";
+        }
+        outHead = outHead + "Host: " + hostValue + "\r\n";
+        if (peer.Length > 0) {
+            if (fwd.Length > 0) { fwd = fwd + ", " + peer; }
+            else { fwd = peer; }
+        }
+        if (fwd.Length > 0) {
+            outHead = outHead + "X-Forwarded-For: " + fwd + "\r\n";
+        }
+        outHead = outHead + "Connection: close\r\n\r\n";
+        return outHead;
+    }
+
+    /// <summary>改写响应头：剥离逐跳头部并标明连接将关闭。
+    /// Transfer-Encoding 保留（分块帧原样透传给下游）。</summary>
+    static string RewriteResponseHead(string head) {
+        List<string> lines = HttpForwarder.HeadLines(head);
+        string outHead = "";
+        for (int i = 0; i < lines.Count; i = i + 1) {
+            string line = lines[i];
+            if (i == 0) { outHead = outHead + line + "\r\n"; continue; }
+            string name = HttpForwarder.LowerName(line);
+            if (name == "connection" || name == "keep-alive"
+                || name == "proxy-connection") {
+                continue;
+            }
+            outHead = outHead + line + "\r\n";
+        }
+        outHead = outHead + "Connection: close\r\n\r\n";
+        return outHead;
+    }
+
+    /// <summary>
+    /// 按 `head` 声明的帧格式把正文从 `src` 搬到 `dst`，每收到
+    /// 一块立即写出：
+    ///   Transfer-Encoding: chunked —— 逐块转发，见到 0 块与尾部结束；
+    ///   Content-Length: n         —— 精确转发 n 字节；
+    ///   两者都没有                 —— 请求侧视为无正文，
+    ///                                响应侧一直转发到上游关闭
+    ///                                （SSE / 无长度的流式响应）。
+    /// </summary>
+    static async long PumpBody(FwdReader src, FwdChannel dst, string head,
+            bool isRequest, int chunkBytes) {
+        if (HttpForwarder.HeadIsChunked(head)) {
+            return await HttpForwarder.PumpChunked(src, dst, chunkBytes);
+        }
+        long len = HttpForwarder.ContentLengthOf(head);
+        if (len > 0) {
+            return await HttpForwarder.PumpExact(src, dst, len, chunkBytes);
+        }
+        if (len == 0) { return 0; }
+        if (isRequest) { return 0; }
+        return await HttpForwarder.PumpToEof(src, dst, chunkBytes);
+    }
+
+    /// <summary>精确搬运 `n` 字节。</summary>
+    static async long PumpExact(FwdReader src, FwdChannel dst, long n,
+            int chunkBytes) {
+        long left = n;
+        while (left > 0) {
+            int want = chunkBytes;
+            if (left < (long)want) { want = (int)left; }
+            string piece = await src.ReadSomeAsync(want);
+            if (piece.Length == 0) { return n - left; }
+            int w = await dst.SendAllAsync(piece);
+            if (w < piece.Length) { return n - left; }
+            left = left - (long)piece.Length;
+        }
+        return n;
+    }
+
+    /// <summary>一直搬运到源端关闭（无 Content-Length 的流式响应）。</summary>
+    static async long PumpToEof(FwdReader src, FwdChannel dst, int chunkBytes) {
+        long total = 0;
+        while (true) {
+            string piece = await src.ReadSomeAsync(chunkBytes);
+            if (piece.Length == 0) { return total; }
+            int w = await dst.SendAllAsync(piece);
+            if (w < piece.Length) { return total; }
+            total = total + (long)piece.Length;
+        }
+        return total;
+    }
+
+    /// <summary>逐块搬运分块编码：长度行原样透传，随后转发该块
+    /// 的数据与 CRLF；0 长度块后转发尾部直到空行结束。逐块转发
+    /// 正是流式聊天在下游能立刻显示的原因。</summary>
+    static async long PumpChunked(FwdReader src, FwdChannel dst,
+            int chunkBytes) {
+        long total = 0;
+        while (true) {
+            string sizeLine = await src.ReadLineAsync(chunkBytes);
+            if (sizeLine.Length == 0) { return total; }
+            int w = await dst.SendAllAsync(sizeLine);
+            if (w < sizeLine.Length) { return total; }
+            long size = HttpForwarder.ParseChunkSize(sizeLine);
+            if (size < 0) { return total; }
+            if (size == 0) {
+                // 尾部头部（可能为空）以空行结束。
+                while (true) {
+                    string trailer = await src.ReadLineAsync(chunkBytes);
+                    if (trailer.Length == 0) { return total; }
+                    int tw = await dst.SendAllAsync(trailer);
+                    if (tw < trailer.Length) { return total; }
+                    if (trailer == "\r\n") { return total; }
+                }
+            }
+            long moved = await HttpForwarder.PumpExact(src, dst, size + 2L,
+                                                       chunkBytes);
+            total = total + moved;
+            if (moved < size + 2L) { return total; }
+        }
+        return total;
+    }
+
+    /// <summary>双向裸字节隧道（CONNECT、101 Upgrade）。任一方向
+    /// 结束就关闭两端，另一方向随即收到 EOF 退出，因此
+    /// WhenAll 不会卡在半关闭的链路上。</summary>
+    static async void Tunnel(FwdChannel a, FwdReader ar, FwdChannel b,
+            FwdReader br, int chunkBytes) {
+        string pendingA = ar.TakeBuffered();
+        if (pendingA.Length > 0) {
+            int _wa = await b.SendAllAsync(pendingA);
+        }
+        string pendingB = br.TakeBuffered();
+        if (pendingB.Length > 0) {
+            int _wb = await a.SendAllAsync(pendingB);
+        }
+        List<long> tasks = new List<long>();
+        tasks.Add(Task.Spawn(HttpForwarder.PumpUntilClose(a, b, chunkBytes)));
+        tasks.Add(Task.Spawn(HttpForwarder.PumpUntilClose(b, a, chunkBytes)));
+        await Task.WhenAll(tasks);
+    }
+
+    static async void PumpUntilClose(FwdChannel src, FwdChannel dst,
+            int chunkBytes) {
+        while (true) {
+            string piece = await src.RecvAsync(chunkBytes);
+            if (piece.Length == 0) { break; }
+            int w = await dst.SendAllAsync(piece);
+            if (w < piece.Length) { break; }
+        }
+        src.Close();
+        dst.Close();
+    }
+
+    // ---- 头部解析辅助 ------------------------------------------------
+
+    /// <summary>头块按行切分（不含各行 CRLF，也不含结束空行）。</summary>
+    static List<string> HeadLines(string head) {
+        List<string> outv = new List<string>();
+        int start = 0;
+        int n = head.Length;
+        for (int i = 0; i < n; i = i + 1) {
+            if ((head[i] & 255) == 10) {
+                int end = i;
+                if (end > start && (head[end - 1] & 255) == 13) { end = end - 1; }
+                if (end > start) {
+                    outv.Add(head.Substring(start, end - start));
+                }
+                start = i + 1;
+            }
+        }
+        return outv;
+    }
+
+    /// <summary>请求行的方法（大写形式原样返回）。</summary>
+    static string MethodOf(string head) {
+        int n = head.Length;
+        for (int i = 0; i < n; i = i + 1) {
+            int b = head[i] & 255;
+            if (b == 32) { return head.Substring(0, i); }
+            if (b == 13 || b == 10) { return ""; }
+        }
+        return "";
+    }
+
+    /// <summary>状态行的状态码，无法解析时返回 0。</summary>
+    static int StatusOf(string head) {
+        int sp = HttpForwarder.IndexOf(head, " ", 0);
+        if (sp < 0) { return 0; }
+        int start = sp + 1;
+        int end = start;
+        while (end < head.Length) {
+            int b = head[end] & 255;
+            if (b < 48 || b > 57) { break; }
+            end = end + 1;
+        }
+        if (end == start) { return 0; }
+        return HttpForwarder.ParseInt(head.Substring(start, end - start));
+    }
+
+    /// <summary>头部行的字段名（小写）；不是头部行时返回空串。</summary>
+    static string LowerName(string line) {
+        int colon = HttpForwarder.IndexOf(line, ":", 0);
+        if (colon <= 0) { return ""; }
+        return HttpForwarder.Lower(line.Substring(0, colon));
+    }
+
+    /// <summary>头部行的字段值（两端空白已去除）。</summary>
+    static string HeaderValueOfLine(string line) {
+        int colon = HttpForwarder.IndexOf(line, ":", 0);
+        if (colon < 0) { return ""; }
+        string v = line.Substring(colon + 1, line.Length - colon - 1);
+        return HttpForwarder.Trim(v);
+    }
+
+    /// <summary>头块中 `name`（小写）的值，缺失时为空串。</summary>
+    static string HeaderValue(string head, string name) {
+        List<string> lines = HttpForwarder.HeadLines(head);
+        for (int i = 1; i < lines.Count; i = i + 1) {
+            if (HttpForwarder.LowerName(lines[i]) == name) {
+                return HttpForwarder.HeaderValueOfLine(lines[i]);
+            }
+        }
+        return "";
+    }
+
+    /// <summary>逐跳头部（RFC 7230 6.1）：只对单段连接有意义，
+    /// 不应转发给上游。</summary>
+    static bool IsHopByHop(string name) {
+        return name == "connection" || name == "proxy-connection"
+            || name == "keep-alive" || name == "te" || name == "trailer"
+            || name == "transfer-encoding" || name == "upgrade"
+            || name == "proxy-authenticate" || name == "proxy-authorization";
+    }
+
+    /// <summary>头块声明了分块传输编码。</summary>
+    static bool HeadIsChunked(string head) {
+        string te = HttpForwarder.Lower(
+            HttpForwarder.HeaderValue(head, "transfer-encoding"));
+        return HttpForwarder.IndexOf(te, "chunked", 0) >= 0;
+    }
+
+    /// <summary>Content-Length 的值；未声明时返回 -1。</summary>
+    static long ContentLengthOf(string head) {
+        string v = HttpForwarder.HeaderValue(head, "content-length");
+        if (v.Length == 0) { return -1; }
+        long n = 0;
+        for (int i = 0; i < v.Length; i = i + 1) {
+            int b = v[i] & 255;
+            if (b < 48 || b > 57) { return n; }
+            n = n * 10 + (long)(b - 48);
+        }
+        return n;
+    }
+
+    /// <summary>分块长度行（十六进制，可带 ";ext"）的字节数；
+    /// 非法时返回 -1。</summary>
+    static long ParseChunkSize(string line) {
+        long n = 0;
+        bool any = false;
+        for (int i = 0; i < line.Length; i = i + 1) {
+            int b = line[i] & 255;
+            int d = -1;
+            if (b >= 48 && b <= 57) { d = b - 48; }
+            else if (b >= 97 && b <= 102) { d = b - 87; }
+            else if (b >= 65 && b <= 70) { d = b - 55; }
+            else { break; }
+            n = n * 16 + (long)d;
+            any = true;
+        }
+        if (!any) { return -1; }
+        return n;
+    }
+
+    static int ParseInt(string s) {
+        int n = 0;
+        bool any = false;
+        for (int i = 0; i < s.Length; i = i + 1) {
+            int b = s[i] & 255;
+            if (b < 48 || b > 57) { break; }
+            n = n * 10 + (b - 48);
+            any = true;
+        }
+        if (!any) { return 0; }
+        return n;
+    }
+
+    static string Lower(string s) {
+        string lo = "abcdefghijklmnopqrstuvwxyz";
+        string outs = "";
+        for (int i = 0; i < s.Length; i = i + 1) {
+            int b = s[i] & 255;
+            if (b >= 65 && b <= 90) { outs = outs + lo.Substring(b - 65, 1); }
+            else { outs = outs + s.Substring(i, 1); }
+        }
+        return outs;
+    }
+
+    static string Trim(string s) {
+        int a = 0;
+        int b = s.Length;
+        while (a < b) {
+            int c = s[a] & 255;
+            if (c == 32 || c == 9) { a = a + 1; } else { break; }
+        }
+        while (b > a) {
+            int c = s[b - 1] & 255;
+            if (c == 32 || c == 9 || c == 13 || c == 10) { b = b - 1; }
+            else { break; }
+        }
+        return s.Substring(a, b - a);
+    }
+
+    static bool StartsWith(string s, string prefix) {
+        if (s.Length < prefix.Length) { return false; }
+        return s.Substring(0, prefix.Length) == prefix;
+    }
+
+    static int IndexOf(string hay, string needle, int from) {
+        int n = hay.Length;
+        int m = needle.Length;
+        if (m == 0) { return from; }
+        int start = from;
+        if (start < 0) { start = 0; }
+        for (int i = start; i + m <= n; i = i + 1) {
+            int k = 0;
+            while (k < m && (hay[i + k] & 255) == (needle[k] & 255)) {
+                k = k + 1;
+            }
+            if (k == m) { return i; }
+        }
+        return -1;
+    }
+
+    static int LastIndexOf(string hay, string needle) {
+        int found = -1;
+        int from = 0;
+        while (true) {
+            int idx = HttpForwarder.IndexOf(hay, needle, from);
+            if (idx < 0) { return found; }
+            found = idx;
+            from = idx + 1;
+        }
+        return found;
+    }
+}

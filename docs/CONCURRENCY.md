@@ -17,26 +17,50 @@ Zan provides **Go-style native concurrency** with lightweight tasks (coroutines)
 
 ### 2.1 Spawning Tasks
 
+> **Implemented surface.** The rest of this document is the design target; the
+> shipped task API is exactly the following, and it takes an *async call* rather
+> than a lambda (a spawned coroutine is a state machine the compiler lowers from
+> a named `async` method):
+>
+> | Form | Meaning |
+> |------|---------|
+> | `long h = Task.Spawn(Worker(x))` | run `Worker` as a detached coroutine, return its handle |
+> | `long h = Task.Run(Worker(x))` | same lowering under this document's name |
+> | `await Task.Delay(ms)` | suspend this coroutine for `ms` (sleeps at a non-async root) |
+> | `await Task.WhenAll(handles)` | suspend until every handle in a `List<long>` has completed |
+> | `await Task.WhenAny(handles)` | suspend until one has completed; yields its index |
+> | `Task.IsDone(h)` | 1 once that coroutine finished (also 1 for a handle whose frame was reaped) |
+> | `Task.Cancel(h)` / `Task.IsCancellationRequested()` | cooperative cancellation, propagated down the await chain |
+> | `TaskJoin.CancelAll(handles)` | cancel every handle not yet finished |
+>
+> A handle is not a `Task<T>`: the joins observe *completion only*: no result,
+> no exception hand-off. A spawned coroutine publishes its result through shared
+> state (a static field, a queue, `System.Threading.BlockingQueue`) that the
+> joiner reads after the join. Channels, `TaskGroup`, lambda-form `Task.Run` and
+> `CancellationToken` parameters below are not implemented yet.
+
 ```csharp
 using System;
-using System.Threading;
 
 class Program {
-    static void Main() {
-        // Spawn a lightweight task (like Go's goroutine)
-        Task.Run(() => {
-            Console.WriteLine("Hello from task!");
-        });
-
-        // Spawn with return value
-        var result = Task.Run(() => {
-            return ComputeExpensiveValue();
-        });
-
-        // Await the result
-        int value = await result;
-        Console.WriteLine($"Result: {value}");
+    static async int Work(int ms, string tag) {
+        await Task.Delay(ms);
+        Console.WriteLine("done: " + tag);
+        return ms;
     }
+
+    static async int Run() {
+        // fan out: each spawn is an independent lightweight coroutine
+        List<long> tasks = new List<long>();
+        tasks.Add(Task.Spawn(Program.Work(30, "a")));
+        tasks.Add(Task.Spawn(Program.Work(10, "b")));
+
+        // aggregate: suspends until both have finished
+        await Task.WhenAll(tasks);
+        return 0;
+    }
+
+    static async void Main() { await Program.Run(); }
 }
 ```
 

@@ -1,0 +1,212 @@
+// System.Net.Http.Proxy.HttpForwarder smoke test: the forwarder must relay
+// bodies as they arrive instead of buffering the whole response (which is what
+// made streaming chat / SSE unusable through a buffering forwarder).
+//
+// The upstream here is a raw socket server so the wire is fully controlled: it
+// answers /stream with chunked transfer encoding, sleeping between chunks, and
+// /echo with the request head it received (Content-Length framed) so header
+// rewriting is observable. The client counts how many separate reads delivered
+// the streamed body: with a buffering forwarder every chunk arrives in one
+// read after the upstream is done, so "progressive" would be 0.
+using System;
+using System.Net.Sockets;
+using System.Net.Http.Proxy;
+
+namespace Conf;
+
+class Prog {
+    static int UP_PORT = 9611;
+    static int FWD_PORT = 9612;
+    static string echoHead;
+
+    static async void Upstream() {
+        TcpListener l = new TcpListener("127.0.0.1", Prog.UP_PORT);
+        l.Start();
+        int served = 0;
+        while (served < 2) {
+            nint c = await l.AcceptAsync();
+            if (c < 0) { break; }
+            served = served + 1;
+            Task.Spawn(Prog.ServeUpstream(c));
+        }
+        l.Stop();
+    }
+
+    static async void ServeUpstream(nint c) {
+        string head = "";
+        while (Prog.Find(head, "\r\n\r\n") < 0) {
+            string piece = await Socket.RecvAsync(c, 8192);
+            if (piece.Length == 0) { break; }
+            head = head + piece;
+        }
+        int hb = Prog.Find(head, "\r\n\r\n");
+        if (hb < 0) { Socket.Close(c); return; }
+        string headOnly = head.Substring(0, hb + 4);
+        string body = head.Substring(hb + 4, head.Length - hb - 4);
+
+        if (Prog.Find(headOnly, "/stream") >= 0) {
+            int _h = await Socket.SendStringAsync(c,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+                + "Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n");
+            // Three chunks, spaced out: a streaming forwarder delivers each
+            // one to the client before the next is produced.
+            for (int i = 1; i <= 3; i = i + 1) {
+                string payload = "tick" + Convert.ToString(i);
+                int _c = await Socket.SendStringAsync(c,
+                    "5\r\n" + payload + "\r\n");
+                await Task.Delay(80);
+            }
+            int _e = await Socket.SendStringAsync(c, "0\r\n\r\n");
+            Socket.Close(c);
+            return;
+        }
+
+        // /echo: report what the forwarder actually sent upstream.
+        string report = headOnly + body;
+        int _o = await Socket.SendStringAsync(c,
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n"
+            + "Content-Length: " + Convert.ToString(report.Length) + "\r\n"
+            + "Connection: close\r\n\r\n" + report);
+        Socket.Close(c);
+    }
+
+    /// Reads a whole response, counting how many separate reads carried body
+    /// bytes. Returns head + "\n\n" + body, with the read count appended by
+    /// the caller through Prog.bodyReads.
+    static int bodyReads;
+
+    static async string ReadResponse(TcpClient c) {
+        string all = "";
+        int hb = -1;
+        Prog.bodyReads = 0;
+        while (true) {
+            string piece = await c.RecvAsync(8192);
+            if (piece.Length == 0) { break; }
+            if (hb < 0) {
+                all = all + piece;
+                hb = Prog.Find(all, "\r\n\r\n");
+                if (hb >= 0 && all.Length > hb + 4) {
+                    Prog.bodyReads = Prog.bodyReads + 1;
+                }
+            } else {
+                all = all + piece;
+                Prog.bodyReads = Prog.bodyReads + 1;
+            }
+        }
+        return all;
+    }
+
+    /// Strips chunked framing from a body (the forwarder passes the frames
+    /// through untouched, so the client sees real chunked encoding).
+    static string DeChunk(string body) {
+        string outs = "";
+        int i = 0;
+        while (i < body.Length) {
+            int nl = Prog.FindFrom(body, "\r\n", i);
+            if (nl < 0) { break; }
+            string sizeLine = body.Substring(i, nl - i);
+            long size = 0;
+            bool any = false;
+            for (int k = 0; k < sizeLine.Length; k = k + 1) {
+                int b = sizeLine[k] & 255;
+                int d = -1;
+                if (b >= 48 && b <= 57) { d = b - 48; }
+                else if (b >= 97 && b <= 102) { d = b - 87; }
+                else if (b >= 65 && b <= 70) { d = b - 55; }
+                else { break; }
+                size = size * 16 + (long)d;
+                any = true;
+            }
+            if (!any) { break; }
+            i = nl + 2;
+            if (size == 0) { break; }
+            int take = (int)size;
+            if (i + take > body.Length) { take = body.Length - i; }
+            outs = outs + body.Substring(i, take);
+            i = i + take + 2;
+        }
+        return outs;
+    }
+
+    static int Find(string hay, string needle) {
+        return Prog.FindFrom(hay, needle, 0);
+    }
+
+    static int FindFrom(string hay, string needle, int from) {
+        int n = hay.Length;
+        int m = needle.Length;
+        for (int i = from; i + m <= n; i = i + 1) {
+            int k = 0;
+            while (k < m && (hay[i + k] & 255) == (needle[k] & 255)) {
+                k = k + 1;
+            }
+            if (k == m) { return i; }
+        }
+        return -1;
+    }
+
+    static async int Run() {
+        Socket.Initialize();
+        Task.Spawn(Prog.Upstream());
+        HttpForwarder fwd = new HttpForwarder("127.0.0.1", Prog.FWD_PORT,
+            "http://127.0.0.1:" + Convert.ToString(Prog.UP_PORT));
+        fwd.SetTimeout(10000);
+        Task.Spawn(fwd.Start());
+        await Task.Delay(120);
+
+        // 1. streamed (chunked) response
+        TcpClient c1 = await TcpClient.ConnectAsync("127.0.0.1", Prog.FWD_PORT,
+                                                    5000);
+        if (c1 == null) { Console.WriteLine("connect failed"); return 1; }
+        int _s1 = await c1.SendAsync(
+            "GET /stream HTTP/1.1\r\nHost: front\r\nAccept: text/event-stream"
+            + "\r\n\r\n");
+        string r1 = await Prog.ReadResponse(c1);
+        int reads = Prog.bodyReads;
+        c1.Close();
+        int hb1 = Prog.Find(r1, "\r\n\r\n");
+        string head1 = r1.Substring(0, hb1);
+        string body1 = r1.Substring(hb1 + 4, r1.Length - hb1 - 4);
+        Console.WriteLine("stream-status-200: "
+            + Convert.ToString(Prog.Find(head1, "200 OK") >= 0 ? 1 : 0));
+        Console.WriteLine("stream-chunked: "
+            + Convert.ToString(Prog.Find(head1, "chunked") >= 0 ? 1 : 0));
+        Console.WriteLine("stream-body: " + Prog.DeChunk(body1));
+        Console.WriteLine("stream-progressive: "
+            + Convert.ToString(reads >= 2 ? 1 : 0));
+
+        // 2. request with a body; upstream echoes the head the forwarder sent
+        TcpClient c2 = await TcpClient.ConnectAsync("127.0.0.1", Prog.FWD_PORT,
+                                                    5000);
+        if (c2 == null) { Console.WriteLine("connect failed"); return 1; }
+        string payload = "hello-upstream";
+        int _s2 = await c2.SendAsync(
+            "POST /echo HTTP/1.1\r\nHost: front\r\nContent-Length: "
+            + Convert.ToString(payload.Length)
+            + "\r\nConnection: keep-alive\r\n\r\n" + payload);
+        string r2 = await Prog.ReadResponse(c2);
+        c2.Close();
+        int hb2 = Prog.Find(r2, "\r\n\r\n");
+        string echoed = r2.Substring(hb2 + 4, r2.Length - hb2 - 4);
+        Console.WriteLine("echo-host-rewritten: "
+            + Convert.ToString(Prog.Find(echoed,
+                "Host: 127.0.0.1:" + Convert.ToString(Prog.UP_PORT)) >= 0
+                ? 1 : 0));
+        Console.WriteLine("echo-xff: "
+            + Convert.ToString(Prog.Find(echoed, "X-Forwarded-For:") >= 0
+                ? 1 : 0));
+        Console.WriteLine("echo-hop-stripped: "
+            + Convert.ToString(Prog.Find(echoed, "keep-alive") < 0 ? 1 : 0));
+        Console.WriteLine("echo-body: "
+            + echoed.Substring(echoed.Length - payload.Length,
+                               payload.Length));
+
+        fwd.Stop();
+        Console.WriteLine("forwarder-ok: 1");
+        return 0;
+    }
+
+    static void Main() {
+        int r = await Prog.Run();
+    }
+}

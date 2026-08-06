@@ -129,6 +129,18 @@ partial class ZanIDE {
         return buf.ToStr(0, n);
     }
 
+    /// Filters of the Open File dialog: Zan sources plus the scripts a Zan
+    /// program embeds (System.Scripting.Lua, Python), which the editor
+    /// highlights and completes in their own language.
+    static List<FileFilter> OpenFileFilters() {
+        List<FileFilter> fs = new List<FileFilter>();
+        fs.Add(new FileFilter(ZanIDE.T("Zan source", "Zan 源文件"), ".zan"));
+        fs.Add(new FileFilter(ZanIDE.T("Script (Lua / Python)", "脚本 (Lua / Python)"),
+                              ".lua;.py;.pyw"));
+        fs.Add(new FileFilter(ZanIDE.T("All files", "所有文件"), ""));
+        return fs;
+    }
+
     /// Directory that contains the running IDE executable, with no trailing
     /// separator. Used so the toolchain (zanc + its stdlib) is located relative
     /// to the IDE rather than a hard-coded absolute path — makes the IDE portable.
@@ -793,9 +805,14 @@ partial class ZanIDE {
             ZanIDE.T("Add a new source file to the current project.",
                 "在当前工程中新建源文件。")));
         actions.Add(1);
-        file.Add(RibbonItem.Small("folder", ZanIDE.T("Open", "打开")).SetTip(
-            ZanIDE.T("Open a folder as the workspace.", "打开一个文件夹作为工作区。")));
+        file.Add(RibbonItem.Small("file", ZanIDE.T("Open", "打开")).SetTip(
+            ZanIDE.T("Open a single source file in the editor.",
+                "在编辑器中打开单个源文件。")));
         actions.Add(2);
+        file.Add(RibbonItem.Small("folder", ZanIDE.T("Open Project", "打开项目")).SetTip(
+            ZanIDE.T("Open a folder as the workspace; its zan.proj becomes the project.",
+                "打开一个文件夹作为工作区，其中的 zan.proj 即为当前工程。")));
+        actions.Add(16);
         file.Add(RibbonItem.Small("save", ZanIDE.T("Save", "保存")).SetTip(
             ZanIDE.T("Write the active editor back to disk (Ctrl+S).",
                 "把当前编辑器的内容写回磁盘（Ctrl+S）。")));
@@ -1884,9 +1901,9 @@ partial class ZanIDE {
                         log.Add(ZanIDE.T("> The design JSON is read-only here; edit the design, or open Name.zan for logic.", "> 设计 JSON 此处只读；请修改设计，或打开 Name.zan 编写逻辑。"));
                     } else if (aSv >= 0 && aSv < tabs.Count
                             && ZanIDE.IsScenePath(tabs[aSv].path) && codeViewForm == tabs[aSv].path) {
-                        // The .zscene code view shows the generated Name.g.zan,
-                        // which is rewritten from the design - it is read-only here.
-                        log.Add(ZanIDE.T("> Generated scene file is read-only; edit the design, or open Name.zan for logic.", "> 生成的场景文件只读；请修改设计，或打开 Name.zan 编写逻辑。"));
+                        // The .zscene code view shows the code the compiler
+                        // projects from the design - it is read-only here.
+                        log.Add(ZanIDE.T("> The projected scene code is read-only; edit the design, or open Name.zan for logic.", "> 场景投影代码只读；请修改设计，或打开 Name.zan 编写逻辑。"));
                     } else if (!designerMode && !sceneMode && aSv >= 0 && aSv < tabs.Count && tabs[aSv].path != "@start") {
                         this.SaveActiveTab();
                         if (autoRun) { hotReloadReq = true; }
@@ -1973,10 +1990,17 @@ partial class ZanIDE {
                     dlg = ZanIDE.OpenWizard(app, ZanIDE.T("New File", "新建文件"), fSel, fNameInput, "NewFile");
                     dlgMode = 2;
                 } else if (rc == 2) {
-                    pathPicker.BeginOpenFile(
-                        ZanIDE.ReadLastPickerDirectory(root), ".zan",
-                        ZanIDE.T("Open Zan source file", "打开 Zan 源文件"));
+                    pathPicker.BeginOpenFileFilters(
+                        ZanIDE.ReadLastPickerDirectory(root),
+                        ZanIDE.OpenFileFilters(),
+                        ZanIDE.T("Open source file", "打开源文件"));
                     pathPickerOwner = 4;
+                    app.RequestRedraw();
+                } else if (rc == 16) {
+                    pathPicker.BeginFolder(
+                        ZanIDE.ReadLastPickerDirectory(root),
+                        ZanIDE.T("Open a project folder", "打开项目文件夹"));
+                    pathPickerOwner = 10;
                     app.RequestRedraw();
                 } else if (rc == 3) {
                     int aSv3 = activeTab.Get();
@@ -1986,8 +2010,8 @@ partial class ZanIDE {
                         log.Add(ZanIDE.T("> The design JSON is read-only here; edit the design, or open Name.zan for logic.", "> 设计 JSON 此处只读；请修改设计，或打开 Name.zan 编写逻辑。"));
                     } else if (aSv3 >= 0 && aSv3 < tabs.Count
                             && ZanIDE.IsScenePath(tabs[aSv3].path) && codeViewForm == tabs[aSv3].path) {
-                        // Generated Name.g.zan is read-only in the scene code view.
-                        log.Add(ZanIDE.T("> Generated scene file is read-only; edit the design, or open Name.zan for logic.", "> 生成的场景文件只读；请修改设计，或打开 Name.zan 编写逻辑。"));
+                        // The projected scene code is read-only in the code view.
+                        log.Add(ZanIDE.T("> The projected scene code is read-only; edit the design, or open Name.zan for logic.", "> 场景投影代码只读；请修改设计，或打开 Name.zan 编写逻辑。"));
                     } else {
                         this.SaveActiveTab();
                         if (autoRun) { hotReloadReq = true; }
@@ -2300,6 +2324,10 @@ partial class ZanIDE {
                     if (act >= 0 && act < tabs.Count
                         && !ZanIDE.IsFormPath(tabs[act].path)
                         && !ZanIDE.IsScenePath(tabs[act].path)) {
+                        // Highlighting, completion and Ctrl+/ follow the file's
+                        // language: an embedded .lua/.py script is not Zan.
+                        editor.SetSyntaxLang(
+                            CodeEditor.LangForName(tabs[act].path));
                         editor.LoadText(tabs[act].body);
                         // Feed the project's other sources to the editor so it
                         // can resolve cross-file types (a `Utils` class in
@@ -2413,24 +2441,20 @@ partial class ZanIDE {
                         tabs[act].body = snewser;
                         if (spath.Length > 0 && spath.Substring(0, 1) != "@") {
                             File.WriteAllText(spath, snewser);
-                            // Regenerate the strongly-typed scene file (Name.g.zan)
-                            // from the design; create the business Name.zan only
-                            // when missing - the designer never overwrites it.
+                            // The .zscene is the only file the design lives in
+                            // (zanc projects the typed elements at compile
+                            // time); create the business Name.zan only when
+                            // missing - the designer never overwrites it.
                             string sname = ZanIDE.SceneBaseName(spath);
-                            string sgenP = ZanIDE.SceneGenFilePath(spath);
-                            string sgenNew = ZanIDE.GenSceneFile(sname, sceneDesigner.doc);
-                            File.WriteAllText(sgenP, sgenNew);
-                            int sgTab = ZanIDE.FindTabByPath(tabs, sgenP);
-                            if (sgTab >= 0) { tabs[sgTab].body = sgenNew; }
                             string scbP = ZanIDE.SceneCodeBehindPath(spath);
                             if (!File.Exists(scbP)) {
                                 File.WriteAllText(scbP, ZanIDE.GenSceneBusinessShell(sname));
                             }
-                            // Push the design and the regenerated typed file to
-                            // zan-lsp so element completion tracks the designer.
+                            // Push the design to zan-lsp, which projects the
+                            // typed elements from the JSON itself, so element
+                            // completion tracks the designer.
                             if (lspSess != null && lspSess.Alive()) {
                                 lspSess.SyncDoc(spath, snewser);
-                                lspSess.SyncDoc(sgenP, sgenNew);
                             }
                         }
                         sceneCache = snewser;
@@ -2468,10 +2492,17 @@ partial class ZanIDE {
                         dlgMode = 2;
                         app.RequestRedraw();
                     } else if (sact == 3) {
-                        pathPicker.BeginOpenFile(
-                            ZanIDE.ReadLastPickerDirectory(root), ".zan",
-                            ZanIDE.T("Open Zan source file", "打开 Zan 源文件"));
+                        pathPicker.BeginOpenFileFilters(
+                            ZanIDE.ReadLastPickerDirectory(root),
+                            ZanIDE.OpenFileFilters(),
+                            ZanIDE.T("Open source file", "打开源文件"));
                         pathPickerOwner = 4;
+                        app.RequestRedraw();
+                    } else if (sact == 4) {
+                        pathPicker.BeginFolder(
+                            ZanIDE.ReadLastPickerDirectory(root),
+                            ZanIDE.T("Open a project folder", "打开项目文件夹"));
+                        pathPickerOwner = 10;
                         app.RequestRedraw();
                     } else if (sact >= 200) {
                         string nurl = startPage.NewsLink(sact - 200);
@@ -2510,17 +2541,14 @@ partial class ZanIDE {
                     }
                 } else if (act >= 0 && act < tabs.Count
                         && ZanIDE.IsScenePath(tabs[act].path) && codeViewForm == tabs[act].path) {
-                    // Code view of the current .zscene: show the generated,
-                    // strongly-typed scene file (Name.g.zan) in place - the
-                    // read-only "Designer" half. The scene is edited visually;
-                    // game logic lives in the sibling Name.zan tab.
+                    // Code view of the current .zscene: show the strongly-typed
+                    // scene code the compiler projects from the design - the
+                    // read-only "Designer" half, kept in memory only. The scene
+                    // is edited visually; game logic lives in Name.zan.
                     string spC = tabs[act].path;
                     if (formCodeLoaded != spC) {
-                        string sgenC = ZanIDE.SceneGenFilePath(spC);
                         string sTxt = "";
-                        if (File.Exists(sgenC)) {
-                            sTxt = File.ReadAllText(sgenC);
-                        } else if (File.Exists(spC)) {
+                        if (File.Exists(spC)) {
                             sTxt = ZanIDE.GenSceneFile(ZanIDE.SceneBaseName(spC),
                                 SceneDoc.Parse(File.ReadAllText(spC)));
                         }
@@ -4477,7 +4505,12 @@ partial class ZanIDE {
                 int curLn = editor.CurLine();
                 int curCl = editor.CurCol();
                 string posInfo = ZanIDE.T("Ln ", "行 ") + Convert.ToString(curLn + 1) + ZanIDE.T(", Col ", "，列 ") + Convert.ToString(curCl + 1);
+                // Language of the buffer, so an embedded .lua/.py script
+                // edited next to its Zan host shows which rules the editor
+                // is applying (highlighting, comment mark, completion).
                 string modeInfo = "Zan";
+                if (editor.SyntaxLang() == 1) { modeInfo = "Lua"; }
+                if (editor.SyntaxLang() == 2) { modeInfo = "Python"; }
                 if (designerMode) { modeInfo = ZanIDE.T("Designer", "设计器"); }
                 if (pubBusy) { modeInfo = ZanIDE.T("Publishing...", "发布中..."); }
                 if (sbDebug) { modeInfo = ZanIDE.T("Debugging", "调试中"); }
@@ -4581,7 +4614,7 @@ partial class ZanIDE {
                                 dlgMode = 2;
                             } else if (chosen == 1 && dlg == null) {
                                 dlg = ZanIDE.OpenWizard(app, ZanIDE.T("New Folder", "新建文件夹"), fSel, fNameInput, "NewFolder");
-                                fSel.Set(8);
+                                fSel.Set(ZanIDE.FileKindFolder());
                                 dlgMode = 2;
                             } else if (chosen == 3) {
                                 // Delete every marked row when the right-clicked
@@ -4917,12 +4950,16 @@ partial class ZanIDE {
         wizTpls = new List<WizardTemplate>();
 
         // ---- New File template catalog ----
+        // Item order IS the kind number: see ZanIDE.FileKind*() in
+        // ZanIDE.Workspace.zan, which names the slots CreateFile branches on.
         fileItems = new List<WizardItem>{
             new WizardItem(ZanIDE.T("Program (Main)", "程序 (Main)"), "arrow-right", ZanIDE.T("Code file: class with a static Main() entry point.", "代码文件：带静态 Main() 入口的类。")),
             new WizardItem(ZanIDE.T("Class", "类"), "grid", ZanIDE.T("Code file: an empty class with fields and methods.", "代码文件：带字段和方法的空类。")),
             new WizardItem(ZanIDE.T("GUI Window", "GUI 窗口"), "maximize", ZanIDE.T("Code file: a Gui window with an event loop.", "代码文件：带事件循环的 Gui 窗口。")),
             new WizardItem(ZanIDE.T("Interface", "接口"), "copy", ZanIDE.T("Code file: a base class defining a contract.", "代码文件：定义契约的基类。")),
             new WizardItem(ZanIDE.T("Empty File", "空文件"), "file", ZanIDE.T("Code file: a blank .zan file.", "代码文件：空白的 .zan 文件。")),
+            new WizardItem(ZanIDE.T("Lua Script", "Lua 脚本"), "file", ZanIDE.T("Script: creates Name.lua, loaded by a Zan host through System.Scripting.Lua (not run on its own).", "脚本：创建 Name.lua，由 Zan 宿主通过 System.Scripting.Lua 加载（不能单独运行）。")),
+            new WizardItem(ZanIDE.T("Python Script", "Python 脚本"), "file", ZanIDE.T("Script: creates Name.py, loaded by a Zan host through System.Scripting.Python (not run on its own).", "脚本：创建 Name.py，由 Zan 宿主通过 System.Scripting.Python 加载（不能单独运行）。")),
             new WizardItem(ZanIDE.T("Form (Designer)", "表单 (设计器)"), "layout", ZanIDE.T("Form: creates Name.zform (visual layout) + Name.zan (code-behind).", "表单：创建 Name.zform（可视化布局）+ Name.zan（代码后置）。")),
             new WizardItem(ZanIDE.T("Free Layout Window", "自由布局窗口"), "grid", ZanIDE.T("Form: free-canvas designer, every control absolutely positioned (layoutMode 1).", "表单：自由画布设计器，控件绝对定位（layoutMode 1）。")),
             new WizardItem(ZanIDE.T("Game Scene (Designer)", "游戏场景 (设计器)"), "maximize", ZanIDE.T("Scene: creates Name.zscene, a free-canvas game window layout.", "场景：创建 Name.zscene，自由画布式游戏窗口布局。")),

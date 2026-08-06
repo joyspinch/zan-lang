@@ -1,0 +1,123 @@
+using System;
+using SDL3;
+
+/// 触摸/多点触控示例：每根手指一条 FINGER_DOWN/MOTION/UP 事件，
+/// 用 SdlEvent.FingerId() 区分，因此多点触控天然支持。
+/// 手指坐标是窗口内归一化的 0..1，乘上窗口尺寸就是像素位置。
+/// 这里把每根活跃手指画成一个方块，同时打印事件。
+///
+/// 桌面上没有触摸屏时，设环境变量 SDL_MOUSE_TOUCH_EVENTS=1 可让 SDL
+/// 把鼠标合成为触摸事件来试。无显示环境用 SDL_VIDEODRIVER=dummy。
+class Program {
+    /// 同时跟踪的手指上限。
+    static int MaxFingers() { return 10; }
+
+    /// 手指 id 在跟踪表里的槽位，不存在返回 -1。
+    static int SlotOf(long[] ids, long id) {
+        for (int i = 0; i < Program.MaxFingers(); i = i + 1) {
+            if (ids[i] == id) { return i; }
+        }
+        return -1;
+    }
+
+    static void Main() {
+        if (!Sdl.Init(SdlInit.Video() + SdlInit.Events())) {
+            Console.WriteLine("SDL 初始化失败: " + Sdl.Error());
+            return;
+        }
+
+        SdlWindow window = SdlWindow.Create("Zan Touch", 640, 480, 0);
+        if (!window.IsValid()) {
+            Console.WriteLine("建窗失败: " + Sdl.Error());
+            Sdl.Quit();
+            return;
+        }
+        SdlRenderer renderer = SdlRenderer.Create(window);
+        if (!renderer.IsValid()) {
+            Console.WriteLine("建渲染器失败: " + Sdl.Error());
+            window.Close();
+            Sdl.Quit();
+            return;
+        }
+
+        int devices = SdlTouch.DeviceCount();
+        Console.WriteLine("touch devices: " + devices.ToString());
+        for (int i = 0; i < devices; i = i + 1) {
+            Console.WriteLine("  device[" + i.ToString() + "] id="
+                + SdlTouch.DeviceAt(i).ToString());
+        }
+        if (devices == 0) {
+            Console.WriteLine("没有触摸设备 — 可设 SDL_MOUSE_TOUCH_EVENTS=1 用鼠标模拟");
+        }
+
+        // 活跃手指跟踪表：id 为 0 表示空槽。
+        long[] ids = new long[Program.MaxFingers()];
+        double[] xs = new double[Program.MaxFingers()];
+        double[] ys = new double[Program.MaxFingers()];
+        double[] press = new double[Program.MaxFingers()];
+        int active = 0;
+
+        bool running = true;
+        int deadline = Sdl.Ticks() + 5000;
+        while (running && Sdl.Ticks() < deadline) {
+            while (SdlEvent.Poll()) {
+                int type = SdlEvent.Type();
+                if (SdlEvent.IsQuit()) {
+                    running = false;
+                } else if (type == SdlEventType.FingerDown()) {
+                    int slot = Program.SlotOf(ids, 0);
+                    if (slot >= 0) {
+                        ids[slot] = SdlEvent.FingerId();
+                        xs[slot] = SdlEvent.FingerX();
+                        ys[slot] = SdlEvent.FingerY();
+                        press[slot] = SdlEvent.FingerPressure();
+                        active = active + 1;
+                    }
+                    Console.WriteLine("down  finger=" + SdlEvent.FingerId().ToString()
+                        + " x=" + SdlEvent.FingerX().ToString()
+                        + " y=" + SdlEvent.FingerY().ToString()
+                        + " p=" + SdlEvent.FingerPressure().ToString());
+                } else if (type == SdlEventType.FingerMotion()) {
+                    int slot = Program.SlotOf(ids, SdlEvent.FingerId());
+                    if (slot >= 0) {
+                        xs[slot] = SdlEvent.FingerX();
+                        ys[slot] = SdlEvent.FingerY();
+                        press[slot] = SdlEvent.FingerPressure();
+                    }
+                    Console.WriteLine("move  finger=" + SdlEvent.FingerId().ToString()
+                        + " dx=" + SdlEvent.FingerDeltaX().ToString()
+                        + " dy=" + SdlEvent.FingerDeltaY().ToString());
+                } else if (type == SdlEventType.FingerUp()
+                        || type == SdlEventType.FingerCanceled()) {
+                    int slot = Program.SlotOf(ids, SdlEvent.FingerId());
+                    if (slot >= 0) {
+                        ids[slot] = 0;
+                        active = active - 1;
+                    }
+                    Console.WriteLine("up    finger=" + SdlEvent.FingerId().ToString()
+                        + " active=" + active.ToString());
+                }
+            }
+
+            renderer.SetColor(18, 20, 28, 255);
+            renderer.Clear();
+            int w = window.Width();
+            int h = window.Height();
+            for (int i = 0; i < Program.MaxFingers(); i = i + 1) {
+                if (ids[i] == 0) { continue; }
+                int size = 24 + (int)(press[i] * 48.0);
+                int px = (int)(xs[i] * (double)w) - size / 2;
+                int py = (int)(ys[i] * (double)h) - size / 2;
+                renderer.SetColor(80 + i * 16, 200 - i * 12, 255, 255);
+                renderer.FillRect(px, py, size, size);
+            }
+            renderer.Present();
+            Sdl.Delay(16);
+        }
+
+        Console.WriteLine("done, fingers still down: " + active.ToString());
+        renderer.Close();
+        window.Close();
+        Sdl.Quit();
+    }
+}

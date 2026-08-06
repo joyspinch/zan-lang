@@ -10,6 +10,7 @@
 #include "parser.h"
 #include "jsongen.h"
 #include "formgen.h"
+#include "scenegen.h"
 #include "dbgen.h"
 #include "routegen.h"
 #include "nsresolve.h"
@@ -978,6 +979,9 @@ static bool zan_win_system_lib(const char *lib, int lib_len) {
 typedef struct {
     char lib[64];      /* normalized -l basename, e.g. "sqlite3", "zan_sdl3" */
     char module[512];  /* owning module path relative to stdlib root, '/'-sep */
+    char sym[64];      /* "<lib> if <prefix>": a driver the program loads at run
+                        * time (dlopen) instead of linking, so it is used when
+                        * the image defines a function with this prefix. */
 } zan_driver_entry_t;
 typedef struct {
     zan_driver_entry_t entries[ZAN_MAX_DRIVERS];
@@ -985,7 +989,8 @@ typedef struct {
 } zan_driver_registry_t;
 
 static void zan_registry_add(zan_driver_registry_t *reg,
-                             const char *lib, const char *module) {
+                             const char *lib, const char *module,
+                             const char *sym) {
     if (reg->count >= ZAN_MAX_DRIVERS) return;
     for (int i = 0; i < reg->count; i++)
         if (strcmp(reg->entries[i].lib, lib) == 0) return; /* first wins */
@@ -993,6 +998,8 @@ static void zan_registry_add(zan_driver_registry_t *reg,
              sizeof(reg->entries[0].lib), "%s", lib);
     snprintf(reg->entries[reg->count].module,
              sizeof(reg->entries[0].module), "%s", module);
+    snprintf(reg->entries[reg->count].sym,
+             sizeof(reg->entries[0].sym), "%s", sym ? sym : "");
     reg->count++;
 }
 
@@ -1012,7 +1019,21 @@ static void zan_read_driver_manifest(const char *manifest_path,
                            s[len - 1] == ' ' || s[len - 1] == '\t'))
             s[--len] = '\0';
         if (s[0] == '\0' || s[0] == '#') continue;
-        zan_registry_add(reg, s, module);
+        /* "<lib> if <symbol-prefix>" declares a run-time loaded driver (the
+         * module resolves it with dlopen/LoadLibrary rather than a
+         * [DllImport], so it never appears among the linked libs). */
+        const char *sym = "";
+        char *cond = strstr(s, " if ");
+        if (cond) {
+            *cond = '\0';
+            sym = cond + 4;
+            while (*sym == ' ' || *sym == '\t') sym++;
+            size_t ll = strlen(s);
+            while (ll > 0 && (s[ll - 1] == ' ' || s[ll - 1] == '\t'))
+                s[--ll] = '\0';
+            if (s[0] == '\0') continue;
+        }
+        zan_registry_add(reg, s, module, sym);
     }
     fclose(f);
 }
@@ -1585,7 +1606,13 @@ int main(int argc, char **argv) {
                 char *owned = NULL;
                 if (fl3 > 6 && strcmp(input_files[fi] + fl3 - 6, ".zform") == 0) {
                     char *translated = zan_formgen_translate(src3, slen3,
-                                                             input_files[fi], NULL);
+                                                             input_files[fi], NULL, 0);
+                    if (translated) { free(src3); src3 = translated; owned = translated; }
+                } else if (fl3 > 7 &&
+                           strcmp(input_files[fi] + fl3 - 7, ".zscene") == 0) {
+                    /* Same for a .zscene design document (scenegen). */
+                    char *translated = zan_scenegen_translate(src3, slen3,
+                                                              input_files[fi], NULL, 0);
                     if (translated) { free(src3); src3 = translated; owned = translated; }
                 }
                 scan_using_tokens(src3, strlen(src3), stdlib_root,
@@ -1640,8 +1667,13 @@ int main(int argc, char **argv) {
         {
             size_t fl = strlen(input_files[fi]);
             if (fl > 6 && strcmp(input_files[fi] + fl - 6, ".zform") == 0) {
+                /* Only the primary input's design becomes the entry point;
+                 * the other designs of a multi-window project compile
+                 * alongside it and are opened with `<Name>.Show()`, so the
+                 * program keeps exactly one Main(). */
                 char *translated = zan_formgen_translate(src, slen,
-                                                         input_files[fi], diag);
+                                                         input_files[fi], diag,
+                                                         fi == 0);
                 if (!translated) {
                     fprintf(stderr,
                             "error: cannot translate design document '%s'\n",
@@ -1657,6 +1689,27 @@ int main(int argc, char **argv) {
                  * still owns `source` (freed on every exit path below), so it
                  * must now point at the translation, not the freed original -
                  * otherwise the exit-path free() double-frees. */
+                if (fi == 0) source = translated;
+            } else if (fl > 7 && strcmp(input_files[fi] + fl - 7, ".zscene") == 0) {
+                /* A .zscene input is a scene design document: scenegen
+                 * projects its typed SceneElement fields, BuildScene() and
+                 * the SceneView render loop, with Main() on the primary
+                 * input only (the other designs are opened with
+                 * `<Name>.Run()`). */
+                char *translated = zan_scenegen_translate(src, slen,
+                                                          input_files[fi], diag,
+                                                          fi == 0);
+                if (!translated) {
+                    fprintf(stderr,
+                            "error: cannot translate scene document '%s'\n",
+                            input_files[fi]);
+                    zan_arena_free(arena);
+                    free(source);
+                    return 1;
+                }
+                free(src);
+                src = translated;
+                slen = strlen(translated);
                 if (fi == 0) source = translated;
             }
         }
@@ -2294,6 +2347,7 @@ int main(int argc, char **argv) {
         const char *used_drivers[16]; int used_driver_count = 0;
         int used_driver_len[16];
         const char *used_driver_module[16];
+        bool used_driver_runtime[16] = { false };  /* dlopen'd, not linked */
         for (int li = 0; li < irgen.extern_lib_count && used_driver_count < 16; li++) {
             int nlen;
             const char *nm = zan_dllimport_lname(
@@ -2303,8 +2357,28 @@ int main(int argc, char **argv) {
                 used_drivers[used_driver_count] = nm;
                 used_driver_len[used_driver_count] = nlen;
                 used_driver_module[used_driver_count] = driver_reg.entries[didx].module;
+                used_driver_runtime[used_driver_count] = false;
                 used_driver_count++;
             }
+        }
+        /* Run-time loaded drivers (declared "<lib> if <prefix>") are never in
+         * extern_libs, since the module dlopens them; they are used when the
+         * image actually contains the module's code. */
+        for (int di = 0; di < driver_reg.count && used_driver_count < 16; di++) {
+            const char *sym = driver_reg.entries[di].sym;
+            if (!sym[0]) continue;
+            if (!zan_irgen_defines_prefix(&irgen, sym)) continue;
+            const char *lib = driver_reg.entries[di].lib;
+            bool dup = false;
+            for (int u = 0; u < used_driver_count; u++)
+                if ((int)strlen(lib) == used_driver_len[u] &&
+                    memcmp(lib, used_drivers[u], strlen(lib)) == 0) dup = true;
+            if (dup) continue;
+            used_drivers[used_driver_count] = lib;
+            used_driver_len[used_driver_count] = (int)strlen(lib);
+            used_driver_module[used_driver_count] = driver_reg.entries[di].module;
+            used_driver_runtime[used_driver_count] = true;
+            used_driver_count++;
         }
         {
             const char *dsub = zan_driver_subdir(&target);
@@ -3330,8 +3404,14 @@ int main(int argc, char **argv) {
          * its drivers as @rpath dylibs, so those still have to travel next to
          * the executable. */
         bool drivers_are_shared = !link_static_drivers || cross_dylib_count > 0;
+        /* A dlopen'd driver is never folded into the exe, so --link-mode static
+         * does not exempt it from travelling next to the executable. */
+        int runtime_driver_count = 0;
+        for (int d = 0; d < used_driver_count; d++)
+            if (used_driver_runtime[d]) runtime_driver_count++;
         if ((publish_mode || target.os == ZAN_OS_WINDOWS) &&
-            drivers_are_shared && used_driver_count > 0) {
+            (drivers_are_shared || runtime_driver_count > 0) &&
+            used_driver_count > 0) {
             char outdir[1024];
             snprintf(outdir, sizeof(outdir), "%s", obj_path);
             { char *s1 = strrchr(outdir, '/'); char *s2 = strrchr(outdir, '\\');
@@ -3342,6 +3422,7 @@ int main(int argc, char **argv) {
             for (int d = 0; d < used_driver_count; d++) {
                 const char *driver_dir = driver_dirs[d];
                 if (!driver_dir[0]) continue;
+                if (!drivers_are_shared && !used_driver_runtime[d]) continue;
                 char drv[64];
                 snprintf(drv, sizeof(drv), "%.*s",
                          used_driver_len[d], used_drivers[d]);
@@ -3349,13 +3430,13 @@ int main(int argc, char **argv) {
                 /* candidate runtime file names for this driver. The cap must
                  * cover a driver's whole dependency closure (e.g. libpq ships
                  * libpq + its OpenSSL and Kerberos dylibs -> 8 files). */
-                char cands[16][128]; int ncand = 0;
+                char cands[64][128]; int ncand = 0;
                 char manifest[1200];
                 snprintf(manifest, sizeof(manifest), "%s/%s.bundle", driver_dir, drv);
                 FILE *mf = fopen(manifest, "rb");
                 if (mf) {
                     char line[128];
-                    while (ncand < 16 && fgets(line, sizeof(line), mf)) {
+                    while (ncand < 64 && fgets(line, sizeof(line), mf)) {
                         size_t l = strlen(line);
                         while (l > 0 && (line[l-1] == '\n' || line[l-1] == '\r'
                                          || line[l-1] == ' ' || line[l-1] == '\t'))
@@ -3407,7 +3488,15 @@ int main(int argc, char **argv) {
                         copied++;
                     }
                 }
-                if (copied == 0) {
+                if (copied == 0 && used_driver_runtime[d]) {
+                    /* A dlopen'd driver is optional by construction: the module
+                     * falls back to a system install (and reports
+                     * IsAvailable() == false when there is none), so an
+                     * unstaged bundle is a note, not a warning. */
+                    printf("  note: driver '%s' not bundled (%s is empty); the "
+                           "program will use a system-installed %s\n",
+                           drv, driver_dir, drv);
+                } else if (copied == 0) {
                     fprintf(stderr,
                         "warning: driver '%s' was not bundled (no runtime library "
                         "found in %s). The published program will require '%s' to "

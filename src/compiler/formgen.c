@@ -8,8 +8,18 @@
  *         static <Widget> <field>;            // typed fields (designer names)
  *         static Control __BuildForm() {...}  // real control tree
  *         static void __WireForm(Form form){...} // on<Event> -> form.Handle()
- *         static void Main() {...}            // window + OnLoad + Wire + Run
+ *         static Form __CreateWindow() {...}  // window + OnLoad + Wire
+ *         static void Show() {...}            // open it, run until closed
+ *         static void Main() {...}            // entry, primary design only
  *     }
+ *
+ * Several designs compile together (a multi-window project): only the FIRST
+ * compiler input gets a Main(), every design gets a Show(), so one window
+ * opens another with `Settings.Show();`. Show() runs the opened window's own
+ * event loop and returns when that window closes, so from the caller's side
+ * it behaves like a modal dialog (the calling window waits); use
+ * __CreateWindow() when the caller wants to adjust the Form before running
+ * it.
  *
  * The synthetic class is a compile-time projection of the design document:
  * nothing is written to disk, so the .zform stays the single source of truth.
@@ -162,9 +172,12 @@ static int fg_ftype_of(zan_json_value_t *o) {
 }
 
 /* Concrete Gui widget type for a field type (mirrors
- * ZanIDE.CodeNav.WidgetTypeOf). Anything unmapped renders as Label so the
- * form always compiles and shows its caption. */
+ * ZanIDE.CodeNav.WidgetTypeOf and FormField.HasWidgetOf). Anything unmapped
+ * renders as Label so the form always compiles and shows its caption. */
 static const char *fg_widget_type(int ft) {
+    /* A project component is declared as the Control base: its concrete class
+     * comes from the design's `custom` kind. */
+    if (ft == 100) return "Control";
     if (ft == 0 || ft == 2 || ft == 3) return "Input";
     if (ft == 1 || ft == 14) return "TextArea";
     if (ft == 4) return "Radio";
@@ -174,7 +187,24 @@ static const char *fg_widget_type(int ft) {
     if (ft == 8) return "Rate";
     if (ft == 9) return "Slider";
     if (ft == 29) return "Progress";
-    if (ft == 49) return "Button";
+    if (ft == 49) return "FloatButton";
+    if (ft == 17) return "Divider";
+    if (ft == 19) return "Tag";
+    if (ft == 20) return "Badge";
+    if (ft == 21) return "Avatar";
+    if (ft == 22) return "Statistic";
+    if (ft == 24) return "Timeline";
+    if (ft == 25) return "TreeView";
+    if (ft == 26) return "Collapse";
+    if (ft == 27) return "Empty";
+    if (ft == 30) return "Result";
+    if (ft == 31) return "Skeleton";
+    if (ft == 32) return "Spin";
+    if (ft == 34) return "Steps";
+    if (ft == 35) return "Breadcrumb";
+    if (ft == 37) return "Pagination";
+    if (ft == 39) return "PageHeader";
+    if (ft == 42) return "Carousel";
     if (ft == 18 || ft == 45 || ft == 36 || ft == 61) return "Panel";
     if (ft == 58) return "ToolStrip";
     if (ft == 59) return "StatusBar";
@@ -363,6 +393,53 @@ static void fg_ctor(fg_buf_t *b, zan_json_value_t *o, int ft, const char *wt) {
         fg_putf(b, "SelectBox.FromOptions(new List<string>(), \"\")");
     } else if (strcmp(wt, "Progress") == 0) {
         fg_putf(b, "new Progress(50, 1)");
+    } else if (strcmp(wt, "Divider") == 0 || strcmp(wt, "Tag") == 0
+               || strcmp(wt, "Avatar") == 0 || strcmp(wt, "Empty") == 0) {
+        /* Display widgets whose only content is the designed caption. */
+        fg_putf(b, "new %s(\"", wt);
+        fg_esc_cstr(b, cap);
+        fg_putf(b, "\")");
+    } else if (strcmp(wt, "Badge") == 0) {
+        fg_putf(b, "new Badge(%d)", atoi(fg_option_at(o, 0, "0")));
+    } else if (strcmp(wt, "Statistic") == 0) {
+        fg_putf(b, "new Statistic(\"");
+        fg_esc_cstr(b, cap);
+        fg_putf(b, "\", \"");
+        fg_esc_cstr(b, fg_option_at(o, 0, "0"));
+        fg_putf(b, "\")");
+    } else if (strcmp(wt, "Result") == 0 || strcmp(wt, "PageHeader") == 0) {
+        fg_putf(b, "new %s(\"", wt);
+        fg_esc_cstr(b, cap);
+        fg_putf(b, "\", \"");
+        fg_esc_cstr(b, fg_obj_str(o, "placeholder"));
+        fg_putf(b, "\")");
+    } else if (strcmp(wt, "Pagination") == 0) {
+        int total = atoi(fg_option_at(o, 0, "10"));
+        if (total <= 0) total = 10;
+        fg_putf(b, "new Pagination(%d)", total);
+    } else if (strcmp(wt, "Timeline") == 0 || strcmp(wt, "TreeView") == 0
+               || strcmp(wt, "Collapse") == 0 || strcmp(wt, "Steps") == 0
+               || strcmp(wt, "Breadcrumb") == 0 || strcmp(wt, "Carousel") == 0
+               || strcmp(wt, "Skeleton") == 0 || strcmp(wt, "Spin") == 0) {
+        /* Item-bearing widgets: constructed empty, filled in fg_field_setup
+         * from the designed options so design and runtime agree. */
+        fg_putf(b, "new %s()", wt);
+    } else if (strcmp(wt, "FloatButton") == 0) {
+        const char *icon = fg_obj_str(o, "icon");
+        fg_putf(b, "new FloatButton(\"");
+        fg_esc_cstr(b, icon[0] ? icon : "plus");
+        fg_putf(b, "\")");
+    } else if (strcmp(wt, "Control") == 0) {
+        /* Project component (`/// @component`): the designed kind names the
+         * class itself, which the project compiles alongside the form. */
+        const char *kind = fg_obj_str(o, "custom");
+        if (fg_is_ident(kind)) {
+            fg_putf(b, "new %s()", kind);
+        } else {
+            fg_putf(b, "new Panel(\"");
+            fg_esc_cstr(b, kind);
+            fg_putf(b, "\")");
+        }
     } else if (strcmp(wt, "Rate") == 0) {
         fg_putf(b, "new Rate(new SignalInt(0), 5)");
     } else if (strcmp(wt, "Panel") == 0) {
@@ -438,6 +515,60 @@ static void fg_field_setup(fg_buf_t *b, zan_json_value_t *o, int ft,
             fg_putf(b, "\");\n");
         }
         free(opts);
+    }
+    /* Item-bearing display widgets take their entries from the designed
+     * options list, exactly like the designer preview builds them. */
+    if (strcmp(wt, "Timeline") == 0 || strcmp(wt, "Steps") == 0
+        || strcmp(wt, "Breadcrumb") == 0 || strcmp(wt, "Carousel") == 0
+        || strcmp(wt, "Collapse") == 0) {
+        zan_json_value_t *opts = zan_json_get(o, "options");
+        if (opts && opts->type == ZAN_JSON_ARRAY) {
+            for (int i = 0; i < opts->array_val.count; i++) {
+                zan_json_value_t *it = opts->array_val.items[i];
+                if (!it || it->type != ZAN_JSON_STRING || !it->string_val.str)
+                    continue;
+                if (strcmp(wt, "Timeline") == 0) {
+                    fg_putf(b, "        %s.AddItem(\"\", \"", vn);
+                    fg_esc(b, it->string_val.str, it->string_val.len);
+                    fg_putf(b, "\", \"\");\n");
+                } else if (strcmp(wt, "Steps") == 0) {
+                    fg_putf(b, "        %s.AddStep(\"", vn);
+                    fg_esc(b, it->string_val.str, it->string_val.len);
+                    fg_putf(b, "\");\n");
+                } else if (strcmp(wt, "Carousel") == 0) {
+                    fg_putf(b, "        %s.AddSlide(\"", vn);
+                    fg_esc(b, it->string_val.str, it->string_val.len);
+                    fg_putf(b, "\");\n");
+                } else if (strcmp(wt, "Collapse") == 0) {
+                    fg_putf(b, "        %s.AddPanel(\"", vn);
+                    fg_esc(b, it->string_val.str, it->string_val.len);
+                    fg_putf(b, "\", \"\");\n");
+                } else {
+                    fg_putf(b, "        %s.AddItem(\"", vn);
+                    fg_esc(b, it->string_val.str, it->string_val.len);
+                    fg_putf(b, "\");\n");
+                }
+            }
+        }
+    }
+    /* A tree binds a node list: the first option is the root directory and
+     * the rest are its files (the shape the designer previews). */
+    if (strcmp(wt, "TreeView") == 0) {
+        zan_json_value_t *opts = zan_json_get(o, "options");
+        if (opts && opts->type == ZAN_JSON_ARRAY && opts->array_val.count > 0) {
+            fg_putf(b, "        List<TreeNode> %s__nodes = new List<TreeNode>();\n", vn);
+            for (int i = 0; i < opts->array_val.count; i++) {
+                zan_json_value_t *it = opts->array_val.items[i];
+                if (!it || it->type != ZAN_JSON_STRING || !it->string_val.str)
+                    continue;
+                fg_putf(b, "        %s__nodes.Add(TreeNode.%s(\"", vn,
+                        i == 0 ? "Dir" : "File");
+                fg_esc(b, it->string_val.str, it->string_val.len);
+                fg_putf(b, "\", %d%s));\n", i == 0 ? 0 : 1,
+                        i == 0 ? ", true" : "");
+            }
+            fg_putf(b, "        %s.Bind(%s__nodes);\n", vn, vn);
+        }
     }
     /* Status bar items: `>` prefix puts an item in the right-hand group. */
     if (strcmp(wt, "StatusBar") == 0) {
@@ -624,7 +755,8 @@ static int fg_emit_field(fg_buf_t *decls, fg_buf_t *body, fg_buf_t *wire,
 /* ---- entry point ---- */
 
 char *zan_formgen_translate(const char *json, size_t json_len,
-                            const char *file_name, struct zan_diag *diag) {
+                            const char *file_name, struct zan_diag *diag,
+                            int emit_main) {
     (void)diag;
     zan_json_value_t *root = zan_json_parse(json, json_len);
     if (!root || root->type != ZAN_JSON_OBJECT) {
@@ -794,7 +926,10 @@ char *zan_formgen_translate(const char *json, size_t json_len,
     fg_putf(&out, "        __form = form;\n");
     if (wire.buf) fg_putf(&out, "%s", wire.buf);
     fg_putf(&out, "    }\n\n");
-    fg_putf(&out, "    static void Main() {\n");
+    fg_putf(&out, "    /// Builds this designed window: control tree, window\n");
+    fg_putf(&out, "    /// attributes, OnLoad and the event wiring - everything except\n");
+    fg_putf(&out, "    /// the event loop, so a caller may still adjust it before Run().\n");
+    fg_putf(&out, "    static Form __CreateWindow() {\n");
     fg_putf(&out, "        Form form = Form.CreateDark(\"");
     fg_esc_cstr(&out, title);
     fg_putf(&out, "\", %d, %d);\n", win_w, win_h);
@@ -823,8 +958,24 @@ char *zan_formgen_translate(const char *json, size_t json_len,
     }
     fg_putf(&out, "        %s.OnLoad(form);\n", name);
     fg_putf(&out, "        %s.__WireForm(form);\n", name);
+    fg_putf(&out, "        return form;\n");
+    fg_putf(&out, "    }\n\n");
+    fg_putf(&out, "    /// Opens this designed window and runs it until it closes,\n");
+    fg_putf(&out, "    /// so the calling window waits like it would on a modal dialog.\n");
+    fg_putf(&out, "    /// This is how one window calls another:\n");
+    fg_putf(&out, "    ///     %s.Show();\n", name);
+    fg_putf(&out, "    static void Show() {\n");
+    fg_putf(&out, "        Form form = %s.__CreateWindow();\n", name);
     fg_putf(&out, "        form.Run();\n");
     fg_putf(&out, "    }\n");
+    if (emit_main) {
+        /* Only the primary input opens as the program's entry point: the other
+         * designs of a multi-window project compile alongside it and are
+         * reached through Show(), so there is exactly one Main(). */
+        fg_putf(&out, "\n    static void Main() {\n");
+        fg_putf(&out, "        %s.Show();\n", name);
+        fg_putf(&out, "    }\n");
+    }
     fg_putf(&out, "}\n");
 
     zan_json_free(root);

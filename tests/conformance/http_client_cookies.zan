@@ -1,0 +1,101 @@
+// Conformance: the HTTP client's cookie jar.
+//
+// The client used to be cookie-blind: Set-Cookie was left in the response
+// header list and every caller had to re-send it by hand with
+// SetHeader("Cookie", ...), which also meant a login response could not be
+// followed by an authenticated request without hand-rolled parsing. UseCookies()
+// now stores what the server sets and replays the matching cookies.
+using System;
+using System.Net.Sockets;
+using System.Net.Http;
+using System.Net.Http.Client;
+using System.Threading;
+
+class Program {
+    static int PORT = 9527;
+
+    static async HttpResponse Handle(HttpRequest req) {
+        if (req.path == "/login") {
+            HttpResponse resp = HttpResponse.Text("logged-in");
+            resp.SetHeader("Set-Cookie", "SID=abc123; Path=/; HttpOnly");
+            resp.SetHeader("Set-Cookie", "theme=dark; Path=/; Max-Age=600");
+            resp.SetHeader("Set-Cookie", "adminOnly=1; Path=/admin");
+            resp.SetHeader("Set-Cookie", "tlsOnly=1; Path=/; Secure");
+            return resp;
+        }
+        if (req.path == "/logout") {
+            HttpResponse resp = HttpResponse.Text("bye");
+            resp.SetHeader("Set-Cookie", "SID=; Path=/; Max-Age=0");
+            return resp;
+        }
+        // Everything else echoes back the Cookie header it received.
+        string got = req.GetHeader("Cookie");
+        if (got.Length == 0) { got = "(none)"; }
+        return HttpResponse.Text(got);
+    }
+
+    static async int Run() {
+        Socket.Initialize();
+        HttpServer server = new HttpServer("127.0.0.1", PORT);
+        server.OnRequest(Handle);
+        Task.Spawn(server.Start());
+        await Task.Delay(50);
+
+        // --- without UseCookies nothing is stored or replayed ---
+        HttpClient plain = new HttpClient("127.0.0.1", PORT);
+        string _l0 = await plain.PostAsync("/login", "");
+        Console.WriteLine("plainJar=" + Convert.ToString(plain.Cookies() == null));
+        string plainEcho = await plain.GetAsync("/echo");
+        Console.WriteLine("plainEcho=" + plainEcho);
+
+        // --- with the jar, Set-Cookie is absorbed and replayed ---
+        HttpClient c = new HttpClient("127.0.0.1", PORT).UseCookies();
+        string before = await c.GetAsync("/echo");
+        Console.WriteLine("beforeLogin=" + before);
+        string login = await c.PostAsync("/login", "user=a&pw=b");
+        Console.WriteLine("login=" + login);
+        Console.WriteLine("sid=" + c.Cookies().Get("SID"));
+        Console.WriteLine("theme=" + c.Cookies().Get("theme"));
+
+        // Path scoping: /admin gets the extra cookie, /echo does not. Secure
+        // cookies stay home on a plain-text connection.
+        string echo = await c.GetAsync("/echo");
+        Console.WriteLine("echo=" + echo);
+        string admin = await c.GetAsync("/admin/echo");
+        Console.WriteLine("admin=" + admin);
+
+        // A hand-written Cookie header still wins over the jar.
+        HttpClient manual = new HttpClient("127.0.0.1", PORT).UseCookies();
+        string _l1 = await manual.PostAsync("/login", "");
+        manual.SetHeader("Cookie", "hand=written");
+        string manualEcho = await manual.GetAsync("/echo");
+        Console.WriteLine("manual=" + manualEcho);
+
+        // Max-Age=0 deletes the cookie.
+        string _bye = await c.GetAsync("/logout");
+        string afterLogout = await c.GetAsync("/echo");
+        Console.WriteLine("afterLogout=" + afterLogout);
+
+        // --- jar semantics without a socket ---
+        CookieJar jar = new CookieJar();
+        jar.SetCookie("example.com", "/a/b", "plain=1");
+        jar.SetCookie("example.com", "/", "wide=2; Domain=example.com; Path=/");
+        jar.SetCookie("example.com", "/", "old=3; Expires=Sun, 06 Nov 1994 08:49:37 GMT");
+        Console.WriteLine("count=" + Convert.ToString(jar.Count()));
+        Console.WriteLine("defaultPath=" + jar.HeaderValue("example.com", "/a/b/c", false));
+        Console.WriteLine("outsidePath=" + jar.HeaderValue("example.com", "/z", false));
+        Console.WriteLine("subdomain=" + jar.HeaderValue("api.example.com", "/", false));
+        Console.WriteLine("otherHost=" + jar.HeaderValue("evil.com", "/", false));
+        jar.SetCookie("example.com", "/", "future=4; Expires=Fri, 01 Jan 2038 00:00:00 GMT");
+        Console.WriteLine("future=" + jar.Get("future"));
+        Console.WriteLine("removed=" + Convert.ToString(jar.Remove("wide"))
+            + " left=" + Convert.ToString(jar.Count()));
+
+        server.Stop();
+        return 0;
+    }
+
+    static async void Main() {
+        int _rc = await Run();
+    }
+}

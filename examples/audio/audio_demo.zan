@@ -1,0 +1,112 @@
+using System;
+using System.IO;
+using SDL3;
+
+/// 播放一段自己合成的 WAV：写出文件 → 加载为 clip → 同时播放多个声音。
+/// 例子不带音频素材，波形在运行时生成，因此仓库里不需要二进制资产。
+class Program {
+    static int SampleRate() { return 44100; }
+
+    /// 小端写入 16 位/32 位整数：WAV 头全是小端标量。
+    static void PutU16(byte[] wav, int at, int value) {
+        wav[at] = (byte)(value & 255);
+        wav[at + 1] = (byte)((value >> 8) & 255);
+    }
+
+    static void PutU32(byte[] wav, int at, int value) {
+        wav[at] = (byte)(value & 255);
+        wav[at + 1] = (byte)((value >> 8) & 255);
+        wav[at + 2] = (byte)((value >> 16) & 255);
+        wav[at + 3] = (byte)((value >> 24) & 255);
+    }
+
+    static void PutTag(byte[] wav, int at, string tag) {
+        for (int i = 0; i < tag.Length; i = i + 1) {
+            wav[at + i] = (byte)(tag[i] & 255);
+        }
+    }
+
+    /// 单声道 16 位 PCM 正弦音，带首尾淡入淡出（避免爆音）。
+    static void WriteBeep(string path, double frequency, int milliseconds) {
+        int rate = Program.SampleRate();
+        int frames = rate * milliseconds / 1000;
+        int dataBytes = frames * 2;
+        byte[] wav = new byte[44 + dataBytes];
+
+        Program.PutTag(wav, 0, "RIFF");
+        Program.PutU32(wav, 4, 36 + dataBytes);
+        Program.PutTag(wav, 8, "WAVE");
+        Program.PutTag(wav, 12, "fmt ");
+        Program.PutU32(wav, 16, 16);          // PCM 格式块大小
+        Program.PutU16(wav, 20, 1);           // PCM
+        Program.PutU16(wav, 22, 1);           // 单声道
+        Program.PutU32(wav, 24, rate);
+        Program.PutU32(wav, 28, rate * 2);    // 字节率
+        Program.PutU16(wav, 32, 2);           // 块对齐
+        Program.PutU16(wav, 34, 16);          // 位深
+        Program.PutTag(wav, 36, "data");
+        Program.PutU32(wav, 40, dataBytes);
+
+        int fade = rate / 100;
+        for (int i = 0; i < frames; i = i + 1) {
+            double t = (double)i / (double)rate;
+            double envelope = 1.0;
+            if (i < fade) { envelope = (double)i / (double)fade; }
+            int tail = frames - i;
+            if (tail < fade) { envelope = (double)tail / (double)fade; }
+            double sample = Math.Sin(6.283185307179586 * frequency * t) * envelope;
+            int pcm = (int)(sample * 12000.0);
+            Program.PutU16(wav, 44 + i * 2, pcm & 65535);
+        }
+
+        File.WriteAllBytes(path, wav);
+    }
+
+    static void Main() {
+        string path = "beep.wav";
+        Program.WriteBeep(path, 440.0, 700);
+
+        if (!SdlAudio.Open()) {
+            Console.WriteLine("打开音频设备失败: " + Sdl.Error());
+            return;
+        }
+        SdlAudio.SetVolume(0.8);
+        Console.WriteLine("driver: " + SdlAudio.DriverName());
+
+        SdlAudioClip clip = SdlAudioClip.LoadWav(path);
+        if (!clip.IsValid()) {
+            Console.WriteLine("加载 WAV 失败: " + Sdl.Error());
+            SdlAudio.Close();
+            return;
+        }
+        Console.WriteLine("clip: " + clip.Frequency().ToString() + " Hz, "
+            + clip.Channels().ToString() + " ch, "
+            + clip.DurationMs().ToString() + " ms");
+
+        // 一次性音效：播完后声音自动回收，IsPlaying 转 false。
+        int t0 = Sdl.Ticks();
+        SdlVoice beep = clip.Play();
+        while (beep.IsPlaying()) { Sdl.Delay(20); }
+        Console.WriteLine("played in " + (Sdl.Ticks() - t0).ToString() + " ms");
+
+        // 同一个 clip 可以叠加播放：三个声音不同音量同时在响。
+        clip.Play(0.9, 0);
+        Sdl.Delay(120);
+        clip.Play(0.5, 0);
+        Sdl.Delay(120);
+        SdlVoice third = clip.Play(0.3, 0);
+        Console.WriteLine("voices: " + SdlAudio.ActiveVoices().ToString());
+        while (third.IsPlaying()) { Sdl.Delay(20); }
+
+        // 循环播放（背景音乐用法）：放两遍后提前停掉。
+        SdlVoice music = clip.PlayLooping(0.4);
+        Sdl.Delay(1500);
+        music.Stop();
+
+        Console.WriteLine("voices after stop: " + SdlAudio.ActiveVoices().ToString());
+
+        clip.Close();
+        SdlAudio.Close();
+        Sdl.Quit();
+    }
+}

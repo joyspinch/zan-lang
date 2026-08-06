@@ -1,0 +1,159 @@
+// ============================================================================
+// 流式 HTTP 转发器（HttpForwarder）—— 边收边转，不缓冲整个响应
+// ----------------------------------------------------------------------------
+// 用 HttpClient 请求上游、拿到完整 HttpResponse 再回给下游的转发写法，会把
+// 整个响应先缓冲在内存里：对流式聊天（SSE / 逐 token 的分块响应）来说，下游
+// 要等上游全部结束才看到第一个字节，CONNECT 与 WebSocket 更是完全走不通。
+//
+// HttpForwarder 全程只用套接字原语按块搬运：
+//   1. 上游响应头一到就立刻写给下游（SSE 客户端据此进入事件循环）
+//   2. 之后每收到一块正文就立刻转出，任何时刻都不缓冲整个响应
+//   3. CONNECT / 101 Upgrade 退化为双向裸字节隧道（TLS 直通，不解密）
+//   4. 逐跳头部按 RFC 7230 6.1 剥离，Host 改写为上游主机，追加 X-Forwarded-For
+//
+// 本例的上游是一个逐 token 推送的分块响应服务（模拟流式聊天接口），客户端
+// 经转发器订阅，并打印每个 token 到达的时刻——时间戳递增说明 token 是流式
+// 到达的，而不是响应结束后一次性到达。
+//
+// 运行：zanc examples/net/http_forwarder.zan --auto-stdlib -o fwd.exe && ./fwd.exe
+// ============================================================================
+using System;
+using System.Net.Sockets;
+using System.Threading;
+using System.Net.Http.Proxy;
+
+class Program {
+    static int UP_PORT = 54471;      // 上游"聊天接口"
+    static int FWD_PORT = 54472;     // 转发器对外端口
+
+    // ---- 上游：逐 token 推送的分块响应（模拟 /v1/chat/completions 流式） ----
+    static async void Upstream() {
+        TcpListener l = new TcpListener("127.0.0.1", UP_PORT);
+        l.Start();
+        nint c = await l.AcceptAsync();
+        if (c < 0) { return; }
+
+        // 读掉请求头（本例不关心内容）
+        string head = "";
+        while (Program.Find(head, "\r\n\r\n") < 0) {
+            string piece = await Socket.RecvAsync(c, 4096);
+            if (piece.Length == 0) { break; }
+            head = head + piece;
+        }
+        Console.WriteLine("upstream: got request, streaming tokens");
+
+        int _h = await Socket.SendStringAsync(c,
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+            + "Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n");
+
+        List<string> tokens = new List<string>();
+        tokens.Add("Zan ");
+        tokens.Add("streams ");
+        tokens.Add("tokens.");
+        for (int i = 0; i < tokens.Count; i = i + 1) {
+            string data = "data: " + tokens[i] + "\n\n";
+            // 分块编码：长度（十六进制）+ CRLF + 数据 + CRLF
+            int _c = await Socket.SendStringAsync(c,
+                Program.Hex(data.Length) + "\r\n" + data + "\r\n");
+            await Task.Delay(200);      // 模型逐 token 生成的间隔
+        }
+        int _e = await Socket.SendStringAsync(c, "0\r\n\r\n");
+        Socket.Close(c);
+        l.Stop();
+    }
+
+    // ---- 客户端：经转发器消费流，打印每个 token 的到达时刻 ------------------
+    static async int Client() {
+        TcpClient c = await TcpClient.ConnectAsync("127.0.0.1", FWD_PORT, 5000);
+        if (c == null) { Console.WriteLine("client: connect failed"); return 1; }
+        int _s = await c.SendAsync(
+            "GET /v1/chat/completions HTTP/1.1\r\nHost: front\r\n"
+            + "Accept: text/event-stream\r\n\r\n");
+
+        long t0 = Stopwatch.GetMicroseconds();
+        bool headSeen = false;
+        int arrivals = 0;
+        while (true) {
+            string piece = await c.RecvAsync(8192);
+            if (piece.Length == 0) { break; }
+            if (!headSeen) {
+                int hb = Program.Find(piece, "\r\n\r\n");
+                if (hb >= 0) {
+                    Console.WriteLine("client: response head after "
+                        + Program.Ms(t0) + " ms");
+                    headSeen = true;
+                    piece = piece.Substring(hb + 4, piece.Length - hb - 4);
+                }
+            }
+            // 分块帧原样透传，这里只把可打印的 data: 行摘出来
+            int di = Program.Find(piece, "data: ");
+            if (di >= 0) {
+                arrivals = arrivals + 1;
+                int end = Program.FindFrom(piece, "\n", di);
+                if (end < 0) { end = piece.Length; }
+                Console.WriteLine("client: +" + Program.Ms(t0) + " ms  "
+                    + piece.Substring(di + 6, end - di - 6));
+            }
+        }
+        c.Close();
+        Console.WriteLine("client: " + Convert.ToString(arrivals)
+            + " token(s) arrived progressively (a buffering forwarder would"
+            + " deliver them all at once at the end)");
+        return 0;
+    }
+
+    static string Hex(int n) {
+        string digits = "0123456789abcdef";
+        if (n == 0) { return "0"; }
+        string outs = "";
+        int v = n;
+        while (v > 0) {
+            outs = digits.Substring(v % 16, 1) + outs;
+            v = v / 16;
+        }
+        return outs;
+    }
+
+    static string Ms(long t0) {
+        return Convert.ToString((Stopwatch.GetMicroseconds() - t0) / 1000);
+    }
+
+    static int Find(string hay, string needle) {
+        return Program.FindFrom(hay, needle, 0);
+    }
+
+    static int FindFrom(string hay, string needle, int from) {
+        int n = hay.Length;
+        int m = needle.Length;
+        for (int i = from; i + m <= n; i = i + 1) {
+            int k = 0;
+            while (k < m && (hay[i + k] & 255) == (needle[k] & 255)) {
+                k = k + 1;
+            }
+            if (k == m) { return i; }
+        }
+        return -1;
+    }
+
+    static async int Run() {
+        Socket.Initialize();
+        Task.Spawn(Program.Upstream());
+
+        // 转发器：监听 FWD_PORT，把请求转给上游。上游是 https 时写
+        // "https://api.example.com" 即可（TLS 由 TlsStream 处理），
+        // 流式响应仍然逐块转发。
+        HttpForwarder fwd = new HttpForwarder("127.0.0.1", FWD_PORT,
+            "http://127.0.0.1:" + Convert.ToString(UP_PORT));
+        fwd.SetTimeout(600000);     // 流式响应可能长时间静默，给足空闲超时
+        Task.Spawn(fwd.Start());
+        await Task.Delay(100);
+
+        int r = await Program.Client();
+        fwd.Stop();
+        return r;
+    }
+
+    static void Main() {
+        int r = await Run();
+    }
+}

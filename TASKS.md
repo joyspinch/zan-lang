@@ -1220,6 +1220,139 @@ sel = sel.OrderByDescending(x => x.id);   // error: 'string' has no member 'Orde
 > `nameof`、原始字符串、`lock`、`goto`、`switch` 语句、List/Dictionary、
 > `new int[]{...}`、集合与对象初始化器、`??`。
 
+# A44 · Chart 组件对照 ECharts 的搁置项（2026-08-06，范围决策记录）
+
+图表组件完善（补齐雷达面积填充/每轴 max、markPoint、嵌套环饼、K 线 dataZoom、
+悬停 emphasis，新增和弦/力导向/事件河/韦恩渲染器 + `examples/gui_charts`
+独立示例）时，对照 ECharts 2.2.4 明确**不做**、留待后续的部分。均非缺陷绕过：
+现有 API 已解析相关字段或留有占位，只是渲染层未接。
+
+* [ ] **数值 / 时间 / 对数 X 轴**：`ChartAxisType.Value/Time/Log` 已定义且
+  `FromJson` 已解析，但 `Chart.BuildAxes*` 仍按类别槽布局——X 轴只能等距分类。
+* [ ] **itemStyle / emphasis 完整样式树**：`ChartItemStyle` 等样式类已建模，
+  但渲染器尚未逐项消费（目前只有三级颜色控制 option < series < data item）。
+* [ ] **toolbox / visualMap / timeline 组件**：ECharts 的工具箱、视觉映射与
+  时间轴组件无对应物。
+* [ ] **地图渲染器**：`ChartType.Map` 目前渲染占位面板
+  （`ChartView.DrawMapPlaceholder`）；需要地理边界数据（GeoJSON），标准库不内置。
+* [ ] **Canvas 曲线/旋转原语**：和弦 ribbon、韦恩等用密集折线采样 +
+  `FillPolygon`（Zan 侧扫描线）近似，受"不新增原生 Canvas 导出"约束
+  （五平台预编译驱动，`Render.zan` 注释）。若未来开放原生导出可替换为真贝塞尔。
+
+# A45 · List<T> 实参不做类型实参检查的 typecheck 洞（2026-08-06，编译器缺陷记录）
+
+**现象**：`examples/gui_charts` 的 Heatmap 演示闪退（静默 SIGSEGV）。
+回溯：`ChartSeries_Number ← ChartSeries_Value ← ChartView_CacheFingerprint ←
+Charts_DemoHeatmap` —— 演示把 `List<int>` 传给了
+`ChartSeries.Named(name, type, List<ChartData>)`，裸整数被当成 `ChartData*`
+解引用。
+
+**根因**：checker 不比较泛型容器实参的类型实参，`List<int>` 可以顶替
+`List<ChartData>` 通过编译。最小探针（`zanc` 编译通过，EXIT=0）：
+
+    class Box { int x; }
+    class P {
+        static void Take(List<Box> b) { }
+        static void Main() {
+            List<int> v = new List<int>();
+            v.Add(1);
+            P.Take(v);    // 应当编译报错，实际通过
+        }
+    }
+
+**现状处理**：演示侧改用正确工厂 `ChartSeries.Of(name, type, List<int>)`
+（演示本身是 API 误用，不属于缺陷绕过）；checker 修复超出本次任务范围，
+记录在此。将来修 checker 时：比较泛型容器的类型实参（不变式即可），把上面
+的探针落为 `tests/diag/` 负例（期望编译报错）。修复前注意：任何向容器形参
+传容器的调用点误用都拦不住，只能靠运行时崩溃暴露——重构 stdlib 容器调用时
+优先核对工厂签名。
+
+# A46 · 设计器内置类型有一半没接到真控件（2026-08-06，formgen 缺口记录）
+
+**现象**：`.zform` 设计支持 72 种内置类型（`src/compiler/formgen.c` 的 `fg_kind_of`
+表，0..71），但代码生成只映射了其中一部分，其余全部落到兜底分支
+`return "Label"`（`formgen.c` 的 `fg_widget_type`）——表单能编译、能显示
+标题，控件本体是假的。
+
+**回落成 Label 的类型**（21 个真缺口，另有 `title`/`text`/`ellipsis` 三个
+本就该是文本，不算）：`date`(10) `time`(11) `upload`(12) `color`(13)
+`table`(23) `alert`(28) `tooltip`(33) `menu`(38) `listview`(40)
+`datatable`(41) `chart`(43) `scrollbar`(46) `loading`(47) `popover`(50)
+`popconfirm`(51) `notification`(52) `ribbon`(53) `icon`(54)
+`contextmenu`(55) `layer`(56) `timer`(57)。
+
+**被降级的类型**：`card`(18) / `tabs`(36) / `dockpanel`(61) 都映射到
+`Panel`——`Card` 的边框标题、`Tabs` 的标签页、`Dock` 的停靠边全部丢失，
+`fg_default_dock` 只给 dockpanel 填了个默认停靠值补偿。
+
+**分两类处理**：
+
+* [ ] **A46-1 只差接线**（`stdlib/Gui` 里已有真控件，`fg_widget_type` 加映射
+  即可，必要时补 `fg_pref_h` / `fg_is_container` / 选项透传）：
+  `Table`→`Widget/Table.zan`、`ListView`→`Widget/ListView.zan`、
+  `Tooltip`、`Popover`、`ContextMenu`、`Menu`、`Ribbon`、`Layer`、
+  `Scrollbar`、`Ellipsis`、`Spin`(loading)、`Icon`→`Gui/Icon.zan`、
+  `DataTable`→`Component/DataTable`、`Chart`→`Component/Chart`、
+  `Card`→`Widget/Card.zan`、`Tabs`→`Widget/Tabs.zan`、
+  `Dock`→`Component/Dock.zan`。
+* [ ] **A46-2 控件本身不存在**，要先在 `stdlib/Gui` 写出来再接：
+  日期选择、时间选择、上传、取色、`Alert`、`Popconfirm`、`Notification`、
+  `Timer`（非可视，需决定生成成字段还是控件）。
+
+**A46-3 菜单栏与下拉菜单**：`toolbar`(58) 生成的是真 `ToolStrip`，缺的是
+菜单能力——没有 `MenuBar` 类型，工具项挂不了下拉菜单，属性检查器对工具项
+只能编辑一行文本。需要：`MenuBar` 内置类型 + 项的子菜单模型 + 检查器的
+多级编辑 UI。
+
+**判定标准**：每个接上的类型在 `tests/conformance/` 有一个 `.zform` 驱动的
+用例，断言生成代码里出现对应控件类名（而不是 `new Label`），并跑通
+`scripts\test.ps1 smoke`。
+
+# A47 · 仓库里 openssl 副本重复、build 树自嵌套（2026-08-06，工程卫生记录）
+
+**openssl 重复**：`libcrypto`/`libssl` 在源码树里有多份**逐字节相同**的拷贝，
+因为 driver bundle 的约定是"每个模块自带全部运行期依赖"，而 Postgres 和 Tls
+都依赖 openssl（MD5 前 8 位相同即同一文件）：
+
+| 文件 | Postgres | Tls | 大小 |
+|------|----------|-----|------|
+| `libcrypto.so.3` (linux-x64) | ✓ | ✓ | 5.5 MB |
+| `libssl.so.3` (linux-x64) | ✓ | ✓ | 0.7 MB |
+| `libcrypto.so.3` (linux-arm64) | ✓ | ✓ | 4.8 MB |
+| `libssl.so.3` (linux-arm64) | ✓ | ✓ | 0.8 MB |
+| `libcrypto-3-x64.dll` (win-x64) | ✓ | ✓ | 5.5 MB |
+| `libssl-3-x64.dll` (win-x64) | ✓ | ✓ | 1.0 MB |
+
+合计约 18 MB 纯重复（macOS 只有 Postgres 一份，不重复；
+`System/Scripting/drivers/win-x64` 的 `libcrypto-3.dll` 是 CPython 嵌入包
+自带的**另一个** build，名字和内容都不同，不能与上表合并）。
+
+* [ ] **A47-1 拆出共享原生依赖目录**。挡路的是安全校验
+  `zan_is_safe_bundle_name`（`src/compiler/main.c`）：bundle 清单只允许同目录
+  裸文件名，禁止路径分隔符，所以今天没法引用别的模块的文件。方案：清单支持
+  一种受限的共享引用（如 `@shared/openssl-3/<file>`，解析相对 stdlib 根、
+  仍然拒绝 `..`、`:`、绝对路径），文件只留一份在
+  `stdlib/_shared/openssl-3/<target>/`，发布时按 basename 复制到 exe 旁边。
+  链接期不受影响：导入库（`libcrypto.dll.a` / `libssl.dll.a`）只有 Tls 用，
+  留在原处。
+* [ ] **A47-2 `build/toolchain` 自嵌套**：实测嵌套到 32 层
+  （`build/toolchain/toolchain/toolchain/...`，每层都带一份 stdlib 和
+  openssl），`build/toolchain` 单独占 1.29 GB / 3205 文件。`build/` 是
+  git-ignored 的一次性产物，但说明某个发布/拷贝步骤把目标目录拷进了自己
+  （`scripts/publish_ide.ps1` 的注释已经点出要避免 `toolchain\toolchain`）。
+  要定位到具体步骤并加自嵌套防护，然后清掉。
+* [ ] **A47-3 `templates/server/server-mvc/.build/` 里躺着 libcrypto/libssl
+  两份拷贝**（被 `.gitignore` 的 `.build/` 挡住没进版本库），属于跑过一次
+  模板构建留下的残留，清掉。
+* [x] **A47-4 `System/Scripting/drivers/win-x64` 瘦身**（2026-08-06）：CPython
+  嵌入包里只有解释器 DLL 是被 `Python.zan` 用 `Interop.Load` 加载的，随包
+  下发的启动器 `python.exe` / `pythonw.exe`、安装包签名目录 `python.cat`、
+  MSI 扩展 `_msi.pyd` 和已停用的 `python312._pth.disabled` 都用不到，共
+  0.8 MB。已删除并从 `python.bundle` 摘掉，`scripts/stage_python.ps1` 里加了
+  排除清单（`._pth` 由重命名改为删除），重跑脚本不会再把它们放回来。
+  〔已实测〕`zanc tests\conformance\python_embed_smoke.zan --auto-stdlib
+  --publish` 发布 77 个文件、运行输出 `python-ok: 1`，退出码 0。
+
 # 已撤回的结论（早期草稿中的错误，勿再引用）
 
 1. ~~"无符号/窄类型只是语法别名，IR 层全塌成 i64，语义是假的"~~ ——

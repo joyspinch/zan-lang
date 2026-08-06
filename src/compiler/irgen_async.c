@@ -414,6 +414,82 @@ static LLVMValueRef get_co_cancel_fn(zan_irgen_t *g) {
     return fn;
 }
 
+/* Return the module's `i32 __zan_co_isdone(i8*)`, creating it once.
+ *
+ * Whether the coroutine a Task.Spawn handle names has finished, so a fan-out
+ * (Task.WhenAll) can join detached coroutines instead of every caller wiring
+ * its own counter and gate. Two states mean "finished":
+ *
+ *   - the handle is no longer in the live detached-frame list: the reaper has
+ *     already run and freed the frame (dereferencing it would be a use after
+ *     free, which is why the list is scanned rather than the flag read blind);
+ *   - the frame is still live but its DONE flag is set: the body ran to
+ *     completion and the frame is only queued for reaping.
+ *
+ * A handle that never named a detached frame (0, or a frame already reaped)
+ * therefore reads as done, which is what a joiner wants: it cannot wait for
+ * something that no longer exists. */
+static LLVMValueRef get_co_isdone_fn(zan_irgen_t *g) {
+    LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "__zan_co_isdone");
+    if (fn) return fn;
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
+    LLVMTypeRef hdr = g->co_header_type;
+    fn = LLVMAddFunction(g->mod, "__zan_co_isdone",
+        LLVMFunctionType(i32, &i8ptr, 1, 0));
+    LLVMSetLinkage(fn, LLVMInternalLinkage);
+
+    LLVMBasicBlockRef saved = LLVMGetInsertBlock(g->builder);
+    LLVMValueRef saved_fn = g->current_fn;
+    g->current_fn = fn;
+    LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, fn, "entry");
+    LLVMBasicBlockRef scan_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "id.scan");
+    LLVMBasicBlockRef cmp_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "id.cmp");
+    LLVMBasicBlockRef next_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "id.next");
+    LLVMBasicBlockRef live_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "id.live");
+    LLVMBasicBlockRef gone_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "id.gone");
+    LLVMPositionBuilderAtEnd(g->builder, entry);
+    di_clear(g);
+    LLVMValueRef arg = LLVMGetParam(fn, 0);
+    LLVMValueRef scan = LLVMBuildAlloca(g->builder, i8ptr, "id.scan.p");
+    LLVMBuildStore(g->builder, LLVMBuildLoad2(g->builder, i8ptr,
+        get_co_live_head(g), "id.live.head"), scan);
+    LLVMBuildBr(g->builder, scan_bb);
+
+    LLVMPositionBuilderAtEnd(g->builder, scan_bb);
+    LLVMValueRef s = LLVMBuildLoad2(g->builder, i8ptr, scan, "id.s");
+    LLVMBuildCondBr(g->builder,
+        zan_icmp(g->builder, LLVMIntNE, s, LLVMConstNull(i8ptr), "id.snn"),
+        cmp_bb, gone_bb);
+
+    LLVMPositionBuilderAtEnd(g->builder, cmp_bb);
+    LLVMValueRef s2 = LLVMBuildLoad2(g->builder, i8ptr, scan, "id.s2");
+    LLVMBuildCondBr(g->builder,
+        zan_icmp(g->builder, LLVMIntEQ, s2, arg, "id.seq"), live_bb, next_bb);
+
+    LLVMPositionBuilderAtEnd(g->builder, next_bb);
+    LLVMValueRef s3 = LLVMBuildLoad2(g->builder, i8ptr, scan, "id.s3");
+    LLVMBuildStore(g->builder, LLVMBuildLoad2(g->builder, i8ptr,
+        LLVMBuildStructGEP2(g->builder, hdr, s3, ASYNC_FRAME_LNEXT, "id.sn"),
+        "id.snv"), scan);
+    LLVMBuildBr(g->builder, scan_bb);
+
+    LLVMPositionBuilderAtEnd(g->builder, live_bb);
+    LLVMValueRef done = LLVMBuildLoad2(g->builder, i32,
+        LLVMBuildStructGEP2(g->builder, hdr, arg, ASYNC_FRAME_DONE, "id.done.p"),
+        "id.done");
+    LLVMBuildRet(g->builder, LLVMBuildZExt(g->builder,
+        zan_icmp(g->builder, LLVMIntNE, done, LLVMConstInt(i32, 0, 0), "id.isdone"),
+        i32, "id.r"));
+
+    LLVMPositionBuilderAtEnd(g->builder, gone_bb);
+    LLVMBuildRet(g->builder, LLVMConstInt(i32, 1, 0));
+
+    g->current_fn = saved_fn;
+    if (saved) LLVMPositionBuilderAtEnd(g->builder, saved);
+    return fn;
+}
+
 /* Emit `if (frame->cancel) <complete with no result>` at a point where the
  * body could just as well have executed `return;`: the locals in scope are
  * released by the completion, the awaiter is woken, and the rest of the body

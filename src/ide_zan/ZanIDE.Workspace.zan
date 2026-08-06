@@ -435,7 +435,7 @@ partial class ZanIDE {
     /// After a GUI project is scaffolded from a disk template, make sure each
     /// form has its business file (.zan). The .zform itself is the single
     /// source of truth: zanc compiles it directly, so there is no generated
-    /// layout file to keep in sync. Scenes keep their generated Name.g.zan.
+    /// layout file to keep in sync. Scenes follow the same two-file model.
     static void SyncFormCodeBehinds(string srcDir) {
         if (!Directory.Exists(srcDir)) { return; }
         List<string> files = Directory.GetFiles(srcDir);
@@ -452,9 +452,6 @@ partial class ZanIDE {
                 }
             } else if (ZanIDE.IsScenePath(fp)) {
                 string sbase = ZanIDE.SceneBaseName(fp);
-                SceneDoc sd = SceneDoc.Parse(File.ReadAllText(fp));
-                File.WriteAllText(ZanIDE.SceneGenFilePath(fp),
-                    ZanIDE.GenSceneFile(sbase, sd));
                 string scbp = ZanIDE.SceneCodeBehindPath(fp);
                 if (!File.Exists(scbp)) {
                     File.WriteAllText(scbp, ZanIDE.GenSceneBusinessShell(sbase));
@@ -463,10 +460,47 @@ partial class ZanIDE {
         }
     }
 
+    // ---- New File kinds ----
+    //
+    // The wizard list (fileItems), CreateFile's branches and every "is this
+    // kind special?" test all index the same catalog, so a kind inserted in
+    // the middle used to silently shift the others -- the explorer's "New
+    // Folder" command still asked for kind 8 after Free Layout Window took
+    // that slot, and created a form instead of a folder. The catalog order
+    // is defined here once and read through these names.
+
+    /// New File kind: Lua script (Name.lua).
+    static int FileKindLua() { return 5; }
+
+    /// New File kind: Python script (Name.py).
+    static int FileKindPython() { return 6; }
+
+    /// New File kind: Form, flow layout (Name.zform + code-behind).
+    static int FileKindForm() { return 7; }
+
+    /// New File kind: Free Layout Window, absolute layout (layoutMode 1).
+    static int FileKindFreeForm() { return 8; }
+
+    /// New File kind: Game Scene (Name.zscene + code-behind).
+    static int FileKindScene() { return 9; }
+
+    /// New File kind: folder under src/.
+    static int FileKindFolder() { return 10; }
+
+    /// True for the kinds that declare a Gui/System type named after the
+    /// file (the designer kinds), so the wizard must reject a name that
+    /// collides with a built-in type.
+    static bool FileKindDeclaresType(int kind) {
+        return kind == ZanIDE.FileKindForm()
+            || kind == ZanIDE.FileKindFreeForm()
+            || kind == ZanIDE.FileKindScene();
+    }
+
     /// Creates a file from the chosen file template; returns the path to open.
     /// The kinds match the New File wizard's item order (fileItems): 0-4 code
-    /// templates, 5 Form (flow layout, layoutMode 0), 6 Free Layout Window
-    /// (free-canvas absolute layout, layoutMode 1), 7 Game Scene, 8 Folder.
+    /// templates, 5 Lua script, 6 Python script, 7 Form (flow layout,
+    /// layoutMode 0), 8 Free Layout Window (free-canvas absolute layout,
+    /// layoutMode 1), 9 Game Scene, 10 Folder.
     /// For a Form / Free Layout Window this follows the C#-style rule and
     /// creates BOTH the visual layout file (Name.zform) and its code-behind
     /// (Name.zan), returning the .zform so it opens in the designer.
@@ -491,24 +525,34 @@ partial class ZanIDE {
             sized = true;
         }
         Directory.CreateDirectory(root + "/src");
-        if (kind == 7) {
+        if (kind == ZanIDE.FileKindLua() || kind == ZanIDE.FileKindPython()) {
+            // Scripts are not standalone programs: they are data a Zan host
+            // loads through System.Scripting, so they live next to the code
+            // that loads them and never become a Run/Debug target themselves.
+            string ext = ".lua";
+            if (kind == ZanIDE.FileKindPython()) { ext = ".py"; }
+            string spath = root + "/src/" + name + ext;
+            File.WriteAllText(spath, ZanIDE.ScriptTemplateBody(kind, name));
+            log.Add("> Created script " + spath
+                    + " (load it from Zan, see the header comment).");
+            return spath;
+        }
+        if (kind == ZanIDE.FileKindScene()) {
             // Scenes keep their classic HD default unless a size was chosen.
             int scW = 1280;
             int scH = 720;
             if (sized) { scW = winW; scH = winH; }
             string scenePath = root + "/src/" + name + ".zscene";
-            string sgenPath = ZanIDE.SceneGenFilePath(scenePath);
             string scbPath = ZanIDE.SceneCodeBehindPath(scenePath);
             SceneDoc sdoc = new SceneDoc(name, scW, scH);
             File.WriteAllText(scenePath, sdoc.ToJson());
-            File.WriteAllText(sgenPath, ZanIDE.GenSceneFile(name, sdoc));
             if (!File.Exists(scbPath)) {
                 File.WriteAllText(scbPath, ZanIDE.GenSceneBusinessShell(name));
             }
-            log.Add("> Created scene " + scenePath + " (+ " + sgenPath + ", " + scbPath + ").");
+            log.Add("> Created scene " + scenePath + " (+ " + scbPath + ").");
             return scenePath;
         }
-        if (kind == 5) {
+        if (kind == ZanIDE.FileKindForm()) {
             string formPath = root + "/src/" + name + ".zform";
             string cbPath = ZanIDE.CodeBehindPath(formPath);
             FormDoc o = new FormDoc();
@@ -527,7 +571,7 @@ partial class ZanIDE {
             log.Add("> Created form " + formPath + " (+ " + cbPath + ").");
             return formPath;
         }
-        if (kind == 6) {
+        if (kind == ZanIDE.FileKindFreeForm()) {
             // Free-canvas layout window: same 2-file model as a Form, but the
             // design uses layoutMode 1 so every control is absolutely placed on
             // the canvas (the designer's Free mode), with a starter sample that
@@ -541,7 +585,7 @@ partial class ZanIDE {
             log.Add("> Created free-layout form " + formPath + " (+ " + cbPath + ").");
             return formPath;
         }
-        if (kind == 8) {
+        if (kind == ZanIDE.FileKindFolder()) {
             string dirPath = root + "/src/" + name;
             Directory.CreateDirectoryRecursive(dirPath);
             log.Add("> Created folder " + dirPath + ".");
@@ -623,6 +667,38 @@ partial class ZanIDE {
             return "using System;\n\n/// Contract implemented by concrete types.\nclass " + name + " {\n    void Execute() { }\n}\n";
         }
         return "";
+    }
+
+    /// Body of a new Lua (kind 5) / Python (kind 6) script. A script is never
+    /// a program on its own -- Zan loads it through System.Scripting -- so the
+    /// template opens with the exact host snippet that runs it, and exposes a
+    /// single entry function for the host to call.
+    static string ScriptTemplateBody(int kind, string name) {
+        if (kind == 6) {
+            return "# " + name + ".py -- loaded by a Zan host, not run on its own.\n"
+                 + "#\n"
+                 + "#   using System.Scripting;\n"
+                 + "#   Python.Initialize();\n"
+                 + "#   Python.RunFile(\"src/" + name + ".py\");\n"
+                 + "#   Console.WriteLine(Python.Eval(\"" + name + "_main()\"));\n"
+                 + "#\n"
+                 + "# The interpreter comes from ZAN_PYTHON_LIB, the runtime bundled\n"
+                 + "# next to the executable by zanc, or the system CPython.\n\n"
+                 + "def " + name + "_main():\n"
+                 + "    return \"hello from " + name + ".py\"\n";
+        }
+        return "-- " + name + ".lua -- loaded by a Zan host, not run on its own.\n"
+             + "--\n"
+             + "--   using System.Scripting;\n"
+             + "--   Lua.Initialize();\n"
+             + "--   Lua.RunFile(\"src/" + name + ".lua\");\n"
+             + "--   Console.WriteLine(Lua.CallS(\"" + name + "_main\"));\n"
+             + "--\n"
+             + "-- The interpreter comes from ZAN_LUA_LIB, the runtime bundled next\n"
+             + "-- to the executable by zanc, or the system Lua.\n\n"
+             + "function " + name + "_main()\n"
+             + "    return \"hello from " + name + ".lua\"\n"
+             + "end\n";
     }
 
     // ---- tree scanning ----
@@ -783,17 +859,27 @@ partial class ZanIDE {
             return p;
         }
         if (ZanIDE.IsScenePath(p)) {
-            string sgen = ZanIDE.SceneGenFilePath(p);
-            if (File.Exists(sgen)) { return sgen; }
-            string scb = ZanIDE.SceneCodeBehindPath(p);
-            if (File.Exists(scb)) { return scb; }
-            return ZanIDE.ProjectEntry(root);
+            // Same 2-file model: the .zscene is the compiled input (zanc's
+            // scenegen projects its elements + Main) and its business file
+            // rides along through SmartInputs.
+            return p;
+        }
+        // A leftover generated Name.g.zan still routes to the design it came
+        // from, which the compiler now projects directly.
+        if (ZanIDE.IsGenPath(p)) {
+            string gform = p.Substring(0, p.Length - 6) + ".zform";
+            if (File.Exists(gform)) { return gform; }
+            string gscene = p.Substring(0, p.Length - 6) + ".zscene";
+            if (File.Exists(gscene)) { return gscene; }
         }
         // A form's business file (Name.zan) has no Main of its own; compile via
         // its paired .zform, which zanc projects into the window's entry point.
         if (ZanIDE.IsZanFilePath(p) && !ZanIDE.IsGenPath(p)) {
             string form = p.Substring(0, p.Length - 4) + ".zform";
             if (File.Exists(form)) { return form; }
+            // Same for a scene's business file: compile via its .zscene.
+            string scene = p.Substring(0, p.Length - 4) + ".zscene";
+            if (File.Exists(scene)) { return scene; }
         }
         return p;
     }
@@ -801,8 +887,9 @@ partial class ZanIDE {
     /// Run/Build/Debug from the ribbon act on the ACTIVE TAB: the focused code
     /// tab is what gets compiled and run, so a scratch snippet in its own tab
     /// can be tried without touching the project entry. Special tabs
-    /// (@start/@docs) and designer tabs (.zform/.zscene) still map to the
-    /// project entry via RunTarget.
+    /// (@start/@docs) map to the project entry via RunTarget, while a designer
+    /// tab runs the design it has open (the .zform or .zscene itself, which
+    /// zanc compiles directly).
     static string RibbonRunTarget(string activePath, string root) {
         return ZanIDE.RunTarget(activePath, root);
     }
@@ -829,6 +916,11 @@ partial class ZanIDE {
             if (ZanIDE.IsFormPath(entry)) {
                 string cbp0 = ZanIDE.CodeBehindPath(entry);
                 if (File.Exists(cbp0)) { args0 = args0 + " \"" + cbp0 + "\""; have.Add(cbp0); }
+            }
+            // Same for a loose .zscene and its business half (OnLoad).
+            if (ZanIDE.IsScenePath(entry)) {
+                string scb0 = ZanIDE.SceneCodeBehindPath(entry);
+                if (File.Exists(scb0)) { args0 = args0 + " \"" + scb0 + "\""; have.Add(scb0); }
             }
             return ZanIDE.WithUsedModules(args0, dir, entry, have);
         }
@@ -1245,9 +1337,10 @@ partial class ZanIDE {
     /// absolute path. Window-app templates keep a .zform entry (never
     /// src/main.zan), so the hardcoded main.zan fallback only applies to
     /// projects that do not declare one. A `Name.g.zan` entry is a leftover
-    /// from the pre-formgen IDE: the .zform is the single design source (the
-    /// compiler synthesises the partial class at build time, see formgen.h),
-    /// so it is mapped back to the .zform when that file exists.
+    /// from the pre-formgen IDE: the design document is the single source (the
+    /// compiler synthesises the partial class at build time, see formgen.h /
+    /// scenegen.h), so it is mapped back to the .zform or .zscene when that
+    /// file exists.
     static string ProjectEntryPath(string root) {
         string entry = "src/main.zan";
         string mpath = root + "/zan.proj";
@@ -1258,6 +1351,8 @@ partial class ZanIDE {
         if (ZanIDE.IsGenPath(full)) {
             string form = full.Substring(0, full.Length - 6) + ".zform";
             if (File.Exists(form)) { return form; }
+            string scene = full.Substring(0, full.Length - 6) + ".zscene";
+            if (File.Exists(scene)) { return scene; }
         }
         if (!File.Exists(full)) { full = root + "/src/main.zan"; }
         return full;

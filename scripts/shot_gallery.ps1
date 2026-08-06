@@ -9,6 +9,20 @@ if ($State -ne "") { $argList += $State }
 if ($argList.Count -gt 0) { Start-Process $exe -ArgumentList $argList } else { Start-Process $exe }
 Start-Sleep -Milliseconds 1400
 
+# PowerShell is DPI-unaware by default: on a scaled display GetWindowRect and
+# CopyFromScreen then work in virtualised coordinates, so the capture is a crop
+# of the window's top-left corner (2/3 of it at 150%) instead of the whole
+# window. Opt into per-monitor DPI awareness before measuring anything.
+Add-Type @"
+using System;using System.Runtime.InteropServices;
+public class DPI{
+ [DllImport("user32.dll")] public static extern bool SetProcessDpiAwarenessContext(IntPtr c);
+ [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
+ public static void On(){ try{ if(SetProcessDpiAwarenessContext((IntPtr)(-4))) return; }catch{} try{ SetProcessDPIAware(); }catch{} }
+}
+"@
+[DPI]::On()
+
 Add-Type @"
 using System;using System.Text;using System.Runtime.InteropServices;
 public class WG{

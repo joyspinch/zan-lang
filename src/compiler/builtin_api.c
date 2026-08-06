@@ -143,7 +143,14 @@ static const zan_builtin_member_t members_nativemem[] = {
 };
 
 static const zan_builtin_member_t members_task[] = {
-    { "Spawn", 'M', "void Spawn(Action work)" },
+    { "Spawn",  'M', "long Spawn(asyncCall)" },
+    { "Run",    'M', "long Run(asyncCall)" },
+    { "Delay",  'M', "await Task.Delay(long ms)" },
+    { "WhenAll",'M', "async int WhenAll(List<long> handles)" },
+    { "WhenAny",'M', "async int WhenAny(List<long> handles)" },
+    { "IsDone", 'M', "int IsDone(long handle)" },
+    { "Cancel", 'M', "void Cancel(long handle)" },
+    { "IsCancellationRequested", 'M', "int IsCancellationRequested()" },
 };
 
 #define BT(name, pub, disp, stat, arr) \

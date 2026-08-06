@@ -1148,6 +1148,83 @@ EXPORT void zan_gui_draw_rounded_rect(i32 surface_id, i32 x, i32 y, i32 w, i32 h
     zan_gui_draw_rounded_rect_mask(surface_id, x, y, w, h, radius, 15, color, thickness);
 }
 
+/* Drop shadow: the rounded rect (x,y,w,h,radius) softened over a `blur`-wide
+ * band. Coverage comes from the exact signed distance to the shape and fades
+ * with a smoothstep across the band, which straddles the edge the way a
+ * gaussian box-shadow does (half coverage on the outline itself). The falloff
+ * is therefore continuous in every direction — including across the corner
+ * diagonals, where stacking expanded rounded rects leaves wedge-shaped gaps
+ * that read as concentric arcs.
+ *
+ * Each pixel is written exactly once, so a translucent shadow colour composites
+ * to its nominal alpha instead of darkening wherever layers overlapped. */
+EXPORT void zan_gui_shadow_rounded_rect(i32 surface_id, i32 x, i32 y, i32 w, i32 h, i32 radius, i32 blur, i32 color) {
+    if (surface_id < 0 || surface_id >= g_surface_count) return;
+    zan_surface_t *s = g_surfaces[surface_id];
+    if (!s) return;
+    int iw = (int)w, ih = (int)h;
+    if (iw <= 0 || ih <= 0) return;
+    int bl = (int)blur;
+    if (bl <= 0) { zan_gui_fill_rounded_rect(surface_id, x, y, w, h, radius, color); return; }
+    int r = (int)radius;
+    if (r > iw/2) r = iw/2;
+    if (r > ih/2) r = ih/2;
+    if (r < 0) r = 0;
+    u32 c = (u32)color;
+
+    /* Half extents measured from the shape centre, shrunk by the corner radius:
+     * the classic rounded-box distance field is the distance to that inner
+     * rectangle minus the radius. */
+    double cx = (double)x + (double)iw / 2.0;
+    double cy = (double)y + (double)ih / 2.0;
+    double ex = (double)iw / 2.0 - (double)r;
+    double ey = (double)ih / 2.0 - (double)r;
+
+    int x0 = (int)x - bl, x1 = (int)x + iw + bl;
+    int y0 = (int)y - bl, y1 = (int)y + ih + bl;
+    if (x0 < s->clip_x0) x0 = s->clip_x0;
+    if (y0 < s->clip_y0) y0 = s->clip_y0;
+    if (x1 > s->clip_x1) x1 = s->clip_x1;
+    if (y1 > s->clip_y1) y1 = s->clip_y1;
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 > s->width) x1 = s->width;
+    if (y1 > s->height) y1 = s->height;
+
+    /* Everything further inside than the fade band is fully covered; fill that
+     * rectangle in one go and let the distance field handle only the band. */
+    int in = r + (bl + 1) / 2 + 1;
+    int xi0 = (int)x + in, xi1 = (int)x + iw - in;
+    int yi0 = (int)y + in, yi1 = (int)y + ih - in;
+    if (xi1 > xi0 && yi1 > yi0) {
+        zan_gui_fill_rect(surface_id, xi0, yi0, xi1 - xi0, yi1 - yi0, color);
+    } else {
+        xi0 = 0; xi1 = 0; yi0 = 0; yi1 = 0;
+    }
+
+    double half = (double)bl / 2.0;
+    double inv = 1.0 / (double)bl;
+    for (int py = y0; py < y1; py++) {
+        double qy = fabs((double)py + 0.5 - cy) - ey;
+        int interiorRow = (py >= yi0 && py < yi1);
+        for (int px = x0; px < x1; px++) {
+            if (interiorRow && px >= xi0 && px < xi1) { px = xi1 - 1; continue; }
+            double qx = fabs((double)px + 0.5 - cx) - ex;
+            double mx = qx > 0.0 ? qx : 0.0;
+            double my = qy > 0.0 ? qy : 0.0;
+            double outside = sqrt(mx*mx + my*my);
+            double inside = (qx > qy ? qx : qy);
+            if (inside > 0.0) inside = 0.0;
+            double d = outside + inside - (double)r;   /* <0 inside the shape */
+            double t = (d + half) * inv;
+            if (t <= 0.0) { set_pixel(s, px, py, c); continue; }
+            if (t >= 1.0) continue;
+            double cov = 1.0 - t * t * (3.0 - 2.0 * t);   /* smoothstep falloff */
+            set_pixel_aa(s, px, py, c, (int)(cov * 255.0));
+        }
+    }
+}
+
 /* Anti-aliased filled circle */
 EXPORT void zan_gui_fill_circle(i32 surface_id, i32 cx, i32 cy, i32 radius, i32 color) {
     if (surface_id < 0 || surface_id >= g_surface_count) return;

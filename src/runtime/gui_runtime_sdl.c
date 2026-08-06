@@ -35,6 +35,23 @@ static int g_pending_event[8];
 static SDL_Window *g_event_win = NULL; /* window that produced g_pending_event */
 static SDL_Window *g_main_win = NULL;  /* first window: closing it quits */
 static bool g_mouse_captured = false;  /* holding a client-widget drag */
+
+/* Manual (non-modal) window resize. Handing a border press to the OS through
+ * SDL_HITTEST_RESIZE_* starts Windows' modal move/resize loop, which owns the
+ * thread until the button is released: SDL_PollEvent never returns, so the app
+ * cannot lay out or repaint and the window shows a frozen frame that only
+ * snaps to the new size on release. The border is therefore hit-tested as
+ * client area and resized here instead -- ordinary motion events keep flowing,
+ * so every drag step produces a normal resize event and a repainted frame. */
+#define ZAN_EDGE_LEFT   1
+#define ZAN_EDGE_RIGHT  2
+#define ZAN_EDGE_TOP    4
+#define ZAN_EDGE_BOTTOM 8
+static SDL_Window *g_resize_win = NULL; /* window being resized, NULL = none */
+static int g_resize_edge = 0;           /* ZAN_EDGE_* mask of the grabbed edge */
+static float g_resize_mx0 = 0, g_resize_my0 = 0; /* global pointer at grab */
+static int g_resize_x0 = 0, g_resize_y0 = 0;     /* window rect at grab */
+static int g_resize_w0 = 0, g_resize_h0 = 0;
 static int g_window_width = 0, g_window_height = 0; /* last-resized size (px) */
 static int g_sdl_ready = 0;
 static int g_quit = 0;
@@ -207,6 +224,8 @@ static int cur_mod_bits(void) { return sdl_mods_to_bits(SDL_GetModState()); }
 static SDL_HitTestResult SDLCALL zan_sdl_hittest(SDL_Window *win,
                                                  const SDL_Point *area,
                                                  void *data);
+static int zan_sdl_resize_edge(SDL_Window *win, int x, int y);
+static void zan_sdl_resize_step(void);
 
 /* Decode one UTF-8 codepoint from s (advancing *i); returns -1 at end. */
 static int sdl_utf8_next(const char *s, int *i) {
@@ -265,6 +284,18 @@ static void sdl_translate(const SDL_Event *e) {
                 SDL_CaptureMouse(false);
                 g_mouse_captured = false;
             }
+            /* A manual border drag owns the pointer: resize instead of
+             * reporting motion, so no control sees a phantom drag. */
+            if (g_resize_win) {
+                if ((e->motion.state & SDL_BUTTON_LMASK) == 0) {
+                    g_resize_win = NULL;
+                    g_resize_edge = 0;
+                    SDL_CaptureMouse(false);
+                } else {
+                    zan_sdl_resize_step();
+                }
+                break;
+            }
             zq_push(1, (int)e->motion.x, (int)e->motion.y, 0, 0,
                     cur_mod_bits(), w);
             break;
@@ -284,14 +315,35 @@ static void sdl_translate(const SDL_Event *e) {
              * the mouse captured forever and break all later input routing. */
             if (e->button.button == SDL_BUTTON_LEFT) {
                 if (down) {
+                    /* Border press: start a manual resize and swallow the
+                     * click so it never reaches a control underneath. */
+                    int edge = w ? zan_sdl_resize_edge(w, (int)e->button.x,
+                                                       (int)e->button.y) : 0;
+                    if (edge) {
+                        g_resize_win = w;
+                        g_resize_edge = edge;
+                        SDL_GetGlobalMouseState(&g_resize_mx0, &g_resize_my0);
+                        SDL_GetWindowPosition(w, &g_resize_x0, &g_resize_y0);
+                        SDL_GetWindowSize(w, &g_resize_w0, &g_resize_h0);
+                        SDL_CaptureMouse(true);
+                        break;
+                    }
                     SDL_Point p = { (int)e->button.x, (int)e->button.y };
                     if (w && zan_sdl_hittest(w, &p, NULL) == SDL_HITTEST_NORMAL) {
                         SDL_CaptureMouse(true);
                         g_mouse_captured = true;
                     }
-                } else if (g_mouse_captured) {
-                    SDL_CaptureMouse(false);
-                    g_mouse_captured = false;
+                } else {
+                    if (g_resize_win) {
+                        g_resize_win = NULL;
+                        g_resize_edge = 0;
+                        SDL_CaptureMouse(false);
+                        break;
+                    }
+                    if (g_mouse_captured) {
+                        SDL_CaptureMouse(false);
+                        g_mouse_captured = false;
+                    }
                 }
             }
             zq_push(kind, (int)e->button.x, (int)e->button.y, btn, 0,
@@ -378,9 +430,82 @@ static void sdl_translate(const SDL_Event *e) {
     }
 }
 
-/* Borderless drag/resize regions — the SDL analogue of WM_NCHITTEST: an 8px
- * (DPI-scaled) resize border, a draggable caption strip minus the caption
- * button cluster on the right, everything else client. */
+/* Which resize border (if any) the point lies in, as a ZAN_EDGE_* mask. Zero
+ * for the client area, a maximized window, the caption buttons, or a spot a
+ * control has claimed through the hit guard (a scrollbar flush with the
+ * edge). This is the geometry the old WM_NCHITTEST regions used; the press is
+ * now handled in-process (see g_resize_win) rather than by the OS. */
+static int zan_sdl_resize_edge(SDL_Window *win, int x, int y) {
+    int W = 0, H = 0;
+    SDL_GetWindowSize(win, &W, &H);
+    int b = 8 * g_dpi / 96;
+    if (SDL_GetWindowFlags(win) & SDL_WINDOW_MAXIMIZED) return 0;
+    zan_sdl_win_t *rec = sdl_find(win);
+    int nbtn = rec ? rec->caption_btns : g_caption_btn_count;
+    if (y < g_titlebar_h && x >= W - nbtn * g_btn_w) return 0;
+    int left = x < b, right = x >= W - b, top = y < b, bottom = y >= H - b;
+    int corner = (top && left) || (top && right) || (bottom && left)
+        || (bottom && right);
+    /* Corners always win; a straight edge yields to a control that reserved
+     * those last few pixels. */
+    if (!corner && zan_gui_in_hit_guard((iptr)(intptr_t)win, x, y)) return 0;
+    int mask = 0;
+    if (left)   mask |= ZAN_EDGE_LEFT;
+    if (right)  mask |= ZAN_EDGE_RIGHT;
+    if (top)    mask |= ZAN_EDGE_TOP;
+    if (bottom) mask |= ZAN_EDGE_BOTTOM;
+    return mask;
+}
+
+/* The resize cursor for an edge mask, or NULL for the client area. */
+static SDL_SystemCursor zan_sdl_edge_cursor(int edge) {
+    if ((edge & ZAN_EDGE_TOP) && (edge & ZAN_EDGE_LEFT))
+        return SDL_SYSTEM_CURSOR_NWSE_RESIZE;
+    if ((edge & ZAN_EDGE_BOTTOM) && (edge & ZAN_EDGE_RIGHT))
+        return SDL_SYSTEM_CURSOR_NWSE_RESIZE;
+    if ((edge & ZAN_EDGE_TOP) && (edge & ZAN_EDGE_RIGHT))
+        return SDL_SYSTEM_CURSOR_NESW_RESIZE;
+    if ((edge & ZAN_EDGE_BOTTOM) && (edge & ZAN_EDGE_LEFT))
+        return SDL_SYSTEM_CURSOR_NESW_RESIZE;
+    if (edge & (ZAN_EDGE_LEFT | ZAN_EDGE_RIGHT))
+        return SDL_SYSTEM_CURSOR_EW_RESIZE;
+    return SDL_SYSTEM_CURSOR_NS_RESIZE;
+}
+
+/* Apply one step of a manual resize from the current global pointer. */
+static void zan_sdl_resize_step(void) {
+    if (!g_resize_win) return;
+    float mx = 0, my = 0;
+    SDL_GetGlobalMouseState(&mx, &my);
+    int dx = (int)(mx - g_resize_mx0), dy = (int)(my - g_resize_my0);
+    int x = g_resize_x0, y = g_resize_y0;
+    int w = g_resize_w0, h = g_resize_h0;
+    int minW = 320 * g_dpi / 96, minH = 240 * g_dpi / 96;
+    if (g_resize_edge & ZAN_EDGE_LEFT) {
+        if (w - dx < minW) dx = w - minW;
+        x += dx; w -= dx;
+    } else if (g_resize_edge & ZAN_EDGE_RIGHT) {
+        w += dx;
+        if (w < minW) w = minW;
+    }
+    if (g_resize_edge & ZAN_EDGE_TOP) {
+        if (h - dy < minH) dy = h - minH;
+        y += dy; h -= dy;
+    } else if (g_resize_edge & ZAN_EDGE_BOTTOM) {
+        h += dy;
+        if (h < minH) h = minH;
+    }
+    int cw = 0, ch = 0;
+    SDL_GetWindowSize(g_resize_win, &cw, &ch);
+    if (g_resize_edge & (ZAN_EDGE_LEFT | ZAN_EDGE_TOP))
+        SDL_SetWindowPosition(g_resize_win, x, y);
+    if (w != cw || h != ch) SDL_SetWindowSize(g_resize_win, w, h);
+}
+
+/* Borderless drag regions — the SDL analogue of WM_NCHITTEST. The resize
+ * border is deliberately reported as client area (see g_resize_win): only the
+ * caption strip still hands off to the OS, where a modal loop costs nothing
+ * because moving a window needs no repaint. */
 static SDL_HitTestResult SDLCALL zan_sdl_hittest(SDL_Window *win,
                                                  const SDL_Point *area,
                                                  void *data) {
@@ -388,28 +513,11 @@ static SDL_HitTestResult SDLCALL zan_sdl_hittest(SDL_Window *win,
     int W = 0, H = 0;
     SDL_GetWindowSize(win, &W, &H);
     int x = area->x, y = area->y;
-    int b = 8 * g_dpi / 96;
-    int maxed = (SDL_GetWindowFlags(win) & SDL_WINDOW_MAXIMIZED) ? 1 : 0;
     zan_sdl_win_t *rec = sdl_find(win);
     int nbtn = rec ? rec->caption_btns : g_caption_btn_count;
-    int inButtons = (y < g_titlebar_h &&
-                     x >= W - nbtn * g_btn_w);
-    if (!maxed && !inButtons) {
-        int left = x < b, right = x >= W - b, top = y < b, bottom = y >= H - b;
-        if (top && left)     return SDL_HITTEST_RESIZE_TOPLEFT;
-        if (top && right)    return SDL_HITTEST_RESIZE_TOPRIGHT;
-        if (bottom && left)  return SDL_HITTEST_RESIZE_BOTTOMLEFT;
-        if (bottom && right) return SDL_HITTEST_RESIZE_BOTTOMRIGHT;
-        /* Corners first, then let a control drawn flush with the edge (a
-         * scrollbar in the last few pixels) keep its own presses. */
-        if (!zan_gui_in_hit_guard((iptr)(intptr_t)win, x, y)) {
-            if (left)   return SDL_HITTEST_RESIZE_LEFT;
-            if (right)  return SDL_HITTEST_RESIZE_RIGHT;
-            if (top)    return SDL_HITTEST_RESIZE_TOP;
-            if (bottom) return SDL_HITTEST_RESIZE_BOTTOM;
-        }
-    }
+    int inButtons = (y < g_titlebar_h && x >= W - nbtn * g_btn_w);
     if (inButtons) return SDL_HITTEST_NORMAL;
+    if (zan_sdl_resize_edge(win, x, y)) return SDL_HITTEST_NORMAL;
     if (y < g_titlebar_h) return SDL_HITTEST_DRAGGABLE;
     return SDL_HITTEST_NORMAL;
 }
@@ -939,6 +1047,33 @@ EXPORT i32 zan_gui_set_cursor(i32 cursor_type) {
         cache[4] = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_NS_RESIZE);
         cache[5] = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_CROSSHAIR);
         made = 1;
+    }
+    /* The resize border is client area to the OS now (see g_resize_win), so
+     * its cursor is ours to draw: override the app's per-frame choice while
+     * the pointer sits on an edge, or for the whole manual drag. */
+    int edge = g_resize_edge;
+    if (!edge) {
+        float mx = 0, my = 0;
+        SDL_Window *w = SDL_GetMouseFocus();
+        SDL_GetMouseState(&mx, &my);
+        if (w) edge = zan_sdl_resize_edge(w, (int)mx, (int)my);
+    }
+    if (edge) {
+        static SDL_Cursor *edges[4];
+        static int emade = 0;
+        if (!emade) {
+            edges[0] = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_EW_RESIZE);
+            edges[1] = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_NS_RESIZE);
+            edges[2] = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_NWSE_RESIZE);
+            edges[3] = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_NESW_RESIZE);
+            emade = 1;
+        }
+        SDL_SystemCursor want = zan_sdl_edge_cursor(edge);
+        int i = 0;
+        if (want == SDL_SYSTEM_CURSOR_NS_RESIZE) i = 1;
+        else if (want == SDL_SYSTEM_CURSOR_NWSE_RESIZE) i = 2;
+        else if (want == SDL_SYSTEM_CURSOR_NESW_RESIZE) i = 3;
+        if (edges[i]) { SDL_SetCursor(edges[i]); return 0; }
     }
     int t = (int)cursor_type;
     if (t < 0 || t > 5) t = 0;

@@ -827,6 +827,27 @@ static bool looks_like_type_args_before_dot(zan_parser_t *p) {
     return ok;
 }
 
+/* `Task.WhenAll(handles)` / `Task.WhenAny(handles)` name the fan-out joins the
+ * design docs promise, but the joins themselves are ordinary async standard
+ * library code (System.Threading.TaskJoin) rather than compiler intrinsics:
+ * they suspend and resume like any other awaited call, which is exactly what
+ * the await lowering already does. Rewriting the receiver here -- before name
+ * resolution, binding and irgen -- lets the promised spelling resolve to that
+ * class, so `await Task.WhenAll(list)` needs no special case downstream.
+ * Task's real intrinsics (Spawn/Run/Cancel/Delay/IsDone/IsCancellationRequested)
+ * are untouched. */
+static void desugar_task_join(zan_ast_node_t *member) {
+    zan_istr_t obj_name;
+    zan_istr_t m = member->member.name;
+    if (!member->member.object ||
+        member->member.object->kind != AST_IDENTIFIER) return;
+    obj_name = member->member.object->ident.name;
+    if (obj_name.len != 4 || memcmp(obj_name.str, "Task", 4) != 0) return;
+    if (!((m.len == 7 && memcmp(m.str, "WhenAll", 7) == 0) ||
+          (m.len == 7 && memcmp(m.str, "WhenAny", 7) == 0))) return;
+    member->member.object->ident.name = (zan_istr_t){"TaskJoin", 8};
+}
+
 /* postfix: call, member access, index, ++, --, object initializer */
 static zan_ast_node_t *parse_postfix(zan_parser_t *p) {
     zan_ast_node_t *expr = parse_primary(p);
@@ -876,6 +897,7 @@ static zan_ast_node_t *parse_postfix(zan_parser_t *p) {
             n->member.object = expr;
             n->member.name = p->previous.str_val;
             n->member.null_cond = null_cond;
+            desugar_task_join(n);
             expr = n;
         } else if (parser_match(p, TK_LPAREN)) {
             /* function call */

@@ -36,6 +36,8 @@ class HttpClient {
     // 下面的开发开关在发布二进制中会被编译掉。
     List<string> tlsPins;
     bool pinningEnabled;
+    // cookie 存储；null = 不参与 cookie（Set-Cookie 只留在响应头里）。
+    CookieJar jar;
 
     [DllImport("crt")]
     static extern nint fopen(string path, string mode);
@@ -69,6 +71,7 @@ class HttpClient {
         this.defaultHeaders = new List<string>();
         this.tlsPins = null;
         this.pinningEnabled = false;
+        this.jar = null;
     }
 
     /// <summary>为指定的主机和端口创建 HTTPS 客户端。</summary>
@@ -89,6 +92,19 @@ class HttpClient {
     HttpClient DisableTlsVerify() {
         this.verifyTls = false;
         return this;
+    }
+
+    /// <summary>为此客户端启用 cookie：响应里的 Set-Cookie 被存下来，
+    /// 后续请求按域名/路径/Secure 规则自动带上 Cookie 头。调用方自己用
+    /// <see cref="SetHeader"/> 写的 Cookie 头优先，存储不会覆盖它。</summary>
+    HttpClient UseCookies() {
+        if (this.jar == null) { this.jar = new CookieJar(); }
+        return this;
+    }
+
+    /// <summary>本客户端的 cookie 存储，未启用时为 null。</summary>
+    CookieJar Cookies() {
+        return this.jar;
     }
 
     /// <summary>固定一个受信任的服务器公钥：其 DER SubjectPublicKeyInfo 的
@@ -204,12 +220,28 @@ class HttpClient {
             }
         }
 
+        if (this.jar != null && !this.HasHeaderName("Cookie")) {
+            string cookies = this.jar.HeaderValue(this.host, path, this.useTls);
+            if (cookies.Length > 0) {
+                sb.Append("Cookie: ");
+                sb.Append(cookies);
+                sb.Append("\r\n");
+            }
+        }
+
         sb.Append("Connection: close\r\n");
         sb.Append("\r\n");
         if (body.Length > 0) {
             sb.Append(body);
         }
         return sb.ToString();
+    }
+
+    // 把响应里的 Set-Cookie 交给存储。未启用 cookie 时什么都不做，
+    // 所以调用点不必自己判空。
+    void AbsorbCookies(string path, string raw) {
+        if (this.jar == null) { return; }
+        this.jar.AbsorbHead(this.host, path, raw);
     }
 
     // 报告连接失败，区分被拒绝的连接与
@@ -289,6 +321,7 @@ class HttpClient {
             body = "";
             FailTimeout();
         }
+        this.AbsorbCookies(path, result);
         return result;
     }
 
@@ -363,6 +396,7 @@ class HttpClient {
             body = "";
             FailTimeout();
         }
+        this.AbsorbCookies(path, result);
         return result;
     }
 

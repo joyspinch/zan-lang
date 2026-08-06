@@ -1,0 +1,154 @@
+// System.Net.Http.Proxy.HttpForwarder: CONNECT and 101 Upgrade must become raw
+// bidirectional byte tunnels instead of being framed as an ordinary request with
+// a body — that is what makes tunnelled protocols (TLS through CONNECT,
+// WebSocket after an Upgrade) work through the forwarder at all.
+//
+// The upstream is a raw socket server: for a tunnel it echoes every byte back
+// upper-cased (so both directions are observable), and for /ws it answers 101
+// and then behaves the same way.
+using System;
+using System.Net.Sockets;
+using System.Net.Http.Proxy;
+
+namespace Conf;
+
+class Prog {
+    static int UP_PORT = 9621;
+    static int FWD_PORT = 9622;
+
+    static async void Upstream() {
+        TcpListener l = new TcpListener("127.0.0.1", Prog.UP_PORT);
+        l.Start();
+        int served = 0;
+        while (served < 2) {
+            nint c = await l.AcceptAsync();
+            if (c < 0) { break; }
+            served = served + 1;
+            Task.Spawn(Prog.ServeUpstream(c));
+        }
+        l.Stop();
+    }
+
+    static async void ServeUpstream(nint c) {
+        // First bytes decide the mode: a CONNECT tunnel arrives as raw payload
+        // (the forwarder never forwards the CONNECT line), an Upgrade arrives
+        // as a request head.
+        string first = await Socket.RecvAsync(c, 8192);
+        if (first.Length == 0) { Socket.Close(c); return; }
+        string rest = first;
+        if (Prog.Find(first, "GET /ws") >= 0) {
+            while (Prog.Find(rest, "\r\n\r\n") < 0) {
+                string more = await Socket.RecvAsync(c, 8192);
+                if (more.Length == 0) { break; }
+                rest = rest + more;
+            }
+            int hb = Prog.Find(rest, "\r\n\r\n");
+            int _h = await Socket.SendStringAsync(c,
+                "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
+                + "Connection: Upgrade\r\n\r\n");
+            rest = rest.Substring(hb + 4, rest.Length - hb - 4);
+        }
+        // Echo loop, upper-cased.
+        while (true) {
+            if (rest.Length > 0) {
+                int _e = await Socket.SendStringAsync(c, Prog.Upper(rest));
+                rest = "";
+            }
+            string piece = await Socket.RecvAsync(c, 8192);
+            if (piece.Length == 0) { break; }
+            rest = piece;
+        }
+        Socket.Close(c);
+    }
+
+    static string Upper(string s) {
+        string up = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        string outs = "";
+        for (int i = 0; i < s.Length; i = i + 1) {
+            int b = s[i] & 255;
+            if (b >= 97 && b <= 122) { outs = outs + up.Substring(b - 97, 1); }
+            else { outs = outs + s.Substring(i, 1); }
+        }
+        return outs;
+    }
+
+    static int Find(string hay, string needle) {
+        int n = hay.Length;
+        int m = needle.Length;
+        for (int i = 0; i + m <= n; i = i + 1) {
+            int k = 0;
+            while (k < m && (hay[i + k] & 255) == (needle[k] & 255)) {
+                k = k + 1;
+            }
+            if (k == m) { return i; }
+        }
+        return -1;
+    }
+
+    /// Reads until `want` bytes arrived or the peer closed.
+    static async string ReadAtLeast(TcpClient c, int want) {
+        string all = "";
+        while (all.Length < want) {
+            string piece = await c.RecvAsync(8192);
+            if (piece.Length == 0) { break; }
+            all = all + piece;
+        }
+        return all;
+    }
+
+    static async int Run() {
+        Socket.Initialize();
+        Task.Spawn(Prog.Upstream());
+        HttpForwarder fwd = new HttpForwarder("127.0.0.1", Prog.FWD_PORT,
+            "http://127.0.0.1:" + Convert.ToString(Prog.UP_PORT));
+        fwd.SetTimeout(10000);
+        Task.Spawn(fwd.Start());
+        await Task.Delay(120);
+
+        // 1. CONNECT: 200 Connection Established, then raw bytes both ways.
+        TcpClient c1 = await TcpClient.ConnectAsync("127.0.0.1", Prog.FWD_PORT,
+                                                    5000);
+        if (c1 == null) { Console.WriteLine("connect failed"); return 1; }
+        int _s1 = await c1.SendAsync("CONNECT 127.0.0.1:"
+            + Convert.ToString(Prog.UP_PORT) + " HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+            + "\r\n");
+        string est = await Prog.ReadAtLeast(c1, 39);
+        Console.WriteLine("connect-established: "
+            + Convert.ToString(Prog.Find(est, "200 Connection Established") >= 0
+                ? 1 : 0));
+        string extra = "";
+        int hb = Prog.Find(est, "\r\n\r\n");
+        if (hb >= 0) { extra = est.Substring(hb + 4, est.Length - hb - 4); }
+        int _t1 = await c1.SendAsync("tunnel-payload");
+        string echoed = await Prog.ReadAtLeast(c1, 14 - extra.Length);
+        Console.WriteLine("connect-echo: " + extra + echoed);
+        c1.Close();
+
+        // 2. 101 Upgrade: the switch is relayed, then the same raw tunnel.
+        TcpClient c2 = await TcpClient.ConnectAsync("127.0.0.1", Prog.FWD_PORT,
+                                                    5000);
+        if (c2 == null) { Console.WriteLine("connect failed"); return 1; }
+        int _s2 = await c2.SendAsync(
+            "GET /ws HTTP/1.1\r\nHost: front\r\nUpgrade: websocket\r\n"
+            + "Connection: Upgrade\r\n\r\n");
+        string sw = await Prog.ReadAtLeast(c2, 40);
+        Console.WriteLine("upgrade-101: "
+            + Convert.ToString(Prog.Find(sw, "101 Switching Protocols") >= 0
+                ? 1 : 0));
+        int hb2 = Prog.Find(sw, "\r\n\r\n");
+        string after = "";
+        if (hb2 >= 0) { after = sw.Substring(hb2 + 4, sw.Length - hb2 - 4); }
+        int _t2 = await c2.SendAsync("frame-bytes");
+        string echoed2 = await Prog.ReadAtLeast(c2, 11 - after.Length);
+        Console.WriteLine("upgrade-echo: " + after + echoed2);
+        c2.Close();
+
+        fwd.Stop();
+        Console.WriteLine("tunnel-ok: 1");
+        return 0;
+    }
+
+    static void Main() {
+        int r = await Prog.Run();
+    }
+}

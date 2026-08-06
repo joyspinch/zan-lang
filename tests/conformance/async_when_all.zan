@@ -1,0 +1,78 @@
+// Conformance: fan-out joins — Task.WhenAll / Task.WhenAny / Task.IsDone.
+//
+// Task.Spawn hands back a task handle; Task.IsDone(handle) reports whether that
+// detached coroutine has finished (a handle whose frame was already reaped reads
+// as finished, so a stale handle can never be dereferenced). Task.WhenAll and
+// Task.WhenAny desugar to System.Threading.TaskJoin and suspend the joiner
+// until all / one of the handles complete, so a fan-out no longer needs a
+// hand-rolled counter plus gate.
+using System;
+
+class Program {
+    static int done;
+    static int slowRan;
+
+    static async int Work(int ms, int weight) {
+        await Task.Delay(ms);
+        Program.done = Program.done + weight;
+        return weight;
+    }
+
+    static async int Slow() {
+        await Task.Delay(120);
+        Program.slowRan = 1;
+        return 0;
+    }
+
+    static async int Run() {
+        // WhenAll waits for every spawned coroutine, whatever order they finish in
+        List<long> hs = new List<long>();
+        hs.Add(Task.Spawn(Program.Work(40, 1)));
+        hs.Add(Task.Spawn(Program.Work(10, 2)));
+        hs.Add(Task.Spawn(Program.Work(20, 4)));
+        int joined = await Task.WhenAll(hs);
+        Console.WriteLine("joined=" + Convert.ToString(joined));
+        Console.WriteLine("done=" + Convert.ToString(Program.done));
+
+        // every handle is complete once WhenAll returns
+        int allDone = 1;
+        for (int i = 0; i < hs.Count; i = i + 1) {
+            if (Task.IsDone(hs[i]) == 0) { allDone = 0; }
+        }
+        Console.WriteLine("allDone=" + Convert.ToString(allDone));
+
+        // joining an already finished batch returns immediately
+        int again = await Task.WhenAll(hs);
+        Console.WriteLine("again=" + Convert.ToString(again));
+
+        // an empty batch is not an error
+        List<long> none = new List<long>();
+        int empty = await Task.WhenAll(none);
+        Console.WriteLine("empty=" + Convert.ToString(empty));
+
+        // WhenAny returns the index of the first coroutine to finish
+        List<long> race = new List<long>();
+        race.Add(Task.Spawn(Program.Slow()));
+        race.Add(Task.Spawn(Program.Work(10, 8)));
+        int first = await Task.WhenAny(race);
+        Console.WriteLine("first=" + Convert.ToString(first));
+        Console.WriteLine("slowRanYet=" + Convert.ToString(Program.slowRan));
+
+        // the losers keep running unless cancelled; cancel then drain
+        TaskJoin.CancelAll(race);
+        await Task.WhenAll(race);
+        Console.WriteLine("slowRan=" + Convert.ToString(Program.slowRan));
+
+        // Task.Run is Task.Spawn under the name the design docs use
+        List<long> viaRun = new List<long>();
+        viaRun.Add(Task.Run(Program.Work(10, 16)));
+        await Task.WhenAll(viaRun);
+        Console.WriteLine("afterRun=" + Convert.ToString(Program.done));
+        return 0;
+    }
+
+    static async void Main() {
+        await Program.Run();
+        Console.WriteLine("ok");
+    }
+}

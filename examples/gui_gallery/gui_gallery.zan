@@ -8,6 +8,7 @@ using Gui.Component.Chart;
 using Gui.Component.CodeEditor;
 using Gui.Component.DataTable;
 using Gui.Designer;
+using Gui.Hmi;
 
 // Zan GUI component gallery.
 //
@@ -301,6 +302,9 @@ class Demo {
     // Gutter width chosen in EnsureCache (from the source line count) so the
     // wrap width and the render pass agree on where text starts.
     int cacheGutterW;
+    // The code panel's Copy control is a real Button, retained per card so it
+    // keeps its own hover/press state across frames.
+    Button copyBtn;
 
     Demo(string title, string desc, string previewId,
             int previewH, string code, string json) {
@@ -314,6 +318,8 @@ class Demo {
         this.uid = Demo.seq;
         Demo.seq = Demo.seq + 1;
         this.cacheSig = "";
+        this.copyBtn = new Button { Text = "Copy", Icon = "copy",
+                                    Class = "primary small" };
     }
 
     /// Rebuilds the wrap/highlight cache when (width, tab, font size) change.
@@ -448,6 +454,8 @@ class Gallery {
     static FilePicker filePicker;
     static string pickerResult;
     static string pendingPicker;
+    // Deep-link scroll target for the detail pane, applied after measurement.
+    static int pendingScroll;
     static VirtualList demoVList;
     static ListView<string> demoList;
     static CarouselAnim demoCarousel;
@@ -462,6 +470,9 @@ class Gallery {
     static SignalBool evtRunning;
     static Button evtButton;
     static Button evtStartButton;
+    // Copy buttons of the two API tables (properties / events).
+    static Button apiCopyProps;
+    static Button apiCopyEvents;
     static int evtClicks;
 
     // Showcase navigation / scroll state.
@@ -608,6 +619,42 @@ class Gallery {
 
     // Reusable visual component designer (framework component).
     static Designer designer;
+
+    // ---- HMI (SCADA) demo plant -----------------------------------------
+    // One TagTable feeds every HMI preview, exactly like a real screen: the
+    // simulated "scan" in HmiTick writes raw counts into the tags and the
+    // gauges / trend / alarms / cards all follow, because they read the same
+    // tags rather than each holding a copy.
+    static TagTable hmiIo;
+    static IoTag hmiPv;
+    static IoTag hmiSp;
+    static IoTag hmiFlow;
+    static IoTag hmiLevel;
+    static AlarmBuffer hmiAlarms;
+    static AlarmBanner hmiBanner;
+    static AlarmList hmiAlarmList;
+    static Trend hmiTrend;
+    static NumPad hmiPad;
+    static EquipPanel hmiWall;
+    static DeviceCard hmiCard;
+    static Gauge hmiGaugePv;
+    static Gauge hmiGaugeFlow;
+    static Gauge hmiGaugeFree;
+    static SignalInt hmiLoad;
+    static Bargraph hmiBarPv;
+    static Bargraph hmiBarFlow;
+    static Bargraph hmiBarLevel;
+    static Led hmiLedOff;
+    static Led hmiLedRun;
+    static Led hmiLedWarn;
+    static Led hmiLedFault;
+    static Led hmiLedComm;
+    static Digital hmiDigPv;
+    static Digital hmiDigFlow;
+    static Digital hmiDigLevel;
+    static Digital hmiDigSp;
+    static int hmiScanMs;      // last simulated I/O scan (wall clock)
+    static int hmiSampleMs;    // last trend sample (wall clock)
 
     static void Main() {
         App app = App.CreateDark("Zan GUI Components", 1120, 720);
@@ -809,6 +856,7 @@ class Gallery {
         Gallery.wizSel = new SignalInt(1);
         Gallery.fbScroll = new SignalInt(0);
         Gallery.navSearch = Input.Bind(new SignalString(""), "Search components");
+        Gallery.HmiSetup(app);
 
         Gallery.comps = new List<Comp>();
         Gallery.BuildComps(Gallery.comps);
@@ -842,6 +890,17 @@ class Gallery {
                 else if (a == "neon") { Gallery.SelectTheme(app, 3); }
                 else if (a == "brutalism") { Gallery.SelectTheme(app, 4); }
                 else if (a == "chinese") { Gallery.SelectTheme(app, 5); }
+                // Any other installed skin pack can be named directly, so a
+                // screenshot can pin down the exact skin ("dreamy", "darkgold").
+                else if (app.SkinIndexOf(a) >= 0) { app.ApplySkinName(a); }
+                else if (a == "zh") { Gallery.SetLang(1); }
+                else if (a == "en") { Gallery.SetLang(0); }
+                else if (a.Length > 1 && a[0] == 'y') {
+                    // yNNN scrolls the detail pane to pixel NNN once the page
+                    // has been measured (see pendingScroll).
+                    Gallery.pendingScroll =
+                        Gallery.ArgInt(a.Substring(1, a.Length - 1));
+                }
             }
             if (Environment.ArgCount() > 1 && Environment.ArgAt(1) == "open") {
                 if (want == "Layer") {
@@ -888,8 +947,22 @@ class Gallery {
         Gallery.evtButton.Click += Gallery.OnDemoClick;
         Gallery.evtStartButton = new Button { Text = "Start background task", Class = "primary" };
         Gallery.evtStartButton.Click += Gallery.StartTask;
+        Gallery.apiCopyProps = new Button { Text = "Copy", Icon = "copy",
+                                            Class = "secondary small" };
+        Gallery.apiCopyEvents = new Button { Text = "Copy", Icon = "copy",
+                                             Class = "secondary small" };
 
         app.Show();
+        // Same drawing code the loop below runs, registered so the framework can
+        // paint a frame from inside the window procedure: dragging a window edge
+        // enters the system modal resize loop, which never returns to this loop,
+        // so without it the surface stays at the old size and the newly exposed
+        // strip is blank until the drag ends.
+        app.SetFrameBody(() => {
+            WidgetId.ResetFrame();
+            Gallery.Render(app);
+            app.RenderChrome("Zan GUI Components");
+        });
         // Freeze the id baseline after all retained ids (chrome etc.) exist, so
         // the per-frame ResetFrame() below never reissues one of them.
         WidgetId.Mark();
@@ -1110,6 +1183,134 @@ class Gallery {
         Gallery.calHeat = null;
         Gallery.comps = new List<Comp>();
         Gallery.BuildComps(Gallery.comps);
+    }
+
+    /// Builds the demo plant every HMI preview shares: one tag table plus the
+    /// retained HMI widgets bound to it. Retained here (not in the catalog
+    /// builder) because the catalog is rebuilt on a language switch while the
+    /// live widget state -- keypad entry, acknowledged alarms, trend history --
+    /// must survive.
+    static void HmiSetup(App app) {
+        Theme t = app.theme;
+        Gallery.hmiIo = new TagTable();
+        Gallery.hmiIo.SetPeriod(500);
+        Gallery.hmiPv = Gallery.hmiIo.Add("TIC101.PV", "°C", 10)
+            .Range(0, 3000).Limits(500, 2500);
+        Gallery.hmiSp = Gallery.hmiIo.Add("TIC101.SV", "°C", 10).Range(0, 3000);
+        Gallery.hmiFlow = Gallery.hmiIo.Add("FIC102.PV", "m3/h", 10)
+            .Range(0, 5000).Limits(300, 4500);
+        Gallery.hmiLevel = Gallery.hmiIo.Add("LI103.PV", "%", 1)
+            .Range(0, 100).Limits(10, 90);
+        Gallery.hmiPv.SetRaw(1500);
+        Gallery.hmiSp.SetRaw(1800);
+        Gallery.hmiFlow.SetRaw(2500);
+        Gallery.hmiLevel.SetRaw(50);
+
+        Gallery.hmiAlarms = new AlarmBuffer();
+        Gallery.hmiBanner = new AlarmBanner(Gallery.hmiAlarms);
+        Gallery.hmiAlarmList = new AlarmList(Gallery.hmiAlarms);
+
+        Gallery.hmiTrend = new Trend("TIC101 / FIC102", 0, 5000, 10, 120);
+        Gallery.hmiTrend.Add("TIC101.PV", Gallery.hmiPv, t.success);
+        Gallery.hmiTrend.Add("TIC101.SV", Gallery.hmiSp, t.info);
+        Gallery.hmiTrend.Add("FIC102.PV", Gallery.hmiFlow, t.warning);
+
+        Gallery.hmiPad = new NumPad();
+        Gallery.hmiPad.Target(Gallery.hmiSp);
+
+        Gallery.hmiWall = new EquipPanel();
+        DeviceCard w1 = Gallery.hmiWall.AddDevice("1# 进料泵");
+        w1.Row("流量", Gallery.hmiFlow);
+        w1.Row("液位", Gallery.hmiLevel);
+        DeviceCard w2 = Gallery.hmiWall.AddDevice("2# 进料泵");
+        w2.Row("流量", Gallery.hmiFlow);
+        DeviceCard w3 = Gallery.hmiWall.AddDevice("反应釜 R101");
+        w3.Row("温度", Gallery.hmiPv);
+        w3.Row("设定", Gallery.hmiSp);
+        DeviceCard w4 = Gallery.hmiWall.AddDevice("引风机");
+        w4.Row("液位", Gallery.hmiLevel);
+
+        Gallery.hmiCard = new DeviceCard("1# 压缩机");
+        Gallery.hmiCard.Row("排气温度", Gallery.hmiPv);
+        Gallery.hmiCard.Row("排气流量", Gallery.hmiFlow);
+
+        Gallery.hmiGaugePv = new Gauge("TIC101.PV", Gallery.hmiPv)
+            .Limits(500, 2500);
+        Gallery.hmiGaugeFlow = new Gauge("FIC102.PV", Gallery.hmiFlow)
+            .Limits(300, 4500);
+        Gallery.hmiLoad = new SignalInt(62);
+        Gallery.hmiGaugeFree = new Gauge("Load %", Gallery.hmiLoad, 0, 100);
+
+        Gallery.hmiBarPv = new Bargraph("TIC101", Gallery.hmiPv);
+        Gallery.hmiBarPv.Limits(500, 2500);
+        Gallery.hmiBarFlow = new Bargraph("FIC102", Gallery.hmiFlow);
+        Gallery.hmiBarFlow.Limits(300, 4500);
+        Gallery.hmiBarLevel = new Bargraph("LI103", Gallery.hmiLevel);
+        Gallery.hmiBarLevel.Limits(10, 90);
+        Gallery.hmiBarLevel.Orient(Bargraph.Horizontal());
+
+        Gallery.hmiLedOff = new Led("STOP");
+        Gallery.hmiLedRun = new Led("RUN");
+        Gallery.hmiLedRun.Set(1);
+        Gallery.hmiLedWarn = new Led("WARN");
+        Gallery.hmiLedWarn.Set(2);
+        Gallery.hmiLedWarn.SetBlink(true);
+        Gallery.hmiLedFault = new Led("FAULT");
+        Gallery.hmiLedFault.Set(3);
+        Gallery.hmiLedFault.SetBlink(true);
+        Gallery.hmiLedComm = new Led("COMM");
+        Gallery.hmiLedComm.Set(4);
+
+        Gallery.hmiDigPv = new Digital("TIC101.PV", Gallery.hmiPv);
+        Gallery.hmiDigSp = new Digital("TIC101.SV", Gallery.hmiSp);
+        Gallery.hmiDigFlow = new Digital("FIC102.PV", Gallery.hmiFlow);
+        Gallery.hmiDigLevel = new Digital("LI103.PV", Gallery.hmiLevel);
+
+        Gallery.hmiScanMs = 0;
+        Gallery.hmiSampleMs = 0;
+    }
+
+    /// The simulated I/O scan behind the HMI previews: it writes raw counts
+    /// into the shared tags, samples the trend on its own beat and lets the
+    /// alarm buffer derive alarms from the tag limits -- the same shape as a
+    /// real Modbus/OPC poll thread, minus the field bus. Throttled to one pass
+    /// per period, so the number of HMI cards on screen does not change the
+    /// simulated scan rate.
+    static void HmiTick(App app) {
+        int now = Window.GetTickMs();
+        if (now - Gallery.hmiScanMs < 60) { return; }
+        Gallery.hmiScanMs = now;
+        int ph = now / 40;
+        Gallery.hmiPv.SetRaw(1500 + Gauge.SinDeg(ph % 360) * 1150 / 1000);
+        Gallery.hmiFlow.SetRaw(2500
+            + Gauge.SinDeg((ph * 2 + 60) % 360) * 2100 / 1000);
+        Gallery.hmiLevel.SetRaw(50
+            + Gauge.SinDeg((ph / 2 + 120) % 360) * 46 / 1000);
+        // A recurring comms dropout, so the bad-quality styling (a "----"
+        // readout, a greyed needle) shows up without faking the values.
+        bool dropout = (now / 4000) % 5 == 4;
+        if (dropout) {
+            Gallery.hmiFlow.SetBad();
+            Gallery.hmiLedComm.Set(3);
+        } else {
+            Gallery.hmiLedComm.Set(4);
+        }
+        Gallery.hmiLoad.Set(Gallery.hmiLevel.Percent());
+        Gallery.hmiAlarms.Scan(Gallery.hmiIo);
+        // Acknowledged + cleared records are dropped, so the demo list stays
+        // the "what is wrong now" view rather than growing forever.
+        Gallery.hmiAlarms.Purge();
+        int st = (now / 3000) % 5;
+        Gallery.hmiWall.Set("1# 进料泵", 1);
+        Gallery.hmiWall.Set("2# 进料泵", st);
+        Gallery.hmiWall.Set("反应釜 R101", 1);
+        Gallery.hmiWall.Set("引风机", 4);
+        Gallery.hmiCard.Set((now / 2500) % 5);
+        if (now - Gallery.hmiSampleMs >= 250) {
+            Gallery.hmiSampleMs = now;
+            Gallery.hmiTrend.Sample();
+        }
+        app.RequestAnimationFrame(60);
     }
 
     /// One cell of the EN / 中 language toggle.
@@ -1466,6 +1667,13 @@ class Gallery {
             Gallery.detailContentH.Set(contentH);
             app.RequestRedraw();
         }
+        // A --scroll deep link can only be honoured once the page height is
+        // known, since Begin() clamps to the previous frame's content height.
+        if (Gallery.pendingScroll > 0 && contentH > 0) {
+            Gallery.detailView.ScrollTo(Gallery.pendingScroll);
+            Gallery.pendingScroll = 0;
+            app.RequestRedraw();
+        }
 
         if (haveOverlay) {
             Gallery.RenderOverlay(app, c, t, e.name, overlayPX, overlayPY,
@@ -1478,6 +1686,17 @@ class Gallery {
     static int FoldC(int cc) {
         if (cc >= 65 && cc <= 90) { return cc + 32; }
         return cc;
+    }
+
+    /// Decimal digits of `s` as an int (deep-link args only).
+    static int ArgInt(string s) {
+        int v = 0;
+        for (int i = 0; i < s.Length; i = i + 1) {
+            int c = (int)s[i];
+            if (c < 48 || c > 57) { return v; }
+            v = v * 10 + (c - 48);
+        }
+        return v;
     }
 
     static bool MatchAt(string hay, string needle, int off) {
@@ -1519,26 +1738,23 @@ class Gallery {
         int fh = t.fontSizeSmall;
         c.DrawText(cx, yy, title, t.textPrimary, t.fontSizeMedium);
 
-        // Copy button on the title row (right-aligned).
-        int cpW = app.Scale(74);
+        // Copy button on the title row (right-aligned) — a real Button, one
+        // retained instance per table kind so both tables keep their own state.
+        Button cpBtn = Gallery.apiCopyProps;
+        if (!isProps) { cpBtn = Gallery.apiCopyEvents; }
+        cpBtn.Text = Gallery.T("Copy", "复制");
         int cpH = app.Scale(20);
+        cpBtn.MeasureTree(app);
+        int cpW = cpBtn.prefW;
+        int cpMin = app.Scale(62);
+        if (cpW < cpMin) { cpW = cpMin; }
         int cpX = cx + cw - cpW;
         int cpY = yy - app.Scale(2);
+        cpBtn.Arrange(cpX, cpY, cpW, cpH);
+        cpBtn.RenderTree(app);
         bool cpHot = !app.PointerCaptured()
             && app.mouseX >= cpX && app.mouseX < cpX + cpW
             && app.mouseY >= cpY && app.mouseY < cpY + cpH;
-        int cpBg = t.bgTertiary;
-        if (cpHot) { cpBg = t.bgHover; }
-        c.FillRoundRect(cpX, cpY, cpW, cpH, app.Scale(3), cpBg);
-        int cpIconSz = app.Scale(13);
-        string cpLabel = Gallery.T("Copy", "复制");
-        int cpTxtW = Canvas.MeasureText(cpLabel, fh);
-        int cpGap = app.Scale(6);
-        int cpContentX = cpX + (cpW - (cpIconSz + cpGap + cpTxtW)) / 2;
-        c.DrawGlyph("copy", cpContentX, cpY + (cpH - cpIconSz) / 2,
-            cpIconSz, t.textSecondary);
-        c.DrawText(cpContentX + cpIconSz + cpGap,
-            cpY + (cpH - Canvas.FontHeight(fh)) / 2, cpLabel, t.textSecondary, fh);
 
         yy = yy + app.Scale(30);
         int nameX = cx + app.Scale(6);
@@ -1673,25 +1889,20 @@ class Gallery {
             }
         }
 
-        int cpW = app.Scale(74);
+        // Copy is a real Button control (retained on the card), laid out in the
+        // panel header instead of a hand-drawn pill.
         int cpH = app.Scale(20);
+        d.copyBtn.MeasureTree(app);
+        int cpW = d.copyBtn.prefW;
+        int cpMin = app.Scale(62);
+        if (cpW < cpMin) { cpW = cpMin; }
         int cpX = cx + cw - cpW - app.Scale(8);
-        int cpY = cy + app.Scale(4);
+        int cpY = cy + (hdrH - cpH) / 2;
+        d.copyBtn.Arrange(cpX, cpY, cpW, cpH);
+        d.copyBtn.RenderTree(app);
         bool cpHot = !app.PointerCaptured()
             && app.mouseX >= cpX && app.mouseX < cpX + cpW
             && app.mouseY >= cpY && app.mouseY < cpY + cpH;
-        int cpBg = t.primary;
-        if (cpHot) { cpBg = t.primaryHover; }
-        c.FillRoundRect(cpX, cpY, cpW, cpH, app.Scale(3), cpBg);
-        // Icon + label vertically centered as one group in the pill.
-        int cpIconSz = app.Scale(13);
-        int cpTxtW = Canvas.MeasureText("Copy", fs);
-        int cpGap = app.Scale(6);
-        int cpContentX = cpX + (cpW - (cpIconSz + cpGap + cpTxtW)) / 2;
-        c.DrawGlyph("copy", cpContentX, cpY + (cpH - cpIconSz) / 2,
-            cpIconSz, 0xFFFFFFFF);
-        c.DrawText(cpContentX + cpIconSz + cpGap,
-            cpY + (cpH - Canvas.FontHeight(fs)) / 2, "Copy", 0xFFFFFFFF, fs);
         // This code box owns the selection only if its uid+tab match.
         bool selMine = Gallery.selOwner == d.uid && Gallery.selTab == tab;
         if (app.window.EventKind() == 3 && cpHot) {
@@ -2750,7 +2961,7 @@ class Gallery {
             ChartOption gm = ChartOption.Of(Gallery.T("Standard gauge", "标准仪表盘"), null,
                 new List<ChartSeries>{ gs });
             ChartView.Keyed(gm, 8130).Render(app, x + app.Scale(14), y + app.Scale(30),
-                w - app.Scale(28), app.Scale(240));
+                w - app.Scale(28), app.Scale(300));
         } else if (name == "Chart.gaugeHalf") {
             ChartSeries hs = ChartSeries.Gauge(Gallery.T("Temperature", "温度"), 68);
             hs.gauge.min = 0;
@@ -2776,29 +2987,45 @@ class Gallery {
             ChartOption hm = ChartOption.Of(Gallery.T("Half gauge", "个性化半圆仪表"), null,
                 new List<ChartSeries>{ hs });
             ChartView.Keyed(hm, 8132).Render(app, x + app.Scale(14), y + app.Scale(30),
-                w - app.Scale(28), app.Scale(240));
+                w - app.Scale(28), app.Scale(300));
         } else if (name == "Chart.gaugeMulti") {
-            ChartSeries speed = ChartSeries.Gauge(Gallery.T("Speed", "速度"), 128);
+            // 汽车仪表组：小-大-小。中间车速大盘，
+            // 左侧转速小盘，右侧油量 / 水温共用的小盘。
+            int dialValue = Chart.Rgb(64, 158, 255);
+            ChartSeries rpm = ChartSeries.Gauge(Gallery.T("x1000 r/min", "转速 x1000"), 4);
+            rpm.gauge.min = 0; rpm.gauge.max = 8; rpm.gauge.splitNumber = 8;
+            rpm.gauge.center = ChartPosition.Of(ChartScalar.Pct(17), ChartScalar.Pct(45));
+            rpm.gauge.radius = ChartScalar.Pct(54); rpm.gauge.detail.formatter = "{value}";
+            rpm.gauge.title.offsetCenter = ChartPosition.Of(ChartScalar.Px(0), ChartScalar.Pct(0 - 28));
+            rpm.gauge.detail.offsetCenter = ChartPosition.Of(ChartScalar.Px(0), ChartScalar.Pct(82));
+            rpm.gauge.detail.textStyle.color = dialValue;
+            rpm.gauge.detail.textStyle.fontSize = 26;
+            ChartSeries speed = ChartSeries.Gauge(Gallery.T("km/h", "车速 km/h"), 128);
             speed.gauge.min = 0; speed.gauge.max = 220; speed.gauge.splitNumber = 11;
-            speed.gauge.center = ChartPosition.Of(ChartScalar.Pct(50), ChartScalar.Pct(53));
-            speed.gauge.radius = ChartScalar.Pct(58); speed.gauge.detail.formatter = "{value} km/h";
-            ChartSeries rpm = ChartSeries.Gauge(Gallery.T("RPM", "转速"), 4);
-            rpm.gauge.max = 7; rpm.gauge.endAngle = 45; rpm.gauge.splitNumber = 7;
-            rpm.gauge.center = ChartPosition.Of(ChartScalar.Pct(23), ChartScalar.Pct(67));
-            rpm.gauge.radius = ChartScalar.Pct(31); rpm.gauge.detail.formatter = "{value} x1000 r/min";
-            ChartSeries fuel = ChartSeries.Gauge(Gallery.T("Fuel", "油量"), 1);
-            fuel.gauge.max = 2; fuel.gauge.startAngle = 135; fuel.gauge.endAngle = 45;
-            fuel.gauge.splitNumber = 2; fuel.gauge.center = ChartPosition.Of(ChartScalar.Pct(77), ChartScalar.Pct(62));
-            fuel.gauge.radius = ChartScalar.Pct(29); fuel.gauge.title.show = false; fuel.gauge.detail.show = false;
+            speed.gauge.center = ChartPosition.Of(ChartScalar.Pct(50), ChartScalar.Pct(45));
+            speed.gauge.radius = ChartScalar.Pct(94); speed.gauge.detail.formatter = "{value}";
+            speed.gauge.title.offsetCenter = ChartPosition.Of(ChartScalar.Px(0), ChartScalar.Pct(0 - 25));
+            speed.gauge.detail.offsetCenter = ChartPosition.Of(ChartScalar.Px(0), ChartScalar.Pct(80));
+            speed.gauge.detail.textStyle.color = dialValue;
+            speed.gauge.detail.textStyle.fontSize = 34;
+            // 油量 / 水温共用一只小盘：上半段油量、下半段水温，
+            // 只留 Gas / Water 名称，不显示数字刻度。
+            ChartSeries fuel = ChartSeries.Gauge(Gallery.T("Gas", "油量"), 1);
+            fuel.gauge.max = 2; fuel.gauge.startAngle = 180; fuel.gauge.endAngle = 90;
+            fuel.gauge.splitNumber = 2; fuel.gauge.center = ChartPosition.Of(ChartScalar.Pct(83), ChartScalar.Pct(45));
+            fuel.gauge.radius = ChartScalar.Pct(54); fuel.gauge.detail.show = false;
+            fuel.gauge.axisLabel.show = false;
+            fuel.gauge.title.offsetCenter = ChartPosition.Of(ChartScalar.Px(0), ChartScalar.Pct(0 - 30));
             ChartSeries water = ChartSeries.Gauge(Gallery.T("Water", "水温"), 1);
-            water.gauge.max = 2; water.gauge.startAngle = 315; water.gauge.endAngle = 225;
-            water.gauge.splitNumber = 2; water.gauge.center = ChartPosition.Of(ChartScalar.Pct(77), ChartScalar.Pct(62));
-            water.gauge.radius = ChartScalar.Pct(29); water.gauge.axisTick.show = false;
-            water.gauge.title.show = false; water.gauge.detail.show = false;
+            water.gauge.max = 2; water.gauge.startAngle = 90; water.gauge.endAngle = 0;
+            water.gauge.splitNumber = 2; water.gauge.center = ChartPosition.Of(ChartScalar.Pct(83), ChartScalar.Pct(45));
+            water.gauge.radius = ChartScalar.Pct(54); water.gauge.axisTick.show = false;
+            water.gauge.detail.show = false; water.gauge.axisLabel.show = false;
+            water.gauge.title.offsetCenter = ChartPosition.Of(ChartScalar.Px(0), ChartScalar.Pct(45));
             ChartOption mm = ChartOption.Of(Gallery.T("Vehicle cluster", "车辆仪表组"), null,
-                new List<ChartSeries>{ speed, rpm, fuel, water });
+                new List<ChartSeries>{ rpm, speed, fuel, water });
             ChartView.Keyed(mm, 8133).Render(app, x + app.Scale(14), y + app.Scale(30),
-                w - app.Scale(28), app.Scale(240));
+                w - app.Scale(28), app.Scale(360));
         } else if (name == "Chart.dashboard") {
             int gap = app.Scale(12);
             int left = x + app.Scale(14);
@@ -4420,6 +4647,202 @@ class Gallery {
             }
             Gallery.LayoutIn(app, col, px, py - app.Scale(8),
                              w - app.Scale(36), app.Scale(120));
+        } else if (name == "Hmi.tags") {
+            // The tag table itself: one simulated scan drives every column,
+            // and the engineering text / percent / alarm state are all derived
+            // from the same fixed-point raw counts.
+            Gallery.HmiTick(app);
+            int fs = t.fontSizeSmall;
+            int c0 = px;
+            int c1 = px + app.Scale(150);
+            int c2 = px + app.Scale(250);
+            int c3 = px + app.Scale(330);
+            int c4 = px + app.Scale(410);
+            int hy = py - app.Scale(10);
+            c.DrawText(c0, hy, Gallery.T("Tag", "位号"), t.textTertiary, fs);
+            c.DrawText(c1, hy, Gallery.T("Value", "工程值"), t.textTertiary, fs);
+            c.DrawText(c2, hy, Gallery.T("Raw", "原始值"), t.textTertiary, fs);
+            c.DrawText(c3, hy, Gallery.T("Percent", "量程 %"), t.textTertiary, fs);
+            c.DrawText(c4, hy, Gallery.T("State", "状态"), t.textTertiary, fs);
+            int ry = hy + app.Scale(22);
+            c.DrawLine(px, ry - app.Scale(6), px + w - app.Scale(52),
+                ry - app.Scale(6), t.divider, 1);
+            for (int hi = 0; hi < Gallery.hmiIo.Count(); hi = hi + 1) {
+                IoTag tg = Gallery.hmiIo.At(hi);
+                int al = tg.Alarm();
+                int vc = t.textPrimary;
+                string stt = Gallery.T("normal", "正常");
+                if (al == 1) { vc = t.info; stt = Gallery.T("LO alarm", "低报"); }
+                if (al == 2) { vc = t.error; stt = Gallery.T("HI alarm", "高报"); }
+                if (!tg.IsGood()) {
+                    vc = t.textDisabled;
+                    stt = Gallery.T("bad quality", "坏值");
+                }
+                c.DrawText(c0, ry, tg.Name(), t.textSecondary, fs);
+                c.DrawText(c1, ry, tg.TextWithUnit(), vc, fs);
+                c.DrawText(c2, ry, Convert.ToString(tg.Raw()), t.textSecondary, fs);
+                c.DrawText(c3, ry, Convert.ToString(tg.Percent()) + " %",
+                    t.textSecondary, fs);
+                c.DrawText(c4, ry, stt, vc, fs);
+                ry = ry + app.Scale(24);
+            }
+            c.DrawText(px, ry + app.Scale(14),
+                Gallery.T("io.AlarmCount() = ", "io.AlarmCount() = ")
+                    + Convert.ToString(Gallery.hmiIo.AlarmCount())
+                    + Gallery.T("   ·   scan period ", "   ·   采集周期 ")
+                    + Convert.ToString(Gallery.hmiIo.Period()) + " ms",
+                t.textTertiary, fs);
+        } else if (name == "Hmi.digital") {
+            Gallery.HmiTick(app);
+            Panel row = Panel.Row().Gap(app.Scale(12));
+            row.With(Gallery.hmiDigPv);
+            row.With(Gallery.hmiDigSp);
+            row.With(Gallery.hmiDigFlow);
+            row.With(Gallery.hmiDigLevel);
+            Gallery.LayoutIn(app, row, px, py - app.Scale(10),
+                w - app.Scale(36), app.Scale(76));
+            c.DrawText(px, py + app.Scale(84),
+                Gallery.T("Colour is the tag's alarm state; a bad tag reads \"----\".",
+                    "颜色即位号的报警状态；坏值位号显示 \"----\"。"),
+                t.textTertiary, t.fontSizeSmall);
+        } else if (name == "Hmi.led") {
+            Gallery.HmiTick(app);
+            Panel row = Panel.Row().Gap(app.Scale(24));
+            row.With(Gallery.hmiLedOff);
+            row.With(Gallery.hmiLedRun);
+            row.With(Gallery.hmiLedWarn);
+            row.With(Gallery.hmiLedFault);
+            row.With(Gallery.hmiLedComm);
+            Gallery.LayoutIn(app, row, px, py - app.Scale(4),
+                w - app.Scale(36), app.Scale(28));
+            c.DrawText(px, py + app.Scale(40),
+                Gallery.T("States 0 off / 1 green / 2 yellow / 3 red / 4 blue; WARN and FAULT blink.",
+                    "状态 0 灭 / 1 绿 / 2 黄 / 3 红 / 4 蓝；WARN 与 FAULT 闪烁。"),
+                t.textTertiary, t.fontSizeSmall);
+            c.DrawText(px, py + app.Scale(62),
+                Gallery.T("COMM turns red while the simulated scan drops out.",
+                    "模拟采集中断时 COMM 转红。"),
+                t.textTertiary, t.fontSizeSmall);
+        } else if (name == "Hmi.gauge") {
+            Gallery.HmiTick(app);
+            Panel row = Panel.Row().Gap(app.Scale(18));
+            row.With(Gallery.hmiGaugePv);
+            row.With(Gallery.hmiGaugeFlow);
+            row.With(Gallery.hmiGaugeFree);
+            Gallery.LayoutIn(app, row, px, py - app.Scale(14),
+                w - app.Scale(36), app.Scale(205));
+            c.DrawText(px, py + app.Scale(200),
+                Gallery.T("The arc is coloured by the tag's alarm limits; the needle follows the tag's alarm state and quality.",
+                    "弧段按位号报警限着色；指针颜色跟随位号的报警状态与质量。"),
+                t.textTertiary, t.fontSizeSmall);
+        } else if (name == "Hmi.bargraph") {
+            Gallery.HmiTick(app);
+            Panel row = Panel.Row().Gap(app.Scale(28));
+            row.With(Gallery.hmiBarPv);
+            row.With(Gallery.hmiBarFlow);
+            Gallery.LayoutIn(app, row, px, py - app.Scale(14),
+                app.Scale(260), app.Scale(200));
+            Gallery.LayoutIn(app, Gallery.hmiBarLevel,
+                px + app.Scale(300), py - app.Scale(14),
+                w - app.Scale(340), app.Scale(70));
+            c.DrawText(px + app.Scale(300), py + app.Scale(74),
+                Gallery.T("Bargraph.Horizontal() swaps the axis; the thin lines are the LO / HI limits.",
+                    "Bargraph.Horizontal() 切换方向；细线是低报 / 高报限。"),
+                t.textTertiary, t.fontSizeSmall);
+        } else if (name == "Hmi.trend") {
+            // Live rolling trend: HmiTick samples all three pens on a 250 ms
+            // beat into their ring buffers, so the window scrolls without the
+            // preview holding any history of its own.
+            Gallery.HmiTick(app);
+            Gallery.LayoutIn(app, Gallery.hmiTrend, px, py - app.Scale(20),
+                w - app.Scale(36), app.Scale(230));
+            c.DrawText(px, py + app.Scale(218),
+                Gallery.T("Pens keep a fixed-capacity ring buffer, so a shift running for days costs no extra memory.",
+                    "曲线使用定容环形缓冲，因此连续运行数天也不增长内存。"),
+                t.textTertiary, t.fontSizeSmall);
+        } else if (name == "Hmi.alarmBanner") {
+            Gallery.HmiTick(app);
+            Gallery.LayoutIn(app, Gallery.hmiBanner, px, py - app.Scale(16),
+                w - app.Scale(36), t.heightMedium);
+            int abY = py + app.Scale(28);
+            int rw = app.Scale(150);
+            int wid = new Button { Text = Gallery.T("Raise WARN", "产生警告") }
+                .Render(app, px, abY, rw);
+            if (Ui.Clicked(app, wid)) {
+                Gallery.hmiAlarms.Raise("PT104",
+                    Gallery.T("filter differential high", "过滤器压差高"), 1);
+            }
+            int fid = new Button { Text = Gallery.T("Raise FAULT", "产生故障"),
+                Class = "error" }.Render(app, px + rw + app.Scale(10), abY, rw);
+            if (Ui.Clicked(app, fid)) {
+                Gallery.hmiAlarms.Raise("M105",
+                    Gallery.T("motor overload tripped", "电机过载跳闸"), 2);
+            }
+            c.DrawText(px, abY + t.heightMedium + app.Scale(16),
+                Gallery.T("Unacknowledged: ", "未确认：")
+                    + Convert.ToString(Gallery.hmiAlarms.UnackedCount())
+                    + Gallery.T("   ·   buffered: ", "   ·   缓冲：")
+                    + Convert.ToString(Gallery.hmiAlarms.Count()),
+                t.textTertiary, t.fontSizeSmall);
+            c.DrawText(px, abY + t.heightMedium + app.Scale(38),
+                Gallery.T("The banner blinks until acknowledged; its Ack button clears the whole buffer.",
+                    "横幅在确认前持续闪烁；确认按钮一次清掉整个缓冲。"),
+                t.textTertiary, t.fontSizeSmall);
+        } else if (name == "Hmi.alarmList") {
+            Gallery.HmiTick(app);
+            Gallery.LayoutIn(app, Gallery.hmiAlarmList, px, py - app.Scale(20),
+                w - app.Scale(36), app.Scale(200));
+            AlarmItem sel = Gallery.hmiAlarmList.SelectedItem();
+            string selTxt = Gallery.T("No row selected -- click one.",
+                "尚未选中行 —— 点击任意一行。");
+            if (sel != null) {
+                selTxt = Gallery.T("Selected: ", "已选：") + sel.Point()
+                    + "  " + sel.Message();
+            }
+            c.DrawText(px, py + app.Scale(190), selTxt, t.textTertiary,
+                t.fontSizeSmall);
+            c.DrawText(px, py + app.Scale(212),
+                Gallery.T("Same AlarmBuffer as the banner demo, so an ack there shows up here.",
+                    "与横幅示例共用同一个 AlarmBuffer，因此在那里确认这里同步生效。"),
+                t.textTertiary, t.fontSizeSmall);
+        } else if (name == "Hmi.numpad") {
+            Gallery.HmiTick(app);
+            Gallery.LayoutIn(app, Gallery.hmiPad, px, py - app.Scale(20),
+                app.Scale(200), app.Scale(270));
+            int nx = px + app.Scale(224);
+            Gallery.LayoutIn(app, Gallery.hmiDigSp, nx, py - app.Scale(20),
+                app.Scale(160), app.Scale(72));
+            c.DrawText(nx, py + app.Scale(64),
+                Gallery.T("Type a value, then ENT -- the keypad converts it to raw counts (scale 10) and writes TIC101.SV.",
+                    "输入数值后按 ENT —— 键盘按刻度（10）换算成原始计数并写入 TIC101.SV。"),
+                t.textTertiary, t.fontSizeSmall);
+            c.DrawText(nx, py + app.Scale(90),
+                Gallery.T("Entry buffer: ", "输入缓冲：") + "\"" + Gallery.hmiPad.Text()
+                    + "\"", t.textSecondary, t.fontSizeSmall);
+            c.DrawText(nx, py + app.Scale(112),
+                Gallery.T("The trend's SV pen follows every commit.",
+                    "趋势图的 SV 曲线随每次写入变化。"),
+                t.textTertiary, t.fontSizeSmall);
+        } else if (name == "Hmi.equip") {
+            Gallery.HmiTick(app);
+            Gallery.LayoutIn(app, Gallery.hmiWall, px, py - app.Scale(20),
+                w - app.Scale(36), app.Scale(290));
+            c.DrawText(px, py + app.Scale(276),
+                Gallery.T("The panel is the container: it reflows its cards into as many columns as the width allows.",
+                    "面板本身就是容器：按可用宽度把卡片重排成相应的列数。"),
+                t.textTertiary, t.fontSizeSmall);
+        } else if (name == "Hmi.deviceCard") {
+            Gallery.HmiTick(app);
+            Gallery.LayoutIn(app, Gallery.hmiCard, px, py - app.Scale(16),
+                app.Scale(250), app.Scale(132));
+            c.DrawText(px + app.Scale(268), py - app.Scale(10),
+                Gallery.T("The status chip and the left colour bar cycle through the five states.",
+                    "状态标签与左侧色条在五种状态间循环。"),
+                t.textTertiary, t.fontSizeSmall);
+            c.DrawText(px + app.Scale(268), py + app.Scale(12),
+                Gallery.T("Value rows read their tags directly, so no per-card copy exists.",
+                    "数值行直接读位号，因此卡片内没有值的副本。"),
+                t.textTertiary, t.fontSizeSmall);
         } else {
             rendered = false;
         }
@@ -4762,28 +5185,67 @@ class Gallery {
     // Text wrapping helper
     // ------------------------------------------------------------------
 
+    // Scratch byte for Utf8Width: allocated once, never grows.
+    static nint wrapProbe;
+
+    /// UTF-8 byte width of the character `ch` starts, read from its lead byte:
+    /// 1 for ASCII, 2/3/4 for a multi-byte sequence. Strings are byte-indexed,
+    /// so the wrapper needs this to step character by character.
+    static int Utf8Width(string ch) {
+        if (ch.Length == 0) { return 1; }
+        if (Gallery.wrapProbe == 0) { Gallery.wrapProbe = NativeMemory.Alloc(8); }
+        NativeMemory.PutString(Gallery.wrapProbe, 0, ch, ch.Length);
+        int c0 = new Span<byte>(Gallery.wrapProbe, 4)[0];
+        if ((c0 & 0x80) == 0) { return 1; }
+        if ((c0 & 0xE0) == 0xC0) { return 2; }
+        if ((c0 & 0xF0) == 0xE0) { return 3; }
+        return 4;
+    }
+
+    /// Appends `word` to the current line, starting a new line when it no
+    /// longer fits. `sep` inserts the space the word was split on.
+    static string WrapPush(List<string> lines, string cur, string word, bool sep,
+            int width, int fontSize) {
+        if (word == "") { return cur; }
+        string trial = cur;
+        if (trial != "" && sep) { trial = trial + " "; }
+        trial = trial + word;
+        if (Canvas.MeasureText(trial, fontSize) > width && cur != "") {
+            lines.Add(cur);
+            return word;
+        }
+        return trial;
+    }
+
+    /// Wraps `text` to `width` pixels at `fontSize`. Latin text breaks on
+    /// spaces; CJK has none, so every wide character is also a break
+    /// opportunity -- otherwise a Chinese paragraph is one unbreakable word
+    /// and runs off the pane.
     static List<string> WrapText(string text, int width, int fontSize) {
         List<string> lines = new List<string>();
         string cur = "";
         string word = "";
-        for (int i = 0; i <= text.Length; i = i + 1) {
-            string ch = "";
-            if (i < text.Length) { ch = text.Substring(i, 1); }
-            if (i == text.Length || ch == " ") {
-                string trial = cur;
-                if (trial != "") { trial = trial + " "; }
-                trial = trial + word;
-                if (Canvas.MeasureText(trial, fontSize) > width && cur != "") {
-                    lines.Add(cur);
-                    cur = word;
-                } else {
-                    cur = trial;
-                }
+        bool sep = false;
+        int i = 0;
+        while (i < text.Length) {
+            string ch = text.Substring(i, 1);
+            int cl = Gallery.Utf8Width(ch);
+            if (cl > 1) { ch = text.Substring(i, cl); }
+            i = i + cl;
+            if (cl == 1 && ch == " ") {
+                cur = Gallery.WrapPush(lines, cur, word, sep, width, fontSize);
                 word = "";
+                sep = true;
+            } else if (cl > 1) {
+                cur = Gallery.WrapPush(lines, cur, word, sep, width, fontSize);
+                word = "";
+                sep = false;
+                cur = Gallery.WrapPush(lines, cur, ch, false, width, fontSize);
             } else {
                 word = word + ch;
             }
         }
+        cur = Gallery.WrapPush(lines, cur, word, sep, width, fontSize);
         if (cur != "") { lines.Add(cur); }
         if (lines.Count == 0) { lines.Add(""); }
         return lines;
@@ -4814,6 +5276,156 @@ class Gallery {
         Gallery.BuildNavigation(list);
         Gallery.BuildLayout(list);
         Gallery.BuildEvents(list);
+        Gallery.BuildHmi(list);
+    }
+
+    /// HMI / SCADA category: the Gui.Hmi widgets an operator screen is built
+    /// from. Every preview in this category is driven by one shared TagTable
+    /// (see HmiSetup / HmiTick), which is exactly how a real screen works --
+    /// widgets read tags, the scan writes them.
+    static void BuildHmi(List<Comp> list) {
+        Comp tag = new Comp("HMI", "IoTag",
+            Gallery.T("IoTag is one process point: a name, an engineering unit, a fixed-point value (raw counts + scale), a range and LO/HI alarm limits. Values are fixed-point integers -- scale 10 means one decimal -- because field ranges and limits are fixed-point anyway, and integers do not jitter on screen. TagTable owns the points for a screen: the acquisition side (Modbus / OPC / a serial thread) only writes, the display side only reads, and every gauge, readout, bar, trend and alarm binds to the same tag instead of holding a copy.",
+                "IoTag 就是一个过程位号：名称、工程单位、定点数值（原始计数 + 刻度）、量程与低/高报警限。数值用定点整数表示——scale=10 即一位小数——因为现场量程和限值本来就是定点的，且整数显示不抖动。TagTable 持有一幅画面的位号：采集侧（Modbus / OPC / 串口线程）只写，显示侧只读，所有仪表、数显、棒图、趋势和报警都绑定同一个位号而不是各存一份。"), "");
+        tag.AddDemo(Gallery.T("Tag table (live scan)", "位号表（实时采集）"),
+            Gallery.T("A simulated scan writes raw counts into four tags; the engineering text, the range percentage and the alarm state are all derived from those counts, and SetBad() marks a comms dropout without disturbing the last value.",
+                "模拟采集向四个位号写入原始计数；工程值文本、量程百分比与报警状态都由计数派生，SetBad() 标记通信中断而不改动最后的数值。"),
+            "Hmi.tags", 250,
+            "TagTable io = new TagTable();\nio.SetPeriod(500);                       // scan period (ms)\n\nIoTag pv = io.Add(\"TIC101.PV\", \"°C\", 10)  // scale 10 -> one decimal\n              .Range(0, 3000)            // 0.0 .. 300.0 °C\n              .Limits(500, 2500);        // LO / HI alarm limits\nIoTag flow = io.Add(\"FIC102.PV\", \"m3/h\", 10).Range(0, 5000);\n\n// acquisition thread / timer:\nio.Set(\"TIC101.PV\", 1234);               // 123.4 °C\nio.SetBad(\"FIC102.PV\");                  // comms lost: keep value, drop trust\n\n// display side:\nstring txt = pv.TextWithUnit();           // \"123.4 °C\"\nint pct = pv.Percent();                   // 0..100 over the range\nint al = pv.Alarm();                      // 0 none, 1 LO, 2 HI\nint bad = io.AlarmCount();                // points currently in alarm",
+            "");
+        tag.AddProp("name", "string", "-", Gallery.T("Point name, e.g. \"TIC101.PV\".", "位号名，例如 \"TIC101.PV\"。"));
+        tag.AddProp("unit", "string", "\"\"", Gallery.T("Engineering unit shown after the value.", "工程单位，显示在数值之后。"));
+        tag.AddProp("scale", "int", "1", Gallery.T("Counts per engineering unit: 1 integer, 10 one decimal, 100 two.", "每工程单位的计数：1 整数、10 一位小数、100 两位小数。"));
+        tag.AddProp("Range(lo, hi)", "IoTag", "0..100*scale", Gallery.T("Raw range used by gauges, bars and trends.", "原始量程，供仪表、棒图与趋势使用。"));
+        tag.AddProp("Limits(lo, hi)", "IoTag", "0, 0", Gallery.T("LO / HI alarm limits; equal values disable limit checking.", "低 / 高报警限；两者相等表示不判限。"));
+        tag.AddEvent("SetRaw(v) / SetBad()", "void", Gallery.T("Write a scanned value, or flag the point as untrusted.", "写入采集值，或把位号标记为不可信。"));
+        tag.AddEvent("Alarm()", "int", Gallery.T("0 normal, 1 LO, 2 HI (always 0 without limits).", "0 正常、1 低报、2 高报（未设限时恒为 0）。"));
+        tag.AddEvent("TagTable.Ensure(name)", "IoTag", Gallery.T("Find or create on the fly, for data-driven screens.", "查找或即时建立，供数据驱动的画面使用。"));
+        list.Add(tag);
+
+        Comp gauge = new Comp("HMI", "Gauge",
+            Gallery.T("A 270-degree dial gauge with a scale arc, a needle and a digital readout, plus Bargraph -- the vertical/horizontal range bar of the same family. Both take a tag and colour themselves from its alarm limits (LO segment blue, normal green, HI red), so no colour bands need configuring; the needle also follows the tag's alarm state and quality. Trigonometry is fixed-point (SinDeg returns sin*1000), so drawing a needle pulls in no floating-point maths.",
+                "270° 圆盘仪表：刻度弧 + 指针 + 数字读数；同族的 Bargraph 是竖向/横向的量程条。两者都接受位号并按其报警限自动着色（低报段蓝、正常段绿、高报段红），因此不必配置颜色区间；指针还跟随位号的报警状态与质量。三角函数为定点实现（SinDeg 返回 sin*1000），画指针不引入浮点依赖。"), "");
+        gauge.AddDemo(Gallery.T("Dial gauge", "圆盘仪表"),
+            Gallery.T("Two tag-bound gauges (their arcs are split at the alarm limits, and the needle greys out when the point goes bad) and one plain gauge over a SignalInt with no tag at all.",
+                "两个绑定位号的仪表（弧段按报警限分色，位号坏值时指针转灰），以及一个不绑位号、直接读 SignalInt 的仪表。"),
+            "Hmi.gauge", 280,
+            "// bound to a tag: unit, scale and range come from the point\nGauge g = new Gauge(\"TIC101.PV\", pv).Limits(500, 2500);\n\n// or standalone over a signal, with an explicit range\nSignalInt load = new SignalInt(62);\nGauge free = new Gauge(\"Load %\", load, 0, 100);\n\n// retained control: measured and arranged by its container\nPanel row = Panel.Row().Gap(18);\nrow.With(g).With(free);\nform.Add(row);",
+            "");
+        gauge.AddDemo(Gallery.T("Bargraph", "棒图 / 量程条"),
+            Gallery.T("The same data as a filled bar with limit marks: vertical by default, horizontal via Orient(Bargraph.Horizontal()). The bar turns blue on LO and red on HI.",
+                "同样的数据以带限值标线的填充条呈现：默认竖向，用 Orient(Bargraph.Horizontal()) 转为横向。低报转蓝、高报转红。"),
+            "Hmi.bargraph", 275,
+            "Bargraph b = new Bargraph(\"TIC101\", pv);\nb.Limits(500, 2500);\n\nBargraph wide = new Bargraph(\"LI103\", level);\nwide.Limits(10, 90);\nwide.Orient(Bargraph.Horizontal());",
+            "");
+        gauge.AddProp("caption", "string", "-", Gallery.T("Label drawn under the dial / above the bar.", "画在表盘下方 / 条体上方的标题。"));
+        gauge.AddProp("tag", "IoTag", "null", Gallery.T("Bound point; supplies value, scale, unit and range.", "绑定的位号；提供数值、刻度、单位与量程。"));
+        gauge.AddProp("Range(lo, hi)", "Gauge", Gallery.T("tag range", "位号量程"), Gallery.T("Raw scale span of the arc / bar.", "弧段 / 条体的原始量程。"));
+        gauge.AddProp("Limits(lo, hi)", "Gauge", "0, 0", Gallery.T("Where the arc changes colour; equal values mean one normal band.", "弧段变色的位置；两者相等表示整弧为正常色。"));
+        gauge.AddProp("Orient(o)", "Bargraph", "Vertical()", Gallery.T("Bargraph only: Vertical() or Horizontal().", "仅棒图：Vertical() 或 Horizontal()。"));
+        gauge.AddEvent("Value()", "SignalInt", Gallery.T("The raw-count signal being displayed.", "正在显示的原始计数信号。"));
+        gauge.AddEvent("Bind(tag)", "void", Gallery.T("Re-point the widget at another tag at runtime.", "运行期把控件改绑到另一个位号。"));
+        list.Add(gauge);
+
+        Comp ind = new Comp("HMI", "Indicator",
+            Gallery.T("The two indicators every operator screen is covered in: Led, a glowing dot with a caption whose state is an int (0 off, 1 green, 2 yellow, 3 red, 4 blue) so it can bind straight to a tag and blink on alarm from App's animation clock; and Digital, the large numeric readout that switches to the alarm colour past a limit and prints \"----\" for a bad point.",
+                "上位机画面上最常见的两个指示件：Led 是带标题的发光圆点，状态用整数（0 灭、1 绿、2 黄、3 红、4 蓝），因此可直接绑定位号，并借 App 的动画时钟在报警时闪烁；Digital 是大字号数显，超限转报警色，坏值时显示 \"----\"。"), "");
+        ind.AddDemo(Gallery.T("Led (status lamp)", "Led 指示灯"),
+            Gallery.T("Five lamps, one per state. WARN and FAULT opt into blinking with SetBlink(true) -- App's clock drives it, so the host needs no timer -- and COMM flips to red while the simulated scan drops out.",
+                "五个状态各一盏灯。WARN 与 FAULT 用 SetBlink(true) 开启闪烁——由 App 的时钟驱动，宿主无需定时器——模拟采集中断时 COMM 转红。"),
+            "Hmi.led", 170,
+            "Led run = new Led(\"RUN\");\nrun.Set(1);                       // 0 off 1 green 2 yellow 3 red 4 blue\n\nLed fault = new Led(\"FAULT\");\nfault.Set(3);\nfault.SetBlink(true);             // blinks while in alarm (2 / 3)\n\n// or bind the state straight to a point:\nLed comm = new Led(\"COMM\", commTag.Value());",
+            "");
+        ind.AddDemo(Gallery.T("Digital readout", "数显表"),
+            Gallery.T("Four readouts bound to tags. Colour is the tag's alarm state (blue LO, red HI); the flow point periodically goes bad and prints \"----\" while keeping its last value.",
+                "四个绑定位号的数显。颜色即位号的报警状态（蓝低报、红高报）；流量位号会周期性坏值并显示 \"----\"，同时保留最后的数值。"),
+            "Hmi.digital", 200,
+            "Digital pv = new Digital(\"TIC101.PV\", pvTag);\n\n// unbound form: own signal + scale + unit\nDigital d = new Digital(\"Batch\", new SignalInt(1250), 10, \"kg\");\n\nPanel row = Panel.Row().Gap(12);\nrow.With(pv).With(d);\nform.Add(row);",
+            "");
+        ind.AddProp("caption", "string", "-", Gallery.T("Lamp / readout label.", "指示灯 / 数显的标题。"));
+        ind.AddProp("state", "SignalInt", "0", Gallery.T("Led state: 0 off, 1 green, 2 yellow, 3 red, 4 blue.", "Led 状态：0 灭、1 绿、2 黄、3 红、4 蓝。"));
+        ind.AddProp("blink", "bool", "false", Gallery.T("Led: blink while the state is 2 or 3.", "Led：状态为 2 或 3 时闪烁。"));
+        ind.AddProp("tag", "IoTag", "null", Gallery.T("Digital: bound point (value, scale, unit, alarm, quality).", "Digital：绑定的位号（数值、刻度、单位、报警、质量）。"));
+        ind.AddEvent("Led.Set(st)", "void", Gallery.T("Write the lamp state (or drive its signal from a tag).", "写入指示灯状态（也可由位号驱动其信号）。"));
+        ind.AddEvent("Digital.Bind(tag)", "void", Gallery.T("Re-point the readout at another tag.", "把数显改绑到另一个位号。"));
+        list.Add(ind);
+
+        Comp trend = new Comp("HMI", "Trend",
+            Gallery.T("A rolling real-time trend: several pens share one time axis and range, new samples enter from the right and old ones shift left. Each TrendPen keeps a fixed-capacity ring buffer, so a screen left running for days does not grow its memory -- the oldest sample is simply overwritten. Sampling is explicit (tr.Sample() from the screen's periodic timer), so all pens stay aligned on the same time base.",
+                "实时滚动趋势：多笔曲线共享时间轴与量程，新点从右侧进入、旧点左移。每个 TrendPen 使用定容环形缓冲，因此画面连续运行数天也不增长内存——最旧的点直接被覆盖。采样是显式的（在画面周期定时器里调用 tr.Sample()），因此所有曲线严格对齐同一时基。"), "");
+        trend.AddDemo(Gallery.T("Rolling trend (live)", "实时趋势（滚动）"),
+            Gallery.T("Three pens over a shared 0..500.0 range, sampled on a 250 ms beat by the demo's scan. The grid labels are the fixed-point range formatted through the pens' scale, and the legend is drawn from the pen titles and colours.",
+                "三笔曲线共享 0..500.0 量程，由示例的采集以 250 ms 节拍统一采样。网格标签是按曲线刻度格式化的定点量程，图例取自曲线标题与颜色。"),
+            "Hmi.trend", 300,
+            "Trend tr = new Trend(\"TIC101 / FIC102\", 0, 5000, 10, 120);\ntr.Add(\"TIC101.PV\", pv, theme.success);\ntr.Add(\"TIC101.SV\", sv, theme.info);\ntr.Add(\"FIC102.PV\", flow, theme.warning);\n\n// periodic timer (all pens sample the same instant):\ntr.Sample();\n\n// retained control: hand it a rect through its container\nform.Add(tr);",
+            "");
+        trend.AddProp("caption", "string", "-", Gallery.T("Chart title drawn top-left.", "画在左上角的标题。"));
+        trend.AddProp("Range(lo, hi)", "Trend", Gallery.T("first pen's tag range", "首笔曲线的位号量程"), Gallery.T("Shared raw range of the value axis.", "数值轴共享的原始量程。"));
+        trend.AddProp("window", "int", "120", Gallery.T("Samples per pen = width of the time window.", "每笔曲线的采样点数 = 时间窗宽度。"));
+        trend.AddProp("SetGrid(on)", "void", "true", Gallery.T("Show the grid and its value labels.", "显示网格与数值标签。"));
+        trend.AddEvent("Add(title, tag, color)", "TrendPen", Gallery.T("Adds a pen; the first one adopts the tag's range and scale.", "加一笔曲线；第一笔会跟随位号的量程与刻度。"));
+        trend.AddEvent("Sample()", "void", Gallery.T("Pushes one point per pen into its ring buffer.", "为每笔曲线向环形缓冲推入一个点。"));
+        list.Add(trend);
+
+        Comp alarm = new Comp("HMI", "Alarm",
+            Gallery.T("The alarm subsystem: AlarmBuffer holds the records (timestamp, point, message, priority, acknowledged, still-active) and can derive them itself with Scan(tagTable) -- a point past its limit raises one record, back inside clears it, so no alarm logic is hand-written per point. AlarmBanner shows the newest unacknowledged record and blinks until acked; AlarmList is the five-column log. Both take the same buffer, so acknowledging in one is visible in the other.",
+                "报警子系统：AlarmBuffer 保存记录（时间、位号、描述、优先级、确认与是否仍成立），并可用 Scan(tagTable) 自行派生——位号越限产生一条、回到限内则复归，因此不必为每个位号手写报警逻辑。AlarmBanner 显示最新未确认记录并在确认前闪烁；AlarmList 是五列报警日志。两者接受同一个缓冲区，因此在一处确认另一处同步生效。"), "");
+        alarm.AddDemo(Gallery.T("Alarm banner", "报警横幅"),
+            Gallery.T("The banner blinks at 400 ms for faults and 800 ms otherwise; its Ack button acknowledges the whole buffer and raises the Ack event. The two buttons raise records by hand, on top of the ones Scan() derives from the tag limits.",
+                "横幅按故障级 400 ms、其它 800 ms 闪烁；确认按钮确认整个缓冲并触发 Ack 事件。两个按钮手工产生报警，与 Scan() 按位号限值派生的报警共存。"),
+            "Hmi.alarmBanner", 220,
+            "AlarmBuffer al = new AlarmBuffer();\nAlarmBanner banner = new AlarmBanner(al);\nbanner.Ack += () => { Console.WriteLine(\"acknowledged\"); };\n\n// by hand:\nal.Raise(\"M105\", \"motor overload tripped\", 2);   // 0 info 1 warn 2 fault\n\n// or derived from the tag limits, once per scan:\nal.Scan(io);\nal.Purge();                       // drop acked + cleared records\nint pending = al.UnackedCount();",
+            "");
+        alarm.AddDemo(Gallery.T("Alarm list", "报警列表"),
+            Gallery.T("Time / level / point / message / state, newest first, unacknowledged rows tinted with the priority colour. Clicking a row selects it and raises RowClick. It shares this page's buffer with the banner demo above.",
+                "时间 / 级别 / 位号 / 描述 / 状态，最新在最上，未确认行以优先级色底显示。点击行即选中并触发 RowClick。它与上方横幅示例共用同一个缓冲区。"),
+            "Hmi.alarmList", 300,
+            "AlarmList log = new AlarmList(al);        // same buffer as the banner\nlog.RowClick += () => {\n    AlarmItem a = log.SelectedItem();\n    if (a != null) { Console.WriteLine(a.Point() + \" \" + a.Message()); }\n};\nform.Add(log);",
+            "");
+        alarm.AddProp("buffer", "AlarmBuffer", Gallery.T("own buffer", "自带缓冲区"), Gallery.T("Shared record store; swap it with Bind(buf).", "共享的记录存储；用 Bind(buf) 换绑。"));
+        alarm.AddProp("priority", "int", "0", Gallery.T("0 INFO, 1 WARN, 2 FAULT -- decides colour and blink rate.", "0 提示、1 警告、2 故障——决定颜色与闪烁频率。"));
+        alarm.AddEvent("Ack", "() => void", Gallery.T("AlarmBanner: the operator acknowledged the buffer.", "AlarmBanner：操作员确认了缓冲区。"));
+        alarm.AddEvent("RowClick", "() => void", Gallery.T("AlarmList: the selected row changed (see SelectedItem()).", "AlarmList：选中行变化（见 SelectedItem()）。"));
+        alarm.AddEvent("Scan(io)", "void", Gallery.T("Raise / clear records from the tag table's limits.", "按位号表的限值产生 / 复归报警记录。"));
+        list.Add(alarm);
+
+        Comp pad = new Comp("HMI", "NumPad",
+            Gallery.T("An on-screen numeric keypad: industrial panels are touch screens with no physical keyboard, so setpoints are changed with this. It owns its entry buffer, and on ENT converts the typed text into raw counts through the target tag's scale before writing it -- \"12.34\" with scale 100 becomes 1234, extra decimals truncated and missing ones zero-filled. Enter / Cancel are events, so a host that wants to validate the value first can take over.",
+                "屏幕数字键盘：工控机多为触摸屏、无实体键盘，改设定值靠它。键盘自己维护输入缓冲，按 ENT 时按目标位号的刻度把文本换算成原始计数再写入——\"12.34\" 配 scale=100 得 1234，多余小数截断、缺位补零。Enter / Cancel 是事件，宿主可接管以先做校验。"), "");
+        pad.AddDemo(Gallery.T("Keypad writing a setpoint", "键盘写设定值"),
+            Gallery.T("Type a value and press ENT: the keypad writes TIC101.SV, and the readout beside it (plus the SV pen on the Trend page) follows immediately, because both read the same tag.",
+                "输入数值后按 ENT：键盘写入 TIC101.SV，旁边的数显（以及 Trend 页的 SV 曲线）立即跟随，因为两者读的是同一个位号。"),
+            "Hmi.numpad", 330,
+            "NumPad kp = new NumPad();\nkp.Target(sv);                    // ENT writes this point (preloads its value)\nkp.Enter += () => { Console.WriteLine(\"setpoint = \" + sv.Text()); };\nkp.Cancel += () => { kp.Clear(); };\n\nstring buf = kp.Text();           // current entry buffer\nint raw = NumPad.Parse(\"12.34\", 100);   // -> 1234",
+            "");
+        pad.AddProp("value", "SignalString", "\"\"", Gallery.T("Entry buffer (Text() / SetText() / Clear()).", "输入缓冲（Text() / SetText() / Clear()）。"));
+        pad.AddProp("Target(tag)", "NumPad", "null", Gallery.T("Point written on ENT; its current value is preloaded.", "按 ENT 时写入的位号；其当前值会被预置。"));
+        pad.AddProp("sign / dot", "bool", "true", Gallery.T("Allow the +/- and decimal-point keys.", "允许 +/- 与小数点键。"));
+        pad.AddEvent("Enter", "() => void", Gallery.T("ENT pressed (after the value is committed).", "按下 ENT（在写入之后）。"));
+        pad.AddEvent("Cancel", "() => void", Gallery.T("The keypad was dismissed.", "键盘被取消。"));
+        list.Add(pad);
+
+        Comp equip = new Comp("HMI", "EquipPanel",
+            Gallery.T("The equipment wall: a container that reflows DeviceCard children into a card grid whose column count follows the available width, so widening the window just fits more cards per row instead of forcing a redesign. Each DeviceCard is a device name, a status chip and colour bar (0 stopped, 1 running, 2 alarm, 3 fault, 4 offline -- the same coding as Led) plus value rows that read their tags directly. Device names serialise as layout; the value rows stay code, because I/O is not layout.",
+                "设备卡片墙：容器把 DeviceCard 子控件排成卡片网格，列数随可用宽度自适应，因此窗口拉宽只是每行多放几张卡，不必重新设计画面。每张 DeviceCard 是设备名 + 状态标签与色条（0 停机、1 运行、2 报警、3 故障、4 离线，与 Led 编码一致）加若干直接读位号的数值行。设备名可序列化为布局；数值行留在代码里——I/O 是代码，不是布局。"), "");
+        equip.AddDemo(Gallery.T("Equipment wall", "设备卡片墙"),
+            Gallery.T("Four devices in an auto-reflowing grid; one of them cycles through the five states so the chip and the left colour bar can be compared side by side. Narrow the window to watch the columns collapse.",
+                "四台设备排在自适应网格里；其中一台在五种状态间循环，便于对照状态标签与左侧色条。把窗口收窄可看到列数自动减少。"),
+            "Hmi.equip", 340,
+            "EquipPanel wall = new EquipPanel();\nDeviceCard p1 = wall.AddDevice(\"1# feed pump\");\np1.Row(\"flow\", flow);\np1.Row(\"level\", level);\nwall.AddDevice(\"2# feed pump\").Row(\"flow\", flow);\n\nwall.Set(\"2# feed pump\", 3);      // 0 stop 1 run 2 alarm 3 fault 4 offline\nwall.CardSize(240, 132);          // minimum card size (drives the columns)\nform.Add(wall);\n\n// or rebuild the device list from serialised text:\nwall.SetItemsText(\"1# feed pump|2# feed pump|fan\");",
+            "");
+        equip.AddDemo(Gallery.T("DeviceCard", "设备状态卡"),
+            Gallery.T("One card on its own, cycling through the five states. Its value rows read the tags straight, so a card holds no copy of the data and cannot go stale.",
+                "单独一张卡片，在五种状态间循环。数值行直接读位号，因此卡片内没有数据副本，也不会显示过期值。"),
+            "Hmi.deviceCard", 200,
+            "DeviceCard card = new DeviceCard(\"1# compressor\");\ncard.Row(\"discharge temp\", pv);\ncard.Row(\"discharge flow\", flow);\ncard.Set(1);                      // running\ncard.Click += () => { OpenDeviceDetail(\"1# compressor\"); };",
+            "");
+        equip.AddProp("cardW / cardH", "int", "240 / 132", Gallery.T("Minimum card size in logical px; the column count follows it.", "卡片最小尺寸（逻辑 px）；列数据此推算。"));
+        equip.AddProp("state", "SignalInt", "0", Gallery.T("DeviceCard state: 0 stopped, 1 running, 2 alarm, 3 fault, 4 offline.", "DeviceCard 状态：0 停机、1 运行、2 报警、3 故障、4 离线。"));
+        equip.AddEvent("AddDevice(name)", "DeviceCard", Gallery.T("Appends a device and returns its card (not Add: that adds children).", "追加一台设备并返回其卡片（不叫 Add：那是添加子控件）。"));
+        equip.AddEvent("Set(name, state)", "void", Gallery.T("Writes a device state by name; unknown names are a no-op.", "按名写设备状态；名称未知时为空操作。"));
+        equip.AddEvent("Click", "() => void", Gallery.T("DeviceCard was clicked (open a device detail page).", "卡片被点击（一般用于打开设备详情）。"));
+        list.Add(equip);
     }
 
     static void BuildEvents(List<Comp> list) {
@@ -5241,14 +5853,14 @@ class Gallery {
                 "占比类图表很紧凑，因此每行放两个而不是把单个拉满整宽。ChartSeries.Pie()/Donut() 把每个单值系列渲染为一个扇区；首次渲染时扇区扫入生长，环图在中心打印总计。两个图表使用不同数据集，读起来是两个示例而非重复。"), "Chart.pie", 300,
             "ChartOption pie = ChartOption.Of(\"Language share\", null,\n    new List<ChartSeries>{\n        ChartSeries.Pie(\"Zan\", new List<int>{ 38 }),\n        ChartSeries.Pie(\"C\", new List<int>{ 22 }),\n        ChartSeries.Pie(\"Rust\", new List<int>{ 16 }),\n        ChartSeries.Pie(\"Go\", new List<int>{ 9 })\n    });\nChartView.Of(pie).Render(app, 40, 40, 236, 200);\nChartOption don = ChartOption.Of(\"Browser share\", null,\n    new List<ChartSeries>{\n        ChartSeries.Donut(\"Chrome\", new List<int>{ 63 }),\n        ChartSeries.Donut(\"Safari\", new List<int>{ 19 }),\n        ChartSeries.Donut(\"Edge\", new List<int>{ 11 }),\n        ChartSeries.Donut(\"Firefox\", new List<int>{ 7 })\n    });\nChartView.Of(don).Render(app, 288, 40, 236, 200);", "{\n  \"type\": \"Chart\",\n  \"name\": \"chart\",\n  \"chartType\": \"pie\",\n  \"title\": \"Language share\",\n  \"labels\": [\n    \"Zan\",\n    \"C\",\n    \"Rust\",\n    \"Go\"\n  ],\n  \"series\": [\n    {\n      \"name\": \"Share\",\n      \"values\": [\n        38,\n        22,\n        16,\n        9\n      ]\n    }\n  ]\n}");
         ch.AddDemo("Standard Gauge", Gallery.T("A Gauge series owns its range, arc, layout, ticks, labels, pointer and detail text. Four colour stops divide the axis band, and the pointer animates into place.",
-                "每个 Gauge 系列独立拥有量程、角度、布局、刻度、标签、指针和详情文本。四段颜色停止点划分轴环，指针随入场动画就位。"), "Chart.gauge", 300,
+                "每个 Gauge 系列独立拥有量程、角度、布局、刻度、标签、指针和详情文本。四段颜色停止点划分轴环，指针随入场动画就位。"), "Chart.gauge", 360,
             "ChartSeries s = ChartSeries.Gauge(\"CPU load\", 72);\ns.gauge.detail.formatter = \"{value}%\";\nChartOption o = ChartOption.Of(\"Standard gauge\", null,\n    new List<ChartSeries>{ s });\nChartView.Of(o).Render(app, 40, 40, 480, 220);", "");
         ch.AddDemo("Half Gauge", Gallery.T("Gauge geometry uses ECharts startAngle/endAngle and typed px/% values. Nested axisLine, pointer, title and detail entities own their styles.",
-                "仪表盘几何使用 ECharts 的 startAngle/endAngle 与强类型 px/% 值；axisLine、pointer、title、detail 子实体分别拥有自己的样式。"), "Chart.gaugeHalf", 300,
+                "仪表盘几何使用 ECharts 的 startAngle/endAngle 与强类型 px/% 值；axisLine、pointer、title、detail 子实体分别拥有自己的样式。"), "Chart.gaugeHalf", 360,
             "ChartSeries s = ChartSeries.Gauge(\"Temperature\", 68);\ns.gauge.min = 0; s.gauge.max = 120;\ns.gauge.startAngle = 180; s.gauge.endAngle = 0;\ns.gauge.center = ChartPosition.Of(ChartScalar.Pct(50), ChartScalar.Pct(88));\ns.gauge.radius = ChartScalar.Pct(90);\ns.gauge.detail.formatter = \"{value} °C\";", "");
-        ch.AddDemo("Multi Gauge", Gallery.T("Several Gauge series share the same 240 px content frame as the other gauge demos. Their percentage-based centers and radii form a balanced cluster without changing the card size.",
-                "多个 Gauge 系列与其他仪表盘示例共用同一个 240 px 内容画布；基于百分比的中心点和半径组成均衡仪表组，不再改变卡片尺寸。"), "Chart.gaugeMulti", 300,
-            "ChartSeries speed = ChartSeries.Gauge(\"Speed\", 128);\nspeed.gauge.max = 220; speed.gauge.radius = ChartScalar.Pct(58);\nspeed.gauge.center = ChartPosition.Of(ChartScalar.Pct(50), ChartScalar.Pct(53));\nChartSeries rpm = ChartSeries.Gauge(\"RPM\", 4);\nrpm.gauge.max = 7; rpm.gauge.radius = ChartScalar.Pct(31);\nrpm.gauge.center = ChartPosition.Of(ChartScalar.Pct(23), ChartScalar.Pct(67));\nChartOption o = ChartOption.Of(\"Vehicle cluster\", null,\n    new List<ChartSeries>{ speed, rpm });\nChartView.Of(o).Render(app, 40, 40, 480, 240);", "");
+        ch.AddDemo("Multi Gauge", Gallery.T("Several Gauge series share one content frame, laid out like a vehicle cluster: a small tachometer, the large speedometer and a small fuel/temperature dial. Percentage centers and radii place them; the frame widens automatically for multi-gauge options.",
+                "多个 Gauge 系列共用一块画布，按汽车仪表组的小-大-小布局：小转速表、大车速表、小的油量/水温表。位置与半径用百分比给定，多表时画布自动变宽。"), "Chart.gaugeMulti", 420,
+            "// small - large - small vehicle cluster\nChartSeries rpm = ChartSeries.Gauge(\"x1000 r/min\", 4);\nrpm.gauge.max = 8; rpm.gauge.radius = ChartScalar.Pct(54);\nrpm.gauge.center = ChartPosition.Of(ChartScalar.Pct(17), ChartScalar.Pct(52));\nChartSeries speed = ChartSeries.Gauge(\"km/h\", 128);\nspeed.gauge.max = 220; speed.gauge.radius = ChartScalar.Pct(94);\nspeed.gauge.center = ChartPosition.Of(ChartScalar.Pct(50), ChartScalar.Pct(52));\nChartSeries fuel = ChartSeries.Gauge(\"Fuel\", 1);\nfuel.gauge.max = 2; fuel.gauge.startAngle = 180; fuel.gauge.endAngle = 90;\nfuel.gauge.radius = ChartScalar.Pct(54);\nfuel.gauge.center = ChartPosition.Of(ChartScalar.Pct(83), ChartScalar.Pct(55));\nChartOption o = ChartOption.Of(\"Vehicle cluster\", null,\n    new List<ChartSeries>{ rpm, speed, fuel });\nChartView.Of(o).Render(app, 40, 40, 560, 240);", "");
         ch.AddDemo("Operations Dashboard", Gallery.T("A responsive dashboard composes four equally sized views chosen for the question: donut for revenue mix, radar for service balance, funnel for conversion and heatmap for time/channel intensity. It uses a 2x2 grid on wide cards and one column on narrow cards.",
                 "响应式仪表盘按问题选择四种等尺寸视图：环形图看营收构成、雷达图看服务均衡、漏斗图看转化、热力图看时段与渠道强度。宽卡片使用 2×2 网格，窄卡片自动切换为单列。"), "Chart.dashboard", 446,
             "ChartOption mix = ChartOption.Of(\"Revenue mix\", null,\n    new List<ChartSeries>{\n        ChartSeries.Donut(\"Subscription\", new List<int>{ 46 }),\n        ChartSeries.Donut(\"Usage\", new List<int>{ 29 }),\n        ChartSeries.Donut(\"Services\", new List<int>{ 17 })\n    });\nList<string> metrics = new List<string>{ \"Latency\", \"Uptime\", \"Capacity\", \"Errors\", \"Security\" };\nChartOption health = ChartOption.Of(\"Service health\", metrics,\n    new List<ChartSeries>{\n        ChartSeries.Polar(\"Current\", new List<int>{ 82, 96, 74, 88, 91 }),\n        ChartSeries.Polar(\"Target\", new List<int>{ 92, 99, 88, 95, 96 })\n    });\nChartOption journey = ChartOption.Of(\"Customer journey\", null,\n    new List<ChartSeries>{\n        ChartSeries.Funnel(\"Visits\", new List<int>{ 100 }),\n        ChartSeries.Funnel(\"Trials\", new List<int>{ 63 }),\n        ChartSeries.Funnel(\"Paid\", new List<int>{ 24 })\n    });\nList<string> hours = new List<string>{ \"00\", \"04\", \"08\", \"12\", \"16\", \"20\" };\nChartOption traffic = ChartOption.Of(\"Traffic intensity\", hours,\n    new List<ChartSeries>{\n        ChartSeries.Of(\"API\", ChartType.Heatmap, new List<int>{ 8, 5, 46, 82, 71, 28 }),\n        ChartSeries.Of(\"Web\", ChartType.Heatmap, new List<int>{ 3, 2, 38, 68, 89, 44 })\n    });", "");

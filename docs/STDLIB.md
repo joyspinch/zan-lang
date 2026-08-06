@@ -389,6 +389,53 @@ whatever parsed so far) for authored/tool-emitted documents. The typed
 accessors (`Str`/`Int`/`Bool`/`Double`, `As*`) still return the caller's
 explicit default when a key is absent or of the wrong kind.
 
+**Streaming forwarder (System.Net.Http.Proxy).** `HttpClient` returns a fully
+parsed `HttpResponse`, so a forwarder built on it buffers the whole upstream
+response: the downstream client sees nothing until the upstream is done, which
+makes streaming chat (SSE / chunked token streams) look frozen and leaves
+CONNECT / Upgrade unusable. `HttpForwarder` is the streaming path — it moves
+bytes with socket primitives only, never materialising a response:
+
+```csharp
+namespace System.Net.Http.Proxy;
+
+class HttpForwarder {
+    HttpForwarder(string listenHost, int listenPort, string upstream);
+    // upstream: "https://host[:port]" | "http://host[:port]" | "host:port"
+
+    HttpForwarder SetTimeout(int ms);          // idle timeout, default 5 min
+    HttpForwarder SetChunkBytes(int bytes);    // relay block size
+    HttpForwarder SetMaxHeadBytes(int bytes);  // head-block cap
+    HttpForwarder SetMaxConnections(int max);
+    HttpForwarder DisableTlsVerify();          // self-signed upstream
+    HttpForwarder DenyConnect();               // refuse CONNECT tunnels
+
+    async void Start();                        // accept loop; one coroutine per conn
+    void Stop();
+}
+```
+
+- Response heads are relayed the moment they arrive, then every body block is
+  written downstream as it is read: chunked frames pass through untouched
+  (`Transfer-Encoding` is preserved), a `Content-Length` body is relayed
+  exactly, and a body with neither is relayed until the upstream closes —
+  which is what SSE / `text/event-stream` responses need.
+- Request bodies stream the same way, so large uploads are not buffered
+  either.
+- `CONNECT` and a `101 Switching Protocols` response become raw bidirectional
+  byte tunnels (TLS through CONNECT is passed through, not decrypted); either
+  direction ending closes both, so no half-open tunnel is left parked.
+- Hop-by-hop headers (RFC 7230 6.1) are stripped, `Host` is rewritten to the
+  upstream authority and `X-Forwarded-For` is appended. Upstream connections
+  are per-request (`Connection: close`): streaming wins on first-byte latency,
+  not on connection reuse.
+- https upstreams go through `TlsStream`, so the forwarder itself needs no
+  extra TLS plumbing.
+
+See `examples/net/http_forwarder.zan` (token-by-token stream through the
+forwarder) and the `http_forwarder_stream` / `http_forwarder_tunnel`
+conformance cases.
+
 ---
 
 ### 3.6 System.Linq.Enumerable

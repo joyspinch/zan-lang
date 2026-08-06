@@ -319,6 +319,63 @@ partial class CodeEditor {
     int synNum;
     int synText;
 
+    // ---- 语法语言 ----
+    // 0 = Zan、1 = Lua、2 = Python。决定关键字表、注释引导符
+    // （// / -- / #）和块注释形式，使内嵌的 .lua/.py 脚本不会
+    // 按 Zan 高亮，Ctrl+/ 也插入该语言的注释符。
+    int syntaxLang;
+
+    /// 设置本缓冲区的语法语言（0=Zan、1=Lua、2=Python）。语言
+    /// 变化时丢弃按行高亮缓存，使已绘制的行按新语言重新分词。
+    void SetSyntaxLang(int lang) {
+        int v = lang;
+        if (v < 0 || v > 2) { v = 0; }
+        if (v == syntaxLang) { return; }
+        syntaxLang = v;
+        hlCache = new List<CeHlLine>();
+    }
+
+    /// 当前语法语言（0=Zan、1=Lua、2=Python）。
+    int SyntaxLang() {
+        return syntaxLang;
+    }
+
+    /// 按文件名推断语法语言：.lua 为 Lua、.py/.pyw 为 Python，
+    /// 其余（含无扩展名）按 Zan 处理。
+    static int LangForName(string path) {
+        int n = path.Length;
+        int dot = -1;
+        for (int i = n - 1; i >= 0; i = i - 1) {
+            int b = path[i];
+            if (b == 46) { dot = i; break; }
+            if (b == 47 || b == 92) { break; }
+        }
+        if (dot < 0) { return 0; }
+        string ext = CodeEditor.LowerAscii(path.Substring(dot, n - dot));
+        if (ext == ".lua") { return 1; }
+        if (ext == ".py" || ext == ".pyw") { return 2; }
+        return 0;
+    }
+
+    /// ASCII 小写化（扩展名比较用，不触碰多字节字节）。
+    static string LowerAscii(string s) {
+        string lo = "abcdefghijklmnopqrstuvwxyz";
+        string outs = "";
+        for (int i = 0; i < s.Length; i = i + 1) {
+            int b = s[i];
+            if (b >= 65 && b <= 90) { outs = outs + lo.Substring(b - 65, 1); }
+            else { outs = outs + s.Substring(i, 1); }
+        }
+        return outs;
+    }
+
+    /// 本语言的行注释引导符（Ctrl+/ 插入的就是它）。
+    string LineComment() {
+        if (syntaxLang == 1) { return "--"; }
+        if (syntaxLang == 2) { return "#"; }
+        return "//";
+    }
+
     /// 设置编辑器的代码字号和语法高亮颜色。任一参数为 0
     /// 则该方面保持内置默认值。
     void ApplyTheme(int fontPx, int kw, int ty, int str, int com, int num, int text) {
@@ -333,6 +390,7 @@ partial class CodeEditor {
     }
 
     CodeEditor() {
+        this.syntaxLang = 0;
         this.edFont = 0;
         this.synKw = 0; this.synTy = 0; this.synStr = 0; this.synCom = 0; this.synNum = 0; this.synText = 0;
         this.lines = new List<string>();
@@ -1198,8 +1256,8 @@ partial class CodeEditor {
         else { SaveUndo(); DeleteEdit(); }
     }
 
-    /// 在当前行切换行首"// "注释，或对选区覆盖的
-    /// 每一行切换。
+    /// 在当前行切换行首行注释（本语言的引导符：Zan "// "、
+    /// Lua "-- "、Python "# "），或对选区覆盖的每一行切换。
     void ToggleComment() {
         SaveUndo();
         int a = curLine;
@@ -1210,12 +1268,14 @@ partial class CodeEditor {
             if (a > b) { int tmp = a; a = b; b = tmp; }
         }
         // 若范围内所有行都已注释则取消注释，否则全部加上注释。
+        string tok = LineComment();
+        int tl = tok.Length;
         bool allComment = true;
         int i = a;
         while (i <= b) {
             string s = lines[i];
             string trimmed = CodeEditor.LTrim(s);
-            if (trimmed.Length < 2 || trimmed.Substring(0, 2) != "//") {
+            if (trimmed.Length < tl || trimmed.Substring(0, tl) != tok) {
                 if (trimmed.Length > 0) { allComment = false; }
             }
             i = i + 1;
@@ -1224,10 +1284,10 @@ partial class CodeEditor {
         while (i <= b) {
             string s = lines[i];
             if (allComment) {
-                lines[i] = CodeEditor.Uncomment(s);
+                lines[i] = CodeEditor.UncommentTok(s, tok);
             } else {
                 if (CodeEditor.LTrim(s).Length > 0) {
-                    lines[i] = "// " + s;
+                    lines[i] = tok + " " + s;
                 }
             }
             i = i + 1;
@@ -1271,6 +1331,12 @@ partial class CodeEditor {
 
     /// 删除前导空白后的第一个"// "（或"//"）。
     static string Uncomment(string s) {
+        return CodeEditor.UncommentTok(s, "//");
+    }
+
+    /// 删除前导空白后的第一个 `tok`（及紧随的一个空格），
+    /// `tok` 是该语言的行注释引导符。
+    static string UncommentTok(string s, string tok) {
         int i = 0;
         while (i < s.Length) {
             string ch = s.Substring(i, 1);
@@ -1279,8 +1345,9 @@ partial class CodeEditor {
         }
         string lead = s.Substring(0, i);
         string rest = s.Substring(i, s.Length - i);
-        if (rest.Length >= 2 && rest.Substring(0, 2) == "//") {
-            rest = rest.Substring(2, rest.Length - 2);
+        int tl = tok.Length;
+        if (rest.Length >= tl && rest.Substring(0, tl) == tok) {
+            rest = rest.Substring(tl, rest.Length - tl);
             if (rest.Length >= 1 && rest.Substring(0, 1) == " ") {
                 rest = rest.Substring(1, rest.Length - 1);
             }

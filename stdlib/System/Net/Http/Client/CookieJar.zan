@@ -1,0 +1,434 @@
+using System;
+
+namespace System.Net.Http.Client;
+
+/// <summary>
+/// 一条已存储的 cookie。<c>hostOnly</c> 区分 Set-Cookie 是否带了
+/// Domain 属性：不带时只回给设置它的那台主机，带时连子域一起匹配。
+/// <c>expires</c> 为 0 表示会话 cookie（进程内一直有效）。
+/// </summary>
+class Cookie {
+    string name;
+    string cookieValue;
+    string domain;
+    string path;
+    bool hostOnly;
+    bool secure;
+    long expires;
+
+    Cookie(string name, string cookieValue) {
+        this.name = name;
+        this.cookieValue = cookieValue;
+        this.domain = "";
+        this.path = "/";
+        this.hostOnly = true;
+        this.secure = false;
+        this.expires = 0;
+    }
+
+    string Name() { return this.name; }
+
+    string Value() { return this.cookieValue; }
+
+    string Domain() { return this.domain; }
+
+    string Path() { return this.path; }
+
+    bool Secure() { return this.secure; }
+
+    /// <summary>过期时刻（Unix 秒），0 表示会话 cookie。</summary>
+    long Expires() { return this.expires; }
+}
+
+/// <summary>
+/// 客户端 cookie 存储：吸收响应里的 Set-Cookie，并在后续请求上按
+/// 域名/路径/Secure 规则回放（RFC 6265 的匹配与排序）。
+///
+/// 之前 HttpClient 对 cookie 一无所知——Set-Cookie 只是留在响应头
+/// 列表里，调用方要自己 <c>SetHeader("Cookie", ...)</c> 才能接着发
+/// 已登录的请求。<c>HttpClient.UseCookies()</c> 把这件事交给本类。
+/// </summary>
+class CookieJar {
+    List<Cookie> items;
+
+    CookieJar() {
+        this.items = new List<Cookie>();
+    }
+
+    /// <summary>已存储的 cookie 条数（过期的不计）。</summary>
+    int Count() {
+        this.DropExpired();
+        return this.items.Count;
+    }
+
+    /// <summary>按名字取值，没有则返回空串。</summary>
+    string Get(string name) {
+        this.DropExpired();
+        for (int i = 0; i < this.items.Count; i = i + 1) {
+            if (this.items[i].Name() == name) { return this.items[i].Value(); }
+        }
+        return "";
+    }
+
+    /// <summary>按名字删除，删掉了返回 true。</summary>
+    bool Remove(string name) {
+        for (int i = 0; i < this.items.Count; i = i + 1) {
+            if (this.items[i].Name() == name) {
+                this.items.RemoveAt(i);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// <summary>清空存储。</summary>
+    void Clear() {
+        this.items.Clear();
+    }
+
+    /// <summary>
+    /// 吸收一条 Set-Cookie 头的值（不含头名字），<paramref name="host"/> 和
+    /// <paramref name="requestPath"/> 是发出该请求的主机与路径，用于补齐
+    /// 缺失的 Domain / Path。Max-Age=0 或已过去的 Expires 表示删除，
+    /// 同名同域同路径的旧值被覆盖。
+    /// </summary>
+    void SetCookie(string host, string requestPath, string setCookieValue) {
+        int semi = CookieJar.IndexOfChar(setCookieValue, 59, 0);
+        string pair = setCookieValue;
+        if (semi >= 0) { pair = setCookieValue.Substring(0, semi); }
+        int eq = CookieJar.IndexOfChar(pair, 61, 0);
+        if (eq <= 0) { return; }
+        string name = CookieJar.Trim(pair.Substring(0, eq));
+        if (name.Length == 0) { return; }
+        Cookie c = new Cookie(name,
+            CookieJar.Trim(pair.Substring(eq + 1, pair.Length - eq - 1)));
+        c.domain = CookieJar.Lower(host);
+        c.path = CookieJar.DefaultPath(requestPath);
+
+        bool deleted = false;
+        int pos = semi;
+        while (pos >= 0) {
+            int next = CookieJar.IndexOfChar(setCookieValue, 59, pos + 1);
+            int end = next;
+            if (end < 0) { end = setCookieValue.Length; }
+            string attr = CookieJar.Trim(
+                setCookieValue.Substring(pos + 1, end - pos - 1));
+            pos = next;
+            if (attr.Length == 0) { continue; }
+            int aeq = CookieJar.IndexOfChar(attr, 61, 0);
+            string aname = attr;
+            string aval = "";
+            if (aeq >= 0) {
+                aname = CookieJar.Trim(attr.Substring(0, aeq));
+                aval = CookieJar.Trim(attr.Substring(aeq + 1, attr.Length - aeq - 1));
+            }
+            string lower = CookieJar.Lower(aname);
+            if (lower == "path" && aval.Length > 0 && (aval[0] & 255) == 47) {
+                c.path = aval;
+            } else if (lower == "domain" && aval.Length > 0) {
+                string d = CookieJar.Lower(aval);
+                if ((d[0] & 255) == 46) { d = d.Substring(1, d.Length - 1); }
+                c.domain = d;
+                c.hostOnly = false;
+            } else if (lower == "secure") {
+                c.secure = true;
+            } else if (lower == "max-age") {
+                long age = CookieJar.ParseLong(aval);
+                if (age <= 0) { deleted = true; }
+                else { c.expires = DateTime.UtcNow().ToUnixSeconds() + age; }
+            } else if (lower == "expires") {
+                long at = CookieJar.ParseHttpDate(aval);
+                if (at > 0) {
+                    if (at <= DateTime.UtcNow().ToUnixSeconds()) { deleted = true; }
+                    else { c.expires = at; }
+                }
+            }
+        }
+
+        for (int i = 0; i < this.items.Count; i = i + 1) {
+            Cookie old = this.items[i];
+            if (old.Name() == c.Name() && old.Domain() == c.Domain()
+                    && old.Path() == c.Path()) {
+                this.items.RemoveAt(i);
+                break;
+            }
+        }
+        if (!deleted) { this.items.Add(c); }
+    }
+
+    /// <summary>
+    /// 该请求应带的 Cookie 头值（"a=1; b=2"），没有匹配的 cookie 则为空串。
+    /// <paramref name="secureChannel"/> 为 false 时标了 Secure 的 cookie 不外发。
+    /// 顺序按 RFC 6265：路径长的在前，同长度按写入顺序。
+    /// </summary>
+    string HeaderValue(string host, string requestPath, bool secureChannel) {
+        this.DropExpired();
+        string h = CookieJar.Lower(host);
+        string p = CookieJar.PathOnly(requestPath);
+        List<Cookie> hit = new List<Cookie>();
+        for (int i = 0; i < this.items.Count; i = i + 1) {
+            Cookie c = this.items[i];
+            if (c.Secure() && !secureChannel) { continue; }
+            if (!CookieJar.DomainMatches(h, c.Domain(), c.hostOnly)) { continue; }
+            if (!CookieJar.PathMatches(p, c.Path())) { continue; }
+            hit.Add(c);
+        }
+        // 插入排序：路径长度降序，相等时保持写入顺序（稳定）。
+        for (int i = 1; i < hit.Count; i = i + 1) {
+            Cookie cur = hit[i];
+            int j = i - 1;
+            while (j >= 0 && hit[j].Path().Length < cur.Path().Length) {
+                hit[j + 1] = hit[j];
+                j = j - 1;
+            }
+            hit[j + 1] = cur;
+        }
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < hit.Count; i = i + 1) {
+            if (i > 0) { sb.Append("; "); }
+            sb.Append(hit[i].Name());
+            sb.Append("=");
+            sb.Append(hit[i].Value());
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>
+    /// 从一段响应头里吸收所有 Set-Cookie 行。<paramref name="head"/> 是
+    /// 状态行 + 头部（到空行为止即可，多给了也无妨）。
+    /// </summary>
+    void AbsorbHead(string host, string requestPath, string head) {
+        int pos = 0;
+        int len = head.Length;
+        while (pos < len) {
+            int end = pos;
+            while (end < len && (head[end] & 255) != 10) { end = end + 1; }
+            int stop = end;
+            if (stop > pos && (head[stop - 1] & 255) == 13) { stop = stop - 1; }
+            int lineLen = stop - pos;
+            if (lineLen == 0) { return; }
+            if (lineLen > 11 && (head[pos + 10] & 255) == 58
+                    && CookieJar.NameEquals(head, pos, "set-cookie")) {
+                this.SetCookie(host, requestPath,
+                    CookieJar.Trim(head.Substring(pos + 11, lineLen - 11)));
+            }
+            pos = end + 1;
+        }
+    }
+
+    // 丢掉已过期的条目（会话 cookie 的 expires 为 0，永不丢）。
+    void DropExpired() {
+        long now = DateTime.UtcNow().ToUnixSeconds();
+        int i = 0;
+        while (i < this.items.Count) {
+            long at = this.items[i].Expires();
+            if (at > 0 && at <= now) { this.items.RemoveAt(i); }
+            else { i = i + 1; }
+        }
+    }
+
+    // 请求主机 `host` 是否落在 cookie 的域内：host-only 要求完全相等，
+    // 域 cookie 则允许子域（"api.example.com" 命中 "example.com"）。
+    static bool DomainMatches(string host, string domain, bool hostOnly) {
+        if (host == domain) { return true; }
+        if (hostOnly) { return false; }
+        int hl = host.Length;
+        int dl = domain.Length;
+        if (hl <= dl) { return false; }
+        if (host.Substring(hl - dl, dl) != domain) { return false; }
+        return (host[hl - dl - 1] & 255) == 46;
+    }
+
+    // RFC 6265 的 path-match：相等、cookie 路径以 "/" 结尾的前缀，
+    // 或前缀之后紧跟一个 "/"。
+    static bool PathMatches(string path, string cookiePath) {
+        if (path == cookiePath) { return true; }
+        int cl = cookiePath.Length;
+        if (cl == 0 || path.Length <= cl) { return false; }
+        if (path.Substring(0, cl) != cookiePath) { return false; }
+        if ((cookiePath[cl - 1] & 255) == 47) { return true; }
+        return (path[cl] & 255) == 47;
+    }
+
+    // RFC 6265 的 default-path：请求路径去掉最后一段（"/a/b" -> "/a"）。
+    static string DefaultPath(string requestPath) {
+        string p = CookieJar.PathOnly(requestPath);
+        if (p.Length == 0 || (p[0] & 255) != 47) { return "/"; }
+        int last = 0 - 1;
+        for (int i = 0; i < p.Length; i = i + 1) {
+            if ((p[i] & 255) == 47) { last = i; }
+        }
+        if (last <= 0) { return "/"; }
+        return p.Substring(0, last);
+    }
+
+    // 去掉查询串和片段，只留路径。
+    static string PathOnly(string requestPath) {
+        int cut = requestPath.Length;
+        for (int i = 0; i < requestPath.Length; i = i + 1) {
+            int ch = requestPath[i] & 255;
+            if (ch == 63 || ch == 35) { cut = i; break; }
+        }
+        if (cut == 0) { return "/"; }
+        return requestPath.Substring(0, cut);
+    }
+
+    // "Sun, 06 Nov 1994 08:49:37 GMT" -> Unix 秒（解析不出来返回 0）。
+    // 三种 HTTP 日期格式的日/月/年/时分秒都是按记号取的，因此
+    // RFC 1123、RFC 850 和 asctime 都能过。
+    static long ParseHttpDate(string s) {
+        List<string> tok = CookieJar.Tokens(s);
+        int day = 0 - 1;
+        int month = 0 - 1;
+        int year = 0 - 1;
+        int hour = 0;
+        int minute = 0;
+        int second = 0;
+        bool haveTime = false;
+        for (int i = 0; i < tok.Count; i = i + 1) {
+            string t = tok[i];
+            if (CookieJar.IndexOfChar(t, 58, 0) >= 0) {
+                if (!haveTime) {
+                    List<string> hms = CookieJar.SplitColon(t);
+                    if (hms.Count >= 2) {
+                        hour = (int)CookieJar.ParseLong(hms[0]);
+                        minute = (int)CookieJar.ParseLong(hms[1]);
+                        if (hms.Count >= 3) {
+                            second = (int)CookieJar.ParseLong(hms[2]);
+                        }
+                        haveTime = true;
+                    }
+                }
+                continue;
+            }
+            int m = CookieJar.MonthOf(t);
+            if (m > 0) { month = m; continue; }
+            if (!CookieJar.AllDigits(t)) { continue; }
+            long n = CookieJar.ParseLong(t);
+            if (t.Length >= 3) { year = (int)n; }
+            else if (day < 0) { day = (int)n; }
+            else if (year < 0) {
+                // 两位年份：RFC 850 的 "06-Nov-94"。
+                if (n >= 70) { year = (int)(1900 + n); } else { year = (int)(2000 + n); }
+            }
+        }
+        if (day < 1 || month < 1 || year < 1601) { return 0; }
+        return DateTime.FromParts(year, month, day, hour, minute, second)
+            .ToUnixSeconds();
+    }
+
+    // 按空格、逗号和 '-' 切成记号（"06-Nov-1994" -> 06 / Nov / 1994）。
+    static List<string> Tokens(string s) {
+        List<string> outp = new List<string>();
+        int start = 0 - 1;
+        for (int i = 0; i <= s.Length; i = i + 1) {
+            int ch = 32;
+            if (i < s.Length) { ch = s[i] & 255; }
+            bool sep = ch == 32 || ch == 44 || ch == 45 || ch == 9 || i == s.Length;
+            if (sep) {
+                if (start >= 0) { outp.Add(s.Substring(start, i - start)); }
+                start = 0 - 1;
+            } else if (start < 0) {
+                start = i;
+            }
+        }
+        return outp;
+    }
+
+    static List<string> SplitColon(string s) {
+        List<string> outp = new List<string>();
+        int start = 0;
+        for (int i = 0; i <= s.Length; i = i + 1) {
+            if (i == s.Length || (s[i] & 255) == 58) {
+                outp.Add(s.Substring(start, i - start));
+                start = i + 1;
+            }
+        }
+        return outp;
+    }
+
+    static int MonthOf(string t) {
+        if (t.Length < 3) { return 0; }
+        string m = CookieJar.Lower(t.Substring(0, 3));
+        if (m == "jan") { return 1; }
+        if (m == "feb") { return 2; }
+        if (m == "mar") { return 3; }
+        if (m == "apr") { return 4; }
+        if (m == "may") { return 5; }
+        if (m == "jun") { return 6; }
+        if (m == "jul") { return 7; }
+        if (m == "aug") { return 8; }
+        if (m == "sep") { return 9; }
+        if (m == "oct") { return 10; }
+        if (m == "nov") { return 11; }
+        if (m == "dec") { return 12; }
+        return 0;
+    }
+
+    static bool AllDigits(string s) {
+        if (s.Length == 0) { return false; }
+        for (int i = 0; i < s.Length; i = i + 1) {
+            int ch = s[i] & 255;
+            if (ch < 48 || ch > 57) { return false; }
+        }
+        return true;
+    }
+
+    static long ParseLong(string s) {
+        long n = 0;
+        bool neg = false;
+        int i = 0;
+        if (s.Length > 0 && (s[0] & 255) == 45) { neg = true; i = 1; }
+        for (; i < s.Length; i = i + 1) {
+            int ch = s[i] & 255;
+            if (ch < 48 || ch > 57) { break; }
+            n = n * 10 + (ch - 48);
+        }
+        if (neg) { return 0 - n; }
+        return n;
+    }
+
+    static int IndexOfChar(string s, int ch, int from) {
+        for (int i = from; i < s.Length; i = i + 1) {
+            if ((s[i] & 255) == ch) { return i; }
+        }
+        return 0 - 1;
+    }
+
+    static string Trim(string s) {
+        int a = 0;
+        int b = s.Length;
+        while (a < b) {
+            int ch = s[a] & 255;
+            if (ch != 32 && ch != 9) { break; }
+            a = a + 1;
+        }
+        while (b > a) {
+            int ch = s[b - 1] & 255;
+            if (ch != 32 && ch != 9 && ch != 13 && ch != 10) { break; }
+            b = b - 1;
+        }
+        return s.Substring(a, b - a);
+    }
+
+    static string Lower(string s) {
+        string lo = "abcdefghijklmnopqrstuvwxyz";
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < s.Length; i = i + 1) {
+            int ch = s[i] & 255;
+            if (ch >= 65 && ch <= 90) { sb.Append(lo.Substring(ch - 65, 1)); }
+            else { sb.Append(s.Substring(i, 1)); }
+        }
+        return sb.ToString();
+    }
+
+    // head[at..] 的头名字（到冒号前）是否等于 lower（已小写）。
+    static bool NameEquals(string head, int at, string lower) {
+        for (int i = 0; i < lower.Length; i = i + 1) {
+            int a = head[at + i] & 255;
+            if (a >= 65 && a <= 90) { a = a + 32; }
+            if (a != (lower[i] & 255)) { return false; }
+        }
+        return true;
+    }
+}

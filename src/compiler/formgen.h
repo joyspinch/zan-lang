@@ -23,8 +23,11 @@ struct zan_diag;
 /* Translate a .zform design document (JSON text) into synthetic .zan source.
  * Returns a malloc'd NUL-terminated buffer (caller frees), or NULL when the
  * document is not valid design JSON. `file_name` is used in diagnostics and
- * in the generated header comment. */
+ * in the generated header comment. `emit_main` adds the Main() entry point:
+ * pass it for the primary input only, so a multi-window project can compile
+ * every design at once (the others are opened with `<Name>.Show();`). */
 char *zan_formgen_translate(const char *json, size_t json_len,
-                            const char *file_name, struct zan_diag *diag);
+                            const char *file_name, struct zan_diag *diag,
+                            int emit_main);
 
 #endif /* ZAN_FORMGEN_H */

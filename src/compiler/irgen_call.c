@@ -240,13 +240,15 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
         }
 
         /* Task.Spawn(<asyncCall>) — fire-and-forget: run an async call as an
-         * independent coroutine WITHOUT awaiting it. Emits the callee's ramp
+         * independent coroutine WITHOUT awaiting it. Task.Run is the same
+         * lowering under the name the design docs use. Emits the callee's ramp
          * (heap frame) then schedules it on the cooperative driver with no
          * awaiter and without suspending the caller (contrast await, which
          * registers self as awaiter and suspends). This is the concurrency
          * primitive a server accept loop uses to handle each connection on its
          * own coroutine instead of serially. See docs/ASYNC_CPS_DESIGN.md. */
-        if (is_call_to(expr, "Task", "Spawn") && expr->call.args.count == 1 &&
+        if ((is_call_to(expr, "Task", "Spawn") || is_call_to(expr, "Task", "Run")) &&
+            expr->call.args.count == 1 &&
             expr->call.args.items[0]->kind == AST_CALL) {
             LLVMTypeRef sp_i64 = LLVMInt64TypeInContext(g->ctx);
             LLVMTypeRef sp_i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
@@ -315,6 +317,29 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
             LLVMValueRef cf = get_co_cancel_fn(g);
             zan_call2(g->builder, LLVMGlobalGetValueType(cf), cf, &h, 1, "");
             return LLVMConstInt(ci64, 0, 0);
+        }
+
+        /* Task.IsDone(handle) — whether the coroutine a Task.Spawn handle names
+         * has completed. This is what fan-out joins are built on
+         * (System.Threading.TaskJoin, which `Task.WhenAll` desugars to): without
+         * it a spawned coroutine's completion is unobservable from the outside,
+         * so every caller had to thread its own counter and gate through the
+         * spawned bodies. See get_co_isdone_fn. Yields 1/0 as an `int`, like the
+         * sibling Task.IsCancellationRequested. */
+        if (is_call_to(expr, "Task", "IsDone") && expr->call.args.count == 1) {
+            LLVMTypeRef di8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+            LLVMTypeRef di64 = LLVMInt64TypeInContext(g->ctx);
+            LLVMValueRef h = emit_expr(g, expr->call.args.items[0], locals);
+            if (LLVMGetTypeKind(LLVMTypeOf(h)) == LLVMIntegerTypeKind) {
+                if (LLVMGetIntTypeWidth(LLVMTypeOf(h)) < 64)
+                    h = zan_iwiden(g->builder, h, di64);
+                h = LLVMBuildIntToPtr(g->builder, h, di8ptr, "isdone.h");
+            } else {
+                h = LLVMBuildBitCast(g->builder, h, di8ptr, "isdone.h");
+            }
+            LLVMValueRef idf = get_co_isdone_fn(g);
+            return zan_call2(g->builder, LLVMGlobalGetValueType(idf),
+                             idf, &h, 1, "isdone");
         }
 
         /* Task.IsCancellationRequested() — inside an async body, whether this

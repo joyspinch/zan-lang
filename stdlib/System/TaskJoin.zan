@@ -1,0 +1,80 @@
+using System;
+
+namespace System;
+
+/// <summary>
+/// 扇出汇合（fan-out join）：<c>Task.WhenAll</c> / <c>Task.WhenAny</c> 的
+/// 实现。两者不是编译器内建——解析器只把接收者 <c>Task</c> 改写为
+/// <c>TaskJoin</c>（见 parser.c 的 desugar_task_join），因此汇合本身就是
+/// 普通的 async 标准库代码，像其他被 await 的调用一样挂起与恢复。
+///
+///   List&lt;long&gt; hs = new List&lt;long&gt;();
+///   hs.Add(Task.Spawn(Work(1)));
+///   hs.Add(Task.Spawn(Work(2)));
+///   int n = await Task.WhenAll(hs);      // 全部完成后返回句柄个数
+///   int i = await Task.WhenAny(hs);      // 最先完成者的下标
+///
+/// 完成性由 <c>Task.IsDone(handle)</c> 观察（协程完成或被取消后为真），
+/// 等待期间用 <c>Task.Delay</c> 让出：汇合方挂起到 reactor，不占线程、
+/// 也不忙等。轮询间隔从 1 毫秒起指数退避到 4 毫秒——短任务几乎立即
+/// 汇合，长任务不会每毫秒都唤醒一次。
+/// </summary>
+class TaskJoin {
+    /// 轮询退避上限（毫秒）。
+    static int MAX_BACKOFF = 4;
+
+    /// <summary>挂起直到 `handles` 中每个句柄都已完成（或被取消），
+    /// 返回汇合的句柄个数。空列表立即返回 0，已完成的批次
+    /// 不会挂起。</summary>
+    static async int WhenAll(List<long> handles) {
+        int n = handles.Count;
+        if (n == 0) { return 0; }
+        int wait = 1;
+        while (true) {
+            bool pending = false;
+            for (int i = 0; i < n; i = i + 1) {
+                if (Task.IsDone(handles[i]) == 0) { pending = true; break; }
+            }
+            if (!pending) { return n; }
+            await Task.Delay(wait);
+            if (wait < TaskJoin.MAX_BACKOFF) { wait = wait * 2; }
+        }
+        return n;
+    }
+
+    /// <summary>挂起直到 `handles` 中任一句柄完成，返回其下标；
+    /// 同一轮里多个都已完成时返回最小下标。空列表返回 -1。
+    /// 其余协程继续运行——需要一起收尾就先
+    /// <see cref="CancelAll"/> 再 <see cref="WhenAll"/>。</summary>
+    static async int WhenAny(List<long> handles) {
+        int n = handles.Count;
+        if (n == 0) { return -1; }
+        int wait = 1;
+        while (true) {
+            for (int i = 0; i < n; i = i + 1) {
+                if (Task.IsDone(handles[i]) != 0) { return i; }
+            }
+            await Task.Delay(wait);
+            if (wait < TaskJoin.MAX_BACKOFF) { wait = wait * 2; }
+        }
+        return -1;
+    }
+
+    /// <summary>请求取消每个句柄（已完成的句柄无副作用）。取消是
+    /// 协作式的：协程在下一个挂起点观察到请求，因此取消后通常
+    /// 紧跟一次 <c>WhenAll</c> 等它们真正收尾。</summary>
+    static void CancelAll(List<long> handles) {
+        for (int i = 0; i < handles.Count; i = i + 1) {
+            Task.Cancel(handles[i]);
+        }
+    }
+
+    /// <summary>`handles` 中已完成的句柄个数（不挂起）。</summary>
+    static int DoneCount(List<long> handles) {
+        int done = 0;
+        for (int i = 0; i < handles.Count; i = i + 1) {
+            if (Task.IsDone(handles[i]) != 0) { done = done + 1; }
+        }
+        return done;
+    }
+}

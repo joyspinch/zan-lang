@@ -1,0 +1,127 @@
+// System.Scripting.Lua smoke test: in-process Lua 5.3/5.4 embedding.
+// The harness compares stdout against a single golden file and has no skip
+// concept, so when no lua5x.dll is loadable this prints the same lua-ok: 1
+// line without asserting anything (an environment skip). When Lua IS present
+// it asserts structural invariants: Exec defines globals, Eval returns values,
+// dotted Call paths reach the standard library, UTF-8 strings round-trip,
+// 64-bit integers survive the border, tables work as both arrays and dicts,
+// a registered lua_CFunction callback runs from Lua, script errors surface as
+// Zan exceptions, and the shared Lua stack is left at its entry height.
+using System;
+using System.Scripting;
+
+namespace Conf;
+
+class Prog {
+    static int ZanMul(nint L) {
+        double a = Lua.ArgDouble(L, 1);
+        double b = Lua.ArgDouble(L, 2);
+        return Lua.ReturnDouble(L, a * b);
+    }
+
+    static void Main() {
+        if (!Lua.IsAvailable()) {
+            // No Lua runtime on this machine: skip silently (see header).
+            Console.WriteLine("lua-ok: 1");
+            return;
+        }
+        int bad = 0;
+
+        Lua.Initialize();
+
+        // Exec defines a global; Eval reads it back
+        Lua.Exec("answer = 6 * 7");
+        if (Lua.Eval("answer").ToLong() != 42L) { bad = bad + 1; }
+        if (Lua.GetGlobal("answer").ToLong() != 42L) { bad = bad + 1; }
+
+        // dotted Call path into the standard library
+        if (Lua.CallD("math.floor", 22.3) != 22.0) { bad = bad + 1; }
+        if (Lua.CallL("math.max", 3L, 7L, 5L) != 7L) { bad = bad + 1; }
+        if (Lua.CallS("string.upper", "zan") != "ZAN") { bad = bad + 1; }
+
+        // UTF-8 round-trip through a script function (3 bytes per Chinese char)
+        Lua.Exec("function greet(name)\n  return '你好, ' .. name .. '!'\nend\n");
+        LuaValue greet = Lua.GetGlobal("greet");
+        if (greet.Call(Lua.FromStr("Zan")).ToStr() != "你好, Zan!") { bad = bad + 1; }
+        if (greet("Zan").ToStr() != "你好, Zan!") { bad = bad + 1; }
+        if (Lua.CallS("greet", "Zan") != "你好, Zan!") { bad = bad + 1; }
+
+        // scalar marshalling both ways
+        long big = 1234567890123L;
+        if (Lua.FromLong(big).ToLong() != big) { bad = bad + 1; }
+        if (Lua.FromDouble(3.25).ToDouble() != 3.25) { bad = bad + 1; }
+        if (Lua.FromStr("中文往返").ToStr() != "中文往返") { bad = bad + 1; }
+        if (!Lua.FromBool(true).ToBool()) { bad = bad + 1; }
+        if (Lua.FromBool(false).ToBool()) { bad = bad + 1; }
+        if (!Lua.Nil().IsNil()) { bad = bad + 1; }
+
+        // tables as arrays: Eval, index read/write, length, list conversion
+        LuaValue squares = Lua.Eval("{1, 4, 9}");
+        if (!squares.IsTable()) { bad = bad + 1; }
+        if (squares.Length() != 3L) { bad = bad + 1; }
+        if (squares[2].ToLong() != 4L) { bad = bad + 1; }
+        squares[3] = Lua.FromLong(99L);
+        if (squares[3].ToLong() != 99L) { bad = bad + 1; }
+        List<double> ds = Lua.Eval("{0, 1, 4, 9}").ToListDouble();
+        if (ds.Count != 4 || ds[3] != 9.0) { bad = bad + 1; }
+        List<string> names = new List<string>();
+        names.Add("alice");
+        names.Add("bob");
+        Lua.Exec("function upper_all(t)\n  local r = {}\n  for i, s in ipairs(t) do r[i] = string.upper(s) end\n  return r\nend\n");
+        List<string> up = Lua.Call("upper_all", Lua.FromListStr(names)).ToListStr();
+        if (up.Count != 2 || up[0] != "ALICE") { bad = bad + 1; }
+        List<double> nums = new List<double>();
+        nums.Add(1.5);
+        nums.Add(2.5);
+        if (Lua.Call("table.concat", Lua.FromListDouble(nums)).ToStr() != "1.52.5") {
+            bad = bad + 1;
+        }
+
+        // tables as dicts: field read/write, ToDict, Zan dictionary -> Lua
+        LuaValue person = Lua.Eval("{name = 'Zan', lang = 'Lua'}");
+        if (person["name"].ToStr() != "Zan") { bad = bad + 1; }
+        person["lang"] = "Zan";
+        if (person.Get("lang").ToStr() != "Zan") { bad = bad + 1; }
+        Dictionary<string, LuaValue> pd = person.ToDict();
+        if (pd["name"].ToStr() != "Zan") { bad = bad + 1; }
+        if (pd.Count != 2) { bad = bad + 1; }
+        Dictionary<string, string> cfg = new Dictionary<string, string>();
+        cfg["mode"] = "fast";
+        cfg["debug"] = "off";
+        Lua.Exec("function read_mode(d)\n  return d.mode .. '/' .. d.debug\nend\n");
+        if (Lua.Call("read_mode", Lua.FromDictStr(cfg)).ToStr() != "fast/off") {
+            bad = bad + 1;
+        }
+
+        // SetGlobal writes a name the script can read
+        Lua.SetGlobal("injected", Lua.FromLong(7L));
+        if (Lua.Eval("injected * 6").ToLong() != 42L) { bad = bad + 1; }
+
+        // Lua -> Zan callback
+        if (!Lua.RegisterFunction("zan_mul", ZanMul)) { bad = bad + 1; }
+        if (Lua.Eval("zan_mul(3, 4)").ToDouble() != 12.0) { bad = bad + 1; }
+        Lua.Exec("assert(zan_mul(3, 4) == 12.0)");
+
+        // runtime error and syntax error both surface as Zan exceptions
+        bool threw = false;
+        try {
+            Lua.Exec("error('boom')");
+        } catch (InvalidOperationException) {
+            threw = true;
+        }
+        if (!threw) { bad = bad + 1; }
+        threw = false;
+        try {
+            Lua.Exec("this is not lua");
+        } catch (InvalidOperationException) {
+            threw = true;
+        }
+        if (!threw) { bad = bad + 1; }
+
+        // the shared stack must be balanced after all of the above
+        if (Lua.Top() != 0) { bad = bad + 1; }
+
+        Lua.Finalize();
+        Console.WriteLine("lua-ok: " + Convert.ToString(bad == 0 ? 1 : 0));
+    }
+}

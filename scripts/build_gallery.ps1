@@ -2,18 +2,12 @@ $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 
-# The GUI runtime uses the unified SDL3 windowing backend (ZAN_GUI_SDL), the
-# same one the IDE links. The gallery links exactly like the IDE: a static
-# mingw-ABI GUI runtime plus zanc's own link driver, which pulls in the async
+# The gallery is a pure Gui stdlib program: on Windows its window shell is the
+# Zan-side Win32Shell (Native.zan #if WINDOWS), so the native Win32 GUI
+# runtime is enough -- no SDL3 is linked (the IDE's SDL3 link is a game/IDE
+# thing, the gallery does not need it). The runtime is built as a static
+# mingw-ABI archive plus zanc's own link driver, which pulls in the async
 # reactor (rt_io) and sync runtime (rt_sync) automatically.
-$cache = Get-ChildItem "$env:TEMP" -Filter "zan-sdl3-*" -Directory |
-    Sort-Object Name -Descending | Select-Object -First 1
-if (-not $cache) { throw "SDL3 devel cache not found; run scripts\stage_sdl3.ps1 first." }
-$pkg = Join-Path $cache.FullName ((Get-ChildItem $cache.FullName -Filter "SDL3-*" -Directory | Select-Object -First 1).Name)
-$pkg = Join-Path $pkg "x86_64-w64-mingw32"
-$inc = Join-Path $pkg "include"
-$sdlLibDir = Join-Path $pkg "lib"
-$driverDir = Join-Path $root "stdlib\SDL3\drivers\win-x64"
 
 $galleryComponents = "examples\gui_gallery\components"
 $registryPath = Join-Path $root "stdlib\Gui\CustomComponents.zan"
@@ -21,8 +15,8 @@ $registryOriginal = [System.IO.File]::ReadAllText($registryPath)
 $failed = $false
 
 try {
-    Write-Output "[1/3] Building native GUI runtime (SDL3, static, mingw ABI)..."
-    clang --target=x86_64-w64-windows-gnu -O2 -DZAN_GUI_STATIC -DZAN_GUI_SDL "-I$inc" `
+    Write-Output "[1/3] Building native GUI runtime (Win32, static, mingw ABI)..."
+    clang --target=x86_64-w64-windows-gnu -O2 -DZAN_GUI_STATIC `
         -c src\runtime\gui_runtime.c -o build\zan_gui_gallery_gnu.o
     if ($LASTEXITCODE -ne 0) { throw "RUNTIME_COMPILE_FAILED" }
     llvm-ar rcs build\libzan_gui_gallery_gnu.a build\zan_gui_gallery_gnu.o
@@ -44,10 +38,12 @@ try {
     $zanArgs += $files
     $zanArgs += @("-o", "build\gallery_test.exe", "--subsystem", "windows")
     $zanArgs += @("--libpath", "build", "--link-lib", "zan_gui_gallery_gnu")
-    $zanArgs += @("--libpath", $sdlLibDir, "--link-lib", "SDL3")
+    # Native Win32 backend needs only the system libs it imports directly (the
+    # runtime's #pragma libs: dwmapi/user32/gdi32/imm32) plus the reactor deps.
     $zanArgs += @("--link-lib", "ws2_32", "--link-lib", "mswsock")
     $zanArgs += @("--link-lib", "psapi", "--link-lib", "advapi32")
     $zanArgs += @("--link-lib", "dwmapi", "--link-lib", "gdi32", "--link-lib", "imm32")
+    $zanArgs += @("--link-lib", "user32", "--link-lib", "rpcrt4")
     $zanArgs += @("--icon", (Join-Path (Get-Location) "assets\zan.ico"))
     $out = & build\zanc.exe @zanArgs 2>&1
     $code = $LASTEXITCODE
@@ -55,8 +51,6 @@ try {
         $out | Select-Object -Last 40
         throw "GALLERY_LINK_FAILED code=$code"
     }
-    Copy-Item -LiteralPath (Join-Path $driverDir "SDL3.dll") `
-        -Destination (Join-Path (Get-Location) "build\SDL3.dll") -Force
 } catch {
     Write-Output $_
     $failed = $true
