@@ -46,6 +46,8 @@ class TlsContext {
     static extern void X509_free(string x);
     [DllImport("crt", EntryPoint = "memcpy")]
     static extern nint PlatMemCopyIn(byte[] dst, nint src, long n);
+    [DllImport("crt", EntryPoint = "memcpy")]
+    static extern nint PlatMemCopyOut(nint dst, string src, long n);
     #if WINDOWS
     [DllImport("crypt32", EntryPoint = "CertOpenSystemStoreA")]
     static extern nint CertOpenSystemStore(nint prov, string name);
@@ -58,6 +60,10 @@ class TlsContext {
     string ctx;
     bool server;
     string error;
+    // 对端证书校验是否启用（客户端：链 + 主机名）。默认开启，
+    // DisableVerify() 关闭——关闭后握手只加密不校验，
+    // 用于本地开发，绝不用于生产。
+    bool verify;
     // 公钥（SPKI）固定（pinning）：服务器
     // SubjectPublicKeyInfo 的 base64 SHA-256。启用且非空时，若握手的对端公钥
     // 哈希不匹配任何 pin，客户端将拒绝握手——从而挫败
@@ -69,6 +75,7 @@ class TlsContext {
         this.ctx = null;
         this.server = false;
         this.error = "";
+        this.verify = true;
         this.pins = null;
         this.pinRequired = false;
     }
@@ -171,6 +178,7 @@ class TlsContext {
     /// <summary>禁用对端证书校验（仅限开发）。
     /// 0 = SSL_VERIFY_NONE。</summary>
     void DisableVerify() {
+        this.verify = false;
         SSL_CTX_set_verify(this.ctx, 0, null);
     }
 
@@ -227,6 +235,63 @@ class TlsContext {
     }
     #endif
 
+    // 从 PEM 字符串中抽出 base64 正文（BEGIN/END 标记之间）并解码为 DER。
+    static byte[] PemBodyToDer(string pem, int expectedLen) {
+        int begin = pem.IndexOf("BEGIN");
+        if (begin < 0) { return null; }
+        int nl = pem.IndexOf("\n", begin);
+        if (nl < 0) { return null; }
+        int end = pem.IndexOf("END", nl);
+        if (end < 0) { return null; }
+        // 去掉末尾的换行
+        int bodyEnd = end;
+        while (bodyEnd > nl && (pem[bodyEnd - 1] & 255) == 10) { bodyEnd = bodyEnd - 1; }
+        while (bodyEnd > nl && (pem[bodyEnd - 1] & 255) == 13) { bodyEnd = bodyEnd - 1; }
+        string b64 = pem.Substring(nl + 1, bodyEnd - nl - 1);
+        List<int> derLen = new List<int>(); derLen.Add(0);
+        byte[] der = Base64.Decode(b64, derLen);
+        if (der == null || derLen[0] == 0 || (expectedLen > 0 && derLen[0] != expectedLen)) {
+            return null;
+        }
+        return der;
+    }
+
+    /// <summary>把 PEM 格式的 CA（或自签名）证书加入本上下文的信任库，
+    /// 使其签发的对端证书在链校验中被接受。返回 true 表示成功。
+    /// 用于私有 CA 与测试（自签名开发服务器）。</summary>
+    bool AddTrustedCert(string pemFile) {
+        string pem = File.ReadAllText(pemFile);
+        if (pem == "") { return false; }
+        byte[] der = TlsContext.PemBodyToDer(pem, 0);
+        if (der == null) { return false; }
+        int n = der.Length;
+        // 把 DER 复制到原生内存，再把「指向该内存的指针」写进 8 字节
+        // 指针单元，最后让 d2i_X509 从该指针单元解析 X509。
+        nint derMem = NativeMemory.Alloc(n);
+        if (derMem == 0) { return false; }
+        string derStr = der.ToStr(0, n);
+        PlatMemCopyOut(derMem, derStr, n);
+        // 指针单元 = derMem 的地址（小端，8 字节）。
+        byte[] pp = new byte[8];
+        long v = derMem;
+        int k = 0;
+        while (k < 8) {
+            pp[k] = Bits.Shr64(v, 8 * k) & 255;
+            k = k + 1;
+        }
+        string x = d2i_X509(null, pp, n);
+        NativeMemory.Free(derMem);
+        if (x == null) { return false; }
+        string store = SSL_CTX_get_cert_store(this.ctx);
+        if (store == null) {
+            X509_free(x);
+            return false;
+        }
+        int added = X509_STORE_add_cert(store, x);
+        X509_free(x);
+        return added == 1;
+    }
+
     string Handle() {
         return this.ctx;
     }
@@ -277,6 +342,19 @@ class TlsStream {
     static extern int SSL_shutdown(string ssl);
     [DllImport("ssl")]
     static extern int SSL_ctrl(string ssl, int cmd, int larg, string parg);
+    [DllImport("ssl")]
+    static extern string SSL_get0_param(string ssl);
+    [DllImport("ssl")]
+    static extern long SSL_get_verify_result(string ssl);
+
+    [DllImport("crypto")]
+    static extern int X509_VERIFY_PARAM_set1_host(string param, string name, long len);
+    [DllImport("crypto")]
+    static extern int X509_VERIFY_PARAM_set1_ip_asc(string param, string ipasc);
+    [DllImport("crypto")]
+    static extern void X509_VERIFY_PARAM_set_hostflags(string param, long flags);
+    [DllImport("crypto")]
+    static extern string X509_VERIFY_PARAM_get0_name(string param);
 
     [DllImport("crypto")]
     static extern string BIO_new(string method);
@@ -367,11 +445,47 @@ class TlsStream {
         if (host != null && host.Length > 0) {
             // 55 = SSL_CTRL_SET_TLSEXT_HOSTNAME, 0 = TLSEXT_NAMETYPE_host_name
             int _sni = SSL_ctrl(s.ssl, 55, 0, host);
+            // 主机名校验（RFC 6125）：只校验证书链还不够——必须同时确认
+            // 证书上的域名与调用方期望的主机一致，否则任何受信 CA 给任意
+            // 域名签发的证书都能通过。通过 X509_VERIFY_PARAM 设置期望
+            // 主机名；OpenSSL 会在链校验时把它与证书的 SAN/CN 比对，
+            // 不匹配则 verify_result != X509_V_OK。
+            // verify 被 DisableVerify() 关闭时不设主机名：该校验
+            // 与链校验同属「对端证书校验」，关闭后应整体跳过。
+            if (ctx.verify) {
+                string param = SSL_get0_param(s.ssl);
+                if (param != null) {
+                    // 0x4 = X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS（拒绝 *.example.com
+                    // 匹配 a.b.example.com 这类部分通配，避免跳过子域名的校验）。
+                    X509_VERIFY_PARAM_set_hostflags(param, 4);
+                    int _hv;
+                    if (TlsStream.IsIpLiteral(host)) {
+                        // IP 直连：host 是 IPv4/IPv6 字面量，必须走 set1_ip_asc，
+                        // 与证书 SAN 的 iPAddress 项比对（不能用 set1_host）。
+                        _hv = X509_VERIFY_PARAM_set1_ip_asc(param, host);
+                    } else {
+                        _hv = X509_VERIFY_PARAM_set1_host(param, host, 0);
+                    }
+                    if (_hv != 1) {
+                        s.Close();
+                        return null;
+                    }
+                }
+            }
         }
         int ok = await s.HandshakeAsync();
         if (ok != 1) {
             s.Close();
             return null;
+        }
+        // 握手完成后再查一次 verify_result：即使握手的返回值看起来成功，
+        // 若对端证书未被信任或主机名不匹配，也必须拒绝。0 = X509_V_OK。
+        if (ctx.verify) {
+            long vr = SSL_get_verify_result(s.ssl);
+            if (vr != 0) {
+                s.Close();
+                return null;
+            }
         }
         if (ctx.PinningActive()) {
             string got = TlsStream.SpkiPinOf(s.ssl);
@@ -381,6 +495,22 @@ class TlsStream {
             }
         }
         return s;
+    }
+
+    // host 是否为 IP 字面量（IPv4 点分十进制或 IPv6 含冒号）：
+    // 是则主机名校验走 set1_ip_asc，否则走 set1_host。
+    static bool IsIpLiteral(string host) {
+        if (host == null || host.Length == 0) { return false; }
+        bool hasColon = false;
+        bool onlyDigitDot = true;
+        int i = 0;
+        while (i < host.Length) {
+            int c = host[i] & 255;
+            if (c == 58) { hasColon = true; }
+            if (!((c >= 48 && c <= 57) || c == 46 || c == 58)) { onlyDigitDot = false; }
+            i = i + 1;
+        }
+        return hasColon || onlyDigitDot;
     }
 
     /// <summary>对端证书 DER
