@@ -1,0 +1,60 @@
+using System;
+using System.IO;
+
+/// Named shared-memory ownership semantics: only the CREATOR's close may
+/// release the name (and only an explicit Unlink() before it). A plain
+/// opener's Close must leave the region openable by others. Windows keeps the
+/// name until the last handle closes (reference-counted kernel object), so
+/// this golden holds there both before and after the fix; POSIX used to
+/// shm_unlink on every close, so the "reopen after opener close" check fails
+/// there before the fix.
+class Program {
+    static int bad;
+
+    static void Check(bool ok, string label) {
+        if (!ok) { Console.WriteLine("FAIL " + label); bad = bad + 1; }
+    }
+
+    /// OpenExisting returns true when the region is still there.
+    static bool CanOpen(string name) {
+        try {
+            MemoryMappedFile f = MemoryMappedFile.OpenExisting(name, 64);
+            f.Close();
+            return true;
+        } catch (FileNotFoundException e) {
+            return false;
+        }
+    }
+
+    static void Main() {
+        // ---- opener's close must not release the name ----
+        string region = "ZanOwner_A";
+        MemoryMappedFile owner = MemoryMappedFile.CreateNew(region, 64);
+        MemoryMappedFile opener = MemoryMappedFile.OpenExisting(region, 64);
+        opener.Close();
+        Check(CanOpen(region), "reopen after opener close");
+        owner.Close();
+        Check(!CanOpen(region), "name gone after owner close");
+
+        // ---- explicit Unlink() releases the name while owner is open ----
+        // POSIX shm_unlink removes the name immediately even while a handle
+        // is still open; Windows named objects are reference-counted, so the
+        // name stays resolvable until the last handle closes and Unlink is a
+        // no-op there. Both behaviors are exercised but only asserted against
+        // the platform that defines them.
+        string region2 = "ZanOwner_B";
+        MemoryMappedFile owner2 = MemoryMappedFile.CreateNew(region2, 64);
+        MemoryMappedFile.Unlink(region2);
+        #if WINDOWS
+        Check(CanOpen(region2), "win unlink keeps name (refcounted)");
+        #else
+        Check(!CanOpen(region2), "gone after explicit unlink");
+        #endif
+        owner2.Close();
+
+        // ---- Unlink on a region nobody holds is harmless ----
+        MemoryMappedFile.Unlink("ZanOwner_Nonexistent");
+
+        Console.WriteLine("mmap-owner-ok: " + Convert.ToString(bad == 0 ? 1 : 0));
+    }
+}

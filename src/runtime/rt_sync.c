@@ -2114,7 +2114,9 @@ typedef struct {
 #else
 typedef struct {
     int fd;
-    char name[64];   /* shm name (kept for shm_unlink), or "" for file-backed */
+    int owner;         /* 1 = this handle created the region: only its close
+                        * (or an explicit Unlink) may shm_unlink the name */
+    char name[64];     /* shm name (kept for shm_unlink), or "" for file-backed */
 } zan_mmap_handle;
 #endif
 
@@ -2152,6 +2154,7 @@ long long zan_mmap_create(const char *name, long long size) {
     zan_mmap_handle *h = (zan_mmap_handle *)calloc(1, sizeof(zan_mmap_handle));
     if (!h) { shm_unlink(shm_name); close(fd); return 0; }
     h->fd = fd;
+    h->owner = 1;
     snprintf(h->name, sizeof(h->name), "%s", shm_name);
     return (long long)(intptr_t)h;
 #endif
@@ -2267,8 +2270,9 @@ long long zan_mmap_flush(long long ptr, long long size) {
 #endif
 }
 
-/* Closes the mapping handle. Named POSIX regions are unlinked when the
- * creator closes, so the name stops resolving for new openers. */
+/* Closes a mapping handle. Only the handle that CREATED a named POSIX
+ * region unlinks it on close; a plain opener's close leaves the name in
+ * place so the creator and other clients keep working. */
 long long zan_mmap_close(long long handle) {
     if (!handle) return 0;
 #ifdef _WIN32
@@ -2277,9 +2281,25 @@ long long zan_mmap_close(long long handle) {
 #else
     zan_mmap_handle *h = (zan_mmap_handle *)(intptr_t)handle;
     close(h->fd);
-    if (h->name[0]) shm_unlink(h->name);
+    if (h->owner && h->name[0]) shm_unlink(h->name);
     free(h);
     return 1;
+#endif
+}
+
+/* Explicitly removes a named POSIX region, regardless of open handles.
+ * On Windows named regions are reference-counted kernel objects -- the name
+ * disappears with the last handle -- so there is nothing to unlink and this
+ * is a harmless no-op returning success. */
+long long zan_mmap_unlink(const char *name) {
+    if (!name || !name[0]) return 0;
+#ifdef _WIN32
+    (void)name;
+    return 1;
+#else
+    char shm_name[96];
+    snprintf(shm_name, sizeof(shm_name), "/%s", name);
+    return shm_unlink(shm_name) == 0 ? 1 : 0;
 #endif
 }
 

@@ -146,6 +146,7 @@ long long zan_mmap_map(long long handle, long long size);
 long long zan_mmap_unmap(long long ptr, long long size);
 long long zan_mmap_flush(long long ptr, long long size);
 long long zan_mmap_close(long long handle);
+long long zan_mmap_unlink(const char *name);
 
 #ifdef __cplusplus
 }
