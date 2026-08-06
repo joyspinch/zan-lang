@@ -1314,6 +1314,24 @@ int64_t zan_monotonic_us(void) {
 #endif
 }
 
+/* Monotonic nanoseconds, for System.Diagnostics.Stopwatch. The clock id must
+ * not be hardcoded on the Zan side: CLOCK_MONOTONIC is 1 on Linux but 6 on
+ * macOS, and the struct timespec layout is not portable either. C compiles
+ * the real macro and layout in. */
+int64_t zan_monotonic_ns(void) {
+#ifdef _WIN32
+    static LARGE_INTEGER frequency;
+    if (!frequency.QuadPart) QueryPerformanceFrequency(&frequency);
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    return (int64_t)((now.QuadPart * 1000000000) / frequency.QuadPart);
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000000000 + (int64_t)ts.tv_nsec;
+#endif
+}
+
 /* ---- the same operations against a caller-computed hash ---- */
 
 int64_t zan_shared_table_hash(const char *value) {

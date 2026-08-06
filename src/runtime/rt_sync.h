@@ -57,6 +57,9 @@ int64_t zan_atomic_int_add(int64_t handle, int64_t delta);
 /* Monotonic microseconds (no allocation; the Zan-side clock wrapper allocates). */
 int64_t zan_monotonic_us(void);
 
+/* Monotonic nanoseconds, for System.Diagnostics.Stopwatch (no allocation). */
+int64_t zan_monotonic_ns(void);
+
 int64_t zan_shared_table_create(
     const char *name, int32_t capacity, int32_t key_size, const char *schema);
 int64_t zan_shared_table_open(const char *name);
