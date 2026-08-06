@@ -118,6 +118,21 @@ class Chart {
         return mx;
     }
 
+    // 仅索引窗口 [i0,i1]（含端点）内的最大值，供 dataZoom
+    // 的索引视图使用（渲染循环直接读原系列，不做有损克隆）。
+    static int MaxOfWindow(List<ChartSeries> series, int i0, int i1) {
+        int mx = 0;
+        for (int i = 0; i < series.Count; i = i + 1) {
+            ChartSeries s = series[i];
+            int j = i0;
+            while (j <= i1 && j < s.Count()) {
+                if (s.Value(j) > mx) { mx = s.Value(j); }
+                j = j + 1;
+            }
+        }
+        return mx;
+    }
+
     // 各分类中的最大堆叠总量（用于堆叠柱状图）。
     // 共享 stackName 的系列堆叠在一起；轴适配最高的组，
     // 使多组堆叠柱（ECharts `stack` 组）正确缩放。
@@ -150,6 +165,38 @@ class Chart {
         return mx;
     }
 
+    // MaxStack 的索引窗口版：仅累计分类 j + i0（j 在 [0,n)）。
+    static int MaxStackW(List<ChartSeries> series, int n, int i0) {
+        List<string> grp = new List<string>();
+        for (int g = 0; g < series.Count; g = g + 1) {
+            ChartSeries cs = series[g];
+            if (!ChartView.IsLineFamily(cs.type)) {
+                bool found = false;
+                for (int gi = 0; gi < grp.Count; gi = gi + 1) {
+                    if (grp[gi] == cs.stackName) { found = true; }
+                }
+                if (!found) { grp.Add(cs.stackName); }
+            }
+        }
+        int ng = grp.Count;
+        if (ng < 1) { ng = 1; }
+        int mx = 0;
+        for (int i = 0; i < n; i = i + 1) {
+            int oi = i0 + i;
+            for (int gi = 0; gi < ng; gi = gi + 1) {
+                int sum = 0;
+                for (int s = 0; s < series.Count; s = s + 1) {
+                    ChartSeries cs = series[s];
+                    if (!ChartView.IsLineFamily(cs.type) && cs.stackName == grp[gi]) {
+                        if (oi < cs.Count()) { sum = sum + cs.Value(oi); }
+                    }
+                }
+                if (sum > mx) { mx = sum; }
+            }
+        }
+        return mx;
+    }
+
     // 所有系列堆叠成一条带时的最大累计总量（堆叠面积图
     // / 堆叠折线图：系列按顺序累加，与 stackName 无关）。
     // 隐藏的系列（图例关闭）被跳过，因此隐藏一个系列
@@ -167,6 +214,21 @@ class Chart {
         return mx;
     }
 
+    // MaxStackAll 的索引窗口版：仅累计分类 j + i0。
+    static int MaxStackAllW(List<ChartSeries> series, int n, int i0) {
+        int mx = 0;
+        for (int i = 0; i < n; i = i + 1) {
+            int oi = i0 + i;
+            int sum = 0;
+            for (int s = 0; s < series.Count; s = s + 1) {
+                ChartSeries cs = series[s];
+                if (!cs.hidden && oi < cs.Count()) { sum = sum + cs.Value(oi); }
+            }
+            if (sum > mx) { mx = sum; }
+        }
+        return mx;
+    }
+
     static int MaxInt(List<int> vs) {
         int mx = 0;
         for (int i = 0; i < vs.Count; i = i + 1) { if (vs[i] > mx) { mx = vs[i]; } }
@@ -178,8 +240,8 @@ class Chart {
     // 面板背景 + 标题 + 图例色块。返回标题/图例带
     // 下方紧邻的 y，调用方可在其下布局绘图区。
     static int DrawPanel(App app, int x, int y, int w, int h, string title,
-                         List<ChartSeries> series) {
-        return Chart.DrawPanelI(app, x, y, w, h, title, series, 0);
+                         List<ChartSeries> series, bool showLegend) {
+        return Chart.DrawPanelI(app, x, y, w, h, title, series, 0, showLegend);
     }
 
     // 交互 id `wid` 下系列 `si` 的图例隐藏状态键。
@@ -227,29 +289,9 @@ class Chart {
         return i1;
     }
 
-    // 将系列数据窗口化为包含端点的索引范围 [i0,i1]，
-    // 保留所有逐系列字段（颜色、堆叠 id、轴绑定、条目名）。
-    static List<ChartSeries> Window(List<ChartSeries> series, int i0, int i1) {
-        List<ChartSeries> outp = new List<ChartSeries>();
-        for (int s = 0; s < series.Count; s = s + 1) {
-            ChartSeries src = series[s];
-            ChartSeries d = ChartSeries.Of(src.name, src.type, new List<int>());
-            d.axisIndex = src.axisIndex;
-            d.stack = src.stack;
-            d.color = src.color;
-            d.hidden = src.hidden;
-            d.smooth = src.smooth;
-            int i = i0;
-            while (i <= i1 && i < src.data.Count) {
-                ChartData cd = src.data[i];
-                d.data.Add(ChartData.Full(cd.val, cd.name, cd.color));
-                i = i + 1;
-            }
-            outp.Add(d);
-        }
-        return outp;
-    }
-
+    // 将标签窗口化为包含端点的索引范围 [i0,i1]（仅字符串
+    // 拷贝；渲染器对系列值也按同一 [i0,i1] 直接读原系列，
+    // 避免有损的系列克隆丢失 itemStyle/marks 等字段）。
     static List<string> WindowLabels(List<string> labels, int i0, int i1) {
         List<string> outp = new List<string>();
         int i = i0;
@@ -324,8 +366,10 @@ class Chart {
     // App 状态映射中），解析后的隐藏标志写入帧内系列
     // 快照，所有下游渲染器都会跳过它。隐藏的系列
     // 以变暗 + 删除线绘制，以便可以恢复显示。
+    // showLegend=false 时既绘制也不解析隐藏状态——
+    // 图例关闭时系列恒为可见，避免状态残留让图无声消失。
     static int DrawPanelI(App app, int x, int y, int w, int h, string title,
-                          List<ChartSeries> series, int wid) {
+                          List<ChartSeries> series, int wid, bool showLegend) {
         Canvas c = app.canvas;
         Theme t = app.theme;
         int pad = t.paddingMedium;
@@ -337,6 +381,7 @@ class Chart {
             c.DrawText(x + pad, top, title, t.textPrimary, t.fontSizeLarge);
         }
 
+        if (showLegend) {
         // 图例（右上角），每系列一个色块 + 名称，从右到左
         int lx = x + w - pad;
         int sw = app.Scale(12);
@@ -382,6 +427,7 @@ class Chart {
             series[si].hidden = hid;
             lx = rowLeft - app.Scale(14);
             si = si - 1;
+        }
         }
 
         return top + Canvas.FontHeight(t.fontSizeLarge) + app.Scale(6);

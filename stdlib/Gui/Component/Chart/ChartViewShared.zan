@@ -31,10 +31,12 @@ partial class ChartView {
         return top + Canvas.FontHeight(t.fontSizeLarge) + app.Scale(6);
     }
     // ---- 悬停十字准线 + 数值提示（笛卡尔图表） ----
+    // baseIdx 是 dataZoom 窗口起点：labels 已是窗口内子列表，
+    // 系列值按窗口内索引 baseIdx + idx 读取（无 zoom 时为 0）。
 
     static void CartesianTooltip(App app, ChartFrame f, List<string> labels,
                                  List<ChartSeries> series, int maxV,
-                                 int step, int half) {
+                                 int step, int half, int baseIdx) {
         Canvas c = app.canvas;
         Theme t = app.theme;
         int mx = app.mouseX;
@@ -54,11 +56,12 @@ partial class ChartView {
         // 提示卡片：类别标签 + 每个*可见*序列的值 + 色块。
         List<TooltipRow> rows = new List<TooltipRow>();
         rows.Add(TooltipRow.Of(0, labels[idx]));
+        int oi = baseIdx + idx;
         for (int si = 0; si < series.Count; si = si + 1) {
             ChartSeries s = series[si];
             if (!s.hidden) {
                 int v = 0;
-                if (idx < s.Count()) { v = s.Value(idx); }
+                if (oi < s.Count()) { v = s.Value(oi); }
                 rows.Add(TooltipRow.Of(s.color,
                     s.name + "  " + Convert.ToString(v)));
             }
@@ -110,6 +113,74 @@ partial class ChartView {
             ty = ty + lh;
         }
         app.RequestRedraw();
+    }
+
+    // 系列在窗口 [i0,i1]（含端点）内最大/最小值的下标；
+    // 窗口外或空数据返回 -1。markPoint 自动推导共用。
+    static int SeriesMaxIndex(ChartSeries s, int i0, int i1) {
+        int maxI = 0 - 1;
+        int maxV = 0 - 2147483647 - 1;
+        for (int j = i0; j <= i1 && j < s.Count(); j = j + 1) {
+            int v = s.Value(j);
+            if (v > maxV) { maxV = v; maxI = j; }
+        }
+        return maxI;
+    }
+    static int SeriesMinIndex(ChartSeries s, int i0, int i1) {
+        int minI = 0 - 1;
+        int minV = 2147483647;
+        for (int j = i0; j <= i1 && j < s.Count(); j = j + 1) {
+            int v = s.Value(j);
+            if (v < minV) { minV = v; minI = j; }
+        }
+        return minI;
+    }
+
+    // 系列 markPoint 标记：o.markPoint=true 时自动标出窗口
+    // [i0,i1] 内的最大/最小值；series.marks 的显式项也绘制
+    // （dataIndex 定位；kind=max/min 回退到自动推导的极值）。
+    // 柱状图与折线图共用。f 提供 YOf 映射。
+    static void DrawSeriesMarks(App app, ChartFrame f, ChartSeries s,
+                                int i0, int i1, int step, int half, ChartOption o) {
+        if (!o.markPoint && s.marks.Count < 1) { return; }
+        int maxI = ChartView.SeriesMaxIndex(s, i0, i1);
+        int minI = ChartView.SeriesMinIndex(s, i0, i1);
+        if (o.markPoint) {
+            if (maxI >= 0) { ChartView.MarkAt(app, f, s, maxI, maxI - i0, step, half, "max"); }
+            if (minI >= 0 && minI != maxI) { ChartView.MarkAt(app, f, s, minI, minI - i0, step, half, "min"); }
+        }
+        for (int mi = 0; mi < s.marks.Count; mi = mi + 1) {
+            ChartMarkPoint m = s.marks[mi];
+            int idx = m.dataIndex;
+            if (idx < 0) {
+                if (m.kind == "max") { idx = maxI; }
+                else if (m.kind == "min") { idx = minI; }
+                else { idx = 0 - 1; }
+            }
+            if (idx < i0 || idx > i1 || idx >= s.Count()) { continue; }
+            string lbl = m.label;
+            if (lbl.Length == 0) {
+                if (m.kind == "max") { lbl = "max"; }
+                else if (m.kind == "min") { lbl = "min"; }
+                else { lbl = Convert.ToString(s.Value(idx)); }
+            }
+            ChartView.MarkAt(app, f, s, idx, idx - i0, step, half, lbl);
+        }
+    }
+
+    // 在数据点（类别下标 idx，槽位 slot = idx - i0）上绘制单个
+    // 标记：系列色实心圆 + 白描边 + 上方小标签。
+    static void MarkAt(App app, ChartFrame f, ChartSeries s, int idx,
+                       int slot, int step, int half, string lbl) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int rad = app.Scale(4);
+        int lx = f.plotX + slot * step + half;
+        int ly = f.YOf(s.Value(idx), s.axisIndex);
+        c.FillCircle(lx, ly, rad, s.color);
+        ChartView.RingOutline(c, lx, ly, rad, 4294967295);
+        int lw = Canvas.MeasureText(lbl, t.fontSizeSmall);
+        c.DrawText(lx - lw / 2, ly - app.Scale(16), lbl, t.textSecondary, t.fontSizeSmall);
     }
 
     // 指针角度（度，0..360，从 +x 顺时针，与 FillSector 的

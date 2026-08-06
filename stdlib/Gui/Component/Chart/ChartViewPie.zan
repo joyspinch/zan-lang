@@ -4,9 +4,156 @@ using Gui;
 
 namespace Gui.Component.Chart;
 
+/// 饼图一个扇区（归一化后）：值、颜色、显示名、所属系列/数据项
+/// 索引、角度区间 [a0,a1]（度，Canvas 顺时针，0 在 12 点）与环索引。
+/// 环索引在 pieRings 模式下是可见 Pie 系列的顺序；否则恒为 0。
+class PieSlice {
+    int value;
+    int color;
+    string name;
+    int seriesIndex;
+    int dataIndex;
+    int a0;
+    int a1;
+    int ring;
+
+    static PieSlice Of(int value, int color, string name,
+                       int seriesIndex, int dataIndex, int a0, int a1, int ring) {
+        PieSlice s = new PieSlice();
+        s.value = value;
+        s.color = color;
+        s.name = name;
+        s.seriesIndex = seriesIndex;
+        s.dataIndex = dataIndex;
+        s.a0 = a0;
+        s.a1 = a1;
+        s.ring = ring;
+        return s;
+    }
+}
+
+/// 纯饼图布局：把可见 Pie 系列的 data 项归一化为扇区，供
+/// chart_pie_layout 测试直接断言几何。语义：
+///  - 每条可见 Pie series 的每个 ChartData 是一个扇区；
+///  - 隐藏扇区（data.hidden 或系列 hidden）不进 total，也不占角度；
+///  - pieRings=true 时每条可见系列 = 一独立环，各自计算 total
+///    （各自 360°）；否则所有可见系列的扇区合并进同一张饼；
+///  - 颜色解析：数据项色 > 单数据项系列的系列色 > 按扇区序调色板。
+/// 不触碰 App/Canvas —— (主题, 选项) 进，扇区几何出。
+class PieLayout {
+    List<PieSlice> slices;
+    int total;          // 非环模式：所有可见扇区值之和；环模式：各环之和
+    int ringCount;      // 环数（非环模式 = 1）
+    List<int> ringTotal; // 每环各自可见值之和（环模式角度分母）
+    List<int> ringInner; // 每环有效内径百分比（innerPct>0 ? innerPct : donutPct）
+
+    static PieLayout Of(Theme t, ChartOption o) {
+        PieLayout l = new PieLayout();
+        l.slices = new List<PieSlice>();
+        l.ringTotal = new List<int>();
+        l.ringInner = new List<int>();
+        l.total = 0;
+        l.ringCount = 0;
+
+        // 可见 Pie 系列（隐藏系列不参与）。
+        List<ChartSeries> pies = new List<ChartSeries>();
+        for (int i = 0; i < o.series.Count; i = i + 1) {
+            ChartSeries s = o.series[i];
+            if (!s.hidden && s.type == ChartType.Pie) { pies.Add(s); }
+        }
+        if (pies.Count < 1) { return l; }
+
+        if (o.pieRings) {
+            // 每条可见系列 = 一环，各自 total。
+            l.ringCount = pies.Count;
+            for (int r = 0; r < pies.Count; r = r + 1) {
+                ChartSeries s = pies[r];
+                int inner = s.innerPct;
+                if (inner <= 0) { inner = o.donutPct; }
+                if (inner < 0) { inner = 0; }
+                if (inner > 95) { inner = 95; }
+                l.ringInner.Add(inner);
+                int rt = 0;
+                for (int di = 0; di < s.Count(); di = di + 1) {
+                    if (!s.data[di].hidden) { rt = rt + s.Value(di); }
+                }
+                l.ringTotal.Add(rt);
+                l.total = l.total + rt;
+                if (rt < 1) { continue; }
+                int acc = 0;
+                for (int di2 = 0; di2 < s.Count(); di2 = di2 + 1) {
+                    ChartData d = s.data[di2];
+                    if (d.hidden) { continue; }
+                    int v = s.Value(di2);
+                    int a0 = acc * 360 / rt;
+                    int a1 = (acc + v) * 360 / rt;
+                    l.slices.Add(PieSlice.Of(v, PieLayout.SliceColor(t, s, di2, l.slices.Count),
+                        PieLayout.SliceName(s, di2), r, di2, a0, a1, r));
+                    acc = acc + v;
+                }
+            }
+            return l;
+        }
+
+        // 非环模式：合并所有可见系列的扇区，共享一个 total。
+        l.ringCount = 1;
+        int leadInner = 0;
+        if (pies[0].innerPct > 0) { leadInner = pies[0].innerPct; }
+        else { leadInner = o.donutPct; }
+        if (leadInner < 0) { leadInner = 0; }
+        if (leadInner > 95) { leadInner = 95; }
+        l.ringInner.Add(leadInner);
+        int total = 0;
+        for (int p = 0; p < pies.Count; p = p + 1) {
+            ChartSeries s = pies[p];
+            for (int di = 0; di < s.Count(); di = di + 1) {
+                if (!s.data[di].hidden) { total = total + s.Value(di); }
+            }
+        }
+        l.ringTotal.Add(total);
+        l.total = total;
+        if (total < 1) { return l; }
+        int acc2 = 0;
+        for (int p2 = 0; p2 < pies.Count; p2 = p2 + 1) {
+            ChartSeries s = pies[p2];
+            for (int di2 = 0; di2 < s.Count(); di2 = di2 + 1) {
+                ChartData d = s.data[di2];
+                if (d.hidden) { continue; }
+                int v = s.Value(di2);
+                int a0 = acc2 * 360 / total;
+                int a1 = (acc2 + v) * 360 / total;
+                l.slices.Add(PieSlice.Of(v, PieLayout.SliceColor(t, s, di2, l.slices.Count),
+                    PieLayout.SliceName(s, di2), p2, di2, a0, a1, 0));
+                acc2 = acc2 + v;
+            }
+        }
+        return l;
+    }
+
+    /// 扇区颜色：数据项色 > 单数据项系列的系列色 > 按扇区序调色板。
+    /// 多数据项系列用逐扇区调色板（ECharts 饼图按数据项着色），
+    /// 单数据项系列沿用系列色（保持旧版单系列单扇区的外观）。
+    static int SliceColor(Theme t, ChartSeries s, int di, int sliceIndex) {
+        if (di >= 0 && di < s.data.Count && s.data[di].color != 0) {
+            return s.data[di].color;
+        }
+        if (s.data.Count <= 1 && s.color != 0) { return s.color; }
+        return Chart.Palette(t, sliceIndex);
+    }
+
+    /// 扇区名：数据项名优先，其次系列名，最后回退到序号。
+    static string SliceName(ChartSeries s, int di) {
+        if (di >= 0 && di < s.data.Count && s.data[di].name.Length > 0) {
+            return s.data[di].name;
+        }
+        if (s.name.Length > 0) { return s.name; }
+        return "Item " + Convert.ToString(di + 1);
+    }
+}
+
 partial class ChartView {
     static void DrawPie(App app, int x, int y, int w, int h,
-                        ChartOption o, int innerPct, bool sliceLabels, int g) {
+                        ChartOption o, bool sliceLabels, int g) {
         Canvas c = app.canvas;
         Theme t = app.theme;
         int pad = t.paddingMedium;
@@ -22,16 +169,15 @@ partial class ChartView {
         // 渐入动画是扫到 sweepMax 度的径向扫掠。这避免了
         // 整数除法把早期帧的小值截断为 0（此前
         // 会导致整张图空白）。
-        int total = 0;
-        for (int i = 0; i < o.series.Count; i = i + 1) {
-            ChartSeries s = o.series[i];
-            int v = 0;
-            if (s.Count() > 0) { v = s.Value(0); }
-            total = total + v;
-        }
-        if (total <= 0) { return; }
+        PieLayout layout = PieLayout.Of(t, o);
+        List<PieSlice> slices = layout.slices;
+        int total = layout.total;
+        if (slices.Count < 1 || total <= 0) { return; }
+        int ringCount = layout.ringCount;
+        if (ringCount < 1) { ringCount = 1; }
 
-        int legendW = app.Scale(120);
+        int legendW = 0;
+        if (o.showLegend) { legendW = app.Scale(120); }
         int areaW = w - pad * 2 - legendW;
         int areaH = (y + h - pad) - top;
         int rOuter = areaW / 2;
@@ -39,38 +185,66 @@ partial class ChartView {
         if (rOuter < app.Scale(10)) { rOuter = app.Scale(10); }
         int cx = x + pad + areaW / 2;
         int cy = top + areaH / 2;
-        int rInner = rOuter * innerPct / 100;
         int sweepMax = 360 * g / 1000;
 
-        int acc = 0;
-        for (int k = 0; k < o.series.Count; k = k + 1) {
-            ChartSeries s = o.series[k];
-            int v = 0;
-            if (s.Count() > 0) { v = s.Value(0); }
-            int a0 = acc * 360 / total;
-            int a1 = (acc + v) * 360 / total;
+        // 环带几何：pieRings 时每条可见系列一条等宽环带，
+        // 最外环用系列 innerPct（缺省 donutPct）开孔；
+        // 单环时内半径由布局给出。环带从外向内等分半径。
+        int band = 0;
+        if (ringCount > 1) { band = rOuter / ringCount; }
+        if (band < app.Scale(2)) { band = app.Scale(2); }
+
+        for (int k = 0; k < slices.Count; k = k + 1) {
+            PieSlice sl = slices[k];
+            int ring = sl.ring;
+            if (ring >= ringCount) { ring = ringCount - 1; }
+            if (ring < 0) { ring = 0; }
+            int ri = rOuter - (ring + 1) * band;
+            if (ringCount > 1 && ring == ringCount - 1 && layout.ringInner.Count > ring
+                && layout.ringInner[ring] > 0) {
+                // 最内环仍按配置开孔，让中心不糊成实心。
+                ri = rOuter * layout.ringInner[ring] / 100;
+            }
+            int ro = rOuter - ring * band;
+            if (ringCount == 1) {
+                ri = rOuter * layout.ringInner[0] / 100;
+                ro = rOuter;
+            }
+            if (ri < 0) { ri = 0; }
+            if (ri >= ro) { ri = ro - 1; }
+            if (ri < 0) { ri = 0; }
+            int a0 = sl.a0;
+            int a1 = sl.a1;
             int aEnd = a1;
             if (aEnd > sweepMax) { aEnd = sweepMax; }
             if (aEnd > a0) {
-                c.FillSector(cx, cy, rInner, rOuter, a0, aEnd, s.color);
+                c.FillSector(cx, cy, ri, ro, a0, aEnd, sl.color);
             }
-            acc = acc + v;
         }
 
-        // 可选的分片百分比标签，位于扇区中角处。
+        // 可选的分片百分比标签，位于扇区中角处。百分比按
+        // 该片所属环的 total 计算（环模式各环独立）。
         if (sliceLabels) {
-            int rLbl = (rInner + rOuter) / 2;
-            if (rInner < app.Scale(4)) { rLbl = rOuter * 62 / 100; }
-            int acc2 = 0;
-            for (int p = 0; p < o.series.Count; p = p + 1) {
-                ChartSeries s = o.series[p];
-                int v2 = 0;
-                if (s.Count() > 0) { v2 = s.Value(0); }
-                int a0 = acc2 * 360 / total;
-                int a1 = (acc2 + v2) * 360 / total;
-                int pct = v2 * 100 / total;
-                if (a1 <= sweepMax && pct >= 4) {
-                    int mid = (a0 + a1) / 2;
+            for (int p = 0; p < slices.Count; p = p + 1) {
+                PieSlice sl = slices[p];
+                int ring = sl.ring;
+                if (ring >= ringCount) { ring = ringCount - 1; }
+                if (ring < 0) { ring = 0; }
+                int ringTot = total;
+                if (ring < layout.ringTotal.Count && layout.ringTotal[ring] > 0) {
+                    ringTot = layout.ringTotal[ring];
+                }
+                int pct = sl.value * 100 / ringTot;
+                if (sl.a1 <= sweepMax && pct >= 4) {
+                    int rLbl = 0;
+                    if (ringCount > 1) {
+                        rLbl = rOuter - ring * band - band / 2;
+                    } else {
+                        int ri0 = rOuter * layout.ringInner[0] / 100;
+                        rLbl = (ri0 + rOuter) / 2;
+                        if (ri0 < app.Scale(4)) { rLbl = rOuter * 62 / 100; }
+                    }
+                    int mid = (sl.a0 + sl.a1) / 2;
                     int lxp = cx + ChartView.CosDeg(mid) * rLbl / 1000;
                     int lyp = cy + ChartView.SinDeg(mid) * rLbl / 1000;
                     string pl = Convert.ToString(pct) + "%";
@@ -78,32 +252,36 @@ partial class ChartView {
                     c.DrawText(lxp - pw / 2, Canvas.CenterTextYAt(lyp, t.fontSizeSmall),
                         pl, 4294967295, t.fontSizeSmall);
                 }
-                acc2 = acc2 + v2;
             }
         }
 
         // 环形图中心标注：当前累计值，让中心空洞有意义。
-        if (rInner > app.Scale(18)) {
+        int centerInner = rOuter * layout.ringInner[0] / 100;
+        if (ringCount == 1 && centerInner > app.Scale(18)) {
             string tot = Convert.ToString(total);
             int tw = Canvas.MeasureText(tot, t.fontSizeLarge);
             c.DrawText(cx - tw / 2, Canvas.CenterTextYAt(cy, t.fontSizeLarge),
                 tot, t.textPrimary, t.fontSizeLarge);
         }
 
-        // 图例：色块 + 名称 + 百分比（始终绘制）。
-        int lx = x + w - pad - legendW;
-        int ly = top;
-        int sw = app.Scale(12);
-        int lh = Canvas.FontHeight(t.fontSizeSmall) + app.Scale(6);
-        for (int j = 0; j < o.series.Count; j = j + 1) {
-            ChartSeries s = o.series[j];
-            int v = 0;
-            if (s.Count() > 0) { v = s.Value(0); }
-            c.FillRoundRect(lx, ly + app.Scale(2), sw, sw, t.borderRadiusSmall, s.color);
-            int pct = v * 100 / total;
-            string lbl = s.name + "  " + Convert.ToString(pct) + "%";
-            c.DrawText(lx + sw + app.Scale(6), ly + app.Scale(1), lbl, t.textSecondary, t.fontSizeSmall);
-            ly = ly + lh;
+        // 图例：色块 + 名称 + 百分比（每可见扇区一行；始终绘制）。
+        if (o.showLegend) {
+            int lx = x + w - pad - legendW;
+            int ly = top;
+            int sw = app.Scale(12);
+            int lh = Canvas.FontHeight(t.fontSizeSmall) + app.Scale(6);
+            for (int j = 0; j < slices.Count; j = j + 1) {
+                PieSlice sl = slices[j];
+                int ringTot = total;
+                if (sl.ring < layout.ringTotal.Count && layout.ringTotal[sl.ring] > 0) {
+                    ringTot = layout.ringTotal[sl.ring];
+                }
+                c.FillRoundRect(lx, ly + app.Scale(2), sw, sw, t.borderRadiusSmall, sl.color);
+                int pct = sl.value * 100 / ringTot;
+                string lbl = sl.name + "  " + Convert.ToString(pct) + "%";
+                c.DrawText(lx + sw + app.Scale(6), ly + app.Scale(1), lbl, t.textSecondary, t.fontSizeSmall);
+                ly = ly + lh;
+            }
         }
 
         if (o.showTooltip) {
@@ -112,26 +290,36 @@ partial class ChartView {
             int ddx = mx - cx;
             int ddy = my - cy;
             int dist = ChartView.ISqrt(ddx * ddx + ddy * ddy);
-            if (dist >= rInner && dist <= rOuter) {
-                int ang = ChartView.AngleOf(ddx, ddy);
-                int acc3 = 0;
-                for (int k3 = 0; k3 < o.series.Count; k3 = k3 + 1) {
-                    ChartSeries s = o.series[k3];
-                    int v3 = 0;
-                    if (s.Count() > 0) { v3 = s.Value(0); }
-                    int a0 = acc3 * 360 / total;
-                    int a1 = (acc3 + v3) * 360 / total;
-                    if (ang >= a0 && ang < a1) {
-                        int pct3 = v3 * 100 / total;
-                        List<TooltipRow> rows = new List<TooltipRow>{
-                            TooltipRow.Of(0, o.title),
-                            TooltipRow.Of(s.color,
-                                s.name + "  " + Convert.ToString(v3)
-                                + "  (" + Convert.ToString(pct3) + "%)") };
-                        ChartView.TooltipCard(app, mx, my, x + w, rows);
-                        break;
+            int ang = ChartView.AngleOf(ddx, ddy);
+            for (int k3 = slices.Count - 1; k3 >= 0; k3 = k3 - 1) {
+                PieSlice sl = slices[k3];
+                int ring = sl.ring;
+                if (ring >= ringCount) { ring = ringCount - 1; }
+                if (ring < 0) { ring = 0; }
+                int ri = rOuter - (ring + 1) * band;
+                if (ringCount > 1 && ring == ringCount - 1 && layout.ringInner.Count > ring
+                    && layout.ringInner[ring] > 0) {
+                    ri = rOuter * layout.ringInner[ring] / 100;
+                }
+                int ro = rOuter - ring * band;
+                if (ringCount == 1) {
+                    ri = rOuter * layout.ringInner[0] / 100;
+                    ro = rOuter;
+                }
+                if (ri < 0) { ri = 0; }
+                if (dist >= ri && dist <= ro && ang >= sl.a0 && ang < sl.a1) {
+                    int ringTot = total;
+                    if (ring < layout.ringTotal.Count && layout.ringTotal[ring] > 0) {
+                        ringTot = layout.ringTotal[ring];
                     }
-                    acc3 = acc3 + v3;
+                    int pct3 = sl.value * 100 / ringTot;
+                    List<TooltipRow> rows = new List<TooltipRow>{
+                        TooltipRow.Of(0, o.title),
+                        TooltipRow.Of(sl.color,
+                            sl.name + "  " + Convert.ToString(sl.value)
+                            + "  (" + Convert.ToString(pct3) + "%)") };
+                    ChartView.TooltipCard(app, mx, my, x + w, rows);
+                    break;
                 }
             }
         }

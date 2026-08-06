@@ -22,28 +22,31 @@ partial class ChartView {
             for (int hsi = 0; hsi < series.Count; hsi = hsi + 1) {
                 if (series[hsi].stackName.Length > 0) { hstack = true; }
             }
-            ChartView.HBarCore(app, x, y, w, h, o.title, labels, ChartView.Scaled(series, g), hstack);
+            ChartView.HBarCore(app, x, y, w, h, o.title, labels, ChartView.Scaled(series, g), hstack, o.showLegend);
             return;
         }
 
-        // dataZoom：裁剪类别窗口并预留底部条带。
+        // dataZoom：锁定窗口索引 [i0,i1]（含端点）并预留底部
+        // 滑块条带。渲染循环直接读原系列（数据索引 = i0+i），
+        // 不做有损的系列克隆；标签按窗口取子列表。
         int zoomH = 0;
         int fullN = labels.Count;
+        int i0 = 0;
+        int i1 = fullN - 1;
         if (o.zoom && o.iwid != 0 && fullN > 1) {
-            int wi0 = Chart.ZoomI0(app, o, o.iwid, fullN);
-            int wi1 = Chart.ZoomI1(app, o, o.iwid, fullN);
-            series = Chart.Window(series, wi0, wi1);
-            labels = Chart.WindowLabels(labels, wi0, wi1);
+            i0 = Chart.ZoomI0(app, o, o.iwid, fullN);
+            i1 = Chart.ZoomI1(app, o, o.iwid, fullN);
             zoomH = app.Scale(24);
         }
+        List<string> winLabels = Chart.WindowLabels(labels, i0, i1);
 
-        int n = labels.Count;
+        int n = winLabels.Count;
         int ns = series.Count;
 
         int leftData = 0 - 1;
-        if (stacked) { leftData = Chart.MaxStack(series, n); }
-        int plotTop = Chart.DrawPanelI(app, x, y, w, h, o.title, series, o.iwid);
-        ChartFrame f = Chart.BuildAxesR(app, x, y, w, h - zoomH, plotTop, labels, o, series, leftData, 0 - 1);
+        if (stacked) { leftData = Chart.MaxStackW(series, n, i0); }
+        int plotTop = Chart.DrawPanelI(app, x, y, w, h, o.title, series, o.iwid, o.showLegend);
+        ChartFrame f = Chart.BuildAxesR(app, x, y, w, h - zoomH, plotTop, winLabels, o, series, leftData, 0 - 1);
         if (zoomH > 0) {
             Chart.DrawZoomBar(app, f.plotX, f.plotW, y + h - app.Scale(18),
                 app.Scale(12), o.iwid, fullN);
@@ -96,6 +99,7 @@ partial class ChartView {
                 }
             }
             for (int i = 0; i < n; i = i + 1) {
+                int oi = i0 + i;
                 for (int a2 = 0; a2 < ng; a2 = a2 + 1) { accs[a2] = 0; }
                 for (int si = 0; si < ns; si = si + 1) {
                     ChartSeries sc = series[si];
@@ -103,7 +107,7 @@ partial class ChartView {
                         int gi = ChartView.GroupIndex(grp, sc.stackName);
                         if (gi < 0) { gi = 0; }
                         int v = 0;
-                        if (i < sc.Count()) { v = sc.Value(i); }
+                        if (oi < sc.Count()) { v = sc.Value(oi); }
                         int bx = f.plotX + i * step + groupX0 + gi * barW;
                         int yTop = f.YOf((accs[gi] + v) * g / 1000, 0);
                         int yBot = f.YOf(accs[gi] * g / 1000, 0);
@@ -125,9 +129,11 @@ partial class ChartView {
                 if (!s.hidden && ChartView.IsLineFamily(s.type)) {
                     List<int> lpx = new List<int>();
                     List<int> lpy = new List<int>();
-                    for (int oi = 0; oi < n && oi < s.Count(); oi = oi + 1) {
-                        lpx.Add(f.plotX + oi * step + step / 2);
-                        lpy.Add(f.YOf(s.Value(oi) * g / 1000, s.axisIndex));
+                    for (int oi2 = 0; oi2 < n; oi2 = oi2 + 1) {
+                        int oi3 = i0 + oi2;
+                        if (oi3 >= s.Count()) { continue; }
+                        lpx.Add(f.plotX + oi2 * step + step / 2);
+                        lpy.Add(f.YOf(s.Value(oi3) * g / 1000, s.axisIndex));
                     }
                     bool smooth = o.smooth;
                     if (s.smooth == 1) { smooth = true; } else if (s.smooth == 0) { smooth = false; }
@@ -152,17 +158,21 @@ partial class ChartView {
                         // 在组中心上方以折线绘制
                         List<int> lpx = new List<int>();
                         List<int> lpy = new List<int>();
-                        for (int li = 0; li < n && li < s.Count(); li = li + 1) {
+                        for (int li = 0; li < n; li = li + 1) {
+                            int oiL = i0 + li;
+                            if (oiL >= s.Count()) { continue; }
                             lpx.Add(f.plotX + li * step + step / 2);
-                            lpy.Add(f.YOf(s.Value(li) * g / 1000, ax));
+                            lpy.Add(f.YOf(s.Value(oiL) * g / 1000, ax));
                         }
                         bool smooth = o.smooth;
                         if (s.smooth == 1) { smooth = true; } else if (s.smooth == 0) { smooth = false; }
                         ChartView.PolyLine(c, lpx, lpy, smooth, s.color, app.Scale(2));
                         for (int di = 0; di < lpx.Count; di = di + 1) { c.FillCircle(lpx[di], lpy[di], app.Scale(3), s.color); }
                     } else if (s.type == ChartType.Scatter) {
-                        for (int sp = 0; sp < n && sp < s.Count(); sp = sp + 1) {
-                            int v = s.Value(sp) * g / 1000;
+                        for (int sp = 0; sp < n; sp = sp + 1) {
+                            int oiS = i0 + sp;
+                            if (oiS >= s.Count()) { continue; }
+                            int v = s.Value(oiS) * g / 1000;
                             int px2 = f.plotX + sp * step + step / 2;
                             int py2 = f.YOf(v, ax);
                             c.FillCircle(px2, py2, app.Scale(3), s.color);
@@ -170,12 +180,13 @@ partial class ChartView {
                     } else {
                         int zeroY = f.YOf(0, ax);
                         for (int i = 0; i < n; i = i + 1) {
+                            int oi = i0 + i;
                             int v = 0;
-                            if (i < s.Count()) { v = s.Value(i); }
+                            if (oi < s.Count()) { v = s.Value(oi); }
                             // 逐项颜色（ChartData.Colored）优先于
                             // 序列颜色 —— ECharts 的三级颜色控制。
                             int col = s.color;
-                            if (i < s.data.Count && s.data[i].color != 0) { col = s.data[i].color; }
+                            if (oi < s.data.Count && s.data[oi].color != 0) { col = s.data[oi].color; }
                             int by = f.YOf(v * g / 1000, ax);
                             int bx = f.plotX + i * step + groupX0 + barSlot * (barW + gap);
                             if (v < 0) {
@@ -208,8 +219,15 @@ partial class ChartView {
         }
 
         Chart.DrawMarkLine(app, f, o);
+        // markPoint：自动 max/min + 显式 marks（仅柱状族）。
+        for (int msi = 0; msi < ns; msi = msi + 1) {
+            ChartSeries ms = series[msi];
+            if (!ms.hidden && !ChartView.IsLineFamily(ms.type)) {
+                ChartView.DrawSeriesMarks(app, f, ms, i0, i1, step, step / 2, o);
+            }
+        }
         if (o.showTooltip) {
-            ChartView.CartesianTooltip(app, f, labels, series, maxV, step, step / 2);
+            ChartView.CartesianTooltip(app, f, winLabels, series, maxV, step, step / 2, i0);
         }
     }
 
@@ -254,7 +272,8 @@ partial class ChartView {
     /// 共享 stackName 的序列每组堆成一条水平色带，
     /// （对应 ECharts stacked bar4），各行上下排列各组。
     static void HBarCore(App app, int x, int y, int w, int h, string title,
-                         List<string> labels, List<ChartSeries> series, bool stacked) {
+                         List<string> labels, List<ChartSeries> series, bool stacked,
+                         bool showLegend) {
         Canvas c = app.canvas;
         Theme t = app.theme;
         c.PushClip(x, y, w, h);
@@ -264,7 +283,7 @@ partial class ChartView {
         int ns = series.Count;
         int maxV = Chart.NiceMax(Chart.MaxOf(series));
         if (stacked) { maxV = Chart.NiceMax(Chart.MaxStackAll(series, n)); }
-        int plotTop = Chart.DrawPanel(app, x, y, w, h, title, series);
+        int plotTop = Chart.DrawPanel(app, x, y, w, h, title, series, showLegend);
 
         if (n < 1 || ns < 1) { c.PopClip(); return; }
 
@@ -378,25 +397,39 @@ partial class ChartView {
         if (series.Count < 1) { return; }
         ChartSeries s = series[0];
         List<string> labels = o.XCategories();
-        int n = labels.Count;
+        int fullN = labels.Count;
+        if (fullN < 1) { return; }
+
+        // dataZoom：窗口索引 [i0,i1]（含端点）。累计量在整个
+        // 数据上计算后再切片，使窗口内的柱条延续窗口前的
+        // 累计值，而不是从 0 重启。
+        int zoomH = 0;
+        int i0 = 0;
+        int i1 = fullN - 1;
+        if (o.zoom && o.iwid != 0 && fullN > 1) {
+            i0 = Chart.ZoomI0(app, o, o.iwid, fullN);
+            i1 = Chart.ZoomI1(app, o, o.iwid, fullN);
+            zoomH = app.Scale(24);
+        }
+        List<string> winLabels = Chart.WindowLabels(labels, i0, i1);
+        int n = winLabels.Count;
         if (n < 1) { return; }
 
-        List<int> cum = new List<int>();
+        List<int> cumAll = new List<int>();
         int acc = 0;
-        int i = 0;
-        for (; i < n; i = i + 1) {
+        for (int ii = 0; ii < fullN; ii = ii + 1) {
             int v = 0;
-            if (i < s.Count()) { v = s.Value(i); }
-            if (i < s.data.Count && s.data[i].name == "total") { cum.Add(acc); }
-            else { acc = acc + v; cum.Add(acc); }
+            if (ii < s.Count()) { v = s.Value(ii); }
+            if (ii < s.data.Count && s.data[ii].name == "total") { cumAll.Add(acc); }
+            else { acc = acc + v; cumAll.Add(acc); }
         }
         int maxC = acc;
         int minC = 0;
-        i = 0;
-        while (i < n) {
-            if (cum[i] > maxC) { maxC = cum[i]; }
-            if (cum[i] < minC) { minC = cum[i]; }
-            i = i + 1;
+        int fi = 0;
+        while (fi < fullN) {
+            if (cumAll[fi] > maxC) { maxC = cumAll[fi]; }
+            if (cumAll[fi] < minC) { minC = cumAll[fi]; }
+            fi = fi + 1;
         }
         if (maxC < 1 && minC >= 0) { maxC = 1; }
 
@@ -404,8 +437,12 @@ partial class ChartView {
         if (o.yAxes.Count == 0 && minC < 0) {
             o.yAxes.Add(ChartAxis.ValueRange(minC, Chart.NiceMax(maxC)));
         }
-        int plotTop = Chart.DrawPanelI(app, x, y, w, h, o.title, series, o.iwid);
-        ChartFrame f = Chart.BuildAxesR(app, x, y, w, h, plotTop, labels, o, series, maxC, 0 - 1);
+        int plotTop = Chart.DrawPanelI(app, x, y, w, h, o.title, series, o.iwid, o.showLegend);
+        ChartFrame f = Chart.BuildAxesR(app, x, y, w, h - zoomH, plotTop, winLabels, o, series, maxC, 0 - 1);
+        if (zoomH > 0) {
+            Chart.DrawZoomBar(app, f.plotX, f.plotW, y + h - app.Scale(18),
+                app.Scale(12), o.iwid, fullN);
+        }
         int step = f.plotW / n;
         if (step < 1) { step = 1; }
         int barW = step * 5 / 10;
@@ -415,10 +452,12 @@ partial class ChartView {
         if (!o.rounded) { rad = app.Scale(1); }
 
         int prev = 0;
+        if (i0 > 0) { prev = cumAll[i0 - 1]; }
         for (int ci = 0; ci < n; ci = ci + 1) {
+            int oi = i0 + ci;
             int v = 0;
-            if (ci < s.Count()) { v = s.Value(ci); }
-            bool isTotal = (ci < s.data.Count && s.data[ci].name == "total");
+            if (oi < s.Count()) { v = s.Value(oi); }
+            bool isTotal = (oi < s.data.Count && s.data[oi].name == "total");
             int topV = prev;
             int botV = prev;
             if (isTotal) { topV = acc; botV = 0; }
@@ -460,10 +499,11 @@ partial class ChartView {
                 int tIdx = (mx - f.plotX) / step;
                 if (tIdx < 0) { tIdx = 0; }
                 if (tIdx > n - 1) { tIdx = n - 1; }
+                int oiT = i0 + tIdx;
                 int tv = 0;
-                if (tIdx < s.Count()) { tv = s.Value(tIdx); }
-                bool tIsTotal = (tIdx < s.data.Count && s.data[tIdx].name == "total");
-                string nm = labels[tIdx];
+                if (oiT < s.Count()) { tv = s.Value(oiT); }
+                bool tIsTotal = (oiT < s.data.Count && s.data[oiT].name == "total");
+                string nm = winLabels[tIdx];
                 if (nm.Length == 0) { nm = "Step " + Convert.ToString(tIdx + 1); }
                 string vtxt = Convert.ToString(tv);
                 if (tv >= 0) { vtxt = "+" + vtxt; }
