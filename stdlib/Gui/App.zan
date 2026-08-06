@@ -40,6 +40,12 @@ class App {
     /// 界面可以把它当状态显示（“本次运行有 N 个错误”）。
     int frameErrors;
     string lastFrameError;
+    // 注册的帧绘制体（SetFrameBody）。窗口过程在系统模态
+    // 尺寸调整循环里用它就地画帧，见 PaintFromWndProc。
+    FrameBody frameBody;
+    // 最后一个注册了帧体的 App。窗口过程回调是普通函数
+    // 指针，拿不到实例，因此在这里存一份。
+    static App frameApp;
     int frameCount;
     int mouseX;
     int mouseY;
@@ -309,6 +315,7 @@ class App {
         this.hitTester = new HitTester();
         this.isRunning = true;
         this.needsRedraw = true;
+        this.frameBody = null;
         this.frameErrors = 0;
         this.lastFrameError = "";
         this.frameCount = 0;
@@ -1383,12 +1390,54 @@ class App {
         this.RunLoop(() => { this.RenderChrome(title); });
     }
 
+    /// <summary>让渲染表面跟上真实的窗口大小（并把滚动限制到
+    /// 新视口）。由 ProcessEvent 每次事件调用，也由窗口过程
+    /// 驱动的重绘调用。</summary>
+    void SyncSurface() {
+        int curW = window.ClientWidth();
+        int curH = window.ClientHeight();
+        if (curW <= 0 || curH <= 0) { return; }
+        if (curW == canvas.Width() && curH == canvas.Height()) { return; }
+        canvas.Destroy();
+        canvas = new Canvas(curW, curH);
+        // 将滚动限制到新视口，而非跳到顶部——调整大小
+        // 不应跳变用户的滚动位置。
+        int viewH = curH - titlebarH;
+        int maxScroll = contentHeight - viewH;
+        if (maxScroll < 0) { maxScroll = 0; }
+        if (scrollY > maxScroll) { scrollY = maxScroll; }
+        if (scrollY < 0) { scrollY = 0; }
+        needsRedraw = true;
+    }
+
+    /// <summary>注册每帧的绘制内容，供框架在应用循环之外
+    /// 也能画帧：拖动窗口边框会进入系统模态尺寸调整循环，
+    /// 它在松手前不会回到应用的循环，没有帧体时表面就停在
+    /// 旧尺寸上，新露出的一条一直空白。自己写循环的应用在
+    /// Show() 之后注册一次，循环体照旧。RunLoop 会自动注册。
+    /// </summary>
+    void SetFrameBody(FrameBody body) {
+        frameBody = body;
+        App.frameApp = this;
+        Window.SetSizePaint(() => { App.PaintFromWndProc(); });
+    }
+
+    /// <summary>从窗口过程就地画一帧（先让表面跟上新的窗口
+    /// 尺寸）。没有注册帧体时为空操作。</summary>
+    static void PaintFromWndProc() {
+        App a = App.frameApp;
+        if (a == null || a.frameBody == null) { return; }
+        a.SyncSurface();
+        a.SafeFrame(a.frameBody);
+    }
+
     /// <summary>受保护的标准事件循环：每一轮的事件分发与
     /// 绘制都包在异常保护里，一帧里抛出的异常只丢掉这一帧（并记入
     /// UiErrorLog），而不是结束进程。<paramref name="body"/> 只负责画
     /// 内容：BeginFrame/PresentFrame 由循环完成。</summary>
     void RunLoop(FrameBody body) {
         Show();
+        if (frameBody == null) { this.SetFrameBody(body); }
         while (isRunning) {
             if (!this.PumpSafe()) { break; }
             if (!needsRedraw) { continue; }
@@ -2076,22 +2125,7 @@ class App {
         // 持久的窗口尺寸为准，而非一次性的 kind==7 事件。
         // 这保证 Present() 1:1 拷贝（绝不拉伸/模糊），且布局
         // 和命中测试与鼠标使用相同的坐标系。
-        int curW = window.ClientWidth();
-        int curH = window.ClientHeight();
-        if (curW > 0 && curH > 0) {
-            if (curW != canvas.Width() || curH != canvas.Height()) {
-                canvas.Destroy();
-                canvas = new Canvas(curW, curH);
-                // 将滚动限制到新视口，而非跳到
-                // 顶部——调整大小不应跳变用户的滚动位置。
-                int viewH = curH - titlebarH;
-                int maxScroll = contentHeight - viewH;
-                if (maxScroll < 0) { maxScroll = 0; }
-                if (scrollY > maxScroll) { scrollY = maxScroll; }
-                if (scrollY < 0) { scrollY = 0; }
-                needsRedraw = true;
-            }
-        }
+        this.SyncSurface();
 
         if (kind == 1) {
             mouseX = window.EventX();
