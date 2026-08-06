@@ -108,20 +108,30 @@ class KnownFolders {
     }
 
     /// 为当前进程（及其子进程）设置环境变量。
-    /// Windows 下空值表示删除该变量。
+    /// 空值表示删除该变量（Windows 的 SetEnvironmentVariableW
+    /// 对空串指针是设成空串，真正删除必须传 NULL；POSIX
+    /// 用 unsetenv，两平台行为一致）。
     static void SetEnv(string name, string val) {
         #if WINDOWS
         nint wname = Wide.Of(name);
-        nint wvalue = Wide.Of(val);
         nint fn = Interop.Entry("kernel32.dll", "SetEnvironmentVariableW");
         if (fn != 0) {
             SetEnvironmentVariableWFn call = (SetEnvironmentVariableWFn)fn;
-            call(wname, wvalue);
+            if (val == "") {
+                call(wname, 0);   // NULL 删除变量
+            } else {
+                nint wvalue = Wide.Of(val);
+                call(wname, wvalue);
+                Wide.Free(wvalue);
+            }
         }
-        Wide.Free(wvalue);
         Wide.Free(wname);
         #else
-        KnownFolders.PosixSetenv(name, val);
+        if (val == "") {
+            KnownFolders.PosixUnsetenv(name);
+        } else {
+            KnownFolders.PosixSetenv(name, val, 1);
+        }
         #endif
     }
 
@@ -199,8 +209,14 @@ class KnownFolders {
     }
 
     #if !WINDOWS
+    // 真实签名是 int setenv(const char*, const char*, int overwrite)：
+    // 缺第三个参数时 x86-64 SysV 的 edx 是调用点残留的垃圾值，
+    // overwrite 随机 → 有时覆盖、有时不覆盖，行为不可复现。
     [DllImport("crt", EntryPoint = "setenv")]
-    static extern int PosixSetenv(string name, string value);
+    static extern int PosixSetenv(string name, string value, int overwrite);
+
+    [DllImport("crt", EntryPoint = "unsetenv")]
+    static extern int PosixUnsetenv(string name);
     #endif
 }
 

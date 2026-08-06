@@ -18,13 +18,36 @@ class Prog {
         string appdata = KnownFolders.AppData();
         if (appdata == "") { bad = bad + 1; }
         if (!Directory.Exists(appdata)) { bad = bad + 1; }
-        // Env round-trip: set a unique var, read it back, then clear.
+        // Env round-trip: set a unique var, read it back, overwrite it,
+        // then delete it.
         string key = "ZAN_TEST_ENV_" + Convert.ToString(ProcessList.SelfPid());
         KnownFolders.SetEnv(key, "hello-环境");
         string got = KnownFolders.GetEnv(key);
         if (got != "hello-环境") { bad = bad + 1; }
+        // setenv's overwrite flag: setting again must replace, not ignore.
+        KnownFolders.SetEnv(key, "second");
+        if (KnownFolders.GetEnv(key) != "second") { bad = bad + 1; }
+        // Empty value must DELETE the variable, not set it to "" -- the two
+        // are indistinguishable through GetEnv (both read ""), so probe the
+        // C layer directly: Windows GetEnvironmentVariableW returns 0 with
+        // ERROR_ENVVAR_NOT_FOUND (203); POSIX getenv returns null.
         KnownFolders.SetEnv(key, "");
-        if (KnownFolders.GetEnv(key) != "") { bad = bad + 1; }
+        #if WINDOWS
+        nint wname = Wide.Of(key);
+        GetEnvironmentVariableWFn gecall =
+            (GetEnvironmentVariableWFn)Interop.Entry("kernel32.dll", "GetEnvironmentVariableW");
+        nint buf = NativeMemory.Alloc(4);
+        new Span<short>(buf, 1)[0] = 0;
+        int units = gecall(wname, buf, 2);
+        // Read GetLastError immediately -- it is thread-local and any FFI
+        // call (even a successful one) may clobber it.
+        int lerr = Privileges.WinGetLastError();
+        if (units != 0 || lerr != 203) { bad = bad + 1; }
+        NativeMemory.Free(buf);
+        Wide.Free(wname);
+        #else
+        if (Interop.getenv(key) != null) { bad = bad + 1; }
+        #endif
         // Expand: known token expands, unknown token stays literal.
         #if WINDOWS
         string homeToken = "%USERPROFILE%";
