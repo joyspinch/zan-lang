@@ -162,9 +162,17 @@ static void check_generic_constraints(zan_checker_t *c, zan_type_t *t,
          * instantiated with a real type. */
         if (arg && arg->kind == TYPE_TYPE_PARAM) continue;
         for (int k = 0; k < wc->where_clause.constraints.count; k++) {
-            zan_type_t *cons = zan_binder_resolve_type(
-                c->binder, wc->where_clause.constraints.items[k]);
-            if (!cons || cons->kind == TYPE_ERROR) continue;
+            zan_ast_node_t *cons_ref = wc->where_clause.constraints.items[k];
+            zan_type_t *cons = zan_binder_resolve_type(c->binder, cons_ref);
+            if (!cons || cons->kind == TYPE_ERROR) {
+                zan_diag_emit(c->diag, DIAG_ERROR, loc,
+                    "unknown constraint '%.*s' in 'where %.*s : ...' for '%s'",
+                    cons_ref->type_ref.name.len, cons_ref->type_ref.name.str,
+                    wc->where_clause.param_name.len,
+                    wc->where_clause.param_name.str,
+                    type_name(t));
+                continue;
+            }
             if (!type_satisfies_constraint(arg, cons)) {
                 zan_diag_emit(c->diag, DIAG_ERROR, loc,
                     "type '%s' does not satisfy constraint '%s' for type parameter '%.*s' of '%s'",
@@ -977,6 +985,7 @@ static void check_method_body(zan_checker_t *c, zan_ast_node_t *method) {
     zan_type_t *saved = c->current_return_type;
     c->current_return_type = zan_binder_resolve_type(c->binder,
                                                       method->method_decl.return_type);
+    check_generic_constraints(c, c->current_return_type, method->loc);
     zan_checker_check_stmt(c, method->method_decl.body);
     c->current_return_type = saved;
     c->in_no_runtime = saved_nrt;
