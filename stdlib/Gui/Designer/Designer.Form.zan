@@ -111,21 +111,21 @@ partial class Designer {
 
         // --- 缩放与平移（两种布局通用）---
         RibbonGroup gz = new RibbonGroup(Designer.T("Zoom", "缩放"));
-        string zs = Designer.T("Fit ", "适应 ") + Convert.ToString(lastFitPct / 10) + "%";
-        if (winZoom > 0) { zs = Convert.ToString(winZoom / 10) + "%"; }
-        RibbonItem zin = RibbonItem.Small("plus", Designer.T("Zoom in", "放大"));
+        int zpct = winZoom;
+        if (zpct <= 0) { zpct = 1000; }
+        string zs = Convert.ToString(zpct / 10) + "%";
         RibbonItem zout = RibbonItem.Small("minus", Designer.T("Zoom out", "缩小"));
-        RibbonItem z100 = RibbonItem.Small("search", "100%");
-        RibbonItem zfit = RibbonItem.Small("layout", Designer.T("Fit", "适应"));
-        zfit.SetTip(Designer.T("Fit the design into the panel", "让设计铺满面板"));
-        gz.Add(zin);
-        acts.Add("zin");
+        zout.SetTip(Designer.T("Zoom out 10% (50%-200%)", "缩小 10%（50%–200%）"));
+        RibbonItem zlvl = RibbonItem.Small("search", zs).SetMenu();
+        zlvl.SetTip(Designer.T("Pick a zoom level (50%-200%)", "选择缩放比例（50%–200%）"));
+        RibbonItem zin = RibbonItem.Small("plus", Designer.T("Zoom in", "放大"));
+        zin.SetTip(Designer.T("Zoom in 10% (50%-200%)", "放大 10%（50%–200%）"));
         gz.Add(zout);
         acts.Add("zout");
-        gz.Add(z100);
-        acts.Add("z1000");
-        gz.Add(zfit);
-        acts.Add("z0");
+        gz.Add(zlvl);
+        acts.Add("zoommenu");
+        gz.Add(zin);
+        acts.Add("zin");
         RibbonItem hand = RibbonItem.Toggle("hand", Designer.T("Pan", "抓手"), freeHand);
         hand.SetTip(Designer.T("Drag the canvas with the left button (middle button always pans)",
             "按住左键拖动画布平移（中键随时可拖）"));
@@ -220,11 +220,12 @@ partial class Designer {
             this.ZoomStep(1);
         } else if (act == "zout") {
             this.ZoomStep(0 - 1);
-        } else if (act == "z0") { winZoom = 0; }
-        else if (act == "z500") { winZoom = 500; }
-        else if (act == "z1000") { winZoom = 1000; }
-        else if (act == "z1500") { winZoom = 1500; }
-        else if (act == "z2000") { winZoom = 2000; }
+        } else if (act == "zoommenu") {
+            zoomMenuOpen = true;
+            zoomMenuArm = false;
+            zoomMenuX = app.mouseX;
+            zoomMenuY = app.mouseY + app.Scale(6);
+        }
         else if (act == "rotate") {
             // 每种设计尺寸各存一套矩形，所以走 ApplyDesignSize
             // 而不是直接交换 winW/winH。
@@ -236,14 +237,31 @@ partial class Designer {
         }
     }
 
-    /// 按预设档位放大/缩小一级（Fit 从 100% 起步）。
+    /// 放大/缩小一级（10%），钳制在 50%–200%。
     void ZoomStep(int dir) {
         int z = winZoom;
-        if (z <= 0) { z = lastFitPct; }
-        z = z + dir * 250;
-        if (z < 250) { z = 250; }
-        if (z > 4000) { z = 4000; }
+        if (z <= 0) { z = 1000; }
+        z = z + dir * 100;
+        if (z < 500) { z = 500; }
+        if (z > 2000) { z = 2000; }
         winZoom = z;
+    }
+
+    /// 缩放档位（千分比，1000 = 100%），50%–200% 与
+    /// 缩放下拉菜单一一对应。
+    List<int> ZoomPresets() {
+        return new List<int>{ 500, 600, 700, 800, 900, 1000,
+                              1100, 1200, 1300, 1400, 1500, 2000 };
+    }
+
+    /// 缩放下拉菜单的显示标签（"50%" .. "200%"）。
+    List<string> ZoomMenuLabels() {
+        List<int> ps = this.ZoomPresets();
+        List<string> ls = new List<string>();
+        for (int i = 0; i < ps.Count; i = i + 1) {
+            ls.Add(Convert.ToString(ps[i] / 10) + "%");
+        }
+        return ls;
     }
 
     /// 把选中组件对齐到它所在的框（顶层为设计窗口，容器子元素
@@ -823,19 +841,14 @@ partial class Designer {
         if (inH < 20) { inH = 20; }
 
         int psMilli;
-        // 设计空间是逻辑像素：屏幕像素 = 设计像素 × 显示缩放
-        // × 视图缩放，因此 100% 在任何显示比例下都是按目标
-        // 设备 1:1，而 Fit 由面板的物理尺寸直接算出。
-        // 「适应」（winZoom == 0）每帧按当前视口重算：窗口缩小时设计
-        // 随之缩小、不再溢出挤作一团；显式缩放档位（winZoom > 0）才固定。
-        int fw2 = inW * 1000 / dw;
-        int fh2 = inH * 1000 / dh;
-        int fitPs = fw2;
-        if (fh2 < fitPs) { fitPs = fh2; }
-        lastFitPct = fitPs * 100 / app.dpiScale;
-        if (lastFitPct < 100) { lastFitPct = 100; }
+        // 画布固定 1:1：屏幕像素 = 设计像素 × 显示缩放 × 视图缩放，
+        // 因此 100% 在任何显示比例下都按目标设备 1:1，绝不随宿主
+        // 面板自动缩放。视图缩放仅由用户显式设定，钳制在 50%–200%；
+        // 放大后超出面板的部分用抓手/滚轮平移，不缩小、不显示滚动条。
         int effZoom = winZoom;
-        if (effZoom <= 0) { effZoom = lastFitPct; }
+        if (effZoom < 500) { effZoom = 1000; }
+        if (effZoom > 2000) { effZoom = 2000; }
+        lastFitPct = effZoom;
         psMilli = effZoom * app.dpiScale / 100;
         if (psMilli < 1) { psMilli = 1; }
         int cw2 = dw * psMilli / 1000;
@@ -899,11 +912,12 @@ partial class Designer {
                 && Modifiers.HasCtrl(app.window.EventMods())) {
             if (app.CaptureWheel(inX, inY, inW, inH)) {
                 int wdelta = app.window.EventKeyCode();
-                int z = psMilli;
-                if (wdelta > 0) { z = z * 110 / 100; }
-                else if (wdelta < 0) { z = z * 100 / 110; }
-                if (z < 100) { z = 100; }
-                if (z > 4000) { z = 4000; }
+                int z = winZoom;
+                if (z <= 0) { z = 1000; }
+                if (wdelta > 0) { z = z + 100; }
+                else if (wdelta < 0) { z = z - 100; }
+                if (z < 500) { z = 500; }
+                if (z > 2000) { z = 2000; }
                 winZoom = z;
                 app.RequestRedraw();
             }
