@@ -1051,8 +1051,9 @@ partial class ZanIDE {
         doc.Child(UiNode.Label(ZanIDE.T("Color Theme", "配色主题"))
             .Class("secondary small").Dock("top").Height(20));
         for (int i = 0; i < ZanIDE.EditorThemeCount(); i = i + 1) {
-            doc.Child(UiNode.Of("ThemeCard").Index(i)
-                .Dock("top").Height(38).Bind("themeIdx"));
+            doc.Child(UiNode.Of("Radio").Num("option", i)
+                .Str("label", ZanIDE.EditorThemeName(i))
+                .Dock("top").Bind("themeIdx"));
         }
         doc.Child(UiNode.Label(ZanIDE.T("Font Size", "字体大小"))
             .Class("secondary small").Dock("top").Height(20));
@@ -2890,18 +2891,17 @@ partial class ZanIDE {
                 // Error rows are widgets: the ErrorList component records clicks
                 // during RenderAt; apply them here.
                 if (!coCtxOpen) {
-                    int efr = errorList.TakeFix();
-                    if (efr >= 0) {
+                    DiagnosticRecord efr = errorList.TakeFix();
+                    if (efr != null) {
                         ZanIDE.AddUsing(editor, tabs, activeTab,
                             errorList.FixNs(efr), log);
                         app.RequestRedraw();
                     }
-                    int ejr = errorList.TakeJump();
-                    if (ejr >= 0 && ejr < errors.Count) {
-                        DiagnosticRecord error = errors[ejr];
+                    DiagnosticRecord ejr = errorList.TakeJump();
+                    if (ejr != null) {
                         int ejt = ZanIDE.FindTabByBase(
-                            tabs, ZanIDE.BaseName(error.path));
-                        int ejl = ZanIDE.ParseInt(error.line);
+                            tabs, ZanIDE.BaseName(ejr.path));
+                        int ejl = ZanIDE.ParseInt(ejr.line);
                         if (ejt >= 0) {
                             activeTab.Set(ejt);
                             lastActive = 0 - 1;
@@ -3205,9 +3205,7 @@ partial class ZanIDE {
                         }
                     }
                     if (aiModelSelSig != aiSelSig) {
-                        aiModelSel = new SelectBox(ZanIDE.T("Provider / model", "服务商 / 模型"));
-                        aiModelOpts = new List<string>();
-                        aiModelOptProf = new List<int>();
+                        aiModelOptions = new List<ModelOption>();
                         for (int pi = 0; pi < aiProfiles.Count; pi = pi + 1) {
                             AiProfile profile = aiProfiles[pi];
                             string pname = profile.name;
@@ -3228,25 +3226,28 @@ partial class ZanIDE {
                                 if (!dup && !hidden) { pmods.Add(fetched[fmi]); }
                             }
                             for (int mj = 0; mj < pmods.Count; mj = mj + 1) {
-                                aiModelOpts.Add(pmods[mj]);
-                                aiModelOptProf.Add(pi);
-                                aiModelSel.AddOption(pname + " / " + pmods[mj]);
+                                aiModelOptions.Add(ModelOption.Of(pi, pmods[mj],
+                                    pname + " / " + pmods[mj]));
                             }
                         }
                         // Preselect the enabled profile's default model.
                         int pre = 0 - 1;
-                        for (int oi = 0; oi < aiModelOptProf.Count; oi = oi + 1) {
-                            if (aiModelOptProf[oi] == aiProfActive
-                                && aiModelOpts[oi] == aiProfiles[aiProfActive].model) {
-                                pre = oi;
+                        for (int oi = 0; oi < aiModelOptions.Count; oi = oi + 1) {
+                            ModelOption opt = aiModelOptions[oi];
+                            if (opt.profile == aiProfActive
+                                && opt.model == aiProfiles[aiProfActive].model) {
+                                pre = oi; break;
                             }
                         }
-                        if (pre < 0 && aiModelOptProf.Count > 0) {
-                            for (int oj = 0; oj < aiModelOptProf.Count; oj = oj + 1) {
-                                if (aiModelOptProf[oj] == aiProfActive) { pre = oj; oj = aiModelOptProf.Count; }
+                        if (pre < 0 && aiModelOptions.Count > 0) {
+                            for (int oj = 0; oj < aiModelOptions.Count; oj = oj + 1) {
+                                if (aiModelOptions[oj].profile == aiProfActive) { pre = oj; oj = aiModelOptions.Count; }
                             }
                         }
-                        if (pre >= 0) { aiModelSel.Choose(pre); }
+                        aiModelSel = new Dropdown<ModelOption>(o => o.label);
+                        aiModelSel.Hint(ZanIDE.T("Provider / model", "服务商 / 模型"));
+                        aiModelSel.Bind(aiModelOptions);
+                        if (pre >= 0) { aiModelSel.SelectIndex(pre); }
                         aiModelSelSig = aiSelSig;
                     }
                     // One header row now (the model switcher); sessions moved
@@ -3275,7 +3276,7 @@ partial class ZanIDE {
                     // Same explicit height for the selector and every button so
                     // the header row's controls line up (a select's natural head
                     // height is otherwise shorter than a `small` button).
-                    aiModelSel.RenderIn(app, rBody.x + rPad, aiRow1Y, aiSelW, aiRow1H);
+                    aiModelSel.RenderInside(app, new Rect(rBody.x + rPad, aiRow1Y, aiSelW, aiRow1H));
                     int aiCfgId = aiCfgBtn.RenderIn(app,
                         rBody.x + rPad * 2 + aiSelW, aiRow1Y, aiSmBtnW, aiRow1H);
                     int aiRingR = aiRingBox / 2 - app.Scale(3);
@@ -3292,24 +3293,36 @@ partial class ZanIDE {
                     // switches the enabled profile too, so the base URL / key
                     // below follow the chosen provider. Falls back to the
                     // enabled profile's default model when nothing is picked.
-                    int selMi = aiModelSel.Selected();
-                    if (selMi >= 0 && selMi < aiModelOptProf.Count) {
-                        int chosenProf = aiModelOptProf[selMi];
-                        if (chosenProf >= 0 && chosenProf < aiProfiles.Count) {
-                            aiProfActive = chosenProf;
+                    ModelOption selMi = aiModelSel.Selected();
+                    if (selMi != null && selMi.profile >= 0
+                            && selMi.profile < aiProfiles.Count) {
+                        aiProfActive = selMi.profile;
+                    }
+                    // aiProfActive 可能在删改配置后落到越界值；越界索引会返回
+                    // null，随后 .model/.limits 解引用崩溃。先夹取到有效范围，
+                    // 空列表时用安全默认，避免把悬空/空串喂给 AiLimitInt。
+                    if (aiProfActive < 0 || aiProfActive >= aiProfiles.Count) {
+                        aiProfActive = 0;
+                    }
+                    string chatModel = "";
+                    string aiLimMap = "";
+                    if (aiProfiles.Count > 0) {
+                        AiProfile aiProf = aiProfiles[aiProfActive];
+                        if (aiProf != null) {
+                            chatModel = aiProf.model;
+                            aiLimMap = aiProf.limits;
+                            // Which model each member runs on, taken from the
+                            // provider in effect: reading it here means switching
+                            // provider (or saving the settings dialog) moves the
+                            // whole team with it.
+                            AiTeam.SetModels(aiProf.roles);
                         }
                     }
-                    string chatModel = aiProfiles[aiProfActive].model;
-                    if (selMi >= 0 && selMi < aiModelOpts.Count) { chatModel = aiModelOpts[selMi]; }
-                    // Which model each member runs on, taken from the provider
-                    // in effect: reading it here means switching provider (or
-                    // saving the settings dialog) moves the whole team with it.
-                    AiTeam.SetModels(aiProfiles[aiProfActive].roles);
+                    if (selMi != null) { chatModel = selMi.model; }
                     // Feed the enabled model's configured context / output limits
                     // to the agent layer, so context compaction, the usage ring
                     // and the request's max_tokens all follow this model. An
                     // unconfigured model uses the default context length.
-                    string aiLimMap = aiProfiles[aiProfActive].limits;
                     int aiCtxTok = ZanIDE.AiLimitInt(aiLimMap, chatModel, "ctx");
                     if (aiCtxTok <= 0) { aiCtxTok = AiAgent.DefaultCtxTokens(); }
                     AiAgent.SetLimits(aiCtxTok,
@@ -5810,10 +5823,9 @@ partial class ZanIDE {
         aiWindow = null;
         // Chat model switcher: the dropdown lists the active profile's models
         // (default model first); no selection = the profile's default model.
-        aiModelSel = new SelectBox(ZanIDE.T("Provider / model", "服务商 / 模型"));
-        aiModelOpts = new List<string>();
-        aiModelOptProf = new List<int>();
-        aiModelSelProf = 0 - 1;
+        aiModelSel = new Dropdown<ModelOption>(o => o.label);
+        aiModelSel.Hint(ZanIDE.T("Provider / model", "服务商 / 模型"));
+        aiModelOptions = new List<ModelOption>();
         aiModelSelSig = "";
         aiCfgBtn = new Button { Text = ZanIDE.T("Config", "配置"), Class = "small" };
         // Chat sessions: switch / new / clear the transcript context. Inactive
