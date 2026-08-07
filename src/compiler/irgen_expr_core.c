@@ -281,6 +281,102 @@ static void check_value_type_mismatch(zan_irgen_t *g, zan_type_t *dst, zan_type_
                   dst->name.str ? dst->name.str : "?", what);
 }
 
+/* Render `t`'s display name including generic arguments, arrays and nullable
+ * into `buf` (truncated to `cap`). The generic-invariance diagnostic needs to
+ * show List<int> vs List<Box>, not two bare "List"s. */
+static int render_type_full(zan_type_t *t, char *buf, int cap) {
+    if (!t || cap <= 1) return 0;
+    int n = 0;
+    if (t->kind == TYPE_ARRAY && t->element_type) {
+        n = render_type_full(t->element_type, buf, cap);
+        if (n < cap - 1) { buf[n++] = '['; buf[n++] = ']'; }
+        if (n < cap) buf[n] = '\0';
+        return n;
+    }
+    if (t->name.len) {
+        int w = (int)t->name.len;
+        if (w > cap - n - 1) w = cap - n - 1;
+        memcpy(buf + n, t->name.str, (size_t)w);
+        n += w;
+    } else if (n < cap - 1) {
+        buf[n++] = '?';
+    }
+    if (t->type_arg_count > 0 && n < cap - 2) {
+        buf[n++] = '<';
+        for (int i = 0; i < t->type_arg_count && n < cap - 2; i++) {
+            if (i) buf[n++] = ',';
+            n += render_type_full(t->type_args[i], buf + n, cap - n);
+        }
+        if (n < cap - 1) buf[n++] = '>';
+    }
+    if (n < cap) buf[n] = '\0';
+    return n;
+}
+
+/* Structural equality of two types, recursing into generic type arguments.
+ * Used to compare a container's concrete type arguments (List<int> vs
+ * List<Box>), which are otherwise erased to the same object pointer in IR. */
+static bool type_full_equal(zan_type_t *a, zan_type_t *b) {
+    if (a == b) return true;
+    if (!a || !b) return false;
+    if (a->kind != b->kind) return false;
+    if (a->name.len != b->name.len ||
+        (a->name.len && memcmp(a->name.str, b->name.str, (size_t)a->name.len) != 0))
+        return false;
+    if (a->type_arg_count != b->type_arg_count) return false;
+    for (int i = 0; i < a->type_arg_count; i++)
+        if (!type_full_equal(a->type_args[i], b->type_args[i])) return false;
+    return true;
+}
+
+/* True when `t` (recursively, through generic arguments and array/nullable
+ * element types) mentions an unresolved type parameter or error type. Such
+ * types appear in the bodies of generic classes/methods while T is not yet
+ * bound; they are compared at instantiation time, when concrete arguments
+ * substitute in. Skipping them here avoids false positives on e.g.
+ * List<ListColumn<T>> vs List<ListColumn<string>>, where the outer comparison
+ * is legitimate but the inner T is not yet a concrete type. */
+static bool type_has_unresolved(zan_type_t *t) {
+    if (!t) return true;
+    if (t->kind == TYPE_ERROR || t->kind == TYPE_TYPE_PARAM) return true;
+    for (int i = 0; i < t->type_arg_count; i++)
+        if (type_has_unresolved(t->type_args[i])) return true;
+    if (t->element_type && type_has_unresolved(t->element_type)) return true;
+    return false;
+}
+
+/* Generic type arguments are invariant: List<int> is not a List<Box>, even
+ * though both erase to the same object pointer. The old behaviour silently
+ * accepted any container of the same class with mismatched type arguments, so
+ * a method taking List<ChartData> could be handed a List<int> and the elements
+ * were then dereferenced as ChartData* (the A45 crash). Reject a mismatch when
+ * both sides are resolved enough to compare; unresolved (error / type-param)
+ * arguments are skipped so earlier phase failures do not cascade. */
+static void check_generic_invariance(zan_irgen_t *g, zan_type_t *dst, zan_type_t *src,
+                                     zan_ast_node_t *at, const char *what) {
+    if (!g || !g->diag || !at || !dst || !src) return;
+    if (dst->kind != TYPE_CLASS && dst->kind != TYPE_STRUCT) return;
+    if (src->sym != dst->sym) return;          /* different container class */
+    if (dst->type_arg_count == 0) return;
+    if (type_has_unresolved(dst) || type_has_unresolved(src)) return;
+    for (int i = 0; i < dst->type_arg_count; i++) {
+        zan_type_t *a = dst->type_args[i];
+        zan_type_t *b = src->type_arg_count > i ? src->type_args[i] : NULL;
+        if (!a || !b) return;
+        if (!type_full_equal(a, b)) {
+            char dbuf[96], sbuf[96];
+            render_type_full(dst, dbuf, sizeof(dbuf));
+            render_type_full(src, sbuf, sizeof(sbuf));
+            zan_diag_emit(g->diag, DIAG_ERROR, at->loc,
+                          "cannot convert '%s' to '%s' in %s: generic type "
+                          "arguments are invariant and must match exactly",
+                          sbuf[0] ? sbuf : "?",
+                          dbuf[0] ? dbuf : "?", what);
+            return;
+        }
+    }
+}
+
 static zan_type_t *infer_expr_type(zan_irgen_t *g, zan_ast_node_t *e, local_scope_t *locals);
 
 /* The declared type of a field, read through a receiver of type `owner`: a

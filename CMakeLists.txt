@@ -1132,6 +1132,22 @@ add_test(NAME diag_enum_unknown_member
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_enum_unknown_member PROPERTIES TIMEOUT 60)
 
+# Generic type arguments are invariant: List<int> is not a List<Box>, even
+# though both erase to the same object pointer in IR. Passing a mismatched
+# container used to compile and then dereference the elements as the wrong
+# type at runtime (the A45 crash), so both the call-argument and the
+# assignment/initializer paths must reject it.
+foreach(_invariant_case arg assign)
+  add_test(NAME diag_generic_invariant_${_invariant_case}
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/generic_invariant_${_invariant_case}.zan
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_generic_invariant_${_invariant_case}${_exe_ext}
+      "-DEXPECT_REGEX=generic type arguments are invariant"
+      -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+  set_tests_properties(diag_generic_invariant_${_invariant_case} PROPERTIES TIMEOUT 60)
+endforeach()
+
 # A member access on a builtin scalar type (string/int/...) must be a compile
 # error: irgen used to silently lower it to the constant 0, which crashed at
 # runtime when the zero was used as a pointer (`tabs[i].path.path`, the IDE's

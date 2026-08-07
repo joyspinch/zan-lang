@@ -666,6 +666,9 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             check_value_type_mismatch(g, type,
                 infer_expr_type(g, stmt->var_decl.initializer, locals),
                 stmt->var_decl.initializer, "initializer");
+            check_generic_invariance(g, type,
+                infer_expr_type(g, stmt->var_decl.initializer, locals),
+                stmt->var_decl.initializer, "initializer");
             if (type && type->kind == TYPE_DELEGATE &&
                 stmt->var_decl.initializer->kind != AST_LAMBDA)
                 check_delegate_async_match(g, stmt->var_decl.initializer, type, locals);

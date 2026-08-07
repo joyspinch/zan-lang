@@ -1536,6 +1536,9 @@ static void emit_decl_field_initializers(zan_irgen_t *g,
         check_value_type_mismatch(g, field_type, source_type,
                                   field->field_decl.initializer,
                                   "field initializer");
+        check_generic_invariance(g, field_type, source_type,
+                                 field->field_decl.initializer,
+                                 "field initializer");
         LLVMValueRef value = field_type && field_type->kind == TYPE_DELEGATE &&
                              field->field_decl.initializer->kind == AST_LAMBDA
             ? emit_lambda_typed(g, field->field_decl.initializer,
@@ -1624,6 +1627,9 @@ static LLVMValueRef emit_expr_assignment(zan_irgen_t *g, zan_ast_node_t *expr,
                 infer_expr_type(g, expr->binary.right, locals),
                 expr->binary.right, "assignment");
             check_value_type_mismatch(g, lt,
+                infer_expr_type(g, expr->binary.right, locals),
+                expr->binary.right, "assignment");
+            check_generic_invariance(g, lt,
                 infer_expr_type(g, expr->binary.right, locals),
                 expr->binary.right, "assignment");
             if (type_is_binding(lt) &&
@@ -5741,6 +5747,7 @@ static LLVMValueRef emit_arg_typed(zan_irgen_t *g, zan_ast_node_t *arg,
     zan_type_t *atype = infer_expr_type(g, arg, locals);
     check_implicit_narrowing(g, ptype, atype, arg, "argument");
     check_value_type_mismatch(g, ptype, atype, arg, "argument");
+    check_generic_invariance(g, ptype, atype, arg, "argument");
     if (arg && ptype && ptype->kind == TYPE_DELEGATE) {
         if (arg->kind == AST_LAMBDA)
             return emit_lambda_typed(g, arg, ptype, locals);
