@@ -47,61 +47,63 @@ class SqlServerPool {
     /// <summary>借出一条连接：复用空闲连接，未达到上限则新建，
     /// 否则挂起协程直到有连接被释放。
     /// 连接池关闭后返回 null。</summary>
-    async SqlServerConnection AcquireAsync() {{
-        while (true) {{
-            if (this.core.IsClosed()) {{
+    async SqlServerConnection AcquireAsync() {
+        while (true) {
+            if (this.core.IsClosed()) {
                 return null;
-            }}
+            }
             SqlServerConnection pooled = this.core.TakeIdle();
-            while (pooled != null) {{
+            while (pooled != null) {
                 // 连接在池中闲置时可能已失效（服务器重启、空闲超时），
                 // 此时应将其驱逐，把名额让给等待者。
-                if (pooled.IsConnected()) {{
+                if (pooled.IsConnected()) {
                     return pooled;
-                }}
-                this.core.Drop();
+                }
+                this.core.Drop(pooled);
                 pooled = this.core.TakeIdle();
-            }}
-            if (this.core.TryReserve()) {{
+            }
+            if (this.core.TryReserve()) {
                 SqlServerConnection opened = await this.OpenOne();
-                if (opened == null || !opened.IsConnected()) {{
+                if (opened == null || !opened.IsConnected()) {
                     this.core.UndoReserve();
-                }}
+                    return null;
+                }
+                this.core.Borrow(opened);
                 return opened;
-            }}
+            }
             // 连接池已满：挂起等待直到有连接被释放。
             this.core.EnterWait();
             await this.core.Waiter().Wait();
             this.core.LeaveWait();
-        }}
+        }
         return null;
-    }}
+    }
 
     /// <summary>将连接归还连接池。已损坏或 Close() 之后的
     /// 连接将被关闭并丢弃，而不会入池。</summary>
-    void Release(SqlServerConnection c) {{
-        if (c == null) {{
+    void Release(SqlServerConnection c) {
+        if (c == null) {
             return;
-        }}
-        if (this.core.IsClosed() || !c.IsConnected()) {{
-            if (c.IsConnected()) {{
+        }
+        if (this.core.IsClosed() || !c.IsConnected()) {
+            if (c.IsConnected()) {
                 c.Close();
-            }}
-            this.core.Drop();
+            }
+            this.core.Drop(c);
             return;
-        }}
+        }
         this.core.Pool(c);
-    }}
+    }
 
     /// <summary>空闲（已入池、可直接使用）连接数。</summary>
-    int IdleCount() {{
+    int IdleCount() {
         return this.core.IdleCount();
-    }}
+    }
 
     /// <summary>活跃连接总数（空闲 + 已借出）。</summary>
-    int LiveCount() {{
+    int LiveCount() {
         return this.core.LiveCount();
-    }}
+    }
 
     /// <summary>当前挂起等待连接的协程数。</summary>
     int WaitingCount() {
@@ -115,14 +117,14 @@ class SqlServerPool {
 
     /// <summary>关闭所有空闲连接并将连接池标记为已关闭。
     /// 仍被借出的连接在归还时关闭。</summary>
-    void Close() {{
+    void Close() {
         this.core.MarkClosed();
         SqlServerConnection c = this.core.TakeIdle();
-        while (c != null) {{
+        while (c != null) {
             c.Close();
-            this.core.Drop();
+            this.core.Drop(c);
             c = this.core.TakeIdle();
-        }}
+        }
         this.core.WakeAll();
-    }}
-}}
+    }
+}

@@ -20,7 +20,7 @@ class Timer {
     ThreadStart callback;
     bool running;
     int tickCount;
-    long nextDue;   // 下次触发的时间（单调毫秒，ServerMetrics.MonoMillis）
+    long nextDue;   // 下次触发的时间（单调毫秒，ServerMetrics.MonoMillis()）
 
     /// 创建一个每隔 `intervalMs` 毫秒触发一次 `callback` 的定时器。
     /// 在调用 <see cref="Start"/> 之前不会启动。
@@ -35,13 +35,24 @@ class Timer {
     /// <summary>启动定时器。已在运行时为无操作。
     /// 定时器处于运行状态时返回 true。</summary>
     bool Start() {
-        if (running) { return true; }
-        if (intervalMs < 1) { return false; }
-        running = true;
-        nextDue = Timer.Now() + intervalMs;
+        Mutex.Lock(Timer.lockHandle);
+        if (this.running) {
+            Mutex.Unlock(Timer.lockHandle);
+            return true;
+        }
+        if (this.intervalMs < 1) {
+            Mutex.Unlock(Timer.lockHandle);
+            return false;
+        }
+        this.running = true;
+        this.nextDue = Timer.Now() + this.intervalMs;
         Timer.timers.Add(this);
-        if (!Timer.pumpRunning) {
+        bool startPump = !Timer.pumpRunning;
+        if (startPump) {
             Timer.pumpRunning = true;
+        }
+        Mutex.Unlock(Timer.lockHandle);
+        if (startPump) {
             Thread.Start(Timer.Pump);
         }
         return true;
@@ -50,55 +61,70 @@ class Timer {
     /// <summary>停止定时器并注销它。正在进行的 tick（如有）
     /// 会执行完；后续 tick 不再触发。未运行时为无操作。</summary>
     void Stop() {
-        if (!running) { return; }
-        running = false;
-        for (int i = 0; i < Timer.timers.Count; i = i + 1) {
+        Mutex.Lock(Timer.lockHandle);
+        if (!this.running) {
+            Mutex.Unlock(Timer.lockHandle);
+            return;
+        }
+        this.running = false;
+        int i = 0;
+        while (i < Timer.timers.Count) {
             if (Timer.timers[i] == this) {
                 Timer.timers.RemoveAt(i);
                 break;
             }
+            i = i + 1;
         }
+        Mutex.Unlock(Timer.lockHandle);
     }
 
     /// <summary>自 Start（或上次 Reset）以来已完成的 tick 数。</summary>
     int TickCount() {
-        return tickCount;
+        return this.tickCount;
     }
 
     /// <summary>将 tick 计数器重置为零。</summary>
     void Reset() {
-        tickCount = 0;
+        this.tickCount = 0;
     }
 
     /// 定时器运行期间（Start 与 Stop 之间）为 true。
     bool IsRunning() {
-        return running;
+        return this.running;
     }
 
     // 共享泵线程：约每 10 毫秒遍历注册表，触发到期的定时器。
     // 遍历采用倒序，这样回调中停止/移除某个定时器（自身或
     // 其他的、当前索引处或之后的）都不会跳过条目。
     static void Pump() {
-        while (Timer.HasWork()) {
-            Thread.Sleep(10);
+        while (true) {
+            Mutex.Lock(Timer.lockHandle);
+            if (Timer.timers.Count == 0) {
+                Timer.pumpRunning = false;
+                Mutex.Unlock(Timer.lockHandle);
+                break;
+            }
             long now = Timer.Now();
+            List<Timer> due = new List<Timer>();
             int i = Timer.timers.Count - 1;
             while (i >= 0) {
                 Timer t = Timer.timers[i];
                 if (t.running && now >= t.nextDue) {
                     t.nextDue = now + t.intervalMs;
                     t.tickCount = t.tickCount + 1;
-                    t.callback();
+                    due.Add(t);
                 }
                 i = i - 1;
             }
+            Mutex.Unlock(Timer.lockHandle);
+            int j = due.Count - 1;
+            while (j >= 0) {
+                Timer t = due[j];
+                if (t.callback != null) { t.callback(); }
+                j = j - 1;
+            }
+            Thread.Sleep(10);
         }
-        Timer.pumpRunning = false;
-    }
-
-    // 只要仍注册着至少一个定时器即为 true。
-    static bool HasWork() {
-        return Timer.timers.Count > 0;
     }
 
     static long Now() {
@@ -107,4 +133,13 @@ class Timer {
 
     static List<Timer> timers = new List<Timer>();
     static bool pumpRunning = false;
+    #if WINDOWS
+    static nint lockHandle;
+    #else
+    static string lockHandle;
+    #endif
+
+    static Timer() {
+        Timer.lockHandle = Mutex.Create();
+    }
 }

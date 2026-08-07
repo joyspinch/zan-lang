@@ -44,61 +44,63 @@ class PgPool {
     /// <summary>借出连接：优先复用空闲连接，
     /// 未达上限则新建，否则挂起协程直到有连接被归还。
     /// 连接池关闭后返回 null。</summary>
-    async PgConnection AcquireAsync() {{
-        while (true) {{
-            if (this.core.IsClosed()) {{
+    async PgConnection AcquireAsync() {
+        while (true) {
+            if (this.core.IsClosed()) {
                 return null;
-            }}
+            }
             PgConnection pooled = this.core.TakeIdle();
-            while (pooled != null) {{
+            while (pooled != null) {
                 // 连接在停泊期间可能失效（服务器重启、空闲
                 // 超时）：将其驱逐，为等待者腾出槽位。
-                if (pooled.IsConnected()) {{
+                if (pooled.IsConnected()) {
                     return pooled;
-                }}
-                this.core.Drop();
+                }
+                this.core.Drop(pooled);
                 pooled = this.core.TakeIdle();
-            }}
-            if (this.core.TryReserve()) {{
+            }
+            if (this.core.TryReserve()) {
                 PgConnection opened = await this.OpenOne();
-                if (opened == null || !opened.IsConnected()) {{
+                if (opened == null || !opened.IsConnected()) {
                     this.core.UndoReserve();
-                }}
+                    return null;
+                }
+                this.core.Borrow(opened);
                 return opened;
-            }}
+            }
             // 连接池已满：停泊直到有连接被归还。
             this.core.EnterWait();
             await this.core.Waiter().Wait();
             this.core.LeaveWait();
-        }}
+        }
         return null;
-    }}
+    }
 
     /// <summary>将连接归还连接池。已损坏或 Close() 之后的
     /// 连接会被关闭销毁而不入池。</summary>
-    void Release(PgConnection c) {{
-        if (c == null) {{
+    void Release(PgConnection c) {
+        if (c == null) {
             return;
-        }}
-        if (this.core.IsClosed() || !c.IsConnected()) {{
-            if (c.IsConnected()) {{
+        }
+        if (this.core.IsClosed() || !c.IsConnected()) {
+            if (c.IsConnected()) {
                 c.Close();
-            }}
-            this.core.Drop();
+            }
+            this.core.Drop(c);
             return;
-        }}
+        }
         this.core.Pool(c);
-    }}
+    }
 
     /// <summary>空闲（已入池、立即可用）连接数。</summary>
-    int IdleCount() {{
+    int IdleCount() {
         return this.core.IdleCount();
-    }}
+    }
 
     /// <summary>存活连接总数（空闲 + 借出）。</summary>
-    int LiveCount() {{
+    int LiveCount() {
         return this.core.LiveCount();
-    }}
+    }
 
     /// <summary>当前停泊等待连接的协程数。</summary>
     int WaitingCount() {
@@ -107,14 +109,14 @@ class PgPool {
 
     /// <summary>关闭所有空闲连接并标记连接池已关闭。仍
     /// 被借出的连接在归还时关闭。</summary>
-    void Close() {{
+    void Close() {
         this.core.MarkClosed();
         PgConnection c = this.core.TakeIdle();
-        while (c != null) {{
+        while (c != null) {
             c.Close();
-            this.core.Drop();
+            this.core.Drop(c);
             c = this.core.TakeIdle();
-        }}
+        }
         this.core.WakeAll();
-    }}
-}}
+    }
+}

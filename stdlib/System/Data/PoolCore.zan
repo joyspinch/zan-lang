@@ -24,6 +24,7 @@ namespace System.Data;
 class PoolCore<T> {
     int maxSize;
     List<T> idle;
+    List<T> borrowed;   // 当前已借出、尚未归还的连接
     int liveCount;      // 已打开的连接总数（空闲 + 借出）
     int waiting;        // 当前停泊等待连接的协程数
     Gate gate;          // 面向等待者的事件驱动唤醒（取代轮询）
@@ -37,6 +38,7 @@ class PoolCore<T> {
         }
         this.maxSize = maxSize;
         this.idle = new List<T>();
+        this.borrowed = new List<T>();
         this.liveCount = 0;
         this.waiting = 0;
         this.gate = new Gate();
@@ -54,11 +56,16 @@ class PoolCore<T> {
         int last = this.idle.Count - 1;
         T c = this.idle[last];
         this.idle.RemoveAt(last);
+        this.borrowed.Add(c);
         return c;
     }
 
-    /// <summary>将可用连接放入空闲列表并唤醒一个等待者。</summary>
+    /// <summary>将可用连接放入空闲列表并唤醒一个等待者。
+    /// 仅接受当前处于借出状态的连接，重复归还会被忽略。</summary>
     void Pool(T c) {
+        if (!this.RemoveBorrowed(c)) {
+            return;
+        }
         this.idle.Add(c);
         if (this.waiting > 0) {
             this.gate.Signal();
@@ -68,13 +75,20 @@ class PoolCore<T> {
     /// <summary>登记一条永久离开连接池的连接（关闭、
     /// 损坏或被驱逐）：释放其槽位，等待者可新建
     /// 连接顶替它。</summary>
-    void Drop() {
+    void Drop(T c) {
+        this.RemoveBorrowed(c);
         if (this.liveCount > 0) {
             this.liveCount = this.liveCount - 1;
         }
         if (this.waiting > 0) {
             this.gate.Signal();
         }
+    }
+
+    /// <summary>记录新打开的连接已借出。在 <see cref="TryReserve"/>
+    /// 预留槽位并成功打开后调用。</summary>
+    void Borrow(T c) {
+        this.borrowed.Add(c);
     }
 
     /// <summary>为即将打开的连接预留槽位。预先
@@ -90,7 +104,25 @@ class PoolCore<T> {
 
     /// <summary>归还因打开失败而空出的槽位，并让等待者重试。</summary>
     void UndoReserve() {
-        this.Drop();
+        if (this.liveCount > 0) {
+            this.liveCount = this.liveCount - 1;
+        }
+        if (this.waiting > 0) {
+            this.gate.Signal();
+        }
+    }
+
+    bool RemoveBorrowed(T c) {
+        int i = 0;
+        int n = this.borrowed.Count;
+        while (i < n) {
+            if (this.borrowed[i] == c) {
+                this.borrowed.RemoveAt(i);
+                return true;
+            }
+            i = i + 1;
+        }
+        return false;
     }
 
     /// <summary>连接池饱和时停泊获取者的闸门。其计数

@@ -53,72 +53,74 @@ class MySqlPool {
     /// <summary>借出一个连接：复用空闲的，未达上限则新建，
     /// 否则挂起协程直到有连接被释放。
     /// 连接池关闭后返回 null。</summary>
-    async MySqlConnection AcquireAsync() {{
-        while (true) {{
-            if (this.core.IsClosed()) {{
+    async MySqlConnection AcquireAsync() {
+        while (true) {
+            if (this.core.IsClosed()) {
                 return null;
-            }}
+            }
             MySqlConnection pooled = this.core.TakeIdle();
-            while (pooled != null) {{
+            while (pooled != null) {
                 // 连接在停放期间可能已失效（服务器重启、空闲
                 // 超时等）：将其逐出，把槽位让给等待者。
-                if (pooled.IsConnected()) {{
+                if (pooled.IsConnected()) {
                     return pooled;
-                }}
-                this.core.Drop();
+                }
+                this.core.Drop(pooled);
                 pooled = this.core.TakeIdle();
-            }}
-            if (this.core.TryReserve()) {{
+            }
+            if (this.core.TryReserve()) {
                 MySqlConnection opened = await this.OpenOne();
-                if (opened == null || !opened.IsConnected()) {{
+                if (opened == null || !opened.IsConnected()) {
                     this.core.UndoReserve();
-                }}
+                    return null;
+                }
+                this.core.Borrow(opened);
                 return opened;
-            }}
+            }
             // 连接池已满：挂起等待，直到有连接被释放。
             this.core.EnterWait();
             await this.core.Waiter().Wait();
             this.core.LeaveWait();
-        }}
+        }
         return null;
-    }}
+    }
 
     /// <summary>将连接归还连接池。损坏的或 Close() 之后的
     /// 连接会被关闭丢弃，不再入池。</summary>
-    void Release(MySqlConnection c) {{
-        if (c == null) {{
+    void Release(MySqlConnection c) {
+        if (c == null) {
             return;
-        }}
-        if (this.core.IsClosed() || !c.IsConnected()) {{
-            if (c.IsConnected()) {{
+        }
+        if (this.core.IsClosed() || !c.IsConnected()) {
+            if (c.IsConnected()) {
                 c.Close();
-            }}
-            this.core.Drop();
+            }
+            this.core.Drop(c);
             return;
-        }}
+        }
         this.core.Pool(c);
-    }}
+    }
 
     /// <summary>空闲（已入池、可直接使用）连接数。</summary>
-    int IdleCount() {{
+    int IdleCount() {
         return this.core.IdleCount();
-    }}
+    }
 
     /// <summary>活跃连接总数（空闲 + 已借出）。</summary>
-    int LiveCount() {{
+    int LiveCount() {
         return this.core.LiveCount();
-    }}
+    }
 
     /// <summary>关闭所有空闲连接并将连接池标记为已关闭。
     /// 仍被借出的连接在归还时关闭。</summary>
-    void Close() {{
+    void Close() {
         this.core.MarkClosed();
         MySqlConnection c = this.core.TakeIdle();
-        while (c != null) {{
+        while (c != null) {
             c.Close();
-            this.core.Drop();
+            this.core.Drop(c);
             c = this.core.TakeIdle();
-        }}
+        }
         this.core.WakeAll();
-    }}
-}}
+    }
+}

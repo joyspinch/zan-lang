@@ -70,6 +70,7 @@ class SdlGpuNative {
 class SdlGpuTexture {
     nint context;
     nint handle;
+    SdlGpu owner;
 
     bool IsValid() { return this.handle != 0; }
     nint Handle() { return this.handle; }
@@ -78,9 +79,16 @@ class SdlGpuTexture {
 
     void Free() {
         if (this.handle != 0) {
-            SdlGpuNative.zan_gpu_free_texture(this.context, this.handle);
+            if (this.context != 0) {
+                SdlGpuNative.zan_gpu_free_texture(this.context, this.handle);
+            }
             this.handle = 0;
         }
+        if (this.owner != null) {
+            this.owner.Untrack(this);
+            this.owner = null;
+        }
+        this.context = 0;
     }
 }
 
@@ -91,11 +99,13 @@ class SdlGpuTexture {
 /// </summary>
 class SdlGpu {
     nint handle;
+    List<SdlGpuTexture> textures;
 
     /// <summary>创建向 <paramref name="window"/> 呈现的 GPU 上下文。</summary>
     static SdlGpu Create(SdlWindow window) {
         SdlGpu gpu = new SdlGpu();
         gpu.handle = SdlGpuNative.zan_gpu_create(window.Handle());
+        gpu.textures = new List<SdlGpuTexture>();
         return gpu;
     }
 
@@ -104,40 +114,65 @@ class SdlGpu {
     static SdlGpu CreateOffscreen(int width, int height) {
         SdlGpu gpu = new SdlGpu();
         gpu.handle = SdlGpuNative.zan_gpu_create_offscreen(width, height);
+        gpu.textures = new List<SdlGpuTexture>();
         return gpu;
     }
 
     bool IsValid() { return this.handle != 0; }
     nint Handle() { return this.handle; }
 
-    /// <summary>以紧凑的 RGBA32 像素上传为采样纹理。</summary>
-    SdlGpuTexture LoadTexture(int width, int height, string pixels) {
+    /// <summary>在上下文有效时记录子纹理，便于
+    /// <see cref="Destroy"/> 按顺序释放。</summary>
+    void Track(SdlGpuTexture tex) {
+        if (this.handle != 0 && tex != null) {
+            this.textures.Add(tex);
+        }
+    }
+
+    void Untrack(SdlGpuTexture tex) {
+        int i = 0;
+        int n = this.textures.Count;
+        while (i < n) {
+            if (this.textures[i] == tex) {
+                this.textures.RemoveAt(i);
+                return;
+            }
+            i = i + 1;
+        }
+    }
+
+    SdlGpuTexture MakeTexture() {
         SdlGpuTexture tex = new SdlGpuTexture();
         tex.context = this.handle;
+        tex.owner = this;
+        this.Track(tex);
+        return tex;
+    }
+
+    /// <summary>以紧凑的 RGBA32 像素上传为采样纹理。</summary>
+    SdlGpuTexture LoadTexture(int width, int height, string pixels) {
+        SdlGpuTexture tex = this.MakeTexture();
         tex.handle = SdlGpuNative.zan_gpu_load_texture(this.handle, width, height, pixels);
         return tex;
     }
 
     /// <summary>创建纯白纹理；通过绘制颜色着色。</summary>
     SdlGpuTexture SolidTexture(int width, int height) {
-        SdlGpuTexture tex = new SdlGpuTexture();
-        tex.context = this.handle;
+        SdlGpuTexture tex = this.MakeTexture();
         tex.handle = SdlGpuNative.zan_gpu_solid_texture(this.handle, width, height);
         return tex;
     }
 
     /// <summary>加载 BMP 文件并转换为 RGBA32。</summary>
     SdlGpuTexture LoadBmp(string path) {
-        SdlGpuTexture tex = new SdlGpuTexture();
-        tex.context = this.handle;
+        SdlGpuTexture tex = this.MakeTexture();
         tex.handle = SdlGpuNative.zan_gpu_load_bmp(this.handle, path);
         return tex;
     }
 
     /// <summary>将 PNG/JPEG 图像数据加载为 RGBA32 采样纹理。</summary>
     SdlGpuTexture LoadImage(string path) {
-        SdlGpuTexture tex = new SdlGpuTexture();
-        tex.context = this.handle;
+        SdlGpuTexture tex = this.MakeTexture();
         tex.handle = SdlGpuNative.zan_gpu_load_image(this.handle, path);
         return tex;
     }
@@ -174,6 +209,18 @@ class SdlGpu {
 
     void Destroy() {
         if (this.handle != 0) {
+            // 先释放所有子纹理：一旦上下文销毁，
+            // native 端将再无法接受 free_texture。
+            int i = this.textures.Count - 1;
+            while (i >= 0) {
+                SdlGpuTexture tex = this.textures[i];
+                this.textures.RemoveAt(i);
+                if (tex != null) {
+                    tex.owner = null;
+                    tex.Free();
+                }
+                i = i - 1;
+            }
             SdlGpuNative.zan_gpu_destroy(this.handle);
             this.handle = 0;
         }

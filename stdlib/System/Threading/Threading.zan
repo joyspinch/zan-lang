@@ -731,17 +731,33 @@ class SharedTable {
 
 /// <summary>
 /// 用于协程间通信的协程感知 channel。
-/// 平台无关（纯 Zan 实现）。
+/// 平台无关（纯 Zan 实现）。容量为 0 表示无界；
+/// 正容量表示有界缓冲；<see cref="CreateUnbuffered"/>
+/// 创建容量为 1 的 channel（阻塞当且仅当缓冲已满）。
 /// </summary>
 class Channel {
     List<string> buffer;
     int capacity;
     bool closed;
+    int sendWaiters;
+    int recvWaiters;
+    Gate sendGate;
+    Gate recvGate;
+    #if WINDOWS
+    nint lockHandle;
+    #else
+    string lockHandle;
+    #endif
 
     Channel(int capacity) {
         this.buffer = new List<string>();
         this.capacity = capacity;
         this.closed = false;
+        this.sendWaiters = 0;
+        this.recvWaiters = 0;
+        this.sendGate = new Gate();
+        this.recvGate = new Gate();
+        this.lockHandle = Mutex.Create();
     }
 
     /// <summary>创建无缓冲 channel。</summary>
@@ -749,35 +765,82 @@ class Channel {
         return new Channel(1);
     }
 
-    /// <summary>向 channel 发送一个值（满时阻塞）。</summary>
-    void Send(string item) {
-        if (!this.closed) {
-            this.buffer.Add(item);
+    /// <summary>向 channel 发送一个值（满时阻塞）。
+    /// 已关闭的 channel 上发送会被忽略。</summary>
+    async void Send(string item) {
+        Mutex.Lock(this.lockHandle);
+        while (!this.closed && this.capacity > 0
+               && this.buffer.Count >= this.capacity) {
+            this.sendWaiters = this.sendWaiters + 1;
+            Mutex.Unlock(this.lockHandle);
+            await this.sendGate.Wait();
+            Mutex.Lock(this.lockHandle);
+            this.sendWaiters = this.sendWaiters - 1;
         }
+        if (this.closed) {
+            Mutex.Unlock(this.lockHandle);
+            return;
+        }
+        this.buffer.Add(item);
+        Mutex.Unlock(this.lockHandle);
+        this.recvGate.Signal();
     }
 
-    /// <summary>从 channel 接收一个值（空时阻塞）。</summary>
-    string Receive() {
-        if (this.buffer.Count > 0) {
-            string val = this.buffer[0];
-            this.buffer.RemoveAt(0);
-            return val;
+    /// <summary>从 channel 接收一个值（空时阻塞）。
+    /// 关闭并取空后返回空字符串。</summary>
+    async string Receive() {
+        Mutex.Lock(this.lockHandle);
+        while (!this.closed && this.buffer.Count == 0) {
+            this.recvWaiters = this.recvWaiters + 1;
+            Mutex.Unlock(this.lockHandle);
+            await this.recvGate.Wait();
+            Mutex.Lock(this.lockHandle);
+            this.recvWaiters = this.recvWaiters - 1;
         }
-        return "";
+        if (this.closed && this.buffer.Count == 0) {
+            Mutex.Unlock(this.lockHandle);
+            return "";
+        }
+        string val = this.buffer[0];
+        this.buffer.RemoveAt(0);
+        Mutex.Unlock(this.lockHandle);
+        this.sendGate.Signal();
+        return val;
     }
 
-    /// <summary>关闭 channel。</summary>
+    /// <summary>关闭 channel，唤醒所有阻塞的
+    /// 发送方和接收方。</summary>
     void Close() {
+        Mutex.Lock(this.lockHandle);
         this.closed = true;
+        int sw = this.sendWaiters;
+        int rw = this.recvWaiters;
+        Mutex.Unlock(this.lockHandle);
+        int i = 0;
+        while (i < sw) {
+            this.sendGate.Signal();
+            i = i + 1;
+        }
+        i = 0;
+        while (i < rw) {
+            this.recvGate.Signal();
+            i = i + 1;
+        }
     }
 
     /// <summary>channel 已关闭时返回 true。</summary>
     bool IsClosed() {
-        return this.closed;
+        Mutex.Lock(this.lockHandle);
+        bool v = this.closed;
+        Mutex.Unlock(this.lockHandle);
+        return v;
     }
 
     /// <summary>返回当前缓冲条目数。</summary>
     int Count() {
-        return this.buffer.Count;
+        Mutex.Lock(this.lockHandle);
+        int v = this.buffer.Count;
+        Mutex.Unlock(this.lockHandle);
+        return v;
     }
 }
