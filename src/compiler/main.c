@@ -13,6 +13,8 @@
 #include "scenegen.h"
 #include "dbgen.h"
 #include "routegen.h"
+#include "genrun.h"
+#include "genmeta.h"
 #include "nsresolve.h"
 #include "ast.h"
 #include "binder.h"
@@ -1295,6 +1297,8 @@ static void print_usage(void) {
     fprintf(stderr, "  --icon <f.ico>   Embed an icon in the Windows executable\n");
     fprintf(stderr, "  --no-icon        Do not embed any icon (skip the built-in default)\n");
     fprintf(stderr, "  --emit-symbols <f> Write the type/member index (IDE completion) and exit\n");
+    fprintf(stderr, "  --no-gen         Disable the Zan-scripted code generators (bootstrap)\n");
+    fprintf(stderr, "  --gen-meta <f>   Export compilation-unit metadata JSON to <f> and exit\n");
     fprintf(stderr, "  --time           Report how long each compiler phase took\n");
     fprintf(stderr, "  -D<name>[=value] Define preprocessor symbol\n");
     fprintf(stderr, "  --version, -v    Print version and exit\n");
@@ -1325,6 +1329,7 @@ int main(int argc, char **argv) {
     bool do_dump_tokens = false;
     bool do_dump_ast = false;
     const char *emit_symbols_path = NULL; /* --emit-symbols <file> */
+    const char *gen_meta_path = NULL;     /* --gen-meta <file>: export metadata */
     bool do_emit_ir = false;
     bool check_leaks = false;
     bool runtime_checks = true;
@@ -1361,6 +1366,8 @@ int main(int argc, char **argv) {
      * outside the stdlib-discovery scope) can root driver dirs at
      * <stdlib_root>/<module>/drivers/<target>/. Empty when no stdlib is used. */
     char resolved_stdlib_root[1024] = {0};
+    char **design_outs = NULL;   /* translated .zform/.zscene texts, per input */
+    size_t design_count = 0;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--dump-tokens") == 0) {
@@ -1369,6 +1376,10 @@ int main(int argc, char **argv) {
             do_dump_ast = true;
         } else if (strcmp(argv[i], "--emit-symbols") == 0 && i + 1 < argc) {
             emit_symbols_path = argv[++i];
+        } else if (strcmp(argv[i], "--no-gen") == 0) {
+            zan_gen_enabled = 0;
+        } else if (strcmp(argv[i], "--gen-meta") == 0 && i + 1 < argc) {
+            gen_meta_path = argv[++i];
         } else if (strcmp(argv[i], "--emit-ir") == 0) {
             do_emit_ir = true;
         } else if (strcmp(argv[i], "--check-leaks") == 0) {
@@ -1570,9 +1581,9 @@ int main(int argc, char **argv) {
             }
 #endif
         }
-        /* Hoist for the native-driver block below (outside this scope). */
-        snprintf(resolved_stdlib_root, sizeof(resolved_stdlib_root), "%s",
-                 stdlib_root);
+    /* Hoist for the native-driver block below (outside this scope). */
+    snprintf(resolved_stdlib_root, sizeof(resolved_stdlib_root), "%s",
+             stdlib_root);
 
         /* Auto-include stdlib modules by PATH. Every `using X.Y.Z;` directive
          * maps directly to the directory stdlib_root/X/Y/Z, and all *.zan files
@@ -1586,6 +1597,17 @@ int main(int argc, char **argv) {
          * Resolve to a fixpoint because a pulled-in module may itself `using`
          * another namespace (e.g. System.Net.WebSocket -> System.Text), so
          * re-scan every included file until nothing new is added. */
+        /* Design documents (.zform/.zscene) are translated by the Zan-scripted
+         * generators (stdlib/System/Compiler/ZanGen.zan) before the using-scan:
+         * the synthetic source carries the `using System/Gui/...` directives
+         * the auto-stdlib pull-in needs, and one generator run covers every
+         * design input. Entries for non-design files stay NULL. */
+        design_outs = zan_gen_design(
+            resolved_stdlib_root, (const char *const *)input_files,
+            (size_t)input_count);
+        if (!design_outs) return 1;
+        design_count = (size_t)input_count;
+
         /* Each file's `using` set never changes, so scan every file exactly
          * once: new files land at the end of the list and the next round picks
          * them up. Re-reading the whole list per round used to dominate
@@ -1598,22 +1620,17 @@ int main(int argc, char **argv) {
                 char *src3 = read_file(input_files[fi], &slen3);
                 if (!src3) continue;
                 /* A .zform input is a JSON design document, so the raw text has
-                 * no `using` directives to scan. Translate it first (formgen
-                 * projects a `partial class` with `using System/Gui/...`) so
-                 * the auto-stdlib pull-in covers the widgets the design uses
-                 * even when the .zform is compiled without its sibling .zan. */
-                size_t fl3 = strlen(input_files[fi]);
+                 * no `using` directives to scan. It was translated up front
+                 * (design_outs) into a synthetic `partial class` with
+                 * `using System/Gui/...`, so the auto-stdlib pull-in covers the
+                 * widgets the design uses even when the .zform is compiled
+                 * without its sibling .zan. */
                 char *owned = NULL;
-                if (fl3 > 6 && strcmp(input_files[fi] + fl3 - 6, ".zform") == 0) {
-                    char *translated = zan_formgen_translate(src3, slen3,
-                                                             input_files[fi], NULL, 0);
-                    if (translated) { free(src3); src3 = translated; owned = translated; }
-                } else if (fl3 > 7 &&
-                           strcmp(input_files[fi] + fl3 - 7, ".zscene") == 0) {
-                    /* Same for a .zscene design document (scenegen). */
-                    char *translated = zan_scenegen_translate(src3, slen3,
-                                                              input_files[fi], NULL, 0);
-                    if (translated) { free(src3); src3 = translated; owned = translated; }
+                if ((size_t)fi < design_count && design_outs[fi]) {
+                    free(src3);
+                    src3 = strdup(design_outs[fi]);
+                    owned = src3;
+                    if (!src3) { fprintf(stderr, "error: out of memory\n"); return 1; }
                 }
                 scan_using_tokens(src3, strlen(src3), stdlib_root,
                                   &input_files, &input_count, &input_cap);
@@ -1665,52 +1682,38 @@ int main(int argc, char **argv) {
             return 1;
         }
         {
-            size_t fl = strlen(input_files[fi]);
-            if (fl > 6 && strcmp(input_files[fi] + fl - 6, ".zform") == 0) {
-                /* Only the primary input's design becomes the entry point;
-                 * the other designs of a multi-window project compile
-                 * alongside it and are opened with `<Name>.Show()`, so the
-                 * program keeps exactly one Main(). */
-                char *translated = zan_formgen_translate(src, slen,
-                                                         input_files[fi], diag,
-                                                         fi == 0);
-                if (!translated) {
-                    fprintf(stderr,
-                            "error: cannot translate design document '%s'\n",
-                            input_files[fi]);
-                    zan_arena_free(arena);
-                    free(source);
-                    return 1;
+            /* A .zform/.zscene input is a visual design document: it was
+             * translated up front (design_outs) to a synthetic `partial
+             * class` -- typed widget fields, __BuildForm, __WireForm and
+             * Main -- which is then parsed and merged exactly like a source
+             * file. Only the primary input's design becomes the entry point;
+             * the other designs of a multi-window project compile alongside
+             * it and are opened with `<Name>.Show()`, so the program keeps
+             * exactly one Main(). */
+            if ((size_t)fi < design_count && design_outs[fi]) {
+                char *owned_text = design_outs[fi];
+                design_outs[fi] = NULL;
+                if (fi == 0) {
+                    /* The caller still owns `source` (freed on every exit
+                     * path below), so the primary translation must be that
+                     * buffer - otherwise the exit-path free() double-frees. */
+                    free(src);
+                    src = owned_text;
+                    source = src;
+                } else {
+                    /* Later designs live in the arena, so they are reclaimed
+                     * with zan_arena_free on every exit path. */
+                    src = zan_arena_strdup(arena, owned_text,
+                                           strlen(owned_text));
+                    free(owned_text);
+                    if (!src) {
+                        fprintf(stderr, "error: out of memory\n");
+                        zan_arena_free(arena);
+                        free(source);
+                        return 1;
+                    }
                 }
-                free(src);
-                src = translated;
-                slen = strlen(translated);
-                /* The translation replaces the first source buffer: the caller
-                 * still owns `source` (freed on every exit path below), so it
-                 * must now point at the translation, not the freed original -
-                 * otherwise the exit-path free() double-frees. */
-                if (fi == 0) source = translated;
-            } else if (fl > 7 && strcmp(input_files[fi] + fl - 7, ".zscene") == 0) {
-                /* A .zscene input is a scene design document: scenegen
-                 * projects its typed SceneElement fields, BuildScene() and
-                 * the SceneView render loop, with Main() on the primary
-                 * input only (the other designs are opened with
-                 * `<Name>.Run()`). */
-                char *translated = zan_scenegen_translate(src, slen,
-                                                          input_files[fi], diag,
-                                                          fi == 0);
-                if (!translated) {
-                    fprintf(stderr,
-                            "error: cannot translate scene document '%s'\n",
-                            input_files[fi]);
-                    zan_arena_free(arena);
-                    free(source);
-                    return 1;
-                }
-                free(src);
-                src = translated;
-                slen = strlen(translated);
-                if (fi == 0) source = translated;
+                slen = strlen(src);
             }
         }
         zan_diag_add_file(diag, input_files[fi], src);
@@ -1782,6 +1785,7 @@ int main(int argc, char **argv) {
             if (!ast->comp_unit.ns) ast->comp_unit.ns = unit->comp_unit.ns;
         }
     }
+    free(design_outs); /* entries were moved into `source`/the arena */
 
     phase("parse");
 
@@ -1794,12 +1798,57 @@ int main(int argc, char **argv) {
         zan_parser_desugar_events(ast, arena, diag);
         zan_compile_trace("nsresolve");
         zan_nsresolve_run(ast, arena, diag);
-        zan_compile_trace("jsongen");
-        zan_jsongen_run(ast, arena, diag);
-        zan_compile_trace("dbgen");
-        zan_dbgen_run(ast, arena, diag);
-        zan_compile_trace("routegen");
-        zan_routegen_run(ast, arena, diag);
+
+        /* --gen-meta: dump the compilation-unit metadata the Zan-scripted
+         * code generators consume (see genmeta.h) and exit. Must run before
+         * the generators, whose rewrites would otherwise change the call
+         * sites under export. Debugging aid for writing/testing generators. */
+        if (gen_meta_path) {
+            char *meta = zan_genmeta_export(ast);
+            if (!meta) {
+                fprintf(stderr, "error: cannot export metadata\n");
+                zan_arena_free(arena);
+                free(source);
+                return 1;
+            }
+            FILE *out = fopen(gen_meta_path, "wb");
+            int ok = out &&
+                     fwrite(meta, 1, strlen(meta), out) == strlen(meta) &&
+                     fclose(out) == 0;
+            free(meta);
+            if (!ok) {
+                fprintf(stderr, "error: cannot write metadata '%s'\n",
+                        gen_meta_path);
+                zan_arena_free(arena);
+                free(source);
+                return 1;
+            }
+            zan_arena_free(arena);
+            free(source);
+            return 0;
+        }
+
+        zan_compile_trace("codegen");
+        /* jsongen/dbgen/routegen moved into Zan (stdlib/System/Compiler/
+         * ZanGen.zan): one subprocess run exports the metadata, generates the
+         * binders/mappers/routes and returns rewrite directives for the call
+         * sites.
+         * --no-gen (compiling the generators themselves) falls back to the
+         * C inline jsongen/routegen so stdlib code that uses Json.Serialize
+         * (e.g. System.Diagnostics.ServerMetrics, pulled in through
+         * System.IO/Threading) still compiles without the generator
+         * subprocess. */
+        if (zan_gen_enabled) {
+            if (zan_gen_codegen(ast, arena, diag, resolved_stdlib_root) != 0) {
+                zan_arena_free(arena);
+                free(source);
+                return 1;
+            }
+        } else {
+            zan_jsongen_run(ast, arena, diag);
+            zan_routegen_run(ast, arena, diag);
+            zan_dbgen_run(ast, arena, diag);
+        }
         zan_compile_trace("resolve done");
     }
 

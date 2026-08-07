@@ -1,0 +1,937 @@
+// GenRoute.zan -- System.Web 属性路由生成器(routegen.c 迁移)。
+//
+// 扫描单元里呈 Controller 形状的类,为每个公开 action 生成一个
+// async HttpContext 蹦床(__h_<Controller>_<Action>)与一条
+// app.Map(...) 注册(方法/路径/名称/元数据/参数文档),全部放进
+// 合成的 __AttrRoutes 类。属性三层合并(类默认 → 方法覆盖),
+// 请求参数从 action 体内的 this.In/InInt/Need/Paged 调用点发现——
+// 调用本身就是参数的声明,没有第二处可声明。
+//
+// 本模块只消费 genmeta 导出的单元元数据(classes + calls),不碰 AST。
+namespace System.Compiler;
+
+class GenRoute {
+    static JsonValue Reply;
+    static Dict<string, JsonValue> ClassOf;   /* 类名 → 类 JSON */
+    static JsonValue Unit;
+
+    /* 属性元数据累积(prop → kind/sval):kind 0 int 1 bool 2 string 3 enum */
+    static Dict<string, int> MetaKind;
+    static Dict<string, string> MetaVal;
+    static List<string> MetaOrder;            /* 插入序,保证 .Meta 输出顺序 */
+
+    /* 参数文档(每个 action 重建) */
+    static List<string> PName;
+    static List<string> PType;
+    static List<bool> PRequired;
+    static List<string> PDef;
+    static List<string> PDesc;
+    static List<string> PWhere;
+
+    /* ctor 参数 → 属性名映射(编译期属性类的赋值扫描) */
+    static List<string> PmParam;
+    static List<string> PmProp;
+
+    /* 常量求值输出 */
+    static int ConstKind;
+    static string ConstSval;
+
+    /* reader 描述(rg_readers 表) */
+    static string RType;
+    static bool RRequired;
+    static bool RHasDefault;
+    static bool RHasLabel;
+    static string RWhere;
+
+    static JsonValue ClassGet(string name) {
+        JsonValue v;
+        if (GenRoute.ClassOf.TryGetValue(name, out v)) { return v; }
+        return null;
+    }
+
+    static void Run(JsonValue req, JsonValue reply) {
+        GenRoute.Reply = reply;
+        GenRoute.ClassOf = new Dict<string, JsonValue>();
+        GenRoute.Unit = req.Get("unit");
+        if (GenRoute.Unit == null) { return; }
+        JsonValue classes = GenRoute.Unit.Get("classes");
+        if (classes != null && classes.IsArray()) {
+            for (int i = 0; i < classes.Count(); i = i + 1) {
+                JsonValue c = classes.At(i);
+                GenRoute.ClassOf.Add(c.Str("name", ""), c);
+            }
+        }
+        StringBuilder handlers = new StringBuilder();
+        StringBuilder reg = new StringBuilder();
+        int nroutes = 0;
+        if (classes != null && classes.IsArray()) {
+            for (int i = 0; i < classes.Count(); i = i + 1) {
+                JsonValue cls = classes.At(i);
+                if (!GenRoute.IsController(cls)) { continue; }
+                nroutes = nroutes + GenRoute.GenController(cls, handlers, reg);
+            }
+        }
+        if (nroutes == 0 || GenCommon.HasError(GenRoute.Reply)) { return; }
+        StringBuilder out0 = new StringBuilder();
+        out0.Append("class __AttrRoutes {\n");
+        out0.Append(handlers.ToString());
+        out0.Append("    static void Register(WebApp app) {\n");
+        out0.Append(reg.ToString());
+        out0.Append("    }\n}\n");
+        GenCommon.AddSource(GenRoute.Reply, "__AttrRoutes", out0);
+    }
+
+    /* ---- 字符串工具 ---- */
+
+    /// 转义为 Zan 字符串字面量正文(与 routegen 的 rg_put_qstr 一致:
+    /// 反斜杠/双引号/LF/CR/TAB 转义,其余原样)。
+    static string Esc(string s) {
+        StringBuilder b = new StringBuilder();
+        int n = s.Length;
+        for (int i = 0; i < n; i = i + 1) {
+            string ch = s.Substring(i, 1);
+            if (ch == "\\") { b.Append("\\\\"); }
+            else if (ch == "\"") { b.Append("\\\""); }
+            else if (ch == "\n") { b.Append("\\n"); }
+            else if (ch == "\r") { b.Append("\\r"); }
+            else if (ch == "\t") { b.Append("\\t"); }
+            else { b.Append(ch); }
+        }
+        return b.ToString();
+    }
+
+    /// 小写(对应 C 的 lower_inplace)。
+    static string Lower(string s) {
+        const string UP = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        const string LO = "abcdefghijklmnopqrstuvwxyz";
+        StringBuilder b = new StringBuilder();
+        int n = s.Length;
+        for (int i = 0; i < n; i = i + 1) {
+            string ch = s.Substring(i, 1);
+            int at = UP.IndexOf(ch);
+            if (at >= 0) { b.Append(LO.Substring(at, 1)); }
+            else { b.Append(ch); }
+        }
+        return b.ToString();
+    }
+
+    /// 十进制解析(rg_cval 的 sval 反推 ival)。
+    static int Atoi(string s) {
+        int v = 0;
+        int i = 0;
+        bool neg = false;
+        if (s.Length > 0 && s.Substring(0, 1) == "-") { neg = true; i = 1; }
+        while (i < s.Length) {
+            int c = s[i] & 255;
+            if (c < 48 || c > 57) { break; }
+            v = v * 10 + (c - 48);
+            i = i + 1;
+        }
+        if (neg) { v = 0 - v; }
+        return v;
+    }
+
+    /* ---- 属性帮助 ---- */
+
+    /// HTTP 动词属性名 → 动词,否则 ""。
+    static string AttrHttpVerb(string n) {
+        if (n == "HttpGet") { return "GET"; }
+        if (n == "HttpPost") { return "POST"; }
+        if (n == "HttpPut") { return "PUT"; }
+        if (n == "HttpDelete") { return "DELETE"; }
+        if (n == "HttpPatch") { return "PATCH"; }
+        if (n == "HttpHead") { return "HEAD"; }
+        if (n == "HttpOptions") { return "OPTIONS"; }
+        return "";
+    }
+
+    /// 结构性属性(按结构解释,不进入用户元数据)。
+    static bool AttrIsStructural(string n) {
+        if (GenRoute.AttrHttpVerb(n).Length > 0) { return true; }
+        if (n == "Route" || n == "ApiController" || n == "NonAction" ||
+            n == "Description" || n == "AttributeUsage" ||
+            n == "DllImport" || n == "StructLayout" || n == "Obsolete") {
+            return true;
+        }
+        return false;
+    }
+
+    static bool AttrNamed(JsonValue d, string nm) {
+        JsonValue attrs = d.Get("attrs");
+        if (attrs == null || !attrs.IsArray()) { return false; }
+        for (int i = 0; i < attrs.Count(); i = i + 1) {
+            if (attrs.At(i).Str("name", "") == nm) { return true; }
+        }
+        return false;
+    }
+
+    /// 属性类上第一个 <name>(...) 的字符串参数;无则 ""。
+    static string AttrStringArg(JsonValue d, string nm) {
+        JsonValue attrs = d.Get("attrs");
+        if (attrs == null || !attrs.IsArray()) { return ""; }
+        for (int i = 0; i < attrs.Count(); i = i + 1) {
+            JsonValue a = attrs.At(i);
+            if (a.Str("name", "") != nm) { continue; }
+            JsonValue args = a.Get("args");
+            if (args != null && args.Count() >= 1) {
+                JsonValue a0 = args.At(0);
+                if (a0.Str("k", "") == "lit" && a0.Str("t", "") == "str") {
+                    return a0.Str("v", "");
+                }
+            }
+            return "";
+        }
+        return "";
+    }
+
+    /* ---- 控制器/action 识别 ---- */
+
+    static bool DerivesFrom(JsonValue cls, string basename) {
+        JsonValue bases = cls.Get("bases");
+        if (bases == null || !bases.IsArray()) { return false; }
+        for (int i = 0; i < bases.Count(); i = i + 1) {
+            if (bases.At(i).AsString("") == basename) { return true; }
+        }
+        return false;
+    }
+
+    static bool IsController(JsonValue cls) {
+        string nm = cls.Str("name", "");
+        if (nm.EndsWith("Controller")) { return true; }
+        if (GenRoute.DerivesFrom(cls, "Controller")) { return true; }
+        if (GenRoute.DerivesFrom(cls, "ApiController")) { return true; }
+        if (GenRoute.AttrNamed(cls, "Route")) { return true; }
+        if (GenRoute.AttrNamed(cls, "ApiController")) { return true; }
+        return false;
+    }
+
+    /* ---- 显示名/模块名/token ---- */
+
+    /// 原始(未改名)简单类名:nsresolve 会给重名控制器改名,但
+    /// orig_name 保留源码名,路由/视图键保持可读。
+    static string ControllerDisplay(JsonValue cls) {
+        string orig = cls.Str("orig", "");
+        if (orig.Length > 0) { return orig; }
+        return cls.Str("name", "");
+    }
+
+    /// 模块 = 应用根命名空间之下的部分:第一个 '.' 之后的段
+    /// ("ZanWeb.Admin.System" → "Admin.System";根命名空间为空)。
+    static string ControllerModule(JsonValue cls) {
+        string ns = cls.Str("ns", "");
+        int dot = ns.IndexOf(".");
+        if (dot >= 0) { return ns.Substring(dot + 1); }
+        return "";
+    }
+
+    /// action 名的控制器半段:源码名,程序里另有同名控制器时带模块前缀。
+    static string ControllerActionName(JsonValue cls, string disp, string mod) {
+        int seen = 0;
+        JsonValue classes = GenRoute.Unit.Get("classes");
+        if (classes != null && classes.IsArray()) {
+            for (int i = 0; i < classes.Count(); i = i + 1) {
+                JsonValue o = classes.At(i);
+                if (o.Str("kind", "") != "class") { continue; }
+                if (!GenRoute.IsController(o)) { continue; }
+                if (GenRoute.ControllerDisplay(o) == disp) {
+                    seen = seen + 1;
+                }
+            }
+        }
+        if (seen > 1 && mod.Length > 0) { return mod + "." + disp; }
+        return disp;
+    }
+
+    /// 控制器 token = 原始类名去掉 "Controller" 后缀并小写。
+    static string ControllerToken(JsonValue cls) {
+        string nm = GenRoute.ControllerDisplay(cls);
+        if (nm.EndsWith("Controller")) {
+            nm = nm.Substring(0, nm.Length - 10);
+        }
+        return GenRoute.Lower(nm);
+    }
+
+    /* ---- 路径拼装 ---- */
+
+    static string BuildPath(string clsTpl, string mTpl, string ctrlTok,
+                            string actionTok) {
+        string tpl;
+        if (mTpl.StartsWith("/")) {
+            tpl = mTpl;
+        } else if (mTpl.Length > 0) {
+            if (clsTpl.Length > 0) { tpl = clsTpl + "/" + mTpl; }
+            else { tpl = mTpl; }
+        } else {
+            tpl = clsTpl;
+        }
+        if (tpl.IndexOf("[action]") < 0 && !mTpl.StartsWith("/")) {
+            if (tpl.EndsWith("/")) { tpl = tpl + "[action]"; }
+            else { tpl = tpl + "/[action]"; }
+        }
+        /* token 替换 + 斜杠归一化 */
+        StringBuilder sub = new StringBuilder();
+        int i = 0;
+        int n = tpl.Length;
+        while (i < n) {
+            if (n - i >= 12 && tpl.Substring(i, 12) == "[controller]") {
+                sub.Append(ctrlTok);
+                i = i + 12;
+            } else if (n - i >= 8 && tpl.Substring(i, 8) == "[action]") {
+                sub.Append(actionTok);
+                i = i + 8;
+            } else {
+                sub.Append(tpl.Substring(i, 1));
+                i = i + 1;
+            }
+        }
+        /* 前导 '/'、折叠重复 '/'、去尾 '/' */
+        StringBuilder out0 = new StringBuilder();
+        out0.Append("/");
+        bool prevSlash = true;
+        string s = sub.ToString();
+        for (int j = 0; j < s.Length; j = j + 1) {
+            string ch = s.Substring(j, 1);
+            if (ch == "/") {
+                if (prevSlash) { continue; }
+                out0.Append(ch);
+                prevSlash = true;
+            } else {
+                out0.Append(ch);
+                prevSlash = false;
+            }
+        }
+        string r = out0.ToString();
+        while (r.Length > 1 && r.EndsWith("/")) {
+            r = r.Substring(0, r.Length - 1);
+        }
+        return r;
+    }
+
+    /* ---- 编译期常量求值(genmeta 表达式树 → kind/sval) ---- */
+
+    /// 枚举成员求值(仅需要名字;数值无消费者)。
+    static bool EvalConst(JsonValue e) {
+        GenRoute.ConstSval = "";
+        if (e == null) { return false; }
+        string k = e.Str("k", "");
+        if (k == "lit") {
+            string t = e.Str("t", "");
+            if (t == "int") {
+                GenRoute.ConstKind = 0;
+                GenRoute.ConstSval = Convert.ToString(e.Int("v", 0));
+                return true;
+            }
+            if (t == "bool") {
+                GenRoute.ConstKind = 1;
+                if (e.Bool("v", false)) { GenRoute.ConstSval = "true"; }
+                else { GenRoute.ConstSval = "false"; }
+                return true;
+            }
+            if (t == "str") {
+                GenRoute.ConstKind = 2;
+                GenRoute.ConstSval = e.Str("v", "");
+                return true;
+            }
+            return false;
+        }
+        if (k == "mem") {
+            JsonValue o = e.Get("o");
+            if (o != null && o.Str("k", "") == "id") {
+                GenRoute.ConstKind = 3;
+                GenRoute.ConstSval = e.Str("n", "");
+                return true;
+            }
+            return false;
+        }
+        if (k == "id") {
+            GenRoute.ConstKind = 3;
+            GenRoute.ConstSval = e.Str("n", "");
+            return true;
+        }
+        if (k == "uni" && e.Str("op", "") == "-") {
+            if (GenRoute.EvalConst(e.Get("o")) && GenRoute.ConstKind == 0) {
+                string sv = GenRoute.ConstSval;
+                if (sv.StartsWith("-")) { GenRoute.ConstSval = sv.Substring(1); }
+                else if (sv != "0") { GenRoute.ConstSval = "-" + sv; }
+                return true;
+            }
+            return false;
+        }
+        return false;
+    }
+
+    /* ---- 属性元数据合并 ---- */
+
+    static void MetaSet(string key, bool onlyAbsent) {
+        string dummy;
+        if (onlyAbsent && GenRoute.MetaVal.TryGetValue(key, out dummy)) {
+            return;
+        }
+        if (GenRoute.MetaVal.ContainsKey(key)) { GenRoute.MetaVal.Remove(key); }
+        GenRoute.MetaVal.Add(key, GenRoute.ConstSval);
+        if (GenRoute.MetaKind.ContainsKey(key)) { GenRoute.MetaKind.Remove(key); }
+        GenRoute.MetaKind.Add(key, GenRoute.ConstKind);
+        bool seen = false;
+        for (int i = 0; i < GenRoute.MetaOrder.Count; i = i + 1) {
+            if (GenRoute.MetaOrder[i] == key) { seen = true; }
+        }
+        if (!seen) { GenRoute.MetaOrder.Add(key); }
+    }
+
+    static int MetaGetKind(string key) {
+        int k;
+        if (GenRoute.MetaKind.TryGetValue(key, out k)) { return k; }
+        return -1;
+    }
+
+    static string MetaGetVal(string key) {
+        string v;
+        if (GenRoute.MetaVal.TryGetValue(key, out v)) { return v; }
+        return "";
+    }
+
+    static string PmapProp(string param) {
+        for (int i = 0; i < GenRoute.PmParam.Count; i = i + 1) {
+            if (GenRoute.PmParam[i] == param) { return GenRoute.PmProp[i]; }
+        }
+        return "";
+    }
+
+    /// 应用一次属性用法到元数据:属性类默认值(仅缺省时)先,
+    /// 用法的位置/命名参数后(总是覆盖)。
+    static void ApplyAttr(JsonValue attr) {
+        string base0 = attr.Str("name", "");
+        JsonValue cls = GenRoute.ClassGet(base0);
+        if (cls == null) { cls = GenRoute.ClassGet(base0 + "Attribute"); }
+        if (cls != null && cls.Str("kind", "") != "class") { cls = null; }
+
+        GenRoute.PmParam = new List<string>();
+        GenRoute.PmProp = new List<string>();
+        JsonValue ctor = null;
+        if (cls != null) {
+            JsonValue ctors = cls.Get("ctors");
+            if (ctors != null && ctors.IsArray() && ctors.Count() > 0) {
+                ctor = ctors.At(0);
+                JsonValue assigns = ctor.Get("assigns");
+                if (assigns != null && assigns.IsArray()) {
+                    for (int i = 0; i < assigns.Count(); i = i + 1) {
+                        JsonValue a = assigns.At(i);
+                        GenRoute.PmParam.Add(a.Str("param", ""));
+                        GenRoute.PmProp.Add(a.Str("prop", ""));
+                    }
+                }
+            }
+            /* 属性/字段初始化默认值(仅缺省时) */
+            JsonValue props = cls.Get("props");
+            if (props != null && props.IsArray()) {
+                for (int i = 0; i < props.Count(); i = i + 1) {
+                    JsonValue p = props.At(i);
+                    if (GenRoute.EvalConst(p.Get("init"))) {
+                        GenRoute.MetaSet(p.Str("name", ""), true);
+                    }
+                }
+            }
+            /* ctor 参数默认值经 Prop=param 映射(仅缺省时) */
+            if (ctor != null) {
+                JsonValue ps = ctor.Get("params");
+                if (ps != null && ps.IsArray()) {
+                    for (int i = 0; i < ps.Count(); i = i + 1) {
+                        JsonValue p = ps.At(i);
+                        if (!p.Has("def")) { continue; }
+                        string prop = GenRoute.PmapProp(p.Str("name", ""));
+                        if (prop.Length == 0) { continue; }
+                        if (GenRoute.EvalConst(p.Get("def"))) {
+                            GenRoute.MetaSet(prop, true);
+                        }
+                    }
+                }
+            }
+        }
+
+        /* 用法参数(覆盖) */
+        int posi = 0;
+        JsonValue args = attr.Get("args");
+        if (args != null && args.IsArray()) {
+            for (int i = 0; i < args.Count(); i = i + 1) {
+                JsonValue a = args.At(i);
+                if (a.Str("k", "") == "assign") {
+                    JsonValue l = a.Get("l");
+                    JsonValue r = a.Get("r");
+                    if (l != null && l.Str("k", "") == "id" &&
+                        GenRoute.EvalConst(r)) {
+                        GenRoute.MetaSet(l.Str("n", ""), false);
+                    }
+                } else {
+                    /* 位置参数 → ctor 参数 → 属性 */
+                    string prop = "";
+                    if (ctor != null) {
+                        JsonValue ps = ctor.Get("params");
+                        if (posi < ps.Count()) {
+                            prop = GenRoute.PmapProp(
+                                ps.At(posi).Str("name", ""));
+                        }
+                    }
+                    if (GenRoute.EvalConst(a) && prop.Length > 0) {
+                        GenRoute.MetaSet(prop, false);
+                    }
+                    posi = posi + 1;
+                }
+            }
+        }
+    }
+
+    /* ---- 请求参数发现 ---- */
+
+    /// reader 名 → (type, required, has_default, has_label, where)。
+    /// 返回 false 表示不是 reader。
+    static bool ReaderFor(string name) {
+        GenRoute.RRequired = false;
+        GenRoute.RHasDefault = false;
+        GenRoute.RHasLabel = false;
+        GenRoute.RWhere = "query";
+        if (name == "In") { GenRoute.RType = "string"; return true; }
+        if (name == "InText") { GenRoute.RType = "string"; return true; }
+        if (name == "InRaw") { GenRoute.RType = "string"; return true; }
+        if (name == "InInt") { GenRoute.RType = "int"; GenRoute.RHasDefault = true; return true; }
+        if (name == "InLong") { GenRoute.RType = "long"; GenRoute.RHasDefault = true; return true; }
+        if (name == "InDouble") { GenRoute.RType = "number"; GenRoute.RHasDefault = true; return true; }
+        if (name == "InBool") { GenRoute.RType = "bool"; GenRoute.RHasDefault = true; return true; }
+        if (name == "HasIn") { GenRoute.RType = "bool"; return true; }
+        if (name == "Need") { GenRoute.RType = "string"; GenRoute.RRequired = true; GenRoute.RHasLabel = true; return true; }
+        if (name == "NeedText") { GenRoute.RType = "string"; GenRoute.RRequired = true; GenRoute.RHasLabel = true; return true; }
+        if (name == "NeedInt") { GenRoute.RType = "int"; GenRoute.RRequired = true; GenRoute.RHasLabel = true; return true; }
+        if (name == "NeedLong") { GenRoute.RType = "long"; GenRoute.RRequired = true; GenRoute.RHasLabel = true; return true; }
+        if (name == "Param") { GenRoute.RType = "string"; GenRoute.RRequired = true; GenRoute.RWhere = "path"; return true; }
+        return false;
+    }
+
+    /// 字面量参数原样输出;非字面量(动态默认值是代码,不是文档)为 ""。
+    static string Literal(JsonValue e) {
+        if (e == null) { return ""; }
+        if (e.Str("k", "") == "uni" && e.Str("op", "") == "-" &&
+            e.Get("o") != null) {
+            /* 仅前导负号有意义 */
+            JsonValue o = e.Get("o");
+            string ot = o.Str("t", "");
+            if (ot == "int") { return Convert.ToString(-(long)o.Int("v", 0)); }
+            if (ot == "double") { return Convert.ToString(0.0 - o.Double("v", 0.0)); }
+            return "";
+        }
+        if (e.Str("k", "") != "lit") { return ""; }
+        string t = e.Str("t", "");
+        if (t == "int") { return Convert.ToString(e.Int("v", 0)); }
+        if (t == "double") { return Convert.ToString(e.Double("v", 0.0)); }
+        if (t == "bool") {
+            if (e.Bool("v", false)) { return "true"; }
+            return "false";
+        }
+        if (t == "str") { return e.Str("v", ""); }
+        return "";
+    }
+
+    static void ParamsAdd(JsonValue call) {
+        if (GenRoute.PName.Count >= 64) { return; }
+        JsonValue args = call.Get("args");
+        if (args == null || args.Count() < 1) { return; }
+        JsonValue a0 = args.At(0);
+        if (a0.Str("k", "") != "lit" || a0.Str("t", "") != "str") { return; }
+        string nm = a0.Str("v", "");
+        if (nm.Length == 0) { return; }
+
+        /* 同名参数读两次(一次带默认,一次必填):保留更强的声明,不重复 */
+        for (int i = 0; i < GenRoute.PName.Count; i = i + 1) {
+            if (GenRoute.PName[i] != nm) { continue; }
+            if (GenRoute.RRequired) { GenRoute.PRequired[i] = true; }
+            if (GenRoute.RHasLabel && args.Count() >= 2 &&
+                GenRoute.PDesc[i].Length == 0) {
+                GenRoute.PDesc[i] = GenRoute.Literal(args.At(1));
+            }
+            if (GenRoute.RHasDefault && args.Count() >= 2 &&
+                GenRoute.PDef[i].Length == 0) {
+                GenRoute.PDef[i] = GenRoute.Literal(args.At(1));
+            }
+            if (GenRoute.PType[i] == "string") {
+                GenRoute.PType[i] = GenRoute.RType;
+            }
+            return;
+        }
+
+        GenRoute.PName.Add(nm);
+        GenRoute.PType.Add(GenRoute.RType);
+        GenRoute.PRequired.Add(GenRoute.RRequired);
+        GenRoute.PWhere.Add(GenRoute.RWhere);
+        if (args.Count() >= 2) {
+            if (GenRoute.RHasDefault) {
+                GenRoute.PDef.Add(GenRoute.Literal(args.At(1)));
+            } else {
+                GenRoute.PDef.Add("");
+            }
+            if (GenRoute.RHasLabel) {
+                GenRoute.PDesc.Add(GenRoute.Literal(args.At(1)));
+            } else {
+                GenRoute.PDesc.Add("");
+            }
+        } else {
+            GenRoute.PDef.Add("");
+            GenRoute.PDesc.Add("");
+        }
+    }
+
+    static bool PNameSeen(string nm) {
+        for (int i = 0; i < GenRoute.PName.Count; i = i + 1) {
+            if (GenRoute.PName[i] == nm) { return true; }
+        }
+        return false;
+    }
+
+    static void ParamAddOne(string nm, string ty, string desc, string def) {
+        if (GenRoute.PName.Count >= 64) { return; }
+        if (GenRoute.PNameSeen(nm)) { return; }
+        GenRoute.PName.Add(nm);
+        GenRoute.PType.Add(ty);
+        GenRoute.PRequired.Add(false);
+        GenRoute.PDef.Add(def);
+        GenRoute.PDesc.Add(desc);
+        GenRoute.PWhere.Add("query");
+    }
+
+    /// this.Paged(defOrder, defLimit) 读每个列表屏共享的五个参数
+    /// (Controller.Paged → ListQuery.From)。读发生在框架内部,因此
+    /// 在这里展开唯一调用点——否则 /api/docs 会把列表端点描述成
+    /// 不取任何参数。
+    static void ParamsAddPaged(JsonValue call) {
+        string def_order = "";
+        string def_limit = "";
+        JsonValue args = call.Get("args");
+        if (args != null && args.Count() >= 1) {
+            def_order = GenRoute.Literal(args.At(0));
+        }
+        if (args != null && args.Count() >= 2) {
+            def_limit = GenRoute.Literal(args.At(1));
+        }
+        /* 同名显式读优先:已存在则跳过展开 */
+        GenRoute.ParamAddOne("page", "int", "页码，从 1 开始", "1");
+        GenRoute.ParamAddOne("limit", "int", "每页条数", def_limit);
+        GenRoute.ParamAddOne("order", "string", "排序字段", def_order);
+        GenRoute.ParamAddOne("dir", "string", "排序方向：desc 或 asc", "desc");
+        GenRoute.ParamAddOne("kw", "string", "搜索关键词", "");
+    }
+
+    /// 扫描一个 action 方法体里的输入调用点(经 genmeta 的 calls 数组,
+    /// 按所属类/方法过滤)。
+    static void ScanCalls(string cls, string fn) {
+        JsonValue calls = GenRoute.Unit.Get("calls");
+        if (calls == null || !calls.IsArray()) { return; }
+        for (int i = 0; i < calls.Count(); i = i + 1) {
+            JsonValue call = calls.At(i);
+            if (call.Str("cls", "") != cls) { continue; }
+            if (call.Str("fn", "") != fn) { continue; }
+        /* 接收者必须是控制器自身或它的 HttpContext:任何对象都可能有个
+         * 叫 In() 的方法,都写进文档就是噪音。this / ctx / c 直接命中;
+         * 接收者是调用时(recv="call#<id>")查它的表达式树,只有
+         * `this.Ctx()`(名字为 Ctx 的调用)算数。 */
+        string recv = call.Str("recv", "");
+        bool ok = recv == "this" || recv == "id:ctx" || recv == "id:c";
+        if (!ok && recv.StartsWith("call#")) {
+            JsonValue rx = call.Get("recvx");
+            if (rx != null && rx.IsObject()) {
+                JsonValue rf = rx.Get("f");
+                if (rx.Str("k", "") == "call" && rf != null &&
+                    rf.IsObject() && rf.Str("k", "") == "mem" &&
+                    rf.Str("n", "") == "Ctx") {
+                    ok = true;
+                }
+            }
+        }
+        if (!ok) { continue; }
+            string name = call.Str("name", "");
+            if (GenRoute.ReaderFor(name)) {
+                GenRoute.ParamsAdd(call);
+            } else if (name == "Paged") {
+                GenRoute.ParamsAddPaged(call);
+            }
+        }
+    }
+
+    /// 路由路径段也是参数,即使 action 从未在读取中命名它
+    /// ("{id:int}" → id/int/path)。
+    static void ParamsFromPath(string path) {
+        int n = path.Length;
+        int i = 0;
+        while (i < n) {
+            if (path.Substring(i, 1) != "{") { i = i + 1; continue; }
+            int e = path.IndexOf("}", i);
+            if (e < 0) { return; }
+            string nm = path.Substring(i + 1, e - i - 1);
+            string ty = "string";
+            int colon = nm.IndexOf(":");
+            if (colon >= 0) {
+                string rest = nm.Substring(colon + 1);
+                nm = nm.Substring(0, colon);
+                if (rest == "int") { ty = "int"; }
+                else if (rest == "long") { ty = "long"; }
+            }
+            bool seen = false;
+            for (int j = 0; j < GenRoute.PName.Count; j = j + 1) {
+                if (GenRoute.PName[j] == nm) {
+                    GenRoute.PWhere[j] = "path";
+                    GenRoute.PRequired[j] = true;
+                    seen = true;
+                }
+            }
+            if (!seen && GenRoute.PName.Count < 64) {
+                GenRoute.PName.Add(nm);
+                GenRoute.PType.Add(ty);
+                GenRoute.PRequired.Add(true);
+                GenRoute.PDef.Add("");
+                GenRoute.PDesc.Add("");
+                GenRoute.PWhere.Add("path");
+            }
+            i = e;
+        }
+    }
+
+    static void EmitParams(StringBuilder out0) {
+        for (int i = 0; i < GenRoute.PName.Count; i = i + 1) {
+            out0.Append("\n            .Param(\"");
+            out0.Append(GenRoute.Esc(GenRoute.PName[i]));
+            out0.Append("\", \"");
+            out0.Append(GenRoute.PType[i]);
+            out0.Append("\", ");
+            if (GenRoute.PRequired[i]) { out0.Append("true"); }
+            else { out0.Append("false"); }
+            out0.Append(", \"");
+            out0.Append(GenRoute.Esc(GenRoute.PDef[i]));
+            out0.Append("\", \"");
+            out0.Append(GenRoute.Esc(GenRoute.PDesc[i]));
+            out0.Append("\", \"");
+            out0.Append(GenRoute.PWhere[i]);
+            out0.Append("\")");
+        }
+    }
+
+    /* ---- fluent 元数据输出 ---- */
+
+    static void EmitFluent(StringBuilder out0, string title) {
+        if (title.Length > 0) {
+            out0.Append(".Title(\"");
+            out0.Append(GenRoute.Esc(title));
+            out0.Append("\")");
+        }
+
+        /* Authorization 枚举 → 分发器在该 action 运行前的要求。
+         * None/Auth 无所求(会话本来就为每个请求解析);Login 要求会话;
+         * Grant -- 给 token 客户端的 ApiAuth -- 要求会话 AND 该 action
+         * 的授权,而角色授予的正是这一个动作。声明 Grant 即完整声明
+         * 一个页面的安全。 */
+        if (GenRoute.MetaGetKind("Authorization") == 3) {
+            string av = GenRoute.MetaGetVal("Authorization");
+            if (av == "Login") { out0.Append(".Login()"); }
+            else if (av == "Grant") { out0.Append(".Auth()"); }
+            else if (av == "ApiAuth") { out0.Append(".Auth()"); }
+        }
+        /* IsMenu → 在管理菜单中呈现(路由上的布尔旗标)。 */
+        if (GenRoute.MetaGetKind("IsMenu") == 1 &&
+            GenRoute.MetaGetVal("IsMenu") == "true") {
+            out0.Append(".Menu()");
+        }
+        /* 仅路由约定的可选属性:Lock → 请求锁范围,Upload → 流式上传。 */
+        if (GenRoute.MetaGetKind("Lock") == 2 &&
+            GenRoute.MetaGetVal("Lock").Length > 0) {
+            out0.Append(".Lock(\"");
+            out0.Append(GenRoute.Esc(GenRoute.MetaGetVal("Lock")));
+            out0.Append("\")");
+        }
+        if (GenRoute.MetaGetKind("Upload") == 1 &&
+            GenRoute.MetaGetVal("Upload") == "true") {
+            out0.Append(".Upload()");
+        }
+        if (GenRoute.MetaGetKind("ApiMax") == 0 &&
+            GenRoute.Atoi(GenRoute.MetaGetVal("ApiMax")) < 1000) {
+            if (GenRoute.MetaGetKind("RateBy") == 2) {
+                string scope = GenRoute.MetaGetVal("RateBy");
+                if (scope == "uid" || scope == "ip") {
+                    out0.Append(".LimitBy(");
+                    out0.Append(GenRoute.MetaGetVal("ApiMax"));
+                    out0.Append(", \"");
+                    out0.Append(GenRoute.Esc(scope));
+                    out0.Append("\")");
+                } else {
+                    out0.Append(".Limit(");
+                    out0.Append(GenRoute.MetaGetVal("ApiMax"));
+                    out0.Append(")");
+                }
+            } else {
+                out0.Append(".Limit(");
+                out0.Append(GenRoute.MetaGetVal("ApiMax"));
+                out0.Append(")");
+            }
+        }
+
+        /* 求值过的元数据全部忠实带过 */
+        for (int i = 0; i < GenRoute.MetaOrder.Count; i = i + 1) {
+            string key = GenRoute.MetaOrder[i];
+            out0.Append(".Meta(\"");
+            out0.Append(GenRoute.Esc(key));
+            out0.Append("\", \"");
+            out0.Append(GenRoute.Esc(GenRoute.MetaGetVal(key)));
+            out0.Append("\")");
+        }
+    }
+
+    /* ---- 控制器生成 ---- */
+
+    /// 生成一个控制器的全部路由;返回路由数。
+    static int GenController(JsonValue cls, StringBuilder handlers,
+                             StringBuilder reg) {
+        string cname = cls.Str("name", "");
+        string ctrltok = GenRoute.ControllerToken(cls);
+        string cmod = GenRoute.ControllerModule(cls);
+        string cdisp = GenRoute.ControllerDisplay(cls);
+        string cact = GenRoute.ControllerActionName(cls, cdisp, cmod);
+        string clsTpl = GenRoute.AttrStringArg(cls, "Route");
+        string clsDesc = GenRoute.AttrStringArg(cls, "Description");
+        bool apiController = GenRoute.AttrNamed(cls, "ApiController");
+        int nroutes = 0;
+
+        JsonValue methods = cls.Get("methods");
+        if (methods == null || !methods.IsArray()) { return 0; }
+        for (int mi = 0; mi < methods.Count(); mi = mi + 1) {
+            JsonValue m = methods.At(mi);
+            if (m.Bool("ctor", false)) { continue; }
+            if (GenRoute.AttrNamed(m, "NonAction")) { continue; }
+
+            bool tagged = GenRoute.AttrNamed(m, "Route") ||
+                          GenRoute.AttrHttpVerb(
+                              GenRoute.FirstVerbAttr(m)).Length > 0;
+            if (!tagged && !apiController) { continue; }
+
+            /* 只有公开 action 成为路由 */
+            if (m.Bool("private", false) || m.Bool("protected", false)) {
+                continue;
+            }
+
+            /* 支持的形状:0 参数,或单个 HttpContext 参数 */
+            JsonValue ps = m.Get("params");
+            int np = ps != null ? ps.Count() : 0;
+            bool ctxParam = false;
+            if (np == 1 && ps.At(0).Str("type", "") == "HttpContext") {
+                ctxParam = true;
+            }
+            if (np != 0 && !ctxParam) { continue; }
+
+            string mname = m.Str("name", "");
+            string actiontok = GenRoute.Lower(mname);
+
+            string verb = GenRoute.MethodVerb(m);
+            if (verb.Length == 0) { verb = "GET"; }
+
+            string mTpl = GenRoute.AttrStringArg(m, "Route");
+            string path = GenRoute.BuildPath(clsTpl, mTpl, ctrltok,
+                                             actiontok);
+
+            /* 三层元数据合并:类 → 方法(方法覆盖) */
+            GenRoute.MetaKind = new Dict<string, int>();
+            GenRoute.MetaVal = new Dict<string, string>();
+            GenRoute.MetaOrder = new List<string>();
+            JsonValue attrs = cls.Get("attrs");
+            if (attrs != null && attrs.IsArray()) {
+                for (int a = 0; a < attrs.Count(); a = a + 1) {
+                    JsonValue at = attrs.At(a);
+                    if (!GenRoute.AttrIsStructural(at.Str("name", ""))) {
+                        GenRoute.ApplyAttr(at);
+                    }
+                }
+            }
+            attrs = m.Get("attrs");
+            if (attrs != null && attrs.IsArray()) {
+                for (int a = 0; a < attrs.Count(); a = a + 1) {
+                    JsonValue at = attrs.At(a);
+                    if (!GenRoute.AttrIsStructural(at.Str("name", ""))) {
+                        GenRoute.ApplyAttr(at);
+                    }
+                }
+            }
+            string mDesc = GenRoute.AttrStringArg(m, "Description");
+            string title = mDesc.Length > 0 ? mDesc : clsDesc;
+
+            bool isStatic = m.Bool("static", false);
+            bool isAsync = m.Bool("async", false);
+            string hname = "__h_" + cname + "_" + mname;
+            string aw = isAsync ? "await " : "";
+            string arg = ctxParam ? "ctx" : "";
+
+            /* 蹦床:async 以满足 async HttpHandler 委托(WebApp.Dispatch
+             * await 它),让 action 能 await I/O 而不阻塞连接协程。 */
+            handlers.Append("    static async void " + hname +
+                            "(HttpContext ctx) {\n");
+            if (isStatic) {
+                handlers.Append("        try {\n");
+                handlers.Append("            " + aw + cname + "." + mname +
+                                "(" + arg + ");\n");
+                handlers.Append("        } catch (ApiError __e) {\n");
+                handlers.Append("            ctx.Status(__e.Status(), ApiError.Reason(__e.Status()));\n");
+                handlers.Append("            ctx.Api(__e.Code(), __e.Message, \"null\");\n");
+                handlers.Append("        }\n");
+            } else {
+                handlers.Append("        " + cname + " __c = new " + cname +
+                                "();\n");
+                handlers.Append("        __c.__Bind(ctx);\n");
+                string vkey;
+                if (cmod.Length > 0) { vkey = cmod + "." + cdisp + "." + mname; }
+                else { vkey = cdisp + "." + mname; }
+                handlers.Append("        __c.__SetView(\"" + vkey + "\");\n");
+                /* 必填参数以抛 ApiError 中止;在这里捕获,`this.Need(...)`
+                 * 才能读作一个表达式而非每个 action 里的守卫子句。 */
+                handlers.Append("        if (await __c.__BeforeAsync()) {\n");
+                handlers.Append("            try {\n");
+                handlers.Append("                " + aw + "__c." + mname +
+                                "(" + arg + ");\n");
+                handlers.Append("            } catch (ApiError __e) {\n");
+                handlers.Append("                ctx.Status(__e.Status(), ApiError.Reason(__e.Status()));\n");
+                handlers.Append("                ctx.Api(__e.Code(), __e.Message, \"null\");\n");
+                handlers.Append("            }\n");
+                handlers.Append("            await __c.__AfterAsync();\n");
+                handlers.Append("        }\n");
+            }
+            handlers.Append("    }\n");
+
+            /* 注册 */
+            reg.Append("        app.Map(\"" + verb + "\", \"");
+            reg.Append(GenRoute.Esc(path));
+            reg.Append("\", __AttrRoutes." + hname + ")\n            .Named(\"");
+            reg.Append(GenRoute.Esc(cact));
+            reg.Append(".");
+            reg.Append(GenRoute.Esc(mname));
+            reg.Append("\")");
+            GenRoute.EmitFluent(reg, title);
+            GenRoute.PName = new List<string>();
+            GenRoute.PType = new List<string>();
+            GenRoute.PRequired = new List<bool>();
+            GenRoute.PDef = new List<string>();
+            GenRoute.PDesc = new List<string>();
+            GenRoute.PWhere = new List<string>();
+            GenRoute.ScanCalls(cname, mname);
+            GenRoute.ParamsFromPath(path);
+            GenRoute.EmitParams(reg);
+            reg.Append(";\n");
+            nroutes = nroutes + 1;
+        }
+        return nroutes;
+    }
+
+    /// 方法上第一个 HTTP 动词属性名,无则 ""。
+    static string FirstVerbAttr(JsonValue m) {
+        JsonValue attrs = m.Get("attrs");
+        if (attrs == null || !attrs.IsArray()) { return ""; }
+        for (int i = 0; i < attrs.Count(); i = i + 1) {
+            string n = attrs.At(i).Str("name", "");
+            if (GenRoute.AttrHttpVerb(n).Length > 0) { return n; }
+        }
+        return "";
+    }
+
+    static string MethodVerb(JsonValue m) {
+        return GenRoute.AttrHttpVerb(GenRoute.FirstVerbAttr(m));
+    }
+}

@@ -1,0 +1,489 @@
+// GenForm.zan -- .zform 设计文档 → 合成 partial class 的代码生成器。
+// 等价迁移自 src/compiler/formgen.c(输出逐字节一致)。
+//
+// 输入(design 请求的 files[i]):
+//   { "name": "App.zform", "text": "<.zform JSON>", "emitMain": bool }
+// 输出:reply.sources 里追加一段名为 name 的 .zan 源码。
+namespace System.Compiler;
+
+class GenForm {
+    static void Translate(JsonValue req, JsonValue reply) {
+        JsonValue files = req.Get("files");
+        if (files == null) { return; }
+        for (int i = 0; i < files.Count(); i = i + 1) {
+            JsonValue f = files.At(i);
+            string fname = f.Str("name", "");
+            /* 只处理 .zform;.zscene 归 GenScene(与旧 C 的按扩展名分派一致)。 */
+            if (!fname.EndsWith(".zform")) { continue; }
+            string text = f.Str("text", "");
+            bool emitMain = f.Bool("emitMain", false);
+            StringBuilder outText = GenForm.TranslateOne(reply, text, fname, emitMain);
+            if (outText == null) {
+                if (!GenCommon.HasError(reply)) {
+                    GenCommon.Fail(reply,
+                        "cannot translate design document '" + fname + "'");
+                }
+                return;
+            }
+            GenCommon.AddSource(reply, fname, outText);
+        }
+    }
+
+    /// 翻译单个 .zform 文档。失败返回 null;具体诊断(非法 kind 等)
+    /// 已写入 reply 的 error,纯解析失败则不设 error(C 端报通用错误)。
+    static StringBuilder TranslateOne(JsonValue reply, string json,
+                                      string file_name, bool emit_main) {
+        JsonValue root;
+        try {
+            root = JsonValue.Parse(json);
+        } catch (Exception ex) {
+            return null;
+        }
+
+        string name = GenForm.ObjStr(root, "name");
+        if (!GenCommon.IsIdent(name)) {
+            /* fall back to the file's base name (strip dir and .zform) */
+            string base0 = file_name;
+            if (base0 == null) { base0 = ""; }
+            int slash = base0.LastIndexOf("/");
+            int bslash = base0.LastIndexOf("\\");
+            int p = 0;
+            if (slash >= 0 && (bslash < 0 || slash > bslash)) { p = slash + 1; }
+            else if (bslash >= 0) { p = bslash + 1; }
+            string nm = base0.Substring(p);
+            if (nm.EndsWith(".zform")) { nm = nm.Substring(0, nm.Length - 6); }
+            if (nm.Length > 127) { nm = nm.Substring(0, 127); }
+            if (!GenCommon.IsIdent(nm)) { nm = "Form"; }
+            name = nm;
+        }
+
+        JsonValue fields = root.Get("fields");
+        GenForm.ValidateFields(reply, fields, file_name);
+        if (GenCommon.HasError(reply)) { return null; }
+
+        int win_w = 480;
+        int win_h = 520;
+        JsonValue w = root.Get("winW");
+        if (w != null && w.IsNumber() && w.AsInt(0) > 0) { win_w = w.AsInt(0); }
+        JsonValue h = root.Get("winH");
+        if (h != null && h.IsNumber() && h.AsInt(0) > 0) { win_h = h.AsInt(0); }
+        bool free_mode = GenForm.ObjNum(root, "layoutMode", 0) == 1;
+        string title = GenForm.ObjStr(root, "winTitle");
+        if (title.Length == 0) { title = name; }
+        bool center = GenForm.ObjBool(root, "winCenter");
+        int pos_x = 0;
+        int pos_y = 0;
+        JsonValue px = root.Get("winPosX");
+        if (px != null && px.IsNumber()) { pos_x = px.AsInt(0); }
+        JsonValue py = root.Get("winPosY");
+        if (py != null && py.IsNumber()) { pos_y = py.AsInt(0); }
+        int win_shape = GenForm.ObjNum(root, "winShape", 0);
+        int win_shape_radius = GenForm.ObjNum(root, "winShapeRadius", 0);
+        int win_shadow = GenForm.ObjNum(root, "winShadow", 0);
+        int win_opacity = GenForm.ObjNum(root, "winOpacity", 0);
+        bool win_glass = GenForm.ObjBool(root, "winGlass");
+        bool win_chrome = true;
+        JsonValue wch = root.Get("winChrome");
+        if (wch != null && wch.IsBool()) { win_chrome = wch.AsBool(true); }
+
+        /* Compose the silhouette spec string: "t,x,y,w,h,r;..." in logical px. */
+        string shape_spec = "";
+        JsonValue wshape = root.Get("winShape");
+        if (wshape != null && wshape.IsArray()) {
+            int n = 0;
+            for (int i = 0; i < wshape.Count(); i = i + 1) {
+                JsonValue reg = wshape.At(i);
+                int t = GenForm.ObjNum(reg, "t", 1);
+                int rx = GenForm.ObjNum(reg, "x", 0);
+                int ry = GenForm.ObjNum(reg, "y", 0);
+                int rw = GenForm.ObjNum(reg, "w", 0);
+                int rh = GenForm.ObjNum(reg, "h", 0);
+                int rr = GenForm.ObjNum(reg, "r", 0);
+                if (rw <= 0 || rh <= 0) { continue; }
+                if (n > 0) { shape_spec = shape_spec + ";"; }
+                shape_spec = shape_spec + Convert.ToString(t) + "," +
+                    Convert.ToString(rx) + "," + Convert.ToString(ry) + "," +
+                    Convert.ToString(rw) + "," + Convert.ToString(rh) + "," +
+                    Convert.ToString(rr);
+                n = n + 1;
+            }
+        } else if (win_shape == 1) {
+            shape_spec = "1,0,0," + Convert.ToString(win_w) + "," +
+                Convert.ToString(win_h) + "," + Convert.ToString(win_shape_radius);
+        } else if (win_shape == 2) {
+            int d = win_w;
+            if (win_h < d) { d = win_h; }
+            shape_spec = "2,0,0," + Convert.ToString(d) + "," +
+                Convert.ToString(d) + ",0";
+        }
+
+        /* winShadow: prepend a type-3 "shadow band" region. */
+        if (win_shadow > 0 && shape_spec.Length > 0) {
+            int max_r = win_shape_radius;
+            if (wshape != null && wshape.IsArray()) {
+                for (int i = 0; i < wshape.Count(); i = i + 1) {
+                    int rr = GenForm.ObjNum(wshape.At(i), "r", 0);
+                    if (rr > max_r) { max_r = rr; }
+                }
+            }
+            int band_r = max_r + win_shadow;
+            if (band_r < 8) { band_r = 8; }
+            if (band_r > 64) { band_r = 64; }
+            string band = "3,0,0," + Convert.ToString(win_w) + "," +
+                Convert.ToString(win_h) + "," + Convert.ToString(band_r) + ";";
+            shape_spec = band + shape_spec;
+        }
+
+        StringBuilder decls = new StringBuilder();
+        StringBuilder body = new StringBuilder();
+        StringBuilder wire = new StringBuilder();
+        StringBuilder valid = new StringBuilder();
+        List<string> used = new List<string>();
+
+        if (fields != null && fields.IsArray()) {
+            int id = 0;
+            string rootParent = "root";
+            if (!free_mode) {
+                body.Append("        FbFlow __flow = new FbFlow();\n");
+                body.Append("        __flow.Dock(Dock.Top());\n");
+                body.Append("        root.Add(__flow);\n");
+                rootParent = "__flow";
+            }
+            for (int i = 0; i < fields.Count(); i = i + 1) {
+                id = GenForm.EmitField(decls, body, wire, valid, fields.At(i),
+                                       rootParent, id, used, free_mode,
+                                       !free_mode);
+            }
+        }
+
+        /* ---- assemble the synthetic partial class ---- */
+        StringBuilder out0 = new StringBuilder();
+        out0.Append("using System;\n");
+        out0.Append("using Gui;\n");
+        out0.Append("using Gui.Widget;\n");
+        out0.Append("using Gui.Hmi;\n\n");
+        out0.Append("// <auto-generated> Window layout compiled from ");
+        if (file_name == null) { out0.Append("<design>"); } else { out0.Append(file_name); }
+        out0.Append(".\n");
+        out0.Append("// Regenerated from the visual design on every build - do not edit.\n");
+        out0.Append("// Write your initialization and event logic in " + name + ".zan.\n");
+        out0.Append("partial class " + name + " {\n");
+        out0.Append("    /// The live form, kept for the non-capturing handler\n");
+        out0.Append("    /// lambdas (delegates are plain function pointers).\n");
+        out0.Append("    static Form __form;\n");
+        if (decls.Length > 0) {
+            out0.Append(decls.ToString());
+            out0.Append("\n");
+        }
+        out0.Append("    /// Builds the designed control tree (real, interactive widgets).\n");
+        out0.Append("    static Control __BuildForm() {\n");
+        out0.Append("        Panel root = new Panel(\"root\");\n");
+        out0.Append("        root.Dock(Dock.Fill());\n");
+        if (free_mode) {
+            out0.Append("        root.Pad(0);\n");
+            out0.Append("        root.gap = 0;\n");
+            out0.Append("        int __dp = Canvas.GetDpiScale();\n");
+        } else {
+            out0.Append("        root.Pad(16);\n");
+            out0.Append("        root.gap = 10;\n");
+        }
+        if (body.Length > 0) { out0.Append(body.ToString()); }
+        out0.Append("        return root;\n");
+        out0.Append("    }\n\n");
+        out0.Append("    /// Validates the required fields: flags every empty required\n");
+        out0.Append("    /// input (red border + message) and reports whether the form is\n");
+        out0.Append("    /// OK to submit. Call it from the submit handler:\n");
+        out0.Append("    ///     if (!__ValidateForm()) { return; }\n");
+        out0.Append("    static bool __ValidateForm() {\n");
+        out0.Append("        bool ok = true;\n");
+        if (valid.Length > 0) { out0.Append(valid.ToString()); }
+        out0.Append("        return ok;\n");
+        out0.Append("    }\n\n");
+        out0.Append("    /// Subscribes every designed `on<Event>` binding to the handler\n");
+        out0.Append("    /// registry on the form (see Form.On / Form.Handle). Unregistered\n");
+        out0.Append("    /// handler names simply never fire.\n");
+        out0.Append("    static void __WireForm(Form form) {\n");
+        out0.Append("        __form = form;\n");
+        if (wire.Length > 0) { out0.Append(wire.ToString()); }
+        out0.Append("    }\n\n");
+        out0.Append("    /// Builds this designed window: control tree, window\n");
+        out0.Append("    /// attributes, OnLoad and the event wiring - everything except\n");
+        out0.Append("    /// the event loop, so a caller may still adjust it before Run().\n");
+        out0.Append("    static Form __CreateWindow() {\n");
+        out0.Append("        Form form = Form.CreateDark(\"");
+        out0.Append(GenCommon.Esc(title));
+        out0.Append("\", " + Convert.ToString(win_w) + ", " +
+                    Convert.ToString(win_h) + ");\n");
+        out0.Append("        form.Add(__BuildForm());\n");
+        if (center) {
+            out0.Append("        form.GetApp().CenterWindow();\n");
+        } else {
+            out0.Append("        form.GetApp().SetWindowPos(" +
+                        Convert.ToString(pos_x) + ", " +
+                        Convert.ToString(pos_y) + ");\n");
+        }
+        if (shape_spec.Length > 0) {
+            out0.Append("        form.GetApp().SetWindowShape(\"");
+            out0.Append(GenCommon.Esc(shape_spec));
+            out0.Append("\");\n");
+        }
+        if (win_shadow > 0) {
+            out0.Append("        form.GetApp().SetWindowShadow(" +
+                        Convert.ToString(win_shadow) + ");\n");
+        }
+        if (!win_chrome) {
+            out0.Append("        form.GetApp().SetChromeVisible(false);\n");
+        }
+        if (win_glass) {
+            out0.Append("        form.GetApp().SetNativeGlass(true);\n");
+        }
+        if (win_opacity > 0 && win_opacity < 100) {
+            out0.Append("        form.GetApp().SetWindowOpacity(" +
+                        Convert.ToString(win_opacity) + ");\n");
+        }
+        out0.Append("        " + name + ".OnLoad(form);\n");
+        out0.Append("        " + name + ".__WireForm(form);\n");
+        out0.Append("        return form;\n");
+        out0.Append("    }\n\n");
+        out0.Append("    /// Opens this designed window and runs it until it closes,\n");
+        out0.Append("    /// so the calling window waits like it would on a modal dialog.\n");
+        out0.Append("    /// This is how one window calls another:\n");
+        out0.Append("    ///     " + name + ".Show();\n");
+        out0.Append("    static void Show() {\n");
+        out0.Append("        Form form = " + name + ".__CreateWindow();\n");
+        out0.Append("        form.Run();\n");
+        out0.Append("    }\n");
+        if (emit_main) {
+            out0.Append("\n    static void Main() {\n");
+            out0.Append("        " + name + ".Show();\n");
+            out0.Append("    }\n");
+        }
+        out0.Append("}\n");
+        return out0;
+    }
+
+    /// 校验字段树:每个字段的 kind 必须是合法 Zan 标识符(递归 kids)。
+    static void ValidateFields(JsonValue reply, JsonValue arr,
+                               string file_name) {
+        if (arr == null || !arr.IsArray()) { return; }
+        string f0 = file_name;
+        if (f0 == null) { f0 = "<design>"; }
+        for (int i = 0; i < arr.Count(); i = i + 1) {
+            JsonValue o = arr.At(i);
+            if (o == null || !o.IsObject()) {
+                GenCommon.Fail(reply, f0 + ": .zform field " +
+                    Convert.ToString(i) + " must be an object");
+                continue;
+            }
+            string kind = GenForm.KindOf(o);
+            if (!GenCommon.IsIdent(kind)) {
+                GenCommon.Fail(reply, f0 + ": .zform field " +
+                    Convert.ToString(i) +
+                    " requires a valid Zan Control kind; use the class name in \"kind\"");
+            }
+            GenForm.ValidateFields(reply, o.Get("kids"), file_name);
+        }
+    }
+
+    static string KindOf(JsonValue o) {
+        JsonValue k = o.Get("kind");
+        if (k != null && k.IsString()) { return k.AsString(""); }
+        return "";
+    }
+
+    static bool IsContainer(JsonValue o) {
+        JsonValue kids = o.Get("kids");
+        return kids != null && kids.IsArray();
+    }
+
+    static int ObjNum(JsonValue o, string key, int def) {
+        JsonValue v = o.Get(key);
+        if (v != null && v.IsNumber()) { return v.AsInt(def); }
+        return def;
+    }
+
+    static bool ObjBool(JsonValue o, string key) {
+        JsonValue v = o.Get(key);
+        return v != null && v.AsBool(false);
+    }
+
+    static string ObjStr(JsonValue o, string key) {
+        JsonValue v = o.Get(key);
+        if (v != null && v.IsString()) { return v.AsString(""); }
+        return "";
+    }
+
+    static int PrefH(JsonValue o) {
+        int h = GenForm.ObjNum(o, "fh", 32);
+        if (h > 0) { return h; }
+        return 32;
+    }
+
+    /// Join options with '|' (mirrors JoinOpts).
+    static string JoinOpts(JsonValue o) {
+        JsonValue opts = o.Get("options");
+        if (opts == null || !opts.IsArray() || opts.Count() == 0) { return null; }
+        string out0 = "";
+        for (int i = 0; i < opts.Count(); i = i + 1) {
+            JsonValue it = opts.At(i);
+            if (i > 0) { out0 = out0 + "|"; }
+            if (it.IsString()) { out0 = out0 + it.AsString(""); }
+        }
+        return out0;
+    }
+
+    /// 应用 schema 级属性(options/placeholder/required/defOn)。
+    static void FieldSetup(StringBuilder b, JsonValue o, string vn) {
+        string opts = GenForm.JoinOpts(o);
+        if (opts != null && opts.Length > 0) {
+            b.Append("        " + vn + ".SetProp(\"options\", \"");
+            b.Append(GenCommon.Esc(opts));
+            b.Append("\");\n");
+        }
+        string placeholder = GenForm.ObjStr(o, "placeholder");
+        if (placeholder.Length > 0) {
+            b.Append("        " + vn + ".SetProp(\"placeholder\", \"");
+            b.Append(GenCommon.Esc(placeholder));
+            b.Append("\");\n");
+        }
+        if (GenForm.ObjBool(o, "required")) {
+            b.Append("        " + vn + ".SetProp(\"required\", \"true\");\n");
+        }
+        if (GenForm.ObjBool(o, "defOn")) {
+            b.Append("        " + vn + ".SetProp(\"defOn\", \"true\");\n");
+        }
+    }
+
+    /// 发射 on<Event> 处理器绑定(事件名 = 去掉前导 "on" 的键)。
+    static void EmitHandlers(StringBuilder wire, JsonValue o, string vn) {
+        if (o == null || !o.IsObject()) { return; }
+        for (int i = 0; i < o.Count(); i = i + 1) {
+            string key = o.KeyAt(i);
+            if (key.Length < 2 || key[0] != 'o' || key[1] != 'n') { continue; }
+            JsonValue v = o.ValAt(i);
+            if (v == null || !v.IsString()) { continue; }
+            string hv = v.AsString("");
+            if (hv.Length == 0) { continue; }
+            wire.Append("        " + vn + ".BindEvent(\"");
+            wire.Append(GenCommon.Esc(key.Substring(2)));
+            wire.Append("\", () => __form.Handle(\"");
+            wire.Append(GenCommon.Esc(hv));
+            wire.Append("\"));\n");
+        }
+    }
+
+    static int ChildrenCount(JsonValue o) {
+        JsonValue kids = o.Get("kids");
+        if (kids != null && kids.IsArray()) { return kids.Count(); }
+        return 0;
+    }
+
+    /// 发射一个字段的声明/构造/事件接线/校验,递归容器 kids。
+    /// 返回下一个局部 id。与旧 formgen 的 fg_emit_field 逐字节等价。
+    static int EmitField(StringBuilder decls, StringBuilder body,
+                         StringBuilder wire, StringBuilder valid,
+                         JsonValue o, string parent, int id,
+                         List<string> used, bool freeMode,
+                         bool parentIsFlow) {
+        string kind = GenForm.KindOf(o);
+        string fname = GenForm.ObjStr(o, "name");
+        int next = id + 1;
+        bool req = GenForm.ObjBool(o, "required");
+
+        bool flowCell = !freeMode && parentIsFlow;
+
+        string vn;
+        bool typed = GenCommon.IsIdent(fname) && fname.Length > 0 &&
+                     !used.Contains(fname);
+        if (typed) {
+            vn = fname;
+            used.Add(fname);
+            decls.Append("    static " + kind + " " + vn + ";\n");
+        } else {
+            vn = "c" + Convert.ToString(id);
+            body.Append("        " + kind + " " + vn + ";\n");
+        }
+
+        body.Append("        " + vn + " = new " + kind + "();\n");
+        body.Append("        " + vn + ".name = \"");
+        body.Append(GenCommon.Esc(fname));
+        body.Append("\";\n");
+        GenForm.FieldSetup(body, o, vn);
+        if (req) {
+            body.Append("        " + vn + ".SetProp(\"required\", \"true\");\n");
+        }
+
+        if (freeMode) {
+            int fx = GenForm.ObjNum(o, "fx", 0);
+            int fy = GenForm.ObjNum(o, "fy", 0);
+            int fw = GenForm.ObjNum(o, "fw", 200);
+            int fh = GenForm.ObjNum(o, "fh", 32);
+            int dk = GenForm.ObjNum(o, "dock", 0);
+            if (dk == 1 || dk == 2) {
+                body.Append("        " + vn + ".Dock(Dock.");
+                if (dk == 1) { body.Append("Top"); } else { body.Append("Bottom"); }
+                body.Append("());\n");
+                body.Append("        " + vn + ".Prefer(0, " +
+                            Convert.ToString(fh) + " * __dp / 100);\n");
+            } else if (dk == 3 || dk == 4) {
+                body.Append("        " + vn + ".Dock(Dock.");
+                if (dk == 3) { body.Append("Left"); } else { body.Append("Right"); }
+                body.Append("());\n");
+                body.Append("        " + vn + ".Prefer(" +
+                            Convert.ToString(fw) + " * __dp / 100, 0);\n");
+            } else if (dk == 5) {
+                body.Append("        " + vn + ".Dock(Dock.Fill());\n");
+            } else {
+                body.Append("        " + vn + ".Dock(Dock.Manual());\n");
+                body.Append("        " + vn + ".Place(" +
+                            Convert.ToString(fx) + " * __dp / 100, " +
+                            Convert.ToString(fy) + " * __dp / 100);\n");
+                body.Append("        " + vn + ".Prefer(" +
+                            Convert.ToString(fw) + " * __dp / 100, " +
+                            Convert.ToString(fh) + " * __dp / 100);\n");
+            }
+            if (GenForm.IsContainer(o)) {
+                body.Append("        " + vn + ".Pad(0);\n");
+            }
+            body.Append("        " + parent + ".Add(" + vn + ");\n");
+        } else if (!flowCell) {
+            body.Append("        " + vn + ".Dock(Dock.Top());\n");
+            if (GenForm.IsContainer(o)) {
+                body.Append("        " + vn + ".Pad(10);\n");
+                int ph = 44 + 44 * GenForm.ChildrenCount(o);
+                body.Append("        " + vn + ".Prefer(0, " +
+                            Convert.ToString(ph) + ");\n");
+            } else {
+                body.Append("        " + vn + ".Prefer(0, " +
+                            Convert.ToString(GenForm.PrefH(o)) + ");\n");
+            }
+            body.Append("        " + parent + ".Add(" + vn + ");\n");
+        } else {
+            int sp = GenForm.ObjNum(o, "span", 24);
+            if (sp < 1) { sp = 1; }
+            if (sp > 24) { sp = 24; }
+            if (GenForm.IsContainer(o)) {
+                body.Append("        " + vn + ".Pad(10);\n");
+                int ph = 44 + 44 * GenForm.ChildrenCount(o);
+                body.Append("        " + vn + ".Prefer(0, " +
+                            Convert.ToString(ph) + ");\n");
+                body.Append("        " + parent + ".AddCell(" + vn + ", 24);\n");
+            } else {
+                body.Append("        " + vn + ".Prefer(0, " +
+                            Convert.ToString(GenForm.PrefH(o)) + ");\n");
+                body.Append("        " + parent + ".AddCell(" + vn + ", " +
+                            Convert.ToString(sp) + ");\n");
+            }
+        }
+        GenForm.EmitHandlers(wire, o, vn);
+
+        JsonValue kids = o.Get("kids");
+        if (GenForm.IsContainer(o) && kids != null && kids.IsArray()) {
+            for (int i = 0; i < kids.Count(); i = i + 1) {
+                next = GenForm.EmitField(decls, body, wire, valid, kids.At(i),
+                                         vn, next, used, freeMode, false);
+            }
+        }
+        return next;
+    }
+}

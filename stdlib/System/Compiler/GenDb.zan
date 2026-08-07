@@ -1,0 +1,2038 @@
+// GenDb.zan -- 编译期类型化 ORM 查询降级(迁移自 src/compiler/dbgen.c)。
+//
+// `db.Query<T>()` 起一条类型化查询链,链上的方法在编译期被重写:
+//   * 根调用 `db.Query<T>()` / `Select<T>()` / `Insert<T>` / `Update<T>()` /
+//     `Delete<T>()` / `SyncStructure<T>()` / `SyncStructureAll()` 改为对
+//     `__DbBind.<X>_<T>(db)` 的调用(指令 db_root);
+//   * 访问器 `obj.<Entity>.Where(...)` 等把接收者换成
+//     `__DbBind.Q_<T>(obj.__Conn())`(指令 db_acc_head),而
+//     `obj.<Entity>.Insert/Update/Delete/Read` 整体替换为绑定树
+//     (指令 db_acc_root);
+//   * 链方法 Where/WhereIf/Having/GroupBy/Distinct/OrderBy/Set/Sum/...
+//     被替换为 `.W(frag).P(v)...` 形式的参数化链(指令 db_chain),SQL
+//     片段与绑定值由本模块用 lambda 的表达式树拼装;
+//   * 参数类型声明为 `Expr<T>` 的方法收到 lambda 时,把 lambda 降级为
+//     `Expr<T>.From(DbExpr.Lambda(...))` 表达式树(指令 db_expr_arg)。
+//
+// 实体绑定类(__DbQ_/__DbI_/__DbU_/__DbD_/__DbCF_ 与 __DbBind)的文本
+// 生成在 GenDbEmit.zan,与 dbgen.c 的输出逐字节一致。
+//
+// 本模块只使用基础 stdlib,绝不使用任何会触发代码生成 pass 的特性。
+namespace System.Compiler;
+
+/// 一个实体字段的编译期模型(对应 dbgen.c 的 dg_field_t)。
+class DbField {
+    string Name;
+    string TypeName;
+    int Kind;      // 0 int, 1 double, 2 bool, 3 string, 4 enum, 5 nav
+    string Col;
+    bool IsPk;
+    bool IsIdent;
+    bool NotNull;
+    int StrLen;
+}
+
+class GenDb {
+    static JsonValue Unit;
+    static JsonValue Reply;
+    static Dict<string, JsonValue> ClassOf;   // 类/枚举名 -> classes 条目
+    static List<string> NeedNames;            // 需要生成绑定类的实体
+    static Dict<int, string> Rewrote;         // 调用点 id -> __DbBind.<名>
+    static Dict<int, JsonValue> CallById;     // 调用点 id -> calls 条目
+    static int RwCount;                       // 已发出的重写指令数(链登记用)
+    static bool Any;
+    static bool SyncAll;
+
+    // ---- 类/枚举查找 ----
+
+    static JsonValue ClassGet(string name) {
+        JsonValue v;
+        if (GenDb.ClassOf.TryGetValue(name, out v)) { return v; }
+        return null;
+    }
+
+    static bool EnumGet(string name) {
+        JsonValue v = GenDb.ClassGet(name);
+        return v != null && v.Str("kind", "") == "enum";
+    }
+
+    /// 属性读取(与 dbgen.c 的 dg_attr 一致,名字精确匹配)。
+    static JsonValue AttrOf(JsonValue cls, string name) {
+        if (cls == null) { return null; }
+        JsonValue attrs = cls.Get("attrs");
+        if (attrs == null || !attrs.IsArray()) { return null; }
+        for (int i = 0; i < attrs.Count(); i = i + 1) {
+            JsonValue a = attrs.At(i);
+            if (a == null) { continue; }
+            if (a.Str("name", "") == name) { return a; }
+        }
+        return null;
+    }
+
+    /// 具名属性参数(`Name = expr`)的表达式树,或 null。
+    static JsonValue AttrArg(JsonValue attr, string key) {
+        if (attr == null) { return null; }
+        JsonValue args = attr.Get("args");
+        if (args == null || !args.IsArray()) { return null; }
+        for (int i = 0; i < args.Count(); i = i + 1) {
+            JsonValue a = args.At(i);
+            if (a == null) { continue; }
+            if (a.Str("k", "") != "assign") { continue; }
+            JsonValue l = a.Get("l");
+            if (l == null) { continue; }
+            if (l.Str("n", "") != key) { continue; }
+            return a.Get("r");
+        }
+        return null;
+    }
+
+    static string AttrStr(JsonValue attr, string key) {
+        JsonValue v = GenDb.AttrArg(attr, key);
+        if (v == null) { return ""; }
+        if (v.Str("k", "") != "lit") { return ""; }
+        if (v.Str("t", "") != "str") { return ""; }
+        return v.Str("v", "");
+    }
+
+    static bool AttrBool(JsonValue attr, string key, bool dflt) {
+        JsonValue v = GenDb.AttrArg(attr, key);
+        if (v == null) { return dflt; }
+        if (v.Str("k", "") != "lit") { return dflt; }
+        if (v.Str("t", "") != "bool") { return dflt; }
+        return v.Bool("v", dflt);
+    }
+
+    static int AttrInt(JsonValue attr, string key, int dflt) {
+        JsonValue v = GenDb.AttrArg(attr, key);
+        if (v == null) { return dflt; }
+        if (v.Str("k", "") != "lit") { return dflt; }
+        if (v.Str("t", "") != "int") { return dflt; }
+        return v.Int("v", dflt);
+    }
+
+    // ---- 实体字段模型 ----
+    // kind: 0 int, 1 double, 2 bool, 3 string, 4 enum, 5 nav, 6 skip
+
+    static bool IsIntName(string n) {
+        return n == "int" || n == "long" || n == "short" || n == "byte" ||
+               n == "sbyte" || n == "uint" || n == "ushort" || n == "ulong" ||
+               n == "char" || n == "nint";
+    }
+
+    static bool IsFloatName(string n) {
+        return n == "double" || n == "float" || n == "decimal";
+    }
+
+    static int ClassifyKind(string type) {
+        if (GenDb.IsIntName(type)) { return 0; }
+        if (GenDb.IsFloatName(type)) { return 1; }
+        if (type == "bool") { return 2; }
+        if (type == "string") { return 3; }
+        if (type.Contains("[") || type.Contains("<") || type.Contains("?")) {
+            return 6;
+        }
+        if (GenDb.EnumGet(type)) { return 4; }
+        if (GenDb.ClassGet(type) != null) { return 5; }
+        return 6;
+    }
+
+    /// 收集一个实体的全部字段(基类递归,与 dbgen.c 的 dg_collect_fields
+    /// 一致:跳过 static 与 DF_SKIP)。
+    static List<DbField> FieldsOf(string cls, int depth) {
+        List<DbField> outl = new List<DbField>();
+        GenDb.FieldsInto(cls, depth, outl);
+        return outl;
+    }
+
+    static void FieldsInto(string cls, int depth, List<DbField> outl) {
+        if (depth > 8) { return; }
+        JsonValue decl = GenDb.ClassGet(cls);
+        if (decl == null) { return; }
+        JsonValue bases = decl.Get("bases");
+        if (bases != null && bases.IsArray()) {
+            for (int b = 0; b < bases.Count(); b = b + 1) {
+                string bn = bases.At(b).AsString("");
+                if (bn.Length > 0) { GenDb.FieldsInto(bn, depth + 1, outl); }
+            }
+        }
+        JsonValue fields = decl.Get("fields");
+        if (fields == null || !fields.IsArray()) { return; }
+        for (int i = 0; i < fields.Count(); i = i + 1) {
+            JsonValue f = fields.At(i);
+            if (f == null) { continue; }
+            if (f.Bool("static", false)) { continue; }
+            DbField df = new DbField();
+            df.Name = f.Str("name", "");
+            df.TypeName = f.Str("type", "");
+            df.Kind = GenDb.ClassifyKind(df.TypeName);
+            JsonValue ca = GenDb.AttrOf(f, "Column");
+            string cn = GenDb.AttrStr(ca, "Name");
+            df.Col = cn.Length > 0 ? cn : df.Name;
+            df.IsPk = GenDb.AttrBool(ca, "IsPrimary", df.Name == "id");
+            df.IsIdent = GenDb.AttrBool(ca, "IsIdentity",
+                                        df.IsPk && df.Kind == 0);
+            df.NotNull = !GenDb.AttrBool(ca, "IsNullable", !df.IsPk);
+            df.StrLen = GenDb.AttrInt(ca, "StringLength", 0);
+            if (df.Kind != 6) { outl.Add(df); }
+        }
+    }
+
+    static DbField FieldFind(List<DbField> fs, string name) {
+        for (int i = 0; i < fs.Count; i = i + 1) {
+            if (fs[i].Name == name) { return fs[i]; }
+        }
+        return null;
+    }
+
+    static string TableOf(string cls) {
+        JsonValue decl = GenDb.ClassGet(cls);
+        string n = GenDb.AttrStr(GenDb.AttrOf(decl, "Table"), "Name");
+        return n.Length > 0 ? n : cls;
+    }
+
+    static bool IsTableEntity(string cls) {
+        JsonValue decl = GenDb.ClassGet(cls);
+        return GenDb.AttrOf(decl, "Table") != null;
+    }
+
+    /// 主键列:显式 identity 优先,其次叫 id 的字段,没有返回 ""。
+    static string PkOf(string cls) {
+        List<DbField> fs = GenDb.FieldsOf(cls, 0);
+        for (int i = 0; i < fs.Count; i = i + 1) {
+            if (fs[i].IsIdent) { return fs[i].Name; }
+        }
+        for (int i = 0; i < fs.Count; i = i + 1) {
+            if (fs[i].Name == "id") { return fs[i].Name; }
+        }
+        return "";
+    }
+
+    static int NeedAdd(string name) {
+        for (int i = 0; i < GenDb.NeedNames.Count; i = i + 1) {
+            if (GenDb.NeedNames[i] == name) { return i; }
+        }
+        GenDb.NeedNames.Add(name);
+        return GenDb.NeedNames.Count - 1;
+    }
+
+    static JsonValue CallAt(int id) {
+        JsonValue v;
+        if (GenDb.CallById.TryGetValue(id, out v)) { return v; }
+        return null;
+    }
+
+    // ---- 表达式树构造(genmeta 的 gm_expr_tree 输出格式) ----
+
+    static JsonValue TreeStr(string s) {
+        JsonValue o = JsonValue.NewObject();
+        o.Put("k", JsonValue.NewStr("lit"));
+        o.Put("t", JsonValue.NewStr("str"));
+        o.Put("v", JsonValue.NewStr(s));
+        return o;
+    }
+
+    static JsonValue TreeNull() {
+        JsonValue o = JsonValue.NewObject();
+        o.Put("k", JsonValue.NewStr("null"));
+        return o;
+    }
+
+    static JsonValue TreeId(string name) {
+        JsonValue o = JsonValue.NewObject();
+        o.Put("k", JsonValue.NewStr("id"));
+        o.Put("n", JsonValue.NewStr(name));
+        return o;
+    }
+
+    /// 泛型标识符:`Expr<T>` 的 "Expr" 带 targs 数组(反序列化器据此
+    /// 构建 inst_type_ref)。
+    static JsonValue TreeGenericId(string name, string targ) {
+        JsonValue o = JsonValue.NewObject();
+        o.Put("k", JsonValue.NewStr("id"));
+        o.Put("n", JsonValue.NewStr(name));
+        JsonValue ta = JsonValue.NewArray();
+        ta.Append(JsonValue.NewStr(targ));
+        o.Put("targs", ta);
+        return o;
+    }
+
+    static JsonValue TreeMem(JsonValue obj, string name) {
+        JsonValue o = JsonValue.NewObject();
+        o.Put("k", JsonValue.NewStr("mem"));
+        o.Put("o", obj);
+        o.Put("n", JsonValue.NewStr(name));
+        return o;
+    }
+
+    static JsonValue TreeCall(JsonValue callee, JsonValue args) {
+        JsonValue o = JsonValue.NewObject();
+        o.Put("k", JsonValue.NewStr("call"));
+        o.Put("f", callee);
+        o.Put("a", args);
+        return o;
+    }
+
+    static JsonValue TreeCall1(JsonValue callee, JsonValue arg) {
+        JsonValue a = JsonValue.NewArray();
+        if (arg != null) { a.Append(arg); }
+        return GenDb.TreeCall(callee, a);
+    }
+
+    static JsonValue OneArg(JsonValue arg) {
+        JsonValue a = JsonValue.NewArray();
+        if (arg != null) { a.Append(arg); }
+        return a;
+    }
+
+    static JsonValue TreeBin(string op, JsonValue l, JsonValue r) {
+        JsonValue o = JsonValue.NewObject();
+        o.Put("k", JsonValue.NewStr("bin"));
+        o.Put("op", JsonValue.NewStr(op));
+        o.Put("l", l);
+        o.Put("r", r);
+        return o;
+    }
+
+    static JsonValue TreeCast(string t, JsonValue e) {
+        JsonValue o = JsonValue.NewObject();
+        o.Put("k", JsonValue.NewStr("cast"));
+        o.Put("t", JsonValue.NewStr(t));
+        o.Put("e", e);
+        return o;
+    }
+
+    static JsonValue TreeLam(List<string> ps, JsonValue body) {
+        JsonValue o = JsonValue.NewObject();
+        o.Put("k", JsonValue.NewStr("lam"));
+        JsonValue pa = JsonValue.NewArray();
+        for (int i = 0; i < ps.Count; i = i + 1) {
+            pa.Append(JsonValue.NewStr(ps[i]));
+        }
+        o.Put("p", pa);
+        o.Put("b", body);
+        return o;
+    }
+
+    // ---- 调用点访问 ----
+
+    static int ArgsCount(JsonValue call) {
+        JsonValue args = call.Get("args");
+        if (args == null) { return 0; }
+        return args.Count();
+    }
+
+    static JsonValue ArgAt(JsonValue call, int i) {
+        JsonValue args = call.Get("args");
+        if (args == null || i >= args.Count()) { return null; }
+        return args.At(i);
+    }
+
+    // ---- 重写指令下发 ----
+
+    static JsonValue NewOp(string op, JsonValue call) {
+        JsonValue o = JsonValue.NewObject();
+        o.Put("op", JsonValue.NewStr(op));
+        o.Put("id", JsonValue.NewNum(Convert.ToString(call.Int("id", 0))));
+        return o;
+    }
+
+    static void AddRewrite(JsonValue op) {
+        GenCommon.AddRewrite(GenDb.Reply, op);
+        GenDb.RwCount = GenDb.RwCount + 1;
+    }
+
+    /// 链重写成功后登记调用点:下游调用点沿 `call#<id>` 回溯链根时,每一环
+    /// 都必须在 Rewrote 里。children-first 分配 id、按 id 升序处理,内层
+    /// 先于外层登记,与 dbgen.c 直接改 AST 的语义一致。
+    static void MarkChain(JsonValue call, string entity, int ck) {
+        string pre = ck == 1 ? "Q" : ck == 2 ? "I" : ck == 3 ? "U" : "D";
+        GenDb.Rewrote.Add(call.Int("id", 0), pre + "_" + entity);
+    }
+
+    static void Diag(JsonValue call, string msg) {
+        JsonValue arr = GenDb.Reply.Get("errors");
+        if (arr == null) { return; }
+        JsonValue d = JsonValue.NewObject();
+        d.Put("file", JsonValue.NewNum(Convert.ToString(call.Int("file", 0))));
+        d.Put("line", JsonValue.NewNum(Convert.ToString(call.Int("line", 0))));
+        d.Put("col", JsonValue.NewNum(Convert.ToString(call.Int("col", 0))));
+        d.Put("msg", JsonValue.NewStr(msg));
+        arr.Append(d);
+    }
+
+    // ---- SQL 运算符文本 ----
+
+    static string SqlOp(string op, bool flip) {
+        if (op == "==") { return " = "; }
+        if (op == "!=") { return " <> "; }
+        if (op == "<") { return flip ? " > " : " < "; }
+        if (op == ">") { return flip ? " < " : " > "; }
+        if (op == "<=") { return flip ? " >= " : " <= "; }
+        if (op == ">=") { return flip ? " <= " : " >= "; }
+        return "";
+    }
+
+    static string ExprOp(string op) {
+        if (op == "==") { return "=="; }
+        if (op == "!=") { return "!="; }
+        if (op == "<") { return "<"; }
+        if (op == ">") { return ">"; }
+        if (op == "<=") { return "<="; }
+        if (op == ">=") { return ">="; }
+        if (op == "+") { return "+"; }
+        if (op == "-") { return "-"; }
+        if (op == "*") { return "*"; }
+        if (op == "/") { return "/"; }
+        if (op == "%") { return "%"; }
+        if (op == "&&") { return "&&"; }
+        if (op == "||") { return "||"; }
+        return "";
+    }
+
+    // ---- WHERE 片段构建 ----
+    // 片段累积为"文本段 + 表达式段"交替,最终折叠成 bin("+") 树;
+    // 绑定值按出现顺序记录,链成 `.W(frag).P(v)...`。
+
+    class Wf {
+        string Pname;
+        List<DbField> Fields;
+        StringBuilder Lit;
+        JsonValue FragExpr;
+        List<JsonValue> Binds;     // 每个元素是 { kind, expr }
+        bool Ok;
+        JsonValue Call;
+    }
+
+    static void WfText(Wf w, string s) {
+        w.Lit.Append(s);
+    }
+
+    static void WfFlush(Wf w) {
+        if (w.Lit.Length == 0) { return; }
+        JsonValue lit = GenDb.TreeStr(w.Lit.ToString());
+        w.FragExpr = w.FragExpr == null ? lit
+                                        : GenDb.TreeBin("+", w.FragExpr, lit);
+        w.Lit = new StringBuilder();
+    }
+
+    static void WfExpr(Wf w, JsonValue e) {
+        GenDb.WfFlush(w);
+        w.FragExpr = w.FragExpr == null ? e : GenDb.TreeBin("+", w.FragExpr, e);
+    }
+
+    static void WfBind(Wf w, int kind, JsonValue expr) {
+        if (w.Binds.Count >= 64) { w.Ok = false; return; }
+        JsonValue b = JsonValue.NewObject();
+        b.Put("kind", JsonValue.NewNum(Convert.ToString(kind)));
+        b.Put("expr", expr);
+        w.Binds.Add(b);
+    }
+
+    static void WfErr(Wf w, string msg) {
+        GenDb.Diag(w.Call, "db.Query<T>().Where: " + msg);
+        w.Ok = false;
+    }
+
+    /// 表达式树里是否出现 lambda 参数名。
+    static bool MentionsParam(JsonValue e, string pname) {
+        if (e == null) { return false; }
+        string k = e.Str("k", "");
+        if (k == "id") { return e.Str("n", "") == pname; }
+        if (k == "mem") { return GenDb.MentionsParam(e.Get("o"), pname); }
+        if (k == "bin" || k == "assign") {
+            return GenDb.MentionsParam(e.Get("l"), pname) ||
+                   GenDb.MentionsParam(e.Get("r"), pname);
+        }
+        if (k == "uni" || k == "await" || k == "ref") {
+            return GenDb.MentionsParam(e.Get("o"), pname);
+        }
+        if (k == "call") {
+            if (GenDb.MentionsParam(e.Get("f"), pname)) { return true; }
+            JsonValue a = e.Get("a");
+            if (a != null && a.IsArray()) {
+                for (int i = 0; i < a.Count(); i = i + 1) {
+                    if (GenDb.MentionsParam(a.At(i), pname)) { return true; }
+                }
+            }
+            return false;
+        }
+        if (k == "idx") {
+            return GenDb.MentionsParam(e.Get("o"), pname) ||
+                   GenDb.MentionsParam(e.Get("i"), pname);
+        }
+        if (k == "cast") { return GenDb.MentionsParam(e.Get("e"), pname); }
+        if (k == "cond") {
+            return GenDb.MentionsParam(e.Get("c"), pname) ||
+                   GenDb.MentionsParam(e.Get("t"), pname) ||
+                   GenDb.MentionsParam(e.Get("e"), pname);
+        }
+        return false;
+    }
+
+    /// `p.field` -> 字段条目,否则 null。
+    static DbField AsColumn(Wf w, JsonValue e) {
+        if (e == null) { return null; }
+        if (e.Str("k", "") != "mem") { return null; }
+        JsonValue obj = e.Get("o");
+        if (obj == null) { return null; }
+        if (obj.Str("k", "") != "id") { return null; }
+        if (obj.Str("n", "") != w.Pname) { return null; }
+        return GenDb.FieldFind(w.Fields, e.Str("n", ""));
+    }
+
+    static void WfCol(Wf w, DbField f) {
+        GenDb.WfText(w, "t.");
+        GenDb.WfText(w, f.Name);
+    }
+
+    /// 字面量/字段类型匹配(编译期)。不匹配返回消息,匹配返回 ""。
+    static string LitMismatch(DbField f, JsonValue e) {
+        JsonValue lit = e;
+        if (e != null && e.Str("k", "") == "uni") {
+            string op = e.Str("op", "");
+            if (op == "-" || op == "+") { lit = e.Get("o"); }
+        }
+        if (lit == null) { return ""; }
+        string lk = lit.Str("k", "");
+        string lt = lit.Str("t", "");
+        if (lk == "lit" && (lt == "int" || lt == "char")) {
+            if (f.Kind == 0 || f.Kind == 4 || f.Kind == 1) { return ""; }
+            if (f.Kind == 3) {
+                return "type mismatch: string column compared to an int value";
+            }
+            return "type mismatch: numeric value for a non-numeric column";
+        }
+        if (lk == "lit" && lt == "double") {
+            if (f.Kind == 1) { return ""; }
+            return "type mismatch: double value compared to a non-double column";
+        }
+        if (lk == "lit" && lt == "str") {
+            if (f.Kind == 3) { return ""; }
+            return "type mismatch: string value compared to a numeric column";
+        }
+        if (lk == "lit" && lt == "bool") {
+            if (f.Kind == 2) { return ""; }
+            return "type mismatch: bool value compared to a non-bool column";
+        }
+        return "";
+    }
+
+    static bool CheckValueType(Wf w, DbField f, JsonValue e) {
+        string msg = GenDb.LitMismatch(f, e);
+        if (msg.Length > 0) {
+            GenDb.WfErr(w, msg);
+            return false;
+        }
+        return true;
+    }
+
+    /// 标量比较值:`?` 标记 + 按列类型的绑定。枚举包 (int) 转换,
+    /// double 除纯字面量外包 (double) 转换。
+    static void WfValue(Wf w, DbField f, JsonValue e) {
+        if (!GenDb.CheckValueType(w, f, e)) { return; }
+        GenDb.WfText(w, "?");
+        if (f.Kind == 0) {
+            GenDb.WfBind(w, 1, e);
+        } else if (f.Kind == 4) {
+            GenDb.WfBind(w, 1, GenDb.TreeCast("int", e));
+        } else if (f.Kind == 1) {
+            if (e.Str("k", "") == "lit" && e.Str("t", "") == "double") {
+                GenDb.WfBind(w, 2, e);
+            } else {
+                GenDb.WfBind(w, 2, GenDb.TreeCast("double", e));
+            }
+        } else if (f.Kind == 3) {
+            GenDb.WfBind(w, 0, e);
+        } else {
+            GenDb.WfErr(w, "unsupported column type in comparison");
+        }
+    }
+
+    /// 条件里的聚合调用 `p.Count` / `p.Sum(x => x.col)` 等。返回
+    /// 聚合名(COUNT/SUM/AVG/MAX/MIN),不是聚合调用时返回 ""。
+    /// 畸形聚合发诊断并返回非空,但 w.Ok 已清。
+    static string AggCall(Wf w, JsonValue e, out int outKind) {
+        outKind = 0;
+        if (e == null) { return ""; }
+        if (e.Str("k", "") != "call") { return ""; }
+        JsonValue callee = e.Get("f");
+        if (callee == null) { return ""; }
+        if (callee.Str("k", "") != "mem") { return ""; }
+        JsonValue recv = callee.Get("o");
+        if (recv == null) { return ""; }
+        if (recv.Str("k", "") != "id") { return ""; }
+        if (recv.Str("n", "") != w.Pname) { return ""; }
+        string mn = callee.Str("n", "");
+        string fn = "";
+        if (mn == "Count") { fn = "COUNT"; }
+        else if (mn == "Sum") { fn = "SUM"; }
+        else if (mn == "Avg") { fn = "AVG"; }
+        else if (mn == "Max") { fn = "MAX"; }
+        else if (mn == "Min") { fn = "MIN"; }
+        if (fn.Length == 0) { return ""; }
+        JsonValue args = e.Get("a");
+        int nargs = args != null ? args.Count() : 0;
+        if (mn == "Count") {
+            if (nargs != 0) {
+                GenDb.WfErr(w, "Count() takes no arguments");
+                return fn;
+            }
+            GenDb.WfText(w, "COUNT(*)");
+            outKind = 0;
+            return fn;
+        }
+        if (nargs != 1) {
+            GenDb.WfErr(w, fn + " requires x => x.<column>");
+            return fn;
+        }
+        JsonValue lam = args.At(0);
+        if (lam.Str("k", "") != "lam" || lam.Get("p").Count() != 1) {
+            GenDb.WfErr(w, fn + " expects x => x.<column>");
+            return fn;
+        }
+        JsonValue body = lam.Get("b");
+        if (body == null || body.Str("k", "") != "mem") {
+            GenDb.WfErr(w, fn + " expects x => x.<column>");
+            return fn;
+        }
+        JsonValue bobj = body.Get("o");
+        if (bobj == null || bobj.Str("k", "") != "id" ||
+            bobj.Str("n", "") != lam.Get("p").At(0).AsString("")) {
+            GenDb.WfErr(w, fn + " expects x => x.<column>");
+            return fn;
+        }
+        DbField col = GenDb.FieldFind(w.Fields, body.Str("n", ""));
+        if (col == null || col.Kind == 5) {
+            GenDb.WfErr(w, fn + " expects a scalar column");
+            return fn;
+        }
+        GenDb.WfText(w, fn + "(t." + col.Col + ")");
+        outKind = mn == "Avg" ? 1 : col.Kind;
+        return fn;
+    }
+
+    // ---- 条件树 -> SQL 片段 ----
+
+    /// 绑定类型 -> 链方法名。
+    static string BindMethod(int kind) {
+        if (kind == 1) { return "Pi"; }
+        if (kind == 2) { return "Pd"; }
+        if (kind == 3) { return "InI"; }
+        if (kind == 4) { return "InS"; }
+        if (kind == 5) { return "InD"; }
+        return "P";
+    }
+
+    static JsonValue OpObj(string m, JsonValue args) {
+        JsonValue o = JsonValue.NewObject();
+        o.Put("m", JsonValue.NewStr(m));
+        o.Put("args", args);
+        return o;
+    }
+
+    static JsonValue OneOp(string m, JsonValue arg) {
+        JsonValue a = JsonValue.NewArray();
+        if (arg != null) { a.Append(arg); }
+        return GenDb.OpObj(m, a);
+    }
+
+    /// `p.f.Method(arg...)` 条件:空参 null 测试、两参范围测试、
+    /// 单参比较方法,以及字符串匹配与 In 系列。
+    static bool WhereMethod(Wf w, JsonValue e) {
+        if (e.Str("k", "") != "call") { return false; }
+        JsonValue callee = e.Get("f");
+        if (callee == null) { return false; }
+        if (callee.Str("k", "") != "mem") { return false; }
+        DbField col = GenDb.AsColumn(w, callee.Get("o"));
+        string mn = callee.Str("n", "");
+        JsonValue args = e.Get("a");
+        int nargs = args != null ? args.Count() : 0;
+
+        /* FreeSQL 风格 `list.Contains(p.col)` -> `p.col IN (?, ...)`。 */
+        if (col == null && mn == "Contains" && nargs == 1) {
+            DbField inner = GenDb.AsColumn(w, args.At(0));
+            if (inner != null && inner.Kind != 2) {
+                JsonValue list = callee.Get("o");
+                if (GenDb.MentionsParam(list, w.Pname)) {
+                    GenDb.WfErr(w, "the list receiver must not reference the lambda parameter");
+                    return true;
+                }
+                GenDb.WfCol(w, inner);
+                GenDb.WfText(w, " IN (");
+                GenDb.WfExpr(w, GenDb.TreeCall1(
+                    GenDb.TreeMem(GenDb.TreeId("__DbBind"), "M"),
+                    GenDb.TreeMem(list, "Count")));
+                GenDb.WfText(w, ")");
+                if (inner.Kind == 0 || inner.Kind == 4) {
+                    GenDb.WfBind(w, 3, list);
+                } else if (inner.Kind == 3) {
+                    GenDb.WfBind(w, 4, list);
+                } else if (inner.Kind == 1) {
+                    GenDb.WfBind(w, 5, list);
+                } else {
+                    GenDb.WfErr(w, "Contains requires an int/string/double column");
+                }
+                return true;
+            }
+            return false;
+        }
+
+        if (col == null) { return false; }
+
+        /* p.x.IsNull() / p.x.IsNotNull() */
+        if (mn == "IsNull" || mn == "IsNotNull") {
+            if (nargs != 0) {
+                GenDb.WfErr(w, "IsNull/IsNotNull take no arguments");
+                return true;
+            }
+            GenDb.WfCol(w, col);
+            GenDb.WfText(w, mn == "IsNull" ? " IS NULL" : " IS NOT NULL");
+            return true;
+        }
+
+        /* p.age.Between(lo, hi) / NotBetween */
+        if (mn == "Between" || mn == "NotBetween") {
+            if (nargs != 2) {
+                GenDb.WfErr(w, "Between/NotBetween take exactly two arguments");
+                return true;
+            }
+            if (col.Kind != 0 && col.Kind != 4 && col.Kind != 1) {
+                GenDb.WfErr(w, "Between requires an int/double/enum column");
+                return true;
+            }
+            for (int i = 0; i < 2; i = i + 1) {
+                if (GenDb.MentionsParam(args.At(i), w.Pname)) {
+                    GenDb.WfErr(w, "argument must not reference the lambda parameter");
+                    return true;
+                }
+            }
+            GenDb.WfCol(w, col);
+            GenDb.WfText(w, mn == "Between" ? " BETWEEN " : " NOT BETWEEN ");
+            GenDb.WfValue(w, col, args.At(0));
+            GenDb.WfText(w, " AND ");
+            GenDb.WfValue(w, col, args.At(1));
+            return true;
+        }
+
+        /* p.age.Eq(x) / Ne / Gt / Ge / Lt / Le */
+        string cmp = "";
+        if (mn == "Eq") { cmp = " = "; }
+        else if (mn == "Ne") { cmp = " <> "; }
+        else if (mn == "Gt") { cmp = " > "; }
+        else if (mn == "Ge") { cmp = " >= "; }
+        else if (mn == "Lt") { cmp = " < "; }
+        else if (mn == "Le") { cmp = " <= "; }
+        if (cmp.Length > 0) {
+            if (nargs != 1) {
+                GenDb.WfErr(w, "comparison method takes exactly one argument");
+                return true;
+            }
+            if (col.Kind == 2) {
+                GenDb.WfErr(w, "bool columns compare with == / !=");
+                return true;
+            }
+            JsonValue arg = args.At(0);
+            if (GenDb.MentionsParam(arg, w.Pname)) {
+                GenDb.WfErr(w, "argument must not reference the lambda parameter");
+                return true;
+            }
+            GenDb.WfCol(w, col);
+            GenDb.WfText(w, cmp);
+            GenDb.WfValue(w, col, arg);
+            return true;
+        }
+
+        /* 其余方法恰好一个参数。 */
+        if (nargs != 1) {
+            GenDb.WfErr(w, "column method takes exactly one argument");
+            return true;
+        }
+        JsonValue arg1 = args.At(0);
+        if (GenDb.MentionsParam(arg1, w.Pname)) {
+            GenDb.WfErr(w, "argument must not reference the lambda parameter");
+            return true;
+        }
+        if (mn == "Like" || mn == "NotLike") {
+            if (col.Kind != 3) {
+                GenDb.WfErr(w, "Like requires a string column");
+                return true;
+            }
+            GenDb.WfCol(w, col);
+            GenDb.WfText(w, mn == "Like" ? " LIKE ?" : " NOT LIKE ?");
+            GenDb.WfBind(w, 0, arg1);
+            return true;
+        }
+        if (mn == "Contains" || mn == "StartsWith" || mn == "EndsWith") {
+            if (col.Kind != 3) {
+                GenDb.WfErr(w, "string matching requires a string column");
+                return true;
+            }
+            GenDb.WfCol(w, col);
+            GenDb.WfText(w, " LIKE ?");
+            JsonValue pat = arg1;
+            if (mn != "StartsWith") {
+                pat = GenDb.TreeBin("+", GenDb.TreeStr("%"), pat);
+            }
+            if (mn != "EndsWith") {
+                pat = GenDb.TreeBin("+", pat, GenDb.TreeStr("%"));
+            }
+            GenDb.WfBind(w, 0, pat);
+            return true;
+        }
+        if (mn == "In" || mn == "NotIn") {
+            GenDb.WfCol(w, col);
+            GenDb.WfText(w, mn == "In" ? " IN (" : " NOT IN (");
+            GenDb.WfExpr(w, GenDb.TreeCall1(
+                GenDb.TreeMem(GenDb.TreeId("__DbBind"), "M"),
+                GenDb.TreeMem(arg1, "Count")));
+            GenDb.WfText(w, ")");
+            if (col.Kind == 0 || col.Kind == 4) {
+                GenDb.WfBind(w, 3, arg1);
+            } else if (col.Kind == 3) {
+                GenDb.WfBind(w, 4, arg1);
+            } else if (col.Kind == 1) {
+                GenDb.WfBind(w, 5, arg1);
+            } else {
+                GenDb.WfErr(w, "In requires an int/string/double column");
+            }
+            return true;
+        }
+        GenDb.WfErr(w, "unsupported column method (expected Eq/Ne/Gt/Ge/Lt/Le/Between/NotBetween/IsNull/IsNotNull/Like/NotLike/" +
+                       "Contains/StartsWith/EndsWith/In/NotIn)");
+        return true;
+    }
+
+    static void WhereCond(Wf w, JsonValue e) {
+        if (!w.Ok || e == null) { return; }
+        string k = e.Str("k", "");
+        string op = e.Str("op", "");
+        if (k == "bin" && (op == "&&" || op == "||")) {
+            GenDb.WfText(w, "(");
+            GenDb.WhereCond(w, e.Get("l"));
+            GenDb.WfText(w, op == "&&" ? " AND " : " OR ");
+            GenDb.WhereCond(w, e.Get("r"));
+            GenDb.WfText(w, ")");
+            return;
+        }
+        if (k == "uni" && op == "!") {
+            DbField col = GenDb.AsColumn(w, e.Get("o"));
+            if (col != null && col.Kind == 2) {
+                GenDb.WfCol(w, col);
+                GenDb.WfText(w, " = 0");
+                return;
+            }
+            GenDb.WfText(w, "NOT (");
+            GenDb.WhereCond(w, e.Get("o"));
+            GenDb.WfText(w, ")");
+            return;
+        }
+        if (k == "mem") {
+            DbField col = GenDb.AsColumn(w, e);
+            if (col != null && col.Kind == 2) {
+                GenDb.WfCol(w, col);
+                GenDb.WfText(w, " = 1");
+                return;
+            }
+            GenDb.WfErr(w, "expected a boolean condition");
+            return;
+        }
+        if (GenDb.WhereMethod(w, e)) { return; }
+        if (k == "bin") {
+            string sqlop = GenDb.SqlOp(op, false);
+            if (sqlop.Length == 0) {
+                GenDb.WfErr(w, "unsupported operator");
+                return;
+            }
+            JsonValue l = e.Get("l");
+            JsonValue r = e.Get("r");
+            DbField lc = GenDb.AsColumn(w, l);
+            DbField rc = GenDb.AsColumn(w, r);
+            if (lc != null && rc != null) {
+                GenDb.WfCol(w, lc);
+                GenDb.WfText(w, sqlop);
+                GenDb.WfCol(w, rc);
+                return;
+            }
+            bool flip = false;
+            DbField col = lc;
+            JsonValue val = r;
+            if (col == null && rc != null) {
+                col = rc;
+                val = l;
+                flip = true;
+                sqlop = GenDb.SqlOp(op, true);
+            }
+            if (col == null && rc == null) {
+                /* FreeSQL 风格聚合比较 `p.Count > n`。 */
+                int ak = 0;
+                string af = GenDb.AggCall(w, l, out ak);
+                if (af.Length > 0) {
+                    if (!w.Ok) { return; }
+                    if (GenDb.MentionsParam(r, w.Pname)) {
+                        GenDb.WfErr(w, "value side must not reference the lambda parameter");
+                        return;
+                    }
+                    DbField fake = new DbField();
+                    fake.Kind = ak;
+                    GenDb.WfText(w, sqlop);
+                    GenDb.WfValue(w, fake, r);
+                    return;
+                }
+                af = GenDb.AggCall(w, r, out ak);
+                if (af.Length > 0) {
+                    if (!w.Ok) { return; }
+                    if (GenDb.MentionsParam(l, w.Pname)) {
+                        GenDb.WfErr(w, "value side must not reference the lambda parameter");
+                        return;
+                    }
+                    DbField fake = new DbField();
+                    fake.Kind = ak;
+                    GenDb.WfValue(w, fake, l);
+                    GenDb.WfText(w, sqlop);
+                    return;
+                }
+            }
+            if (col == null) {
+                GenDb.WfErr(w, "one side of a comparison must be a lambda-parameter field (e.g. p.age > x)");
+                return;
+            }
+            if (GenDb.MentionsParam(val, w.Pname)) {
+                GenDb.WfErr(w, "value side must not reference the lambda parameter");
+                return;
+            }
+            /* x == null / x != null */
+            if (val.Str("k", "") == "null") {
+                if (op == "==") {
+                    GenDb.WfCol(w, col);
+                    GenDb.WfText(w, " IS NULL");
+                } else if (op == "!=") {
+                    GenDb.WfCol(w, col);
+                    GenDb.WfText(w, " IS NOT NULL");
+                } else {
+                    GenDb.WfErr(w, "null only supports == / !=");
+                }
+                return;
+            }
+            if (col.Kind == 2) {
+                if (val.Str("k", "") != "lit" || val.Str("t", "") != "bool" ||
+                    (op != "==" && op != "!=")) {
+                    GenDb.WfErr(w, "bool columns only compare to true/false literals");
+                    return;
+                }
+                bool truth = val.Bool("v", false) == (op == "==");
+                GenDb.WfCol(w, col);
+                GenDb.WfText(w, truth ? " = 1" : " = 0");
+                return;
+            }
+            GenDb.WfCol(w, col);
+            GenDb.WfText(w, sqlop);
+            GenDb.WfValue(w, col, val);
+            return;
+        }
+        GenDb.WfErr(w, "unsupported condition");
+    }
+
+    /// 把 lambda 翻译成 SQL 片段树 + 绑定列表,返回片段树;不可翻译时
+    /// 发诊断并返回 null。
+    static JsonValue WhereFrag(JsonValue call, string cls, JsonValue lambda,
+                               Wf w) {
+        if (lambda == null) {
+            GenDb.Diag(call, "Where expects a one-parameter lambda");
+            return null;
+        }
+        if (lambda.Str("k", "") != "lam") {
+            GenDb.Diag(call, "Where expects a one-parameter lambda");
+            return null;
+        }
+        JsonValue ps = lambda.Get("p");
+        if (ps == null || ps.Count() != 1) {
+            GenDb.Diag(call, "Where expects a one-parameter lambda");
+            return null;
+        }
+        JsonValue body = lambda.Get("b");
+        if (body != null && body.Str("k", "") == "block") {
+            GenDb.Diag(call, "Where lambda must be an expression (no block body)");
+            return null;
+        }
+        w.Fields = GenDb.FieldsOf(cls, 0);
+        w.Pname = ps.At(0).AsString("");
+        w.Ok = true;
+        GenDb.WhereCond(w, body);
+        if (!w.Ok) { return null; }
+        GenDb.WfFlush(w);
+        JsonValue frag = w.FragExpr;
+        if (frag == null) { frag = GenDb.TreeStr("1 = 1"); }
+        return frag;
+    }
+
+    // ---- Expr<T> 目标类型 lambda 降级 ----
+
+    class ExprSlot {
+        string Cls;
+        string Name;
+        int Param;
+        string Entity;
+    }
+
+    static List<ExprSlot> Eslots;
+
+    /// 扫描方法声明的 `Expr<...>` 形参(形状检查即可,无需 binder)。
+    static void CollectExprSlots() {
+        GenDb.Eslots = new List<ExprSlot>();
+        JsonValue classes = GenDb.Unit.Get("classes");
+        if (classes == null || !classes.IsArray()) { return; }
+        for (int i = 0; i < classes.Count(); i = i + 1) {
+            JsonValue c = classes.At(i);
+            string cls = c.Str("name", "");
+            JsonValue methods = c.Get("methods");
+            if (methods == null || !methods.IsArray()) { continue; }
+            for (int m = 0; m < methods.Count(); m = m + 1) {
+                JsonValue mm = methods.At(m);
+                JsonValue ps = mm.Get("params");
+                if (ps == null || !ps.IsArray()) { continue; }
+                for (int p = 0; p < ps.Count(); p = p + 1) {
+                    string t = ps.At(p).Str("type", "");
+                    if (t.StartsWith("Expr<") && t.EndsWith(">")) {
+                        ExprSlot es = new ExprSlot();
+                        es.Cls = cls;
+                        es.Name = mm.Str("name", "");
+                        es.Param = p;
+                        es.Entity = t.Substring(5, t.Length - 6);
+                        GenDb.Eslots.Add(es);
+                    }
+                }
+            }
+        }
+    }
+
+    /// `ExprNode.<fn>(args)` 构造调用树。
+    static JsonValue ExprCall(string fn, JsonValue args) {
+        return GenDb.TreeCall(
+            GenDb.TreeMem(GenDb.TreeId("ExprNode"), fn), args);
+    }
+
+    /// 接收者链是否最终落在 lambda 参数上(`o` in `o.region` / ...)。
+    static bool PnameChain(JsonValue e, string pname) {
+        if (e == null) { return false; }
+        if (e.Str("k", "") == "id") { return e.Str("n", "") == pname; }
+        if (e.Str("k", "") == "mem") { return GenDb.PnameChain(e.Get("o"), pname); }
+        return false;
+    }
+
+    static bool ExprIsValue(JsonValue e, string pname) {
+        if (e.Str("k", "") == "mem") { return GenDb.PnameChain(e.Get("o"), pname); }
+        if (e.Str("k", "") == "lit") {
+            string t = e.Str("t", "");
+            return t == "int" || t == "double" || t == "str" || t == "bool";
+        }
+        return false;
+    }
+
+    static DbField MemberField(List<DbField> fs, JsonValue e, string pname) {
+        if (fs == null) { return null; }
+        if (e.Str("k", "") != "mem") { return null; }
+        JsonValue obj = e.Get("o");
+        if (obj == null) { return null; }
+        if (obj.Str("k", "") != "id" || obj.Str("n", "") != pname) {
+            return null;
+        }
+        return GenDb.FieldFind(fs, e.Str("n", ""));
+    }
+
+    static int LitKind(JsonValue e) {
+        if (e.Str("k", "") != "lit") { return -1; }
+        string t = e.Str("t", "");
+        if (t == "int") { return 0; }
+        if (t == "double") { return 1; }
+        if (t == "bool") { return 2; }
+        if (t == "str") { return 3; }
+        return -1;
+    }
+
+    /// 字面量 lk 能否与列类型 fk 比较(与 dbgen.c 的 dg_kind_compat 一致)。
+    static bool KindCompat(int fk, int lk) {
+        if (fk == 0 || fk == 4) { return lk == 0 || lk == 2; }
+        if (fk == 1) { return lk == 0 || lk == 1; }
+        if (fk == 2) { return lk == 2 || lk == 0; }
+        if (fk == 3) { return lk == 3; }
+        return false;
+    }
+
+    static bool ExprTypeOk(List<DbField> fs, JsonValue l, JsonValue r,
+                           string pname) {
+        DbField lf = GenDb.MemberField(fs, l, pname);
+        DbField rf = GenDb.MemberField(fs, r, pname);
+        int lk = GenDb.LitKind(l);
+        int rk = GenDb.LitKind(r);
+        if (lf != null && rk >= 0) { return GenDb.KindCompat(lf.Kind, rk); }
+        if (rf != null && lk >= 0) { return GenDb.KindCompat(rf.Kind, lk); }
+        return true;
+    }
+
+    /// lambda 体能否降级为 ExprSql 能构建 SQL 的树:列读、字面量、
+    /// 支持的二元运算(含操作数类型检查)、取反、p 链上
+    /// StartsWith/EndsWith/Contains。其余(Eq/Gt/Between/IsNull/Like/In
+    /// 方法调用、捕获变量、聚合…)回退经典 SQL 片段路径。
+    static bool ExprCompatible(List<DbField> fs, JsonValue e, string pname) {
+        if (e == null) { return false; }
+        string k = e.Str("k", "");
+        if (k == "mem") { return GenDb.PnameChain(e.Get("o"), pname); }
+        if (k == "lit") {
+            string t = e.Str("t", "");
+            return t == "int" || t == "double" || t == "str" || t == "bool";
+        }
+        if (k == "bin") {
+            string op = GenDb.ExprOp(e.Str("op", ""));
+            if (op.Length == 0) { return false; }
+            if (!GenDb.ExprCompatible(fs, e.Get("l"), pname) ||
+                !GenDb.ExprCompatible(fs, e.Get("r"), pname)) {
+                return false;
+            }
+            if (op == "&&" || op == "||") { return true; }
+            if (!GenDb.ExprIsValue(e.Get("l"), pname) ||
+                !GenDb.ExprIsValue(e.Get("r"), pname)) {
+                return false;
+            }
+            return GenDb.ExprTypeOk(fs, e.Get("l"), e.Get("r"), pname);
+        }
+        if (k == "uni" && e.Str("op", "") == "!") {
+            return GenDb.ExprCompatible(fs, e.Get("o"), pname);
+        }
+        if (k == "call") {
+            JsonValue callee = e.Get("f");
+            if (callee == null) { return false; }
+            if (callee.Str("k", "") != "mem") { return false; }
+            string mn = callee.Str("n", "");
+            if (mn != "StartsWith" && mn != "EndsWith" && mn != "Contains") {
+                return false;
+            }
+            if (!GenDb.PnameChain(callee.Get("o"), pname)) { return false; }
+            JsonValue args = e.Get("a");
+            int nargs = args != null ? args.Count() : 0;
+            if (nargs > 1) { return false; }
+            if (nargs == 1 &&
+                !GenDb.ExprCompatible(fs, args.At(0), pname)) {
+                return false;
+            }
+            return true;
+        }
+        return false;
+    }
+
+    /// 构建 DbExpr 构造树(用户表达式树 -> ExprNode 调用树)。
+    static JsonValue ExprTree(JsonValue e, string pname) {
+        if (e == null) { return null; }
+        string k = e.Str("k", "");
+        if (k == "mem") {
+            JsonValue obj = e.Get("o");
+            if (obj != null && obj.Str("k", "") == "id" &&
+                obj.Str("n", "") == pname) {
+                JsonValue args = JsonValue.NewArray();
+                args.Append(GenDb.TreeStr(e.Str("n", "")));
+                return GenDb.ExprCall("Member", args);
+            }
+            GenDb.Diag(e, "expression-tree member access must read the lambda parameter (p => p.<field>)");
+            return null;
+        }
+        if (k == "lit") {
+            JsonValue args = JsonValue.NewArray();
+            args.Append(e);
+            return GenDb.ExprCall("Const", args);
+        }
+        if (k == "bin") {
+            string op = GenDb.ExprOp(e.Str("op", ""));
+            if (op.Length == 0) {
+                GenDb.Diag(e, "unsupported operator in expression tree");
+                return null;
+            }
+            JsonValue l = GenDb.ExprTree(e.Get("l"), pname);
+            JsonValue r = GenDb.ExprTree(e.Get("r"), pname);
+            if (l == null || r == null) { return null; }
+            JsonValue args = JsonValue.NewArray();
+            args.Append(GenDb.TreeStr(op));
+            args.Append(l);
+            args.Append(r);
+            return GenDb.ExprCall("Binary", args);
+        }
+        if (k == "uni" && e.Str("op", "") == "!") {
+            JsonValue x = GenDb.ExprTree(e.Get("o"), pname);
+            if (x == null) { return null; }
+            JsonValue args = JsonValue.NewArray();
+            args.Append(x);
+            return GenDb.ExprCall("Not", args);
+        }
+        if (k == "call") {
+            JsonValue callee = e.Get("f");
+            if (callee == null || callee.Str("k", "") != "mem") {
+                GenDb.Diag(e, "expression-tree calls must be p.chain.Method(...)");
+                return null;
+            }
+            string mn = callee.Str("n", "");
+            if (mn != "StartsWith" && mn != "EndsWith" && mn != "Contains") {
+                GenDb.Diag(e, "unsupported method '" + mn +
+                              "' in expression tree");
+                return null;
+            }
+            JsonValue args = e.Get("a");
+            int nargs = args != null ? args.Count() : 0;
+            if (nargs > 1) {
+                GenDb.Diag(e, "expression-tree calls take at most one argument");
+                return null;
+            }
+            JsonValue obj = callee.Get("o");
+            JsonValue recv = null;
+            if (obj != null && obj.Str("k", "") == "id" &&
+                obj.Str("n", "") == pname) {
+                recv = null;
+            } else {
+                recv = GenDb.ExprTree(obj, pname);
+                if (recv == null) { return null; }
+            }
+            JsonValue arg = null;
+            if (nargs == 1) {
+                arg = GenDb.ExprTree(args.At(0), pname);
+                if (arg == null) { return null; }
+            }
+            JsonValue cargs = JsonValue.NewArray();
+            cargs.Append(GenDb.TreeStr(mn));
+            cargs.Append(recv != null ? recv : GenDb.TreeNull());
+            cargs.Append(arg != null ? arg : GenDb.TreeNull());
+            return GenDb.ExprCall("Call", cargs);
+        }
+        GenDb.Diag(e, "unsupported expression in lambda tree");
+        return null;
+    }
+
+    /// 包一层 `Expr<T>.From(DbExpr.Lambda(pname, tree))`。
+    static JsonValue ExprWrap(string entity, string pname, JsonValue tree) {
+        JsonValue largs = JsonValue.NewArray();
+        largs.Append(GenDb.TreeStr(pname));
+        largs.Append(tree);
+        JsonValue lam = GenDb.ExprCall("Lambda", largs);
+        JsonValue from = GenDb.TreeMem(GenDb.TreeGenericId("Expr", entity),
+                                       "From");
+        return GenDb.TreeCall1(from, lam);
+    }
+
+    /// 参数在 Expr slot 上的调用点:`M(p => body)` 降级为
+    /// `M(Expr<T>.From(DbExpr.Lambda(...)))`。
+    static bool ExprRewriteCall(JsonValue call) {
+        string name = call.Str("name", "");
+        string recv = call.Str("recv", "");
+        bool direct = recv == "other";
+        string cls = "";
+        if (recv.StartsWith("id:")) { cls = recv.Substring(3); }
+        if (!direct && cls.Length == 0) { return false; }
+        for (int i = 0; i < GenDb.Eslots.Count; i = i + 1) {
+            ExprSlot es = GenDb.Eslots[i];
+            if (es.Name != name) { continue; }
+            if (!direct && es.Cls != cls) { continue; }
+            if (es.Param >= GenDb.ArgsCount(call)) { continue; }
+            JsonValue arg = GenDb.ArgAt(call, es.Param);
+            if (arg == null) { continue; }
+            if (arg.Str("k", "") != "lam") { continue; }
+            JsonValue ps = arg.Get("p");
+            if (ps == null || ps.Count() != 1) { continue; }
+            string pname = ps.At(0).AsString("");
+            JsonValue tree = GenDb.ExprTree(arg.Get("b"), pname);
+            if (tree == null) { return true; }
+            JsonValue op = GenDb.NewOp("db_expr_arg", call);
+            op.Put("param", JsonValue.NewNum(Convert.ToString(es.Param)));
+            op.Put("tree", GenDb.ExprWrap(es.Entity, pname, tree));
+            GenDb.AddRewrite(op);
+            return true;
+        }
+        return false;
+    }
+
+    // ---- 链方法重写 ----
+
+    /// `db.Query<T>().Where(...)`:Expr 路径替换参数;否则把调用点替换
+    /// 成 `.W(frag).P(v)...` 链(db_chain 指令)。
+    static void RewriteWhere(JsonValue call, string cls, bool exprOk) {
+        JsonValue lambda = GenDb.ArgAt(call, 0);
+        List<DbField> fields = GenDb.FieldsOf(cls, 0);
+        if (exprOk && lambda != null && lambda.Str("k", "") == "lam") {
+            JsonValue ps = lambda.Get("p");
+            if (ps != null && ps.Count() == 1) {
+                string pname = ps.At(0).AsString("");
+                if (GenDb.ExprCompatible(fields, lambda.Get("b"), pname)) {
+                    JsonValue tree = GenDb.ExprTree(lambda.Get("b"), pname);
+                    if (tree != null) {
+                        JsonValue op = GenDb.NewOp("db_expr_arg", call);
+                        op.Put("param", JsonValue.NewNum("0"));
+                        op.Put("tree", GenDb.ExprWrap(cls, pname, tree));
+                        GenDb.AddRewrite(op);
+                        return;
+                    }
+                }
+            }
+        }
+        Wf w = new Wf();
+        w.Call = call;
+        w.Lit = new StringBuilder();
+        w.Binds = new List<JsonValue>();
+        JsonValue frag = GenDb.WhereFrag(call, cls, lambda, w);
+        if (frag == null) { return; }
+        JsonValue ops = JsonValue.NewArray();
+        ops.Append(GenDb.OneOp("W", frag));
+        for (int i = 0; i < w.Binds.Count; i = i + 1) {
+            JsonValue b = w.Binds[i];
+            ops.Append(GenDb.OneOp(GenDb.BindMethod(b.Int("kind", 0)),
+                                   b.Get("expr")));
+        }
+        JsonValue op = GenDb.NewOp("db_chain", call);
+        op.Put("ops", ops);
+        GenDb.AddRewrite(op);
+    }
+
+    /// 把 `recv.W(...)` 构建为 `.W(frag).P(v)...` 链树(Read 访问器用,
+    /// 不经过指令)。诊断挂在 w.Call 上。
+    static JsonValue BuildWhereChain(JsonValue recv, string cls,
+                                     JsonValue lambda, JsonValue call) {
+        Wf w = new Wf();
+        w.Call = call;
+        w.Lit = new StringBuilder();
+        w.Binds = new List<JsonValue>();
+        JsonValue frag = GenDb.WhereFrag(call, cls, lambda, w);
+        if (frag == null) { return null; }
+        JsonValue node = GenDb.TreeCall1(GenDb.TreeMem(recv, "W"), frag);
+        for (int i = 0; i < w.Binds.Count; i = i + 1) {
+            JsonValue b = w.Binds[i];
+            node = GenDb.TreeCall1(
+                GenDb.TreeMem(node, GenDb.BindMethod(b.Int("kind", 0))),
+                b.Get("expr"));
+        }
+        return node;
+    }
+
+    /// `WhereIf(cond, p => ...)`:片段与参数只在 cond 成立时应用。
+    static void RewriteWhereIf(JsonValue call, string cls) {
+        JsonValue cond = GenDb.ArgAt(call, 0);
+        JsonValue lambda = GenDb.ArgAt(call, 1);
+        Wf w = new Wf();
+        w.Call = call;
+        w.Lit = new StringBuilder();
+        w.Binds = new List<JsonValue>();
+        JsonValue frag = GenDb.WhereFrag(call, cls, lambda, w);
+        if (frag == null) { return; }
+        JsonValue ops = JsonValue.NewArray();
+        ops.Append(GenDb.OneOp("CondBegin", cond));
+        ops.Append(GenDb.OneOp("W", frag));
+        for (int i = 0; i < w.Binds.Count; i = i + 1) {
+            JsonValue b = w.Binds[i];
+            ops.Append(GenDb.OneOp(GenDb.BindMethod(b.Int("kind", 0)),
+                                   b.Get("expr")));
+        }
+        ops.Append(GenDb.OpObj("CondEnd", JsonValue.NewArray()));
+        JsonValue op = GenDb.NewOp("db_chain", call);
+        op.Put("ops", ops);
+        GenDb.AddRewrite(op);
+    }
+
+    /// `Having(p => ...)`:同 Where,但落在 HAVING 子句。
+    static void RewriteHaving(JsonValue call, string cls) {
+        JsonValue lambda = GenDb.ArgAt(call, 0);
+        Wf w = new Wf();
+        w.Call = call;
+        w.Lit = new StringBuilder();
+        w.Binds = new List<JsonValue>();
+        JsonValue frag = GenDb.WhereFrag(call, cls, lambda, w);
+        if (frag == null) { return; }
+        JsonValue ops = JsonValue.NewArray();
+        ops.Append(GenDb.OneOp("H", frag));
+        for (int i = 0; i < w.Binds.Count; i = i + 1) {
+            JsonValue b = w.Binds[i];
+            ops.Append(GenDb.OneOp(GenDb.BindMethod(b.Int("kind", 0)),
+                                   b.Get("expr")));
+        }
+        JsonValue op = GenDb.NewOp("db_chain", call);
+        op.Put("ops", ops);
+        GenDb.AddRewrite(op);
+    }
+
+    /// `Set(a => a.col, value)` / `SetIncr(a => a.col, delta)`。
+    static void RewriteSet(JsonValue call, string cls, bool incr) {
+        List<DbField> fields = GenDb.FieldsOf(cls, 0);
+        DbField col = GenDb.SelColumn(call, cls, fields,
+                                      incr ? "SetIncr" : "Set");
+        if (col == null) { return; }
+        JsonValue val = GenDb.ArgAt(call, 1);
+        string msg = GenDb.LitMismatch(col, val);
+        if (msg.Length > 0) {
+            GenDb.Diag(call, "db.Update<T>().Set: " + msg);
+            return;
+        }
+        string m = "";
+        JsonValue arg = val;
+        if (col.Kind == 0) {
+            m = incr ? "SetIncrI" : "SetI";
+        } else if (col.Kind == 4) {
+            m = incr ? "SetIncrI" : "SetI";
+            arg = GenDb.TreeCast("int", val);
+        } else if (col.Kind == 1) {
+            m = incr ? "SetIncrD" : "SetD";
+            if (!(val.Str("k", "") == "lit" && val.Str("t", "") == "double")) {
+                arg = GenDb.TreeCast("double", val);
+            }
+        } else if (col.Kind == 3) {
+            m = "SetS";
+        } else if (col.Kind == 2) {
+            m = "SetB";
+        }
+        if (m.Length == 0 || (incr && (col.Kind == 3 || col.Kind == 2))) {
+            GenDb.Diag(call, "unsupported column type for Set/SetIncr");
+            return;
+        }
+        JsonValue ops = JsonValue.NewArray();
+        JsonValue args = JsonValue.NewArray();
+        args.Append(GenDb.TreeStr(col.Col));
+        args.Append(arg);
+        ops.Append(GenDb.OpObj(m, args));
+        JsonValue op = GenDb.NewOp("db_chain", call);
+        op.Put("ops", ops);
+        GenDb.AddRewrite(op);
+    }
+
+    /// `Sum/Avg/Max/Min(a => a.col)`:终端返回列自身类型(AVG 恒 double)。
+    static void RewriteAgg(JsonValue call, string cls, string fn) {
+        List<DbField> fields = GenDb.FieldsOf(cls, 0);
+        DbField col = GenDb.SelColumn(call, cls, fields, fn);
+        if (col == null) { return; }
+        if (col.Kind != 0 && col.Kind != 1) {
+            GenDb.Diag(call, fn + " requires an int or double column");
+            return;
+        }
+        bool asInt = col.Kind == 0 && fn != "AVG";
+        string m = asInt ? "AggI" : "AggD";
+        JsonValue ops = JsonValue.NewArray();
+        ops.Append(GenDb.OneOp(m, GenDb.TreeStr(fn + "(t." + col.Col + ")")));
+        JsonValue op = GenDb.NewOp("db_chain", call);
+        op.Put("ops", ops);
+        GenDb.AddRewrite(op);
+    }
+
+    /// `InsertColumns/UpdateColumns(a => a.col)` / `IgnoreColumns(...)`。
+    static void RewriteCols(JsonValue call, string cls, bool only) {
+        List<DbField> fields = GenDb.FieldsOf(cls, 0);
+        DbField col = GenDb.SelColumn(
+            call, cls, fields,
+            only ? "InsertColumns/UpdateColumns" : "IgnoreColumns");
+        if (col == null) { return; }
+        JsonValue ops = JsonValue.NewArray();
+        ops.Append(GenDb.OneOp(only ? "Only" : "Skip",
+                               GenDb.TreeStr(col.Col)));
+        JsonValue op = GenDb.NewOp("db_chain", call);
+        op.Put("ops", ops);
+        GenDb.AddRewrite(op);
+    }
+
+    /// `GroupBy(p => p.col)` -> `.GB("t.col")`。
+    static void RewriteGroupBy(JsonValue call, string cls) {
+        JsonValue lambda = GenDb.ArgAt(call, 0);
+        if (lambda == null || lambda.Str("k", "") != "lam") {
+            GenDb.Diag(call, "GroupBy expects p => p.<scalar field> or p => new { ... }");
+            return;
+        }
+        JsonValue ps = lambda.Get("p");
+        if (ps == null || ps.Count() != 1) {
+            GenDb.Diag(call, "GroupBy expects p => p.<scalar field> or p => new { ... }");
+            return;
+        }
+        JsonValue body = lambda.Get("b");
+        string pname = ps.At(0).AsString("");
+        List<DbField> fields = GenDb.FieldsOf(cls, 0);
+        StringBuilder gb = new StringBuilder();
+        bool first = true;
+        bool ok = true;
+        if (body != null && body.Str("k", "") == "new") {
+            JsonValue args = body.Get("a");
+            for (int i = 0; i < args.Count(); i = i + 1) {
+                JsonValue arg = args.At(i);
+                DbField col = null;
+                if (arg.Str("k", "") == "mem") {
+                    JsonValue obj = arg.Get("o");
+                    if (obj != null && obj.Str("k", "") == "id" &&
+                        obj.Str("n", "") == pname) {
+                        col = GenDb.FieldFind(fields, arg.Str("n", ""));
+                    }
+                }
+                if (col == null || col.Kind == 5) {
+                    GenDb.Diag(arg, "GroupBy member must be p => p.<scalar field>");
+                    ok = false;
+                    break;
+                }
+                if (!first) { gb.Append(", "); }
+                gb.Append("t." + col.Name);
+                first = false;
+            }
+            if (ok && first) {
+                GenDb.Diag(body, "GroupBy new { } must name at least one field");
+                ok = false;
+            }
+        } else {
+            DbField col = null;
+            if (body != null && body.Str("k", "") == "mem") {
+                JsonValue obj = body.Get("o");
+                if (obj != null && obj.Str("k", "") == "id" &&
+                    obj.Str("n", "") == pname) {
+                    col = GenDb.FieldFind(fields, body.Str("n", ""));
+                }
+            }
+            if (col == null || col.Kind == 5) {
+                GenDb.Diag(call, "GroupBy expects p => p.<scalar field>");
+                ok = false;
+            } else {
+                gb.Append("t." + col.Name);
+            }
+        }
+        if (!ok) { return; }
+        JsonValue ops = JsonValue.NewArray();
+        ops.Append(GenDb.OneOp("GB", GenDb.TreeStr(gb.ToString())));
+        JsonValue op = GenDb.NewOp("db_chain", call);
+        op.Put("ops", ops);
+        GenDb.AddRewrite(op);
+    }
+
+    /// `Distinct()` -> `.DISTINCT()`。
+    static void RewriteDistinct(JsonValue call) {
+        JsonValue ops = JsonValue.NewArray();
+        ops.Append(GenDb.OpObj("DISTINCT", JsonValue.NewArray()));
+        JsonValue op = GenDb.NewOp("db_chain", call);
+        op.Put("ops", ops);
+        GenDb.AddRewrite(op);
+    }
+
+    /// `OrderBy(p => p.col)` -> `.OB("t.col")`(desc -> OBD)。
+    static void RewriteOrderBy(JsonValue call, string cls, bool desc) {
+        JsonValue lambda = GenDb.ArgAt(call, 0);
+        JsonValue body = null;
+        if (lambda != null && lambda.Str("k", "") == "lam") {
+            JsonValue ps = lambda.Get("p");
+            if (ps != null && ps.Count() == 1) { body = lambda.Get("b"); }
+        }
+        List<DbField> fields = GenDb.FieldsOf(cls, 0);
+        DbField col = null;
+        if (body != null && body.Str("k", "") == "mem") {
+            JsonValue obj = body.Get("o");
+            if (obj != null && obj.Str("k", "") == "id" &&
+                obj.Str("n", "") == lambda.Get("p").At(0).AsString("")) {
+                col = GenDb.FieldFind(fields, body.Str("n", ""));
+            }
+        }
+        if (col == null || col.Kind == 5) {
+            GenDb.Diag(call, "OrderBy expects p => p.<scalar field>");
+            return;
+        }
+        JsonValue ops = JsonValue.NewArray();
+        ops.Append(GenDb.OneOp(desc ? "OBD" : "OB",
+                               GenDb.TreeStr("t." + col.Name)));
+        JsonValue op = GenDb.NewOp("db_chain", call);
+        op.Put("ops", ops);
+        GenDb.AddRewrite(op);
+    }
+
+    /// `ToList(a => a.field)` -> `.ToListCol("t.field")`;
+    /// `ToList<TDto>(a => new Dto { ... })` -> `.ToListDto(...)`。
+    static void RewriteToList(JsonValue call, string cls) {
+        JsonValue lambda = GenDb.ArgAt(call, 0);
+        if (lambda == null || lambda.Str("k", "") != "lam") {
+            GenDb.Diag(call, "ToList expects a one-parameter lambda");
+            return;
+        }
+        JsonValue ps = lambda.Get("p");
+        if (ps == null || ps.Count() != 1) {
+            GenDb.Diag(call, "ToList expects a one-parameter lambda");
+            return;
+        }
+        JsonValue body = lambda.Get("b");
+        string pname = ps.At(0).AsString("");
+        List<DbField> fields = GenDb.FieldsOf(cls, 0);
+        JsonValue targs = call.Get("targs");
+        if (targs != null && targs.Count() == 1) {
+            /* DTO 映射:ToList<TDto>(a => new Dto { f1 = a.x, ... }) */
+            string dtc = targs.At(0).AsString("");
+            if (body == null || body.Str("k", "") != "new") {
+                GenDb.Diag(body, "ToList<Dto> expects a => new Dto { f = a.col, ... }");
+                return;
+            }
+            StringBuilder cols = new StringBuilder();
+            bool first = true;
+            bool ok = true;
+            JsonValue args = body.Get("a");
+            for (int i = 0; i < args.Count(); i = i + 1) {
+                JsonValue arg = args.At(i);
+                JsonValue src = arg;
+                if (arg.Str("k", "") == "assign") {
+                    src = arg.Get("r");
+                }
+                DbField col = null;
+                if (src != null && src.Str("k", "") == "mem") {
+                    JsonValue obj = src.Get("o");
+                    if (obj != null && obj.Str("k", "") == "id" &&
+                        obj.Str("n", "") == pname) {
+                        col = GenDb.FieldFind(fields, src.Str("n", ""));
+                    }
+                }
+                if (col == null || col.Kind == 5) {
+                    GenDb.Diag(src, "ToList<Dto> member must read p => p.<scalar field>");
+                    ok = false;
+                    break;
+                }
+                if (!first) { cols.Append(", "); }
+                cols.Append("t." + col.Name);
+                first = false;
+            }
+            if (!ok) { return; }
+            if (first) {
+                GenDb.Diag(body, "ToList<Dto> must name at least one member");
+                return;
+            }
+            JsonValue ops = JsonValue.NewArray();
+            JsonValue oargs = JsonValue.NewArray();
+            oargs.Append(GenDb.TreeStr(cols.ToString()));
+            oargs.Append(GenDb.TreeStr(dtc));
+            ops.Append(GenDb.OpObj("ToListDto", oargs));
+            JsonValue op = GenDb.NewOp("db_chain", call);
+            op.Put("ops", ops);
+            GenDb.AddRewrite(op);
+            return;
+        }
+        /* 标量投影:ToList(a => a.field) */
+        DbField col = null;
+        if (body != null && body.Str("k", "") == "mem") {
+            JsonValue obj = body.Get("o");
+            if (obj != null && obj.Str("k", "") == "id" &&
+                obj.Str("n", "") == pname) {
+                col = GenDb.FieldFind(fields, body.Str("n", ""));
+            }
+        }
+        if (col == null || col.Kind == 5) {
+            GenDb.Diag(body, "ToList expects a => a.<scalar field>");
+            return;
+        }
+        JsonValue ops = JsonValue.NewArray();
+        ops.Append(GenDb.OneOp("ToListCol", GenDb.TreeStr("t." + col.Name)));
+        JsonValue op = GenDb.NewOp("db_chain", call);
+        op.Put("ops", ops);
+        GenDb.AddRewrite(op);
+    }
+
+    /// `Include(p => p.nav)`:LEFT JOIN 导航实体。
+    static void RewriteInclude(JsonValue call, string cls) {
+        JsonValue lambda = GenDb.ArgAt(call, 0);
+        JsonValue body = null;
+        if (lambda != null && lambda.Str("k", "") == "lam") {
+            JsonValue ps = lambda.Get("p");
+            if (ps != null && ps.Count() == 1) { body = lambda.Get("b"); }
+        }
+        List<DbField> fields = GenDb.FieldsOf(cls, 0);
+        DbField col = null;
+        if (body != null && body.Str("k", "") == "mem") {
+            JsonValue obj = body.Get("o");
+            if (obj != null && obj.Str("k", "") == "id" &&
+                obj.Str("n", "") == lambda.Get("p").At(0).AsString("")) {
+                col = GenDb.FieldFind(fields, body.Str("n", ""));
+            }
+        }
+        if (col == null || col.Kind != 5) {
+            GenDb.Diag(call, "Include expects p => p.<navigation field>");
+            return;
+        }
+        GenDb.NeedAdd(col.TypeName);
+        JsonValue ops = JsonValue.NewArray();
+        ops.Append(GenDb.OpObj("Inc_" + col.Name, JsonValue.NewArray()));
+        JsonValue op = GenDb.NewOp("db_chain", call);
+        op.Put("ops", ops);
+        GenDb.AddRewrite(op);
+    }
+
+    /// 选择器列:`p => p.field` 的列,失败时发诊断并返回 null。
+    static DbField SelColumn(JsonValue call, string cls, List<DbField> fields,
+                             string what) {
+        JsonValue lambda = GenDb.ArgAt(call, 0);
+        JsonValue body = null;
+        if (lambda != null && lambda.Str("k", "") == "lam") {
+            JsonValue ps = lambda.Get("p");
+            if (ps != null && ps.Count() == 1) { body = lambda.Get("b"); }
+        }
+        DbField col = null;
+        if (body != null && body.Str("k", "") == "mem") {
+            JsonValue obj = body.Get("o");
+            if (obj != null && obj.Str("k", "") == "id" &&
+                obj.Str("n", "") == lambda.Get("p").At(0).AsString("")) {
+                col = GenDb.FieldFind(fields, body.Str("n", ""));
+            }
+        }
+        if (col == null || col.Kind == 5) {
+            GenDb.Diag(call, what + " expects p => p.<scalar field>");
+            return null;
+        }
+        return col;
+    }
+
+    // ---- 链识别 ----
+
+    static bool SelectHead(string name) {
+        return name == "Where" || name == "WhereIf" ||
+               name == "OrderBy" || name == "OrderByDescending" ||
+               name == "Include" || name == "GroupBy" ||
+               name == "Distinct" || name == "Skip" || name == "Take" ||
+               name == "Limit" || name == "Page" || name == "Count" ||
+               name == "CountAsync" || name == "Any" || name == "AnyAsync" ||
+               name == "First" || name == "FirstAsync" ||
+               name == "FirstOrDefault" || name == "FirstOrDefaultAsync" ||
+               name == "ToOne" || name == "ToOneAsync" ||
+               name == "ToList" || name == "ToListAsync" ||
+               name == "Sum" || name == "Avg" || name == "Max" ||
+               name == "Min";
+    }
+
+    /// 沿 fluent 链接收者回溯到重写后的 `__DbBind.X_<T>` 根,返回实体名
+    /// ("" 表示不是 db 链)。kind: 1 select, 2 insert, 3 update, 4 delete。
+    /// 与 dbgen.c 的 dg_chain_entity2 一致:未重写的链方法(SetDict/Page
+    /// 等真实方法)直接穿过,直到找到登记过的根。
+    static string ChainEntity2(JsonValue call, out int kind) {
+        kind = 0;
+        string recv = call.Str("recv", "");
+        while (recv.StartsWith("call#")) {
+            int rid = call.Int("recv_id", 0);
+            JsonValue r = GenDb.CallAt(rid);
+            if (r == null) { return ""; }
+            string rname = "";
+            bool found = GenDb.Rewrote.TryGetValue(rid, out rname);
+            if (found && rname.Length >= 3 && rname[1] == '_') {
+                string x = rname.Substring(0, 1);
+                if (x == "Q") { kind = 1; }
+                else if (x == "I") { kind = 2; }
+                else if (x == "U") { kind = 3; }
+                else if (x == "D") { kind = 4; }
+                else { return ""; }
+                return rname.Substring(2);
+            }
+            call = r;
+            recv = r.Str("recv", "");
+        }
+        return "";
+    }
+
+    /// `<recv>.Query<T>()` / `Select<T>()` / `Insert<T>(..)` / `Update<T>()`
+    /// / `Delete<T>()` / `SyncStructure<T>()` 且 T 是已知实体类。
+    static bool IsRoot(JsonValue call, out string cls, out int kind,
+                       out bool sync) {
+        cls = "";
+        kind = 0;
+        sync = false;
+        string name = call.Str("name", "");
+        int maxargs = 0;
+        if (name == "Query" || name == "Select") { kind = 1; }
+        else if (name == "Insert") { kind = 2; maxargs = 1; }
+        else if (name == "Update") { kind = 3; }
+        else if (name == "Delete") { kind = 4; }
+        else if (name == "SyncStructure" || name == "SyncStructureAsync") {
+            sync = true;
+        } else {
+            return false;
+        }
+        JsonValue targs = call.Get("targs");
+        if (targs == null || targs.Count() != 1) { return false; }
+        if (GenDb.ArgsCount(call) > maxargs) { return false; }
+        string targ = targs.At(0).AsString("");
+        if (targ.Contains("[") || targ.Contains("<") || targ.Contains("?")) {
+            return false;
+        }
+        if (GenDb.ClassGet(targ) == null) { return false; }
+        cls = targ;
+        return true;
+    }
+
+    /// `__DbBind.<name>(args...)` 调用树。
+    static JsonValue DbBindCall(string name, JsonValue args) {
+        return GenDb.TreeCall(GenDb.TreeMem(GenDb.TreeId("__DbBind"), name),
+                              args);
+    }
+
+    /// 访问器 `obj.__Conn()` 调用树。
+    static JsonValue AccConn(JsonValue acc) {
+        return GenDb.TreeCall1(GenDb.TreeMem(acc.Get("o"), "__Conn"), null);
+    }
+
+    // ---- 调用点主分派(children-first,id 降序) ----
+
+    static void VisitCall(JsonValue call) {
+        string name = call.Str("name", "");
+        int id = call.Int("id", 0);
+
+        /* db.SyncStructureAll() -> __DbBind.SyncAll(db) */
+        if ((name == "SyncStructureAll" || name == "SyncStructureAllAsync") &&
+            call.Get("targs").Count() == 0 && GenDb.ArgsCount(call) == 0) {
+            GenDb.SyncAll = true;
+            string n2 = name == "SyncStructureAll" ? "SyncAll"
+                                                   : "SyncAllAsync";
+            JsonValue op = GenDb.NewOp("db_root", call);
+            op.Put("name", JsonValue.NewStr(n2));
+            op.Put("extra", JsonValue.NewBool(false));
+            GenDb.AddRewrite(op);
+            GenDb.Rewrote.Add(id, n2);
+            return;
+        }
+
+        /* Expr<T> 目标类型 lambda:先于 ORM 链处理 */
+        if (GenDb.ExprRewriteCall(call)) { return; }
+
+        /* 访问器 `<obj>.<Entity>.Method(...)` */
+        JsonValue recvx = call.Get("recvx");
+        bool isAcc = false;
+        string accCls = "";
+        if (recvx != null && recvx.Str("k", "") == "mem") {
+            string en = recvx.Str("n", "");
+            if (GenDb.IsTableEntity(en)) {
+                isAcc = true;
+                accCls = en;
+            }
+        }
+        if (isAcc) {
+            JsonValue conn = GenDb.AccConn(recvx);
+            int nargs = GenDb.ArgsCount(call);
+            if (name == "Insert" && nargs <= 1) {
+                JsonValue args = JsonValue.NewArray();
+                args.Append(conn);
+                if (nargs == 1) { args.Append(GenDb.ArgAt(call, 0)); }
+                JsonValue tree = GenDb.DbBindCall("I_" + accCls, args);
+                JsonValue op = GenDb.NewOp("db_acc_root", call);
+                op.Put("tree", tree);
+                GenDb.AddRewrite(op);
+                GenDb.Rewrote.Add(id, "I_" + accCls);
+                GenDb.Any = true;
+                GenDb.NeedAdd(accCls);
+                return;
+            }
+            if ((name == "Update" || name == "Delete") && nargs == 0) {
+                JsonValue args = JsonValue.NewArray();
+                args.Append(conn);
+                JsonValue tree = GenDb.DbBindCall(
+                    (name == "Update" ? "U_" : "D_") + accCls, args);
+                JsonValue op = GenDb.NewOp("db_acc_root", call);
+                op.Put("tree", tree);
+                GenDb.AddRewrite(op);
+                GenDb.Rewrote.Add(id, (name == "Update" ? "U_" : "D_") +
+                                      accCls);
+                GenDb.Any = true;
+                GenDb.NeedAdd(accCls);
+                return;
+            }
+            if ((name == "Read" || name == "ReadAsync") && nargs == 1) {
+                string pk = GenDb.PkOf(accCls);
+                if (pk.Length == 0) {
+                    GenDb.Diag(call, "Read() needs an identity column on the entity");
+                    return;
+                }
+                JsonValue q = GenDb.DbBindCall("Q_" + accCls,
+                                               GenDb.OneArg(conn));
+                List<string> lps = new List<string>();
+                lps.Add("a");
+                JsonValue cmp = GenDb.TreeBin(
+                    "==", GenDb.TreeMem(GenDb.TreeId("a"), pk),
+                    GenDb.ArgAt(call, 0));
+                JsonValue lam = GenDb.TreeLam(lps, cmp);
+                JsonValue wq = GenDb.BuildWhereTree(q, accCls, lam, call);
+                if (wq == null) { return; }
+                JsonValue first = GenDb.TreeCall1(
+                    GenDb.TreeMem(wq, "FirstAsync"), null);
+                JsonValue op = GenDb.NewOp("db_acc_root", call);
+                op.Put("tree", first);
+                GenDb.AddRewrite(op);
+                GenDb.Rewrote.Add(id, "Q_" + accCls);
+                GenDb.Any = true;
+                GenDb.NeedAdd(accCls);
+                return;
+            }
+            if (!GenDb.SelectHead(name)) { return; }
+            JsonValue op = GenDb.NewOp("db_acc_head", call);
+            op.Put("name", JsonValue.NewStr("Q_" + accCls));
+            op.Put("conn", conn);
+            GenDb.AddRewrite(op);
+            GenDb.Rewrote.Add(id, "Q_" + accCls);
+            GenDb.Any = true;
+            GenDb.NeedAdd(accCls);
+            /* 继续当链方法处理(Where/OrderBy/...) */
+            string entity = accCls;
+            int ck = 1;
+            GenDb.ChainMethods(call, entity, ck);
+            return;
+        }
+
+        string cls2 = "";
+        int kind2 = 0;
+        bool sync2 = false;
+        if (GenDb.IsRoot(call, out cls2, out kind2, out sync2)) {
+            string rootName = "";
+            bool extra = false;
+            if (sync2) {
+                rootName = name == "SyncStructureAsync"
+                               ? "CFA_" + cls2 : "CF_" + cls2;
+            } else {
+                string pre = kind2 == 1 ? "Q" : kind2 == 2 ? "I"
+                           : kind2 == 3 ? "U" : "D";
+                rootName = pre + "_" + cls2;
+                extra = kind2 == 2 && GenDb.ArgsCount(call) == 1;
+            }
+            JsonValue op = GenDb.NewOp("db_root", call);
+            op.Put("name", JsonValue.NewStr(rootName));
+            op.Put("extra", JsonValue.NewBool(extra));
+            GenDb.AddRewrite(op);
+            GenDb.Rewrote.Add(id, rootName);
+            GenDb.Any = true;
+            GenDb.NeedAdd(cls2);
+            return;
+        }
+
+        int ck2 = 0;
+        string entity2 = GenDb.ChainEntity2(call, out ck2);
+        if (entity2.Length == 0) { return; }
+        GenDb.ChainMethods(call, entity2, ck2);
+    }
+
+    /// 链上方法分派(调用点已被识别为 db 链)。
+    static void ChainMethods(JsonValue call, string entity, int ck) {
+        string name = call.Str("name", "");
+        bool is_where = name == "Where";
+        bool is_whereif = name == "WhereIf";
+        bool is_ob = name == "OrderBy";
+        bool is_obd = name == "OrderByDescending";
+        bool is_inc = name == "Include";
+        bool is_set = name == "Set";
+        bool is_incr = name == "SetIncr";
+        bool is_only = name == "InsertColumns" || name == "UpdateColumns";
+        bool is_skip = name == "IgnoreColumns";
+        bool is_groupby = name == "GroupBy";
+        bool is_having = name == "Having";
+        bool is_distinct = name == "Distinct";
+        string agg = "";
+        if (name == "Sum") { agg = "SUM"; }
+        else if (name == "Avg") { agg = "AVG"; }
+        else if (name == "Max") { agg = "MAX"; }
+        else if (name == "Min") { agg = "MIN"; }
+        int nargs = GenDb.ArgsCount(call);
+        int before = GenDb.RwCount;
+
+        if (is_distinct && ck == 1 && nargs == 0) {
+            GenDb.RewriteDistinct(call);
+            return;
+        }
+        if (is_whereif) {
+            if (nargs != 2) { return; }
+            JsonValue l1 = GenDb.ArgAt(call, 1);
+            if (l1 == null || l1.Str("k", "") != "lam") { return; }
+            GenDb.RewriteWhereIf(call, entity);
+            return;
+        }
+        if ((is_set || is_incr) && ck == 3) {
+            if (nargs != 2) { return; }
+            JsonValue l0 = GenDb.ArgAt(call, 0);
+            if (l0 == null || l0.Str("k", "") != "lam") { return; }
+            GenDb.RewriteSet(call, entity, is_incr);
+            return;
+        }
+        if (nargs != 1) { return; }
+        JsonValue l = GenDb.ArgAt(call, 0);
+        if (l == null || l.Str("k", "") != "lam") { return; }
+        if (is_where) {
+            GenDb.RewriteWhere(call, entity, ck == 1);
+        } else if (is_inc && ck == 1) {
+            GenDb.RewriteInclude(call, entity);
+        } else if ((is_ob || is_obd) && ck == 1) {
+            GenDb.RewriteOrderBy(call, entity, is_obd);
+        } else if (agg.Length > 0 && ck == 1) {
+            GenDb.RewriteAgg(call, entity, agg);
+        } else if (is_groupby && ck == 1) {
+            GenDb.RewriteGroupBy(call, entity);
+        } else if (is_having && ck == 1) {
+            GenDb.RewriteHaving(call, entity);
+        } else if (name == "ToList" && ck == 1) {
+            GenDb.RewriteToList(call, entity);
+        } else if ((is_only || is_skip) && (ck == 2 || ck == 3)) {
+            GenDb.RewriteCols(call, entity, is_only);
+        }
+        if (GenDb.RwCount > before) { GenDb.MarkChain(call, entity, ck); }
+    }
+
+    /// Where 调用树(Read 访问器内部用):Expr 路径替换参数,否则返回
+    /// `.W(frag).P(v)...` 链树。
+    static JsonValue BuildWhereTree(JsonValue wCall, string cls,
+                                    JsonValue lambda, JsonValue call) {
+        List<DbField> fields = GenDb.FieldsOf(cls, 0);
+        JsonValue ps = lambda.Get("p");
+        string pname = ps.At(0).AsString("");
+        if (GenDb.ExprCompatible(fields, lambda.Get("b"), pname)) {
+            JsonValue tree = GenDb.ExprTree(lambda.Get("b"), pname);
+            if (tree != null) {
+                return GenDb.TreeCall1(GenDb.TreeMem(wCall, "Where"),
+                                       GenDb.ExprWrap(cls, pname, tree));
+            }
+            return null;
+        }
+        return GenDb.BuildWhereChain(wCall, cls, lambda, call);
+    }
+
+    // ---- 入口 ----
+
+    static void Run(JsonValue req, JsonValue reply) {
+        GenDb.Reply = reply;
+        GenDb.Unit = req.Get("unit");
+        if (GenDb.Unit == null) { return; }
+        GenDb.ClassOf = new Dict<string, JsonValue>();
+        GenDb.NeedNames = new List<string>();
+        GenDb.Rewrote = new Dict<int, string>();
+        GenDb.CallById = new Dict<int, JsonValue>();
+        GenDb.RwCount = 0;
+        GenDb.Any = false;
+        GenDb.SyncAll = false;
+        JsonValue classes = GenDb.Unit.Get("classes");
+        if (classes != null && classes.IsArray()) {
+            for (int i = 0; i < classes.Count(); i = i + 1) {
+                GenDb.ClassOf.Add(classes.At(i).Str("name", ""),
+                                  classes.At(i));
+            }
+        }
+        GenDb.CollectExprSlots();
+        JsonValue calls = GenDb.Unit.Get("calls");
+        if (calls != null && calls.IsArray()) {
+            /* 与 dbgen.c 的 children-first 访问一致:调用点 id 按
+             * children-first 分配(内层先),因此按 id 升序处理 */
+            int n = calls.Count();
+            List<int> ord = new List<int>();
+            for (int i = 0; i < n; i = i + 1) { ord.Add(i); }
+            for (int i = 1; i < n; i = i + 1) {
+                int v = ord[i];
+                int j = i - 1;
+                while (j >= 0 && calls.At(ord[j]).Int("id", 0) >
+                       calls.At(v).Int("id", 0)) {
+                    ord[j + 1] = ord[j];
+                    j = j - 1;
+                }
+                ord[j + 1] = v;
+            }
+            for (int i = 0; i < n; i = i + 1) {
+                JsonValue call = calls.At(ord[i]);
+                int cid = call.Int("id", 0);
+                GenDb.CallById.Add(cid, call);
+                GenDb.VisitCall(call);
+            }
+        }
+        if (!GenDb.Any || GenCommon.HasError(GenDb.Reply)) { return; }
+        if (GenDb.SyncAll) {
+            if (classes != null && classes.IsArray()) {
+                for (int i = 0; i < classes.Count(); i = i + 1) {
+                    JsonValue c = classes.At(i);
+                    string cn = c.Str("name", "");
+                    if (c.Str("kind", "") == "class" &&
+                        GenDb.IsTableEntity(cn)) {
+                        GenDb.NeedAdd(cn);
+                    }
+                }
+            }
+        }
+        GenDbEmit.Run();
+    }
+}

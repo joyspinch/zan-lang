@@ -91,6 +91,9 @@ add_executable(zanc
     src/compiler/scenegen.c
     src/compiler/dbgen.c
     src/compiler/routegen.c
+    src/compiler/genrun.c
+    src/compiler/genmeta.c
+    src/common/json.c
     src/compiler/nsresolve.c
     src/compiler/binder.c
     src/compiler/checker.c
