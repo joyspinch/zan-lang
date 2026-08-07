@@ -594,8 +594,25 @@ add_custom_command(OUTPUT ${_stdlib_stamp}
   COMMENT "Stamping stdlib sources for the test suite")
 add_custom_target(stdlib_stamp ALL DEPENDS ${_stdlib_stamp})
 
+# The RA2 format tests were moved out of stdlib into
+# examples/game/ra2/stdlib_rts; they need its Formats sources on the command
+# line so the compiler can resolve Ra2.StdlibRts.Formats.
+set(_rts_stdlib_srcs
+  ${CMAKE_SOURCE_DIR}/examples/game/ra2/stdlib_rts/Formats/Binary.zan
+  ${CMAKE_SOURCE_DIR}/examples/game/ra2/stdlib_rts/Formats/Csf.zan
+  ${CMAKE_SOURCE_DIR}/examples/game/ra2/stdlib_rts/Formats/Ini.zan
+  ${CMAKE_SOURCE_DIR}/examples/game/ra2/stdlib_rts/Formats/Pal.zan
+  ${CMAKE_SOURCE_DIR}/examples/game/ra2/stdlib_rts/Formats/Shp.zan
+  ${CMAKE_SOURCE_DIR}/examples/game/ra2/stdlib_rts/Formats/Tmp.zan)
+string(JOIN ";" _rts_stdlib_zanc_args ${_rts_stdlib_srcs})
+
 foreach(_src ${_conf_srcs})
   get_filename_component(_name ${_src} NAME_WE)
+  if(_name MATCHES "^rts_")
+    set(_extra_args "${_rts_stdlib_zanc_args}")
+  else()
+    set(_extra_args "")
+  endif()
   add_test(NAME conformance_${_name}
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
@@ -603,6 +620,7 @@ foreach(_src ${_conf_srcs})
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/${_name}.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_${_name}${_exe_ext}
       -DSTDLIB_STAMP=${_stdlib_stamp}
+      "-DZANC_ARGS=${_extra_args}"
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
   # A program and its leakcheck twin are built from the same source, so any
   # hardcoded listen port (e.g. the async networking conformance tests) is
@@ -621,12 +639,18 @@ endforeach()
 # (reproducible-build / correctness net).
 foreach(_src ${_conf_srcs})
   get_filename_component(_name ${_src} NAME_WE)
+  if(_name MATCHES "^rts_")
+    set(_extra_args "${_rts_stdlib_zanc_args}")
+  else()
+    set(_extra_args "")
+  endif()
   add_test(NAME determinism_${_name}
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${_src}
       -DSTDLIB_STAMP=${_stdlib_stamp}
       -DSTAMP=${CMAKE_BINARY_DIR}/det_${_name}.stamp
+      "-DZANC_ARGS=${_extra_args}"
       -P ${CMAKE_SOURCE_DIR}/tests/run_determinism.cmake)
   set_tests_properties(determinism_${_name} PROPERTIES TIMEOUT 120)
 endforeach()
@@ -642,12 +666,18 @@ set(_known_leaky
 )
 foreach(_src ${_conf_srcs})
   get_filename_component(_name ${_src} NAME_WE)
+  if(_name MATCHES "^rts_")
+    set(_extra_args "${_rts_stdlib_zanc_args}")
+  else()
+    set(_extra_args "")
+  endif()
   add_test(NAME leakcheck_${_name}
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${_src}
       -DOUT_EXE=${CMAKE_BINARY_DIR}/leak_${_name}${_exe_ext}
       -DSTDLIB_STAMP=${_stdlib_stamp}
+      "-DZANC_ARGS=${_extra_args}"
       -P ${CMAKE_SOURCE_DIR}/tests/run_leakcheck.cmake)
   set_tests_properties(leakcheck_${_name} PROPERTIES
     RESOURCE_LOCK src_${_name} TIMEOUT 120)

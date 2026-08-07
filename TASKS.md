@@ -258,7 +258,7 @@
   分批推进：Path/File/Directory → 字符串原语 → 压缩/图像/音频（rts_*）→ 序列化
   （json/zandb/hex）→ 加密 → Net 全链（Socket/Mqtt/WebSocket/Worker/Tls/WebApp）→
   Diagnostics / IO.Directory / Text.Encoding / CSPRNG / ResourcePack → System.Data 全驱动
-  + Wechat / RsaKey / Gui.Text / Game.Rts / Zgm / Windows.Forms。协议数据一律带显式长度，
+  + Wechat / RsaKey / Gui.Text / examples/game/ra2 / Zgm / Windows.Forms。协议数据一律带显式长度，
   不靠 NUL；OpenSSL/libpq/sqlite3/ODBC 的 opaque handle 仍是 native 指针。
   〔实测〕`byte[]` 与 `string` 布局兼容，下游 `string` 形参不必全翻；
   `examples/net` 编译运行正确、多批 ctest 子集全绿。

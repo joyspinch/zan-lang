@@ -3,7 +3,6 @@
 The game modules are intentionally layered:
 
 ```text
-Game.Rts ------+
 Game.Arpg -----+--> SDL3 --> zan_sdl3 --> SDL3
 Game.Zgm
 
@@ -38,4 +37,5 @@ world, combat, scheduling, graphical controls, data binding and SDL rendering.
 `SDL3` owns platform windows, rendering, input and timing. Game modules own
 domain concepts and do not expose raw SDL handles through gameplay APIs.
 
-`Game.Rts` is a clean-room compatibility engine for user-owned RA2/Yuri assets.
+The RA2/Yuri clean-room demo lives in `examples/game/ra2`; it is not part of the
+standard library.

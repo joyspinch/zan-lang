@@ -1,7 +1,7 @@
 # Deterministic-codegen check for a single Zan program.
 #
 # Invoked as:
-#   cmake -DZANC=<zanc> -DSRC=<file.zan> -P run_determinism.cmake
+#   cmake -DZANC=<zanc> -DSRC=<file.zan> [-DZANC_ARGS=<extra;args>] -P run_determinism.cmake
 #
 # Compiles SRC to LLVM IR twice and fails (non-zero) unless the two emissions
 # are byte-for-byte identical. This is the C-hosted analogue of a self-hosting
@@ -48,7 +48,7 @@ endif()
 
 function(emit_ir out_var)
   execute_process(
-    COMMAND ${ZANC} ${SRC} --emit-ir
+    COMMAND ${ZANC} ${SRC} ${ZANC_ARGS} --emit-ir
     RESULT_VARIABLE rc
     OUTPUT_VARIABLE ir
     ERROR_VARIABLE  err)
