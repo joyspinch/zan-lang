@@ -1740,6 +1740,14 @@ int main(int argc, char **argv) {
             zan_lexer_define(&lex, "ARM64", "1");
         else if (target.arch == ZAN_ARCH_X86_64)
             zan_lexer_define(&lex, "X86_64", "1");
+        else if (target.arch == ZAN_ARCH_RISCV64)
+            zan_lexer_define(&lex, "RISCV64", "1");
+        else if (target.arch == ZAN_ARCH_WASM32)
+            zan_lexer_define(&lex, "WASM32", "1");
+        if (target.os == ZAN_OS_WASI)
+            zan_lexer_define(&lex, "WASI", "1");
+        if (target.abi == ZAN_ABI_MUSL)
+            zan_lexer_define(&lex, "MUSL", "1");
         zan_lexer_define(&lex, "ZAN", "1");
         /* User -D defines */
         for (int di = 0; di < pp_define_count; di++) {
