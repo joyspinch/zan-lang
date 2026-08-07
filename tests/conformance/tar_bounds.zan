@@ -1,0 +1,92 @@
+// Tar.Read must reject size fields that overrun the archive instead of
+// allocating huge buffers or reading past the byte[] (no bounds check in
+// this runtime). The old code parsed the 12-digit octal size into an int,
+// so (size + 511) could overflow and drive the scan position backwards.
+using System;
+using System.IO;
+using System.IO.Compression;
+
+class Program {
+    static int bad;
+
+    static void Check(bool ok, string label) {
+        if (!ok) { Console.WriteLine("FAIL " + label); bad = bad + 1; }
+    }
+
+    static byte[] CopyOf(byte[] src) {
+        byte[] d = new byte[src.Length];
+        for (int i = 0; i < src.Length; i = i + 1) { d[i] = src[i]; }
+        return d;
+    }
+
+    // Write `size` octal right-aligned into the 12-byte size field and
+    // recompute the header checksum so the crafted header is otherwise valid.
+    static void PatchSize(byte[] tar, int hdr, long size) {
+        int i = 0;
+        for (; i < 12; i = i + 1) { tar[hdr + 124 + i] = 32; }   // spaces
+        int vpos = hdr + 124 + 10;
+        long v = size;
+        while (v > 0 && vpos >= hdr + 124) {
+            tar[vpos] = (byte)(48 + (v & 7));
+            v = v >> 3;
+            vpos = vpos - 1;
+        }
+        tar[hdr + 124 + 11] = 0;                                  // NUL 终止
+        // 校验和：148..155 按空格计。
+        int sum = 0;
+        i = 0;
+        while (i < 512) {
+            int c = (i >= 148 && i < 156) ? 32 : (tar[hdr + i] & 255);
+            sum = sum + c;
+            i = i + 1;
+        }
+        i = 0;
+        for (; i < 8; i = i + 1) { tar[hdr + 148 + i] = 32; }
+        int cpos = hdr + 148 + 6;
+        while (sum > 0 && cpos >= hdr + 148) {
+            tar[cpos] = (byte)(48 + (sum & 7));
+            sum = sum >> 3;
+            cpos = cpos - 1;
+        }
+        tar[hdr + 148 + 7] = 0;
+    }
+
+    static void Main() {
+        // Round-trip sanity.
+        List<TarEntry> es = new List<TarEntry>();
+        TarEntry a = new TarEntry("a.txt");
+        a.data = "hello tar".ToBytes();
+        es.Add(a);
+        byte[] tar = Tar.Create(es);
+        List<TarEntry> ok = Tar.Read(tar);
+        Check(ok != null && ok.Count == 1 && ok[0].data != null, "roundtrip");
+
+        // Size that fits the archive still reads.
+        byte[] t1 = CopyOf(tar);
+        PatchSize(t1, 0, 5);
+        List<TarEntry> r1 = Tar.Read(t1);
+        Check(r1 != null && r1.Count == 1 && r1[0].data.Length == 5, "small size");
+
+        // Size larger than the whole archive -> null (was an OOB read).
+        byte[] t2 = CopyOf(tar);
+        PatchSize(t2, 0, 4096);
+        Check(Tar.Read(t2) == null, "size beyond archive");
+
+        // 12 octal digits (8^12-1), int-overflow territory -> null.
+        byte[] t3 = CopyOf(tar);
+        for (int i = 0; i < 12; i = i + 1) { t3[124 + i] = 55; }  // all '7'
+        Tar.Read(t3);   // must not crash; recompute checksum for a strict check
+        int sum = 0;
+        for (int i = 0; i < 512; i = i + 1) {
+            int c = (i >= 148 && i < 156) ? 32 : (t3[i] & 255);
+            sum = sum + c;
+        }
+        int cpos = 148 + 6;
+        for (int i = 0; i < 8; i = i + 1) { t3[148 + i] = 32; }
+        while (sum > 0 && cpos >= 148) { t3[cpos] = (byte)(48 + (sum & 7)); sum = sum >> 3; cpos = cpos - 1; }
+        t3[155] = 0;
+        Check(Tar.Read(t3) == null, "size 12 octal digits");
+
+        Console.WriteLine("tar-bounds-ok: " + Convert.ToString(bad == 0 ? 1 : 0));
+    }
+}

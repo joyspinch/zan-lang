@@ -71,15 +71,23 @@ class Tar {
             if (prefix.Length > 0) {
                 name = prefix + "/" + name;
             }
-            int size = Tar.ParseOctal(tar, pos + 124, 12);
+            long size = Tar.ParseSize(tar, pos + 124);
             int type = tar[pos + 156] & 255;
+            // 防炸弹 + 防溢出：size 来自归档头部（12 位八进制），
+            // 用 long 累计，数据区必须整体落在归档内——byte[] 无越界
+            // 检查，(size + 511) 的 int 溢出会让游标倒退、从缓冲区
+            // 前方读取。
+            if (size < 0) { return null; }
+            long dataLen = ((size + 511) / 512) * 512;
+            if ((long)pos + 512 + dataLen > tar.Length) { return null; }
             TarEntry e = new TarEntry(name);
             e.mode = Tar.ParseOctal(tar, pos + 100, 8);
             if (type == 53) {                      // '5' = 目录
                 e.isDirectory = true;
             } else if (type == 0 || type == 48) {  // 普通文件（'0' 或 NUL）
-                e.data = new byte[size];
-                for (int k = 0; k < size; k = k + 1) {
+                int isz = (int)size;
+                e.data = new byte[isz];
+                for (int k = 0; k < isz; k = k + 1) {
                     e.data[k] = tar[pos + 512 + k];
                 }
             } else {
@@ -87,7 +95,7 @@ class Tar {
                 e.data = null;                     // 符号链接/设备/其他
             }
             entries.Add(e);
-            pos = pos + 512 + ((size + 511) / 512) * 512;
+            pos = pos + 512 + (int)dataLen;
         }
         return entries;
     }
@@ -203,6 +211,19 @@ class Tar {
             int c = b[off + i] & 255;
             if (c >= 48 && c <= 55) {
                 v = (v << 3) | (c - 48);
+            }
+        }
+        return v;
+    }
+
+    /// size 字段（12 位八进制）可能超过 int 范围，必须用 long
+    /// 累计，否则攻击者把 32 位截断值写进 size 就能绕过边界检查。
+    static long ParseSize(byte[] b, int off) {
+        long v = 0;
+        for (int i = 0; i < 12; i = i + 1) {
+            int c = b[off + i] & 255;
+            if (c >= 48 && c <= 55) {
+                v = (v << 3) | (long)(c - 48);
             }
         }
         return v;
