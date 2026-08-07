@@ -1,0 +1,119 @@
+// Malformed archives and deflate streams must be rejected (null) instead of
+// reading past the end of the byte[] (no bounds check in this runtime) or
+// allocating unbounded output. The old Zip central-directory walk advanced
+// without re-validating, Deflate.Inflate let Ensure grow past maxOut, and the
+// EOCD cdPos/cdSize int arithmetic overflowed to bypass the bounds check.
+using System;
+using System.IO;
+using System.IO.Compression;
+
+class Program {
+    static int bad;
+
+    static void Check(bool ok, string label) {
+        if (!ok) { Console.WriteLine("FAIL " + label); bad = bad + 1; }
+    }
+
+    static byte[] CopyOf(byte[] src) {
+        byte[] d = new byte[src.Length];
+        for (int i = 0; i < src.Length; i = i + 1) { d[i] = src[i]; }
+        return d;
+    }
+
+    static void PutU32(byte[] b, int off, long v) {
+        b[off] = (byte)(v & 255);
+        b[off + 1] = (byte)((v >> 8) & 255);
+        b[off + 2] = (byte)((v >> 16) & 255);
+        b[off + 3] = (byte)((v >> 24) & 255);
+    }
+
+    static void PutU16(byte[] b, int off, int v) {
+        b[off] = (byte)(v & 255);
+        b[off + 1] = (byte)((v >> 8) & 255);
+    }
+
+    static byte[] MakeZip() {
+        List<ZipEntry> es = new List<ZipEntry>();
+        ZipEntry a = new ZipEntry("a.txt");
+        a.data = "hello hello hello".ToBytes();
+        es.Add(a);
+        ZipEntry d = new ZipEntry("dir/");
+        d.isDirectory = true;
+        es.Add(d);
+        return Zip.Create(es, 6);
+    }
+
+    static void Main() {
+        byte[] zip = MakeZip();
+        int eocd = zip.Length - 22;
+
+        // Sanity: the unmodified archive reads back.
+        List<ZipEntry> ok = Zip.Read(zip);
+        Check(ok != null && ok.Count == 2, "roundtrip read");
+
+        // cdPos patched past the end -> Read returns null.
+        byte[] t1 = CopyOf(zip);
+        PutU32(t1, eocd + 16, (long)(((t1[eocd + 16] & 255) | ((t1[eocd + 17] & 255) << 8)
+            | ((t1[eocd + 18] & 255) << 16) | ((t1[eocd + 19] & 255) << 24)) + 30));
+        Check(Zip.Read(t1) == null, "cdpos past end");
+
+        // cdSize set to a u32 with the high bit -> casts to negative int.
+        byte[] t2 = CopyOf(zip);
+        PutU32(t2, eocd + 12, 4294967295);          // 0xFFFFFFFF -> -1 as int
+        Check(Zip.Read(t2) == null, "cdsize negative");
+
+        // cdSize huge positive -> cdPos + cdSize must exceed the archive.
+        byte[] t3 = CopyOf(zip);
+        PutU32(t3, eocd + 12, 2147483647);
+        Check(Zip.Read(t3) == null, "cdsize huge");
+
+        // Central-directory entry name that overruns the archive.
+        byte[] t4 = CopyOf(zip);
+        int cdPos = (t4[eocd + 16] & 255) | ((t4[eocd + 17] & 255) << 8)
+            | ((t4[eocd + 18] & 255) << 16) | ((t4[eocd + 19] & 255) << 24);
+        PutU16(t4, cdPos + 28, 32767);              // nameLen
+        Check(Zip.Read(t4) == null, "cd name overruns");
+
+        // Local header of a deflate entry with huge declared usize -> bomb.
+        byte[] t5 = CopyOf(zip);
+        int lho = -1;
+        for (int i = 0; i + 4 <= zip.Length; i = i + 1) {
+            int s = (zip[i] & 255) | ((zip[i + 1] & 255) << 8)
+                | ((zip[i + 2] & 255) << 16) | ((zip[i + 3] & 255) << 24);
+            if (s == 0x04034B50) { lho = i; break; }
+        }
+        Check(lho >= 0, "found local header");
+        if (lho >= 0) {
+            PutU32(t5, lho + 22, 2147483647);       // usize huge
+            Check(Zip.Extract(t5, ok[0]) == null, "extract bomb");
+        }
+
+        // Local header with csize whose sum overflows int -> must be rejected.
+        byte[] t6 = CopyOf(zip);
+        if (lho >= 0) {
+            PutU32(t6, lho + 18, 2147483647);       // csize huge
+            Check(Zip.Extract(t6, ok[0]) == null, "extract csize overflow");
+        }
+
+        // Deflate: output beyond maxOut -> null.
+        byte[] comp = Deflate.Deflate("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".ToBytes(), 6);
+        Check(Deflate.Inflate(comp, 0, comp.Length, 5) == null, "maxout enforced");
+
+        // Deflate: truncated input must terminate with null, not loop or
+        // read past the end.
+        byte[] cut = new byte[comp.Length - 3];
+        for (int i = 0; i < cut.Length; i = i + 1) { cut[i] = comp[i]; }
+        Check(Deflate.Inflate(cut, 0, cut.Length, 1000) == null, "truncated deflate");
+
+        // Deflate: garbage input must terminate with null.
+        byte[] junk = new byte[64];
+        int seed = 99;
+        for (int i = 0; i < 64; i = i + 1) {
+            seed = seed * 1103515245 + 12345;
+            junk[i] = (byte)((seed >> 16) & 255);
+        }
+        Check(Deflate.Inflate(junk, 0, junk.Length, 4096) == null, "garbage deflate");
+
+        Console.WriteLine("zip-deflate-bounds-ok: " + Convert.ToString(bad == 0 ? 1 : 0));
+    }
+}

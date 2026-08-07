@@ -15,7 +15,7 @@ namespace System.IO.Compression;
 class Deflate {
     // ---- bit reader ------------------------------------------------------
 
-    static int ReadBits(byte[] src, ref int pos, ref int bit, int n) {
+    static int ReadBits(byte[] src, ref int pos, ref int bit, int n, int end) {
         int v = 0;
         int shift = 0;
         while (shift < n) {
@@ -23,6 +23,7 @@ class Deflate {
                 pos = pos + 1;
                 bit = 0;
             }
+            if (pos >= end) { return -1; }   // 输入耗尽：绝不越过 end 读取
             int b = src[pos] & 255;
             int take = 8 - bit;
             if (take > n - shift) { take = n - shift; }
@@ -33,11 +34,12 @@ class Deflate {
         return v;
     }
 
-    static int ReadBit(byte[] src, ref int pos, ref int bit) {
+    static int ReadBit(byte[] src, ref int pos, ref int bit, int end) {
         if (bit == 8) {
             pos = pos + 1;
             bit = 0;
         }
+        if (pos >= end) { return -1; }   // 输入耗尽：绝不越过 end 读取
         int v = (src[pos] >> bit) & 1;
         bit = bit + 1;
         return v;
@@ -106,23 +108,24 @@ class Deflate {
     }
 
     // 从规范表中解码一个符号。`count`/`symbol` 来自
-    // BuildHuffman；`src`/`pos`/`bit` 为位流。
+    // BuildHuffman；`src`/`pos`/`bit` 为位流。输入耗尽时
+    // 返回 -1（ReadBit 的 -1 绝不能被当作位参与索引计算）。
     static int DecodeSymbol(int[] count, int[] symbol, byte[] src,
-                            ref int pos, ref int bit) {
+                            ref int pos, ref int bit, int end) {
         int code = 0;
         int first = 0;
         int index = 0;
         int len = 1;
         while (len <= 15) {
-            code = code | Deflate.ReadBit(src, ref pos, ref bit);
+            int b = Deflate.ReadBit(src, ref pos, ref bit, end);
+            if (b < 0) { return -1; }
+            code = (code << 1) | b;
             int cnt = count[len];
             if (code - first < cnt) {
                 return symbol[index + (code - first)];
             }
             index = index + cnt;
-            first = first + cnt;
-            first = first << 1;
-            code = code << 1;
+            first = (first + cnt) << 1;
             len = len + 1;
         }
         return -1;
@@ -161,6 +164,7 @@ class Deflate {
     static byte[] InflateConsumed(byte[] src, int offset, int len, int maxOut,
                                   ref int consumed) {
         if (maxOut <= 0) { maxOut = 268435456; }
+        if (maxOut > 268435456) { maxOut = 268435456; }   // 硬性上限，防压缩炸弹
         byte[] out2 = new byte[4096];
         int outLen = 0;
         int pos = offset;
@@ -174,8 +178,8 @@ class Deflate {
 
         while (true) {
             if (pos >= end) { return null; }
-            int bfinal = Deflate.ReadBit(src, ref pos, ref bit);
-            int btype = Deflate.ReadBits(src, ref pos, ref bit, 2);
+            int bfinal = Deflate.ReadBit(src, ref pos, ref bit, end);
+            int btype = Deflate.ReadBits(src, ref pos, ref bit, 2, end);
             if (btype == 0) {
                 // Stored 块：跳过到下一个字节边界。
                 if (bit > 0) {
@@ -186,7 +190,8 @@ class Deflate {
                 int n = (src[pos] & 255) | ((src[pos + 1] & 255) << 8);
                 pos = pos + 4;
                 if (pos + n > end) { return null; }
-                out2 = Deflate.Ensure(out2, ref outLen, n);
+                out2 = Deflate.Ensure(out2, ref outLen, n, maxOut);
+                if (out2 == null) { return null; }
                 for (int k = 0; k < n; k = k + 1) {
                     out2[outLen + k] = src[pos + k];
                 }
@@ -201,11 +206,12 @@ class Deflate {
                 }
                 while (true) {
                     int sym = Deflate.DecodeSymbol(litCount, litSymbol, src,
-                        ref pos, ref bit);
+                        ref pos, ref bit, end);
                     if (sym < 0) { return null; }
                     if (sym == 256) { break; }
                     if (sym < 256) {
-                        out2 = Deflate.Ensure(out2, ref outLen, 1);
+                        out2 = Deflate.Ensure(out2, ref outLen, 1, maxOut);
+                        if (out2 == null) { return null; }
                         out2[outLen] = (byte)sym;
                         outLen = outLen + 1;
                     } else {
@@ -213,15 +219,17 @@ class Deflate {
                         if (li < 0 || li >= 29) { return null; }
                         int length = Deflate.LengthBase[li] +
                             Deflate.ReadBits(src, ref pos, ref bit,
-                                Deflate.LengthExtra[li]);
+                                Deflate.LengthExtra[li], end);
                         int dsym = Deflate.DecodeSymbol(distCount, distSymbol,
-                            src, ref pos, ref bit);
+                            src, ref pos, ref bit, end);
                         if (dsym < 0 || dsym >= 30) { return null; }
                         int dist = Deflate.DistBase[dsym] +
                             Deflate.ReadBits(src, ref pos, ref bit,
-                                Deflate.DistExtra[dsym]);
+                                Deflate.DistExtra[dsym], end);
                         if (dist > outLen) { return null; }
-                        out2 = Deflate.Ensure(out2, ref outLen, length);
+                        if (length > maxOut - outLen) { return null; }
+                        out2 = Deflate.Ensure(out2, ref outLen, length, maxOut);
+                        if (out2 == null) { return null; }
                         for (int m = 0; m < length; m = m + 1) {
                             out2[outLen + m] = out2[outLen - dist + m];
                         }
@@ -249,9 +257,9 @@ class Deflate {
     static int DynamicTables(int[] litCount, int[] litSymbol, int[] distCount,
                              int[] distSymbol, byte[] src, ref int pos,
                              ref int bit, int end) {
-        int hlit = Deflate.ReadBits(src, ref pos, ref bit, 5) + 257;
-        int hdist = Deflate.ReadBits(src, ref pos, ref bit, 5) + 1;
-        int hclen = Deflate.ReadBits(src, ref pos, ref bit, 4) + 4;
+        int hlit = Deflate.ReadBits(src, ref pos, ref bit, 5, end) + 257;
+        int hdist = Deflate.ReadBits(src, ref pos, ref bit, 5, end) + 1;
+        int hclen = Deflate.ReadBits(src, ref pos, ref bit, 4, end) + 4;
         if (hlit > 286 || hdist > 30) { return -1; }
         // 码长字母表顺序（RFC 1951 §3.2.7）。
         int[] clOrder = new int[] { 16,17,18,0,8,7,9,6,10,5,11,4,12,3,13,2,14,1,15 };
@@ -260,7 +268,7 @@ class Deflate {
         for (; i < 19; i = i + 1) { clLen[i] = 0; }
         i = 0;
         while (i < hclen) {
-            clLen[clOrder[i]] = Deflate.ReadBits(src, ref pos, ref bit, 3);
+            clLen[clOrder[i]] = Deflate.ReadBits(src, ref pos, ref bit, 3, end);
             i = i + 1;
         }
         int[] clCount = new int[16];
@@ -274,7 +282,7 @@ class Deflate {
         int n = 0;
         while (n < hlit + hdist) {
             int sym = Deflate.DecodeSymbol(clCount, clSymbol, src, ref pos,
-                ref bit);
+                ref bit, end);
             if (sym < 0 || sym > 18) { return -1; }
             if (sym < 16) {
                 lens[n] = sym;
@@ -282,21 +290,21 @@ class Deflate {
             } else if (sym == 16) {
                 if (n == 0) { return -1; }
                 int prev = lens[n - 1];
-                int rep = 3 + Deflate.ReadBits(src, ref pos, ref bit, 2);
+                int rep = 3 + Deflate.ReadBits(src, ref pos, ref bit, 2, end);
                 while (rep > 0 && n < hlit + hdist) {
                     lens[n] = prev;
                     n = n + 1;
                     rep = rep - 1;
                 }
             } else if (sym == 17) {
-                int rep = 3 + Deflate.ReadBits(src, ref pos, ref bit, 3);
+                int rep = 3 + Deflate.ReadBits(src, ref pos, ref bit, 3, end);
                 while (rep > 0 && n < hlit + hdist) {
                     lens[n] = 0;
                     n = n + 1;
                     rep = rep - 1;
                 }
             } else {
-                int rep = 11 + Deflate.ReadBits(src, ref pos, ref bit, 7);
+                int rep = 11 + Deflate.ReadBits(src, ref pos, ref bit, 7, end);
                 while (rep > 0 && n < hlit + hdist) {
                     lens[n] = 0;
                     n = n + 1;
@@ -324,12 +332,12 @@ class Deflate {
         return 0;
     }
 
-    static byte[] Ensure(byte[] buf, ref int used, int need) {
+    static byte[] Ensure(byte[] buf, ref int used, int need, int maxOut) {
+        if (need < 0 || used + need > maxOut) { return null; }   // 超出上限
         if (used + need <= buf.Length) { return buf; }
         int cap = buf.Length * 2;
         while (cap < used + need) { cap = cap * 2; }
         if (cap > 268435456) { cap = 268435456; }
-        if (used + need > cap) { cap = used + need; }
         byte[] bigger = new byte[cap];
         for (int i = 0; i < used; i = i + 1) {
             bigger[i] = buf[i];

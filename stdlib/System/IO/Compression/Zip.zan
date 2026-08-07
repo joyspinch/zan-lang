@@ -182,10 +182,17 @@ class Zip {
         int entryCount = Zip.ReadU16(zip, eocd + 10);
         int cdSize = (int)Zip.ReadU32(zip, eocd + 12);
         int cdPos = (int)Zip.ReadU32(zip, eocd + 16);
-        if (cdPos + cdSize > zip.Length) { return null; }
+        // long 运算：这两个值来自 EOCD，int 加法会溢出为负，
+        // 使负偏移绕过检查后从缓冲区前方读取。
+        if (cdPos < 0 || cdSize < 0) { return null; }
+        if ((long)cdPos + (long)cdSize > zip.Length) { return null; }
         List<ZipEntry> entries = new List<ZipEntry>();
         int p = cdPos;
         for (int i = 0; i < entryCount; i = i + 1) {
+            // 每个条目都要整体落在归档内（头部字段到 p+45，
+            // 名称/额外/注释由长度字段决定）——byte[] 无越界
+            // 检查，越过末尾会读到堆上垃圾。
+            if (p + 46 > zip.Length) { return null; }
             if (Zip.ReadU32(zip, p) != Zip.SigCentral) { return null; }
             int method = Zip.ReadU16(zip, p + 10);
             int crc = (int)Zip.ReadU32(zip, p + 16);
@@ -195,6 +202,9 @@ class Zip {
             int extraLen = Zip.ReadU16(zip, p + 30);
             int commentLen = Zip.ReadU16(zip, p + 32);
             int lho = (int)Zip.ReadU32(zip, p + 42);
+            if (p + 46 + nameLen + extraLen + commentLen > zip.Length) {
+                return null;
+            }
             string name = Zip.ReadName(zip, p + 46, nameLen);
             ZipEntry e = new ZipEntry(name);
             e.method = method;
@@ -223,13 +233,19 @@ class Zip {
         int nameLen = Zip.ReadU16(zip, lho + 26);
         int extraLen = Zip.ReadU16(zip, lho + 28);
         int dataPos = lho + 30 + nameLen + extraLen;
-        if (dataPos + csize > zip.Length) { return null; }
+        // long 运算：csize 来自归档头部，int 加法可能溢出为负
+        // 从而绕过边界检查（byte[] 无越界检查，会读到堆垃圾）。
+        if (csize < 0 || (long)dataPos + (long)csize > zip.Length) { return null; }
         byte[] raw = new byte[csize];
         for (int k = 0; k < csize; k = k + 1) {
             raw[k] = zip[dataPos + k];
         }
         byte[] content = null;
         if (method == Zip.MethodDeflate) {
+            // 防压缩炸弹：声明的解压大小不能超过硬上限，
+            // 压缩比也不能过高（usize 来自归档头部，不可信）。
+            if (usize < 0 || usize > 268435456) { return null; }
+            if ((long)usize > (long)csize * 4096 + 1048576) { return null; }
             content = Deflate.Inflate(raw, 0, raw.Length, usize + 1);
         } else {
             content = raw;
