@@ -376,9 +376,14 @@ header-only 库 / C 回调 / 结构体字段偏移，全部对应 A2 / A3 / A4�
   `build/zanc src/selfhost/*.zan -o gen1 && gen1 g2.ll src/selfhost/*.zan` → 报
   "undefined identifier 'ref'"（dbgen.zan:581/592）；另有一个独立的 stdlib 编译缺口
   "type 'Stopwatch' has no member 'Start'"（Stopwatch.zan:35，`Start` 未被 gen1
-  binder 解析）。修法：自举编译器补 `ref`（parser/binder/checker/irgen，C host 参考
-  c28d1f61），并核实 Stopwatch.Start 的成员解析。自举代码量小（1 签名 2 调用点），
-  但 `ref` 是跨阶段特性，单列任务；在修好前 full 档 `ctest -R selfhost` 允许红
+  binder 解析）。**2026-08-08 复核**：把 `ref` 改写成 `out` 仍然失败——selfhost
+  parser 只在**调用实参**位置认 `out`（`ParseArgs` 特判，专供内建 `TryParse`），
+  **形参声明**完全不认修饰符（`ParseParams` 只有 `params`）→ "unknown type 'out'" +
+  "no overload takes 2 arguments"；irgen 的 `AK.OutArg` 也只在 TryParse 特例里
+  有写回。修法：自举编译器补 `out`/`ref` 形参声明（parser `ParseParams` 修饰符 +
+  binder 参数标记 + checker 实参对应校验 + irgen 通用写回，C host 参考 c28d1f61），
+  并核实 Stopwatch.Start 的成员解析。自举代码量小（1 签名 2 调用点），
+  但这是跨阶段特性，单列任务；在修好前 full 档 `ctest -R selfhost` 允许红
   （smoke/standard 档不含 fixed_point）。
 
 ## B7 runtime 边界复核
@@ -424,8 +429,16 @@ HTTP 解析、编码转换、路径处理这类纯逻辑，上移到 Zan。
      emutls 模拟，首次访问触发 `pthread_once(emutls_init)`，而 `emutls_init` 内部调
      `malloc` → wrap 后递归访问同一未初始化 emutls 变量 → once 锁自旋死锁。rt_mem 目前
      只在 POSIX 链接（原生 TLS）不受影响；已把 Windows 侧改为普通 static（slab 路径在
-     Windows 本来就禁用）+ 注释防未来误用。POSIX 上的 double-free abort 逻辑本机无法
-     实测（Windows 无 mmap 无 slab），需 Linux CI 验证（`build_linux_rt.sh`）。
+     Windows 本来就禁用）+ 注释防未来误用。POSIX 上的 double-free abort 已用 WSL 实测
+     （2026-08-08）：新增 `tests/runtime/rt_mem_dblfree_test.c`（fork 子进程触发二次
+     free / 损坏 header，父进程断言 SIGABRT + 消息，`--wrap` 链接 rt_mem.c；注册为
+     `runtime_mem_dblfree`，Linux CI 生效）。**实测暴露一个真 bug**：`zan_mem_small`
+     从自由链表弹块时不重置 header，哨兵（`ZAN_MEM_FREED`）残留到下一轮，合法的
+     free→malloc 复用→再 free 被误判 double-free 而 abort（Windows 无 slab 路径所以
+     完全隐形；smoke 在 Windows 全过恰因如此）。已修：弹出时重置 `magic`/`cls`；
+     200k 次混合 malloc/free/realloc churn 无误报；hello / Json.Serialize 程序的
+     linux-musl ELF 在 WSL 运行正常。本地 `toolchain/linux-musl/zanrt_mem.o` 已用
+     zig 重建（未跟踪产物，非签入物）。
   3. `rt_sched.c` 任务对象只增不减（`g_all_tasks` 直到 shutdown 才清）→ 新增
      `zan_task_release()`（幂等摘链+free）与 `zan_task_live()` 测试钩子，所有权契约写入
      `rt_sched.h`；`tests/runtime/rt_test.c` 全部 task 生命周期补 release，新增
