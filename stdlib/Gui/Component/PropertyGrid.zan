@@ -22,6 +22,10 @@ class PropertyGrid : Control {
     List<SignalBool> flagSigs;
     List<SelectBox> picks;
     List<SignalInt> pickSigs;
+    /// 整数属性行的 -/+ 步进按钮稳定控件 id（按行索引对齐，
+    /// 非整数行也占位）。
+    List<int> minusIds;
+    List<int> plusIds;
     /// 上一帧的值：用来判断这一帧是外部改了模型还是用户改了编辑器。
     List<string> shadow;
     /// 当前绑定对象的标识，变化时重建编辑器。
@@ -42,6 +46,8 @@ class PropertyGrid : Control {
         flagSigs = new List<SignalBool>();
         picks = new List<SelectBox>();
         pickSigs = new List<SignalInt>();
+        minusIds = new List<int>();
+        plusIds = new List<int>();
         shadow = new List<string>();
         key = "";
         scroll = new SignalInt(0);
@@ -84,6 +90,8 @@ class PropertyGrid : Control {
         flagSigs = new List<SignalBool>();
         picks = new List<SelectBox>();
         pickSigs = new List<SignalInt>();
+        minusIds = new List<int>();
+        plusIds = new List<int>();
         shadow = new List<string>();
         for (int i = 0; i < data.Count; i = i + 1) {
             PropSpec p = data[i];
@@ -113,6 +121,8 @@ class PropertyGrid : Control {
             flagSigs.Add(fs);
             picks.Add(sb);
             pickSigs.Add(ps);
+            minusIds.Add(WidgetId.Next());
+            plusIds.Add(WidgetId.Next());
         }
         hitRow = 0 - 1;
     }
@@ -169,7 +179,9 @@ class PropertyGrid : Control {
 
     /// 一行的双向同步：外部改动优先灌回编辑器，否则把编辑器的新值
     /// 写进模型并广播 Change。整数行在输入合法前不写。
-    void Sync(int i) {
+    /// 提交时请求重绘：Change 经 Dispatcher 延迟到 UI 队列，若不保证
+    /// 下一帧，即时模式下循环会空转，处理器不排空、预览慢半拍。
+    void Sync(App app, int i) {
         PropSpec p = data[i];
         if (p.kind == 5 || !p.IsBound()) { return; }
         string cur = p.Read();
@@ -185,6 +197,42 @@ class PropertyGrid : Control {
         shadow[i] = p.Read();
         hitRow = i;
         Change.Post();
+        app.RequestRedraw();
+    }
+
+    /// 整数属性的 -/+ 步进：按 spec 配置的步长增减、钳制到范围，
+    /// 直接写回模型与编辑器，并立即请求重绘，预览同帧跟新。
+    void Step(App app, int i, int delta) {
+        PropSpec p = data[i];
+        if (!p.IsBound()) { return; }
+        int cur = 0;
+        string r = p.Read();
+        if (PropertyGrid.IsNumber(r)) { cur = Convert.ToInt32(r); }
+        int nv = p.Clamp(cur + delta);
+        string s = Convert.ToString(nv);
+        p.Write(s);
+        textSigs[i].Set(s);
+        shadow[i] = p.Read();
+        hitRow = i;
+        Change.Post();
+        app.RequestRedraw();
+    }
+
+    /// 画一个步进小按钮（方形，中间一个字符字形），注册命中区，
+    /// 返回本帧是否被点击。
+    bool StepBtn(App app, int id, int x, int y, int sz, string glyph) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        app.hitTester.Register(new HitRegion(id, x, y, sz, sz, 0));
+        int hv = Ui.HoverLevel(app, id);
+        int bg = App.LerpColor(t.bgTertiary, t.bgHover, hv);
+        c.FillRoundRect(x, y, sz, sz, t.borderRadiusSmall, bg);
+        c.DrawRoundRect(x, y, sz, sz, t.borderRadiusSmall, t.borderPrimary, 1);
+        int fs = t.fontSizeSmall;
+        int gw = Canvas.MeasureText(glyph, fs);
+        c.DrawText(x + (sz - gw) / 2, Canvas.CenterTextY(y, sz, fs),
+            glyph, t.textPrimary, fs);
+        return Ui.Clicked(app, id);
     }
 
     int RowHeight(App app) { return app.Scale(30); }
@@ -244,10 +292,30 @@ class PropertyGrid : Control {
                         flags[i].Render(app, ex, ey);
                     } else if (p.kind == 3) {
                         picks[i].Render(app, ex, ey, ew);
+                    } else if (p.kind == 1) {
+                        // 整数行：[-] [可点击键入的输入框] [+]。
+                        int gap = app.Scale(4);
+                        int inW = ew - (eh + gap) * 2;
+                        if (inW < app.Scale(24)) { inW = app.Scale(24); }
+                        if (this.StepBtn(app, minusIds[i], ex, ey, eh, "-")) {
+                            this.Step(app, i, 0 - p.step);
+                        }
+                        texts[i].Render(app, ex + eh + gap, ey, inW, eh);
+                        if (this.StepBtn(app, plusIds[i], ex + eh + gap + inW + gap,
+                                ey, eh, "+")) {
+                            this.Step(app, i, p.step);
+                        }
                     } else {
                         texts[i].Render(app, ex, ey, ew, eh);
                     }
-                    this.Sync(i);
+                    this.Sync(app, i);
+                    // 悬停该行且有说明时请求气泡提示（帧末由宿主 Flush）。
+                    if (p.tip != "" && app.mouseX >= bx && app.mouseX < bx + rowW
+                            && app.mouseY >= y && app.mouseY < y + rowH
+                            && app.mouseY >= by && app.mouseY < by + bh) {
+                        Tooltip.RequestBox(app, bx, y, rowW, rowH, p.tip,
+                            Tooltip.Left(), app.Scale(240));
+                    }
                 }
             }
             y = y + rowH;
