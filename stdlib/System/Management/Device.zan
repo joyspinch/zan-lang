@@ -1,8 +1,10 @@
 using System;
+using System.IO;
 
 namespace System.Management;
 
-/// <summary>单个 Windows 即插即用设备的只读信息。</summary>
+/// <summary>单个设备的只读信息（Windows 即插即用设备或
+/// Linux sysfs 设备节点）。</summary>
 class DeviceInfo {
     public string instanceId;
     public string classGuid;
@@ -14,10 +16,13 @@ class DeviceInfo {
 }
 
 /// <summary>
-/// 通过 SetupAPI 对 Windows 设备进行只读枚举。Present() 返回
-/// 当前存在的设备；All() 还包括不存在的设备节点。
-/// 每次查询都覆盖所有安装类。其他平台抛出
-/// PlatformNotSupportedException.
+/// 设备的只读枚举。Windows 上走 SetupAPI：Present() 返回当前
+/// 存在的设备，All() 还包括不存在的设备节点，每次查询覆盖
+/// 所有安装类。Linux 上走 sysfs（/sys/bus/&lt;bus&gt;/devices）：
+/// className 是总线名，hardwareIds 是 MODALIAS，classGuid 总为 ""
+/// （Linux 没有设备类 GUID）；sysfs 只暴露当前存在的设备，
+/// 因此 All() 与 Present() 结果相同。macOS 没有对应实现（需要
+/// IOKit/ioreg），仍抛出 PlatformNotSupportedException。
 /// </summary>
 class Device {
     /// <summary>枚举所有安装类中当前存在的设备。</summary>
@@ -35,11 +40,90 @@ class Device {
     static List<DeviceInfo> List(bool presentOnly) {
         #if WINDOWS
         return Device.WinList(presentOnly);
+        #elif LINUX
+        return Device.SysfsList();
         #else
         throw new PlatformNotSupportedException(
             "System.Management.Device is not implemented on this platform");
         #endif
     }
+
+    #if LINUX
+    // 枚举 /sys/bus/<bus>/devices/*。每个节点的 uevent 是内核向
+    // udev 报告的 KEY=VALUE 列表（SUBSYSTEM/DRIVER/MODALIAS 等），
+    // 另外 vendor/device/product/manufacturer 等属性是单行文本文件。
+    static List<DeviceInfo> SysfsList() {
+        List<DeviceInfo> list = new List<DeviceInfo>();
+        string busRoot = "/sys/bus";
+        if (!Directory.Exists(busRoot)) { return list; }
+        List<string> buses = Directory.GetDirectories(busRoot);
+        for (int b = 0; b < buses.Count; b = b + 1) {
+            string bus = buses[b];
+            string devRoot = busRoot + "/" + bus + "/devices";
+            if (!Directory.Exists(devRoot)) { continue; }
+            List<string> names = Directory.GetDirectories(devRoot);
+            for (int i = 0; i < names.Count; i = i + 1) {
+                string name = names[i];
+                string full = devRoot + "/" + name;
+                DeviceInfo d = new DeviceInfo();
+                d.instanceId = bus + "/" + name;
+                d.classGuid = "";
+                d.className = bus;
+                string modalias = Device.SysfsUevent(full, "MODALIAS");
+                d.hardwareIds = new List<string>();
+                if (modalias != "") { d.hardwareIds.Add(modalias); }
+                d.friendlyName = Device.SysfsFirst(full,
+                    "product,name,model,of_node/name");
+                if (d.friendlyName == "") { d.friendlyName = name; }
+                d.manufacturer = Device.SysfsFirst(full, "manufacturer,vendor");
+                d.description = Device.SysfsUevent(full, "DRIVER");
+                if (d.description == "") {
+                    d.description = Device.SysfsUevent(full, "DEVTYPE");
+                }
+                if (d.description == "") { d.description = d.friendlyName; }
+                list.Add(d);
+            }
+        }
+        return list;
+    }
+
+    // 读 uevent 里 `key=` 的值；不存在时返回 ""。
+    static string SysfsUevent(string dir, string key) {
+        string path = dir + "/uevent";
+        if (!File.Exists(path)) { return ""; }
+        string text = "";
+        try {
+            text = File.ReadAllText(path);
+        } catch (IOException e) {
+            return "";
+        }
+        List<string> lines = text.Split("\n");
+        for (int i = 0; i < lines.Count; i = i + 1) {
+            string line = lines[i].Trim();
+            if (line.StartsWith(key + "=")) {
+                return line.Substring(key.Length + 1,
+                                      line.Length - key.Length - 1);
+            }
+        }
+        return "";
+    }
+
+    // 按逗号分隔的候选顺序读第一个存在的属性文件。
+    static string SysfsFirst(string dir, string names) {
+        List<string> candidates = names.Split(",");
+        for (int i = 0; i < candidates.Count; i = i + 1) {
+            string path = dir + "/" + candidates[i];
+            if (!File.Exists(path)) { continue; }
+            try {
+                string text = File.ReadAllText(path).Trim();
+                if (text != "") { return text; }
+            } catch (IOException e) {
+                continue;
+            }
+        }
+        return "";
+    }
+    #endif
 
     // 解析 REG_MULTI_SZ 负载，不越界读取。格式错误的
     // 值（字节数为奇数、缺少字符串终止符或末尾列表

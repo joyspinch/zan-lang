@@ -9,6 +9,10 @@ class HttpResponse {
     int statusCode;
     string statusText;
     string body;
+    /// 二进制正文（与 body 二选一）。Zan 字符串以 NUL 结尾，
+    /// 无法携带任意字节，因此图片/可执行文件等正文走 byte[]。
+    byte[] bodyBytes;
+    int bodyBytesLen;
     string contentType;
     List<string> headers;
     bool keepAlive;
@@ -17,6 +21,8 @@ class HttpResponse {
         this.statusCode = 200;
         this.statusText = "OK";
         this.body = "";
+        this.bodyBytes = null;
+        this.bodyBytesLen = 0;
         this.contentType = "text/html";
         this.headers = new List<string>();
         this.keepAlive = true;
@@ -44,6 +50,27 @@ class HttpResponse {
         resp.contentType = "text/plain";
         return resp;
     }
+
+    /// <summary>
+    /// 用二进制正文创建响应。正文按 <paramref name="len"/> 字节
+    /// 原样发送，内嵌 NUL 不会截断报文。
+    /// </summary>
+    static HttpResponse Bytes(byte[] data, int len, string ct) {
+        HttpResponse resp = new HttpResponse();
+        resp.bodyBytes = data;
+        resp.bodyBytesLen = len;
+        resp.contentType = ct;
+        return resp;
+    }
+
+    /// <summary>正文字节数（文本或二进制）。</summary>
+    int BodyLength() {
+        if (this.bodyBytes != null) { return this.bodyBytesLen; }
+        return this.body.Length;
+    }
+
+    /// <summary>正文是否为二进制缓冲区。</summary>
+    bool IsBinary() { return this.bodyBytes != null; }
 
     /// <summary>创建重定向响应。</summary>
     static HttpResponse Redirect(string url) {
@@ -87,6 +114,8 @@ class HttpResponse {
             this.headers.Clear();
             this.headers = null;
         }
+        this.bodyBytes = null;
+        this.bodyBytesLen = 0;
     }
 
     /// <summary>设置响应头。</summary>
@@ -107,8 +136,11 @@ class HttpResponse {
         return this;
     }
 
-    /// <summary>将响应序列化为原始 HTTP 响应字符串。</summary>
-    string Build() {
+    /// <summary>
+    /// 只序列化状态行与头部（含结尾空行）。二进制正文时
+    /// 调用方先发这个字符串，再按字节发 <c>bodyBytes</c>。
+    /// </summary>
+    string BuildHeaders() {
         StringBuilder sb = new StringBuilder();
         sb.Append("HTTP/1.1 ");
         sb.Append(Convert.ToString(this.statusCode));
@@ -121,7 +153,7 @@ class HttpResponse {
         sb.Append("\r\n");
 
         sb.Append("Content-Length: ");
-        sb.Append(Convert.ToString(this.body.Length));
+        sb.Append(Convert.ToString(this.BodyLength()));
         sb.Append("\r\n");
 
         if (this.keepAlive) {
@@ -138,8 +170,15 @@ class HttpResponse {
         }
 
         sb.Append("\r\n");
-        sb.Append(this.body);
         return sb.ToString();
+    }
+
+    /// <summary>
+    /// 将响应序列化为原始 HTTP 响应字符串。仅适用于文本正文；
+    /// 二进制正文请用 <see cref="BuildHeaders"/> + <c>bodyBytes</c>。
+    /// </summary>
+    string Build() {
+        return this.BuildHeaders() + this.body;
     }
 
     /// <summary>解析原始 HTTP 响应（客户端用法）。</summary>

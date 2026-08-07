@@ -1,4 +1,5 @@
 using System;
+using System.Diagnostics;
 using System.Drawing;
 using System.Threading;
 
@@ -8,10 +9,9 @@ namespace System.Input;
 /// 鼠标输入：位置、移动（可选分步轨迹）、
 /// 点击、拖拽和滚轮。Windows 下通过 SendInput 驱动真实光标
 /// （与物理设备相同的路径，因此在 SetCursorPos 单独使用会被忽略的
-/// 提权/远程会话中也有效）。其他
-/// 平台暴露相同 API 并抛出 PlatformNotSupportedException，
-/// 因此使用它的代码可在任何地方编译运行，并在操作系统尚不支持
-/// 输入注入路径时明确失败。
+/// 提权/远程会话中也有效）。X11 下走 xdotool（XTEST），Wayland 需
+/// ydotool，macOS 需 cliclick；后端缺失时抛出
+/// PlatformNotSupportedException，而不是默默不发事件。
 ///
 ///   Mouse.SetPos(100, 100);
 ///   Mouse.MoveTo(200, 200, 12);     // 12 步缓动轨迹
@@ -76,9 +76,35 @@ class Mouse {
         int y = p[1];
         NativeMemory.Free(pt);
         return new Point(x, y);
+        #elif MACOS
+        if (!Mouse.HaveCliclick()) { InputTool.Missing("Mouse.GetPos"); }
+        // cliclick p:  "123,456"
+        ProcessResult r = Process.Capture("cliclick p 2>/dev/null");
+        if (!r.Ok() || r.lines.Count == 0) {
+            throw new IOException("cliclick p failed");
+        }
+        List<int> nums = Mouse.Ints(r.lines[0]);
+        if (nums.Count < 2) { throw new IOException("cliclick p gave no point"); }
+        return new Point(nums[0], nums[1]);
         #else
-        throw new PlatformNotSupportedException(
-            "Mouse.GetPos is not implemented on this platform");
+        int kind = InputTool.Kind();
+        if (kind != InputTool.Xdotool()) {
+            // ydotool 只能写不能读（uinput 是单向的）
+            InputTool.Missing("Mouse.GetPos");
+        }
+        // xdotool getmouselocation --shell: "X=..\nY=..\nSCREEN=..\nWINDOW=.."
+        ProcessResult r = Process.Capture(
+            "xdotool getmouselocation --shell 2>/dev/null");
+        if (!r.Ok()) { throw new IOException("xdotool getmouselocation failed"); }
+        int x = -1;
+        int y = -1;
+        for (int i = 0; i < r.lines.Count; i = i + 1) {
+            string ln = r.lines[i];
+            if (ln.StartsWith("X=")) { x = Convert.ToInt(ln.Substring(2, ln.Length - 2)); }
+            else if (ln.StartsWith("Y=")) { y = Convert.ToInt(ln.Substring(2, ln.Length - 2)); }
+        }
+        if (x < 0 || y < 0) { throw new IOException("xdotool gave no position"); }
+        return new Point(x, y);
         #endif
     }
 
@@ -87,8 +113,9 @@ class Mouse {
         #if WINDOWS
         WinSetCursorPos(x, y);
         #else
-        throw new PlatformNotSupportedException(
-            "Mouse.SetPos is not implemented on this platform");
+        Mouse.Posix("mousemove " + Convert.ToString(x) + " " + Convert.ToString(y),
+                    "m:" + Convert.ToString(x) + "," + Convert.ToString(y),
+                    "Mouse.SetPos");
         #endif
     }
 
@@ -118,8 +145,18 @@ class Mouse {
             i = i + 1;
         }
         #else
-        throw new PlatformNotSupportedException(
-            "Mouse.MoveTo is not implemented on this platform");
+        if (steps <= 1) {
+            Mouse.SetPos(x, y);
+            return;
+        }
+        Point from = Mouse.GetPos();
+        int i = 1;
+        while (i <= steps) {
+            Mouse.SetPos(from.x + (x - from.x) * i / steps,
+                         from.y + (y - from.y) * i / steps);
+            Thread.Sleep(1);
+            i = i + 1;
+        }
         #endif
     }
 
@@ -137,8 +174,8 @@ class Mouse {
         if (button == 4) { data = 2; }
         Mouse.SendMouse(0, 0, data, flags);
         #else
-        throw new PlatformNotSupportedException(
-            "Mouse.Down is not implemented on this platform");
+        Mouse.Posix("mousedown " + Convert.ToString(Mouse.XButtonOf(button)),
+                    "dd:" + Mouse.MacButtonOf(button), "Mouse.Down");
         #endif
     }
 
@@ -156,8 +193,8 @@ class Mouse {
         if (button == 4) { data = 2; }
         Mouse.SendMouse(0, 0, data, flags);
         #else
-        throw new PlatformNotSupportedException(
-            "Mouse.Up is not implemented on this platform");
+        Mouse.Posix("mouseup " + Convert.ToString(Mouse.XButtonOf(button)),
+                    "du:" + Mouse.MacButtonOf(button), "Mouse.Up");
         #endif
     }
 
@@ -194,8 +231,14 @@ class Mouse {
         #if WINDOWS
         Mouse.SendMouse(0, 0, delta, Mouse.FWheel());
         #else
-        throw new PlatformNotSupportedException(
-            "Mouse.Wheel is not implemented on this platform");
+        // X11/macOS 没有“滚多少像素”的概念，按 120 一档发档位事件
+        int notches = delta / 120;
+        if (notches == 0 && delta != 0) { notches = delta > 0 ? 1 : -1; }
+        int n = notches < 0 ? 0 - notches : notches;
+        for (int i = 0; i < n; i = i + 1) {
+            Mouse.Posix("click " + (notches > 0 ? "4" : "5"),
+                        notches > 0 ? "w:+1" : "w:-1", "Mouse.Wheel");
+        }
         #endif
     }
 
@@ -211,10 +254,78 @@ class Mouse {
         else { throw new ArgumentException("invalid mouse button"); }
         return (Mouse.WinGetAsyncKeyState(vk) & 0x8000) != 0;
         #else
+        // 没有不拓展也不开窗口就能查按钮状态的路子：XQueryPointer 需要
+        // X 连接，System Events 根本不暴露。宁可明确不支持也不猜。
         throw new PlatformNotSupportedException(
-            "Mouse.IsDown is not implemented on this platform");
+            "Mouse.IsDown needs a live X11/Quartz event tap, which the "
+            + "command-line injection backends do not provide");
         #endif
     }
+
+    #if !WINDOWS
+    /// X11 按钮号（1 左 2 中 3 右，8/9 = 后退/前进）。
+    static int XButtonOf(int button) {
+        if (button == 0) { return 1; }
+        if (button == 1) { return 2; }
+        if (button == 2) { return 3; }
+        if (button == 3) { return 8; }
+        if (button == 4) { return 9; }
+        throw new ArgumentException("invalid mouse button");
+    }
+
+    /// cliclick 的按钮名（只有左/右两个）。
+    static string MacButtonOf(int button) {
+        if (button == 0) { return ""; }
+        if (button == 2) { return "right"; }
+        throw new ArgumentException(
+            "cliclick only injects the left and right mouse buttons");
+    }
+
+    static bool HaveCliclick() {
+        return Process.Capture("command -v cliclick >/dev/null 2>&1").Ok();
+    }
+
+    /// 将一个动作发给当前平台后端：`xargs` 是 xdotool/ydotool 的参数，
+    /// `mac` 是 cliclick 的命令。两者都只含本文件生成的数字和字面量。
+    static void Posix(string xargs, string mac, string what) {
+        #if MACOS
+        if (!Mouse.HaveCliclick()) { InputTool.Missing(what); }
+        if (!InputTool.Run("cliclick " + mac)) {
+            throw new IOException(what + ": cliclick failed");
+        }
+        #else
+        int kind = InputTool.Kind();
+        if (kind == InputTool.Xdotool()) {
+            if (!InputTool.Run("xdotool " + xargs)) {
+                throw new IOException(what + ": xdotool failed");
+            }
+            return;
+        }
+        InputTool.Missing(what);
+        #endif
+    }
+
+    /// 一行里的十进制整数（用于解析 cliclick 的 "x,y"）。
+    static List<int> Ints(string line) {
+        List<int> outp = new List<int>();
+        int i = 0;
+        while (i < line.Length) {
+            int c = line[i] & 255;
+            if (c >= 48 && c <= 57) {
+                int v = 0;
+                while (i < line.Length && (line[i] & 255) >= 48
+                       && (line[i] & 255) <= 57) {
+                    v = v * 10 + ((line[i] & 255) - 48);
+                    i = i + 1;
+                }
+                outp.Add(v);
+                continue;
+            }
+            i = i + 1;
+        }
+        return outp;
+    }
+    #endif
 
     #if WINDOWS
     /// 发送一次鼠标 INPUT 事件（x64 INPUT 布局：4 字节 type + 填充

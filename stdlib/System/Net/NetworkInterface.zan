@@ -3,8 +3,9 @@ using System;
 namespace System.Net;
 
 /// <summary>
-/// 单个 Windows 网络适配器及其单播地址。枚举由
-/// GetAdaptersAddresses 支撑，并直接解析原生 x64 ABI 布局。
+/// 单个网络适配器及其单播地址。Windows 上由
+/// GetAdaptersAddresses 支撑（直接解析原生 x64 ABI 布局）；
+/// Linux/macOS 上由 getifaddrs 支撑（运行时 zan_plat_net_interfaces）。
 /// </summary>
 class NetworkInterface {
     public string name;
@@ -23,15 +24,48 @@ class NetworkInterface {
         ipAddresses = null;
     }
 
-    /// <summary>返回 Windows 已知的所有适配器。</summary>
+    /// <summary>返回本机已知的所有适配器。</summary>
     static List<NetworkInterface> GetAllNetworkInterfaces() {
         #if WINDOWS
         return NetworkInterface.ReadWindows();
         #else
-        throw new PlatformNotSupportedException(
-            "System.Net.NetworkInterface is only supported on Windows");
+        return NetworkInterface.ReadPosix();
         #endif
     }
+
+    #if !WINDOWS
+    // 每行一个适配器：name \t index \t up \t mac \t addr[,addr...]
+    [DllImport("crt", EntryPoint = "zan_plat_net_interfaces")]
+    static extern string NativeInterfaces();
+
+    static List<NetworkInterface> ReadPosix() {
+        List<NetworkInterface> result = new List<NetworkInterface>();
+        string text = NetworkInterface.NativeInterfaces();
+        if (text == null || text == "") { return result; }
+        List<string> lines = text.Split("\n");
+        for (int i = 0; i < lines.Count; i = i + 1) {
+            string line = lines[i];
+            if (line == "") { continue; }
+            List<string> cols = line.Split("\t");
+            if (cols.Count < 5) { continue; }
+            NetworkInterface item = new NetworkInterface();
+            item.name = cols[0];
+            item.description = cols[0];
+            item.index = Convert.ToInt32(cols[1]);
+            item.up = cols[2] == "1";
+            item.macAddress = cols[3];
+            item.ipAddresses = new List<string>();
+            if (cols[4] != "") {
+                List<string> addrs = cols[4].Split(",");
+                for (int j = 0; j < addrs.Count; j = j + 1) {
+                    if (addrs[j] != "") { item.ipAddresses.Add(addrs[j]); }
+                }
+            }
+            result.Add(item);
+        }
+        return result;
+    }
+    #endif
 
     #if WINDOWS
     [DllImport("iphlpapi", EntryPoint = "GetAdaptersAddresses")]

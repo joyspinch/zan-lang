@@ -1,16 +1,27 @@
 using System;
+using System.Diagnostics;
+using System.IO;
 
 namespace System.Drawing.Printing;
 
-/// <summary>只读访问当前用户已安装的打印机。</summary>
+/// <summary>只读访问当前用户已安装的打印机。Windows 上走
+/// winspool（EnumPrintersW/GetDefaultPrinterW），Linux/macOS 上走 CUPS
+/// 的 lpstat。</summary>
 class PrinterSettings {
     /// <summary>枚举本地打印机及打印机连接。</summary>
     static List<string> InstalledPrinters() {
         #if WINDOWS
         return PrinterSettings.WinInstalledPrinters();
         #else
-        throw new PlatformNotSupportedException(
-            "System.Drawing.Printing is only supported on Windows");
+        List<string> printers = new List<string>();
+        // lpstat -e 每行一个目的地名（含类和远程连接）。
+        ProcessResult r = Process.Capture("lpstat -e");
+        if (r.exitCode != 0) { return printers; }
+        for (int i = 0; i < r.lines.Count; i = i + 1) {
+            string name = r.lines[i].Trim();
+            if (name != "") { printers.Add(name); }
+        }
+        return printers;
         #endif
     }
 
@@ -33,8 +44,17 @@ class PrinterSettings {
         NativeMemory.Free(charsOut);
         return name;
         #else
-        throw new PlatformNotSupportedException(
-            "System.Drawing.Printing is only supported on Windows");
+        // "system default destination: name"，未配置时为
+        // "no system default destination"。
+        ProcessResult r = Process.Capture("lpstat -d");
+        if (r.exitCode != 0) { return ""; }
+        for (int i = 0; i < r.lines.Count; i = i + 1) {
+            string line = r.lines[i].Trim();
+            int colon = line.IndexOf(":");
+            if (colon < 0) { continue; }
+            return line.Substring(colon + 1, line.Length - colon - 1).Trim();
+        }
+        return "";
         #endif
     }
 
@@ -180,7 +200,78 @@ internal class WinRawPrinterBackend : IRawPrinterBackend {
 }
 #endif
 
-/// <summary>将已格式化的字节流直接发送到 Windows 打印队列。</summary>
+#if !WINDOWS
+// CUPS 没有逐页的 spooler API：把 RAW 字节流收集到临时文件，
+// EndDoc 时用 `lp -o raw` 整份提交（-o raw 让 CUPS 跳过过滤链，
+// 字节原样送给打印机，与 Windows 的 RAW 数据类型一致）。
+internal class CupsRawPrinterBackend : IRawPrinterBackend {
+    string printer;
+    string document;
+    string spoolPath;
+    bool failed;
+
+    bool Open(string printerName) {
+        this.printer = printerName;
+        this.spoolPath = "";
+        this.failed = false;
+        // 没有 lp 就谈不上打印，直接失败而不是假装成功。
+        return Process.Capture("command -v lp").exitCode == 0;
+    }
+
+    bool StartDoc(string documentName) {
+        this.spoolPath = Path.GetTempPath() + "zan_raw_"
+            + Convert.ToString(ProcessHost.Pid()) + ".prn";
+        try {
+            File.WriteAllBytes(this.spoolPath, new byte[0]);
+        } catch (IOException e) {
+            this.spoolPath = "";
+            return false;
+        }
+        this.document = documentName;
+        return true;
+    }
+
+    bool StartPage() { return this.spoolPath != ""; }
+
+    int Write(byte[] data) {
+        if (this.spoolPath == "") { return 0 - 1; }
+        try {
+            File.AppendAllBytes(this.spoolPath, data);
+        } catch (IOException e) {
+            this.failed = true;
+            return 0 - 1;
+        }
+        return data.Length;
+    }
+
+    bool EndPage() { return !this.failed; }
+
+    bool EndDoc() {
+        if (this.spoolPath == "" || this.failed) { return false; }
+        string cmd = "lp -d " + CupsRawPrinterBackend.Quote(this.printer)
+            + " -t " + CupsRawPrinterBackend.Quote(this.document)
+            + " -o raw " + CupsRawPrinterBackend.Quote(this.spoolPath);
+        return Process.Capture(cmd).exitCode == 0;
+    }
+
+    void Abort() { this.failed = true; }
+
+    bool Close() {
+        if (this.spoolPath != "") {
+            File.Delete(this.spoolPath);
+            this.spoolPath = "";
+        }
+        return true;
+    }
+
+    static string Quote(string s) {
+        return "'" + s.Replace("'", "'\\''") + "'";
+    }
+}
+#endif
+
+/// <summary>将已格式化的字节流直接发送到打印队列（Windows 走
+/// winspool 的 RAW 数据类型，Linux/macOS 走 CUPS 的 `lp -o raw`）。</summary>
 class RawPrinter {
     /// <summary>
     /// 发送一个 RAW 文档。字节原样传递给所选
@@ -199,8 +290,16 @@ class RawPrinter {
         return RawPrinter.SendWithBackend(
             printerName, documentName, data, new WinRawPrinterBackend());
         #else
-        throw new PlatformNotSupportedException(
-            "System.Drawing.Printing is only supported on Windows");
+        if (printerName == null || printerName.Length == 0) {
+            throw new ArgumentException("printerName must not be empty");
+        }
+        if (documentName == null || documentName.Length == 0) {
+            documentName = "Zan RAW document";
+        }
+        if (data == null) { throw new ArgumentException("data must not be null"); }
+
+        return RawPrinter.SendWithBackend(
+            printerName, documentName, data, new CupsRawPrinterBackend());
         #endif
     }
 

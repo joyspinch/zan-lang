@@ -26,8 +26,10 @@ class PingReply {
 }
 
 /// <summary>
-/// 直接基于 iphlpapi 的 Windows ICMP echo 客户端，不经过命令行 shell 或
-/// 外部 ping 可执行程序。
+/// ICMP echo 客户端，不经过命令行 shell 或外部 ping 可执行程序。
+/// Windows 上直接调 iphlpapi；Linux/macOS 上走运行时的 ICMP socket
+/// （Linux 优先用无需提权的 SOCK_DGRAM/IPPROTO_ICMP “ping socket”，
+/// 内核不开放时回退到需 root/CAP_NET_RAW 的 SOCK_RAW）。
 /// </summary>
 class Ping {
     /// <summary>发送 IPv4 echo 请求，超时 4 秒。</summary>
@@ -74,10 +76,37 @@ class Ping {
         Ping.IcmpCloseHandle(handle);
         return result;
         #else
-        throw new PlatformNotSupportedException(
-            "System.Net.Ping is only supported on Windows");
+        if (timeoutMs < 0) { timeoutMs = 0; }
+        PingReply result = new PingReply();
+        result.address = address;
+        result.roundtripTime = 0;
+        result.dataSize = 0;
+        int rc = Ping.NativeIcmpPing(address, timeoutMs);
+        if (rc >= 0) {
+            result.status = PingStatus.Success;
+            result.roundtripTime = rc;
+            result.dataSize = 8;
+            return result;
+        }
+        if (rc == -1) { result.status = PingStatus.TimedOut; return result; }
+        if (rc == -2) {
+            result.status = PingStatus.DestinationUnreachable;
+            return result;
+        }
+        if (rc == -4) {
+            throw new ArgumentException("Ping address must be an IPv4 address");
+        }
+        result.status = PingStatus.Error;
+        return result;
         #endif
     }
+
+    #if !WINDOWS
+    // 返回往返毫秒（>= 0），或 -1 超时 / -2 不可达 /
+    // -3 socket 或权限错误 / -4 地址无法解析。
+    [DllImport("crt", EntryPoint = "zan_plat_icmp_ping")]
+    static extern int NativeIcmpPing(string address, int timeoutMs);
+    #endif
 
     #if WINDOWS
     [DllImport("iphlpapi", EntryPoint = "IcmpCreateFile")]

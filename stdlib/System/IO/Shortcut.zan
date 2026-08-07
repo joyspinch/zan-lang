@@ -24,9 +24,12 @@ class ShortcutInfo {
 }
 
 /// <summary>
-/// 通过 IShellLink COM 接口创建和解析 Windows .lnk 快捷方式：
-/// 目标路径、参数、工作目录、说明和
-/// 图标。仅支持 Windows；其他平台抛出 PlatformNotSupportedException。
+/// 创建和解析桌面快捷方式：目标路径、参数、工作目录、
+/// 说明和图标。Windows 上是 IShellLink COM 接口写的 .lnk；
+/// Linux 上是 freedesktop 的 `[Desktop Entry]` 文件（.desktop），
+/// 字段一一对应：Exec=目标+参数、Path=工作目录、Icon=图标、
+/// Comment=说明。macOS 没有等价的用户级快捷方式格式，会抛出
+/// PlatformNotSupportedException 而不是静默写一个不能用的文件。
 ///
 ///   Shortcut.Create("C:\\Users\\me\\Desktop\\app.lnk",
 ///                   "C:\\app\\app.exe", "--fast", "C:\\app",
@@ -102,11 +105,93 @@ class Shortcut {
         }
         Com.Release(shell);
         return ok;
+        #elif LINUX
+        return Shortcut.WriteDesktopEntry(lnkPath, target, arguments,
+                                          workingDir, iconPath, description);
         #else
         throw new PlatformNotSupportedException(
             "Shortcut is not implemented on this platform");
         #endif
     }
+
+    #if LINUX
+    // freedesktop Desktop Entry Specification：一个带 [Desktop Entry] 头的
+    // INI 文件，Type=Application 时 Exec 是要执行的命令行。
+    static bool WriteDesktopEntry(string path, string target, string arguments,
+                                  string workingDir, string iconPath,
+                                  string description) {
+        if (target == "") { return false; }
+        string exec = Shortcut.QuoteArg(target);
+        if (arguments != "") { exec = exec + " " + arguments; }
+        StringBuilder sb = new StringBuilder();
+        sb.Append("[Desktop Entry]\n");
+        sb.Append("Version=1.0\n");
+        sb.Append("Type=Application\n");
+        sb.Append("Name=" + Shortcut.EntryName(path) + "\n");
+        sb.Append("Exec=" + exec + "\n");
+        if (workingDir != "") { sb.Append("Path=" + workingDir + "\n"); }
+        if (iconPath != "") { sb.Append("Icon=" + iconPath + "\n"); }
+        if (description != "") { sb.Append("Comment=" + description + "\n"); }
+        sb.Append("Terminal=false\n");
+        try {
+            File.WriteAllText(path, sb.ToString());
+        } catch (IOException e) {
+            return false;
+        }
+        // 桌面环境只会启动可执行的 .desktop 文件。
+        File.SetExecutable(path, true);
+        return true;
+    }
+
+    // Desktop Entry 的 Name 默认用文件名（去掉 .desktop 后缀）。
+    static string EntryName(string path) {
+        string name = Path.GetFileName(path);
+        if (name.EndsWith(".desktop")) {
+            name = name.Substring(0, name.Length - 8);
+        }
+        if (name == "") { return "Shortcut"; }
+        return name;
+    }
+
+    // Exec 行里带空白的可执行路径需要引号（规范 1.5 章）。
+    static string QuoteArg(string s) {
+        if (s.IndexOf(" ") < 0) { return s; }
+        return "\"" + s.Replace("\"", "\\\"") + "\"";
+    }
+
+    // Exec 的第一个 token 是目标程序，其余是参数；首 token 允许带引号。
+    static string ExecTarget(string exec) {
+        if (exec == "") { return ""; }
+        if (exec.StartsWith("\"")) {
+            int close = exec.IndexOf("\"", 1);
+            if (close > 0) { return exec.Substring(1, close - 1); }
+            return exec.Substring(1, exec.Length - 1);
+        }
+        int space = exec.IndexOf(" ");
+        if (space < 0) { return exec; }
+        return exec.Substring(0, space);
+    }
+
+    static string ExecArguments(string exec) {
+        string target = Shortcut.ExecTarget(exec);
+        if (target == "") { return ""; }
+        int used = target.Length;
+        if (exec.StartsWith("\"")) { used = used + 2; }
+        if (used >= exec.Length) { return ""; }
+        return exec.Substring(used, exec.Length - used).Trim();
+    }
+
+    static string EntryValue(string text, string key) {
+        List<string> lines = text.Split("\n");
+        for (int i = 0; i < lines.Count; i = i + 1) {
+            string line = lines[i].Trim();
+            if (line.StartsWith(key + "=")) {
+                return line.Substring(key.Length + 1, line.Length - key.Length - 1);
+            }
+        }
+        return "";
+    }
+    #endif
 
     /// <summary>解析 .lnk 文件。快捷方式未定义的字段
     /// 返回空值（iconIndex 为 0）。</summary>
@@ -131,6 +216,16 @@ class Shortcut {
         }
         Com.Release(persist);
         Com.Release(shell);
+        #elif LINUX
+        if (!File.Exists(lnkPath)) { return info; }
+        string text = File.ReadAllText(lnkPath);
+        string exec = Shortcut.EntryValue(text, "Exec");
+        info.target = Shortcut.ExecTarget(exec);
+        info.arguments = Shortcut.ExecArguments(exec);
+        info.workingDir = Shortcut.EntryValue(text, "Path");
+        info.description = Shortcut.EntryValue(text, "Comment");
+        info.iconPath = Shortcut.EntryValue(text, "Icon");
+        info.iconIndex = 0;
         #else
         throw new PlatformNotSupportedException(
             "Shortcut is not implemented on this platform");

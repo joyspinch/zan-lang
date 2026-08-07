@@ -1,0 +1,65 @@
+// JSON escapes are lossless in both directions: \uXXXX (including surrogate
+// pairs) decodes to UTF-8, control bytes serialize as \u00xx instead of being
+// silently rewritten to a space, and text survives a Parse -> ToJson -> Parse
+// round trip byte for byte. Clients that send non-ASCII as \uXXXX (the default
+// of Python's json.dumps) used to write the literal text "u4e2du6587".
+using System;
+using System.Json;
+using System.Text;
+
+class Program {
+    static string Hex(string s) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < s.Length; i = i + 1) {
+            if (i > 0) { sb.Append(" "); }
+            sb.Append(Encoding.ByteToHex(s[i] & 255));
+        }
+        return sb.ToString();
+    }
+
+    static void Main() {
+        JsonValue doc = JsonValue.Parse(
+            "{\"ascii\":\"\\u0041\",\"zh\":\"\\u4e2d\\u6587\",\"emoji\":\"\\ud83d\\ude00\"}");
+        Console.WriteLine("ascii=" + doc.Str("ascii", ""));
+        Console.WriteLine("zh=" + doc.Str("zh", ""));
+        Console.WriteLine("zh.bytes=" + Program.Hex(doc.Str("zh", "")));
+        Console.WriteLine("emoji.bytes=" + Program.Hex(doc.Str("emoji", "")));
+
+        // Escaped and literal UTF-8 must decode to the same bytes.
+        JsonValue lit = JsonValue.Parse("{\"zh\":\"中文\"}");
+        Console.WriteLine("same=" + Convert.ToString(lit.Str("zh", "") == doc.Str("zh", "")));
+
+        // Short escapes, including \b and \f.
+        JsonValue esc = JsonValue.Parse("{\"s\":\"a\\tb\\nc\\bd\\fe\\\\f\\\"g\\/h\"}");
+        Console.WriteLine("short=" + Program.Hex(esc.Str("s", "")));
+
+        // Control bytes serialize as \u00xx (lossless), not as a space.
+        JsonValue o = JsonValue.NewObject();
+        o.Put("ctl", JsonValue.NewStr(Encoding.CharFromCode(7) + "x"
+            + Encoding.CharFromCode(27) + Encoding.CharFromCode(31)));
+        string wire = o.ToJson();
+        Console.WriteLine("wire=" + wire);
+        Console.WriteLine("rt=" + Program.Hex(JsonValue.Parse(wire).Str("ctl", "")));
+
+        // Round trip of non-ASCII payloads keeps the exact bytes.
+        JsonValue r = JsonValue.NewObject();
+        r.Put("t", JsonValue.NewStr("中文 tab\there"));
+        string back = JsonValue.Parse(r.ToJson()).Str("t", "");
+        Console.WriteLine("roundtrip=" + Convert.ToString(back == "中文 tab\there"));
+
+        // Malformed \u is a parse error (strict Parse), not a silent 'u'.
+        try {
+            JsonValue bad = JsonValue.Parse("{\"a\":\"\\u12\"}");
+            Console.WriteLine("badu=accepted");
+        } catch (JsonException e) {
+            Console.WriteLine("badu=" + e.Message);
+        }
+        try {
+            JsonValue bad2 = JsonValue.Parse("{\"a\":\"\\q\"}");
+            Console.WriteLine("badesc=accepted");
+        } catch (JsonException e) {
+            Console.WriteLine("badesc=" + e.Message);
+        }
+        Console.WriteLine("done");
+    }
+}

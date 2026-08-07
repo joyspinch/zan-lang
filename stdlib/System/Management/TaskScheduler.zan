@@ -17,19 +17,22 @@ class TaskInfo {
 }
 
 /// <summary>
-/// Windows 任务计划程序：枚举、查询、创建、删除、运行和停止
-/// 计划任务。基于内置的 schtasks.exe 实现（其
-/// /fo CSV 与 /fo LIST /v 的输出跨版本稳定）。Linux/macOS
-/// 抛出 PlatformNotSupportedException（cron 集成是后续
-/// 里程碑）。
+/// 计划任务：枚举、查询、创建、删除、运行和停止。
+/// Windows 上基于内置的 schtasks.exe（其 /fo CSV 与 /fo LIST /v
+/// 输出跨版本稳定）；Linux/macOS 上基于当前用户的 crontab，
+/// 每个由本类创建的条目前面带一行标记注释
+/// `# zan-task: &lt;name&gt;`，以便按名字查询/删除；其他人手写的
+/// cron 条目以 "cron:&lt;行号&gt;" 的名字只读列出，不会被改写。
 ///
-/// 创建或删除任务需要管理员权限；Run/End 仅需
-/// 访问该特定任务。失败返回 false（从不抛异常）。
+/// 创建或删除任务需要管理员权限（POSIX 上只需当前用户的
+/// crontab 可写）；Run/End 仅需访问该特定任务。失败返回 false
+/// （从不抛异常）。
 ///
 /// 触发器字符串遵循 schtasks /sc 值："ONLOGON"（登录时）、"ONSTART"
 /// （系统启动时）、"ONIDLE"、"DAILY"、"WEEKLY"、"ONCE"、"MONTHLY"。DAILY、
 /// WEEKLY、ONCE 和 MONTHLY 还需要时间 "HH:MM"（以及可选的日期
-/// "MM/DD/YYYY"）。
+/// "MM/DD/YYYY"）。cron 没有等价的 ONLOGON/ONIDLE/ONCE 触发器，
+/// 在 POSIX 上传这三个会返回 false（不会静默建一个永不触发的条目）。
 /// </summary>
 class TaskScheduler {
     /// <summary>当前用户可见的所有计划任务。</summary>
@@ -53,8 +56,24 @@ class TaskScheduler {
         }
         return list;
         #else
-        throw new PlatformNotSupportedException(
-            "TaskScheduler is not implemented on this platform");
+        List<string> lines = TaskScheduler.CrontabLines();
+        string pending = "";
+        for (int i = 0; i < lines.Count; i = i + 1) {
+            string line = TaskScheduler.Trim(lines[i]);
+            if (line == "") { continue; }
+            string marked = TaskScheduler.MarkerName(line);
+            if (marked != "") { pending = marked; continue; }
+            if (TaskScheduler.StartsWith(line, "#")) { continue; }
+            TaskInfo t = new TaskInfo();
+            t.name = pending != "" ? pending
+                                   : "cron:" + Convert.ToString(i + 1);
+            t.nextRun = TaskScheduler.CronSchedule(line);
+            t.status = "Ready";
+            t.command = TaskScheduler.CronCommand(line);
+            list.Add(t);
+            pending = "";
+        }
+        return list;
         #endif
     }
 
@@ -99,19 +118,17 @@ class TaskScheduler {
         if (!found) { return null; }
         return t;
         #else
-        throw new PlatformNotSupportedException(
-            "TaskScheduler is not implemented on this platform");
+        List<TaskInfo> all = TaskScheduler.List();
+        for (int i = 0; i < all.Count; i = i + 1) {
+            if (all[i].name == name) { return all[i]; }
+        }
+        return null;
         #endif
     }
 
     /// <summary>存在同名任务时返回 True。</summary>
     static bool Exists(string name) {
-        #if WINDOWS
         return TaskScheduler.Get(name) != null;
-        #else
-        throw new PlatformNotSupportedException(
-            "TaskScheduler is not implemented on this platform");
-        #endif
     }
 
     /// <summary>
@@ -130,8 +147,15 @@ class TaskScheduler {
         cmd = cmd + " /f";
         return TaskScheduler.SchtasksOk(cmd);
         #else
-        throw new PlatformNotSupportedException(
-            "TaskScheduler is not implemented on this platform");
+        if (name == "" || command == "") { return false; }
+        if (TaskScheduler.MarkerName("# zan-task: " + name) == "") { return false; }
+        string schedule = TaskScheduler.CronExpr(trigger, time);
+        if (schedule == "") { return false; }
+        List<string> kept = TaskScheduler.WithoutTask(
+            TaskScheduler.CrontabLines(), name);
+        kept.Add(TaskScheduler.Marker(name));
+        kept.Add(schedule + " " + command);
+        return TaskScheduler.WriteCrontab(kept);
         #endif
     }
 
@@ -141,8 +165,10 @@ class TaskScheduler {
         return TaskScheduler.SchtasksOk(
             "schtasks /delete /tn " + TaskScheduler.Quote(name) + " /f");
         #else
-        throw new PlatformNotSupportedException(
-            "TaskScheduler is not implemented on this platform");
+        List<string> lines = TaskScheduler.CrontabLines();
+        List<string> kept = TaskScheduler.WithoutTask(lines, name);
+        if (kept.Count == lines.Count) { return false; }
+        return TaskScheduler.WriteCrontab(kept);
         #endif
     }
 
@@ -152,8 +178,10 @@ class TaskScheduler {
         return TaskScheduler.SchtasksOk(
             "schtasks /run /tn " + TaskScheduler.Quote(name));
         #else
-        throw new PlatformNotSupportedException(
-            "TaskScheduler is not implemented on this platform");
+        TaskInfo t = TaskScheduler.Get(name);
+        if (t == null || t.command == "") { return false; }
+        // cron 本身没有“立即运行”接口，直接异步启动它的命令行。
+        return Process.RunDetached(t.command) == 0;
         #endif
     }
 
@@ -163,10 +191,169 @@ class TaskScheduler {
         return TaskScheduler.SchtasksOk(
             "schtasks /end /tn " + TaskScheduler.Quote(name));
         #else
-        throw new PlatformNotSupportedException(
-            "TaskScheduler is not implemented on this platform");
+        TaskInfo t = TaskScheduler.Get(name);
+        if (t == null || t.command == "") { return false; }
+        // pkill 的退出码：0 杀死了进程，1 没有匹配的进程（已经停了）。
+        ProcessResult r = Process.Capture(
+            "pkill -f " + TaskScheduler.ShellQuote(t.command));
+        return r.exitCode == 0 || r.exitCode == 1;
         #endif
     }
+
+    #if !WINDOWS
+    // 本类写入的条目前的标记行。
+    static string Marker(string name) { return "# zan-task: " + name; }
+
+    // 行是标记行时返回任务名，否则返回 ""。
+    static string MarkerName(string line) {
+        string prefix = "# zan-task:";
+        if (!TaskScheduler.StartsWith(line, prefix)) { return ""; }
+        return TaskScheduler.Trim(
+            line.Substring(prefix.Length, line.Length - prefix.Length));
+    }
+
+    static List<string> CrontabLines() {
+        ProcessResult r = Process.Capture("crontab -l");
+        // 没有 crontab 时它以非 0 退出并在 stderr 上报 "no crontab for ..."。
+        if (r.exitCode != 0) { return new List<string>(); }
+        return r.lines;
+    }
+
+    static bool WriteCrontab(List<string> lines) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < lines.Count; i = i + 1) {
+            sb.Append(lines[i]);
+            sb.Append("\n");
+        }
+        string tmp = Path.GetTempPath() + "zan_crontab_"
+            + Convert.ToString(ProcessHost.Pid()) + ".tmp";
+        try {
+            File.WriteAllText(tmp, sb.ToString());
+        } catch (IOException e) {
+            return false;
+        }
+        ProcessResult r = Process.Capture("crontab " + TaskScheduler.ShellQuote(tmp));
+        File.Delete(tmp);
+        return r.exitCode == 0;
+    }
+
+    // 去掉 `name` 对应的标记行和紧跟在后的 cron 行。
+    static List<string> WithoutTask(List<string> lines, string name) {
+        List<string> kept = new List<string>();
+        bool dropNext = false;
+        for (int i = 0; i < lines.Count; i = i + 1) {
+            string line = lines[i];
+            string marked = TaskScheduler.MarkerName(TaskScheduler.Trim(line));
+            if (marked == name) { dropNext = true; continue; }
+            if (dropNext) {
+                dropNext = false;
+                string t = TaskScheduler.Trim(line);
+                // 只丢掉真正的 cron 行；空行/注释仍保留。
+                if (t != "" && !TaskScheduler.StartsWith(t, "#")) { continue; }
+            }
+            kept.Add(line);
+        }
+        return kept;
+    }
+
+    // 把 schtasks 的 /sc 值映射到 cron 调度表达式；无等价表达时返回 ""。
+    static string CronExpr(string trigger, string time) {
+        string kind = TaskScheduler.Upper(TaskScheduler.Trim(trigger));
+        if (kind == "ONSTART") { return "@reboot"; }
+        // "HH:MM" → cron 的 "MM HH"；无法解析时两者都是 -1。
+        int hh = TaskScheduler.TimePart(time, 0);
+        int mm = TaskScheduler.TimePart(time, 1);
+        if (hh < 0 || hh > 23 || mm < 0 || mm > 59) { return ""; }
+        string at = Convert.ToString(mm) + " " + Convert.ToString(hh);
+        if (kind == "DAILY") { return at + " * * *"; }
+        if (kind == "WEEKLY") { return at + " * * 0"; }
+        if (kind == "MONTHLY") { return at + " 1 * *"; }
+        return "";
+    }
+
+    // 从 "HH:MM" 取第 `index` 个字段（0=小时，1=分钟）；无效时返回 -1。
+    static int TimePart(string time, int index) {
+        string t = TaskScheduler.Trim(time);
+        int colon = TaskScheduler.IndexOf(t, ":", 0);
+        if (colon <= 0) { return 0 - 1; }
+        if (index == 0) { return TaskScheduler.ParseInt(t.Substring(0, colon)); }
+        return TaskScheduler.ParseInt(
+            t.Substring(colon + 1, t.Length - colon - 1));
+    }
+
+    static int ParseInt(string s) {
+        string t = TaskScheduler.Trim(s);
+        if (t.Length == 0) { return 0 - 1; }
+        int v = 0;
+        for (int i = 0; i < t.Length; i = i + 1) {
+            int ch = t[i] & 255;
+            if (ch < 48 || ch > 57) { return 0 - 1; }
+            v = v * 10 + (ch - 48);
+        }
+        return v;
+    }
+
+    static string Upper(string s) {
+        StringBuilder sb = new StringBuilder();
+        string upper = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        for (int i = 0; i < s.Length; i = i + 1) {
+            int ch = s[i] & 255;
+            if (ch >= 97 && ch <= 122) {
+                sb.Append(upper.Substring(ch - 97, 1));
+            } else {
+                sb.Append(s.Substring(i, 1));
+            }
+        }
+        return sb.ToString();
+    }
+
+    // cron 行：要么 "@reboot cmd"，要么五个时间字段后接命令。
+    static string CronSchedule(string line) {
+        if (TaskScheduler.StartsWith(line, "@")) {
+            int sp = TaskScheduler.IndexOf(line, " ", 0);
+            if (sp < 0) { return line; }
+            return line.Substring(0, sp);
+        }
+        return TaskScheduler.FieldSplit(line, 5, true);
+    }
+
+    static string CronCommand(string line) {
+        if (TaskScheduler.StartsWith(line, "@")) {
+            int sp = TaskScheduler.IndexOf(line, " ", 0);
+            if (sp < 0) { return ""; }
+            return TaskScheduler.Trim(
+                line.Substring(sp + 1, line.Length - sp - 1));
+        }
+        return TaskScheduler.FieldSplit(line, 5, false);
+    }
+
+    // 取前 `count` 个空白分隔字段（head），或它们后面的剩余部分。
+    static string FieldSplit(string line, int count, bool head) {
+        int i = 0;
+        int fields = 0;
+        while (i < line.Length && fields < count) {
+            while (i < line.Length && TaskScheduler.IsSpace(line[i] & 255)) {
+                i = i + 1;
+            }
+            int start = i;
+            while (i < line.Length && !TaskScheduler.IsSpace(line[i] & 255)) {
+                i = i + 1;
+            }
+            if (i == start) { break; }
+            fields = fields + 1;
+        }
+        if (fields < count) { return head ? TaskScheduler.Trim(line) : ""; }
+        if (head) { return TaskScheduler.Trim(line.Substring(0, i)); }
+        return TaskScheduler.Trim(line.Substring(i, line.Length - i));
+    }
+
+    static bool IsSpace(int ch) { return ch == 32 || ch == 9; }
+
+    // 单引号引用：内部的 ' 拆成 '\'' 以保持字面量。
+    static string ShellQuote(string s) {
+        return "'" + s.Replace("'", "'\\''") + "'";
+    }
+    #endif
 
     #if WINDOWS
     static bool SchtasksOk(string cmd) {
@@ -237,6 +424,9 @@ class TaskScheduler {
         return null;
     }
 
+    #endif
+
+    // 两个平台的解析代码共用的字符串工具。
     static bool StartsWith(string s, string prefix) {
         if (prefix.Length > s.Length) { return false; }
         return s.Substring(0, prefix.Length) == prefix;
@@ -265,7 +455,6 @@ class TaskScheduler {
             if (hay.Substring(i, n) == needle) { return i; }
             i = i + 1;
         }
-        return -1;
+        return 0 - 1;
     }
-    #endif
 }

@@ -1,4 +1,6 @@
 using System;
+using System.Diagnostics;
+using System.IO;
 
 namespace System.Windows.Clipboard;
 
@@ -15,9 +17,8 @@ class ClipFormat {
 }
 
 /// <summary>
-/// 剪贴板访问：Unicode 文本、文件列表（CF_HDROP）、格式探测与
-/// 枚举。仅 Windows 支持；其他平台会抛出
-/// PlatformNotSupportedException。
+/// 剪贴板访问：Unicode 文本、文件列表（CF_HDROP / text/uri-list）、
+/// 格式探测与枚举。
 ///
 ///   if (Clipboard.HasText()) {
 ///       string t = Clipboard.GetText();
@@ -25,6 +26,14 @@ class ClipFormat {
 ///   Clipboard.SetText("hello");
 ///   Clipboard.SetFiles(paths);          // Explorer 会将其视为真实文件拖放
 ///   List<string> files = Clipboard.GetFiles();
+///
+/// Windows 走 user32 剪贴板 API。Linux 上 X11 的剪贴板是“谁拥有
+/// 选区谁就要活着响应请求”的协议，进程退出内容就没了，因此
+/// 这里委托给平台自己的剪贴板工具（Wayland 用 wl-copy/wl-paste，
+/// X11 用 xclip 或 xsel，macOS 用 pbcopy/pbpaste）；它们会自己 fork 一个
+/// 持有进程。内容走临时文件而不进命令行，因此任意文本（包括
+/// 引号、换行、shell 元字符）都不会被解释。工具不存在时抛出
+/// PlatformNotSupportedException，而不是假装成功。
 /// </summary>
 class Clipboard {
     #if WINDOWS
@@ -77,13 +86,114 @@ class Clipboard {
     static extern void WinDragFinish(nint hdrop);
     #endif
 
+    // ---- POSIX 后端（Wayland / X11 / macOS 的剪贴板工具）--------------
+
+    static int ToolNone() { return 0; }
+    static int ToolWayland() { return 1; }   // wl-copy / wl-paste
+    static int ToolXclip() { return 2; }     // xclip（支持 -t 目标）
+    static int ToolXsel() { return 3; }      // xsel（只有纯文本）
+    static int ToolPasteboard() { return 4; }// pbcopy / pbpaste
+
+    static string MimeText() { return "text/plain;charset=utf-8"; }
+    static string MimeUriList() { return "text/uri-list"; }
+
+    static bool HaveCommand(string name) {
+        // 名字是本文件里的字面量，不含用户输入
+        return Process.Capture("command -v " + name + " >/dev/null 2>&1").Ok();
+    }
+
+    /// <summary>当前平台可用的剪贴板工具；一个都没有时返回 ToolNone。
+    /// Wayland 会话优先 wl-clipboard：X11 工具在纯 Wayland 下无法访问
+    /// 合成器的剪贴板。</summary>
+    static int PosixTool() {
+        #if MACOS
+        if (Clipboard.HaveCommand("pbcopy")) { return Clipboard.ToolPasteboard(); }
+        return Clipboard.ToolNone();
+        #else
+        if (ProcessHost.Env("WAYLAND_DISPLAY").Length > 0
+            && Clipboard.HaveCommand("wl-copy")) {
+            return Clipboard.ToolWayland();
+        }
+        if (Clipboard.HaveCommand("xclip")) { return Clipboard.ToolXclip(); }
+        if (Clipboard.HaveCommand("xsel")) { return Clipboard.ToolXsel(); }
+        if (Clipboard.HaveCommand("wl-copy")) { return Clipboard.ToolWayland(); }
+        return Clipboard.ToolNone();
+        #endif
+    }
+
+    static void NoTool() {
+        throw new PlatformNotSupportedException(
+            "Clipboard needs a platform clipboard tool: install wl-clipboard "
+            + "(Wayland), xclip or xsel (X11); macOS uses pbcopy/pbpaste");
+    }
+
+    /// <summary>临时文件路径：剪贴板内容走文件而不进命令行。</summary>
+    static string TempFile(string tag) {
+        return Path.GetTempPath() + "zan_clip_" + tag + "_"
+            + Convert.ToString(ProcessHost.Pid()) + ".tmp";
+    }
+
+    /// <summary>读取 `mime` 目标的剪贴板内容；没有该目标时返回 ""。</summary>
+    static string PosixRead(int tool, string mime) {
+        if (tool == Clipboard.ToolNone()) { Clipboard.NoTool(); }
+        string tmp = Clipboard.TempFile("out");
+        string cmd = "";
+        if (tool == Clipboard.ToolWayland()) {
+            cmd = "wl-paste --no-newline --type '" + mime + "'";
+        } else if (tool == Clipboard.ToolXclip()) {
+            cmd = "xclip -selection clipboard -o -t '" + mime + "'";
+        } else if (tool == Clipboard.ToolXsel()) {
+            if (mime != Clipboard.MimeText()) { return ""; }
+            cmd = "xsel -b -o";
+        } else {
+            if (mime != Clipboard.MimeText()) { return ""; }
+            cmd = "pbpaste";
+        }
+        int rc = Process.Run(cmd + " > '" + tmp + "' 2>/dev/null");
+        string text = "";
+        if (rc == 0 && File.Exists(tmp)) { text = File.ReadAllText(tmp); }
+        if (File.Exists(tmp)) { File.Delete(tmp); }
+        return text;
+    }
+
+    /// <summary>把 `content` 作为 `mime` 目标放上剪贴板。</summary>
+    static bool PosixWrite(int tool, string mime, string content) {
+        if (tool == Clipboard.ToolNone()) { Clipboard.NoTool(); }
+        if (tool == Clipboard.ToolXsel() && mime != Clipboard.MimeText()) {
+            throw new PlatformNotSupportedException(
+                "xsel cannot publish '" + mime + "'; install xclip or wl-clipboard");
+        }
+        if (tool == Clipboard.ToolPasteboard() && mime != Clipboard.MimeText()) {
+            throw new PlatformNotSupportedException(
+                "pbcopy cannot publish '" + mime + "' (file lists are not "
+                + "available through the pasteboard tools)");
+        }
+        string tmp = Clipboard.TempFile("in");
+        File.WriteAllText(tmp, content);
+        string cmd = "";
+        if (tool == Clipboard.ToolWayland()) {
+            // wl-copy 自己 fork 出持有进程；--foreground 会阻塞
+            cmd = "wl-copy --type '" + mime + "' < '" + tmp + "'";
+        } else if (tool == Clipboard.ToolXclip()) {
+            // xclip 同样 fork 一个持有 CLIPBOARD 选区的后台进程
+            cmd = "xclip -selection clipboard -i -t '" + mime + "' < '" + tmp + "'";
+        } else if (tool == Clipboard.ToolXsel()) {
+            cmd = "xsel -b -i < '" + tmp + "'";
+        } else {
+            cmd = "pbcopy < '" + tmp + "'";
+        }
+        int rc = Process.Run(cmd);
+        File.Delete(tmp);
+        return rc == 0;
+    }
+
     /// 剪贴板上有 Unicode 文本时为 true。
     static bool HasText() {
         #if WINDOWS
         return Clipboard.WinIsClipboardFormatAvailable(13) != 0;
         #else
-        throw new PlatformNotSupportedException(
-            "Clipboard is not implemented on this platform");
+        return Clipboard.PosixRead(Clipboard.PosixTool(),
+                                   Clipboard.MimeText()).Length > 0;
         #endif
     }
 
@@ -92,8 +202,8 @@ class Clipboard {
         #if WINDOWS
         return Clipboard.WinIsClipboardFormatAvailable(15) != 0;
         #else
-        throw new PlatformNotSupportedException(
-            "Clipboard is not implemented on this platform");
+        return Clipboard.PosixRead(Clipboard.PosixTool(),
+                                   Clipboard.MimeUriList()).Length > 0;
         #endif
     }
 
@@ -114,8 +224,7 @@ class Clipboard {
         Clipboard.WinCloseClipboard();
         return s;
         #else
-        throw new PlatformNotSupportedException(
-            "Clipboard is not implemented on this platform");
+        return Clipboard.PosixRead(Clipboard.PosixTool(), Clipboard.MimeText());
         #endif
     }
 
@@ -148,8 +257,8 @@ class Clipboard {
         }
         return true;
         #else
-        throw new PlatformNotSupportedException(
-            "Clipboard is not implemented on this platform");
+        return Clipboard.PosixWrite(Clipboard.PosixTool(),
+                                    Clipboard.MimeText(), text);
         #endif
     }
 
@@ -161,8 +270,15 @@ class Clipboard {
             Clipboard.WinCloseClipboard();
         }
         #else
-        throw new PlatformNotSupportedException(
-            "Clipboard is not implemented on this platform");
+        int tool = Clipboard.PosixTool();
+        if (tool == Clipboard.ToolWayland()) {
+            Process.Run("wl-copy --clear");
+        } else if (tool == Clipboard.ToolXsel()) {
+            // X11 没有“清空”这个操作：放弃选区所有权就是清空，xsel -c 即如此
+            Process.Run("xsel -bc");
+        } else {
+            Clipboard.PosixWrite(tool, Clipboard.MimeText(), "");
+        }
         #endif
     }
 
@@ -214,8 +330,14 @@ class Clipboard {
         }
         return true;
         #else
-        throw new PlatformNotSupportedException(
-            "Clipboard is not implemented on this platform");
+        // freedesktop 的文件拖放/粘贴格式是 text/uri-list，每行一个
+        // file:// URI，CRLF 分隔
+        StringBuilder sb = new StringBuilder();
+        for (int k = 0; k < paths.Count; k = k + 1) {
+            sb.Append(Clipboard.FileUri(paths[k]) + "\r\n");
+        }
+        return Clipboard.PosixWrite(Clipboard.PosixTool(),
+                                    Clipboard.MimeUriList(), sb.ToString());
         #endif
     }
 
@@ -238,8 +360,16 @@ class Clipboard {
         }
         Clipboard.WinCloseClipboard();
         #else
-        throw new PlatformNotSupportedException(
-            "Clipboard is not implemented on this platform");
+        string text = Clipboard.PosixRead(Clipboard.PosixTool(),
+                                          Clipboard.MimeUriList());
+        List<string> lines = text.Split("\n");
+        for (int k = 0; k < lines.Count; k = k + 1) {
+            string line = lines[k].Trim();
+            // uri-list 里以 '#' 开头的行是注释
+            if (line.Length == 0 || line.StartsWith("#")) { continue; }
+            string p = Clipboard.PathFromUri(line);
+            if (p.Length > 0) { list.Add(p); }
+        }
         #endif
         return list;
     }
@@ -259,8 +389,15 @@ class Clipboard {
         }
         Clipboard.WinCloseClipboard();
         #else
-        throw new PlatformNotSupportedException(
-            "Clipboard is not implemented on this platform");
+        // POSIX 上格式是 MIME 字符串，没有数值 id；报告这里能用
+        // Windows 常量表达的那两个，其余请用 MimeTypes()
+        int tool = Clipboard.PosixTool();
+        if (Clipboard.PosixRead(tool, Clipboard.MimeText()).Length > 0) {
+            list.Add(13);
+        }
+        if (Clipboard.PosixRead(tool, Clipboard.MimeUriList()).Length > 0) {
+            list.Add(15);
+        }
         #endif
         return list;
     }
@@ -274,8 +411,11 @@ class Clipboard {
         Wide.Free(w);
         return id;
         #else
+        // 在 X11/Wayland 上格式就是 MIME 字符串本身，不存在"注册后得到一个
+        // 数字 id"这回事；编一个假 id 只会让调用方拿着它去白跑
         throw new PlatformNotSupportedException(
-            "Clipboard is not implemented on this platform");
+            "clipboard format ids are a Windows concept; on this platform a "
+            + "format is its MIME type ('" + name + "'), used directly");
         #endif
     }
 
@@ -289,8 +429,105 @@ class Clipboard {
         NativeMemory.Free(buf);
         return s;
         #else
-        throw new PlatformNotSupportedException(
-            "Clipboard is not implemented on this platform");
+        if (format == 13 || format == 1) { return Clipboard.MimeText(); }
+        if (format == 15) { return Clipboard.MimeUriList(); }
+        return "";
         #endif
+    }
+
+    /// <summary>剪贴板上现有的 MIME 类型（POSIX 上格式的真名字）。
+    /// Windows 上把已知的内置格式映射成对应的 MIME 名。</summary>
+    static List<string> MimeTypes() {
+        List<string> list = new List<string>();
+        #if WINDOWS
+        List<int> fmts = Clipboard.Formats();
+        for (int i = 0; i < fmts.Count; i = i + 1) {
+            if (fmts[i] == 13 || fmts[i] == 1) { list.Add(Clipboard.MimeText()); }
+            else if (fmts[i] == 15) { list.Add(Clipboard.MimeUriList()); }
+        }
+        #else
+        int tool = Clipboard.PosixTool();
+        string cmd = "";
+        if (tool == Clipboard.ToolWayland()) {
+            cmd = "wl-paste --list-types";
+        } else if (tool == Clipboard.ToolXclip()) {
+            cmd = "xclip -selection clipboard -o -t TARGETS";
+        } else if (tool == Clipboard.ToolNone()) {
+            Clipboard.NoTool();
+        } else {
+            // xsel / pbpaste 只能看到纯文本
+            if (Clipboard.HasText()) { list.Add(Clipboard.MimeText()); }
+            return list;
+        }
+        ProcessResult r = Process.Capture(cmd);
+        for (int i = 0; i < r.lines.Count; i = i + 1) {
+            string t = r.lines[i].Trim();
+            if (t.Length > 0) { list.Add(t); }
+        }
+        #endif
+        return list;
+    }
+
+    /// <summary>本地路径 -> file:// URI（uri-list 需要百分号转义）。</summary>
+    static string FileUri(string path) {
+        string full = path;
+        if (!(full.StartsWith("/") || (full.Length > 1 && full.Substring(1, 1) == ":"))) {
+            full = Directory.GetCurrentDirectory() + Path.Separator() + full;
+        }
+        full = Clipboard.Slashes(full);
+        if (!full.StartsWith("/")) { full = "/" + full; }   // Windows 盘符
+        StringBuilder sb = new StringBuilder();
+        sb.Append("file://");
+        for (int i = 0; i < full.Length; i = i + 1) {
+            int c = full[i] & 255;
+            bool safe = (c >= 48 && c <= 57) || (c >= 65 && c <= 90)
+                || (c >= 97 && c <= 122) || c == 47 || c == 45 || c == 46
+                || c == 95 || c == 126;
+            if (safe) {
+                sb.Append(full.Substring(i, 1));
+            } else {
+                sb.Append("%" + Encoding.ByteToHex(c));
+            }
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>反斜杠换正斜杠（URI 里只有 '/'）。</summary>
+    static string Slashes(string path) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < path.Length; i = i + 1) {
+            string ch = path.Substring(i, 1);
+            if (ch == "\\") { sb.Append("/"); } else { sb.Append(ch); }
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>file:// URI -> 本地路径；不是 file URI 时返回 ""。</summary>
+    static string PathFromUri(string uri) {
+        if (!uri.StartsWith("file://")) { return ""; }
+        string rest = uri.Substring(7, uri.Length - 7);
+        // file://host/path：只接受本机（空 host）
+        int slash = rest.IndexOf("/");
+        if (slash != 0) {
+            if (slash < 0) { return ""; }
+            rest = rest.Substring(slash, rest.Length - slash);
+        }
+        StringBuilder sb = new StringBuilder();
+        int i = 0;
+        while (i < rest.Length) {
+            string c = rest.Substring(i, 1);
+            if (c == "%" && i + 2 < rest.Length) {
+                int hi = Encoding.HexDigit(rest[i + 1] & 255);
+                int lo = Encoding.HexDigit(rest[i + 2] & 255);
+                if (hi >= 0 && lo >= 0) {
+                    sb.Append(Encoding.CharFromCode(hi * 16 + lo));
+                    i = i + 3;
+                    continue;
+                }
+            }
+            sb.Append(c);
+            i = i + 1;
+        }
+        return sb.ToString();
     }
 }

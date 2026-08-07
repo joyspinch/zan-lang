@@ -581,6 +581,36 @@ class JsonReader {
                 else if (n == 34) { sb.Append("\""); }
                 else if (n == 92) { sb.Append("\\"); }
                 else if (n == 47) { sb.Append("/"); }
+                else if (n == 98) { sb.Append(Encoding.CharFromCode(8)); }
+                else if (n == 102) { sb.Append(Encoding.CharFromCode(12)); }
+                else if (n == 117) {
+                    // \uXXXX：以 UTF-8 输出（含代理对）。很多客户端默认
+                    // 把所有非 ASCII 字符发成 \uXXXX（Python json.dumps 的
+                    // ensure_ascii=True 就是这样），不解码就会把
+                    // "\u4e2d\u6587" 变成字面量 "u4e2du6587"。
+                    pos = pos + 2;
+                    int cp = JsonReader.Hex4(s, pos, len);
+                    if (cp < 0) { sb.Append("u"); continue; }
+                    pos = pos + 4;
+                    if (cp >= 55296 && cp <= 56319 && pos + 5 < len
+                        && (s[pos] & 255) == 92 && (s[pos + 1] & 255) == 117) {
+                        int lo = JsonReader.Hex4(s, pos + 2, len);
+                        if (lo >= 56320 && lo <= 57343) {
+                            cp = 65536 + ((cp - 55296) << 10) + (lo - 56320);
+                            pos = pos + 6;
+                        }
+                    }
+                    if (cp == 0) {
+                        // Zan 字符串以 NUL 结尾，装不下 U+0000：静默丢掉
+                        // 会让写文件的内容与客户端发的不一致，因此明确
+                        // 报错，让调用方改用 base64 通道传二进制。
+                        throw new JsonException(
+                            "\\u0000 cannot be represented in a string; "
+                            + "send binary content as base64");
+                    }
+                    sb.Append(Encoding.Utf8FromCodePoint(cp));
+                    continue;
+                }
                 else { sb.Append(s.Substring(pos + 1, 1)); }
                 pos = pos + 2;
             } else {
@@ -595,6 +625,19 @@ class JsonReader {
             }
         }
         return sb.ToString();
+    }
+
+    /// 从 `at` 开始的 4 位十六进制值；不足 4 位或含非十六进制
+    /// 字符时返回 -1。
+    static int Hex4(string src, int at, int limit) {
+        if (at + 4 > limit) { return -1; }
+        int acc = 0;
+        for (int i = 0; i < 4; i = i + 1) {
+            int d = Encoding.HexDigit(src[at + i] & 255);
+            if (d < 0) { return -1; }
+            acc = acc * 16 + d;
+        }
+        return acc;
     }
 
     JsonValue ReadBool() {
@@ -705,6 +748,17 @@ class JsonReader {
             if (c == 34) { pos = pos + 1; return true; }
             if (c == 92) {
                 if (pos + 1 >= len) { return false; }
+                int e = s[pos + 1] & 255;
+                // 合法转义：" \ / b f n r t u；\u 后面必须跟 4 位十六进制。
+                if (e == 117) {
+                    if (JsonReader.Hex4(s, pos + 2, len) < 0) { return false; }
+                    pos = pos + 6;
+                    continue;
+                }
+                if (e != 34 && e != 92 && e != 47 && e != 98 && e != 102
+                    && e != 110 && e != 114 && e != 116) {
+                    return false;
+                }
                 pos = pos + 2;
             } else {
                 pos = pos + 1;

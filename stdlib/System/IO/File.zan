@@ -38,6 +38,10 @@ class File {
     [DllImport("crt")]
     static extern int fputc(int ch, nint fp);
 
+    // 位 0 只读、位 1 隐藏、位 2 目录；路径不存在时为 -1。
+    [DllImport("crt")]
+    static extern long zan_file_attributes(string path);
+
     /// <summary>以字符串形式读取整个文件内容。
     /// 文件无法打开时抛出 FileNotFoundException。</summary>
     static string ReadAllText(string path) {
@@ -64,15 +68,23 @@ class File {
     }
 
     /// <summary>将字符串写入文件，不存在则创建，已存在则覆盖。
-    /// 文件无法以写入方式打开时抛出 IOException。</summary>
+    /// 文件无法以写入方式打开时抛出 IOException。
+    ///
+    /// 以二进制模式按显式长度写出：文本模式（"w"）会在 Windows 上
+    /// 把 '\n' 翻成 "\r\n"，而 fputs 会在首个 NUL 处停止 —— 两者都会让
+    /// 写回的内容与传入的字符串不一致（写文件再读回不等于原文）。</summary>
     static void WriteAllText(string path, string content) {
-        nint fp = fopen(path, "w");
+        nint fp = fopen(path, "wb");
         if (fp == 0) {
             throw new IOException("Could not open file for writing: " + path);
         }
-        if (fputs(content, fp) < 0) {
-            fclose(fp);
-            throw new IOException("Could not write file: " + path);
+        int len = content.Length;
+        if (len > 0) {
+            int written = (int)fwrite(content, 1, len, fp);
+            if (written != len) {
+                fclose(fp);
+                throw new IOException("Could not write file: " + path);
+            }
         }
         fclose(fp);
     }
@@ -83,15 +95,20 @@ class File {
     }
 
     /// <summary>将字符串追加到文件末尾。
-    /// 文件无法以追加方式打开时抛出 IOException。</summary>
+    /// 文件无法以追加方式打开时抛出 IOException。
+    /// 与 WriteAllText 同理，用二进制模式按长度写出。</summary>
     static void AppendAllText(string path, string content) {
-        nint fp = fopen(path, "a");
+        nint fp = fopen(path, "ab");
         if (fp == 0) {
             throw new IOException("Could not open file for appending: " + path);
         }
-        if (fputs(content, fp) < 0) {
-            fclose(fp);
-            throw new IOException("Could not append to file: " + path);
+        int len = content.Length;
+        if (len > 0) {
+            int written = (int)fwrite(content, 1, len, fp);
+            if (written != len) {
+                fclose(fp);
+                throw new IOException("Could not append to file: " + path);
+            }
         }
         fclose(fp);
     }
@@ -101,14 +118,52 @@ class File {
         AppendAllText(path, content);
     }
 
-    /// <summary>检查文件是否存在。</summary>
+    /// <summary>检查路径是否存在且为文件。目录返回 false
+    /// （用 Directory.Exists 判断目录）。
+    ///
+    /// 不能用 fopen 判存在：POSIX 上 <c>fopen(dir, "rb")</c> 会成功，
+    /// 于是目录会被当成文件（调用方紧接着就会去 remove/读它），
+    /// 而 Windows 上同一调用失败 —— 同一份代码在两个平台行为相反。</summary>
     static bool Exists(string path) {
-        nint fp = fopen(path, "rb");
-        if (fp != 0) {
-            fclose(fp);
-            return true;
-        }
-        return false;
+        long a = zan_file_attributes(path);
+        if (a < 0) { return false; }
+        return ((a / 4) % 2) == 0;
+    }
+
+    #if !WINDOWS
+    [DllImport("crt")]
+    static extern int chmod(string path, int mode);
+
+    [DllImport("crt")]
+    static extern int access(string path, int mode);
+    #endif
+
+    /// <summary>设置或清除文件的可执行位。POSIX 上按 owner/group/other
+    /// 的当前可读位加上（或去掉）对应的 x 位；Windows 没有可执行位
+    /// （可执行性由扩展名决定），返回 true 且不做修改。</summary>
+    static bool SetExecutable(string path, bool on) {
+        #if WINDOWS
+        return File.Exists(path);
+        #else
+        if (!File.Exists(path)) { return false; }
+        // 0755 / 0644：可执行时给所有能读的角色加 x。
+        int mode = on ? 493 : 420;
+        return chmod(path, mode) == 0;
+        #endif
+    }
+
+    /// <summary>文件存在且当前用户可执行时返回 true。
+    /// Windows 上退化为按扩展名判断（.exe/.bat/.cmd/.com）。</summary>
+    static bool IsExecutable(string path) {
+        #if WINDOWS
+        string lower = path.ToLower();
+        if (!File.Exists(path)) { return false; }
+        return lower.EndsWith(".exe") || lower.EndsWith(".bat")
+            || lower.EndsWith(".cmd") || lower.EndsWith(".com");
+        #else
+        if (!File.Exists(path)) { return false; }
+        return access(path, 1 /*X_OK*/) == 0;
+        #endif
     }
 
     /// <summary>删除指定路径的文件。</summary>
@@ -251,6 +306,17 @@ class File {
         return buf;
     }
 
+    /// <summary>读取整个文件为字节数组（二进制安全：内嵌 NUL
+    /// 会被保留，因此可用于图片、可执行文件等任意内容）。
+    /// 文件无法打开时抛出 FileNotFoundException。</summary>
+    static byte[] ReadAllBytes(string path) {
+        int size = File.GetSize(path);
+        if (size < 0) {
+            throw new FileNotFoundException("Could not open file: " + path);
+        }
+        return File.ReadBytes(path, 0, size);
+    }
+
     /// <summary>将原始字节写入文件（二进制安全，不同于
     /// 接收字符串、无法携带 NUL 字节的 WriteBytes）。</summary>
     static void WriteAllBytes(string path, byte[] data) {
@@ -262,6 +328,20 @@ class File {
         fclose(fp);
         if (written != (long)data.Length) {
             throw new IOException("Could not write complete file: " + path);
+        }
+    }
+
+    /// <summary>将原始字节追加到文件末尾（二进制安全）。
+    /// 文件不存在时创建。</summary>
+    static void AppendAllBytes(string path, byte[] data) {
+        nint fp = fopen(path, "ab");
+        if (fp == 0) {
+            throw new IOException("Could not open file for appending: " + path);
+        }
+        long written = fwrite(data, 1, data.Length, fp);
+        fclose(fp);
+        if (written != (long)data.Length) {
+            throw new IOException("Could not append complete data to file: " + path);
         }
     }
 }

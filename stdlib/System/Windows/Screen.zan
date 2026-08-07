@@ -1,12 +1,16 @@
 using System;
+using System.Diagnostics;
+using System.IO;
+using System.Management;
 
 namespace System.Windows;
 
 /// <summary>
 /// 屏幕捕获、像素探测与显示器信息。Windows 通过
-/// GDI（GetDC/BitBlt/GetDIBits）实现全部功能；其他平台提供
-/// 相同 API 但会抛出 PlatformNotSupportedException（捕获后端
-/// 需要 X11/AppKit，属于后续里程碑）。
+/// GDI（GetDC/BitBlt/GetDIBits）实现。Linux/macOS 调用平台自带的截图
+/// 工具（X11 用 ImageMagick import，Wayland 用 grim，macOS 用
+/// screencapture）写出 BMP 后再读回像素；工具不存在时抛出
+/// PlatformNotSupportedException 而不是返回黑图。
 ///
 /// 像素以 BGRA 字节数组返回（stride = 宽度 * 4，行序
 /// 自上而下）。颜色为 0xAARRGGBB。
@@ -67,8 +71,7 @@ class Screen {
         #if WINDOWS
         return Screen.WinGetSystemMetrics(0 /*SM_CXSCREEN*/);
         #else
-        throw new PlatformNotSupportedException(
-            "Screen is not implemented on this platform");
+        return Display.ScreenWidth();
         #endif
     }
 
@@ -77,8 +80,7 @@ class Screen {
         #if WINDOWS
         return Screen.WinGetSystemMetrics(1 /*SM_CYSCREEN*/);
         #else
-        throw new PlatformNotSupportedException(
-            "Screen is not implemented on this platform");
+        return Display.ScreenHeight();
         #endif
     }
 
@@ -90,6 +92,17 @@ class Screen {
         Screen.WinReleaseDC(0, dc);
         if (dpi <= 0) { dpi = 96; }
         return dpi;
+        #elif LINUX
+        // xdpyinfo: "  resolution:    96x96 dots per inch"
+        ProcessResult r = Process.Capture("xdpyinfo 2>/dev/null");
+        if (r.lines != null) {
+            for (int i = 0; i < r.lines.Count; i = i + 1) {
+                if (r.lines[i].IndexOf("resolution:") < 0) { continue; }
+                int dpi = Screen.FirstInt(r.lines[i]);
+                if (dpi > 0) { return dpi; }
+            }
+        }
+        return 96;
         #else
         return 96;
         #endif
@@ -107,8 +120,12 @@ class Screen {
         int r = px[2] & 255;
         return 0xFF000000 | (r << 16) | (g << 8) | b;
         #else
-        throw new PlatformNotSupportedException(
-            "Screen is not implemented on this platform");
+        byte[] px = Screen.CapturePixels(x, y, 1, 1);
+        if (px == null || px.Length < 4) { return -1; }
+        int b = px[0] & 255;
+        int g = px[1] & 255;
+        int r = px[2] & 255;
+        return 0xFF000000 | (r << 16) | (g << 8) | b;
         #endif
     }
 
@@ -140,8 +157,14 @@ class Screen {
         Screen.WinReleaseDC(0, screenDc);
         return px;
         #else
-        throw new PlatformNotSupportedException(
-            "Screen is not implemented on this platform");
+        if (w <= 0 || h <= 0) { return null; }
+        string tmp = Screen.TempBmp();
+        byte[] px = null;
+        if (Screen.ShotToBmp(tmp, x, y, w, h)) {
+            px = Screen.ReadBmpPixels(tmp, w, h);
+        }
+        if (File.Exists(tmp)) { File.Delete(tmp); }
+        return px;
         #endif
     }
 
@@ -152,8 +175,8 @@ class Screen {
         return Screen.CaptureToBmp(path, 0, 0, Screen.ScreenWidth(),
                                    Screen.ScreenHeight());
         #else
-        throw new PlatformNotSupportedException(
-            "Screen is not implemented on this platform");
+        // 全屏：不传 -crop，省得先去问一遍屏幕尺寸
+        return Screen.ShotToBmp(path, 0, 0, 0, 0);
         #endif
     }
 
@@ -165,10 +188,175 @@ class Screen {
         if (px == null) { return false; }
         return Screen.WriteBmp(path, px, w, h);
         #else
-        throw new PlatformNotSupportedException(
-            "Screen is not implemented on this platform");
+        return Screen.ShotToBmp(path, x, y, w, h);
         #endif
     }
+
+    #if !WINDOWS
+    static string TempBmp() {
+        return Path.GetTempPath() + "zan_shot_"
+            + Convert.ToString(ProcessHost.Pid()) + ".bmp";
+    }
+
+    static bool Have(string tool) {
+        return Process.Capture("command -v " + tool + " >/dev/null 2>&1").Ok();
+    }
+
+    /// <summary>用平台截图工具把屏幕矩形写成 BMP。w/h 为 0 表示整屏。
+    /// 一个可用工具都没有时抛 PlatformNotSupportedException——静默返回
+    /// false 会让调用方以为是运行时失败而不停重试。</summary>
+    static bool ShotToBmp(string path, int x, int y, int w, int h) {
+        string geom = "";
+        if (w > 0 && h > 0) {
+            geom = Convert.ToString(w) + "x" + Convert.ToString(h)
+                + "+" + Convert.ToString(x) + "+" + Convert.ToString(y);
+        }
+        string cmd = "";
+        #if MACOS
+        if (!Screen.Have("screencapture")) {
+            throw new PlatformNotSupportedException(
+                "Screen capture needs /usr/sbin/screencapture");
+        }
+        cmd = "screencapture -x -t bmp";
+        if (geom.Length > 0) {
+            cmd = cmd + " -R" + Convert.ToString(x) + "," + Convert.ToString(y)
+                + "," + Convert.ToString(w) + "," + Convert.ToString(h);
+        }
+        cmd = cmd + " '" + path + "'";
+        #else
+        bool wayland = ProcessHost.Env("WAYLAND_DISPLAY").Length > 0;
+        if (wayland && Screen.Have("grim")) {
+            // grim 只写 PNG/PPM，先出 PPM 再自己转 BMP
+            string ppm = path + ".ppm";
+            string g = "grim -t ppm";
+            if (geom.Length > 0) {
+                g = g + " -g '" + Convert.ToString(x) + "," + Convert.ToString(y)
+                    + " " + Convert.ToString(w) + "x" + Convert.ToString(h) + "'";
+            }
+            int grc = Process.Run(g + " '" + ppm + "' 2>/dev/null");
+            bool ok = grc == 0 && Screen.PpmToBmp(ppm, path);
+            if (File.Exists(ppm)) { File.Delete(ppm); }
+            return ok;
+        }
+        if (Screen.Have("import")) {
+            // ImageMagick：BMP3 是无压缩 24 位，最容易读回
+            cmd = "import -window root";
+            if (geom.Length > 0) { cmd = cmd + " -crop " + geom + " +repage"; }
+            cmd = cmd + " BMP3:'" + path + "'";
+        } else if (Screen.Have("spectacle")) {
+            cmd = "spectacle -b -n -o '" + path + "'";
+        } else if (Screen.Have("gnome-screenshot")) {
+            cmd = "gnome-screenshot -f '" + path + "'";
+        } else {
+            throw new PlatformNotSupportedException(
+                "Screen capture needs a screenshot tool: install imagemagick "
+                + "(X11) or grim (Wayland)");
+        }
+        #endif
+        int rc = Process.Run(cmd + " 2>/dev/null");
+        return rc == 0 && File.Exists(path);
+    }
+
+    /// <summary>P6 PPM -> 24 位 BMP（grim 不会写 BMP）。</summary>
+    static bool PpmToBmp(string ppm, string bmpPath) {
+        byte[] data = File.ReadAllBytes(ppm);
+        if (data == null || data.Length < 16) { return false; }
+        if (data[0] != 80 || data[1] != 54) { return false; }   // "P6"
+        int p = 2;
+        List<int> head = new List<int>();
+        while (head.Count < 3 && p < data.Length) {
+            int c = data[p] & 255;
+            if (c == 35) {                       // '#' 注释到行尾
+                while (p < data.Length && (data[p] & 255) != 10) { p = p + 1; }
+            } else if (c >= 48 && c <= 57) {
+                int v = 0;
+                while (p < data.Length && (data[p] & 255) >= 48 && (data[p] & 255) <= 57) {
+                    v = v * 10 + ((data[p] & 255) - 48);
+                    p = p + 1;
+                }
+                head.Add(v);
+                continue;
+            }
+            p = p + 1;
+        }
+        if (head.Count < 3 || head[2] != 255) { return false; }
+        int w = head[0];
+        int h = head[1];
+        if (w <= 0 || h <= 0 || p + w * h * 3 > data.Length) { return false; }
+        byte[] px = new byte[w * h * 4];
+        for (int row = 0; row < h; row = row + 1) {
+            for (int col = 0; col < w; col = col + 1) {
+                int s = p + (row * w + col) * 3;
+                int d = (row * w + col) * 4;
+                px[d] = data[s + 2];       // B
+                px[d + 1] = data[s + 1];   // G
+                px[d + 2] = data[s];       // R
+                px[d + 3] = 255;
+            }
+        }
+        return Screen.WriteBmp(bmpPath, px, w, h);
+    }
+
+    /// <summary>读回 BMP 的像素为自上而下的 BGRA。24/32 位无压缩
+    /// （BI_RGB）的 BMP 才支持——截图工具写出的正是这种。
+    /// w/h 传 0 表示按文件里的尺寸；尺寸不符时返回 null。</summary>
+    static byte[] ReadBmpPixels(string path, int w, int h) {
+        byte[] f = File.ReadAllBytes(path);
+        if (f == null || f.Length < 54) { return null; }
+        if (f[0] != 66 || f[1] != 77) { return null; }        // "BM"
+        int off = Screen.GetInt(f, 10);
+        int bw = Screen.GetInt(f, 18);
+        int bh = Screen.GetInt(f, 22);
+        int bpp = (f[28] & 255) | ((f[29] & 255) << 8);
+        int comp = Screen.GetInt(f, 30);
+        bool topDown = bh < 0;
+        if (bh < 0) { bh = 0 - bh; }
+        if (comp != 0 && comp != 3) { return null; }
+        if (bpp != 24 && bpp != 32) { return null; }
+        if (bw <= 0 || bh <= 0) { return null; }
+        if (w > 0 && (bw != w || bh != h)) { return null; }
+        int srcStride = ((bw * bpp / 8) + 3) / 4 * 4;   // BMP 行按 4 字节对齐
+        if (off + srcStride * bh > f.Length) { return null; }
+        byte[] px = new byte[bw * bh * 4];
+        for (int row = 0; row < bh; row = row + 1) {
+            int srcRow = topDown ? row : bh - 1 - row;
+            int s = off + srcRow * srcStride;
+            int d = row * bw * 4;
+            for (int col = 0; col < bw; col = col + 1) {
+                int si = s + col * (bpp / 8);
+                px[d] = f[si];
+                px[d + 1] = f[si + 1];
+                px[d + 2] = f[si + 2];
+                px[d + 3] = bpp == 32 ? f[si + 3] : (byte)255;
+                d = d + 4;
+            }
+        }
+        return px;
+    }
+
+    static int GetInt(byte[] b, int off) {
+        return (b[off] & 255) | ((b[off + 1] & 255) << 8)
+            | ((b[off + 2] & 255) << 16) | ((b[off + 3] & 255) << 24);
+    }
+
+    static int FirstInt(string line) {
+        int i = 0;
+        while (i < line.Length) {
+            int c = line[i] & 255;
+            if (c >= 48 && c <= 57) {
+                int v = 0;
+                while (i < line.Length && (line[i] & 255) >= 48
+                       && (line[i] & 255) <= 57) {
+                    v = v * 10 + ((line[i] & 255) - 48);
+                    i = i + 1;
+                }
+                return v;
+            }
+            i = i + 1;
+        }
+        return 0;
+    }
+    #endif
 
     #if WINDOWS
     /// 用 GetDIBits 将选中的位图读入自上而下的 BGRA 字节数组。
@@ -195,6 +383,7 @@ class Screen {
         NativeMemory.Free(bmi);
         return px;
     }
+    #endif
 
     /// 将 32 位 BGRA 像素缓冲写入自下而上 (bottom-up) 的 BMP 文件。
     static bool WriteBmp(string path, byte[] px, int w, int h) {
@@ -224,11 +413,8 @@ class Screen {
             dst = dst + stride;
             row = row - 1;
         }
-        nint fp = Screen.PlatFopen(path, "wb");
-        if (fp == 0) { return false; }
-        long n = Screen.PlatFwrite(bmp, 1, fileSize, fp);
-        Screen.PlatFclose(fp);
-        return n == fileSize;
+        File.WriteAllBytes(path, bmp);
+        return File.Exists(path);
     }
 
     static void PutInt(byte[] b, int off, int v) {
@@ -237,5 +423,4 @@ class Screen {
         b[off + 2] = (byte)((v >> 16) & 255);
         b[off + 3] = (byte)((v >> 24) & 255);
     }
-    #endif
 }

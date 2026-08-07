@@ -16,15 +16,27 @@ namespace System.Text.RegularExpressions;
 /// 需要时再让出；其惰性 `?` 形式
 /// 则相反。
 ///
-/// 支持的语法：字面量、`.`、字符类 `[a-z]` / `[^a-z]`，类内可用 `\d \w \s`
-/// 简写；另有 `\d \D \w \W \s \S \b \B`、元字符转义、
-/// 分组 `( )` 与非捕获组 `(?: )`、交替 `|`、
-/// 量词 `* + ? {n} {n,} {n,m}`（均有惰性形式）、锚点
-/// `^ $`（在行边界也可匹配）以及反向引用 `\1`-`\9`。
+/// 匹配以 **UTF-8 码点** 为单位：`.` 吃掉整个字符（"中" 而不是它的
+/// 第一个字节），字符类里可以直接写非 ASCII 字符（`[中文]`）。
 ///
-/// 格式错误的模式在编译期抛出异常。为避免病态模式
-/// 失控，匹配器设有步骤预算：耗尽后
-/// 本次尝试报告"无匹配"，而不是卡死。
+/// 支持的语法：字面量、`.`、字符类 `[a-z]` / `[^a-z]`（类内可用
+/// `\d \D \w \W \s \S` 与 POSIX `[[:digit:]]` 等）、
+/// `\d \D \w \W \s \S \b \B \A \z \Z \G`、
+/// 转义 `\n \r \t \f \v \a \e \0 \xHH \x{...} \uXXXX \cX`、
+/// 分组 `( )` `(?: )` `(?&lt;name&gt; )`、原子组 `(?&gt; )`、注释 `(?# )`、
+/// 环视 `(?= ) (?! ) (?&lt;= ) (?&lt;! )`（回顾须定长）、交替 `|`、
+/// 量词 `* + ? {n} {n,} {n,m}`（均有惰性形式）、锚点 `^ $`、
+/// 反向引用 `\1`-`\99` 与 `\k&lt;name&gt;`，以及只能写在模式开头的
+/// 内联标志 `(?i)`（ASCII 大小写）、`(?m)`（`^ $` 匹配行边界）、
+/// `(?s)`（`.` 也匹配换行）。
+///
+/// 大小写折叠与 `\d \w \s` 都只覆盖 ASCII；`\p{...}`、占有量词、
+/// 八进制转义、作用域内联标志 `(?i:...)` 等未实现的语法在
+/// **编译期报错**，不会被当成普通字符"接受但永不匹配"。
+///
+/// 格式错误的模式在编译期抛出 ArgumentException。为避免病态模式
+/// 失控，匹配器设有回溯步骤预算：耗尽时抛出
+/// <see cref="RegexBudgetException"/>，而不是把超时伪装成"无匹配"。
 /// </summary>
 class Regex {
     RegexProgram prog;
@@ -72,6 +84,12 @@ class Regex {
     /// <summary>捕获组数量，含组 0。</summary>
     int GroupCount() { return this.prog.GroupCount(); }
 
+    /// <summary>命名组 `name` 的组号，没有该名字时返回 -1。</summary>
+    int GroupNumber(string name) { return this.prog.GroupNumber(name); }
+
+    /// <summary>所有命名组的名字。</summary>
+    List<string> GroupNames() { return this.prog.GroupNames(); }
+
     /// <summary>模式在 `input` 任意位置匹配时返回 true。</summary>
     bool IsMatch(string input) {
         return this.FindFrom(input, 0).Success();
@@ -92,42 +110,77 @@ class Regex {
             NativeMemory.PutString(buf, 0, input, len);
         }
         List<int> caps = new List<int>();
-        Match result = Match.Failure();
+        int rc = this.ScanFrom(buf, len, start, caps);
+        NativeMemory.Free(buf);
+        buf = 0;
+        if (rc == -2) { this.Overflow(start); }
+        if (rc < 0) { return Match.Failure(); }
+        return Match.FromCaps(input, caps, this.prog.GroupCount());
+    }
+
+    /// <summary>在已经准备好的字节缓冲区上从 `start` 起找最左匹配。
+    /// 返回 0 表示成功（`caps` 已填好），-1 无匹配，-2 预算耗尽。
+    /// Matches/Replace 共用同一个缓冲区，避免每找到一个匹配就把整个
+    /// 输入重新分配加拷贝一遍（原先是 O(n²)）。</summary>
+    int ScanFrom(nint buf, int len, int start, List<int> caps) {
         int at = start;
         bool done = false;
         while (!done) {
-            if (this.prog.RunAt(buf, len, at, caps) >= 0) {
-                result = Match.FromCaps(input, caps, this.prog.GroupCount());
-                done = true;
-            } else if (at >= len) {
+            int end = this.prog.RunAt(buf, len, at, start, caps);
+            if (end == -2) { return -2; }
+            if (end >= 0) { return 0; }
+            if (at >= len) {
                 done = true;
             } else {
-                at = at + 1;
+                at = at + RegexProgram.StepWidth(buf, len, at);
             }
         }
-        NativeMemory.Free(buf);
-        return result;
+        return -1;
     }
 
-    /// <summary>从左到右的所有不重叠匹配。空匹配
-    /// 会前进一个字节，保证扫描必然终止。</summary>
+    /// <summary>回溯预算耗尽：把它作为错误报出去，调用方才能
+    /// 区分"这个模式在这段输入上代价失控"和"确实没有匹配"。</summary>
+    void Overflow(int start) {
+        throw new RegexBudgetException("regular expression '" + this.pattern
+            + "' exhausted its backtracking budget at offset " + start);
+    }
+
+    /// <summary>从左到右的所有不重叠匹配。空匹配会前进一个码点，
+    /// 保证扫描必然终止。</summary>
     List<Match> Matches(string input) {
         List<Match> all = new List<Match>();
-        int at = 0;
         int len = input.Length;
+        nint buf = NativeMemory.Alloc(len + 1);
+        if (len > 0) {
+            NativeMemory.PutString(buf, 0, input, len);
+        }
+        List<int> caps = new List<int>();
+        int at = 0;
         bool done = false;
+        bool overflow = false;
+        int overflowAt = 0;
         while (!done) {
-            Match m = this.FindFrom(input, at);
-            if (!m.Success()) {
+            int rc = this.ScanFrom(buf, len, at, caps);
+            if (rc == -2) {
+                overflow = true;
+                overflowAt = at;
+                done = true;
+            } else if (rc < 0) {
                 done = true;
             } else {
+                Match m = Match.FromCaps(input, caps, this.prog.GroupCount());
                 all.Add(m);
                 int next = m.Index() + m.Length();
-                if (m.Length() == 0) { next = next + 1; }
+                if (m.Length() == 0) {
+                    next = next + RegexProgram.StepWidth(buf, len, next);
+                }
                 at = next;
                 if (at > len) { done = true; }
             }
         }
+        NativeMemory.Free(buf);
+        buf = 0;
+        if (overflow) { this.Overflow(overflowAt); }
         return all;
     }
 
@@ -136,8 +189,8 @@ class Regex {
         return this.Matches(input).Count;
     }
 
-    /// <summary>替换所有匹配。`replacement` 中的 `$0`-`$9`
-    /// 代表匹配文本和捕获组，`$$` 表示字面量 '$'。</summary>
+    /// <summary>替换所有匹配。`replacement` 里 `$1` / `${1}` /
+    /// `${name}` 是捕获组，`$&amp;` 是整个匹配，`$$` 是字面量 '$'。</summary>
     string Replace(string input, string replacement) {
         List<Match> all = this.Matches(input);
         StringBuilder sb = new StringBuilder();
@@ -147,7 +200,7 @@ class Regex {
             if (m.Index() > at) {
                 sb.Append(input.Substring(at, m.Index() - at));
             }
-            sb.Append(Regex.Expand(replacement, m));
+            sb.Append(this.ExpandFor(replacement, m));
             at = m.Index() + m.Length();
         }
         if (at < input.Length) {
@@ -162,7 +215,7 @@ class Regex {
         if (!m.Success()) { return input; }
         StringBuilder sb = new StringBuilder();
         sb.Append(input.Substring(0, m.Index()));
-        sb.Append(Regex.Expand(replacement, m));
+        sb.Append(this.ExpandFor(replacement, m));
         int at = m.Index() + m.Length();
         if (at < input.Length) {
             sb.Append(input.Substring(at, input.Length - at));
@@ -170,30 +223,84 @@ class Regex {
         return sb.ToString();
     }
 
-    /// <summary>在替换字符串中替换 `$0`-`$9` 与 `$$`。</summary>
-    static string Expand(string replacement, Match m) {
+    /// <summary>在替换字符串中展开 `$1` / `${12}` / `${name}` /
+    /// `$&amp;` / `$$`。无法解析的 `$` 原样保留。</summary>
+    string ExpandFor(string replacement, Match m) {
         StringBuilder sb = new StringBuilder();
         int i = 0;
-        while (i < replacement.Length) {
+        int n = replacement.Length;
+        while (i < n) {
             string c = replacement.Substring(i, 1);
-            if (c == "$" && i + 1 < replacement.Length) {
-                string d = replacement.Substring(i + 1, 1);
-                if (d == "$") {
-                    sb.Append("$");
-                    i = i + 2;
-                } else if (Regex.IsDigit(d)) {
-                    sb.Append(m.Group(Regex.DigitValue(d)));
-                    i = i + 2;
-                } else {
+            if (c != "$" || i + 1 >= n) {
+                sb.Append(c);
+                i = i + 1;
+                continue;
+            }
+            string d = replacement.Substring(i + 1, 1);
+            if (d == "$") {
+                sb.Append("$");
+                i = i + 2;
+            } else if (d == "&") {
+                sb.Append(m.Group(0));
+                i = i + 2;
+            } else if (d == "{") {
+                int close = -1;
+                for (int k = i + 2; k < n; k = k + 1) {
+                    if (replacement.Substring(k, 1) == "}") {
+                        close = k;
+                        break;
+                    }
+                }
+                if (close < 0) {
                     sb.Append(c);
                     i = i + 1;
+                } else {
+                    string body = replacement.Substring(i + 2, close - i - 2);
+                    int gi = this.RefNumber(body);
+                    if (gi < 0) {
+                        // 既不是组号也不是组名：整段原样输出，替换串里的
+                        // 拼写错误不该被悄悄吃掉
+                        sb.Append(replacement.Substring(i, close - i + 1));
+                    } else {
+                        sb.Append(m.Group(gi));
+                    }
+                    i = close + 1;
                 }
+            } else if (Regex.IsDigit(d)) {
+                int gi = Regex.DigitValue(d);
+                int j = i + 2;
+                while (j < n && Regex.IsDigit(replacement.Substring(j, 1))
+                       && gi * 10 + Regex.DigitValue(replacement.Substring(j, 1))
+                          < this.prog.GroupCount()) {
+                    gi = gi * 10 + Regex.DigitValue(replacement.Substring(j, 1));
+                    j = j + 1;
+                }
+                sb.Append(m.Group(gi));
+                i = j;
             } else {
                 sb.Append(c);
                 i = i + 1;
             }
         }
         return sb.ToString();
+    }
+
+    /// <summary>`${...}` 里的组号或组名对应的组号，无法解析时 -1。</summary>
+    int RefNumber(string body) {
+        if (body.Length == 0) { return -1; }
+        bool digits = true;
+        for (int i = 0; i < body.Length; i = i + 1) {
+            if (!Regex.IsDigit(body.Substring(i, 1))) { digits = false; }
+        }
+        if (digits) {
+            int v = 0;
+            for (int i = 0; i < body.Length; i = i + 1) {
+                v = v * 10 + Regex.DigitValue(body.Substring(i, 1));
+            }
+            if (v >= this.prog.GroupCount()) { return -1; }
+            return v;
+        }
+        return this.prog.GroupNumber(body);
     }
 
     static int DigitValue(string d) {
@@ -239,7 +346,7 @@ class Regex {
     /// <summary>转义 `text` 中的元字符，使其
     /// 按字面匹配。</summary>
     static string Escape(string text) {
-        string meta = "\\.^$|()[]{}*+?";
+        string meta = "\\.^$|()[]{}*+?-#";
         StringBuilder sb = new StringBuilder();
         for (int i = 0; i < text.Length; i = i + 1) {
             string c = text.Substring(i, 1);

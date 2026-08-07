@@ -301,10 +301,24 @@ class HttpServer {
             }
             response = response.SetKeepAlive(keepAlive);
 
-            string responseData = response.Build();
+            // 按字节长度发送：SendAsync 用 strlen 定长，正文里的 NUL
+            // 会把响应截断（下载二进制文件、返回带 NUL 的日志片段时
+            // 客户端只收到半个报文）。Content-Length 与发送长度必须
+            // 取自同一处（BodyLength）。二进制正文单独发一次，因为它
+            // 无法拼进以 NUL 结尾的字符串里。
+            if (response.IsBinary()) {
+                string head = response.BuildHeaders();
+                int _h2 = await client.SendBytesAsync(head, head.Length);
+                int blen = response.BodyLength();
+                if (blen > 0) {
+                    int _b2 = await client.SendBytesAsync(response.bodyBytes, blen);
+                }
+            } else {
+                string responseData = response.Build();
+                int _sent = await client.SendBytesAsync(responseData, responseData.Length);
+            }
             response.Dispose();
             response = null;
-            int _sent = await client.SendAsync(responseData);
             Worker.BumpSent();
 
             if (!keepAlive) {

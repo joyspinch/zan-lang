@@ -1,4 +1,5 @@
 using System;
+using System.Diagnostics;
 
 namespace System.Management;
 
@@ -11,6 +12,11 @@ class DisplayInfo {
     public string name;
     public int width;
     public int height;
+    /// 该显示器在虚拟桌面里的左上角坐标。
+    public int x;
+    public int y;
+    /// 是否为主显示器。
+    public bool primary;
     /// 刷新率（Hz；未知时为 0）。
     public int refreshHz;
     /// 颜色深度（每像素位数；未知时为 0）。
@@ -19,8 +25,10 @@ class DisplayInfo {
 
 /// <summary>
 /// 显示器拓扑。Windows 通过 GetSystemMetrics 查询主屏，
-/// 并通过 EnumDisplayMonitors/EnumDisplaySettingsW 查询每台显示器；
-/// 其他平台返回 0/空值而不抛异常。
+/// 并通过 EnumDisplayMonitors/EnumDisplaySettingsW 查询每台显示器。
+/// Linux 读 xrandr（X11）或 wlr-randr / swaymsg（wlroots 系 Wayland），
+/// macOS 读 system_profiler。拿不到拓扑时返回 0/空值而不抛异常：
+/// 布局代码更希望拿到一个可回退的值。
 /// </summary>
 class Display {
     /// <summary>主屏宽度（像素）。</summary>
@@ -28,7 +36,9 @@ class Display {
         #if WINDOWS
         return Display.WinGetSystemMetrics(0);
         #else
-        return 0;
+        DisplayInfo d = Display.Primary();
+        if (d == null) { return 0; }
+        return d.width;
         #endif
     }
 
@@ -37,7 +47,9 @@ class Display {
         #if WINDOWS
         return Display.WinGetSystemMetrics(1);
         #else
-        return 0;
+        DisplayInfo d = Display.Primary();
+        if (d == null) { return 0; }
+        return d.height;
         #endif
     }
 
@@ -46,7 +58,9 @@ class Display {
         #if WINDOWS
         return Display.WinMode(0xFFFFFFFF /*ENUM_CURRENT_SETTINGS*/, 184);
         #else
-        return 0;
+        DisplayInfo d = Display.Primary();
+        if (d == null) { return 0; }
+        return d.refreshHz;
         #endif
     }
 
@@ -54,9 +68,29 @@ class Display {
     static int ColorDepth() {
         #if WINDOWS
         return Display.WinMode(0xFFFFFFFF /*ENUM_CURRENT_SETTINGS*/, 168);
+        #elif LINUX
+        // xdpyinfo: "  depth of root window:    24 planes"
+        ProcessResult r = Process.Capture("xdpyinfo 2>/dev/null");
+        for (int i = 0; i < r.lines.Count; i = i + 1) {
+            string line = r.lines[i];
+            if (line.IndexOf("depth of root window") >= 0) {
+                return Display.FirstInt(line);
+            }
+        }
+        return 0;
         #else
         return 0;
         #endif
+    }
+
+    /// <summary>主显示器；拿不到拓扑时为 null。</summary>
+    static DisplayInfo Primary() {
+        List<DisplayInfo> all = Display.Monitors();
+        for (int i = 0; i < all.Count; i = i + 1) {
+            if (all[i].primary) { return all[i]; }
+        }
+        if (all.Count > 0) { return all[0]; }
+        return null;
     }
 
     /// <summary>所有显示器（索引 0 = 主屏）。枚举不可用时
@@ -67,9 +101,194 @@ class Display {
         Display.monitorResults = list;
         Display.monitorProc = Display.WinMonitorProc;
         Display.WinEnumDisplayMonitors(0, 0, Display.monitorProc, 0);
+        #elif MACOS
+        // system_profiler 报告的是“Resolution: 2560 x 1440”这种行，
+        // 没有位置信息；没有位置就保持 0/0 而不编一个
+        ProcessResult r = Process.Capture("system_profiler SPDisplaysDataType 2>/dev/null");
+        for (int i = 0; i < r.lines.Count; i = i + 1) {
+            string line = r.lines[i];
+            if (line.IndexOf("Resolution:") < 0) { continue; }
+            List<int> nums = Display.Ints(line);
+            if (nums.Count < 2) { continue; }
+            DisplayInfo d = new DisplayInfo();
+            d.index = list.Count;
+            d.name = "Display " + Convert.ToString(list.Count);
+            d.width = nums[0];
+            d.height = nums[1];
+            d.primary = list.Count == 0;
+            list.Add(d);
+        }
+        #else
+        Display.ReadXrandr(list);
+        if (list.Count == 0) { Display.ReadWlrRandr(list); }
+        if (list.Count == 0) { Display.ReadXdpyinfo(list); }
         #endif
         return list;
     }
+
+    #if !WINDOWS
+    /// xrandr --current 里的已连接输出：
+    ///   eDP-1 connected primary 1920x1080+0+0 (normal ...) 344mm x 193mm
+    ///      1920x1080     60.02*+  59.97
+    /// 带 '*' 的那行是当前模式，刷新率从那里取。
+    static void ReadXrandr(List<DisplayInfo> list) {
+        ProcessResult r = Process.Capture("xrandr --current 2>/dev/null");
+        if (!r.Ok() || r.lines == null) { return; }
+        DisplayInfo cur = null;
+        for (int i = 0; i < r.lines.Count; i = i + 1) {
+            string line = r.lines[i];
+            if (line.StartsWith(" ") || line.StartsWith("\t")) {
+                // 模式行：带 '*' 则为当前模式
+                if (cur != null && line.IndexOf("*") >= 0) {
+                    cur.refreshHz = Display.RateOf(line);
+                }
+                continue;
+            }
+            if (line.IndexOf(" connected") < 0) { continue; }
+            if (line.IndexOf(" disconnected") >= 0) { continue; }
+            int sp = line.IndexOf(" ");
+            if (sp <= 0) { continue; }
+            DisplayInfo d = new DisplayInfo();
+            d.index = list.Count;
+            d.name = line.Substring(0, sp);
+            d.primary = line.IndexOf(" primary") >= 0;
+            if (!Display.Geometry(line, d)) { continue; }
+            list.Add(d);
+            cur = d;
+        }
+    }
+
+    /// wlr-randr（wlroots 系 Wayland）的输出：
+    ///   DP-1 "..."
+    ///     Position: 0,0
+    ///     Enabled: yes
+    ///     Modes:
+    ///       1920x1080 px, 60.000000 Hz (current)
+    static void ReadWlrRandr(List<DisplayInfo> list) {
+        ProcessResult r = Process.Capture("wlr-randr 2>/dev/null");
+        if (!r.Ok() || r.lines == null) { return; }
+        DisplayInfo cur = null;
+        for (int i = 0; i < r.lines.Count; i = i + 1) {
+            string line = r.lines[i];
+            if (!(line.StartsWith(" ") || line.StartsWith("\t"))) {
+                int sp = line.IndexOf(" ");
+                cur = new DisplayInfo();
+                cur.index = list.Count;
+                cur.name = sp > 0 ? line.Substring(0, sp) : line.Trim();
+                cur.primary = list.Count == 0;
+                list.Add(cur);
+                continue;
+            }
+            if (cur == null) { continue; }
+            string t = line.Trim();
+            if (t.StartsWith("Position:")) {
+                List<int> nums = Display.Ints(t);
+                if (nums.Count >= 2) { cur.x = nums[0]; cur.y = nums[1]; }
+            } else if (t.IndexOf("(current)") >= 0) {
+                List<int> nums = Display.Ints(t);
+                if (nums.Count >= 2) { cur.width = nums[0]; cur.height = nums[1]; }
+                cur.refreshHz = Display.RateOf(t);
+            }
+        }
+    }
+
+    /// 没有 xrandr 时的下限：xdpyinfo 至少给出整个屏幕的尺寸。
+    static void ReadXdpyinfo(List<DisplayInfo> list) {
+        ProcessResult r = Process.Capture("xdpyinfo 2>/dev/null");
+        if (!r.Ok() || r.lines == null) { return; }
+        for (int i = 0; i < r.lines.Count; i = i + 1) {
+            string line = r.lines[i];
+            if (line.IndexOf("dimensions:") < 0) { continue; }
+            List<int> nums = Display.Ints(line);
+            if (nums.Count < 2) { continue; }
+            DisplayInfo d = new DisplayInfo();
+            d.index = 0;
+            d.name = "screen";
+            d.width = nums[0];
+            d.height = nums[1];
+            d.primary = true;
+            list.Add(d);
+            return;
+        }
+    }
+
+    /// 从 "1920x1080+0+0" 取尺寸与位置；没有几何信息（输出已连接但未启用）
+    /// 时返回 false。
+    static bool Geometry(string line, DisplayInfo d) {
+        for (int i = 0; i < line.Length; i = i + 1) {
+            if (line[i] != 120) { continue; }        // 'x'
+            if (i == 0 || !Display.IsDigit(line[i - 1] & 255)) { continue; }
+            if (i + 1 >= line.Length || !Display.IsDigit(line[i + 1] & 255)) { continue; }
+            // 回头找宽度的起点
+            int s = i - 1;
+            while (s > 0 && Display.IsDigit(line[s - 1] & 255)) { s = s - 1; }
+            // 一定要是带位置的几何串（WxH+X+Y），不能是尾部的物理尺寸
+            List<int> nums = Display.Ints(line.Substring(s, line.Length - s));
+            if (nums.Count < 4) { continue; }
+            if (line.Substring(s, line.Length - s).IndexOf("+") < 0) { continue; }
+            d.width = nums[0];
+            d.height = nums[1];
+            d.x = nums[2];
+            d.y = nums[3];
+            return true;
+        }
+        return false;
+    }
+
+    /// 一行里的刷新率（四舍五入到整数 Hz；拿不到时为 0）。
+    static int RateOf(string line) {
+        // "60.02*+" / "60.000000 Hz (current)"
+        int i = 0;
+        while (i < line.Length) {
+            if (Display.IsDigit(line[i] & 255)) {
+                int s = i;
+                while (i < line.Length && Display.IsDigit(line[i] & 255)) { i = i + 1; }
+                int whole = Convert.ToInt(line.Substring(s, i - s));
+                int frac = 0;
+                if (i < line.Length && line[i] == 46) {   // '.'
+                    i = i + 1;
+                    if (i < line.Length && Display.IsDigit(line[i] & 255)) {
+                        frac = (line[i] & 255) - 48;
+                    }
+                    while (i < line.Length && Display.IsDigit(line[i] & 255)) {
+                        i = i + 1;
+                    }
+                    if (frac >= 5) { whole = whole + 1; }
+                    return whole;
+                }
+                // 没有小数部分的整数不是刷新率（那是模式宽度）
+                if (i < line.Length && line[i] == 120) { i = i + 1; }   // 'x'
+            } else {
+                i = i + 1;
+            }
+        }
+        return 0;
+    }
+
+    static bool IsDigit(int c) { return c >= 48 && c <= 57; }
+
+    /// 一行里的所有十进制整数（按出现顺序）。
+    static List<int> Ints(string line) {
+        List<int> nums = new List<int>();
+        int i = 0;
+        while (i < line.Length) {
+            if (Display.IsDigit(line[i] & 255)) {
+                int s = i;
+                while (i < line.Length && Display.IsDigit(line[i] & 255)) { i = i + 1; }
+                nums.Add(Convert.ToInt(line.Substring(s, i - s)));
+            } else {
+                i = i + 1;
+            }
+        }
+        return nums;
+    }
+
+    static int FirstInt(string line) {
+        List<int> nums = Display.Ints(line);
+        if (nums.Count == 0) { return 0; }
+        return nums[0];
+    }
+    #endif
 
     #if WINDOWS
     [DllImport("user32", EntryPoint = "GetSystemMetrics")]

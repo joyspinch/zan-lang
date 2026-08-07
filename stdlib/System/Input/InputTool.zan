@@ -1,0 +1,177 @@
+using System;
+using System.Diagnostics;
+using System.IO;
+using System.Text;
+
+namespace System.Input;
+
+/// <summary>
+/// POSIX 输入注入后端：把 VK 码/文本翻译成平台工具能懂的形式。
+///
+/// X11 下用 xdotool（走 XTEST，和物理设备同一条路径），macOS 走
+/// System Events（osascript）、鼠标需要 cliclick。纯 Wayland 下合成器
+/// 不接受任意客户端注入事件，而基于 uinput 的 ydotool 用的是 Linux 输入
+/// 子系统的 keycode、不是 keysym，映射不能直接复用，因此目前明确不支持
+/// ——伪装成功会让自动化脚本对着一个什么都没发生的桌面继续跑。
+///
+/// 所有要注入的文本都写进临时 AppleScript/参数文件而不拼进命令行，
+/// 因此文本里的引号和 shell 元字符不会被解释。
+/// </summary>
+class InputTool {
+    static int None() { return 0; }
+    static int Xdotool() { return 1; }
+    static int MacOs() { return 3; }
+
+    static bool Have(string tool) {
+        return Process.Capture("command -v " + tool + " >/dev/null 2>&1").Ok();
+    }
+
+    /// <summary>本机可用的注入后端。</summary>
+    static int Kind() {
+        #if WINDOWS
+        return InputTool.None();
+        #elif MACOS
+        return InputTool.MacOs();
+        #else
+        // 纯 Wayland 下 DISPLAY 为空；有 XWayland 时 xdotool 仍能驱动 X 客户端
+        if (ProcessHost.Env("DISPLAY").Length > 0 && InputTool.Have("xdotool")) {
+            return InputTool.Xdotool();
+        }
+        return InputTool.None();
+        #endif
+    }
+
+    /// <summary>没有可用后端时抛出，附带该平台的安装提示。</summary>
+    static void Missing(string what) {
+        #if MACOS
+        throw new PlatformNotSupportedException(
+            what + " needs osascript/System Events (and cliclick for the "
+            + "mouse), plus Accessibility permission for this process");
+        #else
+        throw new PlatformNotSupportedException(
+            what + " needs xdotool on an X11 (or XWayland) display; a "
+            + "Wayland-native compositor does not accept injected events");
+        #endif
+    }
+
+    /// <summary>跑一条后端命令；命令由本文件拼装，不含外部文本。</summary>
+    static bool Run(string cmd) {
+        return Process.Run(cmd + " >/dev/null 2>&1") == 0;
+    }
+
+    /// <summary>把 AppleScript 写进临时文件后执行——脚本正文不进命令行。</summary>
+    static bool Osa(string script) {
+        string tmp = Path.GetTempPath() + "zan_input_"
+            + Convert.ToString(ProcessHost.Pid()) + ".applescript";
+        File.WriteAllText(tmp, script);
+        int rc = Process.Run("osascript '" + tmp + "' >/dev/null 2>&1");
+        File.Delete(tmp);
+        return rc == 0;
+    }
+
+    /// <summary>Windows VK 码 -> X11 keysym 名（xdotool/ydotool 的 key 名）。
+    /// 不认识的码返回 ""，调用方据此明确报错而不是发一个错的键。</summary>
+    static string Keysym(int vk) {
+        if (vk >= 0x41 && vk <= 0x5A) {                 // A-Z
+            return InputTool.Ascii(vk + 0x20);          // xdotool 用小写字母名
+        }
+        if (vk >= 0x30 && vk <= 0x39) { return InputTool.Ascii(vk); }   // 0-9
+        if (vk >= 0x70 && vk <= 0x87) {                 // F1..F24
+            return "F" + Convert.ToString(vk - 0x6F);
+        }
+        if (vk == 0x11) { return "ctrl"; }
+        if (vk == 0x10) { return "shift"; }
+        if (vk == 0x12) { return "alt"; }
+        if (vk == 0x5B) { return "super"; }
+        if (vk == 0x0D) { return "Return"; }
+        if (vk == 0x1B) { return "Escape"; }
+        if (vk == 0x09) { return "Tab"; }
+        if (vk == 0x08) { return "BackSpace"; }
+        if (vk == 0x20) { return "space"; }
+        if (vk == 0x2E) { return "Delete"; }
+        if (vk == 0x2D) { return "Insert"; }
+        if (vk == 0x24) { return "Home"; }
+        if (vk == 0x23) { return "End"; }
+        if (vk == 0x21) { return "Prior"; }
+        if (vk == 0x22) { return "Next"; }
+        if (vk == 0x26) { return "Up"; }
+        if (vk == 0x28) { return "Down"; }
+        if (vk == 0x25) { return "Left"; }
+        if (vk == 0x27) { return "Right"; }
+        if (vk == 0x14) { return "Caps_Lock"; }
+        if (vk == 0x90) { return "Num_Lock"; }
+        if (vk == 0x91) { return "Scroll_Lock"; }
+        return "";
+    }
+
+    /// <summary>Windows VK 码 -> macOS 虚拟键码（System Events 的 key code）；
+    /// 不认识返回 -1。</summary>
+    static int MacKeyCode(int vk) {
+        if (vk >= 0x41 && vk <= 0x5A) {
+            // 字母的键码不连续，直接查表
+            int[] map = InputTool.LetterCodes();
+            return map[vk - 0x41];
+        }
+        if (vk >= 0x30 && vk <= 0x39) {
+            int[] d = InputTool.DigitCodes();
+            return d[vk - 0x30];
+        }
+        if (vk >= 0x70 && vk <= 0x7B) {   // F1..F12
+            int[] f = InputTool.FnCodes();
+            return f[vk - 0x70];
+        }
+        if (vk == 0x0D) { return 36; }    // Return
+        if (vk == 0x09) { return 48; }    // Tab
+        if (vk == 0x20) { return 49; }    // Space
+        if (vk == 0x08) { return 51; }    // Delete（退格）
+        if (vk == 0x1B) { return 53; }    // Escape
+        if (vk == 0x2E) { return 117; }   // Forward delete
+        if (vk == 0x24) { return 115; }   // Home
+        if (vk == 0x23) { return 119; }   // End
+        if (vk == 0x21) { return 116; }   // Page up
+        if (vk == 0x22) { return 121; }   // Page down
+        if (vk == 0x25) { return 123; }
+        if (vk == 0x27) { return 124; }
+        if (vk == 0x28) { return 125; }
+        if (vk == 0x26) { return 126; }
+        return -1;
+    }
+
+    /// <summary>System Events 的修饰键名；不是修饰键返回 ""。</summary>
+    static string MacModifier(int vk) {
+        if (vk == 0x11) { return "control down"; }
+        if (vk == 0x10) { return "shift down"; }
+        if (vk == 0x12) { return "option down"; }
+        if (vk == 0x5B) { return "command down"; }
+        return "";
+    }
+
+    static int[] LetterCodes() {
+        // A B C D E F G H I J K L M N O P Q R S T U V W X Y Z
+        int[] m = new int[26];
+        m[0] = 0;  m[1] = 11; m[2] = 8;  m[3] = 2;  m[4] = 14; m[5] = 3;
+        m[6] = 5;  m[7] = 4;  m[8] = 34; m[9] = 38; m[10] = 40; m[11] = 37;
+        m[12] = 46; m[13] = 45; m[14] = 31; m[15] = 35; m[16] = 12; m[17] = 15;
+        m[18] = 1;  m[19] = 17; m[20] = 32; m[21] = 9;  m[22] = 13; m[23] = 7;
+        m[24] = 16; m[25] = 6;
+        return m;
+    }
+
+    static int[] DigitCodes() {
+        int[] m = new int[10];
+        m[0] = 29; m[1] = 18; m[2] = 19; m[3] = 20; m[4] = 21;
+        m[5] = 23; m[6] = 22; m[7] = 26; m[8] = 28; m[9] = 25;
+        return m;
+    }
+
+    static int[] FnCodes() {
+        int[] m = new int[12];
+        m[0] = 122; m[1] = 120; m[2] = 99;  m[3] = 118; m[4] = 96; m[5] = 97;
+        m[6] = 98;  m[7] = 100; m[8] = 101; m[9] = 109; m[10] = 103; m[11] = 111;
+        return m;
+    }
+
+    static string Ascii(int code) {
+        return Encoding.CharFromCode(code);
+    }
+}

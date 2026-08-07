@@ -1,0 +1,85 @@
+using System;
+using System.Text;
+using System.Text.RegularExpressions;
+
+/// Regressions for the UTF-8 / syntax gaps the byte-oriented engine had: it
+/// matched single bytes, folded `\D` inside a class into `\d` (inverting the
+/// whole class), silently accepted `(?i)` / lookaround / named groups and then
+/// never matched, and reported a spent backtracking budget as "no match".
+class Program {
+    static string M(string pattern, string input) {
+        string why = Regex.Validate(pattern);
+        if (why.Length > 0) { return "ERR"; }
+        Match m = Regex.Compile(pattern).Find(input);
+        if (!m.Success()) { return "-"; }
+        return m.Group(0);
+    }
+
+    static void Main() {
+        // A class member is a code point, not a byte.
+        Console.WriteLine("dot=" + M(".", "中文"));
+        Console.WriteLine("anchored_dot=" + M("^.$", "中"));
+        Console.WriteLine("class_hit=" + M("[中文]+", "中文"));
+        Console.WriteLine("class_miss=" + M("[中]", "文"));
+        Console.WriteLine("class_range=" + M("[\\u4e00-\\u9fa5]+", "中文abc"));
+        Console.WriteLine("neg_class=" + M("[^a]", "中"));
+        Console.WriteLine("quant=" + M("文{2}", "中文文"));
+
+        // Negated shorthands inside a class no longer invert the class.
+        Console.WriteLine("class_D=" + M("[\\D]", "a") + M("[\\D]", "5"));
+        Console.WriteLine("class_S=" + M("[\\S]", "x") + M("[\\S]", " "));
+        Console.WriteLine("class_mixed=" + M("[\\Dx]", "5x"));
+
+        // Escapes.
+        Console.WriteLine("hex=" + M("\\x41", "A") + M("\\x{4e2d}", "中")
+            + M("\\u4e2d", "中"));
+        Console.WriteLine("ctrl=" + Convert.ToString(
+            M("\\cA", Encoding.CharFromCode(1)).Length)
+            + Convert.ToString(M("\\a", Encoding.CharFromCode(7)).Length));
+
+        // Anchors.
+        Console.WriteLine("bos=" + M("\\Aab", "ab") + M("a\\Ab", "ab"));
+        Console.WriteLine("eos=" + M("ab\\z", "ab\n") + M("ab\\Z", "ab\n"));
+
+        // Inline flags at the start of the pattern.
+        Console.WriteLine("flag_i=" + M("(?i)ab", "AB") + M("(?i)[a-z]+", "ABC"));
+        Console.WriteLine("flag_s=" + Convert.ToString(M("(?s)a.b", "a\nb").Length)
+            + Convert.ToString(M("a.b", "a\nb").Length));
+        Console.WriteLine("flag_m=" + M("(?m)^b", "a\nb"));
+
+        // Lookaround, named groups, atomic groups, comments.
+        Console.WriteLine("look=" + M("a(?=b)", "ab") + M("a(?!b)", "ac"));
+        Console.WriteLine("behind=" + M("(?<=ab)c", "abc") + M("(?<!x)c", "abc"));
+        Console.WriteLine("named=" + M("(?<w>\\d+)", "42") + M("(?<c>\\w)\\k<c>", "aa"));
+        Console.WriteLine("atomic=" + M("(?>ab|a)b", "ab") + M("(?>a)b", "ab"));
+        Console.WriteLine("comment=" + M("a(?#skipped)b", "ab"));
+        Regex named = Regex.Compile("(?<k>\\w+)=(?<v>\\d+)");
+        Console.WriteLine("group_number=" + Convert.ToString(named.GroupNumber("v"))
+            + Convert.ToString(named.GroupNumber("nope")));
+
+        // POSIX classes.
+        Console.WriteLine("posix=" + M("[[:digit:]]+", "42") + M("[[:alpha:]]+", "ab1"));
+
+        // Empty loops terminate and still match.
+        Console.WriteLine("empty_loop=" + M("(a*)*b", "aaab") + M("(a?)*b", "b")
+            + M("()*a", "a"));
+
+        // Replacement syntax.
+        Regex kv = Regex.Compile("(\\w+)=(\\d+)");
+        Console.WriteLine("braced=" + kv.Replace("port=8080", "${2}:${1}"));
+        Console.WriteLine("amp=" + kv.Replace("port=8080", "[$&]"));
+        Console.WriteLine("by_name=" + named.Replace("port=8080", "${v}/${k}"));
+        Console.WriteLine("bad_ref=" + kv.Replace("port=8080", "${9}"));
+
+        // Matches() steps by code point, so an empty pattern lands on
+        // character boundaries only.
+        Console.WriteLine("empty_steps="
+            + Convert.ToString(Regex.Compile("").Matches("中a").Count));
+
+        // Unsupported syntax is a compile error instead of a pattern that can
+        // never match.
+        Console.WriteLine("rejected=" + M("\\p{L}", "a") + M("a++", "a")
+            + M("(?i:ab)", "AB") + M("\\101", "A") + M("(?<=a+)c", "aac")
+            + M("[[:nope:]]", "a"));
+    }
+}
