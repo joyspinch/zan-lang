@@ -108,88 +108,11 @@ class ReqAgg {
     }
 }
 
-// ---- metrics-snapshot entities -------------------------------------------
-// SnapshotJson is declared as classes and serialized with Json.Serialize<T>;
-// the JSON keys match the documented /admin/stats shape exactly.
-
-class ServerMetricsRequestDoc {
-    long count;
-    long errors;
-    long failed;
-    long rejected;
-    long avg_ms;
-    long max_ms;
-    long slow_threshold_ms;
-    long slow_count;
-}
-
-class ServerMetricsQueryDoc {
-    long count;
-    long avg_ms;
-    long max_ms;
-    long slow_threshold_ms;
-    long slow_count;
-}
-
-class ServerSlowRequestDoc {
-    string req;
-    long ms;
-}
-
-class ServerSlowQueryDoc {
-    string sql;
-    long ms;
-}
-
-/// <summary>One leaderboard row: a normalized statement ranked by total time
-/// spent in it, with the count and per-call average/maximum, so an operator can
-/// see WHICH query shape is costing the most, not just the last slow sample.</summary>
-class ServerTopSqlDoc {
-    string sql;
-    long count;
-    long total_ms;
-    long avg_ms;
-    long max_ms;
-}
-
-/// <summary>One request-leaderboard row: an endpoint ranked by total time
-/// served across all its hits, with count and per-hit average/maximum.</summary>
-class ServerTopReqDoc {
-    string req;
-    long count;
-    long total_ms;
-    long avg_ms;
-    long max_ms;
-    long errors;
-    long failed;
-    long rejected;
-}
-
-/// Load in flight right now: requests being served, the highest that has been,
-/// and the long-lived connections (SSE/WebSocket) currently held open.
-class ServerMetricsLoadDoc {
-    long concurrent;
-    long peak;
-    long streams;
-    long stream_frames;
-    long stream_bytes;
-}
-
-class ServerMetricsDoc {
-    long uptime_ms;
-    long pid;
-    long worker_id;
-    long cpu_ms;
-    long cpu_percent;
-    long mem_rss_bytes;
-    ServerMetricsRequestDoc requests;
-    ServerMetricsQueryDoc queries;
-    ServerMetricsLoadDoc load;
-    List<ServerSlowRequestDoc> slow_requests;
-    List<ServerSlowQueryDoc> slow_queries;
-    List<ServerTopSqlDoc> top_sql;
-    List<ServerTopReqDoc> top_requests;
-}
+// ---- metrics-snapshot JSON ------------------------------------------------
+// SnapshotJson is built straight into JsonValue trees: ServerMetrics sits on
+// the compiler's generator bootstrap path (pulled in through System.IO), so it
+// must not call Json.Serialize<T> -- the keys still match the documented
+// /admin/stats shape exactly.
 
 class ServerMetrics {
     #if WINDOWS
@@ -829,24 +752,23 @@ class ServerMetrics {
     /// <summary>The leaderboard: up to `limit` normalized statements ranked by
     /// total time spent, most expensive first. A selection scan rather than a
     /// sort -- the shape set is small and bounded, and `limit` is tiny.</summary>
-    List<ServerTopSqlDoc> TopSqlDocs(int limit) {
-        List<ServerTopSqlDoc> outp = new List<ServerTopSqlDoc>();
+    JsonValue TopSqlJson(int limit) {
+        JsonValue outp = JsonValue.NewArray();
         List<SqlAgg> pool = new List<SqlAgg>();
         for (int k = 0; k < this.sqlAgg.Count; k = k + 1) { pool.Add(this.sqlAgg[k]); }
-        while (outp.Count < limit && pool.Count > 0) {
+        while (outp.Count() < limit && pool.Count > 0) {
             int best = 0;
             for (int k = 1; k < pool.Count; k = k + 1) {
                 if (pool[k].totalMs > pool[best].totalMs) { best = k; }
             }
             SqlAgg a = pool[best];
-            ServerTopSqlDoc d = new ServerTopSqlDoc();
-            d.sql = a.sql;
-            d.count = a.count;
-            d.total_ms = a.totalMs;
-            d.max_ms = a.maxMs;
-            d.avg_ms = 0;
-            if (a.count > 0) { d.avg_ms = a.totalMs / a.count; }
-            outp.Add(d);
+            JsonValue d = JsonValue.NewObject();
+            d.Put("sql", ServerMetrics.DocStr(a.sql));
+            d.Put("count", ServerMetrics.DocNum(a.count));
+            d.Put("total_ms", ServerMetrics.DocNum(a.totalMs));
+            d.Put("avg_ms", ServerMetrics.DocNum(a.count > 0 ? a.totalMs / a.count : 0));
+            d.Put("max_ms", ServerMetrics.DocNum(a.maxMs));
+            outp.Append(d);
             pool.RemoveAt(best);
         }
         return outp;
@@ -855,52 +777,51 @@ class ServerMetrics {
     /// <summary>The request leaderboard: endpoints ranked by total time served,
     /// highest first, capped at `limit` rows. Selection-sort over a copied pool
     /// (the list is tiny and this avoids mutating the live aggregates).</summary>
-    List<ServerTopReqDoc> TopReqDocs(int limit) {
-        List<ServerTopReqDoc> outp = new List<ServerTopReqDoc>();
+    JsonValue TopReqJson(int limit) {
+        JsonValue outp = JsonValue.NewArray();
         List<ReqAgg> pool = new List<ReqAgg>();
         for (int k = 0; k < this.reqAgg.Count; k = k + 1) {
             pool.Add(this.reqAgg[k]);
         }
-        while (outp.Count < limit && pool.Count > 0) {
+        while (outp.Count() < limit && pool.Count > 0) {
             int best = 0;
             for (int k = 1; k < pool.Count; k = k + 1) {
                 if (pool[k].totalMs > pool[best].totalMs) { best = k; }
             }
             ReqAgg a = pool[best];
-            ServerTopReqDoc d = new ServerTopReqDoc();
-            d.req = a.req;
-            d.count = a.count;
-            d.total_ms = a.totalMs;
-            d.max_ms = a.maxMs;
-            d.errors = a.errors;
-            d.failed = a.failed;
-            d.rejected = a.rejected;
-            d.avg_ms = 0;
-            if (a.count > 0) { d.avg_ms = a.totalMs / a.count; }
-            outp.Add(d);
+            JsonValue d = JsonValue.NewObject();
+            d.Put("req", ServerMetrics.DocStr(a.req));
+            d.Put("count", ServerMetrics.DocNum(a.count));
+            d.Put("total_ms", ServerMetrics.DocNum(a.totalMs));
+            d.Put("avg_ms", ServerMetrics.DocNum(a.count > 0 ? a.totalMs / a.count : 0));
+            d.Put("max_ms", ServerMetrics.DocNum(a.maxMs));
+            d.Put("errors", ServerMetrics.DocNum(a.errors));
+            d.Put("failed", ServerMetrics.DocNum(a.failed));
+            d.Put("rejected", ServerMetrics.DocNum(a.rejected));
+            outp.Append(d);
             pool.RemoveAt(best);
         }
         return outp;
     }
 
-    List<ServerSlowRequestDoc> SlowReqDocs() {
-        List<ServerSlowRequestDoc> outp = new List<ServerSlowRequestDoc>();
+    JsonValue SlowReqJson() {
+        JsonValue outp = JsonValue.NewArray();
         foreach (SlowEntry e in this.slowReqs) {
-            ServerSlowRequestDoc o = new ServerSlowRequestDoc();
-            o.req = e.text;
-            o.ms = e.ms;
-            outp.Add(o);
+            JsonValue o = JsonValue.NewObject();
+            o.Put("req", ServerMetrics.DocStr(e.text));
+            o.Put("ms", ServerMetrics.DocNum(e.ms));
+            outp.Append(o);
         }
         return outp;
     }
 
-    List<ServerSlowQueryDoc> SlowQueryDocs() {
-        List<ServerSlowQueryDoc> outp = new List<ServerSlowQueryDoc>();
+    JsonValue SlowQueryJson() {
+        JsonValue outp = JsonValue.NewArray();
         foreach (SlowEntry e in this.slowQueries) {
-            ServerSlowQueryDoc o = new ServerSlowQueryDoc();
-            o.sql = e.text;
-            o.ms = e.ms;
-            outp.Add(o);
+            JsonValue o = JsonValue.NewObject();
+            o.Put("sql", ServerMetrics.DocStr(e.text));
+            o.Put("ms", ServerMetrics.DocNum(e.ms));
+            outp.Append(o);
         }
         return outp;
     }
@@ -1010,6 +931,14 @@ class ServerMetrics {
     /// <summary>Full metrics snapshot as JSON. Recomputes CPU% from the delta
     /// since the previous snapshot, so poll it on a fixed interval for a
     /// meaningful "cpu_percent".</summary>
+    /// JsonValue leaf builders for the snapshot (number text goes through
+    /// Convert.ToString, exactly like the generated __JsonBind tree writers).
+    static JsonValue DocNum(long v) { return JsonValue.NewNum(Convert.ToString(v)); }
+    static JsonValue DocStr(string s) {
+        if (s == null) { return JsonValue.NewNull(); }
+        return JsonValue.NewStr(s);
+    }
+
     string SnapshotJson() {
         long nowWall = ServerMetrics.MonoMillis();
         long cpuMs = ServerMetrics.CpuMillis();
@@ -1029,44 +958,44 @@ class ServerMetrics {
         long qAvg = 0;
         if (this.queryCount > 0) { qAvg = this.queryTotalMs / this.queryCount; }
 
-        ServerMetricsRequestDoc requests = new ServerMetricsRequestDoc();
-        requests.count = this.reqCount;
-        requests.errors = this.reqErrors;
-        requests.failed = this.reqFailed;
-        requests.rejected = this.reqRejected;
-        requests.avg_ms = reqAvg;
-        requests.max_ms = this.reqMaxMs;
-        requests.slow_threshold_ms = this.slowReqMs;
-        requests.slow_count = this.slowReqs.Count;
+        JsonValue requests = JsonValue.NewObject();
+        requests.Put("count", ServerMetrics.DocNum(this.reqCount));
+        requests.Put("errors", ServerMetrics.DocNum(this.reqErrors));
+        requests.Put("failed", ServerMetrics.DocNum(this.reqFailed));
+        requests.Put("rejected", ServerMetrics.DocNum(this.reqRejected));
+        requests.Put("avg_ms", ServerMetrics.DocNum(reqAvg));
+        requests.Put("max_ms", ServerMetrics.DocNum(this.reqMaxMs));
+        requests.Put("slow_threshold_ms", ServerMetrics.DocNum(this.slowReqMs));
+        requests.Put("slow_count", ServerMetrics.DocNum(this.slowReqs.Count));
 
-        ServerMetricsQueryDoc queries = new ServerMetricsQueryDoc();
-        queries.count = this.queryCount;
-        queries.avg_ms = qAvg;
-        queries.max_ms = this.queryMaxMs;
-        queries.slow_threshold_ms = this.slowQueryMs;
-        queries.slow_count = this.slowQueries.Count;
+        JsonValue queries = JsonValue.NewObject();
+        queries.Put("count", ServerMetrics.DocNum(this.queryCount));
+        queries.Put("avg_ms", ServerMetrics.DocNum(qAvg));
+        queries.Put("max_ms", ServerMetrics.DocNum(this.queryMaxMs));
+        queries.Put("slow_threshold_ms", ServerMetrics.DocNum(this.slowQueryMs));
+        queries.Put("slow_count", ServerMetrics.DocNum(this.slowQueries.Count));
 
-        ServerMetricsLoadDoc load = new ServerMetricsLoadDoc();
-        load.concurrent = this.concurrent;
-        load.peak = this.concurrentPeak;
-        load.streams = this.streams;
-        load.stream_frames = this.streamFrames;
-        load.stream_bytes = this.streamBytes;
+        JsonValue load = JsonValue.NewObject();
+        load.Put("concurrent", ServerMetrics.DocNum(this.concurrent));
+        load.Put("peak", ServerMetrics.DocNum(this.concurrentPeak));
+        load.Put("streams", ServerMetrics.DocNum(this.streams));
+        load.Put("stream_frames", ServerMetrics.DocNum(this.streamFrames));
+        load.Put("stream_bytes", ServerMetrics.DocNum(this.streamBytes));
 
-        ServerMetricsDoc o = new ServerMetricsDoc();
-        o.uptime_ms = uptime;
-        o.pid = ProcessHost.Pid();
-        o.worker_id = ProcessHost.WorkerId();
-        o.cpu_ms = cpuMs;
-        o.cpu_percent = cpuPct;
-        o.mem_rss_bytes = ServerMetrics.MemoryRssBytes();
-        o.requests = requests;
-        o.queries = queries;
-        o.load = load;
-        o.slow_requests = this.SlowReqDocs();
-        o.slow_queries = this.SlowQueryDocs();
-        o.top_sql = this.TopSqlDocs(20);
-        o.top_requests = this.TopReqDocs(20);
-        return Json.Serialize<ServerMetricsDoc>(o);
+        JsonValue o = JsonValue.NewObject();
+        o.Put("uptime_ms", ServerMetrics.DocNum(uptime));
+        o.Put("pid", ServerMetrics.DocNum(ProcessHost.Pid()));
+        o.Put("worker_id", ServerMetrics.DocNum(ProcessHost.WorkerId()));
+        o.Put("cpu_ms", ServerMetrics.DocNum(cpuMs));
+        o.Put("cpu_percent", ServerMetrics.DocNum(cpuPct));
+        o.Put("mem_rss_bytes", ServerMetrics.DocNum(ServerMetrics.MemoryRssBytes()));
+        o.Put("requests", requests);
+        o.Put("queries", queries);
+        o.Put("load", load);
+        o.Put("slow_requests", this.SlowReqJson());
+        o.Put("slow_queries", this.SlowQueryJson());
+        o.Put("top_sql", this.TopSqlJson(20));
+        o.Put("top_requests", this.TopReqJson(20));
+        return o.ToJson();
     }
 }

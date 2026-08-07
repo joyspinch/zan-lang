@@ -1,0 +1,123 @@
+// ServerMetrics snapshot shape: pins the hand-rolled JsonValue serialization
+// (ServerMetrics is on the generator bootstrap path, so SnapshotJson must not
+// call Json.Serialize<T>). The key set, key order and every deterministic
+// value are asserted; timing-derived fields (uptime/pid/cpu/mem) are only
+// checked for presence.
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Json;
+
+class Program {
+    static int fails;
+
+    static void Check(bool ok, string what) {
+        if (!ok) {
+            Console.WriteLine("FAIL " + what);
+            fails = fails + 1;
+        }
+    }
+
+    static void CheckKeys(JsonValue v, List<string> want, string what) {
+        Check(v.Count() == want.Count, what + " key count");
+        bool ok = true;
+        for (int i = 0; i < want.Count; i = i + 1) {
+            if (v.KeyAt(i) != want[i]) { ok = false; }
+        }
+        Check(ok, what + " key order");
+    }
+
+    static int Main() {
+        ServerMetrics m = ServerMetrics.Global();
+        m.SlowRequestMs(10).SlowQueryMs(20).ErrorLog("", false);
+        m.RecordRequest("GET", "/api/a", 200, 5);
+        m.RecordRequest("POST", "/api/b", 201, 12);
+        m.RecordRequest("GET", "/slow", 500, 25);
+        m.RecordError(1000, "db", "timeout");
+        m.RecordQuery("select * from t where id = ?", 3);
+        m.RecordQuery("select count(*) from big", 40);
+        m.Entered();
+        m.StreamClosed(3, 120);
+        m.Left();
+
+        JsonValue v = JsonValue.Parse(m.SnapshotJson());
+        Check(v != null && v.IsObject(), "snapshot parses");
+        Check(v.Count() == 13, "top key count");
+        Check(v.KeyAt(0) == "uptime_ms" && v.KeyAt(1) == "pid" &&
+              v.KeyAt(2) == "worker_id" && v.KeyAt(3) == "cpu_ms" &&
+              v.KeyAt(4) == "cpu_percent" && v.KeyAt(5) == "mem_rss_bytes" &&
+              v.KeyAt(6) == "requests" && v.KeyAt(7) == "queries" &&
+              v.KeyAt(8) == "load" && v.KeyAt(9) == "slow_requests" &&
+              v.KeyAt(10) == "slow_queries" && v.KeyAt(11) == "top_sql" &&
+              v.KeyAt(12) == "top_requests", "top key order");
+
+        JsonValue req = v.Get("requests");
+        CheckKeys(req, new List<string> { "count", "errors", "failed", "rejected",
+                  "avg_ms", "max_ms", "slow_threshold_ms", "slow_count" },
+                  "requests");
+        Check(req.Int("count", -1) == 3, "requests.count");
+        Check(req.Int("errors", -1) == 1, "requests.errors");
+        Check(req.Int("failed", -1) == 1, "requests.failed");
+        Check(req.Int("rejected", -1) == 0, "requests.rejected");
+        Check(req.Int("avg_ms", -1) == 14, "requests.avg_ms");
+        Check(req.Int("max_ms", -1) == 25, "requests.max_ms");
+        Check(req.Int("slow_threshold_ms", -1) == 10, "requests.slow_threshold_ms");
+        Check(req.Int("slow_count", -1) == 2, "requests.slow_count");
+
+        JsonValue q = v.Get("queries");
+        CheckKeys(q, new List<string> { "count", "avg_ms", "max_ms",
+                  "slow_threshold_ms", "slow_count" }, "queries");
+        Check(q.Int("count", -1) == 2, "queries.count");
+        Check(q.Int("avg_ms", -1) == 21, "queries.avg_ms");
+        Check(q.Int("max_ms", -1) == 40, "queries.max_ms");
+        Check(q.Int("slow_threshold_ms", -1) == 20, "queries.slow_threshold_ms");
+        Check(q.Int("slow_count", -1) == 1, "queries.slow_count");
+
+        JsonValue load = v.Get("load");
+        CheckKeys(load, new List<string> { "concurrent", "peak", "streams",
+                  "stream_frames", "stream_bytes" }, "load");
+        Check(load.Int("concurrent", -1) == 0, "load.concurrent");
+        Check(load.Int("peak", -1) == 1, "load.peak");
+        Check(load.Int("streams", -1) == 0, "load.streams");
+        Check(load.Int("stream_frames", -1) == 3, "load.stream_frames");
+        Check(load.Int("stream_bytes", -1) == 120, "load.stream_bytes");
+
+        JsonValue sr = v.Get("slow_requests");
+        Check(sr != null && sr.IsArray() && sr.Count() == 2, "slow_requests size");
+        Check(sr.At(0).Get("req").AsString("") == "POST /api/b -> 201" &&
+              sr.At(0).Int("ms", -1) == 12, "slow_requests[0]");
+        Check(sr.At(1).Get("req").AsString("") == "GET /slow -> 500" &&
+              sr.At(1).Int("ms", -1) == 25, "slow_requests[1]");
+
+        JsonValue sq = v.Get("slow_queries");
+        Check(sq != null && sq.IsArray() && sq.Count() == 1, "slow_queries size");
+        Check(sq.At(0).Get("sql").AsString("") == "select count(*) from big" &&
+              sq.At(0).Int("ms", -1) == 40, "slow_queries[0]");
+
+        JsonValue ts = v.Get("top_sql");
+        Check(ts != null && ts.IsArray() && ts.Count() == 2, "top_sql size");
+        Check(ts.At(0).Get("sql").AsString("") == "select count(*) from big" &&
+              ts.At(0).Int("count", -1) == 1 && ts.At(0).Int("total_ms", -1) == 40 &&
+              ts.At(0).Int("avg_ms", -1) == 40 && ts.At(0).Int("max_ms", -1) == 40,
+              "top_sql[0]");
+        Check(ts.At(1).Get("sql").AsString("") == "select * from t where id = ?" &&
+              ts.At(1).Int("total_ms", -1) == 3, "top_sql[1]");
+
+        JsonValue tr = v.Get("top_requests");
+        Check(tr != null && tr.IsArray() && tr.Count() == 3, "top_requests size");
+        Check(tr.At(0).Get("req").AsString("") == "GET /slow" &&
+              tr.At(0).Int("total_ms", -1) == 25 && tr.At(0).Int("errors", -1) == 1 &&
+              tr.At(0).Int("failed", -1) == 1 && tr.At(0).Int("rejected", -1) == 0,
+              "top_requests[0]");
+        Check(tr.At(1).Get("req").AsString("") == "POST /api/b" &&
+              tr.At(1).Int("total_ms", -1) == 12, "top_requests[1]");
+        Check(tr.At(2).Get("req").AsString("") == "GET /api/a" &&
+              tr.At(2).Int("total_ms", -1) == 5, "top_requests[2]");
+
+        if (fails == 0) {
+            Console.WriteLine("snapshot-ok: 1");
+            return 0;
+        }
+        return 1;
+    }
+}

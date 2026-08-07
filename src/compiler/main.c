@@ -8,11 +8,6 @@
 #include "diag.h"
 #include "lexer.h"
 #include "parser.h"
-#include "jsongen.h"
-#include "formgen.h"
-#include "scenegen.h"
-#include "dbgen.h"
-#include "routegen.h"
 #include "genrun.h"
 #include "genmeta.h"
 #include "nsresolve.h"
@@ -1829,25 +1824,19 @@ int main(int argc, char **argv) {
         }
 
         zan_compile_trace("codegen");
-        /* jsongen/dbgen/routegen moved into Zan (stdlib/System/Compiler/
-         * ZanGen.zan): one subprocess run exports the metadata, generates the
-         * binders/mappers/routes and returns rewrite directives for the call
-         * sites.
-         * --no-gen (compiling the generators themselves) falls back to the
-         * C inline jsongen/routegen so stdlib code that uses Json.Serialize
-         * (e.g. System.Diagnostics.ServerMetrics, pulled in through
-         * System.IO/Threading) still compiles without the generator
-         * subprocess. */
-        if (zan_gen_enabled) {
-            if (zan_gen_codegen(ast, arena, diag, resolved_stdlib_root) != 0) {
-                zan_arena_free(arena);
-                free(source);
-                return 1;
-            }
-        } else {
-            zan_jsongen_run(ast, arena, diag);
-            zan_routegen_run(ast, arena, diag);
-            zan_dbgen_run(ast, arena, diag);
+        /* All five code generators (jsongen/dbgen/routegen/formgen/scenegen)
+         * live in stdlib/System/Compiler/ZanGen.zan: one subprocess run exports
+         * the metadata, generates the binders/mappers/routes and returns
+         * rewrite directives for the call sites.
+         * --no-gen (compiling the generators themselves) skips the subprocess
+         * entirely -- the generator sources and the stdlib they pull in
+         * (System.IO/Threading -> ServerMetrics, etc.) must compile without a
+         * generator run. */
+        if (zan_gen_enabled &&
+            zan_gen_codegen(ast, arena, diag, resolved_stdlib_root) != 0) {
+            zan_arena_free(arena);
+            free(source);
+            return 1;
         }
         zan_compile_trace("resolve done");
     }

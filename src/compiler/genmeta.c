@@ -33,7 +33,7 @@ typedef struct {
     char cur_cls[128];   /* enclosing class name (call owner) */
     char cur_fn[128];    /* enclosing method name ("" for field initializers) */
     /* node -> id, filled when a call is recorded. The walk is children-first
-     * (the same order dbgen.c visits), so a receiver call is recorded before
+     * (the same order the old C dbgen visited), so a receiver call is recorded before
      * the outer call that names it as `call#<id>`. Grows as needed. */
     zan_ast_node_t **rec_nodes;
     int *rec_ids;
@@ -418,7 +418,7 @@ static void gm_walk_expr(zan_ast_node_t *n, gm_ctx_t *c) {
     if (!n) return;
     switch (n->kind) {
     case AST_CALL:
-        /* children first, exactly like dbgen.c's dg_visit_call: a chain
+        /* children first, exactly like the old C dbgen's dg_visit_call: a chain
          * root (`Query<T>`) is recorded before the chain methods above it,
          * so their `recv` can name it as call#<id> */
         gm_walk_expr(n->call.callee, c);

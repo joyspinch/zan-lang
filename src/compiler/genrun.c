@@ -532,7 +532,7 @@ static void rw_set_ident(zan_arena_t *arena, zan_ast_node_t *id,
 }
 
 /* Ascending-id order: call-site ids are assigned children-first (the same
- * order dbgen.c visits), so ascending replays the exact rewrite sequence of
+ * order the old C dbgen visits), so ascending replays the exact rewrite sequence of
  * the C generators. The array is tiny, insertion sort is fine. */
 static void rw_sort_desc(json_value *rw, int *order, int count) {
     for (int i = 1; i < count; i++) {
@@ -809,6 +809,25 @@ int zan_gen_codegen(zan_ast_node_t *unit, zan_arena_t *arena,
             goto done;
         }
         zan_merge_sources(unit, json_obj_get(root, "sources"), arena, diag);
+        /* ZAN_GEN_REPLY=<path>: keep a copy of the reply (test hook --
+         * tests/gen/ asserts on the generated text and rewrite directives). */
+        {
+            const char *gr = getenv("ZAN_GEN_REPLY");
+            if (gr && gr[0]) {
+                FILE *cf = fopen(gr, "wb");
+                if (cf) {
+                    FILE *rf = fopen(out_path, "rb");
+                    if (rf) {
+                        char buf[8192];
+                        size_t n;
+                        while ((n = fread(buf, 1, sizeof(buf), rf)) > 0)
+                            fwrite(buf, 1, n, cf);
+                        fclose(rf);
+                    }
+                    fclose(cf);
+                }
+            }
+        }
         json_free(root);
         free(reply);
         rc = 0;

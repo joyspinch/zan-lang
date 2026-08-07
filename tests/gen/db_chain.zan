@@ -1,0 +1,60 @@
+// Generator regression: fluent ORM chains must lower end-to-end even when a
+// real (non-rewritten) method sits between the root and the rewritten links.
+//   * Select<T>().Where(...).Sum(...)     -- Expr path + aggregate after it
+//   * Update<T>().SetDict(...).Where(...) -- chain walking through SetDict
+//   * accessor chain ctx.Order.Where(...).Count()
+// These used to break when chain rewrites failed to register the call-site id
+// the next link walks through (the Zan generator's Rewrote map).
+using System;
+using System.Data;
+using System.Data.Orm;
+using System.Data.Sqlite;
+using System.IO;
+
+[Table(Name = "t_ord")]
+class Order {
+    [Column(IsIdentity = true)]
+    long id;
+    string region;
+    long amount;
+    string note;
+}
+
+class Ctx {
+    SqliteConnection db;
+
+    static Ctx Open(string path) {
+        Ctx c = new Ctx();
+        c.db = SqliteConnection.Open(path);
+        c.db.Execute("CREATE TABLE t_ord (id INTEGER PRIMARY KEY, region TEXT, amount INTEGER, note TEXT)");
+        c.db.Execute("INSERT INTO t_ord VALUES (1, 'EA', 10, 'a'), (2, 'WE', 20, 'b'), (3, 'EA', 300, 'c')");
+        return c;
+    }
+
+    SqliteConnection __Conn() { return this.db; }
+}
+
+class Program {
+    static void Main() {
+        string path = "gen_db_chain.tmp.db";
+        File.Delete(path);
+        Ctx ctx = Ctx.Open(path);
+        SqliteConnection db = ctx.db;
+
+        // aggregate after Expr Where (multi-link chain: Where -> Sum)
+        long sum = db.Select<Order>().Where(o => o.amount > 15).Sum(o => o.amount);
+        Console.WriteLine("sum: " + Convert.ToString(sum));
+
+        // chain walking through a real method (SetDict is not rewritten)
+        DbValues patch = new DbValues().Set("region", "WW");
+        int upd = db.Update<Order>().SetDict(patch).Where(a => a.id == 1).ExecuteAffrows();
+        Console.WriteLine("upd: " + Convert.ToString(upd));
+
+        // accessor head + terminal Count after a rewritten Where
+        int cnt = ctx.Order.Where(o => o.region.Eq("EA")).Count();
+        Console.WriteLine("cnt: " + Convert.ToString(cnt));
+
+        db.Close();
+        File.Delete(path);
+    }
+}

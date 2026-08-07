@@ -37,8 +37,8 @@
 | IR 生成（表达式） | `irgen_expr.c`（最大，312K）、`irgen_expr_core.c` | 成员访问、索引、运算符、临时值生命周期 |
 | IR 生成（调用） | `irgen_call.c` | 方法解析、重载、内建函数、委托、链式调用 |
 | IR 生成（语句/泛型/异步/ARC） | `irgen_stmt.c`, `irgen_generics.c`, `irgen_async.c`, `irgen_arc.c` | 控制流、泛型实例化、await 状态机、retain/release |
-| 代码生成/发射 | `irgen_emit.c`, `dbgen.c` | LLVM 发射、调试信息 |
-| 领域代码生成 | `formgen.c`（`.zform` → `.g.zan`）、`routegen.c`（路由表）、`jsongen.c` | 设计器窗体、Web 路由、JSON 绑定 |
+| 代码生成/发射 | `irgen_emit.c` | LLVM 发射、调试信息 |
+| 领域代码生成 | `stdlib/System/Compiler/`（ZanGen.zan: `GenForm`/`GenScene`/`GenJson`/`GenRoute`/`GenDb`） | 设计器窗体、场景、JSON 绑定、路由表、ORM 绑定 |
 | 驱动/CLI | `main.c` | 命令行开关、`--publish`、`--stdlib-path`、打包 |
 
 **入口**：`src/compiler/main.c`。**诊断输出**：`zan_diag_emit(...)`，grep 消息文本即可
@@ -88,12 +88,12 @@
 | 新控件 | `stdlib/Gui/Widget/<Name>.zan` + `stdlib/Gui/Component/` 注册 + gallery 示例 |
 | 新 HMI 元件 | `stdlib/Gui/Hmi/` + `templates/gui/gui-hmi` 演示 |
 | 主题/皮肤 | `stdlib/Gui/Theme.zan`, `Skin.zan`, `Style*.zan`, `skins/` |
-| 设计器行为 | `stdlib/Gui/Designer/*` + `src/compiler/formgen.c`（`.zform` → 代码） |
+| 设计器行为 | `stdlib/Gui/Designer/*` + `stdlib/System/Compiler/GenForm.zan`（`.zform` → 代码） |
 | 新建项目模板 | `templates/**/template.manifest` + `ZanIDE.Workspace.zan`（见 [templates-and-wizard.md](templates-and-wizard.md)） |
 | IDE 面板/命令 | `ZanIDE.Panels.zan` + `ZanIDE.zan`（命令分发）+ `ZanIDE.State.zan`（状态） |
 | 补全/跳转/悬停 | `src/lsp/` + `LspSession.zan` |
 | 调试器 | `src/dap/` + `DebugSession.zan`, `ZanIDE.Dap.zan` |
-| Web 路由/接口文档 | `stdlib/System/Web/Router.zan`, `ApiDocs.zan` + `src/compiler/routegen.c` |
+| Web 路由/接口文档 | `stdlib/System/Web/Router.zan`, `ApiDocs.zan` + `stdlib/System/Compiler/GenRoute.zan` |
 
 ## 工具链命令（都在仓库根执行）
 

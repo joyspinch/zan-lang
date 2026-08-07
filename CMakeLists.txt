@@ -86,11 +86,6 @@ add_executable(zanc
     src/compiler/lexer.c
     src/compiler/ast.c
     src/compiler/parser.c
-    src/compiler/jsongen.c
-    src/compiler/formgen.c
-    src/compiler/scenegen.c
-    src/compiler/dbgen.c
-    src/compiler/routegen.c
     src/compiler/genrun.c
     src/compiler/genmeta.c
     src/common/json.c
@@ -565,29 +560,6 @@ if(NOT WIN32)
 endif()
 add_test(NAME unit_json_trailing COMMAND zan_json_trailing_test)
 
-# ---- direct .zform kind generation test ----
-add_executable(zan_formgen_test
-    tests/unit/formgen_test.c
-    src/compiler/formgen.c
-    src/compiler/stdlib_ext.c
-    src/compiler/diag.c
-    src/compiler/arena.c
-)
-target_include_directories(zan_formgen_test PRIVATE
-    ${CMAKE_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/src/compiler
-)
-set_target_properties(zan_formgen_test PROPERTIES
-    C_STANDARD 11
-    C_STANDARD_REQUIRED YES
-)
-if(WIN32)
-    target_link_libraries(zan_formgen_test PRIVATE winhttp)
-else()
-    find_package(Threads REQUIRED)
-    target_link_libraries(zan_formgen_test PRIVATE Threads::Threads m)
-endif()
-add_test(NAME unit_formgen COMMAND zan_formgen_test)
-
 # A .zform node must name a real Zan Control class. Invalid kinds fail at
 # formgen time instead of silently becoming a Panel or Label.
 add_test(NAME diag_invalid_zform_kind
@@ -610,6 +582,30 @@ set_target_properties(zan_rpc_framing_test PROPERTIES
     C_STANDARD_REQUIRED YES
 )
 add_test(NAME unit_rpc_framing COMMAND zan_rpc_framing_test)
+
+# ---- Runtime: allocator double-free detection (rt_mem.c) ----
+# Produced programs link the size-class allocator with
+# `ld --wrap=malloc,free,calloc,realloc`; a second free of a live block is an
+# ARC aliasing bug the allocator turns into an immediate abort. The slab path
+# is mmap-based and therefore POSIX-only (Windows falls through to the libc
+# heap, where the guard never runs), and ld64 has no --wrap, so the Linux CI
+# job is where this runs.
+if(NOT WIN32 AND NOT APPLE)
+  add_executable(zan_rt_mem_dblfree_test
+    tests/runtime/rt_mem_dblfree_test.c
+    src/runtime/rt_mem.c
+  )
+  target_include_directories(zan_rt_mem_dblfree_test PRIVATE ${CMAKE_SOURCE_DIR})
+  set_target_properties(zan_rt_mem_dblfree_test PROPERTIES
+    C_STANDARD 11
+    C_STANDARD_REQUIRED YES
+  )
+  target_link_options(zan_rt_mem_dblfree_test PRIVATE
+    -Wl,--wrap=malloc -Wl,--wrap=free -Wl,--wrap=calloc -Wl,--wrap=realloc
+  )
+  add_test(NAME runtime_mem_dblfree COMMAND zan_rt_mem_dblfree_test)
+  set_tests_properties(runtime_mem_dblfree PROPERTIES TIMEOUT 30)
+endif()
 
 # ---- Conformance suite: compile each program, run it, diff stdout vs golden ----
 if(WIN32)
@@ -692,6 +688,35 @@ foreach(_src ${_conf_srcs})
       "-DZANC_ARGS=${_extra_args}"
       -P ${CMAKE_SOURCE_DIR}/tests/run_determinism.cmake)
   set_tests_properties(determinism_${_name} PROPERTIES TIMEOUT 120)
+endforeach()
+
+# ---- Generator suite: drive the Zan-scripted generators through zanc and
+#      assert on the reply (rewrite directives + generated sources) ----
+# Each case is a tiny program that must (a) compile with the generator reply
+# captured, (b) produce the expected rewrite directives / generated classes,
+# (c) run to a golden output. This pins the generator contract the way the
+# deleted C unit tests did, from outside the compiler process.
+file(GLOB _gen_srcs ${CMAKE_SOURCE_DIR}/tests/gen/*.zan)
+foreach(_src ${_gen_srcs})
+  get_filename_component(_name ${_src} NAME_WE)
+  set(_gen_regex
+    "\"op\": \"db_root\","
+    "\"name\": \"Q_Order\""
+    "\"op\": \"db_expr_arg\","
+    "\"v\": \"SUM\\(t\\.amount\\)\""
+    "\"op\": \"db_acc_head\","
+    "class __DbQ_Order"
+    "class __DbU_Order")
+  add_test(NAME gen_${_name}
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${_src}
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/gen/${_name}.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/gen_${_name}${_exe_ext}
+      -DREPLY=${CMAKE_BINARY_DIR}/gen_${_name}_reply.json
+      "-DREPLY_REGEX=${_gen_regex}"
+      -P ${CMAKE_SOURCE_DIR}/tests/run_gen_case.cmake)
+  set_tests_properties(gen_${_name} PROPERTIES TIMEOUT 120)
 endforeach()
 
 # ---- Leak detection: run each program under --check-leaks, fail on leaks ----

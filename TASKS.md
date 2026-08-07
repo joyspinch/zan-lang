@@ -413,6 +413,48 @@ HTTP 解析、编码转换、路径处理这类纯逻辑，上移到 Zan。
   `issetugid`），`gui_runtime_x11.c` 末尾加了弱定义兜底；这仍然是"配方缺失"的
   同一个坑，重编归档时应一并解决。
 
+* **B7-4 ✅（2026-08-08）三项 runtime 修复 + 一个 emutls 死锁根因（探针实测）**：
+  1. `rt_timer.c` 竞态：`timer_add` 的 `callback` 在入堆（unlock）之后才赋值，另一线程
+     `dispatch_due` 可能对 NULL 调用；`zan_timer_delay` 的 `g_sequence` 在锁外递增；
+     `g_ready_hook` 无锁读；`zan_timer_stats` 无锁读 `g_initialized`/`g_round`（且嵌套调用
+     `zan_timer_list_count` 会二次加锁）。全部改为发布前赋值 / 锁内读，stats 锁内内联计数。
+  2. `rt_mem.c` double-free：free 时 header 置 `ZAN_MEM_FREED` 哨兵，同一块二次 free 直接
+     abort（编译器对象头在 p..p+15、分配器头在 p-16，互不覆盖，哨兵可靠）；顺带 `cls`
+     越界校验。**附赠根因（Windows 探针实测，gdb 栈）**：MinGW 的 `__thread` 由 libgcc
+     emutls 模拟，首次访问触发 `pthread_once(emutls_init)`，而 `emutls_init` 内部调
+     `malloc` → wrap 后递归访问同一未初始化 emutls 变量 → once 锁自旋死锁。rt_mem 目前
+     只在 POSIX 链接（原生 TLS）不受影响；已把 Windows 侧改为普通 static（slab 路径在
+     Windows 本来就禁用）+ 注释防未来误用。POSIX 上的 double-free abort 逻辑本机无法
+     实测（Windows 无 mmap 无 slab），需 Linux CI 验证（`build_linux_rt.sh`）。
+  3. `rt_sched.c` 任务对象只增不减（`g_all_tasks` 直到 shutdown 才清）→ 新增
+     `zan_task_release()`（幂等摘链+free）与 `zan_task_live()` 测试钩子，所有权契约写入
+     `rt_sched.h`；`tests/runtime/rt_test.c` 全部 task 生命周期补 release，新增
+     `zan_task_live()==0` 泄漏断言（17/17 通过）。构建命令注释补上缺失的 `rt_co.c`。
+  **预存失败（与本次无关）**：`conformance_stopwatch_timer` 编译失败——
+  `stdlib/System/Diagnostics/ServerMetrics.zan:1070` `Json.Serialize` 无法解析
+  （HEAD 同样存在，疑似未提交编译器改动或 stdlib map 缺 Json 注册）。
+  （2026-08-08 已随生成器迁移修复：现在通过。）
+
+* **B7-5 ✅（2026-08-08）五个 C 代码生成器整体迁移到纯 Zan**（`stdlib/System/Compiler/`，
+  约 6800 行 C → 约 5300 行 Zan + 约 2100 行 C 通用管道）：
+  - 架构：`genmeta.c`（AST → JSON 元数据：类形状 + 调用点索引，children-first 编号）、
+    `genrun.c`（触发词预过滤 + 缓存式 `ZanGen.exe` 子进程 + JSON 交换 + 通用重写执行器），
+    框架知识全部进 `GenForm/GenScene/GenJson/GenRoute/GenDb(+GenDbEmit)`，C 端零框架字面量。
+  - 等价性：生成文本逐字节一致（form 13/13 模板、scene 往返、route golden、
+    orm typed_query/extended/table_accessor 64114/63741/60194 字节），运行时行为
+    conformance golden 覆盖；smoke 101/101、orm 8+3、新增 `tests/gen/`（回复断言）+
+    `conformance_servermetrics_snapshot`（手写 JsonValue 序列化形状钉死）。
+  - 关键坑：调用点必须 children-first 编号 + 升序处理（与旧 dg_visit_call 一致，跨方法顺序才
+    对）；链方法重写后必须在 `Rewrote` 登记 id 且 `ChainEntity2` 要穿过未重写的真实方法
+    （SetDict/Page 等）直达根——否则 `Where(...).Sum(...)`、`Update().SetDict().Where()` 断链。
+  - `ServerMetrics.SnapshotJson` 改为手写 JsonValue（在生成器自举路径上，不能再依赖
+    `Json.Serialize<T>`）；`--no-gen` 不再有 C 回退（旧 jsongen/routegen/dbgen 已删除）。
+  - **预存失败（与本次无关，full 层）**：`selfhost_fixed_point` 在 gen1→gen2 处失败——
+    `src/selfhost/dbgen.zan:581` 用 `ref` 参数，而自举编译器（selfhost/parser.zan）从未支持
+    `ref` 关键字（e01975ee 引入，parser 无 TK_REF）。另 7 个 `conformance_arpg_*` 在 HEAD
+    就坏（Zgm→Arpg 改名后 `ArpgSaveState` 从未定义、`System/Collections/Generic` 不存在）；
+    `jwt_rs256`/`rsa_oaep_cbc` 的堆损坏退出与 B7-4 的 rt_mem 双重释放哨兵有关。
+
 ---
 
 # C. 文档

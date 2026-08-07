@@ -270,7 +270,7 @@ void intel_register_snippets(intellisense_t *is) {
  *
  * A .zform file is the visual designer's JSON description of a form (see
  * stdlib/Gui/Designer and src/ide_zan/ZanIDE.CodeNav.zan GenFormFile for the
- * format). At compile time formgen.c projects it onto a synthetic
+ * format). At compile time the GenForm generator (stdlib/System/Compiler) projects it onto a synthetic
  * `partial class <Name>` with a static widget field per entry and event
  * bindings wired by handler name. The index mirrors that projection so the
  * business file's autocomplete, go-to-def and hover see the typed fields and
@@ -278,13 +278,13 @@ void intel_register_snippets(intellisense_t *is) {
  *
  *   - the form name becomes a class symbol whose base type is Form,
  *   - each field (recursing into container kids) becomes a static field whose
- *     type is the mapped widget class (same table as formgen's fg_widget_type),
+ *     type is the mapped widget class (same table as GenForm's widget map),
  *   - each on*Event handler name and the top-level "submit" name become method
  *     symbols on the class.
  */
 
-/* Concrete Gui widget type for a field type (must match
- * src/compiler/formgen.c fg_widget_type). */
+/* Concrete Gui widget type for a field type (must match the
+ * stdlib/System/Compiler/GenForm.zan widget map). */
 static const char *intel_zform_widget(int ft) {
     if (ft == 0 || ft == 2 || ft == 3) return "Input";
     if (ft == 1 || ft == 14) return "TextArea";

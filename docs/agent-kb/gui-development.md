@@ -118,7 +118,7 @@ canvas.DrawImage(path, x, y);                              // 原尺寸
 - 文档模型在 `src/ide_zan/ZanIDE.CodeNav.zan`：`FormDoc { name, winW, winH, winTitle,
   winCenter, layoutMode, winZoom, fields }`、`FormFieldDoc { type, label, name,
   required, wrap, span, fx, fy, fw, fh }`（`fx/fy/fw/fh` 是自由布局的绝对坐标）。
-- 生成器在 `src/compiler/formgen.c`（编译期）与 IDE 侧的生成代码路径。
+- 生成器在 `stdlib/System/Compiler/GenForm.zan`（编译期）与 IDE 侧的生成代码路径。
 - 因此：**改窗口尺寸/控件位置就是改 `FormDoc` 再写回 `.zform`**，不要去改生成的 `.g.zan`。
 
 ## 验证 GUI 改动
