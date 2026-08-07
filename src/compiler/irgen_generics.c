@@ -986,6 +986,94 @@ static void emit_runtime_check(zan_irgen_t *g, LLVMValueRef is_error,
     LLVMPositionBuilderAtEnd(g->builder, cont_bb);
 }
 
+static LLVMValueRef emit_index_i64(zan_irgen_t *g, LLVMValueRef value,
+                                   const char *name) {
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+    LLVMTypeKind kind = LLVMGetTypeKind(LLVMTypeOf(value));
+    if (kind != LLVMIntegerTypeKind) return value;
+    unsigned width = LLVMGetIntTypeWidth(LLVMTypeOf(value));
+    if (width < 64) return LLVMBuildSExt(g->builder, value, i64, name);
+    if (width > 64) return LLVMBuildTrunc(g->builder, value, i64, name);
+    return value;
+}
+
+static void emit_index_range_check(zan_irgen_t *g, LLVMValueRef index,
+                                   LLVMValueRef length, bool allow_end,
+                                   zan_loc_t loc, const char *kind) {
+    if (!g->runtime_checks || !g->current_fn) return;
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+    index = emit_index_i64(g, index, "idx.i64");
+    length = emit_index_i64(g, length, "len.i64");
+    LLVMValueRef negative = zan_icmp(g->builder, LLVMIntSLT, index,
+                                     LLVMConstInt(i64, 0, 0), "idx.neg");
+    LLVMIntPredicate upper_pred = allow_end ? LLVMIntSGT : LLVMIntSGE;
+    LLVMValueRef outside = zan_icmp(g->builder, upper_pred, index, length,
+                                    "idx.high");
+    LLVMValueRef bad = LLVMBuildOr(g->builder, negative, outside, "idx.bad");
+    char msg[96];
+    snprintf(msg, sizeof(msg), "%s index out of bounds", kind ? kind : "array");
+    emit_runtime_check(g, bad, loc, msg);
+}
+
+static void emit_index_bounds_check(zan_irgen_t *g, LLVMValueRef index,
+                                    LLVMValueRef length, zan_loc_t loc,
+                                    const char *kind) {
+    emit_index_range_check(g, index, length, false, loc, kind);
+}
+
+/* Strings and byte[] share the payload pointer ABI. A Zan string has the
+ * string magic in the second header word; a byte[] has its element count in
+ * the first header word and no string magic. Use the carried array length for
+ * byte buffers so embedded NUL bytes do not truncate indexing bounds. */
+static LLVMValueRef emit_string_buffer_len(zan_irgen_t *g, LLVMValueRef payload) {
+    LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+    LLVMValueRef back = LLVMConstInt(i64, (uint64_t)-16, 1);
+    LLVMValueRef header = LLVMBuildGEP2(g->builder, i8, payload, &back, 1,
+                                        "strbuf.header");
+    LLVMValueRef count = LLVMBuildLoad2(g->builder, i64,
+        LLVMBuildBitCast(g->builder, header, LLVMPointerType(i64, 0),
+                         "strbuf.countp"), "strbuf.count");
+    LLVMValueRef magic_ptr = LLVMBuildGEP2(g->builder, i8, payload,
+        &(LLVMValueRef){ LLVMConstInt(i64, (uint64_t)-8, 1) }, 1,
+        "strbuf.magicp");
+    LLVMValueRef magic = LLVMBuildLoad2(g->builder, i64,
+        LLVMBuildBitCast(g->builder, magic_ptr, LLVMPointerType(i64, 0),
+                         "strbuf.magicc"), "strbuf.magic");
+    LLVMValueRef is_string = zan_icmp(g->builder, LLVMIntEQ, magic,
+        LLVMConstInt(i64, ZAN_STRING_MAGIC, 0), "strbuf.isstr");
+    LLVMTypeRef strlen_ty = LLVMFunctionType(i64,
+        (LLVMTypeRef[]){ LLVMPointerType(i8, 0) }, 1, 0);
+    LLVMValueRef string_len = zan_call2(g->builder, strlen_ty, g->fn_strlen,
+                                        &payload, 1, "strbuf.strlen");
+    return LLVMBuildSelect(g->builder, is_string, string_len, count,
+                           "strbuf.len");
+}
+
+static void emit_span_window_check(zan_irgen_t *g, LLVMValueRef start,
+                                   LLVMValueRef window, LLVMValueRef length,
+                                   zan_loc_t loc) {
+    if (!g->runtime_checks || !g->current_fn) return;
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+    start = emit_index_i64(g, start, "span.start");
+    window = emit_index_i64(g, window, "span.count");
+    length = emit_index_i64(g, length, "span.length");
+    LLVMValueRef bad_start = zan_icmp(g->builder, LLVMIntSLT, start,
+                                      LLVMConstInt(i64, 0, 0), "span.start.neg");
+    LLVMValueRef bad_window = zan_icmp(g->builder, LLVMIntSLT, window,
+                                      LLVMConstInt(i64, 0, 0), "span.count.neg");
+    LLVMValueRef after_end = zan_icmp(g->builder, LLVMIntSGT, start, length,
+                                      "span.start.high");
+    LLVMValueRef remaining = LLVMBuildSub(g->builder, length, start,
+                                          "span.remaining");
+    LLVMValueRef too_long = zan_icmp(g->builder, LLVMIntSGT, window, remaining,
+                                     "span.count.high");
+    LLVMValueRef bad = LLVMBuildOr(g->builder, bad_start, bad_window, "span.bad0");
+    bad = LLVMBuildOr(g->builder, bad, after_end, "span.bad1");
+    bad = LLVMBuildOr(g->builder, bad, too_long, "span.bad2");
+    emit_runtime_check(g, bad, loc, "span range out of bounds");
+}
+
 /* Resolve the base pointer to a struct/class instance held by a local.
  * A class local may be stored either inline (alloca of the struct itself,
  * a value-like representation) or as a pointer (alloca of a pointer to a

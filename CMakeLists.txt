@@ -562,6 +562,40 @@ if(NOT WIN32)
 endif()
 add_test(NAME unit_json_trailing COMMAND zan_json_trailing_test)
 
+# ---- direct .zform kind generation test ----
+add_executable(zan_formgen_test
+    tests/unit/formgen_test.c
+    src/compiler/formgen.c
+    src/compiler/stdlib_ext.c
+    src/compiler/diag.c
+    src/compiler/arena.c
+)
+target_include_directories(zan_formgen_test PRIVATE
+    ${CMAKE_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/src/compiler
+)
+set_target_properties(zan_formgen_test PROPERTIES
+    C_STANDARD 11
+    C_STANDARD_REQUIRED YES
+)
+if(WIN32)
+    target_link_libraries(zan_formgen_test PRIVATE winhttp)
+else()
+    find_package(Threads REQUIRED)
+    target_link_libraries(zan_formgen_test PRIVATE Threads::Threads m)
+endif()
+add_test(NAME unit_formgen COMMAND zan_formgen_test)
+
+# A .zform node must name a real Zan Control class. Invalid kinds fail at
+# formgen time instead of silently becoming a Panel or Label.
+add_test(NAME diag_invalid_zform_kind
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/invalid_zform_kind.zform
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_invalid_zform_kind${_exe_ext}
+    "-DEXPECT_REGEX=invalid_zform_kind\\.zform: \.zform field 0 requires a valid Zan Control kind"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_invalid_zform_kind PROPERTIES TIMEOUT 60)
+
 # ---- RPC framing test (A3) ----
 add_executable(zan_rpc_framing_test
     tests/unit/rpc_framing_test.c
@@ -1269,6 +1303,72 @@ add_test(NAME diag_unresolved_static_chain
     "-DEXPECT_REGEX=unresolved call 'Fluent.Create'"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_unresolved_static_chain PROPERTIES TIMEOUT 60)
+
+# Source-level type and interface regressions: reject malformed inheritance,
+# mixed comparisons, invalid reference/delegate assignments, local mismatches,
+# narrowing conversions, and incomplete interface contracts before IR emission.
+set(_new_diag_cases
+  cyclic_inheritance
+  mixed_comparison
+  unrelated_reference_assignment
+  delegate_invalid_assignment
+  local_assignment_type_mismatch
+  float_to_int_narrowing
+  integer_narrowing
+  interface_missing_method
+  interface_bad_signature)
+foreach(_case ${_new_diag_cases})
+  if(_case STREQUAL cyclic_inheritance)
+    set(_diag_regex "cyclic inheritance")
+  elseif(_case STREQUAL mixed_comparison)
+    set(_diag_regex "cannot compare")
+  elseif(_case STREQUAL unrelated_reference_assignment)
+    set(_diag_regex "cannot convert 'B' to 'A'")
+  elseif(_case STREQUAL delegate_invalid_assignment)
+    set(_diag_regex "cannot convert 'int' to 'Handler'")
+  elseif(_case STREQUAL local_assignment_type_mismatch)
+    set(_diag_regex "cannot convert 'string' to 'int' in assignment")
+  elseif(_case STREQUAL interface_missing_method OR
+         _case STREQUAL interface_bad_signature)
+    set(_diag_regex "does not implement interface method")
+  else()
+    set(_diag_regex "narrowing conversion")
+  endif()
+  add_test(NAME diag_${_case}
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/${_case}.zan
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_${_case}${_exe_ext}
+      "-DEXPECT_REGEX=${_diag_regex}"
+      -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+  set_tests_properties(diag_${_case} PROPERTIES TIMEOUT 60)
+endforeach()
+
+foreach(_runtime_case IN ITEMS
+    array_oob
+    list_removeat_oob
+    list_insert_oob
+    span_window_oob
+    span_negative_length)
+  if(_runtime_case STREQUAL list_removeat_oob OR
+     _runtime_case STREQUAL list_insert_oob)
+    set(_runtime_regex "list index out of bounds")
+  elseif(_runtime_case STREQUAL span_window_oob)
+    set(_runtime_regex "span range out of bounds")
+  elseif(_runtime_case STREQUAL span_negative_length)
+    set(_runtime_regex "negative span length")
+  else()
+    set(_runtime_regex "array index out of bounds")
+  endif()
+  add_test(NAME runtime_${_runtime_case}
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/runtime/${_runtime_case}.zan
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/runtime_${_runtime_case}${_exe_ext}
+      "-DEXPECT_REGEX=${_runtime_regex}"
+      -P ${CMAKE_SOURCE_DIR}/tests/run_runtime_error.cmake)
+  set_tests_properties(runtime_${_runtime_case} PROPERTIES TIMEOUT 60)
+endforeach()
 
 # ---- Golden compiler regression tests ----
 # Freeze the lexer token stream and parse tree for a set of hermetic (stdlib-free)

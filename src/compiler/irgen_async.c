@@ -89,7 +89,11 @@ static LLVMValueRef coerce_async_ret(zan_irgen_t *g, LLVMValueRef val) {
     }
     if (wk == LLVMIntegerTypeKind && hk == LLVMIntegerTypeKind) {
         unsigned wb = LLVMGetIntTypeWidth(want), hb = LLVMGetIntTypeWidth(have);
-        if (wb > hb) return LLVMBuildSExt(g->builder, val, want, "ret.ext");
+        /* i1/i8 are `bool`/`byte`, both unsigned: widen them zero-extended
+         * (same rule as the sync return path). */
+        if (wb > hb) return hb <= 8
+            ? LLVMBuildZExt(g->builder, val, want, "ret.zext")
+            : LLVMBuildSExt(g->builder, val, want, "ret.ext");
         if (wb < hb) return LLVMBuildTrunc(g->builder, val, want, "ret.trunc");
         return val;
     }

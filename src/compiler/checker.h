@@ -7,6 +7,9 @@
 #include "ast.h"
 #include "binder.h"
 
+/* locals of the method body being checked; see checker.c */
+struct checker_local;
+
 struct zan_checker {
     zan_binder_t *binder;
     zan_arena_t *arena;
@@ -19,6 +22,10 @@ struct zan_checker {
      * constructor: a `readonly` field may only be assigned there */
     zan_symbol_t *current_type_sym;
     bool in_ctor;
+    /* linked list of the current body's locals/params, so a bare name in an
+     * expression resolves local-first, then fields, then scope -- the same
+     * precedence irgen uses */
+    struct checker_local *locals;
 };
 
 void zan_checker_init(zan_checker_t *c, zan_binder_t *binder,

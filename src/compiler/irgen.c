@@ -399,8 +399,19 @@ static int reserve_closure_site(zan_irgen_t *g) {
 static LLVMValueRef zan_call2(LLVMBuilderRef b, LLVMTypeRef ty, LLVMValueRef fn,
                               LLVMValueRef *args, unsigned n, const char *nm) {
     LLVMValueRef callee = fn;
-    if (fn && LLVMIsAFunction(fn) && LLVMGlobalGetValueType(fn) != ty)
+    if (fn && LLVMIsAFunction(fn) && LLVMGlobalGetValueType(fn) != ty) {
         fn = LLVMConstBitCast(fn, LLVMPointerType(ty, 0));
+    } else if (fn && !LLVMIsAFunction(fn) &&
+               LLVMGetTypeKind(LLVMTypeOf(fn)) == LLVMPointerTypeKind &&
+               LLVMTypeOf(fn) != LLVMPointerType(ty, 0)) {
+        /* Indirect callee: a delegate's function pointer and a closure
+         * record's destructor are both loaded as i8*, which a typed-pointer
+         * LLVM (<= 14) rejects as "Called function is not the same type as
+         * the call". Retype the pointer here rather than at every call site;
+         * on an opaque-pointer LLVM the types already match and this is a
+         * no-op. */
+        fn = LLVMBuildBitCast(b, fn, LLVMPointerType(ty, 0), "callee.fp");
+    }
     LLVMValueRef call = LLVMBuildCall2(b, ty, fn, args, n, nm);
     /* Carry the callee's sub-`int` promotions onto the call site: once the
      * callee is bitcast the backend sees an opaque pointer and has nothing
@@ -1937,40 +1948,38 @@ static zan_symbol_t *method_sym_for_decl(zan_symbol_t *type_sym, zan_ast_node_t 
     return NULL;
 }
 
-/* Overload-aware method resolution used at call sites. Among same-named methods
- * pick the one whose declared parameter count matches the number of arguments
- * supplied at the call. When several remain (same arity) the first is returned;
- * when none match on arity the first same-named method is returned so that
- * behaviour degrades to the historical name-only lookup instead of failing. */
+/* Overload-aware method resolution used at call sites. A same-named method is
+ * usable only when its arity matches, or when its final parameter is variadic.
+ * Falling back to an unrelated same-named method creates invalid calls and can
+ * leave interface dispatch with a fabricated function pointer. */
 static int method_is_params_variadic(zan_symbol_t *m) {
-    if (!m->decl || m->decl->method_decl.params.count == 0) return 0;
+    if (!m || !m->decl || m->decl->method_decl.params.count == 0) return 0;
     zan_ast_node_t *last =
         m->decl->method_decl.params.items[m->decl->method_decl.params.count - 1];
     return last->kind == AST_PARAM && last->param.is_params;
 }
 
-static zan_symbol_t *resolve_overload(zan_symbol_t *type_sym, zan_istr_t name, int argc) {
-    zan_symbol_t *first = NULL;
-    zan_symbol_t *variadic = NULL;
-    zan_class_index_t *ci = class_index_for(type_sym);
-    for (int i = member_first_named(ci, name); i >= 0;
-         i = member_next_named(ci, i)) {
-        zan_symbol_t *m = type_sym->members[i];
-        if (m->kind != SYM_METHOD) continue;
-        if (!member_name_is(m, name)) continue;
-        if (!first) first = m;
-        if (m->decl && m->decl->method_decl.params.count == argc) {
-            return m;
+static zan_symbol_t *resolve_overload(zan_symbol_t *type_sym, zan_istr_t name,
+                                      int argc) {
+    int depth = 0;
+    while (type_sym && depth++ < 512) {
+        zan_symbol_t *variadic = NULL;
+        zan_class_index_t *ci = class_index_for(type_sym);
+        for (int i = member_first_named(ci, name); i >= 0;
+             i = member_next_named(ci, i)) {
+            zan_symbol_t *m = type_sym->members[i];
+            if (m->kind != SYM_METHOD || !member_name_is(m, name)) continue;
+            if (m->decl && m->decl->method_decl.params.count == argc)
+                return m;
+            if (!variadic && method_is_params_variadic(m) &&
+                argc >= m->decl->method_decl.params.count - 1)
+                variadic = m;
         }
-        if (!variadic && method_is_params_variadic(m) &&
-            argc >= m->decl->method_decl.params.count - 1) {
-            variadic = m;
-        }
-    }
-    if (variadic) return variadic;
-    if (first) return first;
-    if (type_sym->type && type_sym->type->base_type && type_sym->type->base_type->sym) {
-        return resolve_overload(type_sym->type->base_type->sym, name, argc);
+        if (variadic) return variadic;
+        if (!type_sym->type || !type_sym->type->base_type ||
+            !type_sym->type->base_type->sym)
+            break;
+        type_sym = type_sym->type->base_type->sym;
     }
     return NULL;
 }
@@ -1980,19 +1989,25 @@ static zan_symbol_t *resolve_overload(zan_symbol_t *type_sym, zan_istr_t name, i
  * (`interface IDbConnection : IDbExecutor`), and those live in the extends
  * list rather than in base_type, so resolve_overload alone would miss an
  * inherited method and the call would dispatch to nothing. */
-static zan_symbol_t *resolve_iface_overload(zan_symbol_t *iface, zan_istr_t name,
-                                            int argc) {
-    if (!iface) return NULL;
+static zan_symbol_t *resolve_iface_overload_depth(zan_symbol_t *iface,
+                                                   zan_istr_t name, int argc,
+                                                   int depth) {
+    if (!iface || depth > 512) return NULL;
     zan_symbol_t *m = resolve_overload(iface, name, argc);
     if (m) return m;
     if (!iface->type) return NULL;
     for (int i = 0; i < iface->type->interface_count; i++) {
         zan_type_t *it = iface->type->interfaces[i];
         if (!it || !it->sym || it->sym == iface) continue;
-        m = resolve_iface_overload(it->sym, name, argc);
+        m = resolve_iface_overload_depth(it->sym, name, argc, depth + 1);
         if (m) return m;
     }
     return NULL;
+}
+
+static zan_symbol_t *resolve_iface_overload(zan_symbol_t *iface, zan_istr_t name,
+                                            int argc) {
+    return resolve_iface_overload_depth(iface, name, argc, 0);
 }
 
 /* Defined in irgen_abi.c, which is part of this translation unit. */

@@ -549,7 +549,18 @@ static bool type_has_own_member(zan_symbol_t *type_sym, zan_istr_t name) {
 static void resolve_bases(zan_binder_t *b, zan_ast_node_t *type_node) {
     zan_symbol_t *type_sym = scope_find(b->current_scope, type_node->type_decl.name);
     if (!type_sym || !type_sym->type || type_sym->decl != type_node) return;
-    if (type_sym->type->bases_resolved) return;   /* done or cycle guard */
+    if (type_sym->type->bases_resolved == 2) return;   /* done */
+    if (type_sym->type->bases_resolved == 1) {
+        /* Re-entered while still on the inheritance stack: the base edge we
+         * are resolving closes a cycle (`class A : B {} class B : A {}`).
+         * Report it and leave bases_resolved at 1 so the caller that recursed
+         * into us can see the resolution failed and skip this edge. */
+        zan_diag_emit(b->diag, DIAG_ERROR, type_node->loc,
+                      "cyclic inheritance involving '%.*s'",
+                      (int)type_node->type_decl.name.len,
+                      type_node->type_decl.name.str);
+        return;
+    }
     type_sym->type->bases_resolved = 1;
 
     if (type_node->type_decl.bases.count > 0) {
@@ -561,7 +572,12 @@ static void resolve_bases(zan_binder_t *b, zan_ast_node_t *type_node) {
             zan_ast_node_t *base_ref = type_node->type_decl.bases.items[bx];
             zan_istr_t base_name = base_ref->type_ref.name;
             zan_symbol_t *base_sym = scope_find(b->current_scope, base_name);
-            if (!base_sym) continue;
+            if (!base_sym) {
+                zan_diag_emit(b->diag, DIAG_ERROR, base_ref->loc,
+                              "undefined base type '%.*s'",
+                              (int)base_name.len, base_name.str);
+                continue;
+            }
             if ((base_sym->kind == SYM_CLASS || base_sym->kind == SYM_STRUCT) &&
                 !type_sym->type->base_type) {
                 /* make sure the base has its own inherited fields first */
@@ -570,6 +586,11 @@ static void resolve_bases(zan_binder_t *b, zan_ast_node_t *type_node) {
                      base_sym->decl->kind == AST_STRUCT_DECL)) {
                     resolve_bases(b, base_sym->decl);
                 }
+                /* A base whose own resolution was interrupted hit a cycle:
+                 * adopting it would build a base_type ring that later passes
+                 * walk forever. Skip the edge (the cycle was already
+                 * diagnosed at the re-entry site). */
+                if (base_sym->type->bases_resolved != 2) continue;
                 type_sym->type->base_type = base_sym->type;
                 /* inherit base class fields and properties (prefix layout):
                  * collect the base's non-shadowed fields/properties, then
@@ -602,6 +623,8 @@ static void resolve_bases(zan_binder_t *b, zan_ast_node_t *type_node) {
                     type_sym->member_cap = total;
                 }
             } else if (base_sym->kind == SYM_INTERFACE) {
+                if (base_sym->decl) resolve_bases(b, base_sym->decl);
+                if (base_sym->type->bases_resolved != 2) continue;
                 ifaces[nif++] = base_sym->type;
             }
         }
@@ -626,13 +649,73 @@ static void resolve_bases(zan_binder_t *b, zan_ast_node_t *type_node) {
  *
  * Runs between pass 1 (types registered) and pass 2 (members bound), so the
  * copies are bound as members of the implementing type. */
-static bool type_declares_method(zan_ast_node_t *type_node, zan_istr_t name) {
+static bool binder_type_equal(zan_type_t *a, zan_type_t *b, int depth) {
+    if (!a || !b) return a == b;
+    if (a == b) return true;
+    if (depth > 64 || a->kind != b->kind) return false;
+    if (a->kind == TYPE_ARRAY || a->kind == TYPE_NULLABLE)
+        return binder_type_equal(a->element_type, b->element_type, depth + 1);
+    if (a->kind == TYPE_DELEGATE) {
+        if (a->delegate_is_async != b->delegate_is_async ||
+            a->delegate_param_count != b->delegate_param_count ||
+            !binder_type_equal(a->delegate_ret_type, b->delegate_ret_type, depth + 1))
+            return false;
+        for (int i = 0; i < a->delegate_param_count; i++)
+            if (!binder_type_equal(a->delegate_param_types[i],
+                                   b->delegate_param_types[i], depth + 1))
+                return false;
+        return true;
+    }
+    if (a->type_arg_count != b->type_arg_count) return false;
+    if (a->sym && b->sym && a->sym != b->sym) return false;
+    if ((!a->sym || !b->sym) &&
+        (a->name.len != b->name.len ||
+         memcmp(a->name.str, b->name.str, (size_t)a->name.len) != 0))
+        return false;
+    for (int i = 0; i < a->type_arg_count; i++)
+        if (!binder_type_equal(a->type_args[i], b->type_args[i], depth + 1))
+            return false;
+    return true;
+}
+
+static bool method_signature_equal(zan_binder_t *b, zan_ast_node_t *a,
+                                   zan_ast_node_t *other) {
+    if (!a || !other || a->kind != AST_METHOD_DECL ||
+        other->kind != AST_METHOD_DECL ||
+        a->method_decl.name.len != other->method_decl.name.len ||
+        memcmp(a->method_decl.name.str, other->method_decl.name.str,
+               (size_t)a->method_decl.name.len) != 0)
+        return false;
+    if (((a->method_decl.modifiers ^ other->method_decl.modifiers) &
+         (MOD_STATIC | MOD_ASYNC)) != 0)
+        return false;
+    if (a->method_decl.params.count != other->method_decl.params.count)
+        return false;
+    zan_type_t *ar = a->method_decl.return_type
+        ? zan_binder_resolve_type(b, a->method_decl.return_type) : b->type_void;
+    zan_type_t *br = other->method_decl.return_type
+        ? zan_binder_resolve_type(b, other->method_decl.return_type) : b->type_void;
+    if (!binder_type_equal(ar, br, 0)) return false;
+    for (int i = 0; i < a->method_decl.params.count; i++) {
+        zan_ast_node_t *ap = a->method_decl.params.items[i];
+        zan_ast_node_t *bp = other->method_decl.params.items[i];
+        if (!ap || !bp || ap->kind != AST_PARAM || bp->kind != AST_PARAM ||
+            ap->param.by_ref != bp->param.by_ref ||
+            ap->param.is_params != bp->param.is_params ||
+            ap->param.is_this != bp->param.is_this)
+            return false;
+        zan_type_t *at = zan_binder_resolve_type(b, ap->param.type);
+        zan_type_t *bt = zan_binder_resolve_type(b, bp->param.type);
+        if (!binder_type_equal(at, bt, 0)) return false;
+    }
+    return true;
+}
+
+static bool type_declares_method(zan_binder_t *b, zan_ast_node_t *type_node,
+                                 zan_ast_node_t *wanted) {
     for (int i = 0; i < type_node->type_decl.members.count; i++) {
         zan_ast_node_t *m = type_node->type_decl.members.items[i];
-        if (m->kind != AST_METHOD_DECL) continue;
-        if (m->method_decl.name.len == name.len &&
-            memcmp(m->method_decl.name.str, name.str, (size_t)name.len) == 0)
-            return true;
+        if (method_signature_equal(b, m, wanted)) return true;
     }
     return false;
 }
@@ -644,7 +727,7 @@ static void inherit_default_methods(zan_binder_t *b, zan_ast_node_t *type_node,
         zan_ast_node_t *m = iface_node->type_decl.members.items[i];
         if (m->kind != AST_METHOD_DECL || !m->method_decl.body) continue;
         if ((m->method_decl.modifiers & MOD_STATIC) != 0) continue;
-        if (type_declares_method(type_node, m->method_decl.name)) continue;
+        if (type_declares_method(b, type_node, m)) continue;
         /* Shallow copy: the body and parameter list are read-only here, but the
          * node identity must differ per implementing type, since irgen keys a
          * method's symbol and its emitted function on the declaration node. */
@@ -670,6 +753,59 @@ static void bind_default_interface_methods(zan_binder_t *b, zan_ast_list_t *decl
                 decl->type_decl.bases.items[bx]->type_ref.name);
             if (bs && bs->kind == SYM_INTERFACE && bs->decl)
                 inherit_default_methods(b, decl, bs->decl, 0);
+        }
+    }
+}
+
+static bool class_has_interface_method(zan_binder_t *b, zan_symbol_t *cls,
+                                       zan_ast_node_t *wanted) {
+    for (zan_symbol_t *s = cls; s; s = (s->type && s->type->base_type)
+             ? s->type->base_type->sym : NULL) {
+        for (int i = 0; i < s->member_count; i++) {
+            zan_symbol_t *m = s->members[i];
+            if (m && m->kind == SYM_METHOD && m->decl &&
+                method_signature_equal(b, m->decl, wanted))
+                return true;
+        }
+    }
+    return false;
+}
+
+static void validate_interface_contract(zan_binder_t *b, zan_symbol_t *cls,
+                                        zan_ast_node_t *iface, int depth) {
+    if (!iface || depth > 64) return;
+    for (int i = 0; i < iface->type_decl.members.count; i++) {
+        zan_ast_node_t *im = iface->type_decl.members.items[i];
+        if (im->kind != AST_METHOD_DECL ||
+            (im->method_decl.modifiers & MOD_STATIC) != 0 ||
+            im->method_decl.body)
+            continue;
+        if (!class_has_interface_method(b, cls, im)) {
+            zan_diag_emit(b->diag, DIAG_ERROR, im->loc,
+                          "type '%.*s' does not implement interface method '%.*s'",
+                          (int)cls->name.len, cls->name.str,
+                          (int)im->method_decl.name.len,
+                          im->method_decl.name.str);
+        }
+    }
+    for (int i = 0; i < iface->type_decl.bases.count; i++) {
+        zan_symbol_t *base = scope_find(b->current_scope,
+            iface->type_decl.bases.items[i]->type_ref.name);
+        if (base && base->kind == SYM_INTERFACE && base->decl)
+            validate_interface_contract(b, cls, base->decl, depth + 1);
+    }
+}
+
+static void validate_interface_contracts(zan_binder_t *b, zan_ast_list_t *decls) {
+    for (int i = 0; i < decls->count; i++) {
+        zan_ast_node_t *decl = decls->items[i];
+        if (decl->kind != AST_CLASS_DECL && decl->kind != AST_STRUCT_DECL) continue;
+        zan_symbol_t *cls = scope_find(b->current_scope, decl->type_decl.name);
+        if (!cls || !cls->type) continue;
+        for (int j = 0; j < cls->type->interface_count; j++) {
+            zan_type_t *iface = cls->type->interfaces[j];
+            if (iface && iface->sym && iface->sym->decl)
+                validate_interface_contract(b, cls, iface->sym->decl, 0);
         }
     }
 }
@@ -791,6 +927,11 @@ void zan_binder_bind(zan_binder_t *b, zan_ast_node_t *unit) {
             resolve_bases(b, decl);
         }
     }
+
+    /* Every interface contract is checked after inherited members and default
+     * methods are known, so a class method with the right name but the wrong
+     * signature cannot silently satisfy the interface. */
+    validate_interface_contracts(b, &unit->comp_unit.decls);
 
     /* keep generic type parameters resolvable for the checker / irgen passes */
     register_type_params(b, &unit->comp_unit.decls);

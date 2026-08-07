@@ -2725,6 +2725,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                         LLVMGetIntTypeWidth(LLVMTypeOf(idx)) < 64) {
                         idx = LLVMBuildSExt(g->builder, idx, i64, "idx.sx");
                     }
+                    emit_index_bounds_check(g, idx, count, expr->loc, "list");
                     unsigned rwords = elem_slot_words(g, container_elem_type(ltype));
                     LLVMValueRef widx = slot_word_index(g, idx, rwords);
                     LLVMValueRef removed_ptr = LLVMBuildGEP2(g->builder, i64, data, &widx, 1, "rmp");
@@ -2914,6 +2915,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                     unsigned ins_words = elem_slot_words(g, elem_type);
                     LLVMValueRef idx = coerce_int_to(g,
                         emit_expr(g, expr->call.args.items[0], locals), i64);
+                    emit_index_range_check(g, idx, count, true,
+                                           expr->loc, "list");
                     /* Keep `item` in its natural type (pointer for string/class
                      * elements) so emit_collection_slot_store can retain it:
                      * emit_string_retain/emit_arc_retain no-op on non-pointer
@@ -3121,10 +3124,9 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                         LLVMValueRef vslot = LLVMBuildGEP2(g->builder, i64, vs,
                             &word, 1, "tgv.vsl");
                         LLVMValueRef vv = load_collection_slot_value(g, value_type, vslot);
-                        if (value_type && is_rc_managed_type(value_type)) {
-                            emit_rc_retain_for_type(g, value_type, vv);
+                        if (out_ptr) {
+                            emit_typed_out_store(g, value_type, out_ptr, vv);
                         }
-                        if (out_ptr) { zan_store_fit(g, vv, out_ptr); }
                         LLVMBuildStore(g->builder, LLVMConstInt(i32t, 1, 0), res_a);
                         LLVMBuildBr(g->builder, done_bb);
                         LLVMPositionBuilderAtEnd(g->builder, miss_bb);
@@ -3713,7 +3715,12 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                         LLVMPositionBuilderAtEnd(g->builder, nextbb);
                     }
 
-                    /* no matching class: yield a null/zero result */
+                    /* A well-formed interface value must have a matching
+                     * implementation. Reaching this arm means the tag or the
+                     * emitted method table is inconsistent; abort instead of
+                     * returning a fabricated null/zero and swallowing the call. */
+                    emit_runtime_check(g, LLVMConstInt(LLVMInt1TypeInContext(c), 1, 0),
+                                       expr->loc, "interface dispatch has no implementation");
                     if (has_res) {
                         phi_vals[np] = LLVMConstNull(res_ty);
                         phi_bbs[np] = LLVMGetInsertBlock(g->builder); np++;

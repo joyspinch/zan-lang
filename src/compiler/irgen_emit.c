@@ -934,7 +934,8 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
                     strncmp(ext_name, "zan_shared_table_", 17) == 0 ||
                     strncmp(ext_name, "zan_thread_", 11) == 0 ||
                     strncmp(ext_name, "zan_dispatch_", 13) == 0 ||
-                    strncmp(ext_name, "zan_monotonic_", 14) == 0) {
+                    strncmp(ext_name, "zan_monotonic_", 14) == 0 ||
+                    strncmp(ext_name, "zan_plat_", 9) == 0) {
                     g->uses_sync_runtime = true;
                 }
                 if (strncmp(ext_name, "zan_io_socket_", 14) == 0) {

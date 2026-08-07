@@ -236,6 +236,7 @@ static void check_implicit_narrowing(zan_irgen_t *g, zan_type_t *dst,
                                       zan_type_t *src, zan_ast_node_t *at,
                                       const char *what) {
     if (!g || !g->diag || !at || !dst || !src) return;
+    if (at->kind == AST_CAST_EXPR) return;
     int64_t cv;
     if (const_int_expr(at, &cv) && const_fits(dst, cv)) return;
     int rd = conv_rank(dst), rs = conv_rank(src);
@@ -247,11 +248,19 @@ static void check_implicit_narrowing(zan_irgen_t *g, zan_type_t *dst,
      * pointer bits are lost before the value reaches the runtime/FFI call. */
     bool native_handle_loss =
         src->kind == TYPE_NINT && dst->kind != TYPE_NINT && rd < 8;
+    /* An implicit float/double -> integral conversion is not a truncation but
+     * a bit-pattern misread (3.14 does not become 3; it becomes the low bits
+     * of the double representation), so it is an unconditional error even
+     * though integer narrowing stays an opt-in migration diagnostic. */
+    bool float_to_int_loss = src_float && rd != 0;
     bool loses = src_float || rs > rd || native_handle_loss;
     if (!loses) return;
-    if (!native_handle_loss && !narrow_warn_enabled()) return;
+    if (!float_to_int_loss && !native_handle_loss && !narrow_warn_enabled())
+        return;
 
-    zan_diag_emit(g->diag, native_handle_loss ? DIAG_ERROR : DIAG_WARNING,
+    zan_diag_emit(g->diag,
+                  (float_to_int_loss || native_handle_loss) ? DIAG_ERROR
+                                                            : DIAG_WARNING,
                   at->loc,
                   "narrowing conversion from '%s' to '%s' in %s needs an "
                   "explicit cast (C# rules)",
@@ -715,6 +724,13 @@ static int method_group_score(zan_irgen_t *g, zan_symbol_t *mg, zan_type_t *pt) 
 
 static struct zan_ctor_entry *find_ctor(zan_irgen_t *g, zan_symbol_t *type_sym,
                                         zan_ast_list_t *args, local_scope_t *locals,
+                                        zan_ast_node_t *exclude);
+static bool implicit_ctor_for_arg(zan_irgen_t *g, zan_type_t *target,
+                                  zan_type_t *source, zan_ast_node_t *arg,
+                                  local_scope_t *locals);
+
+static struct zan_ctor_entry *find_ctor(zan_irgen_t *g, zan_symbol_t *type_sym,
+                                        zan_ast_list_t *args, local_scope_t *locals,
                                         zan_ast_node_t *exclude) {
     struct zan_ctor_entry *first = NULL;
     struct zan_ctor_entry *best = NULL;
@@ -790,6 +806,10 @@ static struct zan_ctor_entry *find_ctor(zan_irgen_t *g, zan_symbol_t *type_sym,
                     score += 2;
                     continue;
                 }
+                if (implicit_ctor_for_arg(g, pt, at, args->items[j], locals)) {
+                    score += 1;
+                    continue;
+                }
                 if (pf == FAM_FLOAT && af == FAM_INT)
                     continue;
                 if (str_and_byte_buffer(pt, at) || str_and_byte_buffer(at, pt))
@@ -804,6 +824,37 @@ static struct zan_ctor_entry *find_ctor(zan_irgen_t *g, zan_symbol_t *type_sym,
         }
     }
     return locals ? best : first;
+}
+
+/* A primitive value may be materialized as a class only when the destination
+ * declares a matching one-argument constructor. This is deliberately narrow:
+ * reference-to-reference assignment remains the normal path, while a raw
+ * integer/bool must never reach emit_boundary_coerce as an inttoptr. */
+static bool is_implicit_ctor_source(zan_type_t *t) {
+    if (!t) return false;
+    switch (t->kind) {
+    case TYPE_BOOL:
+    case TYPE_SBYTE: case TYPE_BYTE: case TYPE_SHORT: case TYPE_USHORT:
+    case TYPE_INT: case TYPE_UINT: case TYPE_LONG: case TYPE_ULONG:
+    case TYPE_NINT: case TYPE_CHAR: case TYPE_ENUM:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool implicit_ctor_for_arg(zan_irgen_t *g, zan_type_t *target,
+                                  zan_type_t *source, zan_ast_node_t *arg,
+                                  local_scope_t *locals) {
+    if (!target || target->kind != TYPE_CLASS || !target->sym ||
+        !is_implicit_ctor_source(source) || !arg || !locals)
+        return false;
+    zan_ast_node_t *items[1] = { arg };
+    zan_ast_list_t one;
+    one.items = items;
+    one.count = 1;
+    one.capacity = 1;
+    return find_ctor(g, target->sym, &one, locals, NULL) != NULL;
 }
 
 /* Whether the type declares any constructor at all: a class that does, but
@@ -952,6 +1003,10 @@ static int method_args_score(zan_irgen_t *g, zan_symbol_t *m,
             int pf = type_family(pt), af = type_family(at);
             if (pf == FAM_UNKNOWN || af == FAM_UNKNOWN) continue;
             if (pf == af) { score += 2; continue; }
+            if (implicit_ctor_for_arg(g, pt, at, a, locals)) {
+                score += 1;
+                continue;
+            }
             /* integer arguments widen to floating parameters */
             if (pf == FAM_FLOAT && af == FAM_INT) continue;
             return -1;
@@ -1688,18 +1743,26 @@ static zan_symbol_t *expr_class_sym(zan_irgen_t *g, zan_ast_node_t *e,
 
 /* True when class `cls` (or one of its base classes) declares `iface` — or an
  * interface that itself extends `iface` — in its implements list. */
-static bool class_implements_iface(zan_symbol_t *cls, zan_symbol_t *iface) {
-    if (!cls || !cls->type || !iface) return false;
+static bool class_implements_iface_depth(zan_symbol_t *cls, zan_symbol_t *iface,
+                                          int depth) {
+    if (!cls || !cls->type || !iface || depth > 512) return false;
     for (int i = 0; i < cls->type->interface_count; i++) {
         zan_type_t *it = cls->type->interfaces[i];
         if (!it || !it->sym) continue;
         if (it->sym == iface) return true;
-        if (it->sym != cls && class_implements_iface(it->sym, iface)) return true;
+        if (it->sym != cls &&
+            class_implements_iface_depth(it->sym, iface, depth + 1))
+            return true;
     }
     if (cls->type->base_type && cls->type->base_type->sym &&
         cls->type->base_type->sym != cls)
-        return class_implements_iface(cls->type->base_type->sym, iface);
+        return class_implements_iface_depth(cls->type->base_type->sym,
+                                            iface, depth + 1);
     return false;
+}
+
+static bool class_implements_iface(zan_symbol_t *cls, zan_symbol_t *iface) {
+    return class_implements_iface_depth(cls, iface, 0);
 }
 
 /* True when the program (or the stdlib it was compiled with) declares a type
@@ -1727,16 +1790,26 @@ static bool zan_type_defines(zan_irgen_t *g, const char *type_name,
  * pointer can still be handed to C unchanged. */
 #define ZAN_ARRAY_HEADER 16
 
+static void emit_runtime_check(zan_irgen_t *g, LLVMValueRef is_error,
+                               zan_loc_t loc, const char *msg);
+
 static LLVMValueRef zan_array_alloc(zan_irgen_t *g, LLVMValueRef total,
                                     LLVMValueRef count) {
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
     LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
     LLVMTypeRef i8ptr = LLVMPointerType(i8, 0);
-    LLVMValueRef bytes = LLVMBuildAdd(g->builder, total,
-        LLVMConstInt(i64, ZAN_ARRAY_HEADER, 0), "arr.bytes");
+    LLVMValueRef max_i64 = LLVMConstInt(i64, UINT64_MAX, 0);
+    LLVMValueRef header = LLVMConstInt(i64, ZAN_ARRAY_HEADER, 0);
+    LLVMValueRef max_total = LLVMBuildSub(g->builder, max_i64, header, "arr.max");
+    LLVMValueRef overflow = zan_icmp(g->builder, LLVMIntUGT, total,
+        max_total, "arr.overflow");
+    emit_runtime_check(g, overflow, (zan_loc_t){0}, "array allocation overflow");
+    LLVMValueRef bytes = LLVMBuildAdd(g->builder, total, header, "arr.bytes");
     LLVMValueRef raw = zan_call2(g->builder,
         LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i64, i64 }, 2, 0),
         get_calloc_fn(g), (LLVMValueRef[]){ bytes, LLVMConstInt(i64, 1, 0) }, 2, "arr.raw");
+    LLVMValueRef null_raw = LLVMBuildIsNull(g->builder, raw, "arr.null");
+    emit_runtime_check(g, null_raw, (zan_loc_t){0}, "array allocation failed");
     LLVMBuildStore(g->builder, count,
         LLVMBuildBitCast(g->builder, raw, LLVMPointerType(i64, 0), "arr.hdr"));
     LLVMValueRef off = LLVMConstInt(i64, ZAN_ARRAY_HEADER, 0);

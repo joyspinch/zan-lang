@@ -906,7 +906,13 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                     unsigned fn_bits = LLVMGetIntTypeWidth(fn_ret);
                     unsigned val_bits = LLVMGetIntTypeWidth(val_t);
                     if (fn_bits > val_bits) {
-                        val = LLVMBuildSExt(g->builder, val, fn_ret, "retext");
+                        /* Of the narrow widths only i1 (`bool`) and i8 (`byte`)
+                         * occur and both are unsigned, so `return someByte;`
+                         * from an `int` method must zero-extend -- sign-extending
+                         * made `return buf[i];` read 0xE4 back as -28. */
+                        val = val_bits <= 8
+                            ? LLVMBuildZExt(g->builder, val, fn_ret, "retzext")
+                            : LLVMBuildSExt(g->builder, val, fn_ret, "retext");
                     } else if (fn_bits < val_bits) {
                         val = LLVMBuildTrunc(g->builder, val, fn_ret, "rettrunc");
                     }

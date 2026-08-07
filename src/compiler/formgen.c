@@ -71,211 +71,59 @@ static void fg_putf(fg_buf_t *b, const char *fmt, ...) {
     b->buf[b->len] = '\0';
 }
 
-/* Highest built-in design type (mirrors FormField.MaxType). */
-#define FG_MAX_TYPE 71
-
-/* ---- design type table (mirrors FormField.TypeKey / TypeName) ---- */
-
-static const char *fg_kind_of(int ft) {
-    switch (ft) {
-    case 1:  return "textarea";
-    case 2:  return "password";
-    case 3:  return "number";
-    case 4:  return "radio";
-    case 5:  return "checkbox";
-    case 6:  return "select";
-    case 7:  return "switch";
-    case 8:  return "rate";
-    case 9:  return "slider";
-    case 10: return "date";
-    case 11: return "time";
-    case 12: return "upload";
-    case 13: return "color";
-    case 14: return "richtext";
-    case 15: return "title";
-    case 16: return "text";
-    case 17: return "divider";
-    case 18: return "card";
-    case 19: return "tag";
-    case 20: return "badge";
-    case 21: return "avatar";
-    case 22: return "statistic";
-    case 23: return "table";
-    case 24: return "timeline";
-    case 25: return "tree";
-    case 26: return "collapse";
-    case 27: return "empty";
-    case 28: return "alert";
-    case 29: return "progress";
-    case 30: return "result";
-    case 31: return "skeleton";
-    case 32: return "spin";
-    case 33: return "tooltip";
-    case 34: return "steps";
-    case 35: return "breadcrumb";
-    case 36: return "tabs";
-    case 37: return "pagination";
-    case 38: return "menu";
-    case 39: return "pageheader";
-    case 40: return "listview";
-    case 41: return "datatable";
-    case 42: return "carousel";
-    case 43: return "chart";
-    case 44: return "ellipsis";
-    case 45: return "panel";
-    case 46: return "scrollbar";
-    case 47: return "loading";
-    case 48: return "dropdown";
-    case 49: return "floatbutton";
-    case 50: return "popover";
-    case 51: return "popconfirm";
-    case 52: return "notification";
-    case 53: return "ribbon";
-    case 54: return "icon";
-    case 55: return "contextmenu";
-    case 56: return "layer";
-    case 57: return "timer";
-    case 58: return "toolbar";
-    case 59: return "statusbar";
-    case 60: return "split";
-    case 61: return "dockpanel";
-    case 62: return "led";
-    case 63: return "digital";
-    case 64: return "gauge";
-    case 65: return "bargraph";
-    case 66: return "trend";
-    case 67: return "alarmbanner";
-    case 68: return "alarmlist";
-    case 69: return "numpad";
-    case 70: return "devicecard";
-    case 71: return "equippanel";
-    default:  return "input";
-    }
-}
-
-/* Field type of a .zform field object: "kind" string wins, else "type" int. */
-static int fg_ftype_of(zan_json_value_t *o) {
+/* A .zform field names the concrete Zan Control class directly.  There is no
+ * numeric type table here: the generated source is intentionally generic so
+ * a project can add any Control without changing the compiler. */
+static const char *fg_kind_of(zan_json_value_t *o) {
     zan_json_value_t *k = zan_json_get(o, "kind");
-    if (k && k->type == ZAN_JSON_STRING && k->string_val.str) {
-        const char *s = k->string_val.str;
-        size_t n = k->string_val.len;
-        for (int ft = 0; ft <= FG_MAX_TYPE; ft++) {
-            const char *kk = fg_kind_of(ft);
-            if (strlen(kk) == n && memcmp(kk, s, n) == 0) return ft;
+    if (k && k->type == ZAN_JSON_STRING && k->string_val.str)
+        return k->string_val.str;
+    return "";
+}
+
+static bool fg_is_ident(const char *s);
+
+static void fg_validate_fields(zan_json_value_t *arr, zan_diag_t *diag,
+                               const char *file_name) {
+    if (!arr || arr->type != ZAN_JSON_ARRAY) return;
+    for (int i = 0; i < arr->array_val.count; i++) {
+        zan_json_value_t *o = arr->array_val.items[i];
+        if (!o || o->type != ZAN_JSON_OBJECT) {
+            if (diag) {
+                zan_diag_emit(diag, DIAG_ERROR, zan_loc(0, 0, 0, 0),
+                              "%s: .zform field %d must be an object",
+                              file_name ? file_name : "<design>", i);
+            }
+            continue;
         }
-        if (n == 6 && memcmp(s, "custom", 6) == 0) return 100;
-        return 0;
+        const char *kind = fg_kind_of(o);
+        if (!fg_is_ident(kind) && diag) {
+            zan_diag_emit(diag, DIAG_ERROR, zan_loc(0, 0, 0, 0),
+                          "%s: .zform field %d requires a valid Zan Control kind; use the class name in \"kind\"",
+                          file_name ? file_name : "<design>", i);
+        }
+        zan_json_value_t *kids = zan_json_get(o, "kids");
+        fg_validate_fields(kids, diag, file_name);
     }
-    zan_json_value_t *t = zan_json_get(o, "type");
-    if (t && t->type == ZAN_JSON_NUMBER) return (int)t->number_val;
+}
+
+/* A field with children.  Container semantics belong to the
+ * Control implementation; formgen only preserves the declared tree. */
+static bool fg_is_container(zan_json_value_t *o) {
+    zan_json_value_t *kids = zan_json_get(o, "kids");
+    return kids && kids->type == ZAN_JSON_ARRAY;
+}
+
+static int fg_obj_num(zan_json_value_t *o, const char *key, int def);
+
+static int fg_default_dock(zan_json_value_t *o) {
+    (void)o;
     return 0;
 }
 
-/* Concrete Gui widget type for a field type (mirrors
- * ZanIDE.CodeNav.WidgetTypeOf and FormField.HasWidgetOf). Anything unmapped
- * renders as Label so the form always compiles and shows its caption. */
-static const char *fg_widget_type(int ft) {
-    /* A project component is declared as the Control base: its concrete class
-     * comes from the design's `custom` kind. */
-    if (ft == 100) return "Control";
-    if (ft == 0 || ft == 2 || ft == 3) return "Input";
-    if (ft == 1 || ft == 14) return "TextArea";
-    if (ft == 4) return "RadioGroup";
-    if (ft == 5) return "CheckboxGroup";
-    if (ft == 6 || ft == 48) return "SelectBox";
-    if (ft == 7) return "Switch";
-    if (ft == 8) return "Rate";
-    if (ft == 9) return "Slider";
-    if (ft == 29) return "Progress";
-    if (ft == 49) return "FloatButton";
-    if (ft == 17) return "Divider";
-    if (ft == 19) return "Tag";
-    if (ft == 20) return "Badge";
-    if (ft == 21) return "Avatar";
-    if (ft == 22) return "Statistic";
-    if (ft == 24) return "Timeline";
-    if (ft == 25) return "TreeView";
-    if (ft == 26) return "Collapse";
-    if (ft == 27) return "Empty";
-    if (ft == 30) return "Result";
-    if (ft == 31) return "Skeleton";
-    if (ft == 32) return "Spin";
-    if (ft == 34) return "Steps";
-    if (ft == 35) return "Breadcrumb";
-    if (ft == 37) return "Pagination";
-    if (ft == 39) return "PageHeader";
-    if (ft == 42) return "Carousel";
-    if (ft == 18 || ft == 45 || ft == 36 || ft == 61) return "Panel";
-    if (ft == 58) return "ToolStrip";
-    if (ft == 59) return "StatusBar";
-    if (ft == 60) return "SplitPanel";
-    if (ft == 62) return "Led";
-    if (ft == 63) return "Digital";
-    if (ft == 64) return "Gauge";
-    if (ft == 65) return "Bargraph";
-    if (ft == 66) return "Trend";
-    if (ft == 67) return "AlarmBanner";
-    if (ft == 68) return "AlarmList";
-    if (ft == 69) return "NumPad";
-    if (ft == 70) return "DeviceCard";
-    if (ft == 71) return "EquipPanel";
-    return "Label";
-}
-
-/* Whether a field needs a caption Label above it (mirrors FieldNeedsCaption). */
-static bool fg_needs_caption(int ft) {
-    return ft == 0 || ft == 1 || ft == 2 || ft == 3 || ft == 4 || ft == 5
-        || ft == 6 || ft == 8 || ft == 9 || ft == 29 || ft == 14 || ft == 48;
-}
-
-/* Preferred height of a field (mirrors PrefHOf). */
-static int fg_pref_h(int ft) {
-    if (ft == 1 || ft == 14) return 90;
-    if (ft == 29) return 16;
-    if (ft == 15) return 30;
-    if (ft == 5 || ft == 7 || ft == 4 || ft == 8) return 26;
-    if (ft == 49) return 36;
-    if (ft == 58) return 34;
-    if (ft == 59) return 24;
-    if (ft == 60 || ft == 61) return 240;
-    if (ft == 62) return 26;
-    if (ft == 63) return 72;
-    if (ft == 64) return 160;
-    if (ft == 65) return 180;
-    if (ft == 66) return 200;
-    if (ft == 67) return 32;
-    if (ft == 68) return 200;
-    if (ft == 69) return 260;
-    if (ft == 70) return 140;
-    if (ft == 71) return 300;
-    return 32;
-}
-
-/* Container types nest children (mirrors FormField.IsContainerOf). */
-static bool fg_is_container(int ft) {
-    return ft == 18 || ft == 36 || ft == 60 || ft == 61;
-}
-
-/* Dock edge a shell bar takes when the design does not name one: a tool strip
- * spans the top, a status bar the bottom, a dock panel fills what is left.
- * 0 keeps the free-canvas absolute placement. */
-static int fg_default_dock(int ft) {
-    if (ft == 58) return 1;
-    if (ft == 59) return 2;
-    if (ft == 61) return 5;
-    return 0;
-}
-
-/* Option `i` of a field as a NUL-terminated string, or `def`. Split panels
- * keep their orientation/size in the generic options list so no extra schema
- * keys are needed: options[0] = "vertical"|"horizontal", options[1] = size. */
-static const char *fg_option_at(zan_json_value_t *o, int i, const char *def) {
-    zan_json_value_t *opts = zan_json_get(o, "options");
-    if (!opts || opts->type != ZAN_JSON_ARRAY || i >= opts->array_val.count)
-        return def;
-    zan_json_value_t *it = opts->array_val.items[i];
-    if (!it || it->type != ZAN_JSON_STRING || !it->string_val.str) return def;
-    return it->string_val.str;
+static int fg_pref_h(zan_json_value_t *o) {
+    int h = fg_obj_num(o, "fh", 32);
+    return h > 0 ? h : 32;
 }
 
 /* ---- string helpers ---- */
@@ -351,244 +199,39 @@ static const char *fg_obj_str(zan_json_value_t *o, const char *key) {
     return "";
 }
 
-/* The field's display caption: label, else field name, else "". */
-static const char *fg_caption(zan_json_value_t *o) {
-    const char *label = fg_obj_str(o, "label");
-    if (label && label[0]) return label;
-    const char *fname = fg_obj_str(o, "name");
-    if (fname && fname[0]) return fname;
-    return "";
-}
-
 /* ---- per-field code emission (mirrors EmitBuildField / CtorExpr /
  *      EmitFieldSetup, plus the missing event wiring) ---- */
 
-static void fg_ctor(fg_buf_t *b, zan_json_value_t *o, int ft, const char *wt) {
-    const char *cap = fg_caption(o);
-    if (strcmp(wt, "Input") == 0) {
-        fg_putf(b, "new Input(\"");
-        fg_esc_cstr(b, fg_obj_str(o, "placeholder"));
-        fg_putf(b, "\")");
-    } else if (strcmp(wt, "TextArea") == 0) {
-        fg_putf(b, "new TextArea(\"");
-        fg_esc_cstr(b, fg_obj_str(o, "placeholder"));
-        fg_putf(b, "\")");
-    } else if (strcmp(wt, "Button") == 0) {
-        fg_putf(b, "new Button { Text = \"");
-        fg_esc_cstr(b, cap);
-        fg_putf(b, "\" }");
-    } else if (strcmp(wt, "CheckboxGroup") == 0) {
-        fg_putf(b, "new CheckboxGroup()");
-    } else if (strcmp(wt, "Switch") == 0) {
-        fg_putf(b, "new Switch()");
-    } else if (strcmp(wt, "RadioGroup") == 0) {
-        fg_putf(b, "new RadioGroup()");
-    } else if (strcmp(wt, "Slider") == 0) {
-        fg_putf(b, "new Slider(0, 100, new SignalInt(0))");
-    } else if (strcmp(wt, "SelectBox") == 0) {
-        fg_putf(b, "SelectBox.FromOptions(new List<string>(), \"\")");
-    } else if (strcmp(wt, "Progress") == 0) {
-        fg_putf(b, "new Progress(50, 1)");
-    } else if (strcmp(wt, "Divider") == 0 || strcmp(wt, "Tag") == 0
-               || strcmp(wt, "Avatar") == 0 || strcmp(wt, "Empty") == 0) {
-        /* Display widgets whose only content is the designed caption. */
-        fg_putf(b, "new %s(\"", wt);
-        fg_esc_cstr(b, cap);
-        fg_putf(b, "\")");
-    } else if (strcmp(wt, "Badge") == 0) {
-        fg_putf(b, "new Badge(%d)", atoi(fg_option_at(o, 0, "0")));
-    } else if (strcmp(wt, "Statistic") == 0) {
-        fg_putf(b, "new Statistic(\"");
-        fg_esc_cstr(b, cap);
-        fg_putf(b, "\", \"");
-        fg_esc_cstr(b, fg_option_at(o, 0, "0"));
-        fg_putf(b, "\")");
-    } else if (strcmp(wt, "Result") == 0 || strcmp(wt, "PageHeader") == 0) {
-        fg_putf(b, "new %s(\"", wt);
-        fg_esc_cstr(b, cap);
-        fg_putf(b, "\", \"");
-        fg_esc_cstr(b, fg_obj_str(o, "placeholder"));
-        fg_putf(b, "\")");
-    } else if (strcmp(wt, "Pagination") == 0) {
-        int total = atoi(fg_option_at(o, 0, "10"));
-        if (total <= 0) total = 10;
-        fg_putf(b, "new Pagination(%d)", total);
-    } else if (strcmp(wt, "Timeline") == 0 || strcmp(wt, "TreeView") == 0
-               || strcmp(wt, "Collapse") == 0 || strcmp(wt, "Steps") == 0
-               || strcmp(wt, "Breadcrumb") == 0 || strcmp(wt, "Carousel") == 0
-               || strcmp(wt, "Skeleton") == 0 || strcmp(wt, "Spin") == 0) {
-        /* Item-bearing widgets: constructed empty, filled in fg_field_setup
-         * from the designed options so design and runtime agree. */
-        fg_putf(b, "new %s()", wt);
-    } else if (strcmp(wt, "FloatButton") == 0) {
-        const char *icon = fg_obj_str(o, "icon");
-        fg_putf(b, "new FloatButton(\"");
-        fg_esc_cstr(b, icon[0] ? icon : "plus");
-        fg_putf(b, "\")");
-    } else if (strcmp(wt, "Control") == 0) {
-        /* Project component (`/// @component`): the designed kind names the
-         * class itself, which the project compiles alongside the form. */
-        const char *kind = fg_obj_str(o, "custom");
-        if (fg_is_ident(kind)) {
-            fg_putf(b, "new %s()", kind);
-        } else {
-            fg_putf(b, "new Panel(\"");
-            fg_esc_cstr(b, kind);
-            fg_putf(b, "\")");
-        }
-    } else if (strcmp(wt, "Rate") == 0) {
-        fg_putf(b, "new Rate(new SignalInt(0), 5)");
-    } else if (strcmp(wt, "Panel") == 0) {
-        fg_putf(b, "new Panel(\"");
-        fg_esc_cstr(b, fg_obj_str(o, "name"));
-        fg_putf(b, "\")");
-    } else if (strcmp(wt, "ToolStrip") == 0) {
-        fg_putf(b, "new ToolStrip()");
-    } else if (strcmp(wt, "StatusBar") == 0) {
-        fg_putf(b, "new StatusBar()");
-    } else if (strcmp(wt, "SplitPanel") == 0) {
-        const char *orient = fg_option_at(o, 0, "vertical");
-        int size = atoi(fg_option_at(o, 1, "240"));
-        if (size <= 0) size = 240;
-        fg_putf(b, "new SplitPanel(SplitPanel.%s(), %d)",
-                strcmp(orient, "horizontal") == 0 ? "Horizontal" : "Vertical",
-                size);
-    } else if (strcmp(wt, "Led") == 0 || strcmp(wt, "Digital") == 0
-               || strcmp(wt, "Gauge") == 0 || strcmp(wt, "Bargraph") == 0
-               || strcmp(wt, "Trend") == 0 || strcmp(wt, "DeviceCard") == 0) {
-        /* Industrial widgets all take the caption alone and are bound to a
-         * process tag by the code-behind, which is where the I/O lives. */
-        fg_putf(b, "new %s(\"", wt);
-        fg_esc_cstr(b, cap);
-        fg_putf(b, "\")");
-    } else if (strcmp(wt, "EquipPanel") == 0) {
-        fg_putf(b, "new EquipPanel()");
-    } else if (strcmp(wt, "AlarmBanner") == 0 || strcmp(wt, "AlarmList") == 0
-               || strcmp(wt, "NumPad") == 0) {
-        fg_putf(b, "new %s()", wt);
-    } else {
-        fg_putf(b, "new Label(\"");
-        fg_esc_cstr(b, cap);
-        fg_putf(b, "\")");
-    }
+/* Emit the component named by `kind` directly. The compiler deliberately does
+ * not know the component's implementation or maintain a type mapping. A
+ * missing class/constructor is reported by the normal Zan compiler. */
+static void fg_ctor(fg_buf_t *b, zan_json_value_t *o, const char *kind) {
+    (void)o;
+    fg_putf(b, "new %s()", kind);
 }
 
-/* Extra per-widget initialisation (checked/on state, select options). */
-static void fg_field_setup(fg_buf_t *b, zan_json_value_t *o, int ft,
-                           const char *wt, const char *vn) {
-    if (strcmp(wt, "RadioGroup") == 0 || strcmp(wt, "CheckboxGroup") == 0) {
-        char *opts = fg_join_opts(o);
-        if (opts && opts[0]) {
-            fg_putf(b, "        %s.SetOptionsText(\"", vn);
-            fg_esc_cstr(b, opts);
-            fg_putf(b, "\");\n");
-        }
-        free(opts);
+/* Apply schema-level properties without knowing what the component is. Each
+ * Control may override SetProp/SetExtra for its own options. */
+static void fg_field_setup(fg_buf_t *b, zan_json_value_t *o, const char *vn) {
+    char *opts = fg_join_opts(o);
+    if (opts && opts[0]) {
+        fg_putf(b, "        %s.SetProp(\"options\", \"", vn);
+        fg_esc_cstr(b, opts);
+        fg_putf(b, "\");\n");
     }
-    if (strcmp(wt, "Switch") == 0 && fg_obj_bool(o, "defOn")) {
-        fg_putf(b, "        %s.SetOn(true);\n", vn);
+    free(opts);
+    const char *placeholder = fg_obj_str(o, "placeholder");
+    if (placeholder[0]) {
+        fg_putf(b, "        %s.SetProp(\"placeholder\", \"", vn);
+        fg_esc_cstr(b, placeholder);
+        fg_putf(b, "\");\n");
     }
-    if (strcmp(wt, "SelectBox") == 0) {
-        char *opts = fg_join_opts(o);
-        if (opts && opts[0]) {
-            fg_putf(b, "        %s.SetOptionsText(\"", vn);
-            fg_esc_cstr(b, opts);
-            fg_putf(b, "\");\n");
-        }
-        free(opts);
+    if (fg_obj_bool(o, "required")) {
+        fg_putf(b, "        %s.SetProp(\"required\", \"true\");\n", vn);
     }
-    /* Tool strip items are "caption:icon" texts, `>` prefixed for the right
-     * group and "-" for a separator (same spec the designer previews). */
-    if (strcmp(wt, "ToolStrip") == 0) {
-        char *opts = fg_join_opts(o);
-        if (opts && opts[0]) {
-            fg_putf(b, "        %s.SetItemsText(\"", vn);
-            fg_esc_cstr(b, opts);
-            fg_putf(b, "\");\n");
-        }
-        free(opts);
+    if (fg_obj_bool(o, "defOn")) {
+        fg_putf(b, "        %s.SetProp(\"defOn\", \"true\");\n", vn);
     }
-    /* Equipment panel items are device names, one card each. */
-    if (strcmp(wt, "EquipPanel") == 0) {
-        char *opts = fg_join_opts(o);
-        if (opts && opts[0]) {
-            fg_putf(b, "        %s.SetItemsText(\"", vn);
-            fg_esc_cstr(b, opts);
-            fg_putf(b, "\");\n");
-        }
-        free(opts);
-    }
-    /* Item-bearing display widgets take their entries from the designed
-     * options list, exactly like the designer preview builds them. */
-    if (strcmp(wt, "Timeline") == 0 || strcmp(wt, "Steps") == 0
-        || strcmp(wt, "Breadcrumb") == 0 || strcmp(wt, "Carousel") == 0
-        || strcmp(wt, "Collapse") == 0) {
-        zan_json_value_t *opts = zan_json_get(o, "options");
-        if (opts && opts->type == ZAN_JSON_ARRAY) {
-            for (int i = 0; i < opts->array_val.count; i++) {
-                zan_json_value_t *it = opts->array_val.items[i];
-                if (!it || it->type != ZAN_JSON_STRING || !it->string_val.str)
-                    continue;
-                if (strcmp(wt, "Timeline") == 0) {
-                    fg_putf(b, "        %s.AddItem(\"\", \"", vn);
-                    fg_esc(b, it->string_val.str, it->string_val.len);
-                    fg_putf(b, "\", \"\");\n");
-                } else if (strcmp(wt, "Steps") == 0) {
-                    fg_putf(b, "        %s.AddStep(\"", vn);
-                    fg_esc(b, it->string_val.str, it->string_val.len);
-                    fg_putf(b, "\");\n");
-                } else if (strcmp(wt, "Carousel") == 0) {
-                    fg_putf(b, "        %s.AddSlide(\"", vn);
-                    fg_esc(b, it->string_val.str, it->string_val.len);
-                    fg_putf(b, "\");\n");
-                } else if (strcmp(wt, "Collapse") == 0) {
-                    fg_putf(b, "        %s.AddPanel(\"", vn);
-                    fg_esc(b, it->string_val.str, it->string_val.len);
-                    fg_putf(b, "\", \"\");\n");
-                } else {
-                    fg_putf(b, "        %s.AddItem(\"", vn);
-                    fg_esc(b, it->string_val.str, it->string_val.len);
-                    fg_putf(b, "\");\n");
-                }
-            }
-        }
-    }
-    /* A tree binds a node list: the first option is the root directory and
-     * the rest are its files (the shape the designer previews). */
-    if (strcmp(wt, "TreeView") == 0) {
-        zan_json_value_t *opts = zan_json_get(o, "options");
-        if (opts && opts->type == ZAN_JSON_ARRAY && opts->array_val.count > 0) {
-            fg_putf(b, "        List<TreeNode> %s__nodes = new List<TreeNode>();\n", vn);
-            for (int i = 0; i < opts->array_val.count; i++) {
-                zan_json_value_t *it = opts->array_val.items[i];
-                if (!it || it->type != ZAN_JSON_STRING || !it->string_val.str)
-                    continue;
-                fg_putf(b, "        %s__nodes.Add(TreeNode.%s(\"", vn,
-                        i == 0 ? "Dir" : "File");
-                fg_esc(b, it->string_val.str, it->string_val.len);
-                fg_putf(b, "\", %d%s));\n", i == 0 ? 0 : 1,
-                        i == 0 ? ", true" : "");
-            }
-            fg_putf(b, "        %s.Bind(%s__nodes);\n", vn, vn);
-        }
-    }
-    /* Status bar items: `>` prefix puts an item in the right-hand group. */
-    if (strcmp(wt, "StatusBar") == 0) {
-        zan_json_value_t *opts = zan_json_get(o, "options");
-        if (opts && opts->type == ZAN_JSON_ARRAY) {
-            for (int i = 0; i < opts->array_val.count; i++) {
-                zan_json_value_t *it = opts->array_val.items[i];
-                if (!it || it->type != ZAN_JSON_STRING || !it->string_val.str
-                    || !it->string_val.str[0]) continue;
-                const char *s = it->string_val.str;
-                bool right = s[0] == '>';
-                fg_putf(b, "        %s.Add%s(\"", vn, right ? "Right" : "Left");
-                fg_esc_cstr(b, right ? s + 1 : s);
-                fg_putf(b, "\");\n");
-            }
-        }
-    }
-    (void)ft;
 }
 
 /* Emit `on<Event>` handler bindings for the field. The event name is the key
@@ -642,24 +285,13 @@ static int fg_emit_field(fg_buf_t *decls, fg_buf_t *body, fg_buf_t *wire,
                          const char *parent, int id,
                          fg_used_t *used, bool freeMode,
                          bool parentIsFlow) {
-    int ft = fg_ftype_of(o);
-    const char *wt = fg_widget_type(ft);
+    const char *kind = fg_kind_of(o);
     const char *fname = fg_obj_str(o, "name");
     char fallback[24];
     int next = id + 1;
     bool req = fg_obj_bool(o, "required");
-    bool isInput = strcmp(wt, "Input") == 0;
 
     bool flowCell = !freeMode && parentIsFlow;
-
-    if (!freeMode && !flowCell && fg_needs_caption(ft)) {
-        fg_putf(body, "        Label cap%d = new Label(\"", id);
-        fg_esc_cstr(body, fg_caption(o));
-        fg_putf(body, "\");\n");
-        fg_putf(body, "        cap%d.Dock(Dock.Top());\n", id);
-        fg_putf(body, "        cap%d.Prefer(0, 18);\n", id);
-        fg_putf(body, "        %s.Add(cap%d);\n", parent, id);
-    }
 
     const char *vn;
     bool typed = fg_is_ident(fname) && fname[0] != '\0'
@@ -667,31 +299,25 @@ static int fg_emit_field(fg_buf_t *decls, fg_buf_t *body, fg_buf_t *wire,
     if (typed) {
         vn = fname;
         if (used->count < 128) used->names[used->count++] = fname;
-        fg_putf(decls, "    static %s %s;\n", wt, vn);
-    } else if (req && isInput) {
-        // A required field must stay reachable from __ValidateForm, so it is
-        // hoisted to a static field even when its name is not an identifier.
-        snprintf(fallback, sizeof(fallback), "c%d", id);
-        vn = fallback;
-        fg_putf(decls, "    static %s %s;\n", wt, vn);
+        fg_putf(decls, "    static %s %s;\n", kind, vn);
     } else {
         snprintf(fallback, sizeof(fallback), "c%d", id);
         vn = fallback;
-        fg_putf(body, "        %s %s;\n", wt, vn);
+        fg_putf(body, "        %s %s;\n", kind, vn);
     }
 
     fg_putf(body, "        %s = ", vn);
-    fg_ctor(body, o, ft, wt);
+    fg_ctor(body, o, kind);
     fg_putf(body, ";\n");
     fg_putf(body, "        %s.name = \"", vn);
     fg_esc_cstr(body, fname);
     fg_putf(body, "\";\n");
-    fg_field_setup(body, o, ft, wt, vn);
-    if (strcmp(wt, "Label") == 0 && fg_obj_bool(o, "wrap")) {
-        fg_putf(body, "        %s.wrap = true;\n", vn);
-    }
-    if (req && isInput) {
-        fg_putf(valid, "        if (TextWrap.Trim(%s.GetText()) == \"\") { %s.SetError(\"Required\"); ok = false; }\n", vn, vn);
+    fg_field_setup(body, o, vn);
+    if (req) {
+        /* Required validation is component-owned. A custom Control may expose
+         * its own required/error properties; formgen must not cast it to an
+         * Input or assume a GetText API. */
+        fg_putf(body, "        %s.SetProp(\"required\", \"true\");\n", vn);
     }
 
     if (freeMode) {
@@ -703,7 +329,7 @@ static int fg_emit_field(fg_buf_t *decls, fg_buf_t *body, fg_buf_t *wire,
          * display like the theme metrics and the stylesheet lengths already
          * are, so a design keeps its proportions (and stays inside its
          * winShape silhouette, which the runtime scales too) at 125/150/200%. */
-        int dk = fg_obj_num(o, "dock", fg_default_dock(ft));
+        int dk = fg_obj_num(o, "dock", fg_default_dock(o));
         if (dk == 1 || dk == 2) {
             fg_putf(body, "        %s.Dock(Dock.%s());\n",
                     vn, dk == 1 ? "Top" : "Bottom");
@@ -721,7 +347,7 @@ static int fg_emit_field(fg_buf_t *decls, fg_buf_t *body, fg_buf_t *wire,
             fg_putf(body, "        %s.Prefer(%d * __dp / 100, %d * __dp / 100);\n",
                     vn, fw, fh);
         }
-        if (fg_is_container(ft)) {
+        if (fg_is_container(o)) {
             fg_putf(body, "        %s.Pad(0);\n", vn);
         }
         fg_putf(body, "        %s.Add(%s);\n", parent, vn);
@@ -730,12 +356,12 @@ static int fg_emit_field(fg_buf_t *decls, fg_buf_t *body, fg_buf_t *wire,
          * panes and dock panels, whose parent is a plain Panel, not an
          * FbFlow. Top-level fields and card contents go through AddCell. */
         fg_putf(body, "        %s.Dock(Dock.Top());\n", vn);
-        if (fg_is_container(ft)) {
+        if (fg_is_container(o)) {
             fg_putf(body, "        %s.Pad(10);\n", vn);
             int ph = 44 + 44 * (int)fg_children_count(o);
             fg_putf(body, "        %s.Prefer(0, %d);\n", vn, ph);
         } else {
-            fg_putf(body, "        %s.Prefer(0, %d);\n", vn, fg_pref_h(ft));
+            fg_putf(body, "        %s.Prefer(0, %d);\n", vn, fg_pref_h(o));
         }
         fg_putf(body, "        %s.Add(%s);\n", parent, vn);
     } else {
@@ -745,62 +371,26 @@ static int fg_emit_field(fg_buf_t *decls, fg_buf_t *body, fg_buf_t *wire,
         int sp = fg_obj_num(o, "span", 24);
         if (sp < 1) sp = 1;
         if (sp > 24) sp = 24;
-        if (fg_is_container(ft)) {
+        if (fg_is_container(o)) {
             fg_putf(body, "        %s.Pad(10);\n", vn);
             int ph = 44 + 44 * (int)fg_children_count(o);
             fg_putf(body, "        %s.Prefer(0, %d);\n", vn, ph);
             fg_putf(body, "        %s.AddCell(%s, 24);\n", parent, vn);
-        } else if (fg_needs_caption(ft)) {
-            fg_putf(body, "        FbStack cell%d = new FbStack();\n", id);
-            fg_putf(body, "        Label cap%d = new Label(\"", id);
-            fg_esc_cstr(body, fg_caption(o));
-            fg_putf(body, "\");\n");
-            fg_putf(body, "        cap%d.Dock(Dock.Top());\n", id);
-            fg_putf(body, "        cap%d.Prefer(0, 18);\n", id);
-            fg_putf(body, "        cell%d.Add(cap%d);\n", id, id);
-            fg_putf(body, "        %s.Dock(Dock.Fill());\n", vn);
-            fg_putf(body, "        %s.Prefer(0, %d);\n", vn, fg_pref_h(ft));
-            fg_putf(body, "        cell%d.Add(%s);\n", id, vn);
-            fg_putf(body, "        %s.AddCell(cell%d, %d);\n", parent, id, sp);
         } else {
-            fg_putf(body, "        %s.Prefer(0, %d);\n", vn, fg_pref_h(ft));
+            fg_putf(body, "        %s.Prefer(0, %d);\n", vn, fg_pref_h(o));
             fg_putf(body, "        %s.AddCell(%s, %d);\n", parent, vn, sp);
         }
     }
     fg_emit_handlers(wire, o, vn);
 
     zan_json_value_t *kids = zan_json_get(o, "kids");
-    if (fg_is_container(ft) && kids && kids->type == ZAN_JSON_ARRAY) {
-        /* A card is a plain content box: host its children in a nested FbFlow
-         * so they honour `span` exactly like the top level. Tabs, split panes
-         * and dock panels keep their own hosting and the legacy stack path. */
-        bool cardFlow = (ft == 18) && !freeMode;
-        char flowvar[32];
-        flowvar[0] = '\0';
-        if (cardFlow) {
-            snprintf(flowvar, sizeof(flowvar), "__cf%d", id);
-            fg_putf(body, "        FbFlow %s = new FbFlow();\n", flowvar);
-            fg_putf(body, "        %s.Dock(Dock.Fill());\n", flowvar);
-            fg_putf(body, "        %s.Add(%s);\n", vn, flowvar);
-        }
+    if (fg_is_container(o) && kids && kids->type == ZAN_JSON_ARRAY) {
+        /* The component owns its child layout. Formgen only appends each
+         * generated child to the declared parent Control. */
         for (int i = 0; i < kids->array_val.count; i++) {
             zan_json_value_t *kid = kids->array_val.items[i];
-            char host[160];
-            bool childFlow = false;
-            /* A split panel owns two panes instead of one content box: a kid
-             * goes into the pane its `childTab` names. */
-            if (ft == 60) {
-                snprintf(host, sizeof(host), "%s.%s()", vn,
-                         fg_obj_num(kid, "childTab", 0) == 1 ? "Second"
-                                                            : "First");
-            } else if (cardFlow) {
-                snprintf(host, sizeof(host), "%s", flowvar);
-                childFlow = true;
-            } else {
-                snprintf(host, sizeof(host), "%s", vn);
-            }
             next = fg_emit_field(decls, body, wire, valid, kid,
-                                 host, next, used, freeMode, childFlow);
+                                 vn, next, used, freeMode, false);
         }
     }
     return next;
@@ -811,7 +401,6 @@ static int fg_emit_field(fg_buf_t *decls, fg_buf_t *body, fg_buf_t *wire,
 char *zan_formgen_translate(const char *json, size_t json_len,
                             const char *file_name, struct zan_diag *diag,
                             int emit_main) {
-    (void)diag;
     zan_json_value_t *root = zan_json_parse(json, json_len);
     if (!root || root->type != ZAN_JSON_OBJECT) {
         if (root) zan_json_free(root);
@@ -837,6 +426,11 @@ char *zan_formgen_translate(const char *json, size_t json_len,
     }
 
     zan_json_value_t *fields = zan_json_get(root, "fields");
+    fg_validate_fields(fields, diag, file_name);
+    if (diag && zan_diag_has_errors(diag)) {
+        zan_json_free(root);
+        return NULL;
+    }
     int win_w = 480, win_h = 520;
     zan_json_value_t *w = zan_json_get(root, "winW");
     if (w && w->type == ZAN_JSON_NUMBER && w->number_val > 0) win_w = (int)w->number_val;

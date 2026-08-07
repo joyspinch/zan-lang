@@ -3212,7 +3212,7 @@ int main(int argc, char **argv) {
             argv[a++] = "-lmoldname"; argv[a++] = "-lmingwex";
             argv[a++] = "-lmsvcrt";   argv[a++] = "-lkernel32";
             argv[a++] = "-ladvapi32"; argv[a++] = "-lshell32";
-            argv[a++] = "-luser32";
+            argv[a++] = "-luser32";   argv[a++] = "-lwinpthread";
             if (rt_io_obj) argv[a++] = "-lws2_32";
             /* extern [DllImport] libraries (skip those already in the CRT) */
             char libbufs[24][128]; int nb = 0;
@@ -3273,6 +3273,10 @@ int main(int argc, char **argv) {
             for (int ei = 0; ei < extra_link_lib_count; ei++) {
                 size_t cur = strlen(link_cmd);
                 snprintf(link_cmd + cur, sizeof(link_cmd) - cur, " -l%s", extra_link_libs[ei]);
+            }
+            {
+                size_t cur = strlen(link_cmd);
+                snprintf(link_cmd + cur, sizeof(link_cmd) - cur, " -lwinpthread");
             }
             for (int li = 0; li < irgen.extern_lib_count; li++) {
                 int nlen;
@@ -3378,6 +3382,14 @@ int main(int argc, char **argv) {
         for (int ei = 0; ei < extra_link_lib_count; ei++) {
             size_t cur = strlen(link_cmd);
             snprintf(link_cmd + cur, sizeof(link_cmd) - cur, " -l%s", extra_link_libs[ei]);
+        }
+        /* libm again, last: the -lm above sits before the driver libraries, and
+         * a static driver archive pulled in after it (zan_gui's software
+         * rasterizer uses sqrt/atan2) would otherwise leave those references
+         * unresolved -- ld only scans an archive for symbols already needed. */
+        {
+            size_t cur = strlen(link_cmd);
+            snprintf(link_cmd + cur, sizeof(link_cmd) - cur, " -lm");
         }
         link_ret = system(link_cmd);
 #endif

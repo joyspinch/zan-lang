@@ -416,6 +416,28 @@ static void emit_collection_slot_store(zan_irgen_t *g, zan_type_t *elem_type,
     }
 }
 
+static void emit_typed_out_store(zan_irgen_t *g, zan_type_t *value_type,
+                                 LLVMValueRef out_ptr, LLVMValueRef value) {
+    if (!value_type || !out_ptr || !value) return;
+    LLVMTypeRef value_llvm = map_type(g, value_type);
+    LLVMValueRef old = LLVMBuildLoad2(g->builder, value_llvm, out_ptr,
+                                      "out.old");
+    /* The dictionary slot is borrowed. Retain the incoming value before
+     * replacing the caller's owner, then release the overwritten value. */
+    emit_collection_value_retain(g, value_type, value, 0);
+    LLVMValueRef stored = value;
+    if (LLVMGetTypeKind(LLVMTypeOf(stored)) == LLVMPointerTypeKind &&
+        LLVMGetTypeKind(value_llvm) == LLVMPointerTypeKind &&
+        LLVMTypeOf(stored) != value_llvm)
+        stored = LLVMBuildBitCast(g->builder, stored, value_llvm, "out.bc");
+    else if (LLVMGetTypeKind(LLVMTypeOf(stored)) == LLVMIntegerTypeKind &&
+             LLVMGetTypeKind(value_llvm) == LLVMIntegerTypeKind &&
+             LLVMTypeOf(stored) != value_llvm)
+        stored = coerce_int_to(g, stored, value_llvm);
+    LLVMBuildStore(g->builder, stored, out_ptr);
+    emit_collection_value_release(g, value_type, old, 0);
+}
+
 static void emit_collection_release_raw_slot(zan_irgen_t *g, zan_type_t *elem_type,
                                              LLVMValueRef raw, LLVMTypeRef slot_ty) {
     if (!elem_type || !type_contains_collection_rc(g, elem_type, 0)) return;

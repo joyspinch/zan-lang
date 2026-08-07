@@ -9,7 +9,13 @@
 
 #include "checker.h"
 #include "diag.h"
+#include "arena.h"
 #include <string.h>
+
+/* Depth cap for every walk that follows base_type / interface chains. The
+ * binder rejects cyclic inheritance outright (binder.c resolve_bases), but a
+ * stray ring must never turn a checker pass into an infinite loop. */
+#define CHECKER_DERIVES_MAX_DEPTH 512
 
 void zan_checker_init(zan_checker_t *c, zan_binder_t *binder,
                       zan_arena_t *arena, zan_diag_t *diag) {
@@ -73,6 +79,43 @@ static zan_symbol_t *checker_find_field(zan_symbol_t *type_sym, zan_istr_t name)
     return NULL;
 }
 
+/* ---- local variable tracking ---------------------------------------------
+ * The checker walks a method body without its own scope stack; irgen, in
+ * contrast, resolves a bare name in an expression local-first (its
+ * local_scope_t), then the enclosing type's fields, then scope lookup. To
+ * type an identifier the same way, track the current body's locals/params in
+ * a simple name-keyed list: parameters are seeded at method entry, var and
+ * foreach declarations register on the way down. One approximation: names
+ * are never unregistered at block exit, so an out-of-scope use resolves to
+ * the stale local's type rather than error -- a benign widening, consistent
+ * with the checker's "defer, don't error" stance for anything it cannot see
+ * precisely. */
+struct checker_local {
+    zan_istr_t name;
+    zan_type_t *type;
+    struct checker_local *next;
+};
+
+static zan_type_t *checker_find_local(zan_checker_t *c, zan_istr_t name) {
+    for (struct checker_local *l = c->locals; l; l = l->next) {
+        if (l->name.len == name.len &&
+            memcmp(l->name.str, name.str, (size_t)name.len) == 0)
+            return l->type;
+    }
+    return NULL;
+}
+
+static void checker_add_local(zan_checker_t *c, zan_istr_t name,
+                              zan_type_t *type) {
+    if (!type || type == c->binder->type_error) return;
+    struct checker_local *l = (struct checker_local *)
+        zan_arena_alloc(c->arena, sizeof(struct checker_local));
+    l->name = name;
+    l->type = type;
+    l->next = c->locals;
+    c->locals = l;
+}
+
 static bool field_is_readonly(zan_symbol_t *field) {
     return field && field->decl && field->decl->kind == AST_FIELD_DECL &&
            (field->decl->field_decl.modifiers & MOD_READONLY) != 0;
@@ -85,7 +128,7 @@ static zan_symbol_t *assign_target_field(zan_checker_t *c, zan_ast_node_t *lhs,
     if (!lhs) return NULL;
     if (lhs->kind == AST_IDENTIFIER) {
         if (!c->current_type_sym) return NULL;
-        *owner = c->current_type_sym;
+        if (owner) *owner = c->current_type_sym;
         return checker_find_field(c->current_type_sym, lhs->ident.name);
     }
     if (lhs->kind == AST_MEMBER_ACCESS) {
@@ -97,38 +140,81 @@ static zan_symbol_t *assign_target_field(zan_checker_t *c, zan_ast_node_t *lhs,
             ts = ot ? ot->sym : NULL;
         }
         if (!ts) return NULL;
-        *owner = ts;
+        if (owner) *owner = ts;
         return checker_find_field(ts, lhs->member.name);
     }
     return NULL;
 }
 
 static void check_readonly_assignment(zan_checker_t *c, zan_ast_node_t *expr) {
+    if (expr && expr->binary.left && expr->binary.left->kind == AST_IDENTIFIER &&
+        checker_find_local(c, expr->binary.left->ident.name))
+        return;
     zan_symbol_t *owner = NULL;
     zan_symbol_t *field = assign_target_field(c, expr->binary.left, &owner);
     if (!field_is_readonly(field)) return;
-    if (c->in_ctor && owner == c->current_type_sym) return;
+    /* A derived constructor cannot initialize a readonly field declared by its
+     * base. `field->parent` is the declaration owner; `owner` is only the
+     * lookup starting point. */
+    if (c->in_ctor && field->parent == c->current_type_sym) return;
+    zan_symbol_t *decl_owner = field->parent ? field->parent : owner;
     zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
                   "cannot assign to readonly field '%.*s' outside a "
                   "constructor of '%.*s'",
                   (int)field->name.len, field->name.str,
-                  (int)(owner ? owner->name.len : 0),
-                  owner ? owner->name.str : "");
+                  (int)(decl_owner ? decl_owner->name.len : 0),
+                  decl_owner ? decl_owner->name.str : "");
+}
+
+static zan_type_t *checker_assignment_target_type(zan_checker_t *c,
+                                                   zan_ast_node_t *lhs) {
+    if (!lhs) return NULL;
+    if (lhs->kind == AST_IDENTIFIER) {
+        zan_type_t *local = checker_find_local(c, lhs->ident.name);
+        if (local) return local;
+        zan_symbol_t *field = assign_target_field(c, lhs, NULL);
+        return field ? field->type : NULL;
+    }
+    if (lhs->kind == AST_MEMBER_ACCESS) {
+        zan_type_t *obj = zan_checker_check_expr(c, lhs->member.object);
+        zan_symbol_t *sym = obj && obj->sym ? checker_find_field(obj->sym,
+                                                                  lhs->member.name)
+                                            : NULL;
+        return sym ? sym->type : NULL;
+    }
+    if (lhs->kind == AST_INDEX) {
+        zan_type_t *obj = zan_checker_check_expr(c, lhs->index.object);
+        zan_checker_check_expr(c, lhs->index.index);
+        if (obj && obj->kind == TYPE_ARRAY) return obj->element_type;
+        if (obj && obj->kind == TYPE_STRING) return c->binder->type_char;
+        if (obj && obj->kind == TYPE_CLASS && obj->type_arg_count == 1 &&
+            obj->name.len == 4 && memcmp(obj->name.str, "List", 4) == 0)
+            return obj->type_args[0];
+    }
+    return NULL;
 }
 
 /* ---- generic constraint checking ---- */
 
-/* True when `arg` is, implements, or derives from `cons`. */
-static bool type_satisfies_constraint(zan_type_t *arg, zan_type_t *cons) {
+/* True when `arg` is, implements, or derives from `cons`. Depth-guarded so a
+ * (defensively) cyclic hierarchy cannot recurse forever. */
+static bool type_satisfies_constraint_depth(zan_type_t *arg, zan_type_t *cons,
+                                            int depth) {
     if (!arg || !cons) return true;
+    if (depth > CHECKER_DERIVES_MAX_DEPTH) return false;
     if (arg == cons) return true;
     if (arg->sym && cons->sym && arg->sym == cons->sym) return true;
     for (int i = 0; i < arg->interface_count; i++) {
-        if (type_satisfies_constraint(arg->interfaces[i], cons)) return true;
+        if (type_satisfies_constraint_depth(arg->interfaces[i], cons, depth + 1))
+            return true;
     }
     if (arg->base_type && arg->base_type != arg)
-        return type_satisfies_constraint(arg->base_type, cons);
+        return type_satisfies_constraint_depth(arg->base_type, cons, depth + 1);
     return false;
+}
+
+static bool type_satisfies_constraint(zan_type_t *arg, zan_type_t *cons) {
+    return type_satisfies_constraint_depth(arg, cons, 0);
 }
 
 static const char *type_name(zan_type_t *t);
@@ -270,17 +356,26 @@ static bool checker_type_equal(zan_type_t *a, zan_type_t *b) {
 }
 
 /* True when `sub` is, implements, or derives from `sup` -- the same relation
- * type_satisfies_constraint computes for `where T : C` clauses. */
-static bool checker_type_derives_from(zan_type_t *sub, zan_type_t *sup) {
+ * type_satisfies_constraint computes for `where T : C` clauses. Depth-guarded
+ * so a (defensively) cyclic class hierarchy can never loop forever. */
+static bool checker_type_derives_from_depth(zan_type_t *sub, zan_type_t *sup,
+                                            int depth) {
     if (!sub || !sup) return false;
+    if (depth > CHECKER_DERIVES_MAX_DEPTH) return false;
     if (sub == sup) return true;
-    if (sub->sym && sup->sym && sub->sym == sup->sym) return true;
+    if (sub->sym && sup->sym && sub->sym == sup->sym)
+        return checker_type_equal(sub, sup);
     if (sub->kind == sup->kind && checker_type_equal(sub, sup)) return true;
     for (int i = 0; i < sub->interface_count; i++)
-        if (checker_type_derives_from(sub->interfaces[i], sup)) return true;
+        if (checker_type_derives_from_depth(sub->interfaces[i], sup, depth + 1))
+            return true;
     if (sub->base_type && sub->base_type != sub)
-        return checker_type_derives_from(sub->base_type, sup);
+        return checker_type_derives_from_depth(sub->base_type, sup, depth + 1);
     return false;
+}
+
+static bool checker_type_derives_from(zan_type_t *sub, zan_type_t *sup) {
+    return checker_type_derives_from_depth(sub, sup, 0);
 }
 
 /* Reference kinds: the IR carries them all as one object pointer, so any two
@@ -325,7 +420,7 @@ static zan_type_t *merge_conditional_types(zan_checker_t *c,
             if (checker_type_derives_from(b, t)) return t;
             if (!t->base_type) break;
         }
-        return a; /* unrelated references still share one pointer carrier */
+        return NULL; /* unrelated references have no implicit common type */
     }
 
     /* enums ride an integer carrier at the IR level; enum vs enum was handled
@@ -333,6 +428,26 @@ static zan_type_t *merge_conditional_types(zan_checker_t *c,
     if (a->kind == TYPE_ENUM || b->kind == TYPE_ENUM) return a;
 
     return NULL; /* unrelated value types, or a value mixed with a reference */
+}
+
+/* True when `a` and `b` are the same generic container class (List<...>,
+ * Dict<...>, a user Box<...>) regardless of their type arguments. User
+ * generics share the class symbol; builtin containers (List/Dict) are created
+ * by resolve_type as fresh types with no symbol, so those match by name. */
+static bool same_generic_container(zan_type_t *a, zan_type_t *b) {
+    if (!a || !b || a->kind != b->kind) return false;
+    if (a->type_arg_count != b->type_arg_count || a->type_arg_count == 0)
+        return false;
+    if (a->sym && b->sym) return a->sym == b->sym;
+    return a->name.len == b->name.len &&
+           memcmp(a->name.str, b->name.str, (size_t)a->name.len) == 0;
+}
+
+static bool checker_is_byte_buffer(zan_type_t *t) {
+    if (!t || t->kind != TYPE_ARRAY || !t->element_type) return false;
+    return t->element_type->kind == TYPE_BYTE ||
+           t->element_type->kind == TYPE_SBYTE ||
+           t->element_type->kind == TYPE_CHAR;
 }
 
 /* ---- return/assignment compatibility (D2) --------------------------------
@@ -376,34 +491,181 @@ static bool checker_type_assignable(zan_type_t *target, zan_type_t *value) {
         value->kind != TYPE_OBJECT && target->element_type)
         return checker_type_assignable(target->element_type, value); /* T -> T? */
 
-    /* Delegates accept method groups, lambdas and null; the checker doesn't
-     * model method-group types, so defer to irgen's delegate lowering. */
-    if (target->kind == TYPE_DELEGATE) return true;
+    /* Delegates accept method groups and lambdas (both typed as error here),
+     * null (typed as object), and the identical delegate type (already
+     * accepted above). Anything with a concrete non-delegate type -- an int,
+     * a string, an unrelated class -- is rejected: irgen would call it as a
+     * function pointer. */
+    if (target->kind == TYPE_DELEGATE)
+        return value->kind == TYPE_OBJECT ||
+               (value->kind == TYPE_DELEGATE && checker_type_equal(target, value));
     bool tnum = type_is_numeric(target), vnum = type_is_numeric(value);
+    /* Enums use the integer carrier in IR and retain the language's existing
+     * explicit numeric interoperability. Keep these cases before the
+     * reference-kind switch below. */
+    if (target->kind == TYPE_ENUM)
+        return value->kind == TYPE_ENUM || vnum || value->kind == TYPE_CHAR;
+    if (value->kind == TYPE_ENUM)
+        return tnum || target->kind == TYPE_CHAR;
     if (tnum && (vnum || value->kind == TYPE_CHAR)) return true;
     if (target->kind == TYPE_CHAR && (vnum || value->kind == TYPE_CHAR))
         return true;
 
-    /* reference kinds (and a null literal, typed as object) share one carrier */
-    if (checker_type_is_ref(target) &&
-        (checker_type_is_ref(value) || value->kind == TYPE_OBJECT))
-        return true;
-
-    /* enums ride an integer carrier */
-    if (target->kind == TYPE_ENUM && value->kind == TYPE_ENUM) return true;
-    if (target->kind == TYPE_ENUM && (vnum || value->kind == TYPE_CHAR)) return true;
-    if (value->kind == TYPE_ENUM && (tnum || target->kind == TYPE_CHAR)) return true;
+    /* Reference kinds: only sound implicit conversions -- null into any
+     * reference, a derived class into its base, an implementing class into
+     * its interface, and arrays with the same element type. Everything else
+     * (an unrelated class, a string into a class, an array of the wrong
+     * element type) shares a pointer carrier but not a layout, and must be an
+     * explicit cast. */
+    if (value->kind == TYPE_OBJECT) {
+        return checker_type_is_ref(target); /* null literal */
+    }
+    switch (target->kind) {
+    case TYPE_STRING:
+        return value->kind == TYPE_STRING || checker_is_byte_buffer(value);
+    case TYPE_CLASS:
+        if (value->kind == TYPE_CLASS) {
+            /* Inside a generic class body, `this` is represented by the
+             * uninstantiated class declaration while a fluent return type is
+             * represented as the matching class with its type parameters.
+             * They are the same definition; the call-site instantiation fills
+             * the arguments later. */
+            if (target->sym && value->sym && target->sym == value->sym &&
+                (target->type_arg_count == 0 || value->type_arg_count == 0))
+                return true;
+            /* The same generic class with a mismatched instantiation
+             * (List<int> vs List<Box>) is the generic-invariance rule, which
+             * irgen reports with its precise diagnostic. Defer so that
+             * message surfaces instead of a generic "no implicit conversion". */
+            if (same_generic_container(target, value) &&
+                !checker_type_equal(target, value))
+                return true;
+            return checker_type_derives_from(value, target);
+        }
+        return false;
+    case TYPE_INTERFACE:
+        if (value->kind == TYPE_INTERFACE || value->kind == TYPE_CLASS ||
+            value->kind == TYPE_STRUCT) {
+            if (same_generic_container(target, value) &&
+                !checker_type_equal(target, value))
+                return true;
+            return checker_type_derives_from(value, target);
+        }
+        return false;
+    case TYPE_ARRAY:
+        return value->kind == TYPE_ARRAY &&
+               checker_type_equal(target->element_type, value->element_type);
+    case TYPE_OBJECT:
+        return checker_type_is_ref(value);
+    default:
+        return false;
+    }
 
     return false;
 }
 
-/* Emit the D2 diagnostic when `value` is not assignable to `target`. */
+static bool integral_range(zan_type_t *t, int64_t *min_value,
+                           uint64_t *max_value, bool *is_unsigned) {
+    if (!t) return false;
+    *is_unsigned = false;
+    switch (t->kind) {
+    case TYPE_SBYTE:  *min_value = -128; *max_value = 127; return true;
+    case TYPE_BYTE:   *min_value = 0; *max_value = 255; *is_unsigned = true; return true;
+    case TYPE_SHORT:  *min_value = -32768; *max_value = 32767; return true;
+    case TYPE_USHORT: *min_value = 0; *max_value = 65535; *is_unsigned = true; return true;
+    case TYPE_CHAR:   *min_value = 0; *max_value = 65535; *is_unsigned = true; return true;
+    case TYPE_INT:    *min_value = INT32_MIN; *max_value = INT32_MAX; return true;
+    case TYPE_UINT:   *min_value = 0; *max_value = UINT32_MAX; *is_unsigned = true; return true;
+    case TYPE_LONG:
+    case TYPE_NINT:   *min_value = INT64_MIN; *max_value = INT64_MAX; return true;
+    case TYPE_ULONG:  *min_value = 0; *max_value = UINT64_MAX; *is_unsigned = true; return true;
+    case TYPE_ENUM:   *min_value = INT32_MIN; *max_value = INT32_MAX; return true;
+    default: return false;
+    }
+}
+
+static bool const_integral_value(zan_ast_node_t *expr, int64_t *value) {
+    if (!expr) return false;
+    if (expr->kind == AST_INT_LITERAL) {
+        *value = expr->int_val;
+        return true;
+    }
+    if (expr->kind == AST_CHAR_LITERAL) {
+        *value = expr->int_val;
+        return true;
+    }
+    if (expr->kind == AST_UNARY && expr->unary.op == TK_MINUS &&
+        expr->unary.operand && expr->unary.operand->kind == AST_INT_LITERAL) {
+        *value = -expr->unary.operand->int_val;
+        return true;
+    }
+    return false;
+}
+
+static bool integral_conversion_is_safe(zan_type_t *target, zan_type_t *value,
+                                        zan_ast_node_t *expr) {
+    int64_t tmin, vmin, constant;
+    uint64_t tmax, vmax;
+    bool tu, vu;
+    if (!integral_range(target, &tmin, &tmax, &tu) ||
+        !integral_range(value, &vmin, &vmax, &vu))
+        return true;
+    if ((!vu || tu) && vmin >= tmin && vmax <= tmax) return true;
+    if (!const_integral_value(expr, &constant)) return false;
+    if (constant < tmin) return false;
+    if (tu) {
+        if (constant < 0) return false;
+        return (uint64_t)constant <= tmax;
+    }
+    return constant <= (int64_t)tmax;
+}
+
+/* Emit the D2 diagnostic when `value` is not assignable to `target`. Numeric
+ * conversions follow C#-style implicit rules: integral widening is allowed,
+ * fitting constants may narrow, and every float-to-integral conversion needs
+ * an explicit cast. */
 static void checker_check_assignable(zan_checker_t *c, zan_type_t *target,
-                                     zan_type_t *value, zan_loc_t loc,
-                                     const char *what) {
+                                     zan_type_t *value, zan_ast_node_t *expr,
+                                     zan_loc_t loc, const char *what) {
     if (!target || !value || target == c->binder->type_error ||
         value == c->binder->type_error || value == c->binder->type_void)
         return;
+    bool target_integral = type_is_integral(target) || target->kind == TYPE_CHAR ||
+                           target->kind == TYPE_ENUM;
+    bool value_integral = type_is_integral(value) || value->kind == TYPE_CHAR ||
+                          value->kind == TYPE_ENUM;
+    if (target_integral &&
+        (value->kind == TYPE_FLOAT || value->kind == TYPE_DOUBLE)) {
+        zan_diag_emit(c->diag, DIAG_ERROR, loc,
+                      "narrowing conversion from '%s' to '%s' in %s needs an "
+                      "explicit cast (C# rules)",
+                      type_name(value), type_name(target), what);
+        return;
+    }
+    if (target_integral && value_integral) {
+        int64_t constant = 0;
+        bool has_constant = const_integral_value(expr, &constant);
+        bool native_handle_narrowing = value->kind == TYPE_NINT &&
+            target->kind != TYPE_LONG && target->kind != TYPE_NINT;
+        bool uint32_bit_pattern = value->kind == TYPE_LONG &&
+            target->kind == TYPE_INT && has_constant && constant >= 0 &&
+            (uint64_t)constant <= UINT32_MAX;
+        /* The lexer preserves an unsuffixed/hex literal's full uint64 bit
+         * pattern in int_val, so direct ulong literals above INT64_MAX appear
+         * negative here. They are still exact ulong constants; a unary minus
+         * remains a real negative expression and is rejected below. */
+        bool ulong_literal = target->kind == TYPE_ULONG && expr &&
+            expr->kind == AST_INT_LITERAL;
+        if (native_handle_narrowing ||
+            (!uint32_bit_pattern && !ulong_literal && has_constant &&
+             !integral_conversion_is_safe(target, value, expr))) {
+            zan_diag_emit(c->diag, DIAG_ERROR, loc,
+                          "narrowing conversion from '%s' to '%s' in %s needs an "
+                          "explicit cast (C# rules)",
+                          type_name(value), type_name(target), what);
+            return;
+        }
+    }
     if (checker_type_assignable(target, value)) return;
     zan_diag_emit(c->diag, DIAG_ERROR, loc,
                   "cannot convert '%s' to '%s' in %s: no implicit conversion",
@@ -528,6 +790,25 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
         return c->binder->type_object;
 
     case AST_IDENTIFIER: {
+        /* A bare name in an expression resolves local-first, exactly like
+         * irgen (emit_expr_identifier): a parameter/local shadows a field of
+         * the same name, and the enclosing type's field shadows an in-scope
+         * type of the same name (`string Icon;` beats `using Gui;`'s
+         * `class Icon`). The old ref-carrier rules masked these mismatches;
+         * the strict assignability/initializer checks surfaced them as bogus
+         * "cannot convert 'Icon' to 'string'" / "type 'int' has no member"
+         * errors. Only when no local or field matches do we fall back to
+         * scope lookup, which is what finds types, enum members and method
+         * names. */
+        zan_type_t *lt = checker_find_local(c, expr->ident.name);
+        if (lt) return lt;
+        if (c->current_type_sym) {
+            zan_symbol_t *fsym = checker_find_field(c->current_type_sym,
+                                                    expr->ident.name);
+            if (fsym) {
+                return fsym->type ? fsym->type : c->binder->type_error;
+            }
+        }
         zan_symbol_t *sym = zan_binder_lookup(c->binder, expr->ident.name);
         if (!sym) {
             /* don't error — may be resolved in later phases */
@@ -552,6 +833,14 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
             if (type_is_numeric(left) && type_is_numeric(right)) {
                 return promote_numeric(c->binder, left, right);
             }
+            /* Enums ride an integer carrier: irgen compiles `int + enum` as
+             * plain integer arithmetic (the stdlib folds enum flags into
+             * hash sums), so accept them as integers here too. promote_numeric
+             * already defaults an enum operand to int. */
+            if ((type_is_numeric(left) || left->kind == TYPE_ENUM) &&
+                (type_is_numeric(right) || right->kind == TYPE_ENUM)) {
+                return promote_numeric(c->binder, left, right);
+            }
             /* User-defined operator overloading: `a + b` on a class/struct left
              * operand dispatches to a static op_add/op_sub/... method resolved
              * in irgen. Assume the result is the left operand's type (e.g. an
@@ -573,16 +862,81 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
             }
             return c->binder->type_error;
 
-        case TK_EQ_EQ: case TK_BANG_EQ:
+        case TK_EQ_EQ: case TK_BANG_EQ: {
+            bool ln = type_is_numeric(left) || left->kind == TYPE_CHAR ||
+                      left->kind == TYPE_ENUM;
+            bool rn = type_is_numeric(right) || right->kind == TYPE_CHAR ||
+                      right->kind == TYPE_ENUM;
+            if (ln && rn) return c->binder->type_bool;
+            /* Reference equality is valid for null and types connected by an
+             * implicit reference conversion. Sharing the LLVM pointer carrier
+             * alone is not enough: unrelated object layouts must not compare
+             * as though they were compatible source types. */
+            if (checker_type_is_ref(left) && checker_type_is_ref(right) &&
+                (left->kind == TYPE_OBJECT || right->kind == TYPE_OBJECT ||
+                 checker_type_assignable(left, right) ||
+                 checker_type_assignable(right, left)))
+                return c->binder->type_bool;
+            if (left->kind == TYPE_BOOL && right->kind == TYPE_BOOL)
+                return c->binder->type_bool;
+            if (left->kind != TYPE_ERROR && right->kind != TYPE_ERROR)
+                zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
+                              "cannot compare '%s' and '%s'",
+                              type_name(left), type_name(right));
+            return c->binder->type_error;
+        }
         case TK_LESS: case TK_GREATER:
-        case TK_LESS_EQ: case TK_GREATER_EQ:
-            return c->binder->type_bool;
+        case TK_LESS_EQ: case TK_GREATER_EQ: {
+            bool ln = type_is_numeric(left) || left->kind == TYPE_CHAR ||
+                      left->kind == TYPE_ENUM;
+            bool rn = type_is_numeric(right) || right->kind == TYPE_CHAR ||
+                      right->kind == TYPE_ENUM;
+            if (ln && rn) return c->binder->type_bool;
+            /* irgen routes string ordering through strcmp; the stdlib
+             * compares single-char substrings with `<`/`<=`/`>`/`>=` (URL
+             * encoding, markdown list detection), so accept it here too */
+            if (left->kind == TYPE_STRING && right->kind == TYPE_STRING)
+                return c->binder->type_bool;
+            if (left->kind != TYPE_ERROR && right->kind != TYPE_ERROR)
+                zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
+                              "cannot compare '%s' and '%s' with a relational "
+                              "operator: no implicit numeric conversion",
+                              type_name(left), type_name(right));
+            return c->binder->type_error;
+        }
 
         case TK_AMP_AMP: case TK_PIPE_PIPE:
-            return c->binder->type_bool;
+            if ((left->kind == TYPE_BOOL && right->kind == TYPE_BOOL) ||
+                left->kind == TYPE_ERROR || right->kind == TYPE_ERROR)
+                return c->binder->type_bool;
+            zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
+                          "cannot apply logical operator to '%s' and '%s': "
+                          "both operands must be bool",
+                          type_name(left), type_name(right));
+            return c->binder->type_error;
 
-        case TK_QUESTION_QUESTION:
-            return left;
+        case TK_QUESTION_QUESTION: {
+            /* `a ?? b`: nullish types (nullable value types and reference
+             * kinds) on either side merge to the most specific of the two,
+             * like a conditional branch -- `x ?? "fallback"` with x:object
+             * yields string, and `int? x; x ?? 0` yields int. */
+            if (left->kind == TYPE_NULLABLE && left->element_type) {
+                zan_type_t *merged = merge_conditional_types(c,
+                                                              left->element_type,
+                                                              right);
+                if (merged) return merged;
+            } else if (checker_type_is_ref(left) || checker_type_is_ref(right) ||
+                       right->kind == TYPE_OBJECT ||
+                       right->kind == TYPE_NULLABLE) {
+                zan_type_t *merged = merge_conditional_types(c, left, right);
+                if (merged) return merged;
+            }
+            if (left->kind != TYPE_ERROR && right->kind != TYPE_ERROR)
+                zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
+                              "cannot apply '??' to '%s' and '%s'",
+                              type_name(left), type_name(right));
+            return c->binder->type_error;
+        }
 
         default:
             return c->binder->type_error;
@@ -704,20 +1058,14 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
     }
 
     case AST_ASSIGNMENT: {
-        zan_checker_check_expr(c, expr->binary.left);
+        zan_type_t *left = zan_checker_check_expr(c, expr->binary.left);
         zan_type_t *right = zan_checker_check_expr(c, expr->binary.right);
         check_readonly_assignment(c, expr);
-        /* Only compare explicit member-access LHS (`this.f`, `obj.f`,
-         * `Type.f`). A bare identifier may be a local variable shadowing a
-         * field, and the checker does not track locals. */
-        if (expr->binary.left->kind == AST_MEMBER_ACCESS) {
-            zan_symbol_t *owner = NULL;
-            zan_symbol_t *field = assign_target_field(
-                c, expr->binary.left, &owner);
-            if (field && field->type)
-                checker_check_assignable(c, field->type, right, expr->loc,
-                                         "assignment");
-        }
+        zan_type_t *target = checker_assignment_target_type(c, expr->binary.left);
+        if (!target) target = left;
+        if (target)
+            checker_check_assignable(c, target, right, expr->binary.right,
+                                     expr->loc, "assignment");
         return right;
     }
 
@@ -741,7 +1089,28 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
             type = zan_binder_make_array_type(c->binder, type);
         check_generic_constraints(c, type, expr->loc);
         for (int i = 0; i < expr->new_expr.args.count; i++) {
-            zan_checker_check_expr(c, expr->new_expr.args.items[i]);
+            zan_ast_node_t *arg = expr->new_expr.args.items[i];
+            /* Object-initializer assignments are field writes on the newly
+             * allocated type, not ordinary assignments in the surrounding
+             * scope. Resolve the bare field name against that type first so a
+             * same-named namespace type (for example Gui.Icon) cannot shadow
+             * the actual field (Button.Icon). */
+            if (arg && arg->kind == AST_ASSIGNMENT &&
+                arg->binary.left &&
+                arg->binary.left->kind == AST_IDENTIFIER &&
+                type && type->sym) {
+                zan_symbol_t *field = checker_find_field(
+                    type->sym, arg->binary.left->ident.name);
+                if (field && field->type) {
+                    zan_type_t *right = zan_checker_check_expr(
+                        c, arg->binary.right);
+                    checker_check_assignable(c, field->type, right,
+                                             arg->binary.right, arg->loc,
+                                             "object initializer");
+                    continue;
+                }
+            }
+            zan_checker_check_expr(c, arg);
         }
         return type;
     }
@@ -792,21 +1161,38 @@ void zan_checker_check_stmt(zan_checker_t *c, zan_ast_node_t *stmt) {
     if (!stmt) return;
 
     switch (stmt->kind) {
-    case AST_BLOCK:
+    case AST_BLOCK: {
+        struct checker_local *saved_locals = c->locals;
         for (int i = 0; i < stmt->block.stmts.count; i++) {
             zan_checker_check_stmt(c, stmt->block.stmts.items[i]);
         }
+        c->locals = saved_locals;
         break;
+    }
 
-    case AST_VAR_DECL:
+    case AST_VAR_DECL: {
+        zan_type_t *dt = stmt->var_decl.type
+            ? zan_binder_resolve_type(c->binder, stmt->var_decl.type)
+            : NULL;
+        zan_type_t *iv = NULL;
         if (stmt->var_decl.initializer) {
-            zan_checker_check_expr(c, stmt->var_decl.initializer);
+            iv = zan_checker_check_expr(c, stmt->var_decl.initializer);
         }
-        if (stmt->var_decl.type) {
-            zan_type_t *dt = zan_binder_resolve_type(c->binder, stmt->var_decl.type);
+        if (dt) {
             check_generic_constraints(c, dt, stmt->loc);
+            if (iv) {
+                checker_check_assignable(c, dt, iv, stmt->var_decl.initializer,
+                                         stmt->loc, "initializer");
+            }
+            checker_add_local(c, stmt->var_decl.name, dt);
+        } else {
+            /* `var x = ...`: register with the inferred type so later bare
+             * uses in the body resolve to it, not to a field/type of the
+             * same name */
+            checker_add_local(c, stmt->var_decl.name, iv);
         }
         break;
+    }
 
     case AST_EXPR_STMT:
         zan_checker_check_expr(c, stmt->expr_stmt.expr);
@@ -820,7 +1206,8 @@ void zan_checker_check_stmt(zan_checker_t *c, zan_ast_node_t *stmt) {
             if (c->current_return_type &&
                 c->current_return_type->kind != TYPE_VOID)
                 checker_check_assignable(c, c->current_return_type, rv,
-                                         stmt->loc, "return statement");
+                                         stmt->ret.value, stmt->loc,
+                                         "return statement");
         }
         break;
 
@@ -853,7 +1240,20 @@ void zan_checker_check_stmt(zan_checker_t *c, zan_ast_node_t *stmt) {
     case AST_FOREACH_STMT:
         /* iterating a managed collection walks rc-managed elements */
         no_runtime_reject(c, stmt->loc, "`foreach`");
-        zan_checker_check_expr(c, stmt->foreach_stmt.collection);
+        {
+            zan_type_t *col = zan_checker_check_expr(c, stmt->foreach_stmt.collection);
+            zan_type_t *elem = NULL;
+            if (col) {
+                if (col->kind == TYPE_ARRAY) elem = col->element_type;
+                else if (col->kind == TYPE_CLASS && col->type_arg_count == 1)
+                    elem = col->type_args[0];
+            }
+            if (stmt->foreach_stmt.var_type) {
+                elem = zan_binder_resolve_type(c->binder,
+                                               stmt->foreach_stmt.var_type);
+            }
+            checker_add_local(c, stmt->foreach_stmt.var_name, elem);
+        }
         zan_checker_check_stmt(c, stmt->foreach_stmt.body);
         break;
 
@@ -986,7 +1386,20 @@ static void check_method_body(zan_checker_t *c, zan_ast_node_t *method) {
     c->current_return_type = zan_binder_resolve_type(c->binder,
                                                       method->method_decl.return_type);
     check_generic_constraints(c, c->current_return_type, method->loc);
+    /* seed the local list with the parameters: a param that shadows a field
+     * (`static int Val(ChartData d)` in a class with `int d;`) must type as
+     * the parameter, not the field */
+    struct checker_local *saved_locals = c->locals;
+    c->locals = NULL;
+    for (int j = 0; j < method->method_decl.params.count; j++) {
+        zan_ast_node_t *p = method->method_decl.params.items[j];
+        if (p && p->kind == AST_PARAM) {
+            zan_type_t *pt = zan_binder_resolve_type(c->binder, p->param.type);
+            checker_add_local(c, p->param.name, pt);
+        }
+    }
     zan_checker_check_stmt(c, method->method_decl.body);
+    c->locals = saved_locals;
     c->current_return_type = saved;
     c->in_no_runtime = saved_nrt;
     c->in_ctor = saved_ctor;

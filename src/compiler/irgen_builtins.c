@@ -1631,10 +1631,13 @@ static LLVMValueRef get_eh_tmp_unwind_fn(zan_irgen_t *g) {
     LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
     LLVMValueRef kind = zan_and(g->builder, obj_i,
         LLVMConstInt(i64t, 6, 0), "eh.kind");
+    /* The slot holds an i8*, so the untagged address is an i8** -- typing it
+     * as i8* makes the load/store below fail verification on a typed-pointer
+     * LLVM ("Stored value type does not match pointer operand type"). */
     LLVMValueRef untag = LLVMBuildIntToPtr(g->builder,
         zan_and(g->builder, obj_i,
             LLVMConstInt(i64t, ~(uint64_t)7, 0), "untag"),
-        i8ptr, "vslot");
+        LLVMPointerType(i8ptr, 0), "vslot");
     LLVMValueRef vobj = LLVMBuildLoad2(g->builder, i8ptr, untag, "vobj");
     LLVMBuildStore(g->builder, LLVMConstNull(i8ptr), untag);
     LLVMBuildCondBr(g->builder,
