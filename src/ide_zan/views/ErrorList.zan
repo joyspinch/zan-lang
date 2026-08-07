@@ -2,165 +2,98 @@ using System;
 using Gui;
 using Gui.Widget;
 
-/// One diagnostics row: the row container, its message label and the optional
-/// quick-fix button (one entity instead of parallel lists).
-class ErrorRowView {
-    Panel box;
-    Label label;
-    Button fixBtn;
-    string fixNs;
-}
-
-/// Output panel "Errors" tab as a retained component tree: each diagnostic is
-/// a row of widgets (message label + optional quick-fix button) instead of
-/// per-frame manual drawing. The layout skeleton lives in ErrorList.zform;
-/// rows are data-driven and rebuilt only when the diagnostics change. The
-/// shell polls TakeFix()/TakeJump() once per frame after RenderAt.
+/// Output panel "Errors" tab as a standard ListView over diagnostic records.
+/// Each row is a message label plus an optional quick-fix button bound to the
+/// record itself, so the panel no longer walks parallel lists or tracks rows
+/// by index.
 class ErrorList : Control {
-    List<ErrorRowView> rows;
-    Label emptyLabel;
-    string sig;
-    int jumpRow;
-    int fixRow;
-
-    // <<< ZAN-DESIGNER BEGIN (generated from ErrorList.zform - do not edit) >>>
-    void BuildUi() {
-        layout = 1;
-        Class = "errorList";
-    }
-    // <<< ZAN-DESIGNER END >>>
+    ListView<DiagnosticRecord> list;
+    List<DiagnosticRecord> lastRecords;
+    string lastSig;
+    DiagnosticRecord fixRecord;
+    DiagnosticRecord jumpRecord;
 
     ErrorList() {
         this.InitControl("errorList", 5);
-        rows = new List<ErrorRowView>();
-        emptyLabel = null;
-        sig = "";
-        jumpRow = 0 - 1;
-        fixRow = 0 - 1;
-        BuildUi();
+        ErrorList.current = this;
+        // lastSig 必须先给空串：SetErrors 第一帧就会算 `sig == lastSig`，
+        // 若 lastSig 还是未初始化的 null，字符串比较会在原生层解引用空指针
+        // 直接崩溃（错误面板一显示就闪退）。
+        this.lastSig = "";
+        this.lastRecords = null;
+        list = new ListView<DiagnosticRecord>(ErrorList.RowOf);
+        list.EmptyText(ZanIDE.T("No errors.", "无错误。"));
+        list.OnActivate(ErrorList.OnJump);
+        list.dock = 5;
+        this.Add(list);
     }
 
-    override string Kind() { return "ErrorList"; }
+    static Control RowOf(DiagnosticRecord r) {
+        Panel row = Panel.Row();
+        if (r == null) { return row; }
+        string rmsg = r.msg; if (rmsg == null) { rmsg = ""; }
+        string rpath = r.path; if (rpath == null) { rpath = ""; }
+        string rline = r.line; if (rline == null) { rline = ""; }
+        string ns = ZanIDE.SuggestedUsing(rmsg);
+        Label lbl = new Label(
+            ZanIDE.BaseName(rpath) + ":" + rline + "   " + rmsg);
+        lbl.Class = "secondary small";
+        lbl.dock = 5;
+        row.Add(lbl);
+        if (ns != "") {
+            Button b = new Button(
+                ZanIDE.T("Add using " + ns, "添加 using " + ns));
+            b.Class = "primary tiny";
+            b.dock = 4;
+            b.Click += () => { ErrorList.current.fixRecord = r; };
+            row.Add(b);
+        }
+        return row;
+    }
 
-    /// Rebuilds the row widgets when the parsed diagnostics changed.
+    static ErrorList current;
+
+    static void OnJump() {
+        if (ErrorList.current == null) { return; }
+        ErrorList.current.jumpRecord = ErrorList.current.list.Selected();
+    }
+
+    /// Rebind the list only when the diagnostics actually changed.
     void SetErrors(List<DiagnosticRecord> records) {
-        string s = Convert.ToString(records.Count);
+        if (records == null) { records = new List<DiagnosticRecord>(); }
+        string sig = "";
         for (int i = 0; i < records.Count; i = i + 1) {
-            DiagnosticRecord record = records[i];
-            s = s + "|" + record.path + ":" + record.line + ":" + record.msg;
+            DiagnosticRecord r = records[i];
+            if (r == null) { continue; }
+            string rp = r.path; if (rp == null) { rp = ""; }
+            string rl = r.line; if (rl == null) { rl = ""; }
+            string rm = r.msg;  if (rm == null) { rm = ""; }
+            sig = sig + rp + ":" + rl + ":" + rm + "|";
         }
-        if (s == sig) { return; }
-        sig = s;
-        while (children.Count > 0) { Remove(children[children.Count - 1]); }
-        while (rows.Count > 0) { rows.RemoveAt(rows.Count - 1); }
-        emptyLabel = null;
-        if (records.Count == 0) {
-            Label l = new Label(ZanIDE.T("No errors.", "无错误。"));
-            l.Class = "secondary small";
-            emptyLabel = l;
-            Add(l);
-            return;
-        }
-        for (int r = 0; r < records.Count; r = r + 1) {
-            DiagnosticRecord record = records[r];
-            ErrorRowView row = new ErrorRowView();
-            Panel box = Panel.Row();
-            box.dock = 1;
-            string ns = ZanIDE.SuggestedUsing(record.msg);
-            row.fixNs = ns;
-            row.fixBtn = null;
-            if (ns != "") {
-                Button b = new Button {
-                    Text = ZanIDE.T("Add using " + ns, "添加 using " + ns),
-                    Class = "primary tiny"
-                };
-                b.dock = 4;
-                box.Add(b);
-                row.fixBtn = b;
-            }
-            Label l = new Label(
-                ZanIDE.BaseName(record.path) + ":" + record.line + "   " + record.msg);
-            l.Class = "secondary small";
-            l.dock = 5;
-            box.Add(l);
-            row.box = box;
-            row.label = l;
-            rows.Add(row);
-            Add(box);
-        }
+        if (sig == lastSig && lastRecords == records) { return; }
+        lastSig = sig;
+        lastRecords = records;
+        list.Bind(records);
+        list.Refresh();
     }
 
-    override void OnMeasure(App app) {
-        padT = app.Scale(6);
-        padL = app.Scale(6);
-        padR = app.Scale(6);
-        for (int i = 0; i < rows.Count; i = i + 1) {
-            rows[i].box.prefH = app.Scale(20);
-        }
-    }
-
-    /// Host-mode render into an explicit rectangle (the shell owns the overall
-    /// window layout during migration). Resolves theme-driven colors, applies
-    /// the hover highlight through the CSS style layer, paints the widget tree
-    /// and records which row / quick-fix the user clicked this frame.
-    void RenderAt(App app, int x, int y, int w, int h) {
-        Theme t = app.theme;
-        if (emptyLabel != null) { emptyLabel.TextColor(t.success); }
-        MeasureTree(app);
-        Arrange(x, y, w, h);
-        int i = 0;
-        for (i = 0; i < rows.Count; i = i + 1) {
-            ErrorRowView rv = rows[i];
-            rv.label.TextColor(t.error);
-            bool hov = app.mouseX >= rv.box.bx
-                && app.mouseX < rv.box.bx + rv.box.bw
-                && app.mouseY >= rv.box.by
-                && app.mouseY < rv.box.by + rv.box.bh
-                && rv.box.bh > 0;
-            if (hov) { rv.box.Bg(t.bgHover); } else { rv.box.Bg(0); }
-        }
-        RenderTree(app);
-        i = 0;
-        i = 0;
-        for (i = 0; i < rows.Count; i = i + 1) {
-            ErrorRowView rv = rows[i];
-            if (rv.fixBtn != null && Ui.Clicked(app, rv.fixBtn.wid)) {
-                fixRow = i;
-            }
-        }
-        if (fixRow < 0 && app.ClickAvailable()) {
-            i = 0;
-            i = 0;
-            for (i = 0; i < rows.Count; i = i + 1) {
-                ErrorRowView rv = rows[i];
-                if (app.mouseX >= rv.box.bx
-                    && app.mouseX < rv.box.bx + rv.box.bw
-                    && app.mouseY >= rv.box.by
-                    && app.mouseY < rv.box.by + rv.box.bh
-                    && rv.box.bh > 0) {
-                    jumpRow = i;
-                }
-            }
-        }
-    }
-
-    /// The quick-fix row clicked this frame, or -1. Consumes the click.
-    int TakeFix() {
-        int r = fixRow;
-        fixRow = 0 - 1;
+    /// The quick-fix record clicked since the last call, or null. Consumes it.
+    DiagnosticRecord TakeFix() {
+        DiagnosticRecord r = fixRecord;
+        fixRecord = null;
         return r;
     }
 
-    /// The row clicked (jump to file:line) this frame, or -1. Consumes it.
-    int TakeJump() {
-        int r = jumpRow;
-        jumpRow = 0 - 1;
+    /// The jump-to record activated since the last call, or null. Consumes it.
+    DiagnosticRecord TakeJump() {
+        DiagnosticRecord r = jumpRecord;
+        jumpRecord = null;
         return r;
     }
 
-    /// The suggested `using` namespace for a row ("" when none).
-    string FixNs(int i) {
-        if (i >= 0 && i < rows.Count) { return rows[i].fixNs; }
-        return "";
+    /// Suggested `using` namespace for a record ("" when none).
+    string FixNs(DiagnosticRecord r) {
+        if (r == null) { return ""; }
+        return ZanIDE.SuggestedUsing(r.msg);
     }
 }

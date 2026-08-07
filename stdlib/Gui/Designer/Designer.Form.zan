@@ -1044,7 +1044,7 @@ partial class Designer {
                         this.ClearExtraSel();
                     } else if (hit != sel && this.IsExtraSel(hit)) {
                         this.ToggleExtraSel(hit);
-                        freeExtra.Add(sel);
+                        if (sel != null) { freeExtra.Add(sel); }
                     }
                     sel = hit;
                     inspTab = 0;
@@ -1119,7 +1119,7 @@ partial class Designer {
             if (mvdx != 0 || mvdy != 0) {
                 for (int me = 0; me < freeExtra.Count; me = me + 1) {
                     FormField ef = freeExtra[me];
-                    if (ef.locked) { continue; }
+                    if (ef == null || ef.locked) { continue; }
                     ef.fx = ef.fx + mvdx;
                     ef.fy = ef.fy + mvdy;
                     if (ef.fx < 0) { ef.fx = 0; }
@@ -1845,10 +1845,37 @@ partial class Designer {
     }
 
     /// 在设计画布上按给定矩形绘制一个保留式控件的实时预览。
+    /// 用 BeginCtrlZoom/EndCtrlZoom 夹住渲染：真控件内部只认 app.dpiScale
+    /// 和主题度量，本身不知道画布视图缩放，因此临时把两者按视图缩放放大/
+    /// 缩小，控件的字号、内边距就随画布一起等比缩放（放大不再「有的变有的
+    /// 不变」）。给定矩形 x/y/w/h 已是缩放后的屏幕坐标，渲染完精确还原。
     void PvCtrl(App app, Control ctl, int x, int y, int w, int h) {
+        BeginCtrlZoom(app);
         ctl.MeasureTree(app);
         ctl.Arrange(x, y, w, h);
         ctl.RenderTree(app);
+        EndCtrlZoom(app);
+    }
+
+    /// 进入真控件等比缩放：按视图缩放（winZoom，50%–200%）临时放大/缩小
+    /// app.dpiScale 和主题度量。100% 时为恒等变换，真控件保持 1:1 清晰。
+    void BeginCtrlZoom(App app) {
+        Theme t = app.theme;
+        czBase = t.SnapshotMetrics();
+        czDpi = app.dpiScale;
+        int z = winZoom;
+        if (z < 500) { z = 1000; }
+        if (z > 2000) { z = 2000; }
+        t.ApplyMetricsScaled(czBase, z, 1000);
+        app.dpiScale = czDpi * z / 1000;
+        if (app.dpiScale < 1) { app.dpiScale = 1; }
+    }
+
+    /// 退出真控件等比缩放：从基线精确还原主题度量与 app.dpiScale。
+    void EndCtrlZoom(App app) {
+        Theme t = app.theme;
+        t.ApplyMetricsScaled(czBase, 1000, 1000);
+        app.dpiScale = czDpi;
     }
 
     /// 基础输入控件（输入/多行/密码/数字/下拉/开关/评分/滑块）用
@@ -1904,7 +1931,9 @@ partial class Designer {
             ChartOption opt = ChartOption.With(ChartType.Pie, f.label, labels);
             opt.Add("Series A", a);
             if (kind == 6) { opt.series[0].innerPct = 55; }
+            BeginCtrlZoom(app);
             ChartView.Of(opt).Render(app, x, y, w, hh);
+            EndCtrlZoom(app);
             return;
         }
         if (kind == 7) {
@@ -1916,7 +1945,9 @@ partial class Designer {
             ChartSeries s0 = ChartSeries.OfPoints("Series A", points);
             s0.color = Chart.Palette(t, 0);
             opt.Add(s0);
+            BeginCtrlZoom(app);
             ChartView.Of(opt).Render(app, x, y, w, hh);
+            EndCtrlZoom(app);
             return;
         }
 
@@ -1932,7 +1963,9 @@ partial class Designer {
         } else {
             opt.Add("Series A", a).Add("Series B", b);
         }
+        BeginCtrlZoom(app);
         ChartView.Of(opt).Render(app, x, y, w, hh);
+        EndCtrlZoom(app);
     }
 
     /// 渲染表格字段的紧凑非交互预览：由字段选项（其列）构建的
@@ -1952,8 +1985,11 @@ partial class Designer {
             cells.Add("—");
         }
         int totalW = colW * nc;
-        int rowH = t.heightMedium;
         int bh = avail - PvS(app, 6);
+        // 表格内部只认 dpi/主题，同样用 BeginCtrlZoom 让行高/字号随视图
+        // 缩放等比变化；bh 是屏幕空间的外框高（已含缩放），先算好。
+        BeginCtrlZoom(app);
+        int rowH = t.heightMedium;
         if (bh < rowH * 3) { bh = rowH * 3; }
         c.PushClip(x, y, totalW, bh);
         Table.RenderHeader(app, x, y, cols, widths);
@@ -1965,6 +2001,7 @@ partial class Designer {
             ry = ry + rowH;
         }
         c.PopClip();
+        EndCtrlZoom(app);
         c.DrawRect(x, y, totalW, bh, t.borderPrimary, 1);
     }
 

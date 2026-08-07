@@ -128,6 +128,12 @@ partial class Designer {
     bool winRound;
     // 预览缩放（千分比，参见 PvS/PvFont）；1000 = 1:1（流式模式）。
     int pvScale;
+    // 真实控件预览的等比缩放：渲染真控件（输入/表格/图表等）时
+    // 临时把 app.dpiScale 和主题度量按视图缩放放大/缩小，让它们
+    // 的字号、内边距随画布一起等比缩放，渲染完精确还原。
+    // czBase 是被缩放前的主题度量快照，czDpi 是原 dpiScale。
+    List<int> czBase;
+    int czDpi;
 
     // 缩放下拉菜单（50%–200% 档位）：点功能区缩放按钮弹出，
     // 在叠层顶部绘制。zoomMenuArm 跳过打开当帧的那次点击，
@@ -281,6 +287,8 @@ partial class Designer {
         this.zoomMenuX = 0;
         this.zoomMenuY = 0;
         this.zoomMenuArm = false;
+        this.czBase = null;
+        this.czDpi = 0;
         this.freeDragging = false;
         this.freeResizing = false;
         this.freeResizeH = 4;
@@ -699,23 +707,33 @@ partial class Designer {
     }
 
     /// 删除整个多选：先删附加项，再删主选中项。
+    /// 无论从功能区按钮还是 Delete 键触发，都走这里，
+    /// 保证多选里的每一个都被删掉（而不是只删主选中项）。
     void DeleteSelGroup() {
         List<FormField> extra = freeExtra;
         freeExtra = new List<FormField>();
+        int n = 0;
         for (int i = 0; i < extra.Count; i = i + 1) {
             FormField f = extra[i];
+            if (f == null || f == sel) { continue; }
             FormField pc = ParentContainerOf(f);
             if (pc == null) { fields = ListRemove(fields, f); }
             else { pc.kids = ListRemove(pc.kids, f); }
+            n = n + 1;
         }
         DeleteSel();
-        if (extra.Count > 0) {
+        if (n > 0) {
             msg = Designer.T("deleted selection", "已删除选中的组件");
         }
     }
 
     void DeleteSel() {
-        if (sel == null) { return; }
+        if (sel == null) {
+            // 即使没有主选中项，也把残留的多选和交互状态清干净，
+            // 避免后续帧引用已删对象或向 freeExtra 加入 null。
+            freeExtra = new List<FormField>();
+            return;
+        }
         FormField pc = ParentContainerOf(sel);
         if (pc == null) {
             fields = ListRemove(fields, sel);
@@ -725,6 +743,11 @@ partial class Designer {
         sel = null;
         selPrev = null;
         activeContainer = null;
+        // 清掉可能引用已删组件的交互状态，避免悬空引用崩溃。
+        freeExtra = new List<FormField>();
+        freeDragging = false;
+        freeResizing = false;
+        freeMarquee = false;
         msg = Designer.T("deleted field", "已删除组件");
     }
 
@@ -818,7 +841,7 @@ partial class Designer {
         // 忽略该操作，避免影响输入。
         if (!preview && ek == 4 && app.window.EventKeyCode() == 46
             && sel != null && app.focus.focusedId < 0) {
-            DeleteSel();
+            DeleteSelGroup();
             app.RequestRedraw();
         }
         if (jsonOpen) {
