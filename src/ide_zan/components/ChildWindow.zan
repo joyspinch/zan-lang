@@ -1,4 +1,5 @@
 using System;
+using System.IO;
 using System.Json;
 using Gui;
 using Gui.Widget;
@@ -45,6 +46,33 @@ class ChildWindow {
     /// never see the hover/press resolved on the previous frame.
     virtual int IdBase() { return 900000; }
 
+    /// Relative `.zform` source for this window. Empty keeps support for
+    /// legacy dynamic documents while each migrated window moves to a file.
+    virtual string FormPath() { return ""; }
+
+    /// Loads a form from the executable directory in packaged builds or from
+    /// the source tree during development.
+    string LoadForm(string relPath) {
+        if (relPath == null || relPath == "") { return ""; }
+        string p = ZanIDE.BaseDir() + "/" + relPath;
+        if (File.Exists(p)) { return File.ReadAllText(p); }
+        p = ZanIDE.BaseDir() + "/../src/ide_zan/" + relPath;
+        if (File.Exists(p)) { return File.ReadAllText(p); }
+        p = ZanIDE.BaseDir() + "/../src/ide_zan/views/"
+            + Path.GetFileName(relPath);
+        if (File.Exists(p)) { return File.ReadAllText(p); }
+        return "";
+    }
+
+    /// Builds a retained control tree from a checked-in `.zform` document.
+    /// Subclasses can bind their model and wire events after this call.
+    bool BuildForm(string relPath, JsonValue model) {
+        string src = this.LoadForm(relPath);
+        if (src == "") { return false; }
+        ui = UiDoc.FromJson(src).Bind(model);
+        return true;
+    }
+
     /// Extra reasons to repaint: actions raised by UiDoc handlers between
     /// frames, background work still running, ...
     virtual bool Pending() { return false; }
@@ -73,7 +101,10 @@ class ChildWindow {
         int saved = WidgetId.SeqValue();
         WidgetId.SetSeq(idBase);
         host.BeginFrame();
-        ui.RenderInto(host, 0, 0, host.canvas.Width(), host.canvas.Height());
+        int top = host.ContentTop();
+        ui.RenderInto(host, 0, top, host.ClientWidth(),
+                        host.ClientHeight() - top);
+        host.RenderChrome(this.Title());
         host.PresentFrame();
         WidgetId.SetSeq(saved);
         this.AfterFrame();
@@ -94,12 +125,17 @@ class ChildWindow {
     void ApplyEvent(nint hwnd) {
         if (!this.OwnsWindow(hwnd)) { return; }
         if (host.EventKind() == 8) {
+            this.OnCloseRequested();
             open = false;
             this.Teardown();
             return;
         }
         host.ApplyEvent(hwnd);
     }
+
+    /// Called when the user clicks the window's close button. Subclasses can
+    /// mirror the behaviour of their internal "done"/"cancel" handlers here.
+    virtual void OnCloseRequested() { }
 
     void Close() {
         if (open) { host.window.Close(); }

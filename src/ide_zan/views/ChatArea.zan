@@ -77,57 +77,10 @@ class ChatSessionsDoc {
 /// serialization (ChatPack/ChatUnpack), the wrapped markdown-aware line
 /// cache (ChatBuildLines) and the bottom-anchored transcript renderer.
 class ChatArea {
-    /// One pre-wrapped display row of the chat cache: the text, its colour,
-    /// its display kind (0 normal / 1 code / 2 heading / 3 turn header /
-    /// 4 thinking toggle / 5 foldable toggle / 6 spacer between turns), the
-    /// message index a kind-5 row toggles (else -1) and the speaker of the
-    /// message the row belongs to (0 you / 1 Xiao Zan / 2 tool / 3 error, used
-    /// to tint whole blocks).
-    /// One entity instead of the old parallel lines/colors/kinds/meta/owner
-    /// lists, whose index alignment any edit could silently break.
-    static class ChatLine {
-        string text;
-        int color;
-        int kind;
-        int meta;
-        int owner;
-        // Componentized name-row extras. A head row (kind 3) is drawn as a real
-        // Avatar + Tag chip instead of a hand-painted pill, so these carry what
-        // those components need: the avatar's initial, the role Tag class, an
-        // optional status label (ack/doing/handed off...) and a progress % (-1
-        // when the beat carried none). Empty / -1 on the single assistant.
-        string ava;
-        string tagCls;
-        string status;
-        int pct;
-
-        static ChatLine Create(string text, int color, int kind) {
-            ChatLine ln = new ChatLine();
-            ln.text = text;
-            ln.color = color;
-            ln.kind = kind;
-            ln.meta = 0 - 1;
-            ln.owner = 0 - 1;
-            ln.ava = "";
-            ln.tagCls = "";
-            ln.status = "";
-            ln.pct = 0 - 1;
-            return ln;
-        }
-    }
-
-    /// The first visible character of a speaker name, for the round Avatar. A
-    /// CJK name keeps its first glyph; a latin name is upper-cased.
-    static string Initial(string name) {
-        if (name == "") { return "?"; }
-        // Cut on a character boundary, not a byte one: a CJK name is 3 bytes per
-        // glyph and Left(name, 1) would slice one third of a codepoint into the
-        // mojibake the user saw inside the avatar.
-        int end = Text.NextCharEnd(name, 0);
-        if (end <= 0) { end = 1; }
-        string ch = Text.Left(name, end);
-        return ch.ToUpper();
-    }
+    /// The display-line row type lives in the stdlib as `Gui.Widget.TextRun`
+    /// (declared in StyledText.zan), so the chat transcript's line cache and
+    /// the StyledText control that paints it share one entity without the IDE
+    /// having to re-wrap rows per frame.
 
     /// Greedily wraps `s` to `maxW` pixels, appending the pieces to `outLines`.
     static void WrapInto(string s, int maxW, int fontSize, List<string> outLines) {
@@ -165,25 +118,25 @@ class ChatArea {
     /// empty piece becomes one empty row), matching the old "add a blank line
     /// when nothing was emitted" idiom without the index bookkeeping.
     static void WrapRows(string s, int maxW, int fontSize,
-            List<ChatLine> cache, int color, int kind) {
+            List<TextRun> cache, int color, int kind) {
         List<string> wrapped = new List<string>();
         ChatArea.WrapInto(s, maxW, fontSize, wrapped);
         for (int wi = 0; wi < wrapped.Count; wi = wi + 1) {
-            cache.Add(ChatLine.Create(wrapped[wi], color, kind));
+            cache.Add(TextRun.Create(wrapped[wi], color, kind));
         }
     }
 
     /// Sets `owner` on every row the cache gained since `start`: the speaker
     /// of the message those rows belong to, used to tint whole blocks.
-    static void OwnRows(List<ChatLine> cache, int start, int owner) {
+    static void OwnRows(List<TextRun> cache, int start, int owner) {
         for (int oi = start; oi < cache.Count; oi = oi + 1) {
             cache[oi].owner = owner;
         }
     }
 
     /// The selected text of `cache`, newline-joined ("" when nothing is
-    /// selected); mirrors LogView.SelectionText for the ChatLine entity.
-    static string SelectionText(List<ChatLine> cache, LogState st) {
+    /// selected); mirrors LogView.SelectionText for the TextRun entity.
+    static string SelectionText(List<TextRun> cache, LogState st) {
         if (!st.HasSelection()) { return ""; }
         int r0 = st.selR0; int c0 = st.selC0;
         int r1 = st.selR1; int c1 = st.selC1;
@@ -384,7 +337,7 @@ class ChatArea {
 
     static void ChatBuildLines(App app, List<AiChatMsg> msgs,
             int textW, bool thinkOpen, List<int> toolOpen,
-            List<ChatLine> cache) {
+            List<TextRun> cache) {
         ChatArea.ChatBuildRange(app, msgs, 0, msgs.Count,
             textW, thinkOpen, toolOpen, cache);
     }
@@ -408,7 +361,7 @@ class ChatArea {
     /// of re-wrapping a whole long conversation on every frame.
     static void ChatBuildRange(App app, List<AiChatMsg> msgs,
             int from, int to, int textW, bool thinkOpen,
-            List<int> toolOpen, List<ChatLine> cache) {
+            List<int> toolOpen, List<TextRun> cache) {
         Theme t = app.theme;
         List<int> togPos = new List<int>();
         List<int> togMsg = new List<int>();
@@ -475,9 +428,9 @@ class ChatArea {
                 }
                 if (expandable) { togPos.Add(cache.Count); togMsg.Add(i); }
                 if (expandable) {
-                    cache.Add(ChatLine.Create(sline, headCol, 5));
+                    cache.Add(TextRun.Create(sline, headCol, 5));
                 } else {
-                    cache.Add(ChatLine.Create(sline, headCol, 3));
+                    cache.Add(TextRun.Create(sline, headCol, 3));
                 }
                 if (open) {
                     for (int k = 1; k < tl.Count; k = k + 1) {
@@ -486,15 +439,15 @@ class ChatArea {
                     }
                 }
                 ChatArea.OwnRows(cache, msgStart, 2);
-                ChatLine tgap = ChatLine.Create("", t.textTertiary, 6);
+                TextRun tgap = TextRun.Create("", t.textTertiary, 6);
                 tgap.owner = 2;
                 cache.Add(tgap);
                 i = i + 1;
                 continue;
             }
             int msgStart = cache.Count;
-            ChatLine hln = ChatLine.Create(head, headCol, 3);
-            hln.ava = ChatArea.Initial(head);
+            TextRun hln = TextRun.Create(head, headCol, 3);
+            hln.ava = StyledText.Initial(head);
             hln.tagCls = headCls;
             hln.status = headStatus;
             hln.pct = headPct;
@@ -507,10 +460,10 @@ class ChatArea {
                 // shows, so the thinking never buries the answer. Clicking it
                 // (handled in RenderChatArea) expands the full reasoning.
                 if (thinkOpen) {
-                    cache.Add(ChatLine.Create(ZanIDE.T("Thinking (click to hide)",
+                    cache.Add(TextRun.Create(ZanIDE.T("Thinking (click to hide)",
                         "思考过程（点击收起）"), t.textTertiary, 4));
                 } else {
-                    cache.Add(ChatLine.Create(ZanIDE.T("Thinking (click to show)",
+                    cache.Add(TextRun.Create(ZanIDE.T("Thinking (click to show)",
                         "思考过程（点击展开）"), t.textTertiary, 4));
                 }
                 if (thinkOpen) {
@@ -535,7 +488,7 @@ class ChatArea {
             if (codeOpen && ChatArea.HasLongCode(src)) {
                 togPos.Add(cache.Count);
                 togMsg.Add(i);
-                cache.Add(ChatLine.Create("▼ " + ZanIDE.T("collapse code", "收起代码"),
+                cache.Add(TextRun.Create("▼ " + ZanIDE.T("collapse code", "收起代码"),
                     t.textTertiary, 5));
             }
             int li = 0;
@@ -558,7 +511,7 @@ class ChatArea {
                         }
                         togPos.Add(cache.Count);
                         togMsg.Add(i);
-                        cache.Add(ChatLine.Create("▶ " + ZanIDE.T("show ", "展开剩余 ")
+                        cache.Add(TextRun.Create("▶ " + ZanIDE.T("show ", "展开剩余 ")
                             + Convert.ToString(blockLen - keep)
                             + ZanIDE.T(" more code lines", " 行代码"),
                             t.textTertiary, 5));
@@ -591,7 +544,7 @@ class ChatArea {
             // One unpainted spacer row closes a turn: with six members talking,
             // tinted blocks that touch each other read as one wall of text. The
             // spacer carries no tint and no rail, so the blocks separate.
-            ChatLine gap = ChatLine.Create("", t.textTertiary, 6);
+            TextRun gap = TextRun.Create("", t.textTertiary, 6);
             gap.owner = ownCode;
             cache.Add(gap);
             i = i + 1;
@@ -623,273 +576,50 @@ class ChatArea {
         return sb.ToString();
     }
 
-    /// The display-line index under `mouseY` for a bottom-anchored transcript
-    /// whose first visible line is `start`.
-    /// One name row, assembled from Avatar + Tag. Reused instances: a head row
-    /// is drawn for every visible turn, and allocating a control per row per
-    /// frame is exactly the kind of churn that made long transcripts crawl.
-    static Avatar headAva;
-    static Avatar HeadAvatar() {
-        if (ChatArea.headAva == null) {
-            ChatArea.headAva = new Avatar();
-        }
-        return ChatArea.headAva;
-    }
+    // HeadAvatar / PaintHeadRow / FontPx / RowH / RowAtChat used to live here;
+    // they moved into the StyledText control alongside the line-grid painting,
+    // so this view no longer holds any drawing helpers of its own.
 
-    static void PaintHeadRow(App app, ChatLine ln, int x, int y, int rowH,
-            int rightEdge) {
-        int cx = x;
-        // Everything on the name strip is centred on the row with the height the
-        // widgets really have: a chip is theme.heightTiny tall, so laying the
-        // strip out against a shorter guessed row is what pushed the name into
-        // the line below it.
-        int chipH = Tag.Height(app, ln.tagCls);
-        int chipY = y + (rowH - chipH) / 2;
-        if (chipY < y) { chipY = y; }
-        Avatar av = ChatArea.HeadAvatar();
-        av.Text = ln.ava;
-        av.Size = 16;
-        av.Class = ln.tagCls;
-        int d = av.Diameter(app);
-        int avY = y + (rowH - d) / 2;
-        if (avY < y) { avY = y; }
-        av.RenderAt(app, cx, avY, d);
-        cx = cx + d + app.Scale(5);
-        int nameW = Tag.Width(app, ln.text, ln.tagCls);
-        if (cx + nameW <= rightEdge) {
-            Tag.Chip(app, cx, chipY, ln.text, ln.tagCls);
-            cx = cx + nameW + app.Scale(4);
-        }
-        if (ln.status != "") {
-            int stW = Tag.Width(app, ln.status, "");
-            if (cx + stW <= rightEdge) {
-                Tag.Chip(app, cx, chipY, ln.status, "");
-                cx = cx + stW + app.Scale(4);
-            }
-        }
-        if (ln.pct >= 0) {
-            string pl = Convert.ToString(ln.pct) + "%";
-            if (cx + Tag.Width(app, pl, "primary") <= rightEdge) {
-                Tag.Chip(app, cx, chipY, pl, "primary");
-            }
-        }
-    }
+    // One retained StyledText paints the whole transcript grid; one retained
+    // Label paints the empty-state hint. Static so they live across frames
+    // instead of being rebuilt each draw.
+    static StyledText tx;
+    static Label emptyLbl;
 
-    /// The transcript's font size, resolved from the same style the rows are
-    /// drawn with so measuring and painting cannot disagree.
-    static int FontPx(App app) {
-        return Style.Of(app, "label", "small", Style.SNormal())
-            .FontOr(app.theme.fontSizeSmall);
-    }
-
-    /// One transcript row's height: a text line plus breathing room, and never
-    /// less than the chips a name row paints. Both halves are why the panel
-    /// looked cramped and misaligned before -- a fixed 18px row is tighter than
-    /// the font's own line box at a large UI scale, and shorter than the Tag it
-    /// had to hold.
-    static int RowH(App app) {
-        int h = Canvas.FontHeight(ChatArea.FontPx(app)) + app.Scale(5);
-        int chip = Tag.Height(app, "") + app.Scale(2);
-        if (h < chip) { h = chip; }
-        return h;
-    }
-
-    static int RowAtChat(Rect area, int pad, int rowH, int start,
-            int count, int mouseY) {
-        int rel = (mouseY - (area.y + pad)) / rowH;
-        if (rel < 0) { rel = 0; }
-        int ri = start + rel;
-        if (ri < 0) { ri = 0; }
-        if (ri >= count) { ri = count - 1; }
-        return ri;
-    }
-
-    /// Draws the (pre-wrapped, cached) chat transcript bottom-anchored inside
-    /// `area`; code lines get a code-colored background strip. Returns the
-    /// maximum scroll offset.
-    static int RenderChatArea(App app, Rect area, List<ChatLine> cache,
+    /// Binds the (pre-wrapped, cached) chat transcript to the StyledText grid
+    /// and returns the maximum scroll offset. All painting -- block tints, the
+    /// speaker rail, code background, selection highlight, head row, busy line
+    /// -- is the control's own OnPaint; this view only supplies the data and
+    /// the empty-state hint.
+    static int RenderChatArea(App app, Rect area, List<TextRun> cache,
             List<int> toolOpen, int scroll, bool busy,
             LogState sel, bool interactive, SignalInt thinkOpen) {
-        Canvas c = app.canvas;
-        Theme t = app.theme;
         int pad = app.Scale(6);
-        int rowH = ChatArea.RowH(app);
-        int fontPx = ChatArea.FontPx(app);
-        int textDy = (rowH - Canvas.FontHeight(fontPx)) / 2;
-        if (textDy < 0) { textDy = 0; }
-        int extra = 0;
-        if (busy) { extra = 1; }
         if (cache.Count == 0 && !busy) {
-            c.PushClip(area.x, area.y, area.width, area.height);
-            List<string> hint = new List<string>();
-            ChatArea.WrapInto(ZanIDE.T(
-                "Ask Xiao Zan about your project: explain code, find bugs, generate Zan snippets.",
-                "向小赞提问：解释代码、查找问题、生成 Zan 代码片段。"),
-                area.width - pad * 2, t.fontSizeSmall, hint);
-            for (int hi = 0; hi < hint.Count; hi = hi + 1) {
-                app.canvas.DrawStyledText(
-                    Style.Of(app, "label", "hint small", Style.SNormal()),
-                    area.x + pad, area.y + pad + hi * rowH, hint[hi],
-                    app.theme.textPrimary, app.theme.fontSizeMedium);
+            if (ChatArea.emptyLbl == null) {
+                ChatArea.emptyLbl = new Label();
+                ChatArea.emptyLbl.wrap = true;
+                ChatArea.emptyLbl.Class = "hint small";
             }
-            c.PopClip();
+            ChatArea.emptyLbl.Text = ZanIDE.T(
+                "Ask Xiao Zan about your project: explain code, find bugs, generate Zan snippets.",
+                "向小赞提问：解释代码、查找问题、生成 Zan 代码片段。");
+            ChatArea.emptyLbl.RenderInside(app,
+                new Rect(area.x + pad, area.y + pad,
+                         area.width - pad * 2, area.height));
             return 0;
         }
-        int total = cache.Count + extra;
-        int maxRows = (area.height - pad * 2) / rowH;
-        if (maxRows < 1) { maxRows = 1; }
-        int maxScroll = total - maxRows;
-        if (maxScroll < 0) { maxScroll = 0; }
-        if (scroll > maxScroll) { scroll = maxScroll; }
-        if (scroll < 0) { scroll = 0; }
-        int start = total - maxRows - scroll;
-        if (start < 0) { start = 0; }
-        // Drag-to-select over the wrapped display lines, reusing the LogView
-        // selection model (LogState + LogView.ColAt / SelectionText). Wheel
-        // scrolling stays with the caller so it keeps its own scroll model.
-        if (interactive && cache.Count > 0) {
-            int hid = app.focus.AllocId();
-            app.hitTester.Register(new HitRegion(hid, area.x, area.y,
-                area.width, area.height, 1));
-            int kind = app.EventKind();
-            bool over = app.mouseX >= area.x && app.mouseX < area.x + area.width
-                && app.mouseY >= area.y && app.mouseY < area.y + area.height;
-            if (kind == 2 && app.window.EventButton() == 0 && over
-                && !app.PointerCaptured()) {
-                int ri = ChatArea.RowAtChat(area, pad, rowH, start,
-                    cache.Count, app.mouseY);
-                if (ri >= 0 && ri < cache.Count && cache[ri].kind == 4) {
-                    // Clicking a "Thinking" toggle row expands/collapses the
-                    // reasoning instead of starting a text selection.
-                    thinkOpen.Set(1 - thinkOpen.Get());
-                    app.RequestRedraw();
-                } else if (ri >= 0 && ri < cache.Count && cache[ri].kind == 5) {
-                    // Clicking a tool summary row expands/collapses that one
-                    // tool result (toggles its message index in toolOpen).
-                    int mid = 0 - 1;
-                    if (ri < cache.Count) { mid = cache[ri].meta; }
-                    if (mid >= 0) {
-                        int at = 0 - 1;
-                        for (int z = 0; z < toolOpen.Count; z = z + 1) {
-                            if (toolOpen[z] == mid) { at = z; }
-                        }
-                        if (at >= 0) { toolOpen.RemoveAt(at); }
-                        else { toolOpen.Add(mid); }
-                        app.RequestRedraw();
-                    }
-                } else {
-                    int cc = LogView.ColAt(cache[ri].text,
-                        area.x + pad + app.Scale(11),
-                        t.fontSizeSmall, app.mouseX);
-                    sel.selR0 = ri; sel.selC0 = cc;
-                    sel.selR1 = ri; sel.selC1 = cc;
-                    sel.selDrag = true;
-                    app.RequestRedraw();
-                }
-            }
-            if (kind == 1 && sel.selDrag) {
-                int ri = ChatArea.RowAtChat(area, pad, rowH, start,
-                    cache.Count, app.mouseY);
-                int cc = LogView.ColAt(cache[ri].text,
-                    area.x + pad + app.Scale(11),
-                    t.fontSizeSmall, app.mouseX);
-                sel.selR1 = ri; sel.selC1 = cc;
-                app.RequestRedraw();
-            }
-            if (kind == 3 && sel.selDrag) {
-                sel.selDrag = false;
-                app.RequestRedraw();
-            }
-        }
-        int sr0 = sel.selR0; int sc0 = sel.selC0;
-        int sr1 = sel.selR1; int sc1 = sel.selC1;
-        if (sr0 >= 0 && (sr0 > sr1 || (sr0 == sr1 && sc0 > sc1))) {
-            int tr = sr0; sr0 = sr1; sr1 = tr;
-            int tc = sc0; sc0 = sc1; sc1 = tc;
-        }
-        int selCol = App.ScaleAlpha(t.primary, 90);
-        c.PushClip(area.x, area.y, area.width, area.height);
-        int idx = start;
-        int codeBg = App.ScaleAlpha(t.bgTertiary, 160);
-        // Each turn is painted as one block: a coloured rail down its left
-        // edge plus a tint of the speaker's colour behind every one of its
-        // rows. That -- not a per-line marker -- is what makes a question,
-        // an answer and a tool dump separable at a glance.
-        int barW = app.Scale(3);
-        int blockX = area.x + pad;
-        int textX = blockX + barW + app.Scale(8);
-        int textW2 = area.width - pad * 2 - barW - app.Scale(8);
-        for (int row = 0; idx < total && row < maxRows; row = row + 1) {
-            int ry = area.y + pad + row * rowH;
-            if (idx < cache.Count) {
-                int who = 1;
-                if (cache[idx].owner >= 0) { who = cache[idx].owner; }
-                int rail = t.success;
-                int tint = App.ScaleAlpha(t.success, 16);
-                if (who == 0) {
-                    rail = t.primary;
-                    tint = App.ScaleAlpha(t.primary, 34);
-                } else if (who == 2) {
-                    rail = t.textTertiary;
-                    tint = App.ScaleAlpha(t.bgTertiary, 90);
-                } else if (who == 3) {
-                    rail = t.error;
-                    tint = App.ScaleAlpha(t.error, 30);
-                }
-                bool spacer = cache[idx].kind == 6;
-                if (!spacer) {
-                    c.FillRect(blockX, ry, area.width - pad * 2, rowH, tint);
-                    c.FillRect(blockX, ry, barW, rowH, rail);
-                }
-                if (!spacer && cache[idx].kind == 1) {
-                    c.FillRect(textX - app.Scale(2), ry,
-                        textW2 + app.Scale(4), rowH, codeBg);
-                }
-                if (!spacer && sr0 >= 0 && idx >= sr0 && idx <= sr1) {
-                    string ln = cache[idx].text;
-                    int hs = 0;
-                    int he = ln.Length;
-                    if (idx == sr0) { hs = sc0; }
-                    if (idx == sr1) { he = sc1; }
-                    if (hs < 0) { hs = 0; }
-                    if (he > ln.Length) { he = ln.Length; }
-                    if (hs > he) { hs = he; }
-                    int hx0 = textX
-                        + Canvas.MeasureText(Text.Left(ln, hs), t.fontSizeSmall);
-                    int hx1 = textX
-                        + Canvas.MeasureText(Text.Left(ln, he), t.fontSizeSmall);
-                    if (idx < sr1) { hx1 = hx1 + pad; }
-                    if (hx1 < hx0 + 2) { hx1 = hx0 + 2; }
-                    c.FillRect(hx0, ry, hx1 - hx0, rowH, selCol);
-                }
-                if (spacer) {
-                    // Nothing to paint: the row is the gap between two turns.
-                } else if (cache[idx].kind == 3) {
-                    // Name row of a turn, built from the shared widgets rather
-                    // than painted here: a round Avatar for the speaker, a Tag
-                    // chip for the name, and -- in a team chat -- one more Tag
-                    // for the beat and one for the percentage. Hand-rolling this
-                    // pill is what made the assistant's chrome drift away from
-                    // every other list row in the IDE.
-                    ChatArea.PaintHeadRow(app, cache[idx], textX, ry, rowH,
-                        area.x + area.width - pad);
-                } else if (cache[idx].kind == 1) {
-                    app.canvas.DrawText(textX + app.Scale(4), ry + textDy,
-                        cache[idx].text, cache[idx].color, fontPx);
-                } else {
-                    app.canvas.DrawText(textX, ry + textDy, cache[idx].text,
-                        cache[idx].color, fontPx);
-                }
-            } else {
-                app.canvas.DrawStyledText(
-                    Style.Of(app, "label", "hint small", Style.SNormal()),
-                    area.x + pad, ry + textDy,
-                    ZanIDE.T("Xiao Zan is thinking...", "小赞思考中..."),
-                    app.theme.textPrimary, app.theme.fontSizeMedium);
-            }
-            idx = idx + 1;
-        }
-        c.PopClip();
-        return maxScroll;
+        if (ChatArea.tx == null) { ChatArea.tx = new StyledText(); }
+        StyledText g = ChatArea.tx;
+        g.lines = cache;
+        g.scroll = scroll;
+        g.busy = busy;
+        g.sel = sel;
+        g.interactive = interactive;
+        g.thinkOpen = thinkOpen;
+        g.toolOpen = toolOpen;
+        g.busyText = ZanIDE.T("Xiao Zan is thinking...", "小赞思考中...");
+        g.RenderInside(app, area);
+        return g.maxScroll;
     }
 }
