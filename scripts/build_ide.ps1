@@ -198,4 +198,13 @@ if ($failed) { exit 1 }
 & powershell -NoProfile -ExecutionPolicy Bypass `
     -File (Join-Path (Get-Location) "scripts\stage_dev_toolchain.ps1")
 
+# Generate the assistant's offline knowledge base next to the dev exe
+# (build\knowledge), so an IDE launched from build\ has working api_search /
+# example tools (BaseDir()+"/knowledge"). Non-fatal: warns and continues.
+& powershell -NoProfile -ExecutionPolicy Bypass `
+    -File (Join-Path (Get-Location) "scripts\gen_knowledge.ps1") `
+    -Zanc (Join-Path (Get-Location) "build\zanc.exe") `
+    -Stdlib (Join-Path (Get-Location) "stdlib") `
+    -OutDir (Join-Path (Get-Location) "build\knowledge")
+
 Write-Output "IDE_BUILD_OK"

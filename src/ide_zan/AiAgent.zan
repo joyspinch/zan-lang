@@ -117,6 +117,160 @@ class AiAgent {
         return "";
     }
 
+    /// The knowledge base shipped next to the IDE: knowledge/symbols.json
+    /// (the RepoMap API index built from the real stdlib) and
+    /// knowledge/gallery.json (the golden-example catalog). Published layout
+    /// is <BaseDir>/knowledge; the dev tree keeps it one level up. "" when
+    /// absent -- callers then fall back to stdlib_grep. This is the SAME data
+    /// the server-side MCP serves, so the built-in assistant and external
+    /// agents answer from one source and neither has to grep large files.
+    static string KnowledgeDir() {
+        string a = ZanIDE.BaseDir() + "/knowledge";
+        if (Directory.Exists(a)) { return a; }
+        string b = ZanIDE.BaseDir() + "/../knowledge";
+        if (Directory.Exists(b)) { return b; }
+        return "";
+    }
+
+    /// Resolves a shipped example/template path (as stored in gallery.json,
+    /// e.g. "templates/gui/gui-empty/src/App.zan") to a file next to the IDE,
+    /// trying the published layout then the dev tree one level up. "" when
+    /// the file is not present.
+    static string ShippedFile(string rel) {
+        string a = ZanIDE.BaseDir() + "/" + rel;
+        if (File.Exists(a)) { return a; }
+        string b = ZanIDE.BaseDir() + "/../" + rel;
+        if (File.Exists(b)) { return b; }
+        return "";
+    }
+
+    /// Searches the shipped API index (knowledge/symbols.json) for records
+    /// whose name or signature contains `query` (case-insensitive), returning
+    /// up to `limit` verbatim {name,kind,file,line,sig} JSON records. This is
+    /// the fast path for "what is the exact signature of X" -- use it before
+    /// grepping the raw stdlib.
+    static string ApiSearch(string query, int limit) {
+        if (AiAgent.Trim(query) == "") {
+            return "error: 'query' is required (a symbol fragment, e.g."
+                + " \"Button\" or \"App.Create\").";
+        }
+        string kdir = AiAgent.KnowledgeDir();
+        if (kdir == "") {
+            return "error: the knowledge index was not found next to the IDE"
+                + " (expected knowledge/symbols.json). Use stdlib_grep instead.";
+        }
+        string idx = kdir + "/symbols.json";
+        if (!File.Exists(idx)) {
+            return "error: knowledge/symbols.json is missing. Use stdlib_grep"
+                + " instead.";
+        }
+        if (limit <= 0) { limit = 40; }
+        string q = ZanIDE.ToLowerS(query);
+        List<string> lines = File.ReadAllLines(idx);
+        StringBuilder sb = new StringBuilder();
+        int found = 0;
+        for (int i = 0; i < lines.Count; i = i + 1) {
+            if (found >= limit) { break; }
+            string line = lines[i];
+            if (ZanIDE.IndexOfStr(line, "\"name\"") < 0) { continue; }
+            if (ZanIDE.IndexOfStr(ZanIDE.ToLowerS(line), q) < 0) { continue; }
+            string rec = AiAgent.Trim(line);
+            if (rec.Length > 0 && rec.Substring(rec.Length - 1, 1) == ",") {
+                rec = rec.Substring(0, rec.Length - 1);
+            }
+            sb.Append(rec);
+            sb.Append("\n");
+            found = found + 1;
+        }
+        if (found == 0) {
+            return "no symbol matched \"" + query + "\". Try a shorter fragment"
+                + " (e.g. \"Button\", \"App.Create\", \"Gauge\"), or use"
+                + " stdlib_grep.";
+        }
+        return "api_search \"" + query + "\" -- " + Convert.ToString(found)
+            + " match(es), each {name,kind,file,line,sig}:\n" + sb.ToString();
+    }
+
+    /// Returns a shipped, build-verified template/example VERBATIM from the
+    /// gallery.json catalog. With no topic it lists the catalog. The assistant
+    /// copies the returned file(s) as a known-good starting point rather than
+    /// inventing API usage.
+    static string Example(string topic) {
+        string kdir = AiAgent.KnowledgeDir();
+        if (kdir == "") {
+            return "error: the knowledge catalog was not found next to the IDE"
+                + " (expected knowledge/gallery.json).";
+        }
+        string gp = kdir + "/gallery.json";
+        if (!File.Exists(gp)) {
+            return "error: knowledge/gallery.json is missing.";
+        }
+        JsonValue man = JsonValue.ParseLenient(File.ReadAllText(gp));
+        if (man == null) {
+            return "error: knowledge/gallery.json is not valid JSON.";
+        }
+        JsonValue entries = man.Get("entries");
+        if (entries == null || !entries.IsArray()) {
+            return "error: knowledge/gallery.json has no 'entries' array.";
+        }
+        string want = AiAgent.Trim(topic);
+        if (want == "") {
+            StringBuilder sb = new StringBuilder();
+            sb.Append("example catalog -- call example {\"topic\":\"<one"
+                + " below>\"} to get the verbatim file(s):\n");
+            for (int i = 0; i < entries.Count(); i = i + 1) {
+                JsonValue e = entries.At(i);
+                sb.Append("- " + e.Str("topic", "") + "  [" + e.Str("kind", "")
+                    + "]  " + e.Str("summary", "") + "\n");
+            }
+            return sb.ToString();
+        }
+        JsonValue match = null;
+        for (int i = 0; i < entries.Count(); i = i + 1) {
+            if (entries.At(i).Str("topic", "") == want) {
+                match = entries.At(i);
+                break;
+            }
+        }
+        if (match == null) {
+            for (int i = 0; i < entries.Count(); i = i + 1) {
+                if (ZanIDE.IndexOfStr(entries.At(i).Str("topic", ""), want) >= 0) {
+                    match = entries.At(i);
+                    break;
+                }
+            }
+        }
+        if (match == null) {
+            return "error: no example for topic '" + topic + "'. Call example"
+                + " with no topic to list the catalog.";
+        }
+        string kind = match.Str("kind", "");
+        StringBuilder sb = new StringBuilder();
+        sb.Append("example topic \"" + match.Str("topic", "") + "\" [" + kind
+            + "]: " + match.Str("summary", "") + "\n");
+        string bld = match.Str("build", "");
+        if (bld != "") { sb.Append("build: " + bld + "\n"); }
+        JsonValue models = man.Get("models");
+        if (models != null && models.Has(kind)) {
+            sb.Append("model: " + models.Str(kind, "") + "\n");
+        }
+        JsonValue files = match.Get("files");
+        if (files != null && files.IsArray()) {
+            for (int i = 0; i < files.Count(); i = i + 1) {
+                string rel = files.At(i).AsString("");
+                sb.Append("\n===== " + rel + " =====\n");
+                string full = AiAgent.ShippedFile(rel);
+                if (full == "") {
+                    sb.Append("(file missing next to the IDE)\n");
+                } else {
+                    sb.Append(File.ReadAllText(full));
+                    sb.Append("\n");
+                }
+            }
+        }
+        return sb.ToString();
+    }
+
     // --- path sandbox --------------------------------------------------------
 
     /// Resolves a project-relative path against `root`, or returns "" when it
@@ -204,6 +358,12 @@ class AiAgent {
             return AiAgent.Grep(sroot, v.Str("pattern", ""), v.Str("path", ""),
                                 v.Str("ext", ""));
         }
+        if (tool == "api_search") {
+            return AiAgent.ApiSearch(v.Str("query", ""), v.Int("limit", 40));
+        }
+        if (tool == "example") {
+            return AiAgent.Example(v.Str("topic", ""));
+        }
         if (tool == "write_file") {
             return AiAgent.WriteFile(root, v.Str("path", ""),
                                      v.Str("content", ""));
@@ -220,9 +380,9 @@ class AiAgent {
             return "error: '" + tool + "' is run by the IDE, not this dispatch.";
         }
         return "error: unknown tool '" + tool + "'. Available: read_file,"
-            + " list_dir, grep, repo_map, stdlib_read, stdlib_grep, plan,"
-            + " write_file, edit_file, build, run, ui_check, ui_tree, diff,"
-            + " run_errors.";
+            + " list_dir, grep, repo_map, stdlib_read, stdlib_grep, api_search,"
+            + " example, plan, write_file, edit_file, build, run, ui_check,"
+            + " ui_tree, diff, run_errors.";
     }
 
     /// Fills `outSteps` from a `plan` tool call's `items` array, replacing
@@ -352,6 +512,12 @@ class AiAgent {
             return "grep \"" + v.Str("pattern", "") + "\"";
         }
         if (tool == "repo_map") { return "repo_map"; }
+        if (tool == "api_search") {
+            return "api_search \"" + v.Str("query", "") + "\"";
+        }
+        if (tool == "example") {
+            return "example " + v.Str("topic", "");
+        }
         if (tool == "plan") { return "plan"; }
         if (tool == "build") { return "build"; }
         if (tool == "run") { return "run"; }
@@ -735,6 +901,15 @@ class AiAgent {
             + " the IDE (paths relative to the stdlib root, e.g."
             + " \"Gui/Widget/Button.zan\"). Use these to check the real"
             + " signature/behaviour of a stdlib API before using it.\n"
+            + "- api_search {query, limit}: search the shipped API index"
+            + " (knowledge/symbols.json, generated from the real stdlib) and"
+            + " get matching {name,kind,file,line,sig} records. Use this FIRST"
+            + " to find a control/method's exact signature instead of grepping"
+            + " large stdlib files.\n"
+            + "- example {topic}: return a shipped, build-verified"
+            + " template/example VERBATIM (no topic = list the catalog). Copy"
+            + " this as your starting point for Gui/Game code instead of"
+            + " writing from memory.\n"
             + "- plan {items}: show/update the task-plan checklist above the"
             + " chat. `items` is an array of short step strings (prefix"
             + " \"[x] \" to mark a step done); it replaces the current plan."
@@ -789,13 +964,14 @@ class AiAgent {
             + " first action, resend it with steps marked [x] as they finish,"
             + " and revise it when the situation changes the plan.\n"
             + "2. RETRIEVE before acting. Read the code a change depends on"
-            + " first (grep / read_file / stdlib_grep); find the real source of"
-            + " a value before editing it. Never invent a file, symbol or API"
-            + " you have not seen in a tool result this conversation. For Gui or"
-            + " Game work this is mandatory: read the real API AND open a shipped"
-            + " template/example (see the GUI & GAME section) BEFORE writing"
-            + " code -- do not guess a control constructor, a Theme token or a"
-            + " Game module entry.\n"
+            + " first (grep / read_file / stdlib_grep / api_search); find the"
+            + " real source of a value before editing it. Never invent a file,"
+            + " symbol or API you have not seen in a tool result this"
+            + " conversation. For Gui or Game work this is mandatory: query the"
+            + " API index (api_search) AND open a shipped example (example tool)"
+            + " -- see the GUI & GAME section -- BEFORE writing code; do not"
+            + " guess a control constructor, a Theme token or a Game module"
+            + " entry.\n"
             + "3. CITE your evidence as path:line so the user can check every"
             + " claim against the code you actually read.\n"
             + "4. VERIFY before claiming. After an edit, build (or run /"
@@ -843,10 +1019,11 @@ class AiAgent {
             + "- Build/run a file: `zanc file.zan --auto-stdlib -o out.exe`"
             + " (the IDE's build tool does this for you).\n\n");
         sb.Append("GUI & GAME. Before writing ANY Gui or Game code you MUST"
-            + " first read the exact API (stdlib_read/stdlib_grep) AND copy a"
-            + " shipped example instead of inventing usage. Never guess a"
-            + " control constructor, a Theme token name, or a Game module's"
-            + " entry shape.\n"
+            + " first look up the exact API (api_search, falling back to"
+            + " stdlib_read/stdlib_grep) AND copy a shipped example (the example"
+            + " tool) instead of inventing usage. Never guess a control"
+            + " constructor, a Theme token name, or a Game module's entry"
+            + " shape.\n"
             + "GUI has two models -- pick one, don't mix:\n"
             + "- DESIGNER (recommended for windows/forms): a .zform/.zscene JSON"
             + " defines the window; zanc projects the designed controls into"

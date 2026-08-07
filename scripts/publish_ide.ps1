@@ -211,6 +211,16 @@ if (Test-Path $toolsDir) {
     Write-Output "PUBLISH_WARN: tools\ missing; the Tools panel will be empty"
 }
 
+# ---- knowledge base for the built-in assistant (offline API index + example
+#      catalog) -------------------------------------------------------------
+# The IDE's assistant reads <ExeDir>\knowledge\symbols.json (RepoMap index of
+# the shipped stdlib) and <ExeDir>\knowledge\gallery.json (golden-example
+# catalog) via its api_search / example tools, so it answers from a generated
+# index instead of grepping the raw stdlib. Same data the server-side MCP
+# serves. Non-fatal: the assistant falls back to stdlib_grep if this is absent.
+& (Join-Path $root 'scripts\gen_knowledge.ps1') `
+    -Zanc $zancExe -Stdlib $stdlib -OutDir (Join-Path $dist 'knowledge')
+
 # ---- release readme ----
 Write-Output "[4/4] Writing README.txt ..."
 $readme = @"
@@ -239,6 +249,10 @@ Contents
                  no external toolchain. Keep this folder intact.
   stdlib\        Standard library sources. zanc auto-includes the .zan files
                  it needs from here; keep this folder next to ZanIDE.exe.
+  knowledge\     Offline knowledge base for the built-in assistant:
+                   symbols.json  API index generated from stdlib (api_search)
+                   gallery.json  golden-example catalog (example tool)
+                 The assistant queries these instead of grepping the stdlib.
   examples\      Sample programs shown in the IDE's Examples pane (optional).
   templates\     Built-in New Project templates (one folder each, with a
                  template.manifest). Edit or drop in your own folders to add
