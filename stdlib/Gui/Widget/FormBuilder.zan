@@ -1,0 +1,676 @@
+using System;
+using Gui;
+using Gui.Hmi;
+
+namespace Gui.Widget;
+
+/// 统一的 .zform -> 真控件树构建器。设计器预览与运行时窗口
+/// 共用这一套：把设计文档（Designer.SaveJson / formgen 消费的同一 JSON）
+/// 实例化为真正的 Control 树，按 24 列流式或自由画布布局排布。
+///
+/// 设计器把它渲染在编辑外框内并叠加选中/handle 覆盖层；运行时把
+/// 同一棵树放进 Form。因此“所见即所得”天然成立，自定义组件也走
+/// 同一条实例化路径（CustomComponents / 注入工厂）。
+///
+/// 字段类型 -> 控件 / 首选高度 / 是否容器 的映射与 src/compiler/formgen.c
+/// 严格镜像（fg_widget_type / fg_pref_h / fg_is_container / fg_ctor /
+/// fg_field_setup），是唯一权威。所有 setup 都在具体类型的局部变量上完成，
+/// 避免向下强转（stdlib 一贯用虚方法而非强转）。
+class FormBuilder {
+    /// 把设计文档根对象构建为内容根 Control（不含窗口外框）。
+    static Control Build(JsonValue root) {
+        Panel host = new Panel("root");
+        host.style = 3;
+        bool free = false;
+        if (root != null) { free = root.Int("layoutMode", 0) == 1; }
+        host.Dock(Dock.Fill());
+        if (free) {
+            host.Pad(0);
+            host.gap = 0;
+        } else {
+            host.Pad(16);
+            host.gap = 10;
+        }
+        if (root == null) { return host; }
+        JsonValue arr = root.Get("fields");
+        if (arr == null || !arr.IsArray()) { return host; }
+        if (free) {
+            for (int i = 0; i < arr.Count(); i = i + 1) {
+                FormBuilder.BuildFree(host, arr.At(i));
+            }
+        } else {
+            FormBuilder.BuildFlow(host, arr);
+        }
+        return host;
+    }
+
+    // ---- 类型解析（镜像 formgen fg_ftype_of / fg_widget_type 等）----
+
+    static int Ftype(JsonValue o) {
+        int ft = o.Int("type", -1);
+        if (ft >= 0) { return ft; }
+        return FormBuilder.KindToType(o.Str("kind", "input"));
+    }
+
+    static int KindToType(string k) {
+        if (k == "textarea") { return 1; }
+        if (k == "password") { return 2; }
+        if (k == "number") { return 3; }
+        if (k == "radio") { return 4; }
+        if (k == "checkbox") { return 5; }
+        if (k == "select") { return 6; }
+        if (k == "switch") { return 7; }
+        if (k == "rate") { return 8; }
+        if (k == "slider") { return 9; }
+        if (k == "richtext") { return 14; }
+        if (k == "title") { return 15; }
+        if (k == "text") { return 16; }
+        if (k == "divider") { return 17; }
+        if (k == "card") { return 18; }
+        if (k == "tag") { return 19; }
+        if (k == "badge") { return 20; }
+        if (k == "avatar") { return 21; }
+        if (k == "statistic") { return 22; }
+        if (k == "timeline") { return 24; }
+        if (k == "tree") { return 25; }
+        if (k == "collapse") { return 26; }
+        if (k == "empty") { return 27; }
+        if (k == "progress") { return 29; }
+        if (k == "result") { return 30; }
+        if (k == "skeleton") { return 31; }
+        if (k == "spin") { return 32; }
+        if (k == "steps") { return 34; }
+        if (k == "breadcrumb") { return 35; }
+        if (k == "tabs") { return 36; }
+        if (k == "pagination") { return 37; }
+        if (k == "pageheader") { return 39; }
+        if (k == "carousel") { return 42; }
+        if (k == "panel") { return 45; }
+        if (k == "dropdown") { return 48; }
+        if (k == "floatbutton") { return 49; }
+        if (k == "toolbar") { return 58; }
+        if (k == "statusbar") { return 59; }
+        if (k == "split") { return 60; }
+        if (k == "dockpanel") { return 61; }
+        if (k == "led") { return 62; }
+        if (k == "digital") { return 63; }
+        if (k == "gauge") { return 64; }
+        if (k == "bargraph") { return 65; }
+        if (k == "trend") { return 66; }
+        if (k == "alarmbanner") { return 67; }
+        if (k == "alarmlist") { return 68; }
+        if (k == "numpad") { return 69; }
+        if (k == "devicecard") { return 70; }
+        if (k == "equippanel") { return 71; }
+        if (k == "custom") { return 100; }
+        return 0;
+    }
+
+    static string WidgetType(int ft) {
+        if (ft == 100) { return "Control"; }
+        if (ft == 0 || ft == 2 || ft == 3) { return "Input"; }
+        if (ft == 1 || ft == 14) { return "TextArea"; }
+        if (ft == 4) { return "Radio"; }
+        if (ft == 5) { return "Checkbox"; }
+        if (ft == 6 || ft == 48) { return "SelectBox"; }
+        if (ft == 7) { return "Switch"; }
+        if (ft == 8) { return "Rate"; }
+        if (ft == 9) { return "Slider"; }
+        if (ft == 29) { return "Progress"; }
+        if (ft == 49) { return "FloatButton"; }
+        if (ft == 17) { return "Divider"; }
+        if (ft == 19) { return "Tag"; }
+        if (ft == 20) { return "Badge"; }
+        if (ft == 21) { return "Avatar"; }
+        if (ft == 22) { return "Statistic"; }
+        if (ft == 24) { return "Timeline"; }
+        if (ft == 25) { return "TreeView"; }
+        if (ft == 26) { return "Collapse"; }
+        if (ft == 27) { return "Empty"; }
+        if (ft == 30) { return "Result"; }
+        if (ft == 31) { return "Skeleton"; }
+        if (ft == 32) { return "Spin"; }
+        if (ft == 34) { return "Steps"; }
+        if (ft == 35) { return "Breadcrumb"; }
+        if (ft == 37) { return "Pagination"; }
+        if (ft == 39) { return "PageHeader"; }
+        if (ft == 42) { return "Carousel"; }
+        if (ft == 18 || ft == 45 || ft == 36 || ft == 61) { return "Panel"; }
+        if (ft == 58) { return "ToolStrip"; }
+        if (ft == 59) { return "StatusBar"; }
+        if (ft == 60) { return "SplitPanel"; }
+        if (ft == 62) { return "Led"; }
+        if (ft == 63) { return "Digital"; }
+        if (ft == 64) { return "Gauge"; }
+        if (ft == 65) { return "Bargraph"; }
+        if (ft == 66) { return "Trend"; }
+        if (ft == 67) { return "AlarmBanner"; }
+        if (ft == 68) { return "AlarmList"; }
+        if (ft == 69) { return "NumPad"; }
+        if (ft == 70) { return "DeviceCard"; }
+        if (ft == 71) { return "EquipPanel"; }
+        return "Label";
+    }
+
+    static bool NeedsCaption(int ft) {
+        return ft == 0 || ft == 1 || ft == 2 || ft == 3 || ft == 4
+            || ft == 6 || ft == 8 || ft == 9 || ft == 29 || ft == 14 || ft == 48;
+    }
+
+    static int PrefH(int ft) {
+        if (ft == 1 || ft == 14) { return 90; }
+        if (ft == 29) { return 16; }
+        if (ft == 15) { return 30; }
+        if (ft == 5 || ft == 7 || ft == 4 || ft == 8) { return 26; }
+        if (ft == 49) { return 36; }
+        if (ft == 58) { return 34; }
+        if (ft == 59) { return 24; }
+        if (ft == 60 || ft == 61) { return 240; }
+        if (ft == 62) { return 26; }
+        if (ft == 63) { return 72; }
+        if (ft == 64) { return 160; }
+        if (ft == 65) { return 180; }
+        if (ft == 66) { return 200; }
+        if (ft == 67) { return 32; }
+        if (ft == 68) { return 200; }
+        if (ft == 69) { return 260; }
+        if (ft == 70) { return 140; }
+        if (ft == 71) { return 300; }
+        return 32;
+    }
+
+    static bool IsContainer(int ft) {
+        return ft == 18 || ft == 36 || ft == 60 || ft == 61;
+    }
+
+    static int DefaultDock(int ft) {
+        if (ft == 58) { return 1; }
+        if (ft == 59) { return 2; }
+        if (ft == 61) { return 5; }
+        return 0;
+    }
+
+    static int ClampSpan(int s) {
+        if (s < 1) { return 1; }
+        if (s > 24) { return 24; }
+        return s;
+    }
+
+    static string Caption(JsonValue o) {
+        string label = o.Str("label", "");
+        if (label != "") { return label; }
+        return o.Str("name", "");
+    }
+
+    static int ChildCount(JsonValue o) {
+        JsonValue kids = o.Get("kids");
+        if (kids != null && kids.IsArray()) { return kids.Count(); }
+        return 0;
+    }
+
+    static string OptAt(JsonValue o, int i, string def) {
+        JsonValue opts = o.Get("options");
+        if (opts == null || !opts.IsArray() || i >= opts.Count()) { return def; }
+        JsonValue it = opts.At(i);
+        if (it == null || !it.IsString()) { return def; }
+        return it.AsString(def);
+    }
+
+    static int OptInt(JsonValue o, int i, int def) {
+        string s = FormBuilder.OptAt(o, i, "");
+        if (s == "" || !FormBuilder.IsNumber(s)) { return def; }
+        return Convert.ToInt32(s);
+    }
+
+    static bool IsNumber(string s) {
+        if (s == "") { return false; }
+        int i = 0;
+        if (s.StartsWith("-")) { i = 1; }
+        if (i >= s.Length) { return false; }
+        while (i < s.Length) {
+            string ch = s.Substring(i, 1);
+            if (ch < "0" || ch > "9") { return false; }
+            i = i + 1;
+        }
+        return true;
+    }
+
+    static string JoinOpts(JsonValue o) {
+        JsonValue opts = o.Get("options");
+        if (opts == null || !opts.IsArray() || opts.Count() == 0) { return ""; }
+        string s = "";
+        for (int i = 0; i < opts.Count(); i = i + 1) {
+            if (i > 0) { s = s + "|"; }
+            s = s + opts.At(i).AsString("");
+        }
+        return s;
+    }
+
+    // ---- 构造 + 初始化 + 容器填充（镜像 fg_ctor / fg_field_setup）----
+    // 全部在具体类型上进行，返回时隐式上转为 Control，避免向下强转。
+
+    static Control MakeControl(JsonValue o, int ft, string wt, bool free) {
+        string cap = FormBuilder.Caption(o);
+        if (wt == "Input") { return new Input(o.Str("placeholder", "")); }
+        if (wt == "TextArea") { return new TextArea(o.Str("placeholder", "")); }
+        if (wt == "Button") { return new Button { Text = cap }; }
+        if (wt == "Checkbox") {
+            Checkbox cb = new Checkbox(cap);
+            if (o.Bool("defOn", false)) { cb.SetChecked(true); }
+            return cb;
+        }
+        if (wt == "Switch") {
+            Switch sw = new Switch();
+            if (o.Bool("defOn", false)) { sw.SetOn(true); }
+            return sw;
+        }
+        if (wt == "Radio") { return new Radio(new SignalInt(0), 0, cap); }
+        if (wt == "Slider") { return new Slider(0, 100, new SignalInt(0)); }
+        if (wt == "SelectBox") {
+            SelectBox sb = SelectBox.FromOptions(new List<string>(), "");
+            string opts = FormBuilder.JoinOpts(o);
+            if (opts != "") { sb.SetOptionsText(opts); }
+            return sb;
+        }
+        if (wt == "Progress") { return new Progress(50, 1); }
+        if (wt == "Divider") { return new Divider(cap); }
+        if (wt == "Tag") { return new Tag(cap); }
+        if (wt == "Avatar") { return new Avatar(cap); }
+        if (wt == "Empty") { return new Empty(cap); }
+        if (wt == "Badge") { return new Badge(FormBuilder.OptInt(o, 0, 0)); }
+        if (wt == "Statistic") { return new Statistic(cap, FormBuilder.OptAt(o, 0, "0")); }
+        if (wt == "Result") { return new Result(cap, o.Str("placeholder", "")); }
+        if (wt == "PageHeader") { return new PageHeader(cap, o.Str("placeholder", "")); }
+        if (wt == "Pagination") {
+            int total = FormBuilder.OptInt(o, 0, 10);
+            if (total <= 0) { total = 10; }
+            return new Pagination(total);
+        }
+        if (wt == "Timeline") {
+            Timeline tl = new Timeline();
+            JsonValue opts = o.Get("options");
+            if (opts != null && opts.IsArray()) {
+                for (int i = 0; i < opts.Count(); i = i + 1) {
+                    tl.AddItem("", opts.At(i).AsString(""), "");
+                }
+            }
+            return tl;
+        }
+        if (wt == "TreeView") {
+            TreeView tv = new TreeView();
+            JsonValue opts = o.Get("options");
+            if (opts != null && opts.IsArray() && opts.Count() > 0) {
+                List<TreeNode> nodes = new List<TreeNode>();
+                for (int i = 0; i < opts.Count(); i = i + 1) {
+                    string txt = opts.At(i).AsString("");
+                    if (i == 0) { nodes.Add(TreeNode.Dir(txt, 0, true)); }
+                    else { nodes.Add(TreeNode.File(txt, 1)); }
+                }
+                tv.Bind(nodes);
+            }
+            return tv;
+        }
+        if (wt == "Collapse") {
+            Collapse cl = new Collapse();
+            JsonValue opts = o.Get("options");
+            if (opts != null && opts.IsArray()) {
+                for (int i = 0; i < opts.Count(); i = i + 1) {
+                    cl.AddPanel(opts.At(i).AsString(""), "");
+                }
+            }
+            return cl;
+        }
+        if (wt == "Steps") {
+            Steps st = new Steps();
+            JsonValue opts = o.Get("options");
+            if (opts != null && opts.IsArray()) {
+                for (int i = 0; i < opts.Count(); i = i + 1) {
+                    st.AddStep(opts.At(i).AsString(""));
+                }
+            }
+            return st;
+        }
+        if (wt == "Breadcrumb") {
+            Breadcrumb bc = new Breadcrumb();
+            JsonValue opts = o.Get("options");
+            if (opts != null && opts.IsArray()) {
+                for (int i = 0; i < opts.Count(); i = i + 1) {
+                    bc.AddItem(opts.At(i).AsString(""));
+                }
+            }
+            return bc;
+        }
+        if (wt == "Carousel") {
+            Carousel cr = new Carousel();
+            JsonValue opts = o.Get("options");
+            if (opts != null && opts.IsArray()) {
+                for (int i = 0; i < opts.Count(); i = i + 1) {
+                    cr.AddSlide(opts.At(i).AsString(""));
+                }
+            }
+            return cr;
+        }
+        if (wt == "Skeleton") { return new Skeleton(); }
+        if (wt == "Spin") { return new Spin(); }
+        if (wt == "FloatButton") {
+            string icon = o.Str("icon", "");
+            if (icon == "") { icon = "plus"; }
+            return new FloatButton(icon);
+        }
+        if (wt == "Rate") { return new Rate(new SignalInt(0), 5); }
+        if (wt == "Panel") {
+            Panel p = new Panel(o.Str("name", ""));
+            if (FormBuilder.IsContainer(ft)) { FormBuilder.FillKids(p, o, free); }
+            return p;
+        }
+        if (wt == "ToolStrip") {
+            ToolStrip ts = new ToolStrip();
+            string opts = FormBuilder.JoinOpts(o);
+            if (opts != "") { ts.SetItemsText(opts); }
+            return ts;
+        }
+        if (wt == "StatusBar") {
+            StatusBar bar = new StatusBar();
+            JsonValue opts = o.Get("options");
+            if (opts != null && opts.IsArray()) {
+                for (int i = 0; i < opts.Count(); i = i + 1) {
+                    string s = opts.At(i).AsString("");
+                    if (s == "") { continue; }
+                    if (s.StartsWith(">")) { bar.AddRight(s.Substring(1, s.Length - 1)); }
+                    else { bar.AddLeft(s); }
+                }
+            }
+            return bar;
+        }
+        if (wt == "SplitPanel") {
+            string orient = FormBuilder.OptAt(o, 0, "vertical");
+            int size = FormBuilder.OptInt(o, 1, 240);
+            if (size <= 0) { size = 240; }
+            SplitPanel sp;
+            if (orient == "horizontal") { sp = new SplitPanel(SplitPanel.Horizontal(), size); }
+            else { sp = new SplitPanel(SplitPanel.Vertical(), size); }
+            JsonValue kids = o.Get("kids");
+            if (kids != null && kids.IsArray()) {
+                for (int i = 0; i < kids.Count(); i = i + 1) {
+                    JsonValue kid = kids.At(i);
+                    Control pane = sp.First();
+                    if (kid.Int("childTab", 0) == 1) { pane = sp.Second(); }
+                    if (free) { FormBuilder.BuildFree(pane, kid); }
+                    else { FormBuilder.BuildFlowOne(pane, kid); }
+                }
+            }
+            return sp;
+        }
+        if (wt == "Led") { return new Led(cap); }
+        if (wt == "Digital") { return new Digital(cap); }
+        if (wt == "Gauge") { return new Gauge(cap); }
+        if (wt == "Bargraph") { return new Bargraph(cap); }
+        if (wt == "Trend") { return new Trend(cap); }
+        if (wt == "DeviceCard") { return new DeviceCard(cap); }
+        if (wt == "EquipPanel") {
+            EquipPanel ep = new EquipPanel();
+            string opts = FormBuilder.JoinOpts(o);
+            if (opts != "") { ep.SetItemsText(opts); }
+            return ep;
+        }
+        if (wt == "AlarmBanner") { return new AlarmBanner(); }
+        if (wt == "AlarmList") { return new AlarmList(); }
+        if (wt == "NumPad") { return new NumPad(); }
+        if (wt == "Control") {
+            string kind = o.Str("custom", "");
+            Control cc = CustomComponents.Create(kind);
+            if (cc != null) { return cc; }
+            return new Panel(kind);
+        }
+        Label lb = new Label(cap);
+        if (o.Bool("wrap", false)) { lb.wrap = true; }
+        return lb;
+    }
+
+    /// 把 Panel 型容器（card/tabs/dockpanel）的 kids 填入。
+    static void FillKids(Panel p, JsonValue o, bool free) {
+        JsonValue kids = o.Get("kids");
+        if (kids == null || !kids.IsArray()) { return; }
+        if (free) {
+            for (int i = 0; i < kids.Count(); i = i + 1) {
+                FormBuilder.BuildFree(p, kids.At(i));
+            }
+        } else {
+            FormBuilder.BuildFlow(p, kids);
+        }
+    }
+
+    // ---- flow (24-col) ----
+
+    static void BuildFlow(Control parent, JsonValue arr) {
+        FbFlow flow = new FbFlow();
+        flow.Dock(Dock.Top());
+        for (int i = 0; i < arr.Count(); i = i + 1) {
+            JsonValue o = arr.At(i);
+            int ft = FormBuilder.Ftype(o);
+            int sp = FormBuilder.ClampSpan(o.Int("span", 24));
+            if (FormBuilder.IsContainer(ft)) { sp = 24; }
+            Control cell = FormBuilder.BuildCell(o, ft);
+            flow.AddCell(cell, sp);
+        }
+        parent.Add(flow);
+    }
+
+    static Control BuildCell(JsonValue o, int ft) {
+        string wt = FormBuilder.WidgetType(ft);
+        Control ctl = FormBuilder.MakeControl(o, ft, wt, false);
+        ctl.name = o.Str("name", "");
+        if (FormBuilder.IsContainer(ft)) {
+            ctl.Pad(10);
+            return ctl;
+        }
+        if (FormBuilder.NeedsCaption(ft)) {
+            FbStack cell = new FbStack();
+            Label capL = new Label(FormBuilder.Caption(o));
+            capL.Dock(Dock.Top());
+            capL.Prefer(0, 18);
+            cell.Add(capL);
+            ctl.Dock(Dock.Fill());
+            ctl.Prefer(0, FormBuilder.PrefH(ft));
+            cell.Add(ctl);
+            return cell;
+        }
+        ctl.Prefer(0, FormBuilder.PrefH(ft));
+        return ctl;
+    }
+
+    /// 把单个字段（分栏面板某个 pane 的直接子节点）按流式加入。
+    static void BuildFlowOne(Control pane, JsonValue kid) {
+        JsonValue arr = JsonValue.NewArray();
+        arr.Append(kid);
+        FormBuilder.BuildFlow(pane, arr);
+    }
+
+    // ---- free canvas ----
+
+    static void BuildFree(Control parent, JsonValue o) {
+        int ft = FormBuilder.Ftype(o);
+        string wt = FormBuilder.WidgetType(ft);
+        Control ctl = FormBuilder.MakeControl(o, ft, wt, true);
+        ctl.name = o.Str("name", "");
+        int fx = o.Int("fx", 0);
+        int fy = o.Int("fy", 0);
+        int fw = o.Int("fw", 200);
+        int fh = o.Int("fh", 32);
+        int dk = o.Int("dock", FormBuilder.DefaultDock(ft));
+        if (dk == 1 || dk == 2) {
+            ctl.Dock(dk == 1 ? Dock.Top() : Dock.Bottom());
+            ctl.Prefer(0, fh);
+        } else if (dk == 3 || dk == 4) {
+            ctl.Dock(dk == 3 ? Dock.Left() : Dock.Right());
+            ctl.Prefer(fw, 0);
+        } else if (dk == 5) {
+            ctl.Dock(Dock.Fill());
+        } else {
+            ctl.Dock(Dock.Manual());
+            ctl.Place(fx, fy);
+            ctl.Prefer(fw, fh);
+        }
+        if (FormBuilder.IsContainer(ft)) {
+            ctl.Pad(0);
+        }
+        parent.Add(ctl);
+    }
+}
+
+/// 24 列流式容器（设计器/运行时/FormBuilder 共用的唯一布局原语）。
+/// 把子节点按各自 span（1..24）贪心打包成多行：一行累计 span 超过 24
+/// 就换行；每个单元宽度按 span/24 比例分配（与设计器 LayoutFlowList
+/// 完全一致：按 24 列而非行内总和分配，列间留 colGap，行间留 rowGap），
+/// 行高取该行子节点 prefH 的最大值。无表面。
+class FbFlow : Panel {
+    List<int> spans;
+    int colGap;
+    int rowGap;
+    int minCell;
+
+    FbFlow() {
+        this.InitPanel("fbflow", 3);
+        this.spans = new List<int>();
+        this.colGap = 12;
+        this.rowGap = 6;
+        this.minCell = 24;
+    }
+
+    /// 追加一个单元及其列宽（span，1..24）。
+    void AddCell(Control c, int span) {
+        this.spans.Add(span);
+        this.Add(c);
+    }
+
+    int SpanAt(int i) {
+        if (i < this.spans.Count) {
+            int s = this.spans[i];
+            if (s < 1) { return 1; }
+            if (s > 24) { return 24; }
+            return s;
+        }
+        return 24;
+    }
+
+    /// 行结束下标（不含）：从 start 起贪心累计到超过 24 列。
+    int RowEnd(int start) {
+        int n = this.children.Count;
+        int end = start;
+        int cols = 0;
+        while (end < n) {
+            int sp = this.SpanAt(end);
+            if (end > start && cols + sp > 24) { break; }
+            cols = cols + sp;
+            end = end + 1;
+            if (cols >= 24) { break; }
+        }
+        return end;
+    }
+
+    int RowHeight(int start, int end) {
+        int rowH = 0;
+        for (int k = start; k < end; k = k + 1) {
+            int hk = this.children[k].prefH;
+            if (hk > rowH) { rowH = hk; }
+        }
+        return rowH;
+    }
+
+    override void OnPaint(App app) {
+    }
+
+    override void OnMeasure(App app) {
+        int n = this.children.Count;
+        int i = 0;
+        int total = 0;
+        int rows = 0;
+        while (i < n) {
+            int end = this.RowEnd(i);
+            total = total + this.RowHeight(i, end);
+            rows = rows + 1;
+            i = end;
+        }
+        if (rows > 1) { total = total + this.rowGap * (rows - 1); }
+        this.prefH = total;
+        this.prefW = 0;
+    }
+
+    override void Arrange(int px, int py, int pw, int ph) {
+        if (pw < 0) { pw = 0; }
+        if (ph < 0) { ph = 0; }
+        this.bx = px;
+        this.by = py;
+        this.bw = pw;
+        this.bh = ph;
+        int cx = px + this.StylePadL();
+        int cy = py + this.StylePadT();
+        int cw = pw - this.StylePadL() - this.StylePadR();
+        if (cw < 0) { cw = 0; }
+        int n = this.children.Count;
+        int i = 0;
+        int rowY = cy;
+        while (i < n) {
+            int end = this.RowEnd(i);
+            int rowH = this.RowHeight(i, end);
+            int acc = 0;
+            for (int k = i; k < end; k = k + 1) {
+                int xa = cx + cw * acc / 24;
+                acc = acc + this.SpanAt(k);
+                int xb = cx + cw * acc / 24;
+                int wCell = xb - xa;
+                if (k < end - 1) { wCell = wCell - this.colGap; }
+                if (wCell < this.minCell) { wCell = this.minCell; }
+                this.children[k].Arrange(xa, rowY, wCell, rowH);
+            }
+            rowY = rowY + rowH + this.rowGap;
+            i = end;
+        }
+    }
+}
+
+/// 竖直单元：标签在上、控件填充其余。用于带 caption 的流式字段，
+/// 无表面。
+class FbStack : Panel {
+    FbStack() {
+        this.InitPanel("fbstack", 3);
+    }
+
+    override void OnPaint(App app) {
+    }
+
+    override void OnMeasure(App app) {
+        int h = 0;
+        int w = 0;
+        for (int i = 0; i < this.children.Count; i = i + 1) {
+            h = h + this.children[i].prefH;
+            if (this.children[i].prefW > w) { w = this.children[i].prefW; }
+        }
+        this.prefH = h;
+        this.prefW = 0;
+    }
+
+    override void Arrange(int px, int py, int pw, int ph) {
+        if (pw < 0) { pw = 0; }
+        if (ph < 0) { ph = 0; }
+        this.bx = px;
+        this.by = py;
+        this.bw = pw;
+        this.bh = ph;
+        int cy = py;
+        int rest = ph;
+        for (int i = 0; i < this.children.Count; i = i + 1) {
+            Control c = this.children[i];
+            if (c.dock == 5) {
+                c.Arrange(px, cy, pw, rest);
+            } else {
+                int hh = c.prefH;
+                if (hh > rest) { hh = rest; }
+                if (hh < 0) { hh = 0; }
+                c.Arrange(px, cy, pw, hh);
+                cy = cy + hh;
+                rest = rest - hh;
+            }
+        }
+    }
+}

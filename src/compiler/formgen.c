@@ -638,7 +638,8 @@ static int fg_children_count(zan_json_value_t *o) {
 static int fg_emit_field(fg_buf_t *decls, fg_buf_t *body, fg_buf_t *wire,
                          fg_buf_t *valid, zan_json_value_t *o,
                          const char *parent, int id,
-                         fg_used_t *used, bool freeMode) {
+                         fg_used_t *used, bool freeMode,
+                         bool parentIsFlow) {
     int ft = fg_ftype_of(o);
     const char *wt = fg_widget_type(ft);
     const char *fname = fg_obj_str(o, "name");
@@ -647,7 +648,9 @@ static int fg_emit_field(fg_buf_t *decls, fg_buf_t *body, fg_buf_t *wire,
     bool req = fg_obj_bool(o, "required");
     bool isInput = strcmp(wt, "Input") == 0;
 
-    if (!freeMode && fg_needs_caption(ft)) {
+    bool flowCell = !freeMode && parentIsFlow;
+
+    if (!freeMode && !flowCell && fg_needs_caption(ft)) {
         fg_putf(body, "        Label cap%d = new Label(\"", id);
         fg_esc_cstr(body, fg_caption(o));
         fg_putf(body, "\");\n");
@@ -688,6 +691,7 @@ static int fg_emit_field(fg_buf_t *decls, fg_buf_t *body, fg_buf_t *wire,
     if (req && isInput) {
         fg_putf(valid, "        if (TextWrap.Trim(%s.GetText()) == \"\") { %s.SetError(\"Required\"); ok = false; }\n", vn, vn);
     }
+
     if (freeMode) {
         int fx = fg_obj_num(o, "fx", 0);
         int fy = fg_obj_num(o, "fy", 0);
@@ -718,7 +722,11 @@ static int fg_emit_field(fg_buf_t *decls, fg_buf_t *body, fg_buf_t *wire,
         if (fg_is_container(ft)) {
             fg_putf(body, "        %s.Pad(0);\n", vn);
         }
-    } else {
+        fg_putf(body, "        %s.Add(%s);\n", parent, vn);
+    } else if (!flowCell) {
+        /* Legacy stacking path: used only for children of tab pages, split
+         * panes and dock panels, whose parent is a plain Panel, not an
+         * FbFlow. Top-level fields and card contents go through AddCell. */
         fg_putf(body, "        %s.Dock(Dock.Top());\n", vn);
         if (fg_is_container(ft)) {
             fg_putf(body, "        %s.Pad(10);\n", vn);
@@ -727,26 +735,70 @@ static int fg_emit_field(fg_buf_t *decls, fg_buf_t *body, fg_buf_t *wire,
         } else {
             fg_putf(body, "        %s.Prefer(0, %d);\n", vn, fg_pref_h(ft));
         }
+        fg_putf(body, "        %s.Add(%s);\n", parent, vn);
+    } else {
+        /* Flow (auto-snap) mode: add the field as a 24-column cell to the
+         * FbFlow `parent`, exactly like FormBuilder.Build - one layout
+         * authority shared by designer preview and runtime. */
+        int sp = fg_obj_num(o, "span", 24);
+        if (sp < 1) sp = 1;
+        if (sp > 24) sp = 24;
+        if (fg_is_container(ft)) {
+            fg_putf(body, "        %s.Pad(10);\n", vn);
+            int ph = 44 + 44 * (int)fg_children_count(o);
+            fg_putf(body, "        %s.Prefer(0, %d);\n", vn, ph);
+            fg_putf(body, "        %s.AddCell(%s, 24);\n", parent, vn);
+        } else if (fg_needs_caption(ft)) {
+            fg_putf(body, "        FbStack cell%d = new FbStack();\n", id);
+            fg_putf(body, "        Label cap%d = new Label(\"", id);
+            fg_esc_cstr(body, fg_caption(o));
+            fg_putf(body, "\");\n");
+            fg_putf(body, "        cap%d.Dock(Dock.Top());\n", id);
+            fg_putf(body, "        cap%d.Prefer(0, 18);\n", id);
+            fg_putf(body, "        cell%d.Add(cap%d);\n", id, id);
+            fg_putf(body, "        %s.Dock(Dock.Fill());\n", vn);
+            fg_putf(body, "        %s.Prefer(0, %d);\n", vn, fg_pref_h(ft));
+            fg_putf(body, "        cell%d.Add(%s);\n", id, vn);
+            fg_putf(body, "        %s.AddCell(cell%d, %d);\n", parent, id, sp);
+        } else {
+            fg_putf(body, "        %s.Prefer(0, %d);\n", vn, fg_pref_h(ft));
+            fg_putf(body, "        %s.AddCell(%s, %d);\n", parent, vn, sp);
+        }
     }
-    fg_putf(body, "        %s.Add(%s);\n", parent, vn);
     fg_emit_handlers(wire, o, vn);
 
     zan_json_value_t *kids = zan_json_get(o, "kids");
     if (fg_is_container(ft) && kids && kids->type == ZAN_JSON_ARRAY) {
+        /* A card is a plain content box: host its children in a nested FbFlow
+         * so they honour `span` exactly like the top level. Tabs, split panes
+         * and dock panels keep their own hosting and the legacy stack path. */
+        bool cardFlow = (ft == 18) && !freeMode;
+        char flowvar[32];
+        flowvar[0] = '\0';
+        if (cardFlow) {
+            snprintf(flowvar, sizeof(flowvar), "__cf%d", id);
+            fg_putf(body, "        FbFlow %s = new FbFlow();\n", flowvar);
+            fg_putf(body, "        %s.Dock(Dock.Fill());\n", flowvar);
+            fg_putf(body, "        %s.Add(%s);\n", vn, flowvar);
+        }
         for (int i = 0; i < kids->array_val.count; i++) {
             zan_json_value_t *kid = kids->array_val.items[i];
             char host[160];
+            bool childFlow = false;
             /* A split panel owns two panes instead of one content box: a kid
              * goes into the pane its `childTab` names. */
             if (ft == 60) {
                 snprintf(host, sizeof(host), "%s.%s()", vn,
                          fg_obj_num(kid, "childTab", 0) == 1 ? "Second"
                                                             : "First");
+            } else if (cardFlow) {
+                snprintf(host, sizeof(host), "%s", flowvar);
+                childFlow = true;
             } else {
                 snprintf(host, sizeof(host), "%s", vn);
             }
             next = fg_emit_field(decls, body, wire, valid, kid,
-                                 host, next, used, freeMode);
+                                 host, next, used, freeMode, childFlow);
         }
     }
     return next;
@@ -870,10 +922,20 @@ char *zan_formgen_translate(const char *json, size_t json_len,
 
     if (fields && fields->type == ZAN_JSON_ARRAY) {
         int id = 0;
+        const char *rootParent = "root";
+        if (!free_mode) {
+            /* Flow mode packs fields into 24-column rows via one shared FbFlow
+             * (the same primitive FormBuilder.Build and the designer preview
+             * use), so `span` is honoured identically at design and run time. */
+            fg_putf(&body, "        FbFlow __flow = new FbFlow();\n");
+            fg_putf(&body, "        __flow.Dock(Dock.Top());\n");
+            fg_putf(&body, "        root.Add(__flow);\n");
+            rootParent = "__flow";
+        }
         for (int i = 0; i < fields->array_val.count; i++)
             id = fg_emit_field(&decls, &body, &wire, &valid,
                                fields->array_val.items[i],
-                               "root", id, &used, free_mode);
+                               rootParent, id, &used, free_mode, !free_mode);
     }
 
     /* ---- assemble the synthetic partial class ---- */
