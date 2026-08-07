@@ -1,4 +1,7 @@
 using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Text;
 using System.Threading;
 
 namespace System.Windows;
@@ -72,8 +75,15 @@ class TrayMenuItem {
 ///   TrayIcon.SetMenu(items, Demo.OnTrayMenu);   // 右键菜单
 ///   TrayIcon.Remove();
 ///
-/// 每个进程仅一个图标（常见情形）。仅 Windows 支持；其他
-/// 平台会抛出 PlatformNotSupportedException。
+/// 每个进程仅一个图标（常见情形）。
+///
+/// Windows 走 Shell_NotifyIconW；Linux 走 freedesktop 系统托盘
+/// （XEmbed）协议，图标支持 .ico（未压缩 DIB 或 PNG 子图）与
+/// PNG/BMP/JPEG，气泡通知走 libnotify 的 notify-send，右键菜单
+/// 由托盘后端自绘。没有运行的托盘（例如无桌面环境、
+/// 无 DISPLAY）时 Add() 返回 false。macOS 需要在主线程 run loop 上
+/// 驱动 NSStatusItem，与本 API 的专用线程模型不兼容，仍抛出
+/// PlatformNotSupportedException。
 /// </summary>
 class TrayIcon {
     #if WINDOWS
@@ -156,6 +166,31 @@ class TrayIcon {
     /// 因此调用方可以随时改完后重新 SetMenu（例如切换勾选）。
     static List<TrayMenuItem> menuItems;
     static TrayMenuCallback menuCb;
+    #elif LINUX
+    // Linux 托盘后端（zan_gui）。回调不能交给原生线程，因此
+    // 原生层只排队事件，由下面的 Zan 泵线程取出并调用回调。
+    // 只在 LINUX 下声明这些 extern：macOS 的 zan_gui 里没有托盘
+    // 后端，若在那边也声明会让链接期找不到符号。
+    [DllImport("zan_gui", EntryPoint = "zan_tray_start")]
+    static extern int NativeStart(string iconPath, string tooltip);
+
+    [DllImport("zan_gui", EntryPoint = "zan_tray_stop")]
+    static extern int NativeStop();
+
+    [DllImport("zan_gui", EntryPoint = "zan_tray_set_tooltip")]
+    static extern int NativeSetTooltip(string tooltip);
+
+    [DllImport("zan_gui", EntryPoint = "zan_tray_set_menu")]
+    static extern int NativeSetMenu(string packed);
+
+    [DllImport("zan_gui", EntryPoint = "zan_tray_next_event")]
+    static extern int NativeNextEvent(int timeoutMs);
+
+    static TrayIconCallback userCb;
+    static TrayMenuCallback menuCb;
+    static List<TrayMenuItem> menuItems;
+    static int posixLive;
+    static int posixPumpStop;
     #endif
 
     /// <summary>
@@ -179,6 +214,17 @@ class TrayIcon {
             return false;
         }
         return true;
+        #elif LINUX
+        if (TrayIcon.posixLive != 0) { return false; }
+        TrayIcon.userCb = cb;
+        if (TrayIcon.NativeStart(iconPath, tooltip) == 0) {
+            TrayIcon.userCb = null;
+            return false;
+        }
+        TrayIcon.posixLive = 1;
+        TrayIcon.posixPumpStop = 0;
+        Thread.Start(TrayIcon.PosixPumpEntry);
+        return true;
         #else
         throw new PlatformNotSupportedException(
             "TrayIcon is not implemented on this platform");
@@ -193,6 +239,15 @@ class TrayIcon {
         TrayIcon.Notify(2 /*NIM_DELETE*/);
         TrayIcon.WinPostThreadMessageW(TrayIcon.trayThreadId, 0x0012 /*WM_QUIT*/, 0, 0);
         while (TrayIcon.trayHwnd != 0) { Thread.Sleep(1); }
+        TrayIcon.userCb = null;
+        TrayIcon.menuItems = null;
+        TrayIcon.menuCb = null;
+        #elif LINUX
+        if (TrayIcon.posixLive == 0) { return; }
+        TrayIcon.NativeStop();
+        // 后端退出时会排一个 -1 事件，泵线程看到就自行结束。
+        while (TrayIcon.posixPumpStop == 0) { Thread.Sleep(1); }
+        TrayIcon.posixLive = 0;
         TrayIcon.userCb = null;
         TrayIcon.menuItems = null;
         TrayIcon.menuCb = null;
@@ -213,6 +268,9 @@ class TrayIcon {
         int ok = TrayIcon.WinShellNotifyIcon(1 /*NIM_MODIFY*/, data);
         NativeMemory.Free(data);
         return ok != 0;
+        #elif LINUX
+        if (TrayIcon.posixLive == 0) { return false; }
+        return TrayIcon.NativeSetTooltip(tooltip) != 0;
         #else
         throw new PlatformNotSupportedException(
             "TrayIcon is not implemented on this platform");
@@ -234,6 +292,20 @@ class TrayIcon {
         int ok = TrayIcon.WinShellNotifyIcon(1 /*NIM_MODIFY*/, data);
         NativeMemory.Free(data);
         return ok != 0;
+        #elif LINUX
+        if (TrayIcon.posixLive == 0) { return false; }
+        // 桌面通知走 libnotify 的 notify-send（org.freedesktop.Notifications）。
+        // 没装 notify-send 时返回 false，而不是假装弹过。
+        string urgency = "normal";
+        if (iconKind >= 3) { urgency = "critical"; }
+        if (iconKind <= 0) { urgency = "low"; }
+        string cmd = "notify-send -u " + urgency;
+        if (timeoutMs > 0) {
+            cmd = cmd + " -t " + Convert.ToString(timeoutMs);
+        }
+        cmd = cmd + " -- " + TrayIcon.ShellQuote(title)
+            + " " + TrayIcon.ShellQuote(text);
+        return Process.Capture(cmd).exitCode == 0;
         #else
         throw new PlatformNotSupportedException(
             "TrayIcon is not implemented on this platform");
@@ -251,6 +323,12 @@ class TrayIcon {
         #if WINDOWS
         TrayIcon.menuItems = items;
         TrayIcon.menuCb = cb;
+        #elif LINUX
+        TrayIcon.menuItems = items;
+        TrayIcon.menuCb = cb;
+        if (TrayIcon.posixLive != 0) {
+            TrayIcon.NativeSetMenu(TrayIcon.PackMenu(items));
+        }
         #else
         throw new PlatformNotSupportedException(
             "TrayIcon is not implemented on this platform");
@@ -262,11 +340,69 @@ class TrayIcon {
         #if WINDOWS
         TrayIcon.menuItems = null;
         TrayIcon.menuCb = null;
+        #elif LINUX
+        TrayIcon.menuItems = null;
+        TrayIcon.menuCb = null;
+        if (TrayIcon.posixLive != 0) { TrayIcon.NativeSetMenu(""); }
         #else
         throw new PlatformNotSupportedException(
             "TrayIcon is not implemented on this platform");
         #endif
     }
+
+    #if LINUX
+    /// 把菜单模型打包成后端的行格式："id\tflags\ttext\n"，
+    /// flags 位：1 = 置灰，2 = 勾选，4 = 分隔线。
+    static string PackMenu(List<TrayMenuItem> items) {
+        if (items == null) { return ""; }
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < items.Count; i = i + 1) {
+            TrayMenuItem it = items[i];
+            if (it == null) { continue; }
+            int flags = 0;
+            if (it.disabled) { flags = flags | 1; }
+            if (it.checkMark) { flags = flags | 2; }
+            if (it.separator) { flags = flags | 4; }
+            // 制表符/换行是字段分隔符，文本里出现时换成空格。
+            string text = it.text;
+            if (text == null) { text = ""; }
+            text = text.Replace("\t", " ").Replace("\n", " ").Replace("\r", " ");
+            sb.Append(Convert.ToString(it.id));
+            sb.Append("\t");
+            sb.Append(Convert.ToString(flags));
+            sb.Append("\t");
+            sb.Append(text);
+            sb.Append("\n");
+        }
+        return sb.ToString();
+    }
+
+    static string ShellQuote(string s) {
+        if (s == null) { return "''"; }
+        return "'" + s.Replace("'", "'\\''") + "'";
+    }
+
+    /// 托盘事件泵：把原生队列里的动作变成 Zan 回调。回调在这个
+    /// 线程上执行（与 Windows 一致）。
+    static void PosixPumpEntry() {
+        while (true) {
+            int ev = TrayIcon.NativeNextEvent(200);
+            if (ev == 0) {
+                if (TrayIcon.posixLive == 0) { break; }
+                continue;
+            }
+            if (ev < 0) { break; }              // 后端已停
+            if (ev >= 65536) {
+                if (TrayIcon.menuCb != null) {
+                    TrayIcon.menuCb(ev - 65536);
+                }
+            } else if (TrayIcon.userCb != null) {
+                TrayIcon.userCb(ev);
+            }
+        }
+        TrayIcon.posixPumpStop = 1;
+    }
+    #endif
 
     #if WINDOWS
     /// 在鼠标处弹出右键菜单并同步等待选择。必须在托盘

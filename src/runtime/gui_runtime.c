@@ -1617,6 +1617,12 @@ EXPORT void *zan_gui_get_pixels(i32 surface_id) {
  * cache below is only ever touched from the UI thread, so plain globals are
  * what we want anyway. */
 #define STBI_NO_THREAD_LOCALS
+/* Only 8-bit-per-channel decoding is used (zan_gui_load_image, the tray icon,
+ * the SDL texture loader). Dropping the float/HDR paths also drops stb's only
+ * call to pow(), so the driver archives link without libm on targets whose
+ * link line does not carry it. */
+#define STBI_NO_LINEAR
+#define STBI_NO_HDR
 #define STB_IMAGE_IMPLEMENTATION
 #include "../../stdlib/SDL3/native/stb_image.h"
 
@@ -1854,4 +1860,5 @@ static inline int zan_gui_in_hit_guard(iptr hwnd, int x, int y) {
 #include "gui_runtime_sdl.c"
 #include "gui_runtime_x11.c"
 #include "gui_runtime_font.c"
+#include "gui_runtime_tray.c"
 #include "gui_runtime_shims.c"

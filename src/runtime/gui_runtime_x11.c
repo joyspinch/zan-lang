@@ -757,4 +757,17 @@ EXPORT void zan_gui_sleep_ms(i32 ms) {
     req.tv_nsec = (long)((ms % 1000) * 1000000L);
     nanosleep(&req, NULL);
 }
+
+/* libc compatibility shim for the bundled static X11 archive
+ * (stdlib/Gui/drivers/linux-x64/static/libzan_gui.a). Its Xlib objects were
+ * compiled against a libc that has issetugid() (musl/BSD); glibc before 2.41
+ * does not, so statically linking the font/locale part of Xlib fails with
+ * "undefined reference to issetugid". Weak, so a libc that does define it
+ * wins, and it implements the documented semantics rather than a stub: Xlib
+ * only uses it to decide whether to trust XLOCALEDIR from the environment. */
+#if defined(__GNUC__)
+__attribute__((weak)) int issetugid(void) {
+    return (getuid() != geteuid() || getgid() != getegid()) ? 1 : 0;
+}
+#endif
 #endif /* __linux__ && !ZAN_GUI_SDL (X11 window shell) */

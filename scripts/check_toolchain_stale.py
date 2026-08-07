@@ -25,7 +25,9 @@ import sys
 RT_IO = ["src/runtime/rt_io.c", "src/runtime/rt_sched.c"]
 RT_SYNC = ["src/runtime/rt_sync.c"]
 GUI = ["src/runtime/gui_runtime.c", "src/runtime/gui_runtime_text.c",
-       "src/runtime/gui_runtime_font.c", "src/runtime/gui_runtime_x11.c"]
+       "src/runtime/gui_runtime_font.c", "src/runtime/gui_runtime_x11.c",
+       "src/runtime/gui_runtime_tray.c", "src/runtime/gui_runtime_sdl.c",
+       "src/runtime/gui_runtime_shims.c"]
 
 # (path, sources, group). The groups exist so CI can hold the part it can
 # rebuild -- `--group runtime`, which zig cc produces for every target from one

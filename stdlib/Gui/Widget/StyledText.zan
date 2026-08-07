@@ -1,0 +1,349 @@
+using System;
+using Gui;
+using Gui.Component;
+
+namespace Gui.Widget;
+
+/// 一条预换行的展示行：文本、颜色、显示类型（0 普通 / 1 代码 / 2 标题 /
+/// 3 轮次头行 / 4 思考折叠 / 5 可折叠摘要 / 6 轮次间隔），kind-5 行
+/// 切换的消息索引（否则 -1），以及该行所属发言者（0 我 / 1 小赞 /
+/// 2 工具 / 3 错误，用于整块着色）。
+/// 把旧的并行 lines/colors/kinds/meta/owner 列表合并成一个实体，
+/// 避免任何编辑都可能让索引对齐静默错位。
+class TextRun {
+    string text;
+    int color;
+    int kind;
+    int meta;
+    int owner;
+    // 头行的组件化附加项。头行（kind 3）画成真正的 Avatar + Tag 芯片，
+    // 而非手绘胶囊，因此这里携带这些组件所需的内容：头像首字母、
+    // 角色 Tag 类名、可选状态标签（确认/进行中/已转交…）和进度百分比
+    // （-1 表示该节拍没有）。单助手场景下为空 / -1。
+    string ava;
+    string tagCls;
+    string status;
+    int pct;
+
+    static TextRun Create(string text, int color, int kind) {
+        TextRun ln = new TextRun();
+        ln.text = text;
+        ln.color = color;
+        ln.kind = kind;
+        ln.meta = 0 - 1;
+        ln.owner = 0 - 1;
+        ln.ava = "";
+        ln.tagCls = "";
+        ln.status = "";
+        ln.pct = 0 - 1;
+        return ln;
+    }
+}
+
+/// 聊天记录的展示网格：一个自管绘制的内容型控件，承接整行网格——
+/// 块底色 / 竖条 / 代码底纹 / 正文 / 选中反白 / 头行（委托给 Avatar +
+/// Tag）/ busy 提示。它把记录渲染从视图层搬到标准库组件，这样
+/// ChatArea 作为视图层不再有任何画布自绘调用。
+///
+/// 每帧由调用方绑定：行缓存、滚动、busy、选择状态、交互开关、
+/// 思考折叠信号、工具展开列表，以及 busy 行要显示的文本（已由调用方
+/// 本地化，控件本身不依赖 IDE 的翻译层）。绘制完成后 `maxScroll`
+/// 写出最大滚动偏移，供调用方回读。
+class StyledText : Control {
+    List<TextRun> lines;
+    int scroll;
+    bool busy;
+    LogState sel;
+    bool interactive;
+    SignalInt thinkOpen;
+    List<int> toolOpen;
+    string busyText;
+    int maxScroll;
+
+    // busy 行复用的常驻 Label（替代每帧 DrawStyledText）。
+    static Label thinkingLbl;
+
+    static void EnsureThinking(App app) {
+        if (StyledText.thinkingLbl == null) {
+            StyledText.thinkingLbl = new Label();
+            StyledText.thinkingLbl.Class = "hint small";
+        }
+    }
+
+    StyledText() {
+        this.InitControl("styledText", 1);
+        // OnPaint 自行绘制网格，不让框架再铺一层 CSS 表面。
+        styleSurfaceOwned = true;
+        lines = null;
+        scroll = 0;
+        busy = false;
+        sel = null;
+        interactive = false;
+        thinkOpen = null;
+        toolOpen = null;
+        busyText = "";
+        maxScroll = 0;
+    }
+
+    /// 记录的字号，解析自各行绘制时用的同一套样式，使测量与绘制不会错位。
+    static int FontPx(App app) {
+        return Style.Of(app, "label", "small", Style.SNormal())
+            .FontOr(app.theme.fontSizeSmall);
+    }
+
+    /// 一行的高度：一行文本加呼吸空间，且不小于头行要画的芯片。两者
+    /// 都解释了之前面板为何显得局促错位——固定 18px 在大 UI 缩放
+    /// 下比字体的行盒更紧，也比它要装的 Tag 更矮。
+    static int RowH(App app) {
+        int h = Canvas.FontHeight(StyledText.FontPx(app)) + app.Scale(5);
+        int chip = Tag.Height(app, "") + app.Scale(2);
+        if (h < chip) { h = chip; }
+        return h;
+    }
+
+    /// `mouseY` 下的展示行索引（底端锚定的记录，第一可见行为 `start`）。
+    static int RowAt(int startY, int pad, int rowH, int start,
+            int count, int mouseY) {
+        int rel = (mouseY - (startY + pad)) / rowH;
+        if (rel < 0) { rel = 0; }
+        int ri = start + rel;
+        if (ri < 0) { ri = 0; }
+        if (ri >= count) { ri = count - 1; }
+        return ri;
+    }
+
+    /// 发言者名字的首个可见字符，用于圆形 Avatar。CJK 名字保留首字；
+    /// 拉丁名字大写。
+    static string Initial(string name) {
+        if (name == "") { return "?"; }
+        // 按字符边界而非字节边界截断：CJK 名字每字 3 字节，Left(name,1)
+        // 会切下码点的三分之一，变成头像里看到的乱码。
+        int end = Text.NextCharEnd(name, 0);
+        if (end <= 0) { end = 1; }
+        string ch = Text.Left(name, end);
+        return ch.ToUpper();
+    }
+
+    // 一个名字行，由共享控件而非手绘拼成：复用实例，因为每个可见轮次
+    // 都画一个头行，每行每帧分配一个控件正是长记录卡顿的根源。
+    static Avatar headAva;
+    static Avatar HeadAvatar() {
+        if (StyledText.headAva == null) {
+            StyledText.headAva = new Avatar();
+        }
+        return StyledText.headAva;
+    }
+
+    static void PaintHeadRow(App app, TextRun ln, int x, int y, int rowH,
+            int rightEdge) {
+        int cx = x;
+        // 名字条上的一切都按控件真实高度在行内居中：芯片高度为
+        // theme.heightTiny，按更短的猜测行高布局正是把名字压进下一行的原因。
+        int chipH = Tag.Height(app, ln.tagCls);
+        int chipY = y + (rowH - chipH) / 2;
+        if (chipY < y) { chipY = y; }
+        Avatar av = StyledText.HeadAvatar();
+        av.Text = ln.ava;
+        av.Size = 16;
+        av.Class = ln.tagCls;
+        int d = av.Diameter(app);
+        int avY = y + (rowH - d) / 2;
+        if (avY < y) { avY = y; }
+        av.RenderAt(app, cx, avY, d);
+        cx = cx + d + app.Scale(5);
+        int nameW = Tag.Width(app, ln.text, ln.tagCls);
+        if (cx + nameW <= rightEdge) {
+            Tag.Chip(app, cx, chipY, ln.text, ln.tagCls);
+            cx = cx + nameW + app.Scale(4);
+        }
+        if (ln.status != "") {
+            int stW = Tag.Width(app, ln.status, "");
+            if (cx + stW <= rightEdge) {
+                Tag.Chip(app, cx, chipY, ln.status, "");
+                cx = cx + stW + app.Scale(4);
+            }
+        }
+        if (ln.pct >= 0) {
+            string pl = Convert.ToString(ln.pct) + "%";
+            if (cx + Tag.Width(app, pl, "primary") <= rightEdge) {
+                Tag.Chip(app, cx, chipY, pl, "primary");
+            }
+        }
+    }
+
+    override void OnMeasure(App app) {
+        // 纯铺满槽位的画布：尺寸由 RenderInside 的 Rect 决定，
+        // 这里把偏好设成当前边界即可。
+        prefW = bw;
+        prefH = bh;
+    }
+
+    override void OnPaint(App app) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        if (lines == null || lines.Count == 0) { return; }
+        List<TextRun> cache = lines;
+        int pad = app.Scale(6);
+        int rowH = StyledText.RowH(app);
+        int fontPx = StyledText.FontPx(app);
+        int textDy = (rowH - Canvas.FontHeight(fontPx)) / 2;
+        if (textDy < 0) { textDy = 0; }
+        int extra = 0;
+        if (busy) { extra = 1; }
+        int total = cache.Count + extra;
+        int maxRows = (bh - pad * 2) / rowH;
+        if (maxRows < 1) { maxRows = 1; }
+        int maxSc = total - maxRows;
+        if (maxSc < 0) { maxSc = 0; }
+        int sc = scroll;
+        if (sc > maxSc) { sc = maxSc; }
+        if (sc < 0) { sc = 0; }
+        int start = total - maxRows - sc;
+        if (start < 0) { start = 0; }
+        this.maxScroll = maxSc;
+        // 在已换行展示行上拖拽选择，复用 LogView 的选择模型
+        // （LogState + LogView.ColAt / SelectionText）。滚轮滚动仍由
+        // 调用方持有，以保留它自己的滚动模型。
+        if (interactive && cache.Count > 0) {
+            int hid = app.focus.AllocId();
+            app.hitTester.Register(new HitRegion(hid, bx, by, bw, bh, 1));
+            int kind = app.EventKind();
+            bool over = app.mouseX >= bx && app.mouseX < bx + bw
+                && app.mouseY >= by && app.mouseY < by + bh;
+            if (kind == 2 && app.window.EventButton() == 0 && over
+                && !app.PointerCaptured()) {
+                int ri = StyledText.RowAt(by, pad, rowH, start,
+                    cache.Count, app.mouseY);
+                if (ri >= 0 && ri < cache.Count && cache[ri].kind == 4) {
+                    // 点击「思考过程」折叠行展开/收起推理，而非开始文本选择。
+                    thinkOpen.Set(1 - thinkOpen.Get());
+                    app.RequestRedraw();
+                } else if (ri >= 0 && ri < cache.Count && cache[ri].kind == 5) {
+                    // 点击工具摘要行展开/收起该工具结果
+                    // （在 toolOpen 中切换它的消息索引）。
+                    int mid = 0 - 1;
+                    if (ri < cache.Count) { mid = cache[ri].meta; }
+                    if (mid >= 0) {
+                        int at = 0 - 1;
+                        for (int z = 0; z < toolOpen.Count; z = z + 1) {
+                            if (toolOpen[z] == mid) { at = z; }
+                        }
+                        if (at >= 0) { toolOpen.RemoveAt(at); }
+                        else { toolOpen.Add(mid); }
+                        app.RequestRedraw();
+                    }
+                } else {
+                    int cc = LogView.ColAt(cache[ri].text,
+                        bx + pad + app.Scale(11),
+                        t.fontSizeSmall, app.mouseX);
+                    sel.selR0 = ri; sel.selC0 = cc;
+                    sel.selR1 = ri; sel.selC1 = cc;
+                    sel.selDrag = true;
+                    app.RequestRedraw();
+                }
+            }
+            if (kind == 1 && sel.selDrag) {
+                int ri = StyledText.RowAt(by, pad, rowH, start,
+                    cache.Count, app.mouseY);
+                int cc = LogView.ColAt(cache[ri].text,
+                    bx + pad + app.Scale(11),
+                    t.fontSizeSmall, app.mouseX);
+                sel.selR1 = ri; sel.selC1 = cc;
+                app.RequestRedraw();
+            }
+            if (kind == 3 && sel.selDrag) {
+                sel.selDrag = false;
+                app.RequestRedraw();
+            }
+        }
+        int sr0 = sel.selR0; int sc0 = sel.selC0;
+        int sr1 = sel.selR1; int sc1 = sel.selC1;
+        if (sr0 >= 0 && (sr0 > sr1 || (sr0 == sr1 && sc0 > sc1))) {
+            int tr = sr0; sr0 = sr1; sr1 = tr;
+            int tc = sc0; sc0 = sc1; sc1 = tc;
+        }
+        int selCol = App.ScaleAlpha(t.primary, 90);
+        c.PushClip(bx, by, bw, bh);
+        int idx = start;
+        int codeBg = App.ScaleAlpha(t.bgTertiary, 160);
+        // 每个轮次画成一个块：左边一条彩色竖条，加一层发言者颜色的
+        // 淡色衬于它的每一行之后。正是这个——而非每行标记——让一个问题、
+        // 一个答案和一段工具输出一眼可分。
+        int barW = app.Scale(3);
+        int blockX = bx + pad;
+        int textX = blockX + barW + app.Scale(8);
+        int textW2 = bw - pad * 2 - barW - app.Scale(8);
+        for (int row = 0; idx < total && row < maxRows; row = row + 1) {
+            int ry = by + pad + row * rowH;
+            if (idx < cache.Count) {
+                int who = 1;
+                if (cache[idx].owner >= 0) { who = cache[idx].owner; }
+                int rail = t.success;
+                int tint = App.ScaleAlpha(t.success, 16);
+                if (who == 0) {
+                    rail = t.primary;
+                    tint = App.ScaleAlpha(t.primary, 34);
+                } else if (who == 2) {
+                    rail = t.textTertiary;
+                    tint = App.ScaleAlpha(t.bgTertiary, 90);
+                } else if (who == 3) {
+                    rail = t.error;
+                    tint = App.ScaleAlpha(t.error, 30);
+                }
+                bool spacer = cache[idx].kind == 6;
+                if (!spacer) {
+                    c.FillRect(blockX, ry, bw - pad * 2, rowH, tint);
+                    c.FillRect(blockX, ry, barW, rowH, rail);
+                }
+                if (!spacer && cache[idx].kind == 1) {
+                    c.FillRect(textX - app.Scale(2), ry,
+                        textW2 + app.Scale(4), rowH, codeBg);
+                }
+                if (!spacer && sr0 >= 0 && idx >= sr0 && idx <= sr1) {
+                    string ln = cache[idx].text;
+                    int hs = 0;
+                    int he = ln.Length;
+                    if (idx == sr0) { hs = sc0; }
+                    if (idx == sr1) { he = sc1; }
+                    if (hs < 0) { hs = 0; }
+                    if (he > ln.Length) { he = ln.Length; }
+                    if (hs > he) { hs = he; }
+                    int hx0 = textX
+                        + Canvas.MeasureText(Text.Left(ln, hs), t.fontSizeSmall);
+                    int hx1 = textX
+                        + Canvas.MeasureText(Text.Left(ln, he), t.fontSizeSmall);
+                    if (idx < sr1) { hx1 = hx1 + pad; }
+                    if (hx1 < hx0 + 2) { hx1 = hx0 + 2; }
+                    c.FillRect(hx0, ry, hx1 - hx0, rowH, selCol);
+                }
+                if (spacer) {
+                    // 无需绘制：该行是两个轮次之间的间隔。
+                } else if (cache[idx].kind == 3) {
+                    // 轮次的名字行，由共享控件而非这里手绘拼成：发言者的
+                    // 圆形 Avatar、名字的 Tag 芯片，团队聊天下再加一个
+                    // 节拍 Tag 和一个百分比 Tag。手搓这个胶囊正是让助手
+                    // 的外观偏离 IDE 中所有其它列表行的原因。
+                    StyledText.PaintHeadRow(app, cache[idx], textX, ry, rowH,
+                        bx + bw - pad);
+                } else if (cache[idx].kind == 1) {
+                    c.DrawText(textX + app.Scale(4), ry + textDy,
+                        cache[idx].text, cache[idx].color, fontPx);
+                } else {
+                    c.DrawText(textX, ry + textDy, cache[idx].text,
+                        cache[idx].color, fontPx);
+                }
+            } else {
+                // busy 行：常驻 Label 替代每帧 DrawStyledText。
+                StyledText.EnsureThinking(app);
+                StyledText.thinkingLbl.Text = busyText;
+                StyledText.thinkingLbl.RenderAt(app, bx + pad, ry + textDy);
+            }
+            idx = idx + 1;
+        }
+        c.PopClip();
+    }
+
+    // ---- 设计器 / 序列化模型 ----
+
+    override string Kind() { return "StyledText"; }
+}

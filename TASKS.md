@@ -404,6 +404,14 @@ HTTP 解析、编码转换、路径处理这类纯逻辑，上移到 Zan。
   **仍未解决：2 个 `libzan_gui.a`（linux-x64 / linux-arm64）**——签入的是胖归档
   （`gui_runtime*.o` + 平台 libX11/libxcb/libXau 成员），树里没有任何地方记录
   它是怎么产生的，保持手工，`--group=gui` 继续报，等有人把配方写下来。
+  **2026-08-07 补充**：新增 `gui_runtime_tray.c`（Linux 托盘后端）时，只能在本机
+  重编 linux-x64 归档里的 `zan_gui_x64.o`；**linux-arm64 归档、macOS dylib 尚未
+  重编**，因此在这两个目标上链接用到 `System.Windows.TrayIcon` 的程序会报
+  `undefined reference to zan_tray_*`（macOS 侧的 Zan 分支本来就抛
+  `PlatformNotSupportedException`，extern 声明已收进 `#elif LINUX`，只有 arm64
+  Linux 受影响）。归档成员里的 libX11 是别的 libc 上编的（`lcFile.o` 引用
+  `issetugid`），`gui_runtime_x11.c` 末尾加了弱定义兜底；这仍然是"配方缺失"的
+  同一个坑，重编归档时应一并解决。
 
 ---
 

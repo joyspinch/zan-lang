@@ -10,8 +10,7 @@ Set-Location $root
 # reactor (rt_io) and sync runtime (rt_sync) automatically.
 
 $galleryComponents = "examples\gui_gallery\components"
-$registryPath = Join-Path $root "stdlib\Gui\CustomComponents.zan"
-$registryOriginal = [System.IO.File]::ReadAllText($registryPath)
+$registryPath = Join-Path $root "build\ProjectComponents.gallery.zan"
 $failed = $false
 
 try {
@@ -24,18 +23,21 @@ try {
 
     Write-Output "[2/3] Scanning custom components..."
     powershell -ExecutionPolicy Bypass -File scripts\scan_components.ps1 `
-        -Source $galleryComponents -Out "stdlib\Gui\CustomComponents.zan"
+        -Source $galleryComponents -Out "build\ProjectComponents.gallery.zan"
     if ($LASTEXITCODE -ne 0) { throw "COMPONENT_SCAN_FAILED" }
 
     Write-Output "[3/3] Compiling and linking gallery_test.exe..."
     $files = @()
-    $files += (Get-ChildItem stdlib\Gui\*.zan).FullName
+    $files += (Get-ChildItem stdlib\Gui\*.zan |
+        Where-Object { $_.Name -ne "ProjectComponents.zan" }).FullName
     $files += (Get-ChildItem stdlib\Gui\Widget\*.zan).FullName
     $files += (Get-ChildItem $galleryComponents\*.zan).FullName
+    $files += $registryPath
     $files += (Join-Path (Get-Location) "examples\gui_gallery\gui_gallery.zan")
 
     $zanArgs = @()
     $zanArgs += $files
+    $zanArgs += @("-DZAN_PROJECT_COMPONENTS")
     $zanArgs += @("-o", "build\gallery_test.exe", "--subsystem", "windows")
     $zanArgs += @("--libpath", "build", "--link-lib", "zan_gui_gallery_gnu")
     # Native Win32 backend needs only the system libs it imports directly (the
@@ -43,7 +45,7 @@ try {
     $zanArgs += @("--link-lib", "ws2_32", "--link-lib", "mswsock")
     $zanArgs += @("--link-lib", "psapi", "--link-lib", "advapi32")
     $zanArgs += @("--link-lib", "dwmapi", "--link-lib", "gdi32", "--link-lib", "imm32")
-    $zanArgs += @("--link-lib", "user32", "--link-lib", "rpcrt4")
+    $zanArgs += @("--link-lib", "user32", "--link-lib", "rpcrt4", "--link-lib", "winpthread")
     $zanArgs += @("--icon", (Join-Path (Get-Location) "assets\zan.ico"))
     $out = & build\zanc.exe @zanArgs 2>&1
     $code = $LASTEXITCODE
@@ -55,7 +57,9 @@ try {
     Write-Output $_
     $failed = $true
 } finally {
-    [System.IO.File]::WriteAllText($registryPath, $registryOriginal)
+    if (Test-Path -LiteralPath $registryPath) {
+        Remove-Item -LiteralPath $registryPath -Force -ErrorAction SilentlyContinue
+    }
 }
 
 if ($failed) { exit 1 }

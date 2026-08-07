@@ -69,9 +69,12 @@ class UiDoc {
     /// 构建控件（及其子树），把 `sheet` 级联到每个节点，
     /// 再应用内联属性，保证内联值始终优先。
     static Control BuildWith(JsonValue node, StyleSheet sheet) {
-        if (node == null || !node.IsObject()) { return new Panel("panel"); }
-        string type = node.Str("type", "Panel");
+        if (node == null || !node.IsObject()) { return null; }
+        string type = node.Str("kind", "");
+        if (type == "") { type = UiDoc.LegacyKind(node.Str("type", "")); }
+        if (type == "") { return null; }
         Control c = UiDoc.Make(type, node);
+        if (c == null) { return null; }
 
         if (node.Has("class")) { c.Class = node.Str("class", ""); }
         // 先做样式表级联；下方的内联属性覆盖之。
@@ -161,29 +164,33 @@ class UiDoc {
             JsonValue kids = node.Get("children");
             if (kids != null && kids.IsArray()) {
                 for (int j = 0; j < kids.Count(); j = j + 1) {
-                    c.Add(UiDoc.BuildWith(kids.At(j), sheet));
+                    Control child = UiDoc.BuildWith(kids.At(j), sheet);
+                    if (child != null) { c.Add(child); }
                 }
             }
         }
         return c;
     }
 
-    /// 为 `type` 标签实例化具体控件，填入构造函数所需
-    /// 的属性（text/value）。未知类型回退为面板，
-    /// 即使文档格式有误也能加载。
+    static string LegacyKind(string type) {
+        if (type == "Text" || type == "H1" || type == "Title") { return "Label"; }
+        if (type == "TextBox") { return "Input"; }
+        if (type == "Select" || type == "Dropdown") { return "SelectBox"; }
+        if (type == "Card" || type == "Column" || type == "Row") { return "Panel"; }
+        return type;
+    }
+
+    /// 为 `kind` 标签实例化具体控件，填入构造函数所需
+    /// 的属性（text/value）。未知类型交给项目注册表；
+    /// 注册表未声明时返回 null，避免改变文档语义。
     static Control Make(string type, JsonValue node) {
-        if (type == "Column") { return Panel.Column(); }
-        if (type == "Row") { return Panel.Row(); }
         if (type == "ScrollColumn") { return new ScrollColumn(); }
-        if (type == "Panel" || type == "Card") { return new Panel("panel"); }
-        if (type == "Label" || type == "Text") {
+        if (type == "Panel") { return new Panel(); }
+        if (type == "Label") {
             return new Label(node.Str("text", ""));
         }
-        if (type == "H1" || type == "Title") {
-            return new Label { Text = node.Str("text", ""), Class = "title" };
-        }
         if (type == "Button") { return new Button(node.Str("text", "Button")); }
-        if (type == "Input" || type == "TextBox") {
+        if (type == "Input") {
             return new Input(node.Str("hint", ""));
         }
         if (type == "Switch") { return new Switch(); }
@@ -200,7 +207,7 @@ class UiDoc {
                               node.Int("max", 100),
                               new SignalInt(node.Int("value", 0)));
         }
-        if (type == "Select" || type == "Dropdown") {
+        if (type == "SelectBox") {
             List<string> opts = new List<string>();
             JsonValue arr = node.Get("options");
             if (arr != null && arr.IsArray()) {
@@ -211,11 +218,10 @@ class UiDoc {
             return SelectBox.FromOptions(opts, node.Str("hint", ""));
         }
         if (type == "Progress") { return new Progress(node.Int("value", 0), 1); }
-        // 项目组件在构建时自动发现（scan_components.ps1），因此
-        // JSON `type`（如“MyChart”）即可实例化用户类。
-        Control cc = CustomComponents.Create(type);
-        if (cc != null) { return cc; }
-        return new Panel("panel");
+        if (type == "Divider") { return new Divider(node.Str("text", "")); }
+        // Dynamic project components use the same string-kind registry as
+        // FormBuilder. Unknown kinds remain invalid instead of becoming Panel.
+        return ProjectComponents.Create(type);
     }
 
     /// 由 Build 显式处理的结构键（不转发给 SetProp）。
