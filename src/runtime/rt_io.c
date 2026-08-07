@@ -1397,12 +1397,14 @@ int64_t zan_io_wait_writable(intptr_t fd) {
 }
 
 int64_t zan_io_wait_readable_timeout(intptr_t fd, int64_t timeout_ms) {
-    /* Synchronous poll/select with timeout.
-     * This function currently has no callers; when one is added it should
-     * ideally be reimplemented as a non-blocking watcher + timer.  For now
-     * this at least makes the timeout parameter meaningful instead of
-     * ignoring it and waiting forever. */
-    if (timeout_ms <= 0) {
+    /* Synchronous poll/select with timeout.  This function currently has no
+     * callers; when one is added it should ideally be reimplemented as a
+     * non-blocking watcher + timer.  For now this at least honors the
+     * timeout semantics instead of ignoring them.
+     *   timeout_ms < 0  -> wait indefinitely until the fd becomes readable
+     *   timeout_ms == 0 -> poll once and return immediately
+     *   timeout_ms > 0  -> block up to timeout_ms for readability */
+    if (timeout_ms < 0) {
         void *co = zan_io_get_current_co();
         if (!co) return -1;
         io_register(fd, ZAN_IO_READ, co, NULL);
