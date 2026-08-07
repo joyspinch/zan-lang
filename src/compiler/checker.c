@@ -235,6 +235,92 @@ static zan_type_t *promote_numeric(zan_binder_t *b, zan_type_t *a, zan_type_t *b
     return b->type_int;
 }
 
+/* ---- conditional branch type merging (D1) ---------------------------------
+ * `cond ? then : else` used to be typed as the then branch alone, so a class
+ * and a primitive could mix (`cond ? new A() : 123`) and only fail later as
+ * an LLVM verification error naming no source line. Merge the branch types
+ * like C#: identical types win, numerics promote, a subtype converts to its
+ * base, a common base class is used, otherwise the conditional is an error. */
+
+/* Structural equality at the level the checker can see: same kind, same name
+ * (generic arguments included). */
+static bool checker_type_equal(zan_type_t *a, zan_type_t *b) {
+    if (a == b) return true;
+    if (!a || !b) return false;
+    if (a->kind != b->kind) return false;
+    if (a->name.len != b->name.len ||
+        (a->name.len && memcmp(a->name.str, b->name.str, (size_t)a->name.len) != 0))
+        return false;
+    if (a->type_arg_count != b->type_arg_count) return false;
+    for (int i = 0; i < a->type_arg_count; i++)
+        if (!checker_type_equal(a->type_args[i], b->type_args[i])) return false;
+    return true;
+}
+
+/* True when `sub` is, implements, or derives from `sup` -- the same relation
+ * type_satisfies_constraint computes for `where T : C` clauses. */
+static bool checker_type_derives_from(zan_type_t *sub, zan_type_t *sup) {
+    if (!sub || !sup) return false;
+    if (sub == sup) return true;
+    if (sub->sym && sup->sym && sub->sym == sup->sym) return true;
+    if (sub->kind == sup->kind && checker_type_equal(sub, sup)) return true;
+    for (int i = 0; i < sub->interface_count; i++)
+        if (checker_type_derives_from(sub->interfaces[i], sup)) return true;
+    if (sub->base_type && sub->base_type != sub)
+        return checker_type_derives_from(sub->base_type, sup);
+    return false;
+}
+
+/* Reference kinds: the IR carries them all as one object pointer, so any two
+ * of them can share a single PHI; the merged type picks the more general side. */
+static bool checker_type_is_ref(zan_type_t *t) {
+    if (!t) return false;
+    return t->kind == TYPE_OBJECT || t->kind == TYPE_INTERFACE ||
+           t->kind == TYPE_STRING || t->kind == TYPE_CLASS ||
+           t->kind == TYPE_ARRAY;
+}
+
+/* Merge the then/else branch types of a conditional expression. NULL means
+ * the two are unrelated and the conditional is an error. */
+static zan_type_t *merge_conditional_types(zan_checker_t *c,
+                                           zan_type_t *a, zan_type_t *b) {
+    if (!a) return b;
+    if (!b) return a;
+    if (a == c->binder->type_error) return b;
+    if (b == c->binder->type_error) return a;
+    if (a == b) return a;
+    /* An unresolved generic parameter: nothing concrete to compare yet; the
+     * instantiation site re-checks with real arguments. */
+    if (a->kind == TYPE_TYPE_PARAM || b->kind == TYPE_TYPE_PARAM) return a;
+
+    /* identical types (same kind, name and generic arguments) */
+    if (a->kind == b->kind && checker_type_equal(a, b)) return a;
+
+    /* numeric promotion: int widens to long, float to double, ... */
+    if ((type_is_numeric(a) || a->kind == TYPE_CHAR) &&
+        (type_is_numeric(b) || b->kind == TYPE_CHAR))
+        return promote_numeric(c->binder, a, b);
+
+    if (checker_type_is_ref(a) && checker_type_is_ref(b)) {
+        if (checker_type_derives_from(b, a)) return a;  /* b is-a a */
+        if (checker_type_derives_from(a, b)) return b;  /* a is-a b */
+        /* common base class: walk a's strict base chain and return the first
+         * (nearest) type b also derives from. Depth-guarded so a cyclic class
+         * hierarchy cannot loop forever. */
+        for (zan_type_t *t = a->base_type; t && t != a; t = t->base_type) {
+            if (checker_type_derives_from(b, t)) return t;
+            if (!t->base_type) break;
+        }
+        return a; /* unrelated references still share one pointer carrier */
+    }
+
+    /* enums ride an integer carrier at the IR level; enum vs enum was handled
+     * above, enum vs int (or int vs enum) matches that carrier. */
+    if (a->kind == TYPE_ENUM || b->kind == TYPE_ENUM) return a;
+
+    return NULL; /* unrelated value types, or a value mixed with a reference */
+}
+
 /* The member-access rules, taking the object's type as an argument instead of
  * inferring it. A call on a chain (`app.Map(..).Named(..).Auth()`) needs the
  * receiver's type twice -- once to decide whether it is a builtin scalar, once
@@ -558,8 +644,16 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
     case AST_CONDITIONAL: {
         zan_checker_check_expr(c, expr->conditional.cond);
         zan_type_t *then_type = zan_checker_check_expr(c, expr->conditional.then_expr);
-        zan_checker_check_expr(c, expr->conditional.else_expr);
-        return then_type;
+        zan_type_t *else_type = zan_checker_check_expr(c, expr->conditional.else_expr);
+        zan_type_t *merged = merge_conditional_types(c, then_type, else_type);
+        if (!merged) {
+            zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
+                "cannot apply '?:' operator to operands of type '%s' and '%s': "
+                "neither converts to the other and they share no common type",
+                type_name(then_type), type_name(else_type));
+            return c->binder->type_error;
+        }
+        return merged;
     }
 
     case AST_LAMBDA:

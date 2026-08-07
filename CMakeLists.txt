@@ -1132,6 +1132,19 @@ add_test(NAME diag_enum_unknown_member
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_enum_unknown_member PROPERTIES TIMEOUT 60)
 
+# A conditional's branches must share a common type (identical, implicitly
+# convertible, or a common base class). The checker used to type it as the
+# then branch alone, so `cond ? new A() : 123` only failed as a sourceless
+# LLVM verification error when the ternary PHI mixed a pointer and an integer.
+add_test(NAME diag_conditional_branch_mismatch
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/conditional_branch_mismatch.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_conditional_branch_mismatch${_exe_ext}
+    "-DEXPECT_REGEX=share no common type"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_conditional_branch_mismatch PROPERTIES TIMEOUT 60)
+
 # Generic type arguments are invariant: List<int> is not a List<Box>, even
 # though both erase to the same object pointer in IR. Passing a mismatched
 # container used to compile and then dereference the elements as the wrong
