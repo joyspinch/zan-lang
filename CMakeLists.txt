@@ -147,6 +147,7 @@ add_custom_command(
     DEPENDS ${CMAKE_SOURCE_DIR}/src/runtime/rt_io.c
             ${CMAKE_SOURCE_DIR}/src/runtime/rt_io.h
             ${CMAKE_SOURCE_DIR}/src/runtime/rt_co.h
+            ${CMAKE_SOURCE_DIR}/src/runtime/rt_crash.h
     COMMENT "Building socket-async reactor object (zanrt_io)"
     VERBATIM)
 add_custom_target(zanrt_io ALL DEPENDS ${ZAN_RT_IO_OBJ})
@@ -210,6 +211,7 @@ add_custom_command(
     DEPENDS ${CMAKE_SOURCE_DIR}/src/runtime/rt_io.c
             ${CMAKE_SOURCE_DIR}/src/runtime/rt_io.h
             ${CMAKE_SOURCE_DIR}/src/runtime/rt_co.h
+            ${CMAKE_SOURCE_DIR}/src/runtime/rt_crash.h
     COMMENT "Building multi-worker reactor object (zanrt_io_mt)"
     VERBATIM)
 add_custom_target(zanrt_io_mt ALL DEPENDS ${ZAN_RT_IO_MT_OBJ})

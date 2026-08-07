@@ -480,7 +480,12 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
         /* ---- ramp ---- */
         LLVMBasicBlockRef ramp_entry = LLVMAppendBasicBlockInContext(g->ctx, ramp_fn, "entry");
         LLVMPositionBuilderAtEnd(g->builder, ramp_entry);
-        di_clear(g);
+        /* -g: anchor to the async method's decl line so ramp/resume prologue
+         * calls (frame malloc/memset, arg retains, state restore) carry an
+         * in-scope !dbg -- the resume fn gains a DISubprogram from its body
+         * statements, and LLVM rejects any inlinable call without a location
+         * in a debug-info function. (no-op when debug info is disabled.) */
+        di_set_loc(g, member->loc);
         LLVMTypeRef malloc_ty = LLVMGlobalGetValueType(g->fn_malloc);
         LLVMValueRef fsize = LLVMSizeOf(frame_type);
         LLVMValueRef raw = zan_call2(g->builder, malloc_ty, g->fn_malloc, &fsize, 1, "frame.raw");
@@ -546,7 +551,7 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
         /* ---- resume ---- */
         LLVMBasicBlockRef res_entry = LLVMAppendBasicBlockInContext(g->ctx, resume_fn, "entry");
         LLVMPositionBuilderAtEnd(g->builder, res_entry);
-        di_clear(g);
+        di_set_loc(g, member->loc);
         LLVMValueRef fparam = LLVMGetParam(resume_fn, 0);
         LLVMValueRef sframe = LLVMBuildBitCast(g->builder, fparam, frame_ptr_ty, "frame");
 
@@ -1222,7 +1227,13 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
 
         LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, fn, "entry");
         LLVMPositionBuilderAtEnd(g->builder, entry);
-        di_clear(g);
+        /* -g: anchor to the method's declaration line before emitting the
+         * prologue. This eagerly creates this function's DISubprogram and
+         * gives prologue instructions -- notably a constructor's base/chained
+         * ctor call -- a valid in-scope !dbg, which LLVM requires of every
+         * inlinable call in a function that carries debug info. Statements
+         * override it per line. (no-op when debug info is disabled.) */
+        di_set_loc(g, member->loc);
 
         local_scope_t *locals = local_scope_new(g->arena);
 
@@ -1838,7 +1849,10 @@ static void emit_method_spec_body(zan_irgen_t *g, int idx) {
     LLVMBasicBlockRef saved_bb = LLVMGetInsertBlock(g->builder);
     LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, sp.fn, "entry");
     LLVMPositionBuilderAtEnd(g->builder, entry);
-    di_clear(g);
+    /* -g: see emit_user_methods Pass B -- anchor to the decl line so the
+     * specialization's prologue (incl. any chained ctor call) gets a valid
+     * in-scope !dbg before per-statement locations take over. */
+    di_set_loc(g, member->loc);
 
     local_scope_t *locals = local_scope_new(g->arena);
     int param_count = member->method_decl.params.count;

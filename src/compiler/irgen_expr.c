@@ -5339,6 +5339,26 @@ static LLVMValueRef emit_lambda_typed(zan_irgen_t *g, zan_ast_node_t *expr,
     LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, lambda_fn, "entry");
     LLVMPositionBuilderAtEnd(g->builder, entry);
 
+    /* -g: the lambda is its own LLVM function, so its prologue (capture/param
+     * allocas) and body must not inherit the enclosing function's
+     * DISubprogram scope -- an instruction whose !dbg scope belongs to a
+     * different function is a hard verifier error ("!dbg attachment points at
+     * wrong subprogram"). Save the caller's location and re-anchor the builder
+     * to the lambda's own scope at its source line: di_set_loc, now that the
+     * builder sits in lambda_fn, lazily creates lambda_fn's DISubprogram and
+     * stamps a valid in-scope location, so both the prologue and an
+     * expression-bodied lambda's calls carry a !dbg (LLVM also requires every
+     * inlinable call in a debug-info function to have one). Block bodies
+     * override this per statement; the caller's location is restored once the
+     * builder returns to the caller's block below. */
+    LLVMMetadataRef saved_dl = NULL;
+    uint32_t saved_di_line = g->di_cur_line;
+    uint32_t saved_di_file = g->di_cur_file;
+    if (g->emit_debug) {
+        saved_dl = LLVMGetCurrentDebugLocation2(g->builder);
+        di_set_loc(g, expr->loc);
+    }
+
     /* The body must emit into the lambda's own function: control-flow blocks
      * append to current_fn and `return` coerces to current_fn_ret. The
      * instance/async context of the enclosing method does not carry over; a
@@ -5459,6 +5479,14 @@ static LLVMValueRef emit_lambda_typed(zan_irgen_t *g, zan_ast_node_t *expr,
     g->current_fn_body = saved_fn_body;
     g->lambda_depth--;
     LLVMPositionBuilderAtEnd(g->builder, saved_bb);
+    /* Back in the caller's function: restore its debug location so the closure
+     * record built below (and any later instruction sharing this statement)
+     * carries the enclosing scope again, not the lambda's. */
+    if (g->emit_debug) {
+        LLVMSetCurrentDebugLocation2(g->builder, saved_dl);
+        g->di_cur_line = saved_di_line;
+        g->di_cur_file = saved_di_file;
+    }
     free(param_types);
     free(ptypes);
     if (!is_closure) return lambda_fn;
