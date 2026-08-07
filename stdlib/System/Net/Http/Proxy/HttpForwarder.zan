@@ -395,6 +395,14 @@ class HttpForwarder {
         }
 
         string peer = Socket.RemoteIp(clientSock);
+        if (!HttpForwarder.IsBodyFramingValid(head, true)) {
+            int _bad = await client.SendAllAsync(
+                "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n"
+                + "Connection: close\r\n\r\n");
+            up.Close();
+            client.Close();
+            return;
+        }
         string upHead = this.RewriteRequestHead(head, peer);
         int sent = await up.SendAllAsync(upHead);
         if (sent < upHead.Length) {
@@ -494,7 +502,9 @@ class HttpForwarder {
     }
 
     /// <summary>改写请求头：Host 指向上游、剥离逐跳头部、
-    /// 追加 X-Forwarded-For，并要求上游按请求关闭连接。</summary>
+    /// 追加 X-Forwarded-For，并要求上游按请求关闭连接。
+    /// 对 Transfer-Encoding: chunked 的请求保留该头部，确保上游
+    /// 能正确解析后续 chunk 正文。</summary>
     string RewriteRequestHead(string head, string peer) {
         List<string> lines = HttpForwarder.HeadLines(head);
         string outHead = "";
@@ -504,11 +514,21 @@ class HttpForwarder {
             hostValue = this.upHost + ":" + Convert.ToString(this.upPort);
         }
         string fwd = "";
+        bool chunked = HttpForwarder.HeadIsChunked(head);
         for (int i = 0; i < lines.Count; i = i + 1) {
             string line = lines[i];
             if (i == 0) { outHead = outHead + line + "\r\n"; continue; }
             string name = HttpForwarder.LowerName(line);
             if (name == "host") { continue; }
+            // Transfer-Encoding: chunked 需要原样透传，否则上游会
+            // 按无正文解析，而实际 chunk 数据仍在继续转发。
+            if (name == "transfer-encoding") {
+                if (chunked && HttpForwarder.Trim(HttpForwarder.Lower(
+                        HttpForwarder.HeaderValueOfLine(line))) == "chunked") {
+                    outHead = outHead + line + "\r\n";
+                }
+                continue;
+            }
             if (HttpForwarder.IsHopByHop(name)) { continue; }
             if (name == "x-forwarded-for") {
                 fwd = HttpForwarder.HeaderValueOfLine(line);
@@ -562,6 +582,8 @@ class HttpForwarder {
             return await HttpForwarder.PumpChunked(src, dst, chunkBytes);
         }
         long len = HttpForwarder.ContentLengthOf(head);
+        // 非法 Content-Length：不应到达这里，作为防御按无正文处理
+        if (len == -2) { return -1; }
         if (len > 0) {
             return await HttpForwarder.PumpExact(src, dst, len, chunkBytes);
         }
@@ -742,24 +764,77 @@ class HttpForwarder {
             || name == "proxy-authenticate" || name == "proxy-authorization";
     }
 
-    /// <summary>头块声明了分块传输编码。</summary>
+    /// <summary>头块声明了分块传输编码。
+    /// 按 RFC 7230，只有列表最后一项严格等于 "chunked" 时才成立，
+    /// 且 "chunked" 之后不能再有其他编码。</summary>
     static bool HeadIsChunked(string head) {
         string te = HttpForwarder.Lower(
             HttpForwarder.HeaderValue(head, "transfer-encoding"));
-        return HttpForwarder.IndexOf(te, "chunked", 0) >= 0;
+        List<string> parts = HttpForwarder.SplitCsv(te);
+        if (parts.Count == 0) { return false; }
+        string last = HttpForwarder.Trim(parts[parts.Count - 1]);
+        return last == "chunked";
     }
 
-    /// <summary>Content-Length 的值；未声明时返回 -1。</summary>
+    /// <summary>Content-Length 的值；未声明时返回 -1，
+    /// 包含非数字字符时返回 -2（非法）。</summary>
     static long ContentLengthOf(string head) {
         string v = HttpForwarder.HeaderValue(head, "content-length");
         if (v.Length == 0) { return -1; }
         long n = 0;
         for (int i = 0; i < v.Length; i = i + 1) {
             int b = v[i] & 255;
-            if (b < 48 || b > 57) { return n; }
+            if (b < 48 || b > 57) { return -2; }
+            // 检查溢出：n > (LLONG_MAX - digit) / 10
+            if (n > 922337203685477580L) { return -2; }
             n = n * 10 + (long)(b - 48);
         }
         return n;
+    }
+
+    /// <summary>检查请求/响应头块的正文定界是否合法。
+    /// 非法定界（TE+CL 冲突、非 chunked 的 TE、chunked 不在最后、
+    /// 非法 Content-Length）返回 false，调用方应返回 400。</summary>
+    static bool IsBodyFramingValid(string head, bool isRequest) {
+        string teValue = HttpForwarder.Lower(
+            HttpForwarder.HeaderValue(head, "transfer-encoding"));
+        bool hasTe = teValue.Length > 0;
+        bool hasCl = HttpForwarder.HeaderValue(head, "content-length").Length > 0;
+        if (hasTe && hasCl) { return false; }
+        if (hasTe) {
+            List<string> parts = HttpForwarder.SplitCsv(teValue);
+            for (int i = 0; i < parts.Count; i = i + 1) {
+                string enc = HttpForwarder.Trim(parts[i]);
+                // 只有 chunked 作为最后一项才合法；其他编码
+                // （如 gzip）应由应用层处理，转发器不支持。
+                if (enc == "chunked") {
+                    if (i != parts.Count - 1) { return false; }
+                } else if (enc == "identity") {
+                    // identity 不应出现在 TE 中（默认即 identity）
+                    if (isRequest) { return false; }
+                } else {
+                    // 未知的 transfer-coding 拒绝转发，避免走私
+                    return false;
+                }
+            }
+            if (parts.Count == 0) { return false; }
+        }
+        long cl = HttpForwarder.ContentLengthOf(head);
+        if (cl == -2) { return false; }
+        return true;
+    }
+
+    /// <summary>按 ',' 拆分 TE/CL 等逗号分隔值，并 trim 每项。</summary>
+    static List<string> SplitCsv(string s) {
+        List<string> parts = new List<string>();
+        int i = 0;
+        while (i < s.Length) {
+            int j = i;
+            while (j < s.Length && s[j] != ',') { j = j + 1; }
+            parts.Add(HttpForwarder.Trim(s.Substring(i, j - i)));
+            i = j + 1;
+        }
+        return parts;
     }
 
     /// <summary>分块长度行（十六进制，可带 ";ext"）的字节数；

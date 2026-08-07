@@ -45,19 +45,7 @@ class File {
         if (fp == 0) {
             throw new FileNotFoundException("Could not open file: " + path);
         }
-        fseek(fp, 0, 2);
-        int size = ftell(fp);
         fseek(fp, 0, 0);
-        if (size > 0) {
-            byte[] buf = new byte[size];
-            int got = (int)fread(buf, 1, size, fp);
-            fclose(fp);
-            return buf.ToStr(0, got);
-        }
-        // 大小为 0 不代表内容为空：生成的文件（/proc、/sys）有
-        // 内容但无法上报长度，因此 seek/ftell 快捷方式不能
-        // 作为唯一途径。应读取全部内容，而不是对
-        // 能被 `cat` 正常读取的文件返回“”。
         StringBuilder sb = new StringBuilder();
         byte[] chunk = new byte[8192];
         int n = (int)fread(chunk, 1, 8192, fp);
@@ -82,7 +70,10 @@ class File {
         if (fp == 0) {
             throw new IOException("Could not open file for writing: " + path);
         }
-        fputs(content, fp);
+        if (fputs(content, fp) < 0) {
+            fclose(fp);
+            throw new IOException("Could not write file: " + path);
+        }
         fclose(fp);
     }
 
@@ -98,7 +89,10 @@ class File {
         if (fp == 0) {
             throw new IOException("Could not open file for appending: " + path);
         }
-        fputs(content, fp);
+        if (fputs(content, fp) < 0) {
+            fclose(fp);
+            throw new IOException("Could not append to file: " + path);
+        }
         fclose(fp);
     }
 
@@ -199,8 +193,10 @@ class File {
             throw new IOException("Could not open file for writing: " + path);
         }
         for (int i = 0; i < lines.Count; i = i + 1) {
-            fputs(lines[i], fp);
-            fputc(10, fp);
+            if (fputs(lines[i], fp) < 0 || fputc(10, fp) < 0) {
+                fclose(fp);
+                throw new IOException("Could not write file: " + path);
+            }
         }
         fclose(fp);
     }
@@ -222,10 +218,11 @@ class File {
         }
     }
 
-    /// <summary>从文件读取指定数量的字节。返回的
-    /// 缓冲区由 ARC 管理并自带长度，因此内嵌 NUL 字节
-    /// 得以保留，调用者也无需手动释放。
-    /// 文件无法打开时抛出 FileNotFoundException。</summary>
+    /// <summary>从文件读取最多 <paramref name="count"/> 个字节。
+    /// 返回的缓冲区由 ARC 管理并自带长度，因此内嵌 NUL 字节
+    /// 得以保留，调用者也无需手动释放。文件比 count 短小时
+    /// 返回实际读取的字节数；文件无法打开时抛出
+    /// FileNotFoundException。</summary>
     static byte[] ReadBytes(string path, int offset, int count) {
         nint fp = fopen(path, "rb");
         if (fp == 0) {
@@ -233,8 +230,24 @@ class File {
         }
         fseek(fp, offset, 0);
         byte[] buf = new byte[count];
-        (int)fread(buf, 1, count, fp);
+        int total = 0;
+        byte[] chunk = new byte[4096];
+        while (total < count) {
+            int want = count - total;
+            if (want > 4096) { want = 4096; }
+            int got = (int)fread(chunk, 1, want, fp);
+            if (got <= 0) { break; }
+            int i = 0;
+            while (i < got) { buf[total + i] = chunk[i]; i = i + 1; }
+            total = total + got;
+        }
         fclose(fp);
+        if (total < count) {
+            byte[] actual = new byte[total];
+            int i = 0;
+            while (i < total) { actual[i] = buf[i]; i = i + 1; }
+            return actual;
+        }
         return buf;
     }
 

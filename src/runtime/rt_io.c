@@ -1397,16 +1397,38 @@ int64_t zan_io_wait_writable(intptr_t fd) {
 }
 
 int64_t zan_io_wait_readable_timeout(intptr_t fd, int64_t timeout_ms) {
-    /* For simplicity, delegate to wait_readable; timeout is handled
-     * by the scheduler's timer integration.  A proper implementation
-     * would register both an IO watcher and a timer, and cancel whichever
-     * fires second. */
-    (void)timeout_ms;
-    void *co = zan_io_get_current_co();
-    if (!co) return -1;
-    io_register(fd, ZAN_IO_READ, co, NULL);
-    zan_io_suspend_current();
+    /* Synchronous poll/select with timeout.
+     * This function currently has no callers; when one is added it should
+     * ideally be reimplemented as a non-blocking watcher + timer.  For now
+     * this at least makes the timeout parameter meaningful instead of
+     * ignoring it and waiting forever. */
+    if (timeout_ms <= 0) {
+        void *co = zan_io_get_current_co();
+        if (!co) return -1;
+        io_register(fd, ZAN_IO_READ, co, NULL);
+        zan_io_suspend_current();
+        return 1;
+    }
+#if defined(_WIN32)
+    fd_set fds;
+    FD_ZERO(&fds);
+    FD_SET((SOCKET)fd, &fds);
+    struct timeval tv;
+    tv.tv_sec = (long)(timeout_ms / 1000);
+    tv.tv_usec = (long)((timeout_ms % 1000) * 1000);
+    int r = select(0, &fds, NULL, NULL, &tv);
+    if (r < 0) return -1;
+    if (r == 0) return 0;
     return 1;
+#else
+    struct pollfd pfd;
+    pfd.fd = (int)fd;
+    pfd.events = POLLIN;
+    int r = poll(&pfd, 1, (int)timeout_ms);
+    if (r < 0) return -1;
+    if (r == 0) return 0;
+    return 1;
+#endif
 }
 
 /* ================= async connect ================= */

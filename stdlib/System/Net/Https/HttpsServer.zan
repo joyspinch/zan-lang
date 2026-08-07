@@ -24,6 +24,8 @@ class HttpsServer {
     bool running;
     int activeConnections;
     int maxRequestBytes;
+    int maxHeaderBytes;
+    int requestTimeoutMs;
     HttpRequestHandler requestHandler;
 
     HttpsServer(string host, int port) {
@@ -32,6 +34,8 @@ class HttpsServer {
         this.running = false;
         this.activeConnections = 0;
         this.maxRequestBytes = 1048576;
+        this.maxHeaderBytes = 16384;
+        this.requestTimeoutMs = 30000;
         this.requestHandler = null;
         this.tls = null;
     }
@@ -52,6 +56,19 @@ class HttpsServer {
     /// （请求头 + 请求体）。</summary>
     HttpsServer SetMaxRequestBytes(int bytes) {
         this.maxRequestBytes = bytes;
+        return this;
+    }
+
+    /// <summary>设置请求头块的最大字节数，超过则返回 431。</summary>
+    HttpsServer SetMaxHeaderBytes(int bytes) {
+        this.maxHeaderBytes = bytes;
+        return this;
+    }
+
+    /// <summary>设置读取请求头和请求体的截止时间（毫秒）。
+    /// 0 表示禁用。默认 30 秒。</summary>
+    HttpsServer SetTimeout(int ms) {
+        this.requestTimeoutMs = ms;
         return this;
     }
 
@@ -95,6 +112,7 @@ class HttpsServer {
             return;
         }
 
+        int watch = HttpDeadline.Arm(clientSock, this.requestTimeoutMs);
         bool keepAlive = true;
         string buffer = "";
         int reject = 0;
@@ -102,7 +120,7 @@ class HttpsServer {
         while (keepAlive) {
             int headerEnd = HttpServer.FindHeaderEnd(buffer);
             while (headerEnd < 0) {
-                if (buffer.Length > this.maxRequestBytes) { reject = 413; break; }
+                if (buffer.Length > this.maxHeaderBytes) { reject = 431; break; }
                 string chunk = await stream.RecvAsync(65536);
                 if (chunk.Length == 0) { keepAlive = false; break; }
                 buffer = buffer + chunk;
@@ -123,6 +141,7 @@ class HttpsServer {
             int need = headerEnd + bodyLen;
             if (need > this.maxRequestBytes) { reject = 413; break; }
             while (buffer.Length < need) {
+                HttpDeadline.Touch(watch, this.requestTimeoutMs);
                 string chunk = await stream.RecvAsync(65536);
                 if (chunk.Length == 0) { keepAlive = false; break; }
                 buffer = buffer + chunk;
@@ -141,6 +160,7 @@ class HttpsServer {
             }
             keepAlive = request.keepAlive;
 
+            HttpDeadline.Touch(watch, this.requestTimeoutMs);
             HttpResponse response = ProcessRequest(request);
             response = response.SetKeepAlive(keepAlive);
 
@@ -152,7 +172,12 @@ class HttpsServer {
             }
         }
 
-        if (reject == 413) {
+        if (reject == 431) {
+            HttpResponse tooLarge = HttpResponse.WithStatus(431, "Request Header Fields Too Large", "header block exceeds limit");
+            tooLarge = tooLarge.SetKeepAlive(false);
+            string data = tooLarge.Build();
+            int _s = await stream.SendAsync(data, data.Length);
+        } else if (reject == 413) {
             HttpResponse tooLarge = HttpResponse.WithStatus(413, "Payload Too Large", "request exceeds limit");
             tooLarge = tooLarge.SetKeepAlive(false);
             string data = tooLarge.Build();
@@ -172,6 +197,7 @@ class HttpsServer {
             int _n = await stream.SendAsync(data, data.Length);
         }
 
+        HttpDeadline.Disarm(watch);
         stream.Close();
         Socket.Close(clientSock);
         this.activeConnections = this.activeConnections - 1;

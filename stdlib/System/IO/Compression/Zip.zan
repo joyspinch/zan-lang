@@ -227,15 +227,20 @@ class Zip {
         // 改为从头向前扫描，寻找名称匹配的签名。
         int lho = Zip.FindLocal(zip, e.name);
         if (lho < 0) { return null; }
+        // 读取固定字段前，先保证 local header 的固定部分存在。
+        if (lho + 30 > zip.Length) { return null; }
         int method = Zip.ReadU16(zip, lho + 8);
         int csize = (int)Zip.ReadU32(zip, lho + 18);
         int usize = (int)Zip.ReadU32(zip, lho + 22);
         int nameLen = Zip.ReadU16(zip, lho + 26);
         int extraLen = Zip.ReadU16(zip, lho + 28);
-        int dataPos = lho + 30 + nameLen + extraLen;
-        // long 运算：csize 来自归档头部，int 加法可能溢出为负
-        // 从而绕过边界检查（byte[] 无越界检查，会读到堆垃圾）。
-        if (csize < 0 || (long)dataPos + (long)csize > zip.Length) { return null; }
+        // 验证完整 local header（固定 30 字节 + 名称 + 额外字段）
+        // 不越界，并用 long 防止 int 加法回绕。
+        if (lho < 0 || nameLen < 0 || extraLen < 0) { return null; }
+        long headerEnd = (long)lho + 30L + (long)nameLen + (long)extraLen;
+        if (headerEnd > zip.Length) { return null; }
+        long dataPos = headerEnd;
+        if (csize < 0 || dataPos + (long)csize > (long)zip.Length) { return null; }
         byte[] raw = new byte[csize];
         for (int k = 0; k < csize; k = k + 1) {
             raw[k] = zip[dataPos + k];
@@ -260,6 +265,9 @@ class Zip {
         for (int i = 0; i + 30 <= zip.Length; i = i + 1) {
             if (Zip.ReadU32(zip, i) == Zip.SigLocal) {
                 int nameLen = Zip.ReadU16(zip, i + 26);
+                // 本地头本身 30 字节 + 名称必须落在归档内，
+                // 否则按损坏跳过，继续扫描下一个签名。
+                if (i + 30 + nameLen > zip.Length) { continue; }
                 if (nameLen == name.Length) {
                     bool same = true;
                     for (int k = 0; k < nameLen; k = k + 1) {

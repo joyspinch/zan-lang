@@ -547,6 +547,10 @@ class TlsStream {
     }
 
     // 把 wbio 中待发的加密输出字节刷到套接字。
+    // 必须保证 BIO 中读出的每一块都完整发出；否则截断的 TLS
+    // 记录会导致握手/数据损坏。Socket.SendAsync 在内部已经循环
+    // 重发，因此其返回值应等于请求发送的字节数；若不相等则
+    // 视为连接已不可用。
     async int FlushOutAsync() {
         int pending = BIO_ctrl_pending(this.wbio);
         while (pending > 0) {
@@ -555,7 +559,7 @@ class TlsStream {
             int n = Norm(BIO_read(this.wbio, this.scratch, chunk));
             if (n <= 0) { return -1; }
             int sent = Norm(await Socket.SendAsync(this.sock, this.scratch, n));
-            if (sent < 0) { return -1; }
+            if (sent != n) { return -1; }
             pending = BIO_ctrl_pending(this.wbio);
         }
         return 0;
@@ -686,13 +690,26 @@ class TlsStream {
         if (this.ssl != null) {
             if (this.open) {
                 int _s = SSL_shutdown(this.ssl);
-                // 尽力而为：同步刷出 close_notify
+                // 尽力把 close_notify 全部发出；每次从 BIO 读出后
+                // 循环发送直到这块字节写完或出错，避免截断 TLS 记录。
                 int pending = BIO_ctrl_pending(this.wbio);
-                if (pending > 0 && pending <= SCRATCH) {
+                while (pending > 0 && pending <= SCRATCH) {
                     int n = BIO_read(this.wbio, this.scratch, pending);
-                    if (n > 0) {
-                        int _sent = Socket.Send(this.sock, this.scratch, n);
+                    if (n <= 0) { break; }
+                    int sent = Socket.Send(this.sock, this.scratch, n);
+                    if (sent <= 0) { break; }
+                    if (sent < n) {
+                        // 同步 Send 发生了短写，继续尝试发送剩余字节
+                        int offset = sent;
+                        while (offset < n) {
+                            string tail = this.scratch.Substring(offset, n - offset);
+                            int r = Socket.Send(this.sock, tail, n - offset);
+                            if (r <= 0) { break; }
+                            offset = offset + r;
+                        }
+                        if (offset < n) { break; }
                     }
+                    pending = BIO_ctrl_pending(this.wbio);
                 }
             }
             SSL_free(this.ssl);
