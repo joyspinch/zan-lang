@@ -93,11 +93,11 @@ class Socket {
     [DllImport("ws2_32")]
     static extern int inet_addr(string cp);
 
-    [DllImport("ws2_32")]
-    static extern nint gethostbyname(string name);
-
     [DllImport("ws2_32", EntryPoint = "WSAGetLastError")]
     static extern int WinLastError();
+
+    [DllImport("crt", EntryPoint = "zan_io_resolve_ipv4")]
+    static extern int NativeResolveIpv4(string hostname);
 
     // Winsock 接收完整 SOCKET 句柄，因此这些只是直接转发。
     static int SysClose(nint s) { return closesocket(s); }
@@ -162,10 +162,7 @@ class Socket {
     static extern ushort ntohs(ushort netshort);
 
     [DllImport("crt")]
-    static extern int inet_addr(string cp);
-
-    [DllImport("crt")]
-    static extern nint gethostbyname(string name);
+    static extern nint inet_addr(string cp);
 
     [DllImport("crt")]
     static extern int fcntl(int fd, int cmd, int arg);
@@ -687,45 +684,18 @@ class Socket {
     [DllImport("crt", EntryPoint = "memcpy")]
     static extern nint PlatMemCopyIn(byte[] dst, nint src, long n);
 
-    // 从结构体 base + off 处读取原生指针宽度字段（8 字节，在本编译器
-    // 构建的 LP64 目标上为小端序）。
-    static nint PtrFieldAt(nint ptr, int off) {
-        byte[] x = new byte[8];
-        PlatMemCopyIn(x, ptr + off, 8);
-        nint p = 0;
-        nint mul = 1;
-        for (int k = 0; k < 8; k = k + 1) {
-            p = p + (x[k] & 255) * mul;
-            mul = mul * 256;
-        }
-        return p;
-    }
-
     /// <summary>将主机名解析为 IPv4 地址，字节序与
     /// <c>inet_addr</c> 一致（第一段在低字节），无法
-    /// 解析时返回 0。通过 gethostbyname/AF_INET 固定 IPv4，避免双栈主机
-    /// 虽通告了 AAAA 记录，却经由一条可能通告但实际
-    /// 不可路由的 IPv6 路径被访问。</summary>
+    /// 解析时返回 0。通过运行时 C shim 调用 gethostbyname/AF_INET，
+    /// 避免在 Zan 代码中硬编码 hostent 布局。</summary>
     static int ResolveIpv4(string hostname) {
-        nint he = gethostbyname(hostname);
-        if (he == 0) { return 0; }
-        // 在 LP64 下，struct hostent 的 h_addr_list (char**) 位于偏移 24
-        // （Windows x64 与 Linux/macOS x64 均如此）；其首项指向
-        // 地址的 4 个网络字节序字节。
-        nint list = Socket.PtrFieldAt(he, 24);
-        if (list == 0) { return 0; }
-        nint first = Socket.PtrFieldAt(list, 0);
-        if (first == 0) { return 0; }
-        byte[] ip = new byte[4];
-        PlatMemCopyIn(ip, first, 4);
-        return (ip[0] & 255) + ((ip[1] & 255) << 8)
-            + ((ip[2] & 255) << 16) + ((ip[3] & 255) << 24);
+        return Socket.NativeResolveIpv4(hostname);
     }
 
-    /// <summary>将主机名解析为 IP 地址。</summary>
+    /// <summary>将主机名解析为 IP 地址。若无法解析则返回 ""；
+    /// 否则返回原主机名。</summary>
     static string Resolve(string hostname) {
-        nint he = gethostbyname(hostname);
-        if (he == 0) { return ""; }
+        if (Socket.NativeResolveIpv4(hostname) == 0) { return ""; }
         return hostname;
     }
 

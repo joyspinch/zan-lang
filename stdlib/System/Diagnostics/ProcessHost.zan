@@ -38,10 +38,10 @@ class ProcessHost {
     #if WINDOWS
     [DllImport("kernel32", EntryPoint = "GetCurrentProcessId")]
     static extern int GetCurrentProcessId();
-    [DllImport("kernel32", EntryPoint = "GetModuleFileNameA")]
-    static extern int GetModuleFileNameA(nint hModule, string buf, int size);
-    [DllImport("kernel32", EntryPoint = "GetEnvironmentVariableA")]
-    static extern int GetEnvironmentVariableA(string name, string buf, int size);
+    [DllImport("kernel32", EntryPoint = "GetModuleFileNameW")]
+    static extern int GetModuleFileNameW(nint hModule, nint buf, int size);
+    [DllImport("kernel32", EntryPoint = "GetEnvironmentVariableW")]
+    static extern int GetEnvironmentVariableW(nint name, nint buf, int size);
     #elif LINUX
     [DllImport("crt")]
     static extern int getpid();
@@ -50,6 +50,8 @@ class ProcessHost {
     #elif MACOS
     [DllImport("crt")]
     static extern int getpid();
+    [DllImport("crt", EntryPoint = "_NSGetExecutablePath")]
+    static extern int NSGetExecutablePath(nint buf, nint size);
     #endif
 
     /// <summary>当前进程的 PID。</summary>
@@ -68,10 +70,14 @@ class ProcessHost {
         // 读取实时的 Win32 环境块。CRT 的 getenv 获取的是快照，
         // 该快照在 CRT 启动时截取，会漏掉父进程在 CreateProcess 前通过
         // SetEnvironmentVariable 设置的变量。
-        byte[] buf = new byte[4097];
-        int n = GetEnvironmentVariableA(name, buf, 4096);
-        if (n <= 0 || n > 4096) { return ""; }
-        return buf.ToStr(0, n);
+        nint wname = Wide.Of(name);
+        nint buf = NativeMemory.Alloc(8192);
+        int n = GetEnvironmentVariableW(wname, buf, 4096);
+        string text = "";
+        if (n > 0 && n < 4096) { text = Wide.Read(buf); }
+        NativeMemory.Free(buf);
+        Wide.Free(wname);
+        return text;
         #else
         string v = getenv(name);
         if (v == null) { return ""; }
@@ -83,16 +89,34 @@ class ProcessHost {
     /// 重新启动自身的 worker 副本。无法确定时返回 ""
     /// （macOS/其他平台），此时调用方按单进程运行。</summary>
     static string SelfExe() {
-        byte[] buf = new byte[4097];
         #if WINDOWS
-        int n = GetModuleFileNameA(0, buf, 4096);
+        nint buf = NativeMemory.Alloc(8192);
+        int n = GetModuleFileNameW(0, buf, 4096);
+        string exe = "";
+        if (n > 0 && n < 4096) { exe = Wide.Read(buf); }
+        NativeMemory.Free(buf);
+        return exe;
         #elif LINUX
+        byte[] buf = new byte[4097];
         int n = readlink("/proc/self/exe", buf, 4096);
-        #else
-        int n = 0;
-        #endif
         if (n <= 0 || n > 4096) { return ""; }
         return buf.ToStr(0, n);
+        #elif MACOS
+        nint sizeBuf = NativeMemory.Alloc(4);
+        new Span<int>(sizeBuf, 1)[0] = 4096;
+        nint pathBuf = NativeMemory.Alloc(4096);
+        int ok = NSGetExecutablePath(pathBuf, sizeBuf);
+        string exe = "";
+        if (ok == 0) {
+            int len = new Span<int>(sizeBuf, 1)[0];
+            if (len > 0 && len < 4096) { exe = NativeMemory.GetString(pathBuf, 0, len); }
+        }
+        NativeMemory.Free(pathBuf);
+        NativeMemory.Free(sizeBuf);
+        return exe;
+        #else
+        return "";
+        #endif
     }
 
     /// <summary>本进程的 worker 索引：master 为 0，被派生的 worker 为 N

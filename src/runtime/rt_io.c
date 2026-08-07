@@ -51,6 +51,7 @@ static int zan_io_trace(void){static int t=-1;if(t<0){const char*e=getenv("ZAN_I
 #include <sys/select.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <netdb.h>
 #include <errno.h>
 #include <limits.h>
 #include <time.h>
@@ -68,6 +69,7 @@ static int zan_io_trace(void){static int t=-1;if(t<0){const char*e=getenv("ZAN_I
 #include <ws2tcpip.h>
 #include <mswsock.h>          /* ConnectEx + WSAID_CONNECTEX */
 #include <windows.h>
+#include <wincrypt.h>
 #include <malloc.h>           /* _aligned_malloc / _aligned_free (op pool) */
 #else
 #include <sys/select.h>
@@ -324,6 +326,29 @@ const char *zan_io_socket_peer_ip(intptr_t fd) {
                    address, sizeof(address))) return "";
     return address;
 }
+
+/* Resolve a hostname to an IPv4 address in the same byte order as inet_addr.
+ * Returns 0 on failure.  The implementation uses gethostbyname/AF_INET and
+ * avoids hard-coding the hostent layout in Zan code. */
+int32_t zan_io_resolve_ipv4(const char *hostname) {
+    struct hostent *he = gethostbyname(hostname);
+    if (!he || !he->h_addr_list || !he->h_addr_list[0]) return 0;
+    unsigned char *a = (unsigned char *)he->h_addr_list[0];
+    return (int32_t)(a[0] | (a[1] << 8) | (a[2] << 16) | (a[3] << 24));
+}
+
+#if defined(_WIN32)
+/* Read the encoded DER pointer/length from a Windows PCCERT_CONTEXT.
+ * Returns the pointer to the encoded bytes and writes the length to *out_len.
+ * Returns NULL when the context is invalid.  This keeps the CERT_CONTEXT
+ * layout out of the Zan standard library. */
+const unsigned char *zan_crypto_cert_encoded(const void *cert, int *out_len) {
+    const CERT_CONTEXT *ctx = (const CERT_CONTEXT *)cert;
+    if (!ctx || !out_len) return NULL;
+    *out_len = (int)ctx->cbCertEncoded;
+    return ctx->pbCertEncoded;
+}
+#endif
 
 int32_t zan_io_socket_ready(intptr_t fd, int32_t write_ready) {
     fd_set fds;

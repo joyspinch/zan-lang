@@ -52,6 +52,16 @@ int32_t zan_io_connect_status(intptr_t fd);
 int32_t zan_io_socket_alive(intptr_t fd);
 int64_t zan_io_socket_peer_ipv4(intptr_t fd);
 
+/* Resolve a hostname to an IPv4 address in the same byte order as inet_addr.
+ * Returns 0 when the hostname cannot be resolved. */
+int32_t zan_io_resolve_ipv4(const char *hostname);
+
+#if defined(_WIN32)
+/* Read the encoded DER pointer/length from a Windows PCCERT_CONTEXT.
+ * Keeps the CERT_CONTEXT layout out of the Zan standard library. */
+const unsigned char *zan_crypto_cert_encoded(const void *cert, int *out_len);
+#endif
+
 /* ---- stackless (CPS state-machine) ABI ----
  *
  * The compiler's async lowering (see docs/ASYNC_CPS_DESIGN.md) has no fiber to
