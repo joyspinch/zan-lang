@@ -155,12 +155,23 @@ static void collect_inst_member(zan_irgen_t *g, zan_ast_node_t *member) {
 }
 
 /* Repeatedly scan until no new instantiation appears, so a concrete generic
- * used only inside another specialized generic's body (transitive) is found. */
+ * used only inside another specialized generic's body (transitive) is found.
+ * If the scan keeps adding instantiations past the resource limit, the type
+ * graph is either recursively dependent or too large; report an error instead
+ * of silently emitting an incomplete program. */
 static void discover_generic_insts(zan_irgen_t *g, zan_ast_node_t *unit) {
     if (!unit || unit->kind != AST_COMPILATION_UNIT) return;
     int prev = -1;
     int guard = 0;
-    while (g->generic_inst_count != prev && guard++ < 64) {
+    const int limit = 64;
+    while (g->generic_inst_count != prev) {
+        if (guard >= limit) {
+            zan_diag_emit(g->diag, DIAG_ERROR, unit->loc,
+                "generic instantiation did not reach a fixed point within "
+                "%d iterations; the type graph may be recursively dependent "
+                "or too large", limit);
+            break;
+        }
         prev = g->generic_inst_count;
         for (int i = 0; i < unit->comp_unit.decls.count; i++) {
             zan_ast_node_t *decl = unit->comp_unit.decls.items[i];
@@ -170,6 +181,7 @@ static void discover_generic_insts(zan_irgen_t *g, zan_ast_node_t *unit) {
                     collect_inst_member(g, decl->type_decl.members.items[j]);
             }
         }
+        guard++;
     }
 }
 
