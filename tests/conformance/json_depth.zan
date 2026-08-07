@@ -1,0 +1,61 @@
+// Deeply nested JSON must be rejected instead of exhausting the call stack
+// (the old parser crashed with 'exception unwind stack exhausted' around
+// 200k-400k levels on a ~400KB input). JsonValue.Parse throws JsonException
+// once nesting exceeds the depth limit; ParseLenient degrades gracefully.
+using System;
+using System.Json;
+
+class Program {
+    static int bad;
+
+    static void Check(bool ok, string label) {
+        if (!ok) { Console.WriteLine("FAIL " + label); bad = bad + 1; }
+    }
+
+    static string Nested(int n) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < n; i = i + 1) { sb.Append("["); }
+        sb.Append("1");
+        for (int i = 0; i < n; i = i + 1) { sb.Append("]"); }
+        return sb.ToString();
+    }
+
+    static void Main() {
+        // Normal documents still parse and round-trip.
+        JsonValue doc = JsonValue.Parse("{\"a\": [1, 2, {\"b\": \"x\"}]}");
+        Check(doc.Int("a", 0) != 0 || doc.Count() == 1, "normal parse");
+        Check(doc.Get("a").At(2).Str("b", "") == "x", "nested access");
+
+        // Reasonably deep (100 levels) is fine.
+        JsonValue deep = JsonValue.Parse(Nested(100));
+        Check(deep.IsArray(), "depth 100 ok");
+
+        // Absurdly deep: strict Parse throws, lenient returns a tree.
+        bool threw = false;
+        try {
+            JsonValue v = JsonValue.Parse(Nested(2000));
+        } catch (JsonException e) {
+            threw = true;
+        }
+        Check(threw, "depth 2000 rejected");
+
+        JsonValue lenient = JsonValue.ParseLenient(Nested(2000));
+        Check(lenient != null && lenient.IsArray(), "lenient depth 2000");
+
+        // Deep object nesting too.
+        StringBuilder ob = new StringBuilder();
+        int n = 2000;
+        for (int i = 0; i < n; i = i + 1) { ob.Append("{\"k\":"); }
+        ob.Append("1");
+        for (int i = 0; i < n; i = i + 1) { ob.Append("}"); }
+        bool threw2 = false;
+        try {
+            JsonValue v = JsonValue.Parse(ob.ToString());
+        } catch (JsonException e) {
+            threw2 = true;
+        }
+        Check(threw2, "object depth 2000 rejected");
+
+        Console.WriteLine("json-depth-ok: " + Convert.ToString(bad == 0 ? 1 : 0));
+    }
+}

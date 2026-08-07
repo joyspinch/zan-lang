@@ -466,6 +466,9 @@ class JsonReader {
     string s;
     int pos;
     int len;
+    /// 递归解析/校验的最大嵌套深度。深层嵌套文档会耗尽
+    /// 调用栈（约 20-40 万层时解析器崩溃），必须显式限制。
+    static int MaxDepth = 512;
 
     static JsonReader Of(string src) {
         JsonReader r = new JsonReader();
@@ -493,17 +496,22 @@ class JsonReader {
     }
 
     JsonValue ReadValue() {
+        return ReadValueAt(0);
+    }
+
+    JsonValue ReadValueAt(int depth) {
+        if (depth > JsonReader.MaxDepth) { return JsonValue.NewNull(); }
         SkipWs();
         int c = CurB();
-        if (c == 123) { return ReadObject(); }              // '{'
-        if (c == 91) { return ReadArray(); }                // '['
+        if (c == 123) { return ReadObjectAt(depth); }              // '{'
+        if (c == 91) { return ReadArrayAt(depth); }                // '['
         if (c == 34) { return JsonValue.NewStr(ReadString()); }
         if (c == 116 || c == 102) { return ReadBool(); }    // 't' / 'f'
         if (c == 110) { pos = pos + 4; return JsonValue.NewNull(); }
         return ReadNumber();
     }
 
-    JsonValue ReadObject() {
+    JsonValue ReadObjectAt(int depth) {
         JsonValue obj = JsonValue.NewObject();
         pos = pos + 1;                 // 消费 '{'
         SkipWs();
@@ -513,7 +521,7 @@ class JsonReader {
             string key = ReadString();
             SkipWs();
             if (CurB() == 58) { pos = pos + 1; }            // ':'
-            JsonValue v = ReadValue();
+            JsonValue v = ReadValueAt(depth + 1);
             obj.Put(key, v);
             SkipWs();
             int c = CurB();
@@ -524,13 +532,13 @@ class JsonReader {
         return obj;
     }
 
-    JsonValue ReadArray() {
+    JsonValue ReadArrayAt(int depth) {
         JsonValue arr = JsonValue.NewArray();
         pos = pos + 1;                 // 消费 '['
         SkipWs();
         if (CurB() == 93) { pos = pos + 1; return arr; }    // ']'
         while (pos < len) {
-            JsonValue v = ReadValue();
+            JsonValue v = ReadValueAt(depth + 1);
             arr.Append(v);
             SkipWs();
             int c = CurB();
@@ -629,10 +637,15 @@ class JsonReader {
     }
 
     bool ValidValue() {
+        return ValidValueAt(0);
+    }
+
+    bool ValidValueAt(int depth) {
+        if (depth > JsonReader.MaxDepth) { return false; }
         SkipWs();
         int c = CurB();
-        if (c == 123) { return ValidObject(); }             // '{'
-        if (c == 91) { return ValidArray(); }               // '['
+        if (c == 123) { return ValidObjectAt(depth); }          // '{'
+        if (c == 91) { return ValidArrayAt(depth); }            // '['
         if (c == 34) { return ValidString(); }
         if (c == 116) { return ValidLiteral("true"); }
         if (c == 102) { return ValidLiteral("false"); }
@@ -648,7 +661,7 @@ class JsonReader {
         return true;
     }
 
-    bool ValidObject() {
+    bool ValidObjectAt(int depth) {
         pos = pos + 1;                 // 消费 '{'
         SkipWs();
         if (CurB() == 125) { pos = pos + 1; return true; }  // '}'
@@ -659,7 +672,7 @@ class JsonReader {
             SkipWs();
             if (CurB() != 58) { return false; }             // ':'
             pos = pos + 1;
-            if (!ValidValue()) { return false; }
+            if (!ValidValueAt(depth + 1)) { return false; }
             SkipWs();
             int c = CurB();
             if (c == 44) { pos = pos + 1; }                 // ','
@@ -669,12 +682,12 @@ class JsonReader {
         return false;
     }
 
-    bool ValidArray() {
+    bool ValidArrayAt(int depth) {
         pos = pos + 1;                 // 消费 '['
         SkipWs();
         if (CurB() == 93) { pos = pos + 1; return true; }   // ']'
         while (pos < len) {
-            if (!ValidValue()) { return false; }
+            if (!ValidValueAt(depth + 1)) { return false; }
             SkipWs();
             int c = CurB();
             if (c == 44) { pos = pos + 1; }                 // ','
