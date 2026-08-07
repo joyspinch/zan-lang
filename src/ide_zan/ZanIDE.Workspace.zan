@@ -1300,7 +1300,7 @@ partial class ZanIDE {
         if (File.Exists(exe)) { File.Delete(exe); }
         string inputs = ZanIDE.SmartInputs(root, ZanIDE.DirOf(target), target);
         ZanIDE.BuildDetach(
-            ZanIDE.CompileToExe(root, target, inputs, bd + "/.zanrun.ll", exe, false));
+            ZanIDE.CompileToExe(root, target, inputs, bd + "/.zanrun.ll", exe, false, false));
         return exe;
     }
 
@@ -1503,6 +1503,22 @@ partial class ZanIDE {
         bool isLib = ZanIDE.IsLibraryProject(root);
         bool wantPack = ZanIDE.ProjSingleFile(root) && !isLib;
         bool pack = ZanIDE.CanPackSingle() && wantPack;
+        // Release (--publish, optimize + strip) vs Debug (-g, DWARF + -O0,
+        // runtime checks kept so published-build crashes resolve to .zan:line).
+        // The choice lives in zan.proj (toggled in the Publish window) and is
+        // threaded into every target's compile command below.
+        bool dbg = ZanIDE.ProjPublishDebug(root);
+        string pubFlag = " --publish";
+        if (dbg) { pubFlag = " -g"; }
+        if (dbg) {
+            log.Add(ZanIDE.T(
+                "> Publish mode: Debug (-g, source locations, runtime checks kept).",
+                "> 发布模式：Debug（-g，保留源码位置与运行时检查）。"));
+        } else {
+            log.Add(ZanIDE.T(
+                "> Publish mode: Release (--publish, optimized + stripped).",
+                "> 发布模式：Release（--publish，优化并去除调试信息）。"));
+        }
         // Silently falling back to loose DLLs is what makes "I checked
         // single-file and still got DLLs" look like a bug, so say why.
         if (isLib) {
@@ -1545,7 +1561,7 @@ partial class ZanIDE {
                         ct = " --target " + ct;
                     }
                     if (seq != "") { seq = seq + sep; }
-                    seq = seq + "(" + zc + " --publish" + ct + " " + inputs
+                    seq = seq + "(" + zc + pubFlag + ct + " " + inputs
                         + " -o \"" + lib + "\")";
                     exes.Add(lib);
                     log.Add("> Publishing " + id + " library ...");
@@ -1555,7 +1571,7 @@ partial class ZanIDE {
                     if (ZanIDE.ProjStaticLib(root)) {
                         string slib = outDir + "/" + baseName + "-" + id
                             + ZanIDE.StaticLibExtFor(id);
-                        seq = seq + sep + "(" + zc + " --publish" + ct + " "
+                        seq = seq + sep + "(" + zc + pubFlag + ct + " "
                             + inputs + " -o \"" + slib + "\")";
                         exes.Add(slib);
                         log.Add("> Publishing " + id + " static library ...");
@@ -1572,10 +1588,10 @@ partial class ZanIDE {
                         string sexe = stage + "/" + baseName + "-windows-x64.exe";
                         ZanIDE.CopyResources(root, stage, log);
                         ZanIDE.CopyThemeSkins(root, stage, log);
-                        seq = seq + "(" + ZanIDE.CompileToExe(root, p, inputs, ll, sexe, true)
+                        seq = seq + "(" + ZanIDE.CompileToExe(root, p, inputs, ll, sexe, !dbg, dbg)
                             + " && " + ZanIDE.PackCmd(root, stage, exe) + ")";
                     } else {
-                        seq = seq + "(" + ZanIDE.CompileToExe(root, p, inputs, ll, exe, true) + ")";
+                        seq = seq + "(" + ZanIDE.CompileToExe(root, p, inputs, ll, exe, !dbg, dbg) + ")";
                     }
                     exes.Add(exe);
                     log.Add("> Publishing windows-x64 ...");
@@ -1589,10 +1605,10 @@ partial class ZanIDE {
                         string sexe = stage + "/" + baseName + "-windows-arm64.exe";
                         ZanIDE.CopyResources(root, stage, log);
                         ZanIDE.CopyThemeSkins(root, stage, log);
-                        seq = seq + "(" + ZanIDE.CompileToExeCross(root, p, inputs, sexe, "win-arm64")
+                        seq = seq + "(" + ZanIDE.CompileToExeCross(root, p, inputs, sexe, "win-arm64", dbg)
                             + " && " + ZanIDE.PackCmd(root, stage, exe) + ")";
                     } else {
-                        seq = seq + "(" + ZanIDE.CompileToExeCross(root, p, inputs, exe, "win-arm64") + ")";
+                        seq = seq + "(" + ZanIDE.CompileToExeCross(root, p, inputs, exe, "win-arm64", dbg) + ")";
                     }
                     exes.Add(exe);
                     log.Add("> Publishing windows-arm64 ...");
@@ -1605,9 +1621,9 @@ partial class ZanIDE {
                     string exe = outDir + "/" + baseName + "-" + id;
                     if (seq != "") { seq = seq + sep; }
                     if (id == hostId) {
-                        seq = seq + "(" + ZanIDE.CompileToExe(root, p, inputs, "", exe, true) + ")";
+                        seq = seq + "(" + ZanIDE.CompileToExe(root, p, inputs, "", exe, !dbg, dbg) + ")";
                     } else {
-                        seq = seq + "(" + ZanIDE.CompileToExeCross(root, p, inputs, exe, id) + ")";
+                        seq = seq + "(" + ZanIDE.CompileToExeCross(root, p, inputs, exe, id, dbg) + ")";
                     }
                     exes.Add(exe);
                     log.Add("> Publishing " + id + " ...");
@@ -1615,7 +1631,7 @@ partial class ZanIDE {
                     // Self-contained musl static single file (cross from any host).
                     string exe = outDir + "/" + baseName + "-linux-x64";
                     if (seq != "") { seq = seq + sep; }
-                    seq = seq + "(" + zc + " --publish " + inputs
+                    seq = seq + "(" + zc + pubFlag + " " + inputs
                         + " --target linux-musl --link-mode static -o \"" + exe + "\")";
                     exes.Add(exe);
                     log.Add("> Publishing linux-x64 ...");
@@ -1623,7 +1639,7 @@ partial class ZanIDE {
                     // Same musl static path as linux-x64; only triple/sysroot differ.
                     string exe = outDir + "/" + baseName + "-linux-arm64";
                     if (seq != "") { seq = seq + sep; }
-                    seq = seq + "(" + zc + " --publish " + inputs
+                    seq = seq + "(" + zc + pubFlag + " " + inputs
                         + " --target linux-arm64 --link-mode static -o \"" + exe + "\")";
                     exes.Add(exe);
                     log.Add("> Publishing linux-arm64 ...");
