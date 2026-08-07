@@ -57,9 +57,21 @@ Get-ChildItem -LiteralPath $Dest -File |
     Where-Object { $unused -contains $_.Name -or $_.Name -like "python3??._pth*" } |
     Remove-Item -Force
 
-# zanc copies the files listed here next to a published executable; the whole
-# embeddable payload is needed (stdlib zip and .pyd extension modules), not just
-# the DLL. Everything the module itself owns is excluded (lua*, *.bundle).
+# Keep only the core interpreter: pythonXY.dll, python3.dll, pythonXY.zip,
+# vcruntime140*.dll and LICENSE.txt. The embeddable's optional C extension
+# modules (*.pyd) and their support DLLs (libssl/libcrypto/libffi/sqlite3) are
+# dropped -- a published program only needs the core interpreter plus the Lua
+# driver, so a script that imports ssl / sqlite3 / ctypes / socket / etc. is out
+# of scope for the shipped driver. Re-add a module (and its DLLs) here if it
+# becomes required.
+$optionalDlls = @("libcrypto-3.dll", "libssl-3.dll", "libffi-8.dll", "sqlite3.dll")
+Get-ChildItem -LiteralPath $Dest -File |
+    Where-Object { $_.Extension -eq ".pyd" -or $optionalDlls -contains $_.Name } |
+    Remove-Item -Force
+
+# zanc copies the files listed here next to a published executable; ship the
+# trimmed core-interpreter payload (stdlib zip + DLLs). Everything the module
+# itself owns is excluded (lua*, *.bundle).
 $payload = Get-ChildItem -LiteralPath $Dest -File |
            Where-Object { $_.Name -notlike "*.bundle" -and $_.Name -notlike "lua*" } |
            ForEach-Object { $_.Name }
